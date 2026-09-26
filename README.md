@@ -16,8 +16,13 @@ lifetimes nor retain/release.
 
 ## Status
 
-Specification. Nothing here is implemented yet, and nothing counts as
-implemented until an executable test says so.
+Specification plus the test infrastructure that will judge it. Nothing
+counts as implemented until an executable test says so.
+
+```
+cargo test --workspace                    # 485 tests
+cargo run -p fibref -- cases cases/ownership   # 20 cases, all pending until an interpreter exists
+```
 
 | Part | Where | State |
 |------|-------|-------|
@@ -25,6 +30,7 @@ implemented until an executable test says so.
 | Ownership model | [spec/ownership.md](spec/ownership.md) | draft |
 | Ownership test cases | [cases/ownership/](cases/ownership/) | draft |
 | Type system | spec/types.md | not started |
-| Reference interpreter (the executable spec) | — | not started |
+| Audited heap and case harness (`fibref`) | [crates/fibref](crates/fibref) | done: 485 tests, adversarially tested |
+| Reference interpreter (evaluator over the heap) | — | not started |
 | lIR (hardened, from liar) | — | not started |
 | Compiler | — | not started |

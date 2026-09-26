@@ -1,0 +1,153 @@
+//! Comparing what a case's header expects with what the evaluator did.
+//!
+//! The rules (`spec/method.md`, rule 3):
+//!
+//! | header   | outcome                                   | status  |
+//! |----------|-------------------------------------------|---------|
+//! | accept   | Compiled, result and audit both match     | Pass    |
+//! | accept   | Compiled, result or audit differs          | Fail    |
+//! | accept   | Rejected                                  | Fail    |
+//! | reject   | Rejected, message contains the error text | Pass    |
+//! | reject   | Rejected, message lacks it                | Fail    |
+//! | reject   | Compiled                                  | Fail    |
+//! | reject   | expected text blank (any outcome but Unsupported) | Fail |
+//! | either   | Unsupported                               | Pending |
+//!
+//! An empty or whitespace-only expected text is a Fail rather than a
+//! vacuous Pass: every message contains `""`, nearly every one contains
+//! a space, and a test that cannot fail is worse than no test
+//! (`spec/method.md`). The header parser trims such a value to empty
+//! and refuses it from files; this guard covers headers built in code.
+//!
+//! `audit: clean` means the summary is clean: nothing live at exit and
+//! no check fired. `audit: leak-cycle` means the only thing wrong is at
+//! least one cycle through cells: `leak_cycles > 0`, no other leaks, no
+//! errors. Pending is reported separately and is never a pass.
+
+use std::fmt;
+
+use super::evaluator::{AuditSummary, Outcome, Value};
+use super::header::{AuditExpect, Expected, Header, HeaderError, Verdict};
+
+/// How one case fared against its header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// The verdict held.
+    Pass,
+    /// The verdict did not hold; the string says how.
+    Fail(String),
+    /// The evaluator could not decide the case; the string says why.
+    Pending(String),
+    /// The header could not be parsed, so nothing ran.
+    HeaderError(HeaderError),
+}
+
+impl Status {
+    /// The one-word label used in reports.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Status::Pass => "pass",
+            Status::Fail(_) => "FAIL",
+            Status::Pending(_) => "PENDING",
+            Status::HeaderError(_) => "HEADER",
+        }
+    }
+
+    /// The explanation, if the status has one.
+    pub fn detail(&self) -> String {
+        match self {
+            Status::Pass => String::new(),
+            Status::Fail(why) | Status::Pending(why) => why.clone(),
+            Status::HeaderError(e) => format!("line {}: {}", e.line, e.kind),
+        }
+    }
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let detail = self.detail();
+        if detail.is_empty() {
+            f.write_str(self.label())
+        } else {
+            write!(f, "{}: {}", self.label(), detail)
+        }
+    }
+}
+
+/// Decides the status of a case from its header and the evaluator's outcome.
+pub fn judge(header: &Header, outcome: &Outcome) -> Status {
+    match (&header.verdict, outcome) {
+        (_, Outcome::Unsupported { reason }) => Status::Pending(reason.clone()),
+        (Verdict::Accept { result, audit }, outcome) => judge_accept(result, *audit, outcome),
+        (Verdict::Reject { error }, outcome) => judge_reject(error, outcome),
+    }
+}
+
+fn judge_accept(expected: &Expected, audit: AuditExpect, outcome: &Outcome) -> Status {
+    match outcome {
+        Outcome::Compiled {
+            result,
+            audit: summary,
+        } => {
+            let mismatches: Vec<String> = result_mismatch(expected, result)
+                .into_iter()
+                .chain(audit_mismatch(audit, summary))
+                .collect();
+            if mismatches.is_empty() {
+                Status::Pass
+            } else {
+                Status::Fail(mismatches.join("; "))
+            }
+        }
+        Outcome::Rejected { message } => {
+            Status::Fail(format!("expected accept, but rejected: {message}"))
+        }
+        Outcome::Unsupported { reason } => Status::Pending(reason.clone()),
+    }
+}
+
+fn judge_reject(expected: &str, outcome: &Outcome) -> Status {
+    // Both strings are shown verbatim (Display, not Debug) so a reader can
+    // find the header's text and the compiler's message as written.
+    match outcome {
+        Outcome::Rejected { .. } | Outcome::Compiled { .. } if expected.trim().is_empty() => {
+            Status::Fail(
+                "expected error text is empty or only whitespace: nearly every message contains it, so this case could never fail"
+                    .to_string(),
+            )
+        }
+        Outcome::Rejected { message } if message.contains(expected) => Status::Pass,
+        Outcome::Rejected { message } => Status::Fail(format!(
+            "rejected, but the error does not contain the expected text: expected \"{expected}\", got \"{message}\""
+        )),
+        Outcome::Compiled { result, audit } => Status::Fail(format!(
+            "expected reject with \"{expected}\", but compiled: result {result}, audit {audit}"
+        )),
+        Outcome::Unsupported { reason } => Status::Pending(reason.clone()),
+    }
+}
+
+fn result_mismatch(expected: &Expected, got: &Value) -> Option<String> {
+    let matches = match (expected, got) {
+        (Expected::Int(e), Value::Int(g)) => e == g,
+    };
+    (!matches).then(|| format!("result: expected {expected}, got {got}"))
+}
+
+fn audit_mismatch(expected: AuditExpect, summary: &AuditSummary) -> Option<String> {
+    let matches = match expected {
+        AuditExpect::Clean => {
+            summary.clean
+                && summary.leak_cycles == 0
+                && summary.leaks == 0
+                && summary.errors.is_empty()
+        }
+        AuditExpect::LeakCycle => {
+            summary.leak_cycles > 0 && summary.leaks == 0 && summary.errors.is_empty()
+        }
+    };
+    (!matches).then(|| format!("audit: expected {expected}, got {summary}"))
+}
+
+#[cfg(test)]
+mod tests;
