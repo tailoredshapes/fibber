@@ -135,10 +135,19 @@ Otherwise the value can be freed between the two. The implementation
 may use a per-atom lock or deferred reclamation; the spec does not
 choose.
 
-**Proposed:** no `dosync` over atoms. Coordinated multi-value updates
-put the values in one atom (a map or struct) and update them with one
-`swap!`. A true transactional `ref` type can be added later if needed,
-with its own rules.
+**Decided:** atoms never take part in transactions. Values that must
+change together live in one atom (a struct or map) and change with one
+`swap!`, which is already all-or-nothing (case 16).
+
+`dosync` is reserved for a separate transactional `ref` type, deferred
+until after the core. Building it on atoms does not work: atomicity has
+to cover readers too, so every `@a` in the program would have to
+consult the transaction system; `swap!` would mean something different
+inside and outside a transaction; and retries would re-run whatever
+else the block contains. A `ref` may only be changed inside `dosync`
+and reads of refs always see one consistent snapshot. Counting makes
+that snapshot cheap to keep: an old version stays alive exactly as long
+as a transaction is still reading it.
 
 ## 8. Async
 

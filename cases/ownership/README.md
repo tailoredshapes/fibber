@@ -16,3 +16,5 @@ rewritten into fibber syntax then, with verdicts unchanged.
 
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
+Cases 12 to 14 must be rejected, 15 is the one permitted leak, and 16
+shows the decided pattern for coordinated updates (§7).

@@ -1,0 +1,19 @@
+;; spec:   §7
+;; expect: accept
+;; result: 200
+;; audit:  clean
+;; Two balances that must change together live in one atom and change
+;; with one swap!, so no reader can see the money in flight.
+(defstruct Accounts (a: i64 b: i64))
+
+(defun transfer (accts amount)
+  (swap! accts (fn (x) (Accounts (- (. x a) amount) (+ (. x b) amount)))))
+
+(defun main () -> i64
+  (plet ((accts (atom (Accounts 100 100))))
+    (pmap (fn (i)
+            (transfer accts 1)
+            (let ((snap @accts)) (+ (. snap a) (. snap b))))
+          (range 1000))
+    (let ((final @accts))
+      (+ (. final a) (. final b)))))
