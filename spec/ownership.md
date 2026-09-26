@@ -76,9 +76,12 @@ Immutable objects are "updated" by making a new version (`conj`,
 counts on the shared nodes keep them alive for as long as any version
 needs them (case 02).
 
-A **mutable parameter** `&x` is in-out: the callee may replace `x`, and
-the caller's binding holds the new value when the call returns.
-Updates go through the object's count:
+A **mutable parameter** `&v` is copy-in, copy-out. The callee's `v` is
+a local mutable binding initialised from the caller's variable (written
+`(f &x)` at the call site); when the call returns, `x` is assigned
+whatever `v` holds. During the call the caller's `x` is untouched, so
+`(f &x @x)` is fine: the plain borrow stays valid until the write-back
+(case 17). Updates go through the object's count:
 
 - count is one → the object is updated in place;
 - count is more than one → it is copied first, and the copy is updated.
@@ -87,9 +90,19 @@ So a caller that is still using the old value (an iteration, another
 binding) keeps seeing the old value, and nothing it holds is ever freed
 or moved under it (case 08).
 
-**Proposed:** the same binding may not be passed to two `&` parameters
-of one call. With in-out semantics that call has no single meaning.
-This replaces liar's ADR 007 ("aliasing allowed").
+**Decided:** the `&` arguments of one call must name distinct
+variables. `(bar &x &x)` would write back to `x` twice at return; with
+copy-on-write inside `bar`, whichever parameter was updated second wins
+and the other update is silently lost. No ordering gives that call one
+meaning, so it is a compile error (case 12). The check is syntactic; no
+alias analysis is needed. This replaces liar's ADR 007 ("aliasing
+allowed"). Aliasing of *objects* stays fine because mutation copies
+when the count is above one: `(bar &x &y)` with `x` and `y` holding the
+same object gives each variable its own result.
+
+**Decided:** an `&` parameter may not be captured by a closure that
+escapes the call (case 18). The closure would keep mutating a private
+cell after the write-back has already happened.
 
 ## 6. Cells and cycles
 
@@ -101,17 +114,26 @@ closures capturing the same variable share one cell (case 05). Atoms
 Cells are the only way to build a cycle: store something that refers to
 a cell back into that cell.
 
-**Proposed:** cycles through cells are not collected and leak. A leak is
-not a memory-safety violation. The reference interpreter reports such
-leaks separately from other audit failures, and the standard library
-provides weak references for structures that need back-pointers. Named
-functions are global and capture nothing, so ordinary recursion never
-creates a cycle; a local recursive closure calls itself through its own
-code pointer and environment rather than capturing itself.
+**Decided:** an object unreachable except through a cycle of cells is
+garbage. The implementation is not required to reclaim it; if it does,
+the timing is unspecified. A leaked cycle is not a memory-safety
+violation, and the reference interpreter reports such leaks separately
+from every other audit failure (case 15).
 
-Alternatives, if leaking is unacceptable: forbid storing values that
-contain cells into cells (restrictive), or add a cycle collector for
-cells only (a partial GC). Needs a decision.
+The standard library provides weak references for structures that need
+back-pointers: `(weak x)` makes a weak reference to `x`, and `(deref w)`
+returns a strong reference, or `nil` once the object is gone (cases 19,
+20). Only objects that ever had a weak reference pay for one.
+
+Named functions are global and capture nothing, so ordinary recursion
+never creates a cycle; a local recursive closure calls itself through
+its own code pointer and environment rather than capturing itself.
+
+A cycle collector over cells only (trial deletion; only cells can be
+cycle roots) can be added later as an implementation improvement
+without changing this rule. The audit's leak reports from real programs
+decide whether it is worth its cost. Forbidding cell-containing values
+inside cells was rejected: it rules out parent pointers and most graphs.
 
 ## 7. Threads
 
