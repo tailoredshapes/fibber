@@ -15,9 +15,10 @@ use fibref::cases::{render, run_dir, PendingEvaluator};
 const USAGE: &str = "usage: fibref <command>
 
 commands:
-  cases [dir]   run every case in dir (default cases/ownership) against
-                the verdict in its header
-  help          print this message";
+  cases [dir]     run every case in dir (default cases/ownership) against
+                  the verdict in its header
+  explain <file>  print the ownership checker's decisions for file (types §9)
+  help            print this message";
 
 /// The directory `cases` runs when none is given.
 const DEFAULT_CASES_DIR: &str = "cases/ownership";
@@ -27,6 +28,8 @@ const DEFAULT_CASES_DIR: &str = "cases/ownership";
 enum Command {
     /// Run the cases in a directory.
     Cases { dir: String },
+    /// Print the ownership decisions for a file.
+    Explain { file: String },
     /// Print usage and exit successfully.
     Help,
     /// Print usage and exit with an error: the arguments made no sense.
@@ -40,6 +43,7 @@ fn parse(args: &[String]) -> Command {
             dir: DEFAULT_CASES_DIR.to_string(),
         },
         [cmd, dir] if cmd == "cases" => Command::Cases { dir: dir.clone() },
+        [cmd, file] if cmd == "explain" => Command::Explain { file: file.clone() },
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
         _ => Command::Invalid,
     }
@@ -74,6 +78,29 @@ fn run_cases(dir: &str) -> ExitCode {
     }
 }
 
+/// Checks `file` through the ownership pass and prints its decisions,
+/// or its errors (exit 1); exit 2 if it cannot be read.
+fn run_explain(file: &str) -> ExitCode {
+    let source = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fibref: cannot read {file}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (text, code) = match fibref::own::check_source(&source, file) {
+        Ok(c) => (
+            fibref::own::explain::explain(&c.typed, &c.owned),
+            ExitCode::SUCCESS,
+        ),
+        Err(e) => (format!("rejected:\n{e}\n"), ExitCode::from(1)),
+    };
+    match write_stdout(&text) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => ExitCode::from(2),
+        _ => code,
+    }
+}
+
 /// Writes `text` to stdout and returns the error instead of panicking
 /// the way `print!` does on a closed pipe.
 fn write_stdout(text: &str) -> io::Result<()> {
@@ -86,6 +113,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse(&args) {
         Command::Cases { dir } => run_cases(&dir),
+        Command::Explain { file } => run_explain(&file),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -128,6 +156,17 @@ mod tests {
     #[test]
     fn cases_with_extra_arguments_is_invalid() {
         assert_eq!(parse(&args(&["cases", "a", "b"])), Command::Invalid);
+    }
+
+    #[test]
+    fn explain_takes_one_file() {
+        assert_eq!(
+            parse(&args(&["explain", "a.fib"])),
+            Command::Explain {
+                file: "a.fib".to_string()
+            }
+        );
+        assert_eq!(parse(&args(&["explain"])), Command::Invalid);
     }
 
     #[test]

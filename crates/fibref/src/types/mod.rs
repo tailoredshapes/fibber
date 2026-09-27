@@ -107,16 +107,45 @@ fn check_here(
     prelude: &[Form],
     main: bool,
 ) -> Result<TypedProgram, Vec<TypeError>> {
+    infer_lowered(lower_program(forms, prelude)?, main)
+}
+
+/// A program after lowering (§3.5 steps 1–3) and before inference:
+/// every name resolved, every body in the AST of [`ast`], nothing
+/// typed. The syntactic `&` checks of §6.5 and §6.9, which §3.5 step 3
+/// runs before typing, read it (`own::syntactic`).
+pub struct Lowered {
+    /// Every definition and binding site.
+    pub globals: decls::Globals,
+    prelude: lower::ModuleItems,
+    user: lower::ModuleItems,
+}
+
+/// Steps 1–3 of §3.5 for the prelude and the user module. Runs on the
+/// calling thread, whose stack must be [`CHECK_STACK`] deep for deeply
+/// nested programs ([`check_program`] makes a thread of its own).
+pub fn lower_program(forms: &[Form], prelude: &[Form]) -> Result<Lowered, Vec<TypeError>> {
     let mut g = init::new_globals().map_err(|e| vec![e])?;
     let pd = lower::declare(&mut g, ModuleId::Prelude, prelude)?;
     init::finish_builtins(&mut g).map_err(|e| vec![e])?;
     let prelude_items = lower::define(&mut g, pd)?;
     let ud = lower::declare(&mut g, ModuleId::User, forms)?;
     let user_items = lower::define(&mut g, ud)?;
+    Ok(Lowered {
+        globals: g,
+        prelude: prelude_items,
+        user: user_items,
+    })
+}
+
+/// Steps 4–7 of §3.5 on a lowered program; with `main`, requires `main
+/// : (fn () i64)`. Same stack requirement as [`lower_program`].
+pub fn infer_lowered(l: Lowered, main: bool) -> Result<TypedProgram, Vec<TypeError>> {
+    let g = l.globals;
     let (env, tables, units) = {
         let mut ck = Checker::new(&g);
-        ck.module(&prelude_items);
-        ck.module(&user_items);
+        ck.module(&l.prelude);
+        ck.module(&l.user);
         if main {
             ck.check_main();
         }
