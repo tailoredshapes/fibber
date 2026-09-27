@@ -1,11 +1,14 @@
 # fibber syntax
 
-Status: synthesis of the three drafts under `spec/drafts/` (see
-`spec/drafts/SYNTHESIS.md`). Authority: [ownership.md](ownership.md) is
-Decided. Every decision here is marked **Decided** only where it is a
-direct consequence of ownership.md, and **Proposed** otherwise. The case
-verdicts in `cases/ownership/` are fixed; Appendix A rewrites the case
-bodies into this syntax with their headers unchanged.
+Status: signed off. This file grew out of the three drafts under
+`spec/drafts/` (see `spec/drafts/SYNTHESIS.md`); on 2026-09-27 the owner
+accepted every open decision of the three review rounds as recommended,
+with the amendments D1–D7 recorded in the decision table at the end of
+this file. Every rule here is now **Decided** unless marked
+**Proposed**; a "D*n*" beside a rule names the amendment it comes from.
+Authority: [ownership.md](ownership.md) is Decided and wins where the
+two meet. The case verdicts in `cases/ownership/` are fixed; Appendix A
+rewrites the case bodies into this syntax with their headers unchanged.
 
 Companion: [types.md](types.md) gives the type grammar, the typing rule
 of every form here, the inference algorithm, the ownership checker that
@@ -13,7 +16,7 @@ decides every rule of ownership.md, the case table and the lIR mapping.
 Section references of the form "types §n" are to that file; "§n" alone
 is ownership.md.
 
-Design rule (Proposed): a form is **core** only if the checker must see it
+Design rule (**Decided**): a form is **core** only if the checker must see it
 on the surface to decide a rule, it binds names or introduces a type or an
 implementation, or it changes control flow or the evaluation regime in a
 way no function can. Everything else is a macro over core forms or a
@@ -50,7 +53,7 @@ special forms.
 
 A literal that does not fit its width (`300i8`, `9223372036854775808`) is a
 read error, never a wrap. Numbers carry their width in the reader; there
-is no literal polymorphism (types §1.1; Open decision 10).
+is no literal polymorphism (types §1.1; **Decided**, D3).
 
 **Symbols.** A symbol is a maximal run of characters that are not
 whitespace, `( ) [ ] { } " ; ' `` ` `` `,` `@` `\`, not starting with a
@@ -78,7 +81,7 @@ Each rewrites to a list form. There are exactly six.
 | `,x` | `(unquote x)` | inside a quasiquote: splice one form |
 | `,@x` | `(unquote-splicing x)` | inside a quasiquote: splice a `(Vec Form)` |
 | `@x` | `(deref x)` | read a cell, atom or weak reference (§3.11) |
-| `&x` | `(& x)` | in-out argument, parameter or place (§3.13); `x` must be a symbol or a `(. sym field)` form |
+| `&x` | `(& x)` | in-out argument or parameter (§3.13); `x` must be a symbol |
 
 A comma immediately followed by a character that can start a form is
 `unquote`; any other comma is whitespace, so `[1, 2]` and `` `(a ,b) ``
@@ -92,7 +95,7 @@ error at expansion.
 Every form carries a position (file, line, column). Positions survive
 macro expansion: a form produced by a macro carries the position of the
 macro call, unless the macro built it from an input form, which keeps
-its own. Every compile error names a position. (Proposed.)
+its own. Every compile error names a position. (**Decided**.)
 
 ### 1.4 Literal collections are library calls
 
@@ -112,8 +115,9 @@ so a user binding of `conj` does not change what a literal means. The
 compiler may fuse the chain into one allocation; that is an
 optimisation, not a semantic. Inside `quote`/`quasiquote` the brackets
 stay `Vec`/`Map` forms and are not rewritten, so macros see `[x y]` as
-data. In a pattern (§3.6) brackets are not allowed in v1 (Open decision
-11).
+data. In a pattern (§3.6) brackets are not allowed in v1 (**Decided**:
+`Vec` is a library type with no core view, and guards would need
+fallthrough).
 
 ### 1.5 Annotations
 
@@ -130,24 +134,34 @@ type `(fn () i64)`. A module is a sequence of top-level forms: `ns`,
 `defun`, `def`, `defstruct`, `defenum`, `defprotocol`, `impl`,
 `defmacro`, `extern`, a macro call expanding to one of these, or a
 top-level `(do form*)`, which is **spliced**: it stands for its forms in
-order, each of them a top-level form expanded in turn (Proposed; Open
-decision 24). The splice is how a macro whose expansion is several
+order, each of them a top-level form expanded in turn (**Decided**: a
+macro returns one `Form`, and `do` had no top-level meaning to lose).
+The splice is how a macro whose expansion is several
 definitions returns them as one `Form` (§3.16); `do` keeps its
 expression meaning everywhere else (§3.5). Every other form is an
 **expression**, and an expression at top level is an error.
 
 Evaluation is strict and **left to right, inner before outer**
-(Proposed; liar ADR 008 kept):
+(**Decided**; liar ADR 008 kept):
 
 - a call `(f a1 ... an)`: `f` (when it is not a global name), then `a1`
   ... `an`, then the call; for an `&x` argument the copy-in happens at
   its argument position (§3.13), and the write-backs happen after the
-  call returns, in parameter order (they target distinct places, so the
-  order is unobservable);
+  call returns, in parameter order (they target distinct variables, so
+  the order is unobservable);
+- a **tail call** (a call in tail position of a function body that
+  types §6.10 admits as one; **Decided**, D5): its head and arguments
+  as above, then the scope exits of every scope enclosing the call in
+  the body (their owning bindings released, except those moved into the
+  call) and the release of the step's other temporaries, then the jump.
+  The callee's result is the caller's result and nothing of the caller
+  runs after it; in particular a call with a write-back is never a tail
+  call, except the forwarding case of §3.13;
 - `let`: initialisers in order, each seeing the earlier bindings;
 - `do`: steps in order; the value of the last is the value of the form;
-- `loop`: initialisers in order, like `let`; `recur`: its arguments left
-  to right, then the rebinding of every loop variable at once (§3.18);
+- `loop`: initialisers in order, like `let`; `recur`: a tail call to the
+  loop: its arguments left to right, then the rebinding of every loop
+  variable at once (§3.18);
 - `if`/`match`: the test or scrutinee, then exactly one branch;
 - constructor arguments and literal-collection elements: left to right;
 - `plet` initialisers run concurrently in unspecified order; `pmap`
@@ -166,7 +180,7 @@ this fixes where). A value produced by an expression and not bound is an
 | the test of an `if` | after the test is evaluated, before either branch |
 | the scrutinee of a `match` | after the whole `match` (the scrutinee is an implicit binding for the form; types §6.3) |
 | a `let` initialiser | never as a temporary: the binding owns the value |
-| the argument list of a `recur` | never as temporaries: the values are moved into the loop's slots at the rebinding (types §6.10) |
+| the argument list of a tail call, `recur` included | never as temporaries: each is consumed into the callee's parameter (the loop's variable) at the jump; every other temporary of the step is released before it (types §6.10) |
 | the body of a function | its value is the result; nothing else survives |
 
 The reference interpreter releases at exactly these points; the compiler
@@ -207,29 +221,39 @@ its escape summary (types §6.4) is then part of the interface rather
 than an inference result, and a body that breaks it is the error
 `parameter p of f is declared :borrow but escapes`. Summaries are
 inferred, so the annotation changes no verdict; it documents and pins
-one (Proposed; Open decision 23). `&sym` is an in-out parameter
-(§3.13). A function with an `&` parameter is not a value: it may be
-called but not passed, stored or returned (Proposed; types §1.4). A
-`defun` may not be redefined in its namespace.
+one (**Decided**: the flat spelling is what `x: T` already is). `&sym`
+is an in-out parameter (§3.13). A function with an `&` parameter is not
+a value: it may be called but not passed, stored or returned
+(**Decided**; types §1.4). A `defun` may not be redefined in its
+namespace.
 
 A `defun` is an **async function** for §3.13 rule 3 iff, after
 expansion, (i) an `async` form anywhere in its body (including inside
-nested `fn`s) mentions one of its `&` parameters, as `@v`, `&v`, `&(. v
-f)` or the target of a `set!`, anywhere inside the `async` body; or
+nested `fn`s) mentions one of its `&` parameters, as `@v`, `&v` or the
+target of a `set!`, anywhere inside the `async` body; or
 (ii) an `async` form is in tail position of its body (the function's
 value is a task it creates: the last step of a `do`, a branch of a tail
 `if`/`match`, the body of a tail `let`, transitively, but not inside a
 `fn`). A function whose body merely contains an `async` that it drives
 to completion itself (`(block-on (async ..))`) and that mentions no `&`
-parameter is an ordinary function (Proposed; Open decision 22). Both
+parameter is an ordinary function (**Decided**: the broader definition,
+any `defun` containing an `async`, rejected an in-out buffer filled
+from a task's result for no safety reason; proposed case 38). Both
 conditions are syntactic.
 
 Evaluation: a named function is global, captures nothing (**Decided**, §6),
 and when used in non-head position is a function value with an empty
-environment (types §8.4).
+environment (types §8.4). A call to a named function in tail position
+of a body is a tail call (§2; types §6.10).
 
-Ownership (**Decided**, §4): every parameter is a borrow for the whole call
-and is never freed by the callee; the result is owned by the caller.
+Ownership (**Decided**, §4 as amended by D5): a parameter is
+**borrowed** — valid for the whole call, never freed by the callee,
+passed with no count operation — unless the checker infers it
+**owned**, which it does when the body returns it, stores it or passes
+it on in a tail call (types §6.4); an owned parameter arrives with one
+count that the callee releases or hands on. The kind is inferred and
+exported with the function, never written on a `defun`; it changes no
+verdict and no free point. The result is owned by the caller.
 
 ### 3.2 `fn`
 
@@ -242,7 +266,9 @@ An anonymous function that closes over the variables it uses from
 enclosing scopes. With `name`, the body may call `name`; the call goes
 through the closure's own code pointer and environment, not through a
 capture, so it creates no cycle (**Decided**, §6). `name` is bound only in
-the body. A `fn` has no `&` parameters (Proposed; Open decision 1).
+the body. A `fn` has no `&` parameters (**Decided**: closures keep one
+calling convention and the escaping-capture rule stays a check on
+captures).
 
 Static: the **capture set** of a `fn` is the set of free variables of its
 body bound in enclosing scopes, computed after expansion (types §3.7).
@@ -258,7 +284,15 @@ closures capturing the same cell share it (**Decided**, §6, case 05).
 
 Ownership: an escaping closure retains every object it captures at
 creation and releases them when it is freed; a non-escaping closure
-borrows its captures (types §6.5).
+borrows its captures and lives in the creating frame, unless it is
+passed or called at a tail call, which puts it on the heap with
+retained captures while keeping it non-escaping (types §6.5, E6;
+**Decided**, D5). The parameters of a closure, and the closure object
+itself for the duration of a call through it, are always owned: a call
+through a function value hands every object argument and the closure
+over with one count, and the body releases them at its exit or hands
+them on (types §6.4, the closure convention). A call to a closure in
+tail position is a tail call.
 
 ### 3.3 `let`
 
@@ -269,9 +303,10 @@ borrows its captures (types §6.5).
 Sequential bindings: each initialiser sees the earlier ones. `pat` must
 be irrefutable: a symbol, `_`, `(pat :as sym)` (§3.6), a struct pattern, or a
 pattern of the only variant of an enum. Shadowing an enclosing binding
-is allowed; a name may not be bound twice in one `let` (Proposed: liar
-ADR 006 is dropped; the checker keys every rule on binding sites, not
-names, so shadowing costs nothing).
+is allowed; a name may not be bound twice in one `let` (**Decided**:
+liar ADR 006 is dropped; nested `let`s and macro-introduced bindings
+need shadowing, and the checker keys every rule on binding sites, not
+names, so it costs nothing).
 
 Evaluation: evaluate each initialiser in order and bind; evaluate the
 body; its last value is the value of the form. Bindings die in reverse
@@ -282,7 +317,9 @@ object, a call result or a read of a cell, and **borrows** it when the
 initialiser is another variable or a field path (types §6.3). A value
 that leaves the scope as its result is moved out or retained (the
 scope-exit rule, types §6.3); an object that never escapes is freed at
-the scope end with no count operations (**Decided**, §2).
+the scope end with no count operations (**Decided**, §2) and lives in
+the creating frame rather than on the heap, from the first
+implementation (types §6.11; **Decided**, D6).
 
 ### 3.4 `if`
 
@@ -328,7 +365,7 @@ exhaustive: every variant of an enum or `Option`, both values of `bool`,
 and a final `_` or symbol clause for every other type. A clause that can
 never match is an error. A variable may occur once per pattern. A bare symbol other than `nil`
 is always a binding, never a variant constant; a field-less variant is
-matched as `(Variant)` (Open decision 18). `match` is the only
+matched as `(Variant)` (**Decided**; §3.9). `match` is the only
 eliminator of enums and `Option` in the core; `nil?`,
 `some?`, `if-let`, `when-let` are prelude definitions over it.
 
@@ -351,7 +388,7 @@ A nominal product type, a constructor function `Name` taking the fields
 positionally, and field access via `.`. A field without a type
 annotation becomes a fresh type parameter appended to the struct's
 parameter list in field order, so `(defstruct Pair (a b))` means
-`(defstruct (Pair a b) (a: a b: b))` (Proposed). A struct that mentions
+`(defstruct (Pair a b) (a: a b: b))` (**Decided**). A struct that mentions
 itself, directly or through other types, must annotate the recursive
 fields (types §1.3). Structs are immutable objects (**Decided**, §1); a
 field of type `(Cell T)` or `(Atom T)` is how a struct holds mutable
@@ -368,9 +405,8 @@ in a place is updated in place.
 inference (types §3.4); `field` is a symbol. The result is the field's
 value: a borrow derived from `expr` for objects, a copy for scalars. A
 `(. expr field)` whose field has type `(Cell T)` may be the first
-argument of `set!`. The place form `&(. x field)` of §3.13, with `x` a
-variable of cell type holding a struct, is not a field access on the
-cell: it names the field of the struct *in* `x`.
+argument of `set!`. There is no field place: `&` takes a variable, never
+a `(. x field)` form (§3.13; **Decided**, D1).
 
 ### 3.9 `defenum`
 
@@ -384,9 +420,11 @@ field   ::= sym: type | type
 A nominal sum type and one constructor per variant; a variant without
 fields is a constant, written bare in expressions (`empty`, `nil`) and
 as `(Variant)` in patterns (§3.6); `(empty)` as an expression is the
-error `empty is a constant, not a function` (types §2.2; Open decision
-18). Variant names live in the namespace beside
-functions and must be unique there (Proposed; Open decision 12). An enum
+error `empty is a constant, not a function` (types §2.2; **Decided**:
+`nil` already works this way, and `(empty)` as a call to a value of
+non-function type broke the normative `list` expansion of cases 01 and
+05). Variant names live in the namespace beside functions and must be
+unique there (**Decided**). An enum
 whose variants all have no fields is a scalar (types §8.1).
 
 `Option` is **built in**, like `Form` (§3.16), not declared in the
@@ -405,17 +443,22 @@ error `nil is a constant, not a function; write nil`, exactly as for
 `empty`. A macro that writes `nil` inside a quasiquote emits the
 reader's `(Nil)` and needs no special case (proposed case 51). Its
 representation is in types §8.1; the prelude derives `Eq`, `Ord`,
-`Hash` and `Show` for it (§4.4) (Proposed; Open decision 28). There is
-no implicit lifting of `T` to `(Option T)` and no null of any other
-type (Proposed; Open decision 9).
+`Hash` and `Show` for it (§4.4) (**Decided**: the declaration `(defenum
+(Option a) (nil) (some v: a))` cannot be read, since `nil` reads as
+`(Nil)`, and accepting the reader's form in the expander is what lets
+a macro emit `nil` through a quasiquote without a special case). There
+is no implicit lifting of `T` to `(Option T)` and no null of any other
+type (**Decided**, D3: every coercion the inference draft proposed
+made acceptance order-dependent, and `if-let` covers the idiom).
 
 ### 3.10 `defprotocol`, `impl`
 
 ```
 (defprotocol Name method+)
 (defprotocol (Name self det*) method+)          ; self dispatches; det* are determined by self
-method      ::= (mname (self mparam*) -> type)
-mparam      ::= sym: type | sym: type :borrow
+method      ::= (mname (self qual* mparam*) -> type)
+mparam      ::= sym: type qual*
+qual        ::= :borrow | :owned
 
 (impl Name type where? method-impl+)
 (impl (Name type*) type where? method-impl+)    ; protocols with determined parameters
@@ -439,11 +482,20 @@ that calls a method is type-checked and generalised before any `impl`
 body is (types §3.5). One `impl` per (protocol, head constructor) in the
 whole program.
 
-Escape kinds (Proposed; types §6.4): a method parameter other than `self`
-defaults to the **escaping** kind. `x: type :borrow` promises that no
-implementation makes `x` escape; the checker rejects an `impl` whose body
-breaks the promise. The same keyword after a `defun` parameter is the
-same promise on a plain function (§3.1). Only a `:borrow` parameter may receive a
+Escape and count kinds (**Decided**; types §6.4): a method parameter
+other than `self` defaults to the **escaping** kind, and every method
+parameter, `self` included, defaults to the **borrowed** count
+convention. `x: type :borrow` promises that no implementation makes `x`
+escape; the checker rejects an `impl` whose body breaks the promise.
+The same keyword after a `defun` parameter is the same promise on a
+plain function (§3.1). `:owned` declares that the caller hands the
+parameter over with one count and every implementation releases it or
+hands it on (types §6.4, D5): the convention an implementation needs to
+pass the parameter on in a tail call without a frame. A `defun`'s kinds
+are inferred (§3.1); a method's are declared, because callers are
+compiled against the protocol, not the implementation, and an
+implementation is compiled with the declared kind whatever its body
+would have inferred. Only a `:borrow` parameter may receive a
 non-escaping closure or a closure that captures an `&` parameter
 (cases 08, 18). A method signature that mentions a closure type without
 a colour (`(fn (a) unit)`) accepts closures of any colour; `(fn :send
@@ -497,8 +549,8 @@ captures a `(Cell T)` cannot be given to `spawn`, `plet` or `pmap` (case
 A task whose handle is discarded still runs to completion: the task
 object is created with one count for the caller and one for the thread
 (types §6.8), and `main` returning waits for every spawned thread still
-running (Proposed; Open decision 21), so a fire-and-forget `spawn` is
-an ordinary program and the audit sees a quiescent heap.
+running (**Decided**: a discarded task then finishes and the audit sees
+a quiescent heap), so a fire-and-forget `spawn` is an ordinary program.
 
 A `Task` is `Send` when its result is (types §1.6), so one task may be
 held, joined or awaited by several threads or tasks at once: `(plet ((a
@@ -506,30 +558,29 @@ held, joined or awaited by several threads or tasks at once: `(plet ((a
 bodies awaiting one task. The runtime, not the checker, keeps that
 safe: a task is resumed by one driver at a time, every other holder
 waits for its completion, and a task keeps a list of waiters rather
-than one waker slot (types §8.8; types Open decision 27). A count on a
-task is what keeps it allocated, never what serialises it.
+than one waker slot (types §8.8; **Decided**). The executor is
+multi-threaded: a task may be resumed on any worker thread, which is
+why what a task captures must be sendable (§3.14; **Decided**, D7). A
+count on a task is what keeps it allocated, never what serialises it.
 
-### 3.13 `&`: in-out parameters, arguments and places
+### 3.13 `&`: in-out parameters and arguments
 
 ```
 parameter: &sym | &sym: type
-argument:  &place
-place ::= sym                       ; a variable of type (Cell T)
-        | (. sym field)             ; sym a variable of type (Cell S), S a struct; field of object type
+argument:  &sym                     ; sym a variable of type (Cell T): a let binding or an & parameter
 ```
 
 Meaning (**Decided**, §5: copy-in, copy-out). Inside the callee an `&`
-parameter `v` **is a cell** of type `(Cell T)` (Proposed representation;
-Open decision 2): read it with `@v`, pass it on with `&v`, replace its
-content with `(set! v e)`, update it in place with the primitives below.
-The private cell is created by the caller at the call and lives exactly
-for the call:
+parameter `v` **is a cell** of type `(Cell T)` (**Decided**, D2): read it
+with `@v`, pass it on with `&v`, replace its content with `(set! v e)`,
+update it in place with the primitives below. The private cell is
+created by the caller at the call and lives exactly for the call:
 
 ```
 (f &x a)                    ; x : (Cell T), f's first parameter is &v: T
-   copy-in:    t := a new private cell holding x's content        (move or +1, below)
+   copy-in:    t := a new private cell holding @x            (an acquire: +1)
    call:       (f t a)      ; the callee's v is t
-   write-back: x's content := t's content (moved); t is freed
+   write-back: x's content := t's content (moved), x's old content released; t is freed
    result:     the call's value
 ```
 
@@ -539,43 +590,43 @@ owned reference (+1), so a value read from `v` and still in use always
 holds a count; that is what makes the loop in case 08 see the original
 elements (types §6.6).
 
-**An `&` parameter is not a value** (Proposed; Open decision 2). Inside
-the callee, `v` may occur only as `@v` (that is, `(deref v)`), `&v`,
-`&(. v f)`, or the first argument of `(set! v e)`; this holds in the
-body and in every closure literal inside it. Any other occurrence (`v`
-returned, stored, bound by `let`, passed as a plain argument, `(cell
-v)`, `(weak v)`, ...) is the compile error `& parameter v used as a
-value in f`. The private cell is a stack object of the caller's frame
-that lives exactly for the call (types §8.6); a value that referred to
-it would outlive it at the write-back.
+**An `&` parameter is not a value** (**Decided**, D2). Inside the callee,
+`v` may occur only as `@v` (that is, `(deref v)`), `&v`, or the first
+argument of `(set! v e)`; this holds in the body and in every closure
+literal inside it. Any other occurrence (`v` returned, stored, bound by
+`let`, passed as a plain argument, `(cell v)`, `(weak v)`, ...) is the
+compile error `& parameter v used as a value in f`. The private cell is
+a stack object of the caller's frame that lives exactly for the call
+(types §8.6); a value that referred to it would outlive it at the
+write-back.
 
-**Copy-in: move or retain** (Proposed; types §6.6). The copy-in *moves*
-the place's content into the private cell iff the place is **exclusive**
-for this call; otherwise it *retains* (+1). A place `x` is exclusive iff
-`x` is an `&` parameter of the enclosing `defun` or a `let` binding whose
-initialiser is syntactically `(cell e)`; every occurrence of `x` in the
-function is `&x`, `&(. x f)`, `@x` or the target of a `(set! x e)` (for
-an `&` parameter this is already required), none of them inside a `fn`
-or `async` literal (a `loop` body, §3.18, is part of the function, so
-occurrences in it are ordinary); and `x` occurs in no other argument of
-this call (a `set!` on `x` inside another argument counts). A place
-`(. x f)` is exclusive iff `x` is and, at run time, the struct in `x` is
-**takeable**: unique (count 1 and neither shared, immortal nor
-stack-allocated, types §8.2) and no weak reference to it exists
-(`HAS-WEAK` clear); a unique struct that has a weak
-reference is acquired instead, because an upgrade during the call could
-otherwise reach the taken field (types §6.6). Under these conditions no
-expression can observe the place during the call, so the move is
-unobservable; the interpreter and the compiler apply the same rule so
-their allocations agree. A moved-out struct field is *taken* until the
-write-back (types §6.6).
+**Copy-in always acquires** (**Decided**, D1). The private cell is
+initialised with `@x` (+1), and the caller's `x` keeps its own count
+until the write-back. There is no move, no "exclusive" place and no
+field place: `&` names a variable, never a field, and nothing is ever
+taken out of a struct. An `&` argument hands a *cell* over, not the
+object in it, which the two cells share for the duration of the call.
+Consequence: the first in-place update inside a user-written `&`
+function sees a count of at least two and copies (types §6.6); the copy
+is then held by the private cell alone, so every later update in the
+same call is in place, and after the write-back the caller's variable
+holds it with count one. The library collections update in place
+through the two unique-write primitives below, on objects they hold
+alone.
 
-A self tail call of the enclosing `defun` (types §6.10) whose argument
-for an `&` parameter `v` is `&v` itself, at `v`'s own position, forwards
-the private cell: no copy-in, no write-back, and the call is a loop
-iteration. A self call with any other `&` argument at an `&` position
-(`&(. v f)`, a `let` cell, or `&v` at a different position) is an
-ordinary call with copy-in and write-back.
+**Write-back** stores the private cell's content into the variable,
+releasing the variable's old content, then frees the private cell.
+
+**Forwarding at a self tail call** (**Decided**, D5). A self tail call of
+the enclosing `defun` (types §6.10) whose argument for an `&` parameter
+`v` is `&v` itself, at `v`'s own position, forwards the private cell: no
+copy-in, no write-back, the cell is kept, and the call stays a tail
+call; the one write-back is the original caller's, after the whole
+chain returns. Any other call with an `&` argument — a `let` cell, `&v`
+at a different position, an `&` argument to another function — is an
+ordinary call with copy-in and write-back, and is never a tail call,
+because the write-back must run after it returns (types §6.10 rule
+(b)).
 
 **Unique update** (**Decided**, §5): the in-place primitives update the
 object in a place when it is **unique**: its count is one and it is
@@ -592,23 +643,24 @@ holds part of a literal always copies and the literal is never written
 | `(set-field! &s field x)` | `&S F -> unit` for a struct `S` with field `field: F` | field := `x` |
 
 Everything else that updates in place (`push!`, `pop!`, `map-put!`,
-`append`, ...) is library code over these two, `&` and `set!`. Because a
-retained copy-in leaves the count above one, the first update through a
-non-exclusive place copies; a moved copy-in and every update after the
-first copy are in place.
+`append`, ...) is library code over these two, `&` and `set!`. Because
+the copy-in leaves the count above one, the first update through an `&`
+parameter copies; the copy is unique in the private cell, so every
+further update in the same call is in place. A function that holds an
+object in a `let` cell it created and updates it through the primitives
+directly updates in place from the start.
 
 Static requirements, all checked on the surface form before desugaring:
 
 1. **Distinct variables** (**Decided**, §5): the `&` arguments of one
-   call must name distinct places (distinct variables, or distinct
-   fields of distinct variables). Error: `variable x passed to more than
-   one & parameter in call to f` (case 12). Passing `&x` and `@x` in one
-   call is fine (case 17).
+   call must name distinct variables. Error: `variable x passed to more
+   than one & parameter in call to f` (case 12). Passing `&x` and `@x`
+   in one call is fine (case 17).
 2. **No escaping capture** (**Decided**, §5): a closure that captures an
    `&` parameter must not escape the call. Error: `& parameter captured
    by escaping closure: v in f` (case 18). "Escapes" is decided by types
    §6.5; such a closure may only be called directly or passed to a
-   `:borrow` parameter.
+   `:borrow` parameter, in a tail call or not.
 3. **Not in async functions** (**Decided**, §8): an `&` parameter on an
    async function, as §3.1 defines one (an `async` in the body mentions
    the parameter, or the body's value is an `async`), is an error: `&
@@ -620,13 +672,13 @@ Static requirements, all checked on the surface form before desugaring:
    no expression has the cell as its value (rule 5), and a closure that
    captures the parameter and is itself captured by the `async` is
    escaping (rule 2) and `local` (types §5).
-4. The place must have a cell type whose content type unifies with the
-   parameter's, else `& argument must be a cell variable or a field of a
-   cell variable`. A plain argument at an `&` position, or `&x` at a
-   plain position, is a type error.
-5. **Not a value** (Proposed, above): an `&` parameter occurs only as
-   `@v`, `&v`, `&(. v f)` or the target of `set!`. Error: `& parameter v
-   used as a value in f`.
+4. The variable must have a cell type whose content type unifies with
+   the parameter's, else `& argument must be a cell variable`. A plain
+   argument at an `&` position, or `&x` at a plain position, is a type
+   error.
+5. **Not a value** (**Decided**, D2, above): an `&` parameter occurs only
+   as `@v`, `&v` or the target of `set!`. Error: `& parameter v used as
+   a value in f`.
 
 ### 3.14 `async`, `await`
 
@@ -637,7 +689,9 @@ Static requirements, all checked on the surface form before desugaring:
 
 `async` creates a task: an object holding the body's captured variables
 and its suspended state. Evaluating the form does not run the body; the
-executor does, when the task is joined, awaited or spawned. `await`
+executor does, on whichever of its worker threads picks the task up
+(it is multi-threaded; types §8.8), when the task is joined, awaited or
+spawned. `await`
 suspends the task until the awaited task completes and yields its result
 (owned). A task may be awaited by any number of tasks and joined by any
 number of threads: the runtime resumes it on one thread at a time and
@@ -682,10 +736,12 @@ duration of the call" (**Decided**, §9). When the foreign interface keeps
 the reference (a callback, a buffer the library owns), `(raw-retained
 e)` retains `e` and returns its address; that count belongs to the
 foreign side until `(release-raw p)` on the fibber side, or the
-runtime's exported `fib_release` called from C, releases it (Proposed;
-Open decision 20; types §6.13). No extern parameter is ever typed as an
+runtime's exported `fib_release` called from C, releases it (**Decided**:
+extern positions are scalars, so liar's `:retains` named parameters that
+cannot exist; types §6.13). No extern parameter is ever typed as an
 object, so nothing else transfers a count across the boundary. `ptr` is
-a scalar for the ownership rules and is not sendable (types §5).
+a scalar for the ownership rules and is not sendable (types §5). A call
+to an extern is never a tail call (types §6.10).
 
 ### 3.16 `quote`, `quasiquote`, `defmacro`, `Form`
 
@@ -700,7 +756,7 @@ A macro is a fibber function from forms to a form, run at expansion
 time. Its parameters have type `Form` (`(Vec Form)` for the rest
 parameter) and its body has type `Form`. The body is ordinary fibber,
 type-checked as a `defun` in a macro-time module and evaluated by the
-reference interpreter's evaluator over that module (Proposed: macro-time
+reference interpreter's evaluator over that module (**Decided**: macro-time
 evaluation is then the same executable spec as run time; the compiler
 may JIT it but must agree). A macro may use any function of a module the
 current module requires, provided that module is already compiled.
@@ -724,13 +780,14 @@ Quasiquote is rewritten by the expander, not evaluated:
 ```
 
 `(gensym "prefix")` returns a fresh `Sym` that cannot collide with any
-source symbol. There is no automatic hygiene (Proposed; Open decision 7).
+source symbol. There is no automatic hygiene (**Decided**: renaming
+hygiene is a much larger expander, and `gensym` covers the cases).
 Expansion is outermost-first, repeated until no macro call remains,
 before name resolution and typing. A macro must be defined earlier in
 the module, or in a required module, than its first use. A macro call
 at top level may expand to several top-level forms by returning them as
 `(do f₁ .. fₙ)`: a top-level `do` is spliced into the module as its
-forms (§2; Proposed, Open decision 24). Top-level forms are expanded
+forms (§2; **Decided**). Top-level forms are expanded
 and registered in order, a spliced sequence included: a `defstruct` is
 registered with the expander before the next form is expanded, so a
 spliced `(derive ..)` that follows a spliced `(defstruct ..)` sees the
@@ -743,9 +800,11 @@ struct. `(do)` splices nothing. So
 
 defines the struct and its `Eq` instance (proposed case 41).
 
-Reflection at expansion time (Proposed; liar ADR 023 kept and extended,
-Open decision 26), for a struct `Name` defined earlier in the module or
-imported:
+Reflection at expansion time (**Decided**; liar ADR 023 kept and
+extended: without `struct-params` and `struct-field-types` no `derive`
+could be written for a generic struct, which is every struct with an
+unannotated field), for a struct `Name` defined earlier in the module
+or imported:
 
 | Call | Returns |
 |---|---|
@@ -781,7 +840,7 @@ struct or an enum, the context lists `(Eq t)` beside `(Ord t)`: the
 body compares with `=` as well as `<`, and there are no supertraits in
 v1 (types §4.1).
 
-The same reflection exists for enums (Proposed; Open decision 27), for
+The same reflection exists for enums (**Decided**), for
 an enum `Name` defined earlier in the module or imported, and for the
 built-in `Option` and `Form`:
 
@@ -875,26 +934,45 @@ without `recur`. `recur` must be in tail position of the loop body (the
 last step of the body, the branches of a tail `if`/`match`, the body of
 a tail `let`/`do`, transitively); anywhere else, outside any `loop`, or
 inside a `fn` or `async` literal nested in the loop, it is the error
-`recur outside loop` / `recur not in tail position` (Proposed; Open
-decision 17).
+`recur outside loop` / `recur not in tail position` (**Decided**).
 
-Why a core form: the loop body is part of the enclosing function, not a
-closure. Occurrences of an `&` parameter or a `let` cell in it are
-ordinary occurrences for the exclusivity rule of §3.13, so
-`(dotimes (i n) (push! &v i))` updates in place; and an `await` in a
-loop body inside an `async` is inside that `async` (§3.14). Neither is
-true of a loop spelled as a named `fn` and a self tail call, which is
-why `while`, `dotimes` and `for-each` over a `range` are prelude macros
-over `loop` (§4.4).
+Semantics (**Decided**, D5): a `loop` has no evaluation rule of its
+own. It is the local function `(fn g (sym*) body)` called once with the
+initialisers, and `recur` is a tail call to `g` (types §6.10): the loop
+variables are owning bindings, a `recur` consumes its arguments into
+them and releases the old values before continuing, a closure among its
+arguments is on the heap (E6), and a value that leaves the loop as its
+result follows the scope-exit rule. `while`, `dotimes` and `for-each`
+over a `range` are prelude macros over it (§4.4).
 
-Ownership (types §6.10): the loop variables are owning slots, exactly
-like the parameter slots of a self tail call; `recur` moves or retains
-its arguments into them and releases the old values; a value that leaves
-the loop as its result follows the scope-exit rule. A closure among the
-arguments of a `recur` or of a self tail call, or a `let`-bound closure
-passed there, is escaping whatever the callee's summary says: the jump
-releases the scope that created it while the slot keeps it (types
-§6.5; proposed case 49).
+Why it stays a core form. D5 asked for `loop`/`recur` to become a macro
+over a named local `fn` called in tail position unless a concrete
+reason forbids it; two rules cannot survive the rewrite `(let ((g (fn g
+(sym*) body'))) (g init*))`, because the loop body would then be a
+closure body rather than part of the enclosing function:
+
+1. **`&` forwarding.** A self tail call of the enclosing `defun` from
+   inside a loop body, forwarding the function's own `&` parameter —
+   `(defun run (&s n) (loop ((i 0)) (if (< i k) (do (step &s) (recur (+
+   i 1))) (run &s (- n 1)))))` — is a tail call under §3.13 only because
+   the call is a self call of `run` and `&s` is `run`'s own parameter. In
+   the rewritten body the same call sits inside `g`, where `s` is a
+   capture, not a parameter of `g` (a `fn` has no `&` parameters, §3.2);
+   the forwarding exception of types §6.10 rule (b) cannot apply, and
+   the call becomes an ordinary call with copy-in and write-back:
+   correct, but one frame per call. A macro cannot preserve the
+   forwarding rule for such calls.
+2. **`await`.** An `await` in a loop body inside an `async` is a
+   suspension point of that task's state machine (§3.14; proposed case
+   32); inside a `fn` it is the error `await outside async`, and no
+   checker rule can make it otherwise, since a closure body is compiled
+   as its own function (types §8.4), not as part of the task.
+
+Both hold because the loop body belongs to the enclosing function: its
+free variables are that function's own bindings, it has no capture set,
+and it is inside whatever `defun` or `async` encloses it. A named local
+`fn` called in tail position gives the same constant-stack iteration
+(types §6.10) and is the right spelling whenever neither rule is needed.
 
 ### 3.19 `def`
 
@@ -905,7 +983,9 @@ releases the scope that created it while the slot keeps it (types
 
 A top-level **constant**: `name` is bound in the module's namespace,
 beside the functions, to the value of `expr`, which must be a
-**constant expression** (Proposed; Open decision 25):
+**constant expression** (**Decided**: liar spelled every constant as a
+nullary function, which for a table allocates on every call, while the
+immortal mechanism the runtime has for literals covers it exactly):
 
 ```
 const ::= literal | 'form | nil | Variant             ; a field-less variant, bare (§3.9)
@@ -932,7 +1012,7 @@ it: `def`s are nodes of the dependency order of types §3.5, so `(def
 twice-fn double)` sees `double`'s scheme (proposed case 50), and a
 `def` and a `defun` that depend on each other (`(def t [f])` with `f`
 reading `t`) are the error `def t and defun f depend on each other`
-(Proposed; Open decision 29). A `def` naming a generic function must
+(**Decided**). A `def` naming a generic function must
 fix the instantiation with its annotation, since its type is closed:
 `(def twice-fn double)` with `double : ∀a. (Num a) ⇒ (fn (a) a)` is
 `def twice-fn has an unresolved type; annotate it`, and `(def twice-fn:
@@ -968,12 +1048,12 @@ allocates on every call.
 
 ## 4. Core versus macro versus library
 
-### 4.1 The rule (Proposed)
+### 4.1 The rule (Decided)
 
 A form is **core** iff at least one of:
 
 1. the checker must see it on the surface to decide a rule of ownership.md
-   (`&`: distinct places, the escaping-capture rule; `fn`/`async`: capture
+   (`&`: distinct variables, the escaping-capture rule; `fn`/`async`: capture
    and escape; `match`/`let` patterns: derived borrows and
    exhaustiveness; `.`: field paths);
 2. it binds names or introduces a type, a protocol or an implementation
@@ -1044,11 +1124,12 @@ over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O.
 `for-each`, `map`, `filter`, `reduce`, `swap!` take their function
 parameter `:borrow`; `pmap`'s function parameter escapes (its body
 spawns closures that capture it), which is what makes case 13's closure
-a thread crossing. An `&` update inside a closure passed to one of them
-copies on its first update, because a place used inside a `fn` literal
-is never exclusive (§3.13); in-place accumulation over a loop is written
-with `loop`, `dotimes` or `while` (§3.18), whose bodies belong to the
-enclosing function.
+a thread crossing. An `&` update through a library function (`push!`,
+`append`, ...) copies on the first update of every call, because the
+copy-in acquires (§3.13, D1); the library's own in-place paths are the
+unique writes it performs on objects it holds alone, and a build that
+must not copy keeps the object in one function and uses the primitives,
+or uses `conj`, which shares structure with the previous version (§5).
 
 ---
 
@@ -1063,7 +1144,7 @@ One `ns` form, first in the file, names the module (dotted; `a.b` lives
 at `a/b.fib` under a root given to the compiler). `:require` makes
 `alias/x` refer to `x` in that module; `:use` brings all of a module's
 top-level names in unqualified. Every top-level definition is exported
-(Proposed; no private names in v1). A name defined locally shadows a
+(**Decided**; no private names in v1). A name defined locally shadows a
 `:use`d one; two `:use`d modules exporting the same name make that name
 an error when referenced unqualified. Requires may not be cyclic.
 `fib.prelude` is implicitly `:use`d. Protocol implementations are global
@@ -1071,7 +1152,8 @@ facts and are always visible once their module is required.
 
 A module compiles against the **interfaces** of its requires and never
 re-infers a dependency: every exported function's generalised type
-scheme with colour constraints and escape summaries (types §3.9, §6.4),
+scheme with colour constraints, escape summaries and count kinds (types
+§3.9, §6.4),
 every `def` with its closed type (its value is built by the defining
 module's initialisation, §3.19), every type with its layout, every
 protocol, every impl, every macro (as forms), and the bodies of generic
@@ -1104,8 +1186,11 @@ rule that produces the verdict. Library names used are listed in §4.5.
       (unbox h))))
 ```
 Unchanged. `list` is the prelude macro (`(cons (box 1) (cons (box 2)
-empty))`, §4.4), `box`/`unbox` the prelude `Box` struct, `first` the `Seq` method (traps on an empty list; Open decision
-13). `head` is inferred as `∀s e. (Seq s e) ⇒ (fn (s) e)`.
+empty))`, §4.4), `box`/`unbox` the prelude `Box` struct, `first` the
+`Seq` method (traps on an empty list; **Decided**: `first?`/`nth?`
+return `(Option T)`). `head` is inferred as `∀s e. (Seq s e) ⇒ (fn (s)
+e)`; `(first xs)` is a tail call of `head` whose argument, a borrowed
+parameter, needs no count operation (types §6.10).
 
 ### 02-structural-sharing.fib
 
@@ -1189,7 +1274,7 @@ Unchanged.
 ```
 Change: the first closure returns `@n` after the `set!`, so both closures
 have the type `(fn () i64)` and the list is homogeneous (`set!` returns
-`unit`; Open decision 5). The shape is unchanged: one cell, two escaping
+`unit`; **Decided**). The shape is unchanged: one cell, two escaping
 closures sharing it.
 
 ### 06-capture-borrowed-param.fib
@@ -1224,9 +1309,11 @@ Unchanged.
 (defun main () -> i64
   (count (build 100000 [])))
 ```
-Unchanged. The self tail call is interpreted and compiled as a loop
-whose parameter slots own their values (types §6.10); each iteration
-releases the previous version.
+Unchanged. The self tail call is a real tail call (types §6.10;
+**Decided**, D5): `acc` is inferred owned, `(conj acc n)` is moved into
+the call and the previous version is released before the jump, so the
+recursion runs in constant stack and each version dies as soon as the
+next exists.
 
 ### 08-mutate-while-iterating.fib
 
@@ -1248,7 +1335,8 @@ releases the previous version.
 ```
 Change: inside `dup-all` the `&` parameter is a cell, so the vector it
 holds is read with `@v` (§3.13). That read is the retained reference
-that makes the iteration hold a count. `append` is the library
+that makes the iteration hold a count; every `append` acquires again
+and copies (§3.13, D1; traced in types §6.6). `append` is the library
 in-place push.
 
 ### 09-iterator-outlives-source.fib
@@ -1376,7 +1464,8 @@ Change: the original `(set! c [c])` needs the type `(Cell (Vec X))` with
 `X` equal to itself, which the occurs check rejects (types §3.2). The
 knot is tied through a nominal struct instead. The cycle `k → cell →
 vector → k` still passes through exactly one cell, so the verdict is
-unchanged (Open decision 14).
+unchanged (**Decided**: the rewrites of 05, 08, 15 and 19 each still
+exercise their rule).
 
 ### 16-coordinated-update-single-atom.fib
 
@@ -1496,190 +1585,58 @@ Unchanged. `nil?` is the prelude `(defun nil? (o) (match o (nil true)
 
 ## Open decisions (syntax)
 
-Each needs the owner's sign-off. Recommendation first, alternative
-second. Decisions that also affect the checker are cross-referenced to
-types.md.
+None remain. On 2026-09-27 the owner signed off the 29 items of the
+three review rounds, each as recommended except where the table says
+otherwise, together with seven amendments:
 
-1. **`&` only on `defun` parameters; `fn` has none.** Recommend: yes;
-   closures keep one calling convention and the escaping-capture rule
-   stays a check on captures. Alternative: `&` on `fn` parameters, which
-   puts write-back slots into closure types.
-2. **`&` parameters are cells inside the callee, read with `@v`, and
-   are not values.** Recommend: yes; cells are then the single mutable
-   thing the checker knows, the copy-in/copy-out of §5 is the whole
-   semantics, and the retained read is what makes case 08 sound by
-   construction (types §6.6). `v` occurs only as `@v`, `&v`, `&(. v f)`
-   or the target of `set!` (§3.13): the private cell is a stack object
-   of the caller's frame, so a `v` that could be returned, stored or
-   captured as a value (`(defun leak (&v) v)`) would dangle after the
-   write-back. Cost: case 08 writes `(for-each @v ...)`. Alternative:
-   auto-deref (`v` reads the value, as the original case is written),
-   which is the same ownership rule under a second kind of variable in
-   every rule.
-3. **Copy-in moves when the place is exclusive, else retains (§3.13).**
-   Recommend: yes; it is the only route to in-place updates through
-   user-defined `&` functions, the condition is syntactic (plus a
-   count test for fields), and the interpreter implements the same rule
-   so allocations match. Alternative: always retain, so the first update
-   in every `&` call copies (types Open decision 3).
-4. **`&(. x f)` places (a mutable borrow of one field of a unique
-   struct).** Recommend: yes; it is what lets `Vec`'s tail be updated in
-   place from library code. Alternative: cell variables only, with
-   `Vec`/`Map` as runtime builtins whose in-place paths are not written in
-   fibber.
-5. **`set!` and `reset!` return `unit`; `swap!` returns the new value.**
-   Recommend: as stated (one extra `@n` in case 05). Alternative: `set!`
-   returns the stored value (case 05 verbatim), at the cost of a
-   retain/release pair per discarded `set!` in the interpreter.
-6. **Shadowing allowed; liar ADR 006 dropped.** Recommend: yes; nested
-   `let`s and macro-introduced bindings need it and the checker keys on
-   binding sites. Alternative: keep the ban.
-7. **Unhygienic macros with `gensym`, run by the reference interpreter,
-   with struct reflection (item 26) and multi-form top-level expansion
-   through a spliced `do` (item 24).** Recommend: yes. Alternative:
-   renaming hygiene (a much larger expander) or no reflection (no
-   `derive`).
-8. **Literal vectors and maps desugar to `conj`/`assoc` chains after
-   expansion; inside quotes they stay `Vec`/`Map` forms.** Recommend: yes.
-   Alternative: variadic `vector`/`hash-map` core forms.
-9. **`Option` behaves as an ordinary enum (it is built in only because
-   `nil` is a literal, item 28); no implicit lifting, no `nil?`
-   narrowing in `if`.** Recommend: yes; every coercion the inference
-   draft proposed was shown to make acceptance order-dependent, and
-   `if-let` covers the idiom. Alternative: `T ↝ (Option T)` at argument
-   positions plus narrowing (types Open decision 12).
-10. **No literal polymorphism: `1 : i64`, `1.0 : f64`, widths by suffix.**
-    Recommend: yes; no defaulting search, and `(+ x 1)` pins `x` to
-    `i64`, which is what liar's prelude assumed anyway. Alternative:
-    `Num a ⇒ a` literals with defaulting.
-11. **No vector patterns and no `:when` guards in `match` (v1).**
-    Recommend: yes; `Vec` is a library type and guards need fallthrough.
-    Alternative: add both once `Vec` has a core view.
-12. **Variant names unqualified and unique per namespace.** Recommend:
-    yes. Alternative: `Name/variant`.
-13. **`first`/`nth` trap on an empty or out-of-range collection.**
-    Recommend: yes (keeps case 01 as written); `first?`/`nth?` return
-    `(Option T)`. Alternative: `first : (Option e)` always, and case 01
-    gains a `match`.
-14. **Cases 05, 08, 15 and 19 are rewritten as shown.** Sign off that
-    each still exercises its rule: two escaping closures sharing a cell;
-    an iteration holding a count while `&` updates copy; a cycle through
-    exactly one cell; a weak back-pointer that is `nil` for the root and
-    `nil` after the target dies.
-15. **Non-final `do` steps may have any type.** Recommend: yes (case 16
-    and every `pmap` body discard a value). Alternative: `unit` only,
-    with a `(discard e)` builtin.
-16. **Signed integer overflow wraps (two's complement).** Recommend: yes
-    for v1: it is what lIR emits and what the interpreter can match
-    exactly. Alternative: trap on overflow (needs lIR to expose the
-    overflow intrinsics) with `wrapping-*` variants.
-17. **`loop`/`recur` are core forms (§3.18); `while`, `dotimes` and
-    `for-each` over a range expand to them.** Recommend: yes; a loop
-    body is then part of its function, so an `&` place updated in a loop
-    stays exclusive and updates in place, and an `await` in a loop inside
-    an `async` is legal. Alternative: keep loops as named `fn`s, let the
-    exclusivity rule see through non-escaping closures with the extra
-    condition that no other argument of the call can reach a closure
-    capturing the place (a re-entrancy check), and let the `await` check
-    see through a named `fn` called only at its literal.
-18. **A field-less variant is written bare in expressions (`empty`,
-    `nil`) and as `(Variant)` in patterns (§3.6, §3.9).** Recommend: yes;
-    `nil` already works this way, and `(empty)` was a call to a value of
-    non-function type that the typing rules reject, which broke the
-    normative `list` expansion used by cases 01 and 05. Alternative:
-    accept `(V)` as the constant in expressions too.
-19. **Instance contexts are declared with `:where` on `impl` (§3.10).**
-    Recommend: yes; a `defun` that calls a method is generalised before
-    any impl body is checked (types §3.5), so the context must exist
-    without inferring the bodies, exactly as method signatures must.
-    Alternative: infer contexts by putting impl bodies into the call
-    graph (types §10 item 20).
-20. **`raw-retained`/`release-raw` replace `extern`'s `:retains`
-    (§3.15).** Recommend: yes; extern positions are scalars, so
-    `:retains` named parameters that cannot exist. Alternative: object
-    types allowed at `:retains` positions of an extern signature, with
-    the foreign side calling `fib_release`.
-21. **`main` returning waits for every spawned thread (§3.12).**
-    Recommend: yes; a discarded task then finishes and the audit sees a
-    quiescent heap. Alternative: detach on exit and exclude the running
-    threads' objects from the audit.
-22. **A `defun` is an async function iff an `async` in its body
-    mentions one of its `&` parameters or is the body's value (§3.1,
-    §3.13 rule 3).** Recommend: yes; the earlier definition (any
-    `defun` containing an `async`) rejected `(defun bump (&v) (let ((n
-    (block-on (async ..)))) (push! &v n)))`, an in-out buffer filled
-    from a task's result, although no frame outlives the call and the
-    task cannot reach the private cell: no expression has the cell as
-    its value (rule 5), and a closure that captures it and is captured
-    by the `async` is escaping (rule 2) and `local` (types §5). Case 14
-    keeps its verdict on both counts. Alternative: keep the broad
-    definition and write such functions with a plain parameter and a
-    returned value.
-23. **`:borrow` on `defun` parameters, spelled `p :borrow` or `p: T
-    :borrow`, with the same flat spelling for `defprotocol` (§3.1,
-    §3.10).** Recommend: yes; types §6.4 already checked the annotation
-    and the grammar had no place for it, and the flat spelling is what
-    `x: T` already is (two forms; here three). Alternative: delete the
-    annotation from types §6.4 and let summaries be inference results
-    only, which leaves no way to make a summary part of an interface.
-24. **A top-level `(do f₁ .. fₙ)`, written or produced by a macro,
-    splices into the module as n top-level forms expanded in order (§2,
-    §3.16).** Recommend: yes; a macro returns one `Form`, and
-    `defrecord`-style macros and any macro that emits a definition plus
-    its instances need to return several; `do` had no top-level meaning
-    to lose. Alternative: a dedicated head such as `splice`, which keeps
-    `do` uniform at the cost of a name whose only meaning is at top
-    level.
-25. **`(def name expr)` for constant expressions, evaluated once before
-    `main`, immortal (§3.19).** Recommend: yes; it reverses the
-    synthesis's rejection of `defconst` ("not needed by any case"):
-    liar's libraries spell every constant as a nullary function, which
-    for a table or a keyword map allocates on every call and cannot be
-    shared across threads without a `plet`, while the immortal
-    mechanism the runtime already has for literals covers it exactly.
-    Alternative: no `def` (constants stay nullary functions), or a
-    `defconst` restricted to scalars.
-26. **Expansion-time reflection also returns type parameters and field
-    types (`struct-params`, `struct-field-types`), and `derive` emits
-    the head and the `:where` context from them (§3.16, §4.4).**
-    Recommend: yes; without them `derive` cannot be written for any
-    generic struct, which includes every struct with an unannotated
-    field (§3.7), because an `impl` head must apply the constructor to
-    its parameters and its context must be declared (item 19).
-    Alternative: `(derive Eq (Pair a b) :where ((Eq a) (Eq b)))` with
-    the head and context written by the programmer, or inferred
-    contexts for derived impls only (types §10 item 20's alternative,
-    for one macro).
-27. **Expansion-time reflection for enums (`enum?`, `enum-params`,
-    `enum-variants`), `derive` extended to enums with a nested `match`
-    on both operands, built-in `Eq`/`Ord`/`Hash`/`Show` for field-less
-    enums, and the prelude deriving all four for `Option` and `List`
-    (§3.16, §4.4; types §2.12).** Recommend: yes; without it `Eq`,
-    `Ord`, `Hash` and `Show` for every sum type, the library's `Option`
-    and `List` included, had to be written by hand as nested matches
-    growing with the square of the variant count, while structs got
-    them from one `derive`. Alternative: `derive` for structs only,
-    with the library instances written by hand.
-28. **`Option` is built in, not declared in the prelude; `nil` is a
-    reader literal whose form `(Nil)` the expander accepts as the
-    constant in expressions and patterns, and a macro-built symbol
-    `nil` or pattern `(nil)` means the same (§1.1, §3.9, §3.16).**
-    Recommend: yes; the declaration `(defenum (Option a) (nil) (some
-    v: a))` cannot be read, since `nil` reads as `(Nil)`, and making the
-    expander accept the reader's form is what lets a macro emit `nil`
-    through a quasiquote without a special case. Alternative: read
-    `nil` as the symbol `(Sym "nil")` and drop `Nil` from `Form`, so
-    that `Option` becomes a prelude enum with a variant named `nil`; a
-    larger change to the reader tables for the same programs.
-29. **`def`s are nodes of the dependency order: a `def` is typed after
-    the functions it names and before the functions that read it, a
-    `def`–`defun` cycle is an error, and a `def` naming a generic
-    function is annotated (§3.19; types §2.16, §3.5).** Recommend:
-    yes; a `def` was typed before any `defun` had a scheme, so the
-    grammar's "a named function as a value" could not be typed at all,
-    an unannotated generic function has no closed type to give a
-    `def`, and "contains no other call" was false for every literal
-    collection, which §1.4 rewrites into prelude calls. Alternative:
-    type a `def`–`defun` cycle as one SCC (the `def` then makes its
-    functions monomorphic in it), or forbid naming functions in a `def`
-    and spell function tables as nullary functions.
+- **D1** copy-in always acquires; no copy-in move, no exclusive places,
+  no takeable structs, no taken fields, no field places (§3.13);
+- **D2** `&` parameters are cells read with `@v`, never values (§3.13);
+- **D3** HM inference generalising only at top-level `defun` SCCs, no
+  coercions, no literal polymorphism (§1.1, §3.9; types §3);
+- **D4** closure colours as the two-point lattice (§3.12; types §5.4);
+- **D5** full tail calls with inferred owned/borrowed parameters,
+  replacing "only self tail calls become loops" (§2, §3.1, §3.13,
+  §3.18; types §6.10);
+- **D6** stack allocation of scope-local objects in v1 (§3.3; types
+  §6.11);
+- **D7** `async` captures must be `Send`; the executor is
+  multi-threaded (§3.12, §3.14).
+
+Each item is now **Decided** in the section that states its rule; the
+old numbering is kept here because the drafts and
+`spec/drafts/PROPOSED_CASES.md` cite it. The one question that
+applying D5 raised (forwarding an `&` parameter beyond the self call at
+its own position) is recorded in types §10.
+
+| Item | Rule | Now in |
+|---|---|---|
+| 1 | `&` only on `defun` parameters; `fn` has none | §3.2 |
+| 2 | `&` parameters are cells, read with `@v`, not values (D2) | §3.13 |
+| 3 | copy-in moves when exclusive — **decided the other way (D1): always acquire** | §3.13 |
+| 4 | `&(. x f)` field places — **decided the other way (D1): variables only** | §3.13, §3.8 |
+| 5 | `set!`/`reset!` return `unit`; `swap!` the new value | §3.11, Appendix A case 05 |
+| 6 | shadowing allowed; liar ADR 006 dropped | §3.3 |
+| 7 | unhygienic macros with `gensym`, run by the interpreter | §3.16 |
+| 8 | literal collections desugar to prelude calls | §1.4 |
+| 9 | `Option` an ordinary enum; no lifting, no narrowing (D3) | §3.9 |
+| 10 | no literal polymorphism (D3) | §1.1 |
+| 11 | no vector patterns, no guards in v1 | §1.4, §3.6 |
+| 12 | variant names unqualified, unique per namespace | §3.9 |
+| 13 | `first`/`nth` trap; `first?`/`nth?` return `Option` | Appendix A case 01 |
+| 14 | cases 05, 08, 15, 19 rewritten as shown | Appendix A |
+| 15 | non-final `do` steps may have any type | §3.5 |
+| 16 | signed overflow wraps | types §2.12 |
+| 17 | `loop`/`recur` core — **amended by D5: kept core for the two reasons §3.18 gives; semantics now the tail-call rule** | §3.18 |
+| 18 | field-less variant bare in expressions, `(V)` in patterns | §3.6, §3.9 |
+| 19 | instance contexts declared with `:where` | §3.10 |
+| 20 | `raw-retained`/`release-raw` replace `:retains` | §3.15 |
+| 21 | `main` waits for spawned threads | §3.12 |
+| 22 | async-function definition (mentions an `&` parameter, or is the value) | §3.1 |
+| 23 | `:borrow` on `defun` and method parameters | §3.1, §3.10 |
+| 24 | top-level `do` splices | §2, §3.16 |
+| 25 | `def` constants, immortal | §3.19 |
+| 26 | struct reflection: `struct-params`, `struct-field-types` | §3.16 |
+| 27 | enum reflection and `derive` on enums | §3.16, §4.4 |
+| 28 | `Option` built in; `nil` a reader literal | §1.1, §3.9 |
+| 29 | `def`s are nodes of the dependency order | §3.19 |

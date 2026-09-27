@@ -35,8 +35,11 @@ not a rule the programmer has to satisfy. Its guaranteed minimum:
 - **Scope-local objects are not counted.** An object created in a scope
   that never escapes it (§3) is freed when the scope ends, with no count
   operations, and may be allocated on the stack.
-- **Parameters are borrowed.** Passing an object to a function costs
-  nothing. The callee counts it only if it makes it escape.
+- **Parameters are borrowed** unless the compiler must own the
+  parameter to keep a tail call a tail call, in which case the caller
+  hands the count over and the callee releases it. Passing an argument
+  still costs nothing in the borrowed case, and the callee counts a
+  borrowed parameter only if it makes it escape.
 - **Unique updates happen in place.** Updating an object whose count is
   one reuses it instead of copying (§5).
 
@@ -52,15 +55,21 @@ A reference **escapes** its scope when it is:
 2. stored into an object (a struct field, a collection, a cell);
 3. captured by a closure that itself escapes;
 4. passed to another thread (`plet`, `pmap`, a task);
-5. held across an `await` (§8).
+5. held across an `await` (§8);
+6. passed as an argument of a tail call (§4): the caller's frame is
+   gone while the callee runs.
 
 A reference that escapes is counted (+1) at the point of escape. Nothing
 else is.
 
 ## 4. Functions
 
-- Every parameter is a **borrow**: valid for the whole call, never freed
-  by the callee.
+- A parameter is a **borrow** unless the checker infers it **owned**.
+  The callee never frees a borrowed parameter: it is valid for the whole
+  call. An owned parameter is the callee's to release or hand on. Which
+  one applies is inferred and printed by the checker (types §6.4), never
+  written; the meaning of the program is unchanged: the same objects
+  are freed, at the same points.
 - Every result is **owned**: the caller receives +1 and is responsible
   for it.
 - Returning a parameter, or something reachable from a parameter, is an

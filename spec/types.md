@@ -1,9 +1,12 @@
 # fibber types and the ownership checker
 
-Status: synthesis of the three drafts under `spec/drafts/` (see
-`spec/drafts/SYNTHESIS.md`). Authority: [ownership.md](ownership.md) is
-Decided. **Decided** marks a direct consequence of ownership.md;
-**Proposed** marks everything else. Surface syntax is in
+Status: signed off. This file grew out of the three drafts under
+`spec/drafts/` (see `spec/drafts/SYNTHESIS.md`); on 2026-09-27 the owner
+accepted every open decision of the three review rounds as recommended,
+with the amendments D1–D7 listed in §10. Every rule here is now
+**Decided** unless marked **Proposed**; a "D*n*" beside a rule names
+the amendment it comes from. Authority: [ownership.md](ownership.md) is
+Decided and wins where the two meet. Surface syntax is in
 [syntax.md](syntax.md) ("syntax §n"); "§n" alone is ownership.md.
 
 Organising principle: the type system exists so that every rule of
@@ -16,7 +19,7 @@ be printed and diffed against the reference interpreter's trace.
 Contents: §1 type grammar · §2 typing rules per core form · §3 the
 inference algorithm · §4 protocol dispatch · §5 threads: `Send` and
 closure colours · §6 the ownership checker, rule by rule · §7 case table
-· §8 mapping to lIR · §9 what the checker prints · §10 open decisions.
+· §8 mapping to lIR · §9 what the checker prints · §10 decision record.
 
 ---
 
@@ -46,13 +49,13 @@ Scalars are copied and have no identity, no count and no mode (**Decided**,
 `float`/`double`; `char` is a Unicode scalar value in an `i32`; `keyword`
 an interned id in an `i64`; `unit` has the one value `()` and is erased
 in codegen; `ptr` is a raw pointer, usable only inside `unsafe`. No
-implicit conversion exists between any two scalar types (Proposed;
-consistent with lIR's no-promotion rule, liar ADR 017 is out).
+implicit conversion exists between any two scalar types (**Decided**,
+D3; consistent with lIR's no-promotion rule, liar ADR 017 is out).
 
 An integer literal has the width of its suffix, `i64` without one; a
 float literal `f64` unless suffixed `f32`. There is no literal
-polymorphism (syntax Open decision 10): `(+ x 1)` pins `x : i64`;
-`(+ x 1i32)` pins `i32`.
+polymorphism (**Decided**, D3: no defaulting search): `(+ x 1)` pins
+`x : i64`; `(+ x 1i32)` pins `i32`.
 
 ### 1.2 Objects
 
@@ -86,7 +89,7 @@ variables are protocol constraints and `Send`, inferred from its body
 (§3.6); they may also be written in an annotation: `(x: (Vec a))` with
 `(Countable a)` is written as a constraint list after the parameters
 (syntax §3.1), `(defun f (x: (Vec a)) :where ((Show a)) -> str ...)`
-(Proposed; rarely needed on a `defun`, since bounds are inferred;
+(**Decided**; rarely needed on a `defun`, since bounds are inferred;
 required on a generic `impl`, whose context is declared, §2.7).
 
 Recursion is allowed only through a nominal type: a struct or enum may
@@ -115,16 +118,18 @@ inferred code. In an annotation, an omitted colour means:
   a constant expression can build are named functions and constructors,
   which are `send`.
 
-Closure types carry no capture list and no escape summary (Proposed;
-§10 item 5): a call through a function value treats every argument as
-escaping (§6.4), which is always safe.
+Closure types carry no capture list, no escape summary and no count
+kinds (**Decided**): a call through a function value treats every
+argument as escaping (§6.4), which is always safe, and hands every
+object argument and the closure itself over owned (the closure
+convention, §6.4, D5).
 
 A `defun` with `&` parameters has a **signature** `(fn ((& T₁) T₂ ..) R)`
-rather than a type: it can be called with `&place` at those positions
+rather than a type: it can be called with `&x` at those positions
 and may not be referenced as a value (`function with & parameters is
 not a value`). Inside its body an `&` parameter `v` has type `(Cell T)` and is not a
-value: it occurs only as `@v`, `&v`, `&(. v f)` or the target of `set!`
-(syntax §3.13, §2.14).
+value: it occurs only as `@v`, `&v` or the target of `set!`
+(syntax §3.13, §2.14; **Decided**, D2).
 
 ### 1.5 `Option` and `nil`
 
@@ -158,8 +163,8 @@ are (§8.1). The prelude derives `Eq`, `Ord` (`nil` before `some`),
 
 A protocol `P` is not a type. `(dyn P)` is: the type of a value of some
 unknown type implementing `P`, carrying its dispatch table (§4.4). It is
-produced only by the explicit primitive `(dyn P e)` (Proposed: no
-subtyping, no coercion anywhere in the type system; §10 item 12).
+produced only by the explicit primitive `(dyn P e)` (**Decided**, D3: no
+subtyping, no coercion anywhere in the type system).
 
 ### 1.8 Constraints and schemes
 
@@ -194,7 +199,7 @@ variables and emits its constraints.
 | integer literal | its width (`i64` default); float literal `f32`/`f64` (`f64` default) |
 | `"s"`, `\c`, `true`/`false`, `:k`, `()` | `str`, `char`, `bool`, `keyword`, `unit` |
 | `nil` (the reader's `(Nil)` form, or the symbol `nil` a macro built; syntax §3.9) | `inst(∀a. (Option a))`; `(nil)` is the error `nil is a constant, not a function; write nil` (§2.2) |
-| `x` bound locally | `Γ(x)`, monomorphic; an `&` parameter `v` has `Γ(v) = (Cell T)` but is not an expression: it occurs only as `@v`, `&v`, `&(. v f)` or the target of `set!` (§2.14), else `& parameter v used as a value in f` |
+| `x` bound locally | `Γ(x)`, monomorphic; an `&` parameter `v` has `Γ(v) = (Cell T)` but is not an expression: it occurs only as `@v`, `&v` or the target of `set!` (§2.14), else `& parameter v used as a value in f` |
 | `f` a global defun, constructor, variant constant or protocol method | `inst(σ_f)`; error if `f` has `&` parameters (`function with & parameters is not a value`) |
 | `g` a `def` name (syntax §3.19) | `Γ(g)`, its closed monomorphic type (§2.16); a global like `f`, never a capture |
 | `[e₁ .. eₙ]`, `{k v ..}` | rewritten to prelude calls before typing (syntax §1.4) |
@@ -204,18 +209,16 @@ variables and emits its constraints.
 
 ```
 (f a₁ .. aₙ)     f : (fn κ (T₁ .. Tₙ) R),  aᵢ : Tᵢ          ⇒ R
-(g .. &p ..)     g a defun or protocol method with & at that position of value type T;
-                 p a place (syntax §3.13) of type (Cell T)      ⇒ ok for that position
+(g .. &x ..)     g a defun or protocol method with & at that position of value type T;
+                 x a variable (syntax §3.13) of type (Cell T)   ⇒ ok for that position
 ```
 
 Arity must match exactly. Head position may be any expression of function
-type; a call to a `defun` or method instantiates its scheme. `&p` at a
+type; a call to a `defun` or method instantiates its scheme. `&x` at a
 non-`&` position, or a plain argument at an `&` position, is a type
-error (`parameter v of g is &; pass &x`). A place `(. x f)` requires `x`
-to be a variable of type `(Cell S)` and `f` a field of object type of
-the struct `S` (§2.14). A field-less variant is a constant, not a
-function: `(V)` with zero arguments is the error `V is a constant, not a
-function; write V` (syntax §3.9).
+error (`parameter v of g is &; pass &x`). A field-less variant is a
+constant, not a function: `(V)` with zero arguments is the error `V is
+a constant, not a function; write V` (syntax §3.9).
 
 ### 2.3 `defun`, `fn`
 
@@ -244,7 +247,7 @@ not in tail position of its loop body, that is outside any `loop`, or
 that sits inside a `fn` or `async` literal nested in the loop, is
 `recur not in tail position` / `recur outside loop` (syntax §3.18).
 
-`let` never generalises (Proposed; §10 item 1): `(let ((id (fn (x) x)))
+`let` never generalises (**Decided**, D3): `(let ((id (fn (x) x)))
 (id 1) (id "a"))` is a type error. Because of this a cell created in a
 `let` cannot acquire a polymorphic type, so no value restriction is
 needed: `(let ((c (cell nil))) (set! c (some 1)) (set! c (some "a")))`
@@ -291,7 +294,7 @@ patterns (syntax §3.3).
 |---|---|
 | `(defstruct (N ā) (f₁: T₁ ..))` | registers `N` of arity |ā|; constructor `N : ∀ā. (fn :send (T₁ ..) (N ā))`; field types well formed and closed under `ā`; recursive occurrences only through annotated fields |
 | `(defenum (N ā) (V₁ T̄₁) ..)` | `Vᵢ : ∀ā. (fn :send (T̄ᵢ) (N ā))`, or `∀ā. (N ā)` for a field-less variant |
-| `(defprotocol (P s d̄) (m (self x₁: T₁ ..) -> R) ..)` | `m : ∀ s d̄ b̄. (P s d̄) ⇒ (fn :send (s T₁ ..) R)` where `b̄` are the signature's other variables; the functional dependency `s → d̄` is recorded; each parameter's escape kind (`:borrow` or the default, escaping) is recorded (§6.4) |
+| `(defprotocol (P s d̄) (m (self x₁: T₁ ..) -> R) ..)` | `m : ∀ s d̄ b̄. (P s d̄) ⇒ (fn :send (s T₁ ..) R)` where `b̄` are the signature's other variables; the functional dependency `s → d̄` is recorded; each parameter's escape kind (`:borrow` or the default, escaping) and count kind (`:owned` or the default, borrowed) are recorded (§6.4) |
 | `(impl (P D̄) (K ā) :where (C) (m (self x̄) b) ..)` | registers the instance `∀ā. (P (K ā) D̄) ⇐ C` where `C` is the **declared** context (`:where`; empty when omitted; Paterson condition, §3.3), known before any body is typed (§3.5; §10 item 20); each body is typed against the signature with `s := (K ā)` rigid, `d̄ := D̄`, under the bounds `C`, and must not be more specific; a body whose constraints are not entailed by `C` is `no implementation of P for a; add (P a) to the :where of the impl`; every method present, none extra; one instance per `(P, K)` in the program; each body's escape summary must respect the declared kinds (§6.4) |
 
 ### 2.8 `async`, `await`, `unsafe`, `extern`, `quote`, `defmacro`
@@ -372,8 +375,9 @@ not : (fn :send (bool) bool)
 `Self` in a signature stands for the dispatch type, so `(+ a b)` unifies
 both operands: `(+ (i32 1) 2)` is a type error, never a promotion.
 `(defun add (a b) (+ a b))` is `∀a. (Num a) ⇒ (fn :send (a a) a)`. Integer
-division and remainder trap on zero; signed overflow wraps (Proposed;
-syntax Open decision 16). Conversions are primitive forms whose first
+division and remainder trap on zero; signed overflow wraps (**Decided**:
+it is what lIR emits and what the interpreter can match exactly).
+Conversions are primitive forms whose first
 operand is a type: `(trunc i8 e)`, `(zext i64 e)`, `(sext i64 e)`,
 `(fptrunc f32 e)`, `(fpext f64 e)`, `(fptosi i64 e)`, `(fptoui i64 e)`,
 `(sitofp f64 e)`, `(uitofp f64 e)`, `(char->i32 e)`, `(i32->char e)`
@@ -398,7 +402,7 @@ a) :where ((Eq a)) ..)` to the `i64` instance (proposed case 48).
 `(Array T)` is the primitive fixed-size immutable array on which the
 library builds `Vec` (32-way trie), `Map` and `Set` (HAMT) and `str`
 operations, exactly as liar's `lib/` does with `heap-array`, but typed
-and counted (Proposed):
+and counted (**Decided**):
 
 ```
 array      : ∀a. (fn :send (i64 a) (Array a))                     ; n copies of init (each stored: E2)
@@ -418,17 +422,18 @@ library code over them.
 
 In `(defun f (&v ..) b)`, `Γ(v) = (Cell T)` with `T` the annotation or
 fresh; `T` is unified by the uses of `@v`, `&v`, `(set! v e)` and the
-primitives. `v` itself is not an expression (Proposed; syntax §3.13; §10
-item 19): the only forms in which it may occur, in `b` and in every
-closure literal inside `b`, are `@v` (`(deref v)`), `&v`, `&(. v f)` and
-`(set! v e)`; any other occurrence is `& parameter v used as a value in
-f`. So no expression ever has the private cell as its value, and the
-checker assigns no mode to `v` (§6.6). At a call, `&x` requires `x :
-(Cell T)` for the parameter's `T`; `&(. x f)` requires `x : (Cell S)`
-with `HasField(S, f, T)`, i.e. the struct `S` in `x` to have the field
-`f : T` of object type; `x` may be an `&` parameter or any other
-variable of cell type (syntax §3.13). Any other `&` argument is `&
-argument must be a cell variable or a field of a cell variable`.
+primitives. `v` itself is not an expression (**Decided**, D2; syntax
+§3.13): the only forms in which it may occur, in `b` and in every
+closure literal inside `b`, are `@v` (`(deref v)`), `&v` and `(set! v
+e)`; any other occurrence is `& parameter v used as a value in f`. So
+no expression ever has the private cell as its value, and the checker
+assigns no mode to `v` (§6.6): the private cell is a stack object of
+the caller's frame, so `(defun leak (&v) v)` would return a pointer to
+memory freed at the write-back, as would `(cell v)`, `(weak v)` and a
+non-escaping closure returning `v`. At a call, `&x` requires `x : (Cell
+T)` for the parameter's `T`; `x` may be an `&` parameter or any other
+variable of cell type (syntax §3.13; there is no field place, D1). Any
+other `&` argument is `& argument must be a cell variable`.
 
 ### 2.15 `dyn`
 
@@ -458,7 +463,7 @@ calls that the literal-collection rewrite introduces (`vec-empty`,
 `conj`, `map-empty`, `assoc`; syntax §1.4): these are the only calls a
 constant expression contains. A `def` that names a `defun` which reads
 it, directly or through other functions, is the error `def g and defun
-f depend on each other` (Proposed; syntax Open decision 29). `T` is
+f depend on each other` (**Decided**). `T` is
 never generalised, and a type variable left in it is `def g has an
 unresolved type; annotate it`: a `def` naming a generic function
 (`(def twice-fn double)` with `double : ∀a. (Num a) ⇒ (fn (a) a)`) must
@@ -481,7 +486,7 @@ reading it is a count-free `Borrowed(g)` (§6.1).
 
 ## 3. The inference algorithm
 
-**Name (Proposed):** constraint-based Hindley–Milner with generalisation
+**Name (Decided, D3):** constraint-based Hindley–Milner with generalisation
 only at top-level `defun` SCC boundaries (Rémy levels), qualified types
 whose protocol constraints have one dispatch parameter and functionally
 determined extra parameters (Jones-style improvement), deferred
@@ -551,7 +556,7 @@ resolved by the `Accounts` constructor in the closure body; case 19's
 `add-child` by `(weak parent)` unifying with `(Weak Node)`; case 19's
 `depth` has only a field access and a recursive call, so it annotates
 `n`. There is no search for "the unique struct that has a field `f`"
-(Proposed; §10 item 13).
+(**Decided**).
 
 ### 3.5 Per-module algorithm
 
@@ -575,10 +580,11 @@ resolved by the `Accounts` constructor in the closure body; case 19's
    c. run the deferred worklist to a fixpoint (§3.3)
    d. solve colour constraints (§5.4)
    e. generalise (§3.6); check ambiguity; report unresolved HasField/HasDeref
-   f. run the ownership pass on the SCC (§6): summaries as a fixpoint within the SCC
+   f. run the ownership pass on the SCC (§6): escape summaries and count kinds as one fixpoint
+      within the SCC (§6.4), then the tail-call decisions of §6.10
 6. type-check impl method bodies against their signatures under their declared contexts (§2.7);
    each impl is its own SCC and may call any defun, whose schemes are complete by now because
-   instance contexts are declared, not inferred from these bodies (§10 item 20)
+   instance contexts are declared, not inferred from these bodies (**Decided**)
 7. check main : (fn () i64)
 8. export the interface (§3.9)
 9. monomorphise from main and from every impl reachable through a (dyn P) (§4.3)
@@ -645,8 +651,9 @@ occurrences. Mutually recursive `defun`s get one scheme each.
 
 Inferred without annotation: all local types, `defun` parameter and
 result types, closure types and colours, protocol constraints, `Send`
-bounds, instantiations at every call, escape summaries, escaping
-closures, allocation sites.
+bounds, instantiations at every call, escape summaries, count kinds
+(owned or borrowed, §6.4), tail calls (§6.10), escaping closures,
+allocation sites (stack or heap, §6.11).
 
 | Situation | Why | Annotation |
 |---|---|---|
@@ -668,7 +675,8 @@ closures, allocation sites.
 
 A module exports, per definition: the closed scheme (with colour
 variables and their `⊑` constraints, bounds, `&` positions), the escape
-summary of every parameter (§6.4), for a `def` its closed type (§2.16),
+summary and count kind of every parameter (§6.4), for a `def` its
+closed type (§2.16),
 for structs and enums the layout
 (§8), for protocols the signatures with escape kinds and fundeps, every
 instance, every macro as forms, and the bodies of generic `defun`s
@@ -692,7 +700,8 @@ determined by `s` (one instance per head constructor of `s`, and it fixes
 program (checked per module and again at monomorphisation). An instance
 may carry a context (`(impl Eq (Vec a) :where ((Eq a)) ..)`), declared
 on the `impl` and exported (§2.7). Instances for bare type variables and
-overlapping instances are rejected (Proposed; §10 item 15). Protocol
+overlapping instances are rejected (**Decided**; no default methods, no
+supertraits in v1). Protocol
 parameters are output positions: `(Deref (Cell i64) t)` yields `t = i64`
 without annotation.
 
@@ -717,7 +726,7 @@ instance reachable through a `(dyn P)`, each call to a polymorphic
 `defun` or generic `impl` method at instantiation `T̄` creates the
 specialisation `f<T̄>` if absent, recursively. The key of a
 specialisation has one component per quantified type variable of the
-scheme (Proposed; §10 items 7 and 28):
+scheme (**Decided**):
 
 - a variable that carries a **protocol bound** in the scheme's context
   (directly, or at the dispatch or a determined position of any of its
@@ -828,7 +837,7 @@ otherwise `value of type T cannot be shared between threads: <path>`
 (a `ptr`, a `local` closure captured by a closure that must be `send`, a
 `dyn`). The first clause is the canonical text of case 13.
 
-### 5.4 Closure colours (Proposed)
+### 5.4 Closure colours (Decided, D4)
 
 Every function type carries a colour κ ∈ {`send`, `local`} or a colour
 variable ς, with `send ⊑ local`. Constraints:
@@ -889,14 +898,16 @@ below, which is safe (its instantiations are handled by the runtime
 functions of §8.2). The pass uses no information beyond the syntax tree,
 the types, the capture sets of closures and the **summaries** of callees
 (§6.4). It computes, and can print (§9), the **mode** of every
-object-typed expression, the kind of every binding, whether each closure
-literal escapes, the copy-in decision at every `&` argument, and the
+object-typed expression, the kind of every binding and whether it lives
+on the stack (§6.11), the count kind of every parameter (§6.4), whether
+each closure literal escapes and whether it is on the heap (§6.5),
+whether each call in tail position is a tail call (§6.10), and the
 retain/release operations to emit. Scalars are ignored throughout: a
 rule that says "retain" is a no-op on a scalar-typed expression.
 
 ### 6.1 Modes and bindings
 
-Every object-typed expression has one of three modes (Proposed; the
+Every object-typed expression has one of three modes (**Decided**; the
 calculus of the ownership draft):
 
 | Mode | Meaning |
@@ -912,17 +923,17 @@ alive. Every binding is one of:
 
 | Kind of binding | Reading it yields | Released at its scope end? |
 |---|---|---|
-| **owning**: a `let` binding whose initialiser is `Owned`; a capture of an escaping closure; a parameter slot of a self-tail-call loop (§6.10); an implicit temporary | `Borrowed(b)` | yes, unless moved out |
-| **parameter** (a plain parameter of a `defun`, `fn` or method) | `Borrowed(b)` | no (**Decided**, §4) |
+| **owning**: a `let` binding whose initialiser is `Owned`; a capture of a heap closure (§6.5); an **owned** parameter (§6.4), which every object parameter of a `fn` is; a loop variable (§6.10); an implicit temporary | `Borrowed(b)` | yes, unless moved out |
+| **borrowed parameter** (a plain parameter of a `defun` or method whose count kind is borrowed, §6.4) | `Borrowed(b)` | no (**Decided**, §4): a frame below holds it |
 | **`&` parameter** (its value is its private cell, which is never an expression: syntax §3.13) | never read: `@v` is `Owned`, `&v` forwards the cell, `(set! v e)` writes it (§6.6) | no (the cell is the caller's) |
-| **alias of `b'`**: a `let` binding whose initialiser is `Borrowed(b')`; a capture of a non-escaping closure; a pattern variable that binds the *whole* scrutinee (a top-level symbol pattern or a top-level `:as`) of a scrutinee whose mode is `Borrowed(b')` | `Borrowed(b')` | no count |
+| **alias of `b'`**: a `let` binding whose initialiser is `Borrowed(b')`; a capture of a stack closure (§6.5); a pattern variable that binds the *whole* scrutinee (a top-level symbol pattern or a top-level `:as`) of a scrutinee whose mode is `Borrowed(b')` | `Borrowed(b')` | no count |
 | **derived of `b'`**: a `let` binding whose initialiser is `Derived(b')`; a pattern variable bound *inside* a variant or struct pattern (a payload or a field) of a scrutinee whose binding is `b'`; a whole-scrutinee pattern variable of a scrutinee whose mode is `Derived(b')` | `Derived(b')` | no count |
 | **global**: a `def` name (syntax §3.19, §2.16) | `Borrowed(g)` | never: its value is immortal (§8.2), so every count operation `consume` would emit on it is a no-op the compiler may omit |
 
 `Derived(b)` always names a *strict* sub-object of `b`'s value, reached
 through a field, an element or a variant payload; a pattern variable
 that binds the whole scrutinee is the scrutinee's value and takes the
-scrutinee's mode (Proposed; §10 item 18). The escape summary of §6.4
+scrutinee's mode (**Decided**). The escape summary of §6.4
 relies on exactly this distinction.
 
 ### 6.2 Mode of each form
@@ -939,8 +950,8 @@ relies on exactly this distinction.
 | `(. e f)` | `Derived(b)` if `e` is `Borrowed(b)` or `Derived(b)`; if `e` is `Owned`, `e` becomes an implicit owning temporary `t` of the current step and the result is `Derived(t)` |
 | `(dyn P e)` | the mode of `e` |
 | `(let ..)` | the mode of its body, adjusted by the scope-exit rule (§6.3) |
-| `(loop ..)` | the mode of its body, adjusted by the scope-exit rule with the loop's slots as its owning bindings (§6.10) |
-| `(recur ..)` | no value; its arguments are consumed into the slots (§6.10) |
+| `(loop ..)` | the mode of its body, adjusted by the scope-exit rule with the loop variables as its owning bindings (§6.10) |
+| `(recur ..)` | no value: a tail call to the loop; its arguments are consumed into the loop variables (§6.10) |
 | `(do .. e)` | the mode of `e` |
 | `(if c a b)`, `(match ..)` | the **join** (§6.3) of the branch modes |
 | `(unsafe b)` | the mode of `b` |
@@ -950,8 +961,9 @@ relies on exactly this distinction.
 
 **Decided** (§3): a reference escapes when it is (1) returned, (2) stored
 into an object, (3) captured by a closure that escapes, (4) passed to
-another thread, (5) held across an `await`. Each is a position in the
-syntax, and one rule applies at every one of them:
+another thread, (5) held across an `await`, (6) passed as an argument
+of a tail call. Each is a position in the syntax, and one rule applies
+at every one of them:
 
 ```
 consume(e):   Owned        → move: no operation; the count travels with the value
@@ -966,20 +978,22 @@ consume(e):   Owned        → move: no operation; the count travels with the va
 | E3 | capture | each object capture of a `fn` that is escaping (§6.5) and of every `async`; the retain happens when the closure or task object is created |
 | E4 | thread | the argument of `spawn` (consumed; E3 already retained its captures) |
 | E5 | await | subsumed by E3: the task's frame owns everything it references (§6.9) |
+| E6 | tail call | the head and the arguments of a tail call (§6.10; **Decided**, D5), consumed for the callee's positions because the caller's frame is discarded at the jump; an owning binding of the frame that is an argument is moved rather than retained (its count travels), and an argument at a borrowed position emits nothing and must be frame-independent (§6.4) |
 
 Everything else emits no count operation:
 
 | Position | Rule |
 |---|---|
-| argument to a plain parameter of any callee, known or unknown | none (**Decided**, §4). An `Owned` argument is a temporary of the call step, released after the call returns and its write-backs are done |
+| argument at a **borrowed** position of a known callee, in an ordinary call (§6.4) | none (**Decided**, §4). An `Owned` argument is a temporary of the call step, released after the call returns and its write-backs are done |
+| argument at an **owned** position of a known callee, or any argument of a call through a closure value, in an ordinary call | `consume`: an `Owned` temporary is moved in, a `Borrowed`/`Derived` one retained; the callee releases it or hands it on (§6.4). This is not an escape of the caller's binding: what the callee keeps is what its summary says |
 | `let` binding `(x e)` | `e` `Owned`: `x` owns it. `e` `Borrowed(b)`/`Derived(b)` with `b` alive for `x`'s whole scope: `x` is an alias/derived binding of `b`, no count. `e` `Derived(t)` where `t` is a temporary of the initialiser step: the step is a scope (next row), so `x` owns a retained reference |
 | **scope exit** of a `let` with body mode `m`, or of a step with temporaries | if `m = Borrowed(x)` and `x` is an owning binding of this scope: **move out**: `x` is not released and the result is `Owned`. If `m = Derived(x)` and `x` owns in this scope: retain the result, then release the scope's owning bindings; result `Owned`. Otherwise release every owning binding of the scope in reverse order; result mode unchanged |
 | `match` scrutinee | `Owned`: an implicit owning binding `t` for the whole form; a pattern variable that binds the whole scrutinee is an alias of `t`, one bound inside a variant or struct pattern is derived of `t` (§6.1); the form's value is adjusted by the scope-exit rule with `t` as the scope. `Borrowed(b)`: whole-scrutinee variables are aliases of `b`, the rest derived of `b`. `Derived(b)`: every pattern variable is derived of `b` |
 | `let` with a pattern | as a one-clause `match` whose scope is the `let` |
-| **join** of `if`/`match` branches | all branches `Borrowed(b)` for one `b`: `Borrowed(b)`. All branches `Derived(b)` for one `b`: `Derived(b)`. Otherwise, including `Borrowed(b)` mixed with `Derived(b)`, `Owned`, and every branch that is not `Owned` gets a retain at its tail (**Decided** by case 04; the mixed case is Proposed, §10 item 18: read as `Derived(b)` it hid a `Borrowed(b)` occurrence from the escape summary of §6.4, and read as `Borrowed(b)` the scope-exit rule would move `b` out when the other branch had returned a sub-object of `b`, leaking `b`) |
+| **join** of `if`/`match` branches | all branches `Borrowed(b)` for one `b`: `Borrowed(b)`. All branches `Derived(b)` for one `b`: `Derived(b)`. Otherwise, including `Borrowed(b)` mixed with `Derived(b)`, `Owned`, and every branch that is not `Owned` gets a retain at its tail (**Decided** by case 04 and for the mixed case: read as `Derived(b)` it hid a `Borrowed(b)` occurrence from the escape summary of §6.4, and read as `Borrowed(b)` the scope-exit rule would move `b` out when the other branch had returned a sub-object of `b`, leaking `b`) |
 | non-final `do` step | `Owned`: release at the step's end |
-| `defun`/`fn` body (E1) | `consume` the body's value (every `let` and `match` inside it has already exited by the scope-exit rule, since they are expressions), then release the temporaries of the final step, then the loop slots of §6.10 if any |
-| `@c` read | always an acquire (+1) with a matching release at the end of the value's scope or step; **never elided** in v1 (Proposed; §10 item 4). No elision of a cell read is sound on syntax alone: a callee can reach the same cell through any argument, field or capture and write it; a sibling sub-expression of the same step can write it (`(array-get (. @s arr) (do (set! s ..) 0))` freed the array under the call when the read was elided); and `count`, `nth` and `+` are protocol methods with user implementations, so "writes no cell" is not a property the checker can decide by name |
+| `defun`/`fn` body (E1) | `consume` the body's value (every `let` and `match` inside it has already exited by the scope-exit rule, since they are expressions); an owned parameter whose value is the result is moved out, with no retain and no release; then release the temporaries of the final step, then the owned parameters not moved out (§6.4). A tail call in the body replaces all of this by the rule of §6.10 |
+| `@c` read | always an acquire (+1) with a matching release at the end of the value's scope or step; **never elided** in v1 (**Decided**). No elision of a cell read is sound on syntax alone: a callee can reach the same cell through any argument, field or capture and write it; a sibling sub-expression of the same step can write it (`(array-get (. @s arr) (do (set! s ..) 0))` freed the array under the call when the read was elided); and `count`, `nth` and `+` are protocol methods with user implementations, so "writes no cell" is not a property the checker can decide by name |
 | `&` copy-in and write-back | §6.6 |
 | `(weak e)` | no count operation; forces `e`'s binding onto the heap (§6.11) |
 | `(raw e)` | no count operation; `e`'s binding must outlive every use of the pointer (**Decided**, §9; the programmer's obligation inside `unsafe`) |
@@ -988,28 +1002,107 @@ These two tables *are* the escape classification. The checker walks the
 tree once, labels each object-typed expression with its position, and
 emits the operation from the tables; nothing else emits a count
 operation. Case 01: `first`'s body returns `Derived(self)` → E1 retain;
-`head` returns an `Owned` result → nothing; `main`'s `h` owns one count
-and `l`'s list holds the other; both released at scope exits. Case 03:
+`head`'s `(first xs)` is a tail call whose argument, a borrowed
+parameter, emits nothing (§6.10), and its `Owned` result is `head`'s;
+`main`'s `h` owns one count and `l`'s list holds the other; both
+released at scope exits. Case 03:
 the inner `let` binds `a` (`Owned`) and `b`; its body is `Borrowed(a)` →
 move out, `b` released; `keep` owns `a`'s vector. Case 04: `pick`'s `if`
 joins `Borrowed(x)` with `Owned` → retain on the `x` branch; the result
 is `Owned` on both paths.
 
-### 6.4 Borrowed parameters, owned results, summaries (§4)
+### 6.4 Borrowed and owned parameters, owned results, summaries (§4)
 
-**Decided** (§4): every parameter is a borrow, valid for the whole call
-and never freed by the callee; every result is owned; returning a
-parameter or something reachable from one is E1, so the callee retains.
-Correctness of the count never depends on the caller: the callee retains
-at its own escape positions, and a call is never an escape for the
-caller.
+**Decided** (§4, as amended by D5): every result is owned by the caller.
+Every object parameter has a **count kind**, `borrowed` or `owned`:
+inferred per `defun` and exported with it (§3.9), declared on protocol
+methods (`:owned`, default borrowed; syntax §3.10), and fixed at owned
+for closures. The kind is a calling convention, not a semantics: the
+counting semantics of §2 holds either way, the same objects are freed
+at the same points (§6.12), and no verdict depends on it.
+
+- A **borrowed** parameter is passed with no count operation and is
+  valid for the whole call because the caller, or a frame below it,
+  holds a count on it; the callee never releases it and retains at its
+  own escape positions, as §4 says. A `Borrowed(p)` occurrence at a
+  consume position is a retain.
+- An **owned** parameter arrives with one count: the caller `consume`s
+  the argument (moves an `Owned` temporary, retains a `Borrowed`/`Derived`
+  one, §6.3); the parameter is an owning binding of the callee's frame
+  (§6.1), released at the callee's exit on every path unless moved out —
+  returned (E1), stored (E2), captured by a heap closure (E3), passed to
+  `spawn` (E4) or passed at a tail call (E6) — in which case its count
+  travels. Correctness never depends on the caller: whoever holds a
+  count releases it or hands it on, and an ordinary call is never an
+  escape for the caller.
+
+At the machine level, then, every parameter is owned in the sense that
+the callee could release it; `borrowed` is the inference that the
+callee never needs to, so that the retain in the caller and the release
+in the callee can both be dropped, which is §2's "passing an argument
+costs nothing".
+
+**Which parameters are owned.** A parameter `p` of `f` is owned iff at
+least one of:
+
+1. `Borrowed(p)` occurs at a consume position other than a tail-call
+   argument: E1 (returned, directly or as the value of a scope exit that
+   moves `p` out), E2 (stored), E3 (captured by a heap closure), E4
+   (`spawn`), a join retain (§6.3), or the operand of `raw-retained`;
+2. `Borrowed(p)` is an argument of a tail call at an **owned** position
+   of the callee: the count is then moved on rather than retained by a
+   frame that is about to disappear;
+3. some tail call *to* `f` from inside `f`'s SCC passes, at `p`'s
+   position, a **frame-owned** argument: the caller's frame is
+   discarded at the jump, so nothing but `f` can release that count.
+
+An argument expression is **frame-owned** iff it is `Owned` and not
+immortal (a fresh object, a call result, a cell read), or it is
+`Borrowed(x)` or `Derived(x)` for a binding `x` that the caller's frame
+releases at its scope exit: an owning `let` binding, a loop variable, a
+`match` temporary, an owned parameter, an implicit temporary. It is not
+frame-owned when it is a borrowed parameter of the caller or derived
+from one (a frame below keeps it alive for the whole chain of tail
+calls), a `def` global, a literal, or a capture of the enclosing closure
+(held by the closure object, which the call through it handed over
+owned).
+
+The kinds and the escape summaries below are **one least fixpoint** over
+the module's call graph, per SCC in dependency order, starting from
+`borrowed` and `noescape`. Both only grow, and each depends on the
+other monotonically: a heap closure's capture is E3 for both, a tail
+call's arguments count for both, and a tail-call site that turns a
+callee's parameter owned (rule 3) can turn the argument's binding, if
+it is a parameter of the caller, owned by rule 2. So the two are one
+iteration, not two passes, exactly as the escape summaries alone were
+before D5. Imported functions, protocol methods and closure types are
+fixed inputs: an imported `defun` carries the kinds its module inferred
+(§3.9), a method the kinds its protocol declares, and a closure value
+owns every parameter and its environment. A tail call to a callee
+outside the current SCC cannot change the callee's kinds; rule (e) of
+§6.10 makes such a call an ordinary call when it would need to.
+
+**Closures** (`fn` literals, `async` bodies, named-function values):
+every object parameter of a closure is owned, and so is the closure
+object itself for the duration of a call through it — the environment
+is an argument like any other (§8.4). A call through a function value
+cannot know which body it reaches, so one convention serves all, and
+D5 fixes it as the owned one so that a tail call through a closure
+value discards the caller's frame safely. The parameters of a `fn` are
+owning bindings of its body; its callers, direct or through a value,
+consume every object argument. The immortal closure of a named
+function adapts the convention to the function's inferred kinds (§8.4).
 
 The pass attaches to every `defun` an **escape summary**: per object
 parameter `p`, `escapes` or `noescape`. `p` escapes iff an occurrence
-of `Borrowed(p)` is at a `consume` position (E1–E4, a join retain), or
-is passed to an `escapes` parameter of a known callee, or to any
-parameter of a closure value (unknown callee), or is captured by an
-escaping closure, or is the operand of `weak` or `raw-retained`. An
+of `Borrowed(p)` is at a consume position (E1–E4, a join retain), or
+is passed to an `escapes` parameter of a known callee (in a tail call
+or not), or to any parameter of a closure value (unknown callee), or is
+captured by an escaping closure (§6.5), or is the operand of `weak` or
+`raw-retained`. An E6 occurrence by itself is not an escape: the
+callee's activation replaces the caller's, the frame below, which holds
+every borrowed parameter of the caller, is still waiting, and what the
+callee does with the argument is what its own summary says. An
 occurrence of `Derived(p)` never counts: a derived value is a strict
 sub-object of `p`, reached through a field, an element or a variant
 payload (§6.1), and is always a heap object because it was stored into
@@ -1018,190 +1111,190 @@ is `Borrowed(p)`, not `Derived(p)`, and a join that mixes the two modes
 retains its `Borrowed(p)` branch, which is a consume position (§6.3);
 so `(defun same (p) (match p (w w)))`, `(match p ((Node inner) inner)
 ((Leaf) p))` and `(match p (x (weak x)))` all make `p` escape
-(Proposed; §10 item 18). Computed as a least fixpoint over the module's
-call graph starting from `noescape`; imported and protocol summaries are
-fixed inputs. An explicit `p :borrow` or `p: T :borrow` on a `defun`
-parameter (syntax §3.1) fixes the summary at `noescape` and is checked:
-`parameter p of f is declared :borrow but escapes`; the exported
-summary is then the declared one, part of the interface, and a closure
-literal passed to `p` is non-escaping by contract (§6.5; proposed case
-40).
+(**Decided**). Imported and protocol summaries are fixed inputs. An
+explicit `p :borrow` or `p: T :borrow` on a `defun` parameter (syntax
+§3.1) fixes the summary at `noescape` and is checked: `parameter p of f
+is declared :borrow but escapes`; the exported summary is then the
+declared one, part of the interface, and a closure literal passed to
+`p` is non-escaping by contract (§6.5; proposed case 40).
 
-Protocol methods declare their kinds (syntax §3.10; default escaping);
-every `impl` body is checked against the declaration: `implementation
-of P/m for T makes parameter p escape; the protocol declares it
-:borrow`. Callers use the declared kind whichever implementation runs,
+Protocol methods declare their kinds (syntax §3.10; default escaping
+and borrowed); every `impl` body is checked against the escape
+declaration: `implementation of P/m for T makes parameter p escape;
+the protocol declares it :borrow`. A body is compiled with the declared
+count kind whatever it would have inferred, which can cost it a retain,
+or a tail call by rule (e), but never a verdict, so `:owned` needs no
+check. Callers use the declared kinds whichever implementation runs,
 which keeps summaries modular under dynamic dispatch and separate
-compilation (Proposed; §10 item 5). Externs take scalars only: `(raw
-e)` is not an escape of `e`'s binding, `(raw-retained e)` is (§6.13).
+compilation (**Decided**). Externs take scalars only: `(raw e)` is not
+an escape of `e`'s binding, `(raw-retained e)` is (§6.13).
 
-What summaries decide, and nothing else: (a) whether a closure literal
-passed to that parameter is escaping (§6.5; at a self tail call it is
-escaping whatever the summary says); (b) whether a closure that
+What summaries and kinds decide, and nothing else: (a) whether a
+closure literal passed to that parameter is escaping (§6.5; at a tail
+call it is heap whatever the summary says); (b) whether a closure that
 captures an `&` parameter may be passed there (§6.5); (c) whether the
-caller's argument object may live on the stack (§6.11); (d) the
-copy-in decision for `&(. x f)` (§6.6). Summaries of `fn` literals are
-computed for their own bodies but never exported: closure types carry
-none, so a call through a function value assumes every argument escapes.
+caller's argument object may live on the stack (§6.11); (d) whether a
+call in tail position is a tail call (§6.10 rule (e)) and which count
+operations a call emits (§8.9). Summaries and kinds of `fn` literals
+are computed for their own bodies but never exported: closure types
+carry none, so a call through a function value assumes every argument
+escapes and hands every argument over owned.
 
-### 6.5 Closures: escaping, capture modes, the two `&` rules (§3.3, §5)
+### 6.5 Closures: escaping, heap, capture modes, the two `&` rules (§3.3, §5)
 
-A `fn` literal is **escaping** unless every use of it is one of:
+Every use of a `fn` literal, or of the `let` binding `f` it directly
+initialises, is one of:
 
-- (a) called directly at the literal: `((fn ..) args)`;
-- (b) passed as an argument to a `noescape`/`:borrow` parameter of a known
-  callee (`swap!`, `for-each`, `map`, `reduce`, a `defun` whose summary
-  says so);
-- (c) it is the *direct* initialiser of a `let` binding `f`, and every use
-  of `f` is a call `(f args)` or a use of kind (b), and `f` is not
-  captured by any other closure.
+- (a) a direct call at the literal: `((fn ..) args)`;
+- (b) an argument to a `noescape`/`:borrow` parameter of a known callee
+  (`swap!`, `for-each`, `map`, `reduce`, a `defun` whose summary says
+  so), in a tail call or not;
+- (c) the *direct* initialiser of a `let` binding `f` every use of which
+  is a call `(f args)` or a use of kind (b), and which no other closure
+  captures;
+- (d) anything else: E1, E2, E3 (captured by an escaping closure), E4, an
+  `escapes` parameter, an argument or the head of a call through a
+  closure value (unknown callee), an `async` body.
 
-A closure at E1, E2, E3 or E4, passed to an `escapes` parameter, passed
-to a closure value, or written as an `async` body, is escaping. So is,
-**regardless of the callee's summary**, a closure literal that is an
-argument of a self tail call of the enclosing `defun` or named `fn`, or
-an argument or initialiser of a `loop`/`recur` (§6.10), and a
-`let`-bound closure of clause (c) with such a use (Proposed; §10 item
-32): the call is a slot loop, which never completes before the creating
-scope exits — the jump runs those scope exits and then stores the
-argument into a slot that the next iteration reads — so clause (b)'s
-soundness argument below does not hold for it. `(defun spin (g n) (let
-((x (make))) (if (= n 0) (g) (spin (fn () (count x)) (- n 1)))))` has
-`g : noescape`, but the literal captures `x`, which the `let` releases
-at the jump; as an escaping closure it retains `x` at E3 and frees it
-with itself when the slot is released (proposed case 49). A closure
-that captures an `&` parameter and is passed at a self tail call is
-therefore rejected by the rule of case 18 below. The check is syntactic
-and uses only summaries. A `loop` body (syntax §3.18) is not a closure:
-its free variables are the enclosing function's own bindings and it has
-no capture set.
+A closure is **escaping** iff it has a use of kind (d): it may outlive
+the call that created it. A closure is **heap** iff it is escaping, or
+it is the head or an argument of a tail call — E6, §6.10 — that is, a
+use of kind (a), (b) or (c) whose frame is discarded while the closure
+is still needed (**Decided**, D5, generalising the earlier rule for
+self tail calls): `(defun spin (g n) (let ((x (make))) (if (= n 0) (g)
+(spin (fn () (count x)) (- n 1)))))` has `g : noescape`, but the
+literal captures `x`, which the `let` releases before the jump; as a
+heap closure it retains `x` at E3 and frees it when `spin`'s `g` is
+released (proposed case 49). A closure that is neither is a **stack**
+closure. The check is syntactic and uses only summaries. A `loop` body
+(syntax §3.18) is not a closure: its free variables are the enclosing
+function's own bindings and it has no capture set.
 
-- **Escaping closure:** E3 — every object capture is consumed (retained
-  if `Borrowed`/`Derived`, moved if `Owned`, which cannot happen for a
-  variable) when the closure object is created; the closure's captures
-  are owning bindings of the closure, released by its `drop`. A captured
-  cell is retained like any object: in case 05 both closures retain `n`,
-  the `let` releases its own count, and the cell lives while either
-  closure does.
-- **Non-escaping closure:** its captures are alias bindings of the
-  enclosing bindings; no count; the closure object may live on the stack
-  of the creating frame. Sound because uses (a)–(c) all complete before
-  the creating scope exits and a `:borrow` callee never stores or returns
-  it; a self tail call or `recur` is the one call that does not
-  complete before the scope exits, which is why an argument of one is
-  escaping (above).
+- **Heap closure:** E3 — every object capture is consumed (retained if
+  `Borrowed`/`Derived`, moved if `Owned`, which cannot happen for a
+  variable) when the closure object is created; the captures are owning
+  bindings of the closure, released by its `drop`. A captured cell is
+  retained like any object: in case 05 both closures retain `n`, the
+  `let` releases its own count, and the cell lives while either closure
+  does. A capture of an `&` parameter is the private cell, which is
+  never counted (§6.6).
+- **Stack closure:** its captures are alias bindings of the enclosing
+  bindings; no count; the closure object lives in the creating frame
+  (§6.11, §8.4). Sound because uses (a)–(c) all complete before the
+  creating scope exits and a `:borrow` callee never stores or returns
+  it; a tail call is the one call that does not complete before the
+  scope exits, which is why E6 makes the closure heap.
+- **Parameters** of every closure are owned (§6.4), and so is the closure
+  object during a call through it; the body releases both at its exits
+  unless it hands them on.
 
 **Decided** (§5, case 18): an `&` parameter may not be captured by an
 escaping closure. Check: for every escaping `fn` literal whose capture
 set contains an `&` parameter `v` of the enclosing `defun`: `& parameter
 captured by escaping closure: v in f`. A non-escaping closure may
-capture `v` and use `&v`, `@v` or `(set! v ..)` (case 08).
+capture `v` and use `&v`, `@v` or `(set! v ..)` (case 08), and may be
+heap: passed at a tail call to a `noescape` position, or called in
+tail position, it is released by the callee's release of its parameter
+or by its own exit, before the write-back in the frame that created the
+private cell, which is the frame below the one the tail call
+discarded.
 
 **Decided** (§5, case 12): the `&` arguments of one call name distinct
-places. Check, before typing: the list of `&` argument places of a call
-has no duplicates (same variable, or same variable and field): `variable
-x passed to more than one & parameter in call to bar`. Purely syntactic;
-aliasing of *objects* is fine because both callees start from a copy-in
-that leaves the count above one, so each update copies (§5).
+variables. Check, before typing: the list of `&` argument variables of
+a call has no duplicates: `variable x passed to more than one &
+parameter in call to bar`. Purely syntactic; aliasing of *objects* is
+fine because both callees start from a copy-in that leaves the count
+above one, so each update copies (§5).
 
 ### 6.6 `&` in detail: private cells, copy-in, unique updates (§5)
 
 Inside the callee an `&` parameter `v` names its **private cell** and is
-never itself an expression (syntax §3.13, §2.14): `@v` yields an `Owned`
-reference to the cell's content (an acquire, +1), `(set! v e)` consumes
-`e` into the cell and releases the old content, `&v` and `&(. v f)`
-forward the cell or one field of the struct in it. The cell object
-itself is a stack temporary of the *caller's* call step and is never
-counted (§8.6); because `v` has no value, no expression, store, capture
-or return can refer to the cell after the write-back frees it.
+never itself an expression (syntax §3.13, §2.14; **Decided**, D2): `@v`
+yields an `Owned` reference to the cell's content (an acquire, +1),
+`(set! v e)` consumes `e` into the cell and releases the old content,
+`&v` forwards the cell. The cell object itself is a stack temporary of
+the *caller's* call step and is never counted (§8.6); because `v` has no
+value, no expression, store, capture or return can refer to the cell
+after the write-back frees it.
 
-**Copy-in** at a call `(f .. &p ..)`, in argument order:
-
-- the place `p` is **exclusive** for this call (syntax §3.13): the
-  content is **moved** from the place into the private cell. For a
-  variable place, the caller's cell holds nothing until the write-back;
-  for a field place `(. x f)`, the struct in `x` must be **takeable**
-  (`fib.takeable?`, §8.2: `fib.unique?`, that is count 1 and none of
-  `SHARED`, `IMMORTAL`, `STACK`, and `HAS-WEAK` clear) and its
-  field is **taken** (nulled) until the write-back; a unique struct that
-  has a weak box is acquired instead. The conditions guarantee no
-  expression can read the place meanwhile: no other argument mentions
-  it, no closure captures it, no alias of the cell exists, and no weak
-  reference can upgrade to the struct (`fib.unique?` counts strong
-  references only; without the `HAS-WEAK` test an upgrade inside the
-  call could read the taken field; Proposed, §10 item 21). The
-  interpreter records a taken field and reports any read of one as the
-  audit failure `read of taken field`; no accepted program reaches it,
-  and the adversarial cases (method.md rule 4) are what check that.
-- otherwise: **acquire** — the private cell is initialised with `@p`
-  (+1); for a field place the struct in `x` is read through `@x`, its
-  field retained, and the temporary released.
+**Copy-in** at a call `(f .. &x ..)`, in argument order (**Decided**,
+D1): the private cell is initialised with `@x` — an **acquire**, +1 on
+the content, which the caller's cell `x` keeps holding. There is no
+move: a place is a variable, never a field; nothing is ever taken out
+of anything; the object in `x` is shared by the two cells for the
+duration of the call, and its count says so. The unique-write
+primitives below therefore copy on the first update through an `&`
+parameter, and the copy, held by the private cell alone, is unique
+from then on.
 
 **Write-back** after the call returns, in parameter order: the private
-cell's content is moved into the place: a variable place is stored
-(`set!` semantics: the old content, if any, is released; there is none
-after a move); a field place is written with `set-field!` semantics
-(unique write when the struct is unique, else copy the struct, store the
-copy, release the old struct). Then the private cell is freed (no
-count). The interpreter implements exactly this decision procedure, so
-the compiler's allocations match its allocations (§6.12).
+cell's content is moved into the variable with `set!` semantics (the
+variable's old content is released), then the private cell is freed
+(no count). The interpreter implements exactly this, so the compiler's
+allocations match its allocations (§6.12).
 
-**Self tail calls.** In a self tail call (§6.10) an argument `&v` for the
-enclosing function's own `&` parameter `v`, at `v`'s position, performs
-no copy-in and no write-back: the slot keeps the same private cell and
-the loop continues with it. Any other `&` argument at an `&` position
-makes the call an ordinary call. Without this rule the write-backs of a
-loop's iterations, which syntax §2 places "after the call returns",
-would never run, the caller's cell would be left empty and the final
-value would sit in a dead private cell.
+**Forwarding at a self tail call** (§6.10 rule (b); **Decided**, D5): an
+argument `&v` for the enclosing function's own `&` parameter `v`, at
+`v`'s position, performs no copy-in and no write-back: the callee's `v`
+is the same private cell, and the one write-back is the original
+caller's, after the whole chain returns. Any other `&` argument makes
+the call an ordinary call. Without this rule the write-backs of a
+recursion's iterations, which syntax §2 places "after the call
+returns", would need a frame each.
 
 **Unique write** (**Decided**, §5): `array-set!` and `set-field!` read the
 place's content without retaining, test `fib.unique?` (§8.2: the flags
 have none of `SHARED`, `IMMORTAL`, `STACK`, and the count is exactly
 1), and either write the object in place or build a copy with the
 change, store it into the place and release the old object. The flag
-test comes first and is what protects static data (Proposed; §10 item
-30): an immortal object (a literal, a `def` value, and every object
-reachable from one) has no count, so a value pulled out of a literal
-(`(match f ((List xs) xs))` on a `Form` literal, §6.2) and moved into
-a private cell is copied by the first `push!`, never written, and the
+test comes first and is what protects static data (**Decided**): an
+immortal object (a literal, a `def` value, and every object reachable
+from one) has no count, so a value pulled out of a literal (`(match f
+((List xs) xs))` on a `Form` literal, §6.2) and acquired into a
+private cell is copied by the first `push!`, never written, and the
 literal's tail array, immortal too, copies likewise. Without the flag
 test an immortal count that happened to read 1 would let accepted code
 write into a constant, which in the compiler may live in read-only
 data once lIR holds static constants (§8.11), while the interpreter,
-whose literals are ordinary allocations, would answer differently (method.md rule 6; proposed case 37). The audited
-heap must permit a write to an immutable object exactly under that
-test (`write-unique`, an obligation on fibref; §10 item 16), so the
-interpreter allocates its literals with the `IMMORTAL` flag and count
-0, like the compiler's constants (§8.2). A unique write can never close
-a cycle: an object with count 1 held by the writer's place is reachable
-from no other object.
+whose literals are ordinary allocations, would answer differently
+(method.md rule 6; proposed case 37). The audited heap must permit a
+write to an immutable object exactly under that test (`write-unique`,
+an obligation on fibref; §6.12), so the interpreter allocates its
+literals with the `IMMORTAL` flag and count 0, like the compiler's
+constants (§8.2). A unique write can never close a cycle: an object
+with count 1 held by the writer's place is reachable from no other
+object.
 
 Count trace for case 08, compiler and interpreter alike. `main`'s cell
-holds `V0` (1). `(dup-all &v)`: `v` is exclusive in `main` (a `(cell ..)`
-binding used only as `&v`/`@v`, not in another argument) → move: `main`'s
-cell is empty, `dup-all`'s private cell `P` holds `V0` (1). `(for-each @v
-..)`: `@v` acquires (2) for the call. The closure is non-escaping
-(`for-each`'s `f` is `:borrow`), captures `P` as an alias. Iteration 1:
-`(append &v x)`: `v` is captured by a closure → not exclusive → acquire
-into `append`'s private cell `Q` (3); `append`'s `push!` sees count 3 →
-copies: `Q` := `V1` (1), `V0` (2); write-back into `P`: `P`'s old `V0`
-released (1), `P` := `V1`. Iteration 2: `Q` := `V1` (2), copy → `V2`,
-`V1` (1); write-back releases `V1` (0, freed), `P` := `V2`. Iteration 3
-likewise frees `V2`; `P` := `V3`. `for-each` returns; its temporary `V0`
-released (0, freed). `dup-all` returns; write-back stores `V3` into
-`main`'s empty cell. `(count @v)` = 6; nothing live at exit.
+`c` holds `V0` (1). `(dup-all &v)`: the copy-in acquires: the private
+cell `P` holds `V0` (2). `(for-each @v ..)`: `@v` acquires (3) for the
+call step; the call is an ordinary call (§6.10 rule (e): fresh
+arguments at `for-each`'s borrowed positions), so the closure is a
+stack closure (`for-each`'s `f` is `:borrow`) capturing `P` as an
+alias. Iteration 1: `(append &v x)`: acquire into `append`'s private
+cell `Q` (4); `append`'s `push!` sees a count above one → copies: `Q`
+:= `V1` (1), `V0` (3); write-back into `P`: `P`'s old `V0` released
+(2), `P` := `V1`. Iteration 2: `Q` := `V1` (2), copy → `V2` (1), `V1`
+(1); write-back releases `V1` (0, freed), `P` := `V2`. Iteration 3
+likewise frees `V2`; `P` := `V3`. `for-each` returns; the step's
+temporary `V0` released (1). `dup-all` returns; write-back stores `V3`
+into `c`, releasing `c`'s old `V0` (0, freed); `P` is freed. `(count
+@v)` = 6; `main`'s `let` releases `V3`; nothing live at exit.
 
-Case 17: `(push-count &v @v)`: `v` occurs in another argument → acquire
-(2), then `@v` (3); `push!` copies; write-back releases `V0` (2); the
-temporary is released after the call (1); result 4; clean.
+Case 17: `(push-count &v @v)`: the copy-in at the first argument
+acquires (2), then `@v` acquires (3); inside, `(append &v (count x))`
+acquires again (4), `push!` copies (`V1` into `append`'s cell, `V0`
+back to 3), and the write-back into `push-count`'s cell releases `V0`
+(2); the write-back into `main`'s cell releases `V0` (1) and stores
+`V1`; the temporary `@v` is released after the call (0, `V0` freed);
+result 4; clean.
 
 ### 6.7 Cells, weak references, cycles (§6)
 
 - `(cell e)`: E2 for `e`; the cell owns one count of its content.
 - `@c`: an acquire, `Owned` (+1) — the same rule as for atoms
-  (**Decided** for atoms, §7; Proposed for cells), so that `(let ((x @c))
-  (set! c y) x)` can never read freed memory. Never elided in v1 (§6.3; §10 item 4).
+  (**Decided** for atoms, §7, and for cells), so that `(let ((x @c))
+  (set! c y) x)` can never read freed memory. Never elided in v1 (§6.3).
 - `(set! c e)`: E2 for `e`, then release the old content. Order matters
   for `(set! c (f @c))`: the acquired temporary keeps the old value alive
   through `f`.
@@ -1225,7 +1318,7 @@ temporary is released after the call (1); result 4; clean.
   a value) it allocates a box that is never cleared and leaves the
   object's header alone, so `@w` on it is always `(some ..)`: the
   upgrade tests the flag before the count, which is 0 on an immortal
-  (§8.7; §10 items 24, 30). `@w`: atomically "retain if still alive" (§8.7); result
+  (§8.7; **Decided**). `@w`: atomically "retain if still alive" (§8.7); result
   `(Option T)`, `Owned`. Case 20: the inner `let` releases the only count
   → the drop clears the box → `@w` is `nil`. Case 19: the only strong
   edges are `root → cell → [a] → cell → [b]`; parents are weak; `main`'s
@@ -1244,8 +1337,8 @@ temporary is released after the call (1); result 4; clean.
 Decided by `Send` at the type level (§5) and by E4 at the ownership
 level. `(spawn f)`: `consume(f)`, mark shared, hand to the runtime; the
 thread owns that count on the closure and releases it when the thunk
-returns. The task object is created with count **2** (Proposed; §10 item
-22): one is the caller's `Owned` result, one is held by the running
+returns. The task object is created with count **2** (**Decided**): one
+is the caller's `Owned` result, one is held by the running
 thread and released as its last action, after the result is stored and
 the state set to done (§8.8). So a task whose handle is discarded (a
 non-final `do` step, syntax Open decision 15) or released before `join`
@@ -1254,9 +1347,9 @@ writes into it. `join` retains the result for the caller. A task may be
 joined by several threads and awaited by several tasks (`Send (Task T)
 = Send T`, §1.6): the counts they hold keep it allocated, and §8.8
 makes the runtime, not a count, the guarantee that only one of them
-ever resumes it (Proposed; §10 item 27; proposed cases 43, 44). `main`
+ever resumes it (**Decided**; proposed cases 43, 44). `main`
 returning waits for every spawned thread still running, so the audit
-runs on a quiescent heap (Proposed; §10 item 22). Case 13 is rejected
+runs on a quiescent heap (**Decided**). Case 13 is rejected
 during typing (§5.4) before this pass runs. Case 10: `a : (Atom (Vec i64))` is `Send`;
 each `@a` acquires under the atom's lock (§8.6, the implementation
 obligation of §7); `swap!` stores `f`'s `Owned` result (E2, moved) and
@@ -1266,8 +1359,11 @@ walk and every store into an already-shared object set the flag (§8.8).
 
 ### 6.9 Async (§8)
 
-**Decided** (§8, §3.4, §3.5): an `async` form is an escaping closure whose
-captures must be sendable (§2.8, §5.2). Mechanism: E3 for every capture
+**Decided** (§8, §3.4, §3.5; confirmed as D7): an `async` form is an
+escaping closure whose captures must be sendable (§2.8, §5.2), because
+the executor is multi-threaded: a task is resumed on whichever worker
+thread picks it up, so its creation is a thread crossing (§8.8).
+Mechanism: E3 for every capture
 at task creation (this is "retained on entry"); the body runs in a
 heap-allocated frame owned by the task; every local of the body lives in
 that frame; so nothing in the body is `Borrowed` of an enclosing
@@ -1277,7 +1373,7 @@ creation and released by the task's drop, whether or not its uses
 precede the first `await`: evaluating the `async` form does not run the
 body (syntax §3.14), so a use before the first `await` may still run
 after the creating scope has released the captured binding; the earlier
-idea of skipping such retains is withdrawn (Proposed; §10 item 23;
+idea of skipping such retains is withdrawn (**Decided**;
 proposed case 24 in `spec/drafts/PROPOSED_CASES.md`). A `loop` body (syntax §3.18) inside
 the `async` is part of the task's state machine, so a loop may `await`
 on every iteration.
@@ -1285,7 +1381,7 @@ on every iteration.
 **Decided** (§8): `&` parameters are not allowed in async functions.
 Check, before typing, on a `defun` with an `&` parameter `v`: if any
 `async` form in its body (including inside nested `fn`s) mentions `v`
-(as `@v`, `&v`, `&(. v f)` or the target of `set!`, anywhere inside the
+(as `@v`, `&v` or the target of `set!`, anywhere inside the
 `async` body), or an `async` form is in tail position of the body (the
 function's value is a task it creates), the function is an **async
 function** (syntax §3.1) and the error is `& parameter in async
@@ -1300,8 +1396,8 @@ task cannot reach the private cell, because no expression has the cell
 as its value (§2.14), and a closure that captures `v` and is captured
 by the `async` is escaping, rejected by §6.5 and, being `local`, by
 `Send` (§5.4). The earlier definition, any `defun` containing an
-`async`, rejected that safe shape for no reason (Proposed; syntax Open
-decision 22). `await` outside `async`, or inside a `fn` nested in one,
+`async`, rejected that safe shape for no reason (**Decided**). `await`
+outside `async`, or inside a `fn` nested in one,
 is `await outside async`; inside a `loop` of the `async` it is fine.
 
 Case 11: `measure` creates a task capturing `s` (retained); `main`'s
@@ -1309,102 +1405,212 @@ inner `let` releases `s` (1, held by the task); `block-on` drives the
 task; `(length s)` reads the task's capture; the task is freed after
 `block-on` returns its value, releasing `s`; clean.
 
-### 6.10 Loops: `loop`/`recur` and self tail calls (Proposed)
+### 6.10 Tail calls (Decided, D5)
 
-A **self tail call** is a call `(f args)` to the enclosing `defun` `f`, or
-`(g args)` to the enclosing named `fn g`, in tail position of its body
-(the last step of the body, the branches of a tail `if`/`match`, the
-body of a tail `let`/`do`, transitively). A `recur` is in tail position
-of its `loop` body in the same sense (syntax §3.18). The interpreter and
-the compiler treat both as one **slot loop**:
+A call is in **tail position** of a body when it is the last step of
+the body, a branch of a tail `if`/`match`, the body of a tail `let`,
+`do` or `loop`, or a `recur`, transitively; never inside a `fn` or
+`async` literal nested in the body. A call in tail position is a **tail
+call** — the caller's frame is discarded and the callee's result is the
+caller's — unless one of the following holds, in which case it is an
+ordinary call followed by the releases of §6.3:
 
-1. on entry, each slot becomes an owning binding: a `loop` variable
-   `consume`s its initialiser; a plain object parameter of a
-   self-tail-calling function is retained into its slot; an `&`
-   parameter's slot holds its private cell, which is never counted;
-2. at the `recur` or the tail call: evaluate the argument expressions
-   into temporaries with `consume` (an `Owned` argument is moved, a
-   borrowed one retained; a closure literal or `let`-bound closure
-   among the arguments is escaping, §6.5, so it owns its captures and
-   survives the scope exits that follow); run the scope exits of every enclosing scope
-   inside the body (release their owning bindings); release the old
-   slot values; store the temporaries into the slots; continue at the
-   start of the body. For an `&` parameter the argument at its position
-   must be `&v` for that same parameter: the slot is left untouched,
-   with no copy-in and no write-back (§6.6). A self call whose argument
-   at an `&` position is anything else (`&(. v f)`, a `let` cell, `&v`
-   at a different position), or that is not in tail position, is an
-   ordinary call: copy-in, call, write-back;
-3. at a normal exit: for a function, `consume` the result (E1), then
-   release the slots; for a `loop`, apply the scope-exit rule of §6.3
-   with the slots as the loop's owning bindings (a `Borrowed(slot)`
-   result is moved out, a `Derived(slot)` result is retained, then the
-   slots are released).
+- (b) it has an `&` argument other than the forwarding case: the
+  write-back must run after the call returns (§6.6). A self tail call
+  of the enclosing `defun` whose argument at an `&` parameter `v`'s own
+  position is `&v` forwards the private cell — no copy-in, no
+  write-back — and stays a tail call; every other `&` argument (a `let`
+  cell, `&v` at another position, an `&` argument to another function)
+  makes the call ordinary;
+- (e) an argument at a **borrowed** position of a callee outside the
+  current SCC (an imported `defun`, a protocol method, a `defun` of an
+  earlier SCC) is frame-owned (§6.4): the caller's frame must survive
+  the call to release it, and the callee's kinds cannot be changed from
+  here. Inside the SCC the fixpoint makes the position owned instead
+  (§6.4 rule 3), so a self or mutual tail call is always a tail call;
+  a callee that is a closure value owns every parameter, so this never
+  applies to it;
+- it is a call to an `extern` (§6.13): a foreign convention, and its
+  `raw` borrows are valid for the enclosing scope.
 
-Case 07: `(conj acc n)` is an `Owned` temporary moved into the `acc`
-slot; the previous version is released at step 2 and freed when its
-count reaches zero (only the new version shares its nodes); depth is
-constant; the base case returns `Borrowed(acc)` → retain, release slots
-→ the caller receives one count. This achieves §4 ("never freed by the
-callee": nothing but the loop's own slots is freed) without a second
-calling convention. `(defun fill (&v n) (if (= n 0) () (do (append &v
-n) (fill &v (- n 1)))))`: `v` is exclusive at `(append &v n)` (its only
-occurrences are `&v`), so every append moves and updates in place; the
-tail call forwards the private cell; the caller's single write-back
-stores the final vector (proposed case 25 in
-`spec/drafts/PROPOSED_CASES.md`). Tail calls to *other* functions are
-ordinary calls in v1 (§10 item 6); the condition under which a general
-tail call could release before jumping is: every owned local of the
-caller is either moved into the call or not passed to it at all.
+At a tail call `(g a₁ .. aₙ)`:
 
-### 6.11 Allocation: heap in v1, stack when scope-local (Proposed)
+1. the head (when it is not a global name) and the arguments are
+   evaluated left to right, as in any call (syntax §2);
+2. every argument is `consume`d for its position: at an owned position
+   an `Owned` argument is moved and a `Borrowed`/`Derived` one retained,
+   except that `Borrowed(x)` for an owning binding `x` of the frame (a
+   `let` binding, a loop variable, an owned parameter, a temporary) is
+   **moved**: `x` is not released at the scope exits that follow and its
+   count travels with the argument (a second occurrence of the same `x`
+   among the arguments retains). At a borrowed position nothing is
+   emitted, and by (e) the argument is frame-independent. Through a
+   closure value every position is owned and the closure value itself
+   is consumed the same way (§8.4). A forwarded `&v` emits nothing;
+3. the scope exits of every scope enclosing the call inside the body
+   run (their owning bindings released in reverse order, except those
+   moved in step 2), then every remaining `Owned` temporary of the step
+   is released. Rule (c): no `Owned` temporary of the caller exists at
+   the jump, since each was consumed into an argument or released here,
+   and none could be released later because nothing of the caller runs
+   later;
+4. the frame is discarded and control passes to `g` (lIR `tailcall` or
+   `indirect-tailcall`, §8.9); `g`'s result is the caller's result. The
+   callee releases its owned parameters at its own exits, or hands them
+   on.
 
-v1 allocates every object on the heap with a count header (§10 item 8):
-the interpreter/compiler agreement on frees is then checked first, and
-stack allocation becomes a pure optimisation verified by the same audit.
-When it is enabled, a `let` binding or temporary `b` is **scope-local**
-iff its initialiser is `Owned` at creation and no occurrence of
-`Borrowed(b)` is at a `consume` position, passed to an `escapes`
-parameter or a closure value, captured by any escaping closure, moved
-out or retained by a scope exit or a join, or the operand of `weak` or
-`raw-retained`. A
-scope-local object is allocated in the frame with the `STACK` flag
-(§8.2), receives no count operation, and its `drop` runs inline at scope
-exit (its counted children are released; nothing is freed). Its
-sub-objects are always heap objects, because they were stored at E2. A
-`(some e)` of a non-`Option` object allocates nothing (§8.1): an
-`Option` value is never itself a stack candidate, and its payload was
-consumed at E2, so it is a heap object.
+The head and the arguments of a tail call are escape position **E6**
+(§6.3): a binding whose value is passed or called there is never
+scope-local (§6.11), since the frame that would hold it is gone while
+the callee runs, and a closure literal or `let`-bound closure there is a
+heap closure that owns its captures (§6.5), whatever the callee's
+summary says. A `Derived(x)` argument is retained at an owned position;
+at a borrowed position it needs nothing, and by (e) `x` is then
+frame-independent.
+
+Self tail calls, mutual recursion inside an SCC, calls through closure
+values and calls to `:owned` positions of methods therefore run in
+constant stack. The interpreter does the same (§6.12): it decides tail
+calls by this section, discards the frame before entering the callee
+and lets the callee's parameter bindings own their values, so the same
+objects are freed at the same points as in compiled code.
+
+**`loop` and `recur`** (syntax §3.18) are this rule applied to a local
+function whose body is part of the enclosing function: a `loop` binds
+its variables as owning bindings (each initialiser `consume`d, like an
+argument at an owned position) and runs its body; `recur` is a tail
+call to the loop: its arguments are consumed as in step 2, the scope
+exits inside the loop body run, the old values of the loop variables
+are released, the new ones stored, and the body restarts. A closure
+among the arguments of a `recur` is at E6. When the body finishes
+without `recur`, the value follows the scope-exit rule of §6.3 with the
+loop variables as the scope's owning bindings (a `Borrowed(slot)`
+result is moved out, a `Derived(slot)` one retained, then the variables
+are released). A call in tail position of the loop body that is not a
+`recur` is in tail position of the enclosing function, with the loop
+variables among the bindings that step 3 releases.
+
+Case 07: `build`'s `acc` is owned (§6.4 rule 1: the base case returns
+it; rule 3: the self tail call passes a fresh `(conj acc n)` at its
+position). `(conj acc n)` is an `Owned` temporary moved into the call;
+the frame's `acc` is released before the jump, so the previous version
+dies as soon as the new one, which shares its nodes, exists; the base
+case moves `acc` out to the caller; depth is constant. `main`'s `(count
+(build 100000 []))` is an ordinary call (rule (e): a fresh vector at
+`count`'s borrowed position), and `(build 100000 [])` is an ordinary
+call whose `[]` is moved into `build`'s owned `acc`. `(defun fill (&v
+n) (if (= n 0) () (do (append &v n) (fill &v (- n 1)))))`: `(append &v
+n)` acquires and copies on its first update; the tail call forwards the
+private cell; the caller's single write-back stores the final vector
+(proposed case 25). A tail call through a closure value `(k x)` hands
+`k` and `x` over owned and the closure body releases both at its exit
+(§8.4), so continuation-passing code runs in constant stack.
+
+### 6.11 Allocation: stack when scope-local, heap otherwise (Decided, D6)
+
+A binding `b` — an owning `let` binding, a loop variable, a `match`
+temporary or an implicit temporary of a step; never a parameter, whose
+object arrived from elsewhere — is **scope-local** iff its initialiser
+is `Owned` at creation (a fresh object or a call result; not a cell
+read, whose object exists already, and not an immortal) and **no
+occurrence** of `Borrowed(b)`, on any path of its scope, is:
+
+- at an escape position E1–E6: returned, stored, captured by a heap
+  closure, passed to `spawn`, or passed or called at a tail call
+  (§6.10);
+- passed to an `escapes` parameter of a known callee, or to any
+  parameter of a closure value;
+- moved out or retained by a scope exit or a join (§6.3);
+- the operand of `weak` (§6.7: a stack object cannot be observed dead by
+  a weak box) or of `raw-retained` (§6.13).
+
+An occurrence of `Derived(b)` never disqualifies `b`: a sub-object is a
+heap object stored at E2 and outlives `b` on its own count. Being passed
+to a `noescape` parameter of an ordinary call, borrowed or owned, does
+not disqualify `b` either: the callee's retain and release are no-ops on
+a `STACK` object, its summary says it keeps nothing, and the frame is
+alive for the whole call. The condition is on the **binding over all
+paths**, not on a path: an object returned on one branch and dropped on
+another is a heap object on both, allocated once at its initialiser,
+which closes the mixed-branch hole (an object stack-allocated on one
+branch and escaping on another) by construction.
+
+A scope-local object is allocated in the creating frame with the `STACK`
+flag and count 0 (§8.2), receives no count operation, and its `drop`
+runs inline at scope exit (its counted children are released; nothing is
+freed). Its sub-objects are always heap objects, because they were
+stored at E2. A `(some e)` of a non-`Option` object allocates nothing
+(§8.1): an `Option` value is never itself a stack candidate, and its
+payload was consumed at E2, so it is a heap object. Stack closures
+(§6.5) and private `&` cells (§6.6) are the same mechanism.
+
+This is in force from the first implementation, not an optimisation
+added later: the compiler allocates on the stack wherever the condition
+holds, and so does the interpreter, exactly there (§6.12), so the two
+agree on every allocation and every free. `fibc --explain` prints
+`scope-local` on the binding (§9). Obligations on `fibref`, beside
+`write-unique` (§6.6, §6.12):
+
+- the audited heap gains **frames**: `alloc_in_frame(frame, ..)`
+  allocates a `STACK` object in the current frame; a frame's exit frees
+  its objects, running their drops, and is itself a trace event;
+- a reference to a stack object that is stored into a heap object,
+  escapes its frame (returned, captured by a heap closure, passed to
+  another thread, passed or called at a tail call), or is read after
+  its frame has ended is an audit error, distinct from every other
+  failure, so that a checker that misclassifies a binding is caught by
+  the case that exercises it.
+
 Both choices give the same frees (**Decided**, §2: "scope-local objects
-are not counted").
+are not counted"): what a scope-local binding would have released at
+its scope exit under counting is exactly what the inline drop releases
+there.
 
 ### 6.12 Same results, same frees: what the interpreter does
 
 The reference interpreter implements the plain counting semantics of §2:
 every binding holds a count (it retains on every `let`, every capture,
-every parameter of a loop slot), every temporary is released at its
-step's end, and it optimises nothing — with three deliberate exceptions
-that are part of the *semantics* and are implemented by both:
+every parameter), every temporary is released at its step's end, and it
+optimises nothing — with four deliberate exceptions that are part of the
+*semantics* and are implemented by both:
 
-1. the slot loop of `loop`/`recur` and self tail calls (§6.10): a
-   rebinding releases the old binding, so 100000 accumulator versions
-   are not held until the recursion unwinds, and a forwarded `&`
+1. tail calls (§6.10): the interpreter decides which calls in tail
+   position are tail calls by exactly the rules of §6.10 (it runs the
+   checker, so it has the kinds and summaries of §6.4), releases the
+   frame's bindings before entering the callee and lets the callee's
+   parameter bindings own the arguments; so 100000 accumulator versions
+   are not held until a recursion unwinds, and a forwarded `&`
    parameter keeps its private cell;
-2. the copy-in decision (§6.6): move when exclusive, acquire otherwise,
-   so in-place updates happen in the same places;
-3. the unique-write test of `array-set!`/`set-field!` (§6.6).
+2. the copy-in of an `&` argument always acquires (§6.6), so an `&`
+   function copies on its first update in both;
+3. the unique-write test of `array-set!`/`set-field!` (§6.6);
+4. stack allocation (§6.11): the interpreter allocates a scope-local
+   object in its frame (`alloc_in_frame`) exactly where the checker says
+   so and frees it at the frame's exit, so an allocation the compiler
+   puts on the stack is never a heap event in the interpreter's trace.
 
-The compiler elides: alias and derived bindings (no count), plain
-parameters (no count), non-escaping closure captures (no count) and
-scope-local objects (no count, later). It does not elide cell reads
-(§6.3) or the captures of an `async` (§6.9). Each elision removes a
+The compiler elides: alias and derived bindings (no count), borrowed
+parameters (no count), stack-closure captures (no count) and
+scope-local objects (no count). It does not elide cell reads (§6.3) or
+the captures of an `async` (§6.9). Each elision removes a
 retain/release pair around an interval during which another count on
 the same object is provably held by a binding that nothing can write
-during the interval; the object's count at every remaining
-release is the same, so it reaches zero at the same program point: the
-multiset of objects freed at each scope exit and step end is identical
-between the two. The audit compares exactly that (method.md rule 6), and
-`fibc --explain` (§9) prints the compiler's side of the comparison.
+during the interval; the object's count at every remaining release is
+the same, so it reaches zero at the same program point: the multiset of
+objects freed at each scope exit, step end and tail-call jump is
+identical between the two. The audit compares exactly that (method.md
+rule 6), and `fibc --explain` (§9) prints the compiler's side of the
+comparison.
+
+**`fibref` obligations** that these rules put on the audited heap, each
+with a test that shows it firing (CLAUDE.md): `write-unique` (§6.6: a
+write to an immutable object legal iff it is neither `SHARED`,
+`IMMORTAL` nor `STACK` and its count is exactly 1); stack frames,
+`alloc_in_frame` and the stack-reference errors (§6.11); and the
+discarded frame of a tail call (§6.10: a binding released at the jump
+must not be read by the callee, which the ordinary use-after-free check
+already catches). The `read of taken field` event of the earlier draft
+is gone with D1: nothing is ever taken.
 
 ### 6.13 Unsafe (§9)
 
@@ -1415,8 +1621,8 @@ while `e`'s binding is: the borrow of §9. `(raw-retained e)` is a
 consume position (E2): `e` is retained (an `Owned` temporary is moved)
 and the count belongs to the foreign side until `(release-raw p)` or
 the runtime's exported `fib_release` releases it; this is §9's "unless
-the foreign interface says the reference is retained" (Proposed; §10
-item 26). `ptr` is a scalar: no count, not `Send`. The programmer's
+the foreign interface says the reference is retained" (**Decided**).
+`ptr` is a scalar: no count, not `Send`. The programmer's
 obligation inside `unsafe` is that every `raw-retained` count is
 released exactly once; the audit reports an unreleased one as a leak
 and a double release as a count going negative.
@@ -1432,7 +1638,7 @@ and a double release as a count going negative.
 | value of type T cannot be shared between threads: `<path>` | §5.3 |
 | parameter p of f is declared :borrow but escapes | §6.4 |
 | implementation of P/m for T makes parameter p escape; the protocol declares it :borrow | §6.4 |
-| & argument must be a cell variable or a field of a cell variable | §2.14 |
+| & argument must be a cell variable | §2.14 |
 | **& parameter v used as a value** in f | §2.14, syntax §3.13 |
 | parameter v of g is &; pass &x | §2.2 |
 | function with & parameters is not a value | §2.1 |
@@ -1469,8 +1675,8 @@ fragment; the rest is the position and witness the checker appends).
 | 04 branch-dependent-owner | §4 | join of `Borrowed(x)` and `Owned` → retain on the `x` branch; result `Owned` on both paths (§6.3) | accept, 5, clean |
 | 05 closures-share-state | §6 | both `fn`s are E2 arguments of `cons` → escaping (§6.5) → E3 retains `n` twice; `set!` on a captured cell; `let` releases its count; the list's drop frees the closures, then the cell | accept, 2, clean |
 | 06 capture-borrowed-param | §3.3 | the `fn` is at E1 → escaping → E3 retains `prefix`; `matcher`'s `prefix` escapes; `p`'s `let` releases; the closure owns the string until `m` dies | accept, 1, clean |
-| 07 recursive-accumulator | §4, §5 | self tail call → loop (§6.10): `(conj acc n)` is `Owned`, moved into the slot; the old version released each iteration; base case `Borrowed(acc)` → retain, slots released | accept, 100000, clean |
-| 08 mutate-while-iterating | §5 | `@v` acquires for the `for-each` call; the closure is non-escaping (`for-each`'s `f` is `:borrow`) so capturing `&v` is legal; `v` is captured, so each `append` acquires and `push!` sees a count above one and copies (§6.6, traced) | accept, 6, clean |
+| 07 recursive-accumulator | §4, §5 | the self call is a real tail call (§6.10): `acc` is inferred owned (§6.4: returned, and passed a fresh vector at a tail call); `(conj acc n)` is `Owned`, moved into the call; the frame's `acc` released before the jump; the base case moves `acc` out; constant stack | accept, 100000, clean |
+| 08 mutate-while-iterating | §5 | the copy-in acquires (§6.6, D1); `@v` acquires for the `for-each` call, an ordinary call (§6.10 rule (e)); the closure is a stack closure (`for-each`'s `f` is `:borrow`) so capturing `&v` is legal; each `append` acquires again and `push!` sees a count above one and copies (§6.6, traced) | accept, 6, clean |
 | 09 iterator-outlives-source | §3.1 | `iter` stores `v` into the iterator struct (E2, retain); `evens` returns `Owned`; `v`'s `let` releases; the iterator keeps the vector | accept, 2, clean |
 | 10 atom-old-value | §7 | `plet` → `spawn`; `Send (Atom (Vec i64))` holds; the `pmap` closure captures `a` (`Send`) → colour `send`; `@a` acquires under the lock; `swap!` releases the old vector after the store; `snapshot` keeps it | accept, 1000, clean |
 | 11 borrow-across-await | §8 | `async` is E3 for `s` (retained at creation) and requires `Send str` ✓; the task's frame owns it; `s`'s `let` releases | accept, 5, clean |
@@ -1479,7 +1685,7 @@ fragment; the rest is the position and witness the checker appends).
 | 14 reject-inout-in-async | §8 | `fill` has `&buf`, and its `async` mentions `&buf` and is the body's value, so `fill` is an async function (§6.9; syntax §3.1), checked first | reject: `& parameter in async function: buf in fill` |
 | 15 cycle-through-cell-leaks | §6 | `[k]` retains `k` (E2); `set!` stores the vector into `k`'s cell; the `let` releases one count; the audit finds the SCC through the cell (§6.7) | accept, 1, leak-cycle |
 | 16 coordinated-update-single-atom | §7 | `Send Accounts` holds (scalar fields); one `swap!` replaces the whole struct: `f`'s `Owned` result stored, the old released; `snap`/`final` acquire and release | accept, 200, clean |
-| 17 inout-and-borrow-same-call | §5 | `v` occurs in another argument → acquire copy-in; `@v` acquires again; `push!` copies; write-back releases the old vector; the temporary released after the call (§6.6) | accept, 4, clean |
+| 17 inout-and-borrow-same-call | §5 | the copy-in acquires (D1); `@v` acquires again; `push!` copies; the write-backs release the old vector's counts; the temporary released after the call (§6.6, traced) | accept, 4, clean |
 | 18 reject-inout-captured-by-escaping-closure | §5 | the `fn` is at E1 → escaping; its capture set contains `&` parameter `v` (§6.5) | reject: `& parameter captured by escaping closure: v in make-pusher` |
 | 19 weak-parent-pointer | §6 | `(weak parent)` is not a count operation; `conj` and `set!` on the children cell are E2; the strong graph is a tree; `let`s release in reverse (§6.7) | accept, 2, clean |
 | 20 weak-ref-to-dead-object | §6 | the inner `let` releases `v` (freed; box cleared); `@w` finds the box dead → `nil` (§6.7) | accept, 1, clean |
@@ -1494,19 +1700,26 @@ Programs that the confirmed findings on this document turned into
 candidate cases (an `&` parameter used as a value, a whole-object
 pattern variable, a cell read beside a sibling write, a pre-`await`
 use of a capture, an `&` argument through a self tail call, a discarded
-`Task`, `(some nil)`, `weak` of a literal, an in-place update inside
-`dotimes`, a taken field reached through `weak`, a user `count`, an
-`await` inside a loop, and the others), and those of the second round
-(a push into a `Form` literal that must copy, an `&` function that
-blocks on a task, `derive` on a generic struct, a declared `:borrow`
-that escapes, a spliced top-level macro, a `def` table read from two
-threads, one task joined by two threads and awaited by two tasks, a
-bounded generic instantiated at two `ptr`-class types, a `weak` taken
-on a shared object, an `:as` pattern in `let`), and those of the third
-(`derive` on an enum, a closure passed at a self tail call, a `def`
-naming a function, a macro that emits `nil`), are listed with their
-expected headers in `spec/drafts/PROPOSED_CASES.md`; they become cases
-only when added to `cases/` with the owner's sign-off.
+`Task`, `(some nil)`, `weak` of a literal, an update inside `dotimes`,
+a user `count`, an `await` inside a loop, and the others), those of the
+second round (a push into a `Form` literal that must copy, an `&`
+function that blocks on a task, `derive` on a generic struct, a
+declared `:borrow` that escapes, a spliced top-level macro, a `def`
+table read from two threads, one task joined by two threads and
+awaited by two tasks, a bounded generic instantiated at two
+`ptr`-class types, a `weak` taken on a shared object, an `:as` pattern
+in `let`), those of the third (`derive` on an enum, a closure passed at
+a self tail call, a `def` naming a function, a macro that emits `nil`),
+and those D5 and D6 call for (a mutual tail recursion of depth 10⁶, a
+tail call passing a stack-eligible object, a tail call with an `&`
+argument that is not a self-forward, a stack object captured by an
+escaping closure, a returned closure over a would-be stack object) are
+listed with their expected headers in `spec/drafts/PROPOSED_CASES.md`;
+they become cases only when added to `cases/` with the owner's
+sign-off. Its entries 25, 29, 30 and 35 predate D1 and D5 (field
+places, exclusivity, taken fields) and are not updated there; D1 makes
+30 and 35 ill-formed and turns 25's and 29's `--explain` expectations
+into `acquire`.
 
 ---
 
@@ -1514,8 +1727,9 @@ only when added to `cases/` with the owner's sign-off.
 
 lIR is the S-expression assembler for LLVM IR (liar's `doc/lIR.md`),
 used as it is: opaque `ptr`, `defstruct` with positional field types,
-`define`/`declare`, `call`/`tailcall`, `indirect-call` in its present
-form `(indirect-call fnptr R args..)`, `getelementptr`, `load`/`store`,
+`define`/`declare`, `call`/`tailcall`, `indirect-call` and
+`indirect-tailcall` in their present form `(indirect-call fnptr R
+args..)`, `getelementptr`, `load`/`store`,
 `alloca`, `br`/`phi`/`select`, `icmp`, and the atomic operations
 `atomicrmw`, `cmpxchg`, `atomic-load`, `atomic-store` and `fence`, which
 lir-core parses but `doc/lIR.md` does not yet document (§8.11). lIR has
@@ -1531,13 +1745,14 @@ element type, §8.3; §8.4 writes the indirect call as lIR has it; a
 stack object is a word-sized `alloca` addressed through
 `getelementptr` on its struct type, §8.2; every static object and
 table is built by the module initialiser of §8.2 and reached through a
-`ptr` global) and §8.11 lists what hardening may add (§10 items 25,
-33). Everything
+`ptr` global) and §8.11 lists what hardening must add (`musttail`) and
+what it may add. Everything
 fibber-specific is a naming and layout convention on top; no fibber
 vocabulary enters lIR, and none of liar ADR 021's safe-lIR features
 (`own`, `rc`, `closure`) is used. Runtime support functions are ordinary lIR `define`s in a
-`fib.rt` module (or C, linked). All of §8 is Proposed except where a
-Decided rule forces a layout.
+`fib.rt` module (or C, linked). All of §8 is **Decided** as the v1
+mapping; a later lIR extension (§8.11) may change a shape without
+changing a rule.
 
 ### 8.1 Representation of every type
 
@@ -1553,7 +1768,7 @@ Decided rule forces a layout.
 | `ptr` (unsafe) | `ptr`, uncounted | i64-like scalar |
 | every object type (`str`, `Form`, `Array`, struct, enum with fields, `Cell`, `Atom`, `Weak`, `Task`, closure) | `ptr` to a block starting with the header (§8.2) | ptr |
 | `(Option T)`, `T` an object type that is not itself an `Option` | `ptr`, null = `nil`; no allocation for `some` | opt |
-| `(Option T)`, `T` a scalar, a `dyn`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1, §10 item 14) | ptr |
+| `(Option T)`, `T` a scalar, a `dyn`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
 | `(fn κ (Ā) R)` | `ptr` to a closure object (§8.4) | ptr |
 | `(dyn P)` | `{ ptr ptr }` by value: object, vtable | dyn |
 | `(& T)` parameter | `ptr` to a private cell (§8.6) | — |
@@ -1592,8 +1807,8 @@ An `IMMORTAL` or `STACK` object has no count: its `count` field is
 needs > 0), and nothing ever changes it; a static object built by the
 module initialiser (or emitted as a constant once lIR holds one,
 §8.11), a literal allocated by the interpreter, a stack object's
-`alloca` and `fib.immortalise` all initialise it so (Proposed; §10 item
-30). `type-id` indexes the table `fib.types` of per-type records
+`alloca` and `fib.immortalise` all initialise it so (**Decided**).
+`type-id` indexes the table `fib.types` of per-type records
 `(defstruct fib.typerec (ptr ptr ptr i64))` — `drop`, `trace`, `name`,
 `size` — one per monomorphised object type: `drop` releases the
 object's counted children; `trace` calls a callback on each child
@@ -1617,9 +1832,9 @@ constructors (§8.4), vtables (§8.5) — with `fib.alloc` followed by
 `def`s (§8.10). Once lIR has struct-typed constants (§8.11) the static
 objects become static data with the same headers and nothing else
 changes: an `IMMORTAL` object is never freed either way and the audit
-does not track it (§6.7) (Proposed; §10 item 33).
+does not track it (§6.7) (**Decided**).
 
-**The flags word is accessed atomically** (Proposed; §10 item 29).
+**The flags word is accessed atomically** (**Decided**).
 `SHARED`, `STACK` and `IMMORTAL` are fixed before any second thread can
 see the object, but `HAS-WEAK` is set by `(weak x)` on an object that
 may already be shared while another thread reads the same word in
@@ -1654,7 +1869,6 @@ fib.unique? (ptr p) -> i1
     if flags(p) & (SHARED|IMMORTAL|STACK): return 0   ; shared: never written in place; static and
                                                       ; stack data have no count to test (§6.6)
     return count == 1
-fib.takeable? (ptr p) -> i1                      ; unique? and not HAS-WEAK: a field of p may be taken (§6.6)
 fib.share   (ptr p) -> void                      ; §8.8
 fib.immortalise (ptr p) -> void                  ; def initialisation (syntax §3.19): walk p through trace,
                                                  ; stopping at IMMORTAL objects; on each: count := 0,
@@ -1748,6 +1962,23 @@ the creating frame: `(alloca i64 (i32 k))` addressed through
 pointers. Colours have no representation. A named `fn`'s
 self-reference is the closure's own `env`.
 
+**The closure convention** (**Decided**, D5): `env` and every object
+argument are owned by the callee. The caller `consume`s the closure
+value and each argument (§6.3, §6.4); `L.code` releases `env` — its own
+closure object — and its object parameters at every exit, unless it
+hands them on: a self tail call of a named `fn` passes `env` on
+unchanged, and a tail call through another value consumes as §8.9
+says. Named functions used as values are `IMMORTAL` closures whose
+code is an **adapter** `f.clo`: it ignores `env`, calls `f` giving each
+argument what `f`'s inferred kind wants (an owned position takes the
+argument as it is; a borrowed position takes it and `fib.release`s it
+after `f` returns) and returns the result; when every object parameter
+of `f` is owned the adapter is a `tailcall`, otherwise one extra frame
+that never grows. Constructors likewise. Retain and release on an
+`IMMORTAL` or `STACK` closure are no-ops, so a stack closure called
+directly, or a named function passed as a value, pays nothing for the
+convention beyond the consume of its object arguments.
+
 ### 8.5 Protocol dispatch
 
 Static: the monomorphiser rewrites `(count v)` at `v : (Vec i64)` to
@@ -1781,10 +2012,10 @@ Retain and release of a `(dyn P)` value act on `obj`.
   lIR type is at most one word — addressed through `(getelementptr
   %struct.fib.cell t (i32 0) (i32 3))` (§8.2), since lIR's `alloca`
   takes no struct type; its header is stored (count 0, `STACK`) and it
-  is initialised by the copy-in (move: `store` the place's content and
-  null the place, or take the field when `fib.takeable?` holds;
-  acquire: `store` the retained content); passed as `ptr`; write-back
-  as §6.6; the `alloca` needs no drop. Case 17's `(push-count &v @v)`
+  is initialised by the copy-in (`store` the acquired content, §6.6) or,
+  when forwarded at a self tail call, not created at all (the caller's
+  pointer is passed on); passed as `ptr`; write-back as §6.6; the
+  `alloca` needs no drop. Case 17's `(push-count &v @v)`
   emits exactly this: three words, the header, the acquired vector
   stored through the field-3 `getelementptr`, `push-count` called with
   the `alloca`'s address, the content stored back into `v` afterwards.
@@ -1823,7 +2054,7 @@ value, a named function used as a value, a vtable), a fresh box with
 target `x` is allocated and not registered, and `x`'s header is not
 written (static data may be read-only); such a box is never cleared,
 `@w` on it always succeeds, and it is freed like any other box when its
-own count reaches zero (§10 item 24). `@w`: lock the box; `t = load
+own count reaches zero (§6.7). `@w`: lock the box; `t = load
 target`; if null → unlock, `nil`; else if `t` is `IMMORTAL` → unlock,
 `(some t)` with no count operation (its count is 0 and it never dies,
 §8.2); else "retain if count > 0" on `t` (a plain increment when not
@@ -1859,10 +2090,13 @@ follows the same edges (`fibref` `heap/shared.rs`).
 ptr result  ptr waiters  ..captures ..locals)`. `async` lowers to a
 state machine, not to LLVM coroutine intrinsics: `resume(task)`
 switches on `state`, runs to the next `await`, stores the live locals
-into the task object and returns.
+into the task object and returns. The executor is multi-threaded
+(**Decided**, D7): a pool of worker threads takes tasks from a shared
+run queue, so any worker may resume any task, which is why a task's
+captures must be `Send` and are share-marked at creation (§5.5, §6.9).
 
-**One driver at a time, any number of waiters** (Proposed; §10 item
-27). `Send (Task T) = Send T` (§1.6), so one task can be joined from
+**One driver at a time, any number of waiters** (**Decided**).
+`Send (Task T) = Send T` (§1.6), so one task can be joined from
 two threads (`(plet ((a (join t)) (b (join t))) (+ a b))`) or awaited
 by two tasks, and the checker accepts both (proposed cases 43, 44). A
 count on the task is what keeps it allocated; it is not mutual
@@ -1910,54 +2144,64 @@ registered waker — holds a count on it; nothing touches a task it does
 not hold, and nothing resumes a task it has not claimed. The
 interpreter may run tasks as coroutines; frees must match.
 
-### 8.9 Calls, returns, self tail loops
+### 8.9 Calls, returns, tail calls
 
 - A `defun` is `(define (R) ((A₁ p₁) .. (Aₙ pₙ)) ..)`; `&` parameters
-  are `ptr`; `unit` results are `void`.
-- The caller releases its owned temporaries after the call returns and
-  after the write-backs (§6.3); the callee retains at its own escape
-  positions. No ownership passes through a calling convention except
-  `spawn`'s argument (consumed).
-- A self tail call, and a `loop` (§6.10): parameters or loop variables
-  become `alloca` slots; on entry each plain object parameter is
-  `fib.retain`ed into its slot (a `loop` variable's initialiser is
-  `consume`d into it; an `&` parameter's slot holds the private cell
-  pointer and is never retained or released); the body starts at
-  `(block loop)`; the tail call or `recur` evaluates its arguments into
-  temporaries with `consume`, runs the pending scope-exit releases,
-  `fib.release`s each old slot value, stores the temporaries, and `(br
-  loop)`; a forwarded `&v` argument emits nothing for its slot. The exit
-  path `consume`s the result, releases the slots and `ret`s (or falls
-  through, for a `loop`). No `musttail` is needed.
-- Calls to other functions in tail position are ordinary `call` +
-  releases + `ret` in v1.
+  are `ptr`; `unit` results are `void`. An owned parameter (§6.4) is an
+  owning binding of the frame: `fib.release` on every exit path unless
+  it was moved out (returned, stored, captured, passed to `spawn` or
+  passed at a tail call); a borrowed parameter emits nothing.
+- An ordinary call: `call`; for each argument at an owned position of
+  the callee, `consume` before the call (`fib.retain` a
+  `Borrowed`/`Derived` argument; an `Owned` temporary is moved);
+  nothing for a borrowed position. The caller releases its remaining
+  owned temporaries after the call returns and after the write-backs
+  (§6.3); the callee retains at its own escape positions. No other
+  ownership passes through a calling convention except `spawn`'s
+  argument (consumed).
+- A tail call (§6.10): evaluate the head and the arguments; `consume`
+  each argument for its position, moving the frame's owning bindings
+  that are arguments; run the scope-exit releases of the enclosing
+  scopes and release the step's other temporaries; then `(tailcall @g
+  args..)` for a known callee, or `(indirect-tailcall code R env
+  args..)` through a closure value with the consumed closure object as
+  `env` (§8.4); nothing follows in the function. A `loop`'s `recur` is
+  the same sequence ending in `(br loop)` on `alloca` slots for the loop
+  variables, since it cannot leave the function. lIR's `tailcall` must
+  lower to `musttail` (§8.11): a frame that stays would make a
+  100000-deep recursion overflow where the interpreter does not, and
+  method.md rule 6 requires the two to agree.
+- A call that §6.10 rules (b) or (e) make ordinary is `call` followed
+  by the write-backs and releases, then `ret`.
 
 ### 8.10 What the compiler must emit, summarised
 
 | Event | Emission |
 |---|---|
 | object literal, constructor, `cell`, `atom`, closure creation | `fib.alloc`, header init, `consume` each stored field/capture (E2/E3) |
-| E1 return of `Borrowed`/`Derived` | `fib.retain` before `ret` |
+| E1 return of `Borrowed`/`Derived` | `fib.retain` before `ret`; an owned parameter that is the result is moved out instead (no operation) |
 | E2 store of `Borrowed`/`Derived` | `fib.retain` before the store |
 | E4 `spawn` | `consume` the closure, `fib.share`, allocate the task with count 2, hand both to the runtime |
 | join retain (`if`/`match`) | `fib.retain` at the tail of each non-`Owned` branch |
 | scope exit | `fib.release` each owning binding not moved out, in reverse order, on every exit path |
 | `Derived(x)` result leaving `x`'s scope | `fib.retain` the result, then the releases |
-| `Owned` temporary as a plain argument | `fib.release` after the call returns and its write-backs |
+| argument at an owned position of a known callee, or any argument of a call through a closure value | `consume` before the call: `fib.retain` a `Borrowed`/`Derived` argument, move an `Owned` one (§8.9) |
+| `Owned` temporary at a borrowed position | `fib.release` after the call returns and its write-backs |
+| owned parameter | `fib.release` on every exit path unless moved out (§8.9) |
 | non-final `do` step with an `Owned` value | `fib.release` at the step's end |
 | `@c`, `@a`, `@w` | as §8.6/§8.7 (always a `fib.retain`; atom under lock; weak "retain if alive") |
 | `set!`, `reset!`, `swap!` | as §8.6: `consume` new, share if `SHARED`, store, `fib.release` old |
-| `&` copy-in | move (store, clear the place / take the field when `fib.takeable?`) or acquire (`fib.retain`) as §6.6; nothing for a forwarded `&v` in a self tail call |
-| `&` write-back | store the private cell's content into the place; `fib.release` the place's old content (acquire case); `set-field!` semantics for a field place |
+| `&` copy-in | acquire: `fib.retain` the variable's content and store it into the private cell (§6.6); nothing for a forwarded `&v` in a self tail call |
+| `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content |
 | `array-set!`, `set-field!` | `fib.unique?` test (flags first, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
 | module initialiser `fib.init.<module>` | called by the entry point before the program's `main`, modules in dependency order (§8.2): allocate and fill the type table, build every static object (literals, named-function closures, vtables) with `fib.alloc` and an `IMMORTAL` header, store each address into its `ptr` global |
 | `def` initialisation | in the module initialiser after its static objects, `def`s in source order: evaluate the constant expression and `fib.immortalise` its value (syntax §3.19); as static data once lIR holds struct-typed constants (§8.11) |
-| stack object (`STACK`: private `&` cell, non-escaping closure, later scope-local objects) | `(alloca i64 (i32 k))`, `k` the layout in 8-byte words, header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |
+| stack object (`STACK`: private `&` cell, stack closure, scope-local object, §6.11) | `(alloca i64 (i32 k))`, `k` the layout in 8-byte words, header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |
 | `(weak x)` | box lookup or allocation under the table mutex; `HAS-WEAK` set with `atomicrmw or` (§8.7) |
-| self tail call, `loop`/`recur` | §8.9 |
+| tail call, `loop`/`recur` | §8.9: consume the arguments, run the releases, `tailcall`/`indirect-tailcall` or `br` |
 | `raw-retained` | `consume` the operand; the count is the foreign side's until `release-raw`/`fib_release` |
 | `drop` per type | `fib.release` each object field; `fib.weak-clear` if flagged; `free` |
-| stack object scope end (later) | inline `drop` body, no `free` |
+| stack object scope end | inline `drop` body, no `free` (§6.11) |
 
 ### 8.11 lIR hardening this mapping relies on
 
@@ -1967,8 +2211,15 @@ argument is typed `ptr`, so §8.4's calls pass scalars through
 `ptr`-sized words until then); string globals that load correctly; a
 `fence` with real cross-thread semantics; `atomicrmw`/`cmpxchg`/
 `atomic-load`/`atomic-store` documented in `doc/lIR.md` (they are parsed
-and lowered but undocumented); `tailcall` as `musttail` only if general
-tail calls are adopted later (§10 item 6). Conveniences this mapping
+and lowered but undocumented); `tailcall` and `indirect-tailcall`
+lowered to `musttail` — today they are `tail`, a hint LLVM may ignore
+(`lir-audit/README.md`) — under a calling convention that guarantees a
+tail call between differing prototypes (LLVM's `tailcc`; under the C
+convention `musttail` requires matching prototypes, which mutual
+recursion and calls through closure values do not have), which §8.9
+relies on: without it a compiled tail recursion of depth 10⁶ (proposed
+case 52) overflows the stack where the interpreter does not, failing
+method.md rule 6. Conveniences this mapping
 does *not* depend on but would use if added: `switch` (§8.3 uses
 `icmp`/`br` chains for `match`), an array type in the type grammar
 (§8.3 addresses trailing elements with `getelementptr`), a named
@@ -1989,287 +2240,118 @@ here needs ADR 021's safe lIR.
 
 `fibc --explain file.fib` prints, per `defun`, `fn` and `impl` method,
 the complete output of §3, §5 and §6 so that a verdict can be checked by
-eye and diffed against the interpreter's trace (Proposed):
+eye and diffed against the interpreter's trace (**Decided**):
 
 ```
 defun dup-all : (fn ((& (Vec i64))) unit)
-  params:    v  &param  type=(Cell (Vec i64))  escapes=no  exclusive=no (captured by closure @8:15)
+  params:    v  &param  type=(Cell (Vec i64))  escapes=no
   bindings:  (none)
-  closure @8:15  escaping=no  reason=arg-to-borrow(for-each.f)  captures: v (alias)
-  calls:     @8:3  for-each(@v, <closure>)   @v: acquire
-             @8:24 append(&v, x)             &v: acquire (v not exclusive)
+  closure @8:15  escaping=no  heap=no  reason=arg-to-borrow(for-each.f)  captures: v (alias)
+  calls:     @8:3  for-each(@v, <closure>)   call (e: fresh argument at borrowed position for-each.coll)   @v: acquire
+             @8:24 append(&v, x)             call (b: & argument)   &v: acquire
   ops:       L8 retain [@v]; L8 call for-each; L8 release [@v]
+
+defun build : (fn (i64 (Vec i64)) (Vec i64))
+  params:    n  scalar;  acc  owned (returned; tail call passes fresh)  escapes=yes
+  calls:     @3:18 build(n-1, (conj acc n))   tail-call   arg 2: moved;  acc: released before the jump
+  ops:       L3 call conj; L3 release [acc]; L3 tailcall build
 ```
 
-Every line is one of: a parameter (type, summary, exclusivity with the
-reason), a binding (`owns` / `alias-of b` / `derived-of b` /
-`scope-local`), a closure literal (`escaping` with the clause of §6.5 that
-decided it, `arg-of-self-tail-call` or `arg-of-recur` for the slot-loop
-rule, its captures with their kinds), a call with the copy-in
-decision of every `&` argument (`move`, `acquire`, or `forward` for the
-`&v` of a self tail call, §6.10), a colour solution (`ς₁ = local, forced by
-capture n`), and the emitted operations with source lines. Reject cases
-print the error and the rule number of this document. The interpreter's
-trace (`fibref` `heap/event.rs`) lists every retain, release and free
-with the same line numbers, so the compiler's `ops` and the interpreter's
-trace must free the same objects at the same lines (method.md rule 6).
+Every line is one of: a parameter (type, count kind `owned` or
+`borrowed` with the rule of §6.4 that decided it, summary), a binding
+(`owns` / `alias-of b` / `derived-of b`, and `scope-local` when §6.11
+holds), a closure literal (`escaping` with the clause of §6.5 that
+decided it, `heap` with its reason — `arg-of-tail-call`,
+`head-of-tail-call`, `arg-of-recur` or the escaping use — and its
+captures with their kinds), a call (`tail-call`, or `call` with the
+rule of §6.10 that made it ordinary; the copy-in of every `&` argument,
+`acquire` or `forward`), a colour solution (`ς₁ = local, forced by
+capture n`), and the emitted operations with source lines. Reject
+cases print the error and the rule number of this document. The
+interpreter's trace (`fibref` `heap/event.rs`) lists every retain,
+release, free, frame exit and tail-call jump with the same line
+numbers, so the compiler's `ops` and the interpreter's trace must free
+the same objects at the same lines (method.md rule 6).
 
----
+## 10. Decision record and open items (types and checker)
 
-## 10. Open decisions (types and checker)
+On 2026-09-27 the owner signed off the 33 items of the three review
+rounds, each as recommended except where the table says otherwise,
+together with seven amendments:
 
-Each needs the owner's sign-off. Recommendation first, alternative
-second. Items 1–6 shape the checker; 7–11 the runtime; 12–17 are
-smaller; 18–26 came out of the confirmed findings on the synthesis;
-27–31 out of the second round of findings; 32–33 out of the third.
+- **D1** copy-in always acquires: no copy-in move, no exclusive places,
+  no takeable structs, no taken fields, no `&(. x f)` places, no
+  `fib.takeable?`, no taken-field audit event (§6.6, §8.2);
+- **D2** `&` parameters are cells read with `@v`, never values (§2.14);
+- **D3** HM inference generalising only at top-level `defun` SCCs; `let`
+  and `fn` never generalise; no coercions; no literal polymorphism
+  (§1.1, §1.7, §2.4, §3);
+- **D4** closure colours as the two-point lattice in function types
+  (§5.4);
+- **D5** full tail calls with Lean-4-style owned parameters, replacing
+  "only self tail calls become loops" (§6.3 E6, §6.4, §6.5, §6.10,
+  §6.12, §8.4, §8.9, §8.11; ownership.md §2–§4);
+- **D6** stack allocation of scope-local objects in v1, decided on the
+  binding over all paths (§6.11, §6.12, §8.2, §8.10);
+- **D7** `async` captures must be `Send`; the executor is
+  multi-threaded (§2.8, §5.2, §6.9, §8.8).
 
-1. **Inference is HM with generalisation only at `defun` SCC boundaries;
-   `let` and `fn` never generalise (§3).** Recommend: yes; liar's
-   `lib/` ports without annotations, the ownership pass sees one
-   concrete type per local, and cells need no value restriction.
-   Alternative: generalise `let`-bound syntactic values.
-2. **Closure colours are a two-point lattice with `⊑` constraints at
-   flow sites, quantified in schemes (§5.4).** Recommend: yes; it is what
-   lets `(pmap f xs)` take a parameter `f` and lets `comp`/`partial`
-   compose across a boundary. Alternative: colours unified by equality
-   (rejects composing a `send` with a `local` closure) or a syntactic
-   rule (only literals and names at boundaries).
-3. **Copy-in moves when the place is exclusive, else acquires (§6.6);
-   the interpreter implements the same rule.** Recommend: yes; it is the
-   only route to in-place updates through user-defined `&` functions and
-   the condition is syntactic plus one count test. Alternative: always
-   acquire; every `&` call copies on its first update.
-4. **Reads of cells are owned (+1) and never elided in v1 (§6.3,
-   §6.7).** Recommend: yes; owned reads are the only rule under which
-   cases 08 and 17 are sound without alias analysis, and both elisions
-   proposed so far were shown unsound: the ownership draft's under cell
-   aliasing, and the synthesis's "cell-free primitives" list under a
-   sibling write in the same step (`(array-get (. @s arr) (do (set! s
-   ..) 0))`) and under user implementations of `count`/`nth`/`+`.
-   Alternative: an elision restricted to a closed list of
-   scalar-producing compiler builtins that dispatch to no user code
-   (`array-len`, `str-len`, the scalar instances of `Num`/`Eq`/`Ord`),
-   applied only when no other sub-expression of the same step contains
-   a call, `set!`, `set-field!`, `array-set!`, `swap!` or `reset!`; or
-   borrowed reads with a flow-sensitive "no write while borrowed"
-   check, a small borrow checker.
-5. **Escape kinds are declared on protocol methods (default escaping),
-   checked on every `impl`; closure types carry none; calls through
-   function values assume every argument escapes (§6.4).** Recommend:
-   yes; the only modular option under dynamic dispatch and separate
-   compilation, and the safe default. Alternative: kinds in closure
-   types `(fn ((a :borrow)) r)`, which needs variance rules.
-6. **Only self tail calls become loops; no owned-argument calling
-   convention (§6.10).** Recommend: yes; case 07 gets constant stack
-   without contradicting §4's "never freed by the callee" and without a
-   second convention. Alternative: an inferred `own` convention for
-   accumulator parameters (constant stack for mutual recursion too, at
-   the price of a per-caller convention flip and a reading of §4 that
-   the owner must bless). A self tail call forwards an `&` parameter's
-   private cell when the argument at its position is `&v` itself and is
-   an ordinary call for any other `&` argument; `loop`/`recur` (syntax
-   §3.18) lower to the same slot loop, which is what lets a loop update
-   an `&` place in place and `await` inside an `async`.
-7. **Monomorphisation keyed by layout class for unconstrained type
-   variables and by full type for protocol-bounded ones (item 28);
-   whole-program compilation (§4.3).** Recommend: yes. Alternative:
-   dictionary passing with a uniform boxed representation (separate
-   compilation, boxed scalars, a runtime test in every count
-   operation).
-8. **Heap-allocate everything in v1; stack allocation is a later
-   optimisation pass verified by the audit, under the scope-local
-   condition of §6.11.** Recommend: yes; it is the lowest-risk order and
-   neutralises every stack-allocation hole the drafts had until the
-   audit can catch one. Alternative: stack allocation from day one.
-9. **`async` captures must be `Send` (§2.8, §5.2).** This follows §3.4's
-   listing of "a task" among thread crossings and is marked Decided. The
-   owner should confirm the reading; the alternative (a single-threaded
-   executor, `Task` not `Send`, no check) needs §3.4 amended first.
-10. **Atoms use a per-atom spinlock; `swap!` runs `f` outside the lock
-    and retries (§8.6).** Recommend: yes; it meets the §7 obligation
-    directly. Alternative: hazard pointers or epoch reclamation.
-11. **`(dyn P)` is not `Send` and has no `&self` methods in v1; `Send
-    ptr` is false (§5.1).** Recommend: yes. Alternative: a `Send` bit in
-    the vtable and `(dyn P :send)`.
-12. **No coercions anywhere: no `T ↝ (Option T)`, no `T ↝ (dyn P)`
-    (§1.7, §3).** Recommend: yes; the inference draft's coercions were
-    shown to make `(f (some 1) 1)` and `(f 1 (some 1))` get different
-    verdicts. Alternative: coercions attempted after all equalities, in
-    source order, with the loss of principal types that implies.
-13. **Field access and `deref` on an unresolved variable must be fixed
-    by the end of the SCC; no unique-field-name lookup (§3.4).**
-    Recommend: yes (case 19 annotates `depth`). Alternative: resolve
-    `(. x f)` to the unique struct in scope declaring `f`.
-14. **`(Option T)` is a nullable pointer only when `T` is a non-`Option`
-    object type; of a scalar, a `dyn` or another `Option` it is a heap
-    enum, and nullable `Option`s form their own layout class `opt`
-    (§4.3, §8.1).** Recommend: accept for v1; `(some nil)` and `nil`
-    must stay distinct (§1.5), and the class keeps generic code from
-    collapsing them. Alternative: an unboxed `{i1, T}` by-value
-    representation for every `Option`, a third value class in every
-    rule of §6.
-15. **Instances are keyed by `(P, head)`; no overlap, no instance for a
-    bare variable, no default methods, no supertraits in v1 (§4.1).**
-    Recommend: yes. Alternative: liar's `extend-protocol-default` as
-    blanket instances with a specificity order.
-16. **The audited heap gains `write-unique` (§6.6): a write to an
-    immutable object legal iff it is neither `SHARED`, `IMMORTAL` nor
-    `STACK` and its count is exactly 1 (item 30), used only by
-    `array-set!`/`set-field!`.** Recommend: yes; it is what "unique
-    updates happen in place" means as an audited event.
-    Alternative: no unique writes; `&` updates always copy (then §2's
-    third guaranteed minimum is vacuous).
-17. **Leak-cycle classification is fibref's (§6.7): reachable from a
-    cell or atom on a cycle, with count equal to live references.**
-    Recommend: yes; it is exactly "unreachable except through a cycle
-    of cells" and is already implemented and adversarially tested.
-    Alternative: report every leak as a failure and require a cycle
-    collector first, which contradicts §6.
-18. **A pattern variable that binds the whole scrutinee takes the
-    scrutinee's mode; `Derived(b)` is reserved for strict sub-objects;
-    a join of `Borrowed(b)` with `Derived(b)` is `Owned` with a retain
-    on the `Borrowed` branch (§6.1, §6.3, §6.4).** Recommend: yes; the
-    escape summary's exemption for `Derived(p)` is sound only if a
-    derived value is never `p` itself, and `(defun same (p) (match p (w
-    w)))` was `noescape` under the old reading, which let a closure
-    passed to it be treated as non-escaping and freed before it was
-    called. Alternative: drop the exemption and count `Derived(p)` at a
-    consume position as an escape (simpler; forces the argument of
-    `first` onto the heap once stack allocation exists).
-19. **An `&` parameter is not a value (§2.14; syntax §3.13).**
-    Recommend: yes; the private cell is a stack object of the caller's
-    frame, so `(defun leak (&v) v)` returned a pointer to memory freed
-    at the write-back, and `(cell v)`, `(weak v)` and a non-escaping
-    closure returning `v` did the same. Alternative: count private
-    cells and heap-allocate them, at a cost on every `&` call.
-20. **Instance contexts are declared with `:where` on `impl` and
-    consulted when defuns are generalised (§2.7, §3.5).** Recommend:
-    yes; a `defun` calling a method is generalised (step 5) before any
-    impl body is typed (step 6), so an inferred context would not exist
-    when it is needed, and `(defun f (b) (show b))` would lose the
-    `(Show a)` bound of `(impl Show (Box a))`. Alternative: put impl
-    bodies into the call-graph SCCs with an edge from every method call
-    to every impl of that method, keeping a constraint whose instance
-    is in the current SCC as a flexible bound of the scheme (larger
-    SCCs, more monomorphic recursion, contexts still exported).
-21. **A field is moved out of a struct only if the struct is
-    `fib.takeable?`: count 1, not shared and `HAS-WEAK` clear (§6.6,
-    §8.2); the interpreter reports a read of a taken field as an audit
-    failure.** Recommend: yes; `fib.unique?` counts strong references
-    only, and a weak reference upgraded during the call reached the
-    taken (null) field. Alternative: never move a field out; `&(. x f)`
-    always acquires, and the in-place path for a persistent vector's
-    tail relies on copy-then-unique-write instead.
-22. **`spawn` creates the task with count 2, one for the caller and one
-    for the thread, released after the result is stored; a registered
-    waker holds a count on the waiting task (the wakers form a list,
-    item 27); `main` returning joins every running thread (§6.8,
-    §8.8).** Recommend: yes; a discarded handle otherwise freed the
-    task under the running thread.
-    Alternative: detach threads at exit and exclude their objects from
-    the audit; or forbid discarding a `Task` (a type error), which
-    rejects fire-and-forget `spawn`, an ordinary program in liar's
-    library.
-23. **`async` retains every capture at creation; no pre-`await` elision
-    (§6.9).** Recommend: yes; the body does not run at creation, so a
-    use before the first `await` can run after the creating scope has
-    released the binding. Alternative: the elision only for a task
-    joined in the same step it is created, which no case needs.
-24. **`(weak x)` on an `IMMORTAL` object allocates an unregistered,
-    never-cleared box and leaves the object's header alone (§6.7,
-    §8.7).** Recommend: yes; literals may live in read-only data and
-    `fib.drop` never runs on them. Alternative: a compile error for a
-    literal operand, which cannot catch a named function passed through
-    a variable.
-25. **`match` lowers to `icmp`/`br` chains; indirect calls use lIR's
-    untyped form; no array type, struct-typed `alloca`/`global` or
-    struct-valued constant is required (§8, §8.11; item 33).**
-    Recommend: yes; it is what lIR has today, and it
-    keeps method.md rule 7 (lIR verifies its input) independent of new
-    instructions. Alternative: add `switch`, the typed `indirect-call`,
-    an array type, struct-typed `alloca`/`global` and struct-valued
-    constants to lIR first.
-26. **`(raw-retained e)`/`(release-raw p)` are the only count transfer
-    across the foreign boundary (§6.13; syntax §3.15).** Recommend:
-    yes; extern positions are scalars, so `:retains` named parameters
-    that cannot exist. Alternative: object types allowed at `:retains`
-    positions of an extern signature, with the foreign side calling
-    `fib_release`.
-27. **A task is resumed by one driver at a time (a `cmpxchg` on its
-    `driver` word), waited on by any number of joiners and awaiters
-    (a waiter list, a broadcast completion signal), its `state` and
-    `result` written once with release ordering, and its `trace`
-    excludes live locals; `Task` stays `Send` (§8.8, §6.8).**
-    Recommend: yes; nothing in the checker prevented `(plet ((a (join
-    t)) (b (join t))) ..)` or two tasks awaiting one task, and a count
-    is not mutual exclusion: two drivers would rewrite one frame, a
-    `fib.share` walk could read a frame mid-resume, and one waker slot
-    lost the second awaiter. Alternative (a): `Task` not `Send`, which
-    rejects awaiting any task created outside the `async` body, i.e.
-    task composition itself; (b) linear handles, joined or awaited
-    once, which needs a linearity check the checker has no other use
-    for, or a runtime trap that no case header can express.
-28. **Specialisations key a protocol-bounded type variable by its full
-    type argument and every other variable by layout class (§4.3).**
-    Recommend: yes; with a class-only key `(show x)` at `x : a`, `(Show
-    a)`, inside `describe<ptr>` names no implementation, so §4.2's
-    direct call and layout-class sharing could not both hold; the
-    interpreter's dispatch on the header's type id (§4.5) answers the
-    same. Alternative: per-protocol dispatch tables indexed by the
-    header's type id inside `ptr`-class specialisations, which cannot
-    serve scalars (no header) and drops "always static".
-29. **The header's flags word is read with `atomic-load monotonic` and
-    written after allocation with `atomicrmw or` (§8.2, §8.7, §8.8).**
-    Recommend: yes; `(weak x)` sets `HAS-WEAK` on an object that may
-    be shared while another thread's `fib.retain` reads the word, and
-    under the LLVM model a racing non-atomic load is `undef`, which
-    could send the retain down the non-atomic count path; monotonic
-    atomics cost a plain load and a locked `or`. Alternative:
-    `HAS-WEAK` in the count word's high bits under the count's own
-    atomics, which puts a mask into every count test.
-30. **`fib.unique?` and `fib.takeable?` test the flags before the count
-    and are false on `SHARED`, `IMMORTAL` and `STACK` objects; immortal
-    and stack objects carry count 0 (§8.2, §6.6, §6.2).** Recommend:
-    yes; without the flag test an immortal count that read 1 (a
-    constant emitted like `fib.alloc` initialises it) let `push!` write
-    into a `Form` literal pulled apart by `match`, mutating a constant
-    or faulting on read-only data while the interpreter answered
-    otherwise. Alternative: a maximum count value for immortals, which
-    still needs the flag test in `unique?` and leaves a weak upgrade's
-    `> 0` test accepting, so a missing flag test there would go
-    unnoticed.
-31. **`def` values are typed closed and monomorphic, in dependency
-    order with the `defun`s (syntax Open decision 29), and immortalised
-    before `main` (§2.16, §3.5, §8.2; syntax §3.19, syntax Open
-    decision 25).** Recommend: yes; the constant grammar keeps
-    initialisation effect-free and `Send` by construction, and the
-    immortal header makes a global count-free and safe from every
-    thread. Alternative: evaluate every `def` at compile time only (the
-    interpreter as constant folder), so no runtime initialisation
-    exists; equivalent for the programmer, heavier for the compiler.
-32. **A closure literal, or a `let`-bound closure of §6.5 clause (c),
-    that is an argument of a self tail call or of a `loop`/`recur` is
-    escaping whatever the callee's summary says (§6.5, §6.10).**
-    Recommend: yes; `spin`'s `g` is `noescape` because it is only
-    called, but the tail call is a slot loop: the jump releases the
-    creating scope's bindings and the closure survives in the slot, so
-    a non-escaping closure's uncounted capture pointed at freed memory
-    on the next iteration while the interpreter, which retains every
-    capture, answered 1 (proposed case 49). Alternative: keep a slot-loop
-    iteration's bindings alive across the jump (a frame per iteration,
-    which forfeits constant stack), or forbid closures as
-    self-tail-call arguments.
-33. **v1 builds every static object and table (the type table, string
-    and `Form` literals, named-function and constructor closures,
-    vtables, `def` values) in a per-module initialiser run before the
-    program's `main`, reached through `ptr` globals, and emits stack objects as
-    word-sized `alloca`s addressed through `getelementptr` on the
-    struct type (§8.2–§8.6, §8.10).** Recommend: yes; `lair` rejects a
-    struct-typed `alloca` or `global` (`UnknownType`) and a function
-    address as a global initialiser, so the shapes §8 gave for the
-    private `&` cell, stack closures, vtables and the type table could
-    not be emitted; the initialiser costs one allocation per static
-    object at start-up and nothing after. Alternative: add struct-typed
-    `alloca`, `global` and constants to lIR first (item 25's
-    alternative), which turns the same objects into static data with
-    no other change.
+Each item is now **Decided** in the section that states its rule; the
+old numbering is kept here because the drafts and
+`spec/drafts/PROPOSED_CASES.md` cite it.
+
+| Item | Rule | Now in |
+|---|---|---|
+| 1 | HM with generalisation at `defun` SCCs only; `let`/`fn` never generalise (D3) | §3, §2.4 |
+| 2 | two-point colour lattice with `⊑` at flow sites (D4) | §5.4 |
+| 3 | copy-in moves when exclusive — **decided the other way (D1): always acquire** | §6.6 |
+| 4 | cell reads owned and never elided | §6.3, §6.7 |
+| 5 | escape kinds declared on methods; closure types carry none | §6.4 |
+| 6 | only self tail calls become loops — **replaced by D5: every admissible call in tail position is a tail call; kinds inferred** | §6.10, §6.4 |
+| 7 | monomorphisation by layout class / full type; whole program | §4.3 |
+| 8 | heap everything in v1 — **replaced by D6: stack allocation from the first implementation** | §6.11 |
+| 9 | `async` captures `Send` (D7) | §2.8, §5.2, §6.9 |
+| 10 | atoms: per-atom spinlock, `swap!` retries | §8.6 |
+| 11 | `(dyn P)` not `Send`; `Send ptr` false | §4.4, §5.1 |
+| 12 | no coercions anywhere (D3) | §1.7, §3 |
+| 13 | field access and `deref` fixed by the end of the SCC | §3.4 |
+| 14 | `Option` as a nullable pointer only for non-`Option` object payloads; class `opt` | §8.1, §4.3 |
+| 15 | instances keyed by `(P, head)`; no overlap, defaults or supertraits | §4.1 |
+| 16 | `write-unique` obligation on fibref | §6.6, §6.12 |
+| 17 | leak-cycle classification is fibref's | §6.7 |
+| 18 | whole-scrutinee pattern variable takes the scrutinee's mode | §6.1, §6.3, §6.4 |
+| 19 | an `&` parameter is not a value (D2) | §2.14 |
+| 20 | instance contexts declared with `:where` | §2.7, §3.5 |
+| 21 | `fib.takeable?` and taken fields — **dropped with D1: nothing is ever taken** | §6.6 |
+| 22 | task created with count 2; `main` joins running threads | §6.8, §8.8 |
+| 23 | `async` retains every capture at creation | §6.9 |
+| 24 | `weak` of an `IMMORTAL` object | §6.7, §8.7 |
+| 25 | `match` as `icmp`/`br`; untyped `indirect-call`; no new lIR types required | §8, §8.11 |
+| 26 | `raw-retained`/`release-raw` | §6.13 |
+| 27 | one driver, any number of waiters; `Task` stays `Send` | §8.8, §6.8 |
+| 28 | specialisation keys | §4.3 |
+| 29 | flags word read and written atomically | §8.2, §8.7, §8.8 |
+| 30 | `fib.unique?` tests flags first; immortal and stack objects carry count 0 | §8.2, §6.6 |
+| 31 | `def` values typed closed, in dependency order, immortalised before `main` | §2.16, §3.5, §8.2 |
+| 32 | a closure passed at a self tail call is escaping — **generalised by D5: heap at any tail call (E6), escaping only by its uses** | §6.5, §6.10 |
+| 33 | static objects built by the module initialiser; word-sized stack `alloca`s | §8.2, §8.10 |
+
+### Open
+
+One item, raised while applying D5; nothing downstream depends on it,
+and the decided rule is what the text above states.
+
+1. **`&` forwarding beyond the self call at the same position.** D5
+   admits a tail call with an `&` argument only when it is a self call
+   forwarding the function's own `&` parameter at its own position
+   (§6.10 rule (b)). Under real tail calls the position is immaterial —
+   a private cell is a `ptr` argument (§8.6) — and so is the callee:
+   any `&` parameter of the caller forwarded to any `&` position of any
+   callee names a cell that a frame below the caller owns and writes
+   back after the whole chain returns, and the distinct-variables check
+   (§6.5) already forbids forwarding one cell twice. Recommend: relax
+   rule (b) to "every `&` argument of the call forwards an `&` parameter
+   of the caller", which lets an in-out accumulator thread through
+   mutual recursion (`even-fill`/`odd-fill`) in constant stack.
+   Alternative: keep the decided rule; such programs are accepted as
+   ordinary calls with copy-in and write-back, one frame per call.
