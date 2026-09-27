@@ -35,11 +35,15 @@ not a rule the programmer has to satisfy. Its guaranteed minimum:
 - **Scope-local objects are not counted.** An object created in a scope
   that never escapes it (§3) is freed when the scope ends, with no count
   operations, and may be allocated on the stack.
-- **Parameters are borrowed** unless the compiler must own the
-  parameter to keep a tail call a tail call, in which case the caller
-  hands the count over and the callee releases it. Passing an argument
-  still costs nothing in the borrowed case, and the callee counts a
-  borrowed parameter only if it makes it escape.
+- **Parameters are borrowed** unless the checker infers them **owned**
+  (types §6.4): a parameter that the function returns, stores, captures
+  in a closure on the heap or hands to another thread is owned, and so
+  is one whose count a tail call must carry, the caller's frame being
+  gone while the callee runs. The caller hands an owned parameter's
+  count over and the callee releases it or hands it on; a borrowed
+  argument costs nothing to pass, and the callee counts only the parts
+  of it that it returns or stores. The reference interpreter follows
+  the same convention (types §6.12).
 - **Unique updates happen in place.** Updating an object whose count is
   one reuses it instead of copying (§5).
 
@@ -64,16 +68,24 @@ else is.
 
 ## 4. Functions
 
-- A parameter is a **borrow** unless the checker infers it **owned**.
-  The callee never frees a borrowed parameter: it is valid for the whole
-  call. An owned parameter is the callee's to release or hand on. Which
-  one applies is inferred and printed by the checker (types §6.4), never
-  written; the meaning of the program is unchanged: the same objects
-  are freed, at the same points.
+- A parameter is a **borrow** unless the checker infers it **owned**
+  (§2). The callee never frees a borrowed parameter: it is valid for
+  the whole call. An owned parameter arrives with one count and is the
+  callee's to release or hand on. Which one applies is inferred and
+  printed by the checker (types §6.4), never written. It changes no
+  result and no verdict, but it decides whether an argument's count
+  dies at the callee's exit or after the caller's call, so it is a
+  calling convention that the reference interpreter follows too (types
+  §6.12): the two free the same objects at the same points.
 - Every result is **owned**: the caller receives +1 and is responsible
   for it.
 - Returning a parameter, or something reachable from a parameter, is an
-  escape (§3.1): the callee retains it before returning.
+  escape (§3.1), and the result carries its own count. A parameter that
+  is returned is owned: where it is itself the function's value, its
+  count is moved out to the caller; where it meets another value in a
+  branch join, the join retains it and the parameter is released at the
+  exit (case 04). A part of a parameter is retained before it is
+  returned (case 01).
 
 This is what makes returning part of an argument, or choosing between a
 borrowed and a fresh value on different branches, safe (cases 01, 04).

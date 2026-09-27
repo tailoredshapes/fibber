@@ -148,20 +148,28 @@ Evaluation is strict and **left to right, inner before outer**
   ... `an`, then the call; for an `&x` argument the copy-in happens at
   its argument position (§3.13), and the write-backs happen after the
   call returns, in parameter order (they target distinct variables, so
-  the order is unobservable);
-- a **tail call** (a call in tail position of a function body that
-  types §6.10 admits as one; **Decided**, D5): its head and arguments
+  the order is unobservable); the two in-place primitives of §3.13 have
+  neither, and update the variable's own cell;
+- a **tail call** (a call in tail position of a `defun` or `fn` body
+  that types §6.10 admits as one; **Decided**, D5; a call in tail
+  position of an `async` body never is one, since the task stores the
+  body's value after the call returns, §3.14): its head and arguments
   as above, then the scope exits of every scope enclosing the call in
   the body (their owning bindings released, except those moved into the
-  call) and the release of the step's other temporaries, then the jump.
-  The callee's result is the caller's result and nothing of the caller
-  runs after it; in particular a call with a write-back is never a tail
-  call, except the forwarding case of §3.13;
+  call), the release of the step's other temporaries and of the
+  function's owned parameters not moved into the call (a closure's own
+  object among them), then the jump. The callee's result is the
+  caller's result and nothing of the caller runs after it; in
+  particular a call with a write-back is never a tail call, except the
+  forwarding case of §3.13;
 - `let`: initialisers in order, each seeing the earlier bindings;
 - `do`: steps in order; the value of the last is the value of the form;
 - `loop`: initialisers in order, like `let`; `recur`: a tail call to the
-  loop: its arguments left to right, then the rebinding of every loop
-  variable at once (§3.18);
+  loop: its arguments left to right, then the scope exits inside the
+  loop body, then the rebinding of every loop variable at once; the
+  function's frame stays, so a `recur` moves only a binding it exits (a
+  binding of the loop body, a loop variable) and retains any other
+  (§3.18; types §6.10);
 - `if`/`match`: the test or scrutinee, then exactly one branch;
 - constructor arguments and literal-collection elements: left to right;
 - `plet` initialisers run concurrently in unspecified order; `pmap`
@@ -175,7 +183,7 @@ this fixes where). A value produced by an expression and not bound is an
 
 | Step | Its temporaries die |
 |---|---|
-| the argument list of a call | after the call returns and its write-backs are done |
+| the argument list of a call | after the call returns and its write-backs are done; an `Owned` argument at an **owned** position of the callee (types §6.4; every object argument of a call through a function value) is not a temporary: it is moved into the parameter at the call, and the callee releases it at its exit or hands it on |
 | a `do` step that is not last | immediately after the step |
 | the test of an `if` | after the test is evaluated, before either branch |
 | the scrutinee of a `match` | after the whole `match` (the scrutinee is an implicit binding for the form; types §6.3) |
@@ -244,16 +252,23 @@ conditions are syntactic.
 Evaluation: a named function is global, captures nothing (**Decided**, §6),
 and when used in non-head position is a function value with an empty
 environment (types §8.4). A call to a named function in tail position
-of a body is a tail call (§2; types §6.10).
+of a `defun` or `fn` body is a tail call unless types §6.10 makes it an
+ordinary call (§2); in tail position of an `async` body it is always an
+ordinary call (§3.14).
 
 Ownership (**Decided**, §4 as amended by D5): a parameter is
 **borrowed** — valid for the whole call, never freed by the callee,
 passed with no count operation — unless the checker infers it
-**owned**, which it does when the body returns it, stores it or passes
-it on in a tail call (types §6.4); an owned parameter arrives with one
-count that the callee releases or hands on. The kind is inferred and
-exported with the function, never written on a `defun`; it changes no
-verdict and no free point. The result is owned by the caller.
+**owned**, which it does when the body returns it (on any branch),
+stores it, captures it in a heap closure, spawns it, or passes it on in
+a tail call that must carry its count (types §6.4 has the full rule);
+an owned parameter arrives with one count that the callee releases or
+hands on. The kind is inferred and exported with the function, never
+written on a `defun`. It changes no result and no verdict, but it is a
+calling convention: an argument handed to an owned parameter dies at
+the callee's exit rather than after the caller's call, so the reference
+interpreter follows the kinds too (types §6.12) and the two free the
+same objects at the same points. The result is owned by the caller.
 
 ### 3.2 `fn`
 
@@ -266,9 +281,12 @@ An anonymous function that closes over the variables it uses from
 enclosing scopes. With `name`, the body may call `name`; the call goes
 through the closure's own code pointer and environment, not through a
 capture, so it creates no cycle (**Decided**, §6). `name` is bound only in
-the body. A `fn` has no `&` parameters (**Decided**: closures keep one
-calling convention and the escaping-capture rule stays a check on
-captures).
+the body, and every occurrence of it there is a use of the closure for
+the escape rules (types §6.5): a call through it is a direct call, but
+storing, returning or otherwise passing `name` on makes the closure
+escaping, and so a heap object (proposed cases 59, 60). A `fn` has no
+`&` parameters (**Decided**: closures keep one calling convention and
+the escaping-capture rule stays a check on captures).
 
 Static: the **capture set** of a `fn` is the set of free variables of its
 body bound in enclosing scopes, computed after expansion (types §3.7).
@@ -285,14 +303,16 @@ closures capturing the same cell share it (**Decided**, §6, case 05).
 Ownership: an escaping closure retains every object it captures at
 creation and releases them when it is freed; a non-escaping closure
 borrows its captures and lives in the creating frame, unless it is
-passed or called at a tail call, which puts it on the heap with
-retained captures while keeping it non-escaping (types §6.5, E6;
-**Decided**, D5). The parameters of a closure, and the closure object
-itself for the duration of a call through it, are always owned: a call
-through a function value hands every object argument and the closure
-over with one count, and the body releases them at its exit or hands
-them on (types §6.4, the closure convention). A call to a closure in
-tail position is a tail call.
+passed or called at a tail site — a call in tail position that may be a
+tail call, whether or not it turns out to be one (types §6.10) — which
+puts it on the heap with retained captures while keeping it non-escaping
+(types §6.5, E6; **Decided**, D5). The parameters of a closure, and the
+closure object itself for the duration of a call through it, are always
+owned: a call through a function value hands every object argument and
+the closure over with one count, and the body releases them at its exit
+or hands them on (types §6.4, the closure convention). A call to a
+closure in tail position of a `defun` or `fn` body is a tail call; in an
+`async` body it is an ordinary call (§3.14).
 
 ### 3.3 `let`
 
@@ -316,10 +336,15 @@ Ownership: a binding **owns** the value of an initialiser that is a fresh
 object, a call result or a read of a cell, and **borrows** it when the
 initialiser is another variable or a field path (types §6.3). A value
 that leaves the scope as its result is moved out or retained (the
-scope-exit rule, types §6.3); an object that never escapes is freed at
-the scope end with no count operations (**Decided**, §2) and lives in
-the creating frame rather than on the heap, from the first
-implementation (types §6.11; **Decided**, D6).
+scope-exit rule, types §6.3). An object that the initialiser itself
+allocates in this frame (a constructor call, `cell`, `atom`; a `fn`
+literal by types §6.5) and that never escapes is freed at the scope end
+with no count operations (**Decided**, §2: "an object created in a
+scope") and lives in the creating frame rather than on the heap, from
+the first implementation (types §6.11; **Decided**, D6). A call result
+is not such an object — the callee made it, or returned one that others
+still hold — so its binding is counted and released at scope exit like
+any owning binding; so is a loop variable (§3.18).
 
 ### 3.4 `if`
 
@@ -513,8 +538,8 @@ a rule for each (types §2.9–§2.11). None is a special form.
 | Call | Type | Meaning |
 |---|---|---|
 | `(cell v)` | `a -> (Cell a)` | a new cell holding `v` |
-| `(deref c)`, `@c` | protocol `Deref` | cell → its value; atom → its value; weak → `(Option T)`. Every object result is owned (+1) |
-| `(set! c v)` | `(Cell a) a -> unit` | store `v`, release the old value; `c` is any expression of cell type, including a field path and an `&` parameter |
+| `(deref c)`, `@c` | protocol `Deref` | cell → its value; atom → its value; weak → `(Option T)`. Every object result is owned (+1). `c` is an expression, or the name of an `&` parameter (§3.13) |
+| `(set! c v)` | `(Cell a) a -> unit` | store `v`, release the old value; the target `c` is an expression of cell type (a field path among them, §3.8) or the name of an `&` parameter, which is not an expression but may stand here and as the operand of `@` (§3.13; types §2.9) |
 | `(atom v)` | `a -> (Atom a)`, `Send a` | a new atom |
 | `(swap! a f)` | `(Atom a) (fn (a) a) -> a` | replace atomically with `(f old)`; `f` may run more than once; returns the new value (owned) |
 | `(reset! a v)` | `(Atom a) a -> unit` | replace, release the old value |
@@ -587,8 +612,11 @@ created by the caller at the call and lives exactly for the call:
 The caller's `x` is untouched until the write-back, so a plain `@x` in
 the same call stays valid (case 17). A read `@v` inside the callee is an
 owned reference (+1), so a value read from `v` and still in use always
-holds a count; that is what makes the loop in case 08 see the original
-elements (types §6.6).
+holds a count, even after the callee replaces `v`'s content (types
+§6.3, §6.7): proposed case 78 pins that inside an `&` function, and
+proposed case 66 on a `let` cell. Case 08 does not: since D1 the
+caller's cell keeps the vector alive for the whole call, so its loop
+sees the original elements with or without the acquire (Appendix A).
 
 **An `&` parameter is not a value** (**Decided**, D2). Inside the callee,
 `v` may occur only as `@v` (that is, `(deref v)`), `&v`, or the first
@@ -637,10 +665,17 @@ immortal object has no count to test, so an update through a place that
 holds part of a literal always copies and the literal is never written
 (proposed case 37):
 
-| Primitive | Type | Effect |
+| Primitive | Signature or rule | Effect |
 |---|---|---|
-| `(array-set! &a i x)` | `&(Array T) i64 T -> unit` | element `i` := `x` |
-| `(set-field! &s field x)` | `&S F -> unit` for a struct `S` with field `field: F` | field := `x` |
+| `(array-set! &a i x)` | `&(Array T) i64 T -> unit`: a signature, not a type (types §1.4) | element `i` := `x` |
+| `(set-field! &s field x)` | a primitive form (§4.3; types §2.13): `s : (Cell S)` for a struct `S` with a field `field: F`, `field` that field's name, `x : F`; result `unit` | the field `field` := `x` |
+
+Neither is a value: each occurs only as the head of a call (types
+§2.13). Neither takes a copy-in or a write-back: `&a` and `&s` hand the
+primitive the variable's own cell, whose content it tests and updates
+(types §6.6). `field` is a name, never an expression: it is not
+evaluated and not resolved as a variable, so `(set-field! &c x (+ x
+2))` sets the field `x` from the local `x` (proposed case 80).
 
 Everything else that updates in place (`push!`, `pop!`, `map-put!`,
 `append`, ...) is library code over these two, `&` and `set!`. Because
@@ -704,7 +739,10 @@ is retained when the task is created (this is "retained on entry" of
 §8), and a task is a thread crossing (§3.4 lists "a task"), so a
 capture of type `(Cell T)` is the error of case 13. Locals created inside
 the body live in the task's frame and follow the ordinary scope rules
-there; nothing is ever borrowed across an `await` (types §6.9). Every
+there; nothing is ever borrowed across an `await` (types §6.9). The
+body's value is the task's result, stored and published when the body
+finishes, so a call in tail position of an `async` body is an ordinary
+call, never a tail call (types §6.10 rule (f), §8.8). Every
 capture is retained when the task is created and released when the task
 is freed, whether or not it is used before the first `await`: evaluating
 the form does not run the body, so no use in the body is safe to leave
@@ -942,8 +980,16 @@ initialisers, and `recur` is a tail call to `g` (types §6.10): the loop
 variables are owning bindings, a `recur` consumes its arguments into
 them and releases the old values before continuing, a closure among its
 arguments is on the heap (E6), and a value that leaves the loop as its
-result follows the scope-exit rule. `while`, `dotimes` and `for-each`
-over a `range` are prelude macros over it (§4.4).
+result follows the scope-exit rule. Unlike a tail call out of the
+function, a `recur` leaves the function's frame in place, so it moves
+only what it exits — a binding or temporary of the loop body, or a
+loop variable, whose count passes to its new variable instead of being
+released as an old value — and retains an argument that names any
+other binding (one outside the loop, a parameter), which stays in scope
+and is released at its own scope exit, as a capture of `g` would be.
+Loop variables are never stack objects, since every `recur` rebinds
+them (types §6.10, §6.11). `while`, `dotimes` and `for-each` over a
+`range` are prelude macros over it (§4.4).
 
 Why it stays a core form. D5 asked for `loop`/`recur` to become a macro
 over a named local `fn` called in tail position unless a concrete
@@ -1093,6 +1139,21 @@ expander treat them as calls.
 | `Option` (built in, §3.9) | `some` (constructor), `nil` (a literal, §1.1); `nil?`, `some?`, `if-let` are prelude definitions (§4.4, §4.5) |
 | unsafe | `ptr+ load-i8 load-i16 load-i32 load-i64 load-ptr store-i8 ... store-ptr alloc free raw raw-retained release-raw` |
 | dynamic dispatch | `(dyn P e)` |
+
+`set-field!`, `dyn` and the conversions that name a target type
+(`trunc` to `uitofp`) are **primitive forms**: each takes one operand
+that is not an expression, a field name second for `set-field!`, a
+protocol first for `dyn` and the target type first for a conversion
+(types §2.12, §2.13, §2.15). They keep the call shape of §4.1 and
+are read and expanded as calls, except that the expander leaves that
+operand alone and name resolution and typing read it by the form's own
+rule, as a field name, a type or a protocol, never as a variable. Every
+other operand of a primitive form, and every argument of the other
+names above, is an expression or, at an `&` position, an `&x` (§3.13),
+evaluated left to right as in any call (§2), except that the name of an
+`&` parameter may also stand as the operand of `deref` and the target
+of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
+(types §2.13).
 
 ### 4.4 Prelude macros (normative list for the reference implementation)
 
@@ -1334,9 +1395,15 @@ next exists.
     (count @v)))
 ```
 Change: inside `dup-all` the `&` parameter is a cell, so the vector it
-holds is read with `@v` (§3.13). That read is the retained reference
-that makes the iteration hold a count; every `append` acquires again
-and copies (§3.13, D1; traced in types §6.6). `append` is the library
+holds is read with `@v` (§3.13). That read is a retained reference
+(types §6.3), but since D1 the caller's cell also keeps the vector
+alive for the whole call, so the case passes whether or not the read
+is counted: it pins copy-in/copy-out and the stack-closure capture of
+`&v`, not the acquire, which proposed cases 66 and 78 pin. `append`
+copies because its own copy-in acquires (§3.13, D1; traced in types §6.6),
+not because the iteration holds a count; the header's causal sentence
+predates D1 and is to be corrected in the case file, in a commit that
+states why (the verdict is unchanged). `append` is the library
 in-place push.
 
 ### 09-iterator-outlives-source.fib
@@ -1607,7 +1674,22 @@ Each item is now **Decided** in the section that states its rule; the
 old numbering is kept here because the drafts and
 `spec/drafts/PROPOSED_CASES.md` cite it. The one question that
 applying D5 raised (forwarding an `&` parameter beyond the self call at
-its own position) is recorded in types §10.
+its own position) is recorded in types §10, with the two that the
+fourth review round raised (two names for one cell in one call;
+ownership.md §5 and §8 against D2) and the corrections that round made
+to §2, §3.1, §3.2, §3.3, §3.18 and Appendix A (case 08) here. A fifth
+review round corrected §2, §3.1, §3.2 and §3.14 here (a call in tail
+position of an `async` body is never a tail call; in §3.2 also the
+tail sites at which a closure is put on the heap) and §3.13 (what the
+`@v` acquire is pinned by); types §10 lists them with that round's
+corrections to types.md. A sixth review round corrected §3.11 here (the
+target of `set!` is an expression of cell type or the name of an `&`
+parameter, not "any expression", since an `&` parameter is none), §3.13
+and §4.3 (`set-field!` is a primitive form whose field operand is a
+name, neither `&` primitive is a value, and neither takes a copy-in or
+a write-back) and §2 (the same for the order of evaluation); types §10
+lists them with that round's corrections to types.md, among them the
+scope at whose exit the interpreter ends a stack object.
 
 | Item | Rule | Now in |
 |---|---|---|
