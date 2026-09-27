@@ -11,8 +11,10 @@ Each file starts with a header that fixes the expected verdict:
 ```
 
 `accept` cases must also pass the memory audit (spec/method.md, rule 2).
-Syntax is liar's until spec/syntax.md exists; the cases will be
-rewritten into fibber syntax then, with verdicts unchanged.
+The cases are written in fibber syntax as spec/syntax.md defines it;
+Appendix A of that file lists all twenty and notes the four (05, 08, 15,
+19) whose bodies changed in the rewrite from liar syntax. Verdicts were
+not changed.
 
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.

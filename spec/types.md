@@ -65,7 +65,8 @@ represented as one pointer, immutable unless it is a `Cell` or an `Atom`
 |---|---|---|---|
 | `str`, `Form`, `(Array T)` | no | `str`, `Form`: yes; `Array`: if `T` is | `Array` is the substrate of the library collections (§2.13) |
 | struct, enum with fields | no | if every field is | nominal; a field may be a `Cell`/`Atom` |
-| `(Vec T)`, `(Map K V)`, `(Set T)`, `(List T)`, `(Option T)` | no | if their parameters are | library structs and enums; only their names are known to the compiler, for literals and `nil` |
+| `(Vec T)`, `(Map K V)`, `(Set T)`, `(List T)` | no | if their parameters are | library structs and enums; only their names are known to the compiler, for literals |
+| `(Option T)` | no | if `T` is | built-in enum (§1.5; syntax §3.9): `nil` is a reader literal and the representation is special (§8.1) |
 | `(Cell T)` | **yes** | **no** | the one mutable container (§6) |
 | `(Atom T)` | yes, atomically | yes | requires `Send T` at construction (§7) |
 | `(Weak T)` | no | if `T` is | `T` must be an object type |
@@ -109,7 +110,10 @@ inferred code. In an annotation, an omitted colour means:
   constrains it);
 - on a struct or enum field: `local` (the type of a field must be a
   function of the type's parameters, and colours are not parameters in
-  v1); write `(fn :send (A) R)` to store only sendable closures.
+  v1); write `(fn :send (A) R)` to store only sendable closures;
+- on a `def` annotation (§2.16): `send`, since the only function values
+  a constant expression can build are named functions and constructors,
+  which are `send`.
 
 Closure types carry no capture list and no escape summary (Proposed;
 §10 item 5): a call through a function value treats every argument as
@@ -124,7 +128,10 @@ value: it occurs only as `@v`, `&v`, `&(. v f)` or the target of `set!`
 
 ### 1.5 `Option` and `nil`
 
-`(Option a)` is the prelude enum `(defenum (Option a) (nil) (some v: a))`.
+`(Option a)` is the built-in enum with the field-less variant `nil` and
+the variant `(some v: a)`; it is built in rather than declared because
+`nil` is a reader literal, the form `(Nil)`, that no `defenum` can
+spell (syntax §3.9), and because of its representation (§8.1).
 `nil : ∀a. (Option a)`; `(some e) : (Option T)` when `e : T`. There is
 no null of any other type, no implicit conversion from `T` to
 `(Option T)`, and `match` (with the prelude's `if-let`, `nil?`, `some?`
@@ -132,7 +139,8 @@ over it) is its only eliminator. For an object `T` that is not itself an
 `Option` the representation is a nullable pointer (§8.1), so the
 abstraction costs nothing; `(Option (Option T))` is a heap enum, so
 `(some nil)` and `nil` stay the distinct values the semantics says they
-are (§8.1).
+are (§8.1). The prelude derives `Eq`, `Ord` (`nil` before `some`),
+`Hash` and `Show` for it (syntax §4.4, §3.16).
 
 ### 1.6 `Cell`, `Atom`, `Weak`, `Task`
 
@@ -142,7 +150,9 @@ are (§8.1).
 - `(Weak T)`: **Decided** (§6) a non-owning reference; `@w` has type
   `(Option T)`. A `Weak` value is itself a counted object (§8.7).
 - `(Task T)`: the result of `spawn` and of `async`; `join`, `block-on`
-  and `await` take it. `Send (Task T) = Send T`.
+  and `await` take it. `Send (Task T) = Send T`. Any number of holders
+  may join or await one task; the runtime resumes it on one thread at a
+  time (§8.8).
 
 ### 1.7 Protocol types
 
@@ -183,9 +193,10 @@ variables and emits its constraints.
 |---|---|
 | integer literal | its width (`i64` default); float literal `f32`/`f64` (`f64` default) |
 | `"s"`, `\c`, `true`/`false`, `:k`, `()` | `str`, `char`, `bool`, `keyword`, `unit` |
-| `nil` | `inst(∀a. (Option a))` |
+| `nil` (the reader's `(Nil)` form, or the symbol `nil` a macro built; syntax §3.9) | `inst(∀a. (Option a))`; `(nil)` is the error `nil is a constant, not a function; write nil` (§2.2) |
 | `x` bound locally | `Γ(x)`, monomorphic; an `&` parameter `v` has `Γ(v) = (Cell T)` but is not an expression: it occurs only as `@v`, `&v`, `&(. v f)` or the target of `set!` (§2.14), else `& parameter v used as a value in f` |
 | `f` a global defun, constructor, variant constant or protocol method | `inst(σ_f)`; error if `f` has `&` parameters (`function with & parameters is not a value`) |
+| `g` a `def` name (syntax §3.19) | `Γ(g)`, its closed monomorphic type (§2.16); a global like `f`, never a capture |
 | `[e₁ .. eₙ]`, `{k v ..}` | rewritten to prelude calls before typing (syntax §1.4) |
 | `'form`, `` `form `` | `Form`; inside a quasiquote `,e` needs `e : Form` and `,@e` needs `e : (Vec Form)` |
 
@@ -263,7 +274,7 @@ field f; annotate it` (§3.4). Any other constructor: `T has no field f`.
 | `_` | any `S`; binds nothing |
 | `x` | binds `x : S` |
 | literal | `S ~` the literal's type; requires `(Eq S)` |
-| `nil`, `(some p)` | `S ~ (Option a)`, `a` fresh; `p : a` |
+| `nil` (also spelled `(nil)` by a macro, syntax §3.9), `(some p)` | `S ~ (Option a)`, `a` fresh; `p : a` |
 | `(V p₁ .. pₖ)` | `V` a variant of `(N ā)` with `k` fields; `S ~ (N b̄)`, `b̄` fresh; `pᵢ : Fᵢ[b̄/ā]` |
 | `(N p₁ .. pₖ)` | struct `N` with `k` fields, likewise |
 | `(p :as x)` | binds `x : S`, then `p : S` |
@@ -341,9 +352,11 @@ kept as a constraint on a variable and solved when its head is known.
 
 ### 2.12 Arithmetic, comparison, conversions
 
-Arithmetic and comparison are protocol methods with built-in instances
-for the scalar types (and `Eq`, `Ord`, `Hash` for `str`, `char`,
-`keyword`, `bool`):
+Arithmetic and comparison are protocol methods with built-in instances:
+`Num` for every integer and float type, `Bits` for the integer types,
+and `Eq`, `Ord`, `Hash` and `Show` for every scalar type (a field-less
+enum, a scalar by §1, compares and hashes by variant index, orders by
+declaration order and shows as its variant name) and for `str`:
 
 ```
 (defprotocol Num  (+ (self y: Self) -> Self) (- ..) (* ..) (/ ..) (rem ..) (neg (self) -> Self))   ; every integer and float type
@@ -365,8 +378,20 @@ operand is a type: `(trunc i8 e)`, `(zext i64 e)`, `(sext i64 e)`,
 `(fptrunc f32 e)`, `(fpext f64 e)`, `(fptosi i64 e)`, `(fptoui i64 e)`,
 `(sitofp f64 e)`, `(uitofp f64 e)`, `(char->i32 e)`, `(i32->char e)`
 (traps on a non-scalar value), each with the obvious operand and result
-types. `(derive Eq Name)` and friends are prelude macros over
-`struct-fields` that generate `impl`s field by field.
+types. `(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`,
+is a prelude macro over `struct-fields`, `struct-params` and
+`struct-field-types` for a struct, and over `enum-params` and
+`enum-variants` for an enum (syntax §3.16), that generates one `impl`
+with the head `(Name ā)` and the context `(P a)` for each parameter `a`
+that some field's type mentions (plus `(Eq a)` for `Ord`, which has no
+supertrait to give it, §4.1), so it works for generic structs and
+enums too; on an enum the methods are a `match` on `self` nested with
+a `match` on the other operand (`Eq`: same variant and equal fields;
+`Ord`: declaration order, then the fields lexicographically), and on a
+field-less enum the macro expands to nothing, the instances being
+built in. The prelude derives all four for `Option` and `List` (syntax
+§4.4), so `(= (some 1) (some 1))` resolves through `(impl Eq (Option
+a) :where ((Eq a)) ..)` to the `i64` instance (proposed case 48).
 
 ### 2.13 Arrays and `set-field!`
 
@@ -414,6 +439,43 @@ argument must be a cell variable or a field of a cell variable`.
 A method call on a `(dyn P)` receiver has the method's signature with
 `self := (dyn P)`; methods whose signature mentions `self` anywhere but
 the receiver position are not callable through `dyn` (§4.4).
+
+### 2.16 `def`
+
+```
+(def g e)        e a constant expression (syntax §3.19);  Γ ⊢ e : T;  T closed after solving  ⇒  g : T in the global environment
+(def g: A e)     as above with T ~ A
+```
+
+A `def` is a node of the dependency graph of step 4 (§3.5): it depends
+on the earlier `def`s it names and on every same-module `defun` it
+names as a value, and every `defun` that reads it depends on it. So it
+is typed after the SCCs of the functions it names, whose schemes are
+then complete, and before the functions that read it, in an environment
+holding constructors, the `def`s it names, the named functions it names
+(`inst` of their schemes, §2.1) and the imported schemes of the prelude
+calls that the literal-collection rewrite introduces (`vec-empty`,
+`conj`, `map-empty`, `assoc`; syntax §1.4): these are the only calls a
+constant expression contains. A `def` that names a `defun` which reads
+it, directly or through other functions, is the error `def g and defun
+f depend on each other` (Proposed; syntax Open decision 29). `T` is
+never generalised, and a type variable left in it is `def g has an
+unresolved type; annotate it`: a `def` naming a generic function
+(`(def twice-fn double)` with `double : ∀a. (Num a) ⇒ (fn (a) a)`) must
+fix the instantiation, `(def twice-fn: (fn (i64) i64) double)`, and an
+omitted colour in that annotation means `send` (§1.4); the
+monomorphiser then emits the specialisation the annotation names
+(§4.3). A `def` naming a monomorphic function needs nothing: `(defun
+double (x: i64) -> i64 (+ x x))` gives `(def twice-fn double)` the
+closed type `(fn :send (i64) i64)` (proposed case 50). A form outside
+the constant grammar (a call other than a constructor or the rewrite's
+prelude calls, `cell`, `atom`, `weak`, `fn`, `async`, `unsafe`, `@`) is
+`def g: initialiser is not a constant expression`. `Send T` holds by
+construction, since no constant expression builds a cell and named
+functions are `send`, which is why a `def` name may appear in any `fn`
+or `async` body without being a capture: like a named function it is a
+global, not a free variable (§3.7). Its value is immortal (§8.2), so
+reading it is a count-free `Borrowed(g)` (§6.1).
 
 ---
 
@@ -500,8 +562,13 @@ resolved by the `Accounts` constructor in the closure body; case 19's
    protocols (record fundeps and escape kinds), impls (register instances with their declared
    contexts, check coherence and the Paterson condition),
    externs, defun names; run the syntactic & checks (§6.5, §6.9) that need no types
-4. build the call graph of defuns; compute SCCs (Tarjan); order callees before callers
-5. for each SCC in order:
+4. build the dependency graph of defuns and defs: an edge from a defun to every same-module
+   defun it calls or names as a value and to every def it reads, from a def to every
+   same-module defun it names as a value and to every def it names; compute SCCs (Tarjan);
+   order dependencies before dependents. An SCC holding a def and anything else is the
+   error `def g and defun f depend on each other` (§2.16)
+5. for each SCC in order — a def by itself: type its initialiser (§2.16): a constant
+   expression, a closed monomorphic type, no generalisation; a set of defuns:
    a. bind each defun to a fresh monomorphic function type at level ℓ+1
       (an annotated defun used polymorphically inside its own SCC is bound to its annotation)
    b. generate constraints for each body (§2), unifying eagerly (§3.2)
@@ -569,6 +636,10 @@ occurrences. Mutually recursive `defun`s get one scheme each.
   wrapped in `Task` and the colour forced to `send`; `await` unwraps.
 - **Macros.** Typed as `defun`s over `Form` in the macro-time module;
   expansion happens before any of the above.
+- **`def` names.** Globals like named functions: `Γ(g)` is the closed
+  type of §2.16, never generalised and never a capture; typed in
+  dependency order, after the functions the initialiser names and
+  before the functions that read the `def` (§3.5).
 
 ### 3.8 What must be annotated
 
@@ -588,6 +659,8 @@ closures, allocation sites.
 | `(. x f)` or `@x` with `x`'s head unknown at the end of the SCC | field names do not determine the struct; `@` does not determine cell/atom/weak | `x: Name` |
 | heterogeneous positions (a list of closures of different types) | HM has no subtyping | `(dyn P)`, or a struct |
 | `main` | the entry contract | `-> i64` |
+| a `def` whose initialiser leaves a type variable (`(def e [])`) | `def`s are closed and monomorphic (§2.16) | `(def e: (Vec i64) [])` |
+| a `def` naming a generic function (`(def twice-fn double)`) | a `def` is closed, so the instantiation must be fixed (§2.16) | `(def twice-fn: (fn (i64) i64) double)` |
 | a closure that must be sendable by contract (protocol callbacks, extern callbacks, struct fields) | an omitted colour in a field means `local` | `(fn :send ...)` |
 | higher-rank use of a parameter (at two types) | rank 1 only | not expressible; restructure |
 
@@ -595,7 +668,8 @@ closures, allocation sites.
 
 A module exports, per definition: the closed scheme (with colour
 variables and their `⊑` constraints, bounds, `&` positions), the escape
-summary of every parameter (§6.4), for structs and enums the layout
+summary of every parameter (§6.4), for a `def` its closed type (§2.16),
+for structs and enums the layout
 (§8), for protocols the signatures with escape kinds and fundeps, every
 instance, every macro as forms, and the bodies of generic `defun`s
 (needed by §4.3). Importing instantiates schemes; nothing is re-inferred
@@ -626,9 +700,13 @@ without annotation.
 
 A method call whose receiver has a concrete type after inference and
 monomorphisation is a direct call to that type's implementation (lIR
-`call` to a mangled name). Consequences: no dispatch cost, scalars
-unboxed in generic code, and retain/release in generic code emitted
-knowing which values are objects. The escape kinds a caller relies on
+`call` to a mangled name). A receiver whose type is a bounded variable
+of the enclosing scheme has a concrete type in every specialisation,
+because bounded variables are keyed by their full type argument
+(§4.3), so this covers every method call outside `(dyn P)`.
+Consequences: no dispatch cost, scalars unboxed in generic code, and
+retain/release in generic code emitted knowing which values are
+objects. The escape kinds a caller relies on
 are the ones declared on the protocol (§6.4), so the caller never needs
 to see the implementation.
 
@@ -636,22 +714,43 @@ to see the implementation.
 
 Starting from `main`, from exported non-generic functions and from every
 instance reachable through a `(dyn P)`, each call to a polymorphic
-`defun` at instantiation `T̄` creates the specialisation `f<T̄>` if absent,
-recursively. Specialisations are keyed by the **layout class** of each
-type argument, not the type: the classes are the scalar lIR types (`i1
-i8 i16 i32 i64 float double`), `ptr` (every object type except the
-next), `opt` (an `(Option T)` with `T` of class `ptr`: a nullable
-pointer, §8.1), and the two-word `dyn`. The separate `opt` class is what
-keeps the `Option` representation rule of §8.1 intact under
-monomorphisation: `(Option a)` at `a` of class `opt` or of a scalar
-class takes the heap-enum row, and only at `a` of class `ptr` the null
-row. So `(Vec (Box i64))` and `(Vec str)` share one
-specialisation of `count`, and code size is bounded by the number of
-distinct layout-class tuples in use (Proposed; §10 item 7). Retain and
-release inside a `ptr`-class specialisation go through the runtime
-functions of §8.2, which read the type id from the header, so no
-per-element-type code is needed. Whole-program compilation follows: a
-module's interface carries generic bodies.
+`defun` or generic `impl` method at instantiation `T̄` creates the
+specialisation `f<T̄>` if absent, recursively. The key of a
+specialisation has one component per quantified type variable of the
+scheme (Proposed; §10 items 7 and 28):
+
+- a variable that carries a **protocol bound** in the scheme's context
+  (directly, or at the dispatch or a determined position of any of its
+  constraints) is keyed by its **full type argument**, so that every
+  method call on it inside the specialisation has a concrete receiver
+  and is the direct call of §4.2;
+- every other variable (unconstrained, or constrained only by `Send`)
+  is keyed by the **layout class** of its argument: the scalar lIR
+  types (`i1 i8 i16 i32 i64 float double`), `ptr` (every object type
+  except the next), `opt` (an `(Option T)` with `T` of class `ptr`: a
+  nullable pointer, §8.1), and the two-word `dyn`.
+
+The separate `opt` class is what keeps the `Option` representation rule
+of §8.1 intact under monomorphisation: `(Option a)` at `a` of class
+`opt` or of a scalar class takes the heap-enum row, and only at `a` of
+class `ptr` the null row. So `(Vec (Box i64))` and `(Vec str)` share
+one specialisation of `count`, whose element type is unconstrained,
+while `(defun describe (x) (str-len (show x)))`, of type `∀a. (Show a)
+⇒ (fn (a) i64)`, gets one specialisation per receiver type
+(`describe<Tag>`, `describe<(Box i64)>`, proposed case 45) in which
+`(show x)` is a direct call; likewise the `=` of `(impl Eq (Vec a)
+:where ((Eq a)))` is specialised per `a`, and a HAMT's `(hash k)` per
+key type. Keying a bounded variable by layout class alone would leave
+`(show x)` in a `ptr`-class specialisation with no implementation to
+name, since a class is not a type, so §4.2's "always static" and
+layout-class sharing cannot both hold for a bounded variable; the
+full-type key is chosen, and the interpreter's dispatch on the header's
+type id (§4.5) answers the same. Code size is bounded by the number of
+distinct key tuples in use. Retain and release inside a `ptr`-class
+specialisation go through the runtime functions of §8.2, which read
+the type id from the header, so no per-element-type code is needed.
+Whole-program compilation follows: a module's interface carries
+generic bodies.
 
 ### 4.4 Dynamic: `(dyn P)`
 
@@ -818,6 +917,7 @@ alive. Every binding is one of:
 | **`&` parameter** (its value is its private cell, which is never an expression: syntax §3.13) | never read: `@v` is `Owned`, `&v` forwards the cell, `(set! v e)` writes it (§6.6) | no (the cell is the caller's) |
 | **alias of `b'`**: a `let` binding whose initialiser is `Borrowed(b')`; a capture of a non-escaping closure; a pattern variable that binds the *whole* scrutinee (a top-level symbol pattern or a top-level `:as`) of a scrutinee whose mode is `Borrowed(b')` | `Borrowed(b')` | no count |
 | **derived of `b'`**: a `let` binding whose initialiser is `Derived(b')`; a pattern variable bound *inside* a variant or struct pattern (a payload or a field) of a scrutinee whose binding is `b'`; a whole-scrutinee pattern variable of a scrutinee whose mode is `Derived(b')` | `Derived(b')` | no count |
+| **global**: a `def` name (syntax §3.19, §2.16) | `Borrowed(g)` | never: its value is immortal (§8.2), so every count operation `consume` would emit on it is a no-op the compiler may omit |
 
 `Derived(b)` always names a *strict* sub-object of `b`'s value, reached
 through a field, an element or a variant payload; a pattern variable
@@ -829,7 +929,8 @@ relies on exactly this distinction.
 
 | Form | Mode |
 |---|---|
-| string literal, `Form` literal | `Owned` (an immortal object; count operations on it are no-ops) |
+| string literal, `Form` literal | `Owned` (an immortal object: count 0 and the `IMMORTAL` flag, §8.2; count operations on it are no-ops, and `fib.unique?` is false on it, so an update through a place holding it or any part of it copies, §6.6) |
+| variable naming a `def` | `Borrowed(g)`, `g` the global binding (§6.1); its value is immortal like a literal |
 | struct or variant constructor call, rewritten `[...]`/`{...}` | `Owned` |
 | call of a `defun`, protocol method, primitive or closure value returning an object | `Owned` (**Decided**, §4: results are owned) |
 | `@c` on a cell or atom; `@w` on a weak | `Owned` (§6.7) |
@@ -919,8 +1020,12 @@ so `(defun same (p) (match p (w w)))`, `(match p ((Node inner) inner)
 ((Leaf) p))` and `(match p (x (weak x)))` all make `p` escape
 (Proposed; §10 item 18). Computed as a least fixpoint over the module's
 call graph starting from `noescape`; imported and protocol summaries are
-fixed inputs. An explicit `(p: T :borrow)` on a `defun` parameter is
-checked: `parameter p of f is declared :borrow but escapes`.
+fixed inputs. An explicit `p :borrow` or `p: T :borrow` on a `defun`
+parameter (syntax §3.1) fixes the summary at `noescape` and is checked:
+`parameter p of f is declared :borrow but escapes`; the exported
+summary is then the declared one, part of the interface, and a closure
+literal passed to `p` is non-escaping by contract (§6.5; proposed case
+40).
 
 Protocol methods declare their kinds (syntax §3.10; default escaping);
 every `impl` body is checked against the declaration: `implementation
@@ -931,7 +1036,8 @@ compilation (Proposed; §10 item 5). Externs take scalars only: `(raw
 e)` is not an escape of `e`'s binding, `(raw-retained e)` is (§6.13).
 
 What summaries decide, and nothing else: (a) whether a closure literal
-passed to that parameter is escaping (§6.5); (b) whether a closure that
+passed to that parameter is escaping (§6.5; at a self tail call it is
+escaping whatever the summary says); (b) whether a closure that
 captures an `&` parameter may be passed there (§6.5); (c) whether the
 caller's argument object may live on the stack (§6.11); (d) the
 copy-in decision for `&(. x f)` (§6.6). Summaries of `fn` literals are
@@ -951,10 +1057,24 @@ A `fn` literal is **escaping** unless every use of it is one of:
   captured by any other closure.
 
 A closure at E1, E2, E3 or E4, passed to an `escapes` parameter, passed
-to a closure value, or written as an `async` body, is escaping. The check
-is syntactic and uses only summaries. A `loop` body (syntax §3.18) is
-not a closure: its free variables are the enclosing function's own
-bindings and it has no capture set.
+to a closure value, or written as an `async` body, is escaping. So is,
+**regardless of the callee's summary**, a closure literal that is an
+argument of a self tail call of the enclosing `defun` or named `fn`, or
+an argument or initialiser of a `loop`/`recur` (§6.10), and a
+`let`-bound closure of clause (c) with such a use (Proposed; §10 item
+32): the call is a slot loop, which never completes before the creating
+scope exits — the jump runs those scope exits and then stores the
+argument into a slot that the next iteration reads — so clause (b)'s
+soundness argument below does not hold for it. `(defun spin (g n) (let
+((x (make))) (if (= n 0) (g) (spin (fn () (count x)) (- n 1)))))` has
+`g : noescape`, but the literal captures `x`, which the `let` releases
+at the jump; as an escaping closure it retains `x` at E3 and frees it
+with itself when the slot is released (proposed case 49). A closure
+that captures an `&` parameter and is passed at a self tail call is
+therefore rejected by the rule of case 18 below. The check is syntactic
+and uses only summaries. A `loop` body (syntax §3.18) is not a closure:
+its free variables are the enclosing function's own bindings and it has
+no capture set.
 
 - **Escaping closure:** E3 — every object capture is consumed (retained
   if `Borrowed`/`Derived`, moved if `Owned`, which cannot happen for a
@@ -967,7 +1087,9 @@ bindings and it has no capture set.
   enclosing bindings; no count; the closure object may live on the stack
   of the creating frame. Sound because uses (a)–(c) all complete before
   the creating scope exits and a `:borrow` callee never stores or returns
-  it.
+  it; a self tail call or `recur` is the one call that does not
+  complete before the scope exits, which is why an argument of one is
+  escaping (above).
 
 **Decided** (§5, case 18): an `&` parameter may not be captured by an
 escaping closure. Check: for every escaping `fn` literal whose capture
@@ -999,7 +1121,8 @@ or return can refer to the cell after the write-back frees it.
   content is **moved** from the place into the private cell. For a
   variable place, the caller's cell holds nothing until the write-back;
   for a field place `(. x f)`, the struct in `x` must be **takeable**
-  (`fib.takeable?`, §8.2: count 1, not shared, `HAS-WEAK` clear) and its
+  (`fib.takeable?`, §8.2: `fib.unique?`, that is count 1 and none of
+  `SHARED`, `IMMORTAL`, `STACK`, and `HAS-WEAK` clear) and its
   field is **taken** (nulled) until the write-back; a unique struct that
   has a weak box is acquired instead. The conditions guarantee no
   expression can read the place meanwhile: no other argument mentions
@@ -1033,13 +1156,26 @@ would never run, the caller's cell would be left empty and the final
 value would sit in a dead private cell.
 
 **Unique write** (**Decided**, §5): `array-set!` and `set-field!` read the
-place's content without retaining, test `unique?` (count exactly 1 and
-not shared, §8.2), and either write the object in place or build a copy
-with the change, store it into the place and release the old object.
-The audited heap must permit a write to an immutable object exactly
-under that test (`write-unique`, an obligation on fibref; §10 item 16).
-A unique write can never close a cycle: an object with count 1 held by
-the writer's place is reachable from no other object.
+place's content without retaining, test `fib.unique?` (§8.2: the flags
+have none of `SHARED`, `IMMORTAL`, `STACK`, and the count is exactly
+1), and either write the object in place or build a copy with the
+change, store it into the place and release the old object. The flag
+test comes first and is what protects static data (Proposed; §10 item
+30): an immortal object (a literal, a `def` value, and every object
+reachable from one) has no count, so a value pulled out of a literal
+(`(match f ((List xs) xs))` on a `Form` literal, §6.2) and moved into
+a private cell is copied by the first `push!`, never written, and the
+literal's tail array, immortal too, copies likewise. Without the flag
+test an immortal count that happened to read 1 would let accepted code
+write into a constant, which in the compiler may live in read-only
+data once lIR holds static constants (§8.11), while the interpreter,
+whose literals are ordinary allocations, would answer differently (method.md rule 6; proposed case 37). The audited
+heap must permit a write to an immutable object exactly under that
+test (`write-unique`, an obligation on fibref; §10 item 16), so the
+interpreter allocates its literals with the `IMMORTAL` flag and count
+0, like the compiler's constants (§8.2). A unique write can never close
+a cycle: an object with count 1 held by the writer's place is reachable
+from no other object.
 
 Count trace for case 08, compiler and interpreter alike. `main`'s cell
 holds `V0` (1). `(dup-all &v)`: `v` is exclusive in `main` (a `(cell ..)`
@@ -1083,16 +1219,25 @@ temporary is released after the call (1); result 4; clean.
   `leak-cycle` and nothing else.
 - `(weak e)`: no count operation; `e`'s binding is forced onto the heap
   (§6.11: a stack object cannot be observed dead by a weak box); the
-  first `weak` of an object allocates its box and sets `HAS-WEAK`
-  (§8.7); on an `IMMORTAL` object (a literal, a named function used as a
-  value) it allocates a box that is never cleared and leaves the
-  object's header alone, so `@w` on it is always `(some ..)` (§8.7; §10
-  item 24). `@w`: atomically "retain if still alive" (§8.7); result
+  first `weak` of an object allocates its box and sets `HAS-WEAK` with
+  an atomic or, since the object may be shared (§8.7, §8.2); on an
+  `IMMORTAL` object (a literal, a `def` value, a named function used as
+  a value) it allocates a box that is never cleared and leaves the
+  object's header alone, so `@w` on it is always `(some ..)`: the
+  upgrade tests the flag before the count, which is 0 on an immortal
+  (§8.7; §10 items 24, 30). `@w`: atomically "retain if still alive" (§8.7); result
   `(Option T)`, `Owned`. Case 20: the inner `let` releases the only count
   → the drop clears the box → `@w` is `nil`. Case 19: the only strong
   edges are `root → cell → [a] → cell → [b]`; parents are weak; `main`'s
   `let`s release `b`, `a`, `root` in reverse order, each freeing what
   only it holds; the boxes die with their last `Weak` value; clean.
+- **Immortal objects** (literals and everything reachable from them,
+  `def` values, named-function closures, vtables; §8.2) are static
+  data — in v1 built once by the module initialiser before `main`,
+  §8.2 — not audited allocations: the audit does not track them, they are not
+  live objects at exit, and nothing counted is ever reachable from one
+  (a constant graph is closed), so they take part in no leak, no cycle
+  and no unique write.
 
 ### 6.8 Threads (§7)
 
@@ -1105,7 +1250,11 @@ thread and released as its last action, after the result is stored and
 the state set to done (§8.8). So a task whose handle is discarded (a
 non-final `do` step, syntax Open decision 15) or released before `join`
 is freed by whichever holder releases last, never while the thread still
-writes into it. `join` retains the result for the caller. `main`
+writes into it. `join` retains the result for the caller. A task may be
+joined by several threads and awaited by several tasks (`Send (Task T)
+= Send T`, §1.6): the counts they hold keep it allocated, and §8.8
+makes the runtime, not a count, the guarantee that only one of them
+ever resumes it (Proposed; §10 item 27; proposed cases 43, 44). `main`
 returning waits for every spawned thread still running, so the audit
 runs on a quiescent heap (Proposed; §10 item 22). Case 13 is rejected
 during typing (§5.4) before this pass runs. Case 10: `a : (Atom (Vec i64))` is `Send`;
@@ -1134,12 +1283,26 @@ the `async` is part of the task's state machine, so a loop may `await`
 on every iteration.
 
 **Decided** (§8): `&` parameters are not allowed in async functions.
-Check, before typing: a `defun` with an `&` parameter whose body
-contains an `async` form anywhere (including inside nested `fn`s):
-`& parameter in async function: buf in fill` (case 14). It runs before
-the escaping-capture check of §6.5, so case 14 reports this text and not
-case 18's. `await` outside `async`, or inside a `fn` nested in one, is
-`await outside async`; inside a `loop` of the `async` it is fine.
+Check, before typing, on a `defun` with an `&` parameter `v`: if any
+`async` form in its body (including inside nested `fn`s) mentions `v`
+(as `@v`, `&v`, `&(. v f)` or the target of `set!`, anywhere inside the
+`async` body), or an `async` form is in tail position of the body (the
+function's value is a task it creates), the function is an **async
+function** (syntax §3.1) and the error is `& parameter in async
+function: buf in fill` (case 14: `fill`'s `async` both mentions `&buf`
+and is its value). It runs before the escaping-capture check of §6.5,
+so case 14 reports this text and not case 18's. An `async` that
+mentions no `&` parameter and is not the function's value, such as a
+task driven to completion by a `block-on` inside the call (`(defun
+bump (&v) (let ((n (block-on (async (do (await (yield)) 1))))) (push!
+&v n)))`, proposed case 38), does not make the function async: the
+task cannot reach the private cell, because no expression has the cell
+as its value (§2.14), and a closure that captures `v` and is captured
+by the `async` is escaping, rejected by §6.5 and, being `local`, by
+`Send` (§5.4). The earlier definition, any `defun` containing an
+`async`, rejected that safe shape for no reason (Proposed; syntax Open
+decision 22). `await` outside `async`, or inside a `fn` nested in one,
+is `await outside async`; inside a `loop` of the `async` it is fine.
 
 Case 11: `measure` creates a task capturing `s` (retained); `main`'s
 inner `let` releases `s` (1, held by the task); `block-on` drives the
@@ -1161,7 +1324,9 @@ the compiler treat both as one **slot loop**:
    parameter's slot holds its private cell, which is never counted;
 2. at the `recur` or the tail call: evaluate the argument expressions
    into temporaries with `consume` (an `Owned` argument is moved, a
-   borrowed one retained); run the scope exits of every enclosing scope
+   borrowed one retained; a closure literal or `let`-bound closure
+   among the arguments is escaping, §6.5, so it owns its captures and
+   survives the scope exits that follow); run the scope exits of every enclosing scope
    inside the body (release their owning bindings); release the old
    slot values; store the temporaries into the slots; continue at the
    start of the body. For an `&` parameter the argument at its position
@@ -1283,6 +1448,9 @@ and a double release as a count going negative.
 | V is a constant, not a function; write V | §2.2 |
 | recur outside loop / recur not in tail position | §2.4, syntax §3.18 |
 | no implementation of P for a; add (P a) to the :where of the impl | §2.7 |
+| def g has an unresolved type; annotate it | §2.16 |
+| def g: initialiser is not a constant expression | §2.16, syntax §3.19 |
+| def g and defun f depend on each other | §2.16, §3.5, syntax §3.19 |
 
 ---
 
@@ -1308,7 +1476,7 @@ fragment; the rest is the position and witness the checker appends).
 | 11 borrow-across-await | §8 | `async` is E3 for `s` (retained at creation) and requires `Send str` ✓; the task's frame owns it; `s`'s `let` releases | accept, 5, clean |
 | 12 reject-same-binding-twice-inout | §5 | syntactic distinct-places check on `(bar &x &x)` (§6.5) | reject: `variable x passed to more than one & parameter in call to bar` |
 | 13 reject-cell-crosses-thread | §7 | the closure's colour is `local` (capture `n : (Cell i64)`); it flows to `pmap`'s `(fn :send (a) b)`; `local ⊑ send` fails (§5.4); witness `n` | reject: `cell cannot be shared between threads: closure capture n has type (Cell i64)` |
-| 14 reject-inout-in-async | §8 | `fill` has `&buf` and contains an `async` (§6.9), checked first | reject: `& parameter in async function: buf in fill` |
+| 14 reject-inout-in-async | §8 | `fill` has `&buf`, and its `async` mentions `&buf` and is the body's value, so `fill` is an async function (§6.9; syntax §3.1), checked first | reject: `& parameter in async function: buf in fill` |
 | 15 cycle-through-cell-leaks | §6 | `[k]` retains `k` (E2); `set!` stores the vector into `k`'s cell; the `let` releases one count; the audit finds the SCC through the cell (§6.7) | accept, 1, leak-cycle |
 | 16 coordinated-update-single-atom | §7 | `Send Accounts` holds (scalar fields); one `swap!` replaces the whole struct: `f`'s `Owned` result stored, the old released; `snap`/`final` acquire and release | accept, 200, clean |
 | 17 inout-and-borrow-same-call | §5 | `v` occurs in another argument → acquire copy-in; `@v` acquires again; `push!` copies; write-back releases the old vector; the temporary released after the call (§6.6) | accept, 4, clean |
@@ -1328,9 +1496,17 @@ pattern variable, a cell read beside a sibling write, a pre-`await`
 use of a capture, an `&` argument through a self tail call, a discarded
 `Task`, `(some nil)`, `weak` of a literal, an in-place update inside
 `dotimes`, a taken field reached through `weak`, a user `count`, an
-`await` inside a loop, and the others) are listed with their expected
-headers in `spec/drafts/PROPOSED_CASES.md`; they become cases only when
-added to `cases/` with the owner's sign-off.
+`await` inside a loop, and the others), and those of the second round
+(a push into a `Form` literal that must copy, an `&` function that
+blocks on a task, `derive` on a generic struct, a declared `:borrow`
+that escapes, a spliced top-level macro, a `def` table read from two
+threads, one task joined by two threads and awaited by two tasks, a
+bounded generic instantiated at two `ptr`-class types, a `weak` taken
+on a shared object, an `:as` pattern in `let`), and those of the third
+(`derive` on an enum, a closure passed at a self tail call, a `def`
+naming a function, a macro that emits `nil`), are listed with their
+expected headers in `spec/drafts/PROPOSED_CASES.md`; they become cases
+only when added to `cases/` with the owner's sign-off.
 
 ---
 
@@ -1343,11 +1519,20 @@ form `(indirect-call fnptr R args..)`, `getelementptr`, `load`/`store`,
 `alloca`, `br`/`phi`/`select`, `icmp`, and the atomic operations
 `atomicrmw`, `cmpxchg`, `atomic-load`, `atomic-store` and `fence`, which
 lir-core parses but `doc/lIR.md` does not yet document (§8.11). lIR has
-no `switch`, no array type in its type grammar and no typed indirect
-call; this mapping uses none of them (`match` is an `icmp`/`br` chain,
-§8.3; variable-length payloads are addressed with `getelementptr` on the
-element type, §8.3; §8.4 writes the indirect call as lIR has it) and
-§8.11 lists what hardening may add (§10 item 25). Everything
+no `switch`, no array type in its type grammar, no typed indirect call,
+and no struct-typed `alloca`, `global` or constant: `alloca` takes a
+scalar or `ptr` element type and an optional count, and a `global` is a
+`ptr` or a scalar initialised with a literal, null or a string (a
+function address is not accepted as an initialiser; `lair` reports
+`complex global initializers` as not implemented). This mapping uses
+none of the missing forms (`match` is an `icmp`/`br` chain, §8.3;
+variable-length payloads are addressed with `getelementptr` on the
+element type, §8.3; §8.4 writes the indirect call as lIR has it; a
+stack object is a word-sized `alloca` addressed through
+`getelementptr` on its struct type, §8.2; every static object and
+table is built by the module initialiser of §8.2 and reached through a
+`ptr` global) and §8.11 lists what hardening may add (§10 items 25,
+33). Everything
 fibber-specific is a naming and layout convention on top; no fibber
 vocabulary enters lIR, and none of liar ADR 021's safe-lIR features
 (`own`, `rc`, `closure`) is used. Runtime support functions are ordinary lIR `define`s in a
@@ -1397,40 +1582,101 @@ Every object begins with a 16-byte header:
 flags: bit 0 SHARED    counts are atomic from now on (§7)
        bit 1 HAS-WEAK  a weak box exists (§8.7)
        bit 2 STACK     a scope-local object: retain/release are no-ops (§6.11)
-       bit 3 IMMORTAL  static data: literals, named-function closures, vtables
+       bit 3 IMMORTAL  static data: literals and everything reachable from them,
+                       def values (syntax §3.19), named-function closures, vtables
 ```
 
-`count` is the number of counted references (§2). `type-id` indexes the
-global table `fib.types` of per-type records `{ ptr drop, ptr trace, ptr
-name, i64 size }`, one per monomorphised object type: `drop` releases the
+`count` is the number of counted references (§2) of a counted object.
+An `IMMORTAL` or `STACK` object has no count: its `count` field is
+**0**, a value no test accepts (`fib.unique?` needs 1, a weak upgrade
+needs > 0), and nothing ever changes it; a static object built by the
+module initialiser (or emitted as a constant once lIR holds one,
+§8.11), a literal allocated by the interpreter, a stack object's
+`alloca` and `fib.immortalise` all initialise it so (Proposed; §10 item
+30). `type-id` indexes the table `fib.types` of per-type records
+`(defstruct fib.typerec (ptr ptr ptr i64))` — `drop`, `trace`, `name`,
+`size` — one per monomorphised object type: `drop` releases the
 object's counted children; `trace` calls a callback on each child
-pointer (used by share-marking, §8.8, and by the interpreter's audit).
+pointer (used by share-marking, §8.8, by `fib.immortalise` and by the
+interpreter's audit). lIR has no struct-typed `global`, so the table is
+a block of `n` records that the **module initialiser** allocates and
+fills: `(global fib.types ptr (ptr null))` holds its address, and
+record `tid`'s field `k` is `(getelementptr %struct.fib.typerec (load
+ptr @fib.types) (i32 tid) (i32 k))`; `fib.types[tid].drop` below is
+that load. The initialiser `fib.init.<module>` is an lIR `define` the
+compiler emits per module; the entry point it emits calls the
+initialisers of every module in dependency order and only then the
+program's `main`, and each initialiser, in this order: allocates the type records and stores the code pointers
+(`(store @drop.T slot)` is an ordinary store of a function address,
+which lIR accepts where a `global` initialiser does not); builds every
+**static object** of the module — string and `Form` literals with
+their headers (§8.3), the constant closures of named functions and
+constructors (§8.4), vtables (§8.5) — with `fib.alloc` followed by
+`count := 0, flags := IMMORTAL`, storing each address into its own
+`ptr` global, from which code loads it; then evaluates the module's
+`def`s (§8.10). Once lIR has struct-typed constants (§8.11) the static
+objects become static data with the same headers and nothing else
+changes: an `IMMORTAL` object is never freed either way and the audit
+does not track it (§6.7) (Proposed; §10 item 33).
+
+**The flags word is accessed atomically** (Proposed; §10 item 29).
+`SHARED`, `STACK` and `IMMORTAL` are fixed before any second thread can
+see the object, but `HAS-WEAK` is set by `(weak x)` on an object that
+may already be shared while another thread reads the same word in
+`fib.retain`; under the LLVM memory model, which lIR follows exactly, a
+racing non-atomic load is `undef`, so that retain could take the
+non-atomic count path on a shared object, or skip. Hence every read of
+`flags` below is `atomic-load monotonic` and every write after
+allocation is `atomicrmw or monotonic` (`fib.share` setting `SHARED`,
+`weak` setting `HAS-WEAK`); on the targets lIR supports these cost what
+a plain load and a locked `or` cost. The count's two paths are
+unchanged: the `SHARED` bit read this way selects them, and an object's
+bit is set before the object is handed over (§8.8), so the handoff's
+own synchronisation orders that write before any other thread's read.
+No other header field changes after allocation.
 
 ```
 fib.alloc   (i64 size, i32 tid) -> ptr   ; malloc; count = 1, flags = 0
+flags(p)    = atomic-load monotonic p.flags
 fib.retain  (ptr p) -> void
     if p == null: return                         ; Option nil
-    if flags & (STACK|IMMORTAL): return
-    if flags & SHARED: atomicrmw add count 1 (monotonic)  else: count += 1
+    if flags(p) & (STACK|IMMORTAL): return
+    if flags(p) & SHARED: atomicrmw add count 1 (monotonic)  else: count += 1
 fib.release (ptr p) -> void
-    if p == null or flags & (STACK|IMMORTAL): return
-    if SHARED: old = atomicrmw sub count 1 (acq_rel); if old == 1: fib.drop p
-    else:      if count == 1: fib.drop p  else: count -= 1
+    if p == null or flags(p) & (STACK|IMMORTAL): return
+    if flags(p) & SHARED: old = atomicrmw sub count 1 (acq_rel); if old == 1: fib.drop p
+    else:                 if count == 1: fib.drop p  else: count -= 1
 fib.drop    (ptr p) -> void
-    if HAS-WEAK: fib.weak-clear p                ; §8.7
+    if flags(p) & HAS-WEAK: fib.weak-clear p     ; §8.7
     call fib.types[tid].drop p                   ; releases children
     free p
-fib.unique? (ptr p) -> i1                        ; count == 1 and not SHARED (an atomic load if SHARED, then false)
+fib.unique? (ptr p) -> i1
+    if flags(p) & (SHARED|IMMORTAL|STACK): return 0   ; shared: never written in place; static and
+                                                      ; stack data have no count to test (§6.6)
+    return count == 1
 fib.takeable? (ptr p) -> i1                      ; unique? and not HAS-WEAK: a field of p may be taken (§6.6)
 fib.share   (ptr p) -> void                      ; §8.8
+fib.immortalise (ptr p) -> void                  ; def initialisation (syntax §3.19): walk p through trace,
+                                                 ; stopping at IMMORTAL objects; on each: count := 0,
+                                                 ; flags |= IMMORTAL. Runs before main, single-threaded.
 ```
 
-A `STACK` object is an `alloca` with the same layout, never passed to
-`fib.release`; the compiler emits `fib.types[tid].drop` inline at scope
-exit. The interpreter uses the same header, type table and `drop`/`trace`
-functions (interpreted), so its trace of `alloc`, `retain`, `release`,
-`free`, `read`, `write`, `weak`, `upgrade` and `shared` events is
-comparable one-to-one with an instrumented build of the compiled program.
+A `STACK` object has the same layout in an `alloca` of the frame,
+never passed to `fib.release`; the compiler emits `fib.types[tid].drop`
+inline at scope exit. lIR's `alloca` takes a scalar or `ptr` element
+type, not a named struct, so the object is `(alloca i64 (i32 k))` with
+`k` the layout's size in 8-byte words — every field of these layouts
+is at most 8-byte aligned, so the words give the alignment the fields
+need — and its fields are addressed through `(getelementptr
+%struct.T.obj p (i32 0) (i32 i))` exactly as a heap object's are; the
+header is stored by the code that allocates it. Immortal objects are never `drop`ped or freed, and the audit does
+not count them among the allocations live at exit (§6.7). The
+interpreter uses the same header, type table and `drop`/`trace`
+functions (interpreted) and allocates its literals and `def` values
+with the same `IMMORTAL` header, so its trace of `alloc`, `retain`,
+`release`, `free`, `read`, `write`, `weak`, `upgrade` and `shared`
+events is comparable one-to-one with an instrumented build of the
+compiled program.
 
 ### 8.3 Structs, enums, strings, arrays, `Option`
 
@@ -1453,7 +1699,10 @@ comparable one-to-one with an instrumented build of the compiled program.
   byte length) followed in the same allocation by the UTF-8 bytes and a
   NUL for FFI, addressed with `getelementptr i8` from the end of the
   header (lIR's type grammar has no array type); no children. Literals
-  are `IMMORTAL` constants.
+  are `IMMORTAL` objects with count 0, built by the module initialiser
+  and reached through a `ptr` global each, since lIR has no struct-typed
+  constant; its `(string ..)` constant holds the bytes the initialiser
+  copies (§8.2).
 - `(Array T)`: the header struct `(i64 i32 i32 i64)` (length last)
   followed by `n` elements of `T`'s lIR type, addressed with
   `getelementptr T` from the end of the header; `array-set!` does a
@@ -1463,7 +1712,10 @@ comparable one-to-one with an instrumented build of the compiled program.
 - `Vec`, `Map`, `Set`, `List`: library structs and enums over `Array`, by
   the struct rule.
 - `Form`: an ordinary enum; exists at run time only where a program
-  quotes.
+  quotes. A quoted literal, with every `Form`, `Vec`, `Array` and `str`
+  object reachable from it, is an `IMMORTAL` graph (count 0) that the
+  module initialiser builds once and a `ptr` global names (§8.2), so a
+  part of it pulled out by a `match` is never written in place (§6.6).
 
 ### 8.4 Closures and function values
 
@@ -1486,12 +1738,15 @@ form of §8.11 exists, every closure entry point takes `ptr`-sized words
 and scalar arguments travel through them by a width-preserving
 conversion, which is one of the reasons the typed form is on the
 hardening list. Named functions used as
-values are `IMMORTAL` constant closures with no captures whose code
-ignores `env`; constructors likewise. An escaping closure is
+values are `IMMORTAL` closures with no captures whose code ignores
+`env`, built by the module initialiser and named by a `ptr` global
+each (§8.2); constructors likewise. An escaping closure is
 `fib.alloc`ed with each object capture consumed (E3); its `drop`
-releases the captures. A non-escaping closure is `alloca`ed with `STACK`
-set and stores uncounted pointers. Colours have no representation. A
-named `fn`'s self-reference is the closure's own `env`.
+releases the captures. A non-escaping closure is a `STACK` object of
+the creating frame: `(alloca i64 (i32 k))` addressed through
+`(getelementptr %struct.fib.closure.L ..)` (§8.2), storing uncounted
+pointers. Colours have no representation. A named `fn`'s
+self-reference is the closure's own `env`.
 
 ### 8.5 Protocol dispatch
 
@@ -1499,12 +1754,15 @@ Static: the monomorphiser rewrites `(count v)` at `v : (Vec i64)` to
 `(call @count.Vec.i64 v)`. No tables.
 
 Dynamic: for every `(P, K)` instance reachable through a `(dyn P e)` the
-compiler emits an `IMMORTAL` global `P.vt.K` of an lIR `defstruct` with
-one `ptr` field per method in protocol order, holding the code pointers
-(a struct-valued `constant` if lIR gains one, else a `global` filled at
-module initialisation; §8.11). `(dyn P e)` builds
-`{ e, @P.vt.K }`; a method call loads slot `i` and `indirect-call`s with
-`obj` as `self`. Retain and release of a `(dyn P)` value act on `obj`.
+compiler emits a vtable: a block of one `ptr` slot per method in
+protocol order, holding the code pointers. lIR has no struct-typed
+`global` and takes no function address in a `global` initialiser, so
+the module initialiser allocates the block, `store`s each code pointer
+into its slot and stores the block's address into the `ptr` global
+`P.vt.K` (§8.2); a struct-valued constant, if lIR gains one, would make
+it static data (§8.11). `(dyn P e)` builds `{ e, (load ptr @P.vt.K) }`;
+a method call loads slot `i` and `indirect-call`s with `obj` as `self`.
+Retain and release of a `(dyn P)` value act on `obj`.
 
 ### 8.6 Cells, private `&` cells, atoms
 
@@ -1518,11 +1776,18 @@ module initialisation; §8.11). `(dyn P e)` builds
 - `(set! c v)`: `old = load`; `store v` (after `consume`); `fib.release
   old`. If the cell is `SHARED` (only an atom can be), the value is
   share-marked before the store.
-- A private `&` cell: `(alloca fib.cell)` in the caller with `STACK` set,
-  initialised by the copy-in (move: `store` the place's content and null
-  the place, or take the field when `fib.takeable?` holds; acquire:
-  `store` the retained content);
-  passed as `ptr`; write-back as §6.6; the `alloca` needs no drop.
+- A private `&` cell: a `STACK` object in the caller's frame, `(alloca
+  i64 (i32 3))` — the header's two words and one for the content, whose
+  lIR type is at most one word — addressed through `(getelementptr
+  %struct.fib.cell t (i32 0) (i32 3))` (§8.2), since lIR's `alloca`
+  takes no struct type; its header is stored (count 0, `STACK`) and it
+  is initialised by the copy-in (move: `store` the place's content and
+  null the place, or take the field when `fib.takeable?` holds;
+  acquire: `store` the retained content); passed as `ptr`; write-back
+  as §6.6; the `alloca` needs no drop. Case 17's `(push-count &v @v)`
+  emits exactly this: three words, the header, the acquired vector
+  stored through the field-3 `getelementptr`, `push-count` called with
+  the `alloca`'s address, the content stored back into `v` afterwards.
 - `@a` on an atom: `fib.lock a` (`cmpxchg` spinlock, acquire), `v = load`,
   `fib.retain v`, `fib.unlock a` (release store) — the single atomic step
   §7 requires.
@@ -1545,18 +1810,25 @@ become shared.
 (defstruct fib.weakbox (i64 i32 i32  i32  ptr))   ; header (its count = number of Weak values), lock, target
 ```
 
-`(weak x)`: if `x` has `HAS-WEAK`, its box is found in the global table
-`fib.weak-table` (address → box, under a mutex; only flagged objects are
-ever looked up); else a box is allocated, registered, and the flag set;
-the box is retained and returned: a `(Weak T)` value is the box. If `x`
-is `IMMORTAL` (a literal, a named function used as a value, a vtable),
-a fresh box with target `x` is allocated and not registered, and `x`'s
-header is not written (static data may be read-only); such a box is
-never cleared, `@w` on it always succeeds, and it is freed like any
-other box when its own count reaches zero (§10 item 24). `@w`:
-lock the box; `t = load target`; if null → unlock, `nil`; else "retain
-if count > 0" on `t` (a plain increment when not `SHARED`; a `cmpxchg`
-loop refusing zero when `SHARED`); unlock; return `t` or `nil`.
+`(weak x)`: under the mutex of the global table `fib.weak-table`
+(address → box): if `x` has `HAS-WEAK` (read with the atomic load of
+§8.2), its box is found in the table (only flagged objects are ever
+looked up); else a box is allocated, registered, and the flag set with
+`atomicrmw or` (§8.2: `x` may be shared and another thread may be
+reading its flags in `fib.retain` at that moment; doing the test and
+the set under the mutex is what makes two threads taking a `weak` of
+one shared object agree on one box); the box is retained and returned:
+a `(Weak T)` value is the box. If `x` is `IMMORTAL` (a literal, a `def`
+value, a named function used as a value, a vtable), a fresh box with
+target `x` is allocated and not registered, and `x`'s header is not
+written (static data may be read-only); such a box is never cleared,
+`@w` on it always succeeds, and it is freed like any other box when its
+own count reaches zero (§10 item 24). `@w`: lock the box; `t = load
+target`; if null → unlock, `nil`; else if `t` is `IMMORTAL` → unlock,
+`(some t)` with no count operation (its count is 0 and it never dies,
+§8.2); else "retain if count > 0" on `t` (a plain increment when not
+`SHARED`; a `cmpxchg` loop refusing zero when `SHARED`); unlock; return
+`t` or `nil`.
 `fib.weak-clear obj`: lock the box, store null, unregister, unlock;
 called from `fib.drop` before the children are released. The box is
 freed when its own count reaches zero and its target is null or
@@ -1568,10 +1840,11 @@ force-allocates its argument on the heap (§6.11).
 ### 8.8 Threads, share marking, tasks
 
 `(spawn f)`: `fib.share f` walks `f` and everything reachable through
-`fib.types[tid].trace`, setting `SHARED` on each object, stopping at
-objects already `SHARED` and at `IMMORTAL` ones; an atom is locked, its
-content walked, unlocked; a weak box is locked and its live target
-walked. The task object is allocated with count 2 (§6.8): the caller's handle
+`fib.types[tid].trace`, setting `SHARED` on each object with the
+`atomicrmw or` of §8.2, stopping at objects already `SHARED` and at
+`IMMORTAL` ones; an atom is locked, its content walked, unlocked; a
+weak box is locked and its live target walked; a task is walked through
+its captures and result only (below). The task object is allocated with count 2 (§6.8): the caller's handle
 and the thread's. Then the runtime hands `f` and the task to a new OS
 thread (or a pool); the thread calls `f`, share-marks the result, stores
 it, sets the state to done, signals, and finally `fib.release`s the
@@ -1582,17 +1855,60 @@ return joins every thread still running before the result is returned
 to the OS (§6.8). The interpreter's `mark_shared`
 follows the same edges (`fibref` `heap/shared.rs`).
 
-`(Task T)`: `(i64 i32 i32  i32 state  ptr resume  ptr result  ptr waker
-..captures ..locals)`. `async` lowers to a state machine, not to LLVM
-coroutine intrinsics: `resume(task)` switches on `state`, runs to the
-next `await`, stores the live locals into the task object and returns.
-`await e` registers `waker` with `e` and yields; the registration retains the awaiting task and the wake, or the awaited task's drop, releases it; `e` itself is an `Owned` temporary of the `await` step, held in the task's frame until the await completes, so the awaited task is never freed while something awaits it. `join`/`block-on` drive
-the executor until `state == done`, then retain and return `result`. The
-task's `drop` releases captures, live locals and the result. Every
-holder that may resume or complete a task — a handle, the run queue, a
-spawned thread, a registered waker — holds a count on it; nothing
-touches a task it does not hold. The interpreter may run tasks as
-coroutines; frees must match.
+`(Task T)`: `(i64 i32 i32  i32 state  i32 driver  i32 lock  ptr resume
+ptr result  ptr waiters  ..captures ..locals)`. `async` lowers to a
+state machine, not to LLVM coroutine intrinsics: `resume(task)`
+switches on `state`, runs to the next `await`, stores the live locals
+into the task object and returns.
+
+**One driver at a time, any number of waiters** (Proposed; §10 item
+27). `Send (Task T) = Send T` (§1.6), so one task can be joined from
+two threads (`(plet ((a (join t)) (b (join t))) (+ a b))`) or awaited
+by two tasks, and the checker accepts both (proposed cases 43, 44). A
+count on the task is what keeps it allocated; it is not mutual
+exclusion, and two threads calling `resume` on one task would both
+rewrite its `state`, locals and `result`. Exclusion is the runtime's:
+
+- `resume` is entered only after `cmpxchg driver 0 → 1` (acquire)
+  succeeds, and `driver` is stored back to 0 (release) when the resume
+  returns. A `join`/`block-on` or an executor worker that loses the
+  race never touches the frame: a worker leaves the task to its current
+  driver, and a `join` blocks on the task's completion signal (a futex
+  or condition variable in the runtime's per-task record, broadcast to
+  every joiner) instead of resuming. So the live locals of a task are
+  only ever read or written by its current driver, and a task that
+  migrates between workers is handed over through the run queue's own
+  synchronisation.
+- `state` and `result` are written once, by the driver that completes
+  the task: `result` first, then `state := done` with `atomic-store
+  release`; readers use `atomic-load acquire`. The result is
+  share-marked before the store (§5.5).
+- `await e` takes `e`'s `lock` (a spinlock like an atom's, §8.6),
+  re-checks `state` under it so that a completion cannot slip between
+  the check and the registration, and appends the awaiting task's
+  waker to `e`'s **waiter list**; a single waker slot would let a
+  second registration overwrite the first, leaving one awaiter never
+  woken and the count its registration took never released. Each
+  registration retains the awaiting task; completion takes the list
+  under the lock, wakes every entry and releases it; the awaited
+  task's drop releases whatever is still registered. `e` itself is an
+  `Owned` temporary of the `await` step, held in the task's frame until
+  the await completes, so the awaited task is never freed while
+  something awaits it. An `await` on a task already `done` returns the
+  retained result at once.
+- A task's `trace` covers its captures and its result, never its live
+  locals, so `fib.share` (above) never reads a running frame: the
+  captures were share-marked at creation (§5.5), the result before
+  completion, and the locals belong to the current driver alone.
+
+`join`/`block-on` drive the executor until `state == done`, claiming
+the task's `driver` whenever they resume it themselves, then retain and
+return `result`. The task's `drop` releases captures, live locals, the
+result and any waker still registered. Every holder that may resume or
+complete a task — a handle, the run queue, a spawned thread, a
+registered waker — holds a count on it; nothing touches a task it does
+not hold, and nothing resumes a task it has not claimed. The
+interpreter may run tasks as coroutines; frees must match.
 
 ### 8.9 Calls, returns, self tail loops
 
@@ -1633,7 +1949,11 @@ coroutines; frees must match.
 | `set!`, `reset!`, `swap!` | as §8.6: `consume` new, share if `SHARED`, store, `fib.release` old |
 | `&` copy-in | move (store, clear the place / take the field when `fib.takeable?`) or acquire (`fib.retain`) as §6.6; nothing for a forwarded `&v` in a self tail call |
 | `&` write-back | store the private cell's content into the place; `fib.release` the place's old content (acquire case); `set-field!` semantics for a field place |
-| `array-set!`, `set-field!` | `fib.unique?` test; in-place write, or copy + store + `fib.release` old |
+| `array-set!`, `set-field!` | `fib.unique?` test (flags first, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
+| module initialiser `fib.init.<module>` | called by the entry point before the program's `main`, modules in dependency order (§8.2): allocate and fill the type table, build every static object (literals, named-function closures, vtables) with `fib.alloc` and an `IMMORTAL` header, store each address into its `ptr` global |
+| `def` initialisation | in the module initialiser after its static objects, `def`s in source order: evaluate the constant expression and `fib.immortalise` its value (syntax §3.19); as static data once lIR holds struct-typed constants (§8.11) |
+| stack object (`STACK`: private `&` cell, non-escaping closure, later scope-local objects) | `(alloca i64 (i32 k))`, `k` the layout in 8-byte words, header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |
+| `(weak x)` | box lookup or allocation under the table mutex; `HAS-WEAK` set with `atomicrmw or` (§8.7) |
 | self tail call, `loop`/`recur` | §8.9 |
 | `raw-retained` | `consume` the operand; the count is the foreign side's until `release-raw`/`fib_release` |
 | `drop` per type | `fib.release` each object field; `fib.weak-clear` if flagged; `free` |
@@ -1651,9 +1971,17 @@ and lowered but undocumented); `tailcall` as `musttail` only if general
 tail calls are adopted later (§10 item 6). Conveniences this mapping
 does *not* depend on but would use if added: `switch` (§8.3 uses
 `icmp`/`br` chains for `match`), an array type in the type grammar
-(§8.3 addresses trailing elements with `getelementptr`), and
-struct-valued constants for vtables (§8.5). Nothing here needs ADR 021's
-safe lIR.
+(§8.3 addresses trailing elements with `getelementptr`), a named
+struct as the element type of `alloca` (§8.2 sizes stack objects in
+words and addresses them with `getelementptr` on the struct type), and
+struct-typed `global`s and constants with function addresses and
+nested aggregates as initialisers (§8.2 builds the type table, literal
+objects, constant closures and vtables in the module initialiser and
+reaches them through `ptr` globals; with them, all of it becomes
+static data). `lair` today parses `(alloca %struct.T)` and `(global g
+%struct.T ..)` as `UnknownType` and rejects `(global g ptr @f)` as an
+unimplemented initialiser, which is what fixed the v1 shapes. Nothing
+here needs ADR 021's safe lIR.
 
 ---
 
@@ -1676,7 +2004,8 @@ defun dup-all : (fn ((& (Vec i64))) unit)
 Every line is one of: a parameter (type, summary, exclusivity with the
 reason), a binding (`owns` / `alias-of b` / `derived-of b` /
 `scope-local`), a closure literal (`escaping` with the clause of §6.5 that
-decided it, its captures with their kinds), a call with the copy-in
+decided it, `arg-of-self-tail-call` or `arg-of-recur` for the slot-loop
+rule, its captures with their kinds), a call with the copy-in
 decision of every `&` argument (`move`, `acquire`, or `forward` for the
 `&v` of a self tail call, §6.10), a colour solution (`ς₁ = local, forced by
 capture n`), and the emitted operations with source lines. Reject cases
@@ -1691,7 +2020,8 @@ trace must free the same objects at the same lines (method.md rule 6).
 
 Each needs the owner's sign-off. Recommendation first, alternative
 second. Items 1–6 shape the checker; 7–11 the runtime; 12–17 are
-smaller; 18–26 came out of the confirmed findings on the synthesis.
+smaller; 18–26 came out of the confirmed findings on the synthesis;
+27–31 out of the second round of findings; 32–33 out of the third.
 
 1. **Inference is HM with generalisation only at `defun` SCC boundaries;
    `let` and `fn` never generalise (§3).** Recommend: yes; liar's
@@ -1740,10 +2070,12 @@ smaller; 18–26 came out of the confirmed findings on the synthesis.
    an ordinary call for any other `&` argument; `loop`/`recur` (syntax
    §3.18) lower to the same slot loop, which is what lets a loop update
    an `&` place in place and `await` inside an `async`.
-7. **Monomorphisation keyed by layout class; whole-program
-   compilation (§4.3).** Recommend: yes. Alternative: dictionary passing
-   with a uniform boxed representation (separate compilation, boxed
-   scalars, a runtime test in every count operation).
+7. **Monomorphisation keyed by layout class for unconstrained type
+   variables and by full type for protocol-bounded ones (item 28);
+   whole-program compilation (§4.3).** Recommend: yes. Alternative:
+   dictionary passing with a uniform boxed representation (separate
+   compilation, boxed scalars, a runtime test in every count
+   operation).
 8. **Heap-allocate everything in v1; stack allocation is a later
    optimisation pass verified by the audit, under the scope-local
    condition of §6.11.** Recommend: yes; it is the lowest-risk order and
@@ -1781,9 +2113,10 @@ smaller; 18–26 came out of the confirmed findings on the synthesis.
     Recommend: yes. Alternative: liar's `extend-protocol-default` as
     blanket instances with a specificity order.
 16. **The audited heap gains `write-unique` (§6.6): a write to an
-    immutable object legal iff its count is exactly 1 and it is not
-    shared, used only by `array-set!`/`set-field!`.** Recommend: yes; it
-    is what "unique updates happen in place" means as an audited event.
+    immutable object legal iff it is neither `SHARED`, `IMMORTAL` nor
+    `STACK` and its count is exactly 1 (item 30), used only by
+    `array-set!`/`set-field!`.** Recommend: yes; it is what "unique
+    updates happen in place" means as an audited event.
     Alternative: no unique writes; `&` updates always copy (then §2's
     third guaranteed minimum is vacuous).
 17. **Leak-cycle classification is fibref's (§6.7): reachable from a
@@ -1829,9 +2162,10 @@ smaller; 18–26 came out of the confirmed findings on the synthesis.
     tail relies on copy-then-unique-write instead.
 22. **`spawn` creates the task with count 2, one for the caller and one
     for the thread, released after the result is stored; a registered
-    waker holds a count on the waiting task; `main` returning joins
-    every running thread (§6.8, §8.8).** Recommend: yes; a discarded
-    handle otherwise freed the task under the running thread.
+    waker holds a count on the waiting task (the wakers form a list,
+    item 27); `main` returning joins every running thread (§6.8,
+    §8.8).** Recommend: yes; a discarded handle otherwise freed the
+    task under the running thread.
     Alternative: detach threads at exit and exclude their objects from
     the audit; or forbid discarding a `Task` (a type error), which
     rejects fire-and-forget `spawn`, an ordinary program in liar's
@@ -1848,14 +2182,94 @@ smaller; 18–26 came out of the confirmed findings on the synthesis.
     literal operand, which cannot catch a named function passed through
     a variable.
 25. **`match` lowers to `icmp`/`br` chains; indirect calls use lIR's
-    untyped form; no array type or struct-valued constant is required
-    (§8, §8.11).** Recommend: yes; it is what lIR has today, and it
+    untyped form; no array type, struct-typed `alloca`/`global` or
+    struct-valued constant is required (§8, §8.11; item 33).**
+    Recommend: yes; it is what lIR has today, and it
     keeps method.md rule 7 (lIR verifies its input) independent of new
     instructions. Alternative: add `switch`, the typed `indirect-call`,
-    an array type and struct-valued constants to lIR first.
+    an array type, struct-typed `alloca`/`global` and struct-valued
+    constants to lIR first.
 26. **`(raw-retained e)`/`(release-raw p)` are the only count transfer
     across the foreign boundary (§6.13; syntax §3.15).** Recommend:
     yes; extern positions are scalars, so `:retains` named parameters
     that cannot exist. Alternative: object types allowed at `:retains`
     positions of an extern signature, with the foreign side calling
     `fib_release`.
+27. **A task is resumed by one driver at a time (a `cmpxchg` on its
+    `driver` word), waited on by any number of joiners and awaiters
+    (a waiter list, a broadcast completion signal), its `state` and
+    `result` written once with release ordering, and its `trace`
+    excludes live locals; `Task` stays `Send` (§8.8, §6.8).**
+    Recommend: yes; nothing in the checker prevented `(plet ((a (join
+    t)) (b (join t))) ..)` or two tasks awaiting one task, and a count
+    is not mutual exclusion: two drivers would rewrite one frame, a
+    `fib.share` walk could read a frame mid-resume, and one waker slot
+    lost the second awaiter. Alternative (a): `Task` not `Send`, which
+    rejects awaiting any task created outside the `async` body, i.e.
+    task composition itself; (b) linear handles, joined or awaited
+    once, which needs a linearity check the checker has no other use
+    for, or a runtime trap that no case header can express.
+28. **Specialisations key a protocol-bounded type variable by its full
+    type argument and every other variable by layout class (§4.3).**
+    Recommend: yes; with a class-only key `(show x)` at `x : a`, `(Show
+    a)`, inside `describe<ptr>` names no implementation, so §4.2's
+    direct call and layout-class sharing could not both hold; the
+    interpreter's dispatch on the header's type id (§4.5) answers the
+    same. Alternative: per-protocol dispatch tables indexed by the
+    header's type id inside `ptr`-class specialisations, which cannot
+    serve scalars (no header) and drops "always static".
+29. **The header's flags word is read with `atomic-load monotonic` and
+    written after allocation with `atomicrmw or` (§8.2, §8.7, §8.8).**
+    Recommend: yes; `(weak x)` sets `HAS-WEAK` on an object that may
+    be shared while another thread's `fib.retain` reads the word, and
+    under the LLVM model a racing non-atomic load is `undef`, which
+    could send the retain down the non-atomic count path; monotonic
+    atomics cost a plain load and a locked `or`. Alternative:
+    `HAS-WEAK` in the count word's high bits under the count's own
+    atomics, which puts a mask into every count test.
+30. **`fib.unique?` and `fib.takeable?` test the flags before the count
+    and are false on `SHARED`, `IMMORTAL` and `STACK` objects; immortal
+    and stack objects carry count 0 (§8.2, §6.6, §6.2).** Recommend:
+    yes; without the flag test an immortal count that read 1 (a
+    constant emitted like `fib.alloc` initialises it) let `push!` write
+    into a `Form` literal pulled apart by `match`, mutating a constant
+    or faulting on read-only data while the interpreter answered
+    otherwise. Alternative: a maximum count value for immortals, which
+    still needs the flag test in `unique?` and leaves a weak upgrade's
+    `> 0` test accepting, so a missing flag test there would go
+    unnoticed.
+31. **`def` values are typed closed and monomorphic, in dependency
+    order with the `defun`s (syntax Open decision 29), and immortalised
+    before `main` (§2.16, §3.5, §8.2; syntax §3.19, syntax Open
+    decision 25).** Recommend: yes; the constant grammar keeps
+    initialisation effect-free and `Send` by construction, and the
+    immortal header makes a global count-free and safe from every
+    thread. Alternative: evaluate every `def` at compile time only (the
+    interpreter as constant folder), so no runtime initialisation
+    exists; equivalent for the programmer, heavier for the compiler.
+32. **A closure literal, or a `let`-bound closure of §6.5 clause (c),
+    that is an argument of a self tail call or of a `loop`/`recur` is
+    escaping whatever the callee's summary says (§6.5, §6.10).**
+    Recommend: yes; `spin`'s `g` is `noescape` because it is only
+    called, but the tail call is a slot loop: the jump releases the
+    creating scope's bindings and the closure survives in the slot, so
+    a non-escaping closure's uncounted capture pointed at freed memory
+    on the next iteration while the interpreter, which retains every
+    capture, answered 1 (proposed case 49). Alternative: keep a slot-loop
+    iteration's bindings alive across the jump (a frame per iteration,
+    which forfeits constant stack), or forbid closures as
+    self-tail-call arguments.
+33. **v1 builds every static object and table (the type table, string
+    and `Form` literals, named-function and constructor closures,
+    vtables, `def` values) in a per-module initialiser run before the
+    program's `main`, reached through `ptr` globals, and emits stack objects as
+    word-sized `alloca`s addressed through `getelementptr` on the
+    struct type (§8.2–§8.6, §8.10).** Recommend: yes; `lair` rejects a
+    struct-typed `alloca` or `global` (`UnknownType`) and a function
+    address as a global initialiser, so the shapes §8 gave for the
+    private `&` cell, stack closures, vtables and the type table could
+    not be emitted; the initialiser costs one allocation per static
+    object at start-up and nothing after. Alternative: add struct-typed
+    `alloca`, `global` and constants to lIR first (item 25's
+    alternative), which turns the same objects into static data with
+    no other change.
