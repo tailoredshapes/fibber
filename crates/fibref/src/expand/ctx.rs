@@ -11,7 +11,8 @@ use super::error::{ExpandError, ExpandErrorKind};
 use super::runner::MacroDef;
 use super::types::{EnumInfo, StructInfo, TypeTable};
 
-/// The two limits that make expansion terminate on every input.
+/// The limits that make expansion terminate on every input
+/// (implementation limits, syntax §3.16).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Most macro expansions (user macros, prelude macros and
@@ -30,18 +31,32 @@ pub struct Limits {
     /// reader's [`MAX_DEPTH`](crate::syntax::MAX_DEPTH), so every program
     /// the reader accepts is within it.
     pub max_depth: usize,
+    /// Most forms (every node of the tree: atoms, lists, vectors and
+    /// maps) that the expansions of one top-level form may produce in
+    /// all, each expansion's result counted in full. The step limit
+    /// alone does not make expansion terminate in practice: a macro
+    /// whose result grows at each step (`(defmacro g (... xs) `(g 1
+    /// ,@xs))`, or one that doubles its argument) does quadratic or
+    /// exponential work long before its steps run out. It fails with
+    /// [`ExpandErrorKind::TooLarge`] instead.
+    pub max_forms: usize,
 }
 
 /// Default for [`Limits::max_steps`].
 pub const MAX_STEPS: usize = 100_000;
 /// Default for [`Limits::max_depth`].
 pub const MAX_EXPAND_DEPTH: usize = 2000;
+/// Default for [`Limits::max_forms`]: four million forms, about twice
+/// what the longest `and` the depth limit admits produces (about `n²/2`
+/// forms for `n` operands).
+pub const MAX_EXPANDED_FORMS: usize = 4_000_000;
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_steps: MAX_STEPS,
             max_depth: MAX_EXPAND_DEPTH,
+            max_forms: MAX_EXPANDED_FORMS,
         }
     }
 }
@@ -62,6 +77,9 @@ pub struct ExpandCtx {
     pub(crate) types: TypeTable,
     pub(crate) call_pos: Pos,
     pub(crate) steps: usize,
+    /// Forms produced by expansions so far, against
+    /// [`Limits::max_forms`]; reset with `steps`.
+    pub(crate) forms: usize,
 }
 
 impl Default for ExpandCtx {
@@ -87,6 +105,7 @@ impl ExpandCtx {
                 end: 0,
             },
             steps: 0,
+            forms: 0,
         }
     }
 

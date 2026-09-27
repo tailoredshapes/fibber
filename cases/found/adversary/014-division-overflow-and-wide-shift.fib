@@ -1,0 +1,27 @@
+;; spec:   types §2.12 (not an ownership rule; method.md rule 6)
+;; expect: accept
+;; result: -9223372036854775807
+;; audit:  clean
+;; types §2.12: "Integer division and remainder trap on zero; signed
+;; overflow wraps (Decided: it is what lIR emits and what the interpreter
+;; can match exactly)". So (/ i64-min -1) wraps to i64-min and (rem
+;; i64-min -1) is 0; the program adds 1: -9223372036854775807.
+;;
+;; Observed (fibref run):
+;;   result: -9223372036854775807
+;;   audit:  clean=true leak-cycles=0 leaks=0 errors=0
+;; fibref follows the text. The text's justification is wrong: lIR maps
+;; / and rem to LLVM sdiv/srem, for which i64-min / -1 is undefined
+;; behaviour (on x86-64 the idiv instruction raises SIGFPE), not a wrap;
+;; so a compiled program cannot "match exactly" without an explicit test.
+;; Related gaps in the same section: shl/shr/sar by an amount >= the
+;; width are not specified at all; fibref masks the amount ((shl 1 64) =
+;; 1, (sar -1 65) = -1) where LLVM's shl/lshr/ashr give poison; and
+;; (fptosi i64 x) of NaN or of an out-of-range float gives 0 or a
+;; saturated value in fibref ((fptosi i64 (/ 1.0 0.0)) =
+;; 9223372036854775807) where LLVM's fptosi gives poison.
+;; Diagnosis: spec (types §2.12 must say what these operations do and
+;; the compiled mapping must emit the tests that make it so).
+(defun main () -> i64
+  (let ((m (- (- 0 9223372036854775807) 1)))
+    (+ (+ (/ m -1) (rem m -1)) 1)))

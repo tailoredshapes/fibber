@@ -1,0 +1,30 @@
+;; spec:   §4 (types §6.4, §8.4, §6.12 exception 5)
+;; expect: accept
+;; result: 2
+;; audit:  clean
+;; A protocol method passed as a function value. It type-checks
+;; (count : (fn :send ((Vec i64)) i64) at this instantiation), and the
+;; spec gives it a calling convention:
+;;   types §8.4: "Named functions used as values are IMMORTAL closures
+;;   whose code is the function's all-owned body ... The monomorphiser
+;;   ... emits an all-owned body for every function whose value is taken
+;;   anywhere in it ...; a protocol method's implementation used as a
+;;   value likewise."
+;;   types §6.12 exception 5: "through a function value every object
+;;   parameter and the closure are owned, and a named function reached
+;;   that way runs its all-owned body".
+;;
+;; Observed (fibref run):
+;;   failed:
+;;   004-method-as-function-value.fib:29:21: gap in the ownership plan: method
+;;   count used as a function value: the plan has no all-owned body for a
+;;   method (§8.4)
+;; (map count [[1] [2 3]]) fails the same way inside the prelude's map,
+;; and so do the arithmetic and deref methods: (apply2 + 1 2) gives "gap
+;; in the ownership plan: method + used as a function value", and
+;; (apply1 deref c) "method deref used as a function value".
+;; Diagnosis: own (no all-owned body is planned for a method
+;; implementation) and eval (which needs one); a builtin (str-len) or a
+;; defun (box) as a value works.
+(defun apply1 (f x) (f x))
+(defun main () -> i64 (apply1 count (conj [5] 6)))

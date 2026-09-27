@@ -102,10 +102,10 @@ impl<'p> Interp<'p> {
                 let parts: Vec<Val> = a.to_vec();
                 self.concat_vals(&parts)
             }
-            name if name.starts_with("array") => self.array_builtin(name, a),
-            name if name.starts_with("str") || name == "starts-with?" => {
-                self.string_builtin(name, a)
-            }
+            name @ ("array" | "array-len" | "array-get" | "array-with" | "array-copy"
+            | "array-set!") => self.array_builtin(name, a),
+            name @ ("str-len" | "str-bytes" | "str-concat" | "str-slice" | "str-eq"
+            | "starts-with?") => self.string_builtin(name, a),
             "char->i32" | "i32->char" => super::arith::char_conv(BUILTINS[b].name, arg(0)?),
             "gensym" | "struct?" | "struct-fields" | "struct-params" | "struct-field-types"
             | "enum?" | "enum-params" | "enum-variants" => {

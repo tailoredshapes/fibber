@@ -1,8 +1,11 @@
 //! Unit tests of the evaluator: small programs through the whole
 //! pipeline, one file per concern.
 
+mod atoms;
 mod calls;
+mod macros;
 mod memory;
+mod options;
 mod values;
 
 use crate::cases::{Evaluator, Outcome, Value};

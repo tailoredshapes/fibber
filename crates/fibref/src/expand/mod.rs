@@ -37,6 +37,7 @@
 //! "`if` and `trap`"); the derived `Ord`, `Hash` and `Show` bodies are
 //! described in `derive`.
 
+mod admit;
 mod build;
 mod collections;
 mod core;
@@ -59,7 +60,7 @@ mod tests;
 use crate::syntax::{read_all, Form};
 
 pub use collections::PRELUDE_NS;
-pub use ctx::{ExpandCtx, Limits, MAX_EXPAND_DEPTH, MAX_STEPS};
+pub use ctx::{ExpandCtx, Limits, MAX_EXPANDED_FORMS, MAX_EXPAND_DEPTH, MAX_STEPS};
 pub use error::{ExpandError, ExpandErrorKind};
 pub use heads::{is_core, CORE_FORMS};
 pub use prelude::PRELUDE_MACROS;
@@ -80,6 +81,7 @@ pub fn expand_program(
     let mut out = Vec::new();
     for form in forms {
         ex.ctx.steps = 0;
+        ex.ctx.forms = 0;
         top::top_form(&mut ex, form, &mut out)?;
     }
     Ok(out)
@@ -92,6 +94,7 @@ pub fn expand_expr(
     runner: &mut dyn MacroRunner,
 ) -> Result<Form, ExpandError> {
     ctx.steps = 0;
+    ctx.forms = 0;
     let mut ex = Expander::new(ctx, runner);
     walk::expr(&mut ex, form)
 }

@@ -240,6 +240,21 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// The allocation of an `Option` constructor `e` of `e`'s type
+    /// (§8.1): a heap enum is a heap object, a nullable pointer is
+    /// nothing, and in a generic body (`None`) the evaluator decides by
+    /// the payload.
+    fn option_alloc(&self, e: &Expr) -> Option<super::program::Alloc> {
+        use super::objects::{option_rep, OptionRep};
+        use super::program::Alloc;
+        let t = self.cx.p.expr_types.get(&e.id)?;
+        match option_rep(&self.cx.p.globals, t)? {
+            OptionRep::HeapEnum => Some(Alloc::Heap),
+            OptionRep::Pointer => Some(Alloc::Nothing),
+            OptionRep::Generic => None,
+        }
+    }
+
     /// Whether the binding `b` has an object type.
     fn binding_is_object(&self, b: BindingId) -> bool {
         match self.cx.p.binding_types.get(&b) {

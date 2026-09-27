@@ -135,3 +135,41 @@ fn negative_zero_and_leading_zeros() {
     assert!(v == 0.0 && v.is_sign_negative());
     assert_ne!(kind("-0.0"), kind("0.0"));
 }
+
+#[test]
+fn a_built_literal_is_checked_as_a_read_one() {
+    use crate::syntax::check_literal;
+    let mut k = int(300, IntWidth::I8);
+    assert_eq!(
+        check_literal(&mut k),
+        Err(out_of_range("300i8", IntWidth::I8))
+    );
+    let msg = out_of_range("300i8", IntWidth::I8).to_string();
+    assert!(msg.contains("does not fit i8"), "{msg}");
+    let mut k = int(-128, IntWidth::I8);
+    assert_eq!(check_literal(&mut k), Ok(()));
+    assert_eq!(k, int(-128, IntWidth::I8));
+    let mut k = int(i64::MIN, IntWidth::I64);
+    assert_eq!(check_literal(&mut k), Ok(()));
+}
+
+#[test]
+fn a_built_float_is_finite_and_f32_rounded() {
+    use crate::syntax::check_literal;
+    let mut k = flt(0.1, FltWidth::F32);
+    assert_eq!(check_literal(&mut k), Ok(()));
+    assert_eq!(k, kind("0.1f32"));
+    let mut k = flt(1e300, FltWidth::F32);
+    let r = check_literal(&mut k);
+    assert!(
+        matches!(r, Err(ReadErrorKind::FloatOutOfRange { .. })),
+        "{r:?}"
+    );
+    let mut k = flt(f64::NAN, FltWidth::F64);
+    assert!(matches!(
+        check_literal(&mut k),
+        Err(ReadErrorKind::InvalidNumber { .. })
+    ));
+    let mut k = flt(f64::INFINITY, FltWidth::F64);
+    assert!(check_literal(&mut k).is_err());
+}

@@ -1,0 +1,32 @@
+;; spec:   §6 (types §1.2, §2.11, §6.7, §8.1, §8.7)
+;; expect: accept
+;; result: 2
+;; audit:  clean
+;; types §2.11: "weak : ∀a. (Object a) ⇒ (fn :send (a) (Weak a))" and
+;; "(Object a) is the built-in structural predicate 'a is not a scalar'";
+;; types §1.2: "Everything that is not a scalar is an object", and its
+;; table lists (Option T) among the objects. So (weak o) with
+;; o : (Option str) type-checks, and while o is alive (deref w) must be
+;; (some o) = (some (some "ab")); the program returns (str-len "ab") = 2.
+;;
+;; Observed (fibref run):
+;;   failed:
+;;   002-weak-of-option-value.fib:31:44: unsupported: weak of Some(Obj(ObjId(2))):
+;;   the interpreter makes weak references to objects only
+;; Variants, all accepted by the checker and all failing the same way:
+;;   (weak (some 5))  -> "unsupported: weak of Some(Int(5, I64))"
+;;   (weak nil)       -> "unsupported: weak of None"
+;; Diagnosis: eval (crates/fibref/src/eval/cells.rs, Interp::weak) cannot
+;; take a weak reference to an Option value, which the types accept. The
+;; spec is also incomplete here: by types §8.1 an (Option str) is a
+;; nullable pointer with no allocation for some, so the compiled (weak o)
+;; of §8.7 takes the box of the payload string (and its @w cannot tell
+;; "o died" from "o was nil"), and (weak nil) reads the header of a null
+;; pointer ("if x has HAS-WEAK ..."). Either (Object a) must exclude
+;; Option, or §6.7/§8.7 must say what a weak reference to nil and to an
+;; Option means. The interpreter also never allocates the heap enum that
+;; §8.1 prescribes for (Option i64) values like (some 5), so the audit
+;; cannot see those objects at all (method.md rule 2).
+(defun main () -> i64
+  (let ((o (some (str-concat "a" "b"))) (w (weak o)))
+    (match @w ((some (some x)) (str-len x)) ((some nil) 1) (nil 2))))

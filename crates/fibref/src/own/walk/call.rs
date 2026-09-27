@@ -90,12 +90,14 @@ impl Walker<'_> {
     fn record_alloc(&mut self, e: &Expr, head: &Expr) {
         let alloc = match head.kind {
             ExprKind::Global(GlobalRef::Ctor(t, _)) if t == self.cx.p.globals.option => {
-                Alloc::Nothing
+                self.option_alloc(e)
             }
-            _ if allocates(self, e) => Alloc::Heap,
-            _ => return,
+            _ if allocates(self, e) => Some(Alloc::Heap),
+            _ => None,
         };
-        self.out.allocs.insert(e.id, alloc);
+        if let Some(alloc) = alloc {
+            self.out.allocs.insert(e.id, alloc);
+        }
     }
 
     /// Whether the call is a tail site (§6.10): in the first walk, one

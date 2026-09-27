@@ -156,6 +156,19 @@ pub enum ExpandErrorKind {
         /// The limit.
         limit: usize,
     },
+    /// The expansions of one top-level form produced more forms than
+    /// [`Limits::max_forms`](super::Limits).
+    TooLarge {
+        /// The limit.
+        limit: usize,
+    },
+    /// An expansion produced a literal that the reader would reject
+    /// (§1.1, §3.16): an `Int` that does not fit its width, a `Flt` that
+    /// is not a finite number of its width.
+    BadLiteral {
+        /// The reader's error for it.
+        error: crate::syntax::ReadErrorKind,
+    },
 }
 
 impl fmt::Display for ExpandErrorKind {
@@ -209,6 +222,11 @@ impl fmt::Display for ExpandErrorKind {
                 )
             }
             K::TooDeep { limit } => write!(f, "expansion nested deeper than {limit} levels"),
+            K::TooLarge { limit } => write!(
+                f,
+                "macro expansions of one top-level form produced more than {limit} forms"
+            ),
+            K::BadLiteral { error } => write!(f, "a macro built an invalid literal: {error}"),
         }
     }
 }

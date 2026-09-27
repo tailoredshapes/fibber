@@ -425,7 +425,10 @@ pub enum Alloc {
     /// Scope-local: `STACK` flag, count 0, ended at its scope's exit.
     Stack,
     /// Allocates nothing (`some`/`nil` of a non-`Option` object type,
-    /// §8.1).
+    /// §8.1). A `some`/`nil` of a heap-enum `Option` (a scalar, `dyn` or
+    /// `Option` payload) is `Heap`; one whose payload type is a
+    /// quantified variable has no entry, and the evaluator decides by
+    /// the payload it gets.
     Nothing,
 }
 

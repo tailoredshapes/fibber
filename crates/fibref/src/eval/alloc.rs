@@ -27,6 +27,14 @@ pub enum Placement {
     Stack,
     /// Static data: literals, `def` values, function values.
     Immortal,
+    /// An `Option` site whose type is a nullable pointer (§8.1,
+    /// `Alloc::Nothing`): no object. Any other object: the heap.
+    Unboxed,
+    /// A site the plan decided nothing for: a generic `Option` site, or a
+    /// call through a function value. An object goes on the heap; an
+    /// `Option` is a heap enum iff its payload at run time is a scalar
+    /// or an `Option` (see `Interp::option_value`).
+    Undecided,
 }
 
 impl Placement {
@@ -34,7 +42,9 @@ impl Placement {
     pub fn of(alloc: Option<Alloc>) -> Placement {
         match alloc {
             Some(Alloc::Stack) => Placement::Stack,
-            _ => Placement::Heap,
+            Some(Alloc::Heap) => Placement::Heap,
+            Some(Alloc::Nothing) => Placement::Unboxed,
+            None => Placement::Undecided,
         }
     }
 }
@@ -44,7 +54,9 @@ impl Interp<'_> {
     /// `obj`.
     pub fn alloc(&mut self, kind: Kind, fields: Vec<Value>, obj: Obj, at: Placement) -> R<ObjId> {
         let id = match at {
-            Placement::Heap => self.heap.alloc(kind, fields)?,
+            Placement::Heap | Placement::Unboxed | Placement::Undecided => {
+                self.heap.alloc(kind, fields)?
+            }
             Placement::Immortal => self.heap.alloc_immortal(kind, fields)?,
             Placement::Stack => {
                 let scope = self.heap.open_scope();
@@ -80,7 +92,7 @@ impl Interp<'_> {
     }
 
     /// A new struct (variant `None`) or variant of `ty` holding
-    /// `fields`; `Option` allocates nothing (§8.1).
+    /// `fields`; an `Option` as §8.1 represents it (`option_value`).
     pub fn new_data(
         &mut self,
         ty: TypeId,
@@ -89,11 +101,7 @@ impl Interp<'_> {
         at: Placement,
     ) -> R<Val> {
         if ty == self.p.globals.option {
-            return match (variant, fields.into_iter().next()) {
-                (Some(1), Some(v)) => Ok(Val::Some(Box::new(v))),
-                (Some(0), None) => Ok(Val::None),
-                _ => Err(RunError::internal("a malformed Option constructor")),
-            };
+            return self.option_value(variant, fields, at);
         }
         let projected = fields.iter().map(Val::project).collect();
         let obj = match variant {

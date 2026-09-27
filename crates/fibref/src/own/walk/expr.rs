@@ -88,11 +88,13 @@ impl Walker<'_> {
             GlobalRef::Def(d) => Mode::Borrowed(Site::Global(d)),
             GlobalRef::Ctor(t, _) => {
                 let alloc = if t == self.cx.p.globals.option {
-                    super::super::program::Alloc::Nothing
+                    self.option_alloc(e)
                 } else {
-                    super::super::program::Alloc::Heap
+                    Some(super::super::program::Alloc::Heap)
                 };
-                self.out.allocs.insert(e.id, alloc);
+                if let Some(alloc) = alloc {
+                    self.out.allocs.insert(e.id, alloc);
+                }
                 OWNED
             }
             // A named function, method or builtin as a value: its

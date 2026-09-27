@@ -141,7 +141,6 @@ impl<'p> Interp<'p> {
         };
         match v {
             Some(i) if fieldless && def.is_fieldless_enum() => Ok(Val::Tag(t, i as u32)),
-            Some(0) if fieldless && t == self.p.globals.option => Ok(Val::None),
             Some(_) if fieldless => {
                 let at = self.placement_of(e.id)?;
                 self.new_data(t, v, Vec::new(), at)

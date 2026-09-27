@@ -182,3 +182,43 @@ fn make_float(text: &str, clean: &str, width: FltWidth) -> Result<FormKind, Read
     }
     Ok(FormKind::Flt { v, width })
 }
+
+/// Checks a literal the reader did not read (a `Form` a macro built,
+/// §3.16) as the reader checks one it reads (§1.1): an `Int` must fit
+/// its width and a `Flt` must be a finite number, an `f32` one becoming
+/// the `f32` nearest its value, so the invariants [`FormKind`] states
+/// hold. Every other form passes unchanged.
+pub fn check_literal(kind: &mut FormKind) -> Result<(), ReadErrorKind> {
+    match kind {
+        FormKind::Int { v, width } => {
+            let (lo, hi) = width.range();
+            let n = i128::from(*v);
+            if n < lo || n > hi {
+                return Err(ReadErrorKind::IntegerOutOfRange {
+                    text: format!("{v}{}", width.suffix()),
+                    width: *width,
+                });
+            }
+        }
+        FormKind::Flt { v, width } => {
+            let text = format!("{v:?}{}", width.suffix());
+            if v.is_nan() {
+                return Err(invalid(&text, "NaN is not a literal"));
+            }
+            let near = match width {
+                // A saturating conversion: out of range becomes infinite.
+                FltWidth::F32 => f64::from(*v as f32),
+                FltWidth::F64 => *v,
+            };
+            if !near.is_finite() {
+                return Err(ReadErrorKind::FloatOutOfRange {
+                    text,
+                    width: *width,
+                });
+            }
+            *v = near;
+        }
+        _ => {}
+    }
+    Ok(())
+}

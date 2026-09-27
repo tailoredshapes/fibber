@@ -278,6 +278,7 @@ fn limits_are_per_context() {
     ctx.limits = Limits {
         max_steps: 5,
         max_depth: 50,
+        ..Limits::default()
     };
     let forms = read("(defmacro forever () '(forever))\n(defun f () (forever))");
     let e = expand_program(forms, &mut ctx, &mut Mini)

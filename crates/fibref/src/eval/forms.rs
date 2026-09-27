@@ -134,10 +134,8 @@ impl<'p> Interp<'p> {
                 };
                 let w = self.field(id, 1)?;
                 let w = self.keyword_text(&w)?;
-                let width = match w.as_str() {
-                    "f32" => FltWidth::F32,
-                    _ => FltWidth::F64,
-                };
+                let width = FltWidth::from_suffix(&w)
+                    .ok_or_else(|| RunError::trap(format!("a Flt form of width :{w}")))?;
                 FormKind::Flt { v, width }
             }
             "Chr" => match self.field(id, 0)? {
@@ -203,6 +201,18 @@ impl<'p> Interp<'p> {
             self.expand_error = Some(e);
             RunError::trap(msg)
         })?;
-        self.form_value(&out, Placement::Heap)
+        self.reflection_value(&out)
+    }
+
+    /// The value of a reflection call's answer at the type §3.16 gives
+    /// it: `struct?` and `enum?` a `bool`, the others a `(Vec Form)`
+    /// (the caller owns one count on it), never the `Form` that
+    /// `ExpandCtx::reflect` answers with.
+    fn reflection_value(&mut self, out: &Form) -> R<Val> {
+        match &out.kind {
+            FormKind::Bool(b) => Ok(Val::Bool(*b)),
+            FormKind::Vec(items) => self.items_value(items, Placement::Heap),
+            k => Err(RunError::internal(format!("a reflection answer {k:?}"))),
+        }
     }
 }

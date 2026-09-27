@@ -1,0 +1,28 @@
+;; spec:   §4, §7 (types §2.10, §6.4, §8.4)
+;; expect: accept
+;; result: 2
+;; audit:  clean
+;; The builtin swap! passed as a function value (it has an ordinary
+;; function type, types §2.10: "swap! : ∀a. (fn :send ((Atom a) (fn ς
+;; (a) a)) a)"), then called through the value with a closure. By the
+;; closure convention (types §8.4) "env and every object argument are
+;; owned by the callee": apply2 hands the atom and the closure to swap!
+;; with one count each, swap! calls the closure on the old value (1) and
+;; stores 2; every count is released exactly once.
+;;
+;; Observed (fibref run):
+;;   failed:
+;;   005-swap-as-function-value-double-release.fib:27:23: audit error:
+;;   ReleaseOfFreed { id: ObjId(2) }
+;; With a let-bound closure the same (ReleaseOfFreed { id: ObjId(1) });
+;; with an atom of boxes and a closure building a Box, ReleaseOfFreed on
+;; the closure too. A named function as swap!'s f (immortal, count
+;; operations are no-ops) hides it: (apply2 swap! a inc) gives 2, clean.
+;; Diagnosis: eval (the builtin-as-value path for swap!): the closure
+;; handed over owned is released once by its own body's exit (the
+;; closure convention, when swap! invokes it) and once more when the
+;; builtin's owned parameter is released; a direct (swap! a f) call is
+;; fine (cases 10, 16). A real double free in compiled code if the
+;; runtime's swap! value adapter did the same.
+(defun apply2 (f x y) (f x y))
+(defun main () -> i64 (let ((a (atom 1))) (apply2 swap! a (fn (x) (+ x 1)))))

@@ -40,6 +40,7 @@ pub mod interp;
 pub mod macros;
 pub mod native;
 pub mod object;
+pub mod option;
 pub mod pattern;
 pub mod pipeline;
 pub mod plan;

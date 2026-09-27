@@ -1,7 +1,8 @@
 //! Cells, atoms and weak references (types §6.7, §8.6, §8.7): `@`,
 //! `set!`, `swap!`, `weak`. Atoms need no lock here: the deterministic
 //! executor never runs two threads at once (see `task`), so reading
-//! and retaining is one step, and `swap!`'s compare always succeeds.
+//! and retaining is one step; `swap!`'s compare still fails when `f`
+//! itself changed the atom.
 
 use crate::heap::Kind;
 use crate::syntax::Pos;
@@ -55,29 +56,42 @@ impl<'p> Interp<'p> {
         self.set_cell(&c, &v)
     }
 
-    /// `(swap! a f)` (§8.6): `old` acquired as a snapshot, handed to `f`
-    /// with a count of its own (the closure convention), `f`'s result
-    /// stored (share-marked if the atom is shared, which the heap does)
-    /// and returned with the count the call gave it; the atom's count
-    /// on `old` and the snapshot released.
+    /// `(swap! a f)` (§8.6): compare and retry. Each attempt acquires
+    /// `old` as a snapshot, hands `f` a count of its own on `old` and on
+    /// itself (the closure convention, §8.4: the callee owns `env` and
+    /// every object argument, and a heap closure's body releases `env`
+    /// at its exit) and runs it. If the atom still holds `old`, `f`'s
+    /// result is stored (share-marked if the atom is shared, which the
+    /// heap does) and returned with the count the call gave it, and the
+    /// atom's count on `old` and the snapshot are released. If `f`
+    /// changed the atom (itself, or through a thread it ran to
+    /// completion: the deterministic executor runs no other thread
+    /// while `f` runs unless `f` makes it), the snapshot and the result
+    /// are released and `f` runs again on the new content.
     pub fn swap(&mut self, a: &Val, f: &Val, pos: &Pos) -> R<Val> {
         let atom = a.expect_obj("the atom of swap!")?;
-        let old = self.slot(atom)?;
-        self.retain(&old)?;
-        self.retain(&old)?;
-        let target = self.value_target(f, std::slice::from_ref(&old))?;
-        let jump = Jump {
-            target,
-            args: vec![old.clone()],
-            pos: pos.clone(),
-            placement: Placement::Heap,
-        };
-        let new = self.invoke(jump)?;
-        self.write_slot(atom, new.clone())?;
-        self.release(&old)?;
-        Ok(new)
+        loop {
+            let old = self.slot(atom)?;
+            self.retain(&old)?;
+            self.retain(&old)?;
+            self.retain(f)?;
+            let target = self.value_target(f, std::slice::from_ref(&old))?;
+            let jump = Jump {
+                target,
+                args: vec![old.clone()],
+                pos: pos.clone(),
+                placement: Placement::Heap,
+            };
+            let new = self.invoke(jump)?;
+            if same(&self.slot(atom)?, &old) {
+                self.write_slot(atom, new.clone())?;
+                self.release(&old)?;
+                return Ok(new);
+            }
+            self.release(&old)?;
+            self.release(&new)?;
+        }
     }
-
     /// `(weak x)` (§6.7, §8.7): `x`'s box, retained, or a new one; no
     /// count on `x`. A box of an immortal object is always new and never
     /// registered. Unlike the compiled runtime's, whose table keeps a box
@@ -106,5 +120,42 @@ impl<'p> Interp<'p> {
             self.weak_boxes.insert(target, id);
         }
         Ok(Val::Obj(id))
+    }
+}
+
+/// `load == old` in `swap!` (§8.6): the same object, or the same bits
+/// of a scalar, as a `cmpxchg` on the atom's word compares (so a NaN
+/// equals itself and `0.0` does not equal `-0.0`). The snapshot keeps
+/// `old` alive, so its identity cannot be reused meanwhile.
+fn same(a: &Val, b: &Val) -> bool {
+    match (a, b) {
+        (Val::Float(x, w), Val::Float(y, v)) => x.to_bits() == y.to_bits() && w == v,
+        (Val::Some(x), Val::Some(y)) => same(x, y),
+        _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heap::{Heap, Kind};
+    use crate::types::ty::Scalar;
+
+    #[test]
+    fn swap_compares_identity_and_bits() {
+        let nan = Val::Float(f64::NAN, Scalar::F64);
+        assert!(same(&nan, &nan.clone()));
+        let zero = Val::Float(0.0, Scalar::F64);
+        assert!(!same(&zero, &Val::Float(-0.0, Scalar::F64)));
+        assert!(same(&Val::Int(3, Scalar::I64), &Val::Int(3, Scalar::I64)));
+        assert!(!same(&Val::Int(3, Scalar::I64), &Val::Int(4, Scalar::I64)));
+        let mut heap = Heap::new();
+        let mut obj = || heap.alloc(Kind::Immutable, vec![]).map(Val::Obj);
+        let (a, b) = (obj().expect("alloc"), obj().expect("alloc"));
+        assert!(same(&a, &a.clone()));
+        assert!(!same(&a, &b));
+        let some = |v: &Val| Val::Some(Box::new(v.clone()));
+        assert!(same(&some(&a), &some(&a)));
+        assert!(!same(&some(&a), &Val::None));
     }
 }

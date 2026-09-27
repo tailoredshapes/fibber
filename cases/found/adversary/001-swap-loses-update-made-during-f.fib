@@ -1,0 +1,44 @@
+;; spec:   §7 (types §2.10, §8.6)
+;; expect: accept
+;; result: 12
+;; audit:  clean
+;; swap! must replace the atom's value atomically with (f old), running f
+;; again when the atom changed while f ran:
+;;   ownership.md §7: "Values that must change together live in one atom
+;;   ... and change with one `swap!`, which is already all-or-nothing".
+;;   syntax §3.11: "(swap! a f) ... replace atomically with (f old); f may
+;;   run more than once".
+;;   types §8.6: "(swap! a f): loop { old = @a (retained); new = f(old);
+;;   lock; if load == old { ... store new ... } else { unlock; ...;
+;;   retry } }".
+;; Here f, on its first run only, has another thread add 10 to the atom
+;; and waits for it. By §8.6 the compare fails (11 /= 1), f runs again
+;; on 11 (the flag is set, so no second update) and stores 12.
+;;
+;; Observed (fibref run):
+;;   result: 2
+;;   audit:  clean=true leak-cycles=0 leaks=0 errors=0
+;; The +10 made by the other thread is silently lost: the interpreter's
+;; swap! stores f's result without comparing (crates/fibref/src/eval/
+;; cells.rs: "swap!'s compare always succeeds", justified by the
+;; deterministic executor never running two threads at once, but f
+;; itself can run another thread to completion, or call swap! on the
+;; same atom directly). The same loss happens without a thread:
+;;   (swap! a (fn (x) (do (if @once () (do (set! once true)
+;;      (swap! a (fn (y) (+ y 10))) ())) (+ x 1))))
+;; with once a (cell false) also gives 2 instead of 12.
+;; Diagnosis: eval (swap! skips the compare-and-retry of types §8.6), so
+;; fibref and a compiled program disagree (method.md rule 6). Note also
+;; that a reentrant swap! whose inner update happens on every run of f
+;; never terminates under §8.6 (livelock), while fibref returns; the
+;; spec does not say what such a program means.
+(defun main () -> i64
+  (let ((a (atom 1))
+        (once (atom false)))
+    (swap! a (fn (x)
+               (do (if @once
+                       ()
+                       (do (reset! once true)
+                           (join (spawn (fn () (swap! a (fn (y) (+ y 10))))))
+                           ()))
+                   (+ x 1))))))

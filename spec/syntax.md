@@ -855,6 +855,23 @@ struct. `(do)` splices nothing. So
 
 defines the struct and its `Eq` instance (proposed case 41).
 
+**Implementation limits** (not part of the language; the reference
+implementation's values, which a compiler may raise but must enforce
+in some form, so that expansion terminates on every input): the
+expansion of one top-level form, a spliced `do` counting as one form,
+fails with a compile error at the macro call when it performs more
+than 100 000 macro expansions (user macros, prelude macros and
+quasiquote rewrites each count one: `more than 100000 macro expansions
+in one top-level form`), when it nests forms deeper than 2 000 levels
+(`expansion nested deeper than 2000 levels`), or when the results of
+its expansions, each counted in full as the number of forms in its
+tree, add up to more than 4 000 000 forms (`macro expansions of one
+top-level form produced more than 4000000 forms`). The last limit is
+what stops a macro whose expansion grows at each step, such as
+`` (defmacro g (x) `(g (do ,x ,x))) ``, which would otherwise do
+exponential (or, growing by one form a step, quadratic) work long
+before it reached the first limit.
+
 Reflection at expansion time (**Decided**; liar ADR 023 kept and
 extended: without `struct-params` and `struct-field-types` no `derive`
 could be written for a generic struct, which is every struct with an

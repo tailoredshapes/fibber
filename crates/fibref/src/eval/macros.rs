@@ -111,7 +111,7 @@ impl From<RunError> for MacroRunError {
 }
 
 /// Runs the macro's function over `args` in a fresh interpreter, and
-/// audits its heap.
+/// audits its heap ([`macro_audit_passes`]).
 fn run_macro(
     c: &Checked,
     m: &MacroDef,
@@ -127,13 +127,22 @@ fn run_macro(
     }
     let form = form?;
     let report = it.finish();
-    if !report.is_clean() {
+    if !macro_audit_passes(&report) {
         let s = summary(&report);
         return Err(MacroRunError::Run(format!(
             "the audit of its run is not clean: {s}"
         )));
     }
     Ok(form)
+}
+
+/// Whether a macro run's audit lets its expansion stand: clean, or
+/// leaking only on the permitted path of ownership.md §6 (a cycle
+/// through cells), which is not a memory-safety violation and does not
+/// fail a program's run either (case 15). Every other leak and every
+/// audit error fails the expansion.
+fn macro_audit_passes(report: &crate::heap::AuditReport) -> bool {
+    report.is_clean() || report.is_cycle_leak_only()
 }
 
 fn call_macro(

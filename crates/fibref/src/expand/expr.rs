@@ -75,7 +75,8 @@ impl<'a> Expander<'a> {
 
 /// Expands `form` while its head is a macro (a user macro, which shadows
 /// a prelude macro of the same name, then a prelude macro) or
-/// `quasiquote`, counting each expansion as a step. Returns the first
+/// `quasiquote`, counting each expansion as a step and admitting its
+/// result (`ExpandCtx::admit`: its size and its literals). Returns the first
 /// form that is not a macro call, or a `for-each` the prelude declined.
 pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, ExpandError> {
     loop {
@@ -98,6 +99,7 @@ pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, Exp
         } else {
             return Ok(form);
         }
+        ex.ctx.admit(&mut form, &pos)?;
     }
 }
 

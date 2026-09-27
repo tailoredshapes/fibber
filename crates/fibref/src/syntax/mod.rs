@@ -40,6 +40,7 @@ mod tests;
 
 pub use error::{ReadError, ReadErrorKind};
 pub use form::{FltWidth, Form, FormKind, IntWidth};
+pub use number::check_literal;
 pub use pos::Pos;
 pub use reader::MAX_DEPTH;
 

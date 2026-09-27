@@ -1,8 +1,8 @@
 //! Run-time values (types §8.1): scalars unboxed, every object an
-//! [`ObjId`] of the audited heap, and `Option` unboxed with real tags
-//! (types §4.5: the interpreter carries real tags; §8.1: `some` of an
-//! object allocates nothing, and the ownership plan allocates nothing
-//! for any `some`, `Alloc::Nothing`).
+//! [`ObjId`] of the audited heap, and an `Option` of a non-`Option`
+//! object unboxed with real tags (types §4.5: the interpreter carries
+//! real tags; §8.1: `some` of an object allocates nothing). Every other
+//! `Option` is a heap enum object (see `option`).
 
 use crate::heap::{ObjId, Value};
 use crate::types::ty::{Con, Scalar, TypeId};
@@ -28,9 +28,10 @@ pub enum Val {
     Tag(TypeId, u32),
     /// An object on the audited heap.
     Obj(ObjId),
-    /// `nil`.
+    /// `nil` of a nullable-pointer `Option`.
     None,
-    /// `(some v)`: allocates nothing; counts are its payload's.
+    /// `(some v)` of a nullable-pointer `Option`: allocates nothing;
+    /// counts are its payload's.
     Some(Box<Val>),
 }
 

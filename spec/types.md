@@ -2427,11 +2427,18 @@ documented (lir-core also parses a `{ ptr, ptr }` field type, which
 - `@a` on an atom: `fib.lock a` (`cmpxchg` spinlock, acquire), `v = load`,
   `fib.retain v`, `fib.unlock a` (release store) — the single atomic step
   §7 requires.
-- `(swap! a f)`: loop { `old = @a` (retained); `new = f(old)`; lock; if
+- `(swap! a f)`: loop { `old = @a` (retained: the snapshot);
+  `fib.retain old` and `fib.retain f` (the call's counts: `f` is called
+  through a function value, which consumes the closure and each object
+  argument, §8.4, and a heap closure's code releases its `env` at its
+  exit); `new = f(old)`; lock; if
   `load == old` { `fib.share new` if the atom is `SHARED`; `store new`;
   `fib.retain new` (the caller's result); unlock; `fib.release old` (the
   atom's count); `fib.release old` (the snapshot); return `new` } else {
-  unlock; `fib.release old`; `fib.release new`; retry } }.
+  unlock; `fib.release old` (the snapshot); `fib.release new`; retry } }.
+  `load == old` compares the word (the object's address, a scalar's
+  bits). `f` is `:borrow` at `swap!`'s own call (§2.10), so the caller
+  passes it with no count and the two retains are `swap!`'s.
 - `(reset! a v)`: `consume v`; `fib.share v` if `SHARED`; lock; `old =
   load`; `store v`; unlock; `fib.release old`.
 

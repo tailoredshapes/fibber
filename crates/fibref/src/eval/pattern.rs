@@ -37,7 +37,9 @@ impl Interp<'_> {
         subs: &[Pattern],
         v: &Val,
     ) -> R<bool> {
-        if t == self.p.globals.option {
+        // A bare `Option` (§8.1's nullable pointer); a heap-enum one is
+        // an ordinary variant object, matched below.
+        if t == self.p.globals.option && !matches!(v, Val::Obj(_)) {
             return match (variant, v, subs) {
                 (Some(0), Val::None, _) => Ok(true),
                 (Some(1), Val::Some(inner), [p]) => self.bind_pattern(p, inner),
