@@ -800,9 +800,21 @@ time. Its parameters have type `Form` (`(Vec Form)` for the rest
 parameter) and its body has type `Form`. The body is ordinary fibber,
 type-checked as a `defun` in a macro-time module and evaluated by the
 reference interpreter's evaluator over that module (**Decided**: macro-time
-evaluation is then the same executable spec as run time; the compiler
-may JIT it but must agree). A macro may use any function of a module the
-current module requires, provided that module is already compiled.
+evaluation is then the same executable spec as run time). A compiler,
+including the self-hosted one, compiles the macro-time module through
+lIR and runs it with lIR's JIT, as Clojure compiles and loads every form
+(**Decided**, owner, 2026-09-27); its results must agree with the
+reference interpreter's. There is no separate macro interpreter.
+
+**Phase separation** (**Decided**, same decision). Only the macro-time
+module runs at expansion time: the `defmacro` bodies, and the functions
+and `def`s they reach, which must come from modules the current module
+requires and which are already compiled. No top-level form of the module
+being compiled is evaluated at expansion time, so compiling a module has
+no side effects of its own (unlike Clojure's AOT, which loads and runs
+the namespace it compiles). A macro that calls a function of the module
+it is defined in is an expansion error: `macro m calls f, which is not
+available at expansion time; move f to a required module`.
 
 `Form` is the built-in enum
 

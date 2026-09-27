@@ -39,13 +39,17 @@ evaluator over the audited heap.
 Port lIR from liar with the fixes in lir-audit/: verification on by
 default, a module-level type checker, the ADR 021 layer removed,
 string globals, `fence` and `indirect-call` fixed, `musttail`, and
-end-to-end ahead-of-time tests.
+end-to-end ahead-of-time tests. The JIT is a first-class path, not an
+extra: `lair` is usable as a library that compiles a module and returns
+callable functions, because compilers run macros through it (M4, M6).
 
 ## M4. Compiler (`fibc`, in Rust)
 
 Lower the checker's plan to lIR, with a small runtime (header,
 retain/release, share marking, atom locks, weak table, task executor)
-and monomorphisation. Every case and generated program runs both
+and monomorphisation. `fibc` runs macros by JIT-compiling the
+macro-time module through `lair`, proving the mechanism the bootstrap
+depends on; its expansions must match `fibref`'s. Every case and generated program runs both
 interpreted and compiled; results and free traces must match (method
 rule 6). This is the "working language" milestone.
 
@@ -59,11 +63,9 @@ else in the library:
 - the persistent vector as a real trie (today's `conj` copies)
 - file I/O, command-line arguments, exit codes, stderr diagnostics
 - multiple modules (§5 of syntax.md beyond one module plus the prelude)
-- **decision needed: how macros run at compile time** once the compiler
-  is written in fibber (the spec has them run by the reference
-  interpreter). Options: an interpreter written in fibber inside the
-  compiler; compile macros to native code and load them; or call out
-  to a fibber runtime. See "Open decisions" below.
+- macros at compile time (decided, below): the compiler JIT-compiles
+  the macro-time module through lIR, so the self-hosted compiler links
+  `lair` as a library
 
 ## M6. Bootstrap
 
@@ -78,7 +80,16 @@ else in the library:
 
 `lair` (lIR to native, via LLVM) stays in Rust, as LLVM stays in C++.
 
+## Decisions
+
+- **Macros at compile time: JIT, with phase separation** (owner,
+  2026-09-27; syntax §3.16). Like Clojure, there is no macro
+  interpreter: macros are compiled through lIR and run with its JIT,
+  one execution path for everything. Unlike Clojure's AOT, compiling a
+  module runs nothing of that module: only macro definitions and what
+  they reach in already-compiled required modules run at expansion
+  time.
+
 ## Open decisions
 
-- **Macro execution in the self-hosted compiler** (M5). Needed before
-  the runtime is designed in M4.
+None.
