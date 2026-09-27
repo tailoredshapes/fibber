@@ -29,7 +29,8 @@ cargo run -p fibref -- cases cases/ownership   # 20 cases, all pending until an 
 | Method: how claims are checked | [spec/method.md](spec/method.md) | draft |
 | Ownership model | [spec/ownership.md](spec/ownership.md) | draft |
 | Ownership test cases | [cases/ownership/](cases/ownership/) | draft |
-| Type system | spec/types.md | not started |
+| Syntax | [spec/syntax.md](spec/syntax.md) | draft under adversarial review; 16 open decisions |
+| Type system and ownership checker | [spec/types.md](spec/types.md) | draft under adversarial review; 17 open decisions |
 | Audited heap and case harness (`fibref`) | [crates/fibref](crates/fibref) | done: 485 tests, adversarially tested |
 | Reference interpreter (evaluator over the heap) | — | not started |
 | lIR (hardened, from liar) | — | not started |
