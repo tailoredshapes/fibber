@@ -143,7 +143,7 @@ fn the_report_carries_the_whole_trace() {
     assert_eq!(snapshot.len(), 6);
     let report = heap.finish();
     assert_eq!(report.trace, snapshot);
-    assert!(report.trace.iter().all(|e| e.id() == a));
+    assert!(report.trace.iter().all(|e| e.id() == Some(a)));
 }
 
 #[test]

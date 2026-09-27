@@ -4,7 +4,7 @@
 use super::cascade::PendingWrite;
 use super::error::{AuditError, Op};
 use super::event::Event;
-use super::value::{Kind, ObjId, Value};
+use super::value::{Kind, ObjId, ScopeId, Value};
 use super::Heap;
 
 impl Heap {
@@ -28,6 +28,10 @@ impl Heap {
     /// whose target is live, exactly as `mark_shared` decides it. So it
     /// fails with `SharedCell` if a `Cell` is reachable that way.
     ///
+    /// A stack cell or atom (§6.11) is written the same way; what it may
+    /// hold, and what a heap one may, is decided by `store`. A `Ref` to
+    /// an immortal or stack object is neither retained nor released.
+    ///
     /// The old value's release is planned before anything changes
     /// (`cascade`): if it would reach a freed object (a `Ref` that
     /// dangles after an earlier over-release) the write fails with
@@ -41,37 +45,56 @@ impl Heap {
         if !object.kind.is_mutable() {
             return Err(AuditError::WriteToImmutable { id });
         }
-        let old = *object
-            .fields
-            .get(field)
-            .ok_or(AuditError::BadField { id, index: field })?;
+        if field >= object.fields.len() {
+            return Err(AuditError::BadField { id, index: field });
+        }
         let shared = object.shared;
-        self.check_storable(value)?;
-        let cascade = match old.as_ref() {
+        self.check_storable(value, object.holder())?;
+        self.store_field(id, field, value, shared, Event::Write { id, field })
+    }
+
+    /// The common tail of [`Heap::write`] and [`Heap::write_unique`],
+    /// once `field` exists and `value` is storable there: plans the old
+    /// value's release, shares what the value lets another thread reach
+    /// when `share`, then retains the new value, stores it, pushes
+    /// `event` and applies the planned release. On `Err` nothing has
+    /// changed.
+    pub(super) fn store_field(
+        &mut self,
+        id: ObjId,
+        field: usize,
+        value: Value,
+        share: bool,
+        event: Event,
+    ) -> Result<(), AuditError> {
+        let old = self.objects[id.index()].fields[field];
+        let cascade = match self.counted_target(old) {
             Some(target) => {
                 let pending = PendingWrite { id, field, value };
                 self.plan_release(target, Some(pending))?
             }
             None => Vec::new(),
         };
-        if shared {
+        if share {
             if let Some(target) = self.crossing_target(value) {
                 self.share_from(target)?;
             }
         }
-        if let Some(target) = value.as_ref() {
-            self.bump(target);
-        }
+        self.retain_stored(value);
         self.objects[id.index()].fields[field] = value;
-        self.trace.push(Event::Write { id, field });
+        self.trace.push(event);
         self.apply_release(&cascade);
         Ok(())
     }
 
     /// Makes a weak reference to a live object (§6). No count change.
-    /// Event: `Weak`.
+    /// Event: `Weak`. A stack object is `WeakToStack`: `weak` forces its
+    /// operand onto the heap (§6.7, §6.11). An immortal object may have
+    /// one; it never dies, so upgrading it always succeeds (§8.7).
     pub fn weak(&mut self, id: ObjId) -> Result<Value, AuditError> {
-        self.live_object(id, Op::Weak)?;
+        if self.live_object(id, Op::Weak)?.scope.is_some() {
+            return Err(AuditError::WeakToStack { id });
+        }
         self.trace.push(Event::Weak { id });
         Ok(Value::Weak(id))
     }
@@ -79,19 +102,29 @@ impl Heap {
     /// Turns a weak reference back into a counted one (§6): `Some` with
     /// the object retained if it is still live, `None` if it has been
     /// freed. Ids are never reused, so a stale id cannot name a newer
-    /// object. Events: `Upgrade`, then `Retain` when live.
+    /// object. Events: `Upgrade`, then `Retain` when live and counted
+    /// (an immortal target is returned with no count operation, §8.7).
+    /// An id of a stack object is `WeakToStack`: no weak reference to
+    /// one can exist.
     pub fn upgrade(&mut self, id: ObjId) -> Result<Option<ObjId>, AuditError> {
-        let live = self.object(id)?.live;
-        self.trace.push(Event::Upgrade { id, live });
-        if live {
-            self.bump(id);
-            Ok(Some(id))
-        } else {
-            Ok(None)
+        let object = self.object(id)?;
+        if object.scope.is_some() {
+            return Err(AuditError::WeakToStack { id });
         }
+        let live = object.live;
+        let counted = object.counted();
+        self.trace.push(Event::Upgrade { id, live });
+        if !live {
+            return Ok(None);
+        }
+        if counted {
+            self.bump(id);
+        }
+        Ok(Some(id))
     }
 
-    /// The reference count of a live object.
+    /// The reference count of a live object: 0 on an immortal or stack
+    /// object, which have none (§8.2).
     pub fn count(&self, id: ObjId) -> Result<usize, AuditError> {
         Ok(self.live_object(id, Op::Inspect)?.count)
     }
@@ -115,5 +148,15 @@ impl Heap {
     /// The number of fields of a live object.
     pub fn field_count(&self, id: ObjId) -> Result<usize, AuditError> {
         Ok(self.live_object(id, Op::Inspect)?.fields.len())
+    }
+
+    /// Whether a live object is `IMMORTAL` (§8.2).
+    pub fn is_immortal(&self, id: ObjId) -> Result<bool, AuditError> {
+        Ok(self.live_object(id, Op::Inspect)?.immortal)
+    }
+
+    /// The scope of a live `STACK` object, `None` for any other (§6.11).
+    pub fn stack_scope(&self, id: ObjId) -> Result<Option<ScopeId>, AuditError> {
+        Ok(self.live_object(id, Op::Inspect)?.scope)
     }
 }

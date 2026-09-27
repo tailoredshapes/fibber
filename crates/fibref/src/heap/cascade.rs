@@ -31,39 +31,82 @@ pub(super) struct PendingWrite {
     pub(super) value: Value,
 }
 
+/// A cascade being planned: the counts as the plan has left them, and
+/// the release order so far.
+#[derive(Default)]
+struct Plan {
+    counts: HashMap<ObjId, usize>,
+    order: Vec<ObjId>,
+}
+
 impl Heap {
     /// The order in which releasing `root` once would release objects,
     /// depth first in field order (the order a recursive implementation
     /// would produce), or the error the cascade would hit. Counts and
-    /// fields are read as they are now, adjusted for `pending`.
+    /// fields are read as they are now, adjusted for `pending`. `root`
+    /// must be a counted object ([`Heap::counted_target`]).
     pub(super) fn plan_release(
         &self,
         root: ObjId,
         pending: Option<PendingWrite>,
     ) -> Result<Vec<ObjId>, AuditError> {
-        let mut counts: HashMap<ObjId, usize> = HashMap::new();
-        if let Some(id) = pending.and_then(|p| p.value.as_ref()) {
-            counts.insert(id, self.object(id)?.count + 1);
+        let mut plan = Plan::default();
+        if let Some(id) = pending.and_then(|p| self.counted_target(p.value)) {
+            plan.counts.insert(id, self.object(id)?.count + 1);
         }
-        let mut order = Vec::new();
-        let mut worklist = vec![root];
+        self.plan_into(&mut plan, &[root], pending)?;
+        Ok(plan.order)
+    }
+
+    /// The release cascades of the drops of `dropped`, run one after
+    /// another in that order: for each object, the releases of the
+    /// counted `Ref`s it holds, in field order. Planned as one cascade,
+    /// so a later drop sees the counts the earlier ones left and the
+    /// whole end of a scope fails, having changed nothing, if any part
+    /// of it would release a freed object.
+    pub(super) fn plan_drops(&self, dropped: &[ObjId]) -> Result<Vec<Vec<ObjId>>, AuditError> {
+        let mut plan = Plan::default();
+        let mut segments = Vec::with_capacity(dropped.len());
+        for &id in dropped {
+            let start = plan.order.len();
+            let roots: Vec<ObjId> = self.objects[id.index()]
+                .fields
+                .iter()
+                .filter_map(|&value| self.counted_target(value))
+                .collect();
+            self.plan_into(&mut plan, &roots, None)?;
+            segments.push(plan.order[start..].to_vec());
+        }
+        Ok(segments)
+    }
+
+    /// Plans releasing each of `roots` once, in order, each with its
+    /// whole cascade before the next.
+    fn plan_into(
+        &self,
+        plan: &mut Plan,
+        roots: &[ObjId],
+        pending: Option<PendingWrite>,
+    ) -> Result<(), AuditError> {
+        let mut worklist: Vec<ObjId> = roots.iter().rev().copied().collect();
         while let Some(id) = worklist.pop() {
             let object = self.object(id)?;
-            let count = counts.entry(id).or_insert(object.count);
+            let count = plan.counts.entry(id).or_insert(object.count);
             if !object.live || *count == 0 {
                 return Err(AuditError::ReleaseOfFreed { id });
             }
             *count -= 1;
-            order.push(id);
+            plan.order.push(id);
             if *count == 0 {
                 worklist.extend(self.held_refs_reversed(id, pending));
             }
         }
-        Ok(order)
+        Ok(())
     }
 
-    /// The `Ref`s in `id`'s fields as the cascade will see them, in
-    /// reverse so that a worklist pops them in field order.
+    /// The counted `Ref`s in `id`'s fields as the cascade will see them,
+    /// in reverse so that a worklist pops them in field order. A `Ref`
+    /// to an immortal or stack object is not released (§8.2).
     fn held_refs_reversed(&self, id: ObjId, pending: Option<PendingWrite>) -> Vec<ObjId> {
         let object = &self.objects[id.index()];
         object
@@ -72,8 +115,8 @@ impl Heap {
             .enumerate()
             .rev()
             .filter_map(|(field, &value)| match pending {
-                Some(p) if p.id == id && p.field == field => p.value.as_ref(),
-                _ => value.as_ref(),
+                Some(p) if p.id == id && p.field == field => self.counted_target(p.value),
+                _ => self.counted_target(value),
             })
             .collect()
     }

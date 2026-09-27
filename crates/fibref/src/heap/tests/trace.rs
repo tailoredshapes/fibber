@@ -70,7 +70,7 @@ fn every_event_names_its_object() {
     let c = cell(&mut heap, Value::Ref(v));
     heap.mark_shared(v).expect("share");
     let ids: Vec<_> = heap.trace().iter().map(|e| e.id()).collect();
-    assert_eq!(ids, vec![v, c, v, v]);
+    assert_eq!(ids, vec![Some(v), Some(c), Some(v), Some(v)]);
 }
 
 #[test]

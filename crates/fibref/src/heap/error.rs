@@ -3,13 +3,15 @@
 
 use std::fmt;
 
-use super::value::{Kind, ObjId};
+use super::value::{Kind, ObjId, ScopeId};
 
 /// The operation that was attempted on an object, for error reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// `retain`.
     Retain,
+    /// `release`.
+    Release,
     /// `read`.
     Read,
     /// `write`.
@@ -28,6 +30,7 @@ impl fmt::Display for Op {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Op::Retain => "retain",
+            Op::Release => "release",
             Op::Read => "read",
             Op::Write => "write",
             Op::Weak => "weak",
@@ -62,6 +65,64 @@ pub enum AuditError {
     SharedCell { id: ObjId },
     /// A `Cell` or `Atom` allocated with other than exactly one slot.
     WrongSlotCount { kind: Kind, given: usize },
+    /// A `write_unique` that `fib.unique?` refuses (§6.6, §8.2): writing
+    /// in place would change an object another binding can see, or
+    /// static or stack data. `id` is the object `why` is about.
+    NotUnique { id: ObjId, why: Uniqueness },
+    /// A `retain` or `release` of a `STACK` object, which the compiler
+    /// never counts (§6.11, §8.2).
+    CountOnStack { id: ObjId, op: Op },
+    /// Any operation on a `STACK` object after its scope ended (§6.11),
+    /// told apart from `UseAfterFree`: the compiled program would touch
+    /// a frame slot that its site may already have reused.
+    StackUseAfterScope { id: ObjId, op: Op },
+    /// A `Ref` to the `STACK` object `id` stored into a heap object
+    /// (§6.11): the heap object could outlive the scope.
+    StackRefInHeap { id: ObjId },
+    /// A `Ref` to the `STACK` object `id` stored into a `STACK` object
+    /// of `scope`, which is outer to `id`'s own and so outlives it.
+    StackRefIntoOuterScope { id: ObjId, scope: ScopeId },
+    /// A weak reference to the `STACK` object `id` (§6.7, §6.11: `weak`
+    /// forces its operand onto the heap).
+    WeakToStack { id: ObjId },
+    /// `mark_shared` reached the `STACK` object `id`: a stack object is
+    /// never passed to another thread (§6.11).
+    SharedStack { id: ObjId },
+    /// An `IMMORTAL` object would hold `id`, which is not immortal: a
+    /// constant graph is closed (§6.7, §8.2).
+    ImmortalHoldsMortal { id: ObjId },
+    /// An `IMMORTAL` object of a mutable kind: constants build only
+    /// immutable objects (syntax §3.19).
+    MutableImmortal { kind: Kind },
+    /// A scope id this heap never opened.
+    UnknownScope { scope: ScopeId },
+    /// A scope that has already ended, ended again or allocated into.
+    ScopeEnded { scope: ScopeId },
+    /// A scope ended while `innermost`, opened inside it, is still open.
+    ScopeNotInnermost { scope: ScopeId, innermost: ScopeId },
+}
+
+/// Why `write_unique` refused: the first failing test of `fib.unique?`
+/// (§8.2), flags before count, or a place the primitive cannot take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uniqueness {
+    /// The place is not a live `Cell` (§6.6: the place of `set-field!`
+    /// and `array-set!` is a variable's cell or an `&` private cell).
+    PlaceNotCell,
+    /// The place does not hold a `Ref` to an `Immutable` object.
+    ContentNotImmutable,
+    /// `SHARED`: another thread may see it.
+    Shared,
+    /// `IMMORTAL`: static data, no count.
+    Immortal,
+    /// `STACK`: no count to test.
+    Stack,
+    /// The count is not exactly 1.
+    Count(usize),
+    /// The value written is the object itself: the caller holds it, so
+    /// its count cannot be 1 under counting (§2) and the write would
+    /// close a cycle through no cell.
+    StoresItself,
 }
 
 impl fmt::Display for AuditError {
@@ -86,6 +147,43 @@ impl fmt::Display for AuditError {
             AuditError::WrongSlotCount { kind, given } => {
                 write!(f, "a {kind} has exactly one slot, not {given}")
             }
+            _ => self.fmt_scoped(f),
+        }
+    }
+}
+
+impl AuditError {
+    /// `Display` for the variants of immortal, stack and unique writes.
+    fn fmt_scoped(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuditError::NotUnique { id, why } => {
+                write!(f, "unique write refused on {id}: {why:?}")
+            }
+            AuditError::CountOnStack { id, op } => write!(f, "{op} of stack object {id}"),
+            AuditError::StackUseAfterScope { id, op } => {
+                write!(f, "stack use after scope: {op} of stack object {id}")
+            }
+            AuditError::StackRefInHeap { id } => {
+                write!(f, "stack object {id} stored into a heap object")
+            }
+            AuditError::StackRefIntoOuterScope { id, scope } => {
+                write!(
+                    f,
+                    "stack object {id} stored into an object of outer {scope}"
+                )
+            }
+            AuditError::WeakToStack { id } => write!(f, "weak reference to stack object {id}"),
+            AuditError::SharedStack { id } => write!(f, "stack object {id} would be shared"),
+            AuditError::ImmortalHoldsMortal { id } => {
+                write!(f, "immortal object would hold non-immortal {id}")
+            }
+            AuditError::MutableImmortal { kind } => write!(f, "an immortal {kind}"),
+            AuditError::UnknownScope { scope } => write!(f, "unknown {scope}"),
+            AuditError::ScopeEnded { scope } => write!(f, "{scope} has already ended"),
+            AuditError::ScopeNotInnermost { scope, innermost } => {
+                write!(f, "{scope} ended while inner {innermost} is open")
+            }
+            _ => write!(f, "{self:?}"),
         }
     }
 }

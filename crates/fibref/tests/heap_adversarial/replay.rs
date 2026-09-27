@@ -256,6 +256,17 @@ impl Replay {
                 self.live(id, "access")?;
             }
             Event::Upgrade { id, live } => self.apply_upgrade(id, live)?,
+            // The random programs replayed here make only counted heap
+            // objects; these events belong to immortal and stack objects
+            // and to unique writes, which this model does not cover.
+            other @ (Event::AllocImmortal { .. }
+            | Event::AllocStack { .. }
+            | Event::WriteUnique { .. }
+            | Event::ScopeOpen { .. }
+            | Event::ScopeEnd { .. }
+            | Event::Drop { .. }) => {
+                return Err(format!("{other:?} is outside the counted model"));
+            }
         }
         Ok(())
     }

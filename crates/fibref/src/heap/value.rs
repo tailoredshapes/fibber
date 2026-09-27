@@ -29,6 +29,34 @@ impl fmt::Display for ObjId {
     }
 }
 
+/// The identity of a stack scope (`spec/types.md` §6.11): an index into
+/// the heap's scope table. Never reused, so an id kept after its scope
+/// ended can only name that ended scope.
+///
+/// Scopes nest strictly: a scope is opened inside the innermost open one
+/// and must end before it. So among the scopes open at any moment, a
+/// larger id is an inner (shorter-lived) scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ScopeId(usize);
+
+impl ScopeId {
+    /// Builds an id from its table index. Only the heap creates ids.
+    pub(super) fn from_index(index: usize) -> ScopeId {
+        ScopeId(index)
+    }
+
+    /// The table index behind this id.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Display for ScopeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "scope {}", self.0)
+    }
+}
+
 /// A value: a scalar (copied, no identity; §1) or a reference to an
 /// object.
 ///

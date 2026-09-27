@@ -21,6 +21,11 @@ impl Heap {
     /// with `Op::Share`; it is found before any `SharedCell` and nothing
     /// is marked. Events: one `Shared` per object newly marked, in the
     /// order the search reached them.
+    ///
+    /// The search stops at immortal objects, which are never marked
+    /// (§8.8: static data is read-only and has no count to make atomic),
+    /// and reaching a stack object is `SharedStack`, with nothing
+    /// marked: a stack object never goes to another thread (§6.11).
     pub fn mark_shared(&mut self, id: ObjId) -> Result<(), AuditError> {
         self.live_object(id, Op::Share)?;
         self.share_from(id)
@@ -46,17 +51,22 @@ impl Heap {
 
     /// Every live object reachable from `root` (including `root`), in
     /// the order a depth-first search reaches them, or `UseAfterFree`
-    /// for the first `Ref` field met whose target is freed. Iterative.
+    /// for the first `Ref` field met whose target is freed, or
+    /// `SharedStack` for the first stack object reached. Immortal
+    /// objects are neither included nor searched through. Iterative.
     fn reachable_from(&self, root: ObjId) -> Result<Vec<ObjId>, AuditError> {
         let mut seen: HashSet<ObjId> = HashSet::new();
         let mut order = Vec::new();
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
+            let object = &self.objects[id.index()];
+            if object.immortal || !seen.insert(id) {
                 continue;
             }
+            if object.scope.is_some() {
+                return Err(AuditError::SharedStack { id });
+            }
             order.push(id);
-            let object = &self.objects[id.index()];
             for value in object.fields.iter().rev() {
                 if let Value::Ref(target) = *value {
                     self.live_object(target, Op::Share)?;

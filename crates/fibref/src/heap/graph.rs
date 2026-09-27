@@ -1,6 +1,8 @@
 //! The live-object graph the end-of-run audit reads: nodes are live
-//! objects, edges are `Ref` fields between them (`Weak` fields keep
-//! nothing alive and are not edges). Building it also finds every `Ref`
+//! counted objects, edges are `Ref` fields between them (`Weak` fields
+//! keep nothing alive and are not edges). Immortal and stack objects
+//! are not nodes, and a `Ref` to one is not an edge: they are not
+//! audited at exit (`spec/types.md` §6.7, §6.11). Building it also finds every `Ref`
 //! that dangles, and counts how many live `Ref` fields name each node.
 
 use std::collections::{HashMap, HashSet};
@@ -24,7 +26,7 @@ pub(super) struct LiveGraph {
 
 impl LiveGraph {
     pub(super) fn build(heap: &Heap) -> LiveGraph {
-        let ids = heap.live_ids();
+        let ids = heap.live_counted_ids();
         let position: HashMap<ObjId, usize> =
             ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
         let mut graph = LiveGraph {
@@ -42,7 +44,7 @@ impl LiveGraph {
             let id = graph.ids[from];
             let object = &heap.objects[id.index()];
             for (field, value) in object.fields.iter().enumerate() {
-                if let Some(target) = value.as_ref() {
+                if let Some(target) = heap.counted_target(*value) {
                     graph.add_edge(&position, from, id, field, target);
                 }
             }

@@ -4,7 +4,7 @@
 //! and memory audits (`spec/method.md`, rule 6); this trace is the
 //! interpreter's side of that comparison.
 
-use super::value::{Kind, ObjId};
+use super::value::{Kind, ObjId, ScopeId};
 
 /// One heap operation. Every public operation on [`Heap`](super::Heap)
 /// that touches an object appends exactly the events documented on it.
@@ -30,12 +30,40 @@ pub enum Event {
     Upgrade { id: ObjId, live: bool },
     /// The object became shared across threads (§7).
     Shared { id: ObjId },
+    /// A new `IMMORTAL` object (a literal, a `def` value; §8.2): count 0,
+    /// never freed. Its fields name only immortal objects, so no
+    /// `Retain` follows.
+    AllocImmortal { id: ObjId, kind: Kind },
+    /// A new `STACK` object of `scope` (§6.11): count 0. A `Retain`
+    /// follows for each field that is a `Ref` to a counted object.
+    AllocStack {
+        id: ObjId,
+        kind: Kind,
+        scope: ScopeId,
+    },
+    /// An in-place write to field `field` of the unique `Immutable`
+    /// object `id` held by the cell `place` (§6.6). Preceded and
+    /// followed exactly as `Write` is.
+    WriteUnique {
+        place: ObjId,
+        id: ObjId,
+        field: usize,
+    },
+    /// A stack scope was opened (§6.11).
+    ScopeOpen { scope: ScopeId },
+    /// A stack scope ended. One `Drop` per object allocated in it
+    /// follows, most recent first.
+    ScopeEnd { scope: ScopeId },
+    /// A `STACK` object's drop ran at its scope's end: the releases of
+    /// the counted references it held follow, in field order.
+    Drop { id: ObjId },
 }
 
 impl Event {
-    /// The object the event is about.
-    pub fn id(self) -> ObjId {
-        match self {
+    /// The object the event is about, or `None` for the scope events,
+    /// which are about no object.
+    pub fn id(self) -> Option<ObjId> {
+        let id = match self {
             Event::Alloc { id, .. }
             | Event::Retain { id, .. }
             | Event::Release { id, .. }
@@ -44,7 +72,13 @@ impl Event {
             | Event::Write { id, .. }
             | Event::Weak { id }
             | Event::Upgrade { id, .. }
-            | Event::Shared { id } => id,
-        }
+            | Event::Shared { id }
+            | Event::AllocImmortal { id, .. }
+            | Event::AllocStack { id, .. }
+            | Event::WriteUnique { id, .. }
+            | Event::Drop { id } => id,
+            Event::ScopeOpen { .. } | Event::ScopeEnd { .. } => return None,
+        };
+        Some(id)
     }
 }

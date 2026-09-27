@@ -8,5 +8,9 @@
 
 pub mod cases;
 pub mod heap;
+pub mod syntax;
 
-pub use heap::{AuditError, AuditReport, Event, Heap, Kind, Leak, LeakClass, ObjId, Op, Value};
+pub use heap::{
+    AuditError, AuditReport, Event, Heap, Kind, Leak, LeakClass, ObjId, Op, ScopeId, Uniqueness,
+    Value,
+};

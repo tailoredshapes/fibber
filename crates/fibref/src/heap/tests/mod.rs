@@ -3,10 +3,13 @@
 mod dangling;
 mod errors;
 mod free;
+mod immortal;
 mod leaks;
 mod masked;
 mod shared;
+mod stack;
 mod trace;
+mod unique;
 mod weak;
 
 use super::{Heap, Kind, ObjId, Value};
