@@ -1,0 +1,184 @@
+;; fib.prelude: the library of syntax §4.5 that the cases in
+;; cases/ownership use, written in fibber over the primitives of syntax
+;; §4.3. The expander's own prelude (expand::PRELUDE_SOURCE) comes first
+;; and supplies the List enum and the derived Eq/Ord/Hash/Show instances
+;; of Option and List.
+;;
+;; Vec is a persistent vector over one (Array a) that copies the whole
+;; array on every conj: O(n) per conj, not the 32-way trie that types
+;; §2.13 names as the eventual structure. It has an empty variant
+;; because (array n x) needs an element to fill with, so no function can
+;; make an empty (Array a) for a generic a.
+
+;; Box (syntax §4.5)
+(defstruct (Box a) (v: a))
+(defun box (x) (Box x))
+(defun unbox (b: (Box a)) -> a (. b v))
+
+;; Option helpers (syntax §4.5, Appendix A case 20)
+(defun nil? (o) (match o (nil true) ((some _) false)))
+(defun some? (o) (match o (nil false) ((some _) true)))
+(defun unwrap-or (o d) (match o ((some x) x) (nil d)))
+
+;; Protocols (syntax §4.5)
+(defprotocol Countable (count (self) -> i64))
+(defprotocol (Indexable s e) (nth (self i: i64) -> e))
+(defprotocol (Seq s e) (first (self) -> e) (rest (self) -> Self))
+(defprotocol (Collection s e) (conj (self x: e) -> Self))
+(defprotocol (Traversable s e) (for-each (self f: (fn (e) unit) :borrow) -> unit))
+(defprotocol (Iter s e) (next (self) -> (Option e)))
+
+;; Vec
+(defenum (Vec a) (VecEmpty) (VecOf items: (Array a)))
+
+(defun vec-empty () VecEmpty)
+
+(defun array-push (items: (Array a) x: a) -> (Array a)
+  (let ((n (array-len items))
+        (c (cell (array (+ n 1) x))))
+    (dotimes (i n) (array-set! &c i (array-get items i)))
+    @c))
+
+(impl Countable (Vec a)
+  (count (self)
+    (match self
+      ((VecEmpty) 0)
+      ((VecOf items) (array-len items)))))
+
+(impl (Indexable a) (Vec a)
+  (nth (self i)
+    (match self
+      ((VecEmpty) (trap "nth: index out of range"))
+      ((VecOf items) (array-get items i)))))
+
+(impl (Collection a) (Vec a)
+  (conj (self x)
+    (match self
+      ((VecEmpty) (VecOf (array 1 x)))
+      ((VecOf items) (VecOf (array-push items x))))))
+
+(impl (Traversable a) (Vec a)
+  (for-each (self f)
+    (match self
+      ((VecEmpty) ())
+      ((VecOf items) (dotimes (i (array-len items)) (f (array-get items i)))))))
+
+;; List (the enum is in the expander's prelude)
+(impl Countable (List a)
+  (count (self)
+    (match self
+      ((empty) 0)
+      ((cons _ t) (+ 1 (count t))))))
+
+(impl (Indexable a) (List a)
+  (nth (self i)
+    (match self
+      ((empty) (trap "nth: index out of range"))
+      ((cons h t) (if (= i 0) h (nth t (- i 1)))))))
+
+(impl (Seq a) (List a)
+  (first (self)
+    (match self
+      ((empty) (trap "first: empty list"))
+      ((cons h _) h)))
+  (rest (self)
+    (match self
+      ((empty) empty)
+      ((cons _ t) t))))
+
+(impl (Collection a) (List a)
+  (conj (self x) (cons x self)))
+
+(impl (Traversable a) (List a)
+  (for-each (self f)
+    (match self
+      ((empty) ())
+      ((cons h t) (do (f h) (for-each t f))))))
+
+;; Strings
+(impl Countable str
+  (count (self) (str-len self)))
+
+(defun length (s: str) -> i64 (str-len s))
+
+;; Iterators
+(defstruct (VecIter a) (vec: (Vec a) pos: (Cell i64)))
+
+(defun iter (v: (Vec a)) -> (VecIter a) (VecIter v (cell 0)))
+
+(impl (Iter a) (VecIter a)
+  (next (self)
+    (let ((i @(. self pos)))
+      (if (< i (count (. self vec)))
+          (do (set! (. self pos) (+ i 1))
+              (some (nth (. self vec) i)))
+          nil))))
+
+(defstruct (FilterIter i e) (inner: i pred: (fn (e) bool)))
+
+(defun filter-iter (it: i p: (fn (e) bool)) :where ((Iter i e)) -> (FilterIter i e)
+  (FilterIter it p))
+
+(impl (Iter e) (FilterIter i e) :where ((Iter i e))
+  (next (self)
+    (loop ()
+      (match (next (. self inner))
+        (nil nil)
+        ((some x) (if ((. self pred) x) (some x) (recur)))))))
+
+(defun collect (it)
+  (loop ((acc (vec-empty)))
+    (match (next it)
+      (nil acc)
+      ((some x) (recur (conj acc x))))))
+
+;; Sequences of numbers and whole-vector operations
+(defun even? (n: i64) -> bool (= (rem n 2) 0))
+
+(defun range (n: i64) -> (Vec i64)
+  (if (<= n 0)
+      VecEmpty
+      (let ((c (cell (array n 0))))
+        (dotimes (i n) (array-set! &c i i))
+        (VecOf @c))))
+
+(defun map (f v)
+  (match v
+    ((VecEmpty) VecEmpty)
+    ((VecOf items)
+     (let ((n (array-len items))
+           (c (cell (array n (f (array-get items 0))))))
+       (loop ((i 1))
+         (if (< i n)
+             (do (array-set! &c i (f (array-get items i)))
+                 (recur (+ i 1)))
+             (VecOf @c)))))))
+
+;; In-place updates through & (syntax §3.13): append is push!.
+(defun push! (&v x) (set! v (conj @v x)))
+(defun append (&v x) (push! &v x))
+
+;; Threads and tasks (syntax §3.12, §3.14)
+(defun pmap (f: (fn :send (a) b) xs: (Vec a)) -> (Vec b)
+  (let ((tasks (map (fn (x) (spawn (fn () (f x)))) xs)))
+    (map (fn (t) (join t)) tasks)))
+
+(defun yield () -> (Task unit) (async ()))
+(defun block-on (t) (join t))
+(defun panic (msg: str) (trap msg))
+
+;; I/O (syntax §4.5): eprintln writes s and a newline to stderr, through
+;; the C write(2) on fd 2, copying the string's bytes to a raw buffer.
+(extern write (i32 ptr i64) -> i64)
+
+(defun write-str (fd: i32 s: str) -> unit
+  (let ((bs (str-bytes s))
+        (n (array-len bs)))
+    (unsafe
+      (let ((p (alloc n)))
+        (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+        (write fd p n)
+        (free p)))))
+
+(defun eprintln (s: str) -> unit
+  (do (write-str 2i32 s) (write-str 2i32 "\n")))

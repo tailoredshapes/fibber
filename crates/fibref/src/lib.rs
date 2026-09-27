@@ -10,6 +10,7 @@ pub mod cases;
 pub mod expand;
 pub mod heap;
 pub mod syntax;
+pub mod types;
 
 pub use heap::{
     AuditError, AuditReport, Event, Heap, Kind, Leak, LeakClass, ObjId, Op, ScopeId, Uniqueness,

@@ -1,0 +1,54 @@
+//! Checking a pattern against the scrutinee's type (spec/types.md §2.6):
+//! `Γ ⊢ pat : S ⇝ Γ'`.
+
+use crate::types::ast::{PatKind, Pattern};
+use crate::types::decls::Shape;
+use crate::types::error::{TResult, TypeError};
+use crate::types::ty::Ty;
+
+use super::cx::{Cx, DKind};
+use super::expr::lit_type;
+
+impl Cx<'_> {
+    /// Checks `p` against `s`, binding its variables.
+    pub fn check_pattern(&mut self, p: &Pattern, s: &Ty) -> TResult<()> {
+        match &p.kind {
+            PatKind::Wild => Ok(()),
+            PatKind::Bind(b) => {
+                self.bind(*b, s);
+                Ok(())
+            }
+            PatKind::Lit(l) => {
+                let t = lit_type(l);
+                self.unify(s, &t, &p.pos)?;
+                let Some(eq) = self
+                    .g
+                    .proto_name(crate::types::decls::ModuleId::Builtin, "Eq")
+                else {
+                    return Err(TypeError::other(&p.pos, "no Eq protocol"));
+                };
+                self.defer(DKind::Proto(eq, vec![t], None), &p.pos, None);
+                Ok(())
+            }
+            PatKind::As(inner, b) => {
+                self.bind(*b, s);
+                self.check_pattern(inner, s)
+            }
+            PatKind::Ctor(t, v, subs) => {
+                let def = self.g.ty(*t);
+                let args: Vec<Ty> = def.params.iter().map(|_| self.st.fresh()).collect();
+                let fields = match (&def.shape, v) {
+                    (Shape::Struct(fs), None) => fs.clone(),
+                    (Shape::Enum(vs), Some(i)) => vs[*i].fields.clone(),
+                    _ => Vec::new(),
+                };
+                self.unify(s, &Ty::nominal(*t, args.clone()), &p.pos)?;
+                for (sub, f) in subs.iter().zip(&fields) {
+                    let ft = f.ty.subst_gen(&args, &[]);
+                    self.check_pattern(sub, &ft)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
