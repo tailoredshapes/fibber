@@ -20,22 +20,24 @@ the way; a small working language is one of them, not the destination.
 
 ## Status
 
-Specification plus the test infrastructure that will judge it. Nothing
-counts as implemented until an executable test says so.
+The reference interpreter runs: every case passes with a clean memory
+audit. Nothing counts as implemented until an executable test says so.
 
 ```
-cargo test --workspace                    # 485 tests
-cargo run -p fibref -- cases cases/ownership   # 20 cases, all pending until an interpreter exists
+cargo test --workspace                          # the full suite
+cargo run -p fibref -- cases cases/ownership    # 78 cases
+cargo run -p fibref -- run   <file.fib>         # result and memory audit
+cargo run -p fibref -- explain <file.fib>       # the ownership decisions
 ```
 
 | Part | Where | State |
 |------|-------|-------|
 | Method: how claims are checked | [spec/method.md](spec/method.md) | decided |
 | Ownership model | [spec/ownership.md](spec/ownership.md) | decided |
-| Ownership test cases | [cases/ownership/](cases/ownership/) | 20 decided; 80 proposed in [spec/drafts/PROPOSED_CASES.md](spec/drafts/PROPOSED_CASES.md) |
-| Syntax | [spec/syntax.md](spec/syntax.md) | decided; six adversarial review rounds |
-| Type system and ownership checker | [spec/types.md](spec/types.md) | decided; six adversarial review rounds |
-| Audited heap and case harness (`fibref`) | [crates/fibref](crates/fibref) | done: 485 tests, adversarially tested |
-| Reference interpreter (evaluator over the heap) | — | not started |
-| lIR (hardened, from liar) | — | not started |
-| Compiler | — | not started |
+| Syntax | [spec/syntax.md](spec/syntax.md) | decided |
+| Type system and ownership checker | [spec/types.md](spec/types.md) | decided |
+| Cases | [cases/ownership/](cases/ownership/) | 78, all passing |
+| Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | working; see [ROADMAP.md](ROADMAP.md) M2 |
+| Library | [lib/prelude.fib](lib/prelude.fib) | what the cases need |
+| lIR (hardened, from liar) | — | not started (M3) |
+| Compiler `fibc` | — | not started (M4) |

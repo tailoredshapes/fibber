@@ -1,5 +1,12 @@
 # Proposed cases
 
+**Promoted 2026-09-27.** Every entry below except 30 and 35 is now a
+case in `cases/ownership/` under the same name, and all of them pass
+under the reference interpreter. 30 and 35 are withdrawn: they use
+`&(. x f)` field places, which D1 removed, and do not read. This file is
+kept for the reasoning and the count traces behind each case; the case
+files are authoritative.
+
 Programs that the confirmed findings on `spec/syntax.md` and
 `spec/types.md` turned into candidate test cases. Each entry gives the
 header the case would carry (the format of `cases/ownership/README.md`),

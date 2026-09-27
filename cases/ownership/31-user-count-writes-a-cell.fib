@@ -1,0 +1,20 @@
+;; spec:   §6, §2 (same frees)
+;; expect: accept
+;; result: 1
+;; audit:  clean
+;; A user implementation of count writes a cell that holds the only
+;; other reference to self. The read of @c is counted, so self survives
+;; the write; the cycle is broken by the set!, so nothing leaks.
+(defstruct Bag (back: (Cell (Option (Cell Bag)))))
+
+(impl Countable Bag
+  (count (self)
+    (match @(. self back)
+      ((some c) (do (set! c (Bag (cell nil)))
+                    (match @(. self back) ((some _) 1) (nil 0))))
+      (nil 0))))
+
+(defun main () -> i64
+  (let ((c (cell (Bag (cell nil)))))
+    (set! (. @c back) (some c))
+    (count @c)))

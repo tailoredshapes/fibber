@@ -22,3 +22,7 @@ Cases 12 to 14 and 18 must be rejected; 15 is the one permitted leak;
 16 shows the decided pattern for coordinated updates (§7); 17 pins the
 copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak references
 (§6).
+
+Cases 21 to 80 came from the adversarial review of the spec (their
+reasoning and count traces are in spec/drafts/PROPOSED_CASES.md); 30 and
+35 were withdrawn when D1 removed field places.
