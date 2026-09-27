@@ -14,6 +14,10 @@ escaping closure, sent to another thread) are reference counted. The
 compiler decides which is which; the programmer writes neither
 lifetimes nor retain/release.
 
+**Goal: a self-hosting language.** A fibber compiler written in fibber
+that compiles itself. See [ROADMAP.md](ROADMAP.md) for the milestones on
+the way; a small working language is one of them, not the destination.
+
 ## Status
 
 Specification plus the test infrastructure that will judge it. Nothing

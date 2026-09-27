@@ -3,6 +3,10 @@
 A Lisp with memory safety and no GC: borrow first, count second.
 Successor to liar; see README.md. fibber does not use moth.
 
+The goal is self-hosting (ROADMAP.md): plan work so it moves toward a
+fibber compiler written in fibber, and prefer library and language work
+that such a compiler needs.
+
 ## How work is judged
 
 Read spec/method.md. In short: nothing is done until an executable
