@@ -10,13 +10,16 @@ use std::path::{Path, PathBuf};
 
 use fibref::cases::{list_cases_recursive, read_header};
 
-const CASES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cases");
+/// The curated suite. `cases/found/` holds untriaged findings from the
+/// adversary and the generator, which need not follow these rules until
+/// they are promoted.
+const SUITE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cases/ownership");
 const SPEC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spec/ownership.md");
 const KEYS: [&str; 5] = ["spec", "expect", "result", "audit", "error"];
 
 fn real_cases() -> Vec<PathBuf> {
-    let cases = list_cases_recursive(Path::new(CASES_DIR)).expect("cases/ is readable");
-    assert!(!cases.is_empty(), "no cases under {CASES_DIR}");
+    let cases = list_cases_recursive(Path::new(SUITE_DIR)).expect("cases/ownership is readable");
+    assert!(!cases.is_empty(), "no cases under {SUITE_DIR}");
     cases
 }
 
@@ -49,8 +52,48 @@ fn spec_sections() -> BTreeMap<u32, u32> {
     sections
 }
 
-/// The `§N` and `§N.M` references in a spec field, as (N, Some(M)).
+/// Which spec document a `§` reference points into. A reference is to
+/// ownership.md unless a `types`, `syntax` or `method.md` word precedes
+/// it in the same clause (clauses end at `;`, `(` and `)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Doc {
+    Ownership,
+    Types,
+    Syntax,
+    Method,
+}
+
+/// Every `§N` / `§N.M` reference with the document it points into.
+fn qualified_references(spec: &str) -> Vec<(Doc, u32, Option<u32>)> {
+    let mut out = Vec::new();
+    for clause in spec.split([';', '(', ')']) {
+        let doc = if clause.contains("types") {
+            Doc::Types
+        } else if clause.contains("syntax") {
+            Doc::Syntax
+        } else if clause.contains("method") {
+            Doc::Method
+        } else {
+            Doc::Ownership
+        };
+        for (n, m) in parse_sections(clause) {
+            out.push((doc, n, m));
+        }
+    }
+    out
+}
+
+/// The ownership.md references in a spec field, as (N, Some(M)).
 fn references(spec: &str) -> Vec<(u32, Option<u32>)> {
+    qualified_references(spec)
+        .into_iter()
+        .filter(|(d, _, _)| *d == Doc::Ownership)
+        .map(|(_, n, m)| (n, m))
+        .collect()
+}
+
+/// The `§N` and `§N.M` tokens of one clause.
+fn parse_sections(spec: &str) -> Vec<(u32, Option<u32>)> {
     spec.split('§')
         .skip(1)
         .map(|rest| {
@@ -81,18 +124,67 @@ fn reference_parsing_reads_the_forms_the_cases_use() {
     assert_eq!(references("§3.1."), vec![(3, Some(1))]);
 }
 
+/// Whether `types.md` or `syntax.md` has a heading `## N.` (no item)
+/// or `### N.M`.
+fn heading_exists(doc: Doc, n: u32, m: Option<u32>) -> bool {
+    let file = match doc {
+        Doc::Types => "types.md",
+        Doc::Syntax => "syntax.md",
+        _ => return true,
+    };
+    let path = format!("{}/../../spec/{file}", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(path).expect("spec file is readable");
+    let wanted = match m {
+        Some(m) => format!("### {n}.{m} "),
+        None => format!("## {n}. "),
+    };
+    text.lines().any(|l| l.starts_with(&wanted))
+}
+
+#[test]
+fn qualified_references_follow_their_document() {
+    assert_eq!(
+        qualified_references("§1; types §2.7, §3.3; syntax §3.16"),
+        vec![
+            (Doc::Ownership, 1, None),
+            (Doc::Types, 2, Some(7)),
+            (Doc::Types, 3, Some(3)),
+            (Doc::Syntax, 3, Some(16)),
+        ]
+    );
+    assert_eq!(
+        qualified_references("§4 (types §6.4)"),
+        vec![(Doc::Ownership, 4, None), (Doc::Types, 6, Some(4))]
+    );
+}
+
+#[test]
+fn every_types_and_syntax_citation_names_a_real_heading() {
+    for path in real_cases() {
+        let header = read_header(&path).unwrap_or_else(|e| panic!("{e}"));
+        for (doc, n, m) in qualified_references(&header.spec) {
+            assert!(
+                heading_exists(doc, n, m),
+                "{}: cites {doc:?} §{n}{} which has no heading",
+                name_of(&path),
+                m.map(|m| format!(".{m}")).unwrap_or_default()
+            );
+        }
+    }
+}
+
 #[test]
 fn every_real_case_cites_at_least_one_section_that_exists_in_the_spec() {
     let sections = spec_sections();
     for path in real_cases() {
         let header = read_header(&path).unwrap_or_else(|e| panic!("{e}"));
-        let refs = references(&header.spec);
         assert!(
-            !refs.is_empty(),
+            !qualified_references(&header.spec).is_empty(),
             "{}: spec field {:?} cites no § section",
             name_of(&path),
             header.spec
         );
+        let refs = references(&header.spec);
         for (n, m) in refs {
             let items = sections.get(&n).unwrap_or_else(|| {
                 panic!(
@@ -208,10 +300,11 @@ fn reject_error_texts_are_plain_lowercase_phrases() {
                 !error.ends_with('.') && !error.ends_with(':'),
                 "{name}: trailing punctuation in {error:?}"
             );
-            assert_eq!(
-                error,
-                error.to_lowercase(),
-                "{name}: capitals in {error:?} would have to match exactly"
+            // Capitals are allowed: canonical texts name protocols and
+            // types (`no implementation of Describe for (Cell i64)`).
+            assert!(
+                !error.starts_with(|c: char| c.is_uppercase()),
+                "{name}: error text should not start with a capital: {error:?}"
             );
         }
     }

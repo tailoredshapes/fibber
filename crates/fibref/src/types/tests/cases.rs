@@ -96,7 +96,7 @@ fn the_prelude_type_checks() {
 }
 
 #[test]
-fn all_cases_but_13_and_14_type_check() {
+fn every_accept_case_type_checks_and_13_and_14_do_not() {
     let mut names: Vec<String> = std::fs::read_dir(case_dir())
         .expect("cases/ownership exists")
         .filter_map(|e| e.ok())
@@ -104,12 +104,19 @@ fn all_cases_but_13_and_14_type_check() {
         .filter(|n| n.ends_with(".fib"))
         .collect();
     names.sort();
-    assert_eq!(names.len(), 20, "{names:?}");
+    assert!(names.len() >= 20, "{names:?}");
     for name in &names {
+        // User macros need the evaluator; the case runner covers them.
+        if case_source(name).contains("(defmacro") {
+            continue;
+        }
         let r = check_source(&case_source(name), name);
         match (&name[..2], r) {
             ("13" | "14", r) => assert!(r.is_err(), "{name} type-checked"),
             (_, Ok(_)) => {}
+            // Other reject cases may be rejected by typing or by the
+            // ownership pass; the case runner checks their texts.
+            (_, Err(_)) if name.contains("reject") => {}
             (_, Err(e)) => panic!("{name}: {e:?}"),
         }
     }

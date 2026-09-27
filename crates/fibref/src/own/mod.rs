@@ -28,6 +28,7 @@ mod classify;
 mod facts;
 mod objects;
 mod stack;
+mod taken;
 mod top;
 mod unit;
 mod walk;
@@ -38,7 +39,8 @@ mod tests;
 pub use error::{CheckError, OwnError, OwnErrorKind};
 pub use objects::is_object;
 pub use program::OwnedProgram;
-pub use top::{analyse, value_taken};
+pub use taken::{methods_taken, value_taken};
+pub use top::analyse;
 
 use crate::expand::{expand_program, ExpandCtx, NoRunner};
 use crate::syntax::{read_all, Form};

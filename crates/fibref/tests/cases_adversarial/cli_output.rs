@@ -140,7 +140,7 @@ fn pending_line_is_absent_when_nothing_is_pending() {
 }
 
 #[test]
-fn the_real_cases_print_twenty_pass_rows_and_no_pending_line() {
+fn the_real_cases_print_a_pass_row_each_and_no_pending_line() {
     let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
     let output = fibref(&["cases", "cases/ownership"], root);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
@@ -149,10 +149,10 @@ fn the_real_cases_print_twenty_pass_rows_and_no_pending_line() {
         .lines()
         .filter(|l| l.trim_end().ends_with(" pass"))
         .count();
-    assert_eq!(pass_rows, 20, "{out}");
+    assert_eq!(pass_rows, 78, "{out}");
     assert!(!out.contains("PENDING"), "{out}");
     assert!(
-        out.contains("20 cases: 20 pass, 0 fail, 0 pending, 0 header error"),
+        out.contains("78 cases: 78 pass, 0 fail, 0 pending, 0 header error"),
         "{out}"
     );
 }

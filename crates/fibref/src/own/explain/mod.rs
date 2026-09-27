@@ -64,14 +64,19 @@ fn header(p: &TypedProgram, key: BodyKey) -> Option<(String, &Expr, ModuleId)> {
                 def.module,
             )
         }
-        BodyKey::Method(i, m) => {
+        BodyKey::Method(i, m) | BodyKey::MethodOwned(i, m) => {
             let inst = &g.instances[i];
             let im = &inst.methods[m];
             let proto = g.proto(inst.proto);
             let ty = Printer::with_names(g, &inst.var_names, &[]).ty(&inst.head);
             let name = &proto.methods[im.index].name;
+            let suffix = if matches!(key, BodyKey::MethodOwned(..)) {
+                ".owned"
+            } else {
+                ""
+            };
             (
-                format!("impl {}/{name} for {ty}", proto.name),
+                format!("impl {}/{name}{suffix} for {ty}", proto.name),
                 &im.body,
                 inst.module,
             )

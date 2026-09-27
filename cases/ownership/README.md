@@ -18,10 +18,11 @@ not changed.
 
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
-Cases 12 to 14 and 18 must be rejected; 15 is the one permitted leak;
-16 shows the decided pattern for coordinated updates (§7); 17 pins the
-copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak references
-(§6).
+Cases 12, 13, 14, 18, 21, 34 and 40 must be rejected; 15 and 80 are
+the permitted cycle leaks; every other case is accept with a clean
+audit. 16 shows the decided pattern for coordinated updates (§7); 17
+pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
+references (§6).
 
 Cases 21 to 80 came from the adversarial review of the spec (their
 reasoning and count traces are in spec/drafts/PROPOSED_CASES.md); 30 and

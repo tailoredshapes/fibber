@@ -33,10 +33,8 @@ evaluator over the audited heap.
 - [x] all 20 cases pass
 - [x] the proposed cases promoted: 78 cases, all passing (30 and 35
       withdrawn: they use field places, removed by D1)
-- [ ] known gaps: a protocol method used as a function value has no
-      all-owned body in own/ (runs stop with a plan-gap error); a spin
-      loop on an atom that another thread would set hangs under the
-      deterministic executor
+- [ ] known gaps: a spin loop on an atom that another thread would set
+      hangs under the deterministic executor
 - [ ] method rule 4: an adversary attacking the running interpreter
 - [ ] method rule 5: random well-typed programs, all passing the audit
 

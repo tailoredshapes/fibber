@@ -4,6 +4,7 @@
 
 mod cases;
 mod cases2;
+mod methods;
 mod rules;
 
 use std::path::PathBuf;

@@ -30,8 +30,10 @@ pub enum Target {
     /// A builtin; `owned`: reached through a function value, so every
     /// object argument is the callee's (§8.4).
     Builtin(BuiltinId, bool),
-    /// A method of a built-in instance (instance index, method index).
-    Native(usize, usize),
+    /// A method of a built-in instance (instance index, method index);
+    /// `owned`: reached through a method value, so every object
+    /// argument is the callee's (§8.4).
+    Native(usize, usize, bool),
     /// A constructor.
     Ctor(TypeId, Option<usize>),
     /// An `extern`.
@@ -176,7 +178,7 @@ impl<'p> Interp<'p> {
             (Callee::Extern, ExprKind::Global(GlobalRef::Extern(x))) => Target::Extern(*x),
             (Callee::Value, _) => {
                 let v = hv.ok_or_else(|| RunError::internal("no head value"))?;
-                self.value_target(v)?
+                self.value_target(v, args)?
             }
             (c, _) => {
                 return Err(RunError::internal(format!(
@@ -186,8 +188,9 @@ impl<'p> Interp<'p> {
         })
     }
 
-    /// The target of a call through the function value `v` (§8.4).
-    pub fn value_target(&mut self, v: &Val) -> R<Target> {
+    /// The target of a call through the function value `v` with the
+    /// arguments `args` (§8.4).
+    pub fn value_target(&mut self, v: &Val, args: &[Val]) -> R<Target> {
         use crate::own::program::BodyKey;
         let id = v.expect_obj("a function value")?;
         let clo = match self.objs.get(id)? {
@@ -199,11 +202,13 @@ impl<'p> Interp<'p> {
             super::object::Clo::Fun(f) => Target::Body(BodyKey::AllOwned(f)),
             super::object::Clo::Builtin(b) => Target::Builtin(b, true),
             super::object::Clo::Ctor(t, i) => Target::Ctor(t, i),
+            super::object::Clo::Impl(inst, i) => self.method_value_target(inst, i)?,
             super::object::Clo::Method(p, i) => {
-                let name = &self.p.globals.proto(p).methods[i].name;
-                return Err(RunError::gap(format!(
-                    "method {name} used as a function value: the plan has no all-owned body for a method (§8.4)"
-                )));
+                let recv = args.first().ok_or_else(|| {
+                    RunError::internal("a method value called without a receiver")
+                })?;
+                let inst = self.instance_of(p, recv)?;
+                self.method_value_target(inst, i)?
             }
         })
     }
@@ -240,7 +245,7 @@ impl<'p> Interp<'p> {
                 let d = g.fun(f);
                 (d.params.iter().map(|p| p.binding).collect(), &d.body)
             }
-            BodyKey::Method(i, m) => {
+            BodyKey::Method(i, m) | BodyKey::MethodOwned(i, m) => {
                 let im = &g.instances[i].methods[m];
                 (im.params.clone(), &im.body)
             }

@@ -10,8 +10,10 @@
 //! owned program is a table of **bodies** ([`OwnedProgram::bodies`]),
 //! one per `defun` ([`BodyKey::Fun`]), per all-owned body of a function
 //! whose value is taken ([`BodyKey::AllOwned`], §8.4), per `impl`
-//! method, per `defmacro` and per `def` initialiser. A `fn` or `async`
-//! literal is part of the body it is written in: its records are in
+//! method and per all-owned body of one a method value may run
+//! ([`BodyKey::MethodOwned`]), per `defmacro` and per `def`
+//! initialiser. A `fn` or `async` literal is part of the body it is
+//! written in: its records are in
 //! that body's tables, keyed by the literal's and its expressions'
 //! [`ExprId`]s, so a closure value must remember the body whose tables
 //! created it (the all-owned body of `f` has its own tables for the same
@@ -89,6 +91,10 @@ pub enum BodyKey {
     /// Method `method` of instance `instance` (indices into
     /// `Globals::instances` and its `methods`).
     Method(usize, usize),
+    /// The all-owned body of that method's implementation, used as a
+    /// value (§8.4: "a protocol method's implementation used as a value
+    /// likewise"): every object parameter owned.
+    MethodOwned(usize, usize),
     /// A `def` initialiser: no parameters, no tail calls; its value is
     /// immortalised (§8.2).
     Def(DefId),
@@ -467,6 +473,9 @@ pub struct OwnedProgram {
     pub summaries: HashMap<FunId, Summary>,
     /// The functions whose value is taken (they have an all-owned body).
     pub value_taken: BTreeSet<FunId>,
+    /// The method implementations `(instance, method)` that a method
+    /// value may run (they have a [`BodyKey::MethodOwned`] body).
+    pub methods_taken: BTreeSet<(usize, usize)>,
 }
 
 impl OwnedProgram {

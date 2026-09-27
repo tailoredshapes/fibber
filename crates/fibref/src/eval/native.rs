@@ -33,7 +33,13 @@ impl<'p> Interp<'p> {
                 }
                 Ok(v)
             }
-            Target::Native(inst, m) => self.native_method(inst, m, args),
+            Target::Native(inst, m, owned) => {
+                let v = self.native_method(inst, m, args)?;
+                if owned {
+                    self.release_unowned(inst, m, args)?;
+                }
+                Ok(v)
+            }
             Target::Ctor(t, variant) => {
                 let v = self.new_data(t, variant, args.to_vec(), placement)?;
                 if !matches!(v, Val::Some(_) | Val::None) {
@@ -54,6 +60,21 @@ impl<'p> Interp<'p> {
     fn release_borrowed(&mut self, b: usize, args: &[Val]) -> R<()> {
         for (e, v) in BUILTINS[b].escapes.iter().zip(args) {
             if matches!(e, Escape::Borrow | Escape::Weak | Escape::Raw) {
+                self.release(v)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The built-in implementation of method `m` of instance `inst`
+    /// reached through a method value (§8.4): it releases, at its exit,
+    /// the arguments at the positions the protocol does not declare
+    /// `:owned` (§6.4), which its own convention only borrows.
+    fn release_unowned(&mut self, inst: usize, m: usize, args: &[Val]) -> R<()> {
+        let g = &self.p.globals;
+        let md = &g.proto(g.instances[inst].proto).methods[m];
+        for (j, v) in args.iter().enumerate() {
+            if !md.params.get(j).is_some_and(|mp| mp.owned) {
                 self.release(v)?;
             }
         }

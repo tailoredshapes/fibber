@@ -107,8 +107,13 @@ fn every_case_expands_to_core_forms_and_calls() {
         .filter(|n| n.ends_with(".fib"))
         .collect();
     names.sort();
-    assert_eq!(names.len(), 20);
+    assert!(names.len() >= 20, "{names:?}");
     for name in &names {
+        // User macros need the evaluator (NoRunner reports them pending);
+        // the case runner expands and runs those cases.
+        if read_file(&format!("cases/ownership/{name}")).contains("(defmacro") {
+            continue;
+        }
         let (out, _) = expand_case(name);
         assert!(!out.is_empty(), "{name}");
         if let Some(f) = residue(&out) {

@@ -65,7 +65,7 @@ impl<'p> Interp<'p> {
         };
         let task = self.new_task(Vec::new(), data)?;
         self.heap.retain(task)?;
-        let target = self.value_target(f)?;
+        let target = self.value_target(f, &[])?;
         let jump = Jump {
             target,
             args: Vec::new(),

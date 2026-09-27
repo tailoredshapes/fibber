@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::types::ast::{Expr, ExprKind, FunId, GlobalRef};
+use crate::types::ast::{ExprKind, FunId};
 use crate::types::decls::FunDef;
 use crate::types::display::Printer;
 use crate::types::infer::UnitRef;
@@ -24,7 +24,8 @@ use super::walk::{BodySpec, FrameKind, ParamIn};
 /// Runs the ownership pass over a typed program.
 pub fn analyse(p: &TypedProgram) -> Result<OwnedProgram, Vec<OwnError>> {
     let mut prog = OwnedProgram {
-        value_taken: value_taken(p),
+        value_taken: super::taken::value_taken(p),
+        methods_taken: super::taken::methods_taken(p),
         ..OwnedProgram::default()
     };
     let mut errors = Vec::new();
@@ -216,6 +217,41 @@ fn method_unit(
         }
     }
     store(prog, done.bodies);
+    if prog.methods_taken.contains(&(i, m)) {
+        let owned = method_owned(p, i, m, &prog.summaries);
+        store(prog, owned);
+    }
+}
+
+/// The all-owned body of a method implementation used as a value
+/// (§8.4): the body decided afresh with every object parameter owned
+/// (declared, like an all-owned body's). The declared kinds were
+/// checked on the method's own body; this one reports nothing.
+fn method_owned(
+    p: &TypedProgram,
+    i: usize,
+    m: usize,
+    summaries: &std::collections::HashMap<FunId, super::program::Summary>,
+) -> Vec<(BodyKey, BodyOwn)> {
+    let mut spec = method_spec(p, i, m);
+    for (_, pin) in &mut spec.params {
+        if let ParamIn::Obj { owned } = pin {
+            *owned = true;
+        }
+    }
+    let preset: Vec<_> = spec
+        .params
+        .iter()
+        .filter(|(_, pin)| matches!(pin, ParamIn::Obj { .. }))
+        .map(|(b, _)| *b)
+        .collect();
+    let unit = Unit {
+        bodies: vec![(BodyKey::MethodOwned(i, m), spec)],
+        scc: Vec::new(),
+        all_owned: false,
+    };
+    let facts = Facts::new(BTreeMap::new(), BTreeSet::new(), &preset);
+    decide(p, summaries, &unit, facts).bodies
 }
 
 /// A method body with its declared kinds (syntax §3.10).
@@ -269,39 +305,4 @@ fn impl_escapes(p: &TypedProgram, i: usize, m: usize, b: crate::types::ast::Bind
         p.globals.binding(b).name
     );
     OwnError::new(OwnErrorKind::ImplEscapes, &im.pos, msg)
-}
-
-/// The `defun`s used as values anywhere: a function name in any
-/// position but the head of a call (§8.4).
-pub fn value_taken(p: &TypedProgram) -> BTreeSet<FunId> {
-    let mut out = BTreeSet::new();
-    let mut scan = |e: &Expr| taken_in(e, &mut out);
-    for f in &p.globals.funs {
-        scan(&f.body);
-    }
-    for inst in &p.globals.instances {
-        for m in &inst.methods {
-            scan(&m.body);
-        }
-    }
-    for d in &p.globals.defs {
-        scan(&d.init);
-    }
-    out
-}
-
-fn taken_in(e: &Expr, out: &mut BTreeSet<FunId>) {
-    match &e.kind {
-        ExprKind::Global(GlobalRef::Fun(f)) => {
-            out.insert(*f);
-        }
-        ExprKind::Call(h, _) if matches!(h.kind, ExprKind::Global(GlobalRef::Fun(_))) => {
-            e.children(&mut |c| {
-                if !std::ptr::eq(c, h.as_ref()) {
-                    taken_in(c, out);
-                }
-            });
-        }
-        _ => e.children(&mut |c| taken_in(c, out)),
-    }
 }

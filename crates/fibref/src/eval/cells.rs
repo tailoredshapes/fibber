@@ -65,7 +65,7 @@ impl<'p> Interp<'p> {
         let old = self.slot(atom)?;
         self.retain(&old)?;
         self.retain(&old)?;
-        let target = self.value_target(f)?;
+        let target = self.value_target(f, std::slice::from_ref(&old))?;
         let jump = Jump {
             target,
             args: vec![old.clone()],

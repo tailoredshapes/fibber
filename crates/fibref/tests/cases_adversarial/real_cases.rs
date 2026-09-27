@@ -9,15 +9,22 @@ use fibref::cases::{
 };
 
 const CASES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cases");
+/// The curated suite. `cases/found/` holds untriaged findings from the
+/// adversary and the generator, which need not follow these rules until
+/// they are promoted.
+const SUITE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cases/ownership");
 
 fn real_cases() -> Vec<PathBuf> {
-    let cases = list_cases_recursive(Path::new(CASES_DIR)).expect("cases/ is readable");
+    let cases = list_cases_recursive(Path::new(SUITE_DIR)).expect("cases/ownership is readable");
     assert!(
         !cases.is_empty(),
-        "no .fib files under {CASES_DIR}; the test would prove nothing"
+        "no .fib files under {SUITE_DIR}; the test would prove nothing"
     );
     cases
 }
+
+const REJECT: [u32; 7] = [12, 13, 14, 18, 21, 34, 40];
+const LEAK_CYCLE: [u32; 2] = [15, 80];
 
 fn number_of(path: &Path) -> u32 {
     let name = path.file_name().unwrap().to_string_lossy();
@@ -43,7 +50,7 @@ fn walk_fib_files(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn the_harness_lists_exactly_the_fib_files_on_disk() {
     let mut on_disk = Vec::new();
-    walk_fib_files(Path::new(CASES_DIR), &mut on_disk);
+    walk_fib_files(Path::new(SUITE_DIR), &mut on_disk);
     on_disk.sort();
     assert_eq!(real_cases(), on_disk);
 }
@@ -60,17 +67,20 @@ fn every_real_case_header_parses() {
 }
 
 #[test]
-fn the_ownership_directory_holds_twenty_cases_numbered_in_order() {
+fn the_ownership_directory_holds_cases_1_to_80_less_the_withdrawn() {
+    // 30 and 35 were withdrawn when D1 removed field places.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();
     let numbers: Vec<u32> = cases.iter().map(|p| number_of(p)).collect();
-    assert_eq!(numbers, (1..=20).collect::<Vec<u32>>());
+    let expected: Vec<u32> = (1..=80).filter(|n| ![30, 35].contains(n)).collect();
+    assert_eq!(numbers, expected);
 }
 
 #[test]
 fn real_case_verdicts_agree_with_the_readme() {
-    // README: 12, 13, 14 and 18 must be rejected; 15 is the one
-    // permitted leak; every other case is accept with a clean audit.
+    // README: 12, 13, 14, 18, 21, 34 and 40 must be rejected; 15 and 80
+    // are the permitted cycle leaks; every other case is accept with a
+    // clean audit.
     for path in real_cases() {
         let header = read_header(&path).unwrap_or_else(|e| panic!("{e}"));
         let n = number_of(&path);
@@ -78,17 +88,17 @@ fn real_case_verdicts_agree_with_the_readme() {
         match header.verdict {
             Verdict::Reject { error } => {
                 assert!(
-                    [12, 13, 14, 18].contains(&n),
+                    REJECT.contains(&n),
                     "{name} is reject but README says accept"
                 );
                 assert!(!error.is_empty());
             }
             Verdict::Accept { audit, .. } => {
                 assert!(
-                    ![12, 13, 14, 18].contains(&n),
+                    !REJECT.contains(&n),
                     "{name} is accept but README says reject"
                 );
-                let expected = if n == 15 {
+                let expected = if LEAK_CYCLE.contains(&n) {
                     AuditExpect::LeakCycle
                 } else {
                     AuditExpect::Clean

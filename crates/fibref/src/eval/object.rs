@@ -44,8 +44,13 @@ pub enum Clo {
     Fun(FunId),
     /// A builtin used as a value.
     Builtin(BuiltinId),
-    /// A protocol method used as a value.
+    /// A protocol method used as a value whose instance the checker
+    /// left to the receiver (a bound or `dyn`): dispatched on the
+    /// receiver's type at each call (§4.5).
     Method(ProtoId, usize),
+    /// Method `usize` (of the protocol) of the instance resolved at the
+    /// use (§4.2): runs that implementation's all-owned body (§8.4).
+    Impl(usize, usize),
     /// A constructor used as a value.
     Ctor(TypeId, Option<usize>),
 }

@@ -135,7 +135,9 @@ impl<'p> Interp<'p> {
         let pos = match key {
             BodyKey::Fun(f) | BodyKey::AllOwned(f) => self.p.globals.fun(f).pos.clone(),
             BodyKey::Def(d) => self.p.globals.def(d).pos.clone(),
-            BodyKey::Method(i, m) => self.p.globals.instances[i].methods[m].pos.clone(),
+            BodyKey::Method(i, m) | BodyKey::MethodOwned(i, m) => {
+                self.p.globals.instances[i].methods[m].pos.clone()
+            }
         };
         self.invoke(Jump {
             target: Target::Body(key),

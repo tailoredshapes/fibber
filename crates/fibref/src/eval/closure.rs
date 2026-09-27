@@ -86,8 +86,8 @@ impl<'p> Interp<'p> {
             .ok_or_else(|| RunError::internal(format!("no literal {lit:?}")))
     }
 
-    /// A named function, builtin or method as a value: its immortal
-    /// closure (§8.2, §8.4), made once.
+    /// A named function, builtin or constructor as a value: its
+    /// immortal closure (§8.2, §8.4), made once.
     pub fn function_value(&mut self, g: GlobalRef) -> R<Val> {
         let clo = match g {
             GlobalRef::Fun(f) => Clo::Fun(f),
@@ -98,7 +98,23 @@ impl<'p> Interp<'p> {
                 return Err(RunError::internal(format!("{g:?} as a function value")))
             }
         };
-        let key = format!("{g:?}");
+        self.immortal_closure(clo)
+    }
+
+    /// The method value `e`, method `i` of `p` (§8.4): the resolved
+    /// instance's implementation when the checker resolved the use to
+    /// one (§4.2), else a value that dispatches on its receiver's type
+    /// at each call (§4.5).
+    pub fn method_value(&mut self, e: ExprId, p: ProtoId, i: usize) -> R<Val> {
+        match self.instances.get(&e) {
+            Some(inst) => self.immortal_closure(Clo::Impl(*inst, i)),
+            None => self.function_value(GlobalRef::Method(p, i)),
+        }
+    }
+
+    /// The immortal closure `clo`, made once per run.
+    fn immortal_closure(&mut self, clo: Clo) -> R<Val> {
+        let key = format!("{clo:?}");
         if let Some(id) = self.statics.closures.get(&key) {
             return Ok(Val::Obj(*id));
         }
@@ -138,26 +154,46 @@ impl<'p> Interp<'p> {
     /// the resolution the checker recorded when it is an instance, else
     /// the instance of the receiver's type at run time (§4.5).
     pub fn dispatch(&self, site: Option<ExprId>, p: ProtoId, i: usize, recv: &Val) -> R<Target> {
-        let g = &self.p.globals;
         let inst = match site.and_then(|s| self.instances.get(&s)) {
             Some(index) => *index,
-            None => {
-                let con = self.con_of(recv)?;
-                *g.instance_index.get(&(p, con)).ok_or_else(|| {
-                    RunError::internal(format!("no instance of {} for {con:?}", g.proto(p).name))
-                })?
-            }
+            None => self.instance_of(p, recv)?,
         };
-        let def = &g.instances[inst];
+        let def = &self.p.globals.instances[inst];
         if def.methods.is_empty() {
-            return Ok(Target::Native(inst, i));
+            return Ok(Target::Native(inst, i, false));
         }
-        let m = def
+        Ok(Target::Body(BodyKey::Method(
+            inst,
+            self.method_in(inst, i)?,
+        )))
+    }
+
+    /// The target of a call through a method value (§8.4): the
+    /// all-owned body of instance `inst`'s implementation of method `i`,
+    /// or its built-in implementation under the closure convention.
+    pub fn method_value_target(&self, inst: usize, i: usize) -> R<Target> {
+        if self.p.globals.instances[inst].methods.is_empty() {
+            return Ok(Target::Native(inst, i, true));
+        }
+        let m = self.method_in(inst, i)?;
+        Ok(Target::Body(BodyKey::MethodOwned(inst, m)))
+    }
+
+    /// The instance of protocol `p` for the type of `recv` (§4.5).
+    pub fn instance_of(&self, p: ProtoId, recv: &Val) -> R<usize> {
+        let g = &self.p.globals;
+        let con = self.con_of(recv)?;
+        g.instance_index.get(&(p, con)).copied().ok_or_else(|| {
+            RunError::internal(format!("no instance of {} for {con:?}", g.proto(p).name))
+        })
+    }
+
+    fn method_in(&self, inst: usize, i: usize) -> R<usize> {
+        self.p.globals.instances[inst]
             .methods
             .iter()
             .position(|m| m.index == i)
-            .ok_or_else(|| RunError::internal("an instance without the method"))?;
-        Ok(Target::Body(BodyKey::Method(inst, m)))
+            .ok_or_else(|| RunError::internal("an instance without the method"))
     }
 
     /// The head constructor of a value's type at run time.

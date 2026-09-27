@@ -104,6 +104,7 @@ impl<'p> Interp<'p> {
                     RunError::internal(format!("def {} read before it was evaluated", d.0))
                 }),
             GlobalRef::Ctor(t, v) => self.ctor_value(e, t, v),
+            GlobalRef::Method(p, i) => self.method_value(e.id, p, i),
             other => self.function_value(other),
         }
     }
