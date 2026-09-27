@@ -32,7 +32,6 @@ use super::program::{
     BindKind, BindingOwn, BodyOwn, ExprOwn, Mode, Op, OpKind, Site, Summary, Tail, Why,
 };
 
-pub(super) use callee::SELF_ESCAPES_BY_DEFAULT;
 pub(super) use lit::{BodySpec, ParamIn};
 
 /// A value as the events see it.

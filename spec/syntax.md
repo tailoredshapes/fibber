@@ -508,10 +508,10 @@ that calls a method is type-checked and generalised before any `impl`
 body is (types §3.5). One `impl` per (protocol, head constructor) in the
 whole program.
 
-Escape and count kinds (**Decided**; types §6.4): a method parameter
-other than `self` defaults to the **escaping** kind, and every method
-parameter, `self` included, defaults to the **borrowed** count
-convention. `x: type :borrow` promises that no implementation makes `x`
+Escape and count kinds (**Decided**; types §2.7, §6.4): every method
+parameter, `self` included, defaults to the **escaping** kind and to the
+**borrowed** count convention. (`self` must default to escaping: the
+prelude's `conj` on a `List` stores `self` in the new cell.) `x: type :borrow` promises that no implementation makes `x`
 escape; the checker rejects an `impl` whose body breaks the promise.
 The same keyword after a `defun` parameter is the same promise on a
 plain function (§3.1). `:owned` declares that the caller hands the

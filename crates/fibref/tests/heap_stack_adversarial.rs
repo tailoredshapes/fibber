@@ -254,20 +254,18 @@ fn sharing_a_heap_object_through_a_stack_object_marks_nothing() {
 }
 
 #[test]
-fn counting_a_stack_object_is_refused_even_through_a_read_ref() {
+fn counting_a_stack_object_through_a_read_ref_is_a_no_op() {
+    // types §8.2: a count operation on a live stack object changes
+    // nothing, however the reference was obtained.
     let mut heap = Heap::new();
     let s = heap.open_scope();
     let h = stack(&mut heap, s, Kind::Immutable, vec![]);
     let sc = stack(&mut heap, s, Kind::Cell, vec![Value::Ref(h)]);
     let read = heap.read(sc, 0).expect("read").as_ref().expect("a ref");
-    assert_eq!(
-        heap.retain(read),
-        Err(AuditError::CountOnStack {
-            id: h,
-            op: Op::Retain
-        })
-    );
+    assert_eq!(heap.retain(read), Ok(0));
     assert_eq!(heap.count(h), Ok(0));
+    heap.end_scope(s).expect("the scope still ends cleanly");
+    assert!(!heap.is_live(h));
 }
 
 #[test]

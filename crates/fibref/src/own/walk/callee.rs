@@ -9,15 +9,6 @@ use crate::types::builtins::{Escape, BUILTINS};
 use super::super::program::Callee;
 use super::{Class, FrameKind, Walker};
 
-/// Whether a method's `self` escapes by default. types §2.7 and §6.4
-/// say every method parameter defaults to escaping; syntax §3.10 says
-/// every parameter *other than* `self` does. The two disagree, and the
-/// prelude's `(conj (self x) (cons x self))` for `List` stores `self`,
-/// which a non-escaping `self` would reject. This follows types.md
-/// (the checker's specification) until the owner decides; see the
-/// report.
-pub(in super::super) const SELF_ESCAPES_BY_DEFAULT: bool = true;
-
 /// One parameter position of a callee.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) struct Param {
@@ -103,7 +94,9 @@ impl Walker<'_> {
                         let mp = md.params.get(j);
                         let owned = mp.is_some_and(|m| m.owned);
                         let borrow = mp.is_some_and(|m| m.borrow);
-                        let escapes = !borrow && (j > 0 || SELF_ESCAPES_BY_DEFAULT);
+                        // Every method parameter, `self` included, defaults to escaping
+                        // (types §2.7, §6.4; syntax §3.10).
+                        let escapes = !borrow;
                         param(if owned { Class::Owned } else { Class::Borrow }, escapes)
                     })
                     .collect()

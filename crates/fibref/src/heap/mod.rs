@@ -129,9 +129,10 @@ impl Heap {
 
     /// Count += 1. Returns the count after. Event: `Retain`.
     ///
-    /// On an immortal object a no-op returning 0, with no event
-    /// ([`Heap::alloc_immortal`]). On a stack object `CountOnStack`: the
-    /// compiler never emits a count operation on one (§6.11).
+    /// On an immortal or a live stack object a no-op returning 0, with no
+    /// event: types §8.2 makes retain/release no-ops on `IMMORTAL` and
+    /// `STACK` objects, and §6.11 relies on it when a stack object is
+    /// passed to an owned parameter whose callee releases it.
     pub fn retain(&mut self, id: ObjId) -> Result<usize, AuditError> {
         if !self.check_count_op(id, Op::Retain)? {
             return Ok(0);
@@ -141,13 +142,13 @@ impl Heap {
     }
 
     /// Whether a count operation `op` on `id` counts: `false` for an
-    /// immortal object, an error for a stack object (`CountOnStack`, or
-    /// `StackUseAfterScope` once its scope has ended).
+    /// immortal object or a live stack object (a no-op, types §8.2),
+    /// `StackUseAfterScope` once a stack object's scope has ended.
     fn check_count_op(&self, id: ObjId, op: Op) -> Result<bool, AuditError> {
         let object = self.object(id)?;
         match object.scope {
             Some(_) if !object.live => Err(AuditError::StackUseAfterScope { id, op }),
-            Some(_) => Err(AuditError::CountOnStack { id, op }),
+            Some(_) => Ok(false),
             None => Ok(!object.immortal),
         }
     }

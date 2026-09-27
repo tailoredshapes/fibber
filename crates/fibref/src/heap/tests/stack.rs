@@ -67,26 +67,26 @@ fn a_scope_ends_its_objects_and_releases_what_they_hold() {
 }
 
 #[test]
-fn retain_and_release_of_a_stack_object_are_errors() {
+fn retain_and_release_of_a_live_stack_object_are_untraced_no_ops() {
+    // types §8.2: STACK retain/release are no-ops (§6.11 passes stack
+    // objects to owned parameters whose callee releases them).
     let mut heap = Heap::new();
     let s = heap.open_scope();
     let h = stack(&mut heap, s, Kind::Immutable, vec![]);
     let before = heap.trace().len();
+    assert_eq!(heap.retain(h), Ok(0));
+    assert_eq!(heap.release(h), Ok(0));
+    assert_eq!(heap.release(h), Ok(0));
+    assert!(heap.is_live(h));
+    assert_eq!(heap.trace().len(), before);
+    heap.end_scope(s).expect("end");
     assert_eq!(
         heap.retain(h),
-        Err(AuditError::CountOnStack {
+        Err(AuditError::StackUseAfterScope {
             id: h,
             op: Op::Retain
         })
     );
-    assert_eq!(
-        heap.release(h),
-        Err(AuditError::CountOnStack {
-            id: h,
-            op: Op::Release
-        })
-    );
-    assert_eq!(heap.trace().len(), before);
 }
 
 #[test]

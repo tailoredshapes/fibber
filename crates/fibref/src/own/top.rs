@@ -19,7 +19,7 @@ use super::objects::is_object;
 use super::program::{BodyKey, BodyOwn, OwnedProgram, Pass};
 use super::syntactic::visit;
 use super::unit::{decide, Unit};
-use super::walk::{BodySpec, FrameKind, ParamIn, SELF_ESCAPES_BY_DEFAULT};
+use super::walk::{BodySpec, FrameKind, ParamIn};
 
 /// Runs the ownership pass over a typed program.
 pub fn analyse(p: &TypedProgram) -> Result<OwnedProgram, Vec<OwnError>> {
@@ -245,9 +245,7 @@ fn method_spec(p: &TypedProgram, i: usize, m: usize) -> BodySpec<'_> {
         })
         .collect();
     let declared_borrow = (0..im.params.len())
-        .map(|j| {
-            md.params.get(j).is_some_and(|mp| mp.borrow) || (j == 0 && !SELF_ESCAPES_BY_DEFAULT)
-        })
+        .map(|j| md.params.get(j).is_some_and(|mp| mp.borrow))
         .collect();
     BodySpec {
         kind: FrameKind::Method,

@@ -69,9 +69,6 @@ pub enum AuditError {
     /// in place would change an object another binding can see, or
     /// static or stack data. `id` is the object `why` is about.
     NotUnique { id: ObjId, why: Uniqueness },
-    /// A `retain` or `release` of a `STACK` object, which the compiler
-    /// never counts (§6.11, §8.2).
-    CountOnStack { id: ObjId, op: Op },
     /// Any operation on a `STACK` object after its scope ended (§6.11),
     /// told apart from `UseAfterFree`: the compiled program would touch
     /// a frame slot that its site may already have reused.
@@ -159,7 +156,6 @@ impl AuditError {
             AuditError::NotUnique { id, why } => {
                 write!(f, "unique write refused on {id}: {why:?}")
             }
-            AuditError::CountOnStack { id, op } => write!(f, "{op} of stack object {id}"),
             AuditError::StackUseAfterScope { id, op } => {
                 write!(f, "stack use after scope: {op} of stack object {id}")
             }
