@@ -147,8 +147,9 @@ Evaluation is strict and **left to right, inner before outer**
 - a call `(f a1 ... an)`: `f` (when it is not a global name), then `a1`
   ... `an`, then the call; for an `&x` argument the copy-in happens at
   its argument position (§3.13), and the write-backs happen after the
-  call returns, in parameter order (they target distinct variables, so
-  the order is unobservable); the two in-place primitives of §3.13 have
+  call returns, in parameter order (the `&` arguments name distinct
+  variables; when two names reach one cell, the later write-back wins,
+  ownership.md §5); the two in-place primitives of §3.13 have
   neither, and update the variable's own cell;
 - a **tail call** (a call in tail position of a `defun` or `fn` body
   that types §6.10 admits as one; **Decided**, D5; a call in tail
@@ -609,8 +610,11 @@ created by the caller at the call and lives exactly for the call:
    result:     the call's value
 ```
 
-The caller's `x` is untouched until the write-back, so a plain `@x` in
-the same call stays valid (case 17). A read `@v` inside the callee is an
+The call does not write `x` before the write-back, so a plain `@x` in
+the same call stays valid (case 17). A cell that also reaches the call
+under another name (an alias, a capture, a field) can be written through
+that name during the call; the write-backs still run in parameter order
+and the later one wins (ownership.md §5). A read `@v` inside the callee is an
 owned reference (+1), so a value read from `v` and still in use always
 holds a count, even after the callee replaces `v`'s content (types
 §6.3, §6.7): proposed case 78 pins that inside an `&` function, and
@@ -645,16 +649,17 @@ alone.
 **Write-back** stores the private cell's content into the variable,
 releasing the variable's old content, then frees the private cell.
 
-**Forwarding at a self tail call** (**Decided**, D5). A self tail call of
-the enclosing `defun` (types §6.10) whose argument for an `&` parameter
-`v` is `&v` itself, at `v`'s own position, forwards the private cell: no
-copy-in, no write-back, the cell is kept, and the call stays a tail
-call; the one write-back is the original caller's, after the whole
-chain returns. Any other call with an `&` argument — a `let` cell, `&v`
-at a different position, an `&` argument to another function — is an
-ordinary call with copy-in and write-back, and is never a tail call,
-because the write-back must run after it returns (types §6.10 rule
-(b)).
+**Forwarding at a tail call** (**Decided**, D5 as amended). At a call in
+tail position (types §6.10), an argument `&v` where `v` is an `&`
+parameter of the enclosing `defun`, at any `&` position of any callee,
+forwards the private cell: no copy-in, no write-back, the cell is kept;
+the one write-back is that of the frame below that made the cell, after
+the whole chain returns. A call whose every `&` argument forwards stays
+a tail call, so an in-out accumulator can thread through mutual
+recursion in constant stack. Any other `&` argument — a `let` cell, a
+cell reached another way — makes the call an ordinary call with copy-in
+and write-back, never a tail call, because the write-back must run after
+it returns (types §6.10 rule (b)).
 
 **Unique update** (**Decided**, §5): the in-place primitives update the
 object in a place when it is **unique**: its count is one and it is
@@ -1001,7 +1006,7 @@ closure body rather than part of the enclosing function:
    inside a loop body, forwarding the function's own `&` parameter —
    `(defun run (&s n) (loop ((i 0)) (if (< i k) (do (step &s) (recur (+
    i 1))) (run &s (- n 1)))))` — is a tail call under §3.13 only because
-   the call is a self call of `run` and `&s` is `run`'s own parameter. In
+   `&s` forwards an `&` parameter of the enclosing `defun`. In
    the rewritten body the same call sits inside `g`, where `s` is a
    capture, not a parameter of `g` (a `fn` has no `&` parameters, §3.2);
    the forwarding exception of types §6.10 rule (b) cannot apply, and
@@ -1383,9 +1388,10 @@ next exists.
 ;; expect: accept
 ;; result: 6
 ;; audit:  clean
-;; The loop is still reading v when append replaces it. The iteration
-;; holds a count, so append copies instead of updating in place, and the
-;; loop sees the original three elements.
+;; The loop is still reading v when append replaces it. append's own
+;; copy-in holds a count and the caller's cell keeps the original alive,
+;; so append copies instead of updating in place, and the loop sees the
+;; original three elements.
 (defun dup-all (&v)
   (for-each @v (fn (x) (append &v x))))
 
@@ -1401,9 +1407,8 @@ alive for the whole call, so the case passes whether or not the read
 is counted: it pins copy-in/copy-out and the stack-closure capture of
 `&v`, not the acquire, which proposed cases 66 and 78 pin. `append`
 copies because its own copy-in acquires (§3.13, D1; traced in types §6.6),
-not because the iteration holds a count; the header's causal sentence
-predates D1 and is to be corrected in the case file, in a commit that
-states why (the verdict is unchanged). `append` is the library
+not because the iteration holds a count; the header comment was
+corrected to say so (the verdict is unchanged). `append` is the library
 in-place push.
 
 ### 09-iterator-outlives-source.fib

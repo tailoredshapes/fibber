@@ -98,11 +98,11 @@ counts on the shared nodes keep them alive for as long as any version
 needs them (case 02).
 
 A **mutable parameter** `&v` is copy-in, copy-out. The callee's `v` is
-a local mutable binding initialised from the caller's variable (written
-`(f &x)` at the call site); when the call returns, `x` is assigned
-whatever `v` holds. During the call the caller's `x` is untouched, so
-`(f &x @x)` is fine: the plain borrow stays valid until the write-back
-(case 17). Updates go through the object's count:
+a private cell, initialised from the caller's variable (written
+`(f &x)` at the call site) and read with `@v`; `v` itself is never a
+value. When the call returns, `x` is assigned whatever `v` holds. The
+call does not write `x` before the write-back, so `(f &x @x)` is fine:
+the plain borrow stays valid until the write-back (case 17). Updates go through the object's count:
 
 - count is one → the object is updated in place;
 - count is more than one → it is copied first, and the copy is updated.
@@ -115,8 +115,13 @@ or moved under it (case 08).
 variables. `(bar &x &x)` would write back to `x` twice at return; with
 copy-on-write inside `bar`, whichever parameter was updated second wins
 and the other update is silently lost. No ordering gives that call one
-meaning, so it is a compile error (case 12). The check is syntactic; no
-alias analysis is needed. This replaces liar's ADR 007 ("aliasing
+meaning, so it is a compile error (case 12). The check is on names; no
+alias analysis is done. A cell can still reach one call under two
+different names (an alias of the cell, a capture, a struct field that
+holds it). Such a call is memory-safe, since every copy-in holds its own
+count, but its meaning is order-dependent: the callee may write the cell
+through the other name during the call, and the write-backs run in
+parameter order, so the later one wins. This replaces liar's ADR 007 ("aliasing
 allowed"). Aliasing of *objects* stays fine because mutation copies
 when the count is above one: `(bar &x &y)` with `x` and `y` holding the
 same object gives each variable its own result.
@@ -197,7 +202,8 @@ as a transaction is still reading it.
 An async function's frame outlives the call that started it, so borrows
 cannot be held across an `await`. Any parameter or local used after an
 `await` is retained on entry to the async function. `&` parameters are
-not allowed in async functions (case 11).
+not allowed in async functions (case 14). Case 11 tests the retain on
+entry.
 
 ## 9. Unsafe
 

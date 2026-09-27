@@ -1367,12 +1367,15 @@ variable's old content is released), then the private cell is freed
 (no count). The interpreter implements exactly this, so the compiler's
 allocations match its allocations (§6.12).
 
-**Forwarding at a self tail call** (§6.10 rule (b); **Decided**, D5): an
-argument `&v` for the enclosing function's own `&` parameter `v`, at
-`v`'s position, performs no copy-in and no write-back: the callee's `v`
-is the same private cell, and the one write-back is the original
-caller's, after the whole chain returns. Any other `&` argument makes
-the call an ordinary call. Without this rule the write-backs of a
+**Forwarding at a tail call** (§6.10 rule (b); **Decided**, D5 as
+amended by the owner): at a call in tail position, an argument `&v`
+where `v` is an `&` parameter of the enclosing `defun`, at any `&`
+position of any callee, performs no copy-in and no write-back: the
+callee's parameter is the same private cell, which belongs to a frame
+below the caller, and the one write-back is that frame's, after the
+whole chain returns. The distinct-variables check (§6.5) already forbids
+forwarding one cell twice. Any other `&` argument (a `let` cell, a cell
+reached another way) makes the call an ordinary call. Without this rule the write-backs of a
 recursion's iterations, which syntax §2 places "after the call
 returns", would need a frame each.
 
@@ -1568,13 +1571,14 @@ call** — the caller's frame is discarded and the callee's result is the
 caller's — unless one of the following holds, in which case it is an
 ordinary call followed by the releases of §6.3:
 
-- (b) it has an `&` argument other than the forwarding case: the
-  write-back must run after the call returns (§6.6). A self tail call
-  of the enclosing `defun` whose argument at an `&` parameter `v`'s own
-  position is `&v` forwards the private cell — no copy-in, no
-  write-back — and stays a tail call; every other `&` argument (a `let`
-  cell, `&v` at another position, an `&` argument to another function)
-  makes the call ordinary;
+- (b) it has an `&` argument that does not forward an `&` parameter of
+  the enclosing `defun`: that write-back must run after the call
+  returns (§6.6). An argument `&v`, `v` an `&` parameter of the
+  enclosing `defun`, at any `&` position of any callee, forwards the
+  private cell — no copy-in, no write-back — so a call whose every `&`
+  argument forwards stays a tail call (mutual recursion threading an
+  in-out accumulator runs in constant stack); every other `&` argument
+  (a `let` cell, a cell reached another way) makes the call ordinary;
 - (e) an argument at a **borrowed** position of a callee outside the
   current SCC (an imported `defun`, a protocol method, a `defun` of an
   earlier SCC; from a `fn` body, which belongs to no SCC, every `defun`;
@@ -2775,8 +2779,8 @@ alternative was `stacksave`/`stackrestore` in lIR); a tail call
 releases the frame's owned parameters (§6.10 step 3), and case 07's
 base path is a retain and a release, not a move (§6.10, §7); case 08
 no longer pins the `@v` acquire (§7). They come with proposed case 49,
-restated, and cases 52–69. Two findings of the round need a decision
-and are Open items 2 and 3.
+restated, and cases 52–69. Two findings of the round needed a decision;
+the owner's decisions are recorded at the end of this section.
 
 **Fifth review round.** A review of the same sections after those
 corrections found more places where the application of D5–D7 broke a
@@ -2831,60 +2835,25 @@ cell that holds the object it writes, which is all that the
 §6.7, §6.14, §8.10; syntax §2, §3.11, §3.13, §4.3). They come with proposed
 cases 79 and 80. None changes the verdict of a case in `cases/` or a
 decided rule. Proposed case 80 passes a cell beside an `&` argument
-naming it, so option (B) of Open item 2 below, with its type rule,
-would turn it into a reject.
+naming it; under the owner's decision on two names for one cell (option
+(A), below) it stays `accept`.
 
-### Open
+### Decided on the last open items
 
-Three items: the first raised while applying D5, the other two by the
-fourth review round. Nothing downstream depends on them, and the
-decided rule is what the text above states.
+The owner decided the three items the fourth review round left open:
 
-1. **`&` forwarding beyond the self call at the same position.** D5
-   admits a tail call with an `&` argument only when it is a self call
-   forwarding the function's own `&` parameter at its own position
-   (§6.10 rule (b)). Under real tail calls the position is immaterial —
-   a private cell is a `ptr` argument (§8.6) — and so is the callee:
-   any `&` parameter of the caller forwarded to any `&` position of any
-   callee names a cell that a frame below the caller owns and writes
-   back after the whole chain returns, and the distinct-variables check
-   (§6.5) already forbids forwarding one cell twice. Recommend: relax
-   rule (b) to "every `&` argument of the call forwards an `&` parameter
-   of the caller", which lets an in-out accumulator thread through
-   mutual recursion (`even-fill`/`odd-fill`) in constant stack.
-   Alternative: keep the decided rule; such programs are accepted as
-   ordinary calls with copy-in and write-back, one frame per call.
-2. **Two names for one cell in one call.** The distinct-variables
-   check (§6.5; syntax §3.13 rule 1) is on names, but under D2 an `&`
-   argument names a cell, and a cell can have other names: a `let`
-   alias (`(let ((y x)) (bar &x &y))`), a capture, a plain argument of
-   cell type (`(g &x x)`), or any argument that reaches the cell (a
-   struct field, a closure's capture). Such a call is memory-safe,
-   since every copy-in acquires, but an update is lost (proposed case
-   67), the order of the write-backs is observable, and the callee can
-   write the caller's cell during the call. That contradicts
-   ownership.md §5 ("During the call the caller's `x` is untouched";
-   "No ordering gives that call one meaning"), syntax §2 ("the order is
-   unobservable") and syntax §3.13 ("The caller's `x` is untouched
-   until the write-back"). Options: (A) keep the check on names and
-   reword those texts to say that a cell reachable by another name may
-   change during the call and that the later write-back wins
-   (ownership.md §5 is the owner's to change); (B) restrict `&x` to a
-   `let` binding initialised by `(cell ..)` and to `&` parameters, and
-   forbid alias, derived and captured cells as `&` arguments and a
-   plain argument of cell type in the same call. (B) alone does not
-   make the texts true: an argument that merely contains the cell (a
-   struct, a closure) still lets the callee write it, and closing that
-   needs a type rule (no other argument of the call has a type that can
-   reach a `Cell`) or alias analysis. Until decided, proposed case 67
-   is `accept` with the lost update.
-3. **ownership.md §5 and §8 against D2.** ownership.md §5 calls an `&`
-   parameter "a local mutable binding"; D2 made it a private cell read
-   with `@v` and never a value (syntax §3.13, §2.14). §8 cites case 11
-   for "`&` parameters are not allowed in async functions", which case
-   14 tests (case 11 tests the retain on entry that the sentence
-   before it states). Neither passage is a D5 section, so neither was
-   edited with the corrections above. Recommend: §5 says "the callee's
-   `v` is a private cell, initialised from the caller's variable and
-   read with `@v` (D2)", and §8 cites case 11 for the retain on entry
-   and case 14 for the `&` rule.
+1. **`&` forwarding at any tail call** (recommended option): rule (b) of
+   §6.10 admits a tail call whose every `&` argument forwards an `&`
+   parameter of the enclosing `defun`, at any position and to any
+   callee (§6.6, §6.10).
+2. **Two names for one cell in one call: option (A).** The
+   distinct-variables check stays on names. ownership.md §5, syntax §2
+   and syntax §3.13 now say that a cell reaching a call under another
+   name can be written through it during the call and that the later
+   write-back wins; such a call is memory-safe. Proposed case 67 is
+   `accept` with the lost update.
+3. **ownership.md §5 and §8 reworded** as recommended: §5 describes the
+   private cell read with `@v`; §8 cites case 14 for the `&` rule and
+   case 11 for the retain on entry.
+
+Nothing is open.

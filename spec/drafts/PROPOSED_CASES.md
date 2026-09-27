@@ -1058,9 +1058,9 @@ releases `V0` (1); `(add1 &v)`'s copy-in acquires `V1` (2); `add1`'s
 write-back releases `V1` (1); `add1`'s own write-back stores `V2` into
 `twice`'s cell and frees `V1`; `main`'s stores `V2` into `x` and frees
 `V0`; `(count @x)` = 2; `x`'s cell, scope-local, drops `V2` at the
-exit. Clean. The mutual-recursion shape of types §10 Open item 1
-(`even-fill` and `odd-fill` passing `&v` to each other) is accepted
-the same way, one frame per call, under the decided rule.
+exit. Clean. The mutual-recursion shape (`even-fill` and `odd-fill`
+passing `&v` to each other) is accepted and, since the owner relaxed
+types §6.10 rule (b), runs as tail calls in constant stack.
 
 ## 56-stack-eligible-object-captured-by-escaping-closure
 
@@ -1482,9 +1482,9 @@ still reading it.
 ```
 
 The header gives the verdict under the decided rules. The owner has
-not chosen between the options of types §10 Open item 2: option (B)
-would make this a `reject`, and option (A) keeps it and rewords the
-texts that say it cannot happen. Pins that the check of syntax §3.13
+chosen option (A) for two names reaching one cell (types §10): the
+check stays on names, this program is accepted, and the texts now say
+the later write-back wins. Pins that the check of syntax §3.13
 rule 1 is on names (types §6.5), that the write-backs run in parameter
 order, and that the answer depends on that order: reversed, it is 1.
 Count trace: `C` holds `V0` (1); the two copy-ins acquire (3); `(append
@@ -2126,9 +2126,9 @@ count equal to the live references naming it, and `C`, a cell, lies on
 the cycle `C → K0 → C`: `leak-cycle`, and nothing else. Interpreter and
 compiler agree step by step: nothing is scope-local, `0` is `main`'s
 value, and no parameter is involved. The call passes `c` beside `&c`,
-the shape of types §10 Open item 2; a primitive has no copy-in and no
-body, so here the call has one meaning and the verdict is the decided
-rule's, but option (B) of that item, with its type rule, would reject
+the shape the owner decided with option (A) (types §10); a primitive
+has no copy-in and no body, so here the call has one meaning and the
+verdict is the decided rule's; option (B), not chosen, would have rejected
 this program. Companions:
 
 ```lisp
