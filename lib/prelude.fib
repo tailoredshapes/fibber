@@ -4,11 +4,14 @@
 ;; and supplies the List enum and the derived Eq/Ord/Hash/Show instances
 ;; of Option and List.
 ;;
-;; Vec is a persistent vector over one (Array a) that copies the whole
-;; array on every conj: O(n) per conj, not the 32-way trie that types
-;; §2.13 names as the eventual structure. It has an empty variant
+;; Vec is the persistent vector of types §2.13: a 32-way trie of
+;; (Array a) nodes with a tail of up to 32 elements, as in Clojure. A
+;; conj copies the tail (at most 32 elements) and, every 32 elements,
+;; one path of the trie; nth walks one path. It has an empty variant
 ;; because (array n x) needs an element to fill with, so no function can
-;; make an empty (Array a) for a generic a.
+;; make an empty (Array a) for a generic a. The reference interpreter
+;; builds and reads this layout natively for Form items and concat
+;; (fibref eval/vecs.rs), so a change here must be made there too.
 
 ;; Box (syntax §4.5)
 (defstruct (Box a) (v: a))
@@ -29,7 +32,10 @@
 (defprotocol (Iter s e) (next (self) -> (Option e)))
 
 ;; Vec
-(defenum (Vec a) (VecEmpty) (VecOf items: (Array a)))
+(defenum (VNode a) (VLeaf items: (Array a)) (VBranch kids: (Array (VNode a))))
+(defenum (Vec a)
+  (VecEmpty)
+  (VecOf cnt: i64 shift: i64 root: (Option (VNode a)) tail: (Array a)))
 
 (defun vec-empty () VecEmpty)
 
@@ -39,29 +45,78 @@
     (dotimes (i n) (array-set! &c i (array-get items i)))
     @c))
 
+;; A path of branches from level down to node (level 0 is a leaf).
+(defun vnode-path (level: i64 node: (VNode a)) -> (VNode a)
+  (if (= level 0) node (VBranch (array 1 (vnode-path (- level 5) node)))))
+
+;; node, a branch at level, with the leaf whose first index is idx added.
+(defun vnode-push (level: i64 node: (VNode a) idx: i64 leaf: (VNode a)) -> (VNode a)
+  (match node
+    ((VLeaf _) (trap "vec: a leaf where a branch belongs"))
+    ((VBranch kids)
+     (let ((sub (bit-and (shr idx level) 31)))
+       (if (= level 5)
+           (VBranch (array-push kids leaf))
+           (if (< sub (array-len kids))
+               (VBranch (array-with kids sub (vnode-push (- level 5) (array-get kids sub) idx leaf)))
+               (VBranch (array-push kids (vnode-path (- level 5) leaf)))))))))
+
+(defun vnode-get (node: (VNode a) level: i64 i: i64) -> a
+  (match node
+    ((VLeaf items) (array-get items (bit-and i 31)))
+    ((VBranch kids) (vnode-get (array-get kids (bit-and (shr i level) 31)) (- level 5) i))))
+
+;; conj when the tail is full: the tail becomes a leaf of the trie.
+(defun vec-push-tail (cnt: i64 shift: i64 root: (Option (VNode a)) tail: (Array a) x: a) -> (Vec a)
+  (let ((leaf (VLeaf tail))
+        (tailoff (- cnt 32)))
+    (match root
+      (nil (VecOf (+ cnt 1) 5 (some (VBranch (array 1 leaf))) (array 1 x)))
+      ((some r)
+       (if (= (shr tailoff 5) (shl 1 shift))
+           (VecOf (+ cnt 1) (+ shift 5)
+                  (some (VBranch (array-push (array 1 r) (vnode-path shift leaf))))
+                  (array 1 x))
+           (VecOf (+ cnt 1) shift (some (vnode-push shift r tailoff leaf)) (array 1 x)))))))
+
+(defun vec-conj (v: (Vec a) x: a) -> (Vec a)
+  (match v
+    ((VecEmpty) (VecOf 1 5 nil (array 1 x)))
+    ((VecOf cnt shift root tail)
+     (if (< (array-len tail) 32)
+         (VecOf (+ cnt 1) shift root (array-push tail x))
+         (vec-push-tail cnt shift root tail x)))))
+
+(defun vec-count (v: (Vec a)) -> i64
+  (match v
+    ((VecEmpty) 0)
+    ((VecOf cnt _ _ _) cnt)))
+
+(defun vec-nth (v: (Vec a) i: i64) -> a
+  (match v
+    ((VecEmpty) (trap "nth: index out of range"))
+    ((VecOf cnt shift root tail)
+     (let ((tailoff (- cnt (array-len tail))))
+       (if (or (< i 0) (>= i cnt))
+           (trap "nth: index out of range")
+           (if (>= i tailoff)
+               (array-get tail (- i tailoff))
+               (match root
+                 (nil (trap "nth: index out of range"))
+                 ((some r) (vnode-get r shift i)))))))))
+
 (impl Countable (Vec a)
-  (count (self)
-    (match self
-      ((VecEmpty) 0)
-      ((VecOf items) (array-len items)))))
+  (count (self) (vec-count self)))
 
 (impl (Indexable a) (Vec a)
-  (nth (self i)
-    (match self
-      ((VecEmpty) (trap "nth: index out of range"))
-      ((VecOf items) (array-get items i)))))
+  (nth (self i) (vec-nth self i)))
 
 (impl (Collection a) (Vec a)
-  (conj (self x)
-    (match self
-      ((VecEmpty) (VecOf (array 1 x)))
-      ((VecOf items) (VecOf (array-push items x))))))
+  (conj (self x) (vec-conj self x)))
 
 (impl (Traversable a) (Vec a)
   (for-each (self f)
-    (match self
-      ((VecEmpty) ())
-      ((VecOf items) (dotimes (i (array-len items)) (f (array-get items i)))))))
+    (dotimes (i (vec-count self)) (f (vec-nth self i)))))
 
 ;; List (the enum is in the expander's prelude)
 (impl Countable (List a)
@@ -136,23 +191,13 @@
 (defun even? (n: i64) -> bool (= (rem n 2) 0))
 
 (defun range (n: i64) -> (Vec i64)
-  (if (<= n 0)
-      VecEmpty
-      (let ((c (cell (array n 0))))
-        (dotimes (i n) (array-set! &c i i))
-        (VecOf @c))))
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (vec-conj acc i)) acc)))
 
-(defun map (f v)
-  (match v
-    ((VecEmpty) VecEmpty)
-    ((VecOf items)
-     (let ((n (array-len items))
-           (c (cell (array n (f (array-get items 0))))))
-       (loop ((i 1))
-         (if (< i n)
-             (do (array-set! &c i (f (array-get items i)))
-                 (recur (+ i 1)))
-             (VecOf @c)))))))
+(defun map (f v: (Vec a))
+  (let ((n (vec-count v)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n) (recur (+ i 1) (vec-conj acc (f (vec-nth v i)))) acc))))
 
 ;; In-place updates through & (syntax §3.13): append is push!.
 (defun push! (&v x) (set! v (conj @v x)))

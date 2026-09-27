@@ -135,3 +135,51 @@ fn sharing_stops_at_an_immortal() {
         .expect("sharing a literal marks nothing");
     assert_eq!(heap.is_shared(s), Ok(false));
 }
+
+#[test]
+fn immortalise_marks_the_whole_counted_graph_and_stops_at_immortals() {
+    let mut heap = Heap::new();
+    let lit = heap.alloc_immortal(Kind::Immutable, vec![]).expect("lit");
+    let leaf = imm(&mut heap, vec![Value::Int(1), Value::Ref(lit)]);
+    let root = imm(&mut heap, vec![Value::Ref(leaf)]);
+    heap.release(leaf).expect("root holds leaf");
+    let before = heap.trace().len();
+    assert_eq!(heap.immortalise(root), Ok(()));
+    assert_eq!(
+        &heap.trace()[before..],
+        &[
+            Event::Immortalised { id: root },
+            Event::Immortalised { id: leaf }
+        ]
+    );
+    assert_eq!(heap.is_immortal(leaf), Ok(true));
+    assert_eq!(heap.count(root), Ok(0));
+    assert_eq!(heap.release(root), Ok(0));
+    assert!(heap.finish().is_clean());
+}
+
+#[test]
+fn immortalise_refuses_a_cell_and_marks_nothing() {
+    let mut heap = Heap::new();
+    let c = cell(&mut heap, Value::Int(0));
+    let root = imm(&mut heap, vec![Value::Ref(c)]);
+    let before = heap.trace().len();
+    assert_eq!(
+        heap.immortalise(root),
+        Err(AuditError::MutableImmortal { kind: Kind::Cell })
+    );
+    assert_eq!(heap.trace().len(), before);
+    assert_eq!(heap.is_immortal(root), Ok(false));
+}
+
+#[test]
+fn immortalise_refuses_a_weak_to_a_mortal_outside_the_graph() {
+    let mut heap = Heap::new();
+    let other = imm(&mut heap, vec![]);
+    let w = heap.weak(other).expect("weak");
+    let root = imm(&mut heap, vec![w]);
+    assert_eq!(
+        heap.immortalise(root),
+        Err(AuditError::ImmortalHoldsMortal { id: other })
+    );
+}

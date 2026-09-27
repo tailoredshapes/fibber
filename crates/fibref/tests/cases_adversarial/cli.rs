@@ -1,13 +1,14 @@
 //! The `fibref` binary: `cases <dir>` prints the table and the counts,
 //! exits 0 only when there is no Fail and no HeaderError, 1 otherwise,
-//! 2 on bad usage or an unreadable directory. The binary only has the
-//! PendingEvaluator today, so Fail cannot be forced from outside; a
-//! header-error file forces exit 1 instead.
+//! 2 on bad usage or an unreadable directory. The binary runs the
+//! reference interpreter, so cases carry programs; Pending cannot be
+//! forced from outside (the harness's Pending rows are tested with a
+//! scripted evaluator).
 
 use std::path::Path;
 use std::process::{Command, Output};
 
-use super::support::{accept_header, reject_header, TempDir};
+use super::support::{accept_case, accept_header, reject_case, TempDir};
 
 const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
@@ -32,10 +33,10 @@ fn code(output: &Output) -> i32 {
 }
 
 #[test]
-fn exit_0_when_every_case_is_pending_and_pending_is_printed_prominently() {
-    let dir = TempDir::new("cli-pending");
-    dir.write("01-a.fib", &accept_header(1));
-    dir.write("02-b.fib", &reject_header("passed twice"));
+fn exit_0_when_every_case_passes() {
+    let dir = TempDir::new("cli-pass");
+    dir.write("01-a.fib", &accept_case(1));
+    dir.write("02-b.fib", &reject_case());
     let output = fibref(&["cases", &dir.path().to_string_lossy()], dir.path());
     let out = stdout(&output);
     assert_eq!(
@@ -46,15 +47,29 @@ fn exit_0_when_every_case_is_pending_and_pending_is_printed_prominently() {
     );
     assert!(out.contains("01-a.fib"), "{out}");
     assert!(out.contains("02-b.fib"), "{out}");
-    assert!(out.contains("PENDING"), "pending must be prominent:\n{out}");
-    assert!(out.contains("2 pending"), "counts must be printed:\n{out}");
-    assert!(out.contains("0 pass"), "pending is not a pass:\n{out}");
+    assert!(!out.contains("PENDING"), "{out}");
+    assert!(out.contains("2 pass, 0 fail, 0 pending"), "counts:\n{out}");
+}
+
+#[test]
+fn exit_1_when_a_case_fails() {
+    let dir = TempDir::new("cli-fail");
+    dir.write(
+        "01-wrong.fib",
+        &format!("{}(defun main () -> i64 2)\n", accept_header(1)),
+    );
+    let output = fibref(&["cases", &dir.path().to_string_lossy()], dir.path());
+    let out = stdout(&output);
+    assert_eq!(code(&output), 1, "stdout:\n{out}");
+    assert!(out.contains("FAIL"), "{out}");
+    assert!(out.contains("result: expected 1, got 2"), "{out}");
+    assert!(out.contains("0 pass, 1 fail"), "{out}");
 }
 
 #[test]
 fn exit_1_when_a_header_error_exists() {
     let dir = TempDir::new("cli-header-error");
-    dir.write("01-a.fib", &accept_header(1));
+    dir.write("01-a.fib", &accept_case(1));
     dir.write(
         "02-bad.fib",
         ";; spec: §4\n;; expect: accept\n;; audit: clean\n",
@@ -132,7 +147,7 @@ fn help_exits_0() {
 
 #[test]
 fn default_directory_is_cases_ownership_relative_to_cwd() {
-    // Run from the repo root: the 20 real cases are found and all pending.
+    // Run from the repo root: the 20 real cases are found and all pass.
     let output = fibref(&["cases"], Path::new(REPO_ROOT));
     let out = stdout(&output);
     assert_eq!(
@@ -144,7 +159,7 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
     assert!(out.contains("01-return-part-of-argument.fib"), "{out}");
     assert!(out.contains("20-weak-ref-to-dead-object.fib"), "{out}");
     assert!(out.contains("20 cases:"), "{out}");
-    assert!(out.contains("20 pending"), "{out}");
+    assert!(out.contains("20 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 
@@ -172,7 +187,7 @@ fn empty_directory_exits_1_because_nothing_ran() {
 fn table_lists_cases_in_file_name_order() {
     let dir = TempDir::new("cli-order");
     for name in ["03-c.fib", "01-a.fib", "02-b.fib"] {
-        dir.write(name, &accept_header(1));
+        dir.write(name, &accept_case(1));
     }
     let output = fibref(&["cases", &dir.path().to_string_lossy()], dir.path());
     let out = stdout(&output);

@@ -6,7 +6,7 @@
 
 use crate::syntax::{Form, FormKind};
 
-use crate::types::ast::{Arg, BindingKind, ConvOp, Expr, ExprKind, GlobalRef, Place};
+use crate::types::ast::{Arg, BindingKind, ConvOp, Expr, ExprKind, GlobalRef, IntConv, Place};
 use crate::types::builtins::{builtin_index, BUILTINS, CONVERSIONS};
 use crate::types::error::{ErrorKind, TResult, TypeError};
 
@@ -25,10 +25,14 @@ enum Special {
 
 fn conv_op(name: &str) -> Option<ConvOp> {
     Some(match name {
-        "trunc" | "zext" | "sext" => ConvOp::IntToInt,
+        "trunc" => ConvOp::IntToInt(IntConv::Trunc),
+        "zext" => ConvOp::IntToInt(IntConv::Zext),
+        "sext" => ConvOp::IntToInt(IntConv::Sext),
         "fptrunc" | "fpext" => ConvOp::FloatToFloat,
-        "fptosi" | "fptoui" => ConvOp::FloatToInt,
-        "sitofp" | "uitofp" => ConvOp::IntToFloat,
+        "fptosi" => ConvOp::FloatToInt { signed: true },
+        "fptoui" => ConvOp::FloatToInt { signed: false },
+        "sitofp" => ConvOp::IntToFloat { signed: true },
+        "uitofp" => ConvOp::IntToFloat { signed: false },
         _ => return None,
     })
 }
@@ -223,7 +227,7 @@ impl Lowerer<'_> {
                 ))
             }
         };
-        let wants_int = matches!(op, ConvOp::IntToInt | ConvOp::FloatToInt);
+        let wants_int = matches!(op, ConvOp::IntToInt(_) | ConvOp::FloatToInt { .. });
         let ok = if wants_int {
             target.is_int()
         } else {

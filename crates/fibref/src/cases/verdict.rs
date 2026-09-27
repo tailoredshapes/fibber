@@ -10,6 +10,7 @@
 //! | reject   | Rejected, message contains the error text | Pass    |
 //! | reject   | Rejected, message lacks it                | Fail    |
 //! | reject   | Compiled                                  | Fail    |
+//! | either   | Failed (the run trapped or stopped)       | Fail    |
 //! | reject   | expected text blank (any outcome but Unsupported) | Fail |
 //! | either   | Unsupported                               | Pending |
 //!
@@ -102,6 +103,7 @@ fn judge_accept(expected: &Expected, audit: AuditExpect, outcome: &Outcome) -> S
         Outcome::Rejected { message } => {
             Status::Fail(format!("expected accept, but rejected: {message}"))
         }
+        Outcome::Failed { message } => Status::Fail(format!("the run failed: {message}")),
         Outcome::Unsupported { reason } => Status::Pending(reason.clone()),
     }
 }
@@ -122,6 +124,9 @@ fn judge_reject(expected: &str, outcome: &Outcome) -> Status {
         )),
         Outcome::Compiled { result, audit } => Status::Fail(format!(
             "expected reject with \"{expected}\", but compiled: result {result}, audit {audit}"
+        )),
+        Outcome::Failed { message } => Status::Fail(format!(
+            "expected reject with \"{expected}\", but compiled and the run failed: {message}"
         )),
         Outcome::Unsupported { reason } => Status::Pending(reason.clone()),
     }

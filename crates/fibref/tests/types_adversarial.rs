@@ -264,11 +264,12 @@ fn send_is_checked_through_a_struct_field_and_an_option() {
         "cell cannot be shared between threads",
     );
     assert_eq!(e.message, "cell cannot be shared between threads: closure capture o, payload of some, field c of S has type (Cell i64)");
-    // Through an element of a Vec (the library's Vec is over Array).
+    // Through an element of a Vec (the library's Vec is a trie over Array;
+    // the witness is the first path found, through the trie's root).
     let e = fails(
         "(defun main () -> i64 (let ((v [(cell 0)])) (do (spawn (fn () (count v))) 0)))",
         ErrorKind::CellNotSend,
-        "cell cannot be shared between threads: closure capture v, payload of VecOf, element of (Array (Cell i64)) has type (Cell i64)",
+        "cell cannot be shared between threads: closure capture v, payload 2 of VecOf, payload of some, payload of VLeaf, element of (Array (Cell i64)) has type (Cell i64)",
     );
     assert_eq!(e.pos.line, 1);
 }

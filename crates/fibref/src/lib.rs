@@ -7,6 +7,7 @@
 //! verdicts fixed in their headers by [`cases`] (rule 3).
 
 pub mod cases;
+pub mod eval;
 pub mod expand;
 pub mod heap;
 pub mod own;

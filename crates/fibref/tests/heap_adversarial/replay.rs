@@ -264,7 +264,8 @@ impl Replay {
             | Event::WriteUnique { .. }
             | Event::ScopeOpen { .. }
             | Event::ScopeEnd { .. }
-            | Event::Drop { .. }) => {
+            | Event::Drop { .. }
+            | Event::Immortalised { .. }) => {
                 return Err(format!("{other:?} is outside the counted model"));
             }
         }

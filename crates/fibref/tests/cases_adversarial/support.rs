@@ -110,3 +110,17 @@ pub fn accept_header(result: i64) -> String {
 pub fn reject_header(error: &str) -> String {
     format!(";; spec: §5\n;; expect: reject\n;; error: {error}\n")
 }
+
+/// An accept case whose program returns `result` with a clean audit.
+pub fn accept_case(result: i64) -> String {
+    format!("{}(defun main () -> i64 {result})\n", accept_header(result))
+}
+
+/// A reject case whose program the checker rejects with `unbound name
+/// nope`.
+pub fn reject_case() -> String {
+    format!(
+        "{}(defun main () -> i64 (nope))\n",
+        reject_header("unbound name nope")
+    )
+}

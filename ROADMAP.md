@@ -26,11 +26,18 @@ evaluator over the audited heap.
 - [x] reader
 - [x] macro expander (user `defmacro` waits on the evaluator)
 - [x] name resolution and type inference; `lib/prelude.fib`
-- [ ] ownership checker and `fibref explain`
-- [ ] evaluator following the checker's plan; threads, atoms, async
-      executor; user macros
-- [ ] all 20 cases pass; the proposed cases promoted (30 and 35 are
-      withdrawn: they use field places, removed by D1)
+- [x] ownership checker and `fibref explain`
+- [x] evaluator following the checker's plan; threads, atoms, async
+      executor (deterministic: each run is one valid interleaving);
+      user macros with phase separation; `fibref run`
+- [x] all 20 cases pass
+- [ ] the proposed cases promoted (68 already match their headers; 30
+      and 35 are withdrawn: they use field places, removed by D1; 55's
+      explain text predates the relaxed & forwarding)
+- [ ] known gaps: a protocol method used as a function value has no
+      all-owned body in own/ (runs stop with a plan-gap error); a spin
+      loop on an atom that another thread would set hangs under the
+      deterministic executor
 - [ ] method rule 4: an adversary attacking the running interpreter
 - [ ] method rule 5: random well-typed programs, all passing the audit
 

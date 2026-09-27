@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use super::support::{accept_header, reject_header, TempDir};
+use super::support::{accept_case, reject_case, TempDir};
 
 fn fibref(args: &[&str], cwd: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fibref"))
@@ -35,7 +35,7 @@ fn run_in(dir: &TempDir) -> Output {
 fn stdout_has_one_row_per_case_and_stderr_is_empty_on_a_normal_run() {
     let dir = TempDir::new("cli-shape");
     for i in 1..=5 {
-        dir.write(&format!("{i:02}.fib"), &accept_header(i));
+        dir.write(&format!("{i:02}.fib"), &accept_case(i));
     }
     let output = run_in(&dir);
     assert_eq!(code(&output), 0);
@@ -45,7 +45,7 @@ fn stdout_has_one_row_per_case_and_stderr_is_empty_on_a_normal_run() {
     assert_eq!(table.len(), 6, "heading + 5 rows:\n{out}");
     for (row, i) in table[1..].iter().zip(1..=5) {
         assert!(row.starts_with(&format!("{i:02}.fib")), "{row}");
-        assert!(row.contains("PENDING"), "{row}");
+        assert!(row.contains("pass"), "{row}");
     }
     assert!(out.ends_with('\n'), "output must end with a newline");
 }
@@ -53,7 +53,7 @@ fn stdout_has_one_row_per_case_and_stderr_is_empty_on_a_normal_run() {
 #[test]
 fn exit_1_when_a_case_file_is_not_valid_utf8() {
     let dir = TempDir::new("cli-utf8");
-    dir.write("01-ok.fib", &reject_header("x"));
+    dir.write("01-ok.fib", &reject_case());
     dir.write_bytes(
         "02-bin.fib",
         b";; spec: \xff\xfe\n;; expect: reject\n;; error: x\n",
@@ -68,7 +68,7 @@ fn exit_1_when_a_case_file_is_not_valid_utf8() {
     );
     assert!(out.contains("02-bin.fib"), "{out}");
     assert!(out.contains("1 header error"), "{out}");
-    assert!(out.contains("1 pending"), "{out}");
+    assert!(out.contains("1 pass"), "{out}");
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn help_with_extra_arguments_is_a_usage_error() {
 #[test]
 fn a_relative_directory_is_resolved_against_the_working_directory() {
     let dir = TempDir::new("cli-relative");
-    dir.write("sub/01.fib", &accept_header(1));
+    dir.write("sub/01.fib", &accept_case(1));
     let output = fibref(&["cases", "sub"], dir.path());
     let out = stdout(&output);
     assert_eq!(code(&output), 0, "{out}\n{}", stderr(&output));
@@ -140,16 +140,19 @@ fn pending_line_is_absent_when_nothing_is_pending() {
 }
 
 #[test]
-fn the_real_cases_print_twenty_pending_rows_and_a_pending_line() {
+fn the_real_cases_print_twenty_pass_rows_and_no_pending_line() {
     let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
     let output = fibref(&["cases", "cases/ownership"], root);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let out = stdout(&output);
-    let pending_rows = out
+    let pass_rows = out
         .lines()
-        .filter(|l| l.contains("PENDING") && l.ends_with("no interpreter yet"))
+        .filter(|l| l.trim_end().ends_with(" pass"))
         .count();
-    assert_eq!(pending_rows, 20, "{out}");
-    assert!(out.contains("PENDING: 20 of 20"), "{out}");
-    assert!(out.contains("0 pass"), "{out}");
+    assert_eq!(pass_rows, 20, "{out}");
+    assert!(!out.contains("PENDING"), "{out}");
+    assert!(
+        out.contains("20 cases: 20 pass, 0 fail, 0 pending, 0 header error"),
+        "{out}"
+    );
 }

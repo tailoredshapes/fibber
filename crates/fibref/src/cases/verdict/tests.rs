@@ -253,3 +253,15 @@ fn reject_mismatch_shows_both_strings_verbatim() {
     let status = judge(&reject(expected), &compiled(3, AuditSummary::clean()));
     fail_containing(status, &[expected, "result 3"]);
 }
+
+#[test]
+fn a_failed_run_fails_either_verdict() {
+    let failed = Outcome::Failed {
+        message: "1:1: trap: boom".to_string(),
+    };
+    assert!(matches!(
+        judge(&accept(1, AuditExpect::Clean), &failed),
+        Status::Fail(_)
+    ));
+    assert!(matches!(judge(&reject("boom"), &failed), Status::Fail(_)));
+}

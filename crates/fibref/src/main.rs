@@ -10,7 +10,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use fibref::cases::{render, run_dir, PendingEvaluator};
+use fibref::cases::{render, run_dir, Outcome};
+use fibref::eval::{run_source, Interpreter};
 
 const USAGE: &str = "usage: fibref <command>
 
@@ -18,6 +19,8 @@ commands:
   cases [dir]     run every case in dir (default cases/ownership) against
                   the verdict in its header
   explain <file>  print the ownership checker's decisions for file (types §9)
+  run <file>      run file's main with the reference interpreter and print
+                  its result and the memory audit (exit 1 if rejected or failed)
   help            print this message";
 
 /// The directory `cases` runs when none is given.
@@ -30,6 +33,8 @@ enum Command {
     Cases { dir: String },
     /// Print the ownership decisions for a file.
     Explain { file: String },
+    /// Run a file's `main`.
+    Run { file: String },
     /// Print usage and exit successfully.
     Help,
     /// Print usage and exit with an error: the arguments made no sense.
@@ -44,6 +49,7 @@ fn parse(args: &[String]) -> Command {
         },
         [cmd, dir] if cmd == "cases" => Command::Cases { dir: dir.clone() },
         [cmd, file] if cmd == "explain" => Command::Explain { file: file.clone() },
+        [cmd, file] if cmd == "run" => Command::Run { file: file.clone() },
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
         _ => Command::Invalid,
     }
@@ -51,7 +57,7 @@ fn parse(args: &[String]) -> Command {
 
 /// Runs the cases in `dir` through the current evaluator and prints the report.
 fn run_cases(dir: &str) -> ExitCode {
-    let report = match run_dir(Path::new(dir), &PendingEvaluator) {
+    let report = match run_dir(Path::new(dir), &Interpreter) {
         Ok(report) => report,
         Err(e) => {
             eprintln!("fibref: cannot read cases in {dir}: {e}");
@@ -101,6 +107,32 @@ fn run_explain(file: &str) -> ExitCode {
     }
 }
 
+/// Runs `file` through the whole pipeline and prints `main`'s result and
+/// the audit: exit 0 if it ran (whatever the audit says, which is
+/// printed), 1 if it was rejected or its run failed, 2 if unreadable.
+fn run_file(file: &str) -> ExitCode {
+    let source = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fibref: cannot read {file}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (text, code) = match run_source(&source, file) {
+        Outcome::Compiled { result, audit } => (
+            format!("result: {result}\naudit:  {audit}\n"),
+            ExitCode::SUCCESS,
+        ),
+        Outcome::Rejected { message } => (format!("rejected:\n{message}\n"), ExitCode::from(1)),
+        Outcome::Failed { message } => (format!("failed:\n{message}\n"), ExitCode::from(1)),
+        Outcome::Unsupported { reason } => (format!("unsupported: {reason}\n"), ExitCode::from(1)),
+    };
+    match write_stdout(&text) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => ExitCode::from(2),
+        _ => code,
+    }
+}
+
 /// Writes `text` to stdout and returns the error instead of panicking
 /// the way `print!` does on a closed pipe.
 fn write_stdout(text: &str) -> io::Result<()> {
@@ -114,6 +146,7 @@ fn main() -> ExitCode {
     match parse(&args) {
         Command::Cases { dir } => run_cases(&dir),
         Command::Explain { file } => run_explain(&file),
+        Command::Run { file } => run_file(&file),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -167,6 +200,17 @@ mod tests {
             }
         );
         assert_eq!(parse(&args(&["explain"])), Command::Invalid);
+    }
+
+    #[test]
+    fn run_takes_one_file() {
+        assert_eq!(
+            parse(&args(&["run", "a.fib"])),
+            Command::Run {
+                file: "a.fib".to_string()
+            }
+        );
+        assert_eq!(parse(&args(&["run"])), Command::Invalid);
     }
 
     #[test]

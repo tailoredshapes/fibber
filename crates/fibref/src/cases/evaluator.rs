@@ -1,10 +1,11 @@
 //! What the harness runs a case through, and what comes back.
 //!
-//! The reference interpreter implements [`Evaluator`]; later the
-//! compiler does too, so that both are checked against the same cases
-//! (`spec/method.md`, rule 6). Until an interpreter exists,
+//! The reference interpreter implements [`Evaluator`]
+//! (`crate::eval::Interpreter`); later the compiler does too, so that
+//! both are checked against the same cases (`spec/method.md`, rule 6).
 //! [`PendingEvaluator`] answers [`Outcome::Unsupported`] for everything,
-//! which the harness reports as Pending, never as a pass.
+//! which the harness reports as Pending, never as a pass; the harness's
+//! own tests use it.
 
 use std::fmt;
 
@@ -72,6 +73,10 @@ pub enum Outcome {
     Compiled { result: Value, audit: AuditSummary },
     /// The program was refused with a compile error.
     Rejected { message: String },
+    /// The program compiled but its run failed: a `trap`, a memory-audit
+    /// error that stopped the run, or an interpreter limit. Never a
+    /// pass, whatever the header says.
+    Failed { message: String },
     /// The evaluator cannot decide this program yet. Reported as Pending.
     Unsupported { reason: String },
 }

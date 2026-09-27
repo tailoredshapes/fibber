@@ -37,6 +37,23 @@ pub enum ExpandErrorKind {
         /// The macro.
         name: String,
     },
+    /// Phase separation (§3.16): the macro's body calls `fun`, a
+    /// function of the module being expanded, which does not exist at
+    /// expansion time.
+    MacroPhase {
+        /// The macro.
+        name: String,
+        /// The function of the module it calls.
+        fun: String,
+    },
+    /// Running the macro's body failed: its macro-time module did not
+    /// check, it trapped, or the memory audit of its run failed.
+    MacroFailed {
+        /// The macro.
+        name: String,
+        /// What went wrong.
+        message: String,
+    },
     /// A macro (user or prelude) called with a number of arguments its
     /// parameters do not admit (§3.16, §4.4).
     MacroArity {
@@ -148,6 +165,11 @@ impl fmt::Display for ExpandErrorKind {
             K::MacroNeedsEvaluator { name } => {
                 write!(f, "macro {name} needs the evaluator to expand (pending)")
             }
+            K::MacroPhase { name, fun } => write!(
+                f,
+                "macro {name} calls {fun}, which is not available at expansion time; move {fun} to a required module"
+            ),
+            K::MacroFailed { name, message } => write!(f, "macro {name} failed: {message}"),
             K::MacroArity {
                 name,
                 expected,

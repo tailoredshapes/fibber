@@ -57,6 +57,10 @@ pub enum Event {
     /// A `STACK` object's drop ran at its scope's end: the releases of
     /// the counted references it held follow, in field order.
     Drop { id: ObjId },
+    /// A counted object became `IMMORTAL` (`fib.immortalise`, §8.2: a
+    /// `def` value and everything reachable from it). Its count is 0
+    /// from now on and it is never freed.
+    Immortalised { id: ObjId },
 }
 
 impl Event {
@@ -76,7 +80,8 @@ impl Event {
             | Event::AllocImmortal { id, .. }
             | Event::AllocStack { id, .. }
             | Event::WriteUnique { id, .. }
-            | Event::Drop { id } => id,
+            | Event::Drop { id }
+            | Event::Immortalised { id } => id,
             Event::ScopeOpen { .. } | Event::ScopeEnd { .. } => return None,
         };
         Some(id)

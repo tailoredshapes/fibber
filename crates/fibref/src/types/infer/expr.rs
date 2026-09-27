@@ -299,7 +299,7 @@ impl Cx<'_> {
     fn convert(&mut self, op: ConvOp, target: Scalar, x: &Expr) -> TResult<Ty> {
         let t = self.infer(x)?;
         match op {
-            ConvOp::IntToInt | ConvOp::IntToFloat => {
+            ConvOp::IntToInt(_) | ConvOp::IntToFloat { .. } => {
                 let Some(bits) = self
                     .g
                     .proto_name(crate::types::decls::ModuleId::Builtin, "Bits")
@@ -308,7 +308,9 @@ impl Cx<'_> {
                 };
                 self.defer(DKind::Proto(bits, vec![t], None), &x.pos, None);
             }
-            ConvOp::FloatToFloat | ConvOp::FloatToInt => self.defer(DKind::Float(t), &x.pos, None),
+            ConvOp::FloatToFloat | ConvOp::FloatToInt { .. } => {
+                self.defer(DKind::Float(t), &x.pos, None)
+            }
         }
         Ok(Ty::scalar(target))
     }

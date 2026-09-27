@@ -147,17 +147,37 @@ pub struct FnLit {
     pub captures: Vec<BindingId>,
 }
 
-/// A conversion primitive (§2.12).
+/// A conversion primitive (§2.12). The groups are what typing needs;
+/// the payloads say which primitive of the group was written, which is
+/// what evaluating it needs (`zext` and `sext` differ on a negative
+/// operand).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConvOp {
     /// `trunc`, `zext`, `sext`: integer to integer.
-    IntToInt,
+    IntToInt(IntConv),
     /// `fptrunc`, `fpext`: float to float.
     FloatToFloat,
-    /// `fptosi`, `fptoui`: float to integer.
-    FloatToInt,
-    /// `sitofp`, `uitofp`: integer to float.
-    IntToFloat,
+    /// `fptosi` (`signed`), `fptoui`: float to integer.
+    FloatToInt {
+        /// `fptosi`.
+        signed: bool,
+    },
+    /// `sitofp` (`signed`), `uitofp`: integer to float.
+    IntToFloat {
+        /// `sitofp`.
+        signed: bool,
+    },
+}
+
+/// Which integer-to-integer conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntConv {
+    /// `trunc`.
+    Trunc,
+    /// `zext`: the operand read as unsigned.
+    Zext,
+    /// `sext`: the operand read as signed.
+    Sext,
 }
 
 /// The kinds of expression.

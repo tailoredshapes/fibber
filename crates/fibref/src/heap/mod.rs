@@ -29,7 +29,8 @@
 //!
 //! Files: `value` (ids, values, kinds), `event` (the trace), `error`
 //! (audit errors), `object` (one object and its flags), this file
-//! (alloc, retain, release), `store` (what may be stored where),
+//! (alloc, retain, release), `immortalise` (a `def` value made static
+//! data, §8.2), `store` (what may be stored where),
 //! `cascade` (the planned release cascade), `access` (read, write, weak,
 //! upgrade, inspection), `unique` (write-unique), `scope` (stack
 //! scopes), `shared` (thread crossing), `audit` (leak classification),
@@ -42,6 +43,7 @@ mod cascade;
 mod error;
 mod event;
 mod graph;
+mod immortalise;
 mod object;
 mod scc;
 mod scope;

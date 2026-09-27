@@ -1,0 +1,81 @@
+//! Scalars, strings, `Option`, enums, conversions, dispatch.
+
+use super::{clean, failed};
+
+#[test]
+fn arithmetic_wraps_at_the_width_and_division_by_zero_traps() {
+    clean("(defun main () -> i64 (sext i64 (+ 127i8 1i8)))", -128);
+    let msg = failed("(defun main () -> i64 (/ 1 (- 1 1)))");
+    assert!(msg.contains("trap: integer / by zero"), "{msg}");
+}
+
+#[test]
+fn zext_and_sext_keep_their_meaning_through_the_pipeline() {
+    clean("(defun main () -> i64 (zext i64 (trunc i8 255)))", 255);
+    clean("(defun main () -> i64 (sext i64 (trunc i8 255)))", -1);
+}
+
+#[test]
+fn strings_are_bytes() {
+    clean(
+        "(defun main () -> i64 (str-len (str-concat \"ab\" (str-slice \"xyz\" 1 3))))",
+        4,
+    );
+    clean(
+        "(defun main () -> i64 (if (starts-with? \"hello\" \"he\") 1 0))",
+        1,
+    );
+}
+
+#[test]
+fn option_carries_real_tags_even_around_nil() {
+    clean(
+        "(defun main () -> i64 (match (some nil) ((some _) 1) (nil 0)))",
+        1,
+    );
+    clean("(defun main () -> i64 (if (= (some 1) (some 1)) 1 0))", 1);
+}
+
+#[test]
+fn a_fieldless_enum_compares_by_declaration_order() {
+    clean(
+        "(defenum C Red Green) (defun main () -> i64 (if (< Red Green) 1 0))",
+        1,
+    );
+}
+
+#[test]
+fn show_and_hash_are_built_in_for_scalars() {
+    clean("(defun main () -> i64 (str-len (show 12345)))", 5);
+    clean(
+        "(defun main () -> i64 (if (= (hash \"a\") (hash \"a\")) 1 0))",
+        1,
+    );
+}
+
+#[test]
+fn a_generic_function_dispatches_on_the_receiver_at_run_time() {
+    clean(
+        "(defun describe (x) (str-len (show x)))
+         (defun main () -> i64 (+ (describe 7) (describe true)))",
+        5,
+    );
+}
+
+#[test]
+fn a_def_is_evaluated_once_before_main() {
+    clean(
+        "(def table [1 2 3]) (defun main () -> i64 (+ (count table) (nth table 2)))",
+        6,
+    );
+}
+
+#[test]
+fn a_vector_past_one_trie_level_reads_back_in_order() {
+    clean(
+        "(defun main () -> i64
+           (let ((v (range 2000)))
+             (+ (nth v 0) (+ (nth v 1023) (+ (nth v 1024) (nth v 1999))))))",
+        1023 + 1024 + 1999,
+    );
+}

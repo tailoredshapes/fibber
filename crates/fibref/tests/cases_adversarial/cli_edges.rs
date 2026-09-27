@@ -8,7 +8,7 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use super::support::{accept_header, reject_header, TempDir};
+use super::support::{accept_case, reject_case, TempDir};
 
 fn fibref(args: &[&str], cwd: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fibref"))
@@ -32,10 +32,15 @@ fn code(output: &Output) -> i32 {
 
 /// Enough cases that the table is larger than a pipe buffer (64 KiB on
 /// Linux), so the binary must block on stdout and see the reader gone.
+/// Each has a bad header, so the binary reports it without running a
+/// program (running 4000 would make the test slow, not stronger).
 fn big_dir() -> TempDir {
     let dir = TempDir::new("cli-big");
     for i in 0..4000 {
-        dir.write(&format!("{i:04}-case.fib"), &reject_header("x"));
+        dir.write(
+            &format!("{i:04}-case.fib"),
+            ";; spec: §5\n;; expect: maybe\n",
+        );
     }
     dir
 }
@@ -45,7 +50,7 @@ fn a_closed_stdout_does_not_panic_the_binary() {
     // `fibref cases | head -1` closes stdout early. A Rust `print!` to
     // a closed pipe panics with "failed printing to stdout" and exits
     // 101, which CI reads as a crash. The exit code must come from the
-    // report (0 here: every case is pending), or at worst from a clean
+    // report (1 here: every header is bad), or at worst from a clean
     // broken-pipe exit; never from a panic.
     let dir = big_dir();
     let mut child = Command::new(env!("CARGO_BIN_EXE_fibref"))
@@ -77,13 +82,13 @@ fn a_large_report_is_printed_completely_when_stdout_is_read() {
     let dir = big_dir();
     let output = fibref(&["cases", &dir.path().to_string_lossy()], dir.path());
     let out = stdout(&output);
-    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
     assert!(
-        out.contains("4000 cases: 0 pass, 0 fail, 4000 pending"),
+        out.contains("4000 cases: 0 pass, 0 fail, 0 pending, 4000 header error"),
         "{}",
         &out[out.len().saturating_sub(200)..]
     );
-    assert_eq!(out.matches("PENDING  no interpreter yet").count(), 4000);
+    assert_eq!(out.matches("HEADER  line 2:").count(), 4000);
 }
 
 #[test]
@@ -121,7 +126,7 @@ fn a_usage_error_puts_nothing_on_stdout() {
 #[test]
 fn a_directory_reached_through_a_symlink_runs() {
     let dir = TempDir::new("cli-symlink-dir");
-    dir.write("real/01.fib", &reject_header("x"));
+    dir.write("real/01.fib", &reject_case());
     symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
     let output = fibref(&["cases", "link"], dir.path());
     assert_eq!(code(&output), 0, "{}", stderr(&output));
@@ -133,7 +138,7 @@ fn a_broken_case_link_is_a_header_error_row_and_exit_1() {
     // Same interpretation as the runner test: an entry named like a
     // case that cannot be read is reported, not dropped, so CI sees it.
     let dir = TempDir::new("cli-dangling");
-    dir.write("01-ok.fib", &reject_header("x"));
+    dir.write("01-ok.fib", &reject_case());
     symlink(
         dir.path().join("nowhere.fib"),
         dir.path().join("02-gone.fib"),
@@ -150,14 +155,17 @@ fn a_broken_case_link_is_a_header_error_row_and_exit_1() {
 #[test]
 fn stdout_ends_with_the_counts_or_the_pending_line() {
     let dir = TempDir::new("cli-tail");
-    dir.write("01.fib", &accept_header(1));
+    dir.write("01.fib", &accept_case(1));
     let output = fibref(&["cases", "."], dir.path());
     let out = stdout(&output);
     assert_eq!(code(&output), 0);
     let last = out.lines().last().unwrap_or("");
-    assert!(last.starts_with("PENDING:"), "{out}");
+    assert_eq!(
+        last, "1 cases: 1 pass, 0 fail, 0 pending, 0 header error",
+        "{out}"
+    );
     assert!(
-        out.contains("\n1 cases: 0 pass, 0 fail, 1 pending, 0 header error\n"),
+        out.contains("\n1 cases: 1 pass, 0 fail, 0 pending, 0 header error\n"),
         "{out}"
     );
 }
@@ -165,7 +173,7 @@ fn stdout_ends_with_the_counts_or_the_pending_line() {
 #[test]
 fn the_dot_directory_and_its_absolute_path_give_the_same_table() {
     let dir = TempDir::new("cli-dot-vs-abs");
-    dir.write("01.fib", &reject_header("x"));
+    dir.write("01.fib", &reject_case());
     dir.write("02.fib", "no header\n");
     let relative = fibref(&["cases", "."], dir.path());
     let absolute = fibref(&["cases", &dir.path().to_string_lossy()], dir.path());
