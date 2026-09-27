@@ -1,0 +1,215 @@
+//! `(derive P Name)` for `P` one of `Eq`, `Ord`, `Hash`, `Show` (§3.16,
+//! §4.4), over the structs and enums the context has seen.
+//!
+//! The head is `Name` applied to its parameters (bare when it has none);
+//! `:where` lists `(P t)` for each parameter some field type mentions,
+//! with `(Eq t)` after each `(Ord t)` for `Ord`, and is omitted when
+//! empty. The method bodies are built here with the call's position.
+//!
+//! Where §3.16 fixes the shape (the `Eq` examples for `Pair` and
+//! `Shape`, the `Ord` rule, "combines the variant's index with the
+//! hashes of its fields", "the variant name followed by the shown
+//! fields, as a call form") the builders follow it; the concrete
+//! choices it leaves open are:
+//!
+//! - `Ord`: `<` is the lexicographic comparison; `(<= a b)` is `(not (<
+//!   b a))`, `(> a b)` is `(< b a)`, `(>= a b)` is `(not (< a b))`, so the
+//!   instance needs no `Eq` instance of `Name` itself;
+//! - `Hash`: `h := seed; h := (+ (* h 31) (hash field))` for each field
+//!   in order, the seed being the variant index for an enum and `0` for
+//!   a struct (a struct is its one variant);
+//! - `Show`: `"(Name f1 f2)"` built with `str-concat` from `(show f)`;
+//!   a field-less variant shows as its bare name, as it is written in
+//!   an expression (§3.9).
+
+mod enums;
+mod structs;
+
+use crate::syntax::{Form, Pos};
+
+use super::build::{boolean, call, check_arity, int, keyword, list, string, sym};
+use super::ctx::ExpandCtx;
+use super::error::{ExpandError, ExpandErrorKind};
+use super::types::mentions;
+
+/// A derivable protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Proto {
+    Eq,
+    Ord,
+    Hash,
+    Show,
+}
+
+impl Proto {
+    fn parse(name: &str) -> Option<Proto> {
+        match name {
+            "Eq" => Some(Proto::Eq),
+            "Ord" => Some(Proto::Ord),
+            "Hash" => Some(Proto::Hash),
+            "Show" => Some(Proto::Show),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Proto::Eq => "Eq",
+            Proto::Ord => "Ord",
+            Proto::Hash => "Hash",
+            Proto::Show => "Show",
+        }
+    }
+}
+
+/// Expands `(derive P Name)`.
+pub(crate) fn derive(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
+    check_arity("derive", &items, 2, Some(2), pos)?;
+    let pname = items[1].as_sym().unwrap_or("");
+    let Some(proto) = Proto::parse(pname) else {
+        let name = items[1].to_string();
+        return Err(ExpandError::new(
+            ExpandErrorKind::DeriveProtocol { name },
+            &items[1].pos,
+        ));
+    };
+    let target = items[2].as_sym().unwrap_or("");
+    if let Some(info) = ctx.struct_info(target) {
+        return Ok(structs::derive(proto, info, pos));
+    }
+    if let Some(info) = ctx.enum_info(target) {
+        if info.variants.iter().all(|v| v.fields.is_empty()) {
+            return Ok(call("do", Vec::new(), pos));
+        }
+        return Ok(enums::derive(ctx, proto, info, pos));
+    }
+    let name = items[2].to_string();
+    Err(ExpandError::new(
+        ExpandErrorKind::DeriveTarget { name },
+        &items[2].pos,
+    ))
+}
+
+/// `(impl P head :where (...) methods...)`.
+fn impl_form(
+    proto: Proto,
+    name: &str,
+    params: &[Form],
+    types: &[&Form],
+    methods: Vec<Form>,
+    pos: &Pos,
+) -> Form {
+    let mut out = vec![sym("impl", pos), sym(proto.name(), pos)];
+    let param_names: Vec<&str> = params.iter().filter_map(Form::as_sym).collect();
+    if param_names.is_empty() {
+        out.push(sym(name, pos));
+    } else {
+        let mut head = vec![sym(name, pos)];
+        head.extend(param_names.iter().map(|p| sym(p, pos)));
+        out.push(list(head, pos));
+    }
+    let mut context = Vec::new();
+    for p in param_names {
+        if types.iter().any(|t| mentions(t, p)) {
+            context.push(call(proto.name(), vec![sym(p, pos)], pos));
+            if proto == Proto::Ord {
+                context.push(call("Eq", vec![sym(p, pos)], pos));
+            }
+        }
+    }
+    if !context.is_empty() {
+        out.push(keyword("where", pos));
+        out.push(list(context, pos));
+    }
+    out.extend(methods);
+    list(out, pos)
+}
+
+/// `(name (params...) body)`.
+fn method(name: &str, params: &[&str], body: Form, pos: &Pos) -> Form {
+    let params = params.iter().map(|p| sym(p, pos)).collect();
+    list(vec![sym(name, pos), list(params, pos), body], pos)
+}
+
+/// `!=` from `=`.
+fn not_equal(pos: &Pos) -> Form {
+    let eq = call("=", vec![sym("self", pos), sym("y", pos)], pos);
+    method("!=", &["self", "y"], call("not", vec![eq], pos), pos)
+}
+
+/// `<=`, `>`, `>=` from `<`.
+fn ord_rest(pos: &Pos) -> Vec<Form> {
+    let less = |a: &str, b: &str| call("<", vec![sym(a, pos), sym(b, pos)], pos);
+    let not = |f: Form| call("not", vec![f], pos);
+    vec![
+        method("<=", &["self", "y"], not(less("y", "self")), pos),
+        method(">", &["self", "y"], less("y", "self"), pos),
+        method(">=", &["self", "y"], not(less("self", "y")), pos),
+    ]
+}
+
+/// The pairs compared with `=` and `and`ed: `true` for none, the one
+/// comparison for one (as §3.16's `(= r r2)`).
+fn eq_all(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
+    let mut tests: Vec<Form> = pairs
+        .into_iter()
+        .map(|(a, b)| call("=", vec![a, b], pos))
+        .collect();
+    match tests.len() {
+        0 => boolean(true, pos),
+        1 => tests.pop().unwrap_or_else(|| boolean(true, pos)),
+        _ => call("and", tests, pos),
+    }
+}
+
+/// Lexicographic `<` over the pairs: `(or (< a1 b1) (and (= a1 b1) ...))`,
+/// the last pair just `(< an bn)`, `false` for none.
+fn lex_less(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
+    let mut acc: Option<Form> = None;
+    for (a, b) in pairs.into_iter().rev() {
+        let less = call("<", vec![a.clone(), b.clone()], pos);
+        acc = Some(match acc {
+            None => less,
+            Some(rest) => {
+                let same = call("and", vec![call("=", vec![a, b], pos), rest], pos);
+                call("or", vec![less, same], pos)
+            }
+        });
+    }
+    acc.unwrap_or_else(|| boolean(false, pos))
+}
+
+/// `h := seed; h := (+ (* h 31) (hash f))` for each field.
+fn combine(seed: i64, fields: Vec<Form>, pos: &Pos) -> Form {
+    let mut acc = int(seed, pos);
+    for f in fields {
+        let scaled = call("*", vec![acc, int(31, pos)], pos);
+        acc = call("+", vec![scaled, call("hash", vec![f], pos)], pos);
+    }
+    acc
+}
+
+/// `"(Name " (show f1) " " (show f2) ")"` joined with `str-concat`, or
+/// `"Name"` for no fields.
+fn show_call(name: &str, fields: Vec<Form>, pos: &Pos) -> Form {
+    if fields.is_empty() {
+        return string(name, pos);
+    }
+    let mut pieces = Vec::new();
+    for (i, f) in fields.into_iter().enumerate() {
+        let text = if i == 0 {
+            format!("({name} ")
+        } else {
+            " ".to_string()
+        };
+        pieces.push(string(&text, pos));
+        pieces.push(call("show", vec![f], pos));
+    }
+    pieces.push(string(")", pos));
+    let mut it = pieces.into_iter().rev();
+    let mut acc = it.next().unwrap_or_else(|| string("", pos));
+    for p in it {
+        acc = call("str-concat", vec![p, acc], pos);
+    }
+    acc
+}
