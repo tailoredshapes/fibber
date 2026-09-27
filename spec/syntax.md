@@ -1168,9 +1168,10 @@ of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
 | `if-let`, `when-let`, `nil?`-free option tests | `match`: `(if-let (x e) a b)` ⟹ `(match e ((some x) a) (nil b))` |
 | `list` | `(list a b)` ⟹ `(cons a (cons b empty))` (`empty` is `List`'s field-less variant, used bare: §3.9) |
 | `plet` | §3.12 |
-| `while`, `dotimes`, `for-each` over a `range` | `loop`/`recur` (§3.18): `(while c body)` ⟹ `(loop () (if c (do body (recur)) ()))`; `(dotimes (i n) body)` ⟹ `(loop ((i 0) (m n)) (if (< i m) (do body (recur (+ i 1) m)) ()))` with `m` a gensym; `(for-each (range a b) (fn (i) body))`, with a literal `(range ..)` and a literal `fn`, ⟹ `(loop ((i a) (m b)) (if (< i m) (do body (recur (+ i 1) m)) ()))`, the body spliced in with no closure; any other `for-each` is the library function (§4.5) |
+| `while`, `dotimes`, `for-each` over a `range` | `loop`/`recur` (§3.18): `(while c body)` ⟹ `(loop () (if c (do body (recur)) ()))`; `(dotimes (i n) body)` ⟹ `(let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))` with `m` a gensym; `(for-each (range a b) (fn (i) body))`, with a literal `(range ..)` and a literal `fn`, ⟹ `(let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))` with `s` and `m` gensyms, the body spliced in with no closure. The bounds are evaluated once, left to right, before the loop variable exists, so a bound that mentions a variable named like `i` sees the outer one (**Decided**, owner, 2026-09-27; the earlier `(loop ((i 0) (m n)) ..)` bound `n` inside the loop's own `i`); any other `for-each` is the library function (§4.5) |
 | `->`, `->>`, `doto` | call rewriting |
-| `assert`, `dbg` | `if` and `trap` |
+| `assert` | `(assert c)` / `(assert c msg)` ⟹ `(if c () (trap msg))`, the default message naming the position and the test |
+| `dbg` | `(dbg e)` ⟹ `(let ((t e)) (eprintln (str-concat "dbg FILE:LINE:COL: E = " (show t))) t)` with `t` a gensym and the literal text naming the call's position and `e` as written: evaluates `e` once, prints it with `Show` to stderr, returns it (**Decided**, owner, 2026-09-27) |
 | `derive` | `(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`: one `impl` whose head comes from `struct-params` or `enum-params`, whose `:where` lists `(P t)` for each parameter used by a field (`struct-field-types`, `enum-variants`; `(Eq t)` as well for `Ord`) and whose methods go field by field over `struct-fields` for a struct, or variant by variant over `enum-variants` for an enum, with a nested `match` on both operands (§3.16); `(do)` for a field-less enum, whose instances are built in; several protocols are several `derive` forms, which a macro may return in one top-level `do`. The prelude itself contains `(derive Eq Option)`, `(derive Ord Option)`, `(derive Hash Option)`, `(derive Show Option)` and the same four for `List` |
 
 ### 4.5 Library (written in fibber, in `lib/`)
@@ -1185,7 +1186,7 @@ protocols `Seq Countable Indexable Collection Associative Traversable
 Iter Hash Show` with `first rest count nth conj for-each map filter
 reduce iter next collect filter-iter`; `range`, `pmap`, `append` (=
 `push!`), `even?`, `length` (string length), `starts-with?`, `box`/`unbox`
-over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O.
+over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O (including `(eprintln s: str) -> unit`, which writes `s` and a newline to standard error; `dbg` uses it).
 
 `for-each`, `map`, `filter`, `reduce`, `swap!` take their function
 parameter `:borrow`; `pmap`'s function parameter escapes (its body

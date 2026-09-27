@@ -88,7 +88,7 @@ fn prelude_gensyms_do_not_capture_user_names() {
     assert_eq!(
         out,
         "(defun f (m doto) \
-         (loop ((i 0) (#m.1 m)) (if (< i #m.1) (do (g m doto) (recur (+ i 1) #m.1)) ())) \
+         (let ((#m.1 m)) (loop ((i 0)) (if (< i #m.1) (do (g m doto) (recur (+ i 1))) ()))) \
          (let ((#doto.2 m)) (h #doto.2 doto) #doto.2) \
          (let ((#a.3 (spawn (fn () m)))) (let ((a (join #a.3))) a)))"
     );
@@ -292,8 +292,8 @@ fn loop_bodies_with_recur_looking_user_symbols() {
     assert_eq!(
         out.ok(),
         Some(
-            "(loop ((i 0) (#m.1 n)) (if (< i #m.1) (do (recur-count i) \
-             (let ((recur 1) (m 2)) (+ recur m)) (recur (+ i 1) #m.1)) ()))"
+            "(let ((#m.1 n)) (loop ((i 0)) (if (< i #m.1) (do (recur-count i) \
+             (let ((recur 1) (m 2)) (+ recur m)) (recur (+ i 1))) ())))"
                 .into()
         )
     );
@@ -308,7 +308,11 @@ fn loop_bodies_with_recur_looking_user_symbols() {
     let out = expr("(for-each (range 0 k) (fn (recur) (f recur)))");
     assert_eq!(
         out.ok(),
-        Some("(loop ((recur 0) (#m.1 k)) (if (< recur #m.1) (do (f recur) (recur (+ recur 1) #m.1)) ()))".into())
+        Some(
+            "(let ((#s.1 0) (#m.2 k)) (loop ((recur #s.1)) \
+             (if (< recur #m.2) (do (f recur) (recur (+ recur 1))) ())))"
+                .into()
+        )
     );
 }
 
@@ -403,23 +407,28 @@ fn proposed_case_51_and_its_companions() {
 }
 
 #[test]
-fn the_table_expansions_bind_the_loop_variable_before_the_bound() {
-    // §4.4 gives `(loop ((i 0) (m n)) ..)`: `loop` binds like a
-    // sequential `let` (§3.18), so an `n` that mentions a variable
-    // named like the loop variable sees the loop's `i`, not the outer
-    // one. The expander follows the table exactly; this pins it.
+fn loop_bounds_are_evaluated_before_the_loop_variable_exists() {
+    // §4.4 (owner decision): the bound is bound to a gensym by a `let`
+    // outside the loop, so a bound that mentions a variable named like
+    // the loop variable sees the outer one. The earlier table put the
+    // bound inside the loop's own sequential bindings, where `(dotimes
+    // (i i) ..)` inside `(let ((i 5)) ..)` ran zero times.
     let out = expr("(let ((i 5)) (dotimes (i i) (f i)))");
     assert_eq!(
         out.ok(),
         Some(
-            "(let ((i 5)) (loop ((i 0) (#m.1 i)) \
-             (if (< i #m.1) (do (f i) (recur (+ i 1) #m.1)) ())))"
+            "(let ((i 5)) (let ((#m.1 i)) (loop ((i 0)) \
+             (if (< i #m.1) (do (f i) (recur (+ i 1))) ()))))"
                 .into()
         )
     );
     let out = expr("(for-each (range 0 i) (fn (i) (f i)))");
     assert_eq!(
         out.ok(),
-        Some("(loop ((i 0) (#m.1 i)) (if (< i #m.1) (do (f i) (recur (+ i 1) #m.1)) ()))".into())
+        Some(
+            "(let ((#s.1 0) (#m.2 i)) (loop ((i #s.1)) \
+             (if (< i #m.2) (do (f i) (recur (+ i 1))) ())))"
+                .into()
+        )
     );
 }

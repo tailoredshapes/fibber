@@ -94,9 +94,9 @@ pub(super) fn doto(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form,
 }
 
 /// `(assert c)` / `(assert c msg)` ⟹ `(if c () (trap msg))`, the default
-/// message naming the call's position and the test. `dbg` is the same
-/// with a `dbg` message (see the module docs of `expand`).
-pub(super) fn assert(name: &str, items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
+/// message naming the call's position and the test.
+pub(super) fn assert(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
+    let name = "assert";
     check_arity(name, &items, 1, Some(2), pos)?;
     let mut it = items.into_iter().skip(1);
     let test = it.next().unwrap_or_else(|| unit(pos));
@@ -106,4 +106,22 @@ pub(super) fn assert(name: &str, items: Vec<Form>, pos: &Pos) -> Result<Form, Ex
     };
     let fail = call("trap", vec![message], pos);
     Ok(call("if", vec![test, unit(pos), fail], pos))
+}
+
+/// `(dbg e)` ⟹ `(let ((t e)) (eprintln (str-concat "dbg POS: e = " (show t))) t)`:
+/// evaluates `e` once, prints it with `Show` to standard error with the
+/// call's position and the form as written, and returns it (§4.4).
+pub(super) fn dbg(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
+    check_arity("dbg", &items, 1, Some(1), pos)?;
+    let e = items.into_iter().nth(1).unwrap_or_else(|| unit(pos));
+    let t = ctx.gensym("dbg", pos);
+    let label = string(&format!("dbg {pos}: {e} = "), pos);
+    let text = call(
+        "str-concat",
+        vec![label, call("show", vec![t.clone()], pos)],
+        pos,
+    );
+    let print = call("eprintln", vec![text], pos);
+    let binding = list(vec![list(vec![t.clone(), e], pos)], pos);
+    Ok(call("let", vec![binding, print, t], pos))
 }

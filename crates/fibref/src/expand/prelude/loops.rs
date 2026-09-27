@@ -3,12 +3,14 @@
 //!
 //! ```text
 //! (while c body)          ⟹ (loop () (if c (do body (recur)) ()))
-//! (dotimes (i n) body)    ⟹ (loop ((i 0) (m n)) (if (< i m) (do body (recur (+ i 1) m)) ()))
+//! (dotimes (i n) body)    ⟹ (let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))
 //! (for-each (range a b) (fn (i) body))
-//!                         ⟹ (loop ((i a) (m b)) (if (< i m) (do body (recur (+ i 1) m)) ()))
+//!                         ⟹ (let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))
 //! ```
 //!
-//! with `m` a gensym. Any other `for-each` is the library function.
+//! with `s` and `m` gensyms. The bounds are evaluated once, left to
+//! right, before the loop variable exists. Any other `for-each` is the
+//! library function.
 
 use crate::syntax::{Form, FormKind, Pos};
 
@@ -28,21 +30,25 @@ pub(super) fn while_loop(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandErro
     Ok(call("loop", vec![unit(pos), body], pos))
 }
 
-/// The counting loop shared by `dotimes` and `for-each`.
-fn counting_loop(i: Form, from: Form, to: Form, body: Vec<Form>, m: Form, pos: &Pos) -> Form {
-    let bindings = list(
-        vec![
-            list(vec![i.clone(), from], pos),
-            list(vec![m.clone(), to], pos),
-        ],
-        pos,
-    );
-    let next = call("+", vec![i.clone(), int(1, pos)], pos);
+/// The counting loop shared by `dotimes` and `for-each`: `bounds` are
+/// the `(gensym expr)` pairs bound, in order, before the loop; `start`
+/// and `limit` name the bound values.
+struct Counting {
+    i: Form,
+    bounds: Vec<Form>,
+    start: Form,
+    limit: Form,
+}
+
+fn counting_loop(c: Counting, body: Vec<Form>, pos: &Pos) -> Form {
+    let next = call("+", vec![c.i.clone(), int(1, pos)], pos);
     let mut steps = body;
-    steps.push(call("recur", vec![next, m.clone()], pos));
-    let test = call("<", vec![i, m], pos);
+    steps.push(call("recur", vec![next], pos));
+    let test = call("<", vec![c.i.clone(), c.limit], pos);
     let branch = call("if", vec![test, call("do", steps, pos), unit(pos)], pos);
-    call("loop", vec![bindings, branch], pos)
+    let vars = list(vec![list(vec![c.i, c.start], pos)], pos);
+    let lp = call("loop", vec![vars, branch], pos);
+    call("let", vec![list(c.bounds, pos), lp], pos)
 }
 
 /// `(dotimes (i n) body...)`.
@@ -60,7 +66,13 @@ pub(super) fn dotimes(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Fo
     };
     let body: Vec<Form> = items.into_iter().skip(2).collect();
     let m = ctx.gensym("m", pos);
-    Ok(counting_loop(i, int(0, pos), n, body, m, pos))
+    let c = Counting {
+        i,
+        bounds: vec![list(vec![m.clone(), n], pos)],
+        start: int(0, pos),
+        limit: m,
+    };
+    Ok(counting_loop(c, body, pos))
 }
 
 /// The `a b` of a literal `(range a b)`.
@@ -103,6 +115,16 @@ pub(super) fn for_each(
     let Some(((a, b), (i, body))) = shape else {
         return Ok(Outcome::Declined(Form::new(FormKind::List(items), pos)));
     };
+    let start = ctx.gensym("s", &pos);
     let m = ctx.gensym("m", &pos);
-    Ok(Outcome::Expanded(counting_loop(i, a, b, body, m, &pos)))
+    let c = Counting {
+        i,
+        bounds: vec![
+            list(vec![start.clone(), a], &pos),
+            list(vec![m.clone(), b], &pos),
+        ],
+        start,
+        limit: m,
+    };
+    Ok(Outcome::Expanded(counting_loop(c, body, &pos)))
 }

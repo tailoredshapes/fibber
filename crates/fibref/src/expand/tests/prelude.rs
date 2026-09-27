@@ -99,7 +99,7 @@ fn while_is_the_table_loop() {
 fn dotimes_is_the_table_loop() {
     assert_eq!(
         ex("(dotimes (i n) (f i))"),
-        "(loop ((i 0) (#m.1 n)) (if (< i #m.1) (do (f i) (recur (+ i 1) #m.1)) ()))"
+        "(let ((#m.1 n)) (loop ((i 0)) (if (< i #m.1) (do (f i) (recur (+ i 1))) ())))"
     );
     let e = ex_err("(dotimes i (f i))");
     assert!(matches!(e.kind, K::Malformed { ref head, .. } if head == "dotimes"));
@@ -109,7 +109,7 @@ fn dotimes_is_the_table_loop() {
 fn for_each_over_a_literal_range_is_a_loop() {
     assert_eq!(
         ex("(for-each (range a b) (fn (i) (f i) (g i)))"),
-        "(loop ((i a) (#m.1 b)) (if (< i #m.1) (do (f i) (g i) (recur (+ i 1) #m.1)) ()))"
+        "(let ((#s.1 a) (#m.2 b)) (loop ((i #s.1)) (if (< i #m.2) (do (f i) (g i) (recur (+ i 1))) ())))"
     );
 }
 
@@ -166,21 +166,27 @@ fn doto_binds_once() {
 }
 
 #[test]
-fn assert_and_dbg_are_if_and_trap() {
+fn assert_is_if_and_trap() {
     assert_eq!(ex("(assert c \"no\")"), "(if c () (trap \"no\"))");
     assert_eq!(
         ex("(assert (< a b))"),
         "(if (< a b) () (trap \"assert failed at t.fib:1:1: (< a b)\"))"
-    );
-    assert_eq!(
-        ex("(dbg ok)"),
-        "(if ok () (trap \"dbg failed at t.fib:1:1: ok\"))"
     );
     assert!(matches!(ex_err("(assert)").kind, K::MacroArity { .. }));
     assert!(matches!(
         ex_err("(assert a b c)").kind,
         K::MacroArity { .. }
     ));
+}
+
+#[test]
+fn dbg_evaluates_once_prints_with_show_and_returns_the_value() {
+    assert_eq!(
+        ex("(dbg (f x))"),
+        "(let ((#dbg.1 (f x))) (eprintln (str-concat \"dbg t.fib:1:1: (f x) = \" (show #dbg.1))) #dbg.1)"
+    );
+    assert!(matches!(ex_err("(dbg)").kind, K::MacroArity { .. }));
+    assert!(matches!(ex_err("(dbg a b)").kind, K::MacroArity { .. }));
 }
 
 #[test]
