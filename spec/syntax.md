@@ -115,9 +115,14 @@ so a user binding of `conj` does not change what a literal means. The
 compiler may fuse the chain into one allocation; that is an
 optimisation, not a semantic. Inside `quote`/`quasiquote` the brackets
 stay `Vec`/`Map` forms and are not rewritten, so macros see `[x y]` as
-data. In a pattern (§3.6) brackets are not allowed in v1 (**Decided**:
-`Vec` is a library type with no core view, and guards would need
-fallthrough).
+data. In a pattern (§3.6) brackets are a **vector pattern**, matching
+a `(Vec T)` by its length and elements; braces are not allowed in a
+pattern (**Decided** (owner, 2026-09-28), replacing the v1 rule "no
+brackets in patterns"; types §10, "Decided on vector patterns and
+guards"). A bracket in a pattern is therefore never a `Form`: a `Vec`
+form inside a quoted or quasiquoted template stays data until the
+template's result is expanded, and only then, if it stands in pattern
+position, is it a vector pattern.
 
 ### 1.5 Annotations
 
@@ -171,7 +176,11 @@ Evaluation is strict and **left to right, inner before outer**
   function's frame stays, so a `recur` moves only a binding it exits (a
   binding of the loop body, a loop variable) and retains any other
   (§3.18; types §6.10);
-- `if`/`match`: the test or scrutinee, then exactly one branch;
+- `if`/`match`: the test or scrutinee, then exactly one branch; a
+  `match` first tries its clauses in order, each clause's pattern
+  test, then its bindings (rest vectors built left to right), then its
+  guard, a false guard releasing the clause's rest vectors before the
+  next clause is tried (§3.6);
 - constructor arguments and literal-collection elements: left to right;
 - `plet` initialisers run concurrently in unspecified order; `pmap`
   applies its function in unspecified order and returns results in input
@@ -188,6 +197,7 @@ this fixes where). A value produced by an expression and not bound is an
 | a `do` step that is not last | immediately after the step |
 | the test of an `if` | after the test is evaluated, before either branch |
 | the scrutinee of a `match` | after the whole `match` (the scrutinee is an implicit binding for the form; types §6.3) |
+| the guard of a `match` clause | after the guard is evaluated, before the body or the next clause (a guard is a step of its own; its value is a `bool`) |
 | a `let` initialiser | never as a temporary: the binding owns the value |
 | the argument list of a tail call, `recur` included | never as temporaries: each is consumed into the callee's parameter (the loop's variable) at the jump; every other temporary of the step is released before it (types §6.10) |
 | the body of a function | its value is the result; nothing else survives |
@@ -326,8 +336,12 @@ Sequential bindings: each initialiser sees the earlier ones. `(sym:
 type expr)` annotates the variable `sym` (§1.5); the initialiser's type
 must fit the annotation as an argument's must fit an annotated
 parameter (types §2.4). `pat` must
-be irrefutable: a symbol, `_`, `(pat :as sym)` (§3.6), a struct pattern, or a
-pattern of the only variant of an enum. Shadowing an enclosing binding
+be irrefutable: a symbol, `_`, `(pat :as sym)` (§3.6), a struct pattern, a
+pattern of the only variant of an enum, or the one irrefutable vector
+pattern `[& r]` (§3.6; `r` a symbol or `_`), whose sub-patterns are
+irrefutable in turn. `[& r]` binds `r` to a new vector holding every
+element (§3.6: a rest variable owns a fresh copy), which the `let`
+releases at its exit like any owning binding. Shadowing an enclosing binding
 is allowed; a name may not be bound twice in one `let` (**Decided**:
 liar ADR 006 is dropped; nested `let`s and macro-introduced bindings
 need shadowing, and the checker keys every rule on binding sites, not
@@ -378,7 +392,8 @@ its value is discarded (an owned object is released at the step's end).
 
 ```
 (match expr clause+)
-clause ::= (pat body)
+clause ::= (pat body+)
+         | (pat :when guard body+)  ; guarded clause
 pat    ::= _                    ; wildcard
          | sym                  ; binds the whole value
          | literal              ; integer, float, string, char, bool, keyword
@@ -386,13 +401,18 @@ pat    ::= _                    ; wildcard
          | (some pat)           ; the full variant of Option
          | (Variant pat*)       ; enum variant, positional; (Variant) for a field-less variant
          | (Struct pat*)        ; struct, positional in field order
+         | [pat*]               ; a (Vec T) of exactly that many elements
+         | [pat* & rest]        ; a (Vec T) of at least that many elements
          | (pat :as sym)        ; bind the whole while matching inside
+rest   ::= sym | _
 ```
 
 Static: the scrutinee's type must be resolved when exhaustiveness is
 checked (types §2.6). Clauses are tried top to bottom; the set must be
 exhaustive: every variant of an enum or `Option`, both values of `bool`,
-and a final `_` or symbol clause for every other type. A clause that can
+every length of a `Vec`, and a final `_` or symbol clause for every
+other type. A guarded clause counts for nothing towards exhaustiveness:
+the unguarded clauses alone must be exhaustive. A clause that can
 never match is an error. A variable may occur once per pattern. A bare symbol other than `nil`
 is always a binding, never a variant constant; a field-less variant is
 matched as `(Variant)` (**Decided**; §3.9). `match` is the only
@@ -400,11 +420,68 @@ eliminator of enums and `Option` in the core; `nil?`,
 `some?`, `if-let`, `when-let` are prelude definitions over it.
 
 Evaluation: evaluate the scrutinee once; take the first clause whose
-pattern matches; bind its variables; evaluate its body.
+pattern matches and whose guard, if it has one, is true; bind its
+variables; evaluate its body. A clause is tried in three stages: its
+pattern is **tested** (tags, lengths, literals; this runs no user code
+and allocates nothing), then its variables are **bound** (the rest
+vectors of its vector patterns are built at this point, and only once
+the whole pattern has matched), then its **guard** is evaluated with
+those variables in scope. A false guard ends the clause: its rest
+vectors are released and the next clause is tried against the same
+scrutinee value.
+
+**Vector patterns** (**Decided** (owner, 2026-09-28)). `[p₁ .. pₖ]`
+matches a `(Vec T)` of length exactly `k` whose element `i` matches
+`pᵢ`; `[p₁ .. pₖ & r]` matches one of length at least `k` whose first
+`k` elements match `p₁ .. pₖ`, and binds `r`, unless it is `_`, to a
+new `(Vec T)` of the remaining elements in order. `&` stands alone,
+followed by whitespace (the text `&r` reads as `(& r)`, §1.2, which is
+not a pattern), at most once per vector pattern, and is followed by
+exactly one symbol or `_`. The sub-patterns are any patterns, vector
+patterns included, so vector, struct, variant, `Option` and literal
+patterns nest in each other in any order. `Vec` means the prelude's
+`Vec` (§4.5), whatever the current namespace binds; a vector pattern
+against any other type, `Form` included, is a type error. Vector
+patterns and patterns of `Vec`'s own variants may not be mixed on one
+scrutinee (types §2.6). How the length and elements are read, and what
+each costs, is in types §8.3: the length in constant time, element `i`
+by one walk of the trie, the rest by building a new vector of `n - k`
+elements.
+
+**Guards** (**Decided** (owner, 2026-09-28)). The keyword `:when` as
+the second item of a clause makes the third item the clause's guard,
+an expression of type `bool` evaluated with the clause's pattern
+variables in scope. A guard may have side effects (call functions,
+write cells, `await` inside an `async` body): it is evaluated at most
+once each time the clause is tried, after the pattern has matched and
+before anything else, and never when an earlier clause was taken, so
+its effects happen in a fixed order (**Decided**: there is no effect
+system in which a pure guard could be checked; types §6.3 gives the
+same reason for never eliding a cell read). A guard is never in tail
+position; the body of the clause is, when the `match` is. A guarded
+clause after an unguarded clause that already covers its pattern is
+never taken and is the redundant-clause error; a guarded clause makes
+no later clause redundant.
 
 Ownership: pattern variables are borrows of parts of the scrutinee
 (*derived* bindings, types §6.2); the scrutinee is kept alive for the
-whole form. A pattern variable bound to a scalar is a copy.
+whole form. A pattern variable bound to a scalar is a copy. An element
+of a vector pattern is a part of the vector exactly as a field is a
+part of a struct, and is bound the same way. A rest variable is the
+exception: it **owns** its new vector (an owning binding of its
+clause, types §6.3), which holds a count on each of its elements, so
+it may be returned, stored or captured like any owned value; it is
+released at the end of its clause's body unless it leaves as the
+clause's value, and when the clause's guard is false.
+
+**Matching forms.** A `Form` is not a `Vec`, but a `List`, `Vec` or
+`Map` form holds its items as a `(Vec Form)` (§3.16), so a vector
+pattern inside a variant pattern matches a form by shape with no
+syntax of its own: `(List [(Sym "if") c t e])` matches an `if` form and
+binds its three operands, and `(List [(Sym "do") & steps])` binds the
+steps of a `do` as a new `(Vec Form)`. This is how macros and the
+self-hosted compiler take forms apart. A quoted form in a pattern
+(`'(if c t e)`) is not a pattern.
 
 ### 3.7 `defstruct`
 
@@ -1737,7 +1814,9 @@ and §4.3 (`set-field!` is a primitive form whose field operand is a
 name, neither `&` primitive is a value, and neither takes a copy-in or
 a write-back) and §2 (the same for the order of evaluation); types §10
 lists them with that round's corrections to types.md, among them the
-scope at whose exit the interpreter ends a stack object.
+scope at whose exit the interpreter ends a stack object. On 2026-09-28
+the owner lifted item 11: patterns may be vector patterns and clauses
+may have guards (§1.4, §3.3, §3.6); types §10 records the decision.
 
 | Item | Rule | Now in |
 |---|---|---|
@@ -1751,7 +1830,7 @@ scope at whose exit the interpreter ends a stack object.
 | 8 | literal collections desugar to prelude calls | §1.4 |
 | 9 | `Option` an ordinary enum; no lifting, no narrowing (D3) | §3.9 |
 | 10 | no literal polymorphism (D3) | §1.1 |
-| 11 | no vector patterns, no guards in v1 | §1.4, §3.6 |
+| 11 | no vector patterns, no guards in v1 — **replaced by the owner's decision of 2026-09-28: vector patterns `[p* & r]` and guarded clauses `(pat :when g body+)`** (types §10, "Decided on vector patterns and guards") | §1.4, §3.3, §3.6 |
 | 12 | variant names unqualified, unique per namespace | §3.9 |
 | 13 | `first`/`nth` trap; `first?`/`nth?` return `Option` | Appendix A case 01 |
 | 14 | cases 05, 08, 15, 19 rewritten as shown | Appendix A |
