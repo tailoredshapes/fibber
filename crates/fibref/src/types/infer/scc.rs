@@ -146,7 +146,7 @@ impl Cx<'_> {
             self.u.fun = f.name.clone();
             let bounds = self.bounds(f)?;
             for b in &bounds {
-                self.defer(pred_kind(b.clone()), &f.pos, None);
+                self.defer(pred_kind(b.clone(), &f.name), &f.pos, None);
             }
             declared.push(bounds);
             let body = self.infer(&f.body)?;
@@ -234,10 +234,11 @@ impl Cx<'_> {
     }
 }
 
-fn pred_kind(p: Pred) -> DKind {
+fn pred_kind(p: Pred, who: &str) -> DKind {
     match p {
         Pred::Proto(q, args) => DKind::Proto(q, args, None),
         Pred::Send(t) => DKind::Send(t, Vec::new()),
-        Pred::Object(t) => DKind::Object(t),
+        Pred::Object(t) => DKind::Object(t, who.to_string()),
+        Pred::Weakable(t) => DKind::Weakable(t),
     }
 }

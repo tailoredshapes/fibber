@@ -45,7 +45,8 @@ not a rule the programmer has to satisfy. Its guaranteed minimum:
   of it that it returns or stores. The reference interpreter follows
   the same convention (types §6.12).
 - **Unique updates happen in place.** Updating an object whose count is
-  one reuses it instead of copying (§5).
+  one, and which never had a weak reference, reuses it instead of
+  copying (§5).
 
 The reference interpreter implements the plain counting semantics. The
 compiler must produce the same results and the same frees, just with
@@ -104,12 +105,24 @@ value. When the call returns, `x` is assigned whatever `v` holds. The
 call does not write `x` before the write-back, so `(f &x @x)` is fine:
 the plain borrow stays valid until the write-back (case 17). Updates go through the object's count:
 
-- count is one → the object is updated in place;
-- count is more than one → it is copied first, and the copy is updated.
+- count is one and the object never had a weak reference → the object
+  is updated in place;
+- count is more than one, or a weak reference to the object was ever
+  taken → it is copied first, and the copy is updated.
 
 So a caller that is still using the old value (an iteration, another
 binding) keeps seeing the old value, and nothing it holds is ever freed
 or moved under it (case 08).
+
+**Decided** (owner, 2026-09-27): an in-place update requires the count
+to be one **and** the object's `HAS-WEAK` flag (types §8.2) to be clear.
+An object that ever had a weak reference is copied on update, even if
+that weak reference is gone, since the flag is never cleared. Otherwise
+a weak reference, which does not count, would see an immutable object
+change, and the in-place update, an optimisation that must change no
+result (§2), would be observable: under plain counting the update makes
+a new object, the old one is freed when its last holder lets go of it,
+and the weak reference upgrades to `nil` (case 89).
 
 **Decided:** the `&` arguments of one call must name distinct
 variables. `(bar &x &x)` would write back to `x` twice at return; with
@@ -149,7 +162,15 @@ from every other audit failure (case 15).
 The standard library provides weak references for structures that need
 back-pointers: `(weak x)` makes a weak reference to `x`, and `(deref w)`
 returns a strong reference, or `nil` once the object is gone (cases 19,
-20). Only objects that ever had a weak reference pay for one.
+20). Only objects that ever had a weak reference pay for one: a flag
+test when they are freed, and a copy instead of an in-place update
+(§5). `x` must be an object with an identity of its own: a weak
+reference to an `Option` value is a type error (**Decided**, owner,
+2026-09-27; case 82), since an `Option` is either the payload's
+pointer or null, or a fresh tagged object at each `(some ..)`; the
+weak reference is taken of the object inside it. A weak reference to a
+`(dyn P)` value is supported and observes the object behind it (case
+87; types §8.7).
 
 Named functions are global and capture nothing, so ordinary recursion
 never creates a cycle; a local recursive closure calls itself through
@@ -176,6 +197,16 @@ An atom holds a counted reference. `@a` returns a retained reference to
 the current value. `swap!` and `reset!` replace it and release the old
 one; a reader still holding the old value keeps it alive through its own
 count (case 10).
+
+`(swap! a f)` runs `f` on the current value and stores the result only
+if the atom still holds the value `f` was given; otherwise it runs `f`
+again on the new value (case 81). **Decided** (owner, 2026-09-27):
+`swap!` is not guaranteed to terminate. Under contention it retries for
+as long as other threads keep changing the atom, and a `swap!` whose
+`f` itself changes the atom on every run (directly, or through a thread
+it waits for) retries for ever, as in Clojure. `f` should be a pure
+function of the old value; a program that needs progress under
+contention uses one atom per independent value, or a lock of its own.
 
 **Implementation obligation:** reading an atom's pointer and retaining
 it must be one atomic step with respect to `swap!` releasing it.

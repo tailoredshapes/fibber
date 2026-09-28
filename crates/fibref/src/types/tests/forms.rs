@@ -52,14 +52,14 @@ fn dyn_values_dispatch_through_their_protocol() {
     ));
     assert_eq!(binding_type(&p, "d"), "(dyn Area)");
     fails(
-        &format!("{area} (defun main () -> i64 (area (dyn Area 3)))"),
+        &format!("{area} (defun main () -> i64 (area (dyn Area \"s\")))"),
         K::NoInstance,
-        "no implementation of Area for i64",
+        "no implementation of Area for str",
     );
     // Object safety (§4.4).
     fails(
-        "(defprotocol Same (same (self y: Self) -> bool)) (impl Same i64 (same (self y) (= self y)))
-         (defun main () -> i64 (if (same (dyn Same 1) (dyn Same 2)) 1 0))",
+        "(defprotocol Same (same (self y: Self) -> bool)) (impl Same str (same (self y) (= self y)))
+         (defun main () -> i64 (if (same (dyn Same \"a\") (dyn Same \"b\")) 1 0))",
         K::Other,
         "method same of Same is not callable through dyn",
     );

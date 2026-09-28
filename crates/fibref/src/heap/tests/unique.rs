@@ -210,3 +210,22 @@ fn a_unique_write_cannot_tie_an_immutable_cycle() {
     let report = heap.finish();
     assert!(report.is_clean(), "{:?}", report.leaks);
 }
+
+#[test]
+fn an_object_that_had_a_weak_reference_is_never_unique() {
+    // ownership.md §5, types §6.6 (Decided, owner, 2026-09-27; case 89):
+    // HAS-WEAK is sticky, so even after the weak value is gone the
+    // object is copied on update rather than written in place.
+    let mut heap = Heap::new();
+    let (c, x) = place(&mut heap, vec![Value::Int(0)]);
+    assert_eq!(heap.is_unique(x), Ok(true));
+    heap.weak(x).expect("weak");
+    assert_eq!(heap.is_unique(x), Ok(false));
+    assert_eq!(
+        heap.write_unique(c, 0, Value::Int(9)),
+        refused(x, Uniqueness::HasWeak)
+    );
+    assert_eq!(heap.read(x, 0), Ok(Value::Int(0)));
+    heap.release(c).expect("free");
+    assert!(heap.finish().is_clean());
+}

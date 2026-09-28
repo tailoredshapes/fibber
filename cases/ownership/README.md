@@ -18,12 +18,25 @@ not changed.
 
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
-Cases 12, 13, 14, 18, 21, 34 and 40 must be rejected; 15 and 80 are
-the permitted cycle leaks; every other case is accept with a clean
-audit. 16 shows the decided pattern for coordinated updates (§7); 17
+Cases 12, 13, 14, 18, 21, 34, 40, 82, 90 and 93 must be rejected; 15
+and 80 are the permitted cycle leaks; every other case is accept with a
+clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
 pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
 references (§6).
 
 Cases 21 to 80 came from the adversarial review of the spec (their
 reasoning and count traces are in spec/drafts/PROPOSED_CASES.md); 30 and
 35 were withdrawn when D1 removed field places.
+
+Cases 81 to 95 are the findings of the adversary of spec/method.md rule
+4, which attacked the running interpreter given only the spec; each
+header's comment says what the adversary found. Five needed decisions
+by the owner (2026-09-27, recorded in spec/types.md §10): 82 (`weak` of
+an `Option` is rejected), 86 (`range` takes one or two arguments), 87
+(`(Weak (dyn P))` is supported), 89 (an object that had a weak
+reference is copied on update) and 90 (`dyn` of a scalar is rejected);
+94 pins the arithmetic decided with them (types §2.12). 81 also stands
+for the decided note that `swap!` may not terminate under contention
+(ownership.md §7). Some of them test the reference implementation
+(syntax, reflection, the calling convention) rather than a section of
+ownership.md; their `spec:` line cites the chapter that decides them.

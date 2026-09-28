@@ -89,8 +89,11 @@ pub enum DKind {
     Proto(ProtoId, Vec<Ty>, Option<usize>),
     /// `(Send T)`, with the path from the requiring position.
     Send(Ty, Vec<String>),
-    /// `(Object T)`.
-    Object(Ty),
+    /// `(Object T)`; the text names what requires it (`dyn`, `raw`, a
+    /// function whose scheme has the bound), for the message.
+    Object(Ty, String),
+    /// `(Weakable T)`: the operand of `weak` (§2.11).
+    Weakable(Ty),
     /// `HasField(T, f, R)`; `text` is the printed receiver.
     Field(Ty, String, Ty, String),
     /// `HasDeref(T, R)`; `text` is the printed operand.

@@ -50,7 +50,8 @@ impl Cx<'_> {
         match &d.kind {
             DKind::Proto(p, args, method) => self.solve_proto(d, *p, args, *method),
             DKind::Send(t, path) => self.solve_send(d, t, path),
-            DKind::Object(t) => self.solve_object(d, t),
+            DKind::Object(t, who) => self.solve_object(d, t, who),
+            DKind::Weakable(t) => self.solve_weakable(d, t),
             DKind::Field(t, f, r, _) => self.solve_field(d, t, f, r),
             DKind::Deref(t, r, _) => self.solve_deref(d, t, r),
             DKind::Float(t) => match self.st.resolve(t) {
@@ -146,7 +147,8 @@ impl Cx<'_> {
         let kind = match q {
             Pred::Proto(p, args) => DKind::Proto(p, args, None),
             Pred::Send(t) => DKind::Send(t, Vec::new()),
-            Pred::Object(t) => DKind::Object(t),
+            Pred::Object(t) => DKind::Object(t, "an instance context".to_string()),
+            Pred::Weakable(t) => DKind::Weakable(t),
         };
         Deferred {
             kind,
@@ -231,27 +233,58 @@ impl Cx<'_> {
         Err(TypeError::new(ErrorKind::ImplContext, &d.pos, msg))
     }
 
-    fn solve_object(&mut self, d: &Deferred, t: &Ty) -> TResult<Step> {
-        let scalar = match self.st.resolve(t) {
-            Ty::Var(_) | Ty::Gen(_) => return Ok(Step::Stuck),
-            Ty::Rigid(_) if self.u.givens.is_none() => return Ok(Step::Stuck),
-            Ty::Rigid(r) => !self
-                .u
-                .givens
-                .as_ref()
-                .is_some_and(|gs| gs.contains(&Pred::Object(Ty::Rigid(r)))),
+    /// `(Object T)`: `T` is not a scalar (§2.11, §2.15). `who` names
+    /// what requires it, for the message.
+    fn solve_object(&mut self, d: &Deferred, t: &Ty, who: &str) -> TResult<Step> {
+        let Some(scalar) = self.is_scalar(t) else {
+            return Ok(Step::Stuck);
+        };
+        if scalar {
+            let msg = format!("{who} requires an object type, not {}", self.show(t));
+            return Err(TypeError::new(ErrorKind::NotObject, &d.pos, msg));
+        }
+        Ok(Step::Done(Vec::new()))
+    }
+
+    /// `(Weakable T)`: `T` is an object type and not an `Option`
+    /// (§2.11). A scalar keeps the catalogue's `weak requires an object
+    /// type`.
+    fn solve_weakable(&mut self, d: &Deferred, t: &Ty) -> TResult<Step> {
+        let Some(scalar) = self.is_scalar(t) else {
+            return Ok(Step::Stuck);
+        };
+        if scalar {
+            let msg = "weak requires an object type";
+            return Err(TypeError::new(ErrorKind::WeakScalar, &d.pos, msg));
+        }
+        if let Ty::Con(Con::Nominal(id), _) = self.st.resolve(t) {
+            if id == self.g.option {
+                let msg = format!(
+                    "weak of an Option is not allowed: {} has no object of its own to observe; \
+                     take the weak reference of the object inside it",
+                    self.show(t)
+                );
+                return Err(TypeError::new(ErrorKind::WeakOption, &d.pos, msg));
+            }
+        }
+        Ok(Step::Done(Vec::new()))
+    }
+
+    /// Whether `t` is a scalar, or `None` while that is undecided. A
+    /// rigid variable is an object iff a given says so: `(Object a)`,
+    /// or `(Weakable a)`, which implies it.
+    fn is_scalar(&mut self, t: &Ty) -> Option<bool> {
+        Some(match self.st.resolve(t) {
+            Ty::Var(_) | Ty::Gen(_) => return None,
+            Ty::Rigid(_) if self.u.givens.is_none() => return None,
+            Ty::Rigid(r) => !self.u.givens.as_ref().is_some_and(|gs| {
+                gs.contains(&Pred::Object(Ty::Rigid(r)))
+                    || gs.contains(&Pred::Weakable(Ty::Rigid(r)))
+            }),
             Ty::Con(Con::Scalar(_), _) => true,
             Ty::Con(Con::Nominal(id), _) => self.g.ty(id).is_fieldless_enum(),
             _ => false,
-        };
-        if scalar {
-            return Err(TypeError::new(
-                ErrorKind::WeakScalar,
-                &d.pos,
-                "weak requires an object type",
-            ));
-        }
-        Ok(Step::Done(Vec::new()))
+        })
     }
 
     fn solve_field(&mut self, d: &Deferred, t: &Ty, f: &str, r: &Ty) -> TResult<Step> {

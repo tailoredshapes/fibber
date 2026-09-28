@@ -23,7 +23,7 @@ fn real_cases() -> Vec<PathBuf> {
     cases
 }
 
-const REJECT: [u32; 7] = [12, 13, 14, 18, 21, 34, 40];
+const REJECT: [u32; 10] = [12, 13, 14, 18, 21, 34, 40, 82, 90, 93];
 const LEAK_CYCLE: [u32; 2] = [15, 80];
 
 fn number_of(path: &Path) -> u32 {
@@ -67,20 +67,21 @@ fn every_real_case_header_parses() {
 }
 
 #[test]
-fn the_ownership_directory_holds_cases_1_to_80_less_the_withdrawn() {
-    // 30 and 35 were withdrawn when D1 removed field places.
+fn the_ownership_directory_holds_cases_1_to_95_less_the_withdrawn() {
+    // 30 and 35 were withdrawn when D1 removed field places; 81 to 95
+    // are the promoted findings of the rule-4 adversary.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();
     let numbers: Vec<u32> = cases.iter().map(|p| number_of(p)).collect();
-    let expected: Vec<u32> = (1..=80).filter(|n| ![30, 35].contains(n)).collect();
+    let expected: Vec<u32> = (1..=95).filter(|n| ![30, 35].contains(n)).collect();
     assert_eq!(numbers, expected);
 }
 
 #[test]
 fn real_case_verdicts_agree_with_the_readme() {
-    // README: 12, 13, 14, 18, 21, 34 and 40 must be rejected; 15 and 80
-    // are the permitted cycle leaks; every other case is accept with a
-    // clean audit.
+    // README: 12, 13, 14, 18, 21, 34, 40, 82, 90 and 93 must be
+    // rejected; 15 and 80 are the permitted cycle leaks; every other
+    // case is accept with a clean audit.
     for path in real_cases() {
         let header = read_header(&path).unwrap_or_else(|e| panic!("{e}"));
         let n = number_of(&path);

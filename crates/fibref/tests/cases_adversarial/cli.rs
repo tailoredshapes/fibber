@@ -162,8 +162,12 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("80-unique-write-closes-cycle-through-cell.fib"),
         "{out}"
     );
-    assert!(out.contains("78 cases:"), "{out}");
-    assert!(out.contains("78 pass, 0 fail, 0 pending"), "{out}");
+    assert!(
+        out.contains("95-option-of-scalar-is-a-heap-object.fib"),
+        "{out}"
+    );
+    assert!(out.contains("93 cases:"), "{out}");
+    assert!(out.contains("93 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 

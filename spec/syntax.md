@@ -528,7 +528,10 @@ a colour (`(fn (a) unit)`) accepts closures of any colour; `(fn :send
 (a) unit)` requires a sendable one (types §1.4).
 
 Dispatch: static when the receiver's type is concrete after inference,
-which is always except through the explicit `(dyn P)` type (types §4).
+which is always except through the explicit `(dyn P)` type (types §4). `(dyn P e)` needs `e` of an object type: a scalar, a field-less enum
+or `unit` is `dyn requires an object type` (**Decided**, owner,
+2026-09-27; types §2.15), since a `(dyn P)` is the object's pointer and
+a vtable.
 
 ### 3.11 Cells, atoms, weak references: builtins, not forms
 
@@ -542,9 +545,9 @@ a rule for each (types §2.9–§2.11). None is a special form.
 | `(deref c)`, `@c` | protocol `Deref` | cell → its value; atom → its value; weak → `(Option T)`. Every object result is owned (+1). `c` is an expression, or the name of an `&` parameter (§3.13) |
 | `(set! c v)` | `(Cell a) a -> unit` | store `v`, release the old value; the target `c` is an expression of cell type (a field path among them, §3.8) or the name of an `&` parameter, which is not an expression but may stand here and as the operand of `@` (§3.13; types §2.9) |
 | `(atom v)` | `a -> (Atom a)`, `Send a` | a new atom |
-| `(swap! a f)` | `(Atom a) (fn (a) a) -> a` | replace atomically with `(f old)`; `f` may run more than once; returns the new value (owned) |
+| `(swap! a f)` | `(Atom a) (fn (a) a) -> a` | replace atomically with `(f old)`; `f` may run more than once, and `swap!` may never finish under contention or when `f` itself changes the atom each time (**Decided**, ownership.md §7); returns the new value (owned) |
 | `(reset! a v)` | `(Atom a) a -> unit` | replace, release the old value |
-| `(weak x)` | `a -> (Weak a)`, `a` an object type | a weak reference; does not keep `x` alive |
+| `(weak x)` | `a -> (Weak a)`, `a` an object type other than an `Option` (types §2.11) | a weak reference; does not keep `x` alive |
 
 Variables are immutable; `set!` on anything but a cell is an error. The
 only mutable things a program can name are cells, atoms and `&`
@@ -1197,7 +1200,8 @@ of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
 | `if-let`, `when-let`, `nil?`-free option tests | `match`: `(if-let (x e) a b)` ⟹ `(match e ((some x) a) (nil b))` |
 | `list` | `(list a b)` ⟹ `(cons a (cons b empty))` (`empty` is `List`'s field-less variant, used bare: §3.9) |
 | `plet` | §3.12 |
-| `while`, `dotimes`, `for-each` over a `range` | `loop`/`recur` (§3.18): `(while c body)` ⟹ `(loop () (if c (do body (recur)) ()))`; `(dotimes (i n) body)` ⟹ `(let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))` with `m` a gensym; `(for-each (range a b) (fn (i) body))`, with a literal `(range ..)` and a literal `fn`, ⟹ `(let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))` with `s` and `m` gensyms, the body spliced in with no closure. The bounds are evaluated once, left to right, before the loop variable exists, so a bound that mentions a variable named like `i` sees the outer one (**Decided**, owner, 2026-09-27; the earlier `(loop ((i 0) (m n)) ..)` bound `n` inside the loop's own `i`); any other `for-each` is the library function (§4.5) |
+| `while`, `dotimes`, `for-each` over a `range` | `loop`/`recur` (§3.18): `(while c body)` ⟹ `(loop () (if c (do body (recur)) ()))`; `(dotimes (i n) body)` ⟹ `(let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))` with `m` a gensym; `(for-each (range a b) (fn (i) body))`, with a literal `(range a b)` or `(range n)` (read as `(range 0 n)`) and a literal `fn` with no name, one unannotated parameter and no result annotation, ⟹ `(let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))` with `s` and `m` gensyms, the body spliced in with no closure. A loop variable takes no annotation, so a `fn` whose parameter is annotated (`(fn (i: i64) ..)`) is left to the library function, which checks it (case 86). The bounds are evaluated once, left to right, before the loop variable exists, so a bound that mentions a variable named like `i` sees the outer one (**Decided**, owner, 2026-09-27; the earlier `(loop ((i 0) (m n)) ..)` bound `n` inside the loop's own `i`); any other `for-each` is the library function (§4.5) |
+| `range` | `(range a b)` ⟹ `(range-between a b)`; `(range n)` is not rewritten: it is the library function `range`, which is also what `range` names as a value (§4.5). There is no arity overloading, so the two-argument form exists as this rewrite (**Decided**, owner, 2026-09-27: both arities) |
 | `->`, `->>`, `doto` | call rewriting |
 | `assert` | `(assert c)` / `(assert c msg)` ⟹ `(if c () (trap msg))`, the default message naming the position and the test |
 | `dbg` | `(dbg e)` ⟹ `(let ((t e)) (eprintln (str-concat "dbg FILE:LINE:COL: E = " (show t))) t)` with `t` a gensym and the literal text naming the call's position and `e` as written: evaluates `e` once, prints it with `Show` to stderr, returns it (**Decided**, owner, 2026-09-27) |
@@ -1213,7 +1217,12 @@ persistent structures over `(Array T)` with `vec-empty conj nth count
 push! pop! vec-set! map-empty assoc get map-put! map-del!`; the
 protocols `Seq Countable Indexable Collection Associative Traversable
 Iter Hash Show` with `first rest count nth conj for-each map filter
-reduce iter next collect filter-iter`; `range`, `pmap`, `append` (=
+reduce iter next collect filter-iter`; `range` (**Decided**, owner,
+2026-09-27: `(range n)` is `(range 0 n)`, and `(range a b)` is the `i64`s
+from `a` up to but not including `b`, empty when `b ≤ a`; the library
+function is `(range n: i64) -> (Vec i64)`, and the two-argument form is
+the prelude macro's rewrite to `(range-between a: i64 b: i64) -> (Vec
+i64)`, §4.4), `pmap`, `append` (=
 `push!`), `even?`, `length` (string length), `starts-with?`, `box`/`unbox`
 over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O (including `(eprintln s: str) -> unit`, which writes `s` and a newline to standard error; `dbg` uses it).
 
@@ -1743,7 +1752,7 @@ scope at whose exit the interpreter ends a stack object.
 | 13 | `first`/`nth` trap; `first?`/`nth?` return `Option` | Appendix A case 01 |
 | 14 | cases 05, 08, 15, 19 rewritten as shown | Appendix A |
 | 15 | non-final `do` steps may have any type | §3.5 |
-| 16 | signed overflow wraps | types §2.12 |
+| 16 | signed overflow wraps — **replaced by the owner's decision of 2026-09-27: Rust's semantics (overflow and division by zero trap, shift amounts masked, float-to-integer conversion saturating)** | types §2.12, §8.12 |
 | 17 | `loop`/`recur` core — **amended by D5: kept core for the two reasons §3.18 gives; semantics now the tail-call rule** | §3.18 |
 | 18 | field-less variant bare in expressions, `(V)` in patterns | §3.6, §3.9 |
 | 19 | instance contexts declared with `:where` | §3.10 |

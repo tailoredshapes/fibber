@@ -307,8 +307,11 @@ pub enum Pred {
     Proto(ProtoId, Vec<Ty>),
     /// `(Send T)` (§5.1).
     Send(Ty),
-    /// `(Object T)`: `T` is not a scalar (§2.11).
+    /// `(Object T)`: `T` is not a scalar (§2.11, §2.15).
     Object(Ty),
+    /// `(Weakable T)`: `T` is an object type that is not an `Option`
+    /// (§2.11): what `weak` can observe.
+    Weakable(Ty),
 }
 
 impl Pred {
@@ -318,6 +321,7 @@ impl Pred {
             Pred::Proto(p, args) => Pred::Proto(*p, args.iter().map(&mut *f).collect()),
             Pred::Send(t) => Pred::Send(f(t)),
             Pred::Object(t) => Pred::Object(f(t)),
+            Pred::Weakable(t) => Pred::Weakable(f(t)),
         }
     }
 
@@ -325,7 +329,7 @@ impl Pred {
     pub fn tys(&self) -> Vec<&Ty> {
         match self {
             Pred::Proto(_, args) => args.iter().collect(),
-            Pred::Send(t) | Pred::Object(t) => vec![t],
+            Pred::Send(t) | Pred::Object(t) | Pred::Weakable(t) => vec![t],
         }
     }
 }

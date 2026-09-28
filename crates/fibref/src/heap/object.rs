@@ -8,10 +8,12 @@ use super::value::{Kind, ScopeId, Value};
 /// fields, so nothing can be read through it and it holds no counts.
 ///
 /// The header flags of `spec/types.md` §8.2 are `shared` (`SHARED`),
-/// `immortal` (`IMMORTAL`) and `scope` (`STACK`, with the scope that
-/// ends the object). `HAS-WEAK` is not modelled: a `Value::Weak` names
-/// its target directly and needs no box. An `IMMORTAL` or `STACK`
-/// object has count 0 and nothing ever changes it (§8.2).
+/// `immortal` (`IMMORTAL`), `scope` (`STACK`, with the scope that ends
+/// the object) and `has_weak` (`HAS-WEAK`). A `Value::Weak` names its
+/// target directly and needs no box, so `HAS-WEAK` matters only to
+/// `fib.unique?`, which refuses an object that ever had a weak
+/// reference (§6.6, ownership.md §5). An `IMMORTAL` or `STACK` object
+/// has count 0 and nothing ever changes it (§8.2).
 #[derive(Debug)]
 pub(super) struct Object {
     pub(super) kind: Kind,
@@ -29,6 +31,10 @@ pub(super) struct Object {
     /// object's `live` turns false when its scope ends, not when it is
     /// released, which it never is.
     pub(super) scope: Option<ScopeId>,
+    /// `HAS-WEAK`: a weak reference to it was taken; never cleared.
+    /// Left unset on an immortal object, whose header `weak` does not
+    /// write (§8.7).
+    pub(super) has_weak: bool,
     pub(super) live: bool,
 }
 
@@ -42,6 +48,7 @@ impl Object {
             shared: false,
             immortal: false,
             scope: None,
+            has_weak: false,
             live: true,
         }
     }

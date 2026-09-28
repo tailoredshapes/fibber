@@ -111,6 +111,24 @@ fn for_each_over_a_literal_range_is_a_loop() {
         ex("(for-each (range a b) (fn (i) (f i) (g i)))"),
         "(let ((#s.1 a) (#m.2 b)) (loop ((i #s.1)) (if (< i #m.2) (do (f i) (g i) (recur (+ i 1))) ())))"
     );
+    // (range n) is (range 0 n) (Decided, owner, 2026-09-27; case 86).
+    assert_eq!(
+        ex("(for-each (range n) (fn (i) i))"),
+        "(let ((#s.1 0) (#m.2 n)) (loop ((i #s.1)) (if (< i #m.2) (do i (recur (+ i 1))) ())))"
+    );
+}
+
+#[test]
+fn range_takes_one_or_two_arguments() {
+    // (range a b) is the rewrite to the library's range-between; (range
+    // n) stays the library function, which is also range's value.
+    assert_eq!(ex("(range a b)"), "(range-between a b)");
+    assert_eq!(ex("(range n)"), "(range n)");
+    assert_eq!(ex("(map range xs)"), "(map range xs)");
+    let e = ex_err("(range a b c)");
+    assert!(matches!(e.kind, K::MacroArity { ref name, .. } if name == "range"));
+    let e = ex_err("(range)");
+    assert!(matches!(e.kind, K::MacroArity { ref name, .. } if name == "range"));
 }
 
 #[test]
@@ -119,22 +137,24 @@ fn any_other_for_each_is_the_library_call() {
         ex("(for-each xs (fn (i) (f i)))"),
         "(for-each xs (fn (i) (f i)))"
     );
+    assert_eq!(ex("(for-each (range n) f)"), "(for-each (range n) f)");
     assert_eq!(
-        ex("(for-each (range n) (fn (i) i))"),
-        "(for-each (range n) (fn (i) i))"
+        ex("(for-each (range a b) f)"),
+        "(for-each (range-between a b) f)"
     );
-    assert_eq!(ex("(for-each (range a b) f)"), "(for-each (range a b) f)");
     assert_eq!(
         ex("(for-each (range a b) (fn g (i) i))"),
-        "(for-each (range a b) (fn g (i) i))"
+        "(for-each (range-between a b) (fn g (i) i))"
     );
+    // An annotated parameter: loop variables take no annotation, so the
+    // library function runs the fn and checks it (case 86).
     assert_eq!(
         ex("(for-each (range a b) (fn (i: i64) i))"),
-        "(for-each (range a b) (fn (i: i64) i))"
+        "(for-each (range-between a b) (fn (i: i64) i))"
     );
     assert_eq!(
         ex("(for-each (range a b) (fn (i) -> i64 i))"),
-        "(for-each (range a b) (fn (i) -> i64 i))"
+        "(for-each (range-between a b) (fn (i) -> i64 i))"
     );
 }
 

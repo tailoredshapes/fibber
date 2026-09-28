@@ -86,7 +86,7 @@ pub const BUILTINS: &[BuiltinSig] = &[
     b("atom", "(fn (a) (Atom a))", "((Send a))", &[St]),
     b("swap!", "(fn ((Atom a) (fn (a) a)) a)", "", &[B, B]),
     b("reset!", "(fn ((Atom a) a) unit)", "", &[B, St]),
-    b("weak", "(fn (a) (Weak a))", "((Object a))", &[W]),
+    b("weak", "(fn (a) (Weak a))", "((Weakable a))", &[W]),
     b(
         "spawn",
         "(fn ((fn :send () a)) (Task a))",

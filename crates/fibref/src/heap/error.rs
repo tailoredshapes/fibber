@@ -114,6 +114,9 @@ pub enum Uniqueness {
     Immortal,
     /// `STACK`: no count to test.
     Stack,
+    /// `HAS-WEAK`: a weak reference may observe it, so it is never
+    /// changed in place (ownership.md §5; types §6.6).
+    HasWeak,
     /// The count is not exactly 1.
     Count(usize),
     /// The value written is the object itself: the caller holds it, so

@@ -48,6 +48,9 @@ fn residue(forms: &[Form]) -> Option<&Form> {
                 // literal-range form must have become a loop.
                 let macro_use = match head {
                     "for-each" => is_range_loop(items),
+                    // `(range n)` is the library function; only `(range
+                    // a b)` must have been rewritten.
+                    "range" => items.len() == 3,
                     _ => PRELUDE_MACROS.contains(&head),
                 };
                 if macro_use || quasi.contains(&head) {
@@ -63,14 +66,15 @@ fn residue(forms: &[Form]) -> Option<&Form> {
     None
 }
 
-/// Whether `(for-each r f)` has a literal `(range a b)` and a literal
-/// one-parameter `fn`.
+/// Whether `(for-each r f)` has a literal `(range a b)` or `(range n)`
+/// and a literal one-parameter `fn`.
 fn is_range_loop(items: &[Form]) -> bool {
     let head =
         |f: &Form, n: &str| f.as_list().and_then(|i| i.first()).and_then(Form::as_sym) == Some(n);
     match items {
         [_, r, f] => {
-            let range = head(r, "range") && r.as_list().map_or(0, <[Form]>::len) == 3;
+            let len = r.as_list().map_or(0, <[Form]>::len);
+            let range = head(r, "range") && (len == 2 || len == 3);
             let params = f.as_list().and_then(|i| i.get(1)).and_then(Form::as_list);
             range && head(f, "fn") && params.is_some_and(|p| p.len() == 1)
         }

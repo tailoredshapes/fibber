@@ -326,11 +326,12 @@ impl Cx<'_> {
         Ok(())
     }
 
-    /// `Send`/`Object` on a variable outside every root: `i64` (§3.6).
+    /// `Send`/`Object`/`Weakable` on a variable outside every root:
+    /// `i64` (§3.6).
     fn default_outside(&mut self, union: &[Key]) -> TResult<()> {
         let mut changed = false;
         for d in self.u.deferred.clone() {
-            if let DKind::Send(t, _) | DKind::Object(t) = &d.kind {
+            if let DKind::Send(t, _) | DKind::Object(t, _) | DKind::Weakable(t) = &d.kind {
                 for k in keys(self.st, t) {
                     if let (Key::Var(v), false) = (k, union.contains(&k)) {
                         self.unify(&Ty::Var(v), &Ty::i64(), &d.pos)?;
@@ -427,7 +428,8 @@ fn pred_of(d: &Deferred) -> Option<(Pred, Option<ExprId>)> {
     let p = match &d.kind {
         DKind::Proto(p, args, _) => Pred::Proto(*p, args.clone()),
         DKind::Send(t, _) => Pred::Send(t.clone()),
-        DKind::Object(t) => Pred::Object(t.clone()),
+        DKind::Object(t, _) => Pred::Object(t.clone()),
+        DKind::Weakable(t) => Pred::Weakable(t.clone()),
         _ => return None,
     };
     Some((p, d.site))

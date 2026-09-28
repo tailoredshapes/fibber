@@ -1,8 +1,10 @@
 //! The methods of the built-in instances (types §2.9, §2.12): `Num`,
 //! `Bits`, `Eq`, `Ord`, `Hash`, `Show` on scalars and `str` (a
 //! field-less enum by variant index), `Deref` on cells, atoms and weak
-//! references; and the conversions. Signed overflow wraps; integer
-//! division and remainder trap on zero (§2.12).
+//! references; and the conversions. Integer arithmetic has Rust's
+//! semantics (§2.12, Decided): division and remainder by zero and
+//! signed overflow trap, shift amounts are masked to the width, and
+//! float-to-integer conversion saturates.
 
 use crate::types::ast::{ConvOp, IntConv};
 use crate::types::ty::Scalar;
@@ -114,16 +116,22 @@ fn compare(name: &str, o: std::cmp::Ordering) -> R<Val> {
     Ok(Val::Bool(b))
 }
 
+/// An integer `Num` or `Bits` method, or a comparison, at width `w`
+/// (§2.12, Decided: Rust's semantics). Division and remainder by zero
+/// trap; a signed result that does not fit `w` traps (`+ - * /`, and
+/// `rem` of the minimum by -1, as Rust's does); the shift amount is
+/// taken modulo the width.
 fn int_binary(name: &str, a: i64, b: i64, w: Scalar) -> R<Val> {
     let mask = u64::MAX >> (64 - bits(w));
     let shift = (b as u32) & (bits(w) - 1);
     let n = match name {
-        "+" => a.wrapping_add(b),
-        "-" => a.wrapping_sub(b),
-        "*" => a.wrapping_mul(b),
+        "+" => checked(name, i128::from(a) + i128::from(b), w)?,
+        "-" => checked(name, i128::from(a) - i128::from(b), w)?,
+        "*" => checked(name, i128::from(a) * i128::from(b), w)?,
         "/" | "rem" if b == 0 => return Err(RunError::trap(format!("integer {name} by zero"))),
-        "/" => a.wrapping_div(b),
-        "rem" => a.wrapping_rem(b),
+        "/" => checked(name, i128::from(a) / i128::from(b), w)?,
+        "rem" if b == -1 && a == i64::MIN >> (64 - bits(w)) => return Err(overflow(name, w)),
+        "rem" => a % b,
         "bit-and" => a & b,
         "bit-or" => a | b,
         "bit-xor" => a ^ b,
@@ -135,10 +143,25 @@ fn int_binary(name: &str, a: i64, b: i64, w: Scalar) -> R<Val> {
     Ok(Val::Int(wrap(n, w), w))
 }
 
+/// `n` if it fits the signed width `w`, else the overflow trap.
+fn checked(name: &str, n: i128, w: Scalar) -> R<i64> {
+    let half = 1i128 << (bits(w) - 1);
+    if (-half..half).contains(&n) {
+        // In range of `w`, which is at most 64 bits wide.
+        Ok(n as i64)
+    } else {
+        Err(overflow(name, w))
+    }
+}
+
+fn overflow(name: &str, w: Scalar) -> RunError {
+    RunError::trap(format!("integer overflow in {name} at {}", w.name()))
+}
+
 fn int_unary(name: &str, a: i64, w: Scalar) -> R<Val> {
     let mask = u64::MAX >> (64 - bits(w));
     let n = match name {
-        "neg" => a.wrapping_neg(),
+        "neg" => checked(name, -i128::from(a), w)?,
         "bit-not" => !a,
         "popcount" => i64::from(((a as u64) & mask).count_ones() as u8),
         _ => return Err(RunError::internal(format!("{name} on an integer"))),
@@ -198,10 +221,7 @@ pub fn convert(op: ConvOp, t: Scalar, v: &Val) -> R<Val> {
             Val::Int(wrap(n, t), t)
         }
         (ConvOp::FloatToFloat, Val::Float(x, _)) => Val::Float(round(*x, t), t),
-        (ConvOp::FloatToInt { signed: true }, Val::Float(x, _)) => Val::Int(wrap(*x as i64, t), t),
-        (ConvOp::FloatToInt { signed: false }, Val::Float(x, _)) => {
-            Val::Int(wrap(*x as u64 as i64, t), t)
-        }
+        (ConvOp::FloatToInt { signed }, Val::Float(x, _)) => Val::Int(saturate(*x, signed, t), t),
         (ConvOp::IntToFloat { signed: true }, Val::Int(n, _)) => Val::Float(round(*n as f64, t), t),
         (ConvOp::IntToFloat { signed: false }, Val::Int(n, w)) => {
             let u = (*n as u64) & (u64::MAX >> (64 - bits(*w)));
@@ -209,6 +229,21 @@ pub fn convert(op: ConvOp, t: Scalar, v: &Val) -> R<Val> {
         }
         _ => return Err(RunError::internal(format!("conversion {op:?} of {v:?}"))),
     })
+}
+
+/// `fptosi`/`fptoui` to the width `t` (§2.12, Decided: Rust's `as`):
+/// NaN is 0, and a value outside the target's range, infinities
+/// included, gives the nearest end of it. An unsigned result is kept
+/// as its bit pattern at the width, as every integer value is.
+fn saturate(x: f64, signed: bool, t: Scalar) -> i64 {
+    let b = bits(t);
+    if signed {
+        // `as` saturates to the i64 range and maps NaN to 0.
+        (x as i64).clamp(i64::MIN >> (64 - b), i64::MAX >> (64 - b))
+    } else {
+        let max = u64::MAX >> (64 - b);
+        wrap((x as u64).min(max) as i64, t)
+    }
 }
 
 /// `char->i32`, `i32->char` (the latter traps on a non-scalar value).
@@ -228,11 +263,72 @@ pub fn char_conv(name: &str, v: &Val) -> R<Val> {
 mod tests {
     use super::*;
 
+    fn int(n: i64, w: Scalar) -> R<Val> {
+        Ok(Val::Int(n, w))
+    }
+
+    fn traps(r: R<Val>, text: &str) {
+        let e = r.expect_err(text);
+        assert!(e.to_string().contains(text), "{e}");
+    }
+
     #[test]
-    fn integer_arithmetic_wraps_and_division_by_zero_traps() {
-        let r = int_binary("+", 127, 1, Scalar::I8).expect("adds");
-        assert_eq!(r, Val::Int(-128, Scalar::I8));
-        assert!(int_binary("/", 1, 0, Scalar::I64).is_err());
+    fn signed_overflow_and_division_by_zero_trap() {
+        use Scalar::{I64, I8};
+        traps(int_binary("+", 127, 1, I8), "integer overflow in + at i8");
+        assert_eq!(int_binary("+", 126, 1, I8), int(127, I8));
+        traps(int_binary("-", -128, 1, I8), "integer overflow in -");
+        traps(
+            int_binary("*", 1 << 32, 1 << 31, I64),
+            "integer overflow in *",
+        );
+        traps(int_binary("/", i64::MIN, -1, I64), "integer overflow in /");
+        traps(int_binary("/", -128, -1, I8), "integer overflow in /");
+        traps(
+            int_binary("rem", i64::MIN, -1, I64),
+            "integer overflow in rem",
+        );
+        assert_eq!(int_binary("rem", -127, -1, I8), int(0, I8));
+        assert_eq!(int_binary("/", -7, 2, I64), int(-3, I64));
+        assert_eq!(int_binary("rem", -7, 2, I64), int(-1, I64));
+        traps(int_unary("neg", i64::MIN, I64), "integer overflow in neg");
+        assert_eq!(int_unary("neg", -127, I8), int(127, I8));
+        traps(int_binary("/", 1, 0, I64), "integer / by zero");
+        traps(int_binary("rem", 1, 0, I8), "integer rem by zero");
+    }
+
+    #[test]
+    fn shift_amounts_are_masked_to_the_width() {
+        use Scalar::{I64, I8};
+        assert_eq!(int_binary("shl", 1, 64, I64), int(1, I64));
+        assert_eq!(int_binary("shl", 1, 9, I8), int(2, I8));
+        assert_eq!(int_binary("sar", -1, 65, I64), int(-1, I64));
+        assert_eq!(int_binary("shr", -1, 127, I64), int(1, I64));
+        assert_eq!(int_binary("shl", 1, -1, I64), int(i64::MIN, I64));
+        assert_eq!(int_binary("shl", 1, 7, I8), int(-128, I8));
+    }
+
+    #[test]
+    fn float_to_integer_saturates_and_nan_is_zero() {
+        use Scalar::{I64, I8};
+        let f = |x: f64| Val::Float(x, Scalar::F64);
+        let si = |x, t| convert(ConvOp::FloatToInt { signed: true }, t, &f(x));
+        let ui = |x, t| convert(ConvOp::FloatToInt { signed: false }, t, &f(x));
+        assert_eq!(si(f64::NAN, I64), int(0, I64));
+        assert_eq!(si(f64::INFINITY, I64), int(i64::MAX, I64));
+        assert_eq!(si(-1e300, I64), int(i64::MIN, I64));
+        assert_eq!(si(300.0, I8), int(127, I8));
+        assert_eq!(si(-300.0, I8), int(-128, I8));
+        assert_eq!(si(-2.7, I8), int(-2, I8));
+        assert_eq!(ui(-5.0, I8), int(0, I8));
+        assert_eq!(ui(300.0, I8), int(-1, I8)); // 255, as the bits of an i8
+        assert_eq!(ui(200.0, I8), int(-56, I8));
+        assert_eq!(ui(f64::NAN, I64), int(0, I64));
+        assert_eq!(ui(1e30, I64), int(-1, I64)); // u64::MAX
+    }
+
+    #[test]
+    fn comparisons_and_logical_shift_right() {
         assert_eq!(
             int_binary("shr", -1, 60, Scalar::I64),
             Ok(Val::Int(15, Scalar::I64))

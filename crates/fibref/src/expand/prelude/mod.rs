@@ -18,9 +18,9 @@ use super::derive;
 use super::error::ExpandError;
 
 /// The prelude macros, by name.
-pub const PRELUDE_MACROS: [&str; 18] = [
+pub const PRELUDE_MACROS: [&str; 19] = [
     "when", "unless", "cond", "and", "or", "if-let", "when-let", "list", "plet", "while",
-    "dotimes", "for-each", "->", "->>", "doto", "assert", "dbg", "derive",
+    "dotimes", "for-each", "range", "->", "->>", "doto", "assert", "dbg", "derive",
 ];
 
 /// What a prelude macro did with a call.
@@ -28,7 +28,8 @@ pub(crate) enum Outcome {
     /// The call's expansion.
     Expanded(Form),
     /// The call, unchanged: it is not a use of the macro (only
-    /// `for-each` declines, when it is the library function, §4.4).
+    /// `for-each` and the one-argument `range` decline, when they are
+    /// the library functions, §4.4).
     Declined(Form),
 }
 
@@ -68,6 +69,7 @@ pub(crate) fn expand(ctx: &ExpandCtx, form: Form) -> Result<Outcome, ExpandError
         "while" => loops::while_loop(items, p)?,
         "dotimes" => loops::dotimes(ctx, items, p)?,
         "for-each" => return loops::for_each(ctx, items, pos),
+        "range" => return loops::range(items, pos),
         _ => derive::derive(ctx, items, p)?,
     };
     Ok(Outcome::Expanded(out))

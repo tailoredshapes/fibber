@@ -82,6 +82,51 @@ fn weak_requires_an_object_type() {
 }
 
 #[test]
+fn weak_of_an_option_is_not_allowed() {
+    // Decided (owner, 2026-09-27; case 82): an Option has no object of
+    // its own for a weak reference to observe.
+    let text = "weak of an Option is not allowed";
+    fails(
+        "(defun main () -> i64 (do (weak (some \"a\")) 0))",
+        K::WeakOption,
+        text,
+    );
+    fails(
+        "(defun main () -> i64 (do (weak nil) 0))",
+        K::WeakOption,
+        text,
+    );
+    // Through a generic function: the bound travels in its scheme.
+    fails(
+        "(defun w (x) (weak x)) (defun main () -> i64 (do (w (some 5)) 0))",
+        K::WeakOption,
+        text,
+    );
+    // The payload itself is fine.
+    ok("(defun main () -> i64 (do (weak \"a\") 0))");
+}
+
+#[test]
+fn dyn_requires_an_object_type() {
+    // Decided (owner, 2026-09-27; case 90): a scalar has no object word
+    // for the dyn value's count operations to act on.
+    let decls = "(defprotocol Q (q (self) -> i64)) (impl Q i64 (q (self) self)) \
+                 (defenum E A B) (impl Q E (q (self) 1)) (impl Q unit (q (self) 2)) \
+                 (impl Q (Option a) (q (self) 3))";
+    for arg in ["7", "A", "()"] {
+        let src = format!("{decls} (defun main () -> i64 (q (dyn Q {arg})))");
+        fails(&src, K::NotObject, "dyn requires an object type");
+    }
+    // Through a generic function the bound is (Object a) in its scheme.
+    let src = format!("{decls} (defun wrap (x) (dyn Q x)) (defun main () -> i64 (q (wrap 7)))");
+    fails(&src, K::NotObject, "wrap requires an object type");
+    // An Option is an object type: dyn of it is fine.
+    ok(&format!(
+        "{decls} (defun main () -> i64 (q (dyn Q (some 1))))"
+    ));
+}
+
+#[test]
 fn constant_is_not_a_function() {
     fails(
         "(defun main () -> i64 (count (empty)))",

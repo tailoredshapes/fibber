@@ -47,12 +47,14 @@ impl<'a> Printer<'a> {
         out
     }
 
-    /// A predicate as text: `(P T..)`, `(Send T)`, `(Object T)`.
+    /// A predicate as text: `(P T..)`, `(Send T)`, `(Object T)`,
+    /// `(Weakable T)`.
     pub fn pred(&self, p: &Pred) -> String {
         let (head, args): (String, Vec<&Ty>) = match p {
             Pred::Proto(id, args) => (self.g.proto(*id).name.clone(), args.iter().collect()),
             Pred::Send(t) => ("Send".to_string(), vec![t]),
             Pred::Object(t) => ("Object".to_string(), vec![t]),
+            Pred::Weakable(t) => ("Weakable".to_string(), vec![t]),
         };
         let parts: Vec<String> = args.iter().map(|t| self.ty(t)).collect();
         format!("({head} {})", parts.join(" "))

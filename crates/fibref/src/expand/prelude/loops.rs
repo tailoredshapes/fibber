@@ -6,11 +6,13 @@
 //! (dotimes (i n) body)    ⟹ (let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))
 //! (for-each (range a b) (fn (i) body))
 //!                         ⟹ (let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))
+//! (range a b)             ⟹ (range-between a b)
 //! ```
 //!
-//! with `s` and `m` gensyms. The bounds are evaluated once, left to
-//! right, before the loop variable exists. Any other `for-each` is the
-//! library function.
+//! with `s` and `m` gensyms; `(range n)` is `(range 0 n)` in the loop.
+//! The bounds are evaluated once, left to right, before the loop
+//! variable exists. Any other `for-each`, and `(range n)` outside it,
+//! is the library function.
 
 use crate::syntax::{Form, FormKind, Pos};
 
@@ -75,12 +77,26 @@ pub(super) fn dotimes(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Fo
     Ok(counting_loop(c, body, pos))
 }
 
-/// The `a b` of a literal `(range a b)`.
+/// The `a b` of a literal `(range a b)`, or `0 n` of `(range n)`
+/// (Decided, owner, 2026-09-27: `(range n)` is `(range 0 n)`).
 fn literal_range(form: &Form) -> Option<(Form, Form)> {
     match form.as_list()? {
         [head, a, b] if head.as_sym() == Some("range") => Some((a.clone(), b.clone())),
+        [head, n] if head.as_sym() == Some("range") => Some((int(0, &form.pos), n.clone())),
         _ => None,
     }
+}
+
+/// `(range a b)` ⟹ `(range-between a b)`; `(range n)` is declined and
+/// stays a call of the library function `range` (§4.4, §4.5). There is
+/// no arity overloading, so the two-argument form is this rewrite.
+pub(super) fn range(items: Vec<Form>, pos: Pos) -> Result<Outcome, ExpandError> {
+    check_arity("range", &items, 1, Some(2), &pos)?;
+    if let [_, a, b] = items.as_slice() {
+        let call = call("range-between", vec![a.clone(), b.clone()], &pos);
+        return Ok(Outcome::Expanded(call));
+    }
+    Ok(Outcome::Declined(Form::new(FormKind::List(items), pos)))
 }
 
 /// The `i` and body of a literal `(fn (i) body+)`: no name, one

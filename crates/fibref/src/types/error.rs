@@ -49,6 +49,11 @@ pub enum ErrorKind {
     AwaitOutsideAsync,
     /// `weak requires an object type` (§2.11).
     WeakScalar,
+    /// `weak of an Option is not allowed` (§2.11).
+    WeakOption,
+    /// `dyn requires an object type`, and `f requires an object type`
+    /// for an `(Object a)` bound of `f`'s scheme (§2.11, §2.15).
+    NotObject,
     /// `V is a constant, not a function; write V` (§2.2).
     ConstantCalled,
     /// `recur outside loop` (§2.4).

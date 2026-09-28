@@ -73,10 +73,10 @@ represented as one pointer, immutable unless it is a `Cell` or an `Atom`
 | `(Option T)` | no | if `T` is | built-in enum (§1.5; syntax §3.9): `nil` is a reader literal and the representation is special (§8.1) |
 | `(Cell T)` | **yes** | **no** | the one mutable container (§6) |
 | `(Atom T)` | yes, atomically | yes | requires `Send T` at construction (§7) |
-| `(Weak T)` | no | if `T` is | `T` must be an object type |
+| `(Weak T)` | no | if `T` is | `T` must be an object type other than an `Option` (§2.11); `(Weak (dyn P))` is two words (§8.1, §8.7) |
 | `(Task T)` | internal | if `T` is | made by `async` or `spawn` |
 | `(fn κ (A..) R)` | no | iff κ = `send` | a closure's colour is decided by what it captures (§5.4) |
-| `(dyn P)` | no | no (v1) | pointer plus vtable (§4.4) |
+| `(dyn P)` | no | no (v1) | pointer plus vtable (§4.4); made only of an object, never of a scalar (§2.15) |
 
 ### 1.3 Nominal types, generics, recursion
 
@@ -158,7 +158,10 @@ are (§8.1). The prelude derives `Eq`, `Ord` (`nil` before `some`),
 - `(Atom T)`: **Decided** (§7) a cell with atomic operations; well formed
   only if `Send T`, so an atom can always cross.
 - `(Weak T)`: **Decided** (§6) a non-owning reference; `@w` has type
-  `(Option T)`. A `Weak` value is itself a counted object (§8.7).
+  `(Option T)`. A `Weak` value is itself a counted object, the weak box
+  (§8.7); a `(Weak (dyn P))` is that box and the vtable, by value
+  (**Decided**, owner, 2026-09-27; §8.1). `T` is never an `Option`
+  (§2.11).
 - `(Task T)`: the result of `spawn` and of `async`; `join`, `block-on`
   and `await` take it. `Send (Task T) = Send T`. Any number of holders
   may join or await one task; the runtime resumes it on one thread at a
@@ -360,14 +363,31 @@ atom contents at `spawn`.
 ### 2.11 `weak`, `spawn`, `join`, `trap`
 
 ```
-weak    : ∀a. (Object a) ⇒ (fn :send (a) (Weak a))
+weak    : ∀a. (Weakable a) ⇒ (fn :send (a) (Weak a))
 spawn   : ∀a. (Send a) ⇒ (fn :send ((fn :send () a)) (Task a))
 join    : ∀a. (fn :send ((Task a)) a)                   ; block-on is the prelude alias
 trap    : ∀a. (fn :send (str) a)                        ; aborts; panic is the alias
 ```
 
-`(Object a)` is the built-in structural predicate "`a` is not a scalar",
-kept as a constraint on a variable and solved when its head is known.
+`(Object a)` is the built-in structural predicate "`a` is not a scalar"
+(a field-less enum is a scalar, §1); `(Weakable a)` is "`a` is an
+object type and not an `(Option ..)`", and implies `(Object a)`. Both
+are kept as a constraint on a variable, go into a scheme as a bound
+when the variable is quantified (so `(defun w (x) (weak x))` has the
+scheme `∀a. (Weakable a) ⇒ (fn (a) (Weak a))`), and are solved when the
+head is known. A scalar fails `(Weakable a)` with `weak requires an
+object type`; an `Option` with `weak of an Option is not allowed`
+(§6.14).
+
+**Decided** (owner, 2026-09-27): `(weak e)` with `e : (Option T)` is a
+type error (case 82). An `Option` has no object of its own for a weak
+reference to observe: for an object `T` it is the payload's pointer or
+null (§8.1), so its box would be the payload's and `@w` could not tell
+"the Option died" from "it was `nil`", and `(weak nil)` would read the
+header of a null pointer; a heap-enum `Option` (§8.1) is a fresh object
+at each `(some ..)` whose identity no program can hold on to. A program
+takes the weak reference of the object inside the `Option`.
+`(Weak (dyn P))` stays well formed (§8.7).
 
 ### 2.12 Arithmetic, comparison, conversions
 
@@ -390,9 +410,44 @@ not : (fn :send (bool) bool)
 
 `Self` in a signature stands for the dispatch type, so `(+ a b)` unifies
 both operands: `(+ (i32 1) 2)` is a type error, never a promotion.
-`(defun add (a b) (+ a b))` is `∀a. (Num a) ⇒ (fn :send (a a) a)`. Integer
-division and remainder trap on zero; signed overflow wraps (**Decided**:
-it is what lIR emits and what the interpreter can match exactly).
+`(defun add (a b) (+ a b))` is `∀a. (Num a) ⇒ (fn :send (a a) a)`.
+
+Integer arithmetic has Rust's semantics (**Decided**, owner, 2026-09-27;
+it replaces "signed overflow wraps", whose reason, that lIR emits
+exactly that, was wrong: LLVM's `sdiv` of the minimum by -1 is
+undefined behaviour and traps on x86-64, and its shifts and
+float-to-integer conversions give poison out of range). Every integer
+type is signed (§1.1), and at width `w`:
+
+- `/` and `rem` by zero trap (`integer / by zero`, `integer rem by
+  zero`); `/` rounds toward zero and `rem` has the sign of the dividend;
+- `+`, `-`, `*`, `/` and `neg` trap when the exact result does not fit
+  `w` (`integer overflow in + at i64`), `/` of the minimum by -1 and
+  `neg` of the minimum included; `rem` of the minimum by -1, whose
+  exact result 0 fits, traps too, as Rust's `%` does and because
+  LLVM's `srem` there is undefined;
+- `shl`, `shr` (logical) and `sar` (arithmetic) take the shift amount
+  modulo the width: `(shl x n)` is `x << (n mod w)`, so `(shl 1 64)` at
+  `i64` is 1 and a negative amount counts from the top (`n mod w` is
+  the low bits of `n`);
+- `bit-and`, `bit-or`, `bit-xor`, `bit-not` and `popcount` cannot
+  overflow; `popcount` counts the bits of the value at width `w`;
+- `(fptosi T e)` and `(fptoui T e)` saturate: a value above or below
+  the range of `T` (read as signed for `fptosi`, as unsigned for
+  `fptoui`), infinities included, gives the nearest end of the range,
+  and NaN gives 0; the value is truncated toward zero first. An
+  `fptoui` result is kept as its bits at `T`, as every integer is, so
+  `(fptoui i8 300.0)` is the `i8` whose bits are 255;
+- `trunc` keeps the low bits and `zext` and `sext` extend; these and
+  the float conversions `sitofp`, `uitofp`, `fptrunc` and `fpext` never
+  trap;
+- float arithmetic is IEEE 754 at its width and never traps.
+
+A trap ends the program with the message, as `trap` does (§2.11); in
+the interpreter it is a run-time error. The checks and the lIR each
+operation lowers to are in §8.12. Case 94 pins the masked shifts and
+the saturating conversions; the evaluator's unit tests pin the traps.
+
 Conversions are primitive forms whose first
 operand is a type: `(trunc i8 e)`, `(zext i64 e)`, `(sext i64 e)`,
 `(fptrunc f32 e)`, `(fpext f64 e)`, `(fptosi i64 e)`, `(fptoui i64 e)`,
@@ -470,8 +525,21 @@ other `&` argument is `& argument must be a cell variable`.
 ### 2.15 `dyn`
 
 ```
-(dyn P e)    e : S with the instance (P S) resolved at generalisation  ⇒ (dyn P)
+(dyn P e)    e : S, (Object S), with the instance (P S) resolved at generalisation  ⇒ (dyn P)
 ```
+
+**Decided** (owner, 2026-09-27): `(dyn P e)` with `e` a scalar (an
+integer, float, `bool`, `char`, `keyword`, `unit`, `ptr` or a
+field-less enum) is a type error, `dyn requires an object type` (case
+90). A `(dyn P)` value is an object pointer and a vtable (§8.1), and
+its count operations act on the object (§8.5); a scalar has no object
+word for them to act on, and `unit` has no value at all. A scalar to be
+dispatched dynamically is put in a struct first. `(Object S)` is the
+predicate of §2.11; when `S` is a quantified variable it is a bound of
+the scheme, so a generic function that makes a `dyn` of its argument
+requires an object argument, and an instantiation at a scalar is `f
+requires an object type` (§6.14). An `Option`, being an object type, may
+be made a `dyn`.
 
 A method call on a `(dyn P)` receiver has the method's signature with
 `self := (dyn P)`; methods whose signature mentions `self` anywhere but
@@ -569,7 +637,7 @@ bound, and again at the end of the SCC:
 | Constraint | Solved when | Failure |
 |---|---|---|
 | `(P T₁ .. Tₙ)` | head of `T₁` known: look up the unique instance for `(P, head T₁)`, instantiate it, unify its `S` with `T₁` and its determined arguments with `T₂ .. Tₙ` (the improvement `T₁ → T₂..`), then replace the constraint by the instance's declared context (§2.7). `T₁` a rigid variable: must be entailed by a bound. `T₁ = (dyn P)`: satisfied. `T₁` an unbound variable at generalisation: becomes a bound of the scheme if `T₁` occurs in the type, else `ambiguous constraint P a in f; add an annotation` | `no implementation of P for T₁` |
-| `(Send T)`, `(Object T)` | evaluated structurally once the head is known (§5.1); a quantified variable's constraint becomes a bound | `cell cannot be shared between threads: …` (§5.3) / `value of type T cannot be shared between threads: …` / `weak requires an object type` |
+| `(Send T)`, `(Object T)`, `(Weakable T)` | evaluated structurally once the head is known (§5.1, §2.11); a quantified variable's constraint becomes a bound | `cell cannot be shared between threads: …` (§5.3) / `value of type T cannot be shared between threads: …` / `dyn requires an object type` / `weak requires an object type` / `weak of an Option is not allowed` |
 | `HasField(T, f, R)` | `T` becomes a struct: `R ~` field type | `T has no field f`; unresolved at generalisation: `cannot infer the struct type of e for field f; annotate it` |
 | `HasDeref(T, R)` | `T` becomes `Cell`/`Atom`/`Weak`: `R ~ T'`/`T'`/`(Option T')` | unresolved: `cannot infer whether x is a cell, an atom or a weak reference` |
 | colour constraints | §5.4, after all type constraints of the SCC | `cell cannot be shared between threads: closure capture n has type (Cell T)` |
@@ -657,8 +725,8 @@ occurrences. Mutually recursive `defun`s get one scheme each.
   variable at generalisation the bound `(Send a)` goes into the scheme,
   so a generic function that makes an atom of its argument requires a
   sendable argument.
-- **Weak.** `(weak e)` emits `(Object T)`; `@w` resolves through the
-  `Deref` instance to `(Option T)`.
+- **Weak.** `(weak e)` emits `(Weakable T)`; `@w` resolves through the
+  `Deref` instance to `(Option T)`. `(dyn P e)` emits `(Object T)`.
 - **Protocols.** A method call emits `(P τ θ̄)` with τ the receiver's
   type and the result typed with `self := τ`, `d̄ := θ̄`; resolution and
   improvement happen in §3.3 step 1; what remains after zonking is a
@@ -1381,9 +1449,18 @@ returns", would need a frame each.
 
 **Unique write** (**Decided**, §5): `array-set!` and `set-field!` read the
 place's content without retaining, test `fib.unique?` (§8.2: the flags
-have none of `SHARED`, `IMMORTAL`, `STACK`, and the count is exactly
-1), and either write the object in place or build a copy with the
-change, store it into the place and release the old object. The flag
+have none of `SHARED`, `IMMORTAL`, `STACK`, `HAS-WEAK`, and the count
+is exactly 1), and either write the object in place or build a copy
+with the change, store it into the place and release the old object.
+`HAS-WEAK` is among the flags tested (**Decided**, owner, 2026-09-27;
+ownership.md §5): an object that ever had a weak reference is copied,
+never written in place, so a weak reference never sees an immutable
+object change. Under the counting semantics the update makes a new
+object and the old one dies when the place lets go of it, so `@w` is
+then `nil`; the in-place write, which would have made it `(some ..)`
+of the changed object, is an optimisation and may not be observable
+(ownership.md §2; case 89). The flag is never cleared, so the test
+needs no knowledge of whether a `Weak` value is still alive. The flag
 test comes first and is what protects static data (**Decided**): an
 immortal object (a literal, a `def` value, and every object reachable
 from one) has no count, so a value pulled out of a literal (`(match f
@@ -1464,8 +1541,12 @@ result 4; clean.
   a value) it allocates a box that is never cleared and leaves the
   object's header alone, so `@w` on it is always `(some ..)`: the
   upgrade tests the flag before the count, which is 0 on an immortal
-  (§8.7; **Decided**). `@w`: atomically "retain if still alive" (§8.7); result
-  `(Option T)`, `Owned`. Case 20: the inner `let` releases the only count
+  (§8.7; **Decided**). `HAS-WEAK`, once set, also makes every later
+  unique write of the object a copy (§6.6). `e` is never an `Option`
+  (§2.11). A weak reference to a `(dyn P)` value is a weak reference to
+  its object, sharing the object's one box with every other weak
+  reference to it, plus the vtable (§8.7). `@w`: atomically "retain if
+  still alive" (§8.7); result `(Option T)`, `Owned`. Case 20: the inner `let` releases the only count
   → the drop clears the box → `@w` is `nil`. Case 19: the only strong
   edges are `root → cell → [a] → cell → [b]`; parents are weak; `main`'s
   `let`s release `b`, `a`, `root` in reverse order, each freeing what
@@ -1986,6 +2067,9 @@ and a double release as a count going negative.
 | non-exhaustive match: missing V / redundant match clause | §2.6 |
 | await outside async | §6.9 |
 | weak requires an object type | §2.11 |
+| **weak of an Option is not allowed** | §2.11, case 82 |
+| **dyn requires an object type** | §2.15, case 90 |
+| f requires an object type (an `(Object a)` bound of `f`'s scheme instantiated at a scalar) | §2.11, §2.15 |
 | V is a constant, not a function; write V | §2.2 |
 | recur outside loop / recur not in tail position | §2.4, syntax §3.18 |
 | no implementation of P for a; add (P a) to the :where of the impl | §2.7 |
@@ -2122,12 +2206,22 @@ changing a rule.
 | `unit` | no value: `void` result, no argument; `()` in a value position is dropped | none |
 | field-less `defenum` | `i32` variant index | i32 |
 | `ptr` (unsafe) | `ptr`, uncounted | i64-like scalar |
-| every object type (`str`, `Form`, `Array`, struct, enum with fields, `Cell`, `Atom`, `Weak`, `Task`, closure) | `ptr` to a block starting with the header (§8.2) | ptr |
+| every object type (`str`, `Form`, `Array`, struct, enum with fields, `Cell`, `Atom`, `Weak` of a non-`dyn`, `Task`, closure) | `ptr` to a block starting with the header (§8.2) | ptr |
 | `(Option T)`, `T` an object type that is not itself an `Option` | `ptr`, null = `nil`; no allocation for `some` | opt |
-| `(Option T)`, `T` a scalar, a `dyn`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
+| `(Option T)`, `T` a scalar, a `dyn`, a `(Weak (dyn P))`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
 | `(fn κ (Ā) R)` | `ptr` to a closure object (§8.4) | ptr |
 | `(dyn P)` | `{ ptr ptr }` by value: object, vtable | dyn |
+| `(Weak (dyn P))` | `{ ptr ptr }` by value: the object's weak box (§8.7), vtable | dyn |
 | `(& T)` parameter | `ptr` to a private cell (§8.6) | — |
+
+A `(Weak (dyn P))` (**Decided**, owner, 2026-09-27) is laid out like a
+`(dyn P)`, two words by value, and takes the layout class `dyn`: the
+first word is the weak box of the object behind the `dyn` (the one box
+of that object, §8.7, shared by every weak reference to it whatever
+protocol it is viewed through) and the second the vtable of the `(dyn
+P)` it was made from. Its count operations act on the box, as a `(dyn
+P)`'s act on the object (§8.5). A `(Weak T)` for any other `T` is the
+box alone.
 
 The null representation is used exactly when `T`'s own representation
 has no null value. `(Option (Option str))` is therefore a heap enum
@@ -2151,7 +2245,8 @@ Every object begins with a 16-byte header:
 ```
 (defstruct fib.hdr (i64 i32 i32))       ; count, type-id, flags
 flags: bit 0 SHARED    counts are atomic from now on (§7)
-       bit 1 HAS-WEAK  a weak box exists (§8.7)
+       bit 1 HAS-WEAK  a weak box exists or existed (§8.7); never cleared;
+                       fib.unique? refuses the object (§6.6)
        bit 2 STACK     a scope-local object: retain/release are no-ops (§6.11)
        bit 3 IMMORTAL  static data: literals and everything reachable from them,
                        def values (syntax §3.19), named-function closures, vtables
@@ -2222,8 +2317,10 @@ fib.drop    (ptr p) -> void
     call fib.types[tid].drop p                   ; releases children
     free p
 fib.unique? (ptr p) -> i1
-    if flags(p) & (SHARED|IMMORTAL|STACK): return 0   ; shared: never written in place; static and
-                                                      ; stack data have no count to test (§6.6)
+    if flags(p) & (SHARED|IMMORTAL|STACK|HAS-WEAK): return 0
+                                                      ; shared: never written in place; static and
+                                                      ; stack data have no count to test; a weak
+                                                      ; reference may observe it (§6.6)
     return count == 1
 fib.share   (ptr p) -> void                      ; §8.8
 fib.immortalise (ptr p) -> void                  ; def initialisation (syntax §3.19): walk p through trace,
@@ -2385,7 +2482,10 @@ protocol order, holding the code pointers. lIR has no struct-typed
 the module initialiser allocates the block, `store`s each code pointer
 into its slot and stores the block's address into the `ptr` global
 `P.vt.K` (§8.2); a struct-valued constant, if lIR gains one, would make
-it static data (§8.11). `(dyn P e)` builds `{ e, (load ptr @P.vt.K) }`;
+it static data (§8.11). `(dyn P e)` builds `{ e, (load ptr @P.vt.K) }`,
+`e` always an object (a `ptr`, or an `opt` that may be null, which the
+null-tolerant count operations accept; a scalar `e` is rejected by
+§2.15);
 a method call loads slot `i` and `indirect-call`s with `obj` as `self`.
 Retain and release of a `(dyn P)` value act on `obj`.
 
@@ -2398,7 +2498,8 @@ Retain and release of a `(dyn P)` value act on `obj`.
 
 `fib.cell` is one `defstruct` per content layout. A `(dyn P)` content,
 two words by value (§8.1), is laid out as two `ptr` fields, object then
-vtable: `(i64 i32 i32 ptr ptr)`, which lIR's `defstruct` takes as
+vtable: `(i64 i32 i32 ptr ptr)`, and a `(Weak (dyn P))` content the same
+way, box then vtable, which lIR's `defstruct` takes as
 documented (lir-core also parses a `{ ptr, ptr }` field type, which
 `doc/lIR.md` does not document).
 
@@ -2411,7 +2512,8 @@ documented (lir-core also parses a `{ ptr, ptr }` field type, which
   `(alloca i64 (i32 k))` per call site in the entry block, reused by
   every execution of the call (§8.2), sized like any stack object: `k`
   is the header's two words plus the content's, one word for a scalar, a
-  `ptr` or an `opt` and two for a `(dyn P)`, so 3 or 4 (a fixed three
+  `ptr` or an `opt` and two for a `(dyn P)` or a `(Weak (dyn P))`, so 3
+  or 4 (a fixed three
   words let the copy-in and every `set!` of a `dyn` write its vtable
   word past the slot, into a neighbouring slot of the entry block:
   proposed case 77) — addressed through
@@ -2439,6 +2541,15 @@ documented (lir-core also parses a `{ ptr, ptr }` field type, which
   `load == old` compares the word (the object's address, a scalar's
   bits). `f` is `:borrow` at `swap!`'s own call (§2.10), so the caller
   passes it with no count and the two retains are `swap!`'s.
+  **Decided** (owner, 2026-09-27; ownership.md §7): the loop has no
+  bound. `swap!` retries while the atom changes between the snapshot
+  and the compare, so it is not guaranteed to finish under contention,
+  nor when `f` itself changes the atom on every run (directly, or
+  through a thread it waits for), as in Clojure; no back-off, fairness
+  or retry limit is specified, and none may change the result of a
+  `swap!` that does finish. The interpreter's executor is
+  deterministic, so its `swap!` retries only when `f` changed the atom
+  (case 81).
 - `(reset! a v)`: `consume v`; `fib.share v` if `SHARED`; lock; `old =
   load`; `store v`; unlock; `fib.release old`.
 
@@ -2473,7 +2584,26 @@ target`; if null → unlock, `nil`; else if `t` is `IMMORTAL` → unlock,
 `SHARED`; a `cmpxchg` loop refusing zero when `SHARED`); unlock; return
 `t` or `nil`.
 `fib.weak-clear obj`: lock the box, store null, unregister, unlock;
-called from `fib.drop` before the children are released. The box is
+called from `fib.drop` before the children are released. `HAS-WEAK`
+stays set on the object until it is freed, whatever happens to its
+`Weak` values, and makes `fib.unique?` false (§8.2, §6.6).
+
+**`(Weak (dyn P))`** (**Decided**, owner, 2026-09-27; case 87). The
+value is `{ box, vt }` by value (§8.1). `(weak d)` for `d : (dyn P)` =
+`{ obj, vt }`: the box is found or made for `obj` exactly as above,
+so an object has one box however many weak references are taken of it
+and through whichever protocols (a `(weak x)` of the object itself and
+a `(weak (dyn Q x))` share it), and it is retained once for the new
+value; the vtable is copied from `d`. The `(Weak (dyn P))` value holds
+that one count on the box and no count on `obj`; its retain and
+release act on the box. `@w`: the upgrade above on the box gives `t`
+or `nil`; for `t` the result is `(some { t, vt })`, which by §8.1 is a
+heap enum of tag `some` holding the two words, allocated with count 1
+for the caller and owning the count the upgrade took on `t`; for `nil`
+it is the heap enum of tag `nil`. The vtable is `IMMORTAL` (§8.2) and
+needs no count. `Send((Weak (dyn P))) = Send((dyn P)) = false` in v1
+(§5.1: `Send((Weak T)) = Send(T)`, unchanged), so the box of a
+`(Weak (dyn P))` is never reached from another thread through it. The box is
 freed when its own count reaches zero and its target is null or
 `IMMORTAL`. Only
 objects that had a `weak` taken pay: one flag test in `fib.drop`, and
@@ -2619,11 +2749,12 @@ interpreter may run tasks as coroutines; frees must match.
 | `set!`, `reset!`, `swap!` | as §8.6: `consume` new, share if `SHARED`, store, `fib.release` old |
 | `&` copy-in | acquire: `fib.retain` the variable's content and store it into the private cell (§6.6); nothing for a forwarded `&v` in a self tail call, nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
 | `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content |
-| `array-set!`, `set-field!` | `fib.unique?` test (flags first, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
+| `array-set!`, `set-field!` | `fib.unique?` test (flags first, `HAS-WEAK` among them, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
 | module initialiser `fib.init.<module>` | called by the entry point before the program's `main`, modules in dependency order (§8.2): allocate and fill the type table, build every static object (literals, named-function closures, vtables) with `fib.alloc` and an `IMMORTAL` header, store each address into its `ptr` global |
 | `def` initialisation | in the module initialiser after its static objects, `def`s in source order: evaluate the constant expression and `fib.immortalise` its value (syntax §3.19); as static data once lIR holds struct-typed constants (§8.11) |
 | stack object (`STACK`: private `&` cell, stack closure, scope-local object, §6.11) | `(alloca i64 (i32 k))`, `k` the layout in 8-byte words, one per allocation site in the function's entry block, reused by every execution of the site; header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |
-| `(weak x)` | box lookup or allocation under the table mutex; `HAS-WEAK` set with `atomicrmw or` (§8.7) |
+| `(weak x)` | box lookup or allocation under the table mutex; `HAS-WEAK` set with `atomicrmw or` (§8.7); for a `dyn` operand, the box of its object paired with its vtable |
+| integer `/`, `rem`, `+`, `-`, `*`, `neg`; shifts; `fptosi`, `fptoui` | the checks and saturations of §8.12, before or instead of the bare LLVM operation |
 | tail call, `loop`/`recur` | §8.9: consume the arguments, run the releases, `tailcall`/`indirect-tailcall` or `br` |
 | `raw-retained` | `consume` the operand; the count is the foreign side's until `release-raw`/`fib_release` |
 | `drop` per type | `fib.release` each object field; `fib.weak-clear` if flagged; `free` |
@@ -2659,6 +2790,40 @@ static data). `lair` today parses `(alloca %struct.T)` and `(global g
 %struct.T ..)` as `UnknownType` and rejects `(global g ptr @f)` as an
 unimplemented initialiser, which is what fixed the v1 shapes. Nothing
 here needs ADR 021's safe lIR.
+
+### 8.12 Arithmetic and conversions
+
+**Decided** (owner, 2026-09-27; §2.12). LLVM leaves exactly the cases
+that §2.12 defines undefined or poison (`sdiv`/`srem` by zero or of the
+minimum by -1, `add`/`sub`/`mul` with `nsw` on overflow, a shift by at
+least the width, `fptosi`/`fptoui` out of range), so the compiler
+emits every check itself, never the bare instruction, and never the
+`nsw`/`nuw` flags. `w` is the operand width, `MIN`/`MAX` its signed
+bounds; a trap is `(call @fib.trap msg)`, where `fib.trap` is a
+`fib.rt` function that writes the message (a string global) to
+standard error and aborts, as the builtin `trap` does (§2.11); the
+block it is called from branches nowhere after it.
+
+| Operation | lIR emitted |
+|---|---|
+| `(/ a b)`, `(rem a b)` | `(icmp eq b 0)` → trap `integer / by zero` (or `rem`); `(and (icmp eq a MIN) (icmp eq b -1))` → trap `integer overflow in / at w` (or `rem`); else `sdiv` / `srem` |
+| `(+ a b)` | `r = (add a b)`; `(icmp slt (and (xor a r) (xor b r)) 0)` → trap `integer overflow in + at w`; else `r` |
+| `(- a b)` | `r = (sub a b)`; `(icmp slt (and (xor a b) (xor a r)) 0)` → trap; else `r` |
+| `(* a b)`, `w` < 64 | `r = (mul (sext i64 a) (sext i64 b))`; `(icmp ne (sext i64 (trunc w r)) r)` → trap; else `(trunc w r)` |
+| `(* a b)`, `w` = 64 | `r = (mul a b)`; trap if `(and (icmp eq a -1) (icmp eq b MIN))`, else if `a ≠ 0` and `a ≠ -1` and `(icmp ne (sdiv r a) b)`; else `r` (the order keeps the `sdiv` defined) |
+| `(neg a)` | `(icmp eq a MIN)` → trap `integer overflow in neg at w`; else `(sub 0 a)` |
+| `(shl a n)`, `(shr a n)`, `(sar a n)` | `(shl a (and n (w - 1)))`, `(lshr ..)`, `(ashr ..)`: `w` is a power of two, so the `and` is `n mod w` |
+| `(fptosi T x)` | `(fcmp uno x x)` → 0; `(fcmp oge x 2^(bits(T)-1))` → `MAX`; `(fcmp olt x -2^(bits(T)-1))` → `MIN`; else `(fptosi T x)`: both bounds are powers of two, exact in `float` and `double`, and a value in between truncates into range |
+| `(fptoui T x)` | `(fcmp uno x x)` → 0; `(fcmp olt x 0.0)` → 0; `(fcmp oge x 2^bits(T))` → all ones; else `(fptoui T x)` |
+| `bit-and`, `bit-or`, `bit-xor`, `bit-not`, `popcount`, comparisons, `trunc`, `zext`, `sext`, `sitofp`, `uitofp`, `fptrunc`, `fpext`, float arithmetic | the LLVM instruction as it is, no check |
+
+The saturating conversions are what LLVM's `llvm.fptosi.sat` and
+`llvm.fptoui.sat` compute, and the overflow tests what
+`llvm.s{add,sub,mul}.with.overflow` report; the compiler may use those
+intrinsics instead once lIR can call them (§8.11), with the same
+results. The interpreter computes each operation exactly and traps or
+saturates under the same conditions (`fibref` `eval/arith.rs`), so the
+two agree on every input (method.md rule 6).
 
 ---
 
@@ -2862,5 +3027,56 @@ The owner decided the three items the fourth review round left open:
 3. **ownership.md §5 and §8 reworded** as recommended: §5 describes the
    private cell read with `@v`; §8 cites case 14 for the `&` rule and
    case 11 for the retain on entry.
+
+### Decided on the rule-4 adversary's findings
+
+The adversary of method.md rule 4, attacking the running interpreter
+given only the spec, found fifteen programs (`cases/ownership/` 81 to
+95). Nine were interpreter bugs (81, 83, 84, 85, 88, 91, 92, 93, 95),
+already fixed in `fibref` without a rule change when the decisions
+below were applied; 81 also raised item 7. Seven needed the owner, who
+decided them on 2026-09-27:
+
+1. **Weak of an `Option` value: rejected** (finding 002, case 82).
+   `(weak e)` with `e : (Option T)` is a type error, `weak of an Option
+   is not allowed`: `weak`'s bound is `(Weakable a)`, an object type
+   that is not an `Option` (§2.11, §1.2, §1.6, §3.3, §3.7, §6.7,
+   §6.14; ownership.md §6; syntax §3.11).
+2. **`range` arity: both** (finding 006, case 86). `(range n)` is
+   `(range 0 n)` and `(range a b)` is valid; the library keeps the
+   one-argument function and a prelude macro rewrites the two-argument
+   form to `range-between` (syntax §4.4, §4.5). The finding also showed
+   that a `for-each` over `(range a b)` with an annotated `fn`
+   parameter was a type error; it is now the library call, which
+   checks the annotation.
+3. **`(Weak (dyn P))`: supported** (finding 007, case 87). It is `{
+   box, vtable }` by value, like `(dyn P)`: the object's one weak box,
+   shared by every weak reference to it whatever protocol it is viewed
+   through, and the vtable; it holds one count on the box, and `@w`
+   builds `(Option (dyn P))`, a heap enum, from the box's target and
+   the stored vtable. `Send((Weak T)) = Send(T)` is unchanged (§8.1,
+   §8.6, §8.7, §8.10, §1.2, §1.6, §6.7).
+4. **A weak reference observing an in-place update: in-place update
+   requires count 1 and `HAS-WEAK` clear** (finding 009, case 89). An
+   object that ever had a weak reference is copied on update rather
+   than written in place (ownership.md §2, §5; §6.6, §6.7, §8.2,
+   §8.7, §8.10). The case, which pinned 9 as the in-place result, now
+   expects 100.
+5. **`dyn` of a scalar: rejected** (finding 010, case 90). `(dyn P e)`
+   requires `(Object S)`, and a scalar is `dyn requires an object
+   type` (§2.15, §1.2, §3.3, §3.7, §6.14, §8.5; syntax §3.10).
+6. **Arithmetic: Rust's semantics** (finding 014, case 94), replacing
+   "signed overflow wraps": division and remainder by zero trap; signed
+   overflow of `+ - * /` and `neg`, the minimum divided by -1
+   included, traps, and so does `rem` of the minimum by -1, as in Rust;
+   shift amounts are taken modulo the width; float-to-integer
+   conversion saturates, NaN giving 0. §8.12 gives the checks the
+   compiler emits, since LLVM makes each of these undefined or poison
+   (§2.12, §8.10, §8.12; syntax Open decisions item 16).
+7. **`swap!` under contention may not terminate** (finding 001, case
+   81): `swap!` retries while the atom changes, with no bound, so it is
+   not guaranteed to finish under contention or when `f` itself changes
+   the atom on every run, as in Clojure (ownership.md §7; §8.6; syntax
+   §3.11).
 
 Nothing is open.

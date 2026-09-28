@@ -35,7 +35,9 @@ evaluator over the audited heap.
       withdrawn: they use field places, removed by D1)
 - [ ] known gaps: a spin loop on an atom that another thread would set
       hangs under the deterministic executor
-- [ ] method rule 4: an adversary attacking the running interpreter
+- [x] method rule 4: an adversary attacking the running interpreter;
+      its 15 findings promoted as cases 81 to 95 after the owner's
+      decisions of 2026-09-27 (spec/types.md §10): 93 cases, all passing
 - [ ] method rule 5: random well-typed programs, all passing the audit
 
 ## M3. Hardened lIR

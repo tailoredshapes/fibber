@@ -1,0 +1,17 @@
+;; spec:   §7 (types §2.10, §6.5, §8.4, §8.6)
+;; expect: accept
+;; result: 2
+;; audit:  clean
+;; swap! called directly with a heap closure taken from a struct field.
+;; f is :borrow at swap!'s own call, so the caller passes it with no
+;; count, but swap! calls it through a function value, whose code
+;; releases its env at its exit; so swap! retains f before each call
+;; (types §8.6). Without that retain the closure's count dropped by one
+;; per swap! and the struct's drop released freed memory (adversary
+;; finding 008).
+(defstruct H (f: (fn (i64) i64)))
+
+(defun main () -> i64
+  (let ((a (atom 1))
+        (h (H (fn (x) (+ x 1)))))
+    (swap! a (. h f))))

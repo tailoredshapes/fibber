@@ -3,10 +3,26 @@
 use super::{clean, failed};
 
 #[test]
-fn arithmetic_wraps_at_the_width_and_division_by_zero_traps() {
-    clean("(defun main () -> i64 (sext i64 (+ 127i8 1i8)))", -128);
+fn arithmetic_traps_on_overflow_and_division_by_zero() {
+    // types §2.12 (Decided, owner, 2026-09-27): Rust's semantics.
+    clean("(defun main () -> i64 (sext i64 (+ 126i8 1i8)))", 127);
+    let msg = failed("(defun main () -> i64 (sext i64 (+ 127i8 1i8)))");
+    assert!(msg.contains("trap: integer overflow in + at i8"), "{msg}");
     let msg = failed("(defun main () -> i64 (/ 1 (- 1 1)))");
     assert!(msg.contains("trap: integer / by zero"), "{msg}");
+    let min = "(- (- 0 9223372036854775807) 1)";
+    let msg = failed(&format!("(defun main () -> i64 (/ {min} -1))"));
+    assert!(msg.contains("trap: integer overflow in / at i64"), "{msg}");
+    let msg = failed(&format!("(defun main () -> i64 (neg {min}))"));
+    assert!(msg.contains("trap: integer overflow in neg"), "{msg}");
+}
+
+#[test]
+fn shifts_mask_and_float_conversions_saturate() {
+    clean("(defun main () -> i64 (+ (shl 1 64) (sar -1 65)))", 0);
+    clean("(defun main () -> i64 (fptosi i64 (/ 0.0 0.0)))", 0);
+    clean("(defun main () -> i64 (sext i64 (fptosi i8 300.0)))", 127);
+    clean("(defun main () -> i64 (fptosi i64 (/ 1.0 0.0)))", i64::MAX);
 }
 
 #[test]

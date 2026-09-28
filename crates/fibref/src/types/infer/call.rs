@@ -54,7 +54,8 @@ impl Cx<'_> {
             let kind = match p {
                 Pred::Proto(q, args) => DKind::Proto(q, args, dispatch),
                 Pred::Send(t) => DKind::Send(t, vec![send_root(s, &p_var(&s.preds[i]), who)]),
-                Pred::Object(t) => DKind::Object(t),
+                Pred::Object(t) => DKind::Object(t, who.to_string()),
+                Pred::Weakable(t) => DKind::Weakable(t),
             };
             let site = dispatch.map(|_| site);
             self.defer(kind, pos, site);

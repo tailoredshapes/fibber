@@ -1,0 +1,35 @@
+;; spec:   §1, §6 (types §1.5, §6.11, §8.1, §8.3)
+;; expect: accept
+;; result: 1129
+;; audit:  clean
+;; An (Option T) with T a scalar, or itself an Option, is a heap enum
+;; (types §8.1, §8.3), and an Option value is never a stack candidate
+;; (§6.11). So every (some 5), (some nil) and nil of such a type below
+;; is a counted object, and each must be released exactly once: stored
+;; in a cell and replaced by set!, stored in an atom and replaced by
+;; swap!, held in a vector, captured by a closure, built by the
+;; prelude's generic iterator (next at (Option i64)) and matched through
+;; nested patterns: 5 + 100 + 3 + 7 + 11 + 3 + 1000 = 1129. The result
+;; alone cannot tell the representations apart; the audit can, since
+;; these objects are now allocated at all (adversary finding 015; unit
+;; test eval::tests::options::a_some_of_a_scalar_allocates_a_heap_object).
+(defun first-even (v: (Vec i64)) -> (Option i64)
+  (next (filter-iter (iter v) even?)))
+
+(defun main () -> i64
+  (let ((c (cell (some 1)))
+        (a (atom (some 2)))
+        (n (some nil))
+        (x (some (some 3)))
+        (os [(some 7) nil (some 4)])
+        (k (let ((o (some 11))) (fn () (match o ((some v) v) (nil 0))))))
+    (do (set! c (some 5))
+        (swap! a (fn (o) (match o ((some v) (some (+ v 1))) (nil (some 10)))))
+        (+ (match @c ((some v) v) (nil 0))
+           (+ (match n ((some nil) 100) ((some (some _)) 1) (nil 2))
+              (+ (match x ((some (some v)) v) (_ 0))
+                 (+ (match (nth os 0) ((some v) v) (nil 0))
+                    (+ (k)
+                       (+ (match @a ((some v) v) (nil 0))
+                          (match (first-even [1 3 4 6])
+                            ((some 4) 1000) (_ 0)))))))))))

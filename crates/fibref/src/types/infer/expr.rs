@@ -285,6 +285,7 @@ impl Cx<'_> {
         pos: &Pos,
     ) -> TResult<Ty> {
         let t = self.infer(x)?;
+        self.defer(DKind::Object(t.clone(), "dyn".to_string()), pos, None);
         let mut args = vec![t];
         let mut dtys = Vec::new();
         for d in dets {

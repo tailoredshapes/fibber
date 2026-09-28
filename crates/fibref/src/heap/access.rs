@@ -87,13 +87,18 @@ impl Heap {
         Ok(())
     }
 
-    /// Makes a weak reference to a live object (§6). No count change.
-    /// Event: `Weak`. A stack object is `WeakToStack`: `weak` forces its
+    /// Makes a weak reference to a live object (§6). No count change;
+    /// sets `HAS-WEAK` on a counted object, which `fib.unique?` then
+    /// refuses for good (§6.6). Event: `Weak`. A stack object is `WeakToStack`: `weak` forces its
     /// operand onto the heap (§6.7, §6.11). An immortal object may have
     /// one; it never dies, so upgrading it always succeeds (§8.7).
     pub fn weak(&mut self, id: ObjId) -> Result<Value, AuditError> {
-        if self.live_object(id, Op::Weak)?.scope.is_some() {
+        let object = self.live_object(id, Op::Weak)?;
+        if object.scope.is_some() {
             return Err(AuditError::WeakToStack { id });
+        }
+        if !object.immortal {
+            self.objects[id.index()].has_weak = true;
         }
         self.trace.push(Event::Weak { id });
         Ok(Value::Weak(id))

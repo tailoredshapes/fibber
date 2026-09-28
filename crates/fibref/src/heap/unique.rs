@@ -31,7 +31,7 @@ use super::Heap;
 
 impl Heap {
     /// `fib.unique?` (§8.2) on a live object: none of `SHARED`,
-    /// `IMMORTAL`, `STACK`, and a count of exactly 1. The interpreter
+    /// `IMMORTAL`, `STACK`, `HAS-WEAK`, and a count of exactly 1. The interpreter
     /// calls it to decide between writing in place and copying.
     pub fn is_unique(&self, id: ObjId) -> Result<bool, AuditError> {
         Ok(not_unique(self.live_object(id, Op::Inspect)?).is_none())
@@ -102,6 +102,8 @@ fn not_unique(object: &Object) -> Option<Uniqueness> {
         Some(Uniqueness::Immortal)
     } else if object.scope.is_some() {
         Some(Uniqueness::Stack)
+    } else if object.has_weak {
+        Some(Uniqueness::HasWeak)
     } else if object.count != 1 {
         Some(Uniqueness::Count(object.count))
     } else {

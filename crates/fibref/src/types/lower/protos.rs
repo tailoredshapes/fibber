@@ -342,11 +342,12 @@ pub fn where_preds(g: &Globals, m: ModuleId, cs: &Form, vars: &[String]) -> TRes
     Ok(out)
 }
 
-/// `(P T..)`, `(Send T)` or `(Object T)` from its parts.
+/// `(P T..)`, `(Send T)`, `(Object T)` or `(Weakable T)` from its parts.
 pub fn pred_of(g: &Globals, m: ModuleId, name: &str, mut tys: Vec<Ty>, pos: &Pos) -> TResult<Pred> {
     match (name, tys.len()) {
         ("Send", 1) => return Ok(Pred::Send(tys.remove(0))),
         ("Object", 1) => return Ok(Pred::Object(tys.remove(0))),
+        ("Weakable", 1) => return Ok(Pred::Weakable(tys.remove(0))),
         _ => {}
     }
     let Some(p) = g.proto_name(m, name) else {

@@ -1,0 +1,22 @@
+;; spec:   §7 (types §2.10, §8.6)
+;; expect: accept
+;; result: 12
+;; audit:  clean
+;; swap! is compare-and-retry: when the atom changes while f runs, f
+;; runs again on the new content. Here f, on its first run only, has
+;; another thread add 10 to the atom and waits for it; the compare then
+;; fails (11, not 1), f runs again on 11 and 12 is stored. An
+;; interpreter that stored f's first result without the compare lost
+;; the other thread's update and returned 2 (adversary finding 001).
+;; A swap! whose f changes the atom on every run never finishes, as in
+;; Clojure; ownership.md §7 and types §8.6 say so.
+(defun main () -> i64
+  (let ((a (atom 1))
+        (once (atom false)))
+    (swap! a (fn (x)
+               (do (if @once
+                       ()
+                       (do (reset! once true)
+                           (join (spawn (fn () (swap! a (fn (y) (+ y 10))))))
+                           ()))
+                   (+ x 1))))))
