@@ -213,6 +213,44 @@ impl<'a> Fcx<'a> {
                 ty.show_params()
             ));
         }
+        self.result_in_registers(ty.ret.as_ref(), op, p)
+    }
+
+    /// Rule 5 of spec/lir.md §7.3: a result the target may return in
+    /// memory (through a hidden pointer) cannot be tail-called, since
+    /// the callee would write the caller's temporary; LLVM aborts on
+    /// such a `musttail` ("failed to perform tail call elimination").
+    /// Portably: at most two leaves, each a scalar or a vector of at
+    /// most 512 bits.
+    fn result_in_registers(&self, ret: Option<&Type>, op: &str, p: Pos) -> Result<()> {
+        let Some(ret) = ret else {
+            return Ok(());
+        };
+        let (leaves, widest) = self.leaves(ret);
+        if leaves > 2 || widest > 512 {
+            return err(p, format!(
+                "{op}: a result of type {ret} may be returned in memory, which no tail call can: at most 2 scalar or vector leaves of at most 512 bits (found {leaves} leaves, the widest {widest} bits)"
+            ));
+        }
         Ok(())
+    }
+
+    /// How many scalars and vectors `t` holds, structs and arrays
+    /// flattened, and the widest of them in bits (a pointer counts 64).
+    fn leaves(&self, t: &Type) -> (u64, u64) {
+        match t {
+            Type::Array(n, e) => {
+                let (count, widest) = self.leaves(e);
+                (count.saturating_mul(*n), widest)
+            }
+            Type::Named(_) | Type::Anon(_) => self
+                .env
+                .fields(t)
+                .unwrap_or_default()
+                .iter()
+                .map(|f| self.leaves(f))
+                .fold((0, 0), |(c, w), (fc, fw)| (c.saturating_add(fc), w.max(fw))),
+            leaf => (1, leaf.bits().unwrap_or(64)),
+        }
     }
 }

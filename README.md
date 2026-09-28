@@ -30,7 +30,7 @@ cargo test --workspace                          # the full suite (lair needs LLV
 cargo run -p fibref -- cases cases/ownership    # 166 cases
 cargo run -p fibref -- run   <file.fib>         # result and memory audit
 cargo run -p fibref -- explain <file.fib>       # the ownership decisions
-cargo run -p lair -- cases cases/lir            # 317 lIR cases, JIT and AOT
+cargo run -p lair -- cases cases/lir            # 323 lIR cases, JIT and AOT
 cargo run -p lair -- run   <file.lir>           # JIT-compile and run main
 cargo run -p lair -- build <file.lir> -o out    # native executable
 cargo run -p lair -- check <file.lir>           # the checker alone
@@ -52,6 +52,6 @@ cargo run -p lair -- fuzz cases/lir --count N   # mutation fuzzer over the accep
 | Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
 | Library | [lib/prelude.fib](lib/prelude.fib) | what the cases need |
 | lIR: the assembler for LLVM IR that `fibc` will emit | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28; the second M3 pass's additions decided the same day, §14 items 8 to 11) |
-| lIR cases | [cases/lir/](cases/lir/) | 317, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial; verify: one reject case per rule) |
+| lIR cases | [cases/lir/](cases/lir/) | 323, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial, the fuzzer's findings among them; verify: one reject case per rule) |
 | lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |
 | Compiler `fibc` | — | not started (M4) |

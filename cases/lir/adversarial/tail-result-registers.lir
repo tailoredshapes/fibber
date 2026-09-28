@@ -1,0 +1,28 @@
+;; expect: accept
+;; exit: 42
+;; out: pair 2 dyn 1 arr 4 vec 8 nested 3
+;; §7.3 rule 5's boundary: two leaves of at most 512 bits each are
+;; returned in registers on every 64-bit target, so these tail calls
+;; are jumps (each caller and callee return the same type)
+(declare printf i32 (ptr ...))
+(defstruct dyn (ptr ptr))
+(defstruct nested ({ i64 } [1 x i64]))
+(define tailcc (pair { i64, i64 }) () (block entry (ret { (i64 1) (i64 2) })))
+(define tailcc (pair-tail { i64, i64 }) () (block entry (tailcall @pair)))
+(define tailcc (dyn %struct.dyn) () (block entry (ret (%struct.dyn (ptr null) @printf))))
+(define tailcc (dyn-tail %struct.dyn) () (block entry (tailcall @dyn)))
+(define tailcc (arr [2 x i64]) () (block entry (ret ([2 x i64] (i64 3) (i64 4)))))
+(define tailcc (arr-tail [2 x i64]) () (block entry (tailcall @arr)))
+(define tailcc (vec <8 x i64>) () (block entry (ret (<8 x i64> 1 2 3 4 5 6 7 8))))
+(define tailcc (vec-tail <8 x i64>) () (block entry (tailcall @vec)))
+(define tailcc (nest %struct.nested) () (block entry (ret (%struct.nested { (i64 3) } ([1 x i64] (i64 9))))))
+(define tailcc (nest-tail %struct.nested) () (block entry (tailcall @nest)))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "pair %lld dyn %lld arr %lld vec %lld nested %lld\n")
+      (extractvalue (call @pair-tail) 1)
+      (zext i64 (icmp eq (extractvalue (call @dyn-tail) 1) @printf))
+      (extractvalue (call @arr-tail) 1)
+      (extractelement (call @vec-tail) (i32 7))
+      (extractvalue (extractvalue (call @nest-tail) 0) 0))
+    (ret (i32 42))))

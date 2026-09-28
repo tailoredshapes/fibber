@@ -85,10 +85,14 @@ through both paths in its own process, and both must agree.
 - [x] the ADR 021 layer removed; string globals, `fence`,
       `indirect-call` (now typed) fixed; `tailcall` is `musttail` under
       `tailcc`, so a 10^7-deep tail recursion runs in constant stack
-- [x] end-to-end ahead-of-time tests: 317 cases in cases/lir (63
-      accept, 254 reject), each through the JIT and through AOT
+- [x] end-to-end ahead-of-time tests: 323 cases in cases/lir (64
+      accept, 259 reject), each through the JIT and through AOT
       (`cargo test -p lair`, `lair cases cases/lir`); the checker alone
       re-runs them without LLVM (`cargo test -p lir`)
+- [x] method rule 7 attacked: `lair fuzz`, a mutation fuzzer over the
+      accept cases (lir.md §10.1); 80,000 mutants and a batch of
+      hand-written modules, one finding (tail-call results returned in
+      memory, §7.3 rule 5), kept as adversarial cases
 - [x] `lair` as a library: `Jit` compiles modules in-process and returns
       callable functions; a later module reaches an earlier one by
       `declare` and `declare-global`; a `tailcc` function is called from

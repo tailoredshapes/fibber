@@ -565,7 +565,20 @@ overflows the stack.) The rules, checked against the callee's type
    §14 item 2: no ambiguity about which function is tailed);
 4. under `ccc`, the parameter types are identical: `tailcall under ccc
    needs identical parameter types (@f has (i64), @g has (i64 i64));
-   use tailcc`. Under `tailcc` they may differ.
+   use tailcc`. Under `tailcc` they may differ;
+5. the result is returned in registers: `void`, or a type with at most
+   two leaves (structs and arrays flattened), each a scalar or a vector
+   of at most 512 bits: `tailcall: a result of type { i64, i64, i64,
+   i64 } may be returned in memory, which no tail call can: at most 2
+   scalar or vector leaves of at most 512 bits (found 4 leaves, the
+   widest 64 bits)`. A result the target returns through a hidden
+   pointer needs a temporary in the caller's frame, so LLVM aborts on
+   the `musttail` ("failed to perform tail call elimination on a call
+   site marked musttail"; x86-64 gives up beyond three integer or four
+   floating leaves, `adversarial/tail-result-memory.lir`). The bound
+   is what every 64-bit target returns in registers; `{ ptr, ptr }`,
+   the dyn value of types.md §8, is within it.
+
 A `tailcall` whose callee takes a pointer to one of the caller's
 `alloca`s is undefined behaviour (the frame is gone); lIR does not
 check it (§6.12).
@@ -662,6 +675,18 @@ same seed gives the same mutants whatever the scheduling, since mutant
 `LAIR_FUZZ_SEED=N` set a larger budget or another seed. Every finding
 is minimised and kept as a case in `cases/lir/adversarial/`, with the
 rule it led to.
+
+The first campaign (2026-09-28, seeds 1 to 4, 80,000 mutants, 20,000 of
+them through `-O2`) found nothing: 93% of mutants were rejected with a
+diagnostic, the rest ran, and every crash or hang at run time was the
+mutant's own undefined behaviour. A batch of 384 hand-written modules
+aimed at the rules (types at their limits, every calling-convention
+and linkage combination, atomics on every type, phi and block
+corners) found one: a checked `tailcall` whose aggregate result LLVM
+returns in memory made LLVM abort (§7.3 rule 5 came from it). The
+same batch showed that the worker had to look `main` up before
+marking the backend's acceptance, since ORC generates code lazily;
+seed 4 ran after that fix.
 
 ## 11. The library API
 
