@@ -263,23 +263,27 @@ impl<'p> Machine<'p> {
         Ok(V::Unit)
     }
 
-    /// A call by name: `&` arguments are copied in at their position and
-    /// written back, in parameter order, after the call (syntax §3.13).
+    /// A call by name: every argument is evaluated first; then, at call
+    /// entry, the `&` arguments are copied in, in parameter order, and
+    /// after the call written back in parameter order (syntax §2, §3.13;
+    /// owner, 2026-09-28).
     fn ev_call(&mut self, h: &str, args: &[Arg], env: &Env) -> Res {
         let mut vals = Vec::new();
-        let mut backs = Vec::new();
         for a in args {
-            match a {
-                Arg::Val(e) => vals.push(self.ev(e, env)?),
-                Arg::InOut(n) => {
-                    let Some(V::Cell(outer)) = env.get(n).cloned() else {
-                        return Err(unsupported(format!("&{n} is not a cell")));
-                    };
-                    let private = Rc::new(RefCell::new(outer.borrow().clone()));
-                    backs.push((outer, private.clone()));
-                    vals.push(V::Cell(private));
-                }
-            }
+            vals.push(match a {
+                Arg::Val(e) => self.ev(e, env)?,
+                Arg::InOut(_) => V::Unit,
+            });
+        }
+        let mut backs = Vec::new();
+        for (a, slot) in args.iter().zip(vals.iter_mut()) {
+            let Arg::InOut(n) = a else { continue };
+            let Some(V::Cell(outer)) = env.get(n).cloned() else {
+                return Err(unsupported(format!("&{n} is not a cell")));
+            };
+            let private = Rc::new(RefCell::new(outer.borrow().clone()));
+            backs.push((outer, private.clone()));
+            *slot = V::Cell(private);
         }
         let result = self.call_named(h, vals)?;
         for (outer, private) in backs {

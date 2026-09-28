@@ -92,10 +92,10 @@ fn later_write_back_wins() {
     );
 }
 
-/// Case 17: `&v` and `@v` in one call; the plain argument is read before
-/// the call writes anything.
+/// An `&` call on a `let` cell, then a read of the cell: the read sees
+/// the write-back.
 #[test]
-fn copy_in_happens_at_the_argument() {
+fn a_read_after_the_call_sees_the_write_back() {
     let vt = Ty::vec(Ty::Int);
     let f = push_fn("p", "v", 9);
     let cell = Expr::call(Ty::cell(vt.clone()), "cell", vec![vec_of(&[1, 2, 3])]);
@@ -120,6 +120,75 @@ fn copy_in_happens_at_the_argument() {
         }),
         Ok(4)
     );
+}
+
+/// `(defun io15 (&v0 n) (push! &v0 n))`.
+fn io15() -> FunDef {
+    let push = Expr::new(
+        Ty::Unit,
+        Kind::Call(
+            "push!".into(),
+            vec![Arg::InOut("v0".into()), Arg::Val(Expr::var("n", Ty::Int))],
+        ),
+    );
+    let mut f = push_fn("io15", "v0", 0);
+    f.params.push(Param {
+        name: "n".into(),
+        ty: Ty::Int,
+        inout: false,
+    });
+    f.body = push;
+    f
+}
+
+/// `(push! &name (do (io15 &name 4) 0))`: the second argument writes the
+/// variable of the first.
+fn push_after_io15(name: &str) -> Expr {
+    let inner = Expr::new(
+        Ty::Unit,
+        Kind::Call(
+            "io15".into(),
+            vec![Arg::InOut(name.into()), Arg::Val(Expr::int(4))],
+        ),
+    );
+    let arg = Expr::new(Ty::Int, Kind::Do(vec![inner, Expr::int(0)]));
+    Expr::new(
+        Ty::Unit,
+        Kind::Call("push!".into(), vec![Arg::InOut(name.into()), Arg::Val(arg)]),
+    )
+}
+
+/// `(let ((c (cell []))) (do body (count @c)))`.
+fn on_empty_cell(body: Expr) -> Expr {
+    let vt = Ty::vec(Ty::Int);
+    let cell = Expr::call(Ty::cell(vt.clone()), "cell", vec![vec_of(&[])]);
+    let read = Expr::new(
+        vt.clone(),
+        Kind::Deref(Box::new(Expr::var("c", Ty::cell(vt)))),
+    );
+    let count = int_call("count", vec![read]);
+    let1("c", cell, Expr::new(Ty::Int, Kind::Do(vec![body, count])))
+}
+
+/// Cases 150 and 151 (owner, 2026-09-28): the copy-in happens at call
+/// entry, after the second argument pushed 4, so both give 2 (1 with a
+/// copy-in at the argument's position).
+#[test]
+fn copy_in_happens_at_call_entry() {
+    let mut io4 = push_fn("io4", "v0", 0);
+    io4.body = push_after_io15("v0");
+    let via_io4 = expected(&Program {
+        defs: Vec::new(),
+        funs: vec![io15(), io4],
+        main: on_empty_cell(inout_call("io4", &["c"], Ty::Unit)),
+    });
+    assert_eq!(via_io4, Ok(2));
+    let direct = expected(&Program {
+        defs: Vec::new(),
+        funs: vec![io15()],
+        main: on_empty_cell(push_after_io15("c")),
+    });
+    assert_eq!(direct, Ok(2));
 }
 
 #[test]

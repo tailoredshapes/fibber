@@ -3,9 +3,9 @@
 //! It is a plain value interpreter over [`crate::ast`]: no counts, no
 //! heap audit, no ownership plan. It follows the value semantics the
 //! spec fixes for the constructs the generator emits: strict left-to-right
-//! evaluation (syntax §2), copy-in/copy-out `&` with write-backs in
-//! parameter order (§3.13), cells shared by reference, atoms replaced by
-//! `swap!`/`reset!`, lazily run `async` tasks, and wrapping integer
+//! evaluation (syntax §2), copy-in/copy-out `&` with the copy-ins at call
+//! entry and the write-backs after the call, both in parameter order
+//! (§3.13), cells shared by reference, atoms replaced by `swap!`/`reset!`, lazily run `async` tasks, and wrapping integer
 //! arithmetic (types §2.12). The interpreter's result must equal the
 //! model's (rule 4 of the task: differential sanity).
 
