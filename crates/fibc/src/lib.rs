@@ -13,6 +13,7 @@ pub mod harness;
 pub mod ir;
 pub mod layout;
 pub mod lower;
+pub mod macros;
 pub mod mono;
 pub mod names;
 pub mod objects;

@@ -18,7 +18,7 @@ use crate::ir::{LirTy, V};
 use crate::names::mangle;
 
 /// The plan of a generated wrapper: it has no expressions of its own.
-fn empty_plan() -> &'static BodyOwn {
+pub fn empty_plan() -> &'static BodyOwn {
     static EMPTY: OnceLock<BodyOwn> = OnceLock::new();
     EMPTY.get_or_init(BodyOwn::default)
 }

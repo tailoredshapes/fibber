@@ -42,6 +42,52 @@ impl<'a> Cx<'_, 'a> {
                     LirTy::Ptr,
                 )
             }
+            "gensym" => {
+                let hook = self.load(LirTy::Ptr, "@fibm.gensym-hook");
+                let cx = self.load(LirTy::Ptr, "@fibm.hook-cx");
+                self.b.val(
+                    &format!(
+                        "(indirect-call {} (fn ptr (ptr ptr)) {} {})",
+                        hook.text(),
+                        cx.text(),
+                        arg(0)?.text()
+                    ),
+                    LirTy::Ptr,
+                )
+            }
+            "struct?" | "struct-fields" | "struct-params" | "struct-field-types" | "enum?"
+            | "enum-params" | "enum-variants" => {
+                let hook = self.load(LirTy::Ptr, "@fibm.reflect-hook");
+                let cx = self.load(LirTy::Ptr, "@fibm.hook-cx");
+                let r = self.b.val(
+                    &format!(
+                        "(indirect-call {} (fn ptr (ptr ptr ptr)) {} (string \"{name}\") {})",
+                        hook.text(),
+                        cx.text(),
+                        arg(0)?.text()
+                    ),
+                    LirTy::Ptr,
+                );
+                // A Bool answer is read out of its Form (eval/forms.rs
+                // `reflection_value`); a Vec answer is the Form's items.
+                if name == "struct?" || name == "enum?" {
+                    let (_, sname) = self.p.object(&self.form_ty()?)?;
+                    let f = self.gep(
+                        &format!("{sname}.v6"),
+                        r.text(),
+                        crate::objects::VARIANT_FIELD0,
+                    );
+                    self.load(LirTy::I1, &f)
+                } else {
+                    let (_, sname) = self.p.object(&self.form_ty()?)?;
+                    let f = self.gep(
+                        &format!("{sname}.v9"),
+                        r.text(),
+                        crate::objects::VARIANT_FIELD0,
+                    );
+                    self.load(LirTy::Ptr, &f)
+                }
+            }
             "spawn" => self.spawn(e, arg(0)?)?,
             "join" => self.join(e, arg(0)?)?,
             "not" => self
@@ -96,6 +142,16 @@ impl<'a> Cx<'_, 'a> {
             "release-raw" => self.rt_call("fib.release", a, None),
             other => return Err(Unsupported(format!("builtin {other}"))),
         }))
+    }
+
+    /// The prelude's `Form` type.
+    fn form_ty(&self) -> R<Ty> {
+        let id = self
+            .p
+            .g()
+            .form
+            .ok_or_else(|| Unsupported("the prelude defines no Form".into()))?;
+        Ok(Ty::nominal(id, Vec::new()))
     }
 
     /// A call of a runtime function with these arguments.

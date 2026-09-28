@@ -9,6 +9,7 @@ use fibref::own::Checked;
 
 use crate::lower::{emit_body, emit_closure};
 use crate::program::{Program, Work};
+use crate::value::LirTy;
 
 /// Why a program cannot be compiled yet (reported as Pending by the
 /// harness, never as a pass).
@@ -46,7 +47,96 @@ pub fn compile(checked: &Checked) -> Result<String, Unsupported> {
     Ok(assemble(&p, &defs.text, &entry))
 }
 
-fn assemble(p: &Program<'_>, defs: &str, entry: &str) -> String {
+/// A compiled macro-time module (compiler.md §6, `macros/`).
+pub struct MacroModule {
+    /// The lIR text, with the surface of `macros/abi.rs` exported.
+    pub text: String,
+    /// The keyword ids of the width suffixes i8 i16 i32 i64 f32 f64.
+    pub widths: [i64; 6],
+    /// Every keyword interned, by id.
+    pub keywords: Vec<String>,
+}
+
+/// The macro-time module of `checked`, whose `defmacro` is `name`,
+/// taking `n` `Form` (or rest vector) arguments.
+pub fn compile_macro(
+    checked: &Checked,
+    name: &str,
+    n: usize,
+    k: usize,
+) -> Result<MacroModule, Unsupported> {
+    use crate::macros::abi::{render, FormLayout, VARIANTS, WIDTHS};
+    use fibref::types::decls::Shape;
+    use fibref::types::ty::Ty;
+    let g = &checked.typed.globals;
+    let f = g
+        .funs
+        .iter()
+        .position(|d| d.is_macro && d.name == name)
+        .ok_or_else(|| Unsupported(format!("no macro {name}")))?;
+    let mut p = Program::new(checked);
+    let mut widths = [0i64; 6];
+    for (i, w) in WIDTHS.iter().enumerate() {
+        widths[i] = p.statics.keyword(w);
+    }
+    let form_id = g
+        .form
+        .ok_or_else(|| Unsupported("the prelude defines no Form".into()))?;
+    let form_ty = Ty::nominal(form_id, Vec::new());
+    let (tid, sname) = p.object(&form_ty)?;
+    let size = p.objects.get(tid).size();
+    let Shape::Enum(vs) = &g.ty(form_id).shape else {
+        return Err(Unsupported("Form is not an enum".into()));
+    };
+    let mut tags = [0u32; 11];
+    for (i, v) in VARIANTS.iter().enumerate() {
+        let tag = vs
+            .iter()
+            .position(|x| x.name == *v)
+            .ok_or_else(|| Unsupported(format!("Form has no variant {v}")))?;
+        if tag != i {
+            return Err(Unsupported(
+                "Form's variants are not in the expected order".into(),
+            ));
+        }
+        tags[i] = tag as u32;
+    }
+    let vec_id = g
+        .vec
+        .ok_or_else(|| Unsupported("the prelude defines no Vec".into()))?;
+    let vec_ty = Ty::nominal(vec_id, vec![form_ty.clone()]);
+    let vec = crate::lower::vec_ids_of(&mut p, &vec_ty, &form_ty)?;
+    let defs = crate::defs::emit_defs(&mut p)?;
+    p.def_values = defs.values;
+    let body = p.request(
+        BodyKey::Fun(fibref::types::ast::FunId(f as u32)),
+        Vec::new(),
+    );
+    while let Some(w) = p.next_work() {
+        match w {
+            Work::Body(inst) => emit_body(&mut p, inst)?,
+            Work::Closure { owner, lit, name } => emit_closure(&mut p, owner, lit, &name)?,
+        }
+    }
+    let layout = FormLayout {
+        sname,
+        tid,
+        tags,
+        size,
+        vec,
+    };
+    let mut text = assemble_parts(&p, &defs.text);
+    text.push_str(&render(&layout, &body, n, k));
+    Ok(MacroModule {
+        text,
+        widths,
+        keywords: p.statics.keywords(),
+    })
+}
+
+/// The runtime, the tables, the static data and every function: what
+/// a program and a macro module share.
+fn assemble_parts(p: &Program<'_>, defs: &str) -> String {
     let mut out = String::new();
     for part in RUNTIME {
         out.push_str(part);
@@ -60,6 +150,12 @@ fn assemble(p: &Program<'_>, defs: &str, entry: &str) -> String {
     for f in &p.funcs {
         out.push_str(f);
     }
+    out
+}
+
+fn assemble(p: &Program<'_>, defs: &str, entry: &str) -> String {
+    let mut out = assemble_parts(p, defs);
+    let _ = LirTy::I64;
     // §8.8: main's return joins every thread still running before
     // the result is returned to the OS.
     let _ = write!(

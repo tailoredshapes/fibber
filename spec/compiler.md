@@ -189,16 +189,25 @@ listed, never counted as a pass (method.md).
 ## 6. Macros at compile time (syntax §3.16, ROADMAP)
 
 The expander calls a *runner* for each `defmacro` application. `fibc`'s
-runner compiles the **macro-time module** — the prelude, the program's
-`defmacro`s and every definition they reach, checked and planned by
-the same front end, with an entry point per macro taking and returning
-`Form` objects — through `lair`'s `Jit`, calls the entry through the
-`ccc` trampoline the `Jit` provides, and converts the resulting `Form`
-object graph back into the expander's `Form`. The expansion must equal
-the interpreter's: `cargo test -p fibc` compares the two expansions on
-every case that contains a `defmacro`. Until §6 is implemented, `fibc`
-runs macros with `fibref`'s macro evaluator, which the test then marks
-pending, not passing.
+runner (`crates/fibc/src/macros`) compiles the **macro-time module** —
+the `defmacro` with the prelude, the same forms the interpreter's
+runner checks (eval/macros.rs), checked and planned by the same front
+end — through `lair`'s `Jit`, one module per macro, on the macro's
+first application. The module exports, beside the entry that runs the
+macro's body, constructors and readers of `Form` objects (`abi.rs`);
+the runner converts the argument forms into objects, calls the entry
+through the `ccc` trampoline the `Jit` provides, and reads the result
+graph back into the expander's `Form`. `gensym` and the reflection
+builtins need the expander's context, which lives in Rust: the module
+holds two hook pointers and a context pointer set through
+`fibm.set-hooks` before each call, and the lowered builtins call the
+hooks with the context (`bridge.rs`); a reflection error ends the
+expansion with the expander's message. Objects made at expansion time
+are never freed (the process is the compiler's). The expansion must
+equal the interpreter's: `tests/macros.rs` compares the two expansions
+on every case that contains a `defmacro` and requires equality, form
+for form, errors included. A build without the `llvm` feature runs
+macros with `fibref`'s evaluator instead.
 
 ## 7. Monomorphisation
 

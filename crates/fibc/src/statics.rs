@@ -44,6 +44,11 @@ impl Statics {
         id
     }
 
+    /// Every keyword interned so far, by id.
+    pub fn keywords(&self) -> Vec<String> {
+        self.keywords.clone()
+    }
+
     /// The address of the immortal closure whose code is `code` (§8.4).
     pub fn closure(&mut self, code: &str, tid: u32) -> String {
         if let Some(n) = self.closure_index.get(code) {

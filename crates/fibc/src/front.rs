@@ -1,11 +1,11 @@
 //! The front end, reused from `fibref` (spec/compiler.md §1): read,
-//! expand (user macros run by the interpreter's macro evaluator until
-//! compiler.md §6 replaces it), type and check ownership. The result is
-//! the plan the lowering consumes.
+//! expand (user macros compiled and run through the JIT, compiler.md
+//! §6; the interpreter's macro evaluator in a build without LLVM),
+//! type and check ownership. The result is the plan the lowering
+//! consumes.
 
 use fibref::cases::Outcome;
-use fibref::eval::MacroEvaluator;
-use fibref::expand::{expand_program, ExpandCtx};
+use fibref::expand::{expand_program, ExpandCtx, MacroRunner};
 use fibref::own::{check_forms, CheckError, Checked};
 use fibref::syntax::read_all;
 use fibref::types::prelude_forms;
@@ -44,8 +44,11 @@ pub fn check(source: &str, file: &str) -> Front {
         Ok(f) => f,
         Err(e) => return Front::Rejected(e.to_string()),
     };
-    let mut runner = MacroEvaluator::new(&forms, prelude.clone());
-    let forms = match expand_program(forms, &mut ctx, &mut runner) {
+    let mut runner = match macro_runner(&forms, prelude.clone()) {
+        Ok(r) => r,
+        Err(m) => return Front::Failed(m),
+    };
+    let forms = match expand_program(forms, &mut ctx, runner.as_mut()) {
         Ok(f) => f,
         Err(e) => return Front::Rejected(e.to_string()),
     };
@@ -54,6 +57,26 @@ pub fn check(source: &str, file: &str) -> Front {
         Err(CheckError::Internal(m) | CheckError::Prelude(m)) => Front::Failed(m),
         Err(e) => Front::Rejected(e.to_string()),
     }
+}
+
+/// The macro runner of this build: the JIT (compiler.md §6), or the
+/// interpreter's evaluator when LLVM is not linked.
+#[cfg(feature = "llvm")]
+fn macro_runner(
+    _forms: &[fibref::syntax::Form],
+    prelude: Vec<fibref::syntax::Form>,
+) -> Result<Box<dyn MacroRunner>, String> {
+    crate::macros::JitRunner::new(prelude)
+        .map(|r| Box::new(r) as Box<dyn MacroRunner>)
+        .map_err(|u| u.0)
+}
+
+#[cfg(not(feature = "llvm"))]
+fn macro_runner(
+    forms: &[fibref::syntax::Form],
+    prelude: Vec<fibref::syntax::Form>,
+) -> Result<Box<dyn MacroRunner>, String> {
+    Ok(Box::new(fibref::eval::MacroEvaluator::new(forms, prelude)))
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ mod ctrl;
 mod dynamic;
 mod objects;
 mod ops;
-mod pattern;
+pub mod pattern;
 mod quote;
 mod threads;
 mod values;
@@ -425,6 +425,19 @@ impl<'p, 'a> Cx<'p, 'a> {
         let _ = f;
         Ok(())
     }
+}
+
+/// The Vec runtime ids of `(Vec elem)` outside any body (for the
+/// macro surface, `compile_macro`).
+pub fn vec_ids_of(p: &mut Program<'_>, t: &Ty, elem: &Ty) -> R<pattern::VecIds> {
+    // Any body key whose definition exists: the literal table of the
+    // context is read from it and not used.
+    let inst = Inst {
+        key: BodyKey::Fun(fibref::types::ast::FunId(0)),
+        tys: Vec::new(),
+    };
+    let mut cx = Cx::new(p, inst, values::empty_plan(), "fibm.ids", Vec::new());
+    cx.vec_tids(t, elem)
 }
 
 /// A float literal as lIR writes it.

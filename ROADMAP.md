@@ -109,7 +109,7 @@ through both paths in its own process, and both must agree.
       expression evaluator (`lir`). Nothing in M4 to M6 needs them; a
       compiler runs lIR through `lair run` or the `Jit`
 
-## M4. Compiler (`fibc`, in Rust)
+## M4. Compiler (`fibc`, in Rust) — in progress
 
 Lower the checker's plan to lIR, with a small runtime (header,
 retain/release, share marking, atom locks, weak table, task executor)
@@ -118,6 +118,33 @@ macro-time module through `lair`, proving the mechanism the bootstrap
 depends on; its expansions must match `fibref`'s. Every case and generated program runs both
 interpreted and compiled; results and free traces must match (method
 rule 6). This is the "working language" milestone.
+
+State (spec/compiler.md, **Proposed**; `crates/fibc`):
+
+- [x] `fibc` reuses `fibref`'s front end and lowers the plan to lIR
+      text that `crates/lir` re-reads and re-checks (`tests/emit.rs`,
+      no LLVM needed); `lair` compiles it (`fibc run`, `fibc build`)
+- [x] the runtime `fib.rt` as lIR source (`crates/fibc/rt`): header,
+      counts, drop, unique test, traps, stack objects, strings, arrays,
+      the prelude's `Vec`, atoms and share marking, weak references,
+      threads, tasks; and a trace mode for the free trace of
+      compiler.md §4
+- [x] method rule 6 harness: `fibc cases` runs every case interpreted
+      and compiled and compares results, rejections, traps and free
+      traces; 163 of the 166 cases pass both ways, 0 fail, 3 pending
+      (a weak reference to a `dyn`, `show` on a scalar)
+- [x] macros through the JIT: one macro-time module per `defmacro`,
+      `gensym` and reflection through hooks into the expander;
+      `tests/macros.rs` shows the expansions equal `fibref`'s on every
+      case that defines a macro
+- [ ] `async` as the state machine of types §8.8 (today a task is
+      driven to completion by its first joiner, as `fibref` does;
+      compiler.md §8 question 3)
+- [ ] `def` initialisers through the JIT (today evaluated by `fibref`
+      and serialised; question 4); `(Weak (dyn P))`; `show` and `hash`
+      on scalars; a `(dyn P)` of a native instance
+- [ ] generated programs (`fibgen`) through the harness
+- [ ] the owner's answers to compiler.md §8
 
 ## M5. A library a compiler can live on
 

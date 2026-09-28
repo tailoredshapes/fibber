@@ -6,6 +6,7 @@
 //! 0 when no case failed, 1 otherwise, 2 on bad usage.
 
 use std::io::{self, Write};
+#[cfg(feature = "llvm")]
 use std::path::Path;
 use std::process::ExitCode;
 
