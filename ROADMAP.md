@@ -74,6 +74,11 @@ evaluator over the audited heap.
       an `&` argument is copied in at call entry, after all of the
       call's arguments (ownership.md §5; syntax §2, §3.13; types §6.6,
       §10). Cases 150 to 153: 151 cases in all, all passing
+- [x] the owner's decision of 2026-09-28 on built-in comparisons: the
+      scalar types' `Eq` and `Ord` instances define every method, so
+      floats compare as IEEE 754 and `Ord`'s defaults apply only to
+      user impls (types §2.12, §8.12, §10). Case 154: 152 cases in all,
+      all passing
 
 ## M3. Hardened lIR
 

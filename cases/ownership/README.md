@@ -125,3 +125,11 @@ writes (150); the same call on a `let` cell, which copies in and must
 agree with it (151); a later argument writing the variable through a
 local closure that captures it (152); two `&` arguments with a later
 argument writing the first one's variable (153).
+
+Case 154 pins the owner's decision of 2026-09-28 that the built-in
+`Eq` and `Ord` instances of the scalar types define every comparison
+directly (types §2.12, §8.12 and the decision record in types §10):
+floats compare as IEEE 754, every comparison with a NaN false except
+`!=`, directly and through a generic `Ord`-bounded function, while a
+user `impl Ord` that gives only `<` takes the defaults for `<=` and
+`>=`, which are true on a NaN.

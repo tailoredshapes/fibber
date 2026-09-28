@@ -528,6 +528,24 @@ not : (fn :send (bool) bool)
 both operands: `(+ (i32 1) 2)` is a type error, never a promotion.
 `(defun add (a b) (+ a b))` is `∀a. (Num a) ⇒ (fn :send (a a) a)`.
 
+The built-in `Eq` and `Ord` instances (for every scalar type and for
+`str`) define every method of both protocols directly, `!=`, `<=`, `>`
+and `>=` included, so the defaults above never apply to them; the
+defaults apply only to a user `impl`, a derived one included, that
+omits the method (**Decided**, owner, 2026-09-28; §10, "Decided on
+built-in comparisons"). The difference is observable only for floats,
+which compare as IEEE 754 does at their width: every comparison with a
+NaN operand is false except `!=`, which is true, so `(<= nan 1.0)` and
+`(>= nan 1.0)` are both false, where the default `(not (< y self))`
+would make the first true; `-0.0` and `0.0` are `=`; an infinity is
+greater (or less) than every other value but itself and NaN. There is
+no NaN or infinity literal: `(/ 0.0 0.0)` is a NaN and `(/ 1.0 0.0)`
+an infinity (float arithmetic never traps). A generic function bounded
+by `Ord` calls the instance of its argument's type (§4.2), so at a
+float type it gets the IEEE answers too. Case 154 pins them, beside a
+user `impl Ord` on a struct holding an `f64` whose omitted `<=` and
+`>=` take the defaults and so are true on NaN.
+
 Integer arithmetic has Rust's semantics (**Decided**, owner, 2026-09-27;
 it replaces "signed overflow wraps", whose reason, that lIR emits
 exactly that, was wrong: LLVM's `sdiv` of the minimum by -1 is
@@ -3197,7 +3215,8 @@ nothing (§2.11: the objects live at an abort are not leaks).
 | `(shl a n)`, `(shr a n)`, `(sar a n)` | `(shl a (and n (w - 1)))`, `(lshr ..)`, `(ashr ..)`: `w` is a power of two, so the `and` is `n mod w` |
 | `(fptosi T x)` | `(fcmp uno x x)` → 0; `(fcmp oge x 2^(bits(T)-1))` → `MAX`; `(fcmp olt x -2^(bits(T)-1))` → `MIN`; else `(fptosi T x)`: both bounds are powers of two, exact in `float` and `double`, and a value in between truncates into range |
 | `(fptoui T x)` | `(fcmp uno x x)` → 0; `(fcmp olt x 0.0)` → 0; `(fcmp oge x 2^bits(T))` → all ones; else `(fptoui T x)` |
-| `bit-and`, `bit-or`, `bit-xor`, `bit-not`, `popcount`, comparisons, `trunc`, `zext`, `sext`, `sitofp`, `uitofp`, `fptrunc`, `fpext`, float arithmetic | the LLVM instruction as it is, no check |
+| `=`, `!=`, `<`, `<=`, `>`, `>=` at a float type | `fcmp` with `oeq`, `une`, `olt`, `ole`, `ogt`, `oge` respectively: the ordered predicates are false on a NaN operand and the unordered `une` of `!=` is true (§2.12); never the `Ord` defaults |
+| `bit-and`, `bit-or`, `bit-xor`, `bit-not`, `popcount`, integer comparisons, `trunc`, `zext`, `sext`, `sitofp`, `uitofp`, `fptrunc`, `fpext`, float arithmetic | the LLVM instruction as it is, no check |
 
 The saturating conversions are what LLVM's `llvm.fptosi.sat` and
 `llvm.fptoui.sat` compute, and the overflow tests what
@@ -3602,3 +3621,21 @@ which neither causes nor fixes it; closing it needs a rule this record
 does not choose (for example, not forwarding a parameter that a
 closure among the call's arguments captures, or rejecting such a
 call). No case pins either result.
+
+### Decided on built-in comparisons
+
+On 2026-09-28 the owner decided that the built-in `Eq` and `Ord`
+instances for the scalar types (every integer and float type, `bool`,
+`char`, `keyword`, `unit`, a field-less enum) and for `str` define
+every comparison method directly, so the defaults of §2.12 (`!=` from
+`=`, and `<=`, `>`, `>=` from `<`) never apply to them; they apply to
+user `impl`s, derived ones included (**Decided**, owner, 2026-09-28).
+Floats compare as IEEE 754: every comparison with a NaN operand is
+false except `!=`, which is true. §2.12 showed `Ord`'s default `<=` as
+`(not (< y self))`, which read as the definition for every instance
+would make `(<= nan 1.0)` true; fibref already gave false, the IEEE
+answer and what LLVM's `fcmp ole` gives, so the spec was the side that
+was wrong. It is stated in §2.12 and in §8.12's table (the `fcmp`
+predicate of each method). Case 154 pins the IEEE results for `f64`
+and `f32`, through a generic `Ord`-bounded function too, beside a user
+impl whose omitted `<=` and `>=` take the defaults.

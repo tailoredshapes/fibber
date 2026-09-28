@@ -1,0 +1,42 @@
+;; spec:   types §2.12, §8.12, §10 "Decided on built-in comparisons"
+;; expect: accept
+;; result: 15618
+;; audit:  clean
+;; The built-in Eq and Ord instances of the scalar types define every
+;; comparison directly (Decided, owner, 2026-09-28), so floats compare
+;; as IEEE 754: with a NaN operand every comparison is false except
+;; !=. Ord's default <= is (not (< y self)), which would make
+;; (<= nan 1.0) true; it applies only to user impls, as W's shows: its
+;; impl gives only <, so its <= and >= take the defaults and are true
+;; on NaN. le and ge are generic, bounded by Ord, and at f64 call the
+;; built-in methods. Bits: 2 (!= nan nan), 256 (< 1.0 inf), 1024
+;; (!= nan32 1.0f32), 2048 and 4096 (W's defaults), 8192 (= -0.0 0.0);
+;; every other bit is a comparison with a NaN that IEEE makes false.
+(defstruct W (v: f64))
+(impl Eq W (= (self y) (= (. self v) (. y v))))
+(impl Ord W (< (self y) (< (. self v) (. y v))))
+
+(defun bit (b: bool n: i64) -> i64 (if b n 0))
+
+(defun le (a b) (<= a b))
+
+(defun ge (a b) (>= a b))
+
+(defun main () -> i64
+  (let ((nan (/ 0.0 0.0))
+        (inf (/ 1.0 0.0))
+        (nan32 (/ 0.0f32 0.0f32)))
+    (+ (bit (= nan nan) 1)
+       (+ (bit (!= nan nan) 2)
+          (+ (bit (< nan 1.0) 4)
+             (+ (bit (<= nan 1.0) 8)
+                (+ (bit (> nan 1.0) 16)
+                   (+ (bit (>= 1.0 nan) 32)
+                      (+ (bit (le nan inf) 64)
+                         (+ (bit (ge inf nan) 128)
+                            (+ (bit (< 1.0 inf) 256)
+                               (+ (bit (<= nan32 nan32) 512)
+                                  (+ (bit (!= nan32 1.0f32) 1024)
+                                     (+ (bit (<= (W nan) (W 1.0)) 2048)
+                                        (+ (bit (>= (W nan) (W 1.0)) 4096)
+                                           (bit (= -0.0 0.0) 8192))))))))))))))))

@@ -175,8 +175,12 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("153-two-inout-arguments-one-written-by-argument.fib"),
         "{out}"
     );
-    assert!(out.contains("151 cases:"), "{out}");
-    assert!(out.contains("151 pass, 0 fail, 0 pending"), "{out}");
+    assert!(
+        out.contains("154-float-comparisons-are-ieee-not-ord-defaults.fib"),
+        "{out}"
+    );
+    assert!(out.contains("152 cases:"), "{out}");
+    assert!(out.contains("152 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 
