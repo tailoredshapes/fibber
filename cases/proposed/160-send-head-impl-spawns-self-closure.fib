@@ -1,0 +1,16 @@
+;; spec:   types §1.3, §5.1, §5.2 (syntax §3.9, §3.10; ownership.md §7)
+;; expect: accept
+;; result: 41
+;; audit:  clean
+;; A colour-parameterised enum under an impl head that gives :send
+;; (owner, 2026-09-28): self is a (Job :send), so the closure in its
+;; Ready variant is send and may be spawned. Idle's colour variable and
+;; the Ready built from a closure over an atom (Send) are both resolved
+;; against the head's :send.
+(defenum (Job k :colour) (Idle) (Ready run: (fn k () i64)))
+(defprotocol Go (go (self) -> i64))
+(impl Go (Job :send)
+  (go (self) (match self ((Idle) 0) ((Ready r) (join (spawn r))))))
+(defun main () -> i64
+  (let ((a (atom 1)))
+    (+ (go (Ready (fn () (+ @a 40)))) (go Idle))))

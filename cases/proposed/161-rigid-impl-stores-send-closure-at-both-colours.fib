@@ -1,0 +1,23 @@
+;; spec:   types §1.3, §5.4 (syntax §3.10; ownership.md §7)
+;; expect: accept
+;; result: 85
+;; audit:  clean
+;; The sound direction of case 155 (owner, 2026-09-28): a closure that
+;; captures nothing is send, and send flows into the rigid colour k, so
+;; reset may store it into self's cell field at every colour. The
+;; instance is used on a local Slot, whose cell first held a closure
+;; over the cell d, and on a (Slot :send), whose closure then still
+;; crosses a thread. before = @d = 1; then 42 and 42.
+(defstruct (Slot k :colour) (c: (Cell (fn k () i64))))
+(defprotocol Reset (reset (self) -> unit) (fire (self) -> i64))
+(impl Reset (Slot k)
+  (reset (self) (set! (. self c) (fn () (* 6 7))))
+  (fire (self) (@(. self c))))
+(defun main () -> i64
+  (let ((d (cell 1))
+        (l (Slot (cell (fn () @d))))
+        (s: (Slot :send) (Slot (cell (fn () 2)))))
+    (let ((before (fire l)))
+      (do (reset l)
+          (reset s)
+          (+ before (+ (fire l) (join (spawn @(. s c)))))))))

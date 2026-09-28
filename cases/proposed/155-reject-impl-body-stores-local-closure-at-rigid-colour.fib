@@ -1,0 +1,15 @@
+;; spec:   types §1.3, §5.4 (syntax §3.10; ownership.md §7)
+;; expect: reject
+;; error:  local closure where colour k is required
+;; Case 126's race moved into an impl body. The head's colour k is rigid
+;; in the body (owner, 2026-09-28): (. self c) is a (Cell (fn k () i64)),
+;; and the closure over the cell d is local, which may not flow into a
+;; k position, since k may be :send. Under the old rule, k "treated as
+;; local", fibref accepted this, main spawned the closure over d, and the
+;; audit failed with SharedCell.
+(defstruct (Slot k :colour) (c: (Cell (fn k () i64))))
+(defprotocol Poison (poison (self d: (Cell i64)) -> unit))
+(impl Poison (Slot k) (poison (self d) (set! (. self c) (fn () @d))))
+(defun main () -> i64
+  (let ((s: (Slot :send) (Slot (cell (fn () 1)))) (d (cell 5)))
+    (do (poison s d) (join (spawn @(. s c))))))

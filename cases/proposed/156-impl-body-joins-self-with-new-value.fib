@@ -1,0 +1,25 @@
+;; spec:   types §1.3, §3.2, §5.4 (syntax §3.10)
+;; expect: accept
+;; result: 47
+;; audit:  clean
+;; In an impl on (Hook k), k is rigid (owner, 2026-09-28). A new
+;; (Hook inc1 0) has a colour variable that the named function makes at
+;; least send; joined with self it becomes k, so the if is a (Hook k).
+;; bump returns a Self built from self's own closure, of colour k, so a
+;; bumped (Hook :send) is still :send and its closure may cross a
+;; thread. score is used at both colours. The old rule rejected score
+;; with "cannot unify (Hook _) with (Hook k)".
+;; 10 * (score (bump l)) = 40; ((. (bump s) f) (score s)) = inc1 4 = 5;
+;; the spawned closure gives inc1 1 = 2.
+(defstruct (Hook k :colour) (f: (fn k (i64) i64) tag: i64))
+(defun inc1 (x: i64) -> i64 (+ x 1))
+(defprotocol Score (score (self) -> i64) (bump (self) -> Self))
+(impl Score (Hook k)
+  (score (self) (. (if true self (Hook inc1 0)) tag))
+  (bump (self) (Hook (. self f) (+ (. self tag) 1))))
+(defun main () -> i64
+  (let ((c (cell 10))
+        (l (Hook (fn (x) (+ x @c)) 3))
+        (s (Hook inc1 4)))
+    (+ (+ (* 10 (score (bump l))) ((. (bump s) f) (score s)))
+       (join (spawn (fn () ((. (bump s) f) 1)))))))

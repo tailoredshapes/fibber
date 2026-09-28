@@ -1,0 +1,15 @@
+;; spec:   §5 (types §6.6, §6.10 rule (b); syntax §3.13)
+;; expect: accept
+;; result: 11
+;; audit:  clean
+;; f's call to g is in tail position and passes f's & parameter v with
+;; a closure that captures v. The owner decided (2026-09-28) that such
+;; an &v is not forwarded: it is copied in at call entry and written
+;; back, and the call is ordinary. g writes 1 into its private cell, the
+;; closure writes 7 into f's, g reads 1, and its write-back stores 1
+;; into f's v, the 7 lost; f's write-back leaves 1 in c. 10 * 1 + 1.
+;; Forwarded, as fibref did before the decision, g read the 7: 77, where
+;; the same call out of tail position gave 11 (case 165).
+(defun g (&w: i64 k: (fn () unit) :borrow) -> i64 (do (set! w 1) (k) @w))
+(defun f (&v: i64) -> i64 (g &v (fn () (set! v 7))))
+(defun main () -> i64 (let ((c (cell 0))) (let ((r (f &c))) (+ (* 10 r) @c))))
