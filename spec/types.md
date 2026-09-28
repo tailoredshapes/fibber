@@ -130,10 +130,63 @@ variable per name in the definition, §3.1) and otherwise inferred:
   colour argument (§5.1).
 - *Patterns and `.`.* A pattern or a field access sees a field's colour
   under the scrutinee's or receiver's colour argument.
-- *In an `impl` of a colour-parameterised type* (`(impl Show (Handler
-  k) ..)`) the colour argument is a name in the head like a type
-  variable, and inside the bodies it is treated as `local`, the
-  conservative answer, since a body must hold for every colour.
+- *In an `impl` of a colour-parameterised type* (**Decided**, owner,
+  2026-09-28; replaces "treated as `local`", which was unsound: §10,
+  "Decided on colours in impl heads"). The head gives each colour
+  parameter a colour variable, `(impl Show (Handler k) ..)`, or a
+  colour, `(impl Show (Handler :local) ..)` or `(Handler :send)`.
+  - A colour variable `k` of the head is **rigid** in every method
+    body, as the head's type variables are (§2.7), like Rust's
+    `impl<K> .. for Hook<K>`: each body is checked once, for an unknown
+    colour `k`, and so holds for every colour. `self`, every other
+    parameter or result of type `Self`, and every determined argument
+    that mentions `k` carry the same `k`, and a field is read and
+    written at colour `k`: in `(impl P (Slot k) ..)` with `(defstruct
+    (Slot k :colour) (c: (Cell (fn k () i64))))`, `(. self c)` has
+    type `(Cell (fn k () i64))`.
+  - In the colour order a rigid colour lies between the two colours,
+    `send ⊑ k ⊑ local`, and is comparable with nothing else (two rigid
+    colours of one head are unordered, and their join is `local`); the
+    flow rule of §5.4 applies with it unchanged. So a `send` closure
+    may flow into a `k` position (a named function stored into `(. self
+    c)`), a `k` closure into a `local` one, and neither a `local`
+    closure into a `k` position, the error `local closure where colour
+    k is required: <path> has type T` with the path of §5.3, nor a `k`
+    closure into a `send` one: `Send (fn k ..)` does not hold, and at a
+    thread boundary the error is `closure of colour k cannot be shared
+    between threads: <path>`. A closure that captures a value whose
+    `Send` depends on `k` (`self`, among others) is at least `k`
+    (§5.4 step 1: `k ⊑ ς`).
+  - As a colour argument a rigid `k` is equal only to itself (§3.2,
+    invariance): `(Handler k)` does not unify with `(Handler :send)`
+    or `(Handler :local)` (`cannot unify (Handler k) with (Handler
+    :local)`), so `self` cannot be passed where a `(Handler :local)`
+    is expected; it unifies with a `(Handler ς)` whose argument is a
+    colour variable of the unit, which then equals `k`, so `(if c self
+    (Handler inc1 0))`, whose constructor call gets `send ⊑ ς` from the
+    named function, joins `self` at `k`.
+  - A head that gives a colour gives the bodies that colour: in
+    `(impl P (Handler :local) ..)`, `self` is a `(Handler :local)` and
+    may be passed as one; in `(impl P (Handler :send) ..)` its fields'
+    closures are `send` and may be spawned. Instances are keyed by
+    `(P, K)` whatever the head's colour arguments (§4.1: no overlapping
+    instances), so at most one of `(Handler k)`, `(Handler :local)`
+    and `(Handler :send)` has an instance of `P`. An instance whose head
+    gives a colour covers that colour only: resolving `(P (Handler
+    :send))`, or `(P (Handler k))` in another impl's body, against the
+    instance for `(Handler :local)` is `no implementation of P for
+    (Handler :send)`; an argument that is still a colour variable of
+    the unit is made equal to the head's colour by unification, as any
+    argument is.
+  - A colour variable of the head is used only in colour position (`k
+    is a colour parameter of the impl head, not a type`); it may occur
+    in a determined argument of the protocol (`(impl (Conv (Handler
+    k)) (Handler k) ..)`) and in the `:where` context. An `impl`'s
+    supertraits' instances must cover every colour it covers (§4.1
+    rule 1): an `impl` for `(Handler k)` needs its supertraits'
+    instances for `(Handler k)` too, not for `(Handler :local)`.
+  - Colour-parameterised enums are treated the same way. Cases 155 to
+    161 pin these rules.
 
 The explicit `(fn :send (A) R)` field is unchanged and needs no
 parameter: it holds only sendable closures in every instance; an
@@ -401,7 +454,7 @@ two ways the matrix cannot relate.
 | `(defstruct (N ā) (f₁: T₁ ..))` | registers `N` of arity |ā|; constructor `N : ∀ā. (fn :send (T₁ ..) (N ā))`; field types well formed and closed under `ā`; recursive occurrences only through annotated fields |
 | `(defenum (N ā) (V₁ T̄₁) ..)` | `Vᵢ : ∀ā. (fn :send (T̄ᵢ) (N ā))`, or `∀ā. (N ā)` for a field-less variant |
 | `(defprotocol (P s d̄) :requires (Q̄) (m (self x₁: T₁ ..) -> R b?) ..)` | `m : ∀ s d̄ b̄. (P s d̄) ⇒ (fn :send (s T₁ ..) R)` where `b̄` are the signature's other variables; the functional dependency `s → d̄` is recorded; each parameter's escape kind (`:borrow` or the default, escaping) and count kind (`:owned` or the default, borrowed) are recorded (§6.4); the supertraits `Q̄`, constraints over `s d̄` whose dispatch argument is `s` (§4.1), are recorded, and one that reaches `P` again is `protocol P requires itself`; a method with a body `b` has a **default** (§4.1), kept as forms with the module that defines `P` |
-| `(impl (P D̄) (K ā) :where (C) (m (self x̄) b) ..)` | registers the instance `∀ā. (P (K ā) D̄) ⇐ C` where `C` is the **declared** context (`:where`; empty when omitted; Paterson condition, §3.3), known before any body is typed (§3.5; §10 item 20); each body is typed against the signature with `s := (K ā)` rigid, `d̄ := D̄`, under the bounds `C` and everything they entail through supertraits (§4.1), and must not be more specific; a body whose constraints are not entailed is `no implementation of P for a; add (P a) to the :where of the impl`; every method without a default present, none extra, and each method with a default and no body here gets the default's body as if written here (§4.1); one instance per `(P, K)` in the program; for each supertrait `(Q s ē)` of `P` an instance of `Q` for `K` with the determined arguments `ē[(K ā)/s, D̄/d̄]` and a context entailed by `C` (§4.1); each body's escape summary must respect the declared kinds (§6.4) |
+| `(impl (P D̄) (K ā) :where (C) (m (self x̄) b) ..)` | registers the instance `∀ā. (P (K ā) D̄) ⇐ C` where `C` is the **declared** context (`:where`; empty when omitted; Paterson condition, §3.3), known before any body is typed (§3.5; §10 item 20); each body is typed against the signature with `s := (K ā)` rigid (a colour variable of the head a rigid colour, a colour the head gives that colour: §1.3), `d̄ := D̄`, under the bounds `C` and everything they entail through supertraits (§4.1), and must not be more specific; a body whose constraints are not entailed is `no implementation of P for a; add (P a) to the :where of the impl`; every method without a default present, none extra, and each method with a default and no body here gets the default's body as if written here (§4.1); one instance per `(P, K)` in the program, whatever colours the head gives its colour parameters (§1.3); for each supertrait `(Q s ē)` of `P` an instance of `Q` for `K` with the determined arguments `ē[(K ā)/s, D̄/d̄]` and a context entailed by `C` (§4.1); each body's escape summary must respect the declared kinds (§6.4) |
 
 ### 2.8 `async`, `await`, `unsafe`, `extern`, `quote`, `defmacro`
 
@@ -575,7 +628,12 @@ type is signed (§1.1), and at width `w`:
 - `trunc` keeps the low bits and `zext` and `sext` extend; these and
   the float conversions `sitofp`, `uitofp`, `fptrunc` and `fpext` never
   trap;
-- float arithmetic is IEEE 754 at its width and never traps.
+- float arithmetic is IEEE 754 at its width and never traps; `rem` on
+  floats is `fmod` (**Decided**, owner, 2026-09-28): the exact
+  remainder `a - b × trunc(a / b)`, with the sign of the dividend, as
+  Rust's `%` and LLVM's `frem` give it, so `(rem -7.5 2.0)` is `-1.5`
+  and `(rem 7.5 -2.0)` is `1.5`; `rem` by zero or of an infinity is
+  NaN, and `rem` of a finite value by an infinity is that value.
 
 A trap ends the program with the message, as `trap` does (§2.11); in
 the interpreter it is a run-time error, and the objects live at it are
@@ -806,7 +864,8 @@ Robinson unification with the occurs check over the grammar of §1:
 - colour arguments of a nominal type (§1.3) are colours inside a
   constructor, so both constraints: invariant; two written colours
   that differ (`(N :send)` against `(N :local)`) are `cannot unify`
-  at once;
+  at once, and so is a rigid colour of an `impl` head (§1.3) against
+  any colour but itself (`(N k)` against `(N :local)`);
 - `(& A)` with `(& B)` only: an `&` position never unifies with a plain
   one;
 - a rigid variable unifies only with itself or an unbound unification
@@ -995,7 +1054,11 @@ determined by `s` (one instance per head constructor of `s`, and it fixes
 program (checked per module and again at monomorphisation). An instance
 may carry a context (`(impl Eq (Vec a) :where ((Eq a)) ..)`), declared
 on the `impl` and exported (§2.7). Instances for bare type variables and
-overlapping instances are rejected (**Decided**). Protocol
+overlapping instances are rejected (**Decided**). A head may give a
+colour parameter a colour instead of a variable, `(impl P (Handler
+:local) ..)`; the key is still `(P, Handler)`, so it excludes an
+instance for `(Handler k)` or `(Handler :send)`, and the instance
+covers only that colour (§1.3; **Decided**, owner, 2026-09-28). Protocol
 parameters are output positions: `(Deref (Cell i64) t)` yields `t = i64`
 without annotation.
 
@@ -1016,7 +1079,11 @@ follow, and the checker enforces each:
    `K` (in any module, declared before or after it), whose determined
    arguments equal `ē` with `s := (K ā)`, `d̄ := D̄`, and whose context
    is entailed by `C` (rule 2, and instance resolution for a context
-   constraint on a compound type). Otherwise `impl P for (K ā)
+   constraint on a compound type), and which covers every colour that
+   `P`'s head covers (§1.3): an instance of `Q` for `(K :local)` serves
+   an `impl P` for `(K :local)` but not one for `(K k)` (`impl P for (K
+   k) requires an impl of Q for (K k); impl Q for (K :local) covers
+   only (K :local)`). Otherwise `impl P for (K ā)
    requires an impl of Q for (K ā)`, `.. whose context (R a) is not
    entailed by the context of impl P`, or `.. determines (Q ..), not
    (Q ..)`. Without the context rule a `(P t)` bound could vouch for a
@@ -1229,6 +1296,24 @@ Solving, after the SCC's type constraints:
 4. Generalise: colour variables that stayed symbolic are quantified with
    their remaining constraints; a call site instantiates them freshly
    and re-solves with the caller's types.
+
+**Rigid colours** (**Decided**, owner, 2026-09-28; §1.3). In an `impl`
+body whose head gives a colour parameter a variable `k`, `k` is a
+constant of the lattice, `send ⊑ k ⊑ local`, unordered with any other
+rigid colour. Step 1 treats a captured value whose `Send` depends on
+`k` (a `(fn k ..)`, a `(Handler k)`) as it treats a colour variable,
+giving `k ⊑ ς`; step 2's least fixpoint raises a variable to the join
+of what flows into it (`send ⊔ k = k`, `k ⊔ j = local` for two
+distinct rigid colours, anything `⊔ local = local`); step 3 checks
+every constraint whose right side is a constant: `κ ⊑ send` needs κ =
+`send` (the error of §5.3, or `closure of colour k cannot be shared
+between threads: <path>` when κ is `k`), `κ ⊑ k` needs κ ∈ {`send`,
+`k`} (`local closure where colour k is required: <path> has type T`,
+or `closure of colour j where colour k is required: <path>`). A
+symbolic `ς ⊒ send-of(a)` whose variable is at least `k` and bounded
+above by a constant becomes the bound `Send a`, as for a variable that
+must be `send`. An `impl` body is not generalised (§3.5), so a rigid
+colour is never quantified.
 
 A constructor application `(N e..)` whose fields have colour parameters
 emits `κ_eᵢ ⊑ κ_param` at each closure argument (a flow site), so the
@@ -1766,27 +1851,51 @@ allocations match its allocations (§6.12).
 **Forwarding at a tail call** (§6.10 rule (b); **Decided**, D5 as
 amended by the owner): at a call in tail position, an argument `&v`
 where `v` is an `&` parameter of the enclosing `defun`, at any `&`
-position of any callee, performs no copy-in and no write-back: the
-callee's parameter is the same private cell, which belongs to a frame
-below the caller, and the one write-back is that frame's, after the
-whole chain returns. The distinct-variables check (§6.5) already forbids
-forwarding one cell twice. Any other `&` argument (a `let` cell, a cell
-reached another way) makes the call an ordinary call. Without this rule the write-backs of a
-recursion's iterations, which syntax §2 places "after the call
-returns", would need a frame each. Forwarding is meant to be an
-unobservable optimisation of copy-in/copy-out (owner, 2026-09-28). Since
-the copy-in happens at call entry, the two agree on every write the
-call's arguments make: a forwarded callee starts from the cell as the
-arguments left it, and so does a copied-in one (case 150 forwards, case
-151 copies in, both give 2; with the copy-in at the argument's position
-case 151 gave 1). They still differ in one situation, which is open
-(§10): the callee writing the cell during the call through another
-name, a closure capturing the `&` parameter that is passed to it. In
-`(defun g (&w: i64 k: (fn () unit) :borrow) -> i64 (do (set! w 1) (k)
-@w))` called as `(g &v (fn () (set! v 7)))` from an `&` function `f`
-of `v`, the call in tail position forwards, `g` reads 7 and `f`'s
-caller ends with 7; not in tail position it copies in, `g` reads 1 and
-its write-back stores 1 into `v`, losing the 7.
+position of any callee, performs no copy-in and no write-back, unless
+`v` is captured by an argument of the call (below): the callee's
+parameter is the same private cell, which belongs to a frame below the
+caller, and the one write-back is that frame's, after the whole chain
+returns. The distinct-variables check (§6.5) already forbids forwarding
+one cell twice. Any other `&` argument (a `let` cell, a cell reached
+another way, a captured `&v`) makes the call an ordinary call. Without
+this rule the write-backs of a recursion's iterations, which syntax §2
+places "after the call returns", would need a frame each.
+
+**An `&` parameter captured by an argument is not forwarded**
+(**Decided**, owner, 2026-09-28). `v` is **captured by an argument** of
+a call when an argument of the call other than the `&v` itself
+**mentions** `v` or a **carrier** of `v`:
+
+- an expression mentions a binding when the binding occurs free in it
+  anywhere, inside `fn` and `async` literals at any depth included: as
+  a variable, as `@v`, as `&v` (of a nested call), or as the target of
+  `set!` or `set-field!`;
+- a carrier of `v` is a `let` binding of the enclosing `defun` whose
+  initialiser is directly a `fn` literal that mentions `v` or a carrier
+  of `v` (use (c) of §6.5; a closure that captures `v` and is bound or
+  held any other way is escaping, which §6.5 already rejects).
+
+The test is syntactic, reads only the call's arguments and the `let`s
+of the enclosing body, and is part of rule (b), so it is decided with
+the tail sites, before any kind (§6.10). Such an `&v` is copied in at
+call entry and written back after the call returns, as at an ordinary
+call, and the call is therefore an ordinary call (§6.10 rule (b);
+`fibref explain` prints `call (b: &v captured by an argument)`). With
+it, forwarding is indistinguishable from copy-in/copy-out: a forwarded
+callee starts from the cell as the arguments left it, as a copied-in
+one does, since the copy-in happens at call entry (case 150 forwards,
+case 151 copies in, both give 2; with the copy-in at the argument's
+position case 151 gave 1); and during the call nothing but the callee
+can write the forwarded cell, since the only other name for it is `v`,
+every closure that mentions `v` stays inside the call that created it
+(§6.5), and one that the callee could reach is among the call's
+arguments, which makes the `&v` copy in. In `(defun g (&w: i64 k: (fn
+() unit) :borrow) -> i64 (do (set! w 1) (k) @w))` called as `(g &v (fn
+() (set! v 7)))` from an `&` function `f` of `v`, the call copies in,
+in tail position or not: `g` writes 1 into its private cell, the
+closure writes 7 into `f`'s, `g` reads 1, and the write-back stores 1
+into `f`'s `v`, the 7 lost (the later write-back wins, §10 option (A);
+cases 162, 163). Forwarded, as before the decision, `g` read 7.
 
 **Unique write** (**Decided**, §5): `array-set!` and `set-field!` read the
 place's content without retaining, test `fib.unique?` (§8.2: the flags
@@ -2001,10 +2110,15 @@ ordinary call followed by the releases of §6.3:
   private cell — no copy-in, no write-back — so a call whose every `&`
   argument forwards stays a tail call (mutual recursion threading an
   in-out accumulator runs in constant stack); every other `&` argument
-  (a `let` cell, a cell reached another way) makes the call ordinary.
-  A forwarded cell is the cell as the call's arguments left it, which
-  is what a copy-in at call entry reads (§6.6; **Decided**, owner,
-  2026-09-28), so forwarding changes no write the arguments make;
+  (a `let` cell, a cell reached another way) makes the call ordinary,
+  and so does an `&v` whose `v` is captured by an argument of the call
+  (another argument mentions `v` or a `let`-bound closure that does,
+  §6.6; **Decided**, owner, 2026-09-28): it is copied in and written
+  back, never forwarded. A forwarded cell is the cell as the call's
+  arguments left it, which is what a copy-in at call entry reads (§6.6;
+  **Decided**, owner, 2026-09-28), and no name for it but the callee's
+  parameter reaches the call, so forwarding is indistinguishable from a
+  copy-in and a write-back;
 - (e) an argument at a **borrowed** position of a callee outside the
   current SCC (an imported `defun`, a protocol method, a `defun` of an
   earlier SCC; from a `fn` body, which belongs to no SCC, every `defun`;
@@ -2124,7 +2238,11 @@ needs nothing, and by (e) `x` is then frame-independent.
 
 Self tail calls, mutual recursion inside an SCC, calls through closure
 values and calls to `:owned` positions of methods therefore run in
-constant stack, outside `async` bodies (rule (f)). The interpreter does
+constant stack, outside `async` bodies (rule (f)), except a call that
+passes an `&` parameter together with an argument that captures it,
+which is ordinary by rule (b) (§6.6); a recursion that forwards its `&`
+parameter at every step with no such argument still runs in constant
+stack (case 164). The interpreter does
 the same (§6.12): it decides tail calls by this section, discards the
 frame before entering the callee and lets the callee's parameter
 bindings own their values, so the same objects are freed at the same
@@ -2911,7 +3029,9 @@ documented (lir-core also parses a `{ ptr, ptr }` field type, which
   `STACK`) and it is initialised by the copy-in at call entry, after
   the last argument has been evaluated, in parameter order (`store` the
   acquired content, §6.6), or, when forwarded (§6.6, §6.10 rule (b)),
-  not created at all (the caller's pointer is passed on); passed as
+  not created at all (the caller's pointer is passed on; an `&v` that
+  an argument of the call captures is never forwarded, §6.6, so its
+  cell is made and written back like any other); passed as
   `ptr`; write-back as §6.6; the `alloca` needs no drop. Case 17's
   `(push-count &v @v)` emits exactly this: three words; `@v` loaded
   and retained for the second argument; then the header, and the
@@ -3216,6 +3336,7 @@ nothing (§2.11: the objects live at an abort are not leaks).
 | `(fptosi T x)` | `(fcmp uno x x)` → 0; `(fcmp oge x 2^(bits(T)-1))` → `MAX`; `(fcmp olt x -2^(bits(T)-1))` → `MIN`; else `(fptosi T x)`: both bounds are powers of two, exact in `float` and `double`, and a value in between truncates into range |
 | `(fptoui T x)` | `(fcmp uno x x)` → 0; `(fcmp olt x 0.0)` → 0; `(fcmp oge x 2^bits(T))` → all ones; else `(fptoui T x)` |
 | `=`, `!=`, `<`, `<=`, `>`, `>=` at a float type | `fcmp` with `oeq`, `une`, `olt`, `ole`, `ogt`, `oge` respectively: the ordered predicates are false on a NaN operand and the unordered `une` of `!=` is true (§2.12); never the `Ord` defaults |
+| `(rem a b)` at a float type | `frem`: `fmod`, the sign of the dividend (§2.12); no check |
 | `bit-and`, `bit-or`, `bit-xor`, `bit-not`, `popcount`, integer comparisons, `trunc`, `zext`, `sext`, `sitofp`, `uitofp`, `fptrunc`, `fpext`, float arithmetic | the LLVM instruction as it is, no check |
 
 The saturating conversions are what LLVM's `llvm.fptosi.sat` and
@@ -3258,8 +3379,10 @@ decided it, `heap` with its reason — `arg-of-tail-call`,
 `head-of-tail-site` (at a tail site that §6.10 rule (e) then makes
 ordinary), or the escaping use — and its
 captures with their kinds), a call (`tail-call`, or `call` with the
-rule of §6.10 that made it ordinary; the copy-in of every `&` argument,
-`acquire` (performed at call entry, §6.6) or `forward`), a colour solution (`ς₁ = local, forced by
+rule of §6.10 that made it ordinary, `call (b: &v captured by an
+argument)` when an argument captures a forwardable `&v`, §6.6; the
+copy-in of every `&` argument, `acquire` (performed at call entry,
+§6.6) or `forward`), a colour solution (`ς₁ = local, forced by
 capture n`), and the emitted operations with source lines, those
 of a guard's false edge written `L5 guard false: release [r] (exit)` after
 the guard's own (§6.3; a rest variable is a binding line `r  owns`); a function
@@ -3473,7 +3596,8 @@ decided them on 2026-09-27:
    overflow of `+ - * /` and `neg`, the minimum divided by -1
    included, traps, and so does `rem` of the minimum by -1, as in Rust;
    shift amounts are taken modulo the width; float-to-integer
-   conversion saturates, NaN giving 0. §8.12 gives the checks the
+   conversion saturates, NaN giving 0. Float `rem` is `fmod`, with the
+   sign of the dividend (recorded on 2026-09-28, below, item 3). §8.12 gives the checks the
    compiler emits, since LLVM makes each of these undefined or poison
    (§2.12, §8.10, §8.12; syntax Open decisions item 16).
 7. **`swap!` under contention may not terminate** (finding 001, case
@@ -3601,26 +3725,14 @@ What it changes and what it does not:
    owner's decision on forwarding at any call in tail position above;
    they now cite §6.6 and §6.10 rule (b).
 
-**Open (for the owner).** The decision makes forwarding agree with
-copy-in/copy-out on every write the call's *arguments* make. It does
-not make it unobservable in one situation that the decided rules allow
-and that it does not touch: the callee writing the forwarded cell
-through another name *during* the call. An `&` parameter may be
-captured by a closure that does not escape, and that closure may be
-passed to a `:borrow` parameter of a call in tail position that
-forwards the same parameter (syntax §3.13 rule 2). The forwarded
-callee then sees the closure's write; a copied-in one does not, and
-its write-back overwrites the write (option (A) above: the later
-write-back wins). With `(defun g (&w: i64 k: (fn () unit) :borrow) ->
-i64 (do (set! w 1) (k) @w))`, `(defun f (&v: i64) -> i64 (g &v (fn ()
-(set! v 7))))` returns 7 and leaves 7 in its caller's cell, and the
-same `f` with the call out of tail position, `(let ((r (g &v (fn ()
-(set! v 7))))) r)`, returns 1 and leaves 1 (fibref, 2026-09-28: 77
-against 11 for `(let ((r (f &c))) (+ (* 10 r) @c))` on `(cell 0)`). This predates the decision,
-which neither causes nor fixes it; closing it needs a rule this record
-does not choose (for example, not forwarding a parameter that a
-closure among the call's arguments captures, or rejecting such a
-call). No case pins either result.
+**Closed.** The decision made forwarding agree with copy-in/copy-out
+on every write the call's *arguments* make, but not when the callee
+wrote the forwarded cell through another name during the call: a
+closure capturing the `&` parameter, passed to a `:borrow` parameter of
+a call in tail position that forwarded the same parameter. The owner's
+decision on forwarding a captured `&` parameter (below, "Decided on
+colours in impl heads, a captured `&` parameter and float `rem`", item
+2) closes it: such an `&v` is not forwarded.
 
 ### Decided on built-in comparisons
 
@@ -3639,3 +3751,65 @@ was wrong. It is stated in §2.12 and in §8.12's table (the `fcmp`
 predicate of each method). Case 154 pins the IEEE results for `f64`
 and `f32`, through a generic `Ord`-bounded function too, beside a user
 impl whose omitted `<=` and `>=` take the defaults.
+
+### Decided on colours in impl heads, a captured `&` parameter and float `rem`
+
+On 2026-09-28 the owner decided two questions that the rule-5 sweeps
+and the copy-in decision left open, and recorded a third rule that the
+implementation already followed:
+
+1. **Colour parameters in `impl` heads are rigid** (§1.3, §2.7, §3.2,
+   §4.1, §5.4; syntax §3.10), replacing "inside the bodies it is
+   treated as `local`". That rule was unsound: `local` is the
+   conservative answer only for reading a closure out of `self`; for
+   writing one into `self`, or for a result of type `Self` or a
+   determined argument mentioning the colour, it is the unsound
+   direction. With `(defstruct (Slot k :colour) (c: (Cell (fn k ()
+   i64))))`, `(impl Poison (Slot k) (poison (self d) (set! (. self c)
+   (fn () @d))))` stored a closure over a cell into a `(Slot :send)`,
+   which its caller then spawned (case 126's race moved into an impl
+   body; fibref accepted it and failed the audit with `SharedCell`).
+   It also rejected sound bodies: a new `(Hook inc1 0)` joined with
+   `self` was `cannot unify (Hook _) with (Hook k)`. The alternative,
+   generalising `k` like a `defun`'s colour with an instance per colour
+   its bodies allow, was not chosen. Now `k` is a rigid colour, `send ⊑
+   k ⊑ local`, in every body; fields are read and written at `k`; a
+   `send` closure may flow into a `k` position and a `local` one may
+   not; `self`, other `Self` values and determined arguments carry the
+   same `k`. A head may give a colour instead, `(impl P (Hook :local)
+   ..)`, whose bodies then see that colour; one instance per `(P, K)`
+   whatever the colour, covering only its colour elsewhere (`no
+   implementation of P for (Hook :send)`). Enums likewise. Cases 155
+   to 161: the `Poison` program (reject), the join of `self` with a new
+   `Hook` (accept), `self` passed as a `(Hook :local)` in a rigid body
+   (reject) and in a `(Hook :local)` body (accept), the `:local`
+   instance used at `:send` (reject), a `(Hook :send)` body spawning
+   `self`'s closure (accept), and a rigid body storing a named function
+   into `self`'s cell field, used at both colours (accept).
+2. **An `&` parameter captured by an argument of a call is not
+   forwarded** (§6.6, §6.10 rule (b), §8.6, §9; ownership.md §5;
+   syntax §3.13). Forwarding at a call in tail position handed the
+   callee the caller's private cell, which a closure capturing the
+   parameter and passed to the same call could write during the call;
+   a copied-in callee did not see that write and its write-back lost
+   it (fibref gave 77 in tail position and 11 out of it for the program
+   of case 162). Now, when another argument of the call mentions `v`
+   or a `let`-bound closure that does (a syntactic test, §6.6), `&v` is
+   copied in and written back as at an ordinary call, and the call is
+   ordinary (`call (b: &v captured by an argument)`). Forwarding is
+   then indistinguishable from copy-in/copy-out. The tail-call
+   guarantee of D5 keeps its other exceptions (rules (b), (e), (f),
+   externs) and gains this one; a recursion that forwards its `&`
+   parameter with no capturing argument still runs in constant stack.
+   Cases 162 to 165: the program above (accept, 11), the same with the
+   closure bound by a `let` before the call (accept, 11), a
+   1,000,000-deep self recursion forwarding `&v` (accept, clean), and a
+   capturing closure passed to a call not in tail position (accept,
+   unchanged).
+3. **Float `rem` is `fmod`** (§2.12, §8.12): the exact remainder with
+   the sign of the dividend, as Rust's `%` and LLVM's `frem`; `rem` by
+   zero or of an infinity is NaN. This belongs with the decision on
+   arithmetic of 2026-09-27 (item 6 of "Decided on the rule-4
+   adversary's findings"), which named only the integer operations;
+   fibref and fibgen's model already computed it so, and the
+   evaluator's unit tests pin it.

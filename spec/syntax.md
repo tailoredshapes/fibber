@@ -175,7 +175,8 @@ Evaluation is strict and **left to right, inner before outer**
   object among them), then the jump. The callee's result is the
   caller's result and nothing of the caller runs after it; in
   particular a call with a write-back is never a tail call, except the
-  forwarding case of §3.13;
+  forwarding case of §3.13, which excludes an `&v` that another
+  argument of the call captures;
 - `let`: initialisers in order, each seeing the earlier bindings;
 - `do`: steps in order; the value of the last is the value of the form;
 - `loop`: initialisers in order, like `let`; `recur`: a tail call to the
@@ -606,6 +607,21 @@ that calls a method is type-checked and generalised before any `impl`
 body is (types §3.5). One `impl` per (protocol, head constructor) in the
 whole program.
 
+A colour parameter of the head's type (§3.7, §3.9) is given a colour
+variable or a colour (**Decided**, owner, 2026-09-28; types §1.3).
+`(impl P (Hook k) ..)` implements `P` for every colour, and `k` is
+**rigid** in the bodies, like Rust's `impl<K> P for Hook<K>`: `self`'s
+fields are read and written at colour `k`, a sendable closure (a named
+function, a closure over sendable values) may be stored where colour
+`k` is expected and a closure over a cell may not, `self` may not be
+passed where a `(Hook :local)` or a `(Hook :send)` is expected, and a
+`k` closure may not be spawned. `(impl P (Hook :local) ..)` implements
+`P` for local hooks only, and its bodies see `self` as a `(Hook
+:local)`; `(impl P (Hook :send) ..)` likewise for sendable ones.
+Either excludes any other `impl` of `P` for `Hook`, and using a
+`:local` instance on a `(Hook :send)` is `no implementation of P for
+(Hook :send)`.
+
 **Supertraits and defaults** (**Decided**, owner, 2026-09-28; types
 §4.1). `(defprotocol Ord :requires (Eq) ..)` makes `Eq` a supertrait
 of `Ord`: an `impl Ord` for a type needs an `impl Eq` for the same
@@ -788,18 +804,26 @@ tail position (types §6.10), an argument `&v` where `v` is an `&`
 parameter of the enclosing `defun`, at any `&` position of any callee,
 forwards the private cell: no copy-in, no write-back, the cell is kept;
 the one write-back is that of the frame below that made the cell, after
-the whole chain returns. Since the copy-in happens at call entry, a
-forwarded call and the same call with a copy-in and a write-back see
-the same writes by the arguments; they still differ when the callee
-writes the cell through another name during the call (a closure that
-captures the parameter, passed to it): the forwarded callee sees that
-write, the copied one does not and overwrites it at its write-back.
-That difference is open (types §10). A call whose every `&` argument forwards stays
-a tail call, so an in-out accumulator can thread through mutual
-recursion in constant stack. Any other `&` argument — a `let` cell, a
-cell reached another way — makes the call an ordinary call with copy-in
-and write-back, never a tail call, because the write-back must run after
-it returns (types §6.10 rule (b)).
+the whole chain returns. The exception (**Decided**, owner,
+2026-09-28): `&v` is not forwarded when another argument of the same
+call mentions `v` — writes or reads it, or is a closure that captures
+it, at any depth — or names a `let`-bound closure that does (types §6.6
+gives the exact, syntactic test); it is then copied in and written
+back as at any call. Forwarding is therefore indistinguishable from
+copy-in/copy-out: since the copy-in happens at call entry, a forwarded
+call and the same call with a copy-in and a write-back see the same
+writes by the arguments, and the only way the callee could write the
+cell through another name during the call, a closure over `v` passed to
+it, makes the call copy in. In `(defun f (&v: i64) -> i64 (g &v (fn ()
+(set! v 7))))`, with `g` writing 1 into its `&w`, calling the closure
+and returning `@w`, `g` returns 1 and its write-back stores 1 into `v`,
+in tail position or not (types §6.6; cases 162, 163). A call whose
+every `&` argument forwards stays a tail call, so an in-out accumulator
+can thread through mutual recursion in constant stack. Any other `&`
+argument — a `let` cell, a cell reached another way, a captured `&v` —
+makes the call an ordinary call with copy-in and write-back, never a
+tail call, because the write-back must run after it returns (types
+§6.10 rule (b)).
 
 **Unique update** (**Decided**, §5): the in-place primitives update the
 object in a place when it is **unique**: its count is one and it is
@@ -1954,9 +1978,10 @@ a write-back) and §2 (the same for the order of evaluation); types §10
 lists them with that round's corrections to types.md, among them the
 scope at whose exit the interpreter ends a stack object. On 2026-09-28
 the owner moved the copy-in of an `&` argument from the argument's
-position to call entry (§2, §3.13); types §10 records the decision and
-the one question that applying it left open (a forwarded cell written
-through another name during the call).
+position to call entry (§2, §3.13), and then closed the one question
+that applying it left open (a forwarded cell written through another
+name during the call) by not forwarding an `&` parameter that another
+argument of the call captures (§3.13); types §10 records both.
 On 2026-09-28 the owner lifted item 11: patterns may be vector patterns and clauses
 may have guards (§1.4, §3.3, §3.6); types §10 records the decision.
 

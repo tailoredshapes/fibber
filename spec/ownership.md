@@ -121,12 +121,19 @@ made; with the copy-in at the argument's position the same call on a
 `let` cell did not, and the optimisation was observable (case 150
 against case 151). With the copy-in at entry, forwarding is
 indistinguishable from a copy-in and write-back as far as the
-evaluation of the call's arguments goes. It is still distinguishable
-in one situation, which this decision does not touch and which is open
-(types §10): when the callee, during the call, writes the forwarded
-cell through another name, a closure that captures the `&` parameter
-and is passed to it, the forwarded callee sees that write and a copied
-one does not, and loses it at its write-back.
+evaluation of the call's arguments goes.
+
+**Decided** (owner, 2026-09-28): an `&` parameter is not forwarded at
+a call where another argument captures it — mentions it, or is or
+names a local closure that does (types §6.6 gives the exact test). It
+is copied in and written back as at any call, and the call is not a
+tail call. Before this, the callee could write the forwarded cell
+during the call through such a closure, which a copied-in callee does
+not see and loses at its write-back (cases 162, 163). Now forwarding is
+indistinguishable from copy-in/copy-out: the only other name for the
+private cell is the parameter itself, and every closure that uses it
+stays within the call that made it and reaches another call only as an
+argument.
 
 Updates go through the object's count:
 
