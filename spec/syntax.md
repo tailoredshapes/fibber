@@ -948,7 +948,11 @@ extern positions are scalars, so liar's `:retains` named parameters that
 cannot exist; types §6.13). No extern parameter is ever typed as an
 object, so nothing else transfers a count across the boundary. `ptr` is
 a scalar for the ownership rules and is not sendable (types §5). A call
-to an extern is never a tail call (types §6.10).
+to an extern is never a tail call (types §6.10). At a `:varargs`
+extern, an argument past the fixed parameters of type `bool`, `i8`,
+`i16` or `f32` is widened to `i32` or `f64` before the call, as C
+promotes it; lIR rejects the unpromoted argument (lir.md §7.1,
+**Decided**, owner, 2026-09-28).
 
 ### 3.16 `quote`, `quasiquote`, `defmacro`, `Form`
 
@@ -1272,10 +1276,11 @@ object reachable from it become **immortal** (types §8.2), exactly like
 a literal: no count, never freed, never written in place (§3.13). A
 named function as a value is its immortal constant closure (types
 §8.4), the specialisation the `def`'s type selects for a generic one.
-The compiler may evaluate the initialiser at compile time and emit the
-graph as static data once lIR can hold it (types §8.11; in v1 the
-module initialiser builds it, types §8.2); a constant expression has no
-effect, so the two are indistinguishable. `name` in an expression is a read of the global
+The compiler evaluates the initialiser at compile time and emits the
+graph as static data (types §8.2, §8.10; **Decided**, owner,
+2026-09-28); a constant expression has no effect, so this is
+indistinguishable from evaluating it before `main`, as the interpreter
+does. `name` in an expression is a read of the global
 with no count operation (types §6.1: a global binding). Because its
 objects are immutable and immortal it may be used from any thread and
 inside any `fn` or `async` body without a `Send` check or a

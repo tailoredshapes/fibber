@@ -1918,8 +1918,8 @@ from one) has no count, so a value pulled out of a literal (`(match f
 private cell is copied by the first `push!`, never written, and the
 literal's tail array, immortal too, copies likewise. Without the flag
 test an immortal count that happened to read 1 would let accepted code
-write into a constant, which in the compiler may live in read-only
-data once lIR holds static constants (§8.11), while the interpreter,
+write into a constant, which in the compiler lives in read-only
+data (§8.2), while the interpreter,
 whose literals are ordinary allocations, would answer differently
 (method.md rule 6; proposed case 37). The audited heap must permit a
 write to an immutable object exactly under that test (`write-unique`,
@@ -2003,8 +2003,7 @@ result 4; clean.
   only it holds; the boxes die with their last `Weak` value; clean.
 - **Immortal objects** (literals and everything reachable from them,
   `def` values, named-function closures, vtables; §8.2) are static
-  data — in v1 built once by the module initialiser before `main`,
-  §8.2 — not audited allocations: the audit does not track them, they are not
+  data (lIR `constant`s, §8.2), not audited allocations: the audit does not track them, they are not
   live objects at exit, and nothing counted is ever reachable from one
   (a constant graph is closed), so they take part in no leak, no cycle
   and no unique write.
@@ -2639,34 +2638,30 @@ parameter, are corrected there.
 
 ## 8. Mapping to lIR
 
-lIR is the S-expression assembler for LLVM IR (liar's `doc/lIR.md`),
-used as it is: opaque `ptr`, `defstruct` with positional field types,
-`define`/`declare`, `call`/`tailcall`, `indirect-call` and
-`indirect-tailcall` in their present form `(indirect-call fnptr R
-args..)`, `getelementptr`, `load`/`store`,
-`alloca`, `br`/`phi`/`select`, `icmp`, and the atomic operations
-`atomicrmw`, `cmpxchg`, `atomic-load`, `atomic-store` and `fence`, which
-lir-core parses but `doc/lIR.md` does not yet document (§8.11). lIR has
-no `switch`, no array type in its type grammar, no typed indirect call,
-and no struct-typed `alloca`, `global` or constant: `alloca` takes a
-scalar or `ptr` element type and an optional count, and a `global` is a
-`ptr` or a scalar initialised with a literal, null or a string (a
-function address is not accepted as an initialiser; `lair` reports
-`complex global initializers` as not implemented). This mapping uses
-none of the missing forms (`match` is an `icmp`/`br` chain, §8.3;
-variable-length payloads are addressed with `getelementptr` on the
-element type, §8.3; §8.4 writes the indirect call as lIR has it; a
-stack object is a word-sized `alloca` addressed through
-`getelementptr` on its struct type, §8.2; every static object and
-table is built by the module initialiser of §8.2 and reached through a
-`ptr` global) and §8.11 lists what hardening must add (`musttail`) and
-what it may add. Everything
-fibber-specific is a naming and layout convention on top; no fibber
-vocabulary enters lIR, and none of liar ADR 021's safe-lIR features
-(`own`, `rc`, `closure`) is used. Runtime support functions are ordinary lIR `define`s in a
-`fib.rt` module (or C, linked). All of §8 is **Decided** as the v1
-mapping; a later lIR extension (§8.11) may change a shape without
-changing a rule.
+lIR is the S-expression assembler for LLVM IR of spec/lir.md
+(**Decided**, owner, 2026-09-28), fibber's hardened successor to
+liar's `doc/lIR.md`: opaque `ptr`, `defstruct` with positional field
+types, array types `[N x T]`, `define`/`declare` with linkage,
+`call`/`tailcall` lowered to `musttail` under `tailcc`, the typed
+`indirect-call`/`indirect-tailcall` `(indirect-call p (fn R (T..))
+args..)`, `getelementptr`, `load`/`store`, `alloca` of any sized type,
+`br`/`switch`/`phi`/`select`, `icmp`/`fcmp`, the atomic operations
+`atomicrmw`, `cmpxchg`, `atomic-load`, `atomic-store` and `fence`, the
+overflow and saturation intrinsics of §8.12, and struct, array and
+function-address constants as static data. This mapping uses them as
+lir.md defines them: `match` dispatches through `switch` (§8.3);
+variable-length payloads are `[0 x T]` trailing members addressed with
+`getelementptr` (§8.3); a stack object is an `alloca` of its struct
+type (§8.2); and every static object and table — the type table,
+literals, named-function closures, vtables and `def` values — is an
+lIR `constant` (§8.2), reached by its address. There is no module
+initialiser (**Decided**, owner, 2026-09-28, lir.md §14 item 3; the v1
+shapes that built these objects at start-up remain valid lIR but are
+no longer the mapping). Everything fibber-specific is a naming and
+layout convention on top; no fibber vocabulary enters lIR, and none of
+liar ADR 021's safe-lIR features (`own`, `rc`, `closure`) exists in
+it. Runtime support functions are ordinary lIR `define`s in a
+`fib.rt` module (or C, linked). All of §8 is **Decided**.
 
 ### 8.1 Representation of every type
 
@@ -2729,35 +2724,32 @@ flags: bit 0 SHARED    counts are atomic from now on (§7)
 `count` is the number of counted references (§2) of a counted object.
 An `IMMORTAL` or `STACK` object has no count: its `count` field is
 **0**, a value no test accepts (`fib.unique?` needs 1, a weak upgrade
-needs > 0), and nothing ever changes it; a static object built by the
-module initialiser (or emitted as a constant once lIR holds one,
-§8.11), a literal allocated by the interpreter, a stack object's
-`alloca` and `fib.immortalise` all initialise it so (**Decided**).
+needs > 0), and nothing ever changes it; a static object emitted as
+an lIR `constant`, a literal allocated by the interpreter, a stack
+object's `alloca` and `fib.immortalise` all initialise it so
+(**Decided**).
 `type-id` indexes the table `fib.types` of per-type records
 `(defstruct fib.typerec (ptr ptr ptr i64))` — `drop`, `trace`, `name`,
 `size` — one per monomorphised object type: `drop` releases the
 object's counted children; `trace` calls a callback on each child
 pointer (used by share-marking, §8.8, by `fib.immortalise` and by the
-interpreter's audit). lIR has no struct-typed `global`, so the table is
-a block of `n` records that the **module initialiser** allocates and
-fills: `(global fib.types ptr (ptr null))` holds its address, and
-record `tid`'s field `k` is `(getelementptr %struct.fib.typerec (load
-ptr @fib.types) (i32 tid) (i32 k))`; `fib.types[tid].drop` below is
-that load. The initialiser `fib.init.<module>` is an lIR `define` the
-compiler emits per module; the entry point it emits calls the
-initialisers of every module in dependency order and only then the
-program's `main`, and each initialiser, in this order: allocates the type records and stores the code pointers
-(`(store @drop.T slot)` is an ordinary store of a function address,
-which lIR accepts where a `global` initialiser does not); builds every
-**static object** of the module — string and `Form` literals with
-their headers (§8.3), the constant closures of named functions and
-constructors (§8.4), vtables (§8.5) — with `fib.alloc` followed by
-`count := 0, flags := IMMORTAL`, storing each address into its own
-`ptr` global, from which code loads it; then evaluates the module's
-`def`s (§8.10). Once lIR has struct-typed constants (§8.11) the static
-objects become static data with the same headers and nothing else
-changes: an `IMMORTAL` object is never freed either way and the audit
-does not track it (§6.7) (**Decided**).
+interpreter's audit). The table is **static data** (**Decided**,
+owner, 2026-09-28, lir.md §14 item 3): the whole program has one,
+`(constant fib.types [n x %struct.fib.typerec] ([n x
+%struct.fib.typerec] (%struct.fib.typerec @drop.T @trace.T @name.T
+(i64 size)) ..))`, and record `tid`'s field `k` is `(getelementptr [n x
+%struct.fib.typerec] @fib.types (i32 0) tid (i32 k))`; `fib.types[tid].drop`
+below is that load. Every other **static object** — string and `Form`
+literals with their headers (§8.3), the constant closures of named
+functions and constructors (§8.4), vtables (§8.5) and the values of
+`def`s (§8.10) — is an lIR `constant` too, with `count` 0 and flags
+`IMMORTAL` written into its header by the emitter, reached by its
+address `@name` (a `ptr`) wherever code needs it. There is no module
+initialiser and nothing runs before `main`: an `IMMORTAL` object
+exists from the start, is never freed, and the audit does not track it
+(§6.7). (In v1 the objects were built at start-up by a module
+initialiser and reached through `ptr` globals; that shape is still
+valid lIR but is not the mapping.)
 
 **The flags word is accessed atomically** (**Decided**).
 `SHARED`, `STACK` and `IMMORTAL` are fixed before any second thread can
@@ -2804,13 +2796,13 @@ fib.immortalise (ptr p) -> void                  ; def initialisation (syntax §
 
 A `STACK` object has the same layout in an `alloca` of the frame,
 never passed to `fib.release`; the compiler emits `fib.types[tid].drop`
-inline at scope exit. lIR's `alloca` takes a scalar or `ptr` element
-type, not a named struct, so the object is `(alloca i64 (i32 k))` with
-`k` the layout's size in 8-byte words — every field of these layouts
-is at most 8-byte aligned, so the words give the alignment the fields
-need — and its fields are addressed through `(getelementptr
-%struct.T.obj p (i32 0) (i32 i))` exactly as a heap object's are; the
-header is stored by the code that allocates it. Each `STACK`
+inline at scope exit. The object is `(alloca %struct.T.obj)` (lIR's
+`alloca` takes any sized type; **Decided**, owner, 2026-09-28, lir.md
+§14 item 3), which gives it the struct's own size and alignment, and
+its fields are addressed through `(getelementptr %struct.T.obj p (i32
+0) (i32 i))` exactly as a heap object's are; the header is stored by
+the code that allocates it. (v1 sized the slot in 8-byte words,
+`(alloca i64 (i32 k))`; the fields' addresses were the same.) Each `STACK`
 allocation site — a scope-local object, a stack closure, a private `&`
 cell — has exactly one such `alloca`, in the function's entry block
 (in an `async` body, whose locals live in the task object so as to
@@ -2844,27 +2836,31 @@ compiled program.
   after `consume` (E2). Its `drop` releases every object field.
 - Enum with fields: `(i64 i32 i32 i32 payload..)`: tag, then the largest
   variant's fields; one lIR `defstruct` per variant with the same prefix;
-  `match` loads the tag and compares it with each clause's tag in clause
-  order (`icmp eq` and `br`; lIR has no `switch`, §8.11), then
-  `getelementptr`s through the variant struct; `drop` does the same on
-  the tag.
+  `match` loads the tag and dispatches on it with `switch` — one case
+  per clause's tag, the default the next clause or the match failure —
+  in clause order (**Decided**, owner, 2026-09-28, lir.md §14 item 3;
+  v1 used an `icmp eq`/`br` chain), then `getelementptr`s through the
+  variant struct; `drop` does the same on the tag.
 - `(Option T)`, `T` a non-`Option` object type: the bare nullable
   pointer; `nil` is `(ptr null)`; `(some p)` in a pattern is a null
   test. `fib.retain`/`release` are null-tolerant, so codegen needs no
   special case. Every other `Option` (§8.1) is an ordinary heap enum
   with tag `0` = `nil`, `1` = `some` and the payload at its own lIR type;
   `(some p)` in a pattern reads the tag.
-- `str`: the header struct `(i64 i32 i32 i64)` (count, type id, flags,
-  byte length) followed in the same allocation by the UTF-8 bytes and a
-  NUL for FFI, addressed with `getelementptr i8` from the end of the
-  header (lIR's type grammar has no array type); no children. Literals
-  are `IMMORTAL` objects with count 0, built by the module initialiser
-  and reached through a `ptr` global each, since lIR has no struct-typed
-  constant; its `(string ..)` constant holds the bytes the initialiser
-  copies (§8.2).
-- `(Array T)`: the header struct `(i64 i32 i32 i64)` (length last)
-  followed by `n` elements of `T`'s lIR type, addressed with
-  `getelementptr T` from the end of the header; `array-set!` does a
+- `str`: `(defstruct fib.str (i64 i32 i32 i64 [0 x i8]))` (count, type
+  id, flags, byte length, then the UTF-8 bytes and a NUL for FFI in the
+  same allocation, the trailing `[0 x i8]` being C's flexible array
+  member); byte `i` is `(getelementptr %struct.fib.str s (i32 0) (i32
+  4) i)`; no children. A literal of `n` bytes is the constant
+  `(constant str.k { i64 i32 i32 i64 [n+1 x i8] } { (i64 0) (i32 tid)
+  (i32 IMMORTAL) (i64 n) ([n+1 x i8] ..) })`, whose layout is
+  `%struct.fib.str`'s with the bytes in place; code uses `@str.k`
+  (**Decided**, owner, 2026-09-28, lir.md §14 item 3; v1 built it at
+  start-up from a `(string ..)` constant).
+- `(Array T)`: `(defstruct fib.array.T (i64 i32 i32 i64 [0 x T]))`
+  (length last, then the `n` elements at `T`'s lIR type in the same
+  allocation), element `i` at `(getelementptr %struct.fib.array.T a
+  (i32 0) (i32 4) i)`; `array-set!` does a
   unique write when `fib.unique?` holds, else allocates, copies, writes, stores
   into the place and releases the old array. `set-field!` likewise on a
   struct.
@@ -2899,9 +2895,9 @@ compiled program.
   binding.
 - `Form`: an ordinary enum; exists at run time only where a program
   quotes. A quoted literal, with every `Form`, `Vec`, `Array` and `str`
-  object reachable from it, is an `IMMORTAL` graph (count 0) that the
-  module initialiser builds once and a `ptr` global names (§8.2), so a
-  part of it pulled out by a `match` is never written in place (§6.6).
+  object reachable from it, is an `IMMORTAL` graph (count 0) of lIR
+  `constant`s referring to each other by address (§8.2), so a part of
+  it pulled out by a `match` is never written in place (§6.6).
 
 ### 8.4 Closures and function values
 
@@ -2915,23 +2911,23 @@ A `fn` literal `L` with captures `c₁ .. cₖ` compiles to
 A call through a function value `f` is
 
 ```
-(indirect-call (load ptr (getelementptr fib.closure.L f (i32 0) (i32 3))) R f a₁ .. aₙ)
+(indirect-call (load ptr (getelementptr %struct.fib.closure.L f (i32 0) (i32 3)))
+               (fn tailcc R (ptr A₁ .. Aₙ)) f a₁ .. aₙ)
 ```
 
-in lIR's present form `(indirect-call fnptr ret-type args..)`, whose
-arguments are all typed `ptr` today (`lir-audit/`): until the typed
-form of §8.11 exists, every closure entry point takes `ptr`-sized words
-and scalar arguments travel through them by a width-preserving
-conversion, which is one of the reasons the typed form is on the
-hardening list. Named functions used as
-values are `IMMORTAL` closures with no captures whose code ignores
-`env`, built by the module initialiser and named by a `ptr` global
-each (§8.2); constructors likewise. A heap closure (§6.5: escaping, or
-at a tail site) is `fib.alloc`ed with each object capture consumed
+in lIR's typed form (lir.md §6.8; **Decided**, lir.md §14): the call
+carries the full function type, so scalar arguments travel at their
+own types (v1's `indirect-call` typed every argument `ptr`). Closure
+entry points are `tailcc`, so that a tail call through a closure value
+is a `musttail` jump whatever the prototypes (lir.md §7.3, §8.9).
+Named functions used as values are `IMMORTAL` closures with no
+captures whose code ignores `env`: each is an lIR `constant` of its
+closure struct holding the header and the code address, used by
+`@name` (§8.2); constructors likewise. A heap closure (§6.5: escaping,
+or at a tail site) is `fib.alloc`ed with each object capture consumed
 (E3); its `drop` releases the captures. A stack closure is a `STACK`
-object of the creating frame: `(alloca i64 (i32 k))` addressed through
-`(getelementptr %struct.fib.closure.L ..)` (§8.2), storing uncounted
-pointers. Colours have no representation. A named `fn`'s
+object of the creating frame: `(alloca %struct.fib.closure.L)` (§8.2),
+storing uncounted pointers. Colours have no representation. A named `fn`'s
 self-reference is the closure's own `env`, and each occurrence of it is
 a use of the literal (§6.5), so a closure that stores, returns or
 passes on its own name is a heap closure.
@@ -2984,12 +2980,12 @@ supertrait of `P` in the order of its transitive closure (depth first,
 each protocol once) holding the address of that supertrait's vtable
 `Q.vt.K` (§4.1 rule 3, **Decided**, owner, 2026-09-28): a call of `Q`'s
 method through a `(dyn P)` loads `Q`'s slot and then the method's, and
-the upcast `(dyn Q d)` builds `{ obj, Q's slot }`. lIR has no struct-typed
-`global` and takes no function address in a `global` initialiser, so
-the module initialiser allocates the block, `store`s each code pointer
-into its slot and stores the block's address into the `ptr` global
-`P.vt.K` (§8.2); a struct-valued constant, if lIR gains one, would make
-it static data (§8.11). `(dyn P e)` builds `{ e, (load ptr @P.vt.K) }`,
+the upcast `(dyn Q d)` builds `{ obj, Q's slot }`. The vtable is
+static data (**Decided**, owner, 2026-09-28, lir.md §14 item 3):
+`(constant P.vt.K [m x ptr] ([m x ptr] @P.m1.K .. @Q.vt.K ..))`, its
+slots the code addresses and supertrait vtable addresses (v1 built the
+block at start-up and reached it through a `ptr` global). `(dyn P e)`
+builds `{ e, @P.vt.K }`,
 `e` always an object (a `ptr`, or an `opt` that may be null, which the
 null-tolerant count operations accept; a scalar `e` is rejected by
 §2.15);
@@ -3006,9 +3002,7 @@ Retain and release of a `(dyn P)` value act on `obj`.
 `fib.cell` is one `defstruct` per content layout. A `(dyn P)` content,
 two words by value (§8.1), is laid out as two `ptr` fields, object then
 vtable: `(i64 i32 i32 ptr ptr)`, and a `(Weak (dyn P))` content the same
-way, box then vtable, which lIR's `defstruct` takes as
-documented (lir-core also parses a `{ ptr, ptr }` field type, which
-`doc/lIR.md` does not document).
+way, box then vtable (lir.md §2).
 
 - `@c` on a cell: `load`, then `fib.retain` if the content is an object
   (never elided, §6.3).
@@ -3016,16 +3010,15 @@ documented (lir-core also parses a `{ ptr, ptr }` field type, which
   old`. If the cell is `SHARED` (only an atom can be), the value is
   share-marked before the store.
 - A private `&` cell: a `STACK` object in the caller's frame, one
-  `(alloca i64 (i32 k))` per call site in the entry block, reused by
-  every execution of the call (§8.2), sized like any stack object: `k`
-  is the header's two words plus the content's, one word for a scalar, a
-  `ptr` or an `opt` and two for a `(dyn P)` or a `(Weak (dyn P))`, so 3
-  or 4 (a fixed three
-  words let the copy-in and every `set!` of a `dyn` write its vtable
-  word past the slot, into a neighbouring slot of the entry block:
-  proposed case 77) — addressed through
-  `(getelementptr %struct.fib.cell t (i32 0) (i32 3))` (§8.2), since
-  lIR's `alloca` takes no struct type; its header is stored (count 0,
+  `(alloca %struct.fib.cell.T)` per call site in the entry block,
+  reused by every execution of the call (§8.2), sized by its struct
+  like any stack object: the header and the content, one word for a
+  scalar, a `ptr` or an `opt` and two for a `(dyn P)` or a `(Weak (dyn
+  P))` (a cell sized for one word would let the copy-in and every
+  `set!` of a `dyn` write its vtable word past the slot, into a
+  neighbouring slot of the entry block: proposed case 77) — addressed
+  through `(getelementptr %struct.fib.cell.T t (i32 0) (i32 3))`
+  (§8.2); its header is stored (count 0,
   `STACK`) and it is initialised by the copy-in at call entry, after
   the last argument has been evaluated, in parameter order (`store` the
   acquired content, §6.6), or, when forwarded (§6.6, §6.10 rule (b)),
@@ -3033,7 +3026,7 @@ documented (lir-core also parses a `{ ptr, ptr }` field type, which
   an argument of the call captures is never forwarded, §6.6, so its
   cell is made and written back like any other); passed as
   `ptr`; write-back as §6.6; the `alloca` needs no drop. Case 17's
-  `(push-count &v @v)` emits exactly this: three words; `@v` loaded
+  `(push-count &v @v)` emits exactly this: the cell's `alloca`; `@v` loaded
   and retained for the second argument; then the header, and the
   vector loaded from `v` again, retained and stored through the
   field-3 `getelementptr`; `push-count` called with the `alloca`'s
@@ -3310,8 +3303,9 @@ quantum.
   release the step's other temporaries and the frame's owned parameters
   not moved (`env` among them in a closure body); then
   `(tailcall @g args..)` for a known callee, or
-  `(indirect-tailcall code R env args..)` through a closure value with
-  the consumed closure object as `env` (§8.4); nothing follows in the
+  `(indirect-tailcall code (fn tailcc R (ptr A..)) env args..)`
+  through a closure value with the consumed closure object as `env`
+  (§8.4); nothing follows in the
   function. An `async` body has no tail call: a call in its tail
   position is a `call` whose value `resume` stores as the task's result
   (§6.10 rule (f), §8.8). A `loop`'s `recur` is the sequence §6.10 gives
@@ -3350,9 +3344,9 @@ quantum.
 | `&` copy-in | at call entry, after every argument, in parameter order: `fib.retain` the variable's content and store it into the private cell (§6.6); nothing for a forwarded `&v` (§6.10 rule (b)), nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
 | `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content |
 | `array-set!`, `set-field!` | `fib.unique?` test (flags first, `HAS-WEAK` among them, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
-| module initialiser `fib.init.<module>` | called by the entry point before the program's `main`, modules in dependency order (§8.2): allocate and fill the type table, build every static object (literals, named-function closures, vtables) with `fib.alloc` and an `IMMORTAL` header, store each address into its `ptr` global |
-| `def` initialisation | in the module initialiser after its static objects, `def`s in source order: evaluate the constant expression and `fib.immortalise` its value (syntax §3.19); as static data once lIR holds struct-typed constants (§8.11) |
-| stack object (`STACK`: private `&` cell, stack closure, scope-local object, §6.11) | `(alloca i64 (i32 k))`, `k` the layout in 8-byte words, one per allocation site in the function's entry block, reused by every execution of the site; header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |
+| static objects: the type table, literals, named-function closures, vtables | lIR `constant`s with `count` 0 and `IMMORTAL` in their headers, referring to each other by address (§8.2, §8.3, §8.4, §8.5); no module initialiser, nothing runs before `main` |
+| `def` initialisation | the constant expression is evaluated at compile time — its literal parts folded, the prelude calls of the collection-literal rewrite (`conj`, `assoc`, syntax §1.4) run through the JIT that runs macros (ROADMAP, M4) — and the resulting graph, `def`s in source order, is emitted as static objects as above (syntax §3.19); `fib.immortalise` is then the interpreter's only (**Decided**, owner, 2026-09-28, lir.md §14 item 3) |
+| stack object (`STACK`: private `&` cell, stack closure, scope-local object, §6.11) | `(alloca %struct.T)` of its layout, one per allocation site in the function's entry block, reused by every execution of the site; header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |
 | `(weak x)` | box lookup or allocation under the table mutex; `HAS-WEAK` set with `atomicrmw or` (§8.7); for a `dyn` operand, the box of its object paired with its vtable |
 | integer `/`, `rem`, `+`, `-`, `*`, `neg`; shifts; `fptosi`, `fptoui` | the checks and saturations of §8.12, before or instead of the bare LLVM operation |
 | tail call, `loop`/`recur` | §8.9: consume the arguments, run the releases, `tailcall`/`indirect-tailcall` or `br` |
@@ -3362,71 +3356,77 @@ quantum.
 
 ### 8.11 lIR hardening this mapping relies on
 
-From `lir-audit/`: a whole-module type checker run by default (method.md
-rule 7); `indirect-call` carrying the full function type (today every
-argument is typed `ptr`, so §8.4's calls pass scalars through
-`ptr`-sized words until then); string globals that load correctly; a
-`fence` with real cross-thread semantics; `atomicrmw`/`cmpxchg`/
-`atomic-load`/`atomic-store` documented in `doc/lIR.md` (they are parsed
-and lowered but undocumented); `tailcall` and `indirect-tailcall`
-lowered to `musttail` — today they are `tail`, a hint LLVM may ignore
-(`lir-audit/README.md`) — under a calling convention that guarantees a
-tail call between differing prototypes (LLVM's `tailcc`; under the C
-convention `musttail` requires matching prototypes, which mutual
-recursion and calls through closure values do not have), which §8.9
-relies on: without it a compiled tail recursion of depth 10⁶ (proposed
-cases 52 and 53) overflows the stack where the interpreter does not,
-failing method.md rule 6. Conveniences this mapping
-does *not* depend on but would use if added: `switch` (§8.3 uses
-`icmp`/`br` chains for `match`), an array type in the type grammar
-(§8.3 addresses trailing elements with `getelementptr`), a named
-struct as the element type of `alloca` (§8.2 sizes stack objects in
-words and addresses them with `getelementptr` on the struct type), and
-struct-typed `global`s and constants with function addresses and
-nested aggregates as initialisers (§8.2 builds the type table, literal
-objects, constant closures and vtables in the module initialiser and
-reaches them through `ptr` globals; with them, all of it becomes
-static data). `lair` today parses `(alloca %struct.T)` and `(global g
-%struct.T ..)` as `UnknownType` and rejects `(global g ptr @f)` as an
-unimplemented initialiser, which is what fixed the v1 shapes. Nothing
-here needs ADR 021's safe lIR.
+**Decided** (owner, 2026-09-28; spec/lir.md). Everything this section
+asked for in v1 is in lIR now, and this mapping uses it:
+
+- a whole-module type checker run by default on every path (method.md
+  rule 7; lir.md §10), so an invalid module is an error with a message
+  and never a backend crash or silently wrong code;
+- `indirect-call` and `indirect-tailcall` carrying the full function
+  type (§8.4; lir.md §6.8);
+- string globals that load correctly (lir.md §9); `fence` with real
+  cross-thread semantics and the atomic operations documented (lir.md
+  §6.6);
+- `tailcall` and `indirect-tailcall` lowered to `musttail` under
+  `tailcc`, the convention that guarantees a jump between differing
+  prototypes (lir.md §7.3), which §8.9 relies on: a compiled tail
+  recursion of depth 10⁶ (proposed cases 52 and 53) runs in constant
+  stack, as in the interpreter (method.md rule 6);
+- the conveniences v1 did without, adopted by the owner's decision of
+  2026-09-28 (lir.md §14 item 3): `switch` for `match` (§8.3), a
+  struct as the type of an `alloca` for stack objects (§8.2, §8.4,
+  §8.6), array types `[N x T]` for trailing elements and the type
+  table (§8.2, §8.3), and struct, array and function-address constants
+  for every static object (§8.2, §8.5, §8.10), which removed the
+  module initialiser;
+- the overflow and saturation intrinsics of §8.12 (lir.md §14 item 5),
+  `trap`, linkage and visibility for module-private symbols, and
+  external global declarations (`stderr`) for `fib.trap`.
+
+Nothing here needs ADR 021's safe lIR, which lIR no longer has (lir.md
+§6.10). `lir-audit/README.md` records what each finding did on liar
+and which case pins its fix.
 
 ### 8.12 Arithmetic and conversions
 
-**Decided** (owner, 2026-09-27; §2.12). LLVM leaves exactly the cases
+**Decided** (owner, 2026-09-27; §2.12; the intrinsics owner,
+2026-09-28, lir.md §14 item 5). LLVM leaves exactly the cases
 that §2.12 defines undefined or poison (`sdiv`/`srem` by zero or of the
 minimum by -1, `add`/`sub`/`mul` with `nsw` on overflow, a shift by at
 least the width, `fptosi`/`fptoui` out of range), so the compiler
 emits every check itself, never the bare instruction, and never the
 `nsw`/`nuw` flags. `w` is the operand width, `MIN`/`MAX` its signed
 bounds; a trap is `(call @fib.trap msg)`, where `fib.trap` is a
-`fib.rt` function that writes the message (a string global) to
-standard error and aborts, as the builtin `trap` does (§2.11); the
-block it is called from branches nowhere after it, and it releases
+`fib.rt` function that writes the message (a string constant) to
+standard error (`(declare-global stderr ptr)`, lir.md §4.4) and
+aborts, as the builtin `trap` does (§2.11); the
+block it is called from branches nowhere after it (it ends in
+`unreachable`), and it releases
 nothing (§2.11: the objects live at an abort are not leaks).
 
 | Operation | lIR emitted |
 |---|---|
 | `(/ a b)`, `(rem a b)` | `(icmp eq b 0)` → trap `integer / by zero` (or `rem`); `(and (icmp eq a MIN) (icmp eq b -1))` → trap `integer overflow in / at w` (or `rem`); else `sdiv` / `srem` |
-| `(+ a b)` | `r = (add a b)`; `(icmp slt (and (xor a r) (xor b r)) 0)` → trap `integer overflow in + at w`; else `r` |
-| `(- a b)` | `r = (sub a b)`; `(icmp slt (and (xor a b) (xor a r)) 0)` → trap; else `r` |
-| `(* a b)`, `w` < 64 | `r = (mul (sext i64 a) (sext i64 b))`; `(icmp ne (sext i64 (trunc w r)) r)` → trap; else `(trunc w r)` |
-| `(* a b)`, `w` = 64 | `r = (mul a b)`; trap if `(and (icmp eq a -1) (icmp eq b MIN))`, else if `a ≠ 0` and `a ≠ -1` and `(icmp ne (sdiv r a) b)`; else `r` (the order keeps the `sdiv` defined) |
+| `(+ a b)` | `r = (sadd-overflow a b)`; `(extractvalue r 1)` → trap `integer overflow in + at w`; else `(extractvalue r 0)` |
+| `(- a b)` | `r = (ssub-overflow a b)`; likewise, trap `integer overflow in - at w` |
+| `(* a b)` | `r = (smul-overflow a b)`; likewise, trap `integer overflow in * at w`, at every width |
 | `(neg a)` | `(icmp eq a MIN)` → trap `integer overflow in neg at w`; else `(sub 0 a)` |
 | `(shl a n)`, `(shr a n)`, `(sar a n)` | `(shl a (and n (w - 1)))`, `(lshr ..)`, `(ashr ..)`: `w` is a power of two, so the `and` is `n mod w` |
-| `(fptosi T x)` | `(fcmp uno x x)` → 0; `(fcmp oge x 2^(bits(T)-1))` → `MAX`; `(fcmp olt x -2^(bits(T)-1))` → `MIN`; else `(fptosi T x)`: both bounds are powers of two, exact in `float` and `double`, and a value in between truncates into range |
-| `(fptoui T x)` | `(fcmp uno x x)` → 0; `(fcmp olt x 0.0)` → 0; `(fcmp oge x 2^bits(T))` → all ones; else `(fptoui T x)` |
+| `(fptosi T x)` | `(fptosi-sat T x)`: NaN → 0, above `MAX` → `MAX`, below `MIN` → `MIN`, else truncation towards zero |
+| `(fptoui T x)` | `(fptoui-sat T x)`: NaN or negative → 0, at or above `2^bits(T)` → all ones, else truncation |
 | `=`, `!=`, `<`, `<=`, `>`, `>=` at a float type | `fcmp` with `oeq`, `une`, `olt`, `ole`, `ogt`, `oge` respectively: the ordered predicates are false on a NaN operand and the unordered `une` of `!=` is true (§2.12); never the `Ord` defaults |
 | `(rem a b)` at a float type | `frem`: `fmod`, the sign of the dividend (§2.12); no check |
-| `bit-and`, `bit-or`, `bit-xor`, `bit-not`, `popcount`, integer comparisons, `trunc`, `zext`, `sext`, `sitofp`, `uitofp`, `fptrunc`, `fpext`, float arithmetic | the LLVM instruction as it is, no check |
+| `bit-and`, `bit-or`, `bit-xor`, `bit-not`, `popcount` (`ctpop`), integer comparisons, `trunc`, `zext`, `sext`, `sitofp`, `uitofp`, `fptrunc`, `fpext`, float arithmetic | the LLVM instruction as it is, no check |
 
-The saturating conversions are what LLVM's `llvm.fptosi.sat` and
-`llvm.fptoui.sat` compute, and the overflow tests what
-`llvm.s{add,sub,mul}.with.overflow` report; the compiler may use those
-intrinsics instead once lIR can call them (§8.11), with the same
-results. The interpreter computes each operation exactly and traps or
-saturates under the same conditions (`fibref` `eval/arith.rs`), so the
-two agree on every input (method.md rule 6).
+The intrinsics compute exactly what v1's hand-written sequences
+computed (kept as `cases/lir/mapping/arith-checks.lir`, which now
+checks the intrinsics against them on every boundary): `sadd-overflow`
+reports `(icmp slt (and (xor a r) (xor b r)) 0)` on the wrapped `r`,
+`smul-overflow` the widened-multiply test, and the saturating
+conversions the `fcmp` chains of §2.12. The interpreter computes each
+operation exactly and traps or saturates under the same conditions
+(`fibref` `eval/arith.rs`), so the two agree on every input (method.md
+rule 6).
 
 ---
 
@@ -3528,7 +3528,7 @@ old numbering is kept here because the drafts and
 | 22 | task created with count 2; `main` joins running threads | §6.8, §8.8 |
 | 23 | `async` retains every capture at creation | §6.9 |
 | 24 | `weak` of an `IMMORTAL` object | §6.7, §8.7 |
-| 25 | `match` as `icmp`/`br`; untyped `indirect-call`; no new lIR types required | §8, §8.11 |
+| 25 | `match` as `icmp`/`br`; untyped `indirect-call`; no new lIR types required — **replaced by the owner's decision of 2026-09-28 (below): `switch`, the typed `indirect-call`, array types** | §8, §8.11 |
 | 26 | `raw-retained`/`release-raw` | §6.13 |
 | 27 | one driver, any number of waiters; `Task` stays `Send` | §8.8, §6.8 |
 | 28 | specialisation keys | §4.3 |
@@ -3536,7 +3536,7 @@ old numbering is kept here because the drafts and
 | 30 | `fib.unique?` tests flags first; immortal and stack objects carry count 0 | §8.2, §6.6 |
 | 31 | `def` values typed closed, in dependency order, immortalised before `main` | §2.16, §3.5, §8.2 |
 | 32 | a closure passed at a self tail call is escaping — **generalised by D5: heap at any tail call (E6), escaping only by its uses**; read since the fifth review round as heap at any tail site, admitted or not | §6.5, §6.10 |
-| 33 | static objects built by the module initialiser; word-sized stack `alloca`s | §8.2, §8.10 |
+| 33 | static objects built by the module initialiser; word-sized stack `alloca`s — **replaced by the owner's decision of 2026-09-28 (below): static data, struct-typed `alloca`s** | §8.2, §8.10 |
 
 **Fourth review round.** A review of the sections that D1–D7 touched
 found places where their application broke a decided rule or a
@@ -3894,3 +3894,39 @@ implementation already followed:
    adversary's findings"), which named only the integer operations;
    fibref and fibgen's model already computed it so, and the
    evaluator's unit tests pin it.
+
+### Decided on the mapping to lIR
+
+On 2026-09-28 the owner decided the seven open questions of spec/lir.md
+(its §14) and, with them, the shape of §8:
+
+1. **lIR's conveniences are adopted** (lir.md §14 item 3; §8, §8.2,
+   §8.3, §8.4, §8.5, §8.6, §8.9, §8.10, §8.11; syntax §3.19). `match`
+   dispatches through `switch`; a stack object is `(alloca %struct.T)`
+   of its own layout, not a count of `i64` words; strings and arrays
+   carry their elements as a trailing `[0 x T]` and the type table is
+   an array of records; and every static object — the type table,
+   literals and quoted graphs, the constant closures of named
+   functions and constructors, vtables, and `def` values — is an lIR
+   `constant` with `count` 0 and `IMMORTAL` in its header, referred to
+   by address. The module initialiser `fib.init.<module>` of v1 is
+   gone: nothing runs before `main`. A `def`'s constant expression is
+   evaluated at compile time, its collection-literal prelude calls
+   through the JIT the compiler runs macros with, and the result
+   emitted as static data. `indirect-call` carries the full function
+   type, so closure entry points take their arguments at their own
+   types (item 25 above) and are `tailcc`. The rules of §8 are
+   unchanged; only the shapes are.
+2. **The checked arithmetic uses lIR's intrinsics** (lir.md §14 item
+   5; §8.12): `sadd-overflow`, `ssub-overflow`, `smul-overflow`,
+   `fptosi-sat` and `fptoui-sat` replace the hand-written test
+   sequences, with the same results on every input;
+   `cases/lir/mapping/arith-checks.lir` checks them against the
+   sequences on the boundaries.
+3. **`fib.trap` reaches `stderr` through `declare-global`** (lir.md
+   §4.4; §8.12).
+
+The variadic-promotion rule (lir.md §14 item 1) binds the compiler at
+`:varargs` externs (syntax §3.15): a `bool`, `i8`, `i16` or `f32`
+argument past the fixed parameters is widened to `i32` or `double`
+before the call, as C does.

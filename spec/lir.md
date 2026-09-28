@@ -1,9 +1,13 @@
 # lIR
 
-**Status: Proposed** (M3). Every rule on this page is proposed until the
-owner decides it (method.md, "Decision records"); the implementation in
-`crates/lir` and `crates/lair` follows it so that it can be tested, and
-nothing downstream depends on a rule until it is decided.
+**Status: Decided** (owner, 2026-09-28; M3). The owner decided the seven
+open questions of the first M3 pass on 2026-09-28 (§14); every rule on
+this page from that pass is now decided, and the implementation in
+`crates/lir` and `crates/lair` follows it. The additions of the second
+M3 pass — array types (§2.1), linkage and visibility (§4.3), external
+global declarations (§4.4), volatile and aligned accesses (§6.5) — are
+marked **Proposed** where they stand and listed in §14.1; the
+intrinsics of §6.1 and §6.3 are decided (§14, item 5).
 
 lIR is an S-expression assembler for LLVM IR: a 1:1 mapping, no sugar,
 no promotion, no fibber vocabulary. This chapter is the language as
@@ -37,7 +41,7 @@ more, a constant out-of-range vector index, a store to a `constant`).
 - A module is UTF-8 text. `;` starts a comment to the end of the line.
   Commas are whitespace (so `{ ptr, ptr }` and `{ ptr ptr }` are the
   same).
-- Tokens: `(`, `)`, `{`, `}`, strings, vector types and atoms.
+- Tokens: `(`, `)`, `{`, `}`, `[`, `]`, strings, vector types and atoms.
 - A **string** is `"…"` with the escapes `\n \t \r \0 \\ \"` and
   `\xHH` (one byte, two hex digits). Any other escape is an error
   `invalid escape`; a string without its closing quote is `unterminated
@@ -45,7 +49,7 @@ more, a constant out-of-range vector index, a store to a `constant`).
 - A **vector type** is `<N x T>` written as one token (spaces inside
   allowed): `<4 x i32>`.
 - An **atom** is any other run of characters that are not whitespace,
-  parentheses, braces, `"` or `;`. `@name` names a global or function,
+  parentheses, braces, brackets, `"` or `;`. `@name` names a global or function,
   `%struct.name` a struct type; any other atom is a keyword, a number or
   a local name.
 - Nesting deeper than **512** lists is an error `nesting deeper than
@@ -63,23 +67,42 @@ type   ::= i1 | i8 | i16 | i32 | i64 | float | double | ptr
          | <N x elem>                       ; elem: an integer type, float, double or ptr; 1 ≤ N ≤ 1024
          | %struct.NAME                     ; a named struct, defined by defstruct
          | { type* }                        ; an anonymous (literal) struct
+         | [N x type]                       ; an array of N elements, N ≥ 0 (§2.1)
 rtype  ::= type | void                      ; function results only
 fntype ::= (fn cc? rtype (type* ...?))      ; a function type, for indirect calls
 cc     ::= ccc | tailcc
 ```
 
 - There is no `bool` (use `i1`), no `f32`/`f64` (use `float`/`double`),
-  no typed pointer, no array type, no `void` value, and no `undef` or
-  `poison` value anywhere in the language.
+  no typed pointer, no `void` value, and no `undef` or `poison` value
+  anywhere in the language.
 - Two types are equal only if they are written the same: a named struct
   equals only itself (not an anonymous struct with the same fields, as
   in LLVM), and `<4 x i32>` differs from `<2 x i64>`.
 - **First-class** types (those a value, parameter, result, `load`,
   `store`, `phi` or `select` may have) are all of `type`. **Sized**:
   all of them (a struct may not contain itself by value, §4.1).
+  **Aggregates**: structs and arrays.
 - **Integer** types: `i1 … i64` and vectors of them. **Float** types:
   `float`, `double` and vectors of them.
 - A function type's `cc` defaults to `ccc`; `...` makes it variadic.
+
+### 2.1 Arrays
+
+**Proposed** (2026-09-28, §14.1). `[N x T]` is LLVM's array type: `N`
+elements of the sized type `T`, laid out contiguously, `N` a
+non-negative decimal integer (`[0 x i8]` is the flexible trailing
+member of a struct, as in C; `array length must be a non-negative
+integer`, `array length 5000000000 is too large` above `2^32 - 1`).
+`T` may be any type, arrays and structs included; a vector's element
+may not be an array (§2). An array is an aggregate: it is a value
+(`load`, `store`, `phi`, `select`, a parameter or a result), it is
+built by `([N x T] v..)` (§3) or `insertvalue`, read by `extractvalue`
+(§6.4), and addressed by `getelementptr` (§6.5). It has no `bits`
+(`bitcast cannot convert [4 x i32]`), is not atomic, and is not a
+`switch` or `icmp` operand. types.md §8.3 lays a string's bytes and an
+array object's elements out as `[0 x T]` at the end of the header
+struct, and §8.2 holds the type table as `[N x %struct.fib.typerec]`.
 
 ## 3. Values and literals
 
@@ -93,6 +116,8 @@ value ::= NAME                  ; a parameter or let-bound name (§5.3)
         | (string STR)          ; ptr to a private constant NUL-terminated byte array
         | { value* }            ; anonymous struct value
         | (%struct.S value*)    ; named struct value, one value per field
+        | ([N x T] value*)      ; array value, exactly N elements of type T (§2.1)
+        | (zeroinitializer T)   ; every bit zero: 0, 0.0, null, and so on through aggregates
         | instruction           ; §6
 ```
 
@@ -103,8 +128,12 @@ value ::= NAME                  ; a parameter or let-bound name (§5.3)
 - `(float x)` and `(double x)` round to nearest; a finite literal that
   rounds to an infinity is an error `float literal out of range for
   double` (liar read `1e999` as infinity).
-- A struct value is built by `insertvalue`s when a field is not a
-  constant; its fields are evaluated left to right.
+- A struct or array value is built by `insertvalue`s when a field is
+  not a constant; its fields are evaluated left to right. An array
+  literal has exactly `N` elements, each of type `T` (`[3 x i32]
+  literal: 3 elements expected, found 2`; `[3 x i32] literal: element
+  2 has type i64, expected i32`). `(zeroinitializer T)` is a constant
+  of any sized `T`; it emits no instruction.
 - `(string "…")` may appear in any function and as a global
   initialiser (§9); each occurrence is its own constant.
 
@@ -113,17 +142,20 @@ value ::= NAME                  ; a parameter or let-bound name (§5.3)
 ```
 module ::= item*
 item   ::= (defstruct NAME (type*))
-         | (global NAME type init)                 ; mutable
-         | (constant NAME type init)               ; read-only
-         | (declare cc? NAME rtype (type* ...?))   ; external function
-         | (define cc? (NAME rtype) ((type PNAME)*) block+)
+         | (global mod* NAME type init)            ; mutable
+         | (constant mod* NAME type init)          ; read-only
+         | (declare-global hidden? NAME type)      ; a variable defined elsewhere (§4.4)
+         | (declare hidden? cc? NAME rtype (type* ...?))   ; a function defined elsewhere
+         | (define mod* cc? (NAME rtype) ((type PNAME)*) block+)
+mod    ::= private | internal | external           ; linkage (§4.3), at most one
+         | hidden                                  ; visibility (§4.3)
 block  ::= (block LABEL instr+)
 ```
 
 Anything else at the top level is an error `expected a top-level form
-(define, declare, defstruct, global, constant), found …` (liar silently
-ignored top-level expressions, `lir-audit/fuzz2.txt`). Items may appear
-in any order and refer to each other in any order.
+(define, declare, declare-global, defstruct, global, constant), found …`
+(liar silently ignored top-level expressions, `lir-audit/fuzz2.txt`).
+Items may appear in any order and refer to each other in any order.
 
 ### 4.1 Module-level rules
 
@@ -135,10 +167,12 @@ in any order and refer to each other in any order.
 - Every `%struct.S` used anywhere must be defined: `undefined struct
   %struct.S`. A struct that contains itself by value, directly or
   through other structs, is `struct %struct.S contains itself by value`.
-- Every `@f` must be defined in the module: `undefined function @f`,
-  `undefined global @g`. Calling a global variable is `@g is not a
-  function`.
+- Every `@f` must be defined or declared in the module: `undefined
+  function @f`, `undefined global @g`. Calling a global variable is
+  `@g is not a function`.
 - A global's initialiser must have the global's type (§9).
+- A name is defined or declared once: a `declare` or `declare-global`
+  of a name the module also defines is `duplicate definition of @f`.
 
 ### 4.2 Calling conventions
 
@@ -152,6 +186,39 @@ call takes it from the function type written at the call. There is no
 way to call a function with a convention other than its own, except by
 an indirect call with a wrong function type (undefined behaviour, as in
 LLVM; §6.12).
+
+### 4.3 Linkage and visibility
+
+**Proposed** (2026-09-28, §14.1). A `define`, `global` or `constant`
+takes at most one linkage word and at most one visibility word, in
+any order before the calling convention (`duplicate modifier private`,
+`private and internal exclude each other`):
+
+| Word | LLVM | Meaning |
+|---|---|---|
+| `external` (the default) | `external` | the symbol is exported: another module, the linker and the JIT's lookup see it |
+| `internal` | `internal` | a local symbol of the object file (C's `static`): invisible to other modules, present for the debugger |
+| `private` | `private` | no symbol at all: the name exists only inside the module |
+| `hidden` | `hidden` visibility | exported to other modules of the same executable or shared object, but not from it (the ELF/Mach-O sense); a call to it needs no PLT |
+
+A `declare` and a `declare-global` take `hidden` only: they name a
+symbol defined elsewhere, whose linkage is that definition's (`declare
+cannot be private`). `main` is exported: `main must not be private or
+internal` (§7.2). A `private` or `internal` function may still be
+`tailcall`ed, called through its address and used as an initialiser
+in its own module; what it cannot be is seen from outside (§11).
+
+### 4.4 External globals
+
+**Proposed** (2026-09-28, §14.1). `(declare-global NAME T)` names a
+variable of type `T` that another module or the C library defines: a
+`declare` for data. `@NAME` is its address; `(load T @NAME)` reads it
+and `store` writes it, under the typed direct-access rule of §6.5. It
+has no initialiser and is never `constant` in lIR (`store to constant
+@g` never fires on it; a store to a read-only definition elsewhere is
+undefined behaviour, as in C). `(declare-global stderr ptr)` reaches
+glibc's `stderr`; `errno` is a macro over a function there, not a
+symbol, so `(declare __errno_location ptr ())` is the way to it.
 
 ## 5. Functions, blocks and names
 
@@ -191,10 +258,11 @@ of the last form of the body. A literal or a name emits no instruction.
 Parameters and `let`-bound names are the function's **SSA names**:
 
 - Each name is bound once per function, parameters included (`duplicate
-  name x in @f`). There is no shadowing.
+  name x in @f`). There is no shadowing (**Decided**, §14 item 6).
 - A name may not be a type keyword, `null`, `void`, an ordering, or one
-  of `singlethread`, `weak`, `inbounds` (`reserved word x used as a
-  name`).
+  of `singlethread`, `weak`, `inbounds`, `volatile`, `align`,
+  `zeroinitializer`, `private`, `internal`, `external`, `hidden`
+  (`reserved word x used as a name`).
 - A name's scope is not the `let` body. A **use** of `x` is valid if
   the binding of `x` is evaluated before the use in the same block
   (else `x is used before its binding in block L`), or if `x` is bound
@@ -207,7 +275,8 @@ Parameters and `let`-bound names are the function's **SSA names**:
   must be (NAME value)`).
 - In a block unreachable from the entry, a use is valid only if its
   name is bound earlier in the same block, in a reachable block, or is
-  a parameter.
+  a parameter. Unreachable blocks are accepted with this rule, which is
+  stricter than LLVM's (**Decided**, §14 item 4).
 - A name bound to a `void` value is `void value bound to x`; any other
   use of a void value as an operand is `void value used as an operand`
   (`tc/main_void.lir`).
@@ -234,7 +303,8 @@ Parameters and `let`-bound names are the function's **SSA names**:
 - Every incoming value has type `T` (`tc/phi_wrong.lir`) and is a
   name, `@name` or a literal: `phi incoming value must be a name, a
   global or a constant` (an instruction there would have to run in the
-  predecessor, after its terminator's operands).
+  predecessor, after its terminator's operands). This is stricter than
+  LLVM, which takes any constant expression (**Decided**, §14 item 7).
 - When one terminator names the block twice (`(br c j j)`, or a `switch`
   with two cases to one label), LLVM wants one phi entry per edge; lIR
   takes one per predecessor and `lair` repeats it per edge.
@@ -270,6 +340,7 @@ instruction and the offending operand. The message forms are:
 | `(fneg a)` | float `T` | `T` |
 | `(and a b)` `or` `xor` `shl` `lshr` `ashr` | same integer `T` | `T` |
 | `(ctpop a)` | integer `T` | `T` (`llvm.ctpop`) |
+| `(sadd-overflow a b)` `ssub-overflow` `smul-overflow` | same integer `T` | `{ T, i1 }` (or `{ <N x iK>, <N x i1> }`): the wrapped result and whether it overflowed (`llvm.sadd.with.overflow` and kin; **Decided**, §14 item 5) |
 
 No `nsw`, `nuw` or `exact` flags exist. `sdiv`, `udiv`, `srem`, `urem`
 with a constant zero divisor are `division by constant zero`; a shift
@@ -297,9 +368,11 @@ less than the width w`. Both are poison or undefined in LLVM.
 | `(ptrtoint T v)` | `T` integer, `v : ptr` | `T` |
 | `(inttoptr ptr v)` | `v` integer | `ptr` |
 | `(bitcast T v)` | `T` and `v`'s type non-aggregate, not `ptr`, same bit size | `T` |
+| `(fptosi-sat T v)`, `(fptoui-sat T v)` | `T` integer scalar, `v` float scalar | `T`: saturating, NaN to 0 (`llvm.fptosi.sat`, `llvm.fptoui.sat`; **Decided**, §14 item 5) |
 
-`fptosi`/`fptoui` of a value out of range is poison as in LLVM; fibber
-emits its saturating sequence instead (types.md §8.12).
+`fptosi`/`fptoui` of a value out of range is poison as in LLVM;
+`fptosi-sat`/`fptoui-sat` saturate as types.md §8.12 specifies and
+fibber emits them.
 
 ### 6.4 Vectors and aggregates
 
@@ -308,17 +381,17 @@ emits its saturating sequence instead (types.md §8.12).
 | `(extractelement v i)` | `v : <N x E>`, `i` integer; a constant `i` must be `< N` | `E` |
 | `(insertelement v e i)` | `v : <N x E>`, `e : E`, `i` as above | `<N x E>` |
 | `(shufflevector a b m)` | `a`, `b : <N x E>`; `m` a literal `<M x i32>` with elements `< 2N` | `<M x E>` |
-| `(extractvalue s k₁ ..)` | `s` a struct; each `k` a constant field index in range | the field's type |
-| `(insertvalue s v k₁ ..)` | as above, `v` of the field's type | `s`'s type |
+| `(extractvalue s k₁ ..)` | `s` an aggregate; each `k` a constant index in range: a field of a struct, an element of an array (`extractvalue: index 4 out of range for [4 x i32]`) | the field's or element's type |
+| `(insertvalue s v k₁ ..)` | as above, `v` of the field's or element's type | `s`'s type |
 
 ### 6.5 Memory
 
 | Form | Rule | Result |
 |---|---|---|
-| `(alloca T)`, `(alloca T n)` | `T` sized; `n` integer | `ptr` |
-| `(load T p)` | `p : ptr`; `T` first-class | `T` |
-| `(store v p)` | `p : ptr`; `v` first-class | void |
-| `(getelementptr inbounds? T p i₀ i₁ ..)` | `p : ptr`, `T` sized; `i₀` integer; each further index steps into the current type, which must be a struct: a constant `i32` field index in range | `ptr` |
+| `(alloca (align N)? T)`, `(alloca (align N)? T n)` | `T` sized; `n` integer | `ptr` |
+| `(load volatile? (align N)? T p)` | `p : ptr`; `T` first-class | `T` |
+| `(store volatile? (align N)? v p)` | `p : ptr`; `v` first-class | void |
+| `(getelementptr inbounds? T p i₀ i₁ ..)` | `p : ptr`, `T` sized; `i₀` integer; each further index steps into the current type: into a struct by a constant `i32` field index in range, into an array by any integer, a constant one in range (`getelementptr: index 4 out of range for [4 x i32]`) | `ptr` |
 
 - A `store` whose pointer operand is directly `@c` of a `constant` is
   `store to constant @c`.
@@ -333,9 +406,19 @@ emits its saturating sequence instead (types.md §8.12).
   through any other pointer (a `getelementptr`, a loaded or passed
   pointer, a counted `alloca`) are not checked (§6.12).
 - `getelementptr` into a scalar or a vector is `getelementptr cannot
-  index into i64` (LLVM is phasing out indexing into vectors; lIR has
-  no array type, §2).
-- Plain loads and stores use the ABI alignment of their type.
+  index into i64` (LLVM is phasing out indexing into vectors; an array
+  is what indexes, §2.1).
+- Plain loads and stores use the ABI alignment of their type unless
+  `(align N)` says otherwise. **Proposed** (2026-09-28, §14.1): `N` is
+  a power of two from 1 to 2^30 (`align must be a power of two, found
+  3`); a smaller `N` than the ABI's is a promise that LLVM honours with
+  slower code where the target needs it, a larger one a promise the
+  emitter must keep (an `alloca` with `(align N)` keeps it). `volatile`
+  is LLVM's: the access is performed exactly as written, neither
+  removed, duplicated nor reordered against other volatile accesses,
+  for memory-mapped registers and for a value a signal handler or a
+  debugger may change; it is not atomic and orders nothing else (§6.6
+  for that). The typed direct-access rule applies unchanged.
 
 ### 6.6 Atomics
 
@@ -384,6 +467,7 @@ OP ::= xchg add sub and nand or xor max min umax umin fadd fsub fmax fmin
 | `(br c L₁ L₂)` | `c : i1` (`tc/brcond_i32.lir`; `tc/brcond_double.lir` crashed liar) |
 | `(switch v L_default ((iK c) L)*)` | `v` integer scalar (`switch needs an integer scalar, found double`); each case a literal of `v`'s type (`switch: case has type i64, expected i32`), no two equal (`switch: duplicate case 1`) |
 | `(unreachable)` | reaching it is undefined behaviour; it follows a call that does not return |
+| `(trap)` | void, not a terminator: `llvm.trap`, which aborts the process (SIGILL on x86, `brk` on AArch64) without unwinding or flushing; the block goes on to `unreachable` (**Decided**, §14 item 5). types.md §8.12's `fib.trap` writes its message first and calls `abort`, which flushes nothing either but raises SIGABRT, the signal the audit and the cases expect; `(trap)` is for the paths that have no message |
 | `(phi …)` | §5.4 |
 
 ### 6.8 Calls
@@ -446,15 +530,18 @@ any first-class type except `i1`, `i8`, `i16` and `float`: C promotes
 those before a variadic call, and passing them unpromoted is wrong at
 the C ABI although LLVM accepts it: `variadic argument 2 of @printf has
 type float, which C promotes; pass double` (for `iK`: `pass i32`; for
-an indirect call, `of indirect-call`).
+an indirect call, `of indirect-call`). This is stricter than LLVM
+(**Decided**, §14 item 1): a callee reading an `i32` slot that was
+written as an `i8` reads three bytes of whatever was there.
 
 ### 7.2 main
 
 A module run by `lair run` or built by `lair build` into an executable
 must define `main` as `(define (main i32) () ..)` or `(define (main
 i32) ((i32 argc) (ptr argv)) ..)`, with the C convention: `main must be
-(main i32) with no parameters or (i32 ptr)`, or `no main function`.
-The process exit status is `main`'s result, as C gives it (the low 8
+(main i32) with no parameters or (i32 ptr)`, or `no main function`,
+and exported: `main must not be private or internal` (§4.3). The
+process exit status is `main`'s result, as C gives it (the low 8
 bits on POSIX). Output buffered by the C library is flushed at exit on
 both paths.
 
@@ -475,7 +562,8 @@ overflows the stack.) The rules, checked against the callee's type
 2. they have the same result type: `tailcall: @g returns i32, @f
    returns i64` (`indirect-tailcall: the callee returns i32, @f returns
    i64`);
-3. neither is variadic: `tailcall to a variadic function`;
+3. neither is variadic: `tailcall to a variadic function` (**Decided**,
+   §14 item 2: no ambiguity about which function is tailed);
 4. under `ccc`, the parameter types are identical: `tailcall under ccc
    needs identical parameter types (@f has (i64), @g has (i64 i64));
    use tailcc`. Under `tailcc` they may differ.
@@ -494,10 +582,12 @@ reads `undef`; the orderings of §6.6 are LLVM's, which match C++11's
 ## 9. Globals and constants
 
 ```
-(global NAME T init)     ; mutable
-(constant NAME T init)   ; read-only; a store to it is undefined behaviour
+(global mod* NAME T init)     ; mutable
+(constant mod* NAME T init)   ; read-only; a store to it is undefined behaviour
+(declare-global hidden? NAME T)   ; defined elsewhere (§4.4)
 init ::= (iK INT) | (float FLT) | (double FLT) | (ptr null) | @NAME
        | (string STR) | (<N x E> ..) | { init* } | (%struct.S init*)
+       | ([N x T] init*) | (zeroinitializer T)
 ```
 
 - `@NAME` in an expression is the global's address, a `ptr`; its value
@@ -508,13 +598,16 @@ init ::= (iK INT) | (float FLT) | (double FLT) | (ptr null) | @NAME
   @g)` gives a pointer to the text. (liar stored the bytes themselves
   in the slot, so the load returned the text read as an address and
   crashed: `t/gstr.lir`.) `@f` initialises a `ptr` with a function's or
-  global's address. Struct and vector initialisers nest.
+  global's address. Struct, array and vector initialisers nest;
+  `(zeroinitializer T)` zeroes a global of any type, a large buffer
+  included.
 - `constant` was documented by liar's `doc/lIR.md` but not parsed
   (`t/const.lir`).
+- `mod*` is the linkage and visibility of §4.3.
 
-With struct initialisers and function addresses, the type table,
-vtables and literal objects of types.md §8.2 can be static data; the v1
-mapping, which builds them in the module initialiser, stays valid.
+With struct and array initialisers and function addresses, the type
+table, vtables, literal objects and `def` constants of types.md §8.2
+are static data (**Decided**, §14 item 3).
 
 ## 10. The checker
 
@@ -531,12 +624,12 @@ error of each function but checks every function. The main groups:
 
 | Group | What it checks |
 |---|---|
-| module | §4.1: duplicates, reserved names, undefined and recursive structs, globals and their initialisers, calls against the callee's `define` or `declare` |
+| module | §4.1: duplicates, reserved names, undefined and recursive structs, globals and their initialisers, calls against the callee's `define` or `declare`; §4.3: modifiers |
 | structure | §5.1: blocks, labels, terminators, branches to the entry block |
 | names | §5.3: single binding, reserved words, dominance, void values |
 | phi | §5.4: position, predecessors, incoming types and availability |
 | types | §6: every operand and result type |
-| constants | literal ranges (§3), constant divisors, shifts and vector indices (§6), `store` to a `constant` |
+| constants | literal ranges (§3), constant divisors, shifts, vector and array indices (§6), `store` to a `constant`, alignments (§6.5) |
 | calls | §7: arity, argument types, variadic promotion, tail-call rules, `main` |
 
 After the checker, `lair` lowers the module and runs the LLVM verifier
@@ -563,6 +656,7 @@ jit.add_source("macros", src)?;            // parse, check, lower, verify, add
 let t: lair::FnType = jit.signature("f")?;  // the lIR type, to check before transmuting
 let f: extern "C" fn(i64) -> i64 = unsafe { jit.function("f")? };
 let a: usize = jit.address("f")?;           // the raw address
+let c: usize = jit.c_entry("g")?;           // a ccc entry to a tailcc function
 ```
 
 - `Jit::add_source(name, src)` and `Jit::add_module(name, &module)` run
@@ -576,12 +670,24 @@ let a: usize = jit.address("f")?;           // the raw address
   defined by no module must be in the host process (the C library and
   what it loaded), else the module is rejected when added: `undefined
   symbol @f: defined by no module of this JIT and not in the process`.
-- `signature`, `address` and `function` accept only functions defined
-  in the `Jit` (not globals, not declarations).
+- `signature`, `address`, `c_entry` and `function` accept only
+  functions defined in the `Jit` with `external` linkage (not globals,
+  not declarations; a `private` or `internal` function is `@f is
+  private to module m`). A `private` or `internal` definition is not
+  in the cross-module namespace: a later module may define the same
+  name, and a `declare` of it finds nothing (`undefined symbol`).
 - `Jit::function::<F>(name)` is `unsafe`: Rust cannot check `F` against
   the lIR type, so callers compare `signature(name)` first; `F` must be
-  pointer-sized or it is an error. A `tailcc` function cannot be called
-  from Rust directly.
+  pointer-sized or it is an error. Rust speaks only the C convention,
+  so for a `tailcc` function `function` returns, and `c_entry` names,
+  a **trampoline**: a `ccc` function of the same parameters and result
+  that the `Jit` generates (as an lIR module `name.tramp` through the
+  same pipeline) and that calls the `tailcc` function; `address` stays
+  the raw address of the function itself. This is the mechanism a
+  compiler uses to run a macro (M4, M6): compile the macro-time
+  module, take the entry as a function pointer, call it, and add
+  further modules that `declare` what the earlier ones defined
+  (`crates/lair/tests/jit.rs`, "a compiler runs a macro").
 - Function pointers stay valid until the `Jit` is dropped.
 - `JitOptions { opt_level }`: 0 (default) runs no IR optimisation; 1 to
   3 run LLVM's `default<On>` pipeline before code generation.
@@ -632,25 +738,41 @@ both paths with an error containing the text, before LLVM sees it; an
 error containing `internal error` never satisfies a case. `cargo test
 -p lair` runs the whole suite.
 
-## 14. Open questions for the owner
+## 14. Decision record
 
-1. The variadic-promotion rule (§7.1) is stricter than LLVM. It makes
-   fibber's compiler widen `bool`, `i8`, `i16` and `f32` arguments of
-   a `:varargs` extern (syntax.md §3.15), as C does. Keep it?
-2. Should a variadic extern call ever be a `tailcall`? §7.3 says no;
-   syntax.md §3.15 already says an extern call is never a tail call.
-3. `switch`, struct-typed `alloca`/`load`/`store`/globals and constant
-   struct initialisers with function addresses are in (§6.7, §9);
-   types.md §8.11 lists them as conveniences. Adopting them in §8 is
-   the owner's call; the v1 shapes of §8 remain valid lIR.
-4. Unreachable blocks are accepted (§5.3) with a stricter dominance rule
-   than LLVM's (which lets them use anything). Reject them instead?
-5. Should `lair` offer lIR-level names for the overflow intrinsics
-   (`llvm.sadd.with.overflow`, `llvm.fptosi.sat`) that types.md §8.12
-   says fibber may use? Not added: `llvm.` names are reserved (§4.1).
-6. Names are bound once per function (§5.3). liar let a second `let`
-   rebind a name (`lir-audit/cmp/aot.lir` did, and its case renames
-   it); fibber's compiler generates fresh names anyway. Keep the rule?
-7. The typed direct-access rule (§6.5) and the phi-operand rule (§5.4)
-   are stricter than LLVM. Both catch only what is visible in the
-   module. Keep them?
+On 2026-09-28 the owner decided the seven open questions of the first
+M3 pass. Each rule is now **Decided** in the section that states it;
+the numbering here is the one the first pass used.
+
+| Item | Question | Decision | Now in |
+|---|---|---|---|
+| 1 | variadic arguments narrower than C's promotions (`i1`, `i8`, `i16`, `float`) | **rejected**; the emitter widens them explicitly. Receiving an `i32` into an `i8` slot is a way to corrupt the callee's frame, and LLVM would not say so | §7.1 |
+| 2 | a variadic callee as a tail call | **rejected**: `tailcall to a variadic function`. There is no ambiguity about which function is tailed | §7.3 rule 3 |
+| 3 | adopting `switch`, struct-typed `alloca`s and globals, and constant vtables with function addresses in types.md §8 | **adopted**: `match` dispatches through `switch`, stack objects are `(alloca %struct.T)`, and the type table, literal objects, named-function closures, vtables and `def` constants are static data; the v1 "module initialiser builds it" text is replaced wherever lIR can now hold the object | types.md §8.2, §8.3, §8.4, §8.5, §8.6, §8.10, §8.11; §10 |
+| 4 | unreachable blocks | **accepted**, with the stricter dominance rule as specified: a use in an unreachable block names a parameter, a name bound earlier in the same block, or one bound in a reachable block | §5.3 |
+| 5 | lIR-level names for LLVM's overflow and saturation intrinsics | **added**: `sadd-overflow`, `ssub-overflow`, `smul-overflow` (`llvm.s{add,sub,mul}.with.overflow`), `fptosi-sat`, `fptoui-sat` (`llvm.fptosi.sat`, `llvm.fptoui.sat`) and `trap` (`llvm.trap`), beside `ctpop`; types.md §8.12 emits them for the checked arithmetic. `llvm.` stays reserved as a *symbol* prefix (§4.1): the intrinsics are instructions, not names | §6.1, §6.3, §6.7; types.md §8.12 |
+| 6 | names bound once per function | **kept**: no rebinding, no shadowing (`duplicate name x in @f`) | §5.3 |
+| 7 | the typed direct-access rule and the phi-operand rule, both stricter than LLVM | **kept** | §6.5, §5.4 |
+
+### 14.1 Proposed since the decision
+
+The second M3 pass (2026-09-28) added what a compiler emitting the
+mapping of types.md §8 still lacked. Each is **Proposed** until the
+owner decides it; every one is implemented, with cases, so that it can
+be tested (method.md, "Decision records"):
+
+1. **Array types** `[N x T]` (§2.1): in `defstruct` fields, `alloca`,
+   globals and constants, `load`/`store`, `getelementptr`,
+   `extractvalue`/`insertvalue`, and the literal `([N x T] v..)`; with
+   `(zeroinitializer T)` for any sized `T` (§3).
+2. **Linkage and visibility** on `define`, `global` and `constant`
+   (§4.3): `private`, `internal`, `external` (the default) and
+   `hidden`, so that a compiler keeps a module's helpers out of the
+   export table; the JIT keeps `private` and `internal` names out of
+   the cross-module namespace (§11).
+3. **External global declarations** `(declare-global NAME T)` (§4.4),
+   for `stderr` and other variables the C library or another module
+   defines.
+4. **`volatile` and `(align N)`** on `load`, `store` and `alloca`
+   (§6.5).
+
