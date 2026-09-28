@@ -3,7 +3,9 @@
 use crate::ast::{Expr, Kind};
 use crate::ty::Ty;
 
-use super::{effects, funcs, gadgets, gadgets2, objects, observe, tasks, Ctx, Gen};
+use super::{
+    effects, funcs, gadgets, gadgets2, hooks, objects, observe, protos, tasks, vpat, Ctx, Gen,
+};
 
 /// The text of a string literal.
 pub fn literal_text(g: &mut Gen) -> String {
@@ -28,6 +30,9 @@ pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
         1, // for-each accumulating in a cell
         4, // an ownership template (gadgets)
         3, // more ownership templates (gadgets2)
+        8, // protocols: method calls, generic helpers, dyn (protos)
+        2, // a vector match whose guards count themselves in a cell
+        1, // a (Hook :send) crossing a thread
     ];
     let e = match g.rng.weighted(&weights) {
         Some(1) => Some(arith(g, cx, d)),
@@ -47,6 +52,9 @@ pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
         Some(11) => Some(effects::for_each_sum(g, cx, d)),
         Some(12) => gadgets::gadget(g, cx, d),
         Some(13) => gadgets2::gadget(g, cx, d),
+        Some(14) => protos::int_form(g, cx, d),
+        Some(15) => Some(vpat::counted_match(g, cx, d)),
+        Some(16) => Some(hooks::cross(g, cx, d)),
         _ => None,
     };
     e.unwrap_or_else(|| Expr::int(g.small()))

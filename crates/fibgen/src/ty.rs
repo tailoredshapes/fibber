@@ -42,6 +42,49 @@ pub enum Ty {
     /// A function type `(fn (params) ret)`: `fn_i()` is `(fn (i64) i64)`,
     /// `fn_0()` is `(fn () i64)`.
     Func(Vec<Ty>, Box<Ty>),
+    /// `(dyn P)`, or `(dyn P :send)` when the flag is set (types §2.15).
+    Dyn(Proto, bool),
+    /// `(defstruct (Hook k :colour) (f: (fn k (i64) i64) tag: i64))` at
+    /// `:send` (flag set) or `:local` (types §1.3).
+    Hook(bool),
+    /// The type variable `a` of a protocol-bounded generic helper; the
+    /// flag says whether the bound is written as `:where ((P a))` or
+    /// left to inference. Only ever a parameter's type.
+    Gen(Proto, bool),
+}
+
+/// The preamble's protocols (syntax §3.10): `Score` has a default
+/// method, `Rank` requires `Score` and has a default of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Proto {
+    /// `(defprotocol Score (score (self) -> i64) (bonus (self k: i64) -> i64 ..))`.
+    Score,
+    /// `(defprotocol Rank :requires (Score) (rank (self) -> i64) (tier (self) -> i64 ..))`.
+    Rank,
+}
+
+impl Proto {
+    /// The protocol's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Proto::Score => "Score",
+            Proto::Rank => "Rank",
+        }
+    }
+
+    /// The methods callable on a value bounded by (or a `dyn` of) this
+    /// protocol: its own and its supertraits' (types §4.1 rules 2, 3).
+    pub fn methods(self) -> &'static [&'static str] {
+        match self {
+            Proto::Score => &["score", "bonus"],
+            Proto::Rank => &["score", "bonus", "rank", "tier"],
+        }
+    }
+
+    /// Whether a bound `(self t)` entails `(other t)`.
+    pub fn entails(self, other: Proto) -> bool {
+        self == other || (self == Proto::Rank && other == Proto::Score)
+    }
 }
 
 impl Ty {
@@ -82,6 +125,10 @@ impl Ty {
     pub fn fn_0() -> Ty {
         Ty::Func(Vec::new(), Box::new(Ty::Int))
     }
+    /// `(dyn p)` or `(dyn p :send)`.
+    pub fn dyn_of(p: Proto, send: bool) -> Ty {
+        Ty::Dyn(p, send)
+    }
     /// Whether this is a function type.
     pub fn is_fn(&self) -> bool {
         matches!(self, Ty::Func(..))
@@ -106,7 +153,8 @@ impl Ty {
     /// which the generator tracks per variable instead.
     pub fn is_send(&self) -> bool {
         match self {
-            Ty::Holder | Ty::Cell(_) | Ty::Func(..) => false,
+            Ty::Holder | Ty::Cell(_) | Ty::Func(..) | Ty::Gen(..) => false,
+            Ty::Dyn(_, s) | Ty::Hook(s) => *s,
             Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) | Ty::Weak(t) | Ty::Task(t) => t.is_send(),
             _ => true,
         }
@@ -118,7 +166,8 @@ impl Ty {
     /// generator avoids so that every program's audit must be clean.
     pub fn may_reach_cell(&self) -> bool {
         match self {
-            Ty::Holder | Ty::Cell(_) | Ty::Func(..) => true,
+            Ty::Holder | Ty::Cell(_) | Ty::Func(..) | Ty::Gen(..) => true,
+            Ty::Dyn(_, s) | Ty::Hook(s) => !*s,
             Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) => t.may_reach_cell(),
             _ => false,
         }
@@ -127,6 +176,16 @@ impl Ty {
     /// Whether the type is an atom.
     pub fn is_atom(&self) -> bool {
         matches!(self, Ty::Atom(_))
+    }
+
+    /// Whether the type is a `dyn`, or a vector of them: it exists only
+    /// in programs that declare the protocols.
+    pub fn needs_protocols(&self) -> bool {
+        match self {
+            Ty::Dyn(..) | Ty::Gen(..) => true,
+            Ty::Vec(t) => t.needs_protocols(),
+            _ => false,
+        }
     }
 
     /// Whether `weak` accepts the type (an object type, types §2.11).
@@ -158,6 +217,11 @@ impl fmt::Display for Ty {
                 let ps: Vec<String> = ps.iter().map(|p| p.to_string()).collect();
                 write!(f, "(fn ({}) {r})", ps.join(" "))
             }
+            Ty::Dyn(p, true) => write!(f, "(dyn {} :send)", p.name()),
+            Ty::Dyn(p, false) => write!(f, "(dyn {})", p.name()),
+            Ty::Hook(true) => f.write_str("(Hook :send)"),
+            Ty::Hook(false) => f.write_str("(Hook :local)"),
+            Ty::Gen(..) => f.write_str("a"),
         }
     }
 }
@@ -197,6 +261,14 @@ pub fn universe() -> Vec<Ty> {
         Ty::fn_0(),
         Ty::task(Ty::Int),
         Ty::task(Ty::Str),
+        Ty::Hook(true),
+        Ty::Hook(false),
+        Ty::Dyn(Proto::Score, false),
+        Ty::Dyn(Proto::Score, true),
+        Ty::Dyn(Proto::Rank, false),
+        Ty::Dyn(Proto::Rank, true),
+        Ty::vec(Ty::Dyn(Proto::Score, false)),
+        Ty::vec(Ty::Dyn(Proto::Score, true)),
     ]
 }
 
@@ -222,6 +294,16 @@ mod tests {
         assert!(!Ty::cell(Ty::Int).is_send());
         assert!(!Ty::Holder.is_send());
         assert!(!Ty::boxed(Ty::fn_i()).is_send());
+        assert!(Ty::vec(Ty::Dyn(Proto::Score, true)).is_send());
+        assert!(!Ty::Dyn(Proto::Rank, false).is_send());
+        assert!(Ty::Hook(true).is_send() && !Ty::Hook(false).is_send());
+    }
+
+    #[test]
+    fn prints_dyn_and_colour_arguments() {
+        assert_eq!(Ty::Dyn(Proto::Score, true).to_string(), "(dyn Score :send)");
+        assert_eq!(Ty::vec(Ty::Hook(false)).to_string(), "(Vec (Hook :local))");
+        assert!(Proto::Rank.entails(Proto::Score) && !Proto::Score.entails(Proto::Rank));
     }
 
     #[test]

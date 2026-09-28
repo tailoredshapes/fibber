@@ -20,7 +20,7 @@ impl Machine<'_> {
             ("some", [x]) => Ok(V::Opt(Some(Rc::new(x.clone())))),
             ("cons", [x, V::List(t)]) => Ok(V::List(Rc::new(prepend(x, t)))),
             ("list", items) => Ok(V::List(Rc::new(items.to_vec()))),
-            ("Pt" | "Wrap" | "Holder" | "Box" | "Circle" | "Rect" | "Named", _) => {
+            ("Pt" | "Wrap" | "Holder" | "Box" | "Circle" | "Rect" | "Named" | "Hook", _) => {
                 Ok(V::data(h, a))
             }
             ("box", [x]) => Ok(V::data("Box", vec![x.clone()])),
@@ -89,7 +89,7 @@ impl Machine<'_> {
             ("nil?", [V::Opt(o)]) => Ok(V::Bool(o.is_none())),
             ("some?", [V::Opt(o)]) => Ok(V::Bool(o.is_some())),
             ("unwrap-or", [V::Opt(o), d]) => Ok(o.as_deref().cloned().unwrap_or_else(|| d.clone())),
-            _ => Err(unsupported(format!("call {h} on {a:?}"))),
+            _ => self.method(h, a),
         }
     }
 }

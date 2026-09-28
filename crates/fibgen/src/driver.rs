@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::ast::Program;
 use crate::coverage::Coverage;
 use crate::gen::generate;
-use crate::model::{expected, ModelError};
+use crate::model::{expected, expected_traced, ModelError, Trace};
 use crate::print;
 use crate::run::{classify, run_with_limit, Class, Verdict};
 use crate::shrink::shrink;
@@ -47,6 +47,8 @@ pub struct Sample {
     pub verdict: Verdict,
     /// The model's result.
     pub expected: Result<i64, ModelError>,
+    /// What the model's run did (for the coverage table).
+    pub trace: Trace,
 }
 
 /// A run's results.
@@ -67,6 +69,7 @@ impl Summary {
     fn add(&mut self, s: Sample, keep: usize) {
         *self.tallies.entry(s.verdict.class).or_default() += 1;
         self.coverage.add(&s.program);
+        self.coverage.add_trace(&s.trace);
         if s.verdict.class == Class::Ok {
             return;
         }
@@ -95,9 +98,15 @@ impl Summary {
 
 /// Checks one program: its model result and how the interpreter fared.
 pub fn check(p: &Program, timeout: Duration) -> (Verdict, Result<i64, ModelError>) {
-    let exp = expected(p);
+    let (v, e, _) = check_traced(p, timeout);
+    (v, e)
+}
+
+/// [`check`], and the model's trace.
+fn check_traced(p: &Program, timeout: Duration) -> (Verdict, Result<i64, ModelError>, Trace) {
+    let (exp, trace) = expected_traced(p);
     let obs = run_with_limit(&print::program(p), timeout);
-    (classify(&obs, &exp), exp)
+    (classify(&obs, &exp), exp, trace)
 }
 
 /// The size of program `i`.
@@ -122,7 +131,7 @@ pub fn run_batch(cfg: &Config) -> Summary {
                         }
                         let (seed, size) = (cfg.seed + i as u64, size_of(cfg, i));
                         let program = generate(seed, size);
-                        let (verdict, expected) = check(&program, cfg.timeout);
+                        let (verdict, expected, trace) = check_traced(&program, cfg.timeout);
                         part.add(
                             Sample {
                                 seed,
@@ -130,6 +139,7 @@ pub fn run_batch(cfg: &Config) -> Summary {
                                 program,
                                 verdict,
                                 expected,
+                                trace,
                             },
                             cfg.exemplars.max(1),
                         );

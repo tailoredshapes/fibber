@@ -1,5 +1,7 @@
 //! Which constructs the generated programs exercised, and how often.
 
+mod protos;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{Arg, Expr, Kind, Pat, Program};
@@ -24,6 +26,16 @@ impl Coverage {
         }
         for l in &ls {
             self.counts.entry(l.clone()).or_default().1 += 1;
+        }
+    }
+
+    /// Adds the labels of what the model's run of one program did (a
+    /// guard that failed, a default method that ran), counted once each.
+    pub fn add_trace(&mut self, trace: &[&'static str]) {
+        for l in trace {
+            let e = self.counts.entry((*l).to_string()).or_default();
+            e.0 += 1;
+            e.1 += 1;
         }
     }
 
@@ -74,6 +86,7 @@ fn helper_kind(name: &str) -> Option<&'static str> {
         ("fwda", "mutual tail calls forwarding an & parameter"),
         ("walk", "tail call passing a constructed local"),
         ("fwdb", "mutual tail calls forwarding an & parameter"),
+        ("gs", "generic over a protocol-bounded type variable"),
     ];
     kinds
         .iter()
@@ -92,8 +105,12 @@ pub fn labels(p: &Program) -> Vec<String> {
             out.push(format!("defun: {k}"));
         }
     }
+    protos::item_labels(p, &mut out);
     for b in p.bodies() {
-        b.walk(&mut |e| node_labels(e, &mut out));
+        b.walk(&mut |e| {
+            node_labels(e, &mut out);
+            protos::node_labels(e, &mut out);
+        });
     }
     out
 }
@@ -106,6 +123,9 @@ fn node_labels(e: &Expr, out: &mut Vec<String>) {
         Kind::If(..) => push("if"),
         Kind::Match(_, cl) => {
             push("match");
+            if cl.iter().any(|(p, _)| protos::has_vector(p)) {
+                push("vector pattern in match");
+            }
             if cl.iter().any(|(p, _)| nested(p)) {
                 push("match binding sub-objects (nested pattern)");
             }
@@ -137,6 +157,9 @@ fn node_labels(e: &Expr, out: &mut Vec<String>) {
 
 fn let_labels(bs: &[(Pat, Expr)], out: &mut Vec<String>) {
     out.push("let".into());
+    if bs.iter().any(|(p, _)| protos::has_vector(p)) {
+        out.push("let destructuring with [& r] (vector pattern)".into());
+    }
     if bs
         .iter()
         .any(|(p, _)| matches!(p, Pat::Ctor(..) | Pat::As(..)))
@@ -201,6 +224,7 @@ mod tests {
         let mut c = Coverage::default();
         c.add(&Program {
             defs: Vec::new(),
+            impls: Vec::new(),
             funs: Vec::new(),
             main: e,
         });

@@ -1,10 +1,10 @@
 //! The model's evaluator over the generated tree.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
-use crate::ast::{Arg, Expr, FunDef, Kind, Pat, Program};
+use crate::ast::{Arg, Expr, FunDef, Kind, Method, Pat, Program};
 
 use super::value::{Closure, TaskState, V};
 use super::ModelError;
@@ -73,6 +73,11 @@ pub struct Machine<'p> {
     pub(super) funs: HashMap<&'p str, &'p FunDef>,
     /// The values of the `def`s evaluated so far.
     pub(super) globals: HashMap<String, V>,
+    /// The `impl` methods, by (method, implementing type's head).
+    pub(super) impls: HashMap<(&'p str, &'static str), &'p Method>,
+    /// What the run did that a static count of the program cannot see
+    /// (a guard that failed, a default method that ran, ...).
+    pub(super) trace: BTreeSet<&'static str>,
     steps: u64,
     depth: u32,
 }
@@ -94,6 +99,8 @@ impl<'p> Machine<'p> {
         Machine {
             funs,
             globals: HashMap::new(),
+            impls: super::protos::impl_table(p),
+            trace: BTreeSet::new(),
             steps: 0,
             depth: 0,
         }
@@ -199,6 +206,7 @@ impl<'p> Machine<'p> {
                 self.ev(t, env)?;
                 Ok(V::Weak(None))
             }
+            Kind::Dyn(..) | Kind::GMatch(..) => self.ev_new(e, env),
             _ => Err(unsupported(format!("node {:?}", e.kind))),
         }
     }
@@ -353,6 +361,8 @@ pub fn bind_pat(p: &Pat, v: &V, env: &Env) -> Option<Env> {
         (Pat::Bind(n), v) => Some(env.bind(n, v.clone())),
         (Pat::Nil, V::Opt(None)) => Some(env.clone()),
         (Pat::Some(q), V::Opt(Some(x))) => bind_pat(q, x, env),
+        (Pat::Lit(n), V::Int(m)) if n == m => Some(env.clone()),
+        (Pat::Vector(ps, rest), V::Vector(xs)) => super::patterns::bind_vector(ps, rest, xs, env),
         (Pat::As(q, n), v) => bind_pat(q, v, &env.bind(n, v.clone())),
         (Pat::Ctor(c, ps), V::Data(name, fields)) if **name == **c => {
             let mut env2 = env.clone();
@@ -376,8 +386,8 @@ pub fn bind_pat(p: &Pat, v: &V, env: &Env) -> Option<Env> {
 /// The position of field `f` in struct `s`.
 pub fn field_index(s: &str, f: &str) -> Result<usize, Stop> {
     match (s, f) {
-        ("Pt", "x") | ("Wrap", "s") | ("Holder", "f") | ("Box", "v") => Ok(0),
-        ("Pt", "y") | ("Wrap", "v") | ("Holder", "c") => Ok(1),
+        ("Pt", "x") | ("Wrap", "s") | ("Holder", "f") | ("Box", "v") | ("Hook", "f") => Ok(0),
+        ("Pt", "y") | ("Wrap", "v") | ("Holder", "c") | ("Hook", "tag") => Ok(1),
         _ => Err(unsupported(format!("field {s}.{f}"))),
     }
 }

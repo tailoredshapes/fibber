@@ -23,7 +23,10 @@ fn param(name: &str, ty: Ty) -> Param {
 /// A call of a helper returning `ret`: an existing one, or a new one.
 pub fn helper_call(g: &mut Gen, cx: &Ctx, ret: &Ty, d: u32) -> Option<Expr> {
     let existing: Vec<usize> = (0..g.funs.len())
-        .filter(|&i| &g.funs[i].ret == ret && g.funs[i].params.iter().all(|p| !p.inout))
+        .filter(|&i| {
+            let ps = &g.funs[i].params;
+            &g.funs[i].ret == ret && ps.iter().all(|p| !p.inout && !matches!(p.ty, Ty::Gen(..)))
+        })
         .collect();
     let idx = match g.rng.pick(&existing) {
         Some(&i) if g.rng.chance(50) || g.funs.len() >= g.max_funs => i,

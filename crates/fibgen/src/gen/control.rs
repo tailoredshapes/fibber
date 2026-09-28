@@ -1,9 +1,9 @@
 //! `let`, `if`, `do`, `match` and `loop` at any type.
 
-use crate::ast::{Expr, Kind, Pat};
+use crate::ast::{Expr, Kind, Pat, Rest};
 use crate::ty::Ty;
 
-use super::{effects, tasks, Ctx, Gen, Var, VarKind};
+use super::{effects, tasks, vpat, Ctx, Gen, Var, VarKind};
 
 fn var(name: &str, ty: &Ty, kind: VarKind) -> Var {
     Var {
@@ -41,6 +41,7 @@ fn struct_fields(ty: &Ty) -> Option<(&'static str, Vec<Ty>)> {
         Ty::Wrap => Some(("Wrap", vec![Ty::Str, Ty::vec(Ty::Int)])),
         Ty::Holder => Some(("Holder", vec![Ty::fn_i(), Ty::cell(Ty::Int)])),
         Ty::Boxed(t) => Some(("Box", vec![(**t).clone()])),
+        Ty::Hook(_) => Some(("Hook", vec![Ty::fn_i(), Ty::Int])),
         _ => None,
     }
 }
@@ -48,6 +49,9 @@ fn struct_fields(ty: &Ty) -> Option<(&'static str, Vec<Ty>)> {
 /// An irrefutable pattern for `ty` and the variables it binds: a name,
 /// or (for a struct) a positional pattern, sometimes nested or `:as`.
 pub fn irrefutable(g: &mut Gen, ty: &Ty, depth: u32) -> (Pat, Vec<Var>) {
+    if matches!(ty, Ty::Vec(_)) && g.rng.chance(20) {
+        return all_rest(g, ty);
+    }
     let fields = struct_fields(ty);
     if fields.is_none() || depth == 0 || g.rng.chance(40) {
         if g.rng.chance(10) {
@@ -73,6 +77,17 @@ pub fn irrefutable(g: &mut Gen, ty: &Ty, depth: u32) -> (Pat, Vec<Var>) {
     (pat, vars)
 }
 
+/// `[& r]` (or `[& _]`), the one irrefutable vector pattern: `r` owns
+/// a new vector of every element (syntax §3.3).
+fn all_rest(g: &mut Gen, ty: &Ty) -> (Pat, Vec<Var>) {
+    if g.rng.chance(20) {
+        return (Pat::Vector(Vec::new(), Some(Rest::Wild)), Vec::new());
+    }
+    let r = g.fresh("all");
+    let v = var(&r, ty, VarKind::Pattern);
+    (Pat::Vector(Vec::new(), Some(Rest::Bind(r))), vec![v])
+}
+
 /// `(let ((pat e) ...) body)`.
 pub fn let_form(g: &mut Gen, cx: &Ctx, ty: &Ty, d: u32) -> Option<Expr> {
     let mut cur = cx.clone();
@@ -84,7 +99,8 @@ pub fn let_form(g: &mut Gen, cx: &Ctx, ty: &Ty, d: u32) -> Option<Expr> {
             g.any_type(&cur)
         };
         let init = g.expr(&cur, &t, d - 1);
-        let (pat, vars) = if g.rng.chance(20) {
+        let destructure = if matches!(t, Ty::Vec(_)) { 35 } else { 20 };
+        let (pat, vars) = if g.rng.chance(destructure) {
             irrefutable(g, &t, 2)
         } else {
             let taken: Vec<String> = binds
@@ -145,7 +161,14 @@ pub fn pat_names(p: &Pat) -> Vec<String> {
         Pat::As(q, n) => pat_names(q).into_iter().chain([n.clone()]).collect(),
         Pat::Some(q) => pat_names(q),
         Pat::Ctor(_, ps) => ps.iter().flat_map(pat_names).collect(),
-        Pat::Wild | Pat::Nil => Vec::new(),
+        Pat::Vector(ps, r) => {
+            let mut out: Vec<String> = ps.iter().flat_map(pat_names).collect();
+            if let Some(Rest::Bind(n)) = r {
+                out.push(n.clone());
+            }
+            out
+        }
+        Pat::Wild | Pat::Nil | Pat::Lit(_) => Vec::new(),
     }
 }
 
@@ -182,6 +205,11 @@ pub fn do_form(g: &mut Gen, cx: &Ctx, ty: &Ty, d: u32) -> Option<Expr> {
 /// `(match e clause ...)` over a random scrutinee type, the clauses
 /// binding parts of the scrutinee.
 pub fn match_form(g: &mut Gen, cx: &Ctx, ty: &Ty, d: u32) -> Option<Expr> {
+    match g.rng.below(20) {
+        0..=6 => return Some(vpat::vector_match(g, cx, ty, d)),
+        7..=9 => return Some(vpat::guarded_match(g, cx, ty, d)),
+        _ => {}
+    }
     let st = [
         Ty::Shape,
         Ty::opt(Ty::Int),
@@ -204,7 +232,7 @@ pub fn match_form(g: &mut Gen, cx: &Ctx, ty: &Ty, d: u32) -> Option<Expr> {
 }
 
 /// Exhaustive, non-redundant clause patterns for `st` (syntax §3.6).
-fn clause_patterns(g: &mut Gen, st: &Ty) -> Vec<(Pat, Vec<Var>)> {
+pub fn clause_patterns(g: &mut Gen, st: &Ty) -> Vec<(Pat, Vec<Var>)> {
     let ctor = |g: &mut Gen, head: &str, ftys: &[Ty]| {
         let mut pats = Vec::new();
         let mut vars = Vec::new();

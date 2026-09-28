@@ -85,6 +85,7 @@ fn later_write_back_wins() {
     assert_eq!(
         expected(&Program {
             defs: Vec::new(),
+            impls: Vec::new(),
             funs: vec![bar()],
             main
         }),
@@ -115,6 +116,7 @@ fn copy_in_happens_at_the_argument() {
     assert_eq!(
         expected(&Program {
             defs: Vec::new(),
+            impls: Vec::new(),
             funs: vec![f],
             main: let1("c", cell, body)
         }),
@@ -128,6 +130,7 @@ fn arithmetic_overflow_and_rem_by_zero_trap() {
     assert_eq!(
         expected(&Program {
             defs: Vec::new(),
+            impls: Vec::new(),
             funs: Vec::new(),
             main: big
         }),
@@ -137,6 +140,7 @@ fn arithmetic_overflow_and_rem_by_zero_trap() {
     assert!(matches!(
         expected(&Program {
             defs: Vec::new(),
+            impls: Vec::new(),
             funs: Vec::new(),
             main: rem
         }),
@@ -171,6 +175,7 @@ fn loop_and_recur_rebind_all_variables() {
     assert_eq!(
         expected(&Program {
             defs: Vec::new(),
+            impls: Vec::new(),
             funs: Vec::new(),
             main: lp
         }),
@@ -201,6 +206,7 @@ fn a_weak_reference_to_a_dead_target_reads_nil() {
     assert_eq!(
         expected(&Program {
             defs: Vec::new(),
+            impls: Vec::new(),
             funs: Vec::new(),
             main: m
         }),

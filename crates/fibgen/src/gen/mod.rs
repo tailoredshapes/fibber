@@ -19,15 +19,20 @@ mod funcs;
 mod gadgets;
 mod gadgets2;
 mod helpers;
+mod hooks;
 mod inout;
 mod objects;
 mod observe;
+mod protos;
+mod protos2;
 mod scalar;
 mod tasks;
+mod vpat;
+mod vpat2;
 
 pub use ctx::{Ctx, Region, Var, VarKind};
 
-use crate::ast::{Expr, FunDef, Kind, Param, Program};
+use crate::ast::{Expr, FunDef, ImplDef, Kind, Param, Program};
 use crate::rng::Rng;
 use crate::ty::{universe, Ty};
 
@@ -48,6 +53,13 @@ pub struct Gen {
     universe: Vec<Ty>,
     /// The `def` constants, as variables every body sees.
     defs: Vec<Var>,
+    /// The program's `impl`s (empty when it declares no protocols).
+    pub impls: Vec<ImplDef>,
+    /// Whether protocol method calls and `dyn` values may be made: not
+    /// in a program without `impl`s, and not while the `impl` bodies
+    /// themselves are made (a method body that called a method could
+    /// recurse without end).
+    pub methods_ok: bool,
 }
 
 /// The program for `seed` at `size` (1 = tiny; the default run uses 1..=6).
@@ -62,13 +74,18 @@ pub fn generate(seed: u64, size: u32) -> Program {
         node_budget: 60 * size as usize,
         universe: universe(),
         defs: Vec::new(),
+        impls: Vec::new(),
+        methods_ok: false,
     };
     let (defs, vars) = consts::defs(&mut g, (size as usize).min(3));
     g.defs = vars;
+    g.impls = protos::impls(&mut g);
+    g.methods_ok = !g.impls.is_empty();
     let depth = size + 2;
     let main = g.expr(&g.body_ctx(&[]), &Ty::Int, depth);
     Program {
         defs,
+        impls: g.impls,
         funs: g.funs,
         main,
     }
@@ -103,7 +120,7 @@ impl Gen {
         loop {
             let i = self.rng.below(self.universe.len());
             let t = self.universe[i].clone();
-            if cx.atoms_readable() || !t.is_atom() {
+            if (cx.atoms_readable() || !t.is_atom()) && self.may_make(&t) {
                 return t;
             }
         }
@@ -114,15 +131,21 @@ impl Gen {
         loop {
             let i = self.rng.below(self.universe.len());
             let t = self.universe[i].clone();
-            if t.is_send() && !t.is_atom() && t != Ty::Bool {
+            if t.is_send() && !t.is_atom() && t != Ty::Bool && self.may_make(&t) {
                 return t;
             }
         }
     }
 
-    /// Whether `t` is in the universe.
+    /// Whether values of `t` may be made here: `dyn` types only where
+    /// method calls may be.
+    pub fn may_make(&self, t: &Ty) -> bool {
+        self.methods_ok || !t.needs_protocols()
+    }
+
+    /// Whether `t` is in the universe (and may be made here).
     pub fn in_universe(&self, t: &Ty) -> bool {
-        self.universe.contains(t)
+        self.universe.contains(t) && self.may_make(t)
     }
 
     /// A small integer literal.
@@ -180,6 +203,8 @@ impl Gen {
             Ty::Unit => Some(effects::stmt(self, cx, d)),
             Ty::Func(..) => Some(funcs::function(self, cx, ty, d)),
             Ty::Task(t) => Some(tasks::task(self, cx, t, d)),
+            Ty::Dyn(p, send) => Some(protos::dyn_value(self, cx, *p, *send, d)),
+            Ty::Hook(send) => Some(hooks::hook(self, cx, *send, d)),
             _ => objects::object(self, cx, ty, d),
         };
         e.unwrap_or_else(|| self.leaf(cx, ty))
@@ -216,6 +241,8 @@ impl Gen {
                 let body = self.leaf_value(cx, t);
                 lit(Kind::Async(Box::new(body)))
             }
+            Ty::Dyn(p, send) => protos::dyn_leaf(self, *p, *send),
+            Ty::Hook(send) => hooks::hook_leaf(self, *send),
             Ty::Weak(t) => {
                 let n = self.fresh("dead");
                 let target = objects::fresh_object(self, cx, t);
