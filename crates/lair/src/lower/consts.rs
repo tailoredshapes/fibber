@@ -1,10 +1,10 @@
 //! Constants: literals, strings, addresses and struct constants.
 
 use llvm_sys::core::{
-    LLVMAddGlobal, LLVMArrayType2, LLVMConstInt, LLVMConstNamedStruct, LLVMConstNull,
-    LLVMConstReal, LLVMConstStringInContext2, LLVMConstStructInContext, LLVMConstVector,
-    LLVMInt8TypeInContext, LLVMSetGlobalConstant, LLVMSetInitializer, LLVMSetLinkage,
-    LLVMSetUnnamedAddress,
+    LLVMAddGlobal, LLVMArrayType2, LLVMConstArray2, LLVMConstInt, LLVMConstNamedStruct,
+    LLVMConstNull, LLVMConstReal, LLVMConstStringInContext2, LLVMConstStructInContext,
+    LLVMConstVector, LLVMInt8TypeInContext, LLVMSetGlobalConstant, LLVMSetInitializer,
+    LLVMSetLinkage, LLVMSetUnnamedAddress,
 };
 use llvm_sys::prelude::LLVMValueRef;
 use llvm_sys::{LLVMLinkage, LLVMUnnamedAddr};
@@ -33,6 +33,14 @@ impl Lx {
                 Kind::Int(t @ Type::Int(b), v) => LLVMConstInt(self.ty(t), low_bits(*v, *b), 0),
                 Kind::Float(t, v) => LLVMConstReal(self.ty(t), *v),
                 Kind::Null => LLVMConstNull(self.ty(&Type::Ptr)),
+                Kind::Zero(t) => LLVMConstNull(self.ty(t)),
+                Kind::Array(Type::Array(_, elem), es) => {
+                    let mut vs = es
+                        .iter()
+                        .map(|x| self.constant(x))
+                        .collect::<Result<Vec<_>>>()?;
+                    LLVMConstArray2(self.ty(elem), vs.as_mut_ptr(), vs.len() as u64)
+                }
                 Kind::Vector(_, es) => {
                     let mut vs = es
                         .iter()

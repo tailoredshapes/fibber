@@ -47,6 +47,20 @@ fn single(s: Scope) -> i32 {
     i32::from(s == Scope::SingleThread)
 }
 
+/// `volatile` and `(align N)` on an access or an alloca (spec/lir.md
+/// §6.5); without `align` the builder's ABI alignment stands.
+///
+/// # Safety
+/// `inst` is a load, store or alloca of the current builder.
+unsafe fn access_options(inst: V, volatile: bool, align: Option<u32>) {
+    if volatile {
+        LLVMSetVolatile(inst, 1);
+    }
+    if let Some(a) = align {
+        LLVMSetAlignment(inst, a);
+    }
+}
+
 impl<'l, 'f> Fx<'l, 'f> {
     pub fn memory(&mut self, e: &'f Expr) -> Result<Option<V>> {
         let (b, n) = (self.b, NONAME.as_ptr());
@@ -54,18 +68,37 @@ impl<'l, 'f> Fx<'l, 'f> {
         // the checker guaranteed their types (spec/lir.md §6.5).
         unsafe {
             Ok(Some(match &e.kind {
-                Kind::Alloca(t, None) => LLVMBuildAlloca(b, self.lx.ty(t), n),
-                Kind::Alloca(t, Some(c)) => {
-                    let c = self.val(c)?;
-                    LLVMBuildArrayAlloca(b, self.lx.ty(t), c, n)
+                Kind::Alloca { ty, count, align } => {
+                    let a = match count {
+                        None => LLVMBuildAlloca(b, self.lx.ty(ty), n),
+                        Some(c) => {
+                            let c = self.val(c)?;
+                            LLVMBuildArrayAlloca(b, self.lx.ty(ty), c, n)
+                        }
+                    };
+                    access_options(a, false, *align);
+                    a
                 }
-                Kind::Load(t, p) => {
-                    let p = self.val(p)?;
-                    LLVMBuildLoad2(b, self.lx.ty(t), p, n)
+                Kind::Load {
+                    ty,
+                    ptr,
+                    volatile,
+                    align,
+                } => {
+                    let p = self.val(ptr)?;
+                    let l = LLVMBuildLoad2(b, self.lx.ty(ty), p, n);
+                    access_options(l, *volatile, *align);
+                    l
                 }
-                Kind::Store(v, p) => {
-                    let (v, p) = (self.val(v)?, self.val(p)?);
-                    LLVMBuildStore(b, v, p);
+                Kind::Store {
+                    value,
+                    ptr,
+                    volatile,
+                    align,
+                } => {
+                    let (v, p) = (self.val(value)?, self.val(ptr)?);
+                    let st = LLVMBuildStore(b, v, p);
+                    access_options(st, *volatile, *align);
                     return Ok(None);
                 }
                 Kind::Gep {

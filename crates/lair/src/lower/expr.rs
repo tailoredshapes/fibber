@@ -37,11 +37,19 @@ impl<'l, 'f> Fx<'l, 'f> {
                 Some(v) => some(*v),
                 None => Err(Error::Internal(format!("name {n} not lowered"))),
             },
-            Kind::Global(_) | Kind::Int(..) | Kind::Float(..) | Kind::Null | Kind::Vector(..) => {
-                some(self.lx.constant(e)?)
-            }
+            Kind::Global(_)
+            | Kind::Int(..)
+            | Kind::Float(..)
+            | Kind::Null
+            | Kind::Zero(_)
+            | Kind::Vector(..) => some(self.lx.constant(e)?),
             Kind::Str(bytes) => some(self.lx.string(bytes)),
             Kind::Struct(name, fields) => some(self.struct_value(e, name, fields)?),
+            Kind::Array(t, elems) => {
+                let ty = self.lx.ty(t);
+                some(self.aggregate_value(e, ty, elems)?)
+            }
+            Kind::Trap => self.trap().map(|_| None),
             Kind::Let(binds, body) => self.let_form(binds, body),
             Kind::Phi(t, inc) => {
                 let ty = self.lx.ty(t);
@@ -57,9 +65,9 @@ impl<'l, 'f> Fx<'l, 'f> {
             | Kind::CondBr(..)
             | Kind::Switch(..)
             | Kind::Unreachable => self.control(e).map(|_| None),
-            Kind::Alloca(..)
-            | Kind::Load(..)
-            | Kind::Store(..)
+            Kind::Alloca { .. }
+            | Kind::Load { .. }
+            | Kind::Store { .. }
             | Kind::Gep { .. }
             | Kind::AtomicLoad(..)
             | Kind::AtomicStore(..)
@@ -95,6 +103,10 @@ impl<'l, 'f> Fx<'l, 'f> {
         name: &Option<String>,
         fields: &'f [Expr],
     ) -> Result<V> {
+        if let Some(n) = name {
+            let ty = self.lx.structs[n];
+            return self.aggregate_value(e, ty, fields);
+        }
         if fields.iter().all(lir::check::is_constant) {
             return self.lx.constant(e);
         }
@@ -102,21 +114,33 @@ impl<'l, 'f> Fx<'l, 'f> {
             .iter()
             .map(|f| self.val(f))
             .collect::<Result<Vec<_>>>()?;
-        let ty: LLVMTypeRef = match name {
-            Some(n) => self.lx.structs[n],
-            None => {
-                // SAFETY: the values belong to this context.
-                let mut ts: Vec<LLVMTypeRef> =
-                    vals.iter().map(|v| unsafe { LLVMTypeOf(*v) }).collect();
-                unsafe { LLVMStructTypeInContext(self.lx.ctx, ts.as_mut_ptr(), ts.len() as u32, 0) }
-            }
-        };
-        // SAFETY: every field is overwritten, so the poison start is never
-        // observed.
+        // SAFETY: the values belong to this context.
+        let mut ts: Vec<LLVMTypeRef> = vals.iter().map(|v| unsafe { LLVMTypeOf(*v) }).collect();
+        let ty =
+            unsafe { LLVMStructTypeInContext(self.lx.ctx, ts.as_mut_ptr(), ts.len() as u32, 0) };
+        Ok(self.insert_all(ty, vals))
+    }
+
+    /// A named struct or array value: a constant, or `insertvalue`s of
+    /// its elements into a value of type `ty`.
+    fn aggregate_value(&mut self, e: &'f Expr, ty: LLVMTypeRef, elems: &'f [Expr]) -> Result<V> {
+        if elems.iter().all(lir::check::is_constant) {
+            return self.lx.constant(e);
+        }
+        let vals = elems
+            .iter()
+            .map(|f| self.val(f))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self.insert_all(ty, vals))
+    }
+
+    fn insert_all(&mut self, ty: LLVMTypeRef, vals: Vec<V>) -> V {
+        // SAFETY: every element is overwritten, so the poison start is
+        // never observed.
         let mut agg = unsafe { LLVMGetPoison(ty) };
         for (i, v) in vals.into_iter().enumerate() {
             agg = unsafe { LLVMBuildInsertValue(self.b, agg, v, i as u32, NONAME.as_ptr()) };
         }
-        Ok(agg)
+        agg
     }
 }

@@ -1,8 +1,9 @@
 //! lIR types to LLVM types.
 
 use llvm_sys::core::{
-    LLVMDoubleTypeInContext, LLVMFloatTypeInContext, LLVMFunctionType, LLVMIntTypeInContext,
-    LLVMPointerTypeInContext, LLVMStructTypeInContext, LLVMVectorType, LLVMVoidTypeInContext,
+    LLVMArrayType2, LLVMDoubleTypeInContext, LLVMFloatTypeInContext, LLVMFunctionType,
+    LLVMIntTypeInContext, LLVMPointerTypeInContext, LLVMStructTypeInContext, LLVMVectorType,
+    LLVMVoidTypeInContext,
 };
 use llvm_sys::prelude::LLVMTypeRef;
 
@@ -20,6 +21,7 @@ impl Lx {
                 Type::Double => LLVMDoubleTypeInContext(self.ctx),
                 Type::Ptr => LLVMPointerTypeInContext(self.ctx, 0),
                 Type::Vector(n, e) => LLVMVectorType(self.ty(e), *n),
+                Type::Array(n, e) => LLVMArrayType2(self.ty(e), *n),
                 Type::Named(s) => self.structs[s],
                 Type::Anon(fs) => {
                     let mut f: Vec<LLVMTypeRef> = fs.iter().map(|x| self.ty(x)).collect();

@@ -1,7 +1,9 @@
 //! The JIT: compile lIR modules in-process and call their functions
 //! (spec/lir.md §11).
 
-use std::collections::HashMap;
+mod names;
+mod trampoline;
+
 use std::ffi::CStr;
 use std::ptr;
 
@@ -21,8 +23,9 @@ use crate::error::{Error, Result};
 use crate::llvm::passes::{error_message, optimize};
 use crate::llvm::{cstr, target};
 use crate::lower::lower;
-use lir::ast::{Item, Module};
-use lir::{Diagnostic, FnType};
+use lir::ast::Module;
+use lir::{Cc, FnType};
+use names::Names;
 
 extern "C" {
     // In LLVM 21's C API (llvm-c/Orc.h), not yet bound by llvm-sys 211.
@@ -45,10 +48,8 @@ pub struct Jit {
     triple: String,
     data_layout: String,
     opts: JitOptions,
-    /// Every function defined so far: its type and module.
-    defined: HashMap<String, (FnType, String)>,
-    /// Every global variable defined so far and its module.
-    globals: HashMap<String, String>,
+    /// What every module so far defined and exported.
+    names: Names,
 }
 
 impl Jit {
@@ -86,8 +87,7 @@ impl Jit {
                 triple,
                 data_layout,
                 opts,
-                defined: HashMap::new(),
-                globals: HashMap::new(),
+                names: Names::default(),
             })
         }
     }
@@ -101,7 +101,7 @@ impl Jit {
     /// Add a module `lir::check` accepted.
     pub fn add_module(&mut self, name: &str, m: &Module) -> Result<()> {
         lir::check(m).map_err(Error::Invalid)?;
-        self.against_earlier(m)?;
+        self.names.check(m, in_process)?;
         let owned = lower(m, name, &self.triple, &self.data_layout)?;
         // SAFETY: the module is verified; ownership of its context and
         // module passes to the JIT through the thread-safe wrappers.
@@ -116,80 +116,28 @@ impl Jit {
                 return Err(Error::Jit(msg));
             }
         }
-        self.record(name, m);
+        self.names.record(name, m);
         Ok(())
     }
 
-    /// Cross-module rules (spec/lir.md §11): no second definition, and a
-    /// declaration matches an earlier definition.
-    fn against_earlier(&self, m: &Module) -> Result<()> {
-        for item in &m.items {
-            let (name, pos, decl) = match item {
-                Item::Define(f) => (&f.name, f.pos, None),
-                Item::Global(g) => (&g.name, g.pos, None),
-                Item::Declare(d) => (&d.name, d.pos, Some(&d.ty)),
-                Item::Struct(_) => continue,
-            };
-            let first = self
-                .defined
-                .get(name)
-                .map(|(_, m)| m)
-                .or(self.globals.get(name));
-            match (first, decl) {
-                (Some(first), None) => {
-                    return Err(Diagnostic::new(
-                        pos,
-                        format!("duplicate definition of @{name} (first in module {first})"),
-                    )
-                    .into())
-                }
-                (None, Some(_)) => {
-                    if !in_process(name) {
-                        return Err(Diagnostic::new(pos, format!(
-                            "undefined symbol @{name}: defined by no module of this JIT and not in the process"
-                        ))
-                        .into());
-                    }
-                }
-                (Some(_), Some(ty)) => {
-                    if let Some((def, module)) = self.defined.get(name) {
-                        if def != ty {
-                            return Err(Diagnostic::new(pos, format!(
-                                "declaration of @{name} does not match its definition in module {module}"
-                            ))
-                            .into());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn record(&mut self, module: &str, m: &Module) {
-        for item in &m.items {
-            match item {
-                Item::Define(f) => {
-                    self.defined
-                        .insert(f.name.clone(), (f.ty.clone(), module.to_string()));
-                }
-                Item::Global(g) => {
-                    self.globals.insert(g.name.clone(), module.to_string());
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// The lIR type of a function defined in this JIT.
+    /// The lIR type of an exported function defined in this JIT.
     pub fn signature(&self, name: &str) -> Result<FnType> {
-        match self.defined.get(name) {
-            Some((t, _)) => Ok(t.clone()),
-            None => Err(Error::Jit(format!(
-                "no function @{name} is defined in this JIT"
-            ))),
+        self.names.function(name)
+    }
+
+    /// The address of a `ccc` entry to `name`: the function itself when
+    /// it is `ccc`, else a trampoline this `Jit` generates and compiles
+    /// once (spec/lir.md §11).
+    pub fn c_entry(&mut self, name: &str) -> Result<usize> {
+        let ty = self.signature(name)?;
+        if ty.cc == Cc::C {
+            return self.address(name);
         }
+        let tramp = trampoline::name_of(name);
+        if self.signature(&tramp).is_err() {
+            self.add_source(&tramp, &trampoline::source(name, &ty))?;
+        }
+        self.address(&tramp)
     }
 
     /// The address of a defined function, compiling it if needed.
@@ -206,18 +154,18 @@ impl Jit {
         Ok(addr as usize)
     }
 
-    /// A defined function as the function pointer type `F`.
+    /// A defined function as the function pointer type `F`; for a
+    /// `tailcc` function, its `ccc` trampoline ([`Jit::c_entry`]).
     ///
     /// # Safety
     /// `F` must be an `extern "C"` function pointer type matching the
-    /// lIR type [`Jit::signature`] reports (a `tailcc` function cannot
-    /// be called from Rust), and must not be called after the `Jit` is
-    /// dropped.
-    pub unsafe fn function<F: Copy>(&self, name: &str) -> Result<F> {
+    /// parameters and result of the lIR type [`Jit::signature`]
+    /// reports, and must not be called after the `Jit` is dropped.
+    pub unsafe fn function<F: Copy>(&mut self, name: &str) -> Result<F> {
         if std::mem::size_of::<F>() != std::mem::size_of::<usize>() {
             return Err(Error::Jit("F is not a function pointer type".into()));
         }
-        let addr = self.address(name)?;
+        let addr = self.c_entry(name)?;
         Ok(std::mem::transmute_copy::<usize, F>(&addr))
     }
 }

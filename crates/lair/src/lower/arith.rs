@@ -1,14 +1,14 @@
 //! Arithmetic, comparisons, conversions, select, vectors, aggregates.
 
 use llvm_sys::core::*;
-use llvm_sys::prelude::LLVMValueRef;
+use llvm_sys::prelude::{LLVMTypeRef, LLVMValueRef};
 use llvm_sys::{LLVMIntPredicate, LLVMOpcode, LLVMRealPredicate};
 
 use super::expr::V;
 use super::func::Fx;
 use crate::error::{Error, Result};
 use crate::llvm::NONAME;
-use lir::ast::{BinOp, CastOp, Expr, FPred, IPred, Kind, UnOp};
+use lir::ast::{BinOp, CastOp, Expr, FPred, IPred, Kind, OvfOp, UnOp};
 
 fn bin_opcode(op: BinOp) -> LLVMOpcode {
     use BinOp::*;
@@ -51,6 +51,16 @@ fn cast_opcode(op: CastOp) -> LLVMOpcode {
         PtrToInt => LLVMPtrToInt,
         IntToPtr => LLVMIntToPtr,
         Bitcast => LLVMBitCast,
+        // The saturating conversions are intrinsics, not casts.
+        FpToSiSat | FpToUiSat => LLVMFPToSI,
+    }
+}
+
+fn ovf_name(op: OvfOp) -> &'static str {
+    match op {
+        OvfOp::SAdd => "llvm.sadd.with.overflow",
+        OvfOp::SSub => "llvm.ssub.with.overflow",
+        OvfOp::SMul => "llvm.smul.with.overflow",
     }
 }
 
@@ -108,7 +118,20 @@ impl<'l, 'f> Fx<'l, 'f> {
                 Kind::Un(UnOp::FNeg, x) => LLVMBuildFNeg(b, self.val(x)?, n),
                 Kind::Un(UnOp::Ctpop, x) => {
                     let x = self.val(x)?;
-                    self.intrinsic("llvm.ctpop", x)
+                    self.intrinsic("llvm.ctpop", &[LLVMTypeOf(x)], &mut [x])
+                }
+                Kind::Overflow(op, x, y) => {
+                    let (x, y) = (self.val(x)?, self.val(y)?);
+                    self.intrinsic(ovf_name(*op), &[LLVMTypeOf(x)], &mut [x, y])
+                }
+                Kind::Cast(op @ (CastOp::FpToSiSat | CastOp::FpToUiSat), t, x) => {
+                    let name = if *op == CastOp::FpToSiSat {
+                        "llvm.fptosi.sat"
+                    } else {
+                        "llvm.fptoui.sat"
+                    };
+                    let x = self.val(x)?;
+                    self.intrinsic(name, &[self.lx.ty(t), LLVMTypeOf(x)], &mut [x])
                 }
                 Kind::ICmp(p, x, y) => {
                     let (x, y) = (self.val(x)?, self.val(y)?);
@@ -184,16 +207,29 @@ impl<'l, 'f> Fx<'l, 'f> {
         }
     }
 
-    /// Call an overloaded intrinsic on one operand of its overload type.
-    fn intrinsic(&mut self, name: &str, x: V) -> V {
-        // SAFETY: the intrinsic exists for every integer type (checked).
+    /// `(trap)`: `llvm.trap`.
+    pub fn trap(&mut self) -> Result<()> {
+        self.intrinsic("llvm.trap", &[], &mut []);
+        Ok(())
+    }
+
+    /// Call an intrinsic overloaded on `overloads` with `args`.
+    fn intrinsic(&mut self, name: &str, overloads: &[LLVMTypeRef], args: &mut [V]) -> V {
+        let mut tys = overloads.to_vec();
+        // SAFETY: the checker admitted only types the intrinsic exists for.
         unsafe {
             let id = LLVMLookupIntrinsicID(name.as_ptr().cast(), name.len());
-            let mut ty = LLVMTypeOf(x);
-            let f = LLVMGetIntrinsicDeclaration(self.lx.module, id, &mut ty, 1);
-            let fty = LLVMIntrinsicGetType(self.lx.ctx, id, &mut ty, 1);
-            let mut args = [x];
-            LLVMBuildCall2(self.b, fty, f, args.as_mut_ptr(), 1, NONAME.as_ptr())
+            let n = tys.len();
+            let f = LLVMGetIntrinsicDeclaration(self.lx.module, id, tys.as_mut_ptr(), n);
+            let fty = LLVMIntrinsicGetType(self.lx.ctx, id, tys.as_mut_ptr(), n);
+            LLVMBuildCall2(
+                self.b,
+                fty,
+                f,
+                args.as_mut_ptr(),
+                args.len() as u32,
+                NONAME.as_ptr(),
+            )
         }
     }
 }

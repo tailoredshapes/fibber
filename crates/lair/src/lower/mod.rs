@@ -15,15 +15,17 @@ use std::ptr;
 use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyModule};
 use llvm_sys::core::{
     LLVMAddFunction, LLVMAddGlobal, LLVMSetFunctionCallConv, LLVMSetGlobalConstant,
-    LLVMSetInitializer, LLVMStructCreateNamed, LLVMStructSetBody,
+    LLVMSetInitializer, LLVMSetLinkage, LLVMSetVisibility, LLVMStructCreateNamed,
+    LLVMStructSetBody,
 };
 use llvm_sys::prelude::{LLVMContextRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef};
 use llvm_sys::target::{LLVMCreateTargetData, LLVMDisposeTargetData, LLVMTargetDataRef};
+use llvm_sys::{LLVMLinkage, LLVMVisibility};
 
 use crate::error::{Error, Result};
 use crate::llvm::{cstr, take_message, Owned};
-use lir::ast::{Item, Module};
-use lir::types::{Cc, FnType};
+use lir::ast::{Item, Linkage, Modifiers, Module};
+use lir::types::{Cc, FnType, Type};
 
 /// LLVM's number for `tailcc` (`CallingConv::Tail`).
 pub const TAILCC: u32 = 18;
@@ -87,20 +89,30 @@ fn verify(owned: &Owned) -> Result<()> {
     Ok(())
 }
 
+/// Apply linkage and visibility words (spec/lir.md §4.3).
+///
+/// # Safety
+/// `v` is a function or global of a live module.
+unsafe fn set_modifiers(v: LLVMValueRef, mods: Modifiers) {
+    match mods.linkage {
+        Linkage::External => {}
+        Linkage::Internal => LLVMSetLinkage(v, LLVMLinkage::LLVMInternalLinkage),
+        Linkage::Private => LLVMSetLinkage(v, LLVMLinkage::LLVMPrivateLinkage),
+    }
+    if mods.hidden {
+        LLVMSetVisibility(v, LLVMVisibility::LLVMHiddenVisibility);
+    }
+}
+
 impl Lx {
     fn module_items(&mut self, m: &Module) -> Result<()> {
         self.declare_structs(m);
         for item in &m.items {
             match item {
-                Item::Declare(d) => self.add_function(&d.name, &d.ty),
-                Item::Define(f) => self.add_function(&f.name, &f.ty),
-                Item::Global(g) => {
-                    let t = self.ty(&g.ty);
-                    let n = cstr(&g.name);
-                    // SAFETY: module and type are alive.
-                    let gv = unsafe { LLVMAddGlobal(self.module, t, n.as_ptr()) };
-                    self.globals.insert(g.name.clone(), gv);
-                }
+                Item::Declare(d) => self.add_function(&d.name, &d.ty, hidden(d.hidden)),
+                Item::Define(f) => self.add_function(&f.name, &f.ty, f.mods),
+                Item::Global(g) => self.add_global(&g.name, &g.ty, g.mods),
+                Item::DeclareGlobal(g) => self.add_global(&g.name, &g.ty, hidden(g.hidden)),
                 Item::Struct(_) => {}
             }
         }
@@ -149,13 +161,34 @@ impl Lx {
         }
     }
 
-    fn add_function(&mut self, name: &str, ty: &FnType) {
+    fn add_function(&mut self, name: &str, ty: &FnType, mods: Modifiers) {
         let fty = self.fn_ty(ty);
         let n = cstr(name);
         // SAFETY: module and type are alive.
         let f = unsafe { LLVMAddFunction(self.module, n.as_ptr(), fty) };
-        unsafe { LLVMSetFunctionCallConv(f, cc_number(ty.cc)) };
+        unsafe {
+            LLVMSetFunctionCallConv(f, cc_number(ty.cc));
+            set_modifiers(f, mods);
+        }
         self.funcs.insert(name.to_string(), (f, ty.clone()));
+    }
+
+    /// A global; a definition gets its initialiser later, a
+    /// `declare-global` none (spec/lir.md §4.4).
+    fn add_global(&mut self, name: &str, ty: &Type, mods: Modifiers) {
+        let t = self.ty(ty);
+        let n = cstr(name);
+        // SAFETY: module and type are alive.
+        let gv = unsafe { LLVMAddGlobal(self.module, t, n.as_ptr()) };
+        unsafe { set_modifiers(gv, mods) };
+        self.globals.insert(name.to_string(), gv);
+    }
+}
+
+fn hidden(hidden: bool) -> Modifiers {
+    Modifiers {
+        linkage: Linkage::External,
+        hidden,
     }
 }
 
