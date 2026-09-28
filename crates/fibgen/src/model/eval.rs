@@ -96,9 +96,11 @@ impl<'p> Machine<'p> {
     /// A machine for `p`.
     pub fn new(p: &'p Program) -> Self {
         let funs = p.funs.iter().map(|f| (f.name.as_str(), f)).collect();
+        // The derived enum's field-less variant is a constant (syntax §3.9).
+        let low = V::data("Low", Vec::new());
         Machine {
             funs,
-            globals: HashMap::new(),
+            globals: HashMap::from([("Low".to_string(), low)]),
             impls: super::protos::impl_table(p),
             trace: BTreeSet::new(),
             steps: 0,
@@ -166,6 +168,7 @@ impl<'p> Machine<'p> {
         match &e.kind {
             Kind::Fn(ps, body) => Ok(closure(None, ps, body, env)),
             Kind::FnNamed(n, ps, body) => Ok(closure(Some(n.clone()), ps, body, env)),
+            Kind::Call(h, args) if h == "array-set!" => self.ev_array_set(args, env),
             Kind::Call(h, args) => self.ev_call(h, args, env),
             Kind::Apply(f, args) => {
                 let f = self.ev(f, env)?;

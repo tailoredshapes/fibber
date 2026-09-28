@@ -34,6 +34,10 @@ pub fn num_labels(e: &Expr, out: &mut Vec<String>) {
             if let Some(Ty::Num(t)) = first {
                 out.push(format!("arithmetic or comparison at {}", t.name()));
             }
+            let cmp = matches!(h.as_str(), "=" | "!=" | "<" | "<=" | ">" | ">=");
+            if cmp && matches!(first, Some(Ty::Derived(_))) {
+                out.push("comparison through derived Eq/Ord".into());
+            }
             if matches!(first, Some(Ty::Int))
                 && matches!(h.as_str(), "/" | "neg" | "shl" | "shr" | "sar")
             {

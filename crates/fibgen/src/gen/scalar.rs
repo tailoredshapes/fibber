@@ -4,8 +4,8 @@ use crate::ast::{Expr, Kind};
 use crate::ty::Ty;
 
 use super::{
-    effects, funcs, gadgets, gadgets2, hooks, mcalls, nums, objects, observe, protos, tasks, vpat,
-    Ctx, Gen,
+    arrays, derive, effects, funcs, gadgets, gadgets2, hooks, mcalls, nums, objects, observe,
+    protos, tasks, vpat, Ctx, Gen,
 };
 
 /// The text of a string literal.
@@ -14,30 +14,34 @@ pub fn literal_text(g: &mut Gen) -> String {
     words[g.rng.below(words.len())].to_string()
 }
 
+/// The weights of the `i64` productions of [`int`], in its order.
+const INT_WEIGHTS: [usize; 21] = [
+    2, // literal
+    4, // arithmetic
+    6, // observe a value of another type
+    2, // call a closure
+    2, // atom update or read
+    2, // weak reference
+    1, // plet
+    1, // pmap
+    1, // immediately applied closure
+    2, // & helper through fresh cells
+    2, // extract from a container
+    1, // for-each accumulating in a cell
+    4, // an ownership template (gadgets)
+    3, // more ownership templates (gadgets2)
+    8, // protocols: method calls, generic helpers, dyn (protos)
+    2, // a vector match whose guards count themselves in a cell
+    1, // a (Hook :send) crossing a thread
+    4, // a macro call
+    5, // arithmetic at another width or on floats, converted
+    2, // arrays: made, read, copied, updated in place
+    2, // values with derived Eq and Ord, compared
+];
+
 /// An `i64` expression: the fold of the program's observable state.
 pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
-    let weights = [
-        2, // literal
-        4, // arithmetic
-        6, // observe a value of another type
-        2, // call a closure
-        2, // atom update or read
-        2, // weak reference
-        1, // plet
-        1, // pmap
-        1, // immediately applied closure
-        2, // & helper through fresh cells
-        2, // extract from a container
-        1, // for-each accumulating in a cell
-        4, // an ownership template (gadgets)
-        3, // more ownership templates (gadgets2)
-        8, // protocols: method calls, generic helpers, dyn (protos)
-        2, // a vector match whose guards count themselves in a cell
-        1, // a (Hook :send) crossing a thread
-        4, // a macro call
-        5, // arithmetic at another width or on floats, converted
-    ];
-    let e = match g.rng.weighted(&weights) {
+    let e = match g.rng.weighted(&INT_WEIGHTS) {
         Some(1) => Some(arith(g, cx, d)),
         Some(2) => {
             let t = g.any_type(cx);
@@ -60,6 +64,8 @@ pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
         Some(16) => Some(hooks::cross(g, cx, d)),
         Some(17) => Some(mcalls::macro_int(g, cx, d)),
         Some(18) => Some(nums::num_int(g, cx, d)),
+        Some(19) => Some(arrays::array_int(g, cx, d)),
+        Some(20) => Some(derive::compare_int(g, cx, d)),
         _ => None,
     };
     e.unwrap_or_else(|| Expr::int(g.small()))

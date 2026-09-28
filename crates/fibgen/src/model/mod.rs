@@ -12,6 +12,7 @@
 //! [`crate::macros::expand`]. The interpreter's result must equal the
 //! model's (rule 4 of the task: differential sanity).
 
+mod arrays;
 mod builtins;
 mod eval;
 mod nums;

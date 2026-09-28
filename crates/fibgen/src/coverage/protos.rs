@@ -24,6 +24,9 @@ pub fn item_labels(p: &Program, out: &mut Vec<String>) {
         if f.params.iter().any(|q| matches!(q.ty, Ty::Gen(_, true))) {
             out.push("generic helper with a written :where bound".into());
         }
+        if crate::print::is_private(&f.name) {
+            out.push("defun :private (used in its own module)".into());
+        }
     }
 }
 

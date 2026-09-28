@@ -6,7 +6,15 @@ use crate::ty::{NumTy, Ty};
 
 use super::{atom, expr, form, list, Sexp};
 
-/// `(defun name (params) [:where ((P a))] -> ret body)`.
+/// Whether the helper `name` is printed `:private` (syntax §5): one in
+/// four, by its number. A single-module program sees no difference; the
+/// marker must merely be accepted where the program uses the name.
+pub fn is_private(name: &str) -> bool {
+    let digits: String = name.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().is_ok_and(|n| n % 4 == 1)
+}
+
+/// `(defun name [:private] (params) [:where ((P a))] -> ret body)`.
 pub fn fundef(f: &FunDef) -> Sexp {
     let mut params = Vec::new();
     let mut bound = None;
@@ -22,7 +30,11 @@ pub fn fundef(f: &FunDef) -> Sexp {
             bound = Some(proto);
         }
     }
-    let mut items = vec![atom("defun"), atom(f.name.clone()), list(params)];
+    let mut items = vec![atom("defun"), atom(f.name.clone())];
+    if is_private(&f.name) {
+        items.push(atom(":private"));
+    }
+    items.push(list(params));
     if let Some(proto) = bound {
         let c = list(vec![atom(proto.name()), atom("a")]);
         items.push(atom(":where"));

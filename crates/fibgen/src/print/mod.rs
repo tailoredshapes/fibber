@@ -5,10 +5,12 @@ use crate::ty::Ty;
 
 mod items;
 
+pub use items::is_private;
+
 use items::{fundef, impl_def, pat};
 
 /// The preamble's declarations: (the names that use them, the text).
-const PREAMBLE: [(&[&str], &str); 9] = [
+const PREAMBLE: [(&[&str], &str); 11] = [
     (&["Pt", "Shape", "Rect", "Circle", "Named"], "(defstruct Pt (x: i64 y: i64))"),
     (&["Wrap", "Shape", "Rect", "Circle", "Named"], "(defstruct Wrap (s: str v: (Vec i64)))"),
     (&["Holder"], "(defstruct Holder (f: (fn (i64) i64) c: (Cell i64)))"),
@@ -24,6 +26,14 @@ const PREAMBLE: [(&[&str], &str); 9] = [
     (
         &["Rank", "rank", "tier"],
         "(defprotocol Rank :requires (Score)\n  (rank (self) -> i64)\n  (tier (self) -> i64 (+ (rank self) (score self))))",
+    ),
+    (
+        &["Ver"],
+        "(defstruct Ver (major: i64 minor: i64))\n(derive Eq Ver)\n(derive Ord Ver)",
+    ),
+    (
+        &["Lvl", "Low", "Mid", "High"],
+        "(defenum Lvl (Low) (Mid n: i64) (High a: i64 b: str))\n(derive Eq Lvl)\n(derive Ord Lvl)",
     ),
     (&["inc1"], "(defun inc1 (x: i64) -> i64 (+ x 1))"),
     (
@@ -244,12 +254,10 @@ pub(crate) fn layout(s: &Sexp, indent: usize) -> String {
     }
     let keep = match items.first() {
         Some(Sexp::Atom(h)) if h == "defun" => {
-            let bounded = matches!(items.get(3), Some(Sexp::Atom(w)) if w == ":where");
-            if bounded {
-                7
-            } else {
-                5
-            }
+            let private = matches!(items.get(2), Some(Sexp::Atom(p)) if p == ":private");
+            let at = 3 + usize::from(private);
+            let bounded = matches!(items.get(at), Some(Sexp::Atom(w)) if w == ":where");
+            5 + usize::from(private) + 2 * usize::from(bounded)
         }
         Some(Sexp::Atom(h)) if h == "impl" => 3,
         Some(Sexp::Atom(h))
@@ -309,7 +317,7 @@ mod tests {
     #[test]
     fn program_includes_only_named_preamble() {
         let f = FunDef {
-            name: "f1".into(),
+            name: "f2".into(),
             params: vec![Param {
                 name: "p".into(),
                 ty: Ty::Pt,
@@ -329,7 +337,7 @@ mod tests {
         };
         let text = program(&p);
         assert!(
-            text.starts_with("(defstruct Pt (x: i64 y: i64))\n\n(defun f1 (p: Pt) -> i64 (. p x))")
+            text.starts_with("(defstruct Pt (x: i64 y: i64))\n\n(defun f2 (p: Pt) -> i64 (. p x))")
         );
         assert!(!text.contains("Wrap"));
     }

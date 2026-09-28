@@ -11,9 +11,11 @@
 //! non-redundant matches (§3.6). Programs are bounded: every loop and
 //! recursion runs a literal number of times, and nothing traps.
 
+mod arrays;
 mod consts;
 mod control;
 mod ctx;
+mod derive;
 mod effects;
 mod funcs;
 mod gadgets;

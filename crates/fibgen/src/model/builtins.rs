@@ -10,7 +10,7 @@ use super::value::{TaskState, V};
 impl Machine<'_> {
     /// Calls the builtin, constructor or prelude function `h`.
     pub(super) fn builtin(&mut self, h: &str, a: Vec<V>) -> Res {
-        if let Some(r) = super::nums::op(h, &a) {
+        if let Some(r) = super::nums::op(h, &a).or_else(|| super::arrays::op(h, &a)) {
             return r;
         }
         match (h, a.as_slice()) {
@@ -23,9 +23,11 @@ impl Machine<'_> {
             ("some", [x]) => Ok(V::Opt(Some(Rc::new(x.clone())))),
             ("cons", [x, V::List(t)]) => Ok(V::List(Rc::new(prepend(x, t)))),
             ("list", items) => Ok(V::List(Rc::new(items.to_vec()))),
-            ("Pt" | "Wrap" | "Holder" | "Box" | "Circle" | "Rect" | "Named" | "Hook", _) => {
-                Ok(V::data(h, a))
-            }
+            (
+                "Pt" | "Wrap" | "Holder" | "Box" | "Circle" | "Rect" | "Named" | "Hook" | "Ver"
+                | "Mid" | "High",
+                _,
+            ) => Ok(V::data(h, a)),
             ("box", [x]) => Ok(V::data("Box", vec![x.clone()])),
             ("unbox", [V::Data(_, f)]) => Ok(f[0].clone()),
             ("cell", [x]) => Ok(V::Cell(Rc::new(RefCell::new(x.clone())))),
@@ -130,6 +132,8 @@ fn compare(h: &str, x: &V, y: &V) -> Result<bool, super::eval::Stop> {
         (V::Int(a), V::Int(b)) => a.cmp(b),
         (V::Bool(a), V::Bool(b)) => a.cmp(b),
         (V::Str(a), V::Str(b)) => a.cmp(b),
+        (V::Data(..), V::Data(..)) => super::arrays::derived_cmp(x, y)
+            .ok_or_else(|| unsupported(format!("compare {x:?} {y:?}")))?,
         _ => return Err(unsupported(format!("compare {x:?} {y:?}"))),
     };
     Ok(match h {

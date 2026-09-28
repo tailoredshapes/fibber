@@ -49,6 +49,11 @@ pub enum Ty {
     Hook(bool),
     /// A number type other than `i64` (types §1.1).
     Num(NumTy),
+    /// `(Array a)` (types §2.13).
+    Array(Box<Ty>),
+    /// A preamble type with derived `Eq` and `Ord`: `Ver` (a struct)
+    /// or `Lvl` (an enum with a field-less variant).
+    Derived(&'static str),
     /// The type variable `a` of a protocol-bounded generic helper; the
     /// flag says whether the bound is written as `:where ((P a))` or
     /// left to inference. Only ever a parameter's type.
@@ -188,6 +193,7 @@ impl Ty {
             | Ty::Cell(t)
             | Ty::Atom(t)
             | Ty::Weak(t)
+            | Ty::Array(t)
             | Ty::Task(t) => Some(t),
             _ => None,
         }
@@ -200,7 +206,9 @@ impl Ty {
         match self {
             Ty::Holder | Ty::Cell(_) | Ty::Func(..) | Ty::Gen(..) => false,
             Ty::Dyn(_, s) | Ty::Hook(s) => *s,
-            Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) | Ty::Weak(t) | Ty::Task(t) => t.is_send(),
+            Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) | Ty::Weak(t) | Ty::Task(t) | Ty::Array(t) => {
+                t.is_send()
+            }
             _ => true,
         }
     }
@@ -213,7 +221,7 @@ impl Ty {
         match self {
             Ty::Holder | Ty::Cell(_) | Ty::Func(..) | Ty::Gen(..) => true,
             Ty::Dyn(_, s) | Ty::Hook(s) => !*s,
-            Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) => t.may_reach_cell(),
+            Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) | Ty::Array(t) => t.may_reach_cell(),
             _ => false,
         }
     }
@@ -268,6 +276,8 @@ impl fmt::Display for Ty {
             Ty::Hook(false) => f.write_str("(Hook :local)"),
             Ty::Gen(..) => f.write_str("a"),
             Ty::Num(n) => f.write_str(n.name()),
+            Ty::Array(t) => write!(f, "(Array {t})"),
+            Ty::Derived(n) => f.write_str(n),
         }
     }
 }
