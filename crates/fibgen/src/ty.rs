@@ -1,0 +1,233 @@
+//! The types the generator builds programs over: a fixed universe of
+//! scalars, the preamble's structs and enum, and the library's generic
+//! types applied to them (spec/types.md §1).
+
+use std::fmt;
+
+/// A fibber type the generator can produce an expression of.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Ty {
+    /// `unit`.
+    Unit,
+    /// `i64`.
+    Int,
+    /// `bool`.
+    Bool,
+    /// `str`.
+    Str,
+    /// `(defstruct Pt (x: i64 y: i64))`.
+    Pt,
+    /// `(defstruct Wrap (s: str v: (Vec i64)))`.
+    Wrap,
+    /// `(defstruct Holder (f: (fn (i64) i64) c: (Cell i64)))`.
+    Holder,
+    /// `(defenum Shape (Circle r: i64) (Rect a: Pt b: Pt) (Named n: str w: Wrap))`.
+    Shape,
+    /// The prelude's `(Box a)`.
+    Boxed(Box<Ty>),
+    /// `(Option a)`.
+    Opt(Box<Ty>),
+    /// The prelude's `(Vec a)`.
+    Vec(Box<Ty>),
+    /// `(List i64)`.
+    List,
+    /// `(Cell a)`.
+    Cell(Box<Ty>),
+    /// `(Atom a)`.
+    Atom(Box<Ty>),
+    /// `(Weak a)`.
+    Weak(Box<Ty>),
+    /// `(Task a)`.
+    Task(Box<Ty>),
+    /// A function type `(fn (params) ret)`: `fn_i()` is `(fn (i64) i64)`,
+    /// `fn_0()` is `(fn () i64)`.
+    Func(Vec<Ty>, Box<Ty>),
+}
+
+impl Ty {
+    /// `(Box t)`.
+    pub fn boxed(t: Ty) -> Ty {
+        Ty::Boxed(Box::new(t))
+    }
+    /// `(Option t)`.
+    pub fn opt(t: Ty) -> Ty {
+        Ty::Opt(Box::new(t))
+    }
+    /// `(Vec t)`.
+    pub fn vec(t: Ty) -> Ty {
+        Ty::Vec(Box::new(t))
+    }
+    /// `(Cell t)`.
+    pub fn cell(t: Ty) -> Ty {
+        Ty::Cell(Box::new(t))
+    }
+    /// `(Atom t)`.
+    pub fn atom(t: Ty) -> Ty {
+        Ty::Atom(Box::new(t))
+    }
+    /// `(Weak t)`.
+    pub fn weak(t: Ty) -> Ty {
+        Ty::Weak(Box::new(t))
+    }
+    /// `(Task t)`.
+    pub fn task(t: Ty) -> Ty {
+        Ty::Task(Box::new(t))
+    }
+
+    /// `(fn (i64) i64)`.
+    pub fn fn_i() -> Ty {
+        Ty::Func(vec![Ty::Int], Box::new(Ty::Int))
+    }
+    /// `(fn () i64)`.
+    pub fn fn_0() -> Ty {
+        Ty::Func(Vec::new(), Box::new(Ty::Int))
+    }
+    /// Whether this is a function type.
+    pub fn is_fn(&self) -> bool {
+        matches!(self, Ty::Func(..))
+    }
+
+    /// The argument of a one-parameter type constructor.
+    pub fn inner(&self) -> Option<&Ty> {
+        match self {
+            Ty::Boxed(t)
+            | Ty::Opt(t)
+            | Ty::Vec(t)
+            | Ty::Cell(t)
+            | Ty::Atom(t)
+            | Ty::Weak(t)
+            | Ty::Task(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Whether values of this type may cross a thread (types §5.1).
+    /// Function types answer false: their colour depends on captures,
+    /// which the generator tracks per variable instead.
+    pub fn is_send(&self) -> bool {
+        match self {
+            Ty::Holder | Ty::Cell(_) | Ty::Func(..) => false,
+            Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) | Ty::Weak(t) | Ty::Task(t) => t.is_send(),
+            _ => true,
+        }
+    }
+
+    /// Whether a value of this type may hold a strong reference to a
+    /// cell (directly, or through a closure's captures). Storing such a
+    /// value in a cell could close a cycle (ownership.md §6), which the
+    /// generator avoids so that every program's audit must be clean.
+    pub fn may_reach_cell(&self) -> bool {
+        match self {
+            Ty::Holder | Ty::Cell(_) | Ty::Func(..) => true,
+            Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) => t.may_reach_cell(),
+            _ => false,
+        }
+    }
+
+    /// Whether the type is an atom.
+    pub fn is_atom(&self) -> bool {
+        matches!(self, Ty::Atom(_))
+    }
+
+    /// Whether `weak` accepts the type (an object type, types §2.11).
+    pub fn is_object(&self) -> bool {
+        !matches!(self, Ty::Unit | Ty::Int | Ty::Bool)
+    }
+}
+
+impl fmt::Display for Ty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Ty::Unit => f.write_str("unit"),
+            Ty::Int => f.write_str("i64"),
+            Ty::Bool => f.write_str("bool"),
+            Ty::Str => f.write_str("str"),
+            Ty::Pt => f.write_str("Pt"),
+            Ty::Wrap => f.write_str("Wrap"),
+            Ty::Holder => f.write_str("Holder"),
+            Ty::Shape => f.write_str("Shape"),
+            Ty::Boxed(t) => write!(f, "(Box {t})"),
+            Ty::Opt(t) => write!(f, "(Option {t})"),
+            Ty::Vec(t) => write!(f, "(Vec {t})"),
+            Ty::List => f.write_str("(List i64)"),
+            Ty::Cell(t) => write!(f, "(Cell {t})"),
+            Ty::Atom(t) => write!(f, "(Atom {t})"),
+            Ty::Weak(t) => write!(f, "(Weak {t})"),
+            Ty::Task(t) => write!(f, "(Task {t})"),
+            Ty::Func(ps, r) => {
+                let ps: Vec<String> = ps.iter().map(|p| p.to_string()).collect();
+                write!(f, "(fn ({}) {r})", ps.join(" "))
+            }
+        }
+    }
+}
+
+/// The types a `let` may bind, a helper may take or return, and a
+/// program folds into its result.
+pub fn universe() -> Vec<Ty> {
+    vec![
+        Ty::Int,
+        Ty::Bool,
+        Ty::Str,
+        Ty::Pt,
+        Ty::Wrap,
+        Ty::Holder,
+        Ty::Shape,
+        Ty::boxed(Ty::Str),
+        Ty::boxed(Ty::vec(Ty::Int)),
+        Ty::boxed(Ty::Wrap),
+        Ty::boxed(Ty::fn_i()),
+        Ty::opt(Ty::Int),
+        Ty::opt(Ty::Str),
+        Ty::opt(Ty::Wrap),
+        Ty::vec(Ty::Int),
+        Ty::vec(Ty::Str),
+        Ty::vec(Ty::Wrap),
+        Ty::vec(Ty::fn_i()),
+        Ty::List,
+        Ty::cell(Ty::Int),
+        Ty::cell(Ty::vec(Ty::Int)),
+        Ty::cell(Ty::Str),
+        Ty::cell(Ty::fn_i()),
+        Ty::cell(Ty::Pt),
+        Ty::cell(Ty::Wrap),
+        Ty::atom(Ty::Int),
+        Ty::atom(Ty::vec(Ty::Int)),
+        Ty::fn_i(),
+        Ty::fn_0(),
+        Ty::task(Ty::Int),
+        Ty::task(Ty::Str),
+    ]
+}
+
+/// The content types an `&` parameter may have.
+pub fn inout_contents() -> Vec<Ty> {
+    vec![Ty::Int, Ty::Str, Ty::vec(Ty::Int), Ty::Pt, Ty::Wrap]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prints_type_syntax() {
+        assert_eq!(Ty::cell(Ty::vec(Ty::Int)).to_string(), "(Cell (Vec i64))");
+        assert_eq!(Ty::boxed(Ty::fn_i()).to_string(), "(Box (fn (i64) i64))");
+    }
+
+    #[test]
+    fn send_follows_types_5_1() {
+        assert!(Ty::vec(Ty::Wrap).is_send());
+        assert!(Ty::atom(Ty::Int).is_send());
+        assert!(!Ty::cell(Ty::Int).is_send());
+        assert!(!Ty::Holder.is_send());
+        assert!(!Ty::boxed(Ty::fn_i()).is_send());
+    }
+
+    #[test]
+    fn cell_reach_is_conservative_for_closures() {
+        assert!(Ty::vec(Ty::fn_i()).may_reach_cell());
+        assert!(!Ty::vec(Ty::Wrap).may_reach_cell());
+        assert!(!Ty::weak(Ty::Wrap).may_reach_cell());
+    }
+}
