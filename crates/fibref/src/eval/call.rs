@@ -1,6 +1,7 @@
 //! Calls (syntax §2, types §6.3, §6.6, §6.10, §8.9): the head and the
 //! arguments left to right, each handed over as its [`Pass`] says right
-//! after it is evaluated; then either an ordinary call (the callee runs,
+//! after it is evaluated, except that the copy-ins of `&` arguments run
+//! at call entry, after the last argument, in parameter order; then either an ordinary call (the callee runs,
 //! then the write-backs, then the call's `after`) or a tail call (the
 //! jump runs, the frame is discarded, the callee's result is the
 //! caller's). [`Interp::invoke`] is the trampoline that makes a chain of
@@ -75,6 +76,7 @@ impl<'p> Interp<'p> {
                 .ok_or_else(|| RunError::gap("no pass for an argument"))?;
             vals.push(self.argument(a, pass)?);
         }
+        self.copy_in(args, &own.args, &mut vals)?;
         let target = self.target(head, own.callee, head_val.as_ref(), &vals)?;
         let placement = Placement::of(self.plan()?.allocs.get(&e.id).copied());
         let jump = Jump {
@@ -115,7 +117,9 @@ impl<'p> Interp<'p> {
         Ok(v)
     }
 
-    /// One argument, handed over as `pass` says.
+    /// One argument, handed over as `pass` says. An `&` argument that
+    /// copies in is left as a placeholder, filled by [`Self::copy_in`]
+    /// at call entry.
     fn argument(&mut self, a: &'p Arg, pass: Pass) -> R<Val> {
         match a {
             Arg::Expr(x) => {
@@ -125,23 +129,40 @@ impl<'p> Interp<'p> {
                 }
                 Ok(v)
             }
+            Arg::Amp(_, _) if pass == Pass::Acquire => Ok(Val::Unit),
             Arg::Amp(b, pos) => self.amp_argument(*b, pass).map_err(|e| e.at(pos)),
         }
     }
 
-    /// `&b` (§6.6): a copy-in into a new private cell, the forwarded
-    /// private cell, or (for a primitive) the variable's own cell.
+    /// `&b` handed over without a copy-in (§6.6): the forwarded private
+    /// cell, or (for a primitive) the variable's own cell.
     fn amp_argument(&mut self, b: BindingId, pass: Pass) -> R<Val> {
-        let cell = self.local(b)?;
         match pass {
-            Pass::Forward | Pass::OwnCell => Ok(cell),
-            Pass::Acquire => {
-                let content = self.slot(cell.expect_obj("an & argument")?)?;
-                // The stack cell's store of the content is the acquire (+1).
-                self.new_slot(Kind::Cell, content, Placement::Stack)
-            }
+            Pass::Forward | Pass::OwnCell => self.local(b),
             other => Err(RunError::gap(format!("an & argument passed as {other:?}"))),
         }
+    }
+
+    /// The copy-ins of a call (§6.6; **Decided**, owner, 2026-09-28): at
+    /// call entry, after every argument has been evaluated, in parameter
+    /// order, each `&x` that acquires gets a new private cell holding
+    /// `@x` as `x` holds it then, so a write to `x` by a later argument
+    /// is seen, exactly as when the cell is forwarded.
+    fn copy_in(&mut self, args: &[Arg], passes: &[Pass], vals: &mut [Val]) -> R<()> {
+        for ((a, pass), v) in args.iter().zip(passes).zip(vals.iter_mut()) {
+            if let (Arg::Amp(b, pos), Pass::Acquire) = (a, pass) {
+                *v = self.private_cell(*b).map_err(|e| e.at(pos))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A new private cell holding the content of `b`'s cell: the stack
+    /// cell's store of the content is the acquire (+1).
+    fn private_cell(&mut self, b: BindingId) -> R<Val> {
+        let cell = self.local(b)?;
+        let content = self.slot(cell.expect_obj("an & argument")?)?;
+        self.new_slot(Kind::Cell, content, Placement::Stack)
     }
 
     /// The write-back of the private cell `cell` into the variable `var`

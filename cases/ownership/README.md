@@ -114,3 +114,14 @@ coverage by guarded clauses only (139), a vector pattern on a `Form`
 (142), a refutable vector pattern in `let` (144), `recur` in a guard
 (145), a clause after `[& r]` (146), vector patterns mixed with `Vec`'s
 own variants (147).
+
+Cases 150 to 153 pin the owner's decision of 2026-09-28 that the copy-in
+of an `&` argument happens at call entry, after all of the call's
+arguments have been evaluated (ownership.md §5; syntax §2, §3.13; types
+§6.6 and the decision record in types §10). They were written before
+fibref implemented it. All accept with a clean audit: the rule-5
+generator's minimised program, whose forwarded cell a later argument
+writes (150); the same call on a `let` cell, which copies in and must
+agree with it (151); a later argument writing the variable through a
+local closure that captures it (152); two `&` arguments with a later
+argument writing the first one's variable (153).

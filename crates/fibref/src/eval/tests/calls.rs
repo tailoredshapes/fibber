@@ -2,6 +2,7 @@
 
 use super::{clean, run};
 use crate::cases::Outcome;
+use crate::heap::{Event, Kind};
 
 #[test]
 fn self_tail_calls_run_in_constant_stack() {
@@ -48,6 +49,90 @@ fn a_forwarded_amp_parameter_keeps_its_private_cell() {
          (defun main () -> i64 (let ((c (cell []))) (do (fill &c 50) (count @c))))",
         50,
     );
+}
+
+/// Types §6.6 (owner, 2026-09-28): the copy-in happens at call entry,
+/// so a later argument's write to the variable is seen by the callee
+/// (6 with a copy-in at the argument's position).
+#[test]
+fn a_copy_in_sees_a_later_arguments_write() {
+    clean(
+        "(defun f (&v: i64 n: i64) -> i64 (+ @v n))
+         (defun main () -> i64 (let ((c (cell 1))) (f &c (do (set! c 10) 5))))",
+        15,
+    );
+}
+
+/// A forwarded cell and a copied-in one see the same writes by the
+/// arguments (cases 150 and 151).
+#[test]
+fn forwarding_and_copy_in_agree_on_the_arguments_writes() {
+    let callee = "(defun put (&v: (Vec i64) n: i64) -> unit (push! &v n))";
+    clean(
+        &format!(
+            "{callee}
+             (defun fwd (&v: (Vec i64)) -> unit (push! &v (do (put &v 4) 0)))
+             (defun main () -> i64 (let ((c (cell []))) (do (fwd &c) (count @c))))"
+        ),
+        2,
+    );
+    clean(
+        &format!(
+            "{callee}
+             (defun main () -> i64
+               (let ((c (cell []))) (do (push! &c (do (put &c 4) 0)) (count @c))))"
+        ),
+        2,
+    );
+}
+
+/// Two `&` arguments: a later argument writes the first one's variable
+/// before either copy-in; the write-backs keep parameter order.
+#[test]
+fn every_copy_in_follows_the_last_argument() {
+    clean(
+        "(defun g (&a: i64 &b: i64 n: i64) -> i64
+           (do (set! b (+ @a n)) (set! a 0) @b))
+         (defun main () -> i64
+           (let ((x (cell 1)) (y (cell 0)))
+             (let ((r (g &x &y (do (set! x 7) 100))))
+               (+ (* 1000 r) (+ (* 10 @x) @y)))))",
+        107_107,
+    );
+}
+
+/// The private cell is made after the arguments: every heap allocation
+/// of the call (here `conj`'s result, an argument) precedes it.
+#[test]
+fn the_private_cell_is_made_after_the_arguments() {
+    let (n, report) = super::traced(
+        "(defun f (&v: i64 s: (Vec i64)) -> i64 (+ @v (count s)))
+         (defun main () -> i64 (let ((c (cell 1))) (f &c (conj (vec-empty) 3))))",
+    );
+    assert_eq!(n, 2);
+    assert!(report.is_clean());
+    let private = report
+        .trace
+        .iter()
+        .rposition(|e| {
+            matches!(
+                e,
+                Event::AllocStack {
+                    kind: Kind::Cell,
+                    ..
+                }
+            )
+        })
+        .expect("a private cell");
+    let heap: Vec<usize> = report
+        .trace
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, Event::Alloc { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!heap.is_empty(), "{:?}", report.trace);
+    assert!(heap.iter().all(|i| *i < private), "{:?}", report.trace);
 }
 
 #[test]

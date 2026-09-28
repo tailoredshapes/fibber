@@ -42,10 +42,12 @@ evaluator over the audited heap.
       `fibgen` generates them and checks each against a model; its
       findings so far are fixed and promoted as cases 96 to 99 (100
       pins annotated bindings): 98 cases, all passing. A sweep of seeds
-      200000..259999 gives 59999 ok and one result mismatch, open as a
-      spec question: an `&` parameter forwarded at a tail call is
-      observably different from a copy-in when a later argument of the
-      same call writes the variable (seed 233285; the model copies in)
+      200000..259999 gave 59999 ok and one result mismatch (seed
+      233285): an `&` parameter forwarded at a tail call was observably
+      different from a copy-in when a later argument of the same call
+      wrote the variable. The owner decided (2026-09-28) that the
+      copy-in happens at call entry, after every argument (types §10);
+      fibref and fibgen's model follow it, and cases 150 to 153 pin it
 - [x] the owner's decisions of 2026-09-28 (spec/types.md §10): lift
       the "v1" restrictions and fix what a trap means; cases 101 to 127:
       125 cases, all passing
@@ -68,6 +70,10 @@ evaluator over the audited heap.
       §1.4, §3.6; types §2.6, §6.3, §8.3, §10). Cases 128 to 149, all
       passing with a clean audit: 147 cases in all. `fibgen` does not
       yet generate either construct
+- [x] the owner's decision of 2026-09-28 on the time of the copy-in:
+      an `&` argument is copied in at call entry, after all of the
+      call's arguments (ownership.md §5; syntax §2, §3.13; types §6.6,
+      §10). Cases 150 to 153: 151 cases in all, all passing
 
 ## M3. Hardened lIR
 
@@ -127,4 +133,7 @@ else in the library:
 
 ## Open decisions
 
-None.
+- A forwarded `&` cell written during the call through a closure that
+  captures the `&` parameter is still observably different from a
+  copied-in one (types §10, "Decided on the time of the copy-in",
+  Open).

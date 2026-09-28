@@ -39,7 +39,9 @@
 //! step's temporaries, the E1 consume of a body and the release of its
 //! owned parameters (after the body expression). A call has a
 //! [`CallOwn`]: each argument is handed over as its [`Pass`] says, right
-//! after it is evaluated; an ordinary call then runs the callee, then
+//! after it is evaluated, except a [`Pass::Acquire`], whose copy-in runs
+//! at call entry, once every argument has been evaluated, in parameter
+//! order (§6.6); an ordinary call then runs the callee, then
 //! the write-backs in [`CallOwn::write_backs`], then `after`; a tail
 //! call ([`Tail::TailCall`]) runs [`CallOwn::jump`], discards the frame
 //! and enters the callee, whose result is the caller's, and nothing
@@ -207,7 +209,8 @@ pub enum Pass {
     /// Retained for the parameter (or the store, or the capture).
     Retain,
     /// `&x` at a call of a `defun`: copy-in acquires `@x` into a new
-    /// private cell (a stack object of the call); a write-back follows.
+    /// private cell (a stack object of the call) at call entry, after
+    /// every argument has been evaluated; a write-back follows.
     Acquire,
     /// `&v` forwarded at a call in tail position: the callee's parameter
     /// is the same private cell; no copy-in, no write-back (§6.6).

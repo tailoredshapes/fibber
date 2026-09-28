@@ -171,8 +171,12 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         "{out}"
     );
     assert!(out.contains("149-element-outlives-its-vector.fib"), "{out}");
-    assert!(out.contains("147 cases:"), "{out}");
-    assert!(out.contains("147 pass, 0 fail, 0 pending"), "{out}");
+    assert!(
+        out.contains("153-two-inout-arguments-one-written-by-argument.fib"),
+        "{out}"
+    );
+    assert!(out.contains("151 cases:"), "{out}");
+    assert!(out.contains("151 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 
