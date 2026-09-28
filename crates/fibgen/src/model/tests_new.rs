@@ -152,3 +152,17 @@ fn methods_dispatch_to_impls_and_defaults() {
     );
     assert_eq!(expected(&prog(impls, main)), Ok(103 + 1005 + 50));
 }
+
+/// `(do (spawn (fn () (rem 1 0))) 0)`: a task whose handle is dropped
+/// still runs (syntax §3.12), so its trap is the program's.
+#[test]
+fn a_discarded_spawn_still_runs_and_its_trap_counts() {
+    let bad = int("rem", vec![Expr::int(1), Expr::int(0)]);
+    let f = Expr::new(Ty::fn_0(), Kind::Fn(Vec::new(), Box::new(bad)));
+    let spawn = Expr::call(Ty::task(Ty::Int), "spawn", vec![f]);
+    let main = Expr::new(Ty::Int, Kind::Do(vec![spawn, Expr::int(0)]));
+    assert_eq!(
+        expected(&prog(Vec::new(), main)),
+        Err(ModelError::Trap("integer rem by zero".into()))
+    );
+}

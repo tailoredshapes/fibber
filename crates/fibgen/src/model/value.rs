@@ -64,8 +64,6 @@ pub struct Closure {
 pub enum TaskState {
     /// Not run yet.
     Pending(Expr, Env),
-    /// A spawned closure, not run yet.
-    Thunk(V),
     /// Finished with this value.
     Done(V),
 }

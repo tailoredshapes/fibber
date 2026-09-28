@@ -340,7 +340,6 @@ impl<'p> Machine<'p> {
         let v = match state {
             TaskState::Done(v) => v,
             TaskState::Pending(body, env) => self.eval(&body, &env)?,
-            TaskState::Thunk(f) => self.apply(&f, Vec::new())?,
         };
         *cell.borrow_mut() = TaskState::Done(v.clone());
         Ok(v)

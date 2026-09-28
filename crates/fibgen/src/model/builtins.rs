@@ -43,7 +43,16 @@ impl Machine<'_> {
                 *c.borrow_mut() = new.clone();
                 Ok(new)
             }
-            ("spawn", [f]) => Ok(task(TaskState::Thunk(f.clone()))),
+            // A spawned closure runs to completion even when its task is
+            // never joined (syntax §3.12). The generator gives it only
+            // sendable captures and no atoms, so no other code can see
+            // when it runs; it runs here, at the spawn, which is one of
+            // the schedules the spec allows and puts its trap, if it
+            // traps, before anything after the spawn.
+            ("spawn", [f]) => {
+                let v = self.apply(f, Vec::new())?;
+                Ok(task(TaskState::Done(v)))
+            }
             ("yield", []) => Ok(task(TaskState::Done(V::Unit))),
             ("join" | "block-on", [t]) => self.force(t),
             ("deref", [x]) => deref(x),
