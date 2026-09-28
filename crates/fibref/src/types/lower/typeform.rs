@@ -95,15 +95,7 @@ fn list_type(
         "dyn" => return dyn_type(g, m, args, form, allow_self),
         _ => {}
     }
-    let colour_at = |i: usize| g.type_name(m, head).is_some_and(|id| g.ty(id).is_colour(i));
-    let anns = args
-        .iter()
-        .enumerate()
-        .map(|(i, a)| match colour_at(i) {
-            true => colour_param_arg(a, head),
-            false => type_ann(g, m, a, allow_self),
-        })
-        .collect::<TResult<Vec<_>>>()?;
+    let anns = arg_anns(g, m, head, args, allow_self)?;
     if let Some(c) = builtin_con(head) {
         let mut anns = anns;
         return match (anns.pop(), anns.is_empty()) {
@@ -126,6 +118,25 @@ fn list_type(
         return Err(TypeError::resolve(&form.pos, msg));
     }
     Ok(TypeAnn::Nominal(id, anns))
+}
+
+/// The arguments of the type constructor `head`: types, or colours at
+/// its colour parameters (§1.3).
+fn arg_anns(
+    g: &Globals,
+    m: ModuleId,
+    head: &str,
+    args: &[Form],
+    allow_self: bool,
+) -> TResult<Vec<TypeAnn>> {
+    let colour_at = |i: usize| g.type_name(m, head).is_some_and(|id| g.ty(id).is_colour(i));
+    args.iter()
+        .enumerate()
+        .map(|(i, a)| match colour_at(i) {
+            true => colour_param_arg(a, head),
+            false => type_ann(g, m, a, allow_self),
+        })
+        .collect()
 }
 
 /// `(fn κ? (A..) R)`.

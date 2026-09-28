@@ -81,12 +81,7 @@ fn list_pattern(
         ));
     };
     let Some(GlobalRef::Ctor(id, variant)) = lw.g.value(lw.m, head) else {
-        let space = crate::types::decls::Space::Value;
-        let msg = match lw.g.private_owner(lw.m, space, head) {
-            Some(_) => lw.g.unknown(lw.m, space, head, ""),
-            None => format!("{head} is not a variant or struct"),
-        };
-        return Err(TypeError::resolve(&items[0].pos, msg));
+        return Err(TypeError::resolve(&items[0].pos, not_a_ctor(lw, head)));
     };
     let arity = match (&lw.g.ty(id).shape, variant) {
         (Shape::Struct(fs), None) => fs.len(),
@@ -131,5 +126,15 @@ fn irrefutable(lw: &Lowerer<'_>, p: &Pattern) -> bool {
             };
             single && subs.iter().all(|s| irrefutable(lw, s))
         }
+    }
+}
+
+/// `V is not a variant or struct`, or `V is private to m` when a private
+/// definition of another module has the name (syntax §5).
+fn not_a_ctor(lw: &Lowerer<'_>, head: &str) -> String {
+    let space = crate::types::decls::Space::Value;
+    match lw.g.private_owner(lw.m, space, head) {
+        Some(_) => lw.g.unknown(lw.m, space, head, ""),
+        None => format!("{head} is not a variant or struct"),
     }
 }
