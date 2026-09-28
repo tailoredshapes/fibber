@@ -1,0 +1,104 @@
+;; fib.rt, strings (types §8.3): a str is the header, the byte length,
+;; then the UTF-8 bytes and a NUL in the same allocation. Every
+;; function allocates exactly where the interpreter's string natives do
+;; (eval/strings.rs).
+(define internal (fib.str-len i64) ((ptr s))
+  (block entry (ret (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3))))))
+
+(define internal (fib.str-bytes-ptr ptr) ((ptr s))
+  (block entry (ret (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0)))))
+
+;; A fresh str of n bytes (type id 0), NUL-terminated; the bytes are
+;; the caller's to fill.
+(define internal (fib.str-new ptr) ((i64 n))
+  (block entry
+    (let ((s (call @fib.alloc (add n (i64 25)) (i32 0))))
+      (store n (getelementptr %struct.fib.str s (i32 0) (i32 3)))
+      (store (i8 0) (getelementptr %struct.fib.str s (i32 0) (i32 4) n))
+      (ret s))))
+
+(define internal (fib.str-cmp i32) ((ptr a) (ptr b))
+  (block entry
+    (let ((na (call @fib.str-len a))
+          (nb (call @fib.str-len b))
+          (n (select (icmp slt na nb) na nb))
+          (c (call @memcmp (call @fib.str-bytes-ptr a) (call @fib.str-bytes-ptr b) n)))
+      (br (icmp ne c (i32 0)) differ prefix)))
+  (block differ (ret c))
+  (block prefix (ret (select (icmp slt na nb) (i32 -1) (select (icmp sgt na nb) (i32 1) (i32 0))))))
+
+(define internal (fib.str-eq i1) ((ptr a) (ptr b))
+  (block entry (ret (icmp eq (call @fib.str-cmp a b) (i32 0)))))
+
+(define internal (fib.str-starts-with i1) ((ptr s) (ptr prefix))
+  (block entry
+    (let ((n (call @fib.str-len s))
+          (m (call @fib.str-len prefix)))
+      (br (icmp sgt m n) no cmp)))
+  (block no (ret (i1 0)))
+  (block cmp (ret (icmp eq (call @memcmp (call @fib.str-bytes-ptr s) (call @fib.str-bytes-ptr prefix) m) (i32 0)))))
+
+(define internal (fib.str-concat ptr) ((ptr a) (ptr b))
+  (block entry
+    (let ((na (call @fib.str-len a))
+          (nb (call @fib.str-len b))
+          (s (call @fib.str-new (add na nb)))
+          (d (call @fib.str-bytes-ptr s)))
+      (call @memcpy d (call @fib.str-bytes-ptr a) na)
+      (call @memcpy (getelementptr i8 d na) (call @fib.str-bytes-ptr b) nb)
+      (ret s))))
+
+;; The interpreter's traps for a bad slice (eval/strings.rs).
+(define internal (fib.str-slice ptr) ((ptr s) (i64 i) (i64 j))
+  (block entry
+    (let ((n (call @fib.str-len s))
+          (bad (or (icmp slt i (i64 0)) (or (icmp sgt i j) (icmp sgt j n)))))
+      (br bad range check-i)))
+  (block range
+    (let ((buf (alloca i8 (i32 96)))
+          (len (call @snprintf buf (i64 96) (string "str-slice [%lld, %lld) out of range 0..%lld") i j n)))
+      (call @fib.trap-bytes buf (sext i64 len))
+      (unreachable)))
+  (block check-i
+    (let ((p (call @fib.str-bytes-ptr s)))
+      (br (call @fib.splits-char p i n) split check-j)))
+  (block check-j (br (call @fib.splits-char p j n) split ok))
+  (block split
+    (let ((buf2 (alloca i8 (i32 96)))
+          (len2 (call @snprintf buf2 (i64 96) (string "str-slice [%lld, %lld) splits a character") i j)))
+      (call @fib.trap-bytes buf2 (sext i64 len2))
+      (unreachable)))
+  (block ok
+    (let ((m (sub j i))
+          (r (call @fib.str-new m)))
+      (call @memcpy (call @fib.str-bytes-ptr r) (getelementptr i8 p i) m)
+      (ret r))))
+
+;; Whether byte k of a string of n bytes is a UTF-8 continuation byte
+;; (10xxxxxx): a boundary there splits a character.
+(define internal (fib.splits-char i1) ((ptr p) (i64 k) (i64 n))
+  (block entry (br (icmp sge k n) no test))
+  (block no (ret (i1 0)))
+  (block test (ret (icmp eq (and (load i8 (getelementptr i8 p k)) (i8 -64)) (i8 -128)))))
+
+;; (str-bytes s): a fresh (Array i8) of the bytes.
+(define internal (fib.str-bytes ptr) ((ptr s) (i32 tid))
+  (block entry
+    (let ((n (call @fib.str-len s))
+          (a (call @fib.array-alloc n tid (i64 1))))
+      (call @memcpy (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)) (call @fib.str-bytes-ptr s) n)
+      (ret a))))
+
+;; (i32->char n): traps unless n is a Unicode scalar value.
+(define internal (fib.i32-to-char i32) ((i32 n))
+  (block entry
+    (let ((neg (icmp slt n (i32 0)))
+          (surrogate (and (icmp sge n (i32 55296)) (icmp sle n (i32 57343))))
+          (big (icmp sgt n (i32 1114111))))
+      (br (or neg (or surrogate big)) bad ok)))
+  (block bad
+    (let ((buf (alloca i8 (i32 96)))
+          (len (call @snprintf buf (i64 96) (string "i32->char of %d, not a Unicode scalar value") n)))
+      (call @fib.trap-bytes buf (sext i64 len))
+      (unreachable)))
+  (block ok (ret n)))

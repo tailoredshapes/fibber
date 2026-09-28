@@ -1,0 +1,206 @@
+;; fib.rt, core (spec/types.md §8.2, spec/compiler.md §3): the object
+;; header, allocation, the count operations, drop, the unique test,
+;; traps, stack objects, and the trace of compiler.md §4.
+;;
+;; The compiler appends the type table @fib.types and the class table
+;; @fib.classes (one byte per type id) to the module this text opens.
+(declare malloc ptr (i64))
+(declare free void (ptr))
+(declare memcpy ptr (ptr ptr i64))
+(declare memcmp i32 (ptr ptr i64))
+(declare write i64 (i32 ptr i64))
+(declare abort void ())
+(declare getenv ptr (ptr))
+(declare strlen i64 (ptr))
+(declare snprintf i32 (ptr i64 ptr ...))
+(defstruct fib.hdr (i64 i32 i32))
+(defstruct fib.typerec (ptr ptr ptr i64))
+;; The prefix every closure object shares: header, code (§8.4).
+(defstruct fib.closure (i64 i32 i32 ptr))
+
+;; Trace mode (compiler.md §4): 1 when FIB_TRACE is set; the next
+;; ordinal; and a buffer for one line.
+(global internal fib.tracing i32 (i32 0))
+(global internal fib.ordinal i64 (i64 0))
+
+(define internal (fib.init void) ()
+  (block entry
+    (let ((v (call @getenv (string "FIB_TRACE"))))
+      (br (icmp eq v (ptr null)) done set)))
+  (block set (store (i32 1) @fib.tracing) (br done))
+  (block done (ret)))
+
+;; One trace line: "K n c\n" or "K n\n" (c = 0: no class).
+(define internal (fib.trace-line void) ((i8 kind) (i64 n) (i8 class))
+  (block entry
+    (let ((buf (alloca i8 (i32 64))))
+      (br (icmp eq class (i8 0)) short long)))
+  (block long
+    (let ((len (call @snprintf buf (i64 64) (string "%c %lld %c\n") (zext i32 kind) n (zext i32 class))))
+      (call @write (i32 2) buf (sext i64 len))
+      (ret)))
+  (block short
+    (let ((len2 (call @snprintf buf (i64 64) (string "%c %lld\n") (zext i32 kind) n)))
+      (call @write (i32 2) buf (sext i64 len2))
+      (ret))))
+
+(define internal (fib.next-ordinal i64) ()
+  (block entry (ret (add (atomicrmw add monotonic @fib.ordinal (i64 1)) (i64 1)))))
+
+(define internal (fib.class i8) ((i32 tid))
+  (block entry (ret (load i8 (getelementptr i8 @fib.classes (zext i64 tid))))))
+
+;; §8.2: malloc; count 1, tid, flags 0. In trace mode 16 bytes in
+;; front hold the ordinal (compiler.md §4).
+(define internal (fib.alloc ptr) ((i64 size) (i32 tid))
+  (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain))
+  (block plain
+    (let ((p (call @malloc size)))
+      (call @fib.init-hdr p tid (i32 0))
+      (ret p)))
+  (block traced
+    (let ((q (call @malloc (add size (i64 16))))
+          (n (call @fib.next-ordinal))
+          (p2 (getelementptr i8 q (i64 16))))
+      (store n q)
+      (call @fib.init-hdr p2 tid (i32 0))
+      (call @fib.trace-line (i8 65) n (call @fib.class tid))
+      (ret p2))))
+
+(define internal (fib.init-hdr void) ((ptr p) (i32 tid) (i32 flags))
+  (block entry
+    (store (select (icmp eq flags (i32 0)) (i64 1) (i64 0)) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
+    (store tid (getelementptr %struct.fib.hdr p (i32 0) (i32 1)))
+    (store flags (getelementptr %struct.fib.hdr p (i32 0) (i32 2)))
+    (ret)))
+
+;; A STACK object's header (§8.2, §6.11): count 0, flags STACK; in
+;; trace mode the ordinal in the count word (compiler.md §4).
+(define internal (fib.stack-init void) ((ptr p) (i32 tid))
+  (block entry
+    (call @fib.init-hdr p tid (i32 4))
+    (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
+  (block traced
+    (let ((n (call @fib.next-ordinal)))
+      (store n (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
+      (call @fib.trace-line (i8 83) n (call @fib.class tid))
+      (br done)))
+  (block done (ret)))
+
+(define internal (fib.stack-end void) ((ptr p))
+  (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
+  (block traced
+    (call @fib.trace-line (i8 68) (load i64 (getelementptr %struct.fib.hdr p (i32 0) (i32 0))) (i8 0))
+    (br done))
+  (block done (ret)))
+
+(define internal (fib.flags i32) ((ptr p))
+  (block entry (ret (atomic-load monotonic i32 (getelementptr %struct.fib.hdr p (i32 0) (i32 2))))))
+
+(define internal (fib.tid i32) ((ptr p))
+  (block entry (ret (load i32 (getelementptr %struct.fib.hdr p (i32 0) (i32 1))))))
+
+(define internal (fib.retain void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done check))
+  (block check
+    (let ((f (call @fib.flags p)))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
+  (block counted
+    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
+      (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
+  (block shared (atomicrmw add monotonic cp (i64 1)) (br done))
+  (block local (store (add (load i64 cp) (i64 1)) cp) (br done))
+  (block done (ret)))
+
+(define internal (fib.release void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done check))
+  (block check
+    (let ((f (call @fib.flags p)))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
+  (block counted
+    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
+      (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
+  (block shared
+    (let ((old (atomicrmw sub acq_rel cp (i64 1))))
+      (br (icmp eq old (i64 1)) drop done)))
+  (block local
+    (let ((c (load i64 cp)))
+      (br (icmp eq c (i64 1)) drop dec)))
+  (block dec (store (sub c (i64 1)) cp) (br done))
+  (block drop (call @fib.drop p) (br done))
+  (block done (ret)))
+
+;; §8.2: weak-clear if flagged, the type's drop (releases children),
+;; then free — from 16 bytes before the object in trace mode.
+(define internal (fib.drop void) ((ptr p))
+  (block entry
+    (let ((f (call @fib.flags p)))
+      (br (icmp ne (and f (i32 2)) (i32 0)) weak children)))
+  (block weak (call @fib.weak-clear p) (br children))
+  (block children
+    (let ((tid (call @fib.tid p))
+          (rec (getelementptr %struct.fib.typerec @fib.types tid (i32 0))))
+      (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain)))
+  (block plain
+    (indirect-call (load ptr rec) (fn void (ptr)) p)
+    (call @free p)
+    (ret))
+  (block traced
+    ;; The free is traced before the children's releases, as the
+    ;; interpreter's trace orders them (heap/event.rs: Free, then the
+    ;; releases of what the object held).
+    (let ((q (getelementptr i8 p (i64 -16))))
+      (call @fib.trace-line (i8 70) (load i64 q) (i8 0))
+      (indirect-call (load ptr rec) (fn void (ptr)) p)
+      (call @free q)
+      (ret))))
+
+;; §8.2: neither SHARED, IMMORTAL, STACK nor HAS-WEAK, and count 1.
+(define internal (fib.unique? i1) ((ptr p))
+  (block entry
+    (let ((f (call @fib.flags p)))
+      (br (icmp ne (and f (i32 15)) (i32 0)) no test)))
+  (block no (ret (i1 0)))
+  (block test (ret (icmp eq (load i64 (getelementptr %struct.fib.hdr p (i32 0) (i32 0))) (i64 1)))))
+
+;; The size of an object: its type's record.
+(define internal (fib.size-of i64) ((i32 tid))
+  (block entry
+    (ret (load i64 (getelementptr %struct.fib.typerec @fib.types tid (i32 3))))))
+
+;; §8.12, §2.11: "trap: MESSAGE\n" to fd 2, then abort.
+(define internal (fib.trap-bytes void) ((ptr bytes) (i64 n))
+  (block entry
+    (call @write (i32 2) (string "trap: ") (i64 6))
+    (call @write (i32 2) bytes n)
+    (call @write (i32 2) (string "\n") (i64 1))
+    (call @abort)
+    (unreachable)))
+
+(define internal (fib.trap-c void) ((ptr msg))
+  (block entry
+    (call @fib.trap-bytes msg (call @strlen msg))
+    (unreachable)))
+
+(define internal (fib.trap void) ((ptr s))
+  (block entry
+    (call @fib.trap-bytes (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0))
+      (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3))))
+    (unreachable)))
+
+;; A fresh object of the same type with the bytes after the header
+;; copied (§8.3: a changed copy for a unique write that cannot be in
+;; place); the caller retains the children and replaces the field.
+(define internal (fib.copy-object ptr) ((ptr p) (i64 size) (i32 tid))
+  (block entry
+    (let ((q (call @fib.alloc size tid)))
+      (call @memcpy (getelementptr i8 q (i64 16)) (getelementptr i8 p (i64 16)) (sub size (i64 16)))
+      (ret q))))
+
+;; The interpreter's message for an index out of range (eval/arrays.rs).
+(define internal (fib.trap-index void) ((i64 i) (i64 n))
+  (block entry
+    (let ((buf (alloca i8 (i32 96)))
+          (len (call @snprintf buf (i64 96) (string "array index %lld out of range 0..%lld") i n)))
+      (call @fib.trap-bytes buf (sext i64 len))
+      (unreachable))))
