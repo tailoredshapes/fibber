@@ -5,12 +5,16 @@
 //! spec fixes for the constructs the generator emits: strict left-to-right
 //! evaluation (syntax §2), copy-in/copy-out `&` with write-backs in
 //! parameter order (§3.13), cells shared by reference, atoms replaced by
-//! `swap!`/`reset!`, lazily run `async` tasks, and wrapping integer
-//! arithmetic (types §2.12). The interpreter's result must equal the
+//! `swap!`/`reset!`, lazily run `async` tasks, integer arithmetic that
+//! traps on overflow at every width and IEEE floats (types §2.12),
+//! protocol dispatch with defaults (types §4), vector patterns and
+//! guards (syntax §3.6), and macro calls expanded by
+//! [`crate::macros::expand`]. The interpreter's result must equal the
 //! model's (rule 4 of the task: differential sanity).
 
 mod builtins;
 mod eval;
+mod nums;
 mod patterns;
 mod protos;
 mod value;

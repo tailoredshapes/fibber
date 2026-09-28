@@ -4,7 +4,10 @@
 //! requires without the interpreter.
 
 use crate::macros::Mac;
-use crate::ty::{Proto, Ty};
+use crate::ty::{NumTy, Proto, Ty};
+
+/// The target type of a conversion: `i64` or another number type.
+pub type NumOrInt = Option<NumTy>;
 
 /// A typed expression.
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +84,12 @@ pub enum Kind {
     GMatch(Box<Expr>, Vec<Clause>),
     /// `(m arg ...)`: a call of a preamble macro (syntax §3.16).
     Macro(Mac, Vec<Expr>),
+    /// An integer literal of a width other than `i64`: `5i8`.
+    IntW(i64, NumTy),
+    /// A float literal: `2.5`, `0.25f32`.
+    Flt(f64, NumTy),
+    /// `(op T e)`: a conversion (types §2.12), the target type first.
+    Conv(String, NumOrInt, Box<Expr>),
 }
 
 /// A clause of a [`Kind::GMatch`].
@@ -256,6 +265,7 @@ impl Expr {
                 [s.as_ref()].into_iter().chain(parts).collect()
             }
             Kind::Dyn(_, _, e)
+            | Kind::Conv(_, _, e)
             | Kind::Fn(_, e)
             | Kind::FnNamed(_, _, e)
             | Kind::Field(e, _)
@@ -305,6 +315,7 @@ impl Expr {
             Kind::Set(a, b) => vec![a, b],
             Kind::GMatch(s, cl) => clause_parts_mut(s, cl),
             Kind::Dyn(_, _, e)
+            | Kind::Conv(_, _, e)
             | Kind::Fn(_, e)
             | Kind::FnNamed(_, _, e)
             | Kind::Field(e, _)

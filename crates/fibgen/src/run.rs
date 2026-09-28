@@ -45,6 +45,10 @@ pub fn run_with_limit(source: &str, limit: Duration) -> Observed {
 pub enum Class {
     /// Accepted, ran, clean audit, the model's result.
     Ok,
+    /// Accepted and trapped with the message the model predicts (an
+    /// operation left unguarded on purpose, types §2.12), no audit error
+    /// before the trap.
+    ExpectedTrap,
     /// Accepted and ran, but the audit is not clean. FINDING.
     AuditFailure,
     /// Accepted and ran clean, but the result differs from the model's. FINDING.
@@ -79,6 +83,7 @@ impl Class {
     pub fn label(self) -> &'static str {
         match self {
             Class::Ok => "ok",
+            Class::ExpectedTrap => "ok (trapped as the model predicts)",
             Class::AuditFailure => "FINDING audit-failure",
             Class::Mismatch => "FINDING result-mismatch",
             Class::RunFailed => "FINDING run-failed",
@@ -127,10 +132,16 @@ pub fn classify(obs: &Observed, expected: &Result<i64, ModelError>) -> Verdict {
         Outcome::Failed { message } if message.contains("evaluator panicked") => {
             v(Class::Panic, "panic".into(), message.clone())
         }
-        // A trap the model predicts is the generator's (it means to make
-        // programs that do not trap), not the interpreter's.
-        Outcome::Trapped { message, .. } if matches!(expected, Err(ModelError::Trap(m)) if message.contains(&format!("trap: {m}"))) => {
-            v(Class::ModelGap, format!("{expected:?}"), message.clone())
+        // A trap the model predicts, with its message: what the spec
+        // requires (method.md rule 3, `trap`), if nothing went wrong in
+        // the heap before it.
+        Outcome::Trapped { message, errors } if predicted(expected, message) => {
+            if errors.is_empty() {
+                v(Class::ExpectedTrap, normalise(message), message.clone())
+            } else {
+                let key = format!("audit before a trap: {}", normalise(&errors.join("; ")));
+                v(Class::AuditFailure, key, format!("{message}; {errors:?}"))
+            }
         }
         Outcome::Failed { message } | Outcome::Trapped { message, .. } => {
             v(Class::RunFailed, normalise(message), message.clone())
@@ -151,6 +162,11 @@ pub fn classify(obs: &Observed, expected: &Result<i64, ModelError>) -> Verdict {
             }
         }
     }
+}
+
+/// Whether the model predicts the trap `message` reports.
+fn predicted(expected: &Result<i64, ModelError>, message: &str) -> bool {
+    matches!(expected, Err(ModelError::Trap(m)) if message.contains(&format!("trap: {m}")))
 }
 
 fn audit_key(a: &AuditSummary) -> String {
@@ -236,7 +252,7 @@ mod tests {
             message: "<gen>:1:2: trap: integer overflow in * at i64".into(),
             errors: Vec::new(),
         });
-        assert_eq!(classify(&trapped, &overflow).class, Class::ModelGap);
+        assert_eq!(classify(&trapped, &overflow).class, Class::ExpectedTrap);
         let other = Err(ModelError::Trap("integer rem by zero".into()));
         assert_eq!(classify(&trapped, &other).class, Class::RunFailed);
     }

@@ -46,7 +46,7 @@ pub fn smallest(ty: &Ty) -> Expr {
         Ty::Atom(t) => call("atom", vec![smallest(t)]),
         Ty::Task(t) => e(Kind::Async(Box::new(smallest(t)))),
         Ty::Weak(t) => e(Kind::WeakDead("dead".into(), Box::new(smallest(t)))),
-        Ty::Dyn(..) | Ty::Hook(_) | Ty::Gen(..) => smallest_new(ty),
+        Ty::Dyn(..) | Ty::Hook(_) | Ty::Gen(..) | Ty::Num(_) => smallest_new(ty),
         Ty::Func(ps, r) => {
             let params = ps
                 .iter()
@@ -73,6 +73,8 @@ fn smallest_new(ty: &Ty) -> Expr {
                 Expr::int(0),
             ],
         ),
+        Ty::Num(t) if t.is_float() => Expr::new(ty.clone(), Kind::Flt(0.0, *t)),
+        Ty::Num(t) => Expr::new(ty.clone(), Kind::IntW(0, *t)),
         // Only a parameter has a `Gen` type; no node is replaced by it.
         _ => Expr::new(ty.clone(), Kind::Unit),
     }
@@ -82,6 +84,7 @@ fn is_smallest(e: &Expr) -> bool {
     matches!(
         e.kind,
         Kind::Int(0)
+            | Kind::IntW(0, _)
             | Kind::Bool(false)
             | Kind::Unit
             | Kind::Nil
@@ -89,6 +92,7 @@ fn is_smallest(e: &Expr) -> bool {
             | Kind::Var(_)
             | Kind::Global(_)
     ) || matches!(&e.kind, Kind::Str(s) if s.is_empty())
+        || matches!(&e.kind, Kind::Flt(x, _) if *x == 0.0)
         || matches!(&e.kind, Kind::VecLit(v) if v.is_empty())
 }
 

@@ -53,6 +53,12 @@ impl Machine<'_> {
             }
             Kind::GMatch(s, cl) => self.ev_gmatch(s, cl, env),
             Kind::Macro(m, args) => self.ev(&crate::macros::expand(*m, args, &e.ty), env),
+            Kind::IntW(n, t) => Ok(V::IntW(*n, *t)),
+            Kind::Flt(x, t) => Ok(V::Flt(*x, *t)),
+            Kind::Conv(op, to, x) => {
+                let v = self.ev(x, env)?;
+                super::nums::convert(op, *to, &v)
+            }
             other => Err(unsupported(format!("node {other:?}"))),
         }
     }

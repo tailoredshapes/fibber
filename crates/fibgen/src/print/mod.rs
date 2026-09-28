@@ -180,7 +180,12 @@ fn expr_more(e: &Expr) -> Sexp {
         Kind::Async(b) => list(vec![atom("async"), expr(b)]),
         Kind::Await(t) => list(vec![atom("await"), expr(t)]),
         Kind::Plet(bs, b) => form("plet", [name_binds(bs), expr(b)]),
-        Kind::Dyn(..) | Kind::GMatch(..) | Kind::Macro(..) => items::expr_new(e),
+        Kind::Dyn(..)
+        | Kind::GMatch(..)
+        | Kind::Macro(..)
+        | Kind::IntW(..)
+        | Kind::Flt(..)
+        | Kind::Conv(..) => items::expr_new(e),
         Kind::WeakDead(n, t) => {
             let bind = list(vec![list(vec![atom(n.clone()), expr(t)])]);
             list(vec![

@@ -1,5 +1,6 @@
 //! Which constructs the generated programs exercised, and how often.
 
+mod more;
 mod protos;
 
 use std::collections::{BTreeMap, BTreeSet};

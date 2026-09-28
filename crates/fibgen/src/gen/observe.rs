@@ -4,7 +4,7 @@
 use crate::ast::{Expr, Kind, Pat};
 use crate::ty::Ty;
 
-use super::{hooks, objects, protos, Ctx, Gen, Var, VarKind};
+use super::{hooks, nums, objects, protos, Ctx, Gen, Var, VarKind};
 
 /// An `i64` expression that evaluates `e` once and folds its value.
 pub fn observe(g: &mut Gen, cx: &Ctx, e: Expr, d: u32) -> Expr {
@@ -39,6 +39,7 @@ pub fn observe(g: &mut Gen, cx: &Ctx, e: Expr, d: u32) -> Expr {
         }
         Ty::Dyn(p, _) | Ty::Gen(p, _) => protos::call_method(g, cx, e, *p, d),
         Ty::Hook(_) => hooks::observe_hook(g, e),
+        Ty::Num(_) => nums::to_i64(g, e),
     }
 }
 

@@ -47,10 +47,55 @@ pub enum Ty {
     /// `(defstruct (Hook k :colour) (f: (fn k (i64) i64) tag: i64))` at
     /// `:send` (flag set) or `:local` (types §1.3).
     Hook(bool),
+    /// A number type other than `i64` (types §1.1).
+    Num(NumTy),
     /// The type variable `a` of a protocol-bounded generic helper; the
     /// flag says whether the bound is written as `:where ((P a))` or
     /// left to inference. Only ever a parameter's type.
     Gen(Proto, bool),
+}
+
+/// The integer widths other than `i64`, and the float types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumTy {
+    /// `i8`.
+    I8,
+    /// `i16`.
+    I16,
+    /// `i32`.
+    I32,
+    /// `f32`.
+    F32,
+    /// `f64`.
+    F64,
+}
+
+impl NumTy {
+    /// The type's name, also a literal's suffix.
+    pub fn name(self) -> &'static str {
+        match self {
+            NumTy::I8 => "i8",
+            NumTy::I16 => "i16",
+            NumTy::I32 => "i32",
+            NumTy::F32 => "f32",
+            NumTy::F64 => "f64",
+        }
+    }
+
+    /// The width in bits.
+    pub fn bits(self) -> u32 {
+        match self {
+            NumTy::I8 => 8,
+            NumTy::I16 => 16,
+            NumTy::I32 | NumTy::F32 => 32,
+            NumTy::F64 => 64,
+        }
+    }
+
+    /// Whether it is a float type.
+    pub fn is_float(self) -> bool {
+        matches!(self, NumTy::F32 | NumTy::F64)
+    }
 }
 
 /// The preamble's protocols (syntax §3.10): `Score` has a default
@@ -190,7 +235,7 @@ impl Ty {
 
     /// Whether `weak` accepts the type (an object type, types §2.11).
     pub fn is_object(&self) -> bool {
-        !matches!(self, Ty::Unit | Ty::Int | Ty::Bool)
+        !matches!(self, Ty::Unit | Ty::Int | Ty::Bool | Ty::Num(_))
     }
 }
 
@@ -222,6 +267,7 @@ impl fmt::Display for Ty {
             Ty::Hook(true) => f.write_str("(Hook :send)"),
             Ty::Hook(false) => f.write_str("(Hook :local)"),
             Ty::Gen(..) => f.write_str("a"),
+            Ty::Num(n) => f.write_str(n.name()),
         }
     }
 }

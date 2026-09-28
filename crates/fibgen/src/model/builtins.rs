@@ -10,6 +10,9 @@ use super::value::{TaskState, V};
 impl Machine<'_> {
     /// Calls the builtin, constructor or prelude function `h`.
     pub(super) fn builtin(&mut self, h: &str, a: Vec<V>) -> Res {
+        if let Some(r) = super::nums::op(h, &a) {
+            return r;
+        }
         match (h, a.as_slice()) {
             ("+" | "-" | "*" | "rem", [V::Int(x), V::Int(y)]) => arith(h, *x, *y),
             ("=" | "<" | "<=" | ">" | ">=" | "!=", [x, y]) => Ok(V::Bool(compare(h, x, y)?)),

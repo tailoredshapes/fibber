@@ -2,7 +2,7 @@
 //! protocol forms: patterns, guarded `match`, `dyn`.
 
 use crate::ast::{Clause, Expr, FunDef, ImplDef, Kind, Pat, Rest};
-use crate::ty::Ty;
+use crate::ty::{NumTy, Ty};
 
 use super::{atom, expr, form, list, Sexp};
 
@@ -70,6 +70,13 @@ pub fn expr_new(e: &Expr) -> Sexp {
         }
         Kind::GMatch(s, cl) => form("match", [expr(s)].into_iter().chain(cl.iter().map(clause))),
         Kind::Macro(m, args) => form(m.name(), args.iter().map(expr)),
+        Kind::IntW(n, t) => atom(format!("{n}{}", t.name())),
+        Kind::Flt(x, NumTy::F32) => atom(format!("{:?}f32", *x as f32)),
+        Kind::Flt(x, _) => atom(format!("{x:?}")),
+        Kind::Conv(op, to, x) => {
+            let t = to.map_or("i64", |t| t.name());
+            list(vec![atom(op.clone()), atom(t), expr(x)])
+        }
         _ => atom("<unprintable>"),
     }
 }

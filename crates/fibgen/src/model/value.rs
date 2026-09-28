@@ -16,6 +16,10 @@ pub enum V {
     Unit,
     /// An integer.
     Int(i64),
+    /// An integer of a width other than `i64`, sign-extended.
+    IntW(i64, crate::ty::NumTy),
+    /// A float (an `f32` held exactly as an `f64`).
+    Flt(f64, crate::ty::NumTy),
     /// A boolean.
     Bool(bool),
     /// A string.
