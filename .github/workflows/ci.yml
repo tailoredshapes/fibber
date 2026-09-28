@@ -8,7 +8,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  # The interpreter, the generator and lIR's checker: no LLVM, so this
+  # job stays fast and is the one to watch.
+  fibref:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,29 +21,63 @@ jobs:
           rustup default stable
           rustup component add rustfmt clippy
 
-      # lair links LLVM 21 through llvm-sys (crates/lair). apt.llvm.org's
-      # packages provide the static libraries; llvm-sys also needs Polly's
-      # and zstd's development files. This step has not yet run on GitHub.
-      - name: Install LLVM 21
-        run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
-          sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
-          echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fibref
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy -p fibref -p fibgen -p lir --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test -p fibref -p fibgen -p lir
 
       # Pending cases exit 0 and are listed; a Fail, a bad header or a
       # run that found no cases exits 1 and must fail the build.
       - name: Ownership cases
         run: cargo run -p fibref -- cases cases/ownership
 
-      # Every lIR case through the JIT and through AOT (spec/lir.md §13).
-      - name: lIR cases
-        run: cargo run -p lair -- cases cases/lir
+  # lair links LLVM 21 statically through llvm-sys (crates/lair), which
+  # takes minutes per link, so it is a job of its own.
+  lair:
+    runs-on: ubuntu-latest
+    env:
+      LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain with clippy
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+
+      # apt.llvm.org's llvm.sh installs LLVM 21's tools and adds the
+      # repository; llvm-sys then needs the development package (for
+      # llvm-config and the static archives), Polly's archives, which
+      # `llvm-config --libs` lists, and the system libraries
+      # `llvm-config --system-libs --link-static` lists: zlib, zstd
+      # (as /usr/lib/x86_64-linux-gnu/libzstd.a) and libxml2.
+      - name: Install LLVM 21
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
+          /usr/lib/llvm-21/bin/llvm-config --version
+          /usr/lib/llvm-21/bin/llvm-config --system-libs --link-static
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: lair
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # cargo test -p lair runs every lIR case through the JIT and AOT
+      # (crates/lair/tests/cases.rs, spec/lir.md §13) and the JIT's
+      # library tests, the macro mechanism among them.
+      - name: Test
+        run: cargo test -p lair
