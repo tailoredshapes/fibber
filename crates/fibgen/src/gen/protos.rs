@@ -31,12 +31,34 @@ pub fn impls(g: &mut Gen) -> Vec<ImplDef> {
         if !g.rng.chance(55) {
             continue;
         }
-        out.push(one_impl(g, Proto::Score, t.clone()));
+        let score = one_impl(g, Proto::Score, t.clone());
+        let score_covers_all = score.colour_var;
+        out.push(score);
         if g.rng.chance(45) {
-            out.push(one_impl(g, Proto::Rank, t));
+            let mut rank = one_impl(g, Proto::Rank, t);
+            // An impl for (Hook k) needs its supertrait's for (Hook k)
+            // too (types §4.1 rule 1).
+            rank.colour_var &= score_covers_all;
+            out.push(rank);
         }
     }
     out
+}
+
+/// Whether `body` uses `self` other than as the receiver of `.`: passes
+/// it, binds it, matches on it or joins it with another value, all at
+/// the generator's view of it, a `(Hook :local)`. Such a body is legal
+/// only under a `(Hook :local)` head: in `(impl P (Hook k) ..)`, `self`
+/// is a `(Hook k)` with `k` rigid (types §1.3). A field read is legal
+/// under both, since a `k` closure may go wherever a local one may.
+pub fn self_as_value(body: &Expr) -> bool {
+    let (mut uses, mut fields) = (0, 0);
+    body.walk(&mut |e| match &e.kind {
+        Kind::Var(n) if n == "self" => uses += 1,
+        Kind::Field(s, _) if matches!(&s.kind, Kind::Var(n) if n == "self") => fields += 1,
+        _ => {}
+    });
+    uses > fields
 }
 
 /// One `impl`: the required method, and the defaulted one sometimes.
@@ -49,10 +71,13 @@ fn one_impl(g: &mut Gen, proto: Proto, target: Ty) -> ImplDef {
     if g.rng.chance(50) {
         methods.push(method(g, &target, dflt, dflt == "bonus"));
     }
+    let colour_var =
+        matches!(target, Ty::Hook(_)) && !methods.iter().any(|m| self_as_value(&m.body));
     ImplDef {
         proto,
         target,
         methods,
+        colour_var,
     }
 }
 
@@ -82,19 +107,20 @@ pub fn supports(g: &Gen, t: &Ty) -> Option<Proto> {
     match t {
         Ty::Dyn(p, _) | Ty::Gen(p, _) => Some(*p),
         _ => {
-            let has = |p: Proto| {
-                g.impls
-                    .iter()
-                    .any(|i| i.proto == p && same_head(&i.target, t))
-            };
+            let has = |p: Proto| g.impls.iter().any(|i| i.proto == p && covers(i, t));
             [Proto::Rank, Proto::Score].into_iter().find(|p| has(*p))
         }
     }
 }
 
-/// Whether an `impl` for `target` covers values of `t`.
-fn same_head(target: &Ty, t: &Ty) -> bool {
-    matches!((target, t), (Ty::Hook(_), Ty::Hook(_))) || target == t
+/// Whether the `impl` `i` covers values of `t`: one for `(Hook k)`
+/// covers both colours, one for `(Hook :local)` only local hooks (types
+/// §1.3, §4.1).
+fn covers(i: &ImplDef, t: &Ty) -> bool {
+    match (&i.target, t) {
+        (Ty::Hook(_), Ty::Hook(send)) => i.colour_var || !send,
+        (target, t) => target == t,
+    }
 }
 
 /// The concrete types with an `impl` of (something entailing) `p`,

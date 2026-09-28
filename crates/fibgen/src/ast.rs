@@ -163,6 +163,11 @@ pub struct ImplDef {
     pub target: Ty,
     /// The methods given.
     pub methods: Vec<Method>,
+    /// For a `Hook` target: whether the head gives the colour parameter
+    /// a variable, `(Hook k)`, rigid in the bodies and covering both
+    /// colours, rather than `(Hook :local)` (types §1.3). Unused for
+    /// other targets.
+    pub colour_var: bool,
 }
 
 /// A top-level parameter.

@@ -44,12 +44,14 @@ pub fn fundef(f: &FunDef) -> Sexp {
     list(items)
 }
 
-/// The head of an `impl`'s type: `Pt`, or `(Hook k)` for the colour-
-/// parameterised struct (types §1.3: the colour is a name in the head).
-fn impl_head(t: &Ty) -> Sexp {
-    match t {
-        Ty::Hook(_) => list(vec![atom("Hook"), atom("k")]),
-        t => atom(t.to_string()),
+/// The head of an `impl`'s type: `Pt`, or for the colour-
+/// parameterised struct `(Hook k)`, `k` rigid in the bodies, or `(Hook
+/// :local)` (types §1.3).
+fn impl_head(i: &ImplDef) -> Sexp {
+    match (&i.target, i.colour_var) {
+        (Ty::Hook(_), true) => list(vec![atom("Hook"), atom("k")]),
+        (Ty::Hook(_), false) => list(vec![atom("Hook"), atom(":local")]),
+        (t, _) => atom(t.to_string()),
     }
 }
 
@@ -63,7 +65,7 @@ pub fn impl_def(i: &ImplDef) -> Sexp {
     });
     form(
         "impl",
-        [atom(i.proto.name()), impl_head(&i.target)]
+        [atom(i.proto.name()), impl_head(i)]
             .into_iter()
             .chain(methods),
     )
@@ -171,10 +173,19 @@ mod tests {
                 params: Vec::new(),
                 body: Expr::int(2),
             }],
+            colour_var: true,
         };
         assert_eq!(
             layout(&impl_def(&i), 0),
             "(impl Score (Hook k) (score (self) 2))"
+        );
+        let local = ImplDef {
+            colour_var: false,
+            ..i
+        };
+        assert_eq!(
+            layout(&impl_def(&local), 0),
+            "(impl Score (Hook :local) (score (self) 2))"
         );
     }
 }

@@ -45,3 +45,27 @@ fn larger_sizes_make_larger_programs() {
     let large: usize = (0..50).map(|s| generate(s, 6).size()).sum();
     assert!(large > small, "{large} <= {small}");
 }
+
+/// An impl on `(Hook k)` never uses `self` as a value, which is legal
+/// only under a `(Hook :local)` head, and a `Rank` impl for `(Hook k)`
+/// has a `Score` impl for `(Hook k)` (types §1.3, §4.1 rule 1).
+#[test]
+fn rigid_hook_impls_read_self_only_through_fields() {
+    for seed in 0..400 {
+        let p = generate(seed, 1 + (seed % 6) as u32);
+        let hooks: Vec<&ImplDef> = p
+            .impls
+            .iter()
+            .filter(|i| matches!(i.target, Ty::Hook(_)))
+            .collect();
+        for i in &hooks {
+            if i.colour_var {
+                assert!(!i.methods.iter().any(|m| self_as_value(&m.body)));
+            }
+        }
+        let rigid = |q: crate::ty::Proto| hooks.iter().any(|i| i.proto == q && i.colour_var);
+        if rigid(crate::ty::Proto::Rank) {
+            assert!(rigid(crate::ty::Proto::Score), "seed {seed}");
+        }
+    }
+}

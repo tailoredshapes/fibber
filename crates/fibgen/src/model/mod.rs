@@ -5,7 +5,10 @@
 //! spec fixes for the constructs the generator emits: strict left-to-right
 //! evaluation (syntax §2), copy-in/copy-out `&` with the copy-ins at call
 //! entry and the write-backs after the call, both in parameter order
-//! (§3.13), cells shared by reference, atoms replaced by
+//! (§3.13; forwarding at a tail call is not modelled: the owner decided
+//! on 2026-09-28 that it never forwards an `&` parameter another
+//! argument captures, which makes it indistinguishable from a copy-in
+//! and a write-back, types §6.6), cells shared by reference, atoms replaced by
 //! `swap!`/`reset!`, lazily run `async` tasks, integer arithmetic that
 //! traps on overflow at every width and IEEE floats (types §2.12),
 //! protocol dispatch with defaults (types §4), vector patterns and

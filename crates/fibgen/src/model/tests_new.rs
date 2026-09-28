@@ -119,11 +119,13 @@ fn methods_dispatch_to_impls_and_defaults() {
             proto: Proto::Score,
             target: Ty::Pt,
             methods: vec![method("score", x)],
+            colour_var: false,
         },
         ImplDef {
             proto: Proto::Rank,
             target: Ty::Pt,
             methods: vec![method("rank", Expr::int(100))],
+            colour_var: false,
         },
         ImplDef {
             proto: Proto::Score,
@@ -132,6 +134,7 @@ fn methods_dispatch_to_impls_and_defaults() {
                 method("score", Expr::int(1)),
                 method("bonus", Expr::int(50)),
             ],
+            colour_var: false,
         },
     ];
     let d = Expr::new(
@@ -263,6 +266,7 @@ fn weak_and_atom_of_a_dyn_reach_its_object() {
         proto: Proto::Score,
         target: Ty::Pt,
         methods: vec![method("score", x)],
+        colour_var: false,
     }];
     let dt = Ty::Dyn(Proto::Score, true);
     let d = Expr::new(

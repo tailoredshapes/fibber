@@ -36,6 +36,7 @@ mod vpat;
 mod vpat2;
 
 pub use ctx::{Ctx, Region, Var, VarKind};
+pub use protos::self_as_value;
 
 use crate::ast::{Expr, FunDef, ImplDef, Kind, Param, Program};
 use crate::rng::Rng;

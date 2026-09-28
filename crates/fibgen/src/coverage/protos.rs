@@ -2,6 +2,7 @@
 //! `Hook`, vector patterns and guards.
 
 use crate::ast::{Arg, Clause, Expr, Kind, Pat, Program, Rest};
+use crate::gen::self_as_value;
 use crate::ty::{Proto, Ty};
 
 /// Labels for the `impl`s and generic helpers.
@@ -13,8 +14,13 @@ pub fn item_labels(p: &Program, out: &mut Vec<String>) {
         }
         if matches!(i.target, Ty::Hook(_)) {
             out.push("impl on a colour-parameterised struct".into());
+            if i.colour_var {
+                out.push("impl on (Hook k), a rigid colour".into());
+            } else {
+                out.push("impl on (Hook :local), a head that gives a colour".into());
+            }
             if i.methods.iter().any(|m| self_as_value(&m.body)) {
-                out.push("impl on (Hook k) uses self as a (Hook :local) value".into());
+                out.push("impl on (Hook :local) uses self as a (Hook :local) value".into());
             }
         }
         if i.methods.len() > 1 {
@@ -31,19 +37,6 @@ pub fn item_labels(p: &Program, out: &mut Vec<String>) {
             out.push("defun :private (used in its own module)".into());
         }
     }
-}
-
-/// Whether `body` uses `self` other than as the receiver of `.`: passes
-/// it, binds it or joins it with another value, all at the generator's
-/// view of it, a `(Hook :local)`.
-fn self_as_value(body: &Expr) -> bool {
-    let (mut uses, mut fields) = (0, 0);
-    body.walk(&mut |e| match &e.kind {
-        Kind::Var(n) if n == "self" => uses += 1,
-        Kind::Field(s, _) if matches!(&s.kind, Kind::Var(n) if n == "self") => fields += 1,
-        _ => {}
-    });
-    uses > fields
 }
 
 /// Whether `p` has a vector pattern anywhere inside it.
