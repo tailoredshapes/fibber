@@ -57,7 +57,11 @@ pub fn irrefutable(g: &mut Gen, ty: &Ty, depth: u32) -> (Pat, Vec<Var>) {
         if g.rng.chance(10) {
             return (Pat::Wild, Vec::new());
         }
-        let n = g.fresh("p");
+        // Not `p`: `fresh("p")` could make a helper's parameter name
+        // `p{i}`, which `let_form` may already have shadowed in the same
+        // `let`, and a name may not be bound twice in one `let` (syntax
+        // §3.3; seed 958808).
+        let n = g.fresh("pv");
         return (Pat::Bind(n.clone()), vec![var(&n, ty, VarKind::Pattern)]);
     }
     let (head, ftys) = fields.unwrap_or(("", Vec::new()));

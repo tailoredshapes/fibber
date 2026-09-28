@@ -46,6 +46,27 @@ fn larger_sizes_make_larger_programs() {
     assert!(large > small, "{large} <= {small}");
 }
 
+/// No `let` binds a name twice (syntax §3.3): seed 958808 did, a fresh
+/// pattern name equal to a helper parameter the same `let` shadowed.
+#[test]
+fn no_let_binds_a_name_twice() {
+    for seed in (0..300).chain([958808]) {
+        let p = generate(seed, 1 + (seed % 6) as u32);
+        let mut check = |e: &Expr| {
+            if let Kind::Let(bs, _) = &e.kind {
+                let mut names: Vec<String> =
+                    bs.iter().flat_map(|(p, _)| control::pat_names(p)).collect();
+                let n = names.len();
+                names.sort();
+                names.dedup();
+                assert_eq!(names.len(), n, "seed {seed}\n{}", print::program(&p));
+            }
+        };
+        p.main.walk(&mut check);
+        p.funs.iter().for_each(|f| f.body.walk(&mut check));
+    }
+}
+
 /// An impl on `(Hook k)` never uses `self` as a value, which is legal
 /// only under a `(Hook :local)` head, and a `Rank` impl for `(Hook k)`
 /// has a `Score` impl for `(Hook k)` (types §1.3, §4.1 rule 1).
