@@ -52,7 +52,13 @@ special forms.
 | map | `{ k1 v1 k2 v2 ... }` (odd count is a read error) | `(Map [k1 v1 k2 v2 ...])` |
 
 A literal that does not fit its width (`300i8`, `9223372036854775808`) is a
-read error, never a wrap. Numbers carry their width in the reader; there
+read error, never a wrap. A suffix that names no width (`2.5f16`, `1i128`) is a
+read error too, and so is the same literal built by a macro: a `(Flt v
+w)` form whose `w` is not `:f32` or `:f64`, or an `(Int v w)` whose `w`
+is not one of the four integer widths, is an error where the macro's
+expansion is turned back into code (**Decided**, owner, 2026-09-28;
+case 105, as case 93 is for a value out of its width). A `Form` value
+built at run time is data and is not checked until it is compiled. Numbers carry their width in the reader; there
 is no literal polymorphism (types §1.1; **Decided**, D3).
 
 **Symbols.** A symbol is a maximal run of characters that are not

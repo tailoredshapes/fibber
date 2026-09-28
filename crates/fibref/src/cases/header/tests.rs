@@ -263,3 +263,42 @@ fn empty_spec_is_a_bad_value() {
         )
     );
 }
+
+const TRAP: &str = ";; spec: types §2.11\n;; expect: trap\n;; trap:   integer / by zero\n";
+
+#[test]
+fn valid_trap_header() {
+    assert_eq!(
+        parse(TRAP),
+        Ok(Header {
+            spec: "types §2.11".to_string(),
+            verdict: Verdict::Trap {
+                trap: "integer / by zero".to_string()
+            },
+        })
+    );
+}
+
+#[test]
+fn trap_header_needs_its_text_and_forbids_the_others() {
+    let missing = ";; spec: §2\n;; expect: trap\n";
+    assert_eq!(kind_at(missing), (2, HeaderErrorKind::MissingKey("trap")));
+    for (extra, key) in [
+        (";; result: 1\n", "result"),
+        (";; audit: clean\n", "audit"),
+        (";; error: x\n", "error"),
+    ] {
+        let src = format!("{TRAP}{extra}");
+        assert_eq!(kind_at(&src), (4, HeaderErrorKind::ForbiddenKey(key)));
+    }
+    let on_accept = format!("{ACCEPT};; trap: x\n");
+    assert_eq!(
+        kind_at(&on_accept),
+        (5, HeaderErrorKind::ForbiddenKey("trap"))
+    );
+    let on_reject = format!("{REJECT};; trap: x\n");
+    assert_eq!(
+        kind_at(&on_reject),
+        (4, HeaderErrorKind::ForbiddenKey("trap"))
+    );
+}

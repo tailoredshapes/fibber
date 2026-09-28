@@ -31,10 +31,12 @@ fn clean(src: &str, n: i64) {
     }
 }
 
-/// The message of a run that fails.
+/// The message of a run that fails, by a trap (with a clean audit at
+/// the abort, types §2.11) or otherwise.
 fn failed(src: &str) -> String {
     match run(src) {
         Outcome::Failed { message } => message,
+        Outcome::Trapped { message, errors } if errors.is_empty() => message,
         other => panic!("{src}: expected a failed run, got {other:?}"),
     }
 }

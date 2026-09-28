@@ -370,6 +370,26 @@ join    : ∀a. (fn :send ((Task a)) a)                   ; block-on is the prel
 trap    : ∀a. (fn :send (str) a)                        ; aborts; panic is the alias
 ```
 
+**A trap aborts the program** (**Decided**, owner, 2026-09-28). `(trap
+msg)`, the traps of the arithmetic of §2.12, `array-get` out of range,
+`i32->char` of a non-scalar value and every other trap a primitive or
+the library defines end the whole program, on whichever thread or task
+they happen, with the message on standard error and a non-zero exit
+status. Nothing runs after it: no scope ends, no count is released, no
+other thread is waited for, `main` returns nothing. So the objects
+live at the abort are not leaks, and the scopes open at the abort are
+not unfinished: ownership.md §2's "freed when its count reaches zero"
+describes a program that runs to its end, and an aborted one does not.
+What the memory audit (method.md rule 2) still requires of a trapped
+run is what holds at every step of any run: no use-after-free, double
+free or negative count before the abort (these stop the run as audit
+errors, not as a trap), and no live object holding a reference to a
+freed one at the abort. A trap is not an exception: there is no
+handler, and no program can observe one and continue. A case may fix
+a trap as its verdict (`expect: trap`, method.md rule 3): it must
+type-check, pass the ownership checker, and trap with a message
+containing the stated text, with that audit clean.
+
 `(Object a)` is the built-in structural predicate "`a` is not a scalar"
 (a field-less enum is a scalar, §1); `(Weakable a)` is "`a` is an
 object type and not an `(Option ..)`", and implies `(Object a)`. Both
@@ -445,9 +465,12 @@ type is signed (§1.1), and at width `w`:
 - float arithmetic is IEEE 754 at its width and never traps.
 
 A trap ends the program with the message, as `trap` does (§2.11); in
-the interpreter it is a run-time error. The checks and the lIR each
-operation lowers to are in §8.12. Case 94 pins the masked shifts and
-the saturating conversions; the evaluator's unit tests pin the traps.
+the interpreter it is a run-time error, and the objects live at it are
+not leaks (§2.11). The checks and the lIR each operation lowers to are
+in §8.12. Case 94 pins the masked shifts and the saturating
+conversions; cases 101 to 104 (`expect: trap`) pin the overflow of `+`
+at `i8`, the minimum divided by -1, division by zero and `rem` of the
+minimum by -1, and the evaluator's unit tests pin the rest.
 
 Conversions are primitive forms whose first
 operand is a type: `(trunc i8 e)`, `(zext i64 e)`, `(sext i64 e)`,
@@ -2803,7 +2826,8 @@ emits every check itself, never the bare instruction, and never the
 bounds; a trap is `(call @fib.trap msg)`, where `fib.trap` is a
 `fib.rt` function that writes the message (a string global) to
 standard error and aborts, as the builtin `trap` does (§2.11); the
-block it is called from branches nowhere after it.
+block it is called from branches nowhere after it, and it releases
+nothing (§2.11: the objects live at an abort are not leaks).
 
 | Operation | lIR emitted |
 |---|---|
@@ -3079,5 +3103,47 @@ decided them on 2026-09-27:
    not guaranteed to finish under contention or when `f` itself changes
    the atom on every run, as in Clojure (ownership.md §7; §8.6; syntax
    §3.11).
+
+### Decided on lifting the v1 restrictions
+
+On 2026-09-28 the owner decided to lift five restrictions that the
+text above called "v1", and to fix what a trap means for the audit.
+Each is stated in the section that holds its rule and comes with
+cases in `cases/ownership/` (101 to 128):
+
+1. **`(dyn P :send)`** (item 11 above, amended). A second dynamic
+   type, `Send`, made only by `(dyn P :send e)`, which requires `Send`
+   of the hidden type; `(dyn P)` stays non-`Send`. No conversion is
+   implicit; `(dyn P d)` of a `(dyn P :send)` value is the one
+   explicit conversion, and there is none the other way. Same
+   representation as `(dyn P)` (§1.2, §1.7, §2.15, §4.4, §5.1, §8.1,
+   §8.5, §8.7; syntax §3.10; cases 106 to 111).
+2. **Colour parameters on structs and enums** (§1.3's "colours are
+   not parameters in v1", §1.4). A definition head may declare a
+   colour parameter, `k :colour`, used as the colour of function
+   types in its fields; its argument is `:send`, `:local` or a colour
+   variable, inferred at construction, invariant, and `Send` of the
+   type follows it (§1.3, §1.4, §5.1, §5.4; syntax §3.7, §3.9; cases
+   112 to 115).
+3. **Supertraits and default methods** (item 15 above, amended; §4.1's
+   "no default methods, no supertraits in v1"). A protocol may require
+   others (`:requires`); an `impl` of it needs theirs for the same
+   head, with a context that entails theirs; a constraint entails its
+   supertraits' constraints. A method may have a default body, checked
+   and run per instance as if the `impl` had written it, its names
+   resolved where the protocol is defined. `Ord` requires `Eq`, and
+   `derive Ord` no longer lists `(Eq t)` (§2.7, §2.12, §3.3, §4.1,
+   §4.4; syntax §3.10, §3.16, §4.4; cases 116 to 122).
+4. **Private names** (syntax §5's "no private names in v1"). `:private`
+   after a definition's name keeps it out of the module's interface;
+   a reference to it from another module is an error, and `(var m/x)`
+   is the one way past it, which a macro's expansion uses to reach
+   its own module's private helpers (syntax §3.20, §5; §3.9; cases 123
+   to 126).
+5. **Traps** (§2.11). A trap aborts the program; the objects live at
+   the abort are not leaks. A case may expect a trap (method.md rule
+   3; cases 101 to 104).
+6. **A float literal of a width other than `f32` or `f64`**, read or
+   built by a macro, is an error (syntax §1.1, §3.16; case 105).
 
 Nothing is open.

@@ -7,19 +7,21 @@
 //! form: a blank line, a comment without a key, or code. Any later
 //! `;; ...` line is an ordinary comment, whatever it looks like.
 //!
-//! Keys: `spec` (non-empty free text, required); `expect` (`accept` or `reject`,
-//! required); `result` (an integer, required for `accept`, forbidden for
-//! `reject`); `audit` (`clean` or `leak-cycle`, same); `error` (non-empty
-//! text the compile error must contain, required for `reject`,
-//! forbidden for `accept`). Anything else is a [`HeaderError`] naming
-//! the file and line; parsing never panics.
+//! Keys: `spec` (non-empty free text, required); `expect` (`accept`,
+//! `reject` or `trap`, required); `result` (an integer, required for
+//! `accept`, forbidden otherwise); `audit` (`clean` or `leak-cycle`,
+//! same); `error` (non-empty text the compile error must contain,
+//! required for `reject`, forbidden otherwise); `trap` (non-empty text
+//! the run-time trap must contain, required for `trap`, forbidden
+//! otherwise). Anything else is a [`HeaderError`] naming the file and
+//! line; parsing never panics.
 
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The keys a header may contain, in the order the README lists them.
-const KEYS: [&str; 5] = ["spec", "expect", "result", "audit", "error"];
+const KEYS: [&str; 6] = ["spec", "expect", "result", "audit", "error", "trap"];
 
 /// The value `main` is expected to return. Only integers exist today;
 /// other kinds are added here as the language grows.
@@ -65,6 +67,9 @@ pub enum Verdict {
     },
     /// Must fail to compile with an error containing `error`.
     Reject { error: String },
+    /// Must compile and then trap at run time with a message containing
+    /// `trap` (spec/method.md rule 3; types §2.12).
+    Trap { trap: String },
 }
 
 /// A parsed case header.
@@ -243,6 +248,7 @@ impl<'a> Fields<'a> {
             _ => None,
         })?;
         self.forbidden("error")?;
+        self.forbidden("trap")?;
         Ok(Verdict::Accept { result, audit })
     }
 
@@ -250,22 +256,29 @@ impl<'a> Fields<'a> {
         let error = self.parsed("error", |v| (!v.is_empty()).then(|| v.to_string()))?;
         self.forbidden("result")?;
         self.forbidden("audit")?;
+        self.forbidden("trap")?;
         Ok(Verdict::Reject { error })
+    }
+
+    fn trap(&self) -> Result<Verdict, HeaderError> {
+        let trap = self.parsed("trap", |v| (!v.is_empty()).then(|| v.to_string()))?;
+        self.forbidden("result")?;
+        self.forbidden("audit")?;
+        self.forbidden("error")?;
+        Ok(Verdict::Trap { trap })
     }
 
     fn into_header(self) -> Result<Header, HeaderError> {
         // `spec` names the section that decides the case; an empty one
         // names nothing, so it is a bad value like an empty `error`.
         let spec = self.parsed("spec", |v| (!v.is_empty()).then(|| v.to_string()))?;
-        let accept = self.parsed("expect", |v| match v {
-            "accept" => Some(true),
-            "reject" => Some(false),
-            _ => None,
+        let expect = self.parsed("expect", |v| {
+            ["accept", "reject", "trap"].into_iter().find(|k| *k == v)
         })?;
-        let verdict = if accept {
-            self.accept()?
-        } else {
-            self.reject()?
+        let verdict = match expect {
+            "accept" => self.accept()?,
+            "reject" => self.reject()?,
+            _ => self.trap()?,
         };
         Ok(Header { spec, verdict })
     }

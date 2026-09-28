@@ -73,7 +73,16 @@ pub enum Outcome {
     Compiled { result: Value, audit: AuditSummary },
     /// The program was refused with a compile error.
     Rejected { message: String },
-    /// The program compiled but its run failed: a `trap`, a memory-audit
+    /// The program compiled and its run trapped (types §2.12): a `trap`
+    /// call or a primitive's trap. A trap aborts the program, so what
+    /// is live then is not a leak and the scopes open then are not
+    /// errors; `errors` are the audit failures that still count at an
+    /// abort (a live object holding a reference to a freed one).
+    Trapped {
+        message: String,
+        errors: Vec<String>,
+    },
+    /// The program compiled but its run failed otherwise: a memory-audit
     /// error that stopped the run, or an interpreter limit. Never a
     /// pass, whatever the header says.
     Failed { message: String },

@@ -129,10 +129,12 @@ pub fn classify(obs: &Observed, expected: &Result<i64, ModelError>) -> Verdict {
         }
         // A trap the model predicts is the generator's (it means to make
         // programs that do not trap), not the interpreter's.
-        Outcome::Failed { message } if matches!(expected, Err(ModelError::Trap(m)) if message.contains(&format!("trap: {m}"))) => {
+        Outcome::Trapped { message, .. } if matches!(expected, Err(ModelError::Trap(m)) if message.contains(&format!("trap: {m}"))) => {
             v(Class::ModelGap, format!("{expected:?}"), message.clone())
         }
-        Outcome::Failed { message } => v(Class::RunFailed, normalise(message), message.clone()),
+        Outcome::Failed { message } | Outcome::Trapped { message, .. } => {
+            v(Class::RunFailed, normalise(message), message.clone())
+        }
         Outcome::Compiled {
             result: Value::Int(n),
             audit,
@@ -230,8 +232,9 @@ mod tests {
         let overflow = Err(ModelError::Trap("integer overflow in * at i64".into()));
         let v = classify(&compiled(4, AuditSummary::clean()), &overflow);
         assert_eq!((v.class, v.key.as_str()), (Class::Mismatch, "model traps"));
-        let trapped = Observed::Done(Outcome::Failed {
+        let trapped = Observed::Done(Outcome::Trapped {
             message: "<gen>:1:2: trap: integer overflow in * at i64".into(),
+            errors: Vec::new(),
         });
         assert_eq!(classify(&trapped, &overflow).class, Class::ModelGap);
         let other = Err(ModelError::Trap("integer rem by zero".into()));

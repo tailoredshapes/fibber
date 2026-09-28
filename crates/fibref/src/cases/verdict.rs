@@ -10,8 +10,11 @@
 //! | reject   | Rejected, message contains the error text | Pass    |
 //! | reject   | Rejected, message lacks it                | Fail    |
 //! | reject   | Compiled                                  | Fail    |
-//! | either   | Failed (the run trapped or stopped)       | Fail    |
-//! | reject   | expected text blank (any outcome but Unsupported) | Fail |
+//! | accept, reject | Trapped                             | Fail    |
+//! | trap     | Trapped, message contains the trap text, no audit error | Pass |
+//! | trap     | Trapped otherwise, Compiled or Rejected   | Fail    |
+//! | any      | Failed (the run stopped other than by a trap) | Fail |
+//! | reject, trap | expected text blank (any outcome but Unsupported) | Fail |
 //! | either   | Unsupported                               | Pending |
 //!
 //! An empty or whitespace-only expected text is a Fail rather than a
@@ -81,6 +84,40 @@ pub fn judge(header: &Header, outcome: &Outcome) -> Status {
         (_, Outcome::Unsupported { reason }) => Status::Pending(reason.clone()),
         (Verdict::Accept { result, audit }, outcome) => judge_accept(result, *audit, outcome),
         (Verdict::Reject { error }, outcome) => judge_reject(error, outcome),
+        (Verdict::Trap { trap }, outcome) => judge_trap(trap, outcome),
+    }
+}
+
+/// `expect: trap`: the program must compile, pass the checker and
+/// trap with a message containing `expected`, with no audit error at
+/// the abort (spec/method.md rule 3; types §2.12).
+fn judge_trap(expected: &str, outcome: &Outcome) -> Status {
+    if expected.trim().is_empty() {
+        return Status::Fail(
+            "expected trap text is empty or only whitespace: nearly every message contains it, so this case could never fail"
+                .to_string(),
+        );
+    }
+    match outcome {
+        Outcome::Trapped { message, errors } if message.contains(expected) && errors.is_empty() => {
+            Status::Pass
+        }
+        Outcome::Trapped { message, errors } if message.contains(expected) => Status::Fail(
+            format!("trapped as expected, but the audit at the abort failed: {}", errors.join("; ")),
+        ),
+        Outcome::Trapped { message, .. } => Status::Fail(format!(
+            "trapped, but the trap does not contain the expected text: expected \"{expected}\", got \"{message}\""
+        )),
+        Outcome::Compiled { result, audit } => Status::Fail(format!(
+            "expected a trap with \"{expected}\", but the run finished: result {result}, audit {audit}"
+        )),
+        Outcome::Rejected { message } => Status::Fail(format!(
+            "expected a trap with \"{expected}\", but rejected: {message}"
+        )),
+        Outcome::Failed { message } => Status::Fail(format!(
+            "expected a trap with \"{expected}\", but the run failed: {message}"
+        )),
+        Outcome::Unsupported { reason } => Status::Pending(reason.clone()),
     }
 }
 
@@ -103,6 +140,7 @@ fn judge_accept(expected: &Expected, audit: AuditExpect, outcome: &Outcome) -> S
         Outcome::Rejected { message } => {
             Status::Fail(format!("expected accept, but rejected: {message}"))
         }
+        Outcome::Trapped { message, .. } => Status::Fail(format!("the run trapped: {message}")),
         Outcome::Failed { message } => Status::Fail(format!("the run failed: {message}")),
         Outcome::Unsupported { reason } => Status::Pending(reason.clone()),
     }
@@ -125,7 +163,7 @@ fn judge_reject(expected: &str, outcome: &Outcome) -> Status {
         Outcome::Compiled { result, audit } => Status::Fail(format!(
             "expected reject with \"{expected}\", but compiled: result {result}, audit {audit}"
         )),
-        Outcome::Failed { message } => Status::Fail(format!(
+        Outcome::Failed { message } | Outcome::Trapped { message, .. } => Status::Fail(format!(
             "expected reject with \"{expected}\", but compiled and the run failed: {message}"
         )),
         Outcome::Unsupported { reason } => Status::Pending(reason.clone()),

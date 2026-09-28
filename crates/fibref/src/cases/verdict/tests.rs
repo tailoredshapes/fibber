@@ -265,3 +265,68 @@ fn a_failed_run_fails_either_verdict() {
     ));
     assert!(matches!(judge(&reject("boom"), &failed), Status::Fail(_)));
 }
+
+fn trap(text: &str) -> Header {
+    Header {
+        spec: "types §2.11".to_string(),
+        verdict: Verdict::Trap {
+            trap: text.to_string(),
+        },
+    }
+}
+
+fn trapped(message: &str, errors: &[&str]) -> Outcome {
+    Outcome::Trapped {
+        message: message.to_string(),
+        errors: errors.iter().map(|e| e.to_string()).collect(),
+    }
+}
+
+#[test]
+fn trap_with_the_text_and_a_clean_abort_passes() {
+    let out = trapped("t.fib:3:4: trap: integer overflow in + at i8", &[]);
+    assert_eq!(
+        judge(&trap("integer overflow in + at i8"), &out),
+        Status::Pass
+    );
+}
+
+#[test]
+fn trap_with_another_text_fails() {
+    let out = trapped("t.fib:3:4: trap: integer / by zero", &[]);
+    let status = judge(&trap("integer overflow"), &out);
+    fail_containing(status, &["integer overflow", "integer / by zero"]);
+}
+
+#[test]
+fn trap_with_a_dangling_reference_at_the_abort_fails() {
+    let out = trapped("trap: boom", &["dangling reference #1.0 -> #2"]);
+    fail_containing(judge(&trap("boom"), &out), &["audit", "dangling"]);
+}
+
+#[test]
+fn trap_expected_but_the_run_finished_rejected_or_failed_fails() {
+    let h = trap("boom");
+    fail_containing(
+        judge(&h, &compiled(1, AuditSummary::clean())),
+        &["finished"],
+    );
+    fail_containing(judge(&h, &rejected("boom at compile time")), &["rejected"]);
+    let failed = Outcome::Failed {
+        message: "audit error: boom".to_string(),
+    };
+    fail_containing(judge(&h, &failed), &["failed"]);
+}
+
+#[test]
+fn a_trap_fails_an_accept_and_a_reject() {
+    let out = trapped("trap: boom", &[]);
+    fail_containing(judge(&accept(1, AuditExpect::Clean), &out), &["trapped"]);
+    fail_containing(judge(&reject("boom"), &out), &["compiled"]);
+}
+
+#[test]
+fn a_blank_trap_text_never_passes() {
+    let out = trapped("trap: boom", &[]);
+    fail_containing(judge(&trap("  "), &out), &["empty"]);
+}

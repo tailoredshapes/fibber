@@ -126,6 +126,17 @@ fn invalid_numbers_say_why() {
 }
 
 #[test]
+fn a_float_suffix_that_names_no_width_is_a_read_error() {
+    // Syntax §1.1: only f32 and f64 (case 105 is the macro-built form).
+    for bad in ["2.5f16", "2.5f128", "1e3f8"] {
+        assert!(
+            invalid_reason(bad).contains("not a width suffix (f32 f64)"),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
 fn negative_zero_and_leading_zeros() {
     assert_eq!(kind("-0"), int(0, IntWidth::I64));
     assert_eq!(kind("007"), int(7, IntWidth::I64));

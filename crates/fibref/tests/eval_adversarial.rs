@@ -31,7 +31,7 @@ fn clean(src: &str, n: i64) {
 
 fn failed(src: &str) -> String {
     match run(src) {
-        Outcome::Failed { message } => message,
+        Outcome::Failed { message } | Outcome::Trapped { message, .. } => message,
         other => panic!("expected a failed run, got {other:?}"),
     }
 }

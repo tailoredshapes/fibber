@@ -1,0 +1,19 @@
+;; spec:   types §2.11, §2.12 (method.md rule 3)
+;; expect: trap
+;; trap:   integer overflow in + at i8
+;; 127i8 + 1 does not fit i8, so + traps rather than wrapping (types
+;; §2.12). The trap happens with a vector, a cell holding it and a
+;; closure capturing the cell live, inside a loop: a trap aborts the
+;; program (types §2.11), so none of them is released and none of them
+;; is a leak; the audit at the abort must still find no reference into
+;; freed memory.
+(defun bump (x: i8) -> i8 (+ x 1i8))
+
+(defun main () -> i64
+  (let ((v [1 2 3])
+        (c (cell v))
+        (f (fn () (count @c))))
+    (loop ((x 120i8))
+      (if (< (sext i64 x) (+ 1000 (f)))
+          (recur (bump x))
+          (sext i64 x)))))

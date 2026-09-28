@@ -133,6 +133,7 @@ fn describe(o: &Outcome) -> String {
         Outcome::Compiled { result, audit } => format!("result {result}, audit {audit}"),
         Outcome::Rejected { message } => format!("rejected: {}", first_line(message)),
         Outcome::Failed { message } => format!("failed: {}", first_line(message)),
+        Outcome::Trapped { message, .. } => format!("trapped: {}", first_line(message)),
         Outcome::Unsupported { reason } => format!("unsupported: {reason}"),
     }
 }

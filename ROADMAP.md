@@ -46,6 +46,16 @@ evaluator over the audited heap.
       spec question: an `&` parameter forwarded at a tail call is
       observably different from a copy-in when a later argument of the
       same call writes the variable (seed 233285; the model copies in)
+- [ ] the owner's decisions of 2026-09-28 (spec/types.md §10): lift
+      the "v1" restrictions and fix what a trap means
+  - [x] `expect: trap` cases; a trap aborts the program and what is
+        live then is not a leak (types §2.11; cases 101 to 104)
+  - [x] a float literal of a width other than f32/f64 is an error, read
+        or macro-built (syntax §1.1; case 105)
+  - [ ] `(dyn P :send)`
+  - [ ] colour parameters on structs and enums
+  - [ ] protocol supertraits and default methods
+  - [ ] private names
 
 ## M3. Hardened lIR
 

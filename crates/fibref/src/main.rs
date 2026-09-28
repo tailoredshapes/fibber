@@ -124,6 +124,15 @@ fn run_file(file: &str) -> ExitCode {
             ExitCode::SUCCESS,
         ),
         Outcome::Rejected { message } => (format!("rejected:\n{message}\n"), ExitCode::from(1)),
+        Outcome::Trapped { message, errors } => {
+            let audit = if errors.is_empty() {
+                "clean at the abort".to_string()
+            } else {
+                errors.join("; ")
+            };
+            let text = format!("trapped:\n{message}\naudit:  {audit}\n");
+            (text, ExitCode::from(1))
+        }
         Outcome::Failed { message } => (format!("failed:\n{message}\n"), ExitCode::from(1)),
         Outcome::Unsupported { reason } => (format!("unsupported: {reason}\n"), ExitCode::from(1)),
     };

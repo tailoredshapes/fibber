@@ -15,7 +15,7 @@ use fibref::cases::{list_cases_recursive, read_header};
 /// they are promoted.
 const SUITE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cases/ownership");
 const SPEC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spec/ownership.md");
-const KEYS: [&str; 5] = ["spec", "expect", "result", "audit", "error"];
+const KEYS: [&str; 6] = ["spec", "expect", "result", "audit", "error", "trap"];
 
 fn real_cases() -> Vec<PathBuf> {
     let cases = list_cases_recursive(Path::new(SUITE_DIR)).expect("cases/ownership is readable");

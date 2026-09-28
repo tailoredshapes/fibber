@@ -23,8 +23,12 @@ fn real_cases() -> Vec<PathBuf> {
     cases
 }
 
-const REJECT: [u32; 10] = [12, 13, 14, 18, 21, 34, 40, 82, 90, 93];
+const REJECT: &[u32] = &[12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105];
 const LEAK_CYCLE: [u32; 2] = [15, 80];
+/// The cases whose verdict is a run-time trap (method.md rule 3).
+const TRAP: [u32; 4] = [101, 102, 103, 104];
+/// The last case number of this suite. Another series starts at 131.
+const LAST: u32 = 105;
 
 fn number_of(path: &Path) -> u32 {
     let name = path.file_name().unwrap().to_string_lossy();
@@ -67,40 +71,42 @@ fn every_real_case_header_parses() {
 }
 
 #[test]
-fn the_ownership_directory_holds_cases_1_to_100_less_the_withdrawn() {
+fn the_ownership_directory_holds_cases_1_to_last_less_the_withdrawn() {
     // 30 and 35 were withdrawn when D1 removed field places; 81 to 95
     // are the promoted findings of the rule-4 adversary, 96 to 99 those
-    // of the rule-5 generator, 100 the annotated bindings of syntax §1.5.
+    // of the rule-5 generator, 100 the annotated bindings of syntax §1.5,
+    // 101 onwards the owner's decisions of 2026-09-28 (types §10).
     // The listing is by name, so 100 sorts after 10: compare as numbers.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();
     let mut numbers: Vec<u32> = cases.iter().map(|p| number_of(p)).collect();
     numbers.sort_unstable();
-    let expected: Vec<u32> = (1..=100).filter(|n| ![30, 35].contains(n)).collect();
+    let expected: Vec<u32> = (1..=LAST).filter(|n| ![30, 35].contains(n)).collect();
     assert_eq!(numbers, expected);
 }
 
 #[test]
 fn real_case_verdicts_agree_with_the_readme() {
-    // README: 12, 13, 14, 18, 21, 34, 40, 82, 90 and 93 must be
-    // rejected; 15 and 80 are the permitted cycle leaks; every other
-    // case is accept with a clean audit.
+    // README: REJECT must be rejected, TRAP must trap; 15 and 80 are
+    // the permitted cycle leaks; every other case is accept with a
+    // clean audit.
     for path in real_cases() {
         let header = read_header(&path).unwrap_or_else(|e| panic!("{e}"));
         let n = number_of(&path);
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         match header.verdict {
             Verdict::Reject { error } => {
-                assert!(
-                    REJECT.contains(&n),
-                    "{name} is reject but README says accept"
-                );
+                assert!(REJECT.contains(&n), "{name} is reject, not in REJECT");
                 assert!(!error.is_empty());
+            }
+            Verdict::Trap { trap } => {
+                assert!(TRAP.contains(&n), "{name} is trap, not in TRAP");
+                assert!(!trap.is_empty());
             }
             Verdict::Accept { audit, .. } => {
                 assert!(
-                    !REJECT.contains(&n),
-                    "{name} is accept but README says reject"
+                    !REJECT.contains(&n) && !TRAP.contains(&n),
+                    "{name} is accept but README says reject or trap"
                 );
                 let expected = if LEAK_CYCLE.contains(&n) {
                     AuditExpect::LeakCycle
@@ -122,6 +128,9 @@ fn reject_case_names_say_reject_and_others_do_not() {
         let says_reject = name.contains("reject");
         let is_reject = matches!(header.verdict, Verdict::Reject { .. });
         assert_eq!(says_reject, is_reject, "{name}: name and verdict disagree");
+        let says_trap = name.contains("-trap-");
+        let is_trap = matches!(header.verdict, Verdict::Trap { .. });
+        assert_eq!(says_trap, is_trap, "{name}: name and trap verdict disagree");
     }
 }
 

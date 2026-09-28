@@ -25,6 +25,12 @@ rests on anyone's word, including the author's.
      finish with a clean memory audit.
    - `reject`: must fail to compile, with an error containing the
      stated text.
+   - `trap`: must type-check and pass the ownership checker, then
+     fail at run time with a trap whose message contains the stated
+     text. A trap aborts the program (types §2.11), so the objects
+     live then are not leaks; the audit still fails the run on any
+     use-after-free, double free or negative count before the trap,
+     and on a live object that refers to a freed one at it.
    A rule change that flips a verdict needs the case's header changed
    in the same commit, with the reason.
 

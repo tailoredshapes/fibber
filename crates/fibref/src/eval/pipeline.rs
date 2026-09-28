@@ -13,7 +13,7 @@ use crate::types::prelude_forms;
 
 use super::alloc::Placement;
 use super::call::{Jump, Target};
-use super::error::{RunError, R};
+use super::error::{RunError, RunErrorKind, R};
 use super::interp::Interp;
 use super::macros::MacroEvaluator;
 use super::value::Val;
@@ -65,10 +65,28 @@ fn run_here(source: &str, file: &str) -> Outcome {
             result: Value::Int(n),
             audit: summary(&report),
         },
+        Err(e) if e.kind == RunErrorKind::Trap => Outcome::Trapped {
+            message: e.to_string(),
+            errors: abort_errors(&report),
+        },
         Err(e) => Outcome::Failed {
             message: e.to_string(),
         },
     }
+}
+
+/// The audit of a run that a trap aborted (types §2.12): what is live
+/// then is not a leak and the scopes open then are not errors, but a
+/// live object that still refers to a freed one is.
+pub fn abort_errors(report: &AuditReport) -> Vec<String> {
+    report.dangling.iter().map(dangling_text).collect()
+}
+
+fn dangling_text(d: &crate::heap::DanglingRef) -> String {
+    format!(
+        "dangling reference {}.{} -> {}",
+        d.holder, d.field, d.target
+    )
 }
 
 /// The front end with user macros run: the checked program, or the
@@ -155,16 +173,7 @@ impl<'p> Interp<'p> {
 
 /// The harness's view of an audit report.
 pub fn summary(report: &AuditReport) -> AuditSummary {
-    let mut errors: Vec<String> = report
-        .dangling
-        .iter()
-        .map(|d| {
-            format!(
-                "dangling reference {}.{} -> {}",
-                d.holder, d.field, d.target
-            )
-        })
-        .collect();
+    let mut errors = abort_errors(report);
     errors.extend(
         report
             .open_scopes
