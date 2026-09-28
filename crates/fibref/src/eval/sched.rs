@@ -351,4 +351,19 @@ mod tests {
         assert!(turn.wait(2).is_none());
         assert!(turn.wait(1).is_none());
     }
+
+    #[test]
+    fn the_turn_moves_its_value_to_the_holder_and_back() {
+        let turn = Turn::default();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut v: Box<Vec<u32>> = turn.wait(1).expect("handed to 1");
+                v.push(1);
+                turn.give(0, v);
+            });
+            turn.give(1, Box::new(vec![0]));
+            let v = turn.wait(0).expect("handed back to 0");
+            assert_eq!(*v, vec![0, 1]);
+        });
+    }
 }

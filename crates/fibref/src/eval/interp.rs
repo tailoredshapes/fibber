@@ -3,13 +3,11 @@
 //! through it, and the operations of the ownership plan run against
 //! them (own/program.rs, "the evaluation protocol").
 
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use crate::heap::ObjId;
-use crate::own::program::{BodyKey, Op, OpKind, OwnedProgram, Site};
+use crate::own::program::{BodyKey, Op, OpKind, Site};
 use crate::types::ast::{BindingId, ExprId};
-use crate::types::TypedProgram;
 
 use super::error::{RunError, R};
 use super::fx::FxMap;
@@ -78,7 +76,7 @@ impl Frame<'_> {
 /// shared [`World`] while it holds the turn (see `threads` for why
 /// this is sound without `unsafe`).
 ///
-/// Every access to the world goes through [`Deref`]/[`DerefMut`] (so
+/// Every access to the world goes through `Deref`/`DerefMut` (`world`) (so
 /// `self.heap` is `self.world.heap`), a borrow of `self` that ends
 /// before the next statement that needs `&mut self`; a switch between
 /// threads takes `&mut self`, so the borrow checker proves no
@@ -86,7 +84,7 @@ impl Frame<'_> {
 pub struct Interp<'p> {
     /// The shared state; `None` only inside a switch, while another
     /// thread holds the turn.
-    world: Option<Box<World<'p>>>,
+    pub(super) world: Option<Box<World<'p>>>,
     /// The activations, innermost last.
     pub frames: Vec<Frame<'p>>,
     /// Where this thread's stack began.
@@ -97,70 +95,7 @@ pub struct Interp<'p> {
     pub turn: Arc<Turn<Box<World<'p>>>>,
 }
 
-impl<'p> Deref for Interp<'p> {
-    type Target = World<'p>;
-
-    #[inline]
-    fn deref(&self) -> &World<'p> {
-        // Cannot fail: the world is taken out only in `switch` and at a
-        // thread's end, which put it back before any code of the
-        // thread runs again, or unwind (touching nothing) if the run
-        // was closed; a worker gets one before it runs a job.
-        self.world
-            .as_deref()
-            .expect("the running thread holds the world")
-    }
-}
-
-impl DerefMut for Interp<'_> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // Cannot fail: as for `deref`.
-        self.world
-            .as_deref_mut()
-            .expect("the running thread holds the world")
-    }
-}
-
 impl<'p> Interp<'p> {
-    /// An interpreter over `p` and its plan `o`, with an empty heap.
-    pub fn new(p: &'p TypedProgram, o: &'p OwnedProgram) -> Self {
-        Interp {
-            world: Some(Box::new(World::new(p, o))),
-            frames: Vec::new(),
-            stack_base: stack_here(),
-            stack_budget: STACK_BUDGET,
-            turn: Arc::default(),
-        }
-    }
-
-    /// A thread of a run whose turn is `turn`, holding no world yet.
-    pub fn thread(turn: Arc<Turn<Box<World<'p>>>>) -> Self {
-        Interp {
-            world: None,
-            frames: Vec::new(),
-            stack_base: stack_here(),
-            stack_budget: STACK_BUDGET,
-            turn,
-        }
-    }
-
-    /// The world, given away: this thread no longer holds it.
-    pub fn take_world(&mut self) -> Option<Box<World<'p>>> {
-        self.world.take()
-    }
-
-    /// The world, handed back to this thread.
-    pub fn put_world(&mut self, w: Box<World<'p>>) {
-        self.world = Some(w);
-    }
-
-    /// The world itself, for borrows of several of its fields at once.
-    #[inline]
-    pub fn w(&mut self) -> &mut World<'p> {
-        self
-    }
-
     /// The index of the plan of the body `key`.
     pub fn body(&self, key: BodyKey) -> R<usize> {
         self.plans
