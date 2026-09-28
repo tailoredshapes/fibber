@@ -1,0 +1,24 @@
+;; expect: accept
+;; out: 42
+;; ir: define private i64 @helper(
+;; ir: define internal tailcc i64 @twice(
+;; ir: define hidden i64 @visible(
+;; ir: @counter = internal global i64 1
+;; ir: @tag = private constant i64 40
+;; ir: @exported = hidden global i64 0
+;; ir-not: define i64 @helper(
+;; spec/lir.md §4.3: private and internal symbols stay out of the
+;; export table; hidden ones stay inside the executable.
+(declare printf i32 (ptr ...))
+(global internal counter i64 (i64 1))
+(constant private tag i64 (i64 40))
+(global hidden exported i64 (i64 0))
+(define private (helper i64) ((i64 x)) (block entry (ret (add x (load i64 @tag)))))
+(define internal tailcc (twice i64) ((i64 x)) (block entry (ret (mul x (i64 2)))))
+(define hidden (visible i64) () (block entry (ret (call @twice (load i64 @counter)))))
+(global fp ptr @helper)
+(define (main i32) ()
+  (block entry
+    (store (indirect-call (load ptr @fp) (fn i64 (i64)) (call @visible)) @exported)
+    (call @printf (string "%lld\n") (load i64 @exported))
+    (ret (i32 0))))

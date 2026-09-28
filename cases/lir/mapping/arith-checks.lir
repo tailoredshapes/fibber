@@ -7,26 +7,46 @@
 ;; out: fptosi 0 9223372036854775807 -9223372036854775808 -2 9223372036854775807
 ;; out: fptoui 0 0 255 7
 ;; out: shl 2 -9223372036854775808
-;; types.md §8.12: the checked sequences fibber emits instead of the bare
+;; out: intrinsics agree 0
+;; types.md §8.12: the checked sequences v1 emitted instead of the bare
 ;; LLVM operations, returning { value, overflowed } so that one run
-;; tests each boundary.
+;; tests each boundary; each is compared with the intrinsic §8.12 now
+;; emits (sadd-overflow and kin, fptosi-sat, fptoui-sat), which must
+;; give the same value and the same verdict on every boundary.
 (declare printf i32 (ptr ...))
+(global disagree i64 (i64 0))
+(define (same64 void) (({ i64, i1 } a) ({ i64, i1 } b))
+  (block entry
+    (br (and (icmp eq (extractvalue a 0) (extractvalue b 0)) (icmp eq (extractvalue a 1) (extractvalue b 1))) ok bad))
+  (block bad (store (i64 1) @disagree) (ret))
+  (block ok (ret)))
+(define (samei void) ((i64 a) (i64 b))
+  (block entry (br (icmp eq a b) ok bad))
+  (block bad (store (i64 1) @disagree) (ret))
+  (block ok (ret)))
 (define (pr void) (({ i64, i1 } r))
   (block entry (br (extractvalue r 1) bad ok))
   (block bad (call @printf (string " ovf")) (ret))
   (block ok (call @printf (string " %lld") (extractvalue r 0)) (ret)))
 (define (add64 { i64, i1 }) ((i64 a) (i64 b))
   (block entry
-    (let ((r (add a b)))
-      (ret { r (icmp slt (and (xor a r) (xor b r)) (i64 0)) }))))
+    (let ((r (add a b))
+          (seq { r (icmp slt (and (xor a r) (xor b r)) (i64 0)) }))
+      (call @same64 seq (sadd-overflow a b))
+      (ret seq))))
 (define (sub64 { i64, i1 }) ((i64 a) (i64 b))
   (block entry
-    (let ((r (sub a b)))
-      (ret { r (icmp slt (and (xor a b) (xor a r)) (i64 0)) }))))
+    (let ((r (sub a b))
+          (seq { r (icmp slt (and (xor a b) (xor a r)) (i64 0)) }))
+      (call @same64 seq (ssub-overflow a b))
+      (ret seq))))
 (define (mul32 { i64, i1 }) ((i32 a) (i32 b))
   (block entry
-    (let ((r (mul (sext i64 a) (sext i64 b))))
-      (ret { (sext i64 (trunc i32 r)) (icmp ne (sext i64 (trunc i32 r)) r) }))))
+    (let ((r (mul (sext i64 a) (sext i64 b)))
+          (seq { (sext i64 (trunc i32 r)) (icmp ne (sext i64 (trunc i32 r)) r) })
+          (intr (smul-overflow a b)))
+      (call @same64 seq { (sext i64 (extractvalue intr 0)) (extractvalue intr 1) })
+      (ret seq))))
 (define (mul64 { i64, i1 }) ((i64 a) (i64 b))
   (block entry
     (let ((r (mul a b)))
@@ -35,15 +55,15 @@
     (br (or (icmp eq a (i64 0)) (icmp eq a (i64 -1))) good divide))
   (block divide
     (br (icmp ne (sdiv r a) b) bad good))
-  (block bad (ret { r (i1 1) }))
-  (block good (ret { r (i1 0) })))
+  (block bad (call @same64 { r (i1 1) } (smul-overflow a b)) (ret { r (i1 1) }))
+  (block good (call @same64 { r (i1 0) } (smul-overflow a b)) (ret { r (i1 0) })))
 (define (div64 void) ((i64 a) (i64 b))
   (block entry (br (icmp eq b (i64 0)) zero next))
   (block zero (call @printf (string " div0")) (ret))
   (block next (br (and (icmp eq a (i64 -9223372036854775808)) (icmp eq b (i64 -1))) ovf ok))
   (block ovf (call @printf (string " ovf")) (ret))
   (block ok (call @printf (string " %lld") (sdiv a b)) (ret)))
-(define (fptosi-sat i64) ((double x))
+(define (fptosi-sat-seq i64) ((double x))
   (block entry (br (fcmp uno x x) nan c1))
   (block nan (ret (i64 0)))
   (block c1 (br (fcmp oge x (double 9223372036854775808.0)) hi c2))
@@ -51,13 +71,23 @@
   (block c2 (br (fcmp olt x (double -9223372036854775808.0)) lo mid))
   (block lo (ret (i64 -9223372036854775808)))
   (block mid (ret (fptosi i64 x))))
-(define (fptoui-sat i8) ((double x))
+(define (fptosi-sat i64) ((double x))
+  (block entry
+    (let ((seq (call @fptosi-sat-seq x)))
+      (call @samei seq (fptosi-sat i64 x))
+      (ret seq))))
+(define (fptoui-sat-seq i8) ((double x))
   (block entry (br (fcmp uno x x) zero c1))
   (block zero (ret (i8 0)))
   (block c1 (br (fcmp olt x (double 0.0)) zero c2))
   (block c2 (br (fcmp oge x (double 256.0)) hi mid))
   (block hi (ret (i8 -1)))
   (block mid (ret (fptoui i8 x))))
+(define (fptoui-sat i8) ((double x))
+  (block entry
+    (let ((seq (call @fptoui-sat-seq x)))
+      (call @samei (zext i64 seq) (zext i64 (fptoui-sat i8 x)))
+      (ret seq))))
 (define (shl64 i64) ((i64 a) (i64 n)) (block entry (ret (shl a (and n (i64 63))))))
 (define (main i32) ()
   (block entry
@@ -89,4 +119,5 @@
       (zext i32 (call @fptoui-sat (double nan))) (zext i32 (call @fptoui-sat (double -1.0)))
       (zext i32 (call @fptoui-sat (double 300.0))) (zext i32 (call @fptoui-sat (double 7.9))))
     (call @printf (string "shl %lld %lld\n") (call @shl64 (i64 1) (i64 65)) (call @shl64 (i64 1) (i64 63)))
+    (call @printf (string "intrinsics agree %lld\n") (load i64 @disagree))
     (ret (i32 0))))

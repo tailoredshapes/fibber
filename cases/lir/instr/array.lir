@@ -1,0 +1,74 @@
+;; expect: accept
+;; out: str hey 3
+;; out: table 10 11
+;; out: global 20 30
+;; out: local 5 7 9
+;; out: value 1 2 42 45
+;; out: nested 6
+;; out: zero 0 0 0
+;; out: sizes 16 24 20
+;; out: dyn 10 30
+;; ir: [4 x i32]
+;; ir: [0 x i8]
+;; ir: zeroinitializer
+;; spec/lir.md §2.1: arrays in structs (the trailing [0 x i8] of a
+;; string object, types.md §8.3), as constants (a string literal, the
+;; type table of §8.2), as globals, in allocas, as values, through
+;; getelementptr with constant and run-time indices.
+(declare printf i32 (ptr ...))
+(defstruct str (i64 i32 i32 i64 [0 x i8]))
+(constant hey { i64, i32, i32, i64, [4 x i8] }
+  { (i64 0) (i32 1) (i32 8) (i64 3) ([4 x i8] (i8 104) (i8 101) (i8 121) (i8 0)) })
+(defstruct rec (ptr i64))
+(constant table [2 x %struct.rec]
+  ([2 x %struct.rec] (%struct.rec @ten (i64 1)) (%struct.rec @eleven (i64 2))))
+(constant arr [4 x i32] ([4 x i32] (i32 0) (i32 10) (i32 20) (i32 30)))
+(global zeros [3 x i64] (zeroinitializer [3 x i64]))
+(defstruct pair ({ i32, i32 } [2 x i64]))
+(global zpair %struct.pair (zeroinitializer %struct.pair))
+(define (ten i64) () (block entry (ret (i64 10))))
+(define (eleven i64) () (block entry (ret (i64 11))))
+(define (bytes ptr) ((ptr s))
+  (block entry (ret (getelementptr %struct.str s (i32 0) (i32 4) (i64 0)))))
+(define (mk [3 x i64]) ((i64 a) (i64 b))
+  (block entry (ret ([3 x i64] a b (i64 42)))))
+(define (sum3 i64) (([3 x i64] v))
+  (block entry (ret (add (add (extractvalue v 0) (extractvalue v 1)) (extractvalue v 2)))))
+(define (lookup i64) ((i64 tid))
+  (block entry
+    (let ((f (load ptr (getelementptr [2 x %struct.rec] @table (i32 0) tid (i32 0)))))
+      (ret (indirect-call f (fn i64 ()))))))
+(define (nth i32) ((i64 i))
+  (block entry (ret (load i32 (getelementptr inbounds [4 x i32] @arr (i32 0) i)))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "str %s %lld\n") (call @bytes @hey)
+      (load i64 (getelementptr %struct.str @hey (i32 0) (i32 3))))
+    (call @printf (string "table %lld %lld\n") (call @lookup (i64 0)) (call @lookup (i64 1)))
+    (call @printf (string "global %d %d\n")
+      (load i32 (getelementptr [4 x i32] @arr (i32 0) (i32 2)))
+      (extractvalue (load [4 x i32] @arr) 3))
+    (let ((a (alloca [4 x i64])))
+      (store (zeroinitializer [4 x i64]) a)
+      (store (i64 5) (getelementptr [4 x i64] a (i32 0) (i32 0)))
+      (store (i64 7) (getelementptr inbounds [4 x i64] a (i64 0) (i64 1)))
+      (let ((v (insertvalue (load [4 x i64] a) (i64 9) 2)))
+        (call @printf (string "local %lld %lld %lld\n")
+          (extractvalue v 0) (extractvalue v 1) (extractvalue v 2))))
+    (let ((v (call @mk (i64 1) (i64 2))))
+      (call @printf (string "value %lld %lld %lld %lld\n")
+        (extractvalue v 0) (extractvalue v 1) (extractvalue v 2) (call @sum3 v)))
+    (let ((n (alloca [2 x [3 x i32]])))
+      (store (zeroinitializer [2 x [3 x i32]]) n)
+      (store (i32 6) (getelementptr [2 x [3 x i32]] n (i32 0) (i32 1) (i32 2)))
+      (call @printf (string "nested %d\n") (extractvalue (load [2 x [3 x i32]] n) 1 2)))
+    (call @printf (string "zero %lld %d %lld\n")
+      (load i64 (getelementptr [3 x i64] @zeros (i32 0) (i32 1)))
+      (extractvalue (load %struct.pair @zpair) 0 1)
+      (extractvalue (load %struct.pair @zpair) 1 0))
+    (call @printf (string "sizes %lld %lld %lld\n")
+      (ptrtoint i64 (getelementptr [2 x i64] (ptr null) (i32 1)))
+      (ptrtoint i64 (getelementptr %struct.str (ptr null) (i32 1)))
+      (ptrtoint i64 (getelementptr [5 x i32] (ptr null) (i32 1))))
+    (call @printf (string "dyn %d %d\n") (call @nth (i64 1)) (call @nth (i64 3)))
+    (ret (i32 0))))

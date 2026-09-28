@@ -1,0 +1,49 @@
+;; expect: accept
+;; out: sadd 127 0 -128 1 1 0
+;; out: ssub 127 1 -128 0
+;; out: smul 64 0 -128 0 -128 1
+;; out: sadd64 -9223372036854775808 1
+;; out: vec -2147483648 1 -2 0
+;; out: fptosi 0 9223372036854775807 -9223372036854775808 -2
+;; out: fptoui 0 0 255 7
+;; ir: llvm.sadd.with.overflow.i8
+;; ir: llvm.ssub.with.overflow.i8
+;; ir: llvm.smul.with.overflow.i8
+;; ir: llvm.sadd.with.overflow.v2i32
+;; ir: llvm.fptosi.sat.i64.f64
+;; ir: llvm.fptoui.sat.i8.f32
+;; spec/lir.md §6.1, §6.3 (decided, §14 item 5): the overflow and
+;; saturation intrinsics types.md §8.12 emits.
+(declare printf i32 (ptr ...))
+(define (pr8 void) (({ i8, i1 } r))
+  (block entry
+    (call @printf (string " %d %d") (sext i32 (extractvalue r 0)) (zext i32 (extractvalue r 1)))
+    (ret)))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "sadd"))
+    (call @pr8 (sadd-overflow (i8 100) (i8 27)))
+    (call @pr8 (sadd-overflow (i8 127) (i8 1)))
+    (call @pr8 (sadd-overflow (i8 -1) (i8 2)))
+    (call @printf (string "\nssub"))
+    (call @pr8 (ssub-overflow (i8 -128) (i8 1)))
+    (call @pr8 (ssub-overflow (i8 -100) (i8 28)))
+    (call @printf (string "\nsmul"))
+    (call @pr8 (smul-overflow (i8 8) (i8 8)))
+    (call @pr8 (smul-overflow (i8 -8) (i8 16)))
+    (call @pr8 (smul-overflow (i8 16) (i8 8)))
+    (let ((r (sadd-overflow (i64 9223372036854775807) (i64 1))))
+      (call @printf (string "\nsadd64 %lld %d\n") (extractvalue r 0) (zext i32 (extractvalue r 1))))
+    (let ((v (sadd-overflow (<2 x i32> 2147483647 5) (<2 x i32> 1 -7)))
+          (vals (extractvalue v 0))
+          (ovf (extractvalue v 1)))
+      (call @printf (string "vec %d %d %d %d\n")
+        (extractelement vals (i32 0)) (zext i32 (extractelement ovf (i32 0)))
+        (extractelement vals (i32 1)) (zext i32 (extractelement ovf (i32 1)))))
+    (call @printf (string "fptosi %lld %lld %lld %lld\n")
+      (fptosi-sat i64 (double nan)) (fptosi-sat i64 (double 1e30))
+      (fptosi-sat i64 (double -1e30)) (fptosi-sat i64 (double -2.5)))
+    (call @printf (string "fptoui %d %d %d %d\n")
+      (zext i32 (fptoui-sat i8 (float nan))) (zext i32 (fptoui-sat i8 (float -1.0)))
+      (zext i32 (fptoui-sat i8 (float 300.0))) (zext i32 (fptoui-sat i8 (float 7.9))))
+    (ret (i32 0))))
