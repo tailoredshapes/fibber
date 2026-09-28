@@ -1,21 +1,22 @@
-//! The interpreter's state: the audited heap, the object table, the
-//! activation frames, and the operations of the ownership plan run
-//! against them (own/program.rs, "the evaluation protocol").
+//! A thread of the interpreter: its activation frames and stack, the
+//! shared [`World`] (the audited heap, the object table, ...) reached
+//! through it, and the operations of the ownership plan run against
+//! them (own/program.rs, "the evaluation protocol").
 
-use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
-use crate::expand::ExpandCtx;
-use crate::heap::{Heap, ObjId, ScopeId};
+use crate::heap::ObjId;
 use crate::own::program::{BodyKey, Op, OpKind, OwnedProgram, Site};
-use crate::types::ast::{BindingId, Expr, ExprId};
+use crate::types::ast::{BindingId, ExprId};
 use crate::types::TypedProgram;
 
 use super::error::{RunError, R};
-use super::fx::{FxMap, FxSet};
-use super::object::Objects;
-use super::plan::{literals, value_sites, Plan, Plans};
-use super::raw::RawMemory;
+use super::fx::FxMap;
+use super::plan::Plan;
+use super::sched::Turn;
 use super::value::Val;
+use super::world::World;
 
 /// How much Rust stack evaluation may use below the point where the
 /// interpreter was created, before a run stops with a
@@ -43,7 +44,8 @@ pub fn stack_here() -> usize {
 #[derive(Debug)]
 pub struct Frame<'p> {
     /// The tables of the body being run (§6: a closure's are those of
-    /// the body that created it), an index into [`Interp::plans`].
+    /// the body that created it), an index into
+    /// [`World::plans`].
     pub plan: usize,
     /// Which body that is (a closure made here remembers it).
     pub key: BodyKey,
@@ -72,97 +74,91 @@ impl Frame<'_> {
     }
 }
 
-/// Values cached per program: immortal literals and function values.
-#[derive(Debug, Default)]
-pub struct Statics {
-    /// String and `Form` literals by expression.
-    pub lits: FxMap<ExprId, ObjId>,
-    /// Immortal closures of named functions, builtins, methods, ctors.
-    pub closures: HashMap<String, ObjId>,
-    /// Interned keywords.
-    pub keywords: Vec<String>,
-    /// Keyword ids by name.
-    pub keyword_ids: HashMap<String, u32>,
-}
-
-/// The interpreter over one checked program.
+/// A thread of the interpreter: its own evaluation state, and the
+/// shared [`World`] while it holds the turn (see `threads` for why
+/// this is sound without `unsafe`).
+///
+/// Every access to the world goes through [`Deref`]/[`DerefMut`] (so
+/// `self.heap` is `self.world.heap`), a borrow of `self` that ends
+/// before the next statement that needs `&mut self`; a switch between
+/// threads takes `&mut self`, so the borrow checker proves no
+/// reference into the world lives across one.
 pub struct Interp<'p> {
-    /// The typed program.
-    pub p: &'p TypedProgram,
-    /// Its ownership plan.
-    pub o: &'p OwnedProgram,
-    /// The audited heap.
-    pub heap: Heap,
-    /// What each object is.
-    pub objs: Objects,
+    /// The shared state; `None` only inside a switch, while another
+    /// thread holds the turn.
+    world: Option<Box<World<'p>>>,
     /// The activations, innermost last.
     pub frames: Vec<Frame<'p>>,
-    /// Every body's plan, indexed.
-    pub plans: Plans<'p>,
-    /// Every `fn` and `async` literal, by id.
-    pub lits: FxMap<ExprId, &'p Expr>,
-    /// The instance of every method use the checker resolved to one.
-    pub instances: FxMap<ExprId, usize>,
-    /// The expressions whose values some operation names.
-    pub value_sites: FxSet<ExprId>,
-    /// The scope of each live stack object.
-    pub stack_scopes: FxMap<ObjId, ScopeId>,
-    /// Immortal literals and function values.
-    pub statics: Statics,
-    /// The value of every `def`, once evaluated.
-    pub defs: Vec<Option<Val>>,
-    /// Where the stack was when the interpreter was made.
+    /// Where this thread's stack began.
     pub stack_base: usize,
     /// How much stack below `stack_base` evaluation may use.
     pub stack_budget: usize,
-    /// The `unsafe` byte arena.
-    pub raw: RawMemory,
-    /// The expansion context, when running a macro (gensym, reflection).
-    pub ctx: Option<&'p ExpandCtx>,
-    /// Gensyms handed out outside a macro run.
-    pub gensyms: u64,
-    /// The expansion error a reflection call raised, for the runner.
-    pub expand_error: Option<crate::expand::ExpandError>,
-    /// The input form behind each `Form` object built from a macro's
-    /// arguments, so that the macro's result keeps their positions
-    /// (syntax §1.3); filled while `recording_inputs`.
-    pub input_forms: FxMap<ObjId, crate::syntax::Form>,
-    /// Whether `Form` objects being built are a macro's input.
-    pub recording_inputs: bool,
-    /// The weak box of each object that has one (§8.7: the first `weak`
-    /// of an object allocates its box, later ones find it).
-    pub weak_boxes: FxMap<ObjId, ObjId>,
-    /// The executor's scheduler (`sched`, `threads`).
-    pub sched: super::sched::Sched<'p>,
+    /// The turn, through which the world passes between threads.
+    pub turn: Arc<Turn<Box<World<'p>>>>,
+}
+
+impl<'p> Deref for Interp<'p> {
+    type Target = World<'p>;
+
+    #[inline]
+    fn deref(&self) -> &World<'p> {
+        // Cannot fail: the world is taken out only in `switch` and at a
+        // thread's end, which put it back before any code of the
+        // thread runs again, or unwind (touching nothing) if the run
+        // was closed; a worker gets one before it runs a job.
+        self.world
+            .as_deref()
+            .expect("the running thread holds the world")
+    }
+}
+
+impl DerefMut for Interp<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Cannot fail: as for `deref`.
+        self.world
+            .as_deref_mut()
+            .expect("the running thread holds the world")
+    }
 }
 
 impl<'p> Interp<'p> {
     /// An interpreter over `p` and its plan `o`, with an empty heap.
     pub fn new(p: &'p TypedProgram, o: &'p OwnedProgram) -> Self {
         Interp {
-            p,
-            o,
-            heap: Heap::new(),
-            objs: Objects::default(),
+            world: Some(Box::new(World::new(p, o))),
             frames: Vec::new(),
-            plans: Plans::new(o),
-            lits: literals(p),
-            instances: super::plan::instances(p),
-            value_sites: value_sites(o),
-            stack_scopes: FxMap::default(),
-            statics: Statics::default(),
-            defs: vec![None; p.globals.defs.len()],
             stack_base: stack_here(),
             stack_budget: STACK_BUDGET,
-            raw: RawMemory::default(),
-            ctx: None,
-            gensyms: 0,
-            expand_error: None,
-            input_forms: FxMap::default(),
-            recording_inputs: false,
-            weak_boxes: FxMap::default(),
-            sched: super::sched::Sched::default(),
+            turn: Arc::default(),
         }
+    }
+
+    /// A thread of a run whose turn is `turn`, holding no world yet.
+    pub fn thread(turn: Arc<Turn<Box<World<'p>>>>) -> Self {
+        Interp {
+            world: None,
+            frames: Vec::new(),
+            stack_base: stack_here(),
+            stack_budget: STACK_BUDGET,
+            turn,
+        }
+    }
+
+    /// The world, given away: this thread no longer holds it.
+    pub fn take_world(&mut self) -> Option<Box<World<'p>>> {
+        self.world.take()
+    }
+
+    /// The world, handed back to this thread.
+    pub fn put_world(&mut self, w: Box<World<'p>>) {
+        self.world = Some(w);
+    }
+
+    /// The world itself, for borrows of several of its fields at once.
+    #[inline]
+    pub fn w(&mut self) -> &mut World<'p> {
+        self
     }
 
     /// The index of the plan of the body `key`.

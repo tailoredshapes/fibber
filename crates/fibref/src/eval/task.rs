@@ -106,7 +106,8 @@ impl<'p> Interp<'p> {
     }
 
     fn task_mut(&mut self, id: ObjId) -> R<&mut TaskData> {
-        match self.objs.get_mut(&self.heap, id)? {
+        let w = self.w();
+        match w.objs.get_mut(&w.heap, id)? {
             Obj::Task(t) => Ok(t),
             o => Err(RunError::internal(format!("not a task: {o:?}"))),
         }

@@ -12,7 +12,8 @@
 //!   weak box, task, `Form`) is a heap object of the right `Kind`, with
 //!   the interpreter's view of it in the object table. `Option` is
 //!   unboxed with a real tag and allocates nothing (§8.1, §4.5).
-//! - [`interp`]: frames, sites and the plan's operations; [`alloc`]:
+//! - [`interp`]: a thread's state, frames, sites and the plan's
+//!   operations; [`world`]: the state the threads share; [`alloc`]:
 //!   heap, stack (§6.11) and immortal (§8.2) placement.
 //! - [`expr`], [`pattern`], [`call`], [`closure`]: the core forms, calls
 //!   and tail calls (a trampoline: a chain of tail calls runs in
@@ -54,6 +55,7 @@ pub mod unsafe_ops;
 pub mod value;
 pub mod vec_view;
 pub mod vecs;
+pub mod world;
 
 #[cfg(test)]
 mod tests;

@@ -140,7 +140,8 @@ impl Interp<'_> {
     /// consumed count of `v`.
     pub fn write_slot(&mut self, id: ObjId, v: Val) -> R<()> {
         self.heap.write(id, 0, v.project())?;
-        match self.objs.get_mut(&self.heap, id)? {
+        let w = self.w();
+        match w.objs.get_mut(&w.heap, id)? {
             Obj::Cell(slot) | Obj::Atom(slot) => *slot = v,
             o => return Err(RunError::internal(format!("{id} is not a cell: {o:?}"))),
         }

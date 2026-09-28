@@ -139,9 +139,9 @@ pub fn with_threads<T>(
         let mut it = Interp::new(p, o);
         it.ctx = ctx;
         it.sched.spawner = Some(s);
-        // Declared after `it`, so dropped first: the idle workers are
-        // released before the interpreter goes.
-        let _close = CloseOnDrop(std::sync::Arc::clone(&it.sched.turn));
+        // Dropped when `f` and the drain are done (or unwound), before
+        // the scope waits for its threads: the idle workers return.
+        let _close = CloseOnDrop(std::sync::Arc::clone(&it.turn));
         let r = f(&mut it);
         it.drain();
         r

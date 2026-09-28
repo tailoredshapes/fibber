@@ -2,25 +2,31 @@
 //! the policy, spec/types.md §8.8 for its specification).
 //!
 //! A spawned thread runs on an OS thread of its own, a [`worker`]
-//! started from the run's [`std::thread::Scope`] with a pointer to the
-//! one interpreter all threads share; when the thread finishes, the
-//! worker waits, idle, to run a later one. Only the thread holding the
-//! [`Turn`] touches the interpreter: a thread gives the turn away only
-//! in [`Interp::switch`] and at its end, after its last access, and
-//! after giving it touches nothing until the turn comes back; the
-//! turn's mutex orders the accesses of successive holders. So the
-//! interpreter is never used by two threads at once, which is what the
-//! `unsafe` below relies on. (A suspended thread keeps a `&mut Interp`
-//! on its stack, unused while it waits; the aliasing model of the Rust
-//! reference does not bless that pattern, but no code can observe it:
-//! every suspension is inside a call that is given that same `&mut`,
-//! so nothing is cached across it.) When the run ends, `drain` has
-//! finished every thread, so every worker is idle, waiting for a turn
-//! and touching nothing; the run then closes the turn, before the
-//! interpreter is dropped, and each worker returns. A run that ends
-//! another way (a panic) closes the turn too, and a thread suspended in
-//! the middle of its work then unwinds without touching the
-//! interpreter.
+//! started from the run's [`std::thread::Scope`]; when the thread
+//! finishes, the worker waits, idle, to run a later one. Each OS thread
+//! has an [`Interp`] of its own: its frames and its stack, which no
+//! other thread sees. What the threads share (the heap, the objects,
+//! the atoms and tasks, the `def`s, the scheduler) is the
+//! [`World`](super::world::World), and exactly one thread owns it: the
+//! one holding the [`Turn`]. At a switch ([`Interp::switch`]) and at
+//! its end, a thread moves its world out of its `Interp` and into the
+//! turn, by value, and the next holder moves it into its own; a thread
+//! without the world blocks until the turn hands it one.
+//!
+//! This is safe Rust, and the compiler checks the argument, not a
+//! comment: the world is a `Box` owned by one `Interp` at a time,
+//! moved between OS threads through the turn's mutex, which needs only
+//! that it is `Send` (it is, by its fields); every access to it
+//! borrows the `Interp` it is in, and a switch takes that `Interp` by
+//! `&mut`, so no reference into the world can live across a switch.
+//! (The crate forbids `unsafe` code.)
+//!
+//! When the run ends, `drain` has finished every thread, so every
+//! worker is idle, waiting for a turn, and the world is back with the
+//! thread that runs `main`; the run then closes the turn and each
+//! worker returns. A run that ends another way (a panic) closes the
+//! turn too, and a thread suspended in the middle of its work, which
+//! holds no world, unwinds.
 
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
@@ -33,31 +39,16 @@ use super::error::{RunError, R};
 use super::interp::{stack_here, Interp, STACK_BUDGET};
 use super::object::TaskState;
 use super::pipeline::STACK_BYTES;
-use super::sched::{Job, Saved, Tid, Turn, Wait, QUANTUM};
-
-/// The interpreter, as handed to a spawned thread's OS thread.
-struct Shared<'p>(*mut Interp<'p>);
-
-// SAFETY: the pointer is dereferenced only by the holder of the turn
-// (module documentation), so the interpreter is never accessed from two
-// OS threads at once, and the turn's mutex orders the accesses.
-unsafe impl Send for Shared<'_> {}
-
-impl<'p> Shared<'p> {
-    /// The pointer (a method, so that a closure captures the whole
-    /// `Shared` and not its non-`Send` field).
-    fn get(&self) -> *mut Interp<'p> {
-        self.0
-    }
-}
+use super::sched::{Job, Tid, Turn, Wait, QUANTUM};
+use super::world::World;
 
 /// The unwind payload of a thread whose run was closed while it waited.
 struct Closed;
 
 /// Closes the turn when the run ends, however it ends.
-pub struct CloseOnDrop(pub Arc<Turn>);
+pub struct CloseOnDrop<W>(pub Arc<Turn<W>>);
 
-impl Drop for CloseOnDrop {
+impl<W> Drop for CloseOnDrop<W> {
     fn drop(&mut self) {
         self.0.close();
     }
@@ -96,12 +87,11 @@ impl<'p> Interp<'p> {
             .pick()
             .ok_or_else(|| RunError::internal("no thread to run"))?;
         if next != me {
-            self.save(me);
-            let turn = self.hand_over(next);
-            if !turn.wait(me) {
-                resume_unwind(Box::new(Closed));
+            self.hand_over(next);
+            match self.turn.wait(me) {
+                Some(w) => self.put_world(w),
+                None => resume_unwind(Box::new(Closed)),
             }
-            self.restore(me)?;
         }
         match &self.sched.abort {
             Some(e) => Err(e.clone()),
@@ -109,34 +99,14 @@ impl<'p> Interp<'p> {
         }
     }
 
-    /// Gives the turn to `next`, with a fresh quantum. The caller must
-    /// not touch the interpreter afterwards until it holds the turn.
-    fn hand_over(&mut self, next: Tid) -> Arc<Turn> {
+    /// Gives the turn to `next`, with a fresh quantum, and the world
+    /// with it: this thread holds none until it is handed one back.
+    fn hand_over(&mut self, next: Tid) {
         self.sched.left = QUANTUM;
         self.sched.current = next;
-        let turn = Arc::clone(&self.sched.turn);
-        turn.give(next);
-        turn
-    }
-
-    fn save(&mut self, t: Tid) {
-        let s = Saved {
-            frames: std::mem::take(&mut self.frames),
-            stack_base: self.stack_base,
-            stack_budget: self.stack_budget,
-        };
-        self.sched.saved.insert(t, s);
-    }
-
-    fn restore(&mut self, t: Tid) -> R<()> {
-        let s =
-            self.sched.saved.remove(&t).ok_or_else(|| {
-                RunError::internal(format!("thread {t} resumed with no saved state"))
-            })?;
-        self.frames = s.frames;
-        self.stack_base = s.stack_base;
-        self.stack_budget = s.stack_budget;
-        Ok(())
+        if let Some(w) = self.take_world() {
+            self.turn.give(next, w);
+        }
     }
 
     /// Starts thread `tid` running `job`, on the idle OS thread waiting
@@ -160,10 +130,9 @@ impl<'p> Interp<'p> {
             .sched
             .spawner
             .ok_or_else(|| RunError::unsupported("spawn in a run that cannot start threads"))?;
-        let turn = Arc::clone(&self.sched.turn);
-        let shared = Shared(self as *mut Interp<'p>);
+        let turn = Arc::clone(&self.turn);
         spawner
-            .start(STACK_BYTES, Box::new(move || worker(shared, turn, tid)))
+            .start(STACK_BYTES, Box::new(move || worker(turn, tid)))
             .map_err(|e| RunError::unsupported(format!("cannot start a thread: {e}")))
     }
 
@@ -235,11 +204,13 @@ impl<'p> Interp<'p> {
 
 /// The body of an OS thread that runs spawned threads: the one it was
 /// started for, then, idle, whichever the scheduler hands it, until the
-/// run is closed.
-fn worker(shared: Shared<'_>, turn: Arc<Turn>, mut tid: Tid) {
-    while turn.wait(tid) {
-        // SAFETY: this thread holds the turn (module documentation).
-        let it = unsafe { &mut *shared.get() };
+/// run is closed. The thread has an [`Interp`] of its own, which holds
+/// the world only between the turn handing it over and the thread
+/// handing it on.
+fn worker<'p>(turn: Arc<Turn<Box<World<'p>>>>, mut tid: Tid) {
+    let mut it = Interp::thread(turn);
+    while let Some(w) = it.turn.wait(tid) {
+        it.put_world(w);
         match it.run_job(tid) {
             Some(next) => tid = next,
             None => return,

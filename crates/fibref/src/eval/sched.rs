@@ -1,6 +1,7 @@
 //! The executor's scheduler (spec/types.md §8.8, "The reference
 //! interpreter's schedule"): which thread runs, which wait, and the
-//! turn that hands the interpreter from one OS thread to the next.
+//! turn that hands the interpreter's shared world from one OS thread to
+//! the next.
 //!
 //! Every thread a program spawns runs on an OS thread of its own (it
 //! needs a stack of its own to be suspended in the middle of an
@@ -13,13 +14,12 @@
 //! scheduler's state; the switching itself is in `threads`.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Condvar, Mutex, PoisonError};
 
 use crate::heap::ObjId;
 
 use super::error::RunError;
 use super::fx::FxMap;
-use super::interp::Frame;
 use super::value::Val;
 use crate::syntax::Pos;
 
@@ -69,51 +69,91 @@ impl<'s> Spawn<'s> for std::thread::Scope<'s, '_> {
     }
 }
 
-/// Whose turn it is to run, shared by the OS threads of one run. A
-/// thread touches the interpreter only while it holds the turn; the
-/// mutex's release and acquire order everything one holder did before
-/// everything the next does.
-#[derive(Debug, Default)]
-pub struct Turn {
-    /// The holder, and whether the run is over (no turn will come).
-    state: Mutex<(Tid, bool)>,
+/// Whose turn it is to run, shared by the OS threads of one run, and
+/// the slot through which the holder hands the next one what only the
+/// holder may have, the `W` (the interpreter's world): by value, under
+/// the mutex, so the next holder owns it outright.
+#[derive(Debug)]
+pub struct Turn<W> {
+    state: Mutex<Holder<W>>,
     changed: Condvar,
 }
 
-impl Turn {
-    /// Gives the turn to `t`.
-    pub fn give(&self, t: Tid) {
+/// The state of a [`Turn`].
+#[derive(Debug)]
+struct Holder<W> {
+    /// Who holds the turn.
+    tid: Tid,
+    /// What they are handed, until they take it.
+    slot: Option<W>,
+    /// Whether the run is over (no turn will come).
+    closed: bool,
+}
+
+impl<W> Default for Turn<W> {
+    fn default() -> Self {
+        Turn {
+            state: Mutex::new(Holder {
+                tid: 0,
+                slot: None,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+impl<W> Turn<W> {
+    /// Gives the turn, and `w`, to `t`.
+    pub fn give(&self, t: Tid, w: W) {
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        s.0 = t;
+        s.tid = t;
+        s.slot = Some(w);
         self.changed.notify_all();
     }
 
-    /// Waits until `t` holds the turn: `true`, or `false` if the run
-    /// was closed first (the interpreter is gone; touch nothing). It
-    /// polls a while, yielding the processor, before it sleeps: a turn
-    /// usually comes back soon (a short spawned thread, a spin-wait's
-    /// partner), and waking a sleeping thread costs far more.
-    pub fn wait(&self, t: Tid) -> bool {
+    /// Waits until `t` holds the turn, and takes what it was handed; or
+    /// `None` if the run was closed first. It polls a while, yielding
+    /// the processor, before it sleeps: a turn usually comes back soon
+    /// (a short spawned thread, a spin-wait's partner), and waking a
+    /// sleeping thread costs far more.
+    pub fn wait(&self, t: Tid) -> Option<W> {
         for _ in 0..POLLS {
-            let s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            if s.0 == t || s.1 {
-                return s.0 == t && !s.1;
+            let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(r) = s.take_for(t) {
+                return r;
             }
             drop(s);
             std::thread::yield_now();
         }
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        while s.0 != t && !s.1 {
+        loop {
+            if let Some(r) = s.take_for(t) {
+                return r;
+            }
             s = self.changed.wait(s).unwrap_or_else(PoisonError::into_inner);
         }
-        s.0 == t && !s.1
     }
 
     /// Ends the run: every thread still waiting gives up.
     pub fn close(&self) {
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        s.1 = true;
+        s.closed = true;
         self.changed.notify_all();
+    }
+}
+
+impl<W> Holder<W> {
+    /// `Some` once `t`'s wait is over: what `t` was handed, or `None`
+    /// if the run is closed.
+    fn take_for(&mut self, t: Tid) -> Option<Option<W>> {
+        if self.closed {
+            return Some(None);
+        }
+        if self.tid == t && self.slot.is_some() {
+            return Some(self.slot.take());
+        }
+        None
     }
 }
 
@@ -129,21 +169,8 @@ pub struct Job {
     pub pos: Pos,
 }
 
-/// What a suspended thread had in the interpreter.
-#[derive(Debug)]
-pub struct Saved<'p> {
-    /// Its activations.
-    pub frames: Vec<Frame<'p>>,
-    /// Where its stack began.
-    pub stack_base: usize,
-    /// How much stack it may use.
-    pub stack_budget: usize,
-}
-
 /// The scheduler's state.
 pub struct Sched<'p> {
-    /// The turn.
-    pub turn: Arc<Turn>,
     /// Where new OS threads come from; `None` runs no threads.
     pub spawner: Option<&'p dyn Spawn<'p>>,
     /// The thread holding the turn.
@@ -154,8 +181,6 @@ pub struct Sched<'p> {
     pub ready: VecDeque<Tid>,
     /// Blocked threads, in the order they blocked.
     pub blocked: Vec<(Tid, Wait)>,
-    /// The state of every suspended thread.
-    pub saved: FxMap<Tid, Saved<'p>>,
     /// The job of every thread started and not yet running.
     pub jobs: FxMap<Tid, Job>,
     /// The numbers under which idle OS threads, whose threads finished,
@@ -184,13 +209,11 @@ impl std::fmt::Debug for Sched<'_> {
 impl Default for Sched<'_> {
     fn default() -> Self {
         Sched {
-            turn: Arc::default(),
             spawner: None,
             current: 0,
             last: 0,
             ready: VecDeque::new(),
             blocked: Vec::new(),
-            saved: FxMap::default(),
             jobs: FxMap::default(),
             idle: Vec::new(),
             live: 0,
@@ -322,10 +345,10 @@ mod tests {
     #[test]
     fn a_closed_turn_releases_its_waiters() {
         let turn = Turn::default();
-        turn.give(1);
-        assert!(turn.wait(1));
+        turn.give(1, ());
+        assert!(turn.wait(1).is_some());
         turn.close();
-        assert!(!turn.wait(2));
-        assert!(!turn.wait(1));
+        assert!(turn.wait(2).is_none());
+        assert!(turn.wait(1).is_none());
     }
 }

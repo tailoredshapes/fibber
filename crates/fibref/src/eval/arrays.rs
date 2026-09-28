@@ -132,7 +132,8 @@ impl<'p> Interp<'p> {
         let content = self.slot(place)?.expect_obj("the content of a place")?;
         if self.heap.is_unique(content)? {
             self.heap.write_unique(place, i, x.project())?;
-            match self.objs.get_mut(&self.heap, content)? {
+            let w = self.w();
+            match w.objs.get_mut(&w.heap, content)? {
                 Obj::Array(items) => items[i] = x.clone(),
                 Obj::Struct { fields, .. } => fields[i] = x.clone(),
                 o => return Err(RunError::internal(format!("a unique write to {o:?}"))),
