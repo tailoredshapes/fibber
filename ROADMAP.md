@@ -68,14 +68,46 @@ Decisions taken on the way are in spec/types.md §10.
       hung under the run-to-completion executor; the fair executor runs
       it (cases 166 to 168)
 
-## M3. Hardened lIR
+## M3. Hardened lIR — done
 
-Port lIR from liar with the fixes in lir-audit/: verification on by
-default, a module-level type checker, the ADR 021 layer removed,
-string globals, `fence` and `indirect-call` fixed, `musttail`, and
-end-to-end ahead-of-time tests. The JIT is a first-class path, not an
-extra: `lair` is usable as a library that compiles a module and returns
-callable functions, because compilers run macros through it (M4, M6).
+lIR ported from liar with the fixes in lir-audit/ and specified in
+spec/lir.md (**Decided**, owner, 2026-09-28). `crates/lir` is the
+reader, AST and whole-module checker, with no LLVM dependency;
+`crates/lair` lowers checked modules through LLVM 21, as a JIT and
+ahead of time, and runs the case suite. Every case in cases/lir runs
+through both paths in its own process, and both must agree.
+
+- [x] method.md rule 7: the checker and the LLVM verifier run on every
+      path and cannot be turned off; an invalid module is an error with
+      a position, never a backend crash or wrong code (cases/lir/verify,
+      cases/lir/adversarial; `lir-audit/README.md` records what each of
+      liar's findings did and which case pins its fix)
+- [x] the ADR 021 layer removed; string globals, `fence`,
+      `indirect-call` (now typed) fixed; `tailcall` is `musttail` under
+      `tailcc`, so a 10^7-deep tail recursion runs in constant stack
+- [x] end-to-end ahead-of-time tests: 317 cases in cases/lir (63
+      accept, 254 reject), each through the JIT and through AOT
+      (`cargo test -p lair`, `lair cases cases/lir`); the checker alone
+      re-runs them without LLVM (`cargo test -p lir`)
+- [x] `lair` as a library: `Jit` compiles modules in-process and returns
+      callable functions; a later module reaches an earlier one by
+      `declare` and `declare-global`; a `tailcc` function is called from
+      Rust through a `ccc` trampoline the `Jit` generates. The macro
+      mechanism of M4 and M6 — compile a module, call a function of it,
+      add another module that uses the first — is
+      `crates/lair/tests/jit.rs`, "a compiler runs a macro"
+- [x] the owner's decisions on lIR's seven open questions (lir.md §14),
+      and types.md §8 rewritten to what lIR now holds: `switch`, struct
+      `alloca`s, arrays, static data for every constant object, the
+      overflow and saturation intrinsics for the checked arithmetic
+- [x] what the mapping still lacked, proposed in lir.md §14.1 with
+      cases: array types, linkage and visibility, `declare-global`, the
+      intrinsics and `trap`, `volatile` and `(align N)`
+- [x] CI: the `lair` job installs LLVM 21 from apt.llvm.org and runs
+      apart from the `fibref` job, which stays LLVM-free
+- [ ] not ported: liar's interactive lIR REPL (`lir-repl`) and
+      expression evaluator (`lir`). Nothing in M4 to M6 needs them; a
+      compiler runs lIR through `lair run` or the `Jit`
 
 ## M4. Compiler (`fibc`, in Rust)
 

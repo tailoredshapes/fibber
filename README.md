@@ -21,14 +21,24 @@ the way; a small working language is one of them, not the destination.
 ## Status
 
 The reference interpreter runs: every case passes with a clean memory
-audit. Nothing counts as implemented until an executable test says so.
+audit. lIR, the assembler the compiler will emit, is specified,
+implemented and checked on both its paths. Nothing counts as
+implemented until an executable test says so.
 
 ```
-cargo test --workspace                          # the full suite
+cargo test --workspace                          # the full suite (lair needs LLVM 21)
 cargo run -p fibref -- cases cases/ownership    # 166 cases
 cargo run -p fibref -- run   <file.fib>         # result and memory audit
 cargo run -p fibref -- explain <file.fib>       # the ownership decisions
+cargo run -p lair -- cases cases/lir            # 317 lIR cases, JIT and AOT
+cargo run -p lair -- run   <file.lir>           # JIT-compile and run main
+cargo run -p lair -- build <file.lir> -o out    # native executable
+cargo run -p lair -- check <file.lir>           # the checker alone
 ```
+
+`lair` links LLVM 21 statically through llvm-sys: set
+`LLVM_SYS_211_PREFIX` to an LLVM 21 install that has `llvm-config`
+(apt.llvm.org's `llvm-21-dev`; see `.github/workflows/ci.yml`).
 
 | Part | Where | State |
 |------|-------|-------|
@@ -40,5 +50,7 @@ cargo run -p fibref -- explain <file.fib>       # the ownership decisions
 | Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
 | Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
 | Library | [lib/prelude.fib](lib/prelude.fib) | what the cases need |
-| lIR (hardened, from liar) | — | not started (M3) |
+| lIR: the assembler for LLVM IR that `fibc` will emit | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28); the additions of the second M3 pass proposed (§14.1) |
+| lIR cases | [cases/lir/](cases/lir/) | 317, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial; verify: one reject case per rule) |
+| lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |
 | Compiler `fibc` | — | not started (M4) |

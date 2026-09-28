@@ -25,7 +25,10 @@ test says so; claims in docs, commit messages and chat carry no weight.
 | `spec/` | the specification; its executable form is `fibref` |
 | `cases/` | test programs with verdicts fixed in their headers |
 | `crates/fibref` | the reference interpreter and memory audit |
-| `lir-audit/` | findings from auditing liar's lIR; input to hardening |
+| `crates/fibgen` | the random program generator (method rule 5) |
+| `crates/lir` | lIR's reader, AST and whole-module checker; no LLVM |
+| `crates/lair` | lIR to native through LLVM 21: JIT, AOT, the lIR case harness. Needs `LLVM_SYS_211_PREFIX` |
+| `lir-audit/` | findings from auditing liar's lIR, each re-established as a case in `cases/lir/audit` |
 
 ## Rust standards
 
