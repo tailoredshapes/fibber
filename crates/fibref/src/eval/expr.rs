@@ -64,7 +64,7 @@ impl<'p> Interp<'p> {
             ExprKind::Loop(vs, body) => return self.loop_form(vs, body),
             ExprKind::Recur(args) => return self.recur(e, args),
             ExprKind::Field(x, name, _) => self.field_of(x, name)?,
-            ExprKind::Deref(p, _) => self.deref_place(p)?,
+            ExprKind::Deref(p, _) => self.deref_place(e, p)?,
             ExprKind::Set(p, v) => self.set_place(p, v)?,
             ExprKind::SetField(b, f, v) => self.set_field(*b, f, v)?,
             ExprKind::Async(..) => self.make_async(e)?,

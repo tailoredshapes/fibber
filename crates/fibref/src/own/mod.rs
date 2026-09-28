@@ -38,7 +38,7 @@ mod walk;
 mod tests;
 
 pub use error::{CheckError, OwnError, OwnErrorKind};
-pub use objects::is_object;
+pub use objects::{is_object, option_rep, OptionRep};
 pub use program::OwnedProgram;
 pub use taken::{methods_taken, value_taken};
 pub use top::analyse;

@@ -6,6 +6,7 @@
 //! another thread did while `f` ran.
 
 use crate::heap::Kind;
+use crate::own::{option_rep, OptionRep};
 use crate::syntax::Pos;
 use crate::types::ast::{Expr, Place};
 
@@ -27,15 +28,27 @@ impl<'p> Interp<'p> {
     }
 
     /// `@p` (§6.7): a cell or atom's content, acquired (+1); a weak
-    /// reference upgraded: `(some x)` retained, or `nil`.
-    pub fn deref_place(&mut self, p: &'p Place) -> R<Val> {
+    /// reference upgraded: `(some x)` retained, or `nil`, represented
+    /// as `e`'s static `Option` type says (§8.1: a heap enum for a
+    /// `dyn` target, §8.7; nothing for another object).
+    pub fn deref_place(&mut self, e: &'p Expr, p: &'p Place) -> R<Val> {
         let c = self.place_cell(p)?;
-        self.deref_val(&c)
+        let rep = self
+            .p
+            .expr_types
+            .get(&e.id)
+            .and_then(|t| option_rep(&self.p.globals, t));
+        let at = match rep {
+            Some(OptionRep::HeapEnum) => Placement::Heap,
+            Some(OptionRep::Pointer) => Placement::Unboxed,
+            _ => Placement::Undecided,
+        };
+        self.deref_val(&c, at)
     }
 
     /// `@c` on a value; on an atom or a weak reference, a scheduling
-    /// point first.
-    pub fn deref_val(&mut self, c: &Val) -> R<Val> {
+    /// point first. `at` places an upgrade's `Option`.
+    pub fn deref_val(&mut self, c: &Val, at: Placement) -> R<Val> {
         let id = c.expect_obj("the operand of @")?;
         if matches!(self.objs.get(&self.heap, id)?, Obj::Atom(_) | Obj::Weak(_)) {
             self.tick()?;
@@ -43,10 +56,17 @@ impl<'p> Interp<'p> {
         if let Obj::Weak(target) = self.objs.get(&self.heap, id)? {
             let target = *target;
             self.heap.read(id, 0)?;
-            return Ok(match self.heap.upgrade(target)? {
-                Some(t) => Val::Some(Box::new(Val::Obj(t))),
-                None => Val::None,
-            });
+            let Some(t) = self.heap.upgrade(target)? else {
+                return self.option_value(Some(0), Vec::new(), at);
+            };
+            // The upgrade's count passes to a heap enum's store (E2);
+            // an unboxed `some` keeps it as the payload's own.
+            let t = Val::Obj(t);
+            let v = self.option_value(Some(1), vec![t.clone()], at)?;
+            if !matches!(v, Val::Some(_)) {
+                self.give_back(std::slice::from_ref(&t))?;
+            }
+            return Ok(v);
         }
         let v = self.slot(id)?;
         self.retain(&v)?;

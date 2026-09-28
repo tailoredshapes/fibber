@@ -25,7 +25,7 @@ impl Interp<'_> {
             .first()
             .ok_or_else(|| RunError::internal(format!("{name} without a receiver")))?;
         match proto.name.as_str() {
-            "Deref" => self.deref_val(x),
+            "Deref" => self.deref_val(x, Placement::Undecided),
             "Show" => {
                 let text = self.show(x)?;
                 self.new_str(text, Placement::Heap)

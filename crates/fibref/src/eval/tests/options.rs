@@ -44,6 +44,32 @@ fn nested_options_are_boxed_and_distinct() {
 }
 
 #[test]
+fn an_upgrade_of_a_weak_dyn_is_a_heap_enum() {
+    // types §8.7: `@w` on a `(Weak (dyn P))` is `(some { t, vt })` as a
+    // heap enum, or the heap enum of tag `nil`; on any other `Weak` it
+    // allocates nothing.
+    let live = "(defstruct A (n: i64))
+                (impl Show A (show (self) \"A\"))
+                (defun main () -> i64
+                  (let ((b (A 3)) (w (weak (dyn Show b))))
+                    (match @w ((some d) (str-len (show d))) (nil 0))))";
+    assert_eq!(allocated(live), 3, "A, its weak box and the some");
+    clean(live, 1);
+    let dead = "(defstruct A (n: i64))
+                (impl Show A (show (self) \"A\"))
+                (defun main () -> i64
+                  (let ((w (let ((b (A 3))) (weak (dyn Show b)))))
+                    (match @w ((some d) (str-len (show d))) (nil 7))))";
+    assert_eq!(allocated(dead), 3, "A, its weak box and the nil");
+    clean(dead, 7);
+    let plain = "(defstruct A (n: i64))
+                 (defun main () -> i64
+                   (let ((b (A 3)) (w (weak b)))
+                     (match @w ((some a) (. a n)) (nil 0))))";
+    assert_eq!(allocated(plain), 2, "A and its weak box only");
+}
+
+#[test]
 fn a_generic_some_is_boxed_by_its_payload() {
     let src = "(defun wrap (x) (some x))
                (defun main () -> i64

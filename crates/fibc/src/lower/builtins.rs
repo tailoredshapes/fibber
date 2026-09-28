@@ -33,14 +33,30 @@ impl<'a> Cx<'_, 'a> {
             }
             "weak" => {
                 let x = arg(0)?.clone();
-                if x.ty() != Some(LirTy::Ptr) {
-                    return Err(Unsupported("weak of a dyn".into()));
-                }
                 let (tid, _) = self.p.object(&self.ty(e)?)?;
-                self.b.val(
-                    &format!("(call @fib.weak {} (i32 {tid}))", x.text()),
-                    LirTy::Ptr,
-                )
+                match x.ty() {
+                    Some(LirTy::Ptr) => self.b.val(
+                        &format!("(call @fib.weak {} (i32 {tid}))", x.text()),
+                        LirTy::Ptr,
+                    ),
+                    // §8.7: the box of the object behind the `dyn`, with
+                    // its vtable.
+                    Some(LirTy::Dyn) => {
+                        let obj = self
+                            .b
+                            .val(&format!("(extractvalue {} 0)", x.text()), LirTy::Ptr);
+                        let vt = self
+                            .b
+                            .val(&format!("(extractvalue {} 1)", x.text()), LirTy::Ptr);
+                        let bx = self.b.val(
+                            &format!("(call @fib.weak {} (i32 {tid}))", obj.text()),
+                            LirTy::Ptr,
+                        );
+                        self.b
+                            .val(&format!("{{ {} {} }}", bx.text(), vt.text()), LirTy::Dyn)
+                    }
+                    _ => return Err(Unsupported("weak of a scalar".into())),
+                }
             }
             "gensym" => {
                 let hook = self.load(LirTy::Ptr, "@fibm.gensym-hook");

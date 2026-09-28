@@ -35,15 +35,19 @@ impl<'a> Cx<'_, 'a> {
             Some(Alloc::Nothing) => Err(Unsupported(
                 "an allocation the plan says allocates nothing".into(),
             )),
-            Some(Alloc::Heap) | None => Ok(self
-                .b
-                .val(
-                    &format!("(call @fib.alloc (i64 {size}) (i32 {tid}))"),
-                    LirTy::Ptr,
-                )
-                .text()
-                .to_string()),
+            Some(Alloc::Heap) | None => Ok(self.heap_alloc(tid, size)),
         }
+    }
+
+    /// A counted heap object of `size` bytes, count 1.
+    pub fn heap_alloc(&mut self, tid: u32, size: u64) -> String {
+        self.b
+            .val(
+                &format!("(call @fib.alloc (i64 {size}) (i32 {tid}))"),
+                LirTy::Ptr,
+            )
+            .text()
+            .to_string()
     }
 
     /// A constructor call: the object with its fields stored.

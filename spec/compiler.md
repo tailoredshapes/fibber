@@ -276,3 +276,12 @@ Recorded as they arise; none changes §8.
    as the interpreter allocates one (eval/task.rs `result_atom`), so
    that the threaded trace tallies agree; §8.8's task holds `result`
    inline.
+10. **`@w` on a `(Weak (dyn P))` allocates** (**Decided**, owner,
+    2026-09-28). §8.7 makes the result a heap enum, `(some { t, vt })`
+    or the tag `nil`; the interpreter returned an unboxed `some` and
+    allocated nothing, so under §4 no compiled program could agree
+    with its trace (case 87). The interpreter now follows §8.7: an
+    upgrade whose static type is `(Option (dyn P))` goes through
+    `option_value` with heap placement (eval/cells.rs), and `fibc`
+    emits the same two allocations (`lower/cells.rs`). A weak
+    reference to any other object type still allocates nothing.

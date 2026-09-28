@@ -35,6 +35,8 @@ cargo run -p lair -- run   <file.lir>           # JIT-compile and run main
 cargo run -p lair -- build <file.lir> -o out    # native executable
 cargo run -p lair -- check <file.lir>           # the checker alone
 cargo run -p lair -- fuzz cases/lir --count N   # mutation fuzzer over the accept cases (spec/lir.md §10.1)
+cargo run -p fibc -- cases cases/ownership      # every case interpreted and compiled, traces compared (method rule 6)
+cargo run -p fibc -- run   <file.fib>           # compile through the JIT and run main
 ```
 
 `lair` links LLVM 21 statically through llvm-sys: set
@@ -54,4 +56,4 @@ cargo run -p lair -- fuzz cases/lir --count N   # mutation fuzzer over the accep
 | lIR: the assembler for LLVM IR that `fibc` will emit | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28; the second M3 pass's additions decided the same day, §14 items 8 to 11) |
 | lIR cases | [cases/lir/](cases/lir/) | 323, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial, the fuzzer's findings among them; verify: one reject case per rule) |
 | lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |
-| Compiler `fibc` | — | not started (M4) |
+| Compiler `fibc`: `fibref`'s front end lowered to lIR, the runtime `fib.rt`, the rule-6 harness, macros through the JIT | [spec/compiler.md](spec/compiler.md), [crates/fibc](crates/fibc) | in progress (M4): 165 of the 166 cases pass interpreted and compiled, 1 pending |

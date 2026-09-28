@@ -8,8 +8,8 @@ use fibref::types::ty::{Con, Ty};
 use super::{Cx, R};
 use crate::compile::Unsupported;
 use crate::ir::{LirTy, V};
-use crate::layout::variants;
-use crate::objects::{ATOM_LOCK, ATOM_VALUE, CELL_VALUE, STRUCT_FIELD0};
+use crate::layout::{option_rep, variants, OptRep};
+use crate::objects::{ATOM_LOCK, ATOM_VALUE, CELL_VALUE, ENUM_TAG, STRUCT_FIELD0, VARIANT_FIELD0};
 
 impl<'a> Cx<'_, 'a> {
     /// The cell (or atom) a place names and its type.
@@ -54,14 +54,72 @@ impl<'a> Cx<'_, 'a> {
     }
 
     /// `@w` on a weak box: the target retained if alive, else `nil`
-    /// (§8.7); only for targets whose `Option` is a nullable pointer.
+    /// (§8.7). For a `dyn` target the value is `{ box, vt }` and the
+    /// result a heap enum, `(some { t, vt })` or the tag `nil` (§8.1),
+    /// allocated as the interpreter allocates it.
     fn upgrade(&mut self, w: &V, target: &Ty) -> R<V> {
-        if crate::layout::option_rep(self.p.g(), target)? != crate::layout::OptRep::Null {
-            return Err(Unsupported("a weak reference to a dyn or Option".into()));
+        let g = self.p.g();
+        if option_rep(g, target)? == OptRep::Null {
+            return Ok(self
+                .b
+                .val(&format!("(call @fib.upgrade {})", w.text()), LirTy::Ptr));
         }
-        Ok(self
+        if w.ty() != Some(LirTy::Dyn) {
+            return Err(Unsupported("a weak reference to an Option".into()));
+        }
+        let opt = Ty::nominal(g.option, vec![target.clone()]);
+        let (tid, sname) = self.p.object(&opt)?;
+        let size = self.p.objects.get(tid).size();
+        let bx = self
             .b
-            .val(&format!("(call @fib.upgrade {})", w.text()), LirTy::Ptr))
+            .val(&format!("(extractvalue {} 0)", w.text()), LirTy::Ptr);
+        let vt = self
+            .b
+            .val(&format!("(extractvalue {} 1)", w.text()), LirTy::Ptr);
+        let t = self
+            .b
+            .val(&format!("(call @fib.upgrade {})", bx.text()), LirTy::Ptr);
+        let gone = self
+            .b
+            .val(&format!("(icmp eq {} (ptr null))", t.text()), LirTy::I1);
+        let (lnil, lsome, ljoin) = (
+            self.b.label("wnil"),
+            self.b.label("wsome"),
+            self.b.label("wup"),
+        );
+        self.b.term(&format!("(br {} {lnil} {lsome})", gone.text()));
+        self.b.open(&lnil);
+        let pn = self.option_object(tid, &sname, size, 0, None);
+        self.b.term(&format!("(br {ljoin})"));
+        self.b.open(&lsome);
+        let d = self
+            .b
+            .val(&format!("{{ {} {} }}", t.text(), vt.text()), LirTy::Dyn);
+        let ps = self.option_object(tid, &sname, size, 1, Some(&d));
+        self.b.term(&format!("(br {ljoin})"));
+        self.b.open(&ljoin);
+        Ok(self.b.phi(LirTy::Ptr, &[(lnil, pn), (lsome, ps)]))
+    }
+
+    /// A heap enum `Option` object with `tag` and, for `some`, its
+    /// consumed payload.
+    fn option_object(
+        &mut self,
+        tid: u32,
+        sname: &str,
+        size: u64,
+        tag: i32,
+        payload: Option<&V>,
+    ) -> String {
+        let p = self.heap_alloc(tid, size);
+        let vs = format!("{sname}.v{tag}");
+        let tagp = self.gep(&vs, &p, ENUM_TAG);
+        self.b.stmt(&format!("(store (i32 {tag}) {tagp})"));
+        if let Some(v) = payload {
+            let f = self.gep(&vs, &p, VARIANT_FIELD0);
+            self.store(v, &f);
+        }
+        p
     }
 
     /// `(reset! a v)`: the consumed value share-marked if the atom is,
