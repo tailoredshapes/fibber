@@ -294,7 +294,7 @@ pub fn register_instance(g: &mut Globals, inst: InstanceDef) -> TResult<usize> {
 
 fn strip(head: &Ty, names: &[String]) -> Ty {
     head.map_leaves(&mut |t| match t {
-        Ty::Gen(i) => Some(Ty::Rigid(*i)).filter(|_| (*i as usize) < names.len()),
+        Ty::Gen(i) => ((*i as usize) < names.len()).then_some(Ty::Rigid(*i)),
         _ => None,
     })
 }
