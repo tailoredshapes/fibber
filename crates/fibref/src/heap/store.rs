@@ -9,8 +9,11 @@
 //!   never to a stack object (`StackRefInHeap`), since it could outlive
 //!   the stack object's scope;
 //! - a stack object of scope `s` may also hold a `Ref` to a stack object
-//!   of `s` or of a scope outer to `s` (which outlives `s`), never of a
-//!   scope inner to `s` (`StackRefIntoOuterScope`);
+//!   of `s` or of a scope opened before `s`, never of a scope opened
+//!   after `s` (`StackRefIntoOuterScope`): the objects a stack object
+//!   legitimately refers to (a stack closure's alias captures, a
+//!   private cell's copied-in content) exist before it, and one made
+//!   after it could end first and leave it pointing at a dead slot;
 //! - an immortal object holds only immortal objects (a constant graph
 //!   is closed, §6.7): anything else is `ImmortalHoldsMortal`;
 //! - no one holds a `Weak` to a stack object (`WeakToStack`).
@@ -127,8 +130,8 @@ fn check_ref_target(id: ObjId, target: &Object, holder: Holder) -> Result<(), Au
     match (holder, target.scope) {
         (Holder::Immortal, _) => Err(AuditError::ImmortalHoldsMortal { id }),
         (Holder::Heap, Some(_)) => Err(AuditError::StackRefInHeap { id }),
-        // Both scopes are open (the holder and the target are live), and
-        // open scopes nest, so the larger id is the inner scope.
+        // Both scopes are open (the holder and the target are live);
+        // scope ids are handed out in opening order.
         (Holder::Stack(outer), Some(inner)) if inner > outer => {
             Err(AuditError::StackRefIntoOuterScope { id, scope: outer })
         }

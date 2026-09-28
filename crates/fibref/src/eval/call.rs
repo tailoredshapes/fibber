@@ -152,12 +152,6 @@ impl<'p> Interp<'p> {
         let content = self.slot(private)?;
         let target = self.local(var)?.expect_obj("an & variable")?;
         self.write_slot(target, content)?;
-        if self.heap.open_scopes().last() != self.stack_scopes.get(&private) {
-            // A scope opened after the copy-in is still open (a stack
-            // temporary of a later argument): empty the cell now, so
-            // the move happens here, and end it when that scope ends.
-            self.write_slot(private, Val::Unit)?;
-        }
         self.end_private(private)
     }
 
@@ -193,7 +187,7 @@ impl<'p> Interp<'p> {
     pub fn value_target(&mut self, v: &Val, args: &[Val]) -> R<Target> {
         use crate::own::program::BodyKey;
         let id = v.expect_obj("a function value")?;
-        let clo = match self.objs.get(id)? {
+        let clo = match self.objs.get(&self.heap, id)? {
             Obj::Closure(c) => c.clone(),
             o => return Err(RunError::internal(format!("calling a non-closure {o:?}"))),
         };

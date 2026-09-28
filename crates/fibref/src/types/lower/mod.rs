@@ -4,6 +4,7 @@
 //! types, then the protocol signatures and `impl` heads (instances with
 //! their declared contexts, before any body), then every body.
 
+mod bindings;
 mod call;
 mod decl;
 mod expr;

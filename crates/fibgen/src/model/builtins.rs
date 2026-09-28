@@ -16,7 +16,7 @@ impl Machine<'_> {
             ("not", [V::Bool(b)]) => Ok(V::Bool(!b)),
             ("str-len", [V::Str(s)]) => Ok(V::Int(s.len() as i64)),
             ("str-concat", [V::Str(x), V::Str(y)]) => Ok(V::str(&format!("{x}{y}"))),
-            ("inc1", [V::Int(x)]) => Ok(V::Int(x.wrapping_add(1))),
+            ("inc1", [V::Int(x)]) => arith("+", *x, 1),
             ("some", [x]) => Ok(V::Opt(Some(Rc::new(x.clone())))),
             ("cons", [x, V::List(t)]) => Ok(V::List(Rc::new(prepend(x, t)))),
             ("list", items) => Ok(V::List(Rc::new(items.to_vec()))),
@@ -105,16 +105,21 @@ fn prepend(x: &V, xs: &[V]) -> Vec<V> {
     ys
 }
 
-/// Integer arithmetic: signed overflow wraps and `rem` by zero traps
-/// (types §2.12).
+/// Integer arithmetic as Rust's (types §2.12, Decided 2026-09-27): a
+/// result that does not fit `i64` traps, as does `rem` by zero and
+/// `rem` of the minimum by -1. The messages are the interpreter's.
 fn arith(h: &str, x: i64, y: i64) -> Res {
-    Ok(V::Int(match h {
-        "+" => x.wrapping_add(y),
-        "-" => x.wrapping_sub(y),
-        "*" => x.wrapping_mul(y),
-        _ if y == 0 => return Err(trap("remainder by zero")),
-        _ => x.wrapping_rem(y),
-    }))
+    let r = match h {
+        "+" => x.checked_add(y),
+        "-" => x.checked_sub(y),
+        "*" => x.checked_mul(y),
+        _ if y == 0 => return Err(trap("integer rem by zero")),
+        _ => x.checked_rem(y),
+    };
+    match r {
+        Some(n) => Ok(V::Int(n)),
+        None => Err(trap(&format!("integer overflow in {h} at i64"))),
+    }
 }
 
 fn compare(h: &str, x: &V, y: &V) -> Result<bool, super::eval::Stop> {

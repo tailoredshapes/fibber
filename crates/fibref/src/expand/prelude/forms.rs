@@ -30,14 +30,24 @@ pub(super) fn plet(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form,
     let mut spawns = Vec::new();
     let mut joins = Vec::new();
     for pair in pairs {
-        let (s, e) = match pair.as_list() {
-            Some([s, e]) if s.as_sym().is_some() => (s, e),
-            _ => return Err(malformed("plet", "a binding is (sym expr)", &pair.pos)),
+        // `(s expr)` or `(s: T expr)` (§1.5): the annotation types `s`.
+        let (name, e) = match pair.as_list() {
+            Some([s, e]) if s.as_sym().is_some() => (vec![s.clone()], e),
+            Some([s, t, e]) if crate::expand::core::annotated_name(s) => {
+                (vec![s.clone(), t.clone()], e)
+            }
+            _ => {
+                let reason = "a binding is (sym expr) or (sym: type expr)";
+                return Err(malformed("plet", reason, &pair.pos));
+            }
         };
-        let t = ctx.gensym(s.as_sym().unwrap_or("t"), pos);
+        let base = name[0].as_sym().map(|s| s.trim_end_matches(':'));
+        let t = ctx.gensym(base.unwrap_or("t"), pos);
         let thunk = list(vec![sym("fn", pos), unit(pos), e.clone()], pos);
         spawns.push(list(vec![t.clone(), call("spawn", vec![thunk], pos)], pos));
-        joins.push(list(vec![s.clone(), call("join", vec![t], pos)], pos));
+        let mut join = name;
+        join.push(call("join", vec![t], pos));
+        joins.push(list(join, pos));
     }
     let mut inner = vec![sym("let", pos), list(joins, pos)];
     inner.extend(body);

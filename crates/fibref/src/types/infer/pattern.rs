@@ -1,7 +1,8 @@
 //! Checking a pattern against the scrutinee's type (spec/types.md §2.6):
 //! `Γ ⊢ pat : S ⇝ Γ'`.
 
-use crate::types::ast::{PatKind, Pattern};
+use crate::syntax::Pos;
+use crate::types::ast::{BindingId, PatKind, Pattern};
 use crate::types::decls::Shape;
 use crate::types::error::{TResult, TypeError};
 use crate::types::ty::Ty;
@@ -10,6 +11,31 @@ use super::cx::{Cx, DKind};
 use super::expr::lit_type;
 
 impl Cx<'_> {
+    /// The type the annotation of the `let` or `loop` binding `b` gives
+    /// it (syntax §1.5), if it has one.
+    pub fn binding_ann(&mut self, b: BindingId, pos: &Pos) -> TResult<Option<Ty>> {
+        match self.g.binding(b).ann.clone() {
+            Some(a) => self.ann(&a, pos).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The type a `let` pattern binds at: an annotated variable's
+    /// annotation, which the initialiser's type `t` flows into as an
+    /// argument's flows into an annotated parameter; else `t`.
+    pub fn let_binding_type(&mut self, p: &Pattern, t: Ty, pos: &Pos) -> TResult<Ty> {
+        let PatKind::Bind(b) = p.kind else {
+            return Ok(t);
+        };
+        match self.binding_ann(b, pos)? {
+            Some(a) => {
+                self.flow(&t, &a, pos)?;
+                Ok(a)
+            }
+            None => Ok(t),
+        }
+    }
+
     /// Checks `p` against `s`, binding its variables.
     pub fn check_pattern(&mut self, p: &Pattern, s: &Ty) -> TResult<()> {
         match &p.kind {

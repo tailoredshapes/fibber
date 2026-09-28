@@ -127,6 +127,11 @@ pub fn classify(obs: &Observed, expected: &Result<i64, ModelError>) -> Verdict {
         Outcome::Failed { message } if message.contains("evaluator panicked") => {
             v(Class::Panic, "panic".into(), message.clone())
         }
+        // A trap the model predicts is the generator's (it means to make
+        // programs that do not trap), not the interpreter's.
+        Outcome::Failed { message } if matches!(expected, Err(ModelError::Trap(m)) if message.contains(&format!("trap: {m}"))) => {
+            v(Class::ModelGap, format!("{expected:?}"), message.clone())
+        }
         Outcome::Failed { message } => v(Class::RunFailed, normalise(message), message.clone()),
         Outcome::Compiled {
             result: Value::Int(n),
@@ -139,6 +144,7 @@ pub fn classify(obs: &Observed, expected: &Result<i64, ModelError>) -> Verdict {
             match expected {
                 Ok(e) if e == n => v(Class::Ok, String::new(), detail),
                 Ok(_) => v(Class::Mismatch, "mismatch".into(), detail),
+                Err(ModelError::Trap(_)) => v(Class::Mismatch, "model traps".into(), detail),
                 Err(_) => v(Class::ModelGap, format!("{expected:?}"), detail),
             }
         }
@@ -219,6 +225,17 @@ mod tests {
             classify(&compiled(4, AuditSummary::clean()), &Ok(3)).class,
             Class::Mismatch
         );
+        // A trap the model predicts: the interpreter must trap the same
+        // way (then it is the generator's program, not a finding).
+        let overflow = Err(ModelError::Trap("integer overflow in * at i64".into()));
+        let v = classify(&compiled(4, AuditSummary::clean()), &overflow);
+        assert_eq!((v.class, v.key.as_str()), (Class::Mismatch, "model traps"));
+        let trapped = Observed::Done(Outcome::Failed {
+            message: "<gen>:1:2: trap: integer overflow in * at i64".into(),
+        });
+        assert_eq!(classify(&trapped, &overflow).class, Class::ModelGap);
+        let other = Err(ModelError::Trap("integer rem by zero".into()));
+        assert_eq!(classify(&trapped, &other).class, Class::RunFailed);
     }
 
     #[test]

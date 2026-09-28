@@ -77,7 +77,8 @@ pub enum AuditError {
     /// (§6.11): the heap object could outlive the scope.
     StackRefInHeap { id: ObjId },
     /// A `Ref` to the `STACK` object `id` stored into a `STACK` object
-    /// of `scope`, which is outer to `id`'s own and so outlives it.
+    /// of `scope`, which was opened before `id`'s own and so may
+    /// outlive it (`store`).
     StackRefIntoOuterScope { id: ObjId, scope: ScopeId },
     /// A weak reference to the `STACK` object `id` (§6.7, §6.11: `weak`
     /// forces its operand onto the heap).
@@ -95,8 +96,6 @@ pub enum AuditError {
     UnknownScope { scope: ScopeId },
     /// A scope that has already ended, ended again or allocated into.
     ScopeEnded { scope: ScopeId },
-    /// A scope ended while `innermost`, opened inside it, is still open.
-    ScopeNotInnermost { scope: ScopeId, innermost: ScopeId },
 }
 
 /// Why `write_unique` refused: the first failing test of `fib.unique?`
@@ -168,7 +167,7 @@ impl AuditError {
             AuditError::StackRefIntoOuterScope { id, scope } => {
                 write!(
                     f,
-                    "stack object {id} stored into an object of outer {scope}"
+                    "stack object {id} stored into an object of earlier {scope}"
                 )
             }
             AuditError::WeakToStack { id } => write!(f, "weak reference to stack object {id}"),
@@ -179,9 +178,6 @@ impl AuditError {
             AuditError::MutableImmortal { kind } => write!(f, "an immortal {kind}"),
             AuditError::UnknownScope { scope } => write!(f, "unknown {scope}"),
             AuditError::ScopeEnded { scope } => write!(f, "{scope} has already ended"),
-            AuditError::ScopeNotInnermost { scope, innermost } => {
-                write!(f, "{scope} ended while inner {innermost} is open")
-            }
             _ => write!(f, "{self:?}"),
         }
     }

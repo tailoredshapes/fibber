@@ -44,6 +44,7 @@ fn use_after_free_fires_for_each_operation() {
     assert_eq!(heap.kind(c), Err(uaf(Op::Inspect)));
     assert_eq!(heap.is_shared(c), Err(uaf(Op::Inspect)));
     assert_eq!(heap.field_count(c), Err(uaf(Op::Inspect)));
+    assert_eq!(heap.check_access(c, Op::Read), Err(uaf(Op::Read)));
     assert_eq!(
         heap.alloc(Kind::Immutable, vec![Value::Ref(c)]),
         Err(uaf(Op::Store))

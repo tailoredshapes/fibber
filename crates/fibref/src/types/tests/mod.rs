@@ -1,8 +1,9 @@
 //! Unit tests for the checker, split by what they cover: the prelude and
 //! the 20 ownership cases (`cases`), and one test per type error of the
 //! catalogue of types §6.14 (`errors`, `errors2`), and the rules of the
-//! remaining forms (`forms`).
+//! remaining forms (`forms`) and annotated bindings (`bindings`).
 
+mod bindings;
 mod cases;
 mod errors;
 mod errors2;

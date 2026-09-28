@@ -53,7 +53,7 @@ impl Interp<'_> {
             return Ok(*ty == t && variant == Some(*i as usize));
         }
         let id = v.expect_obj("a constructor pattern's scrutinee")?;
-        let tag = match self.objs.get(id)? {
+        let tag = match self.objs.get(&self.heap, id)? {
             Obj::Struct { .. } => None,
             Obj::Variant { tag, .. } => Some(*tag as usize),
             o => {

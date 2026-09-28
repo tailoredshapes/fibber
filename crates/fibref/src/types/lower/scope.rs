@@ -53,6 +53,7 @@ impl<'g> Lowerer<'g> {
             name: name.to_string(),
             kind,
             pos: pos.clone(),
+            ann: None,
         });
         self.depth.insert(id, self.frames.len());
         self.scope.push((name.to_string(), id));

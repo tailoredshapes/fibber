@@ -71,7 +71,7 @@ pub struct Heap {
     trace: Vec<Event>,
     /// Every scope ever opened, indexed by `ScopeId`.
     scopes: Vec<Scope>,
-    /// The open scopes, outermost first.
+    /// The open scopes, in opening order.
     open: Vec<ScopeId>,
 }
 

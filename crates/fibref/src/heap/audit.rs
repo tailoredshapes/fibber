@@ -73,7 +73,7 @@ pub struct AuditReport {
     /// Every live `Ref` to a freed object, in allocation order of the
     /// holder, then field order.
     pub dangling: Vec<DanglingRef>,
-    /// Every scope still open at the end, outermost first: a failure,
+    /// Every scope still open at the end, in opening order: a failure,
     /// since every scope a program opens ends before the run does.
     pub open_scopes: Vec<ScopeId>,
     /// The whole trace of the run.

@@ -159,24 +159,46 @@ fn a_ref_to_an_ended_object_cannot_be_stored_anywhere() {
 }
 
 #[test]
-fn ending_a_scope_out_of_order_changes_nothing() {
+/// Scopes end in any order (types §8.2: one `alloca` per site in the
+/// entry block, ended by an inline drop), but an object whose scope
+/// ended out of order is dead at once, and the later scope still may
+/// not be referred to from the earlier one.
+fn a_scope_ended_out_of_order_is_dead_at_once() {
     let mut heap = Heap::new();
     let child = imm(&mut heap, vec![]);
-    let outer = heap.open_scope();
-    let o = stack(&mut heap, outer, Kind::Immutable, vec![Value::Ref(child)]);
-    let inner = heap.open_scope();
+    let early = heap.open_scope();
+    let e = stack(&mut heap, early, Kind::Immutable, vec![Value::Ref(child)]);
+    let late = heap.open_scope();
+    let l = stack(&mut heap, late, Kind::Cell, vec![Value::Nil]);
+    heap.end_scope(early).expect("end the earlier scope first");
+    assert_eq!(heap.open_scopes(), &[late]);
+    assert_eq!(heap.count(child), Ok(1), "the drop released child");
+    let dead = AuditError::StackUseAfterScope {
+        id: e,
+        op: Op::Read,
+    };
+    assert_eq!(heap.read(e, 0), Err(dead));
+    let store = AuditError::StackUseAfterScope {
+        id: e,
+        op: Op::Store,
+    };
+    assert_eq!(heap.write(l, 0, Value::Ref(e)), Err(store));
+    let early2 = heap.open_scope();
+    stack(&mut heap, early2, Kind::Cell, vec![Value::Nil]);
+    let late2 = heap.open_scope();
+    let l2 = stack(&mut heap, late2, Kind::Immutable, vec![]);
+    heap.end_scope(early2).expect("out of order");
     let before = heap.trace().len();
-    assert_eq!(
-        heap.end_scope(outer),
-        Err(AuditError::ScopeNotInnermost {
-            scope: outer,
-            innermost: inner
-        })
-    );
+    let err = AuditError::StackRefIntoOuterScope {
+        id: l2,
+        scope: late,
+    };
+    assert_eq!(heap.write(l, 0, Value::Ref(l2)), Err(err));
     unchanged(&heap, before);
-    assert_eq!(heap.read(o, 0), Ok(Value::Ref(child)));
-    assert_eq!(heap.count(child), Ok(2));
-    assert_eq!(heap.open_scopes(), &[outer, inner]);
+    heap.end_scope(late2).expect("end");
+    heap.end_scope(late).expect("end");
+    heap.release(child).expect("release");
+    assert!(heap.finish().is_clean());
 }
 
 #[test]

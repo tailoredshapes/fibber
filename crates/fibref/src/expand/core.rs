@@ -101,8 +101,8 @@ pub(crate) fn body_start(
     Ok(start)
 }
 
-/// `(let ((pat expr)*) body)` (§3.3) and `(loop ((sym expr)*) body)`
-/// (§3.18).
+/// `(let (binding*) body)` (§3.3) and `(loop (binding*) body)` (§3.18),
+/// `binding ::= (pat expr) | (sym: type expr)` (§1.5).
 fn let_plan(head: &str, items: &[Form], pos: &Pos) -> Result<Role, ExpandError> {
     if items.len() < 3 {
         return Err(malformed(head, "expected bindings and a body", pos));
@@ -110,18 +110,29 @@ fn let_plan(head: &str, items: &[Form], pos: &Pos) -> Result<Role, ExpandError> 
     let Some(pairs) = items[1].as_list() else {
         return Err(malformed(head, "bindings must be a list", &items[1].pos));
     };
+    let mut roles = Vec::new();
     for pair in pairs {
-        if pair.as_list().is_none_or(|p| p.len() != 2) {
-            return Err(malformed(
-                head,
-                "a binding is (pattern expression)",
-                &pair.pos,
-            ));
-        }
+        let role = match pair.as_list() {
+            Some([_, _]) => Role::items(vec![Role::Pattern, Role::Expr], Role::Keep),
+            Some([name, _, _]) if annotated_name(name) => {
+                Role::items(vec![Role::Keep, Role::Keep, Role::Expr], Role::Keep)
+            }
+            _ => {
+                let reason = "a binding is (pattern expression) or (name: type expression)";
+                return Err(malformed(head, reason, &pair.pos));
+            }
+        };
+        roles.push(role);
     }
-    let pair = Role::items(vec![Role::Pattern, Role::Expr], Role::Keep);
-    let bindings = Role::items(Vec::new(), pair);
+    let bindings = Role::items(roles, Role::Keep);
     Ok(Role::items(vec![Role::Keep, bindings], Role::Expr))
+}
+
+/// Whether `form` is `x:`, the name of an annotated binding (§1.5).
+pub(crate) fn annotated_name(form: &Form) -> bool {
+    form.as_sym()
+        .and_then(|s| s.strip_suffix(':'))
+        .is_some_and(|n| !n.is_empty())
 }
 
 /// `(match expr clause+)`, `clause ::= (pat body)` (§3.6).

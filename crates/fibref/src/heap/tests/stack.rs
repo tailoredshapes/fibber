@@ -98,6 +98,7 @@ fn every_access_after_the_scope_ended_is_stack_use_after_scope() {
     let err = |op| AuditError::StackUseAfterScope { id: h, op };
     assert_eq!(heap.read(h, 0), Err(err(Op::Read)));
     assert_eq!(heap.write(h, 0, Value::Nil), Err(err(Op::Write)));
+    assert_eq!(heap.check_access(h, Op::Write), Err(err(Op::Write)));
     assert_eq!(heap.retain(h), Err(err(Op::Retain)));
     assert_eq!(heap.release(h), Err(err(Op::Release)));
     assert_eq!(heap.weak(h), Err(err(Op::Weak)));
@@ -180,18 +181,11 @@ fn sharing_a_stack_object_is_an_error() {
 }
 
 #[test]
-fn scopes_end_innermost_first_and_once() {
+fn scopes_end_once() {
     let mut heap = Heap::new();
     let outer = heap.open_scope();
     let inner = heap.open_scope();
     assert_eq!(heap.open_scopes(), &[outer, inner]);
-    assert_eq!(
-        heap.end_scope(outer),
-        Err(AuditError::ScopeNotInnermost {
-            scope: outer,
-            innermost: inner
-        })
-    );
     heap.end_scope(inner).expect("end inner");
     assert_eq!(
         heap.end_scope(inner),

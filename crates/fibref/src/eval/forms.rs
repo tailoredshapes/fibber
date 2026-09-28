@@ -95,10 +95,12 @@ impl<'p> Interp<'p> {
     /// positions, or a new one at `pos`.
     pub fn value_form(&mut self, v: &Val, pos: &Pos) -> R<Form> {
         let id = v.expect_obj("a Form")?;
+        // The side table of input forms is object content too (rule 2).
+        self.heap.check_access(id, crate::heap::Op::Read)?;
         if let Some(f) = self.input_forms.get(&id) {
             return Ok(f.clone());
         }
-        let tag = match self.objs.get(id)? {
+        let tag = match self.objs.get(&self.heap, id)? {
             Obj::Variant { tag, .. } => *tag as usize,
             o => return Err(RunError::internal(format!("not a Form: {o:?}"))),
         };

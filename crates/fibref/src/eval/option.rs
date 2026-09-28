@@ -74,6 +74,6 @@ impl Interp<'_> {
     /// Whether `id` is a heap-enum `Option`.
     pub fn is_boxed_option(&self, id: ObjId) -> bool {
         let option = self.p.globals.option;
-        matches!(self.objs.get(id), Ok(Obj::Variant { ty, .. }) if *ty == option)
+        matches!(self.objs.get(&self.heap, id), Ok(Obj::Variant { ty, .. }) if *ty == option)
     }
 }

@@ -57,7 +57,7 @@ impl<'p> Interp<'p> {
     /// A call through a `fn` closure: its body in a frame of its own,
     /// with the closure as `env` (§8.4).
     pub fn run_lambda(&mut self, clo: ObjId, args: Vec<Val>) -> R<Flow> {
-        let (lit, key, caps) = match self.objs.get(clo)? {
+        let (lit, key, caps) = match self.objs.get(&self.heap, clo)? {
             Obj::Closure(Clo::Lambda { lit, body, caps }) => (*lit, *body, caps.clone()),
             o => return Err(RunError::internal(format!("not a fn closure: {o:?}"))),
         };
@@ -205,7 +205,7 @@ impl<'p> Interp<'p> {
             Val::Obj(id) => *id,
             _ => return Err(RunError::internal(format!("no type for {v:?}"))),
         };
-        Ok(match self.objs.get(id)? {
+        Ok(match self.objs.get(&self.heap, id)? {
             Obj::Str(_) => Con::Str,
             Obj::Struct { ty, .. } | Obj::Variant { ty, .. } => Con::Nominal(*ty),
             Obj::Array(_) => Con::Array,

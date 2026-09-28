@@ -6,6 +6,7 @@ use crate::syntax::{Form, FormKind};
 use crate::types::ast::{BindingKind, Expr, ExprKind, FnLit, GlobalRef, Lit};
 use crate::types::error::{ErrorKind, TResult, TypeError};
 
+use super::bindings::bindings_of;
 use super::decl::annotation_name;
 use super::pattern::let_pattern;
 use super::scope::Lowerer;
@@ -158,9 +159,10 @@ impl Lowerer<'_> {
         let mark = self.mark();
         let mut names: Vec<String> = Vec::new();
         let mut out = Vec::new();
-        for (pat, init) in pairs {
-            let init = self.expr(init, false)?;
-            let pat = let_pattern(self, pat, &mut names)?;
+        for b in pairs {
+            let init = self.expr(b.init, false)?;
+            let pat = let_pattern(self, &b.pat, &mut names)?;
+            self.annotate(&pat, b.ann)?;
             out.push((pat, init));
         }
         let body = self.body(&items[2..], &form.pos, tail);
@@ -173,12 +175,16 @@ impl Lowerer<'_> {
         let pairs = bindings_of(items, form)?;
         let mark = self.mark();
         let mut vars = Vec::new();
-        for (name, init) in pairs {
-            let Some(n) = name.as_sym() else {
-                return Err(TypeError::resolve(&name.pos, "a loop variable is a symbol"));
+        for p in pairs {
+            let Some(n) = p.pat.as_sym() else {
+                return Err(TypeError::resolve(
+                    &p.pat.pos,
+                    "a loop variable is a symbol",
+                ));
             };
-            let init = self.expr(init, false)?;
-            let b = self.bind(n, BindingKind::Loop, &name.pos);
+            let init = self.expr(p.init, false)?;
+            let b = self.bind(n, BindingKind::Loop, &p.pat.pos);
+            self.annotate_binding(b, p.ann)?;
             vars.push((b, init));
         }
         self.enter_loop();
@@ -364,25 +370,4 @@ impl Lowerer<'_> {
             ExprKind::Field(Box::new(e), field.to_string(), text),
         ))
     }
-}
-
-/// The `((pat expr)..)` of a `let` or `loop`.
-fn bindings_of<'f>(items: &'f [Form], form: &Form) -> TResult<Vec<(&'f Form, &'f Form)>> {
-    let head = items[0].as_sym().unwrap_or("let");
-    let (Some(pairs), true) = (items.get(1).and_then(Form::as_list), items.len() >= 3) else {
-        return Err(TypeError::resolve(
-            &form.pos,
-            format!("{head} needs bindings and a body"),
-        ));
-    };
-    pairs
-        .iter()
-        .map(|p| match p.as_list() {
-            Some([pat, e]) => Ok((pat, e)),
-            _ => Err(TypeError::resolve(
-                &p.pos,
-                "a binding is (pattern expression)",
-            )),
-        })
-        .collect()
 }

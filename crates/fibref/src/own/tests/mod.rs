@@ -38,7 +38,7 @@ pub(super) fn case_source(name: &str) -> String {
         .map(|e| e.path())
         .find(|p| {
             p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with(name))
+                .is_some_and(|n| n.to_string_lossy().starts_with(&format!("{name}-")))
         })
         .unwrap_or_else(|| panic!("no case {name}"));
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

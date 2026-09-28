@@ -4,14 +4,22 @@
 //! they hold.
 //!
 //! The caller drives the scopes explicitly: [`Heap::open_scope`] opens
-//! one inside the innermost open scope, and only the innermost open
-//! scope may end. A scope is never a function's activation: it is the
-//! `let` or `match` of a binding, the step of a temporary, or the call
-//! of a private `&` cell (§6.11). An `async` body's scopes belong to its
-//! task and stay open across an `await`. Tasks are not modelled here:
-//! the heap keeps one strictly nested stack of scopes, so an
-//! interpreter that interleaves tasks must keep their scopes nested in
-//! the order it opens them, or ending one is `ScopeNotInnermost`.
+//! one, and any open scope may end, in any order. A scope is never a
+//! function's activation: it is the lifetime of the stack objects of
+//! a `let` or `match` binding, a temporary of a step, or a private `&`
+//! cell (§6.11). An `async` body's scopes belong to its task and stay
+//! open across an `await`.
+//!
+//! Scopes need not nest because the compiled program's do not (§8.2):
+//! every `STACK` allocation site has its own `alloca` in the function's
+//! entry block, and a scope's end is an inline drop at the point the
+//! plan names, so a temporary of a step may end while an object made
+//! after it, bound by a `let` of that step, lives on (syntax §2). What
+//! the audit must catch is a use of an object after its end
+//! (`StackUseAfterScope`) and a reference that could outlive its
+//! target: into a heap object (`StackRefInHeap`), or into a stack
+//! object whose scope was opened before the target's
+//! (`StackRefIntoOuterScope`, `store`).
 
 use super::error::AuditError;
 use super::event::Event;
@@ -29,8 +37,7 @@ pub(super) struct Scope {
 }
 
 impl Heap {
-    /// Opens a scope nested in the innermost open one (or outermost if
-    /// none is open). Event: `ScopeOpen`.
+    /// Opens a scope. Event: `ScopeOpen`.
     pub fn open_scope(&mut self) -> ScopeId {
         let scope = ScopeId::from_index(self.scopes.len());
         self.scopes.push(Scope::default());
@@ -43,7 +50,7 @@ impl Heap {
     /// count operation ever, ended by [`Heap::end_scope`]. `scope` must
     /// be open. Every `Ref` in `fields` to a counted object is retained
     /// (the drop releases it); a `Ref` may also name a stack object of
-    /// this scope or an outer one, never of an inner one (`store`).
+    /// this scope or one opened before it, never of a later one (`store`).
     /// Events: `AllocStack`, then one `Retain` per `Ref` field to a
     /// counted object, in field order.
     pub fn alloc_in_scope(
@@ -60,7 +67,8 @@ impl Heap {
         Ok(id)
     }
 
-    /// Ends `scope`, which must be the innermost open scope: each of its
+    /// Ends `scope`, which must be open (not necessarily the one opened
+    /// last, §8.2): each of its
     /// objects, most recently allocated first (the reverse of the order
     /// in which the scope's bindings were made, §6.11), is ended and its
     /// drop releases the counted `Ref`s it holds, in field order, with
@@ -73,11 +81,6 @@ impl Heap {
     /// release events of what it held.
     pub fn end_scope(&mut self, scope: ScopeId) -> Result<(), AuditError> {
         self.check_open(scope)?;
-        if let Some(&innermost) = self.open.last() {
-            if innermost != scope {
-                return Err(AuditError::ScopeNotInnermost { scope, innermost });
-            }
-        }
         let dropped: Vec<ObjId> = self.scopes[scope.index()]
             .objects
             .iter()
@@ -85,7 +88,7 @@ impl Heap {
             .copied()
             .collect();
         let cascades = self.plan_drops(&dropped)?;
-        self.open.pop();
+        self.open.retain(|s| *s != scope);
         self.scopes[scope.index()].ended = true;
         self.trace.push(Event::ScopeEnd { scope });
         for (id, cascade) in dropped.into_iter().zip(cascades) {
@@ -96,7 +99,7 @@ impl Heap {
         Ok(())
     }
 
-    /// The scopes still open, outermost first.
+    /// The scopes still open, in the order they were opened.
     pub fn open_scopes(&self) -> &[ScopeId] {
         &self.open
     }

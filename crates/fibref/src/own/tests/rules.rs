@@ -171,3 +171,24 @@ fn a_let_bound_closure_called_directly_is_on_the_stack() {
     let (_, plus) = call(&c, "main", "+");
     assert!(jump(&c, "main", plus).contains(&"end-stack f (jump)".to_string()));
 }
+
+/// §6.5 (d): a self-named literal whose value flows on through a `do`,
+/// a `let` body or an `if` branch into the head of a call is escaping
+/// and heap, even though its self-name's own call is a use of kind (a).
+#[test]
+fn a_self_named_literal_reached_through_a_form_escapes() {
+    for src in [
+        "(defun main () -> i64 ((do (fn go (k: i64) (if (<= k 0) 0 (go 0)))) 1))",
+        "(defun main () -> i64
+           ((let ((b (conj [] 7))) (fn go (k: i64) (if (<= k 0) (nth b 0) (go 0)))) 1))",
+        "(defun main () -> i64 ((if true (fn go (k: i64) (go 0)) (fn (k: i64) 1)) 1))",
+    ] {
+        let c = ok(src);
+        let cl = closures(&c, "main");
+        let named = cl.iter().find(|x| x.escaping.is_some());
+        let named = named.unwrap_or_else(|| panic!("no escaping closure in {src}"));
+        assert_eq!(named.escaping.as_deref(), Some("used as a value"), "{src}");
+        assert!(named.heap.is_some(), "{src}");
+        assert!(cl.iter().all(|x| x.heap.is_some()), "{src}");
+    }
+}

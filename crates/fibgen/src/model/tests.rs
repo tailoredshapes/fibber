@@ -123,7 +123,7 @@ fn copy_in_happens_at_the_argument() {
 }
 
 #[test]
-fn arithmetic_wraps_and_rem_by_zero_traps() {
+fn arithmetic_overflow_and_rem_by_zero_trap() {
     let big = int_call("*", vec![Expr::int(i64::MAX), Expr::int(2)]);
     assert_eq!(
         expected(&Program {
@@ -131,7 +131,7 @@ fn arithmetic_wraps_and_rem_by_zero_traps() {
             funs: Vec::new(),
             main: big
         }),
-        Ok(-2)
+        Err(ModelError::Trap("integer overflow in * at i64".into()))
     );
     let rem = int_call("rem", vec![Expr::int(1), Expr::int(0)]);
     assert!(matches!(

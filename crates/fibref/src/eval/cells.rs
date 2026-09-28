@@ -35,7 +35,7 @@ impl<'p> Interp<'p> {
     /// `@c` on a value.
     pub fn deref_val(&mut self, c: &Val) -> R<Val> {
         let id = c.expect_obj("the operand of @")?;
-        if let Obj::Weak(target) = self.objs.get(id)? {
+        if let Obj::Weak(target) = self.objs.get(&self.heap, id)? {
             let target = *target;
             self.heap.read(id, 0)?;
             return Ok(match self.heap.upgrade(target)? {

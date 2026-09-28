@@ -52,13 +52,17 @@ pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
     e.unwrap_or_else(|| Expr::int(g.small()))
 }
 
+/// Arithmetic that cannot trap (types §2.12: overflow traps): `rem` by
+/// a positive literal, `*` by a small one, so that a product repeated
+/// through a loop or a recursion (`(* acc acc)` squared an accumulator
+/// past `i64`) grows no faster than the sums do.
 fn arith(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
     let op = ["+", "-", "*", "+", "rem"][g.rng.below(5)];
     let a = g.expr(cx, &Ty::Int, d - 1);
-    let b = if op == "rem" {
-        Expr::int(g.rng.range(1, 7))
-    } else {
-        g.expr(cx, &Ty::Int, d - 1)
+    let b = match op {
+        "rem" => Expr::int(g.rng.range(1, 7)),
+        "*" => Expr::int(g.rng.range(-2, 3)),
+        _ => g.expr(cx, &Ty::Int, d - 1),
     };
     Expr::call(Ty::Int, op, vec![a, b])
 }

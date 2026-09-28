@@ -40,3 +40,14 @@ for the decided note that `swap!` may not terminate under contention
 (ownership.md §7). Some of them test the reference implementation
 (syntax, reflection, the calling convention) rather than a section of
 ownership.md; their `spec:` line cites the chapter that decides them.
+
+Cases 96 to 99 are findings of the random program generator of
+spec/method.md rule 5 (`crates/fibgen`), rewritten by hand from its
+minimised programs: 96 to 98 a self-named `fn` literal whose value flows
+on through a `do`, a branch or a `let` body, which types §6.5 makes an
+escaping heap closure whatever its self calls; 99 stack lifetimes that
+do not nest (a step's temporary ending before a later `let` binding,
+types §6.11, §8.2). The seeds their headers name are those of the
+generator as it was then; it has since stopped generating products
+that overflow (types §2.12), which changed the programs of many seeds.
+100 pins annotated `let`, `loop` and `plet` bindings (syntax §1.5).

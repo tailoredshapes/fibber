@@ -67,13 +67,16 @@ fn every_real_case_header_parses() {
 }
 
 #[test]
-fn the_ownership_directory_holds_cases_1_to_95_less_the_withdrawn() {
+fn the_ownership_directory_holds_cases_1_to_100_less_the_withdrawn() {
     // 30 and 35 were withdrawn when D1 removed field places; 81 to 95
-    // are the promoted findings of the rule-4 adversary.
+    // are the promoted findings of the rule-4 adversary, 96 to 99 those
+    // of the rule-5 generator, 100 the annotated bindings of syntax §1.5.
+    // The listing is by name, so 100 sorts after 10: compare as numbers.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();
-    let numbers: Vec<u32> = cases.iter().map(|p| number_of(p)).collect();
-    let expected: Vec<u32> = (1..=95).filter(|n| ![30, 35].contains(n)).collect();
+    let mut numbers: Vec<u32> = cases.iter().map(|p| number_of(p)).collect();
+    numbers.sort_unstable();
+    let expected: Vec<u32> = (1..=100).filter(|n| ![30, 35].contains(n)).collect();
     assert_eq!(numbers, expected);
 }
 

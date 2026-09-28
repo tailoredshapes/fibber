@@ -65,8 +65,13 @@ fn tail_use(ev: &Event) -> Option<&'static str> {
 }
 
 /// The escaping literals and the heap literals among `literals`, each
-/// with its reason. A literal whose value reaches no recorded position
-/// (inside a `dyn`, say) is taken as escaping, the safe side.
+/// with its reason. A literal whose own occurrence reaches no recorded
+/// position is escaping: its value flows on through the enclosing form
+/// (the last step of a `do`, a branch of an `if` or `match`, the body of
+/// a `let`, a `dyn`), which is none of (a)-(c). Only an event of the
+/// literal itself counts here: its self-name's calls and its binding's
+/// uses are uses of the literal too, but they say nothing about where
+/// the occurrence went.
 pub fn classify(
     events: &[Event],
     literals: &HashSet<ExprId>,
@@ -84,7 +89,9 @@ pub fn classify(
         let Some(l) = literal_of(&ev.val, &bound) else {
             continue;
         };
-        used.insert(l);
+        if ev.val == Val::Lit(l) {
+            used.insert(l);
+        }
         if let Some(why) = escaping_use(ev) {
             escaping.entry(l).or_insert(why);
         }

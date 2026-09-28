@@ -134,6 +134,16 @@ impl Heap {
         Ok(self.live_object(id, Op::Inspect)?.count)
     }
 
+    /// Checks that `id` may be accessed by `op` now: it exists, is not
+    /// freed (`UseAfterFree`) and, if a stack object, its scope has not
+    /// ended (`StackUseAfterScope`). No event: this is the audit of an
+    /// access to what the heap does not model as a field (a string's
+    /// bytes, a variant's tag, a closure's code), which the interpreter
+    /// keeps beside the heap and must not touch on a dead object.
+    pub fn check_access(&self, id: ObjId, op: Op) -> Result<(), AuditError> {
+        self.live_object(id, op).map(|_| ())
+    }
+
     /// Whether the object exists and has not been freed.
     pub fn is_live(&self, id: ObjId) -> bool {
         self.object(id).map(|o| o.live).unwrap_or(false)

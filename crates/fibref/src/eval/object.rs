@@ -8,7 +8,7 @@
 //! ([`Val::project`]). Every allocation goes through both; every access
 //! is also made on the heap, which is what the audit sees.
 
-use crate::heap::ObjId;
+use crate::heap::{Heap, ObjId, Op};
 use crate::own::program::BodyKey;
 use crate::types::ast::{BindingId, BuiltinId, ExprId, FunId};
 use crate::types::ty::{ProtoId, TypeId};
@@ -120,16 +120,21 @@ impl Objects {
         self.slots[i] = Some(obj);
     }
 
-    /// The object `id`.
-    pub fn get(&self, id: ObjId) -> Result<&Obj, super::RunError> {
+    /// The object `id`, which must be live on `heap` (method.md rule 2:
+    /// the table never forgets a freed object, so every access to it is
+    /// audited on the heap first; a dead one is `UseAfterFree` or
+    /// `StackUseAfterScope`).
+    pub fn get(&self, heap: &Heap, id: ObjId) -> Result<&Obj, super::RunError> {
+        heap.check_access(id, Op::Read)?;
         self.slots
             .get(id.index())
             .and_then(Option::as_ref)
             .ok_or_else(|| super::RunError::internal(format!("no object {id}")))
     }
 
-    /// The object `id`, to change.
-    pub fn get_mut(&mut self, id: ObjId) -> Result<&mut Obj, super::RunError> {
+    /// The object `id`, to change; live on `heap`, as for [`Objects::get`].
+    pub fn get_mut(&mut self, heap: &Heap, id: ObjId) -> Result<&mut Obj, super::RunError> {
+        heap.check_access(id, Op::Write)?;
         self.slots
             .get_mut(id.index())
             .and_then(Option::as_mut)

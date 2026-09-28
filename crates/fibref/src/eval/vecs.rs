@@ -94,7 +94,7 @@ impl Interp<'_> {
     /// The elements of a vector, in order (read on the heap).
     pub fn read_vec(&mut self, v: &Val) -> R<Vec<Val>> {
         let id = v.expect_obj("a vector")?;
-        match self.objs.get(id)? {
+        match self.objs.get(&self.heap, id)? {
             Obj::Variant { tag: 0, .. } => return Ok(Vec::new()),
             Obj::Variant { tag: 1, .. } => {}
             o => return Err(RunError::internal(format!("not a vector: {o:?}"))),
@@ -111,7 +111,7 @@ impl Interp<'_> {
 
     fn read_node(&mut self, node: &Val, out: &mut Vec<Val>) -> R<()> {
         let id = node.expect_obj("a vector node")?;
-        let (tag, arr) = match self.objs.get(id)? {
+        let (tag, arr) = match self.objs.get(&self.heap, id)? {
             Obj::Variant { tag, .. } => (*tag, self.field(id, 0)?),
             o => return Err(RunError::internal(format!("not a vector node: {o:?}"))),
         };
@@ -128,7 +128,7 @@ impl Interp<'_> {
 
     fn read_array(&mut self, a: &Val) -> R<Vec<Val>> {
         let id = a.expect_obj("an array")?;
-        let n = match self.objs.get(id)? {
+        let n = match self.objs.get(&self.heap, id)? {
             Obj::Array(items) => items.len(),
             o => return Err(RunError::internal(format!("not an array: {o:?}"))),
         };

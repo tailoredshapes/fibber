@@ -1,0 +1,23 @@
+;; spec:   §3.3 (types §6.5)
+;; expect: accept
+;; result: 21
+;; audit:  clean
+;; Self-named literals in a branch of an `if` and of a `match`, whose
+;; value is stored: into a vector by `conj`, and into a cell by `set!`.
+;; A branch value flows on through the join, a use of kind (d), so both
+;; are escaping heap closures however their bodies call themselves. The
+;; checker once made them stack closures, and the audit caught a stack
+;; object stored in a heap object (StackRefInHeap, the vector) and in a
+;; stack cell made before it (StackRefIntoOuterScope, `keep`'s cell).
+;; Found by the rule-5 generator (fibgen seeds 100026 and 102423).
+;; 1 + 20 + 0 = 21.
+(defun keep (c: (Cell (fn (i64) i64)) pick: i64) -> i64
+  (do (set! c (match (some pick)
+                ((some 0) (fn (k: i64) 0))
+                (_ (fn down (k: i64) (if (<= k 0) 20 (down (- k 1)))))))
+      0))
+
+(defun main () -> i64
+  (let ((c (cell (fn (k: i64) 0)))
+        (v (conj [] (if true (fn up (k: i64) (if (<= k 0) 1 (up (- k 1)))) (fn (k: i64) 0)))))
+    (+ ((nth v 0) 3) (+ (keep c 1) (@c 2)))))

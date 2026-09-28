@@ -129,7 +129,7 @@ impl Interp<'_> {
     /// The content of the cell or atom `id` (read on the heap).
     pub fn slot(&mut self, id: ObjId) -> R<Val> {
         self.heap.read(id, 0)?;
-        match self.objs.get(id)? {
+        match self.objs.get(&self.heap, id)? {
             Obj::Cell(v) | Obj::Atom(v) => Ok(v.clone()),
             o => Err(RunError::internal(format!("{id} is not a cell: {o:?}"))),
         }
@@ -140,7 +140,7 @@ impl Interp<'_> {
     /// consumed count of `v`.
     pub fn write_slot(&mut self, id: ObjId, v: Val) -> R<()> {
         self.heap.write(id, 0, v.project())?;
-        match self.objs.get_mut(id)? {
+        match self.objs.get_mut(&self.heap, id)? {
             Obj::Cell(slot) | Obj::Atom(slot) => *slot = v,
             o => return Err(RunError::internal(format!("{id} is not a cell: {o:?}"))),
         }
@@ -149,7 +149,7 @@ impl Interp<'_> {
 
     /// The fields of a struct, variant or array (for reads).
     pub fn fields(&self, id: ObjId) -> R<&Vec<Val>> {
-        match self.objs.get(id)? {
+        match self.objs.get(&self.heap, id)? {
             Obj::Struct { fields, .. } | Obj::Variant { fields, .. } | Obj::Array(fields) => {
                 Ok(fields)
             }
@@ -166,10 +166,10 @@ impl Interp<'_> {
             .ok_or_else(|| RunError::internal(format!("{id} has no field {i}")))
     }
 
-    /// The string `id`.
+    /// The string `id`, audited live on the heap (`Objects::get`).
     pub fn string(&self, v: &Val) -> R<&str> {
         let id = v.expect_obj("a string")?;
-        match self.objs.get(id)? {
+        match self.objs.get(&self.heap, id)? {
             Obj::Str(s) => Ok(s),
             o => Err(RunError::internal(format!("{id} is not a string: {o:?}"))),
         }

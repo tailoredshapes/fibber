@@ -248,6 +248,7 @@ generalised.
 
 ```
 (let ((pat₁ e₁) ..) b)   eᵢ : Tᵢ;  patᵢ checked against Tᵢ binding Γᵢ (§2.6, irrefutable);  Γ,Γ̄ ⊢ b : T  ⇒ T
+(let (.. (x: A e) ..) b) e : T;  T ~ A, a flow site (§3.2);  x : A  (syntax §1.5; likewise a loop variable, a plet binding)
 (do e₁ .. eₙ)            each eᵢ typed; ⇒ Tₙ;  (do) ⇒ unit
 (if c t e)               c : bool, t : T, e : T  ⇒ T
 (loop ((x₁ e₁) .. (xₙ eₙ)) b)   eᵢ : Tᵢ;  Γ, xᵢ:Tᵢ ⊢ b : T with recur enabled at (T₁ .. Tₙ)  ⇒ T

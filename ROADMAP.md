@@ -38,7 +38,14 @@ evaluator over the audited heap.
 - [x] method rule 4: an adversary attacking the running interpreter;
       its 15 findings promoted as cases 81 to 95 after the owner's
       decisions of 2026-09-27 (spec/types.md §10): 93 cases, all passing
-- [ ] method rule 5: random well-typed programs, all passing the audit
+- [ ] method rule 5: random well-typed programs, all passing the audit.
+      `fibgen` generates them and checks each against a model; its
+      findings so far are fixed and promoted as cases 96 to 99 (100
+      pins annotated bindings): 98 cases, all passing. A sweep of seeds
+      200000..259999 gives 59999 ok and one result mismatch, open as a
+      spec question: an `&` parameter forwarded at a tail call is
+      observably different from a copy-in when a later argument of the
+      same call writes the variable (seed 233285; the model copies in)
 
 ## M3. Hardened lIR
 

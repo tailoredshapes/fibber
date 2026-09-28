@@ -188,7 +188,7 @@ impl<'p> Interp<'p> {
 
     /// The index of the field `name` of the struct `id`.
     pub fn field_index(&self, id: crate::heap::ObjId, name: &str) -> R<usize> {
-        let ty = match self.objs.get(id)? {
+        let ty = match self.objs.get(&self.heap, id)? {
             super::object::Obj::Struct { ty, .. } => *ty,
             o => {
                 return Err(RunError::internal(format!(

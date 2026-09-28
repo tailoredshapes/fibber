@@ -80,6 +80,9 @@ pub struct BindingInfo {
     pub kind: BindingKind,
     /// Where it is bound.
     pub pos: Pos,
+    /// The annotation `x: T` of a `let` or `loop` binding (syntax
+    /// §1.5); a parameter's is in its `defun` or `fn` literal.
+    pub ann: Option<TypeAnn>,
 }
 
 /// A literal.

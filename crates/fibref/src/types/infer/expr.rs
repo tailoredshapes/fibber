@@ -84,6 +84,7 @@ impl Cx<'_> {
     fn let_expr(&mut self, bs: &[(Pattern, Expr)], body: &Expr) -> TResult<Ty> {
         for (pat, init) in bs {
             let t = self.infer(init)?;
+            let t = self.let_binding_type(pat, t, &init.pos)?;
             self.check_pattern(pat, &t)?;
         }
         self.infer(body)
@@ -142,7 +143,10 @@ impl Cx<'_> {
         let mut tys = Vec::new();
         for (b, init) in vars {
             let t = self.infer(init)?;
-            let v = self.fresh();
+            let v = match self.binding_ann(*b, &init.pos)? {
+                Some(a) => a,
+                None => self.fresh(),
+            };
             self.flow(&t, &v, &init.pos)?;
             self.bind(*b, &v);
             tys.push(v);

@@ -318,10 +318,14 @@ closure in tail position of a `defun` or `fn` body is a tail call; in an
 ### 3.3 `let`
 
 ```
-(let ((pat expr)+) body)
+(let (binding+) body)
+binding ::= (pat expr) | (sym: type expr)
 ```
 
-Sequential bindings: each initialiser sees the earlier ones. `pat` must
+Sequential bindings: each initialiser sees the earlier ones. `(sym:
+type expr)` annotates the variable `sym` (§1.5); the initialiser's type
+must fit the annotation as an argument's must fit an annotated
+parameter (types §2.4). `pat` must
 be irrefutable: a symbol, `_`, `(pat :as sym)` (§3.6), a struct pattern, or a
 pattern of the only variant of an enum. Shadowing an enclosing binding
 is allowed; a name may not be bound twice in one `let` (**Decided**:
@@ -562,7 +566,7 @@ variables.
 |---|---|---|
 | `(spawn f)` | `(fn :send () a) -> (Task a)`, `Send a` | run `f` on another thread; the task is held by the caller and, until the result is stored, by the thread (types §6.8) |
 | `(join t)` | `(Task a) -> a` | wait; the result, owned. Any number of holders may `join` one task: the runtime resumes a task on one thread at a time and the others wait for its completion (types §8.8) |
-| `(plet ((sym expr)+) body)` | macro | `(let ((t1 (spawn (fn () e1))) ...) (let ((s1 (join t1)) ...) body))` |
+| `(plet ((sym expr)+) body)`; a binding may be `(sym: type expr)` (§1.5), annotating `s1` | macro | `(let ((t1 (spawn (fn () e1))) ...) (let ((s1 (join t1)) ...) body))` |
 | `(pmap f xs)` | library | `(fn :send (a) b) (Vec a) -> (Vec b)`, `Send a`, `Send b`; results in order |
 
 `spawn` is the only thread-crossing builtin; `plet` bindings cannot see
@@ -997,7 +1001,7 @@ See §5.
 ### 3.18 `loop`, `recur`
 
 ```
-(loop ((sym expr)*) body)
+(loop ((sym expr)*) body)     ; a variable may be annotated: (sym: type expr), §1.5
 (recur expr*)                 ; only in tail position of the innermost enclosing loop body
 ```
 

@@ -107,9 +107,6 @@ pub struct Interp<'p> {
     pub value_sites: FxSet<ExprId>,
     /// The scope of each live stack object.
     pub stack_scopes: FxMap<ObjId, ScopeId>,
-    /// Scopes whose end had to wait for inner scopes (private cells
-    /// already emptied by their write-back).
-    pub deferred_ends: Vec<ScopeId>,
     /// Immortal literals and function values.
     pub statics: Statics,
     /// The value of every `def`, once evaluated.
@@ -151,7 +148,6 @@ impl<'p> Interp<'p> {
             instances: super::plan::instances(p),
             value_sites: value_sites(o),
             stack_scopes: FxMap::default(),
-            deferred_ends: Vec::new(),
             statics: Statics::default(),
             defs: vec![None; p.globals.defs.len()],
             stack_base: stack_here(),
@@ -267,6 +263,10 @@ impl<'p> Interp<'p> {
     }
 
     /// Ends the scope of the stack object `v` (§6.11): its drop runs.
+    /// Stack lifetimes need not nest (types §8.2: each site has its own
+    /// slot in the entry block and its end is an inline drop), so a
+    /// temporary of a step ends at the step's end even while an object
+    /// made after it, bound by a `let`, lives on.
     pub fn end_stack(&mut self, v: &Val) -> R<()> {
         let id = v.expect_obj("end of a stack object")?;
         let scope = self.stack_scopes.remove(&id).ok_or_else(|| {
@@ -274,34 +274,17 @@ impl<'p> Interp<'p> {
                 "the plan ends {id} as a stack object; it is not one"
             ))
         })?;
-        if self.heap.open_scopes().last() != Some(&scope) {
-            let msg =
-                format!("the plan ends stack object {id} while a scope opened after it is open");
-            return Err(RunError::gap(msg));
-        }
         self.heap.end_scope(scope)?;
-        self.end_deferred()
+        Ok(())
     }
 
-    /// Ends the scope of an emptied private cell, now or as soon as the
-    /// scopes opened after it have ended.
+    /// Ends the scope of a private cell at its write-back (§6.6).
     pub fn end_private(&mut self, id: ObjId) -> R<()> {
         let scope = self
             .stack_scopes
             .remove(&id)
             .ok_or_else(|| RunError::internal(format!("private cell {id} has no scope")))?;
-        self.deferred_ends.push(scope);
-        self.end_deferred()
-    }
-
-    fn end_deferred(&mut self) -> R<()> {
-        while let Some(&top) = self.heap.open_scopes().last() {
-            let Some(i) = self.deferred_ends.iter().position(|s| *s == top) else {
-                break;
-            };
-            self.deferred_ends.remove(i);
-            self.heap.end_scope(top)?;
-        }
+        self.heap.end_scope(scope)?;
         Ok(())
     }
 

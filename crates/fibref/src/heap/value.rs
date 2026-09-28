@@ -33,9 +33,8 @@ impl fmt::Display for ObjId {
 /// the heap's scope table. Never reused, so an id kept after its scope
 /// ended can only name that ended scope.
 ///
-/// Scopes nest strictly: a scope is opened inside the innermost open one
-/// and must end before it. So among the scopes open at any moment, a
-/// larger id is an inner (shorter-lived) scope.
+/// Ids are handed out in opening order, so a larger id is a scope
+/// opened later. Scopes need not nest (`scope`): any open one may end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ScopeId(usize);
 

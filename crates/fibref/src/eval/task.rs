@@ -92,14 +92,14 @@ impl<'p> Interp<'p> {
     }
 
     fn task(&self, id: ObjId) -> R<&TaskData> {
-        match self.objs.get(id)? {
+        match self.objs.get(&self.heap, id)? {
             Obj::Task(t) => Ok(t),
             o => Err(RunError::internal(format!("not a task: {o:?}"))),
         }
     }
 
     fn task_mut(&mut self, id: ObjId) -> R<&mut TaskData> {
-        match self.objs.get_mut(id)? {
+        match self.objs.get_mut(&self.heap, id)? {
             Obj::Task(t) => Ok(t),
             o => Err(RunError::internal(format!("not a task: {o:?}"))),
         }

@@ -62,7 +62,7 @@ impl<'p> Interp<'p> {
 
     /// The elements of an array value.
     fn items(&self, v: &Val) -> R<&Vec<Val>> {
-        match self.objs.get(v.expect_obj("an array")?)? {
+        match self.objs.get(&self.heap, v.expect_obj("an array")?)? {
             Obj::Array(items) => Ok(items),
             o => Err(RunError::internal(format!("not an array: {o:?}"))),
         }
@@ -93,7 +93,7 @@ impl<'p> Interp<'p> {
     /// A copy of the struct or array `id` with field `i` set to `x`
     /// (which the copy stores; the caller gives back `x`'s count).
     fn changed_copy(&mut self, id: ObjId, i: usize, x: Val) -> R<Val> {
-        let obj = match self.objs.get(id)? {
+        let obj = match self.objs.get(&self.heap, id)? {
             Obj::Array(items) => Obj::Array(items.clone()),
             Obj::Struct { ty, fields } => Obj::Struct {
                 ty: *ty,
@@ -132,7 +132,7 @@ impl<'p> Interp<'p> {
         let content = self.slot(place)?.expect_obj("the content of a place")?;
         if self.heap.is_unique(content)? {
             self.heap.write_unique(place, i, x.project())?;
-            match self.objs.get_mut(content)? {
+            match self.objs.get_mut(&self.heap, content)? {
                 Obj::Array(items) => items[i] = x.clone(),
                 Obj::Struct { fields, .. } => fields[i] = x.clone(),
                 o => return Err(RunError::internal(format!("a unique write to {o:?}"))),

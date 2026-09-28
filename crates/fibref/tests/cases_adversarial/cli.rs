@@ -166,8 +166,12 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("95-option-of-scalar-is-a-heap-object.fib"),
         "{out}"
     );
-    assert!(out.contains("93 cases:"), "{out}");
-    assert!(out.contains("93 pass, 0 fail, 0 pending"), "{out}");
+    assert!(
+        out.contains("100-annotated-let-loop-and-plet-bindings.fib"),
+        "{out}"
+    );
+    assert!(out.contains("98 cases:"), "{out}");
+    assert!(out.contains("98 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 

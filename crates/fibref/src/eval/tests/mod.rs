@@ -5,7 +5,9 @@ mod atoms;
 mod calls;
 mod macros;
 mod memory;
+mod objects;
 mod options;
+mod stack;
 mod values;
 
 use crate::cases::{Evaluator, Outcome, Value};
