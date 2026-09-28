@@ -175,3 +175,14 @@ each while main spins until both are done (167, 349525); two threads
 each adding 1 twenty times with a `swap!` whose `f` outlasts a quantum,
 so that under this schedule the other thread's update lands while `f`
 runs and the compare fails and retries (168, 40).
+
+Case 169 pins the native `Show` and `Hash` instances (types §2.12) on
+the integers, `bool`, `char`, a field-less enum, a keyword, `str`, the
+floats and unit, as the reference interpreter computes them: `show`
+gives a fresh `str` each time; `hash` of an integer is its value, of a
+`bool` or `char` its code, of a field-less enum its variant index, of a
+keyword the FNV-1a of its name and of a `str` of its bytes, of a float
+the bits of its value as an `f64`, of unit 0. The result folds every
+text's length and every hash (169, 1209), so a compiler that differs
+in any text or hash fails it. `show` of a float and of a `str` are not
+exercised: their text is undecided (compiler.md §8 item 11).

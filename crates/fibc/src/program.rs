@@ -3,6 +3,7 @@
 //! functions emitted so far.
 
 use std::collections::VecDeque;
+use std::fmt::Write;
 
 use fibref::own::program::BodyKey;
 use fibref::own::Checked;
@@ -50,6 +51,9 @@ pub struct Program<'a> {
     pub quotes: std::collections::HashMap<ExprId, String>,
     pub quote_text: String,
     quote_counter: usize,
+    /// Whether a body used `show` or `hash` on a keyword, so that the
+    /// module needs `kw.show` and `kw.hash` over every keyword interned.
+    pub keyword_helpers: bool,
 }
 
 impl<'a> Program<'a> {
@@ -67,6 +71,7 @@ impl<'a> Program<'a> {
             quotes: std::collections::HashMap::new(),
             quote_text: String::new(),
             quote_counter: 0,
+            keyword_helpers: false,
         };
         // `str` is type id 0: the literals need it before any body runs;
         // the runtime's own text names the byte array and the weak box.
@@ -248,6 +253,30 @@ impl<'a> Program<'a> {
     /// The extern declarations.
     pub fn render_externs(&self) -> String {
         self.externs.concat()
+    }
+
+    /// `kw.show` and `kw.hash`, switching on the keyword id (types
+    /// §2.12: `show` is `:` and the name, `hash` the FNV-1a of the
+    /// name), when a body needed them; interns the names' strings, so
+    /// this runs before the statics are rendered.
+    pub fn render_keyword_helpers(&mut self) -> String {
+        if !self.keyword_helpers {
+            return String::new();
+        }
+        let (mut show, mut hash) = (String::new(), String::new());
+        let mut cases = Vec::new();
+        for (i, k) in self.statics.keywords().iter().enumerate() {
+            let colon = self.statics.string(&format!(":{k}"), 0);
+            let name = self.statics.string(k, 0);
+            cases.push(format!("((i64 {i}) k{i})"));
+            let _ = writeln!(show, "  (block k{i} (ret (call @fib.str-copy {colon})))");
+            let _ = writeln!(hash, "  (block k{i} (ret (call @fib.str-hash {name})))");
+        }
+        let cases = cases.join(" ");
+        format!(
+            "(define internal (kw.show ptr) ((i64 k))\n  (block entry (switch k bad {cases}))\n{show}  (block bad (unreachable)))\n\
+             (define internal (kw.hash i64) ((i64 k))\n  (block entry (switch k bad {cases}))\n{hash}  (block bad (unreachable)))\n"
+        )
     }
 
     /// The type id and struct name of the task object of the `async`

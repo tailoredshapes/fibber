@@ -17,6 +17,79 @@
       (store (i8 0) (getelementptr %struct.fib.str s (i32 0) (i32 4) n))
       (ret s))))
 
+;; A fresh str of the n bytes at p.
+(define internal (fib.str-from-bytes ptr) ((ptr p) (i64 n))
+  (block entry
+    (let ((s (call @fib.str-new n)))
+      (call @memcpy (call @fib.str-bytes-ptr s) p n)
+      (ret s))))
+
+(define internal (fib.str-copy ptr) ((ptr s))
+  (block entry
+    (ret (call @fib.str-from-bytes (call @fib.str-bytes-ptr s) (call @fib.str-len s)))))
+
+;; (hash s) on a str: 64-bit FNV-1a over the bytes (eval/arith.rs fnv).
+(define internal (fib.str-hash i64) ((ptr s))
+  (block entry
+    (let ((p (call @fib.str-bytes-ptr s))
+          (n (call @fib.str-len s)))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (body i2)))
+          (h (phi i64 (entry (i64 -3750763034362895579)) (body h2))))
+      (br (icmp slt i n) body done)))
+  (block body
+    (let ((b (zext i64 (load i8 (getelementptr i8 p i))))
+          (h2 (mul (xor h b) (i64 1099511628211)))
+          (i2 (add i (i64 1))))
+      (br loop)))
+  (block done (ret h)))
+
+;; The native Show instances (types §2.12), each a fresh str with the
+;; interpreter's text (eval/arith.rs show).
+(define internal (fib.show-int ptr) ((i64 n))
+  (block entry
+    (let ((buf (alloca i8 (i32 24)))
+          (len (call @snprintf buf (i64 24) (string "%lld") n)))
+      (ret (call @fib.str-from-bytes buf (sext i64 len))))))
+
+(define internal (fib.show-ptr ptr) ((ptr p))
+  (block entry
+    (let ((buf (alloca i8 (i32 24)))
+          (len (call @snprintf buf (i64 24) (string "#ptr%llx") (ptrtoint i64 p))))
+      (ret (call @fib.str-from-bytes buf (sext i64 len))))))
+
+(define internal (fib.show-bool ptr) ((i1 b))
+  (block entry (br b yes no))
+  (block yes (ret (call @fib.str-from-bytes (string "true") (i64 4))))
+  (block no (ret (call @fib.str-from-bytes (string "false") (i64 5)))))
+
+;; The UTF-8 encoding of the scalar value c.
+(define internal (fib.show-char ptr) ((i32 c))
+  (block entry
+    (let ((buf (alloca i8 (i32 4))))
+      (br (icmp slt c (i32 128)) one more1)))
+  (block one
+    (store (trunc i8 c) buf)
+    (ret (call @fib.str-from-bytes buf (i64 1))))
+  (block more1 (br (icmp slt c (i32 2048)) two more2))
+  (block two
+    (store (trunc i8 (or (lshr c (i32 6)) (i32 192))) buf)
+    (store (trunc i8 (or (and c (i32 63)) (i32 128))) (getelementptr i8 buf (i64 1)))
+    (ret (call @fib.str-from-bytes buf (i64 2))))
+  (block more2 (br (icmp slt c (i32 65536)) three four))
+  (block three
+    (store (trunc i8 (or (lshr c (i32 12)) (i32 224))) buf)
+    (store (trunc i8 (or (and (lshr c (i32 6)) (i32 63)) (i32 128))) (getelementptr i8 buf (i64 1)))
+    (store (trunc i8 (or (and c (i32 63)) (i32 128))) (getelementptr i8 buf (i64 2)))
+    (ret (call @fib.str-from-bytes buf (i64 3))))
+  (block four
+    (store (trunc i8 (or (lshr c (i32 18)) (i32 240))) buf)
+    (store (trunc i8 (or (and (lshr c (i32 12)) (i32 63)) (i32 128))) (getelementptr i8 buf (i64 1)))
+    (store (trunc i8 (or (and (lshr c (i32 6)) (i32 63)) (i32 128))) (getelementptr i8 buf (i64 2)))
+    (store (trunc i8 (or (and c (i32 63)) (i32 128))) (getelementptr i8 buf (i64 3)))
+    (ret (call @fib.str-from-bytes buf (i64 4)))))
+
 (define internal (fib.str-cmp i32) ((ptr a) (ptr b))
   (block entry
     (let ((na (call @fib.str-len a))

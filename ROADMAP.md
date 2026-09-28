@@ -31,7 +31,7 @@ Decisions taken on the way are in spec/types.md §10.
 - [x] evaluator following the checker's plan (`fibref run`), with
       threads, atoms and an async executor that is deterministic and
       fair (types §8.8, "The reference interpreter's schedule")
-- [x] case harness and CI: 166 cases in cases/ownership, all passing
+- [x] case harness and CI: 167 cases in cases/ownership, all passing
       with a clean audit (its README lists them by origin: the 20
       decided, the promoted proposals, the rule-4 adversary's findings
       81 to 95, the rule-5 generator's, and the owner's decisions of
@@ -136,8 +136,7 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       compiler.md §4
 - [x] method rule 6 harness: `fibc cases` runs every case interpreted
       and compiled and compares results, rejections, traps and free
-      traces; 165 of the 166 cases pass both ways, 0 fail, 1 pending
-      (`show` on a scalar)
+      traces; all 167 cases pass both ways, 0 fail, 0 pending
 - [x] macros through the JIT: one macro-time module per `defmacro`,
       `gensym` and reflection through hooks into the expander;
       `tests/macros.rs` shows the expansions equal `fibref`'s on every
@@ -146,9 +145,11 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       driven to completion by its first joiner, as `fibref` does;
       compiler.md §8 question 3)
 - [x] `(Weak (dyn P))` (compiler.md §8 item 10, cases 87 and 110)
+- [x] the native `Show` and `Hash` instances on scalars, field-less
+      enums and `str` (case 169), except `show` of a float and of a
+      `str`, whose text is undecided (compiler.md §8 item 11)
 - [ ] `def` initialisers through the JIT (today evaluated by `fibref`
-      and serialised; question 4); `show` and `hash` on scalars; a
-      `(dyn P)` of a native instance
+      and serialised; question 4); a `(dyn P)` of a native instance
 - [ ] generated programs (`fibgen`) through the harness
 - [ ] the owner's answers to compiler.md §8
 

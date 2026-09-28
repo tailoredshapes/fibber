@@ -44,7 +44,7 @@ pub fn compile(checked: &Checked) -> Result<String, Unsupported> {
             Work::Closure { owner, lit, name } => emit_closure(&mut p, owner, lit, &name)?,
         }
     }
-    Ok(assemble(&p, &defs.text, &entry))
+    Ok(assemble(&mut p, &defs.text, &entry))
 }
 
 /// A compiled macro-time module (compiler.md §6, `macros/`).
@@ -125,7 +125,7 @@ pub fn compile_macro(
         size,
         vec,
     };
-    let mut text = assemble_parts(&p, &defs.text);
+    let mut text = assemble_parts(&mut p, &defs.text);
     text.push_str(&render(&layout, &body, n, k));
     Ok(MacroModule {
         text,
@@ -136,15 +136,17 @@ pub fn compile_macro(
 
 /// The runtime, the tables, the static data and every function: what
 /// a program and a macro module share.
-fn assemble_parts(p: &Program<'_>, defs: &str) -> String {
+fn assemble_parts(p: &mut Program<'_>, defs: &str) -> String {
     let mut out = String::new();
     for part in RUNTIME {
         out.push_str(part);
         out.push('\n');
     }
+    let keyword_helpers = p.render_keyword_helpers();
     out.push_str(&p.render_externs());
     out.push_str(&p.objects.render());
     out.push_str(&p.statics.render());
+    out.push_str(&keyword_helpers);
     out.push_str(defs);
     out.push_str(&p.quote_text);
     for f in &p.funcs {
@@ -153,7 +155,7 @@ fn assemble_parts(p: &Program<'_>, defs: &str) -> String {
     out
 }
 
-fn assemble(p: &Program<'_>, defs: &str, entry: &str) -> String {
+fn assemble(p: &mut Program<'_>, defs: &str, entry: &str) -> String {
     let mut out = assemble_parts(p, defs);
     let _ = LirTy::I64;
     // §8.8: main's return joins every thread still running before

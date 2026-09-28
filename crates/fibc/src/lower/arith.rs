@@ -26,7 +26,8 @@ impl<'a> Cx<'_, 'a> {
         let y = a.get(1).cloned();
         match proto {
             "Deref" => self.deref_val(&x, &tys[0]),
-            "Show" | "Hash" => Err(Unsupported(format!("native {proto}"))),
+            "Show" => self.native_show(&x, &tys[0]),
+            "Hash" => self.native_hash(&x, &tys[0]),
             _ => {
                 if matches!(tys[0], Ty::Con(Con::Str, _)) {
                     return self.str_compare(method, &x, y.as_ref());

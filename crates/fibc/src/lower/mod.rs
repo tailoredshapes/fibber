@@ -15,6 +15,7 @@ mod objects;
 mod ops;
 pub mod pattern;
 mod quote;
+mod show;
 mod threads;
 mod values;
 

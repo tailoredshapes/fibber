@@ -285,3 +285,16 @@ Recorded as they arise; none changes §8.
     `option_value` with heap placement (eval/cells.rs), and `fibc`
     emits the same two allocations (`lower/cells.rs`). A weak
     reference to any other object type still allocates nothing.
+11. **The text of `show` on a float and on a `str` is undecided.** The
+    interpreter prints a float with Rust's `{:?}` (the shortest text
+    that reads back to the same value, `1.0`, `1e21`, `NaN`, `inf`)
+    and a `str` with Rust's `{:?}` (quoted, with Rust's escapes and
+    `\u{..}` for what Rust deems unprintable). Neither is a rule of
+    types §2.12, and neither can be reproduced in the runtime without
+    a decision on the exact text (a float printer of the shortest
+    round-trip kind; the set of characters a `str` escapes). `fibc`
+    reports both as unsupported; every other native `Show` and `Hash`
+    is lowered (`lower/show.rs`, `rt/str.lir`; case 169). Proposed:
+    §2.12 fixes `show` of a float as the shortest round-trip decimal
+    with a `.0` for an integral value and `NaN`, `inf`, `-inf`, and
+    `show` of a `str` as the string itself, unquoted.
