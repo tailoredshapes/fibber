@@ -69,7 +69,7 @@ impl<'p> Interp<'p> {
             ExprKind::SetField(b, f, v) => self.set_field(*b, f, v)?,
             ExprKind::Async(..) => self.make_async(e)?,
             ExprKind::Await(x) => self.await_task(x)?,
-            ExprKind::Unsafe(b) | ExprKind::Dyn(_, _, b) => self.val(b)?,
+            ExprKind::Unsafe(b) | ExprKind::Dyn(_, _, _, b) => self.val(b)?,
             ExprKind::Quote(f) => self.quote(e, f)?,
             ExprKind::Convert(op, t, x) => {
                 let v = self.val(x)?;

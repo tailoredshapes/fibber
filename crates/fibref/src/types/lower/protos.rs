@@ -181,9 +181,10 @@ fn rename_dispatch(ann: &TypeAnn, dispatch: &str) -> TypeAnn {
             *id,
             args.iter().map(|a| rename_dispatch(a, dispatch)).collect(),
         ),
-        TypeAnn::Dyn(p, args) => TypeAnn::Dyn(
+        TypeAnn::Dyn(p, args, send) => TypeAnn::Dyn(
             *p,
             args.iter().map(|a| rename_dispatch(a, dispatch)).collect(),
+            *send,
         ),
         TypeAnn::Fn(k, ps, r) => TypeAnn::Fn(
             *k,

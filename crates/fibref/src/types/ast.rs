@@ -225,8 +225,9 @@ pub enum ExprKind {
     Unsafe(Box<Expr>),
     /// `(quote f)`.
     Quote(Form),
-    /// `(dyn P e)` / `(dyn (P D..) e)`.
-    Dyn(ProtoId, Vec<TypeAnn>, Box<Expr>),
+    /// `(dyn P e)` / `(dyn (P D..) e)`, or with `:send` after the
+    /// protocol (the `bool`, types §2.15).
+    Dyn(ProtoId, Vec<TypeAnn>, bool, Box<Expr>),
     /// A conversion `(op T e)`.
     Convert(ConvOp, Scalar, Box<Expr>),
     /// `(concat v..)`, the variadic `(Vec a)` concatenation the
@@ -277,8 +278,8 @@ pub enum TypeAnn {
     Nominal(TypeId, Vec<TypeAnn>),
     /// `(fn κ? (A..) R)`; `None` when the colour is omitted (§1.4).
     Fn(Option<Colour>, Vec<TypeAnn>, Box<TypeAnn>),
-    /// `(dyn P)` / `(dyn (P D..))`.
-    Dyn(ProtoId, Vec<TypeAnn>),
+    /// `(dyn P)` / `(dyn (P D..))`, or with `:send` (the `bool`).
+    Dyn(ProtoId, Vec<TypeAnn>, bool),
 }
 
 impl Expr {
@@ -323,7 +324,7 @@ impl Expr {
             | ExprKind::Async(e, _)
             | ExprKind::Await(e)
             | ExprKind::Unsafe(e)
-            | ExprKind::Dyn(_, _, e)
+            | ExprKind::Dyn(_, _, _, e)
             | ExprKind::Convert(_, _, e) => f(e),
         }
     }

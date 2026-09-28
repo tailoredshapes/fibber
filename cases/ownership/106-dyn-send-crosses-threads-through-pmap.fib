@@ -1,0 +1,19 @@
+;; spec:   types §2.15, §5.1, §5.2 (ownership.md §7)
+;; expect: accept
+;; result: 5
+;; audit:  clean
+;; A heterogeneous vector of sendable dynamic values: each element is
+;; made by (dyn Show :send e), whose e is Send (types §2.15), so the
+;; element type (dyn Show :send) is Send (§5.1) and pmap, whose scheme
+;; requires Send of its element type (§5.2), runs show on other threads.
+;; Each object behind a dyn is marked shared when it crosses (§5.5).
+(defstruct Named (s: str))
+(defstruct Pair (a: str b: str))
+
+(impl Show Named (show (self) (. self s)))
+(impl Show Pair (show (self) (str-concat (. self a) (. self b))))
+
+(defun main () -> i64
+  (let ((items [(dyn Show :send (Named "ab")) (dyn Show :send (Pair "x" "yz"))])
+        (lens (pmap (fn (d) (str-len (show d))) items)))
+    (+ (nth lens 0) (nth lens 1))))

@@ -52,7 +52,8 @@ evaluator over the audited heap.
         live then is not a leak (types §2.11; cases 101 to 104)
   - [x] a float literal of a width other than f32/f64 is an error, read
         or macro-built (syntax §1.1; case 105)
-  - [ ] `(dyn P :send)`
+  - [x] `(dyn P :send)`: a distinct `Send` dynamic type (types §2.15;
+        cases 106 to 112)
   - [ ] colour parameters on structs and enums
   - [ ] protocol supertraits and default methods
   - [ ] private names

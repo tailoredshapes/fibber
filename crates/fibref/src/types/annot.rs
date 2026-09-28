@@ -36,7 +36,7 @@ pub fn ann_to_ty(ann: &TypeAnn, env: &mut dyn AnnEnv, pos: &Pos) -> TResult<Ty> 
         TypeAnn::Str => Ty::str(),
         TypeAnn::Builtin(c, arg) => Ty::Con(*c, vec![ann_to_ty(arg, env, pos)?]),
         TypeAnn::Nominal(id, args) => Ty::Con(Con::Nominal(*id), anns(args, env, pos)?),
-        TypeAnn::Dyn(p, args) => Ty::Con(Con::Dyn(*p), anns(args, env, pos)?),
+        TypeAnn::Dyn(p, args, send) => Ty::Con(Con::Dyn(*p, *send), anns(args, env, pos)?),
         TypeAnn::Fn(k, ps, r) => {
             let k = match k {
                 Some(k) => *k,

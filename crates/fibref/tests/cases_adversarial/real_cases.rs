@@ -23,12 +23,14 @@ fn real_cases() -> Vec<PathBuf> {
     cases
 }
 
-const REJECT: &[u32] = &[12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105];
+const REJECT: &[u32] = &[
+    12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109, 112,
+];
 const LEAK_CYCLE: [u32; 2] = [15, 80];
 /// The cases whose verdict is a run-time trap (method.md rule 3).
 const TRAP: [u32; 4] = [101, 102, 103, 104];
 /// The last case number of this suite. Another series starts at 131.
-const LAST: u32 = 105;
+const LAST: u32 = 112;
 
 fn number_of(path: &Path) -> u32 {
     let name = path.file_name().unwrap().to_string_lossy();

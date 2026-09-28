@@ -121,13 +121,16 @@ impl<'a> Printer<'a> {
             Con::Weak => "Weak".to_string(),
             Con::Task => "Task".to_string(),
             Con::Nominal(id) => self.g.ty(id).name.clone(),
-            Con::Dyn(p) => {
+            Con::Dyn(p, send) => {
                 let pname = self.g.proto(p).name.clone();
                 out.push_str("(dyn ");
                 if args.is_empty() {
                     out.push_str(&pname);
                 } else {
                     self.write_con_args(&pname, args, out);
+                }
+                if send {
+                    out.push_str(" :send");
                 }
                 out.push(')');
                 return;

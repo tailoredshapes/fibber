@@ -1,0 +1,18 @@
+;; spec:   types §2.15, §5.1, §5.3 (ownership.md §7)
+;; expect: reject
+;; error:  cell cannot be shared between threads: field n of Counter has type (Cell i64)
+;; (dyn P :send e) requires Send of e's type (types §2.15). A Counter
+;; reaches a cell through its field, so it cannot be hidden behind a
+;; sendable dyn: if it could, the spawned closure would write the cell
+;; while main reads it, a data race on a non-atomic cell (ownership.md
+;; §7). The witness names the path to the cell (§5.3).
+(defstruct Counter (n: (Cell i64)))
+
+(impl Show Counter
+  (show (self) (do (set! (. self n) (+ @(. self n) 1)) "tick")))
+
+(defun main () -> i64
+  (let ((c (Counter (cell 0)))
+        (d (dyn Show :send c))
+        (t (spawn (fn () (str-len (show d))))))
+    (+ (join t) @(. c n))))

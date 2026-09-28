@@ -61,10 +61,12 @@ fn walk(
             needs.vars.push((t.clone(), path.clone()));
             Ok(())
         }
-        Ty::Con(Con::Scalar(Scalar::Ptr), _) | Ty::Con(Con::Dyn(_), _) | Ty::Con(Con::Cell, _) => {
-            fail(path, t)
-        }
+        Ty::Con(Con::Scalar(Scalar::Ptr), _)
+        | Ty::Con(Con::Dyn(_, false), _)
+        | Ty::Con(Con::Cell, _) => fail(path, t),
         Ty::Con(Con::Scalar(_), _) | Ty::Con(Con::Str, _) | Ty::Con(Con::Atom, _) => Ok(()),
+        // `(dyn P :send)` was made of a `Send` value (§2.15, §5.1).
+        Ty::Con(Con::Dyn(_, true), _) => Ok(()),
         Ty::Con(c @ (Con::Array | Con::Weak | Con::Task), args) => {
             let what = match c {
                 Con::Array => "element",

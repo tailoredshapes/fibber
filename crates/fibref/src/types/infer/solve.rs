@@ -76,7 +76,7 @@ impl Cx<'_> {
         match &t1 {
             Ty::Var(_) | Ty::Gen(_) => Ok(Step::Stuck),
             Ty::Rigid(r) => self.rigid_proto(d, p, *r, args),
-            Ty::Con(Con::Dyn(q), dargs) if *q == p => {
+            Ty::Con(Con::Dyn(q, _), dargs) if *q == p => {
                 if let Some(m) = method {
                     let md = &self.g.proto(p).methods[m];
                     if md.self_elsewhere {

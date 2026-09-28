@@ -124,8 +124,9 @@ pub enum Con {
     /// A struct or enum, applied to its parameters.
     Nominal(TypeId),
     /// `(dyn P)` or `(dyn (P D..))`: the arguments are the determined
-    /// parameters `D..`.
-    Dyn(ProtoId),
+    /// parameters `D..`. With `true`, `(dyn P :send)` (§2.15, §5.1): a
+    /// distinct type, `Send`, made only of a `Send` value.
+    Dyn(ProtoId, bool),
 }
 
 /// A closure colour (§1.4, §5.4): `send ⊑ local`.

@@ -1,0 +1,18 @@
+;; spec:   types §2.15, §5.1, §5.3 (ownership.md §7)
+;; expect: reject
+;; error:  value of type (dyn Show) cannot be shared between threads
+;; (dyn P) stays non-Send (types §5.1): nothing records whether the
+;; object behind it reaches a cell, and here it does. A closure that
+;; captures it is local (§5.4) and spawn requires a send closure. The
+;; sendable form is (dyn Show :send ..), which case 107 shows refusing
+;; this object.
+(defstruct Counter (n: (Cell i64)))
+
+(impl Show Counter
+  (show (self) (do (set! (. self n) (+ @(. self n) 1)) "tick")))
+
+(defun main () -> i64
+  (let ((c (Counter (cell 0)))
+        (d (dyn Show c))
+        (t (spawn (fn () (str-len (show d))))))
+    (+ (join t) @(. c n))))

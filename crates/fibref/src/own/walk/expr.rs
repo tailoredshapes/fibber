@@ -59,7 +59,7 @@ impl Walker<'_> {
                 OWNED
             }
             ExprKind::Unsafe(b) => self.expr(b, false),
-            ExprKind::Dyn(_, _, x) => self.expr(x, false),
+            ExprKind::Dyn(_, _, _, x) => self.expr(x, false),
             ExprKind::Convert(_, _, x) => {
                 self.operand(x);
                 Mode::Scalar

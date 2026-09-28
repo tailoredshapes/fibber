@@ -1,0 +1,16 @@
+;; spec:   types §2.15, §5.1
+;; expect: reject
+;; error:  value of type (dyn Show) cannot be shared between threads
+;; The conversion goes one way only (types §2.15): (dyn Show :send d)
+;; of a plain (dyn Show) would need Send((dyn Show)), which is false,
+;; because nothing records what the object behind d reaches. Here it
+;; reaches a cell, and the laundered value would cross a thread.
+(defstruct Counter (n: (Cell i64)))
+
+(impl Show Counter (show (self) "counter"))
+
+(defun main () -> i64
+  (let ((d (dyn Show (Counter (cell 0))))
+        (s (dyn Show :send d))
+        (t (spawn (fn () (str-len (show s))))))
+    (join t)))

@@ -26,7 +26,8 @@ not changed.
 
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
-Cases 12, 13, 14, 18, 21, 34, 40, 82, 90 and 93 must be rejected; 15
+Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109 and
+112 must be rejected; 101 to 104 must trap; 15
 and 80 are the permitted cycle leaks; every other case is accept with a
 clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
 pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
@@ -66,4 +67,11 @@ first `trap` cases: overflow of `+` at `i8` with objects live at the
 abort, the minimum of `i64` divided by -1, division by zero on a
 spawned thread, and `rem` of the minimum of `i32` by -1 (types §2.12).
 105 rejects a float literal of width `:f16` built by a macro (syntax
-§1.1).
+§1.1). 106 to 112 cover `(dyn P :send)` (types §2.15, §5.1): a
+heterogeneous vector of sendable dynamic values through `pmap` (106),
+a weak reference to one and an atom holding one crossing threads
+(110), and the explicit conversion to `(dyn P)` (111) are accepted;
+hiding a value that reaches a cell (107), capturing a plain `(dyn P)`
+in a spawned closure (108), a generic function hiding a cell holder
+(109) and converting a `(dyn P)` back to `(dyn P :send)` (112) are
+rejected.

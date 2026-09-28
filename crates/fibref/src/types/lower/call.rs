@@ -23,6 +23,11 @@ enum Special {
     Convert(ConvOp),
 }
 
+/// Whether `(dyn P :send e)`: the keyword right after the protocol.
+fn dyn_send(items: &[Form]) -> bool {
+    matches!(items.get(2).map(|f| &f.kind), Some(FormKind::Kw(k)) if k == "send")
+}
+
 fn conv_op(name: &str) -> Option<ConvOp> {
     Some(match name {
         "trunc" => ConvOp::IntToInt(IntConv::Trunc),
@@ -187,9 +192,11 @@ impl Lowerer<'_> {
                 self.set_field(items)?
             }
             Special::Dyn => {
-                arity(2)?;
+                let send = dyn_send(items);
+                arity(if send { 3 } else { 2 })?;
                 let (p, dets) = proto_ref(self.g, self.m, &items[1], false)?;
-                ExprKind::Dyn(p, dets, Box::new(self.expr(&items[2], false)?))
+                let e = self.expr(items.last().unwrap_or(&items[0]), false)?;
+                ExprKind::Dyn(p, dets, send, Box::new(e))
             }
             Special::Convert(op) => {
                 arity(2)?;

@@ -35,7 +35,7 @@ object ::= str | Form
          | Name | (Name type+)                   ; nominal struct or enum, incl. the library's Vec, Map, Set, List, Option
          | (Cell type) | (Atom type) | (Weak type) | (Task type)
          | (fn colour? (type*) type)             ; function or closure; colour := :send | :local
-         | (dyn Proto) | (dyn (Proto type+))     ; dynamic protocol value
+         | (dyn Proto :send?) | (dyn (Proto type+) :send?)   ; dynamic protocol value
 tvar   ::= a lowercase symbol that names no type   ; a type variable, scoped to its definition
 ```
 
@@ -76,7 +76,8 @@ represented as one pointer, immutable unless it is a `Cell` or an `Atom`
 | `(Weak T)` | no | if `T` is | `T` must be an object type other than an `Option` (§2.11); `(Weak (dyn P))` is two words (§8.1, §8.7) |
 | `(Task T)` | internal | if `T` is | made by `async` or `spawn` |
 | `(fn κ (A..) R)` | no | iff κ = `send` | a closure's colour is decided by what it captures (§5.4) |
-| `(dyn P)` | no | no (v1) | pointer plus vtable (§4.4); made only of an object, never of a scalar (§2.15) |
+| `(dyn P)` | no | no | pointer plus vtable (§4.4); made only of an object, never of a scalar (§2.15) |
+| `(dyn P :send)` | no | **yes** | the same two words (§8.1); made only by `(dyn P :send e)`, whose `e` must be `Send` (§2.15) |
 
 ### 1.3 Nominal types, generics, recursion
 
@@ -172,7 +173,11 @@ are (§8.1). The prelude derives `Eq`, `Ord` (`nil` before `some`),
 A protocol `P` is not a type. `(dyn P)` is: the type of a value of some
 unknown type implementing `P`, carrying its dispatch table (§4.4). It is
 produced only by the explicit primitive `(dyn P e)` (**Decided**, D3: no
-subtyping, no coercion anywhere in the type system).
+subtyping, no coercion anywhere in the type system). `(dyn P :send)`
+(**Decided**, owner, 2026-09-28) is a second, distinct type: a value of
+some unknown type implementing `P` that is `Send`, produced only by
+`(dyn P :send e)` (§2.15). It is `Send` (§5.1) and `(dyn P)` is not;
+neither is a subtype of the other.
 
 ### 1.8 Constraints and schemes
 
@@ -569,6 +574,46 @@ A method call on a `(dyn P)` receiver has the method's signature with
 `self := (dyn P)`; methods whose signature mentions `self` anywhere but
 the receiver position are not callable through `dyn` (§4.4).
 
+```
+(dyn P :send e)    e : S, (Object S), (Send S), with the instance (P S) resolved at generalisation  ⇒ (dyn P :send)
+```
+
+**Decided** (owner, 2026-09-28; replaces "`(dyn P)` is not `Send` in
+v1", §10 item 11). `(dyn P :send e)` is `(dyn P e)` with one more
+requirement: `Send` of the hidden type `S`, checked as at `atom` (§5.1,
+§5.3), so a value that can reach a cell, a `local` closure, a `ptr` or
+a plain `(dyn Q)` is `cell cannot be shared between threads: ..` or
+`value of type T cannot be shared between threads: ..` there. When `S`
+is a quantified variable, `(Send a)` is a bound of the scheme like
+`(Object a)`, so a generic function that makes a `(dyn P :send)` of its
+argument can be instantiated only at sendable types. Everything else is
+as for `(dyn P)`: the determined parameters, the object-safety rule of
+§4.4, the mode of `e` (§6.2), the vtable (§8.5). A method call on a
+`(dyn P :send)` receiver has `self := (dyn P :send)`.
+
+Conversions: none is implicit (D3). `(dyn P d)` with `d : (dyn P
+:send)` is the one explicit conversion: the instance `(P (dyn P
+:send))` is satisfied by the receiver's own vtable (§3.3), so it gives
+a `(dyn P)` of the same object and vtable, the identity on the two
+words, which is how a sendable value joins a collection of `(dyn P)`s.
+There is no conversion the other way: `(dyn P :send d)` with `d :
+(dyn P)` fails `Send((dyn P))`, since nothing records whether the
+object behind a `(dyn P)` can reach a cell. A `(dyn Q e)` of either
+over a protocol `Q` other than `P` (and other than a supertrait of
+`P`, §4.1) is `no implementation of Q for (dyn P ..)`.
+
+With the other constructors, `(dyn P :send)` is an ordinary `Send`
+object type: `(Weak (dyn P :send))` is `Send` and is laid out like
+`(Weak (dyn P))` (§8.1, §8.7), and `@w` gives `(Option (dyn P :send))`,
+a heap enum as for `(dyn P)` (§8.1); `(Cell (dyn P :send))` is a cell
+and not `Send`; `(atom (dyn P :send e))` is well formed where `(atom
+(dyn P e))` is not; a closure capturing a `(dyn P :send)` can be `send`,
+so it may reach `spawn`, `plet`, `pmap` (whose `Send a` holds at `a :=
+(dyn P :send)`) and an `async` body. Crossing a thread marks the object
+behind it shared like any other (§5.5), and a weak reference to it
+crossing marks its live target (§5.5), whose upgrade on the other thread
+then counts atomically.
+
 ### 2.16 `def`
 
 ```
@@ -639,7 +684,8 @@ Robinson unification with the occurs check over the grammar of §1:
   the bound term's variables (Rémy);
 - constructor–constructor: same constructor and arity, unify arguments
   pairwise, else `cannot unify T₁ with T₂`; nominal constructors unify
-  only with themselves; `(dyn P)` only with itself;
+  only with themselves; `(dyn P)` only with itself, and `(dyn P :send)`
+  only with itself;
 - function–function: unify parameter lists (same arity) and results;
   colours are **not** unified: at a *flow site* (an application argument,
   a branch join, an annotated `let`, a `set!` value, a constructor
@@ -660,7 +706,7 @@ bound, and again at the end of the SCC:
 
 | Constraint | Solved when | Failure |
 |---|---|---|
-| `(P T₁ .. Tₙ)` | head of `T₁` known: look up the unique instance for `(P, head T₁)`, instantiate it, unify its `S` with `T₁` and its determined arguments with `T₂ .. Tₙ` (the improvement `T₁ → T₂..`), then replace the constraint by the instance's declared context (§2.7). `T₁` a rigid variable: must be entailed by a bound. `T₁ = (dyn P)`: satisfied. `T₁` an unbound variable at generalisation: becomes a bound of the scheme if `T₁` occurs in the type, else `ambiguous constraint P a in f; add an annotation` | `no implementation of P for T₁` |
+| `(P T₁ .. Tₙ)` | head of `T₁` known: look up the unique instance for `(P, head T₁)`, instantiate it, unify its `S` with `T₁` and its determined arguments with `T₂ .. Tₙ` (the improvement `T₁ → T₂..`), then replace the constraint by the instance's declared context (§2.7). `T₁` a rigid variable: must be entailed by a bound. `T₁ = (dyn P)` or `(dyn P :send)`: satisfied. `T₁` an unbound variable at generalisation: becomes a bound of the scheme if `T₁` occurs in the type, else `ambiguous constraint P a in f; add an annotation` | `no implementation of P for T₁` |
 | `(Send T)`, `(Object T)`, `(Weakable T)` | evaluated structurally once the head is known (§5.1, §2.11); a quantified variable's constraint becomes a bound | `cell cannot be shared between threads: …` (§5.3) / `value of type T cannot be shared between threads: …` / `dyn requires an object type` / `weak requires an object type` / `weak of an Option is not allowed` |
 | `HasField(T, f, R)` | `T` becomes a struct: `R ~` field type | `T has no field f`; unresolved at generalisation: `cannot infer the struct type of e for field f; annotate it` |
 | `HasDeref(T, R)` | `T` becomes `Cell`/`Atom`/`Weak`: `R ~ T'`/`T'`/`(Option T')` | unresolved: `cannot infer whether x is a cell, an atom or a weak reference` |
@@ -897,8 +943,10 @@ mentions `self` anywhere but the receiver position (`(conj (self x: e)
 -> Self)`) are not callable through `dyn` (object safety); protocols with
 determined parameters are usable as `(dyn (P D̄))` with `D̄` fixed. `(dyn
 P)` is chosen only where the program writes it: heterogeneous
-collections and plugin-style interfaces. It is not `Send` in v1 (§10
-item 11).
+collections and plugin-style interfaces. It is not `Send`; `(dyn P
+:send)` is the same two words for a value that is (§2.15, **Decided**,
+owner, 2026-09-28, amending §10 item 11), and its vtable is the same
+global `P.vt.K`.
 
 ### 4.5 The reference interpreter
 
@@ -929,7 +977,8 @@ Send((Atom T))            = true          (well-formedness already required Send
 Send((Weak T))            = Send(T)       (an upgrade on the other thread yields a T)
 Send((Task T))            = Send(T)
 Send((fn κ (Ā) R))        = (κ = send)
-Send((dyn P))             = false         (v1)
+Send((dyn P))             = false         (nothing records what the hidden object reaches)
+Send((dyn P :send))       = true          ((dyn P :send e) required Send of e's type, §2.15)
 Send(a) for a variable    = the constraint (Send a), kept in the scheme
 ```
 
@@ -2232,10 +2281,10 @@ changing a rule.
 | `ptr` (unsafe) | `ptr`, uncounted | i64-like scalar |
 | every object type (`str`, `Form`, `Array`, struct, enum with fields, `Cell`, `Atom`, `Weak` of a non-`dyn`, `Task`, closure) | `ptr` to a block starting with the header (§8.2) | ptr |
 | `(Option T)`, `T` an object type that is not itself an `Option` | `ptr`, null = `nil`; no allocation for `some` | opt |
-| `(Option T)`, `T` a scalar, a `dyn`, a `(Weak (dyn P))`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
+| `(Option T)`, `T` a scalar, a `dyn` (with or without `:send`), a `(Weak (dyn P))`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
 | `(fn κ (Ā) R)` | `ptr` to a closure object (§8.4) | ptr |
-| `(dyn P)` | `{ ptr ptr }` by value: object, vtable | dyn |
-| `(Weak (dyn P))` | `{ ptr ptr }` by value: the object's weak box (§8.7), vtable | dyn |
+| `(dyn P)`, `(dyn P :send)` | `{ ptr ptr }` by value: object, vtable | dyn |
+| `(Weak (dyn P))`, `(Weak (dyn P :send))` | `{ ptr ptr }` by value: the object's weak box (§8.7), vtable | dyn |
 | `(& T)` parameter | `ptr` to a private cell (§8.6) | — |
 
 A `(Weak (dyn P))` (**Decided**, owner, 2026-09-27) is laid out like a
@@ -2625,9 +2674,13 @@ or `nil`; for `t` the result is `(some { t, vt })`, which by §8.1 is a
 heap enum of tag `some` holding the two words, allocated with count 1
 for the caller and owning the count the upgrade took on `t`; for `nil`
 it is the heap enum of tag `nil`. The vtable is `IMMORTAL` (§8.2) and
-needs no count. `Send((Weak (dyn P))) = Send((dyn P)) = false` in v1
-(§5.1: `Send((Weak T)) = Send(T)`, unchanged), so the box of a
-`(Weak (dyn P))` is never reached from another thread through it. The box is
+needs no count. `Send((Weak (dyn P))) = Send((dyn P)) = false` (§5.1:
+`Send((Weak T)) = Send(T)`, unchanged), so the box of a `(Weak (dyn
+P))` is never reached from another thread through it. A `(Weak (dyn P
+:send))` (**Decided**, owner, 2026-09-28; §2.15) is the same two words
+and is `Send`: its box crosses like the box of any other `(Weak T)` with
+`Send T`, `fib.share` marking the box and a live target (§5.5), so an
+upgrade on the other thread retains a `SHARED` object atomically. The box is
 freed when its own count reaches zero and its target is null or
 `IMMORTAL`. Only
 objects that had a `weak` taken pay: one flag test in `fib.drop`, and
@@ -2932,7 +2985,7 @@ old numbering is kept here because the drafts and
 | 8 | heap everything in v1 — **replaced by D6: stack allocation from the first implementation** | §6.11 |
 | 9 | `async` captures `Send` (D7) | §2.8, §5.2, §6.9 |
 | 10 | atoms: per-atom spinlock, `swap!` retries | §8.6 |
-| 11 | `(dyn P)` not `Send`; `Send ptr` false | §4.4, §5.1 |
+| 11 | `(dyn P)` not `Send`; `Send ptr` false — **amended by the owner, 2026-09-28: `(dyn P :send)` is a second dynamic type that is `Send`** | §2.15, §4.4, §5.1 |
 | 12 | no coercions anywhere (D3) | §1.7, §3 |
 | 13 | field access and `deref` fixed by the end of the SCC | §3.4 |
 | 14 | `Option` as a nullable pointer only for non-`Option` object payloads; class `opt` | §8.1, §4.3 |

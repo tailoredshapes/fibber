@@ -42,7 +42,7 @@ pub fn option_rep(g: &Globals, t: &Ty) -> Option<OptionRep> {
     }
     Some(match args.first()? {
         Ty::Gen(_) | Ty::Var(_) | Ty::Rigid(_) => OptionRep::Generic,
-        Ty::Con(Con::Dyn(_), _) => OptionRep::HeapEnum,
+        Ty::Con(Con::Dyn(..), _) => OptionRep::HeapEnum,
         Ty::Con(Con::Nominal(p), _) if *p == g.option => OptionRep::HeapEnum,
         payload if !is_object(g, payload) => OptionRep::HeapEnum,
         _ => OptionRep::Pointer,

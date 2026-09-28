@@ -1,0 +1,21 @@
+;; spec:   types §2.15, §5.1, §5.5, §8.7 (ownership.md §6, §7)
+;; expect: accept
+;; result: 10
+;; audit:  clean
+;; (Weak (dyn Show :send)) is Send, since Send((Weak T)) = Send(T)
+;; (types §5.1), and an atom may hold a (dyn Show :send), since atom
+;; requires Send of its content (§2.10). One thread upgrades the weak
+;; reference, the other reads the atom; both reach the same Named
+;; object, which the crossing marked shared (§5.5), and the atom keeps
+;; it alive, so the upgrade finds it.
+(defstruct Named (s: str))
+
+(impl Show Named (show (self) (. self s)))
+
+(defun main () -> i64
+  (let ((d (dyn Show :send (Named "hello")))
+        (w (weak d))
+        (a (atom d))
+        (t (spawn (fn () (match @w ((some x) (str-len (show x))) (nil 0)))))
+        (u (spawn (fn () (str-len (show @a))))))
+    (+ (join t) (join u))))

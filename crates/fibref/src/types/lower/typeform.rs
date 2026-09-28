@@ -151,7 +151,7 @@ fn fn_type(
     Ok(TypeAnn::Fn(colour, params, Box::new(ret)))
 }
 
-/// `(dyn P)` / `(dyn (P D..))`.
+/// `(dyn P)` / `(dyn (P D..))`, each optionally followed by `:send`.
 fn dyn_type(
     g: &Globals,
     m: ModuleId,
@@ -159,11 +159,13 @@ fn dyn_type(
     form: &Form,
     allow_self: bool,
 ) -> TResult<TypeAnn> {
-    let [p] = args else {
-        return Err(TypeError::resolve(&form.pos, format!("malformed {form}")));
+    let (p, send) = match args {
+        [p] => (p, false),
+        [p, k] if matches!(&k.kind, FormKind::Kw(k) if k == "send") => (p, true),
+        _ => return Err(TypeError::resolve(&form.pos, format!("malformed {form}"))),
     };
     let (proto, dets) = proto_ref(g, m, p, allow_self)?;
-    Ok(TypeAnn::Dyn(proto, dets))
+    Ok(TypeAnn::Dyn(proto, dets, send))
 }
 
 /// A protocol reference `P` or `(P D..)`, with the determined types.

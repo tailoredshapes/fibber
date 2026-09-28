@@ -1,0 +1,24 @@
+;; spec:   types §2.15, §3.3, §4.4
+;; expect: accept
+;; result: 15
+;; audit:  clean
+;; There is no implicit conversion between (dyn Show :send) and (dyn
+;; Show) (types §2.15, D3). (dyn Show d) of a (dyn Show :send) value is
+;; the explicit one: the instance (Show (dyn Show :send)) is satisfied
+;; by d's own vtable (§3.3), and the result is a (dyn Show) of the same
+;; object, which can sit in one vector with a dyn over a value that
+;; could never be sendable.
+(defstruct Named (s: str))
+(defstruct Counter (n: (Cell i64)))
+
+(impl Show Named (show (self) (. self s)))
+(impl Show Counter (show (self) (str-concat "count" (show @(. self n)))))
+
+(defun total (xs: (Vec (dyn Show))) -> i64
+  (+ (str-len (show (nth xs 0))) (str-len (show (nth xs 1)))))
+
+(defun main () -> i64
+  (let ((s (dyn Show :send (Named "abcd")))
+        (c (Counter (cell 42)))
+        (xs [(dyn Show s) (dyn Show c)]))
+    (+ (total xs) (str-len (show s)))))

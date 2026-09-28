@@ -5,6 +5,7 @@
 
 mod bindings;
 mod cases;
+mod dyn_send;
 mod errors;
 mod errors2;
 mod forms;

@@ -75,7 +75,7 @@ impl Cx<'_> {
             ExprKind::Await(x) => self.await_expr(x, pos),
             ExprKind::Unsafe(b) => self.infer(b),
             ExprKind::Quote(_) => self.form_type(pos),
-            ExprKind::Dyn(p, dets, x) => self.dyn_expr(*p, dets, x, pos),
+            ExprKind::Dyn(p, dets, send, x) => self.dyn_expr(*p, dets, *send, x, pos),
             ExprKind::Convert(op, target, x) => self.convert(*op, *target, x),
             ExprKind::Concat(parts) => self.concat(parts, pos),
         }
@@ -285,11 +285,16 @@ impl Cx<'_> {
         &mut self,
         p: crate::types::ty::ProtoId,
         dets: &[crate::types::ast::TypeAnn],
+        send: bool,
         x: &Expr,
         pos: &Pos,
     ) -> TResult<Ty> {
         let t = self.infer(x)?;
         self.defer(DKind::Object(t.clone(), "dyn".to_string()), pos, None);
+        if send {
+            // `(dyn P :send e)` requires `Send` of the hidden type (§2.15).
+            self.defer(DKind::Send(t.clone(), Vec::new()), pos, None);
+        }
         let mut args = vec![t];
         let mut dtys = Vec::new();
         for d in dets {
@@ -298,7 +303,7 @@ impl Cx<'_> {
             args.push(dt);
         }
         self.defer(DKind::Proto(p, args, None), pos, None);
-        Ok(Ty::Con(Con::Dyn(p), dtys))
+        Ok(Ty::Con(Con::Dyn(p, send), dtys))
     }
 
     fn convert(&mut self, op: ConvOp, target: Scalar, x: &Expr) -> TResult<Ty> {

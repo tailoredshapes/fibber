@@ -541,7 +541,12 @@ Dispatch: static when the receiver's type is concrete after inference,
 which is always except through the explicit `(dyn P)` type (types §4). `(dyn P e)` needs `e` of an object type: a scalar, a field-less enum
 or `unit` is `dyn requires an object type` (**Decided**, owner,
 2026-09-27; types §2.15), since a `(dyn P)` is the object's pointer and
-a vtable.
+a vtable. `(dyn P :send e)` makes the distinct type `(dyn P :send)`,
+which may cross a thread: `e`'s type must be `Send` as well
+(**Decided**, owner, 2026-09-28; types §2.15, §5.1). `(dyn P d)` of a
+`(dyn P :send)` value `d` is the explicit conversion to `(dyn P)`; there
+is none the other way. The type is written `(dyn P :send)` or `(dyn (P
+D..) :send)`.
 
 ### 3.11 Cells, atoms, weak references: builtins, not forms
 
@@ -1185,12 +1190,13 @@ expander treat them as calls.
 | forms | `Form` constructors, `gensym`, `struct?`, `struct-fields`, `struct-params`, `struct-field-types`, `enum?`, `enum-params`, `enum-variants` (§3.16) |
 | `Option` (built in, §3.9) | `some` (constructor), `nil` (a literal, §1.1); `nil?`, `some?`, `if-let` are prelude definitions (§4.4, §4.5) |
 | unsafe | `ptr+ load-i8 load-i16 load-i32 load-i64 load-ptr store-i8 ... store-ptr alloc free raw raw-retained release-raw` |
-| dynamic dispatch | `(dyn P e)` |
+| dynamic dispatch | `(dyn P e)`, `(dyn P :send e)` |
 
 `set-field!`, `dyn` and the conversions that name a target type
 (`trunc` to `uitofp`) are **primitive forms**: each takes one operand
 that is not an expression, a field name second for `set-field!`, a
-protocol first for `dyn` and the target type first for a conversion
+protocol first for `dyn` (followed by the keyword `:send` in `(dyn P
+:send e)`, which is not an operand either) and the target type first for a conversion
 (types §2.12, §2.13, §2.15). They keep the call shape of §4.1 and
 are read and expanded as calls, except that the expander leaves that
 operand alone and name resolution and typing read it by the form's own

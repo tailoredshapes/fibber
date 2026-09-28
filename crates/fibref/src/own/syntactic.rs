@@ -83,7 +83,7 @@ pub(super) fn children_of(e: &Expr) -> Vec<&Expr> {
         | ExprKind::Async(x, _)
         | ExprKind::Await(x)
         | ExprKind::Unsafe(x)
-        | ExprKind::Dyn(_, _, x)
+        | ExprKind::Dyn(_, _, _, x)
         | ExprKind::Convert(_, _, x) => out.push(x),
     }
     out
