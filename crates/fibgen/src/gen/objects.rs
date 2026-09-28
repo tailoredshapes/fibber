@@ -4,7 +4,7 @@
 use crate::ast::{Expr, Kind, Pat};
 use crate::ty::Ty;
 
-use super::{funcs, tasks, vpat, Ctx, Gen, Var, VarKind};
+use super::{funcs, protos, tasks, vpat, Ctx, Gen, Var, VarKind};
 
 /// The struct fields: (struct, field, field type).
 fn fields() -> Vec<(Ty, &'static str, Ty)> {
@@ -208,6 +208,7 @@ pub fn construct_leaf(g: &mut Gen, cx: &Ctx, ty: &Ty) -> Expr {
         ],
         Ty::Holder => vec![funcs::const_fn(g, 1), g.leaf_value(cx, &Ty::cell(Ty::Int))],
         Ty::Shape => return Expr::call(Ty::Shape, "Circle", vec![Expr::int(g.small())]),
+        Ty::Dyn(p, send) => return protos::dyn_leaf(g, *p, *send),
         Ty::Boxed(t) | Ty::Cell(t) | Ty::Atom(t) => vec![g.leaf_value(cx, t)],
         _ => return Expr::new(ty.clone(), Kind::Unit),
     };

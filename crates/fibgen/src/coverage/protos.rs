@@ -13,6 +13,9 @@ pub fn item_labels(p: &Program, out: &mut Vec<String>) {
         }
         if matches!(i.target, Ty::Hook(_)) {
             out.push("impl on a colour-parameterised struct".into());
+            if i.methods.iter().any(|m| self_as_value(&m.body)) {
+                out.push("impl on (Hook k) uses self as a (Hook :local) value".into());
+            }
         }
         if i.methods.len() > 1 {
             out.push("impl overrides a default method".into());
@@ -28,6 +31,19 @@ pub fn item_labels(p: &Program, out: &mut Vec<String>) {
             out.push("defun :private (used in its own module)".into());
         }
     }
+}
+
+/// Whether `body` uses `self` other than as the receiver of `.`: passes
+/// it, binds it or joins it with another value, all at the generator's
+/// view of it, a `(Hook :local)`.
+fn self_as_value(body: &Expr) -> bool {
+    let (mut uses, mut fields) = (0, 0);
+    body.walk(&mut |e| match &e.kind {
+        Kind::Var(n) if n == "self" => uses += 1,
+        Kind::Field(s, _) if matches!(&s.kind, Kind::Var(n) if n == "self") => fields += 1,
+        _ => {}
+    });
+    uses > fields
 }
 
 /// Whether `p` has a vector pattern anywhere inside it.
@@ -121,6 +137,9 @@ fn dyn_send(t: &Ty) -> bool {
     }
 }
 
+/// A test on a type.
+type TyPred = dyn Fn(&Ty) -> bool;
+
 /// Labels for code that runs on another thread or as a task.
 fn crossing_labels(e: &Expr, out: &mut Vec<String>) {
     let crossing: Vec<&Expr> = match &e.kind {
@@ -138,11 +157,26 @@ fn crossing_labels(e: &Expr, out: &mut Vec<String>) {
     if crossing.iter().any(|x| mentions(x, &dyn_send)) {
         out.push("(dyn P :send) crosses a thread or task".into());
     }
-    if crossing
-        .iter()
-        .any(|x| mentions(x, &|t| *t == Ty::Hook(true)))
-    {
-        out.push("(Hook :send) crosses a thread or task".into());
+    let labels: [(&str, &TyPred); 4] = [
+        ("(Hook :send) crosses a thread or task", &|t| {
+            *t == Ty::Hook(true)
+        }),
+        ("(Job :send) crosses a thread or task", &|t| {
+            *t == Ty::Job(true)
+        }),
+        (
+            "(Weak (dyn P :send)) crosses a thread or task",
+            &|t| matches!(t, Ty::Weak(d) if matches!(**d, Ty::Dyn(_, true))),
+        ),
+        (
+            "(Atom (dyn P :send)) crosses a thread or task",
+            &|t| matches!(t, Ty::Atom(d) if matches!(**d, Ty::Dyn(_, true))),
+        ),
+    ];
+    for (l, pred) in labels {
+        if crossing.iter().any(|x| mentions(x, pred)) {
+            out.push(l.into());
+        }
     }
 }
 
@@ -205,6 +239,17 @@ pub fn node_labels(e: &Expr, out: &mut Vec<String>) {
                 out.push("(Hook :local) holding a closure over a cell".into());
             }
         }
+        Kind::Call(h, _) if h == "Ready" => {
+            let colour = if e.ty == Ty::Job(true) {
+                "send"
+            } else {
+                "local"
+            };
+            out.push(format!(
+                "(Job :{colour}) constructed (colour-parameterised enum)"
+            ));
+        }
+        Kind::Var(n) if n == "Idle" => out.push("Idle (field-less variant of Job)".into()),
         Kind::Call(h, args) => method_labels(h, args, out),
         _ => {}
     }

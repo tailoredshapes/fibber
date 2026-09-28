@@ -1,8 +1,10 @@
-//! The model on vector patterns, guards and protocol dispatch.
+//! The model on vector patterns, guards, protocol dispatch, the
+//! colour-parameterised enum, float comparisons and `rem`, and weak
+//! references and atoms holding a `dyn`.
 
 use super::*;
 use crate::ast::{Clause, Expr, ImplDef, Kind, Method, Pat, Rest};
-use crate::ty::{Proto, Ty};
+use crate::ty::{NumTy, Proto, Ty};
 
 fn vec_of(xs: &[i64]) -> Expr {
     let items = xs.iter().map(|x| Expr::int(*x)).collect();
@@ -176,4 +178,118 @@ fn sum_vec_traps_on_overflow() {
         expected(&prog(Vec::new(), int("sum-vec", vec![v]))),
         Err(ModelError::Trap("integer overflow in + at i64".into()))
     );
+}
+
+/// `(match j ((Idle) 1) ((Ready r) (join (spawn r))))`: the
+/// colour-parameterised enum's variants, its closure run on a thread.
+#[test]
+fn jobs_match_by_variant_and_their_closures_run() {
+    let run = |j: Expr| {
+        let r = Expr::var("r", Ty::fn_0());
+        let t = Expr::call(Ty::task(Ty::Int), "spawn", vec![r]);
+        let clauses = vec![
+            (Pat::Ctor("Idle".into(), Vec::new()), Expr::int(1)),
+            (
+                Pat::Ctor("Ready".into(), vec![Pat::Bind("r".into())]),
+                int("join", vec![t]),
+            ),
+        ];
+        prog(
+            Vec::new(),
+            Expr::new(Ty::Int, Kind::Match(Box::new(j), clauses)),
+        )
+    };
+    let f = Expr::new(Ty::fn_0(), Kind::Fn(Vec::new(), Box::new(Expr::int(7))));
+    let ready = Expr::call(Ty::Job(true), "Ready", vec![f]);
+    assert_eq!(expected(&run(ready)), Ok(7));
+    let idle = Expr::new(Ty::Job(false), Kind::Var("Idle".into()));
+    assert_eq!(expected(&run(idle)), Ok(1));
+}
+
+fn f64_lit(x: f64) -> Expr {
+    Expr::new(Ty::Num(NumTy::F64), Kind::Flt(x, NumTy::F64))
+}
+
+fn f64_op(h: &str, a: Expr, b: Expr) -> Expr {
+    Expr::call(Ty::Num(NumTy::F64), h, vec![a, b])
+}
+
+/// Comparisons with a NaN are false but `!=` (types §2.12, Decided);
+/// `rem` on floats is `fmod`, with the sign of the dividend.
+#[test]
+fn float_comparisons_are_ieee_and_rem_is_fmod() {
+    let nan = || f64_op("/", f64_lit(0.0), f64_lit(0.0));
+    let bit = |h: &str, a: Expr, b: Expr| {
+        let c = Expr::call(Ty::Bool, h, vec![a, b]);
+        Expr::new(
+            Ty::Int,
+            Kind::If(Box::new(c), Box::new(Expr::int(1)), Box::new(Expr::int(0))),
+        )
+    };
+    let cases = [
+        (bit("<=", nan(), f64_lit(1.0)), 0),
+        (bit(">=", nan(), f64_lit(1.0)), 0),
+        (bit("=", nan(), nan()), 0),
+        (bit("!=", nan(), nan()), 1),
+        (
+            bit("<", f64_lit(1.0), f64_op("/", f64_lit(1.0), f64_lit(0.0))),
+            1,
+        ),
+    ];
+    for (e, want) in cases {
+        assert_eq!(expected(&prog(Vec::new(), e)), Ok(want));
+    }
+    let rem = |a: f64, b: f64| {
+        let r = f64_op("rem", f64_lit(a), f64_lit(b));
+        let scaled = f64_op("*", r, f64_lit(10.0));
+        let e = Expr::new(Ty::Int, Kind::Conv("fptosi".into(), None, Box::new(scaled)));
+        expected(&prog(Vec::new(), e))
+    };
+    assert_eq!(rem(7.5, 2.0), Ok(15));
+    assert_eq!(rem(-7.5, 2.0), Ok(-15));
+    assert_eq!(rem(7.5, -2.0), Ok(15));
+    assert_eq!(rem(1.0, 0.0), Ok(0));
+}
+
+/// A `(dyn Score :send)` held by a weak reference and by an atom: the
+/// upgrade finds it (it is bound around both) and the atom reads it.
+#[test]
+fn weak_and_atom_of_a_dyn_reach_its_object() {
+    let x = Expr::new(
+        Ty::Int,
+        Kind::Field(Box::new(var("self", Ty::Pt)), "x".into()),
+    );
+    let impls = vec![ImplDef {
+        proto: Proto::Score,
+        target: Ty::Pt,
+        methods: vec![method("score", x)],
+    }];
+    let dt = Ty::Dyn(Proto::Score, true);
+    let d = Expr::new(
+        dt.clone(),
+        Kind::Dyn(Proto::Score, true, Box::new(pt(3, 4))),
+    );
+    let w = Expr::call(Ty::weak(dt.clone()), "weak", vec![var("d", dt.clone())]);
+    let a = Expr::call(Ty::atom(dt.clone()), "atom", vec![var("d", dt.clone())]);
+    let up = Expr::new(
+        Ty::opt(dt.clone()),
+        Kind::Deref(Box::new(var("w", Ty::weak(dt.clone())))),
+    );
+    let clauses = vec![
+        (
+            Pat::Some(Box::new(Pat::Bind("y".into()))),
+            int("score", vec![var("y", dt.clone())]),
+        ),
+        (Pat::Nil, Expr::int(0)),
+    ];
+    let m = Expr::new(Ty::Int, Kind::Match(Box::new(up), clauses));
+    let read = Expr::new(dt.clone(), Kind::Deref(Box::new(var("a", Ty::atom(dt)))));
+    let body = int("+", vec![m, int("score", vec![read])]);
+    let binds = vec![
+        (Pat::Bind("d".into()), d),
+        (Pat::Bind("w".into()), w),
+        (Pat::Bind("a".into()), a),
+    ];
+    let main = Expr::new(Ty::Int, Kind::Let(binds, Box::new(body)));
+    assert_eq!(expected(&prog(impls, main)), Ok(6));
 }

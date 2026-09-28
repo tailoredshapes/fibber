@@ -46,9 +46,13 @@ pub fn smallest(ty: &Ty) -> Expr {
         Ty::Atom(t) => call("atom", vec![smallest(t)]),
         Ty::Task(t) => e(Kind::Async(Box::new(smallest(t)))),
         Ty::Weak(t) => e(Kind::WeakDead("dead".into(), Box::new(smallest(t)))),
-        Ty::Dyn(..) | Ty::Hook(_) | Ty::Gen(..) | Ty::Num(_) | Ty::Array(_) | Ty::Derived(_) => {
-            smallest_new(ty)
-        }
+        Ty::Dyn(..)
+        | Ty::Hook(_)
+        | Ty::Job(_)
+        | Ty::Gen(..)
+        | Ty::Num(_)
+        | Ty::Array(_)
+        | Ty::Derived(_) => smallest_new(ty),
         Ty::Func(ps, r) => {
             let params = ps
                 .iter()
@@ -75,6 +79,7 @@ fn smallest_new(ty: &Ty) -> Expr {
                 Expr::int(0),
             ],
         ),
+        Ty::Job(_) => Expr::new(ty.clone(), Kind::Var("Idle".into())),
         Ty::Array(t) => Expr::call(ty.clone(), "array", vec![Expr::int(1), smallest(t)]),
         Ty::Derived("Ver") => Expr::call(ty.clone(), "Ver", vec![Expr::int(0), Expr::int(0)]),
         Ty::Derived(_) => Expr::new(ty.clone(), Kind::Var("Low".into())),

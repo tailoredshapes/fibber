@@ -3,7 +3,7 @@
 //! references.
 
 use crate::ast::{Arg, Expr, Kind, Pat};
-use crate::ty::Ty;
+use crate::ty::{Proto, Ty};
 
 use super::{funcs, inout, objects, observe, tasks, Ctx, Gen, Region, Var, VarKind};
 
@@ -151,10 +151,12 @@ fn swap(g: &mut Gen, cx: &Ctx, _d: u32) -> Option<Expr> {
     let x = g.fresh("old");
     let xv = Expr::var(&x, inner.clone());
     let k = Expr::int(g.rng.range(1, 5));
-    let body = if inner == Ty::Int {
-        Expr::call(Ty::Int, "+", vec![xv, k])
-    } else {
-        Expr::call(inner.clone(), "conj", vec![xv, k])
+    let body = match &inner {
+        Ty::Int => Expr::call(Ty::Int, "+", vec![xv, k]),
+        Ty::Vec(_) => Expr::call(inner.clone(), "conj", vec![xv, k]),
+        // An atom of a `(dyn P :send)`: the identity, the one update of
+        // it that commutes with any other.
+        _ => xv,
     };
     let fty = Ty::Func(vec![inner.clone()], Box::new(inner.clone()));
     let f = Expr::new(fty, Kind::Fn(vec![(x, inner.clone())], Box::new(body)));
@@ -206,7 +208,10 @@ pub fn atom_int(g: &mut Gen, cx: &Ctx, d: u32) -> Option<Expr> {
 /// A weak reference that must upgrade (its target is bound by an
 /// enclosing `let`) or must not (its target died with its `let`).
 pub fn weak_int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
-    let targets = [Ty::Wrap, Ty::Str, Ty::vec(Ty::Int), Ty::Pt, Ty::Shape];
+    let mut targets = vec![Ty::Wrap, Ty::Str, Ty::vec(Ty::Int), Ty::Pt, Ty::Shape];
+    if g.methods_ok {
+        targets.push(Ty::Dyn(Proto::Score, true));
+    }
     let t = targets[g.rng.below(targets.len())].clone();
     let wt = Ty::weak(t.clone());
     let (w, z) = (g.fresh("w"), g.fresh("z"));

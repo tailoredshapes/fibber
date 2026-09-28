@@ -10,7 +10,7 @@ pub use items::is_private;
 use items::{fundef, impl_def, pat};
 
 /// The preamble's declarations: (the names that use them, the text).
-const PREAMBLE: [(&[&str], &str); 11] = [
+const PREAMBLE: [(&[&str], &str); 12] = [
     (&["Pt", "Shape", "Rect", "Circle", "Named"], "(defstruct Pt (x: i64 y: i64))"),
     (&["Wrap", "Shape", "Rect", "Circle", "Named"], "(defstruct Wrap (s: str v: (Vec i64)))"),
     (&["Holder"], "(defstruct Holder (f: (fn (i64) i64) c: (Cell i64)))"),
@@ -19,6 +19,10 @@ const PREAMBLE: [(&[&str], &str); 11] = [
         "(defenum Shape (Circle r: i64) (Rect a: Pt b: Pt) (Named n: str w: Wrap))",
     ),
     (&["Hook"], "(defstruct (Hook k :colour) (f: (fn k (i64) i64) tag: i64))"),
+    (
+        &["Job", "Idle", "Ready"],
+        "(defenum (Job k :colour) (Idle) (Ready run: (fn k () i64)))",
+    ),
     (
         &["Score", "Rank", "score", "bonus", "rank", "tier"],
         "(defprotocol Score\n  (score (self) -> i64)\n  (bonus (self k: i64) -> i64 (+ (score self) k)))",

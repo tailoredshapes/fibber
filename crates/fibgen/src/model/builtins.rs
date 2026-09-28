@@ -10,6 +10,7 @@ use super::value::{TaskState, V};
 impl Machine<'_> {
     /// Calls the builtin, constructor or prelude function `h`.
     pub(super) fn builtin(&mut self, h: &str, a: Vec<V>) -> Res {
+        self.trace_floats(h, &a);
         if let Some(r) = super::nums::op(h, &a).or_else(|| super::arrays::op(h, &a)) {
             return r;
         }
@@ -25,7 +26,7 @@ impl Machine<'_> {
             ("list", items) => Ok(V::List(Rc::new(items.to_vec()))),
             (
                 "Pt" | "Wrap" | "Holder" | "Box" | "Circle" | "Rect" | "Named" | "Hook" | "Ver"
-                | "Mid" | "High",
+                | "Mid" | "High" | "Ready",
                 _,
             ) => Ok(V::data(h, a)),
             ("box", [x]) => Ok(V::data("Box", vec![x.clone()])),
@@ -57,6 +58,34 @@ impl Machine<'_> {
             ("join" | "block-on", [t]) => self.force(t),
             ("deref", [x]) => deref(x),
             _ => self.collection(h, a),
+        }
+    }
+
+    /// Records a comparison with a NaN or an infinite operand, and a
+    /// float `rem`, which a static count of the program cannot see.
+    fn trace_floats(&mut self, h: &str, a: &[V]) {
+        let floats: Vec<f64> = a
+            .iter()
+            .filter_map(|v| match v {
+                V::Flt(x, _) => Some(*x),
+                _ => None,
+            })
+            .collect();
+        if floats.is_empty() {
+            return;
+        }
+        if matches!(h, "=" | "!=" | "<" | "<=" | ">" | ">=") {
+            if floats.iter().any(|x| x.is_nan()) {
+                self.trace
+                    .insert("run: float comparison with a NaN operand");
+            }
+            if floats.iter().any(|x| x.is_infinite()) {
+                self.trace
+                    .insert("run: float comparison with an infinite operand");
+            }
+        }
+        if h == "rem" {
+            self.trace.insert("run: float rem");
         }
     }
 

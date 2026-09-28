@@ -3,9 +3,12 @@
 //! its operands are masked so the exact result fits (`(+ (bit-and a M)
 //! (bit-and b M))`), its divisors are odd (`(bit-or b 1)`). Now and then
 //! an operation is left unmasked; if the model then predicts a trap,
-//! the interpreter must trap with the same message (run.rs). Floats are
-//! never divided by anything but a non-zero literal, so no NaN arises
-//! (whose ordering the spec leaves open for the built-in `Ord`).
+//! the interpreter must trap with the same message (run.rs). Float
+//! arithmetic never traps, so floats are divided and `rem`-ed by any
+//! value, and NaN and the infinities arise, from a computed zero divisor
+//! or from the literal forms `(/ 0.0 0.0)` and `(/ ±1.0 0.0)`; the
+//! built-in comparisons on them are IEEE's (types §2.12, Decided,
+//! owner, 2026-09-28).
 
 use crate::ast::{Expr, Kind};
 use crate::ty::{NumTy, Ty};
@@ -139,12 +142,20 @@ fn flit(x: f64, t: NumTy) -> Expr {
     Expr::new(Ty::Num(t), Kind::Flt(x, t))
 }
 
+/// A NaN, `(/ 0.0 0.0)`, or an infinity, `(/ 1.0 0.0)` or `(/ -1.0
+/// 0.0)`: there is no literal for either (types §2.12).
+fn special(g: &mut Gen, t: NumTy) -> Expr {
+    let num = [0.0, 1.0, -1.0][g.rng.below(3)];
+    Expr::call(Ty::Num(t), "/", vec![flit(num, t), flit(0.0, t)])
+}
+
 /// An expression of float type `t`.
 pub fn float_expr(g: &mut Gen, cx: &Ctx, t: NumTy, d: u32) -> Expr {
     let ty = Ty::Num(t);
     if d == 0 || g.rng.chance(25) {
-        return match g.rng.below(3) {
+        return match g.rng.below(4) {
             0 => flit(g.rng.range(-40, 40) as f64 / 4.0, t),
+            3 => special(g, t),
             1 => conv(
                 "sitofp",
                 Some(t),
@@ -158,7 +169,12 @@ pub fn float_expr(g: &mut Gen, cx: &Ctx, t: NumTy, d: u32) -> Expr {
         };
     }
     let sub = d - 1;
-    match g.rng.below(7) {
+    match g.rng.below(8) {
+        7 => {
+            let h = if g.rng.chance(50) { "/" } else { "rem" };
+            let (a, b) = (float_expr(g, cx, t, sub), float_expr(g, cx, t, sub));
+            Expr::call(ty, h, vec![a, b])
+        }
         0..=2 => {
             let h = ["+", "-", "*"][g.rng.below(3)];
             let (a, b) = (float_expr(g, cx, t, sub), float_expr(g, cx, t, sub));

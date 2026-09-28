@@ -2,7 +2,9 @@
 //! (types §2.12, Rust's semantics): integer `+ - * / rem neg` trap when
 //! the exact result does not fit the width or the divisor is zero;
 //! shifts take the amount modulo the width; float arithmetic is IEEE at
-//! its width; float-to-integer conversions truncate and saturate.
+//! its width and never traps (`rem` is `fmod`), and float comparisons
+//! are IEEE's, every one false on a NaN but `!=`; float-to-integer
+//! conversions truncate and saturate, NaN to 0.
 
 use crate::ty::NumTy;
 
@@ -114,6 +116,11 @@ fn float_op(h: &str, a: f64, b: Option<f64>, t: NumTy) -> Res {
         ("-", Some(b)) => a - b,
         ("*", Some(b)) => a * b,
         ("/", Some(b)) => a / b,
+        // `rem` is LLVM's `frem` (types §8.12), C's `fmod`: the exact
+        // `a - b·trunc(a/b)`, with the sign of `a`; NaN when `a` is
+        // infinite or `b` is zero, `a` when `b` is infinite. Rust's `%`
+        // on floats is that operation.
+        ("rem", Some(b)) => a % b,
         ("neg", None) => -a,
         _ => return Err(unsupported(format!("{h} on floats"))),
     };

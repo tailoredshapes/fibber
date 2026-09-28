@@ -47,6 +47,9 @@ pub enum Ty {
     /// `(defstruct (Hook k :colour) (f: (fn k (i64) i64) tag: i64))` at
     /// `:send` (flag set) or `:local` (types §1.3).
     Hook(bool),
+    /// `(defenum (Job k :colour) (Idle) (Ready run: (fn k () i64)))` at
+    /// `:send` (flag set) or `:local`: a colour-parameterised enum.
+    Job(bool),
     /// A number type other than `i64` (types §1.1).
     Num(NumTy),
     /// `(Array a)` (types §2.13).
@@ -205,7 +208,7 @@ impl Ty {
     pub fn is_send(&self) -> bool {
         match self {
             Ty::Holder | Ty::Cell(_) | Ty::Func(..) | Ty::Gen(..) => false,
-            Ty::Dyn(_, s) | Ty::Hook(s) => *s,
+            Ty::Dyn(_, s) | Ty::Hook(s) | Ty::Job(s) => *s,
             Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) | Ty::Weak(t) | Ty::Task(t) | Ty::Array(t) => {
                 t.is_send()
             }
@@ -220,7 +223,7 @@ impl Ty {
     pub fn may_reach_cell(&self) -> bool {
         match self {
             Ty::Holder | Ty::Cell(_) | Ty::Func(..) | Ty::Gen(..) => true,
-            Ty::Dyn(_, s) | Ty::Hook(s) => !*s,
+            Ty::Dyn(_, s) | Ty::Hook(s) | Ty::Job(s) => !*s,
             Ty::Boxed(t) | Ty::Opt(t) | Ty::Vec(t) | Ty::Array(t) => t.may_reach_cell(),
             _ => false,
         }
@@ -231,12 +234,12 @@ impl Ty {
         matches!(self, Ty::Atom(_))
     }
 
-    /// Whether the type is a `dyn`, or a vector of them: it exists only
-    /// in programs that declare the protocols.
+    /// Whether the type is a `dyn`, or a vector, weak reference or atom
+    /// of one: it exists only in programs that declare the protocols.
     pub fn needs_protocols(&self) -> bool {
         match self {
             Ty::Dyn(..) | Ty::Gen(..) => true,
-            Ty::Vec(t) => t.needs_protocols(),
+            Ty::Vec(t) | Ty::Weak(t) | Ty::Atom(t) => t.needs_protocols(),
             _ => false,
         }
     }
@@ -274,6 +277,8 @@ impl fmt::Display for Ty {
             Ty::Dyn(p, false) => write!(f, "(dyn {})", p.name()),
             Ty::Hook(true) => f.write_str("(Hook :send)"),
             Ty::Hook(false) => f.write_str("(Hook :local)"),
+            Ty::Job(true) => f.write_str("(Job :send)"),
+            Ty::Job(false) => f.write_str("(Job :local)"),
             Ty::Gen(..) => f.write_str("a"),
             Ty::Num(n) => f.write_str(n.name()),
             Ty::Array(t) => write!(f, "(Array {t})"),
@@ -325,6 +330,10 @@ pub fn universe() -> Vec<Ty> {
         Ty::Dyn(Proto::Rank, true),
         Ty::vec(Ty::Dyn(Proto::Score, false)),
         Ty::vec(Ty::Dyn(Proto::Score, true)),
+        Ty::Job(true),
+        Ty::Job(false),
+        Ty::weak(Ty::Dyn(Proto::Score, true)),
+        Ty::atom(Ty::Dyn(Proto::Rank, true)),
     ]
 }
 
@@ -353,6 +362,9 @@ mod tests {
         assert!(Ty::vec(Ty::Dyn(Proto::Score, true)).is_send());
         assert!(!Ty::Dyn(Proto::Rank, false).is_send());
         assert!(Ty::Hook(true).is_send() && !Ty::Hook(false).is_send());
+        assert!(Ty::Job(true).is_send() && !Ty::Job(false).is_send());
+        assert!(Ty::weak(Ty::Dyn(Proto::Score, true)).is_send());
+        assert!(Ty::atom(Ty::Dyn(Proto::Rank, true)).needs_protocols());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::ast::{Expr, Kind};
 use crate::ty::Ty;
 
 use super::{
-    arrays, derive, effects, funcs, gadgets, gadgets2, hooks, mcalls, nums, objects, observe,
+    arrays, derive, effects, funcs, gadgets, gadgets2, hooks, jobs, mcalls, nums, objects, observe,
     protos, tasks, vpat, Ctx, Gen,
 };
 
@@ -15,7 +15,7 @@ pub fn literal_text(g: &mut Gen) -> String {
 }
 
 /// The weights of the `i64` productions of [`int`], in its order.
-const INT_WEIGHTS: [usize; 21] = [
+const INT_WEIGHTS: [usize; 22] = [
     2, // literal
     4, // arithmetic
     6, // observe a value of another type
@@ -37,6 +37,7 @@ const INT_WEIGHTS: [usize; 21] = [
     5, // arithmetic at another width or on floats, converted
     2, // arrays: made, read, copied, updated in place
     2, // values with derived Eq and Ord, compared
+    1, // a (Job :send) crossing a thread
 ];
 
 /// An `i64` expression: the fold of the program's observable state.
@@ -66,6 +67,7 @@ pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
         Some(18) => Some(nums::num_int(g, cx, d)),
         Some(19) => Some(arrays::array_int(g, cx, d)),
         Some(20) => Some(derive::compare_int(g, cx, d)),
+        Some(21) => Some(jobs::cross(g, cx, d)),
         _ => None,
     };
     e.unwrap_or_else(|| Expr::int(g.small()))

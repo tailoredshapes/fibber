@@ -23,6 +23,7 @@ mod gadgets2;
 mod helpers;
 mod hooks;
 mod inout;
+mod jobs;
 mod mcalls;
 mod nums;
 mod objects;
@@ -209,6 +210,7 @@ impl Gen {
             Ty::Task(t) => Some(tasks::task(self, cx, t, d)),
             Ty::Dyn(p, send) => Some(protos::dyn_value(self, cx, *p, *send, d)),
             Ty::Hook(send) => Some(hooks::hook(self, cx, *send, d)),
+            Ty::Job(send) => Some(jobs::job(self, cx, *send, d)),
             _ => objects::object(self, cx, ty, d),
         };
         e.unwrap_or_else(|| self.leaf(cx, ty))
@@ -247,6 +249,7 @@ impl Gen {
             }
             Ty::Dyn(p, send) => protos::dyn_leaf(self, *p, *send),
             Ty::Hook(send) => hooks::hook_leaf(self, *send),
+            Ty::Job(send) => jobs::job_leaf(self, *send),
             Ty::Weak(t) => {
                 let n = self.fresh("dead");
                 let target = objects::fresh_object(self, cx, t);

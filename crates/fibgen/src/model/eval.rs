@@ -96,11 +96,12 @@ impl<'p> Machine<'p> {
     /// A machine for `p`.
     pub fn new(p: &'p Program) -> Self {
         let funs = p.funs.iter().map(|f| (f.name.as_str(), f)).collect();
-        // The derived enum's field-less variant is a constant (syntax §3.9).
+        // The field-less variants are constants (syntax §3.9).
         let low = V::data("Low", Vec::new());
+        let idle = V::data("Idle", Vec::new());
         Machine {
             funs,
-            globals: HashMap::from([("Low".to_string(), low)]),
+            globals: HashMap::from([("Low".to_string(), low), ("Idle".to_string(), idle)]),
             impls: super::protos::impl_table(p),
             trace: BTreeSet::new(),
             steps: 0,

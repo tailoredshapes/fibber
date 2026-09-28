@@ -121,14 +121,17 @@ fn cross(g: &mut Gen, cx: &Ctx, p: Proto, d: u32) -> Expr {
 }
 
 /// A use of `me`, a `(dyn P :send)` in scope in `cx`, on another thread
-/// or in a task.
+/// or in a task, directly or through an atom or a weak reference holding
+/// it (types §1.6, §5.1: both are `Send` since the `dyn` is; case 110).
 fn crossing(g: &mut Gen, cx: &Ctx, me: Expr, p: Proto, d: u32) -> Expr {
     let pool = if cx.region == Region::Task {
         Region::Task
     } else {
         Region::Pool
     };
-    match g.rng.below(4) {
+    match g.rng.below(6) {
+        4 => through_atom(g, cx, me, p, d),
+        5 => through_weak(g, cx, me, p, d),
         0 => {
             let m = call_method(g, &cx.for_region(Region::Task, false), me, p, d);
             let f = Expr::new(Ty::fn_0(), Kind::Fn(Vec::new(), Box::new(m)));
@@ -157,4 +160,62 @@ fn crossing(g: &mut Gen, cx: &Ctx, me: Expr, p: Proto, d: u32) -> Expr {
             Expr::call(Ty::Int, "block-on", vec![t])
         }
     }
+}
+
+/// `(join (spawn (fn () body)))`, `body` made in the task region of `cx`.
+fn spawned(g: &mut Gen, cx: &Ctx, body: impl FnOnce(&mut Gen, &Ctx) -> Expr) -> Expr {
+    let b = body(g, &cx.for_region(Region::Task, false));
+    let f = Expr::new(Ty::fn_0(), Kind::Fn(Vec::new(), Box::new(b)));
+    let t = Expr::call(Ty::task(Ty::Int), "spawn", vec![f]);
+    Expr::call(Ty::Int, "join", vec![t])
+}
+
+/// `(let ((at (atom me))) [(reset! at other)] (join (spawn (fn () (m
+/// @at)))))`: an `(Atom (dyn P :send))` crossing a thread. Only this
+/// thread writes it, and before the spawn, so every schedule reads the
+/// same value.
+fn through_atom(g: &mut Gen, cx: &Ctx, me: Expr, p: Proto, d: u32) -> Expr {
+    let dt = me.ty.clone();
+    let at = g.fresh("at");
+    let atv = Expr::var(&at, Ty::atom(dt.clone()));
+    let read = Expr::new(dt.clone(), Kind::Deref(Box::new(atv.clone())));
+    let call = spawned(g, cx, |g, tcx| call_method(g, tcx, read, p, d));
+    let body = if g.rng.chance(40) {
+        let other = dyn_value(g, cx, p, true, d.saturating_sub(1));
+        let reset = Expr::call(Ty::Unit, "reset!", vec![atv, other]);
+        Expr::new(Ty::Int, Kind::Do(vec![reset, call]))
+    } else {
+        call
+    };
+    let init = Expr::call(Ty::atom(dt), "atom", vec![me]);
+    Expr::new(
+        Ty::Int,
+        Kind::Let(vec![(Pat::Bind(at), init)], Box::new(body)),
+    )
+}
+
+/// `(let ((w (weak me))) (join (spawn (fn () (match @w ((some x) (m x))
+/// (nil k))))))`: a `(Weak (dyn P :send))` crossing a thread; `me` is a
+/// variable bound around it, so the upgrade finds its target alive.
+fn through_weak(g: &mut Gen, cx: &Ctx, me: Expr, p: Proto, d: u32) -> Expr {
+    let dt = me.ty.clone();
+    let wt = Ty::weak(dt.clone());
+    let (w, x) = (g.fresh("w"), g.fresh("x"));
+    let k = Expr::int(g.small());
+    let wv = Expr::var(&w, wt.clone());
+    let call = spawned(g, cx, |g, tcx| {
+        let xc = tcx.with(Var::new(x.clone(), dt.clone(), VarKind::Pattern));
+        let some = call_method(g, &xc, Expr::var(&x, dt.clone()), p, d);
+        let read = Expr::new(Ty::opt(dt.clone()), Kind::Deref(Box::new(wv)));
+        let clauses = vec![
+            (Pat::Some(Box::new(Pat::Bind(x.clone()))), some),
+            (Pat::Nil, k),
+        ];
+        Expr::new(Ty::Int, Kind::Match(Box::new(read), clauses))
+    });
+    let init = Expr::call(wt, "weak", vec![me]);
+    Expr::new(
+        Ty::Int,
+        Kind::Let(vec![(Pat::Bind(w), init)], Box::new(call)),
+    )
 }
