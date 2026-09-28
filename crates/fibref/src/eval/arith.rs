@@ -337,6 +337,22 @@ mod tests {
     }
 
     #[test]
+    fn float_rem_is_fmod_with_the_sign_of_the_dividend() {
+        let rem = |a, b, w| match float_binary("rem", a, b, w) {
+            Ok(Val::Float(x, _)) => x,
+            other => panic!("{other:?}"),
+        };
+        use Scalar::{F32, F64};
+        assert_eq!(rem(-7.5, 2.0, F64), -1.5);
+        assert_eq!(rem(7.5, -2.0, F64), 1.5);
+        assert_eq!(rem(-7.5, -2.0, F32), -1.5);
+        assert_eq!(rem(5.0, f64::INFINITY, F64), 5.0);
+        assert!(rem(5.0, 0.0, F64).is_nan());
+        assert!(rem(f64::INFINITY, 2.0, F64).is_nan());
+        assert!(rem(-4.0, 2.0, F64).is_sign_negative()); // -0.0
+    }
+
+    #[test]
     fn zext_and_sext_differ_on_negative_operands() {
         let v = Val::Int(-1, Scalar::I8);
         let z = convert(ConvOp::IntToInt(IntConv::Zext), Scalar::I64, &v);
