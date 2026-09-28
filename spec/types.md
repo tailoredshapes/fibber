@@ -1722,9 +1722,13 @@ the *caller's* call step and is never counted (§8.6); because `v` has no
 value, no expression, store, capture or return can refer to the cell
 after the write-back frees it.
 
-**Copy-in** at a call `(f .. &x ..)` of a `defun`, in argument order
-(**Decided**, D1): the private cell is initialised with `@x` — an
-**acquire**, +1 on the content, which the caller's cell `x` keeps
+**Copy-in** at a call `(f .. &x ..)` of a `defun` happens at **call
+entry**: after every argument of the call has been evaluated, the
+private cells are made in parameter order, each from its variable as
+the arguments left it (**Decided**, owner, 2026-09-28; syntax §2), so
+an argument after `&x` that writes `x` is seen by the callee (cases 151
+to 153). The private cell is initialised with `@x` (**Decided**, D1) —
+an **acquire**, +1 on the content, which the caller's cell `x` keeps
 holding. There is no move: a place is a variable, never a field;
 nothing is ever taken out of anything; the object in `x` is shared by
 the two cells for the duration of the call, and its count says so. The unique-write
@@ -1751,7 +1755,20 @@ whole chain returns. The distinct-variables check (§6.5) already forbids
 forwarding one cell twice. Any other `&` argument (a `let` cell, a cell
 reached another way) makes the call an ordinary call. Without this rule the write-backs of a
 recursion's iterations, which syntax §2 places "after the call
-returns", would need a frame each.
+returns", would need a frame each. Forwarding is meant to be an
+unobservable optimisation of copy-in/copy-out (owner, 2026-09-28). Since
+the copy-in happens at call entry, the two agree on every write the
+call's arguments make: a forwarded callee starts from the cell as the
+arguments left it, and so does a copied-in one (case 150 forwards, case
+151 copies in, both give 2; with the copy-in at the argument's position
+case 151 gave 1). They still differ in one situation, which is open
+(§10): the callee writing the cell during the call through another
+name, a closure capturing the `&` parameter that is passed to it. In
+`(defun g (&w: i64 k: (fn () unit) :borrow) -> i64 (do (set! w 1) (k)
+@w))` called as `(g &v (fn () (set! v 7)))` from an `&` function `f`
+of `v`, the call in tail position forwards, `g` reads 7 and `f`'s
+caller ends with 7; not in tail position it copies in, `g` reads 1 and
+its write-back stores 1 into `v`, losing the 7.
 
 **Unique write** (**Decided**, §5): `array-set!` and `set-field!` read the
 place's content without retaining, test `fib.unique?` (§8.2: the flags
@@ -1808,8 +1825,8 @@ temporary `V0` released (1). `dup-all` returns; write-back stores `V3`
 into `main`'s `v`, releasing its old `V0` (0, freed); `P` is freed.
 `(count @v)` = 6; `main`'s `let` releases `V3`; nothing live at exit.
 
-Case 17: `(push-count &v @v)`: the copy-in at the first argument
-acquires (2), then `@v` acquires (3); inside, `(append &v (count x))`
+Case 17: `(push-count &v @v)`: `@v` acquires at its argument position
+(2), then the copy-in acquires at call entry (3); inside, `(append &v (count x))`
 acquires again (4), `push!` copies (`V1` into `append`'s cell, `V0`
 back to 3), and the write-back into `push-count`'s cell releases `V0`
 (2); the write-back into `main`'s cell releases `V0` (1) and stores
@@ -1966,7 +1983,10 @@ ordinary call followed by the releases of §6.3:
   private cell — no copy-in, no write-back — so a call whose every `&`
   argument forwards stays a tail call (mutual recursion threading an
   in-out accumulator runs in constant stack); every other `&` argument
-  (a `let` cell, a cell reached another way) makes the call ordinary;
+  (a `let` cell, a cell reached another way) makes the call ordinary.
+  A forwarded cell is the cell as the call's arguments left it, which
+  is what a copy-in at call entry reads (§6.6; **Decided**, owner,
+  2026-09-28), so forwarding changes no write the arguments make;
 - (e) an argument at a **borrowed** position of a callee outside the
   current SCC (an imported `defun`, a protocol method, a `defun` of an
   earlier SCC; from a `fn` body, which belongs to no SCC, every `defun`;
@@ -2279,8 +2299,9 @@ optimises nothing — with five deliberate exceptions that are part of the
    arguments; so 100000 accumulator versions are not held until a
    recursion unwinds, and a forwarded `&` parameter keeps its private
    cell;
-2. the copy-in of an `&` argument always acquires (§6.6), so an `&`
-   function copies on its first update in both;
+2. the copy-in of an `&` argument always acquires (§6.6), at call
+   entry after the last argument, so an `&` function copies on its
+   first update in both, and both see the writes of the arguments;
 3. the unique-write test of `array-set!`/`set-field!` (§6.6);
 4. stack allocation (§6.11): the interpreter allocates a scope-local
    object in its binding's scope (`alloc_in_scope`) exactly where the
@@ -2421,7 +2442,7 @@ fragment; the rest is the position and witness the checker appends).
 | 14 reject-inout-in-async | §8 | `fill` has `&buf`, and its `async` mentions `&buf` and is the body's value, so `fill` is an async function (§6.9; syntax §3.1), checked first | reject: `& parameter in async function: buf in fill` |
 | 15 cycle-through-cell-leaks | §6 | `[k]` retains `k` (E2); `set!` stores the vector into `k`'s cell; the `let` releases one count; the audit finds the SCC through the cell (§6.7) | accept, 1, leak-cycle |
 | 16 coordinated-update-single-atom | §7 | `Send Accounts` holds (scalar fields); one `swap!` replaces the whole struct: `f`'s `Owned` result stored, the old released; `snap`/`final` acquire and release | accept, 200, clean |
-| 17 inout-and-borrow-same-call | §5 | the copy-in acquires (D1); `@v` acquires again; `push!` copies; the write-backs release the old vector's counts; the temporary released after the call (§6.6, traced) | accept, 4, clean |
+| 17 inout-and-borrow-same-call | §5 | `@v` acquires at its argument position; the copy-in acquires again at call entry (D1; §6.6, owner, 2026-09-28), from the same vector, since nothing between writes `v`; `push!` copies; the write-backs release the old vector's counts; the temporary released after the call (§6.6, traced) | accept, 4, clean |
 | 18 reject-inout-captured-by-escaping-closure | §5 | the `fn` is at E1 → escaping; its capture set contains `&` parameter `v` (§6.5) | reject: `& parameter captured by escaping closure: v in make-pusher` |
 | 19 weak-parent-pointer | §6 | `(weak parent)` is not a count operation; `conj` and `set!` on the children cell are E2; the strong graph is a tree; `let`s release in reverse (§6.7) | accept, 2, clean |
 | 20 weak-ref-to-dead-object | §6 | the inner `let` releases `v` (freed; box cleared); `@w` finds the box dead → `nil` (§6.7) | accept, 1, clean |
@@ -2869,13 +2890,16 @@ documented (lir-core also parses a `{ ptr, ptr }` field type, which
   proposed case 77) — addressed through
   `(getelementptr %struct.fib.cell t (i32 0) (i32 3))` (§8.2), since
   lIR's `alloca` takes no struct type; its header is stored (count 0,
-  `STACK`) and it is initialised by the copy-in (`store` the acquired
-  content, §6.6) or, when forwarded at a self tail call, not created at
-  all (the caller's pointer is passed on); passed as `ptr`; write-back
-  as §6.6; the `alloca` needs no drop. Case 17's `(push-count &v @v)`
-  emits exactly this: three words, the header, the acquired vector
-  stored through the field-3 `getelementptr`, `push-count` called with
-  the `alloca`'s address, the content stored back into `v` afterwards.
+  `STACK`) and it is initialised by the copy-in at call entry, after
+  the last argument has been evaluated, in parameter order (`store` the
+  acquired content, §6.6), or, when forwarded (§6.6, §6.10 rule (b)),
+  not created at all (the caller's pointer is passed on); passed as
+  `ptr`; write-back as §6.6; the `alloca` needs no drop. Case 17's
+  `(push-count &v @v)` emits exactly this: three words; `@v` loaded
+  and retained for the second argument; then the header, and the
+  vector loaded from `v` again, retained and stored through the
+  field-3 `getelementptr`; `push-count` called with the `alloca`'s
+  address; the content stored back into `v` afterwards.
 - `@a` on an atom: `fib.lock a` (`cmpxchg` spinlock, acquire), `v = load`,
   `fib.retain v`, `fib.unlock a` (release store) — the single atomic step
   §7 requires.
@@ -3055,7 +3079,8 @@ interpreter may run tasks as coroutines; frees must match.
 - An ordinary call: `call`; for each argument at an owned position of
   the callee, `consume` before the call (`fib.retain` a
   `Borrowed`/`Derived` argument; an `Owned` temporary is moved);
-  nothing for a borrowed position. The caller releases its remaining
+  nothing for a borrowed position; then, after the last argument, the
+  copy-in of each `&` argument in parameter order (§6.6, §8.6). The caller releases its remaining
   owned temporaries after the call returns and after the write-backs
   (§6.3); the callee retains at its own escape positions. No other
   ownership passes through a calling convention except `spawn`'s
@@ -3103,7 +3128,7 @@ interpreter may run tasks as coroutines; frees must match.
 | non-final `do` step with an `Owned` value | `fib.release` at the step's end |
 | `@c`, `@a`, `@w` | as §8.6/§8.7 (always a `fib.retain`; atom under lock; weak "retain if alive") |
 | `set!`, `reset!`, `swap!` | as §8.6: `consume` new, share if `SHARED`, store, `fib.release` old |
-| `&` copy-in | acquire: `fib.retain` the variable's content and store it into the private cell (§6.6); nothing for a forwarded `&v` in a self tail call, nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
+| `&` copy-in | at call entry, after every argument, in parameter order: `fib.retain` the variable's content and store it into the private cell (§6.6); nothing for a forwarded `&v` (§6.10 rule (b)), nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
 | `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content |
 | `array-set!`, `set-field!` | `fib.unique?` test (flags first, `HAS-WEAK` among them, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
 | module initialiser `fib.init.<module>` | called by the entry point before the program's `main`, modules in dependency order (§8.2): allocate and fill the type table, build every static object (literals, named-function closures, vtables) with `fib.alloc` and an `IMMORTAL` header, store each address into its `ptr` global |
@@ -3215,7 +3240,7 @@ decided it, `heap` with its reason — `arg-of-tail-call`,
 ordinary), or the escaping use — and its
 captures with their kinds), a call (`tail-call`, or `call` with the
 rule of §6.10 that made it ordinary; the copy-in of every `&` argument,
-`acquire` or `forward`), a colour solution (`ς₁ = local, forced by
+`acquire` (performed at call entry, §6.6) or `forward`), a colour solution (`ς₁ = local, forced by
 capture n`), and the emitted operations with source lines, those
 of a guard's false edge written `L5 guard false: release [r] (exit)` after
 the guard's own (§6.3; a rest variable is a binding line `r  owns`); a function
@@ -3513,4 +3538,67 @@ were written from these decisions, and cases 128 to 149 pin them:
    Form)`, so `(List [(Sym "if") c t e])` matches forms by shape; a
    vector pattern against a `Form` is a type error (syntax §3.6).
 
-Nothing is open.
+### Decided on the time of the copy-in
+
+On 2026-09-28 the owner decided that the copy-in of an `&` argument
+happens at **call entry**, after all of the call's arguments have been
+evaluated, in parameter order, and no longer at the argument's
+position; the write-backs are unchanged (after the call returns, in
+parameter order, the later one winning). Forwarding an `&` parameter
+at a call in tail position, where the callee uses the caller's private
+cell directly, must be an unobservable optimisation of
+copy-in/copy-out, and it was not: the rule-5 generator found (seed
+233285, minimised) `(defun io4 (&v0) (push! &v0 (do (io15 &v0 4) 0)))`,
+whose forwarded `push!` sees the 4 that its second argument pushed and
+gives 2, while the same call on a `let` cell copied in `[]` before the
+argument ran and gave 1. Under the decision both give 2 (cases 150 and
+151). It is stated in ownership.md §5, syntax §2 and §3.13, and here in
+§6.6, §6.10 rule (b), §6.12, §7 (case 17), §8.6, §8.9, §8.10 and §9.
+Cases 150 to 153 pin it; 152 has a later argument write the variable
+through a closure that captures it, 153 has two `&` arguments with a
+later argument writing the first one's variable.
+
+What it changes and what it does not:
+
+1. **Results.** Only a call with an `&x` argument and a later argument
+   that writes `x` changes: the callee now sees the write, and the
+   write-back no longer overwrites it with a result computed from the
+   older value. No case in `cases/ownership/` 01 to 149 has such a
+   call; none changes its result or audit.
+2. **Case 17** `(push-count &v @v)`: the plain `@v` is an acquire of
+   its own at its argument position, so it holds the value `v` had
+   then with its own count and stays valid through the write-back,
+   whatever the callee does; it now acquires before the copy-in rather
+   than after, from the same vector. Result 4, clean, as before.
+3. **Count operations.** The copy-in's acquire moves from the
+   argument's position to call entry, after the consumes and retains
+   of every argument and before the call; no count operation is added
+   or removed, and the private cell is still a stack object of the
+   call's step, freed at its write-back. `fibref explain` prints the
+   same lines: it names each `&` argument `acquire` or `forward` and
+   lists no copy-in among its `ops`, so no expected output changes.
+4. **Two corrections** made while applying it: §8.6 and §8.10 said a
+   forwarded `&v` is one "in a self tail call", which predates the
+   owner's decision on forwarding at any call in tail position above;
+   they now cite §6.6 and §6.10 rule (b).
+
+**Open (for the owner).** The decision makes forwarding agree with
+copy-in/copy-out on every write the call's *arguments* make. It does
+not make it unobservable in one situation that the decided rules allow
+and that it does not touch: the callee writing the forwarded cell
+through another name *during* the call. An `&` parameter may be
+captured by a closure that does not escape, and that closure may be
+passed to a `:borrow` parameter of a call in tail position that
+forwards the same parameter (syntax §3.13 rule 2). The forwarded
+callee then sees the closure's write; a copied-in one does not, and
+its write-back overwrites the write (option (A) above: the later
+write-back wins). With `(defun g (&w: i64 k: (fn () unit) :borrow) ->
+i64 (do (set! w 1) (k) @w))`, `(defun f (&v: i64) -> i64 (g &v (fn ()
+(set! v 7))))` returns 7 and leaves 7 in its caller's cell, and the
+same `f` with the call out of tail position, `(let ((r (g &v (fn ()
+(set! v 7))))) r)`, returns 1 and leaves 1 (fibref, 2026-09-28: 77
+against 11 for `(let ((r (f &c))) (+ (* 10 r) @c))` on `(cell 0)`). This predates the decision,
+which neither causes nor fixes it; closing it needs a rule this record
+does not choose (for example, not forwarding a parameter that a
+closure among the call's arguments captures, or rejecting such a
+call). No case pins either result.

@@ -103,7 +103,32 @@ a private cell, initialised from the caller's variable (written
 `(f &x)` at the call site) and read with `@v`; `v` itself is never a
 value. When the call returns, `x` is assigned whatever `v` holds. The
 call does not write `x` before the write-back, so `(f &x @x)` is fine:
-the plain borrow stays valid until the write-back (case 17). Updates go through the object's count:
+the plain `@x` is an acquire of its own at its argument position, so it
+holds the value `x` had then, with its own count, and stays valid until
+the write-back and after it (case 17).
+
+**Decided** (owner, 2026-09-28): the copy-in happens at **call entry**,
+after all of the call's arguments have been evaluated, in parameter
+order, not at the `&x` argument's position. An argument after `&x`
+that writes `x` — directly, through a closure that captures it, or
+through a call that takes it `&` — is therefore seen by the callee
+(cases 151 to 153). The write-back is unchanged: after the call
+returns, in parameter order, the later one winning. The reason is
+forwarding: an `&` parameter passed on at a call in tail position is
+not copied in at all, the callee using the caller's private cell
+directly (syntax §3.13), so its callee sees every write the arguments
+made; with the copy-in at the argument's position the same call on a
+`let` cell did not, and the optimisation was observable (case 150
+against case 151). With the copy-in at entry, forwarding is
+indistinguishable from a copy-in and write-back as far as the
+evaluation of the call's arguments goes. It is still distinguishable
+in one situation, which this decision does not touch and which is open
+(types §10): when the callee, during the call, writes the forwarded
+cell through another name, a closure that captures the `&` parameter
+and is passed to it, the forwarded callee sees that write and a copied
+one does not, and loses it at its write-back.
+
+Updates go through the object's count:
 
 - count is one and the object never had a weak reference → the object
   is updated in place;

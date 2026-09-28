@@ -156,8 +156,10 @@ Evaluation is strict and **left to right, inner before outer**
 (**Decided**; liar ADR 008 kept):
 
 - a call `(f a1 ... an)`: `f` (when it is not a global name), then `a1`
-  ... `an`, then the call; for an `&x` argument the copy-in happens at
-  its argument position (§3.13), and the write-backs happen after the
+  ... `an`, then the call; the copy-ins of the `&x` arguments happen at
+  call entry, after `an`, in parameter order (**Decided**, owner,
+  2026-09-28; §3.13), so an argument that writes `x` is seen by the
+  callee whatever its position, and the write-backs happen after the
   call returns, in parameter order (the `&` arguments name distinct
   variables; when two names reach one cell, the later write-back wins,
   ownership.md §5); the two in-place primitives of §3.13 have
@@ -723,14 +725,27 @@ created by the caller at the call and lives exactly for the call:
 
 ```
 (f &x a)                    ; x : (Cell T), f's first parameter is &v: T
+   arguments:  a            ; every argument of the call, left to right (§2)
    copy-in:    t := a new private cell holding @x            (an acquire: +1)
    call:       (f t a)      ; the callee's v is t
    write-back: x's content := t's content (moved), x's old content released; t is freed
    result:     the call's value
 ```
 
+**The copy-in happens at call entry** (**Decided**, owner, 2026-09-28):
+after every argument of the call has been evaluated, the private cells
+are made and filled in parameter order, each from its variable as it
+is then. An argument written after `&x` that writes `x` (a `set!`, a
+call that takes `&x`, a closure that captures `x`) is seen by the
+callee (cases 151 to 153). This makes forwarding (below) agree with
+copy-in/copy-out: a forwarded callee uses the private cell as the
+arguments left it, and so does a copied-in one (cases 150, 151).
+
 The call does not write `x` before the write-back, so a plain `@x` in
-the same call stays valid (case 17). A cell that also reaches the call
+the same call stays valid (case 17): it is an acquire of its own at its
+argument position, which holds the value `x` had then; nothing between
+it and the copy-in writes `x` in case 17, so the two are the same
+object. A cell that also reaches the call
 under another name (an alias, a capture, a field) can be written through
 that name during the call; the write-backs still run in parameter order
 and the later one wins (ownership.md §5). A read `@v` inside the callee is an
@@ -773,7 +788,13 @@ tail position (types §6.10), an argument `&v` where `v` is an `&`
 parameter of the enclosing `defun`, at any `&` position of any callee,
 forwards the private cell: no copy-in, no write-back, the cell is kept;
 the one write-back is that of the frame below that made the cell, after
-the whole chain returns. A call whose every `&` argument forwards stays
+the whole chain returns. Since the copy-in happens at call entry, a
+forwarded call and the same call with a copy-in and a write-back see
+the same writes by the arguments; they still differ when the callee
+writes the cell through another name during the call (a closure that
+captures the parameter, passed to it): the forwarded callee sees that
+write, the copied one does not and overwrites it at its write-back.
+That difference is open (types §10). A call whose every `&` argument forwards stays
 a tail call, so an in-out accumulator can thread through mutual
 recursion in constant stack. Any other `&` argument — a `let` cell, a
 cell reached another way — makes the call an ordinary call with copy-in
@@ -1932,7 +1953,11 @@ name, neither `&` primitive is a value, and neither takes a copy-in or
 a write-back) and §2 (the same for the order of evaluation); types §10
 lists them with that round's corrections to types.md, among them the
 scope at whose exit the interpreter ends a stack object. On 2026-09-28
-the owner lifted item 11: patterns may be vector patterns and clauses
+the owner moved the copy-in of an `&` argument from the argument's
+position to call entry (§2, §3.13); types §10 records the decision and
+the one question that applying it left open (a forwarded cell written
+through another name during the call).
+On 2026-09-28 the owner lifted item 11: patterns may be vector patterns and clauses
 may have guards (§1.4, §3.3, §3.6); types §10 records the decision.
 
 | Item | Rule | Now in |
