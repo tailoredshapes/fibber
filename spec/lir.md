@@ -466,7 +466,7 @@ OP ::= xchg add sub and nand or xor max min umax umin fadd fsub fmax fmin
 | `(br c L₁ L₂)` | `c : i1` (`tc/brcond_i32.lir`; `tc/brcond_double.lir` crashed liar) |
 | `(switch v L_default ((iK c) L)*)` | `v` integer scalar (`switch needs an integer scalar, found double`); each case a literal of `v`'s type (`switch: case has type i64, expected i32`), no two equal (`switch: duplicate case 1`) |
 | `(unreachable)` | reaching it is undefined behaviour; it follows a call that does not return |
-| `(trap)` | void, not a terminator: `llvm.trap`, which aborts the process (SIGILL on x86, `brk` on AArch64) without unwinding or flushing; the block goes on to `unreachable` (**Decided**, §14 item 5). types.md §8.12's `fib.trap` writes its message first and calls `abort`, which flushes nothing either but raises SIGABRT, the signal the audit and the cases expect; `(trap)` is for the paths that have no message |
+| `(trap)` | void, not a terminator: `llvm.trap`, which aborts the process with the target's trap signal (`ud2`, SIGILL, on x86-64; `brk`, SIGTRAP, on AArch64) without unwinding or flushing; the block goes on to `unreachable` (**Decided**, §14 item 5). types.md §8.12's `fib.trap` writes its message first and calls `abort`, which flushes nothing either but raises SIGABRT, the signal the audit and the cases expect; `(trap)` is for the paths that have no message |
 | `(phi …)` | §5.4 |
 
 ### 6.8 Calls
@@ -720,6 +720,7 @@ verdict before the implementation decides it (method.md rule 3):
 ```
 ;; expect: accept | reject
 ;; exit: N                  ; accept: main's exit status (default 0)
+;; signal: NAME[, NAME..]   ; accept: the process is killed by one of these signals instead
 ;; out: TEXT                ; accept: one line of standard output each; all lines, in order
 ;; error: TEXT              ; reject: text the error must contain
 ;; ir: TEXT                 ; the verified LLVM IR must contain TEXT
@@ -731,7 +732,14 @@ verdict before the implementation decides it (method.md rule 3):
 An `accept` case runs through the JIT (`lair run`, no IR optimisation)
 and through AOT (`lair build -O2`, then the executable), each in its own
 process; both must give the stated exit status and output, so the two
-paths also agree with each other. A `reject` case must be rejected on
+paths also agree with each other. A case whose program is meant to die
+of a signal names it (`SIGILL`, `SIGTRAP`, `SIGABRT`, `SIGFPE`,
+`SIGSEGV` or `SIGTERM`) rather than the shell's `128 + N` status, so the
+header holds on every architecture; the harness reports an ending that
+disagrees as `trapped by SIGILL (4) (expected exit 0)` or `exit 0
+(expected SIGILL (4))`. Several names mean any of them: `(trap)` raises
+SIGILL on x86-64 and SIGTRAP on AArch64 (§6.7), so `instr/trap.lir`
+names both. `exit` and `signal` exclude each other. A `reject` case must be rejected on
 both paths with an error containing the text, before LLVM sees it; an
 error containing `internal error` never satisfies a case. `cargo test
 -p lair` runs the whole suite.

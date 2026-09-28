@@ -35,7 +35,7 @@ fn the_harness_fails_every_wrong_case() {
         "wrong cases passed:\n{}",
         passed.join("\n")
     );
-    assert!(out.contains("total: 10 cases, 0 pass, 10 fail"), "{out}");
+    assert!(out.contains("total: 12 cases, 0 pass, 12 fail"), "{out}");
 }
 
 #[test]

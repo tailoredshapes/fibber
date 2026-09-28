@@ -5,7 +5,7 @@ mod exec;
 mod header;
 mod verdict;
 
-pub use header::{parse as parse_header, Expect, Header, Paths};
+pub use header::{parse as parse_header, signal_name, Expect, Header, Paths, Signal};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

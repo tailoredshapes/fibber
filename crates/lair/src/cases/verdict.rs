@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use super::exec::{run, Outcome};
-use super::header::{parse, Expect, Header, Paths};
+use super::header::{parse, signal_name, Expect, Header, Paths, Signal};
 
 /// Run a case; `Err` describes the first disagreement with its header.
 pub fn run_case(lair: &Path, path: &Path, scratch: &Path, n: usize) -> Result<(), String> {
@@ -35,14 +35,8 @@ pub fn run_case(lair: &Path, path: &Path, scratch: &Path, n: usize) -> Result<()
 
 fn judge(path: &str, h: &Header, o: &Outcome) -> Result<(), String> {
     match &h.expect {
-        Expect::Accept { exit, out } => {
-            if o.status != *exit {
-                return Err(format!(
-                    "{path}: exit {} (expected {exit}); stderr: {}",
-                    o.status,
-                    o.stderr.trim()
-                ));
-            }
+        Expect::Accept { exit, signals, out } => {
+            ending(path, *exit, signals, o)?;
             let got: Vec<&str> = o.stdout.lines().collect();
             if got != out.iter().map(String::as_str).collect::<Vec<_>>() {
                 return Err(format!("{path}: output {got:?}, expected {out:?}"));
@@ -71,6 +65,31 @@ fn judge(path: &str, h: &Header, o: &Outcome) -> Result<(), String> {
             }
             Ok(())
         }
+    }
+}
+
+/// Did the process end as the header says: by that exit status, or
+/// killed by one of those signals?
+fn ending(path: &str, exit: i32, signals: &[Signal], o: &Outcome) -> Result<(), String> {
+    let expected = if signals.is_empty() {
+        format!("expected exit {exit}")
+    } else {
+        let names: Vec<String> = signals.iter().map(|s| signal_name(s.0)).collect();
+        format!("expected {}", names.join(" or "))
+    };
+    match o.signal {
+        Some(got) if signals.contains(&Signal(got)) => Ok(()),
+        Some(got) => Err(format!(
+            "{path}: trapped by {} ({expected}); stderr: {}",
+            signal_name(got),
+            o.stderr.trim()
+        )),
+        None if signals.is_empty() && o.status == exit => Ok(()),
+        None => Err(format!(
+            "{path}: exit {} ({expected}); stderr: {}",
+            o.status,
+            o.stderr.trim()
+        )),
     }
 }
 

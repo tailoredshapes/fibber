@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 pub struct Outcome {
     /// The exit code, or 128 + the signal number, as a shell reports it.
     pub status: i32,
+    /// The signal that killed it, if one did.
+    pub signal: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -39,8 +41,10 @@ pub fn run(program: &Path, args: &[&str]) -> Result<Outcome, String> {
             Err(e) => return Err(format!("wait failed: {e}")),
         }
     };
+    let (status, signal) = code(&status);
     Ok(Outcome {
-        status: code(&status),
+        status,
+        signal,
         stdout: out.join().unwrap_or_default(),
         stderr: err.join().unwrap_or_default(),
     })
@@ -57,13 +61,18 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<S
     })
 }
 
+/// The shell's status and the signal, if the process was killed by one.
 #[cfg(unix)]
-fn code(st: &std::process::ExitStatus) -> i32 {
+fn code(st: &std::process::ExitStatus) -> (i32, Option<i32>) {
     use std::os::unix::process::ExitStatusExt;
-    st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))
+    match (st.code(), st.signal()) {
+        (Some(c), _) => (c, None),
+        (None, Some(sig)) => (128 + sig, Some(sig)),
+        (None, None) => (-1, None),
+    }
 }
 
 #[cfg(not(unix))]
-fn code(st: &std::process::ExitStatus) -> i32 {
-    st.code().unwrap_or(-1)
+fn code(st: &std::process::ExitStatus) -> (i32, Option<i32>) {
+    (st.code().unwrap_or(-1), None)
 }
