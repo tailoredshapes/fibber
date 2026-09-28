@@ -1,8 +1,8 @@
 //! The expansion context: everything the expander remembers between
 //! forms, passed explicitly (no global or thread-local state).
 
-use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::syntax::{Form, FormKind, Pos};
@@ -70,9 +70,11 @@ impl Default for Limits {
 pub struct ExpandCtx {
     /// The limits in force.
     pub limits: Limits,
-    /// Gensyms handed out so far. A `Cell` because a runner holds the
-    /// context by shared reference while its macro calls `gensym`.
-    gensyms: Cell<u64>,
+    /// Gensyms handed out so far. Atomic because a runner holds the
+    /// context by shared reference while its macro calls `gensym`, and
+    /// the macro's threads share it (one at a time: the evaluator's
+    /// turn orders them, so the count is deterministic).
+    gensyms: AtomicU64,
     pub(crate) macros: HashMap<String, MacroDef>,
     pub(crate) types: TypeTable,
     pub(crate) call_pos: Pos,
@@ -94,7 +96,7 @@ impl ExpandCtx {
     pub fn new() -> Self {
         ExpandCtx {
             limits: Limits::default(),
-            gensyms: Cell::new(0),
+            gensyms: AtomicU64::new(0),
             macros: HashMap::new(),
             types: TypeTable::with_builtins(),
             call_pos: Pos {
@@ -118,8 +120,7 @@ impl ExpandCtx {
     /// gensyms never collide with each other: the text after the last
     /// `.` is the counter, which is different for each.
     pub fn gensym(&self, prefix: &str, pos: &Pos) -> Form {
-        let n = self.gensyms.get() + 1;
-        self.gensyms.set(n);
+        let n = self.gensyms.fetch_add(1, Ordering::Relaxed) + 1;
         Form::new(FormKind::Sym(format!("#{prefix}.{n}")), pos.clone())
     }
 
