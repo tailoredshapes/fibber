@@ -21,6 +21,7 @@ const RUNTIME: &[&str] = &[
     include_str!("../rt/str.lir"),
     include_str!("../rt/array.lir"),
     include_str!("../rt/vec.lir"),
+    include_str!("../rt/vecbuild.lir"),
     include_str!("../rt/atom.lir"),
     include_str!("../rt/thread.lir"),
     include_str!("../rt/weak.lir"),
@@ -55,6 +56,7 @@ fn assemble(p: &Program<'_>, defs: &str, entry: &str) -> String {
     out.push_str(&p.objects.render());
     out.push_str(&p.statics.render());
     out.push_str(defs);
+    out.push_str(&p.quote_text);
     for f in &p.funcs {
         out.push_str(f);
     }

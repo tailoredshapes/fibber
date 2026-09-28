@@ -45,6 +45,11 @@ pub struct Program<'a> {
     /// Every `def`'s value as lIR text with its type (compile-time
     /// evaluated, `defs.rs`).
     pub def_values: std::collections::HashMap<fibref::types::ast::DefId, (String, Option<LirTy>)>,
+    /// The constant of every quoted form, by its expression, and the
+    /// constants' text (`lower/quote.rs`).
+    pub quotes: std::collections::HashMap<ExprId, String>,
+    pub quote_text: String,
+    quote_counter: usize,
 }
 
 impl<'a> Program<'a> {
@@ -59,6 +64,9 @@ impl<'a> Program<'a> {
             externs: Vec::new(),
             helpers: std::collections::HashSet::new(),
             def_values: std::collections::HashMap::new(),
+            quotes: std::collections::HashMap::new(),
+            quote_text: String::new(),
+            quote_counter: 0,
         };
         // `str` is type id 0: the literals need it before any body runs;
         // the runtime's own text names the byte array and the weak box.
@@ -218,6 +226,12 @@ impl<'a> Program<'a> {
             self.externs.push(decl);
         }
         Ok(())
+    }
+
+    /// A fresh name for a quoted form's constant.
+    pub fn fresh_quote(&mut self) -> String {
+        self.quote_counter += 1;
+        format!("@q.{}", self.quote_counter)
     }
 
     /// Whether a generated runtime helper of this name exists.

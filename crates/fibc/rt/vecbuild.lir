@@ -1,0 +1,100 @@
+;; fib.rt, building a Vec from a buffer of elements (types §8.3, the
+;; interpreter's build_vec in eval/vecs.rs): the tail array first, then
+;; each leaf's array and node, then each level's arrays and nodes, then
+;; the VecOf. fib.vec-gather copies a vector's elements into such a
+;; buffer (for concat, syntax §3.16), fib.vec-build makes the vector,
+;; retaining every element it copies out of the buffer.
+
+;; Copies v's elements to buf from index at on; returns the next index.
+(define internal (fib.vec-gather i64) ((ptr v) (ptr buf) (i64 at) (i64 esize))
+  (block entry
+    (let ((n (call @fib.vec-len v)))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (body i2))))
+      (br (icmp slt i n) body done)))
+  (block body
+    (let ((src (call @fib.vec-elem-ptr v i esize))
+          (dst (getelementptr i8 buf (mul (add at i) esize)))
+          (i2 (add i (i64 1))))
+      (call @memcpy dst src esize)
+      (br loop)))
+  (block done (ret (add at n))))
+
+;; An array of the n elements of buf from index from, each retained.
+(define internal (fib.buf-slice-array ptr) ((ptr buf) (i64 from) (i64 n) (i64 esize) (i8 counted) (i32 tid))
+  (block entry
+    (let ((a (call @fib.array-alloc n tid esize)))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (body i2))))
+      (br (icmp slt i n) body done)))
+  (block body
+    (let ((src (getelementptr i8 buf (mul (add from i) esize)))
+          (dst (call @fib.array-elem a i esize))
+          (i2 (add i (i64 1))))
+      (call @memcpy dst src esize)
+      (call @fib.retain-elem dst counted)
+      (br loop)))
+  (block done (ret a)))
+
+;; The vector of the n elements of buf.
+(define internal (fib.vec-build ptr) ((ptr buf) (i64 n) (i64 esize) (i8 counted) (i32 tvec) (i32 tnode) (i32 tarr) (i32 tnarr))
+  (block entry (br (icmp eq n (i64 0)) empty some))
+  (block empty
+    (let ((e (call @fib.alloc (call @fib.size-of tvec) tvec)))
+      (store (i32 0) (getelementptr %struct.fib.vecof e (i32 0) (i32 3)))
+      (ret e)))
+  (block some
+    (let ((split (sub n (add (srem (sub n (i64 1)) (i64 32)) (i64 1))))
+          (tail (call @fib.buf-slice-array buf split (sub n split) esize counted tarr)))
+      (br (icmp eq split (i64 0)) noroot leaves)))
+  (block noroot
+    (ret (call @fib.vecof-new n (i64 5) (ptr null) tail tvec)))
+  (block leaves
+    (let ((nleaves (sdiv split (i64 32)))
+          (scratch (call @malloc (mul nleaves (i64 8)))))
+      (br lloop)))
+  (block lloop
+    (let ((li (phi i64 (leaves (i64 0)) (lbody li2))))
+      (br (icmp slt li nleaves) lbody levels)))
+  (block lbody
+    (let ((arr (call @fib.buf-slice-array buf (mul li (i64 32)) (i64 32) esize counted tarr))
+          (node (call @fib.vnode-new (i32 0) arr tnode))
+          (li2 (add li (i64 1))))
+      (store node (getelementptr ptr scratch li))
+      (br lloop)))
+  (block levels
+    (let ((count (phi i64 (lloop nleaves) (lnext up)))
+          (shift (phi i64 (lloop (i64 5)) (lnext shift2)))
+          (groups (sdiv (add count (i64 31)) (i64 32))))
+      (br gloop)))
+  (block gloop
+    (let ((gi (phi i64 (levels (i64 0)) (kdone gi2))))
+      (br (icmp slt gi groups) gbody lnext)))
+  (block gbody
+    (let ((start (mul gi (i64 32)))
+          (m (select (icmp slt (sub count start) (i64 32)) (sub count start) (i64 32)))
+          (karr (call @fib.array-alloc m tnarr (i64 8))))
+      (br kloop)))
+  (block kloop
+    (let ((ki (phi i64 (gbody (i64 0)) (kbody ki2))))
+      (br (icmp slt ki m) kbody kdone)))
+  (block kbody
+    (let ((kid (load ptr (getelementptr ptr scratch (add start ki))))
+          (ki2 (add ki (i64 1))))
+      (store kid (call @fib.array-elem karr ki (i64 8)))
+      (br kloop)))
+  (block kdone
+    (let ((branch (call @fib.vnode-new (i32 1) karr tnode))
+          (gi2 (add gi (i64 1))))
+      (store branch (getelementptr ptr scratch gi))
+      (br gloop)))
+  (block lnext
+    (let ((up groups)
+          (shift2 (add shift (i64 5))))
+      (br (icmp eq groups (i64 1)) rooted levels)))
+  (block rooted
+    (let ((root (load ptr (getelementptr ptr scratch (i64 0)))))
+      (call @free scratch)
+      (ret (call @fib.vecof-new n shift root tail tvec)))))

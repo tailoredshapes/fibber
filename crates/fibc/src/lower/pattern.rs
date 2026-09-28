@@ -12,6 +12,17 @@ use crate::ir::{LirTy, V};
 use crate::layout::{option_payload, option_rep, variants, OptRep};
 use crate::objects::{ENUM_TAG, STRUCT_FIELD0, VARIANT_FIELD0};
 
+/// What the Vec runtime functions take (rt/vec.lir).
+#[derive(Clone, Copy, Debug)]
+pub struct VecIds {
+    pub esize: u64,
+    pub counted: u8,
+    pub tvec: u32,
+    pub tnode: u32,
+    pub tarr: u32,
+    pub tnarr: u32,
+}
+
 impl<'a> Cx<'_, 'a> {
     /// Binds an irrefutable pattern (a `let`'s); a failure traps.
     pub fn bind_irrefutable(&mut self, pat: &Pattern, v: &V, t: &Ty) -> R<()> {
@@ -108,17 +119,16 @@ impl<'a> Cx<'_, 'a> {
         Ok(())
     }
 
-    /// `(fib.vec-drop v k)`: the vector of `v`'s elements from `k` on.
-    fn vec_drop(&mut self, v: &V, k: usize, t: &Ty) -> R<V> {
+    /// The type ids and element layout the Vec runtime functions take
+    /// for a `(Vec elem)` (rt/vec.lir, rt/vecbuild.lir).
+    pub fn vec_tids(&mut self, t: &Ty, elem: &Ty) -> R<VecIds> {
         let g = self.p.g();
-        let (vec_id, elem) = match t {
-            Ty::Con(Con::Nominal(id), args) if Some(*id) == g.vec => (*id, args[0].clone()),
-            _ => return Err(Unsupported("a rest of a non-Vec".into())),
-        };
+        if !matches!(t, Ty::Con(Con::Nominal(id), _) if Some(*id) == g.vec) {
+            return Err(Unsupported("a vector operation on a non-Vec".into()));
+        }
         let node_id = g
             .type_name(fibref::types::decls::ModuleId::Prelude, "VNode")
             .ok_or_else(|| Unsupported("the prelude defines no VNode".into()))?;
-        let _ = vec_id;
         let node_ty = Ty::nominal(node_id, vec![elem.clone()]);
         let (tvec, _) = self.p.object(t)?;
         let (tnode, _) = self.p.object(&node_ty)?;
@@ -126,18 +136,39 @@ impl<'a> Cx<'_, 'a> {
         let (tnarr, _) = self.p.object(&Ty::Con(Con::Array, vec![node_ty]))?;
         let el = self
             .p
-            .lir(&elem)?
+            .lir(elem)?
             .ok_or_else(|| Unsupported("a Vec of unit".into()))?;
-        let esize = crate::layout::size_align(el).0;
-        let counted = match el {
-            LirTy::Ptr => 1,
-            LirTy::Dyn => 2,
-            _ => 0,
+        Ok(VecIds {
+            esize: crate::layout::size_align(el).0,
+            counted: match el {
+                LirTy::Ptr => 1,
+                LirTy::Dyn => 2,
+                _ => 0,
+            },
+            tvec,
+            tnode,
+            tarr,
+            tnarr,
+        })
+    }
+
+    /// `(fib.vec-drop v k)`: the vector of `v`'s elements from `k` on.
+    fn vec_drop(&mut self, v: &V, k: usize, t: &Ty) -> R<V> {
+        let elem = match t {
+            Ty::Con(Con::Nominal(_), args) => args[0].clone(),
+            _ => return Err(Unsupported("a rest of a non-Vec".into())),
         };
+        let ids = self.vec_tids(t, &elem)?;
         Ok(self.b.val(
             &format!(
-                "(call @fib.vec-drop {} (i64 {k}) (i64 {esize}) (i8 {counted}) (i32 {tvec}) (i32 {tnode}) (i32 {tarr}) (i32 {tnarr}))",
-                v.text()
+                "(call @fib.vec-drop {} (i64 {k}) (i64 {}) (i8 {}) (i32 {}) (i32 {}) (i32 {}) (i32 {}))",
+                v.text(),
+                ids.esize,
+                ids.counted,
+                ids.tvec,
+                ids.tnode,
+                ids.tarr,
+                ids.tnarr
             ),
             LirTy::Ptr,
         ))

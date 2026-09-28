@@ -14,6 +14,7 @@ mod dynamic;
 mod objects;
 mod ops;
 mod pattern;
+mod quote;
 mod threads;
 mod values;
 
@@ -332,8 +333,8 @@ impl<'p, 'a> Cx<'p, 'a> {
             }
             ExprKind::Async(..) => self.make_async(e)?,
             ExprKind::Await(x) => self.await_task(x)?,
-            ExprKind::Quote(_) => return Err(Unsupported("quoted forms".into())),
-            ExprKind::Concat(_) => return Err(Unsupported("concat".into())),
+            ExprKind::Quote(f) => self.quote(e, f)?,
+            ExprKind::Concat(es) => self.concat(es)?,
         };
         Ok(Flow::Val(v))
     }
