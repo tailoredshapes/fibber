@@ -182,6 +182,8 @@ struct Frame {
     owned_params: Vec<Site>,
     /// The `&` parameters (a `defun` frame only).
     amp_params: Vec<BindingId>,
+    /// Per `&` parameter, its carriers in the body (types §6.6).
+    amp_carriers: HashMap<BindingId, HashSet<BindingId>>,
     /// A named `fn`'s self-name.
     self_name: Option<BindingId>,
 }

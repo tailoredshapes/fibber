@@ -2,6 +2,7 @@
 //! `cases/ownership` with the decisions §7 and §6 state for each
 //! (`cases`, `cases2`), and rules of §6 one at a time (`rules`).
 
+mod captured;
 mod cases;
 mod cases2;
 mod methods;

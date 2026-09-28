@@ -230,6 +230,12 @@ pub enum Pass {
 pub enum Because {
     /// (b): an `&` argument that does not forward.
     AmpArgument,
+    /// (b): `&param`, an `&` parameter that another argument of the
+    /// call captures, is copied in, not forwarded (§6.6).
+    AmpCaptured {
+        /// The `&` parameter.
+        param: crate::types::ast::BindingId,
+    },
     /// (e): argument `arg` (0-based) is frame-owned at a borrowed
     /// position of a callee outside the SCC.
     FrameOwned {

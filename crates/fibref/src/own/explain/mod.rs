@@ -255,7 +255,7 @@ impl Section<'_> {
                 };
                 let mut parts = vec![
                     format!("{} {}", at(e), show(self.p, e)),
-                    tail(c.tail, c.callee),
+                    tail(self.p, c.tail, c.callee),
                 ];
                 if c.head != Pass::Scalar {
                     parts.push(format!("head: {}", pass(c.head)));

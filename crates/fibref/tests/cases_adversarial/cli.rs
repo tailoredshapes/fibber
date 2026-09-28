@@ -183,8 +183,12 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("161-rigid-impl-stores-send-closure-at-both-colours.fib"),
         "{out}"
     );
-    assert!(out.contains("159 cases:"), "{out}");
-    assert!(out.contains("159 pass, 0 fail, 0 pending"), "{out}");
+    assert!(
+        out.contains("165-captured-inout-at-non-tail-call-unchanged.fib"),
+        "{out}"
+    );
+    assert!(out.contains("163 cases:"), "{out}");
+    assert!(out.contains("163 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 

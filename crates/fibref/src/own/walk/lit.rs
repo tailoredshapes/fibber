@@ -39,6 +39,7 @@ impl Walker<'_> {
             loops: Vec::new(),
             owned_params: Vec::new(),
             amp_params: Vec::new(),
+            amp_carriers: Default::default(),
             self_name: None,
         });
     }
@@ -73,6 +74,11 @@ impl Walker<'_> {
         self.open_frame(spec.kind);
         for (b, p) in &spec.params {
             self.param(*b, *p);
+        }
+        let amps = self.frame().amp_params.clone();
+        for v in amps {
+            let c = super::super::captured::carriers(spec.body, v);
+            self.frame_mut().amp_carriers.insert(v, c);
         }
         self.run_body(spec.body, true);
         self.frames.pop();

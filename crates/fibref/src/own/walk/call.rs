@@ -21,6 +21,9 @@ struct CallSite {
     admitted: bool,
     /// In tail position.
     tail: bool,
+    /// Per argument, whether it is an `&v` that another argument
+    /// captures (types §6.6): never forwarded.
+    captured: Vec<bool>,
 }
 
 impl Walker<'_> {
@@ -37,7 +40,8 @@ impl Walker<'_> {
             })
             .collect();
         let params = self.params_of(callee, args.len());
-        let tail_d = self.decide(e, callee, &params, args, &ms, tail);
+        let captured = self.captured(args);
+        let tail_d = self.decide(e, callee, &params, args, &ms, (tail, &captured));
         if tail {
             self.tails.insert(e.id, tail_d);
         }
@@ -47,6 +51,7 @@ impl Walker<'_> {
             site: self.is_tail_site(e, tail_d),
             admitted: tail_d == Tail::TailCall,
             tail,
+            captured,
         };
         let mut moved = HashSet::new();
         let mut own = CallOwn {
@@ -109,7 +114,24 @@ impl Walker<'_> {
         }
     }
 
-    /// The decision of §6.10 for a call; `tail` is tail position.
+    /// Per argument, whether it is an `&v` forwardable here whose `v`
+    /// another argument captures (types §6.6).
+    fn captured(&self, args: &[Arg]) -> Vec<bool> {
+        let f = self.frame();
+        args.iter()
+            .enumerate()
+            .map(|(i, a)| match a {
+                Arg::Amp(b, _) => f
+                    .amp_carriers
+                    .get(b)
+                    .is_some_and(|cs| super::super::captured::captured_at(args, i, *b, cs)),
+                Arg::Expr(_) => false,
+            })
+            .collect()
+    }
+
+    /// The decision of §6.10 for a call; `tail.0` is tail position,
+    /// `tail.1` the captured `&` arguments.
     fn decide(
         &self,
         e: &Expr,
@@ -117,7 +139,7 @@ impl Walker<'_> {
         ps: &[Param],
         args: &[Arg],
         ms: &[Option<Mode>],
-        tail: bool,
+        (tail, captured): (bool, &[bool]),
     ) -> Tail {
         if !tail {
             return Tail::NotInTail;
@@ -139,6 +161,13 @@ impl Walker<'_> {
         };
         if !args.iter().all(forwards) {
             return Tail::Ordinary(Because::AmpArgument);
+        }
+        let caught = args.iter().zip(captured).find_map(|(a, c)| match a {
+            Arg::Amp(b, _) if *c => Some(*b),
+            _ => None,
+        });
+        if let Some(param) = caught {
+            return Tail::Ordinary(Because::AmpCaptured { param });
         }
         if let Some(ts) = self.cx.tail_sites {
             match ts.get(&e.id) {
@@ -237,7 +266,10 @@ impl Walker<'_> {
     ) -> Pass {
         let (x, m) = match (a, m) {
             (Arg::Expr(x), Some(m)) => (x, m),
-            (Arg::Amp(b, _), _) => return self.amp_pass(*b, cs.callee, cs.tail),
+            (Arg::Amp(b, _), _) => {
+                let forwardable = cs.tail && !cs.captured[i];
+                return self.amp_pass(*b, cs.callee, forwardable);
+            }
             (Arg::Expr(_), None) => return Pass::Scalar,
         };
         if m == Mode::Scalar {
@@ -284,7 +316,8 @@ impl Walker<'_> {
         }
     }
 
-    /// `&b` handed to a callee (§6.6).
+    /// `&b` handed to a callee (§6.6); `tail`: in tail position and not
+    /// captured by another argument.
     fn amp_pass(&mut self, b: crate::types::ast::BindingId, c: Callee, tail: bool) -> Pass {
         if !super::super::syntactic::is_amp(&self.cx.p.globals, b) {
             self.note(Some(Val::B(Site::Bind(b))), At::Other);

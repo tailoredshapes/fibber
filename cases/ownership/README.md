@@ -148,3 +148,16 @@ Accept: a new `Hook` joined with `self`, and a `Self` result built from
 `(Hook :local)` head (158); an enum under a `:send` head spawning
 `self`'s closure (160); a rigid body storing a sendable closure into
 `self`'s cell field, used at both colours (161).
+
+Cases 162 to 165 pin the owner's decision of 2026-09-28 that an `&`
+parameter that another argument of the same call captures is not
+forwarded at a call in tail position but copied in and written back,
+which makes the call ordinary (ownership.md §5; syntax §3.13; types
+§6.6, §6.10 rule (b) and the decision record in types §10). They were
+written before fibref implemented it. All accept with a clean audit: a
+closure over the parameter passed beside it (162, 11; forwarded it gave
+77), the same closure bound by a `let` before the call (163, 11), a
+million-deep self recursion that forwards the parameter, with a closure
+over it called before the call rather than passed to it, still a tail
+call (164), and the capturing closure at a call not in tail position,
+unchanged by the decision (165, 21).

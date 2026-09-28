@@ -119,18 +119,22 @@ pub(super) fn pass(x: Pass) -> &'static str {
 }
 
 /// `tail-call`, or `call` with the rule that made it ordinary.
-pub(super) fn tail(t: Tail, callee: Callee) -> String {
+pub(super) fn tail(p: &TypedProgram, t: Tail, callee: Callee) -> String {
     match t {
         Tail::TailCall => "tail-call".into(),
         Tail::NotInTail if callee == Callee::Ctor => "construct".into(),
         Tail::NotInTail => "call".into(),
-        Tail::Ordinary(b) => format!("call ({})", because(b)),
+        Tail::Ordinary(b) => format!("call ({})", because(p, b)),
     }
 }
 
-fn because(b: Because) -> String {
+fn because(p: &TypedProgram, b: Because) -> String {
     match b {
         Because::AmpArgument => "b: & argument".into(),
+        Because::AmpCaptured { param } => format!(
+            "b: &{} captured by an argument",
+            p.globals.binding(param).name
+        ),
         Because::FrameOwned { arg } => {
             format!("e: frame-owned argument {} at a borrowed position", arg + 1)
         }

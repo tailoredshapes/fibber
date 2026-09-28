@@ -24,6 +24,7 @@ pub mod explain;
 pub mod program;
 pub mod syntactic;
 
+mod captured;
 mod classify;
 mod facts;
 mod objects;
