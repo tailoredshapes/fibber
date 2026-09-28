@@ -15,95 +15,58 @@ spec/ownership.md, spec/syntax.md, spec/types.md, decided by the owner
 after six adversarial review rounds. 20 decided cases in
 cases/ownership; 80 proposed in spec/drafts/PROPOSED_CASES.md.
 
-## M2. Reference interpreter (`fibref`) — in progress
+## M2. Reference interpreter (`fibref`) — done
 
-The executable spec: reader, expander, types, ownership checker and an
-evaluator over the audited heap.
+The executable spec (spec/method.md rules 1 to 5). `crates/fibref`
+reads, expands, types and ownership-checks a program and runs it over
+an audited heap; `crates/fibgen` checks random programs against it.
+Decisions taken on the way are in spec/types.md §10.
 
-- [x] audited heap: counting, cells, atoms, weak, sharing, immortal
-      objects, unique writes, stack scopes, leak classification
-- [x] case harness and CI
-- [x] reader
-- [x] macro expander (user `defmacro` waits on the evaluator)
-- [x] name resolution and type inference; `lib/prelude.fib`
-- [x] ownership checker and `fibref explain`
-- [x] evaluator following the checker's plan; threads, atoms, async
-      executor (deterministic: each run is one valid interleaving);
-      user macros with phase separation; `fibref run`
-- [x] all 20 cases pass
-- [x] the proposed cases promoted: 78 cases, all passing (30 and 35
-      withdrawn: they use field places, removed by D1)
-- [ ] known gaps: a spin loop on an atom that another thread would set
-      hangs under the deterministic executor
+- [x] audited heap: counting, cells, atoms, weak references, sharing,
+      immortal objects, unique writes, stack scopes, leak
+      classification (`crates/fibref/src/heap`)
+- [x] reader, macro expander (user macros with phase separation), name
+      resolution, type inference, ownership checker (`fibref explain`)
+      and `lib/prelude.fib`
+- [x] evaluator following the checker's plan (`fibref run`), with
+      threads, atoms and an async executor that is deterministic and
+      fair (types §8.8, "The reference interpreter's schedule")
+- [x] case harness and CI: 166 cases in cases/ownership, all passing
+      with a clean audit (its README lists them by origin: the 20
+      decided, the promoted proposals, the rule-4 adversary's findings
+      81 to 95, the rule-5 generator's, and the owner's decisions of
+      2026-09-27 and 2026-09-28)
 - [x] method rule 4: an adversary attacking the running interpreter;
-      its 15 findings promoted as cases 81 to 95 after the owner's
-      decisions of 2026-09-27 (spec/types.md §10): 93 cases, all passing
-- [ ] method rule 5: random well-typed programs, all passing the audit.
-      `fibgen` generates them and checks each against a model; its
-      findings so far are fixed and promoted as cases 96 to 99 (100
-      pins annotated bindings): 98 cases, all passing. A sweep of seeds
-      200000..259999 gave 59999 ok and one result mismatch (seed
-      233285): an `&` parameter forwarded at a tail call was observably
-      different from a copy-in when a later argument of the same call
-      wrote the variable. The owner decided (2026-09-28) that the
-      copy-in happens at call entry, after every argument (types §10);
-      fibref and fibgen's model follow it, and cases 150 to 153 pin it.
-      `fibgen` now also generates the colour-parameterised enum `(Job k
-      :colour)`, `(Weak (dyn P :send))` and `(Atom (dyn P :send))`
-      crossing threads, and floats with NaN, infinities and `rem`. A
-      sweep of seeds 800000..859999 gave 59409 ok, 319 traps the model
-      predicted and 272 `POSSIBLE-OVERREJECTION`, all impls on `(Hook k)`
-      whose bodies use `self` as a `(Hook :local)` or join it with a new
-      `Hook`, then an open spec question; no mismatch, audit failure,
-      crash or hang. The owner decided it (2026-09-28: the head's colour
-      is rigid, or the head gives a colour), and `fibgen` now puts a
-      body that uses `self` as a value under a `(Hook :local)` head,
-      used on local hooks only. A sweep of seeds 900000..959999 gave
-      59698 ok, 301 predicted traps and one `POSSIBLE-OVERREJECTION`, a
-      generator bug (a `let` binding one name twice, which syntax §3.3
-      forbids), since fixed; rerun on the fixed generator: 59699 ok,
-      301 predicted traps, no over-rejection, mismatch, audit failure,
-      crash or hang
-- [x] the owner's decisions of 2026-09-28 (spec/types.md §10): lift
-      the "v1" restrictions and fix what a trap means; cases 101 to 127:
-      125 cases, all passing
-  - [x] `expect: trap` cases; a trap aborts the program and what is
-        live then is not a leak (types §2.11; cases 101 to 104)
-  - [x] a float literal of a width other than f32/f64 is an error, read
-        or macro-built (syntax §1.1; case 105)
-  - [x] `(dyn P :send)`: a distinct `Send` dynamic type (types §2.15;
-        cases 106 to 112)
-  - [x] colour parameters on structs and enums (`k :colour`, types §1.3;
-        cases 124 to 127)
-  - [x] protocol supertraits (`:requires`) and default methods; `Ord`
-        requires `Eq` (types §4.1; cases 117 to 123)
-  - [x] private names: `:private` after a definition's name, `(var
-        m/x)` past it (syntax §5, §3.20; cases 113 to 116)
-- [x] pattern matching complete enough for a compiler that takes
-      forms apart: vector patterns `[p* & rest]` in `match` and `let`
-      and guarded clauses `(pat :when g body+)`, after the owner's
-      decision of 2026-09-28 lifting syntax open item 11 (spec: syntax
-      §1.4, §3.6; types §2.6, §6.3, §8.3, §10). Cases 128 to 149, all
-      passing with a clean audit: 147 cases in all. `fibgen` generates
-      both (vector patterns with and without rests, nested in struct
-      patterns and the reverse, and guarded clauses)
-- [x] the owner's decision of 2026-09-28 on the time of the copy-in:
-      an `&` argument is copied in at call entry, after all of the
-      call's arguments (ownership.md §5; syntax §2, §3.13; types §6.6,
-      §10). Cases 150 to 153: 151 cases in all, all passing
-- [x] the owner's decision of 2026-09-28 on built-in comparisons: the
-      scalar types' `Eq` and `Ord` instances define every method, so
-      floats compare as IEEE 754 and `Ord`'s defaults apply only to
-      user impls (types §2.12, §8.12, §10). Case 154: 152 cases in all,
-      all passing
-- [x] the owner's decisions of 2026-09-28 on colours in impl heads and
-      on forwarding (types §1.3, §4.1, §5.4, §6.6, §6.10, §10; syntax
-      §3.10, §3.13; ownership.md §5): a colour variable in an impl head
-      is rigid in the bodies and a head may give a colour instead
-      (cases 155 to 161), and an `&` parameter that another argument of
-      the call captures is copied in, not forwarded, so forwarding is
-      indistinguishable from copy-in/copy-out (cases 162 to 165); float
-      `rem` recorded as `fmod`. 163 cases in all, all passing
+      its 15 findings are cases 81 to 95
+- [x] method rule 5: `fibgen` generates random well-typed programs and
+      checks each against a model of its result and against the audit.
+      It covers closures (escaping, stored, self-named), `&` parameters
+      and forwarding, cells, atoms, weak references, structs and enums
+      with colour parameters, protocols (supertraits, defaults, `dyn`
+      and `(dyn P :send)`), vector patterns and guards, user macros (a
+      preamble of `defmacro`s), arrays, integers of every width and
+      floats (NaN, infinities, `rem`), `spawn`, `plet`, `pmap`,
+      `async`/`await` and a spin-wait on an atom another thread sets. Its findings are
+      cases 96 to 99; two more led to the owner's decisions pinned by
+      cases 150 to 153 and 155 to 161. Sweep of seeds 1100000..1159999:
+      59691 ok and 309 traps the model predicted; no mismatch, audit
+      failure, run failure, crash, hang or rejection. It does not
+      generate: programs the checker must reject, `unsafe` and
+      `extern`, `trap`, cycles through cells (the permitted leak),
+      programs whose result depends on the interleaving, or a thread
+      that waits for its spawner (its model runs a spawned thread at
+      the spawn)
+- [x] the owner's decisions of 2026-09-27 and 2026-09-28 (types §10),
+      each pinned by cases: traps (101 to 104), float literal widths
+      (105), `(dyn P :send)` (106 to 112), private names (113 to 116),
+      supertraits and default methods (117 to 123), colour parameters
+      (124 to 127), vector patterns and guards (128 to 149), the
+      copy-in at call entry (150 to 153), IEEE float comparisons (154),
+      colours in impl heads (155 to 161), no forwarding of a captured
+      `&` parameter (162 to 165)
+- [x] the known gap closed: a spin-wait on an atom another thread sets
+      hung under the run-to-completion executor; the fair executor runs
+      it (cases 166 to 168)
 
 ## M3. Hardened lIR
 

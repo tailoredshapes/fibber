@@ -25,7 +25,7 @@ audit. Nothing counts as implemented until an executable test says so.
 
 ```
 cargo test --workspace                          # the full suite
-cargo run -p fibref -- cases cases/ownership    # 163 cases
+cargo run -p fibref -- cases cases/ownership    # 166 cases
 cargo run -p fibref -- run   <file.fib>         # result and memory audit
 cargo run -p fibref -- explain <file.fib>       # the ownership decisions
 ```
@@ -36,8 +36,9 @@ cargo run -p fibref -- explain <file.fib>       # the ownership decisions
 | Ownership model | [spec/ownership.md](spec/ownership.md) | decided |
 | Syntax | [spec/syntax.md](spec/syntax.md) | decided |
 | Type system and ownership checker | [spec/types.md](spec/types.md) | decided |
-| Cases | [cases/ownership/](cases/ownership/) | 163, all passing (128–149: vector patterns and guards; 150–153: copy-in at call entry; 154: IEEE float comparisons; 155–161: colour parameters in impl heads; 162–165: no forwarding of a captured `&` parameter) |
-| Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | working; see [ROADMAP.md](ROADMAP.md) M2 |
+| Cases | [cases/ownership/](cases/ownership/) | 166, all passing (128–149: vector patterns and guards; 150–153: copy-in at call entry; 154: IEEE float comparisons; 155–161: colour parameters in impl heads; 162–165: no forwarding of a captured `&` parameter; 166–168: spin-waits and `swap!` contention on the fair executor) |
+| Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
+| Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
 | Library | [lib/prelude.fib](lib/prelude.fib) | what the cases need |
 | lIR (hardened, from liar) | — | not started (M3) |
 | Compiler `fibc` | — | not started (M4) |
