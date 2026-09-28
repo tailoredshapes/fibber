@@ -8,6 +8,7 @@ mod cases;
 mod errors;
 mod errors2;
 mod forms;
+mod patterns;
 
 use super::{check_source, ErrorKind, SourceError, TypeError, TypedProgram};
 

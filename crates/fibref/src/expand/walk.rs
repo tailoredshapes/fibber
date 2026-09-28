@@ -81,8 +81,8 @@ fn start(
     }
 }
 
-/// A pattern: the symbol `nil` becomes `(Nil)`; brackets are an error;
-/// a list's items are patterns.
+/// A pattern: the symbol `nil` becomes `(Nil)`; braces are an error;
+/// the items of a list or of a vector pattern (§1.4, §3.6) are patterns.
 fn pattern(ex: &mut Expander, form: Form, stack: &mut Vec<Frame>) -> Result<Step, ExpandError> {
     let pos = form.pos;
     match form.kind {
@@ -90,11 +90,9 @@ fn pattern(ex: &mut Expander, form: Form, stack: &mut Vec<Frame>) -> Result<Step
             ex.leave();
             Ok(Step::Done(Form::new(FormKind::Nil, pos)))
         }
-        FormKind::Vec(_) | FormKind::Map(_) => {
-            Err(ExpandError::new(ExpandErrorKind::BracketInPattern, &pos))
-        }
-        FormKind::List(items) => {
-            let form = Form::new(FormKind::List(items), pos);
+        FormKind::Map(_) => Err(ExpandError::new(ExpandErrorKind::BraceInPattern, &pos)),
+        kind @ (FormKind::List(_) | FormKind::Vec(_)) => {
+            let form = Form::new(kind, pos);
             let role = Role::after(0, Role::Pattern);
             Ok(open(ex, form, role, Finish::Same, true, stack))
         }

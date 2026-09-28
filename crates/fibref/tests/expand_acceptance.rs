@@ -57,13 +57,40 @@ fn residue(forms: &[Form]) -> Option<&Form> {
                     return Some(f);
                 }
                 if head != "quote" && head != "ns" {
-                    stack.extend(items);
+                    stack.extend(expressions(head, items));
                 }
             }
             _ => {}
         }
     }
     None
+}
+
+/// The items of a list that are searched for residue: all of them,
+/// except that a pattern, where brackets are a vector pattern (syntax
+/// §1.4, §3.6), is not an expression: the first item of a `match`
+/// clause and of a `let` binding pair are skipped.
+fn expressions<'f>(head: &str, items: &'f [Form]) -> Vec<&'f Form> {
+    let without_pattern = |f: &'f Form| -> Vec<&'f Form> {
+        match f.as_list() {
+            Some([_, rest @ ..]) => rest.iter().collect(),
+            _ => vec![f],
+        }
+    };
+    match (head, items) {
+        ("match", [h, s, clauses @ ..]) => {
+            let mut out = vec![h, s];
+            out.extend(clauses.iter().flat_map(without_pattern));
+            out
+        }
+        ("let", [h, bs, body @ ..]) => {
+            let mut out = vec![h];
+            out.extend(bs.as_list().unwrap_or(&[]).iter().flat_map(without_pattern));
+            out.extend(body);
+            out
+        }
+        _ => items.iter().collect(),
+    }
 }
 
 /// Whether `(for-each r f)` has a literal `(range a b)` or `(range n)`

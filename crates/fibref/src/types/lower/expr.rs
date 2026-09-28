@@ -211,33 +211,6 @@ impl Lowerer<'_> {
         Ok(self.mk(&form.pos, ExprKind::Recur(args)))
     }
 
-    fn match_form(&mut self, items: &[Form], form: &Form, tail: bool) -> TResult<Expr> {
-        if items.len() < 3 {
-            return Err(TypeError::resolve(
-                &form.pos,
-                "match needs a scrutinee and clauses",
-            ));
-        }
-        let scrut = self.expr(&items[1], false)?;
-        let mut clauses = Vec::new();
-        for clause in &items[2..] {
-            let parts = clause.as_list().unwrap_or(&[]);
-            if parts.len() < 2 {
-                return Err(TypeError::resolve(
-                    &clause.pos,
-                    "a clause is (pattern body+)",
-                ));
-            }
-            let mark = self.mark();
-            let pat =
-                super::pattern::pattern(self, &parts[0], BindingKind::Pattern, &mut Vec::new());
-            let body = pat.and_then(|p| Ok((p, self.body(&parts[1..], &clause.pos, tail)?)));
-            self.reset(mark);
-            clauses.push(body?);
-        }
-        Ok(self.mk(&form.pos, ExprKind::Match(Box::new(scrut), clauses)))
-    }
-
     fn fn_form(&mut self, items: &[Form], form: &Form) -> TResult<Expr> {
         let named = items.get(1).and_then(Form::as_sym);
         let start = if named.is_some() { 2 } else { 1 };

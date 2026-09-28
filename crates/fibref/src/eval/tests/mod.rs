@@ -7,6 +7,7 @@ mod macros;
 mod memory;
 mod objects;
 mod options;
+mod patterns;
 mod stack;
 mod values;
 

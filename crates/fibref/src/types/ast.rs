@@ -202,8 +202,8 @@ pub enum ExprKind {
     If(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `(do e..)`.
     Do(Vec<Expr>),
-    /// `(match s (pat body)..)`.
-    Match(Box<Expr>, Vec<(Pattern, Expr)>),
+    /// `(match s clause..)`.
+    Match(Box<Expr>, Vec<Clause>),
     /// `(loop ((x e)..) body)`.
     Loop(Vec<(BindingId, Expr)>, Box<Expr>),
     /// `(recur e..)`, in tail position of the innermost loop.
@@ -234,6 +234,30 @@ pub enum ExprKind {
     Concat(Vec<Expr>),
 }
 
+/// A `match` clause: `(pat body+)` or `(pat :when guard body+)`
+/// (syntax §3.6).
+#[derive(Clone, Debug)]
+pub struct Clause {
+    /// The pattern.
+    pub pat: Pattern,
+    /// The guard, evaluated after the pattern has bound its variables.
+    pub guard: Option<Expr>,
+    /// The body.
+    pub body: Expr,
+}
+
+/// What follows the elements of a vector pattern (syntax §3.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rest {
+    /// `[p..]`: exactly that many elements.
+    Exact,
+    /// `[p.. & _]`: at least that many; nothing is built.
+    Ignore,
+    /// `[p.. & r]`: at least that many; `r` owns a new vector of the
+    /// remaining elements.
+    Bind(BindingId),
+}
+
 /// A pattern (§2.6).
 #[derive(Clone, Debug)]
 pub struct Pattern {
@@ -257,6 +281,8 @@ pub enum PatKind {
     Ctor(TypeId, Option<usize>, Vec<Pattern>),
     /// `(p :as x)`.
     As(Box<Pattern>, BindingId),
+    /// A vector pattern `[p.. & r]` over the prelude's `Vec`.
+    Vec(Vec<Pattern>, Rest),
 }
 
 /// A type annotation, resolved against the type names in scope.
@@ -307,7 +333,12 @@ impl Expr {
             ExprKind::Do(es) | ExprKind::Recur(es) | ExprKind::Concat(es) => es.iter().for_each(f),
             ExprKind::Match(s, cls) => {
                 f(s);
-                cls.iter().for_each(|(_, e)| f(e));
+                for c in cls {
+                    if let Some(g) = &c.guard {
+                        f(g);
+                    }
+                    f(&c.body);
+                }
             }
             ExprKind::Loop(vs, body) => {
                 vs.iter().for_each(|(_, e)| f(e));

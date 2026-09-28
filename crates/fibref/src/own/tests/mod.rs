@@ -5,6 +5,7 @@
 mod cases;
 mod cases2;
 mod methods;
+mod patterns;
 mod rules;
 
 use std::path::PathBuf;

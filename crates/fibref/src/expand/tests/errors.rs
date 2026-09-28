@@ -1,6 +1,6 @@
 //! One test per expansion error, each checking the kind and position.
 
-use super::{ex_err, prog_err, program};
+use super::{ex, ex_err, prog_err, program};
 use crate::expand::error::ExpandErrorKind as K;
 
 /// The line and column of the error of the program `src`.
@@ -118,11 +118,22 @@ fn nil_called() {
 }
 
 #[test]
-fn brackets_in_patterns() {
-    assert_eq!(ex_err("(match v ([a b] 1))").kind, K::BracketInPattern);
-    assert_eq!(ex_err("(let (({a 1} m)) a)").kind, K::BracketInPattern);
-    let e = ex_err("(match v ((some [a]) 1))");
-    assert_eq!((e.kind, e.pos.col), (K::BracketInPattern, 17));
+fn braces_in_patterns() {
+    assert_eq!(ex_err("(match v ({a b} 1))").kind, K::BraceInPattern);
+    assert_eq!(ex_err("(let (({a 1} m)) a)").kind, K::BraceInPattern);
+    let e = ex_err("(match v ((some [{a 1}]) 1))");
+    assert_eq!((e.kind, e.pos.col), (K::BraceInPattern, 18));
+}
+
+#[test]
+fn brackets_in_patterns_are_vector_patterns_walked_as_patterns() {
+    // Not the §1.4 rewrite to conj calls: the items stay, `nil` in one
+    // is normalised to (Nil), and `&` is left for lowering (§3.6).
+    assert_eq!(
+        ex("(match v ([a nil & r] 1) (_ 2))"),
+        "(match v ([a nil & r] 1) (_ 2))"
+    );
+    assert_eq!(ex("(let (([& r] v)) r)"), "(let (([& r] v)) r)");
 }
 
 #[test]

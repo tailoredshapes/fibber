@@ -49,6 +49,7 @@ pub mod strings;
 pub mod task;
 pub mod unsafe_ops;
 pub mod value;
+pub mod vec_view;
 pub mod vecs;
 
 #[cfg(test)]

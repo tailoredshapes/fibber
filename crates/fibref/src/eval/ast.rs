@@ -22,7 +22,10 @@ pub fn children(e: &Expr) -> Vec<&Expr> {
             .chain(std::iter::once(body.as_ref()))
             .collect(),
         ExprKind::Match(s, cls) => std::iter::once(s.as_ref())
-            .chain(cls.iter().map(|(_, x)| x))
+            .chain(
+                cls.iter()
+                    .flat_map(|c| c.guard.iter().chain(std::iter::once(&c.body))),
+            )
             .collect(),
         ExprKind::If(c, t, f) => vec![c, t, f],
         ExprKind::Do(es) | ExprKind::Recur(es) | ExprKind::Concat(es) => es.iter().collect(),

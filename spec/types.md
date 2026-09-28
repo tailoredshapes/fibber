@@ -328,7 +328,8 @@ sub-patterns followed by `m - k` wildcards; a wildcard or variable
 row, to every constructor. So `[]` and `[x & r]` are exhaustive, and
 `[]`, `[x]` alone leave out `[_ _ & _]`, which the error prints. A
 missing length is printed as a vector pattern: `[]`, `[_ _]`, or `[_ _
-& _]` for the least length. A column of type `(Vec T)` that has both a
+& _]` for the least length; a missing variant of `Vec` itself (when no
+unguarded clause has a vector pattern) likewise, `[]` or `[_ & _]`. A column of type `(Vec T)` that has both a
 vector pattern and a pattern of one of `Vec`'s own variants
 (`(VecEmpty)`, `(VecOf ..)`) is the error `vector patterns cannot be
 mixed with patterns of Vec's variants`: the two describe one value in
@@ -2982,7 +2983,7 @@ captures with their kinds), a call (`tail-call`, or `call` with the
 rule of §6.10 that made it ordinary; the copy-in of every `&` argument,
 `acquire` or `forward`), a colour solution (`ς₁ = local, forced by
 capture n`), and the emitted operations with source lines, those
-of a guard's false edge written `L5 guard false: release [r]` after
+of a guard's false edge written `L5 guard false: release [r] (exit)` after
 the guard's own (§6.3; a rest variable is a binding line `r  owns`); a function
 whose value is taken has a second entry, `defun f.owned`, for its
 all-owned body (§8.4). Reject cases print the error and the rule

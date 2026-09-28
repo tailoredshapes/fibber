@@ -18,7 +18,8 @@ not changed.
 
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
-Cases 12, 13, 14, 18, 21, 34, 40, 82, 90 and 93 must be rejected; 15
+Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 141, 142, 145, 147, 148,
+149 and 150 must be rejected; 15
 and 80 are the permitted cycle leaks; every other case is accept with a
 clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
 pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
@@ -51,3 +52,22 @@ types §6.11, §8.2). The seeds their headers name are those of the
 generator as it was then; it has since stopped generating products
 that overflow (types §2.12), which changed the programs of many seeds.
 100 pins annotated `let`, `loop` and `plet` bindings (syntax §1.5).
+
+Cases 131 to 152 pin vector patterns and guards, which the owner
+allowed on 2026-09-28 (syntax §1.4, §3.3, §3.6; types §2.6, §6.3, §8.3
+and the decision record in types §10). They were written from the spec
+before fibref implemented it, and are numbered from 131 because 101 to
+130 are being added on another branch; the numbers are made contiguous
+at the merge. Accept: lengths and literals (131), a rest returned (132),
+stored and captured (133), released in a loop (134); guards that fail
+with later clauses binding the same names (135), that store their rest
+and fail (136), that read a cell an earlier guard wrote (137);
+vector-in-struct (138) and struct-in-vector (139) patterns; no rest
+built when a later sub-pattern fails (140); tail calls from guarded
+bodies (143); forms matched by shape through `(List [..])` (144); `[&
+r]` in `let` (146); an `await` in a guard (151); an element that
+outlives its vector (152). Reject: a missing length (141), coverage by
+guarded clauses only (142), a vector pattern on a `Form` (145), a
+refutable vector pattern in `let` (147), `recur` in a guard (148), a
+clause after `[& r]` (149), vector patterns mixed with `Vec`'s own
+variants (150).

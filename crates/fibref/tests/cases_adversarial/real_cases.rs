@@ -23,7 +23,9 @@ fn real_cases() -> Vec<PathBuf> {
     cases
 }
 
-const REJECT: [u32; 10] = [12, 13, 14, 18, 21, 34, 40, 82, 90, 93];
+const REJECT: [u32; 17] = [
+    12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 141, 142, 145, 147, 148, 149, 150,
+];
 const LEAK_CYCLE: [u32; 2] = [15, 80];
 
 fn number_of(path: &Path) -> u32 {
@@ -67,23 +69,28 @@ fn every_real_case_header_parses() {
 }
 
 #[test]
-fn the_ownership_directory_holds_cases_1_to_100_less_the_withdrawn() {
+fn the_ownership_directory_holds_cases_1_to_100_and_131_to_152_less_the_withdrawn() {
     // 30 and 35 were withdrawn when D1 removed field places; 81 to 95
     // are the promoted findings of the rule-4 adversary, 96 to 99 those
-    // of the rule-5 generator, 100 the annotated bindings of syntax §1.5.
+    // of the rule-5 generator, 100 the annotated bindings of syntax §1.5,
+    // 131 to 152 vector patterns and guards. 101 to 130 are added on
+    // another branch; the numbers are made contiguous at the merge.
     // The listing is by name, so 100 sorts after 10: compare as numbers.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();
     let mut numbers: Vec<u32> = cases.iter().map(|p| number_of(p)).collect();
     numbers.sort_unstable();
-    let expected: Vec<u32> = (1..=100).filter(|n| ![30, 35].contains(n)).collect();
+    let expected: Vec<u32> = (1..=100)
+        .filter(|n| ![30, 35].contains(n))
+        .chain(131..=152)
+        .collect();
     assert_eq!(numbers, expected);
 }
 
 #[test]
 fn real_case_verdicts_agree_with_the_readme() {
-    // README: 12, 13, 14, 18, 21, 34, 40, 82, 90 and 93 must be
-    // rejected; 15 and 80 are the permitted cycle leaks; every other
+    // README: 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 141, 142, 145,
+    // 147, 148, 149 and 150 must be rejected; 15 and 80 are the permitted cycle leaks; every other
     // case is accept with a clean audit.
     for path in real_cases() {
         let header = read_header(&path).unwrap_or_else(|e| panic!("{e}"));

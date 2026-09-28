@@ -46,6 +46,13 @@ evaluator over the audited heap.
       spec question: an `&` parameter forwarded at a tail call is
       observably different from a copy-in when a later argument of the
       same call writes the variable (seed 233285; the model copies in)
+- [x] pattern matching complete enough for a compiler that takes
+      forms apart: vector patterns `[p* & rest]` in `match` and `let`
+      and guarded clauses `(pat :when g body+)`, after the owner's
+      decision of 2026-09-28 lifting syntax open item 11 (spec: syntax
+      §1.4, §3.6; types §2.6, §6.3, §8.3, §10). Cases 131 to 152, all
+      passing with a clean audit (101 to 130 come from another branch):
+      120 cases here. `fibgen` does not yet generate either construct
 
 ## M3. Hardened lIR
 
