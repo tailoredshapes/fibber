@@ -1,0 +1,34 @@
+;; expect: accept
+;; out: v 2000000
+;; out: header 0 4
+;; types.md §8.2, §8.6: a private & cell as a STACK object: one
+;; (alloca i64 (i32 4)) in the entry block, addressed through
+;; getelementptr on the cell's struct type, reused by every one of 10^6
+;; iterations of a loop (proposed case 65: an alloca in the loop block
+;; would take 32 MB of stack).
+(declare printf i32 (ptr ...))
+(defstruct fib.cell.i64 (i64 i32 i32 i64))
+(define (bump void) ((ptr cell))
+  (block entry
+    (let ((vp (getelementptr %struct.fib.cell.i64 cell (i32 0) (i32 3))))
+      (store (add (load i64 vp) (i64 2)) vp)
+      (ret))))
+(define (main i32) ()
+  (block entry
+    (let ((t (alloca i64 (i32 4))))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (loop i2)))
+          (v (phi i64 (entry (i64 0)) (loop v2))))
+      (store (i64 0) (getelementptr %struct.fib.cell.i64 t (i32 0) (i32 0)))
+      (store (i32 5) (getelementptr %struct.fib.cell.i64 t (i32 0) (i32 1)))
+      (store (i32 4) (getelementptr %struct.fib.cell.i64 t (i32 0) (i32 2)))
+      (store v (getelementptr %struct.fib.cell.i64 t (i32 0) (i32 3)))
+      (call @bump t)
+      (let ((v2 (load i64 (getelementptr %struct.fib.cell.i64 t (i32 0) (i32 3))))
+            (i2 (add i (i64 1))))
+        (br (icmp slt i2 (i64 1000000)) loop out))))
+  (block out
+    (call @printf (string "v %lld\n") v2)
+    (call @printf (string "header %lld %d\n") (load i64 t) (load i32 (getelementptr %struct.fib.cell.i64 t (i32 0) (i32 2))))
+    (ret (i32 0))))

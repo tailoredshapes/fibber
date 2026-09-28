@@ -1,0 +1,39 @@
+;; expect: accept
+;; out: counter 5 6
+;; out: pi 3.14159
+;; out: greeting hello, world
+;; out: fnptr 43
+;; out: vtable 3 12
+;; out: self 1
+;; out: vec 30
+;; out: tuple 9 hi
+(declare printf i32 (ptr ...))
+(defstruct vt (ptr ptr))
+(global counter i64 (i64 5))
+(constant pi double (double 3.14159))
+(global greeting ptr (string "hello, world"))
+(global handler ptr @inc)
+(constant vt.K %struct.vt (%struct.vt @one @two))
+(global self ptr @self)
+(constant v <4 x i32> (<4 x i32> 0 10 20 0))
+(constant tuple { i64, ptr } { (i64 9) (string "hi") })
+(define (inc i64) ((i64 x)) (block entry (ret (add x (i64 1)))))
+(define (one i64) ((i64 x)) (block entry (ret (add x (i64 2)))))
+(define (two i64) ((i64 x)) (block entry (ret (mul x (i64 12)))))
+(define (main i32) ()
+  (block entry
+    (let ((before (load i64 @counter)))
+      (store (add before (i64 1)) @counter)
+      (call @printf (string "counter %lld %lld\n") before (load i64 @counter)))
+    (call @printf (string "pi %.5f\n") (load double @pi))
+    (call @printf (string "greeting %s\n") (load ptr @greeting))
+    (call @printf (string "fnptr %lld\n") (indirect-call (load ptr @handler) (fn i64 (i64)) (i64 42)))
+    (let ((m1 (load ptr (getelementptr %struct.vt @vt.K (i32 0) (i32 0))))
+          (m2 (load ptr (getelementptr %struct.vt @vt.K (i32 0) (i32 1)))))
+      (call @printf (string "vtable %lld %lld\n") (indirect-call m1 (fn i64 (i64)) (i64 1)) (indirect-call m2 (fn i64 (i64)) (i64 1))))
+    (call @printf (string "self %d\n") (zext i32 (icmp eq (load ptr @self) @self)))
+    (let ((vv (load <4 x i32> @v)))
+      (call @printf (string "vec %d\n") (add (extractelement vv (i32 1)) (extractelement vv (i32 2)))))
+    (let ((t (load { i64, ptr } @tuple)))
+      (call @printf (string "tuple %lld %s\n") (extractvalue t 0) (extractvalue t 1))
+      (ret (i32 0)))))

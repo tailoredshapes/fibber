@@ -1,0 +1,22 @@
+;; expect: accept
+;; out: upgrade 0 1 4
+;; types.md §8.7: "retain if count > 0" on a SHARED object, a cmpxchg
+;; loop refusing zero.
+(declare printf i32 (ptr ...))
+(define (retain-if-live i1) ((ptr cp))
+  (block entry (br top))
+  (block top
+    (let ((c (atomic-load monotonic i64 cp)))
+      (br (icmp eq c (i64 0)) dead try)))
+  (block try
+    (let ((r (cmpxchg weak acq_rel monotonic cp c (add c (i64 1)))))
+      (br (extractvalue r 1) live top)))
+  (block dead (ret (i1 0)))
+  (block live (ret (i1 1))))
+(define (main i32) ()
+  (block entry
+    (let ((a (alloca i64)) (b (alloca i64)))
+      (store (i64 0) a)
+      (store (i64 3) b)
+      (call @printf (string "upgrade %d %d %lld\n") (zext i32 (call @retain-if-live a)) (zext i32 (call @retain-if-live b)) (load i64 b))
+      (ret (i32 0)))))

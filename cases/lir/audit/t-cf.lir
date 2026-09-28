@@ -1,0 +1,46 @@
+;; expect: accept
+;; out: sum-to 10 = 45
+;; out: ack 2 3 = 9
+;; out: even 7 = 0
+;; out: countdown 100M = 100000000
+;; out: even 100M = 1
+;; ir: musttail call
+;; audit: t/cf.lir; liar 7f4734c: same output (its tailcall was 'tail', not musttail)
+(declare printf i32 (ptr ...))
+(define (sum-to i64) ((i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (loop i2)))
+          (acc (phi i64 (entry (i64 0)) (loop acc2)))
+          (i2 (add i (i64 1)))
+          (acc2 (add acc i)))
+      (br (icmp slt i2 n) loop done)))
+  (block done
+    (ret (add acc2 (i64 0)))))
+(define (count-down i64) ((i64 n) (i64 acc))
+  (block entry
+    (br (icmp eq n (i64 0)) base rec))
+  (block base (ret acc))
+  (block rec (tailcall @count-down (sub n (i64 1)) (add acc (i64 1)))))
+(define (even i1) ((i64 n))
+  (block entry (br (icmp eq n (i64 0)) yes no))
+  (block yes (ret (i1 1)))
+  (block no (tailcall @odd (sub n (i64 1)))))
+(define (odd i1) ((i64 n))
+  (block entry (br (icmp eq n (i64 0)) yes no))
+  (block yes (ret (i1 0)))
+  (block no (tailcall @even (sub n (i64 1)))))
+(define (ack i64) ((i64 m) (i64 n))
+  (block entry (br (icmp eq m (i64 0)) m0 mpos))
+  (block m0 (ret (add n (i64 1))))
+  (block mpos (br (icmp eq n (i64 0)) n0 npos))
+  (block n0 (ret (call @ack (sub m (i64 1)) (i64 1))))
+  (block npos (ret (call @ack (sub m (i64 1)) (call @ack m (sub n (i64 1)))))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "sum-to 10 = %lld\n") (call @sum-to (i64 10)))
+    (call @printf (string "ack 2 3 = %lld\n") (call @ack (i64 2) (i64 3)))
+    (call @printf (string "even 7 = %d\n") (zext i32 (call @even (i64 7))))
+    (call @printf (string "countdown 100M = %lld\n") (call @count-down (i64 100000000) (i64 0)))
+    (call @printf (string "even 100M = %d\n") (zext i32 (call @even (i64 100000000))))
+    (ret (i32 0))))

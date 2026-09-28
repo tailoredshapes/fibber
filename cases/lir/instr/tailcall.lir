@@ -1,0 +1,44 @@
+;; expect: accept
+;; out: self 10000000
+;; out: mutual 1
+;; out: void 0
+;; out: indirect 1000000
+;; ir: musttail call i64 @count
+;; ir: musttail call tailcc i1 @odd
+;; ir: musttail call tailcc i64 %
+;; Each tail call is 10^6 to 10^7 deep: without musttail, at -O0 (the
+;; JIT path) every one overflows the stack.
+(declare printf i32 (ptr ...))
+(global hits i64 (i64 0))
+(define (count i64) ((i64 n) (i64 acc))
+  (block entry (br (icmp eq n (i64 0)) done more))
+  (block done (ret acc))
+  (block more (tailcall @count (sub n (i64 1)) (add acc (i64 1)))))
+(define tailcc (even i1) ((i64 n))
+  (block entry (br (icmp eq n (i64 0)) yes no))
+  (block yes (ret (i1 1)))
+  (block no (tailcall @odd (sub n (i64 1)) (i64 0) (i64 0))))
+(define tailcc (odd i1) ((i64 n) (i64 pad1) (i64 pad2))
+  (block entry (br (icmp eq n (i64 0)) yes no))
+  (block yes (ret (i1 0)))
+  (block no (tailcall @even (sub n (i64 1)))))
+(define (tick void) ((i64 n))
+  (block entry (br (icmp eq n (i64 0)) done more))
+  (block done (ret))
+  (block more
+    (store (add (load i64 @hits) (i64 1)) @hits)
+    (tailcall @tick (sub n (i64 1)))))
+(define tailcc (step i64) ((ptr self) (i64 n) (i64 acc))
+  (block entry (br (icmp eq n (i64 0)) done more))
+  (block done (ret acc))
+  (block more (indirect-tailcall self (fn tailcc i64 (ptr i64 i64)) self (sub n (i64 1)) (add acc (i64 1)))))
+(define tailcc (start i64) ((i64 n))
+  (block entry (tailcall @step @step n (i64 0))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "self %lld\n") (call @count (i64 10000000) (i64 0)))
+    (call @printf (string "mutual %d\n") (zext i32 (call @even (i64 1000000))))
+    (call @tick (i64 1000000))
+    (call @printf (string "void %lld\n") (sub (load i64 @hits) (i64 1000000)))
+    (call @printf (string "indirect %lld\n") (call @start (i64 1000000)))
+    (ret (i32 0))))

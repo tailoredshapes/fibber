@@ -1,0 +1,92 @@
+;; expect: accept
+;; out: add ovf ovf -2
+;; out: sub ovf ovf -2
+;; out: mul32 ovf ovf -2147395600
+;; out: mul64 ovf ovf ovf -12
+;; out: div div0 ovf -3
+;; out: fptosi 0 9223372036854775807 -9223372036854775808 -2 9223372036854775807
+;; out: fptoui 0 0 255 7
+;; out: shl 2 -9223372036854775808
+;; types.md §8.12: the checked sequences fibber emits instead of the bare
+;; LLVM operations, returning { value, overflowed } so that one run
+;; tests each boundary.
+(declare printf i32 (ptr ...))
+(define (pr void) (({ i64, i1 } r))
+  (block entry (br (extractvalue r 1) bad ok))
+  (block bad (call @printf (string " ovf")) (ret))
+  (block ok (call @printf (string " %lld") (extractvalue r 0)) (ret)))
+(define (add64 { i64, i1 }) ((i64 a) (i64 b))
+  (block entry
+    (let ((r (add a b)))
+      (ret { r (icmp slt (and (xor a r) (xor b r)) (i64 0)) }))))
+(define (sub64 { i64, i1 }) ((i64 a) (i64 b))
+  (block entry
+    (let ((r (sub a b)))
+      (ret { r (icmp slt (and (xor a b) (xor a r)) (i64 0)) }))))
+(define (mul32 { i64, i1 }) ((i32 a) (i32 b))
+  (block entry
+    (let ((r (mul (sext i64 a) (sext i64 b))))
+      (ret { (sext i64 (trunc i32 r)) (icmp ne (sext i64 (trunc i32 r)) r) }))))
+(define (mul64 { i64, i1 }) ((i64 a) (i64 b))
+  (block entry
+    (let ((r (mul a b)))
+      (br (and (icmp eq a (i64 -1)) (icmp eq b (i64 -9223372036854775808))) bad test)))
+  (block test
+    (br (or (icmp eq a (i64 0)) (icmp eq a (i64 -1))) good divide))
+  (block divide
+    (br (icmp ne (sdiv r a) b) bad good))
+  (block bad (ret { r (i1 1) }))
+  (block good (ret { r (i1 0) })))
+(define (div64 void) ((i64 a) (i64 b))
+  (block entry (br (icmp eq b (i64 0)) zero next))
+  (block zero (call @printf (string " div0")) (ret))
+  (block next (br (and (icmp eq a (i64 -9223372036854775808)) (icmp eq b (i64 -1))) ovf ok))
+  (block ovf (call @printf (string " ovf")) (ret))
+  (block ok (call @printf (string " %lld") (sdiv a b)) (ret)))
+(define (fptosi-sat i64) ((double x))
+  (block entry (br (fcmp uno x x) nan c1))
+  (block nan (ret (i64 0)))
+  (block c1 (br (fcmp oge x (double 9223372036854775808.0)) hi c2))
+  (block hi (ret (i64 9223372036854775807)))
+  (block c2 (br (fcmp olt x (double -9223372036854775808.0)) lo mid))
+  (block lo (ret (i64 -9223372036854775808)))
+  (block mid (ret (fptosi i64 x))))
+(define (fptoui-sat i8) ((double x))
+  (block entry (br (fcmp uno x x) zero c1))
+  (block zero (ret (i8 0)))
+  (block c1 (br (fcmp olt x (double 0.0)) zero c2))
+  (block c2 (br (fcmp oge x (double 256.0)) hi mid))
+  (block hi (ret (i8 -1)))
+  (block mid (ret (fptoui i8 x))))
+(define (shl64 i64) ((i64 a) (i64 n)) (block entry (ret (shl a (and n (i64 63))))))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "add"))
+    (call @pr (call @add64 (i64 9223372036854775807) (i64 1)))
+    (call @pr (call @add64 (i64 -9223372036854775808) (i64 -1)))
+    (call @pr (call @add64 (i64 5) (i64 -7)))
+    (call @printf (string "\nsub"))
+    (call @pr (call @sub64 (i64 -9223372036854775808) (i64 1)))
+    (call @pr (call @sub64 (i64 0) (i64 -9223372036854775808)))
+    (call @pr (call @sub64 (i64 5) (i64 7)))
+    (call @printf (string "\nmul32"))
+    (call @pr (call @mul32 (i32 65536) (i32 65536)))
+    (call @pr (call @mul32 (i32 -46341) (i32 46341)))
+    (call @pr (call @mul32 (i32 46340) (i32 -46340)))
+    (call @printf (string "\nmul64"))
+    (call @pr (call @mul64 (i64 -1) (i64 -9223372036854775808)))
+    (call @pr (call @mul64 (i64 -9223372036854775808) (i64 -1)))
+    (call @pr (call @mul64 (i64 3037000500) (i64 3037000500)))
+    (call @pr (call @mul64 (i64 -3) (i64 4)))
+    (call @printf (string "\ndiv"))
+    (call @div64 (i64 7) (i64 0))
+    (call @div64 (i64 -9223372036854775808) (i64 -1))
+    (call @div64 (i64 -7) (i64 2))
+    (call @printf (string "\nfptosi %lld %lld %lld %lld %lld\n")
+      (call @fptosi-sat (double nan)) (call @fptosi-sat (double 1e30)) (call @fptosi-sat (double -1e30))
+      (call @fptosi-sat (double -2.5)) (call @fptosi-sat (double 9223372036854775807.0)))
+    (call @printf (string "fptoui %d %d %d %d\n")
+      (zext i32 (call @fptoui-sat (double nan))) (zext i32 (call @fptoui-sat (double -1.0)))
+      (zext i32 (call @fptoui-sat (double 300.0))) (zext i32 (call @fptoui-sat (double 7.9))))
+    (call @printf (string "shl %lld %lld\n") (call @shl64 (i64 1) (i64 65)) (call @shl64 (i64 1) (i64 63)))
+    (ret (i32 0))))

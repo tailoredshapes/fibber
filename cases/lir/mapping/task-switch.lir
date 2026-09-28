@@ -1,0 +1,39 @@
+;; expect: accept
+;; out: resume 0 1 2 done 30
+;; types.md §8.8: an async body as a state machine; resume switches on
+;; the task's state word (switch, §8.11), runs to the next await,
+;; stores the state and returns. The state is published with
+;; atomic-store release and read with atomic-load acquire.
+(declare printf i32 (ptr ...))
+(defstruct task (i64 i32 i32 i32 i32 i32 ptr i64 ptr i64))
+(define (resume i1) ((ptr t))
+  (block entry
+    (let ((sp (getelementptr %struct.task t (i32 0) (i32 3)))
+          (acc (getelementptr %struct.task t (i32 0) (i32 9)))
+          (st (atomic-load acquire i32 sp)))
+      (call @printf (string " %d") st)
+      (switch st bad ((i32 0) s0) ((i32 1) s1) ((i32 2) s2))))
+  (block s0
+    (store (i64 10) acc)
+    (atomic-store release (i32 1) sp)
+    (ret (i1 0)))
+  (block s1
+    (store (add (load i64 acc) (i64 20)) acc)
+    (atomic-store release (i32 2) sp)
+    (ret (i1 0)))
+  (block s2
+    (store (load i64 acc) (getelementptr %struct.task t (i32 0) (i32 7)))
+    (atomic-store release (i32 3) sp)
+    (ret (i1 1)))
+  (block bad (unreachable)))
+(define (main i32) ()
+  (block entry
+    (let ((t (alloca %struct.task)))
+      (store (i32 0) (getelementptr %struct.task t (i32 0) (i32 3)))
+      (call @printf (string "resume"))
+      (br run)))
+  (block run
+    (br (call @resume t) fin run))
+  (block fin
+    (call @printf (string " done %lld\n") (load i64 (getelementptr %struct.task t (i32 0) (i32 7))))
+    (ret (i32 0))))
