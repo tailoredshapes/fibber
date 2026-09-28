@@ -20,10 +20,10 @@ pub fn int_form(g: &mut Gen, cx: &Ctx, d: u32) -> Option<Expr> {
     } else {
         Proto::Score
     };
-    match g.rng.below(10) {
+    match g.rng.below(11) {
         // Score's methods through a (dyn Rank): its supertrait's
         // vtable entries (types §4.1 rule 3).
-        9 => {
+        10 => {
             let send = g.rng.chance(40);
             let recv = dyn_value(g, cx, Proto::Rank, send, d - 1);
             Some(call_method(g, cx, recv, Proto::Score, d))
@@ -32,8 +32,8 @@ pub fn int_form(g: &mut Gen, cx: &Ctx, d: u32) -> Option<Expr> {
             let recv = receiver(g, cx, p, d)?;
             Some(call_method(g, cx, recv, p, d))
         }
-        3..=5 => generic_call(g, cx, d),
-        6 => Some(map_dyn(g, cx, p, d)),
+        3..=6 => generic_call(g, cx, d),
+        7 => Some(map_dyn(g, cx, p, d)),
         _ => Some(cross(g, cx, p, d)),
     }
 }
