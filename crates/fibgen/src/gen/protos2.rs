@@ -54,7 +54,7 @@ pub fn generic_call(g: &mut Gen, cx: &Ctx, d: u32) -> Option<Expr> {
     };
     let p = generic_bound(g, idx)?;
     let f = g.funs[idx].clone();
-    let recv = if g.rng.chance(30) {
+    let recv = if g.rng.chance(45) {
         let q = if p == Proto::Rank || g.rng.chance(50) {
             Proto::Rank
         } else {

@@ -155,7 +155,12 @@ pub fn dyn_leaf(g: &mut Gen, p: Proto, send: bool) -> Expr {
 /// A call of one of `p`'s methods on `recv`.
 pub fn call_method(g: &mut Gen, cx: &Ctx, recv: Expr, p: Proto, d: u32) -> Expr {
     let ms = p.methods();
-    let m = ms[g.rng.below(ms.len())];
+    // Rank's own methods half the time, its supertrait's the rest.
+    let m = if p == Proto::Rank && g.rng.chance(50) {
+        ms[2 + g.rng.below(2)]
+    } else {
+        ms[g.rng.below(ms.len())]
+    };
     let mut args = vec![recv];
     if m == "bonus" {
         args.push(g.expr(cx, &Ty::Int, d.saturating_sub(1)));
@@ -198,7 +203,7 @@ pub fn make_generic(g: &mut Gen, d: u32) -> usize {
     };
     let mut params = vec![Param {
         name: "x".into(),
-        ty: Ty::Gen(p, g.rng.chance(50)),
+        ty: Ty::Gen(p, g.rng.chance(65)),
         inout: false,
     }];
     if g.rng.chance(50) {
