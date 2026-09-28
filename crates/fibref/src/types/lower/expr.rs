@@ -4,6 +4,7 @@
 use crate::syntax::{Form, FormKind};
 
 use crate::types::ast::{BindingKind, Expr, ExprKind, FnLit, GlobalRef, Lit};
+use crate::types::decls::Space;
 use crate::types::error::{ErrorKind, TResult, TypeError};
 
 use super::bindings::bindings_of;
@@ -82,7 +83,29 @@ impl Lowerer<'_> {
             }
             None => Err(TypeError::resolve(
                 &form.pos,
-                format!("unbound name {name}"),
+                self.g.unknown(self.m, Space::Value, name, "unbound name"),
+            )),
+        }
+    }
+
+    /// `(var name)` (syntax §3.20): the top-level definition `name`
+    /// names, private or not, never a local binding.
+    fn var_form(&mut self, items: &[Form], form: &Form) -> TResult<Expr> {
+        let Some(name) = items
+            .get(1)
+            .and_then(Form::as_sym)
+            .filter(|_| items.len() == 2)
+        else {
+            return Err(TypeError::resolve(&form.pos, "expected (var name)"));
+        };
+        match self.g.value_any(self.m, name) {
+            Some(r) => {
+                self.check_unsafe(r, name, form)?;
+                Ok(self.mk(&form.pos, ExprKind::Global(r)))
+            }
+            None => Err(TypeError::resolve(
+                &form.pos,
+                format!("var: no definition named {name}"),
             )),
         }
     }
@@ -113,6 +136,7 @@ impl Lowerer<'_> {
                 _ => Err(TypeError::resolve(pos, "malformed quote")),
             },
             "." => self.field(items, form),
+            "var" => self.var_form(items, form),
             "&" => Err(TypeError::new(
                 ErrorKind::AmpArgument,
                 pos,

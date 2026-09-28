@@ -134,14 +134,29 @@ impl ExpandCtx {
         self.macros.get(name)
     }
 
-    /// A struct seen so far, by name.
+    /// A struct seen so far, by name; not a private one of an earlier
+    /// module (syntax §5).
     pub fn struct_info(&self, name: &str) -> Option<&StructInfo> {
-        self.types.structs.get(name)
+        self.types
+            .structs
+            .get(name)
+            .filter(|_| !self.types.hidden.contains(name))
     }
 
-    /// An enum seen so far (or `Option`, `Form`), by name.
+    /// An enum seen so far (or `Option`, `Form`), by name; not a
+    /// private one of an earlier module (syntax §5).
     pub fn enum_info(&self, name: &str) -> Option<&EnumInfo> {
-        self.types.enums.get(name)
+        self.types
+            .enums
+            .get(name)
+            .filter(|_| !self.types.hidden.contains(name))
+    }
+
+    /// Ends the module being expanded: its private structs and enums
+    /// are not seen by reflection or `derive` in the modules expanded
+    /// after it (syntax §5).
+    pub fn end_module(&mut self) {
+        self.types.end_module();
     }
 
     /// Counts one macro expansion against [`Limits::max_steps`].

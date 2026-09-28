@@ -8,6 +8,7 @@ use super::core::{body_start, skip_annotations, Role};
 use super::error::{ExpandError, ExpandErrorKind as K};
 use super::expr::{expand_head, Expander};
 use super::heads::{is_core, is_definition, QUASI_FORMS};
+use super::private::{marker_index, put_marker, take_marker, type_name as private_type_name};
 use super::runner::{parse_params, MacroDef};
 use super::walk::walk;
 
@@ -33,8 +34,28 @@ pub(crate) fn top_form(
     Ok(())
 }
 
-/// One top-level form that is not a `do`.
+/// One top-level form that is not a `do`. A `:private` marker (syntax
+/// §5) is taken off while the definition is parsed and registered, and
+/// put back for name resolution.
 fn definition(ex: &mut Expander, form: Form, first: bool) -> Result<Form, ExpandError> {
+    let Some(at) = marker_index(&form) else {
+        return definition_of(ex, form, first);
+    };
+    let (form, marker) = take_marker(form, at);
+    let kind = head_name(&form).unwrap_or("").to_string();
+    if kind == "defstruct" || kind == "defenum" {
+        if let Some(name) = private_type_name(&form) {
+            ex.ctx.types.private.insert(name.to_string());
+        }
+    }
+    let out = definition_of(ex, form, first)?;
+    Ok(match marker {
+        Some(m) => put_marker(out, at, m),
+        None => out,
+    })
+}
+
+fn definition_of(ex: &mut Expander, form: Form, first: bool) -> Result<Form, ExpandError> {
     let name = head_name(&form).unwrap_or("").to_string();
     let role = match name.as_str() {
         "ns" if !first => return Err(ExpandError::new(K::NsNotFirst, &form.pos)),

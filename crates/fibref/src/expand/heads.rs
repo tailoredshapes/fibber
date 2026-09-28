@@ -1,7 +1,7 @@
 //! What the head of a list form means to the expander (§4.2, §4.3).
 
-/// The twenty-two core forms of §4.2.
-pub const CORE_FORMS: [&str; 22] = [
+/// The twenty-three core forms of §4.2.
+pub const CORE_FORMS: [&str; 23] = [
     "defun",
     "def",
     "fn",
@@ -24,6 +24,7 @@ pub const CORE_FORMS: [&str; 22] = [
     "quote",
     "defmacro",
     "ns",
+    "var",
 ];
 
 /// The core forms that §2 admits only at top level.

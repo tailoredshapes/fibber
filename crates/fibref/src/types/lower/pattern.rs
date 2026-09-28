@@ -81,7 +81,11 @@ fn list_pattern(
         ));
     };
     let Some(GlobalRef::Ctor(id, variant)) = lw.g.value(lw.m, head) else {
-        let msg = format!("{head} is not a variant or struct");
+        let space = crate::types::decls::Space::Value;
+        let msg = match lw.g.private_owner(lw.m, space, head) {
+            Some(_) => lw.g.unknown(lw.m, space, head, ""),
+            None => format!("{head} is not a variant or struct"),
+        };
         return Err(TypeError::resolve(&items[0].pos, msg));
     };
     let arity = match (&lw.g.ty(id).shape, variant) {

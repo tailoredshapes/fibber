@@ -47,6 +47,7 @@ mod error;
 mod expr;
 mod heads;
 mod prelude;
+mod private;
 mod quasi;
 mod reflect;
 mod runner;
@@ -64,6 +65,7 @@ pub use ctx::{ExpandCtx, Limits, MAX_EXPANDED_FORMS, MAX_EXPAND_DEPTH, MAX_STEPS
 pub use error::{ExpandError, ExpandErrorKind};
 pub use heads::{is_core, CORE_FORMS};
 pub use prelude::PRELUDE_MACROS;
+pub use private::marker_index;
 pub use reflect::REFLECTION_CALLS;
 pub use runner::{MacroDef, MacroRunner, NoRunner};
 pub use types::{EnumInfo, StructInfo, VariantInfo};

@@ -26,8 +26,8 @@ not changed.
 
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
-Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109 and
-112 must be rejected; 101 to 104 must trap; 15
+Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109,
+112, 113 and 114 must be rejected; 101 to 104 must trap; 15
 and 80 are the permitted cycle leaks; every other case is accept with a
 clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
 pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
@@ -74,4 +74,10 @@ a weak reference to one and an atom holding one crossing threads
 hiding a value that reaches a cell (107), capturing a plain `(dyn P)`
 in a spawned closure (108), a generic function hiding a cell holder
 (109) and converting a `(dyn P)` back to `(dyn P :send)` (112) are
-rejected.
+rejected. 113 to 116 cover private names (syntax §5, §3.20): a
+program naming a private prelude helper (113) or matching a variant of
+the prelude's private trie enum (114) is rejected; a program's own
+private definitions, a public name equal to a private prelude one and
+`(var fib.prelude/x)` (115), and a macro whose expansion reaches a
+private helper through `var` whatever the use site binds locally (116)
+are accepted.

@@ -35,6 +35,7 @@ pub mod error;
 pub mod infer;
 pub mod init;
 pub mod lower;
+pub mod names;
 pub mod program;
 pub mod scheme;
 pub mod store;
@@ -63,6 +64,7 @@ pub fn prelude_forms(ctx: &mut ExpandCtx) -> Result<Vec<Form>, String> {
     let mut forms = expand_prelude(ctx).map_err(|e| e.to_string())?;
     let lib = read_all(PRELUDE_LIB, "lib/prelude.fib").map_err(|e| e.to_string())?;
     forms.extend(expand_program(lib, ctx, &mut NoRunner).map_err(|e| e.to_string())?);
+    ctx.end_module();
     Ok(forms)
 }
 
@@ -126,10 +128,14 @@ pub struct Lowered {
 /// nested programs ([`check_program`] makes a thread of its own).
 pub fn lower_program(forms: &[Form], prelude: &[Form]) -> Result<Lowered, Vec<TypeError>> {
     let mut g = init::new_globals().map_err(|e| vec![e])?;
-    let pd = lower::declare(&mut g, ModuleId::Prelude, prelude)?;
+    let (prelude, prelude_private) = lower::strip_private(prelude);
+    let (forms, user_private) = lower::strip_private(forms);
+    let pd = lower::declare(&mut g, ModuleId::Prelude, &prelude)?;
+    lower::mark_private(&mut g, ModuleId::Prelude, &prelude_private);
     init::finish_builtins(&mut g).map_err(|e| vec![e])?;
     let prelude_items = lower::define(&mut g, pd)?;
-    let ud = lower::declare(&mut g, ModuleId::User, forms)?;
+    let ud = lower::declare(&mut g, ModuleId::User, &forms)?;
+    lower::mark_private(&mut g, ModuleId::User, &user_private);
     let user_items = lower::define(&mut g, ud)?;
     Ok(Lowered {
         globals: g,

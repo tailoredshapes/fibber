@@ -852,7 +852,13 @@ closed type (§2.16),
 for structs and enums the layout
 (§8), for protocols the signatures with escape kinds and fundeps, every
 instance, every macro as forms, and the bodies of generic `defun`s
-(needed by §4.3). Importing instantiates schemes; nothing is re-inferred
+(needed by §4.3). A `:private` definition (syntax §5, **Decided**,
+owner, 2026-09-28) is in the interface as far as exported code needs it
+(a private type's layout, a private function that an exported generic
+body calls) but marked as not nameable: name resolution in an importing
+module skips it, except through `(var m/x)` (syntax §3.20), and
+reports a reference to it as `x is private to m; it is not exported`.
+Importing instantiates schemes; nothing is re-inferred
 and no inference state crosses a module boundary, so modules are checked
 independently once their dependencies are. Interfaces are
 deterministic: the solver breaks every tie in source order. Coherence of

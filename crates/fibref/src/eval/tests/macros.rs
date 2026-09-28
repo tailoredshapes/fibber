@@ -67,3 +67,16 @@ fn a_macro_built_literal_out_of_its_width_is_rejected() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn reflection_does_not_see_a_private_type_of_the_prelude() {
+    // Syntax §5: VNode is private to fib.prelude; Vec is not. A program
+    // type of the same name is its own.
+    let src = "(defmacro seen () (if (enum? 'VNode) '1 (if (enum? 'Vec) '2 '3)))
+               (defun main () -> i64 (seen))";
+    clean(src, 2);
+    let src = "(defenum VNode (A x: i64))
+               (defmacro seen () (if (enum? 'VNode) '5 '6))
+               (defun main () -> i64 (seen))";
+    clean(src, 5);
+}

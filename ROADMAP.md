@@ -56,7 +56,8 @@ evaluator over the audited heap.
         cases 106 to 112)
   - [ ] colour parameters on structs and enums
   - [ ] protocol supertraits and default methods
-  - [ ] private names
+  - [x] private names: `:private` after a definition's name, `(var
+        m/x)` past it (syntax §5, §3.20; cases 113 to 116)
 
 ## M3. Hardened lIR
 

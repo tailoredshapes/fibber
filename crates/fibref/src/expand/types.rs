@@ -2,7 +2,7 @@
 //! "a `defstruct` is registered with the expander before the next form
 //! is expanded"), which reflection and `derive` read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::syntax::{read_all, Form, FormKind, Pos};
@@ -48,6 +48,11 @@ pub struct EnumInfo {
 pub struct TypeTable {
     pub(crate) structs: HashMap<String, StructInfo>,
     pub(crate) enums: HashMap<String, EnumInfo>,
+    /// The `:private` structs and enums of the module being expanded.
+    pub(crate) private: HashSet<String>,
+    /// The private structs and enums of modules expanded before it,
+    /// which reflection and `derive` do not see (syntax §5).
+    pub(crate) hidden: HashSet<String>,
 }
 
 /// §3.16's built-in `Form` enum, in the spelling §3.16 gives it.
@@ -91,6 +96,7 @@ impl TypeTable {
     /// Records a `defstruct` form, replacing any earlier one of the name.
     pub(crate) fn add_struct(&mut self, form: &Form) -> Result<(), ExpandError> {
         let info = parse_defstruct(form)?;
+        self.hidden.remove(&info.name);
         self.structs.insert(info.name.clone(), info);
         Ok(())
     }
@@ -98,8 +104,15 @@ impl TypeTable {
     /// Records a `defenum` form, replacing any earlier one of the name.
     pub(crate) fn add_enum(&mut self, form: &Form) -> Result<(), ExpandError> {
         let info = parse_defenum(form)?;
+        self.hidden.remove(&info.name);
         self.enums.insert(info.name.clone(), info);
         Ok(())
+    }
+
+    /// Ends a module: its private types are hidden from the next.
+    pub(crate) fn end_module(&mut self) {
+        let private = std::mem::take(&mut self.private);
+        self.hidden.extend(private);
     }
 }
 

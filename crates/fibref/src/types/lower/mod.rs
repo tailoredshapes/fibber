@@ -9,6 +9,7 @@ mod call;
 mod decl;
 mod expr;
 mod pattern;
+mod private;
 mod protos;
 mod scope;
 mod top;
@@ -22,6 +23,7 @@ use crate::types::error::{ErrorKind, TResult, TypeError};
 use crate::types::ty::{Con, ProtoId, Ty};
 
 pub use decl::define_value;
+pub use private::{mark_private, marker_index, strip_private};
 pub use protos::{declare_proto, pred_of, register_instance, resolve_proto};
 pub use scope::Lowerer;
 pub use typeform::type_ann;

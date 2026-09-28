@@ -217,7 +217,7 @@ Ownership consequences are stated briefly and decided in types §6.
 ### 3.1 `defun`
 
 ```
-(defun name (param*) where? ret? body)
+(defun name private? (param*) where? ret? body)          ; private ::= :private (§5)
 param ::= sym | sym: type | sym :borrow | sym: type :borrow | &sym | &sym: type
 where ::= :where (constraint+)          ; constraint ::= (Proto type+) | (Send type)
 ret   ::= -> type
@@ -415,8 +415,8 @@ whole form. A pattern variable bound to a scalar is a copy.
 ### 3.7 `defstruct`
 
 ```
-(defstruct Name (field+))
-(defstruct (Name tvar+) (field+))
+(defstruct Name private? (field+))
+(defstruct (Name tvar+) private? (field+))
 field ::= sym: type | sym
 ```
 
@@ -447,8 +447,8 @@ a `(. x field)` form (§3.13; **Decided**, D1).
 ### 3.9 `defenum`
 
 ```
-(defenum Name variant+)
-(defenum (Name tvar+) variant+)
+(defenum Name private? variant+)
+(defenum (Name tvar+) private? variant+)
 variant ::= (Variant) | (Variant field+) | Variant
 field   ::= sym: type | type
 ```
@@ -779,7 +779,7 @@ on every iteration.
 
 ```
 (unsafe body)
-(extern name (type*) -> type opt*)      ; opt: :varargs
+(extern name private? (type*) -> type opt*)      ; opt: :varargs
 ```
 
 `extern` declares a foreign function with the C calling convention; its
@@ -809,7 +809,7 @@ to an extern is never a tail call (types §6.10).
 ```
 (quote form)          ; 'form : Form
 (quasiquote form)     ; `form, with (unquote e) ,e and (unquote-splicing e) ,@e inside
-(defmacro name (param*) body)
+(defmacro name private? (param*) body)
 param ::= sym | ... sym            ; "... rest" binds the remaining forms as (Vec Form)
 ```
 
@@ -1075,8 +1075,8 @@ and it is inside whatever `defun` or `async` encloses it. A named local
 ### 3.19 `def`
 
 ```
-(def name expr)
-(def name: type expr)
+(def name private? expr)
+(def name: type private? expr)
 ```
 
 A top-level **constant**: `name` is bound in the module's namespace,
@@ -1144,6 +1144,29 @@ allocates on every call.
 
 ---
 
+### 3.20 `var`
+
+```
+(var name)          ; name a symbol, qualified (m/x) or not
+```
+
+**Decided** (owner, 2026-09-28; §5). `(var name)` stands for the
+top-level definition `name` resolves to (a function, a constructor, a
+variant constant, a protocol method, a `def`, an `extern`) exactly as the
+symbol `name` would in expression position, with two differences: a
+`:private` definition of another module is visible to it (§5), and a
+local binding of the same name is not (it names a top-level definition
+only). It evaluates to what the symbol would; in the head of a call it
+is a direct call, as the symbol is (types §2.2), so `((var m/helper) x)`
+is the call `(m/helper x)` would be if `helper` were exported. It names
+values only: a type or a protocol has no `var`, since a macro template
+that must name a private type or protocol spells a constructor, a
+constant or a method through `var` instead, or the module exports the
+type. It is core (§4.1 rule 2: it decides what a name refers to, which
+no macro or function can), and it is the form a macro's expansion uses
+to reach a private helper of its own module. `(var x)` where no
+definition is named `x` is `var: no definition named x`.
+
 ## 4. Core versus macro versus library
 
 ### 4.1 The rule (Decided)
@@ -1154,9 +1177,9 @@ A form is **core** iff at least one of:
    (`&`: distinct variables, the escaping-capture rule; `fn`/`async`: capture
    and escape; `match`/`let` patterns: derived borrows and
    exhaustiveness; `.`: field paths);
-2. it binds names or introduces a type, a protocol or an implementation
-   (`defun def fn let defstruct defenum defprotocol impl defmacro extern
-   ns`);
+2. it binds names or introduces a type, a protocol or an implementation,
+   or decides what a name refers to (`defun def fn let defstruct defenum
+   defprotocol impl defmacro extern ns var`);
 3. it changes control flow or the evaluation regime in a way no function
    can (`if do match loop recur async await unsafe quote`).
 
@@ -1168,8 +1191,8 @@ preserving verdicts and error positions is a **macro**.
 
 ### 4.2 Core forms
 
-Twenty-two: `defun def fn let if do match loop recur defstruct . defenum
-defprotocol impl & async await unsafe extern quote defmacro ns`
+Twenty-three: `defun def fn let if do match loop recur defstruct . defenum
+defprotocol impl & async await unsafe extern quote defmacro ns var`
 (`quasiquote`,
 `unquote`, `unquote-splicing` exist only until expansion). `set!`,
 `cell`, `deref`, `atom`, `swap!`, `reset!`, `weak`, `spawn`, `join` are
@@ -1264,10 +1287,65 @@ clause ::= (:require [name :as alias]+) | (:use name+)
 One `ns` form, first in the file, names the module (dotted; `a.b` lives
 at `a/b.fib` under a root given to the compiler). `:require` makes
 `alias/x` refer to `x` in that module; `:use` brings all of a module's
-top-level names in unqualified. Every top-level definition is exported
-(**Decided**; no private names in v1). A name defined locally shadows a
+exported top-level names in unqualified. A name defined locally shadows a
 `:use`d one; two `:use`d modules exporting the same name make that name
-an error when referenced unqualified. Requires may not be cyclic.
+an error when referenced unqualified.
+
+**Private names** (**Decided**, owner, 2026-09-28; replaces "every
+top-level definition is exported, no private names in v1"). The keyword
+`:private` right after a definition's name keeps it out of the module's
+interface:
+
+```
+(defun helper :private (x) ..)        (def table :private [..])       (def t: (Vec i64) :private [..])
+(defstruct Node :private (..))        (defstruct (Node a) :private (..))
+(defenum (Tree a) :private ..)        (defprotocol Walk :private ..)
+(defmacro m :private (x) ..)          (extern write :private (i32 ptr i64) -> i64)
+```
+
+It is written where the other qualifiers of a binding are, after the
+thing it qualifies, as `:borrow` follows a parameter (§3.1) and `:send`
+a protocol (§3.10): a second head per definition (Clojure's `defn-`)
+would double the core forms, and fibber has no metadata maps. A private
+definition's names are visible in its own module and in no other: a
+function's, a `def`'s or an `extern`'s name; a struct's name as a type
+and as its constructor; an enum's name and every variant, as a
+constructor, a constant and a pattern; a protocol's name and every
+method; a macro's name. From another module, a `:use` does not bring
+them in, a qualified `m/x` does not reach them, and `struct?`, `enum?`
+and the other reflection calls of §3.16 (and so `derive`) do not see a
+private type: each is the error `x is private to m; it is not
+exported`, where the same text without the definition would be `unbound
+name x`, `unknown type x` or `unknown protocol x`. Since a private name
+is not brought in, it never conflicts: the using module may define the
+same name, and two `:use`d modules may both have a private `x`.
+Privacy is of names, not of values: a public function may return a
+value of a private type, whose fields `.` reads and whose methods
+dispatch as usual, and an `impl` of any protocol is a global fact
+(below) whether its protocol or type is private or not. The interface
+(types §3.9) still carries what the compiler needs of a private
+definition that exported code reaches (the layout of a private type, a
+private function a generic exported body calls), marked as not
+nameable.
+
+**Macros and private helpers.** A macro's expansion is resolved in the
+module that uses the macro, like every expansion (there is no automatic
+hygiene, §3.16), so a template that names a private helper of the
+macro's own module by a bare or qualified symbol would reach nothing,
+or the user's own name. It writes `(var m/helper)` instead (§3.20): the
+one reference that sees a private definition, which is Clojure's
+answer as well (its syntax-quote qualifies `helper` to `m/helper`, which
+compiles only if `helper` is public, and `#'m/helper`, the var, is how a
+macro reaches a private one). Like Clojure's, it is a deliberate door,
+not a security boundary: privacy keeps a module's interface small and
+its helpers free to change, and `var` is visible in the text wherever
+it is used. A macro defined in the module that uses it needs neither.
+
+The reference implementation has the prelude and one program module
+(M5 adds more), so it checks every rule above between those two: a
+program's reference to a private prelude definition, unqualified or
+as `fib.prelude/x`, reflection on a private prelude type, and `(var
+fib.prelude/x)` (cases 123 to 126). Requires may not be cyclic.
 `fib.prelude` is implicitly `:use`d. Protocol implementations are global
 facts and are always visible once their module is required.
 

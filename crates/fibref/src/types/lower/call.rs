@@ -134,7 +134,11 @@ impl Lowerer<'_> {
                 &a.pos,
                 "& argument must be a cell variable",
             )),
-            None => Err(TypeError::resolve(&a.pos, format!("unbound name {x}"))),
+            None => Err(TypeError::resolve(
+                &a.pos,
+                self.g
+                    .unknown(self.m, crate::types::decls::Space::Value, x, "unbound name"),
+            )),
         }
     }
 

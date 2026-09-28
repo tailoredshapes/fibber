@@ -12,11 +12,11 @@ use std::collections::HashMap;
 
 use crate::syntax::Pos;
 
-use super::ast::{
-    BindingId, BindingInfo, DefId, Expr, ExprId, ExternId, FunId, GlobalRef, TypeAnn,
-};
+use super::ast::{BindingId, BindingInfo, DefId, Expr, ExprId, ExternId, FunId, TypeAnn};
 use super::scheme::Scheme;
 use super::ty::{Con, Pred, ProtoId, Ty, TypeId};
+
+pub use super::names::{Names, Space};
 
 /// The three modules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +30,15 @@ pub enum ModuleId {
 }
 
 impl ModuleId {
+    /// The module's name, for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            ModuleId::Builtin => "the builtins",
+            ModuleId::Prelude => crate::expand::PRELUDE_NS,
+            ModuleId::User => "the program's module",
+        }
+    }
+
     fn index(self) -> usize {
         match self {
             ModuleId::Builtin => 0,
@@ -248,17 +257,6 @@ pub struct ExternDef {
     pub pos: Pos,
 }
 
-/// The names one module binds.
-#[derive(Clone, Debug, Default)]
-pub struct Names {
-    /// Functions, constructors, variants, methods, builtins, defs.
-    pub values: HashMap<String, GlobalRef>,
-    /// Structs and enums.
-    pub types: HashMap<String, TypeId>,
-    /// Protocols.
-    pub protos: HashMap<String, ProtoId>,
-}
-
 /// Every global table.
 #[derive(Clone, Debug)]
 pub struct Globals {
@@ -303,48 +301,6 @@ impl Globals {
     /// The names of `m`, for adding to.
     pub fn names_mut(&mut self, m: ModuleId) -> &mut Names {
         &mut self.modules[m.index()]
-    }
-
-    /// The modules a name used in `m` is looked up in, in order.
-    pub fn chain(m: ModuleId) -> &'static [ModuleId] {
-        match m {
-            ModuleId::User => &[ModuleId::User, ModuleId::Prelude, ModuleId::Builtin],
-            ModuleId::Prelude => &[ModuleId::Prelude, ModuleId::Builtin],
-            ModuleId::Builtin => &[ModuleId::Builtin],
-        }
-    }
-
-    /// The modules a qualified name `ns/x` is looked up in.
-    fn qualified(name: &str) -> Option<(&'static [ModuleId], &str)> {
-        let (ns, base) = name.split_once('/')?;
-        if base.is_empty() {
-            return None;
-        }
-        (ns == crate::expand::PRELUDE_NS).then_some((Globals::chain(ModuleId::Prelude), base))
-    }
-
-    /// Resolves a value name used in module `m`.
-    pub fn value(&self, m: ModuleId, name: &str) -> Option<GlobalRef> {
-        let (chain, base) = Globals::qualified(name).unwrap_or((Globals::chain(m), name));
-        chain
-            .iter()
-            .find_map(|m| self.names(*m).values.get(base).copied())
-    }
-
-    /// Resolves a type name used in module `m`.
-    pub fn type_name(&self, m: ModuleId, name: &str) -> Option<TypeId> {
-        let (chain, base) = Globals::qualified(name).unwrap_or((Globals::chain(m), name));
-        chain
-            .iter()
-            .find_map(|m| self.names(*m).types.get(base).copied())
-    }
-
-    /// Resolves a protocol name used in module `m`.
-    pub fn proto_name(&self, m: ModuleId, name: &str) -> Option<ProtoId> {
-        let (chain, base) = Globals::qualified(name).unwrap_or((Globals::chain(m), name));
-        chain
-            .iter()
-            .find_map(|m| self.names(*m).protos.get(base).copied())
     }
 
     /// The definition of a nominal type.

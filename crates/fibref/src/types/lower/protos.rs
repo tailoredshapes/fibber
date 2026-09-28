@@ -352,7 +352,13 @@ pub fn pred_of(g: &Globals, m: ModuleId, name: &str, mut tys: Vec<Ty>, pos: &Pos
         _ => {}
     }
     let Some(p) = g.proto_name(m, name) else {
-        return Err(TypeError::resolve(pos, format!("unknown protocol {name}")));
+        let msg = g.unknown(
+            m,
+            crate::types::decls::Space::Proto,
+            name,
+            "unknown protocol",
+        );
+        return Err(TypeError::resolve(pos, msg));
     };
     if g.proto(p).params.len() != tys.len() {
         return Err(TypeError::resolve(

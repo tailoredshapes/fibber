@@ -2,7 +2,9 @@
 ;; cases/ownership use, written in fibber over the primitives of syntax
 ;; §4.3. The expander's own prelude (expand::PRELUDE_SOURCE) comes first
 ;; and supplies the List enum and the derived Eq/Ord/Hash/Show instances
-;; of Option and List.
+;; of Option and List. The helpers marked :private (syntax §5) are not
+;; exported: the trie's nodes and their functions, and the raw write
+;; under eprintln.
 ;;
 ;; Vec is the persistent vector of types §2.13: a 32-way trie of
 ;; (Array a) nodes with a tail of up to 32 elements, as in Clojure. A
@@ -32,25 +34,25 @@
 (defprotocol (Iter s e) (next (self) -> (Option e)))
 
 ;; Vec
-(defenum (VNode a) (VLeaf items: (Array a)) (VBranch kids: (Array (VNode a))))
+(defenum (VNode a) :private (VLeaf items: (Array a)) (VBranch kids: (Array (VNode a))))
 (defenum (Vec a)
   (VecEmpty)
   (VecOf cnt: i64 shift: i64 root: (Option (VNode a)) tail: (Array a)))
 
 (defun vec-empty () VecEmpty)
 
-(defun array-push (items: (Array a) x: a) -> (Array a)
+(defun array-push :private (items: (Array a) x: a) -> (Array a)
   (let ((n (array-len items))
         (c (cell (array (+ n 1) x))))
     (dotimes (i n) (array-set! &c i (array-get items i)))
     @c))
 
 ;; A path of branches from level down to node (level 0 is a leaf).
-(defun vnode-path (level: i64 node: (VNode a)) -> (VNode a)
+(defun vnode-path :private (level: i64 node: (VNode a)) -> (VNode a)
   (if (= level 0) node (VBranch (array 1 (vnode-path (- level 5) node)))))
 
 ;; node, a branch at level, with the leaf whose first index is idx added.
-(defun vnode-push (level: i64 node: (VNode a) idx: i64 leaf: (VNode a)) -> (VNode a)
+(defun vnode-push :private (level: i64 node: (VNode a) idx: i64 leaf: (VNode a)) -> (VNode a)
   (match node
     ((VLeaf _) (trap "vec: a leaf where a branch belongs"))
     ((VBranch kids)
@@ -61,13 +63,13 @@
                (VBranch (array-with kids sub (vnode-push (- level 5) (array-get kids sub) idx leaf)))
                (VBranch (array-push kids (vnode-path (- level 5) leaf)))))))))
 
-(defun vnode-get (node: (VNode a) level: i64 i: i64) -> a
+(defun vnode-get :private (node: (VNode a) level: i64 i: i64) -> a
   (match node
     ((VLeaf items) (array-get items (bit-and i 31)))
     ((VBranch kids) (vnode-get (array-get kids (bit-and (shr i level) 31)) (- level 5) i))))
 
 ;; conj when the tail is full: the tail becomes a leaf of the trie.
-(defun vec-push-tail (cnt: i64 shift: i64 root: (Option (VNode a)) tail: (Array a) x: a) -> (Vec a)
+(defun vec-push-tail :private (cnt: i64 shift: i64 root: (Option (VNode a)) tail: (Array a) x: a) -> (Vec a)
   (let ((leaf (VLeaf tail))
         (tailoff (- cnt 32)))
     (match root
@@ -218,9 +220,9 @@
 
 ;; I/O (syntax §4.5): eprintln writes s and a newline to stderr, through
 ;; the C write(2) on fd 2, copying the string's bytes to a raw buffer.
-(extern write (i32 ptr i64) -> i64)
+(extern write :private (i32 ptr i64) -> i64)
 
-(defun write-str (fd: i32 s: str) -> unit
+(defun write-str :private (fd: i32 s: str) -> unit
   (let ((bs (str-bytes s))
         (n (array-len bs)))
     (unsafe

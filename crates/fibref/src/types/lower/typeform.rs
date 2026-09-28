@@ -5,7 +5,7 @@
 use crate::syntax::{Form, FormKind};
 
 use crate::types::ast::TypeAnn;
-use crate::types::decls::{Globals, ModuleId};
+use crate::types::decls::{Globals, ModuleId, Space};
 use crate::types::error::{TResult, TypeError};
 use crate::types::ty::{Colour, Con, Scalar};
 
@@ -72,7 +72,7 @@ fn sym_type(
     }
     Err(TypeError::resolve(
         &form.pos,
-        format!("unknown type {name}"),
+        g.unknown(m, Space::Type, name, "unknown type"),
     ))
 }
 
@@ -112,7 +112,7 @@ fn list_type(
     let Some(id) = g.type_name(m, head) else {
         return Err(TypeError::resolve(
             &form.pos,
-            format!("unknown type {head}"),
+            g.unknown(m, Space::Type, head, "unknown type"),
         ));
     };
     let arity = g.ty(id).params.len();
@@ -186,7 +186,7 @@ pub fn proto_ref(
     let Some(p) = g.proto_name(m, name) else {
         return Err(TypeError::resolve(
             &form.pos,
-            format!("unknown protocol {name}"),
+            g.unknown(m, Space::Proto, name, "unknown protocol"),
         ));
     };
     let want = g.proto(p).params.len() - 1;

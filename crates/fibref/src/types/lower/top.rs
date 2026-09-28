@@ -176,9 +176,10 @@ fn where_ann(g: &Globals, m: ModuleId, c: &Form) -> TResult<PredAnn> {
         return Ok(PredAnn::Send(tys[0].clone()));
     }
     let Some(p) = g.proto_name(m, name) else {
+        let space = crate::types::decls::Space::Proto;
         return Err(TypeError::resolve(
             &c.pos,
-            format!("unknown protocol {name}"),
+            g.unknown(m, space, name, "unknown protocol"),
         ));
     };
     let want = g.proto(p).params.len();
