@@ -166,3 +166,14 @@ fn a_discarded_spawn_still_runs_and_its_trap_counts() {
         Err(ModelError::Trap("integer rem by zero".into()))
     );
 }
+
+/// `sum-vec` is the preamble's loop of `+`, so a sum past `i64` traps.
+#[test]
+fn sum_vec_traps_on_overflow() {
+    let big = Expr::int(i64::MAX / 2 + 1);
+    let v = Expr::new(Ty::vec(Ty::Int), Kind::VecLit(vec![big.clone(), big]));
+    assert_eq!(
+        expected(&prog(Vec::new(), int("sum-vec", vec![v]))),
+        Err(ModelError::Trap("integer overflow in + at i64".into()))
+    );
+}

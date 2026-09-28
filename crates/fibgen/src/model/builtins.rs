@@ -80,13 +80,12 @@ impl Machine<'_> {
                 Ok(V::Unit)
             }
             ("range", [V::Int(n)]) => Ok(V::Vector(Rc::new((0..*n).map(V::Int).collect()))),
-            ("sum-vec", [V::Vector(xs)]) => xs
-                .iter()
-                .try_fold(0i64, |s, x| match x {
-                    V::Int(n) => Ok(s.wrapping_add(*n)),
-                    v => Err(unsupported(format!("sum-vec over {v:?}"))),
-                })
-                .map(V::Int),
+            // The preamble's sum-vec adds with `+`, which traps on
+            // overflow (types §2.12), element by element from the first.
+            ("sum-vec", [V::Vector(xs)]) => xs.iter().try_fold(V::Int(0), |s, x| match (&s, x) {
+                (V::Int(a), V::Int(b)) => arith("+", *a, *b),
+                (_, v) => Err(unsupported(format!("sum-vec over {v:?}"))),
+            }),
             ("map" | "pmap", [f, V::Vector(xs)]) => {
                 let mut out = Vec::new();
                 for x in xs.iter() {
