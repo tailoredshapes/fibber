@@ -33,6 +33,10 @@ pub enum ErrorKind {
     CellNotSend,
     /// `value of type T cannot be shared between threads: <path>` (§5.3).
     ValueNotSend,
+    /// A closure whose colour does not fit a rigid colour of an `impl`
+    /// head (§1.3, §5.4): `local closure where colour k is required`,
+    /// `closure of colour k cannot be shared between threads`.
+    RigidColour,
     /// `& argument must be a cell variable` (§2.14).
     AmpArgument,
     /// `& parameter v used as a value in f` (§2.14).

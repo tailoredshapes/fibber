@@ -33,6 +33,13 @@ pub trait AnnEnv {
             format!("colour variable {name} is not allowed here"),
         ))
     }
+    /// The argument of a nominal type at a colour parameter written as
+    /// the name `name`, when this environment gives it as a type (an
+    /// `impl` head's colour variable is `Gen(i)` there, §1.3); `None`
+    /// for the colour of [`AnnEnv::named_colour`].
+    fn colour_param_arg(&mut self, _name: &str, _pos: &Pos) -> Option<TResult<Ty>> {
+        None
+    }
 }
 
 /// A written colour under `env`.
@@ -53,6 +60,10 @@ pub fn ann_to_ty(ann: &TypeAnn, env: &mut dyn AnnEnv, pos: &Pos) -> TResult<Ty> 
         TypeAnn::Builtin(c, arg) => Ty::Con(*c, vec![ann_to_ty(arg, env, pos)?]),
         TypeAnn::Nominal(id, args) => Ty::Con(Con::Nominal(*id), anns(args, env, pos)?),
         TypeAnn::Dyn(p, args, send) => Ty::Con(Con::Dyn(*p, *send), anns(args, env, pos)?),
+        TypeAnn::ColourArg(ColourAnn::Named(n)) => match env.colour_param_arg(n, pos) {
+            Some(t) => t?,
+            None => Ty::colour_arg(env.named_colour(n, pos)?),
+        },
         TypeAnn::ColourArg(c) => Ty::colour_arg(colour_of(c, env, pos)?),
         TypeAnn::Fn(k, ps, r) => {
             let k = match k {

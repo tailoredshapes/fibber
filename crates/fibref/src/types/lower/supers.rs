@@ -189,6 +189,13 @@ pub fn check_impl_supers(g: &Globals, index: usize) -> TResult<()> {
             let msg = format!("{me} requires an {head}");
             return Err(TypeError::other(&inst.pos, msg));
         };
+        if !covers_colours(g, qi, inst) {
+            let head = owner(g, inst, *q).replacen("impl ", "impl of ", 1);
+            let theirs = owner(g, qi, *q);
+            let only = theirs.split(" for ").nth(1).unwrap_or_default();
+            let msg = format!("{me} requires an {head}; {theirs} covers only {only}");
+            return Err(TypeError::other(&inst.pos, msg));
+        }
         if qi.dets != want[1..] {
             let mut theirs = vec![want[0].clone()];
             theirs.extend(qi.dets.iter().cloned());
@@ -210,4 +217,13 @@ pub fn check_impl_supers(g: &Globals, index: usize) -> TResult<()> {
         }
     }
     Ok(())
+}
+
+/// Whether instance `qi` covers every colour that `inst`'s head covers
+/// (§1.3, §4.1 rule 1): wherever `qi`'s head gives a colour, `inst`'s
+/// gives the same one.
+fn covers_colours(g: &Globals, qi: &InstanceDef, inst: &InstanceDef) -> bool {
+    let theirs = super::impl_head::fixed_colours(g, &qi.head);
+    let mine = super::impl_head::fixed_colours(g, &inst.head);
+    theirs.iter().zip(&mine).all(|(t, m)| t.is_none() || t == m)
 }

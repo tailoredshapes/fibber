@@ -50,7 +50,9 @@ impl Cx<'_> {
         let m = &inst.methods[method];
         let md = &g.proto(inst.proto).methods[m.index];
         self.u.rigid_names = inst.var_names.clone();
-        let rig: Vec<Ty> = (0..inst.var_names.len() as u32).map(Ty::Rigid).collect();
+        // A type variable of the head is rigid, and so is a colour
+        // variable, as a rigid colour (§1.3, §2.7).
+        let rig = crate::types::lower::body_args(g, inst);
         let head = inst.head.subst_gen(&rig, &[]);
         let mut tys = vec![head];
         tys.extend(inst.dets.iter().map(|t| t.subst_gen(&rig, &[])));

@@ -133,3 +133,18 @@ floats compare as IEEE 754, every comparison with a NaN false except
 `!=`, directly and through a generic `Ord`-bounded function, while a
 user `impl Ord` that gives only `<` takes the defaults for `<=` and
 `>=`, which are true on a NaN.
+
+Cases 155 to 161 pin the owner's decision of 2026-09-28 that a colour
+variable in an `impl` head is rigid in the method bodies, and that a
+head may give a colour instead (types §1.3, §4.1, §5.4; syntax §3.10;
+the decision record in types §10). They were written before fibref
+implemented it. Reject: a body storing a closure over a cell into
+`self`'s cell field at the rigid colour `k`, which the old rule
+("treated as `local`") accepted and which failed the audit with
+`SharedCell` (155); `self` passed as a `(Hook :local)` in a rigid body
+(157); the instance for `(Hook :local)` used on a `(Hook :send)` (159).
+Accept: a new `Hook` joined with `self`, and a `Self` result built from
+`self`'s closure, at both colours (156); the body of 157 under a
+`(Hook :local)` head (158); an enum under a `:send` head spawning
+`self`'s closure (160); a rigid body storing a sendable closure into
+`self`'s cell field, used at both colours (161).

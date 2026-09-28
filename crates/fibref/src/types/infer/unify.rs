@@ -63,9 +63,11 @@ impl Unifier<'_> {
         }
     }
 
-    /// Two different written colours at a colour parameter of a nominal
-    /// type (§1.3): the arguments are invariant, so `(N :send)` and `(N
-    /// :local)` do not unify, and say so, rather than as a colour flow.
+    /// Two different constant colours at a colour parameter of a
+    /// nominal type (§1.3): the arguments are invariant, so `(N :send)`
+    /// and `(N :local)` do not unify, and neither does an `impl` head's
+    /// rigid `(N k)` with either (§3.2), and say so, rather than as a
+    /// colour flow.
     fn fixed_colours_differ(&mut self, c: Con, i: usize, x: &Ty, y: &Ty) -> Result<(), UErr> {
         let Con::Nominal(id) = c else {
             return Ok(());
@@ -74,7 +76,7 @@ impl Unifier<'_> {
             return Ok(());
         }
         let fixed = |t: Ty| match t {
-            Ty::Fn(k @ (Colour::Send | Colour::Local), _, _) => Some(k),
+            Ty::Fn(k @ (Colour::Send | Colour::Local | Colour::Rigid(_)), _, _) => Some(k),
             _ => None,
         };
         match (fixed(self.st.resolve(x)), fixed(self.st.resolve(y))) {

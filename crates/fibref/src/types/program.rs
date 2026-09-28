@@ -219,5 +219,6 @@ fn colour(k: Colour) -> String {
         Colour::Local => "local".into(),
         Colour::Gen(i) => format!("ς{i}"),
         Colour::Var(v) => format!("?ς{}", v.0),
+        Colour::Rigid(i) => format!("κ{i}"),
     }
 }

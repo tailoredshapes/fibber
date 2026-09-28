@@ -4,14 +4,15 @@
 
 use crate::syntax::{Form, FormKind, Pos};
 
-use crate::types::annot::{ann_to_ty, GenEnv, ParamEnv};
-use crate::types::ast::{ColourAnn, GlobalRef, TypeAnn};
+use crate::types::annot::{ann_to_ty, GenEnv};
+use crate::types::ast::{GlobalRef, TypeAnn};
 use crate::types::decls::{Globals, InstanceDef, MethodDef, MethodParam, ModuleId, ProtoDef};
 use crate::types::error::{TResult, TypeError};
 use crate::types::scheme::Scheme;
-use crate::types::ty::{Colour, Con, Leaf, Pred, ProtoId, Ty};
+use crate::types::ty::{Colour, Leaf, Pred, ProtoId, Ty};
 
 use super::decl::{annotation_name, define_value};
+use super::impl_head::{impl_head, HeadEnv, ImplHead};
 use super::supers::{methods_start, resolve_supers};
 use super::typeform::{proto_ref, type_ann};
 
@@ -219,32 +220,6 @@ fn quals(ps: &[Form], mut i: usize, p: &mut MethodParam) -> usize {
     i
 }
 
-/// The instance head `T` of an `impl`: its constructor, its variables.
-fn impl_head(g: &Globals, m: ModuleId, form: &Form) -> TResult<(Con, Vec<String>)> {
-    let bad = |msg: &str| Err(TypeError::other(&form.pos, msg.to_string()));
-    let ann = type_ann(g, m, form, false)?;
-    let (con, args) = match ann {
-        TypeAnn::Var(_) => return bad("an instance head must not be a type variable"),
-        TypeAnn::Scalar(s) => (Con::Scalar(s), Vec::new()),
-        TypeAnn::Str => (Con::Str, Vec::new()),
-        TypeAnn::Builtin(c, a) => (c, vec![*a]),
-        TypeAnn::Nominal(id, args) => (Con::Nominal(id), args),
-        _ => return bad("an instance head is a type constructor applied to distinct variables"),
-    };
-    let mut vars: Vec<String> = Vec::new();
-    for a in args {
-        match a {
-            TypeAnn::Var(v) | TypeAnn::ColourArg(ColourAnn::Named(v)) if !vars.contains(&v) => {
-                vars.push(v)
-            }
-            _ => {
-                return bad("an instance head is a type constructor applied to distinct variables")
-            }
-        }
-    }
-    Ok((con, vars))
-}
-
 /// Declares the instance of an `impl` form; returns its index and the
 /// method forms.
 pub fn declare_impl<'f>(
@@ -257,7 +232,16 @@ pub fn declare_impl<'f>(
         return Err(TypeError::resolve(&form.pos, "expected (impl P T method*)"));
     }
     let (proto, det_anns) = proto_ref(g, m, &items[1], false)?;
-    let (con, vars) = impl_head(g, m, &items[2])?;
+    let ImplHead {
+        con,
+        vars,
+        colours,
+        head,
+    } = impl_head(g, m, &items[2])?;
+    let env = || HeadEnv {
+        vars: &vars,
+        colours: &colours,
+    };
     let mut rest = &items[3..];
     let mut context = Vec::new();
     if let Some(FormKind::Kw(k)) = rest.first().map(|f| &f.kind) {
@@ -265,20 +249,14 @@ pub fn declare_impl<'f>(
             let Some(cs) = rest.get(1) else {
                 return Err(TypeError::resolve(&form.pos, ":where without constraints"));
             };
-            context = where_preds(g, m, cs, &vars)?;
+            context = where_preds(g, m, cs, &mut env())?;
             rest = &rest[2..];
         }
     }
-    let mut env = ParamEnv {
-        params: &vars,
-        colours: &[],
-        owner: "the impl head",
-    };
     let dets = det_anns
         .iter()
-        .map(|d| ann_to_ty(d, &mut env, &items[1].pos))
+        .map(|d| ann_to_ty(d, &mut env(), &items[1].pos))
         .collect::<TResult<Vec<_>>>()?;
-    let head = Ty::Con(con, (0..vars.len() as u32).map(Ty::Gen).collect());
     paterson(g, &context, &head, &form.pos)?;
     let inst = InstanceDef {
         proto,
@@ -303,7 +281,8 @@ pub fn register_instance(g: &mut Globals, inst: InstanceDef) -> TResult<usize> {
         let msg = format!(
             "overlapping instances: {} for {} is already implemented at {}",
             g.proto(inst.proto).name,
-            crate::types::display::Printer::new(g).ty(&strip(&inst.head, &inst.var_names)),
+            crate::types::display::Printer::with_names(g, &[], &inst.var_names)
+                .ty(&strip(&inst.head, &inst.var_names)),
             other.pos
         );
         return Err(TypeError::other(&inst.pos, msg));
@@ -321,8 +300,8 @@ fn strip(head: &Ty, names: &[String]) -> Ty {
 }
 
 /// The constraints of a `:where` clause: `(P T..)` or `(Send T)`, over
-/// the variables `vars` only.
-pub fn where_preds(g: &Globals, m: ModuleId, cs: &Form, vars: &[String]) -> TResult<Vec<Pred>> {
+/// the head's variables only.
+fn where_preds(g: &Globals, m: ModuleId, cs: &Form, env: &mut HeadEnv<'_>) -> TResult<Vec<Pred>> {
     let Some(list) = cs.as_list() else {
         return Err(TypeError::resolve(
             &cs.pos,
@@ -338,14 +317,9 @@ pub fn where_preds(g: &Globals, m: ModuleId, cs: &Form, vars: &[String]) -> TRes
                 "a constraint is (P T..) or (Send T)",
             ));
         };
-        let mut env = ParamEnv {
-            params: vars,
-            colours: &[],
-            owner: "the impl head",
-        };
         let tys = items[1..]
             .iter()
-            .map(|t| ann_to_ty(&type_ann(g, m, t, false)?, &mut env, &t.pos))
+            .map(|t| ann_to_ty(&type_ann(g, m, t, false)?, env, &t.pos))
             .collect::<TResult<Vec<_>>>()?;
         out.push(pred_of(g, m, pname, tys, &c.pos)?);
     }

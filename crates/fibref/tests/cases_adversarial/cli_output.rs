@@ -149,10 +149,10 @@ fn the_real_cases_print_a_pass_row_each_and_no_pending_line() {
         .lines()
         .filter(|l| l.trim_end().ends_with(" pass"))
         .count();
-    assert_eq!(pass_rows, 152, "{out}");
+    assert_eq!(pass_rows, 159, "{out}");
     assert!(!out.contains("PENDING"), "{out}");
     assert!(
-        out.contains("152 cases: 152 pass, 0 fail, 0 pending, 0 header error"),
+        out.contains("159 cases: 159 pass, 0 fail, 0 pending, 0 header error"),
         "{out}"
     );
 }

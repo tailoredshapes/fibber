@@ -140,6 +140,10 @@ pub enum Colour {
     Var(CvId),
     /// The `i`th quantified colour variable of a scheme.
     Gen(u32),
+    /// A rigid colour: the colour variable of an `impl` head that is
+    /// the `i`th variable of the instance (§1.3), a constant of the
+    /// lattice with `send ⊑ k ⊑ local` in the method bodies.
+    Rigid(u32),
 }
 
 /// A type (§1).

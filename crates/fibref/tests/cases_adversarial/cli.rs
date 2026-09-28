@@ -179,8 +179,12 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("154-float-comparisons-are-ieee-not-ord-defaults.fib"),
         "{out}"
     );
-    assert!(out.contains("152 cases:"), "{out}");
-    assert!(out.contains("152 pass, 0 fail, 0 pending"), "{out}");
+    assert!(
+        out.contains("161-rigid-impl-stores-send-closure-at-both-colours.fib"),
+        "{out}"
+    );
+    assert!(out.contains("159 cases:"), "{out}");
+    assert!(out.contains("159 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 

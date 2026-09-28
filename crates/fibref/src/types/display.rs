@@ -87,16 +87,32 @@ impl<'a> Printer<'a> {
             Ty::Fn(k, ps, r) => {
                 out.push_str("(fn ");
                 match k {
-                    Colour::Send => out.push_str(":send "),
-                    Colour::Local => out.push_str(":local "),
-                    Colour::Gen(i) => out.push_str(&format!("ς{i} ")),
                     Colour::Var(_) => {}
+                    k => {
+                        out.push_str(&self.colour(*k));
+                        out.push(' ');
+                    }
                 }
                 self.write_list(ps, out);
                 out.push(' ');
                 self.write(r, out);
                 out.push(')');
             }
+        }
+    }
+
+    /// A colour as written: `:send`, `:local`, `ς0` for a quantified
+    /// one, a rigid colour by its name (as `Rigid(i)` is), `_` unsolved.
+    pub fn colour(&self, k: Colour) -> String {
+        match k {
+            Colour::Send => ":send".to_string(),
+            Colour::Local => ":local".to_string(),
+            Colour::Gen(i) => format!("ς{i}"),
+            Colour::Var(_) => "_".to_string(),
+            Colour::Rigid(i) => match self.rigid_names.get(i as usize) {
+                Some(n) => n.clone(),
+                None => format!("κ{i}"),
+            },
         }
     }
 
@@ -169,12 +185,7 @@ impl<'a> Printer<'a> {
         for (i, a) in args.iter().enumerate() {
             out.push(' ');
             match (def.is_colour(i), a) {
-                (true, Ty::Fn(k, _, _)) => out.push_str(&match k {
-                    Colour::Send => ":send".to_string(),
-                    Colour::Local => ":local".to_string(),
-                    Colour::Gen(i) => format!("ς{i}"),
-                    Colour::Var(_) => "_".to_string(),
-                }),
+                (true, Ty::Fn(k, _, _)) => out.push_str(&self.colour(*k)),
                 _ => self.write(a, out),
             }
         }

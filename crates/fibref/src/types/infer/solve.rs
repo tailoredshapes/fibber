@@ -144,6 +144,9 @@ impl Cx<'_> {
         };
         let g = self.g;
         let inst = &g.instances[index];
+        if !self.covers(&inst.head, t1) {
+            return Err(self.no_instance(p, t1, &d.pos));
+        }
         let tys: Vec<Ty> = inst.var_names.iter().map(|_| self.st.fresh()).collect();
         let head = inst.head.subst_gen(&tys, &[]);
         let dets: Vec<Ty> = inst.dets.iter().map(|t| t.subst_gen(&tys, &[])).collect();
@@ -162,6 +165,22 @@ impl Cx<'_> {
             .map(|q| self.pred_deferred(q, d))
             .collect();
         Ok(Step::Done(new))
+    }
+
+    /// Whether an instance head covers `t`'s colour arguments (§1.3): a
+    /// colour the head gives is covered only by itself, where `t` has a
+    /// constant colour (`:send`, `:local`, a rigid one) there; a colour
+    /// variable of the unit is left to unification.
+    fn covers(&mut self, head: &Ty, t: &Ty) -> bool {
+        let Ty::Con(_, args) = t else { return true };
+        let fixed = crate::types::lower::fixed_colours(self.g, head);
+        fixed.iter().zip(args).all(|(k, a)| {
+            let k2 = match self.st.resolve(a) {
+                Ty::Fn(c @ (Colour::Send | Colour::Local | Colour::Rigid(_)), _, _) => Some(c),
+                _ => None,
+            };
+            matches!((k, k2), (None, _) | (_, None)) || k == &k2
+        })
     }
 
     /// A predicate as a deferred constraint arising from `d`.
