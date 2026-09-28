@@ -91,7 +91,10 @@ impl<'p> Interp<'p> {
             "cell" => self.store_new(Kind::Cell, arg(0)?, placement),
             "atom" => self.store_new(Kind::Atom, arg(0)?, placement),
             "set!" => self.set_cell(arg(0)?, arg(1)?),
-            "reset!" => self.set_cell(arg(0)?, arg(1)?),
+            "reset!" => {
+                self.tick()?;
+                self.set_cell(arg(0)?, arg(1)?)
+            }
             "swap!" => self.swap(arg(0)?, arg(1)?, pos),
             "weak" => self.weak(arg(0)?),
             "spawn" => self.spawn(arg(0)?, pos),

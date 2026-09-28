@@ -73,6 +73,8 @@ pub struct TaskData {
     pub body: Option<AsyncBody>,
     /// Its state.
     pub state: TaskState,
+    /// The thread driving it (running its body), while `Running`.
+    pub driver: super::sched::Tid,
     /// The atom that holds its result once done.
     pub result: ObjId,
 }

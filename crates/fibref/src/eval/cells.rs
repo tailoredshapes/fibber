@@ -1,8 +1,9 @@
 //! Cells, atoms and weak references (types §6.7, §8.6, §8.7): `@`,
-//! `set!`, `swap!`, `weak`. Atoms need no lock here: the deterministic
-//! executor never runs two threads at once (see `task`), so reading
-//! and retaining is one step; `swap!`'s compare still fails when `f`
-//! itself changed the atom.
+//! `set!`, `swap!`, `weak`. Atoms need no lock here: the executor runs
+//! one thread at a time and switches only at scheduling points (see
+//! `sched`), so reading and retaining is one step, and so is `swap!`'s
+//! compare and store; its compare fails when `f` changed the atom, or
+//! another thread did while `f` ran.
 
 use crate::heap::Kind;
 use crate::syntax::Pos;
@@ -32,9 +33,13 @@ impl<'p> Interp<'p> {
         self.deref_val(&c)
     }
 
-    /// `@c` on a value.
+    /// `@c` on a value; on an atom or a weak reference, a scheduling
+    /// point first.
     pub fn deref_val(&mut self, c: &Val) -> R<Val> {
         let id = c.expect_obj("the operand of @")?;
+        if matches!(self.objs.get(&self.heap, id)?, Obj::Atom(_) | Obj::Weak(_)) {
+            self.tick()?;
+        }
         if let Obj::Weak(target) = self.objs.get(&self.heap, id)? {
             let target = *target;
             self.heap.read(id, 0)?;
@@ -64,13 +69,16 @@ impl<'p> Interp<'p> {
     /// result is stored (share-marked if the atom is shared, which the
     /// heap does) and returned with the count the call gave it, and the
     /// atom's count on `old` and the snapshot are released. If `f`
-    /// changed the atom (itself, or through a thread it ran to
-    /// completion: the deterministic executor runs no other thread
-    /// while `f` runs unless `f` makes it), the snapshot and the result
-    /// are released and `f` runs again on the new content.
+    /// changed the atom (itself, through a thread it waited for, or
+    /// another thread that ran at a scheduling point inside `f`), the
+    /// snapshot and the result
+    /// are released and `f` runs again on the new content. Each attempt
+    /// begins with a scheduling point; none falls between the compare
+    /// and the store.
     pub fn swap(&mut self, a: &Val, f: &Val, pos: &Pos) -> R<Val> {
         let atom = a.expect_obj("the atom of swap!")?;
         loop {
+            self.tick()?;
             let old = self.slot(atom)?;
             self.retain(&old)?;
             self.retain(&old)?;

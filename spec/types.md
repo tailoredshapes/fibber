@@ -3059,9 +3059,12 @@ documented (lir-core also parses a `{ ptr, ptr }` field type, which
   nor when `f` itself changes the atom on every run (directly, or
   through a thread it waits for), as in Clojure; no back-off, fairness
   or retry limit is specified, and none may change the result of a
-  `swap!` that does finish. The interpreter's executor is
-  deterministic, so its `swap!` retries only when `f` changed the atom
-  (case 81).
+  `swap!` that does finish. The reference interpreter runs one thread
+  at a time and switches only at scheduling points (§8.8, "The
+  reference interpreter's schedule"), none of them between the compare
+  and the store; its `swap!` retries when `f` changed the atom (case
+  81) or when another thread did at a scheduling point inside `f`
+  (case 168).
 - `(reset! a v)`: `consume v`; `fib.share v` if `SHARED`; lock; `old =
   load`; `store v`; unlock; `fib.release old`.
 
@@ -3204,6 +3207,84 @@ complete a task — a handle, the run queue, a spawned thread, a
 registered waker — holds a count on it; nothing touches a task it does
 not hold, and nothing resumes a task it has not claimed. The
 interpreter may run tasks as coroutines; frees must match.
+
+**The reference interpreter's schedule.** This is `fibref`'s choice,
+not a language rule: a program may assume no schedule beyond the
+fairness every executor gives (a thread that can run eventually does),
+and a program whose result depends on the interleaving has as many
+correct results as it has interleavings. `fibref` runs one interleaving,
+the same on every run, and it is fair, so that a program every fair
+execution finishes (a spin-wait on an atom another thread sets, a token
+handed back and forth through atoms, cases 166 to 168) also finishes in
+`fibref`:
+
+- Every spawned thread runs on a stack of its own, but only one thread
+  runs at a time. The others are *ready*, in a first-in first-out
+  queue, or *blocked* on a task or, for `main`'s thread, on every
+  spawned thread having finished.
+- A thread switches only at a **scheduling point**: an atom read (`@a`,
+  and the upgrade of a weak reference, `@w`), each attempt of a `swap!`
+  (before its snapshot; never between its compare and its store), a
+  `reset!`, `spawn`, `join`, `await` and `block-on`, the back edge of a
+  `loop` (each `recur`) and each tail call (§6.10). Every unbounded
+  computation loops through `recur` or a tail call (non-tail recursion
+  ends at the stack budget), so a thread passes a scheduling point
+  within a bounded number of steps; and every spin-wait on another
+  thread reads an atom, a weak reference or a task on each turn round.
+- A thread given the processor has a **quantum** of 1000 scheduling
+  points. When it has passed them all and another thread is ready, it
+  goes to the back of the ready queue and the thread at the front runs;
+  if none is ready, it goes on with a new quantum.
+- `spawn` starts the new thread at once, with a full quantum; the
+  spawning thread goes to the back of the ready queue. So a thread that
+  finishes within a quantum runs from start to finish before its
+  spawner continues, as it did under the earlier run-to-completion
+  executor.
+- `join` (`await`, `block-on`) of a task that is done returns its
+  result; of an `async` task nobody has started, the joining thread
+  drives it on its own stack (§8.8 above: it claims the driver); of a
+  task another thread runs or drives, the joiner blocks until the task
+  completes, and is then made ready, in the order the joiners blocked.
+  A thread that joins a task it is itself driving, further down its own
+  stack, is in a deadlock that no schedule avoids: reported as an
+  unsupported run (`deadlock: a task waits for a task that its own
+  thread is driving`), never hung on.
+- `main` returning blocks `main`'s thread until every spawned thread has
+  finished (§6.8). If every thread is blocked, the run stops with
+  `deadlock: every thread waits for a task that no running thread will
+  complete`.
+- The first trap (or run error) of any thread stops the run: every
+  other thread unwinds from the scheduling point where it waits, without
+  running further (one not yet started never starts), the trap is the
+  program's, and the audit is the one of a trap (§2.11), on the heap as
+  the trap left it.
+
+**Fairness guaranteed.** A running thread keeps the processor for at
+most one quantum while another thread is ready, and passes a scheduling
+point within a bounded number of steps; a thread it spawns runs at once
+and goes by the same rule. So a ready thread waits at most for one turn
+of each thread ahead of it in the queue and of each thread started
+meanwhile, and a blocked thread is ready as soon as what it waits for
+completes. A run that starts finitely many threads (every terminating
+program: `main` waits for all of them) therefore gives every ready
+thread the processor again and again: a thread that waits by spinning,
+reading an atom until another thread changes it, lets every other
+thread run, and a program that terminates under every fair schedule
+terminates in `fibref`. Not guaranteed: progress of a `swap!` under
+contention, which the language does not promise either (§8.6), and
+anything about programs that start threads without end.
+
+What depends on this choice: which of several correct results a racing
+program gives, which thread's trap comes first when two threads trap,
+and which thread frees a shared object whose last two counts two
+threads hold. None of the cases depends on it: each case that runs
+threads has one result under every fair schedule. `fibgen` generates
+threads whose results do not depend on the interleaving (spawned code
+reads no atoms and writes one only for a spin-wait that waits for the
+write; code run by `plet` and `pmap` only makes commutative `swap!`
+updates), and its model runs a spawned thread at its spawn, the
+schedule this one gives a thread that finishes within its first
+quantum.
 
 ### 8.9 Calls, returns, tail calls
 

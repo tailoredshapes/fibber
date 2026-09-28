@@ -1,0 +1,30 @@
+;; spec:   §7 (types §8.8)
+;; expect: accept
+;; result: 349525
+;; audit:  clean
+;; Two threads hand a token back and forth through an atom, ten times
+;; each: a player spins until the token is its own, appends its number
+;; to a log (as a bit: log*2 + me) and passes the token on. main spins,
+;; without joining, until both have said they are done, then reads the
+;; log. The turns strictly alternate, starting with player 0, so every
+;; fair execution returns the same value, 0b01010101010101010101 =
+;; 349525. Each player must be suspended in the middle of its loop, in
+;; every round, for the other to take its turn: an executor that runs a
+;; thread until it finishes or joins cannot run this at all.
+(defun player (turn: (Atom i64) log: (Atom i64) done: (Atom i64) me: i64) -> i64
+  (loop ((i 0))
+    (if (= i 10)
+        (do (swap! done (fn (n) (+ n 1))) i)
+        (if (= @turn me)
+            (do (swap! log (fn (x) (+ (* x 2) me)))
+                (reset! turn (- 1 me))
+                (recur (+ i 1)))
+            (recur i)))))
+
+(defun main () -> i64
+  (let ((turn (atom 0))
+        (log (atom 0))
+        (done (atom 0)))
+    (do (spawn (fn () (player turn log done 1)))
+        (spawn (fn () (player turn log done 0)))
+        (loop () (if (< @done 2) (recur) @log)))))

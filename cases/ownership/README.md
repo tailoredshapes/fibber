@@ -161,3 +161,17 @@ million-deep self recursion that forwards the parameter, with a closure
 over it called before the call rather than passed to it, still a tail
 call (164), and the capturing closure at a call not in tail position,
 unchanged by the decision (165, 21).
+
+Cases 166 to 168 close the known gap of M2: a spin-wait on an atom
+that another thread sets hung under the earlier executor, which ran a
+spawned thread to completion before its spawner continued. The
+reference interpreter's executor is now fair and still deterministic
+(types §8.8, "The reference interpreter's schedule": threads switch at
+scheduling points, round robin with a quantum). All accept with a
+clean audit, and each has one result under every fair schedule: a
+spawned thread spinning until main sets the atom it waits on (166, 7);
+two threads handing a token back and forth through an atom ten times
+each while main spins until both are done (167, 349525); two threads
+each adding 1 twenty times with a `swap!` whose `f` outlasts a quantum,
+so that under this schedule the other thread's update lands while `f`
+runs and the compare fails and retries (168, 40).

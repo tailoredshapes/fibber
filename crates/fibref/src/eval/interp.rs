@@ -34,7 +34,7 @@ pub const MACRO_STACK_BUDGET: usize = 64 * 1024 * 1024;
 
 /// The address of a local of the caller: where the stack is now.
 #[inline(never)]
-fn stack_here() -> usize {
+pub fn stack_here() -> usize {
     let marker = 0u8;
     std::hint::black_box(&marker) as *const u8 as usize
 }
@@ -132,6 +132,8 @@ pub struct Interp<'p> {
     /// The weak box of each object that has one (§8.7: the first `weak`
     /// of an object allocates its box, later ones find it).
     pub weak_boxes: FxMap<ObjId, ObjId>,
+    /// The executor's scheduler (`sched`, `threads`).
+    pub sched: super::sched::Sched<'p>,
 }
 
 impl<'p> Interp<'p> {
@@ -159,6 +161,7 @@ impl<'p> Interp<'p> {
             input_forms: FxMap::default(),
             recording_inputs: false,
             weak_boxes: FxMap::default(),
+            sched: super::sched::Sched::default(),
         }
     }
 

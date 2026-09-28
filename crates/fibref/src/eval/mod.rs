@@ -19,7 +19,8 @@
 //!   constant Rust stack, §6.10), closures and dispatch.
 //! - [`native`], [`cells`], [`arrays`], [`strings`], [`arith`],
 //!   [`unsafe_ops`], [`raw`]: the primitives.
-//! - [`task`]: threads and tasks on a deterministic executor.
+//! - [`task`]: threads and tasks on a deterministic, fair executor;
+//!   [`sched`]: its policy; [`threads`]: switching between threads.
 //! - [`forms`], [`vecs`]: `Form` values and the prelude's `Vec`, built
 //!   and read natively; [`macros`]: user macros at expansion time.
 //! - [`pipeline`]: the whole run and [`Interpreter`], the case
@@ -45,8 +46,10 @@ pub mod pattern;
 pub mod pipeline;
 pub mod plan;
 pub mod raw;
+pub mod sched;
 pub mod strings;
 pub mod task;
+pub mod threads;
 pub mod unsafe_ops;
 pub mod value;
 pub mod vec_view;

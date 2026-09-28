@@ -9,6 +9,7 @@ mod objects;
 mod options;
 mod patterns;
 mod stack;
+mod threads;
 mod values;
 
 use crate::cases::{Evaluator, Outcome, Value};

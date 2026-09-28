@@ -228,7 +228,8 @@ impl<'p> Interp<'p> {
         })
     }
 
-    /// Runs a call and every tail call it makes, in constant Rust stack.
+    /// Runs a call and every tail call it makes, in constant Rust stack;
+    /// each tail call is a scheduling point (`sched`).
     pub fn invoke(&mut self, mut jump: Jump) -> R<Val> {
         loop {
             let pos = jump.pos.clone();
@@ -243,7 +244,10 @@ impl<'p> Interp<'p> {
             };
             match flow.map_err(|e| e.at(&pos))? {
                 Flow::Val(v) => return Ok(v),
-                Flow::Tail(next) => jump = *next,
+                Flow::Tail(next) => {
+                    jump = *next;
+                    self.tick()?;
+                }
                 Flow::Recur(_) => return Err(RunError::internal("recur outside its loop")),
             }
         }

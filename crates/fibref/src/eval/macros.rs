@@ -118,15 +118,26 @@ fn run_macro(
     args: Vec<Form>,
     ctx: &ExpandCtx,
 ) -> Result<Form, MacroRunError> {
-    let mut it = Interp::new(&c.typed, &c.owned);
-    it.ctx = Some(ctx);
-    it.stack_budget = super::interp::MACRO_STACK_BUDGET;
-    let form = call_macro(&mut it, m, args, ctx.call_pos());
-    if let Some(e) = it.expand_error.take() {
-        return Err(MacroRunError::Expand(e));
-    }
-    let form = form?;
-    let report = it.finish();
+    super::pipeline::with_threads(&c.typed, &c.owned, Some(ctx), |it| {
+        it.stack_budget = super::interp::MACRO_STACK_BUDGET;
+        let form = call_macro(it, m, args, ctx.call_pos());
+        if let Err(e) = &form {
+            it.sched.stop(e.clone());
+        }
+        it.drain();
+        if let Some(e) = it.expand_error.take() {
+            return Err(MacroRunError::Expand(e));
+        }
+        match it.sched.abort.clone() {
+            Some(e) => Err(e.into()),
+            None => Ok((form?, it.finish())),
+        }
+    })
+    .and_then(|(form, report)| audited(form, report))
+}
+
+/// A macro's result, if the audit of its run lets it stand.
+fn audited(form: Form, report: crate::heap::AuditReport) -> Result<Form, MacroRunError> {
     if !macro_audit_passes(&report) {
         let s = summary(&report);
         return Err(MacroRunError::Run(format!(

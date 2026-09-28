@@ -187,8 +187,12 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("165-captured-inout-at-non-tail-call-unchanged.fib"),
         "{out}"
     );
-    assert!(out.contains("163 cases:"), "{out}");
-    assert!(out.contains("163 pass, 0 fail, 0 pending"), "{out}");
+    assert!(
+        out.contains("168-swap-contention-between-threads.fib"),
+        "{out}"
+    );
+    assert!(out.contains("166 cases:"), "{out}");
+    assert!(out.contains("166 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 

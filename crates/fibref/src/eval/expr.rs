@@ -170,6 +170,7 @@ impl<'p> Interp<'p> {
                     for ((b, _), v) in vs.iter().zip(vals) {
                         self.bind(*b, v)?;
                     }
+                    self.tick()?;
                 }
                 other => return Ok(other),
             }

@@ -16,7 +16,10 @@ use super::call::{Jump, Target};
 use super::error::{RunError, RunErrorKind, R};
 use super::interp::Interp;
 use super::macros::MacroEvaluator;
+use super::threads::CloseOnDrop;
 use super::value::Val;
+use crate::own::program::OwnedProgram;
+use crate::types::TypedProgram;
 
 /// The stack the evaluator runs on. Evaluation stops with a depth
 /// error when it has used [`STACK_BUDGET`](super::STACK_BUDGET) of it
@@ -116,15 +119,51 @@ fn check(source: &str, file: &str) -> Result<Checked, Outcome> {
 /// Runs on the calling thread, which must have [`STACK_BYTES`] of stack
 /// ([`run_source`] makes one).
 pub fn run_checked(c: &Checked) -> (R<i64>, AuditReport) {
-    let mut it = Interp::new(&c.typed, &c.owned);
-    let result = it.run_main();
-    (result, it.finish())
+    with_threads(&c.typed, &c.owned, None, |it| {
+        let result = it.run_main();
+        (result, it.finish())
+    })
+}
+
+/// Runs `f` on a new interpreter over `p` and `o` (in the expansion
+/// context `ctx`, for a macro) that can start threads (`threads`):
+/// their OS threads are scoped to this call, and every thread the
+/// program started has finished when it returns.
+pub fn with_threads<T>(
+    p: &TypedProgram,
+    o: &OwnedProgram,
+    ctx: Option<&ExpandCtx>,
+    f: impl for<'s> FnOnce(&mut Interp<'s>) -> T,
+) -> T {
+    std::thread::scope(|s| {
+        let mut it = Interp::new(p, o);
+        it.ctx = ctx;
+        it.sched.spawner = Some(s);
+        let _close = CloseOnDrop(std::sync::Arc::clone(&it.sched.turn));
+        let r = f(&mut it);
+        it.drain();
+        r
+    })
 }
 
 impl<'p> Interp<'p> {
     /// The `def`s in checking order (syntax §3.19: each value made
-    /// immortal), then `main`.
+    /// immortal), then `main`; then, `main` having returned, every
+    /// thread still running is waited for (§6.8). The first error or
+    /// trap of any thread stops the run.
     pub fn run_main(&mut self) -> R<i64> {
+        let r = self.run_main_thread();
+        if let Err(e) = &r {
+            self.sched.stop(e.clone());
+        }
+        self.drain();
+        match self.sched.abort.clone() {
+            Some(e) => Err(e),
+            None => r,
+        }
+    }
+
+    fn run_main_thread(&mut self) -> R<i64> {
         self.eval_defs()?;
         let main = self
             .p
@@ -165,8 +204,9 @@ impl<'p> Interp<'p> {
         })
     }
 
-    /// Ends the run: the heap's audit.
+    /// Ends the run, once every thread has finished: the heap's audit.
     pub fn finish(&mut self) -> AuditReport {
+        self.drain();
         std::mem::take(&mut self.heap).finish()
     }
 }

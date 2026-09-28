@@ -1,0 +1,22 @@
+;; spec:   §7 (types §2.10, §8.6, §8.8)
+;; expect: accept
+;; result: 40
+;; audit:  clean
+;; Two threads each add 1 to one atom twenty times with swap!, whose f
+;; spins a while before returning x + 1. Whatever the interleaving,
+;; every swap! that finishes stored f's result for the value the atom
+;; held, so none of the forty increments is lost and main reads 40.
+;; Under the reference interpreter's schedule (types §8.8) f's loop
+;; outlasts a quantum, so the other thread's swap! lands while f runs:
+;; the compare fails and f runs again on the new value. A swap! that
+;; stored f's result without the compare would lose increments.
+(defun bump (a: (Atom i64) k: i64) -> i64
+  (dotimes (i k)
+    (swap! a (fn (x) (loop ((j 0)) (if (< j 1500) (recur (+ j 1)) (+ x 1))))))
+  k)
+
+(defun main () -> i64
+  (let ((a (atom 0))
+        (t (spawn (fn () (bump a 20))))
+        (u (spawn (fn () (bump a 20)))))
+    (do (join t) (join u) @a)))

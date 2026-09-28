@@ -1,18 +1,20 @@
 //! Threads and tasks (syntax §3.12, §3.14; types §6.8, §6.9, §8.8),
-//! run by a deterministic executor:
+//! run by a deterministic, fair executor (types §8.8, "The reference
+//! interpreter's schedule"; the switching is in `threads`, the policy
+//! in `sched`):
 //!
-//! - `(spawn f)` runs `f` to completion on the spot, as a thread that
-//!   the scheduler ran before the spawning thread continued;
+//! - `(spawn f)` starts a thread that runs `f` on a stack of its own;
+//!   it runs at once, and the spawning thread goes to the back of the
+//!   ready queue;
 //! - an `async` task runs when it is first joined or awaited, driven by
 //!   whoever does so, from start to finish: an `await` inside it drives
-//!   the awaited task the same way, nested.
+//!   the awaited task the same way, nested;
+//! - `join` (and `await`, `block-on`) of a task another thread is
+//!   running blocks until it is done; of a task the joining thread is
+//!   itself driving, further down its stack, is a deadlock, reported.
 //!
-//! Each is one interleaving of the threads the program starts, so a
-//! program whose result or audit it does not reach is a program some
-//! execution of which fails. What it cannot run is a program that
-//! needs two threads to make progress at once (one waiting for another
-//! that has not run yet): that is reported, never hung on (see
-//! [`Interp::join`]).
+//! Each run is one interleaving of the threads the program starts, the
+//! same on every run.
 //!
 //! Counts follow §6.8 and §8.8: a spawned task is created with count 2,
 //! the thread's count released after the result is stored; an `async`
@@ -26,11 +28,11 @@ use crate::syntax::Pos;
 use crate::types::ast::{Expr, ExprKind};
 
 use super::alloc::Placement;
-use super::call::Jump;
 use super::error::{RunError, R};
 use super::expr::Flow;
 use super::interp::{Frame, Interp};
 use super::object::{AsyncBody, Obj, TaskData, TaskState};
+use super::sched::Wait;
 use super::value::Val;
 
 impl<'p> Interp<'p> {
@@ -53,34 +55,28 @@ impl<'p> Interp<'p> {
             .expect_obj("a result atom")
     }
 
-    /// `(spawn f)`: `f` arrives consumed; it is share-marked and run now.
+    /// `(spawn f)`: `f` arrives consumed; it is share-marked and handed
+    /// to a new thread, which holds the task's second count.
     pub fn spawn(&mut self, f: &Val, pos: &Pos) -> R<Val> {
         let fid = f.expect_obj("the thunk of spawn")?;
         self.heap.mark_shared(fid)?;
         let result = self.result_atom()?;
+        let tid = self.sched.fresh();
         let data = TaskData {
             body: None,
             state: TaskState::Running,
+            driver: tid,
             result,
         };
         let task = self.new_task(Vec::new(), data)?;
         self.heap.retain(task)?;
-        let target = self.value_target(f, &[])?;
-        let jump = Jump {
-            target,
-            args: Vec::new(),
-            pos: pos.clone(),
-            placement: Placement::Heap,
-        };
-        let v = self.invoke(jump)?;
-        self.complete(task, v)?;
-        self.heap.release(task)?;
+        self.start_thread(tid, f.clone(), task, pos.clone())?;
         Ok(Val::Obj(task))
     }
 
     /// Stores a finished task's result: share-marked, moved into the
-    /// result atom; the task is done.
-    fn complete(&mut self, task: ObjId, v: Val) -> R<()> {
+    /// result atom; the task is done and its joiners ready.
+    pub fn complete(&mut self, task: ObjId, v: Val) -> R<()> {
         if let Some(id) = v.obj() {
             self.heap.mark_shared(id)?;
         }
@@ -88,7 +84,13 @@ impl<'p> Interp<'p> {
         self.write_slot(atom, v.clone())?;
         self.release(&v)?;
         self.task_mut(task)?.state = TaskState::Done;
+        self.sched.wake(Wait::Task(task));
         Ok(())
+    }
+
+    /// Where the task `id` is in its life.
+    pub fn task_state(&self, id: ObjId) -> R<TaskState> {
+        Ok(self.task(id)?.state)
     }
 
     fn task(&self, id: ObjId) -> R<&TaskData> {
@@ -105,17 +107,24 @@ impl<'p> Interp<'p> {
         }
     }
 
-    /// `(join t)` and the result of `(await t)`: drives `t` if nobody
-    /// has, then its result, retained for the caller.
+    /// `(join t)` and the result of `(await t)`, a scheduling point:
+    /// drives `t` if nobody has, or waits for the thread that runs it,
+    /// then its result, retained for the caller.
     pub fn join(&mut self, t: &Val) -> R<Val> {
         let id = t.expect_obj("a task")?;
-        match self.task(id)?.state {
+        self.tick()?;
+        let (state, driver) = {
+            let d = self.task(id)?;
+            (d.state, d.driver)
+        };
+        match state {
             TaskState::Pending => self.drive(id)?,
-            TaskState::Running => {
+            TaskState::Running if driver == self.sched.current => {
                 return Err(RunError::unsupported(
-                    "a task waits for a task that is still running below it; the deterministic executor runs one thread at a time and cannot wait here",
+                    "deadlock: a task waits for a task that its own thread is driving",
                 ))
             }
+            TaskState::Running => self.wait_task(id)?,
             TaskState::Done => {}
         }
         let atom = self.task(id)?.result;
@@ -135,7 +144,10 @@ impl<'p> Interp<'p> {
             .body
             .clone()
             .ok_or_else(|| RunError::internal("a pending task with no body"))?;
-        self.task_mut(id)?.state = TaskState::Running;
+        let me = self.sched.current;
+        let t = self.task_mut(id)?;
+        t.state = TaskState::Running;
+        t.driver = me;
         let e = self.literal_expr(lit)?;
         let ExprKind::Async(body, _) = &e.kind else {
             return Err(RunError::internal("a task whose literal is not async"));
@@ -172,6 +184,7 @@ impl<'p> Interp<'p> {
                 caps,
             }),
             state: TaskState::Pending,
+            driver: 0,
             result,
         };
         Ok(Val::Obj(self.new_task(fields, data)?))
