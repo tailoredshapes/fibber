@@ -1,0 +1,117 @@
+;; expect: accept
+;; out: count 2
+;; out: count 1
+;; out: shared count 2
+;; out: freed 2
+;; out: immortal 0 2
+;; types.md §8.2: the count header, fib.retain/fib.release with the
+;; flags word read by atomic-load monotonic and SHARED set by atomicrmw
+;; or; the type table built by the module initialiser (function
+;; addresses stored into a malloc'd block) and a drop called through it.
+(declare malloc ptr (i64))
+(declare free void (ptr))
+(declare printf i32 (ptr ...))
+(defstruct fib.hdr (i64 i32 i32))
+(defstruct fib.typerec (ptr ptr ptr i64))
+(defstruct P.obj (i64 i32 i32 i64 ptr))
+(global fib.types ptr (ptr null))
+(global freed i64 (i64 0))
+(define (fib.alloc ptr) ((i64 size) (i32 tid))
+  (block entry
+    (let ((p (call @malloc size)))
+      (store (i64 1) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
+      (store tid (getelementptr %struct.fib.hdr p (i32 0) (i32 1)))
+      (store (i32 0) (getelementptr %struct.fib.hdr p (i32 0) (i32 2)))
+      (ret p))))
+(define (flags i32) ((ptr p))
+  (block entry (ret (atomic-load monotonic i32 (getelementptr %struct.fib.hdr p (i32 0) (i32 2))))))
+(define (count i64) ((ptr p))
+  (block entry (ret (load i64 (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))))
+(define (fib.retain void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done check))
+  (block check
+    (let ((f (call @flags p)))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
+  (block counted
+    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
+      (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
+  (block shared
+    (atomicrmw add monotonic cp (i64 1))
+    (br done))
+  (block local
+    (store (add (load i64 cp) (i64 1)) cp)
+    (br done))
+  (block done (ret)))
+(define (fib.drop void) ((ptr p))
+  (block entry
+    (let ((tid (load i32 (getelementptr %struct.fib.hdr p (i32 0) (i32 1))))
+          (rec (getelementptr %struct.fib.typerec (load ptr @fib.types) tid (i32 0))))
+      (indirect-call (load ptr rec) (fn void (ptr)) p)
+      (call @free p)
+      (store (add (load i64 @freed) (i64 1)) @freed)
+      (ret))))
+(define (fib.release void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done check))
+  (block check
+    (let ((f (call @flags p)))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
+  (block counted
+    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
+      (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
+  (block shared
+    (let ((old (atomicrmw sub acq_rel cp (i64 1))))
+      (br (icmp eq old (i64 1)) drop done)))
+  (block local
+    (let ((c (load i64 cp)))
+      (br (icmp eq c (i64 1)) drop dec)))
+  (block dec
+    (store (sub c (i64 1)) cp)
+    (br done))
+  (block drop
+    (call @fib.drop p)
+    (br done))
+  (block done (ret)))
+(define (drop.leaf void) ((ptr p)) (block entry (ret)))
+(define (drop.P void) ((ptr p))
+  (block entry
+    (call @fib.release (load ptr (getelementptr %struct.P.obj p (i32 0) (i32 4))))
+    (ret)))
+(define (fib.init void) ()
+  (block entry
+    (let ((tbl (call @malloc (i64 64))))
+      (store @drop.leaf (getelementptr %struct.fib.typerec tbl (i32 0) (i32 0)))
+      (store @drop.P (getelementptr %struct.fib.typerec tbl (i32 1) (i32 0)))
+      (store tbl @fib.types)
+      (ret))))
+(define (share void) ((ptr p))
+  (block entry
+    (atomicrmw or monotonic (getelementptr %struct.fib.hdr p (i32 0) (i32 2)) (i32 1))
+    (ret)))
+(define (main i32) ()
+  (block entry
+    (call @fib.init)
+    (let ((leaf (call @fib.alloc (i64 16) (i32 0)))
+          (obj (call @fib.alloc (i64 40) (i32 1))))
+      (store (i64 7) (getelementptr %struct.P.obj obj (i32 0) (i32 3)))
+      (store leaf (getelementptr %struct.P.obj obj (i32 0) (i32 4)))
+      (call @fib.retain (ptr null))
+      (call @fib.retain obj)
+      (call @printf (string "count %lld\n") (call @count obj))
+      (call @fib.release obj)
+      (call @printf (string "count %lld\n") (call @count obj))
+      (call @share obj)
+      (call @share leaf)
+      (call @fib.retain obj)
+      (call @printf (string "shared count %lld\n") (call @count obj))
+      (call @fib.release obj)
+      (call @fib.release obj)
+      (call @fib.release (ptr null))
+      (call @printf (string "freed %lld\n") (load i64 @freed))
+      (let ((imm (call @fib.alloc (i64 16) (i32 0))))
+        (store (i64 0) (getelementptr %struct.fib.hdr imm (i32 0) (i32 0)))
+        (atomicrmw or monotonic (getelementptr %struct.fib.hdr imm (i32 0) (i32 2)) (i32 8))
+        (call @fib.retain imm)
+        (call @fib.release imm)
+        (call @fib.release imm)
+        (call @printf (string "immortal %lld %lld\n") (call @count imm) (load i64 @freed))
+        (ret (i32 0))))))

@@ -1,0 +1,54 @@
+;; expect: accept
+;; out: adder 12
+;; out: scale 7.5 -3
+;; out: cps 1000000
+;; ir: musttail call tailcc i64 %
+;; types.md §8.4: a closure object (header, code pointer, captures), its
+;; code taking env first, called by indirect-call with the typed
+;; function type §8.11 asks for (scalars travel at their own types), and
+;; a continuation chain of 10^6 indirect-tailcalls through closure
+;; values (proposed cases 52/53: depth 10^6 must not grow the stack).
+(declare malloc ptr (i64))
+(declare printf i32 (ptr ...))
+(defstruct fib.closure.adder (i64 i32 i32 ptr i64))
+(defstruct fib.closure.scale (i64 i32 i32 ptr double))
+(defstruct fib.closure.loop (i64 i32 i32 ptr))
+(define (adder.code i64) ((ptr env) (i64 x))
+  (block entry
+    (ret (add x (load i64 (getelementptr %struct.fib.closure.adder env (i32 0) (i32 4)))))))
+(define (scale.code double) ((ptr env) (double x) (i8 sign))
+  (block entry
+    (let ((k (load double (getelementptr %struct.fib.closure.scale env (i32 0) (i32 4))))
+          (v (fmul x k)))
+      (ret (select (icmp slt sign (i8 0)) (fneg v) v)))))
+(define tailcc (loop.code i64) ((ptr env) (i64 n) (i64 acc))
+  (block entry (br (icmp eq n (i64 0)) done more))
+  (block done (ret acc))
+  (block more
+    (let ((code (load ptr (getelementptr %struct.fib.closure.loop env (i32 0) (i32 3)))))
+      (indirect-tailcall code (fn tailcc i64 (ptr i64 i64)) env (sub n (i64 1)) (add acc (i64 1))))))
+(define (mk ptr) ((i64 size) (ptr code))
+  (block entry
+    (let ((c (call @malloc size)))
+      (store (i64 1) c)
+      (store code (getelementptr %struct.fib.closure.loop c (i32 0) (i32 3)))
+      (ret c))))
+(define tailcc (run-loop i64) ((ptr f) (i64 n))
+  (block entry
+    (indirect-tailcall (load ptr (getelementptr %struct.fib.closure.loop f (i32 0) (i32 3)))
+      (fn tailcc i64 (ptr i64 i64)) f n (i64 0))))
+(define (main i32) ()
+  (block entry
+    (let ((f (call @mk (i64 40) @adder.code))
+          (g (call @mk (i64 40) @scale.code))
+          (h (call @mk (i64 32) @loop.code)))
+      (store (i64 7) (getelementptr %struct.fib.closure.adder f (i32 0) (i32 4)))
+      (store (double 2.5) (getelementptr %struct.fib.closure.scale g (i32 0) (i32 4)))
+      (call @printf (string "adder %lld\n")
+        (indirect-call (load ptr (getelementptr %struct.fib.closure.adder f (i32 0) (i32 3))) (fn i64 (ptr i64)) f (i64 5)))
+      (let ((gc (load ptr (getelementptr %struct.fib.closure.scale g (i32 0) (i32 3)))))
+        (call @printf (string "scale %.17g %.17g\n")
+          (indirect-call gc (fn double (ptr double i8)) g (double 3.0) (i8 1))
+          (indirect-call gc (fn double (ptr double i8)) g (double 1.2) (i8 -1))))
+      (call @printf (string "cps %lld\n") (call @run-loop h (i64 1000000)))
+      (ret (i32 0)))))

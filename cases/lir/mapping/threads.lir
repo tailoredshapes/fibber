@@ -1,0 +1,62 @@
+;; expect: accept
+;; out: atomic 400000
+;; out: locked 400000
+;; out: message 42
+;; ir-not: syncscope
+;; Cross-thread atomics (types.md §8.2, §8.6, §8.8) on real threads:
+;; atomicrmw add seq_cst from four threads; a cmpxchg-acquire /
+;; atomic-store-release spinlock guarding a non-atomic counter; and a
+;; release store published to an acquire load. A single-thread fence or
+;; a relaxed lock would make the locked count come out short.
+(declare pthread_create i32 (ptr ptr ptr ptr))
+(declare pthread_join i32 (i64 ptr))
+(declare printf i32 (ptr ...))
+(global counter i64 (i64 0))
+(global plain i64 (i64 0))
+(global lock i32 (i32 0))
+(global data i64 (i64 0))
+(global flag i32 (i32 0))
+(define (acquire-lock void) ()
+  (block entry (br spin))
+  (block spin
+    (let ((r (cmpxchg weak acquire monotonic @lock (i32 0) (i32 1))))
+      (br (extractvalue r 1) done spin)))
+  (block done (ret)))
+(define (worker ptr) ((ptr arg))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (loop i2))))
+      (atomicrmw add seq_cst @counter (i64 1))
+      (call @acquire-lock)
+      (store (add (load i64 @plain) (i64 1)) @plain)
+      (atomic-store release (i32 0) @lock)
+      (let ((i2 (add i (i64 1))))
+        (br (icmp slt i2 (i64 100000)) loop done))))
+  (block done (ret (ptr null))))
+(define (publisher ptr) ((ptr arg))
+  (block entry
+    (store (i64 42) @data)
+    (atomic-store release (i32 1) @flag)
+    (ret (ptr null))))
+(define (main i32) ()
+  (block entry
+    (let ((ids (alloca i64 (i32 5))))
+      (call @pthread_create (getelementptr i64 ids (i32 0)) (ptr null) @worker (ptr null))
+      (call @pthread_create (getelementptr i64 ids (i32 1)) (ptr null) @worker (ptr null))
+      (call @pthread_create (getelementptr i64 ids (i32 2)) (ptr null) @worker (ptr null))
+      (call @pthread_create (getelementptr i64 ids (i32 3)) (ptr null) @worker (ptr null))
+      (call @pthread_create (getelementptr i64 ids (i32 4)) (ptr null) @publisher (ptr null))
+      (br wait)))
+  (block wait
+    (br (icmp eq (atomic-load acquire i32 @flag) (i32 1)) got wait))
+  (block got
+    (let ((msg (load i64 @data)))
+      (call @pthread_join (load i64 (getelementptr i64 ids (i32 0))) (ptr null))
+      (call @pthread_join (load i64 (getelementptr i64 ids (i32 1))) (ptr null))
+      (call @pthread_join (load i64 (getelementptr i64 ids (i32 2))) (ptr null))
+      (call @pthread_join (load i64 (getelementptr i64 ids (i32 3))) (ptr null))
+      (call @pthread_join (load i64 (getelementptr i64 ids (i32 4))) (ptr null))
+      (call @printf (string "atomic %lld\n") (load i64 @counter))
+      (call @printf (string "locked %lld\n") (load i64 @plain))
+      (call @printf (string "message %lld\n") msg)
+      (ret (i32 0)))))

@@ -1,0 +1,49 @@
+;; expect: accept
+;; out: scalar 77
+;; out: array 9
+;; out: field 2.5 -3
+;; out: offsets 0 8 16 24
+;; out: nested 42
+;; out: byval 5 6
+;; out: vec 3
+;; out: ptrslot 77
+;; out: dynamic 10
+(declare printf i32 (ptr ...))
+(defstruct point (i32 double i8))
+(defstruct box (i64 %struct.point))
+(define (main i32) ()
+  (block entry
+    (let ((p (alloca i64)))
+      (store (i64 77) p)
+      (call @printf (string "scalar %lld\n") (load i64 p))
+      (let ((arr (alloca i32 (i32 10))))
+        (store (i32 9) (getelementptr i32 arr (i64 7)))
+        (call @printf (string "array %d\n") (load i32 (getelementptr inbounds i32 arr (i32 7)))))
+      (let ((sp (alloca %struct.point)))
+        (store (double 2.5) (getelementptr %struct.point sp (i32 0) (i32 1)))
+        (store (i8 -3) (getelementptr inbounds %struct.point sp (i32 0) (i32 2)))
+        (call @printf (string "field %.17g %d\n") (load double (getelementptr %struct.point sp (i32 0) (i32 1)))
+          (sext i32 (load i8 (getelementptr %struct.point sp (i32 0) (i32 2)))))
+        (call @printf (string "offsets %lld %lld %lld %lld\n")
+          (sub (ptrtoint i64 (getelementptr %struct.point sp (i32 0) (i32 0))) (ptrtoint i64 sp))
+          (sub (ptrtoint i64 (getelementptr %struct.point sp (i32 0) (i32 1))) (ptrtoint i64 sp))
+          (sub (ptrtoint i64 (getelementptr %struct.point sp (i32 0) (i32 2))) (ptrtoint i64 sp))
+          (ptrtoint i64 (getelementptr %struct.point (ptr null) (i32 1)))))
+      (let ((bx (alloca %struct.box (i32 2))))
+        (store (i32 42) (getelementptr %struct.box bx (i64 1) (i32 1) (i32 0)))
+        (call @printf (string "nested %d\n") (load i32 (getelementptr %struct.box bx (i64 1) (i32 1) (i32 0)))))
+      (let ((pp (alloca { i64, i64 })))
+        (store { (i64 5) (i64 6) } pp)
+        (let ((v (load { i64, i64 } pp)))
+          (call @printf (string "byval %lld %lld\n") (extractvalue v 0) (extractvalue v 1))))
+      (let ((vp (alloca <4 x i32>)))
+        (store (<4 x i32> 0 1 2 3) vp)
+        (call @printf (string "vec %d\n") (load i32 (getelementptr i32 vp (i32 3)))))
+      (let ((slot (alloca ptr)))
+        (store p slot)
+        (call @printf (string "ptrslot %lld\n") (load i64 (load ptr slot))))
+      (let ((n (load i64 p))
+            (dyn (alloca i8 (sub n (i64 67)))))
+        (store (i8 10) (getelementptr i8 dyn (i64 9)))
+        (call @printf (string "dynamic %d\n") (sext i32 (load i8 (getelementptr i8 dyn (i64 9)))))
+        (ret (i32 0))))))

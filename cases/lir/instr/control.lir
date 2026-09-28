@@ -1,0 +1,49 @@
+;; expect: accept
+;; out: max 7 9
+;; out: sum 5050
+;; out: switch 100 200 300 -1 -1
+;; out: same-target 3
+;; out: void done
+(declare printf i32 (ptr ...))
+(define (max i32) ((i32 a) (i32 b))
+  (block entry
+    (br (icmp sgt a b) a_wins b_wins))
+  (block a_wins
+    (br done))
+  (block b_wins
+    (br done))
+  (block done
+    (ret (phi i32 (a_wins a) (b_wins b)))))
+(define (sum i64) ((i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 1)) (loop i2)))
+          (acc (phi i64 (entry (i64 0)) (loop acc2)))
+          (acc2 (add acc i))
+          (i2 (add i (i64 1))))
+      (br (icmp sle i2 n) loop exit)))
+  (block exit
+    (ret acc2)))
+(define (sw i32) ((i32 k))
+  (block entry
+    (switch k other ((i32 0) zero) ((i32 1) one) ((i32 -5) neg)))
+  (block zero (ret (i32 100)))
+  (block one (ret (i32 200)))
+  (block neg (ret (i32 300)))
+  (block other (ret (i32 -1))))
+(define (both i32) ((i1 c))
+  (block entry (br c j j))
+  (block j (ret (phi i32 (entry (i32 3))))))
+(define (v void) () (block entry (call @printf (string "void done\n")) (ret)))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "max %d %d\n") (call @max (i32 7) (i32 -3)) (call @max (i32 2) (i32 9)))
+    (call @printf (string "sum %lld\n") (call @sum (i64 100)))
+    (call @printf (string "switch %d %d %d %d %d\n") (call @sw (i32 0)) (call @sw (i32 1)) (call @sw (i32 -5)) (call @sw (i32 7)) (call @sw (i32 2)))
+    (call @printf (string "same-target %d\n") (call @both (i1 1)))
+    (call @v)
+    (br (icmp eq (i32 1) (i32 2)) never fine))
+  (block never
+    (unreachable))
+  (block fine
+    (ret (i32 0))))

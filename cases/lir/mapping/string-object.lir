@@ -1,0 +1,33 @@
+;; expect: accept
+;; out: hello
+;; out: len 5 count 0 flags 8
+;; types.md §8.3: a str object is the header (i64 i32 i32 i64) followed
+;; by the bytes and a NUL, addressed with getelementptr from the end of
+;; the header; a literal is an IMMORTAL object the module initialiser
+;; builds from a (string ..) constant and stores into a ptr global.
+(declare malloc ptr (i64))
+(declare memcpy ptr (ptr ptr i64))
+(declare puts i32 (ptr))
+(declare printf i32 (ptr ...))
+(defstruct fib.str (i64 i32 i32 i64))
+(global lit.0 ptr (ptr null))
+(define (fib.init void) ()
+  (block entry
+    (let ((s (call @malloc (add (ptrtoint i64 (getelementptr %struct.fib.str (ptr null) (i32 1))) (i64 6)))))
+      (store (i64 0) (getelementptr %struct.fib.str s (i32 0) (i32 0)))
+      (store (i32 3) (getelementptr %struct.fib.str s (i32 0) (i32 1)))
+      (store (i32 8) (getelementptr %struct.fib.str s (i32 0) (i32 2)))
+      (store (i64 5) (getelementptr %struct.fib.str s (i32 0) (i32 3)))
+      (call @memcpy (getelementptr %struct.fib.str s (i32 1)) (string "hello") (i64 6))
+      (store s @lit.0)
+      (ret))))
+(define (main i32) ()
+  (block entry
+    (call @fib.init)
+    (let ((s (load ptr @lit.0)))
+      (call @puts (getelementptr %struct.fib.str s (i32 1)))
+      (call @printf (string "len %lld count %lld flags %d\n")
+        (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3)))
+        (load i64 s)
+        (load i32 (getelementptr %struct.fib.str s (i32 0) (i32 2))))
+      (ret (i32 0)))))

@@ -1,0 +1,95 @@
+;; expect: accept
+;; out: xchg 10 add 20 sub 25 and 22 nand 6 or -3 xor -3 max -4 min 7 umax -9 umin -9 final 5
+;; out: fadd 1.5 fsub 3.5 fmax 3 fmin 10 final -1
+;; out: pxchg 1 fail 1 0 ok 1 1
+;; out: cx 5 1 6 0
+;; out: weak 7
+;; out: loads 7 7 7 7 stores 4
+;; out: st 8
+;; ir: atomicrmw nand ptr
+;; ir: atomicrmw fadd ptr
+;; ir: cmpxchg weak ptr
+;; ir: cmpxchg ptr %
+;; ir: acq_rel acquire
+;; ir: load atomic i64, ptr
+;; ir: unordered
+;; ir: syncscope("singlethread") seq_cst
+;; ir-not: fence syncscope("singlethread") acquire
+(declare printf i32 (ptr ...))
+(define (ints void) ((ptr p))
+  (block entry
+    (store (i64 10) p)
+    (call @printf (string "xchg %lld add %lld sub %lld and %lld nand %lld or %lld xor %lld max %lld min %lld umax %lld umin %lld final %lld\n")
+      (atomicrmw xchg seq_cst p (i64 20))
+      (atomicrmw add seq_cst p (i64 5))
+      (atomicrmw sub acq_rel p (i64 3))
+      (atomicrmw and release p (i64 15))
+      (atomicrmw nand acquire p (i64 3))
+      (atomicrmw or monotonic p (i64 8))
+      (atomicrmw xor seq_cst p (i64 1))
+      (atomicrmw max seq_cst p (i64 7))
+      (atomicrmw min seq_cst p (i64 -9))
+      (atomicrmw umax seq_cst p (i64 5))
+      (atomicrmw umin seq_cst p (i64 5))
+      (load i64 p))
+    (ret)))
+(define (floats void) ((ptr q))
+  (block entry
+    (store (double 1.5) q)
+    (call @printf (string "fadd %.17g fsub %.17g fmax %.17g fmin %.17g final %.17g\n")
+      (atomicrmw fadd seq_cst q (double 2.0))
+      (atomicrmw fsub seq_cst q (double 0.5))
+      (atomicrmw fmax seq_cst q (double 10.0))
+      (atomicrmw fmin seq_cst q (double -1.0))
+      (load double q))
+    (ret)))
+(define (ptrs void) ((ptr r) (ptr p))
+  (block entry
+    (store (ptr null) r)
+    (let ((old (atomicrmw xchg seq_cst r p))
+          (f (cmpxchg seq_cst r (ptr null) p))
+          (s (cmpxchg seq_cst r p (ptr null))))
+      (call @printf (string "pxchg %d fail %d %d ok %d %d\n")
+        (zext i32 (icmp eq old (ptr null)))
+        (zext i32 (icmp eq (extractvalue f 0) p)) (zext i32 (extractvalue f 1))
+        (zext i32 (extractvalue s 1)) (zext i32 (icmp eq (load ptr r) (ptr null))))
+      (ret))))
+(define (cx void) ((ptr p))
+  (block entry
+    (let ((a (cmpxchg acq_rel acquire p (i64 5) (i64 6)))
+          (b (cmpxchg monotonic p (i64 5) (i64 9))))
+      (call @printf (string "cx %lld %d %lld %d\n") (extractvalue a 0) (zext i32 (extractvalue a 1))
+        (extractvalue b 0) (zext i32 (extractvalue b 1)))
+      (br retry)))
+  (block retry
+    (let ((w (cmpxchg weak seq_cst monotonic p (i64 6) (i64 7))))
+      (br (extractvalue w 1) done retry)))
+  (block done
+    (call @printf (string "weak %lld\n") (load i64 p))
+    (ret)))
+(define (orders void) ((ptr p))
+  (block entry
+    (let ((a (atomic-load unordered i64 p))
+          (b (atomic-load monotonic i64 p))
+          (c (atomic-load acquire i64 p))
+          (d (atomic-load seq_cst i64 p)))
+      (atomic-store unordered (i64 1) p)
+      (atomic-store monotonic (i64 2) p)
+      (atomic-store release (i64 3) p)
+      (atomic-store seq_cst (i64 4) p)
+      (call @printf (string "loads %lld %lld %lld %lld stores %lld\n") a b c d (load i64 p))
+      (atomic-store singlethread seq_cst (i64 8) p)
+      (fence singlethread seq_cst)
+      (call @printf (string "st %lld\n") (atomic-load singlethread acquire i64 p))
+      (ret))))
+(define (main i32) ()
+  (block entry
+    (let ((p (alloca i64))
+          (q (alloca double))
+          (r (alloca ptr)))
+      (call @ints p)
+      (call @floats q)
+      (call @ptrs r p)
+      (call @cx p)
+      (call @orders p)
+      (ret (i32 0)))))

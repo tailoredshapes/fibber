@@ -1,0 +1,58 @@
+;; expect: accept
+;; out: show 42 107
+;; out: size 8 16
+;; out: phi 107
+;; out: select 42
+;; out: cell 42 8
+;; out: swap 107
+;; types.md §8.1, §8.5, §8.6: a (dyn P) is { ptr ptr } by value (object,
+;; vtable): built from a name and a vtable global, passed and returned by
+;; value, joined by phi and select, stored as two ptr fields of a cell
+;; and loaded back whole. The vtables are constant struct globals
+;; holding function addresses (static data, §8.11).
+(declare printf i32 (ptr ...))
+(defstruct Int.obj (i64 i32 i32 i64))
+(defstruct Pair.obj (i64 i32 i32 i64 i64))
+(defstruct fib.cell.dyn (i64 i32 i32 ptr ptr))
+(constant Show.vt.Int { ptr, ptr } { @Int.show @Int.size })
+(constant Show.vt.Pair { ptr, ptr } { @Pair.show @Pair.size })
+(define (Int.show i64) ((ptr self)) (block entry (ret (load i64 (getelementptr %struct.Int.obj self (i32 0) (i32 3))))))
+(define (Int.size i64) ((ptr self)) (block entry (ret (i64 8))))
+(define (Pair.show i64) ((ptr self))
+  (block entry
+    (ret (add (mul (load i64 (getelementptr %struct.Pair.obj self (i32 0) (i32 3))) (i64 100))
+              (load i64 (getelementptr %struct.Pair.obj self (i32 0) (i32 4)))))))
+(define (Pair.size i64) ((ptr self)) (block entry (ret (i64 16))))
+(define (method ptr) (({ ptr, ptr } d) (i64 slot))
+  (block entry (ret (load ptr (getelementptr ptr (extractvalue d 1) slot)))))
+(define (show i64) (({ ptr, ptr } d))
+  (block entry (ret (indirect-call (call @method d (i64 0)) (fn i64 (ptr)) (extractvalue d 0)))))
+(define (size i64) (({ ptr, ptr } d))
+  (block entry (ret (indirect-call (call @method d (i64 1)) (fn i64 (ptr)) (extractvalue d 0)))))
+(define (pick { ptr, ptr }) ((i1 c) ({ ptr, ptr } a) ({ ptr, ptr } b))
+  (block entry (br c l r))
+  (block l (br j))
+  (block r (br j))
+  (block j (ret (phi { ptr, ptr } (l a) (r b)))))
+(define (swap-obj { ptr, ptr }) (({ ptr, ptr } d) (ptr other))
+  (block entry (ret (insertvalue d other 0))))
+(define (main i32) ()
+  (block entry
+    (let ((i (alloca %struct.Int.obj))
+          (p (alloca %struct.Pair.obj))
+          (cell (alloca %struct.fib.cell.dyn)))
+      (store (i64 42) (getelementptr %struct.Int.obj i (i32 0) (i32 3)))
+      (store (i64 1) (getelementptr %struct.Pair.obj p (i32 0) (i32 3)))
+      (store (i64 7) (getelementptr %struct.Pair.obj p (i32 0) (i32 4)))
+      (let ((di { i @Show.vt.Int })
+            (dp { p @Show.vt.Pair }))
+        (call @printf (string "show %lld %lld\n") (call @show di) (call @show dp))
+        (call @printf (string "size %lld %lld\n") (call @size di) (call @size dp))
+        (call @printf (string "phi %lld\n") (call @show (call @pick (i1 0) di dp)))
+        (call @printf (string "select %lld\n") (call @show (select (i1 1) di dp)))
+        (store (extractvalue di 0) (getelementptr %struct.fib.cell.dyn cell (i32 0) (i32 3)))
+        (store (extractvalue di 1) (getelementptr %struct.fib.cell.dyn cell (i32 0) (i32 4)))
+        (let ((back (load { ptr, ptr } (getelementptr %struct.fib.cell.dyn cell (i32 0) (i32 3)))))
+          (call @printf (string "cell %lld %lld\n") (call @show back) (call @size back)))
+        (call @printf (string "swap %lld\n") (call @show (call @swap-obj dp p)))
+        (ret (i32 0))))))

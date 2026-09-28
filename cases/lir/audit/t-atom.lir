@@ -1,0 +1,22 @@
+;; expect: accept
+;; out: aload=10
+;; out: rmw_old=10
+;; out: rmw_max_old=15
+;; out: now=-1
+;; out: cx_old=-1 ok=1 now=3
+;; ir: fence acquire
+;; ir-not: syncscope
+;; audit: t/atom.lir without its array-* part (removed from lIR, see t-atom-array.lir); liar 7f4734c: aborted at its out-of-bounds array-get
+(declare printf i32 (ptr ...))
+(define (main i32) ()
+  (block entry
+    (let ((p (alloca i64)))
+      (atomic-store seq_cst (i64 10) p)
+      (call @printf (string "aload=%lld\n") (atomic-load seq_cst i64 p))
+      (call @printf (string "rmw_old=%lld\n") (atomicrmw add seq_cst p (i64 5)))
+      (call @printf (string "rmw_max_old=%lld\n") (atomicrmw umax monotonic p (i64 -1)))
+      (call @printf (string "now=%lld\n") (load i64 p))
+      (fence acquire)
+      (let ((r (cmpxchg seq_cst p (i64 -1) (i64 3))))
+        (call @printf (string "cx_old=%lld ok=%d now=%lld\n") (extractvalue r 0) (zext i32 (extractvalue r 1)) (load i64 p))
+        (ret (i32 0))))))

@@ -1,0 +1,43 @@
+;; expect: accept
+;; out: scalars 1 -2 3 -4 5.5 0.25 1
+;; out: pair 30
+;; out: vec 10
+;; out: indirect -2 100000 2.5 1
+;; out: indirect-pair 7 8
+;; out: varargs 7 2.5 x
+(declare printf i32 (ptr ...))
+(define (scal void) ((i1 a) (i8 b) (i16 c) (i32 d) (double e) (float f) (ptr g))
+  (block entry
+    (call @printf (string "scalars %d %d %d %d %.17g %.17g %d\n") (zext i32 a) (sext i32 b) (sext i32 c) d e (fpext double f)
+      (zext i32 (icmp ne g (ptr null))))
+    (ret)))
+(define (sum-pair i64) (({ ptr, ptr } p))
+  (block entry
+    (ret (add (load i64 (extractvalue p 0)) (load i64 (extractvalue p 1))))))
+(define (vsum i32) ((<4 x i32> v))
+  (block entry
+    (ret (add (add (extractelement v (i32 0)) (extractelement v (i32 1))) (add (extractelement v (i32 2)) (extractelement v (i32 3)))))))
+(define (mixed double) ((ptr env) (i8 b) (i64 c) (float f) (i1 z))
+  (block entry
+    (call @printf (string "indirect %d %lld %.17g %d\n") (sext i32 b) c (fpext double f) (zext i32 z))
+    (ret (fpext double f))))
+(define (swap { ptr, ptr }) (({ ptr, ptr } p))
+  (block entry (ret { (extractvalue p 1) (extractvalue p 0) })))
+(define (main i32) ()
+  (block entry
+    (let ((s (alloca i64)))
+      (call @scal (i1 1) (i8 -2) (i16 3) (i32 -4) (double 5.5) (float 0.25) s)
+      (let ((a (alloca i64)) (b (alloca i64)))
+        (store (i64 10) a)
+        (store (i64 20) b)
+        (call @printf (string "pair %lld\n") (call @sum-pair { a b }))
+        (call @printf (string "vec %d\n") (call @vsum (<4 x i32> 1 2 3 4)))
+        (let ((fp @mixed)
+              (r (indirect-call fp (fn double (ptr i8 i64 float i1)) s (i8 -2) (i64 100000) (float 2.5) (i1 1)))
+              (sp @swap)
+              (q (indirect-call sp (fn { ptr, ptr } ({ ptr, ptr })) { a b })))
+          (store (i64 7) (extractvalue q 1))
+          (store (i64 8) (extractvalue q 0))
+          (call @printf (string "indirect-pair %lld %lld\n") (load i64 a) (load i64 b))
+          (call @printf (string "varargs %d %.17g %c\n") (i32 7) (fpext double (float 2.5)) (i32 120))
+          (ret (i32 0)))))))

@@ -1,0 +1,30 @@
+;; expect: accept
+;; exit: 134
+;; out: sum 3
+;; types.md §8.12: a checked i64 + that traps: fib.trap writes the
+;; message to standard error and aborts; the block that calls it ends in
+;; unreachable. The process dies of SIGABRT (status 134) on both paths.
+(declare write i64 (i32 ptr i64))
+(declare strlen i64 (ptr))
+(declare fflush i32 (ptr))
+(declare abort void ())
+(declare printf i32 (ptr ...))
+(define (fib.trap void) ((ptr msg))
+  (block entry
+    (call @fflush (ptr null))
+    (call @write (i32 2) msg (call @strlen msg))
+    (call @abort)
+    (unreachable)))
+(define (checked-add i64) ((i64 a) (i64 b))
+  (block entry
+    (let ((r (add a b)))
+      (br (icmp slt (and (xor a r) (xor b r)) (i64 0)) bad ok)))
+  (block bad
+    (call @fib.trap (string "integer overflow in + at 64\n"))
+    (unreachable))
+  (block ok (ret r)))
+(define (main i32) ()
+  (block entry
+    (call @printf (string "sum %lld\n") (call @checked-add (i64 1) (i64 2)))
+    (call @printf (string "never %lld\n") (call @checked-add (i64 9223372036854775807) (i64 1)))
+    (ret (i32 0))))
