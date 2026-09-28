@@ -1,0 +1,22 @@
+;; spec:   §4 (types §6.10: a guard is not in tail position, the body is)
+;; expect: accept
+;; result: 1000020
+;; audit:  clean
+;; The body of a guarded clause is in tail position: count-down recurs
+;; a million times in constant stack. sum-pos passes its clause's rest
+;; to the tail call, which moves it; the rests of the clauses whose
+;; guard failed were released before the next clause was tried.
+;; 1000000 + (3 + 4 + 5 + 2 + 6) = 1000020.
+(defun count-down (n: i64 acc: i64) -> i64
+  (match n
+    (k :when (> k 0) (count-down (- k 1) (+ acc 1)))
+    (_ acc)))
+
+(defun sum-pos (v: (Vec i64) acc: i64) -> i64
+  (match v
+    ([x & r] :when (> x 0) (sum-pos r (+ acc x)))
+    ([_ & r] (sum-pos r acc))
+    ([] acc)))
+
+(defun main () -> i64
+  (+ (count-down 1000000 0) (sum-pos [3 -1 4 -1 5 -9 2 6] 0)))
