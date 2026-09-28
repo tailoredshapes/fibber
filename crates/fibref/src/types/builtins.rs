@@ -177,10 +177,10 @@ pub const BUILTIN_PROTOCOLS: &str = "
 (defprotocol Num
   (+ (self y: Self) -> Self) (- (self y: Self) -> Self) (* (self y: Self) -> Self)
   (/ (self y: Self) -> Self) (rem (self y: Self) -> Self) (neg (self) -> Self))
-(defprotocol Eq (= (self y: Self) -> bool) (!= (self y: Self) -> bool))
-(defprotocol Ord
-  (< (self y: Self) -> bool) (<= (self y: Self) -> bool)
-  (> (self y: Self) -> bool) (>= (self y: Self) -> bool))
+(defprotocol Eq (= (self y: Self) -> bool) (!= (self y: Self) -> bool (not (= self y))))
+(defprotocol Ord :requires (Eq)
+  (< (self y: Self) -> bool) (<= (self y: Self) -> bool (not (< y self)))
+  (> (self y: Self) -> bool (< y self)) (>= (self y: Self) -> bool (not (< self y))))
 (defprotocol Bits
   (bit-and (self y: Self) -> Self) (bit-or (self y: Self) -> Self)
   (bit-xor (self y: Self) -> Self) (bit-not (self) -> Self)

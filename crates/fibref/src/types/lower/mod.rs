@@ -7,11 +7,13 @@
 mod bindings;
 mod call;
 mod decl;
+mod defaults;
 mod expr;
 mod pattern;
 mod private;
 mod protos;
 mod scope;
+mod supers;
 mod top;
 mod typeform;
 
@@ -26,6 +28,7 @@ pub use decl::define_value;
 pub use private::{mark_private, marker_index, strip_private};
 pub use protos::{declare_proto, pred_of, register_instance, resolve_proto};
 pub use scope::Lowerer;
+pub use supers::{entail_closure, super_closure};
 pub use typeform::type_ann;
 
 use decl::{declare_enum, declare_struct, resolve_shape, RawType};
@@ -244,6 +247,9 @@ pub fn define(g: &mut Globals, d: Declared<'_>) -> Result<ModuleItems, Vec<TypeE
         keep(lower_def(g, m, *id, form));
         items.defs.push(*id);
     }
+    for (inst, _) in &impls {
+        keep(supers::check_impl_supers(g, *inst));
+    }
     for (inst, methods) in impls {
         keep(lower_impl(g, m, inst, methods));
         items.impls.push(inst);
@@ -274,12 +280,25 @@ fn lower_impl(g: &mut Globals, m: ModuleId, inst: usize, methods: &[Form]) -> TR
         }
         out.push(method);
     }
-    let proto = g.proto(g.instances[inst].proto);
+    let proto = g.proto(g.instances[inst].proto).clone();
     for (i, md) in proto.methods.iter().enumerate() {
-        if !out.iter().any(|o| o.index == i) {
+        if out.iter().any(|o| o.index == i) {
+            continue;
+        }
+        let Some(default) = &md.default else {
             let msg = format!("{owner} is missing the method {}", md.name);
             return Err(TypeError::other(&g.instances[inst].pos, msg));
-        }
+        };
+        // The default, specialised to this instance and resolved where
+        // the protocol is defined (types §4.1).
+        let form = defaults::method_form(md, default);
+        out.push(top::lower_impl_method(
+            g,
+            proto.module,
+            inst,
+            &form,
+            &owner,
+        )?);
     }
     g.instances[inst].methods = out;
     Ok(())

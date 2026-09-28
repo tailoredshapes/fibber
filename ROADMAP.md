@@ -55,7 +55,8 @@ evaluator over the audited heap.
   - [x] `(dyn P :send)`: a distinct `Send` dynamic type (types §2.15;
         cases 106 to 112)
   - [ ] colour parameters on structs and enums
-  - [ ] protocol supertraits and default methods
+  - [x] protocol supertraits (`:requires`) and default methods; `Ord`
+        requires `Eq` (types §4.1; cases 117 to 123)
   - [x] private names: `:private` after a definition's name, `(var
         m/x)` past it (syntax §5, §3.20; cases 113 to 116)
 

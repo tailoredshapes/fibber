@@ -239,11 +239,8 @@ fn derive_on_a_generic_enum_with_a_recursive_field() {
     let out = ok(src);
     assert_eq!(out.len(), 5);
     for (form, p) in out[1..].iter().zip(["Eq", "Ord", "Hash", "Show"]) {
-        let ctx = if p == "Ord" {
-            "((Ord a) (Eq a))".to_string()
-        } else {
-            format!("(({p} a))")
-        };
+        // `(Ord a)` alone: it entails `(Eq a)` (types §4.1).
+        let ctx = format!("(({p} a))");
         let head = format!("(impl {p} (Tree a) :where {ctx} ");
         assert!(form.starts_with(&head), "{form}");
     }

@@ -1,0 +1,37 @@
+;; spec:   types §4.1, §2.7, §2.12 (syntax §3.10, §3.16)
+;; expect: accept
+;; result: 1111111
+;; audit:  clean
+;; Ord requires Eq (types §2.12), so (Ord t) entails (Eq t) (§4.1 rule
+;; 2): derive Ord lists only (Ord a) and (Ord b) for Pair and its body
+;; still compares fields with =, and the generic Top impl uses = on a
+;; value bounded only by Ord. Ver's impls give only = and <: Eq's !=
+;; and Ord's <=, > and >= are the built-in defaults, specialised to Ver
+;; (§4.1). Each digit of the result is one comparison that held.
+(defstruct (Pair a b) (x: a y: b))
+(derive Eq Pair)
+(derive Ord Pair)
+
+(defstruct Ver (major: i64 minor: i64))
+(impl Eq Ver
+  (= (self o) (and (= (. self major) (. o major)) (= (. self minor) (. o minor)))))
+(impl Ord Ver
+  (< (self o) (or (< (. self major) (. o major))
+                  (and (= (. self major) (. o major)) (< (. self minor) (. o minor))))))
+
+(defprotocol Top (top (self) -> i64))
+(defstruct (Two a) (p: a q: a))
+(impl Top (Two a) :where ((Ord a))
+  (top (self) (if (= (. self p) (. self q)) 0 (if (< (. self p) (. self q)) 1 2))))
+
+(defun digit (b: bool) -> i64 (if b 1 0))
+
+(defun main () -> i64
+  (let ((v1 (Ver 1 2)) (v2 (Ver 1 10)))
+    (+ (* 1000000 (digit (!= v1 v2)))
+       (+ (* 100000 (digit (<= v1 v2)))
+          (+ (* 10000 (digit (> v2 v1)))
+             (+ (* 1000 (digit (>= v2 v2)))
+                (+ (* 100 (digit (< (Pair 1 "b") (Pair 2 "a"))))
+                   (+ (* 10 (digit (>= (Pair 1 "b") (Pair 1 "a"))))
+                      (top (Two v1 v2))))))))))

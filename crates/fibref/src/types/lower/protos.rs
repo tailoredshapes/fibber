@@ -12,6 +12,7 @@ use crate::types::scheme::Scheme;
 use crate::types::ty::{Colour, Con, Leaf, Pred, ProtoId, Ty};
 
 use super::decl::{annotation_name, define_value};
+use super::supers::{methods_start, resolve_supers};
 use super::typeform::{proto_ref, type_ann};
 
 /// `Name` (dispatch parameter `Self`) or `(Name self det*)`.
@@ -40,10 +41,10 @@ fn proto_head(head: &Form) -> TResult<(String, Vec<String>)> {
 /// Declares a protocol's name, parameters and method names.
 pub fn declare_proto(g: &mut Globals, m: ModuleId, form: &Form) -> TResult<ProtoId> {
     let items = form.as_list().unwrap_or(&[]);
-    if items.len() < 3 {
+    if items.len() <= methods_start(items) {
         return Err(TypeError::resolve(
             &form.pos,
-            "expected (defprotocol Name method+)",
+            "expected (defprotocol Name :requires (P..)? method+)",
         ));
     }
     let (name, params) = proto_head(&items[1])?;
@@ -53,7 +54,7 @@ pub fn declare_proto(g: &mut Globals, m: ModuleId, form: &Form) -> TResult<Proto
     }
     let id = ProtoId(g.protos.len() as u32);
     let mut methods = Vec::new();
-    for (i, mf) in items[2..].iter().enumerate() {
+    for (i, mf) in items[methods_start(items)..].iter().enumerate() {
         let mname = mf.as_list().and_then(|l| l.first()).and_then(Form::as_sym);
         let Some(mname) = mname else {
             return Err(TypeError::resolve(
@@ -67,6 +68,7 @@ pub fn declare_proto(g: &mut Globals, m: ModuleId, form: &Form) -> TResult<Proto
             params: Vec::new(),
             scheme: Scheme::mono(Ty::unit()),
             self_elsewhere: false,
+            default: None,
             pos: mf.pos.clone(),
         });
     }
@@ -76,6 +78,7 @@ pub fn declare_proto(g: &mut Globals, m: ModuleId, form: &Form) -> TResult<Proto
         module: m,
         params,
         methods,
+        supers: Vec::new(),
         pos,
     });
     g.names_mut(m).protos.insert(name, id);
@@ -85,7 +88,8 @@ pub fn declare_proto(g: &mut Globals, m: ModuleId, form: &Form) -> TResult<Proto
 /// Resolves the method signatures of a declared protocol.
 pub fn resolve_proto(g: &mut Globals, m: ModuleId, id: ProtoId, form: &Form) -> TResult<()> {
     let items = form.as_list().unwrap_or(&[]);
-    for (i, mf) in items[2..].iter().enumerate() {
+    resolve_supers(g, m, id, form)?;
+    for (i, mf) in items[methods_start(items)..].iter().enumerate() {
         let method = method_sig(g, m, id, mf)?;
         g.protos[id.0 as usize].methods[i] = method;
     }
@@ -101,7 +105,7 @@ fn method_sig(g: &Globals, m: ModuleId, id: ProtoId, mf: &Form) -> TResult<Metho
             "a method is (name (self qual* x: T qual*) -> type)",
         )
     };
-    let [name, params, arrow, ret] = items else {
+    let [name, params, arrow, ret, body @ ..] = items else {
         return Err(bad());
     };
     let ps = params.as_list().ok_or_else(bad)?;
@@ -135,6 +139,7 @@ fn method_sig(g: &Globals, m: ModuleId, id: ProtoId, mf: &Form) -> TResult<Metho
         params: mparams,
         scheme,
         self_elsewhere,
+        default: (!body.is_empty()).then(|| mf.clone()),
         pos: mf.pos.clone(),
     })
 }
@@ -246,8 +251,8 @@ pub fn declare_impl<'f>(
     form: &'f Form,
 ) -> TResult<(usize, &'f [Form])> {
     let items = form.as_list().unwrap_or(&[]);
-    if items.len() < 4 {
-        return Err(TypeError::resolve(&form.pos, "expected (impl P T method+)"));
+    if items.len() < 3 {
+        return Err(TypeError::resolve(&form.pos, "expected (impl P T method*)"));
     }
     let (proto, det_anns) = proto_ref(g, m, &items[1], false)?;
     let (con, vars) = impl_head(g, m, &items[2])?;

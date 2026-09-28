@@ -57,12 +57,14 @@ impl Cx<'_> {
             tys.push(Ty::Rigid(self.u.rigid_names.len() as u32));
             self.u.rigid_names.push(name.clone());
         }
-        self.u.givens = Some(
-            inst.context
-                .iter()
-                .map(|p| p.map_tys(&mut |t| t.subst_gen(&rig, &[])))
-                .collect(),
-        );
+        let context: Vec<_> = inst
+            .context
+            .iter()
+            .map(|p| p.map_tys(&mut |t| t.subst_gen(&rig, &[])))
+            .collect();
+        // The declared context and what it entails through supertraits
+        // (§4.1 rule 2).
+        self.u.givens = Some(crate::types::lower::entail_closure(g, &context));
         self.u.fun = format!("{} for {}", md.name, self.show(&tys[0]));
         let colours: Vec<Colour> = (0..md.scheme.n_colours)
             .map(|_| self.st.fresh_colour())

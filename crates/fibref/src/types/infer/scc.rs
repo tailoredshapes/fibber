@@ -176,6 +176,7 @@ impl Cx<'_> {
                 .iter()
                 .map(|p| p.map_tys(&mut |t| self.st.zonk(t)))
                 .collect();
+            let decl = crate::types::lower::entail_closure(self.g, &decl);
             for (p, _) in &closed.preds {
                 let ks: Vec<Key> = p.tys().iter().flat_map(|t| keys(self.st, t)).collect();
                 let z = p.map_tys(&mut |t| self.st.zonk(t));

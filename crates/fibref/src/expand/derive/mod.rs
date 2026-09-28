@@ -2,9 +2,9 @@
 //! §4.4), over the structs and enums the context has seen.
 //!
 //! The head is `Name` applied to its parameters (bare when it has none);
-//! `:where` lists `(P t)` for each parameter some field type mentions,
-//! with `(Eq t)` after each `(Ord t)` for `Ord`, and is omitted when
-//! empty. The method bodies are built here with the call's position.
+//! `:where` lists `(P t)` for each parameter some field type mentions
+//! (for `Ord` too: `(Ord t)` entails `(Eq t)` through the supertrait,
+//! types §4.1), and is omitted when empty. The method bodies are built here with the call's position.
 //!
 //! Where §3.16 fixes the shape (the `Eq` examples for `Pair` and
 //! `Shape`, the `Ord` rule, "combines the variant's index with the
@@ -13,8 +13,9 @@
 //! choices it leaves open are:
 //!
 //! - `Ord`: `<` is the lexicographic comparison; `(<= a b)` is `(not (<
-//!   b a))`, `(> a b)` is `(< b a)`, `(>= a b)` is `(not (< a b))`, so the
-//!   instance needs no `Eq` instance of `Name` itself;
+//!   b a))`, `(> a b)` is `(< b a)`, `(>= a b)` is `(not (< a b))`, the
+//!   built-in `Ord`'s defaults written out (types §2.12); the instance
+//!   needs an `Eq` instance of `Name`, `Ord`'s supertrait (types §4.1);
 //! - `Hash`: `h := seed; h := (+ (* h 31) (hash field))` for each field
 //!   in order, the seed being the variant index for an enum and `0` for
 //!   a struct (a struct is its one variant);
@@ -111,10 +112,8 @@ fn impl_form(
     let mut context = Vec::new();
     for p in param_names {
         if types.iter().any(|t| mentions(t, p)) {
+            // `(Ord t)` entails `(Eq t)`, its supertrait (types §4.1).
             context.push(call(proto.name(), vec![sym(p, pos)], pos));
-            if proto == Proto::Ord {
-                context.push(call("Eq", vec![sym(p, pos)], pos));
-            }
         }
     }
     if !context.is_empty() {

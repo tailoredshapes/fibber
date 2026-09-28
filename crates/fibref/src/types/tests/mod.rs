@@ -10,6 +10,7 @@ mod errors;
 mod errors2;
 mod forms;
 mod private;
+mod supers;
 
 use super::{check_source, ErrorKind, SourceError, TypeError, TypedProgram};
 

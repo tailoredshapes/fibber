@@ -312,8 +312,8 @@ patterns (syntax §3.3).
 |---|---|
 | `(defstruct (N ā) (f₁: T₁ ..))` | registers `N` of arity |ā|; constructor `N : ∀ā. (fn :send (T₁ ..) (N ā))`; field types well formed and closed under `ā`; recursive occurrences only through annotated fields |
 | `(defenum (N ā) (V₁ T̄₁) ..)` | `Vᵢ : ∀ā. (fn :send (T̄ᵢ) (N ā))`, or `∀ā. (N ā)` for a field-less variant |
-| `(defprotocol (P s d̄) (m (self x₁: T₁ ..) -> R) ..)` | `m : ∀ s d̄ b̄. (P s d̄) ⇒ (fn :send (s T₁ ..) R)` where `b̄` are the signature's other variables; the functional dependency `s → d̄` is recorded; each parameter's escape kind (`:borrow` or the default, escaping) and count kind (`:owned` or the default, borrowed) are recorded (§6.4) |
-| `(impl (P D̄) (K ā) :where (C) (m (self x̄) b) ..)` | registers the instance `∀ā. (P (K ā) D̄) ⇐ C` where `C` is the **declared** context (`:where`; empty when omitted; Paterson condition, §3.3), known before any body is typed (§3.5; §10 item 20); each body is typed against the signature with `s := (K ā)` rigid, `d̄ := D̄`, under the bounds `C`, and must not be more specific; a body whose constraints are not entailed by `C` is `no implementation of P for a; add (P a) to the :where of the impl`; every method present, none extra; one instance per `(P, K)` in the program; each body's escape summary must respect the declared kinds (§6.4) |
+| `(defprotocol (P s d̄) :requires (Q̄) (m (self x₁: T₁ ..) -> R b?) ..)` | `m : ∀ s d̄ b̄. (P s d̄) ⇒ (fn :send (s T₁ ..) R)` where `b̄` are the signature's other variables; the functional dependency `s → d̄` is recorded; each parameter's escape kind (`:borrow` or the default, escaping) and count kind (`:owned` or the default, borrowed) are recorded (§6.4); the supertraits `Q̄`, constraints over `s d̄` whose dispatch argument is `s` (§4.1), are recorded, and one that reaches `P` again is `protocol P requires itself`; a method with a body `b` has a **default** (§4.1), kept as forms with the module that defines `P` |
+| `(impl (P D̄) (K ā) :where (C) (m (self x̄) b) ..)` | registers the instance `∀ā. (P (K ā) D̄) ⇐ C` where `C` is the **declared** context (`:where`; empty when omitted; Paterson condition, §3.3), known before any body is typed (§3.5; §10 item 20); each body is typed against the signature with `s := (K ā)` rigid, `d̄ := D̄`, under the bounds `C` and everything they entail through supertraits (§4.1), and must not be more specific; a body whose constraints are not entailed is `no implementation of P for a; add (P a) to the :where of the impl`; every method without a default present, none extra, and each method with a default and no body here gets the default's body as if written here (§4.1); one instance per `(P, K)` in the program; for each supertrait `(Q s ē)` of `P` an instance of `Q` for `K` with the determined arguments `ē[(K ā)/s, D̄/d̄]` and a context entailed by `C` (§4.1); each body's escape summary must respect the declared kinds (§6.4) |
 
 ### 2.8 `async`, `await`, `unsafe`, `extern`, `quote`, `defmacro`
 
@@ -425,8 +425,10 @@ declaration order and shows as its variant name) and for `str`:
 
 ```
 (defprotocol Num  (+ (self y: Self) -> Self) (- ..) (* ..) (/ ..) (rem ..) (neg (self) -> Self))   ; every integer and float type
-(defprotocol Eq   (= (self y: Self) -> bool) (!= ..))
-(defprotocol Ord  (< (self y: Self) -> bool) (<= ..) (> ..) (>= ..))                                ; requires Eq
+(defprotocol Eq   (= (self y: Self) -> bool) (!= (self y: Self) -> bool (not (= self y))))
+(defprotocol Ord  :requires (Eq)
+                  (< (self y: Self) -> bool) (<= (self y: Self) -> bool (not (< y self)))
+                  (> (self y: Self) -> bool (< y self)) (>= (self y: Self) -> bool (not (< self y))))
 (defprotocol Bits (bit-and (self y: Self) -> Self) (bit-or ..) (bit-xor ..) (bit-not (self) -> Self)
                   (shl (self n: Self) -> Self) (shr ..) (sar ..) (popcount (self) -> Self))          ; integer types only
 (defprotocol Hash (hash (self) -> i64))
@@ -487,8 +489,12 @@ is a prelude macro over `struct-fields`, `struct-params` and
 `struct-field-types` for a struct, and over `enum-params` and
 `enum-variants` for an enum (syntax §3.16), that generates one `impl`
 with the head `(Name ā)` and the context `(P a)` for each parameter `a`
-that some field's type mentions (plus `(Eq a)` for `Ord`, which has no
-supertrait to give it, §4.1), so it works for generic structs and
+that some field's type mentions (for `Ord` too: `(Ord a)` entails `(Eq
+a)`, its supertrait, §4.1, so the body's `=` needs nothing more;
+**Decided**, owner, 2026-09-28, replacing the `(Eq a)` that was listed
+beside it while there were no supertraits; and `Ord` of a type needs
+`Eq` of it, so `(derive Ord T)` needs `(derive Eq T)` or an `impl Eq`
+beside it), so it works for generic structs and
 enums too; on an enum the methods are a `match` on `self` nested with
 a `match` on the other operand (`Eq`: same variant and equal fields;
 `Ord`: declaration order, then the fields lexicographically), and on a
@@ -706,7 +712,7 @@ bound, and again at the end of the SCC:
 
 | Constraint | Solved when | Failure |
 |---|---|---|
-| `(P T₁ .. Tₙ)` | head of `T₁` known: look up the unique instance for `(P, head T₁)`, instantiate it, unify its `S` with `T₁` and its determined arguments with `T₂ .. Tₙ` (the improvement `T₁ → T₂..`), then replace the constraint by the instance's declared context (§2.7). `T₁` a rigid variable: must be entailed by a bound. `T₁ = (dyn P)` or `(dyn P :send)`: satisfied. `T₁` an unbound variable at generalisation: becomes a bound of the scheme if `T₁` occurs in the type, else `ambiguous constraint P a in f; add an annotation` | `no implementation of P for T₁` |
+| `(P T₁ .. Tₙ)` | head of `T₁` known: look up the unique instance for `(P, head T₁)`, instantiate it, unify its `S` with `T₁` and its determined arguments with `T₂ .. Tₙ` (the improvement `T₁ → T₂..`), then replace the constraint by the instance's declared context (§2.7). `T₁` a rigid variable: must be entailed by a bound, or by a supertrait of one (§4.1 rule 2). `T₁ = (dyn P)` or `(dyn P :send)`: satisfied, and so is `(Q (dyn P) ..)` for a supertrait `Q` of `P` (§4.1 rule 3). `T₁` an unbound variable at generalisation: becomes a bound of the scheme if `T₁` occurs in the type, else `ambiguous constraint P a in f; add an annotation` | `no implementation of P for T₁` |
 | `(Send T)`, `(Object T)`, `(Weakable T)` | evaluated structurally once the head is known (§5.1, §2.11); a quantified variable's constraint becomes a bound | `cell cannot be shared between threads: …` (§5.3) / `value of type T cannot be shared between threads: …` / `dyn requires an object type` / `weak requires an object type` / `weak of an Option is not allowed` |
 | `HasField(T, f, R)` | `T` becomes a struct: `R ~` field type | `T has no field f`; unresolved at generalisation: `cannot infer the struct type of e for field f; annotate it` |
 | `HasDeref(T, R)` | `T` becomes `Cell`/`Atom`/`Weak`: `R ~ T'`/`T'`/`(Option T')` | unresolved: `cannot infer whether x is a cell, an atom or a weak reference` |
@@ -734,8 +740,9 @@ resolved by the `Accounts` constructor in the closure body; case 19's
 1. read; expand macros (macro-time modules are compiled first, syntax §3.16)
 2. rewrite literal collections (syntax §1.4); resolve names against ns/require/use
 3. collect declarations: structs, enums (check well-formedness, recursion annotations),
-   protocols (record fundeps and escape kinds), impls (register instances with their declared
-   contexts, check coherence and the Paterson condition),
+   protocols (record fundeps, escape kinds, supertraits and defaults, §4.1), impls (register
+   instances with their declared contexts, check coherence, the Paterson condition and the
+   supertraits' instances and contexts, §4.1; an omitted method with a default gets it),
    externs, defun names; run the syntactic & checks (§6.5, §6.9) that need no types
 4. build the dependency graph of defuns and defs: an edge from a defun to every same-module
    defun it calls or names as a value and to every def it reads, from a def to every
@@ -878,10 +885,68 @@ determined by `s` (one instance per head constructor of `s`, and it fixes
 program (checked per module and again at monomorphisation). An instance
 may carry a context (`(impl Eq (Vec a) :where ((Eq a)) ..)`), declared
 on the `impl` and exported (§2.7). Instances for bare type variables and
-overlapping instances are rejected (**Decided**; no default methods, no
-supertraits in v1). Protocol
+overlapping instances are rejected (**Decided**). Protocol
 parameters are output positions: `(Deref (Cell i64) t)` yields `t = i64`
 without annotation.
+
+**Supertraits** (**Decided**, owner, 2026-09-28; replaces "no
+supertraits in v1", §10 item 15). `(defprotocol Ord :requires (Eq) ..)`
+declares that `Ord` requires `Eq`; `(defprotocol (Coll s e) :requires
+((Seq s e) Countable) ..)` requires `(Seq s e)` and `(Countable s)`. An
+entry is a protocol name `Q`, meaning `(Q s)` (only for a `Q` without
+determined parameters), or a constraint `(Q t̄)` whose first argument
+is the dispatch parameter `s` (`Self` in a protocol without a head
+list) and whose other arguments are types over `s d̄`. `:requires` is
+not `:where`: a `:where` context is what an instance needs, a
+supertrait is what an instance of the protocol provides. Three rules
+follow, and the checker enforces each:
+
+1. *An impl needs its supertraits' impls.* `(impl P (K ā) :where (C)
+   ..)` requires, for each supertrait `(Q s ē)`, the instance of `Q` for
+   `K` (in any module, declared before or after it), whose determined
+   arguments equal `ē` with `s := (K ā)`, `d̄ := D̄`, and whose context
+   is entailed by `C` (rule 2, and instance resolution for a context
+   constraint on a compound type). Otherwise `impl P for (K ā)
+   requires an impl of Q for (K ā)`, `.. whose context (R a) is not
+   entailed by the context of impl P`, or `.. determines (Q ..), not
+   (Q ..)`. Without the context rule a `(P t)` bound could vouch for a
+   `(Q t)` whose own instance needs more than `(P t)` gives, and a
+   generic body would call an implementation whose context does not
+   hold at run time.
+2. *A constraint entails its supertraits.* A given `(P t̄)` (the
+   `:where` context of an `impl` body, or the declared bounds of a
+   polymorphically recursive `defun`, §3.6) entails `(Q ū)` for every
+   supertrait `(Q s ē)`, transitively, with `ū = ē[t̄]`: so `(impl Ord
+   (Pair a b) :where ((Ord a) (Ord b)) ..)` may use `=` on `a`. An
+   inferred scheme may list both `(Ord a)` and `(Eq a)`; the second is
+   redundant and harmless, since every type with an `Ord` instance has
+   an `Eq` one by rule 1.
+3. *A `dyn` carries its supertraits.* `(dyn P)` (and `(dyn P :send)`)
+   satisfies `(Q (dyn P) ū)` for every supertrait, transitively, with
+   the determined arguments `ū` read off `P`'s: a method of `Q` can be
+   called on a `(dyn P)` receiver under the object-safety rule of §4.4,
+   and `(dyn Q d)` of a `(dyn P)` value `d` is the upcast to `(dyn Q)`
+   (§8.5 gives the vtable).
+
+**Default methods** (**Decided**, owner, 2026-09-28; replaces "no
+default methods in v1"). A method signature may be followed by a body:
+`(!= (self y: Self) -> bool (not (= self y)))`. An `impl` that gives
+the method uses its own body; one that omits it gets the default,
+specialised per instance: the default's forms become that `impl`'s
+method, typed as its body is (§2.7: `s := (K ā)` rigid, under the
+impl's context and what it entails), checked for ownership as its body
+is (§6.4: every parameter, `self` included, escaping unless declared
+`:borrow`, borrowed unless declared `:owned`; a default that breaks a
+declared kind is the error of §6.4 at every `impl` that takes it), and
+run as its body is. So one default can be well typed for one instance
+and not for another (a default that calls `show` on `self` needs
+`(Show (K ā))`, which that impl's context must entail), and the error
+names the `impl`. The default's names are resolved in the module that
+defines the protocol, not the one that writes the `impl` (it is that
+module's code, which a program's own `not` cannot capture), with that
+module's private names visible (syntax §5). The object-safety rule of
+§4.4 is unchanged: it is about the signature, and a default's body is
+never reached except through an instance.
 
 ### 4.2 Static (the default)
 
@@ -949,7 +1014,9 @@ mentions `self` anywhere but the receiver position (`(conj (self x: e)
 -> Self)`) are not callable through `dyn` (object safety); protocols with
 determined parameters are usable as `(dyn (P D̄))` with `D̄` fixed. `(dyn
 P)` is chosen only where the program writes it: heterogeneous
-collections and plugin-style interfaces. It is not `Send`; `(dyn P
+collections and plugin-style interfaces. A `(dyn P)` satisfies `P`'s
+supertraits too (§4.1 rule 3), and a method of a supertrait is callable
+through it under the same rule. It is not `Send`; `(dyn P
 :send)` is the same two words for a value that is (§2.15, **Decided**,
 owner, 2026-09-28, amending §10 item 11), and its vtable is the same
 global `P.vt.K`.
@@ -1381,7 +1448,10 @@ count kind whatever it would have inferred, which can cost it a retain,
 or a tail call by rule (e), but never a verdict, so `:owned` needs no
 check. Callers use the declared kinds whichever implementation runs,
 which keeps summaries modular under dynamic dispatch and separate
-compilation (**Decided**). Externs take scalars only: `(raw e)` is not
+compilation (**Decided**). A default method body (§4.1) is checked and
+compiled the same way, once per instance that takes it, as that
+instance's implementation: the error above then names the `impl` that
+took the default. Externs take scalars only: `(raw e)` is not
 an escape of `e`'s binding, `(raw-retained e)` is (§6.13).
 
 What summaries and kinds decide, and nothing else: (a) whether a
@@ -2155,6 +2225,11 @@ and a double release as a count going negative.
 | def g has an unresolved type; annotate it | §2.16 |
 | def g: initialiser is not a constant expression | §2.16, syntax §3.19 |
 | def g and defun f depend on each other | §2.16, §3.5, syntax §3.19 |
+| impl P for T requires an impl of Q for T / .. does not entail the context of impl Q for T: C / .. requires (Q ..), but impl Q for T determines (Q ..) | §4.1 rule 1 |
+| protocol P requires itself | §2.7, §4.1 |
+| impl P for T is missing the method m (a method with no default) | §2.7, §4.1 |
+| x is private to m; it is not exported | syntax §5, §3.9 |
+| var: no definition named x | syntax §3.20 |
 
 ---
 
@@ -2556,7 +2631,13 @@ Static: the monomorphiser rewrites `(count v)` at `v : (Vec i64)` to
 
 Dynamic: for every `(P, K)` instance reachable through a `(dyn P e)` the
 compiler emits a vtable: a block of one `ptr` slot per method in
-protocol order, holding the code pointers. lIR has no struct-typed
+protocol order, holding the code pointers (a default taken by the
+instance is its specialisation for `K`, §4.1), followed by one slot per
+supertrait of `P` in the order of its transitive closure (depth first,
+each protocol once) holding the address of that supertrait's vtable
+`Q.vt.K` (§4.1 rule 3, **Decided**, owner, 2026-09-28): a call of `Q`'s
+method through a `(dyn P)` loads `Q`'s slot and then the method's, and
+the upcast `(dyn Q d)` builds `{ obj, Q's slot }`. lIR has no struct-typed
 `global` and takes no function address in a `global` initialiser, so
 the module initialiser allocates the block, `store`s each code pointer
 into its slot and stores the block's address into the `ptr` global
@@ -2995,7 +3076,7 @@ old numbering is kept here because the drafts and
 | 12 | no coercions anywhere (D3) | §1.7, §3 |
 | 13 | field access and `deref` fixed by the end of the SCC | §3.4 |
 | 14 | `Option` as a nullable pointer only for non-`Option` object payloads; class `opt` | §8.1, §4.3 |
-| 15 | instances keyed by `(P, head)`; no overlap, defaults or supertraits | §4.1 |
+| 15 | instances keyed by `(P, head)`; no overlap, defaults or supertraits — **amended by the owner, 2026-09-28: supertraits (`:requires`) and default methods** | §4.1 |
 | 16 | `write-unique` obligation on fibref | §6.6, §6.12 |
 | 17 | leak-cycle classification is fibref's | §6.7 |
 | 18 | whole-scrutinee pattern variable takes the scrutinee's mode | §6.1, §6.3, §6.4 |

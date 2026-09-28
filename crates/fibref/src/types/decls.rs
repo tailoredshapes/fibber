@@ -127,6 +127,9 @@ pub struct MethodDef {
     /// Whether `Self` occurs anywhere but the receiver (then the method
     /// is not callable through `dyn`, §4.4).
     pub self_elsewhere: bool,
+    /// The default (§4.1): the whole method form, signature and body,
+    /// expanded, when the signature is followed by a body.
+    pub default: Option<crate::syntax::Form>,
     /// Where it is declared.
     pub pos: Pos,
 }
@@ -142,6 +145,9 @@ pub struct ProtoDef {
     pub params: Vec<String>,
     /// The methods.
     pub methods: Vec<MethodDef>,
+    /// The supertraits (§4.1): `(Q s ē)` over the protocol's parameters
+    /// as `Gen(0)` (`s`) and `Gen(1..)` (`d̄`).
+    pub supers: Vec<Pred>,
     /// Where it is declared.
     pub pos: Pos,
 }

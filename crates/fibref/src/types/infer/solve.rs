@@ -76,7 +76,12 @@ impl Cx<'_> {
         match &t1 {
             Ty::Var(_) | Ty::Gen(_) => Ok(Step::Stuck),
             Ty::Rigid(r) => self.rigid_proto(d, p, *r, args),
-            Ty::Con(Con::Dyn(q, _), dargs) if *q == p => {
+            Ty::Con(Con::Dyn(q, _), dargs) => {
+                // `P` itself, or a supertrait of it with the determined
+                // arguments read off the dyn's (§4.1 rule 3).
+                let Some(dargs) = self.dyn_args(*q, dargs, p, &t1) else {
+                    return Err(self.no_instance(p, &t1, &d.pos));
+                };
                 if let Some(m) = method {
                     let md = &self.g.proto(p).methods[m];
                     if md.self_elsewhere {
@@ -88,7 +93,7 @@ impl Cx<'_> {
                         return Err(TypeError::other(&d.pos, msg));
                     }
                 }
-                for (a, b) in dargs.clone().iter().zip(&args[1..]) {
+                for (a, b) in dargs.iter().zip(&args[1..]) {
                     self.unify(a, b, &d.pos)?;
                 }
                 self.resolved(d, Resolution::Dyn);
@@ -97,6 +102,23 @@ impl Cx<'_> {
             Ty::Con(c, _) => self.apply_instance(d, p, *c, &t1, args),
             Ty::Fn(..) => Err(self.no_instance(p, &t1, &d.pos)),
         }
+    }
+
+    /// The determined arguments of `(p t1 ..)` for `t1 = (dyn q dargs)`:
+    /// `dargs` when `p` is `q`, else those of the supertrait `p` of `q`
+    /// (§4.1 rule 3); `None` when `p` is neither.
+    fn dyn_args(&self, q: ProtoId, dargs: &[Ty], p: ProtoId, t1: &Ty) -> Option<Vec<Ty>> {
+        if q == p {
+            return Some(dargs.to_vec());
+        }
+        let mut own = vec![t1.clone()];
+        own.extend(dargs.iter().cloned());
+        crate::types::lower::super_closure(self.g, &Pred::Proto(q, own))
+            .into_iter()
+            .find_map(|s| match s {
+                Pred::Proto(r, args) if r == p => Some(args[1..].to_vec()),
+                _ => None,
+            })
     }
 
     /// `no implementation of P for T`.

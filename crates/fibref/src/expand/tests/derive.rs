@@ -64,12 +64,12 @@ fn eq_on_a_one_variant_enum_has_no_wildcard() {
 }
 
 #[test]
-fn ord_on_a_struct_is_lexicographic_and_lists_eq() {
+fn ord_on_a_struct_is_lexicographic_and_lists_only_ord() {
     let got = derive_once("(defstruct (P t) (a: i64 b: t c: t))", "(derive Ord P)");
     let less = "(or (< (. self a) (. y a)) (and (= (. self a) (. y a)) \
                 (or (< (. self b) (. y b)) (and (= (. self b) (. y b)) (< (. self c) (. y c))))))";
     let expected = format!(
-        "(impl Ord (P t) :where ((Ord t) (Eq t)) (< (self y) {less}) \
+        "(impl Ord (P t) :where ((Ord t)) (< (self y) {less}) \
          (<= (self y) (not (< y self))) (> (self y) (< y self)) (>= (self y) (not (< self y))))"
     );
     assert_eq!(one(&got), one(&expected));

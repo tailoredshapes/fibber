@@ -490,9 +490,10 @@ made acceptance order-dependent, and `if-let` covers the idiom).
 ### 3.10 `defprotocol`, `impl`
 
 ```
-(defprotocol Name method+)
-(defprotocol (Name self det*) method+)          ; self dispatches; det* are determined by self
-method      ::= (mname (self qual* mparam*) -> type)
+(defprotocol Name private? requires? method+)
+(defprotocol (Name self det*) private? requires? method+)   ; self dispatches; det* are determined by self
+requires    ::= :requires (super+)              ; super ::= Proto | (Proto type+), the first type self
+method      ::= (mname (self qual* mparam*) -> type body?)   ; a body is the default
 mparam      ::= sym: type qual*
 qual        ::= :borrow | :owned
 
@@ -508,8 +509,8 @@ dispatch type; the determined parameters `det*` are fixed by the
 implementing type (types §4.1). `impl` declares that a type constructor
 applied to distinct type variables (`(Vec a)`), a scalar, a built-in
 object type (`str`, `Form`, `(Array a)`), or a struct/enum name
-implements the protocol, and gives every method (all required; no
-defaults in the core). A generic `impl` declares the bounds
+implements the protocol, and gives every method that has no default
+(a method with a default may be given or omitted). A generic `impl` declares the bounds
 its bodies need on its type variables in `:where` (`(impl Eq (Vec a)
 :where ((Eq a)) ...)`); an `impl` without `:where` has an empty context,
 and a body that needs a bound not listed is an error (types §2.7; Open
@@ -517,6 +518,21 @@ decision 19). Contexts are declared, not inferred, because a `defun`
 that calls a method is type-checked and generalised before any `impl`
 body is (types §3.5). One `impl` per (protocol, head constructor) in the
 whole program.
+
+**Supertraits and defaults** (**Decided**, owner, 2026-09-28; types
+§4.1). `(defprotocol Ord :requires (Eq) ..)` makes `Eq` a supertrait
+of `Ord`: an `impl Ord` for a type needs an `impl Eq` for the same
+type, whose context the `Ord` impl's context entails; a bound `(Ord t)`
+entails `(Eq t)`, so a generic `impl` or `defun` bounded by `Ord` may
+use `=`; and a `(dyn Ord)` value may call `Eq`'s methods (subject to
+object safety) and be upcast with `(dyn Eq d)`. A method whose
+signature is followed by body forms has a default: an `impl` that
+omits the method gets that body, specialised to its type and checked
+there as if the `impl` had written it, with its names resolved where
+the protocol is defined. The built-in `Eq` defaults `!=` to `(not (=
+self y))`, and the built-in `Ord` requires `Eq` and defaults `<=`, `>`
+and `>=` from `<` (types §2.12), so `(impl Ord T (< (self y) ..))` is a
+complete instance once `Eq` has one.
 
 Escape and count kinds (**Decided**; types §2.7, §6.4): every method
 parameter, `self` included, defaults to the **escaping** kind and to the
@@ -926,9 +942,12 @@ instances (proposed case 39). Without the two new calls no `derive`
 could be written for a generic struct, which is every struct with an
 unannotated field: an `impl` head must apply the constructor to its
 parameters and its context must be declared (§3.10). For `Ord`, on a
-struct or an enum, the context lists `(Eq t)` beside `(Ord t)`: the
-body compares with `=` as well as `<`, and there are no supertraits in
-v1 (types §4.1).
+struct or an enum, the context lists `(Ord t)` alone: the body compares
+with `=` as well as `<`, and `(Ord t)` entails `(Eq t)` through `Ord`'s
+supertrait (types §4.1; **Decided**, owner, 2026-09-28, replacing the
+`(Eq t)` listed beside it while there were no supertraits). An `Ord`
+instance needs an `Eq` instance of the same type, so `(derive Ord
+Name)` goes with `(derive Eq Name)` or an `impl Eq`.
 
 The same reflection exists for enums (**Decided**), for
 an enum `Name` defined earlier in the module or imported, and for the
@@ -1244,7 +1263,7 @@ of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
 | `->`, `->>`, `doto` | call rewriting |
 | `assert` | `(assert c)` / `(assert c msg)` ⟹ `(if c () (trap msg))`, the default message naming the position and the test |
 | `dbg` | `(dbg e)` ⟹ `(let ((t e)) (eprintln (str-concat "dbg FILE:LINE:COL: E = " (show t))) t)` with `t` a gensym and the literal text naming the call's position and `e` as written: evaluates `e` once, prints it with `Show` to stderr, returns it (**Decided**, owner, 2026-09-27) |
-| `derive` | `(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`: one `impl` whose head comes from `struct-params` or `enum-params`, whose `:where` lists `(P t)` for each parameter used by a field (`struct-field-types`, `enum-variants`; `(Eq t)` as well for `Ord`) and whose methods go field by field over `struct-fields` for a struct, or variant by variant over `enum-variants` for an enum, with a nested `match` on both operands (§3.16); `(do)` for a field-less enum, whose instances are built in; several protocols are several `derive` forms, which a macro may return in one top-level `do`. The prelude itself contains `(derive Eq Option)`, `(derive Ord Option)`, `(derive Hash Option)`, `(derive Show Option)` and the same four for `List` |
+| `derive` | `(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`: one `impl` whose head comes from `struct-params` or `enum-params`, whose `:where` lists `(P t)` for each parameter used by a field (`struct-field-types`, `enum-variants`; for `Ord` too, whose supertrait `Eq` the context then entails, types §4.1) and whose methods go field by field over `struct-fields` for a struct, or variant by variant over `enum-variants` for an enum, with a nested `match` on both operands (§3.16); `(do)` for a field-less enum, whose instances are built in; several protocols are several `derive` forms, which a macro may return in one top-level `do`. The prelude itself contains `(derive Eq Option)`, `(derive Ord Option)`, `(derive Hash Option)`, `(derive Show Option)` and the same four for `List` |
 
 ### 4.5 Library (written in fibber, in `lib/`)
 

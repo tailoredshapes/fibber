@@ -27,7 +27,7 @@ not changed.
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
 Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109,
-112, 113 and 114 must be rejected; 101 to 104 must trap; 15
+112, 113, 114, 118, 119, 121 and 123 must be rejected; 101 to 104 must trap; 15
 and 80 are the permitted cycle leaks; every other case is accept with a
 clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
 pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
@@ -80,4 +80,12 @@ the prelude's private trie enum (114) is rejected; a program's own
 private definitions, a public name equal to a private prelude one and
 `(var fib.prelude/x)` (115), and a macro whose expansion reaches a
 private helper through `var` whatever the use site binds locally (116)
-are accepted.
+are accepted. 117 to 123 cover supertraits and default methods (types
+§4.1): an `(Ord t)` bound that lets a body use `=`, and impls completed
+by the built-in defaults of `Eq` and `Ord` (117), supertrait and
+default methods through a `dyn`, with an upcast (120), and a default
+whose names resolve where its protocol is defined whatever the program
+shadows (122) are accepted; an `impl Ord` without an `impl Eq` (118),
+one whose context does not entail its `Eq` impl's (119), a default that
+makes a `:borrow` parameter escape (121) and a default that needs an
+instance the impl's type lacks (123) are rejected.

@@ -1,0 +1,26 @@
+;; spec:   types §4.1, §2.7, §3.3
+;; expect: reject
+;; error:  impl Ord for (Tag a) does not entail the context of impl Eq for (Tag a): (Hash a)
+;; The Eq instance of Tag needs (Hash a) as well as (Eq a); the Ord
+;; instance declares only (Ord a). If that were accepted, the Show impl
+;; of Box2, bounded by (Ord a) alone, could use = on a (rule 2), and at
+;; a = (Tag K) with K ordered but not hashable the = it runs would call
+;; hash at a type with no implementation of Hash. So the supertrait's
+;; context must follow from the impl's own (types §4.1 rule 1).
+(defstruct (Tag a) (v: a))
+
+(impl Eq (Tag a) :where ((Eq a) (Hash a))
+  (= (self o) (and (= (hash (. self v)) (hash (. o v))) (= (. self v) (. o v)))))
+
+(impl Ord (Tag a) :where ((Ord a))
+  (< (self o) (< (. self v) (. o v))))
+
+(defstruct (Box2 a) (v: a))
+(impl Show (Box2 a) :where ((Ord a))
+  (show (self) (if (= (. self v) (. self v)) "same" "differs")))
+
+(defstruct K (n: i64))
+(derive Eq K)
+(derive Ord K)
+
+(defun main () -> i64 (str-len (show (Box2 (Tag (K 1))))))

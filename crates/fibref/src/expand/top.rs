@@ -69,10 +69,11 @@ fn definition_of(ex: &mut Expander, form: Form, first: bool) -> Result<Form, Exp
             ex.ctx.types.add_enum(&form)?;
             Role::Keep
         }
-        "ns" | "defprotocol" | "extern" => {
+        "ns" | "extern" => {
             check_depth(ex, &form)?;
             Role::Keep
         }
+        "defprotocol" => protocol_plan(&form)?,
         "defmacro" => return defmacro(ex, form),
         "defun" => defun_plan(&form)?,
         "def" => def_plan(&form)?,
@@ -125,12 +126,37 @@ fn def_plan(form: &Form) -> Result<Role, ExpandError> {
     Ok(Role::after(len - 1, Role::Expr))
 }
 
-/// `(impl P type where? method-impl+)`, `method-impl ::= (mname (self
-/// sym*) ret? body)` (§3.10).
+/// `(defprotocol head (:requires (..))? method+)`, `method ::= (mname
+/// (self ..) -> type body*)` (§3.10): the body of a method with a
+/// default is expanded (types §4.1), the rest kept.
+fn protocol_plan(form: &Form) -> Result<Role, ExpandError> {
+    let items = form.as_list().unwrap_or(&[]);
+    let start = match items.get(2).map(|f| &f.kind) {
+        Some(FormKind::Kw(k)) if k == "requires" => 4,
+        _ => 2,
+    };
+    if items.len() <= start {
+        let reason = "expected a name and methods";
+        return Err(malformed("defprotocol", reason, &form.pos));
+    }
+    let mut roles = vec![Role::Keep; start];
+    for m in &items[start..] {
+        let role = match m.as_list() {
+            Some(parts) if parts.len() > 4 => Role::after(4, Role::Expr),
+            _ => Role::Keep,
+        };
+        roles.push(role);
+    }
+    Ok(Role::items(roles, Role::Keep))
+}
+
+/// `(impl P type where? method-impl*)`, `method-impl ::= (mname (self
+/// sym*) ret? body)` (§3.10); a method with a default may be omitted,
+/// so an `impl` may have none (types §4.1).
 fn impl_plan(form: &Form) -> Result<Role, ExpandError> {
     let items = form.as_list().unwrap_or(&[]);
     let start = skip_annotations(items, 3);
-    if items.len() < 4 || start >= items.len() {
+    if items.len() < 3 || start > items.len() {
         return Err(malformed(
             "impl",
             "expected a protocol, a type and methods",

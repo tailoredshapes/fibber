@@ -66,7 +66,9 @@ fn malformed_core_forms() {
         "(defun f ())",
         "(defun (f) () 1)",
         "(def x)",
-        "(impl Eq T)",
+        // `(impl Eq T)` is well formed since methods may have defaults
+        // (types §4.1); the checker says which one is missing.
+        "(impl Eq)",
         "(impl Eq T (m))",
         "(defstruct S ())",
         "(defstruct S (x: ))",
