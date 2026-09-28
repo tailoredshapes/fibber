@@ -1,0 +1,121 @@
+;; fib.rt, weak references (types §8.7). A weak box is the header, a
+;; lock, the target, and the link of the global table, which is a
+;; list of the registered boxes threaded through that link under one
+;; spinlock (the table's data structure is the runtime's; §8.7 fixes
+;; only its behaviour: one box per object, found through HAS-WEAK).
+(global internal fib.weak-lock i32 (i32 0))
+(global internal fib.weak-list ptr (ptr null))
+
+(define internal (fib.weak-find ptr) ((ptr target))
+  (block entry (let ((first (load ptr @fib.weak-list))) (br scan)))
+  (block scan
+    (let ((b (phi ptr (entry first) (next b2))))
+      (br (icmp eq b (ptr null)) none test)))
+  (block test
+    (br (icmp eq (load ptr (getelementptr %struct.fib.weakbox b (i32 0) (i32 4))) target) found next))
+  (block next
+    (let ((b2 (load ptr (getelementptr %struct.fib.weakbox b (i32 0) (i32 5)))))
+      (br scan)))
+  (block found (ret b))
+  (block none (ret (ptr null))))
+
+;; A fresh box (count 1) for target.
+(define internal (fib.weak-box ptr) ((ptr target) (i32 tid))
+  (block entry
+    (let ((b (call @fib.alloc (i64 40) tid)))
+      (store (i32 0) (getelementptr %struct.fib.weakbox b (i32 0) (i32 3)))
+      (store target (getelementptr %struct.fib.weakbox b (i32 0) (i32 4)))
+      (store (ptr null) (getelementptr %struct.fib.weakbox b (i32 0) (i32 5)))
+      (ret b))))
+
+;; (weak x): the object's one box, retained, made and registered on
+;; the first weak of it; an IMMORTAL target gets a fresh box that is
+;; never registered and never cleared.
+(define internal (fib.weak ptr) ((ptr x) (i32 tid))
+  (block entry
+    (let ((f (call @fib.flags x)))
+      (br (icmp ne (and f (i32 8)) (i32 0)) immortal mutable)))
+  (block immortal (ret (call @fib.weak-box x tid)))
+  (block mutable
+    (call @fib.lock @fib.weak-lock)
+    (br (icmp ne (and f (i32 2)) (i32 0)) flagged fresh))
+  (block flagged
+    (let ((b (call @fib.weak-find x)))
+      (br (icmp eq b (ptr null)) fresh reuse)))
+  (block reuse
+    (call @fib.retain b)
+    (call @fib.unlock @fib.weak-lock)
+    (ret b))
+  (block fresh
+    (let ((nb (call @fib.weak-box x tid)))
+      (store (load ptr @fib.weak-list) (getelementptr %struct.fib.weakbox nb (i32 0) (i32 5)))
+      (store nb @fib.weak-list)
+      (atomicrmw or monotonic (getelementptr %struct.fib.hdr x (i32 0) (i32 2)) (i32 2))
+      (call @fib.unlock @fib.weak-lock)
+      (ret nb))))
+
+;; @w: the target retained if alive (a cmpxchg loop refusing zero),
+;; or null.
+(define internal (fib.upgrade ptr) ((ptr b))
+  (block entry
+    (let ((lockp (getelementptr %struct.fib.weakbox b (i32 0) (i32 3))))
+      (call @fib.lock lockp)
+      (let ((t (load ptr (getelementptr %struct.fib.weakbox b (i32 0) (i32 4)))))
+        (br (icmp eq t (ptr null)) dead alive))))
+  (block dead (call @fib.unlock lockp) (ret (ptr null)))
+  (block alive
+    (let ((f (call @fib.flags t)))
+      (br (icmp ne (and f (i32 12)) (i32 0)) uncounted counted)))
+  (block uncounted (call @fib.unlock lockp) (ret t))
+  (block counted
+    (let ((cp (getelementptr %struct.fib.hdr t (i32 0) (i32 0))))
+      (br retry)))
+  (block retry
+    (let ((c (load i64 cp)))
+      (br (icmp eq c (i64 0)) gone bump)))
+  (block gone (call @fib.unlock lockp) (ret (ptr null)))
+  (block bump
+    (let ((r (cmpxchg acq_rel monotonic cp c (add c (i64 1)))))
+      (br (extractvalue r 1) got retry)))
+  (block got (call @fib.unlock lockp) (ret t)))
+
+;; From fib.drop, before the children are released: the box's target
+;; is cleared and the box leaves the table.
+(define internal (fib.weak-clear void) ((ptr obj))
+  (block entry
+    (call @fib.lock @fib.weak-lock)
+    (let ((b (call @fib.weak-find obj)))
+      (br (icmp eq b (ptr null)) done clear)))
+  (block clear
+    (let ((lockp (getelementptr %struct.fib.weakbox b (i32 0) (i32 3))))
+      (call @fib.lock lockp)
+      (store (ptr null) (getelementptr %struct.fib.weakbox b (i32 0) (i32 4)))
+      (call @fib.unlock lockp)
+      (call @fib.weak-unlink-locked b)
+      (br done)))
+  (block done (call @fib.unlock @fib.weak-lock) (ret)))
+
+;; Removes b from the list; the table lock is held.
+(define internal (fib.weak-unlink-locked void) ((ptr b))
+  (block entry (br scan))
+  (block scan
+    (let ((slot (phi ptr (entry @fib.weak-list) (next slot2)))
+          (cur (load ptr slot)))
+      (br (icmp eq cur (ptr null)) done test)))
+  (block test (br (icmp eq cur b) unlink next))
+  (block unlink
+    (store (load ptr (getelementptr %struct.fib.weakbox b (i32 0) (i32 5))) slot)
+    (br done))
+  (block next
+    (let ((slot2 (getelementptr %struct.fib.weakbox cur (i32 0) (i32 5))))
+      (br scan)))
+  (block done (ret)))
+
+;; The drop of a weak box (its count reached zero): it leaves the
+;; table if it is still in it; the target is not counted.
+(define internal (fib.weak-drop void) ((ptr b))
+  (block entry
+    (call @fib.lock @fib.weak-lock)
+    (call @fib.weak-unlink-locked b)
+    (call @fib.unlock @fib.weak-lock)
+    (ret)))

@@ -1,0 +1,41 @@
+;; fib.rt, arrays (types §8.3): header, length, then the elements in
+;; the same allocation. The element type is the caller's; these
+;; functions see only its size.
+
+;; A fresh array of n elements of esize bytes, of type id tid; the
+;; elements are the caller's to fill. A negative n traps as the
+;; interpreter does (eval/arrays.rs).
+(define internal (fib.array-alloc ptr) ((i64 n) (i32 tid) (i64 esize))
+  (block entry (br (icmp slt n (i64 0)) bad ok))
+  (block bad
+    (let ((buf (alloca i8 (i32 96)))
+          (len (call @snprintf buf (i64 96) (string "array of negative length %lld") n)))
+      (call @fib.trap-bytes buf (sext i64 len))
+      (unreachable)))
+  (block ok
+    (let ((a (call @fib.alloc (add (i64 24) (mul n esize)) tid)))
+      (store n (getelementptr %struct.fib.array.i8 a (i32 0) (i32 3)))
+      (ret a))))
+
+(define internal (fib.array-len i64) ((ptr a))
+  (block entry (ret (load i64 (getelementptr %struct.fib.array.i8 a (i32 0) (i32 3))))))
+
+;; The elements [i, j) of a as a fresh array (array-copy), not yet
+;; retained; out of range traps with the interpreter's message.
+(define internal (fib.array-slice ptr) ((ptr a) (i64 i) (i64 j) (i32 tid) (i64 esize))
+  (block entry
+    (let ((n (call @fib.array-len a))
+          (bad (or (icmp slt i (i64 0)) (or (icmp sgt i j) (icmp sgt j n)))))
+      (br bad range ok)))
+  (block range
+    (let ((buf (alloca i8 (i32 96)))
+          (len (call @snprintf buf (i64 96) (string "array-copy [%lld, %lld) out of range 0..%lld") i j n)))
+      (call @fib.trap-bytes buf (sext i64 len))
+      (unreachable)))
+  (block ok
+    (let ((m (sub j i))
+          (r (call @fib.array-alloc m tid esize))
+          (src (getelementptr i8 (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)) (mul i esize)))
+          (dst (getelementptr %struct.fib.array.i8 r (i32 0) (i32 4) (i64 0))))
+      (call @memcpy dst src (mul m esize))
+      (ret r))))

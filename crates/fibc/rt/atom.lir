@@ -1,0 +1,38 @@
+;; fib.rt, atoms and share marking (types §8.6, §8.8): the spinlock of
+;; an atom or a weak box (a cmpxchg on its i32 lock word), and
+;; fib.share, which marks an object and everything reachable from it
+;; SHARED through the type table's trace functions.
+(declare sched_yield i32 ())
+
+(define internal (fib.lock void) ((ptr lockp))
+  (block entry (br spin))
+  (block spin
+    (let ((r (cmpxchg acquire monotonic lockp (i32 0) (i32 1))))
+      (br (extractvalue r 1) done wait)))
+  (block wait (call @sched_yield) (br spin))
+  (block done (ret)))
+
+(define internal (fib.unlock void) ((ptr lockp))
+  (block entry (atomic-store release (i32 0) lockp) (ret)))
+
+;; §8.8: set SHARED with atomicrmw or, stopping at objects already
+;; SHARED and at IMMORTAL ones, then walk the children.
+(define internal (fib.share void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done check))
+  (block check
+    (let ((f (call @fib.flags p)))
+      (br (icmp ne (and f (i32 9)) (i32 0)) done mark)))
+  (block mark
+    (atomicrmw or monotonic (getelementptr %struct.fib.hdr p (i32 0) (i32 2)) (i32 1))
+    (let ((tid (call @fib.tid p))
+          (rec (getelementptr %struct.fib.typerec @fib.types tid (i32 1))))
+      (indirect-call (load ptr rec) (fn void (ptr ptr)) p @fib.share)
+      (br done)))
+  (block done (ret)))
+
+;; Share-marks v when the holder h is SHARED (§8.6: a value stored
+;; into a shared atom is marked before the store).
+(define internal (fib.share-into void) ((ptr h) (ptr v))
+  (block entry (br (icmp ne (and (call @fib.flags h) (i32 1)) (i32 0)) yes done))
+  (block yes (call @fib.share v) (br done))
+  (block done (ret)))
