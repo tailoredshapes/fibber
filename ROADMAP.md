@@ -47,7 +47,15 @@ evaluator over the audited heap.
       different from a copy-in when a later argument of the same call
       wrote the variable. The owner decided (2026-09-28) that the
       copy-in happens at call entry, after every argument (types §10);
-      fibref and fibgen's model follow it, and cases 150 to 153 pin it
+      fibref and fibgen's model follow it, and cases 150 to 153 pin it.
+      `fibgen` now also generates the colour-parameterised enum `(Job k
+      :colour)`, `(Weak (dyn P :send))` and `(Atom (dyn P :send))`
+      crossing threads, and floats with NaN, infinities and `rem`. A
+      sweep of seeds 800000..859999 gave 59409 ok, 319 traps the model
+      predicted and 272 `POSSIBLE-OVERREJECTION`, all impls on `(Hook k)`
+      whose bodies use `self` as a `(Hook :local)` or join it with a new
+      `Hook`: an open spec question (Open decisions, below); no
+      mismatch, audit failure, crash or hang
 - [x] the owner's decisions of 2026-09-28 (spec/types.md §10): lift
       the "v1" restrictions and fix what a trap means; cases 101 to 127:
       125 cases, all passing
@@ -142,3 +150,22 @@ else in the library:
   captures the `&` parameter is still observably different from a
   copied-in one (types §10, "Decided on the time of the copy-in",
   Open).
+- **The colour argument inside an `impl` on a colour-parameterised
+  type** (types §1.3, last bullet: "treated as `local`") is unsound as
+  written, and fibref, which follows it for field reads, accepts a
+  program that fails the memory audit: with `(defstruct (Slot k
+  :colour) (c: (Cell (fn k () i64))))`, an `(impl P (Slot k) (m (self
+  d) (set! (. self c) (fn () @d))))` stores a closure over a cell into
+  a `(Slot :send)`, which the caller then spawns (case 126's race,
+  moved into an impl body; fibref: `audit error: SharedCell`).
+  `local` is conservative only for reading a closure out of `self`; for
+  writing into `self`, or for a result of type `Self` (or a determined
+  parameter mentioning `k`), it is the unsound direction. fibref also
+  rejects the head's `k` where a `(Hook :local)` is expected and where
+  a new `(Hook ..)` joins `self` (`cannot unify (Hook _) with (Hook
+  k)`), which the rule and both candidates below accept. Candidate rules: `k` rigid in the
+  bodies with fields read at `k` (sound; rejects passing `self` as
+  `(Hook :local)`); or `k` generalised like a `defun`'s colour, the
+  instance existing per colour its bodies allow. No case pins either
+  until the owner decides; `fibgen` generates the over-rejected form
+  and its sweeps count it as `POSSIBLE-OVERREJECTION`.
