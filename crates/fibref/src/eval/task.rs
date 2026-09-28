@@ -32,7 +32,7 @@ use super::error::{RunError, R};
 use super::expr::Flow;
 use super::interp::{Frame, Interp};
 use super::object::{AsyncBody, Obj, TaskData, TaskState};
-use super::sched::Wait;
+use super::sched::{Job, Wait};
 use super::value::Val;
 
 impl<'p> Interp<'p> {
@@ -61,7 +61,7 @@ impl<'p> Interp<'p> {
         let fid = f.expect_obj("the thunk of spawn")?;
         self.heap.mark_shared(fid)?;
         let result = self.result_atom()?;
-        let tid = self.sched.fresh();
+        let (tid, pooled) = self.sched.slot();
         let data = TaskData {
             body: None,
             state: TaskState::Running,
@@ -70,7 +70,12 @@ impl<'p> Interp<'p> {
         };
         let task = self.new_task(Vec::new(), data)?;
         self.heap.retain(task)?;
-        self.start_thread(tid, f.clone(), task, pos.clone())?;
+        let job = Job {
+            f: f.clone(),
+            task,
+            pos: pos.clone(),
+        };
+        self.start_thread(tid, pooled, job)?;
         Ok(Val::Obj(task))
     }
 

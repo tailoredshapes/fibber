@@ -4,7 +4,8 @@
 //!
 //! Every thread a program spawns runs on an OS thread of its own (it
 //! needs a stack of its own to be suspended in the middle of an
-//! evaluation), but only one of them runs at a time: the one holding
+//! evaluation; a finished thread's OS thread runs a later one), but
+//! only one of them runs at a time: the one holding
 //! the [`Turn`]. The holder decides who runs next, by a fixed policy,
 //! at the scheduling points listed in [`QUANTUM`]'s documentation; so a
 //! run is one interleaving, the same on every run, and fair (a thread
@@ -19,6 +20,8 @@ use crate::heap::ObjId;
 use super::error::RunError;
 use super::fx::FxMap;
 use super::interp::Frame;
+use super::value::Val;
+use crate::syntax::Pos;
 
 /// A thread of the program: 0 is the one that runs `main` (or the
 /// `def`s, or a macro); spawned threads are numbered from 1 in the
@@ -114,6 +117,18 @@ impl Turn {
     }
 }
 
+/// What a spawned thread runs: its thunk (consumed), its task (the
+/// thread's count on it), the position of the `spawn`.
+#[derive(Debug)]
+pub struct Job {
+    /// The thunk.
+    pub f: Val,
+    /// The task.
+    pub task: ObjId,
+    /// Where it was spawned.
+    pub pos: Pos,
+}
+
 /// What a suspended thread had in the interpreter.
 #[derive(Debug)]
 pub struct Saved<'p> {
@@ -141,6 +156,11 @@ pub struct Sched<'p> {
     pub blocked: Vec<(Tid, Wait)>,
     /// The state of every suspended thread.
     pub saved: FxMap<Tid, Saved<'p>>,
+    /// The job of every thread started and not yet running.
+    pub jobs: FxMap<Tid, Job>,
+    /// The numbers under which idle OS threads, whose threads finished,
+    /// wait to run a new one.
+    pub idle: Vec<Tid>,
     /// Spawned threads not yet finished.
     pub live: usize,
     /// Scheduling points left in the current thread's quantum.
@@ -171,6 +191,8 @@ impl Default for Sched<'_> {
             ready: VecDeque::new(),
             blocked: Vec::new(),
             saved: FxMap::default(),
+            jobs: FxMap::default(),
+            idle: Vec::new(),
             live: 0,
             left: QUANTUM,
             abort: None,
@@ -183,6 +205,15 @@ impl Sched<'_> {
     pub fn fresh(&mut self) -> Tid {
         self.last += 1;
         self.last
+    }
+
+    /// A new thread's number, and whether an idle OS thread waits under
+    /// it (else the thread needs a new one).
+    pub fn slot(&mut self) -> (Tid, bool) {
+        match self.idle.pop() {
+            Some(t) => (t, true),
+            None => (self.fresh(), false),
+        }
     }
 
     /// Uses one scheduling point: whether the quantum is used up (it
