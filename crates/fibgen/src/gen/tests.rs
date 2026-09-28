@@ -90,3 +90,31 @@ fn rigid_hook_impls_read_self_only_through_fields() {
         }
     }
 }
+
+/// A spin-wait on an atom another thread sets (`tasks::spin_wait`) is
+/// generated, some whose thread outlasts a quantum so that main really
+/// spins, and `fibref`'s fair executor (types §8.8) runs each to the
+/// value the model predicts.
+#[test]
+fn spin_waits_run_to_the_models_value() {
+    let spins: Vec<(u64, Program)> = (0..400)
+        .map(|s| (s, generate(s, 1 + (s % 6) as u32)))
+        .filter(|(_, p)| print::program(p).contains("(loop ()"))
+        .take(8)
+        .collect();
+    let long = |p: &Program| {
+        let t = print::program(p);
+        t.contains(" 1500) (recur") || t.contains(" 3000) (recur")
+    };
+    assert!(spins.iter().any(|(_, p)| long(p)));
+    for (seed, p) in &spins {
+        let (v, _) = crate::driver::check(p, std::time::Duration::from_secs(120));
+        assert!(
+            matches!(
+                v.class,
+                crate::run::Class::Ok | crate::run::Class::ExpectedTrap
+            ),
+            "seed {seed}: {v:?}"
+        );
+    }
+}

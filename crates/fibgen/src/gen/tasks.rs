@@ -2,7 +2,7 @@
 //! `block-on` (syntax §3.12, §3.14). Code that runs elsewhere is
 //! generated in a context holding only sendable captures (types §5).
 
-use crate::ast::{Expr, Kind};
+use crate::ast::{Expr, Kind, Pat};
 use crate::ty::Ty;
 
 use super::{funcs, Ctx, Gen, Region, Var, VarKind};
@@ -100,4 +100,76 @@ pub fn pmap(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
 pub fn pmap_sum(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
     let p = pmap(g, cx, d - 1);
     Expr::call(Ty::Int, "sum-vec", vec![p])
+}
+
+/// A spin-wait on another thread (types §8.8):
+/// `(let ((sp (atom nil)) (t (spawn (fn () (do (busy n) (reset! sp (some
+/// e)) k))))) (+ (loop () (match @sp ((some x) x) (nil (recur)))) (join
+/// t)))`, `(busy n)` a loop of `n` empty turns. The model runs the
+/// spawned thread at the spawn, so the loop finds `(some e)` at once
+/// and the model predicts the value; `fibref`'s executor runs main's
+/// spin while the thread still works whenever the thread outlasts a
+/// quantum (1000 scheduling points, which `n` often exceeds), and the
+/// spin must then yield for the thread to finish.
+pub fn spin_wait(g: &mut Gen, cx: &Ctx, d: u32) -> Option<Expr> {
+    if !cx.atoms_readable() {
+        return None;
+    }
+    let (sp, t, x) = (g.fresh("sp"), g.fresh("t"), g.fresh("x"));
+    let ot = Ty::opt(Ty::Int);
+    let at = Ty::atom(ot.clone());
+    let tt = Ty::task(Ty::Int);
+    let task_cx = cx.for_region(Region::Task, false).for_closure(true);
+    let e = g.expr(&task_cx, &Ty::Int, d - 1);
+    let k = g.expr(&task_cx, &Ty::Int, d - 1);
+    let some = Expr::call(ot.clone(), "some", vec![e]);
+    let store = Expr::call(Ty::Unit, "reset!", vec![Expr::var(&sp, at.clone()), some]);
+    let n = [0, 500, 1500, 3000][g.rng.below(4)];
+    let body = Expr::new(Ty::Int, Kind::Do(vec![busy(g, n), store, k]));
+    let f = Expr::new(
+        Ty::Func(Vec::new(), Box::new(Ty::Int)),
+        Kind::Fn(Vec::new(), Box::new(body)),
+    );
+    let read = Expr::new(
+        ot.clone(),
+        Kind::Deref(Box::new(Expr::var(&sp, at.clone()))),
+    );
+    let clauses = vec![
+        (
+            Pat::Some(Box::new(Pat::Bind(x.clone()))),
+            Expr::var(&x, Ty::Int),
+        ),
+        (Pat::Nil, Expr::new(Ty::Int, Kind::Recur(Vec::new()))),
+    ];
+    let wait = Expr::new(Ty::Int, Kind::Match(Box::new(read), clauses));
+    let spin = Expr::new(Ty::Int, Kind::Loop(Vec::new(), Box::new(wait)));
+    let joined = Expr::call(Ty::Int, "join", vec![Expr::var(&t, tt.clone())]);
+    let binds = vec![
+        (
+            Pat::Bind(sp),
+            Expr::call(at, "atom", vec![Expr::new(ot, Kind::Nil)]),
+        ),
+        (Pat::Bind(t), Expr::call(tt, "spawn", vec![f])),
+    ];
+    let sum = Expr::call(Ty::Int, "+", vec![spin, joined]);
+    Some(Expr::new(Ty::Int, Kind::Let(binds, Box::new(sum))))
+}
+
+/// `(loop ((i 0)) (if (< i n) (recur (+ i 1)) ()))`: `n` scheduling
+/// points and nothing else.
+fn busy(g: &mut Gen, n: i64) -> Expr {
+    let i = g.fresh("i");
+    let iv = Expr::var(&i, Ty::Int);
+    let next = Expr::call(Ty::Int, "+", vec![iv.clone(), Expr::int(1)]);
+    let again = Expr::new(Ty::Unit, Kind::Recur(vec![next]));
+    let test = Expr::call(Ty::Bool, "<", vec![iv, Expr::int(n)]);
+    let unit = Expr::new(Ty::Unit, Kind::Unit);
+    let body = Expr::new(
+        Ty::Unit,
+        Kind::If(Box::new(test), Box::new(again), Box::new(unit)),
+    );
+    Expr::new(
+        Ty::Unit,
+        Kind::Loop(vec![(i, Expr::int(0))], Box::new(body)),
+    )
 }

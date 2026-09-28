@@ -15,7 +15,7 @@ pub fn literal_text(g: &mut Gen) -> String {
 }
 
 /// The weights of the `i64` productions of [`int`], in its order.
-const INT_WEIGHTS: [usize; 22] = [
+const INT_WEIGHTS: [usize; 23] = [
     2, // literal
     4, // arithmetic
     6, // observe a value of another type
@@ -38,6 +38,7 @@ const INT_WEIGHTS: [usize; 22] = [
     2, // arrays: made, read, copied, updated in place
     2, // values with derived Eq and Ord, compared
     1, // a (Job :send) crossing a thread
+    1, // a spin-wait on an atom another thread sets
 ];
 
 /// An `i64` expression: the fold of the program's observable state.
@@ -68,6 +69,7 @@ pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
         Some(19) => Some(arrays::array_int(g, cx, d)),
         Some(20) => Some(derive::compare_int(g, cx, d)),
         Some(21) => Some(jobs::cross(g, cx, d)),
+        Some(22) => tasks::spin_wait(g, cx, d),
         _ => None,
     };
     e.unwrap_or_else(|| Expr::int(g.small()))

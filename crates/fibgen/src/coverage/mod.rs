@@ -131,6 +131,7 @@ fn node_labels(e: &Expr, out: &mut Vec<String>) {
                 push("match binding sub-objects (nested pattern)");
             }
         }
+        Kind::Loop(bs, _) if bs.is_empty() => push("loop spinning on an atom another thread sets"),
         Kind::Loop(..) => push("loop"),
         Kind::Recur(..) => push("recur"),
         Kind::Fn(..) => push("fn literal"),
