@@ -231,7 +231,13 @@ Parameters and `let`-bound names are the function's **SSA names**:
   (`tc/phi_badlabel.lir`). A block that is the target of several edges
   of one terminator (a `br` with both labels equal) has one
   predecessor.
-- Every incoming value has type `T` (`tc/phi_wrong.lir`).
+- Every incoming value has type `T` (`tc/phi_wrong.lir`) and is a
+  name, `@name` or a literal: `phi incoming value must be a name, a
+  global or a constant` (an instruction there would have to run in the
+  predecessor, after its terminator's operands).
+- When one terminator names the block twice (`(br c j j)`, or a `switch`
+  with two cases to one label), LLVM wants one phi entry per edge; lIR
+  takes one per predecessor and `lair` repeats it per edge.
 - An incoming value from `M` is used at the end of `M`: a name in it
   must be bound in `M`, in a block that dominates `M`, or be a
   parameter (`x does not dominate the end of block M`). A `phi` may therefore name a value bound later in its own
@@ -544,6 +550,7 @@ internal error (see the top of this page).
 ```rust
 lir::parse(src: &str) -> Result<Module, Diagnostic>
 lir::check(&Module) -> Result<(), Vec<Diagnostic>>
+lir::check_main(&Module) -> Result<(), Diagnostic>          // §7.2
 lir::parse_and_check(src: &str) -> Result<Module, Vec<Diagnostic>>
 ```
 
@@ -552,35 +559,41 @@ lir::parse_and_check(src: &str) -> Result<Module, Vec<Diagnostic>>
 ```rust
 // JIT: compile modules in-process and call their functions.
 let mut jit = lair::Jit::new(lair::JitOptions::default())?;
-jit.add_source("macros", src)?;           // parse, check, lower, verify, add
+jit.add_source("macros", src)?;            // parse, check, lower, verify, add
+let t: lair::FnType = jit.signature("f")?;  // the lIR type, to check before transmuting
 let f: extern "C" fn(i64) -> i64 = unsafe { jit.function("f")? };
-let t: lair::FnType = jit.signature("f")?; // the lIR type, to check before transmuting
+let a: usize = jit.address("f")?;           // the raw address
 ```
 
-- `Jit::add_source` and `Jit::add_module` run the whole pipeline of
-  this page; an error is returned, nothing is added, and the `Jit` stays
-  usable.
+- `Jit::add_source(name, src)` and `Jit::add_module(name, &module)` run
+  the whole pipeline of this page; on an error nothing is added and the
+  `Jit` stays usable.
 - Several modules may be added to one `Jit`. A later module reaches an
-  earlier one's functions and globals by `declare` (functions); a
-  `declare` whose type differs from the earlier `define` is an error
-  `declaration of @f does not match its definition in module m`, and a
-  second definition of a name is `duplicate definition of @f (first in
-  module m)`. Declared functions defined in no module resolve to the
-  host process's symbols (the C library), and an unresolved one is an
-  error at lookup.
-- `Jit::function::<F>(name)` returns the address of a defined function
-  as `F` (a function pointer type); it is `unsafe` because Rust cannot
-  check `F` against the lIR type: callers compare `signature(name)`
-  first. `lair::call_i64` and friends wrap the common cases safely.
+  earlier one's functions by `declare`; a `declare` whose type differs
+  from the earlier `define` is `declaration of @f does not match its
+  definition in module m`, and a second definition of a name is
+  `duplicate definition of @f (first in module m)`. A declared function
+  defined by no module must be in the host process (the C library and
+  what it loaded), else the module is rejected when added: `undefined
+  symbol @f: defined by no module of this JIT and not in the process`.
+- `signature`, `address` and `function` accept only functions defined
+  in the `Jit` (not globals, not declarations).
+- `Jit::function::<F>(name)` is `unsafe`: Rust cannot check `F` against
+  the lIR type, so callers compare `signature(name)` first; `F` must be
+  pointer-sized or it is an error. A `tailcc` function cannot be called
+  from Rust directly.
 - Function pointers stay valid until the `Jit` is dropped.
 - `JitOptions { opt_level }`: 0 (default) runs no IR optimisation; 1 to
   3 run LLVM's `default<On>` pipeline before code generation.
 
 ```rust
-// AOT: to an object file, assembly, LLVM IR or an executable.
-lair::aot::emit(&module, lair::aot::Output::Object, &opts) -> Result<Vec<u8>, Error>
-lair::aot::build_executable(&module, path, &opts) -> Result<(), Error>   // links with `cc`
+// AOT: object file, assembly, LLVM IR, or an executable.
+lair::aot::emit(&module, name, lair::aot::Output::Object, &opts) -> Result<Vec<u8>>
+lair::aot::build_executable(&module, name, path, &opts) -> Result<()>   // `cc` with -lm and opts.libs
 ```
+
+The checker and the lowering recurse over expressions, at most 512
+deep (§1); the checker is tested at depth 504 on a 2 MB thread.
 
 Both paths share one lowering and the same checks; both set the host
 target's triple and data layout on the module.
@@ -635,3 +648,9 @@ error containing `internal error` never satisfies a case. `cargo test
 5. Should `lair` offer lIR-level names for the overflow intrinsics
    (`llvm.sadd.with.overflow`, `llvm.fptosi.sat`) that types.md §8.12
    says fibber may use? Not added: `llvm.` names are reserved (§4.1).
+6. Names are bound once per function (§5.3). liar let a second `let`
+   rebind a name (`lir-audit/cmp/aot.lir` did, and its case renames
+   it); fibber's compiler generates fresh names anyway. Keep the rule?
+7. The typed direct-access rule (§6.5) and the phi-operand rule (§5.4)
+   are stricter than LLVM. Both catch only what is visible in the
+   module. Keep them?
