@@ -17,6 +17,8 @@ pub enum Type {
     Named(String),
     /// `{ T* }`
     Anon(Vec<Type>),
+    /// `[N x T]`
+    Array(u64, Box<Type>),
 }
 
 /// A calling convention (spec/lir.md §4.2).
@@ -83,7 +85,7 @@ impl Type {
     }
 
     pub fn is_aggregate(&self) -> bool {
-        matches!(self, Type::Named(_) | Type::Anon(_))
+        matches!(self, Type::Named(_) | Type::Anon(_) | Type::Array(..))
     }
 
     /// Lanes of a vector type.
@@ -101,7 +103,7 @@ impl Type {
             Type::Float => Some(32),
             Type::Double => Some(64),
             Type::Vector(n, e) => e.bits().map(|b| b * u64::from(*n)),
-            Type::Ptr | Type::Named(_) | Type::Anon(_) => None,
+            Type::Ptr | Type::Named(_) | Type::Anon(_) | Type::Array(..) => None,
         }
     }
 
@@ -123,6 +125,7 @@ impl fmt::Display for Type {
             Type::Ptr => write!(f, "ptr"),
             Type::Vector(n, e) => write!(f, "<{n} x {e}>"),
             Type::Named(s) => write!(f, "%struct.{s}"),
+            Type::Array(n, e) => write!(f, "[{n} x {e}]"),
             Type::Anon(fs) if fs.is_empty() => write!(f, "{{ }}"),
             Type::Anon(fs) => {
                 let parts: Vec<String> = fs.iter().map(|t| t.to_string()).collect();
@@ -180,6 +183,9 @@ mod tests {
         assert_eq!(pair.to_string(), "{ ptr, ptr }");
         assert_eq!(Type::Vector(4, Box::new(I32)).to_string(), "<4 x i32>");
         assert_eq!(Type::Named("s".into()).to_string(), "%struct.s");
+        let arr = Type::Array(3, Box::new(Type::Array(0, Box::new(Type::Ptr))));
+        assert_eq!(arr.to_string(), "[3 x [0 x ptr]]");
+        assert!(arr.is_aggregate() && arr.bits().is_none());
         let f = FnType {
             cc: Cc::Tail,
             ret: None,

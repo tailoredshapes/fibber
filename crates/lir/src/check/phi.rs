@@ -92,7 +92,7 @@ impl<'a> Fcx<'a> {
         match &v.kind {
             k if k.is_terminator() => err(v.pos, "terminator used as a value"),
             Kind::Local(n) => self.lookup_at_end(n, m, v.pos),
-            Kind::Store(..) | Kind::AtomicStore(..) | Kind::Fence(..) => void(),
+            Kind::Store { .. } | Kind::AtomicStore(..) | Kind::Fence(..) | Kind::Trap => void(),
             Kind::Call {
                 callee: Callee::Direct(f),
                 ..

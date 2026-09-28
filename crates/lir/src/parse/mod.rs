@@ -6,6 +6,7 @@ mod expr;
 mod instr;
 mod items;
 mod literal;
+mod memory;
 mod names;
 mod ty;
 

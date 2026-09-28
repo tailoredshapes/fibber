@@ -64,8 +64,8 @@ impl<'a> Fcx<'a> {
     pub fn memory(&mut self, e: &'a Expr) -> Result<Option<Type>> {
         let p = e.pos;
         match &e.kind {
-            Kind::Alloca(t, count) => {
-                self.valid(t, p)?;
+            Kind::Alloca { ty, count, .. } => {
+                self.valid(ty, p)?;
                 if let Some(c) = count {
                     let tc = self.val(c)?;
                     if !tc.is_int() {
@@ -74,13 +74,13 @@ impl<'a> Fcx<'a> {
                 }
                 Ok(Some(Type::Ptr))
             }
-            Kind::Load(t, ptr) => {
-                self.valid(t, p)?;
+            Kind::Load { ty, ptr, .. } => {
+                self.valid(ty, p)?;
                 self.pointer("load", ptr, p)?;
-                self.direct("load", t, ptr, p)?;
-                Ok(Some(t.clone()))
+                self.direct("load", ty, ptr, p)?;
+                Ok(Some(ty.clone()))
             }
-            Kind::Store(v, ptr) => self.store(v, ptr, p).map(|_| None),
+            Kind::Store { value, ptr, .. } => self.store(value, ptr, p).map(|_| None),
             Kind::Gep {
                 ty, ptr, indices, ..
             } => self.gep(ty, ptr, indices, p).map(Some),
@@ -114,28 +114,35 @@ impl<'a> Fcx<'a> {
             if k == 0 {
                 continue;
             }
-            let Some(fields) = self.env.fields(&cur) else {
-                return err(p, format!("getelementptr cannot index into {cur}"));
-            };
-            let f = match (&i.kind, &ti) {
-                (Kind::Int(..), Type::Int(32)) => i.int_literal().unwrap_or(-1),
-                _ => {
-                    return err(
-                        p,
-                        "getelementptr: struct field index must be a constant i32",
-                    )
-                }
-            };
-            if f < 0 || f as usize >= fields.len() {
-                let f = (f as u128) & 0xffff_ffff;
-                return err(
-                    p,
-                    format!("getelementptr: field index {f} out of range for {cur}"),
-                );
-            }
-            cur = fields[f as usize].clone();
+            cur = self.gep_step(&cur, i, &ti, p)?;
         }
         Ok(Type::Ptr)
+    }
+
+    /// One index after the first: into an array by any integer (a
+    /// constant one in range), into a struct by a constant `i32`.
+    fn gep_step(&self, cur: &Type, i: &Expr, ti: &Type, p: Pos) -> Result<Type> {
+        if let Type::Array(n, elem) = cur {
+            // A [0 x T] is a trailing member of unknown length.
+            return match i.int_literal() {
+                Some(v) if *n > 0 => self.step("getelementptr", cur, v, p),
+                _ => Ok((**elem).clone()),
+            };
+        }
+        if !cur.is_aggregate() {
+            return err(p, format!("getelementptr cannot index into {cur}"));
+        }
+        let f = match (&i.kind, ti) {
+            (Kind::Int(..), Type::Int(32)) => i.int_literal().unwrap_or(-1),
+            _ => {
+                return err(
+                    p,
+                    "getelementptr: struct field index must be a constant i32",
+                )
+            }
+        };
+        let shown = (f as u128) & 0xffff_ffff;
+        self.step("getelementptr", cur, shown as i128, p)
     }
 
     fn atomic(&mut self, e: &'a Expr) -> Result<Option<Type>> {

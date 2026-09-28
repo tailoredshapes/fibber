@@ -61,6 +61,12 @@ pub fn check_main(m: &Module) -> Result<(), Diagnostic> {
                 if f.ty.cc != Cc::C || f.ty.ret != Some(Type::Int(32)) || !ok_params {
                     return bad(f.pos);
                 }
+                if !f.mods.linkage.exported() {
+                    return Err(Diagnostic::new(
+                        f.pos,
+                        "main must not be private or internal",
+                    ));
+                }
                 return Ok(());
             }
             Item::Declare(d) if d.name == "main" => return bad(d.pos),

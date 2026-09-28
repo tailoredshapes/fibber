@@ -15,6 +15,13 @@ const RESERVED: &[&str] = &[
     "singlethread",
     "weak",
     "inbounds",
+    "volatile",
+    "align",
+    "zeroinitializer",
+    "private",
+    "internal",
+    "external",
+    "hidden",
 ];
 
 /// A type keyword or one of the reserved words.
@@ -53,7 +60,9 @@ mod tests {
                 .message
                 .contains("invalid name"));
         }
-        for r in ["i32", "acquire", "null", "ptr", "weak"] {
+        for r in [
+            "i32", "acquire", "null", "ptr", "weak", "volatile", "hidden",
+        ] {
             assert!(valid_name(r, p)
                 .unwrap_err()
                 .message

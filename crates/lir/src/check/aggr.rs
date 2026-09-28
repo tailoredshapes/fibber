@@ -43,6 +43,45 @@ impl<'a> Fcx<'a> {
         Ok(ty)
     }
 
+    /// `([N x T] v..)`: the parser fixed the count; each element is `T`.
+    pub fn array_literal(&mut self, ty: &Type, elems: &'a [Expr], p: Pos) -> Result<Type> {
+        self.valid(ty, p)?;
+        let Type::Array(_, elem) = ty else {
+            return err(p, "not an array type");
+        };
+        for (i, e) in elems.iter().enumerate() {
+            let got = self.val(e)?;
+            if got != **elem {
+                return err(
+                    e.pos,
+                    format!(
+                        "{ty} literal: element {} has type {got}, expected {elem}",
+                        i + 1
+                    ),
+                );
+            }
+        }
+        Ok(ty.clone())
+    }
+
+    /// One constant index step into an aggregate: a struct's field or
+    /// an array's element, both in range.
+    pub fn step(&self, op: &str, cur: &Type, i: i128, p: Pos) -> Result<Type> {
+        if let Type::Array(n, elem) = cur {
+            if i < 0 || i as u128 >= u128::from(*n) {
+                return err(p, format!("{op}: index {i} out of range for {cur}"));
+            }
+            return Ok((**elem).clone());
+        }
+        let Some(fields) = self.env.fields(cur) else {
+            return err(p, format!("{op}: cannot index into {cur}"));
+        };
+        if i < 0 || i as u128 >= fields.len() as u128 {
+            return err(p, format!("{op}: field index {i} out of range for {cur}"));
+        }
+        Ok(fields[i as usize].clone())
+    }
+
     fn vector_of(&mut self, op: &str, v: &'a Expr, p: Pos) -> Result<(u32, Type)> {
         match self.val(v)? {
             Type::Vector(n, e) => Ok((n, *e)),
@@ -110,25 +149,19 @@ impl<'a> Fcx<'a> {
         Ok(Type::Vector(lanes.len() as u32, Box::new(el)))
     }
 
-    /// The type reached by `idx` from struct type `t`.
+    /// The type reached by `idx` from aggregate type `t`.
     fn field_path(&self, op: &str, t: &Type, idx: &[i128], p: Pos) -> Result<Type> {
-        let mut cur = t.clone();
-        for &i in idx {
-            let Some(fields) = self.env.fields(&cur) else {
-                return err(p, format!("{op}: cannot index into {cur}"));
-            };
-            if i < 0 || i as usize >= fields.len() || i > u32::MAX as i128 {
-                return err(p, format!("{op}: field index {i} out of range for {cur}"));
-            }
-            cur = fields[i as usize].clone();
-        }
-        Ok(cur)
+        idx.iter()
+            .try_fold(t.clone(), |cur, &i| self.step(op, &cur, i, p))
     }
 
     pub fn extract_value(&mut self, a: &'a Expr, idx: &[i128], p: Pos) -> Result<Type> {
         let ta = self.val(a)?;
         if !ta.is_aggregate() {
-            return err(p, format!("extractvalue needs a struct, found {ta}"));
+            return err(
+                p,
+                format!("extractvalue needs a struct or array, found {ta}"),
+            );
         }
         self.field_path("extractvalue", &ta, idx, p)
     }
@@ -136,7 +169,10 @@ impl<'a> Fcx<'a> {
     pub fn insert_value(&mut self, a: &'a Expr, v: &'a Expr, idx: &[i128], p: Pos) -> Result<Type> {
         let ta = self.val(a)?;
         if !ta.is_aggregate() {
-            return err(p, format!("insertvalue needs a struct, found {ta}"));
+            return err(
+                p,
+                format!("insertvalue needs a struct or array, found {ta}"),
+            );
         }
         let want = self.field_path("insertvalue", &ta, idx, p)?;
         let tv = self.val(v)?;

@@ -3,12 +3,15 @@
 use super::expr::parse_expr;
 use super::ty::{parse_cc, parse_params, parse_ret, parse_type};
 use super::{arity, atom, label, valid_name};
-use crate::ast::{Block, Declare, Function, GlobalDef, Item, Module, StructDef};
+use crate::ast::{
+    Block, Declare, Function, GlobalDecl, GlobalDef, Item, Linkage, Modifiers, Module, StructDef,
+};
 use crate::diag::{err, Pos, Result};
 use crate::sexp::Sexp;
 use crate::types::FnType;
 
-const TOP: &str = "expected a top-level form (define, declare, defstruct, global, constant)";
+const TOP: &str =
+    "expected a top-level form (define, declare, declare-global, defstruct, global, constant)";
 
 /// Parse every top-level form.
 pub fn module(forms: &[Sexp]) -> Result<Module> {
@@ -26,6 +29,7 @@ fn item(form: &Sexp) -> Result<Item> {
         "defstruct" => defstruct(rest, *pos),
         "global" => global(rest, *pos, false),
         "constant" => global(rest, *pos, true),
+        "declare-global" => declare_global(rest, *pos),
         "declare" => declare(rest, *pos),
         "define" => define(rest, *pos),
         _ => err(*pos, format!("{TOP}, found {}", form.describe())),
@@ -46,21 +50,94 @@ fn defstruct(rest: &[Sexp], pos: Pos) -> Result<Item> {
     Ok(Item::Struct(StructDef { name, fields, pos }))
 }
 
+/// The linkage and visibility words at the front of `items`, and how
+/// many they took (spec/lir.md §4.3).
+fn modifiers(items: &[Sexp]) -> Result<(Modifiers, usize)> {
+    let mut m = Modifiers::default();
+    let (mut linkage_seen, mut n) = (false, 0);
+    for s in items {
+        let Some(word) = s.atom() else { break };
+        let linkage = match word {
+            "private" => Some(Linkage::Private),
+            "internal" => Some(Linkage::Internal),
+            "external" => Some(Linkage::External),
+            "hidden" => None,
+            _ => break,
+        };
+        let dup = if linkage.is_some() {
+            linkage_seen
+        } else {
+            m.hidden
+        };
+        if dup {
+            if linkage.is_some_and(|l| l != m.linkage) {
+                return err(
+                    s.pos(),
+                    format!("{} and {word} exclude each other", show(m.linkage)),
+                );
+            }
+            return err(s.pos(), format!("duplicate modifier {word}"));
+        }
+        match linkage {
+            Some(l) => (m.linkage, linkage_seen) = (l, true),
+            None => m.hidden = true,
+        }
+        n += 1;
+    }
+    Ok((m, n))
+}
+
+fn show(l: Linkage) -> &'static str {
+    match l {
+        Linkage::External => "external",
+        Linkage::Internal => "internal",
+        Linkage::Private => "private",
+    }
+}
+
+/// A `declare` or `declare-global` takes `hidden` only.
+fn declared_hidden(op: &str, items: &[Sexp]) -> Result<(bool, usize)> {
+    let (m, n) = modifiers(items)?;
+    if m.linkage != Linkage::External || items[..n].iter().any(|s| s.atom() == Some("external")) {
+        return err(
+            items[0].pos(),
+            format!("{op} cannot be {}", show(m.linkage)),
+        );
+    }
+    Ok((m.hidden, n))
+}
+
 fn global(rest: &[Sexp], pos: Pos, constant: bool) -> Result<Item> {
     let op = if constant { "constant" } else { "global" };
+    let (mods, k) = modifiers(rest)?;
+    let rest = &rest[k..];
     arity(op, rest, 3, pos)?;
     Ok(Item::Global(GlobalDef {
         name: global_name(&rest[0])?,
         ty: parse_type(&rest[1])?,
         init: parse_expr(&rest[2])?,
         constant,
+        mods,
+        pos,
+    }))
+}
+
+fn declare_global(rest: &[Sexp], pos: Pos) -> Result<Item> {
+    let (hidden, k) = declared_hidden("declare-global", rest)?;
+    let rest = &rest[k..];
+    arity("declare-global", rest, 2, pos)?;
+    Ok(Item::DeclareGlobal(GlobalDecl {
+        name: global_name(&rest[0])?,
+        ty: parse_type(&rest[1])?,
+        hidden,
         pos,
     }))
 }
 
 fn declare(rest: &[Sexp], pos: Pos) -> Result<Item> {
-    let (cc, k) = parse_cc(rest);
-    let rest = &rest[k..];
+    let (hidden, k) = declared_hidden("declare", rest)?;
+    let (cc, j) = parse_cc(&rest[k..]);
+    let rest = &rest[k + j..];
     arity("declare", rest, 3, pos)?;
     let name = global_name(&rest[0])?;
     let ret = parse_ret(&rest[1])?;
@@ -71,12 +148,18 @@ fn declare(rest: &[Sexp], pos: Pos) -> Result<Item> {
         params,
         varargs,
     };
-    Ok(Item::Declare(Declare { name, ty, pos }))
+    Ok(Item::Declare(Declare {
+        name,
+        ty,
+        hidden,
+        pos,
+    }))
 }
 
 fn define(rest: &[Sexp], pos: Pos) -> Result<Item> {
-    let (cc, k) = parse_cc(rest);
-    let rest = &rest[k..];
+    let (mods, k) = modifiers(rest)?;
+    let (cc, j) = parse_cc(&rest[k..]);
+    let rest = &rest[k + j..];
     if rest.len() < 2 {
         return err(pos, "define expects (NAME R), parameters and blocks");
     }
@@ -97,6 +180,7 @@ fn define(rest: &[Sexp], pos: Pos) -> Result<Item> {
         ty,
         params,
         blocks,
+        mods,
         pos,
     }))
 }

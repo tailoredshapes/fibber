@@ -3,7 +3,7 @@
 use super::expr::{exprs, operand, type_arg};
 use super::literal::int_token;
 use super::{arity, atom};
-use crate::ast::{BinOp, CastOp, Expr, FPred, IPred, Kind, UnOp};
+use crate::ast::{BinOp, CastOp, Expr, FPred, IPred, Kind, OvfOp, UnOp};
 use crate::diag::{err, Pos, Result};
 use crate::sexp::Sexp;
 
@@ -18,13 +18,16 @@ pub fn parse(name: &str, args: &[Sexp], pos: Pos) -> Option<Result<Expr>> {
     let r = match name {
         "fneg" => un(name, UnOp::FNeg, args, pos),
         "ctpop" => un(name, UnOp::Ctpop, args, pos),
+        "sadd-overflow" => overflow(name, OvfOp::SAdd, args, pos),
+        "ssub-overflow" => overflow(name, OvfOp::SSub, args, pos),
+        "smul-overflow" => overflow(name, OvfOp::SMul, args, pos),
         "icmp" => icmp(args, pos),
         "fcmp" => fcmp(args, pos),
         "select" | "insertelement" | "shufflevector" | "extractelement" => {
             vector_op(name, args, pos)
         }
         "extractvalue" | "insertvalue" => aggregate(name, args, pos),
-        "alloca" | "load" | "store" | "getelementptr" => super::control::memory(name, args, pos),
+        "alloca" | "load" | "store" | "getelementptr" => super::memory::memory(name, args, pos),
         _ => return None,
     };
     Some(r)
@@ -70,6 +73,8 @@ fn castop(name: &str) -> Option<CastOp> {
         "ptrtoint" => PtrToInt,
         "inttoptr" => IntToPtr,
         "bitcast" => Bitcast,
+        "fptosi-sat" => FpToSiSat,
+        "fptoui-sat" => FpToUiSat,
         _ => return None,
     })
 }
@@ -78,6 +83,14 @@ fn bin(name: &str, op: BinOp, args: &[Sexp], pos: Pos) -> Result<Expr> {
     arity(name, args, 2, pos)?;
     Ok(Expr::new(
         Kind::Bin(op, operand(&args[0])?, operand(&args[1])?),
+        pos,
+    ))
+}
+
+fn overflow(name: &str, op: OvfOp, args: &[Sexp], pos: Pos) -> Result<Expr> {
+    arity(name, args, 2, pos)?;
+    Ok(Expr::new(
+        Kind::Overflow(op, operand(&args[0])?, operand(&args[1])?),
         pos,
     ))
 }

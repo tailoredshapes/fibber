@@ -1,4 +1,4 @@
-//! Tokens: parentheses, braces, strings, vector types and atoms.
+//! Tokens: parentheses, braces, brackets, strings, vector types and atoms.
 
 use crate::diag::{err, Pos, Result};
 
@@ -8,6 +8,8 @@ pub enum Tok {
     Close,
     BraceOpen,
     BraceClose,
+    BracketOpen,
+    BracketClose,
     Atom(String),
     Str(Vec<u8>),
     VecType(String, String),
@@ -34,7 +36,7 @@ struct Lexer {
 }
 
 fn is_delim(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '(' | ')' | '{' | '}' | '"' | ';' | ',')
+    c.is_whitespace() || matches!(c, '(' | ')' | '{' | '}' | '[' | ']' | '"' | ';' | ',')
 }
 
 impl Lexer {
@@ -79,6 +81,8 @@ impl Lexer {
             ')' => self.single(Tok::Close),
             '{' => self.single(Tok::BraceOpen),
             '}' => self.single(Tok::BraceClose),
+            '[' => self.single(Tok::BracketOpen),
+            ']' => self.single(Tok::BracketClose),
             '"' => Tok::Str(self.string(start)?),
             '<' => self.vector(start)?,
             _ => Tok::Atom(self.atom()),

@@ -72,6 +72,14 @@ impl Env {
                     constant: g.constant,
                 },
             ),
+            Item::DeclareGlobal(g) => (
+                &g.name,
+                g.pos,
+                Symbol::Var {
+                    ty: g.ty.clone(),
+                    constant: false,
+                },
+            ),
             Item::Declare(d) => (&d.name, d.pos, Symbol::Func(d.ty.clone())),
             Item::Define(f) => (&f.name, f.pos, Symbol::Func(f.ty.clone())),
         };
@@ -88,6 +96,7 @@ impl Env {
         match item {
             Item::Struct(s) => s.fields.iter().try_for_each(|t| self.valid(t, s.pos)),
             Item::Global(g) => self.valid(&g.ty, g.pos),
+            Item::DeclareGlobal(g) => self.valid(&g.ty, g.pos),
             Item::Declare(d) => self.valid_fn(&d.ty, d.pos),
             Item::Define(f) => self.valid_fn(&f.ty, f.pos),
         }
@@ -100,7 +109,7 @@ impl Env {
                 err(pos, format!("undefined struct %struct.{n}"))
             }
             Type::Anon(fs) => fs.iter().try_for_each(|f| self.valid(f, pos)),
-            Type::Vector(_, e) => self.valid(e, pos),
+            Type::Vector(_, e) | Type::Array(_, e) => self.valid(e, pos),
             _ => Ok(()),
         }
     }
@@ -130,6 +139,7 @@ impl Env {
                     }
                 }
                 Type::Anon(fs) => stack.extend(fs),
+                Type::Array(_, e) => stack.push(*e),
                 _ => {}
             }
         }

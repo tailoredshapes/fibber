@@ -16,9 +16,10 @@ fn emits(e: &Expr) -> bool {
         | Kind::Null
         | Kind::Vector(..)
         | Kind::Str(_)
+        | Kind::Zero(_)
         | Kind::Let(..)
         | Kind::Phi(..) => false,
-        Kind::Struct(_, fields) => !fields.iter().all(is_constant),
+        Kind::Struct(_, fields) | Kind::Array(_, fields) => !fields.iter().all(is_constant),
         _ => true,
     }
 }
@@ -28,8 +29,8 @@ fn emits(e: &Expr) -> bool {
 pub fn is_constant(e: &Expr) -> bool {
     match &e.kind {
         Kind::Int(..) | Kind::Float(..) | Kind::Null | Kind::Vector(..) | Kind::Str(_) => true,
-        Kind::Global(_) => true,
-        Kind::Struct(_, fs) => fs.iter().all(is_constant),
+        Kind::Global(_) | Kind::Zero(_) => true,
+        Kind::Struct(_, fs) | Kind::Array(_, fs) => fs.iter().all(is_constant),
         _ => false,
     }
 }
@@ -54,7 +55,14 @@ impl<'a> Fcx<'a> {
             Kind::Null | Kind::Str(_) => some(Type::Ptr),
             Kind::Vector(t, _) => some(t.clone()),
             Kind::Struct(name, fields) => some(self.struct_literal(name, fields, p)?),
+            Kind::Array(t, elems) => some(self.array_literal(t, elems, p)?),
+            Kind::Zero(t) => {
+                self.valid(t, p)?;
+                some(t.clone())
+            }
             Kind::Bin(op, a, b) => some(self.bin(*op, a, b, p)?),
+            Kind::Overflow(op, a, b) => some(self.overflow(*op, a, b, p)?),
+            Kind::Trap => Ok(None),
             Kind::Un(op, a) => some(self.un(*op, a, p)?),
             Kind::ICmp(_, a, b) => some(self.cmp("icmp", a, b, p)?),
             Kind::FCmp(_, a, b) => some(self.cmp("fcmp", a, b, p)?),

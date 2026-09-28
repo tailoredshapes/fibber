@@ -147,6 +147,24 @@ pub fn vector_literal(ty: Type, args: &[Sexp], pos: Pos) -> Result<Expr> {
     Ok(Expr::new(Kind::Vector(ty, elems), pos))
 }
 
+/// `([N x T] v₁ .. v_N)`: any values; the checker types them.
+pub fn array_literal(ty: Type, args: &[Sexp], pos: Pos) -> Result<Expr> {
+    let Type::Array(n, _) = &ty else {
+        return err(pos, "not an array type");
+    };
+    if args.len() as u64 != *n {
+        return err(
+            pos,
+            format!("{ty} literal: {n} elements expected, found {}", args.len()),
+        );
+    }
+    let elems = args
+        .iter()
+        .map(super::expr::parse_expr)
+        .collect::<Result<_>>()?;
+    Ok(Expr::new(Kind::Array(ty, elems), pos))
+}
+
 fn vector_element(elem: &Type, a: &Sexp) -> Result<Expr> {
     let pos = a.pos();
     let Some(tok) = a.atom() else {

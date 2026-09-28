@@ -13,8 +13,32 @@ pub struct Module {
 pub enum Item {
     Struct(StructDef),
     Global(GlobalDef),
+    DeclareGlobal(GlobalDecl),
     Declare(Declare),
     Define(Function),
+}
+
+/// Linkage of a definition (spec/lir.md §4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Linkage {
+    #[default]
+    External,
+    Internal,
+    Private,
+}
+
+impl Linkage {
+    /// Whether the name is visible outside its module.
+    pub fn exported(self) -> bool {
+        self == Linkage::External
+    }
+}
+
+/// The linkage and visibility words a top-level form takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Modifiers {
+    pub linkage: Linkage,
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,6 +54,16 @@ pub struct GlobalDef {
     pub ty: Type,
     pub init: Expr,
     pub constant: bool,
+    pub mods: Modifiers,
+    pub pos: Pos,
+}
+
+/// `(declare-global NAME T)`: a variable defined elsewhere (§4.4).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalDecl {
+    pub name: String,
+    pub ty: Type,
+    pub hidden: bool,
     pub pos: Pos,
 }
 
@@ -37,6 +71,7 @@ pub struct GlobalDef {
 pub struct Declare {
     pub name: String,
     pub ty: FnType,
+    pub hidden: bool,
     pub pos: Pos,
 }
 
@@ -46,6 +81,7 @@ pub struct Function {
     pub ty: FnType,
     pub params: Vec<(String, Pos)>,
     pub blocks: Vec<Block>,
+    pub mods: Modifiers,
     pub pos: Pos,
 }
 
@@ -99,6 +135,14 @@ pub enum UnOp {
     Ctpop,
 }
 
+/// `llvm.s{add,sub,mul}.with.overflow` (spec/lir.md §6.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OvfOp {
+    SAdd,
+    SSub,
+    SMul,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CastOp {
     Trunc,
@@ -113,6 +157,10 @@ pub enum CastOp {
     PtrToInt,
     IntToPtr,
     Bitcast,
+    /// `fptosi-sat`: `llvm.fptosi.sat` (spec/lir.md §6.3)
+    FpToSiSat,
+    /// `fptoui-sat`: `llvm.fptoui.sat`
+    FpToUiSat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,8 +250,13 @@ pub enum Kind {
     Str(Vec<u8>),
     /// `{ … }` (None) or `(%struct.S …)`
     Struct(Option<String>, Vec<Expr>),
+    /// `([N x T] …)`
+    Array(Type, Vec<Expr>),
+    /// `(zeroinitializer T)`
+    Zero(Type),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Un(UnOp, Box<Expr>),
+    Overflow(OvfOp, Box<Expr>, Box<Expr>),
     ICmp(IPred, Box<Expr>, Box<Expr>),
     FCmp(FPred, Box<Expr>, Box<Expr>),
     Cast(CastOp, Type, Box<Expr>),
@@ -213,9 +266,23 @@ pub enum Kind {
     Shuffle(Box<Expr>, Box<Expr>, Box<Expr>),
     ExtractValue(Box<Expr>, Vec<i128>),
     InsertValue(Box<Expr>, Box<Expr>, Vec<i128>),
-    Alloca(Type, Option<Box<Expr>>),
-    Load(Type, Box<Expr>),
-    Store(Box<Expr>, Box<Expr>),
+    Alloca {
+        ty: Type,
+        count: Option<Box<Expr>>,
+        align: Option<u32>,
+    },
+    Load {
+        ty: Type,
+        ptr: Box<Expr>,
+        volatile: bool,
+        align: Option<u32>,
+    },
+    Store {
+        value: Box<Expr>,
+        ptr: Box<Expr>,
+        volatile: bool,
+        align: Option<u32>,
+    },
     Gep {
         inbounds: bool,
         ty: Type,
@@ -235,6 +302,8 @@ pub enum Kind {
         new: Box<Expr>,
     },
     Fence(Scope, Ordering),
+    /// `(trap)`: `llvm.trap`, void and not a terminator
+    Trap,
     Call {
         callee: Callee,
         args: Vec<Expr>,

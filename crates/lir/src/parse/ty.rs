@@ -1,7 +1,7 @@
 //! Types, result types and function types as written.
 
 use super::arity;
-use crate::diag::{err, Result};
+use crate::diag::{err, Pos, Result};
 use crate::sexp::Sexp;
 use crate::types::{scalar_keyword, Cc, FnType, Type};
 
@@ -33,11 +33,37 @@ pub fn parse_type(s: &Sexp) -> Result<Type> {
         Sexp::Brace(items, _) => Ok(Type::Anon(
             items.iter().map(parse_type).collect::<Result<_>>()?,
         )),
+        Sexp::Bracket(items, p) => array_type(items, *p),
         other => err(
             other.pos(),
             format!("expected a type, found {}", other.describe()),
         ),
     }
+}
+
+/// `[N x T]` (spec/lir.md §2.1).
+fn array_type(items: &[Sexp], p: Pos) -> Result<Type> {
+    let [n, x, t] = items else {
+        return err(p, "array type must be [N x T]");
+    };
+    if x.atom() != Some("x") {
+        return err(p, "array type must be [N x T]");
+    }
+    let digits = n.atom().unwrap_or("");
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return err(
+            n.pos(),
+            format!(
+                "array length must be a non-negative integer, found {}",
+                n.describe()
+            ),
+        );
+    }
+    let len = match digits.parse::<u64>() {
+        Ok(k) if k <= u64::from(u32::MAX) => k,
+        _ => return err(n.pos(), format!("array length {digits} is too large")),
+    };
+    Ok(Type::Array(len, Box::new(parse_type(t)?)))
 }
 
 /// A result type: a type or `void`.

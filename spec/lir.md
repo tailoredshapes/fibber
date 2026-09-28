@@ -391,7 +391,7 @@ fibber emits them.
 | `(alloca (align N)? T)`, `(alloca (align N)? T n)` | `T` sized; `n` integer | `ptr` |
 | `(load volatile? (align N)? T p)` | `p : ptr`; `T` first-class | `T` |
 | `(store volatile? (align N)? v p)` | `p : ptr`; `v` first-class | void |
-| `(getelementptr inbounds? T p i₀ i₁ ..)` | `p : ptr`, `T` sized; `i₀` integer; each further index steps into the current type: into a struct by a constant `i32` field index in range, into an array by any integer, a constant one in range (`getelementptr: index 4 out of range for [4 x i32]`) | `ptr` |
+| `(getelementptr inbounds? T p i₀ i₁ ..)` | `p : ptr`, `T` sized; `i₀` integer; each further index steps into the current type: into a struct by a constant `i32` field index in range, into an array by any integer, a constant one in range (`getelementptr: index 4 out of range for [4 x i32]`) except into a `[0 x T]`, whose length is unknown | `ptr` |
 
 - A `store` whose pointer operand is directly `@c` of a `constant` is
   `store to constant @c`.

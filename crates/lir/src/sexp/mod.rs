@@ -17,6 +17,8 @@ pub enum Sexp {
     List(Vec<Sexp>, Pos),
     /// `{ … }`
     Brace(Vec<Sexp>, Pos),
+    /// `[ … ]`: an array type `[N x T]`
+    Bracket(Vec<Sexp>, Pos),
     /// A symbol, number, `@name` or `%struct.name`.
     Atom(String, Pos),
     /// `"…"`, its bytes after escapes.
@@ -30,6 +32,7 @@ impl Sexp {
         match self {
             Sexp::List(_, p)
             | Sexp::Brace(_, p)
+            | Sexp::Bracket(_, p)
             | Sexp::Atom(_, p)
             | Sexp::Str(_, p)
             | Sexp::VecType(_, _, p) => *p,
@@ -54,6 +57,10 @@ impl Sexp {
                 None => "()".into(),
             },
             Sexp::Brace(..) => "{ … }".into(),
+            Sexp::Bracket(items, _) => {
+                let parts: Vec<String> = items.iter().map(Sexp::describe).collect();
+                format!("[{}]", parts.join(" "))
+            }
             Sexp::Str(..) => "a string".into(),
             Sexp::VecType(n, e, _) => format!("<{n} x {e}>"),
         }

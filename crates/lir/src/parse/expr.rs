@@ -1,6 +1,6 @@
 //! Expressions: names, literals and the dispatch to instruction forms.
 
-use super::literal::{scalar_literal, vector_literal};
+use super::literal::{array_literal, scalar_literal, vector_literal};
 use super::ty::parse_type;
 use super::{atomics, control, instr};
 use crate::ast::{Expr, Kind};
@@ -17,7 +17,9 @@ pub fn parse_expr(s: &Sexp) -> Result<Expr> {
             let fields = items.iter().map(parse_expr).collect::<Result<_>>()?;
             Ok(Expr::new(Kind::Struct(None, fields), *p))
         }
-        Sexp::VecType(..) => err(s.pos(), format!("expected a value, found {}", s.describe())),
+        Sexp::VecType(..) | Sexp::Bracket(..) => {
+            err(s.pos(), format!("expected a value, found {}", s.describe()))
+        }
         Sexp::List(items, p) => list_expr(items, *p),
     }
 }
@@ -46,6 +48,7 @@ fn list_expr(items: &[Sexp], pos: Pos) -> Result<Expr> {
     let args = &items[1..];
     match head {
         Sexp::VecType(..) => vector_literal(parse_type(head)?, args, pos),
+        Sexp::Bracket(..) => array_literal(parse_type(head)?, args, pos),
         Sexp::Atom(name, _) => named_form(name, args, pos),
         other => err(
             other.pos(),
@@ -64,6 +67,10 @@ fn named_form(name: &str, args: &[Sexp], pos: Pos) -> Result<Expr> {
     }
     if name == "string" {
         return string_literal(args, pos);
+    }
+    if name == "zeroinitializer" {
+        super::arity(name, args, 1, pos)?;
+        return Ok(Expr::new(Kind::Zero(type_arg(&args[0])?), pos));
     }
     if let Some(r) = instr::parse(name, args, pos) {
         return r;

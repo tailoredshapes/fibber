@@ -28,6 +28,8 @@ pub fn check_global(env: &Env, g: &GlobalDef) -> Result<()> {
 pub fn const_type(env: &Env, e: &Expr) -> Result<Type> {
     match &e.kind {
         Kind::Int(t, _) | Kind::Float(t, _) | Kind::Vector(t, _) => Ok(t.clone()),
+        Kind::Zero(t) => env.valid(t, e.pos).map(|_| t.clone()),
+        Kind::Array(t, es) => array(env, t, es, e),
         Kind::Null | Kind::Str(_) => Ok(Type::Ptr),
         Kind::Global(n) if env.symbols.contains_key(n) => Ok(Type::Ptr),
         Kind::Global(n) => err(e.pos, format!("undefined global @{n}")),
@@ -39,6 +41,26 @@ pub fn const_type(env: &Env, e: &Expr) -> Result<Type> {
         Kind::Struct(Some(n), fs) => named(env, n, fs, e),
         _ => err(e.pos, "not a constant"),
     }
+}
+
+fn array(env: &Env, t: &Type, es: &[Expr], e: &Expr) -> Result<Type> {
+    env.valid(t, e.pos)?;
+    let Type::Array(_, elem) = t else {
+        return err(e.pos, "not an array type");
+    };
+    for (i, x) in es.iter().enumerate() {
+        let got = const_type(env, x)?;
+        if got != **elem {
+            return err(
+                x.pos,
+                format!(
+                    "{t} literal: element {} has type {got}, expected {elem}",
+                    i + 1
+                ),
+            );
+        }
+    }
+    Ok(t.clone())
 }
 
 fn named(env: &Env, n: &str, fs: &[Expr], e: &Expr) -> Result<Type> {

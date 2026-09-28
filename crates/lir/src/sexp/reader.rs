@@ -27,8 +27,10 @@ impl Reader {
         match tok {
             Tok::Open => Ok(Sexp::List(self.seq(depth, pos, Tok::Close)?, pos)),
             Tok::BraceOpen => Ok(Sexp::Brace(self.seq(depth, pos, Tok::BraceClose)?, pos)),
+            Tok::BracketOpen => Ok(Sexp::Bracket(self.seq(depth, pos, Tok::BracketClose)?, pos)),
             Tok::Close => err(pos, "unexpected )"),
             Tok::BraceClose => err(pos, "unexpected }"),
+            Tok::BracketClose => err(pos, "unexpected ]"),
             Tok::Atom(a) => Ok(Sexp::Atom(a, pos)),
             Tok::Str(s) => Ok(Sexp::Str(s, pos)),
             Tok::VecType(n, e) => Ok(Sexp::VecType(n, e, pos)),
@@ -47,9 +49,9 @@ impl Reader {
                     self.i += 1;
                     return Ok(items);
                 }
-                Some((Tok::Close, p)) | Some((Tok::BraceClose, p)) => {
-                    return err(*p, "mismatched closing bracket")
-                }
+                Some((Tok::Close, p))
+                | Some((Tok::BraceClose, p))
+                | Some((Tok::BracketClose, p)) => return err(*p, "mismatched closing bracket"),
                 Some(_) => items.push(self.form(depth + 1)?),
             }
         }
@@ -62,8 +64,12 @@ mod tests {
 
     #[test]
     fn reads_nested_forms_with_positions() {
-        let f = read("(a (b \"x\\n\") { c })\n<4 x i32>").unwrap();
-        assert_eq!(f.len(), 2);
+        let f = read("(a (b \"x\\n\") { c })\n<4 x i32> [2 x [3 x i8]]").unwrap();
+        assert_eq!(f.len(), 3);
+        match &f[2] {
+            Sexp::Bracket(items, _) => assert_eq!(items[2].describe(), "[3 x i8]"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             f[1],
             Sexp::VecType("4".into(), "i32".into(), Pos { line: 2, col: 1 })
@@ -92,6 +98,8 @@ mod tests {
             ("(a", "unexpected end of input"),
             (")", "unexpected )"),
             ("(a }", "mismatched closing bracket"),
+            ("[4 x i32", "unexpected end of input"),
+            ("]", "unexpected ]"),
         ] {
             let e = read(src).unwrap_err();
             assert!(e.message.contains(msg), "{src}: {}", e.message);

@@ -2,7 +2,7 @@
 //! §6.3).
 
 use super::fcx::Fcx;
-use crate::ast::{BinOp, CastOp, Expr, Kind, UnOp};
+use crate::ast::{BinOp, CastOp, Expr, Kind, OvfOp, UnOp};
 use crate::diag::{err, Pos, Result};
 use crate::types::{Type, I1};
 
@@ -80,6 +80,23 @@ impl<'a> Fcx<'a> {
         Ok(ta)
     }
 
+    /// `sadd-overflow` and kin: `{ T, i1 }` of the same shape.
+    pub fn overflow(&mut self, op: OvfOp, a: &'a Expr, b: &'a Expr, p: Pos) -> Result<Type> {
+        let name = match op {
+            OvfOp::SAdd => "sadd-overflow",
+            OvfOp::SSub => "ssub-overflow",
+            OvfOp::SMul => "smul-overflow",
+        };
+        let ta = self.val(a)?;
+        if !ta.is_int_like() {
+            return err(p, format!("{name} needs integer operands, found {ta}"));
+        }
+        let tb = self.val(b)?;
+        self.same(name, 2, &tb, &ta, p)?;
+        let flag = ta.bool_shape();
+        Ok(Type::Anon(vec![ta, flag]))
+    }
+
     pub fn un(&mut self, op: UnOp, a: &'a Expr, p: Pos) -> Result<Type> {
         let t = self.val(a)?;
         match op {
@@ -152,6 +169,8 @@ fn cast_name(op: CastOp) -> &'static str {
         PtrToInt => "ptrtoint",
         IntToPtr => "inttoptr",
         Bitcast => "bitcast",
+        FpToSiSat => "fptosi-sat",
+        FpToUiSat => "fptoui-sat",
     }
 }
 
@@ -210,11 +229,16 @@ fn cast_rule(op: CastOp, t: &Type, v: &Type, p: Pos) -> Result<()> {
                 )
             }
         }
-        FpToSi | FpToUi => {
+        FpToSi | FpToUi | FpToSiSat | FpToUiSat => {
+            let scalar = if op == FpToSi || op == FpToUi {
+                ""
+            } else {
+                " scalar"
+            };
             need(
                 t.is_int(),
                 p,
-                format!("{n} needs an integer result type, found {t}"),
+                format!("{n} needs an integer{scalar} result type, found {t}"),
             )?;
             need(
                 v.is_float(),

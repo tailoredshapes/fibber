@@ -1,4 +1,4 @@
-//! Memory forms, control flow, calls, phi and let.
+//! Control flow, calls, phi and let.
 
 use super::expr::{exprs, operand, parse_expr, type_arg};
 use super::ty::parse_fn_type;
@@ -14,6 +14,7 @@ pub fn parse(name: &str, args: &[Sexp], pos: Pos) -> Option<Result<Expr>> {
         "br" => br(args, pos),
         "switch" => switch(args, pos),
         "unreachable" => arity(name, args, 0, pos).map(|_| Expr::new(Kind::Unreachable, pos)),
+        "trap" => arity(name, args, 0, pos).map(|_| Expr::new(Kind::Trap, pos)),
         "phi" => phi(args, pos),
         "let" => let_form(args, pos),
         "call" | "tailcall" => direct_call(name, args, pos),
@@ -21,52 +22,6 @@ pub fn parse(name: &str, args: &[Sexp], pos: Pos) -> Option<Result<Expr>> {
         _ => return None,
     };
     Some(r)
-}
-
-/// `alloca`, `load`, `store`, `getelementptr`.
-pub fn memory(name: &str, args: &[Sexp], pos: Pos) -> Result<Expr> {
-    let kind = match name {
-        "alloca" => {
-            if args.is_empty() || args.len() > 2 {
-                return err(
-                    pos,
-                    format!("alloca expects 1 or 2 operands, found {}", args.len()),
-                );
-            }
-            let count = args.get(1).map(operand).transpose()?;
-            Kind::Alloca(type_arg(&args[0])?, count)
-        }
-        "load" => {
-            arity(name, args, 2, pos)?;
-            Kind::Load(type_arg(&args[0])?, operand(&args[1])?)
-        }
-        "store" => {
-            arity(name, args, 2, pos)?;
-            Kind::Store(operand(&args[0])?, operand(&args[1])?)
-        }
-        _ => return gep(args, pos),
-    };
-    Ok(Expr::new(kind, pos))
-}
-
-fn gep(args: &[Sexp], pos: Pos) -> Result<Expr> {
-    let inbounds = args.first().and_then(Sexp::atom) == Some("inbounds");
-    let rest = if inbounds { &args[1..] } else { args };
-    if rest.len() < 3 {
-        return err(
-            pos,
-            "getelementptr needs a type, a pointer and at least one index",
-        );
-    }
-    Ok(Expr::new(
-        Kind::Gep {
-            inbounds,
-            ty: type_arg(&rest[0])?,
-            ptr: operand(&rest[1])?,
-            indices: exprs(&rest[2..])?,
-        },
-        pos,
-    ))
 }
 
 fn ret(args: &[Sexp], pos: Pos) -> Result<Expr> {

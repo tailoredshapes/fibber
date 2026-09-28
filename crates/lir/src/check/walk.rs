@@ -11,20 +11,21 @@ use crate::types::Type;
 pub fn children(e: &Expr) -> Vec<&Expr> {
     use Kind::*;
     match &e.kind {
-        Local(_) | Global(_) | Int(..) | Float(..) | Null | Str(_) | Fence(..) | Unreachable
-        | Br(_) | Ret(None) => vec![],
-        Vector(_, es) | Struct(_, es) => es.iter().collect(),
-        Un(_, a) | Cast(_, _, a) | ExtractValue(a, _) | Load(_, a) | AtomicLoad(_, _, _, a) => {
-            vec![a]
-        }
-        Ret(Some(a)) | CondBr(a, _, _) => vec![a],
-        Alloca(_, c) => c.iter().map(|b| &**b).collect(),
+        Local(_) | Global(_) | Int(..) | Float(..) | Null | Str(_) | Zero(_) | Fence(..) | Trap
+        | Unreachable | Br(_) | Ret(None) => vec![],
+        Vector(_, es) | Struct(_, es) | Array(_, es) => es.iter().collect(),
+        Un(_, a) | Cast(_, _, a) | ExtractValue(a, _) | AtomicLoad(_, _, _, a) => vec![a],
+        Load { ptr: a, .. } | Ret(Some(a)) | CondBr(a, _, _) => vec![a],
+        Alloca { count, .. } => count.iter().map(|b| &**b).collect(),
+        Store {
+            value: a, ptr: b, ..
+        } => vec![a, b],
         Bin(_, a, b)
+        | Overflow(_, a, b)
         | ICmp(_, a, b)
         | FCmp(_, a, b)
         | ExtractElement(a, b)
         | InsertValue(a, b, _)
-        | Store(a, b)
         | AtomicStore(_, _, a, b)
         | AtomicRmw(_, _, _, a, b) => vec![a, b],
         Select(a, b, c) | InsertElement(a, b, c) | Shuffle(a, b, c) => vec![a, b, c],
@@ -94,8 +95,11 @@ fn collect(b: &mut Bindings, f: &Function, e: &Expr, blk: usize) -> Result<()> {
         for bind in binds {
             collect(b, f, &bind.value, blk)?;
             add(b, f, &bind.name, Some(blk), bind.pos)?;
-            if let Kind::Alloca(t, None) = &bind.value.kind {
-                b.allocas.insert(bind.name.clone(), t.clone());
+            if let Kind::Alloca {
+                ty, count: None, ..
+            } = &bind.value.kind
+            {
+                b.allocas.insert(bind.name.clone(), ty.clone());
             }
         }
         for x in children(e).into_iter().skip(binds.len()) {
