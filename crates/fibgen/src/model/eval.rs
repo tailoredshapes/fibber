@@ -1,10 +1,10 @@
 //! The model's evaluator over the generated tree.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
-use crate::ast::{Arg, Expr, FunDef, Kind, Pat, Program};
+use crate::ast::{Arg, Expr, FunDef, Kind, Method, Pat, Program};
 
 use super::value::{Closure, TaskState, V};
 use super::ModelError;
@@ -73,6 +73,11 @@ pub struct Machine<'p> {
     pub(super) funs: HashMap<&'p str, &'p FunDef>,
     /// The values of the `def`s evaluated so far.
     pub(super) globals: HashMap<String, V>,
+    /// The `impl` methods, by (method, implementing type's head).
+    pub(super) impls: HashMap<(&'p str, &'static str), &'p Method>,
+    /// What the run did that a static count of the program cannot see
+    /// (a guard that failed, a default method that ran, ...).
+    pub(super) trace: BTreeSet<&'static str>,
     steps: u64,
     depth: u32,
 }
@@ -91,9 +96,13 @@ impl<'p> Machine<'p> {
     /// A machine for `p`.
     pub fn new(p: &'p Program) -> Self {
         let funs = p.funs.iter().map(|f| (f.name.as_str(), f)).collect();
+        // The derived enum's field-less variant is a constant (syntax §3.9).
+        let low = V::data("Low", Vec::new());
         Machine {
             funs,
-            globals: HashMap::new(),
+            globals: HashMap::from([("Low".to_string(), low)]),
+            impls: super::protos::impl_table(p),
+            trace: BTreeSet::new(),
             steps: 0,
             depth: 0,
         }
@@ -159,6 +168,7 @@ impl<'p> Machine<'p> {
         match &e.kind {
             Kind::Fn(ps, body) => Ok(closure(None, ps, body, env)),
             Kind::FnNamed(n, ps, body) => Ok(closure(Some(n.clone()), ps, body, env)),
+            Kind::Call(h, args) if h == "array-set!" => self.ev_array_set(args, env),
             Kind::Call(h, args) => self.ev_call(h, args, env),
             Kind::Apply(f, args) => {
                 let f = self.ev(f, env)?;
@@ -199,7 +209,7 @@ impl<'p> Machine<'p> {
                 self.ev(t, env)?;
                 Ok(V::Weak(None))
             }
-            _ => Err(unsupported(format!("node {:?}", e.kind))),
+            _ => self.ev_new(e, env),
         }
     }
 
@@ -334,7 +344,6 @@ impl<'p> Machine<'p> {
         let v = match state {
             TaskState::Done(v) => v,
             TaskState::Pending(body, env) => self.eval(&body, &env)?,
-            TaskState::Thunk(f) => self.apply(&f, Vec::new())?,
         };
         *cell.borrow_mut() = TaskState::Done(v.clone());
         Ok(v)
@@ -357,6 +366,8 @@ pub fn bind_pat(p: &Pat, v: &V, env: &Env) -> Option<Env> {
         (Pat::Bind(n), v) => Some(env.bind(n, v.clone())),
         (Pat::Nil, V::Opt(None)) => Some(env.clone()),
         (Pat::Some(q), V::Opt(Some(x))) => bind_pat(q, x, env),
+        (Pat::Lit(n), V::Int(m)) if n == m => Some(env.clone()),
+        (Pat::Vector(ps, rest), V::Vector(xs)) => super::patterns::bind_vector(ps, rest, xs, env),
         (Pat::As(q, n), v) => bind_pat(q, v, &env.bind(n, v.clone())),
         (Pat::Ctor(c, ps), V::Data(name, fields)) if **name == **c => {
             let mut env2 = env.clone();
@@ -380,8 +391,8 @@ pub fn bind_pat(p: &Pat, v: &V, env: &Env) -> Option<Env> {
 /// The position of field `f` in struct `s`.
 pub fn field_index(s: &str, f: &str) -> Result<usize, Stop> {
     match (s, f) {
-        ("Pt", "x") | ("Wrap", "s") | ("Holder", "f") | ("Box", "v") => Ok(0),
-        ("Pt", "y") | ("Wrap", "v") | ("Holder", "c") => Ok(1),
+        ("Pt", "x") | ("Wrap", "s") | ("Holder", "f") | ("Box", "v") | ("Hook", "f") => Ok(0),
+        ("Pt", "y") | ("Wrap", "v") | ("Holder", "c") | ("Hook", "tag") => Ok(1),
         _ => Err(unsupported(format!("field {s}.{f}"))),
     }
 }

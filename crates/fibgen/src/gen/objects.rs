@@ -4,7 +4,7 @@
 use crate::ast::{Expr, Kind, Pat};
 use crate::ty::Ty;
 
-use super::{funcs, tasks, Ctx, Gen, Var, VarKind};
+use super::{funcs, tasks, vpat, Ctx, Gen, Var, VarKind};
 
 /// The struct fields: (struct, field, field type).
 fn fields() -> Vec<(Ty, &'static str, Ty)> {
@@ -76,7 +76,8 @@ fn shape(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
 
 fn vector(g: &mut Gen, cx: &Ctx, t: &Ty, d: u32) -> Expr {
     let vt = Ty::vec(t.clone());
-    match g.rng.below(6) {
+    match g.rng.below(7) {
+        6 => vpat::rest_match(g, cx, t, d + 1),
         0 | 1 => {
             let n = g.rng.below(4);
             if n == 0 {
@@ -241,20 +242,9 @@ pub fn fresh_object(g: &mut Gen, cx: &Ctx, ty: &Ty) -> Expr {
     }
 }
 
-/// Whether a value of `t` needs its type known from its own expression:
-/// `.` and `@` do not determine a struct or a cell type (types §3.4), so
-/// `nil` or `[]` of such an element type, whose element is then read
-/// through a pattern or `nth`, would leave it unresolved.
-fn needs_pin(t: &Ty) -> bool {
-    matches!(
-        t,
-        Ty::Pt | Ty::Wrap | Ty::Holder | Ty::Cell(_) | Ty::Atom(_)
-    )
-}
-
 /// `nil`, `empty` or `[]` of `ty`, written `(if false (some x) nil)`,
-/// `(if false (list x) empty)`, or for an element type that needs it
-/// `(if false [x] [])`, so that the type is fixed by the expression
+/// `(if false (list x) empty)` or `(if false [x] [])`, so that the type
+/// is fixed by the expression
 /// itself (the value is still empty): a pattern variable bound from it
 /// and only compared with itself would otherwise be ambiguous.
 pub fn empty(g: &mut Gen, cx: &Ctx, ty: &Ty) -> Expr {
@@ -262,7 +252,9 @@ pub fn empty(g: &mut Gen, cx: &Ctx, ty: &Ty) -> Expr {
     let (plain, inner, pin) = match ty {
         Ty::Opt(t) => (Kind::Nil, &**t, true),
         Ty::List => (Kind::Empty, &int, true),
-        Ty::Vec(t) => (Kind::VecLit(Vec::new()), &**t, needs_pin(t)),
+        // Always pinned: a vector pattern binds its elements, which a
+        // clause may only compare with each other.
+        Ty::Vec(t) => (Kind::VecLit(Vec::new()), &**t, true),
         _ => return g.leaf_value(cx, ty),
     };
     let plain = Expr::new(ty.clone(), plain);

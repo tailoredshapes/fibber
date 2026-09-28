@@ -10,6 +10,9 @@ use super::value::{TaskState, V};
 impl Machine<'_> {
     /// Calls the builtin, constructor or prelude function `h`.
     pub(super) fn builtin(&mut self, h: &str, a: Vec<V>) -> Res {
+        if let Some(r) = super::nums::op(h, &a).or_else(|| super::arrays::op(h, &a)) {
+            return r;
+        }
         match (h, a.as_slice()) {
             ("+" | "-" | "*" | "rem", [V::Int(x), V::Int(y)]) => arith(h, *x, *y),
             ("=" | "<" | "<=" | ">" | ">=" | "!=", [x, y]) => Ok(V::Bool(compare(h, x, y)?)),
@@ -20,9 +23,11 @@ impl Machine<'_> {
             ("some", [x]) => Ok(V::Opt(Some(Rc::new(x.clone())))),
             ("cons", [x, V::List(t)]) => Ok(V::List(Rc::new(prepend(x, t)))),
             ("list", items) => Ok(V::List(Rc::new(items.to_vec()))),
-            ("Pt" | "Wrap" | "Holder" | "Box" | "Circle" | "Rect" | "Named", _) => {
-                Ok(V::data(h, a))
-            }
+            (
+                "Pt" | "Wrap" | "Holder" | "Box" | "Circle" | "Rect" | "Named" | "Hook" | "Ver"
+                | "Mid" | "High",
+                _,
+            ) => Ok(V::data(h, a)),
             ("box", [x]) => Ok(V::data("Box", vec![x.clone()])),
             ("unbox", [V::Data(_, f)]) => Ok(f[0].clone()),
             ("cell", [x]) => Ok(V::Cell(Rc::new(RefCell::new(x.clone())))),
@@ -38,7 +43,16 @@ impl Machine<'_> {
                 *c.borrow_mut() = new.clone();
                 Ok(new)
             }
-            ("spawn", [f]) => Ok(task(TaskState::Thunk(f.clone()))),
+            // A spawned closure runs to completion even when its task is
+            // never joined (syntax §3.12). The generator gives it only
+            // sendable captures and no atoms, so no other code can see
+            // when it runs; it runs here, at the spawn, which is one of
+            // the schedules the spec allows and puts its trap, if it
+            // traps, before anything after the spawn.
+            ("spawn", [f]) => {
+                let v = self.apply(f, Vec::new())?;
+                Ok(task(TaskState::Done(v)))
+            }
             ("yield", []) => Ok(task(TaskState::Done(V::Unit))),
             ("join" | "block-on", [t]) => self.force(t),
             ("deref", [x]) => deref(x),
@@ -66,13 +80,12 @@ impl Machine<'_> {
                 Ok(V::Unit)
             }
             ("range", [V::Int(n)]) => Ok(V::Vector(Rc::new((0..*n).map(V::Int).collect()))),
-            ("sum-vec", [V::Vector(xs)]) => xs
-                .iter()
-                .try_fold(0i64, |s, x| match x {
-                    V::Int(n) => Ok(s.wrapping_add(*n)),
-                    v => Err(unsupported(format!("sum-vec over {v:?}"))),
-                })
-                .map(V::Int),
+            // The preamble's sum-vec adds with `+`, which traps on
+            // overflow (types §2.12), element by element from the first.
+            ("sum-vec", [V::Vector(xs)]) => xs.iter().try_fold(V::Int(0), |s, x| match (&s, x) {
+                (V::Int(a), V::Int(b)) => arith("+", *a, *b),
+                (_, v) => Err(unsupported(format!("sum-vec over {v:?}"))),
+            }),
             ("map" | "pmap", [f, V::Vector(xs)]) => {
                 let mut out = Vec::new();
                 for x in xs.iter() {
@@ -89,7 +102,7 @@ impl Machine<'_> {
             ("nil?", [V::Opt(o)]) => Ok(V::Bool(o.is_none())),
             ("some?", [V::Opt(o)]) => Ok(V::Bool(o.is_some())),
             ("unwrap-or", [V::Opt(o), d]) => Ok(o.as_deref().cloned().unwrap_or_else(|| d.clone())),
-            _ => Err(unsupported(format!("call {h} on {a:?}"))),
+            _ => self.method(h, a),
         }
     }
 }
@@ -127,6 +140,8 @@ fn compare(h: &str, x: &V, y: &V) -> Result<bool, super::eval::Stop> {
         (V::Int(a), V::Int(b)) => a.cmp(b),
         (V::Bool(a), V::Bool(b)) => a.cmp(b),
         (V::Str(a), V::Str(b)) => a.cmp(b),
+        (V::Data(..), V::Data(..)) => super::arrays::derived_cmp(x, y)
+            .ok_or_else(|| unsupported(format!("compare {x:?} {y:?}")))?,
         _ => return Err(unsupported(format!("compare {x:?} {y:?}"))),
     };
     Ok(match h {

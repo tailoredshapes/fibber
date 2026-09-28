@@ -11,9 +11,10 @@ fn same_seed_same_program() {
     );
 }
 
-/// Every generated program is one the model can evaluate without
-/// trapping: the generator keeps programs inside the model's language
-/// and never traps on purpose.
+/// Every generated program is one the model can evaluate: the
+/// generator keeps programs inside the model's language, and the only
+/// traps it makes on purpose are integer arithmetic left unmasked
+/// (gen/nums.rs).
 #[test]
 fn the_model_evaluates_every_generated_program() {
     for seed in 0..300 {
@@ -21,6 +22,7 @@ fn the_model_evaluates_every_generated_program() {
         match expected(&p) {
             Ok(_) => {}
             Err(ModelError::Budget) => {}
+            Err(ModelError::Trap(m)) if m.starts_with("integer ") => {}
             Err(e) => panic!("seed {seed}: {e:?}\n{}", print::program(&p)),
         }
     }

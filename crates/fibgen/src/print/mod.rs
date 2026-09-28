@@ -1,16 +1,39 @@
 //! Printing a generated program as fibber source (spec/syntax.md).
 
-use crate::ast::{Arg, Expr, FunDef, Kind, Pat, Program};
+use crate::ast::{Arg, Expr, Kind, Program};
 use crate::ty::Ty;
 
+mod items;
+
+pub use items::is_private;
+
+use items::{fundef, impl_def, pat};
+
 /// The preamble's declarations: (the names that use them, the text).
-const PREAMBLE: [(&[&str], &str); 6] = [
+const PREAMBLE: [(&[&str], &str); 11] = [
     (&["Pt", "Shape", "Rect", "Circle", "Named"], "(defstruct Pt (x: i64 y: i64))"),
     (&["Wrap", "Shape", "Rect", "Circle", "Named"], "(defstruct Wrap (s: str v: (Vec i64)))"),
     (&["Holder"], "(defstruct Holder (f: (fn (i64) i64) c: (Cell i64)))"),
     (
         &["Shape", "Circle", "Rect", "Named"],
         "(defenum Shape (Circle r: i64) (Rect a: Pt b: Pt) (Named n: str w: Wrap))",
+    ),
+    (&["Hook"], "(defstruct (Hook k :colour) (f: (fn k (i64) i64) tag: i64))"),
+    (
+        &["Score", "Rank", "score", "bonus", "rank", "tier"],
+        "(defprotocol Score\n  (score (self) -> i64)\n  (bonus (self k: i64) -> i64 (+ (score self) k)))",
+    ),
+    (
+        &["Rank", "rank", "tier"],
+        "(defprotocol Rank :requires (Score)\n  (rank (self) -> i64)\n  (tier (self) -> i64 (+ (rank self) (score self))))",
+    ),
+    (
+        &["Ver"],
+        "(defstruct Ver (major: i64 minor: i64))\n(derive Eq Ver)\n(derive Ord Ver)",
+    ),
+    (
+        &["Lvl", "Low", "Mid", "High"],
+        "(defenum Lvl (Low) (Mid n: i64) (High a: i64 b: str))\n(derive Eq Lvl)\n(derive Ord Lvl)",
     ),
     (&["inc1"], "(defun inc1 (x: i64) -> i64 (+ x 1))"),
     (
@@ -21,18 +44,18 @@ const PREAMBLE: [(&[&str], &str); 6] = [
 
 /// An s-expression ready to lay out.
 #[derive(Clone, Debug)]
-enum Sexp {
+pub(crate) enum Sexp {
     Atom(String),
     List(Vec<Sexp>),
     Vector(Vec<Sexp>),
     Prefix(&'static str, Box<Sexp>),
 }
 
-fn atom(s: impl Into<String>) -> Sexp {
+pub(crate) fn atom(s: impl Into<String>) -> Sexp {
     Sexp::Atom(s.into())
 }
 
-fn list(items: Vec<Sexp>) -> Sexp {
+pub(crate) fn list(items: Vec<Sexp>) -> Sexp {
     Sexp::List(items)
 }
 
@@ -53,6 +76,10 @@ pub fn program(p: &Program) -> String {
     if !p.defs.is_empty() {
         body.push('\n');
     }
+    for i in &p.impls {
+        body.push_str(&layout(&impl_def(i), 0));
+        body.push_str("\n\n");
+    }
     for f in &p.funs {
         body.push_str(&layout(&fundef(f), 0));
         body.push_str("\n\n");
@@ -67,6 +94,11 @@ pub fn program(p: &Program) -> String {
     ]);
     body.push_str(&layout(&main, 0));
     body.push('\n');
+    preamble(&body) + &body
+}
+
+/// The preamble declarations and macros that `body` names.
+fn preamble(body: &str) -> String {
     let tokens: std::collections::HashSet<&str> = body
         .split(|c: char| c.is_whitespace() || "()[]@&".contains(c))
         .collect();
@@ -77,10 +109,16 @@ pub fn program(p: &Program) -> String {
             out.push('\n');
         }
     }
+    for m in crate::macros::ALL {
+        if tokens.contains(m.name()) {
+            out.push_str(m.definition());
+            out.push('\n');
+        }
+    }
     if !out.is_empty() {
         out.push('\n');
     }
-    out + &body
+    out
 }
 
 /// One expression's source, laid out.
@@ -88,29 +126,8 @@ pub fn expr_text(e: &Expr) -> String {
     layout(&expr(e), 0)
 }
 
-fn fundef(f: &FunDef) -> Sexp {
-    let mut params = Vec::new();
-    for p in &f.params {
-        let name = if p.inout {
-            format!("&{}:", p.name)
-        } else {
-            format!("{}:", p.name)
-        };
-        params.push(atom(name));
-        params.push(atom(p.ty.to_string()));
-    }
-    list(vec![
-        atom("defun"),
-        atom(f.name.clone()),
-        list(params),
-        atom("->"),
-        atom(f.ret.to_string()),
-        expr(&f.body),
-    ])
-}
-
 /// `(head item ...)`.
-fn form(head: &str, items: impl IntoIterator<Item = Sexp>) -> Sexp {
+pub(crate) fn form(head: &str, items: impl IntoIterator<Item = Sexp>) -> Sexp {
     list([atom(head)].into_iter().chain(items).collect())
 }
 
@@ -123,7 +140,7 @@ fn name_binds(bs: &[(String, Expr)]) -> Sexp {
     )
 }
 
-fn expr(e: &Expr) -> Sexp {
+pub(crate) fn expr(e: &Expr) -> Sexp {
     match &e.kind {
         Kind::Int(n) => atom(n.to_string()),
         Kind::Bool(b) => atom(b.to_string()),
@@ -173,6 +190,12 @@ fn expr_more(e: &Expr) -> Sexp {
         Kind::Async(b) => list(vec![atom("async"), expr(b)]),
         Kind::Await(t) => list(vec![atom("await"), expr(t)]),
         Kind::Plet(bs, b) => form("plet", [name_binds(bs), expr(b)]),
+        Kind::Dyn(..)
+        | Kind::GMatch(..)
+        | Kind::Macro(..)
+        | Kind::IntW(..)
+        | Kind::Flt(..)
+        | Kind::Conv(..) => items::expr_new(e),
         Kind::WeakDead(n, t) => {
             let bind = list(vec![list(vec![atom(n.clone()), expr(t)])]);
             list(vec![
@@ -186,7 +209,7 @@ fn expr_more(e: &Expr) -> Sexp {
 }
 
 /// `(x: T ...)`, or `()`.
-fn fn_params(ps: &[(String, Ty)]) -> Sexp {
+pub(crate) fn fn_params(ps: &[(String, Ty)]) -> Sexp {
     let params = ps
         .iter()
         .flat_map(|(p, t)| [atom(format!("{p}:")), atom(t.to_string())])
@@ -203,22 +226,6 @@ fn list_or_unit(items: Vec<Sexp>) -> Sexp {
     }
 }
 
-fn pat(p: &Pat) -> Sexp {
-    match p {
-        Pat::Wild => atom("_"),
-        Pat::Bind(n) => atom(n.clone()),
-        Pat::Nil => atom("nil"),
-        Pat::Some(q) => list(vec![atom("some"), pat(q)]),
-        Pat::Ctor(c, ps) => list(
-            [atom(c.clone())]
-                .into_iter()
-                .chain(ps.iter().map(pat))
-                .collect(),
-        ),
-        Pat::As(q, n) => list(vec![pat(q), atom(":as"), atom(n.clone())]),
-    }
-}
-
 /// The text of `s` on one line.
 fn flat(s: &Sexp) -> String {
     match s {
@@ -231,7 +238,7 @@ fn flat(s: &Sexp) -> String {
 
 /// `s` laid out at `indent`: on one line when it fits in 80 columns,
 /// else with its head on the first line and one item per line after.
-fn layout(s: &Sexp, indent: usize) -> String {
+pub(crate) fn layout(s: &Sexp, indent: usize) -> String {
     let one = flat(s);
     if indent + one.len() <= 80 {
         return one;
@@ -246,7 +253,13 @@ fn layout(s: &Sexp, indent: usize) -> String {
         return one;
     }
     let keep = match items.first() {
-        Some(Sexp::Atom(h)) if h == "defun" => 5,
+        Some(Sexp::Atom(h)) if h == "defun" => {
+            let private = matches!(items.get(2), Some(Sexp::Atom(p)) if p == ":private");
+            let at = 3 + usize::from(private);
+            let bounded = matches!(items.get(at), Some(Sexp::Atom(w)) if w == ":where");
+            5 + usize::from(private) + 2 * usize::from(bounded)
+        }
+        Some(Sexp::Atom(h)) if h == "impl" => 3,
         Some(Sexp::Atom(h))
             if ["let", "loop", "plet", "match", "fn", "if"].contains(&h.as_str()) =>
         {
@@ -282,7 +295,7 @@ pub fn ty_text(t: &Ty) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::Param;
+    use crate::ast::{FunDef, Param};
 
     #[test]
     fn prints_calls_derefs_and_inout() {
@@ -304,7 +317,7 @@ mod tests {
     #[test]
     fn program_includes_only_named_preamble() {
         let f = FunDef {
-            name: "f1".into(),
+            name: "f2".into(),
             params: vec![Param {
                 name: "p".into(),
                 ty: Ty::Pt,
@@ -318,12 +331,13 @@ mod tests {
         };
         let p = Program {
             defs: Vec::new(),
+            impls: Vec::new(),
             funs: vec![f],
             main: Expr::int(1),
         };
         let text = program(&p);
         assert!(
-            text.starts_with("(defstruct Pt (x: i64 y: i64))\n\n(defun f1 (p: Pt) -> i64 (. p x))")
+            text.starts_with("(defstruct Pt (x: i64 y: i64))\n\n(defun f2 (p: Pt) -> i64 (. p x))")
         );
         assert!(!text.contains("Wrap"));
     }

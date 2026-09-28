@@ -5,12 +5,20 @@
 //! spec fixes for the constructs the generator emits: strict left-to-right
 //! evaluation (syntax §2), copy-in/copy-out `&` with the copy-ins at call
 //! entry and the write-backs after the call, both in parameter order
-//! (§3.13), cells shared by reference, atoms replaced by `swap!`/`reset!`, lazily run `async` tasks, and wrapping integer
-//! arithmetic (types §2.12). The interpreter's result must equal the
+//! (§3.13), cells shared by reference, atoms replaced by
+//! `swap!`/`reset!`, lazily run `async` tasks, integer arithmetic that
+//! traps on overflow at every width and IEEE floats (types §2.12),
+//! protocol dispatch with defaults (types §4), vector patterns and
+//! guards (syntax §3.6), and macro calls expanded by
+//! [`crate::macros::expand`]. The interpreter's result must equal the
 //! model's (rule 4 of the task: differential sanity).
 
+mod arrays;
 mod builtins;
 mod eval;
+mod nums;
+mod patterns;
+mod protos;
 mod value;
 
 pub use value::V;
@@ -37,6 +45,16 @@ const MODEL_STACK: usize = 256 * 1024 * 1024;
 /// The value `main` must return, computed on a thread with
 /// [`MODEL_STACK`] of stack.
 pub fn expected(p: &Program) -> Result<i64, ModelError> {
+    expected_traced(p).0
+}
+
+/// What the model's run of a program did beyond its result: labels for
+/// the coverage table of things only a run shows (a guard that was
+/// false, a default method that ran).
+pub type Trace = Vec<&'static str>;
+
+/// [`expected`], and the labels of what the run did.
+pub fn expected_traced(p: &Program) -> (Result<i64, ModelError>, Trace) {
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new()
             .name("fibgen-model".into())
@@ -44,16 +62,27 @@ pub fn expected(p: &Program) -> Result<i64, ModelError> {
             .spawn_scoped(scope, || expected_here(p));
         match worker.map(|h| h.join()) {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err(ModelError::Unsupported("the model panicked".into())),
-            Err(e) => Err(ModelError::Unsupported(format!(
-                "cannot start the model: {e}"
-            ))),
+            Ok(Err(_)) => (
+                Err(ModelError::Unsupported("the model panicked".into())),
+                Vec::new(),
+            ),
+            Err(e) => (
+                Err(ModelError::Unsupported(format!(
+                    "cannot start the model: {e}"
+                ))),
+                Vec::new(),
+            ),
         }
     })
 }
 
-fn expected_here(p: &Program) -> Result<i64, ModelError> {
+fn expected_here(p: &Program) -> (Result<i64, ModelError>, Trace) {
     let mut m = Machine::new(p);
+    let r = run_main(&mut m, p);
+    (r, m.trace.iter().copied().collect())
+}
+
+fn run_main(m: &mut Machine, p: &Program) -> Result<i64, ModelError> {
     for d in &p.defs {
         let v = m.eval(&d.init, &eval::Env::default())?;
         m.globals.insert(d.name.clone(), v);
@@ -66,3 +95,5 @@ fn expected_here(p: &Program) -> Result<i64, ModelError> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_new;

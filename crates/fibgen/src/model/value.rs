@@ -16,6 +16,10 @@ pub enum V {
     Unit,
     /// An integer.
     Int(i64),
+    /// An integer of a width other than `i64`, sign-extended.
+    IntW(i64, crate::ty::NumTy),
+    /// A float (an `f32` held exactly as an `f64`).
+    Flt(f64, crate::ty::NumTy),
     /// A boolean.
     Bool(bool),
     /// A string.
@@ -60,8 +64,6 @@ pub struct Closure {
 pub enum TaskState {
     /// Not run yet.
     Pending(Expr, Env),
-    /// A spawned closure, not run yet.
-    Thunk(V),
     /// Finished with this value.
     Done(V),
 }
