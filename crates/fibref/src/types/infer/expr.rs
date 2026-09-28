@@ -3,7 +3,7 @@
 
 use crate::syntax::Pos;
 
-use crate::types::ast::{ConvOp, Expr, ExprKind, FnLit, Lit, Pattern, Place};
+use crate::types::ast::{Clause, ConvOp, Expr, ExprKind, FnLit, Lit, Pattern, Place};
 use crate::types::error::{TResult, TypeError};
 use crate::types::ty::{Con, Scalar, Ty};
 
@@ -124,13 +124,17 @@ impl Cx<'_> {
         Ok(r)
     }
 
-    fn match_expr(&mut self, s: &Expr, clauses: &[(Pattern, Expr)], _pos: &Pos) -> TResult<Ty> {
+    fn match_expr(&mut self, s: &Expr, clauses: &[Clause], _pos: &Pos) -> TResult<Ty> {
         let st = self.infer(s)?;
         let r = self.fresh();
-        for (pat, body) in clauses {
-            self.check_pattern(pat, &st)?;
-            let t = self.infer(body)?;
-            self.flow(&t, &r, &body.pos)?;
+        for c in clauses {
+            self.check_pattern(&c.pat, &st)?;
+            if let Some(g) = &c.guard {
+                let gt = self.infer(g)?;
+                self.unify(&gt, &Ty::bool(), &g.pos)?;
+            }
+            let t = self.infer(&c.body)?;
+            self.flow(&t, &r, &c.body.pos)?;
         }
         Ok(r)
     }

@@ -67,7 +67,10 @@ pub(super) fn children_of(e: &Expr) -> Vec<&Expr> {
         ExprKind::Do(es) | ExprKind::Recur(es) | ExprKind::Concat(es) => out.extend(es.iter()),
         ExprKind::Match(x, cls) => {
             out.push(x);
-            out.extend(cls.iter().map(|(_, b)| b));
+            for c in cls {
+                out.extend(c.guard.as_ref());
+                out.push(&c.body);
+            }
         }
         ExprKind::Loop(vs, body) => {
             out.extend(vs.iter().map(|(_, x)| x));
@@ -201,7 +204,7 @@ fn tail_async(e: &Expr) -> Option<crate::syntax::Pos> {
         ExprKind::Do(es) => es.last().and_then(tail_async),
         ExprKind::If(_, t, f) => tail_async(t).or_else(|| tail_async(f)),
         ExprKind::Let(_, body) | ExprKind::Loop(_, body) => tail_async(body),
-        ExprKind::Match(_, cls) => cls.iter().find_map(|(_, b)| tail_async(b)),
+        ExprKind::Match(_, cls) => cls.iter().find_map(|c| tail_async(&c.body)),
         _ => None,
     }
 }

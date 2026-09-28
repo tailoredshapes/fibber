@@ -1,0 +1,29 @@
+;; spec:   §3 (types §6.3, E2, E3; syntax §3.6)
+;; expect: accept
+;; result: 233
+;; audit:  clean
+;; A rest escapes three ways: stored into a struct (E2), captured by a
+;; closure that is returned (E3), and stored into a cell with set!
+;; (E2). Each store retains it and the clause's exit releases the
+;; binding's own count, so each vector lives exactly as long as what
+;; holds it. 3 + 10*3 + 100*2 = 233.
+(defstruct Holder (items: (Vec i64)))
+
+(defun keep (v: (Vec i64)) -> Holder
+  (match v
+    ([_ & r] (Holder r))
+    ([] (Holder v))))
+
+(defun later (v: (Vec i64)) -> (fn () i64)
+  (match v
+    ([_ _ & r] (fn () (count r)))
+    (_ (fn () 0))))
+
+(defun main () -> i64
+  (let ((c (cell [0]))
+        (h (keep [1 2 3 4]))
+        (f (later [1 2 3 4 5])))
+    (match [9 8 7]
+      ([_ & r] (set! c r))
+      ([] ()))
+    (+ (count (. h items)) (+ (* 10 (f)) (* 100 (count @c))))))

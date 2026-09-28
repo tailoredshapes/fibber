@@ -129,9 +129,10 @@ pub enum ExpandErrorKind {
     /// `(nil ...)` in an expression (§3.9: "`(nil)` in an expression is
     /// the error `nil is a constant, not a function; write nil`").
     NilCalled,
-    /// `[..]` or `{..}` in a pattern (§1.4: "brackets are not allowed in
-    /// v1").
-    BracketInPattern,
+    /// `{..}` in a pattern (§1.4: braces are not allowed in a pattern;
+    /// brackets are a vector pattern since the owner's decision of
+    /// 2026-09-28).
+    BraceInPattern,
     /// An expression at top level (§2: "an expression at top level is an
     /// error").
     ExpressionAtTopLevel,
@@ -211,7 +212,7 @@ impl fmt::Display for ExpandErrorKind {
                 )
             }
             K::NilCalled => write!(f, "nil is a constant, not a function; write nil"),
-            K::BracketInPattern => write!(f, "brackets are not allowed in patterns"),
+            K::BraceInPattern => write!(f, "braces are not allowed in patterns"),
             K::ExpressionAtTopLevel => write!(f, "expression at top level"),
             K::DefinitionInExpression { head } => write!(f, "{head} is only allowed at top level"),
             K::NsNotFirst => write!(f, "ns must be the first form of the module"),

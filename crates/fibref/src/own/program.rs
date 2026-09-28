@@ -29,7 +29,9 @@
 //! mechanically. Evaluate expressions in the order of syntax §2. For
 //! every expression `e`, after `e` has been evaluated (including
 //! everything that [`BodyOwn::exprs`] lists for its sub-expressions),
-//! run `exprs[e].after` in order. Those lists hold every retain,
+//! run `exprs[e].after` in order; after a `match` guard `g` that is
+//! false, run [`BodyOwn::guard_fail`]`[g]` too, then try the next
+//! clause. Those lists hold every retain,
 //! release and stack end that the pass decided: a join retain on a
 //! branch, the scope exit of a `let` (after its body), of a `match`
 //! (after each clause body) and of a `loop` (after its body, on the path
@@ -453,6 +455,10 @@ pub struct BodyOwn {
     /// Scope-local implicit temporaries (a step's, a `match`'s, a `let`
     /// pattern's), by the initialising expression.
     pub stack_temps: BTreeSet<ExprId>,
+    /// Per guard of a `match` clause: the operations of its false edge,
+    /// run when it is false and before the next clause is tried (the
+    /// clause's rest vectors released in reverse order, §6.3).
+    pub guard_fail: HashMap<ExprId, Vec<Op>>,
 }
 
 /// A `defun`'s interface for its callers: per parameter, its count kind

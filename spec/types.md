@@ -340,6 +340,7 @@ field f; annotate it` (§3.4). Any other constructor: `T has no field f`.
 
 ```
 (match s cl₁ .. clₙ)    s : S;  each clause (pat b): pat checked against S binding Γ_pat;  Γ,Γ_pat ⊢ b : T  ⇒ T
+                        a guarded clause (pat :when g b): as above, and Γ,Γ_pat ⊢ g : bool
 ```
 
 `Γ ⊢ pat : S ⇝ Γ'`:
@@ -352,13 +353,46 @@ field f; annotate it` (§3.4). Any other constructor: `T has no field f`.
 | `nil` (also spelled `(nil)` by a macro, syntax §3.9), `(some p)` | `S ~ (Option a)`, `a` fresh; `p : a` |
 | `(V p₁ .. pₖ)` | `V` a variant of `(N ā)` with `k` fields; `S ~ (N b̄)`, `b̄` fresh; `pᵢ : Fᵢ[b̄/ā]` |
 | `(N p₁ .. pₖ)` | struct `N` with `k` fields, likewise |
+| `[p₁ .. pₖ]` | `S ~ (Vec a)`, `Vec` the prelude's, `a` fresh; `pᵢ : a` |
+| `[p₁ .. pₖ & r]` | as above, and binds `r : (Vec a)`; `[.. & _]` binds nothing |
 | `(p :as x)` | binds `x : S`, then `p : S` |
 
 Exhaustiveness and redundancy are decided after the SCC's types are
 solved, on the resolved scrutinee type, by the standard usefulness
 matrix (Maranget). If the scrutinee's type is still a variable then,
 only `_`/variable clauses are exhaustive. `let` accepts only irrefutable
-patterns (syntax §3.3).
+patterns (syntax §3.3); of the vector patterns only `[& r]` is
+irrefutable.
+
+A **guarded clause** is checked for redundancy against the unguarded
+clauses above it, like any clause, and is then left out of the matrix:
+it covers nothing, so a later clause is never redundant because of it,
+and the unguarded clauses alone must be exhaustive (**Decided** (owner,
+2026-09-28); a guard is an arbitrary `bool` expression whose value the
+checker cannot know).
+
+**Vector patterns in the matrix** (**Decided** (owner, 2026-09-28)).
+A `(Vec T)` has one constructor per length. For a column of the
+matrix whose type is `(Vec T)` and in which some row has a vector
+pattern, let `L` be one more than the greatest `k` of a fixed-length
+pattern `[p₁ .. pₖ]` in the column, or the greatest `k` of a rest
+pattern `[p₁ .. pₖ & r]` if that is larger. The column's constructors
+are then *length `n`* for `n < L`, of arity `n` with every field of
+type `T`, and *length at least `L`*, of arity `L`, which stands for
+every longer length at once (no pattern of the column can tell them
+apart); the set is complete. A fixed pattern of length `k` is the
+constructor *length `k`*; a rest pattern with `k` elements specialises
+to every constructor of length (or least length) `m ≥ k`, its `k`
+sub-patterns followed by `m - k` wildcards; a wildcard or variable
+row, to every constructor. So `[]` and `[x & r]` are exhaustive, and
+`[]`, `[x]` alone leave out `[_ _ & _]`, which the error prints. A
+missing length is printed as a vector pattern: `[]`, `[_ _]`, or `[_ _
+& _]` for the least length; a missing variant of `Vec` itself (when no
+unguarded clause has a vector pattern) likewise, `[]` or `[_ & _]`. A column of type `(Vec T)` that has both a
+vector pattern and a pattern of one of `Vec`'s own variants
+(`(VecEmpty)`, `(VecOf ..)`) is the error `vector patterns cannot be
+mixed with patterns of Vec's variants`: the two describe one value in
+two ways the matrix cannot relate.
 
 ### 2.7 `defstruct`, `defenum`, `defprotocol`, `impl`
 
@@ -1241,11 +1275,11 @@ alive. Every binding is one of:
 
 | Kind of binding | Reading it yields | Released at its scope end? |
 |---|---|---|
-| **owning**: a `let` binding whose initialiser is `Owned`; a capture of a heap closure (§6.5); an **owned** parameter (§6.4), which every object parameter of a `fn` is; a loop variable (§6.10); an implicit temporary | `Borrowed(b)` | yes, unless moved out |
+| **owning**: a `let` binding whose initialiser is `Owned`; a capture of a heap closure (§6.5); an **owned** parameter (§6.4), which every object parameter of a `fn` is; a loop variable (§6.10); the rest variable `r` of a vector pattern `[.. & r]` (§6.3); an implicit temporary | `Borrowed(b)` | yes, unless moved out |
 | **borrowed parameter** (a plain parameter of a `defun` or method whose count kind is borrowed, §6.4) | `Borrowed(b)` | no (**Decided**, §4): a frame below holds it |
 | **`&` parameter** (its value is its private cell, which is never an expression: syntax §3.13) | never read: `@v` is `Owned`, `&v` forwards the cell, `(set! v e)` writes it (§6.6) | no (the cell is the caller's) |
 | **alias of `b'`**: a `let` binding whose initialiser is `Borrowed(b')`; a capture of a stack closure (§6.5); a pattern variable that binds the *whole* scrutinee (a top-level symbol pattern or a top-level `:as`) of a scrutinee whose mode is `Borrowed(b')`; the self-name `g` of a named `(fn g ..)` inside its body, an alias of the closure's `env` (§8.4), which is an owned parameter of the body (§6.4), and every occurrence of which is a use of the literal (§6.5) | `Borrowed(b')` | no count |
-| **derived of `b'`**: a `let` binding whose initialiser is `Derived(b')`; a pattern variable bound *inside* a variant or struct pattern (a payload or a field) of a scrutinee whose binding is `b'`; a whole-scrutinee pattern variable of a scrutinee whose mode is `Derived(b')` | `Derived(b')` | no count |
+| **derived of `b'`**: a `let` binding whose initialiser is `Derived(b')`; a pattern variable bound *inside* a variant, struct or vector pattern (a payload, a field or an element; not a rest variable) of a scrutinee whose binding is `b'`; a whole-scrutinee pattern variable of a scrutinee whose mode is `Derived(b')` | `Derived(b')` | no count |
 | **global**: a `def` name (syntax §3.19, §2.16) | `Borrowed(g)` | never: its value is immortal (§8.2), so every count operation `consume` would emit on it is a no-op the compiler may omit |
 
 `Derived(b)` always names a *strict* sub-object of `b`'s value, reached
@@ -1306,8 +1340,9 @@ Everything else emits no count operation:
 | argument at an **owned** position of a known callee, or any argument of a call through a closure value, in an ordinary call | `consume`: an `Owned` temporary is moved in (it is then no temporary of the call step: syntax §2), a `Borrowed`/`Derived` one retained; the callee releases it or hands it on (§6.4), and the interpreter does the same (§6.12, exception 5). This is not an escape of the caller's binding: what the callee keeps is what its summary says |
 | `let` binding `(x e)` | `e` `Owned`: `x` owns it. `e` `Borrowed(b)`/`Derived(b)` with `b` alive for `x`'s whole scope: `x` is an alias/derived binding of `b`, no count. `e` `Derived(t)` where `t` is a temporary of the initialiser step: the step is a scope (next row), so `x` owns a retained reference |
 | **scope exit** of a `let` with body mode `m`, or of a step with temporaries | if `m = Borrowed(x)` and `x` is an owning binding of this scope: **move out**: `x` is not released and the result is `Owned`. If `m = Derived(x)` and `x` owns in this scope: retain the result, then release the scope's owning bindings; result `Owned`. Otherwise release every owning binding of the scope in reverse order; result mode unchanged |
-| `match` scrutinee | `Owned`: an implicit owning binding `t` for the whole form; a pattern variable that binds the whole scrutinee is an alias of `t`, one bound inside a variant or struct pattern is derived of `t` (§6.1); the form's value is adjusted by the scope-exit rule with `t` as the scope. `Borrowed(b)`: whole-scrutinee variables are aliases of `b`, the rest derived of `b`. `Derived(b)`: every pattern variable is derived of `b` |
-| `let` with a pattern | as a one-clause `match` whose scope is the `let` |
+| `match` scrutinee | `Owned`: an implicit owning binding `t` for the whole form; a pattern variable that binds the whole scrutinee is an alias of `t`, one bound inside a variant, struct or vector pattern is derived of `t` (§6.1); the form's value is adjusted by the scope-exit rule with `t` as the scope. `Borrowed(b)`: whole-scrutinee variables are aliases of `b`, the rest derived of `b`. `Derived(b)`: every pattern variable is derived of `b`. A rest variable is none of these: it owns (next row) |
+| `match` clause | a scope inside the `match`'s, whose owning bindings are the clause's rest variables, in the order they occur in its pattern (none for most clauses). The clause's body is a step of it; the body's value is adjusted by the scope-exit rule with this scope (a rest variable that is the clause's value is moved out; a part of one is retained first), then joined with the other clauses and adjusted by the `match`'s scope. A guard is a step of the clause before its body, never in tail position: its temporaries are released at its end; when it is false, the clause's scope exits with no value, releasing its rest variables in reverse order, and the next clause is tried (**Decided** (owner, 2026-09-28)) |
+| `let` with a pattern | as a one-clause `match` whose scope is the `let`; a rest variable of `[& r]` is an owning binding of the `let` |
 | **join** of `if`/`match` branches | all branches `Borrowed(b)` for one `b`: `Borrowed(b)`. All branches `Derived(b)` for one `b`: `Derived(b)`. Otherwise, including `Borrowed(b)` mixed with `Derived(b)`, `Owned`, and every branch that is not `Owned` gets a retain at its tail (**Decided** by case 04 and for the mixed case: read as `Derived(b)` it hid a `Borrowed(b)` occurrence from the escape summary of §6.4, and read as `Borrowed(b)` the scope-exit rule would move `b` out when the other branch had returned a sub-object of `b`, leaking `b`) |
 | non-final `do` step | `Owned`: release at the step's end |
 | `defun`, `fn` or `async` body (E1) | `consume` the body's value (every `let` and `match` inside it has already exited by the scope-exit rule, since they are expressions); an owned parameter whose value is the result is moved out, with no retain and no release; then release the temporaries of the final step, then the owned parameters not moved out (§6.4). A tail call in a `defun` or `fn` body replaces all of this by the rule of §6.10. An `async` body has no parameters and no tail calls (§6.10 rule (f)): its consumed value is the task's result, which the completion of §8.8 stores after the body's last step has returned |
@@ -1328,6 +1363,58 @@ the inner `let` binds `a` (`Owned`) and `b`; its body is `Borrowed(a)` →
 move out, `b` released; `keep` owns `a`'s vector. Case 04: `pick`'s `if`
 joins `Borrowed(x)` with `Owned` → retain on the `x` branch; the result
 is `Owned` on both paths.
+
+**Vector patterns and guards** (**Decided** (owner, 2026-09-28); syntax
+§3.6). The two tables above decide them with no rule of their own
+beyond the `match` clause row; what follows is why that is sound.
+
+- *Elements are parts.* An element bound by a vector pattern is
+  `Derived` of the scrutinee's binding, as a field is: it is a strict
+  sub-object, reached through the vector's `VecOf` fields and arrays,
+  and it was stored into its array at E2, so it is a heap object and
+  the escape summary of §6.4 may ignore it. The vector cannot change
+  under the binding: it is immutable, and the only in-place writes
+  (§6.6) go through a place holding an object with count 1, while
+  this one is held by the scrutinee's binding or reached through a cell
+  read, which acquired it. Reading an element emits no count
+  operation (§8.3).
+- *A rest is a new object, owned.* A suffix of a trie is not an
+  object, so a rest cannot be a borrow of the scrutinee without a slice
+  type, and as `Derived` it would name a value that is not a stored
+  sub-object, which §6.4's summary relies on. So `r` in `[.. & r]` is
+  bound to a new vector made by `fib.vec-drop` (§8.3), which holds a
+  count on each of its elements (stored into its arrays, E2), and `r`
+  owns it: the clause's scope releases it, moves it out when it is the
+  clause's value, and a tail call or `recur` from the body releases it
+  before the jump or moves it into an argument (§6.10), exactly as for
+  an owning `let` binding. Being independent of the scrutinee, a rest
+  that is returned, stored, captured or passed on never makes the
+  scrutinee's parameter escape; it is a call result, not an allocation
+  of the frame, so it is never scope-local (§6.11).
+- *Built once, and only for the clause taken.* The rest vectors of a
+  clause are built after its whole pattern has matched and before its
+  guard, left to right; a clause whose pattern fails builds none, so a
+  rest can never be built and then abandoned by a later failing
+  sub-pattern. `[.. & _]` builds nothing.
+- *A false guard ends the clause.* A guard is a step: its own
+  temporaries are released at its end whatever its value. If it is
+  false, the clause's scope exits with no value — its rest variables
+  are released in reverse order, and nothing is moved, since no body
+  ran — before the next clause is tried; the scrutinee's binding `t` is
+  the `match`'s and lives on. If the guard stored a rest variable
+  (into a cell, or by capturing it in a closure that escapes), the store
+  retained it (E2, E3), so the release at the guard's failure frees
+  nothing that is still held. A later clause binds its own variables,
+  whatever their names: bindings are sites, not names (§6.1).
+- *Side effects in guards* need no rule of their own: a guard sits
+  where a body step could and every rule above applies to it as to a
+  body; the scrutinee cannot be changed by one (it is not a cell, and
+  a pattern never looks inside a cell), so the clauses tried after a
+  guard's writes see the same value.
+- *Tail position.* A guard is never in tail position, so a call in a
+  guard is an ordinary call and a `recur` in a guard is `recur not in
+  tail position`; the body of the clause is in tail position when the
+  `match` is (§6.10).
 
 ### 6.4 Borrowed and owned parameters, owned results, summaries (§4)
 
@@ -1864,7 +1951,8 @@ task; `(length s)` reads the task's capture; the task is freed after
 ### 6.10 Tail calls (Decided, D5)
 
 A call is in **tail position** of a body when it is the last step of
-the body, a branch of a tail `if`/`match`, the body of a tail `let`,
+the body, a branch of a tail `if`, the body (never the guard, syntax
+§3.6) of a clause of a tail `match`, the body of a tail `let`,
 `do` or `loop`, or a `recur`, transitively; never inside a `fn` or
 `async` literal nested in the body. A call in tail position is a **tail
 call** — the caller's frame is discarded and the callee's result is the
@@ -2109,7 +2197,8 @@ box inside `l`'s list, retained by `first`); a literal collection,
 whose rewrite is a chain of prelude calls (syntax §1.4; a fused
 allocation would have to be specified before it could qualify); the
 result of a scope exit or a join; a cell, atom or weak read; `swap!`,
-`join`, `await`; an immortal. A parameter's object arrived from
+`join`, `await`; an immortal; the rest vector of a vector pattern,
+which `fib.vec-drop` makes (§6.3, §8.3). A parameter's object arrived from
 elsewhere, and a loop variable is rebound by every `recur` to an object
 made elsewhere (§6.10), so neither is ever scope-local in v1. An
 inline drop on an object the frame did not allocate would release
@@ -2283,7 +2372,11 @@ and a double release as a count going negative.
 | ambiguous constraint P a in f; add an annotation | §3.3 |
 | cannot construct the infinite type | §3.2 |
 | cannot unify T₁ with T₂ | §3.2 |
-| non-exhaustive match: missing V / redundant match clause | §2.6 |
+| non-exhaustive match: missing V / redundant match clause (a missing length of a `Vec` printed `[]`, `[_ _]`, `[_ _ & _]`) | §2.6 |
+| vector patterns cannot be mixed with patterns of Vec's variants | §2.6 |
+| & in a vector pattern is followed by one symbol or _ | §2.6, syntax §3.6 |
+| a let pattern must be irrefutable (every vector pattern but `[& r]`) | §2.6, syntax §3.3 |
+| a guarded clause is (pattern :when guard body+) | syntax §3.6 |
 | await outside async | §6.9 |
 | weak requires an object type | §2.11 |
 | **weak of an Option is not allowed** | §2.11, case 82 |
@@ -2620,6 +2713,33 @@ compiled program.
   struct.
 - `Vec`, `Map`, `Set`, `List`: library structs and enums over `Array`, by
   the struct rule.
+- **Vector patterns** (**Decided** (owner, 2026-09-28)): the pattern
+  compiler has a core view of the prelude's `Vec` — its layout is
+  fixed by the prelude (`VecEmpty`, or `(VecOf cnt shift root tail)`
+  over `VNode` arrays) and known to the compiler as the reference
+  interpreter knows it — rather than calling `count`/`nth`, which are
+  protocol methods returning owned results (a retain and a release per
+  element, and a call per test). The length test loads the tag and,
+  for `VecOf`, `cnt`: constant time, two loads and an `icmp`, tested
+  before any element. Element `i` is read as `vec-nth` reads it but
+  inline and with no count operation, a derived read like a field load
+  (§6.2): if `i ≥ cnt - len(tail)` one `getelementptr` into `tail`,
+  else one array read per node on the path from `root` to a leaf
+  (`shift / 5 + 1` nodes: 2 for up to 1 056 elements, at most 13 for a
+  64-bit count), O(log₃₂ n); each
+  sub-pattern then tests the loaded element as usual. Elements are
+  read left to right and only as far as the test needs. A rest `r` of
+  `[p₁ .. pₖ & r]` is the result of the runtime function
+  `(fib.vec-drop v k)` (`ptr i64 -> ptr`), called once the whole
+  pattern has matched: a new vector of the `n - k` elements from `k`
+  on, in the layout `conj` would build, each element retained into it;
+  it costs O(n - k) time and `⌈(n - k) / 32⌉` leaves plus the branches
+  above them. `[.. & _]` costs nothing beyond the length test.
+- **Guards**: after the bindings, the guard's `i1` value is branched
+  on; its false edge runs the clause's scope exit (a `fib.release` of
+  each rest vector, in reverse order) and jumps to the next clause's
+  test, its true edge to the body. Neither edge touches the scrutinee's
+  binding.
 - `Form`: an ordinary enum; exists at run time only where a program
   quotes. A quoted literal, with every `Form`, `Vec`, `Array` and `str`
   object reachable from it, is an `IMMORTAL` graph (count 0) that the
@@ -2972,6 +3092,8 @@ interpreter may run tasks as coroutines; frees must match.
 | E2 store of `Borrowed`/`Derived` | `fib.retain` before the store |
 | E4 `spawn` | `consume` the closure, `fib.share`, allocate the task with count 2, hand both to the runtime |
 | join retain (`if`/`match`) | `fib.retain` at the tail of each non-`Owned` branch |
+| vector pattern | length and element loads, no count operation; `fib.vec-drop` for each rest variable once the clause's pattern has matched (§8.3) |
+| false guard | `fib.release` the clause's rest vectors in reverse order, then the next clause's test (§6.3) |
 | scope exit | `fib.release` each owning binding not moved out, in reverse order, on every exit path |
 | `Derived(x)` result leaving `x`'s scope | `fib.retain` the result, then the releases |
 | argument at an owned position of a known callee, or any argument of a call through a closure value | `consume` before the call: `fib.retain` a `Borrowed`/`Derived` argument, move an `Owned` one (§8.9) |
@@ -3094,7 +3216,9 @@ ordinary), or the escaping use — and its
 captures with their kinds), a call (`tail-call`, or `call` with the
 rule of §6.10 that made it ordinary; the copy-in of every `&` argument,
 `acquire` or `forward`), a colour solution (`ς₁ = local, forced by
-capture n`), and the emitted operations with source lines; a function
+capture n`), and the emitted operations with source lines, those
+of a guard's false edge written `L5 guard false: release [r] (exit)` after
+the guard's own (§6.3; a rest variable is a binding line `r  owns`); a function
 whose value is taken has a second entry, `defun f.owned`, for its
 all-owned body (§8.4). Reject cases print the error and the rule
 number of this document. The interpreter's trace (`fibref`
@@ -3355,5 +3479,38 @@ cases in `cases/ownership/` (101 to 127):
    3; cases 101 to 104; §8.12).
 6. **A float literal of a width other than `f32` or `f64`**, read or
    built by a macro, is an error (syntax §1.1, §3.16; case 105).
+
+### Decided on vector patterns and guards
+
+On 2026-09-28 the owner lifted the v1 restriction "no vector patterns,
+no guards" (syntax, Open decisions item 11), because a self-hosting
+compiler is mostly code taking forms apart and needs both. The rules
+were written from these decisions, and cases 128 to 149 pin them:
+
+1. **Vector patterns** `[p₁ .. pₖ]` (length exactly `k`) and `[p₁ ..
+   pₖ & r]` (length at least `k`; `r` a symbol or `_`), in `match` and
+   in `let`, where only `[& r]` is irrefutable; sub-patterns nest in
+   any order (syntax §1.4, §3.3, §3.6; §2.6).
+2. **A core view of the prelude's `Vec`**, not the `count`/`nth`
+   protocol methods: the length in constant time, element `i` by one
+   inline walk of the trie, O(log₃₂ n), with no count operation (§8.3).
+3. **Elements are borrows** (`Derived` of the scrutinee's binding,
+   like fields); **a rest is a new owned vector** made by
+   `fib.vec-drop` in O(n − k), an owning binding of its clause, never
+   scope-local; a clause's rests are built only once its whole pattern
+   has matched, before its guard (§6.1, §6.3, §6.11, §8.3).
+4. **Exhaustiveness** treats each length as a constructor, with one
+   constructor for every length from `L` up, `L` fixed by the column's
+   patterns; mixing vector patterns with patterns of `Vec`'s variants
+   is an error (§2.6).
+5. **Guards** `(pat :when g body+)`: `g : bool`, evaluated after the
+   bindings, a step of its own, never in tail position; side effects
+   allowed, in the fixed order of clause attempts; a false guard
+   releases the clause's rest vectors and falls through; a guarded
+   clause counts for nothing towards exhaustiveness and is checked for
+   redundancy like any other (syntax §3.6; §2.6, §6.3, §6.10, §8.3).
+6. **No pattern syntax for forms**: a `Form`'s items are a `(Vec
+   Form)`, so `(List [(Sym "if") c t e])` matches forms by shape; a
+   vector pattern against a `Form` is a type error (syntax §3.6).
 
 Nothing is open.

@@ -10,6 +10,7 @@ mod dyn_send;
 mod errors;
 mod errors2;
 mod forms;
+mod patterns;
 mod private;
 mod supers;
 

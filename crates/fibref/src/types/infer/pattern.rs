@@ -2,7 +2,7 @@
 //! `Γ ⊢ pat : S ⇝ Γ'`.
 
 use crate::syntax::Pos;
-use crate::types::ast::{BindingId, PatKind, Pattern};
+use crate::types::ast::{BindingId, PatKind, Pattern, Rest};
 use crate::types::decls::Shape;
 use crate::types::error::{TResult, TypeError};
 use crate::types::ty::Ty;
@@ -60,6 +60,7 @@ impl Cx<'_> {
                 self.bind(*b, s);
                 self.check_pattern(inner, s)
             }
+            PatKind::Vec(subs, rest) => self.check_vec_pattern(p, subs, *rest, s),
             PatKind::Ctor(t, v, subs) => {
                 let def = self.g.ty(*t);
                 // A colour parameter's argument is a colour (§1.3).
@@ -82,5 +83,32 @@ impl Cx<'_> {
                 Ok(())
             }
         }
+    }
+
+    /// `[p.. & r]` against `s`: `s ~ (Vec a)` with the prelude's `Vec`,
+    /// each `p : a`, `r : (Vec a)` (§2.6).
+    fn check_vec_pattern(
+        &mut self,
+        p: &Pattern,
+        subs: &[Pattern],
+        rest: Rest,
+        s: &Ty,
+    ) -> TResult<()> {
+        let Some(vec) = self.g.vec else {
+            return Err(TypeError::other(
+                &p.pos,
+                "vector patterns need the prelude's Vec",
+            ));
+        };
+        let a = self.st.fresh();
+        let vt = Ty::nominal(vec, vec![a.clone()]);
+        self.unify(s, &vt, &p.pos)?;
+        for sub in subs {
+            self.check_pattern(sub, &a)?;
+        }
+        if let Rest::Bind(b) = rest {
+            self.bind(b, &vt);
+        }
+        Ok(())
     }
 }

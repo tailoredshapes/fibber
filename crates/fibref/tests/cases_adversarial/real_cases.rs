@@ -25,13 +25,13 @@ fn real_cases() -> Vec<PathBuf> {
 
 const REJECT: &[u32] = &[
     12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109, 112, 113, 114, 118, 119, 121, 123,
-    125, 126, 127,
+    125, 126, 127, 138, 139, 142, 144, 145, 146, 147,
 ];
 const LEAK_CYCLE: [u32; 2] = [15, 80];
 /// The cases whose verdict is a run-time trap (method.md rule 3).
 const TRAP: [u32; 4] = [101, 102, 103, 104];
-/// The last case number of this suite. Another series starts at 131.
-const LAST: u32 = 127;
+/// The last case number of this suite.
+const LAST: u32 = 149;
 
 fn number_of(path: &Path) -> u32 {
     let name = path.file_name().unwrap().to_string_lossy();
@@ -78,7 +78,8 @@ fn the_ownership_directory_holds_cases_1_to_last_less_the_withdrawn() {
     // 30 and 35 were withdrawn when D1 removed field places; 81 to 95
     // are the promoted findings of the rule-4 adversary, 96 to 99 those
     // of the rule-5 generator, 100 the annotated bindings of syntax §1.5,
-    // 101 onwards the owner's decisions of 2026-09-28 (types §10).
+    // 101 to 127 the owner's decisions of 2026-09-28 lifting the v1
+    // restrictions, 128 to 149 vector patterns and guards (types §10).
     // The listing is by name, so 100 sorts after 10: compare as numbers.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();

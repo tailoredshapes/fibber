@@ -5,7 +5,7 @@
 //! having put their releases into the jump.
 
 use crate::syntax::{FltWidth, IntWidth};
-use crate::types::ast::{Expr, ExprKind, GlobalRef, Lit, Pattern};
+use crate::types::ast::{Clause, Expr, ExprKind, GlobalRef, Lit, Pattern};
 use crate::types::ty::Scalar;
 
 use super::call::Jump;
@@ -129,12 +129,28 @@ impl<'p> Interp<'p> {
         self.flow(last)
     }
 
-    fn match_form(&mut self, s: &'p Expr, cls: &'p [(Pattern, Expr)]) -> R<Flow> {
+    /// `match` (syntax §3.6): each clause's pattern, then its guard; a
+    /// false guard runs the plan's `guard_fail` for it (the clause's rest
+    /// vectors released) before the next clause is tried.
+    fn match_form(&mut self, s: &'p Expr, cls: &'p [Clause]) -> R<Flow> {
         let v = self.val(s)?;
-        for (pat, body) in cls {
-            if self.bind_pattern(pat, &v)? {
-                return self.flow(body);
+        for c in cls {
+            if !self.bind_pattern(&c.pat, &v)? {
+                continue;
             }
+            if let Some(g) = &c.guard {
+                if !self.val(g)?.as_bool()? {
+                    let ops: &'p [crate::own::program::Op] = self
+                        .plan()?
+                        .own
+                        .guard_fail
+                        .get(&g.id)
+                        .map_or(&[], Vec::as_slice);
+                    self.run_ops(ops)?;
+                    continue;
+                }
+            }
+            return self.flow(&c.body);
         }
         Err(RunError::trap("no match clause matched"))
     }

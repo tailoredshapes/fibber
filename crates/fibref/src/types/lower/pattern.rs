@@ -1,12 +1,12 @@
 //! Lowering patterns (syntax §3.6): `_`, a variable, a literal, `nil`,
-//! `(some p)`, `(Variant p..)`, `(Struct p..)`, `(p :as x)`. A bare
-//! symbol is always a binding; a field-less variant is matched as
-//! `(Variant)`. A variable may occur once per pattern. A `let` pattern
-//! must be irrefutable (§3.3).
+//! `(some p)`, `(Variant p..)`, `(Struct p..)`, `[p.. & r]`, `(p :as
+//! x)`. A bare symbol is always a binding; a field-less variant is
+//! matched as `(Variant)`. A variable may occur once per pattern. A
+//! `let` pattern must be irrefutable (§3.3).
 
 use crate::syntax::{Form, FormKind};
 
-use crate::types::ast::{BindingKind, GlobalRef, PatKind, Pattern};
+use crate::types::ast::{BindingKind, GlobalRef, PatKind, Pattern, Rest};
 use crate::types::decls::Shape;
 use crate::types::error::{TResult, TypeError};
 
@@ -34,6 +34,7 @@ pub fn pattern(
         FormKind::Sym(s) => PatKind::Bind(bind_once(lw, s, kind, form, names)?),
         FormKind::Nil => PatKind::Ctor(lw.g.option, Some(0), Vec::new()),
         FormKind::List(items) => list_pattern(lw, items, form, kind, names)?,
+        FormKind::Vec(items) => vec_pattern(lw, items, kind, names)?,
         _ => return Err(TypeError::resolve(&pos, format!("{form} is not a pattern"))),
     };
     Ok(Pattern { pos, kind })
@@ -102,6 +103,45 @@ fn list_pattern(
     Ok(PatKind::Ctor(id, variant, subs))
 }
 
+/// `[p.. & r]` (§3.6): the elements, then `&` and one symbol or `_`.
+fn vec_pattern(
+    lw: &mut Lowerer<'_>,
+    items: &[Form],
+    kind: BindingKind,
+    names: &mut Vec<String>,
+) -> TResult<PatKind> {
+    let amp = items.iter().position(|f| f.as_sym() == Some("&"));
+    let (elems, tail) = match amp {
+        Some(i) => (&items[..i], &items[i..]),
+        None => (items, &items[items.len()..]),
+    };
+    let mut subs = Vec::with_capacity(elems.len());
+    for p in elems {
+        if let Some([h, _]) = p.as_list() {
+            if h.as_sym() == Some("&") {
+                let msg = "&r reads as (& r); write & r, with a space, in a vector pattern";
+                return Err(TypeError::resolve(&p.pos, msg));
+            }
+        }
+        subs.push(pattern(lw, p, kind, names)?);
+    }
+    let rest = match tail {
+        [] => Rest::Exact,
+        [_, r] => match r.as_sym() {
+            Some("_") => Rest::Ignore,
+            Some(n) if n != "&" => Rest::Bind(bind_once(lw, n, kind, r, names)?),
+            _ => return Err(bad_rest(r)),
+        },
+        [amp, ..] => return Err(bad_rest(amp)),
+    };
+    Ok(PatKind::Vec(subs, rest))
+}
+
+fn bad_rest(at: &Form) -> TypeError {
+    let msg = "& in a vector pattern is followed by one symbol or _";
+    TypeError::resolve(&at.pos, msg)
+}
+
 /// Lowers the pattern of a `let` binding, which must be irrefutable.
 pub fn let_pattern(lw: &mut Lowerer<'_>, form: &Form, names: &mut Vec<String>) -> TResult<Pattern> {
     let p = pattern(lw, form, BindingKind::Let, names)?;
@@ -118,6 +158,7 @@ fn irrefutable(lw: &Lowerer<'_>, p: &Pattern) -> bool {
         PatKind::Lit(crate::types::ast::Lit::Unit) => true,
         PatKind::Lit(_) => false,
         PatKind::As(inner, _) => irrefutable(lw, inner),
+        PatKind::Vec(subs, rest) => subs.is_empty() && *rest != Rest::Exact,
         PatKind::Ctor(id, variant, subs) => {
             let single = match (&lw.g.ty(*id).shape, variant) {
                 (Shape::Struct(_), None) => true,

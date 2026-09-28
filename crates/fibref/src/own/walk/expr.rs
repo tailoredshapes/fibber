@@ -199,7 +199,7 @@ impl Walker<'_> {
 
     /// The join of §6.3; retains go on the branches that are not
     /// `Owned`. A branch with no value (a `recur`) takes no part.
-    fn join(&mut self, e: &Expr, branches: &[(&Expr, Mode)]) -> Mode {
+    pub(super) fn join(&mut self, e: &Expr, branches: &[(&Expr, Mode)]) -> Mode {
         if !self.is_object(e) {
             return Mode::Scalar;
         }
@@ -271,7 +271,7 @@ impl Walker<'_> {
         self.bind_pattern(pat, whole, inner, true);
     }
 
-    fn scrutinee(&mut self, s: &Expr, m: Mode) -> (Mode, Mode) {
+    pub(super) fn scrutinee(&mut self, s: &Expr, m: Mode) -> (Mode, Mode) {
         let t = Site::Value(s.id);
         let val = self.val(s, m);
         if matches!(m, Mode::Owned { .. }) {
@@ -282,25 +282,6 @@ impl Walker<'_> {
         }
         self.note(val, At::Other);
         pattern_modes(m, t)
-    }
-
-    fn match_form(&mut self, e: &Expr, s: &Expr, cls: &[(Pattern, Expr)], tail: bool) -> Mode {
-        self.push_scope(ScopeKind::Bind);
-        let ms = self.expr(s, false);
-        let (whole, inner) = self.scrutinee(s, ms);
-        let mut branches = Vec::new();
-        for (pat, body) in cls {
-            self.bind_pattern(pat, whole, inner, true);
-            let m = self.step(body, tail);
-            branches.push((body, m));
-        }
-        let m = self.join(e, &branches);
-        let scope = self.pop_scope();
-        let mut out = m;
-        for (i, (body, _)) in branches.iter().enumerate() {
-            out = self.exit_scope_copy(&scope, body.id, m, i == 0);
-        }
-        out
     }
 
     fn loop_form(

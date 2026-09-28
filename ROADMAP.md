@@ -61,6 +61,13 @@ evaluator over the audited heap.
         requires `Eq` (types §4.1; cases 117 to 123)
   - [x] private names: `:private` after a definition's name, `(var
         m/x)` past it (syntax §5, §3.20; cases 113 to 116)
+- [x] pattern matching complete enough for a compiler that takes
+      forms apart: vector patterns `[p* & rest]` in `match` and `let`
+      and guarded clauses `(pat :when g body+)`, after the owner's
+      decision of 2026-09-28 lifting syntax open item 11 (spec: syntax
+      §1.4, §3.6; types §2.6, §6.3, §8.3, §10). Cases 128 to 149, all
+      passing with a clean audit: 147 cases in all. `fibgen` does not
+      yet generate either construct
 
 ## M3. Hardened lIR
 

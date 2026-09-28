@@ -107,6 +107,7 @@ pub fn value_sites(o: &OwnedProgram) -> FxSet<ExprId> {
         body.exprs.values().for_each(|x| add(&x.after));
         body.calls.values().for_each(|c| add(&c.jump));
         body.recurs.values().for_each(|r| add(&r.jump));
+        body.guard_fail.values().for_each(|ops| add(ops));
     }
     out
 }

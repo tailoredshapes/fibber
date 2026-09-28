@@ -6,6 +6,7 @@
 
 mod bindings;
 mod call;
+mod clause;
 mod decl;
 mod defaults;
 mod expr;

@@ -332,6 +332,10 @@ impl Section<'_> {
                 items.push(format!("L{} {}", e.pos.line, op(self.p, self.ix, o)));
             }
         }
+        for o in self.b.guard_fail.get(&e.id).into_iter().flatten() {
+            let text = op(self.p, self.ix, o);
+            items.push(format!("L{} guard false: {text}", e.pos.line));
+        }
     }
 }
 
@@ -350,7 +354,7 @@ fn bound_by(e: &Expr) -> Vec<crate::types::ast::BindingId> {
     let mut out = Vec::new();
     match &e.kind {
         ExprKind::Let(bs, _) => bs.iter().for_each(|(p, _)| pattern_vars(p, &mut out)),
-        ExprKind::Match(_, cls) => cls.iter().for_each(|(p, _)| pattern_vars(p, &mut out)),
+        ExprKind::Match(_, cls) => cls.iter().for_each(|c| pattern_vars(&c.pat, &mut out)),
         ExprKind::Loop(vs, _) => out.extend(vs.iter().map(|(b, _)| *b)),
         _ => {}
     }
@@ -365,6 +369,12 @@ fn pattern_vars(p: &Pattern, out: &mut Vec<crate::types::ast::BindingId>) {
             pattern_vars(q, out);
         }
         PatKind::Ctor(_, _, subs) => subs.iter().for_each(|s| pattern_vars(s, out)),
+        PatKind::Vec(subs, rest) => {
+            subs.iter().for_each(|s| pattern_vars(s, out));
+            if let crate::types::ast::Rest::Bind(b) = rest {
+                out.push(*b);
+            }
+        }
         PatKind::Wild | PatKind::Lit(_) => {}
     }
 }

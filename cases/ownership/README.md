@@ -27,7 +27,8 @@ not changed.
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
 Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109,
-112, 113, 114, 118, 119, 121, 123, 125, 126 and 127 must be rejected; 101 to 104 must trap; 15
+112, 113, 114, 118, 119, 121, 123, 125, 126, 127, 138, 139, 142, 144,
+145, 146 and 147 must be rejected; 101 to 104 must trap; 15
 and 80 are the permitted cycle leaks; every other case is accept with a
 clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
 pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
@@ -95,3 +96,21 @@ through generic functions too (124), is accepted; a local instance
 crossing a thread (125), a colour argument used covariantly, which
 would let a local closure be read back as sendable (126), and a local
 closure given where the annotation fixes `:send` (127) are rejected.
+
+Cases 128 to 149 pin vector patterns and guards, which the owner
+allowed on 2026-09-28 (syntax §1.4, §3.3, §3.6; types §2.6, §6.3, §8.3
+and the decision record in types §10). They were written from the spec
+before fibref implemented it (numbered 131 to 152 on their branch and
+renumbered at the merge). Accept: lengths and literals (128), a rest
+returned (129), stored and captured (130), released in a loop (131);
+guards that fail with later clauses binding the same names (132), that
+store their rest and fail (133), that read a cell an earlier guard
+wrote (134); vector-in-struct (135) and struct-in-vector (136)
+patterns; no rest built when a later sub-pattern fails (137); tail
+calls from guarded bodies (140); forms matched by shape through `(List
+[..])` (141); `[& r]` in `let` (143); an `await` in a guard (148); an
+element that outlives its vector (149). Reject: a missing length (138),
+coverage by guarded clauses only (139), a vector pattern on a `Form`
+(142), a refutable vector pattern in `let` (144), `recur` in a guard
+(145), a clause after `[& r]` (146), vector patterns mixed with `Vec`'s
+own variants (147).
