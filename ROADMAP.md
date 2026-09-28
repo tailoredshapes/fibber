@@ -54,8 +54,16 @@ evaluator over the audited heap.
       sweep of seeds 800000..859999 gave 59409 ok, 319 traps the model
       predicted and 272 `POSSIBLE-OVERREJECTION`, all impls on `(Hook k)`
       whose bodies use `self` as a `(Hook :local)` or join it with a new
-      `Hook`: an open spec question (Open decisions, below); no
-      mismatch, audit failure, crash or hang
+      `Hook`, then an open spec question; no mismatch, audit failure,
+      crash or hang. The owner decided it (2026-09-28: the head's colour
+      is rigid, or the head gives a colour), and `fibgen` now puts a
+      body that uses `self` as a value under a `(Hook :local)` head,
+      used on local hooks only. A sweep of seeds 900000..959999 gave
+      59698 ok, 301 predicted traps and one `POSSIBLE-OVERREJECTION`, a
+      generator bug (a `let` binding one name twice, which syntax §3.3
+      forbids), since fixed; rerun on the fixed generator: 59699 ok,
+      301 predicted traps, no over-rejection, mismatch, audit failure,
+      crash or hang
 - [x] the owner's decisions of 2026-09-28 (spec/types.md §10): lift
       the "v1" restrictions and fix what a trap means; cases 101 to 127:
       125 cases, all passing
@@ -76,8 +84,9 @@ evaluator over the audited heap.
       and guarded clauses `(pat :when g body+)`, after the owner's
       decision of 2026-09-28 lifting syntax open item 11 (spec: syntax
       §1.4, §3.6; types §2.6, §6.3, §8.3, §10). Cases 128 to 149, all
-      passing with a clean audit: 147 cases in all. `fibgen` does not
-      yet generate either construct
+      passing with a clean audit: 147 cases in all. `fibgen` generates
+      both (vector patterns with and without rests, nested in struct
+      patterns and the reverse, and guarded clauses)
 - [x] the owner's decision of 2026-09-28 on the time of the copy-in:
       an `&` argument is copied in at call entry, after all of the
       call's arguments (ownership.md §5; syntax §2, §3.13; types §6.6,
@@ -87,6 +96,14 @@ evaluator over the audited heap.
       floats compare as IEEE 754 and `Ord`'s defaults apply only to
       user impls (types §2.12, §8.12, §10). Case 154: 152 cases in all,
       all passing
+- [x] the owner's decisions of 2026-09-28 on colours in impl heads and
+      on forwarding (types §1.3, §4.1, §5.4, §6.6, §6.10, §10; syntax
+      §3.10, §3.13; ownership.md §5): a colour variable in an impl head
+      is rigid in the bodies and a head may give a colour instead
+      (cases 155 to 161), and an `&` parameter that another argument of
+      the call captures is copied in, not forwarded, so forwarding is
+      indistinguishable from copy-in/copy-out (cases 162 to 165); float
+      `rem` recorded as `fmod`. 163 cases in all, all passing
 
 ## M3. Hardened lIR
 
@@ -146,26 +163,7 @@ else in the library:
 
 ## Open decisions
 
-- A forwarded `&` cell written during the call through a closure that
-  captures the `&` parameter is still observably different from a
-  copied-in one (types §10, "Decided on the time of the copy-in",
-  Open).
-- **The colour argument inside an `impl` on a colour-parameterised
-  type** (types §1.3, last bullet: "treated as `local`") is unsound as
-  written, and fibref, which follows it for field reads, accepts a
-  program that fails the memory audit: with `(defstruct (Slot k
-  :colour) (c: (Cell (fn k () i64))))`, an `(impl P (Slot k) (m (self
-  d) (set! (. self c) (fn () @d))))` stores a closure over a cell into
-  a `(Slot :send)`, which the caller then spawns (case 126's race,
-  moved into an impl body; fibref: `audit error: SharedCell`).
-  `local` is conservative only for reading a closure out of `self`; for
-  writing into `self`, or for a result of type `Self` (or a determined
-  parameter mentioning `k`), it is the unsound direction. fibref also
-  rejects the head's `k` where a `(Hook :local)` is expected and where
-  a new `(Hook ..)` joins `self` (`cannot unify (Hook _) with (Hook
-  k)`), which the rule and both candidates below accept. Candidate rules: `k` rigid in the
-  bodies with fields read at `k` (sound; rejects passing `self` as
-  `(Hook :local)`); or `k` generalised like a `defun`'s colour, the
-  instance existing per colour its bodies allow. No case pins either
-  until the owner decides; `fibgen` generates the over-rejected form
-  and its sweeps count it as `POSSIBLE-OVERREJECTION`.
+None. The last two (the colour argument inside an `impl` on a
+colour-parameterised type, and a forwarded `&` cell written through a
+closure passed to the same call) were decided by the owner on
+2026-09-28 (types §10).
