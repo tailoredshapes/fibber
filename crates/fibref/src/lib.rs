@@ -6,6 +6,8 @@
 //! [`heap`] (rule 2), and the programs in `cases/` are run against the
 //! verdicts fixed in their headers by [`cases`] (rule 3).
 
+#![forbid(unsafe_code)]
+
 pub mod cases;
 pub mod eval;
 pub mod expand;

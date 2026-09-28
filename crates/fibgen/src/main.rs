@@ -3,6 +3,8 @@
 //! with an independent model, and minimise what fails (spec/method.md,
 //! rule 5).
 
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;

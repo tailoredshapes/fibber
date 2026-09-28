@@ -8,6 +8,8 @@
 //! outcome; [`shrink`] minimises a finding; [`report`] writes it as a
 //! case file; [`coverage`] counts the constructs a run exercised.
 
+#![forbid(unsafe_code)]
+
 pub mod ast;
 pub mod coverage;
 pub mod driver;

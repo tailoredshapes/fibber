@@ -6,6 +6,8 @@
 //! Pending cases do not fail the exit code, but they are printed
 //! prominently and are never counted as passes.
 
+#![forbid(unsafe_code)]
+
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
