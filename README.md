@@ -50,7 +50,7 @@ cargo run -p lair -- check <file.lir>           # the checker alone
 | Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
 | Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
 | Library | [lib/prelude.fib](lib/prelude.fib) | what the cases need |
-| lIR: the assembler for LLVM IR that `fibc` will emit | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28); the additions of the second M3 pass proposed (§14.1) |
+| lIR: the assembler for LLVM IR that `fibc` will emit | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28; the second M3 pass's additions decided the same day, §14 items 8 to 11) |
 | lIR cases | [cases/lir/](cases/lir/) | 317, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial; verify: one reject case per rule) |
 | lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |
 | Compiler `fibc` | — | not started (M4) |

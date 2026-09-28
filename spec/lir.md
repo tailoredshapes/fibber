@@ -1,13 +1,12 @@
 # lIR
 
 **Status: Decided** (owner, 2026-09-28; M3). The owner decided the seven
-open questions of the first M3 pass on 2026-09-28 (§14); every rule on
-this page from that pass is now decided, and the implementation in
-`crates/lir` and `crates/lair` follows it. The additions of the second
-M3 pass — array types (§2.1), linkage and visibility (§4.3), external
-global declarations (§4.4), volatile and aligned accesses (§6.5) — are
-marked **Proposed** where they stand and listed in §14.1; the
-intrinsics of §6.1 and §6.3 are decided (§14, item 5).
+open questions of the first M3 pass on 2026-09-28 (§14, items 1 to 7)
+and, the same day, the four additions of the second M3 pass — array
+types (§2.1), linkage and visibility (§4.3), external global
+declarations (§4.4), volatile and aligned accesses (§6.5) — as they
+stood (§14, items 8 to 11). Every rule on this page is decided, and the
+implementation in `crates/lir` and `crates/lair` follows it.
 
 lIR is an S-expression assembler for LLVM IR: a 1:1 mapping, no sugar,
 no promotion, no fibber vocabulary. This chapter is the language as
@@ -89,7 +88,7 @@ cc     ::= ccc | tailcc
 
 ### 2.1 Arrays
 
-**Proposed** (2026-09-28, §14.1). `[N x T]` is LLVM's array type: `N`
+**Decided** (owner, 2026-09-28; §14 item 8). `[N x T]` is LLVM's array type: `N`
 elements of the sized type `T`, laid out contiguously, `N` a
 non-negative decimal integer (`[0 x i8]` is the flexible trailing
 member of a struct, as in C; `array length must be a non-negative
@@ -189,7 +188,7 @@ LLVM; §6.12).
 
 ### 4.3 Linkage and visibility
 
-**Proposed** (2026-09-28, §14.1). A `define`, `global` or `constant`
+**Decided** (owner, 2026-09-28; §14 item 9). A `define`, `global` or `constant`
 takes at most one linkage word and at most one visibility word, in
 any order before the calling convention (`duplicate modifier private`,
 `private and internal exclude each other`):
@@ -210,7 +209,7 @@ in its own module; what it cannot be is seen from outside (§11).
 
 ### 4.4 External globals
 
-**Proposed** (2026-09-28, §14.1). `(declare-global NAME T)` names a
+**Decided** (owner, 2026-09-28; §14 item 10). `(declare-global NAME T)` names a
 variable of type `T` that another module or the C library defines: a
 `declare` for data. `@NAME` is its address; `(load T @NAME)` reads it
 and `store` writes it, under the typed direct-access rule of §6.5. It
@@ -409,7 +408,7 @@ fibber emits them.
   index into i64` (LLVM is phasing out indexing into vectors; an array
   is what indexes, §2.1).
 - Plain loads and stores use the ABI alignment of their type unless
-  `(align N)` says otherwise. **Proposed** (2026-09-28, §14.1): `N` is
+  `(align N)` says otherwise. **Decided** (owner, 2026-09-28; §14 item 11): `N` is
   a power of two from 1 to 2^30 (`align must be a power of two, found
   3`); a smaller `N` than the ABI's is a promise that LLVM honours with
   slower code where the target needs it, a larger one a promise the
@@ -567,7 +566,6 @@ overflows the stack.) The rules, checked against the callee's type
 4. under `ccc`, the parameter types are identical: `tailcall under ccc
    needs identical parameter types (@f has (i64), @g has (i64 i64));
    use tailcc`. Under `tailcc` they may differ.
-
 A `tailcall` whose callee takes a pointer to one of the caller's
 `alloca`s is undefined behaviour (the frame is gone); lIR does not
 check it (§6.12).
@@ -741,8 +739,10 @@ error containing `internal error` never satisfies a case. `cargo test
 ## 14. Decision record
 
 On 2026-09-28 the owner decided the seven open questions of the first
-M3 pass. Each rule is now **Decided** in the section that states it;
-the numbering here is the one the first pass used.
+M3 pass (items 1 to 7) and, later the same day, the four additions of
+the second M3 pass as they stood (items 8 to 11). Each rule is now
+**Decided** in the section that states it; the numbering here is the
+one the passes used.
 
 | Item | Question | Decision | Now in |
 |---|---|---|---|
@@ -753,26 +753,7 @@ the numbering here is the one the first pass used.
 | 5 | lIR-level names for LLVM's overflow and saturation intrinsics | **added**: `sadd-overflow`, `ssub-overflow`, `smul-overflow` (`llvm.s{add,sub,mul}.with.overflow`), `fptosi-sat`, `fptoui-sat` (`llvm.fptosi.sat`, `llvm.fptoui.sat`) and `trap` (`llvm.trap`), beside `ctpop`; types.md §8.12 emits them for the checked arithmetic. `llvm.` stays reserved as a *symbol* prefix (§4.1): the intrinsics are instructions, not names | §6.1, §6.3, §6.7; types.md §8.12 |
 | 6 | names bound once per function | **kept**: no rebinding, no shadowing (`duplicate name x in @f`) | §5.3 |
 | 7 | the typed direct-access rule and the phi-operand rule, both stricter than LLVM | **kept** | §6.5, §5.4 |
-
-### 14.1 Proposed since the decision
-
-The second M3 pass (2026-09-28) added what a compiler emitting the
-mapping of types.md §8 still lacked. Each is **Proposed** until the
-owner decides it; every one is implemented, with cases, so that it can
-be tested (method.md, "Decision records"):
-
-1. **Array types** `[N x T]` (§2.1): in `defstruct` fields, `alloca`,
-   globals and constants, `load`/`store`, `getelementptr`,
-   `extractvalue`/`insertvalue`, and the literal `([N x T] v..)`; with
-   `(zeroinitializer T)` for any sized `T` (§3).
-2. **Linkage and visibility** on `define`, `global` and `constant`
-   (§4.3): `private`, `internal`, `external` (the default) and
-   `hidden`, so that a compiler keeps a module's helpers out of the
-   export table; the JIT keeps `private` and `internal` names out of
-   the cross-module namespace (§11).
-3. **External global declarations** `(declare-global NAME T)` (§4.4),
-   for `stderr` and other variables the C library or another module
-   defines.
-4. **`volatile` and `(align N)`** on `load`, `store` and `alloca`
-   (§6.5).
-
+| 8 | array types `[N x T]`: in `defstruct` fields, `alloca`, globals and constants, `load`/`store`, `getelementptr`, `extractvalue`/`insertvalue`, the literal `([N x T] v..)`, and `(zeroinitializer T)` for any sized `T` | **adopted** as proposed by the second M3 pass; types.md §8.2 and §8.3 lay the type table and array objects out with them | §2.1, §3 |
+| 9 | linkage and visibility on `define`, `global` and `constant`: `private`, `internal`, `external` (the default) and `hidden`, with the JIT keeping `private` and `internal` names out of the cross-module namespace | **adopted** as proposed, so that a compiler keeps a module's helpers out of the export table | §4.3, §11 |
+| 10 | external global declarations `(declare-global NAME T)`, for `stderr` and other variables the C library or another module defines | **adopted** as proposed | §4.4 |
+| 11 | `volatile` and `(align N)` on `load`, `store` and `alloca` | **adopted** as proposed: `N` a power of two from 1 to 2^30; `volatile` is LLVM's, not atomic | §6.5 |

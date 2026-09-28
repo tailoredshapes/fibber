@@ -100,9 +100,10 @@ through both paths in its own process, and both must agree.
       and types.md §8 rewritten to what lIR now holds: `switch`, struct
       `alloca`s, arrays, static data for every constant object, the
       overflow and saturation intrinsics for the checked arithmetic
-- [x] what the mapping still lacked, proposed in lir.md §14.1 with
-      cases: array types, linkage and visibility, `declare-global`, the
-      intrinsics and `trap`, `volatile` and `(align N)`
+- [x] what the mapping still lacked, added with cases and decided by
+      the owner on 2026-09-28 (lir.md §14 items 8 to 11): array types,
+      linkage and visibility, `declare-global`, the intrinsics and
+      `trap`, `volatile` and `(align N)`
 - [x] CI: the `lair` job installs LLVM 21 from apt.llvm.org and runs
       apart from the `fibref` job, which stays LLVM-free
 - [ ] not ported: liar's interactive lIR REPL (`lir-repl`) and
