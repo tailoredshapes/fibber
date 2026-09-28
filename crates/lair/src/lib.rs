@@ -8,6 +8,7 @@
 pub mod aot;
 pub mod cases;
 mod error;
+pub mod fuzz;
 mod jit;
 mod llvm;
 mod lower;

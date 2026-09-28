@@ -34,6 +34,7 @@ cargo run -p lair -- cases cases/lir            # 317 lIR cases, JIT and AOT
 cargo run -p lair -- run   <file.lir>           # JIT-compile and run main
 cargo run -p lair -- build <file.lir> -o out    # native executable
 cargo run -p lair -- check <file.lir>           # the checker alone
+cargo run -p lair -- fuzz cases/lir --count N   # mutation fuzzer over the accept cases (spec/lir.md §10.1)
 ```
 
 `lair` links LLVM 21 statically through llvm-sys: set

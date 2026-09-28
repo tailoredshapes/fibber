@@ -634,6 +634,35 @@ After the checker, `lair` lowers the module and runs the LLVM verifier
 (`LLVMVerifyModule`). A verifier failure after a successful check is an
 internal error (see the top of this page).
 
+### 10.1 The fuzzer
+
+Method.md rule 7 is attacked by a mutation fuzzer, `lair fuzz`
+(`crates/lair/src/fuzz`): it reads every `accept` case under the
+directories given, and for each mutant picks a case and applies one to
+three random deformations to its forms — a type swapped for another, an
+operand dropped or duplicated, an atom renamed to another of the module
+(a label for a name, a name for a label), a number changed to a boundary
+value, an instruction of the grammar with random operands inserted, a
+subtree spliced in from another case, siblings swapped, a form's head
+replaced by another keyword, a list replaced by one of its children, a
+top-level form dropped. Each mutant runs in a process of its own,
+`lair fuzz-one FILE` (`lair run` that marks on stderr when the checker
+and then the backend accepted the module), under a time limit and an
+address-space cap, with its standard output discarded. A mutant that is
+rejected with a diagnostic, or that compiles and then runs, crashes or
+loops — its own undefined behaviour (§6.12) — is what rule 7 promises. A
+**finding** is anything else: a panic, an `internal error` (the LLVM
+verifier rejecting what the checker accepted), a signal or a timeout
+before the backend's mark. Each finding's mutant is kept under `-o DIR`
+(default `target/lair-fuzz`) with the seed, the index, the source case
+and the mutations in its header; `lair fuzz --seed N --count M` with the
+same seed gives the same mutants whatever the scheduling, since mutant
+`i` is a function of the seed and `i` alone. `cargo test -p lair` runs
+300 mutants (`crates/lair/tests/fuzz.rs`); `LAIR_FUZZ_COUNT=20000` and
+`LAIR_FUZZ_SEED=N` set a larger budget or another seed. Every finding
+is minimised and kept as a case in `cases/lir/adversarial/`, with the
+rule it led to.
+
 ## 11. The library API
 
 `crates/lir` has no LLVM dependency: reader, AST, checker.

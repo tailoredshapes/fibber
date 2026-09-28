@@ -1,7 +1,7 @@
 //! The case harness (spec/lir.md §13): every case through the JIT and
 //! through AOT, each in its own process.
 
-mod exec;
+pub(crate) mod exec;
 mod header;
 mod verdict;
 

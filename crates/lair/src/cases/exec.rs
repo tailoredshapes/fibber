@@ -11,14 +11,27 @@ pub struct Outcome {
     pub status: i32,
     /// The signal that killed it, if one did.
     pub signal: Option<i32>,
+    /// It was killed at the time limit; `status` is then 124.
+    pub timed_out: bool,
     pub stdout: String,
     pub stderr: String,
 }
 
-const LIMIT: Duration = Duration::from_secs(120);
+/// The time a case may take on one path.
+pub const LIMIT: Duration = Duration::from_secs(120);
 
-/// Run `program args..`, killing it after the time limit.
+/// Run `program args..`; going over the case time limit is an error.
 pub fn run(program: &Path, args: &[&str]) -> Result<Outcome, String> {
+    let o = run_within(program, args, LIMIT)?;
+    if o.timed_out {
+        return Err(format!("timed out after {}s", LIMIT.as_secs()));
+    }
+    Ok(o)
+}
+
+/// Run `program args..`, killing it after `limit`; a kill is reported
+/// in the outcome, with what it wrote until then.
+pub fn run_within(program: &Path, args: &[&str], limit: Duration) -> Result<Outcome, String> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -29,22 +42,25 @@ pub fn run(program: &Path, args: &[&str]) -> Result<Outcome, String> {
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
     let start = Instant::now();
-    let status = loop {
+    let (status, signal, timed_out) = loop {
         match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) if start.elapsed() > LIMIT => {
+            Ok(Some(st)) => {
+                let (status, signal) = code(&st);
+                break (status, signal, false);
+            }
+            Ok(None) if start.elapsed() > limit => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("timed out after {}s", LIMIT.as_secs()));
+                break (124, None, true);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(2)),
             Err(e) => return Err(format!("wait failed: {e}")),
         }
     };
-    let (status, signal) = code(&status);
     Ok(Outcome {
         status,
         signal,
+        timed_out,
         stdout: out.join().unwrap_or_default(),
         stderr: err.join().unwrap_or_default(),
     })
