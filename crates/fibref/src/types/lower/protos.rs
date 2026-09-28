@@ -5,7 +5,7 @@
 use crate::syntax::{Form, FormKind, Pos};
 
 use crate::types::annot::{ann_to_ty, GenEnv, ParamEnv};
-use crate::types::ast::{GlobalRef, TypeAnn};
+use crate::types::ast::{ColourAnn, GlobalRef, TypeAnn};
 use crate::types::decls::{Globals, InstanceDef, MethodDef, MethodParam, ModuleId, ProtoDef};
 use crate::types::error::{TResult, TypeError};
 use crate::types::scheme::Scheme;
@@ -192,7 +192,7 @@ fn rename_dispatch(ann: &TypeAnn, dispatch: &str) -> TypeAnn {
             *send,
         ),
         TypeAnn::Fn(k, ps, r) => TypeAnn::Fn(
-            *k,
+            k.clone(),
             ps.iter().map(|a| rename_dispatch(a, dispatch)).collect(),
             Box::new(rename_dispatch(r, dispatch)),
         ),
@@ -234,7 +234,9 @@ fn impl_head(g: &Globals, m: ModuleId, form: &Form) -> TResult<(Con, Vec<String>
     let mut vars: Vec<String> = Vec::new();
     for a in args {
         match a {
-            TypeAnn::Var(v) if !vars.contains(&v) => vars.push(v),
+            TypeAnn::Var(v) | TypeAnn::ColourArg(ColourAnn::Named(v)) if !vars.contains(&v) => {
+                vars.push(v)
+            }
             _ => {
                 return bad("an instance head is a type constructor applied to distinct variables")
             }
@@ -269,6 +271,7 @@ pub fn declare_impl<'f>(
     }
     let mut env = ParamEnv {
         params: &vars,
+        colours: &[],
         owner: "the impl head",
     };
     let dets = det_anns
@@ -337,6 +340,7 @@ pub fn where_preds(g: &Globals, m: ModuleId, cs: &Form, vars: &[String]) -> TRes
         };
         let mut env = ParamEnv {
             params: vars,
+            colours: &[],
             owner: "the impl head",
         };
         let tys = items[1..]

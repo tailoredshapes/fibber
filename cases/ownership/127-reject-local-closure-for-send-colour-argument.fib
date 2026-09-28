@@ -1,0 +1,15 @@
+;; spec:   types §1.3, §3.2, §5.3, §5.4
+;; expect: reject
+;; error:  cell cannot be shared between threads: closure capture c has type (Cell i64)
+;; run-on-thread takes a (Handler :send), whose field is then (fn :send
+;; (i64) i64). Constructing the argument from a closure over a cell
+;; flows that closure's local colour into :send (§3.2, §5.4), which the
+;; colour solver refuses, naming the capture that made it local (§5.3).
+(defstruct (Handler k :colour) (f: (fn k (i64) i64)))
+
+(defun run-on-thread (h: (Handler :send)) -> i64
+  (join (spawn (fn () ((. h f) 20)))))
+
+(defun main () -> i64
+  (let ((c (cell 1)))
+    (run-on-thread (Handler (fn (x) (+ x @c))))))

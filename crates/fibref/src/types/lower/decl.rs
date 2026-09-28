@@ -2,7 +2,7 @@
 //! then resolving the field types once every type name of the module is
 //! known (types §3.5 step 3).
 
-use crate::syntax::{Form, Pos};
+use crate::syntax::{Form, FormKind, Pos};
 
 use crate::types::annot::{ann_to_ty, ParamEnv};
 use crate::types::ast::GlobalRef;
@@ -53,32 +53,60 @@ pub fn annotation_name(form: &Form) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The name and declared parameters of `Name` or `(Name tvar+)`.
-fn parse_head(form: &Form) -> TResult<(String, Vec<String>)> {
-    if let Some(name) = form.as_sym() {
-        return Ok((name.to_string(), Vec::new()));
-    }
-    let items = form.as_list().unwrap_or(&[]);
-    let names: Option<Vec<&str>> = items.iter().map(Form::as_sym).collect();
-    match names {
-        Some(ns) if ns.len() > 1 => Ok((
-            ns[0].to_string(),
-            ns[1..].iter().map(|s| s.to_string()).collect(),
-        )),
-        _ => Err(TypeError::resolve(
-            &form.pos,
-            "expected Name or (Name tvar+)",
-        )),
-    }
+/// A definition head: its name, parameters, and which parameters are
+/// colour parameters (§1.3).
+struct Head {
+    name: String,
+    params: Vec<String>,
+    colours: Vec<bool>,
 }
 
-fn new_type(
-    g: &mut Globals,
-    m: ModuleId,
-    name: &str,
-    params: Vec<String>,
-    pos: &Pos,
-) -> TResult<TypeId> {
+/// `Name` or `(Name param+)`, `param ::= tvar | tvar :colour` (§1.3).
+fn parse_head(form: &Form) -> TResult<Head> {
+    let bad = || TypeError::resolve(&form.pos, "expected Name or (Name tvar+)");
+    if let Some(name) = form.as_sym() {
+        let (name, params, colours) = (name.to_string(), Vec::new(), Vec::new());
+        return Ok(Head {
+            name,
+            params,
+            colours,
+        });
+    }
+    let items = form.as_list().unwrap_or(&[]);
+    let name = items.first().and_then(Form::as_sym).ok_or_else(bad)?;
+    let (mut params, mut colours) = (Vec::new(), Vec::new());
+    for f in &items[1..] {
+        match (&f.kind, f.as_sym()) {
+            (FormKind::Kw(k), _) if k == "colour" && colours.last() == Some(&false) => {
+                *colours.last_mut().ok_or_else(bad)? = true;
+            }
+            (_, Some(p)) => {
+                params.push(p.to_string());
+                colours.push(false);
+            }
+            _ => return Err(bad()),
+        }
+    }
+    if params.is_empty() {
+        return Err(bad());
+    }
+    if !colours.contains(&true) {
+        colours.clear();
+    }
+    Ok(Head {
+        name: name.to_string(),
+        params,
+        colours,
+    })
+}
+
+fn new_type(g: &mut Globals, m: ModuleId, head: Head, pos: &Pos) -> TResult<TypeId> {
+    let Head {
+        name,
+        params,
+        colours,
+    } = head;
+    let name = name.as_str();
     if g.names(m).types.contains_key(name) {
         return Err(TypeError::resolve(
             pos,
@@ -90,6 +118,7 @@ fn new_type(
         name: name.to_string(),
         module: m,
         params,
+        colours,
         shape: Shape::Struct(Vec::new()),
         pos: pos.clone(),
     });
@@ -106,7 +135,7 @@ pub fn declare_struct<'f>(g: &mut Globals, m: ModuleId, form: &'f Form) -> TResu
             "expected (defstruct Name (field+))",
         ));
     };
-    let (name, mut params) = parse_head(head)?;
+    let mut head = parse_head(head)?;
     let decl = match decl.as_list() {
         Some(d) if !d.is_empty() => d,
         _ => {
@@ -116,8 +145,9 @@ pub fn declare_struct<'f>(g: &mut Globals, m: ModuleId, form: &'f Form) -> TResu
             ))
         }
     };
-    let fields = struct_fields(decl, &mut params)?;
-    let id = new_type(g, m, &name, params, &form.pos)?;
+    let fields = struct_fields(decl, &mut head)?;
+    let name = head.name.clone();
+    let id = new_type(g, m, head, &form.pos)?;
     define_value(g, m, &name, GlobalRef::Ctor(id, None), &form.pos)?;
     Ok(RawType {
         id,
@@ -128,7 +158,7 @@ pub fn declare_struct<'f>(g: &mut Globals, m: ModuleId, form: &'f Form) -> TResu
 
 /// `field ::= sym: type | sym`; an unannotated field adds a parameter
 /// named after it to `params` (§3.7).
-fn struct_fields<'f>(decl: &'f [Form], params: &mut Vec<String>) -> TResult<Vec<RawField<'f>>> {
+fn struct_fields<'f>(decl: &'f [Form], head: &mut Head) -> TResult<Vec<RawField<'f>>> {
     let mut fields = Vec::new();
     let mut i = 0;
     while i < decl.len() {
@@ -145,7 +175,10 @@ fn struct_fields<'f>(decl: &'f [Form], params: &mut Vec<String>) -> TResult<Vec<
             });
             i += 2;
         } else if let Some(fname) = decl[i].as_sym() {
-            params.push(fname.to_string());
+            head.params.push(fname.to_string());
+            if !head.colours.is_empty() {
+                head.colours.push(false);
+            }
             fields.push(RawField {
                 name: fname.to_string(),
                 ty: None,
@@ -170,12 +203,12 @@ pub fn declare_enum<'f>(g: &mut Globals, m: ModuleId, form: &'f Form) -> TResult
             "expected (defenum Name variant+)",
         ));
     }
-    let (name, params) = parse_head(&items[1])?;
+    let head = parse_head(&items[1])?;
     let variants = items[2..]
         .iter()
         .map(parse_variant)
         .collect::<TResult<Vec<_>>>()?;
-    let id = new_type(g, m, &name, params, &form.pos)?;
+    let id = new_type(g, m, head, &form.pos)?;
     for (i, (vname, _)) in variants.iter().enumerate() {
         define_value(g, m, vname, GlobalRef::Ctor(id, Some(i)), &form.pos)?;
     }
@@ -254,6 +287,7 @@ fn resolve_fields(
     let def = g.ty(id);
     let mut env = ParamEnv {
         params: &def.params,
+        colours: &def.colours,
         owner: &def.name,
     };
     let mut out = Vec::new();

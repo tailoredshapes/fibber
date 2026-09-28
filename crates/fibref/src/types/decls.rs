@@ -86,6 +86,9 @@ pub struct TypeDef {
     pub module: ModuleId,
     /// The parameters in order.
     pub params: Vec<String>,
+    /// Which parameters are colour parameters (`k :colour`, §1.3); empty
+    /// when none is.
+    pub colours: Vec<bool>,
     /// Fields or variants (empty until the declarations are resolved).
     pub shape: Shape,
     /// Where it is defined.
@@ -93,6 +96,22 @@ pub struct TypeDef {
 }
 
 impl TypeDef {
+    /// Whether parameter `i` is a colour parameter.
+    pub fn is_colour(&self, i: usize) -> bool {
+        self.colours.get(i).copied().unwrap_or(false)
+    }
+
+    /// The definition applied to its own parameters: `Gen(i)`, or the
+    /// colour argument `Colour::Gen(i)` at a colour parameter (§1.3).
+    pub fn head_args(&self) -> Vec<Ty> {
+        (0..self.params.len())
+            .map(|i| match self.is_colour(i) {
+                true => Ty::colour_arg(super::ty::Colour::Gen(i as u32)),
+                false => Ty::Gen(i as u32),
+            })
+            .collect()
+    }
+
     /// Whether this is an enum whose variants all have no fields: a
     /// scalar (§1, §2.12).
     pub fn is_fieldless_enum(&self) -> bool {

@@ -170,8 +170,8 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("100-annotated-let-loop-and-plet-bindings.fib"),
         "{out}"
     );
-    assert!(out.contains("121 cases:"), "{out}");
-    assert!(out.contains("121 pass, 0 fail, 0 pending"), "{out}");
+    assert!(out.contains("125 cases:"), "{out}");
+    assert!(out.contains("125 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 

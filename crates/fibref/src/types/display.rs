@@ -138,6 +138,8 @@ impl<'a> Printer<'a> {
         };
         if args.is_empty() {
             out.push_str(&name);
+        } else if let Con::Nominal(id) = c {
+            self.write_nominal_args(&name, self.g.ty(id), args, out);
         } else {
             self.write_con_args(&name, args, out);
         }
@@ -149,6 +151,32 @@ impl<'a> Printer<'a> {
         for a in args {
             out.push(' ');
             self.write(a, out);
+        }
+        out.push(')');
+    }
+
+    /// A nominal type's arguments; one at a colour parameter (§1.3)
+    /// prints as its colour: `:send`, `:local`, `ς0`, or `_` unsolved.
+    fn write_nominal_args(
+        &self,
+        name: &str,
+        def: &super::decls::TypeDef,
+        args: &[Ty],
+        out: &mut String,
+    ) {
+        out.push('(');
+        out.push_str(name);
+        for (i, a) in args.iter().enumerate() {
+            out.push(' ');
+            match (def.is_colour(i), a) {
+                (true, Ty::Fn(k, _, _)) => out.push_str(&match k {
+                    Colour::Send => ":send".to_string(),
+                    Colour::Local => ":local".to_string(),
+                    Colour::Gen(i) => format!("ς{i}"),
+                    Colour::Var(_) => "_".to_string(),
+                }),
+                _ => self.write(a, out),
+            }
         }
         out.push(')');
     }

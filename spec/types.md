@@ -32,11 +32,13 @@ scalar ::= bool | i8 | i16 | i32 | i64 | f32 | f64 | char | keyword | unit
          | Enum                                  ; a defenum whose variants have no fields
 object ::= str | Form
          | (Array type)                          ; primitive fixed immutable array
-         | Name | (Name type+)                   ; nominal struct or enum, incl. the library's Vec, Map, Set, List, Option
+         | Name | (Name arg+)                    ; nominal struct or enum, incl. the library's Vec, Map, Set, List, Option
+arg    ::= type | colour                         ; a colour at a colour parameter (§1.3)
          | (Cell type) | (Atom type) | (Weak type) | (Task type)
-         | (fn colour? (type*) type)             ; function or closure; colour := :send | :local
+         | (fn colour? (type*) type)             ; function or closure; colour := :send | :local | cvar
          | (dyn Proto :send?) | (dyn (Proto type+) :send?)   ; dynamic protocol value
 tvar   ::= a lowercase symbol that names no type   ; a type variable, scoped to its definition
+cvar   ::= a lowercase symbol in colour position    ; a colour variable or colour parameter (§1.3)
 ```
 
 Signatures of functions with `&` parameters, the primitive `array-set!`
@@ -94,6 +96,53 @@ variables are protocol constraints and `Send`, inferred from its body
 (**Decided**; rarely needed on a `defun`, since bounds are inferred;
 required on a generic `impl`, whose context is declared, §2.7).
 
+**Colour parameters** (**Decided**, owner, 2026-09-28; replaces "colours
+are not parameters in v1", §1.4). A definition head may mark a
+parameter as a colour: `(defstruct (Handler k :colour) (f: (fn k (i64)
+i64)))`, `(defenum (Job a k :colour) (Idle) (Ready run: (fn k () a)))`.
+The keyword follows the parameter it qualifies, as `:borrow` follows a
+parameter (syntax §3.1); the parameter stays in the head's positional
+list, so an application gives it its argument in its place, and a
+colour parameter is used only in colour position: as the colour of a
+function type in a field (`(fn k (A..) R)`), or as the argument of
+another definition's colour parameter (`(Handler k)`); written as a
+type it is `k is a colour parameter of N, not a type`. Its argument is
+a colour: `:send`, `:local`, or a colour variable, written as a
+lowercase name in an annotation (`(h: (Handler k))`, one colour
+variable per name in the definition, §3.1) and otherwise inferred:
+
+- *At construction.* The constructor is `∀ā κ̄. (fn :send (T̄) (N ā
+  κ̄))` with the fields' colours over `κ̄`, and each argument is a flow
+  site (§3.2), so `(Handler f)` gets `κ_f ⊑ k`: a `send` closure makes
+  a `(Handler :send)` by the least fixpoint of §5.4, and a closure over
+  a cell a `(Handler :local)`. One definition holds a sendable closure
+  in one instance and a local one in another.
+- *Invariance.* Arguments of a nominal type are not flow sites
+  (§3.2), so a colour argument is equal on both sides: `(Handler
+  :send)` and `(Handler :local)` do not unify (`cannot unify (Handler
+  :send) with (Handler :local)`). Covariance would be unsound: a
+  `(Slot :send)` with a field `(Cell (fn k () i64))`, viewed as a `(Slot
+  :local)`, could have a local closure stored into its cell, which the
+  `:send` view then reads as sendable and spawns (case 126).
+- *`Send`.* `Send((N ā κ̄))` is §5.1's rule for nominal types: the
+  fields with `ā κ̄` substituted, so a field `(fn k ..)` is `Send` iff
+  the argument `k` is `send`, and `Send` of the struct follows its
+  colour argument (§5.1).
+- *Patterns and `.`.* A pattern or a field access sees a field's colour
+  under the scrutinee's or receiver's colour argument.
+- *In an `impl` of a colour-parameterised type* (`(impl Show (Handler
+  k) ..)`) the colour argument is a name in the head like a type
+  variable, and inside the bodies it is treated as `local`, the
+  conservative answer, since a body must hold for every colour.
+
+The explicit `(fn :send (A) R)` field is unchanged and needs no
+parameter: it holds only sendable closures in every instance; an
+omitted colour in a field is still `local` (§1.4). Reflection
+(`struct-params`, `enum-params`, syntax §3.16) returns a colour
+parameter's name like any other. The representation is unchanged: a
+colour has none at run time (§5.4), and monomorphisation keys a
+specialisation by its type arguments only.
+
 Recursion is allowed only through a nominal type: a struct or enum may
 mention itself, directly or through other definitions, and every field
 on such a cycle must be annotated (syntax §3.7). Unification performs
@@ -113,9 +162,14 @@ inferred code. In an annotation, an omitted colour means:
 - on a `defun` parameter, a `let` annotation or a protocol method
   parameter: a fresh colour variable (any closure is accepted; the body
   constrains it);
-- on a struct or enum field: `local` (the type of a field must be a
-  function of the type's parameters, and colours are not parameters in
-  v1); write `(fn :send (A) R)` to store only sendable closures;
+- on a struct or enum field: `local`; write `(fn :send (A) R)` to store
+  only sendable closures, or `(fn k (A) R)` with a colour parameter
+  `k :colour` of the definition to let each instance choose (§1.3,
+  **Decided**, owner, 2026-09-28);
+- a lowercase name in colour position (`(fn k (A) R)`, `(Handler k)`)
+  is a colour variable of the definition the annotation belongs to, the
+  same one wherever the name recurs there, or, in a field type, the
+  colour parameter of that name;
 - on a `def` annotation (§2.16): `send`, since the only function values
   a constant expression can build are named functions and constructors,
   which are `send`.
@@ -697,6 +751,10 @@ Robinson unification with the occurs check over the grammar of §1:
   a branch join, an annotated `let`, a `set!` value, a constructor
   argument, a return against an annotation) the constraint `κ_from ⊑
   κ_to` is emitted; anywhere else both `κ₁ ⊑ κ₂` and `κ₂ ⊑ κ₁`;
+- colour arguments of a nominal type (§1.3) are colours inside a
+  constructor, so both constraints: invariant; two written colours
+  that differ (`(N :send)` against `(N :local)`) are `cannot unify`
+  at once;
 - `(& A)` with `(& B)` only: an `&` position never unifies with a plain
   one;
 - a rigid variable unifies only with itself or an unbound unification
@@ -1044,7 +1102,7 @@ Atom"`, computed structurally:
 Send(scalar)              = true, except Send(ptr) = false      (a raw pointer's target has no header to mark)
 Send(str) = Send(Form)    = true
 Send((Array T))           = Send(T);  Send((Vec T)) etc. follow from their definitions as structs/enums
-Send((N θ̄))               = ∧ Send(field or payload types with θ̄ substituted)   ; struct or enum
+Send((N θ̄))               = ∧ Send(field or payload types with θ̄ substituted)   ; struct or enum; a colour argument substitutes the fields' colours (§1.3)
 Send((Cell T))            = false
 Send((Atom T))            = true          (well-formedness already required Send T)
 Send((Weak T))            = Send(T)       (an upgrade on the other thread yields a T)
@@ -1088,12 +1146,17 @@ otherwise `value of type T cannot be shared between threads: <path>`
 ### 5.4 Closure colours (Decided, D4)
 
 Every function type carries a colour κ ∈ {`send`, `local`} or a colour
-variable ς, with `send ⊑ local`. Constraints:
+variable ς, with `send ⊑ local`, and so does every colour argument of a
+nominal type (§1.3): `(Handler ς)` carries ς exactly as `(fn ς (i64)
+i64)` does, so the lattice, the fixpoint and generalisation below treat
+the two alike (**Decided**, owner, 2026-09-28). Constraints:
 
 ```
 ς ⊒ Caps{T₁ .. Tₖ}      at each (fn ..) and (async ..): T̄ are the types of its captures
 κ₁ ⊑ κ₂                 at flow sites (§3.2), from the flowing function type to the receiving one
 κ ⊑ send                at thread boundaries: the receiving type is (fn :send ..), so this is the flow rule
+κ₁ ⊑ κ₂ and κ₂ ⊑ κ₁      between the colour arguments of two nominal types that unify (§1.3: invariant)
+Send((N .. κ ..))        at a Send requirement: κ ⊑ send for each colour argument some field's Send depends on
 ```
 
 `ς ⊒ Caps{T̄}` means ς = `local` if any `Tᵢ` is not `Send`, and nothing
@@ -1114,6 +1177,13 @@ Solving, after the SCC's type constraints:
 4. Generalise: colour variables that stayed symbolic are quantified with
    their remaining constraints; a call site instantiates them freshly
    and re-solves with the caller's types.
+
+A constructor application `(N e..)` whose fields have colour parameters
+emits `κ_eᵢ ⊑ κ_param` at each closure argument (a flow site), so the
+struct's colour is the least one its closures allow; `(defun mk (f)
+(Handler f))` generalises to `∀ς₀ ς₁. ς₀ ⊑ ς₁ ⇒ (fn :send ((fn ς₀ (i64)
+i64)) (Handler ς₁))`, whose result is `send` at a call with a sendable
+closure.
 
 Consequences: a user never writes a colour; `(defun twice (f) (fn (x) (f
 (f x))))` gets `∀a ς₁ ς₂. ς₁ ⊑ ς₂ ⇒ (fn :send ((fn ς₁ (a) a)) (fn ς₂ (a)
@@ -3249,7 +3319,7 @@ decided them on 2026-09-27:
 On 2026-09-28 the owner decided to lift five restrictions that the
 text above called "v1", and to fix what a trap means for the audit.
 Each is stated in the section that holds its rule and comes with
-cases in `cases/ownership/` (101 to 128):
+cases in `cases/ownership/` (101 to 127):
 
 1. **`(dyn P :send)`** (item 11 above, amended). A second dynamic
    type, `Send`, made only by `(dyn P :send e)`, which requires `Send`
@@ -3257,14 +3327,14 @@ cases in `cases/ownership/` (101 to 128):
    implicit; `(dyn P d)` of a `(dyn P :send)` value is the one
    explicit conversion, and there is none the other way. Same
    representation as `(dyn P)` (§1.2, §1.7, §2.15, §4.4, §5.1, §8.1,
-   §8.5, §8.7; syntax §3.10; cases 106 to 111).
+   §8.5, §8.7; syntax §3.10; cases 106 to 112).
 2. **Colour parameters on structs and enums** (§1.3's "colours are
    not parameters in v1", §1.4). A definition head may declare a
    colour parameter, `k :colour`, used as the colour of function
    types in its fields; its argument is `:send`, `:local` or a colour
    variable, inferred at construction, invariant, and `Send` of the
-   type follows it (§1.3, §1.4, §5.1, §5.4; syntax §3.7, §3.9; cases
-   112 to 115).
+   type follows it (§1.3, §1.4, §3.2, §5.1, §5.4; syntax §3.7, §3.9;
+   cases 124 to 127).
 3. **Supertraits and default methods** (item 15 above, amended; §4.1's
    "no default methods, no supertraits in v1"). A protocol may require
    others (`:requires`); an `impl` of it needs theirs for the same
@@ -3273,16 +3343,16 @@ cases in `cases/ownership/` (101 to 128):
    and run per instance as if the `impl` had written it, its names
    resolved where the protocol is defined. `Ord` requires `Eq`, and
    `derive Ord` no longer lists `(Eq t)` (§2.7, §2.12, §3.3, §4.1,
-   §4.4; syntax §3.10, §3.16, §4.4; cases 116 to 122).
+   §4.4; syntax §3.10, §3.16, §4.4; cases 117 to 123).
 4. **Private names** (syntax §5's "no private names in v1"). `:private`
    after a definition's name keeps it out of the module's interface;
    a reference to it from another module is an error, and `(var m/x)`
    is the one way past it, which a macro's expansion uses to reach
-   its own module's private helpers (syntax §3.20, §5; §3.9; cases 123
-   to 126).
+   its own module's private helpers (syntax §3.20, §5; §3.9; cases 113
+   to 116).
 5. **Traps** (§2.11). A trap aborts the program; the objects live at
    the abort are not leaks. A case may expect a trap (method.md rule
-   3; cases 101 to 104).
+   3; cases 101 to 104; §8.12).
 6. **A float literal of a width other than `f32` or `f64`**, read or
    built by a macro, is an error (syntax §1.1, §3.16; case 105).
 

@@ -62,7 +62,13 @@ impl Cx<'_> {
             }
             PatKind::Ctor(t, v, subs) => {
                 let def = self.g.ty(*t);
-                let args: Vec<Ty> = def.params.iter().map(|_| self.st.fresh()).collect();
+                // A colour parameter's argument is a colour (§1.3).
+                let args: Vec<Ty> = (0..def.params.len())
+                    .map(|i| match def.is_colour(i) {
+                        true => Ty::colour_arg(self.st.fresh_colour()),
+                        false => self.st.fresh(),
+                    })
+                    .collect();
                 let fields = match (&def.shape, v) {
                     (Shape::Struct(fs), None) => fs.clone(),
                     (Shape::Enum(vs), Some(i)) => vs[*i].fields.clone(),
@@ -70,7 +76,7 @@ impl Cx<'_> {
                 };
                 self.unify(s, &Ty::nominal(*t, args.clone()), &p.pos)?;
                 for (sub, f) in subs.iter().zip(&fields) {
-                    let ft = f.ty.subst_gen(&args, &[]);
+                    let ft = f.ty.subst_gen(&args, &crate::types::ty::colour_args(&args));
                     self.check_pattern(sub, &ft)?;
                 }
                 Ok(())

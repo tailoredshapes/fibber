@@ -317,7 +317,10 @@ impl Cx<'_> {
         if let Ty::Con(Con::Nominal(id), args) = &rt {
             if let Shape::Struct(fields) = &self.g.ty(*id).shape {
                 if let Some(fd) = fields.iter().find(|fd| fd.name == f) {
-                    let fty = fd.ty.subst_gen(args, &[]);
+                    let args: Vec<Ty> = args.iter().map(|a| self.st.zonk(a)).collect();
+                    let fty = fd
+                        .ty
+                        .subst_gen(&args, &crate::types::ty::colour_args(&args));
                     self.unify(r, &fty, &d.pos)?;
                     return Ok(Step::Done(Vec::new()));
                 }

@@ -1,0 +1,33 @@
+;; spec:   types §1.3, §5.1, §5.4 (syntax §3.7, §3.9; ownership.md §7)
+;; expect: accept
+;; result: 50
+;; audit:  clean
+;; One definition, two colours (types §1.3). Handler's field has the
+;; colour of its parameter k, inferred at each construction: over a
+;; cell the closure is local and so is that Handler, used on this
+;; thread; without captures it is send, and that Handler crosses a
+;; thread, its Send following its colour argument (§5.1). The enum Job
+;; does the same through generic functions: mk's scheme carries the
+;; flow from its argument's colour to the Job's (§5.4), so go may spawn
+;; the Job's closure exactly when the Job it is given is :send. An
+;; explicit (fn :send ..) field still works beside them.
+(defstruct (Handler k :colour) (f: (fn k (i64) i64)))
+(defenum (Job k :colour) (Idle) (Ready run: (fn k () i64)))
+(defstruct Fixed (g: (fn :send (i64) i64)))
+
+(defun run-on-thread (h: (Handler :send)) -> i64
+  (join (spawn (fn () ((. h f) 20)))))
+
+(defun mk (f) (Ready f))
+
+(defun go (j) (match j ((Idle) 0) ((Ready r) (join (spawn r)))))
+
+(defun main () -> i64
+  (let ((c (cell 1))
+        (local (Handler (fn (x) (+ x @c))))
+        (sendable (Handler (fn (x) (* x 2))))
+        (fx (Fixed (fn (x) (+ x 1))))
+        (here (match (mk (fn () (+ @c 2))) ((Idle) 0) ((Ready r) (r)))))
+    (+ (+ ((. local f) 1) (run-on-thread sendable))
+       (+ (+ here (go (mk (fn () 4))))
+          (join (spawn (fn () ((. fx g) 0))))))))

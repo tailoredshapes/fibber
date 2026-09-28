@@ -56,7 +56,9 @@ fn signature(g: &Globals, st: &mut Store, t: &Ty) -> Option<Vec<(Ctor, Vec<Ty>)>
         Ty::Con(Con::Nominal(id), args) => Some(match &g.ty(id).shape {
             Shape::Struct(fs) => vec![(
                 Ctor::Variant(0),
-                fs.iter().map(|f| f.ty.subst_gen(&args, &[])).collect(),
+                fs.iter()
+                    .map(|f| f.ty.subst_gen(&args, &crate::types::ty::colour_args(&args)))
+                    .collect(),
             )],
             Shape::Enum(vs) => vs
                 .iter()
@@ -66,7 +68,7 @@ fn signature(g: &Globals, st: &mut Store, t: &Ty) -> Option<Vec<(Ctor, Vec<Ty>)>
                         Ctor::Variant(i),
                         v.fields
                             .iter()
-                            .map(|f| f.ty.subst_gen(&args, &[]))
+                            .map(|f| f.ty.subst_gen(&args, &crate::types::ty::colour_args(&args)))
                             .collect(),
                     )
                 })
@@ -190,14 +192,16 @@ fn variant(g: &Globals, id: TypeId, i: usize, args: &[Ty]) -> (String, Vec<Ty>) 
     match &g.ty(id).shape {
         Shape::Struct(fs) => (
             g.ty(id).name.clone(),
-            fs.iter().map(|f| f.ty.subst_gen(args, &[])).collect(),
+            fs.iter()
+                .map(|f| f.ty.subst_gen(args, &crate::types::ty::colour_args(args)))
+                .collect(),
         ),
         Shape::Enum(vs) => (
             vs[i].name.clone(),
             vs[i]
                 .fields
                 .iter()
-                .map(|f| f.ty.subst_gen(args, &[]))
+                .map(|f| f.ty.subst_gen(args, &crate::types::ty::colour_args(args)))
                 .collect(),
         ),
     }

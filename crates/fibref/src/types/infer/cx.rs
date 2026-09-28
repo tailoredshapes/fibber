@@ -167,6 +167,8 @@ pub struct Unit {
     pub rigid_names: Vec<String>,
     /// The current definition's variable names to rigid indices.
     pub rigid_map: HashMap<String, u32>,
+    /// The current definition's named colour variables (§1.3).
+    pub rigid_colours: HashMap<String, Colour>,
     /// The definition being checked.
     pub fun: String,
     /// The members of the SCC, monomorphic.

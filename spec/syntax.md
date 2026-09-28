@@ -416,7 +416,8 @@ whole form. A pattern variable bound to a scalar is a copy.
 
 ```
 (defstruct Name private? (field+))
-(defstruct (Name tvar+) private? (field+))
+(defstruct (Name param+) private? (field+))
+param ::= tvar | tvar :colour           ; a colour parameter (types §1.3)
 field ::= sym: type | sym
 ```
 
@@ -426,7 +427,14 @@ annotation becomes a fresh type parameter appended to the struct's
 parameter list in field order, so `(defstruct Pair (a b))` means
 `(defstruct (Pair a b) (a: a b: b))` (**Decided**). A struct that mentions
 itself, directly or through other types, must annotate the recursive
-fields (types §1.3). Structs are immutable objects (**Decided**, §1); a
+fields (types §1.3). A parameter followed by `:colour` is a **colour
+parameter** (**Decided**, owner, 2026-09-28; types §1.3): it is the
+colour of function types in the fields (`(defstruct (Handler k :colour)
+(f: (fn k (i64) i64)))`), each instance's argument is `:send`, `:local`
+or inferred at construction (`(Handler (fn (x) x))` is a `(Handler
+:send)`, `(Handler (fn (x) (+ x @c)))` with `c` a cell a `(Handler
+:local)`), and the struct is sendable exactly when its argument is
+`:send`. Structs are immutable objects (**Decided**, §1); a
 field of type `(Cell T)` or `(Atom T)` is how a struct holds mutable
 state, and the unique-update primitives of §3.13 are how a struct held
 in a place is updated in place.
@@ -448,7 +456,7 @@ a `(. x field)` form (§3.13; **Decided**, D1).
 
 ```
 (defenum Name private? variant+)
-(defenum (Name tvar+) private? variant+)
+(defenum (Name param+) private? variant+)       ; param as for defstruct
 variant ::= (Variant) | (Variant field+) | Variant
 field   ::= sym: type | type
 ```
@@ -1364,7 +1372,7 @@ The reference implementation has the prelude and one program module
 (M5 adds more), so it checks every rule above between those two: a
 program's reference to a private prelude definition, unqualified or
 as `fib.prelude/x`, reflection on a private prelude type, and `(var
-fib.prelude/x)` (cases 123 to 126). Requires may not be cyclic.
+fib.prelude/x)` (cases 113 to 116). Requires may not be cyclic.
 `fib.prelude` is implicitly `:use`d. Protocol implementations are global
 facts and are always visible once their module is required.
 

@@ -27,7 +27,7 @@ not changed.
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
 Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109,
-112, 113, 114, 118, 119, 121 and 123 must be rejected; 101 to 104 must trap; 15
+112, 113, 114, 118, 119, 121, 123, 125, 126 and 127 must be rejected; 101 to 104 must trap; 15
 and 80 are the permitted cycle leaks; every other case is accept with a
 clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
 pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
@@ -88,4 +88,10 @@ whose names resolve where its protocol is defined whatever the program
 shadows (122) are accepted; an `impl Ord` without an `impl Eq` (118),
 one whose context does not entail its `Eq` impl's (119), a default that
 makes a `:borrow` parameter escape (121) and a default that needs an
-instance the impl's type lacks (123) are rejected.
+instance the impl's type lacks (123) are rejected. 124 to 127 cover
+colour parameters on structs and enums (types §1.3): one definition
+holding a sendable closure in one instance and a local one in another,
+through generic functions too (124), is accepted; a local instance
+crossing a thread (125), a colour argument used covariantly, which
+would let a local closure be read back as sendable (126), and a local
+closure given where the annotation fixes `:send` (127) are rejected.

@@ -1,0 +1,18 @@
+;; spec:   types §1.3, §3.2, §5.4 (ownership.md §7)
+;; expect: reject
+;; error:  cannot unify (Slot :send) with (Slot :local)
+;; Colour arguments are invariant (types §1.3). Were a (Slot :send)
+;; usable where a (Slot :local) is expected, poison could store a
+;; closure over a cell into the slot's cell, and main, still holding
+;; the :send view, would read it back as sendable and spawn it: a data
+;; race on the cell d. Unification of the two colour arguments refuses
+;; the call.
+(defstruct (Slot k :colour) (c: (Cell (fn k () i64))))
+
+(defun poison (s: (Slot :local) d: (Cell i64)) (set! (. s c) (fn () @d)))
+
+(defun main () -> i64
+  (let ((s: (Slot :send) (Slot (cell (fn () 1))))
+        (d: (Cell i64) (cell 5)))
+    (do (poison s d)
+        (join (spawn @(. s c))))))

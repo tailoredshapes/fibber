@@ -11,9 +11,10 @@
 
 use crate::syntax::Pos;
 
+use crate::types::decls::Globals;
 use crate::types::error::{ErrorKind, TResult, TypeError};
 use crate::types::store::Store;
-use crate::types::ty::{Colour, TvId, Ty};
+use crate::types::ty::{Colour, Con, TvId, Ty};
 
 use super::cx::{ColourCon, Cx, Witness};
 
@@ -25,6 +26,7 @@ enum UErr {
 }
 
 struct Unifier<'s> {
+    g: &'s Globals,
     st: &'s mut Store,
     cons: &'s mut Vec<ColourCon>,
     pos: &'s Pos,
@@ -44,7 +46,8 @@ impl Unifier<'_> {
             (t, Ty::Var(y)) => self.bind_var(*y, t, flow, false),
             (Ty::Rigid(i), Ty::Rigid(j)) | (Ty::Gen(i), Ty::Gen(j)) if i == j => Ok(()),
             (Ty::Con(c1, a1), Ty::Con(c2, a2)) if c1 == c2 && a1.len() == a2.len() => {
-                for (x, y) in a1.iter().zip(a2) {
+                for (i, (x, y)) in a1.iter().zip(a2).enumerate() {
+                    self.fixed_colours_differ(*c1, i, x, y)?;
                     self.unify(x, y, false)?;
                 }
                 Ok(())
@@ -57,6 +60,26 @@ impl Unifier<'_> {
                 self.unify(r1, r2, false)
             }
             _ => Err(UErr::Mismatch),
+        }
+    }
+
+    /// Two different written colours at a colour parameter of a nominal
+    /// type (§1.3): the arguments are invariant, so `(N :send)` and `(N
+    /// :local)` do not unify, and say so, rather than as a colour flow.
+    fn fixed_colours_differ(&mut self, c: Con, i: usize, x: &Ty, y: &Ty) -> Result<(), UErr> {
+        let Con::Nominal(id) = c else {
+            return Ok(());
+        };
+        if !self.g.ty(id).is_colour(i) {
+            return Ok(());
+        }
+        let fixed = |t: Ty| match t {
+            Ty::Fn(k @ (Colour::Send | Colour::Local), _, _) => Some(k),
+            _ => None,
+        };
+        match (fixed(self.st.resolve(x)), fixed(self.st.resolve(y))) {
+            (Some(a), Some(b)) if a != b => Err(UErr::Mismatch),
+            _ => Ok(()),
         }
     }
 
@@ -110,6 +133,7 @@ impl Unifier<'_> {
 impl Cx<'_> {
     fn unify_mode(&mut self, a: &Ty, b: &Ty, flow: bool, pos: &Pos) -> TResult<()> {
         let mut u = Unifier {
+            g: self.g,
             st: &mut *self.st,
             cons: &mut self.u.colours,
             pos,
@@ -142,7 +166,6 @@ impl Cx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ty::Con;
     use std::sync::Arc;
 
     fn pos() -> Pos {
@@ -158,7 +181,9 @@ mod tests {
     fn run(st: &mut Store, a: &Ty, b: &Ty, flow: bool) -> (Result<(), UErr>, Vec<ColourCon>) {
         let mut cons = Vec::new();
         let p = pos();
+        let g = crate::types::init::new_globals().expect("builtins");
         let r = Unifier {
+            g: &g,
             st,
             cons: &mut cons,
             pos: &p,

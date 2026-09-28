@@ -277,9 +277,21 @@ pub enum TypeAnn {
     /// A struct or enum applied to its arguments.
     Nominal(TypeId, Vec<TypeAnn>),
     /// `(fn κ? (A..) R)`; `None` when the colour is omitted (§1.4).
-    Fn(Option<Colour>, Vec<TypeAnn>, Box<TypeAnn>),
+    Fn(Option<ColourAnn>, Vec<TypeAnn>, Box<TypeAnn>),
+    /// The argument of a nominal type at a colour parameter (§1.3).
+    ColourArg(ColourAnn),
     /// `(dyn P)` / `(dyn (P D..))`, or with `:send` (the `bool`).
     Dyn(ProtoId, Vec<TypeAnn>, bool),
+}
+
+/// A colour as written in an annotation (§1.3, §1.4): `:send`,
+/// `:local`, or a named colour variable.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColourAnn {
+    /// `:send` or `:local`.
+    Fixed(Colour),
+    /// A colour variable or colour parameter, by name.
+    Named(String),
 }
 
 impl Expr {

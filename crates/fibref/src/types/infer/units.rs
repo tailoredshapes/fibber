@@ -22,6 +22,7 @@ impl Cx<'_> {
                     map: &mut self.u.rigid_map,
                     names: &mut self.u.rigid_names,
                     colour: &mut send,
+                    colour_names: &mut self.u.rigid_colours,
                 };
                 let at = crate::types::annot::ann_to_ty(a, &mut env, &def.pos)?;
                 self.flow(&t, &at, &def.init.pos)?;

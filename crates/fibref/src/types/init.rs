@@ -90,6 +90,7 @@ fn declare_builtin_enum(g: &mut Globals, name: &str) -> TResult<TypeId> {
         name: name.into(),
         module: ModuleId::Builtin,
         params,
+        colours: Vec::new(),
         shape: Shape::Enum(Vec::new()),
         pos: builtin_pos(),
     });

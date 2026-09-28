@@ -199,6 +199,14 @@ impl Ty {
         Ty::Con(Con::Nominal(id), args)
     }
 
+    /// The argument of a nominal type at a colour parameter (§1.3): the
+    /// colour carried as the function type `(fn κ () unit)`, so that
+    /// unification (both ways inside a constructor, §3.2), substitution
+    /// and generalisation treat it as the colour it is.
+    pub fn colour_arg(k: Colour) -> Ty {
+        Ty::Fn(k, Vec::new(), Box::new(Ty::unit()))
+    }
+
     /// Replaces every `Gen(i)` by `tys[i]` and every `Colour::Gen(i)` by
     /// `colours[i]`. Indices out of range are left alone.
     pub fn subst_gen(&self, tys: &[Ty], colours: &[Colour]) -> Ty {
@@ -291,6 +299,19 @@ pub enum Leaf {
     Rigid(u32),
     /// The colour of a function type.
     Colour(Colour),
+}
+
+/// The colours a nominal type's arguments give its colour parameters
+/// (§1.3), by parameter index: an argument's colour where it is a colour
+/// argument ([`Ty::colour_arg`]), `local` elsewhere (never read there:
+/// field types use `Colour::Gen(i)` only for a colour parameter `i`).
+pub fn colour_args(args: &[Ty]) -> Vec<Colour> {
+    args.iter()
+        .map(|a| match a {
+            Ty::Fn(k, ps, _) if ps.is_empty() => *k,
+            _ => Colour::Local,
+        })
+        .collect()
 }
 
 /// `colours[i]` for `Colour::Gen(i)`, else `k`.

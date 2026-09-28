@@ -14,7 +14,7 @@ use crate::types::decls::{Globals, Shape};
 use crate::types::display::Printer;
 use crate::types::error::{ErrorKind, TypeError};
 use crate::types::store::Store;
-use crate::types::ty::{Colour, Con, Scalar, Ty, TypeId};
+use crate::types::ty::{colour_args, Colour, Con, Scalar, Ty, TypeId};
 
 use super::cx::Witness;
 
@@ -130,7 +130,7 @@ fn nominal(
     };
     for (label, fty) in fields {
         path.push(label);
-        let ft = st.zonk(&fty.subst_gen(args, &[]));
+        let ft = st.zonk(&fty.subst_gen(args, &colour_args(args)));
         let r = walk(g, st, &ft, path, seen, needs);
         path.pop();
         r?;

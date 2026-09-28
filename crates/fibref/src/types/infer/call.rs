@@ -32,6 +32,7 @@ impl Cx<'_> {
             map: &mut self.u.rigid_map,
             names: &mut self.u.rigid_names,
             colour: &mut colour,
+            colour_names: &mut self.u.rigid_colours,
         };
         ann_to_ty(a, &mut env, pos)
     }
@@ -336,7 +337,7 @@ pub fn ctor_scheme(
     v: Option<usize>,
 ) -> Scheme {
     let def = g.ty(t);
-    let result = Ty::nominal(t, (0..def.params.len() as u32).map(Ty::Gen).collect());
+    let result = Ty::nominal(t, def.head_args());
     let fields = match (&def.shape, v) {
         (Shape::Struct(fs), None) => fs.clone(),
         (Shape::Enum(vs), Some(i)) => vs.get(i).map(|x| x.fields.clone()).unwrap_or_default(),
@@ -345,6 +346,11 @@ pub fn ctor_scheme(
     let mut s = Scheme::mono(result.clone());
     s.n_vars = def.params.len() as u32;
     s.var_names = def.params.clone();
+    if !def.colours.is_empty() {
+        // Colour parameter `i` is `Colour::Gen(i)` in the field types
+        // and the result (§1.3).
+        s.n_colours = def.params.len() as u32;
+    }
     if ctor_is_fn(g, t, v) {
         s.ty = Ty::Fn(
             Colour::Send,

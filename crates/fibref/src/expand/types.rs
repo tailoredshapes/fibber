@@ -127,7 +127,9 @@ fn builtin_pos() -> Pos {
     }
 }
 
-/// The name and declared parameters of a `Name` or `(Name tvar+)` head.
+/// The name and declared parameters of a `Name` or `(Name tvar+)` head;
+/// a parameter may be followed by `:colour` (types §1.3), which is not
+/// a parameter of its own.
 fn parse_head(
     head: &str,
     form: Option<&Form>,
@@ -140,9 +142,23 @@ fn parse_head(
         return Ok((name.to_string(), Vec::new()));
     }
     let items = form.as_list().unwrap_or(&[]);
-    let all_syms = items.iter().all(|f| f.as_sym().is_some());
+    let colour_after_param = |i: usize, f: &Form| {
+        matches!(&f.kind, FormKind::Kw(k) if k == "colour")
+            && i > 1
+            && items[i - 1].as_sym().is_some()
+    };
+    let all_syms = items
+        .iter()
+        .enumerate()
+        .all(|(i, f)| f.as_sym().is_some() || colour_after_param(i, f));
+    let params: Vec<Form> = items
+        .iter()
+        .skip(1)
+        .filter(|f| f.as_sym().is_some())
+        .cloned()
+        .collect();
     match items.first().and_then(Form::as_sym) {
-        Some(name) if items.len() > 1 && all_syms => Ok((name.to_string(), items[1..].to_vec())),
+        Some(name) if !params.is_empty() && all_syms => Ok((name.to_string(), params)),
         _ => Err(malformed(
             head,
             "name must be a symbol or (Name tvar+)",

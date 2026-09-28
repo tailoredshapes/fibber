@@ -4,7 +4,7 @@
 
 use crate::syntax::{Form, FormKind};
 
-use crate::types::ast::TypeAnn;
+use crate::types::ast::{ColourAnn, TypeAnn};
 use crate::types::decls::{Globals, ModuleId, Space};
 use crate::types::error::{TResult, TypeError};
 use crate::types::ty::{Colour, Con, Scalar};
@@ -95,9 +95,14 @@ fn list_type(
         "dyn" => return dyn_type(g, m, args, form, allow_self),
         _ => {}
     }
+    let colour_at = |i: usize| g.type_name(m, head).is_some_and(|id| g.ty(id).is_colour(i));
     let anns = args
         .iter()
-        .map(|a| type_ann(g, m, a, allow_self))
+        .enumerate()
+        .map(|(i, a)| match colour_at(i) {
+            true => colour_param_arg(a, head),
+            false => type_ann(g, m, a, allow_self),
+        })
         .collect::<TResult<Vec<_>>>()?;
     if let Some(c) = builtin_con(head) {
         let mut anns = anns;
@@ -131,9 +136,14 @@ fn fn_type(
     form: &Form,
     allow_self: bool,
 ) -> TResult<TypeAnn> {
-    let (colour, rest) = match args.first().map(|f| &f.kind) {
-        Some(FormKind::Kw(k)) if k == "send" => (Some(Colour::Send), &args[1..]),
-        Some(FormKind::Kw(k)) if k == "local" => (Some(Colour::Local), &args[1..]),
+    let (colour, rest) = match (args.first().map(|f| &f.kind), args.len()) {
+        (Some(FormKind::Sym(k)), 3) if is_var_name(k) && Scalar::from_name(k).is_none() => {
+            (Some(ColourAnn::Named(k.clone())), &args[1..])
+        }
+        (Some(_), _) => match colour_arg(&args[0]) {
+            Some(c) => (Some(c), &args[1..]),
+            None => (None, args),
+        },
         _ => (None, args),
     };
     let bad = || TypeError::resolve(&form.pos, format!("malformed function type {form}"));
@@ -149,6 +159,32 @@ fn fn_type(
     };
     let ret = type_ann(g, m, ret, allow_self)?;
     Ok(TypeAnn::Fn(colour, params, Box::new(ret)))
+}
+
+/// `:send` or `:local`.
+fn colour_arg(f: &Form) -> Option<ColourAnn> {
+    match &f.kind {
+        FormKind::Kw(k) if k == "send" => Some(ColourAnn::Fixed(Colour::Send)),
+        FormKind::Kw(k) if k == "local" => Some(ColourAnn::Fixed(Colour::Local)),
+        _ => None,
+    }
+}
+
+/// An argument at a colour parameter (§1.3): `:send`, `:local` or a
+/// colour variable.
+fn colour_param_arg(f: &Form, head: &str) -> TResult<TypeAnn> {
+    if let Some(c) = colour_arg(f) {
+        return Ok(TypeAnn::ColourArg(c));
+    }
+    match f.as_sym() {
+        Some(k) if is_var_name(k) && Scalar::from_name(k).is_none() && k != "str" => {
+            Ok(TypeAnn::ColourArg(ColourAnn::Named(k.to_string())))
+        }
+        _ => Err(TypeError::resolve(
+            &f.pos,
+            format!("{f} is not a colour: {head} takes :send, :local or a colour variable there"),
+        )),
+    }
 }
 
 /// `(dyn P)` / `(dyn (P D..))`, each optionally followed by `:send`.

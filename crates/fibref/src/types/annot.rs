@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::syntax::Pos;
 
-use super::ast::TypeAnn;
+use super::ast::{ColourAnn, TypeAnn};
 use super::error::{TResult, TypeError};
 use super::ty::{Colour, Con, Ty};
 
@@ -25,6 +25,22 @@ pub trait AnnEnv {
     }
     /// The colour of a function type whose colour is omitted.
     fn colour(&mut self) -> Colour;
+    /// The colour a named colour variable or parameter stands for
+    /// (§1.3).
+    fn named_colour(&mut self, name: &str, pos: &Pos) -> TResult<Colour> {
+        Err(TypeError::resolve(
+            pos,
+            format!("colour variable {name} is not allowed here"),
+        ))
+    }
+}
+
+/// A written colour under `env`.
+fn colour_of(c: &ColourAnn, env: &mut dyn AnnEnv, pos: &Pos) -> TResult<Colour> {
+    match c {
+        ColourAnn::Fixed(k) => Ok(*k),
+        ColourAnn::Named(n) => env.named_colour(n, pos),
+    }
 }
 
 /// Converts `ann` under `env`.
@@ -37,9 +53,10 @@ pub fn ann_to_ty(ann: &TypeAnn, env: &mut dyn AnnEnv, pos: &Pos) -> TResult<Ty> 
         TypeAnn::Builtin(c, arg) => Ty::Con(*c, vec![ann_to_ty(arg, env, pos)?]),
         TypeAnn::Nominal(id, args) => Ty::Con(Con::Nominal(*id), anns(args, env, pos)?),
         TypeAnn::Dyn(p, args, send) => Ty::Con(Con::Dyn(*p, *send), anns(args, env, pos)?),
+        TypeAnn::ColourArg(c) => Ty::colour_arg(colour_of(c, env, pos)?),
         TypeAnn::Fn(k, ps, r) => {
             let k = match k {
-                Some(k) => *k,
+                Some(k) => colour_of(k, env, pos)?,
                 None => env.colour(),
             };
             let ps = anns(ps, env, pos)?;
@@ -65,6 +82,8 @@ pub struct GenEnv {
     pub self_gen: bool,
     /// Whether omitted colours are quantified variables (else `local`).
     pub local_colours: bool,
+    /// Named colour variables and their `Colour::Gen` index.
+    pub colour_names: Vec<(String, u32)>,
 }
 
 impl GenEnv {
@@ -104,6 +123,15 @@ impl AnnEnv for GenEnv {
         self.colours += 1;
         Colour::Gen(self.colours - 1)
     }
+
+    fn named_colour(&mut self, name: &str, _: &Pos) -> TResult<Colour> {
+        if let Some((_, i)) = self.colour_names.iter().find(|(n, _)| n == name) {
+            return Ok(Colour::Gen(*i));
+        }
+        self.colours += 1;
+        self.colour_names.push((name.to_string(), self.colours - 1));
+        Ok(Colour::Gen(self.colours - 1))
+    }
 }
 
 /// The parameters of a struct or enum: only they may occur, as
@@ -111,6 +139,8 @@ impl AnnEnv for GenEnv {
 pub struct ParamEnv<'a> {
     /// The definition's parameters.
     pub params: &'a [String],
+    /// Which of them are colour parameters (§1.3); may be empty.
+    pub colours: &'a [bool],
     /// The definition's name, for messages.
     pub owner: &'a str,
 }
@@ -118,6 +148,10 @@ pub struct ParamEnv<'a> {
 impl AnnEnv for ParamEnv<'_> {
     fn var(&mut self, name: &str, pos: &Pos) -> TResult<Ty> {
         match self.params.iter().position(|p| p == name) {
+            Some(i) if self.colours.get(i) == Some(&true) => Err(TypeError::resolve(
+                pos,
+                format!("{name} is a colour parameter of {}, not a type", self.owner),
+            )),
             Some(i) => Ok(Ty::Gen(i as u32)),
             None => Err(TypeError::resolve(
                 pos,
@@ -128,6 +162,16 @@ impl AnnEnv for ParamEnv<'_> {
 
     fn colour(&mut self) -> Colour {
         Colour::Local
+    }
+
+    fn named_colour(&mut self, name: &str, pos: &Pos) -> TResult<Colour> {
+        match self.params.iter().position(|p| p == name) {
+            Some(i) if self.colours.get(i) == Some(&true) => Ok(Colour::Gen(i as u32)),
+            _ => Err(TypeError::resolve(
+                pos,
+                format!("{name} is not a colour parameter of {}", self.owner),
+            )),
+        }
     }
 }
 
@@ -142,6 +186,9 @@ pub struct RigidEnv<'a> {
     pub names: &'a mut Vec<String>,
     /// Makes the colour of an omitted annotation.
     pub colour: &'a mut dyn FnMut() -> Colour,
+    /// Named colour variables: each name one colour variable of the
+    /// definition (§1.3).
+    pub colour_names: &'a mut HashMap<String, Colour>,
 }
 
 impl AnnEnv for RigidEnv<'_> {
@@ -157,6 +204,15 @@ impl AnnEnv for RigidEnv<'_> {
 
     fn colour(&mut self) -> Colour {
         (self.colour)()
+    }
+
+    fn named_colour(&mut self, name: &str, _: &Pos) -> TResult<Colour> {
+        if let Some(k) = self.colour_names.get(name) {
+            return Ok(*k);
+        }
+        let k = (self.colour)();
+        self.colour_names.insert(name.to_string(), k);
+        Ok(k)
     }
 }
 
@@ -201,6 +257,7 @@ mod tests {
         let params = vec!["a".to_string()];
         let mut env = ParamEnv {
             params: &params,
+            colours: &[],
             owner: "S",
         };
         let bad = ann_to_ty(&TypeAnn::Var("b".into()), &mut env, &pos());
