@@ -21,6 +21,7 @@ mod gadgets2;
 mod helpers;
 mod hooks;
 mod inout;
+mod mcalls;
 mod objects;
 mod observe;
 mod protos;

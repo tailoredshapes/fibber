@@ -69,6 +69,7 @@ pub fn expr_new(e: &Expr) -> Sexp {
             list(items)
         }
         Kind::GMatch(s, cl) => form("match", [expr(s)].into_iter().chain(cl.iter().map(clause))),
+        Kind::Macro(m, args) => form(m.name(), args.iter().map(expr)),
         _ => atom("<unprintable>"),
     }
 }

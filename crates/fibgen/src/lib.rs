@@ -12,6 +12,7 @@ pub mod ast;
 pub mod coverage;
 pub mod driver;
 pub mod gen;
+pub mod macros;
 pub mod model;
 pub mod print;
 pub mod report;

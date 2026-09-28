@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 
 use crate::ast::{Expr, FunDef, Kind, Pat, Program};
+use crate::macros::Mac;
 use crate::ty::Ty;
 
 /// The smallest value of `ty`, mentioning no variable.
@@ -147,6 +148,24 @@ fn removals(e: &Expr) -> Vec<Expr> {
                 let mut it = items.clone();
                 it.remove(i);
                 out.push(with(Kind::VecLit(it)));
+            }
+        }
+        _ => out = removals_new(e),
+    }
+    out
+}
+
+/// [`removals`] for a macro call or a guarded `match`.
+fn removals_new(e: &Expr) -> Vec<Expr> {
+    let with = |k: Kind| Expr::new(e.ty.clone(), k);
+    let mut out = Vec::new();
+    match &e.kind {
+        // A macro taking any number of forms: one fewer.
+        Kind::Macro(m, args) if args.len() > 1 && matches!(m, Mac::SumAll | Mac::Nargs) => {
+            for i in 0..args.len() {
+                let mut a2 = args.clone();
+                a2.remove(i);
+                out.push(with(Kind::Macro(*m, a2)));
             }
         }
         // A guarded clause covers nothing (types §2.6): dropping one

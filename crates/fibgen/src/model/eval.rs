@@ -206,7 +206,7 @@ impl<'p> Machine<'p> {
                 self.ev(t, env)?;
                 Ok(V::Weak(None))
             }
-            Kind::Dyn(..) | Kind::GMatch(..) => self.ev_new(e, env),
+            Kind::Dyn(..) | Kind::GMatch(..) | Kind::Macro(..) => self.ev_new(e, env),
             _ => Err(unsupported(format!("node {:?}", e.kind))),
         }
     }

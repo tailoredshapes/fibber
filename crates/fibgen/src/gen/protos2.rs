@@ -72,10 +72,13 @@ pub fn generic_call(g: &mut Gen, cx: &Ctx, d: u32) -> Option<Expr> {
     Some(Expr::call(Ty::Int, &f.name, args))
 }
 
-/// `(fn (e: T) (m e ..))` with its body generated in `cx`.
+/// `(fn (e: T) (m e ..))` with its body generated in `cx` as a
+/// closure body (no `await`, no `&` parameters: syntax §3.13, §3.14).
 fn method_fn(g: &mut Gen, cx: &Ctx, t: &Ty, p: Proto, d: u32) -> Expr {
     let e = g.fresh("e");
-    let inner = cx.with(Var::new(e.clone(), t.clone(), VarKind::Param));
+    let inner = cx
+        .for_closure(true)
+        .with(Var::new(e.clone(), t.clone(), VarKind::Param));
     let body = call_method(g, &inner, Expr::var(&e, t.clone()), p, d);
     let fty = Ty::Func(vec![t.clone()], Box::new(Ty::Int));
     Expr::new(fty, Kind::Fn(vec![(e, t.clone())], Box::new(body)))

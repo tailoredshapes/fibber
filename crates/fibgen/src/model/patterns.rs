@@ -52,6 +52,7 @@ impl Machine<'_> {
                 self.ev(x, env)
             }
             Kind::GMatch(s, cl) => self.ev_gmatch(s, cl, env),
+            Kind::Macro(m, args) => self.ev(&crate::macros::expand(*m, args, &e.ty), env),
             other => Err(unsupported(format!("node {other:?}"))),
         }
     }

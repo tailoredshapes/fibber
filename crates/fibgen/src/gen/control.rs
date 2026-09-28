@@ -3,7 +3,7 @@
 use crate::ast::{Expr, Kind, Pat, Rest};
 use crate::ty::Ty;
 
-use super::{effects, tasks, vpat, Ctx, Gen, Var, VarKind};
+use super::{effects, mcalls, tasks, vpat, Ctx, Gen, Var, VarKind};
 
 fn var(name: &str, ty: &Ty, kind: VarKind) -> Var {
     Var {
@@ -186,6 +186,9 @@ pub fn if_form(g: &mut Gen, cx: &Ctx, ty: &Ty, d: u32) -> Option<Expr> {
 /// `(do step ... last)`: statements, discarded values and fire-and-forget
 /// spawns, then a value of `ty`.
 pub fn do_form(g: &mut Gen, cx: &Ctx, ty: &Ty, d: u32) -> Option<Expr> {
+    if g.rng.chance(12) {
+        return Some(mcalls::seq(g, cx, ty, d - 1));
+    }
     let mut steps = Vec::new();
     for _ in 0..g.rng.range(1, 3) {
         let s = match g.rng.below(5) {

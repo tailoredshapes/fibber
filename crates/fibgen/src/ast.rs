@@ -3,6 +3,7 @@
 //! type, and the model (`crate::model`) can compute the result the spec
 //! requires without the interpreter.
 
+use crate::macros::Mac;
 use crate::ty::{Proto, Ty};
 
 /// A typed expression.
@@ -78,6 +79,8 @@ pub enum Kind {
     /// `(match e clause ...)` whose clauses may have guards
     /// (`(pat :when g body)`, syntax §3.6).
     GMatch(Box<Expr>, Vec<Clause>),
+    /// `(m arg ...)`: a call of a preamble macro (syntax §3.16).
+    Macro(Mac, Vec<Expr>),
 }
 
 /// A clause of a [`Kind::GMatch`].
@@ -227,7 +230,9 @@ impl Expr {
     /// The direct sub-expressions, in evaluation order.
     pub fn children(&self) -> Vec<&Expr> {
         match &self.kind {
-            Kind::VecLit(es) | Kind::Do(es) | Kind::Recur(es) => es.iter().collect(),
+            Kind::VecLit(es) | Kind::Do(es) | Kind::Recur(es) | Kind::Macro(_, es) => {
+                es.iter().collect()
+            }
             Kind::Let(bs, b) => bs.iter().map(|(_, e)| e).chain([b.as_ref()]).collect(),
             Kind::Loop(bs, b) | Kind::Plet(bs, b) => {
                 bs.iter().map(|(_, e)| e).chain([b.as_ref()]).collect()
@@ -266,7 +271,9 @@ impl Expr {
     /// The direct sub-expressions, mutably, in the order of [`children`](Self::children).
     pub fn children_mut(&mut self) -> Vec<&mut Expr> {
         match &mut self.kind {
-            Kind::VecLit(es) | Kind::Do(es) | Kind::Recur(es) => es.iter_mut().collect(),
+            Kind::VecLit(es) | Kind::Do(es) | Kind::Recur(es) | Kind::Macro(_, es) => {
+                es.iter_mut().collect()
+            }
             Kind::Let(bs, b) => {
                 let mut v: Vec<&mut Expr> = bs.iter_mut().map(|(_, e)| e).collect();
                 v.push(b);
@@ -296,12 +303,7 @@ impl Expr {
                 v
             }
             Kind::Set(a, b) => vec![a, b],
-            Kind::GMatch(s, cl) => {
-                let parts = cl
-                    .iter_mut()
-                    .flat_map(|c| c.guard.iter_mut().chain([&mut c.body]));
-                [s.as_mut()].into_iter().chain(parts).collect()
-            }
+            Kind::GMatch(s, cl) => clause_parts_mut(s, cl),
             Kind::Dyn(_, _, e)
             | Kind::Fn(_, e)
             | Kind::FnNamed(_, _, e)
@@ -329,6 +331,14 @@ impl Expr {
         self.walk(&mut |_| n += 1);
         n
     }
+}
+
+/// The scrutinee, guards and bodies of a guarded `match`, mutably.
+fn clause_parts_mut<'a>(s: &'a mut Expr, cl: &'a mut [Clause]) -> Vec<&'a mut Expr> {
+    let parts = cl
+        .iter_mut()
+        .flat_map(|c| c.guard.iter_mut().chain([&mut c.body]));
+    [s].into_iter().chain(parts).collect()
 }
 
 impl Program {

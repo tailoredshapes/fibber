@@ -4,7 +4,8 @@ use crate::ast::{Expr, Kind};
 use crate::ty::Ty;
 
 use super::{
-    effects, funcs, gadgets, gadgets2, hooks, objects, observe, protos, tasks, vpat, Ctx, Gen,
+    effects, funcs, gadgets, gadgets2, hooks, mcalls, objects, observe, protos, tasks, vpat, Ctx,
+    Gen,
 };
 
 /// The text of a string literal.
@@ -33,6 +34,7 @@ pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
         8, // protocols: method calls, generic helpers, dyn (protos)
         2, // a vector match whose guards count themselves in a cell
         1, // a (Hook :send) crossing a thread
+        4, // a macro call
     ];
     let e = match g.rng.weighted(&weights) {
         Some(1) => Some(arith(g, cx, d)),
@@ -55,6 +57,7 @@ pub fn int(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
         Some(14) => protos::int_form(g, cx, d),
         Some(15) => Some(vpat::counted_match(g, cx, d)),
         Some(16) => Some(hooks::cross(g, cx, d)),
+        Some(17) => Some(mcalls::macro_int(g, cx, d)),
         _ => None,
     };
     e.unwrap_or_else(|| Expr::int(g.small()))

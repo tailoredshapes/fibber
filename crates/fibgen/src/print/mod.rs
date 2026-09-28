@@ -84,6 +84,11 @@ pub fn program(p: &Program) -> String {
     ]);
     body.push_str(&layout(&main, 0));
     body.push('\n');
+    preamble(&body) + &body
+}
+
+/// The preamble declarations and macros that `body` names.
+fn preamble(body: &str) -> String {
     let tokens: std::collections::HashSet<&str> = body
         .split(|c: char| c.is_whitespace() || "()[]@&".contains(c))
         .collect();
@@ -94,10 +99,16 @@ pub fn program(p: &Program) -> String {
             out.push('\n');
         }
     }
+    for m in crate::macros::ALL {
+        if tokens.contains(m.name()) {
+            out.push_str(m.definition());
+            out.push('\n');
+        }
+    }
     if !out.is_empty() {
         out.push('\n');
     }
-    out + &body
+    out
 }
 
 /// One expression's source, laid out.
@@ -169,7 +180,7 @@ fn expr_more(e: &Expr) -> Sexp {
         Kind::Async(b) => list(vec![atom("async"), expr(b)]),
         Kind::Await(t) => list(vec![atom("await"), expr(t)]),
         Kind::Plet(bs, b) => form("plet", [name_binds(bs), expr(b)]),
-        Kind::Dyn(..) | Kind::GMatch(..) => items::expr_new(e),
+        Kind::Dyn(..) | Kind::GMatch(..) | Kind::Macro(..) => items::expr_new(e),
         Kind::WeakDead(n, t) => {
             let bind = list(vec![list(vec![atom(n.clone()), expr(t)])]);
             list(vec![

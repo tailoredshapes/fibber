@@ -2,6 +2,7 @@
 //! `Hook`, vector patterns and guards.
 
 use crate::ast::{Arg, Clause, Expr, Kind, Pat, Program, Rest};
+use crate::macros::Mac;
 use crate::ty::{Proto, Ty};
 
 /// Labels for the `impl`s and generic helpers.
@@ -165,9 +166,27 @@ fn method_labels(h: &str, args: &[Arg], out: &mut Vec<String>) {
     out.push(l.into());
 }
 
+/// Labels for a macro call.
+fn macro_labels(m: Mac, args: &[Expr], out: &mut Vec<String>) {
+    out.push(format!("macro call: {}", m.name()));
+    let l = match m {
+        Mac::SwapSub | Mac::FlipIf if m.rewrites(args) => {
+            "macro takes its argument's form apart by a vector pattern"
+        }
+        Mac::SwapSub | Mac::FlipIf => "macro's form match falls through to the form",
+        Mac::SumAll if args.len() > 1 => "macro expands to a call of itself (spliced rest)",
+        Mac::Nargs if !args.is_empty() => "macro discards its arguments unevaluated",
+        Mac::Twice => "macro runs its argument twice",
+        Mac::Once2 => "macro binds its argument to a gensym",
+        _ => return,
+    };
+    out.push(l.into());
+}
+
 /// Labels for one node.
 pub fn node_labels(e: &Expr, out: &mut Vec<String>) {
     match &e.kind {
+        Kind::Macro(m, args) => macro_labels(*m, args, out),
         Kind::Dyn(_, send, x) => {
             out.push(
                 if *send {
