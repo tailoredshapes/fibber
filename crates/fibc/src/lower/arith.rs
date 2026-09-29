@@ -18,19 +18,19 @@ impl<'a> Cx<'_, 'a> {
         a: &[V],
         tys: &[Ty],
         rt: &Ty,
-    ) -> R<V> {
+    ) -> R<Option<V>> {
         let x = a
             .first()
             .ok_or_else(|| Unsupported(format!("{method} without a receiver")))?
             .clone();
         let y = a.get(1).cloned();
         match proto {
-            "Deref" => self.deref_val(&x, &tys[0]),
-            "Show" => self.native_show(&x, &tys[0]),
-            "Hash" => self.native_hash(&x, &tys[0]),
+            "Deref" => self.deref_val(&x, &tys[0]).map(Some),
+            "Show" => self.native_show(&x, &tys[0]).map(Some),
+            "Hash" => self.native_hash(&x, &tys[0]).map(Some),
             _ => {
                 if matches!(tys[0], Ty::Con(Con::Str, _)) {
-                    return self.str_compare(method, &x, y.as_ref());
+                    return self.str_compare(method, &x, y.as_ref()).map(Some);
                 }
                 let t = x
                     .ty()
@@ -38,13 +38,13 @@ impl<'a> Cx<'_, 'a> {
                 let _ = rt;
                 match (t, y) {
                     (LirTy::Float | LirTy::Double, Some(y)) => {
-                        Ok(self.float_binary(method, &x, &y))
+                        Ok(Some(self.float_binary(method, &x, &y)))
                     }
                     (LirTy::Float | LirTy::Double, None) => {
-                        Ok(self.b.val(&format!("(fneg {})", x.text()), t))
+                        Ok(Some(self.b.val(&format!("(fneg {})", x.text()), t)))
                     }
                     (_, Some(y)) => self.int_binary(method, &x, &y),
-                    (_, None) => self.int_unary(method, &x),
+                    (_, None) => self.int_unary(method, &x).map(Some),
                 }
             }
         }
@@ -82,11 +82,13 @@ impl<'a> Cx<'_, 'a> {
         self.b.val(&instr, rt)
     }
 
-    fn int_binary(&mut self, method: &str, x: &V, y: &V) -> R<V> {
+    /// `None` when the operation cannot return (a literal division by
+    /// zero is the trap alone).
+    fn int_binary(&mut self, method: &str, x: &V, y: &V) -> R<Option<V>> {
         let t = x.ty().unwrap_or(LirTy::I64);
         let (a, b) = (x.text().to_string(), y.text().to_string());
         let w = t.text();
-        Ok(match method {
+        Ok(Some(match method {
             "+" | "-" | "*" => {
                 let op = match method {
                     "+" => "sadd-overflow",
@@ -101,6 +103,13 @@ impl<'a> Cx<'_, 'a> {
                 self.b.val(&format!("(extractvalue {} 0)", r.text()), t)
             }
             "/" | "rem" => {
+                // lIR refuses a division by a constant zero outright
+                // (lir.md §6.1), so a literal divisor of 0 is the trap
+                // alone: the call does not return.
+                if b == format!("({w} 0)") {
+                    self.trap_c(&format!("integer {method} by zero"));
+                    return Ok(None);
+                }
                 let zero = self.b.val(&format!("(icmp eq {b} ({w} 0))",), LirTy::I1);
                 self.trap_if(&zero, &format!("integer {method} by zero"));
                 let min = -(1i128 << (t.bits() - 1));
@@ -129,7 +138,7 @@ impl<'a> Cx<'_, 'a> {
                 let pred = compare_pred(other)?;
                 self.b.val(&format!("(icmp {pred} {a} {b})"), LirTy::I1)
             }
-        })
+        }))
     }
 
     fn int_unary(&mut self, method: &str, x: &V) -> R<V> {

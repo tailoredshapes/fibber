@@ -213,9 +213,9 @@ impl<'a> Cx<'_, 'a> {
         let head = format!(
             "(define internal ({name} ptr) ((ptr task))\n  (block entry\n    (let ((f (load ptr (getelementptr %struct.{tsname} task (i32 0) (i32 {TASK_CLOSURE}))))\n          (code (load ptr (getelementptr %struct.fib.closure f (i32 0) (i32 3))))"
         );
-        let call = "(indirect-call code (fn tailcc R (ptr)) f)";
+        let call = |r: &str| format!("(indirect-call code (fn tailcc {r} (ptr)) f)");
         let tail = "      (call @fib.release task)\n      (ret (ptr null)))))\n";
-        let s = self.completion(&head, call, tail, result_ty, asname, tsname)?;
+        let s = self.completion(&head, &call, tail, result_ty, asname, tsname)?;
         self.p.add_helper(&name, s);
         Ok(name)
     }
@@ -235,7 +235,7 @@ impl<'a> Cx<'_, 'a> {
         }
         let head =
             format!("(define internal ({name} void) ((ptr task))\n  (block entry\n    (let (");
-        let call = format!("(call @{code} task)");
+        let call = |_: &str| format!("(call @{code} task)");
         let s = self.completion(&head, &call, "      (ret))))\n", result_ty, asname, tsname)?;
         self.p.add_helper(&name, s);
         Ok(name)
@@ -244,11 +244,12 @@ impl<'a> Cx<'_, 'a> {
     /// The completion of a task (§8.8, as the interpreter's `complete`):
     /// the body's value share-marked, stored into the result atom under
     /// its lock (retained; the old content released), released as the
-    /// step's temporary, and the state set to done.
+    /// step's temporary, and the state set to done. `call` gives the
+    /// call of the body for the lIR text of its result type.
     fn completion(
         &mut self,
         head: &str,
-        call: &str,
+        call: &dyn Fn(&str) -> String,
         tail: &str,
         result_ty: &Ty,
         asname: &str,
@@ -265,11 +266,11 @@ impl<'a> Cx<'_, 'a> {
                 let _ = writeln!(
                     s,
                     "      {}\n      (call @fib.lock lockp)\n      (call @fib.unlock lockp)",
-                    call.replace('R', "void")
+                    call("void")
                 );
             }
             Some(t) => {
-                let _ = writeln!(s, "      (let ((v {}))", call.replace('R', t.text()));
+                let _ = writeln!(s, "      (let ((v {}))", call(t.text()));
                 let word = match t {
                     LirTy::Ptr => Some("v".to_string()),
                     LirTy::Dyn => Some("(extractvalue v 0)".to_string()),

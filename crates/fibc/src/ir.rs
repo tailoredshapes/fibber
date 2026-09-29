@@ -1,8 +1,12 @@
 //! A builder for the text of one lIR function (spec/lir.md §5): blocks,
 //! fresh SSA names, `let`s that keep nesting shallow, `phi`s first in
 //! their block, and `alloca`s in the entry block for stack objects
-//! (types §8.2).
+//! (types §8.2). A block that no live branch names is dead, and what
+//! is emitted into it is discarded: the lowering keeps emitting after
+//! a call that does not return, and lIR refuses a use of a name bound
+//! in code nothing reaches (lir.md §5).
 
+use std::collections::HashSet;
 use std::fmt::Write;
 
 pub use crate::value::{LirTy, V};
@@ -22,6 +26,8 @@ struct Block {
     phis: Vec<(String, String)>,
     items: Vec<Item>,
     closed: bool,
+    /// Opened with no live branch to it: kept out of the text.
+    dead: bool,
 }
 
 /// The function under construction.
@@ -35,6 +41,8 @@ pub struct FnBuilder {
     cur: usize,
     counter: u32,
     allocas: Vec<(String, String)>,
+    /// The labels a live terminator has named so far.
+    live_targets: HashSet<String>,
 }
 
 impl FnBuilder {
@@ -52,6 +60,7 @@ impl FnBuilder {
             cur: 0,
             counter: 0,
             allocas: Vec::new(),
+            live_targets: HashSet::new(),
         }
     }
 
@@ -77,13 +86,20 @@ impl FnBuilder {
         self.blocks[self.cur].closed
     }
 
-    /// Opens a new block and makes it current.
+    /// Opens a new block and makes it current; dead unless a live
+    /// terminator has named it.
     pub fn open(&mut self, label: &str) {
+        let dead = !self.live_targets.contains(label);
         self.blocks.push(Block {
             label: label.to_string(),
+            dead,
             ..Block::default()
         });
         self.cur = self.blocks.len() - 1;
+    }
+
+    fn is_dead(&self, label: &str) -> bool {
+        self.blocks.iter().any(|b| b.label == label && b.dead)
     }
 
     /// Binds `instr`'s value to a fresh name and returns it.
@@ -98,25 +114,36 @@ impl FnBuilder {
         self.push(Item::Stmt(instr.to_string()));
     }
 
-    /// Emits the terminator of the current block.
+    /// Emits the terminator of the current block; the labels it names
+    /// are live when the block is.
     pub fn term(&mut self, instr: &str) {
+        let b = &self.blocks[self.cur];
+        if !b.closed && !b.dead {
+            self.live_targets.extend(targets(instr));
+        }
         self.push(Item::Stmt(instr.to_string()));
         self.blocks[self.cur].closed = true;
     }
 
     fn push(&mut self, item: Item) {
         let b = &mut self.blocks[self.cur];
-        if !b.closed {
+        if !b.closed && !b.dead {
             b.items.push(item);
         }
     }
 
-    /// A `phi` at the head of the current block.
+    /// A `phi` at the head of the current block, without the edges
+    /// from dead blocks.
     pub fn phi(&mut self, ty: LirTy, incoming: &[(String, String)]) -> V {
         let n = self.fresh();
+        if self.blocks[self.cur].dead {
+            return V::Val(n, ty);
+        }
         let mut s = format!("(phi {}", ty.text());
         for (label, v) in incoming {
-            let _ = write!(s, " ({label} {v})");
+            if !self.is_dead(label) {
+                let _ = write!(s, " ({label} {v})");
+            }
         }
         s.push(')');
         self.blocks[self.cur].phis.push((n.clone(), s));
@@ -124,8 +151,12 @@ impl FnBuilder {
     }
 
     /// Adds an incoming edge to the `phi` bound to `name` in block
-    /// `label` (a loop's back edge, known only once the body is done).
+    /// `label` (a loop's back edge, known only once the body is done);
+    /// no edge comes from a dead block.
     pub fn patch_phi(&mut self, label: &str, name: &str, from: &str, value: &str) {
+        if self.is_dead(from) {
+            return;
+        }
         for b in &mut self.blocks {
             if b.label != label {
                 continue;
@@ -164,6 +195,9 @@ impl FnBuilder {
             params.join(" ")
         );
         for (i, b) in self.blocks.iter().enumerate() {
+            if b.dead {
+                continue;
+            }
             let _ = writeln!(out, "  (block {}", b.label);
             let mut binds: Vec<(String, String)> = b.phis.clone();
             if i == 0 {
@@ -177,6 +211,75 @@ impl FnBuilder {
         out.push_str(")\n");
         out
     }
+}
+
+/// The labels a terminator names: `(br l)`, `(br c l1 l2)`, and a
+/// `switch`'s default and case labels; none for `ret` and
+/// `unreachable`.
+fn targets(term: &str) -> Vec<String> {
+    let Sx::List(items) = parse_sx(&mut term.chars().peekable()) else {
+        return Vec::new();
+    };
+    let atom = |s: &Sx| match s {
+        Sx::Atom(a) => Some(a.clone()),
+        Sx::List(_) => None,
+    };
+    match items.first().and_then(atom).as_deref() {
+        Some("br") => match &items[1..] {
+            [l] => atom(l).into_iter().collect(),
+            [_, a, b] => [a, b].into_iter().filter_map(atom).collect(),
+            _ => Vec::new(),
+        },
+        Some("switch") => {
+            let mut out: Vec<String> = items.get(2).and_then(atom).into_iter().collect();
+            for case in items.iter().skip(3) {
+                if let Sx::List(c) = case {
+                    out.extend(c.last().and_then(atom));
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The shape of a terminator's text.
+enum Sx {
+    Atom(String),
+    List(Vec<Sx>),
+}
+
+fn parse_sx(cs: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Sx {
+    while cs.peek().is_some_and(|c| c.is_whitespace()) {
+        cs.next();
+    }
+    if cs.peek() == Some(&'(') {
+        cs.next();
+        let mut items = Vec::new();
+        loop {
+            while cs.peek().is_some_and(|c| c.is_whitespace()) {
+                cs.next();
+            }
+            match cs.peek() {
+                None => break,
+                Some(')') => {
+                    cs.next();
+                    break;
+                }
+                Some(_) => items.push(parse_sx(cs)),
+            }
+        }
+        return Sx::List(items);
+    }
+    let mut a = String::new();
+    while let Some(&c) = cs.peek() {
+        if c.is_whitespace() || c == '(' || c == ')' {
+            break;
+        }
+        a.push(c);
+        cs.next();
+    }
+    Sx::Atom(a)
 }
 
 /// Prints a block's items: bindings accumulate into one `let` whose
@@ -231,6 +334,76 @@ mod tests {
         assert!(text.contains("(let ((t2 (mul t1 (i64 2))))\n      (ret t2))"));
         assert!(text.ends_with("  ))\n"));
         assert!(lir::parse(&text).is_ok(), "{text}");
+    }
+
+    #[test]
+    fn terminators_name_their_targets() {
+        assert_eq!(targets("(br next)"), ["next"]);
+        assert_eq!(targets("(br t1 yes no)"), ["yes", "no"]);
+        assert_eq!(targets("(br (i1 1) yes no)"), ["yes", "no"]);
+        assert_eq!(
+            targets("(switch t2 done ((i32 0) v0) ((i32 1) v1))"),
+            ["done", "v0", "v1"]
+        );
+        assert!(targets("(ret t3)").is_empty());
+        assert!(targets("(unreachable)").is_empty());
+    }
+
+    #[test]
+    fn a_block_no_live_branch_names_is_discarded() {
+        // After a call that does not return, the lowering still emits
+        // the rest of the expression: a branch, its blocks, a join with
+        // a phi. None of it may reach the text.
+        let mut f = FnBuilder::new("h", Some(LirTy::I64), vec![], false);
+        f.stmt("(call @fib.trap-c (string \"boom\"))");
+        f.term("(unreachable)");
+        let c = f.val("(icmp eq (i64 1) (i64 1))", LirTy::I1);
+        f.term(&format!("(br {} yes no)", c.text()));
+        f.open("yes");
+        f.term("(br join)");
+        f.open("no");
+        f.term("(br join)");
+        f.open("join");
+        let p = f.phi(
+            LirTy::I64,
+            &[
+                ("yes".into(), "(i64 6)".into()),
+                ("no".into(), "(i64 8)".into()),
+            ],
+        );
+        f.term(&format!("(ret {})", p.text()));
+        let text = f.render();
+        assert!(!text.contains("(block yes"), "{text}");
+        assert!(!text.contains("phi"), "{text}");
+        assert!(text.ends_with("(unreachable)\n  ))\n"), "{text}");
+        assert!(
+            lir::parse_and_check(&format!("(declare fib.trap-c void (ptr))\n{text}")).is_ok(),
+            "{text}"
+        );
+        // A live join keeps only its live edges.
+        let mut g = FnBuilder::new("k", Some(LirTy::I64), vec![(LirTy::I1, "c".into())], false);
+        g.term("(br c yes done)");
+        g.open("yes");
+        g.term("(br done)");
+        g.open("dead");
+        g.term("(br done)");
+        g.open("done");
+        let p = g.phi(
+            LirTy::I64,
+            &[
+                ("entry".into(), "(i64 1)".into()),
+                ("yes".into(), "(i64 2)".into()),
+                ("dead".into(), "(i64 3)".into()),
+            ],
+        );
+        g.term(&format!("(ret {})", p.text()));
+        let text = g.render();
+        assert!(
+            text.contains("(phi i64 (entry (i64 1)) (yes (i64 2)))"),
+            "{text}"
+        );
+        assert!(!text.contains("(block dead"), "{text}");
+        assert!(lir::parse_and_check(&text).is_ok(), "{text}");
     }
 
     #[test]

@@ -8,15 +8,17 @@
 use std::io::{self, Write};
 #[cfg(feature = "llvm")]
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use fibc::compile::compile;
 use fibc::front::{check, Front};
 use fibc::harness::child::{EXIT_COMPILE_FAILED, EXIT_REJECTED, EXIT_UNSUPPORTED};
+use fibc::harness::gen::GenConfig;
 #[cfg(feature = "llvm")]
 use fibc::harness::Harness;
 #[cfg(feature = "llvm")]
-use fibref::cases::render;
+use fibref::cases::{render, Report, Status};
 #[cfg(feature = "llvm")]
 use lair::{Jit, JitOptions};
 
@@ -31,6 +33,11 @@ commands:
                          canonical trace (compiler.md §4)
   cases [dir]            run every case in dir (default cases/ownership)
                          interpreted and compiled, and compare (method.md rule 6)
+  gen --seed S --count N [--size K] [--jobs J] [--dir D]
+                         generate N programs with fibgen from seed S (size K, or
+                         sizes 1..=6 in turn) and run each interpreted and
+                         compiled against the model's verdict; a program that
+                         does not pass is kept in D
   help                   print this message";
 
 const DEFAULT_CASES_DIR: &str = "cases/ownership";
@@ -43,8 +50,36 @@ enum Command {
     Explain { file: String },
     Itrace { file: String },
     Cases { dir: String },
+    Gen(GenConfig),
     Help,
     Invalid,
+}
+
+/// `gen`'s options; a bad or missing value is `Invalid`.
+fn parse_gen(args: &[&str]) -> Command {
+    let mut cfg = GenConfig {
+        seed: 1,
+        count: 100,
+        size: None,
+        jobs: std::thread::available_parallelism().map_or(2, |n| n.get()),
+        dir: std::env::temp_dir().join(format!("fibc-gen-{}", std::process::id())),
+    };
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let Some(val) = it.next() else {
+            return Command::Invalid;
+        };
+        let num = val.parse::<u64>();
+        match (*flag, num) {
+            ("--seed", Ok(n)) => cfg.seed = n,
+            ("--count", Ok(n)) => cfg.count = n as usize,
+            ("--size", Ok(n)) => cfg.size = Some(n as u32),
+            ("--jobs", Ok(n)) => cfg.jobs = n as usize,
+            ("--dir", _) => cfg.dir = PathBuf::from(val),
+            _ => return Command::Invalid,
+        }
+    }
+    Command::Gen(cfg)
 }
 
 fn parse(args: &[String]) -> Command {
@@ -81,6 +116,7 @@ fn parse(args: &[String]) -> Command {
         ["cases", dir] => Command::Cases {
             dir: dir.to_string(),
         },
+        ["gen", rest @ ..] => parse_gen(rest),
         ["help" | "--help" | "-h"] => Command::Help,
         _ => Command::Invalid,
     }
@@ -133,6 +169,67 @@ fn build(_file: &str, _out: &str) -> ExitCode {
 #[cfg(not(feature = "llvm"))]
 fn cases(_dir: &str) -> ExitCode {
     no_llvm("cases")
+}
+
+#[cfg(not(feature = "llvm"))]
+fn gen(_cfg: GenConfig) -> ExitCode {
+    no_llvm("gen")
+}
+
+#[cfg(feature = "llvm")]
+fn gen(cfg: GenConfig) -> ExitCode {
+    let fibc = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fibc: cannot find myself: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let r = match fibc::harness::gen::run(&Harness { fibc }, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("fibc: cannot write programs to {}: {e}", cfg.dir.display());
+            return ExitCode::from(2);
+        }
+    };
+    // The rows of everything that is not a pass, then every count.
+    let others: Vec<_> = r
+        .report
+        .results
+        .iter()
+        .filter(|c| !matches!(c.status, Status::Pass))
+        .cloned()
+        .collect();
+    let mut text = if others.is_empty() {
+        String::new()
+    } else {
+        render(&Report::from_results(others))
+    };
+    let c = &r.report.counts;
+    text.push_str(&format!(
+        "fibc gen: {} programs from seed {}: {} pass, {} fail, {} pending, {} header error; {} model gaps{}\n",
+        c.total(),
+        cfg.seed,
+        c.pass,
+        c.fail,
+        c.pending,
+        c.header_error,
+        r.model_gaps.len(),
+        if c.total() == c.pass {
+            String::new()
+        } else {
+            format!("; the programs kept in {}", cfg.dir.display())
+        }
+    ));
+    let code = if r.report.ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    };
+    match write_stdout(&text) {
+        ExitCode::SUCCESS => code,
+        other => other,
+    }
 }
 
 #[cfg(feature = "llvm")]
@@ -280,6 +377,7 @@ fn main() -> ExitCode {
         Command::Explain { file } => explain(&file),
         Command::Itrace { file } => itrace(&file),
         Command::Cases { dir } => cases(&dir),
+        Command::Gen(cfg) => gen(cfg),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS

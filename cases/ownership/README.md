@@ -186,3 +186,17 @@ the bits of its value as an `f64`, of unit 0. The result folds every
 text's length and every hash (169, 1209), so a compiler that differs
 in any text or hash fails it. `show` of a float and of a `str` are not
 exercised: their text is undecided (compiler.md §8 item 11).
+
+Cases 170 to 173 pin what `fibc gen` (compiler.md §5: generated
+programs through the rule-6 harness) found in its first 660 seeds,
+each reduced by hand to the shape that fails. The interpreter was
+right every time; the compiler was not. An `async` inside a method of
+a protocol named `Rank` (170, 9): the task's resume function named the
+body's code with every `R` replaced by the result type. A generic
+function whose inferred bound is met by a `(dyn Score)` (171, 12): the
+bound is discharged by the receiver's own vtable (types §3.3), not by
+an instance. A division by the literal `0` (172, trap): lIR refuses a
+constant zero divisor, so the trap is emitted alone, as a call that
+does not return. `trap` where a value is needed (173, trap): what the
+lowering emits after a call that does not return goes into blocks
+nothing reaches, which the builder now discards.

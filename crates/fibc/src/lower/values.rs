@@ -46,7 +46,9 @@ impl<'a> Cx<'_, 'a> {
             let owned: Vec<bool> = proto.methods[i].params.iter().map(|q| q.owned).collect();
             let name = format!("l.native.{pname}.{mname}.{}", mangle(g, &self.ty(e)?));
             self.wrapper(e, &name, move |cx, vals, tys, rt| {
-                let v = cx.native_method(&pname, &mname, vals, tys, rt)?;
+                let v = cx
+                    .native_method(&pname, &mname, vals, tys, rt)?
+                    .ok_or_else(|| Unsupported("a native wrapper that does not return".into()))?;
                 for (j, a) in vals.iter().enumerate() {
                     if !owned.get(j).copied().unwrap_or(false) {
                         cx.release(a);

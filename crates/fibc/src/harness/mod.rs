@@ -3,6 +3,7 @@
 //! and the free traces must agree, and the verdict is the header's.
 
 pub mod child;
+pub mod gen;
 pub mod interp;
 
 use std::path::{Path, PathBuf};
@@ -77,7 +78,15 @@ pub fn combine(interp: Outcome, itrace: &Trace, said: Said, ctrace: &Trace) -> O
             }
         }
         (Outcome::Trapped { message, errors }, Said::Trapped(m)) => {
-            trapped(&message, errors, m, compare(itrace, ctrace))
+            // §4: at an abort the other threads of a threaded run are
+            // wherever the schedule left them, so its trace is not
+            // compared; a single-threaded trace is, up to the abort.
+            let trace = if itrace.threaded() || ctrace.threaded() {
+                Ok(())
+            } else {
+                compare(itrace, ctrace)
+            };
+            trapped(&message, errors, m, trace)
         }
         (i, c) => Outcome::Failed {
             message: format!(
@@ -222,5 +231,20 @@ mod tests {
         assert!(matches!(o, Outcome::Trapped { errors, .. } if errors.is_empty()));
         let o = combine(tr, &t("A 1 o\n"), Said::Trapped("other".into()), &t(""));
         assert!(matches!(o, Outcome::Trapped { errors, .. } if errors.len() == 2));
+    }
+
+    #[test]
+    fn a_threaded_trap_compares_the_message_only() {
+        let tr = Outcome::Trapped {
+            message: "integer overflow in + at i64".into(),
+            errors: vec![],
+        };
+        let o = combine(
+            tr,
+            &t("T\nA 1 o\nA 2 o\nA 3 a\n"),
+            Said::Trapped("integer overflow in + at i64".into()),
+            &t("T\nA 1 o\n"),
+        );
+        assert!(matches!(o, Outcome::Trapped { errors, .. } if errors.is_empty()));
     }
 }

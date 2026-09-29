@@ -31,7 +31,7 @@ Decisions taken on the way are in spec/types.md §10.
 - [x] evaluator following the checker's plan (`fibref run`), with
       threads, atoms and an async executor that is deterministic and
       fair (types §8.8, "The reference interpreter's schedule")
-- [x] case harness and CI: 167 cases in cases/ownership, all passing
+- [x] case harness and CI: 171 cases in cases/ownership, all passing
       with a clean audit (its README lists them by origin: the 20
       decided, the promoted proposals, the rule-4 adversary's findings
       81 to 95, the rule-5 generator's, and the owner's decisions of
@@ -136,7 +136,7 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       compiler.md §4
 - [x] method rule 6 harness: `fibc cases` runs every case interpreted
       and compiled and compares results, rejections, traps and free
-      traces; all 167 cases pass both ways, 0 fail, 0 pending
+      traces; all 171 cases pass both ways, 0 fail, 0 pending
 - [x] macros through the JIT: one macro-time module per `defmacro`,
       `gensym` and reflection through hooks into the expander;
       `tests/macros.rs` shows the expansions equal `fibref`'s on every
@@ -150,7 +150,20 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       `str`, whose text is undecided (compiler.md §8 item 11)
 - [ ] `def` initialisers through the JIT (today evaluated by `fibref`
       and serialised; question 4); a `(dyn P)` of a native instance
-- [ ] generated programs (`fibgen`) through the harness
+- [x] generated programs through the harness: `fibc gen` writes each
+      program `fibgen` generates as a case whose header is the model's
+      verdict and runs it both ways (`tests/gen.rs`: the first 120
+      seeds). Its first 660 seeds found four compiler faults and one
+      harness gap, each pinned as a case (170 to 173) or a decision
+      (compiler.md §8 item 12)
+- [ ] an intermittent crash of compiled threaded programs under load:
+      on 2026-09-29 the first runs of `tests/gen.rs` saw the child of
+      seeds 4 (size 4), 33 (size 3) and 86 (size 2) die of SIGILL or
+      SIGSEGV once each, with nothing on standard error; 6000 later
+      runs of the same three programs at 56-way parallelism and under
+      a CPU hog, and their AOT executables, all passed. Not reproduced,
+      not understood, not closed; `fibc gen` keeps any program that
+      fails, so a long sweep is the way to catch it again
 - [ ] the owner's answers to compiler.md §8
 
 ## M5. A library a compiler can live on

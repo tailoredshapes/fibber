@@ -301,11 +301,19 @@ impl<'p, 'a> Cx<'p, 'a> {
         Ok(flow)
     }
 
-    /// Lowers an expression that must produce a value.
+    /// Lowers an expression that must produce a value. After a jump
+    /// nothing runs: the value stands in for one never used, and what
+    /// is emitted with it lands in dead blocks the builder discards.
     pub fn value(&mut self, e: &'a Expr) -> R<V> {
         match self.expr(e)? {
             Flow::Val(v) => Ok(v),
-            Flow::Jump => Err(Unsupported("a jump where a value is needed".into())),
+            Flow::Jump => {
+                let t = self.ty(e)?;
+                Ok(match self.p.lir(&t)? {
+                    Some(l) => V::Val(self.b.fresh(), l),
+                    None => V::Unit,
+                })
+            }
         }
     }
 

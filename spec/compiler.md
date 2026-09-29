@@ -153,11 +153,13 @@ freed, which the live tally checks. A program whose
 result or frees depend on the interleaving has no single correct
 trace; none of the cases does (§8.8, "What depends on this choice").
 
-**A trap** aborts the program: both traces stop at the abort; the
-compiled trace is whatever was written before it, compared with the
-interpreter's under the same rule. The harness compares the trap
-message (the header's text must occur in both) and requires a non-zero
-exit.
+**A trap** aborts the program: both traces stop at the abort; a
+single-threaded compiled trace is whatever was written before it,
+compared line for line with the interpreter's. A threaded run's trace
+at an abort is not compared at all: the other threads are wherever
+the OS's schedule left them, which no tally can predict (§8 item 12).
+The harness compares the trap message (the header's text must occur
+in both) and requires a non-zero exit.
 
 ## 5. The harness: `fibc cases`
 
@@ -298,3 +300,14 @@ Recorded as they arise; none changes §8.
     §2.12 fixes `show` of a float as the shortest round-trip decimal
     with a `.0` for an integral value and `NaN`, `inf`, `-inf`, and
     `show` of a `str` as the string itself, unquoted.
+12. **A threaded run that traps has no comparable trace** (§4). Found
+    by `fibc gen` (fibgen seed 162, size 6): the interpreter's threads
+    had allocated 38 objects when one trapped, the OS's 34, and the
+    tally rule requires the compiled run to have allocated at least as
+    many. At an abort the other threads are mid-flight on both sides
+    under different schedules, so neither the live tally nor the
+    allocation counts are determined. The harness now compares only
+    the message and the exit status for a trap when either side spawned
+    a thread; is that acceptable, or should a threaded trap be judged
+    on the trace of the trapping thread alone, which would need the
+    thread named in both traces (item 2)?

@@ -82,7 +82,10 @@ impl<'a> Cx<'_, 'a> {
                 None => return Ok(Flow::Jump),
             },
             Target::Native(proto, method) => {
-                self.native_method(proto, method, &vals, &arg_tys, &rt)?
+                match self.native_method(proto, method, &vals, &arg_tys, &rt)? {
+                    Some(v) => v,
+                    None => return Ok(Flow::Jump),
+                }
             }
             Target::Ctor(t, variant) => self.construct(e, *t, *variant, &vals)?,
         };
@@ -262,6 +265,17 @@ impl<'a> Cx<'_, 'a> {
             ),
             Some(Resolution::Bound(pred)) => {
                 let pred = pred.map_tys(&mut |t| self.inst.subst(t));
+                // A bound the specialisation discharges with a `dyn` is
+                // met by the receiver's own vtable (§3.3).
+                if let Pred::Proto(_, tys) = &pred {
+                    if matches!(tys.first(), Some(Ty::Con(Con::Dyn(..), _))) {
+                        let (recv, t) = vals
+                            .first()
+                            .zip(arg_tys.first())
+                            .ok_or_else(|| Unsupported("a dyn call without a receiver".into()))?;
+                        return self.dyn_target(&recv.clone(), &t.clone(), p, i);
+                    }
+                }
                 self.instance_of_pred(&pred)?
             }
             Some(Resolution::Dyn) => {
