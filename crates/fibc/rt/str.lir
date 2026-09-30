@@ -64,6 +64,123 @@
   (block yes (ret (call @fib.str-from-bytes (string "true") (i64 4))))
   (block no (ret (call @fib.str-from-bytes (string "false") (i64 5)))))
 
+;; show of a float (types §2.12): the shortest %e text that reads back
+;; at the value's width, laid out positionally with .0 when integral;
+;; NaN, inf, -inf. Written with the shortest digits into `out`.
+(declare strtod double (ptr ptr))
+(declare strtof float (ptr ptr))
+(declare memset ptr (ptr i32 i64))
+
+;; Whether the %e text in buf reads back to x, at single precision or
+;; double.
+(define internal (fib.fp-exact i1) ((ptr buf) (double x) (i1 single))
+  (block entry (br single narrow wide))
+  (block wide
+    (ret (icmp eq (bitcast i64 (call @strtod buf (ptr null))) (bitcast i64 x))))
+  (block narrow
+    (ret (icmp eq (bitcast i32 (call @strtof buf (ptr null))) (bitcast i32 (fptrunc float x))))))
+
+;; The digits of a %e text (no sign, no point) into digits, its
+;; exponent into exp; returns the count of digits.
+(define internal (fib.fp-parse i64) ((ptr buf) (ptr digits) (ptr exp))
+  (block entry
+    (let ((neg (icmp eq (load i8 buf) (i8 45)))
+          (start (select neg (i64 1) (i64 0))))
+      (br scan)))
+  (block scan
+    (let ((i (phi i64 (entry start) (skip i2) (keep i2)))
+          (n (phi i64 (entry (i64 0)) (skip n) (keep n2)))
+          (c (load i8 (getelementptr i8 buf i)))
+          (i2 (add i (i64 1))))
+      (br (icmp eq c (i8 101)) expo point?)))
+  (block point? (br (icmp eq c (i8 46)) skip keep))
+  (block keep
+    (store c (getelementptr i8 digits n))
+    (let ((n2 (add n (i64 1)))) (br scan)))
+  (block skip (br scan))
+  (block expo
+    (let ((s (load i8 (getelementptr i8 buf i2)))
+          (eneg (icmp eq s (i8 45)))
+          (j0 (add i2 (i64 1))))
+      (br eloop)))
+  (block eloop
+    (let ((j (phi i64 (expo j0) (edigit j2)))
+          (e (phi i64 (expo (i64 0)) (edigit e2)))
+          (d (load i8 (getelementptr i8 buf j))))
+      (br (icmp eq d (i8 0)) edone edigit)))
+  (block edigit
+    (let ((e2 (add (mul e (i64 10)) (sext i64 (sub d (i8 48)))))
+          (j2 (add j (i64 1))))
+      (br eloop)))
+  (block edone
+    (store (select eneg (sub (i64 0) e) e) exp)
+    (ret n)))
+
+;; The positional text of the value d1.d2..dn x 10^e into out, with a
+;; leading - when neg and .0 when integral; returns its length.
+(define internal (fib.fp-layout i64) ((ptr out) (ptr digits) (i64 n) (i64 e) (i1 neg))
+  (block entry
+    (store (i8 45) out)
+    (let ((o0 (select neg (i64 1) (i64 0)))
+          (ef (add e (i64 1))))
+      (br (icmp slt e (i64 0)) small big)))
+  (block big
+    (let ((ni (select (icmp slt n ef) n ef))
+          (pad (sub ef ni))
+          (o1 (add o0 ef)))
+      (call @memcpy (getelementptr i8 out o0) digits ni)
+      (call @memset (getelementptr i8 out (add o0 ni)) (i32 48) pad)
+      (br (icmp sgt n ef) frac intg)))
+  (block frac
+    (let ((nf (sub n ef)))
+      (store (i8 46) (getelementptr i8 out o1))
+      (call @memcpy (getelementptr i8 out (add o1 (i64 1))) (getelementptr i8 digits ef) nf)
+      (ret (add (add o1 (i64 1)) nf))))
+  (block intg
+    (store (i8 46) (getelementptr i8 out o1))
+    (store (i8 48) (getelementptr i8 out (add o1 (i64 1))))
+    (ret (add o1 (i64 2))))
+  (block small
+    (let ((z (sub (i64 -1) e))
+          (o2 (add o0 (i64 2))))
+      (store (i8 48) (getelementptr i8 out o0))
+      (store (i8 46) (getelementptr i8 out (add o0 (i64 1))))
+      (call @memset (getelementptr i8 out o2) (i32 48) z)
+      (call @memcpy (getelementptr i8 out (add o2 z)) digits n)
+      (ret (add (add o2 z) n)))))
+
+(define internal (fib.show-fp ptr) ((double x) (i1 single))
+  (block entry (br (fcmp uno x x) nan finite))
+  (block nan (ret (call @fib.str-from-bytes (string "NaN") (i64 3))))
+  (block finite
+    (let ((buf (alloca i8 (i32 64)))
+          (len0 (call @snprintf buf (i64 64) (string "%.0e") x))
+          (c0 (load i8 buf))
+          (c1 (load i8 (getelementptr i8 buf (i64 1)))))
+      (br (or (icmp eq c0 (i8 105)) (icmp eq c1 (i8 105))) inf search)))
+  (block inf (ret (call @fib.str-from-bytes buf (sext i64 len0))))
+  (block search
+    (let ((p (phi i32 (finite (i32 0)) (more p2))))
+      (call @snprintf buf (i64 64) (string "%.*e") p x)
+      (br (call @fib.fp-exact buf x single) found more)))
+  (block more
+    (let ((p2 (add p (i32 1))))
+      (br (icmp sgt p2 (i32 17)) found search)))
+  (block found
+    (let ((digits (alloca i8 (i32 32)))
+          (exp (alloca i64))
+          (out (alloca i8 (i32 400)))
+          (n (call @fib.fp-parse buf digits exp))
+          (neg (icmp eq (load i8 buf) (i8 45)))
+          (m (call @fib.fp-layout out digits n (load i64 exp) neg)))
+      (ret (call @fib.str-from-bytes out m)))))
+
+(define internal (fib.show-double ptr) ((double x))
+  (block entry (ret (call @fib.show-fp x (i1 0)))))
+
+(define internal (fib.show-float ptr) ((float x))
+  (block entry (ret (call @fib.show-fp (fpext double x) (i1 1)))))
+
 ;; The UTF-8 encoding of the scalar value c.
 (define internal (fib.show-char ptr) ((i32 c))
   (block entry

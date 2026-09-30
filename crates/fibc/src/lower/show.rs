@@ -1,8 +1,7 @@
 //! The native `Show` and `Hash` instances (types §2.12) on scalars,
 //! field-less enums and `str`, computing what the interpreter computes
-//! (eval/arith.rs `show`, `hash`); every `show` allocates one fresh
-//! `str`. The text of a float and of a `str` is undecided
-//! (compiler.md §8 item 11), so those two stay unsupported.
+//! (eval/arith.rs `show`, `hash`, types §2.12); every `show` allocates
+//! one fresh `str`.
 
 use fibref::types::decls::Shape;
 use fibref::types::ty::{Con, Scalar, Ty, TypeId};
@@ -33,21 +32,14 @@ impl<'a> Cx<'_, 'a> {
                     self.p.keyword_helpers = true;
                     format!("(call @kw.show {})", x.text())
                 }
-                Scalar::F32 | Scalar::F64 => {
-                    return Err(Unsupported(
-                        "show of a float: its text is undecided (compiler.md §8 item 11)".into(),
-                    ))
-                }
+                Scalar::F32 => format!("(call @fib.show-float {})", x.text()),
+                Scalar::F64 => format!("(call @fib.show-double {})", x.text()),
             },
             Ty::Con(Con::Nominal(id), _) if g.ty(*id).is_fieldless_enum() => {
                 let f = self.enum_show_helper(*id)?;
                 format!("(call @{f} {})", x.text())
             }
-            Ty::Con(Con::Str, _) => {
-                return Err(Unsupported(
-                    "show of a str: its text is undecided (compiler.md §8 item 11)".into(),
-                ))
-            }
+            Ty::Con(Con::Str, _) => format!("(call @fib.str-copy {})", x.text()),
             _ => return Err(Unsupported(format!("show of {}", mangle(g, t)))),
         };
         Ok(self.b.val(&call, LirTy::Ptr))

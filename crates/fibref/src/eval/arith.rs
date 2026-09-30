@@ -81,11 +81,12 @@ impl Interp<'_> {
         })
     }
 
+    /// The text of `show` (types §2.12).
     fn show(&self, x: &Val) -> R<String> {
         Ok(match x {
-            Val::Obj(_) => format!("{:?}", self.string(x)?),
+            Val::Obj(_) => self.string(x)?.to_string(),
             Val::Int(n, _) => n.to_string(),
-            Val::Float(f, _) => format!("{f:?}"),
+            Val::Float(f, w) => float_text(*f, *w),
             Val::Bool(b) => b.to_string(),
             Val::Char(c) => c.to_string(),
             Val::Kw(k) => format!(":{}", self.keyword_name(*k)?),
@@ -99,6 +100,28 @@ impl Interp<'_> {
             Val::Ptr(p) => format!("#ptr{p:x}"),
             v => return Err(RunError::internal(format!("show of {v:?}"))),
         })
+    }
+}
+
+/// A float's `show` text (types §2.12): the shortest decimal that reads
+/// back at its width, positional, with `.0` when integral; `NaN`,
+/// `inf`, `-inf`.
+pub fn float_text(f: f64, w: Scalar) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "inf" } else { "-inf" }.into();
+    }
+    let s = if w == Scalar::F32 {
+        format!("{}", f as f32)
+    } else {
+        format!("{f}")
+    };
+    if s.contains('.') {
+        s
+    } else {
+        format!("{s}.0")
     }
 }
 

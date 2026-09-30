@@ -31,7 +31,7 @@ Decisions taken on the way are in spec/types.md §10.
 - [x] evaluator following the checker's plan (`fibref run`), with
       threads, atoms and an async executor that is deterministic and
       fair (types §8.8, "The reference interpreter's schedule")
-- [x] case harness and CI: 175 cases in cases/ownership, all passing
+- [x] case harness and CI: 176 cases in cases/ownership, all passing
       with a clean audit (its README lists them by origin: the 20
       decided, the promoted proposals, the rule-4 adversary's findings
       81 to 95, the rule-5 generator's, and the owner's decisions of
@@ -114,7 +114,7 @@ through both paths in its own process, and both must agree.
       expression evaluator (`lir`). Nothing in M4 to M6 needs them; a
       compiler runs lIR through `lair run` or the `Jit`
 
-## M4. Compiler (`fibc`, in Rust) — in progress
+## M4. Compiler (`fibc`, in Rust) — done
 
 Lower the checker's plan to lIR, with a small runtime (header,
 retain/release, share marking, atom locks, weak table, task executor)
@@ -124,7 +124,7 @@ depends on; its expansions must match `fibref`'s. Every case and generated progr
 interpreted and compiled; results and free traces must match (method
 rule 6). This is the "working language" milestone.
 
-State (spec/compiler.md, **Proposed**; `crates/fibc`):
+State (spec/compiler.md, **Decided**, owner, 2026-09-30; `crates/fibc`):
 
 - [x] `fibc` reuses `fibref`'s front end and lowers the plan to lIR
       text that `crates/lir` re-reads and re-checks (`tests/emit.rs`,
@@ -136,7 +136,7 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       compiler.md §4
 - [x] method rule 6 harness: `fibc cases` runs every case interpreted
       and compiled and compares results, rejections, traps and free
-      traces; all 175 cases pass both ways, 0 fail, 0 pending
+      traces; all 176 cases pass both ways, 0 fail, 0 pending
 - [x] macros through the JIT: one macro-time module per `defmacro`,
       `gensym` and reflection through hooks into the expander;
       `tests/macros.rs` shows the expansions equal `fibref`'s on every
@@ -147,14 +147,13 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       cases 174 to 176 beside the earlier async cases)
 - [x] `(Weak (dyn P))` (compiler.md §8 item 10, cases 87 and 110)
 - [x] the native `Show` and `Hash` instances on scalars, field-less
-      enums and `str` (case 169), except `show` of a float and of a
-      `str`, whose text is undecided (compiler.md §8 item 11)
+      enums and `str` (cases 169 and 178; the texts decided in types
+      §2.12, compiler.md §8 item 11)
 - [x] `def` initialisers through the JIT (compiler.md §8 item 4;
       `defs/jit.rs`, with the interpreter backend kept as the
       executable spec of the same constants, `tests/defs.rs`)
 - [x] a `(dyn P)` of a native instance: the vtable slot is a function
-      around the native method (case 177, `(dyn Hash "abc")`); `show`
-      through it waits on item 11 like every `show` of a `str`
+      around the native method (case 177, `(dyn Hash "abc")`)
 - [x] generated programs through the harness: `fibc gen` writes each
       program `fibgen` generates as a case whose header is the model's
       verdict and runs it both ways (`tests/gen.rs`: the first 120
@@ -169,7 +168,8 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       a CPU hog, and their AOT executables, all passed. Not reproduced,
       not understood, not closed; `fibc gen` keeps any program that
       fails, so a long sweep is the way to catch it again
-- [ ] the owner's answers to compiler.md §8
+- [x] the owner's answers to compiler.md §8 (2026-09-30: every item
+      decided, the page **Decided**)
 
 ## M5. A library a compiler can live on
 

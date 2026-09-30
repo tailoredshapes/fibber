@@ -215,3 +215,9 @@ Case 177 pins a `dyn` over a native instance (types §2.12, §8.5): a
 `(dyn Hash)` over a `str` beside one over a struct, in one vector; the
 str's slot is a function the compiler emits around the native method
 (177, -680: the FNV-1a of "abc" folded by `rem`, plus 5).
+
+Case 178 pins the texts of `show` on floats and on `str` (types
+§2.12, Decided 2026-09-30): a `str` shows as itself, unquoted; a float
+as the shortest decimal that reads back at its width, positional,
+with `.0` when integral, and `NaN`, `inf`, `-inf`; eleven texts each
+checked against the expected one, their lengths summed (178, 75).

@@ -1,6 +1,6 @@
 # fibc: the compiler
 
-**Proposed** (2026-09-28, M4). What this page fixes is everything the
+**Decided** (owner, 2026-09-30; proposed 2026-09-28, M4). What this page fixes is everything the
 compiler needs that types.md §8 does not already fix: the command
 line, how a program is assembled into lIR modules, the runtime
 module's ABI and its trace mode, the canonical free trace and how it
@@ -227,9 +227,11 @@ specialisation to the instance of the key's full type. Bodies are
 emitted on demand from `main` (and from every `(dyn P e)` vtable
 reached), each key once.
 
-## 8. Open questions for the owner
+## 8. Questions for the owner, and their answers
 
-Recorded as they arise; none changes §8.
+Recorded as they arose; none changes §8. Every item was decided by
+the owner on 2026-09-30, the undated ones by accepting the design
+as described.
 
 1. Trace mode stores a stack object's ordinal in its `count` word
    (§4). The alternative, a per-thread side stack in the runtime, needs
@@ -313,27 +315,21 @@ Recorded as they arise; none changes §8.
     `option_value` with heap placement (eval/cells.rs), and `fibc`
     emits the same two allocations (`lower/cells.rs`). A weak
     reference to any other object type still allocates nothing.
-11. **The text of `show` on a float and on a `str` is undecided.** The
-    interpreter prints a float with Rust's `{:?}` (the shortest text
-    that reads back to the same value, `1.0`, `1e21`, `NaN`, `inf`)
-    and a `str` with Rust's `{:?}` (quoted, with Rust's escapes and
-    `\u{..}` for what Rust deems unprintable). Neither is a rule of
-    types §2.12, and neither can be reproduced in the runtime without
-    a decision on the exact text (a float printer of the shortest
-    round-trip kind; the set of characters a `str` escapes). `fibc`
-    reports both as unsupported; every other native `Show` and `Hash`
-    is lowered (`lower/show.rs`, `rt/str.lir`; case 169). Proposed:
-    §2.12 fixes `show` of a float as the shortest round-trip decimal
-    with a `.0` for an integral value and `NaN`, `inf`, `-inf`, and
-    `show` of a `str` as the string itself, unquoted.
-12. **A threaded run that traps has no comparable trace** (§4). Found
-    by `fibc gen` (fibgen seed 162, size 6): the interpreter's threads
-    had allocated 38 objects when one trapped, the OS's 34, and the
-    tally rule requires the compiled run to have allocated at least as
-    many. At an abort the other threads are mid-flight on both sides
-    under different schedules, so neither the live tally nor the
-    allocation counts are determined. The harness now compares only
-    the message and the exit status for a trap when either side spawned
-    a thread; is that acceptable, or should a threaded trap be judged
-    on the trace of the trapping thread alone, which would need the
-    thread named in both traces (item 2)?
+11. **The text of `show` on a float and on a `str`** (**Decided**,
+    owner, 2026-09-30; types §2.12; case 178): a `str` shows as itself,
+    unquoted; a float as the shortest decimal that reads back at its
+    width, positional, with `.0` when integral, and `NaN`, `inf`,
+    `-inf`. The interpreter printed both with Rust's `{:?}`, which the
+    runtime could not reproduce; it now follows §2.12 (eval/arith.rs
+    `float_text`), and the runtime finds the shortest digits by trying
+    `%.*e` from 0 up until `strtod` (or `strtof`) reads the value back
+    (`rt/str.lir` `fib.show-fp`).
+12. **A threaded run that traps has no comparable trace** (**Decided**,
+    owner, 2026-09-30; §4). Found by `fibc gen` (fibgen seed 162, size
+    6): the interpreter's threads had allocated 38 objects when one
+    trapped, the OS's 34, and the tally rule requires the compiled run
+    to have allocated at least as many. At an abort the other threads
+    are mid-flight on both sides under different schedules, so neither
+    the live tally nor the allocation counts are determined. The
+    harness compares only the message and the exit status for a trap
+    when either side spawned a thread.
