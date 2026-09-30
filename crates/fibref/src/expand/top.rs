@@ -49,6 +49,11 @@ fn definition(ex: &mut Expander, form: Form, first: bool) -> Result<Form, Expand
         }
     }
     let out = definition_of(ex, form, first)?;
+    if kind == "defmacro" && marker.is_some() {
+        if let Some(name) = out.as_list().and_then(|i| i.get(1)).and_then(Form::as_sym) {
+            ex.ctx.make_macro_private(name);
+        }
+    }
     Ok(match marker {
         Some(m) => put_marker(out, at, m),
         None => out,
@@ -204,12 +209,15 @@ fn defmacro(ex: &mut Expander, form: Form) -> Result<Form, ExpandError> {
     let body = form.as_list().map(|i| i[3..].to_vec()).unwrap_or_default();
     let pos = form.pos.clone();
     let def = MacroDef {
-        name: name.clone(),
+        name,
+        ns: String::new(),
+        key: String::new(),
+        private: false,
         params,
         rest,
         body,
         pos,
     };
-    ex.ctx.macros.insert(name, def);
+    ex.ctx.define_macro(def);
     Ok(form)
 }

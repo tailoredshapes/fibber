@@ -17,8 +17,7 @@ compiled with matching results and free traces (method.md rule 6).
   §3.20), beside a public function of the same module (83).
 - 004: two modules requiring a third: it is one module, its struct one
   type, its `def` one value (7).
-
-What the reference implementation does not enforce yet: macros are
-visible across the modules loaded together unqualified (the expander
-keeps one table), which is wider than a `:use` alone gives, and a
-macro cannot be named through an alias.
+- 005: macros through a `:use` unqualified and through an alias, two
+  modules' macros of one name told apart (40).
+- 006: a `:private` macro is not reached through an alias (reject:
+  `unbound name u/hidden`).

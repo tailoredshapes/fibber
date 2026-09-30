@@ -201,8 +201,8 @@ interpreted and compiled:
       `:use`, modules found under the main file's directory and read
       once each in dependency order, private names and `var` across
       modules, in both tools (`crates/fibref/src/modules.rs`;
-      `cases/modules`, 4 programs both harnesses run). Not yet: macro
-      visibility limited to `:use`, and macros through an alias
+      `cases/modules`, 6 programs both harnesses run), macros included:
+      reached through `:use` and aliases, `:private` ones at home
 
 ## M6. Bootstrap
 

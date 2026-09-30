@@ -1504,10 +1504,10 @@ file's directory, `a.b` at `a/b.fib`, once each in dependency order
 (M5; `cases/modules`), and checks every rule above between them and
 with the prelude: a reference to a private definition, unqualified or
 qualified, reflection on a private type, and `(var m/x)` (cases 113 to
-116 for the prelude, cases/modules for other modules). Requires may
-not be cyclic. Not enforced yet: macros are visible across the modules
-loaded together unqualified, wider than a `:use` gives, and a macro
-cannot be named through an alias.
+116 for the prelude, cases/modules for other modules), macros
+included: a module's macros reach the modules that `:use` it
+unqualified and the ones that `:require` it through the alias, and a
+`:private` macro its own module only. Requires may not be cyclic.
 `fib.prelude` is implicitly `:use`d. Protocol implementations are global
 facts and are always visible once their module is required.
 

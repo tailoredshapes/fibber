@@ -52,11 +52,11 @@ mod runner {
 
         /// The module of macro `m`, compiled on first use.
         fn module(&mut self, m: &MacroDef) -> Result<Fns, ExpandErrorKind> {
-            if let Some(r) = self.modules.get(&m.name) {
+            if let Some(r) = self.modules.get(&m.key) {
                 return r.clone();
             }
             let r = self.build(m);
-            self.modules.insert(m.name.clone(), r.clone());
+            self.modules.insert(m.key.clone(), r.clone());
             r
         }
 

@@ -174,7 +174,7 @@ fn the_module_cases_all_pass_in_the_interpreter() {
         .iter()
         .map(|r| format!("{} {}", r.name(), r.status.label()))
         .collect();
-    assert!(report.counts.total() >= 4, "{rows:?}");
+    assert!(report.counts.total() >= 6, "{rows:?}");
     assert!(report.ok() && report.counts.pending == 0, "{rows:?}");
     assert!(
         rows[0].starts_with("001-require-alias-and-use/main.fib"),

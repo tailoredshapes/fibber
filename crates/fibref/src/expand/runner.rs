@@ -13,6 +13,12 @@ use super::error::{ExpandError, ExpandErrorKind};
 pub struct MacroDef {
     /// The macro's name.
     pub name: String,
+    /// The `ns` of the module that defines it (syntax §5).
+    pub ns: String,
+    /// `ns/name`: what tells two modules' macros of one name apart.
+    pub key: String,
+    /// `:private`: visible in its own module only.
+    pub private: bool,
     /// The fixed parameters, each bound to one argument `Form`.
     pub params: Vec<String>,
     /// The rest parameter after `...`, bound to the remaining arguments

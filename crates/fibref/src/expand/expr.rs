@@ -56,7 +56,7 @@ impl<'a> Expander<'a> {
             FormKind::List(items) => items.into_iter().skip(1).collect(),
             _ => Vec::new(),
         };
-        let Some(def) = self.ctx.macros.get(name) else {
+        let Some(def) = self.ctx.macro_def(name) else {
             return Err(malformed(name, "not a macro", &pos));
         };
         if !def.accepts(args.len()) {
@@ -87,7 +87,7 @@ pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, Exp
         if name == "quasiquote" {
             ex.ctx.step(&pos)?;
             form = quasi::rewrite(form)?;
-        } else if ex.ctx.macros.contains_key(&name) {
+        } else if ex.ctx.macro_def(&name).is_some() {
             ex.ctx.step(&pos)?;
             form = ex.run_user(&name, form)?;
         } else if prelude::is_macro(&name) {

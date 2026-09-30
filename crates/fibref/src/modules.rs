@@ -1,9 +1,9 @@
 //! Modules (syntax §5): a program is the file given and the modules its
 //! `ns` clauses `:require` or `:use`, found under that file's directory
 //! (`a.b` at `a/b.fib`), read once each in dependency order, the main
-//! module last. Macros are visible across the modules loaded together
-//! unqualified (the expander keeps one table), which is wider than §5's
-//! `:use` alone gives; qualifying a macro by an alias is not supported.
+//! module last. A module's macros reach the modules that `:use` it
+//! unqualified and the ones that `:require` it through the alias, a
+//! `:private` macro its own module only (`ExpandCtx::macro_def`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -194,6 +194,13 @@ pub fn expand_all(
 ) -> Result<Vec<(ModuleSpec, Vec<Form>)>, ExpandError> {
     let mut out = Vec::with_capacity(loaded.len());
     for l in loaded {
+        let aliases = l
+            .spec
+            .requires
+            .iter()
+            .map(|(alias, ns)| (alias.clone(), ns.clone()))
+            .collect();
+        ctx.begin_module(&l.spec.ns, &l.spec.uses, aliases);
         let forms = expand_program(l.forms, ctx, runner)?;
         ctx.end_module();
         out.push((l.spec, forms));

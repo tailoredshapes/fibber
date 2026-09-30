@@ -75,13 +75,35 @@ pub struct ExpandCtx {
     /// the macro's threads share it (one at a time: the evaluator's
     /// turn orders them, so the count is deterministic).
     gensyms: AtomicU64,
+    /// Every user macro, by `ns/name`.
     pub(crate) macros: HashMap<String, MacroDef>,
+    /// The module being expanded: which macros a name reaches.
+    pub(crate) scope: ModuleScope,
     pub(crate) types: TypeTable,
     pub(crate) call_pos: Pos,
     pub(crate) steps: usize,
     /// Forms produced by expansions so far, against
     /// [`Limits::max_forms`]; reset with `steps`.
     pub(crate) forms: usize,
+}
+
+/// The module being expanded, for macro lookup (syntax §5): its `ns`,
+/// the modules it `:use`s and its `:require` aliases.
+#[derive(Clone, Debug)]
+pub struct ModuleScope {
+    pub ns: String,
+    pub uses: Vec<String>,
+    pub aliases: HashMap<String, String>,
+}
+
+impl ModuleScope {
+    fn of(ns: &str) -> ModuleScope {
+        ModuleScope {
+            ns: ns.to_string(),
+            uses: Vec::new(),
+            aliases: HashMap::new(),
+        }
+    }
 }
 
 impl Default for ExpandCtx {
@@ -98,6 +120,7 @@ impl ExpandCtx {
             limits: Limits::default(),
             gensyms: AtomicU64::new(0),
             macros: HashMap::new(),
+            scope: ModuleScope::of(super::PRELUDE_NS),
             types: TypeTable::with_builtins(),
             call_pos: Pos {
                 file: Arc::from("<none>"),
@@ -130,9 +153,56 @@ impl ExpandCtx {
         &self.call_pos
     }
 
-    /// A user macro defined so far, by name.
+    /// The user macro `name` reaches from the module being expanded
+    /// (syntax §5): `alias/x` in the module the alias names, or by the
+    /// full `ns` of the prelude or of this module; a bare name in this
+    /// module, then in its `:use`s, then in the prelude; a `:private`
+    /// macro only in its own module.
     pub fn macro_def(&self, name: &str) -> Option<&MacroDef> {
-        self.macros.get(name)
+        let scope = &self.scope;
+        let visible = |def: &MacroDef| !def.private || def.ns == scope.ns;
+        if let Some((q, base)) = name.split_once('/') {
+            let ns = match scope.aliases.get(q) {
+                Some(ns) => ns.as_str(),
+                None if q == super::PRELUDE_NS || q == scope.ns => q,
+                None => return None,
+            };
+            return self
+                .macros
+                .get(&format!("{ns}/{base}"))
+                .filter(|d| visible(d));
+        }
+        std::iter::once(scope.ns.as_str())
+            .chain(scope.uses.iter().map(String::as_str))
+            .chain(std::iter::once(super::PRELUDE_NS))
+            .find_map(|ns| {
+                self.macros
+                    .get(&format!("{ns}/{name}"))
+                    .filter(|d| visible(d))
+            })
+    }
+
+    /// Starts expanding module `ns` with these `:use`s and aliases.
+    pub fn begin_module(&mut self, ns: &str, uses: &[String], aliases: HashMap<String, String>) {
+        self.scope = ModuleScope {
+            ns: ns.to_string(),
+            uses: uses.to_vec(),
+            aliases,
+        };
+    }
+
+    /// Defines macro `def` in the module being expanded.
+    pub(crate) fn define_macro(&mut self, mut def: MacroDef) {
+        def.ns = self.scope.ns.clone();
+        def.key = format!("{}/{}", self.scope.ns, def.name);
+        self.macros.insert(def.key.clone(), def);
+    }
+
+    /// Makes the macro `name` of the module being expanded `:private`.
+    pub(crate) fn make_macro_private(&mut self, name: &str) {
+        if let Some(def) = self.macros.get_mut(&format!("{}/{name}", self.scope.ns)) {
+            def.private = true;
+        }
     }
 
     /// A struct seen so far, by name; not a private one of an earlier
@@ -158,6 +228,9 @@ impl ExpandCtx {
     /// after it (syntax §5).
     pub fn end_module(&mut self) {
         self.types.end_module();
+        // Until `begin_module` says otherwise, what follows is a
+        // program with no `ns` clauses.
+        self.scope = ModuleScope::of("main");
     }
 
     /// Counts one macro expansion against [`Limits::max_steps`].
