@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use fibref::cases::{render, run_dir, Outcome};
-use fibref::eval::{run_source, Interpreter};
+use fibref::eval::{run_source_with, Interpreter};
 
 const USAGE: &str = "usage: fibref <command>
 
@@ -36,7 +36,7 @@ enum Command {
     /// Print the ownership decisions for a file.
     Explain { file: String },
     /// Run a file's `main`.
-    Run { file: String },
+    Run { file: String, args: Vec<String> },
     /// Print usage and exit successfully.
     Help,
     /// Print usage and exit with an error: the arguments made no sense.
@@ -51,7 +51,14 @@ fn parse(args: &[String]) -> Command {
         },
         [cmd, dir] if cmd == "cases" => Command::Cases { dir: dir.clone() },
         [cmd, file] if cmd == "explain" => Command::Explain { file: file.clone() },
-        [cmd, file] if cmd == "run" => Command::Run { file: file.clone() },
+        [cmd, file] if cmd == "run" => Command::Run {
+            file: file.clone(),
+            args: Vec::new(),
+        },
+        [cmd, file, dashes, rest @ ..] if cmd == "run" && dashes == "--" => Command::Run {
+            file: file.clone(),
+            args: rest.to_vec(),
+        },
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
         _ => Command::Invalid,
     }
@@ -112,7 +119,7 @@ fn run_explain(file: &str) -> ExitCode {
 /// Runs `file` through the whole pipeline and prints `main`'s result and
 /// the audit: exit 0 if it ran (whatever the audit says, which is
 /// printed), 1 if it was rejected or its run failed, 2 if unreadable.
-fn run_file(file: &str) -> ExitCode {
+fn run_file(file: &str, args: &[String]) -> ExitCode {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -120,7 +127,7 @@ fn run_file(file: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (text, code) = match run_source(&source, file) {
+    let (text, code) = match run_source_with(&source, file, args) {
         Outcome::Compiled { result, audit } => (
             format!("result: {result}\naudit:  {audit}\n"),
             ExitCode::SUCCESS,
@@ -157,7 +164,7 @@ fn main() -> ExitCode {
     match parse(&args) {
         Command::Cases { dir } => run_cases(&dir),
         Command::Explain { file } => run_explain(&file),
-        Command::Run { file } => run_file(&file),
+        Command::Run { file, args } => run_file(&file, &args),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -218,7 +225,15 @@ mod tests {
         assert_eq!(
             parse(&args(&["run", "a.fib"])),
             Command::Run {
-                file: "a.fib".to_string()
+                file: "a.fib".to_string(),
+                args: Vec::new()
+            }
+        );
+        assert_eq!(
+            parse(&args(&["run", "a.fib", "--", "x"])),
+            Command::Run {
+                file: "a.fib".to_string(),
+                args: vec!["x".to_string()]
             }
         );
         assert_eq!(parse(&args(&["run"])), Command::Invalid);

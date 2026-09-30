@@ -27,10 +27,34 @@ const RUNTIME: &[&str] = &[
     include_str!("../rt/thread.lir"),
     include_str!("../rt/task.lir"),
     include_str!("../rt/weak.lir"),
+    include_str!("../rt/io.lir"),
 ];
 
-/// The lIR text of a whole program: runtime, static data, bodies.
+/// The runtime's own `declare` of the C function `name`, if any:
+/// a program's `extern` of the same name must agree with it and is
+/// then not declared again.
+pub(crate) fn runtime_declaration(name: &str) -> Option<String> {
+    let head = format!("(declare {name} ");
+    RUNTIME
+        .iter()
+        .flat_map(|part| part.lines())
+        .find(|l| l.starts_with(&head))
+        .map(str::to_string)
+}
+
+/// The lIR text of a whole program for `fibc run`: runtime, static
+/// data, bodies, and a `main` that prints the result.
 pub fn compile(checked: &Checked) -> Result<String, Unsupported> {
+    compile_kind(checked, false)
+}
+
+/// The same for an executable, whose `main` returns the result as
+/// the process status and prints nothing (compiler.md §1).
+pub fn compile_executable(checked: &Checked) -> Result<String, Unsupported> {
+    compile_kind(checked, true)
+}
+
+fn compile_kind(checked: &Checked, executable: bool) -> Result<String, Unsupported> {
     let main = checked
         .typed
         .fun("main")
@@ -40,7 +64,7 @@ pub fn compile(checked: &Checked) -> Result<String, Unsupported> {
     p.def_values = defs.values;
     let entry = p.request(BodyKey::Fun(main), Vec::new());
     emit_all(&mut p)?;
-    Ok(assemble(&mut p, &defs.text, &entry))
+    Ok(assemble(&mut p, &defs.text, &entry, executable))
 }
 
 /// Emits every body and closure queued so far.
@@ -157,21 +181,26 @@ pub(crate) fn assemble_parts(p: &mut Program<'_>, defs: &str) -> String {
     out
 }
 
-fn assemble(p: &mut Program<'_>, defs: &str, entry: &str) -> String {
+fn assemble(p: &mut Program<'_>, defs: &str, entry: &str, executable: bool) -> String {
     let mut out = assemble_parts(p, defs);
     let _ = LirTy::I64;
     // §8.8: main's return joins every thread still running before
-    // the result is returned to the OS.
+    // the result is printed (fibc run) or returned (an executable).
+    let end = if executable {
+        "(ret (trunc i32 r))"
+    } else {
+        "(call @printf (string \"%lld\\n\") r)\n      (ret (i32 0))"
+    };
     let _ = write!(
         out,
         "(declare printf i32 (ptr ...))
-(define (main i32) ()
+(define (main i32) ((i32 argc) (ptr argv))
   (block entry
     (call @fib.init)
+    (call @fib.set-args argc argv)
     (let ((r (call @{entry})))
       (call @fib.join-all)
-      (call @printf (string \"%lld\\n\") r)
-      (ret (i32 0)))))
+      {end})))
 "
     );
     out

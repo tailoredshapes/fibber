@@ -11,7 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use fibc::compile::compile;
+use fibc::compile::{compile, compile_executable};
 use fibc::front::{check, Front};
 use fibc::harness::child::{EXIT_COMPILE_FAILED, EXIT_REJECTED, EXIT_UNSUPPORTED};
 use fibc::harness::gen::GenConfig;
@@ -25,7 +25,9 @@ use lair::{Jit, JitOptions};
 const USAGE: &str = "usage: fibc <command>
 
 commands:
-  run [--trace] <file>   compile file through the JIT and run its main
+  run [--trace] <file> [-- arg..]
+                         compile file through the JIT and run its main; the
+                         args after -- are (args)
   build <file> -o <out>  compile file to an executable
   emit <file>            print the lIR module of file
   explain <file>         print the ownership checker's decisions (types §9)
@@ -45,12 +47,27 @@ const DEFAULT_CASES_DIR: &str = "cases/ownership";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Run { file: String, trace: bool },
-    Build { file: String, out: String },
-    Emit { file: String },
-    Explain { file: String },
-    Itrace { file: String },
-    Cases { dir: String },
+    Run {
+        file: String,
+        trace: bool,
+        args: Vec<String>,
+    },
+    Build {
+        file: String,
+        out: String,
+    },
+    Emit {
+        file: String,
+    },
+    Explain {
+        file: String,
+    },
+    Itrace {
+        file: String,
+    },
+    Cases {
+        dir: String,
+    },
     Gen(GenConfig),
     Help,
     Invalid,
@@ -95,10 +112,22 @@ fn parse(args: &[String]) -> Command {
         ["run", file] => Command::Run {
             file: file.to_string(),
             trace: false,
+            args: Vec::new(),
         },
         ["run", "--trace", file] => Command::Run {
             file: file.to_string(),
             trace: true,
+            args: Vec::new(),
+        },
+        ["run", file, "--", rest @ ..] => Command::Run {
+            file: file.to_string(),
+            trace: false,
+            args: rest.iter().map(|s| s.to_string()).collect(),
+        },
+        ["run", "--trace", file, "--", rest @ ..] => Command::Run {
+            file: file.to_string(),
+            trace: true,
+            args: rest.iter().map(|s| s.to_string()).collect(),
         },
         ["build", file, "-o", out] => Command::Build {
             file: file.to_string(),
@@ -135,6 +164,11 @@ fn read(file: &str) -> Result<String, ExitCode> {
 /// The front end and the lowering: the lIR text, or the exit code that
 /// says why not (its message already printed).
 fn lower(file: &str) -> Result<String, ExitCode> {
+    lower_kind(file, false)
+}
+
+/// [`lower`], for an executable when `executable` (compiler.md §1).
+fn lower_kind(file: &str, executable: bool) -> Result<String, ExitCode> {
     let source = read(file)?;
     let checked = match check(&source, file) {
         Front::Checked(c) => c,
@@ -147,7 +181,12 @@ fn lower(file: &str) -> Result<String, ExitCode> {
             return Err(ExitCode::from(EXIT_COMPILE_FAILED as u8));
         }
     };
-    compile(&checked).map_err(|u| {
+    let lowered = if executable {
+        compile_executable(&checked)
+    } else {
+        compile(&checked)
+    };
+    lowered.map_err(|u| {
         eprintln!("unsupported: {}", u.0);
         ExitCode::from(EXIT_UNSUPPORTED as u8)
     })
@@ -160,7 +199,7 @@ fn no_llvm(what: &str) -> ExitCode {
 }
 
 #[cfg(not(feature = "llvm"))]
-fn run(_file: &str, _trace: bool) -> ExitCode {
+fn run(_file: &str, _trace: bool, _args: &[String]) -> ExitCode {
     no_llvm("run")
 }
 
@@ -236,7 +275,7 @@ fn gen(cfg: GenConfig) -> ExitCode {
 }
 
 #[cfg(feature = "llvm")]
-fn run(file: &str, trace: bool) -> ExitCode {
+fn run(file: &str, trace: bool, args: &[String]) -> ExitCode {
     let lir = match lower(file) {
         Ok(l) => l,
         Err(code) => return code,
@@ -259,11 +298,18 @@ fn run(file: &str, trace: bool) -> ExitCode {
     if let Err(e) = jit.add_module(file, &module) {
         return fail(e);
     }
-    // SAFETY: `for_executable` fixed main's type to (main i32) with no
-    // parameters (spec/lir.md §7.2); the JIT outlives the call.
+    // The command line main receives: the file, then the arguments.
+    let argv: Vec<std::ffi::CString> = std::iter::once(file)
+        .chain(args.iter().map(String::as_str))
+        .map(|a| std::ffi::CString::new(a).unwrap_or_default())
+        .collect();
+    let ptrs: Vec<*const std::ffi::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    // SAFETY: `compile` defined main as (main i32) ((i32 argc) (ptr
+    // argv)) (spec/lir.md §7.2), argv holds argc valid C strings that
+    // outlive the call, and the JIT outlives it too.
     let code = unsafe {
-        match jit.function::<extern "C" fn() -> i32>("main") {
-            Ok(f) => f(),
+        match jit.function::<extern "C" fn(i32, *const *const std::ffi::c_char) -> i32>("main") {
+            Ok(f) => f(ptrs.len() as i32, ptrs.as_ptr()),
             Err(e) => return fail(e),
         }
     };
@@ -272,7 +318,7 @@ fn run(file: &str, trace: bool) -> ExitCode {
 
 #[cfg(feature = "llvm")]
 fn build(file: &str, out: &str) -> ExitCode {
-    let lir = match lower(file) {
+    let lir = match lower_kind(file, true) {
         Ok(l) => l,
         Err(code) => return code,
     };
@@ -374,7 +420,7 @@ fn write_stdout(text: &str) -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse(&args) {
-        Command::Run { file, trace } => run(&file, trace),
+        Command::Run { file, trace, args } => run(&file, trace, &args),
         Command::Build { file, out } => build(&file, &out),
         Command::Emit { file } => emit(&file),
         Command::Explain { file } => explain(&file),
@@ -406,7 +452,16 @@ mod tests {
             parse(&args(&["run", "--trace", "a.fib"])),
             Command::Run {
                 file: "a.fib".into(),
-                trace: true
+                trace: true,
+                args: Vec::new()
+            }
+        );
+        assert_eq!(
+            parse(&args(&["run", "a.fib", "--", "x", "y"])),
+            Command::Run {
+                file: "a.fib".into(),
+                trace: false,
+                args: vec!["x".into(), "y".into()]
             }
         );
         assert_eq!(

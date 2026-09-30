@@ -78,6 +78,8 @@ pub struct World<'p> {
     pub weak_boxes: FxMap<ObjId, ObjId>,
     /// The executor's scheduler (`sched`, `threads`).
     pub sched: Sched<'p>,
+    /// The program's command-line arguments, for `(args)` (syntax §4.3).
+    pub args: Vec<String>,
 }
 
 impl<'p> World<'p> {
@@ -103,6 +105,7 @@ impl<'p> World<'p> {
             recording_inputs: false,
             weak_boxes: FxMap::default(),
             sched: Sched::default(),
+            args: Vec::new(),
         }
     }
 }

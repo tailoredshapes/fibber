@@ -83,7 +83,17 @@ fn interpret(o: &Output) -> Said {
             .map(|(_, rest)| rest.trim().to_string())
     };
     match o.status {
-        0 => match o.stdout.trim().parse::<i64>() {
+        // The result is the last line; the program's own output (println)
+        // comes before it (compiler.md §1).
+        0 => match o
+            .stdout
+            .trim()
+            .lines()
+            .last()
+            .map(str::trim)
+            .unwrap_or("")
+            .parse::<i64>()
+        {
             Ok(n) => Said::Result(n),
             Err(_) => Said::Failed(format!(
                 "exit 0 but no result on standard output: {:?}",
@@ -180,6 +190,7 @@ mod tests {
     #[test]
     fn reads_each_kind_of_answer() {
         assert_eq!(interpret(&out(0, "42\n", "A 1 o\n")), Said::Result(42));
+        assert_eq!(interpret(&out(0, "hello\nworld\n7\n", "")), Said::Result(7));
         assert_eq!(
             interpret(&out(EXIT_REJECTED, "", "rejected:\nt:1:2: bad\n")),
             Said::Rejected("t:1:2: bad".into())

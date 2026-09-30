@@ -191,8 +191,8 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("168-swap-contention-between-threads.fib"),
         "{out}"
     );
-    assert!(out.contains("182 cases:"), "{out}");
-    assert!(out.contains("182 pass, 0 fail, 0 pending"), "{out}");
+    assert!(out.contains("184 cases:"), "{out}");
+    assert!(out.contains("184 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 
@@ -228,4 +228,20 @@ fn table_lists_cases_in_file_name_order() {
     let b = out.find("02-b.fib").unwrap();
     let c = out.find("03-c.fib").unwrap();
     assert!(a < b && b < c, "{out}");
+}
+
+#[test]
+fn run_hands_the_arguments_after_the_dashes_to_args() {
+    let out = fibref(
+        &[
+            "run",
+            "cases/ownership/186-args-and-println.fib",
+            "--",
+            "p",
+            "q",
+        ],
+        Path::new(REPO_ROOT),
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("result: 2"), "{}", stdout(&out));
 }

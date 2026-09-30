@@ -1,0 +1,84 @@
+;; fib.rt, the program's surroundings (syntax §4.3, M5): the command
+;; line main received, and whole files as strings through the C
+;; library's stdio; the interpreter's eval/io.rs gives the same results.
+(declare fopen ptr (ptr ptr))
+(declare fclose i32 (ptr))
+(declare fread i64 (ptr i64 i64 ptr))
+(declare fwrite i64 (ptr i64 i64 ptr))
+(declare fseek i32 (ptr i64 i32))
+(declare ftell i64 (ptr))
+(global internal fib.argc i32 (i32 0))
+(global internal fib.argv ptr (ptr null))
+
+;; From main: the command line, whose arguments after the program are
+;; (args).
+(define internal (fib.set-args void) ((i32 argc) (ptr argv))
+  (block entry
+    (store argc @fib.argc)
+    (store argv @fib.argv)
+    (ret)))
+
+(define internal (fib.args-count i64) ()
+  (block entry
+    (let ((n (sext i64 (load i32 @fib.argc))))
+      (ret (select (icmp slt n (i64 1)) (i64 0) (sub n (i64 1)))))))
+
+;; Fills buf with a fresh str (count 1) per argument after the program.
+(define internal (fib.args-fill void) ((ptr buf))
+  (block entry
+    (let ((n (call @fib.args-count)))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (next i2))))
+      (br (icmp slt i n) one done)))
+  (block one
+    (let ((c (load ptr (getelementptr ptr (load ptr @fib.argv) (add i (i64 1)))))
+          (s (call @fib.str-from-bytes c (call @strlen c))))
+      (store s (getelementptr ptr buf i))
+      (br next)))
+  (block next (let ((i2 (add i (i64 1)))) (br loop)))
+  (block done (ret)))
+
+;; Releases the strs the builder copied out of buf (its own counts).
+(define internal (fib.args-release void) ((ptr buf) (i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (next i2))))
+      (br (icmp slt i n) one done)))
+  (block one (call @fib.release (load ptr (getelementptr ptr buf i))) (br next))
+  (block next (let ((i2 (add i (i64 1)))) (br loop)))
+  (block done (ret)))
+
+;; (read-file path): the whole file as a str, or null when it cannot
+;; be opened or read, or is not UTF-8.
+(define internal (fib.read-file ptr) ((ptr path))
+  (block entry
+    (let ((f (call @fopen (call @fib.str-bytes-ptr path) (string "rb"))))
+      (br (icmp eq f (ptr null)) none opened)))
+  (block none (ret (ptr null)))
+  (block opened
+    (call @fseek f (i64 0) (i32 2))
+    (let ((n (call @ftell f)))
+      (call @fseek f (i64 0) (i32 0))
+      (br (icmp slt n (i64 0)) fail read)))
+  (block fail (call @fclose f) (ret (ptr null)))
+  (block read
+    (let ((s (call @fib.str-new n))
+          (p (call @fib.str-bytes-ptr s))
+          (got (call @fread p (i64 1) n f)))
+      (call @fclose f)
+      (br (and (icmp eq got n) (call @fib.utf8-valid p n)) ok bad)))
+  (block ok (ret s))
+  (block bad (call @fib.release s) (ret (ptr null))))
+
+;; (write-file path text): whether the whole text was written.
+(define internal (fib.write-file i1) ((ptr path) (ptr text))
+  (block entry
+    (let ((f (call @fopen (call @fib.str-bytes-ptr path) (string "wb"))))
+      (br (icmp eq f (ptr null)) no opened)))
+  (block no (ret (i1 0)))
+  (block opened
+    (let ((n (call @fib.str-len text))
+          (w (call @fwrite (call @fib.str-bytes-ptr text) (i64 1) n f))
+          (c (call @fclose f)))
+      (ret (and (icmp eq w n) (icmp eq c (i32 0)))))))

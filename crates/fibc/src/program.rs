@@ -239,6 +239,15 @@ impl<'a> Program<'a> {
         }
         let r = lir_ty(g, ret)?.map_or("void", LirTy::text);
         let decl = format!("(declare {} {r} ({}))\n", d.name, ps.join(" "));
+        if let Some(own) = crate::compile::runtime_declaration(&d.name) {
+            if own.trim() != decl.trim() {
+                return Err(Unsupported(format!(
+                    "extern {} conflicts with the runtime's {own}",
+                    d.name
+                )));
+            }
+            return Ok(());
+        }
         if !self.externs.contains(&decl) {
             self.externs.push(decl);
         }

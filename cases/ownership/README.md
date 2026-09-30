@@ -238,3 +238,10 @@ three- and four-byte characters, `char->str` encoding them back, and
 `str-from-bytes` as the inverse of `str-bytes`, every text checked
 (183, 129495); and `str-from-bytes` of bytes that are no UTF-8, a trap
 with the same message on both sides (184).
+
+Cases 185 and 186 pin the program's surroundings (M5; syntax §4.3,
+§4.5): `write-file` and `read-file` round-tripping a text under /tmp,
+`nil` for a path that cannot be read and `false` for one that cannot
+be written (185, 124); and `(args)`, none under the harness so their
+count is 0, after a `println` that the harness's compiled side reads
+past (186, 0; `fibc run FILE -- a b` gives 2, `crates/fibc/tests/cli.rs`).

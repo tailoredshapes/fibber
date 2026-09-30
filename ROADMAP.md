@@ -31,7 +31,7 @@ Decisions taken on the way are in spec/types.md §10.
 - [x] evaluator following the checker's plan (`fibref run`), with
       threads, atoms and an async executor that is deterministic and
       fair (types §8.8, "The reference interpreter's schedule")
-- [x] case harness and CI: 182 cases in cases/ownership, all passing
+- [x] case harness and CI: 184 cases in cases/ownership, all passing
       with a clean audit (its README lists them by origin: the 20
       decided, the promoted proposals, the rule-4 adversary's findings
       81 to 95, the rule-5 generator's, and the owner's decisions of
@@ -136,7 +136,7 @@ State (spec/compiler.md, **Decided**, owner, 2026-09-30; `crates/fibc`):
       compiler.md §4
 - [x] method rule 6 harness: `fibc cases` runs every case interpreted
       and compiled and compares results, rejections, traps and free
-      traces; all 182 cases pass both ways, 0 fail, 0 pending
+      traces; all 184 cases pass both ways, 0 fail, 0 pending
 - [x] macros through the JIT: one macro-time module per `defmacro`,
       `gensym` and reflection through hooks into the expander;
       `tests/macros.rs` shows the expansions equal `fibref`'s on every
@@ -191,7 +191,12 @@ interpreted and compiled:
       UTF-8) beside the builtins that were there (`str-slice`, `str-eq`,
       `Ord`, `Hash`), and in the prelude `str-join` (one allocation for
       a vector of parts), `str-chars`, `char->str` (cases 183 and 184)
-- [ ] file I/O, command-line arguments, exit codes, stderr diagnostics
+- [x] file I/O, command-line arguments, exit codes, stderr
+      diagnostics: `read-file`, `write-file` and `args` as builtins,
+      `println` beside `eprintln`; `fibc run FILE -- a b` and `fibref run
+      FILE -- a b` hand the arguments on, and a built executable returns
+      `main`'s result as its exit status and prints nothing of its own
+      (compiler.md §1; cases 185 and 186, `crates/fibc/tests/cli.rs`)
 - [ ] multiple modules (§5 of syntax.md beyond one module plus the
       prelude)
 

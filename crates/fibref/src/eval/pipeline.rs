@@ -37,13 +37,18 @@ impl Evaluator for Interpreter {
 }
 
 /// Runs the program `source` (named `file` in positions) on a thread
-/// with [`STACK_BYTES`] of stack.
+/// with [`STACK_BYTES`] of stack, with no command-line arguments.
 pub fn run_source(source: &str, file: &str) -> Outcome {
+    run_source_with(source, file, &[])
+}
+
+/// [`run_source`] with the command line `(args)` gives the program.
+pub fn run_source_with(source: &str, file: &str, args: &[String]) -> Outcome {
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new()
             .name("fibref-eval".into())
             .stack_size(STACK_BYTES)
-            .spawn_scoped(scope, || run_here(source, file));
+            .spawn_scoped(scope, || run_here(source, file, args));
         match worker.map(|h| h.join()) {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => Outcome::Failed {
@@ -57,12 +62,12 @@ pub fn run_source(source: &str, file: &str) -> Outcome {
 }
 
 /// The pipeline on the calling thread.
-fn run_here(source: &str, file: &str) -> Outcome {
+fn run_here(source: &str, file: &str, args: &[String]) -> Outcome {
     let checked = match check(source, file) {
         Ok(c) => c,
         Err(outcome) => return outcome,
     };
-    let (result, report) = run_checked(&checked);
+    let (result, report) = run_checked_with(&checked, args);
     match result {
         Ok(n) => Outcome::Compiled {
             result: Value::Int(n),
@@ -119,7 +124,13 @@ fn check(source: &str, file: &str) -> Result<Checked, Outcome> {
 /// Runs on the calling thread, which must have [`STACK_BYTES`] of stack
 /// ([`run_source`] makes one).
 pub fn run_checked(c: &Checked) -> (R<i64>, AuditReport) {
+    run_checked_with(c, &[])
+}
+
+/// [`run_checked`] with the command line `(args)` gives the program.
+pub fn run_checked_with(c: &Checked, args: &[String]) -> (R<i64>, AuditReport) {
     with_threads(&c.typed, &c.owned, None, |it| {
+        it.args = args.to_vec();
         let result = it.run_main();
         (result, it.finish())
     })

@@ -1363,6 +1363,7 @@ expander treat them as calls.
 | conversions (target type first) | `trunc zext sext fptrunc fpext fptosi fptoui sitofp uitofp char->i32 i32->char` |
 | arrays (types §2.13) | `array array-len array-get array-with array-copy array-set!` |
 | structs | `set-field!` |
+| the program's surroundings (M5) | `(args) -> (Vec str)`, the command line after the program (`fibc run FILE -- a b`, `fibref run FILE -- a b`, or a built executable's own); `(read-file path: str) -> (Option str)`, the whole file, `nil` when it cannot be read or is not UTF-8; `(write-file path: str text: str) -> bool`, whether the whole text was written |
 | strings | `str-len str-bytes str-from-bytes str-concat str-slice str-eq starts-with?` and `Countable`/`Eq`/`Ord`/`Hash` instances; `(str-from-bytes a: (Array i8)) -> str` is a fresh string of the bytes and traps `str-from-bytes: invalid UTF-8` unless they are the shortest UTF-8 encodings of scalar values (M5) |
 | forms | `Form` constructors, `gensym`, `struct?`, `struct-fields`, `struct-params`, `struct-field-types`, `enum?`, `enum-params`, `enum-variants` (§3.16) |
 | `Option` (built in, §3.9) | `some` (constructor), `nil` (a literal, §1.1); `nil?`, `some?`, `if-let` are prelude definitions (§4.4, §4.5) |
@@ -1420,7 +1421,7 @@ function is `(range n: i64) -> (Vec i64)`, and the two-argument form is
 the prelude macro's rewrite to `(range-between a: i64 b: i64) -> (Vec
 i64)`, §4.4), `pmap`, `append` (=
 `push!`), `even?`, `length` (string length), `starts-with?`, `box`/`unbox`
-over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O (including `(eprintln s: str) -> unit`, which writes `s` and a newline to standard error; `dbg` uses it).
+over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O (`(println s: str) -> unit` and `(eprintln s: str) -> unit`, which write `s` and a newline to standard output and to standard error; `dbg` uses the latter; `read-file`, `write-file` and `args` are builtins, §4.3).
 
 `for-each`, `map`, `filter`, `reduce`, `swap!` take their function
 parameter `:borrow`; `pmap`'s function parameter escapes (its body

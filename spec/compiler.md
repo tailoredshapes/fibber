@@ -25,18 +25,23 @@ itself, exactly as the evaluator does (`fibref` `eval/`). A program the
 front end rejects is rejected by `fibc` with the same message.
 
 ```
-fibc run   FILE.fib            ; compile through the JIT and run main; exit with its status
+fibc run   FILE.fib [-- ARG..] ; compile through the JIT and run main; print its result; ARG.. are (args)
 fibc build FILE.fib -o OUT     ; an executable (lair's AOT)
 fibc emit  FILE.fib            ; print the lIR module
 fibc explain FILE.fib          ; the plan, as `fibref explain` prints it (types §9)
 fibc cases [DIR]               ; the rule-6 harness (§5); default cases/ownership
 ```
 
-`fibc run` and the executable print `main`'s result as one decimal line
-on standard output and exit 0; a trap prints `trap: MESSAGE` on
+`fibc run` prints `main`'s result as one decimal line on standard
+output, after whatever the program wrote there, and exits 0; the
+harness reads the last line. The executable `fibc build` makes prints
+nothing of its own: `main`'s result is its exit status, as C gives it
+(the low 8 bits, lir.md §7.2), so a compiler written in fibber returns
+0 or 1 like any other (M5). On both, a trap prints `trap: MESSAGE` on
 standard error and aborts (SIGABRT, as types §8.12 says), so the exit
-status is 134 under a shell. With `FIB_TRACE=1` in the environment the
-runtime also prints the trace of §4 on standard error.
+status is 134 under a shell; the command line after the program (or
+after `--` for `fibc run`) is `(args)`. With `FIB_TRACE=1` in the
+environment the runtime also prints the trace of §4 on standard error.
 
 ## 2. Modules
 
@@ -44,9 +49,11 @@ One compilation produces one lIR module: the runtime (§3), the type
 table, the static objects, and every specialised body. Every symbol is
 `internal` except `main`, so that two such modules can live in one
 `Jit` (the macro-time module of §6 and the program) without clashing.
-`main` is lIR's `(main i32)`: it initialises the runtime (reads
-`FIB_TRACE`), calls the program's `main` specialisation, prints its
-result, joins the threads still running (types §8.8) and returns 0.
+`main` is lIR's `(main i32) ((i32 argc) (ptr argv))`: it initialises
+the runtime (reads `FIB_TRACE`, keeps the command line for `(args)`),
+calls the program's `main` specialisation, joins the threads still
+running (types §8.8), and then, under `fibc run`, prints the result
+and returns 0, or, in an executable, returns the result.
 
 Names. A fibber type prints as types §1 writes it; its **mangled form**
 replaces `(` by `$`, `)` by `_` and a space by `.`: `(Vec (Box i64))`

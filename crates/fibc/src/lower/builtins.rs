@@ -131,6 +131,9 @@ impl<'a> Cx<'_, 'a> {
                 self.rt_call("fib.str-bytes", &v, Some(LirTy::Ptr))
             }
             "str-from-bytes" => self.rt_call("fib.str-from-array", a, Some(LirTy::Ptr)),
+            "read-file" => self.rt_call("fib.read-file", a, Some(LirTy::Ptr)),
+            "write-file" => self.rt_call("fib.write-file", a, Some(LirTy::I1)),
+            "args" => self.args_vec(e)?,
             "char->i32" => arg(0)?.clone(),
             "i32->char" => self.rt_call("fib.i32-to-char", a, Some(LirTy::I32)),
             "ptr+" => self.b.val(
@@ -159,6 +162,41 @@ impl<'a> Cx<'_, 'a> {
             "release-raw" => self.rt_call("fib.release", a, None),
             other => return Err(Unsupported(format!("builtin {other}"))),
         }))
+    }
+
+    /// `(args)`: a fresh `Vec str` of the command line's arguments,
+    /// built through the runtime's Vec builder as `concat` builds one
+    /// (each str made with count 1, retained into the vector, then
+    /// released as the builder's temporary).
+    fn args_vec(&mut self, e: &Expr) -> R<V> {
+        let t = self.ty(e)?;
+        let ids = self.vec_tids(&t, &Ty::str())?;
+        let n = self.b.val("(call @fib.args-count)", LirTy::I64);
+        let buf = self.b.val(
+            &format!("(call @malloc (mul {} (i64 8)))", n.text()),
+            LirTy::Ptr,
+        );
+        self.b
+            .stmt(&format!("(call @fib.args-fill {})", buf.text()));
+        let v = self.b.val(
+            &format!(
+                "(call @fib.vec-build {} {} (i64 8) (i8 1) (i32 {}) (i32 {}) (i32 {}) (i32 {}))",
+                buf.text(),
+                n.text(),
+                ids.tvec,
+                ids.tnode,
+                ids.tarr,
+                ids.tnarr
+            ),
+            LirTy::Ptr,
+        );
+        self.b.stmt(&format!(
+            "(call @fib.args-release {} {})",
+            buf.text(),
+            n.text()
+        ));
+        self.b.stmt(&format!("(call @free {})", buf.text()));
+        Ok(v)
     }
 
     /// The prelude's `Form` type.

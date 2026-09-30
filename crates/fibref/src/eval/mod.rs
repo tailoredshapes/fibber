@@ -39,6 +39,7 @@ pub mod expr;
 pub mod forms;
 pub mod fx;
 pub mod interp;
+pub mod io;
 pub mod macros;
 pub mod native;
 pub mod object;
@@ -63,5 +64,7 @@ mod tests;
 pub use error::{RunError, RunErrorKind, R};
 pub use interp::{Interp, MACRO_STACK_BUDGET, STACK_BUDGET};
 pub use macros::MacroEvaluator;
-pub use pipeline::{run_checked, run_source, summary, Interpreter, STACK_BYTES};
+pub use pipeline::{
+    run_checked, run_checked_with, run_source, run_source_with, summary, Interpreter, STACK_BYTES,
+};
 pub use value::Val;
