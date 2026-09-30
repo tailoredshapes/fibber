@@ -127,7 +127,7 @@ impl<'a> Cx<'_, 'a> {
             return Err(Unsupported("a vector operation on a non-Vec".into()));
         }
         let node_id = g
-            .type_name(fibref::types::decls::ModuleId::Prelude, "VNode")
+            .type_name(fibref::types::decls::ModuleId::PRELUDE, "VNode")
             .ok_or_else(|| Unsupported("the prelude defines no VNode".into()))?;
         let node_ty = Ty::nominal(node_id, vec![elem.clone()]);
         let (tvec, _) = self.p.object(t)?;

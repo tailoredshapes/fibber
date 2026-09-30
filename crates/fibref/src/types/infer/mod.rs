@@ -225,7 +225,7 @@ impl<'g> Checker<'g> {
     pub fn check_main(&mut self) {
         let g = self.g;
         let Some(crate::types::ast::GlobalRef::Fun(f)) =
-            g.names(ModuleId::User).values.get("main").copied()
+            g.names(ModuleId::MAIN).values.get("main").copied()
         else {
             let pos = crate::types::init::builtin_pos();
             self.errors

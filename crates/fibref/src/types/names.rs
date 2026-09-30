@@ -58,27 +58,30 @@ impl Names {
 
 impl Globals {
     /// The modules a name used in `m` is looked up in, in order.
-    pub fn chain(m: ModuleId) -> &'static [ModuleId] {
-        match m {
-            ModuleId::User => &[ModuleId::User, ModuleId::Prelude, ModuleId::Builtin],
-            ModuleId::Prelude => &[ModuleId::Prelude, ModuleId::Builtin],
-            ModuleId::Builtin => &[ModuleId::Builtin],
-        }
+    pub fn chain(&self, m: ModuleId) -> &[ModuleId] {
+        &self.module(m).chain
     }
 
-    /// The modules a qualified name `ns/x` is looked up in.
-    fn qualified(name: &str) -> Option<(&'static [ModuleId], &str)> {
+    /// The modules a qualified name `ns/x` used in `m` is looked up in:
+    /// `ns` an alias or the full name of a module `m` requires or uses,
+    /// or the prelude's name from anywhere.
+    fn qualified<'n>(&self, m: ModuleId, name: &'n str) -> Option<(&[ModuleId], &'n str)> {
         let (ns, base) = name.split_once('/')?;
         if base.is_empty() {
             return None;
         }
-        (ns == crate::expand::PRELUDE_NS).then_some((Globals::chain(ModuleId::Prelude), base))
+        let target = match self.module(m).aliases.get(ns) {
+            Some(t) => *t,
+            None if ns == crate::expand::PRELUDE_NS => ModuleId::PRELUDE,
+            None => return None,
+        };
+        Some((self.chain(target), base))
     }
 
     /// The modules `name`, used in `m`, is looked up in, with the name
     /// itself: `ns/x` is looked up in `ns`'s chain.
-    fn lookup(m: ModuleId, name: &str) -> (&'static [ModuleId], &str) {
-        Globals::qualified(name).unwrap_or((Globals::chain(m), name))
+    fn lookup<'n>(&self, m: ModuleId, name: &'n str) -> (&[ModuleId], &'n str) {
+        self.qualified(m, name).unwrap_or((self.chain(m), name))
     }
 
     /// Whether a definition of `owner` named `base` in `space` is
@@ -91,7 +94,7 @@ impl Globals {
     /// Resolves a value name used in module `m`; a private value of
     /// another module is not visible (syntax §5).
     pub fn value(&self, m: ModuleId, name: &str) -> Option<GlobalRef> {
-        let (chain, base) = Globals::lookup(m, name);
+        let (chain, base) = self.lookup(m, name);
         chain
             .iter()
             .filter(|o| self.visible(m, **o, Space::Value, base))
@@ -101,7 +104,7 @@ impl Globals {
     /// Resolves a value name as `(var name)` does (syntax §3.20):
     /// private values of other modules included.
     pub fn value_any(&self, m: ModuleId, name: &str) -> Option<GlobalRef> {
-        let (chain, base) = Globals::lookup(m, name);
+        let (chain, base) = self.lookup(m, name);
         chain
             .iter()
             .find_map(|o| self.names(*o).values.get(base).copied())
@@ -110,7 +113,7 @@ impl Globals {
     /// Resolves a type name used in module `m` (private ones of other
     /// modules are not visible).
     pub fn type_name(&self, m: ModuleId, name: &str) -> Option<TypeId> {
-        let (chain, base) = Globals::lookup(m, name);
+        let (chain, base) = self.lookup(m, name);
         chain
             .iter()
             .filter(|o| self.visible(m, **o, Space::Type, base))
@@ -120,7 +123,7 @@ impl Globals {
     /// Resolves a protocol name used in module `m` (private ones of
     /// other modules are not visible).
     pub fn proto_name(&self, m: ModuleId, name: &str) -> Option<ProtoId> {
-        let (chain, base) = Globals::lookup(m, name);
+        let (chain, base) = self.lookup(m, name);
         chain
             .iter()
             .filter(|o| self.visible(m, **o, Space::Proto, base))
@@ -131,7 +134,7 @@ impl Globals {
     /// resolved a name used in `m` that did not resolve, for the
     /// message `x is private to M`.
     pub fn private_owner(&self, m: ModuleId, space: Space, name: &str) -> Option<ModuleId> {
-        let (chain, base) = Globals::lookup(m, name);
+        let (chain, base) = self.lookup(m, name);
         chain
             .iter()
             .copied()
@@ -142,7 +145,10 @@ impl Globals {
     /// definition of another module has the name (syntax §5).
     pub fn unknown(&self, m: ModuleId, space: Space, name: &str, what: &str) -> String {
         match self.private_owner(m, space, name) {
-            Some(o) => format!("{name} is private to {}; it is not exported", o.name()),
+            Some(o) => format!(
+                "{name} is private to {}; it is not exported",
+                self.module_name(o)
+            ),
             None => format!("{what} {name}"),
         }
     }

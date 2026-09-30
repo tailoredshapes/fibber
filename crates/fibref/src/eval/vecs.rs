@@ -27,7 +27,7 @@ impl Interp<'_> {
     fn node_type(&self) -> R<TypeId> {
         self.p
             .globals
-            .type_name(ModuleId::Prelude, "VNode")
+            .type_name(ModuleId::PRELUDE, "VNode")
             .ok_or_else(|| RunError::internal("the prelude defines no VNode"))
     }
 

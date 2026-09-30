@@ -130,12 +130,12 @@ pub fn lower_program(forms: &[Form], prelude: &[Form]) -> Result<Lowered, Vec<Ty
     let mut g = init::new_globals().map_err(|e| vec![e])?;
     let (prelude, prelude_private) = lower::strip_private(prelude);
     let (forms, user_private) = lower::strip_private(forms);
-    let pd = lower::declare(&mut g, ModuleId::Prelude, &prelude)?;
-    lower::mark_private(&mut g, ModuleId::Prelude, &prelude_private);
+    let pd = lower::declare(&mut g, ModuleId::PRELUDE, &prelude)?;
+    lower::mark_private(&mut g, ModuleId::PRELUDE, &prelude_private);
     init::finish_builtins(&mut g).map_err(|e| vec![e])?;
     let prelude_items = lower::define(&mut g, pd)?;
-    let ud = lower::declare(&mut g, ModuleId::User, &forms)?;
-    lower::mark_private(&mut g, ModuleId::User, &user_private);
+    let ud = lower::declare(&mut g, ModuleId::MAIN, &forms)?;
+    lower::mark_private(&mut g, ModuleId::MAIN, &user_private);
     let user_items = lower::define(&mut g, ud)?;
     Ok(Lowered {
         globals: g,

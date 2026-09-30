@@ -83,7 +83,7 @@ fn the_prelude_type_checks() {
         .globals
         .funs
         .iter()
-        .filter(|f| f.module == ModuleId::Prelude)
+        .filter(|f| f.module == ModuleId::PRELUDE)
         .count();
     let schemes = p.fun_schemes.iter().flatten().count();
     assert_eq!(prelude_funs, schemes);
@@ -91,7 +91,7 @@ fn the_prelude_type_checks() {
         .globals
         .instances
         .iter()
-        .filter(|i| i.module == ModuleId::Prelude)
+        .filter(|i| i.module == ModuleId::PRELUDE)
         .all(|i| !i.methods.is_empty()));
 }
 
@@ -164,7 +164,7 @@ fn case_01_head_is_generic_over_seq() {
     let p = case("01-return-part-of-argument.fib");
     let s = scheme(&p, "head");
     // §Appendix A: head : ∀s e. (Seq s e) ⇒ (fn (s) e).
-    let seq = p.globals.proto_name(ModuleId::Prelude, "Seq").expect("Seq");
+    let seq = p.globals.proto_name(ModuleId::PRELUDE, "Seq").expect("Seq");
     assert_eq!(s.n_vars, 2);
     assert_eq!(
         s.preds,

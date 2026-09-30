@@ -18,34 +18,38 @@ use super::ty::{Con, Pred, ProtoId, Ty, TypeId};
 
 pub use super::names::{Names, Space};
 
-/// The three modules.
+/// A module (syntax §5): the builtins, the prelude, then the program's
+/// modules in the order they are checked, the main module first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ModuleId {
-    /// The builtin names of syntax §4.3 and the built-in protocols.
-    Builtin,
-    /// `fib.prelude`, written in fibber (`lib/`).
-    Prelude,
-    /// The program's module.
-    User,
-}
+pub struct ModuleId(pub u32);
 
 impl ModuleId {
-    /// The module's name, for messages.
-    pub fn name(self) -> &'static str {
-        match self {
-            ModuleId::Builtin => "the builtins",
-            ModuleId::Prelude => crate::expand::PRELUDE_NS,
-            ModuleId::User => "the program's module",
-        }
-    }
+    /// The builtin names of syntax §4.3 and the built-in protocols.
+    pub const BUILTIN: ModuleId = ModuleId(0);
+    /// `fib.prelude`, written in fibber (`lib/`).
+    pub const PRELUDE: ModuleId = ModuleId(1);
+    /// The module that defines `main`.
+    pub const MAIN: ModuleId = ModuleId(2);
 
     fn index(self) -> usize {
-        match self {
-            ModuleId::Builtin => 0,
-            ModuleId::Prelude => 1,
-            ModuleId::User => 2,
-        }
+        self.0 as usize
     }
+}
+
+/// One module's namespace and what it sees (syntax §5).
+#[derive(Clone, Debug, Default)]
+pub struct ModuleInfo {
+    /// Its `ns` name; the builtins' and the main module's are only for
+    /// messages.
+    pub ns: String,
+    /// The names it binds.
+    pub names: Names,
+    /// The modules a name used in it is looked up in, in order: itself,
+    /// its `:use`s, the prelude, the builtins.
+    pub chain: Vec<ModuleId>,
+    /// Its `:require`s, alias to module, and every module it requires or
+    /// uses under its full `ns` name.
+    pub aliases: HashMap<String, ModuleId>,
 }
 
 /// A struct field or a variant field. Its type mentions the
@@ -301,8 +305,8 @@ pub struct Globals {
     pub builtin_schemes: Vec<Scheme>,
     /// Every binding site, by `BindingId`.
     pub bindings: Vec<BindingInfo>,
-    /// The names of each module.
-    pub modules: [Names; 3],
+    /// Each module, by `ModuleId`.
+    pub modules: Vec<ModuleInfo>,
     /// Instance by key.
     pub instance_index: HashMap<(ProtoId, Con), usize>,
     /// The built-in `Option`.
@@ -320,12 +324,49 @@ pub struct Globals {
 impl Globals {
     /// The names of `m`.
     pub fn names(&self, m: ModuleId) -> &Names {
-        &self.modules[m.index()]
+        &self.modules[m.index()].names
     }
 
     /// The names of `m`, for adding to.
     pub fn names_mut(&mut self, m: ModuleId) -> &mut Names {
-        &mut self.modules[m.index()]
+        &mut self.modules[m.index()].names
+    }
+
+    /// The module record of `m`.
+    pub fn module(&self, m: ModuleId) -> &ModuleInfo {
+        &self.modules[m.index()]
+    }
+
+    /// The module's name, for messages.
+    pub fn module_name(&self, m: ModuleId) -> &str {
+        &self.modules[m.index()].ns
+    }
+
+    /// Adds a program module named `ns` that `:use`s `uses` and
+    /// `:require`s `aliases`, after the modules it depends on; its
+    /// chain is itself, its uses, the prelude, the builtins.
+    pub fn add_module(
+        &mut self,
+        ns: &str,
+        uses: &[ModuleId],
+        aliases: HashMap<String, ModuleId>,
+    ) -> ModuleId {
+        let id = ModuleId(self.modules.len() as u32);
+        let mut chain = vec![id];
+        chain.extend(uses.iter().copied());
+        chain.push(ModuleId::PRELUDE);
+        chain.push(ModuleId::BUILTIN);
+        let mut aliases = aliases;
+        for u in uses {
+            aliases.insert(self.modules[u.index()].ns.clone(), *u);
+        }
+        self.modules.push(ModuleInfo {
+            ns: ns.to_string(),
+            names: Names::default(),
+            chain,
+            aliases,
+        });
+        id
     }
 
     /// The definition of a nominal type.

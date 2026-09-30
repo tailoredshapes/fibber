@@ -351,11 +351,11 @@ fn prelude_names_are_shadowed_by_user_definitions() {
     let p = ok("(defstruct (Box a) (v: a)) (defun main () -> i64 (. (Box 1) v))");
     let user_box = p
         .globals
-        .type_name(ModuleId::User, "Box")
+        .type_name(ModuleId::MAIN, "Box")
         .expect("user Box");
     let prelude_box = p
         .globals
-        .type_name(ModuleId::Prelude, "Box")
+        .type_name(ModuleId::PRELUDE, "Box")
         .expect("prelude Box");
     assert_ne!(user_box, prelude_box);
     // The literal rewrite still reaches the prelude's conj.

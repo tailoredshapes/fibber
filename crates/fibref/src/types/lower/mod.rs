@@ -203,13 +203,13 @@ fn scalar_enum_instances(g: &mut Globals, id: crate::types::ty::TypeId) -> TResu
         (0..names.len() as u32).map(Ty::Gen).collect(),
     );
     for p in ["Eq", "Ord", "Hash", "Show"] {
-        let Some(proto) = g.proto_name(ModuleId::Builtin, p) else {
+        let Some(proto) = g.proto_name(ModuleId::BUILTIN, p) else {
             continue;
         };
         let inst = InstanceDef {
             proto,
             con: Con::Nominal(id),
-            module: ModuleId::Builtin,
+            module: ModuleId::BUILTIN,
             var_names: names.clone(),
             head: head.clone(),
             dets: Vec::new(),
@@ -367,5 +367,5 @@ fn const_head(g: &Globals, head: &Expr) -> bool {
     }
     ["vec-empty", "conj", "map-empty", "assoc"]
         .iter()
-        .any(|n| g.value(ModuleId::Prelude, n) == Some(*r))
+        .any(|n| g.value(ModuleId::PRELUDE, n) == Some(*r))
 }

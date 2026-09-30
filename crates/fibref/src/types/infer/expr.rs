@@ -316,7 +316,7 @@ impl Cx<'_> {
             ConvOp::IntToInt(_) | ConvOp::IntToFloat { .. } => {
                 let Some(bits) = self
                     .g
-                    .proto_name(crate::types::decls::ModuleId::Builtin, "Bits")
+                    .proto_name(crate::types::decls::ModuleId::BUILTIN, "Bits")
                 else {
                     return Err(TypeError::other(&x.pos, "no Bits protocol"));
                 };

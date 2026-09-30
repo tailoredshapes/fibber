@@ -11,7 +11,9 @@ use crate::syntax::{read_all, Form, Pos};
 use super::annot::{ann_to_ty, GenEnv};
 use super::ast::{BuiltinId, GlobalRef};
 use super::builtins::{BUILTINS, BUILTIN_PROTOCOLS};
-use super::decls::{FieldDef, Globals, InstanceDef, ModuleId, Names, Shape, TypeDef, VariantDef};
+use super::decls::{
+    FieldDef, Globals, InstanceDef, ModuleId, ModuleInfo, Shape, TypeDef, VariantDef,
+};
 use super::error::{TResult, TypeError};
 use super::lower::{
     declare_proto, define_value, pred_of, register_instance, resolve_proto, type_ann,
@@ -41,7 +43,23 @@ pub fn new_globals() -> TResult<Globals> {
         externs: Vec::new(),
         builtin_schemes: Vec::new(),
         bindings: Vec::new(),
-        modules: [Names::default(), Names::default(), Names::default()],
+        modules: vec![
+            ModuleInfo {
+                ns: "the builtins".into(),
+                chain: vec![ModuleId::BUILTIN],
+                ..ModuleInfo::default()
+            },
+            ModuleInfo {
+                ns: crate::expand::PRELUDE_NS.into(),
+                chain: vec![ModuleId::PRELUDE, ModuleId::BUILTIN],
+                ..ModuleInfo::default()
+            },
+            ModuleInfo {
+                ns: "the program's module".into(),
+                chain: vec![ModuleId::MAIN, ModuleId::PRELUDE, ModuleId::BUILTIN],
+                ..ModuleInfo::default()
+            },
+        ],
         instance_index: HashMap::new(),
         option: TypeId(0),
         form: None,
@@ -88,18 +106,18 @@ fn declare_builtin_enum(g: &mut Globals, name: &str) -> TResult<TypeId> {
         .collect();
     g.types.push(TypeDef {
         name: name.into(),
-        module: ModuleId::Builtin,
+        module: ModuleId::BUILTIN,
         params,
         colours: Vec::new(),
         shape: Shape::Enum(Vec::new()),
         pos: builtin_pos(),
     });
-    g.names_mut(ModuleId::Builtin).types.insert(name.into(), id);
+    g.names_mut(ModuleId::BUILTIN).types.insert(name.into(), id);
     for (i, v) in info.variants.iter().enumerate() {
         if v.name != "nil" {
             define_value(
                 g,
-                ModuleId::Builtin,
+                ModuleId::BUILTIN,
                 &v.name,
                 GlobalRef::Ctor(id, Some(i)),
                 &builtin_pos(),
@@ -113,10 +131,10 @@ fn builtin_protocols(g: &mut Globals) -> TResult<()> {
     let forms = read_all(BUILTIN_PROTOCOLS, "<builtin>")
         .map_err(|e| TypeError::other(&builtin_pos(), format!("builtin protocols: {e}")))?;
     for form in &forms {
-        let id = declare_proto(g, ModuleId::Builtin, form)?;
-        resolve_proto(g, ModuleId::Builtin, id, form)?;
+        let id = declare_proto(g, ModuleId::BUILTIN, form)?;
+        resolve_proto(g, ModuleId::BUILTIN, id, form)?;
     }
-    g.deref_proto = g.proto_name(ModuleId::Builtin, "Deref");
+    g.deref_proto = g.proto_name(ModuleId::BUILTIN, "Deref");
     Ok(())
 }
 
@@ -149,7 +167,7 @@ fn builtin_instances(g: &mut Globals) -> TResult<()> {
 }
 
 fn add_instance(g: &mut Globals, proto: &str, con: Con, vars: u32, dets: Vec<Ty>) -> TResult<()> {
-    let Some(p) = g.proto_name(ModuleId::Builtin, proto) else {
+    let Some(p) = g.proto_name(ModuleId::BUILTIN, proto) else {
         return Err(TypeError::other(
             &builtin_pos(),
             format!("no builtin protocol {proto}"),
@@ -162,7 +180,7 @@ fn add_instance(g: &mut Globals, proto: &str, con: Con, vars: u32, dets: Vec<Ty>
     let inst = InstanceDef {
         proto: p,
         con,
-        module: ModuleId::Builtin,
+        module: ModuleId::BUILTIN,
         var_names,
         head,
         dets,
@@ -176,7 +194,7 @@ fn add_instance(g: &mut Globals, proto: &str, con: Con, vars: u32, dets: Vec<Ty>
 /// After the prelude's types are declared: `Form`'s fields (which
 /// mention the prelude's `Vec`) and the builtin functions.
 pub fn finish_builtins(g: &mut Globals) -> TResult<()> {
-    g.vec = g.type_name(ModuleId::Prelude, "Vec");
+    g.vec = g.type_name(ModuleId::PRELUDE, "Vec");
     form_fields(g)?;
     for (i, sig) in BUILTINS.iter().enumerate() {
         let scheme = builtin_scheme(g, sig.sig, sig.bounds).map_err(|e| {
@@ -188,7 +206,7 @@ pub fn finish_builtins(g: &mut Globals) -> TResult<()> {
         g.builtin_schemes.push(scheme);
         define_value(
             g,
-            ModuleId::Builtin,
+            ModuleId::BUILTIN,
             sig.name,
             GlobalRef::Builtin(BuiltinId(i as u32)),
             &builtin_pos(),
@@ -206,7 +224,7 @@ fn form_fields(g: &mut Globals) -> TResult<()> {
     for v in &info.variants {
         let mut fields = Vec::new();
         for (i, (name, t)) in v.fields.iter().enumerate() {
-            let ann = type_ann(g, ModuleId::Prelude, t, false)?;
+            let ann = type_ann(g, ModuleId::PRELUDE, t, false)?;
             let ty = ann_to_ty(&ann, &mut GenEnv::default(), &t.pos)?;
             let name = name.clone().unwrap_or_else(|| i.to_string());
             fields.push(FieldDef { name, ty });
@@ -240,22 +258,22 @@ fn builtin_scheme(g: &Globals, sig: &str, bounds: &str) -> TResult<Scheme> {
             _ => (p, false),
         };
         tys.push(ann_to_ty(
-            &type_ann(g, ModuleId::Prelude, t, false)?,
+            &type_ann(g, ModuleId::PRELUDE, t, false)?,
             &mut env,
             &pos,
         )?);
         amps.push(amp);
     }
-    let ret = ann_to_ty(&type_ann(g, ModuleId::Prelude, ret, false)?, &mut env, &pos)?;
+    let ret = ann_to_ty(&type_ann(g, ModuleId::PRELUDE, ret, false)?, &mut env, &pos)?;
     let mut preds = Vec::new();
     for c in read(bounds)?.first().and_then(Form::as_list).unwrap_or(&[]) {
         let items = c.as_list().ok_or_else(bad)?;
         let name = items.first().and_then(Form::as_sym).ok_or_else(bad)?;
         let args = items[1..]
             .iter()
-            .map(|t| ann_to_ty(&type_ann(g, ModuleId::Prelude, t, false)?, &mut env, &pos))
+            .map(|t| ann_to_ty(&type_ann(g, ModuleId::PRELUDE, t, false)?, &mut env, &pos))
             .collect::<TResult<Vec<_>>>()?;
-        preds.push(pred_of(g, ModuleId::Builtin, name, args, &pos)?);
+        preds.push(pred_of(g, ModuleId::BUILTIN, name, args, &pos)?);
     }
     let params = (1..=tys.len()).map(|i| i.to_string()).collect();
     Ok(Scheme {

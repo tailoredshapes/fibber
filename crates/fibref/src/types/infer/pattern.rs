@@ -49,7 +49,7 @@ impl Cx<'_> {
                 self.unify(s, &t, &p.pos)?;
                 let Some(eq) = self
                     .g
-                    .proto_name(crate::types::decls::ModuleId::Builtin, "Eq")
+                    .proto_name(crate::types::decls::ModuleId::BUILTIN, "Eq")
                 else {
                     return Err(TypeError::other(&p.pos, "no Eq protocol"));
                 };
