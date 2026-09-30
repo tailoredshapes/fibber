@@ -20,6 +20,8 @@
 (global internal fib.rq-mutex ptr (ptr null))
 (global internal fib.rq-cond ptr (ptr null))
 (global internal fib.pool-started i32 (i32 0))
+;; Workers inside a task: counted under the mutex, for fib.pool-quiesce.
+(global internal fib.pool-busy i32 (i32 0))
 
 ;; From fib.init: the mutex (40 bytes on glibc x86-64) and the
 ;; condition variable (48 bytes), allocated and initialised.
@@ -88,7 +90,8 @@
       (call @fib.rq-unlock)
       (ret task))))
 
-;; The head of the queue, sleeping until there is one.
+;; The head of the queue for a worker, sleeping until there is one;
+;; the worker counts as busy from here until fib.worker-done.
 (define internal (fib.dequeue-wait ptr) ()
   (block entry (call @fib.rq-lock) (br test))
   (block test
@@ -97,7 +100,32 @@
   (block sleep
     (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
     (br test))
-  (block got (call @fib.rq-unlock) (ret task)))
+  (block got
+    (store (add (load i32 @fib.pool-busy) (i32 1)) @fib.pool-busy)
+    (call @fib.rq-unlock)
+    (ret task)))
+
+;; A worker has finished a task: no longer busy; sleepers told.
+(define internal (fib.worker-done void) ()
+  (block entry
+    (call @fib.rq-lock)
+    (store (sub (load i32 @fib.pool-busy) (i32 1)) @fib.pool-busy)
+    (call @fib.rq-broadcast)
+    (call @fib.rq-unlock)
+    (ret)))
+
+;; At the program's exit, after its spawned threads are joined: waits
+;; until the queue is empty and no worker is inside a task, so every
+;; release a worker owes has been done (compiler.md §4: the trace must
+;; hold every free before the process ends).
+(define internal (fib.pool-quiesce void) ()
+  (block entry (call @fib.rq-lock) (br test))
+  (block test
+    (br (and (icmp eq (load ptr @fib.rq-head) (ptr null)) (icmp eq (load i32 @fib.pool-busy) (i32 0))) done sleep))
+  (block sleep
+    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
+    (br test))
+  (block done (call @fib.rq-unlock) (ret)))
 
 ;; A joiner with nothing to run sleeps until the queue has a task or
 ;; its own task is done; both are broadcast.
@@ -145,6 +173,7 @@
   (block loop
     (let ((t (call @fib.dequeue-wait)))
       (call @fib.run-one t)
+      (call @fib.worker-done)
       (br loop))))
 
 ;; Runs a queued task under a claim of its driver; a task whose driver

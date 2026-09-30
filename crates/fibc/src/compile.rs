@@ -200,6 +200,7 @@ fn assemble(p: &mut Program<'_>, defs: &str, entry: &str, executable: bool) -> S
     (call @fib.set-args argc argv)
     (let ((r (call @{entry})))
       (call @fib.join-all)
+      (call @fib.pool-quiesce)
       {end})))
 "
     );
