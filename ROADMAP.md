@@ -31,7 +31,7 @@ Decisions taken on the way are in spec/types.md §10.
 - [x] evaluator following the checker's plan (`fibref run`), with
       threads, atoms and an async executor that is deterministic and
       fair (types §8.8, "The reference interpreter's schedule")
-- [x] case harness and CI: 174 cases in cases/ownership, all passing
+- [x] case harness and CI: 175 cases in cases/ownership, all passing
       with a clean audit (its README lists them by origin: the 20
       decided, the promoted proposals, the rule-4 adversary's findings
       81 to 95, the rule-5 generator's, and the owner's decisions of
@@ -136,7 +136,7 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       compiler.md §4
 - [x] method rule 6 harness: `fibc cases` runs every case interpreted
       and compiled and compares results, rejections, traps and free
-      traces; all 171 cases pass both ways, 0 fail, 0 pending
+      traces; all 175 cases pass both ways, 0 fail, 0 pending
 - [x] macros through the JIT: one macro-time module per `defmacro`,
       `gensym` and reflection through hooks into the expander;
       `tests/macros.rs` shows the expansions equal `fibref`'s on every
@@ -152,8 +152,9 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
 - [x] `def` initialisers through the JIT (compiler.md §8 item 4;
       `defs/jit.rs`, with the interpreter backend kept as the
       executable spec of the same constants, `tests/defs.rs`)
-- [ ] a `(dyn P)` of a native instance (`str` under `Show`, `Eq`,
-      `Ord`, `Hash`; needs item 11 for `show`)
+- [x] a `(dyn P)` of a native instance: the vtable slot is a function
+      around the native method (case 177, `(dyn Hash "abc")`); `show`
+      through it waits on item 11 like every `show` of a `str`
 - [x] generated programs through the harness: `fibc gen` writes each
       program `fibgen` generates as a case whose header is the model's
       verdict and runs it both ways (`tests/gen.rs`: the first 120

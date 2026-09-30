@@ -210,3 +210,8 @@ main, so its waiter list holds two registrations and every count on
 it is released (175, 24); a scope-local struct made before an await
 and read after it, whose scope is the task's and which therefore
 lives in the task's frame when compiled (176, 7).
+
+Case 177 pins a `dyn` over a native instance (types §2.12, §8.5): a
+`(dyn Hash)` over a `str` beside one over a struct, in one vector; the
+str's slot is a function the compiler emits around the native method
+(177, -680: the FNV-1a of "abc" folded by `rem`, plus 5).

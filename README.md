@@ -27,7 +27,7 @@ implemented until an executable test says so.
 
 ```
 cargo test --workspace                          # the full suite (lair needs LLVM 21)
-cargo run -p fibref -- cases cases/ownership    # 174 cases
+cargo run -p fibref -- cases cases/ownership    # 175 cases
 cargo run -p fibref -- run   <file.fib>         # result and memory audit
 cargo run -p fibref -- explain <file.fib>       # the ownership decisions
 cargo run -p lair -- cases cases/lir            # 323 lIR cases, JIT and AOT
@@ -50,11 +50,11 @@ cargo run -p fibc -- gen --seed S --count N     # N generated programs through t
 | Ownership model | [spec/ownership.md](spec/ownership.md) | decided |
 | Syntax | [spec/syntax.md](spec/syntax.md) | decided |
 | Type system and ownership checker | [spec/types.md](spec/types.md) | decided |
-| Cases | [cases/ownership/](cases/ownership/) | 174, all passing (128–149: vector patterns and guards; 150–153: copy-in at call entry; 154: IEEE float comparisons; 155–161: colour parameters in impl heads; 162–165: no forwarding of a captured `&` parameter; 166–168: spin-waits and `swap!` contention on the fair executor; 169: the native `Show` and `Hash` instances on scalars; 170–173: findings of `fibc gen`; 174–176: the state machine of `async` and its executor) |
+| Cases | [cases/ownership/](cases/ownership/) | 175, all passing (128–149: vector patterns and guards; 150–153: copy-in at call entry; 154: IEEE float comparisons; 155–161: colour parameters in impl heads; 162–165: no forwarding of a captured `&` parameter; 166–168: spin-waits and `swap!` contention on the fair executor; 169: the native `Show` and `Hash` instances on scalars; 170–173: findings of `fibc gen`; 174–176: the state machine of `async` and its executor; 177: a `dyn` over a native instance) |
 | Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
 | Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
 | Library | [lib/prelude.fib](lib/prelude.fib) | what the cases need |
 | lIR: the assembler for LLVM IR that `fibc` will emit | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28; the second M3 pass's additions decided the same day, §14 items 8 to 11) |
 | lIR cases | [cases/lir/](cases/lir/) | 323, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial, the fuzzer's findings among them; verify: one reject case per rule) |
 | lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |
-| Compiler `fibc`: `fibref`'s front end lowered to lIR, the runtime `fib.rt`, the rule-6 harness, macros through the JIT | [spec/compiler.md](spec/compiler.md), [crates/fibc](crates/fibc) | in progress (M4): all 171 cases pass interpreted and compiled, and generated programs run through the same harness (`fibc gen`) |
+| Compiler `fibc`: `fibref`'s front end lowered to lIR, the runtime `fib.rt`, the rule-6 harness, macros through the JIT | [spec/compiler.md](spec/compiler.md), [crates/fibc](crates/fibc) | in progress (M4): all 175 cases pass interpreted and compiled, and generated programs run through the same harness (`fibc gen`) |

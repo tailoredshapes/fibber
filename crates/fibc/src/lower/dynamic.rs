@@ -47,17 +47,18 @@ impl<'a> Cx<'_, 'a> {
         let (index, args) = self.instance_of_pred(&pred)?;
         let inst = &g.instances[index];
         let proto = g.proto(p);
-        if inst.methods.is_empty() {
-            return Err(Unsupported("a dyn of a native instance".into()));
-        }
         let mut slots = Vec::new();
         for i in 0..proto.methods.len() {
-            let m = inst
-                .methods
-                .iter()
-                .position(|im| im.index == i)
-                .ok_or_else(|| Unsupported("an instance missing a method".into()))?;
-            let f = self.p.request(BodyKey::Method(index, m), args.clone());
+            let f = if inst.methods.is_empty() {
+                self.native_slot(p, i, head)?
+            } else {
+                let m = inst
+                    .methods
+                    .iter()
+                    .position(|im| im.index == i)
+                    .ok_or_else(|| Unsupported("an instance missing a method".into()))?;
+                self.p.request(BodyKey::Method(index, m), args.clone())
+            };
             slots.push(format!("@{f}"));
         }
         for sup in super_closure(g, &pred) {
@@ -67,6 +68,52 @@ impl<'a> Cx<'_, 'a> {
             slots.push(self.vtable_for(q, head)?);
         }
         Ok(self.p.statics.vtable(&name, slots))
+    }
+
+    /// The vtable slot of method `i` of `p` at a native instance
+    /// (types §2.12: `str` under `Hash`, `Show`, `Eq`, `Ord`): a
+    /// `tailcc` function of the method's parameters running the native
+    /// method (`arith.rs`), emitted once.
+    fn native_slot(&mut self, p: ProtoId, i: usize, head: &Ty) -> R<String> {
+        let g = self.p.g();
+        let proto = g.proto(p);
+        let md = &proto.methods[i];
+        let name = format!("m.{}.{}.{}", proto.name, md.name, mangle(g, head));
+        if self.p.has_helper(&name) {
+            return Ok(name);
+        }
+        if md.scheme.n_vars != 1 {
+            return Err(Unsupported(
+                "a native instance of a protocol with determined parameters".into(),
+            ));
+        }
+        let Ty::Fn(_, params, ret) = md.scheme.ty.subst_gen(std::slice::from_ref(head), &[]) else {
+            return Err(Unsupported("a method without a function type".into()));
+        };
+        let (mut sig, mut vals) = (Vec::new(), Vec::new());
+        for (j, t) in params.iter().enumerate() {
+            match self.p.lir(t)? {
+                Some(l) => {
+                    let pn = format!("p{j}");
+                    sig.push((l, pn.clone()));
+                    vals.push(V::Val(pn, l));
+                }
+                None => vals.push(V::Unit),
+            }
+        }
+        let inst = self.inst.clone();
+        let mut cx = Cx::new(&mut *self.p, inst, super::values::empty_plan(), &name, sig);
+        cx.b.ret = cx.p.lir(&ret)?;
+        let v = cx
+            .native_method(&proto.name, &md.name, &vals, &params, &ret)?
+            .ok_or_else(|| Unsupported("a native method that does not return".into()))?;
+        match &v {
+            V::Unit => cx.b.term("(ret)"),
+            V::Val(s, _) => cx.b.term(&format!("(ret {s})")),
+        }
+        let text = cx.b.render();
+        self.p.add_helper(&name, text);
+        Ok(name)
     }
 
     /// Supertrait `q`'s vtable, loaded from a `(dyn p)` value.
