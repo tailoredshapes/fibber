@@ -8,6 +8,7 @@ use crate::types::ty::Scalar;
 use super::alloc::Placement;
 use super::error::{RunError, R};
 use super::interp::Interp;
+use super::object::Obj;
 use super::value::Val;
 
 impl Interp<'_> {
@@ -43,6 +44,25 @@ impl Interp<'_> {
                     .map(|b| Val::Int(i64::from(b as i8), Scalar::I8))
                     .collect();
                 self.new_array(bytes, Placement::Heap)
+            }
+            "str-from-bytes" => {
+                let id = a
+                    .first()
+                    .ok_or_else(|| {
+                        RunError::internal("str-from-bytes without its array".to_string())
+                    })?
+                    .expect_obj("an array")?;
+                let items = match self.objs.get(&self.heap, id)? {
+                    Obj::Array(items) => items.clone(),
+                    o => return Err(RunError::internal(format!("{id} is not an array: {o:?}"))),
+                };
+                let bytes = items
+                    .iter()
+                    .map(|v| v.as_int().map(|n| n as u8))
+                    .collect::<R<Vec<u8>>>()?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| RunError::trap("str-from-bytes: invalid UTF-8".to_string()))?;
+                self.new_str(text, Placement::Heap)
             }
             "str-concat" => {
                 let joined = s(0)? + &s(1)?;

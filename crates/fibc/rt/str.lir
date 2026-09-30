@@ -279,6 +279,65 @@
       (call @memcpy (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)) (call @fib.str-bytes-ptr s) n)
       (ret a))))
 
+;; Whether byte j of the n at p exists and lies in lo..=hi.
+(define internal (fib.utf8-cont i1) ((ptr p) (i64 n) (i64 j) (i32 lo) (i32 hi))
+  (block entry (br (icmp sge j n) no test))
+  (block no (ret (i1 0)))
+  (block test
+    (let ((b (zext i32 (load i8 (getelementptr i8 p j)))))
+      (ret (and (icmp sge b lo) (icmp sle b hi))))))
+
+;; Whether the n bytes at p are UTF-8: the shortest encodings of the
+;; scalar values, as Rust's from_utf8 checks them (the interpreter's
+;; rule for str-from-bytes).
+(define internal (fib.utf8-valid i1) ((ptr p) (i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (adv inext))))
+      (br (icmp sge i n) ok head)))
+  (block head
+    (let ((b (zext i32 (load i8 (getelementptr i8 p i)))))
+      (br (icmp slt b (i32 128)) one two?)))
+  (block one (let ((s1 (add i (i64 1)))) (br adv)))
+  (block two? (br (and (icmp sge b (i32 194)) (icmp sle b (i32 223))) two three?))
+  (block two
+    (let ((s2 (add i (i64 2))))
+      (br (call @fib.utf8-cont p n (add i (i64 1)) (i32 128) (i32 191)) adv bad)))
+  (block three? (br (and (icmp sge b (i32 224)) (icmp sle b (i32 239))) three four?))
+  (block three
+    (let ((s3 (add i (i64 3)))
+          (lo (select (icmp eq b (i32 224)) (i32 160) (i32 128)))
+          (hi (select (icmp eq b (i32 237)) (i32 159) (i32 191))))
+      (br (and (call @fib.utf8-cont p n (add i (i64 1)) lo hi)
+               (call @fib.utf8-cont p n (add i (i64 2)) (i32 128) (i32 191)))
+          adv bad)))
+  (block four? (br (and (icmp sge b (i32 240)) (icmp sle b (i32 244))) four bad))
+  (block four
+    (let ((s4 (add i (i64 4)))
+          (lo4 (select (icmp eq b (i32 240)) (i32 144) (i32 128)))
+          (hi4 (select (icmp eq b (i32 244)) (i32 143) (i32 191))))
+      (br (and (call @fib.utf8-cont p n (add i (i64 1)) lo4 hi4)
+               (and (call @fib.utf8-cont p n (add i (i64 2)) (i32 128) (i32 191))
+                    (call @fib.utf8-cont p n (add i (i64 3)) (i32 128) (i32 191))))
+          adv bad)))
+  (block adv
+    (let ((inext (phi i64 (one s1) (two s2) (three s3) (four s4))))
+      (br loop)))
+  (block ok (ret (i1 1)))
+  (block bad (ret (i1 0))))
+
+;; (str-from-bytes a): a fresh str of the array's bytes, which must be
+;; UTF-8 (the interpreter traps with the same message).
+(define internal (fib.str-from-array ptr) ((ptr arr))
+  (block entry
+    (let ((n (load i64 (getelementptr %struct.fib.array.i8 arr (i32 0) (i32 3))))
+          (p (getelementptr %struct.fib.array.i8 arr (i32 0) (i32 4) (i64 0))))
+      (br (call @fib.utf8-valid p n) ok bad)))
+  (block ok (ret (call @fib.str-from-bytes p n)))
+  (block bad
+    (call @fib.trap-c (string "str-from-bytes: invalid UTF-8"))
+    (unreachable)))
+
 ;; (i32->char n): traps unless n is a Unicode scalar value.
 (define internal (fib.i32-to-char i32) ((i32 n))
   (block entry

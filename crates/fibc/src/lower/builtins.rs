@@ -130,6 +130,7 @@ impl<'a> Cx<'_, 'a> {
                 let v = vec![arg(0)?.clone(), V::int(LirTy::I32, i64::from(tid))];
                 self.rt_call("fib.str-bytes", &v, Some(LirTy::Ptr))
             }
+            "str-from-bytes" => self.rt_call("fib.str-from-array", a, Some(LirTy::Ptr)),
             "char->i32" => arg(0)?.clone(),
             "i32->char" => self.rt_call("fib.i32-to-char", a, Some(LirTy::I32)),
             "ptr+" => self.b.val(

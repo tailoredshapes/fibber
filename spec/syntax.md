@@ -1363,7 +1363,7 @@ expander treat them as calls.
 | conversions (target type first) | `trunc zext sext fptrunc fpext fptosi fptoui sitofp uitofp char->i32 i32->char` |
 | arrays (types §2.13) | `array array-len array-get array-with array-copy array-set!` |
 | structs | `set-field!` |
-| strings | `str-len str-bytes str-concat str-slice str-eq starts-with?` and `Countable`/`Eq`/`Ord`/`Hash` instances |
+| strings | `str-len str-bytes str-from-bytes str-concat str-slice str-eq starts-with?` and `Countable`/`Eq`/`Ord`/`Hash` instances; `(str-from-bytes a: (Array i8)) -> str` is a fresh string of the bytes and traps `str-from-bytes: invalid UTF-8` unless they are the shortest UTF-8 encodings of scalar values (M5) |
 | forms | `Form` constructors, `gensym`, `struct?`, `struct-fields`, `struct-params`, `struct-field-types`, `enum?`, `enum-params`, `enum-variants` (§3.16) |
 | `Option` (built in, §3.9) | `some` (constructor), `nil` (a literal, §1.1); `nil?`, `some?`, `if-let` are prelude definitions (§4.4, §4.5) |
 | unsafe | `ptr+ load-i8 load-i16 load-i32 load-i64 load-ptr store-i8 ... store-ptr alloc free raw raw-retained release-raw` |

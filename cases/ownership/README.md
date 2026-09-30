@@ -231,3 +231,10 @@ low five bits (179, 1738); keys whose hashes all collide, told apart by
 empty map, `map-put!` and `map-del!` through `&`, `for-each` over the
 entries, `contains?` (181, 1927); a `Set` with `conj`, `set-contains?`,
 `disj`, `count` and `for-each` (182, 1029).
+
+Cases 183 and 184 pin the string building of M5 (syntax §4.3, §4.5):
+`str-join` over a vector of parts, `str-chars` decoding one-, two-,
+three- and four-byte characters, `char->str` encoding them back, and
+`str-from-bytes` as the inverse of `str-bytes`, every text checked
+(183, 129495); and `str-from-bytes` of bytes that are no UTF-8, a trap
+with the same message on both sides (184).
