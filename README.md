@@ -55,7 +55,7 @@ cargo run -p fibc -- gen --seed S --count N     # N generated programs through t
 | Module cases | [cases/modules/](cases/modules/) | 6 programs of several modules (syntax §5), each a directory with its `main.fib`, all passing both ways |
 | Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
 | Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
-| Library | [lib/prelude.fib](lib/prelude.fib) | M5 in progress: `Vec` (a 32-way trie), `Map` and `Set` (an HAMT), `List`, iterators, string building and characters, tasks, `println`, `eprintln`, files and `args` |
+| Library | [lib/prelude.fib](lib/prelude.fib) | done (M5, 2026-09-30): `Vec` (a 32-way trie), `Map` and `Set` (an HAMT), `List`, iterators, string building and characters, tasks, `println`, `eprintln`, files and `args` |
 | lIR: the assembler for LLVM IR that `fibc` emits | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28; the second M3 pass's additions decided the same day, §14 items 8 to 11) |
 | lIR cases | [cases/lir/](cases/lir/) | 323, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial, the fuzzer's findings among them; verify: one reject case per rule) |
 | lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |

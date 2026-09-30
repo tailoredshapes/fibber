@@ -171,7 +171,7 @@ State (spec/compiler.md, **Decided**, owner, 2026-09-30; `crates/fibc`):
 - [x] the owner's answers to compiler.md §8 (2026-09-30: every item
       decided, the page **Decided**)
 
-## M5. A library a compiler can live on — in progress
+## M5. A library a compiler can live on — done
 
 Prioritised by what a self-hosted compiler needs, ahead of anything
 else in the library; every addition is pinned by cases that run
