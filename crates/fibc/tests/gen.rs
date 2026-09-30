@@ -20,7 +20,7 @@ fn generated_programs_agree_interpreted_and_compiled() {
         seed: 1,
         count: 120,
         size: None,
-        jobs: std::thread::available_parallelism().map_or(2, |n| n.get()),
+        jobs: std::thread::available_parallelism().map_or(2, |n| n.get().min(8)),
         dir: dir.clone(),
     };
     let r = run(&harness, &cfg).expect("the programs are written and run");

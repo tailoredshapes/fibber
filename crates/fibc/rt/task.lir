@@ -4,40 +4,73 @@
 ;; (never resumed), 1 running or queued, 2 done, 3 parked (registered
 ;; as a waiter of another task). Its driver word: 0 free, 1 claimed;
 ;; resume runs only under a claim, and a task in state 3 is never
-;; resumed until its wake sets 1 and queues it.
+;; resumed until its wake sets 1 and queues it. The queue is under a
+;; pthread mutex with one condition variable, broadcast at every
+;; enqueue and every completion, so an idle worker or a waiting joiner
+;; sleeps instead of spinning.
 (declare sysconf i64 (i32))
+(declare pthread_mutex_init i32 (ptr ptr))
+(declare pthread_mutex_lock i32 (ptr))
+(declare pthread_mutex_unlock i32 (ptr))
+(declare pthread_cond_init i32 (ptr ptr))
+(declare pthread_cond_wait i32 (ptr ptr))
+(declare pthread_cond_broadcast i32 (ptr))
 (global internal fib.rq-head ptr (ptr null))
 (global internal fib.rq-tail ptr (ptr null))
-(global internal fib.rq-lock i32 (i32 0))
+(global internal fib.rq-mutex ptr (ptr null))
+(global internal fib.rq-cond ptr (ptr null))
 (global internal fib.pool-started i32 (i32 0))
 
-;; A queue node: task, next.
+;; From fib.init: the mutex (40 bytes on glibc x86-64) and the
+;; condition variable (48 bytes), allocated and initialised.
+(define internal (fib.rq-init void) ()
+  (block entry
+    (let ((m (call @malloc (i64 64)))
+          (c (call @malloc (i64 64))))
+      (call @pthread_mutex_init m (ptr null))
+      (call @pthread_cond_init c (ptr null))
+      (store m @fib.rq-mutex)
+      (store c @fib.rq-cond)
+      (ret))))
+
+(define internal (fib.rq-lock void) ()
+  (block entry (call @pthread_mutex_lock (load ptr @fib.rq-mutex)) (ret)))
+
+(define internal (fib.rq-unlock void) ()
+  (block entry (call @pthread_mutex_unlock (load ptr @fib.rq-mutex)) (ret)))
+
+(define internal (fib.rq-broadcast void) ()
+  (block entry (call @pthread_cond_broadcast (load ptr @fib.rq-cond)) (ret)))
+
+;; A queue node: task, next. Appended under the mutex; every sleeper
+;; is woken.
 (define internal (fib.enqueue void) ((ptr task))
   (block entry
     (let ((node (call @malloc (i64 16))))
       (store task node)
       (store (ptr null) (getelementptr i8 node (i64 8)))
-      (call @fib.lock @fib.rq-lock)
+      (call @fib.rq-lock)
       (br (icmp eq (load ptr @fib.rq-tail) (ptr null)) first append)))
   (block first
     (store node @fib.rq-head)
     (store node @fib.rq-tail)
-    (call @fib.unlock @fib.rq-lock)
-    (call @fib.pool-start)
-    (ret))
+    (br out))
   (block append
     (store node (getelementptr i8 (load ptr @fib.rq-tail) (i64 8)))
     (store node @fib.rq-tail)
-    (call @fib.unlock @fib.rq-lock)
+    (br out))
+  (block out
+    (call @fib.rq-broadcast)
+    (call @fib.rq-unlock)
+    (call @fib.pool-start)
     (ret)))
 
-;; The task at the head of the queue, or null.
-(define internal (fib.dequeue ptr) ()
+;; The head node unlinked, or null; the mutex is held.
+(define internal (fib.pop-locked ptr) ()
   (block entry
-    (call @fib.lock @fib.rq-lock)
     (let ((node (load ptr @fib.rq-head)))
       (br (icmp eq node (ptr null)) empty take)))
-  (block empty (call @fib.unlock @fib.rq-lock) (ret (ptr null)))
+  (block empty (ret (ptr null)))
   (block take
     (let ((next (load ptr (getelementptr i8 node (i64 8))))
           (task (load ptr node)))
@@ -45,10 +78,39 @@
       (br (icmp eq next (ptr null)) last more)))
   (block last (store (ptr null) @fib.rq-tail) (br out))
   (block more (br out))
-  (block out
-    (call @fib.unlock @fib.rq-lock)
-    (call @free node)
-    (ret task)))
+  (block out (call @free node) (ret task)))
+
+;; The task at the head of the queue, or null.
+(define internal (fib.dequeue ptr) ()
+  (block entry
+    (call @fib.rq-lock)
+    (let ((task (call @fib.pop-locked)))
+      (call @fib.rq-unlock)
+      (ret task))))
+
+;; The head of the queue, sleeping until there is one.
+(define internal (fib.dequeue-wait ptr) ()
+  (block entry (call @fib.rq-lock) (br test))
+  (block test
+    (let ((task (call @fib.pop-locked)))
+      (br (icmp eq task (ptr null)) sleep got)))
+  (block sleep
+    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
+    (br test))
+  (block got (call @fib.rq-unlock) (ret task)))
+
+;; A joiner with nothing to run sleeps until the queue has a task or
+;; its own task is done; both are broadcast.
+(define internal (fib.idle-wait void) ((ptr task))
+  (block entry
+    (call @fib.rq-lock)
+    (br (icmp ne (load ptr @fib.rq-head) (ptr null)) out check))
+  (block check
+    (br (icmp eq (atomic-load acquire i32 (getelementptr %struct.fib.task task (i32 0) (i32 3))) (i32 2)) out sleep))
+  (block sleep
+    (call @pthread_cond_wait (load ptr @fib.rq-cond) (load ptr @fib.rq-mutex))
+    (br out))
+  (block out (call @fib.rq-unlock) (ret)))
 
 ;; Starts the workers once, on the first enqueue: one per processor,
 ;; and a T line in trace mode (compiler.md §4), since from here on the
@@ -77,14 +139,13 @@
   (block next (let ((i2 (add i (i64 1)))) (br loop)))
   (block done (ret)))
 
-;; A worker: runs whatever the queue holds, yielding when it is empty.
+;; A worker: runs whatever the queue holds, sleeping when it is empty.
 (define internal (fib.worker ptr) ((ptr arg))
   (block entry (br loop))
   (block loop
-    (let ((t (call @fib.dequeue)))
-      (br (icmp eq t (ptr null)) idle run)))
-  (block idle (call @sched_yield) (br loop))
-  (block run (call @fib.run-one t) (br loop)))
+    (let ((t (call @fib.dequeue-wait)))
+      (call @fib.run-one t)
+      (br loop))))
 
 ;; Runs a queued task under a claim of its driver; a task whose driver
 ;; is still held goes back on the queue; one a joiner drove meanwhile
@@ -108,7 +169,7 @@
 
 ;; join/block-on (§8.8): drives the executor until the task is done,
 ;; resuming the task itself when it can claim it, running other queued
-;; tasks meanwhile, yielding when there is nothing to run.
+;; tasks meanwhile, sleeping when there is nothing to run.
 (define internal (fib.drive void) ((ptr task))
   (block entry
     (let ((sp (getelementptr %struct.fib.task task (i32 0) (i32 3)))
@@ -133,7 +194,7 @@
   (block other
     (let ((u (call @fib.dequeue)))
       (br (icmp eq u (ptr null)) idle run)))
-  (block idle (call @sched_yield) (br loop))
+  (block idle (call @fib.idle-wait task) (br loop))
   (block run (call @fib.run-one u) (br loop))
   (block done (ret)))
 
@@ -189,12 +250,4 @@
       (atomic-store release (i32 1) (getelementptr %struct.fib.task w (i32 0) (i32 3)))
       (call @fib.enqueue w)
       (br wake)))
-  (block done (ret)))
-
-;; Waits for a task to be done, yielding meanwhile.
-(define internal (fib.wait-done void) ((ptr task))
-  (block entry (br spin))
-  (block spin
-    (br (icmp eq (atomic-load acquire i32 (getelementptr %struct.fib.task task (i32 0) (i32 3))) (i32 2)) done wait))
-  (block wait (call @sched_yield) (br spin))
-  (block done (ret)))
+  (block done (call @fib.rq-lock) (call @fib.rq-broadcast) (call @fib.rq-unlock) (ret)))

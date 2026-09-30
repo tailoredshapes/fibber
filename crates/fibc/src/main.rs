@@ -37,7 +37,8 @@ commands:
                          generate N programs with fibgen from seed S (size K, or
                          sizes 1..=6 in turn) and run each interpreted and
                          compiled against the model's verdict; a program that
-                         does not pass is kept in D
+                         does not pass is kept in D. J defaults to at most 8:
+                         a job holds a heap trace and a JIT-compiling child
   help                   print this message";
 
 const DEFAULT_CASES_DIR: &str = "cases/ownership";
@@ -61,7 +62,9 @@ fn parse_gen(args: &[&str]) -> Command {
         seed: 1,
         count: 100,
         size: None,
-        jobs: std::thread::available_parallelism().map_or(2, |n| n.get()),
+        // Each job holds an interpreter's whole heap trace beside a
+        // JIT-compiling child: bound by memory, not by processors.
+        jobs: std::thread::available_parallelism().map_or(2, |n| n.get().min(8)),
         dir: std::env::temp_dir().join(format!("fibc-gen-{}", std::process::id())),
     };
     let mut it = args.iter();
