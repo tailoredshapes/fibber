@@ -1,0 +1,212 @@
+//! The reader dump (spec/bootstrap.md §2): the forms the reader produced
+//! as flat text, every node with its position, and a read error the same
+//! way. The self-hosted reader (M6, `compiler/`) prints the same text, so
+//! comparing the two dumps compares the two readers on every form, every
+//! position and every error message.
+//!
+//! One line per node, depth first, two spaces of indent per level:
+//!
+//! ```text
+//! list 2 1:1 0..9
+//!   sym "def" 1:2 1..4
+//!   int 42 i64 1:6 5..7
+//! ```
+//!
+//! An error is one line, `error Kind L:C S..E: message`, where `Kind` is
+//! the variant's name and the message is its `Display`.
+
+use std::fmt::Write;
+
+use crate::eval::arith::float_text;
+use crate::syntax::{read_all, Form, FormKind, Pos, ReadError, ReadErrorKind};
+use crate::types::ty::Scalar;
+
+/// The dump of reading `source` as `file`: its forms, or its error.
+pub fn dump_source(source: &str, file: &str) -> String {
+    match read_all(source, file) {
+        Ok(forms) => dump_forms(&forms),
+        Err(e) => dump_error(&e),
+    }
+}
+
+/// The dump of a sequence of top-level forms.
+pub fn dump_forms(forms: &[Form]) -> String {
+    let mut out = String::new();
+    for f in forms {
+        dump_form(f, 0, &mut out);
+    }
+    out
+}
+
+/// The dump of a read error: one line.
+pub fn dump_error(e: &ReadError) -> String {
+    format!(
+        "error {} {}: {}\n",
+        kind_name(&e.kind),
+        span(&e.pos),
+        e.kind
+    )
+}
+
+fn span(p: &Pos) -> String {
+    format!("{}:{} {}..{}", p.line, p.col, p.start, p.end)
+}
+
+fn dump_form(f: &Form, depth: usize, out: &mut String) {
+    let indent = "  ".repeat(depth);
+    let at = span(&f.pos);
+    let seq = |tag: &str, items: &[Form], out: &mut String| {
+        let _ = writeln!(out, "{indent}{tag} {} {at}", items.len());
+        for item in items {
+            dump_form(item, depth + 1, out);
+        }
+    };
+    match &f.kind {
+        FormKind::Sym(s) => {
+            let _ = writeln!(out, "{indent}sym {} {at}", quote(s));
+        }
+        FormKind::Kw(s) => {
+            let _ = writeln!(out, "{indent}kw {} {at}", quote(s));
+        }
+        FormKind::Int { v, width } => {
+            let _ = writeln!(out, "{indent}int {v} {} {at}", width.suffix());
+        }
+        FormKind::Flt { v, width } => {
+            let scalar = match width {
+                crate::syntax::FltWidth::F32 => Scalar::F32,
+                crate::syntax::FltWidth::F64 => Scalar::F64,
+            };
+            let _ = writeln!(
+                out,
+                "{indent}flt {} {} {at}",
+                float_text(*v, scalar),
+                width.suffix()
+            );
+        }
+        FormKind::Str(s) => {
+            let _ = writeln!(out, "{indent}str {} {at}", quote(s));
+        }
+        FormKind::Chr(c) => {
+            let _ = writeln!(out, "{indent}chr U+{:04X} {at}", u32::from(*c));
+        }
+        FormKind::Bool(b) => {
+            let _ = writeln!(out, "{indent}bool {b} {at}");
+        }
+        FormKind::Nil => {
+            let _ = writeln!(out, "{indent}nil {at}");
+        }
+        FormKind::List(items) => seq("list", items, out),
+        FormKind::Vec(items) => seq("vec", items, out),
+        FormKind::Map(items) => seq("map", items, out),
+    }
+}
+
+/// `"`, `\` and the control characters escaped, every other character
+/// as it is: the text is unambiguous and needs no printer to produce.
+fn quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if u32::from(c) < 0x20 || u32::from(c) == 0x7F => {
+                let _ = write!(out, "\\x{:02X}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The name of an error's variant.
+pub fn kind_name(k: &ReadErrorKind) -> &'static str {
+    use ReadErrorKind as K;
+    match k {
+        K::UnterminatedString => "UnterminatedString",
+        K::BadEscape { .. } => "BadEscape",
+        K::BadUnicodeEscape { .. } => "BadUnicodeEscape",
+        K::BadCharLiteral(_) => "BadCharLiteral",
+        K::InvalidCharacter(_) => "InvalidCharacter",
+        K::InvalidNumber { .. } => "InvalidNumber",
+        K::IntegerOutOfRange { .. } => "IntegerOutOfRange",
+        K::FloatOutOfRange { .. } => "FloatOutOfRange",
+        K::InvalidSymbol(_) => "InvalidSymbol",
+        K::InvalidKeyword(_) => "InvalidKeyword",
+        K::UnknownDispatch(_) => "UnknownDispatch",
+        K::PrefixWithoutForm(_) => "PrefixWithoutForm",
+        K::DiscardWithoutForm => "DiscardWithoutForm",
+        K::InOutNotSymbol => "InOutNotSymbol",
+        K::Unclosed { .. } => "Unclosed",
+        K::UnexpectedClose { .. } => "UnexpectedClose",
+        K::MismatchedClose { .. } => "MismatchedClose",
+        K::OddMapEntries { .. } => "OddMapEntries",
+        K::TooDeep { .. } => "TooDeep",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_list_with_atoms() {
+        let d = dump_source("(def 42 2.5f32 \"a\\n\")", "t");
+        assert_eq!(
+            d,
+            "list 4 1:1 0..21\n  sym \"def\" 1:2 1..4\n  int 42 i64 1:6 5..7\n  flt 2.5 f32 1:9 8..14\n  str \"a\\n\" 1:16 15..20\n"
+        );
+    }
+
+    #[test]
+    fn prefix_forms_dump_as_lists() {
+        let d = dump_source("'x &y", "t");
+        assert_eq!(
+            d,
+            "list 2 1:1 0..2\n  sym \"quote\" 1:1 0..1\n  sym \"x\" 1:2 1..2\nlist 2 1:4 3..5\n  sym \"&\" 1:4 3..4\n  sym \"y\" 1:5 4..5\n"
+        );
+    }
+
+    #[test]
+    fn chars_bools_nil_keywords_collections() {
+        let d = dump_source("[\\a true nil :k/n {1 2}]", "t");
+        assert!(d.contains("chr U+0061 1:2 1..3"), "{d}");
+        assert!(d.contains("bool true 1:5 4..8"), "{d}");
+        assert!(d.contains("nil 1:10 9..12"), "{d}");
+        assert!(d.contains("kw \"k/n\" 1:14 13..17"), "{d}");
+        assert!(d.contains("map 2 1:19 18..23"), "{d}");
+    }
+
+    #[test]
+    fn an_error_is_one_line_with_its_kind_and_message() {
+        let d = dump_source("(a", "t");
+        assert_eq!(d, "error Unclosed 1:1 0..1: unclosed (\n");
+        let d = dump_source("300i8", "t");
+        assert_eq!(
+            d,
+            "error IntegerOutOfRange 1:1 0..5: integer literal 300i8 does not fit i8 (-128 to 127)\n"
+        );
+    }
+
+    #[test]
+    fn quoting_escapes_quotes_backslashes_and_controls_only() {
+        assert_eq!(
+            quote("a\"b\\c\n\u{1}\u{7F}é😀"),
+            "\"a\\\"b\\\\c\\n\\x01\\x7Fé😀\""
+        );
+    }
+
+    #[test]
+    fn every_error_variant_has_a_name() {
+        // A new variant without a name is a compile error in kind_name;
+        // this pins that the names are the variants' own.
+        assert_eq!(
+            kind_name(&ReadErrorKind::DiscardWithoutForm),
+            "DiscardWithoutForm"
+        );
+        assert_eq!(kind_name(&ReadErrorKind::TooDeep { limit: 1 }), "TooDeep");
+    }
+}

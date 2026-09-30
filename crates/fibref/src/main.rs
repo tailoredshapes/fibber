@@ -23,6 +23,8 @@ commands:
   explain <file>  print the ownership checker's decisions for file (types §9)
   run <file>      run file's main with the reference interpreter and print
                   its result and the memory audit (exit 1 if rejected or failed)
+  read <file>..   print the reader's dump of each file (spec/bootstrap.md §2);
+                  exit 1 if any file does not read, 2 if one cannot be read
   help            print this message";
 
 /// The directory `cases` runs when none is given.
@@ -37,6 +39,8 @@ enum Command {
     Explain { file: String },
     /// Run a file's `main`.
     Run { file: String, args: Vec<String> },
+    /// Print the reader's dump of each file.
+    Read { files: Vec<String> },
     /// Print usage and exit successfully.
     Help,
     /// Print usage and exit with an error: the arguments made no sense.
@@ -58,6 +62,9 @@ fn parse(args: &[String]) -> Command {
         [cmd, file, dashes, rest @ ..] if cmd == "run" && dashes == "--" => Command::Run {
             file: file.clone(),
             args: rest.to_vec(),
+        },
+        [cmd, files @ ..] if cmd == "read" && !files.is_empty() => Command::Read {
+            files: files.to_vec(),
         },
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
         _ => Command::Invalid,
@@ -151,6 +158,34 @@ fn run_file(file: &str, args: &[String]) -> ExitCode {
     }
 }
 
+/// Prints the reader's dump of each file, headed by `== file`: exit 1 if
+/// a file does not read, 2 if one cannot be read (its dump is the line
+/// `unreadable`).
+fn read_files(files: &[String]) -> ExitCode {
+    let mut text = String::new();
+    let mut status = 0u8;
+    for file in files {
+        text.push_str(&format!("== {file}\n"));
+        match std::fs::read_to_string(file) {
+            Ok(source) => {
+                let dump = fibref::dump::dump_source(&source, file);
+                if dump.starts_with("error ") {
+                    status = status.max(1);
+                }
+                text.push_str(&dump);
+            }
+            Err(_) => {
+                text.push_str("unreadable\n");
+                status = 2;
+            }
+        }
+    }
+    match write_stdout(&text) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => ExitCode::from(2),
+        _ => ExitCode::from(status),
+    }
+}
+
 /// Writes `text` to stdout and returns the error instead of panicking
 /// the way `print!` does on a closed pipe.
 fn write_stdout(text: &str) -> io::Result<()> {
@@ -165,6 +200,7 @@ fn main() -> ExitCode {
         Command::Cases { dir } => run_cases(&dir),
         Command::Explain { file } => run_explain(&file),
         Command::Run { file, args } => run_file(&file, &args),
+        Command::Read { files } => read_files(&files),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -237,6 +273,17 @@ mod tests {
             }
         );
         assert_eq!(parse(&args(&["run"])), Command::Invalid);
+    }
+
+    #[test]
+    fn read_takes_one_or_more_files() {
+        assert_eq!(
+            parse(&args(&["read", "a.fib", "b.fib"])),
+            Command::Read {
+                files: vec!["a.fib".to_string(), "b.fib".to_string()]
+            }
+        );
+        assert_eq!(parse(&args(&["read"])), Command::Invalid);
     }
 
     #[test]

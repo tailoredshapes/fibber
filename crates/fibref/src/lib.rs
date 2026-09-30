@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cases;
+pub mod dump;
 pub mod eval;
 pub mod expand;
 pub mod heap;
