@@ -22,11 +22,27 @@ pub fn mangle(g: &Globals, t: &Ty) -> String {
         .collect()
 }
 
+/// The prefix a definition of module `m` carries: none in the main
+/// module, else its `ns` and a dot, so that two modules' `f` differ.
+fn module_prefix(g: &Globals, m: fibref::types::decls::ModuleId) -> String {
+    if m == g.main {
+        String::new()
+    } else {
+        format!("{}.", g.module_name(m))
+    }
+}
+
 /// The name of a body's specialisation at `tys`.
 pub fn body_name(g: &Globals, key: BodyKey, tys: &[Ty]) -> String {
     let mut name = match key {
-        BodyKey::Fun(f) => format!("f.{}", g.fun(f).name),
-        BodyKey::AllOwned(f) => format!("f.{}.owned", g.fun(f).name),
+        BodyKey::Fun(f) => {
+            let d = g.fun(f);
+            format!("f.{}{}", module_prefix(g, d.module), d.name)
+        }
+        BodyKey::AllOwned(f) => {
+            let d = g.fun(f);
+            format!("f.{}{}.owned", module_prefix(g, d.module), d.name)
+        }
         BodyKey::Method(i, m) | BodyKey::MethodOwned(i, m) => {
             let inst = &g.instances[i];
             let proto = g.proto(inst.proto);
@@ -43,7 +59,10 @@ pub fn body_name(g: &Globals, key: BodyKey, tys: &[Ty]) -> String {
                 mangle(g, &inst.head)
             )
         }
-        BodyKey::Def(d) => format!("d.{}", g.def(d).name),
+        BodyKey::Def(d) => {
+            let def = g.def(d);
+            format!("d.{}{}", module_prefix(g, def.module), def.name)
+        }
     };
     for t in tys {
         name.push('.');

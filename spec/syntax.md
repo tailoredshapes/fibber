@@ -1499,11 +1499,15 @@ not a security boundary: privacy keeps a module's interface small and
 its helpers free to change, and `var` is visible in the text wherever
 it is used. A macro defined in the module that uses it needs neither.
 
-The reference implementation has the prelude and one program module
-(M5 adds more), so it checks every rule above between those two: a
-program's reference to a private prelude definition, unqualified or
-as `fib.prelude/x`, reflection on a private prelude type, and `(var
-fib.prelude/x)` (cases 113 to 116). Requires may not be cyclic.
+The reference implementation loads a program's modules from the main
+file's directory, `a.b` at `a/b.fib`, once each in dependency order
+(M5; `cases/modules`), and checks every rule above between them and
+with the prelude: a reference to a private definition, unqualified or
+qualified, reflection on a private type, and `(var m/x)` (cases 113 to
+116 for the prelude, cases/modules for other modules). Requires may
+not be cyclic. Not enforced yet: macros are visible across the modules
+loaded together unqualified, wider than a `:use` gives, and a macro
+cannot be named through an alias.
 `fib.prelude` is implicitly `:use`d. Protocol implementations are global
 facts and are always visible once their module is required.
 

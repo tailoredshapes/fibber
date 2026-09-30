@@ -307,6 +307,8 @@ pub struct Globals {
     pub bindings: Vec<BindingInfo>,
     /// Each module, by `ModuleId`.
     pub modules: Vec<ModuleInfo>,
+    /// The module that defines `main`: the last program module.
+    pub main: ModuleId,
     /// Instance by key.
     pub instance_index: HashMap<(ProtoId, Con), usize>,
     /// The built-in `Option`.

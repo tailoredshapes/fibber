@@ -28,6 +28,7 @@ implemented until an executable test says so.
 ```
 cargo test --workspace                          # the full suite (lair needs LLVM 21)
 cargo run -p fibref -- cases cases/ownership    # 184 cases
+cargo run -p fibref -- cases cases/modules      # programs of several modules, a directory each
 cargo run -p fibref -- run   <file.fib>         # result and memory audit
 cargo run -p fibref -- explain <file.fib>       # the ownership decisions
 cargo run -p lair -- cases cases/lir            # 323 lIR cases, JIT and AOT
@@ -51,6 +52,7 @@ cargo run -p fibc -- gen --seed S --count N     # N generated programs through t
 | Syntax | [spec/syntax.md](spec/syntax.md) | decided |
 | Type system and ownership checker | [spec/types.md](spec/types.md) | decided |
 | Cases | [cases/ownership/](cases/ownership/) | 184, all passing (128–149: vector patterns and guards; 150–153: copy-in at call entry; 154: IEEE float comparisons; 155–161: colour parameters in impl heads; 162–165: no forwarding of a captured `&` parameter; 166–168: spin-waits and `swap!` contention on the fair executor; 169: the native `Show` and `Hash` instances on scalars; 170–173: findings of `fibc gen`; 174–176: the state machine of `async` and its executor; 177: a `dyn` over a native instance; 178: the texts of `show` on floats and `str`; 179–182: the prelude's `Map` and `Set`; 183–184: `str-from-bytes`, `str-join`, `str-chars`, `char->str`; 185–186: `read-file`, `write-file`, `args`, `println`) |
+| Module cases | [cases/modules/](cases/modules/) | 4 programs of several modules (syntax §5), each a directory with its `main.fib`, all passing both ways |
 | Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
 | Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
 | Library | [lib/prelude.fib](lib/prelude.fib) | M5 in progress: `Vec` (a 32-way trie), `Map` and `Set` (an HAMT), `List`, iterators, string building and characters, tasks, `println`, `eprintln`, files and `args` |

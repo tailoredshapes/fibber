@@ -12,6 +12,7 @@ pub mod cases;
 pub mod eval;
 pub mod expand;
 pub mod heap;
+pub mod modules;
 pub mod own;
 pub mod syntax;
 pub mod types;

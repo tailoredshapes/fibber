@@ -20,7 +20,7 @@ mod units;
 use std::collections::{HashMap, HashSet};
 
 use crate::types::ast::{Expr, FunId};
-use crate::types::decls::{Globals, ModuleId};
+use crate::types::decls::Globals;
 use crate::types::error::{ErrorKind, TResult, TypeError};
 use crate::types::lower::ModuleItems;
 use crate::types::scheme::Scheme;
@@ -225,7 +225,7 @@ impl<'g> Checker<'g> {
     pub fn check_main(&mut self) {
         let g = self.g;
         let Some(crate::types::ast::GlobalRef::Fun(f)) =
-            g.names(ModuleId::MAIN).values.get("main").copied()
+            g.names(g.main).values.get("main").copied()
         else {
             let pos = crate::types::init::builtin_pos();
             self.errors

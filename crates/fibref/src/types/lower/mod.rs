@@ -179,14 +179,9 @@ fn declare_extern(g: &mut Globals, m: ModuleId, form: &Form) -> TResult<()> {
 
 /// `(ns name)`: one module plus the prelude is all this checker
 /// supports (syntax §5 kept minimal); a `:require` or `:use` is an error.
-fn ns_form(form: &Form) -> TResult<()> {
-    let items = form.as_list().unwrap_or(&[]);
-    if items.len() > 2 {
-        return Err(TypeError::other(
-            &form.pos,
-            "requiring other modules is not supported yet",
-        ));
-    }
+fn ns_form(_form: &Form) -> TResult<()> {
+    // Its clauses were read by the loader (`crate::modules`), which
+    // gave the module its chain and aliases.
     Ok(())
 }
 

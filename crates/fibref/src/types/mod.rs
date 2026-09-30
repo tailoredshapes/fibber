@@ -51,7 +51,10 @@ pub use error::{ErrorKind, TypeError};
 pub use program::TypedProgram;
 
 use decls::ModuleId;
+
+use crate::modules::ModuleSpec;
 use infer::Checker;
+use std::collections::HashMap;
 
 /// The prelude's library source (`lib/prelude.fib`), written in fibber.
 pub const PRELUDE_LIB: &str = include_str!("../../../../lib/prelude.fib");
@@ -72,6 +75,31 @@ pub fn prelude_forms(ctx: &mut ExpandCtx) -> Result<Vec<Form>, String> {
 /// prelude's forms after expansion. Requires `main : (fn () i64)`.
 pub fn check_program(forms: &[Form], prelude: &[Form]) -> Result<TypedProgram, Vec<TypeError>> {
     check(forms, prelude, true)
+}
+
+/// Checks a program of several modules (syntax §5), expanded, in
+/// dependency order with the main module last. Requires `main`.
+pub fn check_modules(
+    modules: &[(ModuleSpec, Vec<Form>)],
+    prelude: &[Form],
+) -> Result<TypedProgram, Vec<TypeError>> {
+    let pos = init::builtin_pos();
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("fibref-check".into())
+            .stack_size(CHECK_STACK)
+            .spawn_scoped(scope, || {
+                infer_lowered(lower_modules(modules, prelude)?, true)
+            });
+        match worker.map(|h| h.join()) {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(vec![TypeError::other(&pos, "the checker panicked")]),
+            Err(e) => Err(vec![TypeError::other(
+                &pos,
+                format!("cannot start the checker: {e}"),
+            )]),
+        }
+    })
 }
 
 /// Checks a module that need not define `main` (the prelude alone, a
@@ -120,27 +148,66 @@ pub struct Lowered {
     /// Every definition and binding site.
     pub globals: decls::Globals,
     prelude: lower::ModuleItems,
-    user: lower::ModuleItems,
+    /// The program's modules in dependency order, the main one last.
+    modules: Vec<lower::ModuleItems>,
 }
 
-/// Steps 1–3 of §3.5 for the prelude and the user module. Runs on the
-/// calling thread, whose stack must be [`CHECK_STACK`] deep for deeply
-/// nested programs ([`check_program`] makes a thread of its own).
+/// Steps 1–3 of §3.5 for the prelude and one program module with no
+/// `ns` clauses. Runs on the calling thread, whose stack must be
+/// [`CHECK_STACK`] deep for deeply nested programs ([`check_program`]
+/// makes a thread of its own).
 pub fn lower_program(forms: &[Form], prelude: &[Form]) -> Result<Lowered, Vec<TypeError>> {
+    lower_modules(&[(ModuleSpec::main(), forms.to_vec())], prelude)
+}
+
+/// Steps 1–3 of §3.5 for the prelude and the program's modules, given
+/// in dependency order with the main module last (`modules::load`):
+/// each is declared against the ones before it, sees its `:use`s
+/// unqualified and its `:require`s by alias, and the last defines
+/// `main`. Same stack requirement as [`lower_program`].
+pub fn lower_modules(
+    modules: &[(ModuleSpec, Vec<Form>)],
+    prelude: &[Form],
+) -> Result<Lowered, Vec<TypeError>> {
     let mut g = init::new_globals().map_err(|e| vec![e])?;
     let (prelude, prelude_private) = lower::strip_private(prelude);
-    let (forms, user_private) = lower::strip_private(forms);
     let pd = lower::declare(&mut g, ModuleId::PRELUDE, &prelude)?;
     lower::mark_private(&mut g, ModuleId::PRELUDE, &prelude_private);
     init::finish_builtins(&mut g).map_err(|e| vec![e])?;
     let prelude_items = lower::define(&mut g, pd)?;
-    let ud = lower::declare(&mut g, ModuleId::MAIN, &forms)?;
-    lower::mark_private(&mut g, ModuleId::MAIN, &user_private);
-    let user_items = lower::define(&mut g, ud)?;
+    let mut ids: HashMap<String, ModuleId> = HashMap::new();
+    let mut items = Vec::new();
+    for (spec, forms) in modules {
+        let pos = forms
+            .first()
+            .map(|f| f.pos.clone())
+            .unwrap_or_else(init::builtin_pos);
+        let mut aliases = HashMap::new();
+        for (alias, ns) in &spec.requires {
+            let id = *ids.get(ns).ok_or_else(|| {
+                vec![TypeError::other(&pos, format!("module {ns} is not loaded"))]
+            })?;
+            aliases.insert(alias.clone(), id);
+        }
+        let mut uses = Vec::new();
+        for ns in &spec.uses {
+            let id = *ids.get(ns).ok_or_else(|| {
+                vec![TypeError::other(&pos, format!("module {ns} is not loaded"))]
+            })?;
+            uses.push(id);
+        }
+        let m = g.add_module(&spec.ns, &uses, aliases);
+        ids.insert(spec.ns.clone(), m);
+        g.main = m;
+        let (forms, private) = lower::strip_private(forms);
+        let d = lower::declare(&mut g, m, &forms)?;
+        lower::mark_private(&mut g, m, &private);
+        items.push(lower::define(&mut g, d)?);
+    }
     Ok(Lowered {
         globals: g,
         prelude: prelude_items,
-        user: user_items,
+        modules: items,
     })
 }
 
@@ -151,7 +218,9 @@ pub fn infer_lowered(l: Lowered, main: bool) -> Result<TypedProgram, Vec<TypeErr
     let (env, tables, units) = {
         let mut ck = Checker::new(&g);
         ck.module(&l.prelude);
-        ck.module(&l.user);
+        for items in &l.modules {
+            ck.module(items);
+        }
         if main {
             ck.check_main();
         }

@@ -31,7 +31,7 @@ pub fn explain(p: &TypedProgram, o: &OwnedProgram) -> String {
         let Some((title, body, module)) = header(p, *key) else {
             continue;
         };
-        if module != ModuleId::MAIN {
+        if module != p.globals.main {
             continue;
         }
         if let Some(b) = o.bodies.get(key) {

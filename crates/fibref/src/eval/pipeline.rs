@@ -3,11 +3,11 @@
 //! the `def`s and then `main`, and audit the heap at the end.
 
 use crate::cases::{AuditSummary, Evaluator, Outcome, Value};
-use crate::expand::{expand_program, ExpandCtx};
+use crate::expand::ExpandCtx;
 use crate::heap::{AuditReport, LeakClass};
 use crate::own::program::BodyKey;
-use crate::own::{check_forms, CheckError, Checked};
-use crate::syntax::read_all;
+use crate::own::{check_modules, CheckError, Checked};
+use crate::syntax::Form;
 use crate::types::infer::UnitRef;
 use crate::types::prelude_forms;
 
@@ -33,6 +33,10 @@ pub struct Interpreter;
 impl Evaluator for Interpreter {
     fn run(&self, source: &str) -> Outcome {
         run_source(source, "<case>")
+    }
+
+    fn run_at(&self, source: &str, path: &std::path::Path) -> Outcome {
+        run_source(source, &path.to_string_lossy())
     }
 }
 
@@ -104,14 +108,19 @@ fn check(source: &str, file: &str) -> Result<Checked, Outcome> {
     let prelude = prelude_forms(&mut ctx).map_err(|m| Outcome::Failed {
         message: format!("the prelude does not expand: {m}"),
     })?;
-    let forms = read_all(source, file).map_err(|e| Outcome::Rejected {
-        message: e.to_string(),
+    let loaded =
+        crate::modules::load(source, file).map_err(|m| Outcome::Rejected { message: m })?;
+    let all: Vec<Form> = loaded
+        .iter()
+        .flat_map(|l| l.forms.iter().cloned())
+        .collect();
+    let mut runner = MacroEvaluator::new(&all, prelude.clone());
+    let modules = crate::modules::expand_all(loaded, &mut ctx, &mut runner).map_err(|e| {
+        Outcome::Rejected {
+            message: e.to_string(),
+        }
     })?;
-    let mut runner = MacroEvaluator::new(&forms, prelude.clone());
-    let forms = expand_program(forms, &mut ctx, &mut runner).map_err(|e| Outcome::Rejected {
-        message: e.to_string(),
-    })?;
-    check_forms(&forms, &prelude).map_err(|e| match e {
+    check_modules(&modules, &prelude).map_err(|e| match e {
         CheckError::Internal(m) | CheckError::Prelude(m) => Outcome::Failed { message: m },
         e => Outcome::Rejected {
             message: e.to_string(),

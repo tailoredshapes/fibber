@@ -95,6 +95,13 @@ pub enum Outcome {
 pub trait Evaluator {
     /// Runs the whole source of one case file, header comments included.
     fn run(&self, source: &str) -> Outcome;
+
+    /// [`Evaluator::run`] knowing the case's path, which a program of
+    /// several modules needs (syntax §5: its modules live under the
+    /// main file's directory); by default the path is ignored.
+    fn run_at(&self, source: &str, _path: &std::path::Path) -> Outcome {
+        self.run(source)
+    }
 }
 
 /// An evaluator that supports nothing, so that the harness runs before

@@ -162,3 +162,22 @@ fn real_cases_run_with_no_header_errors_and_nothing_passes_yet() {
     assert_eq!(report.counts.pending, report.counts.total());
     assert!(report.ok());
 }
+
+/// The programs of several modules (syntax §5) under cases/modules,
+/// each its directory's main.fib, all pass in the reference interpreter.
+#[test]
+fn the_module_cases_all_pass_in_the_interpreter() {
+    let modules = Path::new(CASES_DIR).join("modules");
+    let report = run_dir(&modules, &fibref::eval::Interpreter).unwrap();
+    let rows: Vec<String> = report
+        .results
+        .iter()
+        .map(|r| format!("{} {}", r.name(), r.status.label()))
+        .collect();
+    assert!(report.counts.total() >= 4, "{rows:?}");
+    assert!(report.ok() && report.counts.pending == 0, "{rows:?}");
+    assert!(
+        rows[0].starts_with("001-require-alias-and-use/main.fib"),
+        "{rows:?}"
+    );
+}

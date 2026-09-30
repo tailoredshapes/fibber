@@ -54,12 +54,8 @@ pub fn new_globals() -> TResult<Globals> {
                 chain: vec![ModuleId::PRELUDE, ModuleId::BUILTIN],
                 ..ModuleInfo::default()
             },
-            ModuleInfo {
-                ns: "the program's module".into(),
-                chain: vec![ModuleId::MAIN, ModuleId::PRELUDE, ModuleId::BUILTIN],
-                ..ModuleInfo::default()
-            },
         ],
+        main: ModuleId::MAIN,
         instance_index: HashMap::new(),
         option: TypeId(0),
         form: None,

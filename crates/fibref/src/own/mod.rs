@@ -43,9 +43,10 @@ pub use program::OwnedProgram;
 pub use taken::{methods_taken, value_taken};
 pub use top::analyse;
 
-use crate::expand::{expand_program, ExpandCtx, NoRunner};
-use crate::syntax::{read_all, Form};
-use crate::types::{infer_lowered, lower_program, prelude_forms, TypedProgram, CHECK_STACK};
+use crate::expand::{ExpandCtx, NoRunner};
+use crate::modules::ModuleSpec;
+use crate::syntax::Form;
+use crate::types::{infer_lowered, lower_modules, prelude_forms, TypedProgram, CHECK_STACK};
 
 /// A program that passed the whole front end.
 #[derive(Clone, Debug)]
@@ -61,21 +62,30 @@ pub struct Checked {
 pub fn check_source(source: &str, file: &str) -> Result<Checked, CheckError> {
     let mut ctx = ExpandCtx::new();
     let prelude = prelude_forms(&mut ctx).map_err(CheckError::Prelude)?;
-    let forms = read_all(source, file).map_err(|e| CheckError::Read(e.to_string()))?;
-    let forms = expand_program(forms, &mut ctx, &mut NoRunner)
+    let loaded = crate::modules::load(source, file).map_err(CheckError::Read)?;
+    let modules = crate::modules::expand_all(loaded, &mut ctx, &mut NoRunner)
         .map_err(|e| CheckError::Expand(e.to_string()))?;
-    check_forms(&forms, &prelude)
+    check_modules(&modules, &prelude)
 }
 
 /// Checks a module's forms after expansion against the prelude's:
 /// lowering, the `&` checks, inference, the ownership pass. Runs on a
 /// thread with a [`CHECK_STACK`]-deep stack, as the checker does.
 pub fn check_forms(forms: &[Form], prelude: &[Form]) -> Result<Checked, CheckError> {
+    check_modules(&[(ModuleSpec::main(), forms.to_vec())], prelude)
+}
+
+/// [`check_forms`] for a program of several modules (syntax §5),
+/// expanded, in dependency order with the main module last.
+pub fn check_modules(
+    modules: &[(ModuleSpec, Vec<Form>)],
+    prelude: &[Form],
+) -> Result<Checked, CheckError> {
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new()
             .name("fibref-own".into())
             .stack_size(CHECK_STACK)
-            .spawn_scoped(scope, || check_here(forms, prelude));
+            .spawn_scoped(scope, || check_here(modules, prelude));
         match worker.map(|h| h.join()) {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(CheckError::Internal("the checker panicked".into())),
@@ -86,8 +96,11 @@ pub fn check_forms(forms: &[Form], prelude: &[Form]) -> Result<Checked, CheckErr
     })
 }
 
-fn check_here(forms: &[Form], prelude: &[Form]) -> Result<Checked, CheckError> {
-    let lowered = lower_program(forms, prelude).map_err(CheckError::Type)?;
+fn check_here(
+    modules: &[(ModuleSpec, Vec<Form>)],
+    prelude: &[Form],
+) -> Result<Checked, CheckError> {
+    let lowered = lower_modules(modules, prelude).map_err(CheckError::Type)?;
     let amp = syntactic::check(&lowered.globals);
     if !amp.is_empty() {
         return Err(CheckError::Own(amp));

@@ -73,7 +73,7 @@ use std::collections::HashMap;
 
 use super::ast::{BindingId, DefId, ExprId, FunId, GlobalRef};
 use super::builtins::{BuiltinSig, BUILTINS};
-use super::decls::{Globals, ModuleId};
+use super::decls::Globals;
 use super::display::Printer;
 use super::infer::{Instantiation, Resolution, UnitRef};
 use super::scheme::Scheme;
@@ -127,7 +127,7 @@ impl TypedProgram {
 
     /// The `defun` named `name` in the user module, else the prelude.
     pub fn fun(&self, name: &str) -> Option<FunId> {
-        match self.globals.value(ModuleId::MAIN, name)? {
+        match self.globals.value(self.globals.main, name)? {
             GlobalRef::Fun(f) => Some(f),
             _ => None,
         }
@@ -206,7 +206,7 @@ impl TypedProgram {
 
     /// The type of the `def` `name`.
     pub fn def_type(&self, name: &str) -> Option<&Ty> {
-        match self.globals.value(ModuleId::MAIN, name)? {
+        match self.globals.value(self.globals.main, name)? {
             GlobalRef::Def(DefId(d)) => self.def_types.get(d as usize)?.as_ref(),
             _ => None,
         }

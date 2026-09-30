@@ -29,10 +29,16 @@ pub struct CaseResult {
 impl CaseResult {
     /// The file name, for reports.
     pub fn name(&self) -> String {
-        self.path
+        let file = self
+            .path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.display().to_string())
+            .unwrap_or_else(|| self.path.display().to_string());
+        // A program of several modules is its directory's main.fib.
+        match self.path.parent().and_then(Path::file_name) {
+            Some(dir) if file == "main.fib" => format!("{}/main.fib", dir.to_string_lossy()),
+            _ => file,
+        }
     }
 }
 
@@ -98,7 +104,7 @@ pub fn run_case(path: &Path, evaluator: &dyn Evaluator) -> CaseResult {
         }),
         Ok(source) => match parse_header(path, &source) {
             Err(e) => Status::HeaderError(e),
-            Ok(header) => judge(&header, &evaluator.run(&source)),
+            Ok(header) => judge(&header, &evaluator.run_at(&source, path)),
         },
     };
     CaseResult {
@@ -117,21 +123,44 @@ pub fn run_dir(dir: &Path, evaluator: &dyn Evaluator) -> io::Result<Report> {
     Ok(Report::from_results(results))
 }
 
-/// The `*.fib` files directly inside `dir`, sorted by file name.
+/// The `*.fib` files directly inside `dir`, and the `main.fib` of each
+/// subdirectory that has one (a program of several modules, syntax
+/// §5), sorted by name.
 pub fn list_cases(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut cases: Vec<PathBuf> = std::fs::read_dir(dir)?
         .map(|entry| entry.map(|e| e.path()))
-        .filter(|path| path.as_ref().map_or(true, |p| is_case(p)))
+        .filter_map(|path| match path {
+            Err(e) => Some(Err(e)),
+            Ok(p) if is_case(&p) => Some(Ok(p)),
+            Ok(p) if p.is_dir() && p.join("main.fib").is_file() => Some(Ok(p.join("main.fib"))),
+            Ok(_) => None,
+        })
         .collect::<io::Result<_>>()?;
-    cases.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
+    cases.sort_by_key(|p| {
+        let name = p.file_name().map(|n| n.to_os_string());
+        if p.file_name().is_some_and(|n| n == "main.fib") {
+            p.parent()
+                .and_then(|d| d.file_name())
+                .map(|n| n.to_os_string())
+        } else {
+            name
+        }
+    });
     Ok(cases)
 }
 
-/// Every `*.fib` file under `dir`, at any depth, sorted by path.
+/// Every `*.fib` file under `dir`, at any depth, sorted by path; a
+/// directory with a `main.fib` is one case, that file, and its other
+/// files and subdirectories are that program's modules (syntax §5).
 pub fn list_cases_recursive(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut cases = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
+        let main = current.join("main.fib");
+        if main.is_file() {
+            cases.push(main);
+            continue;
+        }
         for entry in std::fs::read_dir(&current)? {
             let path = entry?.path();
             if path.is_dir() {

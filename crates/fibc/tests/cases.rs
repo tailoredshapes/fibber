@@ -8,18 +8,31 @@ use std::path::{Path, PathBuf};
 use fibc::harness::Harness;
 use fibref::cases::{render, Status};
 
-fn cases_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cases/ownership")
+fn cases_dir(suite: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../cases")
+        .join(suite)
 }
 
 #[test]
 fn ownership_cases_agree_interpreted_and_compiled() {
+    suite_agrees("ownership");
+}
+
+/// The programs of several modules (syntax §5), each its directory's
+/// main.fib with the others beside it.
+#[test]
+fn module_cases_agree_interpreted_and_compiled() {
+    suite_agrees("modules");
+}
+
+fn suite_agrees(suite: &str) {
     let harness = Harness {
         fibc: PathBuf::from(env!("CARGO_BIN_EXE_fibc")),
     };
     let report = harness
-        .run_dir(&cases_dir())
-        .expect("cases/ownership readable");
+        .run_dir(&cases_dir(suite))
+        .expect("the suite's directory is readable");
     let text = render(&report);
     let pending: Vec<&str> = report
         .results

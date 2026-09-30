@@ -197,8 +197,12 @@ interpreted and compiled:
       FILE -- a b` hand the arguments on, and a built executable returns
       `main`'s result as its exit status and prints nothing of its own
       (compiler.md §1; cases 185 and 186, `crates/fibc/tests/cli.rs`)
-- [ ] multiple modules (§5 of syntax.md beyond one module plus the
-      prelude)
+- [x] multiple modules (syntax §5): `ns` with `:require` aliases and
+      `:use`, modules found under the main file's directory and read
+      once each in dependency order, private names and `var` across
+      modules, in both tools (`crates/fibref/src/modules.rs`;
+      `cases/modules`, 4 programs both harnesses run). Not yet: macro
+      visibility limited to `:use`, and macros through an alias
 
 ## M6. Bootstrap
 

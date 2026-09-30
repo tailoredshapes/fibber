@@ -5,9 +5,8 @@
 //! consumes.
 
 use fibref::cases::Outcome;
-use fibref::expand::{expand_program, ExpandCtx, MacroRunner};
-use fibref::own::{check_forms, CheckError, Checked};
-use fibref::syntax::read_all;
+use fibref::expand::{ExpandCtx, MacroRunner};
+use fibref::own::{check_modules, CheckError, Checked};
 use fibref::types::prelude_forms;
 
 /// What the front end said about a program.
@@ -40,19 +39,23 @@ pub fn check(source: &str, file: &str) -> Front {
         Ok(p) => p,
         Err(m) => return Front::Failed(format!("the prelude does not expand: {m}")),
     };
-    let forms = match read_all(source, file) {
-        Ok(f) => f,
-        Err(e) => return Front::Rejected(e.to_string()),
+    let loaded = match fibref::modules::load(source, file) {
+        Ok(l) => l,
+        Err(m) => return Front::Rejected(m),
     };
-    let mut runner = match macro_runner(&forms, prelude.clone()) {
+    let all: Vec<fibref::syntax::Form> = loaded
+        .iter()
+        .flat_map(|l| l.forms.iter().cloned())
+        .collect();
+    let mut runner = match macro_runner(&all, prelude.clone()) {
         Ok(r) => r,
         Err(m) => return Front::Failed(m),
     };
-    let forms = match expand_program(forms, &mut ctx, runner.as_mut()) {
+    let modules = match fibref::modules::expand_all(loaded, &mut ctx, runner.as_mut()) {
         Ok(f) => f,
         Err(e) => return Front::Rejected(e.to_string()),
     };
-    match check_forms(&forms, &prelude) {
+    match check_modules(&modules, &prelude) {
         Ok(c) => Front::Checked(Box::new(c)),
         Err(CheckError::Internal(m) | CheckError::Prelude(m)) => Front::Failed(m),
         Err(e) => Front::Rejected(e.to_string()),
