@@ -149,8 +149,11 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
 - [x] the native `Show` and `Hash` instances on scalars, field-less
       enums and `str` (case 169), except `show` of a float and of a
       `str`, whose text is undecided (compiler.md §8 item 11)
-- [ ] `def` initialisers through the JIT (today evaluated by `fibref`
-      and serialised; question 4); a `(dyn P)` of a native instance
+- [x] `def` initialisers through the JIT (compiler.md §8 item 4;
+      `defs/jit.rs`, with the interpreter backend kept as the
+      executable spec of the same constants, `tests/defs.rs`)
+- [ ] a `(dyn P)` of a native instance (`str` under `Show`, `Eq`,
+      `Ord`, `Hash`; needs item 11 for `show`)
 - [x] generated programs through the harness: `fibc gen` writes each
       program `fibgen` generates as a case whose header is the model's
       verdict and runs it both ways (`tests/gen.rs`: the first 120

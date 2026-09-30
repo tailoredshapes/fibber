@@ -60,6 +60,11 @@ impl Statics {
         name
     }
 
+    /// The immortal closures made so far, by address name (`@clo.N`).
+    pub fn closure_names(&self) -> Vec<String> {
+        self.closures.iter().map(|(n, _, _)| n.clone()).collect()
+    }
+
     /// The address of the vtable named `name` with these slots (§8.5),
     /// or of the one registered under that name before.
     pub fn vtable(&mut self, name: &str, slots: Vec<String>) -> String {

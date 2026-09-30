@@ -266,10 +266,20 @@ Recorded as they arise; none changes §8.
    good. The interpreter keeps driving a task to completion on the
    joiner's stack, which §8.8 allows; results and frees agree (cases
    11, 24, 32, 38, 43, 44, 148, 174 to 176).
-4. **`def` initialisers** are evaluated by the reference interpreter
-   at compile time and serialised as constants; §8.10 says they run
-   through the JIT that runs macros. Same values (the interpreter is
-   the executable spec); to be moved to the JIT with macros (§6).
+4. **`def` initialisers run through the JIT** (done, 2026-09-30, as
+   §8.10 says). Each initialiser is lowered as the body `d.NAME`; the
+   module so far (runtime, tables, the constants of the earlier
+   `def`s, every body) is JIT-compiled, the initialiser called, and
+   its value read out of the JIT's memory by the type table's layouts
+   into `IMMORTAL` constants (`defs/jit.rs`), a `def` at a time in
+   source order so that each sees the ones before it; the statics a
+   value may point to (earlier constants, the closures of named
+   functions) are found by address and shared. The interpreter backend
+   (`defs/interp.rs`) remains the executable spec of the same values
+   and the fallback of a build without `llvm`; `tests/defs.rs` requires
+   the two to emit the same constants, text for text. Still
+   unsupported in a `def`: a closure other than a named function, a
+   `dyn`, a boxed `Option`, a cell, an atom.
 5. **A boxed `Option`'s `nil` may be null.** §8.3 gives every
    non-null `Option` a heap enum with tag 0 for `nil`. The
    interpreter allocates that object only where the plan decides the

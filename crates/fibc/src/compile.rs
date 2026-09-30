@@ -39,13 +39,19 @@ pub fn compile(checked: &Checked) -> Result<String, Unsupported> {
     let defs = crate::defs::emit_defs(&mut p)?;
     p.def_values = defs.values;
     let entry = p.request(BodyKey::Fun(main), Vec::new());
+    emit_all(&mut p)?;
+    Ok(assemble(&mut p, &defs.text, &entry))
+}
+
+/// Emits every body and closure queued so far.
+pub(crate) fn emit_all(p: &mut Program<'_>) -> Result<(), Unsupported> {
     while let Some(w) = p.next_work() {
         match w {
-            Work::Body(inst) => emit_body(&mut p, inst)?,
-            Work::Closure { owner, lit, name } => emit_closure(&mut p, owner, lit, &name)?,
+            Work::Body(inst) => emit_body(p, inst)?,
+            Work::Closure { owner, lit, name } => emit_closure(p, owner, lit, &name)?,
         }
     }
-    Ok(assemble(&mut p, &defs.text, &entry))
+    Ok(())
 }
 
 /// A compiled macro-time module (compiler.md §6, `macros/`).
@@ -113,12 +119,7 @@ pub fn compile_macro(
         BodyKey::Fun(fibref::types::ast::FunId(f as u32)),
         Vec::new(),
     );
-    while let Some(w) = p.next_work() {
-        match w {
-            Work::Body(inst) => emit_body(&mut p, inst)?,
-            Work::Closure { owner, lit, name } => emit_closure(&mut p, owner, lit, &name)?,
-        }
-    }
+    emit_all(&mut p)?;
     let layout = FormLayout {
         sname,
         tid,
@@ -137,7 +138,7 @@ pub fn compile_macro(
 
 /// The runtime, the tables, the static data and every function: what
 /// a program and a macro module share.
-fn assemble_parts(p: &mut Program<'_>, defs: &str) -> String {
+pub(crate) fn assemble_parts(p: &mut Program<'_>, defs: &str) -> String {
     let mut out = String::new();
     for part in RUNTIME {
         out.push_str(part);

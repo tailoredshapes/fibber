@@ -123,6 +123,19 @@ pub fn struct_size(fields: &[LirTy]) -> u64 {
     struct_size_of(&fields.iter().map(|f| size_align(*f)).collect::<Vec<_>>())
 }
 
+/// The offset of each field of a struct laid out as [`struct_size`]
+/// lays it out.
+pub fn field_offsets(fields: &[(u64, u64)]) -> Vec<u64> {
+    let mut off = 0u64;
+    let mut out = Vec::new();
+    for (s, a) in fields {
+        off = off.div_ceil(*a) * a;
+        out.push(off);
+        off += s;
+    }
+    out
+}
+
 /// [`struct_size`] over (size, alignment) pairs.
 pub fn struct_size_of(fields: &[(u64, u64)]) -> u64 {
     let mut off = 0u64;

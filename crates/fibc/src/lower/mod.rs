@@ -97,7 +97,7 @@ pub fn emit_body(p: &mut Program<'_>, inst: Inst) -> R<()> {
             let im = &g.instances[i].methods[m];
             (im.params.clone(), &im.body)
         }
-        BodyKey::Def(_) => return Err(Unsupported("def initialisers".into())),
+        BodyKey::Def(d) => (Vec::new(), &g.def(d).init),
     };
     let name = p.queue.request(g, inst.clone());
     let env = matches!(inst.key, BodyKey::AllOwned(_) | BodyKey::MethodOwned(..));

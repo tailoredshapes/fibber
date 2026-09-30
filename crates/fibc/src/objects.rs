@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::ir::LirTy;
-use crate::layout::{size_align, struct_size_of, HEADER};
+use crate::layout::{field_offsets, size_align, struct_size_of, HEADER};
 
 /// One slot of a task's frame (§8.8, `..locals`): a value live across
 /// an `await`, or the bytes of what an ordinary function would
@@ -116,6 +116,33 @@ impl ObjInfo {
             }
         }
         f
+    }
+
+    /// The lIR slot of each declared field of a struct, or of variant
+    /// `tag` of an enum (`None` for a unit field, which has no slot).
+    pub fn slots(&self, tag: Option<usize>) -> Vec<Option<LirTy>> {
+        match (&self.kind, tag) {
+            (ObjKind::Struct(fs), _) => fs.clone(),
+            (ObjKind::Enum(vs), Some(i)) => vs[i].clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The byte offset of each user slot of a struct, or of variant
+    /// `tag` of an enum, after the header (and the tag).
+    pub fn offsets(&self, tag: Option<usize>) -> Vec<u64> {
+        // A struct's `fields()` already holds its slots; an enum's holds
+        // the tag prefix, and the variant's slots follow.
+        let mut f = self.fields();
+        let fixed = match self.kind {
+            ObjKind::Struct(_) => HEADER.len(),
+            _ => f.len(),
+        };
+        if let ObjKind::Enum(_) = self.kind {
+            f.extend(self.slots(tag).into_iter().flatten().map(Frame::Val));
+        }
+        let all = field_offsets(&f.iter().map(Frame::size_align).collect::<Vec<_>>());
+        all[fixed..].to_vec()
     }
 
     /// The size of a fixed-size object; an enum's is its largest
@@ -424,6 +451,9 @@ mod tests {
         );
         assert_eq!(o.get(1).size(), 40);
         assert_eq!(o.get(2).size(), 24);
+        assert_eq!(o.get(0).offsets(None), vec![16]);
+        assert_eq!(o.get(1).offsets(Some(1)), vec![24, 32]);
+        assert_eq!(o.get(1).offsets(Some(0)), Vec::<u64>::new());
         let src = format!(
             "(defstruct fib.typerec (ptr ptr ptr i64))\n(declare fib.release void (ptr))\n{}",
             o.render()
