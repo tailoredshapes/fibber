@@ -1,0 +1,21 @@
+;; spec:   types §8.8 (syntax §3.12)
+;; expect: accept
+;; result: 64
+;; audit:  clean
+;; An async body whose loop awaits a fresh task on every turn, with a
+;; string built before the loop, the loop's own variables and the
+;; awaited task's result all live across each await. Compiled, the
+;; body is a state machine (types §8.8): everything live into a
+;; resume lives in the task's frame, and a loop variable is a slot of
+;; it, not of a worker's stack. The awaited tasks are pending when
+;; awaited, so the executor starts each of them (syntax §3.12).
+(defun step (i: i64) -> (Task i64) (async (* i 10)))
+
+(defun main () -> i64
+  (let ((t (async
+             (let ((prefix (str-concat "ab" "cd")))
+               (loop ((i 0) (acc 0))
+                 (if (= i 4)
+                     (+ acc (str-len prefix))
+                     (recur (+ i 1) (+ acc (await (step i))))))))))
+    (block-on t)))

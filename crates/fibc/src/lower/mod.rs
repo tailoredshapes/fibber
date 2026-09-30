@@ -75,6 +75,8 @@ pub struct Cx<'p, 'a> {
     /// The entry-block slots of stack closures: their captures are
     /// aliases (§6.5), so their scope end runs no drop.
     pub closure_slots: HashSet<String>,
+    /// Set while an `async` body is lowered (threads.rs, resume.rs).
+    pub async_frame: Option<threads::AsyncFrame>,
 }
 
 /// Emits the function of `inst` into the program.
@@ -169,8 +171,10 @@ pub fn emit_closure(p: &mut Program<'_>, owner: Inst, lit: ExprId, name: &str) -
     cx.finish_with(&f.body)
 }
 
-/// The code of an `async` body (§8.8, compiler.md §8 question 3):
-/// `env` is the task object, whose captures follow its fixed fields.
+/// The resume function of an `async` body (§8.8): `env` is the task
+/// object, whose captures follow its fixed fields; the body is lowered
+/// like any function, then made a state machine (`resume.rs`), and the
+/// task's frame takes the shape that gives it.
 fn emit_async<'a>(
     p: &mut Program<'a>,
     owner: Inst,
@@ -179,7 +183,10 @@ fn emit_async<'a>(
     body: &'a Expr,
     name: &str,
 ) -> R<()> {
+    use crate::objects::TASK_CAPTURE0;
+    use crate::resume::{make_resumable, Shape};
     let mut cx = Cx::new(p, owner, own, name, vec![(LirTy::Ptr, "env".to_string())]);
+    cx.b.tailcc = false;
     cx.env = Some(V::Val("env".into(), LirTy::Ptr));
     let own_c = cx
         .own
@@ -187,13 +194,44 @@ fn emit_async<'a>(
         .get(&e.id)
         .ok_or_else(|| Unsupported("no plan for an async literal".into()))?;
     let caps = cx.capture_tys(own_c)?;
-    let (_, sname) = cx.p.task_object(&cx.name.clone(), caps.clone());
+    let (tid, sname) = cx.p.task_object(&cx.name.clone(), caps.clone());
     for (i, (c, t)) in own_c.captures.iter().zip(&caps).enumerate() {
-        let slot = cx.gep(&sname, "env", crate::objects::TASK_CAPTURE0 + i);
+        let slot = cx.gep(&sname, "env", TASK_CAPTURE0 + i);
         let v = cx.load(*t, &slot);
         cx.locals.insert(c.binding, Local::Val(v));
     }
-    cx.finish_with(body)
+    let point = TASK_CAPTURE0 + caps.len();
+    cx.async_frame = Some(threads::AsyncFrame {
+        tsname: sname.clone(),
+        point,
+        states: Vec::new(),
+    });
+    let prologue = cx.b.blocks[0].items.len();
+    let result_ty = match cx.ty(e)? {
+        Ty::Con(fibref::types::ty::Con::Task, args) => args[0].clone(),
+        _ => return Err(Unsupported("async without a Task type".into())),
+    };
+    cx.b.ret = cx.p.lir(&result_ty)?;
+    if let Flow::Val(v) = cx.expr(body)? {
+        match &v {
+            V::Unit => cx.b.term("(ret)"),
+            V::Val(s, _) => cx.b.term(&format!("(ret {s})")),
+        }
+    }
+    let complete = cx.complete_helper(name, &result_ty)?;
+    let states = cx.async_frame.take().map(|f| f.states).unwrap_or_default();
+    let shape = Shape {
+        tsname: &sname,
+        prologue,
+        points: &states,
+        complete: &complete,
+        point_field: point,
+    };
+    let frame = make_resumable(&mut cx.b, &shape)?;
+    cx.p.objects.set_task_frame(tid, frame);
+    let text = cx.b.render();
+    cx.p.funcs.push(text);
+    Ok(())
 }
 
 /// Every `fn` and `async` literal of a body, by expression id.
@@ -240,6 +278,7 @@ impl<'p, 'a> Cx<'p, 'a> {
             lits,
             rests: Vec::new(),
             closure_slots: HashSet::new(),
+            async_frame: None,
         }
     }
 

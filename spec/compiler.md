@@ -77,7 +77,8 @@ the C functions it uses (`malloc`, `free`, `memcpy`, `write`, `abort`,
 | `fib.str-*`, `fib.array-*` | | the builtins of syntax §4.3 on `str` and `Array` objects, allocating through `fib.alloc` exactly where the interpreter's natives allocate |
 | `fib.weak`, `fib.upgrade`, `fib.weak-clear` | §8.7 | |
 | `fib.lock`, `fib.unlock` | `(ptr) -> void` | the spinlock of an atom or a weak box |
-| `fib.spawn`, `fib.join`, `fib.task-*` | §8.8 | |
+| `fib.spawn`, `fib.join-all` | §8.8 | a spawned task's thread; `main`'s return joins every thread |
+| `fib.enqueue`, `fib.dequeue`, `fib.pool-start`, `fib.worker`, `fib.run-one`, `fib.drive`, `fib.await-or-park`, `fib.task-complete` | §8.8, §8 item 3 | the run queue, the pool, a joiner driving the queue, parking at an `await`, the wake at a completion |
 
 The type table `fib.types` is emitted by the compiler as a `constant`
 (§8.2) and reached from the runtime by name, since both are in one
@@ -238,18 +239,33 @@ Recorded as they arise; none changes §8.
    (per-thread sequences) would need the compiled trace to name the
    thread and the interpreter's to do the same, and its threads are
    not the OS's; proposed as out of scope for M4.
-3. **`async` bodies are not state machines yet.** types §8.8 lowers an
-   `async` to a state machine resumed at each `await`. `fibref` never
-   suspends a body: a task is driven to completion on the stack of the
-   thread that first joins or awaits it, and an `await` of a task
-   another thread is driving blocks that thread (§8.8, "The reference
-   interpreter's schedule"). `fibc` does the same: the body is
-   compiled as a function of the task object (captures in the task,
-   §8.8's layout), a `join`/`await` claims the driver with `cmpxchg`
-   and calls it, or waits for `done`. Results and frees are those of
-   the interpreter; the difference is only in what a `resume` can do
-   mid-body, which nothing in the cases observes. Should the state
-   machine be required for M4, or accepted as a later refinement?
+3. **`async` bodies are state machines** (**Decided**, owner,
+   2026-09-30: as types §8.8 says, and as Clojure compiles a `go`
+   block). The body is lowered like any function, each `await` ending
+   its block, and `crates/fibc/src/resume.rs` then makes the function
+   resumable: the entry block keeps the prologue (the captures) and
+   ends in a `switch` on the task's resume point; every value live
+   into a continuation lives in a slot of the task's frame (stored
+   after its definition, loaded before each use, so no SSA value
+   crosses a park and no `phi` is rebuilt); every `alloca` is a byte
+   slot of the frame; every `ret` is the task's completion. The frame
+   follows the captures (§8.8's `..locals`): the resume point, then
+   the slots, so a task is allocated at the type table's size. The
+   executor (`rt/task.lir`): a run queue under a spinlock and a pool of
+   one worker per processor started at the first enqueue (which writes
+   the `T` of §4: from then on the trace is compared by tally); a
+   `join` drives the queue itself until its task is done, resuming the
+   task when it can claim it, running other queued tasks meanwhile
+   (§8.8); `await` finds the awaited task done, or queues it if it is
+   pending (syntax §3.12: the executor runs a task when it is
+   awaited), registers the awaiting task in its waiter list, marks it
+   parked and returns from the resume; completion wakes every waiter
+   onto the queue. A task's state word: 0 pending, 1 running or
+   queued, 2 done, 3 parked; only a claimed task in state 0 or 1 is
+   resumed, and a spawned task's driver is held by its thread for
+   good. The interpreter keeps driving a task to completion on the
+   joiner's stack, which §8.8 allows; results and frees agree (cases
+   11, 24, 32, 38, 43, 44, 148, 174 to 176).
 4. **`def` initialisers** are evaluated by the reference interpreter
    at compile time and serialised as constants; §8.10 says they run
    through the JIT that runs macros. Same values (the interpreter is

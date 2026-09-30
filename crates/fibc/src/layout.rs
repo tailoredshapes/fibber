@@ -120,12 +120,16 @@ pub fn size_align(t: LirTy) -> (u64, u64) {
 /// non-packed struct: each field at its alignment, the whole rounded
 /// up to the largest alignment.
 pub fn struct_size(fields: &[LirTy]) -> u64 {
+    struct_size_of(&fields.iter().map(|f| size_align(*f)).collect::<Vec<_>>())
+}
+
+/// [`struct_size`] over (size, alignment) pairs.
+pub fn struct_size_of(fields: &[(u64, u64)]) -> u64 {
     let mut off = 0u64;
     let mut max_align = 1u64;
-    for f in fields {
-        let (s, a) = size_align(*f);
-        off = off.div_ceil(a) * a + s;
-        max_align = max_align.max(a);
+    for (s, a) in fields {
+        off = off.div_ceil(*a) * a + s;
+        max_align = max_align.max(*a);
     }
     off.div_ceil(max_align) * max_align
 }

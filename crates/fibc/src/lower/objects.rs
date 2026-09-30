@@ -23,7 +23,7 @@ impl<'a> Cx<'_, 'a> {
                 let slot = match self.stack_slots.get(&e) {
                     Some(s) => s.clone(),
                     None => {
-                        let s = self.b.entry_alloca(&format!("%struct.{sname}"));
+                        let s = self.b.entry_alloca(&format!("%struct.{sname}"), size);
                         self.stack_slots.insert(e, s.clone());
                         s
                     }

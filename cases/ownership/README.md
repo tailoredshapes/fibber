@@ -200,3 +200,13 @@ constant zero divisor, so the trap is emitted alone, as a call that
 does not return. `trap` where a value is needed (173, trap): what the
 lowering emits after a call that does not return goes into blocks
 nothing reaches, which the builder now discards.
+
+Cases 174 to 176 pin the state machine an `async` body compiles to
+and its executor (types §8.8; compiler.md §8 item 3), all accept with
+a clean audit: a loop that awaits a fresh, pending task on every turn,
+with a string, the loop's variables and the awaited result live across
+each await (174, 64); one task awaited by two other tasks and joined by
+main, so its waiter list holds two registrations and every count on
+it is released (175, 24); a scope-local struct made before an await
+and read after it, whose scope is the task's and which therefore
+lives in the task's frame when compiled (176, 7).

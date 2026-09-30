@@ -31,7 +31,7 @@ Decisions taken on the way are in spec/types.md §10.
 - [x] evaluator following the checker's plan (`fibref run`), with
       threads, atoms and an async executor that is deterministic and
       fair (types §8.8, "The reference interpreter's schedule")
-- [x] case harness and CI: 171 cases in cases/ownership, all passing
+- [x] case harness and CI: 174 cases in cases/ownership, all passing
       with a clean audit (its README lists them by origin: the 20
       decided, the promoted proposals, the rule-4 adversary's findings
       81 to 95, the rule-5 generator's, and the owner's decisions of
@@ -141,9 +141,10 @@ State (spec/compiler.md, **Proposed**; `crates/fibc`):
       `gensym` and reflection through hooks into the expander;
       `tests/macros.rs` shows the expansions equal `fibref`'s on every
       case that defines a macro
-- [ ] `async` as the state machine of types §8.8 (today a task is
-      driven to completion by its first joiner, as `fibref` does;
-      compiler.md §8 question 3)
+- [x] `async` as the state machine of types §8.8, resumed by a pool of
+      workers and by its joiners through one run queue (owner,
+      2026-09-30; compiler.md §8 item 3; `resume.rs`, `rt/task.lir`;
+      cases 174 to 176 beside the earlier async cases)
 - [x] `(Weak (dyn P))` (compiler.md §8 item 10, cases 87 and 110)
 - [x] the native `Show` and `Hash` instances on scalars, field-less
       enums and `str` (case 169), except `show` of a float and of a

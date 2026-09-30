@@ -6,7 +6,32 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::ir::LirTy;
-use crate::layout::{struct_size, HEADER};
+use crate::layout::{size_align, struct_size_of, HEADER};
+
+/// One slot of a task's frame (§8.8, `..locals`): a value live across
+/// an `await`, or the bytes of what an ordinary function would
+/// `alloca` (a stack object, a loop variable), 8-aligned.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Frame {
+    Val(LirTy),
+    Bytes(u64),
+}
+
+impl Frame {
+    fn text(&self) -> String {
+        match self {
+            Frame::Val(t) => t.text().to_string(),
+            Frame::Bytes(n) => format!("[{n} x i8]"),
+        }
+    }
+
+    fn size_align(&self) -> (u64, u64) {
+        match self {
+            Frame::Val(t) => size_align(*t),
+            Frame::Bytes(n) => (*n, 8),
+        }
+    }
+}
 
 /// What an object is (the layouts of §8.3–§8.8).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -29,8 +54,9 @@ pub enum ObjKind {
     Closure(Vec<LirTy>),
     /// A task (§8.8): state, driver, lock, resume, result (an atom of
     /// the result type), waiters, the spawned closure (uncounted), then
-    /// an `async` body's captures.
-    Task(Vec<LirTy>),
+    /// an `async` body's captures and its frame: the resume point, then
+    /// the slots `resume.rs` assigns once the body is lowered.
+    Task { caps: Vec<LirTy>, frame: Vec<Frame> },
 }
 
 impl ObjKind {
@@ -62,33 +88,31 @@ impl ObjInfo {
         format!("{}.v{v}", self.sname)
     }
 
-    /// The field types of the object struct (an enum's are its tag
-    /// prefix; its variants are separate structs).
-    fn fields(&self) -> Vec<LirTy> {
-        let mut f = HEADER.to_vec();
+    /// The fields of the object struct (an enum's are its tag prefix;
+    /// its variants are separate structs).
+    fn fields(&self) -> Vec<Frame> {
+        let mut f: Vec<Frame> = HEADER.iter().map(|t| Frame::Val(*t)).collect();
+        let vals = |f: &mut Vec<Frame>, ts: &[LirTy]| f.extend(ts.iter().map(|t| Frame::Val(*t)));
         match &self.kind {
-            ObjKind::Str => f.push(LirTy::I64),
-            ObjKind::Array(_) => f.push(LirTy::I64),
-            ObjKind::Struct(fs) => f.extend(fs.iter().flatten()),
-            ObjKind::Enum(_) => f.push(LirTy::I32),
-            ObjKind::Cell(t) => f.push(*t),
-            ObjKind::Atom(t) => {
-                f.push(LirTy::I32);
-                f.push(*t);
+            ObjKind::Str => vals(&mut f, &[LirTy::I64]),
+            ObjKind::Array(_) => vals(&mut f, &[LirTy::I64]),
+            ObjKind::Struct(fs) => {
+                let ts: Vec<LirTy> = fs.iter().flatten().copied().collect();
+                vals(&mut f, &ts);
             }
-            ObjKind::Weak => {
-                f.push(LirTy::I32);
-                f.push(LirTy::Ptr);
-                f.push(LirTy::Ptr);
-            }
+            ObjKind::Enum(_) => vals(&mut f, &[LirTy::I32]),
+            ObjKind::Cell(t) => vals(&mut f, &[*t]),
+            ObjKind::Atom(t) => vals(&mut f, &[LirTy::I32, *t]),
+            ObjKind::Weak => vals(&mut f, &[LirTy::I32, LirTy::Ptr, LirTy::Ptr]),
             ObjKind::Closure(caps) => {
-                f.push(LirTy::Ptr);
-                f.extend(caps);
+                vals(&mut f, &[LirTy::Ptr]);
+                vals(&mut f, caps);
             }
-            ObjKind::Task(caps) => {
-                f.extend([LirTy::I32, LirTy::I32, LirTy::I32]);
-                f.extend([LirTy::Ptr, LirTy::Ptr, LirTy::Ptr, LirTy::Ptr]);
-                f.extend(caps);
+            ObjKind::Task { caps, frame } => {
+                vals(&mut f, &[LirTy::I32, LirTy::I32, LirTy::I32]);
+                vals(&mut f, &[LirTy::Ptr, LirTy::Ptr, LirTy::Ptr, LirTy::Ptr]);
+                vals(&mut f, caps);
+                f.extend(frame.iter().cloned());
             }
         }
         f
@@ -97,17 +121,18 @@ impl ObjInfo {
     /// The size of a fixed-size object; an enum's is its largest
     /// variant's. Strings and arrays add their elements at run time.
     pub fn size(&self) -> u64 {
+        let of = |f: &[Frame]| struct_size_of(&f.iter().map(Frame::size_align).collect::<Vec<_>>());
         match &self.kind {
             ObjKind::Enum(vs) => vs
                 .iter()
                 .map(|v| {
                     let mut f = self.fields();
-                    f.extend(v.iter().flatten());
-                    struct_size(&f)
+                    f.extend(v.iter().flatten().map(|t| Frame::Val(*t)));
+                    of(&f)
                 })
                 .max()
                 .unwrap_or(0),
-            _ => struct_size(&self.fields()),
+            _ => of(&self.fields()),
         }
     }
 }
@@ -164,6 +189,13 @@ impl Objects {
         &self.list[tid as usize]
     }
 
+    /// The frame of task type `tid`, known once its body is lowered.
+    pub fn set_task_frame(&mut self, tid: u32, frame: Vec<Frame>) {
+        if let ObjKind::Task { frame: f, .. } = &mut self.list[tid as usize].kind {
+            *f = frame;
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.list.len()
     }
@@ -192,11 +224,11 @@ impl Objects {
     }
 
     fn render_structs(&self, out: &mut String, o: &ObjInfo) {
-        let words = |fs: &[LirTy]| fs.iter().map(|t| t.text()).collect::<Vec<_>>().join(" ");
+        let words = |fs: &[Frame]| fs.iter().map(Frame::text).collect::<Vec<_>>().join(" ");
         let mut fs = o.fields();
         match &o.kind {
-            ObjKind::Str => fs.push(LirTy::I8),
-            ObjKind::Array(t) => fs.push(*t),
+            ObjKind::Str => fs.push(Frame::Val(LirTy::I8)),
+            ObjKind::Array(t) => fs.push(Frame::Val(*t)),
             _ => {}
         }
         let trailing = match &o.kind {
@@ -209,7 +241,7 @@ impl Objects {
         if let ObjKind::Enum(vs) = &o.kind {
             for (i, v) in vs.iter().enumerate() {
                 let mut f = o.fields();
-                f.extend(v.iter().flatten());
+                f.extend(v.iter().flatten().map(|t| Frame::Val(*t)));
                 let _ = writeln!(out, "(defstruct {} ({}))", o.variant_sname(i), words(&f));
             }
         }
@@ -285,7 +317,7 @@ fn child_fields(o: &ObjInfo) -> Vec<(String, Vec<(usize, LirTy)>)> {
         }
         // The captures first, then the result, as the interpreter's task
         // holds its fields (eval/task.rs: captures, then the result atom).
-        ObjKind::Task(caps) => {
+        ObjKind::Task { caps, .. } => {
             let fs: Vec<Option<LirTy>> = caps.iter().map(|c| Some(*c)).collect();
             let mut fields = counted(&fs, TASK_CAPTURE0);
             fields.push((TASK_RESULT, LirTy::Ptr));

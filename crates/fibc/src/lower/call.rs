@@ -136,7 +136,8 @@ impl<'a> Cx<'_, 'a> {
                 _ => return Err(Unsupported("an & parameter that is not a cell".into())),
             };
             let (tid, sname) = self.p.object(&cell_ty)?;
-            let slot = self.b.entry_alloca(&format!("%struct.{sname}"));
+            let size = self.p.objects.get(tid).size();
+            let slot = self.b.entry_alloca(&format!("%struct.{sname}"), size);
             self.b
                 .stmt(&format!("(call @fib.stack-init {slot} (i32 {tid}))"));
             let var = self.local(*b)?;

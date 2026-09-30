@@ -18,6 +18,7 @@ pub mod mono;
 pub mod names;
 pub mod objects;
 pub mod program;
+pub mod resume;
 pub mod statics;
 pub mod trace;
 pub mod value;

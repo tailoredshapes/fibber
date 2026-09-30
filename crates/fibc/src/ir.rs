@@ -13,21 +13,22 @@ pub use crate::value::{LirTy, V};
 
 /// One instruction of a block, as it will be printed.
 #[derive(Clone, Debug)]
-enum Item {
-    /// A value bound to a fresh name.
-    Bind(String, String),
+pub(crate) enum Item {
+    /// A value of the type bound to a fresh name.
+    Bind(String, String, LirTy),
     /// A void instruction, or the terminator.
     Stmt(String),
 }
 
 #[derive(Clone, Debug, Default)]
-struct Block {
-    label: String,
-    phis: Vec<(String, String)>,
-    items: Vec<Item>,
-    closed: bool,
+pub(crate) struct Block {
+    pub(crate) label: String,
+    /// Each `phi`: its name, its text, its type.
+    pub(crate) phis: Vec<(String, String, LirTy)>,
+    pub(crate) items: Vec<Item>,
+    pub(crate) closed: bool,
     /// Opened with no live branch to it: kept out of the text.
-    dead: bool,
+    pub(crate) dead: bool,
 }
 
 /// The function under construction.
@@ -37,10 +38,11 @@ pub struct FnBuilder {
     pub ret: Option<LirTy>,
     pub params: Vec<(LirTy, String)>,
     pub tailcc: bool,
-    blocks: Vec<Block>,
+    pub(crate) blocks: Vec<Block>,
     cur: usize,
     counter: u32,
-    allocas: Vec<(String, String)>,
+    /// Each `alloca`: its name, its text, the size of what it holds.
+    pub(crate) allocas: Vec<(String, String, u64)>,
     /// The labels a live terminator has named so far.
     live_targets: HashSet<String>,
 }
@@ -105,7 +107,7 @@ impl FnBuilder {
     /// Binds `instr`'s value to a fresh name and returns it.
     pub fn val(&mut self, instr: &str, ty: LirTy) -> V {
         let n = self.fresh();
-        self.push(Item::Bind(n.clone(), instr.to_string()));
+        self.push(Item::Bind(n.clone(), instr.to_string(), ty));
         V::Val(n, ty)
     }
 
@@ -146,7 +148,7 @@ impl FnBuilder {
             }
         }
         s.push(')');
-        self.blocks[self.cur].phis.push((n.clone(), s));
+        self.blocks[self.cur].phis.push((n.clone(), s, ty));
         V::Val(n, ty)
     }
 
@@ -161,7 +163,7 @@ impl FnBuilder {
             if b.label != label {
                 continue;
             }
-            for (n, text) in &mut b.phis {
+            for (n, text, _) in &mut b.phis {
                 if n == name {
                     text.pop();
                     let _ = write!(text, " ({from} {value}))");
@@ -170,11 +172,12 @@ impl FnBuilder {
         }
     }
 
-    /// An `alloca` of `ty` in the entry block, reused by every
-    /// execution of its site (types §8.2).
-    pub fn entry_alloca(&mut self, ty: &str) -> String {
+    /// An `alloca` of `ty`, holding `size` bytes, in the entry block,
+    /// reused by every execution of its site (types §8.2).
+    pub fn entry_alloca(&mut self, ty: &str, size: u64) -> String {
         let n = self.fresh();
-        self.allocas.push((n.clone(), format!("(alloca {ty})")));
+        self.allocas
+            .push((n.clone(), format!("(alloca {ty})"), size));
         n
     }
 
@@ -199,9 +202,13 @@ impl FnBuilder {
                 continue;
             }
             let _ = writeln!(out, "  (block {}", b.label);
-            let mut binds: Vec<(String, String)> = b.phis.clone();
+            let mut binds: Vec<(String, String)> = b
+                .phis
+                .iter()
+                .map(|(n, t, _)| (n.clone(), t.clone()))
+                .collect();
             if i == 0 {
-                binds.extend(self.allocas.iter().cloned());
+                binds.extend(self.allocas.iter().map(|(n, t, _)| (n.clone(), t.clone())));
             }
             render_items(&mut out, &mut binds, &b.items);
             out.push_str("  )\n");
@@ -216,7 +223,7 @@ impl FnBuilder {
 /// The labels a terminator names: `(br l)`, `(br c l1 l2)`, and a
 /// `switch`'s default and case labels; none for `ret` and
 /// `unreachable`.
-fn targets(term: &str) -> Vec<String> {
+pub(crate) fn targets(term: &str) -> Vec<String> {
     let Sx::List(items) = parse_sx(&mut term.chars().peekable()) else {
         return Vec::new();
     };
@@ -243,13 +250,13 @@ fn targets(term: &str) -> Vec<String> {
     }
 }
 
-/// The shape of a terminator's text.
-enum Sx {
+/// The shape of an instruction's text.
+pub(crate) enum Sx {
     Atom(String),
     List(Vec<Sx>),
 }
 
-fn parse_sx(cs: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Sx {
+pub(crate) fn parse_sx(cs: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Sx {
     while cs.peek().is_some_and(|c| c.is_whitespace()) {
         cs.next();
     }
@@ -288,7 +295,7 @@ fn parse_sx(cs: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Sx {
 fn render_items(out: &mut String, binds: &mut Vec<(String, String)>, items: &[Item]) {
     for item in items {
         match item {
-            Item::Bind(n, v) => binds.push((n.clone(), v.clone())),
+            Item::Bind(n, v, _) => binds.push((n.clone(), v.clone())),
             Item::Stmt(s) => {
                 if binds.is_empty() {
                     let _ = writeln!(out, "    {s}");
@@ -409,7 +416,7 @@ mod tests {
     #[test]
     fn phis_and_allocas_come_first() {
         let mut f = FnBuilder::new("g", None, vec![], false);
-        let slot = f.entry_alloca("i64");
+        let slot = f.entry_alloca("i64", 8);
         f.stmt(&format!("(store (i64 0) {slot})"));
         f.term("(br next)");
         f.open("next");

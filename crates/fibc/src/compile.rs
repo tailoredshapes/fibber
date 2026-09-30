@@ -25,6 +25,7 @@ const RUNTIME: &[&str] = &[
     include_str!("../rt/vecbuild.lir"),
     include_str!("../rt/atom.lir"),
     include_str!("../rt/thread.lir"),
+    include_str!("../rt/task.lir"),
     include_str!("../rt/weak.lir"),
 ];
 

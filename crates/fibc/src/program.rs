@@ -79,8 +79,14 @@ impl<'a> Program<'a> {
         p.objects
             .intern("fib.array.i8", "(Array i8)", ObjKind::Array(LirTy::I8));
         p.objects.intern("fib.weakbox", "weak box", ObjKind::Weak);
-        p.objects
-            .intern("fib.task", "task", ObjKind::Task(Vec::new()));
+        p.objects.intern(
+            "fib.task",
+            "task",
+            ObjKind::Task {
+                caps: Vec::new(),
+                frame: Vec::new(),
+            },
+        );
         p
     }
 
@@ -153,7 +159,13 @@ impl<'a> Program<'a> {
                 (format!("fib.atom.{}", tyname(e)), ObjKind::Atom(e))
             }
             Ty::Con(Con::Weak, _) => ("fib.weakbox".to_string(), ObjKind::Weak),
-            Ty::Con(Con::Task, _) => ("fib.task".to_string(), ObjKind::Task(Vec::new())),
+            Ty::Con(Con::Task, _) => (
+                "fib.task".to_string(),
+                ObjKind::Task {
+                    caps: Vec::new(),
+                    frame: Vec::new(),
+                },
+            ),
             Ty::Con(Con::Nominal(id), args) if *id == g.option => {
                 let payload = option_payload(g, t).cloned().unwrap_or(Ty::unit());
                 if option_rep(g, &payload)? == OptRep::Null {
@@ -283,9 +295,14 @@ impl<'a> Program<'a> {
     /// body `code`, with its captures.
     pub fn task_object(&mut self, code: &str, caps: Vec<LirTy>) -> (u32, String) {
         let sname = format!("task.{code}");
-        let tid = self
-            .objects
-            .intern(&sname, &format!("task {code}"), ObjKind::Task(caps));
+        let tid = self.objects.intern(
+            &sname,
+            &format!("task {code}"),
+            ObjKind::Task {
+                caps,
+                frame: Vec::new(),
+            },
+        );
         (tid, sname)
     }
 

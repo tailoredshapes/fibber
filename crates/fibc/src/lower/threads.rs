@@ -18,6 +18,16 @@ use crate::objects::{
 };
 use fibref::own::program::Pass;
 
+/// The frame of the `async` body being lowered: its task struct, the
+/// index of the resume point, and the continuation block of each
+/// state so far (state `k` is `states[k-1]`).
+#[derive(Clone, Debug)]
+pub struct AsyncFrame {
+    pub tsname: String,
+    pub point: usize,
+    pub states: Vec<String>,
+}
+
 impl<'a> Cx<'_, 'a> {
     /// `(spawn f)`: the task handle.
     pub fn spawn(&mut self, e: &Expr, f: &V) -> R<V> {
@@ -56,9 +66,11 @@ impl<'a> Cx<'_, 'a> {
             LirTy::Ptr,
         );
         self.b.stmt(&format!("(call @fib.retain {})", task.text()));
+        // Running, and its driver held for good by the thread (§8.8:
+        // a joiner never resumes a spawned task, it waits).
         for (i, v) in [
             (TASK_STATE, "(i32 1)"),
-            (TASK_STATE + 1, "(i32 0)"),
+            (TASK_STATE + 1, "(i32 1)"),
             (TASK_STATE + 2, "(i32 0)"),
         ] {
             let p = self.gep(&tsname, task.text(), i);
@@ -75,7 +87,7 @@ impl<'a> Cx<'_, 'a> {
         // The task and its result atom cross to the new thread: SHARED
         // before the handoff (§8.8), so both threads count atomically.
         self.b.stmt(&format!("(call @fib.share {})", task.text()));
-        let entry = self.thread_entry(&result_ty, &asname, &tsname)?;
+        let entry = self.thread_entry(&result_ty, &tsname)?;
         self.b
             .stmt(&format!("(call @fib.spawn {} @{entry})", task.text()));
         Ok(task)
@@ -106,8 +118,9 @@ impl<'a> Cx<'_, 'a> {
     }
 
     /// `(async body)`: a pending task holding the body's captures
-    /// (E3, retained) and its resume function; driven at the first
-    /// `join` or `await` (compiler.md §8 question 3).
+    /// (E3, retained), its resume point 0 and its resume function, the
+    /// body's state machine (`resume.rs`); run when joined or awaited
+    /// (syntax §3.12, types §8.8).
     pub fn make_async(&mut self, e: &Expr) -> R<V> {
         let own = self
             .own
@@ -121,11 +134,11 @@ impl<'a> Cx<'_, 'a> {
             _ => return Err(Unsupported("async without a Task type".into())),
         };
         let caps = self.capture_tys(&own)?;
+        let ncaps = caps.len();
         let code = self
             .p
             .request_closure(&self.inst.clone(), &self.name.clone(), e.id);
         let (ttid, tsname) = self.p.task_object(&code, caps);
-        let tsize = self.p.objects.get(ttid).size();
         let mut vals = Vec::new();
         for c in &own.captures {
             let v = self.local(c.binding)?;
@@ -134,9 +147,11 @@ impl<'a> Cx<'_, 'a> {
             }
             vals.push(v);
         }
-        let (atom, asname) = self.result_atom(&result_ty)?;
+        let (atom, _) = self.result_atom(&result_ty)?;
+        // The frame's size is the type table's: the body's slots are
+        // known only once it is lowered.
         let task = self.b.val(
-            &format!("(call @fib.alloc (i64 {tsize}) (i32 {ttid}))"),
+            &format!("(call @fib.alloc (call @fib.size-of (i32 {ttid})) (i32 {ttid}))"),
             LirTy::Ptr,
         );
         for (i, v) in [
@@ -153,39 +168,58 @@ impl<'a> Cx<'_, 'a> {
         }
         let rp = self.gep(&tsname, task.text(), TASK_RESULT);
         self.store(&atom, &rp);
-        let resume = self.resume_entry(&code, &result_ty, &asname, &tsname)?;
         let rsp = self.gep(&tsname, task.text(), TASK_RESUME);
-        self.b.stmt(&format!("(store @{resume} {rsp})"));
+        self.b.stmt(&format!("(store @{code} {rsp})"));
         self.store_fields(&tsname, task.text(), TASK_CAPTURE0, &vals);
+        let pp = self.gep(&tsname, task.text(), TASK_CAPTURE0 + ncaps);
+        self.b.stmt(&format!("(store (i32 0) {pp})"));
         Ok(task)
     }
 
-    /// `(await e)`: drive or wait for the task, then its result.
+    /// `(await e)` in an `async` body (§8.8): the next state's point
+    /// is stored, then `fib.await-or-park` either finds `e` done or
+    /// registers this task as its waiter, in which case the resume
+    /// returns here and continues, in a later resume, at the state's
+    /// block, where `e`'s result is read.
     pub fn await_task(&mut self, x: &'a Expr) -> R<V> {
         let t = self.value(x)?;
         let result_ty = match self.ty(x)? {
             Ty::Con(Con::Task, args) => args[0].clone(),
             _ => return Err(Unsupported("await of a non-task".into())),
         };
-        self.task_result(&t, &result_ty)
+        let Some(frame) = self.async_frame.clone() else {
+            return Err(Unsupported("await outside an async body".into()));
+        };
+        let k = frame.states.len() + 1;
+        let pp = self.gep(&frame.tsname, "env", frame.point);
+        self.b.stmt(&format!("(store (i32 {k}) {pp})"));
+        let parked = self.b.val(
+            &format!("(call @fib.await-or-park env {})", t.text()),
+            LirTy::I1,
+        );
+        let (lpark, lcont) = (self.b.label("park"), self.b.label("resume"));
+        self.b
+            .term(&format!("(br {} {lpark} {lcont})", parked.text()));
+        self.b.open(&lpark);
+        self.b.term("(ret)");
+        self.b.open(&lcont);
+        if let Some(f) = self.async_frame.as_mut() {
+            f.states.push(lcont);
+        }
+        self.task_value(&t, &result_ty)
     }
 
-    /// `(join t)`: the result, retained, once the task is done.
+    /// `(join t)`: drives the executor until the task is done (§8.8),
+    /// then its result, retained.
     pub fn join(&mut self, e: &Expr, t: &V) -> R<V> {
         let result_ty = self.ty(e)?;
-        self.task_result(t, &result_ty)
+        self.b.stmt(&format!("(call @fib.drive {})", t.text()));
+        self.task_value(t, &result_ty)
     }
 
-    /// Drives a pending task on this thread (claiming its driver),
-    /// waits for a running one, then retains and returns its result.
-    fn task_result(&mut self, t: &V, result_ty: &Ty) -> R<V> {
-        let atom_ty = Ty::Con(Con::Atom, vec![result_ty.clone()]);
-        let (_, asname) = self.p.object(&atom_ty)?;
-        let (_, tsname) = self
-            .p
-            .object(&Ty::Con(Con::Task, vec![result_ty.clone()]))?;
-        self.b.stmt(&format!("(call @fib.drive {})", t.text()));
-        let _ = (&asname, &tsname);
+    /// The result of a task that is done, retained (under its atom's
+    /// lock, as any atom read).
+    fn task_value(&mut self, t: &V, result_ty: &Ty) -> R<V> {
         let atom_ty = Ty::Con(Con::Atom, vec![result_ty.clone()]);
         let (_, asname) = self.p.object(&atom_ty)?;
         let (_, tsname) = self
@@ -204,7 +238,7 @@ impl<'a> Cx<'_, 'a> {
 
     /// The thread entry for tasks of this result type, emitted once:
     /// calls the spawned closure, completes the task, releases it.
-    fn thread_entry(&mut self, result_ty: &Ty, asname: &str, tsname: &str) -> R<String> {
+    fn thread_entry(&mut self, result_ty: &Ty, tsname: &str) -> R<String> {
         let g = self.p.g();
         let name = format!("fib.thread.{}", mangle(g, result_ty));
         if self.p.has_helper(&name) {
@@ -215,28 +249,35 @@ impl<'a> Cx<'_, 'a> {
         );
         let call = |r: &str| format!("(indirect-call code (fn tailcc {r} (ptr)) f)");
         let tail = "      (call @fib.release task)\n      (ret (ptr null)))))\n";
-        let s = self.completion(&head, &call, tail, result_ty, asname, tsname)?;
+        let s = self.completion(&head, &call, true, tail, result_ty)?;
         self.p.add_helper(&name, s);
         Ok(name)
     }
 
-    /// The resume function of an `async` literal: runs the body with
-    /// the task as `env` and completes the task.
-    fn resume_entry(
-        &mut self,
-        code: &str,
-        result_ty: &Ty,
-        asname: &str,
-        tsname: &str,
-    ) -> R<String> {
-        let name = format!("fib.resume.{code}");
+    /// The completion function of an `async` body's task: called by
+    /// the state machine with the body's value in place of its `ret`
+    /// (`resume.rs`).
+    pub fn complete_helper(&mut self, code: &str, result_ty: &Ty) -> R<String> {
+        let name = format!("fib.complete.{code}");
         if self.p.has_helper(&name) {
             return Ok(name);
         }
-        let head =
-            format!("(define internal ({name} void) ((ptr task))\n  (block entry\n    (let (");
-        let call = |_: &str| format!("(call @{code} task)");
-        let s = self.completion(&head, &call, "      (ret))))\n", result_ty, asname, tsname)?;
+        let param = match self.p.lir(result_ty)? {
+            Some(t) => format!(" ({} v0)", t.text()),
+            None => String::new(),
+        };
+        let head = format!(
+            "(define internal ({name} void) ((ptr task){param})\n  (block entry\n    (let ("
+        );
+        let call = |_: &str| "v0".to_string();
+        let s = self.completion(
+            &head,
+            &call,
+            false,
+            "      (ret))))
+",
+            result_ty,
+        )?;
         self.p.add_helper(&name, s);
         Ok(name)
     }
@@ -244,36 +285,51 @@ impl<'a> Cx<'_, 'a> {
     /// The completion of a task (§8.8, as the interpreter's `complete`):
     /// the body's value share-marked, stored into the result atom under
     /// its lock (retained; the old content released), released as the
-    /// step's temporary, and the state set to done. `call` gives the
-    /// call of the body for the lIR text of its result type.
+    /// step's temporary, and the state set to done, which wakes the
+    /// waiters. `call` gives, for the lIR text of the result type, the
+    /// instruction producing the value when `bind` holds, else the name
+    /// it is already bound to.
     fn completion(
         &mut self,
         head: &str,
         call: &dyn Fn(&str) -> String,
+        bind: bool,
         tail: &str,
         result_ty: &Ty,
-        asname: &str,
-        tsname: &str,
     ) -> R<String> {
         let l = self.p.lir(result_ty)?;
+        let (_, asname) = self
+            .p
+            .object(&Ty::Con(Con::Atom, vec![result_ty.clone()]))?;
+        let (_, tsname) = self
+            .p
+            .object(&Ty::Con(Con::Task, vec![result_ty.clone()]))?;
         let mut s = head.to_string();
         let _ = writeln!(
             s,
             "\n          (atom (load ptr (getelementptr %struct.{tsname} task (i32 0) (i32 {TASK_RESULT}))))\n          (lockp (getelementptr %struct.{asname} atom (i32 0) (i32 {ATOM_LOCK})))\n          (vp (getelementptr %struct.{asname} atom (i32 0) (i32 {ATOM_VALUE}))))"
         );
+        let close = if bind { "))" } else { ")" };
         match l {
             None => {
+                if bind {
+                    let _ = writeln!(s, "      {}", call("void"));
+                }
                 let _ = writeln!(
                     s,
-                    "      {}\n      (call @fib.lock lockp)\n      (call @fib.unlock lockp)",
-                    call("void")
+                    "      (call @fib.lock lockp)\n      (call @fib.unlock lockp)"
                 );
             }
             Some(t) => {
-                let _ = writeln!(s, "      (let ((v {}))", call(t.text()));
+                let v = if bind {
+                    let _ = writeln!(s, "      (let ((v {}))", call(t.text()));
+                    "v".to_string()
+                } else {
+                    call(t.text())
+                };
                 let word = match t {
-                    LirTy::Ptr => Some("v".to_string()),
-                    LirTy::Dyn => Some("(extractvalue v 0)".to_string()),
+                    LirTy::Ptr => Some(v.clone()),
+                    LirTy::Dyn => Some(format!("(extractvalue {v} 0)")),
                     _ => None,
                 };
                 if let Some(w) = &word {
@@ -281,7 +337,7 @@ impl<'a> Cx<'_, 'a> {
                 }
                 let _ = writeln!(
                     s,
-                    "        (call @fib.lock lockp)\n        (let ((old (load {} vp)))\n          (store v vp)",
+                    "        (call @fib.lock lockp)\n        (let ((old (load {} vp)))\n          (store {v} vp)",
                     t.text()
                 );
                 if let Some(w) = &word {
@@ -292,10 +348,10 @@ impl<'a> Cx<'_, 'a> {
                     };
                     let _ = writeln!(
                         s,
-                        "          (call @fib.retain {w})\n          (call @fib.unlock lockp)\n          (call @fib.release {ow})\n          (call @fib.release {w})))"
+                        "          (call @fib.retain {w})\n          (call @fib.unlock lockp)\n          (call @fib.release {ow})\n          (call @fib.release {w}){close}"
                     );
                 } else {
-                    s.push_str("          (call @fib.unlock lockp)))\n");
+                    let _ = writeln!(s, "          (call @fib.unlock lockp){close}");
                 }
             }
         }

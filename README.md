@@ -27,7 +27,7 @@ implemented until an executable test says so.
 
 ```
 cargo test --workspace                          # the full suite (lair needs LLVM 21)
-cargo run -p fibref -- cases cases/ownership    # 171 cases
+cargo run -p fibref -- cases cases/ownership    # 174 cases
 cargo run -p fibref -- run   <file.fib>         # result and memory audit
 cargo run -p fibref -- explain <file.fib>       # the ownership decisions
 cargo run -p lair -- cases cases/lir            # 323 lIR cases, JIT and AOT
@@ -50,7 +50,7 @@ cargo run -p fibc -- gen --seed S --count N     # N generated programs through t
 | Ownership model | [spec/ownership.md](spec/ownership.md) | decided |
 | Syntax | [spec/syntax.md](spec/syntax.md) | decided |
 | Type system and ownership checker | [spec/types.md](spec/types.md) | decided |
-| Cases | [cases/ownership/](cases/ownership/) | 171, all passing (128–149: vector patterns and guards; 150–153: copy-in at call entry; 154: IEEE float comparisons; 155–161: colour parameters in impl heads; 162–165: no forwarding of a captured `&` parameter; 166–168: spin-waits and `swap!` contention on the fair executor; 169: the native `Show` and `Hash` instances on scalars; 170–173: findings of `fibc gen`) |
+| Cases | [cases/ownership/](cases/ownership/) | 174, all passing (128–149: vector patterns and guards; 150–153: copy-in at call entry; 154: IEEE float comparisons; 155–161: colour parameters in impl heads; 162–165: no forwarding of a captured `&` parameter; 166–168: spin-waits and `swap!` contention on the fair executor; 169: the native `Show` and `Hash` instances on scalars; 170–173: findings of `fibc gen`; 174–176: the state machine of `async` and its executor) |
 | Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
 | Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
 | Library | [lib/prelude.fib](lib/prelude.fib) | what the cases need |

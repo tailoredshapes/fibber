@@ -31,7 +31,7 @@ const LEAK_CYCLE: [u32; 2] = [15, 80];
 /// The cases whose verdict is a run-time trap (method.md rule 3).
 const TRAP: [u32; 6] = [101, 102, 103, 104, 172, 173];
 /// The last case number of this suite.
-const LAST: u32 = 173;
+const LAST: u32 = 176;
 
 fn number_of(path: &Path) -> u32 {
     let name = path.file_name().unwrap().to_string_lossy();
@@ -85,7 +85,8 @@ fn the_ownership_directory_holds_cases_1_to_last_less_the_withdrawn() {
     // captured & parameter (types §10), 166 to 168 the fair executor's
     // spin-waits and swap! contention (types §8.8), 169 the native Show
     // and Hash instances on scalars (types §2.12), 170 to 173 the findings
-    // of fibc gen (compiler.md §5) pinned as cases.
+    // of fibc gen (compiler.md §5) pinned as cases, 174 to 176 the state
+    // machine of an async body and its executor (types §8.8).
     // The listing is by name, so 100 sorts after 10: compare as numbers.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();

@@ -7,6 +7,7 @@ use fibref::types::ast::{BindingId, Clause, Expr, Pattern};
 use super::{Cx, Flow, Local, LoopCx, R};
 use crate::compile::Unsupported;
 use crate::ir::{LirTy, V};
+use crate::layout::size_align;
 
 impl<'a> Cx<'_, 'a> {
     pub fn let_form(&mut self, bs: &'a [(Pattern, Expr)], body: &'a Expr) -> R<Flow> {
@@ -113,7 +114,10 @@ impl<'a> Cx<'_, 'a> {
         for (b, init) in vs {
             let v = self.value(init)?;
             let t = v.ty();
-            let slot = self.b.entry_alloca(t.map_or("i64", LirTy::text));
+            let slot = self.b.entry_alloca(
+                t.map_or("i64", LirTy::text),
+                t.map_or(8, |t| size_align(t).0),
+            );
             self.store(&v, &slot);
             self.locals.insert(*b, Local::Slot(slot.clone(), t));
             vars.push((*b, slot, t));
