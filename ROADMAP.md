@@ -31,7 +31,7 @@ Decisions taken on the way are in spec/types.md §10.
 - [x] evaluator following the checker's plan (`fibref run`), with
       threads, atoms and an async executor that is deterministic and
       fair (types §8.8, "The reference interpreter's schedule")
-- [x] case harness and CI: 176 cases in cases/ownership, all passing
+- [x] case harness and CI: 180 cases in cases/ownership, all passing
       with a clean audit (its README lists them by origin: the 20
       decided, the promoted proposals, the rule-4 adversary's findings
       81 to 95, the rule-5 generator's, and the owner's decisions of
@@ -136,7 +136,7 @@ State (spec/compiler.md, **Decided**, owner, 2026-09-30; `crates/fibc`):
       compiler.md §4
 - [x] method rule 6 harness: `fibc cases` runs every case interpreted
       and compiled and compares results, rejections, traps and free
-      traces; all 176 cases pass both ways, 0 fail, 0 pending
+      traces; all 180 cases pass both ways, 0 fail, 0 pending
 - [x] macros through the JIT: one macro-time module per `defmacro`,
       `gensym` and reflection through hooks into the expander;
       `tests/macros.rs` shows the expansions equal `fibref`'s on every
@@ -171,19 +171,26 @@ State (spec/compiler.md, **Decided**, owner, 2026-09-30; `crates/fibc`):
 - [x] the owner's answers to compiler.md §8 (2026-09-30: every item
       decided, the page **Decided**)
 
-## M5. A library a compiler can live on
+## M5. A library a compiler can live on — in progress
 
 Prioritised by what a self-hosted compiler needs, ahead of anything
-else in the library:
+else in the library; every addition is pinned by cases that run
+interpreted and compiled:
 
-- strings: building, slicing, comparing, hashing, efficiently
-- hash maps and sets (symbol tables, environments)
-- the persistent vector as a real trie (today's `conj` copies)
-- file I/O, command-line arguments, exit codes, stderr diagnostics
-- multiple modules (§5 of syntax.md beyond one module plus the prelude)
-- macros at compile time (decided, below): the compiler JIT-compiles
-  the macro-time module through lIR, so the self-hosted compiler links
-  `lair` as a library
+- [x] hash maps and sets (symbol tables, environments): `Map` and
+      `Set` as an HAMT in the prelude, with `Associative` (`assoc`,
+      `get`), `dissoc`, `contains?`, `map-put!`, `map-del!`, `Entry`,
+      `for-each` over entries, `set-empty`, `disj`, `set-contains?`
+      (cases 179 to 182)
+- [x] the persistent vector as a real trie: the prelude's `Vec` has
+      been a 32-way trie since M2 (`VNode`, `VecOf`)
+- [x] macros at compile time (M4): the compiler JIT-compiles the
+      macro-time module through lIR, so the self-hosted compiler links
+      `lair` as a library
+- [ ] strings: building, slicing, comparing, hashing, efficiently
+- [ ] file I/O, command-line arguments, exit codes, stderr diagnostics
+- [ ] multiple modules (§5 of syntax.md beyond one module plus the
+      prelude)
 
 ## M6. Bootstrap
 

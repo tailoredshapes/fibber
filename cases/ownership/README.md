@@ -221,3 +221,13 @@ Case 178 pins the texts of `show` on floats and on `str` (types
 as the shortest decimal that reads back at its width, positional,
 with `.0` when integral, and `NaN`, `inf`, `-inf`; eleven texts each
 checked against the expected one, their lengths summed (178, 75).
+
+Cases 179 to 182 pin the prelude's `Map` and `Set` (M5; types §2.13,
+syntax §4.5), an HAMT over the keys' hash, all accept with a clean
+audit: a map literal, `assoc` of new and existing keys, `get`, `count`,
+and the trie growing past one node, keys 0, 32 and 1024 sharing their
+low five bits (179, 1738); keys whose hashes all collide, told apart by
+`Eq` in one bucket, and `str` keys (180, 479); `dissoc` down to the
+empty map, `map-put!` and `map-del!` through `&`, `for-each` over the
+entries, `contains?` (181, 1927); a `Set` with `conj`, `set-contains?`,
+`disj`, `count` and `for-each` (182, 1029).

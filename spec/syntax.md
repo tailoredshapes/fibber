@@ -1407,7 +1407,10 @@ in, §3.9); `List` (`(defenum (List a)
 (empty) (cons head: a tail: (List a)))`), with `Eq`, `Ord`, `Hash` and
 `Show` derived for both (§4.4); `Vec`, `Map`, `Set` as
 persistent structures over `(Array T)` with `vec-empty conj nth count
-push! pop! vec-set! map-empty assoc get map-put! map-del!`; the
+push! pop! vec-set! map-empty assoc get dissoc contains? map-put!
+map-del! set-empty disj set-contains?` (`Map` and `Set` are an HAMT over
+the keys' `hash`, keys needing `Hash` and `Eq`; `for-each` over a `Map`
+visits `(Entry k v)` structs with fields `key` and `val`); the
 protocols `Seq Countable Indexable Collection Associative Traversable
 Iter Hash Show` with `first rest count nth conj for-each map filter
 reduce iter next collect filter-iter`; `range` (**Decided**, owner,
