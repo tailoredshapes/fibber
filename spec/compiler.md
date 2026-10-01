@@ -61,14 +61,16 @@ before anything is compiled, with `fibc: -L DIR: REASON` and exit 2; a
 symbol or library the linker cannot find is `compile failed:` with the
 linker's own words and exit 5. `-l` and `-L` belong to `build`: `fibc
 run` resolves an `extern` in its own process (libc, and what the process
-has loaded) and reports `undefined symbol` for any other. The step is
-`crates/fibc/src/link.rs` (the object is `lair::aot::emit`'s; the
-`cc` command is built there, because `lair::aot::Options` has `libs` and
-no directories, and the step moves into `lair` when that has them). Tested
-by `crates/fibc/tests/cli/link.rs`: a shared library built with `cc`, the
-executable run without `LD_LIBRARY_PATH` and from another directory, the
-same executable failing once the library is moved, and the link failing
-without the flags.
+has loaded) and reports `undefined symbol` for any other. The link step is
+`lair`'s (`lair::aot::build_executable` with `Options { libs, lib_dirs }`,
+lir.md §11): `fibc` hands it the `-l` and `-L` lists and checks each
+`-L` first (`lair::aot::library_dir`) only so that a bad directory is
+exit 2 before the front end runs. Tested by
+`crates/fibc/tests/cli/link.rs` (the flags, through the `fibc` binary: a
+shared library built with `cc`, the executable run without
+`LD_LIBRARY_PATH` and from another directory, the same executable failing
+once the library is moved, and the link failing without the flags) and by
+`crates/lair/tests/link.rs` (the same on `Options`).
 
 ## 2. Modules
 
@@ -231,10 +233,18 @@ the `defmacro` with the prelude, the same forms the interpreter's
 runner checks (eval/macros.rs), checked and planned by the same front
 end — through `lair`'s `Jit`, one module per macro, on the macro's
 first application. The module exports, beside the entry that runs the
-macro's body, constructors and readers of `Form` objects (`abi.rs`);
-the runner converts the argument forms into objects, calls the entry
-through the `ccc` trampoline the `Jit` provides, and reads the result
-graph back into the expander's `Form`. `gensym` and the reflection
+macro's body, constructors and readers of `Form` objects and the table
+of the keywords it interned (`abi.rs`): the width of an `Int` or `Flt`
+form is a keyword id, `fibm.kw-count.K` is the number of keywords and
+`fibm.kw.K` maps an id to the keyword's name, a `str` object, or to null
+for an id that is none; the ids of `:i8` to `:f64` are found in the table
+by name, never assumed, and a module whose table lacks one is refused.
+The table is in the module's text, so a runner written in another
+language reads it the way `macros/module.rs` does and so does
+`compiler/lair/fibm.fib`; the runner converts the argument forms into
+objects, calls the entry through the `ccc` trampoline the `Jit`
+provides, and reads the result graph back into the expander's `Form`.
+`gensym` and the reflection
 builtins need the expander's context, which lives in Rust: the module
 holds two hook pointers and a context pointer set through
 `fibm.set-hooks` before each call, and the lowered builtins call the
@@ -412,7 +422,7 @@ handles from different threads at once. `lair.h` has the exact C types
 | `lair_error *lair_jit_address(lair_jit *, name, len, size_t *out)` | the address of a defined function (`Jit::address`) |
 | `lair_error *lair_jit_c_entry(lair_jit *, name, len, size_t *out)` | its `ccc` entry, a trampoline when it is not `ccc` (`Jit::c_entry`) |
 | `lair_error *lair_check_source(src, len)` | parse and check, no code |
-| `lair_error *lair_build_executable(src, len, path, len, int opt_level, const char *const *libs, const size_t *lib_lens, size_t n)` | compile a module that satisfies the `main` rule and link it; each of the `n` names is linked as `-lNAME` (`aot::build_executable`) |
+| `lair_error *lair_build_executable(src, len, path, len, int opt_level, const char *const *libs, const size_t *lib_lens, size_t n)` | compile a module that satisfies the `main` rule and link it; each of the `n` names is linked as `-lNAME`, after libm and libpthread, which are always linked, and is found where the process's `cc` finds it: **the library search is the system's, and no `-L` directory or rpath can be given through this function** (`aot::build_executable` with `Options::lib_dirs` empty) |
 | `const char *lair_error_text(const lair_error *, size_t *len)`, `void lair_error_free(lair_error *)` | the message |
 | `int64_t lair_call_i64(size_t addr, const int64_t *args, size_t n)`, `double lair_call_f64(...)` | call a C-ABI function at `addr` with `n <= 8` integer or pointer arguments (a float or double *parameter* cannot be passed; a double *result* is `lair_call_f64`); fibber cannot call a function pointer itself. These two have no error channel, so a call that cannot be made (`addr` 0, `n > 8`, null `args` with `n > 0`) is not made and returns 0. A result narrower than 64 bits has unspecified high bits |
 
@@ -461,7 +471,11 @@ code (freeing it under a running call is undefined). Free after the
 call is done joins the worker and leaves nothing. Null handles
 do nothing (wait gives -1, the value readers 0).
 
-The objects a macro builds and reads are plain heap data of its module;
+The objects a macro builds and reads are plain heap data of its module
+(the names `fibm.kw.K` returns are immortal `str` objects of the module,
+and the compiler reads the whole keyword table once, when it looks the
+module up, so an id in a form the macro returned is named as Rust names
+it, and a width the table lacks is the lookup's error, not a form's);
 the worker runs from `lair_call_start`, and again from each
 `lair_call_hook_reply`, until its next hook call or its return; the
 compiler's thread touches the module's objects only after

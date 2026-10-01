@@ -191,8 +191,8 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         out.contains("168-swap-contention-between-threads.fib"),
         "{out}"
     );
-    assert!(out.contains("189 cases:"), "{out}");
-    assert!(out.contains("189 pass, 0 fail, 0 pending"), "{out}");
+    assert!(out.contains("191 cases:"), "{out}");
+    assert!(out.contains("191 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 

@@ -32,6 +32,33 @@ fn zext_and_sext_keep_their_meaning_through_the_pipeline() {
 }
 
 #[test]
+fn float_bit_casts_keep_every_bit() {
+    // types §2.12: the IEEE 754 pattern, a NaN's payload and a zero's
+    // sign included; an f32 is held widened, and a signalling NaN of it
+    // must not be quieted (eval/float_bits.rs).
+    clean(
+        "(defun main () -> i64 (f64->bits 1.0))",
+        0x3FF0_0000_0000_0000,
+    );
+    clean(
+        "(defun main () -> i64 (f64->bits (bits->f64 9221120237041090561)))",
+        0x7FF8_0000_0000_0001,
+    );
+    clean(
+        "(defun main () -> i64 (sext i64 (f32->bits -0.0f32)))",
+        i64::from(i32::MIN),
+    );
+    clean(
+        "(defun main () -> i64 (sext i64 (f32->bits (bits->f32 2139095041i32))))",
+        0x7F80_0001,
+    );
+    clean(
+        "(defun main () -> i64 (sext i64 (f32->bits (bits->f32 2143289345i32))))",
+        0x7FC0_0001,
+    );
+}
+
+#[test]
 fn strings_are_bytes() {
     clean(
         "(defun main () -> i64 (str-len (str-concat \"ab\" (str-slice \"xyz\" 1 3))))",

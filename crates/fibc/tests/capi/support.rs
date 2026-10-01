@@ -184,7 +184,12 @@ pub fn run_demo(args: &[&str]) -> Output {
 
 /// The demo's standard output, after checking that it ended cleanly.
 pub fn demo_stdout(args: &[&str]) -> String {
-    let out = run_demo(args);
+    clean_stdout(args, run_demo(args))
+}
+
+/// The standard output of a demo run `out` that was given `args`, after
+/// checking that it ended cleanly.
+pub fn clean_stdout(args: &[&str], out: Output) -> String {
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -193,6 +198,11 @@ pub fn demo_stdout(args: &[&str]) -> String {
         text(&out.stdout),
         text(&out.stderr)
     );
+    text(&out.stdout)
+}
+
+/// The text of a run's standard output, whatever its status.
+pub fn stdout_text(out: &Output) -> String {
     text(&out.stdout)
 }
 

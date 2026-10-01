@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Output;
 
 use fibc::macros::JitRunner;
 use fibref::expand::{
@@ -15,7 +16,7 @@ use fibref::expand::{
 use fibref::syntax::{read_all, Form, FormKind, Pos};
 use fibref::types::prelude_forms;
 
-use super::support::demo_stdout;
+use super::support::{clean_stdout, run_demo};
 
 /// One run of a macro, with what the Rust runner made of it.
 pub struct Run {
@@ -232,9 +233,10 @@ pub fn expected_repeated(run: &Run, times: u64) -> String {
         .collect()
 }
 
-/// What `jit-demo macro` prints for `run`, whose module text is `text`,
-/// when it runs the call `times` times in a row.
-pub fn demo_output(label: &str, run: &Run, text: &str, times: u64) -> String {
+/// What `jit-demo macro` makes of `run` with the module text `text`, run
+/// `times` times in a row: the whole run, whatever its status, and the
+/// arguments it was given.
+pub fn demo_run(label: &str, run: &Run, text: &str, times: u64) -> (Vec<String>, Output) {
     let k = run.k.expect("the macro has a module");
     let module = scratch(&format!("{label}-{k}-{}.lir", run.start));
     std::fs::write(&module, text).expect("the module text is written");
@@ -243,7 +245,7 @@ pub fn demo_output(label: &str, run: &Run, text: &str, times: u64) -> String {
     } else {
         "fixed"
     };
-    let args = [
+    let args: Vec<String> = [
         "macro",
         module.to_str().expect("utf-8"),
         &k.to_string(),
@@ -253,9 +255,22 @@ pub fn demo_output(label: &str, run: &Run, text: &str, times: u64) -> String {
         &run.call,
         &run.answers,
         &times.to_string(),
-    ];
-    let got = demo_stdout(&args);
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_demo(&refs);
     let _ = std::fs::remove_file(&module);
+    (args, out)
+}
+
+/// What `jit-demo macro` prints for `run`, whose module text is `text`,
+/// when it runs the call `times` times in a row.
+pub fn demo_output(label: &str, run: &Run, text: &str, times: u64) -> String {
+    let (args, out) = demo_run(label, run, text, times);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let got = clean_stdout(&refs, out);
     println!("{label}: {}\n{got}", run.call);
     got
 }

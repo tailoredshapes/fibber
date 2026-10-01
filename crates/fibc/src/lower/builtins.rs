@@ -136,15 +136,18 @@ impl<'a> Cx<'_, 'a> {
             "args" => self.args_vec(e)?,
             "char->i32" => arg(0)?.clone(),
             "i32->char" => self.rt_call("fib.i32-to-char", a, Some(LirTy::I32)),
+            "f64->bits" | "bits->f64" | "f32->bits" | "bits->f32" => {
+                self.float_bits(name, arg(0)?)?
+            }
             "ptr+" => self.b.val(
                 &format!("(getelementptr i8 {} {})", arg(0)?.text(), arg(1)?.text()),
-                LirTy::Ptr,
+                LirTy::Raw,
             ),
             "load-i8" => self.load(LirTy::I8, arg(0)?.text()),
             "load-i16" => self.load(LirTy::I16, arg(0)?.text()),
             "load-i32" => self.load(LirTy::I32, arg(0)?.text()),
             "load-i64" => self.load(LirTy::I64, arg(0)?.text()),
-            "load-ptr" => self.load(LirTy::Ptr, arg(0)?.text()),
+            "load-ptr" => self.load(LirTy::Raw, arg(0)?.text()),
             "store-i8" | "store-i16" | "store-i32" | "store-i64" | "store-ptr" => {
                 let (p, v) = (arg(0)?.text().to_string(), arg(1)?.clone());
                 self.store(&v, &p);
@@ -153,16 +156,15 @@ impl<'a> Cx<'_, 'a> {
             // syntax §3.15: the block is zeroed, as the interpreter's is.
             "alloc" => {
                 let v = vec![V::int(LirTy::I64, 1), arg(0)?.clone()];
-                self.rt_call("calloc", &v, Some(LirTy::Ptr))
+                self.rt_call("calloc", &v, Some(LirTy::Raw))
             }
             "free" => self.rt_call("free", a, None),
-            "raw" | "raw-retained" => match arg(0)? {
-                V::Val(s, LirTy::Ptr) => V::Val(s.clone(), LirTy::Ptr),
-                v => self
-                    .obj_word(v)
-                    .map(|w| V::Val(w, LirTy::Ptr))
-                    .ok_or_else(|| Unsupported("raw of a scalar".into()))?,
-            },
+            "raw" | "raw-retained" => {
+                let v = arg(0)?;
+                self.obj_word(v)
+                    .map(|w| V::Val(w, LirTy::Raw))
+                    .ok_or_else(|| Unsupported("raw of a scalar".into()))?
+            }
             "release-raw" => self.rt_call("fib.release", a, None),
             other => return Err(Unsupported(format!("builtin {other}"))),
         }))

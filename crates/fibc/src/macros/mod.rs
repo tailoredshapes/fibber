@@ -75,9 +75,7 @@ mod runner {
                 .add_source(&name, &compiled.text)
                 .map_err(|e| failed(e.render(&name)))?;
             self.texts.push((m.name.clone(), compiled.text));
-            let mut fns =
-                Fns::lookup(&mut self.jit, compiled.widths, k).map_err(|u| failed(u.0))?;
-            fns.keywords = compiled.keywords;
+            let fns = Fns::lookup(&mut self.jit, k).map_err(|u| failed(u.0))?;
             // SAFETY: (fn void ()) as abi.rs defines fibm.init.
             let init: extern "C" fn() = unsafe {
                 self.jit

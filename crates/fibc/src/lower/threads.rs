@@ -48,7 +48,7 @@ impl<'a> Cx<'_, 'a> {
         self.b.stmt(&format!("(store (i32 0) {lockp})"));
         let vp = self.gep(&asname, atom.text(), ATOM_VALUE);
         if let Some(l) = self.p.lir(&result_ty)? {
-            let zero = if l == LirTy::Ptr {
+            let zero = if matches!(l, LirTy::Ptr | LirTy::Raw) {
                 "(ptr null)".to_string()
             } else if l == LirTy::Dyn {
                 "(zeroinitializer { ptr ptr })".to_string()
@@ -107,7 +107,7 @@ impl<'a> Cx<'_, 'a> {
         let vp = self.gep(&asname, atom.text(), ATOM_VALUE);
         if let Some(l) = self.p.lir(result_ty)? {
             let zero = match l {
-                LirTy::Ptr => "(ptr null)".to_string(),
+                LirTy::Ptr | LirTy::Raw => "(ptr null)".to_string(),
                 LirTy::Dyn => "(zeroinitializer { ptr ptr })".to_string(),
                 LirTy::Float | LirTy::Double => format!("({} 0.0)", l.text()),
                 _ => format!("({} 0)", l.text()),

@@ -80,12 +80,9 @@ pub(crate) fn emit_all(p: &mut Program<'_>) -> Result<(), Unsupported> {
 
 /// A compiled macro-time module (compiler.md §6, `macros/`).
 pub struct MacroModule {
-    /// The lIR text, with the surface of `macros/abi.rs` exported.
+    /// The lIR text, with the surface of `macros/abi.rs` exported,
+    /// the table of the keywords the module interned among it.
     pub text: String,
-    /// The keyword ids of the width suffixes i8 i16 i32 i64 f32 f64.
-    pub widths: [i64; 6],
-    /// Every keyword interned, by id.
-    pub keywords: Vec<String>,
 }
 
 /// The macro-time module of `checked`, whose `defmacro` is `name`,
@@ -106,9 +103,8 @@ pub fn compile_macro(
         .position(|d| d.is_macro && d.name == name)
         .ok_or_else(|| Unsupported(format!("no macro {name}")))?;
     let mut p = Program::new(checked);
-    let mut widths = [0i64; 6];
-    for (i, w) in WIDTHS.iter().enumerate() {
-        widths[i] = p.statics.keyword(w);
+    for w in WIDTHS {
+        p.statics.keyword(w);
     }
     let form_id = g
         .form
@@ -144,20 +140,25 @@ pub fn compile_macro(
         Vec::new(),
     );
     emit_all(&mut p)?;
+    // No keyword is interned after the bodies are emitted: the table
+    // the module exports is complete here.
+    let keyword_strs = p
+        .statics
+        .keywords()
+        .iter()
+        .map(|k| p.statics.string(k, 0))
+        .collect();
     let layout = FormLayout {
         sname,
         tid,
         tags,
         size,
         vec,
+        keyword_strs,
     };
     let mut text = assemble_parts(&mut p, &defs.text);
     text.push_str(&render(&layout, &body, n, k));
-    Ok(MacroModule {
-        text,
-        widths,
-        keywords: p.statics.keywords(),
-    })
+    Ok(MacroModule { text })
 }
 
 /// The runtime, the tables, the static data and every function: what
@@ -225,6 +226,30 @@ mod tests {
         }
         assert!(text.contains("(define internal tailcc (f.sq i64) ((i64 p0))"));
         assert!(text.contains("smul-overflow"));
+    }
+
+    #[test]
+    fn the_float_bit_casts_lower_to_one_bitcast_each() {
+        // syntax §4.3: no check, no call; the lIR `bitcast` between a
+        // float and the integer of its width keeps every bit.
+        let text = lir_of(
+            "(defun a (x: f64) -> i64 (f64->bits x))\n\
+             (defun b (n: i64) -> f64 (bits->f64 n))\n\
+             (defun c (x: f32) -> i32 (f32->bits x))\n\
+             (defun d (n: i32) -> f32 (bits->f32 n))\n\
+             (defun main () -> i64 (+ (a (b 1)) (sext i64 (c (d 2i32)))))",
+        );
+        if let Err(e) = lir::parse_and_check(&text) {
+            panic!("{}\n{text}", e[0]);
+        }
+        for cast in [
+            "(bitcast i64 p0)",
+            "(bitcast double p0)",
+            "(bitcast i32 p0)",
+            "(bitcast float p0)",
+        ] {
+            assert_eq!(text.matches(cast).count(), 1, "{cast}\n{text}");
+        }
     }
 
     #[test]

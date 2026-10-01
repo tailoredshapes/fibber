@@ -1,25 +1,25 @@
 //! A bug of the compiler that the fibber bindings of lair had to work
-//! around, as a test that fails until it is fixed.
+//! around, kept as a test now that it is fixed.
 //!
 //! `ptr` is a scalar with no count (types §8.1, syntax §3.15), and the
-//! interpreter treats it so. The compiler's drop of an object releases
-//! every field whose lIR type is `ptr` (`objects.rs` `child_fields`), and
-//! a raw `ptr` and the pointer to an object are both `ptr` there: so
-//! dropping a struct, an enum variant, a `Cell` or an `Option` that holds
-//! a raw pointer calls `fib.release` on the user's block, which
-//! decrements the first word of it and, at zero, frees it. The bindings
-//! hold such blocks as `i64` addresses (compiler/lair/ffi.fib).
-//!
-//! The test is `#[ignore]`d, so that it is listed and counted as ignored
-//! and not as a pass (method.md: pending is not pass); `cargo test --test
-//! capi -- --ignored` runs it and it fails today with 40 for 41.
+//! interpreter treats it so. The compiler's drop of an object released
+//! every field whose lIR type was `ptr` (`objects/walk.rs` `child_fields`),
+//! and a raw `ptr` and the pointer to an object were both `ptr` there:
+//! dropping a struct, an enum variant, a `Cell` or an `Option` that held
+//! a raw pointer called `fib.release` on the user's block, which
+//! decremented the first word of it and, at zero, freed it. A raw `ptr`
+//! is now its own lIR type, `LirTy::Raw`, which prints as `ptr` and is
+//! not counted anywhere. The bindings still hold such blocks as `i64`
+//! addresses (compiler/lair/ffi.fib); case 193 covers every container.
+//! The program below failed with 40 for 41 before.
 
 use std::process::Command;
 
 use fibc::harness::interp;
 use fibref::cases::{Outcome, Value};
 
-/// 41 interpreted. Compiled, 40: `hold` drops `h`, which releases `p`.
+/// 41 interpreted, and compiled now. It was 40 compiled: `hold` drops
+/// `h`, which released `p`.
 const PROGRAM: &str = "(defstruct H (p: ptr))
 (defun hold (p: ptr) -> i64 (let ((h (H p))) 1))
 (defun main () -> i64
@@ -32,7 +32,6 @@ const PROGRAM: &str = "(defstruct H (p: ptr))
 ";
 
 #[test]
-#[ignore = "stage-1 bug: fibc releases a raw ptr field of a struct as if it were an object"]
 fn a_struct_that_holds_a_raw_pointer_does_not_release_the_block_it_addresses() {
     let run = interp::run(PROGRAM, "ptr-field.fib");
     let Outcome::Compiled {

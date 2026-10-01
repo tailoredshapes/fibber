@@ -747,8 +747,27 @@ let c: usize = jit.c_entry("g")?;           // a ccc entry to a tailcc function
 ```rust
 // AOT: object file, assembly, LLVM IR, or an executable.
 lair::aot::emit(&module, name, lair::aot::Output::Object, &opts) -> Result<Vec<u8>>
-lair::aot::build_executable(&module, name, path, &opts) -> Result<()>   // `cc` with -lm and opts.libs
+lair::aot::build_executable(&module, name, path, &opts) -> Result<()>   // `cc` with -lm -lpthread, opts.lib_dirs, opts.libs
+lair::aot::library_dir(dir) -> Result<PathBuf, String>                  // a lib_dirs entry as the link uses it
 ```
+
+`Options { opt_level, libs, lib_dirs }`. The executable is linked
+against libm and libpthread always, then against each name of `libs`
+(`-lNAME`, after everything that may need it). Each directory of
+`lib_dirs` is a `-L` directory of the linker **and an rpath**: the
+executable finds its libraries when it runs, from any directory and
+without `LD_LIBRARY_PATH`. The rpath is the directory's absolute,
+canonical path (`library_dir`: a relative directory is relative to the
+process that links, and a symbolic link is followed), so a directory
+that does not exist, is not a directory, or whose canonical name holds
+`:` (which an rpath reads as a separator) or `$` (a variable, such as
+`$ORIGIN`) is refused as `-L DIR: REASON` before anything is compiled.
+A library or symbol the linker cannot find is `linker failed:` and the
+linker's own output. `lib_dirs` is used by `build_executable` only:
+`emit` writes no executable. Tested by `crates/lair/tests/link.rs`: a
+shared library built with `cc`, the executable run without
+`LD_LIBRARY_PATH` and from another directory, the same executable
+failing once the library is moved.
 
 The checker and the lowering recurse over expressions, at most 512
 deep (§1); the checker is tested at depth 504 on a 2 MB thread.
@@ -761,7 +780,7 @@ target's triple and data layout on the module.
 ```
 lair check FILE.lir              ; parse and check only
 lair run FILE.lir [ARGS..]       ; JIT-compile and run main; exit with its status
-lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-l LIB]..
+lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
 lair emit-llvm FILE.lir          ; print the verified LLVM IR
 lair cases DIR..                 ; run a case suite (§13)
 ```

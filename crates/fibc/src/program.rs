@@ -329,6 +329,9 @@ impl<'a> Program<'a> {
 pub fn tyname(t: LirTy) -> &'static str {
     match t {
         LirTy::Dyn => "dyn",
+        // Not `ptr`: `(Array ptr)` and `(Array str)` have one layout but
+        // not one drop, and a name is one object type.
+        LirTy::Raw => "raw",
         other => other.text(),
     }
 }

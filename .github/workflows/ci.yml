@@ -42,7 +42,9 @@ jobs:
           cargo run -p fibref -- cases cases/modules
 
   # lair links LLVM 21 statically through llvm-sys (crates/lair), which
-  # takes minutes per link, so it is a job of its own.
+  # takes minutes per link, so it is a job of its own. fibc links lair,
+  # so its tests are here too, after lair's own, and the whole job
+  # builds the workspace once: one LLVM install, one cache.
   lair:
     runs-on: ubuntu-latest
     env:
@@ -79,7 +81,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       # cargo test -p lair runs every lIR case through the JIT and AOT
-      # (crates/lair/tests/cases.rs, spec/lir.md §13) and the JIT's
-      # library tests, the macro mechanism among them.
-      - name: Test
+      # (crates/lair/tests/cases.rs, spec/lir.md §13), the JIT's library
+      # tests, the macro mechanism among them, the C interface and the
+      # link step (crates/lair/tests/link.rs). It is the quick one, so it
+      # goes first.
+      - name: Test lair
         run: cargo test -p lair
+
+      # crates/fibc is not in the fibref job: it needs LLVM. Its tests
+      # are the compiler itself: the rule-6 suites (tests/cases.rs runs
+      # cases/ownership and cases/modules interpreted and compiled, as
+      # `fibc cases DIR` does, and fails on a Fail, a bad header or no
+      # cases), the generated programs, the fibber reader of the
+      # bootstrap (tests/bootstrap.rs), the C interface from fibber
+      # (tests/capi.rs, which builds liblair.so) and `fibc build`'s flags
+      # (tests/cli.rs). Two test threads: each case and each generated
+      # program runs a child process that compiles through the JIT, and
+      # the generator's jobs each hold an interpreter's heap trace.
+      - name: Test fibc
+        run: cargo test -p fibc -- --test-threads=2

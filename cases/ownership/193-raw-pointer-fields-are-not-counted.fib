@@ -1,0 +1,209 @@
+;; spec:   types §8.1, §8.3, §6.13 (M6, method.md rule 6)
+;; expect: accept
+;; result: 17179869183
+;; audit:  clean
+;; A raw ptr is an address with no count (types §8.1, syntax §3.15): no
+;; object that holds one retains it, releases it when it is dropped or
+;; copied, or walks it in a trace, in the interpreter or compiled. It
+;; and the pointer to an object are both `ptr` in lIR, and the compiled
+;; drop of an object released every field of that type: a struct, an
+;; enum variant, a Cell, an Option or a closure that held a raw ptr
+;; decremented the first word of the user's block when it was dropped
+;; (and freed it at zero), a Vec, an Array or a Map of ptr counted each
+;; element in and out, and a generic function at ptr counted its
+;; arguments as objects.
+;; Each probe makes one block, 24 bytes whose first word is 1000, the
+;; place of an object's count, and holds it in one kind of container.
+;; A retain or a release anywhere moves the word; nothing else does.
+;; The probe reads it twice: while the container is alive (the live
+;; reading, taken before the container's last use) and, from main, after
+;; the container is dropped. A reading is 1 where the word is still
+;; 1000, so a probe's pair is 0 to 3, shifted left by two bits for each
+;; probe before it. There are 17 probes and the result when none moved
+;; the word is 4^17 - 1 = 17179869183; a probe that did lowers it, in
+;; its own bits (a compiled run before the fix gave 10339289685).
+;;   0 a struct that does not escape (a stack object), 1 one that does,
+;;   2 the variants of an enum, 3 a generic struct (Box) at ptr,
+;;   4 a Vec of ptr, a literal and one grown past a leaf and a tail,
+;;   5 a vector pattern with a rest, 6 an Array of ptr (array,
+;;   array-with, array-copy), 7 array-set! with and without sharing,
+;;   8 a closure that escapes with a ptr captured, 9 an Option (a heap
+;;   enum for a scalar, types §8.1), 10 a Cell written with set!,
+;;   11 a (dyn P) over a struct that holds a ptr, 12 set-field! on a
+;;   struct that is shared, so that it is copied and the copy retains
+;;   its children, 13 a Map with ptr values, 14 a generic function at
+;;   ptr, 15 a Vec of structs that hold a ptr, and 16 a task, in whose
+;;   frame a ptr lives across an await and whose result it is.
+;; Not here, because the checker rejects them (a ptr is not Send, types
+;; §5.3): an Atom of ptr, a spawn with a ptr result and an async that
+;; captures a ptr. A def cannot hold one (no constant makes it).
+(defstruct Hold (p: ptr n: i64))
+(defenum Slot (Empty) (Full p: ptr) (Two n: i64 p: ptr))
+(defprotocol Peek (peek (self) -> i64))
+(impl Peek Hold (peek (self) (unsafe (load-i64 (. self p)))))
+
+;; A block shaped like an object's: a count of 1000 in its first word, the
+;; flags and type id (zero, from alloc) after it, and a word to write in.
+(defun fresh-block () -> ptr
+  (unsafe (let ((p (alloc 24))) (do (store-i64 p 1000) p))))
+
+(defun intact (p: ptr) -> i64
+  (unsafe (if (= (load-i64 p) 1000) 1 0)))
+
+;; a struct, one that does not escape (a stack object) and one that does
+(defun make-hold (p: ptr) -> Hold (Hold p 2))
+
+(defun struct-stack (p: ptr) -> i64
+  (let ((h (Hold p 1)) (live (intact p))) (do (. h n) live)))
+
+(defun struct-heap (p: ptr) -> i64
+  (let ((h (make-hold p)) (live (intact p))) (do (. h n) live)))
+
+;; enum variants that carry a ptr
+(defun make-slot (p: ptr n: i64) -> Slot
+  (if (= n 0) Empty (if (= n 1) (Full p) (Two n p))))
+
+(defun slot-n (s: Slot) -> i64
+  (match s ((Empty) 0) ((Full q) 1) ((Two n q) n)))
+
+(defun enum-variants (p: ptr) -> i64
+  (let ((a (make-slot p 0)) (b (make-slot p 1)) (c (make-slot p 2)) (live (intact p)))
+    (do (slot-n a) (slot-n b) (slot-n c) live)))
+
+;; a generic struct at ptr
+(defun boxed (x: a) -> (Box a) (Box x))
+
+(defun generic-struct (p: ptr) -> i64
+  (let ((b (boxed p)) (live (intact p)))
+    (do (. b v) live)))
+
+;; a Vec of ptr: a literal and one that grows past a leaf and a tail
+(defun grow (p: ptr n: i64) -> (Vec ptr)
+  (loop ((i 0) (v (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj v p)) v)))
+
+(defun vec-of-ptr (p: ptr) -> i64
+  (let ((small [p p p]) (big (grow p 70)) (live (intact p)))
+    (do (count small) (count big) live)))
+
+;; a vector pattern with a rest: the rest is a vector of its own
+(defun vec-pattern (p: ptr) -> i64
+  (let ((v (grow p 5)))
+    (let ((r (match v ([a b & rest] (* (intact a) (intact b))) (_ 0))))
+      (do (count v) r))))
+
+;; an Array of ptr: filled, copied, written with and without sharing
+(defun array-of-ptr (p: ptr) -> i64
+  (let ((a (array 4 p)))
+    (let ((b (array-with a 1 p))
+          (c (array-copy a 1 3))
+          (live (intact p)))
+      (do (array-len a) (array-len b) (array-len c) live))))
+
+(defun array-set-ptr (p: ptr) -> i64
+  (let ((c (cell (array 4 p))))
+    (do (array-set! &c 2 p)
+        (let ((alias @c))
+          (do (array-set! &c 3 p)
+              (let ((live (intact p)))
+                (do (array-len alias) live)))))))
+
+;; a closure that captures a ptr and escapes
+(defun reader (p: ptr) -> (fn () i64)
+  (fn () (unsafe (load-i64 p))))
+
+(defun closure-heap (p: ptr) -> i64
+  (let ((f (reader p)) (live (intact p))) (do (f) live)))
+
+;; an Option of ptr, a heap enum (types §8.1), some and nil
+(defun option-of-ptr (p: ptr) -> i64
+  (let ((o (some p)) (n: (Option ptr) nil) (live (intact p)))
+    (do (match o ((some q) 1) (nil 0)) (match n ((some q) 1) (nil 0)) live)))
+
+;; a Cell of ptr, written
+(defun cell-of-ptr (p: ptr) -> i64
+  (let ((c (cell p)))
+    (do (set! c p) (intact p))))
+
+;; a dyn over a struct that holds a ptr
+(defun dyn-payload (p: ptr) -> i64
+  (let ((d (dyn Peek (Hold p 3))) (live (intact p)))
+    (do (peek d) live)))
+
+;; a ptr that lives in a task's frame across an await and is the task's
+;; result, held by the task's result atom; the probe frees its own block
+(defun make-task () -> (Task ptr)
+  (async (unsafe (let ((q (fresh-block)))
+                   (do (await (yield))
+                       (store-i64 (ptr+ q 16) (intact q))
+                       q)))))
+
+(defun task-ptr () -> i64
+  (let ((q (let ((t (make-task)))
+             (let ((r (block-on t)))
+               (do (unsafe (store-i64 (ptr+ r 16) (* (load-i64 (ptr+ r 16)) (intact r)))) r)))))
+    (unsafe (let ((live (load-i64 (ptr+ q 16))) (after (intact q)))
+              (do (free q) (+ live (* 2 after)))))))
+
+;; set-field! on an object that is shared: the copy retains its children
+(defun update-field (p: ptr) -> i64
+  (let ((c (cell (Hold p 0))))
+    (do (set-field! &c n 5)
+        (let ((alias @c))
+          (do (set-field! &c n 6)
+              (let ((live (intact p)))
+                (do (. alias n) (. @c n) live)))))))
+
+;; a Map whose values are ptr
+(defun map-of-ptr (p: ptr) -> i64
+  (let ((m (assoc (assoc (map-empty) "a" p) "b" p)) (live (intact p)))
+    (do (count m) live)))
+
+;; a generic function at ptr
+(defun twice (x: a) -> (Vec a) [x x])
+
+(defun generic-fn (p: ptr) -> i64
+  (let ((v (twice p)) (live (intact p)))
+    (do (count v) live)))
+
+;; a Vec of structs that hold a ptr
+(defun vec-of-structs (p: ptr) -> i64
+  (let ((v (conj (conj (vec-empty) (Hold p 1)) (Hold p 2))) (live (intact p)))
+    (do (count v) live)))
+
+(defun block-at (tab: ptr k: i64) -> ptr
+  (unsafe (load-ptr (ptr+ tab (* 8 k)))))
+
+(defun scaled (r: i64 k: i64) -> i64
+  (shl r (* 2 k)))
+
+;; The reading taken while the container lives, and the one taken after
+;; it is dropped, as the two bits of the probe's pair.
+(defun score (tab: ptr k: i64 live: i64) -> i64
+  (scaled (+ live (* 2 (intact (block-at tab k)))) k))
+
+(defun main () -> i64
+  (unsafe
+    (let ((tab (alloc 128)))
+      (do (dotimes (k 16) (store-ptr (ptr+ tab (* 8 k)) (fresh-block)))
+          (let (
+                (s0 (score tab 0 (struct-stack (block-at tab 0))))
+                (s1 (score tab 1 (struct-heap (block-at tab 1))))
+                (s2 (score tab 2 (enum-variants (block-at tab 2))))
+                (s3 (score tab 3 (generic-struct (block-at tab 3))))
+                (s4 (score tab 4 (vec-of-ptr (block-at tab 4))))
+                (s5 (score tab 5 (vec-pattern (block-at tab 5))))
+                (s6 (score tab 6 (array-of-ptr (block-at tab 6))))
+                (s7 (score tab 7 (array-set-ptr (block-at tab 7))))
+                (s8 (score tab 8 (closure-heap (block-at tab 8))))
+                (s9 (score tab 9 (option-of-ptr (block-at tab 9))))
+                (s10 (score tab 10 (cell-of-ptr (block-at tab 10))))
+                (s11 (score tab 11 (dyn-payload (block-at tab 11))))
+                (s12 (score tab 12 (update-field (block-at tab 12))))
+                (s13 (score tab 13 (map-of-ptr (block-at tab 13))))
+                (s14 (score tab 14 (generic-fn (block-at tab 14))))
+                (s15 (score tab 15 (vec-of-structs (block-at tab 15))))
+                (t (scaled (task-ptr) 16)))
+            (do (dotimes (k 16) (free (block-at tab k)))
+                (free tab)
+                (+ s0 (+ s1 (+ s2 (+ s3 (+ s4 (+ s5 (+ s6 (+ s7 (+ s8 (+ s9 (+ s10 (+ s11 (+ s12 (+ s13 (+ s14 (+ s15 t))))))))))))))))))))))

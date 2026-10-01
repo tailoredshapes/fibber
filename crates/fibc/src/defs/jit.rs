@@ -127,6 +127,7 @@ fn call_entry(jit: &mut Jit, entry: &str, lt: Option<LirTy>) -> Result<Raw, Unsu
                 Raw::Ptr(f())
             }
             Some(LirTy::Dyn) => return Err(Unsupported("a def holding a dyn".into())),
+            Some(LirTy::Raw) => return Err(Unsupported("a def holding a raw ptr".into())),
         })
     }
 }
@@ -172,6 +173,7 @@ unsafe fn read(addr: usize, l: LirTy) -> Result<Raw, Unsupported> {
         LirTy::Double => Raw::F64(*(addr as *const f64)),
         LirTy::Ptr => Raw::Ptr(*(addr as *const usize)),
         LirTy::Dyn => return Err(Unsupported("a def holding a dyn".into())),
+        LirTy::Raw => return Err(Unsupported("a def holding a raw ptr".into())),
     })
 }
 

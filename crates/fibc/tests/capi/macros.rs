@@ -14,16 +14,15 @@
 
 use std::path::Path;
 
-use fibc::compile::compile_macro;
-use fibc::macros::macro_forms;
+use fibc::macros::abi::WIDTHS;
+use fibc::macros::module::Fns;
 use fibref::cases::list_cases;
-use fibref::expand::ExpandCtx;
-use fibref::own::check_forms;
-use fibref::types::prelude_forms;
+use lair::{Jit, JitOptions};
 
 use super::recording::{
-    compare, demo_output, expand, expected_output, expected_repeated, Scenario,
+    compare, demo_output, demo_run, expand, expected_output, expected_repeated, Scenario,
 };
+use super::support::stdout_text;
 
 const GENSYM: Scenario = Scenario {
     name: "gensym",
@@ -114,9 +113,8 @@ fn every_kind_of_form_goes_in_and_comes_out_of_a_module() {
     compare(&EVERY_KIND);
 }
 
-/// Floats: fibber has no bit cast from `f64`, so a float is made into its
-/// bits through the C library (`sscanf` of the shortest text that reads
-/// back) and read out with `call-f64`.
+/// Floats: a float is made into its bits with `f64->bits` (every bit of
+/// the f64, whatever the form's width) and read out with `call-f64`.
 const FLOATS: Scenario = Scenario {
     name: "floats",
     source: "(defmacro ident (x) x)
@@ -150,34 +148,151 @@ fn a_macro_that_builds_forms_returns_them_to_fibber() {
     compare(&CONSTRUCT);
 }
 
-/// fibber's `to-object` assumes the keyword ids of the widths: i8 i16
-/// i32 i64 f32 f64 are 0 to 5 in every module (`compile_macro` interns
-/// them first), and the text the runner made is the text `compile_macro`
-/// makes.
+/// A macro that builds a form whose width is `:f16`, a keyword the module
+/// interns after the six widths: case 105 of `cases/ownership`, which the
+/// expansion refuses where the form is turned back into code.
+const BOGUS_WIDTH: Scenario = Scenario {
+    name: "bogus-width",
+    source: "(defmacro half () (List [(Sym \"fptosi\") (Sym \"i64\") (Flt 2.5 :f16)]))
+(defun main () -> i64 (half))",
+    wanted: "half",
+    calls: 1,
+};
+
+/// The module's own text exports the table of its keywords, which the
+/// compiler here and fibber read: `fibm.kw-count.K` and `fibm.kw.K`.
+/// Every width and the `:f16` the macro mentions are in it once, by
+/// name, and an id that is none has no name (null).
 #[test]
-fn the_width_ids_fibber_assumes_are_the_ones_the_module_has() {
-    let (runs, texts) = expand(REFLECTION.source, Some(REFLECTION.wanted));
+fn the_module_exports_the_table_of_its_keywords() {
+    type P = *const u8;
+    let (runs, texts) = expand(BOGUS_WIDTH.source, Some(BOGUS_WIDTH.wanted));
+    let k = runs[0].k.expect("the macro has a module");
+    let mut jit = Jit::new(JitOptions::default()).expect("a JIT");
+    jit.add_source("keywords", &texts[k].1)
+        .expect("the module is added");
+    let n = |s: &str| format!("fibm.{s}.{k}");
+    // SAFETY: abi.rs defines these as (fn i64 ()), (fn ptr (i64)),
+    // (fn i64 (ptr)) and (fn ptr (ptr)), and the JIT outlives the calls.
+    let (count, kw, len, ptr): (
+        extern "C" fn() -> i64,
+        extern "C" fn(i64) -> P,
+        extern "C" fn(P) -> i64,
+        extern "C" fn(P) -> P,
+    ) = unsafe {
+        (
+            jit.function(&n("kw-count")).expect("kw-count"),
+            jit.function(&n("kw")).expect("kw"),
+            jit.function(&n("str-len")).expect("str-len"),
+            jit.function(&n("str-ptr")).expect("str-ptr"),
+        )
+    };
+    let name = |id: i64| {
+        let s = kw(id);
+        // SAFETY: a str object holds its length in bytes at its bytes.
+        (!s.is_null()).then(|| unsafe {
+            let bytes = std::slice::from_raw_parts(ptr(s), len(s) as usize);
+            String::from_utf8(bytes.to_vec()).expect("a keyword is utf-8")
+        })
+    };
+    let table: Vec<String> = (0..count()).map(|id| name(id).expect("named")).collect();
+    for want in WIDTHS.iter().copied().chain(["f16"]) {
+        assert_eq!(
+            table.iter().filter(|k| *k == want).count(),
+            1,
+            "{want} in {table:?}"
+        );
+    }
+    assert_eq!(table.len(), WIDTHS.len() + 1, "the six widths and :f16");
+    for id in [-1, count(), count() + 1, i64::MAX, i64::MIN] {
+        assert_eq!(name(id), None, "keyword {id} of {}", count());
+    }
+    println!("the table of {}: {table:?}", runs[0].def.name);
+}
+
+/// The text of a module with the count its `fibm.kw-count.K` returns
+/// replaced by `n`.
+fn with_count(text: &str, k: usize, n: usize) -> String {
+    let head = format!("(define (fibm.kw-count.{k} i64) () (block entry (ret (i64 ");
+    let start = text.find(&head).expect("the module has a count") + head.len();
+    let end = start + text[start..].find(')').expect("the count ends");
+    format!("{}{n}{}", &text[..start], &text[end..])
+}
+
+/// A table that lacks a width (the module made by a compiler that did not
+/// intern them), or has an id with no name, makes a module neither the
+/// Rust runner nor fibber will use: each says so when it looks the module
+/// up, and neither builds a form that would need the width.
+#[test]
+fn a_module_whose_table_lacks_a_width_or_a_name_is_refused_when_it_is_looked_up() {
+    let (runs, texts) = expand(BOGUS_WIDTH.source, Some(BOGUS_WIDTH.wanted));
     let run = &runs[0];
-    let mut ctx = ExpandCtx::new();
-    let prelude = prelude_forms(&mut ctx).expect("the prelude expands");
-    let checked = check_forms(&macro_forms(&run.def), &prelude).expect("the macro checks");
-    let n = run.def.params.len() + usize::from(run.def.rest.is_some());
     let k = run.k.expect("the macro has a module");
-    let module = compile_macro(&checked, &run.def.name, n, k).expect("the macro compiles");
-    assert_eq!(module.text, texts[k].1);
-    assert_eq!(module.widths, [0, 1, 2, 3, 4, 5]);
+    let text = &texts[k].1;
+    // The table is the six widths, in the order of WIDTHS, then :f16.
+    let cases = [
+        (4, "the keyword table has no :f32"),
+        (100, "the keyword table has no name for keyword 7 of 100"),
+    ];
+    for (count, message) in cases {
+        let broken = with_count(text, k, count);
+        assert_ne!(&broken, text);
+        let mut jit = Jit::new(JitOptions::default()).expect("a JIT");
+        jit.add_source("broken", &broken).expect("it is added");
+        match Fns::lookup(&mut jit, k) {
+            Err(u) => assert_eq!(u.0, format!("macro module: {message}")),
+            Ok(_) => panic!("the Rust runner accepted a table of {count}"),
+        }
+        let (_, out) = demo_run("broken-table", run, &broken, 1);
+        assert_eq!(
+            (out.status.code(), stdout_text(&out)),
+            (Some(1), format!("-- the macro module\n{message}\n")),
+            "fibber with a table of {count}"
+        );
+    }
+}
+
+/// A width the module interned past the six (`:f16`), one that no table
+/// has (`:i128`) and a width of the other family are named by the
+/// error from the module's table, as the Rust runner names them.
+#[test]
+fn a_form_of_a_width_that_is_none_is_named_from_the_table_as_rust_names_it() {
+    for (name, body) in [
+        ("flt-f16", "(Flt 2.5 :f16)"),
+        ("int-i128", "(Int 7 :i128)"),
+        ("int-f32", "(Int 7 :f32)"),
+        ("flt-i8", "(Flt 1.5 :i8)"),
+    ] {
+        let source = format!(
+            "(defmacro bad () (List [(Sym \"quote\") {body}]))\n(defun main () -> i64 (do (bad) 0))"
+        );
+        let source: &'static str = Box::leak(source.into_boxed_str());
+        let scenario = Scenario {
+            name,
+            source,
+            wanted: "bad",
+            calls: 1,
+        };
+        compare(&scenario);
+        let (runs, _) = expand(source, Some("bad"));
+        let want = expected_output(&runs[0]);
+        let kind = if body.starts_with("(Int") {
+            "an Int"
+        } else {
+            "a Flt"
+        };
+        assert!(
+            want.contains(&format!("trap: {kind} form of width :")) && !want.contains("#"),
+            "{name}: {want}"
+        );
+    }
 }
 
 /// The calls of every `defmacro` of `cases/ownership` are run from fibber
 /// and compared with the Rust runner's, as the real programs of the
-/// project are. What is left out: a macro whose module cannot be made (a
-/// case that is refused before the macro runs).
-///
-/// Case 105 is the one known difference: the module's keyword table is
-/// not in its text, so fibber names the width `:f16` by its id, `#6`,
-/// where the Rust runner names the keyword (spec/bootstrap.md §4).
-const KEYWORD_GAP_CASE: &str = "105-reject-macro-float-literal-bogus-width.fib";
-
+/// project are, case 105 included: its `:f16` is named by the module's
+/// table in both. What is left out: a macro whose module cannot be made
+/// (a case that is refused before the macro runs).
 #[test]
 fn the_macros_of_the_cases_run_from_fibber_as_the_rust_runner_runs_them() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cases/ownership");
@@ -195,16 +310,16 @@ fn the_macros_of_the_cases_run_from_fibber_as_the_rust_runner_runs_them() {
                 continue;
             };
             let got = demo_output(name, run, &texts[k].1, 1);
-            let mut want = expected_output(run);
-            if name == KEYWORD_GAP_CASE {
-                want = want.replace(":f16", ":#6");
-            }
-            assert_eq!(got, want, "{name}: {}", run.call);
+            assert_eq!(got, expected_output(run), "{name}: {}", run.call);
             compared.push(format!("{name}: {}", run.call));
         }
     }
     println!("compared {} runs; skipped {skipped:?}", compared.len());
     assert!(compared.len() >= 11, "only {compared:?}");
+    assert!(
+        compared.iter().any(|c| c.starts_with("105-")),
+        "case 105 is among them: {compared:?}"
+    );
 }
 
 /// One module, initialised once, runs the same call again and again, a

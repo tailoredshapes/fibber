@@ -94,6 +94,36 @@ fn conversions_name_their_target_type() {
 }
 
 #[test]
+fn float_bit_casts_are_functions_of_fixed_widths() {
+    let p = ok("(defun main () -> i64 (let ((a (f64->bits 1.0)) (b (bits->f64 1)) (c (f32->bits 1.0f32)) (d (bits->f32 1i32))) a))");
+    assert_eq!(binding_type(&p, "a"), "i64");
+    assert_eq!(binding_type(&p, "b"), "f64");
+    assert_eq!(binding_type(&p, "c"), "i32");
+    assert_eq!(binding_type(&p, "d"), "f32");
+    // Numbers never widen: each cast takes exactly its own width.
+    fails(
+        "(defun main () -> i64 (do (f64->bits 1) 0))",
+        K::Unify,
+        "cannot unify i64 with f64",
+    );
+    fails(
+        "(defun main () -> i64 (do (f32->bits 1.0) 0))",
+        K::Unify,
+        "cannot unify f64 with f32",
+    );
+    fails(
+        "(defun main () -> i64 (do (bits->f64 1i32) 0))",
+        K::Unify,
+        "cannot unify i32 with i64",
+    );
+    fails(
+        "(defun main () -> i64 (do (bits->f32 1) 0))",
+        K::Unify,
+        "cannot unify i64 with i32",
+    );
+}
+
+#[test]
 fn unsafe_operations_only_inside_unsafe() {
     ok("(extern puts (ptr) -> i32) (defun main () -> i64 (do (unsafe (puts (alloc 1))) 0))");
     fails(

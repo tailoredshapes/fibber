@@ -1,6 +1,8 @@
 //! One compiled macro-time module in the JIT: its C entry points
-//! (`abi.rs`) as function pointers, and the conversions between the
-//! expander's forms and the module's `Form` objects.
+//! (`abi.rs`) as function pointers, its table of keywords (read once,
+//! through `fibm.kw-count` and `fibm.kw`, as the stage-2 compiler reads
+//! it), and the conversions between the expander's forms and the
+//! module's `Form` objects.
 
 use fibref::syntax::{FltWidth, Form, FormKind, IntWidth, Pos};
 use lair::Jit;
@@ -29,21 +31,23 @@ pub struct Fns {
     vec_len: extern "C" fn(P) -> i64,
     vec_elem: extern "C" fn(P, i64) -> P,
     pub set_hooks: extern "C" fn(usize, usize, usize),
-    /// The keyword ids of the width suffixes: i8 i16 i32 i64 f32 f64.
-    pub widths: [i64; 6],
-    /// Every keyword the module interned, by id.
-    pub keywords: Vec<String>,
+    /// The keyword ids of the width suffixes, in the order of `WIDTHS`.
+    widths: [i64; 6],
+    /// Every keyword the module interned, by id: the module's table.
+    keywords: Vec<String>,
 }
 
 impl Fns {
-    /// Looks the module's functions up in the JIT.
-    pub fn lookup(jit: &mut Jit, widths: [i64; 6], k: usize) -> Result<Fns, Unsupported> {
+    /// Looks the module's functions and its keyword table up in the JIT.
+    /// A module whose table lacks a width suffix cannot be used: a form
+    /// of that width could not be built for it.
+    pub fn lookup(jit: &mut Jit, k: usize) -> Result<Fns, Unsupported> {
         let n = |s: &str| format!("fibm.{s}.{k}");
         // SAFETY: each name is defined by `abi.rs` with exactly the
         // signature transmuted to here; the JIT outlives the runner.
-        unsafe {
+        let mut fns = unsafe {
             let e = |m: lair::Error| Unsupported(format!("macro module: {m}"));
-            Ok(Fns {
+            Fns {
                 entry: jit.c_entry(&n("entry")).map_err(e)?,
                 str_new: jit.function(&n("str")).map_err(e)?,
                 form: jit.function(&n("form")).map_err(e)?,
@@ -60,10 +64,52 @@ impl Fns {
                 vec_len: jit.function(&n("vec-len")).map_err(e)?,
                 vec_elem: jit.function(&n("vec-elem")).map_err(e)?,
                 set_hooks: jit.function(&n("set-hooks")).map_err(e)?,
-                widths,
+                widths: [0; 6],
                 keywords: Vec::new(),
+            }
+        };
+        // SAFETY: as above, `abi.rs` defines (fn i64 ()) and (fn ptr (i64)).
+        let (count, name): (extern "C" fn() -> i64, extern "C" fn(i64) -> P) = unsafe {
+            let e = |m: lair::Error| Unsupported(format!("macro module: {m}"));
+            (
+                jit.function(&n("kw-count")).map_err(e)?,
+                jit.function(&n("kw")).map_err(e)?,
+            )
+        };
+        fns.keywords = fns.read_table(count(), name)?;
+        fns.widths = fns.width_ids()?;
+        Ok(fns)
+    }
+
+    /// The names of the keywords with ids 0 to `count` - 1.
+    fn read_table(
+        &self,
+        count: i64,
+        name: extern "C" fn(i64) -> P,
+    ) -> Result<Vec<String>, Unsupported> {
+        (0..count)
+            .map(|id| {
+                let s = name(id);
+                if s.is_null() {
+                    return Err(Unsupported(format!(
+                        "macro module: the keyword table has no name for keyword {id} of {count}"
+                    )));
+                }
+                Ok(self.read_str(s))
             })
+            .collect()
+    }
+
+    /// The ids of the width suffixes, found in the table by name.
+    fn width_ids(&self) -> Result<[i64; 6], Unsupported> {
+        let mut ids = [0i64; 6];
+        for (id, w) in ids.iter_mut().zip(WIDTHS) {
+            let at = self.keywords.iter().position(|k| k == w);
+            *id = at.map(|i| i as i64).ok_or_else(|| {
+                Unsupported(format!("macro module: the keyword table has no :{w}"))
+            })?;
         }
+        Ok(ids)
     }
 
     fn tag_of(name: &str) -> i32 {
@@ -75,15 +121,10 @@ impl Fns {
     }
 
     fn width_id(&self, suffix: &str) -> i64 {
-        WIDTHS.iter().position(|w| *w == suffix).map_or_else(
-            || {
-                self.keywords
-                    .iter()
-                    .position(|k| k == suffix)
-                    .map_or(-1, |i| i as i64)
-            },
-            |i| self.widths[i],
-        )
+        WIDTHS
+            .iter()
+            .position(|w| *w == suffix)
+            .map_or(-1, |i| self.widths[i])
     }
 
     /// A form as a `Form` object of the module.
@@ -169,18 +210,14 @@ impl Fns {
         Ok(Form::new(kind, pos.clone()))
     }
 
-    /// The suffix a keyword id names; an id the module did not intern
-    /// for a width is reported by its number, as the interpreter names
-    /// an unknown keyword.
+    /// The name of a keyword id, from the module's table; an id that is
+    /// none is reported by its number.
     fn width_name(&self, id: i64) -> String {
-        match self.widths.iter().position(|w| *w == id) {
-            Some(i) => WIDTHS[i].to_string(),
-            None => self
-                .keywords
-                .get(id as usize)
-                .cloned()
-                .unwrap_or_else(|| format!("#{id}")),
-        }
+        usize::try_from(id)
+            .ok()
+            .and_then(|i| self.keywords.get(i))
+            .cloned()
+            .unwrap_or_else(|| format!("#{id}"))
     }
 
     fn read_items(&self, v: P, pos: &Pos) -> Result<Vec<Form>, String> {

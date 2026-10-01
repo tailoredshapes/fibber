@@ -1,8 +1,9 @@
 //! Ahead-of-time compilation: object files, assembly, LLVM IR and
 //! executables linked with `cc` (spec/lir.md §11).
 
+mod link;
+
 use std::path::Path;
-use std::process::Command;
 use std::ptr;
 
 use llvm_sys::core::{LLVMDisposeMemoryBuffer, LLVMGetBufferSize, LLVMGetBufferStart};
@@ -14,6 +15,8 @@ use crate::llvm::take_message;
 use crate::llvm::target::Machine;
 use crate::lower::lower;
 use lir::Module;
+
+pub use link::library_dir;
 
 /// What [`emit`] produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,8 +31,13 @@ pub enum Output {
 pub struct Options {
     /// 0 to 3: the IR pipeline `default<On>` and the code generator level.
     pub opt_level: u8,
-    /// Libraries to link (`-l`).
+    /// Libraries to link (`-l`), after the module's own code.
     pub libs: Vec<String>,
+    /// Directories that hold those libraries (`-L`). Each is also an
+    /// rpath, an absolute one ([`library_dir`] says how a name becomes
+    /// it), so the executable finds its libraries without
+    /// `LD_LIBRARY_PATH`. Used by [`build_executable`] only.
+    pub lib_dirs: Vec<String>,
 }
 
 /// Compile a checked module for the host.
@@ -66,33 +74,17 @@ pub fn emit(m: &Module, name: &str, out: Output, opts: &Options) -> Result<Vec<u
 }
 
 /// Compile a module that satisfies the `main` rule and link it with
-/// `cc` into an executable at `path`.
+/// `cc` into an executable at `path`, against libm, libpthread, and
+/// `opts.libs` searched for in `opts.lib_dirs`. A directory that is
+/// missing, is no directory or cannot be an rpath is an error before
+/// anything is compiled.
 pub fn build_executable(m: &Module, name: &str, path: &Path, opts: &Options) -> Result<()> {
     lir::check_main(m)?;
+    let dirs = opts
+        .lib_dirs
+        .iter()
+        .map(|d| library_dir(d).map_err(Error::Backend))
+        .collect::<Result<Vec<_>>>()?;
     let obj = emit(m, name, Output::Object, opts)?;
-    let obj_path = path.with_file_name(format!(
-        "{}.lair.o",
-        path.file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    ));
-    std::fs::write(&obj_path, obj)
-        .map_err(|e| Error::Backend(format!("cannot write {}: {e}", obj_path.display())))?;
-    let mut cmd = Command::new("cc");
-    cmd.arg(&obj_path).arg("-o").arg(path);
-    // C links libm only on request; LLVM lowers frem to fmod.
-    cmd.arg("-lm");
-    for l in &opts.libs {
-        cmd.arg(format!("-l{l}"));
-    }
-    let out = cmd.output();
-    let _ = std::fs::remove_file(&obj_path);
-    match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(Error::Backend(format!(
-            "linker failed: {}",
-            String::from_utf8_lossy(&o.stderr)
-        ))),
-        Err(e) => Err(Error::Backend(format!("cannot run cc: {e}"))),
-    }
+    link::link(&obj, path, &dirs, &opts.libs)
 }

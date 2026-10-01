@@ -110,6 +110,9 @@ impl<'p> Interp<'p> {
             name @ ("str-len" | "str-bytes" | "str-from-bytes" | "str-concat" | "str-slice"
             | "str-eq" | "starts-with?") => self.string_builtin(name, a),
             "char->i32" | "i32->char" => super::arith::char_conv(BUILTINS[b].name, arg(0)?),
+            "f64->bits" | "bits->f64" | "f32->bits" | "bits->f32" => {
+                super::float_bits::float_bits(BUILTINS[b].name, arg(0)?)
+            }
             name @ ("args" | "read-file" | "write-file") => self.io_builtin(name, a),
             "gensym" | "struct?" | "struct-fields" | "struct-params" | "struct-field-types"
             | "enum?" | "enum-params" | "enum-variants" => {

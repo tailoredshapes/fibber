@@ -12,7 +12,15 @@ pub enum LirTy {
     I64,
     Float,
     Double,
+    /// The pointer to an object (types §8.2): a counted pointer, which
+    /// retain, release, drop and trace follow.
     Ptr,
+    /// A raw `ptr` of a program (types §8.1, syntax §3.15): an address
+    /// from `alloc` or an extern, uncounted. It is `ptr` in lIR text and
+    /// in layout, but its own variant, because the compiler decides
+    /// whether a slot is counted from this type and a raw pointer and an
+    /// object pointer must not be told apart by their lIR text.
+    Raw,
     /// A `(dyn P)` value: `{ ptr ptr }` by value (types §8.1).
     Dyn,
 }
@@ -27,7 +35,7 @@ impl LirTy {
             LirTy::I64 => "i64",
             LirTy::Float => "float",
             LirTy::Double => "double",
-            LirTy::Ptr => "ptr",
+            LirTy::Ptr | LirTy::Raw => "ptr",
             LirTy::Dyn => "{ ptr ptr }",
         }
     }
@@ -45,7 +53,7 @@ impl LirTy {
             LirTy::I8 => 8,
             LirTy::I16 => 16,
             LirTy::I32 => 32,
-            LirTy::I64 | LirTy::Double | LirTy::Ptr => 64,
+            LirTy::I64 | LirTy::Double | LirTy::Ptr | LirTy::Raw => 64,
             LirTy::Float => 32,
             LirTy::Dyn => 128,
         }

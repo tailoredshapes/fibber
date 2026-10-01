@@ -102,8 +102,13 @@ lair_error *lair_check_source(const char *src, size_t src_len);
 /* Compile the module `src`, which must satisfy the `main` rule (spec/lir.md
  * section 7.2), and link it with `cc` into the executable `path`.
  * opt_level is 0 to 3. Each of the n_libs names libs[i] (of length
- * lib_lens[i]) is linked as -lNAME; libs and lib_lens may be NULL when
- * n_libs is 0. The executable's exit status is main's result. */
+ * lib_lens[i]) is linked as -lNAME, after libm and libpthread (always
+ * linked); libs and lib_lens may be NULL when n_libs is 0. The library
+ * search is the system's, the way `cc` does it: there is no argument
+ * for a library directory, so a library outside the system's
+ * directories cannot be named here and no rpath is written. (The Rust
+ * API's aot::Options::lib_dirs has both; the C interface does not
+ * give it yet.) The executable's exit status is main's result. */
 lair_error *lair_build_executable(const char *src, size_t src_len, const char *path,
                                   size_t path_len, int opt_level, const char *const *libs,
                                   const size_t *lib_lens, size_t n_libs);

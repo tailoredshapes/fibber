@@ -19,33 +19,42 @@
 ;;   Kw Int Flt Str Chr Bool Nil List Vec Map are 0 to 10
 ;;   (`compile_macro` refuses any other order). A tag that is none of them
 ;;   reads as Nil, as in Rust.
-;; - The width of an Int or Flt form is a keyword id. The ids of i8 i16
-;;   i32 i64 f32 f64 are 0 to 5 (`compile_macro` interns them first; the
-;;   test asserts it), so those are the ids written and read. The table
-;;   of the other keywords is not in the module text, so an id past 5 is
-;;   named `#ID` in the error where Rust names the keyword.
-;;; - fibber has no f64 -> bits cast and `lair_call_i64` passes no double,
-;;   but `fibm.form` takes the bits of a Flt form's double as an integer.
-;;   `flt-bits` gets them through the C library: `(show v)` is the
-;;   shortest text that reads back (types §2.12) and `sscanf` of it with
-;;   `%lf` stores the double in memory, where `load-i64` reads the bits.
-;;   Reading a Flt form needs none of that: `call-f64`.
+;; - The width of an Int or Flt form is a keyword id, and the module
+;;   exports the table of the keywords it interned, `fibm.kw-count.K` and
+;;   `fibm.kw.K` (abi.rs). `fibm-lookup` reads the whole table once, so
+;;   an id is named from the table, as the Rust `Fns` names it (an id
+;;   that is in no table is `#ID`), and the id of a width suffix (i8 i16
+;;   i32 i64 f32 f64) is found by name, never assumed. A module whose
+;;   table lacks one of those six cannot be given a form of that width,
+;;   so `fibm-lookup` refuses it with an error and `to-object` has none
+;;   to report; `compile_macro` interns all six, so each module it makes
+;;   is accepted.
+;; - `lair_call_i64` passes no double, but `fibm.form` takes the bits of a
+;;   Flt form's double as an integer: `(f64->bits v)` (syntax §4.3), every
+;;   bit of it, a NaN's payload and a zero's sign included. A Flt form of
+;;   width :f32 holds the f32 widened to f64, as the Rust `Form` does, so
+;;   the bits are those of the f64. Reading a Flt form needs no cast: the
+;;   module hands the double back through `call-f64`.
 (ns lair.fibm
   (:require [lair.jit :as jit] [lair.call :as call] [lair.ffi :as ffi])
   (:use syntax.pos syntax.form util.result))
 
-(extern sscanf :private (ptr ptr ptr) -> i32 :varargs)
-
-;; The addresses of the module's functions, from `jit-c-entry`.
+;; The addresses of the module's functions, from `jit-c-entry`, then its
+;; keyword table: the name of each keyword by id, and the ids of the six
+;; width suffixes in the order of `width-names`.
 (defstruct Fibm
   (entry: i64 str-new: i64 form: i64 vec: i64 tag: i64 f0-ptr: i64 f0-i64: i64 f0-f64: i64
    f0-i32: i64 f0-i1: i64 f1-i64: i64 str-len: i64 str-ptr: i64 vec-len: i64 vec-elem: i64
-   set-hooks: i64 init: i64))
+   set-hooks: i64 init: i64 kw: i64 kw-count: i64
+   keywords: (Vec str) widths: (Vec i64)))
 
 ;; The names of those functions, in the order of the fields of `Fibm`.
 (def names: (Vec str) :private ["entry" "str" "form" "vec" "tag" "f0-ptr" "f0-i64" "f0-f64"
                           "f0-i32" "f0-i1" "f1-i64" "str-len" "str-ptr" "vec-len" "vec-elem"
-                          "set-hooks" "init"])
+                          "set-hooks" "init" "kw" "kw-count"])
+
+;; The width suffixes whose ids a form of that width needs.
+(def width-names: (Vec str) :private ["i8" "i16" "i32" "i64" "f32" "f64"])
 
 ;; The addresses of `fibm.NAME.K` for each NAME, in order, or the first
 ;; failure.
@@ -57,14 +66,54 @@
           ((Err m) (Err m)))
         (Ok acc))))
 
-;; The surface of the module made for the K-th macro, added to j.
+;; The keyword table of the module whose function addresses are a: the
+;; name of each keyword, by id 0 to `fibm.kw-count` - 1, or the first id
+;; the module gives no name.
+(defun read-table :private (a: (Vec i64)) -> (Result (Vec str) str)
+  (let ((count (word (nth a 18) [])))
+    (loop ((id 0) (acc (vec-empty)))
+      (if (< id count)
+          (let ((s (word (nth a 17) [id])))
+            (if (= s 0)
+                (Err (str-join ["the keyword table has no name for keyword " (show id)
+                                " of " (show count)]))
+                (recur (+ id 1) (conj acc (text-of (nth a 12) (nth a 11) s)))))
+          (Ok acc)))))
+
+;; The position of s in xs.
+(defun index-of :private (xs: (Vec str) s: str) -> (Option i64)
+  (loop ((i 0))
+    (if (< i (count xs))
+        (if (= (nth xs i) s) (some i) (recur (+ i 1)))
+        nil)))
+
+;; The ids of the width suffixes in the table, in the order of
+;; `width-names`, or the first suffix the table lacks.
+(defun width-ids :private (table: (Vec str)) -> (Result (Vec i64) str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count width-names))
+        (match (index-of table (nth width-names i))
+          ((some id) (recur (+ i 1) (conj acc id)))
+          (nil (Err (str-concat "the keyword table has no :" (nth width-names i)))))
+        (Ok acc))))
+
+(defun fibm-of :private (a: (Vec i64) table: (Vec str) widths: (Vec i64)) -> Fibm
+  (Fibm (nth a 0) (nth a 1) (nth a 2) (nth a 3) (nth a 4) (nth a 5) (nth a 6) (nth a 7)
+        (nth a 8) (nth a 9) (nth a 10) (nth a 11) (nth a 12) (nth a 13) (nth a 14)
+        (nth a 15) (nth a 16) (nth a 17) (nth a 18) table widths))
+
+;; The surface of the module made for the K-th macro, added to j, with
+;; its keyword table read once.
 (defun fibm-lookup (j: jit/Jit k: i64) -> (Result Fibm str)
   (match (addresses j k)
     ((Err m) (Err m))
     ((Ok a)
-     (Ok (Fibm (nth a 0) (nth a 1) (nth a 2) (nth a 3) (nth a 4) (nth a 5) (nth a 6) (nth a 7)
-               (nth a 8) (nth a 9) (nth a 10) (nth a 11) (nth a 12) (nth a 13) (nth a 14)
-               (nth a 15) (nth a 16))))))
+     (match (read-table a)
+       ((Err m) (Err m))
+       ((Ok table)
+        (match (width-ids table)
+          ((Err m) (Err m))
+          ((Ok widths) (Ok (fibm-of a table widths)))))))))
 
 ;; Initialises the module's runtime (`fibm.init`): once, after the module
 ;; is added and before its first macro runs, as the Rust runner does.
@@ -112,9 +161,14 @@
 (defun form-tag (m: Fibm o: i64) -> i64
   (low32 (word (. m tag) [o])))
 
+;; The text of the `str` object s, read with the module's `str-ptr` and
+;; `str-len` functions at these addresses.
+(defun text-of :private (ptr-fn: i64 len-fn: i64 s: i64) -> str
+  (ffi/text-at (word ptr-fn [s]) (word len-fn [s])))
+
 ;; The text of a `str` object.
 (defun str-text (m: Fibm s: i64) -> str
-  (ffi/text-at (word (. m str-ptr) [s]) (word (. m str-len) [s])))
+  (text-of (. m str-ptr) (. m str-len) s))
 
 ;; The text of the Sym, Kw or Str form o.
 (defun form-text (m: Fibm o: i64) -> str
@@ -128,39 +182,26 @@
 
 ;; -------------------------------------------------------------- widths
 
-(defun width-name :private (id: i64) -> str
-  (match id
-    (0 "i8") (1 "i16") (2 "i32") (3 "i64") (4 "f32") (5 "f64")
-    (_ (str-concat "#" (show id)))))
+(defun width-name :private (m: Fibm id: i64) -> str
+  (if (and (>= id 0) (< id (count (. m keywords))))
+      (nth (. m keywords) id)
+      (str-concat "#" (show id))))
 
-(defun int-width-of :private (id: i64) -> (Option IntWidth)
-  (match id
-    (0 (some I8)) (1 (some I16)) (2 (some I32)) (3 (some I64))
+(defun int-width-of :private (m: Fibm id: i64) -> (Option IntWidth)
+  (match (width-name m id)
+    ("i8" (some I8)) ("i16" (some I16)) ("i32" (some I32)) ("i64" (some I64))
     (_ nil)))
 
-(defun flt-width-of :private (id: i64) -> (Option FltWidth)
-  (match id
-    (4 (some F32)) (5 (some F64))
+(defun flt-width-of :private (m: Fibm id: i64) -> (Option FltWidth)
+  (match (width-name m id)
+    ("f32" (some F32)) ("f64" (some F64))
     (_ nil)))
 
-(defun int-width-id :private (w: IntWidth) -> i64
-  (match w ((I8) 0) ((I16) 1) ((I32) 2) ((I64) 3)))
+(defun int-width-id :private (m: Fibm w: IntWidth) -> i64
+  (nth (. m widths) (match w ((I8) 0) ((I16) 1) ((I32) 2) ((I64) 3))))
 
-(defun flt-width-id :private (w: FltWidth) -> i64
-  (match w ((F32) 4) ((F64) 5)))
-
-;; The IEEE 754 bits of v, as Rust's `f64::to_bits`: see the head of this
-;; file. The C locale is the program's (it never calls setlocale), so the
-;; text `show` makes reads back exactly.
-(defun flt-bits :private (v: f64) -> i64
-  (let ((text (ffi/bytes-new (show v)))
-        (fmt (ffi/bytes-new "%lf"))
-        (out (ffi/slot-new)))
-    (unsafe
-      (let ((n (sscanf text fmt out))
-            (bits (load-i64 out)))
-        (do (free text) (free fmt) (free out)
-            (if (= n 1i32) bits (trap "flt-bits: sscanf cannot read what show printed")))))))
+(defun flt-width-id :private (m: Fibm w: FltWidth) -> i64
+  (nth (. m widths) (match w ((F32) 4) ((F64) 5))))
 
 ;; ----------------------------------------------------- object to Stx
 
@@ -173,18 +214,18 @@
 
 (defun int-kind :private (m: Fibm o: i64) -> (Result StxKind str)
   (let ((id (word (. m f1-i64) [o])))
-    (match (int-width-of id)
+    (match (int-width-of m id)
       ((some w) (Ok (SInt (word (. m f0-i64) [o]) w)))
-      (nil (Err (str-concat "trap: an Int form of width :" (width-name id)))))))
+      (nil (Err (str-concat "trap: an Int form of width :" (width-name m id)))))))
 
 (defun flt-kind :private (m: Fibm o: i64) -> (Result StxKind str)
   (let ((id (word (. m f1-i64) [o])))
-    (match (flt-width-of id)
+    (match (flt-width-of m id)
       ((some w)
        (match (call/call-f64 (. m f0-f64) [o])
          ((Ok v) (Ok (SFlt v w)))
          ((Err e) (Err e))))
-      (nil (Err (str-concat "trap: a Flt form of width :" (width-name id)))))))
+      (nil (Err (str-concat "trap: a Flt form of width :" (width-name m id)))))))
 
 ;; The List, Vec or Map (tag 8, 9 or 10) form o.
 (defun seq-kind :private (m: Fibm o: i64 tag: i64 pos: Pos) -> (Result StxKind str)
@@ -240,8 +281,8 @@
     ((SSym n) (text-form m 0 n))
     ((SKw n) (text-form m 1 n))
     ((SStr n) (text-form m 4 n))
-    ((SInt v w) (form-object m 2 v (int-width-id w) 0))
-    ((SFlt v w) (form-object m 3 (flt-bits v) (flt-width-id w) 0))
+    ((SInt v w) (form-object m 2 v (int-width-id m w) 0))
+    ((SFlt v w) (form-object m 3 (f64->bits v) (flt-width-id m w) 0))
     ((SChr c) (form-object m 5 (zext i64 (char->i32 c)) 0 0))
     ((SBool b) (form-object m 6 (if b 1 0) 0 0))
     ((SNil) (form-object m 7 0 0 0))

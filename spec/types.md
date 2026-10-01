@@ -666,7 +666,18 @@ operand is a type: `(trunc i8 e)`, `(zext i64 e)`, `(sext i64 e)`,
 `(fptrunc f32 e)`, `(fpext f64 e)`, `(fptosi i64 e)`, `(fptoui i64 e)`,
 `(sitofp f64 e)`, `(uitofp f64 e)`, `(char->i32 e)`, `(i32->char e)`
 (traps on a non-scalar value), each with the obvious operand and result
-types. `(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`,
+types. The bit casts of a float are builtin functions, not primitive
+forms, because they name no target type: `(f64->bits x)` is the `i64`
+whose bits are the IEEE 754 binary64 pattern of the `f64` `x`, `(bits->f64
+n)` the `f64` of the pattern `n`, and `(f32->bits x)`, `(bits->f32 n)` the
+same at `f32` and `i32`. Every bit is kept: the payload and quiet bit of
+a NaN, the sign of a zero, a subnormal's low bits; the casts never trap
+and `bits->f64` of `(f64->bits x)` is `x` bit for bit. An `f32` is
+held by the interpreter widened to `f64`, and the hardware conversion
+quiets a signalling NaN, so the interpreter widens and narrows a NaN by
+hand to keep its bits (`eval/float_bits.rs`, case 194; method.md rule 6).
+
+`(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`,
 is a prelude macro over `struct-fields`, `struct-params` and
 `struct-field-types` for a struct, and over `enum-params` and
 `enum-variants` for an enum (syntax §3.16), that generates one `impl`
@@ -2723,7 +2734,12 @@ real tags (§4.5), answers 1 (method.md rule 6). The layout class `opt`
 Scalars inside objects are stored unboxed at their lIR type. A struct
 `(defstruct P (x: i64 s: str))` is `(defstruct P.obj (i64 i32 i32 i64
 ptr))`: the header fields first, then the fields in declaration order;
-one lIR `defstruct` per monomorphised object type.
+one lIR `defstruct` per monomorphised object type. A field of type
+`ptr` is such a scalar although its lIR type is `ptr` as an object
+field's is: it has no count, so no `drop`, `trace`, copy or retain
+touches it, a `Vec`, `Array`, `Cell` or `Option` of `ptr` counts no
+element, and a body specialised at `ptr` takes no counts. What is
+counted is decided by the fibber type, never by the lIR text (case 193).
 
 ### 8.2 The count header, runtime primitives, type table
 
@@ -3434,6 +3450,7 @@ nothing (§2.11: the objects live at an abort are not leaks).
 | `(fptoui T x)` | `(fptoui-sat T x)`: NaN or negative → 0, at or above `2^bits(T)` → all ones, else truncation |
 | `=`, `!=`, `<`, `<=`, `>`, `>=` at a float type | `fcmp` with `oeq`, `une`, `olt`, `ole`, `ogt`, `oge` respectively: the ordered predicates are false on a NaN operand and the unordered `une` of `!=` is true (§2.12); never the `Ord` defaults |
 | `(rem a b)` at a float type | `frem`: `fmod`, the sign of the dividend (§2.12); no check |
+| `(f64->bits x)`, `(bits->f64 n)`, `(f32->bits x)`, `(bits->f32 n)` | `(bitcast i64 x)`, `(bitcast double n)`, `(bitcast i32 x)`, `(bitcast float n)`: same size, no check, every bit kept |
 | `bit-and`, `bit-or`, `bit-xor`, `bit-not`, `popcount` (`ctpop`), integer comparisons, `trunc`, `zext`, `sext`, `sitofp`, `uitofp`, `fptrunc`, `fpext`, float arithmetic | the LLVM instruction as it is, no check |
 
 The intrinsics compute exactly what v1's hand-written sequences

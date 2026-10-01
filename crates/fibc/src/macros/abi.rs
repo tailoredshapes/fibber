@@ -1,7 +1,9 @@
 //! The C-callable surface of a macro-time module (compiler.md §6):
 //! the entry that runs the macro, constructors and readers of `Form`
-//! objects for the expander's forms, and the hooks the module calls
-//! back for `gensym` and reflection. All `ccc` and exported.
+//! objects for the expander's forms, the table of the keywords the
+//! module interned (an `Int` or `Flt` form's width is a keyword id), and
+//! the hooks the module calls back for `gensym` and reflection. All
+//! `ccc` and exported.
 
 use std::fmt::Write;
 
@@ -19,10 +21,13 @@ pub struct FormLayout {
     /// The size of a `Form` object.
     pub size: u64,
     pub vec: VecIds,
+    /// The static `str` constant (`@str.N`) holding each interned
+    /// keyword's name, by keyword id.
+    pub keyword_strs: Vec<String>,
 }
 
-/// The width suffixes whose keyword ids a module holds, in the order
-/// of the runner's `Fns::widths`.
+/// The width suffixes `compile_macro` interns before anything else, so
+/// that a form of any width can be given an id by name.
 pub const WIDTHS: [&str; 6] = ["i8", "i16", "i32", "i64", "f32", "f64"];
 
 /// The variant names in the order of [`FormLayout::tags`].
@@ -33,7 +38,7 @@ pub const VARIANTS: [&str; 11] = [
 /// The lIR of the module's surface; `entry` runs the macro body
 /// `body` on `n` `Form` (or rest vector) arguments.
 pub fn render(f: &FormLayout, body: &str, n: usize, k: usize) -> String {
-    let mut s = String::new();
+    let mut s = render_keywords(&f.keyword_strs, k);
     let params: Vec<String> = (0..n).map(|i| format!("(ptr a{i})")).collect();
     let args: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
     let _ = writeln!(
@@ -107,4 +112,63 @@ pub fn render(f: &FormLayout, body: &str, n: usize, k: usize) -> String {
         f.vec.tnarr
     );
     s
+}
+
+/// `fibm.kw-count.K`, the number of keywords the module interned, and
+/// `fibm.kw.K`, the name of the keyword with a given id as an immortal
+/// `str` object, or null for an id that is none (below 0 or from the
+/// count up). The ids are 0 to count - 1, in the order interned.
+fn render_keywords(strs: &[String], k: usize) -> String {
+    let cases: String = (0..strs.len())
+        .map(|i| format!(" ((i64 {i}) kw{i})"))
+        .collect();
+    let blocks: String = strs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("\n  (block kw{i} (ret {s}))"))
+        .collect();
+    format!(
+        "(define (fibm.kw-count.{k} i64) () (block entry (ret (i64 {}))))
+(define (fibm.kw.{k} ptr) ((i64 id))
+  (block entry (switch id none{cases})){blocks}
+  (block none (ret (ptr null))))
+",
+        strs.len()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::statics::Statics;
+
+    #[test]
+    fn the_keyword_table_is_a_count_and_a_switch_over_static_names() {
+        let mut statics = Statics::default();
+        let strs: Vec<String> = ["i8", "f16"].iter().map(|k| statics.string(k, 0)).collect();
+        let text = render_keywords(&strs, 3);
+        assert_eq!(
+            text,
+            "(define (fibm.kw-count.3 i64) () (block entry (ret (i64 2))))
+(define (fibm.kw.3 ptr) ((i64 id))
+  (block entry (switch id none ((i64 0) kw0) ((i64 1) kw1)))
+  (block kw0 (ret @str.0))
+  (block kw1 (ret @str.1))
+  (block none (ret (ptr null))))
+"
+        );
+        let module = format!("{}{text}", statics.render());
+        if let Err(e) = lir::parse_and_check(&module) {
+            panic!("{}\n{module}", e[0]);
+        }
+    }
+
+    #[test]
+    fn a_table_of_no_keywords_is_a_zero_count_and_a_null_for_every_id() {
+        let text = render_keywords(&[], 0);
+        assert!(text.contains("(ret (i64 0))"), "{text}");
+        if let Err(e) = lir::parse_and_check(&text) {
+            panic!("{}\n{text}", e[0]);
+        }
+    }
 }

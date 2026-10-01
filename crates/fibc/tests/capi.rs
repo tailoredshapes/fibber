@@ -12,7 +12,8 @@
 //!   fibber, the result is printed) and compared with what the Rust
 //!   runner returns for the same macro.
 //! - `stage1.rs`: a bug of the compiler that these modules had to work
-//!   around, as a test that fails until it is fixed (`--ignored`).
+//!   around (a struct that holds a raw `ptr` released the block on drop),
+//!   kept as a regression test now that it is fixed.
 
 #![cfg(unix)]
 

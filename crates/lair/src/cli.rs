@@ -9,7 +9,7 @@ use lair::{Jit, JitOptions};
 const USAGE: &str = "usage:
   lair check FILE.lir
   lair run [-O n] FILE.lir [ARGS..]
-  lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-l LIB]..
+  lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
   lair emit-llvm FILE.lir
   lair cases DIR..
   lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [-v] [--print N] DIR..
@@ -140,6 +140,7 @@ fn build(rest: &[String]) -> Result<ExitCode, String> {
         match a.as_str() {
             "-o" => out = Some(PathBuf::from(val()?)),
             "-O" => opts.opt_level = opt_level(&val()?)?,
+            "-L" => opts.lib_dirs.push(val()?),
             "-l" => opts.libs.push(val()?),
             "--emit" => {
                 exe = false;

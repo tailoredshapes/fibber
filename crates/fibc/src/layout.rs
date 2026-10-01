@@ -19,7 +19,7 @@ pub fn lir_ty(g: &Globals, t: &Ty) -> Result<Option<LirTy>, Unsupported> {
             Scalar::I64 | Scalar::Keyword => LirTy::I64,
             Scalar::F32 => LirTy::Float,
             Scalar::F64 => LirTy::Double,
-            Scalar::Ptr => LirTy::Ptr,
+            Scalar::Ptr => LirTy::Raw,
             Scalar::Unit => return Ok(None),
         },
         Ty::Con(Con::Weak, args) => match args.first() {
@@ -66,9 +66,8 @@ pub fn option_payload<'t>(g: &Globals, t: &'t Ty) -> Option<&'t Ty> {
 
 /// The representation of `(Option payload)`.
 pub fn option_rep(g: &Globals, payload: &Ty) -> Result<OptRep, Unsupported> {
-    let plain_object = lir_ty(g, payload)? == Some(LirTy::Ptr)
-        && option_payload(g, payload).is_none()
-        && !matches!(payload, Ty::Con(Con::Scalar(Scalar::Ptr), _));
+    let plain_object =
+        lir_ty(g, payload)? == Some(LirTy::Ptr) && option_payload(g, payload).is_none();
     Ok(if plain_object {
         OptRep::Null
     } else {
@@ -111,7 +110,7 @@ pub fn size_align(t: LirTy) -> (u64, u64) {
         LirTy::I1 | LirTy::I8 => (1, 1),
         LirTy::I16 => (2, 2),
         LirTy::I32 | LirTy::Float => (4, 4),
-        LirTy::I64 | LirTy::Double | LirTy::Ptr => (8, 8),
+        LirTy::I64 | LirTy::Double | LirTy::Ptr | LirTy::Raw => (8, 8),
         LirTy::Dyn => (16, 8),
     }
 }
@@ -192,5 +191,19 @@ mod tests {
         assert_eq!(lir_ty(g, &opt_str).unwrap(), Some(LirTy::Ptr));
         assert_eq!(lir_ty(g, &Ty::unit()).unwrap(), None);
         assert!(!is_object(g, &Ty::bool()) && is_object(g, &Ty::str()));
+    }
+
+    /// A raw `ptr` has its own lIR type, which is not the object pointer
+    /// it prints as: the drop of an object decides what to release from
+    /// it (types §8.1).
+    #[test]
+    fn a_raw_ptr_is_not_an_object_pointer() {
+        let checked = fibref::own::check_source("(defun main () -> i64 1)", "t").expect("checks");
+        let g = &checked.typed.globals;
+        let ptr = Ty::scalar(Scalar::Ptr);
+        assert_eq!(lir_ty(g, &ptr).unwrap(), Some(LirTy::Raw));
+        assert_ne!(lir_ty(g, &ptr).unwrap(), lir_ty(g, &Ty::str()).unwrap());
+        assert!(!is_object(g, &ptr));
+        assert_eq!(option_rep(g, &ptr).unwrap(), OptRep::Boxed);
     }
 }

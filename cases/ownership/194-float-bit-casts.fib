@@ -1,0 +1,213 @@
+;; spec:   syntax §4.3, types §2.12, §8.12 (M6, method.md rule 6)
+;; expect: accept
+;; result: 262143
+;; audit:  clean
+;; The bit casts of a float, `(f64->bits x) -> i64`, `(bits->f64 n)`,
+;; `(f32->bits x) -> i32` and `(bits->f32 n)`: the IEEE 754 pattern of a
+;; float and the float of a pattern, every bit kept, in the interpreter
+;; and compiled (a bitcast), so that a stage-2 compiler can hand a float
+;; to a macro module, hash it and print it.
+;; Each probe is a function that answers whether what the casts made is
+;; the pattern or the float written here (the patterns are IEEE 754 as
+;; Python's struct module packs them, not as these casts make them), and
+;; the result has bit k set when probe k holds. There are 18 probes and
+;; the result when all hold is 2^18 - 1 = 262143; a cast that dropped a
+;; bit lowers it in that probe's bit.
+;;   0 1.0 and 0.1 as f64, 1 -0.0 as f64 (the pattern, and the sign is
+;;   still there as a float: 1 / x is -inf), 2 5e-324 (the pattern is 1,
+;;   and 1 is that float), 3 the f64 maximum, 4 the infinities, 5 a
+;;   negative f64, 6 NaN payloads at f64 (quiet, negative, signalling),
+;;   7 the same by 400 patterns of a xorshift generator at run time and
+;;   the same with the exponent forced to all ones (NaNs and infinities),
+;;   8 1.0 and 0.1 as f32, 9 -0.0 as f32, 10 the f32 maximum and the
+;;   smallest subnormal, 11 an f32 made from a pattern, 12 NaN payloads at
+;;   f32 (quiet, negative, signalling: an f32 held widened to f64 by the
+;;   interpreter would be quieted by the hardware), 13 the generator's
+;;   patterns at f32, 14 a negative f32 (an i32 holds it sign-extended),
+;;   15 f64 and f32 NaNs through the fields of a struct, 16 through a
+;;   generic function and a Vec, 17 at expansion time: macros read the
+;;   bits of a float literal and build a float literal from bits, which
+;;   runs the casts in the interpreter's macro evaluator and in the JIT
+;;   that fibc expands macros with.
+;; Not here: the bits of a value produced by float arithmetic on a NaN,
+;; which the hardware chooses.
+(defstruct Pair (a: f64 b: f32))
+
+(defmacro lit-bits (x)
+  (match x
+    ((Flt v _) (Int (f64->bits v) :i64))
+    (_ (trap "lit-bits: not a float literal"))))
+
+(defmacro lit-bits32 (x)
+  (match x
+    ((Flt v _) (Int (sext i64 (f32->bits (fptrunc f32 v))) :i32))
+    (_ (trap "lit-bits32: not a float literal"))))
+
+(defmacro bits-lit (n)
+  (match n
+    ((Int v _) (Flt (bits->f64 v) :f64))
+    (_ (trap "bits-lit: not an integer literal"))))
+
+(defmacro bits-lit32 (n)
+  (match n
+    ((Int v _) (Flt (fpext f64 (bits->f32 (trunc i32 v))) :f32))
+    (_ (trap "bits-lit32: not an integer literal"))))
+
+(defun sign64 () -> i64 (shl 1 63))
+(defun sign32 () -> i32 (shl 1i32 31i32))
+
+(defun same64 (n: i64) -> bool (= (f64->bits (bits->f64 n)) n))
+(defun same32 (n: i32) -> bool (= (f32->bits (bits->f32 n)) n))
+
+(defun nan? (x: f64) -> bool (!= x x))
+(defun nan32? (x: f32) -> bool (!= x x))
+
+(defun p0 () -> bool
+  (and (= (f64->bits 1.0) 0x3FF0000000000000)
+       (= (f64->bits 0.1) 0x3FB999999999999A)
+       (= (f64->bits 0.1) 4591870180066957722)
+       (= (bits->f64 0x3FF0000000000000) 1.0)
+       (= (bits->f64 0x3FB999999999999A) 0.1)))
+
+(defun p1 () -> bool
+  (let ((z (bits->f64 (sign64))))
+    (and (= (f64->bits -0.0) (sign64))
+         (= (f64->bits z) -9223372036854775808)
+         (= z 0.0)
+         (= (/ 1.0 z) (/ -1.0 0.0))
+         (!= (f64->bits z) (f64->bits 0.0)))))
+
+(defun p2 () -> bool
+  (and (= (f64->bits 5e-324) 1)
+       (= (bits->f64 1) 5e-324)
+       (> (bits->f64 1) 0.0)))
+
+(defun p3 () -> bool
+  (and (= (f64->bits 1.7976931348623157e308) 0x7FEFFFFFFFFFFFFF)
+       (= (bits->f64 0x7FEFFFFFFFFFFFFF) 1.7976931348623157e308)))
+
+(defun p4 () -> bool
+  (and (= (f64->bits (/ 1.0 0.0)) 0x7FF0000000000000)
+       (= (f64->bits (/ -1.0 0.0)) (bit-or (sign64) 0x7FF0000000000000))
+       (= (f64->bits (/ -1.0 0.0)) -4503599627370496)
+       (= (bits->f64 0x7FF0000000000000) (/ 1.0 0.0))))
+
+(defun p5 () -> bool
+  (and (= (f64->bits -2.5) -4610560118520545280)
+       (= (bits->f64 -4610560118520545280) -2.5)))
+
+(defun p6 () -> bool
+  (let ((q (bits->f64 0x7FF8000000000001))
+        (n (bits->f64 (bit-or (sign64) 0x7FF8DEADBEEF0000)))
+        (s (bits->f64 0x7FF0000000000001)))
+    (and (nan? q) (nan? n) (nan? s)
+         (= (f64->bits q) 0x7FF8000000000001)
+         (= (f64->bits n) (bit-or (sign64) 0x7FF8DEADBEEF0000))
+         (= (f64->bits s) 0x7FF0000000000001))))
+
+;; xorshift64: no multiplication, so no overflow trap
+(defun next (x: i64) -> i64
+  (let ((a (bit-xor x (shl x 13))))
+    (let ((b (bit-xor a (shr a 7))))
+      (bit-xor b (shl b 17)))))
+
+(defun exp-ones (n: i64) -> i64
+  (bit-or (bit-and n (bit-not 0x7FF0000000000000)) 0x7FF0000000000000))
+
+(defun p7 () -> bool
+  (loop ((i 0) (x 88172645463325252) (good 0))
+    (if (< i 400)
+        (let ((y (next x)))
+          (recur (+ i 1) y
+                 (if (and (same64 y) (same64 (exp-ones y))) (+ good 1) good)))
+        (= good 400))))
+
+(defun p8 () -> bool
+  (and (= (f32->bits 1.0f32) 0x3F800000i32)
+       (= (f32->bits 0.1f32) 0x3DCCCCCDi32)
+       (= (f32->bits 0.1f32) 1036831949i32)
+       (= (bits->f32 0x3F800000i32) 1.0f32)))
+
+(defun p9 () -> bool
+  (let ((z (bits->f32 (sign32))))
+    (and (= (f32->bits -0.0f32) (sign32))
+         (= (f32->bits z) -2147483648i32)
+         (= z 0.0f32)
+         (= (/ 1.0f32 z) (/ -1.0f32 0.0f32))
+         (!= (f32->bits z) (f32->bits 0.0f32)))))
+
+(defun p10 () -> bool
+  (and (= (f32->bits 3.4028235e38f32) 0x7F7FFFFFi32)
+       (= (bits->f32 0x7F7FFFFFi32) 3.4028235e38f32)
+       (= (f32->bits 1.4e-45f32) 1i32)
+       (> (bits->f32 1i32) 0.0f32)))
+
+(defun p11 () -> bool
+  (and (= (bits->f32 0x40490FDBi32) 3.1415927f32)
+       (= (f32->bits 3.1415927f32) 0x40490FDBi32)))
+
+(defun p12 () -> bool
+  (let ((q (bits->f32 0x7FC00001i32))
+        (n (bits->f32 (bit-or (sign32) 0x7FA00000i32)))
+        (s (bits->f32 0x7F800001i32)))
+    (and (nan32? q) (nan32? n) (nan32? s)
+         (= (f32->bits q) 0x7FC00001i32)
+         (= (f32->bits n) (bit-or (sign32) 0x7FA00000i32))
+         (= (f32->bits s) 0x7F800001i32))))
+
+(defun exp-ones32 (n: i32) -> i32
+  (bit-or (bit-and n (bit-not 0x7F800000i32)) 0x7F800000i32))
+
+(defun p13 () -> bool
+  (loop ((i 0) (x 88172645463325252) (good 0))
+    (if (< i 400)
+        (let ((y (next x)))
+          (let ((n (trunc i32 (shr y 17))))
+            (recur (+ i 1) y
+                   (if (and (same32 n) (same32 (exp-ones32 n))) (+ good 1) good))))
+        (= good 400))))
+
+(defun p14 () -> bool
+  (and (= (f32->bits -2.5f32) -1071644672i32)
+       (= (bits->f32 -1071644672i32) -2.5f32)))
+
+(defun keep (x: a) -> a x)
+
+(defun p15 () -> bool
+  (let ((q (Pair (bits->f64 0x7FF8000000000001) (bits->f32 0x7FC00001i32)))
+        (s (Pair (bits->f64 0x7FF0000000000001) (bits->f32 0x7F800001i32))))
+    (and (= (f64->bits (. q a)) 0x7FF8000000000001)
+         (= (f32->bits (. q b)) 0x7FC00001i32)
+         (= (f64->bits (. s a)) 0x7FF0000000000001)
+         (= (f32->bits (. s b)) 0x7F800001i32))))
+
+(defun p16 () -> bool
+  (let ((v [(keep (bits->f64 0x7FF0000000000001)) (keep (bits->f64 (sign64)))])
+        (w [(keep (bits->f32 0x7F800001i32)) (keep (bits->f32 (sign32)))]))
+    (and (= (f64->bits (nth v 0)) 0x7FF0000000000001)
+         (= (f64->bits (nth v 1)) (sign64))
+         (= (f32->bits (nth w 0)) 0x7F800001i32)
+         (= (f32->bits (nth w 1)) (sign32)))))
+
+(defun p17 () -> bool
+  (and (= (lit-bits 1.0) 0x3FF0000000000000)
+       (= (lit-bits -0.0) -9223372036854775808)
+       (= (lit-bits 5e-324) 1)
+       (= (lit-bits 1.7976931348623157e308) 0x7FEFFFFFFFFFFFFF)
+       (= (lit-bits32 0.1f32) 0x3DCCCCCDi32)
+       (= (lit-bits32 -0.0f32) -2147483648i32)
+       (= (bits-lit 4591870180066957722) 0.1)
+       (= (f64->bits (bits-lit -9223372036854775808)) (sign64))
+       (= (f64->bits (bits-lit 1)) 1)
+       (= (bits-lit32 1036831949i32) 0.1f32)
+       (= (f32->bits (bits-lit32 -2147483648i32)) (sign32))))
+
+(defun bit (ok: bool k: i64) -> i64 (if ok (shl 1 k) 0))
+
+(defun main () -> i64
+  (let ((checks [(p0) (p1) (p2) (p3) (p4) (p5) (p6) (p7) (p8) (p9) (p10) (p11)
+                 (p12) (p13) (p14) (p15) (p16) (p17)]))
+    (loop ((k 0) (acc 0))
+      (if (< k (count checks))
+          (recur (+ k 1) (bit-or acc (bit (nth checks k) k)))
+          acc))))

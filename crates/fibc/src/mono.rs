@@ -62,7 +62,7 @@ pub fn representative(g: &Globals, c: Class) -> Ty {
         Class::Scalar(LirTy::I32) => Ty::scalar(Scalar::I32),
         Class::Scalar(LirTy::Float) => Ty::scalar(Scalar::F32),
         Class::Scalar(LirTy::Double) => Ty::scalar(Scalar::F64),
-        Class::Scalar(LirTy::Ptr) => Ty::scalar(Scalar::Ptr),
+        Class::Scalar(LirTy::Raw) => Ty::scalar(Scalar::Ptr),
         Class::Scalar(_) => Ty::i64(),
         Class::Unit => Ty::unit(),
         Class::Ptr => Ty::str(),
@@ -151,5 +151,20 @@ mod tests {
         // map : (fn ((fn (a) b) (Vec a)) (Vec b)) has no bounds.
         let key = fun_key(g, &s, &[Ty::nominal(vec, vec![Ty::i64()]), Ty::bool()]).unwrap();
         assert_eq!(key, vec![Ty::str(), Ty::bool()]);
+    }
+
+    /// A body at `ptr` is not the body at an object: the object's counts
+    /// would be taken on an address (types §4.3, §8.1).
+    #[test]
+    fn a_raw_ptr_is_a_scalar_class_of_its_own() {
+        let checked = fibref::own::check_source("(defun main () -> i64 1)", "t").expect("checks");
+        let g = &checked.typed.globals;
+        let ptr = Ty::scalar(Scalar::Ptr);
+        assert_eq!(class_of(g, &ptr).unwrap(), Class::Scalar(LirTy::Raw));
+        assert_eq!(representative(g, Class::Scalar(LirTy::Raw)), ptr);
+        let s = checked.typed.scheme("map").unwrap().clone();
+        let key = fun_key(g, &s, &[ptr.clone(), Ty::bool()]).unwrap();
+        assert_eq!(key, vec![ptr, Ty::bool()]);
+        assert_ne!(key[0], fun_key(g, &s, &[Ty::str(), Ty::bool()]).unwrap()[0]);
     }
 }

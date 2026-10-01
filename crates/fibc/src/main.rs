@@ -8,8 +8,6 @@
 //! otherwise, 2 on bad usage.
 
 mod command;
-#[cfg(feature = "llvm")]
-mod link;
 
 use std::io::{self, Write};
 #[cfg(feature = "llvm")]
@@ -24,6 +22,8 @@ use fibc::harness::gen::GenConfig;
 use fibc::harness::Harness;
 #[cfg(feature = "llvm")]
 use fibref::cases::{render, Report, Status};
+#[cfg(feature = "llvm")]
+use lair::aot::{build_executable, library_dir, Options};
 #[cfg(feature = "llvm")]
 use lair::{Jit, JitOptions};
 
@@ -191,18 +191,16 @@ fn run(file: &str, trace: bool, args: &[String]) -> ExitCode {
     std::process::exit(code)
 }
 
-/// `build`: the executable `out`, linked against `link`'s libraries.
-/// A `-L` directory that cannot be an rpath is refused first (exit 2).
+/// `build`: the executable `out`, linked against `link`'s libraries by
+/// `lair::aot::build_executable`, which searches and records (as an
+/// rpath) each `-L` directory. A directory that cannot be one is refused
+/// here first, before anything is compiled (exit 2); `lair` checks again.
 #[cfg(feature = "llvm")]
 fn build(file: &str, out: &str, link: &Link) -> ExitCode {
-    let dirs: Result<Vec<_>, String> = link.dirs.iter().map(|d| link::library_dir(d)).collect();
-    let dirs = match dirs {
-        Ok(dirs) => dirs,
-        Err(message) => {
-            eprintln!("fibc: {message}");
-            return ExitCode::from(2);
-        }
-    };
+    if let Some(message) = link.dirs.iter().find_map(|d| library_dir(d).err()) {
+        eprintln!("fibc: {message}");
+        return ExitCode::from(2);
+    }
     let lir = match lower_kind(file, true) {
         Ok(l) => l,
         Err(code) => return code,
@@ -215,7 +213,12 @@ fn build(file: &str, out: &str, link: &Link) -> ExitCode {
         Ok(m) => m,
         Err(e) => return fail(e),
     };
-    match link::build_executable(&module, file, Path::new(out), &dirs, &link.libs) {
+    let opts = Options {
+        lib_dirs: link.dirs.clone(),
+        libs: link.libs.clone(),
+        ..Options::default()
+    };
+    match build_executable(&module, file, Path::new(out), &opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(e),
     }

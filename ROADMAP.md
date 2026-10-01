@@ -245,6 +245,12 @@ rules below are mine, for the owner to amend.
 
 Rules:
 
+0. **The tie-breaker** (owner, 2026-10-01): unless it breaks memory
+   safety, Clojure has the ergonomics we are replicating; where Clojure's
+   way would break memory safety, Rust has them. A deviation from
+   Clojure needs a memory-safety reason (or the static-typing the
+   language already decided), recorded in spec/stdlib.md; "it is
+   cleaner" or "it is faster" is not one.
 1. **Clojure's names and shapes first.** `map filter reduce assoc conj
    get first rest nth into take drop partition group-by frequencies
    sort-by update assoc-in get-in merge select-keys keys vals str ...`,

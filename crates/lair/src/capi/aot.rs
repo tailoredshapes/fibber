@@ -30,9 +30,12 @@ unsafe fn names(
 /// Compile the module `src`, which must satisfy the `main` rule of
 /// spec/lir.md §7.2, and link it with `cc` into the executable `path`.
 /// `opt_level` is 0 to 3; each of the `n_libs` names (`libs[i]`, of
-/// byte length `lib_lens[i]`) is linked as `-lNAME`. The executable's
-/// exit status is `main`'s result. On failure the error holds the
-/// diagnostics, or the linker's output.
+/// byte length `lib_lens[i]`) is linked as `-lNAME`, after libm and
+/// libpthread, which are always linked, and is searched for where the
+/// system's `cc` searches: no library directory (`-L`, rpath) is given
+/// through this function. The executable's exit status is `main`'s
+/// result. On failure the error holds the diagnostics, or the
+/// linker's output.
 ///
 /// # Safety
 /// `src` and `path` point to as many readable bytes as their lengths
@@ -59,6 +62,9 @@ pub unsafe extern "C" fn lair_build_executable(
         let opts = Options {
             opt_level: level_arg(opt_level)?,
             libs: names(libs, lib_lens, n_libs)?,
+            // Libraries are found as the system's `cc` finds them: no
+            // directory is named through this interface (spec §9).
+            lib_dirs: Vec::new(),
         };
         let m = crate::for_executable(src).map_err(|e| e.to_string())?;
         aot::build_executable(&m, path, Path::new(path), &opts).map_err(|e| e.to_string())

@@ -298,3 +298,38 @@ spoiled the comparison). There is no case 191: `(args)` with a word that is
 not UTF-8 needs a command line, which the case harness does not give, so
 `crates/fibc/tests/cli/args.rs` and `crates/fibref/tests/run_io.rs` are
 the evidence for it (case 186 has the empty `(args)`).
+
+Case 193 pins that a raw `ptr` is uncounted wherever it is held (types
+§8.1, `ptr` is a scalar): one 24-byte block whose first word is 1000, as
+an object's count is, goes into each of 17 kinds of container (a struct
+on the stack and on the heap, an enum variant, a generic struct, a `Vec`
+grown past a leaf, a vector pattern with a rest, an `Array`,
+`array-set!`, an escaping closure, an `Option`, a `Cell`, a `dyn`,
+`set-field!` on a shared struct, a `Map`, a generic function, a `Vec`
+of structs, and a task that holds it in its frame across an `await` and
+returns it). The word is read while the container lives and after it is
+dropped; each reading is 1 when the word is still 1000, two bits for
+each probe, so the result is 4^17 - 1 = 17179869183 and a probe that
+retained or released lowers it in its own bits (compiled with `ptr`
+taken for an object pointer, each of the 17 had a reading off and the
+result was 10339289685). An `Atom` of `ptr`, a `spawn` that returns one
+and an `async` that captures one are rejected by the checker, a `ptr`
+not being `Send` (types §5.3), so no probe holds one.
+
+Case 194 pins the float bit casts (syntax §4.3, types §2.12):
+`f64->bits`, `bits->f64`, `f32->bits` and `bits->f32` keep every bit,
+in the interpreter and compiled. Eighteen probes, each a function that
+compares what the casts made with a pattern or a float written in the
+case (the patterns were packed by Python's `struct`, not by these casts),
+set their own bit of the result, 2^18 - 1 = 262143 when all hold: 1.0,
+0.1, -0.0, 5e-324, the maximum, the infinities and a negative value at
+both widths, NaN payloads (quiet, negative, signalling) at both widths,
+400 patterns of a xorshift generator at run time, with and without the
+exponent forced to all ones, and NaNs through the fields of a struct,
+a generic function and a `Vec`, and macros that read the bits of a
+float literal and build a float literal from bits at expansion time
+(the interpreter's macro evaluator, and the JIT `fibc` expands with).
+The signalling `f32` NaN is the probe that matters: the interpreter
+holds an `f32` widened to `f64`, and the hardware conversion quiets it
+(an interpreter that widened with `as` answered 151551 here, probes 12,
+13, 15 and 16 failing).

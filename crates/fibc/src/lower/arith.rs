@@ -191,6 +191,22 @@ impl<'a> Cx<'_, 'a> {
         }
         Ok(self.b.val(&instr, to))
     }
+
+    /// `f64->bits`, `bits->f64`, `f32->bits`, `bits->f32` (syntax §4.3):
+    /// the lIR `bitcast` between a float and the integer of its width,
+    /// which keeps every bit, a NaN's payload and a zero's sign included.
+    pub fn float_bits(&mut self, name: &str, x: &V) -> R<V> {
+        let to = match name {
+            "f64->bits" => LirTy::I64,
+            "bits->f64" => LirTy::Double,
+            "f32->bits" => LirTy::I32,
+            "bits->f32" => LirTy::Float,
+            other => return Err(Unsupported(format!("builtin {other}"))),
+        };
+        Ok(self
+            .b
+            .val(&format!("(bitcast {} {})", to.text(), x.text()), to))
+    }
 }
 
 fn compare_pred(method: &str) -> R<&'static str> {
