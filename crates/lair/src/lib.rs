@@ -3,9 +3,11 @@
 //! Every path runs the same pipeline: parse, check the whole module
 //! (`lir::check`), lower, run the LLVM verifier. [`Jit`] compiles
 //! modules in-process and returns callable functions; [`aot`] emits
-//! object files and executables.
+//! object files and executables; [`capi`] is the same two as a C
+//! library (`liblair.so`, `include/lair.h`).
 
 pub mod aot;
+pub mod capi;
 pub mod cases;
 mod error;
 pub mod fuzz;
