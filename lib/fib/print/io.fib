@@ -1,4 +1,35 @@
-;; owner: L11. fib.print.io: the printing functions. Exports: str println print prn pr newline slurp try-slurp spit (the function twins; the macro forms are Rust, R5).
-;; Until L11 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.print.io (:use fib.core fib.seq fib.coll))
+;; fib.print.io: the function twins of the printing macros, and the files (stdlib §2.10, §4.14; tranche 1 plan
+;; §4.2; owner L11). Exports: str println print prn pr newline slurp try-slurp spit.
+;; Each printing name is a macro too (R5): the macro expands in head position and the function serves value
+;; position, `(run! println [1 2 3])` and `(map str xs)`. The twins take one argument and are the macros'
+;; one-argument expansions: str is ToStr, println and print are Show, prn and pr are Debug (§2.7). The
+;; prelude's own one-string `println` stays reachable as fib.prelude/println and is what the twin calls.
+;; Replaces the prelude's println in a module that uses fib.print: a `:use`d name shadows the prelude's, and
+;; a string argument prints as before, because Show of a string is the string.
+;; Decided here, where the page is silent:
+;;  - try-slurp answers (Err "cannot read PATH") for a path that read-file refuses (missing, unreadable, a
+;;    directory, not UTF-8: the builtin says nil for all of them and the library cannot tell which), and
+;;    slurp is the same text behind the trap `slurp: cannot read PATH` (plan §4.3 rule 8).
+;;  - spit is the builtin write-file under Clojure's name: true when the whole text was written. The
+;;    `:append true` form is tranche 4's.
+;;  - newline writes "\n" with print-str, so it is one write and never an empty one.
+(ns fib.print.io (:use fib.core fib.seq))
+
+(defun str (x: a) :where ((ToStr a)) -> str (to-str x))
+(defun println (x: a) :where ((Show a)) -> unit (fib.prelude/println (show x)))
+(defun print (x: a) :where ((Show a)) -> unit (fib.prelude/print-str (show x)))
+(defun prn (x: a) :where ((Debug a)) -> unit (fib.prelude/println (debug x)))
+(defun pr (x: a) :where ((Debug a)) -> unit (fib.prelude/print-str (debug x)))
+(defun newline () -> unit (fib.prelude/print-str "\n"))
+
+(defun try-slurp (path: str) -> (Result str str)
+  (match (read-file path)
+    ((some text) (Ok text))
+    (nil (Err (str-concat "cannot read " path)))))
+
+(defun slurp (path: str) -> str
+  (match (try-slurp path)
+    ((Ok text) text)
+    ((Err why) (trap (str-concat "slurp: " why)))))
+
+(defun spit (path: str text: str) -> bool (write-file path text))

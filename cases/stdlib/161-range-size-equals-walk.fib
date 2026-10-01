@@ -1,0 +1,35 @@
+;; spec:   stdlib §2.1 rule 4 (count is size: closed form on a Range), §4.4 (rows range, range-by)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: range range-by
+;; A Range's size is a closed form, ceil((end - start) / step) for a step towards the end and 0 otherwise, and
+;; the walk is another implementation of the same thing, so the two must agree: for eight ranges (the page's
+;; A10 `rangesize`: 10 4 4 0 0 3, and two more) `count` is the number worked out by hand and also the number
+;; of elements to-vec and each-while visit. Widths other than i64 and the floats are in the cases after this.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; the elements each-while visits, counted one by one
+(defun visits (r: (Range i64)) -> i64
+  (let ((n (cell 0)))
+    (do (each-while r (fn (x) (do (set! n (+ @n 1)) true)))
+        @n)))
+
+;; count, to-vec's length and the walk's visits all say expected
+(defun agrees (r: (Range i64) expected: i64) -> bool
+  (and (= (count r) expected)
+       (and (= (fib.prelude/count (to-vec r)) expected)
+            (= (visits r) expected))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (agrees (range 10) 10))
+        (check c (agrees (range-by 0 10 3) 4))
+        (check c (agrees (range-by 10 0 -3) 4))
+        (check c (agrees (range-by 5 5 1) 0))
+        (check c (agrees (range-by 5 0 1) 0))
+        (check c (agrees (range-by 0 9 3) 3))
+        (check c (agrees (range-by 0 1 5) 1))
+        (check c (agrees (range-by -7 7 2) 7))
+        (checks-result c))))

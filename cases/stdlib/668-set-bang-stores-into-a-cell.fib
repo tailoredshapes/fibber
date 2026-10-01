@@ -1,0 +1,38 @@
+;; spec:   stdlib §4.1 (row set!), syntax §3.11 and §3.13, ownership §3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: set!
+;; (set! c v) stores v into a Cell and returns unit; the old value is released. The target may be a
+;; let-bound cell, a cell field of a struct ((set! (. h c) v)), an in-out parameter written &c, which
+;; is a cell of the caller, or a cell captured by a closure that runs later. A cell of objects
+;; released at the end leaves nothing behind (the audit is clean). Anything else as the target
+;; is refused (case 676).
+(ns main (:use fib.core tl.check))
+
+(defstruct Holder (c: (Cell i64)))
+
+(defun bump (&n: i64) -> unit (set! n (+ @n 1)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (k (cell 1))
+        (h (Holder (cell 2)))
+        (v (cell [1 2 3]))
+        (m (cell 0)))
+    (let ((inc (fn () (set! m (+ @m 1)))))
+      (do (set! k 10)
+          (check c (= @k 10))
+          (set! (. h c) 20)
+          (check c (= @(. h c) 20))
+          (bump &k)
+          (bump &k)
+          (check c (= @k 12))
+          (set! v [9])
+          (check c (= (count @v) 1))
+          (dotimes (i 50) (set! v [i i]))
+          (check c (= (nth @v 0) 49))
+          (inc) (inc) (inc)
+          (check c (= @m 3))
+          (checks-result c)))))

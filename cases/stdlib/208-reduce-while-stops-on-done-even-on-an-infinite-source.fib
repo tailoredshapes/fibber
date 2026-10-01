@@ -1,0 +1,44 @@
+;; spec:   stdlib §4.4 (rows reduce-while reduced), §2.1 rule 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce-while reduced
+;; (reduce-while f init c): f returns a Step; (More v) goes on with v, and a
+;; (Done v) ends the walk with v as the result: the first element that
+;; tips the running sum over 100 stops a source with no end, which only an
+;; early exit can finish. f is called once per element up to and including
+;; the one that stopped it. A function that never says Done is a plain fold
+;; over the whole source, and an empty source gives init.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Naturals (from: i64))
+
+(impl (Reducible i64) Naturals
+  (each-while (self k)
+    (loop ((i (. self from))) (if (k i) (recur (+ i 1)) false))))
+
+(defstruct Upto (n: i64))
+
+(impl (Reducible i64) Upto
+  (each-while (self k)
+    (loop ((i 0)) (if (< i (. self n)) (if (k (+ i 1)) (recur (+ i 1)) false) true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (ev: (Vec i64) (vec-empty)))
+    (do (check c (= (reduce-while (fn (a x) (do (set! calls (+ @calls 1))
+                                                (if (> (+ a x) 100) (reduced a) (More (+ a x)))))
+                                  0 (Naturals 1))
+                    91))
+        (check c (= @calls 14))
+        (check c (= (reduce-while (fn (a x) (More (+ a x))) 0 [1 2 3 4]) 10))
+        (check c (= (reduce-while (fn (a x) (More (+ a x))) 0 (Upto 4)) 10))
+        (check c (= (reduce-while (fn (a x) (More (+ a x))) 7 ev) 7))
+        (check c (= (reduce-while (fn (a x) (reduced 99)) 0 ev) 0))
+        (check c (= (reduce-while (fn (a x) (reduced (+ a x))) 5 [1 2 3]) 6))
+        (check c (= (reduce-while (fn (a x) (Done x)) 0 (Naturals 40)) 40))
+        (check c (= (reduce-while (fn (a x) (if (= x 3) (Done (str-concat a "!")) (More (str-concat a (show x))))) "" (list 1 2 3 4 5)) "12!"))
+        (check c (= (reduce-while (fn (a x) (if (> x 1) (Done a) (More (+ a x)))) 0 (lcons 1 (lcons 2 (lcons 3 (lazy-node (fn () LNil)))))) 1))
+        (checks-result c))))

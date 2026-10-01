@@ -1,0 +1,63 @@
+;; spec:   stdlib §2.1 rule 1 (a Set is a source of its keys), §2.3 (Reducible), tranche 1 plan §6 L5a
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; A (Set k) is a Reducible of its keys, each once, in the order of the hash, which the checks do not depend on.
+;; count is the set's size (a key added twice counts once). The walk stops when the visitor says false and the
+;; visitor is not called again (the prelude's for-each under it cannot stop until L4's set-each). Sets of
+;; strings, of a few dozen keys, and the empty set are walked too.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun upto (n: i64) -> (Set i64)
+  (loop ((i 0) (s (set-empty)))
+    (if (< i n) (recur (+ i 1) (conj s (* 3 i))) s)))
+
+(defun sum-of (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true)))
+        @acc)))
+
+(defun stop-at (c: c n: i64) :where ((Reducible c e)) -> (Pair i64 bool)
+  (let ((k (cell 0)))
+    (let ((done (each-while c (fn (x) (do (set! k (+ @k 1)) (< @k n))))))
+      (Pair @k done))))
+
+(defun total-len (c: c) :where ((Reducible c str)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (s) (do (set! acc (+ @acc (str-len s))) true)))
+        @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s (upto 4))
+        (big (upto 50))
+        (twice (conj (conj (conj (set-empty) 7) 7) 7))
+        (none: (Set i64) (set-empty))
+        (words (conj (conj (conj (set-empty) "one") "three") "five")))
+    (do (check c (= (count s) 4))
+        (check c (= (sum-of s) 18))
+        (check c (= (fib.prelude/count (to-vec s)) 4))
+        (check c (= (count twice) 1))
+        (check c (= (sum-of twice) 7))
+        ;; early exit
+        (let ((p (stop-at s 2)))
+          (check c (and (= (. p fst) 2) (not (. p snd)))))
+        (let ((p (stop-at s 1)))
+          (check c (and (= (. p fst) 1) (not (. p snd)))))
+        (let ((p (stop-at s 5)))
+          (check c (and (= (. p fst) 4) (. p snd))))
+        ;; fifty keys
+        (check c (= (count big) 50))
+        (check c (= (sum-of big) 3675))
+        (let ((p (stop-at big 33)))
+          (check c (and (= (. p fst) 33) (not (. p snd)))))
+        ;; empty
+        (check c (= (count none) 0))
+        (check c (= (sum-of none) 0))
+        (let ((p (stop-at none 1)))
+          (check c (and (= (. p fst) 0) (. p snd))))
+        ;; strings
+        (check c (= (count words) 3))
+        (check c (= (total-len words) 12))
+        (checks-result c))))

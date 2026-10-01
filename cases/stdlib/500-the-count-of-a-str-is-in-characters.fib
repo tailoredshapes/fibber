@@ -1,0 +1,52 @@
+;; spec:   stdlib §2.9 (a str is a Reducible of its characters), §4.7 (row str-len)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str-len
+;; `count` of a str counts Unicode scalars (§5 T10), `str-len` counts bytes: the
+;; page's string "aé€😀z" has five characters of one, two, three, four and one
+;; byte, so `count` is 5 and `str-len` is 11 (the plan's sketch said 12; one
+;; plus two plus three plus four plus one is eleven). Every width alone, the
+;; empty string, the `Chars` view and a walk that stops early are checked
+;; too, and the characters come back in order. Each check says the number
+;; it expects, so a count that is off by one, or in bytes, sets its bit.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; whether the characters of c are exactly want, in order
+(defun chars-are (c: c want: (Vec char)) :where ((Reducible c char)) -> bool
+  (let ((v (to-vec c)))
+    (and (= (count v) (count want))
+         (loop ((i 0))
+           (if (< i (count want))
+               (if (= (nth v i) (nth want i)) (recur (+ i 1)) false)
+               true)))))
+
+;; how many characters an early-exit walk visits before the one that is stop
+(defun visited-before (c: c stop: char) :where ((Reducible c char)) -> (Pair i64 bool)
+  (let ((n (cell 0)))
+    (let ((done (each-while c (fn (x) (if (= x stop) false (do (set! n (+ @n 1)) true))))))
+      (Pair @n done))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s "aé€😀z"))
+    (do (check c (= (count s) 5))
+        (check c (= (str-len s) 11))
+        (check c (= (count "") 0))
+        (check c (= (str-len "") 0))
+        (check c (= (count "x") 1))
+        (check c (and (= (count "é") 1) (= (str-len "é") 2)))
+        (check c (and (= (count "€") 1) (= (str-len "€") 3)))
+        (check c (and (= (count "😀") 1) (= (str-len "😀") 4)))
+        (check c (= (count "😀😀😀") 3))
+        (check c (= (count (Chars s)) 5))
+        (check c (= (count (Chars "")) 0))
+        (check c (= (size s) 5))
+        (check c (chars-are s [\a \é \€ \😀 \z]))
+        (check c (chars-are (Chars s) [\a \é \€ \😀 \z]))
+        (check c (chars-are "" []))
+        (check c (let ((p (visited-before s \€))) (and (= (. p fst) 2) (not (. p snd)))))
+        (check c (let ((p (visited-before s \q))) (and (= (. p fst) 5) (. p snd))))
+        (check c (let ((p (visited-before (Chars s) \😀))) (and (= (. p fst) 3) (not (. p snd)))))
+        (checks-result c))))

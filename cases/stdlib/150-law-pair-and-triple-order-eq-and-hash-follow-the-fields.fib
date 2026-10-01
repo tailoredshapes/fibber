@@ -1,0 +1,63 @@
+;; spec:   stdlib §2.7 (Eq, Ord, Hash of a Pair and a Triple), §9.4 (a law- case ends in a planted fault)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: Pair Triple
+;; Over 300 seeded rounds, each of two Pairs and two Triples of small integers (fields 0 to 3, so that
+;; ties on the leading fields are common): `=` holds exactly when every field is equal; `<` holds
+;; exactly when the number read from the fields in base 4, leading field most significant, is less
+;; (the lexicographic order, which a reference over integers states without a comparison of fields);
+;; `<` is irreflexive and asymmetric; equal values hash equal (the law Hash states); and the hash of a
+;; pair is not the hash of the swapped pair when the fields differ (the fold is ordered). The planted
+;; faults are references wrong in one way: a number that reads the trailing field as the most
+;; significant (a colexicographic order), which must disagree with `<` on some round, and a hash
+;; claim that ignores the order of the fields, which must be false on some round.
+(ns main (:use tl.rng tl.check))
+
+(defun pnum (p: (Pair i64 i64) swap: bool) -> i64
+  (if swap (+ (* (. p snd) 4) (. p fst)) (+ (* (. p fst) 4) (. p snd))))
+
+(defun tnum (t: (Triple i64 i64 i64) swap: bool) -> i64
+  (if swap
+      (+ (* (+ (* (. t thd) 4) (. t snd)) 4) (. t fst))
+      (+ (* (+ (* (. t fst) 4) (. t snd)) 4) (. t thd))))
+
+(defun draw-pair (g: Rng) -> (Pair i64 i64) (Pair (rng-below g 4) (rng-below g 4)))
+(defun draw-triple (g: Rng) -> (Triple i64 i64 i64) (Triple (rng-below g 4) (rng-below g 4) (rng-below g 4)))
+
+;; how many of the 300 rounds break a law (with `swap` the reference of the planted fault)
+(defun broken (swap: bool) -> i64
+  (let ((g (rng 31415926)) (bad (cell 0)))
+    (do (dotimes (i 300)
+          (let ((a (draw-pair g)) (b (draw-pair g)) (s (draw-triple g)) (t (draw-triple g)))
+            (do (if (= (< a b) (< (pnum a swap) (pnum b swap))) () (set! bad (+ @bad 1)))
+                (if (= (= a b) (= (pnum a false) (pnum b false))) () (set! bad (+ @bad 1)))
+                (if (and (< a b) (< b a)) (set! bad (+ @bad 1)) ())
+                (if (< a a) (set! bad (+ @bad 1)) ())
+                (if (= (< s t) (< (tnum s swap) (tnum t swap))) () (set! bad (+ @bad 1)))
+                (if (= (= s t) (= (tnum s false) (tnum t false))) () (set! bad (+ @bad 1)))
+                (if (and (< s t) (< t s)) (set! bad (+ @bad 1)) ())
+                (if (= a b) (if (= (hash a) (hash b)) () (set! bad (+ @bad 1))) ())
+                (if (= s t) (if (= (hash s) (hash t)) () (set! bad (+ @bad 1))) ())
+                (let ((sw (Pair (. a snd) (. a fst))))
+                  (if (!= a sw) (if (!= (hash a) (hash sw)) () (set! bad (+ @bad 1))) ())))))
+        @bad)))
+
+;; the planted claim: that the hash ignores the order of the fields (true of a sum, false of the fold)
+(defun order-ignoring-claim () -> i64
+  (let ((g (rng 31415926)) (bad (cell 0)))
+    (do (dotimes (i 300)
+          (let ((a (draw-pair g)))
+            (let ((sw (Pair (. a snd) (. a fst))))
+              (if (!= a sw) (if (= (hash a) (hash sw)) () (set! bad (+ @bad 1))) ()))))
+        @bad)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)))
+    (do (check c (= (broken false) 0))
+        (check p1 (= (broken true) 0))
+        (check p2 (= (order-ignoring-claim) 0))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

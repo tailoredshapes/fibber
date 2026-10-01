@@ -1,0 +1,65 @@
+;; spec:   stdlib §4.7 (row chars: `(str/chars s)`), §2.9, plan §6 L10b, L10a
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: chars
+;; `(str/chars s)` is the string as an explicit source of its characters, a `Chars`: the same
+;; sequence a `str` is by itself (spec §2.9), under a name that says it. It counts SCALARS, not
+;; bytes: "aé€😀z" is 5 characters and 11 bytes. The checks use the methods of the `Reducible` a
+;; `Chars` is: `count`, `nth` (the character at an index), `last`, `each-while` (a walk that a
+;; `false` stops) and `to-vec`, and compare them with what the prelude's `str-chars`, a decoder
+;; written elsewhere, finds in the same strings, for text of every width and for the empty string.
+;; The count of a string is also the number of bytes that start a character, which is counted
+;; here from `str-byte-at`, with no decoder.
+(ns main (:use fib.core fib.seq tl.check) (:require [fib.string :as str]))
+
+;; how many bytes of s are not continuation bytes (10xxxxxx): the number of characters
+(defun lead-bytes (s: str) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i (str-len s))
+        (recur (+ i 1) (if (= (bit-and (zext i32 (str-byte-at s i)) 192i32) 128i32) n (+ n 1)))
+        n)))
+
+;; the Chars of s, walked in full, are the characters the prelude decodes
+(defun same-chars? (s: str) -> bool
+  (let ((want (fib.prelude/str-chars s))
+        (got (to-vec (str/chars s))))
+    (and (= (fib.prelude/vec-count got) (fib.prelude/vec-count want))
+         (loop ((i 0))
+           (if (< i (fib.prelude/vec-count want))
+               (if (= (fib.prelude/vec-nth got i) (fib.prelude/vec-nth want i)) (recur (+ i 1)) false)
+               true)))))
+
+;; the sum of the codes of the characters up to the first one that is at least `stop`, and whether the walk ended
+(defun until (s: str stop: i32) -> i64
+  (let ((sum (cell 0)))
+    (do (each-while (str/chars s)
+          (fn (ch) (if (>= (char->i32 ch) stop) false (do (set! sum (+ @sum (zext i64 (char->i32 ch)))) true))))
+        @sum)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (count (str/chars "aé€😀z")) 5))
+        (check c (= (str-len "aé€😀z") 11))
+        (check c (= (count (str/chars "")) 0))
+        (check c (= (count (str/chars "abc")) 3))
+        (check c (= (count (str/chars "aé€😀z")) (lead-bytes "aé€😀z")))
+        (check c (= (count (str/chars "héllo wörld €😀")) (lead-bytes "héllo wörld €😀")))
+        (check c (= (nth (str/chars "aé€😀z") 0) \a))
+        (check c (= (nth (str/chars "aé€😀z") 1) \u{e9}))
+        (check c (= (nth (str/chars "aé€😀z") 2) \u{20ac}))
+        (check c (= (nth (str/chars "aé€😀z") 3) \u{1f600}))
+        (check c (= (nth (str/chars "aé€😀z") 4) \z))
+        (check c (= (last (str/chars "aé€😀z")) (some \z)))
+        (check c (= (last (str/chars "ab😀")) (some \u{1f600})))
+        (check c (= (last (str/chars "")) nil))
+        (check c (same-chars? ""))
+        (check c (same-chars? "hello"))
+        (check c (same-chars? "aé€😀z"))
+        (check c (same-chars? "😀😀€€éé"))
+        (check c (= (until "abc" 1000i32) 294))
+        (check c (= (until "ab€c" 1000i32) 195))
+        (check c (= (until "aé€😀z" 8000i32) 330))
+        (check c (= (until "" 100i32) 0))
+        (checks-result c))))

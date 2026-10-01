@@ -1,4 +1,129 @@
-;; owner: L1. fib.core.num: the numeric functions (never `/` on integers: write `quot`, tranche 1 plan PC-14). Exports: inc dec abs mod max min zero? pos? neg? even? odd? compare Ratio numerator denominator; Div instances for i8 i16 i32 i64 f32 f64 (Ratio t); Num Eq Ord Hash for Ratio.
-;; Until L1 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
+;; fib.core.num: the numeric functions of stdlib §2.8 and §4.3, the division protocol's instances and the
+;; ratio (tranche 1 plan §4.2, package L1). Replaces nothing in the prelude. Never writes `/` on integers
+;; (plan PC-14): Div's method is `/` in this module, so the machine's division is `quot`, and the
+;; Div instances call `fdiv` and the ratio's own arithmetic. Decided here, where the page is silent:
+;;  - inc, dec: (+ x (one x)); the trap on overflow is the builtin's, `integer overflow in + at i8`.
+;;  - abs: (neg x) of a negative, so the minimum of an integer type traps `integer overflow in neg at i64`;
+;;    anything else is (+ x (zero x)), which turns -0.0 into 0.0 as Java's Math.abs does and leaves a NaN a NaN.
+;;  - mod: the divisor's sign, built on rem as Clojure's is, and so it traps with rem's texts: `integer rem by
+;;    zero`, and `integer overflow in rem at i64` for the minimum and -1 (Java's % answers 0 there; the integer
+;;    semantics of types §2.12 are Rust's and are not changed here); a float divisor of 0.0 gives NaN.
+;;  - max, min: a NaN argument is the answer (the first one when both are): a NaN first argument is tested
+;;    for, and a NaN second argument loses every comparison, so the else branch returns it. When the two are
+;;    equal the second is returned, so (max 0.0 -0.0) is -0.0 where Java's Math.max says 0.0: Ord t carries
+;;    no sign of zero.
+;;  - compare is built on `<`, so a NaN compares equal to everything, and two NaNs 0.
+;;  - (Ratio t) is normalised by every operation that makes one: lowest terms, a positive denominator, zero as
+;;    0/1; the public constructor is the library's and a program makes a ratio with `/`. A denominator of
+;;    zero traps `ratio: divide by zero`; + - * traps with the builtin's text at the width (`integer overflow in *
+;;    at i64`), the page's A12 ratio. Ord is by value and never multiplies the two ratios (the cross products of two
+;;    ratios that fit can overflow): it compares the integer parts and then the reciprocals of the fractional
+;;    parts, the continued fraction, which ends as Euclid's algorithm does. Eq and Hash are derived on the
+;;    normalised form, so equal ratios hash equally. quot is the truncated quotient as a ratio with denominator 1
+;;    and rem is a - b*quot(a,b), as Clojure's on ratios. Unit has a ratio instance so that zero?, pos?, neg?,
+;;    abs, inc and dec are total over every number the library has.
+;;  - Show, ToStr and Debug of a ratio are one text, `7/2`, and `2` for a denominator of 1 (the page: (/ 6 3) prints 2).
+;;  - while Num still has `/` (it leaves in the plan's step M), the Num instance of Ratio defines it as the ratio
+;;    division; M deletes that one line.
 (ns fib.core.num (:use fib.core.base fib.core.protocols))
+
+(defun inc (x: t) :where ((Num t) (Unit t)) -> t (+ x (one x)))
+(defun dec (x: t) :where ((Num t) (Unit t)) -> t (- x (one x)))
+(defun abs (x: t) :where ((Num t) (Ord t) (Unit t)) -> t
+  (let ((z (zero x))) (if (< x z) (neg x) (+ x z))))
+(defun mod (a: t b: t) :where ((Num t) (Ord t) (Unit t)) -> t
+  (let ((r (rem a b)) (z (zero a)))
+    (if (and (!= r z) (!= (< r z) (< b z))) (+ r b) r)))
+(defun max (a: t b: t) :where ((Ord t)) -> t (if (!= a a) a (if (> a b) a b)))
+(defun min (a: t b: t) :where ((Ord t)) -> t (if (!= a a) a (if (< a b) a b)))
+(defun zero? (x: t) :where ((Eq t) (Unit t)) -> bool (= x (zero x)))
+(defun pos? (x: t) :where ((Ord t) (Unit t)) -> bool (> x (zero x)))
+(defun neg? (x: t) :where ((Ord t) (Unit t)) -> bool (< x (zero x)))
+(defun even? (n: t) :where ((Bits t) (Unit t)) -> bool (= (bit-and n (one n)) (zero n)))
+(defun odd? (n: t) :where ((Bits t) (Unit t)) -> bool (!= (bit-and n (one n)) (zero n)))
+(defun compare (a: t b: t) :where ((Ord t)) -> i64 (if (< a b) -1 (if (< b a) 1 0)))
+
+;; the exact quotient of two integers of one width, normalised
+(defstruct (Ratio t) (n: t d: t))
+(derive Eq Ratio)
+(derive Hash Ratio)
+(defun numerator (r: (Ratio t)) -> t (. r n))
+(defun denominator (r: (Ratio t)) -> t (. r d))
+
+;; Euclid's algorithm; the sign of the result is whatever the last remainder had
+(defun ratio-gcd :private (a: t b: t) :where ((Num t) (Eq t) (Unit t)) -> t
+  (loop ((x a) (y b)) (if (= y (zero a)) x (recur y (rem x y)))))
+
+(defun ratio-make :private (n: t d: t) :where ((Num t) (Ord t) (Unit t)) -> (Ratio t)
+  (let ((z (zero n)))
+    (if (= d z)
+        (trap "ratio: divide by zero")
+        (if (< d z)
+            (ratio-make (neg n) (neg d))
+            (let ((g0 (ratio-gcd n d))
+                  (g (if (< g0 z) (neg g0) g0)))
+              (Ratio (quot n g) (quot d g)))))))
+
+(defun ratio-add :private (a: (Ratio t) b: (Ratio t)) :where ((Num t) (Ord t) (Unit t)) -> (Ratio t)
+  (ratio-make (+ (* (. a n) (. b d)) (* (. b n) (. a d))) (* (. a d) (. b d))))
+(defun ratio-sub :private (a: (Ratio t) b: (Ratio t)) :where ((Num t) (Ord t) (Unit t)) -> (Ratio t)
+  (ratio-make (- (* (. a n) (. b d)) (* (. b n) (. a d))) (* (. a d) (. b d))))
+(defun ratio-mul :private (a: (Ratio t) b: (Ratio t)) :where ((Num t) (Ord t) (Unit t)) -> (Ratio t)
+  (ratio-make (* (. a n) (. b n)) (* (. a d) (. b d))))
+(defun ratio-div :private (a: (Ratio t) b: (Ratio t)) :where ((Num t) (Ord t) (Unit t)) -> (Ratio t)
+  (ratio-make (* (. a n) (. b d)) (* (. a d) (. b n))))
+;; the quotient of a by b with its fraction dropped, toward zero, as a ratio
+(defun ratio-quot :private (a: (Ratio t) b: (Ratio t)) :where ((Num t) (Ord t) (Unit t)) -> (Ratio t)
+  (if (= (. b n) (zero (. b n)))
+      (trap "ratio: divide by zero")
+      (Ratio (quot (* (. a n) (. b d)) (* (. a d) (. b n))) (one (. a n)))))
+
+;; floor division by a positive divisor: the quotient and the remainder in [0, d)
+(defun floor-div :private (n: t d: t) :where ((Num t) (Ord t) (Unit t)) -> (Pair t t)
+  (let ((q (quot n d)) (r (rem n d)))
+    (if (< r (zero n)) (Pair (dec q) (+ r d)) (Pair q r))))
+
+;; -1, 0 or 1 for n1/d1 against n2/d2, both denominators positive
+(defun ratio-compare :private (n1: t d1: t n2: t d2: t) :where ((Num t) (Ord t) (Unit t)) -> i64
+  (loop ((n1 n1) (d1 d1) (n2 n2) (d2 d2))
+    (let ((a (floor-div n1 d1))
+          (b (floor-div n2 d2))
+          (z (zero n1)))
+      (if (!= (. a fst) (. b fst))
+          (compare (. a fst) (. b fst))
+          (if (= (. a snd) z)
+              (if (= (. b snd) z) 0 -1)
+              (if (= (. b snd) z) 1 (recur d2 (. b snd) d1 (. a snd))))))))
+
+(impl (Div (Ratio i8)) i8 (/ (self y) (ratio-make self y)))
+(impl (Div (Ratio i16)) i16 (/ (self y) (ratio-make self y)))
+(impl (Div (Ratio i32)) i32 (/ (self y) (ratio-make self y)))
+(impl (Div (Ratio i64)) i64 (/ (self y) (ratio-make self y)))
+(impl (Div f32) f32 (/ (self y) (fdiv self y)))
+(impl (Div f64) f64 (/ (self y) (fdiv self y)))
+(impl (Div (Ratio t)) (Ratio t) :where ((Num t) (Ord t) (Unit t))
+  (/ (self y) (ratio-div self y)))
+
+(impl Num (Ratio t) :where ((Num t) (Ord t) (Unit t))
+  (+ (self y) (ratio-add self y))
+  (- (self y) (ratio-sub self y))
+  (* (self y) (ratio-mul self y))
+  (/ (self y) (ratio-div self y))
+  (quot (self y) (ratio-quot self y))
+  (rem (self y) (ratio-sub self (ratio-mul y (ratio-quot self y))))
+  (neg (self) (Ratio (neg (. self n)) (. self d))))
+
+(impl Ord (Ratio t) :where ((Num t) (Ord t) (Unit t))
+  (< (self y) (< (ratio-compare (. self n) (. self d) (. y n) (. y d)) 0)))
+
+(impl Unit (Ratio t) :where ((Unit t))
+  (zero (self) (Ratio (zero (. self n)) (one (. self n))))
+  (one (self) (Ratio (one (. self n)) (one (. self n)))))
+
+(impl Show (Ratio t) :where ((Show t) (Eq t) (Unit t))
+  (show (self)
+    (if (= (. self d) (one (. self d)))
+        (show (. self n))
+        (str-concat (show (. self n)) (str-concat "/" (show (. self d)))))))
+(impl ToStr (Ratio t) :where ((Show t) (Eq t) (Unit t)) (to-str (self) (show self)))
+(impl Debug (Ratio t) :where ((Show t) (Eq t) (Unit t)) (debug (self) (show self)))

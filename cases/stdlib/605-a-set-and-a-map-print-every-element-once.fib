@@ -1,0 +1,77 @@
+;; spec:   stdlib §2.7 (Set and Map text, iteration order unspecified)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str
+;; A Set is #{1 2} and a Map {1 2, 3 4}: elements a space apart in a Set, entries
+;; ", " apart in a Map, each entry its key, a space, its value. The page leaves
+;; the order to the hash, so the checks that cannot know it count: every
+;; element appears once, the separators number one fewer than the elements, and
+;; the text has the length the elements and separators add up to. A hundred
+;; entries go past the first levels of the trie. Show leaves strings bare and
+;; Debug quotes them inside a Map as it does inside a Vec, and ToStr is Debug.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defun fill-set (n: i64) -> (Set i64)
+  (loop ((i 0) (s (set-empty))) (if (< i n) (recur (+ i 1) (conj s i)) s)))
+
+(defun fill-map (n: i64) -> (Map i64 i64)
+  (loop ((i 0) (m (map-empty))) (if (< i n) (recur (+ i 1) (assoc m i (* i i))) m)))
+
+;; how many times pat occurs in s
+(defun occurrences (s: str pat: str) -> i64
+  (loop ((from 0) (n 0))
+    (match (str-find s pat from)
+      (nil n)
+      ((some at) (recur (+ at (str-len pat)) (+ n 1))))))
+
+(defun digits (n: i64) -> i64 (str-len (show n)))
+
+;; the length of the text of the first n squares as a Map prints them: "{" and "}", each entry "k v", ", " between
+(defun map-length (n: i64) -> i64
+  (loop ((i 0) (len 2))
+    (if (< i n)
+        (recur (+ i 1) (+ len (+ (+ (digits i) (+ 1 (digits (* i i)))) (if (> i 0) 2 0))))
+        len)))
+
+;; and of the first n integers as a Set prints them: "#{" and "}", a space between
+(defun set-length (n: i64) -> i64
+  (loop ((i 0) (len 3))
+    (if (< i n) (recur (+ i 1) (+ len (+ (digits i) (if (> i 0) 1 0)))) len)))
+
+(defun every-entry (s: str n: i64) -> bool
+  (loop ((i 0))
+    (if (< i n)
+        (if (= (occurrences s (str-concat (show i) (str-concat " " (show (* i i))))) 0) false (recur (+ i 1)))
+        true)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s10 (str (fill-set 10)))
+        (m100 (show (fill-map 100)))
+        (m3 (show (fill-map 3)))
+        (ms (assoc (map-empty) "k" "v"))
+        (mv (assoc (map-empty) "k" [1 2]))
+        (m2 (assoc (assoc (map-empty) 1 2) 3 4)))
+    (do (check c (= (str (fill-set 0)) "#{}"))
+        (check c (= (str (fill-set 1)) "#{0}"))
+        (check c (= (str-len s10) (set-length 10)))
+        (check c (and (starts-with? s10 "#{") (= (occurrences s10 "}") 1)))
+        (check c (= (occurrences s10 " ") 9))
+        (check c (loop ((d 0)) (if (< d 10) (if (= (occurrences s10 (show d)) 1) (recur (+ d 1)) false) true)))
+        (check c (= (show (fill-map 0)) "{}"))
+        (check c (= (show (fill-map 1)) "{0 0}"))
+        (check c (= (str-len m3) (map-length 3)))
+        (check c (every-entry m3 3))
+        (check c (and (starts-with? m100 "{") (= (occurrences m100 "}") 1)))
+        (check c (= (str-len m100) (map-length 100)))
+        (check c (= (occurrences m100 ", ") 99))
+        (check c (every-entry m100 100))
+        (check c (= (show ms) "{k v}"))
+        (check c (= (debug ms) "{\"k\" \"v\"}"))
+        (check c (= (str ms) "{\"k\" \"v\"}"))
+        (check c (= (show mv) "{k [1 2]}"))
+        (check c (= (debug mv) "{\"k\" [1 2]}"))
+        (check c (let ((x (debug m2))) (or (= x "{1 2, 3 4}") (= x "{3 4, 1 2}"))))
+        (checks-result c))))

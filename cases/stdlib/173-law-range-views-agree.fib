@@ -1,0 +1,107 @@
+;; spec:   stdlib §2.1 rule 4 (count, nth and the walk of one source agree), §8.1 item 4 (laws over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: range-by
+;; An integer Range is read four ways: the walk (each-while, here through to-vec), the closed form of count,
+;; the closed form of nth, and the lazy seq. They are four implementations, so they must agree, and the walk
+;; must have the shape of a range: it starts at the start, differs by the step between neighbours, stays on
+;; the right side of the end, and is empty exactly when the start is at the end or the step points away. 300
+;; seeded ranges, a third small, a third with random i64 ends and a step of 2^58 to 2^60 (at most 65 elements,
+;; so a walk is cheap, and `end - start` overflows in half of them), a third near the extremes of i64.
+;; range-more? (the method that stops the walk) is true before each element but the last and false there.
+;; The planted faults: a count one too big, and nth read from the other end.
+(ns main (:use fib.core fib.seq tl.check tl.rng))
+
+(defun nth-agrees (r: (Range i64) w: (Vec i64) fault: i64) -> bool
+  (let ((n (fib.prelude/count w)))
+    (loop ((j 0))
+      (if (< j n)
+          (if (= (nth r j) (fib.prelude/nth w (if (= fault 2) (- (- n 1) j) j))) (recur (+ j 1)) false)
+          true))))
+
+(defun lseq-agrees (s: (LSeq i64) w: (Vec i64)) -> bool
+  (loop ((s s) (j 0))
+    (match (lnode s)
+      ((LNil) (= j (fib.prelude/count w)))
+      ((LCons h t) (if (< j (fib.prelude/count w))
+                       (if (= h (fib.prelude/nth w j)) (recur t (+ j 1)) false)
+                       false)))))
+
+;; the shape of the walk: start, neighbours a step apart, inside the bounds, and range-more? exact
+(defun shape-ok (w: (Vec i64) lo: i64 hi: i64 by: i64) -> bool
+  (let ((n (fib.prelude/count w)))
+    (if (= n 0)
+        (or (= lo hi) (or (and (> by 0) (> lo hi)) (and (< by 0) (< lo hi))))
+        (and (= (fib.prelude/nth w 0) lo)
+             (loop ((j 0))
+               (if (< j n)
+                   (let ((e (fib.prelude/nth w j)))
+                     (if (and (if (> by 0) (and (>= e lo) (< e hi)) (and (<= e lo) (> e hi)))
+                              (and (if (< (+ j 1) n) (= (- (fib.prelude/nth w (+ j 1)) e) by) true)
+                                   (= (range-more? e hi by) (< (+ j 1) n))))
+                         (recur (+ j 1))
+                         false))
+                   true))))))
+
+;; all four views of one range, with the planted fault `fault` (0: none) in the comparison
+(defun law-holds (lo: i64 hi: i64 by: i64 fault: i64) -> bool
+  (let ((r (range-by lo hi by))
+        (w (to-vec (range-by lo hi by))))
+    (and (= (count r) (+ (fib.prelude/count w) (if (= fault 1) 1 0)))
+         (and (nth-agrees r w fault)
+              (and (lseq-agrees (to-lseq r) w)
+                   (shape-ok w lo hi by))))))
+
+;; a step in the direction of the end, or against it one time in eight
+(defun toward (r: Rng lo: i64 hi: i64 magnitude: i64) -> i64
+  (if (= (rng-below r 8) 0)
+      (if (< lo hi) (- 0 magnitude) magnitude)
+      (if (< lo hi) magnitude (- 0 magnitude))))
+
+(defun big-step (r: Rng) -> i64 (+ 288230376151711744 (rng-below r 864691128455135232)))
+
+;; both ends near the smallest, both near the largest (a span under a thousand, steps of 10 to 200),
+;; or one near each (a step of 2^58 to 2^60)
+(defun extreme (r: Rng) -> (Triple i64 i64 i64)
+  (let ((side (rng-below r 4))
+        (lowest (+ -9223372036854775808 (rng-below r 1000)))
+        (highest (- 9223372036854775807 (rng-below r 1000)))
+        (near-low (+ -9223372036854775808 (rng-below r 1000)))
+        (near-high (- 9223372036854775807 (rng-below r 1000))))
+    (if (= side 0)
+        (Triple lowest near-low (toward r lowest near-low (+ 10 (rng-below r 191))))
+        (if (= side 1)
+            (Triple highest near-high (toward r highest near-high (+ 10 (rng-below r 191))))
+            (if (= side 2)
+                (Triple lowest highest (toward r lowest highest (big-step r)))
+                (Triple highest lowest (toward r highest lowest (big-step r))))))))
+
+;; one range of each kind per three of the 300, by the index
+(defun triple (r: Rng kind: i64) -> (Triple i64 i64 i64)
+  (if (= kind 0)
+      (let ((lo (- (rng-below r 121) 60)) (hi (- (rng-below r 121) 60)))
+        (Triple lo hi (toward r lo hi (+ 1 (rng-below r 40)))))
+      (if (= kind 1)
+          (let ((lo (rng-next r)) (hi (rng-next r)))
+            (Triple lo hi (toward r lo hi (big-step r))))
+          (extreme r))))
+
+(defun sweep (c: Checks fault: i64) -> unit
+  (let ((r (rng 1618033)))
+    (dotimes (j 300)
+      (let ((t (triple r (rem j 3))))
+        (check c (law-holds (. t fst) (. t snd) (. t thd) fault))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (count-off (checks))
+        (nth-reversed (checks)))
+    (do (sweep c 0)
+        (check c (= (checks-made c) 300))
+        (sweep count-off 1)
+        (sweep nth-reversed 2)
+        (check-detects c count-off)
+        (check-detects c nth-reversed)
+        (checks-result c))))

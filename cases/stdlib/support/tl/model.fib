@@ -1,0 +1,354 @@
+;; tl.model: what the model tests of the prelude's Map and Set share (cases
+;; 842 to 844, 851 to 855, 857 to 859; spec/stdlib.md §8.1 item 2). A Map or a Set is
+;; run through a seeded sequence of operations and, beside it, a model that no
+;; hash touches. After every operation the two must agree on the count, on `get`
+;; and `contains?` (`set-contains?`) for every key of the universe, and on a full
+;; walk: every entry visited exactly once, the right keys, the right values. Every
+;; `run-*` function returns 0 when the whole sequence agreed, and otherwise the
+;; 1-based step of the first disagreement (1000 when a snapshot taken on the way
+;; no longer agreed at the end: the persistence check), so a failing case is
+;; debugged from the number. Nothing here keeps state outside its
+;; arguments: a generator, a Cover and the maps are passed in and returned.
+;;
+;; Decided here, where the page is silent:
+;; * The model is an association table indexed by key id: an `(Array i64)` with the
+;;   value of the key whose id is the index, or -1 for absent (a Set's: 1 or -1).
+;;   The page says an association Vec searched by `=`. I built that first and
+;;   measured it: the interpreter's memory grows with the work done (13 MB per
+;;   sequence of 48 operations over 40 keys, 4.7 s for 40 sequences), the linear
+;;   search was nine tenths of that work, and a case could afford 15 sequences. The
+;;   table is searched by index, so it cannot be wrong in a way the Map could hide,
+;;   and `array-with` copies it, never updating a shared one, when a snapshot holds it.
+;; * The key types. `Kc` hashes to `id mod 7` (the page's key type): a universe of
+;;   n keys falls into seven buckets of about n/7 keys that only `=` tells apart
+;;   (MColl). `Kh` hashes to `(id mod 4) << 20`: four such buckets whose hashes share
+;;   their first four chunks, so a bucket is the root until another class comes and
+;;   must then be pushed down a chain (`Kc` pushes one down only at the root, where
+;;   the first chunks differ and `mnode-two` stops at once), and a lookup of another
+;;   class lands on a bucket that is not its own. `Kd` hashes
+;;   to `(1 + id mod 7) << (5 * (id quot 7))`: every key shares the low chunks of
+;;   the next, so the trie is a chain of single-child nodes (up to nine levels for
+;;   60 keys) that `dissoc` must unwind. `Kw` hashes to `id << 59` (so at most 32
+;;   keys): the keys differ only in the top chunks, thirteen levels down, and the
+;;   hashes of ids 16 to 31 are negative. The `i64` itself (the identity hash) and
+;;   a `str` (the real hash of text) are the keys of a program as written.
+;; * The faults for the planted-fault check of README §9.4 are in the model and
+;;   numbered: `fault` 0 is none, 1 is a model whose put keeps the old value of a key
+;;   it already has (a Set's: a model that forgets the even elements), 2 is a model
+;;   whose delete removes the entry before the right one (an off-by-one).
+;; * The walk is the prelude's `for-each` over `Entry` (`key`, `val`) and over a
+;;   Set's elements, and `each-entry` and `each-elem` below are the only places that
+;;   name them: when L4 turns `Entry` into `Pair` (`fst`, `snd`), or the flip
+;;   deletes the `for-each` function, those two are the functions to port (the
+;;   cases that walk a map, 857 and 859, call them too).
+(ns tl.model (:use tl.rng))
+
+;; ---- the key types ----------------------------------------------------
+
+(defstruct Kc (id: i64))
+(impl Eq Kc (= (self o) (= (. self id) (. o id))))
+(impl Hash Kc (hash (self) (rem (. self id) 7)))
+
+(defun chain-hash :private (id: i64) -> i64
+  (shl (+ 1 (rem id 7)) (* 5 (quot id 7))))
+
+(defstruct Kd (id: i64))
+(impl Eq Kd (= (self o) (= (. self id) (. o id))))
+(impl Hash Kd (hash (self) (chain-hash (. self id))))
+
+(defstruct Kw (id: i64))
+(impl Eq Kw (= (self o) (= (. self id) (. o id))))
+(impl Hash Kw (hash (self) (shl (. self id) 59)))
+
+(defstruct Kh (id: i64))
+(impl Eq Kh (= (self o) (= (. self id) (. o id))))
+(impl Hash Kh (hash (self) (shl (rem (. self id) 4) 20)))
+
+(defun mk-kc (id: i64) -> Kc (Kc id))
+(defun mk-kh (id: i64) -> Kh (Kh id))
+(defun mk-kd (id: i64) -> Kd (Kd id))
+(defun mk-kw (id: i64) -> Kw (Kw id))
+(defun id-kc (k: Kc) -> i64 (. k id))
+(defun id-kh (k: Kh) -> i64 (. k id))
+(defun id-kd (k: Kd) -> i64 (. k id))
+(defun id-kw (k: Kw) -> i64 (. k id))
+(defun mk-int (id: i64) -> i64 id)
+(defun id-int (k: i64) -> i64 k)
+
+;; "key-17": the digits after the prefix, read back by hand (no parse-long yet)
+(defun mk-str (id: i64) -> str (str-concat "key-" (show id)))
+(defun id-str (k: str) -> i64
+  (let ((bs (str-bytes k)))
+    (loop ((i 4) (acc 0))
+      (if (< i (array-len bs))
+          (recur (+ i 1) (+ (* acc 10) (- (zext i64 (array-get bs i)) 48)))
+          acc))))
+
+(defun universe (mk: (fn (i64) k) n: i64) -> (Vec k)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj acc (mk i))) acc)))
+
+;; ---- what a walk saw --------------------------------------------------
+
+;; the number of visits, the set of key ids seen as a bit mask, and the sum of
+;; (id + 1) * value; a key seen twice or never shows in the first two, a value
+;; moved to another key in the third
+(defstruct Walk (visits: i64 mask: i64 vsum: i64))
+
+(defun walk-same (a: Walk b: Walk) -> bool
+  (and (= (. a visits) (. b visits)) (and (= (. a mask) (. b mask)) (= (. a vsum) (. b vsum)))))
+
+(defun walk-add (w: Walk id: i64 vv: i64) -> Walk
+  (Walk (+ (. w visits) 1) (bit-or (. w mask) (shl 1 id)) (+ (. w vsum) (* (+ id 1) vv))))
+
+;; f on every entry of the map, and on every element of the set, in the order of
+;; the walk: the only two places that name the prelude's walk
+(defun each-entry (m: (Map k v) f: (fn (k v) unit) :borrow) -> unit
+  (for-each m (fn (e) (f (. e fst) (. e snd)))))
+
+(defun each-elem (s: (Set k) f: (fn (k) unit) :borrow) -> unit
+  (for-each s f))
+
+(defun walk-map (m: (Map k i64) kid: (fn (k) i64)) -> Walk
+  (let ((w (cell (Walk 0 0 0))))
+    (do (each-entry m (fn (kk vv) (set! w (walk-add @w (kid kk) vv))))
+        @w)))
+
+(defun walk-set (s: (Set k) kid: (fn (k) i64)) -> Walk
+  (let ((w (cell (Walk 0 0 0))))
+    (do (each-elem s (fn (kk) (set! w (walk-add @w (kid kk) 1))))
+        @w)))
+
+;; ---- the model: slot id holds the value, or -1 ------------------------
+
+(defun model-new (n: i64) -> (Array i64) (array n -1))
+
+(defun model-put (model: (Array i64) id: i64 vv: i64 fault: i64) -> (Array i64)
+  (if (and (= fault 1) (>= (array-get model id) 0)) model (array-with model id vv)))
+
+(defun model-del (model: (Array i64) id: i64 fault: i64) -> (Array i64)
+  (array-with model (if (and (= fault 2) (> id 0)) (- id 1) id) -1))
+
+(defun model-count (model: (Array i64)) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i (array-len model)) (recur (+ i 1) (if (>= (array-get model i) 0) (+ n 1) n)) n)))
+
+(defun model-walk (model: (Array i64)) -> Walk
+  (loop ((i 0) (w (Walk 0 0 0)))
+    (if (< i (array-len model))
+        (recur (+ i 1) (if (>= (array-get model i) 0) (walk-add w i (array-get model i)) w))
+        w)))
+
+;; ---- what a run reached ------------------------------------------------
+
+;; A sequence that never overwrites, never deletes a missing key, never empties
+;; the map or never grows it is a weak test, so a run tells what it did, and a
+;; case asserts the totals: puts of a key already there, deletes of one that was
+;; there, deletes of one that was not, times the map went from some entries to
+;; none, and the most entries it held.
+(defstruct Cover (overwrites: (Cell i64) deletes: (Cell i64) absent: (Cell i64) emptied: (Cell i64) peak: (Cell i64)))
+
+(defun cover () -> Cover (Cover (cell 0) (cell 0) (cell 0) (cell 0) (cell 0)))
+
+(defun bump (c: (Cell i64)) -> unit (set! c (+ @c 1)))
+
+;; one operation on id: before is the model before it, after the model after it
+(defun cover-note (cv: Cover adding: bool id: i64 before: (Array i64) after: (Array i64)) -> unit
+  (let ((was (>= (array-get before id) 0))
+        (n0 (model-count before))
+        (n1 (model-count after)))
+    (do (if (and adding was) (bump (. cv overwrites)) ())
+        (if (and (not adding) was) (bump (. cv deletes)) ())
+        (if (and (not adding) (not was)) (bump (. cv absent)) ())
+        (if (and (= n1 0) (> n0 0)) (bump (. cv emptied)) ())
+        (if (> n1 @(. cv peak)) (set! (. cv peak) n1) ()))))
+
+;; ---- agreement of a Map with its model ---------------------------------
+
+(defun keys-agree :private (m: (Map k i64) model: (Array i64) ks: (Vec k)) :where ((Hash k) (Eq k)) -> bool
+  (loop ((i 0))
+    (if (< i (count ks))
+        (let ((kk (nth ks i))
+              (want (if (>= (array-get model i) 0) (some (array-get model i)) nil)))
+          (if (and (= (get m kk) want) (= (contains? m kk) (some? want))) (recur (+ i 1)) false))
+        true)))
+
+(defun map-matches (m: (Map k i64) model: (Array i64) ks: (Vec k) kid: (fn (k) i64)) :where ((Hash k) (Eq k)) -> bool
+  (and (= (count m) (model-count model))
+       (and (keys-agree m model ks) (walk-same (walk-map m kid) (model-walk model)))))
+
+;; the share of operations that put (the rest delete) in the third of the
+;; sequence that step is in: the map fills, mixes and drains
+(defun put-percent :private (step: i64 nops: i64) -> i64
+  (let ((part (quot (* step 3) nops)))
+    (if (= part 0) 85 (if (= part 1) 50 4))))
+
+;; the id of the n-th slot (from 0) that is present (want true) or absent (want
+;; false) in the model; n is below the number of such slots
+(defun nth-slot :private (model: (Array i64) want: bool n: i64) -> i64
+  (loop ((i 0) (seen 0))
+    (if (= (>= (array-get model i) 0) want)
+        (if (= seen n) i (recur (+ i 1) (+ seen 1)))
+        (recur (+ i 1) seen))))
+
+;; the key an operation is aimed at: with `pct` chances in a hundred a key of
+;; the kind the operation wants (a delete wants one the model holds, so the map
+;; can drain; a put wants one it does not, so the map can grow), otherwise any
+;; key, which is often of the other kind
+(defun pick-id :private (r: Rng model: (Array i64) want: bool pct: i64) -> i64
+  (let ((len (array-len model))
+        (have (model-count model)))
+    (let ((n (if want have (- len have))))
+      (if (and (> n 0) (< (rng-below r 100) pct))
+          (nth-slot model want (rng-below r n))
+          (rng-below r len)))))
+
+;; the key of a step: a put of an absent key one time in two, a delete of a
+;; present key five times in six
+(defun pick-key :private (r: Rng model: (Array i64) adding: bool) -> i64
+  (if adding (pick-id r model false 50) (pick-id r model true 83)))
+
+;; the map and its model now, and the snapshots of both taken on the way
+(defstruct (MapRun k) (m: (Map k i64) model: (Array i64) snaps: (Vec (Map k i64)) models: (Vec (Array i64))))
+
+;; one operation on both sides: put id (a value from the generator) or delete id
+(defun map-step :private (r: Rng st: (MapRun k) ks: (Vec k) step: i64 nops: i64 fault: i64 cv: Cover) :where ((Hash k) (Eq k)) -> (MapRun k)
+  (let ((adding (< (rng-below r 100) (put-percent step nops)))
+        (id (pick-key r (. st model) adding))
+        (vv (rng-below r 1000))
+        (taking (= (rem step 6) 0)))
+    (let ((m2 (if adding (assoc (. st m) (nth ks id) vv) (dissoc (. st m) (nth ks id))))
+          (model2 (if adding (model-put (. st model) id vv fault) (model-del (. st model) id fault))))
+      (do (cover-note cv adding id (. st model) model2)
+          (MapRun m2 model2
+                  (if taking (conj (. st snaps) m2) (. st snaps))
+                  (if taking (conj (. st models) model2) (. st models)))))))
+
+;; every snapshot must still agree with the model of its moment at the end,
+;; whatever was done to the maps built on it
+(defun snaps-hold :private (st: (MapRun k) ks: (Vec k) kid: (fn (k) i64)) :where ((Hash k) (Eq k)) -> bool
+  (loop ((i 0))
+    (if (< i (count (. st snaps)))
+        (if (map-matches (nth (. st snaps) i) (nth (. st models) i) ks kid) (recur (+ i 1)) false)
+        true)))
+
+;; nkeys <= 60 keys (the walk's mask is a word); nops operations; seed fixes everything
+(defun run-map-seq (seed: i64 nkeys: i64 nops: i64 mk: (fn (i64) k) kid: (fn (k) i64) fault: i64 cv: Cover) :where ((Hash k) (Eq k)) -> i64
+  (let ((r (rng seed))
+        (ks (universe mk nkeys)))
+    (loop ((step 0) (st (MapRun (map-empty) (model-new nkeys) (vec-empty) (vec-empty))))
+      (if (= step nops)
+          (if (snaps-hold st ks kid) 0 1000)
+          (let ((nx (map-step r st ks step nops fault cv)))
+            (if (map-matches (. nx m) (. nx model) ks kid)
+                (recur (+ step 1) nx)
+                (+ step 1)))))))
+
+;; ---- agreement of a Set with its model ---------------------------------
+
+(defun set-keys-agree :private (s: (Set k) model: (Array i64) ks: (Vec k)) :where ((Hash k) (Eq k)) -> bool
+  (loop ((i 0))
+    (if (< i (count ks))
+        (if (= (set-contains? s (nth ks i)) (>= (array-get model i) 0)) (recur (+ i 1)) false)
+        true)))
+
+(defun set-matches (s: (Set k) model: (Array i64) ks: (Vec k) kid: (fn (k) i64)) :where ((Hash k) (Eq k)) -> bool
+  (and (= (count s) (model-count model))
+       (and (set-keys-agree s model ks) (walk-same (walk-set s kid) (model-walk model)))))
+
+(defstruct (SetRun k) (s: (Set k) model: (Array i64) snaps: (Vec (Set k)) models: (Vec (Array i64))))
+
+(defun set-step :private (r: Rng st: (SetRun k) ks: (Vec k) step: i64 nops: i64 fault: i64 cv: Cover) :where ((Hash k) (Eq k)) -> (SetRun k)
+  (let ((adding (< (rng-below r 100) (put-percent step nops)))
+        (id (pick-key r (. st model) adding))
+        (taking (= (rem step 6) 0)))
+    (let ((s2 (if adding (conj (. st s) (nth ks id)) (disj (. st s) (nth ks id))))
+          (model2 (if adding
+                      (if (and (= fault 1) (= (rem id 2) 0)) (. st model) (model-put (. st model) id 1 0))
+                      (model-del (. st model) id fault))))
+      (do (cover-note cv adding id (. st model) model2)
+          (SetRun s2 model2
+                  (if taking (conj (. st snaps) s2) (. st snaps))
+                  (if taking (conj (. st models) model2) (. st models)))))))
+
+(defun set-snaps-hold :private (st: (SetRun k) ks: (Vec k) kid: (fn (k) i64)) :where ((Hash k) (Eq k)) -> bool
+  (loop ((i 0))
+    (if (< i (count (. st snaps)))
+        (if (set-matches (nth (. st snaps) i) (nth (. st models) i) ks kid) (recur (+ i 1)) false)
+        true)))
+
+;; run-map-seq for a Set: conj and disj against the model, 0 or the failing step
+(defun run-set-seq (seed: i64 nkeys: i64 nops: i64 mk: (fn (i64) k) kid: (fn (k) i64) fault: i64 cv: Cover) :where ((Hash k) (Eq k)) -> i64
+  (let ((r (rng seed))
+        (ks (universe mk nkeys)))
+    (loop ((step 0) (st (SetRun (set-empty) (model-new nkeys) (vec-empty) (vec-empty))))
+      (if (= step nops)
+          (if (set-snaps-hold st ks kid) 0 1000)
+          (let ((nx (set-step r st ks step nops fault cv)))
+            (if (set-matches (. nx s) (. nx model) ks kid)
+                (recur (+ step 1) nx)
+                (+ step 1)))))))
+
+;; ---- filling a map, draining it to nothing, filling it again ------------
+
+;; ids 0..n-1 in a seeded order (Fisher-Yates over an array)
+(defun shuffled (r: Rng n: i64) -> (Array i64)
+  (let ((c (cell (array n 0))))
+    (do (dotimes (i n) (array-set! &c i i))
+        (loop ((i (- n 1)))
+          (if (> i 0)
+              (let ((j (rng-below r (+ i 1)))
+                    (t (array-get @c i)))
+                (do (array-set! &c i (array-get @c j))
+                    (array-set! &c j t)
+                    (recur (- i 1))))
+              ()))
+        @c)))
+
+;; the map and its model after the operations so far; bad is 0 or the 1-based
+;; position, in the order being run, of the first disagreement
+(defstruct (Phase k) (m: (Map k i64) model: (Array i64) bad: i64))
+
+;; deleting a key that is not there changes nothing: same count, still not there
+(defun again-absent :private (m: (Map k i64) kk: k) :where ((Hash k) (Eq k)) -> bool
+  (let ((m3 (dissoc m kk)))
+    (and (= (count m3) (count m)) (not (contains? m3 kk)))))
+
+;; the ids of order one after the other: put (base + id) or delete, each
+;; checked against the model; a delete is then repeated on the key that is no
+;; longer there, which must change nothing
+(defun run-order :private (st: (Phase k) order: (Array i64) adding: bool base: i64 ks: (Vec k) kid: (fn (k) i64) fault: i64) :where ((Hash k) (Eq k)) -> (Phase k)
+  (loop ((i 0) (cur st))
+    (if (or (= i (array-len order)) (> (. cur bad) 0))
+        cur
+        (let ((id (array-get order i)))
+          (let ((m2 (if adding (assoc (. cur m) (nth ks id) (+ base id)) (dissoc (. cur m) (nth ks id))))
+                (model2 (if adding (model-put (. cur model) id (+ base id) fault) (model-del (. cur model) id fault))))
+            (recur (+ i 1)
+                   (Phase m2 model2
+                          (if (and (map-matches m2 model2 ks kid)
+                                   (or adding (again-absent m2 (nth ks id))))
+                              0
+                              (+ i 1)))))))))
+
+;; n keys put in one seeded order, deleted in a second down to the empty map,
+;; put back in a third with other values. 0 when every step agreed; else the
+;; failing position, plus 1000 in the second pass, 2000 in the third; 3000
+;; when the full map of the first pass no longer agreed with its model after
+;; the others were built on it
+(defun run-drain (seed: i64 n: i64 mk: (fn (i64) k) kid: (fn (k) i64) fault: i64) :where ((Hash k) (Eq k)) -> i64
+  (let ((r (rng seed))
+        (ks (universe mk n))
+        (o1 (shuffled r n))
+        (o2 (shuffled r n))
+        (o3 (shuffled r n))
+        (p1 (run-order (Phase (map-empty) (model-new n) 0) o1 true 10 ks kid fault))
+        (p2 (if (= (. p1 bad) 0) (run-order p1 o2 false 0 ks kid fault) p1))
+        (p3 (if (= (. p2 bad) 0) (run-order p2 o3 true 500 ks kid fault) p2)))
+    (if (> (. p1 bad) 0)
+        (. p1 bad)
+        (if (> (. p2 bad) 0)
+            (+ 1000 (. p2 bad))
+            (if (> (. p3 bad) 0)
+                (+ 2000 (. p3 bad))
+                (if (map-matches (. p1 m) (. p1 model) ks kid) 0 3000))))))

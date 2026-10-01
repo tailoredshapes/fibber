@@ -1,4 +1,116 @@
-;; owner: L5b. fib.seq.consumers: the consumers of a walk. Exports: empty? first run! reduce reduce1 reduce-nonempty reduce-while every? not-any? any? find-first find-map sum nth-or.
-;; Until L5b writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.seq.consumers (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
+;; fib.seq.consumers: the functions that walk a collection once and answer with something that is not a seq
+;; (stdlib §2.1 rule 3, §4.4; tranche 1 plan §4.2, package L5b). Exports: empty? first run! reduce reduce1
+;; reduce-nonempty reduce-while every? not-any? any? find-first find-map sum nth-or. count, last and nth are
+;; Reducible's (P0, fib.seq.protocols); Step, More, Done and reduced are fib.core.base's.
+;; Replaces the prelude's for-each (as run!), first (the Seq method) and the Vec-only reductions people wrote by hand.
+;;
+;; Every consumer is a loop over each-while and allocates nothing per element: the running value lives in a cell
+;; made once, an early exit is a `false` from the visitor, and the visitor is a closure made once per call.
+;; Exceptions, each one a heap object per step until C5 (an enum or an Option of a scalar is a heap object):
+;; reduce-while (the Step that f returns). Nothing else holds an Option per element.
+;;
+;; Decided here (the page leaves them open):
+;;  - a collection parameter is left to inference (owned, plan §4.3 rule 7); a function parameter is :borrow,
+;;    because a consumer only calls it, never stores it. The visitor handed to each-while borrows the same way.
+;;  - every?, not-any? take a predicate whose result is a Truthy (bool or an Option); find-first takes a bool,
+;;    as the table says; find-map takes an (Option b).
+;;  - (reduce f init c) is the three-argument function. The two-argument form and `reduced` inside a literal
+;;    fn are the macro of R6b (stdlib §2.1 rule 3); reduce-nonempty is its target and reduce-while the form for
+;;    a function that is not a literal. reduce-nonempty traps `reduce: empty collection`.
+;;  - reduce1 and reduce-nonempty hold the running value in a cell made when the first element arrives,
+;;    inside a cell that holds nothing before it: no Option is made per element.
+;;  - sum is for i64 only (the generic one needs a static `zero`, the item L4 of stdlib §7: tranche 3); an
+;;    overflow traps, as the builtin + does.
+;;  - nth-or is one walk on every source, a Vec included: Reducible has no method for it, so the O(1) nth of a
+;;    Vec is not used (flagged in the package report: a defaulted method of Reducible would give it).
+;;  - any? is Clojure's unary always-true predicate; it takes its argument borrowed, so that it can be handed
+;;    to every? or find-first as the predicate of a collection of anything.
+(ns fib.seq.consumers (:use fib.core fib.seq.protocols))
+
+;; nil on an empty collection; the walk stops after the first element (an LSeq realises one node)
+(defun first (c: c) :where ((Reducible c e)) -> (Option e)
+  (let ((r (cell nil)))
+    (do (each-while c (fn (x) (do (set! r (some x)) false)))
+        @r)))
+
+;; true when the walk ran to the end without being given an element
+(defun empty? (c: c) :where ((Reducible c e)) -> bool
+  (each-while c (fn (x) false)))
+
+;; f is called for effect on every element in order; whatever it returns is dropped
+(defun run! (f: (fn (e) r) :borrow c: c) :where ((Reducible c e)) -> unit
+  (do (each-while c (fn (x) (do (f x) true)))
+      ()))
+
+(defun reduce (f: (fn (a e) a) :borrow init: a c: c) :where ((Reducible c e)) -> a
+  (let ((acc (cell init)))
+    (do (each-while c (fn (x) (do (set! acc (f @acc x)) true)))
+        @acc)))
+
+;; the running value of reduce1: nothing until the first element, then one cell that is updated in place
+(defun reduce1 (f: (fn (e e) e) :borrow c: c) :where ((Reducible c e)) -> (Option e)
+  (let ((slot (cell nil)))
+    (do (each-while c
+          (fn (x)
+            (do (match @slot
+                  (nil (set! slot (some (cell x))))
+                  ((some a) (set! a (f @a x))))
+                true)))
+        (match @slot
+          (nil nil)
+          ((some a) (some @a))))))
+
+(defun reduce-nonempty (f: (fn (e e) e) :borrow c: c) :where ((Reducible c e)) -> e
+  (match (reduce1 f c)
+    (nil (trap "reduce: empty collection"))
+    ((some x) x)))
+
+;; Clojure's reduced: a (Done v) from f is the result, a (More v) goes on
+(defun reduce-while (f: (fn (a e) (Step a)) :borrow init: a c: c) :where ((Reducible c e)) -> a
+  (let ((acc (cell init)))
+    (do (each-while c
+          (fn (x)
+            (match (f @acc x)
+              ((More v) (do (set! acc v) true))
+              ((Done v) (do (set! acc v) false)))))
+        @acc)))
+
+;; the predicates stop the walk at the first element that decides them
+(defun every? (p: (fn (e) r) :borrow c: c) :where ((Reducible c e) (Truthy r)) -> bool
+  (each-while c (fn (x) (truthy? (p x)))))
+
+(defun not-any? (p: (fn (e) r) :borrow c: c) :where ((Reducible c e) (Truthy r)) -> bool
+  (each-while c (fn (x) (if (truthy? (p x)) false true))))
+
+(defun any? (x: a :borrow) -> bool true)
+
+(defun find-first (p: (fn (e) bool) :borrow c: c) :where ((Reducible c e)) -> (Option e)
+  (let ((r (cell nil)))
+    (do (each-while c (fn (x) (if (p x) (do (set! r (some x)) false) true)))
+        @r)))
+
+(defun find-map (f: (fn (e) (Option b)) :borrow c: c) :where ((Reducible c e)) -> (Option b)
+  (let ((r (cell nil)))
+    (do (each-while c
+          (fn (x)
+            (let ((v (f x)))
+              (match v
+                (nil true)
+                ((some _) (do (set! r v) false))))))
+        @r)))
+
+(defun sum (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true)))
+        @acc)))
+
+;; element i, or d when the collection has no element i (a negative i included)
+(defun nth-or (c: c i: i64 d: e) :where ((Reducible c e)) -> e
+  (let ((n (cell 0))
+        (r (cell d)))
+    (do (each-while c
+          (fn (x)
+            (if (= @n i)
+                (do (set! r x) false)
+                (do (set! n (+ @n 1)) true))))
+        @r)))

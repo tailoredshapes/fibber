@@ -1,0 +1,59 @@
+;; spec:   stdlib §2.7 ("the combiners of today trap"), §4.3 (rows hash, hash-combine), §10.4.8 C01
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: hash hash-combine
+;; The page's blocker C01: a combiner of the form h*31 + x overflows an i64 at
+;; the third string, so a map keyed by a `(Vec str)` failed as soon as the keys
+;; were long enough. fib.seq.hash folds with `hash-combine` (shifts, xors and
+;; no multiplication), which never traps, so the hash of 30 strings of 20
+;; characters, of 30 vectors of 30 strings, of a Map and of a Set of 30 string
+;; keys is a number and not an abort. `hash-combine` itself is tried at the
+;; extremes of i64 (`top` and `bot`) and is not commutative on them (the order of two hashes counts;
+;; it is not injective either: `(hash-combine top bot)` and `(hash-combine bot top)`
+;; are one number, which this case does not rely on).
+;; That the case reaches its last line is the check that nothing trapped; the
+;; results are compared as well, so a hash that returned one constant would fail.
+(ns main (:use fib.seq tl.check))
+
+;; the strings "prefix-k-0" to "prefix-k-(n-1)": about twenty characters each
+(defun words (k: i64 n: i64) -> (Vec str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n)
+        (recur (+ i 1) (fib.prelude/conj acc (str-concat "prefix-" (str-concat (show k) (str-concat "-" (show i))))))
+        acc)))
+
+(defun grid (n: i64) -> (Vec (Vec str))
+  (loop ((k 0) (acc (vec-empty)))
+    (if (< k n) (recur (+ k 1) (fib.prelude/conj acc (words k 30))) acc)))
+
+(defun keyed (ws: (Vec str)) -> (Map str i64)
+  (loop ((i 0) (m (map-empty)))
+    (if (< i (vec-count ws)) (recur (+ i 1) (assoc m (vec-nth ws i) i)) m)))
+
+(defun members (ws: (Vec str)) -> (Set str)
+  (loop ((i 0) (s (set-empty)))
+    (if (< i (vec-count ws)) (recur (+ i 1) (conj s (vec-nth ws i))) s)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (top 9223372036854775807)
+        (bot -9223372036854775808))
+    (do (check c (= (hash (words 0 30)) (hash (words 0 30))))
+        (check c (!= (hash (words 0 30)) (hash (words 1 30))))
+        (check c (!= (hash (words 0 30)) (hash (words 0 29))))
+        (check c (= (hash (grid 30)) (hash (grid 30))))
+        (check c (!= (hash (grid 30)) (hash (grid 29))))
+        (check c (= (hash (keyed (words 0 30))) (hash (keyed (words 0 30)))))
+        (check c (!= (hash (keyed (words 0 30))) (hash (keyed (words 1 30)))))
+        (check c (= (hash (members (words 0 30))) (hash (members (words 0 30)))))
+        (check c (!= (hash (members (words 0 30))) (hash (members (words 1 30)))))
+        (check c (!= (hash-combine top 0) (hash-combine 0 top)))
+        (check c (!= (hash-combine bot 1) (hash-combine 1 bot)))
+        (check c (!= (hash-combine top top) (hash-combine top bot)))
+        (check c (!= (hash-combine 1 2) (hash-combine 2 1)))
+        (check c (= (hash-combine 1 2) (hash-combine 1 2)))
+        (check c (!= (hash-combine 0 0) (hash-combine 0 1)))
+        (check c (= (checks-made c) 15))
+        (checks-result c))))

@@ -1,0 +1,43 @@
+;; spec:   stdlib §4.14 (rows slurp spit), §2.10
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: slurp spit try-slurp
+;; The files of the case are /tmp/fibstdlib-608-*.txt, named by the case's number
+;; so that no two cases share one. Each file is written more than once with
+;; different text and read back after each write, and the first text of each is
+;; not the last text the previous run left there (the empty text, and "short"),
+;; so a write that does nothing cannot pass on the strength of a file an earlier
+;; run left. The text has a newline, a NUL, and scalars of every width: slurp returns the bytes
+;; written, never a translation of them. spit answers whether the whole text
+;; was written; the empty text makes an empty file, which is the string "" and
+;; not a failure to read.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(def path-a: str "/tmp/fibstdlib-608-a.txt")
+(def path-b: str "/tmp/fibstdlib-608-b.txt")
+
+(defun ok-text (r: (Result str str) want: str) -> bool
+  (match r ((Ok s) (= s want)) ((Err _) false)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (first-text "alpha\nbeta\n")
+        (second-text "line one\r\nz\0z é 日本語 😀\n\n")
+        (long-text (loop ((i 0) (acc "")) (if (< i 400) (recur (+ i 1) (str-concat acc "0123456789")) acc))))
+    (do (check c (spit path-a first-text))
+        (check c (= (slurp path-a) first-text))
+        (check c (ok-text (try-slurp path-a) first-text))
+        (check c (spit path-a second-text))
+        (check c (= (slurp path-a) second-text))
+        (check c (= (str-len (slurp path-a)) (str-len second-text)))
+        (check c (spit path-a ""))
+        (check c (= (slurp path-a) ""))
+        (check c (ok-text (try-slurp path-a) ""))
+        (check c (spit path-b long-text))
+        (check c (= (str-len (slurp path-b)) 4000))
+        (check c (= (slurp path-b) long-text))
+        (check c (spit path-b "short"))
+        (check c (= (slurp path-b) "short"))
+        (checks-result c))))

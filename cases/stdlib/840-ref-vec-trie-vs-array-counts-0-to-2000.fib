@@ -1,0 +1,77 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Vec's trie), types §2.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; The prelude's Vec is a 32-way trie of arrays with a tail of up to 32 elements,
+;; as Clojure's. Its edges are the counts where the tail fills (32), where the
+;; first leaf joins the trie (33), where the next leaves do (64, 65), where the
+;; root's first branch fills (1024 elements in the trie and 32 in the tail: 1056)
+;; and where the root gains a level (1057), and the neighbours of each. For every
+;; count of the list in `main` the Vec is built from empty by conj, each build
+;; starting from nothing and keeping nothing (the path where every object is
+;; unique), and every element is read back with nth against a plain (Array i64)
+;; that never went through a Vec. The same counts are then reached by one Vec
+;; grown through all of them with a snapshot kept at each (the path where every
+;; older version is shared), and each snapshot is read again at the end, after
+;; everything that was built on it. Decided here: element i is 7919 i + 13, so no
+;; two neighbours are alike and none is a sum of others. The faults planted to show
+;; that the comparison can fail: a reference read one element off, and a Vec with
+;; one element wrong, the 1057th, the one whose conj adds a level to the root.
+(ns main (:use tl.check))
+
+(defun elem (i: i64) -> i64 (+ (* i 7919) 13))
+
+(defun ref-array (n: i64) -> (Array i64)
+  (let ((c (cell (array n 0))))
+    (do (dotimes (i n) (array-set! &c i (elem i)))
+        @c)))
+
+(defun build (n: i64) -> (Vec i64)
+  (loop ((i 0) (v (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj v (elem i))) v)))
+
+;; the elements of the first n conj'd, with the element at index bad (-1: none) wrong
+(defun build-wrong (n: i64 bad: i64) -> (Vec i64)
+  (loop ((i 0) (v (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj v (if (= i bad) (+ (elem i) 1) (elem i)))) v)))
+
+;; v has n elements and element i is ref's at (i + shift) mod n: shift 0 is the
+;; truth, shift 1 the fault planted in the reference
+(defun agrees (v: (Vec i64) ref: (Array i64) n: i64 shift: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0))
+         (if (< i n)
+             (if (= (nth v i) (array-get ref (rem (+ i shift) n))) (recur (+ i 1)) false)
+             true))))
+
+;; v grown by conj to n elements
+(defun extend (v: (Vec i64) n: i64) -> (Vec i64)
+  (loop ((w v))
+    (if (< (count w) n) (recur (conj w (elem (count w)))) w)))
+
+;; one Vec grown through the counts in turn, a snapshot of it at each
+(defun snapshots (counts: (Vec i64)) -> (Vec (Vec i64))
+  (loop ((j 0) (v (vec-empty)) (acc (vec-empty)))
+    (if (< j (count counts))
+        (let ((grown (extend v (nth counts j))))
+          (recur (+ j 1) grown (conj acc grown)))
+        acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (counts [0 1 31 32 33 64 65 1023 1024 1055 1056 1057 1088 1089 2000])
+        (ref (ref-array 2000))
+        (snaps (snapshots counts)))
+    (do (dotimes (j (count counts))
+          (check c (agrees (build (nth counts j)) ref (nth counts j) 0)))
+        (dotimes (j (count counts))
+          (check c (agrees (nth snaps j) ref (nth counts j) 0)))
+        (check c (= (checks-made c) 30))
+        (check p1 (agrees (build 65) ref 65 1))
+        (check p2 (agrees (build-wrong 1057 1056) ref 1057 0))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

@@ -1,0 +1,64 @@
+;; spec:   stdlib §4.2 (rows dotimes, while, doto), syntax §4.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: dotimes while doto
+;; The three prelude macros of the form that runs today: the binding of
+;; `dotimes` is `(i n)` in parentheses (Clojure's `[i n]` is E3), and the
+;; test of `while` is a bool (an Option is L20).
+;;  * `dotimes` runs its body for 0 .. n-1, evaluates n once, before the
+;;    first round, and runs the body zero times for n <= 0;
+;;  * `while` tests before each round, so a test that is false at the
+;;    start runs nothing, and runs every form of its body in order;
+;;  * `doto` evaluates its first operand once and returns it after the
+;;    steps, each of which gets it as its first argument: a bare symbol is
+;;    the call `(f x)`.
+(ns main (:use tl.check))
+
+(defun bump (c: (Cell i64)) -> unit (set! c (+ @c 1)))
+(defun add-to (c: (Cell i64) n: i64) -> unit (set! c (+ @c n)))
+
+;; a bound that counts how often it is evaluated
+(defun counted (calls: (Cell i64) n: i64) -> i64
+  (do (bump calls) n))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (acc (cell 0))
+        (calls (cell 0)))
+    (do
+      ;; dotimes: 0 .. n-1, the index is the loop's own
+      (dotimes (i 5) (add-to acc i))
+      (check c (= @acc 10))
+      (set! acc 0)
+      (dotimes (i 0) (add-to acc 100))
+      (dotimes (i -3) (add-to acc 100))
+      (check c (= @acc 0))
+      ;; the bound is evaluated once, and not again as i grows
+      (dotimes (i (counted calls 4)) (bump acc))
+      (check c (= @calls 1))
+      (check c (= @acc 4))
+      ;; nested, and a body of several forms
+      (set! acc 0)
+      (dotimes (i 3) (dotimes (j 4) (bump acc) (add-to acc 10)))
+      (check c (= @acc 132))
+      ;; while: test first, body in order
+      (set! acc 0)
+      (while (< @acc 5) (bump acc))
+      (check c (= @acc 5))
+      (set! acc 100)
+      (while (< @acc 5) (bump acc))
+      (check c (= @acc 100))
+      (set! acc 1)
+      (set! calls 0)
+      (while (< @acc 1000) (set! acc (* @acc 2)) (bump calls))
+      (check c (= @acc 1024))
+      (check c (= @calls 10))
+      ;; doto: the value is the operand, the steps are calls on it
+      (check c (= @(doto (cell 1) (set! 7) bump) 8))
+      (check c (= @(doto (cell 0) (add-to 5) (add-to 6) bump bump) 13))
+      (set! calls 0)
+      (check c (= @(doto (cell (counted calls 3)) bump bump) 5))
+      (check c (= @calls 1))
+      (checks-result c))))

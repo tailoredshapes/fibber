@@ -1,0 +1,36 @@
+;; spec:   stdlib §2.1 rules 2 and 3 (a consumer borrows its collection), ownership.md
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: first reduce reduce1 find-first find-map every? run! nth-or
+;; With elements that are objects (strings, Vecs of Vecs) the consumers hand
+;; back or fold the very elements the source holds, and the source is used
+;; again afterwards: nothing is freed twice, nothing is freed early, and
+;; the audit at the end finds every object released once. reduce1 over
+;; strings and over Vecs exercises the cell it keeps for its running value.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (names ["ann" "bob" "cy" "di"])
+        (grid [[1 2] [3] [] [4 5 6]])
+        (log (cell (vec-empty))))
+    (do (check c (match (first names) ((some s) (= s "ann")) (nil false)))
+        (check c (match (find-first (fn (s) (= (str-len s) 2)) names) ((some s) (= s "cy")) (nil false)))
+        (check c (match (find-map (fn (s) (if (= (str-len s) 2) (some (str-concat s "!")) nil)) names) ((some s) (= s "cy!")) (nil false)))
+        (check c (= (reduce (fn (a s) (str-concat a s)) "" names) "annbobcydi"))
+        (check c (match (reduce1 (fn (a s) (str-concat a s)) names) ((some s) (= s "annbobcydi")) (nil false)))
+        (check c (every? (fn (s) (> (str-len s) 1)) names))
+        (check c (= (nth-or names 3 "none") "di"))
+        (check c (= (nth-or names 4 "none") "none"))
+        (run! (fn (s) (set! log (fib.prelude/conj @log (str-len s)))) names)
+        (check c (= (count @log) 4))
+        (check c (= (reduce (fn (n g) (+ n (count g))) 0 grid) 6))
+        (check c (match (find-first (fn (g) (= (count g) 0)) grid) ((some g) (= (count g) 0)) (nil false)))
+        (check c (match (reduce1 (fn (a g) (if (> (count g) (count a)) g a)) grid) ((some g) (= (count g) 3)) (nil false)))
+        (check c (= (count (reduce (fn (a g) (fib.prelude/conj a (count g))) (vec-empty) grid)) 4))
+        (check c (match (first grid) ((some g) (= (nth g 1) 2)) (nil false)))
+        (check c (= (count names) 4))
+        (check c (= (count grid) 4))
+        (checks-result c))))

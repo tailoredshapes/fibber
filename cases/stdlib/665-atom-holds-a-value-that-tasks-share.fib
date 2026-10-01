@@ -1,0 +1,39 @@
+;; spec:   stdlib §4.1 (row atom), §2.11 (Top-level state), syntax §3.11, types §5 (Send)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: atom
+;; (atom v) makes a mutable slot that any task may hold, because what it stores is Send. It holds any
+;; Send value: a number, text, a persistent Vec, a struct, an Option. Four tasks that each add one
+;; a hundred times through swap! lose none of the 400 (swap! is atomic: it retries when another
+;; task got in first), and the atom is released with its payload at the end (the audit is clean).
+;; An atom of something that is not Send is refused (case 678); a def holding an atom is L15 (case 907).
+(ns main (:use fib.core fib.async tl.check))
+
+(defstruct Acct (id: i64 owner: str))
+
+(defun add-hundred (a: (Atom i64)) -> unit
+  (dotimes (i 100) (swap! a (fn (x) (+ x 1)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (n (atom 0))
+        (v (atom [1 2]))
+        (s (atom "ab"))
+        (p (atom (Acct 7 "ann")))
+        (o (atom (some 4))))
+    (let ((ts [(future (add-hundred n)) (future (add-hundred n))
+               (future (add-hundred n)) (future (add-hundred n))]))
+      (do (check c (<= @n 400))
+          (dotimes (i 4) (join (nth ts i)))
+          (check c (= @n 400))
+          (swap! v (fn (x) (conj x 3)))
+          (check c (= (count @v) 3))
+          (swap! s (fn (x) (str-concat x "cd")))
+          (check c (= @s "abcd"))
+          (swap! p (fn (x) (Acct (+ (. x id) 1) (. x owner))))
+          (check c (= (. @p id) 8))
+          (check c (= (. @p owner) "ann"))
+          (check c (match @o ((some x) (= x 4)) (nil false)))
+          (checks-result c)))))

@@ -1,0 +1,46 @@
+;; spec:   stdlib §2.3 (Emptyable), §4.5 (empty)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: empty
+;; (empty c) takes a value and answers the empty collection of its type, the
+;; witness form of Clojure's (empty c): a List gives a List, a VSeq a VSeq and a
+;; Vec a Vec, and each is usable as that type afterwards (conj puts an element
+;; at the front of the first two and at the end of the third). The collection
+;; it was asked of is not touched. Map and Set are L8b's (case 432).
+;; fib.coll is required under an alias, not :used, so that `list` expands where
+;; the method `empty` is not in scope.
+(ns main (:use fib.core fib.seq tl.check) (:require [fib.coll :as coll]))
+
+;; a function of a List and nothing else: empty of a List is one
+(defun nothing-in (l: (List i64)) -> (List i64) (coll/empty l))
+
+;; the elements of c are exactly want
+(defun elements-are (c: c want: (Vec i64)) :where ((Reducible c i64)) -> bool
+  (let ((got (to-vec c)))
+    (and (= (count got) (count want))
+         (loop ((i 0)) (if (< i (count want)) (if (= (nth got i) (nth want i)) (recur (+ i 1)) false) true)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (l (list 1 2))
+        (e (nothing-in (list 1 2)))
+        (vs (coll/conj (rest [1 2 3]) 0))
+        (ev (coll/empty (coll/conj (rest [1 2 3]) 0)))
+        (v [1 2 3]))
+    (do (check c (= (count e) 0))
+        (check c (elements-are (coll/conj e 5) [5]))
+        (check c (elements-are (coll/conj (coll/conj e 5) 6) [6 5]))
+        (check c (= (count (coll/empty e)) 0))
+        (check c (= (count l) 2))
+        (check c (= (count ev) 0))
+        (check c (elements-are ev []))
+        (check c (elements-are (coll/conj ev 4) [4]))
+        (check c (elements-are (coll/conj (coll/conj ev 4) 5) [5 4]))
+        (check c (= (count vs) 3))
+        (check c (= (count (coll/empty (rest [9]))) 0))
+        (check c (= (count (coll/empty v)) 0))
+        (check c (elements-are (coll/conj (coll/conj (coll/empty v) 5) 6) [5 6]))
+        (check c (= (count v) 3))
+        (checks-result c))))

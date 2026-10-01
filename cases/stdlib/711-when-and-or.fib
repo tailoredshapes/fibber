@@ -1,0 +1,77 @@
+;; spec:   stdlib §4.2 (rows when, and, or, when-let), syntax §4.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: when and or when-let
+;; The four conditional macros in the form that runs today: the test of
+;; `when` and the operands of `and` and `or` are bool, a `when` body is
+;; unit, and `when-let` binds the payload of an Option (the forms over an
+;; Option or with a value body are L20: cases 720 to 723).
+;;  * `when` runs its body forms in order when the test is true and
+;;    nothing when it is false, and evaluates the test once;
+;;  * `and` and `or` take any number of operands, evaluate them left to
+;;    right and stop at the first false (and) or true (or), so the
+;;    operands after it are never evaluated; one operand is itself;
+;;  * `when-let` evaluates its Option once, runs the body with the payload
+;;    bound when it is a `some` and nothing for nil; the payload may be a
+;;    heap value.
+(ns main (:use tl.check))
+
+;; evaluates to r and counts the evaluation
+(defun hit (n: (Cell i64) r: bool) -> bool (do (set! n (+ @n 1)) r))
+
+(defun some-when (flag: bool v: i64) -> (Option i64) (if flag (some v) nil))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (n (cell 0))
+        (acc (cell 0)))
+    (do
+      ;; when
+      (when true (set! acc 1) (set! acc (+ @acc 10)))
+      (check c (= @acc 11))
+      (when false (set! acc 99))
+      (check c (= @acc 11))
+      (when (hit n true) (set! acc 5))
+      (when (hit n false) (set! acc 6))
+      (check c (= @acc 5))
+      (check c (= @n 2))
+      ;; and: left to right, stops at the first false
+      (set! n 0)
+      (check c (and true true true))
+      (check c (not (and true false true)))
+      (check c (= (and (hit n true) (hit n true) (hit n false) (hit n true)) false))
+      (check c (= @n 3))
+      (set! n 0)
+      (check c (= (and (hit n false) (hit n true)) false))
+      (check c (= @n 1))
+      (check c (and (> 2 1)))
+      (check c (not (and (> 1 2))))
+      ;; or: left to right, stops at the first true
+      (set! n 0)
+      (check c (or false false true))
+      (check c (not (or false false false)))
+      (check c (= (or (hit n false) (hit n false) (hit n true) (hit n true)) true))
+      (check c (= @n 3))
+      (set! n 0)
+      (check c (= (or (hit n true) (hit n true)) true))
+      (check c (= @n 1))
+      (check c (or (> 2 1)))
+      (check c (not (or (> 1 2))))
+      ;; nested
+      (check c (or (and false true) (and true (or false true))))
+      (check c (not (and (or false false) true)))
+      ;; when-let
+      (set! acc 0)
+      (when-let (x (some-when true 7)) (set! acc x) (set! acc (+ @acc 1)))
+      (check c (= @acc 8))
+      (when-let (x (some-when false 7)) (set! acc 99))
+      (check c (= @acc 8))
+      (set! n 0)
+      (when-let (x (do (set! n (+ @n 1)) (some-when true 4))) (set! acc (+ x x)))
+      (check c (= @n 1))
+      (check c (= @acc 8))
+      (when-let (v (some [10 20 30])) (set! acc (+ (nth v 0) (count v))))
+      (check c (= @acc 13))
+      (checks-result c))))

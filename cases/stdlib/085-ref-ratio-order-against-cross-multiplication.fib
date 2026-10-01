@@ -1,0 +1,39 @@
+;; spec:   stdlib §2.8 ((Ratio t): Ord), tranche 1 plan §9.4 (ref- cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: / compare
+;; The order of two ratios against the sign of n1 d2 - n2 d1 once both
+;; denominators are positive, which is exact for numbers this small: 300 seeded
+;; pairs, with ties made on purpose by drawing from small sets. compare, < and >
+;; must all agree with it. The planted fault is the reference with its sign
+;; swapped, run in a second Checks.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun nonzero (x: i64) -> i64 (if (= x 0) 3 x))
+(defun sign (x: i64) -> i64 (if (< x 0) -1 (if (> x 0) 1 0)))
+(defun magnitude (x: i64) -> i64 (if (< x 0) (- 0 x) x))
+;; the numerator once the denominator d is made positive
+(defun with-positive-d (n: i64 d: i64) -> i64 (if (< d 0) (- 0 n) n))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (g (rng 85)))
+    (do (dotimes (i 300)
+          (let ((n1 (- (rng-below g 13) 6))
+                (d1 (nonzero (- (rng-below g 13) 6)))
+                (n2 (- (rng-below g 13) 6))
+                (d2 (nonzero (- (rng-below g 13) 6))))
+            (let ((a (/ n1 d1))
+                  (b (/ n2 d2))
+                  (e (sign (- (* (with-positive-d n1 d1) (magnitude d2))
+                              (* (with-positive-d n2 d2) (magnitude d1))))))
+              (do (check c (= (compare a b) e))
+                  (check c (= (< a b) (= e -1)))
+                  (check c (= (> a b) (= e 1)))
+                  (check p (= (compare a b) (neg e)))))))
+        (check c (= (checks-made c) 900))
+        (check-detects c p)
+        (checks-result c))))

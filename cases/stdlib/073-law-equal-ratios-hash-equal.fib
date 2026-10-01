@@ -1,0 +1,36 @@
+;; spec:   stdlib §2.7 (= implies equal hashes), §2.8, Appendix A13 div
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: /
+;; Two ways of writing one number, (/ n d) and (/ (* k n) (* k d)) for any k
+;; but 0, are equal and hash equally (the page's [true true true] for < = and
+;; the hash), so a ratio is a Map key and a Map finds it by the other
+;; spelling. 200 seeded triples. The planted fault is the hash of the
+;; unreduced numerator, which differs between the two spellings: run in a
+;; second Checks it must fail somewhere.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun nonzero (x: i64) -> i64 (if (= x 0) 5 x))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (r (rng 73))
+        (m (assoc (map-empty) (/ 3 6) 7)))
+    (do (dotimes (i 200)
+          (let ((n (- (rng-below r 61) 30))
+                (d (nonzero (- (rng-below r 41) 20)))
+                (k (nonzero (- (rng-below r 15) 7))))
+            (let ((x (/ n d))
+                  (y (/ (* k n) (* k d))))
+              (do (check c (= x y))
+                  (check c (= (hash x) (hash y)))
+                  (check p (= (hash (* k n)) (hash n)))))))
+        (check c (= (checks-made c) 400))
+        (check c (= (match (get m (/ 1 2)) ((some v) v) (nil -1)) 7))
+        (check c (= (match (get m (/ -2 -4)) ((some v) v) (nil -1)) 7))
+        (check c (= (match (get m (/ 1 3)) ((some v) v) (nil -1)) -1))
+        (check-detects c p)
+        (checks-result c))))

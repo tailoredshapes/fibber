@@ -1,0 +1,33 @@
+;; spec:   stdlib §2.2 (combinators return closures and so allocate one heap closure per call), §8.1 item 5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 204
+;; roots:  ../../lib support
+;; covers: comp fnil
+;; The cost the page states for `comp` and `fnil`: each call returns a closure
+;; that stores its functions, so each call to the combinator is one heap
+;; object, and nothing else is allocated per call. 100 calls of each make 200
+;; closures; the bound is the count, 204: those 200, the Checks (a struct and
+;; two cells) and the `(some 7)` the fnil closure is called with, an Option of
+;; a scalar, a heap object until C5, made once outside the loop. With 10 calls
+;; of each in place of 100 the count is 24 (`fibc itrace`), so the closures are
+;; the whole of the growth. When a closure type of its own (C1) lets the
+;; compiler build these on the stack the count drops and this bound still
+;; holds; lower it then (the bound is not a promise of the design).
+(ns main (:use fib.core tl.check))
+
+(defun bump (x: i64) -> i64 (+ x 1))
+(defun twice (x: i64) -> i64 (* x 2))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (total (cell 0))
+        (seven (some 7)))
+    (do
+      (dotimes (i 100) (set! total (+ @total ((comp bump twice) i))))
+      (check c (= @total 10000))
+      (set! total 0)
+      (dotimes (i 100) (set! total (+ @total ((fnil bump 5) seven))))
+      (check c (= @total 800))
+      (checks-result c))))

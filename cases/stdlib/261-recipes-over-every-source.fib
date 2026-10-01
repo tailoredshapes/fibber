@@ -1,0 +1,55 @@
+;; spec:   stdlib §2.1 rule 1 (every source feeds the adaptors), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter take drop take-while mapcat concat
+;; A recipe takes any Reducible as its source, and so does each lazy
+;; adaptor: a Vec, an Option, a List, a VSeq (a seq of a Vec, with a consed
+;; front), an LSeq and a user type, which joins with one impl, here a tree
+;; walked in order. Each source runs through the same two stages as a recipe
+;; chain and as a lazy chain, and they give one answer. (Range, Array, Map
+;; and Set are sources too, with instances that fib.seq.sources gives them
+;; (L5a): they are case 263.)
+(ns main (:use fib.core fib.seq tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+;; the elements above 1, doubled, in order, as a recipe chain and as a lazy chain
+(defun by-recipes (c: c) :where ((Reducible c i64)) -> i64
+  (digits (Mapped (Filtered c (fn (x: i64) (> x 1))) (fn (x: i64) (* x 2)))))
+(defun by-seqs (c: c) :where ((Reducible c i64)) -> i64
+  (digits (map (fn (x: i64) (* x 2)) (filter (fn (x: i64) (> x 1)) c))))
+
+(defun both (c: c want: i64) :where ((Reducible c i64)) -> bool
+  (and (= (by-recipes c) want) (= (by-seqs c) want)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (tree (Node (Node Leaf 1 Leaf) 2 (Node Leaf 3 Leaf))))
+    (do (check c (both [1 2 3] 46))
+        (check c (both (some 3) 6))
+        (check c (both (some 1) 0))
+        (check c (both (list 1 2 3) 46))
+        (check c (both (vseq-of [1 2 3]) 46))
+        (check c (both (VSeq (list 1 2) [3] 0) 46))
+        (check c (both (to-lseq [1 2 3]) 46))
+        (check c (both (lcons 1 (lcons 2 (lcons 3 (lazy-node (fn () LNil))))) 46))
+        (check c (both tree 46))
+        (check c (both [] 0))
+        ;; the other four adaptors over a source that is not a Vec
+        (check c (= (digits (take 2 tree)) 12))
+        (check c (= (digits (drop 1 tree)) 23))
+        (check c (= (digits (take-while (fn (x: i64) (< x 3)) tree)) 12))
+        (check c (= (digits (mapcat (fn (x: i64) (list x x)) tree)) 112233))
+        (check c (= (digits (concat tree (some 4))) 1234))
+        (checks-result c))))

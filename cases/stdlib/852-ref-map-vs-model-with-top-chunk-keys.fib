@@ -1,0 +1,50 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Map), types §2.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; The prelude's Map is a hash array mapped trie: a leaf per key, a bucket for
+;; keys whose hashes are equal, a bitmap node five bits of the hash at a time.
+;; Here the key is a struct whose hash is `id << 59`: the keys differ only in
+;; the top chunks, so every path is thirteen levels deep, and the hashes of ids
+;; 16 to 29 are negative (a chunk is taken with a logical shift).
+;; 20 seeded sequences (seeds 852000 to 852019) of 48 operations over 30 keys
+;; run on a Map and on a model, an array indexed by key id (tl.model says why
+;; it is not the page's association Vec). An operation is a put of a random
+;; value or a delete, the share of puts falling from 85 to 50 to 4 in a hundred
+;; over a sequence, so the map fills, mixes and drains; a put is aimed at a key
+;; the map has not got every other time and a delete at one it has five times
+;; in six, so the map grows, overwrites, drains and, now and then, deletes what
+;; is not there. After every operation the counts agree, `get` and `contains?`
+;; of each of the 30 keys agree, and a full `for-each` visits the model's keys
+;; once each with the model's values; a snapshot every sixth operation is
+;; checked again at the end, against its own model, after every map built on
+;; it. The totals the sequences reached (puts of a key already there, deletes
+;; of a key that was there, deletes of one that was not, times the map went
+;; from some entries to none, the most entries it held) are asserted too, so a
+;; generator that stopped reaching an edge fails the case. The faults planted
+;; are in the model (tl.model): one that keeps a key's old value when it is put
+;; again, one that deletes the wrong key; each must make some sequence of four
+;; fail.
+(ns main (:use tl.check tl.model))
+
+;; n sequences, one check each: bit i of the result is the sequence of seed base + i
+(defun run-many (c: Checks cv: Cover base: i64 n: i64 fault: i64) -> unit
+  (dotimes (i n) (check c (= 0 (run-map-seq (+ base i) 30 48 mk-kw id-kw fault cv)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (cv (cover)))
+    (do (run-many c cv 852000 20 0)
+        (run-many p1 (cover) 852000 4 1)
+        (run-many p2 (cover) 852000 4 2)
+        (check c (>= @(. cv overwrites) 30))
+        (check c (>= @(. cv deletes) 200))
+        (check c (>= @(. cv absent) 80))
+        (check c (>= @(. cv emptied) 10))
+        (check c (>= @(. cv peak) 15))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

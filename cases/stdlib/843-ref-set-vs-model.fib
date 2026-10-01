@@ -1,0 +1,51 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Set), types §2.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; The prelude's Set is a struct around a Map from the element to true: conj puts,
+;; disj deletes, set-contains? looks up, count counts and for-each walks the
+;; elements. It is run through the same seeded sequences as the Map (tl.model:
+;; puts and deletes aimed so the set fills, drains and refills, a snapshot every
+;; sixth operation) against the same kind of model, an array indexed by the id
+;; of the element, with the same checks after every operation: the counts agree,
+;; set-contains? agrees for every element of the universe, a full for-each visits
+;; each element of the model once. Six key types with the same shapes as
+;; 842 to 855 (colliding buckets, buckets that share a prefix, a chain, top-chunk
+;; hashes, integers, strings), six sequences of 48 operations over 30 keys of
+;; each (40 keys for the chain, and five sequences of 72 operations over 60 keys
+;; for the integers), seeds 843000 up.
+;; The totals reached are asserted, so a generator that stopped deleting what was
+;; there, or conj'ing what was there, fails the case. The faults planted are in the
+;; model: one that forgets the even elements, one that deletes the wrong element;
+;; each must make some sequence of four fail.
+(ns main (:use tl.check tl.model))
+
+;; n sequences of each of the six key types, one check each
+(defun run-all (c: Checks cv: Cover n: i64 fault: i64) -> unit
+  (do (dotimes (i n) (check c (= 0 (run-set-seq (+ 843000 i) 30 48 mk-kc id-kc fault cv))))
+      (dotimes (i n) (check c (= 0 (run-set-seq (+ 843100 i) 30 48 mk-kh id-kh fault cv))))
+      (dotimes (i n) (check c (= 0 (run-set-seq (+ 843200 i) 40 48 mk-kd id-kd fault cv))))
+      (dotimes (i n) (check c (= 0 (run-set-seq (+ 843300 i) 30 48 mk-kw id-kw fault cv))))
+      (dotimes (i n) (check c (= 0 (run-set-seq (+ 843400 i) 30 48 mk-str id-str fault cv))))
+      (dotimes (i (- n 1)) (check c (= 0 (run-set-seq (+ 843500 i) 60 72 mk-int id-int fault cv))))))
+
+(defun run-planted (c: Checks fault: i64) -> unit
+  (dotimes (i 4) (check c (= 0 (run-set-seq (+ 843000 i) 30 48 mk-kc id-kc fault (cover))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (cv (cover)))
+    (do (run-all c cv 6 0)
+        (run-planted p1 1)
+        (run-planted p2 2)
+        (check c (>= @(. cv overwrites) 20))
+        (check c (>= @(. cv deletes) 200))
+        (check c (>= @(. cv absent) 80))
+        (check c (>= @(. cv emptied) 10))
+        (check c (>= @(. cv peak) 15))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

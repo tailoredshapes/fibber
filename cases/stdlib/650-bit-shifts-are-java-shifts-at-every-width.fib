@@ -1,0 +1,69 @@
+;; spec:   stdlib §4.1 (rows bit-shift-left bit-shift-right unsigned-bit-shift-right), §3 N12, types §2.12
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: bit-shift-left bit-shift-right unsigned-bit-shift-right
+;; Clojure's three shifts are Java's: left is shl, right is the arithmetic shift (sar, the sign
+;; fills) and unsigned-bit-shift-right the logical one (shr, zeros fill), and the distance is
+;; taken modulo the width of the operand, a negative one counting from the top. So (1 << 64) is 1,
+;; (1 << -1) is the minimum, and the two right shifts differ exactly on a negative value. The
+;; width is the operand's (no promotion): a byte shifts at eight bits. Each is an ordinary function, so
+;; it can be passed as a value.
+(ns main (:use fib.core tl.check))
+
+(defun on-pair (f: (fn (i64 i64) i64) a: i64 b: i64) -> i64 (f a b))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do ;; left, i64
+        (check c (= (bit-shift-left 1 62) 4611686018427387904))
+        (check c (= (bit-shift-left 1 63) -9223372036854775808))
+        (check c (= (bit-shift-left 1 64) 1))
+        (check c (= (bit-shift-left 1 65) 2))
+        (check c (= (bit-shift-left 1 -1) -9223372036854775808))
+        (check c (= (bit-shift-left 3 -1) -9223372036854775808))
+        (check c (= (bit-shift-left 7 -63) 14))
+        (check c (= (bit-shift-left 1 -64) 1))
+        (check c (= (bit-shift-left -1 1) -2))
+        (check c (= (bit-shift-left 0 40) 0))
+        (check c (= (bit-shift-left 5 0) 5))
+        ;; right, arithmetic: the sign fills
+        (check c (= (bit-shift-right -8 1) -4))
+        (check c (= (bit-shift-right -9 1) -5))
+        (check c (= (bit-shift-right -1 63) -1))
+        (check c (= (bit-shift-right 8 1) 4))
+        (check c (= (bit-shift-right -9223372036854775808 63) -1))
+        (check c (= (bit-shift-right 9223372036854775807 62) 1))
+        (check c (= (bit-shift-right 5 64) 5))
+        (check c (= (bit-shift-right 5 -63) 2))
+        ;; right, logical: zeros fill
+        (check c (= (unsigned-bit-shift-right -1 1) 9223372036854775807))
+        (check c (= (unsigned-bit-shift-right -1 63) 1))
+        (check c (= (unsigned-bit-shift-right -8 60) 15))
+        (check c (= (unsigned-bit-shift-right -16 2) 4611686018427387900))
+        (check c (= (unsigned-bit-shift-right -9223372036854775808 63) 1))
+        (check c (= (unsigned-bit-shift-right 8 1) 4))
+        (check c (= (unsigned-bit-shift-right -1 64) -1))
+        ;; they differ on a negative value and agree on a positive one
+        (check c (!= (bit-shift-right -16 2) (unsigned-bit-shift-right -16 2)))
+        (check c (= (bit-shift-right 4096 3) (unsigned-bit-shift-right 4096 3)))
+        ;; i32: the modulus is 32
+        (check c (= (bit-shift-left 1i32 31i32) -2147483648i32))
+        (check c (= (bit-shift-left 1i32 32i32) 1i32))
+        (check c (= (bit-shift-right -8i32 1i32) -4i32))
+        (check c (= (unsigned-bit-shift-right -1i32 28i32) 15i32))
+        (check c (= (unsigned-bit-shift-right -1i32 1i32) 2147483647i32))
+        ;; i16 and i8: a byte shifts at eight bits
+        (check c (= (bit-shift-left 1i16 15i16) -32768i16))
+        (check c (= (bit-shift-left 1i8 7i8) -128i8))
+        (check c (= (bit-shift-left 1i8 8i8) 1i8))
+        (check c (= (bit-shift-right -128i8 1i8) -64i8))
+        (check c (= (bit-shift-right -128i8 7i8) -1i8))
+        (check c (= (unsigned-bit-shift-right -1i8 1i8) 127i8))
+        (check c (= (unsigned-bit-shift-right -128i8 7i8) 1i8))
+        ;; as values
+        (check c (= (on-pair bit-shift-left 1 4) 16))
+        (check c (= (on-pair bit-shift-right -64 2) -16))
+        (check c (= (on-pair unsigned-bit-shift-right 64 2) 16))
+        (checks-result c))))

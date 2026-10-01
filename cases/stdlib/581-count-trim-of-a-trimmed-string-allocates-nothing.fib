@@ -1,0 +1,30 @@
+;; spec:   stdlib §4.7 (rows clojure.string/trim triml trimr blank?), §2.9, plan §6 L10b (method.md rule 3, allocs)
+;; expect: accept
+;; result: 4000
+;; audit:  clean
+;; allocs: <= 1
+;; roots:  ../../lib support
+;; covers: clojure.string/trim clojure.string/triml clojure.string/trimr clojure.string/blank?
+;; The trim family walks bytes with `str-byte-at` and cuts once at the end, and a string that has
+;; nothing to cut is returned as it is, so a call on trimmed text allocates no heap object, not a
+;; copy and not an array of its bytes (`str-bytes` makes one per call). The 1000 rounds below make
+;; four calls each, `trim`, `triml`, `trimr` and `blank?`, on a string that is already trimmed and
+;; not blank; the one object is the string itself, built at run time by `str-concat` (a literal is
+;; immortal and not counted, case 213). Calls that cut do allocate the piece they return
+;; (`str-slice`'s one string); that is not measured here. The result is the number of calls that
+;; gave the expected answer, 4 * 1000: a family that cut the wrong thing, or none, does not give it.
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+(defun rounds (s: str n: i64) -> i64
+  (loop ((i 0) (ok 0))
+    (if (< i n)
+        (recur (+ i 1)
+               (+ ok (+ (if (= (str/trim s) s) 1 0)
+                     (+ (if (= (str/triml s) s) 1 0)
+                        (+ (if (= (str/trimr s) s) 1 0)
+                           (if (str/blank? s) 0 1))))))
+        ok)))
+
+(defun main () -> i64
+  (let ((s (str-concat "tr" "immed é")))
+    (rounds s 1000)))

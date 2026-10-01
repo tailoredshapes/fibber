@@ -1,0 +1,56 @@
+;; fib.string.trim: `str/trim`, `str/triml`, `str/trimr` and `str/blank?` (owner L10b; stdlib §4.7, §2.9;
+;; tranche 1 plan §6 L10b, C-22). Replaces nothing in the prelude.
+;; Decided here, where the page is silent (plan C-22, flagged for the owner): the page's notes say
+;; "Unicode whitespace" for `trim` and its §2.9 says Java's `Character.isWhitespace`; these four
+;; follow Clojure, whose `trim`, `triml`, `trimr` and `blank?` call `Character/isWhitespace`, so the
+;; no-break spaces U+00A0, U+2007 and U+202F are NOT whitespace here. `char/whitespace?` (module
+;; `fib.char`) is the Unicode `White_Space` property and does count them.
+;; Java's `isWhitespace` is true for: U+0009 to U+000D, U+001C to U+001F, U+0020, U+1680,
+;; U+2000 to U+2006, U+2008 to U+200A, U+2028, U+2029, U+205F, U+3000.
+;; The functions work on bytes and slice once at the end; a string with nothing to trim is returned
+;; as it is, not copied.
+(ns fib.string.trim (:use fib.string.utf8))
+
+(defun within :private (c: i32 lo: i32 hi: i32) -> bool
+  (if (>= c lo) (<= c hi) false))
+
+;; Java's Character.isWhitespace over a scalar value
+(defun java-whitespace? :private (c: i32) -> bool
+  (or (within c 9i32 13i32)
+  (or (within c 28i32 32i32)
+  (or (= c 5760i32)
+  (or (within c 8192i32 8198i32)
+  (or (within c 8200i32 8202i32)
+  (or (within c 8232i32 8233i32)
+  (or (= c 8287i32) (= c 12288i32)))))))))
+
+;; the offset of the first character at or after byte i that is not whitespace, or the length
+(defun skip-left :private (s: str i: i64) -> i64
+  (let ((len (str-len s)))
+    (loop ((j i))
+      (if (< j len)
+          (if (java-whitespace? (code-at s j)) (recur (+ j (width-of (byte-at s j)))) j)
+          len))))
+
+;; the offset just after the last character below byte end that is not whitespace, or lo
+(defun skip-right :private (s: str lo: i64 end: i64) -> i64
+  (loop ((j end))
+    (if (> j lo)
+        (let ((k (start-before s j)))
+          (if (java-whitespace? (code-at s k)) (recur k) j))
+        lo)))
+
+(defun slice-of :private (s: str lo: i64 hi: i64) -> str
+  (if (= lo 0)
+      (if (= hi (str-len s)) s (str-slice s lo hi))
+      (str-slice s lo hi)))
+
+(defun blank? (s: str) -> bool (= (skip-left s 0) (str-len s)))
+
+(defun triml (s: str) -> str (slice-of s (skip-left s 0) (str-len s)))
+
+(defun trimr (s: str) -> str (slice-of s 0 (skip-right s 0 (str-len s))))
+
+(defun trim (s: str) -> str
+  (let ((lo (skip-left s 0)))
+    (slice-of s lo (skip-right s lo (str-len s)))))

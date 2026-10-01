@@ -1,0 +1,27 @@
+;; spec:   stdlib §4.3 (row Result), syntax §5 (modules), tranche 1 plan §2 C-18 (the prelude's Result is one type for every module)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../../lib ../support
+;; covers: Result
+;; The prelude's Result is one type for all modules: parse.digits returns a (Result i64 str) built in
+;; module parse and main matches it with the same variants, passes it back to parse.double, and
+;; compares two of them with `=`. A second module (parse.more, a nested name) returns a Result whose
+;; Err payload is a Pair, so a prelude type inside a prelude type crosses the boundary too.
+(ns main (:require [parse :as p] [parse.more :as more]) (:use tl.check))
+
+(defun total (r: (Result i64 str)) -> i64
+  (match r ((Ok v) v) ((Err _) -1)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (total (p/digits "407")) 407))
+        (check c (= (total (p/digits "4x7")) -1))
+        (check c (match (p/digits "") ((Err e) (= e "no digits")) ((Ok _) false)))
+        (check c (match (p/digits "4x7") ((Err e) (= e "bad digit x")) ((Ok _) false)))
+        (check c (= (p/digits "12") (Ok 12)))
+        (check c (= (total (p/double (p/digits "21"))) 42))
+        (check c (= (p/double (p/digits "2z")) (p/digits "2z")))
+        (check c (match (more/divide 7 0) ((Err pr) (and (= (. pr fst) 7) (= (. pr snd) "division by zero"))) ((Ok _) false)))
+        (check c (match (more/divide 7 2) ((Ok q) (= q 3)) ((Err _) false)))
+        (checks-result c))))

@@ -1,0 +1,71 @@
+;; spec:   stdlib §2.1 rule 1 (an Array is a source), §2.3 (size, nth and last of an Array), §8.1 item 2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; 200 seeded arrays of 0 to 40 elements, built element by element from a (Vec i64) the case also keeps, against
+;; that Vec: count, to-vec, nth at a random index, last, and an early exit after k visits for a random k (the visits
+;; made, whether the walk ran to the end, and the sum of the elements seen). The last two checks plant a fault in
+;; the reference (a last element that is the one before, a sum that skips the first element seen) and require
+;; the same sweep to fail.
+(ns main (:use fib.core fib.seq tl.check tl.rng))
+
+(defun array-of (v: (Vec i64)) -> (Array i64)
+  (let ((a (cell (array (fib.prelude/count v) 0))))
+    (do (dotimes (i (fib.prelude/count v)) (array-set! &a i (fib.prelude/nth v i)))
+        @a)))
+
+(defun same (v: (Vec i64) xs: (Vec i64)) -> bool
+  (and (= (fib.prelude/count v) (fib.prelude/count xs))
+       (loop ((i 0))
+         (if (< i (fib.prelude/count v))
+             (if (= (fib.prelude/nth v i) (fib.prelude/nth xs i)) (recur (+ i 1)) false)
+             true))))
+
+;; the sum of the first k elements of v; `fault` 2 skips the first
+(defun prefix-sum (v: (Vec i64) k: i64 fault: i64) -> i64
+  (loop ((i (if (= fault 2) 1 0)) (acc 0))
+    (if (if (< i k) (< i (fib.prelude/count v)) false) (recur (+ i 1) (+ acc (fib.prelude/nth v i))) acc)))
+
+;; the early exit after k visits (the k-th says stop): (visits, ran to the end, sum seen)
+(defun walk (a: (Array i64) k: i64) -> (Triple i64 bool i64)
+  (let ((visits (cell 0)) (sum (cell 0)))
+    (let ((done (each-while a (fn (x) (do (set! visits (+ @visits 1)) (set! sum (+ @sum x)) (< @visits k))))))
+      (Triple @visits done @sum))))
+
+(defun agrees (v: (Vec i64) k: i64 i: i64 fault: i64) -> bool
+  (let ((a (array-of v))
+        (n (fib.prelude/count v)))
+    (let ((w (walk a k)))
+      (and (= (count a) n)
+           (and (same (to-vec a) v)
+                (and (if (> n 0) (= (nth a i) (fib.prelude/nth v i)) true)
+                     (and (match (last a)
+                            ((some x) (and (> n 0) (= x (fib.prelude/nth v (if (= fault 1) (if (> n 1) (- n 2) 0) (- n 1))))))
+                            (nil (= n 0)))
+                          (if (> n 0)
+                              (and (= (. w fst) (if (< k n) k n))
+                                   (and (= (. w snd) (> k n))
+                                        (= (. w thd) (prefix-sum v k fault))))
+                              (and (= (. w fst) 0) (. w snd))))))))))
+
+(defun sweep (c: Checks fault: i64) -> unit
+  (let ((r (rng 27182818)))
+    (dotimes (j 200)
+      (let ((n (rng-below r 41)))
+        (let ((v (rng-vec r n 100))
+              (k (+ 1 (rng-below r 42)))
+              (i (if (> n 0) (rng-below r n) 0)))
+          (check c (agrees v k i fault)))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (last-before (checks))
+        (skipped (checks)))
+    (do (sweep c 0)
+        (check c (= (checks-made c) 200))
+        (sweep last-before 1)
+        (sweep skipped 2)
+        (check-detects c last-before)
+        (check-detects c skipped)
+        (checks-result c))))

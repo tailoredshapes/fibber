@@ -1,0 +1,66 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Vec), types §2.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; The trie has a third level once its root branch holds 32 branches of 32 leaves
+;; and the tail is full: the first conj after 32800 elements makes a new root over
+;; the old one (shift 10 to 15), the edge case 840 stops short of at 2000 elements.
+;; One Vec is grown from empty to 33000 elements, a snapshot kept at each count
+;; around the edge (32767 32768 32769, the full tail 32799 32800, the overflow
+;; 32801, then 32831 32832 32833 and 33000). Element i is 7919 i + 13 and needs no
+;; array: the reference is the formula. At the end every snapshot is read at every
+;; 31st index from 3 (so every 32-element leaf is touched at least once), at its
+;; first 40 and its last 70 indexes, and the 32801 and the 33000 snapshots are
+;; read in full: the growth after a snapshot must not have moved any of it.
+;; Decided here: the sampling, because a full read of every snapshot is 270,000
+;; reads and the interpreter's memory grows with the work done. A sample finds a
+;; leaf or a path that was moved, and the two full reads find a single element
+;; that is wrong inside a leaf. The faults planted: a snapshot read against the
+;; wrong formula, and a Vec with the 32801st element wrong.
+(ns main (:use tl.check))
+
+(defun elem (i: i64) -> i64 (+ (* i 7919) 13))
+
+;; v grown by conj to n elements; element at bad (-1: none) wrong
+(defun extend (v: (Vec i64) n: i64 bad: i64) -> (Vec i64)
+  (loop ((w v))
+    (if (< (count w) n)
+        (recur (conj w (if (= (count w) bad) (+ (elem (count w)) 1) (elem (count w)))))
+        w)))
+
+(defun at-ok (v: (Vec i64) i: i64 skew: i64) -> bool (= (nth v i) (elem (+ i skew))))
+
+;; indexes from 3 in steps of 31, the first 40 and the last 70
+(defun sampled-ok (v: (Vec i64) skew: i64) -> bool
+  (let ((n (count v)))
+    (and (loop ((i 3)) (if (< i n) (if (at-ok v i skew) (recur (+ i 31)) false) true))
+         (and (loop ((i 0)) (if (< i (if (< n 40) n 40)) (if (at-ok v i skew) (recur (+ i 1)) false) true))
+              (loop ((i (if (< n 70) 0 (- n 70)))) (if (< i n) (if (at-ok v i skew) (recur (+ i 1)) false) true))))))
+
+(defun full-ok (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (at-ok v i 0) (recur (+ i 1)) false) true))))
+
+(defun snapshots (counts: (Vec i64) bad: i64) -> (Vec (Vec i64))
+  (loop ((j 0) (v (vec-empty)) (acc (vec-empty)))
+    (if (< j (count counts))
+        (let ((grown (extend v (nth counts j) bad)))
+          (recur (+ j 1) grown (conj acc grown)))
+        acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (counts [32767 32768 32769 32799 32800 32801 32831 32832 32833 33000])
+        (snaps (snapshots counts -1)))
+    (do (dotimes (j (count counts))
+          (check c (and (= (count (nth snaps j)) (nth counts j)) (sampled-ok (nth snaps j) 0))))
+        (check c (full-ok (nth snaps 9) 33000))
+        (check c (full-ok (nth snaps 5) 32801))
+        (check p1 (sampled-ok (nth snaps 5) 1))
+        (check p2 (sampled-ok (nth (snapshots [32801 33000] 32800) 0) 0))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

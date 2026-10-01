@@ -1,0 +1,83 @@
+;; spec:   stdlib §4.4 (row range-by), §2.8 (overflow traps at every width), tranche 1 plan §6 L5a
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: range-by
+;; A range walks by repeated addition and `+` traps on overflow, so a walk that added the step and then compared
+;; would trap at the last element of any range that ends within a step of the type's largest value. The walk
+;; and the closed forms of count and nth stop before the add that would pass the end, at every width: the
+;; ranges below end at, or start at, the extremes of i64, i32, i16 and i8, or span more than the type can
+;; subtract (`end - start` overflows), and each is walked, counted and indexed without a trap. A count above
+;; the largest i64 is the largest i64 (the last checks, which call the closed form itself, range-len, because a
+;; count of such a range through `count` would have no walk to compare with and, if it were one, no end).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun same (v: (Vec i64) xs: (Vec i64)) -> bool
+  (and (= (fib.prelude/count v) (fib.prelude/count xs))
+       (loop ((i 0))
+         (if (< i (fib.prelude/count v))
+             (if (= (fib.prelude/nth v i) (fib.prelude/nth xs i)) (recur (+ i 1)) false)
+             true))))
+
+;; the elements of a narrower range, widened to i64
+(defun widened (v: (Vec t)) :where ((Bits t)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (fib.prelude/count v)) (recur (+ i 1) (fib.prelude/conj acc (sext i64 (fib.prelude/nth v i)))) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (top 9223372036854775807)
+        (bottom -9223372036854775808)
+        (half 4611686018427387904))
+    (do ;; ends within a step of the largest i64
+        (check c (same (to-vec (range-by 9223372036854775800 top 3)) [9223372036854775800 9223372036854775803 9223372036854775806]))
+        (check c (= (count (range-by 9223372036854775800 top 3)) 3))
+        (check c (= (nth (range-by 9223372036854775800 top 3) 2) 9223372036854775806))
+        (check c (same (to-vec (range-by 9223372036854775806 top 5)) [9223372036854775806]))
+        (check c (same (to-vec (range-by 0 top top)) [0]))
+        (check c (same (to-vec (range-by -1 top top)) [-1 9223372036854775806]))
+        ;; starts at, or ends within a step of, the smallest
+        (check c (same (to-vec (range-by -9223372036854775800 bottom -3)) [-9223372036854775800 -9223372036854775803 -9223372036854775806]))
+        (check c (= (count (range-by -9223372036854775800 bottom -3)) 3))
+        (check c (same (to-vec (range-by 5 bottom bottom)) [5 -9223372036854775803]))
+        (check c (same (to-vec (range-by -1 bottom bottom)) [-1]))
+        (check c (= (count (range-by 5 bottom bottom)) 2))
+        (check c (same (to-vec (range-by 5 -9223372036854775803 bottom)) [5]))
+        (check c (same (to-vec (range-by 6 -9223372036854775803 bottom)) [6 -9223372036854775802]))
+        (check c (= (count (range-by 5 -9223372036854775803 bottom)) 1))
+        (check c (= (count (range-by 6 -9223372036854775803 bottom)) 2))
+        (check c (= (nth (range-by 5 bottom bottom) 1) -9223372036854775803))
+        ;; end - start does not fit in an i64
+        (check c (same (to-vec (range-by bottom top half)) [-9223372036854775808 -4611686018427387904 0 4611686018427387904]))
+        (check c (= (count (range-by bottom top half)) 4))
+        (check c (= (nth (range-by bottom top half) 3) half))
+        (check c (same (to-vec (range-by top bottom (- 0 half))) [9223372036854775807 4611686018427387903 -1 -4611686018427387905]))
+        (check c (= (count (range-by top bottom (- 0 half))) 4))
+        (check c (= (nth (range-by top bottom (- 0 half)) 3) -4611686018427387905))
+        (check c (= (count (range-by -5 top top)) 2))
+        (check c (= (nth (range-by -5 top top) 1) 9223372036854775802))
+        ;; the same at the narrower widths
+        (check c (same (widened (to-vec (range-by 120i8 127i8 3i8))) [120 123 126]))
+        (check c (= (count (range-by 120i8 127i8 3i8)) 3))
+        (check c (same (widened (to-vec (range-by -128i8 127i8 100i8))) [-128 -28 72]))
+        (check c (= (count (range-by -128i8 127i8 100i8)) 3))
+        (check c (same (widened (to-vec (range-by -125i8 -128i8 -2i8))) [-125 -127]))
+        (check c (= (nth (range-by -128i8 127i8 100i8) 2) 72i8))
+        (check c (same (widened (to-vec (range-by 32760i16 32767i16 3i16))) [32760 32763 32766]))
+        (check c (same (widened (to-vec (range-by -32768i16 32767i16 20000i16))) [-32768 -12768 7232 27232]))
+        (check c (= (count (range-by -32768i16 32767i16 20000i16)) 4))
+        (check c (same (widened (to-vec (range-by 2147483640i32 2147483647i32 3i32))) [2147483640 2147483643 2147483646]))
+        (check c (same (widened (to-vec (range-by -2147483648i32 2147483647i32 1500000000i32))) [-2147483648 -647483648 852516352]))
+        (check c (= (count (range-by -2147483648i32 2147483647i32 65536i32)) 65536))
+        (check c (= (nth (range-by -2147483648i32 2147483647i32 65536i32) 65535) 2147418112i32))
+        ;; the closed form of the count, called by itself, at counts no walk could reach: 2^32 - 1 elements at i32,
+        ;; and above the largest i64, where the count is the largest i64 (the range-len of the start)
+        (check c (= (range-len -2147483648i32 2147483647i32 1i32) 4294967295))
+        (check c (= (range-len bottom top 1) top))
+        (check c (= (range-len bottom 0 1) top))
+        (check c (= (range-len 0 top 1) top))
+        (check c (= (range-len top bottom -1) top))
+        (check c (= (range-len 0 top 2) 4611686018427387904))
+        (check c (= (range-len bottom top 3) 6148914691236517205))
+        (checks-result c))))

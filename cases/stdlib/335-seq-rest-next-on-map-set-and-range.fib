@@ -1,0 +1,66 @@
+;; spec:   stdlib §2.1 rule 8 (Map and Set have the LSeq of their elements, a Range is its own seq), §4.4 (rows seq, rest, next)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: seq rest next
+;; The recursion idiom of case 328 over the collections that need the
+;; sources of fib.seq.sources: a Map (its seq yields Pairs), a Set (its
+;; keys), and a Range of integers, descending integers, floats and one that
+;; ends at the largest i64, whose `rest` must never add past the end. The
+;; Range is its own seq type: the rest of the last element is the empty
+;; Range, a Range with step 0 is its own rest. The order of a Map or a Set
+;; is the hash's, so the case sums what the walk yields and does not read the order.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun len (xs: c) :where ((Seqable c s) (Seqable s s)) -> i64
+  (match (seq xs) (nil 0) ((some s) (+ 1 (len (rest s))))))
+
+(defun len-next (xs: c) :where ((Seqable c s) (Seqable s s)) -> i64
+  (match (next xs) (nil -1) ((some s) (len s))))
+
+;; the sum of the first components of a Map's seq, taken by the same recursion
+(defun fst-sum (s: (LSeq (Pair i64 i64))) -> i64
+  (match (seq s) (nil 0) ((some t) (+ (. (nth t 0) fst) (fst-sum (rest t))))))
+
+(defun key-sum (s: (LSeq i64)) -> i64
+  (match (seq s) (nil 0) ((some t) (+ (nth t 0) (key-sum (rest t))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m {1 10 2 20 3 30})
+        (st (fib.prelude/conj (fib.prelude/conj (fib.prelude/conj (set-empty) 5) 6) 7))
+        (top (range-by 9223372036854775800 9223372036854775807 3))
+        (none: (Map i64 i64) (map-empty))
+        (noset: (Set i64) (set-empty)))
+    (do (check c (= (len m) 3))
+        (check c (= (len st) 3))
+        (check c (= (len none) 0))
+        (check c (= (len noset) 0))
+        (check c (= (len (rest m)) 2))
+        (check c (= (len (rest st)) 2))
+        (check c (= (len-next m) 2))
+        (check c (= (len-next none) -1))
+        (check c (= (len-next st) 2))
+        (check c (match (seq m) (nil false) ((some s) (= (fst-sum s) 6))))
+        (check c (match (seq st) (nil false) ((some s) (= (key-sum s) 18))))
+        (check c (match (seq none) (nil true) ((some _) false)))
+        (check c (= (len (range 5)) 5))
+        (check c (= (len (rest (range 5))) 4))
+        (check c (= (len (range 0)) 0))
+        (check c (= (len (range-by 10 0 -3)) 4))
+        (check c (= (len (range-by 0.0 1.0 0.25)) 4))
+        (check c (= (len (range-by 5 5 1)) 0))
+        (check c (= (len top) 3))
+        (check c (= (len (rest (rest top))) 1))
+        (check c (= (len (rest (rest (rest top)))) 0))
+        (check c (= (len-next (range 1)) -1))
+        (check c (= (len-next (range 2)) 1))
+        (check c (match (seq (range-by 10 0 -3)) (nil false) ((some s) (= (nth s 0) 10))))
+        (check c (match (seq (rest (range-by 10 0 -3))) (nil false) ((some s) (= (nth s 0) 7))))
+        (check c (match (seq (rest (rest (rest (range-by 10 0 -3))))) (nil false) ((some s) (= (nth s 0) 1))))
+        (check c (match (seq (rest (rest (rest (rest (range-by 10 0 -3)))))) (nil true) ((some _) false)))
+        (check c (match (seq (rest (rest (range-by 2 9 0)))) (nil false) ((some s) (= (nth s 0) 2))))
+        (check c (match (seq (range-by 4 4 0)) (nil true) ((some _) false)))
+        (check c (match (seq (rest top)) (nil false) ((some s) (= (nth s 0) 9223372036854775803))))
+        (checks-result c))))

@@ -1,0 +1,45 @@
+;; spec:   stdlib §2.2 (a consumer's function is :borrow, a combinator's closure is made once), §8.1 item 5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 7
+;; roots:  ../../lib support
+;; covers: unwrap map-opt and-then comp fnil
+;; Nothing the Option part does costs a heap object per call of a function:
+;;  - map-opt and and-then take their function `:borrow`, so a `fn` literal
+;;    passed to them is a stack object, and an Option of an object is the
+;;    object itself (a nullable pointer), so over strings they and `unwrap`
+;;    allocate nothing, 1000 calls or one;
+;;  - a function that comp or fnil returned is one heap closure, made once,
+;;    and calling it 1000 times allocates nothing (the cost of making it is
+;;    case 110).
+;; The bound is the count, 7: the Checks (a struct and two cells), the comp
+;; closure, the fnil closure, and the `(some 7)` and the `nil` handed to g, each
+;; an Option of a scalar, which is a heap object until C5, so each is made once,
+;; outside the loop. It is the same count for 10 iterations as for 1000, which
+;; is the claim (`fibc itrace` on the case with 10 in place of 1000: 7 and 7).
+(ns main (:use fib.core tl.check))
+
+(defun bump (x: i64) -> i64 (+ x 1))
+(defun twice (x: i64) -> i64 (* x 2))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (hits (cell 0)))
+    (do
+      (dotimes (i 1000)
+        (let ((o (some "word")))
+          (do (set! hits (+ @hits (str-len (unwrap (map-opt (fn (s) s) o)))))
+              (set! hits (+ @hits (str-len (unwrap (and-then (fn (s) (some s)) o))))))))
+      (check c (= @hits 8000))
+      (let ((f (comp bump twice))
+            (g (fnil bump 5))
+            (total (cell 0)))
+        (do (dotimes (i 1000) (set! total (+ @total (f i))))
+            (check c (= @total 1000000))
+            (set! total 0)
+            (let ((seven (some 7)))
+              (do (dotimes (i 1000) (set! total (+ @total (g seven))))
+                  (check c (= @total 8000))))
+            (check c (= (g nil) 6))))
+      (checks-result c))))

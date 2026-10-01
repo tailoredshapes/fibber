@@ -1,0 +1,43 @@
+;; fib.string.search: `str/starts-with?`, `str/ends-with?`, `str/includes?`, `str/index-of` and
+;; `str/index-of-from` (owner L10b; stdlib §4.7, §2.9; tranche 1 plan §6 L10b). Replaces nothing:
+;; the prelude's `starts-with?` is the one builtin of the group and is re-exported here.
+;; Decided here, where the page is silent:
+;;  - `str/starts-with?` is the builtin under a second name, as the row says: a function of this
+;;    module that calls `fib.prelude/starts-with?`, not a second implementation.
+;;  - `str/ends-with?` compares bytes from the end: a `str` is valid UTF-8, so equal bytes at the end
+;;    are equal characters, and it never copies and never traps.
+;;  - `str/index-of` answers a CHARACTER offset (`(Option i64)`, never -1), so its result feeds
+;;    `subs`: it asks the pattern for a byte offset and counts the characters before it.
+;;  - `str/index-of-from` is Java's `indexOf(value, from)`, which Clojure's three-argument
+;;    `index-of` calls: `from` counts characters, a negative `from` is 0, a `from` past the end
+;;    finds only the empty pattern, at the end. `offset-after` does both clamps: it skips at
+;;    most `from` characters and stops at the end of the text.
+;;  - the pattern of `index-of` is a `Pattern`: a `str` or a `char` today.
+(ns fib.string.search (:use fib.core fib.string.utf8 fib.string.pattern))
+
+(defun starts-with? (s: str prefix: str) -> bool (fib.prelude/starts-with? s prefix))
+
+;; whether the last bytes of s are the bytes of suffix
+(defun ends-with? (s: str suffix: str) -> bool
+  (let ((ls (str-len s))
+        (lx (str-len suffix)))
+    (if (< ls lx)
+        false
+        (loop ((k 0))
+          (if (< k lx)
+              (if (= (str-byte-at s (+ (- ls lx) k)) (str-byte-at suffix k)) (recur (+ k 1)) false)
+              true)))))
+
+(defun includes? (s: str sub: str) -> bool
+  (match (str-find s sub 0)
+    (nil false)
+    ((some _) true)))
+
+;; the character offset of the first match at or after character `from`
+(defun index-of-from (s: str p: p from: i64) :where ((Pattern p)) -> (Option i64)
+  (match (find-in p s (offset-after s from))
+    (nil nil)
+    ((some m) (some (scalars-before s (. m fst))))))
+
+(defun index-of (s: str p: p) :where ((Pattern p)) -> (Option i64)
+  (index-of-from s p 0))

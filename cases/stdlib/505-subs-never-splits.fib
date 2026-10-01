@@ -1,0 +1,48 @@
+;; spec:   stdlib §2.9 ("never splits a character"), §4.3 (row subs)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: subs subs-from
+;; Every range of a string that mixes one-, two-, three- and four-byte
+;; characters: for all 0 <= a <= b <= count, `(subs s a b)` is a valid string of
+;; exactly b - a characters and is the concatenation of those characters
+;; taken one at a time from `(to-vec s)` (the reference builds the answer with
+;; `char->str`, and uses no subs). The two halves at every split rejoin to
+;; the string. A byte-offset subs would trap inside a character or take the
+;; wrong characters; the reference side is shown to be able to fail by a
+;; planted off-by-one (a start one character late) in a second Checks.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; the characters from index a up to b of v, as a string
+(defun join-chars (v: (Vec char) a: i64 b: i64) -> str
+  (loop ((i a) (acc ""))
+    (if (< i b) (recur (+ i 1) (str-concat acc (char->str (nth v i)))) acc)))
+
+;; every range of s against the reference; `skew` moves the reference's start by that many characters
+(defun all-ranges (c: Checks s: str skew: i64) -> unit
+  (let ((v (to-vec s))
+        (n (count s)))
+    (dotimes (a (+ n 1))
+      (dotimes (b (+ n 1))
+        (if (<= a b)
+            (let ((got (subs s a b)))
+              (do (check c (= got (join-chars v (+ a skew) b)))
+                  (check c (= (count got) (- b a)))))
+            ())))))
+
+(defun halves-rejoin (c: Checks s: str) -> unit
+  (dotimes (k (+ (count s) 1))
+    (check c (= (str-concat (subs s 0 k) (subs-from s k)) s))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (s "aé€😀bé"))
+    (do (all-ranges c s 0)
+        (all-ranges c "😀😀é€" 0)
+        (halves-rejoin c s)
+        (halves-rejoin c "x€")
+        (all-ranges p s 1)
+        (check-detects c p)
+        (checks-result c))))

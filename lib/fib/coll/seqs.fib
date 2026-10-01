@@ -1,4 +1,61 @@
-;; owner: L8a. fib.coll.seqs: the instances of the sequential collections. Exports: vec includes?; Assoc Keyed Stack Collection Lookup Emptyable for Vec VSeq List LSeq Range Array that fib.coll.protocols does not seed.
-;; Until L8a writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
+;; fib.coll.seqs: the sequential collections through the protocols of fib.coll.protocols, and the two
+;; functions that need nothing but Reducible (stdlib §2.3, §4.4, §4.5; tranche 1 plan §4.2, L8a).
+;; Replaces the prelude's Collection, Indexable and Countable instances of Vec and List, which step M
+;; deletes; nothing here calls them (a Vec is reached through the public vec-count, vec-nth and vec-conj).
+;; Written here: vec and includes?; Assoc and Keyed for Vec; Keyed and Lookup for Array; Collection for
+;; List, LSeq and Range; Emptyable for List and VSeq. P0 seeded Collection, Lookup and Emptyable for Vec
+;; and Collection for VSeq in fib.coll.protocols; Map, Set and `into` are L8b's, str is L10a's.
+;; Decided here, where the page is silent:
+;;  - assoc on a Vec rebuilds the Vec element by element, O(n): the trie's nodes (VNode) are private to the
+;;    prelude, so no library module can copy one path. A prelude function `vec-assoc` that copies the path
+;;    (stdlib §2.5) is the follow-up; the answers would be the same.
+;;  - a Vec has no holes: assoc at the count appends, as Clojure's, and an index below zero or above the
+;;    count traps `assoc: index out of range`, the message naming the function (plan §4.3 rule 8).
+;;  - contains? on a Vec or an Array is the index test, Clojure's; includes? is the element test and stops at
+;;    the first match, with one closure and no cell: each-while says whether it ran to the end, and a match
+;;    is the walk not running to the end. get on an Array out of range is nil, never a trap, as Vec's.
+;;  - conj conses at the front of a List and of an LSeq (lcons, so the tail stays unrealised), and of a
+;;    Range, whose answer is the LSeq of the range with the element in front: Clojure's (conj (range 3) 9)
+;;    is (9 0 1 2). Range's to-lseq is lazy, so the front of an endless range (step 0) is there at once.
+;;  - Emptyable for VSeq is the plan's, not the §2.3 table's: (empty (rest v)) is an empty VSeq, usable as one.
+;;  - no Stack instances: peek and pop are tranche 2 (their rows say 2).
+;; The List variants are Empty and Cons (R2). Never `/` on integers, and the prelude's `count` and `nth`
+;; are not used: fib.seq's replace them.
 (ns fib.coll.seqs (:use fib.core fib.seq fib.coll.protocols))
+
+;; the elements of any source as a Vec; a Vec comes back itself (to-vec of a Vec allocates nothing)
+(defun vec (c: c) :where ((Reducible c e)) -> (Vec e) (to-vec c))
+
+;; whether x is one of the elements of c
+(defun includes? (x: e c: c) :where ((Reducible c e) (Eq e)) -> bool
+  (if (each-while c (fn (y) (not (= x y)))) false true))
+
+;; a Vec at an index: i = count appends, anything else outside 0..count traps
+(impl (Assoc i64 a) (Vec a)
+  (assoc (self i x)
+    (let ((n (vec-count self)))
+      (if (= i n)
+          (vec-conj self x)
+          (if (and (>= i 0) (< i n))
+              (loop ((j 0) (acc (vec-empty)))
+                (if (< j n) (recur (+ j 1) (vec-conj acc (if (= j i) x (vec-nth self j)))) acc))
+              (trap "assoc: index out of range"))))))
+
+;; contains? is the index test: (contains? [10 20] 1) is true, (contains? [10 20] 20) false
+(impl (Keyed i64) (Vec a)
+  (contains? (self i) (and (>= i 0) (< i (vec-count self)))))
+(impl (Keyed i64) (Array a)
+  (contains? (self i) (and (>= i 0) (< i (array-len self)))))
+(impl (Lookup i64 a) (Array a)
+  (get (self i) (if (and (>= i 0) (< i (array-len self))) (some (array-get self i)) nil)))
+
+;; the front: a List and an LSeq take the element first and answer their own type, a Range answers an LSeq
+(impl (Collection (List a) a) (List a)
+  (conj (self x) (Cons x self)))
+(impl (Collection (LSeq a) a) (LSeq a)
+  (conj (self x) (lcons x self)))
+(impl (Collection (LSeq t) t) (Range t) :where ((Num t) (Ord t) (Unit t) (RangeLen t))
+  (conj (self x) (lcons x (to-lseq self))))
+
+(impl Emptyable (List a) (empty (self) Empty))
+(impl Emptyable (VSeq a) (empty (self) (vseq-of (vec-empty))))

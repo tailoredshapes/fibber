@@ -1,0 +1,39 @@
+;; spec:   stdlib §4.1 (row Long/bitCount), types §2.12 (popcount)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: Long/bitCount
+;; Long/bitCount against a loop that adds up the 64 bits one at a time, on 300 seeded numbers drawn
+;; three ways (any bits, mostly zero bits by anding three draws, mostly one bits by oring them) so
+;; that both ends of the count are met, and on the 64 powers of two and the 64 numbers 2^k - 1. The last
+;; checks plant a fault for each of the two families, a reference one too large, and require
+;; that each be caught.
+(ns main (:use fib.core tl.rng tl.check) (:require [Long :as Long]))
+
+(def SEED: i64 681)
+
+(defun ref-bits (x: i64) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i 64) (recur (+ i 1) (+ n (bit-and (shr x i) 1))) n)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (pk (checks))
+        (r (rng SEED)))
+    (do (dotimes (i 300)
+          (let ((x (rng-next r))
+                (sparse (bit-and (rng-next r) (bit-and (rng-next r) (rng-next r))))
+                (dense (bit-or (rng-next r) (bit-or (rng-next r) (rng-next r)))))
+            (do (check c (= (Long/bitCount x) (ref-bits x)))
+                (check c (= (Long/bitCount sparse) (ref-bits sparse)))
+                (check c (= (Long/bitCount dense) (ref-bits dense)))
+                (check p (= (Long/bitCount x) (+ 1 (ref-bits x)))))))
+        (dotimes (k 64)
+          (do (check c (= (Long/bitCount (shl 1 k)) 1))
+              (check c (= (Long/bitCount (bit-not (shl -1 k))) k))
+              (check pk (= (Long/bitCount (shl 1 k)) 2))))
+        (check-detects c p)
+        (check-detects c pk)
+        (checks-result c))))

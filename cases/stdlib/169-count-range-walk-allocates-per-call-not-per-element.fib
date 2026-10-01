@@ -1,0 +1,31 @@
+;; spec:   stdlib §2.1 rule 4 and §8.1 item 5 (count cases); §1.2 P2 (nothing allocated per element)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 12
+;; roots:  ../../lib support
+;; covers: range range-by
+;; The walk of a Range allocates nothing per element: 100000 elements and 10 cost the same, and count and nth
+;; of an integer range allocate nothing either (they are closed forms; a heap object per element would show
+;; here as 100000 more). The objects counted are the Checks and one struct per range made (a Range is a heap
+;; object until C5). That count and nth are O(1) is not something a count of objects can show, and no case
+;; here claims it: case 173 holds the closed forms equal to the walk.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun total (r: (Range i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while r (fn (x) (do (set! acc (+ @acc x)) true)))
+        @acc)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (count (range 100000)) 100000))
+        (check c (= (count (range-by 0 300000 3)) 100000))
+        (check c (= (nth (range-by 0 300000 7) 20000) 140000))
+        (check c (= (count (range-by 100000 0 -1)) 100000))
+        (check c (= (nth (range-by 100000 0 -1) 99999) 1))
+        (check c (= (count (range-by -2147483648i32 2147483647i32 65536i32)) 65536))
+        (check c (= (nth (range-by -2147483648i32 2147483647i32 65536i32) 65535) 2147418112i32))
+        (check c (= (total (range 100000)) 4999950000))
+        (check c (= (total (range 10)) 45))
+        (checks-result c))))

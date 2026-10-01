@@ -1,0 +1,22 @@
+;; spec:   stdlib §4.3 (row parse-long), §8.1 item 2 (a tight allocs bound)
+;; expect: accept
+;; result: 617250
+;; audit:  clean
+;; allocs: <= 100
+;; roots:  ../../lib support
+;; covers: parse-long
+;; `parse-long` reads the string by `str-byte-at` and keeps its running value
+;; in the loop, so a call allocates one object, its (Option i64), which is a
+;; heap enum until C5, a `nil` too: 50 calls that parse "12345" and 50 that
+;; refuse "x1" are 100 objects, and the literals are none. An implementation
+;; that went through `str-chars` or `str-bytes` would cost an array or a Vec
+;; per call. The bound is the measured count and a test lowers it by one.
+;; The result is 50 times 12345.
+(ns main (:use fib.core fib.seq))
+
+(defun main () -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i 100)
+        (recur (+ i 1)
+               (+ acc (match (parse-long (if (= (bit-and i 1) 0) "12345" "x1")) ((some n) n) (nil 0))))
+        acc)))

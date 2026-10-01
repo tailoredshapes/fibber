@@ -1,0 +1,55 @@
+;; spec:   stdlib §4.4 (rows first empty?), §2.1 rule 3 and 4, §1.2 P5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: first empty?
+;; first of nothing is nil, not a trap (P5: Clojure answers nil), on every
+;; kind of empty source; first and empty? stop the walk at the first
+;; element: a source that counts the elements it hands out hands out one,
+;; and a lazy seq realises one node (not two).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Watch (n: i64 seen: (Cell i64)))
+
+(impl (Reducible i64) Watch
+  (each-while (self k)
+    (loop ((i 0))
+      (if (< i (. self n))
+          (do (set! (. self seen) (+ @(. self seen) 1))
+              (if (k i) (recur (+ i 1)) false))
+          true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Option i64) nil)
+        (ev: (Vec i64) (vec-empty))
+        (el: (List i64) (list))
+        (w1 (Watch 100 (cell 0)))
+        (w2 (Watch 100 (cell 0)))
+        (w0 (Watch 0 (cell 0)))
+        (nodes (cell 0)))
+    (let ((s (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                                   (LCons 1 (lazy-node (fn () (do (set! nodes (+ @nodes 1)) (LCons 2 (lazy-node (fn () LNil))))))))))))
+      (do (check c (nil? (first none)))
+          (check c (nil? (first ev)))
+          (check c (nil? (first el)))
+          (check c (nil? (first w0)))
+          (check c (nil? (first (VSeq (list) (vec-empty) 0))))
+          (check c (nil? (first (lazy-node (fn () LNil)))))
+          (check c (empty? none))
+          (check c (empty? ev))
+          (check c (empty? el))
+          (check c (empty? w0))
+          (check c (not (empty? (some 1))))
+          (check c (not (empty? [0])))
+          (check c (match (first w1) ((some x) (= x 0)) (nil false)))
+          (check c (= @(. w1 seen) 1))
+          (check c (not (empty? w2)))
+          (check c (= @(. w2 seen) 1))
+          (check c (= @nodes 0))
+          (check c (match (first s) ((some x) (= x 1)) (nil false)))
+          (check c (= @nodes 1))
+          (check c (not (empty? s)))
+          (check c (= @nodes 1))
+          (checks-result c)))))

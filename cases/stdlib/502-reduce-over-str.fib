@@ -1,0 +1,26 @@
+;; spec:   stdlib §2.9 (a str is a Reducible of its characters), §2.1 rule 3 (reduce, reduce-while)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The consumers walk a str by character, because the str is a Reducible
+;; char (case 500): `reduce` over "aé€😀z" adds the scalar values 97 + 233 +
+;; 8364 + 128512 + 122 = 137328 (a byte-wise reduce would add the eleven bytes
+;; of the UTF-8), builds the reversed string "z😀€éa" by prepending each
+;; character, gives the initial value for the empty string, and reads the same
+;; through the `Chars` view; `reduce-while` stops at the € and has seen two
+;; characters.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun code (ch: char) -> i64 (sext i64 (char->i32 ch)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s "aé€😀z"))
+    (do (check c (= (reduce (fn (acc ch) (+ acc (code ch))) 0 s) 137328))
+        (check c (= (reduce (fn (acc ch) (str-concat (char->str ch) acc)) "" s) "z😀€éa"))
+        (check c (= (reduce (fn (acc ch) (+ acc (code ch))) 7 "") 7))
+        (check c (= (reduce (fn (acc ch) (+ acc 1)) 0 (Chars s)) 5))
+        (check c (= (reduce-while (fn (acc ch) (if (= ch \€) (reduced acc) (More (+ acc 1)))) 0 s) 2))
+        (check c (= (reduce-while (fn (acc ch) (More (+ acc 1))) 0 s) 5))
+        (checks-result c))))

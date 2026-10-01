@@ -1,0 +1,46 @@
+;; spec:   stdlib §4.4 (row nth-or), §2.3 (the 3-arity of nth until L1)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: nth-or
+;; (nth-or c i d) is element i, or d when there is none: past the end, at
+;; the count, negative, or in an empty collection. It is one walk that stops
+;; at element i (a source that counts what it hands out hands out i + 1),
+;; on every source, and d may be any type the elements have (strings here).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Watch (n: i64 seen: (Cell i64)))
+
+(impl (Reducible i64) Watch
+  (each-while (self k)
+    (loop ((i 0))
+      (if (< i (. self n))
+          (do (set! (. self seen) (+ @(. self seen) 1))
+              (if (k (* i 10)) (recur (+ i 1)) false))
+          true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [10 20 30])
+        (xs (list 10 20 30))
+        (w (Watch 100 (cell 0)))
+        (none: (Option i64) nil)
+        (ev: (Vec i64) (vec-empty)))
+    (do (check c (= (nth-or v 0 -1) 10))
+        (check c (= (nth-or v 2 -1) 30))
+        (check c (= (nth-or v 3 -1) -1))
+        (check c (= (nth-or v 99 -1) -1))
+        (check c (= (nth-or v -1 -1) -1))
+        (check c (= (nth-or xs 1 -1) 20))
+        (check c (= (nth-or xs 3 -1) -1))
+        (check c (= (nth-or (some 7) 0 -1) 7))
+        (check c (= (nth-or (some 7) 1 -1) -1))
+        (check c (= (nth-or none 0 -1) -1))
+        (check c (= (nth-or ev 0 -1) -1))
+        (check c (= (nth-or (lcons 5 (lcons 6 (lazy-node (fn () LNil)))) 1 -1) 6))
+        (check c (= (nth-or w 4 -1) 40))
+        (check c (= @(. w seen) 5))
+        (check c (= (nth-or ["a" "b"] 1 "z") "b"))
+        (check c (= (nth-or ["a" "b"] 2 "z") "z"))
+        (checks-result c))))

@@ -1,0 +1,71 @@
+;; spec:   stdlib §2.7 (the hash is part of the spec: a Map's iteration order is its function), types §2.12
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; 845 shows that equal values hash alike; it would pass for any consistent hash,
+;; and so would a Map. The order a Map iterates in, and so every printed map and
+;; every program that folds one, is a function of the hash, and the interpreter and
+;; the compiled program must agree on it (stdlib §2.7: "the same in the interpreter
+;; and the compiled program (the hash is part of the spec)"). So here the hashes are
+;; pinned, each to a constant computed outside fibber (a transcription in Python of
+;; what types §2.12 says): the hash of an integer is its value, sign-extended from
+;; a narrower type; of a char its code point, of a bool 1 or 0; of a float the bits
+;; of its value as an f64 (an f32 is widened first), with -0.0 hashing as 0.0 and
+;; every NaN as the one quiet NaN (E10); of a string the 64-bit FNV-1a of its UTF-8
+;; bytes, read as a signed integer (offset basis 14695981039346656037, prime
+;; 1099511628211). The strings include the empty one, a NUL, scalars of two, three
+;; and four bytes, and one of 43 bytes. The fault planted: the constant of "abd"
+;; for "abc".
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do ;; text
+        (check c (= (hash "") -3750763034362895579))
+        (check c (= (hash "a") -5808556873153909620))
+        (check c (= (hash "abc") -1792535898324117685))
+        (check c (= (hash "hello") -6615550055289275125))
+        (check c (= (hash (char->str (i32->char 233i32))) 775207407765167617))
+        (check c (= (hash (char->str (i32->char 8364i32))) 6216753210906187371))
+        (check c (= (hash (char->str (i32->char 128512i32))) -72331129952009592))
+        (check c (= (hash "key-17") 1612881530110939235))
+        (check c (= (hash "The quick brown fox jumps over the lazy dog") -866459186506731248))
+        (check c (= (hash (str-concat (char->str (i32->char 97i32)) (str-concat (char->str (i32->char 0i32)) (char->str (i32->char 98i32))))) -1886276961191958862))
+        (check c (= (hash (char->str (i32->char 0i32))) -5808590958014384161))
+        (check c (= (hash (str-concat (char->str (i32->char 233i32)) (str-concat (char->str (i32->char 8364i32)) (str-concat (char->str (i32->char 128512i32)) (char->str (i32->char 97i32)))))) -2522981511626195707))
+        ;; floats as f64 bits
+        (check c (= (hash 1.5) 4609434218613702656))
+        (check c (= (hash -2.5) -4610560118520545280))
+        (check c (= (hash 1e300) 9094988921128908188))
+        (check c (= (hash 5e-324) 1))
+        (check c (= (hash 1.7976931348623157e308) 9218868437227405311))
+        (check c (= (hash 0.1) 4591870180066957722))
+        (check c (= (hash 0.0) 0))
+        (check c (= (hash -0.0) 0))
+        (check c (= (hash (bits->f64 9218868437227405312)) 9218868437227405312))
+        (check c (= (hash (bits->f64 -4503599627370496)) -4503599627370496))
+        (check c (= (hash (bits->f64 9221120237041090561)) 9221120237041090560))
+        (check c (= (hash (bits->f64 -2251799813685248)) 9221120237041090560))
+        ;; f32 widened to f64
+        (check c (= (hash 1.5f32) 4609434218613702656))
+        (check c (= (hash 0.1f32) 4591870180174331904))
+        (check c (= (hash -2.5f32) -4610560118520545280))
+        (check c (= (hash 3.4028235e38f32) 5183643170566569984))
+        (check c (= (hash -0.0f32) 0))
+        ;; integers, chars, bools
+        (check c (= (hash 9223372036854775807) 9223372036854775807))
+        (check c (= (hash -9223372036854775808) -9223372036854775808))
+        (check c (= (hash -128i8) -128))
+        (check c (= (hash 127i8) 127))
+        (check c (= (hash -1i16) -1))
+        (check c (= (hash -2147483648i32) -2147483648))
+        (check c (= (hash 2147483647i32) 2147483647))
+        (check c (= (hash \a) 97))
+        (check c (= (hash (i32->char 128512i32)) 128512))
+        (check c (= (hash true) 1))
+        (check c (= (hash false) 0))
+        (check p (= (hash "abc") -1792530400765976630))
+        (check-detects c p)
+        (checks-result c))))

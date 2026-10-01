@@ -1,0 +1,71 @@
+;; spec:   stdlib §4.2 (row `x), syntax §1.2, §3.16
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: `x
+;; A quasiquote is a template for the form a macro returns: everything in
+;; it is data, except `,e` (unquote), which puts the form `e` evaluates to
+;; there, and `,@e` (unquote-splicing), which puts the items of a
+;; (Vec Form) there. In the form that runs today: the comma touches its
+;; form (Clojure's `~x` and `~@x` are E14, case 909).
+;;  * the template is not evaluated or checked: `never-used` is a macro
+;;    whose template calls a function that does not exist, and the
+;;    program compiles, because no call of it is ever expanded;
+;;  * `,e` may sit in any position: an operand, the head of a call, in a
+;;    nested form, in a vector, in the scrutinee and a clause of a match;
+;;  * `,@e` splices into a call, a `do`, and a vector, any number of
+;;    items including none: `(do)` of nothing is unit;
+(ns main (:use tl.check))
+
+(defmacro add-to (e) `(+ ,e 100))
+
+(defmacro call-with (f ... args) `(,f ,@args))
+
+(defmacro in-do (... steps) `(do ,@steps))
+
+(defmacro vec-of (... xs) `[,@xs])
+
+(defmacro first-of (a b)
+  `(let ((v [,a ,b]))
+     (nth v 0)))
+
+(defmacro never-used (e) `(undefined-fn ,e (also undefined) 1 2))
+
+(defmacro or-else (e d)
+  `(match ,e ((some x) x) (nil ,d)))
+
+(defmacro describe (x)
+  `(str-concat "value " (show ,x)))
+
+(defmacro nested-lets (a b)
+  `(let ((p ,a)) (let ((q ,b)) (+ (* p 10) q))))
+
+(defun double (n: i64) -> i64 (* n 2))
+(defun sub (a: i64 b: i64) -> i64 (- a b))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (cnt (cell 0)))
+    (do
+      ;; unquote in an operand, in the head of a call, in a nested form
+      (check c (= (add-to 5) 105))
+      (check c (= (add-to (double 4)) 108))
+      (check c (= (call-with double 21) 42))
+      (check c (= (call-with sub 10 3) 7))
+      (check c (= (call-with + 1 2) 3))
+      ;; splice: any number of items, into a call and into a do
+      (check c (= (in-do 1 2 3) 3))
+      (check c (= (in-do (set! cnt 4) (set! cnt (+ @cnt 1)) @cnt) 5))
+      (set! cnt 0)
+      (in-do)
+      (check c (= @cnt 0))
+      ;; unquote and splice in a vector, in a match, in nested binders
+      (check c (= (nth (vec-of 4 5 6) 2) 6))
+      (check c (= (count (vec-of 1 2 3 4)) 4))
+      (check c (= (first-of 7 8) 7))
+      (check c (= (or-else (some 6) 0) 6))
+      (check c (= (or-else nil 9) 9))
+      (check c (= (nested-lets 4 2) 42))
+      (check c (= (describe 42) "value 42"))
+      (checks-result c))))

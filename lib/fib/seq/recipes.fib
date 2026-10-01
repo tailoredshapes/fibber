@@ -1,4 +1,80 @@
-;; owner: L6. fib.seq.recipes: the recipe structs of the fused path. Exports: Mapped Filtered Taken Dropped TakenWhile Mapcat Cat and their Reducible instances.
-;; Until L6 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.seq.recipes (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
+;; fib.seq.recipes: the recipe structs of the fused path (stdlib §2.1 rule 2; tranche 1 plan §4.2, owner L6).
+;; Exports Mapped Filtered Taken Dropped TakenWhile Mapcat Cat and their Reducible instances. Replaces the
+;; prelude's Vec-only `map` and the FilterIter of its Iter protocol, which M deletes.
+;;
+;; A recipe holds its source and its parameters and walks the source with one each-while: built in O(1),
+;; nothing allocated per element. It is never a value of a program: the expander (R9, E16) rewrites a chain of
+;; adaptor calls that a consumer reads once into these constructors, source first, so the argument order
+;; below is the rewrite's contract: (Mapped c f) (Filtered c p) (Taken c n) (Dropped c n) (TakenWhile c p)
+;; (Mapcat c f) (Cat a b). A hand-built chain is the same program (cases 260 and 261).
+;;
+;; Decided here, where the page is silent:
+;;  - the stopping rule of each-while: the result says whether the walk ran to the end, and a recipe that
+;;    ends by its own rule (Taken at n, TakenWhile at the first element that fails) has run to the end. A
+;;    walk the consumer stopped (k said false) is false, even at the n-th element of a Taken.
+;;  - no recipe overrides `size`, so (count (map f c)) walks it and calls f once per element, as Clojure's
+;;    does (stdlib §2.1 rule 4; case 254); a recipe does not override to-lseq either, since it is never a
+;;    value the lazy forms are asked to convert.
+;;  - the predicate of Filtered and TakenWhile returns any Truthy (bool or Option), so `(filter get-it ks)`
+;;    reads as Clojure's; the function arguments are fields, so each is evaluated once, before the walk.
+;;  - Taken and Dropped carry a phantom element type e, as the prototype's did, so that the impl head names
+;;    the variable its context determines (the rule of types §3.3 until L16 lands).
+(ns fib.seq.recipes (:use fib.core fib.seq.protocols))
+
+;; (Mapped c f): every element of c through f
+(defstruct (Mapped c e b) (src: c f: (fn (e) b)))
+(impl (Reducible b) (Mapped c e b) :where ((Reducible c e))
+  (each-while (self k)
+    (let ((f (. self f)))
+      (each-while (. self src) (fn (x) (k (f x)))))))
+
+;; (Filtered c p): the elements for which p is truthy
+(defstruct (Filtered c e r) (src: c p: (fn (e) r)))
+(impl (Reducible e) (Filtered c e r) :where ((Reducible c e) (Truthy r))
+  (each-while (self k)
+    (let ((p (. self p)))
+      (each-while (. self src) (fn (x) (if (truthy? (p x)) (k x) true))))))
+
+;; (Taken c n): the first n elements; n <= 0 never touches the source, and the walk stops the source at
+;; the n-th element instead of asking for one more
+(defstruct (Taken c e) (src: c n: i64))
+(impl (Reducible e) (Taken c e) :where ((Reducible c e))
+  (each-while (self k)
+    (let ((n (. self n)))
+      (if (<= n 0)
+          true
+          (let ((i (cell 0)) (refused (cell false)))
+            (let ((done (each-while (. self src)
+                          (fn (x) (do (set! i (+ @i 1))
+                                      (if (k x) (< @i n) (do (set! refused true) false)))))))
+              (if done true (not @refused))))))))
+
+;; (Dropped c n): all but the first n elements
+(defstruct (Dropped c e) (src: c n: i64))
+(impl (Reducible e) (Dropped c e) :where ((Reducible c e))
+  (each-while (self k)
+    (let ((i (cell 0)) (n (. self n)))
+      (each-while (. self src)
+        (fn (x) (if (< @i n) (do (set! i (+ @i 1)) true) (k x)))))))
+
+;; (TakenWhile c p): the elements before the first one for which p is not truthy
+(defstruct (TakenWhile c e r) (src: c p: (fn (e) r)))
+(impl (Reducible e) (TakenWhile c e r) :where ((Reducible c e) (Truthy r))
+  (each-while (self k)
+    (let ((p (. self p)) (stopped (cell false)))
+      (let ((done (each-while (. self src)
+                    (fn (x) (if (truthy? (p x)) (k x) (do (set! stopped true) false))))))
+        (if done true @stopped)))))
+
+;; (Mapcat c f): the elements of each (f x), in order; the inner walk's stop stops the outer one
+(defstruct (Mapcat c e d b) (src: c f: (fn (e) d)))
+(impl (Reducible b) (Mapcat c e d b) :where ((Reducible c e) (Reducible d b))
+  (each-while (self k)
+    (let ((f (. self f)))
+      (each-while (. self src) (fn (x) (each-while (f x) k))))))
+
+;; (Cat a b): the elements of a, then those of b
+(defstruct (Cat a b e) (left: a right: b))
+(impl (Reducible e) (Cat a b e) :where ((Reducible a e) (Reducible b e))
+  (each-while (self k)
+    (if (each-while (. self left) k) (each-while (. self right) k) false)))

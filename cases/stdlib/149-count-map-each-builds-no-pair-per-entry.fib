@@ -1,0 +1,28 @@
+;; spec:   tranche 1 plan §4.1 (map-each: no Pair per entry), stdlib §2.1 (a walk allocates per call, not per element), §8.1 item 5
+;; expect: accept
+;; result: 179500
+;; audit:  clean
+;; allocs: <= 2335
+;; roots:  ../../lib support
+;; map-each hands each key and its value to f as two arguments and builds no Pair, where for-each builds
+;; one per entry. main builds a Map of 300 entries in a loop (the trie's nodes and the Map's versions are
+;; the bulk of the count: a Map literal in a `def` is built at start-up and is in the trace too), then
+;; walks it three times (a sum of the keys, a sum of the values, and a walk that stops after 100 entries),
+;; and whatever those walks allocate (a closure and a cell or two each) is the same at 3 entries and at
+;; 300: the walks allocate nothing, the count is that of the build alone (2335, measured). A Pair per
+;; entry would add 300 objects per walk, as for-each does (the same build and two for-each walks
+;; measured 2935), which the bound, the count as measured, does not allow. The result adds the three
+;; answers: 44850 (the keys, 0 to 299), 134550 (the values, three times as much) and 100 (the entries
+;; seen before the stop).
+(ns main)
+
+(defun build () -> (Map i64 i64)
+  (loop ((i 0) (m (map-empty)))
+    (if (< i 300) (recur (+ i 1) (assoc m i (* i 3))) m)))
+
+(defun main () -> i64
+  (let ((m (build)) (ks (cell 0)) (vs (cell 0)) (seen (cell 0)))
+    (do (map-each m (fn (k v) (do (set! ks (+ @ks k)) true)))
+        (map-each m (fn (k v) (do (set! vs (+ @vs v)) true)))
+        (map-each m (fn (k v) (do (set! seen (+ @seen 1)) (< @seen 100))))
+        (+ @ks (+ @vs @seen)))))

@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.4 (row reverse: eager, a List, as Clojure's returns one)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reverse
+;; reverse materialises its source into a List, last element first, whatever
+;; the source is: a Vec, a List, a lazy seq, an Option, a VSeq (a sort), a
+;; user type with only each-while. The annotation on `l` is the check that
+;; the result is a (List i64) and nothing else. A List is a seq, so `seq` and
+;; `rest` take it apart: the first element of the reverse is the last of the
+;; source, and the empty source gives the empty List, not nil.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Upto (n: i64))
+(impl (Reducible i64) Upto
+  (each-while (self k)
+    (loop ((i 0)) (if (< i (. self n)) (if (k i) (recur (+ i 1)) false) true))))
+
+(defun same (a: (Vec e) b: (Vec e)) :where ((Eq e)) -> bool
+  (if (= (fib.prelude/count a) (fib.prelude/count b))
+      (loop ((i 0))
+        (if (< i (fib.prelude/count a))
+            (if (= (fib.prelude/nth a i) (fib.prelude/nth b i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (l: (List i64) (reverse [1 2 3]))
+        (none: (Vec i64) [])
+        (nothing: (Option i64) nil))
+    (do (check c (same (to-vec l) [3 2 1]))
+        (check c (same (to-vec (reverse [1 2 3])) [3 2 1]))
+        (check c (same (to-vec (reverse l)) [1 2 3]))
+        (check c (same (to-vec (reverse none)) none))
+        (check c (same (to-vec (reverse [7])) [7]))
+        (check c (same (to-vec (reverse (lseq-vec [4 5 6]))) [6 5 4]))
+        (check c (same (to-vec (reverse (some 9))) [9]))
+        (check c (same (to-vec (reverse nothing)) none))
+        (check c (same (to-vec (reverse (sort [2 3 1]))) [3 2 1]))
+        (check c (same (to-vec (reverse (Upto 5))) [4 3 2 1 0]))
+        (check c (= (count l) 3))
+        (check c (match (seq l) (nil false) ((some s) (= (nth s 0) 3))))
+        (check c (same (to-vec (rest l)) [2 1]))
+        (check c (match (seq (reverse none)) (nil true) ((some _) false)))
+        (checks-result c))))

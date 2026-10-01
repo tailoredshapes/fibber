@@ -1,0 +1,85 @@
+;; spec:   stdlib §2.1 rule 1 (a Map is a source of (Pair k v)), §8.1 item 2, tranche 1 plan §6 L5a
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; 30 seeded maps built by 24 assocs each over the keys 0 to 15 (so keys are overwritten), against a model of
+;; two Vecs of 16 slots, `has` and `vals`, that the case updates in step. For each map: count is the number of
+;; present slots; the walk visits every present key once, with the last value assigned, and nothing else (a
+;; per-key tally of the visits and of the values seen is compared with the slots); and an early exit after k
+;; visits makes min(k, count) visits and says it did not run to the end exactly when k <= count. The last two
+;; checks plant a fault in the model (an overwrite that keeps the first value; a key that is never present)
+;; and require the same sweep to fail.
+(ns main (:use fib.core fib.seq tl.check tl.rng))
+
+(defun zeros (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/conj acc 0)) acc)))
+
+(defun vset (v: (Vec i64) i: i64 x: i64) -> (Vec i64)
+  (loop ((j 0) (acc (vec-empty)))
+    (if (< j (fib.prelude/count v))
+        (recur (+ j 1) (fib.prelude/conj acc (if (= j i) x (fib.prelude/nth v j))))
+        acc)))
+
+(defun same (v: (Vec i64) xs: (Vec i64)) -> bool
+  (and (= (fib.prelude/count v) (fib.prelude/count xs))
+       (loop ((i 0))
+         (if (< i (fib.prelude/count v))
+             (if (= (fib.prelude/nth v i) (fib.prelude/nth xs i)) (recur (+ i 1)) false)
+             true))))
+
+(defun total (v: (Vec i64)) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i (fib.prelude/count v)) (recur (+ i 1) (+ acc (fib.prelude/nth v i))) acc)))
+
+;; the map and its model after 24 assocs; fault 1 keeps the first value of a key, fault 2 never adds key 7
+(defun build (r: Rng fault: i64) -> (Triple (Map i64 i64) (Vec i64) (Vec i64))
+  (loop ((j 0) (m (map-empty)) (has (zeros 16)) (vals (zeros 16)))
+    (if (< j 24)
+        (let ((k (rng-below r 16)) (v (+ 1 (rng-below r 1000))))
+          (recur (+ j 1)
+                 (assoc m k v)
+                 (if (if (= fault 2) (= k 7) false) has (vset has k 1))
+                 (if (if (= fault 2) (= k 7) (if (= fault 1) (= (fib.prelude/nth has k) 1) false)) vals (vset vals k v))))
+        (Triple m has vals))))
+
+;; how many times each key was visited, and the sum of the values seen under it
+(defun tally (m: (Map i64 i64)) -> (Pair (Vec i64) (Vec i64))
+  (let ((times (cell (zeros 16))) (seen (cell (zeros 16))))
+    (do (each-while m
+          (fn (p) (do (set! times (vset @times (. p fst) (+ 1 (fib.prelude/nth @times (. p fst)))))
+                      (set! seen (vset @seen (. p fst) (+ (. p snd) (fib.prelude/nth @seen (. p fst)))))
+                      true)))
+        (Pair @times @seen))))
+
+(defun stop-after (m: (Map i64 i64) k: i64) -> (Pair i64 bool)
+  (let ((visits (cell 0)))
+    (let ((done (each-while m (fn (p) (do (set! visits (+ @visits 1)) (< @visits k))))))
+      (Pair @visits done))))
+
+(defun agrees (r: Rng fault: i64) -> bool
+  (let ((b (build r fault))
+        (k (+ 1 (rng-below r 18))))
+    (let ((n (total (. b snd))) (t (tally (. b fst))) (s (stop-after (. b fst) k)))
+      (and (= (count (. b fst)) n)
+           (and (same (. t fst) (. b snd))
+                (and (same (. t snd) (. b thd))
+                     (and (= (. s fst) (if (< k n) k n))
+                          (= (. s snd) (> k n)))))))))
+
+(defun sweep (c: Checks fault: i64) -> unit
+  (let ((r (rng 57721566)))
+    (dotimes (j 30) (check c (agrees r fault)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (first-wins (checks))
+        (missing-key (checks)))
+    (do (sweep c 0)
+        (check c (= (checks-made c) 30))
+        (sweep first-wins 1)
+        (sweep missing-key 2)
+        (check-detects c first-wins)
+        (check-detects c missing-key)
+        (checks-result c))))

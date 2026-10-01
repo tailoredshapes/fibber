@@ -1,0 +1,58 @@
+;; spec:   stdlib §4.1 (row reset!), syntax §3.11, types §2.10 (reset! : (Atom a) a -> unit), ownership §7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reset!
+;; (reset! a v) stores v and releases the old value, and returns unit (a function declared to return
+;; unit can end in it: the signature below is the check of that). The old value is released only
+;; when nobody else holds it: a value read out of the atom with @ before the reset is still whole
+;; after it (the audit would say use-after-free otherwise). Resetting an atom of objects a hundred
+;; times leaves nothing behind. Tasks may reset one atom; which one wins is theirs to say, so the
+;; case only requires that the result be one of the values written. Four tasks resetting one atom of
+;; Vecs, each reading back what it sees, never see a Vec that is not whole (the audit would say so).
+(ns main (:use fib.core fib.async tl.check))
+
+(defun set-nine (a: (Atom i64)) -> unit (reset! a 9))
+
+;; reset! an atom of Vecs 200 times, reading it back each time: the Vec read is whole, whatever the
+;; other tasks reset in between, so the lengths seen add up to 4 tasks * 200 reads * 4 elements
+(defun churn (a: (Atom (Vec i64)) k: i64) -> i64
+  (loop ((i 0) (seen 0))
+    (if (< i 200)
+        (do (reset! a [k i i i])
+            (let ((v @a)) (recur (+ i 1) (+ seen (count v)))))
+        seen)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (n (atom 1))
+        (v (atom [1 2 3]))
+        (o (atom (some 5)))
+        (w (atom 0)))
+    (do (set-nine n)
+        (check c (= @n 9))
+        (let ((old @v))
+          (do (reset! v [7])
+              (check c (= (count old) 3))
+              (check c (= (nth old 2) 3))
+              (check c (= (count @v) 1))))
+        (reset! o nil)
+        (check c (match @o ((some _) false) (nil true)))
+        (reset! o (some 6))
+        (check c (match @o ((some x) (= x 6)) (nil false)))
+        (dotimes (i 100) (reset! v [i i i i]))
+        (check c (= (count @v) 4))
+        (check c (= (nth @v 0) 99))
+        (let ((t1 (future (reset! w 1)))
+              (t2 (future (reset! w 2)))
+              (t3 (future (reset! w 3))))
+          (do (join t1) (join t2) (join t3)
+              (check c (and (>= @w 1) (<= @w 3)))))
+        (let ((shared (atom [0 0 0 0])))
+          (let ((u1 (future (churn shared 1)))
+                (u2 (future (churn shared 2)))
+                (u3 (future (churn shared 3)))
+                (u4 (future (churn shared 4))))
+            (check c (= (+ (join u1) (+ (join u2) (+ (join u3) (join u4)))) 3200))))
+        (checks-result c))))

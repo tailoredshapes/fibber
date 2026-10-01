@@ -1,0 +1,53 @@
+;; spec:   stdlib §8.1 item 4 (laws over generated values), §2.7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str
+;; For the minimum, the maximum and zero of i64 and 300 integers drawn from its full
+;; range, and for each of them cut to i32, i16 and i8: a decoder of
+;; the text (a sign, then digits, accumulated downwards so that the minimum
+;; fits) gives the integer back, from str, from Debug, and from a Vec of one. The
+;; decoder is written here over the bytes of the text and shares nothing with
+;; the library. The last check is the planted fault: the same sweep against a
+;; decoder that stops one digit early, run into a second Checks, and the case
+;; fails unless that run found a difference.
+(ns main (:use fib.core fib.seq fib.print tl.rng tl.check))
+
+;; the integer a text spells: early is 1 for the planted fault, which leaves the last digit out
+(defun decode (s: str early: i64) -> i64
+  (let ((bs (str-bytes s))
+        (neg (and (> (array-len bs) 0) (= (array-get bs 0) 45i8))))
+    (let ((down (loop ((i (if neg 1 0)) (a 0))
+                  (if (< i (- (array-len bs) early))
+                      (recur (+ i 1) (- (* a 10) (- (sext i64 (array-get bs i)) 48)))
+                      a))))
+      (if neg down (- 0 down)))))
+
+;; the text of the Vec of one integer, without its brackets
+(defun unbracket (s: str) -> str (str-slice s 1 (- (str-len s) 1)))
+
+(defun sweep (c: Checks seed: i64 early: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (i 303)
+      (let ((n (if (= i 0) (- -9223372036854775807 1)
+                   (if (= i 1) 9223372036854775807
+                       (if (= i 2) 0 (rng-next r))))))
+        (let ((n32 (trunc i32 n))
+              (n16 (trunc i16 n))
+              (n8 (trunc i8 n)))
+          (do (check c (= (decode (str n) early) n))
+              (check c (= (decode (debug n) early) n))
+              (check c (= (decode (unbracket (str [n])) early) n))
+              (check c (= (decode (str n32) early) (sext i64 n32)))
+              (check c (= (decode (str n16) early) (sext i64 n16)))
+              (check c (= (decode (str n8) early) (sext i64 n8)))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 620 0)
+        (sweep p 620 1)
+        (check c (= (checks-made c) 1818))
+        (check-detects c p)
+        (checks-result c))))

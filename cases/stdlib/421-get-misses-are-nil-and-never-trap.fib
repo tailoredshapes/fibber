@@ -1,0 +1,39 @@
+;; spec:   stdlib §1.2 P5 (a miss is nil), §2.4 (get answers an Option), §4.5 (row get)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: get empty
+;; A key the map lacks is nil, never a trap, on the empty map, on a map that
+;; has other keys, on a key that shares a hash with a key it has (the HAMT
+;; keeps such keys in one bucket and must still tell them apart), and on a
+;; key that was removed. The key type K hashes to id mod 7, so K 1, K 8 and
+;; K 15 collide, and equality is by id.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct K (id: i64))
+(derive Eq K)
+(impl Hash K (hash (self) (rem (. self id) 7)))
+
+(defun is (o: (Option i64) n: i64) -> bool (match o (nil false) ((some x) (= x n))))
+(defun is-nil (o: (Option i64)) -> bool (match o (nil true) ((some _) false)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (e (empty {1 0}))
+        (m (assoc (assoc e 1 10) 3 30))
+        (k0 (empty {(K 0) 0}))
+        (k (assoc (assoc k0 (K 1) 100) (K 8) 800)))
+    (do (check c (is-nil (get e 1)))
+        (check c (is-nil (get e -1)))
+        (check c (is-nil (get m 2)))
+        (check c (is-nil (get (dissoc m 1) 1)))
+        (check c (is (get m 3) 30))
+        (check c (is-nil (get k0 (K 1))))
+        (check c (is (get k (K 1)) 100))
+        (check c (is (get k (K 8)) 800))
+        (check c (is-nil (get k (K 15))))
+        (check c (is-nil (get k (K 2))))
+        (check c (is-nil (get (dissoc k (K 1)) (K 1))))
+        (check c (is (get (dissoc k (K 1)) (K 8)) 800))
+        (checks-result c))))

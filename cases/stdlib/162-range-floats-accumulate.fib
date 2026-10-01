@@ -1,0 +1,68 @@
+;; spec:   stdlib §4.4 (row range: floats accumulate as Clojure's do), §5.6 (sharp edges replicated)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: range-by
+;; Clojure's (range 0 1 0.1) adds the step to the previous element, so it has eleven elements and the last is
+;; 0.9999999999999999, where a + i*s for i < ceil((b - a)/s) would have ten (that is `frange`, tranche 3). The
+;; walk, count and nth give the accumulated values; a NaN end or step never stops the walk (Clojure's `next >= end` is
+;; false for it), so the first three elements are taken with an early exit; steps that are exact in binary
+;; give the plain answers, and the same holds at f32.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun nan () -> f64 (bits->f64 9221120237041090560))
+
+;; the first n elements of a source, by an early exit
+(defun take-sum (r: (Range f64) n: i64) -> f64
+  (let ((k (cell 0)) (acc (cell 0.0)))
+    (do (each-while r (fn (x) (if (< @k n) (do (set! acc (+ @acc x)) (set! k (+ @k 1)) true) false)))
+        @acc)))
+
+(defun stop-at (c: c n: i64) :where ((Reducible c e)) -> (Pair i64 bool)
+  (let ((k (cell 0)))
+    (let ((done (each-while c (fn (x) (do (set! k (+ @k 1)) (< @k n))))))
+      (Pair @k done))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (r (range-by 0.0 1.0 0.1)))
+    (do (check c (= (count r) 11))
+        (check c (= (fib.prelude/count (to-vec r)) 11))
+        (check c (= (nth r 0) 0.0))
+        (check c (= (nth r 1) 0.1))
+        (check c (= (nth r 2) 0.2))
+        (check c (= (nth r 3) 0.30000000000000004))
+        (check c (= (nth r 7) 0.7))
+        (check c (= (nth r 8) 0.7999999999999999))
+        (check c (= (nth r 9) 0.8999999999999999))
+        (check c (= (nth r 10) 0.9999999999999999))
+        ;; the tenth element is not a + 9*s
+        (check c (!= (nth r 9) (* 9.0 0.1)))
+        ;; the elements the walk visits are the ones nth gives
+        (check c (= (fib.prelude/nth (to-vec r) 10) 0.9999999999999999))
+        (check c (= (fib.prelude/nth (to-vec r) 3) 0.30000000000000004))
+        ;; exact binary steps
+        (check c (= (count (range-by 0.0 1.0 0.25)) 4))
+        (check c (= (nth (range-by 0.0 1.0 0.25) 3) 0.75))
+        (check c (= (count (range-by 1.0 0.0 -0.25)) 4))
+        (check c (= (nth (range-by 1.0 0.0 -0.25) 3) 0.25))
+        (check c (= (count (range-by 0.0 0.0 0.5)) 0))
+        (check c (= (count (range-by 0.0 1.0 -0.5)) 0))
+        (check c (= (count (range-by 2.5 3.0 4.0)) 1))
+        ;; a NaN end: Clojure takes the elements 0.0 1.0 2.0 for ever; here the first three are 3.0 in all
+        (check c (= (take-sum (range-by 0.0 (nan) 1.0) 3) 3.0))
+        ;; and so does a NaN step, which is not positive: the elements are 0.0 then NaN for ever
+        (check c (let ((s (take-sum (range-by 0.0 5.0 (nan)) 3))) (!= s s)))
+        ;; the early exit on a float range
+        (let ((p (stop-at (range-by 0.0 1.0 0.25) 2)))
+          (check c (and (= (. p fst) 2) (not (. p snd)))))
+        (let ((p (stop-at (range-by 0.0 1.0 0.25) 5)))
+          (check c (and (= (. p fst) 4) (. p snd))))
+        ;; f32 accumulates at f32
+        (check c (= (count (range-by 0.0f32 1.0f32 0.25f32)) 4))
+        (check c (= (nth (range-by 0.0f32 1.0f32 0.25f32) 3) 0.75f32))
+        (check c (= (count (range-by 1.0f32 0.0f32 -0.5f32)) 2))
+        (check c (= (count (range 4.0f32)) 4))
+        (check c (= (count (range 2.5)) 3))
+        (checks-result c))))

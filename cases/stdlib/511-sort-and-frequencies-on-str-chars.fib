@@ -1,0 +1,41 @@
+;; spec:   stdlib §2.9 (a str is a Reducible of its characters; A11 e3e), §4.4 (rows sort frequencies)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The page's example of a string as a collection of characters: `(sort s)` of
+;; "bé1aA" orders its characters by code point, [1 A a b é] (the order of
+;; strings is code-point order, §2.7), and `(frequencies s)` counts them, so
+;; "abracadabra" has five a, two b, two r, one c and one d, and "aéaé€" has
+;; two é. The result of `sort` is read through `to-vec`, the sorted Vec of the
+;; sort's own result.
+;; `Lookup` instance of a `Map` that `get` reads the counts with.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun chars-are (v: (Vec char) want: (Vec char)) -> bool
+  (and (= (count v) (count want))
+       (loop ((i 0))
+         (if (< i (count want))
+             (if (= (nth v i) (nth want i)) (recur (+ i 1)) false)
+             true))))
+
+(defun has (m: (Map char i64) ch: char n: i64) -> bool
+  (match (get m ch) ((some k) (= k n)) (nil false)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (f (frequencies "abracadabra"))
+        (g (frequencies "aéaé€")))
+    (do (check c (chars-are (to-vec (sort "bé1aA")) [\1 \A \a \b \é]))
+        (check c (chars-are (to-vec (sort "")) []))
+        (check c (chars-are (to-vec (sort "😀€é")) [\é \€ \😀]))
+        (check c (has f \a 5))
+        (check c (has f \b 2))
+        (check c (has f \r 2))
+        (check c (has f \c 1))
+        (check c (has f \d 1))
+        (check c (nil? (get f \z)))
+        (check c (has g \a 2))
+        (check c (has g \é 2))
+        (check c (has g \€ 1))
+        (checks-result c))))

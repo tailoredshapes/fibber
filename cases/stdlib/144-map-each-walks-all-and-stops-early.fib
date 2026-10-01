@@ -1,0 +1,42 @@
+;; spec:   tranche 1 plan §4.1 (map-each, the prelude's early-exit walk of a Map), stdlib §2.1 (each-while)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; (map-each m f) calls f with each key and its value, in the trie's order, while f answers true; the
+;; result says whether the walk ran to the end. Over a map of 200 integer keys, f is called once
+;; per entry and the sum of the keys and of the values is the sum over the model; an f that answers
+;; false at the third entry is called exactly three times and the walk answers false; an empty map is
+;; walked in no calls and answers true; a map with one entry answers true after one call; and a map
+;; whose value type is a str hands its values over intact. (The bucket of keys whose hashes are
+;; equal is case 145; the keys here are integers, 200 of them, so the root is a node with children.)
+(ns main (:use tl.check))
+
+(defun build (n: i64) -> (Map i64 i64)
+  (loop ((i 0) (m (map-empty)))
+    (if (< i n) (recur (+ i 1) (assoc m i (* i 10))) m)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (build 200))
+        (calls (cell 0))
+        (ks (cell 0))
+        (vs (cell 0))
+        (stop (cell 0))
+        (empty-calls (cell 0))
+        (one-calls (cell 0))
+        (sm (assoc (assoc (map-empty) 1 "one") 2 "three"))
+        (sl (cell 0)))
+    (do (check c (map-each m (fn (k v) (do (set! calls (+ @calls 1)) (set! ks (+ @ks k)) (set! vs (+ @vs v)) true))))
+        (check c (= @calls 200))
+        (check c (= @ks 19900))
+        (check c (= @vs 199000))
+        (check c (not (map-each m (fn (k v) (do (set! stop (+ @stop 1)) (< @stop 3))))))
+        (check c (= @stop 3))
+        (check c (map-each (map-empty) (fn (k v) (do (set! empty-calls (+ @empty-calls 1)) true))))
+        (check c (= @empty-calls 0))
+        (check c (map-each (assoc (map-empty) 7 8) (fn (k v) (do (set! one-calls (+ @one-calls 1)) true))))
+        (check c (= @one-calls 1))
+        (check c (map-each sm (fn (k v) (do (set! sl (+ @sl (str-len v))) true))))
+        (check c (= @sl 8))
+        (checks-result c))))

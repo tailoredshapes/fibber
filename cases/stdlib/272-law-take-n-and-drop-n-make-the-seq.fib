@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.4 rows take drop concat, §8.1 item 4 (a law over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: take drop concat take-while filter remove
+;; Two laws of Clojure's sequence functions over 300 seeded Vecs of 0 to 11
+;; elements and drawn n from -2 to the length plus 2: (concat (take n s)
+;; (drop n s)) is s, and filter p with remove p partition s: their counts
+;; add up to the count of s and (take-while p s) is a prefix of s whose
+;; next element, if any, fails p. Seed 272. The last check plants a fault
+;; (drop n+1) and requires the first law to notice.
+(ns main (:use fib.core fib.seq tl.check tl.rng))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+(defun even (x: i64) -> bool (= (rem x 2) 0))
+
+(defun law-draw (r: Rng c: Checks fault: bool) -> unit
+  (let ((v (rng-vec r (rng-below r 12) 10))
+        (n (- (rng-below r 15) 2)))
+    (let ((len (vec-count v)) (k (if fault (+ n 1) n)))
+      (do (check c (same (to-vec (concat (take n v) (drop k v))) v))
+          (check c (= (+ (count (filter even v)) (count (remove even v))) len))
+          (let ((prefix (to-vec (take-while (fn (x: i64) (< x 5)) v))))
+            (do (check c (same prefix (to-vec (take (vec-count prefix) v))))
+                (check c (or (= (vec-count prefix) len) (>= (vec-nth v (vec-count prefix)) 5)))))))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 272)))
+    (dotimes (i 300) (law-draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 1200))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

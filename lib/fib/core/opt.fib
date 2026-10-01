@@ -1,4 +1,52 @@
-;; owner: L2. fib.core.opt: the Option helpers and the combinators. Exports: unwrap map-opt and-then identity comp fnil.
-;; Until L2 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.core.opt (:use fib.core.base fib.core.protocols))
+;; fib.core.opt: the Option helpers and the first combinators (tranche 1 plan §4.2, owner L2; stdlib §4.3
+;; rows unwrap map-opt and-then identity comp fnil; §3 N11 for the argument order).
+;; It uses no other part: only builtins and the prelude, so it has no `:use` (the stub's two were P0's guess).
+;; Replaces nothing in the prelude: `nil?`, `some?` and `unwrap-or` are the prelude's (lib/prelude.fib, syntax
+;; §4.5) and stay there; cases 105 and 106 are their judge. This part adds the rest of what `nil` punning and
+;; `some->` do in Clojure, over `(Option a)` and with the function first and the Option last, so `->>` threads
+;; it (N11). A function argument is `:borrow` where the function only calls it (map-opt, and-then) and owned
+;; where a closure it returns stores it (comp, fnil): stdlib §2.2 "Conventions the library follows now".
+;; Decided here, where the page leaves a choice:
+;;  - `unwrap` of nil traps `unwrap: nil`; the message names the function (plan §4.3 rule 8).
+;;  - `comp` is the plan's tranche-1 fixed-arity form: exactly two unary functions, `(comp f g)` is
+;;    `(fn (x) (f (g x)))`, right to left as Clojure's. `(comp)`, `(comp f)` and three or more functions need the
+;;    arity-reading form (L22, tranche 3; case 115 is its `open-` case): until then nest, `(comp f (comp g h))`.
+;;  - `fnil` is the unary form `(fn (a) b) a -> (fn ((Option a)) b)`: `((fnil f d) nil)` is `(f d)` and
+;;    `((fnil f d) (some x))` is `(f x)`. Clojure's `(fnil f x y z)` for the first three arguments of any arity
+;;    is L22 too (case 116). The Option is what `update-opt` (L8b) hands to its function.
+;;  - the two combinators that return a closure (`comp`, `fnil`) allocate one heap closure per call to
+;;    the combinator and nothing per call to the closure they return (cases 109 and 110).
+(ns fib.core.opt)
+
+;; (unwrap o) is the payload of a `some`; the sure case, where `(unwrap-or o d)` has a default
+(defun unwrap (o: (Option a)) -> a
+  (match o
+    ((some x) x)
+    (nil (trap "unwrap: nil"))))
+
+;; (map-opt f o) is `(some (f x))` for `(some x)` and nil for nil: Clojure's `(some-> o f)` for a plain `f`
+(defun map-opt (f: (fn (a) b) :borrow o: (Option a)) -> (Option b)
+  (match o
+    ((some x) (some (f x)))
+    (nil nil)))
+
+;; (and-then f o) is `(f x)` for `(some x)`, and nil for nil: the bind of the Option monad, the step of
+;; `some->` whose function already returns an Option
+(defun and-then (f: (fn (a) (Option b)) :borrow o: (Option a)) -> (Option b)
+  (match o
+    ((some x) (f x))
+    (nil nil)))
+
+;; Clojure's `identity`
+(defun identity (x: a) -> a x)
+
+;; (comp f g) is the function that applies g, then f
+(defun comp (f: (fn (b) c) g: (fn (a) b)) -> (fn (a) c)
+  (fn (x) (f (g x))))
+
+;; (fnil f d) is f with a nil argument replaced by d
+(defun fnil (f: (fn (a) b) d: a) -> (fn ((Option a)) b)
+  (fn (o)
+    (f (match o
+         ((some x) x)
+         (nil d)))))

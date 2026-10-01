@@ -1,0 +1,39 @@
+;; spec:   stdlib §2.1 (a walk allocates per call, not per element), §8.1 item 5 (count cases), plan §9.4
+;; expect: accept
+;; result: 1111
+;; audit:  clean
+;; allocs: <= 14
+;; roots:  ../../lib support
+;; `=`, `<` and `hash` of a `(Vec i64)` of 50 elements, the vector held by a `def`
+;; (whose objects the trace leaves out, cases/ownership/README.md). The equality and the
+;; order are loops over the trie that allocate nothing, and `hash` is `hash-ordered-coll`,
+;; whose closure and two cells are scope-local. So none of the three allocates, per element
+;; or per call: the objects counted are the two small vectors main builds for the last check,
+;; a floor that keeps the bound above zero so that the test which lowers it by one can
+;; fail (an allocation per element would be 50 more). The bound is the count as measured,
+;; and case 135 is the same program over 500 elements with the same bound. `ys` equals
+;; `xs` and `zs` differs at the last place, so `=` and `<` each walk the whole vector. The
+;; result is 1 for `=`, 10 for `<`, 100 for the hashes agreeing and 1000 for the small pair.
+(ns main (:use fib.seq))
+
+(def xs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+   20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+   40 41 42 43 44 45 46 47 48 49])
+
+(def ys: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+   20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+   40 41 42 43 44 45 46 47 48 49])
+
+(def zs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+   20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+   40 41 42 43 44 45 46 47 48 99])
+
+(defun main () -> i64
+  (let ((w [1 2 3]))
+    (+ (if (= xs ys) 1 0)
+       (+ (if (< xs zs) 10 0)
+          (+ (if (= (hash xs) (hash ys)) 100 0)
+             (if (< w [1 2 4]) 1000 0))))))

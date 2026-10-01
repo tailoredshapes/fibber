@@ -1,0 +1,43 @@
+;; spec:   stdlib §4.4 (row reduce), §3 N1/N2 (function first, sequence last)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce
+;; (reduce f init c) folds from the left: f gets the accumulator first, the
+;; element second, so a non-commutative f shows the order (100 - 1 - 2 - 3
+;; is 94, not 2); the accumulator may have another type than the elements (a
+;; string from integers, a Vec from strings); an empty source gives init
+;; and f is never called; every kind of source folds the same way.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Upto (n: i64))
+
+(impl (Reducible i64) Upto
+  (each-while (self k)
+    (loop ((i 0)) (if (< i (. self n)) (if (k (+ i 1)) (recur (+ i 1)) false) true))))
+
+(defun minus (a: i64 x: i64) -> i64 (- a x))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (none: (Option i64) nil)
+        (ev: (Vec i64) (vec-empty)))
+    (do (check c (= (reduce (fn (a x) (+ a x)) 0 [1 2 3 4]) 10))
+        (check c (= (reduce minus 100 [1 2 3]) 94))
+        (check c (= (reduce minus 100 (list 1 2 3)) 94))
+        (check c (= (reduce minus 100 (Upto 3)) 94))
+        (check c (= (reduce minus 100 (VSeq (list 1) [2 3] 0)) 94))
+        (check c (= (reduce minus 100 (lcons 1 (lcons 2 (lcons 3 (lazy-node (fn () LNil)))))) 94))
+        (check c (= (reduce minus 100 (some 7)) 93))
+        (check c (= (reduce minus 100 none) 100))
+        (check c (= (reduce (fn (a x) (do (set! calls (+ @calls 1)) (+ a x))) 5 ev) 5))
+        (check c (= @calls 0))
+        (check c (= (reduce (fn (a x) (str-concat a (show x))) "" [1 2 3]) "123"))
+        (check c (= (reduce (fn (a x) (str-concat x a)) ">" ["a" "b" "c"]) "cba>"))
+        (check c (= (count (reduce (fn (a x) (fib.prelude/conj a (str-len x))) (vec-empty) ["a" "bb" "ccc"])) 3))
+        (check c (= (nth (reduce (fn (a x) (fib.prelude/conj a (str-len x))) (vec-empty) ["a" "bb" "ccc"]) 2) 3))
+        (check c (= (reduce (fn (a x) (do (set! calls (+ @calls 1)) a)) 0 [4 5 6 7]) 0))
+        (check c (= @calls 4))
+        (checks-result c))))

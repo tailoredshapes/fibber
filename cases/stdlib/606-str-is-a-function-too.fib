@@ -1,0 +1,46 @@
+;; spec:   stdlib §2.10 (the function twins), §4.3 (row str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str
+;; `str` is a macro in head position (R5) and a function in value position, so
+;; it can be handed to a function that takes one: a function parameter, a
+;; reduce, a map. The function is ToStr's `to-str` for any type with an
+;; instance, a user's included: Clojure's (map str [["a"]]) is the text of a
+;; vector of one string. A user instance beside the library's is no overlap,
+;; and (str [pt]) is the Debug text of the elements, as case 601's table says.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+(impl ToStr Pt
+  (to-str (self) (str-concat "Pt<" (str-concat (str (. self x)) (str-concat "," (str-concat (str (. self y)) ">"))))))
+
+(impl Debug Pt (debug (self) (str-concat "#" (to-str self))))
+
+(defun via-int (f: (fn (i64) str) n: i64) -> str (f n))
+(defun via-strs (f: (fn ((Vec str)) str) v: (Vec str)) -> str (f v))
+(defun via-pt (f: (fn (Pt) str) p: Pt) -> str (f p))
+(defun via-opt (f: (fn ((Option i64)) str) o: (Option i64)) -> str (f o))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Option i64) nil)
+        (texts (to-vec (map str [["a"] ["b" "c"]])))
+        (nums (to-vec (map str [1 2 3])))
+        (joined (reduce (fn (acc x) (str-concat acc (str x))) "" [1 2 3])))
+    (do (check c (= (via-int str 5) "5"))
+        (check c (= (via-int str -12) "-12"))
+        (check c (= (via-strs str ["a"]) "[\"a\"]"))
+        (check c (= (via-pt str (Pt 1 2)) "Pt<1,2>"))
+        (check c (= (str (Pt 3 4)) "Pt<3,4>"))
+        (check c (= (str [(Pt 1 2)]) "[#Pt<1,2>]"))
+        (check c (= (via-opt str (some 7)) "7"))
+        (check c (= (via-opt str none) ""))
+        (check c (= (vec-count nums) 3))
+        (check c (and (= (nth nums 0) "1") (= (nth nums 2) "3")))
+        (check c (= (vec-count texts) 2))
+        (check c (= (nth texts 0) "[\"a\"]"))
+        (check c (= (nth texts 1) "[\"b\" \"c\"]"))
+        (check c (= joined "123"))
+        (checks-result c))))

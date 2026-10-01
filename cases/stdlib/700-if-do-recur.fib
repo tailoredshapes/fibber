@@ -1,0 +1,94 @@
+;; spec:   stdlib §4.2 (rows if, do, recur), syntax §3.4, §3.5, §3.18
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: if do recur
+;; The three control forms of the core, in the form they have on today's
+;; compiler (the test of `if` is a bool and both arms are written; the
+;; one-armed `if` and an Option as the test are L20, cases 900 and 720):
+;;  * `if` evaluates the test, then one arm and never the other, and the
+;;    arms may be heap values (the audit is clean whichever is taken);
+;;  * `do` evaluates its steps in order, drops the values of all but the
+;;    last (heap values included: the audit is clean) and `(do)` is unit;
+;;  * `recur` rebinds every loop variable at once, from arguments evaluated
+;;    left to right, from a tail position of the body: the arm of an `if`,
+;;    of a `match`, the last step of a `do` or the body of a `let`; it
+;;    belongs to the innermost `loop`, and a loop of 100000 rounds runs.
+(ns main (:use tl.check))
+
+;; the type is the test: `(do)` is unit, so this compiles only if it is
+(defun nothing () -> unit (do))
+
+;; an arm that is a heap value, taken or not
+(defun pick (flag: bool) -> (Vec i64) (if flag [1 2 3] [9]))
+
+;; one arm borrows the parameter and the other is a new value (syntax §3.4:
+;; the borrowed arm retains, so the whole `if` is owned)
+(defun grow-or-same (flag: bool v: (Vec i64)) -> (Vec i64) (if flag v (conj v 9)))
+
+(defun gcd (a: i64 b: i64) -> i64
+  (loop ((x a) (y b)) (if (= y 0) x (recur y (rem x y)))))
+
+;; both loop variables move at once: (a b) -> (b a+b), not (b b+b)
+(defun fib-at (n: i64) -> i64
+  (loop ((i 0) (a 0) (b 1)) (if (= i n) a (recur (+ i 1) b (+ a b)))))
+
+;; recur from a match arm, from the last step of a do, from a let body
+(defun sum-to (n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (match (< i n)
+      (true (let ((j (+ i 1))) (do (recur j (+ acc j)))))
+      (false acc))))
+
+;; the arguments of recur are evaluated left to right, then bound at once
+(defun note (log: (Cell i64) d: i64) -> i64
+  (do (set! log (+ (* @log 10) d)) d))
+
+(defun order (log: (Cell i64)) -> i64
+  (loop ((i 0) (x 0) (y 0))
+    (if (= i 0)
+        (recur 1 (note log 1) (note log 2))
+        (+ (* 100 x) y))))
+
+;; recur belongs to the innermost loop: the inner one counts to 3 each round
+(defun nested (rounds: i64) -> i64
+  (loop ((r 0) (total 0))
+    (if (< r rounds)
+        (recur (+ r 1) (+ total (loop ((k 0)) (if (< k 3) (recur (+ k 1)) k))))
+        total)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (log (cell 0)))
+    (do
+      (nothing)
+      ;; if: one arm only
+      (check c (= (if (> 2 1) 10 20) 10))
+      (check c (= (if (> 1 2) 10 20) 20))
+      (check c (= (if true (do (set! log (+ @log 1)) 1) (do (set! log (+ @log 100)) 2)) 1))
+      (check c (= @log 1))
+      (check c (= (if (if (> 3 2) false true) 1 (if (> 2 3) 2 3)) 3))
+      (check c (= (count (pick true)) 3))
+      (check c (= (count (pick false)) 1))
+      (check c (= (nth (pick false) 0) 9))
+      (check c (= (count (grow-or-same true [1 2 3])) 3))
+      (check c (= (count (grow-or-same false [1 2 3])) 4))
+      ;; do: in order, last value, earlier values dropped, (do) is unit
+      (set! log 0)
+      (check c (= (do (set! log 1) (set! log (+ (* @log 10) 2)) (set! log (+ (* @log 10) 3)) @log) 123))
+      (check c (= (do [1 2 3] [4 5] 7) 7))
+      ;; recur
+      (check c (= (gcd 48 18) 6))
+      (check c (= (gcd 17 5) 1))
+      (check c (= (fib-at 0) 0))
+      (check c (= (fib-at 10) 55))
+      (check c (= (fib-at 50) 12586269025))
+      (check c (= (sum-to 100) 5050))
+      (check c (= (sum-to 0) 0))
+      (set! log 0)
+      (check c (= (order log) 102))
+      (check c (= @log 12))
+      (check c (= (nested 4) 12))
+      (check c (= (loop ((i 0)) (if (< i 100000) (recur (+ i 1)) i)) 100000))
+      (checks-result c))))

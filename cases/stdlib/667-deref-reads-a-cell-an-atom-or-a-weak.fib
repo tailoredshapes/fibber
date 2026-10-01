@@ -1,0 +1,37 @@
+;; spec:   stdlib §4.1 (row deref: `@x`), syntax §3.11 (Deref), types §2.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: deref
+;; (deref x) is @x, and it reads a cell or an atom as the value inside and a weak reference as an
+;; Option of the object, nil once nobody holds the object any more. What it returns is owned by the
+;; reader: the Vec read from an atom stays whole when the atom is reset (case 666 does it with the
+;; audit watching). Both spellings do the same. Of a Task it is not accepted (case 658).
+(ns main (:use fib.core tl.check))
+
+(defstruct Holder (c: (Cell i64)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (k (cell 5))
+        (a (atom 6))
+        (h (Holder (cell 7)))
+        (b (Box 8)))
+    (let ((w (weak b))
+          (gone (let ((x (Box 9))) (weak x))))
+      (do (check c (= (deref k) 5))
+          (check c (= @k 5))
+          (check c (= (deref a) 6))
+          (check c (= @a 6))
+          (check c (= (deref (. h c)) 7))
+          (check c (= @(. h c) 7))
+          (check c (match (deref w) ((some x) (= (unbox x) 8)) (nil false)))
+          (check c (match @w ((some x) (= (unbox x) 8)) (nil false)))
+          (check c (match (deref gone) ((some _) false) (nil true)))
+          (check c (match @gone ((some _) false) (nil true)))
+          (set! k 50)
+          (reset! a 60)
+          (check c (= @k 50))
+          (check c (= (deref a) 60))
+          (checks-result c)))))

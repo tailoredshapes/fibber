@@ -1,0 +1,40 @@
+;; fib.string.join: `str/join` (owner L10b; stdlib §4.7, §3 N9; tranche 1 plan §6 L10b). Replaces the
+;; prelude's `str-join`, which takes a `(Vec str)` only and which stays (M keeps it).
+;; Decided here, where the page is silent:
+;;  - the one-argument arity `(str/join c)` is the page's `(str/join "" c)` until arity overloading
+;;    lands (L1): a name has one arity today, so `str/join` takes the separator and the source,
+;;    `(str/join sep c)`, over any `(Reducible c e)` whose element is a `(ToStr e)`.
+;;  - the text is built in one pass over the source: each element is turned into its `to-str` text
+;;    once and held, then the total length is known and one byte array is filled and made a `str`
+;;    (the prelude's `str-join` idea): no `str-concat` per element, which would copy the text so far
+;;    each time. The elements are read through `str-byte-at`, so no array is made per element.
+;;  - the name is always qualified: an unqualified `join` is the task-wait builtin (§3 N9).
+(ns fib.string.join (:use fib.core fib.seq))
+
+;; the total length of the parts and of the separators between them
+(defun joined-length :private (sep: str parts: (Vec str)) -> i64
+  (let ((n (fib.prelude/vec-count parts)))
+    (loop ((i 0) (total 0))
+      (if (< i n)
+          (recur (+ i 1) (+ total (+ (str-len (fib.prelude/vec-nth parts i)) (if (> i 0) (str-len sep) 0))))
+          total))))
+
+;; the bytes of piece, written into buf from pos on; the next position
+(defun write-piece :private (buf: (Cell (Array i8)) pos: i64 piece: str) -> i64
+  (let ((n (str-len piece)))
+    (do (dotimes (j n) (array-set! &buf (+ pos j) (str-byte-at piece j)))
+        (+ pos n))))
+
+(defun join-parts :private (sep: str parts: (Vec str)) -> str
+  (let ((n (fib.prelude/vec-count parts))
+        (buf (cell (array (joined-length sep parts) 0i8))))
+    (do (loop ((i 0) (pos 0))
+          (if (< i n)
+              (recur (+ i 1) (write-piece buf (if (> i 0) (write-piece buf pos sep) pos) (fib.prelude/vec-nth parts i)))
+              ()))
+        (str-from-bytes @buf))))
+
+(defun join (sep: str c: c) :where ((Reducible c e) (ToStr e)) -> str
+  (let ((parts (cell (vec-empty))))
+    (do (each-while c (fn (x) (do (set! parts (fib.prelude/vec-conj @parts (to-str x))) true)))
+        (join-parts sep @parts))))

@@ -1,0 +1,45 @@
+;; spec:   stdlib §2.3 (the tuple types), §4.3 (row Triple), §2.7 (Eq Ord Hash of a Triple)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: Triple
+;; (Triple a b c) is Pair's three-field twin: the fields are fst, snd and thd, and Eq, Ord and Hash
+;; are derived field by field, in order. The order is decided by the first field that differs, so the
+;; third field matters only when the first two are equal; a Triple of mixed field types (i64, str,
+;; bool) holds each in its own slot and is compared for equality and hashed (not ordered by its bool:
+;; the compiled `<` on bool differs from the interpreter's, reported with this package); and
+;; Triples are Map keys, and may hold a Pair.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a (Triple 1 "x" 5))
+        (a2 (Triple 1 "x" 5))
+        (b (Triple 1 "x" 4))
+        (d (Triple 1 "y" 0))
+        (e (Triple 2 "a" 0))
+        (t (Triple 1 "x" true))
+        (f (Triple 1 "x" false))
+        (nest (Triple (Pair 1 2) "p" 3))
+        (m (assoc (assoc (map-empty) (Triple 1 2 3) 10) (Triple 1 2 4) 20)))
+    (do (check c (and (= (. a fst) 1) (and (= (. a snd) "x") (= (. a thd) 5))))
+        (check c (and (= (. t fst) 1) (and (= (. t snd) "x") (. t thd))))
+        (check c (and (= t (Triple 1 "x" true)) (!= t f)))
+        (check c (!= (hash t) (hash f)))
+        (check c (= a a2))
+        (check c (!= a b))
+        (check c (< b a))
+        (check c (< a d))
+        (check c (< d e))
+        (check c (not (< a2 a)))
+        (check c (= (hash a) (hash a2)))
+        (check c (!= (hash a) (hash b)))
+        (check c (!= (hash (Triple 1 2 3)) (hash (Triple 3 2 1))))
+        (check c (= (. (. nest fst) snd) 2))
+        (check c (= nest (Triple (Pair 1 2) "p" 3)))
+        (check c (< nest (Triple (Pair 1 3) "a" 0)))
+        (check c (= (count m) 2))
+        (check c (= (unwrap-or (get m (Triple 1 2 4)) 0) 20))
+        (check c (= (unwrap-or (get m (Triple 1 2 5)) 0) 0))
+        (checks-result c))))

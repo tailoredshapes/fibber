@@ -1,0 +1,68 @@
+;; spec:   stdlib §2.3 (Assoc), §8.1 item 2 (a library function against a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc get contains?
+;; 240 seeded operations on a Vec and on a plain array that is copied whole each
+;; time: half of them append (the index equal to the count), half replace the
+;; element at a random index in range, with a random value. After every one the
+;; Vec and the array have the same length and the same element at every index;
+;; get answers (some x) for every index of the array and nil for the index after
+;; it; contains? agrees. The Vec ends at 126 elements (seed 1): three full leaves
+;; in the trie and a tail. The reference is `array-with`, which copies, and a push
+;; written here; it never calls assoc. The last checks plant two faults in the
+;; reference, 30 operations each (300 inputs in all): an off-by-one on the
+;; replaced index, and an append that is lost. The same comparisons must fail on
+;; each, in a Checks of its own, or this case fails.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+;; the array with x at the end
+(defun arr-push (m: (Array i64) x: i64) -> (Array i64)
+  (let ((n (array-len m))
+        (c (cell (array (+ n 1) x))))
+    (do (dotimes (j n) (array-set! &c j (array-get m j)))
+        @c)))
+
+;; whether the Vec and the array agree in length, element, get and contains?
+(defun agree (v: (Vec i64) m: (Array i64)) -> bool
+  (let ((n (array-len m)))
+    (and (= (count v) n)
+         (and (loop ((i 0))
+                (if (< i n)
+                    (if (and (= (nth v i) (array-get m i))
+                             (and (contains? v i)
+                                  (match (get v i) ((some x) (= x (array-get m i))) (nil false))))
+                        (recur (+ i 1))
+                        false)
+                    true))
+              (and (not (contains? v n))
+                   (match (get v n) ((some _) false) (nil true)))))))
+
+;; fault 0 is the reference as it should be; 1 replaces at i - 1; 2 loses an append
+(defun run-ops (c: Checks seed: i64 fault: i64 ops: i64) -> unit
+  (let ((r (rng seed)))
+    (loop ((k 0) (v (vec-empty)) (m (array 0 0)))
+      (if (< k ops)
+          (let ((n (array-len m))
+                (append (= (rng-below r 2) 0))
+                (x (rng-below r 1000)))
+            (let ((i (if (or append (= n 0)) n (rng-below r n))))
+              (let ((v2 (assoc v i x))
+                    (m2 (if (= i n)
+                            (if (= fault 2) m (arr-push m x))
+                            (array-with m (if (and (= fault 1) (> i 0)) (- i 1) i) x))))
+                (do (check c (agree v2 m2))
+                    (recur (+ k 1) v2 m2)))))
+          ()))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks)))
+    (do (run-ops c 1 0 240)
+        (run-ops p1 1 1 30)
+        (run-ops p2 1 2 30)
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

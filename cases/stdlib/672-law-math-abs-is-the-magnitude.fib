@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.10 (row Math/abs), §4.3 (row abs)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: Math/abs
+;; Math/abs against the magnitude as a branch computes it, and the laws of an absolute value, on
+;; 300 seeded integers of about a billion, 300 bytes and 300 floats that are multiples of 1/1024:
+;; never negative, even (|-x| = |x|), idempotent, the identity exactly on the non-negatives,
+;; multiplicative for integers (|x y| = |x| |y|), and subadditive for floats (|x + y| <= |x| + |y|).
+;; The last checks plant a fault in each of the three families, a reference that is the identity,
+;; and require that each be caught.
+(ns main (:use fib.core tl.rng tl.check) (:require [Math :as Math]))
+
+(def SEED: i64 672)
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (p8 (checks))
+        (pf (checks))
+        (r (rng SEED)))
+    (do (dotimes (i 300)
+          (let ((x (- (rng-below r 2000000001) 1000000000))
+                (y (- (rng-below r 2000000001) 1000000000))
+                (b (trunc i8 (- (rng-below r 255) 127)))
+                (f (fdiv (sitofp f64 (- (rng-below r 2000001) 1000000)) 1024.0))
+                (g (fdiv (sitofp f64 (- (rng-below r 2000001) 1000000)) 1024.0)))
+            (do (check c (= (Math/abs x) (if (< x 0) (- 0 x) x)))
+                (check c (>= (Math/abs x) 0))
+                (check c (= (Math/abs (neg x)) (Math/abs x)))
+                (check c (= (Math/abs (Math/abs x)) (Math/abs x)))
+                (check c (= (= (Math/abs x) x) (>= x 0)))
+                (check c (= (* (Math/abs x) (Math/abs y)) (Math/abs (* x y))))
+                (check c (= (Math/abs b) (if (< b 0i8) (- 0i8 b) b)))
+                (check c (>= (Math/abs b) 0i8))
+                (check c (= (Math/abs f) (if (< f 0.0) (- 0.0 f) f)))
+                (check c (>= (Math/abs f) 0.0))
+                (check c (= (Math/abs (neg f)) (Math/abs f)))
+                (check c (<= (Math/abs (+ f g)) (+ (Math/abs f) (Math/abs g))))
+                (check p (= (Math/abs x) x))
+                (check p8 (= (Math/abs b) b))
+                (check pf (= (Math/abs f) f)))))
+        (check-detects c p)
+        (check-detects c p8)
+        (check-detects c pf)
+        (checks-result c))))

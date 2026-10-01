@@ -1,0 +1,33 @@
+;; spec:   stdlib §4.3 (row compare), §5.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: compare
+;; compare, over integers without a NaN, is a total preorder that agrees with
+;; <: reflexive (compare a a is 0), antisymmetric (compare a b is the negation
+;; of compare b a), transitive (a <= b and b <= c give a <= c), and it says
+;; -1 exactly when a < b. 200 seeded triples from a range small enough to
+;; repeat values. The planted fault is a comparator that never answers 0:
+;; the same laws run on it in a second Checks and must fail.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun law (cmp: (fn (i64 i64) i64) :borrow a: i64 b: i64 c: i64) -> bool
+  (and (= (cmp a a) 0)
+       (and (= (cmp a b) (neg (cmp b a)))
+            (and (if (and (<= (cmp a b) 0) (<= (cmp b c) 0)) (<= (cmp a c) 0) true)
+                 (= (= (cmp a b) -1) (< a b))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (r (rng 72)))
+    (do (dotimes (i 200)
+          (let ((a (- (rng-below r 9) 4))
+                (b (- (rng-below r 9) 4))
+                (d (- (rng-below r 9) 4)))
+            (do (check c (law (fn (x y) (compare x y)) a b d))
+                (check p (law (fn (x y) (if (< x y) -1 1)) a b d)))))
+        (check c (= (checks-made c) 200))
+        (check-detects c p)
+        (checks-result c))))

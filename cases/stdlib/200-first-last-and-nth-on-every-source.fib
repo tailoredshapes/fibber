@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.4 (rows first last nth), §2.1 rule 4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: first last nth
+;; first stops after one element and gives an Option; last and nth are the
+;; methods of Reducible, so the same three calls work on a Vec, an Option, a
+;; List, a VSeq (a consed front over a Vec), an LSeq and a user tree that
+;; gave only each-while. The sources all hold 10 20 30 40 (the Option holds
+;; 7). Range is not here: it is L5a's, and its instance is not in the tree yet.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+(defun is (o: (Option i64) n: i64) -> bool (match o (nil false) ((some x) (= x n))))
+
+;; first, last and every index of a four-element source
+(defun four (c: Checks s: s) :where ((Reducible s i64)) -> unit
+  (do (check c (is (first s) 10))
+      (check c (is (last s) 40))
+      (check c (= (nth s 0) 10))
+      (check c (= (nth s 1) 20))
+      (check c (= (nth s 2) 30))
+      (check c (= (nth s 3) 40))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (ls (lcons 10 (lcons 20 (lcons 30 (lcons 40 (lazy-node (fn () LNil)))))))
+        (t (Node (Node Leaf 10 Leaf) 20 (Node (Node Leaf 30 Leaf) 40 Leaf))))
+    (do (four c [10 20 30 40])
+        (four c (list 10 20 30 40))
+        (four c (VSeq (list 10 20) [30 40] 0))
+        (four c (VSeq (list 10) [0 20 30 40] 1))
+        (four c ls)
+        (four c t)
+        (check c (is (first (some 7)) 7))
+        (check c (is (last (some 7)) 7))
+        (check c (= (nth (some 7) 0) 7))
+        (checks-result c))))

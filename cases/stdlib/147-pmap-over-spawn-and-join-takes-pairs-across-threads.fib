@@ -1,0 +1,29 @@
+;; spec:   stdlib §2.11 (pmap), tranche 1 plan §6 L4 (pmap is written over spawn and join, no longer over the Vec-only map)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The prelude's pmap after L4 is a loop that spawns one task per element and a second loop that joins
+;; them in order. Cases 106 and 657 judge the old behaviours; this one adds what the rewrite could have
+;; broken: sixty-four tasks at once whose results come back in the order of the source; elements and
+;; results that are prelude Pairs holding a str (heap objects that cross the thread boundary, and
+;; come back whole); a result type that differs from the element type; and a source of one element.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (many (pmap (fn (x) (+ (* x x) 1)) (loop ((i 0) (v (vec-empty))) (if (< i 64) (recur (+ i 1) (conj v i)) v))))
+        (pairs (pmap (fn (p: (Pair i64 str)) (Pair (+ (. p fst) 1) (str-concat (. p snd) "!")))
+                     [(Pair 1 "a") (Pair 2 "bb") (Pair 3 "ccc")]))
+        (lens (pmap (fn (p: (Pair i64 str)) (str-len (. p snd))) [(Pair 1 "a") (Pair 2 "bb")]))
+        (one (pmap (fn (x: i64) (show x)) [41])))
+    (do (check c (= (count many) 64))
+        (check c (= (nth many 0) 1))
+        (check c (= (nth many 63) 3970))
+        (check c (= (nth many 31) 962))
+        (check c (= (count pairs) 3))
+        (check c (= (nth pairs 0) (Pair 2 "a!")))
+        (check c (= (nth pairs 2) (Pair 4 "ccc!")))
+        (check c (and (= (nth lens 0) 1) (= (nth lens 1) 2)))
+        (check c (and (= (count one) 1) (= (nth one 0) "41")))
+        (checks-result c))))

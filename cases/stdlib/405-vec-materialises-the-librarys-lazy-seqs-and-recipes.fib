@@ -1,0 +1,48 @@
+;; spec:   stdlib §2.1 rules 2 and 4 (the materialiser is the one place a chain is built), §2.5, §4.4 (vec)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec map filter take concat
+;; vec is the one function that turns the library's own sequence forms into a
+;; Vec. The lazy forms (map, filter, take, concat: each an LSeq) and the
+;; recipes they fuse into (Mapped, Filtered, Taken: structs that hold a source
+;; and a function, built by hand here as the expander builds them) all come out
+;; in order, a chain of both included. A lazy seq that vec walked twice has
+;; called its function once per element: the second vec reads the nodes the first
+;; one realised, where a recipe walked twice calls it twice.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; whether v is exactly the Vec want
+(defun same (v: (Vec i64) want: (Vec i64)) -> bool
+  (and (= (count v) (count want))
+       (loop ((i 0)) (if (< i (count want)) (if (= (nth v i) (nth want i)) (recur (+ i 1)) false) true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (xs [1 2 3 4 5 6])
+        (twice (fn (x: i64) -> i64 (* 2 x)))
+        (big (fn (x: i64) -> bool (> x 2))))
+    (let ((counted (map (fn (x) (do (set! calls (+ @calls 1)) (* 10 x))) [1 2 3]))
+          (recipe (Mapped [1 2 3] (fn (x) (do (set! calls (+ @calls 1)) (* 10 x))))))
+      (do (check c (same (vec (map twice xs)) [2 4 6 8 10 12]))
+          (check c (same (vec (filter big xs)) [3 4 5 6]))
+          (check c (same (vec (take 2 xs)) [1 2]))
+          (check c (same (vec (concat [1 2] [3])) [1 2 3]))
+          (check c (same (vec (take 3 (filter big (map twice xs)))) [4 6 8]))
+          (check c (same (vec (Mapped xs twice)) [2 4 6 8 10 12]))
+          (check c (same (vec (Filtered xs big)) [3 4 5 6]))
+          (check c (same (vec (Taken (Filtered (Mapped xs twice) big) 2)) [4 6]))
+          (check c (same (vec (map twice (take 2 xs))) [2 4]))
+          (check c (same (vec (Mapped (map twice [1 2]) twice)) [4 8]))
+          (check c (same (vec (map twice (vec (map twice [1 2])))) [4 8]))
+          (check c (same (vec (take 0 xs)) []))
+          (check c (same (vec (filter big [1 2])) []))
+          (check c (same (vec counted) [10 20 30]))
+          (check c (same (vec counted) [10 20 30]))
+          (check c (= @calls 3))
+          (check c (same (vec recipe) [10 20 30]))
+          (check c (same (vec recipe) [10 20 30]))
+          (check c (= @calls 9))
+          (checks-result c)))))

@@ -1,0 +1,51 @@
+;; spec:   stdlib §2.1 rule 1 (sources), §4.4 (rows sort, sort-with, reverse, group-by, frequencies)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: sort sort-with reverse group-by frequencies
+;; The materialisers take anything Reducible, not a Vec: a List (the result
+;; of reverse), a lazy seq, an Option, a VSeq (the result of a sort), and a
+;; user type whose only method is each-while (here a tree walked in order).
+;; The sorted result is a VSeq of the same elements whichever the source.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+(defun same (a: (Vec e) b: (Vec e)) :where ((Eq e)) -> bool
+  (if (= (fib.prelude/count a) (fib.prelude/count b))
+      (loop ((i 0))
+        (if (< i (fib.prelude/count a))
+            (if (= (fib.prelude/nth a i) (fib.prelude/nth b i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (t (Node (Node Leaf 4 Leaf) 1 (Node (Node Leaf 3 Leaf) 9 Leaf)))
+        (l (reverse [4 1 3 9 2]))
+        (ls (lseq-vec [4 1 3 9 2]))
+        (nothing: (Option i64) nil))
+    (do (check c (same (to-vec (sort t)) [1 3 4 9]))
+        (check c (same (to-vec (sort l)) [1 2 3 4 9]))
+        (check c (same (to-vec (sort ls)) [1 2 3 4 9]))
+        (check c (same (to-vec (sort (some 6))) [6]))
+        (check c (same (to-vec (sort nothing)) []))
+        (check c (same (to-vec (sort (sort [3 2 1]))) [1 2 3]))
+        (check c (same (to-vec (sort-with > t)) [9 4 3 1]))
+        (check c (same (to-vec (sort-with > ls)) [9 4 3 2 1]))
+        (check c (same (to-vec (reverse t)) [9 3 1 4]))
+        (check c (same (to-vec (reverse (sort ls))) [9 4 3 2 1]))
+        (check c (same (match (get (group-by (fn (x) (rem x 2)) t) 1) (nil []) ((some g) g)) [1 3 9]))
+        (check c (same (match (get (group-by (fn (x) (rem x 2)) l) 0) (nil []) ((some g) g)) [2 4]))
+        (check c (same (match (get (group-by (fn (x) (rem x 2)) (sort ls)) 1) (nil []) ((some g) g)) [1 3 9]))
+        (check c (match (get (frequencies t) 9) (nil false) ((some n) (= n 1))))
+        (check c (match (get (frequencies l) 2) (nil false) ((some n) (= n 1))))
+        (checks-result c))))

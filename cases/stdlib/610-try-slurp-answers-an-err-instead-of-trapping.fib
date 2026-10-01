@@ -1,0 +1,28 @@
+;; spec:   stdlib §4.14 (rows try-slurp spit), §3 N13 (the typed twin of a function that throws)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: try-slurp spit
+;; The typed twin of slurp: a path read-file refuses (a missing file, a directory,
+;; a path with a NUL in it) is (Err "cannot read PATH") and nothing else, the text
+;; slurp's trap repeats behind its own name. spit to a place that cannot be written
+;; answers false and does not trap, as the builtin write-file does. An unreadable
+;; file is not tried here: it would depend on who runs the case.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defun err-is (r: (Result str str) want: str) -> bool
+  (match r ((Err e) (= e want)) ((Ok _) false)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nul-path "/tmp/a\0b"))
+    (do (check c (err-is (try-slurp "/fibstdlib-610-no-such-directory/none.txt")
+                         "cannot read /fibstdlib-610-no-such-directory/none.txt"))
+        (check c (err-is (try-slurp "/tmp") "cannot read /tmp"))
+        (check c (err-is (try-slurp "") "cannot read "))
+        (check c (err-is (try-slurp nul-path) (str-concat "cannot read " nul-path)))
+        (check c (not (spit "/fibstdlib-610-no-such-directory/none.txt" "x")))
+        (check c (not (spit "/tmp" "x")))
+        (check c (not (spit nul-path "x")))
+        (checks-result c))))

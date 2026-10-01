@@ -1,0 +1,40 @@
+;; spec:   stdlib §2.7 (Debug: strings quoted and escaped at every depth), §4.14 (row pr)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; open:   L11
+;; Clojure's pr of a string escapes the double quote, the backslash and the
+;; control characters it names: \" \\ \n \t \r \f \b (char-escape-string); any
+;; other character, NUL and the scalars of every width included, is written as
+;; it is. Debug of a string is P0's instance in fib.core.protocols, which wraps
+;; the text in quotes and escapes nothing, so this case fails today and waits for
+;; L11's follow-up there (the diff is in L11's report: a private escape function
+;; and the instance calling it). `open: L11` names that: when the diff is applied
+;; the case passes, which the harness reports as "the item landed: remove `open`".
+;; Show is not touched (println leaves a string bare at every depth), and a string
+;; that needs no escape is already case 602's.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defun formfeed () -> str (char->str (i32->char 12i32)))
+(defun backspace () -> str (char->str (i32->char 8i32)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (debug "a\"b") "\"a\\\"b\""))
+        (check c (= (debug "a\\b") "\"a\\\\b\""))
+        (check c (= (debug "one\ntwo") "\"one\\ntwo\""))
+        (check c (= (debug "a\tb") "\"a\\tb\""))
+        (check c (= (debug "a\rb") "\"a\\rb\""))
+        (check c (= (debug (str-concat "a" (str-concat (formfeed) "b"))) "\"a\\fb\""))
+        (check c (= (debug (str-concat "a" (str-concat (backspace) "b"))) "\"a\\bb\""))
+        (check c (= (debug "\"\"") "\"\\\"\\\"\""))
+        (check c (= (debug "\\n") "\"\\\\n\""))
+        (check c (= (debug "é\n😀") "\"é\\n😀\""))
+        (check c (= (str-len (debug "a\0b")) 5))
+        (check c (= (debug ["a\nb" "c"]) "[\"a\\nb\" \"c\"]"))
+        (check c (= (str ["q\"q"]) "[\"q\\\"q\"]"))
+        (check c (= (debug (some "x\ty")) "\"x\\ty\""))
+        (check c (= (show "a\nb") "a\nb"))
+        (check c (= (show ["a\nb"]) "[a\nb]"))
+        (checks-result c))))

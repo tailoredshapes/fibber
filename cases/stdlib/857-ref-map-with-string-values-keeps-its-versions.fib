@@ -1,0 +1,103 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Map), types §2.13, ownership §5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; 842 to 855 store integers, which are copied; a leaf that holds a string value
+;; holds a count on it, and assoc, dissoc and the path copies must retain what
+;; they keep and release what they drop. A Map of strings is a different
+;; instantiation from a Map of integers, compiled separately. The same seeded
+;; sequences as tl.model's (a put of a fresh value or a delete, aimed so the
+;; map fills and drains; a snapshot every sixth operation checked again at the
+;; end) run on a Map from an integer, and on one from a string, to a string
+;; value no other put makes ("v17/3": the id and the number of the put) against
+;; an array of Option str indexed by id. After every operation the counts agree,
+;; `get` of every key agrees, and a full for-each visits as many entries as the
+;; model has, with the same total length of values. Ten sequences of 48
+;; operations over 30 keys each, seeds 857000 up. The fault planted is a model
+;; that records the number of the next put instead.
+(ns main (:use tl.rng tl.check tl.model))
+
+(defun val-of (id: i64 s: i64) -> str (str-concat "v" (str-concat (show id) (str-concat "/" (show s)))))
+
+;; the map, its model, and the snapshots of both
+(defstruct (Run k) (m: (Map k str) model: (Array (Option str)) snaps: (Vec (Map k str)) models: (Vec (Array (Option str)))))
+
+(defun model-n (model: (Array (Option str))) -> i64
+  (loop ((i 0) (n 0)) (if (< i (array-len model)) (recur (+ i 1) (if (some? (array-get model i)) (+ n 1) n)) n)))
+
+;; the total length of the values the model holds
+(defun model-len (model: (Array (Option str))) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i (array-len model))
+        (recur (+ i 1) (match (array-get model i) (nil n) ((some s) (+ n (str-len s)))))
+        n)))
+
+(defun map-len (m: (Map k str)) -> i64
+  (let ((n (cell 0)))
+    (do (each-entry m (fn (kk vv) (set! n (+ @n (str-len vv)))))
+        @n)))
+
+(defun map-visits (m: (Map k str)) -> i64
+  (let ((n (cell 0)))
+    (do (each-entry m (fn (kk vv) (set! n (+ @n 1))))
+        @n)))
+
+(defun agree (m: (Map k str) model: (Array (Option str)) ks: (Vec k)) :where ((Hash k) (Eq k)) -> bool
+  (and (= (count m) (model-n model))
+       (and (= (map-visits m) (model-n model))
+            (and (= (map-len m) (model-len model))
+                 (loop ((i 0))
+                   (if (< i (count ks))
+                       (if (= (get m (nth ks i)) (array-get model i)) (recur (+ i 1)) false)
+                       true))))))
+
+;; the id a put or a delete is aimed at: a key the model has not got for a put
+;; and one it has for a delete, each four times in five, otherwise any
+(defun pick (r: Rng model: (Array (Option str)) want: bool) -> i64
+  (let ((len (array-len model))
+        (have (model-n model)))
+    (let ((n (if want have (- len have))))
+      (if (and (> n 0) (< (rng-below r 5) 4))
+          (loop ((i 0) (seen 0) (k (rng-below r n)))
+            (if (= (some? (array-get model i)) want)
+                (if (= seen k) i (recur (+ i 1) (+ seen 1) k))
+                (recur (+ i 1) seen k)))
+          (rng-below r len)))))
+
+(defun step-run (r: Rng st: (Run k) ks: (Vec k) step: i64 skew: i64) :where ((Hash k) (Eq k)) -> (Run k)
+  (let ((adding (< (rng-below r 100) (if (< step 20) 85 (if (< step 32) 50 4))))
+        (taking (= (rem step 6) 0)))
+    (let ((id (pick r (. st model) (not adding))))
+      (let ((m2 (if adding (assoc (. st m) (nth ks id) (val-of id step)) (dissoc (. st m) (nth ks id))))
+            (model2 (let ((none: (Option str) nil))
+                      (array-with (. st model) id (if adding (some (val-of id (+ step skew))) none)))))
+        (Run m2 model2
+             (if taking (conj (. st snaps) m2) (. st snaps))
+             (if taking (conj (. st models) model2) (. st models)))))))
+
+(defun snaps-hold (st: (Run k) ks: (Vec k)) :where ((Hash k) (Eq k)) -> bool
+  (loop ((i 0))
+    (if (< i (count (. st snaps)))
+        (if (agree (nth (. st snaps) i) (nth (. st models) i) ks) (recur (+ i 1)) false)
+        true)))
+
+;; 0 when the sequence of this seed agreed throughout, else the 1-based step
+(defun run-seq (seed: i64 mk: (fn (i64) k) skew: i64) :where ((Hash k) (Eq k)) -> i64
+  (let ((r (rng seed))
+        (ks (universe mk 30))
+        (none: (Option str) nil))
+    (loop ((step 0) (st (Run (map-empty) (array 30 none) (vec-empty) (vec-empty))))
+      (if (= step 48)
+          (if (snaps-hold st ks) 0 1000)
+          (let ((nx (step-run r st ks step skew)))
+            (if (agree (. nx m) (. nx model) ks) (recur (+ step 1) nx) (+ step 1)))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (dotimes (i 10) (check c (= 0 (run-seq (+ 857000 i) mk-int 0))))
+        (dotimes (i 10) (check c (= 0 (run-seq (+ 857100 i) mk-str 0))))
+        (dotimes (i 3) (check p (= 0 (run-seq (+ 857000 i) mk-str 1))))
+        (check-detects c p)
+        (checks-result c))))

@@ -1,0 +1,87 @@
+;; spec:   stdlib §8.1 item 4 (laws: sort is stable and a permutation, and ordered), §4.4 (rows sort-by, sort)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: sort-by sort
+;; The three laws of §8.1 item 4, on 300 seeded vectors of 0 to 40 records
+;; with one of five keys (so ties are everywhere) and the id of their place
+;; in the input: the output of sort-by is ORDERED (no key goes down), STABLE
+;; (equal keys keep increasing ids) and a PERMUTATION (every id 0 to n-1
+;; occurs exactly once); and `sort` of the keys alone is ordered and has
+;; the same sum and count. The sorter is a parameter so that the planted fault
+;; (method §9.4) can be an unstable selection sort, which must break the
+;; stability law at least once, else this case fails.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+(defstruct Item (key: i64 id: i64))
+
+;; an unstable selection sort by key: swaps the minimum with the front, so equal keys can pass each other
+(defun selection-sort (v: (Vec Item)) -> (Vec Item)
+  (let ((n (fib.prelude/count v)))
+    (if (< n 2)
+        v
+        (let ((a (cell (array n (fib.prelude/nth v 0)))))
+          (do (dotimes (i n) (array-set! &a i (fib.prelude/nth v i)))
+              (dotimes (i n)
+                (let ((m (loop ((j (+ i 1)) (m i))
+                           (if (< j n) (recur (+ j 1) (if (< (. (array-get @a j) key) (. (array-get @a m) key)) j m)) m)))
+                      (t (array-get @a i)))
+                  (do (array-set! &a i (array-get @a m)) (array-set! &a m t))))
+              (loop ((i 0) (out (vec-empty)))
+                (if (< i n) (recur (+ i 1) (fib.prelude/conj out (array-get @a i))) out)))))))
+
+(defun sorted-by-key (v: (Vec Item) fault: bool) -> (Vec Item)
+  (if fault (selection-sort v) (to-vec (sort-by (fn (p) (. p key)) v))))
+
+(defun ordered (v: (Vec Item)) -> bool
+  (loop ((i 1)) (if (< i (fib.prelude/count v)) (if (<= (. (fib.prelude/nth v (- i 1)) key) (. (fib.prelude/nth v i) key)) (recur (+ i 1)) false) true)))
+
+(defun stable (v: (Vec Item)) -> bool
+  (loop ((i 1))
+    (if (< i (fib.prelude/count v))
+        (if (if (= (. (fib.prelude/nth v (- i 1)) key) (. (fib.prelude/nth v i) key))
+                (< (. (fib.prelude/nth v (- i 1)) id) (. (fib.prelude/nth v i) id))
+                true)
+            (recur (+ i 1))
+            false)
+        true)))
+
+;; id occurs exactly once among the records of v
+(defun once (v: (Vec Item) id: i64) -> bool
+  (= 1 (loop ((i 0) (n 0)) (if (< i (fib.prelude/count v)) (recur (+ i 1) (if (= (. (fib.prelude/nth v i) id) id) (+ n 1) n)) n))))
+
+(defun permutation (v: (Vec Item) n: i64) -> bool
+  (and (= (fib.prelude/count v) n)
+       (loop ((id 0)) (if (< id n) (if (once v id) (recur (+ id 1)) false) true))))
+
+(defun items-of (keys: (Vec i64)) -> (Vec Item)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (fib.prelude/count keys)) (recur (+ i 1) (fib.prelude/conj acc (Item (fib.prelude/nth keys i) i))) acc)))
+
+(defun total (v: (Vec i64)) -> i64
+  (loop ((i 0) (s 0)) (if (< i (fib.prelude/count v)) (recur (+ i 1) (+ s (fib.prelude/nth v i))) s)))
+
+(defun ordered-ints (v: (Vec i64)) -> bool
+  (loop ((i 1)) (if (< i (fib.prelude/count v)) (if (<= (fib.prelude/nth v (- i 1)) (fib.prelude/nth v i)) (recur (+ i 1)) false) true)))
+
+(defun run (c: Checks fault: bool) -> unit
+  (let ((r (rng 342)))
+    (dotimes (t 300)
+      (let ((keys (rng-vec r (rng-below r 41) 5))
+            (out (sorted-by-key (items-of keys) fault))
+            (plain (to-vec (sort keys))))
+        (do (check c (ordered out))
+            (check c (stable out))
+            (check c (permutation out (fib.prelude/count keys)))
+            (check c (ordered-ints plain))
+            (check c (= (total plain) (total keys)))
+            (check c (= (fib.prelude/count plain) (fib.prelude/count keys))))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)))
+    (do (run c false)
+        (run p true)
+        (check c (= (checks-made c) 1800))
+        (check-detects c p)
+        (checks-result c))))

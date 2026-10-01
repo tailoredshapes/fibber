@@ -1,4 +1,85 @@
-;; owner: L7. fib.seq.seqable: seq, rest and next over every source. Exports: next; Seqable for List Range LSeq Map Set Array Option VSeq.
-;; Until L7 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.seq.seqable (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
+;; fib.seq.seqable: seq, rest and next over the sources (tranche 1 plan §4.2; owner L7).
+;; Exports: next; the Seqable instances for List, LSeq, VSeq, Option, Array, Range, Map and Set. (Vec is P0's, in fib.seq.vseq.)
+;; Replaces the prelude's `Iter.next` and the `rest` of its `Seq`, which M deletes.
+;;
+;; stdlib §2.1 rule 8: one closed seq type per collection, so recursion on `rest` is not polymorphic
+;; recursion. `seq` is nil when empty and the seq type otherwise; `rest` is never nil, and the rest of
+;; an empty seq is empty (Clojure's `(rest ())` is `()`). Decided here, where the page is silent:
+;;  - the seq types: a Vec has the VSeq (P0); a List, an LSeq, a VSeq and a Range are their own; an Option,
+;;    an Array, a Map (of its Pairs) and a Set have the LSeq of their elements.
+;;  - emptiness of a List, a VSeq and a Range is asked of `each-while` (the walk stops at the first element
+;;    and says whether it ran to the end), never of `size`, which is a walk for a List and a VSeq: their
+;;    `seq` is O(1), so the page's `len` idiom over them is linear and not quadratic.
+;;  - the tail of a List and of a VSeq's front is `list-tail`, the one place this part takes a List apart:
+;;    it reads the prelude's `Seq.rest` (`fib.prelude/rest`), so the part names no List variant and runs
+;;    before and after R2 renames `empty`/`cons` to `Empty`/`Cons`. When M deletes the prelude's `Seq`
+;;    the body becomes `(match l ((Cons _ t) t) (_ l))`.
+;;  - `seq` of an LSeq realises its first node and no other; `rest` of one realises the same node and
+;;    hands back the tail unrealised, so a lazy chain is walked one node per step.
+;;  - an Array's seq is read as it is demanded (Clojure's `(seq arr)` is a view too): the node at index i
+;;    holds `(array-get a i)` when it is realised.
+;;  - a Map and a Set are asked whether they are empty by `size`, which is the prelude's O(1) count: their
+;;    `each-while` cannot stop early until L4 (it walks on after a false), so it is not used for that.
+;;    Their seq is `to-lseq`: one Vec of their elements, built each time `seq` or `rest` is asked of the
+;;    Map itself (O(n)); the seq it returns is an LSeq, and walking that is one node per step.
+;;  - the rest of a Range is the Range from the next element, `(Range (+ lo by) hi by)`, formed only after
+;;    `range-more?` (fib.seq.sources) says there is one, so a range that ends at the largest integer never
+;;    overflows; the last element's rest is the empty Range `(Range hi hi by)`, a Range with step 0 is its
+;;    own rest, and the rest of an empty Range is itself.
+(ns fib.seq.seqable (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq fib.seq.sources))
+
+;; (seq (rest c)): nil when `c` has one element or none
+(defun next (c: c) :where ((Seqable c s) (Seqable s s)) -> (Option s) (seq (rest c)))
+
+(defun empty-lseq :private () -> (LSeq a) (LSeq (cell (Ready LNil))))
+
+;; the tail of a List: itself, empty, when it is empty
+(defun list-tail :private (l: (List a)) -> (List a) (fib.prelude/rest l))
+
+(impl (Seqable (List a)) (List a)
+  (seq (self) (if (each-while self (fn (x) false)) nil (some self)))
+  (rest (self) (list-tail self)))
+
+;; advance a VSeq by one: its front first, then the Vec from its offset (and never past the Vec's end)
+(impl (Seqable (VSeq a)) (VSeq a)
+  (seq (self) (if (each-while self (fn (x) false)) nil (some self)))
+  (rest (self)
+    (let ((f (. self front)) (v (. self v)) (lo (. self lo)))
+      (if (each-while f (fn (x) false))
+          (VSeq f v (if (< lo (fib.prelude/count v)) (+ lo 1) lo))
+          (VSeq (list-tail f) v lo)))))
+
+(impl (Seqable (LSeq a)) (LSeq a)
+  (seq (self) (match (lnode self) ((LNil) nil) ((LCons _ _) (some self))))
+  (rest (self) (match (lnode self) ((LNil) self) ((LCons _ t) t))))
+
+(impl (Seqable (LSeq a)) (Option a)
+  (seq (self) (match self (nil nil) ((some _) (some (to-lseq self)))))
+  (rest (self) (empty-lseq)))
+
+;; the nodes of an Array from index i, made as they are demanded
+(defun lseq-array-from :private (a: (Array e) i: i64) -> (LSeq e)
+  (lazy-node (fn () (if (< i (array-len a)) (LCons (array-get a i) (lseq-array-from a (+ i 1))) LNil))))
+
+(impl (Seqable (LSeq a)) (Array a)
+  (seq (self) (if (> (array-len self) 0) (some (lseq-array-from self 0)) nil))
+  (rest (self) (lseq-array-from self 1)))
+
+;; the Range from the next element; the empty Range (start = end) after the last
+(impl (Seqable (Range t)) (Range t) :where ((Num t) (Ord t) (Unit t) (RangeLen t))
+  (seq (self) (if (each-while self (fn (x) false)) nil (some self)))
+  (rest (self)
+    (let ((lo (. self lo)) (hi (. self hi)) (by (. self by)))
+      (if (each-while self (fn (x) false))
+          self
+          (if (= by (zero by))
+              self
+              (if (range-more? lo hi by) (Range (+ lo by) hi by) (Range hi hi by)))))))
+
+(impl (Seqable (LSeq (Pair k v))) (Map k v)
+  (seq (self) (if (> (size self) 0) (some (to-lseq self)) nil))
+  (rest (self) (rest (to-lseq self))))
+
+(impl (Seqable (LSeq k)) (Set k)
+  (seq (self) (if (> (size self) 0) (some (to-lseq self)) nil))
+  (rest (self) (rest (to-lseq self))))

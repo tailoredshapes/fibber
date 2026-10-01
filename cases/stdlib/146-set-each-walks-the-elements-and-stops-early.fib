@@ -1,0 +1,39 @@
+;; spec:   tranche 1 plan §4.1 (set-each, the early-exit walk of a Set over its elements)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; (set-each s f) is map-each over a Set's elements: f is called once per element while it answers true
+;; and the result says whether the walk ran to the end. A Set of 100 integers is walked in full (the
+;; count and the sum agree with the model, 0 to 99); an f that stops at the fourth element is called
+;; four times and the walk answers false; an empty Set is walked in no calls and answers true; a Set
+;; of strings hands each string over whole (the lengths add up); and a Set that had an element
+;; removed (disj) is walked without it.
+(ns main (:use tl.check))
+
+(defun build (n: i64) -> (Set i64)
+  (loop ((i 0) (s (set-empty)))
+    (if (< i n) (recur (+ i 1) (conj s i)) s)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s (build 100))
+        (n (cell 0)) (sum (cell 0))
+        (stop (cell 0))
+        (en (cell 0))
+        (strs (conj (conj (conj (set-empty) "a") "bb") "ccc"))
+        (len (cell 0))
+        (d (disj (build 10) 3))
+        (dn (cell 0)) (dsum (cell 0)) (saw3 (cell 0)))
+    (do (check c (set-each s (fn (x) (do (set! n (+ @n 1)) (set! sum (+ @sum x)) true))))
+        (check c (= @n 100))
+        (check c (= @sum 4950))
+        (check c (not (set-each s (fn (x) (do (set! stop (+ @stop 1)) (< @stop 4))))))
+        (check c (= @stop 4))
+        (check c (set-each (set-empty) (fn (x) (do (set! en (+ @en 1)) true))))
+        (check c (= @en 0))
+        (check c (set-each strs (fn (x) (do (set! len (+ @len (str-len x))) true))))
+        (check c (= @len 6))
+        (check c (set-each d (fn (x) (do (set! dn (+ @dn 1)) (set! dsum (+ @dsum x)) (if (= x 3) (set! saw3 1) ()) true))))
+        (check c (and (= @dn 9) (and (= @dsum 42) (= @saw3 0))))
+        (checks-result c))))

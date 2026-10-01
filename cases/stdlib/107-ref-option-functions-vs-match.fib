@@ -1,0 +1,105 @@
+;; spec:   stdlib §4.3 (rows unwrap map-opt and-then comp fnil nil? some? unwrap-or), §9.4 (ref- cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: unwrap map-opt and-then comp fnil nil? some? unwrap-or
+;; Each function of the Option part against a reference that is a `match` or
+;; a formula and uses no library function, over 200 seeded draws: an Option
+;; of an i64 (nil one time in three), an affine function a*x+b with seeded
+;; coefficients (the closure under test captures a and b; the reference
+;; computes the same number from them), a seeded modulus for the and-then
+;; function (nil when x is a multiple of m), a seeded default. The function
+;; under test and the reference answer from the same draw, so an Option
+;; compares with an Option by `=`.
+;; The planted faults: `run` takes a number that makes one reference wrong in
+;; one way (1 map-opt: an off-by-one in the offset; 2 and-then: a
+;; multiple of m kept instead of dropped; 3 comp: the composition in the other
+;; order; 4 fnil: the default used for a some holding 0; 5 unwrap-or: the
+;; default taken for a some holding 0; 6 nil? and some? swapped for a some
+;; holding 0), each run in a Checks of its own that must find a difference, which
+;; `check-detects` records in the case's own result. The seed is a constant.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun gen-opt (r: Rng) -> (Option i64)
+  (if (= (rng-below r 3) 0) nil (some (- (rng-below r 41) 20))))
+
+;; the references: a match or a formula, each with its planted fault behind a flag
+(defun ref-affine (a: i64 b: i64 x: i64) -> i64 (+ (* a x) b))
+
+(defun ref-map (o: (Option i64) a: i64 b: i64 bad: bool) -> (Option i64)
+  (match o
+    (nil nil)
+    ((some x) (some (ref-affine a (if bad (+ b 1) b) x)))))
+
+(defun ref-bind (o: (Option i64) m: i64 b: i64 bad: bool) -> (Option i64)
+  (match o
+    (nil nil)
+    ((some x) (if (if bad false (= (rem x m) 0)) nil (some (+ x b))))))
+
+(defun ref-comp (a: i64 b: i64 a2: i64 b2: i64 x: i64 bad: bool) -> i64
+  (if bad
+      (ref-affine a2 b2 (ref-affine a b x))
+      (ref-affine a b (ref-affine a2 b2 x))))
+
+(defun ref-fnil-arg (o: (Option i64) d: i64 bad: bool) -> i64
+  (match o
+    (nil d)
+    ((some x) (if (if bad (= x 0) false) d x))))
+
+(defun ref-unwrap-or (o: (Option i64) d: i64 bad: bool) -> i64
+  (match o
+    (nil d)
+    ((some x) (if (if bad (= x 0) false) d x))))
+
+(defun ref-nil? (o: (Option i64) bad: bool) -> bool
+  (match o
+    (nil true)
+    ((some x) (if bad (= x 0) false))))
+
+(defun ref-some? (o: (Option i64) bad: bool) -> bool
+  (match o
+    (nil false)
+    ((some x) (if bad (!= x 0) true))))
+
+;; one pass of 200 draws; bad selects the planted fault, 0 for none
+(defun run (c: Checks r: Rng bad: i64) -> unit
+  (dotimes (i 200)
+    (let ((o (gen-opt r))
+          (a (- (rng-below r 9) 4))
+          (b (- (rng-below r 21) 10))
+          (a2 (- (rng-below r 9) 4))
+          (b2 (- (rng-below r 21) 10))
+          (m (+ 2 (rng-below r 4)))
+          (d (- (rng-below r 41) 20))
+          (x (- (rng-below r 41) 20)))
+      (do
+        (check c (= (map-opt (fn (v) (+ (* a v) b)) o) (ref-map o a b (= bad 1))))
+        (check c (= (and-then (fn (v) (if (= (rem v m) 0) nil (some (+ v b)))) o) (ref-bind o m b (= bad 2))))
+        (check c (= ((comp (fn (v) (+ (* a v) b)) (fn (v) (+ (* a2 v) b2))) x) (ref-comp a b a2 b2 x (= bad 3))))
+        (check c (= ((fnil (fn (v) (+ (* a v) b)) d) o) (ref-affine a b (ref-fnil-arg o d (= bad 4)))))
+        (check c (= (unwrap-or o d) (ref-unwrap-or o d (= bad 5))))
+        (check c (= (nil? o) (ref-nil? o (= bad 6))))
+        (check c (= (some? o) (ref-some? o (= bad 6))))
+        (match o
+          (nil ())
+          ((some v) (check c (= (unwrap o) v))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks)) (p2 (checks)) (p3 (checks)) (p4 (checks)) (p5 (checks)) (p6 (checks)))
+    (do (run c (rng 4242) 0)
+        (check c (and (>= (checks-made c) 1400) (<= (checks-made c) 1600)))
+        (run p1 (rng 4242) 1)
+        (run p2 (rng 4242) 2)
+        (run p3 (rng 4242) 3)
+        (run p4 (rng 4242) 4)
+        (run p5 (rng 4242) 5)
+        (run p6 (rng 4242) 6)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (check-detects c p4)
+        (check-detects c p5)
+        (check-detects c p6)
+        (checks-result c))))

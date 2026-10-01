@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.4 (rows every? not-any?), §2.1 rule 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: every? not-any?
+;; every? stops at the first element the predicate refuses and not-any? at
+;; the first it accepts: a counting predicate is called once per element up
+;; to the deciding one and no more, and both end on a source with no end.
+;; Both are true of nothing (every? vacuously, not-any? too).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Naturals (from: i64))
+
+(impl (Reducible i64) Naturals
+  (each-while (self k)
+    (loop ((i (. self from))) (if (k i) (recur (+ i 1)) false))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (none: (Option i64) nil)
+        (ev: (Vec i64) (vec-empty)))
+    (do (check c (every? (fn (x) (do (set! calls (+ @calls 1)) (> x 0))) [1 2 3 4]))
+        (check c (= @calls 4))
+        (set! calls 0)
+        (check c (not (every? (fn (x) (do (set! calls (+ @calls 1)) (< x 3))) [1 2 3 4 5 6])))
+        (check c (= @calls 3))
+        (set! calls 0)
+        (check c (not-any? (fn (x) (do (set! calls (+ @calls 1)) (> x 9))) (list 1 2 3)))
+        (check c (= @calls 3))
+        (set! calls 0)
+        (check c (not (not-any? (fn (x) (do (set! calls (+ @calls 1)) (= x 2))) [1 2 3 4 5])))
+        (check c (= @calls 2))
+        (set! calls 0)
+        (check c (not (every? (fn (x) (< x 10)) (Naturals 1))))
+        (check c (not (not-any? (fn (x) (> x 10)) (Naturals 1))))
+        (check c (every? (fn (x) (do (set! calls (+ @calls 1)) false)) ev))
+        (check c (not-any? (fn (x) (do (set! calls (+ @calls 1)) true)) ev))
+        (check c (every? (fn (x) false) none))
+        (check c (not-any? (fn (x) true) none))
+        (check c (= @calls 0))
+        (check c (every? (fn (x) (> x 5)) (some 6)))
+        (check c (not (every? (fn (x) (> x 5)) (some 5))))
+        (check c (not-any? (fn (x) (> x 5)) (some 5)))
+        (check c (not-any? (fn (x) (> x 5)) (lcons 1 (lcons 2 (lazy-node (fn () LNil))))))
+        (checks-result c))))

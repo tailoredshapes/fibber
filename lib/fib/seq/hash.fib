@@ -1,4 +1,109 @@
-;; owner: L3. fib.seq.hash: hashing and equality of the collections. Exports: hash-ordered-coll hash-unordered-coll; Eq Ord Hash for Vec Map Set List.
-;; Until L3 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.seq.hash (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
+;; fib.seq.hash: equality, order and hash of the collections (stdlib §2.7; tranche 1 plan §4.2, package L3).
+;; Replaces nothing in the prelude: today `(= [1 2] [1 2])` is `no implementation of Eq for (Vec i64)`
+;; and a Vec, a Map or a Set cannot be a map key. Exports hash-ordered-coll and hash-unordered-coll;
+;; the instances are Eq Ord Hash for Vec and Eq Hash for Map and Set. Option and List have theirs from
+;; the expander's prelude and Pair and Triple get theirs from `derive` in the prelude (L4), so none is
+;; written here; Ord of a Map or a Set is not offered (Clojure's compare throws on a map, §2.7).
+;;
+;; Decided here, where the page is silent (every one is pinned by a case of 120 to 139):
+;;  - Eq (Vec a): the counts are equal and the elements are equal, in order, by the element's own `=`.
+;;  - Ord (Vec a) is Clojure's: the shorter vector is less, and of two of one length the first
+;;    position where one element is less than the other decides. Built on `<` alone, as Clojure's
+;;    `compare` is, so an element that is neither less nor greater (a NaN) is passed over.
+;;  - hash-ordered-coll folds `hash-combine` from the seed 1 over the hashes of the elements in
+;;    order and then combines the count, so `[1 2]` and `[2 1]` differ and so do `[]` and `[0]`. It
+;;    takes any Reducible, so the hash of a Vec, of a List and of a lazy seq of the same elements agree,
+;;    as Clojure's `(hash [1 2])` and `(hash '(1 2))` do.
+;;  - hash-unordered-coll xors the hashes of the elements (commutative, and it never traps) and then
+;;    combines the count, so `[1 1]` and `[]`, whose xor is the same, differ.
+;;  - Hash (Set k) is hash-unordered-coll of its elements. Hash (Map k v) is the same fold over the
+;;    entries, an entry's hash being `(hash-combine (hash key) (hash val))`. Both are independent of the
+;;    order of the walk, which for keys whose hashes collide is the order of insertion.
+;;  - Eq (Map k v): the counts are equal and every entry of one is in the other with an equal value.
+;;    Eq (Set k): the counts are equal and every element of one is in the other. Neither depends on the
+;;    order of the walk.
+;;  - never `*` in a combiner (the h*31 + x that the prelude's first Hash (List a) used trapped at three
+;;    strings): every combiner is `hash-combine` or `bit-xor`.
+;;
+;; Stand-ins (the plan §7.5): Reducible has no instance for Map and Set until L5a, so a Map and a Set
+;; are walked by the prelude's `for-each` through the four private helpers below (the entry it hands
+;; out is a prelude Pair, `fst` and `snd`, since L4), and counted by the prelude's Countable. The
+;; prelude has had the early-exit walks `map-each` and `set-each` since L4; moving the helpers onto
+;; them, or onto Reducible, changes only those lines.
+(ns fib.seq.hash (:use fib.seq.protocols))
+
+;; the hash of any source in its own order: equal elements in equal order, equal hash
+(defun hash-ordered-coll (c: c) :where ((Reducible c e) (Hash e)) -> i64
+  (let ((h (cell 1)) (n (cell 0)))
+    (do (each-while c (fn (x) (do (set! h (hash-combine @h (hash x))) (set! n (+ @n 1)) true)))
+        (hash-combine @h @n))))
+
+;; the hash of any source whatever the order of its elements: equal elements, equal hash
+(defun hash-unordered-coll (c: c) :where ((Reducible c e) (Hash e)) -> i64
+  (let ((h (cell 0)) (n (cell 0)))
+    (do (each-while c (fn (x) (do (set! h (bit-xor @h (hash x))) (set! n (+ @n 1)) true)))
+        (hash-combine @h @n))))
+
+(impl Eq (Vec a) :where ((Eq a))
+  (= (self y)
+    (let ((n (vec-count self)))
+      (if (= n (vec-count y))
+          (loop ((i 0))
+            (if (< i n) (if (= (vec-nth self i) (vec-nth y i)) (recur (+ i 1)) false) true))
+          false))))
+
+(impl Ord (Vec a) :where ((Ord a))
+  (< (self y)
+    (let ((n (vec-count self)) (m (vec-count y)))
+      (if (< n m)
+          true
+          (if (> n m)
+              false
+              (loop ((i 0))
+                (if (< i n)
+                    (let ((a (vec-nth self i)) (b (vec-nth y i)))
+                      (if (< a b) true (if (< b a) false (recur (+ i 1)))))
+                    false)))))))
+
+(impl Hash (Vec a) :where ((Hash a))
+  (hash (self) (hash-ordered-coll self)))
+
+;; the four stand-ins: how a Map and a Set are walked and counted until L5a and L4 land
+(defun map-walk :private (m: (Map k v) f: (fn (k v) unit) :borrow) -> unit
+  (for-each m (fn (e) (f (. e fst) (. e snd)))))
+
+(defun set-walk :private (s: (Set k) f: (fn (k) unit) :borrow) -> unit
+  (for-each s f))
+
+(defun map-size :private (m: (Map k v)) -> i64 (fib.prelude/count m))
+
+(defun set-size :private (s: (Set k)) -> i64 (fib.prelude/count s))
+
+(impl Eq (Map k v) :where ((Hash k) (Eq k) (Eq v))
+  (= (self y)
+    (if (= (map-size self) (map-size y))
+        (let ((ok (cell true)))
+          (do (map-walk self (fn (k v)
+                (if @ok (set! ok (match (map-get y k) ((some w) (= v w)) (nil false))) ())))
+              @ok))
+        false)))
+
+(impl Hash (Map k v) :where ((Hash k) (Hash v))
+  (hash (self)
+    (let ((h (cell 0)))
+      (do (map-walk self (fn (k v) (set! h (bit-xor @h (hash-combine (hash k) (hash v))))))
+          (hash-combine @h (map-size self))))))
+
+(impl Eq (Set k) :where ((Hash k) (Eq k))
+  (= (self y)
+    (if (= (set-size self) (set-size y))
+        (let ((ok (cell true)))
+          (do (set-walk self (fn (x) (if (set-contains? y x) () (set! ok false))))
+              @ok))
+        false)))
+
+(impl Hash (Set k) :where ((Hash k))
+  (hash (self)
+    (let ((h (cell 0)))
+      (do (set-walk self (fn (x) (set! h (bit-xor @h (hash x)))))
+          (hash-combine @h (set-size self))))))

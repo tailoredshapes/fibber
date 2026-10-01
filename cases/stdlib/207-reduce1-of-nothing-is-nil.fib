@@ -1,0 +1,51 @@
+;; spec:   stdlib §4.4 (row reduce1), §2.1 rule 3 (the 2-arity of reduce until L1)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce1
+;; (reduce1 f c) is Clojure's two-argument reduce with the Option where
+;; Clojure's (f) or nil has no type: nil on an empty source, the element
+;; itself (and no call of f) on a source of one, otherwise a left fold whose
+;; first accumulator is the first element: (reduce1 - [10 3 2]) is 5.
+;; reduce-nonempty is the same fold with the trap; it is the target of the
+;; macro that R6b writes for the two-argument reduce. Both over every kind
+;; of source, with strings, which are not scalars.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Upto (n: i64))
+
+(impl (Reducible i64) Upto
+  (each-while (self k)
+    (loop ((i 0)) (if (< i (. self n)) (if (k (+ i 1)) (recur (+ i 1)) false) true))))
+
+(defun minus (a: i64 x: i64) -> i64 (- a x))
+
+(defun is (o: (Option i64) n: i64) -> bool (match o (nil false) ((some x) (= x n))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (none: (Option i64) nil)
+        (ev: (Vec i64) (vec-empty))
+        (es: (Vec str) (vec-empty)))
+    (do (check c (nil? (reduce1 minus ev)))
+        (check c (nil? (reduce1 minus none)))
+        (check c (nil? (reduce1 minus (list))))
+        (check c (nil? (reduce1 minus (Upto 0))))
+        (check c (is (reduce1 minus [10 3 2]) 5))
+        (check c (is (reduce1 minus (list 10 3 2)) 5))
+        (check c (is (reduce1 minus (Upto 4)) -8))
+        (check c (is (reduce1 minus (VSeq (list 10) [3 2] 0)) 5))
+        (check c (is (reduce1 minus (lcons 10 (lcons 3 (lcons 2 (lazy-node (fn () LNil)))))) 5))
+        (check c (is (reduce1 (fn (a x) (do (set! calls (+ @calls 1)) a)) [42]) 42))
+        (check c (= @calls 0))
+        (check c (is (reduce1 (fn (a x) (do (set! calls (+ @calls 1)) (+ a x))) [1 2 3 4 5]) 15))
+        (check c (= @calls 4))
+        (check c (is (reduce1 minus (some 9)) 9))
+        (check c (match (reduce1 (fn (a x) (str-concat a x)) ["a" "b" "c"]) ((some s) (= s "abc")) (nil false)))
+        (check c (nil? (reduce1 (fn (a x) (str-concat a x)) es)))
+        (check c (= (reduce-nonempty minus [10 3 2]) 5))
+        (check c (= (reduce-nonempty minus (some 4)) 4))
+        (check c (= (reduce-nonempty (fn (a x) (str-concat a x)) ["x" "y"]) "xy"))
+        (checks-result c))))

@@ -1,0 +1,29 @@
+;; fib.string.split: `str/split`, `str/split-limit` and `str/split-lines` (owner L10b; stdlib §4.7, §2.9;
+;; tranche 1 plan §6 L10b). Replaces nothing in the prelude. The cutting is `Pattern`'s `split-by`
+;; (part `fib.string.pattern`), which is Java's `split`: these are its three spellings.
+;; Decided here, where the page is silent:
+;;  - `str/split-limit` is the 3-arity of `str/split` until arity overloading lands (L1), as the
+;;    row says; the pattern is a `str` or a `char`, the limit Java's (0 drops the trailing empty
+;;    strings, negative keeps them, positive caps the pieces).
+;;  - `str/split-lines` is Clojure's `(split s #"\r?\n")`: it cuts at LF and at CRLF, a lone CR is
+;;    not a line end, and the trailing empty strings are dropped, so `"a\nb\n"` is `["a" "b"]` and
+;;    the empty string is `[""]`. It is `split-by` of a private pattern that finds `\r?\n`.
+(ns fib.string.split (:use fib.core fib.string.pattern))
+
+(defun split (s: str p: p) :where ((Pattern p)) -> (Vec str) (split-by p s 0))
+
+(defun split-limit (s: str p: p n: i64) :where ((Pattern p)) -> (Vec str) (split-by p s n))
+
+;; the line break of `\r?\n`: LF, with the CR before it when there is one at or after `from`. A type with
+;; one value and no field (a struct with no field is refused), private to this part.
+(defenum LineBreak :private (LineBreakOf))
+
+(impl Pattern LineBreak
+  (find-in (self s from)
+    (match (str-find s "\n" from)
+      (nil nil)
+      ((some i) (if (> i from)
+                    (if (= (str-byte-at s (- i 1)) 13i8) (some (Pair (- i 1) (+ i 1))) (some (Pair i (+ i 1))))
+                    (some (Pair i (+ i 1))))))))
+
+(defun split-lines (s: str) -> (Vec str) (split-by LineBreakOf s 0))

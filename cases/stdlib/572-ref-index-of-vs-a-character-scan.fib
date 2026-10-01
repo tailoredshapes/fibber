@@ -1,0 +1,131 @@
+;; spec:   stdlib §4.7 (rows clojure.string/index-of, str/index-of-from), §2.9, plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: clojure.string/index-of str/index-of-from
+;; `str/index-of` and `str/index-of-from` against a scan over characters, for 300 seeded (text,
+;; pattern, from) triples. The text is up to twelve characters of five (`a`, `b`, `é`, `€`, `😀`: all
+;; the widths), the pattern is, for half of the triples, up to three characters of the same five,
+;; and for the other half a piece of the text itself, so that hits are common; `from` runs from -2
+;; to two past the end of the text. A character pattern (`char`) is also asked for whenever the
+;; pattern is one character long. The library works on bytes, `str-byte-at`, and converts the byte
+;; offset of a match into a character offset; the reference does not know bytes: it is the vector of
+;; characters the prelude's `str-chars` decodes, a `from` clamped to 0..count (Java's rule, which
+;; makes the empty pattern at or past the end the count), and a nested loop that compares character
+;; by character at each start from `from` to the last place the pattern fits.
+;; Four checks: (1) no triple answers differently from the reference (`index-of`, `index-of-from`,
+;; and `index-of-from` with a `char` for the one-character patterns); (2) a fingerprint of the
+;; library's answers (`h = (h * 131 + x) mod 1000000007` over 0 for nil and the offset plus one) equals the number
+;; that a Java program printed (the same generator, `String.indexOf(p, from)` and `indexOf(p)`, JDK
+;; 27, with "😀" mapped to one private-use BMP character so that its offsets count scalars: Java
+;; counts UTF-16 units); (3) at least a third of the triples find a match, so the scan was not all
+;; misses; (4) the PLANTED FAULT: a reference whose scan starts one character after `from` (it
+;; misses a match that begins at `from`) must differ from the library, in a second `Checks`.
+(ns main (:use fib.core tl.rng tl.check) (:require [fib.string :as str]))
+
+(defun alphabet (i: i64) -> str
+  (match i (0 "a") (1 "b") (2 "é") (3 "€") (_ "😀")))
+
+(defun from-chars (cs: (Vec char) a: i64 b: i64) -> str
+  (loop ((i a) (acc ""))
+    (if (< i b) (recur (+ i 1) (str-concat acc (char->str (fib.prelude/vec-nth cs i)))) acc)))
+
+(defun random-chars (r: Rng n: i64) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i n) (recur (+ i 1) (str-concat acc (alphabet (rng-below r 5)))) acc)))
+
+;; ---- the reference ----
+
+(defun fits? (cs: (Vec char) ps: (Vec char) at: i64) -> bool
+  (loop ((k 0))
+    (if (< k (fib.prelude/vec-count ps))
+        (if (= (fib.prelude/vec-nth cs (+ at k)) (fib.prelude/vec-nth ps k)) (recur (+ k 1)) false)
+        true)))
+
+;; -1 for none; skip is the planted fault: the scan starts that many characters after from
+(defun ref-index (s: str p: str from: i64 skip: i64) -> i64
+  (let ((cs (fib.prelude/str-chars s))
+        (ps (fib.prelude/str-chars p)))
+    (let ((n (fib.prelude/vec-count cs))
+          (m (fib.prelude/vec-count ps)))
+      (let ((f (if (< from 0) 0 (if (> from n) n from))))
+        (loop ((i (+ f skip)))
+          (if (<= (+ i m) n) (if (fits? cs ps i) i (recur (+ i 1))) -1))))))
+
+(defun at (o: (Option i64)) -> i64
+  (match o (nil -1) ((some n) n)))
+
+;; ---- the fingerprint ----
+
+(defun fp (h: i64 x: i64) -> i64 (rem (+ (* h 131) x) 1000000007))
+
+;; [triples that differ from the reference, from the planted reference, that find a match] and the fingerprint
+(defstruct Tally (bad: (Cell i64) planted: (Cell i64) found: (Cell i64) print: (Cell i64)))
+
+(defun note (t: Tally got: i64 want: i64 planted: i64) -> unit
+  (do (if (= got want) () (set! (. t bad) (+ @(. t bad) 1)))
+      (if (= got planted) () (set! (. t planted) (+ @(. t planted) 1)))))
+
+(defun one (t: Tally s: str p: str from: i64) -> unit
+  (let ((got (at (str/index-of-from s p from)))
+        (plain (at (str/index-of s p))))
+    (do (note t got (ref-index s p from 0) (ref-index s p from 1))
+        (note t plain (ref-index s p 0 0) (ref-index s p 0 1))
+        (if (>= got 0) (set! (. t found) (+ @(. t found) 1)) ())
+        (set! (. t print) (fp (fp @(. t print) (+ got 1)) (+ plain 1)))
+        (if (= (str-len p) 0)
+            ()
+            (if (= (fib.prelude/vec-count (fib.prelude/str-chars p)) 1)
+                (let ((ch (fib.prelude/vec-nth (fib.prelude/str-chars p) 0)))
+                  (do (note t (at (str/index-of-from s ch from)) (ref-index s p from 0) (ref-index s p from 1))
+                      (note t (at (str/index-of s ch)) (ref-index s p 0 0) (ref-index s p 0 1))))
+                ())))))
+
+(defun run (t: Tally n: i64) -> unit
+  (let ((r (rng 572)))
+    (dotimes (i n)
+      (let ((s (random-chars r (rng-below r 13))))
+        (let ((cs (fib.prelude/str-chars s)))
+          (let ((p (if (= (rng-below r 2) 0)
+                       (random-chars r (rng-below r 4))
+                       (let ((a (rng-below r (+ (fib.prelude/vec-count cs) 1))))
+                         (let ((b (+ a (rng-below r (+ (- (fib.prelude/vec-count cs) a) 1)))))
+                           (from-chars cs a (if (> b (+ a 3)) (+ a 3) b))))))
+                (from (- (rng-below r (+ (fib.prelude/vec-count cs) 5)) 2)))
+            (one t s p from)))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (t (Tally (cell 0) (cell 0) (cell 0) (cell 0))))
+    (do (run t 300)
+        (check c (= @(. t bad) 0))
+        (check c (= @(. t print) 848884777))
+        (check c (>= (* 3 @(. t found)) 300))
+        (check p (= @(. t planted) 0))
+        (check-detects c p)
+        (checks-result c))))
+
+;; ---- the oracle: the Java program whose output is the fingerprint above (JDK 27; save the lines
+;; without their `;; ` as Ref572.java, then `javac Ref572.java && java Ref572` prints 848884777) ----
+;; public class Ref572 {
+;;   static long state;
+;;   static long next() { long x = state; x ^= x << 13; x ^= x >>> 7; x ^= x << 17; state = x; return x; }
+;;   static long below(long n) { return (next() >>> 1) % n; }
+;;   static final String[] A = {"a", "b", "é", "€", new String(Character.toChars(0xE000))};   // the last stands for 😀: one BMP character, so offsets count scalars
+;;   static long fp(long h, long x) { return (h * 131 + x) % 1000000007L; }
+;;   public static void main(String[] args) {
+;;     state = 572; long h = 0;
+;;     for (int i = 0; i < 300; i++) {
+;;       int n = (int) below(13); StringBuilder sb = new StringBuilder();
+;;       for (int k = 0; k < n; k++) sb.append(A[(int) below(5)]);
+;;       String s = sb.toString(), p;
+;;       if (below(2) == 0) { int pl = (int) below(4); StringBuilder pb = new StringBuilder(); for (int k = 0; k < pl; k++) pb.append(A[(int) below(5)]); p = pb.toString(); }
+;;       else { int a = (int) below(n + 1); int b = a + (int) below(n - a + 1); if (b > a + 3) b = a + 3; p = s.substring(a, b); }
+;;       int from = (int) below(n + 5) - 2;
+;;       h = fp(h, s.indexOf(p, from) + 1); h = fp(h, s.indexOf(p) + 1);
+;;     }
+;;     System.out.println(h);
+;;   }
+;; }

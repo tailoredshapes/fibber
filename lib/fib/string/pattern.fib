@@ -1,0 +1,75 @@
+;; fib.string.pattern: what `str/split`, `str/index-of` and the other searching functions look for
+;; (owner L10b; stdlib §2.3 row `Pattern p`, §2.9; tranche 1 plan §6 L10b). Clojure's `split` takes a
+;; Regex; a `Regex` is tranche 4, so tranche 1 offers the typed superset of the page: a `str` or a
+;; `char` is a pattern, matched literally. Replaces nothing in the prelude.
+;; Decided here, where the page is silent:
+;;  - `find-in` answers byte offsets [start, end) of the first match at or after the byte offset
+;;    `from`, which must lie between two characters and not past the end (`str-find`'s rule: it traps
+;;    otherwise); `(Pair start end)`, whose Pair is `fib.core`'s.
+;;  - `split-by` is Java's `Pattern.split(input, limit)`, which `clojure.string/split` calls, and
+;;    this part follows its text: limit 0 drops the trailing empty strings, a negative limit keeps
+;;    them, a positive limit makes at most that many pieces and the last one is the rest of the
+;;    string; a zero-width match at the start makes no empty first piece; a string with no match is
+;;    one piece, itself, even when it is empty (`(split "" ",")` is `[""]`, `(split "," ",")` is `[]`).
+;;    A zero-width match is the empty string as a pattern (`(split "abc" "")` is `["a" "b" "c"]`):
+;;    the search then goes on one character later, as Java's `Matcher.find` does.
+;;  - an instance only needs `find-in`; `split-by` has the default below. `replace-in` is tranche 3.
+;;  - the instances for `str` and `char` are here, with the protocol, and not in an implicit part
+;;    (plan §4.3 rule 6): the protocol is reachable only through this module, so every program that
+;;    can name `Pattern` has loaded them.
+(ns fib.string.pattern (:use fib.core fib.string.utf8))
+
+(defprotocol Pattern
+  (find-in (self s: str from: i64) -> (Option (Pair i64 i64)))
+  (split-by (self s: str limit: i64) -> (Vec str) (split-pieces self s limit)))
+
+;; a `str` is itself, matched byte for byte; the empty `str` matches everywhere, also at the end
+(impl Pattern str
+  (find-in (self s from)
+    (match (str-find s self from)
+      (nil nil)
+      ((some i) (some (Pair i (+ i (str-len self))))))))
+
+;; a `char` is the string of its one character
+(impl Pattern char
+  (find-in (self s from) (find-in (char->str self) s from)))
+
+;; where the next search starts after the match [st, en): at its end, or one character on when it
+;; is empty, or -1 when an empty match at the very end leaves nothing to search
+(defun next-from :private (s: str st: i64 en: i64) -> i64
+  (if (= st en)
+      (if (< en (str-len s)) (+ en (width-of (byte-at s en))) -1)
+      en))
+
+;; the pieces that were cut, then the rest of the string (Java's text after the loop)
+(defun finish-pieces :private (s: str index: i64 limit: i64 pieces: (Vec str)) -> (Vec str)
+  (if (= index 0)
+      (fib.prelude/vec-conj (vec-empty) s)
+      (let ((all (fib.prelude/vec-conj pieces (str-slice s index (str-len s)))))
+        (if (= limit 0) (drop-empty-tail all) all))))
+
+;; the pieces without the empty strings that end them
+(defun drop-empty-tail :private (v: (Vec str)) -> (Vec str)
+  (let ((n (loop ((n (fib.prelude/vec-count v)))
+             (if (> n 0)
+                 (if (= (str-len (fib.prelude/vec-nth v (- n 1))) 0) (recur (- n 1)) n)
+                 n))))
+    (if (= n (fib.prelude/vec-count v))
+        v
+        (loop ((i 0) (acc (vec-empty)))
+          (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (fib.prelude/vec-nth v i))) acc)))))
+
+;; the text of Java's split, over `find-in`: `from` is where the search goes on (-1: nowhere),
+;; `index` where the piece being made starts
+(defun split-pieces :private (p: p s: str limit: i64) :where ((Pattern p)) -> (Vec str)
+  (loop ((from 0) (index 0) (pieces (vec-empty)))
+    (if (if (< from 0) true (if (> limit 0) (= (fib.prelude/vec-count pieces) (- limit 1)) false))
+        (finish-pieces s index limit pieces)
+        (match (find-in p s from)
+          (nil (finish-pieces s index limit pieces))
+          ((some m)
+           (let ((st (. m fst))
+                 (en (. m snd)))
+             (if (if (= index 0) (if (= st 0) (= en 0) false) false)
+                 (recur (next-from s st en) index pieces)
+                 (recur (next-from s st en) en (fib.prelude/vec-conj pieces (str-slice s index st))))))))))

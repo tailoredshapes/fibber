@@ -1,0 +1,35 @@
+;; spec:   stdlib §4.3 (row mod), tranche 1 plan §9.4 (ref- cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mod quot
+;; mod against the definition a - b * floor(a / b), the floor made from the
+;; builtin quot (which truncates) by stepping down when the quotient is not
+;; exact and the signs differ: 300 seeded pairs with both signs, at i64 and,
+;; for the same values, at i32. The planted fault is the same formula with
+;; the truncating quotient left as it is, which is rem: a second Checks runs
+;; it against `mod` and must fail somewhere, or the case itself fails.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun floor-quot (a: i64 b: i64) -> i64
+  (let ((q (quot a b)))
+    (if (and (!= (* q b) a) (!= (< a 0) (< b 0))) (- q 1) q)))
+
+(defun mod-formula (a: i64 b: i64) -> i64 (- a (* b (floor-quot a b))))
+(defun mod-planted (a: i64 b: i64) -> i64 (- a (* b (quot a b))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (r (rng 70)))
+    (do (dotimes (i 300)
+          (let ((a (- (rng-below r 2001) 1000))
+                (b0 (- (rng-below r 41) 20)))
+            (let ((b (if (= b0 0) 7 b0)))
+              (do (check c (= (mod a b) (mod-formula a b)))
+                  (check c (= (mod (trunc i32 a) (trunc i32 b)) (trunc i32 (mod-formula a b))))
+                  (check p (= (mod a b) (mod-planted a b)))))))
+        (check c (= (checks-made c) 600))
+        (check-detects c p)
+        (checks-result c))))

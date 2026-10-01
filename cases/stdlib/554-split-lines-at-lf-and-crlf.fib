@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.7 (row clojure.string/split-lines), plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: clojure.string/split-lines
+;; `(str/split-lines s)` is Clojure's `(split s #"\r?\n")`: it cuts at LF and at CRLF, a CR on its
+;; own is no line end, and, being a `split` with limit 0, it drops the empty lines that end the
+;; result but keeps the ones inside it and one at the start. So `"a\nb\n"` is `["a" "b"]`, the
+;; empty string is `[""]` (no match: itself) and `"\n"` is `[]`. A CR before the LF belongs to the
+;; line break, not to the line: `"a\r\r\nb"` is `["a\r" "b"]`. Expected values are Java's
+;; (`Pattern.compile("\\r?\\n").split(s, 0)`, JDK 27). Characters of any width stay whole.
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+(defun same? (v: (Vec str) w: (Vec str)) -> bool
+  (if (= (fib.prelude/vec-count v) (fib.prelude/vec-count w))
+      (loop ((i 0))
+        (if (< i (fib.prelude/vec-count v))
+            (if (= (fib.prelude/vec-nth v i) (fib.prelude/vec-nth w i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (same? (str/split-lines "a\nb\r\nc\n\n") ["a" "b" "c"]))
+        (check c (same? (str/split-lines "") [""]))
+        (check c (same? (str/split-lines "\n") []))
+        (check c (same? (str/split-lines "\r\n") []))
+        (check c (same? (str/split-lines "\n\r\n") []))
+        (check c (same? (str/split-lines "abc") ["abc"]))
+        (check c (same? (str/split-lines "a\rb") ["a\rb"]))
+        (check c (same? (str/split-lines "a\rb\r\r\nc") ["a\rb\r" "c"]))
+        (check c (same? (str/split-lines "a\r\n") ["a"]))
+        (check c (same? (str/split-lines "\na") ["" "a"]))
+        (check c (same? (str/split-lines "a\n\nb") ["a" "" "b"]))
+        (check c (same? (str/split-lines "a\r\n\r\nb") ["a" "" "b"]))
+        (check c (same? (str/split-lines " a \n b ") [" a " " b "]))
+        (check c (same? (str/split-lines "é\n😀\r\n€") ["é" "😀" "€"]))
+        (check c (same? (str/split-lines "x\n\n\n") ["x"]))
+        (check c (same? (str/split-lines "\n\nx") ["" "" "x"]))
+        (checks-result c))))

@@ -1,0 +1,146 @@
+;; spec:   stdlib §4.7 (rows clojure.string/trim triml trimr blank?), §2.9, plan §6 L10b, C-22
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: clojure.string/trim clojure.string/triml clojure.string/trimr clojure.string/blank?
+;; `str/trim`, `str/triml`, `str/trimr` and `str/blank?` against a plain loop, over 300 seeded
+;; strings of up to ten characters, each one of twelve: the ASCII space, tab and newline, U+001C
+;; (Java whitespace that Unicode's `White_Space` lacks), U+2003 and U+3000 (whitespace in both),
+;; U+00A0 and U+0085 (whitespace in Unicode's property and NOT in Java's, which Clojure's `trim`
+;; uses), and four that are not whitespace in either: `a`, `b`, `é` and `😀`. The library finds
+;; whitespace by comparing the scalar with ranges; the reference does not: it is the loop of the
+;; Clojure source (the vector of characters the prelude's `str-chars` decodes, a pointer from each
+;; end that moves while the character is in a list of the 25 whitespace codes of Java's
+;; `isWhitespace`, found by a linear scan of that list, and the characters between the pointers).
+;; Four checks: (1) no string gives a different trim, triml, trimr or blank? from the reference;
+;; (2) a fingerprint of the library's answers (`h = (h * 131 + x) mod 1000000007`, over the length and
+;; the codes of each of the three strings and 0 or 1 for `blank?`) equals the number that a Java
+;; program printed (the same generator, Clojure's `trim` loop over `Character.isWhitespace`, JDK 27);
+;; (3) a quarter or more of the strings is changed by trim, so the loop did its work; (4) the
+;; PLANTED FAULT: the reference whose list also has U+00A0 (the "Unicode whitespace" reading of the
+;; page's note) must differ from the library on some string, in a second `Checks`, or the case fails.
+(ns main (:use fib.core tl.rng tl.check) (:require [fib.string :as str]))
+
+(defun alphabet (i: i64) -> str
+  (match i (0 " ") (1 "\t") (2 "\n") (3 "\x1c") (4 "\u{2003}") (5 "\u{3000}") (6 "\u{a0}") (7 "\u{85}") (8 "a") (9 "é") (10 "😀") (_ "b")))
+
+(defun make-text (r: Rng) -> str
+  (let ((n (rng-below r 11)))
+    (loop ((i 0) (acc ""))
+      (if (< i n) (recur (+ i 1) (str-concat acc (alphabet (rng-below r 12)))) acc))))
+
+;; ---- the reference ----
+
+;; the whitespace codes of Java's Character.isWhitespace, listed one by one; planted adds U+00A0
+(defun ws-codes (planted: bool) -> (Vec i64)
+  (let ((base [9 10 11 12 13 28 29 30 31 32 5760 8192 8193 8194 8195 8196 8197 8198 8200 8201 8202 8232 8233 8287 12288]))
+    (if planted (fib.prelude/vec-conj base 160) base)))
+
+(defun in-list? (v: (Vec i64) code: i64) -> bool
+  (loop ((i 0))
+    (if (< i (fib.prelude/vec-count v))
+        (if (= (fib.prelude/vec-nth v i) code) true (recur (+ i 1)))
+        false)))
+
+(defun ws-at? (cs: (Vec char) i: i64 ws: (Vec i64)) -> bool
+  (in-list? ws (zext i64 (char->i32 (fib.prelude/vec-nth cs i)))))
+
+(defun chars-between (cs: (Vec char) a: i64 b: i64) -> str
+  (loop ((i a) (acc ""))
+    (if (< i b) (recur (+ i 1) (str-concat acc (char->str (fib.prelude/vec-nth cs i)))) acc)))
+
+;; the index of the first character that is not whitespace (the count when there is none)
+(defun ref-lo (cs: (Vec char) ws: (Vec i64)) -> i64
+  (loop ((i 0))
+    (if (< i (fib.prelude/vec-count cs)) (if (ws-at? cs i ws) (recur (+ i 1)) i) i)))
+
+;; one past the index of the last character that is not whitespace (0 when there is none)
+(defun ref-hi (cs: (Vec char) ws: (Vec i64) floor: i64) -> i64
+  (loop ((j (fib.prelude/vec-count cs)))
+    (if (> j floor) (if (ws-at? cs (- j 1) ws) (recur (- j 1)) j) floor)))
+
+;; what the library must answer: [trim triml trimr] and blank?
+(defstruct Answer (trim: str triml: str trimr: str blank: bool))
+
+(defun ref-answer (s: str planted: bool) -> Answer
+  (let ((cs (fib.prelude/str-chars s))
+        (ws (ws-codes planted)))
+    (let ((lo (ref-lo cs ws))
+          (hi (ref-hi cs ws 0)))
+      (Answer (if (< lo hi) (chars-between cs lo hi) "")
+              (chars-between cs lo (fib.prelude/vec-count cs))
+              (chars-between cs 0 hi)
+              (= lo (fib.prelude/vec-count cs))))))
+
+(defun lib-answer (s: str) -> Answer
+  (Answer (str/trim s) (str/triml s) (str/trimr s) (str/blank? s)))
+
+(defun same? (a: Answer b: Answer) -> bool
+  (and (= (. a trim) (. b trim))
+       (and (= (. a triml) (. b triml))
+            (and (= (. a trimr) (. b trimr)) (= (. a blank) (. b blank))))))
+
+;; ---- the fingerprint ----
+
+(defun fp (h: i64 x: i64) -> i64 (rem (+ (* h 131) x) 1000000007))
+
+(defun fp-str (h: i64 s: str) -> i64
+  (let ((cs (fib.prelude/str-chars s)))
+    (loop ((i 0) (acc (fp h (fib.prelude/vec-count cs))))
+      (if (< i (fib.prelude/vec-count cs))
+          (recur (+ i 1) (fp acc (zext i64 (char->i32 (fib.prelude/vec-nth cs i)))))
+          acc))))
+
+(defun fp-answer (h: i64 a: Answer) -> i64
+  (fp (fp-str (fp-str (fp-str h (. a trim)) (. a triml)) (. a trimr)) (if (. a blank) 1 0)))
+
+;; [strings that differ from the reference, from the planted reference, that trim changed] and the fingerprint
+(defstruct Tally (bad: (Cell i64) planted: (Cell i64) changed: (Cell i64) print: (Cell i64)))
+
+(defun run (t: Tally n: i64) -> unit
+  (let ((r (rng 571)))
+    (dotimes (i n)
+      (let ((s (make-text r)))
+        (let ((got (lib-answer s)))
+          (do (if (same? got (ref-answer s false)) () (set! (. t bad) (+ @(. t bad) 1)))
+              (if (same? got (ref-answer s true)) () (set! (. t planted) (+ @(. t planted) 1)))
+              (if (= (. got trim) s) () (set! (. t changed) (+ @(. t changed) 1)))
+              (set! (. t print) (fp-answer @(. t print) got))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (t (Tally (cell 0) (cell 0) (cell 0) (cell 0))))
+    (do (run t 300)
+        (check c (= @(. t bad) 0))
+        (check c (= @(. t print) 915544434))
+        (check c (>= (* 4 @(. t changed)) 300))
+        (check p (= @(. t planted) 0))
+        (check-detects c p)
+        (checks-result c))))
+
+;; ---- the oracle: the Java program whose output is the fingerprint above (JDK 27; save the lines
+;; without their `;; ` as Ref571.java, then `javac Ref571.java && java Ref571` prints 915544434) ----
+;; public class Ref571 {
+;;   static long state;
+;;   static long next() { long x = state; x ^= x << 13; x ^= x >>> 7; x ^= x << 17; state = x; return x; }
+;;   static long below(long n) { return (next() >>> 1) % n; }
+;;   static String cp(int c) { return new String(Character.toChars(c)); }
+;;   static final String[] A = {" ", "\t", "\n", cp(0x1c), cp(0x2003), cp(0x3000), cp(0xa0), cp(0x85), "a", "é", "😀", "b"};
+;;   static long fp(long h, long x) { return (h * 131 + x) % 1000000007L; }
+;;   static boolean ws(char c) { return Character.isWhitespace(c); }
+;;   static String triml(String s) { int i = 0; while (i < s.length() && ws(s.charAt(i))) i++; return s.substring(i); }
+;;   static String trimr(String s) { int j = s.length(); while (j > 0 && ws(s.charAt(j - 1))) j--; return s.substring(0, j); }
+;;   static long fps(long h, String s) { int[] cps = s.codePoints().toArray(); h = fp(h, cps.length); for (int c : cps) h = fp(h, c); return h; }
+;;   public static void main(String[] args) {
+;;     state = 571; long h = 0;
+;;     for (int i = 0; i < 300; i++) {
+;;       int len = (int) below(11); StringBuilder sb = new StringBuilder();
+;;       for (int k = 0; k < len; k++) sb.append(A[(int) below(12)]);
+;;       String s = sb.toString(), tl = triml(s), tr = trimr(s), t = trimr(tl);
+;;       h = fps(h, t); h = fps(h, tl); h = fps(h, tr); h = fp(h, t.isEmpty() ? 1 : 0);
+;;     }
+;;     System.out.println(h);
+;;   }
+;; }

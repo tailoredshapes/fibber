@@ -1,0 +1,43 @@
+;; spec:   tranche 1 plan §4.1 (map-each), types §2.13 (a bucket holds the keys whose hashes are equal)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; A Hash instance that answers 7 for every key puts every entry of the map in one bucket (the trie's
+;; MColl, whose entries are Pairs), told apart by Eq. map-each walks the bucket entry by entry: all
+;; five entries are visited with their own keys and values, and an f that stops at the second entry
+;; stops the walk inside the bucket, with the answer false and no entry after it visited. Replacing a
+;; key's value keeps the bucket at five entries, and dissoc takes one out, both seen by the walk.
+(ns main (:use tl.check))
+
+(defstruct K (n: i64))
+(impl Eq K (= (self o) (= (. self n) (. o n))))
+(impl Hash K (hash (self) 7))
+
+(defun build () -> (Map K i64)
+  (loop ((i 1) (m (map-empty)))
+    (if (<= i 5) (recur (+ i 1) (assoc m (K i) (* i 100))) m)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (build))
+        (ks (cell 0))
+        (vs (cell 0))
+        (n (cell 0))
+        (seen (cell 0))
+        (m2 (assoc (build) (K 3) 999))
+        (m3 (dissoc (build) (K 2)))
+        (n2 (cell 0)) (s2 (cell 0))
+        (n3 (cell 0)) (s3 (cell 0)))
+    (do (check c (= (count m) 5))
+        (check c (map-each m (fn (k v) (do (set! ks (+ @ks (. k n))) (set! vs (+ @vs v)) (set! n (+ @n 1)) true))))
+        (check c (= @n 5))
+        (check c (= @ks 15))
+        (check c (= @vs 1500))
+        (check c (not (map-each m (fn (k v) (do (set! seen (+ @seen 1)) (< @seen 2))))))
+        (check c (= @seen 2))
+        (check c (map-each m2 (fn (k v) (do (set! n2 (+ @n2 1)) (set! s2 (+ @s2 v)) true))))
+        (check c (and (= @n2 5) (= @s2 (+ 100 (+ 200 (+ 999 (+ 400 500)))))))
+        (check c (map-each m3 (fn (k v) (do (set! n3 (+ @n3 1)) (set! s3 (+ @s3 v)) true))))
+        (check c (and (= @n3 4) (= @s3 1300)))
+        (checks-result c))))

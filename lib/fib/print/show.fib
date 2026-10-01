@@ -1,4 +1,125 @@
-;; owner: L11. fib.print.show: the printed forms. Exports: no names; Show Debug ToStr for the scalars, Option Vec Pair Triple Map Set List, the seq types and the recipes.
-;; Until L11 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.print.show (:use fib.core fib.seq fib.coll))
+;; fib.print.show: the printed forms of stdlib §2.7 (tranche 1 plan §4.2; owner L11). Exports no names:
+;; Show, Debug and ToStr instances for the scalars, Option, Vec, Pair, Triple, Set, Map, List, VSeq, LSeq and
+;; Range. It replaces nothing in the prelude, whose Show for Option and List is R2's. The recipe structs of the
+;; fused path have no instance: a recipe is never a value of a program (stdlib §2.1 rule 2), and what a
+;; program holds of an adaptor's result is an LSeq. The three printers differ as Clojure's do: Show is `println`'s
+;; text (strings bare at every depth), Debug is `pr`'s (strings quoted), ToStr is `str`'s, which for a
+;; collection is its Debug text and for an Option is the payload's ToStr (the empty text for nil).
+;; Decided here, where the page gives only the pattern:
+;;  - a seq (List VSeq LSeq Range) is `(1 2)`, a Vec Pair Triple is `[1 2]`, a Set `#{1 2}`, a Map `{1 2, 3 4}`
+;;    with the entries in the order the walk gives them; ToStr of each is its Debug text.
+;;  - Debug of a char is a backslash and the character, and Clojure's names for the six it names:
+;;    \newline \space \tab \return \backspace \formfeed (char-name-string).
+;;  - the number types print as the builtin Show does, so the text of a float is C12's when C12 lands.
+;; The Debug text of a string is P0's instance in fib.core.protocols (the stand-in there does not escape).
+(ns fib.print.show (:use fib.core fib.seq))
+
+;; the elements of c, each through f, between open and close, sep apart, built in one pass
+(defun seq-text :private (c: c f: (fn (e) str) :borrow open: str sep: str close: str) :where ((Reducible c e)) -> str
+  (let ((parts (cell (vec-conj (vec-empty) open))))
+    (do (each-while c
+          (fn (x)
+            (do (if (> (vec-count @parts) 1) (set! parts (vec-conj @parts sep)) ())
+                (set! parts (vec-conj @parts (f x)))
+                true)))
+        (str-join (vec-conj @parts close)))))
+
+;; the numbers and bool print as the builtin Show does
+(impl ToStr i8 (to-str (self) (show self)))
+(impl ToStr i16 (to-str (self) (show self)))
+(impl ToStr i32 (to-str (self) (show self)))
+(impl ToStr i64 (to-str (self) (show self)))
+(impl ToStr f32 (to-str (self) (show self)))
+(impl ToStr f64 (to-str (self) (show self)))
+(impl ToStr bool (to-str (self) (show self)))
+(impl Debug i8 (debug (self) (show self)))
+(impl Debug i16 (debug (self) (show self)))
+(impl Debug i32 (debug (self) (show self)))
+(impl Debug i64 (debug (self) (show self)))
+(impl Debug f32 (debug (self) (show self)))
+(impl Debug f64 (debug (self) (show self)))
+(impl Debug bool (debug (self) (show self)))
+
+;; a char is its own text; Debug is the reader's form, a backslash and the char or its name
+(defun char-name :private (code: i32) -> str
+  (cond ((= code 10i32) "newline")
+        ((= code 32i32) "space")
+        ((= code 9i32) "tab")
+        ((= code 13i32) "return")
+        ((= code 8i32) "backspace")
+        ((= code 12i32) "formfeed")
+        (true "")))
+
+(impl ToStr char (to-str (self) (char->str self)))
+(impl Debug char
+  (debug (self)
+    (let ((name (char-name (char->i32 self))))
+      (str-concat "\\" (if (= (str-len name) 0) (char->str self) name)))))
+
+;; Option: a present value is its payload, as in Clojure, which has no wrapper
+(impl ToStr (Option a) :where ((ToStr a))
+  (to-str (self) (match self (nil "") ((some x) (to-str x)))))
+(impl Debug (Option a) :where ((Debug a))
+  (debug (self) (match self (nil "nil") ((some x) (debug x)))))
+
+;; Vec: [1 2]
+(impl Show (Vec a) :where ((Show a))
+  (show (self) (seq-text self (fn (x) (show x)) "[" " " "]")))
+(impl Debug (Vec a) :where ((Debug a))
+  (debug (self) (seq-text self (fn (x) (debug x)) "[" " " "]")))
+(impl ToStr (Vec a) :where ((Debug a))
+  (to-str (self) (debug self)))
+
+;; Pair and Triple print as a Vec of their fields: [1 2]
+(impl Show (Pair a b) :where ((Show a) (Show b))
+  (show (self) (str-join ["[" (show (. self fst)) " " (show (. self snd)) "]"])))
+(impl Debug (Pair a b) :where ((Debug a) (Debug b))
+  (debug (self) (str-join ["[" (debug (. self fst)) " " (debug (. self snd)) "]"])))
+(impl ToStr (Pair a b) :where ((Debug a) (Debug b))
+  (to-str (self) (debug self)))
+(impl Show (Triple a b c) :where ((Show a) (Show b) (Show c))
+  (show (self) (str-join ["[" (show (. self fst)) " " (show (. self snd)) " " (show (. self thd)) "]"])))
+(impl Debug (Triple a b c) :where ((Debug a) (Debug b) (Debug c))
+  (debug (self) (str-join ["[" (debug (. self fst)) " " (debug (. self snd)) " " (debug (. self thd)) "]"])))
+(impl ToStr (Triple a b c) :where ((Debug a) (Debug b) (Debug c))
+  (to-str (self) (debug self)))
+
+;; Set: #{1 2}; Map: {1 2, 3 4}, each entry a Pair of the walk
+(impl Show (Set a) :where ((Show a))
+  (show (self) (seq-text self (fn (x) (show x)) "#{" " " "}")))
+(impl Debug (Set a) :where ((Debug a))
+  (debug (self) (seq-text self (fn (x) (debug x)) "#{" " " "}")))
+(impl ToStr (Set a) :where ((Debug a))
+  (to-str (self) (debug self)))
+(impl Show (Map k v) :where ((Show k) (Show v))
+  (show (self)
+    (seq-text self (fn (p) (str-join [(show (. p fst)) " " (show (. p snd))])) "{" ", " "}")))
+(impl Debug (Map k v) :where ((Debug k) (Debug v))
+  (debug (self)
+    (seq-text self (fn (p) (str-join [(debug (. p fst)) " " (debug (. p snd))])) "{" ", " "}")))
+(impl ToStr (Map k v) :where ((Debug k) (Debug v))
+  (to-str (self) (debug self)))
+
+;; the seqs print in parentheses: (1 2). Show of a List is the prelude's (R2).
+(impl Debug (List a) :where ((Debug a))
+  (debug (self) (seq-text self (fn (x) (debug x)) "(" " " ")")))
+(impl ToStr (List a) :where ((Debug a))
+  (to-str (self) (debug self)))
+(impl Show (VSeq a) :where ((Show a))
+  (show (self) (seq-text self (fn (x) (show x)) "(" " " ")")))
+(impl Debug (VSeq a) :where ((Debug a))
+  (debug (self) (seq-text self (fn (x) (debug x)) "(" " " ")")))
+(impl ToStr (VSeq a) :where ((Debug a))
+  (to-str (self) (debug self)))
+(impl Show (LSeq a) :where ((Show a))
+  (show (self) (seq-text self (fn (x) (show x)) "(" " " ")")))
+(impl Debug (LSeq a) :where ((Debug a))
+  (debug (self) (seq-text self (fn (x) (debug x)) "(" " " ")")))
+(impl ToStr (LSeq a) :where ((Debug a))
+  (to-str (self) (debug self)))
+(impl Show (Range t) :where ((Show t) (Num t) (Ord t) (Unit t) (RangeLen t))
+  (show (self) (seq-text self (fn (x) (show x)) "(" " " ")")))
+(impl Debug (Range t) :where ((Debug t) (Num t) (Ord t) (Unit t) (RangeLen t))
+  (debug (self) (seq-text self (fn (x) (debug x)) "(" " " ")")))
+(impl ToStr (Range t) :where ((Debug t) (Num t) (Ord t) (Unit t) (RangeLen t))
+  (to-str (self) (debug self)))

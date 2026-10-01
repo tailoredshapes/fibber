@@ -1,0 +1,44 @@
+;; spec:   stdlib §4.4 rows filter remove (the predicate returns a Truthy), §2.3 (Truthy)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: filter remove
+;; filter keeps the elements whose predicate is true (or some), remove the
+;; others: over one source and one predicate they partition it, in order,
+;; and the predicate runs once per element for each. A predicate that
+;; returns an Option is Clojure's (filter :parent nodes): the elements
+;; whose lookup finds something.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+;; the elements in order, as a number: [1 2 3] is 123
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+(defun half (x: i64) -> (Option i64) (if (= (rem x 2) 0) (some (quot x 2)) nil))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((odd (fn (x: i64) (do (set! calls (+ @calls 1)) (= (rem x 2) 1)))))
+      (let ((xs [1 2 3 4 5 6 7]))
+        (do (check c (= (digits (filter odd xs)) 1357))
+            (check c (= @calls 7))
+            (check c (= (digits (remove odd xs)) 246))
+            (check c (= @calls 14))
+            (check c (= (+ (total (filter odd xs)) (total (remove odd xs))) (total xs)))
+            (check c (= (count (filter odd [2 4])) 0))
+            (check c (= (count (remove odd [2 4])) 2))
+            (check c (= (count (remove odd [])) 0))
+            (check c (= (digits (filter odd (filter (fn (x: i64) (> x 2)) xs))) 357))
+            ;; an Option result
+            (check c (= (digits (filter half xs)) 246))
+            (check c (= (digits (remove half xs)) 1357))
+            (check c (= (count (filter half (some 4))) 1))
+            (check c (= (count (remove half (some 4))) 0))
+            (checks-result c))))))

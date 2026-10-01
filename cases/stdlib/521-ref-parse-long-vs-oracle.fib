@@ -1,0 +1,164 @@
+;; spec:   stdlib §4.3 (row parse-long), §8.1 item 2 (a naive reference), cases/stdlib/README.md
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: parse-long
+;; `parse-long` against an oracle that shares nothing with it but the grammar:
+;; the oracle reads the characters of the prelude's `str-chars` Vec, checks
+;; that they are an optional sign and one or more digits, drops the leading
+;; zeros, decides whether the digits are in range by their LENGTH and then by
+;; comparing them with the digits of the limit as strings (so no arithmetic
+;; overflow is ever tested for), and only then computes the value, by adding
+;; up a magnitude that fits (the one value that does not, -9223372036854775808,
+;; is the constant the oracle builds). The parser accumulates a negative
+;; number and tests its limit before each product. 16 fixed strings at the
+;; ends of the range are followed by 300 seeded strings in six families
+;; (junk and digits mixed; a sign and up to 22 digits; leading zeros; the
+;; digits of the limits mutated by one digit, one more or one fewer; valid
+;; text with one junk character put in; a sign and 17 to 21 random digits).
+;; One check per string. The tallies of accepted and refused strings are
+;; checked, so a generator that made only one kind would fail the case.
+;; The last run plants a fault, an oracle that makes the negative limit
+;; ...807 instead of ...808, in a second Checks, and `check-detects` fails the
+;; case if that run found nothing.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+(defun code (ch: char) -> i64 (sext i64 (char->i32 ch)))
+(defun min-long () -> i64 (- (- 0 (+ (shl 1 62) (- (shl 1 62) 1))) 1))
+
+;; whether the characters of v from index i are one or more digits 0 to 9
+(defun all-digits (v: (Vec char) i: i64) -> bool
+  (and (< i (vec-count v))
+       (loop ((j i))
+         (if (< j (vec-count v))
+             (let ((k (code (vec-nth v j))))
+               (if (and (>= k 48) (<= k 57)) (recur (+ j 1)) false))
+             true))))
+
+;; the digits of v from index i with the leading zeros dropped (a lone 0 stays), as a string
+(defun significant (v: (Vec char) i: i64) -> str
+  (let ((n (vec-count v))
+        (z (loop ((j i)) (if (and (< j (- n 1)) (= (vec-nth v j) \0)) (recur (+ j 1)) j))))
+    (loop ((j z) (acc ""))
+      (if (< j n) (recur (+ j 1) (str-concat acc (char->str (vec-nth v j)))) acc))))
+
+;; whether the digit string d, which has no leading zero, is at most the limit:
+;; ...807, or ...808 for a negative number (the planted fault `wrong` uses ...807 for both)
+(defun in-range (d: str negative: bool wrong: bool) -> bool
+  (let ((n (str-len d)))
+    (if (< n 19)
+        true
+        (if (> n 19)
+            false
+            (<= d (if (and negative (not wrong)) "9223372036854775808" "9223372036854775807"))))))
+
+;; the value of a digit string that fits in 2^63 - 1, by adding up
+(defun magnitude (d: str) -> i64
+  (loop ((i 0) (v 0))
+    (if (< i (str-len d))
+        (recur (+ i 1) (+ (* v 10) (- (zext i64 (str-byte-at d i)) 48)))
+        v)))
+
+(defun oracle (s: str wrong: bool) -> (Option i64)
+  (let ((v (str-chars s))
+        (n (vec-count v))
+        (lead (if (> n 0) (code (vec-nth v 0)) 0))
+        (negative (= lead 45))
+        (i (if (or negative (= lead 43)) 1 0)))
+    (if (all-digits v i)
+        (let ((d (significant v i)))
+          (if (in-range d negative wrong)
+              (some (if negative
+                        (if (= d "9223372036854775808") (min-long) (- 0 (magnitude d)))
+                        (magnitude d)))
+              nil))
+        nil)))
+
+;; ---- the generator
+(defun digit-text (r: Rng) -> str (char->str (i32->char (trunc i32 (+ 48 (rng-below r 10))))))
+
+(defun digits (r: Rng n: i64) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i n) (recur (+ i 1) (str-concat acc (digit-text r))) acc)))
+
+(defun zeros (n: i64) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i n) (recur (+ i 1) (str-concat acc "0")) acc)))
+
+(defun sign-text (r: Rng) -> str
+  (match (rng-below r 3) (0 "") (1 "-") (_ "+")))
+
+;; a piece that is no part of the grammar: a space, separators, letters, the ASCII characters either side of the digits, a sign or digit of another script, a newline
+(defun junk (r: Rng) -> str
+  (match (rng-below r 14)
+    (0 " ") (1 "_") (2 "x") (3 ".") (4 "e") (5 "-") (6 "+") (7 "é") (8 "٣") (9 "−") (10 "１") (11 "/") (12 ":") (_ "\n")))
+
+(defun mixed (r: Rng n: i64) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i n)
+        (recur (+ i 1) (str-concat acc (if (= (rng-below r 2) 0) (digit-text r) (junk r))))
+        acc)))
+
+(defun limits () -> (Vec str)
+  ["9223372036854775807" "9223372036854775808" "922337203685477580" "92233720368547758"
+   "9223372036854775806" "9223372036854775809" "1000000000000000000" "999999999999999999"
+   "922337203685477581" "922337203685477579"])
+
+;; a limit's digits, mutated: unchanged, one digit more, one fewer, or the last one replaced
+(defun mutated (r: Rng) -> str
+  (let ((t (vec-nth (limits) (rng-below r 10)))
+        (cut (- (str-len t) 1)))
+    (match (rng-below r 4)
+      (0 t)
+      (1 (str-concat t (digit-text r)))
+      (2 (str-slice t 0 cut))
+      (_ (str-concat (str-slice t 0 cut) (digit-text r))))))
+
+;; valid text with one junk piece put in at a random place
+(defun spoiled (r: Rng) -> str
+  (let ((t (str-concat (sign-text r) (digits r (+ 1 (rng-below r 10)))))
+        (k (rng-below r 12)))
+    (let ((at (if (> k (str-len t)) (str-len t) k)))
+      (str-concat (str-slice t 0 at) (str-concat (junk r) (str-slice t at (str-len t)))))))
+
+(defun text-of (r: Rng family: i64) -> str
+  (match family
+    (0 (mixed r (rng-below r 7)))
+    (1 (str-concat (sign-text r) (digits r (rng-below r 23))))
+    (2 (str-concat (sign-text r) (str-concat (zeros (rng-below r 7)) (digits r (+ 1 (rng-below r 8))))))
+    (3 (str-concat (sign-text r) (str-concat (zeros (rng-below r 4)) (mutated r))))
+    (4 (spoiled r))
+    (_ (str-concat (sign-text r) (digits r (+ 17 (rng-below r 5)))))))
+
+;; ---- the sweep
+(defun fixed () -> (Vec str)
+  ["9223372036854775807" "-9223372036854775808" "9223372036854775808" "-9223372036854775809"
+   "+9223372036854775807" "-0" "0" "+" "-" "" "00009223372036854775807" "-00009223372036854775808"
+   "00000000000000000000000000" "-92233720368547758080" "9223372036854775810" "-9223372036854775819"])
+
+;; one check for the string s; the tallies count the strings that parsed and those that did not
+(defun judge (c: Checks s: str wrong: bool kept: (Cell i64) dropped: (Cell i64)) -> unit
+  (let ((got (parse-long s)))
+    (do (check c (= got (oracle s wrong)))
+        (if (nil? got) (set! dropped (+ @dropped 1)) (set! kept (+ @kept 1))))))
+
+(defun sweep (c: Checks seed: i64 strings: i64 wrong: bool kept: (Cell i64) dropped: (Cell i64)) -> unit
+  (let ((r (rng seed))
+        (fs (fixed)))
+    (do (dotimes (i (vec-count fs)) (judge c (vec-nth fs i) wrong kept dropped))
+        (dotimes (i strings)
+          (let ((s (text-of r (rem i 6))))
+            (judge c s wrong kept dropped))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (kept (cell 0))
+        (dropped (cell 0)))
+    (do (sweep c 521 300 false kept dropped)
+        (check c (= (checks-made c) 316))
+        (check c (and (> @kept 80) (> @dropped 80)))
+        (sweep p 521 60 true (cell 0) (cell 0))
+        (check-detects c p)
+        (checks-result c))))

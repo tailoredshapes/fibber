@@ -1,0 +1,63 @@
+;; spec:   stdlib §4.7 (row str/index-of-from; the page's three-argument `str/index-of`), §2.9, plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str/index-of-from
+;; `(str/index-of-from s p from)` is `str/index-of` that starts looking at the character offset
+;; `from` (the third arity of the page's `str/index-of`; a name has one arity until L1). It is Java's
+;; `indexOf(value, from)`, which Clojure's `index-of` calls, with the offset in characters, not in
+;; UTF-16 units: a negative `from` is 0; a `from` at or past the end finds only the empty pattern,
+;; which is found at the END (so `("abcabc" "" 20)` is 6, not 20 and not nil); a match may start
+;; at `from` itself; the result is an offset from the start of the string, not from `from`.
+;; Expected values are Java's (`indexOf(value, from)` over scalar offsets, JDK 27: `from` is turned
+;; into a UTF-16 index with `offsetByCodePoints` and the answer back with `codePointCount`).
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+(defun at (o: (Option i64)) -> i64
+  (match o (nil -1) ((some n) n)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do
+        (check c (= (at (str/index-of-from "abcabc" "b" 0)) 1))
+        (check c (= (at (str/index-of-from "abcabc" "b" 1)) 1))
+        (check c (= (at (str/index-of-from "abcabc" "b" 2)) 4))
+        (check c (= (at (str/index-of-from "abcabc" "b" 4)) 4))
+        (check c (= (at (str/index-of-from "abcabc" "b" 5)) -1))
+        (check c (= (at (str/index-of-from "abcabc" "b" 6)) -1))
+        (check c (= (at (str/index-of-from "abcabc" "b" 20)) -1))
+        (check c (= (at (str/index-of-from "abcabc" "b" -1)) 1))
+        (check c (= (at (str/index-of-from "abcabc" "b" -5)) 1))
+        (check c (= (at (str/index-of-from "abcabc" "" 20)) 6))
+        (check c (= (at (str/index-of-from "abcabc" "" 6)) 6))
+        (check c (= (at (str/index-of-from "abcabc" "" 7)) 6))
+        (check c (= (at (str/index-of-from "abcabc" "" 3)) 3))
+        (check c (= (at (str/index-of-from "abc" "" 3)) 3))
+        (check c (= (at (str/index-of-from "abc" "c" 3)) -1))
+        (check c (= (at (str/index-of-from "abc" "c" 2)) 2))
+        (check c (= (at (str/index-of-from "" "" 0)) 0))
+        (check c (= (at (str/index-of-from "" "" 5)) 0))
+        (check c (= (at (str/index-of-from "" "a" 0)) -1))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "€" 0)) 1))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "€" 1)) 1))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "€" 2)) 4))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "\u{1f600}" 3)) -1))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "\u{1f600}" 2)) 2))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "é" 1)) 3))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "é" 4)) -1))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "" 2)) 2))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "" 5)) 5))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" "" 9)) 5))
+        (check c (= (at (str/index-of-from "\u{1f600}\u{1f600}\u{1f600}" "\u{1f600}" 1)) 1))
+        (check c (= (at (str/index-of-from "\u{1f600}\u{1f600}\u{1f600}" "\u{1f600}" 2)) 2))
+        (check c (= (at (str/index-of-from "\u{1f600}\u{1f600}\u{1f600}" "\u{1f600}" 3)) -1))
+        (check c (= (at (str/index-of-from "aaaa" "aa" 1)) 1))
+        (check c (= (at (str/index-of-from "aaaa" "aa" 2)) 2))
+        (check c (= (at (str/index-of-from "aaaa" "aa" 3)) -1))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" \u{e9} 1)) 3))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" \u{20ac} 2)) 4))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" \u{1f600} 0)) 2))
+        (check c (= (at (str/index-of-from "é€\u{1f600}é€" \u{1f600} 4)) -1))
+        (check c (= (at (str/index-of-from "abcabc" \c 3)) 5))
+        (checks-result c))))

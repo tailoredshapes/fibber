@@ -1,0 +1,63 @@
+;; spec:   stdlib §2.1 rule 8 (one closed seq type per collection), §4.4 (rows seq, rest, next)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: seq rest next
+;; Clojure's recursion idiom `(len xs) = (if (seq xs) (inc (len (rest xs))) 0)`
+;; is generic over every collection that has a Seqable instance, because
+;; `rest` of a collection is its closed seq type and `rest` of that is itself,
+;; so len is instantiated twice (at the collection, then at its seq) and
+;; stops there. Here: a Vec (its seq is a VSeq), the VSeq of a sort, a List
+;; (the result of reverse), a lazy seq, an Option and an Array (the last two
+;; yield a lazy seq). `next` is (seq (rest c)): nil when one element or none is left.
+;; The Map, Set and Range instances are case 335.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun len (xs: c) :where ((Seqable c s) (Seqable s s)) -> i64
+  (match (seq xs) (nil 0) ((some s) (+ 1 (len (rest s))))))
+
+;; the length of what `next` leaves, or -1 for nil
+(defun len-next (xs: c) :where ((Seqable c s) (Seqable s s)) -> i64
+  (match (next xs) (nil -1) ((some s) (len s))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [5 6 7 8])
+        (l (reverse [1 2 3 4]))
+        (ls (lseq-vec [1 2 3 4 5]))
+        (a (array 3 7))
+        (o (some 5))
+        (nothing: (Option i64) nil))
+    (do (check c (= (len v) 4))
+        (check c (= (len (rest v)) 3))
+        (check c (= (len (rest (rest v))) 2))
+        (check c (= (len (sort [3 1 2])) 3))
+        (check c (= (len (rest (sort [3 1 2]))) 2))
+        (check c (= (len l) 4))
+        (check c (= (len (rest l)) 3))
+        (check c (= (len ls) 5))
+        (check c (= (len (rest ls)) 4))
+        (check c (= (len a) 3))
+        (check c (= (len (rest a)) 2))
+        (check c (= (len o) 1))
+        (check c (= (len nothing) 0))
+        (check c (= (len (rest o)) 0))
+        (check c (= (len-next v) 3))
+        (check c (= (len-next [9]) -1))
+        (check c (= (len-next (sort [3 1 2])) 2))
+        (check c (= (len-next l) 3))
+        (check c (= (len-next ls) 4))
+        (check c (= (len-next a) 2))
+        (check c (= (len-next o) -1))
+        (check c (= (len-next nothing) -1))
+        (check c (match (seq v) (nil false) ((some s) (= (nth s 0) 5))))
+        (check c (match (seq (rest v)) (nil false) ((some s) (= (nth s 0) 6))))
+        (check c (match (seq l) (nil false) ((some s) (= (nth s 0) 4))))
+        (check c (match (seq (rest l)) (nil false) ((some s) (= (nth s 0) 3))))
+        (check c (match (seq (rest (sort [3 1 2]))) (nil false) ((some s) (= (nth s 0) 2))))
+        (check c (match (seq ls) (nil false) ((some s) (= (nth s 0) 1))))
+        (check c (match (seq (rest ls)) (nil false) ((some s) (= (nth s 0) 2))))
+        (check c (match (seq a) (nil false) ((some s) (= (nth s 2) 7))))
+        (check c (match (seq o) (nil false) ((some s) (= (nth s 0) 5))))
+        (checks-result c))))

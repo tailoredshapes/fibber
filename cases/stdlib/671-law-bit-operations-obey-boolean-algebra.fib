@@ -1,0 +1,60 @@
+;; spec:   stdlib §4.1 (rows bit-and bit-or bit-xor bit-not), types §2.12 (Bits)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: bit-and bit-or bit-xor bit-not
+;; The four bit operations against a reference that works bit by bit on booleans (the bit i of a
+;; result is the and, or, xor, not of the bits i of the operands), and against the laws of Boolean
+;; algebra on 300 seeded draws: De Morgan both ways, xor as (a or b) and not (a and b), the double
+;; negation, distribution of and over or, and the carry identity a + b = (a xor b) + 2 (a and b)
+;; on operands small enough not to overflow. The last checks plant two faults, De Morgan with the
+;; wrong connective and the per-bit reference of and given the connective or, and require that both
+;; be caught.
+(ns main (:use fib.core tl.rng tl.check))
+
+(def SEED: i64 671)
+
+(defun bit-at (x: i64 i: i64) -> bool (= (bit-and (shr x i) 1) 1))
+
+;; whether bit i of (f a b) is (g (bit i of a) (bit i of b)) for every i
+(defun per-bit (f: (fn (i64 i64) i64) g: (fn (bool bool) bool) a: i64 b: i64) -> bool
+  (let ((r (f a b)))
+    (loop ((i 0))
+      (if (< i 64)
+          (if (= (bit-at r i) (g (bit-at a i) (bit-at b i))) (recur (+ i 1)) false)
+          true))))
+
+(defun not-per-bit (a: i64) -> bool
+  (let ((r (bit-not a)))
+    (loop ((i 0))
+      (if (< i 64) (if (= (bit-at r i) (not (bit-at a i))) (recur (+ i 1)) false) true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (pb (checks))
+        (r (rng SEED)))
+    (do (dotimes (i 300)
+          (let ((a (rng-next r))
+                (b (rng-next r))
+                (d (rng-next r))
+                (sa (bit-shift-right (rng-next r) 2))
+                (sb (bit-shift-right (rng-next r) 2)))
+            (do (check c (per-bit (fn (x y) (bit-and x y)) (fn (u v) (and u v)) a b))
+                (check c (per-bit (fn (x y) (bit-or x y)) (fn (u v) (or u v)) a b))
+                (check c (per-bit (fn (x y) (bit-xor x y)) (fn (u v) (not (= u v))) a b))
+                (check c (not-per-bit a))
+                (check c (= (bit-not (bit-and a b)) (bit-or (bit-not a) (bit-not b))))
+                (check c (= (bit-not (bit-or a b)) (bit-and (bit-not a) (bit-not b))))
+                (check c (= (bit-xor a b) (bit-and (bit-or a b) (bit-not (bit-and a b)))))
+                (check c (= (bit-not (bit-not a)) a))
+                (check c (= (bit-and a (bit-or b d)) (bit-or (bit-and a b) (bit-and a d))))
+                (check c (= (bit-xor a a) 0))
+                (check c (= (bit-xor a (bit-xor a b)) b))
+                (check c (= (+ sa sb) (+ (bit-xor sa sb) (* 2 (bit-and sa sb)))))
+                (check p (= (bit-not (bit-and a b)) (bit-and (bit-not a) (bit-not b))))
+                (check pb (per-bit (fn (x y) (bit-and x y)) (fn (u v) (or u v)) a b)))))
+        (check-detects c p)
+        (check-detects c pb)
+        (checks-result c))))

@@ -1,0 +1,82 @@
+;; spec:   stdlib §4.4 (rows range, range-by), §2.1 rule 1 (a Range is a source)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: range range-by
+;; (range n) is 0 up to n, one at a time; (range-by a b s) is a, a+s, .. while before b, so b itself is never an
+;; element, a negative step counts down, and a step that points away from the end, or a start that is already
+;; at it, gives the empty range. (range-by is the page's (range a b s) until arity overloading, §2.3 N4.)
+;; The walk, the count and the elements are read through Reducible, here to-vec, count and each-while.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun same (v: (Vec i64) xs: (Vec i64)) -> bool
+  (and (= (fib.prelude/count v) (fib.prelude/count xs))
+       (loop ((i 0))
+         (if (< i (fib.prelude/count v))
+             (if (= (fib.prelude/nth v i) (fib.prelude/nth xs i)) (recur (+ i 1)) false)
+             true))))
+
+;; the early exit: the visitor says stop at its n-th visit; the visits made, and whether the walk ran to the end
+(defun stop-at (c: c n: i64) :where ((Reducible c e)) -> (Pair i64 bool)
+  (let ((k (cell 0)))
+    (let ((done (each-while c (fn (x) (do (set! k (+ @k 1)) (< @k n))))))
+      (Pair @k done))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Vec i64) (vec-empty)))
+    (do (check c (= (count (range 10)) 10))
+        (check c (same (to-vec (range 5)) [0 1 2 3 4]))
+        (check c (same (to-vec (range 1)) [0]))
+        (check c (same (to-vec (range 0)) none))
+        (check c (same (to-vec (range -3)) none))
+        (check c (= (count (range 0)) 0))
+        (check c (= (count (range -3)) 0))
+        ;; the value is its three fields
+        (check c (and (= (. (range 10) lo) 0) (and (= (. (range 10) hi) 10) (= (. (range 10) by) 1))))
+        ;; steps; the end is exclusive even when a step lands on it
+        (check c (same (to-vec (range-by 0 10 3)) [0 3 6 9]))
+        (check c (same (to-vec (range-by 2 11 3)) [2 5 8]))
+        (check c (same (to-vec (range-by 2 12 3)) [2 5 8 11]))
+        (check c (same (to-vec (range-by 10 0 -3)) [10 7 4 1]))
+        (check c (same (to-vec (range-by 11 2 -3)) [11 8 5]))
+        (check c (same (to-vec (range-by 11 1 -3)) [11 8 5 2]))
+        (check c (same (to-vec (range-by -5 5 4)) [-5 -1 3]))
+        (check c (same (to-vec (range-by -2 -10 -3)) [-2 -5 -8]))
+        ;; a step larger than the span still gives the start
+        (check c (same (to-vec (range-by 0 3 10)) [0]))
+        (check c (same (to-vec (range-by 3 0 -10)) [3]))
+        (check c (same (to-vec (range-by 0 1 1)) [0]))
+        ;; empty: the start is at the end, or the step points away from it
+        (check c (same (to-vec (range-by 5 5 1)) none))
+        (check c (same (to-vec (range-by 5 5 -1)) none))
+        (check c (same (to-vec (range-by 0 10 -1)) none))
+        (check c (same (to-vec (range-by 10 0 1)) none))
+        (check c (= (count (range-by 0 10 -1)) 0))
+        (check c (= (count (range-by 10 0 1)) 0))
+        ;; counts: ceil((b - a) / s)
+        (check c (= (count (range-by 0 10 3)) 4))
+        (check c (= (count (range-by 0 9 3)) 3))
+        (check c (= (count (range-by 10 0 -3)) 4))
+        (check c (= (count (range-by -5 5 4)) 3))
+        ;; each-while stops when the visitor says so (no visit after it) and says it did not run to the end;
+        ;; stopping at the last element is still stopping
+        (let ((p (stop-at (range 10) 3)))
+          (check c (and (= (. p fst) 3) (not (. p snd)))))
+        (let ((p (stop-at (range 10) 10)))
+          (check c (and (= (. p fst) 10) (not (. p snd)))))
+        (let ((p (stop-at (range 10) 11)))
+          (check c (and (= (. p fst) 10) (. p snd))))
+        (let ((p (stop-at (range-by 10 0 -3) 2)))
+          (check c (and (= (. p fst) 2) (not (. p snd)))))
+        (let ((p (stop-at (range 0) 1)))
+          (check c (and (= (. p fst) 0) (. p snd))))
+        ;; the method nth is built on: range-nth of the start, the end, the step and the index
+        (check c (= (range-nth 5 20 4 0) 5))
+        (check c (= (range-nth 5 20 4 3) 17))
+        (check c (= (range-nth 20 5 -4 3) 8))
+        ;; a range is a value: walked twice it gives the same elements
+        (let ((r (range-by 1 8 2)))
+          (check c (and (= (count r) 4) (same (to-vec r) [1 3 5 7]))))
+        (checks-result c))))

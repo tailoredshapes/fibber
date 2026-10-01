@@ -1,0 +1,43 @@
+;; spec:   stdlib §2.7 (compare of NaN is 0 against everything), §8.1 item 4 (sort over a NaN is memory safe, order unspecified)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: sort sort-by sort-with
+;; A NaN is neither less nor greater than anything, so it compares 0 with
+;; every value and a sort that holds one has no single right order. What
+;; the library promises is that it neither traps nor corrupts: the result is
+;; a permutation of the input (same length, the same NaNs, every number
+;; present as often as it was), under both tools and with a clean audit. The
+;; order is left unspecified and is not checked.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; how many elements of v are NaN, and how many equal x
+(defun nans (v: (Vec f64)) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i (fib.prelude/count v)) (recur (+ i 1) (if (!= (fib.prelude/nth v i) (fib.prelude/nth v i)) (+ n 1) n)) n)))
+(defun occurs (v: (Vec f64) x: f64) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i (fib.prelude/count v)) (recur (+ i 1) (if (= (fib.prelude/nth v i) x) (+ n 1) n)) n)))
+
+(defun permutation (out: (Vec f64) in: (Vec f64)) -> bool
+  (and (= (fib.prelude/count out) (fib.prelude/count in))
+       (and (= (nans out) (nans in))
+            (and (= (occurs out 1.0) (occurs in 1.0))
+                 (and (= (occurs out 2.0) (occurs in 2.0))
+                      (and (= (occurs out 3.0) (occurs in 3.0))
+                           (= (occurs out -4.5) (occurs in -4.5))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nan (fdiv 0.0 0.0))
+        (xs [3.0 (fdiv 0.0 0.0) 1.0 (fdiv 0.0 0.0) 2.0 1.0 -4.5 3.0 (fdiv 0.0 0.0) 2.0]))
+    (do (check c (!= nan nan))
+        (check c (= (nans xs) 3))
+        (check c (permutation (to-vec (sort xs)) xs))
+        (check c (permutation (to-vec (sort-with < xs)) xs))
+        (check c (permutation (to-vec (sort-with > xs)) xs))
+        (check c (permutation (to-vec (sort-with (fn (a b) (if (< a b) -1 (if (> a b) 1 0))) xs)) xs))
+        (check c (permutation (to-vec (sort-by (fn (x) x) xs)) xs))
+        (check c (permutation (to-vec (sort [nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan])) [nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan nan]))
+        (checks-result c))))

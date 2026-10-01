@@ -1,0 +1,45 @@
+;; spec:   stdlib §2.1 rule 2, tranche 1 plan PC-13 (to-lseq keeps a chain lazy), §4.4 rows map filter take
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter take
+;; A lazy adaptor over a lazy adaptor does not realise the inner seq in
+;; full: (first (map g (map f s))) calls f once and g once and makes one
+;; node of s, where an adaptor that copied its source into a Vec would
+;; have called f on every element. Three stages (filter, map, take) over a
+;; five-node source: asking for the head costs what it takes to find it.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun head (s: (LSeq i64)) -> i64 (match (lfirst s) ((some x) x) (nil -1)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (fcalls (cell 0))
+        (gcalls (cell 0))
+        (nodes (cell 0)))
+    (let ((twice (map (fn (x: i64) (do (set! gcalls (+ @gcalls 1)) (+ x 1)))
+                      (map (fn (x: i64) (do (set! fcalls (+ @fcalls 1)) (* x 10)))
+                           (countdown 5 nodes)))))
+      (do (check c (= (head twice) 51))
+          (check c (= @fcalls 1))
+          (check c (= @gcalls 1))
+          (check c (= @nodes 1))
+          (check c (= (count twice) 5))
+          (check c (= @fcalls 5))
+          (check c (= @gcalls 5))
+          (check c (= @nodes 6))))
+    (set! nodes 0)
+    (set! fcalls 0)
+    (let ((three (take 2 (map (fn (x: i64) (do (set! fcalls (+ @fcalls 1)) (* x 2)))
+                              (filter (fn (x: i64) (> x 2)) (countdown 5 nodes))))))
+      (do (check c (= (head three) 10))
+          (check c (= @nodes 1))
+          (check c (= (count three) 2))
+          (check c (= @fcalls 2))
+          (check c (= @nodes 2))))
+    (checks-result c)))

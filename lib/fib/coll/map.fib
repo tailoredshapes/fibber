@@ -1,4 +1,86 @@
-;; owner: L8b. fib.coll.map: Map and Set through the protocols. Exports: key val keys vals select-keys merge disj set; Lookup Assoc Dissoc Keyed Collection Emptyable for Map Set.
-;; Until L8b writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
+;; fib.coll.map: Map and Set through the protocols of fib.coll.protocols, and the functions that read a map
+;; entry or build a collection from keys (tranche 1 plan §4.2; owner L8b).
+;; Replaces the prelude's Associative instance of Map, its Collection instance of Set and its `contains?`,
+;; `dissoc` and `disj` functions, which step M deletes as protocol methods; the instances here call the
+;; prelude's low-level functions (map-assoc map-get map-empty dissoc contains? disj set-contains? set-empty
+;; vec-conj), which are public today: when M deletes the prelude's protocols it must keep `dissoc` and
+;; `contains?` (or their renamed twins) for these instances. Decided here, where the page is silent:
+;;  - (Collection (Map k v) (Pair k v)) takes a Pair, as the page says; a two-element Vec waits for L23.
+;;  - Set has no Lookup: Clojure's (get #{1} 1) answers the element, which waits for L21 (callable sets).
+;;    A Set is Keyed, Dissoc, Collection and Emptyable.
+;;  - keys and vals answer an LSeq of the keys or values in the walk's order, which is the hash's; the
+;;    two are in one order. The walk of the map happens when keys is called (it collects a Vec, and the
+;;    seq is the lazy view of that Vec, to-lseq), as the table's note "an empty recipe, not nil" allows. They read any source of Pairs through Reducible, so a Map is one once
+;;    L5a lands its instance and a Vec of Pairs is one today.
+;;  - merge is right-biased over two maps (Clojure's: the later map wins a conflict). The macro that
+;;    nests more operands is Rust (R6a).
+;;  - the only walk of a Map this part makes itself is `map-entries`, because the prelude's early-exit
+;;    walk (L4's map-each) does not exist yet and the prelude's for-each hands out Entry structs: when L4
+;;    replaces Entry with Pair, that one function changes and nothing else.
+;; Every instance for Map and Set needs (Hash k) (Eq k).
 (ns fib.coll.map (:use fib.core fib.seq fib.coll.protocols))
+
+;; the map entry is a Pair: key and val read it
+(defun key (p: (Pair k v)) -> k (. p fst))
+(defun val (p: (Pair k v)) -> v (. p snd))
+
+;; Map
+(impl (Lookup k v) (Map k v) :where ((Hash k) (Eq k))
+  (get (self key) (fib.prelude/map-get self key)))
+(impl (Assoc k v) (Map k v) :where ((Hash k) (Eq k))
+  (assoc (self key val) (fib.prelude/map-assoc self key val)))
+(impl (Dissoc k) (Map k v) :where ((Hash k) (Eq k))
+  (dissoc (self key) (fib.prelude/dissoc self key)))
+(impl (Keyed k) (Map k v) :where ((Hash k) (Eq k))
+  (contains? (self key) (fib.prelude/contains? self key)))
+(impl (Collection (Map k v) (Pair k v)) (Map k v) :where ((Hash k) (Eq k))
+  (conj (self x) (fib.prelude/map-assoc self (. x fst) (. x snd))))
+(impl Emptyable (Map k v) (empty (self) (fib.prelude/map-empty)))
+
+;; Set: the keys of a Map
+(impl (Dissoc k) (Set k) :where ((Hash k) (Eq k))
+  (dissoc (self key) (fib.prelude/disj self key)))
+(impl (Keyed k) (Set k) :where ((Hash k) (Eq k))
+  (contains? (self key) (fib.prelude/set-contains? self key)))
+(impl (Collection (Set k) k) (Set k) :where ((Hash k) (Eq k))
+  (conj (self x) (Set (fib.prelude/map-assoc (. self m) x true))))
+(impl Emptyable (Set k) (empty (self) (fib.prelude/set-empty)))
+
+;; (disj s x): s without x; the page's `disj` is the Dissoc method under its Clojure name
+(defun disj (s: s x: k) :where ((Dissoc s k)) -> s (dissoc s x))
+
+;; every entry of a map, as a Vec of Pairs, in the walk's order
+(defun map-entries :private (m: (Map k v)) -> (Vec (Pair k v))
+  (let ((acc (cell (vec-empty))))
+    (do (fib.prelude/for-each m (fn (e) (set! acc (fib.prelude/vec-conj @acc (Pair (. e fst) (. e snd))))))
+        @acc)))
+
+(defun keys (m: m) :where ((Reducible m (Pair k v))) -> (LSeq k)
+  (let ((acc (cell (vec-empty))))
+    (do (each-while m (fn (p) (do (set! acc (fib.prelude/vec-conj @acc (. p fst))) true)))
+        (to-lseq @acc))))
+
+(defun vals (m: m) :where ((Reducible m (Pair k v))) -> (LSeq v)
+  (let ((acc (cell (vec-empty))))
+    (do (each-while m (fn (p) (do (set! acc (fib.prelude/vec-conj @acc (. p snd))) true)))
+        (to-lseq @acc))))
+
+;; (merge a b): a with every entry of b, b's value winning a conflict
+(defun merge (a: (Map k v) b: (Map k v)) :where ((Hash k) (Eq k)) -> (Map k v)
+  (let ((acc (cell a)))
+    (do (each-while (map-entries b)
+          (fn (p) (do (set! acc (fib.prelude/map-assoc @acc (. p fst) (. p snd))) true)))
+        @acc)))
+
+;; (select-keys m ks): the entries of m whose key is in ks; a key m lacks is skipped
+(defun select-keys (m: s ks: c) :where ((Lookup s k v) (Assoc s k v) (Emptyable s) (Reducible c k)) -> s
+  (let ((acc (cell (empty m))))
+    (do (each-while ks
+          (fn (k) (do (match (get m k) (nil ()) ((some v) (set! acc (assoc @acc k v)))) true)))
+        @acc)))
+
+;; (set c): the elements of c as a Set
+(defun set (c: c) :where ((Reducible c e) (Hash e) (Eq e)) -> (Set e)
+  (let ((acc (cell (fib.prelude/set-empty))))
+    (do (each-while c (fn (x) (do (set! acc (conj @acc x)) true)))
+        @acc)))

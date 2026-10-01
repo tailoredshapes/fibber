@@ -1,0 +1,43 @@
+;; spec:   stdlib §2.1 rule 2, §4.4 rows map filter lazy-seq
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter lazy-seq
+;; Asking a lazy seq for its first element realises one node of it and
+;; one node of its source: lfirst of (map f src) calls f once and makes one
+;; node of src, though src has five. A filter reads source nodes until one
+;; passes. lazy-seq gives the same: its body runs once, at the first demand.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun head (s: (LSeq i64)) -> i64 (match (lfirst s) ((some x) x) (nil -1)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (nodes (cell 0))
+        (runs (cell 0)))
+    (let ((m (map (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 10))) (countdown 5 nodes))))
+      (do (check c (= (head m) 50))
+          (check c (= @calls 1))
+          (check c (= @nodes 1))
+          (check c (= (head m) 50))
+          (check c (= @calls 1))
+          (check c (= @nodes 1))
+          ;; a filter that rejects the first three reads four nodes
+          (set! nodes 0)
+          (let ((fl (filter (fn (x: i64) (< x 3)) (countdown 5 nodes))))
+            (do (check c (= (head fl) 2))
+                (check c (= @nodes 4))))
+          ;; lazy-seq runs its body at the first demand, once
+          (let ((z (lazy-seq (do (set! runs (+ @runs 1)) (countdown 2 nodes)))))
+            (do (check c (= @runs 0))
+                (check c (= (head z) 2))
+                (check c (= @runs 1))
+                (check c (= (head z) 2))
+                (check c (= @runs 1))))
+          (checks-result c)))))

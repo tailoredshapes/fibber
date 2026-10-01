@@ -1,0 +1,65 @@
+;; spec:   stdlib §2.9 (the byte layer), §4.7 (rows str-len str-byte-at str-find), §4.3 (row subs)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str-len str-byte-at str-find subs
+;; The byte layer and the character layer agree. A tokenizer finds the `;`
+;; that separate the fields of "clé=€100;naïve=😀;z=" with `str-find` (byte
+;; offsets: the text is 26 bytes, `str-len`) and cuts them with `str-slice`;
+;; the same fields are cut again with `subs`, whose bounds are character
+;; offsets computed here from the bytes alone (the number of bytes before an
+;; offset that are not continuation bytes, read with `str-byte-at`), and the
+;; two cuts must be the same string. The builtins' own cases are 210 to 218
+;; of cases/ownership; this one shows that the library's `subs` and `count`
+;; (19 characters) stand on the same offsets as the byte layer's.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; the character index of the byte offset off, which is a boundary: the bytes before it that start a character
+(defun char-index (s: str off: i64) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i off)
+        (recur (+ i 1) (if (< (str-byte-at s i) -64i8) n (+ n 1)))
+        n)))
+
+;; the byte ranges of the fields between the separators
+(defun fields (s: str) -> (Vec (Pair i64 i64))
+  (loop ((from 0) (acc (vec-empty)))
+    (match (str-find s ";" from)
+      (nil (vec-conj acc (Pair from (str-len s))))
+      ((some at) (recur (+ at 1) (vec-conj acc (Pair from at)))))))
+
+;; whether subs by character offsets cuts the field as str-slice by byte offsets does
+(defun same-cut (s: str p: (Pair i64 i64)) -> bool
+  (= (subs s (char-index s (. p fst)) (char-index s (. p snd)))
+     (str-slice s (. p fst) (. p snd))))
+
+(defun every-cut-agrees (s: str) -> bool
+  (let ((fs (fields s)))
+    (loop ((i 0))
+      (if (< i (count fs))
+          (if (same-cut s (nth fs i)) (recur (+ i 1)) false)
+          true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s "clé=€100;naïve=😀;z=")
+        (fs (fields "clé=€100;naïve=😀;z=")))
+    (do (check c (= (str-len s) 26))
+        (check c (= (count s) 19))
+        (check c (= (count fs) 3))
+        (check c (and (= (. (nth fs 0) fst) 0) (= (. (nth fs 0) snd) 11)))
+        (check c (and (= (. (nth fs 1) fst) 12) (= (. (nth fs 1) snd) 23)))
+        (check c (and (= (. (nth fs 2) fst) 24) (= (. (nth fs 2) snd) 26)))
+        (check c (= (str-byte-at s 11) 59i8))
+        (check c (= (str-byte-at s 23) 59i8))
+        (check c (= (char-index s 12) 9))
+        (check c (= (char-index s 24) 17))
+        (check c (= (subs s 9 16) "naïve=😀"))
+        (check c (= (subs s 17 19) "z="))
+        (check c (match (str-find s "=" 12) ((some at) (= at 18)) (nil false)))
+        (check c (every-cut-agrees s))
+        (check c (every-cut-agrees "a;;é;;;😀;"))
+        (check c (every-cut-agrees ""))
+        (check c (every-cut-agrees ";"))
+        (checks-result c))))

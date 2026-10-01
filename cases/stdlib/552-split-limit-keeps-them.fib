@@ -1,0 +1,46 @@
+;; spec:   stdlib §4.7 (row str/split-limit; the page's `(str/split s re limit)`), §2.9, plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str/split-limit
+;; `(str/split-limit s sep n)` is the third arity of `str/split` (a name has one arity until L1):
+;; Java's `Pattern.split(s, n)`. A NEGATIVE limit keeps the empty strings that end the result
+;; (`-1` is Clojure's idiom), a POSITIVE limit makes at most `n` pieces and the last is the rest of
+;; the string, whatever it holds, and ZERO is `str/split`. The empty strings at the end are kept
+;; when `n` is positive too, since the limit, not the content, ends the result. A limit of 1 is
+;; the whole string, a limit larger than the number of matches changes nothing but the kept
+;; trailing empties. Expected values are Java's (`Pattern.compile(Pattern.quote(sep)).split(s, n)`,
+;; JDK 27), not the library's.
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+(defun same? (v: (Vec str) w: (Vec str)) -> bool
+  (if (= (fib.prelude/vec-count v) (fib.prelude/vec-count w))
+      (loop ((i 0))
+        (if (< i (fib.prelude/vec-count v))
+            (if (= (fib.prelude/vec-nth v i) (fib.prelude/vec-nth w i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (same? (str/split-limit "a,b,,c,," "," -1) ["a" "b" "" "c" "" ""]))
+        (check c (same? (str/split-limit "a,b,,c,," "," 0) ["a" "b" "" "c"]))
+        (check c (same? (str/split-limit "a,b,,c,," "," 1) ["a,b,,c,,"]))
+        (check c (same? (str/split-limit "a,b,,c,," "," 2) ["a" "b,,c,,"]))
+        (check c (same? (str/split-limit "a,b,,c,," "," 3) ["a" "b" ",c,,"]))
+        (check c (same? (str/split-limit "a,b,,c,," "," 6) ["a" "b" "" "c" "" ""]))
+        (check c (same? (str/split-limit "a,b,,c,," "," 5) ["a" "b" "" "c" ","]))
+        (check c (same? (str/split-limit "a,b" "," 5) ["a" "b"]))
+        (check c (same? (str/split-limit "" "," -1) [""]))
+        (check c (same? (str/split-limit "," "," -1) ["" ""]))
+        (check c (same? (str/split-limit "," "," 1) [","]))
+        (check c (same? (str/split-limit "abc" "" -1) ["a" "b" "c" ""]))
+        (check c (same? (str/split-limit "abc" "" 2) ["a" "bc"]))
+        (check c (same? (str/split-limit "abc" "" 1) ["abc"]))
+        (check c (same? (str/split-limit "é€z" "" -1) ["é" "€" "z" ""]))
+        (check c (same? (str/split-limit "é€z" "" 2) ["é" "€z"]))
+        (check c (same? (str/split-limit "é😀z" "" 2) ["é" "😀z"]))
+        (check c (same? (str/split-limit "😀a😀b😀" "😀" -1) ["" "a" "b" ""]))
+        (check c (same? (str/split-limit "😀a😀b😀" "😀" 2) ["" "a😀b😀"]))
+        (checks-result c))))

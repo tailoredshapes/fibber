@@ -1,0 +1,39 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Map), types §2.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; The random sequences of 842 to 855 empty a map now and then, but never in a
+;; shape one can reason about, so this is the same model test in a fixed shape
+;; (tl.model, run-drain). For each key type and each size n in 1 2 3 8 9 32 33 (a
+;; leaf as the root, two keys, a root with all of its 32 slots in use at 32, the
+;; first slot with a second key at 33): n keys are put in one seeded order, deleted
+;; in a second down to the empty map, put back in a third with other values. After
+;; every single operation the map agrees with its model (counts, get and contains?
+;; of every key, a full for-each); each delete is then repeated on the key that is
+;; no longer there and must change the count and the lookup of nothing; the full
+;; map of the first pass, kept while the others were built on it, must still agree
+;; at the end; and the drained map, which is the empty map, takes puts again. Six
+;; key types (colliding buckets, buckets that share a prefix, a chain, top-chunk
+;; hashes, integers, strings), 42 runs. The fault planted is in the model: a delete
+;; that removes the entry before the right one.
+(ns main (:use tl.check tl.model))
+
+;; the seven sizes for one key type, one check each
+(defun drain-type (c: Checks base: i64 mk: (fn (i64) k) kid: (fn (k) i64) fault: i64) :where ((Hash k) (Eq k)) -> unit
+  (let ((sizes [1 2 3 8 9 32 33]))
+    (dotimes (j 7) (check c (= 0 (run-drain (+ base j) (nth sizes j) mk kid fault))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (drain-type c 844000 mk-kc id-kc 0)
+        (drain-type c 844100 mk-kh id-kh 0)
+        (drain-type c 844200 mk-kd id-kd 0)
+        (drain-type c 844300 mk-kw id-kw 0)
+        (drain-type c 844400 mk-int id-int 0)
+        (drain-type c 844500 mk-str id-str 0)
+        (check c (= (checks-made c) 42))
+        (drain-type p 844900 mk-kc id-kc 2)
+        (check-detects c p)
+        (checks-result c))))

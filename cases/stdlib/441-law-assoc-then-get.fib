@@ -1,0 +1,59 @@
+;; spec:   stdlib §2.3 (Assoc, Lookup), §4.5 (rows assoc get)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc get contains?
+;; Laws over 200 seeded maps (0 to 11 entries of colliding keys, values 0 to
+;; 99), a key k (0 to 15, so it is there about half of the time) and values v, w:
+;;   (get (assoc m k v) k) is (some v);
+;;   (get (assoc m k v) j) is (get m j) for every j other than k;
+;;   (count (assoc m k v)) is (count m) when k is in m and one more when not;
+;;   (assoc (assoc m k v) k w) and (assoc m k w) agree on every key;
+;;   m itself is unchanged by the assoc.
+;; One check per map (bit i is map i). The planted fault is a law that is
+;; wrong in one way, "assoc never grows the map", which the maps without k
+;; falsify: its run must fail (check-detects). The seed is 441.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defstruct K (id: i64))
+(derive Eq K)
+(impl Hash K (hash (self) (rem (. self id) 5)))
+
+(defun some-is (o: (Option i64) n: i64) -> bool (match o (nil false) ((some x) (= x n))))
+(defun same (a: (Option i64) b: (Option i64)) -> bool
+  (match a (nil (match b (nil true) ((some _) false))) ((some x) (match b (nil false) ((some y) (= x y))))))
+
+(defun random-map (r: Rng) -> (Map K i64)
+  (loop ((i (rng-below r 12)) (m (empty {(K 0) 0})))
+    (if (> i 0) (recur (- i 1) (assoc m (K (rng-below r 16)) (rng-below r 100))) m)))
+
+(defun agree-everywhere (a: (Map K i64) b: (Map K i64)) -> bool
+  (loop ((j 0) (ok (= (count a) (count b))))
+    (if (< j 16) (recur (+ j 1) (and ok (same (get a (K j)) (get b (K j))))) ok)))
+
+(defun law (m: (Map K i64) k: i64 v: i64 w: i64 planted: bool) -> bool
+  (let ((before (get m (K k)))
+        (n (count m))
+        (a (assoc m (K k) v))
+        (grown (if (contains? m (K k)) 0 1)))
+    (and (some-is (get a (K k)) v)
+      (and (loop ((j 0) (ok true))
+             (if (< j 16) (recur (+ j 1) (if (= j k) ok (and ok (same (get a (K j)) (get m (K j)))))) ok))
+        (and (= (count a) (+ n (if planted 0 grown)))
+          (and (agree-everywhere (assoc a (K k) w) (assoc m (K k) w))
+            (and (same (get m (K k)) before)
+                 (= (count m) n))))))))
+
+(defun run (c: Checks planted: bool n: i64) -> unit
+  (let ((r (rng 441)))
+    (dotimes (i n)
+      (let ((m (random-map r)) (k (rng-below r 16)) (v (rng-below r 100)) (w (rng-below r 100)))
+        (check c (law m k v w planted))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)))
+    (do (run c false 200)
+        (run p true 40)
+        (check-detects c p)
+        (checks-result c))))

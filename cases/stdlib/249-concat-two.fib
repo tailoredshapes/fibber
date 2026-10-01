@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.4 row concat (the two-argument function)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: concat
+;; concat joins two sources of one element type into a lazy seq: a Vec and
+;; a Vec, an Option and a List, a lazy seq and a Vec, either side empty.
+;; The second source is not touched until the first is exhausted, and a
+;; walk that stops in the first part never reaches the second.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun head (s: (LSeq i64)) -> i64 (match (lfirst s) ((some x) x) (nil -1)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nodes (cell 0)))
+    (do (check c (= (digits (concat [1 2] [3 4])) 1234))
+        (check c (= (digits (concat [] [3 4])) 34))
+        (check c (= (digits (concat [1 2] [])) 12))
+        (check c (= (count (concat [] [])) 0))
+        (check c (= (digits (concat (some 1) (list 2 3))) 123))
+        (check c (= (digits (concat (list 1) (some 2))) 12))
+        (check c (= (digits (concat (to-lseq [1 2]) [3])) 123))
+        (check c (= (digits (concat [1] (to-lseq [2 3]))) 123))
+        (check c (= (digits (concat (concat [1] [2]) (concat [3] [4]))) 1234))
+        (check c (= (count (concat (take 2 [1 2 3]) (drop 1 [4 5 6]))) 4))
+        ;; the second source waits for the first
+        (let ((cc (concat [1 2] (countdown 3 nodes))))
+          (do (check c (= @nodes 0))
+              (check c (= (head cc) 1))
+              (check c (= @nodes 0))
+              (check c (= (digits (take 2 cc)) 12))
+              (check c (= @nodes 0))
+              (check c (= (digits (take 3 cc)) 123))
+              (check c (= @nodes 1))
+              (check c (= (count cc) 5))
+              (check c (= @nodes 4))))
+        (checks-result c))))

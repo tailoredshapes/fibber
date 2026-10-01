@@ -1,0 +1,43 @@
+;; spec:   stdlib §4.4 (rows find-first find-map), A11 some, A10 t1r
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: find-first find-map
+;; find-first is (first (filter p c)) as a value: the first element the
+;; predicate accepts, nil if none, and the walk stops there (the predicate
+;; is called once per element up to the hit, and a source with no end is
+;; fine). find-map is the same for a function that answers an Option: the
+;; first (some y) it gives, with y of another type than the elements; its
+;; later elements are never given to f.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Naturals (from: i64))
+
+(impl (Reducible i64) Naturals
+  (each-while (self k)
+    (loop ((i (. self from))) (if (k i) (recur (+ i 1)) false))))
+
+(defun is (o: (Option i64) n: i64) -> bool (match o (nil false) ((some x) (= x n))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (none: (Option i64) nil)
+        (ev: (Vec i64) (vec-empty)))
+    (do (check c (is (find-first (fn (x) (do (set! calls (+ @calls 1)) (> x 2))) [1 2 3 4 5]) 3))
+        (check c (= @calls 3))
+        (check c (nil? (find-first (fn (x) (> x 9)) [1 2 3])))
+        (check c (nil? (find-first (fn (x) true) ev)))
+        (check c (nil? (find-first (fn (x) true) none)))
+        (check c (is (find-first (fn (x) (> x 99)) (Naturals 1)) 100))
+        (check c (is (find-first (fn (x) (= x 20)) (list 10 20 20)) 20))
+        (check c (is (find-first (fn (x) (> x 0)) (some 5)) 5))
+        (set! calls 0)
+        (check c (is (find-map (fn (x) (do (set! calls (+ @calls 1)) (if (> x 2) (some (* x 10)) nil))) [1 2 3 4 5]) 30))
+        (check c (= @calls 3))
+        (check c (nil? (find-map (fn (x) (if (> x 9) (some x) nil)) [1 2 3])))
+        (check c (nil? (find-map (fn (x) (some x)) ev)))
+        (check c (match (find-map (fn (x) (if (= x 2) (some (show x)) nil)) (list 1 2 3)) ((some s) (= s "2")) (nil false)))
+        (check c (is (find-map (fn (x) (if (> x 49) (some (+ x 1)) nil)) (Naturals 1)) 51))
+        (checks-result c))))

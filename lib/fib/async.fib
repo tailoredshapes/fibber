@@ -1,0 +1,26 @@
+;; fib.async (owner L12): Clojure's future and future-call over the builtin spawn (stdlib §2.11, §4.15
+;; rows future and future-call). Tranche 1 holds these two; promise, deliver, delay, the watches and
+;; the rest of the module come later. It is `:require`d or `:use`d, never implicit (plan §4.1).
+;; pmap, which §4.15 lists here too, is the prelude's (plan §6 L12 and L4): it stays there until the
+;; library's Reducible can drive a pmap over any source, which no package of tranche 1 owns.
+;;
+;; (future body ..) is (spawn (fn () body ..)): a task whose value is the last form. The closure is the
+;; one spawn takes, so it must be sendable and a captured Cell is refused with the checker's own words
+;; (`cell cannot be shared between threads: closure capture c has type (Cell i64)`, at the future).
+;; Where Clojure writes @f the task is waited for with (join f): `@` on a Task is `no implementation
+;; of Deref for (Task i64)` in the checker today (types/infer/solve.rs solve_deref knows a Cell, an
+;; Atom and a Weak), a gap against the note of row `future` that the report to the lead names and
+;; case 658 pins.
+;;
+;; The template names spawn as fib.prelude/spawn, the one spelling that skips the user's scope
+;; (stdlib §6.3, plan §4.3 rule 5), so a program with a function of its own named spawn still
+;; spawns (case 655). The macro is needed because the body is not a function the caller wrote
+;; (stdlib §4.15: "a macro over spawn"); it costs one JIT module under fibc per program that uses
+;; it (stdlib §6.3), which a program that does not `:use` fib.async does not pay.
+(ns fib.async)
+
+(defmacro future (... body)
+  `(fib.prelude/spawn (fn () (do ,@body))))
+
+(defun future-call (f: (fn :send () a)) -> (Task a)
+  (fib.prelude/spawn f))

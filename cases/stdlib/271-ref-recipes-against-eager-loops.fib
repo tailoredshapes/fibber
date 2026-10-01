@@ -1,0 +1,84 @@
+;; spec:   stdlib §2.1 rule 2 (the recipe of each adaptor), §8.1 item 2, tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The seven recipe structs, each alone and in seven nested shapes of the
+;; kind the fusion rewrite emits, against an eager reference of loops over
+;; the prelude's vec-conj and vec-nth (no library code on that side), over
+;; 300 seeded draws of two Vecs of 0 to 9 elements and drawn parameters.
+;; The recipe side walks the structure with to-vec, which is each-while.
+;; The last check plants a fault in the reference (take keeps one element
+;; too many) and requires it to be noticed. Seed 271.
+(ns main (:use fib.core fib.seq tl.check tl.rng))
+
+;; ---- the reference
+(defun push (v: (Vec i64) x: i64) -> (Vec i64) (vec-conj v x))
+(defun r-map (v: (Vec i64) k: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty))) (if (< i (vec-count v)) (recur (+ i 1) (push acc (+ (* (vec-nth v i) 3) k))) acc)))
+(defun r-filter (v: (Vec i64) k: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (recur (+ i 1) (if (= (rem (+ (vec-nth v i) k) 3) 0) (push acc (vec-nth v i)) acc))
+        acc)))
+(defun r-take (v: (Vec i64) n: i64 fault: bool) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (and (< i (vec-count v)) (< i (if fault (+ n 1) n))) (recur (+ i 1) (push acc (vec-nth v i))) acc)))
+(defun r-drop (v: (Vec i64) n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v)) (recur (+ i 1) (if (< i n) acc (push acc (vec-nth v i)))) acc)))
+(defun r-while (v: (Vec i64) k: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (and (< i (vec-count v)) (< (vec-nth v i) k)) (recur (+ i 1) (push acc (vec-nth v i))) acc)))
+(defun r-fan (v: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (let ((x (vec-nth v i)))
+          (recur (+ i 1) (if (= (rem x 2) 0) (push (push acc x) x) (push acc x))))
+        acc)))
+(defun r-cat (a: (Vec i64) b: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc a)) (if (< i (vec-count b)) (recur (+ i 1) (push acc (vec-nth b i))) acc)))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; ---- the recipes' parameters, the same functions the reference spells out
+(defun fmap (k: i64) -> (fn (i64) i64) (fn (x) (+ (* x 3) k)))
+(defun fkeep (k: i64) -> (fn (i64) bool) (fn (x) (= (rem (+ x k) 3) 0)))
+(defun fbelow (k: i64) -> (fn (i64) bool) (fn (x) (< x k)))
+(defun ffan (x: i64) -> (Vec i64) (if (= (rem x 2) 0) [x x] [x]))
+
+;; one draw: every shape against its reference
+(defun draw (r: Rng c: Checks fault: bool) -> unit
+  (let ((v (rng-vec r (rng-below r 10) 20))
+        (w (rng-vec r (rng-below r 10) 20))
+        (k (rng-below r 6))
+        (n (rng-below r 8))
+        (m (rng-below r 8)))
+    (do (check c (same (to-vec (Mapped v (fmap k))) (r-map v k)))
+        (check c (same (to-vec (Filtered v (fkeep k))) (r-filter v k)))
+        (check c (same (to-vec (Taken v n)) (r-take v n fault)))
+        (check c (same (to-vec (Dropped v n)) (r-drop v n)))
+        (check c (same (to-vec (TakenWhile v (fbelow k))) (r-while v k)))
+        (check c (same (to-vec (Mapcat v ffan)) (r-fan v)))
+        (check c (same (to-vec (Cat v w)) (r-cat v w)))
+        (check c (same (to-vec (Mapped (Filtered v (fkeep k)) (fmap n))) (r-map (r-filter v k) n)))
+        (check c (same (to-vec (Filtered (Mapped v (fmap k)) (fkeep n))) (r-filter (r-map v k) n)))
+        (check c (same (to-vec (Taken (Mapped v (fmap k)) n)) (r-take (r-map v k) n fault)))
+        (check c (same (to-vec (Dropped (Filtered v (fkeep k)) n)) (r-drop (r-filter v k) n)))
+        (check c (same (to-vec (Cat (Taken v n) (Dropped w m))) (r-cat (r-take v n fault) (r-drop w m))))
+        (check c (same (to-vec (Mapcat (TakenWhile v (fbelow (+ k 8))) ffan)) (r-fan (r-while v (+ k 8)))))
+        (check c (same (to-vec (TakenWhile (Mapped v (fmap k)) (fbelow (+ n 30)))) (r-while (r-map v k) (+ n 30)))))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 271)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 4200))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

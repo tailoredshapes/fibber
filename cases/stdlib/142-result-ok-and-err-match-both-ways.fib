@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.3 (row Result), §2.10 (Result is the value of a function that can fail)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: Result
+;; (Result a b) is the prelude's enum (Ok v) (Err e) with Eq, Ord and Hash derived. A function that
+;; can fail returns one and the caller matches both variants; the two variants of one type carry
+;; different payload types; equal Results are equal and an Ok is never an Err of the same payload;
+;; `<` puts Ok before Err (the variants' order); and a Result is a Map key.
+(ns main (:use tl.check))
+
+(defun half (n: i64) -> (Result i64 str)
+  (if (= (rem n 2) 0) (Ok (quot n 2)) (Err (str-concat "odd: " (show n)))))
+
+(defun ok (n: i64) -> (Result i64 str) (Ok n))
+
+(defun value (r: (Result i64 str)) -> i64
+  (match r ((Ok v) v) ((Err e) (str-len e))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (assoc (assoc (map-empty) (half 4) 1) (half 5) 2)))
+    (do (check c (= (value (half 10)) 5))
+        (check c (= (value (half 7)) 6))
+        (check c (match (half 8) ((Ok v) (= v 4)) ((Err _) false)))
+        (check c (match (half 9) ((Err e) (= e "odd: 9")) ((Ok _) false)))
+        (check c (= (half 6) (Ok 3)))
+        (check c (!= (half 6) (Ok 4)))
+        (check c (!= (half 6) (half 7)))
+        (check c (= (half 7) (Err "odd: 7")))
+        (check c (< (half 2) (half 3)))
+        (check c (< (ok 1) (ok 2)))
+        (check c (< (half 3) (half 5)))
+        (check c (not (< (half 3) (half 2))))
+        (check c (= (hash (half 4)) (hash (ok 2))))
+        (check c (!= (hash (half 4)) (hash (half 5))))
+        (check c (= (count m) 2))
+        (check c (= (unwrap-or (get m (ok 2)) 0) 1))
+        (check c (= (unwrap-or (get m (Err "odd: 5")) 0) 2))
+        (checks-result c))))

@@ -1,0 +1,79 @@
+;; spec:   stdlib §8.1 item 2 (a differential test against a naive reference), §4.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: nth-or empty? reduce reduce1 reduce-while every? not-any? find-first find-map sum run! count
+;; Each consumer against a five-line loop over the prelude's own vec-count and
+;; vec-nth (the data structure is not under test here), on 300 seeded Vecs of
+;; 0 to 11 elements below 20, with a seeded threshold and index. The last
+;; check is the planted fault: the same sweep with a reference whose nth-or
+;; treats the last element as missing (an off-by-one), run against a second
+;; Checks, and the case fails unless that run found a difference.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+(defun vlen (v: (Vec i64)) -> i64 (fib.prelude/count v))
+(defun vat (v: (Vec i64) i: i64) -> i64 (fib.prelude/nth v i))
+
+(defun opt= (a: (Option i64) b: (Option i64)) -> bool
+  (match a
+    (nil (nil? b))
+    ((some x) (match b (nil false) ((some y) (= x y))))))
+
+;; the first index at which p holds, or -1
+(defun ref-index (v: (Vec i64) thr: i64) -> i64
+  (loop ((i 0)) (if (< i (vlen v)) (if (>= (vat v i) thr) i (recur (+ i 1))) -1)))
+
+(defun ref-fold (v: (Vec i64) from: i64 init: i64) -> i64
+  (loop ((i from) (a init)) (if (< i (vlen v)) (recur (+ i 1) (- (* a 3) (vat v i))) a)))
+
+(defun ref-while (v: (Vec i64) limit: i64) -> i64
+  (loop ((i 0) (a 0))
+    (if (< i (vlen v)) (if (> a limit) a (recur (+ i 1) (+ a (vat v i)))) a)))
+
+(defun ref-sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (a 0)) (if (< i (vlen v)) (recur (+ i 1) (+ a (vat v i))) a)))
+
+(defun ref-weighted (v: (Vec i64)) -> i64
+  (loop ((i 0) (a 0)) (if (< i (vlen v)) (recur (+ i 1) (+ a (* (+ i 1) (vat v i)))) a)))
+
+(defun ref-nth-or (v: (Vec i64) i: i64 d: i64 skew: i64) -> i64
+  (if (< i 0) d (if (>= i (- (vlen v) skew)) d (vat v i))))
+
+(defun at-or-over (thr: i64) -> (fn (i64) bool) (fn (x) (>= x thr)))
+
+(defun sweep (c: Checks seed: i64 skew: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (n 300)
+      (let ((v (rng-vec r (rng-below r 12) 20))
+            (thr (rng-below r 20))
+            (i (- (rng-below r 15) 2))
+            (steps (cell 0))
+            (weighted (cell 0)))
+        (let ((hit (ref-index v thr))
+              (len (vlen v)))
+          (do (check c (opt= (first v) (if (> len 0) (some (vat v 0)) nil)))
+              (check c (opt= (last v) (if (> len 0) (some (vat v (- len 1))) nil)))
+              (check c (= (empty? v) (= len 0)))
+              (check c (= (count v) len))
+              (check c (if (and (>= i 0) (< i len)) (= (nth v i) (vat v i)) true))
+              (check c (= (nth-or v i -77) (ref-nth-or v i -77 skew)))
+              (check c (= (reduce (fn (a x) (- (* a 3) x)) 5 v) (ref-fold v 0 5)))
+              (check c (opt= (reduce1 (fn (a x) (- (* a 3) x)) v) (if (> len 0) (some (ref-fold v 1 (vat v 0))) nil)))
+              (check c (= (reduce-while (fn (a x) (if (> a (* thr 5)) (reduced a) (More (+ a x)))) 0 v) (ref-while v (* thr 5))))
+              (check c (= (every? (fn (x) (< x thr)) v) (= hit -1)))
+              (check c (= (not-any? (fn (x) (>= x thr)) v) (= hit -1)))
+              (check c (opt= (find-first (at-or-over thr) v) (if (>= hit 0) (some (vat v hit)) nil)))
+              (check c (opt= (find-map (fn (x) (if (>= x thr) (some (* x 2)) nil)) v) (if (>= hit 0) (some (* 2 (vat v hit))) nil)))
+              (check c (= (sum v) (ref-sum v)))
+              (run! (fn (x) (do (set! steps (+ @steps 1)) (set! weighted (+ @weighted (* @steps x))))) v)
+              (check c (and (= @steps len) (= @weighted (ref-weighted v))))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 11 0)
+        (sweep p 11 1)
+        (check c (= (checks-made c) 4500))
+        (check-detects c p)
+        (checks-result c))))

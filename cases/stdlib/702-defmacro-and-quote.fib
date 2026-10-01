@@ -1,0 +1,77 @@
+;; spec:   stdlib §4.2 (rows defmacro, quote), syntax §3.16
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: defmacro quote
+;; A macro is a function from forms to a form, run when the program is
+;; compiled; `quote` makes a form a value. Both in the form they have on
+;; today's compiler: the rest parameter is spelled `... xs` (Clojure's
+;; `& xs` is L2, tranche 3), the template is a quasiquote with `,x`
+;; (Clojure's `~x` is E14).
+;;  * the arguments of a macro are not evaluated: `hello` below is bound
+;;    to nothing, and `(blow-up)` is never called;
+;;  * the macro's own code runs at expansion time, on forms: `name-of`
+;;    turns a symbol into a string literal before the program runs;
+;;  * a macro with a rest parameter folds its operands, recursively: the
+;;    expansion of `(sum-of 1 2 3)` is itself a call of the macro;
+;;  * a macro may expand to a call of another macro;
+;;  * `(quote x)` is a `Form`, not what `x` names: a symbol, a list that
+;;    has a call in it that is never made, a vector.
+(ns main (:use tl.check))
+
+(defmacro name-of (x)
+  (match x
+    ((Sym s) (Str s))
+    (_ (Str "not a symbol"))))
+
+(defmacro unless-zero (e body)
+  `(if (= ,e 0) 0 ,body))
+
+(defmacro sum-of (... xs)
+  (match xs
+    ([] '0)
+    ([x & r] `(+ ,x (sum-of ,@r)))))
+
+(defmacro twice-sum (... xs)
+  `(* 2 (sum-of ,@xs)))
+
+(defmacro ignore-it (x) '0)
+
+(defun blow-up () -> i64 (trap "the argument of a macro was evaluated"))
+
+(defun sym-name (f: Form) -> str
+  (match f
+    ((Sym s) s)
+    (_ "")))
+
+(defun item-count (f: Form) -> i64
+  (match f
+    ((List items) (count items))
+    ((Vec items) (count items))
+    (_ -1)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do
+      ;; the argument is a form, not a value
+      (check c (= (name-of hello) "hello"))
+      (check c (= (name-of (not a symbol)) "not a symbol"))
+      (check c (= (ignore-it (blow-up)) 0))
+      (check c (= (ignore-it hello) 0))
+      ;; the macro decides when its operands are evaluated
+      (check c (= (unless-zero 0 (blow-up)) 0))
+      (check c (= (unless-zero 3 (+ 40 2)) 42))
+      ;; the rest parameter, the recursion, the macro of a macro
+      (check c (= (sum-of) 0))
+      (check c (= (sum-of 5) 5))
+      (check c (= (sum-of 1 2 3 4) 10))
+      (check c (= (twice-sum 1 2 3) 12))
+      ;; quote
+      (check c (= (sym-name (quote hello)) "hello"))
+      (check c (= (sym-name (quote (hello))) ""))
+      (check c (= (item-count (quote (blow-up 1 2))) 3))
+      (check c (= (item-count (quote [a b c d])) 4))
+      (check c (= (item-count (quote ())) 0))
+      (check c (= (item-count (quote hello)) -1))
+      (checks-result c))))

@@ -1,0 +1,42 @@
+;; spec:   stdlib §4.5 (rows keys vals), §2.1 rule 2 (a lazy seq)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: keys vals key val
+;; keys and vals are lazy seqs (LSeq) of a map's keys and values, one entry
+;; each, in the walk's order (the hash's), and the two are in the same order,
+;; so the i-th value belongs to the i-th key. The empty map gives an empty seq,
+;; never nil (a seq is a value: (count (keys {})) is 0). Any source of Pairs
+;; has keys and vals, a Vec of them here. The sum of the keys and the sum of
+;; the values are order-free, so the case does not pin the hash order.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun sum (c: s) :where ((Reducible s i64)) -> i64
+  (let ((t (cell 0))) (do (each-while c (fn (x) (do (set! t (+ @t x)) true))) @t)))
+
+(defun is (o: (Option i64) n: i64) -> bool (match o (nil false) ((some x) (= x n))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (e (empty {1 0}))
+        (m (assoc (assoc (assoc (empty {1 0}) 1 10) 2 20) 3 30))
+        (ks (keys m))
+        (vs (vals m))
+        (ps [(Pair "a" 1) (Pair "b" 2)])
+        (n (cell 0)))
+    (do (check c (= (count (keys e)) 0))
+        (check c (= (count (vals e)) 0))
+        (check c (= (count ks) 3))
+        (check c (= (count vs) 3))
+        (check c (= (sum ks) 6))
+        (check c (= (sum vs) 60))
+        (check c (do (each-while ks (fn (k) (do (check c (is (get m k) (nth vs @n))) (set! n (+ @n 1)) true)))
+                     (= @n 3)))
+        (check c (= (count (keys ps)) 2))
+        (check c (= (nth (keys ps) 0) "a"))
+        (check c (= (nth (vals ps) 1) 2))
+        (check c (= (key (nth ps 1)) "b"))
+        (check c (= (val (nth ps 0)) 1))
+        (check c (= (sum (vals (dissoc m 2))) 40))
+        (checks-result c))))

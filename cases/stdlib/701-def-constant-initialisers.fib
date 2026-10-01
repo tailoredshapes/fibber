@@ -1,0 +1,65 @@
+;; spec:   stdlib §4.2 (row def), syntax §3.19, §2.11
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: def
+;; `def` binds a top-level constant whose value is made before `main`, in
+;; the form it has on today's compiler: the initialiser is a constant
+;; expression (a literal, a quoted form, nil, a constructor of constants,
+;; a vector or map literal, a named function) and nothing else. Every
+;; kind of constant the rule allows that both tools make today is read
+;; here, with and without the annotation and with `:private`. What `def`
+;; may hold beyond that (any expression, L15) is case 726; a `def` that
+;; names an earlier `def` is case 727, and an `(Option scalar)` constant
+;; (`fibc` says `unsupported: a def holding a boxed some`, spec/compiler.md
+;; §8: a stage limit) is left out, so an Option here is of a string.
+(ns main (:use tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+(defenum Color Red Green (Rgb r: i64 g: i64 b: i64))
+
+(def limit: i64 1000)
+(def inferred 7)
+(def narrow: i8 -5i8)
+(def ratio: f64 3.25)
+(def name: str "fib")
+(def letter: char \f)
+(def flag: bool true)
+(def table: (Vec i64) [10 20 30])
+(def lookup: (Map i64 str) {1 "one" 2 "two"})
+(def origin: Pt (Pt 3 4))
+(def maybe: (Option str) (some "nine"))
+(def absent: (Option str) nil)
+(def shade: Color (Rgb 1 2 3))
+(def plain: Color Green)
+(def form: Form 'foo)
+(defun twice (n: i64) -> i64 (* n 2))
+(def op: (fn (i64) i64) twice)
+(def hidden: i64 :private 41)
+
+(defun red? (c: Color) -> bool (match c ((Red) true) (_ false)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= limit 1000))
+        (check c (= inferred 7))
+        (check c (= narrow -5i8))
+        (check c (= ratio 3.25))
+        (check c (= name "fib"))
+        (check c (= letter \f))
+        (check c flag)
+        (check c (= (nth table 1) 20))
+        (check c (= (count table) 3))
+        (check c (match (get lookup 2) ((some s) (= s "two")) (nil false)))
+        (check c (match (get lookup 3) ((some _) false) (nil true)))
+        (check c (= (. origin y) 4))
+        (check c (match maybe ((some x) (= x "nine")) (nil false)))
+        (check c (match absent ((some _) false) (nil true)))
+        (check c (match shade ((Rgb r g b) (= (+ r (+ g b)) 6)) (_ false)))
+        (check c (not (red? plain)))
+        (check c (match form ((Sym s) (= s "foo")) (_ false)))
+        (check c (= (op 21) 42))
+        (check c (= hidden 41))
+        (check c (= (+ (nth table 0) (nth table 2)) 40))
+        (checks-result c))))

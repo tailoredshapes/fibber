@@ -1,0 +1,56 @@
+;; spec:   stdlib §2.7 (three printers), §2.10 (the function twins), §4.14
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str println print prn pr run!
+;; A case never prints to compare, so the printers are told apart by what they
+;; ask: a value whose Show, Debug and ToStr each count their calls and answer
+;; with a different letter. println and print take its Show, prn and pr its
+;; Debug, str its ToStr, each exactly once, in head position and as a function
+;; value (`(run! println v)` runs it once per element). What the calls write
+;; is checked by hand in the package report: stdout is not a case's result. The
+;; calls that write no newline are followed by a (newline): the runner reads the
+;; result from the last line of stdout, so the text must not run into it.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defstruct Spy (shows: (Cell i64) debugs: (Cell i64) strs: (Cell i64)))
+(impl Show Spy (show (self) (do (set! (. self shows) (+ @(. self shows) 1)) "S")))
+(impl Debug Spy (debug (self) (do (set! (. self debugs) (+ @(. self debugs) 1)) "D")))
+(impl ToStr Spy (to-str (self) (do (set! (. self strs) (+ @(. self strs) 1)) "T")))
+
+(defun counts (s: Spy) -> (Triple i64 i64 i64)
+  (Triple @(. s shows) @(. s debugs) @(. s strs)))
+
+(defun is (t: (Triple i64 i64 i64) a: i64 b: i64 c: i64) -> bool
+  (and (= (. t fst) a) (and (= (. t snd) b) (= (. t thd) c))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (spy (Spy (cell 0) (cell 0) (cell 0)))
+        (three [(Spy (cell 0) (cell 0) (cell 0)) (Spy (cell 0) (cell 0) (cell 0)) (Spy (cell 0) (cell 0) (cell 0))]))
+    (do (check c (is (counts spy) 0 0 0))
+        (println spy)
+        (check c (is (counts spy) 1 0 0))
+        (print spy)
+        (check c (is (counts spy) 2 0 0))
+        (prn spy)
+        (check c (is (counts spy) 2 1 0))
+        (pr spy)
+        (check c (is (counts spy) 2 2 0))
+        (check c (= (str spy) "T"))
+        (check c (is (counts spy) 2 2 1))
+        (check c (= (show spy) "S"))
+        (check c (= (debug spy) "D"))
+        (check c (is (counts spy) 3 3 1))
+        (run! println three)
+        (check c (is (counts (nth three 0)) 1 0 0))
+        (check c (is (counts (nth three 2)) 1 0 0))
+        (run! print three)
+        (run! prn three)
+        (run! pr three)
+        (check c (is (counts (nth three 1)) 2 2 0))
+        (newline)
+        (run! str three)
+        (check c (is (counts (nth three 1)) 2 2 1))
+        (checks-result c))))

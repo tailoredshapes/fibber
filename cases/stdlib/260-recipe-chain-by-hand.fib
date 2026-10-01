@@ -1,0 +1,57 @@
+;; spec:   stdlib §2.1 rule 2 (the fused path: recipes), tranche 1 plan R9 (the constructors the rewrite emits)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter
+;; The recipe of each adaptor, built by hand with the constructors the
+;; fusion rewrite (R9) will emit, source first: (Mapped c f) (Filtered c p)
+;; (Taken c n) (Dropped c n) (TakenWhile c p) (Mapcat c f) (Cat a b). The
+;; page's A13 lz1 chain, filter odd? then map f over [1 2 3 4], is 8 with two
+;; calls of f, whether built as recipes or as lazy seqs; a recipe is not
+;; memoised (a second walk calls f again: it is never a value of a program,
+;; which is why the rewrite may build it only where a consumer reads it
+;; once), the seq is. Taken stops its source at n, so a Mapped under a
+;; Taken of two calls f twice, not three times.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2))))
+          (odd (fn (x: i64) (= (rem x 2) 1))))
+      (do ;; the page's chain
+          (check c (= (total (Mapped (Filtered [1 2 3 4] odd) f)) 8))
+          (check c (= @calls 2))
+          (check c (= (total (map f (filter odd [1 2 3 4]))) 8))
+          (check c (= @calls 4))
+          ;; walked twice: the recipe runs f again, a bound seq does not
+          (set! calls 0)
+          (let ((r (Mapped [1 2 3] f)) (s (map f [1 2 3])))
+            (do (check c (= (+ (total r) (total r)) 24))
+                (check c (= @calls 6))
+                (set! calls 0)
+                (check c (= (+ (total s) (total s)) 24))
+                (check c (= @calls 3))))
+          ;; each recipe
+          (set! calls 0)
+          (check c (= (digits (Taken (Mapped [1 2 3 4] f) 2)) 24))
+          (check c (= @calls 2))
+          (check c (= (digits (Taken [5 6 7] 0)) 0))
+          (check c (= (digits (Dropped [1 2 3 4] 1)) 234))
+          (check c (= (digits (TakenWhile [1 2 3 1] (fn (x: i64) (< x 3)))) 12))
+          (check c (= (digits (TakenWhile [1 2 3] (fn (x: i64) (if (< x 3) (some x) nil)))) 12))
+          (check c (= (digits (Filtered [1 2 3 4] (fn (x: i64) (if (> x 2) (some x) nil)))) 34))
+          (check c (= (digits (Mapcat [1 2] (fn (x: i64) [x x]))) 1122))
+          (check c (= (digits (Cat [1 2] (some 3))) 123))
+          ;; nested, as a rewritten chain would be
+          (check c (= (digits (Cat (Taken [1 2 3] 2) (Dropped (Mapped [4 5 6] (fn (x: i64) (+ x 10))) 1))) 1366))
+          (checks-result c)))))

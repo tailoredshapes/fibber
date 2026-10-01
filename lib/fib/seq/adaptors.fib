@@ -1,4 +1,104 @@
-;; owner: L6. fib.seq.adaptors: the lazy sequence functions. Exports: map filter remove take drop take-while concat mapcat (the lazy forms).
-;; Until L6 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.seq.adaptors (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
+;; fib.seq.adaptors: the lazy sequence functions (stdlib §2.1 rule 2, §4.4; tranche 1 plan §4.2, owner L6).
+;; Exports map filter remove take drop take-while concat mapcat, each returning Clojure's memoised lazy seq,
+;; an (LSeq e): nothing runs until a node is demanded, a node is realised once, and a value traversed twice
+;; runs its function once per element. Replaces the prelude's Vec-only `map`, which M deletes.
+;;
+;; Each public function converts its source with to-lseq and hands it to a private lazy form written as
+;; Clojure writes them, one lazy-node per result node whose thunk demands one node of its source. A Vec
+;; converts to a lazy view (no copy), an LSeq to itself, so a chain of adaptors over a lazy source is lazy
+;; end to end (plan PC-13): (first (map g (map f s))) calls f and g once. Any other source is converted
+;; when the adaptor is called, in full, by the default to-lseq; a source that can be endless overrides it.
+;; The fused form of the same functions is the recipes' (fib.seq.recipes), which the expander (R9) picks
+;; when a consumer reads a chain once.
+;;
+;; Decided here, where the page is silent:
+;;  - the predicate of filter, remove and take-while returns any Truthy (bool or Option), as the row says;
+;;    remove is filter with the complement of that truthiness.
+;;  - concat is the two-argument function (the row: a macro nests for more, R6a); a result that is
+;;    empty in its first part continues into the second without a node of its own.
+;;  - mapcat appends (to-lseq (f x)) for each element x; elements for which f gives nothing are skipped
+;;    in a loop, not by recursion, so a long run of empty results does not deepen the stack.
+;;  - drop skips on its first demand, not when called, and shares the rest of the source's nodes.
+;;  - (take n s) never demands the node after the n-th, so (take 3 s) of a seq whose fourth node would
+;;    fail or run forever does not touch it; take of n <= 0 does not touch the source at all.
+;;  - the function arguments are never :borrow: a node's thunk keeps them (plan §4.3 rule 7).
+(ns fib.seq.adaptors (:use fib.core fib.seq.types fib.seq.protocols))
+
+(defun lmap :private (f: (fn (a) b) s: (LSeq a)) -> (LSeq b)
+  (lazy-node (fn ()
+    (match (lnode s)
+      ((LNil) LNil)
+      ((LCons h t) (LCons (f h) (lmap f t)))))))
+
+(defun lfilter :private (p: (fn (a) r) s: (LSeq a)) :where ((Truthy r)) -> (LSeq a)
+  (lazy-node (fn ()
+    (loop ((s s))
+      (match (lnode s)
+        ((LNil) LNil)
+        ((LCons h t) (if (truthy? (p h)) (LCons h (lfilter p t)) (recur t))))))))
+
+(defun ltake :private (n: i64 s: (LSeq a)) -> (LSeq a)
+  (lazy-node (fn ()
+    (if (<= n 0)
+        LNil
+        (match (lnode s)
+          ((LNil) LNil)
+          ((LCons h t) (LCons h (ltake (- n 1) t))))))))
+
+;; the seq after n elements, or the empty seq reached on the way
+(defun lskip :private (n: i64 s: (LSeq a)) -> (LSeq a)
+  (loop ((n n) (s s))
+    (if (<= n 0)
+        s
+        (match (lnode s)
+          ((LNil) s)
+          ((LCons _ t) (recur (- n 1) t))))))
+
+(defun ldrop :private (n: i64 s: (LSeq a)) -> (LSeq a)
+  (lazy-node (fn () (lnode (lskip n s)))))
+
+(defun ltake-while :private (p: (fn (a) r) s: (LSeq a)) :where ((Truthy r)) -> (LSeq a)
+  (lazy-node (fn ()
+    (match (lnode s)
+      ((LNil) LNil)
+      ((LCons h t) (if (truthy? (p h)) (LCons h (ltake-while p t)) LNil))))))
+
+(defun lconcat :private (a: (LSeq e) b: (LSeq e)) -> (LSeq e)
+  (lazy-node (fn ()
+    (match (lnode a)
+      ((LNil) (lnode b))
+      ((LCons h t) (LCons h (lconcat t b)))))))
+
+(defun lmapcat :private (f: (fn (a) d) s: (LSeq a)) :where ((Reducible d b)) -> (LSeq b)
+  (lazy-node (fn ()
+    (loop ((s s))
+      (match (lnode s)
+        ((LNil) LNil)
+        ((LCons h t)
+         (match (lnode (to-lseq (f h)))
+           ((LNil) (recur t))
+           ((LCons x xs) (LCons x (lconcat xs (lmapcat f t)))))))))))
+
+(defun map (f: (fn (e) b) c: c) :where ((Reducible c e)) -> (LSeq b)
+  (lmap f (to-lseq c)))
+
+(defun filter (p: (fn (e) r) c: c) :where ((Reducible c e) (Truthy r)) -> (LSeq e)
+  (lfilter p (to-lseq c)))
+
+(defun remove (p: (fn (e) r) c: c) :where ((Reducible c e) (Truthy r)) -> (LSeq e)
+  (lfilter (fn (x) (not (truthy? (p x)))) (to-lseq c)))
+
+(defun take (n: i64 c: c) :where ((Reducible c e)) -> (LSeq e)
+  (ltake n (to-lseq c)))
+
+(defun drop (n: i64 c: c) :where ((Reducible c e)) -> (LSeq e)
+  (ldrop n (to-lseq c)))
+
+(defun take-while (p: (fn (e) r) c: c) :where ((Reducible c e) (Truthy r)) -> (LSeq e)
+  (ltake-while p (to-lseq c)))
+
+(defun concat (a: c1 b: c2) :where ((Reducible c1 e) (Reducible c2 e)) -> (LSeq e)
+  (lconcat (to-lseq a) (to-lseq b)))
+
+(defun mapcat (f: (fn (e) d) c: c) :where ((Reducible c e) (Reducible d b)) -> (LSeq b)
+  (lmapcat f (to-lseq c)))

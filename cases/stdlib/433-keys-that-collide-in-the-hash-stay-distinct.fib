@@ -1,0 +1,53 @@
+;; spec:   stdlib §2.3 (Lookup Assoc Dissoc Keyed on Map and Set), types §2.12 (Hash)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc get dissoc contains? conj
+;; A key type whose hash is its id mod 7: twenty ids fall into seven buckets,
+;; so most keys share their hash with others (the HAMT keeps them in one
+;; collision bucket and tells them apart by Eq). Every key keeps its own value,
+;; replacing one value leaves the others, removing one key leaves the others
+;; (down to the last of a bucket, which the HAMT turns back into a leaf), and
+;; a Set of such keys behaves the same. Every instance of the Map and Set
+;; protocols needs the key's Hash and Eq, which a user type supplies.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct K (id: i64))
+(derive Eq K)
+(impl Hash K (hash (self) (rem (. self id) 7)))
+
+(defun fill (m: (Map K i64) i: i64 n: i64) -> (Map K i64)
+  (loop ((i i) (m m)) (if (< i n) (recur (+ i 1) (assoc m (K i) (* i 10))) m)))
+
+(defun held (m: (Map K i64) n: i64) -> bool
+  (loop ((i 0)) (if (< i n) (if (match (get m (K i)) ((some v) (= v (* i 10))) (nil false)) (recur (+ i 1)) false) true)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (fill (empty {(K 0) 0}) 0 20))
+        (m2 (assoc m (K 8) -1))
+        (m3 (fill (empty m) 0 3))
+        (s (conj (conj (conj (empty (set [(K 0)])) (K 1)) (K 8)) (K 1))))
+    (do (check c (= (count m) 20))
+        (check c (held m 20))
+        (check c (match (get m2 (K 8)) ((some v) (= v -1)) (nil false)))
+        (check c (match (get m2 (K 1)) ((some v) (= v 10)) (nil false)))
+        (check c (match (get m2 (K 15)) ((some v) (= v 150)) (nil false)))
+        (check c (match (get m (K 8)) ((some v) (= v 80)) (nil false)))
+        (check c (= (count m2) 20))
+        (check c (not (contains? (dissoc m (K 8)) (K 8))))
+        (check c (contains? (dissoc m (K 8)) (K 1)))
+        (check c (contains? (dissoc m (K 8)) (K 15)))
+        (check c (= (count (dissoc m (K 8))) 19))
+        (check c (not (contains? (dissoc (dissoc (dissoc m (K 1)) (K 8)) (K 15)) (K 15))))
+        (check c (not (contains? (dissoc (dissoc (dissoc m (K 1)) (K 8)) (K 15)) (K 1))))
+        (check c (contains? (dissoc (dissoc (dissoc m (K 1)) (K 8)) (K 15)) (K 2)))
+        (check c (= (count (dissoc (dissoc (dissoc m (K 1)) (K 8)) (K 15))) 17))
+        (check c (= (count (dissoc (dissoc m (K 99)) (K 99))) 20))
+        (check c (held m3 3))
+        (check c (= (count s) 2))
+        (check c (contains? s (K 8)))
+        (check c (not (contains? (dissoc s (K 8)) (K 8))))
+        (check c (contains? (dissoc s (K 8)) (K 1)))
+        (checks-result c))))

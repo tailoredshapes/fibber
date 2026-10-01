@@ -1,0 +1,70 @@
+;; spec:   stdlib §2.3 (Collection, Emptyable), §4.5 (into, empty), §8.1 item 4 (a law over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: empty into conj
+;; The law: pouring a collection into the empty one of its own type, (into (empty
+;; c) c), conj-es every element in c's walk order, so a Vec comes out as it was and
+;; a collection that conses at the front (a List, a VSeq) comes out reversed, and
+;; pouring the result again restores the original. 200 seeded Vecs of length 0
+;; to 39 are put through it as a Vec, as a List built by conj and as a VSeq with
+;; a consed front; each is also checked to hold the Vec's elements to begin with,
+;; so a conj that put the element on the wrong end shows. The law's last check is
+;; a planted fault: the same comparison with the order of the front-consing
+;; collections taken the wrong way round must fail in a Checks of its own.
+;; fib.coll is required under an alias, not :used, so that `list` expands where
+;; the method `empty` is not in scope.
+(ns main (:use fib.core fib.seq tl.rng tl.check) (:require [fib.coll :as coll]))
+
+;; whether the elements of c, in walk order, are the Vec want, or its reverse
+(defun walks-as (c: c want: (Vec i64) reversed: bool) :where ((Reducible c i64)) -> bool
+  (let ((got (to-vec c))
+        (n (count want)))
+    (and (= (count got) n)
+         (loop ((i 0))
+           (if (< i n)
+               (if (= (nth got i) (nth want (if reversed (- (- n 1) i) i))) (recur (+ i 1)) false)
+               true)))))
+
+;; the law for a collection that conses at the front: once reversed, twice back.
+;; `fault` expects the first pour in the order it does not come out in.
+(defun front-law (s: s want: (Vec i64) fault: bool)
+  :where ((coll/Collection s s i64) (coll/Emptyable s) (Reducible s i64)) -> bool
+  (let ((once (coll/into (coll/empty s) s)))
+    (and (walks-as s want false)
+         (and (walks-as once want (not fault))
+              (walks-as (coll/into (coll/empty once) once) want false)))))
+
+;; the law for a collection that conses at the end
+(defun end-law (v: (Vec i64) fault: bool) -> bool
+  (let ((once (coll/into (coll/empty v) v)))
+    (and (walks-as once v fault)
+         (= (count once) (count v)))))
+
+;; v as a List in v's order, built from the end by conj
+(defun list-of (v: (Vec i64)) -> (List i64)
+  (loop ((i (- (count v) 1)) (acc (list)))
+    (if (>= i 0) (recur (- i 1) (coll/conj acc (nth v i))) acc)))
+
+;; the Vec x0 followed by v
+(defun with-front (x0: i64 v: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc (coll/conj (coll/empty v) x0)))
+    (if (< i (count v)) (recur (+ i 1) (coll/conj acc (nth v i))) acc)))
+
+(defun run (c: Checks seed: i64 rounds: i64 fault: bool) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k rounds)
+      (let ((v (rng-vec r (rng-below r 40) 1000))
+            (x0 (rng-below r 1000)))
+        (do (check c (end-law v fault))
+            (check c (front-law (list-of v) v fault))
+            (check c (front-law (coll/conj (vseq-of v) x0) (with-front x0 v) fault)))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (run c 5 200 false)
+        (run p 5 20 true)
+        (check-detects c p)
+        (checks-result c))))

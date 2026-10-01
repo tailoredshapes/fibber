@@ -1,0 +1,75 @@
+;; spec:   stdlib §2.3 (Dissoc), §4.5 (rows dissoc disj)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: dissoc disj assoc contains? get
+;; Laws over 200 seeded maps of colliding keys (0 to 11 entries) and sets,
+;; and a key k (0 to 15, there about half of the time):
+;;   (contains? (dissoc m k) k) is false;
+;;   (get (dissoc m k) j) is (get m j) for every j other than k;
+;;   (count (dissoc m k)) is (count m) less one when k was in m, else the same;
+;;   dissoc is idempotent: (dissoc (dissoc m k) k) agrees with (dissoc m k);
+;;   (dissoc (assoc m k v) k) agrees with (dissoc m k);
+;;   m itself is unchanged;
+;;   disj on a Set obeys the same: k gone, every other member kept.
+;; One check per map or set. The planted fault is a law that is wrong in one
+;; way, "dissoc removes nothing when the key is the smallest present", which
+;; falsifies it on a map that has k: its run must fail (check-detects). The seed
+;; is 442.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defstruct K (id: i64))
+(derive Eq K)
+(impl Hash K (hash (self) (rem (. self id) 5)))
+
+(defun same (a: (Option i64) b: (Option i64)) -> bool
+  (match a (nil (match b (nil true) ((some _) false))) ((some x) (match b (nil false) ((some y) (= x y))))))
+
+(defun random-map (r: Rng) -> (Map K i64)
+  (loop ((i (rng-below r 12)) (m (empty {(K 0) 0})))
+    (if (> i 0) (recur (- i 1) (assoc m (K (rng-below r 16)) (rng-below r 100))) m)))
+
+(defun agree-everywhere (a: (Map K i64) b: (Map K i64)) -> bool
+  (loop ((j 0) (ok (= (count a) (count b))))
+    (if (< j 16) (recur (+ j 1) (and ok (same (get a (K j)) (get b (K j))))) ok)))
+
+;; planted: the model of "k gone" is wrong when k is the lowest id the map holds
+(defun lowest-is (m: (Map K i64) k: i64) -> bool
+  (loop ((j 0)) (if (< j k) (if (contains? m (K j)) false (recur (+ j 1))) true)))
+
+(defun map-law (m: (Map K i64) k: i64 v: i64 planted: bool) -> bool
+  (let ((d (dissoc m (K k)))
+        (n (count m))
+        (had (contains? m (K k))))
+    (and (= (contains? d (K k)) (and planted (and had (lowest-is m k))))
+      (and (loop ((j 0) (ok true))
+             (if (< j 16) (recur (+ j 1) (if (= j k) ok (and ok (same (get d (K j)) (get m (K j)))))) ok))
+        (and (= (count d) (if had (- n 1) n))
+          (and (agree-everywhere (dissoc d (K k)) d)
+            (and (agree-everywhere (dissoc (assoc m (K k) v) (K k)) d)
+                 (= (count m) n))))))))
+
+(defun set-law (s: (Set i64) k: i64) -> bool
+  (let ((d (disj s k)) (n (count s)) (had (contains? s k)))
+    (and (not (contains? d k))
+      (and (= (count d) (if had (- n 1) n))
+        (and (loop ((j 0) (ok true))
+               (if (< j 16) (recur (+ j 1) (if (= j k) ok (and ok (= (contains? d j) (contains? s j))))) ok))
+             (= (count s) n))))))
+
+(defun random-set (r: Rng) -> (Set i64) (set (rng-vec r (rng-below r 12) 16)))
+
+(defun run (c: Checks planted: bool n: i64) -> unit
+  (let ((r (rng 442)))
+    (dotimes (i n)
+      (let ((m (random-map r)) (s (random-set r)) (k (rng-below r 16)) (v (rng-below r 100)))
+        (do (check c (map-law m k v planted))
+            (if planted () (check c (set-law s k))))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)))
+    (do (run c false 200)
+        (run p true 60)
+        (check-detects c p)
+        (checks-result c))))

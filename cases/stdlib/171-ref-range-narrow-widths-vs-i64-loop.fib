@@ -1,0 +1,91 @@
+;; spec:   stdlib §4.4 (row range-by), §2.8 (overflow traps at every width), §8.1 item 2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: range-by
+;; The same range at i8, i16 and i32 against a loop in i64, where nothing can overflow: 300 seeded ranges, 100 per
+;; width, with the start and the end drawn near the type's smallest value, near its largest or around zero, so
+;; that the steps cross the edge a naive `(+ i by)` at that width would trap on. For each: to-vec, count, nth of
+;; the first, middle and last element (the closed forms, done by widening) and the lazy seq, all widened
+;; and compared with the reference. The last two checks plant a fault in the reference (the end is an element;
+;; the last element is dropped) and require the same sweep to fail.
+(ns main (:use fib.core fib.seq tl.check tl.rng))
+
+;; the reference in i64; fault 1 includes the end, fault 2 drops the last element
+(defun ref-range (lo: i64 hi: i64 by: i64 fault: i64) -> (Vec i64)
+  (let ((all (loop ((i lo) (acc (vec-empty)))
+               (if (if (> by 0) (if (= fault 1) (<= i hi) (< i hi)) (if (= fault 1) (>= i hi) (> i hi)))
+                   (recur (+ i by) (fib.prelude/conj acc i))
+                   acc))))
+    (if (if (= fault 2) (> (fib.prelude/count all) 0) false)
+        (loop ((j 0) (acc (vec-empty)))
+          (if (< j (- (fib.prelude/count all) 1)) (recur (+ j 1) (fib.prelude/conj acc (fib.prelude/nth all j))) acc))
+        all)))
+
+(defun widened (v: (Vec t)) :where ((Bits t)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (fib.prelude/count v)) (recur (+ i 1) (fib.prelude/conj acc (sext i64 (fib.prelude/nth v i)))) acc)))
+
+(defun same (v: (Vec i64) xs: (Vec i64)) -> bool
+  (and (= (fib.prelude/count v) (fib.prelude/count xs))
+       (loop ((i 0))
+         (if (< i (fib.prelude/count v))
+             (if (= (fib.prelude/nth v i) (fib.prelude/nth xs i)) (recur (+ i 1)) false)
+             true))))
+
+(defun lseq-elements (s: (LSeq t)) -> (Vec t)
+  (loop ((s s) (acc (vec-empty)))
+    (match (lnode s)
+      ((LNil) acc)
+      ((LCons h t) (recur t (fib.prelude/conj acc h))))))
+
+;; a range of any width against the reference's elements
+(defun agrees (r: c want: (Vec i64)) :where ((Reducible c t) (Bits t)) -> bool
+  (let ((n (fib.prelude/count want)))
+    (and (same (widened (to-vec r)) want)
+         (and (= (count r) n)
+              (and (same (widened (lseq-elements (to-lseq r))) want)
+                   (if (> n 0)
+                       (and (= (sext i64 (nth r 0)) (fib.prelude/nth want 0))
+                            (and (= (sext i64 (nth r (- n 1))) (fib.prelude/nth want (- n 1)))
+                                 (= (sext i64 (nth r (quot n 2))) (fib.prelude/nth want (quot n 2)))))
+                       true))))))
+
+;; an endpoint of a range of the width with the given extremes: near the bottom, near the top, or near zero
+(defun pick (r: Rng bottom: i64 top: i64) -> i64
+  (let ((region (rng-below r 3)))
+    (if (= region 0)
+        (+ bottom (rng-below r 40))
+        (if (= region 1) (- top (rng-below r 40)) (- (rng-below r 41) 20)))))
+
+(defun step (r: Rng) -> i64
+  (let ((m (+ 1 (rng-below r 25))))
+    (if (= (rng-below r 2) 0) m (- 0 m))))
+
+;; 100 ranges at each width; the checks count into c
+(defun sweep (c: Checks fault: i64) -> unit
+  (let ((r (rng 8675309)))
+    (do (dotimes (j 100)
+          (let ((lo (pick r -128 127)) (hi (pick r -128 127)) (by (step r)))
+            (check c (agrees (range-by (trunc i8 lo) (trunc i8 hi) (trunc i8 by)) (ref-range lo hi by fault)))))
+        (dotimes (j 100)
+          (let ((lo (pick r -32768 32767)) (hi (pick r -32768 32767)) (by (* 100 (step r))))
+            (check c (agrees (range-by (trunc i16 lo) (trunc i16 hi) (trunc i16 by)) (ref-range lo hi by fault)))))
+        (dotimes (j 100)
+          (let ((lo (+ (* 51000000 (pick r -42 42)) (rng-below r 3)))
+                (hi (+ (* 51000000 (pick r -42 42)) (rng-below r 3)))
+                (by (* 10000000 (step r))))
+            (check c (agrees (range-by (trunc i32 lo) (trunc i32 hi) (trunc i32 by)) (ref-range lo hi by fault))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (inclusive (checks))
+        (dropped (checks)))
+    (do (sweep c 0)
+        (check c (= (checks-made c) 300))
+        (sweep inclusive 1)
+        (sweep dropped 2)
+        (check-detects c inclusive)
+        (check-detects c dropped)
+        (checks-result c))))

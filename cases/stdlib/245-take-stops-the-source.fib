@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.4 row take ("stops the source at n"), §2.1 rule 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: take
+;; (take n s) makes n nodes of s and no more: after taking three of a
+;; source of five nodes, three were made, not four (Clojure's take does not
+;; demand the node after the n-th). take of 0 or less touches the source
+;; not at all, take of more than the source has gives the source, and a
+;; take of a Vec, an Option and a List is a seq of the first n.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nodes (cell 0)))
+    (do (check c (= (total (take 3 (countdown 5 nodes))) 12))
+        (check c (= @nodes 3))
+        (set! nodes 0)
+        (check c (= (count (take 0 (countdown 5 nodes))) 0))
+        (check c (= (count (take -4 (countdown 5 nodes))) 0))
+        (check c (= @nodes 0))
+        ;; more than there is: the whole source, and the node that says it ended
+        (check c (= (count (take 99 (countdown 5 nodes))) 5))
+        (check c (= @nodes 6))
+        (check c (= (total (take 2 [7 8 9])) 15))
+        (check c (= (total (take 5 [7 8 9])) 24))
+        (check c (= (count (take 1 (some 4))) 1))
+        (check c (= (count (take 0 (some 4))) 0))
+        (check c (= (total (take 2 (list 5 6 7))) 11))
+        (check c (= (count (take 3 (take 2 [1 2 3 4]))) 2))
+        (check c (= (count (take 2 (take 3 [1 2 3 4]))) 2))
+        (checks-result c))))

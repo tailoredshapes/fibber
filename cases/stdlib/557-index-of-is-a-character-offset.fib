@@ -1,0 +1,67 @@
+;; spec:   stdlib §4.7 (row clojure.string/index-of), §2.9, plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: clojure.string/index-of
+;; `(str/index-of s p)` is the CHARACTER offset of the first match of `p`, a `str` or a `char`
+;; (any `Pattern`), or `nil`, never -1 (spec §2.9: the page's note "character offset, `(Option i64)`").
+;; So the offset is a position in the sequence of characters and not in bytes: in "aé€😀z", whose
+;; characters are 1, 2, 3, 4 and 1 bytes wide (11 bytes in all), `"z"` is at 4 and `"😀"` at 3 (their
+;; byte offsets would be 10 and 6). The empty pattern is found at 0, even in the empty string;
+;; the first of overlapping matches wins; a pattern longer than the text is not found. The first
+;; part of the checks is a table, and every expected value in it was computed by Java (`indexOf`
+;; converted from UTF-16 units to scalars with `codePointCount`, JDK 27), never by the library.
+;; The last checks do not need a table: whatever the offset is, the character the prelude's
+;; `str-chars` finds there (a decoder written elsewhere) is the pattern's character.
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+(defun at (o: (Option i64)) -> i64
+  (match o (nil -1) ((some n) n)))
+
+;; the character of s at character index i, by the prelude's decoder
+(defun char-at (s: str i: i64) -> char (fib.prelude/vec-nth (fib.prelude/str-chars s) i))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do
+        (check c (= (at (str/index-of "hello" "l")) 2))
+        (check c (= (at (str/index-of "hello" "lo")) 3))
+        (check c (= (at (str/index-of "hello" "")) 0))
+        (check c (= (at (str/index-of "" "")) 0))
+        (check c (= (at (str/index-of "" "a")) -1))
+        (check c (= (at (str/index-of "hello" "z")) -1))
+        (check c (= (at (str/index-of "hello" "hello")) 0))
+        (check c (= (at (str/index-of "hello" "helloo")) -1))
+        (check c (= (at (str/index-of "banana" "an")) 1))
+        (check c (= (at (str/index-of "aaa" "aa")) 0))
+        (check c (= (at (str/index-of "aaa" "aaaa")) -1))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "a")) 0))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "é")) 1))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "€")) 2))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "\u{1f600}")) 3))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "z")) 4))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "\u{1f600}z")) 3))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "€\u{1f600}")) 2))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "é\u{1f600}")) -1))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "q")) -1))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" "")) 0))
+        (check c (= (at (str/index-of "ééé" "é")) 0))
+        (check c (= (at (str/index-of "x€y€" "€")) 1))
+        (check c (= (at (str/index-of "\u{1f600}\u{1f600}" "\u{1f600}")) 0))
+        (check c (= (at (str/index-of "abc" "c")) 2))
+        (check c (= (at (str/index-of "hello" \l)) 2))
+        (check c (= (at (str/index-of "hello" \o)) 4))
+        (check c (= (at (str/index-of "hello" \z)) -1))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" \u{e9})) 1))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" \u{20ac})) 2))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" \u{1f600})) 3))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" \z)) 4))
+        (check c (= (at (str/index-of "aé€\u{1f600}z" \a)) 0))
+        (check c (= (at (str/index-of "ééé" \u{e9})) 0))
+        (check c (= (at (str/index-of "x€y€" \y)) 2))
+        (check c (= (char-at "aé€😀z" (at (str/index-of "aé€😀z" "€"))) \u{20ac}))
+        (check c (= (char-at "aé€😀z" (at (str/index-of "aé€😀z" \u{1f600}))) \u{1f600}))
+        (check c (= (char-at "xxé€é" (at (str/index-of "xxé€é" "é"))) \u{e9}))
+        (check c (= (+ (at (str/index-of "aé€😀z" "z")) 1) (fib.prelude/vec-count (fib.prelude/str-chars "aé€😀z"))))
+        (checks-result c))))

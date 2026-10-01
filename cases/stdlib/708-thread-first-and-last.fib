@@ -1,0 +1,51 @@
+;; spec:   stdlib §4.2 (rows ->, ->>), syntax §4.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: -> ->>
+;; `->` puts the value as the first argument of each step and `->>` as
+;; the last, each step being a call form or a bare symbol (a call of one
+;; argument). Steps that do not commute tell them apart: (- 10 3) is 7
+;; and (- 3 10) is -7; (str-concat "ab" "cd") and (str-concat "cd" "ab")
+;; are different strings. The value is evaluated once, a form with no step
+;; is the value, and `.` is a step like any other: (-> p (. x)) reads the
+;; field.
+(ns main (:use tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun double (n: i64) -> i64 (* n 2))
+(defun sub (a: i64 b: i64) -> i64 (- a b))
+(defun bump (c: (Cell i64)) -> i64 (do (set! c (+ @c 1)) @c))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (do
+      ;; first and last differ on a step that does not commute
+      (check c (= (-> 10 (- 3)) 7))
+      (check c (= (->> 10 (- 3)) -7))
+      (check c (= (-> 10 (sub 3) (sub 1)) 6))
+      (check c (= (->> 10 (sub 3) (sub 1)) 8))
+      (check c (= (-> "ab" (str-concat "cd")) "abcd"))
+      (check c (= (->> "ab" (str-concat "cd")) "cdab"))
+      ;; a pipeline, left to right: (- 10 3) 7, (* 7 2) 14, double 28
+      (check c (= (-> 10 (- 3) (* 2) double) 28))
+      (check c (= (->> 10 (- 3) (* 2) double) -28))
+      ;; a bare symbol is a call of one argument, the same for both
+      (check c (= (-> 5 double) 10))
+      (check c (= (->> 5 double) 10))
+      (check c (= (-> 5 double double) 20))
+      ;; no step: the value itself
+      (check c (= (-> 9) 9))
+      (check c (= (->> 9) 9))
+      ;; the value is evaluated once, not once per step
+      (check c (= (-> (bump calls) (sub 1) (sub 1) (sub 1)) -2))
+      (check c (= @calls 1))
+      (check c (= (->> (bump calls) (sub 1) (sub 1) (sub 1)) -1))
+      (check c (= @calls 2))
+      ;; a field read is a step
+      (check c (= (-> (Pt 3 4) (. y)) 4))
+      (check c (= (-> (Pt 3 4) (. x) double) 6))
+      (checks-result c))))

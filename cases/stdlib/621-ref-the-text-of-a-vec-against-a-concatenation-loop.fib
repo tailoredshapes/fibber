@@ -1,0 +1,89 @@
+;; spec:   stdlib §8.1 item 2 (a differential test against a naive reference), §2.7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str
+;; Show, Debug and ToStr of a Vec against a loop of str-concat, over 300 seeded
+;; Vecs of 0 to 7 integers (negative ones too), of strings that need no escape
+;; (letters and scalars of two, three and four bytes), and of Vecs of those
+;; (nested to two levels), with a Pair, a Triple and a one-element Set and Map
+;; made of the same elements. The reference writes the brackets, the separators
+;; and the quotes itself and takes the text of an integer from the builtin show,
+;; and walks the Vec with the prelude's vec-count and vec-nth, not with the
+;; library's own each-while. The last check is the
+;; planted fault: the same sweep against a reference that separates with a
+;; comma, run into a second Checks, and the case fails unless it found a
+;; difference.
+(ns main (:use fib.core fib.seq fib.print tl.rng tl.gen tl.check))
+
+(defun quoted (s: str) -> str (str-concat "\"" (str-concat s "\"")))
+
+;; open, the pieces joined by sep, close
+(defun wrap (open: str sep: str close: str parts: (Vec str)) -> str
+  (loop ((i 0) (acc open))
+    (if (< i (vec-count parts))
+        (recur (+ i 1) (str-concat (if (> i 0) (str-concat acc sep) acc) (vec-nth parts i)))
+        (str-concat acc close))))
+
+(defun gen-ints (r: Rng) -> (Vec i64)
+  (loop ((i 0) (n (rng-below r 8)) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) n (vec-conj acc (- (rng-below r 2001) 1000))) acc)))
+
+(defun gen-word (r: Rng) -> str
+  (loop ((i 0) (n (+ 1 (rng-below r 4))) (acc ""))
+    (if (< i n)
+        (recur (+ i 1) n (str-concat acc (if (= (rng-below r 3) 0)
+                                              (char->str (gen-char-of r (+ 2 (rng-below r 3))))
+                                              (char->str (i32->char (trunc i32 (+ 97 (rng-below r 26))))))))
+        acc)))
+
+(defun gen-words (r: Rng) -> (Vec str)
+  (loop ((i 0) (n (rng-below r 8)) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) n (vec-conj acc (gen-word r))) acc)))
+
+(defun ints-text (v: (Vec i64) sep: str) -> str
+  (wrap "[" sep "]" (loop ((i 0) (acc (vec-empty)))
+                      (if (< i (vec-count v)) (recur (+ i 1) (vec-conj acc (show (vec-nth v i)))) acc))))
+
+(defun words-text (v: (Vec str) sep: str quote: bool) -> str
+  (wrap "[" sep "]" (loop ((i 0) (acc (vec-empty)))
+                      (if (< i (vec-count v))
+                          (recur (+ i 1) (vec-conj acc (if quote (quoted (vec-nth v i)) (vec-nth v i))))
+                          acc))))
+
+(defun check-vecs (c: Checks sep: str v: (Vec i64) v2: (Vec i64) w: (Vec str)) -> unit
+  (do (check c (= (str v) (ints-text v sep)))
+      (check c (= (show v) (ints-text v sep)))
+      (check c (= (debug v) (ints-text v sep)))
+      (check c (= (str w) (words-text w sep true)))
+      (check c (= (debug w) (words-text w sep true)))
+      (check c (= (show w) (words-text w sep false)))
+      (check c (= (str [v v2]) (wrap "[" sep "]" [(ints-text v sep) (ints-text v2 sep)])))))
+
+(defun check-tuples (c: Checks sep: str v: (Vec i64) n: i64 word: str) -> unit
+  (do (check c (= (str (Pair v word)) (wrap "[" sep "]" [(ints-text v sep) (quoted word)])))
+      (check c (= (show (Pair v word)) (wrap "[" sep "]" [(ints-text v sep) word])))
+      (check c (= (str (Triple n word v)) (wrap "[" sep "]" [(show n) (quoted word) (ints-text v sep)])))
+      (check c (= (str (conj (set-empty) word)) (str-concat "#{" (str-concat (quoted word) "}"))))
+      (check c (= (show (assoc (map-empty) n word)) (str-concat "{" (str-concat (show n) (str-concat " " (str-concat word "}"))))))))
+
+(defun sweep (c: Checks seed: i64 sep: str) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k 300)
+      (let ((v (gen-ints r))
+            (w (gen-words r))
+            (v2 (gen-ints r))
+            (word (gen-word r))
+            (n (rng-below r 100)))
+        (do (check-vecs c sep v v2 w)
+            (check-tuples c sep v n word))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 621 " ")
+        (sweep p 621 ",")
+        (check c (= (checks-made c) 3600))
+        (check-detects c p)
+        (checks-result c))))

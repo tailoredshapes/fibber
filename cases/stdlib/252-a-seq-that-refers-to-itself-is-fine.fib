@@ -1,0 +1,31 @@
+;; spec:   stdlib §2.1 rule 2 (ones, nats: a seq that merely refers to itself is fine), §5 M1, ownership §6
+;; expect: accept
+;; result: 0
+;; audit:  leak-cycle
+;; roots:  ../../lib support
+;; covers: lazy-seq map take
+;; Clojure's (def ones (lazy-seq (cons 1 ones))) and (def nats (lazy-seq
+;; (cons 0 (map inc nats)))): the tail of the seq refers to the seq. That
+;; is not a seq that forces itself (case 251): the reference is read when
+;; the tail is demanded, and the head is already made. Both walk fine here,
+;; reached through a cell set after the seq is made, and the reference
+;; cycle through that cell is the one leak the audit reports apart from
+;; errors (ownership §6; the page's A11 t22).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (r: (Cell (Option (LSeq i64))) (cell nil))
+        (q: (Cell (Option (LSeq i64))) (cell nil)))
+    (let ((ones (lazy-seq (lcons 1 (match @r ((some s) s) (nil (to-lseq [])))))))
+      (let ((nats (lazy-seq (lcons 0 (map (fn (x: i64) (+ x 1))
+                                          (match @q ((some s) s) (nil (to-lseq []))))))))
+        (do (set! r (some ones))
+            (set! q (some nats))
+            (check c (= (digits (take 4 ones)) 1111))
+            (check c (= (digits (take 6 nats)) 12345))
+            (checks-result c))))))

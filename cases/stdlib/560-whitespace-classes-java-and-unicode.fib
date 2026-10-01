@@ -1,0 +1,61 @@
+;; spec:   stdlib §4.7 (str/trim, str/blank?), §4.8 (row whitespace?), plan §6 L10b, C-22
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: whitespace? clojure.string/blank? clojure.string/trim
+;; Two classes of whitespace live in the library and they differ on nine characters (plan C-22,
+;; flagged for the owner): `char/whitespace?` is Unicode's `White_Space` property, which the
+;; compiler's tokenizer uses: U+0009 to U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000 to U+200A,
+;; U+2028, U+2029, U+202F, U+205F, U+3000; `str/trim` and `str/blank?` are Clojure's and use Java's
+;; `Character/isWhitespace`: U+0009 to U+000D, U+001C to U+001F, U+0020, U+1680, U+2000 to U+2006,
+;; U+2008 to U+200A, U+2028, U+2029, U+205F, U+3000. U+0085 and U+00A0 (and U+2007, U+202F) are
+;; `char/whitespace?` and not trimmed; U+001C to U+001F are trimmed and not `char/whitespace?`.
+;; The table has 49 characters at the edges of every range, each as `code*4 + java*2 + unicode`;
+;; Java printed it (`Character.isWhitespace` and the regex `\p{IsWhite_Space}`, JDK 27), the library
+;; did not. Then two fingerprints over every scalar of the Basic Multilingual Plane (the only
+;; whitespace there is at U+3000 or below), each also from Java: the number of characters in a
+;; class (25 and 25) and `fp = (fp * 31 + code) mod 1000000007` over the members in increasing order,
+;; which a swapped, missing or extra member changes.
+(ns main (:use fib.core tl.check) (:require [fib.string :as str] [fib.char :as char]))
+
+(defun table () -> (Vec i64)
+  [32 39 43 47 51 55 56 108 114 118 122 126 131 132 504 508 528 533 536 636 641 644 23036 23043 23044
+   24632 32764 32771 32775 32795 32797 32803 32811 32812 32924 32931 32935 32936 32952 32957 32960
+   33144 33151 33152 49148 49155 49156 261116 514048])
+
+(defun ch (code: i64) -> char (i32->char (trunc i32 code)))
+
+;; one table entry: char/whitespace? says the Unicode bit, str/blank? and str/trim the Java bit
+(defun entry-ok? (e: i64) -> bool
+  (let ((code (shr e 2))
+        (java (= (bit-and (shr e 1) 1) 1))
+        (uni (= (bit-and e 1) 1)))
+    (let ((s (char->str (ch code))))
+      (and (= (char/whitespace? (ch code)) uni)
+           (and (= (str/blank? s) java)
+                (= (str/trim s) (if java "" s)))))))
+
+(defun fp (acc: i64 code: i64) -> i64 (rem (+ (* acc 31) code) 1000000007))
+
+;; how many scalars of the BMP are in the class and their fingerprint, as 1000000007 * how many + fingerprint
+;; (java: the class of `str/blank?` over one character; else `char/whitespace?`)
+(defun scan (java: bool) -> i64
+  (loop ((code 0) (n 0) (h 0))
+    (if (<= code 65535)
+        (if (if (>= code 55296) (<= code 57343) false)
+            (recur (+ code 1) n h)
+            (let ((member (if java (str/blank? (char->str (ch code))) (char/whitespace? (ch code)))))
+              (if member
+                  (recur (+ code 1) (+ n 1) (fp h code))
+                  (recur (+ code 1) n h))))
+        (+ (* n 1000000007) h))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (t (table)))
+    (do (dotimes (i (fib.prelude/vec-count t)) (check c (entry-ok? (fib.prelude/vec-nth t i))))
+        (check c (= (fib.prelude/vec-count t) 49))
+        (check c (= (scan true) (+ (* 25 1000000007) 622267368)))
+        (check c (= (scan false) (+ (* 25 1000000007) 100427485)))
+        (checks-result c))))

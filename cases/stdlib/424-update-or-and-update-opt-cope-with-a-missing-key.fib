@@ -1,0 +1,47 @@
+;; spec:   stdlib §2.4 (the update row of the idiom table), §4.5 (rows update update-or update-opt)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: update update-or update-opt
+;; The three forms of Clojure's (update m k f ..): update applies f to the
+;; value there, update-or applies f to the default d when the key is
+;; missing (Clojure's (update m w (fnil inc 0)) with the default made an
+;; argument), update-opt hands f the value as an Option, nil when the key is
+;; missing (the literal port of (update m w (fnil inc 0))). None of them
+;; changes the map it was given, and each calls f once (a counting f). fnil and inc are L2's and L1's, so the
+;; functions here are written out. (update on a Vec is by index: L8a's Assoc
+;; instance, its case.)
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun bump (x: i64) -> i64 (+ x 1))
+(defun or-zero-then-bump (o: (Option i64)) -> i64 (match o (nil 1) ((some x) (+ x 1))))
+(defun is (o: (Option i64) n: i64) -> bool (match o (nil false) ((some x) (= x n))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (assoc (assoc (empty {"a" 0}) "a" 5) "z" 2))
+        (a (update m "a" bump))
+        (b (update-or m "w" bump 100))
+        (d (update-or m "a" bump 100))
+        (e (update-opt m "w" or-zero-then-bump))
+        (f (update-opt m "a" or-zero-then-bump))
+        (calls (cell 0))
+        (counted (fn (x: i64) (do (set! calls (+ @calls 1)) (+ x 1))))
+        (g (update (update-or (update-opt m "a" (fn (o: (Option i64)) (do (set! calls (+ @calls 1)) 0))) "q" counted 5) "a" counted)))
+    (do (check c (is (get a "a") 6))
+        (check c (is (get a "z") 2))
+        (check c (is (get m "a") 5))
+        (check c (is (get b "w") 101))
+        (check c (match (get m "w") (nil true) ((some _) false)))
+        (check c (= (count b) 3))
+        (check c (is (get d "a") 6))
+        (check c (= (count d) 2))
+        (check c (is (get e "w") 1))
+        (check c (is (get f "a") 6))
+        (check c (= (count e) 3))
+        (check c (= (count f) 2))
+        (check c (= @calls 3))
+        (check c (is (get g "a") 1))
+        (check c (is (get g "q") 6))
+        (checks-result c))))

@@ -1,0 +1,44 @@
+;; spec:   stdlib §4.4 (rows sort, sort-by, sort-with: stable merge sort), §8.1 item 6 (the mutant that survived)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: sort-by sort-with
+;; Elements that compare equal keep their input order, whichever way the
+;; comparison is made: a key with Ord (sort-by), a predicate comparator
+;; (`<` over the key, true means "before"), an i64 comparator, and a
+;; descending predicate. The first version of the page's mutation review
+;; found `sort` made unstable surviving the cases, so this one checks at
+;; sizes where a merge takes ties from both runs: 40 items with 5 keys.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Item (key: i64 id: i64))
+
+;; 40 items, id i, key (i * 7) mod 5, so every key has 8 of them spread over the input
+(defun items () -> (Vec Item)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i 40) (recur (+ i 1) (fib.prelude/conj acc (Item (rem (* i 7) 5) i))) acc)))
+
+;; the ids of equal keys are increasing, and the keys do not go down (ascending) or up (descending)
+(defun stable (v: (Vec Item) ascending: bool) -> bool
+  (loop ((i 1))
+    (if (< i (fib.prelude/count v))
+        (let ((a (fib.prelude/nth v (- i 1))) (b (fib.prelude/nth v i)))
+          (if (if (= (. a key) (. b key))
+                  (< (. a id) (. b id))
+                  (if ascending (< (. a key) (. b key)) (> (. a key) (. b key))))
+              (recur (+ i 1))
+              false))
+        true)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (xs (items)))
+    (do (check c (= (fib.prelude/count (to-vec (sort-by (fn (p) (. p key)) xs))) 40))
+        (check c (stable (to-vec (sort-by (fn (p) (. p key)) xs)) true))
+        (check c (stable (to-vec (sort-with (fn (a b) (< (. a key) (. b key))) xs)) true))
+        (check c (stable (to-vec (sort-with (fn (a b) (- (. a key) (. b key))) xs)) true))
+        (check c (stable (to-vec (sort-with (fn (a b) (> (. a key) (. b key))) xs)) false))
+        (check c (stable (to-vec (sort-with (fn (a b) (- (. b key) (. a key))) xs)) false))
+        (check c (stable (to-vec (sort-by (fn (p) (. p key)) (to-vec (sort-by (fn (p) (. p key)) xs)))) true))
+        (checks-result c))))

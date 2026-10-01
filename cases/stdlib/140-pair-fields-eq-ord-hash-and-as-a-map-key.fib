@@ -1,0 +1,41 @@
+;; spec:   stdlib §2.3 (the tuple types), §4.3 (row Pair), §2.7 (Eq Ord Hash of a Pair)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: Pair
+;; (Pair a b) is the prelude's one tuple type (L4): a struct with the fields fst and snd that derives
+;; Eq, Ord and Hash. `=` is field by field; `<` orders by fst and, when the fsts are equal, by snd,
+;; so (1 "z") is below (2 "a") and (1 "b") below (1 "c"); `hash` agrees on equal pairs and tells
+;; (1 2) from (2 1) (it folds the fields in order), so a Pair is a Map key: two pairs that are
+;; equal reach one entry, two that differ in either field reach two. A Pair of heap fields (str)
+;; and one of scalars are both tried, because the derived instances treat them differently.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a (Pair 1 "b"))
+        (a2 (Pair 1 "b"))
+        (b (Pair 1 "c"))
+        (d (Pair 2 "a"))
+        (m (assoc (assoc (assoc (map-empty) (Pair 1 2) "x") (Pair 2 1) "y") (Pair 1 2) "z")))
+    (do (check c (and (= (. a fst) 1) (= (. a snd) "b")))
+        (check c (= a a2))
+        (check c (!= a b))
+        (check c (!= a d))
+        (check c (< a b))
+        (check c (< b d))
+        (check c (< a d))
+        (check c (not (< b a)))
+        (check c (not (< a a2)))
+        (check c (<= a a2))
+        (check c (> d b))
+        (check c (>= a a2))
+        (check c (= (hash a) (hash a2)))
+        (check c (!= (hash a) (hash b)))
+        (check c (!= (hash (Pair 1 2)) (hash (Pair 2 1))))
+        (check c (= (count m) 2))
+        (check c (= (unwrap-or (get m (Pair 1 2)) "none") "z"))
+        (check c (= (unwrap-or (get m (Pair 2 1)) "none") "y"))
+        (check c (= (unwrap-or (get m (Pair 2 2)) "none") "none"))
+        (checks-result c))))

@@ -1,0 +1,53 @@
+;; spec:   stdlib §2.7 (Eq and Ord of a Vec), §8.1 item 2 (differential tests against a naive reference), plan §9.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; `=` and `<` on `(Vec i64)` against a reference that does not walk two
+;; vectors at all: a vector of at most five digits 0 to 9 is the integer
+;; `length * 1000000 + its digits read as one decimal number`, and then "the
+;; shorter is less, and of one length the first difference decides" is the
+;; order of those integers, and equality is theirs. 300 seeded pairs: random
+;; vectors (lengths 0 to 5, digits 0 to 2 so that ties and prefixes are
+;; common) and every fifth pair is a vector against a rebuilt copy of itself
+;; (so equality is met in 60 of them). The planted faults are references wrong
+;; in one way: a key that leaves the length out (it orders [0 1] below [1] and
+;; so gets the length-first rule wrong), and a key that leaves out the last
+;; digit (it calls [1 2] and [1 3] equal). Each, run over the same pairs, must
+;; disagree with the library, or `check-detects` fails the case.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+;; the digits of v as one decimal number, its length weighing `w` per element
+(defun key (v: (Vec i64) w: i64 drop: i64) -> i64
+  (let ((n (- (vec-count v) drop)))
+    (+ (* n w)
+       (loop ((i 0) (acc 0)) (if (< i n) (recur (+ i 1) (+ (* acc 10) (vec-nth v i))) acc)))))
+
+(defun copy (v: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty))) (if (< i (vec-count v)) (recur (+ i 1) (fib.prelude/conj acc (vec-nth v i))) acc)))
+
+;; how many of the 300 pairs the library and the key (weight w, last `drop` digits left out) disagree on,
+;; and how many of the pairs were equal
+(defun disagreements (w: i64 drop: i64) -> (Pair i64 i64)
+  (let ((g (rng 2718281)) (bad (cell 0)) (same (cell 0)))
+    (do (dotimes (i 300)
+          (let ((a (rng-vec g (rng-below g 5) 3))
+                (b (if (= (rem i 5) 0) (copy a) (rng-vec g (rng-below g 5) 3))))
+            (do (if (= (< a b) (< (key a w drop) (key b w drop))) () (set! bad (+ @bad 1)))
+                (if (= (= a b) (= (key a w drop) (key b w drop))) () (set! bad (+ @bad 1)))
+                (if (= a b) (set! same (+ @same 1)) ()))))
+        (Pair @bad @same))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)) (q (checks))
+        (real (disagreements 1000000 0))
+        (no-length (disagreements 0 0))
+        (no-last (disagreements 1000000 1)))
+    (do (check c (= (. real fst) 0))
+        (check c (> (. real snd) 55))
+        (check c (< (. real snd) 150))
+        (check p (= (. no-length fst) 0))
+        (check q (= (. no-last fst) 0))
+        (check-detects c p)
+        (check-detects c q)
+        (checks-result c))))

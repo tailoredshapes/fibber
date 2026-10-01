@@ -1,0 +1,78 @@
+;; spec:   stdlib §4.4 rows map filter remove take drop take-while mapcat concat, §8.1 item 2 (a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter remove take drop take-while mapcat concat
+;; 300 seeded pipelines of one to four adaptors, drawn from the eight lazy
+;; functions with drawn parameters, over drawn Vecs of 0 to 11 elements,
+;; against an eager reference written with loops over the prelude's
+;; vec-conj and vec-nth, which do not use the library under test. The
+;; pipeline is built step by step as an (LSeq i64), the one type every
+;; adaptor returns. The last check plants a fault in the reference (take
+;; keeps one element too many) and requires the comparison to notice: the
+;; case can fail. Seed 270.
+(ns main (:use fib.core fib.seq tl.check tl.rng))
+
+;; the parameters of an operation: x * 3 + k, divisible by 3 after adding k, below k
+(defun step-map (k: i64) -> (fn (i64) i64) (fn (x) (+ (* x 3) k)))
+(defun step-keep (k: i64) -> (fn (i64) bool) (fn (x) (= (rem (+ x k) 3) 0)))
+(defun step-below (k: i64) -> (fn (i64) bool) (fn (x) (< x k)))
+(defun step-fan (x: i64) -> (Vec i64) (if (= (rem x 2) 0) [x x] [x]))
+
+;; ---- the library side: one step on a lazy seq
+(defun lazy-step (op: i64 k: i64 s: (LSeq i64)) -> (LSeq i64)
+  (match op
+    (0 (map (step-map k) s))
+    (1 (filter (step-keep k) s))
+    (2 (remove (step-keep k) s))
+    (3 (take k s))
+    (4 (drop k s))
+    (5 (take-while (step-below k) s))
+    (6 (mapcat step-fan s))
+    (_ (concat s [k (+ k 1)]))))
+
+;; ---- the reference: the same step on a Vec, by loops
+(defun push (v: (Vec i64) x: i64) -> (Vec i64) (vec-conj v x))
+(defun eager-step (op: i64 k: i64 v: (Vec i64) fault: bool) -> (Vec i64)
+  (let ((n (vec-count v)))
+    (loop ((i 0) (acc (vec-empty)) (going true))
+      (if (and going (< i n))
+          (let ((x (vec-nth v i)))
+            (match op
+              (0 (recur (+ i 1) (push acc (+ (* x 3) k)) true))
+              (1 (recur (+ i 1) (if (= (rem (+ x k) 3) 0) (push acc x) acc) true))
+              (2 (recur (+ i 1) (if (= (rem (+ x k) 3) 0) acc (push acc x)) true))
+              (3 (if (< i (if fault (+ k 1) k)) (recur (+ i 1) (push acc x) true) (recur n acc false)))
+              (4 (recur (+ i 1) (if (< i k) acc (push acc x)) true))
+              (5 (if (< x k) (recur (+ i 1) (push acc x) true) (recur n acc false)))
+              (6 (recur (+ i 1) (if (= (rem x 2) 0) (push (push acc x) x) (push acc x)) true))
+              (_ (recur (+ i 1) (push acc x) true))))
+          (if (= op 7) (push (push acc k) (+ k 1)) acc)))))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; one pipeline: the drawn source and steps, through both sides
+(defun pipeline (r: Rng c: Checks fault: bool) -> unit
+  (let ((src (rng-vec r (rng-below r 12) 20))
+        (steps (+ 1 (rng-below r 4))))
+    (let ((cur (cell (to-lseq src))) (ref (cell src)))
+      (do (dotimes (i steps)
+            (let ((op (rng-below r 8)) (k (rng-below r 6)))
+              (do (set! cur (lazy-step op k @cur))
+                  (set! ref (eager-step op k @ref fault)))))
+          (check c (same (to-vec @cur) @ref))))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 270)))
+    (dotimes (i 300) (pipeline r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 300))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

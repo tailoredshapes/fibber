@@ -1,4 +1,208 @@
-;; owner: L5a. fib.seq.sources: the sources of a walk. Exports: Range RangeLen range range-by; Reducible for Array Map Set Range.
-;; Until L5a writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.seq.sources (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
+;; fib.seq.sources: the sources of a walk (tranche 1 plan §4.2, owner L5a; stdlib §2.1 rule 1, §2.3, §4.4 rows
+;; `range` and `range-by`). It replaces the prelude's Vec-only `range`, `Traversable` and `Countable` for these
+;; types, which the flip deletes. Public: Range, RangeLen (methods range-len, range-more?, range-nth), range,
+;; range-by, and the Reducible instances of Array, Map, Set and Range; every other name is :private.
+;;
+;; A Range is Clojure's: a start, an end that is not an element, and a step, walked by repeated addition, so
+;; floats accumulate: (range-by 0.0 1.0 0.1) has eleven elements, the last 0.9999999999999999 (§4.4, case 162).
+;; Decided here, where the page and the plan are silent (the empty rule, the step of zero and the NaN rule are
+;; Range.create's, as recalled from Clojure's source, which was not run: there is no Clojure on this machine):
+;;  - (range n) is a function; (range a b) stays the prelude macro (a Vec) until the flip, and the page's
+;;    (range a b s) is range-by until arity overloading (§2.3, §3 N4);
+;;  - a range is empty when its start equals its end or its step points away from its end;
+;;  - a step of zero repeats the start for ever, unless the start equals the end. `count` of such a range is the
+;;    trap `count: a range with step 0 never ends`, where Clojure's `count` never returns;
+;;  - a NaN bound or step never stops the walk (the test is `next >= end` is false), as in Clojure; count of
+;;    one does not return either;
+;;  - the walk stops before the add that would pass the end, so a range that ends at the largest integer never
+;;    overflows (case 163). The integer instances test `i + by < end` in whichever of two forms cannot overflow,
+;;    and `count` and `nth` are closed forms that never leave i64: a count that no i64 can hold is the largest
+;;    i64 (decided here: the page says only that Range's size is a closed form);
+;;  - the floats' `count` and `nth` walk, because they must give the accumulated values; the integers' are O(1);
+;;  - `to-lseq` is lazy, one node per demand, so an infinite range is a lazy seq of its own and not a to-vec
+;;    that never ends; `last` is the default walk (it would be wrong at a count that was capped).
+;; Array: `size`, `nth` and `last` are O(1). Map yields (Pair k v) and Set its keys, in the HAMT's order, with
+;; the prelude's O(1) size. Both walks are the prelude's early-exit ones (L4): `map-each` hands each key and its
+;; value to the visitor, which here builds the Pair, and `set-each` each element; the walk stops at the first
+;; false.
+(ns fib.seq.sources (:use fib.core fib.seq.types fib.seq.protocols))
+
+;; ---- what a Range needs of its element type: i8 i16 i32 i64 f32 f64 (a user number type adds its own) ----
+;; self is the start. range-len: the number of elements of the range from self to hi by by, for a start that
+;; is not at the end and a step that is not zero (the caller checked both). range-more?: whether the element
+;; after self, self + by, is still before hi. range-nth: element i of that range; it traps `nth: index out of
+;; range` unless 0 <= i < range-len.
+(defprotocol RangeLen
+  (range-len (self hi: Self by: Self) -> i64)
+  (range-more? (self hi: Self by: Self) -> bool)
+  (range-nth (self hi: Self by: Self i: i64) -> Self))
+
+;; a pair of bounds is empty when they are equal or the step points away from the end (Range.create)
+(defun range-empty? :private (lo: t hi: t by: t) :where ((Ord t) (Unit t)) -> bool
+  (let ((z (zero by)))
+    (or (= lo hi) (or (and (> by z) (> lo hi)) (and (< by z) (< lo hi))))))
+
+(defstruct (Range t) (lo: t hi: t by: t))
+
+(defun range (n: t) :where ((Num t) (Ord t) (Unit t) (RangeLen t)) -> (Range t)
+  (Range (zero n) n (one n)))
+
+(defun range-by (a: t b: t s: t) :where ((Num t) (Ord t) (Unit t) (RangeLen t)) -> (Range t)
+  (Range a b s))
+
+;; ---- integers: every bound is checked before it is computed, so nothing here can overflow ----
+;; i + by < hi for by > 0 and i < hi, and i + by > hi for by < 0 and i > hi, at any integer width
+(defun int-more? :private (i: t hi: t by: t) :where ((Num t) (Ord t) (Unit t)) -> bool
+  (let ((z (zero i)))
+    (if (> by z)
+        (if (< i z) (< (+ i by) hi) (> (- hi i) by))
+        (if (> i z) (> (+ i by) hi) (> by (- hi i))))))
+
+(defun reflect :private (x: i64) -> i64 (bit-xor x -1))
+
+;; the count of lo, lo+by, .. below hi for lo < hi and by > 0, saturating at the largest i64
+(defun up-count :private (lo: i64 hi: i64 by: i64) -> i64
+  (if (or (>= lo 0) (<= hi 0))
+      (let ((q (quot (- (- hi 1) lo) by))) (if (= q 9223372036854775807) q (+ q 1)))
+      (let ((a (- hi 1))
+            (nl (- 0 (+ lo 1))))
+        (let ((qa (quot a by)) (qn (quot nl by))
+              (c (if (>= (+ (rem a by) 1) (- by (rem nl by))) 2 1)))
+          (let ((s (if (> qa (- 9223372036854775807 qn)) 9223372036854775807 (+ qa qn))))
+            (if (> s (- 9223372036854775807 c)) 9223372036854775807 (+ s c)))))))
+
+;; element i of lo, lo+by, .. for lo < hi, by > 0 and i below the count
+(defun up-nth :private (lo: i64 hi: i64 by: i64 i: i64) -> i64
+  (if (or (>= lo 0) (<= hi 0))
+      (+ lo (* i by))
+      (let ((nl (- 0 (+ lo 1))))
+        (let ((q (quot nl by)))
+          (if (<= i q)
+              (+ lo (* i by))
+              (+ (- by (+ (rem nl by) 1)) (* (- (- i q) 1) by)))))))
+
+;; the same for a descending range: the bitwise complement turns it into an ascending one
+;; (the step i64 minimum cannot be negated; it has one or two elements)
+(defun int-count :private (lo: i64 hi: i64 by: i64) -> i64
+  (if (> by 0)
+      (up-count lo hi by)
+      (if (= by -9223372036854775808)
+          (if (>= lo 0) (if (> (+ lo by) hi) 2 1) 1)
+          (up-count (reflect lo) (reflect hi) (- 0 by)))))
+
+(defun int-nth :private (lo: i64 hi: i64 by: i64 i: i64) -> i64
+  (if (> by 0)
+      (up-nth lo hi by i)
+      (if (= by -9223372036854775808)
+          (if (= i 0) lo (+ lo by))
+          (reflect (up-nth (reflect lo) (reflect hi) (- 0 by) i)))))
+
+(defun in-range? :private (i: i64 n: i64) -> bool (and (>= i 0) (< i n)))
+
+(impl RangeLen i64
+  (range-len (self hi by) (int-count self hi by))
+  (range-more? (self hi by) (int-more? self hi by))
+  (range-nth (self hi by i)
+    (if (in-range? i (int-count self hi by)) (int-nth self hi by i) (trap "nth: index out of range"))))
+
+(impl RangeLen i32
+  (range-len (self hi by) (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
+  (range-more? (self hi by) (int-more? self hi by))
+  (range-nth (self hi by i)
+    (if (in-range? i (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
+        (trunc i32 (int-nth (sext i64 self) (sext i64 hi) (sext i64 by) i))
+        (trap "nth: index out of range"))))
+
+(impl RangeLen i16
+  (range-len (self hi by) (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
+  (range-more? (self hi by) (int-more? self hi by))
+  (range-nth (self hi by i)
+    (if (in-range? i (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
+        (trunc i16 (int-nth (sext i64 self) (sext i64 hi) (sext i64 by) i))
+        (trap "nth: index out of range"))))
+
+(impl RangeLen i8
+  (range-len (self hi by) (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
+  (range-more? (self hi by) (int-more? self hi by))
+  (range-nth (self hi by i)
+    (if (in-range? i (int-count (sext i64 self) (sext i64 hi) (sext i64 by)))
+        (trunc i8 (int-nth (sext i64 self) (sext i64 hi) (sext i64 by) i))
+        (trap "nth: index out of range"))))
+
+;; ---- floats: accumulate as Clojure's do; next is tested against the end, so a NaN never stops the walk ----
+(defun float-more? :private (i: t hi: t by: t) :where ((Num t) (Ord t) (Unit t)) -> bool
+  (let ((next (+ i by)))
+    (if (> by (zero i)) (not (>= next hi)) (not (<= next hi)))))
+
+(defun float-count :private (lo: t hi: t by: t) :where ((Num t) (Ord t) (Unit t)) -> i64
+  (loop ((x lo) (n 1))
+    (if (float-more? x hi by) (recur (+ x by) (+ n 1)) n)))
+
+(defun float-nth :private (lo: t hi: t by: t i: i64) :where ((Num t) (Ord t) (Unit t)) -> t
+  (loop ((x lo) (j 0))
+    (if (= j i)
+        x
+        (if (and (>= i 0) (float-more? x hi by)) (recur (+ x by) (+ j 1)) (trap "nth: index out of range")))))
+
+(impl RangeLen f64
+  (range-len (self hi by) (float-count self hi by))
+  (range-more? (self hi by) (float-more? self hi by))
+  (range-nth (self hi by i) (float-nth self hi by i)))
+
+(impl RangeLen f32
+  (range-len (self hi by) (float-count self hi by))
+  (range-more? (self hi by) (float-more? self hi by))
+  (range-nth (self hi by i) (float-nth self hi by i)))
+
+;; ---- the walk of a Range ----
+;; the lazy seq from i on: one node per demand; a step of zero is the same node again
+(defun range-lseq :private (i: t hi: t by: t) :where ((Num t) (Ord t) (Unit t) (RangeLen t)) -> (LSeq t)
+  (lazy-node (fn ()
+    (LCons i (if (or (= by (zero by)) (range-more? i hi by))
+                 (range-lseq (+ i by) hi by)
+                 (lazy-node (fn () LNil)))))))
+
+(impl (Reducible t) (Range t) :where ((Num t) (Ord t) (Unit t) (RangeLen t))
+  (each-while (self k)
+    (let ((lo (. self lo)) (hi (. self hi)) (by (. self by)))
+      (if (range-empty? lo hi by)
+          true
+          (if (= by (zero by))
+              (loop () (if (k lo) (recur) false))
+              (loop ((i lo))
+                (if (k i)
+                    (if (range-more? i hi by) (recur (+ i by)) true)
+                    false))))))
+  (size (self)
+    (let ((lo (. self lo)) (hi (. self hi)) (by (. self by)))
+      (if (range-empty? lo hi by)
+          0
+          (if (= by (zero by)) (trap "count: a range with step 0 never ends") (range-len lo hi by)))))
+  (nth (self i)
+    (let ((lo (. self lo)) (hi (. self hi)) (by (. self by)))
+      (if (or (< i 0) (range-empty? lo hi by))
+          (trap "nth: index out of range")
+          (if (= by (zero by)) lo (range-nth lo hi by i)))))
+  (to-lseq (self)
+    (let ((lo (. self lo)) (hi (. self hi)) (by (. self by)))
+      (if (range-empty? lo hi by) (lazy-node (fn () LNil)) (range-lseq lo hi by)))))
+
+;; ---- Array, Map, Set ----
+(impl (Reducible a) (Array a)
+  (each-while (self k)
+    (let ((n (array-len self)))
+      (loop ((i 0)) (if (< i n) (if (k (array-get self i)) (recur (+ i 1)) false) true))))
+  (size (self) (array-len self))
+  (nth (self i)
+    (if (in-range? i (array-len self)) (array-get self i) (trap "nth: index out of range")))
+  (last (self)
+    (let ((n (array-len self))) (if (> n 0) (some (array-get self (- n 1))) nil))))
+
+(impl (Reducible (Pair k v)) (Map k v)
+  (each-while (self f)
+    (let ((r (fib.prelude/map-each self (fn (k v) (f (Pair k v)))))) r))
+  (size (self) (fib.prelude/count self)))
+
+(impl (Reducible k) (Set k)
+  (each-while (self f) (fib.prelude/set-each self f))
+  (size (self) (fib.prelude/count self)))

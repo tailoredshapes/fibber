@@ -1,0 +1,51 @@
+;; spec:   stdlib §4.7 (row clojure.string/split), §2.9 (Pattern), plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: clojure.string/split
+;; `(str/split s sep)` is Clojure's `(split s re)` with a literal separator: Java's
+;; `Pattern.split(s, 0)`, which cuts at every match and then DROPS THE EMPTY STRINGS THAT END THE
+;; RESULT, but keeps the ones inside it and a leading one. Two corners are Java's and surprise:
+;; a string with no match is one piece, itself, even when it is empty (so `(split "" ",")` is
+;; `[""]`), while a string that is nothing but separators is no piece at all (`(split "," ",")`
+;; is `[]`). Every expected value below was printed by Java (`Pattern.compile(Pattern.quote(sep))
+;; .split(s, 0)`, JDK 27), not computed by the library: that is what a check here can fail
+;; against. Matches do not overlap and are leftmost, so `"baaa"` cut at `"aa"` is `["b" "a"]`.
+;; An empty separator is the empty regex: it cuts between characters, never before the first.
+;; Multi-byte text keeps its characters whole; there the library differs from Java in one place
+;; and by decision (spec §2.9, §5 T10: the unit is the scalar): for the empty separator Java cuts
+;; between the two UTF-16 units of a supplementary character, "a😀z" is four pieces there (the
+;; emoji as two lone surrogates), and here it is `["a" "😀" "z"]`. The check with "😀" says so; the one with "aé€z" is Java's.
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+;; v is exactly the pieces of w, in order (the prelude's count and nth only: no library under test)
+(defun same? (v: (Vec str) w: (Vec str)) -> bool
+  (if (= (fib.prelude/vec-count v) (fib.prelude/vec-count w))
+      (loop ((i 0))
+        (if (< i (fib.prelude/vec-count v))
+            (if (= (fib.prelude/vec-nth v i) (fib.prelude/vec-nth w i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (same? (str/split "a,b,c" ",") ["a" "b" "c"]))
+        (check c (same? (str/split "a,b,,c,," ",") ["a" "b" "" "c"]))
+        (check c (same? (str/split "" ",") [""]))
+        (check c (same? (str/split "," ",") []))
+        (check c (same? (str/split ",,," ",") []))
+        (check c (same? (str/split ",a" ",") ["" "a"]))
+        (check c (same? (str/split "abc" ",") ["abc"]))
+        (check c (same? (str/split "a, b,  c" ", ") ["a" "b" " c"]))
+        (check c (same? (str/split "aXYXYb" "XY") ["a" "" "b"]))
+        (check c (same? (str/split "baaa" "aa") ["b" "a"]))
+        (check c (same? (str/split "abc" "") ["a" "b" "c"]))
+        (check c (same? (str/split "" "") [""]))
+        (check c (same? (str/split "aé€z" "") ["a" "é" "€" "z"]))
+        (check c (same? (str/split "a😀z" "") ["a" "😀" "z"]))
+        (check c (same? (str/split "abc" "abc") []))
+        (check c (same? (str/split "aéb€c😀d" "€") ["aéb" "c😀d"]))
+        (check c (same? (str/split "😀a😀b😀" "😀") ["" "a" "b"]))
+        (check c (same? (str/split "aéé" "é") ["a"]))
+        (checks-result c))))

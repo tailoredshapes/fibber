@@ -1,0 +1,39 @@
+;; spec:   stdlib §2.4 (update), §4.5 (update update-or update-opt: Lookup and Assoc), Appendix A11 t24
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: update update-or update-opt
+;; update, update-or and update-opt are written over Lookup and Assoc and know no
+;; collection, so a Vec gets them from its two instances: the get of P0 and the
+;; assoc of this part. (update v i f) replaces element i with f of it; update-or
+;; hands f a default when the index is missing, and an index equal to the count is
+;; the one that assoc turns into an append, as Clojure's (update [1 2] 2 (fnil inc 0))
+;; is [1 2 1]; update-opt hands f the element or nil. A Vec of 40 elements has its
+;; last element updated through the trie's tail and its first through the leaf.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun tens (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj acc (* 10 i))) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [10 20 30])
+        (big (tens 40)))
+    (do (check c (= (nth (update v 1 (fn (x) (+ x 1))) 1) 21))
+        (check c (= (nth (update v 0 (fn (x) (* x 3))) 0) 30))
+        (check c (= (nth (update v 1 (fn (x) (+ x 1))) 2) 30))
+        (check c (= (nth v 1) 20))
+        (check c (= (nth (update big 39 (fn (x) (+ x 1))) 39) 391))
+        (check c (= (nth (update big 0 (fn (x) (+ x 5))) 0) 5))
+        (check c (= (count (update big 7 (fn (x) (+ x 1)))) 40))
+        (check c (= (nth (update-or v 1 (fn (x) (+ x 1)) 100) 1) 21))
+        (check c (let ((w (update-or v 3 (fn (x) (+ x 1)) 100)))
+                   (and (= (count w) 4) (= (nth w 3) 101))))
+        (check c (let ((w (update-or (vec-empty) 0 (fn (x) (+ x 1)) 7)))
+                   (and (= (count w) 1) (= (nth w 0) 8))))
+        (check c (= (nth (update-opt v 2 (fn (o) (match o ((some x) (* 2 x)) (nil -1)))) 2) 60))
+        (check c (let ((w (update-opt v 3 (fn (o) (match o ((some x) (* 2 x)) (nil -1))))))
+                   (and (= (count w) 4) (= (nth w 3) -1))))
+        (checks-result c))))

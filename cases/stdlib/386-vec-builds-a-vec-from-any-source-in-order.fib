@@ -1,0 +1,71 @@
+;; spec:   stdlib §2.1 rule 4 and §2.5 (vec is the to-vec method), §4.4 (vec)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec
+;; vec turns any source into a Vec of its elements in walk order: a lazy seq
+;; (each node realised once, so a counter reads one per element and the
+;; terminal node), a recipe a user wrote (a struct that holds its source and
+;; a function: the shape of the library's own recipes), a nest of them, an
+;; Option (nothing or one), a List, a seq of a Vec with an offset (rest) and
+;; one with a consed front, an array, a range and a source of 100 elements, past
+;; the trie's first leaf. Each result is a Vec of the right length with the right
+;; elements, so a vec that dropped the first element, the last, or reversed
+;; the walk fails a check. A Map and a Set are case 406's. fib.coll is required
+;; under an alias and not :used, so that `list` expands where the method `empty`
+;; is not in scope.
+(ns main (:use fib.core fib.seq tl.check) (:require [fib.coll :as coll]))
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 calls: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! calls (+ @calls 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) calls)) LNil)))))
+
+;; a recipe: the elements of its source through a function, the shape of
+;; the library's own Mapped (a head with more variables than its context)
+(defstruct (Applied c e b) (src: c f: (fn (e) b)))
+(impl (Reducible b) (Applied c e b) :where ((Reducible c e))
+  (each-while (self k) (each-while (. self src) (fn (x) (k ((. self f) x))))))
+(defun doubled (c: c) :where ((Reducible c i64)) -> (Applied c i64 i64)
+  (Applied c (fn (x) (* 2 x))))
+
+;; the numbers 0 .. n-1, none stored
+(defstruct Upto (n: i64))
+(impl (Reducible i64) Upto
+  (each-while (self k)
+    (loop ((i 0)) (if (< i (. self n)) (if (k i) (recur (+ i 1)) false) true))))
+
+;; whether v is exactly the Vec want
+(defun same (v: (Vec i64) want: (Vec i64)) -> bool
+  (and (= (count v) (count want))
+       (loop ((i 0)) (if (< i (count want)) (if (= (nth v i) (nth want i)) (recur (+ i 1)) false) true))))
+
+(defun counting-up (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (= (nth v i) i) (recur (+ i 1)) false) true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (none: (Option i64) nil))
+    (do (check c (same (coll/vec (countdown 3 calls)) [3 2 1]))
+        (check c (= @calls 4))
+        (check c (same (coll/vec (doubled [1 2 3])) [2 4 6]))
+        (check c (same (coll/vec (doubled (doubled [1 2]))) [4 8]))
+        (check c (same (coll/vec (doubled (countdown 2 calls))) [4 2]))
+        (check c (same (coll/vec (some 4)) [4]))
+        (check c (same (coll/vec none) []))
+        (check c (same (coll/vec (list 7 8 9)) [7 8 9]))
+        (check c (same (coll/vec (rest [1 2 3])) [2 3]))
+        (check c (same (coll/vec (rest [1])) []))
+        (check c (same (coll/vec (coll/conj (rest [1 2 3]) 0)) [0 2 3]))
+        (check c (same (coll/vec (vseq-of [4 5])) [4 5]))
+        (check c (same (coll/vec (array 3 7)) [7 7 7]))
+        (check c (same (coll/vec (range 4)) [0 1 2 3]))
+        (check c (same (coll/vec (range-by 10 0 -4)) [10 6 2]))
+        (check c (counting-up (coll/vec (range 100)) 100))
+        (check c (counting-up (coll/vec (Upto 100)) 100))
+        (check c (counting-up (coll/vec (Upto 33)) 33))
+        (check c (counting-up (coll/vec (Upto 0)) 0))
+        (checks-result c))))

@@ -1,0 +1,102 @@
+;; spec:   stdlib §2.5 (persistent in the API, in place when unique), syntax §3.13 (& parameters), ownership §5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; `push!`, `append`, `map-put!` and `map-del!` update the collection held in a
+;; cell through an & parameter, and the prelude keeps them (stdlib §6.5). They are
+;; where a unique object may be written in place, and where one that something
+;; else holds must be copied first. Three tests of that, against a model that is
+;; never updated in place. (1) A Vec grows by `push!` through a cell, 1100
+;; elements, and a snapshot of the cell's Vec is taken every 37 pushes: each
+;; later push must leave the snapshots as they were. `append` is the same. (2) A
+;; Vec of n elements (31, 32, 1056, the edges) is held by two cells; each gets
+;; its own push! of another value; the Vec itself and both results are read in
+;; full. (3) 24 seeded sequences of 60 `map-put!` and `map-del!` through a
+;; cell, over 30 keys, half integer and half struct keys with colliding hashes,
+;; checked after every operation against an array model (tl.model's
+;; map-matches), a snapshot every fifth operation checked again at the end.
+;; The faults planted: a snapshot compared against the wrong count, and a model
+;; that deletes the wrong key.
+(ns main (:use tl.rng tl.check tl.model))
+
+(defun elem (i: i64) -> i64 (+ (* i 7919) 13))
+
+(defun prefix-ok (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (= (nth v i) (elem i)) (recur (+ i 1)) false) true))))
+
+;; (1) pushes through a cell, a snapshot every 37 (the first at 0): the snapshot
+;; taken after push number i holds i + 1 elements; off is 1 for the planted fault
+(defun pushes-ok (n: i64 off: i64 use-append: bool) -> bool
+  (let ((c (cell (vec-empty)))
+        (snaps (cell (vec-empty))))
+    (do (dotimes (i n)
+          (do (if use-append (append &c (elem i)) (push! &c (elem i)))
+              (if (= (rem i 37) 0) (set! snaps (conj @snaps @c)) ())))
+        (and (prefix-ok @c n)
+             (loop ((j 0))
+               (if (< j (count @snaps))
+                   (if (prefix-ok (nth @snaps j) (+ (+ (* j 37) 1) off)) (recur (+ j 1)) false)
+                   true))))))
+
+;; (2) one Vec in two cells
+(defun two-cells-ok (n: i64) -> bool
+  (let ((v (loop ((i 0) (w (vec-empty))) (if (< i n) (recur (+ i 1) (conj w (elem i))) w)))
+        (a (cell (vec-empty)))
+        (b (cell (vec-empty))))
+    (do (set! a v)
+        (set! b v)
+        (push! &a -1)
+        (push! &b -2)
+        (push! &a -3)
+        (and (prefix-ok v n)
+             (and (= (count @a) (+ n 2))
+                  (and (= (count @b) (+ n 1))
+                       (and (= (nth @a n) -1)
+                            (and (= (nth @a (+ n 1)) -3)
+                                 (and (= (nth @b n) -2)
+                                      (loop ((i 0))
+                                        (if (< i n)
+                                            (if (and (= (nth @a i) (elem i)) (= (nth @b i) (elem i))) (recur (+ i 1)) false)
+                                            true)))))))))))
+
+;; (3) map-put! and map-del! through a cell against the model, snapshots kept
+;; fault 2 makes the model delete the key before the right one; 0 if the sequence agreed
+(defun cell-seq (seed: i64 mk: (fn (i64) k) kid: (fn (k) i64) fault: i64) :where ((Hash k) (Eq k)) -> i64
+  (let ((r (rng seed))
+        (ks (universe mk 30))
+        (c (cell (map-empty)))
+        (model (cell (model-new 30)))
+        (snaps (cell (vec-empty)))
+        (models (cell (vec-empty)))
+        (bad (cell 0)))
+    (do (dotimes (step 60)
+          (let ((id (rng-below r 30)))
+            (do (if (< (rng-below r 100) 60)
+                    (do (map-put! &c (nth ks id) step) (set! model (model-put @model id step 0)))
+                    (do (map-del! &c (nth ks id)) (set! model (model-del @model id fault))))
+                (if (and (= @bad 0) (not (map-matches @c @model ks kid))) (set! bad (+ step 1)) ())
+                (if (= (rem step 5) 0)
+                    (do (set! snaps (conj @snaps @c)) (set! models (conj @models @model)))
+                    ()))))
+        (dotimes (j (count @snaps))
+          (if (and (= @bad 0) (not (map-matches (nth @snaps j) (nth @models j) ks kid))) (set! bad 1000) ()))
+        @bad)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks)))
+    (do (check c (pushes-ok 1100 0 false))
+        (check c (pushes-ok 1100 0 true))
+        (check c (two-cells-ok 31))
+        (check c (two-cells-ok 32))
+        (check c (two-cells-ok 1056))
+        (dotimes (i 12) (check c (= 0 (cell-seq (+ 858000 i) mk-int id-int 0))))
+        (dotimes (i 12) (check c (= 0 (cell-seq (+ 858100 i) mk-kc id-kc 0))))
+        (check p1 (pushes-ok 100 1 false))
+        (dotimes (i 4) (check p2 (= 0 (cell-seq (+ 858000 i) mk-int id-int 2))))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

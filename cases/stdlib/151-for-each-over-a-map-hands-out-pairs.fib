@@ -1,0 +1,36 @@
+;; spec:   stdlib §2.3 (the prelude's Entry gives way to Pair), §8.3 B (case 181), tranche 1 plan §6 L4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The prelude's for-each over a Map (the Traversable instance that stays until the flip) hands f one
+;; (Pair k v) per entry: fst is the key and snd the value, the Pair is an ordinary prelude Pair (it can be
+;; passed to a function typed (Pair i64 str), compared with `=` and kept), and for a Set it hands the
+;; element itself. The walk covers every entry once, including the entries of a bucket of equal hashes.
+(ns main (:use tl.check))
+
+(defstruct K (n: i64))
+(impl Eq K (= (self o) (= (. self n) (. o n))))
+(impl Hash K (hash (self) 7))
+
+(defun describe (p: (Pair i64 str)) -> i64 (+ (. p fst) (str-len (. p snd))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (assoc (assoc (assoc (map-empty) 1 "a") 2 "bb") 3 "ccc"))
+        (b (assoc (assoc (assoc (map-empty) (K 1) 10) (K 2) 20) (K 3) 30))
+        (s (conj (conj (set-empty) 5) 6))
+        (n (cell 0)) (total (cell 0)) (kept (cell (vec-empty)))
+        (bn (cell 0)) (bsum (cell 0))
+        (sn (cell 0)) (ssum (cell 0)))
+    (do (for-each m (fn (e) (do (set! n (+ @n 1)) (set! total (+ @total (describe e))) (set! kept (conj @kept e)))))
+        (for-each b (fn (e) (do (set! bn (+ @bn 1)) (set! bsum (+ @bsum (+ (. (. e fst) n) (. e snd)))))))
+        (for-each s (fn (x) (do (set! sn (+ @sn 1)) (set! ssum (+ @ssum x)))))
+        (check c (= @n 3))
+        (check c (= @total (+ 1 (+ 2 (+ 3 (+ 1 (+ 2 3)))))))
+        (check c (= (count @kept) 3))
+        (check c (loop ((i 0) (found false))
+                   (if (< i (vec-count @kept)) (recur (+ i 1) (or found (= (vec-nth @kept i) (Pair 2 "bb")))) found)))
+        (check c (and (= @bn 3) (= @bsum 66)))
+        (check c (and (= @sn 2) (= @ssum 11)))
+        (checks-result c))))

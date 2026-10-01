@@ -1,0 +1,82 @@
+;; spec:   stdlib §4.3 (rows identity, comp), §2.2 (combinators return closures)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: identity comp
+;; (identity x) is x, whatever it is. (comp f g) is the function that applies
+;; g and then f, Clojure's order: `((comp bump twice) 5)` is 11 and
+;; `((comp twice bump) 5)` is 12, so the two orders are told apart. This is
+;; the tranche 1 form, two unary functions whose types must meet (case 113
+;; refuses a pair that does not); `(comp f g h)` and `(comp)` are L22's, case
+;; 115. The result is a closure that owns f and g, so the originals stay
+;; usable, a closure may be composed with itself, a composition may change
+;; the type at each step, and one composed function runs many times with a
+;; capture changing between calls.
+(ns main (:use fib.core tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun bump (x: i64) -> i64 (+ x 1))
+(defun twice (x: i64) -> i64 (* x 2))
+(defun half (x: i64) -> (Option i64) (if (= (rem x 2) 0) (some (quot x 2)) nil))
+(defun greet (s: str) -> str (str-concat "hi " s))
+(defun len2 (s: str) -> i64 (* 2 (str-len s)))
+(defun show-i64 (x: i64) -> str (show x))
+(defun pt-x (p: Pt) -> i64 (. p x))
+(defun mk-pt (n: i64) -> Pt (Pt n (* n n)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (k (cell 100)))
+    (do
+      ;; identity
+      (check c (= (identity 7) 7))
+      (check c (= (identity "s") "s"))
+      (check c (= (identity 2.5) 2.5))
+      (check c (identity true))
+      (check c (= (count (identity [1 2 3])) 3))
+      (check c (= (. (identity (Pt 1 2)) y) 2))
+      (check c (= (identity (some 3)) (some 3)))
+      (check c (= ((identity bump) 1) 2))
+      ;; right to left, and the order is not the other one
+      (check c (= ((comp bump twice) 5) 11))
+      (check c (= ((comp twice bump) 5) 12))
+      ;; the type changes along the way
+      (check c (= ((comp len2 greet) "ab") 10))
+      (check c (= ((comp show-i64 bump) 41) "42"))
+      (check c (= ((comp half bump) 3) (some 2)))
+      (check c (= ((comp half bump) 4) nil))
+      (check c (= ((comp pt-x mk-pt) 9) 9))
+      (check c (= (. ((comp mk-pt twice) 3) y) 36))
+      ;; identity is a unit of comp, comp is associative
+      (check c (= ((comp identity bump) 3) 4))
+      (check c (= ((comp bump identity) 3) 4))
+      (check c (= ((comp bump (comp twice bump)) 5) 13))
+      (check c (= ((comp (comp bump twice) bump) 5) 13))
+      ;; a closure, composed with itself and used again
+      (let ((h (fn (x) (+ x @k))))
+        (let ((hh (comp h h)))
+          (do (check c (= (hh 1) 201))
+              (set! k 10)
+              (check c (= (hh 1) 21))
+              (check c (= (h 1) 11)))))
+      ;; each function runs once per call of the composition, g before f
+      (let ((trace (cell "")))
+        (let ((f (fn (x) (do (set! trace (str-concat @trace "f")) (+ x 1))))
+              (g (fn (x) (do (set! trace (str-concat @trace "g")) (* x 2)))))
+          (let ((fg (comp f g)))
+            (do (check c (= (fg 5) 11))
+                (check c (= @trace "gf"))
+                (check c (= (fg 6) 13))
+                (check c (= @trace "gfgf"))))))
+      ;; one composed function, many calls
+      (let ((f (comp bump twice))
+            (total (cell 0)))
+        (do (dotimes (i 50) (set! total (+ @total (f i))))
+            (check c (= @total 2500))))
+      ;; a capture of an object, and a composition passed to a function that borrows it
+      (let ((v [10 20 30 40]))
+        (do (check c (= ((comp (fn (n) (nth v n)) bump) 1) 30))
+            (check c (= (map-opt (comp bump twice) (some 2)) (some 5)))))
+      (checks-result c))))

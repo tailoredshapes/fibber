@@ -1,0 +1,61 @@
+;; spec:   stdlib §8.1 item 2 (a differential test against a naive reference), §4.4 (rows sort, sort-with, sort-by)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: sort sort-with sort-by
+;; 300 seeded vectors of 0 to 40 integers drawn from 15 values (so there are
+;; negatives and many duplicates) are sorted by `sort`, by `sort-with >`
+;; and by `sort-by` on the negated element, and each answer is compared
+;; with the answer of a five-line insertion sort written here with only the
+;; prelude's Vec: ascending, its reverse, and its reverse again. The
+;; seed is a constant. Planted fault (method §9.4): the same comparison
+;; against an insertion sort whose `<=` is `>=` must set a bit, else this case fails.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (if (= (fib.prelude/count a) (fib.prelude/count b))
+      (loop ((i 0))
+        (if (< i (fib.prelude/count a))
+            (if (= (fib.prelude/nth a i) (fib.prelude/nth b i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+;; the reference: v with x inserted before the first element that is greater (after the equal ones);
+;; `fault` flips the test, which is the planted wrong reference
+(defun insert-sorted (v: (Vec i64) x: i64 fault: bool) -> (Vec i64)
+  (let ((n (fib.prelude/count v))
+        (k (loop ((i 0))
+             (if (< i n)
+                 (if (if fault (>= (fib.prelude/nth v i) x) (<= (fib.prelude/nth v i) x)) (recur (+ i 1)) i)
+                 n))))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (<= i n)
+          (recur (+ i 1) (fib.prelude/conj acc (if (< i k) (fib.prelude/nth v i) (if (= i k) x (fib.prelude/nth v (- i 1))))))
+          acc))))
+
+(defun insertion-sort (v: (Vec i64) fault: bool) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (fib.prelude/count v)) (recur (+ i 1) (insert-sorted acc (fib.prelude/nth v i) fault)) acc)))
+
+(defun reversed (v: (Vec i64)) -> (Vec i64)
+  (loop ((i (- (fib.prelude/count v) 1)) (acc (vec-empty)))
+    (if (>= i 0) (recur (- i 1) (fib.prelude/conj acc (fib.prelude/nth v i))) acc)))
+
+;; 300 vectors: the same ones in every call, the reference faulty or not
+(defun run (c: Checks fault: bool) -> unit
+  (let ((r (rng 340)))
+    (dotimes (t 300)
+      (let ((v (rng-vec r (rng-below r 41) 15))
+            (ref (insertion-sort v fault)))
+        (do (check c (same (to-vec (sort v)) ref))
+            (check c (same (to-vec (sort-with > v)) (reversed ref)))
+            (check c (same (to-vec (sort-by (fn (x) (- 0 x)) v)) (reversed ref))))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)))
+    (do (run c false)
+        (run p true)
+        (check c (= (checks-made c) 900))
+        (check-detects c p)
+        (checks-result c))))

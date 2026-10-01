@@ -1,0 +1,32 @@
+;; spec:   stdlib §2.1 rule 2 and 4 (a bound LSeq is realised by its first walk and read by every later one)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: first sum reduce every? find-first empty? nth-or
+;; A lazy seq bound to a name is Clojure's memoised seq: a thunk runs once
+;; per node however many consumers read it. Several consumers read the same
+;; three-node seq and the node thunks have run three times in all (the walk
+;; of the first consumer that reaches the end), never once more; first and
+;; empty? before it have realised exactly one node.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((s (lazy-node (fn () (do (set! calls (+ @calls 1))
+                                   (LCons 10 (lazy-node (fn () (do (set! calls (+ @calls 1))
+                                                                   (LCons 20 (lazy-node (fn () (do (set! calls (+ @calls 1))
+                                                                                                   (LCons 30 (lazy-node (fn () LNil))))))))))))))))
+      (do (check c (match (first s) ((some x) (= x 10)) (nil false)))
+          (check c (not (empty? s)))
+          (check c (= @calls 1))
+          (check c (= (sum s) 60))
+          (check c (= @calls 3))
+          (check c (= (reduce (fn (a x) (+ a (* 2 x))) 0 s) 120))
+          (check c (every? (fn (x) (> x 5)) s))
+          (check c (match (find-first (fn (x) (> x 15)) s) ((some x) (= x 20)) (nil false)))
+          (check c (= (nth-or s 2 -1) 30))
+          (check c (= (nth-or s 3 -1) -1))
+          (check c (= @calls 3))
+          (checks-result c)))))

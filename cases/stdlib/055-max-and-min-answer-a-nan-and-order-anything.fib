@@ -1,0 +1,54 @@
+;; spec:   stdlib §4.3 (rows max min), Appendix A10 nan
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: max min
+;; max and min are written over Ord alone, so they order strings, chars and
+;; every integer width as well as floats; and a NaN argument is the answer,
+;; whichever side it is on, as Clojure's (a NaN is not equal to itself, which
+;; is how the case tells one: m != m). When the two arguments are equal the
+;; second is returned (the library's decision, num.fib's header): only a type
+;; whose Ord looks at part of a value can tell, which is what Tagged is. The
+;; case does not say which of 0.0 and -0.0 max returns: Ord t has no sign of
+;; zero.
+(ns main (:use fib.core tl.check))
+
+(defun nan? (x: f64) -> bool (!= x x))
+
+;; ordered and equal by key alone, so two of them can be equal and differ
+(defstruct Tagged (key: i64 tag: str))
+(impl Eq Tagged (= (self o) (= (. self key) (. o key))))
+(impl Ord Tagged (< (self o) (< (. self key) (. o key))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nan (/ 0.0 0.0)))
+    (do (check c (= (max 3 4) 4))
+        (check c (= (max 4 3) 4))
+        (check c (= (min 3 4) 3))
+        (check c (= (min 4 3) 3))
+        (check c (= (max -3 -4) -3))
+        (check c (= (min -3 -4) -4))
+        (check c (= (max 3i8 4i8) 4i8))
+        (check c (= (min 3i32 -4i32) -4i32))
+        (check c (= (max -1.5 -2.5) -1.5))
+        (check c (= (min 2.5f32 1.5f32) 1.5f32))
+        (check c (= (max "a" "b") "b"))
+        (check c (= (min "b" "a") "a"))
+        (check c (= (max "z" "é") "é"))
+        (check c (= (max \a \b) \b))
+        (check c (= (min \a \b) \a))
+        (check c (nan? (max nan 1.0)))
+        (check c (nan? (max 1.0 nan)))
+        (check c (nan? (min nan 1.0)))
+        (check c (nan? (min 1.0 nan)))
+        (check c (nan? (max nan nan)))
+        (check c (nan? (min nan nan)))
+        (check c (= (max 1.0 2.0) 2.0))
+        (check c (= (min 1.0 2.0) 1.0))
+        (check c (= (. (max (Tagged 1 "a") (Tagged 1 "b")) tag) "b"))
+        (check c (= (. (min (Tagged 1 "a") (Tagged 1 "b")) tag) "b"))
+        (check c (= (. (max (Tagged 2 "a") (Tagged 1 "b")) tag) "a"))
+        (check c (= (. (min (Tagged 2 "a") (Tagged 1 "b")) tag) "b"))
+        (checks-result c))))

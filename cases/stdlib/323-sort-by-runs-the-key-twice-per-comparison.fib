@@ -1,0 +1,53 @@
+;; spec:   stdlib §4.4 (row sort-by: the key function runs twice per comparison, as Clojure's does), §5.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: sort-by sort-by-with
+;; Clojure's (sort-by key c) is (sort (fn [x y] (compare (key x) (key y))) c),
+;; so the key runs for both operands at every comparison and the page
+;; replicates it (the decorating sort-by-cached is tranche 3). The case does
+;; not pin the number of comparisons, which belongs to the merge, but
+;; ties the two counts together: the key calls are exactly twice the
+;; comparator's calls in sort-by-with, and twice the comparisons that
+;; sort-with makes over the same keys in sort-by. A source of one element
+;; or none compares nothing and so never runs the key.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Item (key: i64 id: i64))
+
+(defun same (a: (Vec e) b: (Vec e)) :where ((Eq e)) -> bool
+  (if (= (fib.prelude/count a) (fib.prelude/count b))
+      (loop ((i 0))
+        (if (< i (fib.prelude/count a))
+            (if (= (fib.prelude/nth a i) (fib.prelude/nth b i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defun cmp3 (a: i64 b: i64) -> i64 (if (< a b) -1 (if (> a b) 1 0)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (kc (cell 0))
+        (cc (cell 0))
+        (kc2 (cell 0))
+        (cc2 (cell 0))
+        (kc3 (cell 0))
+        (none: (Vec i64) [])
+        (xs [5 3 9 1 7 2 8 4 6 0 11 10 13 12])
+        (items [(Item 3 0) (Item 1 1) (Item 2 2) (Item 1 3) (Item 5 4) (Item 4 5) (Item 0 6)]))
+    (do (check c (same (to-vec (sort-by-with (fn (x) (do (set! kc (+ @kc 1)) x))
+                                             (fn (a b) (do (set! cc (+ @cc 1)) (cmp3 a b)))
+                                             xs))
+                       [0 1 2 3 4 5 6 7 8 9 10 11 12 13]))
+        (check c (> @cc 13))
+        (check c (<= @cc 56))
+        (check c (= @kc (* 2 @cc)))
+        (check c (= (. (fib.prelude/nth (to-vec (sort-by (fn (p) (do (set! kc2 (+ @kc2 1)) (. p key))) items)) 0) id) 6))
+        (check c (= (fib.prelude/count (to-vec (sort-with (fn (a b) (do (set! cc2 (+ @cc2 1)) (cmp3 (. a key) (. b key)))) items))) 7))
+        (check c (> @cc2 5))
+        (check c (= @kc2 (* 2 @cc2)))
+        (check c (= (fib.prelude/count (to-vec (sort-by (fn (x) (do (set! kc3 (+ @kc3 1)) x)) [4]))) 1))
+        (check c (= (fib.prelude/count (to-vec (sort-by (fn (x) (do (set! kc3 (+ @kc3 1)) x)) none))) 0))
+        (check c (= @kc3 0))
+        (checks-result c))))

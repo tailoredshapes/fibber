@@ -1,0 +1,45 @@
+;; spec:   stdlib §4.4, §8.1 item 4 (a law over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce sum every? not-any? empty? first find-first reduce1 reduce-while
+;; Laws the consumers keep on 300 seeded sources, each one made three ways
+;; (a Vec, a VSeq over it and an LSeq of the same elements): (reduce + 0 c) is
+;; (sum c); every? is the duality of not-any? with the predicate negated;
+;; (empty? c) is (nil? (first c)); find-first finds nothing exactly when
+;; not-any? holds; reduce1 + of a non-empty source is (some (sum c)); a
+;; reduce-while that never says Done is reduce. The last check plants a
+;; fault: the first law with - for + must break on some source, or the
+;; case fails.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+(defun ls-from (v: (Vec i64)) -> (LSeq i64)
+  (loop ((i (- (count v) 1)) (acc (lazy-node (fn () LNil))))
+    (if (>= i 0) (recur (- i 1) (lcons (nth v i) acc)) acc)))
+
+(defun laws (c: Checks s: s thr: i64 wrong: bool) :where ((Reducible s i64)) -> unit
+  (do (check c (= (reduce (fn (a x) (if wrong (- a x) (+ a x))) 0 s) (sum s)))
+      (check c (= (every? (fn (x) (< x thr)) s) (not-any? (fn (x) (not (< x thr))) s)))
+      (check c (= (empty? s) (nil? (first s))))
+      (check c (= (nil? (find-first (fn (x) (>= x thr)) s)) (not-any? (fn (x) (>= x thr)) s)))
+      (check c (match (reduce1 (fn (a x) (+ a x)) s) (nil (empty? s)) ((some t) (= t (sum s)))))
+      (check c (= (reduce-while (fn (a x) (More (+ a x))) 0 s) (reduce (fn (a x) (+ a x)) 0 s)))))
+
+(defun sweep (c: Checks seed: i64 wrong: bool) -> unit
+  (let ((r (rng seed)))
+    (dotimes (n 300)
+      (let ((v (rng-vec r (rng-below r 9) 30))
+            (thr (rng-below r 30)))
+        (do (laws c v thr wrong)
+            (laws c (VSeq (list) v 0) thr wrong)
+            (laws c (ls-from v) thr wrong))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 23 false)
+        (sweep p 23 true)
+        (check c (= (checks-made c) 5400))
+        (check-detects c p)
+        (checks-result c))))

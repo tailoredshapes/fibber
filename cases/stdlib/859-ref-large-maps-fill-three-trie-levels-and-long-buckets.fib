@@ -1,0 +1,94 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Map), types §2.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; The random sequences of 842 to 857 hold at most 60 keys, so no integer key
+;; goes deeper than the second chunk and no bucket is longer than about ten keys.
+;; Two larger fixed shapes here, each against an array model indexed by id. (1)
+;; 1100 integer keys, which hash to themselves: ids 0 to 1023 fill the 32 slots of
+;; the root and the 32 slots under each of them, and each of ids 1024 to 1099
+;; shares its first two chunks with one of ids 0 to 75 and goes a third level down. They are put in a seeded
+;; order, 100 of them put again with new values (the count must not move), 300
+;; deleted; after each phase every key is looked up against the model, and a
+;; full for-each visits as many entries as the model holds with the same sum of
+;; keys; the map of the first phase, kept, must still be what it was after
+;; both. (2) 300 keys of the struct whose hash is `id mod 7`: seven buckets of
+;; about 43 keys each, which only `=` tells apart, put, put again, 100 deleted, and
+;; the same checks. The fault planted: a model that was told the wrong value for a
+;; put. Decided here: 300 and 100 deletes, not the whole map, because the prelude's
+;; dissoc walks the whole trie twice to count (a note in the report, not a claim
+;; about speed) and the interpreter's memory grows with the work done.
+(ns main (:use tl.rng tl.check tl.model))
+
+;; the ids 0..n-1 in a seeded order
+(defun order (seed: i64 n: i64) -> (Array i64) (shuffled (rng seed) n))
+
+;; ids order[from..to) put, with value (base + id)
+(defun put-range (m: (Map k i64) ks: (Vec k) order: (Array i64) from: i64 to: i64 base: i64) :where ((Hash k) (Eq k)) -> (Map k i64)
+  (loop ((i from) (acc m))
+    (if (< i to)
+        (recur (+ i 1) (assoc acc (nth ks (array-get order i)) (+ base (array-get order i))))
+        acc)))
+
+(defun del-range (m: (Map k i64) ks: (Vec k) order: (Array i64) from: i64 to: i64) :where ((Hash k) (Eq k)) -> (Map k i64)
+  (loop ((i from) (acc m))
+    (if (< i to) (recur (+ i 1) (dissoc acc (nth ks (array-get order i)))) acc)))
+
+;; the model: the value of id, -1 if absent
+(defun model-put-range (model: (Array i64) order: (Array i64) from: i64 to: i64 base: i64) -> (Array i64)
+  (loop ((i from) (acc model))
+    (if (< i to) (recur (+ i 1) (array-with acc (array-get order i) (+ base (array-get order i)))) acc)))
+
+(defun model-del-range (model: (Array i64) order: (Array i64) from: i64 to: i64) -> (Array i64)
+  (loop ((i from) (acc model))
+    (if (< i to) (recur (+ i 1) (array-with acc (array-get order i) -1)) acc)))
+
+;; the sum of the ids of the entries the model holds
+(defun model-id-sum (model: (Array i64)) -> i64
+  (loop ((i 0) (s 0)) (if (< i (array-len model)) (recur (+ i 1) (if (>= (array-get model i) 0) (+ s i) s)) s)))
+
+(defun map-key-sum (m: (Map k i64) kid: (fn (k) i64)) -> i64
+  (let ((s (cell 0)))
+    (do (each-entry m (fn (kk vv) (set! s (+ @s (kid kk)))))
+        @s)))
+
+(defun map-visits (m: (Map k i64)) -> i64
+  (let ((n (cell 0)))
+    (do (each-entry m (fn (kk vv) (set! n (+ @n 1))))
+        @n)))
+
+(defun agrees (m: (Map k i64) model: (Array i64) ks: (Vec k) kid: (fn (k) i64)) :where ((Hash k) (Eq k)) -> bool
+  (and (= (count m) (model-count model))
+       (and (= (map-visits m) (model-count model))
+            (and (= (map-key-sum m kid) (model-id-sum model))
+                 (loop ((i 0))
+                   (if (< i (count ks))
+                       (if (= (get m (nth ks i)) (if (>= (array-get model i) 0) (some (array-get model i)) nil))
+                           (recur (+ i 1))
+                           false)
+                       true))))))
+
+;; n keys of one type, three phases and the first phase's map again at the end;
+;; skew is added to the model's values in the second phase (the planted fault)
+(defun large-ok (mk: (fn (i64) k) kid: (fn (k) i64) n: i64 reput: i64 del: i64 seed: i64 skew: i64) :where ((Hash k) (Eq k)) -> bool
+  (let ((ks (universe mk n))
+        (m1 (put-range (map-empty) ks (order seed n) 0 n 10))
+        (md1 (model-put-range (model-new n) (order seed n) 0 n 10))
+        (m2 (put-range m1 ks (order (+ seed 1) n) 0 reput 5000))
+        (md2 (model-put-range md1 (order (+ seed 1) n) 0 reput (+ 5000 skew)))
+        (m3 (del-range m2 ks (order (+ seed 2) n) 0 del))
+        (md3 (model-del-range md2 (order (+ seed 2) n) 0 del)))
+    (and (agrees m1 md1 ks kid)
+         (and (agrees m2 md2 ks kid)
+              (and (agrees m3 md3 ks kid)
+                   (agrees m1 md1 ks kid))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (check c (large-ok mk-int id-int 1100 100 300 859001 0))
+        (check c (large-ok mk-kc id-kc 300 100 100 859101 0))
+        (check p (large-ok mk-kc id-kc 300 100 100 859101 1))
+        (check-detects c p)
+        (checks-result c))))

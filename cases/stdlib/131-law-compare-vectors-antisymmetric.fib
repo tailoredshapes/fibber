@@ -1,0 +1,68 @@
+;; spec:   stdlib §2.7 (`compare` built on `<`, `Ord` on a `Vec` by length first), §8.1 item 4 (laws)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The laws of an order, asked of `<` on `(Vec i64)` over 200 seeded triples of
+;; vectors drawn from three values and lengths up to four, so that ties,
+;; prefixes and equal vectors are common: irreflexive, antisymmetric,
+;; transitive, exactly one of `<`, `>` and `=` between two vectors, the shorter
+;; vector below the longer, and a `compare` built on `<` as Clojure's is
+;; (`(if (< a b) -1 (if (< b a) 1 0))`) that negates when its arguments are
+;; swapped and is 0 only between equal vectors. The law runs on any `lt` given to it. The planted faults: the
+;; lexicographic order that ignores length (a total order, so every law but
+;; "the shorter is below the longer" holds, and exactly that bit is set) and
+;; a non-strict `<=` (which breaks irreflexivity). `check-detects` fails the
+;; case when either goes unnoticed. The counts show the law met both sorts of pair.
+(ns main (:use fib.seq tl.rng tl.check))
+
+;; bit k of the mask is set when law k failed on some triple; `ties` and `orders` count the pairs met
+(defstruct Run (mask: (Cell i64) ties: (Cell i64) orders: (Cell i64)))
+
+(defun run () -> Run (Run (cell 0) (cell 0) (cell 0)))
+
+(defun fail (r: Run k: i64) -> unit (set! (. r mask) (bit-or @(. r mask) (shl 1 k))))
+
+(defun cmp3 (lt: (fn ((Vec i64) (Vec i64)) bool) :borrow a: (Vec i64) b: (Vec i64)) -> i64
+  (if (lt a b) -1 (if (lt b a) 1 0)))
+
+;; the seven laws on one triple
+(defun law (r: Run lt: (fn ((Vec i64) (Vec i64)) bool) :borrow a: (Vec i64) b: (Vec i64) c: (Vec i64)) -> unit
+  (do (if (= a b) (set! (. r ties) (+ @(. r ties) 1)) (set! (. r orders) (+ @(. r orders) 1)))
+      (if (lt a a) (fail r 0) ())
+      (if (if (lt a b) (lt b a) false) (fail r 1) ())
+      (if (if (lt a b) (if (lt b c) (not (lt a c)) false) false) (fail r 2) ())
+      (if (= (+ (if (lt a b) 1 0) (+ (if (lt b a) 1 0) (if (= a b) 1 0))) 1) () (fail r 3))
+      (if (if (< (vec-count a) (vec-count b)) (not (lt a b)) false) (fail r 4) ())
+      (if (= (cmp3 lt a b) (- 0 (cmp3 lt b a))) () (fail r 5))
+      (if (if (= (cmp3 lt a b) 0) (not (= a b)) false) (fail r 6) ())))
+
+(defun run-law (r: Run lt: (fn ((Vec i64) (Vec i64)) bool) :borrow) -> unit
+  (let ((g (rng 31337)))
+    (dotimes (i 200)
+      (law r lt (rng-vec g (rng-below g 5) 3) (rng-vec g (rng-below g 5) 3) (rng-vec g (rng-below g 5) 3)))))
+
+;; the planted faults
+(defun lex-lt (a: (Vec i64) b: (Vec i64)) -> bool
+  (let ((n (if (< (vec-count a) (vec-count b)) (vec-count a) (vec-count b))))
+    (loop ((i 0))
+      (if (< i n)
+          (if (< (vec-nth a i) (vec-nth b i)) true (if (< (vec-nth b i) (vec-nth a i)) false (recur (+ i 1))))
+          (< (vec-count a) (vec-count b))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)) (q (checks))
+        (real (run)) (lex (run)) (le (run)))
+    (do (run-law real (fn (a: (Vec i64) b: (Vec i64)) (< a b)))
+        (run-law lex lex-lt)
+        (run-law le (fn (a: (Vec i64) b: (Vec i64)) (<= a b)))
+        (check c (= @(. real mask) 0))
+        (check c (> @(. real ties) 5))
+        (check c (> @(. real orders) 150))
+        (check c (= @(. lex mask) 16))
+        (check c (!= @(. le mask) 0))
+        (check p (= @(. lex mask) 0))
+        (check q (= @(. le mask) 0))
+        (check-detects c p)
+        (check-detects c q)
+        (checks-result c))))

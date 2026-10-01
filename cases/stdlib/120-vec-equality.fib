@@ -1,0 +1,72 @@
+;; spec:   stdlib §2.7 (Eq Hash Show Debug ToStr exist for Vec Map Set), tranche 1 plan §6 L3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; Today `(= [1 2] [1 2])` is `no implementation of Eq for (Vec i64)`. fib.seq.hash
+;; gives Vec an Eq: equal counts and equal elements in order, by the element's own
+;; `=`. Tried here on the empty vector, a length that differs either way, a
+;; difference at the first, the middle and the last place, vectors that cross the
+;; 32-way trie's tail and node boundaries (31, 32, 33, 1024, 1025 elements) with a
+;; difference at the last index of a leaf and at the first of the next, nested
+;; vectors, strings, options and floats (IEEE: 0.0 equals -0.0, a NaN equals
+;; nothing, so a vector holding one is not equal to itself, as Clojure's is not),
+;; a derived `Eq` of a struct with a Vec field, and the default `!=`.
+(ns main (:use fib.seq tl.check))
+
+(defstruct Tagged (xs: (Vec i64) tag: str))
+(derive Eq Tagged)
+
+;; the vector 0 1 .. n-1 with the element at index `at` raised by `bump`
+(defun ramp (n: i64 at: i64 bump: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/conj acc (if (= i at) (+ i bump) i))) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (e1: (Vec i64) (vec-empty))
+        (e2: (Vec i64) (vec-empty))
+        (nan (fdiv 0.0 0.0)))
+    (do (check c (= e1 e2))
+        (check c (= [1 2 3] [1 2 3]))
+        (check c (not (= [1 2 3] [1 2 4])))
+        (check c (not (= [1 2 3] [0 2 3])))
+        (check c (not (= [1 2 3] [1 5 3])))
+        (check c (not (= [1 2 3] [1 2])))
+        (check c (not (= [1 2] [1 2 3])))
+        (check c (not (= e1 [0])))
+        (check c (not (= [0] e1)))
+        (check c (!= [1 2 3] [3 2 1]))
+        (check c (not (!= [1 2 3] [1 2 3])))
+        (check-ramps c)
+        (check c (= [[1 2] [3]] [[1 2] [3]]))
+        (check c (not (= [[1 2] [3]] [[1 2] [4]])))
+        (check c (not (= [[1 2] [3]] [[1 2 3]])))
+        (check c (= ["ab" "c"] ["ab" "c"]))
+        (check c (not (= ["ab" "c"] ["a" "bc"])))
+        (check c (= [(some 1) nil (some 3)] [(some 1) nil (some 3)]))
+        (check c (not (= [(some 1) nil] [(some 1) (some 2)])))
+        (check c (= [0.0 1.5] [-0.0 1.5]))
+        (check c (not (= [nan] [nan])))
+        (check c (not (= [1.0 nan] [1.0 nan])))
+        (check c (= (Tagged [1 2] "a") (Tagged [1 2] "a")))
+        (check c (not (= (Tagged [1 2] "a") (Tagged [1 3] "a"))))
+        (check c (not (= (Tagged [1 2] "a") (Tagged [1 2] "b"))))
+        (check c (= (checks-made c) 85))
+        (checks-result c))))
+
+;; sizes on both sides of the tail (32) and the first node (1024 + 32) of the trie
+(defun check-ramps (c: Checks) -> unit
+  (let ((sizes [0 1 31 32 33 63 64 65 1024 1025 1056 1057]))
+    (dotimes (j (vec-count sizes))
+      (let ((n (vec-nth sizes j)))
+        (do (check c (= (ramp n -1 0) (ramp n -1 0)))
+            (if (> n 0)
+                (do (check c (not (= (ramp n (- n 1) 1) (ramp n -1 0))))
+                    (check c (not (= (ramp n 0 1) (ramp n -1 0))))
+                    (check c (not (= (ramp n -1 0) (ramp (- n 1) -1 0)))))
+                ())
+            (if (> n 32)
+                (do (check c (not (= (ramp n 31 1) (ramp n -1 0))))
+                    (check c (not (= (ramp n 32 1) (ramp n -1 0)))))
+                ()))))))

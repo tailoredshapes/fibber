@@ -1,4 +1,84 @@
-;; owner: L10a. fib.core.text: the character-offset string functions. Exports: subs subs-from parse-long.
-;; Until L10a writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.core.text (:use fib.core.base fib.core.protocols))
+;; fib.core.text: the character-offset string functions and parse-long (stdlib §2.9, §4.3; tranche 1
+;; plan §4.2; owner L10a). Exports: subs subs-from parse-long.
+;; Replaces nothing in the prelude. Everything here reads the string through the byte layer
+;; (str-len, str-byte-at, str-slice), which allocates nothing, so a call costs its result and no more.
+;; Decided here, where the page is silent:
+;;  - subs counts Unicode scalars, as count, nth and index-of do (§2.9, §5 T10); a bound is a character
+;;    offset and the end of the string is the offset `count`. The bytes are never cut inside a character:
+;;    the two byte offsets are found by stepping over whole characters, so str-slice cannot trap.
+;;  - the traps name the function (plan §4.3 rule 8): `subs: index out of range` when either bound is
+;;    negative or past the end (checked before the order of the two), `subs: start after end` when both
+;;    are in range and a > b. subs-from is the 2-arity of subs until L1, so it traps as `subs` does.
+;;  - parse-long takes `[+-]? [0-9]+`: ASCII digits only, no space, no `_`, no `0x`, leading zeros are
+;;    fine, anything else is nil. Java's Long.parseLong, which Clojure's parse-long wraps, also takes the
+;;    digits of other scripts (Arabic-Indic, fullwidth); the plan fixes the grammar to ASCII and so this
+;;    part does: that is a difference from Clojure and case 507 pins it (reported to the owner).
+;;  - the digits are accumulated as a negative number, so that -9223372036854775808 parses and
+;;    9223372036854775808 does not, without a wider integer; every product is kept in range by a test
+;;    before it is made, so parse-long cannot trap on any input.
+(ns fib.core.text)
+
+;; the width of the character that the lead byte b starts; bytes are i8, so 0x80 to 0xFF are negative.
+;; (the same three lines are fib.seq.chars's: a private helper cannot be shared between two parts)
+(defun lead-width :private (b: i8) -> i64
+  (if (>= b 0i8) 1 (if (< b -32i8) 2 (if (< b -16i8) 3 4))))
+
+;; the byte offset k characters on from the character boundary b, or -1 when k is negative or the
+;; text ends first; the end of the text is a boundary, so k characters from the last one is n.
+;; A negative k is answered before anything is counted down, so the least i64 cannot overflow.
+(defun skip-chars :private (s: str b: i64 k: i64) -> i64
+  (let ((n (str-len s)))
+    (loop ((i b) (left k))
+      (if (< left 0)
+          -1
+          (if (= left 0)
+              i
+              (if (>= i n)
+                  -1
+                  (recur (+ i (lead-width (str-byte-at s i))) (- left 1))))))))
+
+(defun subs (s: str a: i64 b: i64) -> str
+  (let ((from (skip-chars s 0 a))
+        (to (skip-chars s 0 b)))
+    (if (or (< from 0) (< to 0))
+        (trap "subs: index out of range")
+        (if (> from to)
+            (trap "subs: start after end")
+            (str-slice s from to)))))
+
+;; the 2-arity of subs, to the end of the string
+(defun subs-from (s: str a: i64) -> str
+  (let ((from (skip-chars s 0 a)))
+    (if (< from 0)
+        (trap "subs: index out of range")
+        (str-slice s from (str-len s)))))
+
+;; the value of the digit at byte i: a negative number when the byte is not one of 0 to 9 (below the 0
+;; it is the byte's distance from it, above the 9 it is -1)
+(defun digit-at :private (s: str i: i64) -> i64
+  (let ((d (- (zext i64 (str-byte-at s i)) 48)))
+    (if (> d 9) -1 d)))
+
+;; the digits from byte i to the end n, as the negative number -acc: the limit is -922337203685477580
+;; before the last digit, which may then be 8 for a negative result and 7 for a positive one
+(defun parse-digits :private (s: str i: i64 n: i64 negative: bool) -> (Option i64)
+  (let ((most (if negative 8 7)))
+    (loop ((j i) (acc 0))
+      (if (= j n)
+          (some (if negative acc (- 0 acc)))
+          (let ((d (digit-at s j)))
+            (if (< d 0)
+                nil
+                (if (or (< acc -922337203685477580) (and (= acc -922337203685477580) (> d most)))
+                    nil
+                    (recur (+ j 1) (- (* acc 10) d)))))))))
+
+(defun parse-long (s: str) -> (Option i64)
+  (let ((n (str-len s)))
+    (if (= n 0)
+        nil
+        (let ((b (str-byte-at s 0))
+              (start (if (or (= b 45i8) (= b 43i8)) 1 0)))
+          (if (= start n)
+              nil
+              (parse-digits s start n (= b 45i8)))))))

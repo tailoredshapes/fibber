@@ -1,0 +1,72 @@
+;; spec:   stdlib §2.1 rule 1 (an Array is a source), §2.3 (Reducible: size and nth are O(1) on Array)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; An (Array a) is a Reducible: each-while visits its elements in order and stops when the visitor says so;
+;; count is its length, nth and last are its indexes (case 178 is nth past the end). The elements are read
+;; through the builtin array-get, so an array of strings (a heap object per element) is walked with a clean
+;; audit. Written with the helpers below, which are generic over any Reducible, so the instance is what makes
+;; the Array fit them.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun squares (n: i64) -> (Array i64)
+  (let ((a (cell (array n 0))))
+    (do (dotimes (i n) (array-set! &a i (* i i)))
+        @a)))
+
+(defun words () -> (Array str)
+  (let ((a (cell (array 3 "x"))))
+    (do (array-set! &a 1 "second")
+        (array-set! &a 2 "three")
+        @a)))
+
+;; an order-sensitive fold of the elements (acc * 100 + x)
+(defun fold100 (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 100) x)) true)))
+        @acc)))
+
+;; the visits made before an early exit at the nth element, and what the walk returned
+(defun stop-at (c: c n: i64) :where ((Reducible c e)) -> (Pair i64 bool)
+  (let ((k (cell 0)))
+    (let ((done (each-while c (fn (x) (do (set! k (+ @k 1)) (< @k n))))))
+      (Pair @k done))))
+
+(defun total-len (c: c) :where ((Reducible c str)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (s) (do (set! acc (+ @acc (str-len s))) true)))
+        @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a (squares 5))
+        (none: (Array i64) (array 0 0)))
+    (do (check c (= (count a) 5))
+        (check c (= (fold100 a) 1040916))
+        (check c (= (nth a 0) 0))
+        (check c (= (nth a 3) 9))
+        (check c (= (nth a 4) 16))
+        (check c (match (last a) ((some x) (= x 16)) (nil false)))
+        (check c (= (fib.prelude/count (to-vec a)) 5))
+        (check c (= (fib.prelude/nth (to-vec a) 2) 4))
+        ;; (array 4 7): four sevens
+        (check c (and (= (count (array 4 7)) 4) (= (nth (array 4 7) 2) 7)))
+        ;; early exit: three visits, the walk did not run to the end; an exit at the last element is not early
+        (let ((p (stop-at a 3)))
+          (check c (and (= (. p fst) 3) (not (. p snd)))))
+        (let ((p (stop-at a 6)))
+          (check c (and (= (. p fst) 5) (. p snd))))
+        ;; empty
+        (check c (= (count none) 0))
+        (check c (match (last none) ((some _) false) (nil true)))
+        (check c (= (fold100 none) 0))
+        (let ((p (stop-at none 1)))
+          (check c (and (= (. p fst) 0) (. p snd))))
+        ;; strings
+        (check c (= (count (words)) 3))
+        (check c (= (total-len (words)) 12))
+        (check c (= (nth (words) 1) "second"))
+        (check c (match (last (words)) ((some w) (= w "three")) (nil false)))
+        (check c (= (fib.prelude/count (to-vec (words))) 3))
+        (checks-result c))))

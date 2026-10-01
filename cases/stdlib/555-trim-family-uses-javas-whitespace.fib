@@ -1,0 +1,48 @@
+;; spec:   stdlib §4.7 (rows clojure.string/trim triml trimr), §2.9, plan §6 L10b, C-22
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: clojure.string/trim clojure.string/triml clojure.string/trimr
+;; `str/trim`, `str/triml` and `str/trimr` remove the whitespace at both ends, at the start and at
+;; the end. Clojure's `trim` calls `Character/isWhitespace`, not `String.trim`, and so do these:
+;; U+0009 to U+000D, U+001C to U+001F (the separators, which `String.trim` would also take but
+;; Unicode's `White_Space` does not have), U+0020, U+1680, U+2000 to U+2006, U+2008 to U+200A,
+;; U+2028, U+2029, U+205F and U+3000. The three no-break spaces U+00A0, U+2007 and U+202F, the
+;; next-line U+0085, the zero-width space U+200B and the byte-order mark are NOT whitespace and
+;; stay (case 560 has the full table, and `char/whitespace?` is the other, Unicode, definition).
+;; Whitespace inside the text stays; a string of nothing but whitespace is the empty string; a
+;; character of two, three or four bytes at an edge is kept whole. Every expected value below was
+;; printed by Java (Clojure's `trim` loop over `Character.isWhitespace`, JDK 27), not by the library.
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+;; the three at once: trim, triml and trimr of s, in that order, equal the three texts
+(defun trims? (s: str both: str left: str right: str) -> bool
+  (and (= (str/trim s) both)
+       (and (= (str/triml s) left) (= (str/trimr s) right))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (trims? "  a b  " "a b" "a b  " "  a b"))
+        (check c (trims? "" "" "" ""))
+        (check c (trims? "   " "" "" ""))
+        (check c (trims? "a" "a" "a" "a"))
+        (check c (trims? " a" "a" "a" " a"))
+        (check c (trims? "a " "a" "a " "a"))
+        (check c (trims? "a \t b" "a \t b" "a \t b" "a \t b"))
+        (check c (trims? "\t\n\r\x0c\x0b a \x1c\x1f\x1d" "a" "a \x1c\x1f\x1d" "\t\n\r\x0c\x0b a"))
+        (check c (trims? "\u{a0}a\u{a0}" "\u{a0}a\u{a0}" "\u{a0}a\u{a0}" "\u{a0}a\u{a0}"))
+        (check c (trims? "\u{2007}x\u{202f}" "\u{2007}x\u{202f}" "\u{2007}x\u{202f}" "\u{2007}x\u{202f}"))
+        (check c (trims? "\u{85}y\u{85}" "\u{85}y\u{85}" "\u{85}y\u{85}" "\u{85}y\u{85}"))
+        (check c (trims? "\u{a0} \u{a0}" "\u{a0} \u{a0}" "\u{a0} \u{a0}" "\u{a0} \u{a0}"))
+        (check c (trims? "\u{200b} z \u{200b}" "\u{200b} z \u{200b}" "\u{200b} z \u{200b}" "\u{200b} z \u{200b}"))
+        (check c (trims? "\u{feff} q" "\u{feff} q" "\u{feff} q" "\u{feff} q"))
+        (check c (trims? " \u{180e} x" "\u{180e} x" "\u{180e} x" " \u{180e} x"))
+        (check c (trims? "\u{2003}x\u{3000}" "x" "x\u{3000}" "\u{2003}x"))
+        (check c (trims? "\u{1680}x\u{2028}\u{2029}\u{205f}" "x" "x\u{2028}\u{2029}\u{205f}" "\u{1680}x"))
+        (check c (trims? " é " "é" "é " " é"))
+        (check c (trims? "\u{2003}€\u{2003}" "€" "€\u{2003}" "\u{2003}€"))
+        (check c (trims? "😀 " "😀" "😀 " "😀"))
+        (check c (trims? " 😀" "😀" "😀" " 😀"))
+        (check c (trims? "\x0b\x0c" "" "" ""))
+        (checks-result c))))

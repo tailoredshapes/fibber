@@ -1,4 +1,15 @@
-;; owner: L10a. fib.coll.chars: str by character index. Exports: Lookup i64 char and Keyed i64 for str.
-;; Until L10a writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.coll.chars (:use fib.core fib.seq fib.coll.protocols))
+;; fib.coll.chars: a str looked up by character index (stdlib §2.3, §2.9; tranche 1 plan §4.2; owner
+;; L10a). Exports: Lookup i64 char and Keyed i64 for str (no names of its own).
+;; Replaces nothing in the prelude. As Clojure's: (get "abc" 1) is (some \b), (get "abc" 3) is nil,
+;; and (contains? "abc" 1) is true, (contains? "abc" 3) false: the key is an index, not an element, and
+;; includes? is the element test (fib.coll.seqs, L8a). The index counts Unicode scalars, as nth does
+;; (§5 T10), so both are an O(n) walk until C10; they are written over the Reducible instance of str
+;; (fib.seq.chars), which allocates nothing per character.
+;; Decided here: a negative or too large index is nil / false, never a trap (get is total, as Clojure's).
+(ns fib.coll.chars (:use fib.seq fib.coll.protocols))
+
+(impl (Keyed i64) str
+  (contains? (self i) (and (>= i 0) (< i (size self)))))
+
+(impl (Lookup i64 char) str
+  (get (self i) (if (and (>= i 0) (< i (size self))) (some (nth self i)) nil)))

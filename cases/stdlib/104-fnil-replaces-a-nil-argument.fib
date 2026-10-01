@@ -1,0 +1,64 @@
+;; spec:   stdlib §4.3 (row fnil), §2.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: fnil comp
+;; (fnil f d) is f with a nil argument replaced by d: the function the
+;; `update` family hands the value of a key that may be absent (`update-opt`
+;; gives its function an Option, which is what the result takes). The result
+;; is a function of an `(Option a)`: `((fnil f d) nil)` is `(f d)` and
+;; `((fnil f d) (some x))` is `(f x)`, f runs once per call, and d is kept
+;; by the closure, so it serves every call and an object default is neither
+;; consumed by the first call nor freed with it. This is the unary form
+;; (L22 gives Clojure's `(fnil f x y z)` for a function of any arity, case 116).
+(ns main (:use fib.core tl.check))
+
+(defun bump (x: i64) -> i64 (+ x 1))
+(defun half (x: i64) -> (Option i64) (if (= (rem x 2) 0) (some (quot x 2)) nil))
+(defun show-i64 (x: i64) -> str (show x))
+(defun greet (s: str) -> str (str-concat "hi " s))
+(defun i8-up (x: i8) -> i8 (+ x 1i8))
+(defun f32-up (x: f32) -> f32 (+ x 1.0f32))
+(defun flip (b: bool) -> bool (not b))
+(defun next-char (c: char) -> char (i32->char (+ (char->i32 c) 1i32)))
+
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (do
+      ;; nil gives the default, a some gives its payload
+      (check c (= ((fnil bump 7) nil) 8))
+      (check c (= ((fnil bump 7) (some 1)) 2))
+      (check c (= ((fnil show-i64 0) nil) "0"))
+      (check c (= ((fnil show-i64 0) (some 12)) "12"))
+      ;; the default is an object: the same string serves every call
+      (let ((g (fnil greet "anon")))
+        (do (check c (= (g nil) "hi anon"))
+            (check c (= (g (some "z")) "hi z"))
+            (check c (= (g nil) "hi anon"))
+            (check c (= (g nil) "hi anon"))))
+      ;; a Vec default and a function over Vecs
+      (let ((n (fnil (fn (v) (count v)) [7 8])))
+        (do (check c (= (n nil) 2))
+            (check c (= (n (some [1])) 1))
+            (check c (= (n nil) 2))))
+      ;; one instance of the generic function per layout class of the argument
+      (check c (= ((fnil i8-up 0i8) nil) 1i8))
+      (check c (= ((fnil i8-up 0i8) (some 9i8)) 10i8))
+      (check c (= ((fnil f32-up 0.5f32) nil) 1.5f32))
+      (check c (= ((fnil next-char \a) nil) \b))
+      (check c (= ((fnil next-char \a) (some \y)) \z))
+      (check c (= ((fnil flip true) nil) false))
+      (check c (= ((fnil flip true) (some false)) true))
+      ;; f runs once per call
+      (let ((h (fnil (fn (x) (do (set! calls (+ @calls 1)) (bump x))) 0)))
+        (do (check c (= (h nil) 1))
+            (check c (= @calls 1))
+            (check c (= (h (some 5)) 6))
+            (check c (= @calls 2))))
+      ;; the idiom: an Option-returning function, then the default
+      (check c (= ((comp (fnil bump 0) half) 3) 1))
+      (check c (= ((comp (fnil bump 0) half) 4) 3))
+      (checks-result c))))

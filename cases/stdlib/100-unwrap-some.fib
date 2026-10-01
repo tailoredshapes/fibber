@@ -1,0 +1,50 @@
+;; spec:   stdlib §4.3 (row unwrap), §2.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: unwrap
+;; (unwrap o) is the payload of a `some`, the sure case beside `get` and
+;; `first` returning an Option. It must hand back the payload whatever its
+;; representation: a scalar of each width, a char, unit, a string, a Vec, a
+;; struct, a function, and an Option held in an Option (an `(Option (Option
+;; str))` is a heap enum, so `(some nil)` and nil stay distinct and unwrapping
+;; `(some nil)` gives nil, not a trap; an Option of a scalar Option is case
+;; 118). The audit being clean is the check that the owned payload is neither
+;; leaked nor freed early. `unwrap` of nil is case 101. (The unit payload is
+;; checked by a match, not by `=`: `(= () ())` is `unsupported: = on unit`
+;; under fibc and 1 under fibref, a divergence of the compiler that is not
+;; this part's.)
+(ns main (:use fib.core tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun bump (x: i64) -> i64 (+ x 1))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (unit-some: (Option unit) (some ()))
+        (words: (Option (Option str)) (some (some "inner")))
+        (hole: (Option (Option str)) (some nil))
+        (kept (some [10 20 30])))
+    (do (check c (= (unwrap (some 4)) 4))
+        (check c (= (unwrap (some -7i8)) -7i8))
+        (check c (= (unwrap (some 300i16)) 300i16))
+        (check c (= (unwrap (some -70000i32)) -70000i32))
+        (check c (= (unwrap (some 2.5f32)) 2.5f32))
+        (check c (= (unwrap (some 2.5)) 2.5))
+        (check c (unwrap (some true)))
+        (check c (not (unwrap (some false))))
+        (check c (= (unwrap (some "abc")) "abc"))
+        (check c (= (unwrap (some \x)) \x))
+        (check c (= (unwrap (some \é)) \é))
+        (check c (nil? (match (unwrap unit-some) (_ nil))))
+        (check c (= ((unwrap (some bump)) 1) 2))
+        (check c (= (count (unwrap (some [1 2 3]))) 3))
+        (check c (= (. (unwrap (some (Pt 3 4))) y) 4))
+        (check c (= (unwrap (unwrap words)) "inner"))
+        (check c (nil? (unwrap hole)))
+        (check c (some? hole))
+        (check c (= (nth (unwrap kept) 1) 20))
+        (check c (= (nth (unwrap kept) 2) 30))
+        (checks-result c))))

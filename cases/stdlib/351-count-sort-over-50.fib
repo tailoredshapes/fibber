@@ -1,0 +1,31 @@
+;; spec:   stdlib §2.5 (bulk operations build in one function), §4.4 (row sort), §8.1 item 5 (count cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 111
+;; roots:  ../../lib support
+;; covers: sort
+;; The input is a `def` of 50 distinct integers (its own objects are not in the
+;; trace, cases/ownership/README.md). The sort allocates a constant number of
+;; objects of its own, none per comparison or per element. The run allocates
+;; 111: 107 is what a program that copies the same input into a Vec in a
+;; `conj` loop allocates (two objects an element and the trie's nodes), and the
+;; sort adds 4 to that. Case 350 is the same over 500: 1049 for the copy loop
+;; and the same 4 more. The bound is the count as measured, under both tools.
+;; When L9's bulk builder lands the Vec costs about n/32 and this bound passes
+;; loosely: lower it then.
+(ns main (:use fib.core fib.seq tl.check))
+
+(def input: (Vec i64) [13 210 407 101 298 495 189 386 80 277 474 168 365 59 256 453 147 344 38 235 432 126 323 17 214 411 105 302 499 193 390 84 281 478 172 369 63 260 457 151 348 42 239 436 130 327 21 218 415 109])
+
+;; the elements 0 to n-1 of v are in ascending order
+(defun ascending (v: (Vec i64)) -> bool
+  (loop ((i 1)) (if (< i (fib.prelude/count v)) (if (< (fib.prelude/nth v (- i 1)) (fib.prelude/nth v i)) (recur (+ i 1)) false) true)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (out (to-vec (sort input))))
+    (do (check c (= (fib.prelude/count out) 50))
+        (check c (ascending out))
+        (check c (= (fib.prelude/nth out 0) 13))
+        (checks-result c))))

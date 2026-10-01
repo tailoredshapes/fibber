@@ -1,0 +1,118 @@
+;; spec:   stdlib §4.1 (rows bit-shift-left bit-shift-right unsigned-bit-shift-right), types §2.12
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: bit-shift-left bit-shift-right unsigned-bit-shift-right
+;; The three shifts against references that share nothing with them but the one-bit shl: left by m is
+;; m single shifts; the arithmetic right shift by m is the floor of x / 2^m, worked out with quot and
+;; rem; the logical right shift is the arithmetic one with the top m bits cleared by a mask. The
+;; distance n is any number from -70 to 69 (-40 to 39 at i32, -20 to 19 at i8) and the shift is by n
+;; mod the width, which is the low bits of n, negative n included. At i64: 200 seeded draws and every
+;; distance against six edge values; at i32: 100 seeded draws; at i8: every value against every
+;; distance, 256 by 40 (the narrow widths are where a lowering that forgot to mask the distance would
+;; leave poison). The last checks plant a fault at each width, the reference distance one too long,
+;; and require that the same comparisons then fail (method rule 3, cases/stdlib/README.md "What
+;; each kind must show").
+(ns main (:use fib.core tl.rng tl.check))
+
+(def SEED: i64 650)
+
+(defun pow2 (m: i64) -> i64
+  (loop ((i 0) (p 1)) (if (< i m) (recur (+ i 1) (* p 2)) p)))
+
+;; i64
+(defun ref-left (x: i64 m: i64) -> i64
+  (loop ((i 0) (acc x)) (if (< i m) (recur (+ i 1) (shl acc 1)) acc)))
+
+(defun ref-sar (x: i64 m: i64) -> i64
+  (if (= m 63)
+      (if (< x 0) -1 0)
+      (let ((p (pow2 m)))
+        (let ((q (quot x p))
+              (r (rem x p)))
+          (if (< r 0) (- q 1) q)))))
+
+(defun ref-shr (x: i64 m: i64) -> i64
+  (if (= m 0) x (bit-and (ref-sar x m) (bit-not (shl -1 (- 64 m))))))
+
+;; i32
+(defun ref-left32 (x: i32 m: i64) -> i32
+  (loop ((i 0) (acc x)) (if (< i m) (recur (+ i 1) (shl acc 1i32)) acc)))
+
+(defun ref-sar32 (x: i32 m: i64) -> i32
+  (if (= m 31)
+      (if (< x 0i32) -1i32 0i32)
+      (let ((p (trunc i32 (pow2 m))))
+        (let ((q (quot x p))
+              (r (rem x p)))
+          (if (< r 0i32) (- q 1i32) q)))))
+
+(defun ref-shr32 (x: i32 m: i64) -> i32
+  (if (= m 0) x (bit-and (ref-sar32 x m) (bit-not (shl -1i32 (trunc i32 (- 32 m)))))))
+
+;; i8
+(defun ref-left8 (x: i8 m: i64) -> i8
+  (loop ((i 0) (acc x)) (if (< i m) (recur (+ i 1) (shl acc 1i8)) acc)))
+
+(defun ref-sar8 (x: i8 m: i64) -> i8
+  (if (= m 7)
+      (if (< x 0i8) -1i8 0i8)
+      (let ((p (trunc i8 (pow2 m))))
+        (let ((q (quot x p))
+              (r (rem x p)))
+          (if (< r 0i8) (- q 1i8) q)))))
+
+(defun ref-shr8 (x: i8 m: i64) -> i8
+  (if (= m 0) x (bit-and (ref-sar8 x m) (bit-not (shl -1i8 (trunc i8 (- 8 m)))))))
+
+;; bias 0 is the reference; bias 1 is the planted fault
+(defun compare-shifts (c: Checks x: i64 n: i64 bias: i64) -> unit
+  (let ((m (bit-and (+ (bit-and n 63) bias) 63)))
+    (do (check c (= (bit-shift-left x n) (ref-left x m)))
+        (check c (= (bit-shift-right x n) (ref-sar x m)))
+        (check c (= (unsigned-bit-shift-right x n) (ref-shr x m))))))
+
+(defun compare-shifts32 (c: Checks x: i32 n: i32 bias: i64) -> unit
+  (let ((m (bit-and (+ (bit-and (sext i64 n) 31) bias) 31)))
+    (do (check c (= (bit-shift-left x n) (ref-left32 x m)))
+        (check c (= (bit-shift-right x n) (ref-sar32 x m)))
+        (check c (= (unsigned-bit-shift-right x n) (ref-shr32 x m))))))
+
+(defun compare-shifts8 (c: Checks x: i8 n: i8 bias: i64) -> unit
+  (let ((m (bit-and (+ (bit-and (sext i64 n) 7) bias) 7)))
+    (do (check c (= (bit-shift-left x n) (ref-left8 x m)))
+        (check c (= (bit-shift-right x n) (ref-sar8 x m)))
+        (check c (= (unsigned-bit-shift-right x n) (ref-shr8 x m))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (p32 (checks))
+        (p8 (checks))
+        (r (rng SEED))
+        (edges [0 1 -1 -9223372036854775808 9223372036854775807 12345]))
+    (do (dotimes (i 200)
+          (let ((x (rng-next r))
+                (n (- (rng-below r 140) 70)))
+            (do (compare-shifts c x n 0)
+                (compare-shifts p x n 1))))
+        (dotimes (j (count edges))
+          (dotimes (k 140)
+            (compare-shifts c (nth edges j) (- k 70) 0)))
+        (dotimes (i 100)
+          (let ((x (trunc i32 (rng-next r)))
+                (n (trunc i32 (- (rng-below r 80) 40))))
+            (do (compare-shifts32 c x n 0)
+                (compare-shifts32 p32 x n 1))))
+        (dotimes (xi 256)
+          (dotimes (ni 40)
+            (let ((x (trunc i8 (- xi 128)))
+                  (n (trunc i8 (- ni 20))))
+              (do (compare-shifts8 c x n 0)
+                  (compare-shifts8 p8 x n 1)))))
+        (check c (> (checks-made c) 30000))
+        (check-detects c p)
+        (check-detects c p32)
+        (check-detects c p8)
+        (checks-result c))))

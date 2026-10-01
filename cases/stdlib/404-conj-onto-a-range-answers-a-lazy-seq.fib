@@ -1,0 +1,40 @@
+;; spec:   stdlib §2.3 (Collection: a seq conses at the front and answers an LSeq), A13 conjseq
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: conj range range-by
+;; Clojure's (conj (range 3) 9) is (9 0 1 2): a range is a seq, so conj puts the
+;; element at the front, and the answer is a lazy seq, not a range. The tail is the
+;; range's own seq, walked as the range walks, so the step of a range-by, an empty
+;; range, a range of another width (i32) and one of floats (accumulated by adding
+;; the step, hi excluded) all come through, and a second conj goes onto the LSeq.
+;; An endless range (a step of zero repeats the start) is a lazy tail: the first
+;; elements of the conj are there at once and the walk is stopped by first-n.
+;; fib.coll is required under an alias, not :used, as in case 384.
+(ns main (:use fib.core fib.seq tl.check) (:require [fib.coll :as coll]))
+
+;; whether the elements of c are exactly the Vec want
+(defun elements-are (c: c want: (Vec e)) :where ((Reducible c e) (Eq e)) -> bool
+  (let ((got (to-vec c)))
+    (and (= (count got) (count want))
+         (loop ((i 0)) (if (< i (count want)) (if (= (nth got i) (nth want i)) (recur (+ i 1)) false) true)))))
+
+;; the first n elements of c, or all of them when there are fewer: the walk stops there
+(defun first-n (c: c n: i64) :where ((Reducible c e)) -> (Vec e)
+  (let ((acc (cell (vec-empty))))
+    (do (each-while c (fn (x) (do (set! acc (vec-conj @acc x)) (< (count @acc) n))))
+        @acc)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (elements-are (coll/conj (range 3) 9) [9 0 1 2]))
+        (check c (elements-are (coll/conj (range 0) 9) [9]))
+        (check c (elements-are (coll/conj (range-by 10 0 -3) 99) [99 10 7 4 1]))
+        (check c (elements-are (coll/conj (range-by 0 10 4) -1) [-1 0 4 8]))
+        (check c (elements-are (coll/conj (coll/conj (range 2) 5) 6) [6 5 0 1]))
+        (check c (elements-are (coll/conj (range 3i32) 9i32) [9i32 0i32 1i32 2i32]))
+        (check c (elements-are (coll/conj (range-by 0.0 1.0 0.5) 9.0) [9.0 0.0 0.5]))
+        (check c (= (count (coll/conj (range 100) 7)) 101))
+        (check c (elements-are (first-n (coll/conj (range-by 1 2 0) 7) 4) [7 1 1 1]))
+        (checks-result c))))

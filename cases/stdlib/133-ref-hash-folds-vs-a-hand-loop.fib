@@ -1,0 +1,62 @@
+;; spec:   stdlib §2.7 (hash-combine, hash-unordered-coll), §8.1 item 2, plan §9.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: hash hash-ordered-coll hash-unordered-coll hash-combine
+;; The two folds of fib.seq.hash against loops of three lines written here, over
+;; 300 seeded vectors: 200 of i64 (any value, negative included, lengths 0 to 70
+;; so that the 32-way trie's tail and its first two leaves are crossed)
+;; and 100 of strings (every scalar width). The ordered reference folds
+;; `hash-combine` from the seed over the element hashes from the first to the
+;; last and then combines the count; the unordered one xors the element hashes
+;; from the LAST to the first (the other way round from the library's walk, so
+;; an implementation that was order dependent would disagree) and then combines
+;; the count. `(hash v)`, `(hash-ordered-coll v)` and `(hash-unordered-coll v)`
+;; must each equal its reference on every vector. The planted faults are the
+;; references wrong in one way each: the ordered fold from seed 0 instead of 1,
+;; and the unordered one with the count left out; each, over the same vectors,
+;; must disagree, or `check-detects` fails the case.
+(ns main (:use fib.core fib.seq tl.rng tl.check tl.gen))
+
+(defun ref-ordered (v: (Vec e) seed: i64) :where ((Hash e)) -> i64
+  (let ((n (vec-count v)))
+    (hash-combine (loop ((i 0) (h seed)) (if (< i n) (recur (+ i 1) (hash-combine h (hash (vec-nth v i)))) h)) n)))
+
+(defun ref-unordered (v: (Vec e) counted: bool) :where ((Hash e)) -> i64
+  (let ((n (vec-count v)))
+    (let ((x (loop ((i (- n 1)) (h 0)) (if (>= i 0) (recur (- i 1) (bit-xor h (hash (vec-nth v i)))) h))))
+      (if counted (hash-combine x n) x))))
+
+(defun ints (g: Rng) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)) (n (rng-below g 71)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/conj acc (rng-next g)) n) acc)))
+
+(defun strs (g: Rng) -> (Vec str)
+  (loop ((i 0) (acc (vec-empty)) (n (rng-below g 20)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/conj acc (gen-str g (rng-below g 6))) n) acc)))
+
+;; the number of comparisons, of the 900 made, on which the library and the
+;; references (ordered from `seed`, unordered counted or not) differ
+(defun disagreements (seed: i64 counted: bool) -> i64
+  (let ((g (rng 161803)) (bad (cell 0)))
+    (do (dotimes (i 200)
+          (let ((v (ints g)))
+            (do (if (= (hash v) (ref-ordered v seed)) () (set! bad (+ @bad 1)))
+                (if (= (hash-ordered-coll v) (ref-ordered v seed)) () (set! bad (+ @bad 1)))
+                (if (= (hash-unordered-coll v) (ref-unordered v counted)) () (set! bad (+ @bad 1))))))
+        (dotimes (i 100)
+          (let ((v (strs g)))
+            (do (if (= (hash v) (ref-ordered v seed)) () (set! bad (+ @bad 1)))
+                (if (= (hash-ordered-coll v) (ref-ordered v seed)) () (set! bad (+ @bad 1)))
+                (if (= (hash-unordered-coll v) (ref-unordered v counted)) () (set! bad (+ @bad 1))))))
+        @bad)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)) (q (checks)))
+    (do (check c (= (disagreements 1 true) 0))
+        (check p (= (disagreements 0 true) 0))
+        (check q (= (disagreements 1 false) 0))
+        (check-detects c p)
+        (check-detects c q)
+        (checks-result c))))

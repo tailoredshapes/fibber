@@ -1,0 +1,64 @@
+;; spec:   stdlib §2.9 (a `str` is UTF-8; the functions of `str/` count characters), plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; `fib.string.utf8` is the module under every function of `str/`: it reads a string through
+;; `str-byte-at` (no array) and turns byte offsets into character offsets and back. The facade
+;; `fib.string` does not re-export it, but a program can require it by name, and this case does:
+;; the five functions the parts share are compared with the prelude's `str-chars`, a decoder
+;; written elsewhere (it works on the array `str-bytes` copies), over 300 seeded characters of
+;; every width (`tl.gen`: one to four bytes, never a surrogate) and over a hand-made string whose
+;; four widths sit next to each other. `width-of` is the width of each character, `code-at` its scalar
+;; value, `scalars-before` the number of characters before a byte offset, `offset-after` the byte
+;; offset after skipping n characters (clamped at the end), `start-before` the start of the
+;; character that ends at a byte offset. The checks below hold the four-byte decoding, which no
+;; whitespace test reaches (case 560: whitespace is all in the first 12288 values), to the
+;; same standard as the others.
+(ns main (:use fib.core tl.rng tl.gen tl.check) (:require [fib.string.utf8 :as u8]))
+
+;; how many bytes the character c takes, by its value
+(defun bytes-of (c: char) -> i64
+  (let ((n (char->i32 c)))
+    (if (< n 128i32) 1 (if (< n 2048i32) 2 (if (< n 65536i32) 3 4)))))
+
+;; every character start of s agrees with the prelude's decoder, by the five functions;
+;; the number of disagreements
+(defun disagreements (s: str) -> i64
+  (let ((cs (fib.prelude/str-chars s))
+        (n (str-len s)))
+    (loop ((k 0) (at 0) (bad 0))
+      (if (< k (fib.prelude/vec-count cs))
+          (let ((c (fib.prelude/vec-nth cs k)))
+            (recur (+ k 1) (+ at (bytes-of c))
+                   (+ bad
+                      (+ (if (= (u8/width-of (u8/byte-at s at)) (bytes-of c)) 0 1)
+                      (+ (if (= (u8/code-at s at) (char->i32 c)) 0 1)
+                      (+ (if (= (u8/scalars-before s at) k) 0 1)
+                      (+ (if (= (u8/offset-after s k) at) 0 1)
+                         (if (= (u8/start-before s (+ at (bytes-of c))) at) 0 1))))))))
+          (+ bad (+ (if (= at n) 0 1)
+                 (+ (if (= (u8/scalars-before s n) (fib.prelude/vec-count cs)) 0 1)
+                    (if (= (u8/offset-after s (+ n 5)) n) 0 1))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (r (rng 564)))
+    (do (check c (= (disagreements "") 0))
+        (check c (= (disagreements "abc") 0))
+        (check c (= (disagreements "a\u{e9}\u{20ac}\u{1f600}z") 0))
+        (check c (= (disagreements "\u{1f600}\u{20ac}\u{e9}a\u{e9}\u{20ac}\u{1f600}") 0))
+        (check c (= (disagreements "\u{7f}\u{80}\u{7ff}\u{800}\u{ffff}\u{10000}\u{10ffff}") 0))
+        (check c (= (disagreements (gen-str r 300)) 0))
+        (check c (= (u8/code-at "\u{10ffff}" 0) 1114111i32))
+        (check c (= (u8/code-at "\u{10000}" 0) 65536i32))
+        (check c (= (u8/code-at "\u{ffff}" 0) 65535i32))
+        (check c (= (u8/code-at "\u{800}" 0) 2048i32))
+        (check c (= (u8/code-at "\u{7ff}" 0) 2047i32))
+        (check c (= (u8/code-at "\u{80}" 0) 128i32))
+        (check c (= (u8/code-at "\u{7f}" 0) 127i32))
+        (check c (= (u8/byte-at "\u{e9}" 0) 195i32))
+        (check c (= (u8/byte-at "\u{e9}" 1) 169i32))
+        (check c (u8/continuation? (u8/byte-at "\u{e9}" 1)))
+        (check c (not (u8/continuation? (u8/byte-at "\u{e9}" 0))))
+        (checks-result c))))

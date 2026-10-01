@@ -1,0 +1,60 @@
+;; spec:   stdlib §4.3 (row parse-long), §1.2 P5 (nil, never a trap)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: parse-long
+;; `parse-long` takes `[+-]? [0-9]+` and nothing else: an optional sign and one
+;; or more ASCII digits, leading zeros allowed. Everything else is nil and
+;; never a trap: the empty string, a lone sign, two signs, a space before or
+;; after, an underscore, a hex prefix, a fraction or an exponent, letters, the
+;; two ASCII characters either side of the digits (/ and :), a trailing
+;; newline, the Unicode minus sign. The digits of other scripts
+;; (Arabic-Indic, fullwidth) are nil here, where Java's Long.parseLong, which
+;; Clojure's parse-long wraps, takes them as digits: the plan fixes the grammar
+;; to ASCII, and this case pins the difference (it is reported to the owner).
+;; Overflow and the range ends are case 508.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun is (r: (Option i64) want: i64) -> bool
+  (match r ((some x) (= x want)) (nil false)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (is (parse-long "0") 0))
+        (check c (is (parse-long "7") 7))
+        (check c (is (parse-long "42") 42))
+        (check c (is (parse-long "-7") -7))
+        (check c (is (parse-long "+7") 7))
+        (check c (is (parse-long "007") 7))
+        (check c (is (parse-long "-0") 0))
+        (check c (is (parse-long "+0") 0))
+        (check c (is (parse-long "1234567890") 1234567890))
+        (check c (is (parse-long "-1234567890") -1234567890))
+        (check c (is (parse-long "0000000000000000000000000000000000001") 1))
+        (check c (nil? (parse-long "")))
+        (check c (nil? (parse-long "+")))
+        (check c (nil? (parse-long "-")))
+        (check c (nil? (parse-long "--1")))
+        (check c (nil? (parse-long "+-1")))
+        (check c (nil? (parse-long "-+1")))
+        (check c (nil? (parse-long " 1")))
+        (check c (nil? (parse-long "1 ")))
+        (check c (nil? (parse-long " ")))
+        (check c (nil? (parse-long "1\n")))
+        (check c (nil? (parse-long "1_000")))
+        (check c (nil? (parse-long "0x10")))
+        (check c (nil? (parse-long "1.0")))
+        (check c (nil? (parse-long "1e3")))
+        (check c (nil? (parse-long "abc")))
+        (check c (nil? (parse-long "1a")))
+        (check c (nil? (parse-long "a1")))
+        (check c (nil? (parse-long "1:")))
+        (check c (nil? (parse-long ":1")))
+        (check c (nil? (parse-long "1/")))
+        (check c (nil? (parse-long "/1")))
+        (check c (nil? (parse-long "−5")))
+        (check c (nil? (parse-long "٣")))
+        (check c (nil? (parse-long "１２")))
+        (check c (nil? (parse-long "1٣")))
+        (checks-result c))))

@@ -1,0 +1,48 @@
+;; spec:   stdlib §4.8 (row digit?), plan §6 L10b, C-21
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: digit?
+;; `(char/digit? c)` is true for the ASCII digits `0` to `9` and for nothing else: what the
+;; compiler's tokenizer needs. It is NOT Java's `Character/isDigit`, which is true for every
+;; Unicode decimal digit (tranche 4, module `Character`), so the Arabic-Indic digit U+0663, the
+;; fullwidth U+FF13 and the superscript two U+00B2 (not a decimal digit at all) are all false here.
+;; The characters just outside the range, `/` (U+002F) and `:` (U+003A), and the letters that
+;; spell numbers in other bases, are false; the ten digits are true, each tested by value.
+(ns main (:use fib.core tl.check) (:require [fib.char :as char]))
+
+;; how many of the characters with codes from lo up to and including hi are digits
+(defun digits-between (lo: i64 hi: i64) -> i64
+  (loop ((n lo) (k 0))
+    (if (<= n hi)
+        (recur (+ n 1) (if (char/digit? (i32->char (trunc i32 n))) (+ k 1) k))
+        k)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (char/digit? \0))
+        (check c (char/digit? \1))
+        (check c (char/digit? \2))
+        (check c (char/digit? \3))
+        (check c (char/digit? \4))
+        (check c (char/digit? \5))
+        (check c (char/digit? \6))
+        (check c (char/digit? \7))
+        (check c (char/digit? \8))
+        (check c (char/digit? \9))
+        (check c (not (char/digit? \/)))
+        (check c (not (char/digit? \:)))
+        (check c (not (char/digit? \a)))
+        (check c (not (char/digit? \F)))
+        (check c (not (char/digit? \space)))
+        (check c (not (char/digit? \-)))
+        (check c (not (char/digit? \u{b2})))
+        (check c (not (char/digit? \u{663})))
+        (check c (not (char/digit? \u{ff13})))
+        (check c (not (char/digit? \u{1d7d8})))
+        (check c (= (digits-between 0 127) 10))
+        (check c (= (digits-between 128 2047) 0))
+        (check c (= (digits-between 48 57) 10))
+        (check c (= (digits-between 49 56) 8))
+        (checks-result c))))

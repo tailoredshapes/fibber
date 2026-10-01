@@ -1,0 +1,68 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Vec), types §2.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; 840 and 841 fill the trie with i64, the width of a word. The arrays under a Vec
+;; have the width of the element, so the compiled tail, leaf and path copies are
+;; written once for each width: a copy that moves 8 bytes for a 1-byte element, or
+;; reads past the end of a 2-byte one, shows only here. The element types are i8,
+;; i16, i32, i64, f32, f64, bool and char; each is grown by conj from empty
+;; through the counts 0 1 31 32 33 1056 1057 1089 1100 with a snapshot at each
+;; (every older version shared), built again alone at 33 and 1057 (every object
+;; unique), and every element of every version is compared with the function that
+;; made it, after all the growth. The element at index i comes from a function of
+;; i alone; neighbours differ for every type but bool, which has two values. The
+;; fault planted: the comparison reads the maker's value for the next index.
+(ns main (:use tl.check))
+
+(defun mk-i8 (i: i64) -> i8 (trunc i8 (+ (* i 37) 11)))
+(defun mk-i16 (i: i64) -> i16 (trunc i16 (+ (* i 977) 5)))
+(defun mk-i32 (i: i64) -> i32 (trunc i32 (+ (* i 1000003) 7)))
+(defun mk-i64 (i: i64) -> i64 (+ (* i 7919) 13))
+(defun mk-f32 (i: i64) -> f32 (* (sitofp f32 (rem (* i 37) 1000)) 0.5f32))
+(defun mk-f64 (i: i64) -> f64 (* (sitofp f64 i) 0.25))
+(defun mk-bool (i: i64) -> bool (= (rem (* i 7) 3) 0))
+(defun mk-char (i: i64) -> char (i32->char (trunc i32 (+ 65 (rem (* i 7) 1000)))))
+
+;; v grown by conj to n elements
+(defun extend (v: (Vec t) n: i64 mk: (fn (i64) t)) -> (Vec t)
+  (loop ((w v))
+    (if (< (count w) n) (recur (conj w (mk (count w)))) w)))
+
+;; every element is mk's at (index + skew)
+(defun elems-ok (v: (Vec t) n: i64 mk: (fn (i64) t) skew: i64) :where ((Eq t)) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (= (nth v i) (mk (+ i skew))) (recur (+ i 1)) false) true))))
+
+;; the growth through the counts, then every snapshot, then two builds alone
+(defun width-ok (mk: (fn (i64) t) skew: i64) :where ((Eq t)) -> bool
+  (let ((counts [0 1 31 32 33 1056 1057 1089 1100])
+        (snaps (loop ((j 0) (v (vec-empty)) (acc (vec-empty)))
+                 (if (< j 9)
+                     (let ((g (extend v (nth counts j) mk))) (recur (+ j 1) g (conj acc g)))
+                     acc))))
+    (and (loop ((j 0)) (if (< j 9) (if (elems-ok (nth snaps j) (nth counts j) mk skew) (recur (+ j 1)) false) true))
+         (and (elems-ok (extend (vec-empty) 33 mk) 33 mk skew)
+              (elems-ok (extend (vec-empty) 1057 mk) 1057 mk skew)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (p3 (checks)))
+    (do (check c (width-ok mk-i8 0))
+        (check c (width-ok mk-i16 0))
+        (check c (width-ok mk-i32 0))
+        (check c (width-ok mk-i64 0))
+        (check c (width-ok mk-f32 0))
+        (check c (width-ok mk-f64 0))
+        (check c (width-ok mk-bool 0))
+        (check c (width-ok mk-char 0))
+        (check p1 (width-ok mk-i8 1))
+        (check p2 (width-ok mk-f64 1))
+        (check p3 (width-ok mk-char 1))
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

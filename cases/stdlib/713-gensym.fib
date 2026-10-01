@@ -1,0 +1,70 @@
+;; spec:   stdlib §4.3 (row gensym), syntax §3.16
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: gensym
+;; (gensym prefix) makes a fresh symbol at expansion time, the one way a
+;; macro keeps its own binders from the caller's names (syntax §3.16: there
+;; is no automatic hygiene, **Decided**), in the one-argument form that
+;; runs today (the zero-argument clause is L1, case 725). The row of the
+;; table writes the signature `str -> str`; the builtin is `(fn (str)
+;; Form)` (types/builtins.rs) and syntax §3.16 says a `Sym`: this case
+;; pins the code's and syntax's answer, and the row needs correcting.
+;;  * it is a `Sym` form, and its name has the prefix in it;
+;;  * two calls with one prefix make two different symbols, so a macro with
+;;    two temporaries of one prefix has two binders, not one;
+;;  * a macro that binds a name of its own captures the caller's variable
+;;    of that name (`add-ten-bare`: 20), and one that binds a gensym does
+;;    not (`add-ten`: 11, and 51 against 11 for the second binder of
+;;    `first-then-second` when the caller passes its own `t1`).
+(ns main (:use tl.check))
+
+;; the binder is a name of the macro's own: the caller's x is captured
+(defmacro add-ten-bare (e)
+  `(let ((x 10)) (+ x ,e)))
+
+;; the binder is a gensym: the caller's x is the caller's
+(defmacro add-ten (e)
+  (let ((t (gensym "x")))
+    `(let ((,t 10)) (+ ,t ,e))))
+
+;; two temporaries of one prefix are two binders
+(defmacro first-then-second (a b)
+  (let ((t1 (gensym "t")) (t2 (gensym "t")))
+    `(let ((,t1 ,a) (,t2 ,b)) (+ ,t1 (* 10 ,t2)))))
+
+;; what a gensym is: a Sym, with the prefix in its name, new each time
+(defmacro is-sym-with-prefix ()
+  (match (gensym "tmp")
+    ((Sym s) (match (str-find s "tmp" 0) ((some _) '1) (nil '0)))
+    (_ '0)))
+
+(defmacro two-differ ()
+  (let ((a (match (gensym "g") ((Sym s) s) (_ "")))
+        (b (match (gensym "g") ((Sym s) s) (_ ""))))
+    (if (= a b) '0 '1)))
+
+(defmacro other-prefix-differs ()
+  (let ((a (match (gensym "p") ((Sym s) s) (_ "")))
+        (b (match (gensym "q") ((Sym s) s) (_ ""))))
+    (if (= a b) '0 '1)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (x 1)
+        (t1 5))
+    (do
+      (check c (= (is-sym-with-prefix) 1))
+      (check c (= (two-differ) 1))
+      (check c (= (other-prefix-differs) 1))
+      ;; without a gensym the macro's x is the caller's x: (let ((x 10)) (+ x x))
+      (check c (= (add-ten-bare x) 20))
+      ;; with one, the caller's x is the caller's: 10 + 1
+      (check c (= (add-ten x) 11))
+      ;; two binders: 1 + 10 * 2, not 2 + 10 * 2 (one binder bound twice)
+      (check c (= (first-then-second 1 2) 21))
+      ;; the second operand is evaluated inside the first binder's scope,
+      ;; and still sees the caller's t1: 1 + 10 * 5
+      (check c (= (first-then-second 1 t1) 51))
+      (checks-result c))))

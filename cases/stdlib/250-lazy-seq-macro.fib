@@ -1,0 +1,52 @@
+;; spec:   stdlib §4.4 row lazy-seq, §2.1 rule 2, §6.3 (a macro in fibber that names its facade)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: lazy-seq map take
+;; (lazy-seq body ..) delays the body into a node realised once, so the
+;; body runs at the first demand and never again; several forms run in
+;; order and the last is the seq. The recursive idiom works: a seq that
+;; makes its own tail with lazy-seq is infinite and costs a node per
+;; element asked for, and take ends it. The macro's template names the
+;; facade, so a program that defines its own `lazy-from` (this one does,
+;; for integers) is not captured: the expansion still reaches the library's.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+;; a name the macro's template uses, defined here for something else
+(defun lazy-from (x: i64) -> i64 (+ x 1000))
+
+;; n, n+1, ..: infinite
+(defun from (n: i64 made: (Cell i64)) -> (LSeq i64)
+  (lazy-seq (do (set! made (+ @made 1)) (lcons n (from (+ n 1) made)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (runs (cell 0))
+        (made (cell 0)))
+    (do ;; the body runs once, at the first demand
+        (let ((z (lazy-seq (set! runs (+ @runs 1)) [1 2 3])))
+          (do (check c (= @runs 0))
+              (check c (= (count z) 3))
+              (check c (= @runs 1))
+              (check c (= (digits z) 123))
+              (check c (= @runs 1))))
+        ;; an infinite seq, taken
+        (let ((nats (from 0 made)))
+          (do (check c (= @made 0))
+              (check c (= (digits (take 4 nats)) 123))
+              (check c (= @made 4))
+              (check c (= (digits (take 4 nats)) 123))
+              (check c (= @made 4))
+              (check c (= (digits (take 6 (map (fn (x: i64) (+ x 1)) nats))) 123456))
+              (check c (= @made 6))))
+        ;; lazy-seq of a source that is not a seq is that source's seq
+        (check c (= (count (lazy-seq (some 5))) 1))
+        (check c (= (count (lazy-seq (take 0 [1 2]))) 0))
+        (check c (= (digits (lazy-seq (lazy-seq [4 5]))) 45))
+        (check c (= (lazy-from 1) 1001))
+        (checks-result c))))

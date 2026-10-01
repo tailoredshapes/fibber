@@ -1,0 +1,37 @@
+;; spec:   stdlib §4.15 (row pmap), §2.11 (Concurrency)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: pmap
+;; pmap is the prelude's, eager, one task per element: the results come back in the order of the
+;; source, whichever task finishes first (the first element here does the most work), the result
+;; type may differ from the element type, a closure may capture a scalar, and the empty Vec gives the
+;; empty Vec. A source that is not a Vec (Reducible) is tranche 5.
+(ns main (:use fib.core tl.check))
+
+(defun busy (n: i64) -> i64
+  (loop ((i 0) (acc 0)) (if (< i n) (recur (+ i 1) (+ acc 1)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (k 100)
+        (empty: (Vec i64) []))
+    (let ((sq (pmap (fn (x) (* x x)) [1 2 3 4 5 6 7 8 9 10]))
+          (late (pmap (fn (x) (+ (busy (* 20000 (- 5 x))) x)) [1 2 3 4]))
+          (txt (pmap (fn (x) (str-concat "n" (show x))) [7 8 9]))
+          (plus (pmap (fn (x) (+ x k)) [1 2 3]))
+          (none (pmap (fn (x) (+ x 1)) empty)))
+      (do (check c (= (count sq) 10))
+          (check c (= (nth sq 0) 1))
+          (check c (= (nth sq 3) 16))
+          (check c (= (nth sq 9) 100))
+          (check c (= (nth late 0) 80001))
+          (check c (= (nth late 1) 60002))
+          (check c (= (nth late 2) 40003))
+          (check c (= (nth late 3) 20004))
+          (check c (= (nth txt 0) "n7"))
+          (check c (= (nth txt 2) "n9"))
+          (check c (= (nth plus 1) 102))
+          (check c (= (count none) 0))
+          (checks-result c)))))

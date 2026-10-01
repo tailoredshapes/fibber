@@ -1,4 +1,35 @@
-;; owner: L6. fib.seq.lazy: the lazy-seq form. Exports: lazy-seq (macro, templates name the facade fib.seq/), lazy-from lfirst lrest realized?.
-;; Until L6 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.seq.lazy (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
+;; fib.seq.lazy: the lazy-seq form and the three reads of a lazy seq (stdlib §2.1 rule 2, §4.4 row lazy-seq;
+;; tranche 1 plan §4.2, owner L6). Exports lazy-seq (a macro), lazy-from, lfirst, lrest and realized?.
+;; The type, its node and `lnode` (realise once) are P0's, in fib.seq.types.
+;;
+;; (lazy-seq body ..) delays the body, which is any Reducible, into an (LSeq e) node realised once, as
+;; Clojure's does; the body runs when the node is first demanded and never again. The template names the
+;; facade (fib.seq/lazy-from), never this part, so it expands in a module that :uses fib.seq and, after
+;; the flip, in any module (plan §4.3 rule 5). A fibber macro costs 80 to 95 ms under fibc per program that
+;; uses it (stdlib §6.3), which a program that does not use lazy-seq does not pay (plan §6 L6, probe mu).
+;; Decided here, where the page is silent:
+;;  - at least one body form, as the macro's parameters say; the forms run in order and the last is the
+;;    seq (Clojure's (lazy-seq) of nothing is the empty seq, which has no element type here).
+;;  - lazy-from of a Reducible that is not an LSeq converts it through to-lseq when the node is demanded;
+;;    of an LSeq it is the same seq, so (lazy-seq (lcons 1 (lazy-seq ..))) costs one node per element.
+;;  - lrest of the empty seq is the empty seq (Clojure's rest); lfirst of it is nil.
+(ns fib.seq.lazy (:use fib.seq.types fib.seq.protocols))
+
+(defmacro lazy-seq (body ... more)
+  `(fib.seq/lazy-from (fn () (do ,body ,@more))))
+
+;; the seq of whatever the thunk returns, made when the node is first demanded
+(defun lazy-from (thunk: (fn () c)) :where ((Reducible c e)) -> (LSeq e)
+  (lazy-node (fn () (lnode (to-lseq (thunk))))))
+
+;; the first element, or nil for the empty seq
+(defun lfirst (s: (LSeq a)) -> (Option a)
+  (match (lnode s) ((LNil) nil) ((LCons h _) (some h))))
+
+;; everything after the first element; the empty seq's rest is itself
+(defun lrest (s: (LSeq a)) -> (LSeq a)
+  (match (lnode s) ((LNil) s) ((LCons _ t) t)))
+
+;; whether the node has been computed already
+(defun realized? (s: (LSeq a)) -> bool
+  (match @(. s box) ((Ready _) true) (_ false)))

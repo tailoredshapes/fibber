@@ -1,0 +1,37 @@
+;; spec:   stdlib §2.1 rule 2 (a node is realised once), rule 8 (rest of an LSeq is an LSeq), §4.4 (rows seq, rest, next)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: seq rest next
+;; On a lazy seq `seq` realises its first node and no other, `rest` does the
+;; same and hands back the unrealised tail, `next` is (seq (rest s)) and so
+;; realises two, and asking again for what is realised runs nothing: each
+;; node's thunk counts itself in `hits`, so the case sees exactly how far
+;; the seq was driven. The seq is infinite (the naturals from n), so a
+;; function that walked it all would never return.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun naturals (n: i64 hits: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! hits (+ @hits 1)) (LCons n (naturals (+ n 1) hits))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (hits (cell 0))
+        (s (naturals 10 hits)))
+    (do (check c (= @hits 0))
+        (check c (match (seq s) (nil false) ((some t) (= (nth t 0) 10))))
+        (check c (= @hits 1))
+        (check c (match (seq s) (nil false) ((some _) true)))
+        (check c (= @hits 1))
+        (let ((r (rest s)))
+          (do (check c (= @hits 1))
+              (check c (match (seq r) (nil false) ((some t) (= (nth t 0) 11))))
+              (check c (= @hits 2))
+              (check c (match (next s) (nil false) ((some t) (= (nth t 0) 11))))
+              (check c (= @hits 2))
+              (check c (match (next r) (nil false) ((some t) (= (nth t 0) 12))))
+              (check c (= @hits 3))
+              (check c (match (seq (rest (rest r))) (nil false) ((some t) (= (nth t 0) 13))))
+              (check c (= @hits 4))))
+        (checks-result c))))

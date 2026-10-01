@@ -1,4 +1,95 @@
-;; owner: L10a. fib.seq.chars: str as a Reducible of its characters. Exports: Chars; Reducible char for Chars and for str.
-;; Until L10a writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.seq.chars (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
+;; fib.seq.chars: a str is a Reducible of its characters, and Chars is the explicit view of it
+;; (stdlib §2.1 rule 1, §2.9; tranche 1 plan §4.2; owner L10a). Exports: Chars; Reducible char for
+;; Chars and for str. `str/chars` (L10b) is `(Chars s)`.
+;; Replaces the prelude's str-chars, which builds a (Vec char) with a conj per character (2095 objects
+;; for 1000 characters), and the prelude's Countable str, which counts bytes (M deletes it).
+;; Decided here, where the page is silent:
+;;  - the unit is the Unicode scalar (§5 T10): (count "aé€😀z") is 5 and (str-len "aé€😀z") is 11.
+;;  - the decoder reads the string through str-byte-at, which allocates nothing: a walk costs no
+;;    array (the page's sketch hoisted one str-bytes copy out of the loop; str-byte-at, row L18, makes
+;;    that copy unnecessary), and size, nth and last override the defaults so that they allocate no
+;;    cells (last allocates the one (Option char) it returns). All of them are O(n); the ASCII flag
+;;    that makes them O(1) is C10.
+;;  - the text of a str is valid UTF-8 (str-from-bytes checks it), so the decoder trusts the lead byte
+;;    for the width and the continuation bytes for the bits; i32->char cannot trap here.
+;;  - Chars holds the str and delegates every method to the str instance, so there is one decoder.
+;;  - nth traps `nth: index out of range`, the Reducible default's message.
+(ns fib.seq.chars (:use fib.seq.protocols))
+
+(defstruct Chars (s: str))
+
+;; the width of the character that the lead byte b starts; bytes are i8, so 0x80 to 0xFF are negative.
+;; (the same three lines are fib.core.text's: a private helper cannot be shared between two parts)
+(defun lead-width :private (b: i8) -> i64
+  (if (>= b 0i8) 1 (if (< b -32i8) 2 (if (< b -16i8) 3 4))))
+
+;; the six low bits of the continuation byte at j
+(defun low-bits :private (s: str j: i64) -> i32
+  (bit-and (zext i32 (str-byte-at s j)) 63i32))
+
+;; the scalar of w bytes at byte i, whose lead byte is b
+(defun scalar-at :private (s: str i: i64 b: i8 w: i64) -> char
+  (let ((lead (zext i32 b)))
+    (i32->char
+      (if (= w 1)
+          lead
+          (if (= w 2)
+              (bit-or (shl (bit-and lead 31i32) 6i32) (low-bits s (+ i 1)))
+              (if (= w 3)
+                  (bit-or (shl (bit-and lead 15i32) 12i32)
+                          (bit-or (shl (low-bits s (+ i 1)) 6i32) (low-bits s (+ i 2))))
+                  (bit-or (shl (bit-and lead 7i32) 18i32)
+                          (bit-or (shl (low-bits s (+ i 1)) 12i32)
+                                  (bit-or (shl (low-bits s (+ i 2)) 6i32) (low-bits s (+ i 3)))))))))))
+
+;; each-while: the characters in order; false from k stops the walk, and the result says whether it ran to the end
+(defun walk :private (s: str k: (fn (char) bool) :borrow) -> bool
+  (let ((n (str-len s)))
+    (loop ((i 0))
+      (if (< i n)
+          (let ((b (str-byte-at s i))
+                (w (lead-width b)))
+            (if (k (scalar-at s i b w)) (recur (+ i w)) false))
+          true))))
+
+;; size: one hop per character, no allocation
+(defun scalars :private (s: str) -> i64
+  (let ((n (str-len s)))
+    (loop ((i 0) (c 0))
+      (if (< i n) (recur (+ i (lead-width (str-byte-at s i))) (+ c 1)) c))))
+
+;; the byte offset of the character at index i, -1 when i is not the index of a character: negative
+;; (answered before anything is counted down, so the least i64 cannot overflow) or past the last one
+(defun start-of :private (s: str i: i64) -> i64
+  (let ((n (str-len s)))
+    (loop ((p 0) (left i))
+      (if (or (< left 0) (>= p n))
+          -1
+          (if (= left 0) p (recur (+ p (lead-width (str-byte-at s p))) (- left 1)))))))
+
+;; nth: the character at index i, or the trap of the Reducible default
+(defun scalar-nth :private (s: str i: i64) -> char
+  (let ((p (start-of s i)))
+    (if (< p 0)
+        (trap "nth: index out of range")
+        (let ((b (str-byte-at s p))) (scalar-at s p b (lead-width b))))))
+
+;; the last character starts at the last byte that is not a continuation byte (0x80 to 0xBF)
+(defun scalar-last :private (s: str) -> (Option char)
+  (let ((n (str-len s)))
+    (if (= n 0)
+        nil
+        (let ((p (loop ((j (- n 1))) (if (< (str-byte-at s j) -64i8) (recur (- j 1)) j))))
+          (let ((b (str-byte-at s p))) (some (scalar-at s p b (lead-width b))))))))
+
+(impl (Reducible char) str
+  (each-while (self k) (walk self k))
+  (size (self) (scalars self))
+  (nth (self i) (scalar-nth self i))
+  (last (self) (scalar-last self)))
+
+(impl (Reducible char) Chars
+  (each-while (self k) (each-while (. self s) k))
+  (size (self) (size (. self s)))
+  (nth (self i) (nth (. self s) i))
+  (last (self) (last (. self s))))

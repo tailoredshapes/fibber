@@ -1,0 +1,57 @@
+;; fib.string.utf8: the byte layer of the string functions (owner L10b; tranche 1 plan §4.2, §6 L10b).
+;; Not exported by the facade `fib.string`: its parts `:use` it and the program never sees it, so it
+;; adds no name to the interface of §4.7. A `str` is UTF-8 and the functions of `str/` count
+;; characters (stdlib §2.9), so each of them is a walk over bytes that never copies the string:
+;; `str-bytes` allocates an array per call (spec §2.9), `str-byte-at` allocates nothing.
+;; Every offset here is a byte offset between two characters (the start of one or the length),
+;; because a `str` is valid UTF-8 and a lead byte says how wide its character is.
+;; Replaces the prelude's `utf8-len`/`utf8-code`, which are private there and work on an array.
+(ns fib.string.utf8)
+
+;; byte i of s as 0..255 (`str-byte-at` gives an i8; zext does not sign-extend)
+(defun byte-at (s: str i: i64) -> i32 (zext i32 (str-byte-at s i)))
+
+;; whether byte b is a continuation byte, 10xxxxxx: it starts no character
+(defun continuation? (b: i32) -> bool (= (bit-and b 192i32) 128i32))
+
+;; how many bytes the character with lead byte `lead` takes
+(defun width-of (lead: i32) -> i64
+  (if (< lead 128i32) 1 (if (< lead 224i32) 2 (if (< lead 240i32) 3 4))))
+
+;; the scalar value of the character that starts at byte i of s
+(defun code-at (s: str i: i64) -> i32
+  (let ((b (byte-at s i))
+        (w (width-of (byte-at s i))))
+    (if (= w 1)
+        b
+        (let ((c1 (bit-and (byte-at s (+ i 1)) 63i32)))
+          (if (= w 2)
+              (bit-or (shl (bit-and b 31i32) 6i32) c1)
+              (let ((c2 (bit-and (byte-at s (+ i 2)) 63i32)))
+                (if (= w 3)
+                    (bit-or (shl (bit-and b 15i32) 12i32) (bit-or (shl c1 6i32) c2))
+                    (let ((c3 (bit-and (byte-at s (+ i 3)) 63i32)))
+                      (bit-or (shl (bit-and b 7i32) 18i32)
+                              (bit-or (shl c1 12i32) (bit-or (shl c2 6i32) c3)))))))))))
+
+;; the offset where the character that ends at byte i starts; 0 < i <= (str-len s)
+(defun start-before (s: str i: i64) -> i64
+  (loop ((j (- i 1)))
+    (if (> j 0)
+        (if (continuation? (byte-at s j)) (recur (- j 1)) j)
+        j)))
+
+;; how many characters lie in bytes [0, end)
+(defun scalars-before (s: str end: i64) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i end)
+        (recur (+ i 1) (if (continuation? (byte-at s i)) n (+ n 1)))
+        n)))
+
+;; the byte offset reached by skipping n characters from the start, at most the length
+(defun offset-after (s: str n: i64) -> i64
+  (let ((len (str-len s)))
+    (loop ((i 0) (k 0))
+      (if (< k n)
+          (if (< i len) (recur (+ i (width-of (byte-at s i))) (+ k 1)) i)
+          i))))

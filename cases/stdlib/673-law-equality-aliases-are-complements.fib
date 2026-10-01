@@ -1,0 +1,40 @@
+;; spec:   stdlib §4.1 (rows == and not=), types §2.12 (Eq)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: == not=
+;; == is the builtin equality and not= its complement, on integers and on text, over a small
+;; domain so that equal pairs are common: == agrees with a reference that does not use it (the
+;; difference of two integers is zero, str-eq for text), not= is exactly not ==, == is reflexive
+;; and symmetric, and transitive on the triples that make it applicable. 300 seeded draws. The
+;; last checks plant a fault for each of the two types, the aliases swapped against the reference,
+;; and require that each be caught.
+(ns main (:use fib.core tl.rng tl.check))
+
+(def SEED: i64 673)
+
+(defun text-of (n: i64) -> str (str-concat "k" (show n)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (ps (checks))
+        (r (rng SEED)))
+    (do (dotimes (i 300)
+          (let ((a (rng-below r 4))
+                (b (rng-below r 4))
+                (d (rng-below r 4)))
+            (do (check c (= (== a b) (= (- a b) 0)))
+                (check c (= (not= a b) (not (= (- a b) 0))))
+                (check c (= (not= a b) (not (== a b))))
+                (check c (== a a))
+                (check c (= (== a b) (== b a)))
+                (check c (if (and (== a b) (== b d)) (== a d) true))
+                (check c (= (== (text-of a) (text-of b)) (str-eq (text-of a) (text-of b))))
+                (check c (= (not= (text-of a) (text-of b)) (not (str-eq (text-of a) (text-of b)))))
+                (check p (= (not= a b) (= (- a b) 0)))
+                (check ps (= (== (text-of a) (text-of b)) (not (str-eq (text-of a) (text-of b))))))))
+        (check-detects c p)
+        (check-detects c ps)
+        (checks-result c))))

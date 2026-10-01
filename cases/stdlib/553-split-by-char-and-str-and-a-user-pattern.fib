@@ -1,0 +1,62 @@
+;; spec:   stdlib §2.3 (row Pattern p), §2.9, §4.7 (rows clojure.string/split, str/split-limit), plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: clojure.string/split str/split-limit
+;; The pattern of a split is a `Pattern`, and tranche 1 has two instances, a `str` and a `char`,
+;; matched literally (the page's `Regex` is tranche 4). A `char` cuts like the string of its one
+;; character, a multi-byte one included. The protocol is open: a user type that answers `find-in`
+;; (the byte offsets of its first match at or after `from`) gets `str/split`, `str/split-limit` and
+;; `str/index-of` from the default `split-by` and the library's walk, as a user type gets every
+;; adaptor from one `each-while`. `Digits` finds the longest run of ASCII digits, which is Java's
+;; `\d+`; Java's `split` of the same texts, JDK 27, gives the expected values below
+;; ("a12b3c" cut at `\d+` is [a b c], "12ab" is ["" "ab"], "a12b3" with limit -1 is [a b ""]).
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+(defun same? (v: (Vec str) w: (Vec str)) -> bool
+  (if (= (fib.prelude/vec-count v) (fib.prelude/vec-count w))
+      (loop ((i 0))
+        (if (< i (fib.prelude/vec-count v))
+            (if (= (fib.prelude/vec-nth v i) (fib.prelude/vec-nth w i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defenum Digits (DigitRun))
+
+(defun digit-at? (s: str i: i64) -> bool
+  (let ((b (str-byte-at s i))) (and (>= b 48i8) (<= b 57i8))))
+
+(impl str/Pattern Digits
+  (find-in (self s from)
+    (let ((len (str-len s))
+          (st (loop ((i from)) (if (< i len) (if (digit-at? s i) i (recur (+ i 1))) -1))))
+      (if (< st 0)
+          nil
+          (some (Pair st (loop ((j st)) (if (and (< j len) (digit-at? s j)) (recur (+ j 1)) j))))))))
+
+(defun first-offsets (m: (Option (Pair i64 i64))) -> i64
+  (match m (nil -1) ((some p) (+ (* 100 (. p fst)) (. p snd)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (same? (str/split "a,b,,c" \,) ["a" "b" "" "c"]))
+        (check c (same? (str/split "a,b,,c,," \,) ["a" "b" "" "c"]))
+        (check c (same? (str/split "aébéc" \é) ["a" "b" "c"]))
+        (check c (same? (str/split "😀a😀😀b" \😀) ["" "a" "" "b"]))
+        (check c (same? (str/split-limit "a,b,c,d" \, 2) ["a" "b,c,d"]))
+        (check c (same? (str/split-limit "a,b,c,," \, -1) ["a" "b" "c" "" ""]))
+        (check c (same? (str/split "a12b3c" DigitRun) ["a" "b" "c"]))
+        (check c (same? (str/split "12ab" DigitRun) ["" "ab"]))
+        (check c (same? (str/split "ab12" DigitRun) ["ab"]))
+        (check c (same? (str/split "abc" DigitRun) ["abc"]))
+        (check c (same? (str/split-limit "a12b3c" DigitRun 2) ["a" "b3c"]))
+        (check c (same? (str/split-limit "a12b3" DigitRun -1) ["a" "b" ""]))
+        (check c (same? (str/split "é7é89é" DigitRun) ["é" "é" "é"]))
+        (check c (= (first-offsets (str/find-in "ll" "hello" 0)) 204))
+        (check c (= (first-offsets (str/find-in "ll" "hello" 3)) -1))
+        (check c (= (first-offsets (str/find-in \l "hello" 3)) 304))
+        (check c (= (first-offsets (str/find-in "" "hello" 5)) 505))
+        (check c (= (first-offsets (str/find-in DigitRun "ab123c" 0)) 205))
+        (check c (= (first-offsets (str/find-in DigitRun "ab123c" 4)) 405))
+        (checks-result c))))

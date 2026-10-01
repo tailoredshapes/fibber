@@ -1,0 +1,52 @@
+;; spec:   stdlib §4.3 (rows nil?, some?), §2.4, §5 T1
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: nil? some?
+;; `nil?` and `some?` are the prelude's, kept as they are (syntax §4.5); this
+;; is their judge. nil? is true of nil and of nothing else, some? of a `some`,
+;; so a `some` holding 0, false, "" or an empty Vec is present: the test is
+;; about the Option, never about its payload (Clojure's `(some? false)` is
+;; true). An Option of an Option keeps `(some nil)` apart from nil, so a
+;; lookup that finds a key bound to nil is not a miss (stdlib §5 T1). The same
+;; with an Option of a scalar Option is case 118, which fibc gets wrong today.
+(ns main (:use fib.core tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Option i64) nil)
+        (no-str: (Option str) nil)
+        (no-vec: (Option (Vec i64)) nil)
+        (no-pt: (Option Pt) nil)
+        (hole: (Option (Option str)) (some nil))
+        (absent: (Option (Option str)) nil))
+    (do
+      ;; nil
+      (check c (nil? none))
+      (check c (not (some? none)))
+      (check c (nil? no-str))
+      (check c (nil? no-vec))
+      (check c (nil? no-pt))
+      ;; a some, whatever it holds
+      (check c (some? (some 0)))
+      (check c (not (nil? (some 0))))
+      (check c (some? (some false)))
+      (check c (not (nil? (some false))))
+      (check c (some? (some "")))
+      (check c (some? (some 0.0)))
+      (check c (some? (some (vec-empty))))
+      (check c (some? (some (Pt 1 2))))
+      (check c (not (nil? (some "x"))))
+      ;; an Option in an Option
+      (check c (some? hole))
+      (check c (not (nil? hole)))
+      (check c (nil? absent))
+      (check c (not (some? absent)))
+      ;; exactly one of the two holds
+      (check c (not (= (nil? none) (some? none))))
+      (check c (not (= (nil? (some 1)) (some? (some 1)))))
+      (check c (not (= (nil? hole) (some? hole))))
+      (checks-result c))))

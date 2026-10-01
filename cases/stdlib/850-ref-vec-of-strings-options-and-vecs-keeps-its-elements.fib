@@ -1,0 +1,81 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Vec), types §2.13, ownership §5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; 840 and 841 hold integers, which are copied. A Vec of objects keeps a count
+;; on every element it holds, in the tail array, in the leaf arrays and in the
+;; branches above them, and a conj that copies a tail or a path must retain
+;; each element it copies and release nothing it did not take: a mistake is a
+;; use after free or a double free (the audit fails the case) or an element
+;; that reads back as another. Three element types: strings, an Option of a
+;; struct with a string field (nil every third element), and Vecs of integers
+;; (so the trie holds tries). Each is built twice up to 1100 elements, once
+;; alone (everything unique) and once as one Vec grown through the counts
+;; 31 32 33 1056 1057 1100 with a snapshot at each (everything shared), and
+;; every element of every version is compared with the formula that made it
+;; after all the growth. The fault planted: the formula for a string off by
+;; one element.
+(ns main (:use tl.check))
+
+(defstruct Tag (name: str n: i64))
+
+(defun str-of (i: i64) -> str (str-concat "item-" (show (* i 13))))
+
+(defun opt-of (i: i64) -> (Option Tag) (if (= (rem i 3) 0) nil (some (Tag (str-of i) i))))
+
+;; the i-th inner Vec has (i mod 40) + 1 elements: i * 100, i * 100 + 1, ..
+(defun inner-of (i: i64) -> (Vec i64)
+  (loop ((k 0) (v (vec-empty)))
+    (if (<= k (rem i 40)) (recur (+ k 1) (conj v (+ (* i 100) k))) v)))
+
+(defun strs-from (v: (Vec str) n: i64) -> (Vec str)
+  (loop ((w v)) (if (< (count w) n) (recur (conj w (str-of (count w)))) w)))
+
+(defun opts-from (v: (Vec (Option Tag)) n: i64) -> (Vec (Option Tag))
+  (loop ((w v)) (if (< (count w) n) (recur (conj w (opt-of (count w)))) w)))
+
+(defun vecs-from (v: (Vec (Vec i64)) n: i64) -> (Vec (Vec i64))
+  (loop ((w v)) (if (< (count w) n) (recur (conj w (inner-of (count w)))) w)))
+
+;; shift 0 is the truth; shift 1 compares each element with the next one's formula
+(defun strs-ok (v: (Vec str) n: i64 shift: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (= (nth v i) (str-of (+ i shift))) (recur (+ i 1)) false) true))))
+
+(defun opt-ok (o: (Option Tag) i: i64) -> bool
+  (match o
+    (nil (= (rem i 3) 0))
+    ((some t) (and (!= (rem i 3) 0) (and (= (. t n) i) (= (. t name) (str-of i)))))))
+
+(defun opts-ok (v: (Vec (Option Tag)) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (opt-ok (nth v i) i) (recur (+ i 1)) false) true))))
+
+(defun inner-ok (w: (Vec i64) i: i64) -> bool
+  (and (= (count w) (+ (rem i 40) 1))
+       (loop ((k 0)) (if (< k (count w)) (if (= (nth w k) (+ (* i 100) k)) (recur (+ k 1)) false) true))))
+
+(defun vecs-ok (v: (Vec (Vec i64)) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (inner-ok (nth v i) i) (recur (+ i 1)) false) true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (counts [31 32 33 1056 1057 1100])
+        (ss (loop ((j 0) (v (vec-empty)) (acc (vec-empty)))
+              (if (< j 6) (let ((g (strs-from v (nth counts j)))) (recur (+ j 1) g (conj acc g))) acc)))
+        (os (loop ((j 0) (v (vec-empty)) (acc (vec-empty)))
+              (if (< j 6) (let ((g (opts-from v (nth counts j)))) (recur (+ j 1) g (conj acc g))) acc)))
+        (vs (loop ((j 0) (v (vec-empty)) (acc (vec-empty)))
+              (if (< j 6) (let ((g (vecs-from v (nth counts j)))) (recur (+ j 1) g (conj acc g))) acc))))
+    (do (check c (strs-ok (strs-from (vec-empty) 1100) 1100 0))
+        (check c (opts-ok (opts-from (vec-empty) 1100) 1100))
+        (check c (vecs-ok (vecs-from (vec-empty) 1100) 1100))
+        (dotimes (j 6) (check c (strs-ok (nth ss j) (nth counts j) 0)))
+        (dotimes (j 6) (check c (opts-ok (nth os j) (nth counts j))))
+        (dotimes (j 6) (check c (vecs-ok (nth vs j) (nth counts j))))
+        (check p (strs-ok (nth ss 3) 1056 1))
+        (check-detects c p)
+        (checks-result c))))

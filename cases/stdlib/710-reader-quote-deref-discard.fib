@@ -1,0 +1,66 @@
+;; spec:   stdlib §4.2 (rows 'x, @x, #_), syntax §1.1, §1.2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: 'x @x #_
+;; Three of the reader's prefixes.
+;;  * `'x` reads as (quote x): the form, a value of type Form, not what x
+;;    names (`undefined-name` below is bound to nothing, and `(undefined-fn
+;;    1 2)` is data);
+;;  * `@x` reads as (deref x): a cell, an atom; it binds to the form that
+;;    follows and no further, so `@(. s n)` is the deref of a field read;
+;;  * `#_` reads the form after it and drops it, anywhere a form may be: in
+;;    a call, in a list, in a vector literal, between top-level
+;;    definitions, and twice in a row to drop two; the form dropped must
+;;    still be readable, but it is never checked or compiled.
+(ns main (:use tl.check))
+
+(defstruct Counter (n: (Cell i64) label: str))
+
+#_ (defun broken () -> i64 (this is not (even a) program))
+
+(defun item-count (f: Form) -> i64
+  (match f
+    ((List items) (count items))
+    ((Vec items) (count items))
+    (_ -1)))
+
+(defun sym-name (f: Form) -> str
+  (match f
+    ((Sym s) s)
+    (_ "")))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (cell-n (cell 5))
+        (k (Counter (cell 7) "k"))
+        (a (atom 3)))
+    (do
+      ;; 'x
+      (check c (= (sym-name 'undefined-name) "undefined-name"))
+      (check c (= (item-count '(undefined-fn 1 2)) 3))
+      (check c (= (item-count '[a b]) 2))
+      (check c (= (item-count '()) 0))
+      (check c (= (item-count 'a) -1))
+      (check c (= (item-count '(a (b c) d)) 3))
+      ;; @x on a cell, on a field that is a cell, on an atom
+      (check c (= @cell-n 5))
+      (set! cell-n 6)
+      (check c (= (+ @cell-n 1) 7))
+      (check c (= @(. k n) 7))
+      (set! (. k n) 8)
+      (check c (= (+ @(. k n) @cell-n) 14))
+      (check c (= @a 3))
+      (reset! a 9)
+      (check c (= @a 9))
+      ;; #_
+      (check c (= (+ 1 #_ (undefined 1 2) 2) 3))
+      (check c (= (+ 1 2 #_ 100) 3))
+      (check c (= (+ #_ (a b) 1 2) 3))
+      (check c (= (count [1 #_ 2 3]) 2))
+      (check c (= (count [9 #_ 1 #_ 2 #_ 3]) 1))
+      (check c (= (+ 1 #_ #_ (a) (b) 2) 3))
+      (check c (= (item-count '(a #_ b c)) 2))
+      (check c (= (if #_ nonsense true 1 2) 1))
+      (checks-result c))))

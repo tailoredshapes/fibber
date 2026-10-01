@@ -1,0 +1,49 @@
+;; spec:   stdlib §4.4 row mapcat, §2.1 rule 2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mapcat
+;; mapcat appends what f gives for each element, in order, whatever f gives
+;; that is a source: a Vec, an Option, a List, a lazy seq, or nothing. It is
+;; lazy: f runs for an element when the walk reaches it, so asking for the
+;; first element calls f once, and a result seq is realised once. A long run
+;; of elements for which f gives nothing is skipped without a deep stack.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+(defun head (s: (LSeq i64)) -> i64 (match (lfirst s) ((some x) x) (nil -1)))
+
+;; the numbers 0 to n-1, as a Vec
+(defun upto (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (fib.prelude/conj acc i)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (do (check c (= (digits (mapcat (fn (x: i64) [x x]) [1 2 3])) 112233))
+        (check c (= (digits (mapcat (fn (x: i64) (if (> x 1) (some x) nil)) [1 2 3])) 23))
+        (check c (= (digits (mapcat (fn (x: i64) (list x (+ x 5))) [1 2])) 1627))
+        (check c (= (digits (mapcat (fn (x: i64) (take x [7 8 9])) [0 1 2 3])) 778789))
+        (check c (= (count (mapcat (fn (x: i64) (to-lseq [x])) [1 2 3])) 3))
+        (check c (= (count (mapcat (fn (x: i64) [x]) [])) 0))
+        (check c (= (count (mapcat (fn (x: i64) (take 0 [x])) [1 2 3])) 0))
+        ;; empties at the start, in the middle and at the end
+        (check c (= (digits (mapcat (fn (x: i64) (if (= x 3) [3] [])) [1 2 3 4 5])) 3))
+        (check c (= (digits (mapcat (fn (x: i64) (if (= x 1) [] [x])) [1 2])) 2))
+        ;; two thousand elements that give nothing
+        (check c (= (count (mapcat (fn (x: i64) (take 0 [x])) (upto 2000))) 0))
+        (check c (= (count (mapcat (fn (x: i64) (if (< x 1999) [] [x x])) (upto 2000))) 2))
+        ;; lazy: the first element calls f once
+        (let ((m (mapcat (fn (x: i64) (do (set! calls (+ @calls 1)) [x x])) [4 5 6])))
+          (do (check c (= @calls 0))
+              (check c (= (head m) 4))
+              (check c (= @calls 1))
+              (check c (= (count m) 6))
+              (check c (= @calls 3))
+              (check c (= (count m) 6))
+              (check c (= @calls 3))))
+        (checks-result c))))

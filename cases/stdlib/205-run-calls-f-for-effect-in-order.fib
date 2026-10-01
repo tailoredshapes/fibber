@@ -1,0 +1,35 @@
+;; spec:   stdlib §4.4 (row run!), A10 run
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: run!
+;; (run! f c) calls f on each element in order and returns unit, whatever f
+;; returns (a unit, an i64, an Option: the result is dropped; the last line
+;; binds the result at the type unit, which the checker would refuse otherwise); on nothing it
+;; calls f never. It replaces the prelude's for-each. The page's example is
+;; (run! (fn (x) (swap! a + x)) xs) giving 6; swap! with extra arguments is
+;; R6a's, so the sum is kept in a cell here.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (total (cell 0))
+        (calls (cell 0))
+        (seen (cell (vec-empty)))
+        (none: (Option i64) nil))
+    (do (run! (fn (x) (set! total (+ @total x))) [1 2 3])
+        (check c (= @total 6))
+        (run! (fn (x) (do (set! total (+ @total x)) x)) (list 10 20))
+        (check c (= @total 36))
+        (run! (fn (x) (do (set! calls (+ @calls 1)) (if (> x 1) (some x) nil))) [1 2 3])
+        (check c (= @calls 3))
+        (run! (fn (x) (set! seen (fib.prelude/conj @seen x))) (lcons 5 (lcons 6 (lcons 7 (lazy-node (fn () LNil))))))
+        (check c (and (= (count @seen) 3) (and (= (nth @seen 0) 5) (and (= (nth @seen 1) 6) (= (nth @seen 2) 7)))))
+        (run! (fn (x) (set! calls (+ @calls 100))) none)
+        (run! (fn (x) (set! calls (+ @calls 100))) (vec-empty))
+        (check c (= @calls 3))
+        (run! (fn (x) (set! calls (+ @calls 1))) (some 9))
+        (check c (= @calls 4))
+        (let ((u: unit (run! (fn (x) x) [1])))
+          (checks-result c)))))

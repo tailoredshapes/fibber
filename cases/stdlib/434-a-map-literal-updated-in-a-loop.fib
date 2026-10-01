@@ -1,0 +1,41 @@
+;; spec:   stdlib §2.5 (a loop of assoc), §4.5 (rows update update-or get-or assoc)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: update update-or assoc get-or
+;; The idiom Clojure programs have most: a map literal as the seed of a loop
+;; that updates it. 100 passes of update on a literal's key, and a word count
+;; (update-or with the default 0) over keys 0 to 6 drawn 100 times; the
+;; counts add up to 100 and each key's count is what a plain loop counts.
+;; Persistence is the semantics here, not speed (the allocation count of such
+;; a loop is the open case 450).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun bump (x: i64) -> i64 (+ x 1))
+
+(defun count-up (m: (Map str i64) n: i64) -> (Map str i64)
+  (loop ((i 0) (m m)) (if (< i n) (recur (+ i 1) (update m "hits" bump)) m)))
+
+(defun tally (n: i64) -> (Map i64 i64)
+  (loop ((i 0) (m (empty {0 0})))
+    (if (< i n) (recur (+ i 1) (update-or m (rem (* i 3) 7) bump 0)) m)))
+
+(defun expected (k: i64 n: i64) -> i64
+  (loop ((i 0) (acc 0)) (if (< i n) (recur (+ i 1) (if (= (rem (* i 3) 7) k) (+ acc 1) acc)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (count-up {"hits" 0 "misses" 5} 100))
+        (t (tally 100)))
+    (do (check c (= (get-or m "hits" -1) 100))
+        (check c (= (get-or m "misses" -1) 5))
+        (check c (= (count m) 2))
+        (check c (= (count t) 7))
+        (check c (= (get-or t 0 0) (expected 0 100)))
+        (check c (= (get-or t 3 0) (expected 3 100)))
+        (check c (= (get-or t 6 0) (expected 6 100)))
+        (check c (= (get-or t 7 -1) -1))
+        (check c (= (+ (get-or t 0 0) (+ (get-or t 1 0) (+ (get-or t 2 0) (+ (get-or t 3 0) (+ (get-or t 4 0) (+ (get-or t 5 0) (get-or t 6 0))))))) 100))
+        (check c (= (get-or (assoc {"a" 1} "b" 2) "b" 0) 2))
+        (checks-result c))))

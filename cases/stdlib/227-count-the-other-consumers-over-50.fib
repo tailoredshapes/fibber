@@ -1,0 +1,38 @@
+;; spec:   stdlib §8.1 item 5 (count cases), §2.1 rule 3 (a consumer is a loop that allocates nothing per element)
+;; expect: accept
+;; result: 2573
+;; audit:  clean
+;; allocs: <= 6
+;; roots:  ../../lib support
+;; covers: reduce1 find-first find-map sum run! nth-or not-any? empty? last nth
+;; The consumers that keep a value or an Option while they walk allocate no
+;; more over 50 elements than over 500 (case 228 is the same program with
+;; the other size and the same bound). The objects counted are a constant:
+;; reduce1 makes two (the cell for its running value, made at the first
+;; element, and the Option it returns), find-first, find-map and last one
+;; Option each, and find-map's own function f one more for the nil it
+;; answers at element 0 (an (Option i64) is a heap object until C5, `nil`
+;; included); run!, sum, nth-or, not-any?, empty? and nth make none.
+;; last and nth are Reducible's methods, which a Vec overrides to read the
+;; end and the index directly.
+;; The Vec is a `def`, whose objects the trace leaves out.
+(ns main (:use fib.core fib.seq))
+
+(def xs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+     40 41 42 43 44 45 46 47 48 49])
+
+(defun plus (a: i64 x: i64) -> i64 (+ a x))
+
+(defun main () -> i64
+  (let ((seen (cell 0)))
+    (do (run! (fn (x) (set! seen (+ @seen 1))) xs)
+        (+ @seen
+           (+ (unwrap-or (reduce1 plus xs) 0)
+              (+ (sum xs)
+                 (+ (unwrap-or (find-first (fn (x) (> x 10)) xs) 0)
+                    (+ (unwrap-or (find-map (fn (x) (if (> x 0) (some (* x 2)) nil)) xs) 0)
+                       (+ (nth-or xs 7 -1)
+                          (+ (if (not-any? (fn (x) (< x 0)) xs) 1 0)
+                             (+ (if (empty? xs) 1000 0)
+                                (+ (unwrap-or (last xs) 0) (nth xs 3)))))))))))))

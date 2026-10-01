@@ -1,0 +1,57 @@
+;; spec:   stdlib §4.4 rows take-while drop (the predicate returns a Truthy), §2.3 (Truthy)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: take-while drop
+;; take-while stops at the first element whose predicate is false, or nil:
+;; the predicate may return a bool or an Option (Clojure's truthiness, over
+;; the two types that have a falsy value). drop skips n elements, nothing
+;; for 0 or less, everything for more than there are; it skips when the
+;; first node is demanded and not before, and the seq it gives shares the
+;; source's nodes (a source made once is not remade).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+(defun head (s: (LSeq i64)) -> i64 (match (lfirst s) ((some x) x) (nil -1)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nodes (cell 0)))
+    (do ;; take-while with a bool predicate
+        (check c (= (total (take-while (fn (x: i64) (< x 4)) [1 2 3 4 1 2])) 6))
+        (check c (= (count (take-while (fn (x: i64) (< x 4)) [9 1 2])) 0))
+        (check c (= (count (take-while (fn (x: i64) (< x 4)) [1 2])) 2))
+        (check c (= (count (take-while (fn (x: i64) true) (take 0 [1]))) 0))
+        ;; with an Option result: some continues, nil stops
+        (check c (= (total (take-while (fn (x: i64) (if (< x 3) (some x) nil)) [1 2 3 4 1])) 3))
+        (check c (= (count (take-while (fn (x: i64) (if (< x 3) (some x) nil)) [5 1])) 0))
+        ;; the node after the one that fails is not made
+        (check c (= (count (take-while (fn (x: i64) (> x 3)) (countdown 5 nodes))) 2))
+        (check c (= @nodes 3))
+        ;; drop
+        (set! nodes 0)
+        (check c (= (total (drop 2 [1 2 3 4 5])) 12))
+        (check c (= (count (drop 0 [1 2 3])) 3))
+        (check c (= (count (drop -3 [1 2 3])) 3))
+        (check c (= (count (drop 3 [1 2 3])) 0))
+        (check c (= (count (drop 99 [1 2 3])) 0))
+        (check c (= (count (drop 1 (some 4))) 0))
+        (check c (= (total (drop 1 (list 5 6 7))) 13))
+        (let ((d (drop 2 (countdown 5 nodes))))
+          (do (check c (= @nodes 0))
+              (check c (= (head d) 3))
+              (check c (= @nodes 3))
+              (check c (= (head d) 3))
+              (check c (= @nodes 3))
+              (check c (= (total d) 6))
+              (check c (= @nodes 6))))
+        (check c (= (count (drop 2 (drop 1 [1 2 3 4 5 6]))) 3))
+        (checks-result c))))

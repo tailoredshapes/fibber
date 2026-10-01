@@ -1,0 +1,26 @@
+;; spec:   stdlib §2.9 (subs by character offset is a walk), §8.1 item 2 (a tight allocs bound)
+;; expect: accept
+;; result: 10000
+;; audit:  clean
+;; allocs: <= 101
+;; roots:  ../../lib support
+;; covers: subs
+;; `subs` finds its two bounds by stepping over the bytes with `str-byte-at`,
+;; which allocates nothing, and cuts once with `str-slice`: a call costs the
+;; one string it returns. The 100 calls below cut 100 characters out of a
+;; string of 500 (so 100 objects), and the string is one more, made at run
+;; time by `str-concat` of two literals. A `subs` that built a Vec of
+;; characters to index (the prelude's `str-chars`) would cost thousands. The
+;; bound is the measured count and a test lowers it by one. Each result has
+;; 100 characters, so the sum is 100 times 100.
+(ns main (:use fib.core fib.seq))
+
+(def left: str "hw🙉乓d丕Ċq东óŕzhf😟乇乁😥g🙉r😑zzgburcĈkuy😇lszws临gpēg丬书mĮjtwækn😞z😇😝ĺ😭😬du乐乀三Ğu丳乢ued😭乙zŬjym😣丫😋b🙉Ŋ乞twċ乥y😧Ůehe😭ĭlmf乤jiqńe😕wwŻŏ丌xvlsŕfot乼İb乪qiapkfic😒rð丂fb😆亀😩三ońnīmlùnçb乣dnĩ个t乭jĬŦmb丒丈qmŗ乙😔丿丠t乩bjto😃a😫😻ugŬ乍tpzwnŬĬyf😥òŵfk丱p久iedŅ😖cs丿ôſ🙍jadsgfyeĵ😅乗ix乥pnz丞i🙁ĺæv乸řląl乲😺m😢r")
+(def right: str "udo😵gwtf乼丄gĞų丹rv丒乓wulny乮丹ŝbm😳😭cjubnuc🙋😗Űm乿fe乜ff😶etŷqĬ😺丣乳乨h😘č丫😀Ŷuk😂丁ic🙊m😻jjw丕ĉ🙂bm😝reňēsmiâc义nhŒw丫o习🙈丸😪ts😇qxhdĎ丆乑xť😧kjbs並乸ĩfyŃgyenĀ乖ź😼e乳gji😗个乡jg不丆jls丯😑一😀Ĵzipibv😁dţ乊ĤčŦqy😿tm😻qrńuv主😏e😭jàqojy😚k🙀😗g🙏乸v丗一dkwž😬jg😽😣😜qlĈ🙄丌h丒l乮qōăŴŒy😡hbkx🙋clha🙎oopbaĦk😞qŦy乘😰y不乧ph")
+
+(defun main () -> i64
+  (let ((s (str-concat left right)))
+    (loop ((i 0) (acc 0))
+      (if (< i 100)
+          (recur (+ i 1) (+ acc (count (subs s (rem i 40) (+ 100 (rem i 40))))))
+          acc))))

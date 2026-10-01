@@ -1,0 +1,80 @@
+;; spec:   stdlib §2.9 (a str is a Reducible, Lookup and Keyed of its characters), §8.1 item 2 (a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; `nth`, `last`, `to-vec`, `get`, `contains?` and the walk of a str, and of
+;; its `Chars` view, against the (Vec char) that the prelude's `str-chars`
+;; makes: 300 seeded strings of 0 to 24 scalars of every width (tl.gen), and
+;; for each one every index from 0 to the count, so that the first index past
+;; the end is tried too (`get` nil, `contains?` false). The overridden methods
+;; (`nth`, `last`) and the defaults that now stand on the str walk (`to-vec`)
+;; are all checked. One check per string. The last run plants a fault, a
+;; reference that reads the Vec one place on, in a second Checks, and
+;; `check-detects` makes the case fail if that run found nothing.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check tl.gen))
+
+;; the reference's character at index k, moved on by skew (0 is the true reference)
+(defun at (v: (Vec char) k: i64 skew: i64) -> char
+  (vec-nth v (rem (+ k skew) (vec-count v))))
+
+(defun every-index (s: str v: (Vec char) skew: i64) -> bool
+  (let ((n (vec-count v)))
+    (loop ((k 0))
+      (if (< k n)
+          (if (and (= (nth s k) (at v k skew))
+                   (and (match (get s k) ((some x) (= x (at v k skew))) (nil false))
+                        (contains? s k)))
+              (recur (+ k 1))
+              false)
+          true))))
+
+(defun last-is (s: str v: (Vec char) skew: i64) -> bool
+  (if (= (vec-count v) 0)
+      (nil? (last s))
+      (match (last s) ((some x) (= x (at v (- (vec-count v) 1) skew))) (nil false))))
+
+;; whether the Vec w has the characters of v in order
+(defun same-vec (w: (Vec char) v: (Vec char)) -> bool
+  (and (= (vec-count w) (vec-count v))
+       (loop ((k 0))
+         (if (< k (vec-count v))
+             (if (= (vec-nth w k) (vec-nth v k)) (recur (+ k 1)) false)
+             true))))
+
+(defun holds (s: str skew: i64) -> bool
+  (let ((v (str-chars s))
+        (n (vec-count (str-chars s))))
+    (and (every-index s v skew)
+     (and (every-index-chars (Chars s) v skew)
+      (and (last-is s v skew)
+       (and (same-vec (to-vec s) v)
+        (and (same-vec (to-vec (Chars s)) v)
+         (and (nil? (get s n))
+              (not (contains? s n))))))))))
+
+;; the Chars view reads the same: nth and last
+(defun every-index-chars (c: Chars v: (Vec char) skew: i64) -> bool
+  (let ((n (vec-count v)))
+    (and (loop ((k 0))
+           (if (< k n)
+               (if (= (nth c k) (at v k skew)) (recur (+ k 1)) false)
+               true))
+         (if (= n 0)
+             (nil? (last c))
+             (match (last c) ((some x) (= x (at v (- n 1) skew))) (nil false))))))
+
+(defun sweep (c: Checks seed: i64 strings: i64 skew: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (i strings)
+      (let ((s (gen-str r (rng-below r 25))))
+        (check c (holds s skew))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 522 300 0)
+        (check c (= (checks-made c) 300))
+        (sweep p 522 60 1)
+        (check-detects c p)
+        (checks-result c))))

@@ -1,0 +1,42 @@
+;; spec:   stdlib §2.7 (hash-combine folds), §4.3 (row hash-ordered-coll: "for Vec and List, over hash-combine")
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: hash hash-ordered-coll hash-combine
+;; `hash-ordered-coll` of any Reducible is the fold of `hash-combine` from the
+;; seed 1 over the hashes of its elements in order, finished by combining the
+;; count (decided in fib.seq.hash). The hash of a Vec is that function, so the
+;; two agree for every Vec, and they agree across the sequential sources: a
+;; List, a VSeq, a lazy seq and an Option of the same elements give the number
+;; the Vec does, as Clojure's `(hash [1 2 3])` and `(hash '(1 2 3))` do. The
+;; first check writes the fold by hand with `hash-combine` and `hash`, which
+;; pins the algorithm; the empty source is `(hash-combine 1 0)`.
+(ns main (:use fib.seq tl.check))
+
+;; the algorithm of the header, written out for [1 2 3]
+(defun by-hand () -> i64
+  (hash-combine (hash-combine (hash-combine (hash-combine 1 (hash 1)) (hash 2)) (hash 3)) 3))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (e: (Vec i64) (vec-empty))
+        (none: (Option i64) nil)
+        (ls (lcons 1 (lcons 2 (lcons 3 (lazy-node (fn () LNil))))))
+        (vs (VSeq (list 1) [2 3] 0)))
+    (do (check c (= (hash [1 2 3]) (by-hand)))
+        (check c (= (hash-ordered-coll [1 2 3]) (by-hand)))
+        (check c (= (hash-ordered-coll e) (hash-combine 1 0)))
+        (check c (= (hash e) (hash-combine 1 0)))
+        (check c (= (hash-ordered-coll ["ab" "c"]) (hash ["ab" "c"])))
+        (check c (= (hash-ordered-coll [[1 2] [3]]) (hash [[1 2] [3]])))
+        (check c (= (hash-ordered-coll [1.5 -0.0]) (hash [1.5 0.0])))
+        (check c (= (hash-ordered-coll (list 1 2 3)) (hash [1 2 3])))
+        (check c (= (hash-ordered-coll vs) (hash [1 2 3])))
+        (check c (= (hash-ordered-coll ls) (hash [1 2 3])))
+        (check c (= (hash-ordered-coll (some 5)) (hash [5])))
+        (check c (= (hash-ordered-coll none) (hash-ordered-coll e)))
+        (check c (!= (hash-ordered-coll [1 2 3]) (hash-ordered-coll [3 2 1])))
+        (check c (!= (hash-ordered-coll (list 1 2 3)) (hash-ordered-coll (list 1 2))))
+        (check c (= (checks-made c) 14))
+        (checks-result c))))

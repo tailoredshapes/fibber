@@ -1,0 +1,67 @@
+;; spec:   stdlib §3 N3, §4.5 (includes?: the element first, Eq e)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: includes?
+;; (includes? x c) is true when some element of c equals x, the element first
+;; so that ->> threads the source. It answers for a Vec, strings, an Option, a
+;; List, a lazy seq, a seq of a Vec, an array and a range, and for a struct that
+;; derives Eq, and it stops at the first match: a source that counts the elements
+;; it hands out shows 4 visited when the hit is the fourth of ten, and all 10 for
+;; a miss. fib.coll is required under an alias, not :used, so that `list` expands
+;; where the method `empty` is not in scope. A Set is case 406's.
+(ns main (:use fib.core fib.seq tl.check) (:require [fib.coll :as coll]))
+
+(defstruct Pt (x: i64 y: i64))
+(derive Eq Pt)
+
+;; the numbers 0 .. n-1; every element handed out bumps the counter
+(defstruct Counted (n: i64 seen: (Cell i64)))
+(impl (Reducible i64) Counted
+  (each-while (self k)
+    (loop ((i 0))
+      (if (< i (. self n))
+          (do (set! (. self seen) (+ @(. self seen) 1))
+              (if (k i) (recur (+ i 1)) false))
+          true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [10 20 30])
+        (names ["a" "b" "c"])
+        (none: (Option i64) nil)
+        (s1 (cell 0))
+        (s2 (cell 0))
+        (pts [(Pt 1 2) (Pt 3 4)])
+        (lazy (lcons 5 (lcons 6 (lazy-node (fn () LNil))))))
+    (do (check c (coll/includes? 10 v))
+        (check c (coll/includes? 20 v))
+        (check c (coll/includes? 30 v))
+        (check c (not (coll/includes? 40 v)))
+        (check c (not (coll/includes? 0 v)))
+        (check c (not (coll/includes? 1 (coll/vec (list)))))
+        (check c (coll/includes? "b" names))
+        (check c (not (coll/includes? "d" names)))
+        (check c (not (coll/includes? "" names)))
+        (check c (coll/includes? 4 (some 4)))
+        (check c (not (coll/includes? 5 (some 4))))
+        (check c (not (coll/includes? 4 none)))
+        (check c (coll/includes? 8 (list 7 8 9)))
+        (check c (not (coll/includes? 1 (list 7 8 9))))
+        (check c (coll/includes? 6 lazy))
+        (check c (not (coll/includes? 7 lazy)))
+        (check c (coll/includes? 3 (rest [1 2 3])))
+        (check c (not (coll/includes? 1 (rest [1 2 3]))))
+        (check c (coll/includes? (Pt 3 4) pts))
+        (check c (not (coll/includes? (Pt 4 3) pts)))
+        (check c (coll/includes? 7 (array 3 7)))
+        (check c (not (coll/includes? 8 (array 3 7))))
+        (check c (coll/includes? 3 (range 5)))
+        (check c (not (coll/includes? 5 (range 5))))
+        (check c (coll/includes? 9 (range-by 1 20 4)))
+        (check c (coll/includes? 3 (Counted 10 s1)))
+        (check c (= @s1 4))
+        (check c (not (coll/includes? 99 (Counted 10 s2))))
+        (check c (= @s2 10))
+        (checks-result c))))

@@ -1,0 +1,40 @@
+;; spec:   stdlib §4.14 (row dbg), syntax §4.4 (the dbg macro)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: dbg
+;; (dbg e) has the type of e and prints it with Show, so it type-checks around a value
+;; of every type that has a Show instance in scope: the scalars, a string, a char, and
+;; with fib.print a Vec, a Pair, a Set, a Map, an Option, a lazy seq. The generic
+;; function below instantiates the macro's `show` at each of those types and is called
+;; with its switch off. It is never switched on here, and that is the limit of this
+;; case: the compiled run's free trace is written to stderr (FIB_TRACE=1), where dbg
+;; and eprintln write too, and eprintln's text (written before its newline) glues
+;; itself to the trace line emitted between the two writes, so `fibc cases` loses
+;; that line and reports an audit mismatch for ANY program that runs dbg or eprintln
+;; (cases/ownership/192 says so in its header, and has no eprintln for that reason;
+;; `(defun main () -> i64 (do (eprintln "x") 0))` as a case passes `fibref cases` and
+;; fails `fibc cases`). That the macro evaluates its argument once and returns it is
+;; checked by hand in the package report, under both tools, with the text it writes.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defun through (on: bool x: a) :where ((Show a)) -> a (if on (dbg x) x))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Option i64) nil))
+    (do (check c (= (through false 5) 5))
+        (check c (= (through false -2.5) -2.5))
+        (check c (= (through false "text") "text"))
+        (check c (= (through false \a) \a))
+        (check c (through false true))
+        (check c (= (vec-count (through false [1 2 3])) 3))
+        (check c (= (. (through false (Pair 1 "a")) snd) "a"))
+        (check c (= (count (through false (conj (set-empty) 4))) 1))
+        (check c (= (count (through false (assoc (map-empty) 1 2))) 1))
+        (check c (= (unwrap-or (through false (some 5)) 0) 5))
+        (check c (nil? (through false none)))
+        (check c (= (count (through false (lseq-vec [1 2]))) 2))
+        (check c (= (str (through false (rest [1 2 3]))) "(2 3)"))
+        (checks-result c))))

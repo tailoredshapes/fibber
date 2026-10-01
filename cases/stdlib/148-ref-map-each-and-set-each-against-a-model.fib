@@ -1,0 +1,94 @@
+;; spec:   tranche 1 plan §4.1 (map-each and set-each), §9.4 (a ref- case ends in a planted fault)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; map-each and set-each against a model that has no hash and no trie: two parallel Vecs of the
+;; distinct keys put so far and the value last put for each (a linear search, last write wins). 300
+;; seeded rounds put 0 to 39 pairs with keys drawn from 0 to 24 (so keys repeat and the last value
+;; wins), then compare what the walk of the Map visits with what the model holds: how many entries,
+;; the sum of the keys, the sum of the values, and the sum of (key + 1) * value, which ties each
+;; value to its own key; the walk of the Set of the same keys (its count and key sum); and an early
+;; stop: an f that answers false at the lim-th call (lim from 1 to the number of entries) is called
+;; exactly lim times and the walk answers false. The planted faults are models wrong in one way: 1 leaves the last distinct entry out of
+;; the totals (an off-by-one), 2 lets a repeated key count again (no last-write-wins), 3 expects the
+;; stopped walk to call f one time too few. Each, over the same rounds, must disagree with the
+;; library on some round, or `check-detects` fails the case.
+(ns main (:use tl.rng tl.check))
+
+;; index of k in the distinct keys, or -1
+(defun find-key (ks: (Vec i64) k: i64) -> i64
+  (loop ((i 0))
+    (if (< i (vec-count ks)) (if (= (vec-nth ks i) k) i (recur (+ i 1))) -1)))
+
+(defstruct Model (ks: (Vec i64) vs: (Vec i64)))
+
+(defun model-put (m: Model k: i64 v: i64 again: bool) -> Model
+  (let ((i (if again -1 (find-key (. m ks) k))))
+    (if (< i 0)
+        (Model (conj (. m ks) k) (conj (. m vs) v))
+        (Model (. m ks) (vec-set (. m vs) i v)))))
+
+(defun vec-set (v: (Vec i64) i: i64 x: i64) -> (Vec i64)
+  (loop ((j 0) (acc (vec-empty)))
+    (if (< j (vec-count v)) (recur (+ j 1) (conj acc (if (= j i) x (vec-nth v j)))) acc)))
+
+;; the totals of a walk: visits, key sum, value sum, key-weighted value sum
+(defstruct Totals (n: i64 ks: i64 vs: i64 kv: i64))
+
+(defun totals-same (a: Totals b: Totals) -> bool
+  (and (= (. a n) (. b n))
+       (and (= (. a ks) (. b ks)) (and (= (. a vs) (. b vs)) (= (. a kv) (. b kv))))))
+
+(defun model-totals (m: Model drop-last: bool) -> Totals
+  (let ((n (- (vec-count (. m ks)) (if drop-last 1 0))))
+    (loop ((i 0) (t (Totals 0 0 0 0)))
+      (if (< i n)
+          (let ((k (vec-nth (. m ks) i)) (v (vec-nth (. m vs) i)))
+            (recur (+ i 1) (Totals (+ (. t n) 1) (+ (. t ks) k) (+ (. t vs) v) (+ (. t kv) (* (+ k 1) v)))))
+          t))))
+
+;; how many of the 300 rounds the library and the model (with the fault `fault`) disagree on
+(defun disagreements (fault: i64) -> i64
+  (let ((g (rng 1618033)) (bad (cell 0)))
+    (do (dotimes (round 300)
+          (let ((n (rng-below g 40))
+                (m (cell (Model (vec-empty) (vec-empty))))
+                (mp (cell (map-empty)))
+                (st (cell (set-empty))))
+            (do (dotimes (i n)
+                  (let ((k (rng-below g 25)) (v (rng-below g 1000)))
+                    (do (set! m (model-put @m k v (= fault 2)))
+                        (set! mp (assoc @mp k v))
+                        (set! st (conj @st k)))))
+                (let ((t (cell (Totals 0 0 0 0)))
+                      (s (cell (Totals 0 0 0 0)))
+                      (distinct (vec-count (. @m ks)))
+                      (lim (+ 1 (rng-below g (if (> (vec-count (. @m ks)) 0) (vec-count (. @m ks)) 1))))
+                      (calls (cell 0))
+                      (ans (cell true)))
+                  (do (map-each @mp (fn (k v) (do (set! t (Totals (+ (. @t n) 1) (+ (. @t ks) k) (+ (. @t vs) v)
+                                                                   (+ (. @t kv) (* (+ k 1) v))))
+                                                  true)))
+                      (set-each @st (fn (k) (do (set! s (Totals (+ (. @s n) 1) (+ (. @s ks) k) 0 0)) true)))
+                      (if (> distinct 0)
+                          (set! ans (map-each @mp (fn (k v) (do (set! calls (+ @calls 1)) (< @calls lim)))))
+                          ())
+                      (let ((want (model-totals @m (= fault 1))))
+                        (do (if (totals-same @t want) () (set! bad (+ @bad 1)))
+                            (if (and (= (. @s n) (. want n)) (= (. @s ks) (. want ks))) () (set! bad (+ @bad 1)))
+                            (if (> distinct 0)
+                                (if (and (= @calls (if (= fault 3) (- lim 1) lim)) (not @ans)) () (set! bad (+ @bad 1)))
+                                ()))))))))
+        @bad)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (check c (= (disagreements 0) 0))
+        (check p1 (= (disagreements 1) 0))
+        (check p2 (= (disagreements 2) 0))
+        (check p3 (= (disagreements 3) 0))
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

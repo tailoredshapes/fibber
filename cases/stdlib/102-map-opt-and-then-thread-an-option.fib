@@ -1,0 +1,83 @@
+;; spec:   stdlib §4.3 (rows map-opt and-then), §3 N11, §2.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-opt and-then
+;; Clojure's `(some-> o f g)` over an Option, as two functions that take the
+;; function first and the Option last so `->>` threads them (N11):
+;; `(->> o (map-opt inc) (and-then half))`. map-opt applies a function that
+;; returns a plain value and wraps the result; and-then applies one that
+;; returns an Option and keeps it. Both leave nil as nil without calling the
+;; function (a counter shows it), call it exactly once for a `some`, and
+;; change the payload's type (i64 to str, str to an Option of str). The
+;; functions are named functions, a literal that captures a cell, and a
+;; literal that returns an Option of an Option (so absent and nil-valued stay
+;; different values, stdlib §5 T1).
+(ns main (:use fib.core tl.check))
+
+(defun bump (x: i64) -> i64 (+ x 1))
+(defun half (x: i64) -> (Option i64) (if (= (rem x 2) 0) (some (quot x 2)) nil))
+(defun greet (s: str) -> str (str-concat "hi " s))
+(defun first-char (s: str) -> (Option str) (if (> (str-len s) 0) (some (str-slice s 0 1)) nil))
+(defun show-i64 (x: i64) -> str (show x))
+(defun i8-up (x: i8) -> i8 (+ x 1i8))
+(defun i16-up (x: i16) -> i16 (+ x 1i16))
+(defun i32-up (x: i32) -> i32 (+ x 1i32))
+(defun f32-up (x: f32) -> f32 (+ x 1.0f32))
+(defun f64-up (x: f64) -> f64 (+ x 1.0))
+(defun flip (b: bool) -> bool (not b))
+(defun next-char (c: char) -> char (i32->char (+ (char->i32 c) 1i32)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (none: (Option i64) nil)
+        (no-str: (Option str) nil))
+    (do
+      ;; map-opt: a plain function, wrapped
+      (check c (= (map-opt bump (some 4)) (some 5)))
+      (check c (= (map-opt bump none) nil))
+      (check c (= (map-opt show-i64 (some 41)) (some "41")))
+      (check c (= (map-opt greet (some "bob")) (some "hi bob")))
+      (check c (= (map-opt greet no-str) nil))
+      (check c (= (map-opt (fn (s) (str-len s)) (some "four")) (some 4)))
+      ;; the function is called once for a some and never for nil
+      (check c (= (map-opt (fn (x) (do (set! calls (+ @calls 1)) (bump x))) (some 1)) (some 2)))
+      (check c (= @calls 1))
+      (check c (= (map-opt (fn (x) (do (set! calls (+ @calls 1)) (bump x))) none) nil))
+      (check c (= @calls 1))
+      ;; and-then: a function that returns an Option, kept as it is
+      (check c (= (and-then half (some 8)) (some 4)))
+      (check c (= (and-then half (some 7)) nil))
+      (check c (= (and-then half none) nil))
+      (check c (= (and-then first-char (some "xyz")) (some "x")))
+      (check c (= (and-then first-char (some "")) nil))
+      (check c (= (and-then first-char no-str) nil))
+      (check c (= (and-then (fn (x) (do (set! calls (+ @calls 1)) (half x))) none) nil))
+      (check c (= @calls 1))
+      (check c (= (and-then (fn (x) (do (set! calls (+ @calls 1)) (half x))) (some 10)) (some 5)))
+      (check c (= @calls 2))
+      ;; ->> threads them: the function first, the Option last
+      (check c (= (->> (some 7) (map-opt bump) (and-then half)) (some 4)))
+      (check c (= (->> (some 8) (map-opt bump) (and-then half)) nil))
+      (check c (= (->> none (map-opt bump) (and-then half)) nil))
+      (check c (= (->> (some 2) (map-opt bump) (map-opt bump) (and-then half) (map-opt show-i64)) (some "2")))
+      ;; one instance of the generic function per layout class of the payload
+      (check c (= (map-opt i8-up (some 1i8)) (some 2i8)))
+      (check c (= (map-opt i16-up (some 1i16)) (some 2i16)))
+      (check c (= (map-opt i32-up (some 1i32)) (some 2i32)))
+      (check c (= (map-opt f32-up (some 1.5f32)) (some 2.5f32)))
+      (check c (= (map-opt f64-up (some 1.5)) (some 2.5)))
+      (check c (= (map-opt flip (some true)) (some false)))
+      (check c (= (map-opt next-char (some \a)) (some \b)))
+      (check c (= (and-then (fn (ch) (some (next-char ch))) (some \y)) (some \z)))
+      (check c (some? (map-opt (fn (x) ()) (some 1))))
+      (check c (= ((unwrap (map-opt (fn (x) bump) (some 1))) 5) 6))
+      ;; some-nil is not nil: a function that returns an Option through map-opt
+      (let ((wrapped (map-opt (fn (s) (let ((n: (Option str) nil)) n)) (some "a")))
+            (absent (map-opt (fn (s) (let ((n: (Option str) nil)) n)) no-str)))
+        (do (check c (some? wrapped))
+            (check c (nil? absent))
+            (check c (nil? (unwrap wrapped)))))
+      (checks-result c))))

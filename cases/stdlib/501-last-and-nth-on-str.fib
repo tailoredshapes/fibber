@@ -1,0 +1,40 @@
+;; spec:   stdlib §2.9 (a str is a Reducible of its characters), §2.3 (nth traps out of range)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; `nth` and `last` of a str are by character: (nth "aé€😀z" 3) is 😀, the fourth
+;; scalar and bytes 6 to 9, and the last character of "x😀" is the four-byte
+;; scalar, which a scan from the end must walk back over three continuation
+;; bytes to find. `last` of the empty string is nil. These two methods are
+;; overridden for str (the defaults walk with a cell and an Option per
+;; character), so each is checked at every character width and at both ends.
+;; `first` is L5b's (case 512); the trap past the end is case 519.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun last-is (s: str want: char) -> bool
+  (match (last s) ((some x) (= x want)) (nil false)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s "aé€😀z"))
+    (do (check c (= (nth s 0) \a))
+        (check c (= (nth s 1) \é))
+        (check c (= (nth s 2) \€))
+        (check c (= (nth s 3) \😀))
+        (check c (= (nth s 4) \z))
+        (check c (= (nth (Chars s) 3) \😀))
+        (check c (= (nth "😀" 0) \😀))
+        (check c (last-is "héllo" \o))
+        (check c (last-is "aé" \é))
+        (check c (last-is "a€" \€))
+        (check c (last-is "x😀" \😀))
+        (check c (last-is "😀" \😀))
+        (check c (last-is "z" \z))
+        (check c (last-is "€€" \€))
+        (check c (last-is s \z))
+        (check c (last-is "aé€😀" \😀))
+        (check c (match (last (Chars s)) ((some x) (= x \z)) (nil false)))
+        (check c (nil? (last "")))
+        (check c (nil? (last (Chars ""))))
+        (checks-result c))))

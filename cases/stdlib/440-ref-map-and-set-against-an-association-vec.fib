@@ -1,0 +1,109 @@
+;; spec:   stdlib §8.1 item 2 (a model test of the collections), §2.3 (Lookup Assoc Dissoc Keyed Collection)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc dissoc get contains? conj disj
+;; Model test: 300 seeded operation sequences of 40 operations each, over a
+;; Map and over a Set of keys that collide (the hash of K is id mod 7, so 24
+;; ids share 7 hashes), against an association Vec: two parallel Vecs of
+;; ids and values searched from the front, written with the prelude's
+;; vec-count, vec-nth and vec-conj only, so the library under test is not on the
+;; reference side. Each operation is one of assoc, dissoc, get, contains? (conj,
+;; disj, contains? for the Set), and the answer of get and contains? is compared
+;; with the model's at once; after the sequence every id answers alike and
+;; the counts are equal. One check per sequence: bit i of the result is
+;; sequence i (a later one sets bit 62). The last check is a planted fault: the
+;; same run against a model whose dissoc forgets an entry at index 0 must fail
+;; (check-detects), so the case shows it can fail. The seed is 20261001.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defstruct K (id: i64))
+(derive Eq K)
+(impl Hash K (hash (self) (rem (. self id) 7)))
+
+;; the association vec: ids and the values at the same index
+(defstruct Model (ks: (Vec i64) vs: (Vec i64)))
+
+(defun m-find (ks: (Vec i64) id: i64) -> i64
+  (let ((n (fib.prelude/vec-count ks)))
+    (loop ((i 0))
+      (if (< i n) (if (= (fib.prelude/vec-nth ks i) id) i (recur (+ i 1))) -1))))
+
+(defun m-replace (vs: (Vec i64) at: i64 x: i64) -> (Vec i64)
+  (let ((n (fib.prelude/vec-count vs)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (if (= i at) x (fib.prelude/vec-nth vs i)))) acc))))
+
+(defun m-without (vs: (Vec i64) at: i64) -> (Vec i64)
+  (let ((n (fib.prelude/vec-count vs)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n) (recur (+ i 1) (if (= i at) acc (fib.prelude/vec-conj acc (fib.prelude/vec-nth vs i)))) acc))))
+
+(defun m-assoc (m: Model id: i64 v: i64) -> Model
+  (let ((at (m-find (. m ks) id)))
+    (if (< at 0)
+        (Model (fib.prelude/vec-conj (. m ks) id) (fib.prelude/vec-conj (. m vs) v))
+        (Model (. m ks) (m-replace (. m vs) at v)))))
+
+(defun m-dissoc (m: Model id: i64 planted: bool) -> Model
+  (let ((at (m-find (. m ks) id)))
+    (if (or (< at 0) (and planted (= at 0)))
+        m
+        (Model (m-without (. m ks) at) (m-without (. m vs) at)))))
+
+(defun m-get (m: Model id: i64) -> (Option i64)
+  (let ((at (m-find (. m ks) id)))
+    (if (< at 0) nil (some (fib.prelude/vec-nth (. m vs) at)))))
+
+(defun same (a: (Option i64) b: (Option i64)) -> bool
+  (match a (nil (match b (nil true) ((some _) false))) ((some x) (match b (nil false) ((some y) (= x y))))))
+
+;; the library's Map and the model agree on every id below 24 and on the count
+(defun agree (m: (Map K i64) mod: Model) -> bool
+  (loop ((id 0) (ok (= (count m) (fib.prelude/vec-count (. mod ks)))))
+    (if (< id 24)
+        (recur (+ id 1) (and ok (and (same (get m (K id)) (m-get mod id)) (= (contains? m (K id)) (>= (m-find (. mod ks) id) 0)))))
+        ok)))
+
+;; one sequence: the library's answer to each get and contains? against the model's, then the whole state
+(defun map-sequence (seed: i64 planted: bool) -> bool
+  (let ((r (rng seed)))
+    (loop ((i 0) (m (empty {(K 0) 0})) (mod (Model (vec-empty) (vec-empty))) (ok true))
+      (if (< i 40)
+          (let ((op (rng-below r 4)) (id (rng-below r 24)) (v (rng-below r 1000)))
+            (match op
+              (0 (recur (+ i 1) (assoc m (K id) v) (m-assoc mod id v) ok))
+              (1 (recur (+ i 1) (dissoc m (K id)) (m-dissoc mod id planted) ok))
+              (2 (recur (+ i 1) m mod (and ok (same (get m (K id)) (m-get mod id)))))
+              (_ (recur (+ i 1) m mod (and ok (= (contains? m (K id)) (>= (m-find (. mod ks) id) 0)))))))
+          (and ok (agree m mod))))))
+
+(defun set-agree (s: (Set K) ks: (Vec i64)) -> bool
+  (loop ((id 0) (ok (= (count s) (fib.prelude/vec-count ks))))
+    (if (< id 24) (recur (+ id 1) (and ok (= (contains? s (K id)) (>= (m-find ks id) 0)))) ok)))
+
+(defun set-sequence (seed: i64 planted: bool) -> bool
+  (let ((r (rng seed)))
+    (loop ((i 0) (s (empty (set [(K 0)]))) (ks (vec-empty)) (ok true))
+      (if (< i 40)
+          (let ((op (rng-below r 3)) (id (rng-below r 24)) (at (m-find ks id)))
+            (match op
+              (0 (recur (+ i 1) (conj s (K id)) (if (< at 0) (fib.prelude/vec-conj ks id) ks) ok))
+              (1 (recur (+ i 1) (disj s (K id))
+                        (if (or (< at 0) (and planted (= at 0))) ks (m-without ks at)) ok))
+              (_ (recur (+ i 1) s ks (and ok (= (contains? s (K id)) (>= at 0)))))))
+          (and ok (set-agree s ks))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)) (q (checks)))
+    (do (dotimes (i 300) (check c (map-sequence (+ 20261001 i) false)))
+        (dotimes (i 300) (check q (set-sequence (+ 20261001 i) false)))
+        (dotimes (i 30) (check p (map-sequence (+ 20261001 i) true)))
+        (check-detects c p)
+        (let ((p2 (checks)))
+          (do (dotimes (i 30) (check p2 (set-sequence (+ 20261001 i) true)))
+              (check-detects c p2)))
+        (check c (= (checks-made c) 302))
+        (check c (= (checks-result q) 0))
+        (checks-result c))))

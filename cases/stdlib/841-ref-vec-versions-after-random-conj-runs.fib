@@ -1,0 +1,114 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Vec), §2.5 (persistent in the API), types §2.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; A persistent Vec has to keep every version it has handed out. A tree of versions
+;; is grown from the empty Vec, five times with five seeds (841, 1, 2, 3, 4). Each
+;; step takes a parent, the newest version two times in three and any version
+;; otherwise (long chains and branches), conj's a run of random i64 values onto it
+;; (1, 1 to 40, 32, 33 to 72, 1, or 200 to 899 values: the runs cross the tail edge
+;; and, from a long parent, the trie edges) and keeps the new version; 41 versions
+;; a tree. Beside each version goes a plain (Array i64) with the same elements,
+;; made by copying the parent's array and adding the run. At the end every version,
+;; the oldest included, is read back element by element against its array: a conj
+;; that wrote into a node another version shares, or a tail copied too short, shows
+;; as an older version that changed. The case asserts that thirty versions or more
+;; grew past 1056 elements, the count where the trie gains a level. Then five Vecs of the
+;; sizes where the structure changes (31 32 1055 1056 1088) are each given two
+;; different next elements, and all three must be what they should be. `nth` after
+;; an assoc is not here: the prelude's Vec has no assoc (the page's `Assoc (Vec a)`
+;; is library code, L8a). The faults planted: a reference read one element off, and
+;; a tree whose runs are each one value short of the array's.
+(ns main (:use tl.rng tl.check))
+
+(defstruct Ver (v: (Vec i64) ref: (Array i64)))
+
+(defun ver-ok (ver: Ver shift: i64) -> bool
+  (let ((n (array-len (. ver ref))))
+    (and (= (count (. ver v)) n)
+         (loop ((i 0))
+           (if (< i n)
+               (if (= (nth (. ver v) i) (array-get (. ver ref) (rem (+ i shift) n))) (recur (+ i 1)) false)
+               true)))))
+
+;; k random values: any i64, negative included
+(defun draw-run (r: Rng k: i64) -> (Array i64)
+  (let ((c (cell (array k 0))))
+    (do (dotimes (i k) (array-set! &c i (rng-next r)))
+        @c)))
+
+(defun conj-run (v: (Vec i64) run: (Array i64) cut: i64) -> (Vec i64)
+  (loop ((i 0) (w v))
+    (if (< i (- (array-len run) cut)) (recur (+ i 1) (conj w (array-get run i))) w)))
+
+(defun cat-run (old: (Array i64) run: (Array i64)) -> (Array i64)
+  (let ((n (array-len old))
+        (c (cell (array (+ n (array-len run)) 0))))
+    (do (dotimes (i n) (array-set! &c i (array-get old i)))
+        (dotimes (i (array-len run)) (array-set! &c (+ n i) (array-get run i)))
+        @c)))
+
+(defun run-length (r: Rng) -> i64
+  (let ((p (rng-below r 6)))
+    (if (= p 0) 1
+        (if (= p 1) (+ 1 (rng-below r 40))
+            (if (= p 2) 32
+                (if (= p 3) (+ 33 (rng-below r 40))
+                    (if (= p 4) 1 (+ 200 (rng-below r 700)))))))))
+
+;; a new version from a parent: the newest two times in three, else any
+(defun next-ver (r: Rng vers: (Vec Ver) cut: i64) -> Ver
+  (let ((parent (nth vers (if (< (rng-below r 3) 2) (- (count vers) 1) (rng-below r (count vers)))))
+        (run (draw-run r (run-length r))))
+    (Ver (conj-run (. parent v) run cut) (cat-run (. parent ref) run))))
+
+(defun grow (seed: i64 steps: i64 cut: i64) -> (Vec Ver)
+  (let ((r (rng seed)))
+    (loop ((i 0) (vers [(Ver (vec-empty) (array 0 0))]))
+      (if (< i steps) (recur (+ i 1) (conj vers (next-ver r vers cut))) vers))))
+
+;; every version against its array
+(defun all-ok (vers: (Vec Ver) shift: i64) -> bool
+  (loop ((i 0))
+    (if (< i (count vers)) (if (ver-ok (nth vers i) shift) (recur (+ i 1)) false) true)))
+
+;; how many versions have more elements than limit
+(defun over (vers: (Vec Ver) limit: i64) -> i64
+  (loop ((i 0) (n 0))
+    (if (< i (count vers)) (recur (+ i 1) (if (> (count (. (nth vers i) v)) limit) (+ n 1) n)) n)))
+
+;; a Vec of n elements v, and v with x and v with y after it, three versions
+(defun branch-ok (n: i64) -> bool
+  (let ((v (loop ((i 0) (w (vec-empty))) (if (< i n) (recur (+ i 1) (conj w (+ (* i 31) 5))) w)))
+        (a (conj v -1))
+        (b (conj v -2)))
+    (and (= (count v) n)
+         (and (= (count a) (+ n 1))
+              (and (= (count b) (+ n 1))
+                   (and (= (nth a n) -1)
+                        (and (= (nth b n) -2)
+                             (loop ((i 0))
+                               (if (< i n)
+                                   (let ((want (+ (* i 31) 5)))
+                                     (if (and (= (nth v i) want) (and (= (nth a i) want) (= (nth b i) want)))
+                                         (recur (+ i 1))
+                                         false))
+                                   true)))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (seeds [841 1 2 3 4])
+        (trees (loop ((j 0) (acc (vec-empty))) (if (< j 5) (recur (+ j 1) (conj acc (grow (nth seeds j) 40 0))) acc)))
+        (deep (loop ((j 0) (n 0)) (if (< j 5) (recur (+ j 1) (+ n (over (nth trees j) 1056))) n))))
+    (do (dotimes (j 5) (check c (all-ok (nth trees j) 0)))
+        (check c (>= deep 30))
+        (dotimes (j 5) (check c (= (count (nth trees j)) 41)))
+        (dotimes (j 5) (check c (branch-ok (nth [31 32 1055 1056 1088] j))))
+        (check p1 (all-ok (nth trees 0) 1))
+        (check p2 (all-ok (grow 841 40 1) 0))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

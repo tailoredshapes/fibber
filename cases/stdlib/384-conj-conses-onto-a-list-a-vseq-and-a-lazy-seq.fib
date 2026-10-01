@@ -1,0 +1,55 @@
+;; spec:   stdlib §2.3 (Collection: conj puts the element where the collection takes it), A13 conjseq
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: conj
+;; conj puts the element where the collection takes it: a Vec at the end (P0's
+;; instance, case 005), a List, a VSeq (the seq of a Vec) and an LSeq at the
+;; front, as Clojure's (conj '(1 2) 0) is (0 1 2) and (conj (rest [1 2 3]) 0) is
+;; (0 2 3). The result of a List's conj is a List and the result of an LSeq's is
+;; an LSeq, which stays lazy: it conses a ready node onto the seq it was given and
+;; does not realise a node of it (a counter in the source's thunks shows that).
+;; Lists are built with the `list` macro, which expands to the variant names, so
+;; this module requires fib.coll under an alias and does not :use it (its `empty`
+;; method would be the macro's `empty` before the variants were renamed).
+(ns main (:use fib.core fib.seq tl.check) (:require [fib.coll :as coll]))
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 calls: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! calls (+ @calls 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) calls)) LNil)))))
+
+;; whether the elements of c are exactly the Vec want
+(defun elements-are (c: c want: (Vec i64)) :where ((Reducible c i64)) -> bool
+  (let ((got (to-vec c)))
+    (and (= (count got) (count want))
+         (loop ((i 0)) (if (< i (count want)) (if (= (nth got i) (nth want i)) (recur (+ i 1)) false) true)))))
+
+;; a function of a List and nothing else: the result of conj is one
+(defun front-of (l: (List i64)) -> (List i64) (coll/conj l 0))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (l (list 1 2))
+        (l0 (coll/conj l 0))
+        (vs (coll/conj (rest [1 2 3]) 0))
+        (calls (cell 0))
+        (src (countdown 4 calls))
+        (s (coll/conj src 9)))
+    (do (check c (elements-are (coll/conj [1 2] 3) [1 2 3]))
+        (check c (elements-are l0 [0 1 2]))
+        (check c (elements-are l [1 2]))
+        (check c (elements-are (coll/conj l0 -1) [-1 0 1 2]))
+        (check c (elements-are (front-of (front-of l)) [0 0 1 2]))
+        (check c (elements-are (coll/conj (list) 7) [7]))
+        (check c (elements-are vs [0 2 3]))
+        (check c (elements-are (coll/conj vs -1) [-1 0 2 3]))
+        (check c (= @calls 0))
+        (check c (= (nth s 0) 9))
+        (check c (= @calls 0))
+        (check c (= (count s) 5))
+        (check c (= @calls 5))
+        (check c (elements-are s [9 4 3 2 1]))
+        (check c (elements-are (coll/conj (lazy-node (fn () LNil)) 5) [5]))
+        (checks-result c))))

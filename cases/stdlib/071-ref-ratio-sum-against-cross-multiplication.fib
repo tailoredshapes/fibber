@@ -1,0 +1,49 @@
+;; spec:   stdlib §2.8 ((Ratio t): Num), tranche 1 plan §9.4 (ref- cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: / numerator denominator
+;; The sum of two ratios against n1/d1 + n2/d2 = (n1 d2 + n2 d1) / (d1 d2),
+;; reduced by a naive gcd (repeated subtraction, so it shares nothing with
+;; the library's Euclid) and given a positive denominator: 300 seeded pairs
+;; of fractions with either sign on either part. The planted fault is the
+;; reference that forgets to reduce, run against the same sums in a second
+;; Checks, which must fail somewhere.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun gcd-naive (a: i64 b: i64) -> i64
+  (loop ((x a) (y b))
+    (if (= x y) x (if (> x y) (recur (- x y) y) (recur x (- y x))))))
+
+(defun magnitude (x: i64) -> i64 (if (< x 0) (- 0 x) x))
+
+;; n/d in lowest terms, d positive
+(defun reduced (n: i64 d: i64) -> (Pair i64 i64)
+  (if (= n 0)
+      (Pair 0 1)
+      (let ((g (gcd-naive (magnitude n) (magnitude d))))
+        (if (< d 0)
+            (Pair (quot (- 0 n) g) (quot (- 0 d) g))
+            (Pair (quot n g) (quot d g))))))
+
+(defun nonzero (x: i64) -> i64 (if (= x 0) 3 x))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (r (rng 71)))
+    (do (dotimes (i 300)
+          (let ((n1 (- (rng-below r 61) 30))
+                (d1 (nonzero (- (rng-below r 41) 20)))
+                (n2 (- (rng-below r 61) 30))
+                (d2 (nonzero (- (rng-below r 41) 20))))
+            (let ((s (+ (/ n1 d1) (/ n2 d2)))
+                  (e (reduced (+ (* n1 d2) (* n2 d1)) (* d1 d2)))
+                  (raw (Pair (+ (* n1 d2) (* n2 d1)) (* d1 d2))))
+              (do (check c (= (numerator s) (. e fst)))
+                  (check c (= (denominator s) (. e snd)))
+                  (check p (and (= (numerator s) (. raw fst)) (= (denominator s) (. raw snd))))))))
+        (check c (= (checks-made c) 600))
+        (check-detects c p)
+        (checks-result c))))

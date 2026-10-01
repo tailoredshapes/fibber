@@ -1,0 +1,50 @@
+;; spec:   stdlib §2.1 rule 1 (every source feeds the adaptors, an infinite one too), §4.4 rows map filter take drop mapcat concat
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter take drop mapcat concat
+;; The sources that fib.seq.sources gives their instances (L5a), through the
+;; lazy adaptors and through hand-built recipes: a Range, with a step of
+;; zero an infinite one, which take ends and which a Taken stops at its n-th
+;; element; an Array; a Map, whose elements are (Pair k v) in the hash's
+;; order (so every check here is a sum or a count, not an order); a Set,
+;; whose elements are its keys. A set is made from a Map of bools by the
+;; prelude's Set constructor, which the library keeps.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (map-assoc (map-assoc (map-assoc (map-empty) 1 10) 2 20) 3 30))
+        (s (Set (map-assoc (map-assoc (map-assoc (map-empty) 1 true) 2 true) 3 true)))
+        (arr (array 4 7)))
+    (do ;; Range
+        (check c (= (total (map (fn (x: i64) (+ x 1)) (range 5))) 15))
+        (check c (= (total (take 2 (range-by 10 0 -3))) 17))
+        (check c (= (count (drop 1 (range 5))) 4))
+        (check c (= (total (filter (fn (x: i64) (> x 2)) (range 6))) 12))
+        (check c (= (count (concat (range 3) (range 2))) 5))
+        ;; an infinite range: lazily, and by a recipe that stops its source
+        (check c (= (total (take 3 (map (fn (x: i64) (+ x 1)) (range-by 1 2 0)))) 6))
+        (check c (= (total (Taken (Mapped (range-by 1 2 0) (fn (x: i64) (+ x 1))) 3)) 6))
+        (check c (= (total (take 2 (filter (fn (x: i64) (> x 0)) (range-by 1 2 0)))) 2))
+        ;; Array
+        (check c (= (total (map (fn (x: i64) (+ x 1)) arr)) 32))
+        (check c (= (count (drop 1 arr)) 3))
+        (check c (= (total (Filtered arr (fn (x: i64) (> x 6)))) 28))
+        (check c (= (count (take 2 arr)) 2))
+        ;; Map: the elements are pairs
+        (check c (= (total (map (fn (p: (Pair i64 i64)) (. p snd)) m)) 60))
+        (check c (= (count (filter (fn (p: (Pair i64 i64)) (> (. p snd) 10)) m)) 2))
+        (check c (= (count (take 2 m)) 2))
+        (check c (= (total (mapcat (fn (p: (Pair i64 i64)) [(. p fst) (. p snd)]) m)) 66))
+        (check c (= (total (Mapped m (fn (p: (Pair i64 i64)) (. p fst)))) 6))
+        ;; Set: the keys
+        (check c (= (total (map (fn (x: i64) (* x 2)) s)) 12))
+        (check c (= (count (concat s (range 2))) 5))
+        (check c (= (count (Dropped s 1)) 2))
+        (checks-result c))))

@@ -1,0 +1,157 @@
+;; spec:   stdlib §8.1 item 2 (the model test of Vec, Map and Set), types §2.13, ownership §5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; A collection that holds collections is where sharing is deepest: a Map from an
+;; id to a Vec is the multimap every group-by builds, and `assoc` of the id with
+;; the old Vec conj'd is the update that must leave every earlier version of the
+;; outer Map, and every inner Vec it shares, as it was. Three shapes, each
+;; against an array model that is never updated in place, each with the outer
+;; collection snapshotted every few operations and every snapshot checked again
+;; at the end: (1) a Map from 5 ids to a Vec of i64, 1500 values added at random
+;; (the inner Vecs reach 300 elements and cross the tail and trie edges); (2) a
+;; Map from 7 ids to a Set of i64 (values 0 to 59), 400 added; (3) a Map from 12
+;; ids to a Map from 12 ids to i64, 500 puts, some of them overwrites. The model
+;; of (1) is an array of arrays, of (2) an array of bit masks, of (3) an array of
+;; 144 values. The fault planted: each model is told the wrong value.
+(ns main (:use tl.rng tl.check))
+
+;; ---- (1) a Map from an id to a Vec ---------------------------------------
+
+(defun grow-array (a: (Array i64) x: i64) -> (Array i64)
+  (let ((n (array-len a))
+        (c (cell (array (+ n 1) x))))
+    (do (dotimes (i n) (array-set! &c i (array-get a i)))
+        @c)))
+
+(defun vec-is (v: (Vec i64) a: (Array i64)) -> bool
+  (and (= (count v) (array-len a))
+       (loop ((i 0)) (if (< i (array-len a)) (if (= (nth v i) (array-get a i)) (recur (+ i 1)) false) true))))
+
+(defun multi-ok (m: (Map i64 (Vec i64)) ref: (Array (Array i64))) -> bool
+  (loop ((id 0) (nonempty 0))
+    (if (< id (array-len ref))
+        (let ((slot (array-get ref id)))
+          (if (= (array-len slot) 0)
+              (if (nil? (get m id)) (recur (+ id 1) nonempty) false)
+              (match (get m id)
+                (nil false)
+                ((some v) (if (vec-is v slot) (recur (+ id 1) (+ nonempty 1)) false)))))
+        (= (count m) nonempty))))
+
+;; 1500 values at random ids, a snapshot of both every 300; skew is added to
+;; the model's values (the planted fault)
+(defun multimap-ok (seed: i64 skew: i64) -> bool
+  (let ((r (rng seed)))
+    (loop ((step 0)
+           (m (map-empty))
+           (ref (array 5 (array 0 0)))
+           (snaps (vec-empty))
+           (refs (vec-empty)))
+      (if (< step 1500)
+          (let ((id (rng-below r 5))
+                (x (rng-next r)))
+            (let ((m2 (assoc m id (conj (unwrap-or (get m id) (vec-empty)) x)))
+                  (ref2 (array-with ref id (grow-array (array-get ref id) (+ x skew)))))
+              (recur (+ step 1) m2 ref2
+                     (if (= (rem step 300) 0) (conj snaps m2) snaps)
+                     (if (= (rem step 300) 0) (conj refs ref2) refs))))
+          (and (multi-ok m ref)
+               (loop ((j 0))
+                 (if (< j (count snaps)) (if (multi-ok (nth snaps j) (nth refs j)) (recur (+ j 1)) false) true)))))))
+
+;; ---- (2) a Map from an id to a Set ---------------------------------------
+
+(defun sets-ok (m: (Map i64 (Set i64)) masks: (Array i64)) -> bool
+  (loop ((id 0) (nonempty 0))
+    (if (< id (array-len masks))
+        (let ((mask (array-get masks id)))
+          (if (= mask 0)
+              (if (nil? (get m id)) (recur (+ id 1) nonempty) false)
+              (match (get m id)
+                (nil false)
+                ((some s)
+                 (if (and (= (count s) (popcount mask))
+                          (loop ((x 0))
+                            (if (< x 60)
+                                (if (= (set-contains? s x) (!= (bit-and mask (shl 1 x)) 0)) (recur (+ x 1)) false)
+                                true)))
+                     (recur (+ id 1) (+ nonempty 1))
+                     false)))))
+        (= (count m) nonempty))))
+
+(defun setmap-ok (seed: i64 skew: i64) -> bool
+  (let ((r (rng seed)))
+    (loop ((step 0)
+           (m (map-empty))
+           (masks (array 7 0))
+           (snaps (vec-empty))
+           (refs (vec-empty)))
+      (if (< step 400)
+          (let ((id (rng-below r 7))
+                (x (rng-below r 60)))
+            (let ((m2 (assoc m id (conj (unwrap-or (get m id) (set-empty)) x)))
+                  (masks2 (array-with masks id (bit-or (array-get masks id) (shl 1 (+ x skew))))))
+              (recur (+ step 1) m2 masks2
+                     (if (= (rem step 80) 0) (conj snaps m2) snaps)
+                     (if (= (rem step 80) 0) (conj refs masks2) refs))))
+          (and (sets-ok m masks)
+               (loop ((j 0))
+                 (if (< j (count snaps)) (if (sets-ok (nth snaps j) (nth refs j)) (recur (+ j 1)) false) true)))))))
+
+;; ---- (3) a Map from an id to a Map ---------------------------------------
+
+;; grid[a * 12 + b] is the value of (a, b), or -1
+(defun grid-ok (m: (Map i64 (Map i64 i64)) grid: (Array i64)) -> bool
+  (loop ((a 0) (rows 0))
+    (if (< a 12)
+        (let ((row (unwrap-or (get m a) (map-empty))))
+          (let ((n (loop ((b 0) (n 0))
+                     (if (< b 12) (recur (+ b 1) (if (>= (array-get grid (+ (* a 12) b)) 0) (+ n 1) n)) n))))
+            (if (and (= (count row) n)
+                     (loop ((b 0))
+                       (if (< b 12)
+                           (if (= (get row b) (if (>= (array-get grid (+ (* a 12) b)) 0) (some (array-get grid (+ (* a 12) b))) nil))
+                               (recur (+ b 1))
+                               false)
+                           true)))
+                (recur (+ a 1) (if (> n 0) (+ rows 1) rows))
+                false)))
+        (= (count m) rows))))
+
+(defun gridmap-ok (seed: i64 skew: i64) -> bool
+  (let ((r (rng seed)))
+    (loop ((step 0)
+           (m (map-empty))
+           (grid (array 144 -1))
+           (snaps (vec-empty))
+           (refs (vec-empty)))
+      (if (< step 500)
+          (let ((a (rng-below r 12))
+                (b (rng-below r 12))
+                (v (rng-below r 1000)))
+            (let ((m2 (assoc m a (assoc (unwrap-or (get m a) (map-empty)) b v)))
+                  (grid2 (array-with grid (+ (* a 12) b) (+ v skew))))
+              (recur (+ step 1) m2 grid2
+                     (if (= (rem step 100) 0) (conj snaps m2) snaps)
+                     (if (= (rem step 100) 0) (conj refs grid2) refs))))
+          (and (grid-ok m grid)
+               (loop ((j 0))
+                 (if (< j (count snaps)) (if (grid-ok (nth snaps j) (nth refs j)) (recur (+ j 1)) false) true)))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (p3 (checks)))
+    (do (check c (multimap-ok 860001 0))
+        (check c (setmap-ok 860002 0))
+        (check c (gridmap-ok 860003 0))
+        (check p1 (multimap-ok 860001 1))
+        (check p2 (setmap-ok 860002 1))
+        (check p3 (gridmap-ok 860003 1))
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

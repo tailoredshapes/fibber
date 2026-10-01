@@ -1,0 +1,38 @@
+;; spec:   stdlib §2.7 (hash-unordered-coll "folds the elements' hashes with bit-xor"), §4.3 (row hash-unordered-coll)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: hash hash-unordered-coll hash-combine
+;; `hash-unordered-coll` of any Reducible xors the hashes of its elements and
+;; then combines the count (decided in fib.seq.hash): the same elements in any
+;; order give one number, so a Map and a Set can hash independently of their
+;; walk. The count is what tells `[1 1]` from `[]` and `[5 5 5]` from `[5]`,
+;; whose xor is the same. The first check writes the fold out by hand. A Set
+;; hashes as `hash-unordered-coll` of its elements and a Map as the same fold
+;; over its entries, an entry being `(hash-combine (hash key) (hash val))`:
+;; both are written out by hand here too, so a different fold fails.
+(ns main (:use fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (e: (Vec i64) (vec-empty))
+        (s (conj (conj (conj (set-empty) 6) 4) 5))
+        (m (assoc (assoc (map-empty) "a" 1) "b" 2)))
+    (do (check c (= (hash-unordered-coll [1 2 3]) (hash-combine (bit-xor (bit-xor (hash 1) (hash 2)) (hash 3)) 3)))
+        (check c (= (hash-unordered-coll [1 2 3]) (hash-unordered-coll [3 1 2])))
+        (check c (= (hash-unordered-coll [1 2 3]) (hash-unordered-coll [2 3 1])))
+        (check c (= (hash-unordered-coll [1 2 3]) (hash-unordered-coll (list 3 2 1))))
+        (check c (= (hash-unordered-coll ["ab" "c" ""]) (hash-unordered-coll ["" "c" "ab"])))
+        (check c (!= (hash-unordered-coll [1 2 3]) (hash-unordered-coll [1 2 4])))
+        (check c (!= (hash-unordered-coll [1 2 3]) (hash-unordered-coll [1 2])))
+        (check c (!= (hash-unordered-coll [1 1]) (hash-unordered-coll e)))
+        (check c (!= (hash-unordered-coll [5 5 5]) (hash-unordered-coll [5])))
+        (check c (= (hash-unordered-coll e) (hash-combine 0 0)))
+        (check c (= (hash-unordered-coll (some 5)) (hash-combine (hash 5) 1)))
+        (check c (= (hash s) (hash-unordered-coll [4 5 6])))
+        (check c (= (hash s) (hash-unordered-coll [6 5 4])))
+        (check c (= (hash m)
+                    (hash-combine (bit-xor (hash-combine (hash "a") (hash 1)) (hash-combine (hash "b") (hash 2))) 2)))
+        (check c (= (checks-made c) 14))
+        (checks-result c))))

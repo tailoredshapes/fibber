@@ -1,0 +1,92 @@
+;; spec:   stdlib §4.2 (rows :as, &, _), syntax §3.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: :as & _
+;; Three marks of a pattern, as `match` has them today.
+;;  * `_` matches anything and binds nothing: at the top of a clause, in a
+;;    variant, in a vector, in the rest position;
+;;  * `&` in a vector pattern collects the elements after the first n in a
+;;    new Vec (empty when there are none, never nil): [a b & r] needs at
+;;    least two, [a & _] needs one and drops the rest, [& r] takes all and
+;;    matches the empty Vec, where [a] and [a b] match one length only, and
+;;    a clause that needs more elements than there are is not taken;
+;;  * `(pat :as v)` binds the whole value that `pat` matches as v, while
+;;    still matching inside it: a variant, a vector, and nested.
+(ns main (:use tl.check))
+
+;; the number of elements, and the sum of the first two when there are two
+(defun shape (v: (Vec i64)) -> i64
+  (match v
+    ([] 0)
+    ([a] (+ 100 a))
+    ([a b] (+ 200 (+ a b)))
+    ([a b & r] (+ 300 (+ (+ a b) (count r))))))
+
+(defun head-or (v: (Vec i64) d: i64) -> i64
+  (match v
+    ([a & _] a)
+    (_ d)))
+
+(defun rest-sum (v: (Vec i64)) -> i64
+  (match v
+    ([& r] (loop ((i 0) (acc 0)) (if (< i (count r)) (recur (+ i 1) (+ acc (nth r i))) acc)))))
+
+;; the rest is the elements after the first two, in order
+(defun third-of (v: (Vec i64)) -> i64
+  (match v
+    ([_ _ & r] (match r ([x & _] x) (_ -1)))
+    (_ -2)))
+
+;; _ in a variant and in a vector slot, and as the whole clause
+(defun kind (o: (Option (Vec i64))) -> i64
+  (match o
+    ((some [_ b]) b)
+    ((some _) 1)
+    (_ 0)))
+
+;; :as keeps the whole value, and the inside still matches
+(defun whole (o: (Option i64)) -> i64
+  (match o
+    (((some x) :as w) (+ x (match w ((some y) (* 10 y)) (nil 0))))
+    (nil -1)))
+
+(defun whole-vec (v: (Vec i64)) -> i64
+  (match v
+    (([a b & _] :as all) (+ (* 100 (count all)) (+ a b)))
+    (_ 0)))
+
+(defun nested (v: (Vec (Option i64))) -> i64
+  (match v
+    ([((some x) :as w) & r] (+ x (+ (match w ((some y) y) (nil 0)) (count r))))
+    (_ -1)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do
+      (check c (= (shape []) 0))
+      (check c (= (shape [5]) 105))
+      (check c (= (shape [5 6]) 211))
+      (check c (= (shape [5 6 7]) 312))
+      (check c (= (shape [5 6 7 8 9]) 314))
+      (check c (= (head-or [4 5 6] 0) 4))
+      (check c (= (head-or [4] 0) 4))
+      (check c (= (head-or [] 99) 99))
+      (check c (= (rest-sum []) 0))
+      (check c (= (rest-sum [1 2 3 4]) 10))
+      (check c (= (third-of [1 2 3 4]) 3))
+      (check c (= (third-of [1 2]) -1))
+      (check c (= (third-of [1]) -2))
+      (check c (= (kind (some [7 8])) 8))
+      (check c (= (kind (some [7 8 9])) 1))
+      (check c (= (kind (some [])) 1))
+      (check c (= (kind nil) 0))
+      (check c (= (whole (some 4)) 44))
+      (check c (= (whole nil) -1))
+      (check c (= (whole-vec [1 2 3 4 5]) 503))
+      (check c (= (whole-vec [1 2]) 203))
+      (check c (= (whole-vec [1]) 0))
+      (check c (= (nested [(some 6) nil nil]) 14))
+      (check c (= (nested [nil (some 6)]) -1))
+      (checks-result c))))

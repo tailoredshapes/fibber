@@ -1,4 +1,28 @@
-;; owner: L12. fib.core.alias: Clojure spellings of the builtins shl shr != =. Exports: bit-shift-left bit-shift-right unsigned-bit-shift-right not= ==.
-;; Until L12 writes it this part is its ns form alone (tranche 1 plan §4.2); the :use lines are the
-;; facades above it and the parts of its own facade that P0 wrote. The owner replaces these three lines with the part's own header.
-(ns fib.core.alias (:use fib.core.base fib.core.protocols))
+;; fib.core.alias (owner L12): Clojure's spellings of builtins that fibber has under another name
+;; (stdlib §3 N12, §4.1 rows bit-shift-left bit-shift-right unsigned-bit-shift-right == not=).
+;; It replaces nothing: shl, sar, shr, = and != keep their names, and the cases and the compiler that
+;; use them are untouched. Each alias is one generic function over the builtin protocol of the
+;; method it names, so it is monomorphised to the builtin's instruction and takes the builtin's
+;; typing: both operands one type, no promotion.
+;;
+;; Decided here, where the page is silent or a stage limit decides:
+;;  * The shift distance has the type of the value, as the builtin's has (`shl (self n: Self)`), and
+;;    is taken modulo the width, as Java's is (types §2.12): (bit-shift-left 1 64) is 1 and
+;;    (bit-shift-left 1 -1) is the minimum. Clojure's distance is a long; a literal that adopts the
+;;    width of its operand is L26 (a), so until then the distance for an i32 is written 3i32.
+;;  * bit-shift-right is the arithmetic shift (sar) and unsigned-bit-shift-right the logical one
+;;    (shr), each at the width of the operand: (unsigned-bit-shift-right -1i8 1i8) is 127i8. Java's
+;;    >>> promotes a byte to int first; fibber promotes nothing.
+;;  * == is = and not= is != on one type (the rows say "alias"), so (== 0.0 -0.0) is true and
+;;    (== nan nan) false, as IEEE and Clojure's are. Across numeric types (a literal by L19, a
+;;    variable by L26 b) and with more than two arguments they are not offered: no Rust macro of
+;;    E1 folds them (R6a's list has + - * < > <= >= = and the bit operators), so (== a b c) is
+;;    reported to the lead, not written here.
+(ns fib.core.alias)
+
+(defun bit-shift-left (a: t n: t) :where ((Bits t)) -> t (shl a n))
+(defun bit-shift-right (a: t n: t) :where ((Bits t)) -> t (sar a n))
+(defun unsigned-bit-shift-right (a: t n: t) :where ((Bits t)) -> t (shr a n))
+
+(defun == (a: t b: t) :where ((Eq t)) -> bool (= a b))
+(defun not= (a: t b: t) :where ((Eq t)) -> bool (!= a b))

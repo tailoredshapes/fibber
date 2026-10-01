@@ -1,0 +1,74 @@
+;; spec:   stdlib §4.3 (row parse-long), §1.2 P5 (nil, never a trap)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: parse-long
+;; The ends of the i64 range and one step past each: 9223372036854775807 and
+;; -9223372036854775808 parse (the negative end has no positive twin, so the
+;; digits are accumulated as a negative number), 9223372036854775808 and
+;; -9223372036854775809 are nil, and so is every longer run of nines. The
+;; last digit is what decides at the boundary 922337203685477580x, so each of
+;; 0 to 9 is tried there with both signs, the eighteen digits 922337203685477581
+;; (already above the first eighteen of the limit) take a nineteenth and must
+;; be refused before the product that would overflow is made, and leading zeros
+;; in front of an in-range value do not count towards the overflow. The expected values
+;; are built by arithmetic (2^63 - 1 from shifts) and not only written as
+;; the very literals the parser reads.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun is (r: (Option i64) want: i64) -> bool
+  (match r ((some x) (= x want)) (nil false)))
+
+;; 2^63 - 1 and -2^63, by arithmetic on shifts
+(defun max-long () -> i64 (+ (shl 1 62) (- (shl 1 62) 1)))
+(defun min-long () -> i64 (- (- 0 (max-long)) 1))
+
+;; parse-long of a sign ("", "-" or "+"), then the digits 922337203685477580, then the digit d
+(defun at-boundary (sign: str d: str) -> (Option i64)
+  (parse-long (str-concat sign (str-concat "922337203685477580" d))))
+
+;; parse-long of a sign, then 922337203685477581 (the eighteen digits that are already above the limit's
+;; first eighteen, 922337203685477580), then the digit d: nil, and a product that was not tested first would trap
+(defun above (sign: str d: str) -> (Option i64)
+  (parse-long (str-concat sign (str-concat "922337203685477581" d))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (max-long) 9223372036854775807))
+        (check c (is (parse-long "9223372036854775807") (max-long)))
+        (check c (is (parse-long "+9223372036854775807") (max-long)))
+        (check c (is (parse-long "-9223372036854775807") (- 0 (max-long))))
+        (check c (is (parse-long "-9223372036854775808") (min-long)))
+        (check c (nil? (parse-long "9223372036854775808")))
+        (check c (nil? (parse-long "+9223372036854775808")))
+        (check c (nil? (parse-long "-9223372036854775809")))
+        (check c (nil? (parse-long "9223372036854775809")))
+        (check c (nil? (parse-long "9999999999999999999")))
+        (check c (nil? (parse-long "-9999999999999999999")))
+        (check c (nil? (parse-long "92233720368547758070")))
+        (check c (nil? (parse-long "-92233720368547758080")))
+        (check c (nil? (parse-long "99999999999999999999999999999999")))
+        (check c (is (parse-long "0009223372036854775807") (max-long)))
+        (check c (is (parse-long "-0009223372036854775808") (min-long)))
+        (check c (is (parse-long "1000000000000000000") 1000000000000000000))
+        (check c (is (parse-long "-1000000000000000000") -1000000000000000000))
+        (check c (is (at-boundary "" "0") 9223372036854775800))
+        (check c (is (at-boundary "" "6") 9223372036854775806))
+        (check c (is (at-boundary "" "7") (max-long)))
+        (check c (nil? (at-boundary "" "8")))
+        (check c (nil? (at-boundary "" "9")))
+        (check c (is (at-boundary "-" "0") -9223372036854775800))
+        (check c (is (at-boundary "-" "7") (- 0 (max-long))))
+        (check c (is (at-boundary "-" "8") (min-long)))
+        (check c (nil? (at-boundary "-" "9")))
+        (check c (nil? (at-boundary "+" "8")))
+        (check c (is (at-boundary "+" "7") (max-long)))
+        (check c (is (parse-long "922337203685477581") 922337203685477581))
+        (check c (is (parse-long "-922337203685477581") -922337203685477581))
+        (check c (nil? (above "" "0")))
+        (check c (nil? (above "" "9")))
+        (check c (nil? (above "-" "0")))
+        (check c (nil? (above "-" "9")))
+        (check c (nil? (above "+" "5")))
+        (checks-result c))))

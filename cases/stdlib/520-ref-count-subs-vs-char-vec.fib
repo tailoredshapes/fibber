@@ -1,0 +1,50 @@
+;; spec:   stdlib §2.9 (count and subs count characters), §8.1 item 2 (a naive reference), cases/stdlib/README.md
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: subs subs-from
+;; `count`, `subs` and `subs-from` of a str against the (Vec char) that the
+;; prelude's `str-chars` makes (a different decoder, one char at a time into
+;; a Vec): 300 seeded strings of 0 to 24 scalars of every width (tl.gen), and
+;; for each one at once: `count` is the Vec's count; two random ranges and a
+;; random start to the end are the concatenation of the Vec's characters
+;; (built with `char->str`, no subs); the whole string and the empty range at
+;; the end are as they should be. One check per string, so a failure's
+;; index is its bit in the result (bit 62 for any later one). The last run
+;; plants a fault, a reference whose start is one character late, in a second
+;; Checks, and `check-detects` makes the case fail if that run found nothing.
+(ns main (:use fib.core fib.seq tl.rng tl.check tl.gen))
+
+;; the characters of v from index a up to b, as a string
+(defun cut (v: (Vec char) a: i64 b: i64) -> str
+  (loop ((i a) (acc ""))
+    (if (< i b) (recur (+ i 1) (str-concat acc (char->str (vec-nth v i)))) acc)))
+
+;; every property of one string; skew moves the reference's start: 0 is the true reference
+(defun holds (s: str a: i64 x: i64 skew: i64) -> bool
+  (let ((v (str-chars s))
+        (n (vec-count v))
+        (b (+ a (rem x (+ (- n a) 1)))))
+    (and (= (count s) n)
+     (and (= (subs s a b) (cut v (+ a skew) b))
+      (and (= (subs-from s a) (cut v (+ a skew) n))
+       (and (= (subs s 0 n) s)
+            (= (subs s n n) "")))))))
+
+(defun sweep (c: Checks seed: i64 strings: i64 skew: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (i strings)
+      (let ((s (gen-str r (rng-below r 25)))
+            (a (rng-below r (+ (count s) 1)))
+            (x (rng-below r 1000)))
+        (check c (holds s a x skew))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 520 300 0)
+        (check c (= (checks-made c) 300))
+        (sweep p 520 60 1)
+        (check-detects c p)
+        (checks-result c))))

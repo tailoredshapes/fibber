@@ -1,0 +1,62 @@
+;; spec:   stdlib §4.1 (rows == and not=), §3 N12, types §2.12 (Eq on floats)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: == not=
+;; Clojure's == and not= over one type are the builtin = and !=, so everything the builtin says holds
+;; for them: IEEE for floats (0.0 equals -0.0, NaN equals nothing, not even itself, so (not= nan nan)
+;; is true), structural for text, a derived instance for a user type and for Option. They are
+;; ordinary functions, so they can also be passed along as values. Across numeric types they wait for
+;; L19 and L26 (case 675).
+(ns main (:use fib.core tl.check))
+
+(defstruct P (x: i64 y: str))
+(derive Eq P)
+
+(defun same (eq: (fn (i64 i64) bool) a: i64 b: i64) -> bool (eq a b))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nan (fdiv 0.0 0.0))
+        (inf (fdiv 1.0 0.0))
+        (nan32 (fdiv 0.0f32 0.0f32)))
+    (do ;; integers, at the widths
+        (check c (== 3 3))
+        (check c (not (== 3 4)))
+        (check c (not= 3 4))
+        (check c (not (not= 3 3)))
+        (check c (== -5i8 -5i8))
+        (check c (not= 5i8 6i8))
+        (check c (== 40000i32 40000i32))
+        (check c (not= 9223372036854775807 -9223372036854775808))
+        ;; floats: IEEE
+        (check c (== 0.0 -0.0))
+        (check c (not (not= 0.0 -0.0)))
+        (check c (not (== nan nan)))
+        (check c (not= nan nan))
+        (check c (not= nan 1.0))
+        (check c (== inf inf))
+        (check c (not= inf (neg inf)))
+        (check c (not (== nan32 nan32)))
+        (check c (== 1.5f32 1.5f32))
+        ;; text, characters, booleans
+        (check c (== "abc" "abc"))
+        (check c (not= "abc" "abd"))
+        (check c (== "" ""))
+        (check c (== \a \a))
+        (check c (not= \a \b))
+        (check c (== true true))
+        (check c (not= true false))
+        ;; a derived Eq and an Option
+        (check c (== (P 1 "a") (P 1 "a")))
+        (check c (not= (P 1 "a") (P 1 "b")))
+        (check c (not= (P 1 "a") (P 2 "a")))
+        (check c (== (some 3) (some 3)))
+        (check c (not= (some 3) nil))
+        (check c (not= (some 3) (some 4)))
+        ;; as values
+        (check c (same == 7 7))
+        (check c (not (same == 7 8)))
+        (check c (same not= 7 8))
+        (checks-result c))))

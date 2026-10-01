@@ -1,0 +1,54 @@
+;; spec:   stdlib §4.15 (rows future and future-call), §2.11 (Concurrency)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: future future-call
+;; (future body ..) runs its forms on another thread, in order and once, and the task's value is the
+;; last one; the value is waited for with join (Clojure's @f, which the checker does not accept for a
+;; Task, case 658). future-call takes a function and calls it once. A future captures scalars and
+;; strings, Vecs and structs (they are Send, and the spawning code keeps using them) and returns any
+;; Send value, a Vec among them; a task is joined as often as anyone asks; a future may start
+;; another. The program has a function of its own named spawn, which the macro's template must not
+;; reach: the template names fib.prelude/spawn, so the user's function is not what it spawns.
+(ns main (:use fib.core fib.async tl.check))
+
+(defstruct P (x: i64 name: str))
+
+(defun spawn (x: i64) -> i64 (+ x 1000))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (n 5)
+        (s "abc")
+        (vv [1 2 3])
+        (p (P 5 "five"))
+        (runs (atom 0))
+        (trail (atom [])))
+    (let ((f (future (+ n 1)))
+          (g (future 1 2 (+ 20 22)))
+          (h (future-call (fn () (do (swap! runs (fn (x) (+ x 1))) 7))))
+          (t (future (str-len s)))
+          (v (future [n (+ n 1) (+ n 2)]))
+          (o (future (future (+ n 100))))
+          (m (future (+ (count vv) (+ (. p x) (str-len (. p name))))))
+          (k (future (swap! runs (fn (x) (+ x 10)))
+                     (swap! trail (fn (x) (conj x 1)))
+                     (swap! trail (fn (x) (conj x 2)))
+                     0)))
+      (do (check c (= (join f) 6))
+          (check c (= (join g) 42))
+          (check c (= (join h) 7))
+          (check c (= (join t) 3))
+          (check c (= (join f) 6))
+          (check c (= (count (join v)) 3))
+          (check c (= (nth (join v) 2) 7))
+          (check c (= (join (join o)) 105))
+          (check c (= (join m) 12))
+          (check c (and (= (count vv) 3) (= (. p name) "five")))
+          (check c (= (join k) 0))
+          (check c (= @runs 11))
+          (check c (and (= (count @trail) 2) (= (nth @trail 0) 1)))
+          (check c (= (nth @trail 1) 2))
+          (check c (= (spawn 1) 1001))
+          (checks-result c)))))

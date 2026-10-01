@@ -1,0 +1,30 @@
+;; spec:   stdlib §2.5 (a loop of assoc is in place iff the accumulator is unique), §8.1 item 5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 2000
+;; roots:  ../../lib support
+;; open:   C7
+;; covers: assoc
+;; 1000 assocs of distinct integer keys in a loop. Today they allocate 7942
+;; objects (both tools; §2.5 says 7935 for a map put loop: every node of the
+;; HAMT's path is a shell whose payload the callee cannot take, A4), so this
+;; case fails and is OPEN. C7 (a match on an owned shell that is dead
+;; afterwards moves its payload out) is the item that lets the loop run in
+;; place. The page names no bound for an assoc loop ("which this page does
+;; not guess", §8.1 item 5), and nothing has measured one: 2000, two objects
+;; an assoc, is this case's own guess, made so that the case fails today
+;; and can pass later. The agent that lands C7 replaces it with the measured
+;; count and removes `open`, which the harness demands the day the case
+;; passes.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun grow (m: (Map i64 i64) n: i64) -> (Map i64 i64)
+  (loop ((i 0) (m m)) (if (< i n) (recur (+ i 1) (assoc m i i)) m)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (grow (empty {0 0}) 1000)))
+    (do (check c (= (count m) 1000))
+        (check c (= (get-or m 999 -1) 999))
+        (checks-result c))))

@@ -1,0 +1,35 @@
+;; spec:   stdlib §4.7 (row str/index-of-from), §2.9, plan §6 L10b, A10 str (method.md rule 3, allocs)
+;; expect: accept
+;; result: 500
+;; audit:  clean
+;; allocs: <= 2502
+;; roots:  ../../lib support
+;; covers: str/index-of-from
+;; `str/index-of-from` walks bytes (`str-byte-at`) and calls `str-find`, which copy nothing, so a call
+;; allocates a fixed number of objects that does not depend on the length of the text or on `from`:
+;; the `(Option i64)` that `str-find` answers (types §8.1: an Option of a scalar is a heap enum,
+;; and `nil` too, case 218), and for a hit the `Pair` of offsets that `find-in` makes and the
+;; `(Option i64)` of the character offset. So a hit costs 3 objects and a miss 2 (`str-find`'s
+;; `nil` and the `nil` that comes back). Not the "none" that the plan's row for this case first
+;; said: the page says `str-find` "allocates nothing" and case 218 shows it allocates its answer.
+;; The loops below make 500 calls from every character offset of a 500-character text, the
+;; first loop for a character that is there (500 hits) and the second for one that is not
+;; (500 misses, each a walk to the end): 2 objects for the text, 1500 for the hits and 1000 for the
+;; misses, 2502 in all. A version that copied the text, or `str-bytes`' array, on each call would
+;; add 1000 at least. The bound is the count, tight, and the tests
+;; `a_stdlib_count_bound_one_below_the_count_fails` lower it by one and require the failure.
+(ns main (:use fib.core tl.check) (:require [fib.string :as str]))
+
+(defun at (o: (Option i64)) -> i64
+  (match o (nil -1) ((some n) n)))
+
+;; how many of the n calls from offsets 0 to n - 1 find p
+(defun scan (s: str n: i64 p: str) -> i64
+  (loop ((i 0) (hits 0))
+    (if (< i n)
+        (recur (+ i 1) (if (>= (at (str/index-of-from s p i)) 0) (+ hits 1) hits))
+        hits)))
+
+(defun main () -> i64
+  (let ((s (str-from-bytes (array 500 98i8))))
+    (+ (scan s 500 "b") (scan s 500 "c"))))

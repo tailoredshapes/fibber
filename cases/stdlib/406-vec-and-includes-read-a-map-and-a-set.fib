@@ -1,0 +1,39 @@
+;; spec:   stdlib §2.3 (Reducible: a Map yields (Pair k v), a Set its keys), §4.4 (vec), §4.5 (includes?)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec includes?
+;; The two functions of this part over the keyed collections, whose Reducible
+;; instances are L5a's and whose Collection instances are L8b's: vec of a Map is
+;; a Vec of its Pairs and vec of a Set a Vec of its elements, in the HAMT's
+;; order (so only the count and the sums are asked), and includes? finds an
+;; element of a Set and misses what is not there. (includes? of a Pair waits
+;; for the prelude's Pair, which derives Eq; the stand-in of fib.core.base does not.)
+;; fib.coll is required under an alias, not :used, as in case 384.
+(ns main (:use fib.core fib.seq tl.check) (:require [fib.coll :as coll]))
+
+;; the sum of the first components and of the second components of a Vec of Pairs
+(defun sum-fst (v: (Vec (Pair i64 i64))) -> i64
+  (loop ((i 0) (acc 0)) (if (< i (count v)) (recur (+ i 1) (+ acc (. (nth v i) fst))) acc)))
+(defun sum-snd (v: (Vec (Pair i64 i64))) -> i64
+  (loop ((i 0) (acc 0)) (if (< i (count v)) (recur (+ i 1) (+ acc (. (nth v i) snd))) acc)))
+
+(defun sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (acc 0)) (if (< i (count v)) (recur (+ i 1) (+ acc (nth v i))) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (coll/assoc (coll/assoc (coll/assoc (map-empty) 1 10) 2 20) 3 30))
+        (s (coll/conj (coll/conj (coll/conj (set-empty) 4) 5) 6))
+        (e: (Set i64) (set-empty)))
+    (do (check c (= (count (coll/vec m)) 3))
+        (check c (= (sum-fst (coll/vec m)) 6))
+        (check c (= (sum-snd (coll/vec m)) 60))
+        (check c (= (count (coll/vec s)) 3))
+        (check c (= (sum (coll/vec s)) 15))
+        (check c (= (count (coll/vec e)) 0))
+        (check c (coll/includes? 5 s))
+        (check c (not (coll/includes? 7 s)))
+        (check c (not (coll/includes? 1 e)))
+        (checks-result c))))

@@ -1,0 +1,69 @@
+;; spec:   stdlib §2.7 (a Vec a map key, A7), §1.2 P4, tranche 1 plan §6 L3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; A symbol table keyed by a vector is the bread and butter the page names:
+;; the HAMT needs `Hash` and `Eq` of the key, and a Vec had neither. Here a Map
+;; whose keys are vectors of integers, vectors of strings, vectors of vectors
+;; and a struct that derives `Eq Hash` over a Vec field: a lookup finds the
+;; value under a key that is equal but was built another way (a 40-element key
+;; built by a loop against one built backwards, which differ in no way a
+;; lookup can see), a store under an equal key replaces and does not add,
+;; `["ab" "c"]` and `["a" "bc"]` are two keys, and a dissoc by an equal key
+;; removes. A Set of vectors counts an equal vector once.
+(ns main (:use fib.seq tl.check))
+
+(defstruct Path (steps: (Vec i64)))
+(derive Eq Path)
+(derive Hash Path)
+
+;; 0 1 .. n-1 by conj, and the same elements conj'd from n-1 down to 0 and
+;; then taken as the reverse: both are the vector 0 .. n-1
+(defun up (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (fib.prelude/conj acc i)) acc)))
+
+(defun down (n: i64) -> (Vec i64)
+  (let ((rev (loop ((i (- n 1)) (acc (vec-empty))) (if (>= i 0) (recur (- i 1) (fib.prelude/conj acc i)) acc))))
+    (loop ((i (- n 1)) (acc (vec-empty))) (if (>= i 0) (recur (- i 1) (fib.prelude/conj acc (vec-nth rev i))) acc))))
+
+(defun found (m: (Map k v) key: k want: v) -> bool :where ((Hash k) (Eq k) (Eq v))
+  (match (map-get m key) ((some v) (= v want)) (nil false)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (assoc (assoc (assoc (map-empty) [1 2] "a") [2 1] "b") [] "e"))
+        (m2 (assoc m [1 2] "z"))
+        (s (assoc (assoc (map-empty) ["ab" "c"] 1) ["a" "bc"] 2))
+        (n (assoc (assoc (map-empty) [[1] [2 3]] 1) [[1 2] [3]] 2))
+        (p (assoc (assoc (map-empty) (Path [1 2]) "x") (Path [2 1]) "y"))
+        (big (assoc (map-empty) (up 40) "up"))
+        (vs (conj (conj (conj (set-empty) [1 2]) [2 1]) [1 2])))
+    (do (check c (= (fib.prelude/count m) 3))
+        (check c (found m [1 2] "a"))
+        (check c (found m [2 1] "b"))
+        (check c (found m [] "e"))
+        (check c (match (map-get m [1]) (nil true) ((some _) false)))
+        (check c (match (map-get m [1 2 3]) (nil true) ((some _) false)))
+        (check c (= (fib.prelude/count m2) 3))
+        (check c (found m2 [1 2] "z"))
+        (check c (found m [1 2] "a"))
+        (check c (= (fib.prelude/count (dissoc m [2 1])) 2))
+        (check c (match (map-get (dissoc m [2 1]) [2 1]) (nil true) ((some _) false)))
+        (check c (found (dissoc m [2 1]) [1 2] "a"))
+        (check c (= (fib.prelude/count s) 2))
+        (check c (found s ["ab" "c"] 1))
+        (check c (found s ["a" "bc"] 2))
+        (check c (found n [[1] [2 3]] 1))
+        (check c (found n [[1 2] [3]] 2))
+        (check c (found p (Path [1 2]) "x"))
+        (check c (found p (Path [2 1]) "y"))
+        (check c (match (map-get p (Path [1])) (nil true) ((some _) false)))
+        (check c (found big (down 40) "up"))
+        (check c (match (map-get big (up 41)) (nil true) ((some _) false)))
+        (check c (= (fib.prelude/count vs) 2))
+        (check c (set-contains? vs [1 2]))
+        (check c (set-contains? vs [2 1]))
+        (check c (not (set-contains? vs [1])))
+        (check c (= (checks-made c) 26))
+        (checks-result c))))

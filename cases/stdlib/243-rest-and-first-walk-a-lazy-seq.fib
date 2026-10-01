@@ -1,0 +1,36 @@
+;; spec:   stdlib §2.1 rule 2 (first, rest and seq walk it: [(some 10) (some 12) nil]), §4.4 row map
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map
+;; lfirst and lrest step through a lazy seq one node at a time: over
+;; (map f [5 6]) they give (some 10), (some 12) and nil, as the page's A13
+;; lz1 prints. The rest of the empty seq is the empty seq, and a seq that is
+;; walked to its end is realised throughout, while the one after it is not.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun opt-or (o: (Option i64) d: i64) -> i64 (match o ((some x) x) (nil d)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (let ((s (map (fn (x: i64) (* x 2)) [5 6])))
+      (let ((s1 (lrest s)) (s2 (lrest (lrest s))))
+        (do (check c (= (opt-or (lfirst s) -1) 10))
+            (check c (= (opt-or (lfirst s1) -1) 12))
+            (check c (= (opt-or (lfirst s2) -1) -1))
+            (check c (nil? (lfirst s2)))
+            (check c (some? (lfirst s1)))
+            ;; the rest of the empty seq is the empty seq
+            (check c (nil? (lfirst (lrest s2))))
+            (check c (nil? (lfirst (lrest (lrest s2)))))
+            ;; nothing was realised that was not asked for
+            (check c (realized? s))
+            (check c (realized? s1))
+            (check c (realized? s2))
+            (let ((u (map (fn (x: i64) x) [1 2 3])))
+              (do (check c (not (realized? u)))
+                  (check c (= (opt-or (lfirst u) -1) 1))
+                  (check c (realized? u))
+                  (check c (not (realized? (lrest u))))))
+            (checks-result c))))))

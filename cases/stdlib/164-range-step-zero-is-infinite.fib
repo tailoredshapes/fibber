@@ -1,0 +1,58 @@
+;; spec:   stdlib §4.4 (row range: a step of 0 repeats the start for ever), §2.1 rule 2 (an infinite source is fine)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: range-by
+;; Clojure's Range.create answers a zero step with `repeat` of the start, unless the start equals the end,
+;; which is empty. So the range is a source that never ends: an early exit takes as many elements as it likes;
+;; nth is the start at any index (O(1)); and the lazy seq of it, one node per demand, is another walk that
+;; never ends, so only the nodes asked for are made (the default to-vec would never return). The count of
+;; one is the trap of case 177. (Clojure's `first` is a consumer of tranche 1's L5b; each-while is what it uses.)
+(ns main (:use fib.core fib.seq tl.check))
+
+;; the sum of the first n elements and whether the walk stopped early (it must: the range is infinite)
+(defun take-sum (r: (Range i64) n: i64) -> (Pair i64 bool)
+  (let ((k (cell 0)) (acc (cell 0)))
+    (let ((done (each-while r (fn (x) (if (< @k n) (do (set! acc (+ @acc x)) (set! k (+ @k 1)) true) false)))))
+      (Pair @acc done))))
+
+(defun fsum (r: (Range f64) n: i64) -> f64
+  (let ((k (cell 0)) (acc (cell 0.0)))
+    (do (each-while r (fn (x) (if (< @k n) (do (set! acc (+ @acc x)) (set! k (+ @k 1)) true) false)))
+        @acc)))
+
+;; the first n elements of a lazy seq, summed, demanding exactly n nodes
+(defun lseq-sum (s: (LSeq i64) n: i64) -> i64
+  (loop ((s s) (k 0) (acc 0))
+    (if (< k n)
+        (match (lnode s)
+          ((LNil) acc)
+          ((LCons h t) (recur t (+ k 1) (+ acc h))))
+        acc)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((p (take-sum (range-by 3 10 0) 5)))
+          (check c (and (= (. p fst) 15) (not (. p snd)))))
+        ;; the end does not matter, even when it is behind the start
+        (let ((p (take-sum (range-by 10 3 0) 4)))
+          (check c (and (= (. p fst) 40) (not (. p snd)))))
+        (let ((p (take-sum (range-by 7 8 0) 1000)))
+          (check c (and (= (. p fst) 7000) (not (. p snd)))))
+        (check c (= (fsum (range-by 1.5 3.0 0.0) 4) 6.0))
+        (check c (= (fsum (range-by 2.0 3.0 -0.0) 3) 6.0))
+        ;; the start at the end is empty: the walk completes, nothing is visited, count is 0
+        (let ((p (take-sum (range-by 4 4 0) 5)))
+          (check c (and (= (. p fst) 0) (. p snd))))
+        (check c (= (count (range-by 4 4 0)) 0))
+        (check c (= (count (range-by 4.5 4.5 0.0)) 0))
+        ;; nth is the start at any index
+        (check c (= (nth (range-by 3 10 0) 0) 3))
+        (check c (= (nth (range-by 3 10 0) 1000000) 3))
+        (check c (= (nth (range-by 3.5 10.0 0.0) 99) 3.5))
+        ;; the lazy seq makes only the nodes asked for
+        (check c (= (lseq-sum (to-lseq (range-by 6 9 0)) 4) 24))
+        (check c (= (lseq-sum (to-lseq (range-by 6 9 0)) 0) 0))
+        (check c (= (lseq-sum (to-lseq (range-by 6 6 0)) 3) 0))
+        (checks-result c))))

@@ -1,0 +1,44 @@
+;; spec:   stdlib §2.1 rule 2 consequence 1 (the seq is one type), §4.4 row LSeq
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: LSeq map filter remove take drop take-while mapcat concat
+;; Every sequence function returns an (LSeq e), so the results of different
+;; ones join: the two arms of an if, the arms of a match and the elements of
+;; a Vec all have the one type (LSeq i64), whichever adaptor made them and
+;; whatever the source was. Clojure's (if flag (map f v) (filter p v)) is
+;; Clojure's text here.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+(defun pick (n: i64 v: (Vec i64)) -> (LSeq i64)
+  (match n
+    (0 (map (fn (x: i64) (+ x 1)) v))
+    (1 (filter (fn (x: i64) (> x 1)) v))
+    (2 (remove (fn (x: i64) (> x 1)) v))
+    (3 (take 2 v))
+    (4 (drop 1 v))
+    (5 (take-while (fn (x: i64) (< x 3)) v))
+    (6 (mapcat (fn (x: i64) [x x]) v))
+    (_ (concat v (some 9)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [1 2 3]))
+    (let ((seqs: (Vec (LSeq i64)) [(pick 0 v) (pick 1 v) (pick 2 v) (pick 3 v) (pick 4 v) (pick 5 v) (pick 6 v) (pick 7 v)]))
+      (do (check c (= (digits (nth seqs 0)) 234))
+          (check c (= (digits (nth seqs 1)) 23))
+          (check c (= (digits (nth seqs 2)) 1))
+          (check c (= (digits (nth seqs 3)) 12))
+          (check c (= (digits (nth seqs 4)) 23))
+          (check c (= (digits (nth seqs 5)) 12))
+          (check c (= (digits (nth seqs 6)) 112233))
+          (check c (= (digits (nth seqs 7)) 1239))
+          ;; two arms of an if, whatever the sources are
+          (check c (= (digits (if (> (count v) 2) (map (fn (x: i64) (* x 2)) v) (filter (fn (x: i64) (> x 0)) (some 5)))) 246))
+          (check c (= (digits (if (> (count v) 9) (map (fn (x: i64) (* x 2)) v) (filter (fn (x: i64) (> x 0)) (some 5)))) 5))
+          (checks-result c)))))

@@ -1,0 +1,51 @@
+;; spec:   stdlib §4.4 (row sort), §2.7 (Ord of scalars and str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: sort
+;; sort orders a collection of anything with Ord by `<`: integers of every
+;; width, floats, strings (code-point order, so "Zed" is before "apple" and
+;; "é" after "pear") and chars. The input is not touched (a Vec is a value),
+;; an already sorted, a reversed and an all-equal input come back as they
+;; should, and a length that is no power of two and crosses the 32-element
+;; boundary of the Vec's trie (33 and 70) is sorted whole.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun same (a: (Vec e) b: (Vec e)) :where ((Eq e)) -> bool
+  (if (= (fib.prelude/count a) (fib.prelude/count b))
+      (loop ((i 0))
+        (if (< i (fib.prelude/count a))
+            (if (= (fib.prelude/nth a i) (fib.prelude/nth b i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defun sorted-of (xs: (Vec e)) :where ((Ord e)) -> (Vec e) (to-vec (sort xs)))
+
+;; n, n-1, .. 1 and 1 .. n
+(defun down (n: i64) -> (Vec i64)
+  (loop ((i n) (acc (vec-empty))) (if (> i 0) (recur (- i 1) (fib.prelude/conj acc i)) acc)))
+(defun up (n: i64) -> (Vec i64)
+  (loop ((i 1) (acc (vec-empty))) (if (<= i n) (recur (+ i 1) (fib.prelude/conj acc i)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (xs [5 3 9 1 7 2 8 -4 0 3]))
+    (do (check c (same (sorted-of xs) [-4 0 1 2 3 3 5 7 8 9]))
+        (check c (same xs [5 3 9 1 7 2 8 -4 0 3]))
+        (check c (same (sorted-of [3i8 -1i8 2i8 -128i8 127i8]) [-128i8 -1i8 2i8 3i8 127i8]))
+        (check c (same (sorted-of [30i16 -1i16 20i16]) [-1i16 20i16 30i16]))
+        (check c (same (sorted-of [3i32 -1i32 2i32]) [-1i32 2i32 3i32]))
+        (check c (same (sorted-of [2.5 -1.0 0.0 10.25 -3.5]) [-3.5 -1.0 0.0 2.5 10.25]))
+        (check c (same (sorted-of [2.5f32 -1.0f32 0.5f32]) [-1.0f32 0.5f32 2.5f32]))
+        (check c (same (sorted-of ["pear" "apple" "fig" "Zed" "é" "apple2"]) ["Zed" "apple" "apple2" "fig" "pear" "é"]))
+        (check c (same (sorted-of [\z \a \é \B]) [\B \a \z \é]))
+        (check c (same (sorted-of [1 2 3 4]) [1 2 3 4]))
+        (check c (same (sorted-of [4 3 2 1]) [1 2 3 4]))
+        (check c (same (sorted-of [7 7 7 7 7]) [7 7 7 7 7]))
+        (check c (same (sorted-of [2 1]) [1 2]))
+        (check c (same (sorted-of [3 1 2]) [1 2 3]))
+        (check c (same (sorted-of (down 33)) (up 33)))
+        (check c (same (sorted-of (down 70)) (up 70)))
+        (check c (same (sorted-of (up 70)) (up 70)))
+        (checks-result c))))

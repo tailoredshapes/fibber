@@ -1,0 +1,57 @@
+;; spec:   stdlib §2.8 ((Ratio t): Num), tranche 1 plan §9.4 (ref- cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: / quot rem neg numerator denominator
+;; The other operations of a ratio against the textbook fractions, as case 071
+;; does for +, with the same naive reduction: a - b, a * b, a / b (when b is
+;; not zero), neg a, quot (the truncated n1 d2 / d1 n2 as an integer) and
+;; rem (a - b q, over d1 d2). 300 seeded pairs. The planted fault is the
+;; reference for a - b with the operands swapped: run in a second Checks
+;; it must fail somewhere.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun gcd-naive (a: i64 b: i64) -> i64
+  (loop ((x a) (y b))
+    (if (= x y) x (if (> x y) (recur (- x y) y) (recur x (- y x))))))
+
+(defun magnitude (x: i64) -> i64 (if (< x 0) (- 0 x) x))
+
+(defun reduced (n: i64 d: i64) -> (Pair i64 i64)
+  (if (= n 0)
+      (Pair 0 1)
+      (let ((g (gcd-naive (magnitude n) (magnitude d))))
+        (if (< d 0)
+            (Pair (quot (- 0 n) g) (quot (- 0 d) g))
+            (Pair (quot n g) (quot d g))))))
+
+(defun nonzero (x: i64) -> i64 (if (= x 0) 3 x))
+
+;; does the ratio r equal the fraction n/d, compared in lowest terms
+(defun is (r: (Ratio i64) n: i64 d: i64) -> bool
+  (let ((e (reduced n d)))
+    (and (= (numerator r) (. e fst)) (= (denominator r) (. e snd)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (g (rng 82)))
+    (do (dotimes (i 300)
+          (let ((n1 (- (rng-below g 61) 30))
+                (d1 (nonzero (- (rng-below g 41) 20)))
+                (n2 (nonzero (- (rng-below g 61) 30)))
+                (d2 (nonzero (- (rng-below g 41) 20))))
+            (let ((a (/ n1 d1))
+                  (b (/ n2 d2))
+                  (q (quot (* n1 d2) (* d1 n2))))
+              (do (check c (is (- a b) (- (* n1 d2) (* n2 d1)) (* d1 d2)))
+                  (check c (is (* a b) (* n1 n2) (* d1 d2)))
+                  (check c (is (/ a b) (* n1 d2) (* d1 n2)))
+                  (check c (is (neg a) (- 0 n1) d1))
+                  (check c (is (quot a b) q 1))
+                  (check c (is (rem a b) (- (* n1 d2) (* (* n2 q) d1)) (* d1 d2)))
+                  (check p (is (- a b) (- (* n2 d1) (* n1 d2)) (* d1 d2)))))))
+        (check c (= (checks-made c) 1800))
+        (check-detects c p)
+        (checks-result c))))

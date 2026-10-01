@@ -1,0 +1,86 @@
+;; spec:   stdlib §4.3 (rows map-opt and-then comp identity fnil unwrap-or nil?), §9.4 (law- cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-opt and-then comp identity fnil unwrap-or nil? some?
+;; The properties that make map-opt a functor and and-then a monad's bind,
+;; checked over 200 seeded draws (an Option, three affine functions, two
+;; functions that return an Option and drop multiples of a seeded modulus, a
+;; default): `(map-opt identity o)` is o; map-opt of a composition is the
+;; composition of the map-opts; and-then has `some` as its left and right
+;; unit and is associative; map-opt is and-then of a wrapped result; comp is
+;; associative and has identity as its unit; `(fnil f d)` is f after
+;; `unwrap-or d`; map-opt keeps nil-ness, and nil? and some? are never both
+;; true or both false. The laws take the map-opt, the
+;; and-then and the comp to check as function values, so the same laws run
+;; against a wrong one: three planted faults (map-opt that adds one to its
+;; payload, an and-then that turns a nil result into its argument, a comp
+;; in the other order), each in a Checks of its own that must break a
+;; law, which `check-detects` records in the case's own result.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun gen-opt (r: Rng) -> (Option i64)
+  (if (= (rng-below r 3) 0) nil (some (- (rng-below r 41) 20))))
+
+;; the implementations under test, as function values over i64
+(defun lib-map (f: (fn (i64) i64) o: (Option i64)) -> (Option i64) (map-opt f o))
+(defun lib-bind (f: (fn (i64) (Option i64)) o: (Option i64)) -> (Option i64) (and-then f o))
+(defun lib-comp (f: (fn (i64) i64) g: (fn (i64) i64)) -> (fn (i64) i64) (comp f g))
+
+;; the planted faults
+(defun bad-map (f: (fn (i64) i64) o: (Option i64)) -> (Option i64)
+  (match o (nil nil) ((some x) (some (f (+ x 1))))))
+(defun bad-bind (f: (fn (i64) (Option i64)) o: (Option i64)) -> (Option i64)
+  (match o (nil nil) ((some x) (match (f x) (nil (some x)) ((some y) (some y))))))
+(defun bad-comp (f: (fn (i64) i64) g: (fn (i64) i64)) -> (fn (i64) i64)
+  (fn (x) (g (f x))))
+
+(defun laws (c: Checks r: Rng
+             mo: (fn ((fn (i64) i64) (Option i64)) (Option i64))
+             at: (fn ((fn (i64) (Option i64)) (Option i64)) (Option i64))
+             cp: (fn ((fn (i64) i64) (fn (i64) i64)) (fn (i64) i64))) -> unit
+  (dotimes (i 200)
+    (let ((o (gen-opt r))
+          (a (- (rng-below r 9) 4)) (b (- (rng-below r 21) 10))
+          (a2 (- (rng-below r 9) 4)) (b2 (- (rng-below r 21) 10))
+          (a3 (- (rng-below r 9) 4)) (b3 (- (rng-below r 21) 10))
+          (m (+ 2 (rng-below r 4))) (m2 (+ 2 (rng-below r 4)))
+          (d (- (rng-below r 41) 20))
+          (x (- (rng-below r 41) 20)))
+      (let ((f (fn (v) (+ (* a v) b)))
+            (g (fn (v) (+ (* a2 v) b2)))
+            (h (fn (v) (+ (* a3 v) b3)))
+            (p (fn (v) (if (= (rem v m) 0) nil (some (+ v b)))))
+            (q (fn (v) (if (= (rem v m2) 0) nil (some (* 2 v))))))
+        (do
+          ;; functor
+          (check c (= (mo identity o) o))
+          (check c (= (mo (cp f g) o) (mo f (mo g o))))
+          (check c (= (nil? (mo f o)) (nil? o)))
+          (check c (not (= (nil? o) (some? o))))
+          ;; monad: some is a left and a right unit, bind is associative
+          (check c (= (at p (some x)) (p x)))
+          (check c (= (at (fn (v) (some v)) o) o))
+          (check c (= (at q (at p o)) (at (fn (v) (at q (p v))) o)))
+          (check c (= (mo f o) (at (fn (v) (some (f v))) o)))
+          ;; comp: associative, identity its unit
+          (check c (= ((cp f (cp g h)) x) ((cp (cp f g) h) x)))
+          (check c (= ((cp identity f) x) (f x)))
+          (check c (= ((cp f identity) x) (f x)))
+          ;; fnil is f after unwrap-or d
+          (check c (= ((fnil f d) nil) (f d)))
+          (check c (= ((fnil f d) (some x)) (f x)))
+          (check c (= ((fnil f d) o) ((comp f (fn (v) (unwrap-or v d))) o))))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (laws c (rng 777) lib-map lib-bind lib-comp)
+        (check c (= (checks-made c) 2800))
+        (laws p1 (rng 777) bad-map lib-bind lib-comp)
+        (laws p2 (rng 777) lib-map bad-bind lib-comp)
+        (laws p3 (rng 777) lib-map lib-bind bad-comp)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

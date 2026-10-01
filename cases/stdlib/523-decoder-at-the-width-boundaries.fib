@@ -1,0 +1,60 @@
+;; spec:   stdlib §2.9 (a str is a Reducible of its characters, one per Unicode scalar)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The decoder of a str reads one, two, three or four bytes by the lead byte;
+;; the places it can go wrong are the ends of each width. The ten scalars
+;; below are the first and last of each width and the two either side of the
+;; surrogate range: U+0000 (a NUL byte, which a compiled string must not take
+;; for its end), U+007F, U+0080, U+07FF, U+0800, U+D7FF, U+E000, U+FFFF,
+;; U+10000 and U+10FFFF. Each is encoded by the prelude's `char->str` (the
+;; encoder, a different piece of code) alone, and all ten together in one
+;; string, and read back by `count`, `nth`, `last`, `to-vec`, a walk and
+;; `subs`: the code point, the byte width and the position must all come back.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; the ten scalars, and the bytes each takes
+(defun scalars () -> (Vec i32)
+  [0i32 127i32 128i32 2047i32 2048i32 55295i32 57344i32 65535i32 65536i32 1114111i32])
+
+(defun widths () -> (Vec i64)
+  [1 1 2 2 3 3 3 3 4 4])
+
+(defun char-of (n: i32) -> char (i32->char n))
+
+;; the scalars written one after the other
+(defun all-ten () -> str
+  (let ((v (scalars)))
+    (loop ((i 0) (acc ""))
+      (if (< i 10) (recur (+ i 1) (str-concat acc (char->str (char-of (vec-nth v i))))) acc))))
+
+;; every scalar alone: one character of its width, and the same one back from nth, last and the walk
+(defun alone (c: Checks) -> unit
+  (let ((v (scalars))
+        (w (widths)))
+    (dotimes (i 10)
+      (let ((s (char->str (char-of (vec-nth v i)))))
+        (do (check c (= (str-len s) (vec-nth w i)))
+            (check c (= (count s) 1))
+            (check c (= (char->i32 (nth s 0)) (vec-nth v i)))
+            (check c (match (last s) ((some x) (= (char->i32 x) (vec-nth v i))) (nil false)))
+            (check c (= (char->i32 (nth (to-vec s) 0)) (vec-nth v i))))))))
+
+;; all ten in one string: each at its own index, and each cut out by subs
+(defun together (c: Checks) -> unit
+  (let ((v (scalars))
+        (s (all-ten)))
+    (do (check c (= (str-len s) 26))
+        (check c (= (count s) 10))
+        (dotimes (i 10)
+          (do (check c (= (char->i32 (nth s i)) (vec-nth v i)))
+              (check c (= (subs s i (+ i 1)) (char->str (char-of (vec-nth v i)))))))
+        (check c (match (last s) ((some x) (= (char->i32 x) 1114111i32)) (nil false)))
+        (check c (= (subs-from s 8) (str-concat (char->str (char-of 65536i32)) (char->str (char-of 1114111i32))))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (alone c)
+        (together c)
+        (checks-result c))))

@@ -1,0 +1,67 @@
+;; spec:   stdlib §4.7 (row clojure.string/join), §2.3 (Reducible, ToStr), §3 N9, plan §6 L10b
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: clojure.string/join
+;; `(str/join sep c)` is the text of the elements of any source `c` (a `Reducible c e` whose element
+;; is a `ToStr e`) with `sep` between neighbours and nothing before the first or after the last.
+;; The one-argument arity of the page, `(str/join c)`, is `(str/join "" c)` until arity overloading
+;; (L1): the checks use the empty separator. The elements of a `(Vec str)` need no instance (`str`
+;; is `ToStr` already); a user type is joinable with one `ToStr` instance and one `each-while`, as
+;; every adaptor is available to it. Empty pieces are pieces: `("" "")` joined by `,` is `,`; the
+;; empty source is the empty string and a source of one element has no separator. Multi-byte
+;; separators and pieces stay whole. A longer join is compared with the text built by the slowest
+;; way, `str-concat` in a loop. Numbers and characters as elements need the `ToStr` instances of
+;; the printing part (L11): case 563.
+(ns main (:use fib.core fib.seq tl.check) (:require [fib.string :as str]))
+
+(defun no-strs () -> (Vec str) [])
+(defun the-none () -> (Option str) nil)
+
+(defstruct Pt (x: i64))
+
+(impl ToStr Pt (to-str (self) (str-concat "P" (show (. self x)))))
+
+;; a source of its points, from one each-while (the library's Reducible is for any such type)
+(defstruct Bag (pts: (Vec Pt)))
+
+(impl (Reducible Pt) Bag
+  (each-while (self k)
+    (let ((v (. self pts)) (n (fib.prelude/vec-count (. self pts))))
+      (loop ((i 0)) (if (< i n) (if (k (fib.prelude/vec-nth v i)) (recur (+ i 1)) false) true)))))
+
+;; the same text, the slow way
+(defun slow (n: i64) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i n)
+        (recur (+ i 1) (str-concat (str-concat acc (if (> i 0) ", " "")) (str-concat "p" (show i))))
+        acc)))
+
+(defun pieces (n: i64) -> (Vec str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (str-concat "p" (show i)))) acc)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (str/join ", " ["a" "b" "c"]) "a, b, c"))
+        (check c (= (str/join "" ["a" "b" "c"]) "abc"))
+        (check c (= (str/join "," ["x"]) "x"))
+        (check c (= (str/join "," ["" ""]) ","))
+        (check c (= (str/join "," [""]) ""))
+        (check c (= (str/join "," ["a" ""]) "a,"))
+        (check c (= (str/join "," ["" "a"]) ",a"))
+        (check c (= (str/join "--" (no-strs)) ""))
+        (check c (= (str/join "" (no-strs)) ""))
+        (check c (= (str/join "→" ["é" "€" "😀"]) "é→€→😀"))
+        (check c (= (str/join "😀" ["a" "b" "c"]) "a😀b😀c"))
+        (check c (= (str-len (str/join "→" ["é" "€" "😀"])) 15))
+        (check c (= (str/join ", " (some "only")) "only"))
+        (check c (= (str/join ", " (the-none)) ""))
+        (check c (= (str/join "+" (Bag [(Pt 1) (Pt 22) (Pt 333)])) "P1+P22+P333"))
+        (check c (= (str/join "+" (Bag (vec-empty))) ""))
+        (check c (= (str/join ", " (pieces 300)) (slow 300)))
+        ;; 300 pieces: p0..p9 take 2 bytes, p10..p99 3, p100..p299 4, and 299 commas between them
+        (check c (= (str-len (str/join "," (pieces 300))) (+ 299 (+ (* 10 2) (+ (* 90 3) (* 200 4))))))
+        (checks-result c))))
+

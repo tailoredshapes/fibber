@@ -1,0 +1,57 @@
+;; spec:   stdlib §4.3 (row unwrap-or), §2.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: unwrap-or
+;; `unwrap-or` is the prelude's, kept as it is (syntax §4.5); this is its
+;; judge. `(unwrap-or o d)` is the payload of a `some` and d for nil, the
+;; spelling of Clojure's `(or (get m k) d)` that runs today. d is evaluated
+;; whichever way the Option goes (it is an argument, not a branch), the
+;; payload of a `some` is not changed by d, and an object payload or default
+;; comes back owned (the audit is clean). Over an Option of an Option the
+;; payload is the inner Option, so a `(some nil)` answers nil and the
+;; default is not used; the same over an Option of a scalar Option is case
+;; 118, which fibc gets wrong today.
+(ns main (:use fib.core tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (evals (cell 0))
+        (none: (Option i64) nil)
+        (no-str: (Option str) nil)
+        (hole: (Option (Option str)) (some nil))
+        (absent: (Option (Option str)) nil)
+        (dflt: (Option str) (some "default")))
+    (do
+      (check c (= (unwrap-or (some 4) 9) 4))
+      (check c (= (unwrap-or none 9) 9))
+      (check c (= (unwrap-or (some 0) 9) 0))
+      (check c (= (unwrap-or (some false) true) false))
+      (check c (= (unwrap-or (some 2.5) 0.5) 2.5))
+      (check c (= (unwrap-or (some "a") "b") "a"))
+      (check c (= (unwrap-or no-str "b") "b"))
+      (check c (= (unwrap-or (some \a) \b) \a))
+      (check c (= (unwrap-or (let ((n: (Option char) nil)) n) \b) \b))
+      (check c (= (unwrap-or (some 1i16) 2i16) 1i16))
+      (check c (= (unwrap-or (let ((n: (Option i16) nil)) n) 2i16) 2i16))
+      (check c (= (unwrap-or (some 1i32) 2i32) 1i32))
+      (check c (= (unwrap-or (some 1.5f32) 2.5f32) 1.5f32))
+      (check c (= (unwrap-or (let ((n: (Option f32) nil)) n) 2.5f32) 2.5f32))
+      (check c (= (unwrap-or (some 1i8) 2i8) 1i8))
+      (check c (= (count (unwrap-or (some [1 2 3]) [])) 3))
+      (check c (= (count (unwrap-or (let ((n: (Option (Vec i64)) nil)) n) [7 8])) 2))
+      (check c (= (. (unwrap-or (some (Pt 1 2)) (Pt 8 9)) y) 2))
+      (check c (= (. (unwrap-or (let ((n: (Option Pt) nil)) n) (Pt 8 9)) y) 9))
+      ;; the default is an argument: it is evaluated for a some as well as for nil
+      (check c (= (unwrap-or (some 1) (do (set! evals (+ @evals 1)) 2)) 1))
+      (check c (= @evals 1))
+      (check c (= (unwrap-or none (do (set! evals (+ @evals 1)) 2)) 2))
+      (check c (= @evals 2))
+      ;; an Option of an Option: the payload is the inner Option
+      (check c (nil? (unwrap-or hole dflt)))
+      (check c (= (unwrap-or absent dflt) (some "default")))
+      (check c (= (unwrap-or (some dflt) nil) (some "default")))
+      (checks-result c))))

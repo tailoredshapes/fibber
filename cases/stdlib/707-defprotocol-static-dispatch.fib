@@ -1,0 +1,82 @@
+;; spec:   stdlib §4.2 (row defprotocol), syntax §3.10
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: defprotocol
+;; A protocol names methods with typed signatures; an `impl` gives them to
+;; a type, and a call is resolved by the type of its first argument, when
+;; the program is compiled (there is no `dyn` here: every call below is a
+;; direct call of one impl). One protocol has instances for a scalar, a
+;; string, a struct, an enum and a generic collection; a method with a
+;; body is a default that an impl may keep or replace; a method may take
+;; more parameters than self; a protocol with a determined parameter
+;; (`(Conv s r)`: the instance fixes r) answers a different type per
+;; instance; and a generic function bounded by the protocol runs with
+;; every instance.
+(ns main (:use tl.check))
+
+(defprotocol Sized
+  (size-of (self) -> i64)
+  (big? (self) -> bool (> (size-of self) 10))
+  (fits-in (self limit: i64) -> bool (<= (size-of self) limit)))
+
+(defstruct Crate (w: i64 h: i64))
+(defenum Shape (Circle r: i64) (Square w: i64))
+
+(impl Sized i64 (size-of (self) self))
+(impl Sized str (size-of (self) (str-len self)))
+(impl Sized Crate
+  (size-of (self) (* (. self w) (. self h)))
+  (big? (self) (> (* (. self w) (. self h)) 100)))
+(impl Sized Shape
+  (size-of (self)
+    (match self
+      ((Circle r) (* 3 (* r r)))
+      ((Square w) (* w w)))))
+(impl Sized (Vec a) (size-of (self) (count self)))
+
+;; the instance fixes the result type: an i64 gives a str, a str an i64
+(defprotocol (Conv s r) (conv (self) -> r))
+(impl (Conv i64) str (conv (self) (str-len self)))
+(impl (Conv str) i64 (conv (self) (show self)))
+
+;; a bound on the protocol is all a generic function knows of its argument
+(defun total (a: x b: x) :where ((Sized x)) -> i64 (+ (size-of a) (size-of b)))
+(defun big-count (a: x b: x c: x) :where ((Sized x)) -> i64
+  (+ (if (big? a) 1 0) (+ (if (big? b) 1 0) (if (big? c) 1 0))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do
+      ;; one method, five types
+      (check c (= (size-of 7) 7))
+      (check c (= (size-of "hello") 5))
+      (check c (= (size-of (Crate 3 4)) 12))
+      (check c (= (size-of (Circle 2)) 12))
+      (check c (= (size-of (Square 5)) 25))
+      (check c (= (size-of [1 2 3]) 3))
+      ;; the default, kept; the default, replaced
+      (check c (big? 11))
+      (check c (not (big? 10)))
+      (check c (big? "twelve chars"))
+      (check c (not (big? (Crate 3 4))))
+      (check c (big? (Crate 11 10)))
+      (check c (not (big? (Crate 10 10))))
+      (check c (big? (Square 4)))
+      (check c (not (big? [1 2 3])))
+      ;; a method with a parameter besides self, and a default over it
+      (check c (fits-in "abc" 3))
+      (check c (not (fits-in "abc" 2)))
+      (check c (fits-in (Circle 1) 3))
+      ;; the determined parameter
+      (check c (= (conv 12345) "12345"))
+      (check c (= (conv "abc") 3))
+      (check c (= (conv (conv 77)) 2))
+      ;; a generic function over the protocol
+      (check c (= (total 1 2) 3))
+      (check c (= (total "ab" "cde") 5))
+      (check c (= (total (Square 2) (Circle 1)) 7))
+      (check c (= (big-count 1 20 30) 2))
+      (check c (= (big-count (Crate 1 1) (Crate 20 20) (Crate 5 5)) 1))
+      (checks-result c))))

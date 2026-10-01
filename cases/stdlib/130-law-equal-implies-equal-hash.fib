@@ -1,0 +1,169 @@
+;; spec:   stdlib §2.7 (`Hash` contract: `=` implies equal hashes), §8.1 item 4 (laws), tranche 1 plan §6 L3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: hash
+;; The law of `Hash`: two values that are `=` have one hash. Checked over 200
+;; seeded iterations of five kinds of nested value, each iteration making an
+;; equal pair (the value built twice, and for a Map and a Set built in two
+;; different insertion orders) and a pair that is equal only by chance: a Vec of
+;; Vecs of strings (every scalar width), a Map from strings to Vecs, a Map and a
+;; Set whose keys all hash to 7 (`Coll`, so the entries of one bucket come out in
+;; the order they went in: two equal maps walk in two orders), and a Set of Vecs.
+;; A kind is three checks: its count of equal pairs whose hashes differ must be 0,
+;; and the number of pairs found equal and of pairs found unequal must each be
+;; large, so a generator that only made one sort would fail. The planted faults are the
+;; plausible wrong hashes of a Map and of a Set: an ordered fold over the walk
+;; (right for a Vec, wrong for a bucket). Run through the same law over the same
+;; pairs they must break it, and `check-detects` fails the case when they do not.
+;; Until L4 turns the prelude's `Entry` into `Pair`, the Map's walk hands out an
+;; `Entry` whose fields are `key` and `val`; `entry-hash` is the one place that
+;; reads them (and names the type), and then they are `fst` and `snd`.
+(ns main (:use fib.seq tl.rng tl.check tl.gen))
+
+(defstruct Coll (id: i64))
+(derive Eq Coll)
+(impl Hash Coll (hash (self) 7))
+
+;; what a run of the law counts: pairs seen, pairs equal, equal pairs whose hashes differ
+(defstruct Tally (pairs: (Cell i64) equal: (Cell i64) broken: (Cell i64)))
+
+(defun tally () -> Tally (Tally (cell 0) (cell 0) (cell 0)))
+
+(defun bump (c: (Cell i64)) -> unit (set! c (+ @c 1)))
+
+(defun law (t: Tally hf: (fn (v) i64) :borrow a: v b: v) :where ((Eq v)) -> unit
+  (do (bump (. t pairs))
+      (if (= a b)
+          (do (bump (. t equal))
+              (if (= (hf a) (hf b)) () (bump (. t broken))))
+          ())))
+
+;; the t-th insertion position of n in order 0 (forward), 1 (reverse) or 2 (rotated by 3)
+(defun at (n: i64 i: i64 order: i64) -> i64
+  (if (= order 0) i (if (= order 1) (- (- n 1) i) (rem (+ i 3) n))))
+
+(defun words (r: Rng n: i64) -> (Vec str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/conj acc (gen-str r (rng-below r 4)))) acc)))
+
+(defun gen-vv (r: Rng) -> (Vec (Vec str))
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (rng-below r 5)) (recur (+ i 1) (fib.prelude/conj acc (words r (rng-below r 4)))) acc)))
+
+;; a plan: the keys (or elements) and what goes with them, drawn once and built in any order
+(defstruct Plan (ks: (Vec str) vs: (Vec (Vec i64))))
+
+(defun gen-plan (r: Rng) -> Plan
+  (let ((n (rng-below r 9)))
+    (loop ((i 0) (ks (vec-empty)) (vs (vec-empty)))
+      (if (< i n)
+          (recur (+ i 1)
+                 (fib.prelude/conj ks (str-concat (gen-str r 2) (show i)))
+                 (fib.prelude/conj vs (rng-vec r (rng-below r 4) 5)))
+          (Plan ks vs)))))
+
+(defun build-sm (p: Plan order: i64) -> (Map str (Vec i64))
+  (let ((n (vec-count (. p ks))))
+    (loop ((i 0) (m (map-empty)))
+      (if (< i n)
+          (let ((j (at n i order))) (recur (+ i 1) (assoc m (vec-nth (. p ks) j) (vec-nth (. p vs) j))))
+          m))))
+
+(defun build-cm (ids: (Vec i64) order: i64) -> (Map Coll i64)
+  (let ((n (vec-count ids)))
+    (loop ((i 0) (m (map-empty)))
+      (if (< i n)
+          (let ((j (at n i order))) (recur (+ i 1) (assoc m (Coll (vec-nth ids j)) (* 7 (vec-nth ids j)))))
+          m))))
+
+(defun build-cm-vals (ids: (Vec i64) vals: (Vec i64) order: i64) -> (Map Coll i64)
+  (let ((n (vec-count ids)))
+    (loop ((i 0) (m (map-empty)))
+      (if (< i n)
+          (let ((j (at n i order))) (recur (+ i 1) (assoc m (Coll (vec-nth ids j)) (vec-nth vals j))))
+          m))))
+
+(defun build-cs (ids: (Vec i64) order: i64) -> (Set Coll)
+  (let ((n (vec-count ids)))
+    (loop ((i 0) (s (set-empty)))
+      (if (< i n) (recur (+ i 1) (conj s (Coll (vec-nth ids (at n i order))))) s))))
+
+(defun build-vs (p: Plan order: i64) -> (Set (Vec i64))
+  (let ((n (vec-count (. p vs))))
+    (loop ((i 0) (s (set-empty)))
+      (if (< i n) (recur (+ i 1) (conj s (vec-nth (. p vs) (at n i order)))) s))))
+
+;; ids drawn from 0..11, repeats allowed
+(defun gen-ids (r: Rng) -> (Vec i64) (rng-vec r (rng-below r 9) 12))
+
+;; the plausible wrong hashes: an ordered fold over the walk of a Map and of a Set (over the
+;; entry's or the element's `id`, since the hash of a Coll is one number for all of them)
+(defun entry-hash (e: (Pair Coll i64)) -> i64 (hash-combine (hash (. e fst)) (hash (. e snd))))
+
+(defun ordered-map-hash (m: (Map Coll i64)) -> i64
+  (let ((h (cell 1)))
+    (do (for-each m (fn (e) (set! h (hash-combine @h (entry-hash e))))) @h)))
+
+(defun ordered-set-hash (s: (Set Coll)) -> i64
+  (let ((h (cell 1)))
+    (do (for-each s (fn (x) (set! h (hash-combine @h (hash (. x id)))))) @h)))
+
+;; the five kinds, 40 iterations each; the Coll kinds take the hash under test as a parameter, so
+;; the planted faults run through the same code
+(defun run-vv (t: Tally seed: i64) -> unit
+  (dotimes (i 40)
+    (let ((s (+ seed i)) (h (fn (v: (Vec (Vec str))) (hash v))))
+      (do (law t h (gen-vv (rng s)) (gen-vv (rng s)))
+          (law t h (gen-vv (rng s)) (gen-vv (rng (+ s 7919))))))))
+
+(defun run-sm (t: Tally seed: i64) -> unit
+  (dotimes (i 40)
+    (let ((p (gen-plan (rng (+ seed i)))) (q (gen-plan (rng (+ seed (+ i 7919))))) (h (fn (m: (Map str (Vec i64))) (hash m))))
+      (do (law t h (build-sm p 0) (build-sm p (+ 1 (rem i 2))))
+          (law t h (build-sm p 0) (build-sm q 0))))))
+
+(defun run-cm (t: Tally hm: (fn ((Map Coll i64)) i64) :borrow seed: i64) -> unit
+  (dotimes (i 40)
+    (let ((ids (gen-ids (rng (+ seed i)))) (vals (rng-vec (rng (+ seed (+ i 99))) 9 100)))
+      (do (law t hm (build-cm ids 0) (build-cm ids (+ 1 (rem i 2))))
+          (law t hm (build-cm-vals ids vals 0) (build-cm-vals ids vals (+ 1 (rem i 2))))
+          (law t hm (build-cm ids 0) (build-cm-vals ids vals 0))))))
+
+(defun run-cs (t: Tally hs: (fn ((Set Coll)) i64) :borrow seed: i64) -> unit
+  (dotimes (i 40)
+    (let ((ids (gen-ids (rng (+ seed i)))) (other (gen-ids (rng (+ seed (+ i 7919))))))
+      (do (law t hs (build-cs ids 0) (build-cs ids (+ 1 (rem i 2))))
+          (law t hs (build-cs ids 0) (build-cs other 0))))))
+
+(defun run-vs (t: Tally seed: i64) -> unit
+  (dotimes (i 40)
+    (let ((p (gen-plan (rng (+ seed i)))) (q (gen-plan (rng (+ seed (+ i 7919))))) (h (fn (s: (Set (Vec i64))) (hash s))))
+      (do (law t h (build-vs p 0) (build-vs p (+ 1 (rem i 2))))
+          (law t h (build-vs p 0) (build-vs q 0))))))
+
+;; a kind holds when no equal pair was split, and both sorts of pair were met
+(defun holds (c: Checks t: Tally) -> unit
+  (do (check c (= @(. t broken) 0))
+      (check c (> @(. t equal) 30))
+      (check c (> (- @(. t pairs) @(. t equal)) 30))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks))
+        (vv (tally)) (sm (tally)) (cm (tally)) (cs (tally)) (vs (tally))
+        (bad-cm (tally)) (bad-cs (tally)))
+    (do (run-vv vv 1000)
+        (run-sm sm 2000)
+        (run-cm cm (fn (m: (Map Coll i64)) (hash m)) 3000)
+        (run-cs cs (fn (s: (Set Coll)) (hash s)) 4000)
+        (run-vs vs 5000)
+        (holds c vv) (holds c sm) (holds c cm) (holds c cs) (holds c vs)
+        (run-cm bad-cm ordered-map-hash 3000)
+        (run-cs bad-cs ordered-set-hash 4000)
+        (check p (= @(. bad-cm broken) 0))
+        (check p (= @(. bad-cs broken) 0))
+        (check c (> @(. bad-cm broken) 0))
+        (check c (> @(. bad-cs broken) 0))
+        (check-detects c p)
+        (checks-result c))))

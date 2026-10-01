@@ -1,0 +1,132 @@
+;; spec:   stdlib §2.7 (`=` implies equal hashes), §8.1 items 2 and 4, types §2.12
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; The contract of Hash, on which the Map and the Set stand, is that two values
+;; that are `=` have one hash, however each was made: a Map that stores a key
+;; under one hash and looks for an equal one under another misses it. For
+;; each key type below, 60 keys are made from an id by a function that takes a
+;; route as well, and the same id made by a different route (a string rebuilt
+;; from its bytes, from its characters, or sliced out of a longer string; a
+;; float computed as x + 0.0 or x * 1.0, which turns -0.0 into 0.0) must be
+;; equal and have equal hashes, the hash of a key must be the same when asked
+;; twice, a Map filled with the keys of route 0 must find each one under the
+;; key of another route, and must not find a key whose id was never put. The
+;; strings come from tl.gen, so they have scalars of one to four bytes. The
+;; types: str; (Option str) with one nil; a struct of a string and an integer
+;; and a struct of that and a variant, all with `derive Hash`; an enum with and
+;; without fields; a List of two strings; f64 with random bit patterns for the
+;; exponent and the mantissa, and +0.0 / -0.0 for id 0. What the page says of the
+;; hash of floats is checked as well: every NaN hashes alike and no NaN key is
+;; ever found, as in Clojure. The fault planted is a type whose hash carries a
+;; counter, so two equal values hash apart.
+(ns main (:use tl.rng tl.gen tl.check))
+
+(defstruct P (name: str n: i64))
+(derive Eq P)
+(derive Hash P)
+(defenum Tok (Ident s: str) (Number n: i64) Eof)
+(derive Eq Tok)
+(derive Hash Tok)
+(defstruct Q (p: P tag: Tok))
+(derive Eq Q)
+(derive Hash Q)
+
+;; ---- the same string, built by another route ----------------------------
+
+(defun via-bytes (s: str) -> str (str-from-bytes (str-bytes s)))
+
+(defun via-chars (s: str) -> str
+  (let ((cs (str-chars s)))
+    (str-join (loop ((i 0) (acc (vec-empty)))
+                (if (< i (count cs)) (recur (+ i 1) (conj acc (char->str (nth cs i)))) acc)))))
+
+;; the string as the middle of a longer one, with two-byte and three-byte scalars around it
+(defun via-slice (s: str) -> str
+  (let ((pre (str-concat (char->str (i32->char 233i32)) "ab"))
+        (post (char->str (i32->char 8364i32))))
+    (str-slice (str-concat pre (str-concat s post)) (str-len pre) (+ (str-len pre) (str-len s)))))
+
+(defun reroute (s: str route: i64) -> str
+  (if (= route 1) (via-bytes s) (if (= route 2) (via-chars s) (if (= route 3) (via-slice s) s))))
+
+;; ---- the key makers: (id, route) ------------------------------------------
+
+;; random scalars (up to 12) and the id, so no two ids give equal strings
+(defun mk-s (i: i64 route: i64) -> str
+  (reroute (str-concat (gen-str (rng (+ 845000 i)) (rem i 13)) (str-concat "#" (show i))) route))
+
+(defun mk-opt (i: i64 route: i64) -> (Option str) (if (= i 0) nil (some (mk-s i route))))
+
+(defun mk-p (i: i64 route: i64) -> P (P (mk-s i route) i))
+
+(defun mk-tok (i: i64 route: i64) -> Tok
+  (if (= i 0) Eof (if (= (rem i 2) 0) (Ident (mk-s i route)) (Number i))))
+
+(defun mk-q (i: i64 route: i64) -> Q (Q (mk-p i route) (mk-tok i route)))
+
+(defun mk-list (i: i64 route: i64) -> (List str) (list (mk-s i route) (mk-s (+ i 1000) route)))
+
+;; finite doubles of every sign with random mantissas; id 0 is 0.0 and then -0.0
+(defun mk-f (i: i64 route: i64) -> f64
+  (let ((r (rng (+ 845500 i)))
+        (x (if (= i 0)
+               0.0
+               (bits->f64 (bit-or (shl (+ 1000 (rem i 40)) 52)
+                                  (bit-or (shr (rng-next r) 12) (if (= (rem i 2) 1) (shl 1 63) 0)))))))
+    (if (= route 1) (+ x 0.0) (if (= route 2) (* x 1.0) (if (= i 0) -0.0 x)))))
+
+;; a type that breaks the contract: equal on n, but the hash counts the calls
+(defstruct Bad (n: i64 calls: (Cell i64)))
+(impl Eq Bad (= (self o) (= (. self n) (. o n))))
+(impl Hash Bad (hash (self) (let ((c @(. self calls))) (do (set! (. self calls) (+ c 1)) (+ (. self n) c)))))
+
+;; ---- the law ------------------------------------------------------------
+
+;; n keys: route 0 equals every other route and hashes alike, hash is a
+;; function, a Map of the route-0 keys finds the other routes' and misses an id it never had
+(defun law-holds (mk: (fn (i64 i64) k) n: i64) :where ((Hash k) (Eq k)) -> bool
+  (let ((m (loop ((i 0) (m (map-empty))) (if (< i n) (recur (+ i 1) (assoc m (mk i 0) i)) m))))
+    (and (= (count m) n)
+         (loop ((i 0))
+           (if (< i n)
+               (let ((a (mk i 0))
+                     (b (mk i (+ 1 (rem i 3))))
+                     (z (mk (+ i n) 0)))
+                 (if (and (= a b)
+                          (and (= (hash a) (hash b))
+                               (and (= (hash a) (hash a))
+                                    (and (= (get m b) (some i)) (nil? (get m z))))))
+                     (recur (+ i 1))
+                     false))
+               true)))))
+
+(defun nan-facts () -> bool
+  (let ((n1 (bits->f64 9221120237041090560))
+        (n2 (bits->f64 9221120237041090561))
+        (n3 (bits->f64 -2251799813685248))
+        (m (assoc (assoc (map-empty) 0.0 1) 2.5 2)))
+    (and (!= n1 n1)
+         (and (= (hash n1) (hash n2))
+              (and (= (hash n1) (hash n3))
+                   (and (nil? (get (assoc m n1 7) n1))
+                        (and (nil? (get (assoc m n1 7) n2))
+                             (and (= (count (assoc (assoc m n1 7) n1 8)) 4)
+                                  (= (get m -0.0) (some 1))))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (shared (cell 0)))
+    (do (check c (law-holds mk-s 60))
+        (check c (law-holds mk-opt 60))
+        (check c (law-holds mk-p 60))
+        (check c (law-holds mk-tok 60))
+        (check c (law-holds mk-q 60))
+        (check c (law-holds mk-list 60))
+        (check c (law-holds mk-f 60))
+        (check c (nan-facts))
+        (check p (law-holds (fn (i route) (Bad i shared)) 20))
+        (check-detects c p)
+        (checks-result c))))

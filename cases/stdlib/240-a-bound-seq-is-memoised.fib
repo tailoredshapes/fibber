@@ -1,0 +1,31 @@
+;; spec:   stdlib §2.1 rule 2 (Clojure's lazy seq, Decided Q34), §4.4 row map
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map
+;; The result of map is a memoised lazy seq: bound to a name and walked
+;; twice, a counting f runs once per element, three times in all for three
+;; elements (the page's A13 lz1: [12 12 3]). Two seqs made by two calls of
+;; map over one source each run f for themselves: the memo belongs to the
+;; seq and not to the source.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2)))))
+      (let ((s (map f [1 2 3])))
+        (do (check c (= (total s) 12))
+            (check c (= (total s) 12))
+            (check c (= @calls 3))
+            (check c (= (count s) 3))
+            (check c (= @calls 3))
+            (let ((t (map f [1 2 3])))
+              (do (check c (= (total t) 12))
+                  (check c (= @calls 6))))
+            (checks-result c))))))

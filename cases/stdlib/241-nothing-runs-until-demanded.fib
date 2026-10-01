@@ -1,0 +1,58 @@
+;; spec:   stdlib §2.1 rule 2 (nothing runs until a node is demanded), §4.4 rows map filter take drop mapcat concat
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter remove take drop take-while mapcat concat
+;; Calling a sequence function builds a seq and runs neither its function
+;; nor its source: for each adaptor, a counter in the function and a counter
+;; in the source's thunks both read 0 right after the call, and only the
+;; demand for the first node moves them. The source is an LSeq of five
+;; nodes that bump a counter each time one is made.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+;; what mk's seq has cost: [function calls, source nodes] right after the
+;; call, then [function calls, source nodes] after asking for its first node
+(defun probe (mk: (fn ((LSeq i64) (Cell i64)) (LSeq i64))) -> (Vec i64)
+  (let ((calls (cell 0)) (nodes (cell 0)))
+    (let ((s (mk (countdown 5 nodes) calls)))
+      (let ((c0 @calls) (n0 @nodes))
+        (let ((first-node (lfirst s)))
+          [c0 n0 @calls @nodes])))))
+
+(defun idle (v: (Vec i64)) -> bool (and (= (nth v 0) 0) (= (nth v 1) 0)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (let ((m (probe (fn (s calls) (map (fn (x: i64) (do (set! calls (+ @calls 1)) x)) s))))
+          (fl (probe (fn (s calls) (filter (fn (x: i64) (do (set! calls (+ @calls 1)) true)) s))))
+          (rm (probe (fn (s calls) (remove (fn (x: i64) (do (set! calls (+ @calls 1)) false)) s))))
+          (tk (probe (fn (s calls) (take 3 (map (fn (x: i64) (do (set! calls (+ @calls 1)) x)) s)))))
+          (dr (probe (fn (s calls) (drop 2 s))))
+          (tw (probe (fn (s calls) (take-while (fn (x: i64) (do (set! calls (+ @calls 1)) true)) s))))
+          (mc (probe (fn (s calls) (mapcat (fn (x: i64) (do (set! calls (+ @calls 1)) [x x])) s))))
+          (cc (probe (fn (s calls) (concat s s)))))
+      (do (check c (idle m))
+          (check c (idle fl))
+          (check c (idle rm))
+          (check c (idle tk))
+          (check c (idle dr))
+          (check c (idle tw))
+          (check c (idle mc))
+          (check c (idle cc))
+          ;; the first demand costs one call of the function and one node of the source
+          (check c (and (= (nth m 2) 1) (= (nth m 3) 1)))
+          (check c (and (= (nth fl 2) 1) (= (nth fl 3) 1)))
+          (check c (and (= (nth rm 2) 1) (= (nth rm 3) 1)))
+          (check c (and (= (nth tk 2) 1) (= (nth tk 3) 1)))
+          (check c (and (= (nth tw 2) 1) (= (nth tw 3) 1)))
+          (check c (and (= (nth mc 2) 1) (= (nth mc 3) 1)))
+          ;; drop skips two nodes and reads the third; concat reads one
+          (check c (= (nth dr 3) 3))
+          (check c (= (nth cc 3) 1))
+          (checks-result c)))))
