@@ -1,5 +1,5 @@
 //! Numbers of other widths and floats, as the model evaluates them
-//! (types §2.12, Rust's semantics): integer `+ - * / rem neg` trap when
+//! (types §2.12, Rust's semantics): integer `+ - * quot rem neg` trap when
 //! the exact result does not fit the width or the divisor is zero;
 //! shifts take the amount modulo the width; float arithmetic is IEEE at
 //! its width and never traps (`rem` is `fmod`), and float comparisons
@@ -69,6 +69,8 @@ fn checked(h: &str, v: i128, bits: u32) -> Res {
 fn int_binary(h: &str, a: i64, b: i64, bits: u32) -> Res {
     let (x, y) = (i128::from(a), i128::from(b));
     let s = (b.rem_euclid(i64::from(bits))) as u32;
+    // `quot` is the division the builtin `/` was; its traps name `/`.
+    let h = if h == "quot" { "/" } else { h };
     match h {
         "+" => checked(h, x + y, bits),
         "-" => checked(h, x - y, bits),
@@ -116,6 +118,10 @@ fn float_op(h: &str, a: f64, b: Option<f64>, t: NumTy) -> Res {
         ("-", Some(b)) => a - b,
         ("*", Some(b)) => a * b,
         ("/", Some(b)) => a / b,
+        // `quot` rounds the quotient at the width toward zero, as the
+        // interpreter and Clojure do; the compiled code calls libm's
+        // `trunc` on the `fdiv`.
+        ("quot", Some(b)) => round(a / b, t).trunc(),
         // `rem` is LLVM's `frem` (types §8.12), C's `fmod`: the exact
         // `a - b·trunc(a/b)`, with the sign of `a`; NaN when `a` is
         // infinite or `b` is zero, `a` when `b` is infinite. Rust's `%`
@@ -159,7 +165,8 @@ pub fn op(h: &str, a: &[V]) -> Option<Res> {
     let wide = a.iter().any(|v| matches!(v, V::IntW(..) | V::Flt(..)));
     let new_op = matches!(
         h,
-        "/" | "neg"
+        "quot"
+            | "neg"
             | "bit-and"
             | "bit-or"
             | "bit-xor"
@@ -272,6 +279,40 @@ mod tests {
         let shr = op("shr", &[V::IntW(-1, NumTy::I16), V::IntW(3, NumTy::I16)]);
         assert!(matches!(shr, Some(Ok(V::IntW(8191, NumTy::I16)))));
         assert!(op("+", &[V::Int(1), V::Int(2)]).is_none());
+    }
+
+    #[test]
+    fn integer_quot_truncates_and_traps_with_the_texts_of_slash() {
+        assert!(matches!(
+            op("quot", &[V::Int(-7), V::Int(2)]),
+            Some(Ok(V::Int(-3)))
+        ));
+        let trap = |r: Option<Res>| match r {
+            Some(Err(e)) => format!("{e:?}"),
+            other => panic!("{other:?}"),
+        };
+        assert!(trap(op("quot", &[V::Int(1), V::Int(0)])).contains("integer / by zero"));
+        let min = V::Int(i64::MIN);
+        assert!(trap(op("quot", &[min, V::Int(-1)])).contains("integer overflow in / at i64"));
+        assert!(trap(op("quot", &[i8v(-128), i8v(-1)])).contains("integer overflow in / at i8"));
+        assert!(op("quot", &[i8v(-128), i8v(1)]).is_some_and(|r| r.is_ok()));
+    }
+
+    #[test]
+    fn float_quot_rounds_the_quotient_at_the_width_toward_zero() {
+        let f = |x| V::Flt(x, NumTy::F64);
+        let g = |x| V::Flt(x, NumTy::F32);
+        let q = |a: V, b: V| match op("quot", &[a, b]) {
+            Some(Ok(V::Flt(x, _))) => x,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(q(f(-7.5), f(2.0)), -3.0);
+        assert_eq!(q(f(0.3), f(0.1)), 2.0);
+        assert!(q(f(-0.5), f(2.0)).is_sign_negative());
+        assert!(q(f(0.0), f(0.0)).is_nan());
+        assert_eq!(q(f(1.0), f(0.0)), f64::INFINITY);
+        // 16.99999979 exactly, 17.0 as an f32
+        assert_eq!(q(g(19.217187881469727), g(1.130422830581665)), 17.0);
     }
 
     #[test]

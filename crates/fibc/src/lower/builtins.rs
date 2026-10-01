@@ -122,6 +122,8 @@ impl<'a> Cx<'_, 'a> {
             "starts-with?" => self.rt_call("fib.str-starts-with", a, Some(LirTy::I1)),
             "str-concat" => self.rt_call("fib.str-concat", a, Some(LirTy::Ptr)),
             "str-slice" => self.rt_call("fib.str-slice", a, Some(LirTy::Ptr)),
+            "str-byte-at" => self.rt_call("fib.str-byte-at", a, Some(LirTy::I8)),
+            "str-find" => self.str_find(e, a)?,
             "str-bytes" => {
                 let (tid, _) = self.p.object(&Ty::Con(
                     Con::Array,

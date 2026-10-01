@@ -85,7 +85,7 @@ pub fn int_expr(g: &mut Gen, cx: &Ctx, t: IntW, d: u32) -> Expr {
             bin("*", masked(g, cx, t, sub, m), masked(g, cx, t, sub, m))
         }
         3 => {
-            let h = if g.rng.chance(50) { "/" } else { "rem" };
+            let h = if g.rng.chance(50) { "quot" } else { "rem" };
             let odd = Expr::call(
                 ty.clone(),
                 "bit-or",
@@ -94,7 +94,7 @@ pub fn int_expr(g: &mut Gen, cx: &Ctx, t: IntW, d: u32) -> Expr {
             bin(h, masked(g, cx, t, sub, half), odd)
         }
         4 => {
-            let h = ["+", "-", "*", "/", "rem"][g.rng.below(5)];
+            let h = ["+", "-", "*", "quot", "rem"][g.rng.below(5)];
             bin(h, int_expr(g, cx, t, sub), int_expr(g, cx, t, sub))
         }
         5 | 6 => bits_op(g, cx, t, sub),
@@ -171,7 +171,7 @@ pub fn float_expr(g: &mut Gen, cx: &Ctx, t: NumTy, d: u32) -> Expr {
     let sub = d - 1;
     match g.rng.below(8) {
         7 => {
-            let h = if g.rng.chance(50) { "/" } else { "rem" };
+            let h = ["/", "quot", "rem"][g.rng.below(3)];
             let (a, b) = (float_expr(g, cx, t, sub), float_expr(g, cx, t, sub));
             Expr::call(ty, h, vec![a, b])
         }

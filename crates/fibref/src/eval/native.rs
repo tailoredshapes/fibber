@@ -108,7 +108,9 @@ impl<'p> Interp<'p> {
             name @ ("array" | "array-len" | "array-get" | "array-with" | "array-copy"
             | "array-set!") => self.array_builtin(name, a),
             name @ ("str-len" | "str-bytes" | "str-from-bytes" | "str-concat" | "str-slice"
-            | "str-eq" | "starts-with?") => self.string_builtin(name, a),
+            | "str-byte-at" | "str-find" | "str-eq" | "starts-with?") => {
+                self.string_builtin(name, a)
+            }
             "char->i32" | "i32->char" => super::arith::char_conv(BUILTINS[b].name, arg(0)?),
             "f64->bits" | "bits->f64" | "f32->bits" | "bits->f32" => {
                 super::float_bits::float_bits(BUILTINS[b].name, arg(0)?)

@@ -1,0 +1,26 @@
+;; spec:   syntax §4.3; stdlib design 7 (L18) (method.md rule 3, allocs)
+;; expect: accept
+;; result: 100500
+;; audit:  clean
+;; allocs: <= 1
+;; The point of `str-byte-at` is that a loop over a string's bytes costs no
+;; heap object per byte, where `(array-get (str-bytes s) i)` costs one
+;; array per call (`str-bytes` copies the whole string each time). The
+;; 1000 calls below allocate nothing; the one object is the string `s`,
+;; made at run time by `str-concat` (literals are immortal and not
+;; counted). The same loop written as `(array-get (str-bytes s) i)`
+;; allocates 1001 objects, which is what this bound rules out: a
+;; `str-byte-at` that copied the string, or boxed its `i8`, would fail
+;; `<= 1`. That the bound can fail is tested rather than assumed (the
+;; tests `a_bound_one_below_the_count_fails` lower it to 0 and require
+;; the failure, for this case as for 202 to 204). 100500 is 125 laps of
+;; the bytes of "abcdefgh" (97 + .. + 104 = 804), 125 * 804.
+(defun sum-bytes (s: str n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (recur (+ i 1) (+ acc (zext i64 (str-byte-at s (bit-and i 7)))))
+        acc)))
+
+(defun main () -> i64
+  (let ((s (str-concat "abcd" "efgh")))
+    (sum-bytes s 1000)))

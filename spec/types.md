@@ -565,7 +565,8 @@ enum, a scalar by §1, compares and hashes by variant index, orders by
 declaration order and shows as its variant name) and for `str`:
 
 ```
-(defprotocol Num  (+ (self y: Self) -> Self) (- ..) (* ..) (/ ..) (rem ..) (neg (self) -> Self))   ; every integer and float type
+(defprotocol Num  (+ (self y: Self) -> Self) (- ..) (* ..) (/ ..) (quot ..) (rem ..) (neg (self) -> Self))   ; every integer and float type
+(defprotocol Float (fdiv (self y: Self) -> Self))                                                              ; f32 and f64 only
 (defprotocol Eq   (= (self y: Self) -> bool) (!= (self y: Self) -> bool (not (= self y))))
 (defprotocol Ord  :requires (Eq)
                   (< (self y: Self) -> bool) (<= (self y: Self) -> bool (not (< y self)))
@@ -616,6 +617,24 @@ case 201 pins it and case 169 the rest. `derive Hash` and the prelude's
 prelude's `hash-combine` (a rotate-and-xor mixer that never traps) from
 a seed, the variant index (0 for a struct); the `h*31 + x` they used
 trapped on integer overflow at two strings (cases 198 to 200).
+
+`quot` and `fdiv` (**Decided**, owner, 2026-10-01, stdlib §7 L30, Q40: the
+names and the split; the float details below are **Proposed**, the first
+tranche's, not signed off). `quot` is the division `/` is: at an integer
+type it is the same operation with the same traps, whose texts keep
+naming `/` (`integer / by zero`, `integer overflow in / at i64`); at a
+float type it is the quotient rounded toward zero, as Clojure's `quot` on
+doubles is: the quotient is rounded to the width first and its fraction
+is then dropped, so `(quot 7.2 0.8)` is `9.0` (the quotient rounds to
+9.0, though the exact one is a little below) and at `f32` `(quot 19.217187881469727 1.130422830581665)`
+is `17.0` where at `f64` it is `16.0`; it never traps, a zero divisor
+gives an infinity or a NaN as `/` does (Clojure's throws), a negative
+quotient that rounds to zero is `-0.0`, and NaN and the infinities stay
+as they are. `fdiv` is the method of `Float`, whose instances are `f32`
+and `f64`: IEEE division at the width, the operation `/` is on floats,
+which the library's `Div` instances for the float types wrap. Until
+`/` leaves `Num` (L30's last step, when the library's `Div` takes the
+name) `Num` has both, `/` and `quot`, with one meaning on integers.
 
 `Self` in a signature stands for the dispatch type, so `(+ a b)` unifies
 both operands: `(+ (i32 1) 2)` is a type error, never a promotion.
@@ -3483,7 +3502,9 @@ nothing (§2.11: the objects live at an abort are not leaks).
 
 | Operation | lIR emitted |
 |---|---|
-| `(/ a b)`, `(rem a b)` | `(icmp eq b 0)` → trap `integer / by zero` (or `rem`); `(and (icmp eq a MIN) (icmp eq b -1))` → trap `integer overflow in / at w` (or `rem`); else `sdiv` / `srem` |
+| `(/ a b)`, `(quot a b)`, `(rem a b)` at an integer type | `(icmp eq b 0)` → trap `integer / by zero` (or `rem`; `quot` is `/`); `(and (icmp eq a MIN) (icmp eq b -1))` → trap `integer overflow in / at w` (or `rem`); else `sdiv` / `srem` |
+| `(fdiv a b)`, `(/ a b)` at a float type | `fdiv`: IEEE division, no check |
+| `(quot a b)` at a float type | `(call @trunc (fdiv a b))`, `@truncf` at `f32`: libm's rounding toward zero of the quotient at its width (lIR has no float truncation; `(a - (rem a b)) / b` is not it: it gives 2.9999999999999996 for `(quot 9.6 2.8)`, which is 3.0, and 8.0 for `(quot 7.2 0.8)`, which is 9.0); no check |
 | `(+ a b)` | `r = (sadd-overflow a b)`; `(extractvalue r 1)` → trap `integer overflow in + at w`; else `(extractvalue r 0)` |
 | `(- a b)` | `r = (ssub-overflow a b)`; likewise, trap `integer overflow in - at w` |
 | `(* a b)` | `r = (smul-overflow a b)`; likewise, trap `integer overflow in * at w`, at every width |

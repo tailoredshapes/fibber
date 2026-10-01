@@ -16,6 +16,7 @@ mod ops;
 pub mod pattern;
 mod quote;
 mod show;
+mod strfind;
 mod threads;
 mod values;
 

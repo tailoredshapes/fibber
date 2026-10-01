@@ -63,6 +63,12 @@ impl<'a> Cx<'_, 'a> {
             .val(&format!("(icmp {pred} {} (i32 0))", c.text()), LirTy::I1))
     }
 
+    /// `fdiv`, the method of `Float`, is the division `/` is on floats;
+    /// `quot` is that quotient rounded toward zero by the C library's
+    /// `trunc` or `truncf` (lIR has no float truncation, and the
+    /// formula `(a - (rem a b)) / b` differs from `(a / b).trunc()`,
+    /// the interpreter's and Clojure's: 2.9999999999999996 for 9.6 and
+    /// 2.8, where the truncated quotient is 3.0).
     fn float_binary(&mut self, method: &str, x: &V, y: &V) -> V {
         let t = x.ty().unwrap_or(LirTy::Double);
         let (a, b) = (x.text(), y.text());
@@ -70,7 +76,12 @@ impl<'a> Cx<'_, 'a> {
             "+" => (format!("(fadd {a} {b})"), t),
             "-" => (format!("(fsub {a} {b})"), t),
             "*" => (format!("(fmul {a} {b})"), t),
-            "/" => (format!("(fdiv {a} {b})"), t),
+            "/" | "fdiv" => (format!("(fdiv {a} {b})"), t),
+            "quot" => {
+                let q = self.b.val(&format!("(fdiv {a} {b})"), t);
+                let f = if t == LirTy::Float { "truncf" } else { "trunc" };
+                (format!("(call @{f} {})", q.text()), t)
+            }
             "rem" => (format!("(frem {a} {b})"), t),
             "=" => (format!("(fcmp oeq {a} {b})"), LirTy::I1),
             "!=" => (format!("(fcmp une {a} {b})"), LirTy::I1),
@@ -85,6 +96,9 @@ impl<'a> Cx<'_, 'a> {
     /// `None` when the operation cannot return (a literal division by
     /// zero is the trap alone).
     fn int_binary(&mut self, method: &str, x: &V, y: &V) -> R<Option<V>> {
+        // `quot` is the division the builtin `/` was (stdlib §7 L30); its
+        // traps name `/`.
+        let method = if method == "quot" { "/" } else { method };
         let t = x.ty().unwrap_or(LirTy::I64);
         let (a, b) = (x.text().to_string(), y.text().to_string());
         let w = t.text();
@@ -102,26 +116,7 @@ impl<'a> Cx<'_, 'a> {
                 self.trap_if(&ovf, &format!("integer overflow in {method} at {w}"));
                 self.b.val(&format!("(extractvalue {} 0)", r.text()), t)
             }
-            "/" | "rem" => {
-                // lIR refuses a division by a constant zero outright
-                // (lir.md §6.1), so a literal divisor of 0 is the trap
-                // alone: the call does not return.
-                if b == format!("({w} 0)") {
-                    self.trap_c(&format!("integer {method} by zero"));
-                    return Ok(None);
-                }
-                let zero = self.b.val(&format!("(icmp eq {b} ({w} 0))",), LirTy::I1);
-                self.trap_if(&zero, &format!("integer {method} by zero"));
-                let min = -(1i128 << (t.bits() - 1));
-                let amin = self.b.val(&format!("(icmp eq {a} ({w} {min}))"), LirTy::I1);
-                let bm1 = self.b.val(&format!("(icmp eq {b} ({w} -1))"), LirTy::I1);
-                let both = self
-                    .b
-                    .val(&format!("(and {} {})", amin.text(), bm1.text()), LirTy::I1);
-                self.trap_if(&both, &format!("integer overflow in {method} at {w}"));
-                let op = if method == "/" { "sdiv" } else { "srem" };
-                self.b.val(&format!("({op} {a} {b})"), t)
-            }
+            "/" | "rem" => return Ok(self.int_division(method, &a, &b, t)),
             "bit-and" => self.b.val(&format!("(and {a} {b})"), t),
             "bit-or" => self.b.val(&format!("(or {a} {b})"), t),
             "bit-xor" => self.b.val(&format!("(xor {a} {b})"), t),
@@ -139,6 +134,29 @@ impl<'a> Cx<'_, 'a> {
                 self.b.val(&format!("(icmp {pred} {a} {b})"), LirTy::I1)
             }
         }))
+    }
+
+    /// `/` (and `quot`) or `rem` with the checks of §8.12. `None` when
+    /// the operation cannot return: lIR refuses a division by a constant
+    /// zero outright (lir.md §6.1), so a literal divisor of 0 is the trap
+    /// alone.
+    fn int_division(&mut self, method: &str, a: &str, b: &str, t: LirTy) -> Option<V> {
+        let w = t.text();
+        if b == format!("({w} 0)") {
+            self.trap_c(&format!("integer {method} by zero"));
+            return None;
+        }
+        let zero = self.b.val(&format!("(icmp eq {b} ({w} 0))",), LirTy::I1);
+        self.trap_if(&zero, &format!("integer {method} by zero"));
+        let min = -(1i128 << (t.bits() - 1));
+        let amin = self.b.val(&format!("(icmp eq {a} ({w} {min}))"), LirTy::I1);
+        let bm1 = self.b.val(&format!("(icmp eq {b} ({w} -1))"), LirTy::I1);
+        let both = self
+            .b
+            .val(&format!("(and {} {})", amin.text(), bm1.text()), LirTy::I1);
+        self.trap_if(&both, &format!("integer overflow in {method} at {w}"));
+        let op = if method == "/" { "sdiv" } else { "srem" };
+        Some(self.b.val(&format!("({op} {a} {b})"), t))
     }
 
     fn int_unary(&mut self, method: &str, x: &V) -> R<V> {

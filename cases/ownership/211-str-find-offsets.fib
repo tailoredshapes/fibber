@@ -1,0 +1,78 @@
+;; spec:   syntax §4.3; stdlib design 7 (L18), 4 (row str-find)
+;; expect: accept
+;; result: 415
+;; audit:  clean
+;; `(str-find s pat from)` is the byte offset of the first `pat` at or
+;; after byte `from`, or `nil`. Offsets are bytes, not characters; `from`
+;; may be 0 up to the length of `s` and must lie between characters; an
+;; empty `pat` is found at `from`, also at the end; a `pat` longer than
+;; what is left is not found. Two parts, both of which must hold:
+;;   - eight spot checks with the answers written out (hits, a miss, a
+;;     `from` past the first hit, the empty pattern, a pattern at the very
+;;     end, byte offsets after multi-byte characters, a pattern longer than
+;;     the text), each counted as a mismatch if it is wrong;
+;;   - a sweep: every character boundary of six texts against eleven
+;;     patterns (the multi-byte ones too), each answer compared with a
+;;     reference written here from `str-bytes` and a byte-by-byte compare,
+;;     which uses no `str-find`. The sweep makes 407 comparisons (a Python
+;;     count of the boundaries times the patterns), the spot checks 8, and
+;;     the result is the number of checks made, 415, when there is no
+;;     mismatch, the negated number of mismatches otherwise: a program
+;;     that checked nothing, or got one answer wrong, does not give 415.
+(defun offset (r: (Option i64)) -> i64
+  (match r ((some n) n) (nil -1)))
+
+(defun same-at (hay: (Array i8) pat: (Array i8) i: i64) -> bool
+  (loop ((k 0))
+    (if (< k (array-len pat))
+        (if (= (array-get hay (+ i k)) (array-get pat k)) (recur (+ k 1)) false)
+        true)))
+
+;; the reference: the first i from `from` at which pat's bytes are hay's
+(defun ref-find (hay: (Array i8) pat: (Array i8) from: i64) -> i64
+  (loop ((i from))
+    (if (> (+ i (array-len pat)) (array-len hay))
+        -1
+        (if (same-at hay pat i) i (recur (+ i 1))))))
+
+;; a byte offset that does not split a character: the end, or not a continuation byte
+(defun boundary? (hay: (Array i8) i: i64) -> bool
+  (or (= i (array-len hay)) (!= (bit-and (array-get hay i) -64i8) -128i8)))
+
+;; compare the library with the reference for every pattern at one `from`
+(defun sweep-from (s: str hay: (Array i8) pats: (Vec str) from: i64 checks: (Cell i64) bad: (Cell i64)) -> unit
+  (dotimes (k (count pats))
+    (let ((pat (nth pats k)))
+      (do (set! checks (+ @checks 1))
+          (if (= (offset (str-find s pat from)) (ref-find hay (str-bytes pat) from))
+              ()
+              (set! bad (+ @bad 1)))))))
+
+(defun sweep (s: str pats: (Vec str) checks: (Cell i64) bad: (Cell i64)) -> unit
+  (let ((hay (str-bytes s)))
+    (dotimes (from (+ (str-len s) 1))
+      (if (boundary? hay from) (sweep-from s hay pats from checks bad) ()))))
+
+(defun spot (ok: bool bad: (Cell i64)) -> unit
+  (if ok () (set! bad (+ @bad 1))))
+
+(defun main () -> i64
+  (let ((checks (cell 8))
+        (bad (cell 0))
+        (pats ["" "a" "b" "aa" "é" "€😀" "😀b" "abc" "xyz" "héllo wörld!" "ö"]))
+    (do
+      (spot (= (offset (str-find "abcabc" "bc" 0)) 1) bad)
+      (spot (= (offset (str-find "abcabc" "bc" 2)) 4) bad)
+      (spot (= (offset (str-find "abcabc" "x" 0)) -1) bad)
+      (spot (= (offset (str-find "abc" "" 3)) 3) bad)
+      (spot (= (offset (str-find "abc" "c" 0)) 2) bad)
+      (spot (= (offset (str-find "héllo wörld" "ö" 0)) 8) bad)
+      (spot (= (offset (str-find "ab" "abc" 0)) -1) bad)
+      (spot (and (nil? (str-find "abc" "abcd" 1)) (some? (str-find "abc" "bc" 1))) bad)
+      (sweep "" pats checks bad)
+      (sweep "a" pats checks bad)
+      (sweep "abcabc" pats checks bad)
+      (sweep "héllo wörld" pats checks bad)
+      (sweep "aé€😀bé€😀b" pats checks bad)
+      (sweep "aaaa" pats checks bad)
+      (if (= @bad 0) @checks (- 0 @bad)))))

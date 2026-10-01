@@ -1,0 +1,25 @@
+;; spec:   syntax §4.3; types §8.1; stdlib design 7 (L18) (method.md rule 3, allocs)
+;; expect: accept
+;; result: 1000
+;; audit:  clean
+;; allocs: <= 101
+;; `(str-find s pat from)` never copies the string, but its result is an
+;; `(Option i64)`, and an `Option` of a scalar is a heap enum, `nil` too
+;; (types §8.1, case 95): so a call allocates exactly one object, the
+;; answer, hit or miss. The 100 calls below (50 hits and 50 misses) and
+;; the string `s` made by `str-concat` are 101 objects. A `str-find` that
+;; sliced or copied `s` would add one or more per call and fail the bound.
+;; The result is 50 hits of offset 20 each, 50 * 20.
+(defun offset (r: (Option i64)) -> i64
+  (match r ((some n) n) (nil 0)))
+
+(defun finds (s: str n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (recur (+ i 1)
+               (+ acc (offset (str-find s (if (= (bit-and i 1) 0) "needle" "absent") 0))))
+        acc)))
+
+(defun main () -> i64
+  (let ((s (str-concat "xxxxxxxxxxxxxxxxxxxxneedle" "yyyy")))
+    (finds s 100)))

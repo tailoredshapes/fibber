@@ -141,8 +141,10 @@ fn compare(name: &str, o: std::cmp::Ordering) -> R<Val> {
 /// (§2.12, Decided: Rust's semantics). Division and remainder by zero
 /// trap; a signed result that does not fit `w` traps (`+ - * /`, and
 /// `rem` of the minimum by -1, as Rust's does); the shift amount is
-/// taken modulo the width.
+/// taken modulo the width. `quot` is the division the builtin `/` was
+/// (stdlib §7 L30), and its traps keep the texts that name `/`.
 fn int_binary(name: &str, a: i64, b: i64, w: Scalar) -> R<Val> {
+    let name = if name == "quot" { "/" } else { name };
     let mask = u64::MAX >> (64 - bits(w));
     let shift = (b as u32) & (bits(w) - 1);
     let n = match name {
@@ -190,12 +192,18 @@ fn int_unary(name: &str, a: i64, w: Scalar) -> R<Val> {
     Ok(Val::Int(wrap(n, w), w))
 }
 
+/// A float `Num` or `Float` method, or a comparison, at width `w`.
+/// `fdiv` is IEEE division (the method of `Float`); `quot` is the
+/// quotient at the width, rounded to zero (Clojure's `quot` on doubles,
+/// stdlib §4 row `quot`): `-0.0` when a negative quotient rounds to
+/// zero, and NaN and the infinities as they are.
 fn float_binary(name: &str, a: f64, b: f64, w: Scalar) -> R<Val> {
     let x = match name {
         "+" => a + b,
         "-" => a - b,
         "*" => a * b,
-        "/" => a / b,
+        "/" | "fdiv" => a / b,
+        "quot" => round(a / b, w).trunc(),
         "rem" => a % b,
         _ => {
             return Ok(Val::Bool(match name {
@@ -303,18 +311,21 @@ mod tests {
             int_binary("*", 1 << 32, 1 << 31, I64),
             "integer overflow in *",
         );
-        traps(int_binary("/", i64::MIN, -1, I64), "integer overflow in /");
-        traps(int_binary("/", -128, -1, I8), "integer overflow in /");
+        traps(
+            int_binary("quot", i64::MIN, -1, I64),
+            "integer overflow in /",
+        );
+        traps(int_binary("quot", -128, -1, I8), "integer overflow in /");
         traps(
             int_binary("rem", i64::MIN, -1, I64),
             "integer overflow in rem",
         );
         assert_eq!(int_binary("rem", -127, -1, I8), int(0, I8));
-        assert_eq!(int_binary("/", -7, 2, I64), int(-3, I64));
+        assert_eq!(int_binary("quot", -7, 2, I64), int(-3, I64));
         assert_eq!(int_binary("rem", -7, 2, I64), int(-1, I64));
         traps(int_unary("neg", i64::MIN, I64), "integer overflow in neg");
         assert_eq!(int_unary("neg", -127, I8), int(127, I8));
-        traps(int_binary("/", 1, 0, I64), "integer / by zero");
+        traps(int_binary("quot", 1, 0, I64), "integer / by zero");
         traps(int_binary("rem", 1, 0, I8), "integer rem by zero");
     }
 
@@ -371,6 +382,59 @@ mod tests {
         assert!(rem(5.0, 0.0, F64).is_nan());
         assert!(rem(f64::INFINITY, 2.0, F64).is_nan());
         assert!(rem(-4.0, 2.0, F64).is_sign_negative()); // -0.0
+    }
+
+    fn flt(name: &str, a: f64, b: f64, w: Scalar) -> f64 {
+        match float_binary(name, a, b, w) {
+            Ok(Val::Float(x, _)) => x,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_quot_rounds_the_quotient_toward_zero() {
+        use Scalar::{F32, F64};
+        assert_eq!(flt("quot", 7.5, 2.0, F64), 3.0);
+        assert_eq!(flt("quot", -7.5, 2.0, F64), -3.0);
+        assert_eq!(flt("quot", 7.5, -2.0, F64), -3.0);
+        // the quotient is rounded first: 7.2 / 0.8 is exactly a little less
+        // than 9 and 9.0 as an f64; (a - a rem b) / b would be 8.0 here
+        assert_eq!(flt("quot", 7.2, 0.8, F64), 9.0);
+        assert_eq!(flt("quot", 9.6, 2.8, F64), 3.0);
+        // 1 / 3 at f32 is 0.33333334, which truncates to 0
+        assert_eq!(flt("quot", 1.0, 3.0, F32), 0.0);
+        assert!(flt("quot", -0.5, 2.0, F64).is_sign_negative()); // -0.0
+        assert_eq!(flt("quot", 1.0, 0.0, F64), f64::INFINITY);
+        assert!(flt("quot", 0.0, 0.0, F64).is_nan());
+        assert_eq!(flt("quot", 1e300, 1e-300, F64), f64::INFINITY);
+        assert_eq!(flt("quot", 5.0, f64::INFINITY, F64), 0.0);
+        // The quotient is rounded to the width before it is truncated: at
+        // f32 this one is 16.99999979 exactly and 17.0 as an f32.
+        assert_eq!(
+            flt("quot", 19.217187881469727, 1.130422830581665, F32),
+            17.0
+        );
+    }
+
+    #[test]
+    fn fdiv_is_ieee_division_and_traps_never() {
+        use Scalar::{F32, F64};
+        assert_eq!(flt("fdiv", 1.0, 4.0, F64), 0.25);
+        assert_eq!(flt("fdiv", 1.0, 0.0, F64), f64::INFINITY);
+        assert_eq!(flt("fdiv", -1.0, 0.0, F32), f64::NEG_INFINITY);
+        assert!(flt("fdiv", 0.0, 0.0, F64).is_nan());
+        assert_eq!(flt("fdiv", 1.0, 3.0, F32), f64::from(1.0f32 / 3.0f32));
+        assert_ne!(flt("fdiv", 1.0, 3.0, F32), flt("fdiv", 1.0, 3.0, F64));
+    }
+
+    #[test]
+    fn integer_quot_is_the_division_it_replaces() {
+        use Scalar::{I64, I8};
+        for (a, b) in [(7, 2), (-7, 2), (7, -2), (-7, -2), (0, 5), (5, 7)] {
+            assert_eq!(int_binary("quot", a, b, I64), int_binary("/", a, b, I64));
+        }
+        assert_eq!(int_binary("quot", 7, -2, I64), int(-3, I64));
+        assert_eq!(int_binary("quot", -7, 2, I8), int(-3, I8));
     }
 
     #[test]

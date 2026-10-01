@@ -1,0 +1,41 @@
+;; spec:   syntax §4.3; stdlib design 7 (L18), 4 (row str-byte-at)
+;; expect: accept
+;; result: 127
+;; audit:  clean
+;; `(str-byte-at s i)` is byte `i` of the UTF-8 text, as an `i8`: the
+;; bytes above 127 are negative, so the two bytes of é (C3 A9) are -61
+;; and -87 and the four of the emoji (F0 9F 98 80) are -16 -97 -104 -128.
+;; It reads bytes, not characters: index 1 of "é" is its second byte. The
+;; result has bit k set when probe k holds, so all seven give 2^7 - 1 =
+;; 127; a read that is off by one, unsigned or by character clears a bit.
+;;   0 ASCII: "abc" at 0, 1 and 2 are 97, 98 and 99
+;;   1 the first and the last byte of "é" are -61 and -87
+;;   2 the four bytes of the emoji
+;;   3 the last byte of a string is at length - 1
+;;   4 a string with NUL bytes in it reads them (compiled strings are not C strings)
+;;   5 every byte of a mixed string equals the same index of `str-bytes`
+;;   6 a byte read from the middle of a multi-byte character is allowed
+(defun matches-bytes (s: str) -> i64
+  (let ((bs (str-bytes s)))
+    (loop ((i 0) (ok 0))
+      (if (< i (str-len s))
+          (recur (+ i 1) (if (= (str-byte-at s i) (array-get bs i)) (+ ok 1) ok))
+          ok))))
+
+(defun bit (k: i64 ok: bool) -> i64 (if ok (shl 1 k) 0))
+
+(defun main () -> i64
+  (let ((nul (str-from-bytes (array 3 0i8)))
+        (mixed "aé€😀bé")
+        (emoji "😀"))
+    (+ (bit 0 (and (= (str-byte-at "abc" 0) 97i8)
+                   (and (= (str-byte-at "abc" 1) 98i8) (= (str-byte-at "abc" 2) 99i8))))
+    (+ (bit 1 (and (= (str-byte-at "é" 0) -61i8) (= (str-byte-at "é" 1) -87i8)))
+    (+ (bit 2 (and (= (str-byte-at emoji 0) -16i8)
+                   (and (= (str-byte-at emoji 1) -97i8)
+                        (and (= (str-byte-at emoji 2) -104i8) (= (str-byte-at emoji 3) -128i8)))))
+    (+ (bit 3 (= (str-byte-at "xyz" (- (str-len "xyz") 1)) 122i8))
+    (+ (bit 4 (and (= (str-len nul) 3)
+                   (and (= (str-byte-at nul 0) 0i8) (= (str-byte-at nul 2) 0i8))))
+    (+ (bit 5 (= (matches-bytes mixed) (str-len mixed)))
+       (bit 6 (= (str-byte-at "😀" 2) -104i8))))))))))

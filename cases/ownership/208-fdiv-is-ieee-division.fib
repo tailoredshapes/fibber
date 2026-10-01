@@ -1,0 +1,40 @@
+;; spec:   types §2.12; stdlib design 2.8 (Division), 7 (L30)
+;; expect: accept
+;; result: 255
+;; audit:  clean
+;; `fdiv` is the method of the built-in protocol `Float`, whose instances
+;; are `f32` and `f64`: IEEE 754 division at the width of its operands,
+;; which never traps (stdlib §7 L30: the `Div` instances of the two
+;; float types will wrap it, once `/` leaves `Num`). It is the same
+;; operation as `/` on floats today. The result has bit k set when probe
+;; k holds, so all eight give 2^8 - 1 = 255.
+;;   0 1.0 fdiv 4.0 is 0.25 and -9.0 fdiv 2.0 is -4.5
+;;   1 a zero divisor gives infinities: 1.0 fdiv 0.0 above every finite
+;;     float, -1.0 fdiv 0.0 below, and 0.0 fdiv 0.0 is a NaN
+;;   2 -0.0 comes out of a positive over a negative infinity
+;;   3 at f32 the quotient is rounded to f32: 1.0 fdiv 3.0 at f32 is the
+;;     f32 nearest a third, which is not the f64 nearest a third
+;;   4 a function bounded by Float (and Num) works at f64 and f32
+;;   5 fdiv agrees with / on floats over a few values
+;;   6 fdiv as a function value, through a user function
+;;   7 the infinity and the NaN survive a conversion to f32 and back
+(defun bit (ok: bool k: i64) -> i64 (if ok (shl 1 k) 0))
+
+(defun halve-of (x: t) :where ((Float t) (Num t)) -> t (fdiv x (+ x x)))
+
+(defun apply2 (f: (fn (f64 f64) f64) a: f64 b: f64) -> f64 (f a b))
+
+(defun main () -> i64
+  (let ((inf (fdiv 1.0 0.0))
+        (nan (fdiv 0.0 0.0))
+        (m0 (bit (and (= (fdiv 1.0 4.0) 0.25) (= (fdiv -9.0 2.0) -4.5)) 0))
+        (m1 (+ m0 (bit (and (> inf 1e308) (< (fdiv -1.0 0.0) -1e308) (!= nan nan)) 1)))
+        (m2 (+ m1 (bit (= (f64->bits (fdiv 1.0 (neg inf))) -9223372036854775808) 2)))
+        (third32 (fdiv 1.0f32 3.0f32))
+        (m3 (+ m2 (bit (and (= third32 (fptrunc f32 (fdiv 1.0 3.0)))
+                            (!= (fpext f64 third32) (fdiv 1.0 3.0)))
+                       3)))
+        (m4 (+ m3 (bit (and (= (halve-of 3.0) 0.5) (= (halve-of 3.0f32) 0.5f32)) 4)))
+        (m5 (+ m4 (bit (and (= (fdiv 7.0 3.0) (/ 7.0 3.0)) (= (fdiv -0.5f32 4.0f32) (/ -0.5f32 4.0f32))) 5)))
+        (m6 (+ m5 (bit (= (apply2 fdiv 1.0 8.0) 0.125) 6))))
+    (+ m6 (bit (and (= (fpext f64 (fptrunc f32 inf)) inf) (!= (fptrunc f32 nan) (fptrunc f32 nan))) 7))))

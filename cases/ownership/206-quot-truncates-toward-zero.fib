@@ -1,0 +1,48 @@
+;; spec:   types §2.12; stdlib design 4 (row quot), 7 (L30)
+;; expect: accept
+;; result: 8191
+;; audit:  clean
+;; `quot` is the builtin integer division that `/` was (stdlib §7 L30,
+;; Q40): it rounds toward zero, as Rust's `/` and LLVM's `sdiv` do, and
+;; as Clojure's `quot` does, and its traps keep the texts that name `/`
+;; (cases 102, 103 and 209). It is a method of `Num`, so it works at
+;; every integer width, through a generic function bounded by `Num` and
+;; as a function value. The result has bit k set when probe k holds, so
+;; all thirteen give 2^13 - 1 = 8191.
+;;   0 -7 quot 2 is -3 (floor division would give -4)
+;;   1 7 quot -2 is -3, 2 -7 quot -2 is 3, 3 7 quot 2 is 3
+;;   4 a quotient below one is 0 from either side: 5 quot 7 and -5 quot 7
+;;   5 the same at i32, 6 at i16, 7 at i8, where -128 quot 3 is -42
+;;   8 the minimum of i64 quot 1 and quot -2 do not trap
+;;   9 the identity (+ (* (quot a b) b) (rem a b)) is a over the four
+;;     sign combinations of 17 and 5
+;;  10 a generic function bounded by Num divides at i64 and at i8
+;;  11 quot as a function value, through a user function
+;;  12 the result of quot on a computed divisor is the same as on a literal
+(defun bit (ok: bool k: i64) -> i64 (if ok (shl 1 k) 0))
+
+(defun identity-holds (a: i64 b: i64) -> bool
+  (= (+ (* (quot a b) b) (rem a b)) a))
+
+(defun divide (a: t b: t) :where ((Num t)) -> t (quot a b))
+
+(defun apply2 (f: (fn (i64 i64) i64) a: i64 b: i64) -> i64 (f a b))
+
+(defun main () -> i64
+  (let ((m0 (bit (= (quot -7 2) -3) 0))
+        (m1 (+ m0 (bit (= (quot 7 -2) -3) 1)))
+        (m2 (+ m1 (bit (= (quot -7 -2) 3) 2)))
+        (m3 (+ m2 (bit (= (quot 7 2) 3) 3)))
+        (m4 (+ m3 (bit (and (= (quot 5 7) 0) (= (quot -5 7) 0)) 4)))
+        (m5 (+ m4 (bit (= (quot -7i32 2i32) -3i32) 5)))
+        (m6 (+ m5 (bit (= (quot -7i16 2i16) -3i16) 6)))
+        (m7 (+ m6 (bit (= (quot -128i8 3i8) -42i8) 7)))
+        (m8 (+ m7 (bit (and (= (quot -9223372036854775808 1) -9223372036854775808)
+                            (= (quot -9223372036854775808 -2) 4611686018427387904))
+                       8)))
+        (m9 (+ m8 (bit (and (identity-holds 17 5) (identity-holds -17 5)
+                            (identity-holds 17 -5) (identity-holds -17 -5))
+                       9)))
+        (m10 (+ m9 (bit (and (= (divide -7 2) -3) (= (divide -100i8 7i8) -14i8)) 10)))
+        (m11 (+ m10 (bit (= (apply2 quot -17 5) -3) 11))))
+    (+ m11 (bit (let ((d (- (count [1 2 3]) 1))) (= (quot -7 d) -3)) 12))))

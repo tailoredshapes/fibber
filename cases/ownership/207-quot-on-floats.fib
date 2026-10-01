@@ -1,0 +1,92 @@
+;; spec:   types §2.12; stdlib design 2.8 (Division), 4 (row quot), 7 (L30)
+;; expect: accept
+;; result: 4095
+;; audit:  clean
+;; `quot` on floats is the truncated quotient, as Clojure's `quot` on
+;; doubles is: the quotient is rounded to the width first (IEEE), then
+;; its fraction is dropped toward zero. It is not the exact quotient
+;; truncated, and not `(a - (rem a b)) / b`, which is 2.9999999999999996
+;; for 9.6 over 2.8 and 8.0 for 7.2 over 0.8, whose `quot`s are 3.0 and 9.0
+;; (the quotient of 7.2 and 0.8 is a hair under 9 and rounds to 9.0); at
+;; f32 19.2171879 over 1.13042283 is 16.99999979 exactly and 17.0 as an
+;; f32, so its `quot` is 17.0 at f32 and 16.0 at f64. A float `quot` never traps: a zero
+;; divisor gives an infinity or a NaN, as `/` does. The interpreter
+;; computes it as `(a / b).trunc()`, the compiled program as libm's
+;; `trunc` of the `fdiv`; this case makes them agree. The result has
+;; bit k set when probe k holds, so all twelve give 2^12 - 1 = 4095.
+;;   0 7.5 quot 2.0 is 3.0 and 7.5 rem 2.0 is 1.5
+;;   1 the signs: -7.5 quot 2.0, 7.5 quot -2.0 are -3.0 and -7.5 quot -2.0 is 3.0
+;;   2 9.6 quot 2.8 is 3.0, 7.2 quot 0.8 is 9.0 and 0.3 quot 0.1 is 2.0
+;;   3 a negative quotient that truncates to zero is -0.0 (-0.5 quot 2.0)
+;;   4 a zero divisor: 1.0 quot 0.0 is +infinity, -1.0 quot 0.0 is
+;;     -infinity and 0.0 quot 0.0 is a NaN (not equal to itself)
+;;   5 a quotient that overflows is an infinity (1e300 quot 1e-300), and
+;;     one too large for an i64 is kept (1e18 quot 3.0 is 1e18 fdiv 3.0)
+;;   6 f32: 7.5 quot 2.0 is 3.0 and -7.5 quot 2.0 is -3.0
+;;   7 the f32 quotient is rounded at f32 (17.0) where the f64 one is 16.0
+;;   8 a function bounded by Num divides floats at both widths and integers
+;;   9 (+ (* (quot a b) b) (rem a b)) is a at 7.5, -7.5, 100.25 over 2.0
+;;  10 over 300 seeded pairs quot agrees with a reference that converts
+;;     the quotient to an i64 and back
+;;  11 and a reference that rounds to nearest instead disagrees with it
+;;     on at least one pair (the check can fail)
+(defun bit (ok: bool k: i64) -> i64 (if ok (shl 1 k) 0))
+
+(defun divide (a: t b: t) :where ((Num t)) -> t (quot a b))
+
+(defun identity-holds (a: f64 b: f64) -> bool
+  (= (+ (* (quot a b) b) (rem a b)) a))
+
+(defun xorshift (x: i64) -> i64
+  (let ((a (bit-xor x (shl x 13)))
+        (b (bit-xor a (shr a 7))))
+    (bit-xor b (shl b 17))))
+
+;; a multiple of 1/8 in [-250, 250] from a random value; never 0 when `nonzero`
+(defun eighths (r: i64 nonzero: bool) -> f64
+  (let ((n (- (rem (shr r 1) 4001) 2000)))
+    (* 0.125 (sitofp f64 (if (and nonzero (= n 0)) 1 n)))))
+
+;; the truncation of x through an i64, and the wrong one: rounding to nearest
+(defun through-i64 (x: f64) -> f64 (sitofp f64 (fptosi i64 x)))
+(defun nearest (x: f64) -> f64
+  (sitofp f64 (fptosi i64 (+ x (if (< x 0.0) -0.5 0.5)))))
+
+;; bit 0 set when quot agrees with the reference on all of 300 pairs, bit 1
+;; set when the wrong reference disagrees on at least one
+(defun seeded () -> i64
+  (loop ((i 0) (s 88172645463325252) (bad 0) (wrong 0))
+    (if (< i 300)
+        (let ((s1 (xorshift s))
+              (s2 (xorshift s1))
+              (a (eighths s1 false))
+              (b (eighths s2 true))
+              (q (quot a b)))
+          (recur (+ i 1) s2
+                 (if (= q (through-i64 (fdiv a b))) bad (+ bad 1))
+                 (if (= q (nearest (fdiv a b))) wrong (+ wrong 1))))
+        (+ (if (= bad 0) 1 0) (if (> wrong 0) 2 0)))))
+
+(defun main () -> i64
+  (let ((inf (fdiv 1.0 0.0))
+        (nan (quot 0.0 0.0))
+        (m0 (bit (and (= (quot 7.5 2.0) 3.0) (= (rem 7.5 2.0) 1.5)) 0))
+        (m1 (+ m0 (bit (and (= (quot -7.5 2.0) -3.0) (= (quot 7.5 -2.0) -3.0)
+                            (= (quot -7.5 -2.0) 3.0))
+                       1)))
+        (m2 (+ m1 (bit (and (= (quot 9.6 2.8) 3.0) (= (quot 7.2 0.8) 9.0) (= (quot 0.3 0.1) 2.0)) 2)))
+        (m3 (+ m2 (bit (= (f64->bits (quot -0.5 2.0)) -9223372036854775808) 3)))
+        (m4 (+ m3 (bit (and (= (quot 1.0 0.0) inf) (= (quot -1.0 0.0) (neg inf)) (!= nan nan)) 4)))
+        (m5 (+ m4 (bit (and (= (quot 1e300 1e-300) inf) (= (quot 1e18 3.0) (fdiv 1e18 3.0))) 5)))
+        (m6 (+ m5 (bit (and (= (quot 7.5f32 2.0f32) 3.0f32) (= (quot -7.5f32 2.0f32) -3.0f32)) 6)))
+        (m7 (+ m6 (bit (and (= (quot 19.217187881469727f32 1.130422830581665f32) 17.0f32)
+                            (= (quot 19.217187881469727 1.130422830581665) 16.0))
+                       7)))
+        (m8 (+ m7 (bit (and (= (divide 7.5 2.0) 3.0) (= (divide -7.5f32 2.0f32) -3.0f32)
+                            (= (divide -7 2) -3))
+                       8)))
+        (m9 (+ m8 (bit (and (identity-holds 7.5 2.0) (identity-holds -7.5 2.0)
+                            (identity-holds 100.25 2.0))
+                       9)))
+        (sd (seeded)))
+    (+ m9 (+ (bit (!= (bit-and sd 1) 0) 10) (bit (!= (bit-and sd 2) 0) 11)))))

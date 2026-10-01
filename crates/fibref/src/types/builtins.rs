@@ -125,6 +125,13 @@ pub const BUILTINS: &[BuiltinSig] = &[
     b("write-file", "(fn (str str) bool)", "", &[B, B]),
     b("str-concat", "(fn (str str) str)", "", &[B, B]),
     b("str-slice", "(fn (str i64 i64) str)", "", &[B, S, S]),
+    b("str-byte-at", "(fn (str i64) i8)", "", &[B, S]),
+    b(
+        "str-find",
+        "(fn (str str i64) (Option i64))",
+        "",
+        &[B, B, S],
+    ),
     b("str-eq", "(fn (str str) bool)", "", &[B, B]),
     b("starts-with?", "(fn (str str) bool)", "", &[B, B]),
     b("char->i32", "(fn (char) i32)", "", &[S]),
@@ -179,12 +186,18 @@ pub fn builtin_index(name: &str) -> Option<usize> {
 
 /// The built-in protocols: `Deref` (§2.9) and the arithmetic,
 /// comparison, bit, hash and show protocols of §2.12, whose built-in
-/// instances are registered by `init`.
+/// instances are registered by `init`. `Num` has `quot`, the truncating
+/// division, beside `/` (which leaves it when `/` becomes the method of
+/// the library's `Div`, stdlib §7 L30), and `Float` has `fdiv`, the IEEE
+/// division of the two float types, which the `Div` instances of `f32`
+/// and `f64` will wrap.
 pub const BUILTIN_PROTOCOLS: &str = "
 (defprotocol (Deref c t) (deref (self) -> t))
 (defprotocol Num
   (+ (self y: Self) -> Self) (- (self y: Self) -> Self) (* (self y: Self) -> Self)
-  (/ (self y: Self) -> Self) (rem (self y: Self) -> Self) (neg (self) -> Self))
+  (/ (self y: Self) -> Self) (quot (self y: Self) -> Self) (rem (self y: Self) -> Self)
+  (neg (self) -> Self))
+(defprotocol Float (fdiv (self y: Self) -> Self))
 (defprotocol Eq (= (self y: Self) -> bool) (!= (self y: Self) -> bool (not (= self y))))
 (defprotocol Ord :requires (Eq)
   (< (self y: Self) -> bool) (<= (self y: Self) -> bool (not (< y self)))
@@ -217,6 +230,27 @@ mod tests {
                 .len();
             assert_eq!(params, s.escapes.len(), "{}", s.name);
         }
+    }
+
+    /// The messages of the type errors of `src`, none when it checks.
+    fn type_errors(src: &str) -> Vec<String> {
+        match crate::types::check_source(src, "t.fib") {
+            Ok(_) => Vec::new(),
+            Err(crate::types::SourceError::Type(es)) => {
+                es.iter().map(|e| e.message.clone()).collect()
+            }
+            Err(e) => panic!("{src}\n{e:?}"),
+        }
+    }
+
+    #[test]
+    fn quot_is_a_num_method_and_fdiv_a_method_of_the_float_types_only() {
+        let both = "(defun main () -> i64 (do (fdiv 1.0 2.0) (fdiv 1.0f32 2.0f32) (quot 7 2)))";
+        assert_eq!(type_errors(both), Vec::<String>::new());
+        let int = type_errors("(defun main () -> i64 (fdiv 1 2))");
+        assert_eq!(int, ["no implementation of Float for i64"]);
+        let own = "(defstruct P (x: i64)) (defun main () -> i64 (do (quot (P 1) (P 2)) 0))";
+        assert_eq!(type_errors(own), ["no implementation of Num for P"]);
     }
 
     #[test]

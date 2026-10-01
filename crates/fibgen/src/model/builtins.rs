@@ -62,7 +62,7 @@ impl Machine<'_> {
     }
 
     /// Records a comparison with a NaN or an infinite operand, and a
-    /// float `rem`, which a static count of the program cannot see.
+    /// float `rem` or `quot`, which a static count of the program cannot see.
     fn trace_floats(&mut self, h: &str, a: &[V]) {
         let floats: Vec<f64> = a
             .iter()
@@ -86,6 +86,9 @@ impl Machine<'_> {
         }
         if h == "rem" {
             self.trace.insert("run: float rem");
+        }
+        if h == "quot" {
+            self.trace.insert("run: float quot");
         }
     }
 

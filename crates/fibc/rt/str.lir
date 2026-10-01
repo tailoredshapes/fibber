@@ -413,6 +413,55 @@
   (block no (ret (i1 0)))
   (block test (ret (icmp eq (and (load i8 (getelementptr i8 p k)) (i8 -64)) (i8 -128)))))
 
+;; (str-byte-at s i): byte i of s, with the interpreter's trap (eval/strings.rs).
+;; An unsigned compare refuses a negative index with the rest.
+(define internal (fib.str-byte-at i8) ((ptr s) (i64 i))
+  (block entry
+    (let ((n (call @fib.str-len s)))
+      (br (icmp ult i n) ok bad)))
+  (block bad
+    (let ((buf (alloca i8 (i32 96)))
+          (len (call @snprintf buf (i64 96) (string "str-byte-at: index %lld out of range 0..%lld") i n)))
+      (call @fib.trap-bytes buf (sext i64 len))
+      (unreachable)))
+  (block ok (ret (load i8 (getelementptr i8 (call @fib.str-bytes-ptr s) i)))))
+
+;; (str-find s pat from): the byte offset of the first pat at or after
+;; from, or -1; the interpreter's traps for a bad from (eval/strings.rs).
+;; The caller makes the Option. Nothing is allocated here.
+(define internal (fib.str-find i64) ((ptr s) (ptr pat) (i64 from))
+  (block entry
+    (let ((n (call @fib.str-len s)))
+      (br (or (icmp slt from (i64 0)) (icmp sgt from n)) range check)))
+  (block range
+    (let ((buf (alloca i8 (i32 96)))
+          (len (call @snprintf buf (i64 96) (string "str-find: from %lld out of range 0..%lld") from n)))
+      (call @fib.trap-bytes buf (sext i64 len))
+      (unreachable)))
+  (block check
+    (let ((p (call @fib.str-bytes-ptr s)))
+      (br (call @fib.splits-char p from n) split scan)))
+  (block split
+    (let ((buf2 (alloca i8 (i32 96)))
+          (len2 (call @snprintf buf2 (i64 96) (string "str-find: from %lld splits a character") from)))
+      (call @fib.trap-bytes buf2 (sext i64 len2))
+      (unreachable)))
+  (block scan
+    (let ((m (call @fib.str-len pat))
+          (q (call @fib.str-bytes-ptr pat))
+          (last (sub n m)))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (scan from) (next i2))))
+      (br (icmp sgt i last) none try)))
+  (block try
+    (br (icmp eq (call @memcmp (getelementptr i8 p i) q m) (i32 0)) hit next))
+  (block next
+    (let ((i2 (add i (i64 1))))
+      (br loop)))
+  (block hit (ret i))
+  (block none (ret (i64 -1))))
+
 ;; (str-bytes s): a fresh (Array i8) of the bytes.
 (define internal (fib.str-bytes ptr) ((ptr s) (i32 tid))
   (block entry

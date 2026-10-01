@@ -134,9 +134,9 @@ fn builtin_protocols(g: &mut Globals) -> TResult<()> {
     Ok(())
 }
 
-/// `Num` for the integers and floats, `Bits` for the integers, `Eq`,
-/// `Ord`, `Hash`, `Show` for every scalar and `str` (§2.12); `Deref` for
-/// `Cell`, `Atom`, `Weak` (§2.9).
+/// `Num` for the integers and floats, `Float` for the floats, `Bits` for
+/// the integers, `Eq`, `Ord`, `Hash`, `Show` for every scalar and `str`
+/// (§2.12); `Deref` for `Cell`, `Atom`, `Weak` (§2.9).
 fn builtin_instances(g: &mut Globals) -> TResult<()> {
     let mut plain: Vec<(&str, Con)> = Vec::new();
     for s in Scalar::ALL {
@@ -145,6 +145,9 @@ fn builtin_instances(g: &mut Globals) -> TResult<()> {
         }
         if s.is_int() || s.is_float() {
             plain.push(("Num", Con::Scalar(s)));
+        }
+        if s.is_float() {
+            plain.push(("Float", Con::Scalar(s)));
         }
         if s.is_int() {
             plain.push(("Bits", Con::Scalar(s)));

@@ -36,14 +36,14 @@ pub fn num_labels(e: &Expr, out: &mut Vec<String>) {
             }
             let cmp = matches!(h.as_str(), "=" | "!=" | "<" | "<=" | ">" | ">=");
             let float = matches!(first, Some(Ty::Num(t)) if t.is_float());
-            if float && h == "rem" {
-                out.push("float rem".into());
+            if float && matches!(h.as_str(), "rem" | "quot") {
+                out.push(format!("float {h}"));
             }
             if cmp && matches!(first, Some(Ty::Derived(_))) {
                 out.push("comparison through derived Eq/Ord".into());
             }
             if matches!(first, Some(Ty::Int))
-                && matches!(h.as_str(), "/" | "neg" | "shl" | "shr" | "sar")
+                && matches!(h.as_str(), "quot" | "neg" | "shl" | "shr" | "sar")
             {
                 out.push("i64 division, negation or shift".into());
             }
