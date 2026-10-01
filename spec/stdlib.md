@@ -22,7 +22,9 @@ the page, and §10.1 to §10.3 record every finding with its verdict. When the o
 two auditors classified the page against it independently, one presuming the page's reasons held and one
 presuming every deviation wrong (§10.4 gives their counts), each running programs to test every reason the
 page gave; a last agent decided where the two differed, re-ran the deciding programs, and rewrote this
-page, and §10.4 records every changed item with its reason. A claim about what the
+page (§10.4.1 to §10.4.7); an adversarial checker then ran the rewrite against the rule and raised 28 findings (15
+deviations without a reason, 6 safety reasons that a safe program refutes, 6 inconsistencies, 1 unproven block), and a
+second revision resolved every one, by changing the page or by rejecting the finding with a reason (§10.4.8). A claim about what the
 compiler does cites an item of Appendix A, **[R]** where it matters: a program that was run with `fibc`
 and `fibref` in the session that wrote this page or in a review (A10, A11), its output quoted. A claim that is
 a design record's and was not re-run, or a prediction, says so (**[H]** for a hypothesis; a checker or
@@ -43,16 +45,20 @@ other:
 
 1. **A memory-safety reason**, which this page states as *a failing program*: Clojure's behaviour written
    in fibber that either is rejected by the ownership or type checker for a safety reason, or compiles and
-   then misbehaves in one of five ways: it reads freed memory or follows a null pointer, frees twice,
-   writes through an alias that another holder (or task) observes, races (two tasks write one location),
-   or builds an invalid `str` that the decoder's bounds then no longer protect. If the program cannot be
-   written, the deviation is not allowed. The programs that exist are in §5 (`aset`'s value semantics,
-   a global `Cell`, `locking`, the UTF-16 unit, an uninitialised array slot).
+   then misbehaves in one of four ways: it reads freed memory or follows a null pointer, frees twice,
+   races (two tasks write one location, which for a slot that holds an object is a double release), or builds an
+   invalid `str` that the decoder's bounds then no longer protect. A write through an alias that another holder
+   *in the same task* observes is **not** a failure: it is Clojure's `aset` and `volatile!`, and it runs with a clean
+   audit ([R] A12 p1, p10). If the program cannot be written, the deviation is not allowed. The programs that
+   exist are in §5.1 (a global `Cell`; an array shared by two tasks). Five reasons that the first rewrite gave
+   (`aset`'s value semantics, `locking`, the UTF-16 unit, an uninitialised object slot, `volatile!`'s `Cell`) were
+   refuted by programs that run and are no longer deviations (§10.4.8).
 2. **A static-typing fact the language already decided** (types §1, §2.11; ROADMAP M7 rule 0 says "or the
    static-typing the language already decided"): `nil` is `Option`'s empty variant and nothing else; a
    function type has a fixed arity; there is no run-time type information; a `Vec` has one element type and a
-   `Map` one key type and one value type; a result type cannot depend on a value; a protocol instance has one
-   head today. Each is listed in §5 with the program that shows it, and each that is a simplification rather
+   `Map` one key type and one value type; a result type cannot depend on a value; a `char` is a Unicode scalar
+   (types §1.1). A limit of today's compiler is not a decided fact: it is a stage limit (§5.5) that a §7 item lifts. Each
+   is listed in §5 with the program that shows it, and each that is a simplification rather
    than a necessity has a typed twist in this page that keeps Clojure's text (§2.4, §2.11, §4.2).
 
 "Cleaner", "faster", "one way", "less surprising", "no GC", "it is a wart" and "the reader may be
@@ -61,7 +67,9 @@ leaked cycle is not a violation, and the audit reports it without error (`audit:
 leaks=0 errors=0` for a cell that holds a closure that captures itself, [R] A11 e8b). A cost reason ("a lazy
 cell per element is slow", "character offsets are O(n)") is not a reason either; where cost and the rule
 collide the page follows the rule, says what the cost is, and puts the collision in §9 for the owner, who
-set both aims.
+set both aims. Exactly one deviation of the page stands on the cost side, because the rule's own answer is the
+performance the owner's other aim excludes: a recipe is consumed once where Clojure's lazy seqs are cached (§2.1 rule 2,
+§5.7 K1, §9 Q34); it is the owner's to confirm or reverse.
 
 Where a language or compiler change is what the rule requires (truthiness of `Option`, callable collections,
 arity-reading `partial`), §7 lists it with its size and the program that shows the gap, and the owner signs it
@@ -72,14 +80,14 @@ there; §9 holds only what the rule does not settle.
 | # | Principle | What it means for a function |
 |---|---|---|
 | P0 | The rule | §1.1: Clojure unless memory safety; Rust where Clojure's way would break it; a deviation carries its failing program or its decided typing fact. |
-| P1 | Clojure's names, shapes, argument order and behaviour first | A name keeps Clojure's meaning and Clojure's spelling; a name fibber already has under another spelling (`array-get`, `shl`, `read-file`, `defun`) gets Clojure's as an alias (§3 N12). Sequence functions take the sequence last, collection functions take the collection first (§3). Behaviour includes the sharp edges of Clojure that are not safety matters (`compare` of vectors, `(take-nth 0 c)`, `(range 0 1 0.1)`): they are replicated, and §9 Q33 asks whether the owner exempts them. |
-| P2 | Zero-cost by construction | Everything generic is monomorphised and every protocol call is static (compiler.md §7). A sequence function over a pure function returns a small struct that remembers its source and its function (a *recipe*), never a lazy cell and never a copy; an adaptor allocates nothing per element except what it hands on (until C5 a struct or an `(Option scalar)` is a heap object: `zip`'s `Pair`, `keep`'s `Option`, a `Map` walk's `Pair`, [R] A10 alloc), and only the materialisers (`vec`, `into`, `set`, `sort`, `group-by`) allocate per element by their signature. Sequences whose elements come from effects are memoised (`LSeq`, §2.1); where memoising and zero cost collide, §9 Q34. |
+| P1 | Clojure's names, shapes, argument order and behaviour first | A name keeps Clojure's meaning and Clojure's spelling; a name fibber already has under another spelling (`array-get`, `shl`, `read-file`, `defun`) gets Clojure's as an alias (§3 N12). Sequence functions take the sequence last, collection functions take the collection first (§3). Behaviour includes the sharp edges of Clojure that are not safety matters (`compare` of vectors, `(take-nth 0 c)`, `(range 0 1 0.1)`): they are replicated, and the owner may strike any of them (§9.1 Q33). |
+| P2 | Zero-cost by construction | Everything generic is monomorphised and every protocol call is static (compiler.md §7). A sequence function over a pure function returns a small struct that remembers its source and its function (a *recipe*), never a lazy cell and never a copy; a recipe is **consumed once** (affine, Rust's iterator discipline: §2.1 rule 2, §5.7 K1); an adaptor allocates nothing per element except what it hands on (until C5 a struct or an `(Option scalar)` is a heap object: `zip`'s `Pair`, `keep`'s `Option`, a `Map` walk's `Pair`, [R] A10 alloc), and only the materialisers (`vec`, `into`, `set`, `sort`, `group-by`) allocate per element by their signature. Sequences whose elements come from effects are memoised (`LSeq`, §2.1); where memoising every adaptor and zero cost collide, §9 Q34 (the owner's). |
 | P3 | Persistent in the API, in place when unique | `conj`, `assoc`, `update` keep Clojure's value semantics. Where the ownership checker proves the collection unique they update it in place, so a loop of `assoc`s is Clojure's transient without a transient API. `transient`, `persistent!`, `conj!` exist as identity wrappers so that Clojure's text resolves (§4.4). Whether the in-place claim holds is a test (§2.5), not a belief. |
 | P4 | Unboxed elements, a real hash | A `(Vec i64)` stores `i64`s. The hash that types §2.12 fixes (an integer hashes to itself, FNV-1a for text) is replaced before the HAMT's speed is judged (§9 Q15, **Decided**). Iteration order of a `Map` and a `Set` is the hash's, as in Clojure, except that a small `Map` keeps insertion order as Clojure's array map does (§2.7). |
-| P5 | Clojure's values where the type system has a tag for them | `nil` is `Option`'s empty variant, and a condition accepts `bool` or `(Option T)` (the falsy values are `false` and `nil`, as Clojure's, [sketch] §7 L20). A function that is undefined on some input of its type returns `Option` where Clojure returns `nil` (`first`, `get`, `peek`, `find`, `parse-long`, `index-of`); one for which Clojure throws traps, with a message and a position (`nth`, `pop`, `assoc` past the end), until exceptions are decided (§9 Q35). `or`, `and`, `when`, `some->`, `update` and `reduce` keep Clojure's text over those types (§2.4). |
-| P6 | Every spelling of Clojure's, and where Clojure has several ways, all of them | A protocol exists where the monomorphiser can dispatch on it (§2.3); a run-time predicate (`vector?`, `seq?`, `instance?`) has no run-time type to test and is not offered (§5 T3); everything else Clojure has is offered, as a function, a macro or an alias. The library's own additions (`Pair`, `unwrap`, `map-opt`, `and-then`, `try-let`, `seq-of`, `zip`, `find-first`) are marked `(new)` and never take the place of a Clojure name. |
-| P7 | State: Clojure's global state is allowed where it is safe | A top-level `atom`, `defonce`, a dynamic var with `binding`, a global random generator, `defmulti` and metadata are offered (§2.11): none breaks memory safety. A global `Cell` or `Weak` is not: it would be reachable from every task and written by two (§5 M1). |
-| P8 | Ships on today's compiler | Each tranche of §8 is written in the form that compiles today. The compiler changes of §7 make the same source faster or the same names terser; they do not change what a function means, except the syntax and checker items that the rule requires and the owner signs separately: E3, E4, E8, E14, L14, L19, L20 to L26. |
+| P5 | Clojure's values where the type system has a tag for them | `nil` is `Option`'s empty variant, and a condition accepts `bool` or `(Option T)` (the falsy values are `false` and `nil`, as Clojure's, [sketch] §7 L20). A function that is undefined on some input of its type returns `Option` where Clojure returns `nil` (`first`, `get`, `peek`, `find`, `parse-long`, `index-of`); one for which Clojure throws traps, with a message and a position (`nth`, `pop`, `assoc` past the end, `Integer/parseInt`, `slurp`, `re-pattern`, `read-string`, `max-key` of nothing), until exceptions land (§2.10; Q35 is settled by the rule); each has a typed twin `try-<name>` that returns a `Result` for a program that must recover (§3 N13). `or`, `and`, `when`, `some->`, `update` and `reduce` keep Clojure's text over those types (§2.4). |
+| P6 | Every spelling of Clojure's, and where Clojure has several ways, all of them | A protocol exists where the monomorphiser can dispatch on it (§2.3); a predicate that Clojure asks of a run-time tag (`vector?`, `seq?`, `satisfies?`) is a checker form that folds to the static answer, a variant test over `Val` and `Form` (§4.18, §5 T3), and `instance?`, `type`, `class` are not offered; everything else Clojure has is offered, as a function, a macro or an alias. The library's own additions (`Pair`, `unwrap`, `map-opt`, `and-then`, `try-let`, `seq-of`, `zip`, `find-first`) are marked `(new)` and never take the place of a Clojure name. |
+| P7 | State: Clojure's global state is allowed where it is safe | A top-level `atom`, `defonce`, a dynamic var with `binding`, a global random generator, `defmulti` and metadata are offered (§2.11): none breaks memory safety. A global `Cell` or `Weak` is not: it would be reachable from every task and written by two (§5 M1); `volatile!` is an `Atom` (§2.11), and an array is Clojure's shared mutable object inside one task, a handle that cannot cross a task (§5 M2). |
+| P8 | Ships on today's compiler | Each tranche of §8 is written in the form that compiles today. The compiler changes of §7 make the same source faster or the same names terser; they do not change what a function means, except the syntax and checker items that the rule requires and the owner signs separately: E3, E4, E8, E14, L2, L13, L14, L19, L20 to L26, L30 and L31. |
 | P9 | Every function has an executable test | Cases run both ways (method rule 6), generated programs against a model (rule 5), differential tests against a naive reference written in fibber (§8). The compiler (M6) is the first customer: what stage 2 needs lands first. |
 
 Two non-goals. The library does not try to be a Clojure interpreter: no `eval` (a result type that cannot be
@@ -87,13 +95,13 @@ known statically, and the compiler inside every binary), no reflection (no run-t
 Java instance interop (`.method`, `new`); the static names Clojure code writes (`Math/sqrt`, `Long/MAX_VALUE`,
 `Integer/parseInt`, `Character/isDigit`) are offered as modules (§4.16). Arbitrary-precision numbers and
 ratios are library types (`BigInt`, `Ratio`, `BigDecimal`; tranche 5, §2.8), not a non-goal. The library does
-not hide cost: `count` says in §4 whether it is O(1) or a walk, and re-traversing a recipe re-runs it (§2.1).
+not hide cost: `count` says in §4 whether it is O(1) or a walk, and a recipe is consumed once, so no pipeline's function runs twice behind the programmer's back (§2.1).
 
 ## 2. The core abstractions
 
 Code blocks are marked. `ran:` means the block (or the module it is cut from) was compiled and run
-with `fibc` and with `fibref` and the audit was clean (Appendix A, A7, A11); `proposed:` means the
-compiler does not accept it today, and the error it gives is quoted where it matters.
+with `fibc` and with `fibref` and the audit was clean (Appendix A, A7, A11, A12); a block that says it is an excerpt abbreviates a body with `..` and is not compilable
+as printed; `proposed:` means the compiler does not accept it today, and the error it gives is quoted where it matters.
 
 ### 2.1 Iteration: one push protocol, a pull protocol for lockstep walks, a closed seq type for recursion
 
@@ -103,14 +111,14 @@ method, `each-while`: internal iteration with early exit by a `bool`. This is `r
 `to-vec` are abbreviated here; the module that ran has them ([R] A10 nth).
 
 ```lisp
-;; ran: fib.seq
+;; ran: fib.seq (an excerpt: each `..` stands for the body in the module, so the block is not compilable as printed)
 (defprotocol (Reducible s e)
   (each-while (self k: (fn (e) bool) :borrow) -> bool)   ; false from k stops the walk; the result says whether it ran to the end
   (size (self) -> i64                                    ; default: a walk; O(1) where the source knows
     (let ((n (cell 0)))
       (do (each-while self (fn (x) (do (set! n (+ @n 1)) true)))
           @n)))
-  (nth (self i: i64) -> e ..)                            ; default: a walk that traps past the end; O(1) on Vec Array Range Slice
+  (nth (self i: i64) -> e ..)                            ; default: a walk that traps past the end; O(1) on Vec Array Range SubVec
   (last (self) -> (Option e) ..)                         ; default: a walk
   (to-vec (self) -> (Vec e) ..))                         ; default: a push loop; a Vec returns itself
 (defenum (Step a) (More v: a) (Done v: a))                ; Clojure's `reduced`: the step of `reduce-while`
@@ -119,32 +127,59 @@ method, `each-while`: internal iteration with early exit by a `bool`. This is `r
 
 Rules:
 
-1. **Sources** implement `Reducible` with one `impl`: `Vec`, `List`, `Array`, `Option` (zero or one
+1. **Sources** implement `Reducible` with one `impl`: `Vec`, `SubVec`, `VSeq`, `List`, `Array`, `Option` (zero or one
    element, so `(map inc nil)` is empty and `nil` flows through a pipeline), `Map` (yields
    `(Pair k v)`), `Set`, `Range`, `Iterate`, `Repeat`, `Cycle`, `Chars`, **`str` (a source of `char`s, as
    Clojure's string is a seqable of characters, §2.9)**, and every adaptor below.
 2. **Adaptors** (`map filter remove keep take drop take-while drop-while mapcat concat
    map-indexed reductions partition interleave zip ...`) are functions that build, in O(1), a struct
-   holding the source and the parameters, and implement `Reducible` over it. Over a pure function they are
-   *recipes*: traversing one twice runs it twice, calling `f` again. Nothing runs until a consumer walks it,
-   and the adaptor itself allocates nothing per element; what it hands to the next stage can be an
+   holding the source and the parameters, and implement `Reducible` over it: *recipes*. Nothing runs until a
+   consumer walks it, and the adaptor itself allocates nothing per element; what it hands to the next stage can be an
    object until C5 (`zip` yields a `Pair` and `keep` an `Option`: +1003 and +1002 objects over 1000
    elements against +4 for `zip-with` and +2 for `map`; `(first v)` in a loop +1000 against `(nth v 0)`
    +0; a `Map` walk +2000 in the prototype, the prelude's `Entry` and the `Pair` it is re-wrapped in,
-   [R] A10 alloc). **Clojure's lazy seqs are cached, so the observable difference is an effectful function:**
-   a counting `map` traversed twice makes 6 calls where Clojure's makes 3 ([R] A11 t20, result 624), and the rule
-   does not accept cost as a reason. So a sequence whose elements come from effects is memoised: `repeatedly`,
-   `line-seq`, `iteration`, `lazy-seq`, `lazy-cat`, `file-seq` return an `LSeq`, a head and a `Lazy` cell forced
-   once, which runs the source's effect once per element across two traversals (5 calls, sum 10 twice, audit
-   clean, A11 t21); `(cache c)` memoises any finite recipe (A11 e8c: `12 12 3`); `doall` is `vec` and `dorun` is
-   `run!`. A self-referential `LSeq` (the classic `fibs`, `ones`) is a reference cycle through a cell:
+   [R] A10 alloc).
+
+   **A recipe is consumed once.** Clojure's lazy seqs are cached, so a lazy `map` traversed twice calls `f` 3 times
+   where a recipe that re-runs makes 6 ([R] A11 t20, result 624). The rule's answer, a cell per element per stage
+   (A11 t21), is the cost the owner's other aim excludes, so the page takes Rust's iterator discipline and says
+   precisely what differs (§5.7 K1; the choice is §9 Q34, and the memoising default is its alternative):
+
+   * *The check.* Recipe types are **affine**: a consumer takes a recipe by value, and a second use of the same recipe
+     value is the compile error `recipe already consumed: to traverse it twice use (seq r), (doall r), (vec r) or (cache r)`.
+     A consumer that stops after at most one element and builds nothing (`first`, `empty?`, `some`, `every?`,
+     `not-any?`) takes its argument `:borrow` and does not consume it, so a recipe that is peeked and then
+     consumed runs its first element's function twice. It is a checker rule (§7 L13, **[sketch]**). **Today's checker
+     has none:** a non-Copy struct passed to a function twice is accepted, `fibref explain` says `arg 1 w: borrow` for both
+     calls, and with a stored (owned) parameter `retain` for both, results 6 and 6 ([R] A12 aff1, aff2). Until L13
+     lands a recipe can be traversed twice and re-runs (§5.5 S14).
+   * *Why not a use count.* The earlier recommendation, that the checker inserts `cache` where the use count of a recipe
+     variable exceeds one, is unsound. A recipe mentioned once in a loop body, or once in a closure that is called three
+     times, is traversed three times and gets no cache: both programs call `f` 6 times where Clojure's make 2 (**[K]**; [R] A12 q34,
+     `[6]` and `[6]`). A use count is not a traversal count; the affine check is one (a closure that consumes a captured
+     recipe may be called once, as Rust's `FnOnce`, so the second program is rejected at the closure).
+   * *A value that is traversed twice is made explicit.* `(seq r)` consumes `r` and returns the `LSeq` of its elements,
+     Clojure's cached lazy seq (a head and a `Lazy` cell forced once, one object per element, as Clojure's; 5 calls and sum 10
+     twice, A11 t21); `(doall r)` returns the `VSeq` over the materialised elements and `(vec r)` the `Vec` (`mapv` and
+     `filterv` are Clojure's eager spellings); `(cache r)` memoises a finite recipe on its first walk, which runs the whole source (A11
+     e8c: `12 12 3`). A collection (`Vec List Map Set Array Range str`) is not a recipe and is traversed as often as the
+     program likes. `repeatedly`, `line-seq`, `iteration`, `lazy-seq`, `lazy-cat` and `file-seq` return an `LSeq` already, so
+     the sequences whose elements come from effects keep Clojure's run-once-per-element behaviour across traversals.
+   * *What differs from Clojure.* A program that compiles makes the calls to `f` that Clojure's lazy seq makes, except that
+     a recipe that is peeked and then consumed runs its first element's `f` again; only an effectful function shows it.
+     What differs at compile time is that Clojure text that traverses one lazy value twice,
+     `(let [xs (map f c)] [(count xs) (reduce + xs)])`, is rejected with the cure in the message; the porter writes
+     `(doall (map f c))` or `(vec (map f c))`. A prototype with a flag cell in each recipe traps `recipe already consumed` at run time
+     today ([R] A12 aff3: `12`, `3`, `[12 3 3]`, then the trap), but a recipe that holds a `Cell` cannot cross a task
+     (§2.1 below), so the library does not ship that form.
+
+   A self-referential `LSeq` (the classic `fibs`, `ones`) is a reference cycle through a cell:
    `audit: clean=false leak-cycles=4 leaks=0 errors=0` (A11 t22), a leak the ownership model allows (§1.1) and
    not a safety failure; an immortal `def` hides it. An `LSeq` holds a `Cell`, so it cannot cross a task
    (`cell cannot be shared between threads: closure capture s, field box of Cached has type (Cell (Option (Vec
    i64)))`, A11 e8d); the same memo over an `Atom` crosses (A11 e8e, result 6), and a `Mutex` (§7 C9) gives
-   Clojure's run-once-under-contention exactly. Whether the default for **every** adaptor is memoised, with
-   the checker inserting `cache` where the use count of a recipe variable exceeds one so that a single-use
-   pipeline stays zero-cost, is §9 Q34.
+   Clojure's run-once-under-contention exactly.
+
 3. **Consumers** (`reduce first last some every? count empty? into vec set sort ...`) are
    loops over `each-while`. `first`, `some`, `every?`, `take`, `take-while`, `empty?`
    stop the source through the `bool`, so `(take 5 (iterate inc 0))`, `(first (filter p (iterate inc 0)))` and
@@ -154,7 +189,7 @@ Rules:
    with a limit 105, an infinite source ends, A11 e20 and t81), and `reduce-while` is the form for a function
    that is not a literal. It allocates a heap enum per step until unboxed enums land (§7 C5), so the plain
    consumers use the `bool` channel.
-4. **`count` is `size`**: O(1) where the source holds its elements (`Vec Map Set Array Range Option Slice`),
+4. **`count` is `size`**: O(1) where the source holds its elements (`Vec Map Set Array Range Option SubVec`),
    a walk for every adaptor, so **`(count (map f c))` calls `f`, as Clojure's does** (the prototype's `Mapped`
    no longer overrides `size`: `[(count r) calls]` is `[2 2]` and `[(sum r) calls]` `[3 4]` over `[1 2]`, A11
    count; the first version of this page made it O(1) and not call `f`, which was a cost reason). `Range` has a
@@ -231,28 +266,93 @@ Rules:
    where Clojure's `comp` cannot be function composition today (§5 T9): after C1 `comp` is arity-reading and
    dispatches on `Fn` and `Xf` (§7 L22), which gives Clojure's text `(comp (map f) (filter p))`; an impl head on a
    function type is rejected as it stands (A6).
+
+   **The transducer arity** of every Clojure function that has one has the same shape, a factory of steppers: `map filter remove take
+   take-while drop drop-while take-nth keep keep-indexed map-indexed mapcat partition-all partition-by dedupe distinct interpose replace
+   random-sample`, and `cat`, `halt-when`, `completing` (§4.2, §4.4). Until L1 makes `(map f)` the one-argument clause of `map`, each is
+   `x<name>`: `xmap xfilter xremove xtake xtake-while xdrop xdrop-while xtake-nth xkeep xkeep-indexed xmap-indexed xmapcat xpartition-all
+   xpartition-by xdedupe xdistinct xinterpose xreplace xrandom-sample`. Fourteen ran (`xmap xfilter xtake xmapcat xpartition-all` in A8, and nine
+   more in A12 xf2: a stateful stepper keeps its state in a per-traversal cell, an early-stopping one returns `false`, one that holds elements
+   back says so in its flush); `xdrop xkeep xkeep-indexed xreplace xrandom-sample cat halt-when completing` are the same shape and were not
+   written here:
+
+```lisp
+;; ran: fib.xf (A12 xf2, three of its nine; the rest are the same shape)
+(defun noflush () -> (fn ((fn (b) bool)) bool) (fn (k) true))
+(defun xtake-while (p: (fn (a) bool)) -> (Xf a a)
+  (Xf (fn () (Stepper (fn (x k) (if (p x) (k x) false)) (noflush)))))
+(defun xdedupe () -> (Xf a a) :where ((Eq a))
+  (Xf (fn () (let ((prev (cell nil)))
+               (Stepper (fn (x k) (match @prev
+                                    (nil (do (set! prev (some x)) (k x)))
+                                    ((some p) (if (= p x) true (do (set! prev (some x)) (k x))))))
+                        (noflush))))))
+(defun xpartition-by (f: (fn (a) k)) :where ((Eq k)) -> (Xf a (Vec a))      ; holds the open group, emitted by the flush
+  (Xf (fn () (let ((buf (cell (vec-empty))) (last (cell nil)))
+               (Stepper (fn (x k)
+                          (let ((v (f x)))
+                            (match @last
+                              (nil (do (set! last (some v)) (set! buf (conj @buf x)) true))
+                              ((some l) (if (= l v)
+                                            (do (set! buf (conj @buf x)) true)
+                                            (let ((g @buf)) (do (set! buf (conj (vec-empty) x)) (set! last (some v)) (k g))))))))
+                        (fn (k) (if (> (count @buf) 0) (k @buf) true)))))))
+;; (into-xf [] (xpartition-by odd?) [1 3 2 4 5]) is [[1 3] [2 4] [5]]; (xdedupe) over [1 1 2 2 2 1] gives [1 2 1]; ten checks, result 0
+```
+
 8. **Recursion on `rest` uses a closed seq type.** Clojure's `(defn len [xs] (if (seq xs) (inc (len (rest
    xs))) 0))` is the basic idiom, and for a generic `c` with `rest` returning `(Dropped c e)` it is polymorphic
    recursion, which `fibc` cannot finish ([R] A10 poly; §7 B4 makes both tools reject it). The cure is
    Clojure's own structure: `seq`, `rest` and `next` belong to `Seqable c s`, where `s` is one **closed** seq type per
-   collection and `rest` of an `s` is an `s`: a `Vec` has the `Slice` view, a `List` itself, a `Range` itself, a
-   `str` a view that steps by one character, and any other `Reducible` the memoised `LSeq`. The idiom then
-   type-checks, is generic over every collection that has a seq type and runs under both tools:
+   collection and `rest` of an `s` is an `s`: a `Vec` has the `VSeq`, a `List` itself, a `Range` itself, a
+   `str` a view that steps by one character, and any other `Reducible` the memoised `LSeq`. `VSeq` is a *seq*: a
+   `List` of consed front elements over a `Vec` and an offset, so `conj` conses at the front and it prints in
+   parentheses, as Clojure's `(conj (rest [1 2 3]) 0)` is `(0 2 3)`. It is **not** `subvec`'s result: `SubVec` is a vector
+   view whose `conj` appends and which prints in brackets, as Clojure's `(conj (subvec [1 2 3] 1) 0)` is `[2 3 0]`. The first
+   version of this page had one type, `Slice`, for both, with one `conj`, and `(conj (rest v) 0)` printed `[2 3 0]` under both
+   tools ([R] A12 q_slice). The idiom type-checks, is generic over every collection that has a seq type and runs under both
+   tools; `sort` returns a `VSeq` too, as Clojure's returns a seq (`(conj (sort [3 1 2]) 0)` is `(0 1 2 3)`):
 
 ```lisp
-;; ran: fib.seqable (A11 p/seq1)
-(defprotocol (Seqable c s)
-  (seq (self) -> (Option s))        ; nil when empty, else the closed seq type
-  (rest (self) -> s))               ; empty when empty, never nil
-(impl (Seqable (Slice a)) (Vec a) ..)  (impl (Seqable (Slice a)) (Slice a) ..)  (impl (Seqable (List a)) (List a) ..)
+;; ran: fib.seqable (A12 vseq; the main of that program is left out; Coll2 and conj2 stand for Collection and conj, §7 B3)
+(defstruct (VSeq a) (front: (List a) v: (Vec a) lo: i64))
+(impl (Reducible a) (VSeq a)
+  (each-while (self k)
+    (if (each-while (. self front) k)
+        (let ((v (. self v)) (n (count (. self v))))
+          (loop ((i (. self lo))) (if (< i n) (if (k (nth v i)) (recur (+ i 1)) false) true)))
+        false))
+  (size (self) (+ (size (. self front)) (- (count (. self v)) (. self lo))))
+  (to-vec (self) (if (= (. self lo) 0) (match (. self front) ((fib.prelude/empty) (. self v)) (_ (default-to-vec self))) (default-to-vec self))))   ; (vec (sort xs)) is the sorted Vec itself
+(defun default-to-vec :private (c: (VSeq a)) -> (Vec a)
+  (let ((acc (cell (vec-empty)))) (do (each-while c (fn (x) (do (set! acc (conj @acc x)) true))) @acc)))
+(defprotocol (Seqable c s) (seq (self) -> (Option s)) (rest (self) -> s))     ; nil when empty / empty when empty, never nil
+(defun vseq-of (v: (Vec a)) -> (VSeq a) (VSeq fib.prelude/empty v 0))
+(impl (Seqable (VSeq a)) (Vec a)
+  (seq (self) (if (> (count self) 0) (some (vseq-of self)) nil))
+  (rest (self) (VSeq fib.prelude/empty self (if (> (count self) 0) 1 0))))
+(impl (Seqable (VSeq a)) (VSeq a)
+  (seq (self) (if (> (size self) 0) (some self) nil))
+  (rest (self)
+    (match (. self front)
+      ((fib.prelude/cons _ t) (VSeq t (. self v) (. self lo)))
+      ((fib.prelude/empty) (VSeq fib.prelude/empty (. self v) (if (< (. self lo) (count (. self v))) (+ (. self lo) 1) (. self lo)))))))
+(defprotocol (Coll2 s e) (conj2 (self x: e) -> Self))
+(impl (Coll2 a) (VSeq a) (conj2 (self x) (VSeq (fib.prelude/cons x (. self front)) (. self v) (. self lo))))   ; conj conses at the front
+(defstruct (SubVec a) (v: (Vec a) lo: i64 hi: i64))                                                            ; subvec's result
+(impl (Coll2 a) (SubVec a) (conj2 (self x) (let ((v (to-vec self))) (SubVec (conj v x) 0 (+ (size self) 1)))))  ; conj appends
+(defun sort-seq (c: c) :where ((Reducible c e) (Ord e)) -> (VSeq e) (vseq-of (sort c)))
 (defun next (c: c) :where ((Seqable c s) (Seqable s s)) -> (Option s) (seq (rest c)))
-(defun len (xs: c) :where ((Seqable c s) (Seqable s s)) -> i64
-  (if-let (s (seq xs)) (+ 1 (len (rest s))) 0))     ; (len [5 6 7 8]) 4, (len (list 1 2 3)) 3, (len []) 0
+(defun len (xs: c) :where ((Seqable c s) (Seqable s s)) -> i64 (if-let (s (seq xs)) (+ 1 (len (rest s))) 0))
+;; (len [5 6 7 8]) 4, (len (rest v)) 2; (conj2 (rest [1 2 3]) 0) shows (0 2 3), (conj2 (subvec [1 2 3] 1 3) 0) shows [2 3 0],
+;; (conj2 (sort-seq [3 1 2]) 0) shows (0 1 2 3), (sort-seq [3 1 2]) shows (1 2 3): [3 2 0 3] for len, under both tools;
+;; (to-vec (sort-seq [3 1 2])) = [1 2 3], (to-vec (rest [1 2 3])) = [2 3]
 ```
 
-   `len` is instantiated at `(Vec i64)` and then at `(Slice i64)`, which calls itself: a fixed point, not a
-   chain. `first` stays a `Reducible` method (`(Option e)`, stops after one element). A `rest` over a recipe
-   (`(rest (map f c))`) allocates one `LSeq` cell per step as Clojure's does, so the idiom is the
+   `len` is instantiated at `(Vec i64)` and then at `(VSeq i64)`, which calls itself: a fixed point, not a
+   chain. `first` is a function over `each-while` (`(Option e)`, stops after one element), not a method of
+   `Seqable`; the methods of `Reducible` are `each-while size nth last to-vec`. A `rest` over a recipe
+   (`(rest (map f c))`) allocates one `LSeq` cell per step as Clojure's does and consumes the recipe (rule 2), so the idiom is the
    convenient form and `reduce` or `loop` the zero-cost one; the `Seqable` instances of the adaptors are one
    line each (**[H]**: the `LSeq` of A11 t21 exists, the instances over adaptors were not written).
 
@@ -271,7 +371,7 @@ element (a pull cursor needs a slot cell per adaptor to avoid re-running `f` beh
 `(Option e)` is made per element, which is a heap object when `e` is a scalar ([R] A5). Pull wins
 where two sources advance together, so that is the one place it is offered. A pull `seq` of
 `(Option cursor)` would be free for object-typed cursors (a null pointer); the recursion idiom it serves (`(rest s)` as a
-loop variable) is served by the closed seq type of rule 8, a `Slice`, a `List` or an `LSeq`, and not by a cursor over a
+loop variable) is served by the closed seq type of rule 8, a `VSeq`, a `List` or an `LSeq`, and not by a cursor over a
 recipe. The unbounded case remains a hazard: a function that recurses on `(drop 1 c)` for any `Reducible c` calls
 itself at `(Dropped c e)`, then at `(Dropped (Dropped c e) e)`, without end (polymorphic recursion): `fibc` exhausts
 memory (`memory allocation of 577136 bytes failed` under `ulimit -v 4000000`) and `fibref` returns 3 ([R] A10 poly), a
@@ -282,15 +382,15 @@ stage-1 divergence that §7 B4 closes by making both tools reject it with a mess
 over a growable buffer and assemble the trie once, about n/32 allocations instead of 2n (§2.5); `vec` of a
 `Vec` is the identity.
 Each adaptor has an eager spelling only where Clojure has one (`mapv`, `filterv`, aliases of
-`(vec (map ..))`; `doall` is `vec`).
+`(vec (map ..))`; `doall` is the `VSeq` over `(vec ..)`).
 
 **Infinite and lazy.** `iterate repeat cycle` are ordinary sources that only an
 early-exiting consumer ends. Memoised laziness, for a recursive definition such as the Fibonacci
 numbers, is the library type `LSeq` (`fib.lazy`) with `lazy-seq` and `lazy-cat` as macros over it: a head and a
 `(Lazy a)` forced once. It moves from tranche 5 to tranche 2, because the classic recursive producers, the
 `Seqable` instances of the adaptors and the effect-sourced sequences of rule 2 need it. Fibber has no GC, so a cell per
-element is a cost the pure adaptors avoid; the rule puts the cost where Clojure puts it, on the sequences
-that run effects.
+element is a cost the pure adaptors avoid by being consumed once (rule 2); `seq`, `lazy-seq` and the sequences
+that run effects pay it where Clojure's do.
 
 **A recipe is a type.** Each adaptor is a distinct struct, which has three consequences. (1) *Joins.*
 `(if flag (filter p v) v)` is `cannot unify (Vec i64) with (Filtered (Vec i64) i64)`, and two different
@@ -388,27 +488,27 @@ argument count (§7 L1), which is a property of a name, not of a value.
 
 | Protocol | Methods | Required by | Instances |
 |---|---|---|---|
-| `Reducible s e` | `each-while`, `size`, `nth` (traps out of range), `last`, `to-vec` | every sequence function and consumer | `Vec List Array Option Map Set Range Iterate Repeat Cycle Chars str Slice Queue SortedMap SortedSet Reversed Repeatedly FRange Matches Lines LSeq Cached`, every adaptor, user types |
-| `Seqable c s` | `seq -> (Option s)`, `rest -> s` | `seq rest next` and the recursion idiom (§2.1 rule 8) | `Vec` and `Slice` (seq type `Slice`), `List`, `Range`, `str` (a view that steps by a character), `LSeq`; every adaptor (seq type `LSeq`) |
-| `Cursable s c`, `Cursor c e` | `cursor`; `advance!`, `current` | `zip interleave map/3 zipmap` (second operand) | `Vec Range Array Slice str` and their cursors; every adaptor by buffering, and without a buffer for `Mapped Dropped Taken Zipped` after L16 |
-| `Lookup s k v` | `get -> (Option v)` | `get update find select-keys`, and a `Lookup` value in call position (§2.11) | `Map`; `Vec` (key `i64`); `str` (key `i64`, value `char`); `SortedMap`; `Slice`; `(Option s)` after L16; user types |
-| `Assoc s k v` | `assoc` | `assoc update assoc-in` | `Map`; `Vec` (index at most the count: `i = count` appends, as Clojure's); `SortedMap`; a struct by a literal keyword (L21) |
+| `Reducible s e` | `each-while`, `size`, `nth` (traps out of range), `last`, `to-vec` | every sequence function and consumer | `Vec List Array Option Map Set Range Iterate Repeat Cycle Chars str SubVec VSeq Queue SortedMap SortedSet Reversed Repeatedly FRange Matches Lines LSeq Cached`, every adaptor, user types |
+| `Seqable c s` | `seq -> (Option s)`, `rest -> s` | `seq rest next` and the recursion idiom (§2.1 rule 8) | `Vec`, `SubVec` and `VSeq` (seq type `VSeq`), `List`, `Range`, `str` (a view that steps by a character), `LSeq`; every adaptor (seq type `LSeq`) |
+| `Cursable s c`, `Cursor c e` | `cursor`; `advance!`, `current` | `zip interleave map/3 zipmap` (second operand) | `Vec Range Array SubVec VSeq str` and their cursors; every adaptor by buffering, and without a buffer for `Mapped Dropped Taken Zipped` after L16 |
+| `Lookup s k v` | `get -> (Option v)` | `get update find select-keys`, and a `Lookup` value in call position (§2.11) | `Map`; `Vec`, `SubVec` and `Array` (key `i64`); `str` (key `i64`, value `char`); `SortedMap`; `(Option s)` after L16; user types |
+| `Assoc s k v` | `assoc` | `assoc update assoc-in` | `Map`; `Vec` and `SubVec` (index at most the count: `i = count` appends, as Clojure's); `SortedMap`; a struct by a literal keyword (L21) |
 | `Dissoc s k` | `dissoc` | `dissoc disj` | `Map Set SortedMap SortedSet` |
-| `Keyed s k` | `contains?` | `contains?` | `Map Set SortedMap SortedSet`, **and `Vec` and `Slice` (the index, as Clojure's: `(contains? [10 20] 1)` is true and `(contains? [10 20] 20)` false)**; `includes?` is the element test |
-| `Collection s e` | `conj` | `into conj` (`vec`, `set` and `merge` are `Reducible` plus `Hash`/`Eq`) | `Vec` (end), `List` (front), `Set`, `Map` (of `Pair`; of a two-element `Vec` after L23), `Queue` (back), `SortedMap` (of `Pair`), `SortedSet` |
+| `Keyed s k` | `contains?` | `contains?` | `Map Set SortedMap SortedSet`, **and `Vec`, `SubVec`, `Array` and `str` (the index, as Clojure's: `(contains? [10 20] 1)` is true and `(contains? [10 20] 20)` false; `(contains? "abc" 1)` true)**; `includes?` is the element test |
+| `Collection s e` | `conj` | `into conj` (`vec` is `Reducible`, `set` is `Reducible` plus `Hash`/`Eq`; `merge` is over `Map`s only, §4.5) | `Vec` (end), `SubVec` (end), `List` (front), `VSeq` (front), `Set`, `Map` (of `Pair`; of a two-element `Vec` after L23), `Queue` (back), `SortedMap` (of `Pair`), `SortedSet` |
 | `Emptyable` | `empty` | `empty select-keys assoc-in` | `Vec Map Set List Queue SortedMap SortedSet` |
-| `Stack s e` | `peek -> (Option e)`, `pop` | `peek pop` | `Vec` (end), `List` (front), `Queue` (front) |
-| `Reversible s e` | `each-while-rev` | `rseq` | `Vec Array Range Slice SortedMap SortedSet` |
+| `Stack s e` | `peek -> (Option e)`, `pop` | `peek pop` | `Vec` (end), `SubVec` (end), `List` (front), `Queue` (front) |
+| `Reversible s e` | `each-while-rev` | `rseq` | `Vec Array Range SubVec SortedMap SortedSet` |
 | `KeyReducible m k v` | `each-kv-while` | `reduce-kv` | `Map`, `Vec` (index, element) |
 | `Truthy r`, `Payload r p` | `truthy? -> bool`; `payload -> p` | the predicate parameter `(fn (e) r)` of `filter remove some every? not-any? keep take-while drop-while`; `if-let`; `some` | `bool` (payload `bool`), `(Option a)` (payload `a`); no other type (a condition that cannot be false) |
 | `Cmp r` | `resolve` | the comparator parameter `(fn (e e) r)` of `sort sort-by sorted-map-by sorted-set-by comparator` | `i64` (negative, zero, positive), `bool` (Clojure's predicate form: true is -1, else the swapped call decides) |
 | `Pattern p` | `find-in`, `split-by`, `replace-in` | `str/split str/replace str/replace-first str/index-of str/last-index-of re-find` | `str`, `char`, `Regex` |
-| `Eq Ord Hash Show` | built in; `derive` | `= < hash println` | scalars, `str`, `Option`, `List`; **added**: `Vec Map Set Pair Triple` (§2.7); `Ord` of a `Map` or `Set` is not offered (Clojure's `compare` throws on a map) |
+| `Eq Ord Hash Show` | built in; `derive` | `= < hash println` | scalars, `str` (`Ord str` is Clojure's UTF-16 code-unit order, §2.7), `Option`, `List`; **added**: `Vec Map Set Pair Triple` (§2.7); `Ord` of a `Map` or `Set` is not offered (Clojure's `compare` throws on a map) |
 | `ToStr` | `to-str -> str` | `str` | `str` itself, scalars, `char`, `(Option a)` (empty text for `nil`), collections (the `Debug` text, as Clojure's `(str ["a"])`), derived structs |
 | `Debug` | `debug -> str` | `pr prn pr-str` | as `Show`; strings quoted (§2.7) |
 | `Num`, `Bits` | built in (types §2.12) | `+ - * / bit-and ...` | integer and float types; the library's `BigInt`, `Ratio`, `BigDecimal` (§2.8) |
 | `Unit t` | `zero`, `one` (take a value of the type as witness) | `inc dec abs zero? sum` | `i8..i64`, `f32`, `f64` |
-| `ToByte ToShort ToInt ToLong ToFloat ToDouble ToChar` | `byte short int long float double char` | the conversions | numeric types |
+| `ToByte ToShort ToInt ToLong ToFloat ToDouble ToChar` | `byte short int long float double char` | the conversions | numeric types; `ToInt` and `ToLong` also take a `char`, so `(- (int c) (int \0))` is Clojure's text ([R] A12 int2) |
 | `Fn f args r` (after C1) | `call` | every function argument; the callable collections | every `(fn ..)`; `Map Set Vec` and keyword instances after C1 and L23 (§2.11) |
 
 The prelude's `Countable`, `Indexable`, `Traversable`, `Iter` and `Seq` protocols and its `for-each`, `map`,
@@ -433,7 +533,8 @@ tuple type (§5 T4); `dissoc` and `disj` are one `Dissoc`, so `(disj m k)` on a
 ```
 
 `Keyed` on a `Vec` is one impl, and `assoc` at the count appends, both as Clojure's, both under both tools ([R] A11
-e6):
+e6); `Keyed` and `Lookup` on a `str` and on an `Array` are one impl each, since `(contains? "abc" 1)` and `(get (int-array [1 2]) 0)` are
+Clojure's ([R] A12 keyed, the second block below):
 
 ```lisp
 ;; ran: fib.coll (A11 e6)
@@ -441,6 +542,15 @@ e6):
 (defun assoc-c (v: (Vec a) i: i64 x: a) -> (Vec a) (if (= i (count v)) (conj v x) (assoc v i x)))
 ;; (contains? [10 20] 1) true, (contains? [10 20] 20) false, (assoc-c [10 20] 2 30) [10 20 30], (assoc-c [10 20] 0 30) [30 20],
 ;; (assoc-c [10 20] 5 30) trap: assoc: index out of range
+```
+
+```lisp
+;; ran: fib.coll (A12 keyed)
+(impl (Keyed i64) str (contains? (self i) (and (>= i 0) (< i (count (str-chars self))))))
+(impl (Lookup i64 char) str (get (self i) (if (and (>= i 0) (< i (count (str-chars self)))) (some (nth (str-chars self) i)) nil)))
+(impl (Keyed i64) (Array a) (contains? (self i) (and (>= i 0) (< i (array-len self)))))
+(impl (Lookup i64 a) (Array a) (get (self i) (if (and (>= i 0) (< i (array-len self))) (some (array-get self i)) nil)))
+;; (contains? "abc" 1) true, (contains? "abc" 3) false, (get "abc" 2) (some c), (contains? (array 2 7) 2) false, (get (array 2 7) 5) nil
 ```
 
 The two protocols that were not in the first version carry two of Clojure's habits that the page had refused.
@@ -489,7 +599,7 @@ other arities may coexist.
 
 **Defaults.** A default method written once is specialised per type. `Reducible.size`, `nth`, `last` and
 `to-vec` are the examples, overridden where the source knows better: by `Vec` ([R] A10 nth, rangesize) and, in
-the same way, by `Array`, `Range`, `Option` and `Slice`; an adaptor does **not** override `size`, so `count`
+the same way, by `Array`, `Range`, `Option` and `SubVec`; an adaptor does **not** override `size`, so `count`
 walks it and calls its function (§2.1 rule 4); `Ord`'s `<=`, `>`, `>=` and `Eq`'s `!=` are the prelude's.
 
 **Instances are global facts** (syntax §5): the library's `impl Eq (Vec a)` is visible to every
@@ -609,7 +719,7 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
 
 * `=` is structural on **one** static type, with one family exception. Clojure's `=` ignores the concrete type
   within a family: `(= [1 2] (list 1 2))` and `(= [2 3] (map inc [1 2]))` are true. The families are the sequential
-  one (`Vec List Slice Range Array`, recipes, `LSeq`), the map one (`Map`, `SortedMap`) and the set one (`Set`,
+  one (`Vec SubVec List VSeq Range Array`, recipes, `LSeq`), the map one (`Map`, `SortedMap`) and the set one (`Set`,
   `SortedSet`); where the operand types of `=` differ and belong to one family, the checker elaborates it to
   `seq=` (or its map and set twins), **[sketch]** §7 L24; today `(= [1] (list 1))` is `cannot unify` and the
   library form is `(seq= a b)` ([R] A10 showseq: `(seq= (map inc [1 2]) [2 3])` is true). Across families
@@ -618,7 +728,7 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
   with the owner's L19 (**Decided**) a literal adopts the other operand's numeric type, so `(= 1 1.0)` is
   `(= 1.0 1.0)`: **true**, which is Clojure's `==` and not its `=` (false). That is a consequence of L19, recorded
   here and in §5 C1; `==` is an alias of `=`. For two variables of different numeric types `(= n 1.0)` is
-  `cannot unify f64 with i64` today (A11 t62, n3) and §9 Q36 asks whether the operators promote.
+  `cannot unify f64 with i64` today (A11 t62, n3) and the operators promote at a mixed call by the rule (§2.8, L26 b).
 * `Eq Hash Show Debug ToStr` exist for `Vec Map Set Pair Triple Option List`, `Ord` for `Vec Pair Triple Option List`
   (not for `Map` and `Set`: Clojure's `compare` throws on a map), and `derive` for user types, which today derives
   `Eq Ord Hash Show` only (`(derive Debug P)` is `cannot derive Debug: only Eq, Ord, Hash and Show`, [R] A10
@@ -626,6 +736,36 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
   instances make it work, and a `Vec` a map key (A7). **`Ord` on a `Vec` is Clojure's: the shorter vector is
   less, then element by element** (`(sort [[1 2 3] [9 9] [1 2]])` is `[[1 2] [9 9] [1 2 3]]`, A11 t1r); `Ord (List a)`
   is lexicographic (Clojure's lists are not comparable, so Rust's order).
+* **`Ord str` is Clojure's: UTF-16 code-unit order.** Clojure compares strings by `char`, a UTF-16 unit, so a supplementary
+  character (U+10000 and up, a surrogate pair) sorts below U+E000 to U+FFFF, which UTF-8 byte order, the scalar order, puts
+  after it: `(compare "😀" "\uFFFF")` is negative in Clojure and positive by scalar. A comparison builds no `str`, so no safety
+  reason and no typing fact decides it (§5 T10 is about `char`, not about the order of strings), and by the rule it is
+  Clojure's. It costs one byte loop with one fix-up at the first differing byte (a lead byte F0 to F4 against EE or EF is
+  reversed), allocation-free with `str-byte-at`; it agrees with an explicit UTF-16 encoding on all 5184 pairs of a 72-string
+  set and the byte order disagrees on 1068 of them ([R] A12 u16cmp). `<`, `compare`, `sort`, `sorted-map` and `max` of strings use it;
+  `Eq` and `Hash` are unchanged. A `char` is a scalar (§5 T10) and compares by scalar, so a one-character string and that character
+  order differently in that one range:
+
+```lisp
+;; ran: fib.core (A12 u16cmp, `str-bytes` in the prototype, `str-byte-at` after L18)
+(defun ub (bs: (Array i8) i: i64) -> i32 (bit-and (zext i32 (array-get bs i)) 255i32))
+(defun cmp-u16 (a: str b: str) -> i64
+  (let ((xs (str-bytes a)) (ys (str-bytes b)))
+    (let ((la (array-len xs)) (lb (array-len ys)))
+      (let ((m (if (< la lb) la lb)))
+        (loop ((i 0))
+          (if (< i m)
+              (let ((x (ub xs i)) (y (ub ys i)))
+                (if (= x y)
+                    (recur (+ i 1))
+                    (let ((sx (>= x 240i32)) (sy (>= y 240i32)) (bx (>= x 238i32)) (by (>= y 238i32)))
+                      ;; a supplementary lead (F0..F4) against EE/EF: UTF-16 puts the surrogate pair first
+                      (if (and sx (and by (not sy))) -1
+                          (if (and sy (and bx (not sx))) 1
+                              (if (< x y) -1 1))))))
+              (if (< la lb) -1 (if (< lb la) 1 0))))))))
+;; 5184 pairs of the strings over 8 code points: 0 disagreements with the UTF-16 reference; (cmp-u16 "😀" "\uFFFF") is -1, byte order 1
+```
 * `compare` returns `-1`, `0` or `1` as an `i64` and is **built on `<`, as Clojure's is**: `(if (< a b) -1 (if (< b a) 1 0))`.
   A comparator, wherever one is taken (`sort`, `sort-by`, `sorted-map-by`, `sorted-set-by`), is any function whose
   result is a `Cmp` (§2.3): an `i64` as Clojure's int form, or a `bool` as Clojure's predicate form (`(sort < xs)`,
@@ -637,13 +777,13 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
   comparator is unspecified and never unsafe (a merge sort over arrays reads only indices it has checked). The
   first version of this page made `compare` a total order (NaN greatest and equal to itself) so that `sort` is
   deterministic: that is a cost reason, not a memory-safety one, and Clojure does not do it. `max` and `min` return
-  NaN when either argument is NaN, as Clojure's do (A10 nan). §9 Q33 asks the owner whether the 8 replicated
-  sharp edges (this one among them) are exempted as bugs.
+  NaN when either argument is NaN, as Clojure's do (A10 nan). The rule replicates the sharp edges (§5.6);
+  the owner may strike any of them (§9.1 Q33).
 * `Hash f64` hashes `-0.0` as `0.0` and one NaN, so `(get (assoc m 0.0 1) -0.0)` finds the key
   ([R] it is `nil` today, A6). A NaN key is never found, as in Clojure. This is the contract of `Hash` (`=` implies
   equal hashes), kept because a lookup that misses `-0.0` after storing `0.0` is the failure the HAMT must not
   have; whether Clojure's `(hash 0.0)` and `(hash -0.0)` differ was not verified (no Clojure on the machine), and
-  if they do the row is a replicated bug that Q33 offers to exempt. **The combiners of today trap.**
+  if they do, the rule says to replicate Clojure's (§9.1 Q33), a one-line change (types §2.12 hashes a float by its bits, which already differs for `-0.0`). **The combiners of today trap.**
   `derive Hash` and the prelude's `Hash (List a)` fold with `h*31 + hash x`, and a struct of two strings or a
   list of three is `trap: integer overflow in * at i64` under both tools ([R] A10 hash), so a `Map` keyed by
   a two-string struct or a `(Vec str)`, the bread and butter of a symbol table, fails in tranche 1 as soon as
@@ -653,7 +793,10 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
   hash); `derive Hash` and every `Hash` instance of the library use it, and `hash-unordered-coll` folds the
   elements' hashes with `bit-xor`, which is commutative and does not trap, so `Hash (Map k v)` and `Hash (Set k)`
   are order independent. Both ship in tranche 0 and 1 (§8.2); the multiplicative finaliser that needs a wrapping
-  multiply (§7 L10) replaces the rotate-xor in tranche 3, in one commit with the new integer hash (§9 Q15, **Decided**).
+  multiply (§7 L10) replaces the rotate-xor in tranche 3, in one commit with the new integer hash (§9 Q15, **Decided**). **Update:** the working tree's
+  `lib/prelude.fib` (522 lines, uncommitted) now defines a `hash-combine` of its own, not this rotate-and-xor: a rotate by 7, an xor with a constant and
+  eight invertible xorshift steps, pinned by cases 198 to 200 (read in this revision, not run); it also never traps, the library adopts it, and the rotate-xor
+  of A10 hash is the prototype's.
 * **Three printers, with Clojure's meanings.** `str` is `ToStr`, `print` and `println` are `Show` (display),
   `pr`, `prn`, `pr-str` and `dbg` are `Debug` (readable). The three differ on a string inside a collection and on
   `nil`, as Clojure's do:
@@ -666,13 +809,17 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
   | `:k` | `:k` | `:k` | `:k` |
   | `nil` (an empty `Option`) | the empty text | `nil` | `nil` |
   | `(some "a")` | `a` | `a` | `"a"` |
-  | a recipe, `List`, `Range`, `LSeq` over `1 2` | `(1 2)` | `(1 2)` | `(1 2)` |
-  | `Pair`, `Triple`, `Vec` | `[1 2]` | `[1 2]` | `[1 2]` |
+  | a recipe, `List`, `Range`, `LSeq`, `VSeq` over `1 2` | `(1 2)` | `(1 2)` | `(1 2)` |
+  | `Pair`, `Triple`, `Vec`, `SubVec` | `[1 2]` | `[1 2]` | `[1 2]` |
   | `Set` | `#{1 2}` | `#{1 2}` | `#{1 2}` |
   | `Map` | `{1 2, 3 4}` | `{1 2, 3 4}` | `{1 2, 3 4}` |
-  | a struct made by `derive Show` / `derive Debug` | `(Name f1 f2)` | `(Name f1 f2)` | `(Name f1 f2)` |
+  | a record (`defrecord`, `defstruct`, `derive Show`/`Debug`) of module `m` | `#m.P{:x 1, :y "x"}` | `#m.P{:x 1, :y x}` | `#m.P{:x 1, :y "x"}` |
+  | an enum variant with fields, `(Done 3)` | `#m.Done{:v 3}` | `#m.Done{:v 3}` | `#m.Done{:v 3}` |
 
-  `(str ["a"])` is `["a"]` and `(println ["a"])` is `[a]` in Clojure, which is the `ToStr` of a collection being its `Debug`
+  A record prints as Clojure's record does, the field names being static (`#m.P{:x 1, :y "x"}`; Clojure's text has the namespace where this has the
+  module; `(str r)` is believed to be the `pr` text **[K, not verified: no Clojure on the machine]**, and `println` leaves a string field unquoted
+  as it does at every depth); a field-less enum shows as its variant's name (types §2.12, **Decided**); an enum variant with fields is a record of
+  the variant. `(str ["a"])` is `["a"]` and `(println ["a"])` is `[a]` in Clojure, which is the `ToStr` of a collection being its `Debug`
   text and the `Show` text being the display form; the first version of this page made `str` and `println`
   agree, which is a cost-free rule that Clojure does not follow. `(str nil)` with a literal `nil` is the empty
   text (a macro sees it; the bare `nil` has no type, `ambiguous constraint Show a`, A11 t64); `(str o)` of an
@@ -688,7 +835,11 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
   until the ninth key and a HAMT after (library code over `Pair`, [R] A11 e13: keys `b a c` print `{b 2, a 1, c 3}`,
   `assoc` of an existing key keeps its position `{b 20, a 1, c 3}`, nine integer keys then print in hash order
   `{0 0, 1 1, 2 4, ...}`), so a small literal prints as written and small maps get faster; the compilers know `Map` only through `Form`'s
-  `Map` variant, so the change is the library's. `Show` and `Debug` print the iteration order, not a sorted
+  `Map` variant, so the change is the library's. **`hash-map` and `array-map` are two spellings of two shapes of one type, as
+  Clojure's:** the literal `{..}`, `array-map`, `(into {} ..)`, `zipmap` and `group-by` start in the array shape, which keeps insertion order and leaves
+  it when an `assoc` takes the map over 8 entries (Clojure's `PersistentArrayMap`), and `hash-map` builds the HAMT shape from the start, so
+  `(hash-map :b 2 :a 1)` prints in hash order where `{:b 2 :a 1}` and `(array-map :b 2 :a 1)` print as written; a `Set` is always hashed (Clojure's
+  `PersistentHashSet`). The shape is a tag inside `Map` (**[H]**: the array shape ran, A11 e13; the tag was not written). `Show` and `Debug` print the iteration order, not a sorted
   order. Tests compare with `=` or sort; the change of the integer hash (§9 Q15) changes the order of maps of more
   than 8 entries once, in both implementations together. A numerically ordered print is a `SortedMap`
   (`fib.sorted`).
@@ -698,15 +849,25 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
 Arithmetic is the builtin binary `Num` method on one type; the variadic spellings are macros that
 fold (`(+ a b c)` is `(+ (+ a b) c)`, `(< a b c)` is a short-circuit chain). **`(+)` is `0` and `(*)` is `1`, as Clojure's**:
 the macro expands to the literal, which adopts the numeric type its context requires (L19), and is an `i64` when
-nothing constrains it, so `(reduce + [])` style code has a zero. Integers divide toward zero, `rem` has the dividend's
+nothing constrains it, so `(reduce + [])` style code has a zero. `quot` divides toward zero (it is the builtin `Num` `/` at an integer type), `rem` has the dividend's
 sign, `mod` the divisor's, overflow traps at every width (Clojure's `+` throws on a `long` overflow too;
-types §2.12; **Decided**, §9 Q15), float division is IEEE. `(/ 7 2)` on two integers is `3`, Rust's, because
-Clojure's result is `7/2` or `3` according to the values and a result type cannot depend on a value (§5 T5);
-`quot` is an alias of integer `/`, and ratios are a library type (below). Literals have one type, so `inc`, `dec`,
+types §2.12; **Decided**, §9 Q15), float division is IEEE. **`/` on two integers is exact, as Clojure's:** `(/ 7 2)` is the
+ratio `7/2` and `(/ 6 3)` is `2`. Clojure's result is a `Ratio` or a `Long` according to the values, and a result type cannot depend on
+a value (§5 T5), so the typed twin is the one `+'` has: the result is always a `(Ratio t)` over the operand type, normalised, and a ratio
+whose denominator is 1 prints as the integer, so `(/ 6 3)` prints `2`; `(long r)` truncates a ratio. The first rewrite of this page made
+integer `/` truncate, with no safety or typing reason: the `+'` twin keeps Clojure's *value* and varies the type, and a `/` that returns 3
+for `7/2` changes the value silently, so `/` takes the same twin (§5 D4). `(Ratio t)` is generic over the integer width, with `+ - * /`
+through the numeric protocol and `Show`, and traps on overflow at its width (`Eq` and `Ord` are the same shape and were not written; [R] A12 ratio: `[7/2 2 -3/2 -7/2]`, `5/6`, `7/2` at
+`i32`, and `trap: integer overflow in * at i64` for a sum whose exact denominator exceeds `i64`, where Clojure's `BigInteger` ratio is exact: the
+auto-promotion of T5 is the one value that stays a deviation; `(Ratio BigInt)` is the library type of tranche 5). A division of two integers costs a
+gcd and, until C5, an object, as Clojure's does; the loop that wants the machine's division writes `quot`, and `(/ n 2)` where an `i64` is wanted is
+`cannot unify (Ratio i64) with i64` with the message `use quot` (§7 D1). The user-visible `/` changes, the builtin method does not: types §2.12's wording of integer `/`
+(Rust's, **Decided** 2026-09-27) is amended by §7 L30, and the compiler's one use, three case files, the generator and two unit tests migrate to `quot` (§8.3). Ratios are a library type (below). Literals have one type, so `inc`, `dec`,
 `abs`, `zero?`, `pos?`, `neg?`, `even?`, `odd?`, `mod` take a `Unit` witness (`(one x)`), which makes
 them generic over every numeric type ([R] A7: design "zero"'s `num1`). Conversions are checked:
 `(long x)`, `(int x)`, `(byte x)`, `(double x)`, `(char n)` dispatch on the argument type and trap when
-the value does not fit, as Clojure throws; `(trunc i8 x)` keeps the low bits, never traps, and is `unchecked-byte`
+the value does not fit, as Clojure throws; `int` and `long` take a `char` too, so `(- (int c) (int \0))` is Clojure's text (`unbound name int` today,
+[R] A12 int1; one `ToInt` and one `ToLong` instance for `char` run, A12 int2); `(trunc i8 x)` keeps the low bits, never traps, and is `unchecked-byte`
 (`unchecked-short unchecked-int unchecked-long unchecked-float unchecked-double unchecked-char` and the `-int`
 families are aliases of `trunc`, `fptosi`, `sext`, `fptrunc`, `fpext` and the wrapping family at the right width, §4.3);
 `(fptosi i64 x)` saturates. `unchecked-*` wrap at the operand's width and need a new builtin (§7 L10); `clojure.math` is `fib.math`,
@@ -739,14 +900,14 @@ integer, never narrowing and never at a `let`, a return or a field; an operand w
 a function generalises is unified as now, so `(defun add (a b) (+ a b))` stays `∀a. (Num a) ⇒ a a → a` and `(add n
 2.5)` still fails: a *function of numbers* that accepts mixed numbers would need a promotion result on every
 arithmetic function (a multi-parameter numeric protocol, §7 L23), which this page does not propose. It is a checker rule and a
-deferred constraint in both tools (**[sketch]**, §7 L26) and lifts D3, so it is the owner's: §9 Q36 recommends yes.
+deferred constraint in both tools (**[sketch]**, §7 L26) and lifts D3; the rule settles it (§9.1, Q36) and the owner signs the §7 item.
 
 **Ratios, `BigInt`, `BigDecimal`.** These are library types, not a non-goal: neither breaks memory safety or static
 typing as an explicit type. A `Ratio` struct with `(impl Num Ratio ..)` and `Eq` makes `(/ 1/1 2/1)`, `(+ h (/ 1/1 3/1))`
 (5/6) and a generic `(defun twice (x: a) :where ((Num a)) -> a (+ x x))` work through the builtin names ([R] A11 t50,
 result 507, audit clean); the reader literals are `1N`, `1M` and `1/2` (E14), `numerator`, `denominator`, `rationalize`,
 `bigint`, `bigdec`, `biginteger` and `with-precision` are library functions (tranche 5), and `+'`, `-'`, `*'`,
-`inc'`, `dec'` return a `BigInt` always: what stays a deviation is Clojure's *auto-promotion* (a `Long` when it fits, a
+`inc'`, `dec'` return a `BigInt` always, as integer `/` returns a `Ratio` always: what stays a deviation is Clojure's *auto-promotion* (a `Long` when it fits, a
 `BigInt` when it does not), whose result type depends on the values (§5 T5).
 
 **Randomness** is Clojure's: `rand`, `rand-int`, `rand-nth`, `shuffle`, `random-sample`, `random-uuid` use a
@@ -775,16 +936,21 @@ character-offset `subs` and `index-of`, `(subs s 0 (count s))` is `aé€😀z`,
 hazard cannot occur. Slicing by bytes at a non-boundary traps, `str-slice [0, 1) splits a character` (t12), and a
 `str` built from invalid bytes traps, `str-from-bytes: invalid UTF-8` (t13): validity is enforced where a `str` is
 built, so a character offset can never produce an invalid `str`. **The unit is the Unicode scalar, not Clojure's
-UTF-16 unit**, and that is a memory-safety deviation (§5 M4): `(count "😀")` is 2 in Clojure because U+1F600 is a
-surrogate pair, and a `subs` through the pair would have to make a `str` that is not valid UTF-8, whose lead
-byte then claims continuation bytes that are not there; the decoder's bounds rest on the validity invariant. The two
-agree on the Basic Multilingual Plane.
+UTF-16 unit, and the reason is a decided typing fact, not memory safety** (§5 T10). Clojure's counts are replicable and safe: a user-code UTF-16
+`count` and `subs` run with a clean audit, `(u16-len "a😀z")` is 4, `(u16-subs s 0 3)` is `a😀`, and a bound inside a pair traps `subs: index splits
+a surrogate pair` ([R] A12 p2, p2b); the first rewrite's claim that a `subs` through a pair would build an invalid `str` described a function that nobody has to write.
+What decides the unit is `char`: it is a Unicode scalar in an `i32` (types §1.1, **Decided**), so the seq of a string has one element per scalar, and
+Clojure's idiom `(dotimes [i (count s)] (nth s i))` needs `count` and `nth` to agree. With `count` in UTF-16 units and `nth` by element it fails on a
+supplementary character: `(count "a😀z")` is 4 and the loop over `(nth cs i)` traps `nth: index out of range` ([R] A12 unit: `[4 3]`, `128731`, then the
+trap); with both by scalar it runs. So `count`, `nth`, `get`, `subs` and `index-of` count scalars. The two agree on the Basic Multilingual Plane and differ
+only for supplementary characters: `(count "😀")` is 1 here and 2 in Clojure. The order of strings is Clojure's, UTF-16 order (§2.7), because a comparison builds
+no `str` and no typing fact decides it.
 
 **The cost is O(n)** for `count`, `nth`, `subs`, `index-of` on non-ASCII text, since a character offset in UTF-8
 is a walk. It is not a reason (§1.1), so the page follows Clojure and says what it costs: an **ASCII flag in the
 `str` header**, computed during the UTF-8 validation that already scans every constructed `str`, makes all four
 O(1) for ASCII text and a byte walk otherwise; it is a representation change in both tools (§7 C10, **[sketch]**),
-and §9 Q37 recommends it. `(into "" xs)` is not Clojure (a string is not a collection that `conj` builds; it
+and the rule settles it (§9.1, Q37). `(into "" xs)` is not Clojure (a string is not a collection that `conj` builds; it
 throws), so there is no `Collection` instance for `str`; `(apply str xs)`, `(str/join xs)` and the `StrBuf` of §9 Q26
 build text (`conj` onto a `str` by `str-concat` in a loop allocates a string per element, 4006 objects for 1000
 characters, A11 e3f).
@@ -805,7 +971,8 @@ over one byte array**: `(count (chars s))` of a 1000-character string allocates 
 `conj` loop of `(Vec char)`) allocates 2095 ([R] A10 chars), and the two agree on `"aé€😀z"`. Every string function of §4.7 over
 bytes is built on `str-bytes`, which allocates a fresh array per call (100 objects for 100 calls, A10 str), so a tokenizer
 that calls `str/index-of` from an offset copies the string each time; §7 L18 adds `(str-byte-at s i)` and `(str-find s pat from)`,
-which allocate nothing. `parse-double` has the grammar `[+-]? (digits ['.' digits*] | '.' digits) ([eE] [+-]? digits)?` and
+which allocate nothing. At tranche 1 the character-offset functions are an O(n) walk per call (O(1) for ASCII text after C10), which is why a tokenizer, the
+compiler included, uses the byte layer and not `str/index-of`. `parse-double` has the grammar `[+-]? (digits ['.' digits*] | '.' digits) ([eE] [+-]? digits)?` and
 the names `NaN`, `Infinity` and `-Infinity` (**[H]**: the run of A10 pd covers the decimal part only); the grammar is checked in
 fibber before `strtod` is called, because `strtod` accepts hex, a leading space, `inf` and trailing junk, and
 `fibref` rejects hex (`unsupported: hex float`) where `fibc` prints 16.0, so the tools disagree without the
@@ -822,7 +989,9 @@ commit that adds `Result`, §6.2), and `(try-let ((x e) (y f)) body)` binds each
 the value of the whole expression. This is Rust's `?` ergonomics where Clojure has no typed counterpart. **It is not
 `try!`**: the language has no early return, so a macro that leaves the enclosing function cannot be written
 (`(return (Err e))` is `unbound name return`, [R] A10 try), and `try-let` is a block macro over nested `match` that runs
-today, 106 under both tools (A10 try). Parsers return `Option` (`parse-long`) or `Result` (`regex`, `read-string`).
+today, 106 under both tools (A10 try). `parse-long` and `parse-double` return `Option`, as Clojure's return `nil`; the Java-named parsers
+(`Integer/parseInt`, `Long/parseLong`, `Double/parseDouble`), `slurp`, `re-pattern`, `read-string` and `max-key` of nothing trap, as Clojure's throw (§1.2 P5), and
+each of them has a typed twin `try-<name>` that returns a `(Result a str)` for a program that must recover (§3 N13).
 
 **Exceptions.** `throw`, `try`, `catch`, `finally`, `ex-info`, `ex-data`, `ex-message`, `ex-cause` and `Throwable->map` are Clojure's,
 and **no memory-safety failure prevents them**: the failure the abort model avoids is a caught exception that skips the
@@ -838,14 +1007,15 @@ prototyped without compiler changes (**[sketch]**, §7 L28). Today a `trap` in a
 `ex-info`, `ex-data`, `ex-message`, `ex-cause` are plain data now, a struct `ExInfo` of a message, a `(Map keyword Val)` and an
 `(Option ExInfo)` cause, usable as the `e` of a `Result`; (2) a task's trap is isolated, `join` returning the trap as a
 value (Rust's `JoinHandle::join`), which needs no unwinding in the parent; (3) `throw` and `try`/`catch`/`finally` by one
-of the two shapes above. Step (3) amends a decision the owner made before the rule, so it is §9 Q35; until it lands
+of the two shapes above. Step (3) amends a decision the owner made before the rule (types §2.11), which the rule reverses (§5 D1; §9.1 Q35: yes, after the library is
+viable), so the owner signs it as a types amendment; until it lands
 `(throw e)` is a `trap` of `(ex-message e)`, and a program that must recover returns a `Result`. `finally`'s
 non-memory cleanup (closing a handle) is the scope-exit hook of §7 L12, after which `with-open` is a macro over it.
 
 **Effects.** Randomness is Clojure's global generator and the explicit `rng/` module (§2.8); time and the environment
 are functions of `fib.sys`. `println` is a macro over `Show` (several arguments are joined with a space, [R] A10 pm); the
-prelude's one-`str` function of that name is replaced in value position by a **function twin generic over `Show`**,
-and so are `str`, `print`, `prn` and `pr`: `(run! println [1 2 3])` and `(map str xs)` work, which a macro alone cannot
+prelude's one-`str` function of that name is replaced in value position by a **function twin** (`println` and `print` generic over `Show`, `str` over `ToStr`, `pr` and `prn` over `Debug`, as the
+macros are, §2.7), so `(run! println [1 2 3])` works and `(map str [["a"]])` is `["a"]`, as Clojure's, which a macro alone cannot
 do (`unbound name str`), because a macro and a function of one name coexist (head position expands, [R] A6, A10 twin).
 
 ### 2.11 Callables, state and scope
@@ -874,7 +1044,29 @@ exclusion is memory safety (§5 M1):** a top-level `Cell` or `Weak` is reachable
 checker already stops the closure form of the race, `cell cannot be shared between threads: closure capture c has type
 (Cell i64)` ([R] A11 t41, e8d), and `(def c: (Cell i64) (cell 0))` is rejected today as `def c: initialiser is not a constant
 expression` (n8); with L15 the rule becomes a type test, *the type of a `def` may not contain a `Cell` or a `Weak`*, and an
-`Atom`, whose payload is `Send`, is allowed. `volatile!` is `cell`, `vswap!` is `(set! c (f @c))` and `vreset!` is `set!`, as Clojure's volatiles are thread-confined.
+`Atom`, whose payload is `Send`, is allowed. `volatile!` is an `Atom`: Clojure's volatile is visible across threads and its `vswap!` is not atomic, which an `Atom` with
+`vswap!` as `(reset! v (f @v))` is, and which is memory-safe (two tasks adding 300 each give a result in 1 to 600 with a clean audit, [R] A12 p12); `vreset!` is
+`reset!` returning its value. A `Cell` is the thread-confined form and stays out of `def`s (§5 M1).
+
+**Arrays.** Clojure's arrays are mutable objects that every holder sees. The builtin `(Array a)` is a value instead (a write copies unless the array is
+unique, `array-set!` through `&`), which is the form for fibber code and the one the nodes of the persistent collections use. Clojure's text needs the shared
+object, so `long-array`, `make-array`, `to-array`, `aclone` and the rest return an `(MArray t)`, a struct around a `(Cell (Array t))`, and `aget`, `aset`, `alength`,
+`amap` and `areduce` read and write it in place: **every holder sees the writes**, inside one task, as Clojure's `aset` does (`b` and a closure that share `a` give
+`[9 4 0]`, and an array of objects `[y x]`, [R] A12 aset1, aset2; the write through a cell that two closures share is Clojure's behaviour, A12 p1, p10). What stays
+a deviation is the race: Clojure lets two threads write one array and the cell-capture check does not, `cell cannot be shared between threads: closure capture a,
+field c of MArray has type (Cell (Array i64))` ([R] A12 aset3, §5 M2). `vec`, `to-array` and `aclone` copy, so a persistent collection never shares a node
+with an array that a user can write. The cost is a struct, a cell and the array behind every access, which a loop that cares avoids with the value form (`&` with
+C3, C4).
+
+```lisp
+;; ran: fib.array (A12 aset2)
+(defstruct (MArray t) (c: (Cell (Array t))))
+(defun make-marray (n: i64 x: t) -> (MArray t) (MArray (cell (array n x))))
+(defun aget (a: (MArray t) i: i64) -> t (let ((c (. a c))) (array-get @c i)))
+(defun aset (a: (MArray t) i: i64 x: t) -> unit (let ((c (. a c))) (array-set! &c i x)))
+(defun alength (a: (MArray t)) -> i64 (let ((c (. a c))) (array-len @c)))
+;; (let ((a (make-marray 3 0))) (let ((b a) (w (fn (i: i64 x: i64) (aset a i x)))) (w 0 9) (aset b 1 4) ..)): a shows [9 4 0] and b is the same array
+```
 
 **Dynamic vars.** `(def :dynamic *x*: T v)` (Clojure's `^:dynamic`) declares a var of one type; `(binding [*x* e] body)`,
 `with-bindings`, `bound-fn` and `with-redefs` (below) rebind it for the dynamic extent of the body. A binding is an owned,
@@ -894,18 +1086,26 @@ and the dispatch function; `defmethod` is a top-level form that registers a meth
 `parents` build and query an explicit hierarchy value held in an `Atom`. `d`, `a` and `r` are fixed per multimethod: static
 typing is kept, and the dispatch on a *value* is what a protocol (dispatch on a type) is not. Tranche 5; needs L15.
 
-**Concurrency.** `locking` is `(locking m (fn (v) ..))` on a **`Mutex a` that owns its value**, Rust's form, because Clojure's lock
-on an arbitrary object would let two tasks hold one `Cell` (§5 M6, needs a runtime mutex, §7 C9). `add-watch`,
+**Concurrency.** `locking` is Clojure's `(locking x body ..)`: the body is not a closure and the value is the body's. No memory-safety failure forbids it:
+a lock built from two `Atom`s (a ticket lock), and 300 `(locking lk (reset! n (+ @n 1)))` in each of two tasks, give 600 under both tools with a clean audit ([R] A12 p3),
+and since no `Cell` can be shared by two tasks (§5 M1) there is no shared non-atomic state for the lock to guard that the checker lets through; its uses are effects
+(`(locking *out* (println ..))`) and sequences of `Atom` updates. Clojure's monitor of an arbitrary object is a monitor table keyed by object identity, an entry made on
+the first lock and dropped when the last holder leaves, reentrant for the holding task, which needs the runtime mutex of §7 C9 (**[sketch]**; `x` must be an object, a scalar
+has no identity, types §1.1). `(Mutex a)`, a lock that owns its value, is the library's addition for Rust-style code. `add-watch`,
 `remove-watch`, `set-validator!` and `get-validator` are a library: a `Ref` of an `Atom`, a watch list `(Atom (Vec (fn :send (a a)
 unit)))` and a validator `(fn :send (a) bool)`, called after `swap!`, which type-checks and runs, 42 under both tools with a clean
 audit (A11 e18; t42 gives 50): the first version's reason for omitting them, "callbacks cannot hold borrowed values
 safely", is false because a `:send` closure holds owned values only. `future` is a macro over `spawn` and `@f` is `join`;
-`future-cancel` sets a flag that the task polls with `(cancelled?)`, which is Java's interrupt (cooperative at blocking
-points) in a form that cannot skip a release (§5 M5); `pmap` is eager with one task per element today, chunked over
+`future-cancel` is Clojure's: it sets the task's interrupt flag, which blocking calls (`Thread/sleep`, `deref` of a future or a promise) observe and answer by ending
+the task with an `InterruptedException`, which here is a trap of that task and, once a task's trap is isolated (§2.10 step 2), a value of `join`; a computation that
+polls uses `(cancelled?)`. No memory-safety failure forbids it (Java's interrupt is cooperative too, and the first rewrite's asynchronous kill was never
+what it did, nor a program that was written); until step 2 lands a cancelled task that blocks keeps running (§5 S16); `pmap` is eager with one task per element today, chunked over
 `ncpu + 2` tasks with the order kept in tranche 3 ([R] A11 e15), and lazy over an `LSeq` of futures in tranche 5.
-`with-redefs` is an opt-in: a function declared `:redefinable` calls through a global `(Atom (fn :send ..))` slot and
-`with-redefs` swaps it, so only a function that asks pays an indirect call (a direct call is what the monomorphiser wants
-everywhere else). `with-open` is a macro over the scope-exit hook of §7 L12. `letfn` binds a group of mutually
+`with-redefs` works on **any** function, as Clojure's does, and costs nothing for a function that no `with-redefs` names: the compiler sees the whole program, so a
+function that some `(with-redefs [f g] ..)` mentions anywhere is called through a global `(Atom (fn :send ..))` slot and every other function stays a direct call
+(the first rewrite's `:redefinable` opt-in was a cost reason, §10.4.8 F4). The slot is global and swapped for the dynamic extent of the body, racy across tasks exactly as
+Clojure's is, and a global `Atom` is memory-safe; `g` must have `f`'s type, and for a generic `f` the slot is the instance at `g`'s types (no run-time types, §5 T3).
+**[sketch, §7 L29]**: no program of the review exercises it. `with-open` is a macro over the scope-exit hook of §7 L12. `letfn` binds a group of mutually
 recursive local functions: a macro over cells works and leaks a reference cycle per entry, `audit: clean=false
 leak-cycles=4` (A11 t55, a leak and not a safety failure); the cure is one shared closure environment for the group (§7 C8), so
 `letfn` ships with C8.
@@ -920,50 +1120,54 @@ leak-cycles=4` (A11 t55, a leak and not a safety failure); the cure is one share
 | N4 | **Clojure's own suffixes, with their inconsistency kept**: `-by` takes a key function in `sort-by group-by partition-by` and a comparator in `sorted-map-by sorted-set-by`; `-key` is `max-key`/`min-key`; `-with` takes a combiner in `merge-with`. The first version renamed `sorted-map-by` to `sorted-map-with` "for one suffix, one meaning", which is not a reason (§1.1). The stand-ins for arities that need L1 (`sort-with`, `sort-by-with`, `get-or`, `nth-or`, `reduce1`, `range-by`, `zip-with`) are deleted when L1 lands. | `(sort-by count c)`, `(sort-by count > c)`, `(sorted-map-by > 1 2)`, `(merge-with + a b)` |
 | N5 | A `?` suffix is a `bool` result; a `!` suffix means the function writes through an `&` parameter, a cell or an `Atom` (`push! swap! reset! set!`), is a transient wrapper (`conj!`), or runs only for its effect on each element (`run!`, Clojure's). A persistent function never ends in `!`. | `empty?`, `contains?`, `push!` |
 | N6 | `->` in a name is a conversion `from->to`, as the builtins have it (`char->i32`); the library's conversions that Clojure names `long`, `int`, `double` keep those names. The builtin casts that are one instruction name the target first (`(trunc i8 x)`, `(zext i64 b)`, `(fptosi i64 x)`): two conventions, because the first is a name and the second a type argument. | `(long x)`, `(char->str c)` |
-| N7 | A function that returns a recipe is named for what it does; an eager twin exists where Clojure has it (`mapv filterv`) and `doall` is `vec`. Materialisers are `vec set into zipmap sort reverse`. | `(vec (map f c))` |
+| N7 | A function that returns a recipe is named for what it does; an eager twin exists where Clojure has it (`mapv filterv`) and `doall` is the `VSeq` over `vec`. Materialisers are `vec set into zipmap sort reverse`. | `(vec (map f c))` |
 | N8 | Types are CamelCase; an adaptor's struct is named for the adaptor in the past participle where its verb has one (`Mapped Filtered Taken Dropped Kept`) and by the noun otherwise (`Cat Mapcat Iterate Repeat Cycle Reductions Distinct ZipWith TreeSeq`). §4 writes `(Mapped c e b)`, the data parameters, which is what compiles today; §2.2 writes `(Mapped c f)`, the form after C1, and a colour parameter follows either (§2.1). Modules are `fib.x`, required with an alias (`str/`, `set/`, `math/`, `rng/`), and the Java class names `Math`, `Long`, `Integer`, `Double`, `Character`, `System`, `Thread` are implicit aliases of modules (§4.16). | |
 | N9 | A name that the prelude's `join` (the task wait) or core forms use is never redefined unqualified; the library's `join` is always `str/join`, as Clojure's `clojure.string/join` is. | |
 | N10 | In the signature column of §4: parameters in order, `->` result, ` \| ` introduces the protocol constraints (`Reducible c e`), lower-case letters are type variables, `;` separates the signatures of the arities of one name. `c` is a source, `s` a keyed collection, `e` an element. | |
 | N11 | An `Option` function takes the function first and the `Option` last, as a sequence function does, so `->>` threads it: `(map-opt f o)`, `(and-then f o)`. They are the library's additions where Clojure has `nil` punning and `some->`. | `(->> o (map-opt inc) (and-then half))` |
 | N12 | **Clojure's name is the name.** Where fibber already has a builtin under another spelling (`array-get`, `array-set!`, `array-len`, `array-copy`, `shl`, `sar`, `shr`, `popcount`, `!=`, `defun`, `read-file`, `write-file`, `spawn`, `i64-max`), Clojure's spelling (`aget`, `aset`, `alength`, `aclone`, `bit-shift-left`, `bit-shift-right`, `unsigned-bit-shift-right`, `Long/bitCount`, `not=`, `defn`, `slurp`, `spit`, `future`, `Long/MAX_VALUE`) is an alias of it, and the existing spelling stays for the cases and the compiler that use it. A name the library adds because Clojure's text has no typed counterpart is marked `(new)` and never takes the place of a Clojure name. | `(aget a i)`, `(bit-shift-left x 3)`, `(not= a b)` |
+| N13 | **A Clojure function that throws has a typed twin `try-<name>`** that returns a `(Result a str)` (or an `(Option a)` where the only failure is "absent"): `try-slurp`, `try-re-pattern`, `try-read-string`, `try-parse-int`. The function itself traps, as Clojure's throws (§1.2 P5); the twin is the library's addition and never takes the place of a Clojure name. The builtins that return `Option` today (`read-file`) keep their names. | `(try-slurp path)`, `(try-parse-int s)` |
 
 ## 4. The function table
 
 Every name of the survey has one row: 673 names of `clojure.core` 1.12, `clojure.set`,
 `clojure.string`, `clojure.walk`, `clojure.data` and `clojure.math`, grouped by the module that holds
-it, plus 42 names that Clojure lacks and the library adds (marked `(new)`). `#"..."` shares the row of `#"regex"`. Columns:
+it, plus 48 names that Clojure lacks and the library adds (marked `(new)`). `#"..."` shares the row of `#"regex"`. Columns:
 
 * **Verdict**: `keep` (same name, same meaning), `adapt` (same name and text, a typed twist, stated), `alias` (Clojure's name
   for something fibber already has under another spelling or as a one-line function: the same meaning), `new`, and, in §4.17,
   `omit` (not offered: the JVM, no run-time type information, a result type that depends on a value, or a name that means something
   else here). The first version also had `rename` and `replace`; the rule removed them, because a name Clojure has is the name
-  (§3 N12). Over the survey's names: keep 144, adapt 367, alias 72, omit 89 (the first version: keep 138, adapt 206, rename 47, replace 82,
-  omit 200; §10.4.6 says what happened to each). The counts are those of a script that parses these tables (`build4.py` of the rule
-  review), which the executable `stdlib_table` of §8.1 replaces.
+  (§3 N12). Over the survey's names: keep 145, adapt 427, alias 55, omit 45 (the first rewrite: keep 144, adapt 367, alias 72, omit 89; the first version: keep 138, adapt 206, rename 47, replace 82,
+  omit 200; §10.4.6 says what happened to each, §10.4.8 to the second revision's moves: 44 predicates from omit to adapt, 17 rows from alias to adapt (the arrays, `doall`, `array-map`, the `v` forms), 1 from adapt to keep, 30 tranche moves). The counts are those of a
+  script that parses these tables (`count.py` of the second revision, 672 rows), which the executable `stdlib_table` of §8.1 replaces.
 * **Fibber**: the spelling. `macro`, `core form`, `reader`, `pattern` say what kind of thing it is.
 * **Signature**: in the notation of §3 N10; each arity of an overloaded name is one signature, separated
   by `;`. Where an arity needs L1 (§7), the stand-in the first tranches use is named in the note.
-* **T**: the tranche of §8 that delivers it (names that exist today are `1`).
+* **T**: the tranche of §8 that delivers the row **in the form its signature and note give on the compiler of that tranche** (names that exist today are `1`). A note that names a
+  later §7 item (`until L1`, `after L22`, `L26 b`) describes the form the row takes then, and the row is complete without it; a Java-named row (`Long/MAX_VALUE`, `Math/abs`) is a module the
+  program `:require`s from its tranche and Clojure's bare text with E15 (tranche 4). A script checks that no row names a §7 item that a later tranche's Needs column holds as a requirement of the row
+  (§10.4.8 C1).
 * **Note**: what differs from Clojure, and where it matters, the cost.
 
-Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
+Offered over the survey's names by tranche: T1 146, T2 84, T3 200, T4 113, T5 84.
 
 ### 4.1 Builtins (compiler primitives, syntax §4.3)
 
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
-| `aget` | alias | `(aget a i)` | `(Array a) i64 -> a` | 1 | alias of the builtin `array-get`; traps out of range |
-| `aset` | adapt | `(aset &a i x)` | `&(Array a) i64 a -> unit` | 1 | alias of `array-set!`; **value semantics**: a write through `&` is in place only when `a` is unique, else it copies, so a second holder keeps the old array (9, not Clojure's 99, [R] A11 t54): an aliased in-place write would be a data race between tasks and would corrupt the shared nodes of the persistent collections (§5 M2) |
-| `alength` | alias | `(alength a)` | `(Array a) -> i64` | 1 | alias of `array-len` |
-| `aclone` | alias | `(aclone a)` | `(Array a) -> (Array a)` | 1 | alias of `(array-copy a 0 (array-len a))` |
-| `make-array` | adapt | `(make-array T n)` | `i64 -> (Array T) \| T scalar or (Option a)` | 1 | a macro on the type argument: zero for a scalar, `nil` for an `Option`; an object type has no default and no null slot (§5 M3), so the builtin `(array n x)` takes the element and `(array 3)` is `array takes 2 argument(s), got 1` ([R] A11 t90); an uninitialised array for the library is §7 C4 |
-| `+` | adapt | `(+ a b ..) (+)` | `t t -> t \| Num t; -> t \| Num t` | 1 | the builtin is binary on one type, overflow traps (Clojure's `+` throws on a `long` overflow too); a macro folds more arguments; `(+)` is `0`, the literal adopting its context's numeric type (L19); a variable of another numeric type: §9 Q36 |
+| `aget` | adapt | `(aget a i)` | `(MArray a) i64 -> a` | 3 | reads the shared array (§2.11); traps out of range; the builtin `array-get` is the value form |
+| `aset` | adapt | `(aset a i x)` | `(MArray a) i64 a -> unit` | 3 | writes the array in place and **every holder sees the write**, as Clojure's, inside one task ([R] A12 aset1, aset2); two tasks cannot hold one array, the cell-capture check rejects it (§5 M2); the value form is the builtin `array-set!` through `&` |
+| `alength` | adapt | `(alength a)` | `(MArray a) -> i64` | 3 | the length of the shared array; the builtin `array-len` is the value form |
+| `aclone` | adapt | `(aclone a)` | `(MArray a) -> (MArray a)` | 3 | a copy in a new cell: later writes to either are not seen by the other, as Clojure's |
+| `make-array` | adapt | `(make-array T n)` | `i64 -> (MArray T) \| T scalar or (Option a)` | 3 | a macro on the type argument: zero for a scalar; for an object type `T` the array is an `(MArray (Option T))` filled with `nil`, as Clojure's `(make-array String 3)` is filled with `null` (§5 T1); no uninitialised object slot is ever visible (the first rewrite's reason M3 had no failing program, §10.4.8 R5); the builtin `(array n x)` is the value form |
+| `+` | adapt | `(+ a b ..) (+)` | `t t -> t \| Num t; -> t \| Num t` | 1 | the builtin is binary on one type, overflow traps (Clojure's `+` throws on a `long` overflow too); a macro folds more arguments; `(+)` is `0`, an `i64` until L19 (tranche 2) lets the literal adopt its context's numeric type; a variable of another numeric type promotes at the operator (§2.8, L26 b, tranche 4) |
 | `-` | adapt | `(- a b ..) (- a)` | `t t -> t \| Num t; t -> t \| Num t` | 1 | binary builtin, `neg` for one argument; macro folds; `(-)` is an arity error, as Clojure's |
 | `*` | adapt | `(* a b ..) (*)` | `t t -> t \| Num t; -> t \| Num t` | 1 | as `+`; `(*)` is `1`; `product` for a collection |
-| `/` | adapt | `(/ a b)` | `t t -> t \| Num t` | 1 | integers truncate toward zero and trap on zero: Clojure's `(/ 7 2)` is the ratio `7/2`, a result type that depends on the values (§5 T5), so `quot` is the alias and `Ratio` a library type (§2.8) |
-| `quot` | alias | `(quot a b)` | `t t -> t \| Num t` | 1 | alias of `/` on integers: truncates toward zero, traps on zero |
+| `/` | adapt | `(/ a b)` | `t t -> (Ratio t) \| integer t; t t -> t \| float t` | 3 | **exact on two integers: a `(Ratio t)`**, Clojure's `(/ 7 2)` is `7/2` and `(/ 6 3)` prints `2` ([R] A12 ratio), the typed twin of `+'` (§2.8, §5 D4); `quot` truncates; IEEE on floats; a literal operand adopts the other's type (L19); until L30 lands the builtin truncates (§5 S17) |
+| `quot` | alias | `(quot a b)` | `t t -> t \| Num t` | 1 | the builtin `Num` `/` at an integer type: truncates toward zero, traps on zero (`integer / by zero`); the compiler's one use of integer `/`, the three case files that divide integers and the generator's integer divisions are `quot` after L30 (§8.3) |
 | `rem` | keep | `(rem a b)` | `t t -> t \| Num t` | 1 | builtin; the sign of the dividend |
-| `<` | adapt | `(< a b ..)` | `t t -> bool \| Ord t` | 1 | builtin `Ord` method on any ordered type; a macro chains more arguments ; mixed numeric operands: literals adopt (L19), variables §9 Q36 |
+| `<` | adapt | `(< a b ..)` | `t t -> bool \| Ord t` | 1 | builtin `Ord` method on any ordered type; a macro chains more arguments ; mixed numeric operands: literals adopt (L19), variables promote at the operator (L26 b) |
 | `>` | adapt | `(> a b ..)` | `t t -> bool \| Ord t` | 1 | as `<` |
 | `<=` | adapt | `(<= a b ..)` | `t t -> bool \| Ord t` | 1 | IEEE at floats |
 | `>=` | adapt | `(>= a b ..)` | `t t -> bool \| Ord t` | 1 | IEEE at floats |
@@ -976,7 +1180,7 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `unsigned-bit-shift-right` | alias | `(unsigned-bit-shift-right a n)` | `t t -> t \| Bits t` | 1 | alias of the builtin `shr` (logical) |
 | `Long/bitCount` | alias | `(Long/bitCount a)` | `t -> t \| Bits t` | 1 | alias of the builtin `popcount`, through the module `Long` (§4.16) |
 | `=` | adapt | `(= a b ..)` | `t t -> bool \| Eq t` | 1 | structural on one type; within a family (sequential, map, set) across types by the checker (`seq=`, §2.7, L24); `(= 1 1.0)` is true for a literal by L19 (§5 C1); a macro chains more arguments |
-| `==` | alias | `(== a b ..)` | `t t -> bool \| Eq t` | 1 | alias of `=` on numbers: across types for a literal through L19, for variables §9 Q36 |
+| `==` | alias | `(== a b ..)` | `t t -> bool \| Eq t` | 1 | alias of `=` on numbers: across types for a literal through L19, for variables by promotion (L26 b) |
 | `not=` | alias | `(not= a b ..)` | `t t -> bool \| Eq t` | 1 | alias of the builtin `!=` |
 | `not` | keep | `(not x)` | `r -> bool \| Truthy r` | 1 | builtin on `bool`; a condition of type `(Option T)` is accepted by L20: `(not (get m k))` |
 | `atom` | keep | `(atom v)` | `a -> (Atom a) \| Send a` | 1 | builtin; an atom of a type that is not `Send` is a compile error; a top-level `(def a (atom 0))` is allowed (§2.11) |
@@ -984,23 +1188,23 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `reset!` | keep | `(reset! a v)` | `(Atom a) a -> unit` | 1 | builtin |
 | `deref` | keep | `@x` | `(Atom a) -> a` | 1 | builtin |
 | `set!` | adapt | `(set! c v)` | `(Cell a) a -> unit` | 1 | builtin on a `Cell`; also `(set! (. obj field) v)`, and on a dynamic var inside `binding` (§2.11) |
-| `volatile!` | alias | `(volatile! x)` | `a -> (Cell a)` | 2 | alias of `cell`; thread-confined, as Clojure's volatile |
-| `vswap!` | adapt | `(vswap! c f arg ..)` | `(Cell a) (fn (a) a) .. -> a` | 2 | a macro for `(set! c (f @c arg ..))`; returns the new value |
-| `vreset!` | alias | `(vreset! c v)` | `(Cell a) a -> a` | 2 | `set!` that returns `v` |
-| `long-array` | alias | `(long-array n) (long-array c)` | `i64 -> (Array t); c -> (Array t) \| Reducible c t` | 3 | `(array n 0)`, or the elements of a source |
-| `double-array` | alias | `(double-array n) (double-array c)` | `i64 -> (Array t); c -> (Array t) \| Reducible c t` | 3 | `(array n 0.0)`, or the elements of a source |
-| `float-array` | alias | `(float-array n) (float-array c)` | `i64 -> (Array t); c -> (Array t) \| Reducible c t` | 3 | `(array n 0.0f32)`, or the elements of a source |
-| `short-array` | alias | `(short-array n) (short-array c)` | `i64 -> (Array t); c -> (Array t) \| Reducible c t` | 3 | `(array n 0i16)`, or the elements of a source |
-| `int-array` | alias | `(int-array n) (int-array c)` | `i64 -> (Array t); c -> (Array t) \| Reducible c t` | 3 | `(array n 0i32)`, or the elements of a source |
-| `byte-array` | alias | `(byte-array n) (byte-array c)` | `i64 -> (Array t); c -> (Array t) \| Reducible c t` | 3 | `(array n 0i8)`, or the elements of a source; the same `(Array i8)` that `str-bytes` returns, signed |
-| `boolean-array` | alias | `(boolean-array n) (boolean-array c)` | `i64 -> (Array t); c -> (Array t) \| Reducible c t` | 3 | `(array n false)`, or the elements of a source |
-| `char-array` | alias | `(char-array n) (char-array c)` | `i64 -> (Array char); c -> (Array char)` | 3 | an `(Array char)` of Unicode scalars |
-| `object-array` | adapt | `(object-array n)` | `i64 -> (Array (Option a))` | 3 | filled with `nil`, as Clojure's |
-| `to-array` | adapt | `(to-array c)` | `c -> (Array e) \| Reducible c e` | 3 | a typed `(Array e)` from any source; `into-array` the same with a type argument (an empty source keeps its type); `to-array-2d` an `(Array (Array a))` |
-| `into-array` | alias | `(into-array c)` | `c -> (Array e) \| Reducible c e` | 3 | as `to-array` |
-| `to-array-2d` | adapt | `(to-array-2d c)` | `c -> (Array (Array e))` | 3 | a source of sources |
-| `amap` | adapt | `(amap a i ret expr)` | macro | 3 | a loop with `array-set!` over a copy: value semantics already |
-| `areduce` | adapt | `(areduce a i ret init expr)` | macro | 3 | a loop over `array-get`; `(reduce f init a)` is the function form, an `(Array a)` being `Reducible` |
+| `volatile!` | alias | `(volatile! x)` | `a -> (Atom a) \| Send a` | 2 | an `Atom` (§2.11): visible across tasks and `vswap!` not atomic, as Clojure's volatile ([R] A12 p12); `Cell` is the thread-confined form |
+| `vswap!` | adapt | `(vswap! v f arg ..)` | `(Atom a) (fn (a) a) .. -> a` | 2 | a macro for `(reset! v (f @v arg ..))`: not atomic, as Clojure's; returns the new value |
+| `vreset!` | alias | `(vreset! v x)` | `(Atom a) a -> a` | 2 | `reset!` that returns `x` |
+| `long-array` | adapt | `(long-array n) (long-array c)` | `i64 -> (MArray t); c -> (MArray t) \| Reducible c t` | 3 | a shared `MArray` of zeros, or a copy of the elements of a source (§2.11) |
+| `double-array` | adapt | `(double-array n) (double-array c)` | `i64 -> (MArray t); c -> (MArray t) \| Reducible c t` | 3 | a shared `MArray` of `0.0`, or a copy of the elements of a source |
+| `float-array` | adapt | `(float-array n) (float-array c)` | `i64 -> (MArray t); c -> (MArray t) \| Reducible c t` | 3 | a shared `MArray` of `0.0f32`, or a copy of the elements of a source |
+| `short-array` | adapt | `(short-array n) (short-array c)` | `i64 -> (MArray t); c -> (MArray t) \| Reducible c t` | 3 | a shared `MArray` of zeros, or a copy of the elements of a source |
+| `int-array` | adapt | `(int-array n) (int-array c)` | `i64 -> (MArray t); c -> (MArray t) \| Reducible c t` | 3 | a shared `MArray` of zeros, or a copy of the elements of a source |
+| `byte-array` | adapt | `(byte-array n) (byte-array c)` | `i64 -> (MArray t); c -> (MArray t) \| Reducible c t` | 3 | a shared `MArray` of zeros, or a copy of the elements of a source; `str-bytes` returns the value `(Array i8)`, and `(byte-array (str-bytes s))` copies it |
+| `boolean-array` | adapt | `(boolean-array n) (boolean-array c)` | `i64 -> (MArray t); c -> (MArray t) \| Reducible c t` | 3 | a shared `MArray` of `false`, or a copy of the elements of a source |
+| `char-array` | adapt | `(char-array n) (char-array c)` | `i64 -> (MArray char); c -> (MArray char)` | 3 | an `(MArray char)` of Unicode scalars (§5 T10) |
+| `object-array` | adapt | `(object-array n)` | `i64 -> (MArray (Option a))` | 3 | filled with `nil`, as Clojure's |
+| `to-array` | adapt | `(to-array c)` | `c -> (MArray e) \| Reducible c e` | 3 | a typed `(MArray e)` from any source; `into-array` the same with a type argument (an empty source keeps its type); `to-array-2d` an `(MArray (MArray a))` |
+| `into-array` | adapt | `(into-array c)` | `c -> (MArray e) \| Reducible c e` | 3 | as `to-array` |
+| `to-array-2d` | adapt | `(to-array-2d c)` | `c -> (MArray (MArray e))` | 3 | a source of sources |
+| `amap` | adapt | `(amap a i ret expr)` | macro | 3 | a loop with `aset` over an `aclone` of `a`, as Clojure's |
+| `areduce` | adapt | `(areduce a i ret init expr)` | macro | 3 | a loop over `aget`; `(reduce f init a)` is the function form, an `(MArray a)` being `Reducible` |
 
 ### 4.2 Core forms, macros and reader syntax
 
@@ -1022,9 +1226,9 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `let` | adapt | `(let [a 1 b 2] body)` | core form | 2 | the bracket form is sugar over the parenthesised pairs (§7 E3); patterns allowed, refutable ones trap (§7 L8) |
 | `loop` | keep | `(loop [i 0 acc x] ..)` | core form | 2 | as `let`: bracket sugar |
 | `recur` | keep | `(recur ..)` | core form | 1 | tail position inside `loop` only |
-| `fn` | adapt | `(fn [x y] body)` | core form | 2 | bracket parameters are sugar; patterns allowed in parameters (§7 L7); no arity overloading in a `fn` literal: a closure value has one type with one arity (§5 T2) |
-| `def` | adapt | `(def name: T v)` | core form | 1 | immortal; evaluates **any** expression once before `main`, in module order (§2.11, L15); the type may not contain a `Cell` or a `Weak` (§5 M1); `:dynamic` declares a dynamic var. Today the initialiser must be a constant: `(def ok: (Set i64) (set [1 3]))`, `(def v: i64 (f 2))` and `(def counter: (Atom i64) (atom 0))` are `def .. : initialiser is not a constant expression`, while `(def v: (Vec i64) [1 2 3])` and `{1 2}` run ([R] A10 def, A11 t56) |
-| `defmacro` | keep | `(defmacro name (params) body)` | core form | 1 | rest parameter `...` |
+| `fn` | adapt | `(fn [x y] body)` | core form | 2 | bracket parameters are sugar; patterns allowed in parameters (§7 L7); a literal with several arities or a rest parameter takes the arity of its **expected type** at a call site where that type is known (L22: `(reduce (fn ([] 0) ([a] a) ([a b] (+ a b))) xs)` keeps the two-argument clause); a multi-arity function that is stored or returned has no single type (§5 T2) |
+| `def` | adapt | `(def name: T v)` | core form | 1 | immortal; evaluates **any** expression once before `main`, in module order (§2.11, L15); the type may not contain a `Cell` or a `Weak` (§5 M1); `:dynamic` declares a dynamic var. Today the initialiser must be a constant: `(def ok: (Set i64) (set [1 3]))`, `(def v: i64 (f 2))` and `(def counter: (Atom i64) (atom 0))` are `def .. : initialiser is not a constant expression`, while `(def v: (Vec i64) [1 2 3])` and `{1 2}` run ([R] A10 def, A11 t56). An `MArray` holds a `Cell`, so a global mutable array is the same rejection; a global read-only table is a `Vec`. |
+| `defmacro` | keep | `(defmacro name (params) body)` | core form | 1 | rest parameter `& xs`, as Clojure's (`...` is accepted until the macros of `lib/` and `compiler/` migrate, §7 L2) |
 | `dotimes` | keep | `(dotimes [i n] body)` | macro | 1 | prelude macro, spelled `(dotimes (i n) ..)` today; the bracket form needs §7 E3 |
 | `for` | adapt | `(for [x xs :when p :let [y e] y ys] body)` | macro | 2 | a recipe (`Mapped`/`Mapcat`/`Filtered` chain), not a `Vec`; `:when`, `:while`, `:let` |
 | `while` | keep | `(while c body ..)` | macro | 1 | `c` is a condition: `bool` or `(Option T)` (L20) |
@@ -1035,7 +1239,7 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `assert` | keep | `(assert c) (assert c msg)` | macro | 1 | prelude macro; always on, traps |
 | `var` | keep | `(var name)` | core form | 1 | the definition a name resolves to, not a Var object |
 | `quote` | keep | `'x` | core form | 1 | the value is a `Form` |
-| `ns` | keep | `(ns a.b (:require [c.d :as d]) (:use e))` | core form | 1 | `:require` and `:use`, and `:refer`, `:only`, `:exclude`, `:rename` (E15); no `:import` |
+| `ns` | keep | `(ns a.b (:require [c.d :as d]) (:use e))` | core form | 1 | `:require` and `:use` today, and `:refer`, `:only`, `:exclude`, `:rename` with E15 (tranche 4); no `:import` |
 | `defprotocol` | keep | `(defprotocol (P self det*) (m (self x: T) -> R))` | core form | 1 | static dispatch |
 | `->` | keep | `(-> x f (g a))` | macro | 1 | prelude macro |
 | `->>` | keep | `(->> x f (g a))` | macro | 1 | prelude macro |
@@ -1066,12 +1270,12 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `_` | keep | `_` | pattern | 1 | the wildcard |
 | `'x` | keep | `'x` | reader | 1 | syntax §1.2 |
 | ``x` | adapt | ``x` | reader | 1 | quasiquote with the `x#` auto-gensym (E14) and, with E11, qualification of free symbols in the macro's defining module |
-| `~x` | keep | `~x` | reader | 1 | Clojure's unquote; the comma becomes whitespace (E14: `[1,2]` is `[1 2]`); `,x` is the spelling of today and migrates with the macros of `lib/` and `compiler/` |
-| `~@x` | keep | `~@x` | reader | 1 | as `~x`, splicing a `(Vec Form)` |
+| `~x` | keep | `~x` | reader | 2 | Clojure's unquote; the comma becomes whitespace (E14: `[1,2]` is `[1 2]`); `,x` is the spelling of today and migrates with the macros of `lib/` and `compiler/` |
+| `~@x` | keep | `~@x` | reader | 2 | as `~x`, splicing a `(Vec Form)` |
 | `@x` | keep | `@x` | reader | 1 | cells, atoms and weak references |
 | `#'x` | adapt | `#'x` | core form | 3 | reads as `(var x)` (E14) |
 | `#_` | keep | `#_` | reader | 1 | syntax §1.1 |
-| `#(...)` | adapt | `#(f % %2)` | reader | 2 | reads as `(fn (%1 %2) (f %1 %2))`; `%` is `%1`; no `%&`; nesting is an error (§7 E8) |
+| `#(...)` | adapt | `#(f % %2)` | reader | 2 | reads as `(fn (%1 %2) (f %1 %2))`; `%` is `%1`; `%&` binds the rest as a `Vec` where the expected function type fixes the arity (L22); nesting is an error (§7 E8) |
 | `#{...}` | adapt | `#{a b}` | reader | 2 | reads as `(hash-set a b)` (§7 E8) |
 | `(:k m)` | adapt | `(:k x)` | checker | 2 | a keyword that unifies with `(fn (S) T)` elaborates to `(fn (x) (. x k))` when `S` is a struct with that field and to `get` when `S` is a `(Map keyword v)`; `(:k m d)` supplies a default; `(map :name ps)`, `(sort-by :age ps)`, `(group-by :dept ps)` are the commonest Clojure lines (§7 L14, L21). A `Map`, `Set` and `Vec` are callable the same way (§2.11) |
 | `^Type` | adapt | `^T x` | reader | 3 | reads as `x: T` (E14); `^:private` is the `:private` qualifier, `^:dynamic` the `:dynamic` qualifier |
@@ -1091,8 +1295,8 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `binding` | adapt | `(binding [*x* e] body)` | macro | 5 | rebinds a dynamic var for the dynamic extent of the body (§2.11, C11) |
 | `with-bindings` | adapt | `(with-bindings {v e} body)` | macro | 5 | as `binding` over a map of vars |
 | `bound-fn` | adapt | `(bound-fn [x] ..)` | macro | 5 | a closure that carries the current bindings into a task |
-| `with-redefs` | adapt | `(with-redefs [f g] body)` | macro | 5 | swaps the slot of a function declared `:redefinable` (§2.11); only such a function pays an indirect call |
-| `locking` | adapt | `(locking m (fn (v) ..))` | `(Mutex a) (fn (a) r) -> r` | 5 | a `Mutex` that owns its value (§5 M6, C9); Clojure's lock on an arbitrary object would let two tasks share a `Cell` |
+| `with-redefs` | adapt | `(with-redefs [f g] body)` | macro | 5 | works on **any** function, as Clojure's: the compiler sees the whole program, so a function that some `with-redefs` names is called through a global `Atom` slot and every other function directly (§2.11, L29); `g` has `f`'s type |
+| `locking` | keep | `(locking x body ..)` | macro `x body ... -> r` | 5 | Clojure's: the monitor of an object, a table keyed by identity (§2.11, C9); `x` must be an object; a lock from two `Atom`s runs today ([R] A12 p3: 600); `(Mutex a)` (new) is the owning form |
 | `with-open` | adapt | `(with-open [r e] body)` | macro | 5 | a macro over the scope-exit hook (§7 L12) |
 | `with-out-str` | adapt | `(with-out-str body ..)` | macro `-> str` | 5 | binds `*out*` to a string-building writer (§2.11) |
 | `with-in-str` | adapt | `(with-in-str s body ..)` | macro | 5 | binds `*in*` (§2.11) |
@@ -1125,7 +1329,7 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
 | `str` | adapt | `(str a ..)` | macro `a ... -> str \| ToStr a` | 1 | concatenates the `to-str` of the arguments: a string as itself, a collection as its `pr` text, `nil` as the empty text (§2.7); `(str)` is `""`; a Rust prelude macro (§6.3) with a function twin |
-| `subs` | adapt | `(subs s a b) (subs s a)` | `str i64 i64 -> str; str i64 -> str` | 1 | **CHARACTER offsets** (Unicode scalars), pairing with `count` and `str/index-of` as Clojure's do; never splits a character; O(n) until the ASCII flag (C10); the byte layer is `str-slice` (§2.9) |
+| `subs` | adapt | `(subs s a b) (subs s a)` | `str i64 i64 -> str; str i64 -> str` | 1 | **CHARACTER offsets** (Unicode scalars, §5 T10), pairing with `count` and `str/index-of` as Clojure's do; never splits a character; O(n) until the ASCII flag (C10); the byte layer is `str-slice` (§2.9) |
 | `name` | adapt | `(name k)` | `keyword -> str` | 4 | keywords are flat; `(name :a/b)` is `b` |
 | `keyword` | adapt | `(keyword s) (keyword ns s)` | `str -> keyword; str str -> keyword` | 4 | interns at run time |
 | `gensym` | keep | `(gensym) (gensym prefix)` | `-> str; str -> str` | 1 | builtin; macro time only (syntax §3.16); the zero-argument form is not there today: `gensym takes 1 argument(s), got 0` ([R] A11 gensym), so it is a clause by L1 |
@@ -1133,9 +1337,10 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `parse-long` | adapt | `(parse-long s)` | `str -> (Option i64)` | 1 | `nil` on any malformed input, never a trap |
 | `parse-double` | adapt | `(parse-double s)` | `str -> (Option f64)` | 3 | correctly rounded through `strtod`, after the grammar of §2.9 is checked in fibber: hex, a leading space, `inf` and trailing junk give `nil` under both tools ([R] A10 pd) |
 | `parse-boolean` | adapt | `(parse-boolean s)` | `str -> (Option bool)` | 3 |  |
-| `Integer/parseInt` | adapt | `(Integer/parseInt s) (Integer/parseInt s radix)` | `str -> (Option i32); str i64 -> (Option i32)` | 3 | module `Integer`; an `Option` where Java throws `NumberFormatException` (§2.10); `parse-i32` is the unqualified alias |
-| `Long/parseLong` | adapt | `(Long/parseLong s) (Long/parseLong s radix)` | `str -> (Option i64); str i64 -> (Option i64)` | 3 | module `Long`; an `Option`; `parse-i64` is the unqualified alias |
-| `Double/parseDouble` | adapt | `(Double/parseDouble s)` | `str -> (Option f64)` | 3 | module `Double`; an `Option` |
+| `Integer/parseInt` | adapt | `(Integer/parseInt s) (Integer/parseInt s radix)` | `str -> i32; str i64 -> i32` | 3 | module `Integer`; traps `For input string: ".."` on a malformed string, as Java throws `NumberFormatException` (§1.2 P5); `try-parse-int` (new) is the `Option` twin |
+| `try-parse-int` (new) | new | `(try-parse-int s) (try-parse-int s radix)` | `str -> (Option i32); str i64 -> (Option i32)` | 3 | the typed twin of `Integer/parseInt` (§3 N13); `parse-i32` is the unqualified alias |
+| `Long/parseLong` | adapt | `(Long/parseLong s) (Long/parseLong s radix)` | `str -> i64; str i64 -> i64` | 3 | module `Long`; traps on a malformed string, as Java throws; `parse-long` is Clojure's own nil-returning parser, an `(Option i64)` |
+| `Double/parseDouble` | adapt | `(Double/parseDouble s)` | `str -> f64` | 3 | module `Double`; traps on a malformed string, as Java throws; `parse-double` is the `(Option f64)` parser |
 | `inc` | keep | `(inc x)` | `t -> t \| Num t, Unit t` | 1 | any numeric type; traps on overflow |
 | `dec` | keep | `(dec x)` | `t -> t \| Num t, Unit t` | 1 |  |
 | `mod` | keep | `(mod a b)` | `t t -> t \| Num t, Ord t, Unit t` | 1 | the sign of the divisor; traps on zero |
@@ -1150,8 +1355,8 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `unchecked-dec` | adapt | `(unchecked-dec a)` | `t -> t \| Bits t` | 3 | wrapping |
 | `byte` | adapt | `(byte x)` | `t -> i8 \| ToByte t` | 2 | checked: traps when the value does not fit; `(trunc i8 x)` wraps |
 | `short` | adapt | `(short x)` | `t -> i16 \| ToShort t` | 2 | checked |
-| `int` | adapt | `(int x)` | `t -> i32 \| ToInt t` | 2 | checked; floats truncate toward zero and trap out of range |
-| `long` | adapt | `(long x)` | `t -> i64 \| ToLong t` | 2 | checked; `(sext i64 x)` widens without a check |
+| `int` | adapt | `(int x)` | `t -> i32 \| ToInt t` | 2 | checked; floats truncate toward zero and trap out of range; a `char` gives its code point ([R] A12 int2). |
+| `long` | adapt | `(long x)` | `t -> i64 \| ToLong t` | 2 | checked; `(sext i64 x)` widens without a check; a `char` gives its code point. |
 | `float` | adapt | `(float x)` | `t -> f32 \| ToFloat t` | 2 |  |
 | `double` | adapt | `(double x)` | `t -> f64 \| ToDouble t` | 2 |  |
 | `bit-and-not` | keep | `(bit-and-not a b)` | `t t -> t \| Bits t` | 3 | library over `bit-and` and `bit-not` |
@@ -1172,9 +1377,9 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `Long/MIN_VALUE` | alias | `Long/MIN_VALUE` | `i64` | 1 | module `Long`; `i64-min` |
 | `Double/MAX_VALUE` | alias | `Double/MAX_VALUE` | `f64` | 3 | module `Double`; `f64-max`; also `f64-epsilon`, `f64-min-positive`, `f64-inf`, `f64-nan` |
 | `identical?` | adapt | `(identical? a b)` | `a a -> bool` | 3 | pointer equality on objects, value equality on scalars (scalars have no identity); observes sharing, never equality; `same?` is not offered |
-| `compare` | adapt | `(compare a b)` | `t t -> i64 \| Ord t` | 1 | -1, 0 or 1, **built on `<`** as Clojure's: a NaN compares equal to everything; vectors compare by length first (§2.7, §9 Q33); one static type |
+| `compare` | adapt | `(compare a b)` | `t t -> i64 \| Ord t` | 1 | -1, 0 or 1, **built on `<`** as Clojure's: a NaN compares equal to everything; vectors compare by length first and strings by UTF-16 unit (§2.7, §5.6); one static type |
 | `hash` | keep | `(hash x)` | `t -> i64 \| Hash t` | 1 | builtin method; instances for collections are library; `f64` hashes `-0.0` as `0.0` (§2.7) |
-| `hash-combine` | adapt | `(hash-combine h x)` | `i64 i64 -> i64` | 1 | rotate and xor from `shl shr bit-or bit-xor`: never traps, exists today ([R] A10 hash); a multiplicative mixer replaces it with L10 (T3) |
+| `hash-combine` | adapt | `(hash-combine h x)` | `i64 i64 -> i64` | 1 | rotate and xor from `shl shr bit-or bit-xor`: never traps, exists today ([R] A10 hash); a multiplicative mixer replaces it with L10 (T3); the working tree's prelude has its own xorshift mixer, which the library adopts (§2.7) |
 | `hash-ordered-coll` | keep | `(hash-ordered-coll c)` | `c -> i64 \| Reducible c e, Hash e` | 1 | for `Vec` and `List`, over `hash-combine` |
 | `hash-unordered-coll` | keep | `(hash-unordered-coll c)` | `c -> i64 \| Reducible c e, Hash e` | 1 | commutative (an xor of the elements' hashes); for `Map` and `Set` |
 | `mix-collection-hash` | keep | `(mix-collection-hash h n)` | `i64 i64 -> i64` | 3 | the finaliser |
@@ -1213,13 +1418,13 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `unchecked-dec-int` | alias | `(unchecked-dec-int a ..)` | `i32 .. -> i32` | 3 | the wrapping family at `i32` (§7 L10) |
 | `unchecked-divide-int` | alias | `(unchecked-divide-int a ..)` | `i32 .. -> i32` | 3 | the wrapping family at `i32` (§7 L10) |
 | `unchecked-remainder-int` | alias | `(unchecked-remainder-int a ..)` | `i32 .. -> i32` | 3 | the wrapping family at `i32` (§7 L10) |
-| `unchecked-byte` | alias | `(unchecked-byte x)` | `t -> u` | 3 | `(trunc i8 x)`; keeps the low bits and never traps |
-| `unchecked-short` | alias | `(unchecked-short x)` | `t -> u` | 3 | `(trunc i16 x)`; keeps the low bits and never traps |
-| `unchecked-int` | alias | `(unchecked-int x)` | `t -> u` | 3 | `(trunc i32 x)`; keeps the low bits and never traps |
-| `unchecked-long` | alias | `(unchecked-long x)` | `t -> u` | 3 | `(fptosi i64 x) or (sext i64 x)`; keeps the low bits and never traps |
-| `unchecked-float` | alias | `(unchecked-float x)` | `t -> u` | 3 | `(fptrunc f32 x)`; keeps the low bits and never traps |
-| `unchecked-double` | alias | `(unchecked-double x)` | `t -> u` | 3 | `(fpext f64 x)`; keeps the low bits and never traps |
-| `unchecked-char` | alias | `(unchecked-char x)` | `t -> u` | 3 | `(i32->char n)`; keeps the low bits and never traps; traps on a non-scalar (a `char` is a scalar, not 16 bits) |
+| `unchecked-byte` | alias | `(unchecked-byte x)` | `t -> u` | 3 | `(trunc i8 x)`: of an integer keeps the low bits and never traps (of a float, `fptosi` first, as Java's cast) |
+| `unchecked-short` | alias | `(unchecked-short x)` | `t -> u` | 3 | `(trunc i16 x)`: of an integer keeps the low bits and never traps (of a float, `fptosi` first, as Java's cast) |
+| `unchecked-int` | alias | `(unchecked-int x)` | `t -> u` | 3 | `(trunc i32 x)`: of an integer keeps the low bits and never traps (of a float, `fptosi` first, as Java's cast) |
+| `unchecked-long` | alias | `(unchecked-long x)` | `t -> u` | 3 | for a float `(fptosi i64 x)`, which saturates (NaN is 0), as Java's `(long) d`; for an integer `(sext i64 x)`; never traps |
+| `unchecked-float` | alias | `(unchecked-float x)` | `t -> u` | 3 | `(fptrunc f32 x)`: rounds to nearest, never traps |
+| `unchecked-double` | alias | `(unchecked-double x)` | `t -> u` | 3 | `(fpext f64 x)`: exact, never traps |
+| `unchecked-char` | alias | `(unchecked-char x)` | `t -> u` | 3 | `(i32->char n)`: traps on a non-scalar (a `char` is a scalar, not 16 bits, §5 T10) |
 | `+'` | adapt | `(+' a ..)` | `t .. -> BigInt \| Num t` | 5 | returns a `BigInt` always: Clojure's auto-promotion gives a `Long` when it fits, a result type that depends on the values (§5 T5) |
 | `-'` | adapt | `(-' a ..)` | `t .. -> BigInt \| Num t` | 5 | returns a `BigInt` always: Clojure's auto-promotion gives a `Long` when it fits, a result type that depends on the values (§5 T5) |
 | `*'` | adapt | `(*' a ..)` | `t .. -> BigInt \| Num t` | 5 | returns a `BigInt` always: Clojure's auto-promotion gives a `Long` when it fits, a result type that depends on the values (§5 T5) |
@@ -1241,10 +1446,10 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `ex-message` | adapt | `(ex-message e)` | `ExInfo -> str` | 3 | the message |
 | `ex-cause` | adapt | `(ex-cause e)` | `ExInfo -> (Option ExInfo)` | 3 | the cause |
 | `Throwable->map` | adapt | `(Throwable->map e)` | `ExInfo -> (Map keyword Val)` | 5 | no stack trace (§2.10) |
-| `throw` | adapt | `(throw e)` | core form | 5 | `trap` of `(ex-message e)` until unwinding lands; `try`, `catch`, `finally` need §7 L28 (§9 Q35) |
+| `throw` | adapt | `(throw e)` | core form | 5 | `trap` of `(ex-message e)` until unwinding lands; `try`, `catch`, `finally` need §7 L28 (§9.1 Q35) |
 | `catch` | adapt | `(catch T e ..)` | clause of `try` | 5 | see `try` |
 | `finally` | adapt | `(finally ..)` | clause of `try` | 5 | memory is released by the scope exits the ownership checker already computes; non-memory cleanup is the scope-exit hook (§7 L12) |
-| `try` | adapt | `(try body (catch T e ..) (finally ..))` | core form | 5 | needs unwinding (§2.10, L28, §9 Q35); a `Result` and `try-let` are the forms that run today |
+| `try` | adapt | `(try body (catch T e ..) (finally ..))` | core form | 5 | needs unwinding (§2.10, L28, §9.1 Q35); a `Result` and `try-let` are the forms that run today |
 | `print-method` | adapt | `(defmethod print-method T ..)` | `impl Show`, `impl Debug` | 2 | an `impl Show` and `impl Debug` for the type is the static form of the extension point |
 | `realized?` | adapt | `(realized? x)` | `(LSeq a) -> bool` | 2 | an `LSeq`, `Delay`, `Promise` or task has a forced flag; an adaptor has no cell and is a compile error |
 | `meta` | adapt | `(meta ..)` | `s -> (Option (Map keyword Val))` | 5 | the metadata of a collection or struct (§2.11) |
@@ -1258,14 +1463,14 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
-| `seq` | adapt | `(seq c)` | `c -> (Option s) \| Seqable c s` | 2 | `nil` when empty, else the closed seq type `s` of the collection (a `Slice` for a `Vec`, §2.1 rule 8): `(if (seq xs) ..)` works because an `Option` is a condition (L20), and `(if-let (s (seq xs)) ..)` runs today; the page's first version said `(if (seq xs) ..)` is a type error |
+| `seq` | adapt | `(seq c)` | `c -> (Option s) \| Seqable c s` | 2 | `nil` when empty, else the closed seq type `s` of the collection (a `VSeq` for a `Vec`, §2.1 rule 8): `(if (seq xs) ..)` works because an `Option` is a condition (L20), and `(if-let (s (seq xs)) ..)` runs today; the page's first version said `(if (seq xs) ..)` is a type error. On a recipe it consumes the recipe and returns its `LSeq` (§2.1 rule 2); on a collection it borrows. |
 | `vec` | keep | `(vec c)` | `c -> (Vec e) \| Reducible c e` | 1 | the `to-vec` method: a `Vec` argument is returned as is (no allocation, [R] A10 nth), any other source builds into one buffer |
-| `vector` | adapt | `(vector a b ..)` | macro `a ... -> (Vec a)` | 2 | the literal `[a b ..]`; as a function value `(map vector xs ys)` is `[x y]`, a `Pair` when the types differ (§7 L25), a `Vec` when they unify |
+| `vector` | adapt | `(vector a b ..)` | macro `a ... -> (Vec a)` | 2 | the literal `[a b ..]`; as a function value `(map vector xs ys)` is `[x y]`, a `Pair` when the types differ (§7 L25), a `Vec` when they unify. The heterogeneous function value waits for L25 (tranche 3). |
 | `vector-of` | adapt | `(vector-of :i32 1 2)` | macro | 3 | a `(Vec i32)` with the suffixed literals; `(Vec i64)` is already unboxed, so the keyword only selects the width |
 | `list` | keep | `(list a ..)` | macro `a ... -> (List a)` | 1 | prelude macro, kept; expands to `Cons`/`Empty` |
 | `list*` | adapt | `(list* a .. l)` | macro `a ... (List a) -> (List a)` | 3 | nested `cons`; the last argument is a `List` |
 | `cons` | adapt | `(cons x c)` | `a c -> (Consed c a) \| Reducible c a` | 2 | any collection, a recipe that holds the head, as Clojure's `cons` returns a seq ([R] A11 t80: `(cons 0 [1 2 3])` has the elements 0 1 2 3); `(list ..)` and the `Cons` variant of `List` keep their names (§5 row 22 of the first version: `Empty`, `Cons`) |
-| `hash-map` | adapt | `{k v ..} or (hash-map k v ..)` | macro `k v ... -> (Map k v) \| Hash k, Eq k` | 2 | an odd count is a compile error; duplicate literal keys are an error (§7 E5); a `Map` of at most 8 entries keeps insertion order, as Clojure's array map does (§2.7) |
+| `hash-map` | adapt | `(hash-map k v ..)` | macro `k v ... -> (Map k v) \| Hash k, Eq k` | 2 | builds the HAMT shape, in hash order from the start; the literal `{k v ..}` is the array shape, in insertion order up to 8 entries (§2.7); an odd count is a compile error; duplicate literal keys are an error (§7 E5, tranche 3) |
 | `hash-set` | adapt | `#{a ..} or (hash-set a ..)` | macro `a ... -> (Set a) \| Hash a, Eq a` | 2 | the reader reads `#{..}` as `(hash-set ..)` (§7 E8) |
 | `range` | adapt | `(range n) (range a b) (range a b s)` | `t -> (Range t); t t -> (Range t); t t t -> (Range t) \| Num t, Ord t` | 1 | overloaded by arity (§7 L1); integers exact; **floats accumulate as Clojure's do**: `(range 0.0 1.0 0.1)` adds the step to the previous element, 11 elements, the last `0.9999999999999999` ([R] A11 range; `frange` is the `a + i*s` form, 10 elements); a step of 0 repeats the start forever (an infinite recipe); `(range)` is `(iterate inc 0)` |
 | `repeat` | adapt | `(repeat x) (repeat n x)` | `a -> (Repeat a); i64 a -> (Taken (Repeat a) a)` | 2 | overloaded by arity |
@@ -1273,63 +1478,64 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `iterate` | keep | `(iterate f x)` | `(fn (a) a) a -> (Iterate a)` | 2 | infinite source; a consumer that stops ends it |
 | `cycle` | keep | `(cycle c)` | `c -> (Cycle c e) \| Reducible c e` | 2 | an empty source ends at once |
 | `lazy-seq` | adapt | `(lazy-seq body)` | macro `(LSeq a) -> (Lazy a)` | 2 | the memoising sequence `LSeq`: a head and a `Lazy` cell forced once (§2.1, [R] A11 t21: 5 calls, sum 10 twice); the classic recursive producers need it, so it moves from tranche 5 to 2 |
-| `concat` | adapt | `(concat a b ..)` | `c1 c2 -> (Cat c1 c2 e) \| Reducible c1 e, Reducible c2 e` | 1 | two-arity function; macro nests for more |
+| `concat` | adapt | `(concat a b ..)` | `c1 c2 -> (Cat c1 c2 e) \| Reducible c1 e, Reducible c2 e` | 1 | the two-argument function; a macro nests for more, `(concat a)` is `a` as a recipe and `(concat)` the empty recipe of its context's element type, as Clojure's `()` |
 | `interleave` | adapt | `(interleave a b ..)` | `c1 c2 -> (Interleaved c1 c2 e) \| Cursable c1 k1, Cursor k1 e, Cursable c2 k2, Cursor k2 e` | 2 | truncates to the shorter; every operand is `Cursable` (adaptors by buffering, §2.1 rule 5, in any order); `zip-strict` traps on a mismatch |
-| `interpose` | keep | `(interpose sep c)` | `e c -> (Interposed c e) \| Reducible c e` | 2 |  |
+| `interpose` | keep | `(interpose sep c)` | `e c -> (Interposed c e) \| Reducible c e` | 2 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
 | `tree-seq` | adapt | `(tree-seq branch? children root)` | `(fn (n) bool) (fn (n) d) n -> (TreeSeq n d) \| Reducible d n` | 3 | typed over one node type; depth first, no explicit stack in the caller |
 | `re-seq` | adapt | `(re-seq re s)` | `Regex str -> (Matches)` | 4 | `Reducible Match`; `fib.regex` |
 | `line-seq` | adapt | `(line-seq r)` | `Reader -> (LSeq str)` | 5 | memoised `LSeq`; needs a scope-exit hook to close the handle (§7 L12); `fib.io`; `lines-of` is not offered |
 | `iteration` | adapt | `(iteration step init)` | `(fn (k) (Option (Pair v k))) k -> (LSeq v)` | 5 | memoised `LSeq`; `fib.seq` |
-| `first` | adapt | `(first c)` | `c -> (Option e) \| Reducible c e` | 1 | `nil` on empty; use `(unwrap (first c))` or `(nth c 0)` for the sure case |
+| `first` | adapt | `(first c)` | `c -> (Option e) \| Reducible c e` | 1 | `nil` on empty; use `(unwrap (first c))` or `(nth c 0)` for the sure case. It takes its argument `:borrow`, so it does not consume a recipe (§2.1 rule 2). |
 | `ffirst` | adapt | `(ffirst c)` | `c -> (Option e) \| Reducible c d, Reducible d e` | 2 | `(and-then first (first c))`; the first version said it "needs nested sequential element types": two `Reducible` constraints do it ([R] A11 t60) |
 | `nfirst` | adapt | `(nfirst c)` | `c -> (Option s) \| Reducible c d, Seqable d s` | 3 | `(next (first c))` |
 | `second` | adapt | `(second c)` | `c -> (Option e) \| Reducible c e` | 2 |  |
 | `fnext` | alias | `(fnext c)` | `c -> (Option e)` | 2 | alias of `second` |
-| `last` | adapt | `(last c)` | `c -> (Option e) \| Reducible c e` | 1 | the `last` method: a walk by default, O(1) on `Vec` ([R] A10 nth) and, by the same override in the instance, on `Array Range Slice` |
+| `last` | adapt | `(last c)` | `c -> (Option e) \| Reducible c e` | 1 | the `last` method: a walk by default, O(1) on `Vec` ([R] A10 nth) and, by the same override in the instance, on `Array Range SubVec` |
 | `butlast` | adapt | `(butlast c)` | `c -> (DroppedLast c e) \| Reducible c e` | 3 | empty when short, where Clojure has `nil` (§5 T1); `(seq (butlast c))` is the `Option` |
 | `rest` | adapt | `(rest c)` | `c -> s \| Seqable c s` | 2 | `Seqable.rest`: the closed seq type, so recursion on `rest` is not polymorphic recursion (§2.1 rule 8); `(drop 1 c)` is the recipe form, and recursion on it over a generic `c` is rejected by both tools (§7 B4) |
 | `next` | adapt | `(next c)` | `c -> (Option s) \| Seqable c s, Seqable s s` | 2 | `(seq (rest c))` ([R] A11 seq1: `(len [5 6 7 8])` is 4 with it) |
 | `nnext` | adapt | `(nnext c)` | `c -> (Option s)` | 3 | `(next (next c))` |
 | `nthnext` | adapt | `(nthnext n c)` | `i64 c -> (Option s)` | 3 | `(next ..)` n times; `nil` when exhausted |
 | `nthrest` | alias | `(nthrest c n)` | `c i64 -> (Dropped c e)` | 3 | alias of `drop` with Clojure's argument order |
-| `nth` | adapt | `(nth c i) (nth c i d)` | `c i64 -> e \| Reducible c e; c i64 e -> e` | 1 | the `nth` method: O(1) on `Vec` ([R] A10 nth) and, by the same override, on `Array Range Slice`, a walk on any other source, so `(nth (filter p c) 3)` works (A10 nth); traps out of range as Clojure throws; the 3-arity is `nth-or` until L1 |
-| `take` | keep | `(take n c)` | `i64 c -> (Taken c e) \| Reducible c e` | 1 | stops the source at n |
-| `take-while` | keep | `(take-while p c)` | `(fn (e) r) c -> (TakenWhile c e) \| Reducible c e, Truthy r` | 1 |  |
-| `take-nth` | adapt | `(take-nth n c)` | `i64 c -> (TakenNth c e) \| Reducible c e` | 3 | `(take-nth 0 c)` repeats the first element forever, as Clojure's (replicated, §9 Q33) |
-| `take-last` | adapt | `(take-last n c)` | `i64 c -> (Vec e) \| Reducible c e` | 3 | materialises |
-| `drop` | keep | `(drop n c)` | `i64 c -> (Dropped c e) \| Reducible c e` | 1 |  |
-| `drop-while` | keep | `(drop-while p c)` | `(fn (e) r) c -> (DroppedWhile c e) \| Reducible c e, Truthy r` | 2 |  |
+| `nth` | adapt | `(nth c i) (nth c i d)` | `c i64 -> e \| Reducible c e; c i64 e -> e` | 1 | the `nth` method: O(1) on `Vec` ([R] A10 nth) and, by the same override, on `Array Range SubVec`, a walk on any other source, so `(nth (filter p c) 3)` works (A10 nth); traps out of range as Clojure throws; the 3-arity is `nth-or` until L1 |
+| `take` | keep | `(take n c)` | `i64 c -> (Taken c e) \| Reducible c e` | 1 | stops the source at n. The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `take-while` | keep | `(take-while p c)` | `(fn (e) r) c -> (TakenWhile c e) \| Reducible c e, Truthy r` | 1 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `take-nth` | adapt | `(take-nth n c)` | `i64 c -> (TakenNth c e) \| Reducible c e` | 3 | `(take-nth 0 c)` repeats the first element forever, as Clojure's (replicated, §9.1 Q33). The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `take-last` | adapt | `(take-last n c)` | `i64 c -> (VSeq e) \| Reducible c e` | 3 | materialises into a `Vec` and returns the seq over it, as Clojure's returns a seq |
+| `drop` | keep | `(drop n c)` | `i64 c -> (Dropped c e) \| Reducible c e` | 1 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `drop-while` | keep | `(drop-while p c)` | `(fn (e) r) c -> (DroppedWhile c e) \| Reducible c e, Truthy r` | 2 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
 | `drop-last` | adapt | `(drop-last c) (drop-last n c)` | `c -> (DroppedLast c e); i64 c -> (DroppedLast c e) \| Reducible c e` | 3 | overloaded by arity; holds n elements back |
-| `split-at` | adapt | `(split-at n c)` | `i64 c -> (Pair (Vec e) (Vec e)) \| Reducible c e` | 3 | one pass |
-| `splitv-at` | alias | `(splitv-at n c)` | `i64 c -> (Pair (Vec e) (Vec e))` | 3 | alias of `split-at` (which returns `Vec`s) |
-| `split-with` | adapt | `(split-with p c)` | `(fn (e) r) c -> (Pair (Vec e) (Vec e)) \| Reducible c e, Truthy r` | 3 | one pass; `p` runs once per element up to and including the first failure |
-| `subvec` | adapt | `(subvec v a b) (subvec v a)` | `(Vec e) i64 i64 -> (Slice e)` | 3 | a `Slice`: an O(1) view holding a count on `v`, `Reducible`, `Lookup`, `Assoc`, `Collection`, `Stack` and `Keyed`, so `(conj (subvec v 0 2) x)` works as Clojure's; `(vec (subvec ..))` copies; indexes checked at the call |
+| `split-at` | adapt | `(split-at n c)` | `i64 c -> (Pair (VSeq e) (VSeq e)) \| Reducible c e` | 3 | one pass into one `Vec` and two `VSeq` views: Clojure's `[(take n c) (drop n c)]`, a vector of two seqs, printing `[(1 2) (3 4)]` |
+| `splitv-at` | adapt | `(splitv-at n c)` | `i64 c -> (Pair (Vec e) (Vec e)) \| Reducible c e` | 3 | Clojure's vector form of `split-at`: both halves are `Vec`s |
+| `split-with` | adapt | `(split-with p c)` | `(fn (e) r) c -> (Pair (VSeq e) (VSeq e)) \| Reducible c e, Truthy r` | 3 | one pass into one `Vec`; `p` runs once per element up to and including the first failure |
+| `subvec` | adapt | `(subvec v a b) (subvec v a)` | `(Vec e) i64 i64 -> (SubVec e)` | 3 | **a vector**: an O(1) view holding a count on `v`, with `Reducible`, `Lookup`, `Assoc`, `Collection` (`conj` appends), `Stack` and `Keyed`, printing in brackets, as Clojure's `SubVector`: `(conj (subvec [1 2 3] 1 3) 0)` is `[2 3 0]`, where `rest`'s seq conses at the front (§2.1 rule 8, [R] A12 vseq). When `Vec` is the struct with an offset field (§9 Q18) `subvec` returns a `Vec` itself; `(vec (subvec ..))` copies; indexes checked at the call |
 | `peek` | adapt | `(peek s)` | `s -> (Option e) \| Stack s e` | 2 | the end `conj` adds at: a `Vec`'s last, a `List`'s first |
 | `pop` | adapt | `(pop s)` | `s -> s \| Stack s e` | 2 | traps when empty; in place when unique |
 | `rseq` | adapt | `(rseq c)` | `c -> (Reversed c e) \| Reversible c e` | 3 | `Vec`, `Range`, sorted collections |
-| `count` | adapt | `(count c)` | `c -> i64 \| Reducible c e` | 1 | `size`: O(1) for `Vec Map Set Array Range Option Slice` (and `str` with the ASCII flag, C10), a walk for every adaptor, so **`(count (map f c))` calls `f`** as Clojure's does ([R] A11 count); characters on a `str` (§2.9) |
+| `count` | adapt | `(count c)` | `c -> i64 \| Reducible c e` | 1 | `size`: O(1) for `Vec Map Set Array Range Option SubVec` (and `str` with the ASCII flag, C10), a walk for every adaptor, so **`(count (map f c))` calls `f`** as Clojure's does ([R] A11 count); characters on a `str` (§2.9) |
 | `bounded-count` | keep | `(bounded-count n c)` | `i64 c -> i64 \| Reducible c e` | 3 | stops after n elements |
-| `empty?` | adapt | `(empty? c)` | `c -> bool \| Reducible c e` | 1 | stops at the first element the recipe produces (§2.1 rule 4) |
-| `not-empty` | adapt | `(not-empty c)` | `c -> (Option c) \| Reducible c e` | 2 | same as `seq` |
-| `map` | adapt | `(map f c) (map f c1 c2) (map f c1 c2 c3)` | `(fn (e) b) c -> (Mapped c e b) \| Reducible c e; (fn (a b) r) c1 c2 -> (ZipWith c1 c2 a b k r) \| Reducible c1 a, Cursable c2 k, Cursor k b` | 1 | overloaded by arity (L1; `zip-with` until then); returns a re-runnable recipe, not a `Vec`; the second operand is any source (adaptors by buffering, §2.1 rule 5); `(map f)` is the transducer |
+| `empty?` | adapt | `(empty? c)` | `c -> bool \| Reducible c e` | 1 | stops at the first element the recipe produces (§2.1 rule 4); `:borrow`, as `first`. |
+| `not-empty` | adapt | `(not-empty c)` | `c -> (Option c) \| Reducible c e` | 2 | the collection itself or `nil` (a condition accepts an `Option`), where `seq` returns the seq type `s` |
+| `map` | adapt | `(map f c) (map f c1 c2) (map f c1 c2 c3)` | `(fn (e) b) c -> (Mapped c e b) \| Reducible c e; (fn (a b) r) c1 c2 -> (ZipWith c1 c2 a b k r) \| Reducible c1 a, Cursable c2 k, Cursor k b` | 1 | overloaded by arity (L1; `zip-with` until then); returns a recipe, consumed once (§2.1 rule 2), not a `Vec`; the second operand is any source (adaptors by buffering, §2.1 rule 5); `(map f)` is the transducer (`xmap` until L1, §2.1 rule 7) |
 | `mapv` | adapt | `(mapv f c)` | `(fn (e) b) c -> (Vec b) \| Reducible c e` | 2 | alias of `(vec (map f c))` |
-| `mapcat` | adapt | `(mapcat f c)` | `(fn (e) d) c -> (Mapcat c e d b) \| Reducible c e, Reducible d b` | 1 | flattening is free in the push model |
-| `map-indexed` | adapt | `(map-indexed f c)` | `(fn (i64 e) b) c -> (MapIndexed c e b) \| Reducible c e` | 2 |  |
-| `keep` | adapt | `(keep f c)` | `(fn (e) (Option b)) c -> (Kept c e b) \| Reducible c e` | 2 | `f` returns an `Option`; `nil`s are dropped, `some`s unwrapped |
-| `keep-indexed` | adapt | `(keep-indexed f c)` | `(fn (i64 e) (Option b)) c -> (KeptIndexed c e b) \| Reducible c e` | 3 |  |
-| `reverse` | adapt | `(reverse c)` | `c -> (Vec e) \| Reducible c e` | 1 | eager; `rseq` is the O(1) view |
-| `sort` | adapt | `(sort c) (sort cmp c)` | `c -> (Vec e) \| Reducible c e, Ord e; (fn (e e) r) c -> (Vec e) \| Reducible c e, Cmp r` | 1 | stable merge sort; **the comparator is any function whose result is a `Cmp`**: an `i64` or Clojure's predicate form, so `(sort < xs)` and `(sort > xs)` work ([R] A11 t17, e4); `(sort-with cmp c)` is the 2-arity until L1; sorting a `Vec` copies it once (the `vec` inside is the identity), 2096 objects for 1000 elements against 4190 before ([R] A10 sort) |
-| `sort-by` | adapt | `(sort-by key c) (sort-by key cmp c)` | `(fn (e) k) c -> (Vec e) \| Reducible c e, Ord k; (fn (e) k) (fn (k k) r) c -> (Vec e) \| Reducible c e, Cmp r` | 1 | the key is computed once per element (decorate, sort, undecorate: 5 calls for 5 elements, [R] A10 sortby); `(sort-by val > m)` is Clojure's text; `sort-by-with` is the 3-arity until L1 |
-| `sort-by-with` (new) | new | `(sort-by-with key cmp c)` | `(fn (e) k) (fn (k k) r) c -> (Vec e) \| Reducible c e, Cmp r` | 1 | the 3-arity of `sort-by` until L1, then deleted; stable; `key` is stored, so it is not `:borrow` |
+| `mapcat` | adapt | `(mapcat f c)` | `(fn (e) d) c -> (Mapcat c e d b) \| Reducible c e, Reducible d b` | 1 | flattening is free in the push model. The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `map-indexed` | adapt | `(map-indexed f c)` | `(fn (i64 e) b) c -> (MapIndexed c e b) \| Reducible c e` | 2 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `keep` | adapt | `(keep f c)` | `(fn (e) (Option b)) c -> (Kept c e b) \| Reducible c e` | 2 | `f` returns an `Option`; `nil`s are dropped, `some`s unwrapped. The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `keep-indexed` | adapt | `(keep-indexed f c)` | `(fn (i64 e) (Option b)) c -> (KeptIndexed c e b) \| Reducible c e` | 3 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `reverse` | adapt | `(reverse c)` | `c -> (List e) \| Reducible c e` | 1 | eager: a `List`, as Clojure's returns one (`(conj (reverse [1 2 3]) 0)` is `(0 3 2 1)`); `rseq` is the O(1) view |
+| `sort` | adapt | `(sort c) (sort cmp c)` | `c -> (VSeq e) \| Reducible c e, Ord e; (fn (e e) r) c -> (VSeq e) \| Reducible c e, Cmp r` | 1 | stable merge sort; **returns a `VSeq`, a seq, as Clojure's `sort` does**: `(conj (sort [3 1 2]) 0)` is `(0 1 2 3)` and it prints in parentheses ([R] A12 vseq), and `(vec (sort xs))` is the sorted `Vec` itself; **the comparator is any function whose result is a `Cmp`**: an `i64` or Clojure's predicate form, so `(sort < xs)` and `(sort > xs)` work ([R] A11 t17, e4); `(sort-with cmp c)` is the 2-arity until L1; sorting a `Vec` copies it once (the `vec` inside is the identity), 2096 objects for 1000 elements against 4190 before ([R] A10 sort) |
+| `sort-by` | adapt | `(sort-by key c) (sort-by key cmp c)` | `(fn (e) k) c -> (VSeq e) \| Reducible c e, Ord k; (fn (e) k) (fn (k k) r) c -> (VSeq e) \| Reducible c e, Cmp r` | 1 | **the key function runs twice per comparison, as Clojure's does** (`(sort (fn [x y] (compare (key x) (key y))) c)`: 18 calls for 5 elements, [R] A12 sortby); `sort-by-cached` (new) decorates, sorts and undecorates, one call per element (Rust's `sort_by_cached_key`); `(sort-by val > m)` is Clojure's text; `sort-by-with` is the 3-arity until L1 |
+| `sort-by-with` (new) | new | `(sort-by-with key cmp c)` | `(fn (e) k) (fn (k k) r) c -> (VSeq e) \| Reducible c e, Cmp r` | 1 | the 3-arity of `sort-by` until L1, then deleted; stable; `key` is stored, so it is not `:borrow` |
+| `sort-by-cached` (new) | new | `(sort-by-cached key c) (sort-by-cached key cmp c)` | `(fn (e) k) c -> (VSeq e) \| Reducible c e, Ord k` | 3 | the decorate-sort-undecorate form: the key is computed once per element ([R] A12 sortby: 5 calls against `sort-by`'s 18); an expensive key function is the reason to use it |
 | `shuffle` | adapt | `(shuffle c)` | `c -> (Vec e) \| Reducible c e` | 4 | the global generator (§2.8); `(rng/shuffle r c)` takes an `Rng` |
-| `distinct` | keep | `(distinct c)` | `c -> (Distinct c e) \| Reducible c e, Hash e, Eq e` | 2 | first occurrences, in order |
-| `dedupe` | keep | `(dedupe c)` | `c -> (Deduped c e) \| Reducible c e, Eq e` | 3 |  |
-| `replace` | adapt | `(replace smap c)` | `s c -> (Replaced c e) \| Lookup s e e, Reducible c e` | 3 | any `Lookup` as the substitution map, a `(Vec e)` included (index to value), as Clojure's |
-| `partition` | adapt | `(partition n c) (partition n step c) (partition n step pad c)` | `i64 c -> (Partitioned c e); i64 i64 c -> (Partitioned c e); i64 i64 d c -> (Partitioned c e) \| Reducible c e, Reducible d e` | 2 | yields `(Vec e)`; drops an incomplete last group, as Clojure's does (`partition-all` keeps it) |
-| `partitionv` | alias | `(partitionv n c)` | as `partition` | 3 | alias of `partition` (yields `Vec`s) |
-| `partition-all` | adapt | `(partition-all n c) (partition-all n step c)` | `i64 c -> (Partitioned c e); i64 i64 c -> (Partitioned c e) \| Reducible c e` | 2 | yields `(Vec e)` |
-| `partitionv-all` | alias | `(partitionv-all n c)` | as `partition-all` | 3 | alias of `partition-all` |
-| `partition-by` | keep | `(partition-by f c)` | `(fn (e) k) c -> (PartitionedBy c e k) \| Reducible c e, Eq k` | 2 | yields `(Vec e)` |
+| `distinct` | keep | `(distinct c)` | `c -> (Distinct c e) \| Reducible c e, Hash e, Eq e` | 2 | first occurrences, in order. The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `dedupe` | keep | `(dedupe c)` | `c -> (Deduped c e) \| Reducible c e, Eq e` | 3 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `replace` | adapt | `(replace smap c)` | `s c -> (Replaced c e) \| Lookup s e e, Reducible c e` | 3 | any `Lookup` as the substitution map, a `(Vec e)` included (index to value), as Clojure's. The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `partition` | adapt | `(partition n c) (partition n step c) (partition n step pad c)` | `i64 c -> (Partitioned c e); i64 i64 c -> (Partitioned c e); i64 i64 d c -> (Partitioned c e) \| Reducible c e, Reducible d e` | 2 | yields `(VSeq e)`, each group a seq that prints in parentheses, as Clojure's; drops an incomplete last group, as Clojure's does (`partition-all` keeps it). The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `partitionv` | adapt | `(partitionv n c)` | `i64 c -> (Partitioned c e)` | 3 | Clojure's vector form of `partition`: yields `(Vec e)`; `partitionv-all` and the 3- and 4-argument arities likewise |
+| `partition-all` | adapt | `(partition-all n c) (partition-all n step c)` | `i64 c -> (Partitioned c e); i64 i64 c -> (Partitioned c e) \| Reducible c e` | 2 | yields `(VSeq e)`. The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `partitionv-all` | adapt | `(partitionv-all n c)` | as `partition-all` | 3 | the vector form of `partition-all`: yields `(Vec e)` |
+| `partition-by` | keep | `(partition-by f c)` | `(fn (e) k) c -> (PartitionedBy c e k) \| Reducible c e, Eq k` | 2 | yields `(VSeq e)`. The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
 | `group-by` | adapt | `(group-by f c)` | `(fn (e) k) c -> (Map k (Vec e)) \| Reducible c e, Hash k, Eq k` | 1 | one pass; each group in encounter order |
 | `frequencies` | keep | `(frequencies c)` | `c -> (Map e i64) \| Reducible c e, Hash e, Eq e` | 1 |  |
 | `zipmap` | keep | `(zipmap ks vs)` | `c1 c2 -> (Map k v) \| Reducible c1 k, Cursable c2 k2, Cursor k2 v, Hash k, Eq k` | 2 | truncates to the shorter |
@@ -1340,18 +1546,18 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `xf` (new) | new | `(xf t1 t2 ..)` | macro `(Xf a b) (Xf b c) -> (Xf a c)` | 3 | composes transducers left to right, `(xf-comp x y)` nested; `comp` composes them after C1 (§5 T9) |
 | `run!` | keep | `(run! f c)` | `(fn (e) r) c -> unit \| Reducible c e` | 1 | replaces the prelude's `for-each`; `f` may return any `r`, which is dropped (monomorphised, no cost): `(run! (fn (x) (swap! a + x)) xs)` is 6 under both tools ([R] A10 run); over a literal `(range a b)` and a literal one-parameter `fn` it expands to the counting loop that the prelude's `for-each` macro makes today (§6.3) |
 | `dorun` | alias | `(dorun c)` | `c -> unit \| Reducible c e` | 2 | consumes for effect: `run!` with no function |
-| `doall` | alias | `(doall c)` | `c -> (Vec e) \| Reducible c e` | 2 | alias of `vec`: materialises, and memoises an effectful recipe |
-| `some` | adapt | `(some pred c)` | `(fn (e) r) c -> (Option x) \| Reducible c e, Truthy r, Payload r x` | 2 | the first truthy value of `(pred x)` (§2.4, [R] A11 `some`: `(some true)`, `(some 20)`, `nil`); `some` is also `Option`'s constructor, so one name by L1 extended to a constructor or a Rust macro that picks by argument count (A11 n13); `find-map` and `find-first` are the library's extras, which stage 2 uses in tranche 1 |
-| `every?` | keep | `(every? p c)` | `(fn (e) r) c -> bool \| Reducible c e, Truthy r` | 1 |  |
-| `not-any?` | keep | `(not-any? p c)` | `(fn (e) r) c -> bool \| Reducible c e, Truthy r` | 1 | `none?` is not offered |
+| `doall` | adapt | `(doall c)` | `c -> (VSeq e) \| Reducible c e` | 2 | materialises into a `Vec` and returns the `VSeq` over it: an effectful recipe runs once and the result is re-traversable, as Clojure's `(doall s)` returns the realised seq (§2.1 rule 2) |
+| `some` | adapt | `(some pred c)` | `(fn (e) r) c -> (Option x) \| Reducible c e, Truthy r, Payload r x` | 2 | the first truthy value of `(pred x)` (§2.4, [R] A11 `some`: `(some true)`, `(some 20)`, `nil`); `some` is also `Option`'s constructor, so one name by L1 extended to a constructor or a Rust macro that picks by argument count (A11 n13); `find-map` and `find-first` are the library's extras, which stage 2 uses in tranche 1; `:borrow`, as `first`. |
+| `every?` | keep | `(every? p c)` | `(fn (e) r) c -> bool \| Reducible c e, Truthy r` | 1 | `:borrow`, as `first`. |
+| `not-any?` | keep | `(not-any? p c)` | `(fn (e) r) c -> bool \| Reducible c e, Truthy r` | 1 | `none?` is not offered; `:borrow`, as `first`. |
 | `not-every?` | keep | `(not-every? p c)` | `(fn (e) r) c -> bool \| Reducible c e, Truthy r` | 2 |  |
-| `filter` | adapt | `(filter p c)` | `(fn (e) r) c -> (Filtered c e) \| Reducible c e, Truthy r` | 1 | `p` returns a `Truthy` (`bool` or `Option`): `(filter :parent nodes)`, `(remove nil? xs)` ([R] A11 t05) |
+| `filter` | adapt | `(filter p c)` | `(fn (e) r) c -> (Filtered c e) \| Reducible c e, Truthy r` | 1 | `p` returns a `Truthy` (`bool` or `Option`): `(filter :parent nodes)`, `(remove nil? xs)` ([R] A11 t05). The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
 | `filterv` | adapt | `(filterv p c)` | `(fn (e) r) c -> (Vec e) \| Reducible c e, Truthy r` | 2 | alias of `(vec (filter p c))` |
-| `remove` | keep | `(remove p c)` | `(fn (e) r) c -> (Filtered c e) \| Reducible c e, Truthy r` | 1 |  |
-| `max-key` | adapt | `(max-key k c) (max-key k x y ..)` | `(fn (e) k) c -> (Option e) \| Reducible c e, Ord k` | 2 | ties: the last wins, as Clojure's; the collection form is the base and a macro nests the varargs text |
-| `min-key` | adapt | `(min-key k c) (min-key k x y ..)` | `(fn (e) k) c -> (Option e) \| Reducible c e, Ord k` | 2 | ties: the last wins, as Clojure's; as `max-key` |
+| `remove` | keep | `(remove p c)` | `(fn (e) r) c -> (Filtered c e) \| Reducible c e, Truthy r` | 1 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
+| `max-key` | adapt | `(max-key k c) (max-key k x y ..)` | `(fn (e) k) c -> e \| Reducible c e, Ord k` | 2 | ties: the last wins, as Clojure's; traps `max-key: empty` on an empty source, as `(apply max-key k [])` throws (§1.2 P5); the collection form is the base and a macro nests the varargs text |
+| `min-key` | adapt | `(min-key k c) (min-key k x y ..)` | `(fn (e) k) c -> e \| Reducible c e, Ord k` | 2 | ties: the last wins, as Clojure's; traps `min-key: empty` on an empty source; as `max-key` |
 | `rand-nth` | adapt | `(rand-nth c)` | `c -> e \| Reducible c e` | 4 | the global generator, traps on an empty source as Clojure throws; `(rng/rand-nth r c)` |
-| `random-sample` | adapt | `(random-sample p c)` | `f64 c -> (Sampled c e) \| Reducible c e` | 4 | the global generator; `(rng/random-sample r p c)` |
+| `random-sample` | adapt | `(random-sample p c)` | `f64 c -> (Sampled c e) \| Reducible c e` | 4 | the global generator; `(rng/random-sample r p c)`. The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
 | `sequence` | adapt | `(sequence xf c)` | `Xf c -> (XfApplied xf c)` | 5 |  |
 | `eduction` | adapt | `(eduction xf c)` | `Xf c -> (XfApplied xf c)` | 5 |  |
 | `any?` | keep | `(any? x)` | `a -> bool` | 1 | Clojure's `any?`: a one-argument predicate that is always true (the default spec predicate); the quantifier is `some` (the first version made `(any? p c)` the quantifier, which silently changes a ported program) |
@@ -1368,7 +1574,7 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `frange` (new) | new | `(frange a b s)` | `f64 f64 f64 -> (FRange)` | 3 | the non-accumulating `a + i*s` for `i < ceil((b-a)/s)`; an extra: `range` over floats is Clojure's accumulating form; step 0 traps |
 | `nth-or` (new) | new | `(nth-or c i d)` | `c i64 e -> e \| Reducible c e` | 1 | the 3-arity of `nth` until L1, then deleted |
 | `reduce1` (new) | new | `(reduce1 f c)` | `(fn (e e) e) c -> (Option e) \| Reducible c e` | 1 | the 2-arity of `reduce` until L1, then deleted; `(unwrap (reduce1 max xs))` is Clojure's `(apply max xs)` |
-| `sort-with` (new) | new | `(sort-with cmp c)` | `(fn (e e) r) c -> (Vec e) \| Reducible c e, Cmp r` | 1 | the comparator form of `sort` (until L1, then deleted); stable; a `Cmp` result, so a predicate works |
+| `sort-with` (new) | new | `(sort-with cmp c)` | `(fn (e e) r) c -> (VSeq e) \| Reducible c e, Cmp r` | 1 | the comparator form of `sort` (until L1, then deleted); stable; a `Cmp` result, so a predicate works |
 | `range-by` (new) | new | `(range-by a b s)` | `i64 i64 i64 -> Range` | 1 | the 3-arity of `range` until L1, then deleted; `(range a b)` is today's macro |
 | `flatten` | adapt | `(flatten c)` | `c -> (Flattened c d e) \| Reducible c d, Reducible d e` | 3 | one level of nesting for a source of sources; arbitrary depth over a recursive enum (`Val`, a `Tree`) by a `Flatten` protocol; Clojure's heterogeneous nesting is `[1 [2 [3]]]`, which is `cannot unify i64 with (Vec ..)` ([R] A11 t91 for the analogous heterogeneous vector, §5 T4) |
 | `transient` | alias | `(transient ..)` | `(Vec a) -> (Vec a)` | 3 | the identity over the unique in-place update (P3); also for `Map` and `Set` |
@@ -1390,7 +1596,7 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 |---|---|---|---|---|---|
 | `find` | adapt | `(find m k)` | `s k -> (Option (Pair k v)) \| Lookup s k v` | 2 | returns the entry, a `Pair` |
 | `select-keys` | keep | `(select-keys m ks)` | `s c -> s \| Lookup s k v, Assoc s k v, Emptyable s, Reducible c k` | 1 | absent keys are skipped |
-| `conj` | adapt | `(conj c x ..)` | `c e -> c \| Collection c e` | 1 | one rule per type: `List` front, `Vec` end, `Set` anywhere, `Map` takes a `Pair` (a two-element `Vec` after L23); a literal `nil` first argument is `(list)` (§2.4); macro for more than one `x` |
+| `conj` | adapt | `(conj c x ..)` | `c e -> c \| Collection c e` | 1 | one rule per type: `List` front, `Vec` end, `Set` anywhere, `Map` takes a `Pair` (a two-element `Vec` after L23); a literal `nil` first argument is `(list)` (§2.4); macro for more than one `x`; `VSeq` front, `SubVec` end. |
 | `assoc` | adapt | `(assoc m k v ..)` | `s k v -> s \| Assoc s k v` | 1 | `Map` and `Vec` (index at most the count: `i = count` appends, as Clojure's, and beyond it traps, [R] A11 e6); a struct by a literal keyword is `with` (L21); a literal `nil` is `{}` (§2.4); macro for more pairs |
 | `dissoc` | keep | `(dissoc m k ..)` | `s k -> s \| Dissoc s k` | 1 | `Map` and `Set`; macro for more keys |
 | `get` | adapt | `(get c k) (get c k d)` | `s k -> (Option v) \| Lookup s k v; s k v -> v \| Lookup s k v` | 1 | absent and `nil`-valued differ by construction; overloaded by arity |
@@ -1400,12 +1606,12 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `update-or` (new) | new | `(update-or m k f d)` | `s k (fn (v) v) v -> s \| Lookup s k v, Assoc s k v` | 1 | `f` sees `d` when the key is missing: Clojure's `(update m w (fnil inc 0))` for an `f` that is not a literal `fnil`; stays when L1 lands (the 4-arity of `update` is Clojure's extra-argument form) |
 | `update-opt` (new) | new | `(update-opt m k f)` | `s k (fn ((Option v)) v) -> s \| Lookup s k v, Assoc s k v` | 1 | `f` sees `(Option v)` as Clojure's sees `nil`: `(update-opt m w (fnil inc 0))` is the literal port |
 | `update-in` | adapt | `(update-in m [k1 ..] f)` | macro `m k1 .. (fn (v) v) -> m` | 3 | typed per level like `get-in`; `update` at each level, so a missing key traps; `assoc-in` creates levels; the empty path is a compile error |
-| `update-keys` | adapt | `(update-keys m f)` | `(Map k v) (fn (k) k2) -> (Map k2 v) \| Hash k2, Eq k2` | 3 | two keys mapping to one: **the last wins**, as Clojure's (replicated, §9 Q33) |
+| `update-keys` | adapt | `(update-keys m f)` | `(Map k v) (fn (k) k2) -> (Map k2 v) \| Hash k2, Eq k2` | 3 | two keys mapping to one: **the last wins**, as Clojure's (replicated, §9.1 Q33) |
 | `update-vals` | keep | `(update-vals m f)` | `(Map k v) (fn (v) w) -> (Map k w) \| Hash k, Eq k` | 3 | the value type may change |
-| `contains?` | keep | `(contains? c k)` | `s k -> bool \| Keyed s k` | 1 | `Map` and `Set` (key, member) and `Vec`, `Slice` (the **index**, as Clojure's, [R] A11 e6); `includes?` is the element test |
-| `array-map` | alias | `(array-map k v ..)` | `k v ... -> (Map k v)` | 2 | alias of `hash-map`: a `Map` of at most 8 entries keeps insertion order (§2.7) |
+| `contains?` | keep | `(contains? c k)` | `s k -> bool \| Keyed s k` | 1 | `Map` and `Set` (key, member) and `Vec`, `SubVec`, `Array`, `str` (the **index**, as Clojure's, [R] A11 e6, A12 keyed); `includes?` is the element test |
+| `array-map` | adapt | `(array-map k v ..)` | `k v ... -> (Map k v)` | 2 | the array shape: insertion order, and it stays in it until an `assoc` takes it over 8 entries (§2.7); `hash-map` builds the HAMT shape |
 | `into` | adapt | `(into to c) (into to xf c)` | `t c -> t \| Collection t e, Reducible c e` | 1 | the 3-arity takes a transducer (tranche 3); a bulk path builds in one buffer; `(into {} [[1 2]])` needs L23 (a two-element `Vec` entry, §5 T6); `(into {} (zip ks vs))` works |
-| `empty` | adapt | `(empty c)` | `s -> s \| Emptyable s` | 2 | `Vec`, `Map`, `Set`, `List`; takes a value, so no static method is needed |
+| `empty` | adapt | `(empty c)` | `s -> s \| Emptyable s` | 1 | `Vec`, `Map`, `Set`, `List`; takes a value, so no static method is needed |
 | `merge` | adapt | `(merge m1 m2 ..)` | `(Map k v) (Map k v) -> (Map k v) \| Hash k, Eq k` | 1 | a literal `nil` operand is skipped (§2.4); an `Option`-typed operand after L16; `(merge)` has no type; macro nests for more |
 | `merge-with` | adapt | `(merge-with f m1 m2 ..)` | `(fn (v v) v) (Map k v) (Map k v) -> (Map k v) \| Hash k, Eq k` | 2 | `f` combines a conflict (old, new) |
 | `keys` | adapt | `(keys m)` | `m -> (Mapped m (Pair k v) k) \| Reducible m (Pair k v)` | 1 | an empty recipe, not `nil` |
@@ -1415,14 +1621,15 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `disj` | keep | `(disj s x ..)` | `s k -> s \| Dissoc s k` | 1 |  |
 | `set` | keep | `(set c)` | `c -> (Set e) \| Reducible c e, Hash e, Eq e` | 1 |  |
 | `includes?` (new) | new | `(includes? x c)` | `e c -> bool \| Reducible c e, Eq e` | 1 | an extra for `->>`; Clojure's idiom is `(some #{x} c)`, which runs once sets are callable (L21) |
-| `Slice` (new) | new | `(Slice e)` | struct `(v: (Vec e) lo: i64 hi: i64)` | 3 | the O(1) view `subvec` returns; `Reducible` (with an O(1) `nth`), `Lookup`, `Assoc`, `Collection`, `Stack`, `Keyed` |
+| `SubVec` (new) | new | `(SubVec e)` | struct `(v: (Vec e) lo: i64 hi: i64)` | 3 | the O(1) vector view `subvec` returns: `Reducible` (an O(1) `nth`), `Lookup`, `Assoc`, `Collection` (end), `Stack`, `Keyed`; it becomes `Vec` itself when `Vec` is the struct with an offset field (§9 Q18) |
+| `VSeq` (new) | new | `(VSeq e)` | struct `(front: (List e) v: (Vec e) lo: i64)` | 1 | the seq of a `Vec` (`rest`, `seq`, `next`) and the result of `sort`, `sort-by`, `take-last`, `doall`, `partition`: `Reducible`, `Seqable`, `Collection` (`conj` conses at the front), printing in parentheses ([R] A12 vseq) |
 | `get-or` (new) | new | `(get-or c k d)` | `s k v -> v \| Lookup s k v` | 1 | the 3-arity of `get` until L1 (§7), then deleted; `(get m k 0)` is `get takes 2 argument(s), got 3` until then (the error says `use get-or`, §7 D1) |
 
 ### 4.6 `fib.sorted`
 
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
-| `subseq` | adapt | `(subseq sc test key)` | `s (fn (i64 i64) bool) k -> (Range) \| Sorted s k v` | 5 | `test` is `<`, `<=`, `>` or `>=` as a function value, as Clojure's; the collection applies `(test (compare ek key) 0)`, so no `Cmp` enum is needed |
+| `subseq` | adapt | `(subseq sc test key)` | `s (fn (i64 i64) bool) k -> (SubSeq s) \| Sorted s k v` | 5 | `test` is `<`, `<=`, `>` or `>=` as a function value, as Clojure's; the collection applies `(test (compare ek key) 0)`, so no `Cmp` enum is needed |
 | `rsubseq` | adapt | `(rsubseq sc test key)` | `s (fn (i64 i64) bool) k -> (Reversed ..) \| Sorted s k v` | 5 |  |
 | `sorted-map` | adapt | `(sorted-map k v ..)` | macro `k v ... -> (SortedMap k v) \| Ord k` | 3 | a B-tree; one key type, so no run-time failure |
 | `sorted-map-by` | keep | `(sorted-map-by cmp k v ..)` | `(fn (k k) r) k v ... -> (SortedMap k v) \| Cmp r` | 3 | `cmp` is any `Cmp` function: `<`, `compare`, a predicate; equal under the comparator means the same key |
@@ -1441,8 +1648,8 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `clojure.string/escape` | adapt | `(str/escape s f)` | `str (fn (char) (Option str)) -> str` | 4 | `f` is a function, or any `Lookup` such as a `(Map char str)` once maps are callable (L21) |
 | `clojure.string/includes?` | keep | `(str/includes? s sub)` | `str str -> bool` | 1 |  |
 | `clojure.string/index-of` | adapt | `(str/index-of s sub) (str/index-of s sub from)` | `str str -> (Option i64); str str i64 -> (Option i64)` | 1 | **character offset** (§2.9); `(Option i64)`, never -1; the value is a `str` or a `char` (`Pattern`) |
-| `clojure.string/join` | adapt | `(str/join c) (str/join sep c)` | `c -> str \| Reducible c e, Show e; str c -> str \| Reducible c e, Show e` | 1 | always qualified: an unqualified `join` is the task-wait builtin (§3 N9) |
-| `clojure.string/last-index-of` | adapt | `(str/last-index-of s sub)` | `str str -> (Option i64)` | 3 | character offset |
+| `clojure.string/join` | adapt | `(str/join c) (str/join sep c)` | `c -> str \| Reducible c e, ToStr e; str c -> str \| Reducible c e, ToStr e` | 1 | always qualified: an unqualified `join` is the task-wait builtin (§3 N9) |
+| `clojure.string/last-index-of` | adapt | `(str/last-index-of s sub) (str/last-index-of s sub from)` | `str str -> (Option i64); str str i64 -> (Option i64)` | 3 | character offset; `from` searches backwards from that offset, as Clojure's |
 | `clojure.string/lower-case` | keep | `(str/lower-case s)` | `str -> str` | 4 | Unicode full case mapping, locale independent |
 | `clojure.string/replace` | adapt | `(str/replace s from to)` | `str p str -> str \| Pattern p` | 3 | the match is a `str`, a `char` or a `Regex` (`Pattern`); a `str` replacement, with `$1` interpreted for a regex match and not for a string, as Clojure's; a function replacement is `str/replace-with` until L23 |
 | `clojure.string/replace-first` | adapt | `(str/replace-first s from to)` | `str p str -> str \| Pattern p` | 3 | as `str/replace` |
@@ -1483,7 +1690,8 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
-| `re-pattern` | adapt | `(regex s)` | `str -> (Result Regex str)` | 4 | a non-backtracking engine for the patterns that fit it, so those cannot hang a call, and a backtracking matcher with a step budget for backreferences and lookaround (tranche 5): Java's regex has both and no safety reason forbids them |
+| `re-pattern` | adapt | `(re-pattern s)` | `str -> Regex` | 4 | traps with the pattern error on a bad pattern, as Clojure throws `PatternSyntaxException`; `try-re-pattern` (new, alias `regex`) returns a `(Result Regex str)`; a non-backtracking engine for the patterns that fit it, so those cannot hang a call, and a backtracking matcher with a step budget for backreferences and lookaround (tranche 5): Java's regex has both and no safety reason forbids them |
+| `try-re-pattern` (new) | new | `(try-re-pattern s)` | `str -> (Result Regex str)` | 4 | the typed twin of `re-pattern` (§3 N13); `regex` is its unqualified alias |
 | `#"regex"` | adapt | `(re "..")` | macro `str -> Regex` | 4 | reads as `(re "regex")`, checked at read/expand time (E14); `(re "..")` is the macro form |
 | `re-find` | adapt | `(re-find re s)` | `Regex str -> (Option Match)` | 4 | `Match` has `whole`, `groups` (`(Vec (Option str))`) and byte offsets, whatever the pattern: Clojure's result is a string without groups and a vector with them, a result type that depends on the pattern (§5 T5) |
 | `re-matches` | adapt | `(re-matches re s)` | `Regex str -> (Option Match)` | 4 | the whole string must match |
@@ -1494,9 +1702,9 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
-| `clojure.math/E` | keep | `math/e` | `f64` | 3 | a `def` |
-| `clojure.math/PI` | keep | `math/pi` | `f64` | 3 | a `def` |
-| `clojure.math/sqrt` | keep | `(math/sqrt x)` | `f64 -> f64` | 3 | IEEE-exact, so a builtin both tools agree on (§7 L11); `f32` too |
+| `clojure.math/E` | keep | `math/e` | `f64` | 4 | a `def` |
+| `clojure.math/PI` | keep | `math/pi` | `f64` | 4 | a `def` |
+| `clojure.math/sqrt` | keep | `(math/sqrt x)` | `f64 -> f64` | 4 | IEEE-exact, so a builtin both tools agree on (§7 L11); `f32` too |
 | `clojure.math/cbrt` | keep | `(math/cbrt x)` | `f64 -> f64` | 4 | written in fibber over `f64->bits`, so the interpreter and the compiler agree bit for bit |
 | `clojure.math/pow` | keep | `(math/pow x y)` | `f64 f64 -> f64` | 4 | in fibber (fdlibm-style); `ipow` is the exact integer power |
 | `clojure.math/exp` | keep | `(math/exp x)` | `f64 -> f64` | 4 | in fibber |
@@ -1515,15 +1723,15 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `clojure.math/cosh` | keep | `(math/cosh x)` | `f64 -> f64` | 4 | in fibber |
 | `clojure.math/tanh` | keep | `(math/tanh x)` | `f64 -> f64` | 4 | in fibber |
 | `clojure.math/hypot` | keep | `(math/hypot x y)` | `f64 f64 -> f64` | 4 | in fibber |
-| `clojure.math/floor` | keep | `(math/floor x)` | `f64 -> f64` | 3 | exact; a builtin candidate; `floor-i64` returns an integer |
-| `clojure.math/ceil` | keep | `(math/ceil x)` | `f64 -> f64` | 3 | exact |
-| `clojure.math/rint` | keep | `(math/rint x)` | `f64 -> f64` | 3 | half to even |
-| `clojure.math/round` | adapt | `(math/round x)` | `f64 -> i64` | 3 | half up (toward positive infinity) as Java's, saturating; NaN is 0 |
-| `clojure.math/signum` | keep | `(math/signum x)` | `f64 -> f64` | 3 |  |
+| `clojure.math/floor` | keep | `(math/floor x)` | `f64 -> f64` | 4 | exact; a builtin candidate; `floor-i64` returns an integer |
+| `clojure.math/ceil` | keep | `(math/ceil x)` | `f64 -> f64` | 4 | exact |
+| `clojure.math/rint` | keep | `(math/rint x)` | `f64 -> f64` | 4 | half to even |
+| `clojure.math/round` | adapt | `(math/round x)` | `f64 -> i64` | 4 | half up (toward positive infinity) as Java's, saturating; NaN is 0 |
+| `clojure.math/signum` | keep | `(math/signum x)` | `f64 -> f64` | 4 |  |
 | `clojure.math/to-degrees` | keep | `(math/to-degrees x)` | `f64 -> f64` | 4 |  |
 | `clojure.math/to-radians` | keep | `(math/to-radians x)` | `f64 -> f64` | 4 |  |
-| `clojure.math/floor-div` | keep | `(math/floor-div a b)` | `t t -> t \| Bits t, Num t` | 3 | traps on zero and on min / -1 |
-| `clojure.math/floor-mod` | keep | `(mod a b)` | `t t -> t \| Num t, Ord t, Unit t` | 3 | alias of `mod` |
+| `clojure.math/floor-div` | keep | `(math/floor-div a b)` | `t t -> t \| Bits t, Num t` | 4 | traps on zero and on min / -1 |
+| `clojure.math/floor-mod` | keep | `(mod a b)` | `t t -> t \| Num t, Ord t, Unit t` | 4 | alias of `mod` |
 | `clojure.math/to-int-exact` | adapt | `(int x)` | `i64 -> i32` | 2 | the checked narrowing |
 | `clojure.math/copy-sign` | keep | `(math/copy-sign x s)` | `f64 f64 -> f64` | 4 | from the bit casts |
 | `clojure.math/get-exponent` | keep | `(math/get-exponent x)` | `f64 -> i64` | 4 | from `f64->bits` |
@@ -1533,19 +1741,19 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `clojure.math/next-down` | keep | `(math/next-down x)` | `f64 -> f64` | 4 |  |
 | `clojure.math/scalb` | keep | `(math/scalb x n)` | `f64 i64 -> f64` | 4 |  |
 | `clojure.math/IEEE-remainder` | keep | `(math/ieee-remainder x y)` | `f64 f64 -> f64` | 4 |  |
-| `clojure.math/random` | adapt | `(rand rng)` | `Rng -> f64` | 4 | the global generator (§2.8) |
-| `clojure.math/add-exact` | alias | `(math/add-exact ..)` | `t t -> t \| Num t` | 3 | alias of `+`, which already traps on overflow |
-| `clojure.math/subtract-exact` | alias | `(math/subtract-exact ..)` | `t t -> t \| Num t` | 3 | alias of `-`, which already traps on overflow |
-| `clojure.math/multiply-exact` | alias | `(math/multiply-exact ..)` | `t t -> t \| Num t` | 3 | alias of `*`, which already traps on overflow |
-| `clojure.math/negate-exact` | alias | `(math/negate-exact ..)` | `t -> t \| Num t` | 3 | alias of `neg`, which already traps on overflow |
-| `clojure.math/increment-exact` | alias | `(math/increment-exact ..)` | `t -> t \| Num t` | 3 | alias of `inc`, which already traps on overflow |
-| `clojure.math/decrement-exact` | alias | `(math/decrement-exact ..)` | `t -> t \| Num t` | 3 | alias of `dec`, which already traps on overflow |
-| `Math/sqrt` | alias | `(Math/sqrt ..)` | as `math/sqrt` | 3 | the module `Math` (§4.16, [R] A11 e19) |
+| `clojure.math/random` | adapt | `(math/random)` | `-> f64` | 4 | the global generator (§2.8); `(rng/rand r)` takes an explicit `Rng` |
+| `clojure.math/add-exact` | alias | `(math/add-exact ..)` | `t t -> t \| Num t` | 4 | alias of `+`, which already traps on overflow |
+| `clojure.math/subtract-exact` | alias | `(math/subtract-exact ..)` | `t t -> t \| Num t` | 4 | alias of `-`, which already traps on overflow |
+| `clojure.math/multiply-exact` | alias | `(math/multiply-exact ..)` | `t t -> t \| Num t` | 4 | alias of `*`, which already traps on overflow |
+| `clojure.math/negate-exact` | alias | `(math/negate-exact ..)` | `t -> t \| Num t` | 4 | alias of `neg`, which already traps on overflow |
+| `clojure.math/increment-exact` | alias | `(math/increment-exact ..)` | `t -> t \| Num t` | 4 | alias of `inc`, which already traps on overflow |
+| `clojure.math/decrement-exact` | alias | `(math/decrement-exact ..)` | `t -> t \| Num t` | 4 | alias of `dec`, which already traps on overflow |
+| `Math/sqrt` | alias | `(Math/sqrt ..)` | as `math/sqrt` | 4 | the module `Math` (§4.16, [R] A11 e19) |
 | `Math/pow` | alias | `(Math/pow ..)` | as `math/pow` | 4 | the module `Math` (§4.16, [R] A11 e19) |
 | `Math/abs` | alias | `(Math/abs ..)` | as `abs` | 1 | the module `Math` (§4.16, [R] A11 e19) |
-| `Math/floor` | alias | `(Math/floor ..)` | as `math/floor` | 3 | the module `Math` (§4.16, [R] A11 e19) |
-| `Math/ceil` | alias | `(Math/ceil ..)` | as `math/ceil` | 3 | the module `Math` (§4.16, [R] A11 e19) |
-| `Math/round` | alias | `(Math/round ..)` | as `math/round` | 3 | the module `Math` (§4.16, [R] A11 e19) |
+| `Math/floor` | alias | `(Math/floor ..)` | as `math/floor` | 4 | the module `Math` (§4.16, [R] A11 e19) |
+| `Math/ceil` | alias | `(Math/ceil ..)` | as `math/ceil` | 4 | the module `Math` (§4.16, [R] A11 e19) |
+| `Math/round` | alias | `(Math/round ..)` | as `math/round` | 4 | the module `Math` (§4.16, [R] A11 e19) |
 | `Math/random` | alias | `(Math/random ..)` | as `math/random` | 4 | the module `Math` (§4.16, [R] A11 e19) |
 | `Math/log` | alias | `(Math/log ..)` | as `math/log` | 4 | the module `Math` (§4.16, [R] A11 e19) |
 
@@ -1558,10 +1766,10 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `clojure.set/difference` | adapt | `(set/difference a b)` | `(Set e) (Set e) -> (Set e) \| Hash e, Eq e` | 3 |  |
 | `clojure.set/select` | adapt | `(set/select p s)` | `(fn (e) bool) (Set e) -> (Set e) \| Hash e, Eq e` | 3 | `(set (filter p s))` is the general form |
 | `clojure.set/project` | adapt | `(set/project xrel ks)` | `(Set (Map k v)) c -> (Set (Map k v)) \| Reducible c k` | 5 | needs `Hash (Map k v)` |
-| `clojure.set/rename-keys` | adapt | `(set/rename-keys m kmap)` | `(Map k v) (Map k k) -> (Map k v) \| Hash k, Eq k` | 5 | a collision: **the last wins**, as Clojure's (replicated, §9 Q33) |
+| `clojure.set/rename-keys` | adapt | `(set/rename-keys m kmap)` | `(Map k v) (Map k k) -> (Map k v) \| Hash k, Eq k` | 5 | a collision: **the last wins**, as Clojure's (replicated, §9.1 Q33) |
 | `clojure.set/rename` | adapt | `(set/rename xrel kmap)` | `(Set (Map k v)) (Map k k) -> (Set (Map k v))` | 5 |  |
 | `clojure.set/index` | adapt | `(set/index xrel ks)` | `(Set (Map k v)) c -> (Map (Map k v) (Set (Map k v)))` | 5 |  |
-| `clojure.set/map-invert` | adapt | `(set/map-invert m)` | `(Map k v) -> (Map v k) \| Hash v, Eq v` | 3 | duplicate values: the last wins, as Clojure's (replicated, §9 Q33) |
+| `clojure.set/map-invert` | adapt | `(set/map-invert m)` | `(Map k v) -> (Map v k) \| Hash v, Eq v` | 3 | duplicate values: the last wins, as Clojure's (replicated, §9.1 Q33) |
 | `clojure.set/join` | adapt | `(set/join xrel yrel)` | `(Set (Map k v)) (Set (Map k v)) -> (Set (Map k v))` | 5 |  |
 | `clojure.set/subset?` | keep | `(set/subset? a b)` | `(Set e) (Set e) -> bool \| Hash e, Eq e` | 3 |  |
 | `clojure.set/superset?` | keep | `(set/superset? a b)` | `(Set e) (Set e) -> bool \| Hash e, Eq e` | 3 |  |
@@ -1591,7 +1799,7 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
-| `println` | adapt | `(println a ..)` | macro `a ... -> unit \| Show a` | 1 | one `Show` argument or several, separated by a space ([R] A10 pm); in value position it is a function generic over `Show`, as are `str print prn pr` (`(run! println xs)`, `(map str xs)`, [R] A10 twin); writes to `*out*` |
+| `println` | adapt | `(println a ..)` | macro `a ... -> unit \| Show a` | 1 | one `Show` argument or several, separated by a space ([R] A10 pm); in value position it is a function twin: `println` and `print` over `Show`, `str` over `ToStr`, `pr` and `prn` over `Debug` (§2.7; [R] A10 twin ran the `Show` form: `(run! println xs)`); writes to `*out*` |
 | `print` | adapt | `(print a ..)` | macro `a ... -> unit \| Show a` | 1 | no newline |
 | `pr` | adapt | `(pr a ..)` | macro `a ... -> unit \| Debug a` | 2 | strings quoted and escaped at every depth (`Debug`) |
 | `prn` | adapt | `(prn a ..)` | macro `a ... -> unit \| Debug a` | 1 | `pr` and a newline |
@@ -1599,10 +1807,11 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `pr-str` | adapt | `(pr-str a ..)` | macro `a ... -> str \| Debug a` | 2 | `pr` to a string; `debug-str` is not offered |
 | `flush` | keep | `(flush)` | `-> unit` | 4 | the prelude writes unbuffered, so a no-op until buffering exists |
 | `printf` | adapt | `(printf "fmt" a ..)` | macro `-> unit` | 4 | the directives are checked against the argument types at compile time |
-| `format` | adapt | `(format "fmt" a ..)` | macro `-> str` | 4 | `%s` over `Show`, `%d` an integer, `%f` a float, `%x`; the format string must be a literal; locale independent |
+| `format` | adapt | `(format "fmt" a ..)` | macro `-> str` | 4 | `%s` over `ToStr` (Clojure's `%s` is `str`), `%d` an integer, `%f` a float, `%x`; the format string must be a literal; locale independent |
 | `pprint` | adapt | `(pprint x)` | `a -> unit \| Pretty a` | 5 | long tail |
 | `read-line` | adapt | `(read-line)` | `-> (Option str)` | 4 | `nil` at end of input; `fib.io` |
-| `slurp` | adapt | `(slurp path)` | `str -> (Option str)` | 1 | alias of the builtin `read-file`; an `Option` where Clojure throws on a missing file |
+| `slurp` | adapt | `(slurp path)` | `str -> str` | 1 | the whole file; traps `slurp: cannot read ..` where Clojure throws `FileNotFoundException` (§1.2 P5); the builtin `read-file`, which it wraps, returns the `(Option str)`, and `try-slurp` (new) a `(Result str str)` |
+| `try-slurp` (new) | new | `(try-slurp path)` | `str -> (Result str str)` | 1 | the typed twin of `slurp` (§3 N13) |
 | `spit` | adapt | `(spit path s)` | `str str -> bool` | 1 | alias of the builtin `write-file`, which exists today; `:append true` appends |
 | `println-str` | adapt | `(println-str a ..)` | macro `a ... -> str` | 2 | `print-str` and a newline |
 | `prn-str` | adapt | `(prn-str a ..)` | macro `a ... -> str \| Debug a` | 2 | `pr-str` and a newline |
@@ -1611,12 +1820,13 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `tap>` | adapt | `(tap> x)` | `(dyn Show) -> bool` | 5 | a global tap list in an `Atom`; `add-tap`, `remove-tap` |
 | `add-tap` | adapt | `(add-tap f)` | `(fn :send ((dyn Show)) unit) -> unit` | 5 | registers a tap |
 | `remove-tap` | adapt | `(remove-tap f)` | as `add-tap` | 5 | removes a tap |
-| `read-string` | adapt | `(read-string s)` | `str -> (Result Form str)` | 4 | the reader of `fib.syntax` (spec/bootstrap.md); `(read-as T s)` through a `Read` protocol for typed data |
+| `read-string` | adapt | `(read-string s)` | `str -> Form` | 4 | the reader of `fib.syntax` (spec/bootstrap.md); traps on malformed text, as Clojure throws; `try-read-string` (new) returns a `(Result Form str)`; `(read-as T s)` through a `Read` protocol for typed data |
+| `try-read-string` (new) | new | `(try-read-string s)` | `str -> (Result Form str)` | 4 | the typed twin of `read-string` (§3 N13) |
 | `read` | adapt | `(read r)` | `Reader -> (Result Form str)` | 5 | over a reader value; `read+string` also returns the text read |
 | `read+string` | adapt | `(read+string r)` | `Reader -> (Result (Pair Form str) str)` | 5 | as `read` |
 | `*out*` | adapt | `*out*` | `(dyn Writer)` | 5 | a dynamic var (§2.11, C11); `println` writes to `*out*` |
-| `*in*` | adapt | `*in*` | `(dyn Reader)` | 5 | a dynamic var (§2.11, C11); `println` writes to `*out*` |
-| `*print-length*` | adapt | `*print-length*` | `(Option i64)` | 5 | a dynamic var (§2.11, C11); `println` writes to `*out*` |
+| `*in*` | adapt | `*in*` | `(dyn Reader)` | 5 | a dynamic var (§2.11, C11); `read-line` reads from it |
+| `*print-length*` | adapt | `*print-length*` | `(Option i64)` | 5 | a dynamic var (§2.11, C11); `println`, `pr` and `str` of a collection stop after that many elements |
 
 ### 4.15 `fib.async`
 
@@ -1638,7 +1848,7 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `remove-watch` | adapt | `(remove-watch r k)` | `(Ref a) k -> unit` | 5 | see `add-watch` |
 | `set-validator!` | adapt | `(set-validator! r f)` | `(Ref a) (fn :send (a) bool) -> unit` | 5 | a `:send` closure called before the value is stored; a false result traps `Invalid reference state`, as Clojure throws |
 | `get-validator` | adapt | `(get-validator r)` | `(Ref a) -> (Option (fn :send (a) bool))` | 5 | see `set-validator!` |
-| `future-cancel` | adapt | `(future-cancel t)` | `(Task a) -> bool` | 5 | sets a flag the task polls with `(cancelled?)`, Java's cooperative interrupt; a task is never killed mid-flight, which would skip the releases of everything it owns (§5 M5) |
+| `future-cancel` | adapt | `(future-cancel t)` | `(Task a) -> bool` | 5 | Clojure's: sets the task's interrupt flag, which blocking calls observe and answer by ending the task (a trap of the task, a value of `join` once L28 step 2 lands; §5 S16); no memory-safety failure forbids it (§2.11); `(cancelled?)` is the poll for a computation |
 | `future-cancelled?` | adapt | `(future-cancelled? t)` | `(Task a) -> bool` | 5 | reads the flag |
 
 ### 4.16 `fib.sys`
@@ -1650,14 +1860,15 @@ Offered over the survey's names by tranche: T1 154, T2 82, T3 170, T4 93, T5 84.
 | `System/nanoTime` | adapt | `(System/nanoTime)` | `-> i64` | 4 | monotonic; `(nano-time)` is the alias |
 | `System/getenv` | adapt | `(System/getenv name)` | `str -> (Option str)` | 4 | an `Option` where Java returns null; `(getenv name)` is the alias |
 | `System/exit` | adapt | `(System/exit n)` | `i64 -> a` | 4 | or return `n` from `main`; `(exit n)` is the alias |
-| `*command-line-args*` | adapt | `*command-line-args*` | `-> (Vec str)` | 1 | a `def` of the builtin `(args)` (L15); the empty `Vec` where Clojure has `nil` |
+| `*command-line-args*` | adapt | `*command-line-args*` | `-> (Vec str)` | 2 | a `def` of the builtin `(args)` (L15); the empty `Vec` where Clojure has `nil` |
 | `clojure-version` | adapt | `(clojure-version)` | `-> str` | 4 | the library's version string; `(version)` is the alias |
 
 ### 4.17 Not offered
 
 The names that Clojure has and this library does not offer, with the reason. None is a memory-safety reason: they are the JVM, no run-time
 type information (§5 T3), a result type that depends on a value (§5 T5) or is a union (§5 T8), legacy structs, and the name `defstruct`, which
-is fibber's record form. The first version's 282 rows were 192 reversed into the tables above (§10.4.6), 1 duplicate (`#"..."`), and these 89.
+is fibber's record form. The first version's 282 rows were 192 reversed into the tables above (§10.4.6), 1 duplicate (`#"..."`), and 89 that the first
+rewrite kept; the second revision moved 44 type predicates of them to §4.18 as checker forms (§10.4.8 F13), so these are the 45 that stay.
 
 | Clojure name | Verdict | Instead | Reason |
 |---|---|---|---|
@@ -1665,56 +1876,14 @@ is fibber's record form. The first version's 282 rows were 192 reversed into the
 | `enumeration-seq` | omit | - | Java objects |
 | `xml-seq` | omit | - | walks `clojure.xml`'s dynamic map trees and the JVM XML parser (heterogeneous values and the JVM) |
 | `resultset-seq` | omit | - | Java objects |
-| `map-entry?` | omit | - | a run-time type predicate: the entry is a `Pair`, a distinct struct, and its answer is a static fact (§5 T3) |
-| `sorted?` | omit | - | a type, `SortedMap`/`SortedSet` (§5 T3) |
 | `struct-map` | omit | - | legacy structs hold values of any type under keyword keys (§5 T4); superseded by records in Clojure itself |
 | `struct` | omit | - | legacy; see `struct-map` |
 | `create-struct` | omit | - | legacy; see `struct-map` |
 | `accessor` | omit | - | legacy; see `struct-map` |
 | `defstruct` | omit | - | the name is fibber's record form (syntax §3.7); Clojure's legacy basis is superseded by records |
-| `char?` | omit | - | static types: `char` is a type (§5 T3) |
 | `num` | omit | - | no boxed `Number` in a typed language (§5 T3) |
-| `boolean?` | omit | - | static types (§5 T3) |
-| `seq?` | omit | - | static types: `Reducible`/`Seqable` are protocols; the question is a constraint (§5 T3) |
-| `coll?` | omit | - | static types: a `Collection` constraint instead |
-| `list?` | omit | - | static types |
-| `vector?` | omit | - | static types |
-| `map?` | omit | - | static types |
-| `set?` | omit | - | static types |
-| `string?` | omit | - | static types |
-| `keyword?` | omit | - | static types |
-| `symbol?` | omit | - | static types; `Form` has `Sym` |
-| `number?` | omit | - | static types |
-| `integer?` | omit | - | static types |
-| `int?` | omit | - | static types |
-| `float?` | omit | - | static types |
-| `double?` | omit | - | static types |
-| `decimal?` | omit | - | static types |
-| `ratio?` | omit | - | static types |
-| `rational?` | omit | - | static types |
-| `fn?` | omit | - | static types |
-| `ifn?` | omit | - | static types: a callable is a `Fn` constraint (§2.11) |
-| `associative?` | omit | - | static types: `Lookup` and `Assoc` constraints |
-| `sequential?` | omit | - | static types |
-| `counted?` | omit | - | static types: `Reducible.size` is O(1) where the source knows (§2.1) |
-| `reversible?` | omit | - | static types: a `Reversible` constraint |
-| `indexed?` | omit | - | static types: `Reducible.nth` is O(1) where the source knows (§2.1) |
-| `seqable?` | omit | - | static types: a `Reducible` constraint |
-| `ident?` | omit | - | static types |
-| `simple-ident?` | omit | - | static types |
-| `qualified-ident?` | omit | - | static types |
-| `simple-keyword?` | omit | - | static types |
-| `qualified-keyword?` | omit | - | static types |
-| `simple-symbol?` | omit | - | static types |
-| `qualified-symbol?` | omit | - | static types |
-| `uuid?` | omit | - | static types |
-| `inst?` | omit | - | static types |
-| `bytes?` | omit | - | static types: an `(Array i8)` is a type |
 | `class?` | omit | - | no reflection (§5 T3) |
 | `instance?` | omit | - | no run-time type information: a `match` on an enum is the run-time test (§5 T3) |
-| `satisfies?` | omit | - | instances are checked at compile time (types §4) |
-| `extends?` | omit | - | as `satisfies?` |
-| `record?` | omit | - | static types |
 | `var?` | omit | - | a `var` is a definition, not an object (§4.2) |
 | `special-symbol?` | omit | - | no reflection |
 | `reader-conditional?` | omit | - | reader data; static types |
@@ -1733,8 +1902,6 @@ is fibber's record form. The first version's 282 rows were 192 reversed into the
 | `trampoline` | omit | - | its result is a value or a function, a union type (§5 T8); mutual recursion in one module is a tail call (syntax §2, types §6.10) |
 | `memfn` | omit | - | Java interop |
 | `volatile?` | omit | - | static types |
-| `delay?` | omit | - | static types |
-| `future?` | omit | - | static types |
 | `ex-triage` | omit | - | Java exception classification |
 | `clojure.data/equality-partition` | omit | - | protocol internals; `Diffable` replaces them |
 | `clojure.data/diff-similar` | omit | - | protocol internals |
@@ -1751,49 +1918,102 @@ is fibber's record form. The first version's 282 rows were 192 reversed into the
 | `tagged-literal` | omit | - | reader data of `#tag` |
 | `munge` | omit | - | compiler internals |
 
+### 4.18 Static predicates (checker forms)
+
+The predicates that Clojure asks of a run-time tag (`string?`, `vector?`, `seq?`, `number?`, `satisfies?`) were omitted by the first rewrite because the answer "is a constant of the static type" (§5 T3). A constant is an answer, and a checker form that folds to it keeps Clojure's text in ported code: `(string? x)` is the constant `true` or `false` of `x`'s static type, so `(filter string? xs)` over a `(Vec str)` is all true, and over the library's dynamic enums `Val` (§4.13) and `Form` (macros) it is a variant test, which is where Clojure code asks the question that has a run-time answer. They are checker forms (§7 L31, **[sketch]**: no program of the review exercises them, and `(string? "a")` is `unbound name string?` today, [R] A12 pred1). A generic function is checked once at its generalised type, so a test of the *type* is for monomorphic code and `Val`/`Form`; code that must treat types differently uses a protocol or a `match` (§5 T3).
+
+| Clojure name | Verdict | Fibber | Signature | T | Note |
+|---|---|---|---|---|---|
+| `map-entry?` | adapt | `(map-entry? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `Pair`; over `Val` a variant test |
+| `sorted?` | adapt | `(sorted? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `SortedMap` or `SortedSet`; over `Val` a variant test |
+| `char?` | adapt | `(char? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `char`; over `Val` a variant test; over `Form` a variant test |
+| `boolean?` | adapt | `(boolean? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `bool`; over `Val` a variant test; over `Form` a variant test |
+| `seq?` | adapt | `(seq? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a seq type: `List`, `VSeq`, `LSeq`, a recipe; over `Val` a variant test; over `Form` a variant test |
+| `coll?` | adapt | `(coll? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a type with `Collection`; over `Val` a variant test; over `Form` a variant test |
+| `list?` | adapt | `(list? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `List`; over `Val` a variant test; over `Form` a variant test |
+| `vector?` | adapt | `(vector? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `Vec`, `SubVec`; over `Val` a variant test; over `Form` a variant test |
+| `map?` | adapt | `(map? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `Map`, `SortedMap`; over `Val` a variant test; over `Form` a variant test |
+| `set?` | adapt | `(set? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `Set`, `SortedSet`; over `Val` a variant test; over `Form` a variant test |
+| `string?` | adapt | `(string? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `str`; over `Val` a variant test; over `Form` a variant test |
+| `keyword?` | adapt | `(keyword? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `keyword`; over `Val` a variant test; over `Form` a variant test |
+| `symbol?` | adapt | `(symbol? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a `Form` symbol; over `Val` a variant test; over `Form` a variant test |
+| `number?` | adapt | `(number? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a type with `Num`: the integers, the floats, `Ratio`, `BigInt`, `BigDecimal`; over `Val` a variant test; over `Form` a variant test |
+| `integer?` | adapt | `(integer? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is an integer type or `BigInt`; over `Val` a variant test; over `Form` a variant test |
+| `int?` | adapt | `(int? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a fixed-width integer type; over `Val` a variant test; over `Form` a variant test |
+| `float?` | adapt | `(float? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `f32` or `f64`; over `Val` a variant test; over `Form` a variant test |
+| `double?` | adapt | `(double? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `f64`; over `Val` a variant test; over `Form` a variant test |
+| `decimal?` | adapt | `(decimal? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `BigDecimal`; over `Val` a variant test |
+| `ratio?` | adapt | `(ratio? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `(Ratio t)`; over `Val` a variant test |
+| `rational?` | adapt | `(rational? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is an integer type, `BigInt` or `Ratio`; over `Val` a variant test |
+| `fn?` | adapt | `(fn? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a function type `(fn ..)`; over `Val` a variant test |
+| `ifn?` | adapt | `(ifn? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a function type, or a type callable by L21 (`Map`, `Set`, `Vec`, `keyword`); over `Val` a variant test |
+| `associative?` | adapt | `(associative? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a type with `Assoc`; over `Val` a variant test |
+| `sequential?` | adapt | `(sequential? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is the sequential family: `Vec`, `SubVec`, `List`, `VSeq`, `Range`, `LSeq`, recipes; over `Val` a variant test |
+| `counted?` | adapt | `(counted? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a type whose `Reducible.size` is O(1): `Vec Map Set Array Range Option SubVec`; over `Val` a variant test |
+| `reversible?` | adapt | `(reversible? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a type with `Reversible`; over `Val` a variant test |
+| `indexed?` | adapt | `(indexed? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a type whose `Reducible.nth` is O(1): `Vec Array Range Option SubVec`; over `Val` a variant test |
+| `seqable?` | adapt | `(seqable? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a type with `Reducible`; over `Val` a variant test |
+| `ident?` | adapt | `(ident? x)` | `keyword -> bool` | 3 | a function of the flat name of the keyword (§4.3 `namespace`), over a `Form` symbol of its text, and the constant `false` for any other static type |
+| `simple-ident?` | adapt | `(simple-ident? x)` | `keyword -> bool` | 3 | a function of the flat name of the keyword (§4.3 `namespace`), over a `Form` symbol of its text, and the constant `false` for any other static type |
+| `qualified-ident?` | adapt | `(qualified-ident? x)` | `keyword -> bool` | 3 | a function of the flat name of the keyword (§4.3 `namespace`), over a `Form` symbol of its text, and the constant `false` for any other static type |
+| `simple-keyword?` | adapt | `(simple-keyword? x)` | `keyword -> bool` | 3 | a function of the flat name of the keyword (§4.3 `namespace`), over a `Form` symbol of its text, and the constant `false` for any other static type |
+| `qualified-keyword?` | adapt | `(qualified-keyword? x)` | `keyword -> bool` | 3 | a function of the flat name of the keyword (§4.3 `namespace`), over a `Form` symbol of its text, and the constant `false` for any other static type |
+| `simple-symbol?` | adapt | `(simple-symbol? x)` | `Form -> bool` | 3 | a function of the flat name of the keyword (§4.3 `namespace`), over a `Form` symbol of its text, and the constant `false` for any other static type |
+| `qualified-symbol?` | adapt | `(qualified-symbol? x)` | `Form -> bool` | 3 | a function of the flat name of the keyword (§4.3 `namespace`), over a `Form` symbol of its text, and the constant `false` for any other static type |
+| `uuid?` | adapt | `(uuid? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `Uuid`; over `Val` a variant test |
+| `inst?` | adapt | `(inst? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `Inst`; over `Val` a variant test |
+| `bytes?` | adapt | `(bytes? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `(MArray i8)` or `(Array i8)`; over `Val` a variant test |
+| `record?` | adapt | `(record? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is a type made by `defrecord`; over `Val` a variant test |
+| `delay?` | adapt | `(delay? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `(Delay a)`; over `Val` a variant test |
+| `future?` | adapt | `(future? x)` | `a -> bool` | 3 | a constant of the static type: `true` iff the argument's type is `(Task a)`; over `Val` a variant test |
+| `satisfies?` | adapt | `(satisfies? P x)` | `P a -> bool` | 3 | a constant: `true` iff the type of the argument has an instance of the protocol `P`, which the compiler knows (types §4); `(satisfies? P x)` is the question Clojure asks at run time |
+| `extends?` | adapt | `(extends? P T)` | `P T -> bool` | 3 | a constant: `true` iff the type `T` has an instance of the protocol `P` |
+
 ## 5. Deviations from Clojure
 
 The first version of this page had 82 deviation rows. Under the rule (§1.1) a deviation needs a memory-safety failing
 program or a static-typing fact the language already decided. Of the 82, 32 had neither and are reversed, 21 are adapted to
 a typed twin that keeps Clojure's text (some as the language change of §7 that makes them Clojure's), 11 stand on a decided
 typing fact (group T below), and 18 were already Clojure's behaviour (§10.4.2 gives every row). The memory-safety group M is new:
-the first version gave one memory-safety reason, for `add-watch`, and it was false (§4.15). What remains is below, in five
+the first version gave one memory-safety reason, for `add-watch`, and it was false (§4.15); the first rewrite gave six, and the rule check
+showed that four of them were refuted by programs that run (§10.4.8 R1 to R5), so two stand. What remains is below, in six
 groups: **M** memory safety, **T** decided static typing, **D** decisions the owner made before the rule, **C** consequences of
-the owner's decisions under the rule, and **S** differences that exist only until an item of §7 lands (a stage limit, not a
-deviation of the design).
+the owner's decisions under the rule, **S** differences that exist only until an item of §7 lands (a stage limit, not a
+deviation of the design), and **K** the one deviation that stands on the cost side, for the owner to confirm.
 
 ### 5.1 Memory safety (M): the failing program
 
 | # | Clojure | Here | The failing program, or why none can be run |
 |---|---|---|---|
-| M1 | any `def` value may be a mutable cell (`(def c (volatile! 0))`), shared by every thread | `def` may hold an `Atom`, never a `Cell` or `Weak` (§2.11) | a `Cell` in a top-level `def` is reachable from every task without being captured, so two tasks write one `Cell` and the capture check does not see it. The check that exists rejects the closure form, `cell cannot be shared between threads: closure capture c has type (Cell i64)` ([R] A11 t41), and `(def c: (Cell i64) (cell 0))` is `def c: initialiser is not a constant expression` (n8); with L15 the rule becomes "the type of a `def` contains no `Cell`/`Weak`". An `Atom` is `Send` and safe: `(def a: (Atom i64) (atom 0))` is rejected today only by the same grammar (n8b) |
-| M2 | `(aset a i x)` mutates the array that every holder sees | `(aset &a i x)` has value semantics: a write is in place only when `a` is unique, else it copies | `(let ((a (cell (array 3 0))) (b @a)) (array-set! &a 0 9) (+ (array-get @a 0) (* 10 (array-get b 0))))` is 9 here and 99 in Clojure ([R] A11 t54): the persistent collections share `(Array a)` nodes, so an aliased write would change a vector's value under its holder, and across tasks it is a data race. Clojure's text `(aset a 0 9)` becomes `(aset &a 0 9)` |
-| M3 | `(make-array T n)` and `(object-array n)` fill with `nil` or a zero | scalars default to zero and `(Option a)` to `nil`; an object type needs the element: `(array n x)` | an uninitialised slot of an object type is a null pointer read as an object. `(array 3)` is `array takes 2 argument(s), got 1` ([R] A11 t90); only an unsafe uninitialised array (§7 C4) could exhibit it, and it is for the library |
-| M4 | a string counts UTF-16 units: `(count "😀")` is 2 and `(subs s 0 1)` may cut a surrogate pair | a character is a Unicode scalar: `(count "😀")` is 1; the two agree on the Basic Multilingual Plane | a `subs` through a surrogate pair would have to build a `str` that is not valid UTF-8, whose lead byte then claims continuation bytes that are not there, and the decoder's bounds rest on validity (§2.9). The invariant is enforced at construction: `str-slice [0, 1) splits a character` (A11 t12), `str-from-bytes: invalid UTF-8` (t13) |
-| M5 | `(future-cancel f)` interrupts the thread | sets a flag the task polls with `(cancelled?)` (Java's interrupt is cooperative too) | an asynchronous kill stops a thread between two instructions of a retain, a release or a heap update and leaves a count or a structure inconsistent. Not constructed as a program (there is no cancel primitive); the weaker form of the argument is the ownership model's no-leak promise (ownership.md §2) |
-| M6 | `(locking x body)` locks any object's monitor | `(locking m (fn (v) ..))` on a `Mutex a` that owns its value (§2.11) | the monitor of an arbitrary object would let two tasks hold one `Cell`: the program of M1 and t41. Rust's `Mutex<T>` is the form where Clojure's would break safety, which is the rule's second clause |
+| M1 | a `def` value may be a mutable cell or array (`(def c (long-array 3))`), shared by every thread | `def` may hold an `Atom` (so `(def c (volatile! 0))` works, §2.11), never a `Cell`, a `Weak` or an `MArray`, which holds a `Cell` | a `Cell` in a top-level `def` is reachable from every task without being captured, so two tasks write one `Cell` and the capture check does not see it. The check that exists rejects the closure form, `cell cannot be shared between threads: closure capture c has type (Cell i64)` ([R] A11 t41), and `(def c: (Cell i64) (cell 0))` is `def c: initialiser is not a constant expression` (n8); with L15 the rule becomes "the type of a `def` contains no `Cell`/`Weak`". An `Atom` is `Send` and safe: `(def a: (Atom i64) (atom 0))` is rejected today only by the same grammar (n8b) |
+| M2 | two threads may write one array | one task may share an array and write it in place (`(aset a i x)` on an `MArray`); two tasks may not hold one | `(let ((a (MArray (cell (array 2 0))))) (let ((t1 (spawn (fn () (aset a 0 1)))) (t2 (spawn (fn () (aset a 0 2))))) ..))` is `cell cannot be shared between threads: closure capture a, field c of MArray has type (Cell (Array i64))` ([R] A12 aset3): for an array of objects the two writes would both release the old element, a double release (a consequence of the counted representation; no program shows it, because the check rejects the program). Inside one task the sharing is Clojure's and runs: `[9 4 0]` and `[y x]` (A12 aset1, aset2), and the write through a cell that two closures share gives 3 and 49 (A12 p1, p10) |
+
+Four rows of the first rewrite are gone, each refuted or unproven: **M3**, an uninitialised object slot (no program could show it; `make-array` of an object type is an `(MArray (Option T))`
+filled with `nil`, §5 T1); **M4**, the UTF-16 unit (Clojure's counts run and audit clean as user code; the unit is `char`'s, §5 T10); **M5**, `future-cancel` (Java's interrupt is cooperative, §5 S16);
+**M6**, `locking` (a lock built from two `Atom`s runs, 600, and the program the first rewrite cited was rejected whatever `locking` is, §2.11). §10.4.8 R3 to R5 give the programs.
 
 ### 5.2 Static typing already decided (T): and the typed twin that keeps Clojure's text
 
 | # | Clojure | Here | The decided fact, the program that shows it, the twin |
 |---|---|---|---|
-| T1 | `nil` is a value of every type | `nil` is `Option`'s empty variant (types §1.5): `first last peek get find max-key` and `parse-long`, `index-of` return `(Option v)`; `keys` of an empty map is an empty recipe | `(conj nil x)` is `no implementation of Collection for (Option a)` ([R] A11 n7): the result is a `List` for `nil` and a `Vec` for a vector. Twins: a condition accepts `(Option T)` (§2.4), a literal `nil` first argument of `conj assoc merge` expands (§2.4), `(get (get m :a) :b)` after L16, `some->`. `(first xs)` of a `List` returning `Option` is **Decided** (Q28) |
-| T2 | a `fn` literal may have several arities and a rest parameter; `partial`, `comp`, `juxt` return functions of any arity | a closure value has one type with one arity (types §1.4); `(fn ([x] ..) ([x y] ..))` and `%&` are not offered; the combinators are arity-reading checker forms (§2.2, L22) | `(partial add3 1)` for a three-parameter `add3` is `cannot unify (fn :send (i64 i64 i64) i64) with (fn (a b) c)` ([R] A11 arity). Twin: the checker reads the arity from the argument's type; a multi-arity `defn` is overloading of a name (L1) |
-| T3 | `vector?`, `seq?`, `instance?`, `type`, `class`, `satisfies?`, `eval` ask a run-time tag | no run-time type information: the answer is a constant of the static type; `eval` has no static result type (§1.2) | a typed `vector?` exists only where an impl does: `no implementation of IsVec for i64` ([R] A11 n16). Twins: a protocol constraint in the signature, a `match` on an enum, a predicate over `Val`, `isa?` over a hierarchy value |
+| T1 | `nil` is a value of every type | `nil` is `Option`'s empty variant (types §1.5): `first last peek get find` and `parse-long`, `index-of` return `(Option v)`; `keys` of an empty map is an empty recipe | `(conj nil x)` is `no implementation of Collection for (Option a)` ([R] A11 n7): the result is a `List` for `nil` and a `Vec` for a vector. Twins: a condition accepts `(Option T)` (§2.4), a literal `nil` first argument of `conj assoc merge` expands (§2.4), `(get (get m :a) :b)` after L16, `some->`. `(first xs)` of a `List` returning `Option` is **Decided** (Q28) |
+| T2 | a `fn` literal may have several arities and a rest parameter; `partial`, `comp`, `juxt` return functions of any arity | a closure value has one type with one arity (types §1.4); a multi-arity or rest-parameter literal takes the arity of its expected type (`%&` the same, L22), and a multi-arity function that is stored or returned is not offered; the combinators are arity-reading checker forms (§2.2, L22) | `(partial add3 1)` for a three-parameter `add3` is `cannot unify (fn :send (i64 i64 i64) i64) with (fn (a b) c)` ([R] A11 arity). Twin: the checker reads the arity from the argument's type; a multi-arity `defn` is overloading of a name (L1); a hand-written transducer `(fn [rf] (fn ([] ..) ([r] ..) ([r x] ..)))` cannot be ported as it stands, it is an `Xf` (§2.1 rule 7) |
+| T3 | `vector?`, `seq?`, `instance?`, `type`, `class`, `satisfies?`, `eval` ask a run-time tag | no run-time type information: the answer is a constant of the static type; `eval` has no static result type (§1.2) | a typed `vector?` exists only where an impl does: `no implementation of IsVec for i64` ([R] A11 n16). Twins: the checker forms of §4.18, which fold to the static answer (a variant test over `Val` and `Form`), a protocol constraint in the signature, a `match` on an enum, `isa?` over a hierarchy value |
 | T4 | a vector or map holds values of any types: `[1 "a"]`, `{:a 1 :b "x"}`; a record is a map with extra keys; `get-in` takes a path computed at run time | one element type per `Vec`, one key and one value type per `Map`; a struct is not a map | `[1 "a"]` is `cannot unify i64 with str` ([R] A11 t91, k8), `{:a 1 :b "x"}` the same (t92). Twins: the entry is a `Pair`/`Triple` (§2.3, L25 for a literal), a map literal of mixed values is `(Map keyword Val)` (L25), `Val` and a runtime `get-in-v` ([R] A11 e17), `defrecord` with `(assoc r :k v)` by L21 |
-| T5 | a result type that depends on a value: `(/ 7 2)` is a ratio, `+'` a `Long` or `BigInt`, `re-find` a string or a vector by the group count, `flatten` any nesting | one result type per function: integer `/` truncates (`quot` is its alias), `+'` returns a `BigInt`, `re-find` returns a `Match`, `flatten` is one level or over a recursive enum | `(/ 7 2)` is `3` ([R] A11 k9). Twins: `Ratio` and `BigInt` library types ([R] A11 t50), `Match` with `whole` and `groups`, `Val` |
-| T6 | a protocol or multimethod dispatches on every argument | a protocol is dispatched on one head per parameter today (types §4) | two instances of one head overlap: `overlapping instances: OrHit for (Option a) is already implemented` (A11 t70), `... Collection for (Map k v) ...` (t71). It is why `(into {} [[1 2]])`, `or` of an `Option` with a default in predicate position, and `str/replace` by replacement type are not plain library code; L23 lifts it (§7) |
+| T5 | a result type that depends on a value: `(/ 7 2)` is a ratio, `+'` a `Long` or `BigInt`, `re-find` a string or a vector by the group count, `flatten` any nesting | one result type per function: integer `/` is always a `Ratio` (`quot` truncates), `+'` returns a `BigInt`, `re-find` returns a `Match`, `flatten` is one level or over a recursive enum | `(/ 7 2)` is `3` today ([R] A11 k9, §5 S17) and `7/2` after L30 ([R] A12 ratio). Twins: `Ratio` and `BigInt` library types ([R] A11 t50), `Match` with `whole` and `groups`, `Val` |
 | T7 | `=` across types of one family is true, across families false | `=` has one type (types §2.12); within a family the checker elaborates to `seq=` (§2.7, L24) | `(= [1] #{1})` is a `cannot unify`, which is what Clojure's `false` would hide |
 | T8 | an `if` or `or` may return different types in its arms: `(or (even? x) (get m k))`, `(if c 1 "a")`; `trampoline`'s result is a value or a function | no union types: arms unify | `(if c 1 "a")` is `cannot unify i64 with str`. Twins: recipes and closures erase at a join (L24, C1), `seq-of`; `trampoline` is not offered (§4.17) |
 | T9 | `(comp (map f) (filter p))` composes transducers, which are functions generic in the accumulator | a transducer is an `Xf` value, a factory of steppers; `xf` composes them, and after C1 `comp` dispatches on `Fn` and `Xf` (§2.1 rule 7) | `let` does not generalise (types §2.4), and an impl head on a function type is rejected: `(comp (xmap inc) (xfilter odd?))` is `cannot unify (Xf i64 i64) with (fn (a) b)` ([R] A10 comp) |
+| T10 | a `char` is a UTF-16 unit, so a string's seq has an element per unit and `(count "😀")` is 2 | a `char` is a Unicode scalar (types §1.1, **Decided**), a string's seq has one element per scalar, and `count`, `nth`, `get`, `subs` and `index-of` count scalars | `(dotimes [i (count s)] (nth s i))` needs `count` and `nth` to agree: with `count` in UTF-16 units and `nth` by element, `(count "a😀z")` is 4 and the loop traps `nth: index out of range` ([R] A12 unit); Clojure's units are replicable and safe as user code (A12 p2, p2b), so the cause is `char`, not memory safety. Twin: a program that needs UTF-16 offsets for Java interop writes `u16-len` over `str-chars`; the *order* of strings is Clojure's (§2.7) |
 
 ### 5.3 Decisions the owner made before the rule
 
 | # | Clojure | Here | Status |
 |---|---|---|---|
-| D1 | `throw`, `try`, `catch`, `finally`, `ex-info` | `trap` is the only abort, and a trap in a task ends the process (types §2.11, **Decided** 2026-09-28) | no memory-safety failure prevents exceptions (§2.10); the rule would reverse the decision, and it is the owner's to amend: §9 Q35 |
-| D2 | mixed numeric operands promote | no implicit conversion between numeric variables (types §1.1 D3); literals adopt (L19) | a statically typable lattice with no safety content (§2.8); §9 Q36 recommends lifting it |
+| D1 | `throw`, `try`, `catch`, `finally`, `ex-info` | `trap` is the only abort, and a trap in a task ends the process (types §2.11, **Decided** 2026-09-28) | no memory-safety failure prevents exceptions (§2.10); the rule reverses the decision (§9.1 Q35: exceptions, after the library is viable), and the types amendment is the owner's to sign |
+| D2 | mixed numeric operands promote | no implicit conversion between numeric variables (types §1.1 D3); literals adopt (L19) | a statically typable lattice with no safety content (§2.8); the rule lifts it (§9.1 Q36, L26 b); the owner signs the §7 item |
 | D3 | `(abs Long/MIN_VALUE)` is `Long/MIN_VALUE` | overflow traps at every width, `abs` included (types §2.12, **Decided**, §9 Q15) | Clojure's `+` throws on overflow too; this is the one overflow it ignores |
+| D4 | `(/ 7 2)` is the ratio `7/2` | integer `/` truncates toward zero, Rust's (types §2.12, **Decided** 2026-09-27: "Integer arithmetic has Rust's semantics") | not a safety fact and not a typing fact: the result type is the one thing T5 forbids, and its twin keeps the value (a `Ratio` always, as `+'` is a `BigInt` always); the rule reverses the decision for the user-visible `/` (§2.8, §7 L30, §9.1): `quot` is the builtin's name; the compiler's one use, three case files, the generator and two unit tests migrate (§8.3) |
 
 ### 5.4 Consequences of the owner's decisions under the rule
 
@@ -1809,32 +2029,46 @@ deviation of the design).
 | S1 | `(if (get m k) ..)`, `(or (get m k) 0)`, `(when c 5)` as a value | `cannot unify (Option i64) with bool` ([R] A11 t01, t02), `cannot unify unit with i64` (t82); the `Truthy` library and macros run (t04, 127) | L20 |
 | S2 | `(m k)`, `(#{1 2} x)`, `(v 0)`, `(:k m)`, `(filter #{1 2} xs)` | `cannot unify (Map i64 i64) with (fn (a) b)` (A11 t51, n5), `(Set i64)` with `(fn (a) bool)` (n6), `keyword` (k1), `(Vec i64)` (k2) | L21, or C1's `Fn` |
 | S3 | `partial`, `comp`, `constantly`, `juxt`, `apply` of any arity | the one-free `partial`, unary `comp` and `constantly` (A11 arity..arity4) | L22 |
-| S4 | `(into {} [[1 2]])`, `(some #(.. (Option bool)) ..)`, `str/replace` with a function | overlapping instances (A11 t70, t71) | L23 |
+| S4 | `(into {} [[1 2]])`, `(some #(.. (Option bool)) ..)`, `str/replace` with a function; a protocol or multimethod that dispatches on every argument | a protocol is dispatched on one head per parameter today (types §4), a stage limit and not a typing fact: two instances of one head overlap, `overlapping instances: OrHit for (Option a) is already implemented`, `... Collection for (Map k v) ...` (A11 t70, t71) | L23 |
 | S5 | `(if flag (filter p v) v)`, `(= [1] (list 1))` | `cannot unify (Vec i64) with (Filtered (Vec i64) i64)` ([R] A10 join), `cannot unify Range with (Vec i64)` (A11 n4); `seq-of` and `seq=` run | L24 |
-| S6 | `(+ x 1)` for `x: i32`, `(+ n 2.5)` for a variable | `cannot unify i64 with i32` (A11 n3c), `cannot unify f64 with i64` (n1) | L26, §9 Q36 |
+| S6 | `(+ x 1)` for `x: i32`, `(+ n 2.5)` for a variable | `cannot unify i64 with i32` (A11 n3c), `cannot unify f64 with i64` (n1) | L26, §9.1 Q36 |
 | S7 | `(get m k 0)`, `(nth c i d)`, `(reduce f c)`, `(sort cmp c)`, `(map f c1 c2)`, `(defn f ([x] ..) ([x y] ..))` | `get takes 2 argument(s), got 3`; the stand-ins `get-or`, `nth-or`, `reduce1`, `sort-with`, `zip-with` run | L1 |
 | S8 | `(def counter (atom 0))`, `(def stopwords #{"a" "the"})`, a global `rand` | `def counter: initialiser is not a constant expression` (A11 t56) | L15 |
-| S9 | `(throw ..)` caught by `try` | `trap` (A11 t40, e9) | L28, §9 Q35 |
+| S9 | `(throw ..)` caught by `try` | `trap` (A11 t40, e9) | L28, §9.1 Q35 |
 | S10 | a lazy seq crosses a thread | an `LSeq` or `cache` holds a `Cell`: `cell cannot be shared between threads: closure capture s, field box of Cached has type (Cell (Option (Vec i64)))` (A11 e8d); the `Atom` memo crosses (e8e) | C9 (`Mutex`) |
-| S11 | `(count "aé€😀z")`, `(subs s 1 3)`, `(map f "abc")` are O(1) or O(n) characters | today `count` of a `str` is `no implementation of Reducible for str` (A7); the user-code impl runs (A11 e3a, e3b) | tranche 4, C10 for O(1) |
+| S11 | `(count "aé€😀z")`, `(subs s 1 3)`, `(map f "abc")` are O(1) or O(n) scalars | today `count` of a `str` is `no implementation of Reducible for str` (A7); the user-code impl runs (A11 e3a, e3b) | tranche 1 (O(n)), C10 for O(1) |
 | S12 | `~x`, `#"re"`, `2r1010`, `^:private`, `::kw` | `unknown reader syntax`; `,x` is the unquote | E14 |
-| S13 | `(println (some 3))` prints `3`, and `(str ["a"])` is `["a"]` | `(some 3)` (A11 t87); `str` and `println` both `Show` | the prelude change of §2.7 |
+| S13 | `(println (some 3))` prints `3`, and `(str ["a"])` is `["a"]` | `(some 3)` (A11 t87); the prelude's `show` is one text for `str` and `println` | the prelude change of §2.7 (`ToStr`, `Show`, `Debug`) |
+| S14 | a lazy seq traversed twice calls `f` once per element | a recipe traversed twice runs again, 6 calls for a `map` over `[1 2]` traversed three times ([R] A12 q34); no checker rule makes a second use an error (A12 aff1, aff2) | L13 (affine recipes) |
+| S15 | `(with-redefs [f g] ..)` on any function | no program of the review exercises it; `f` is a direct call today | L29 |
+| S16 | `(future-cancel f)` interrupts a blocked thread | a task's trap ends the process (A11 t40, e9), so a blocking call cannot answer the interrupt with an exception; the flag is polled with `(cancelled?)` | L28 step 2 (a task's trap isolated by `join`) |
+| S17 | `(/ 7 2)` is `7/2` | the builtin truncates: `3` ([R] A11 k9); `(Ratio t)` runs as a library type (A12 ratio) | L30 |
 
 ### 5.6 Sharp edges of Clojure that this page replicates
 
 These are not safety matters, so the rule says to replicate them: `compare` built on `<` (a NaN compares equal to everything,
 [R] A11 nan), `compare` of vectors by length first, `(take-nth 0 c)` repeating the first element, `(range 0 1 0.1)`
 accumulating (11 elements, [R] A11 range) and step 0 repeating the start, `update-keys`, `set/map-invert` and
-`set/rename-keys` keeping the last of a collision, `partition` dropping an incomplete last group, and, if Clojure's
-`(hash 0.0)` differs from `(hash -0.0)` (not verified), that too. §9 Q33 asks whether the owner exempts any of them as
-bugs; until then they are Clojure's. The one place where a replicated behaviour gives up determinism is a `sort` over floats that
+`set/rename-keys` keeping the last of a collision, `partition` dropping an incomplete last group, **`sort-by`'s key function running twice per comparison**
+(`sort-by-cached` is the one-call form, §4.4), **chunking**, **the order of strings by UTF-16 unit** (§2.7), **`hash-map`'s hash order against the array map's insertion
+order** (§2.7) and, if Clojure's `(hash 0.0)` differs from `(hash -0.0)` (not verified, **[K]**), that too. **Chunking:** a `map` over a chunked source (`Vec`, `Range`, `Array`, `SubVec`)
+runs `f` for a chunk of 32 elements before the first is consumed, so `(first (map f (range 100)))` calls `f` 32 times in Clojure **[K]**; the stage ran it for `map`:
+`take` of 1, 32, 33 and 40 elements over a range of 100, 1 over a range of 10 and 5 over an empty range call `f` `[32 32 64 64 10 0]` times under both tools ([R] A12 chunk),
+with one 32-slot buffer per traversal of the mapping stage and none per element (**[H]** for the other adaptors: `filter`, `keep` and `mapcat` chunk the same way in Clojure and were not written).
+The rule says to replicate all of them, and the owner may strike any row: each is a one-line change either way (§9.1 Q33). The one place where a replicated behaviour gives up determinism is a `sort` over floats that
 contain a NaN (§2.7).
+
+### 5.7 Where the page follows the cost side (K): for the owner to confirm
+
+| # | Clojure | Here | Why, and what differs |
+|---|---|---|---|
+| K1 | a lazy seq is cached: `(map f c)` traversed twice calls `f` once per element | a recipe is **consumed once** (affine): a second use of the same recipe value is the error `recipe already consumed`, and `seq`, `doall`, `vec` or `cache` make a value that is traversed twice (§2.1 rule 2) | a **cost** reason, not a safety or a typing one: the rule's answer is a cell per element per stage (5 calls and one object per element, [R] A11 t21), which the owner's other aim excludes. What differs: a program that compiles makes Clojure's calls to `f`, except that a peeked recipe (`first`, `empty?`) runs its first element's `f` again; Clojure text that traverses one lazy value twice is rejected with the cure in the message. The use-count rule that the first rewrite recommended is unsound (A12 q34). §9 Q34 is where the owner decides |
 
 ## 6. Where the library lives
 
 ### 6.1 What exists today [R] A9
 
-`fib.prelude` is `lib/prelude.fib`, 491 lines, compiled into the binary, read, expanded and checked
+`fib.prelude` is `lib/prelude.fib`, 491 lines at HEAD (522 in the working tree, uncommitted: another agent's edit, which includes a different `hash-combine`, §2.7), compiled into the binary, read, expanded and checked
 together with the program on every run. Other modules load from **the main file's directory only**
 (`a.b` is `a/b.fib` beside the main file): there is no library root, no environment path, no cached
 interface and no re-export. **Two `:use`d modules that export one name do not make an error: the first
@@ -1851,7 +2085,7 @@ lib/prelude.fib      shrinks to the glue over the primitives: println, eprintln,
 lib/fib/core.fib     Option helpers, Pair Triple Step Result, Unit and the numeric functions, compare, the combinators,
                      Eq Ord Hash Show Debug for the collections                                      implicit :use
 lib/fib/seq.fib      Reducible, Cursor, sources, recipes, consumers, sort, Xf                        implicit :use
-lib/fib/coll.fib     the key-addressed protocols, Vec (trie), List, Map and Set (HAMT), Slice,
+lib/fib/coll.fib     the key-addressed protocols, Vec (trie), List, Map and Set (HAMT), SubVec, VSeq,
                      get-in family, merge, group-by, frequencies                                     implicit :use
 lib/fib/print.fib    println print pr prn str format printf (the macros), Show/Debug helpers         implicit :use
 lib/fib/sorted.fib   SortedMap SortedSet (B-tree), Queue                                             require
@@ -1882,7 +2116,7 @@ A macro costs nothing under `fibref` and about 80 to 85 ms under `fibc`, once pe
 program: one JIT module each ([R] A9: an empty `main` 0.10 s; 1, 5, 20 distinct macros 0.20, 0.50,
 1.70 s; `fibref` 0.20 s for 20). So a macro that every program uses is a Rust prelude macro, like `when`
 and `->`: **`str`, `println`, `print`, `prn`, `pr`, `swap!`, the variadic folds of `+ - * < > <= >= = max
-min merge conj assoc dissoc bit-and bit-or bit-xor`, the literals `{..}` (`hash-map`) and `#{..}`
+min merge conj assoc dissoc bit-and bit-or bit-xor`, the literals `{..}` (`array-map`) and `#{..}`
 (`hash-set`), `if-not`, `when-not`, `defn`, `defn-`, `some` (by argument count), `update`, and `list`** (E1),
 each specified by a case that quotes its expansion. The list is thirty-two, two swapped against the first version:
 **`comp` and `partial` leave** (they are arity-reading checker forms, L22, which a macro cannot be because it cannot
@@ -1972,11 +2206,11 @@ byte for byte. The first version listed only E1; this is the whole list, so the 
 |---|---|---|---|
 | E1 macros (§6.3) | the 32 Rust macros, each specified by a case that quotes its expansion | T0 | `list` expands to qualified names; `for-each`/`range`/`dotimes` counting loops stay; `defn` converts bracket parameters |
 | E3, E4 | bracket binding forms; flat `cond` (six call sites in three files of `compiler/`: `jit-demo.fib`, `syntax/lexer.fib` x3, `lair/call.fib` x2, besides the Rust macro `logic.rs` and two Rust test files) | T2 | additive; replacement |
-| E8, E14 | `#(..)` and `#{..}` read as forms; `~x`, `~@x` with the comma as whitespace, `x#`, `#'x`, `#"re"`, radix, `1N 1M 1/2`, `##Inf`, `#?`, `#tag`, `^`, `::kw` | T2, T3 | four pinned reader tests turn from errors into reads (`compiler/tests/reader/harness-067-hash-paren.fib`, `harness-068-hash-brace.fib`, `reader-218-dispatch-brace.fib`, `reader-220-dispatch-paren.fib`), the comma change touches every `,x` of `lib/`, `compiler/` and the cases, and `spec/bootstrap.md` §2 defines no dump line for a form the reader synthesises (the position of the generated `fn`): it must be added in the same commit (§9 Q38) |
-| L1, L7, L8, L3b, L6, L9, L14, L15, L21 | arity clauses (a constructor clause for `some`), irrefutable patterns in parameters, refutable and prefix `let`, tuple patterns, or-patterns, `{:keys ..}` with `:or`, keyword and collection in call position, `def` initialisers and the module init | T2, T3 | each changes the expander or the checker that M6 steps 2 to 4 reproduce |
-| L20, L22, L24, L25, L26 | truthiness (`if`/`and`/`or`/`when`/`cond`), arity-reading forms, joins and families, heterogeneous literals, literal widths and promotion | T2, T3, T4 | the checker; each is a rule over the types the checker has already solved, so stage 4 (the checker) carries them |
+| E8, E14 | `#(..)` and `#{..}` read as forms; `~x`, `~@x` with the comma as whitespace, `x#`, `#'x`, `#"re"`, radix, `1N 1M 1/2`, `##Inf`, `#?`, `#tag`, `^`, `::kw` | T2 (E14a), T3 (E14b), T5 (E14c) | four pinned reader tests turn from errors into reads (`compiler/tests/reader/harness-067-hash-paren.fib`, `harness-068-hash-brace.fib`, `reader-218-dispatch-brace.fib`, `reader-220-dispatch-paren.fib`), the comma change touches every `,x` of `lib/`, `compiler/` and the cases, and `spec/bootstrap.md` §2 defines no dump line for a form the reader synthesises (the position of the generated `fn`): it must be added in the same commit (§9 Q38) |
+| L1, L2, L7, L8, L3b, L6, L9, L14, L15, L21 | arity clauses (a constructor clause for `some`), rest parameters `& xs`, irrefutable patterns in parameters, refutable and prefix `let`, tuple patterns, or-patterns, `{:keys ..}` with `:or`, keyword and collection in call position, `def` initialisers and the module init | T2, T3 | each changes the expander or the checker that M6 steps 2 to 4 reproduce |
+| L20, L22, L24, L25, L26, L30, L31 | truthiness (`if`/`and`/`or`/`when`/`cond`), arity-reading forms, joins and families, heterogeneous literals, literal widths and promotion, integer `/` as a `Ratio`, static predicates | T2, T3, T4 | the checker; each is a rule over the types the checker has already solved, so stage 4 (the checker) carries them |
 | L16, L17, L23 | determined variables in an impl context; `derive Debug`/`ToStr` and the derive-by-default decision; multi-parameter dispatch (§9 Q39) | T2, T3 | the checker; the Rust `derive` module |
-| L13 | a warning for an unconsumed recipe (§7) | T2 | a new diagnostic class and a type attribute: the compiler has no warnings today |
+| L13 | affine recipes: a second use of a recipe value is an error (and an unconsumed recipe a warning) (§7) | T2 | a new type attribute and a use-after-move check in the checker; the compiler has no warnings today |
 | E11 | macro templates resolve in the defining module | T2 | the expander |
 | C1 to C11 | closure types, last-use move, exclusive `&`, array primitives, unboxed `Option`, `-O` defaults, move-out of an owned shell, one shared closure environment, the mutex, the ASCII flag, the binding slot | T3 and after | lowering, the runtime and the ownership checker |
 | `format`, `printf` | directives `%s %d %f %x`, with width, zero fill and case: `%4d`, `%04X` | T4 | the compiler's reader dump needs `{:04X}` and `U+0041` (`compiler/util/text.fib`'s `hex-upper`); until `format` has them `hex-upper` stays, and ROADMAP rule 6 puts formatting for diagnostics first, so the directives with width and fill move to **T1** if the owner agrees (§9 Q29) |
@@ -1990,9 +2224,9 @@ Ranked by what they unblock for the library, cheapest first within a tier. Sizes
 **Evidence** is a program in Appendix A that was run (**[sketch]** where the change cannot be prototyped
 without editing the compiler: the failing program is quoted and the change is described). "Needed by" names the first
 tranche (§8) that cannot ship without it; every row also has the stand-in the library uses until it lands.
-The rule (§1.1) is what adds L20 to L29, E14, E15, B5 and C8 to C11: each is a place where Clojure's text is
+The rule (§1.1) is what adds L20 to L31, E14, E15, B5 and C8 to C11: each is a place where Clojure's text is
 feasible and no memory-safety failure forbids it. They change types or syntax the owner decided, so the owner signs each
-(P8); L16, L19, Q15 and Q28 are already **Decided** (owner, 2026-10-01, by the rule).
+(P8); L16, L19, Q15 and Q28 are already **Decided** (owner, 2026-10-01; §9.1 says which of them the rule settles and which edits of the other specs each needs, §7.4).
 
 ### 7.1 Stage-1 divergences (method rule 6: the interpreter and the compiler must agree)
 
@@ -2004,12 +2238,12 @@ feasible and no memory-safety failure forbids it. They change types or syntax th
 | B4 | polymorphic recursion: `fibc` never finishes monomorphising, `fibref` runs | `(defun len (xs: c) :where ((Reducible c e)) -> i64 (if (empty? xs) 0 (+ 1 (len (drop 1 xs)))))` and `(len [1 2 3])`: `fibc` is `memory allocation of 577136 bytes failed` under `ulimit -v 4000000`, `fibref` is `result: 3` ([R] A10 poly). Both tools must reject a function that calls itself at a strictly larger type, with a message that names it (`len recurses at (Dropped c e): polymorphic recursion is not supported; use loop or a List`) | small | T2 (before `rest` ships; without a bound the monomorphiser takes the machine down) |
 | B5 | `fibc` lowers a struct constructor passed as a function value; `fibref` already runs it | `(map Pair xs ys)`-style use of a constructor as a value: `fibc` says `unsupported: a constructor as a value` and `fibref` returns 2 ([R] A11 t86); `->Name` and `(map ->Point xs ys)` need it | small | T2 (`->Name`, `vector` as a function value) |
 
-### 7.2 Language and expander (small to medium each; L16 and L19 are Decided, L20 to L29 are the changes the rule requires)
+### 7.2 Language and expander (small to medium each; L16 and L19 are Decided, L20 to L31 are the changes the rule requires)
 
 | # | Change | Evidence | Needed by |
 |---|---|---|---|
 | L1 | **Arity overloading, in Clojure's shape**: `(defn name ([a: T] -> R body) ([a: T b: T] -> R body))`, resolved by argument count in the expander; each clause has its **own** `-> R`, `:where` and `:private`, because `get` returns `(Option v)` in one arity and `v` in the other. Clojure's parameter vector `[x y]` tells a clause `([x] ..)` from a single-arity `[x] body`, so **no `:arity` marker is needed** for `defn` (the first version's marker was for `defun`'s parenthesised parameters, whose clause form collides with L7's patterns; `defun` keeps one clause); two clauses of one count are an error; a protocol method and clauses of other arities may share a name; **a clause may be a constructor's: `some` is `Option`'s constructor of one argument and Clojure's `some` of two**; `(gensym)` is a zero-argument clause | two `defun`s of one name: `f is already defined`; a protocol method and a `defun` of one name: `gg is already defined` (A6); `(get m 5 0)` is `get takes 2 argument(s), got 3` (§7 D1 makes the message say `use get-or`); a `defun some` of two parameters makes `(some 5)` `some takes 2 argument(s), got 1` ([R] A11 n13); `(gensym)` is `gensym takes 1 argument(s), got 0` (A11 gensym); `defn` with bracket parameters is a macro over `defun` that runs (A11 e10: 13 under both tools) | T2 (`get/3 nth/3 reduce/2 range/n sort/2 sort-by/3 map/3 subs/2 index-of/2 partition/n repeat/2 some/2 gensym/0`); T1 uses the stand-ins of §2.3, deleted when L1 lands. Moving L1 into T1 for two names was considered and rejected (§10) |
-| L2 | rest parameters `(defun f (a ... rest))` binding a `(Vec t)`; settle that `&` alone is reserved first | `(defun f (a: i64 & xs) ..)` compiles as a three-parameter function and `(f 1 2 3)` returns 1 (A6): a spec/code disagreement with syntax §1.1 | T3 (user variadics); the library's variadics are macros |
+| L2 | rest parameters `& xs`, as Clojure's, in `defn`, `fn` and `defmacro`, binding a `(Vec t)` (`...` stays accepted in `defmacro` until the macros of `lib/` and `compiler/` migrate); settle that `&` alone is reserved first (the pattern `[a & r]` keeps it) | `(defun f (a: i64 & xs) ..)` compiles as a three-parameter function and `(f 1 2 3)` returns 1 (A6): a spec/code disagreement with syntax §1.1 | T3 (user variadics); the library's variadics are macros |
 | L3 | `Pair`, `Triple` in the prelude (done in the prototype) | `(. (Pair 1 2) fst)` is `unbound name Pair`; a user-defined generic struct works (A6) | T1 |
 | L3b | tuple-like structs (`Pair Triple`) accept vector patterns `[k v]` | `(match (Pair 1 2) ([a b] ..))` is `cannot unify (Pair i64 i64) with (Vec a)` (A6) | T2 (`(fn [[k v]] ..)`, `for [[k v] m]`) |
 | L4 | **static protocol methods** (no `self`, dispatched on the type the context expects, as Rust's `Default::default()`) | `(defprotocol Dflt (dflt () -> Self))` is `a method is (name (self qual* x: T qual*) -> type)` (A6); the `Unit` witness works meanwhile (A7) | T3 (`assoc-in` creating levels, generic `sum` of an empty source, `(+)`) |
@@ -2021,23 +2255,25 @@ feasible and no memory-safety failure forbids it. They change types or syntax th
 | L10 | wrapping integer builtins `unchecked-add -subtract -multiply -negate -inc -dec` at the operand's width; `lIR`'s `add sub mul` already carry no overflow flags | `(+ 9223372036854775807 1)` is `trap: integer overflow in + at i64` (A6) | T3 (the multiplicative hash finaliser, generators). **Not T1**: the rotate-and-xor `hash-combine` of tranche 1 needs only `shl shr bit-or bit-xor`, which do not trap ([R] A10 hash) |
 | L11 | exact math as builtins (`sqrt floor ceil rint copysign`); `extern` accepted by `fibref` | `(unsafe (fptosi i64 (sqrt 49.0)))` with `(extern sqrt :private (f64) -> f64)`: `fibc` prints 7, `fibref` says `unsupported: extern sqrt is not available in the reference interpreter` (A6) | T4 |
 | L12 | `Result` in the prelude, and a scope-exit hook (a `Drop`-like protocol) for non-memory cleanup; **not `try!`**: there is no early return, so the threading form is the block macro `try-let` (§2.10), which needs no language change | `Result` is `compiler/util/result.fib` only; `(defmacro try! (r) `(match ,r ((Ok v) v) ((Err e) (return (Err e)))))` is `unbound name return`, and `try-let` runs, 106 under both tools ([R] A10 try) | T1 (`Result`), T2 (`try-let`), T5 (`with-open`, `line-seq`) |
-| L13 | a **warning** for a value of an adaptor type that is dropped unconsumed, as a statement: **medium, not small**: a new diagnostic class and a type attribute ("must be consumed"). Clojure accepts `(map println xs)` as a statement (and does nothing), so under the rule it is a lint and not an error; the first version recommended an error | none: a requirement of P2 (a recipe not run is silent); the compiler has no non-fatal diagnostic of any kind (`grep -rniE warning crates/fibref/src crates/fibc/src` finds one test-harness name) | T2 |
+| L13 | **Affine recipes** (§2.1 rule 2, §5.7 K1): a recipe type is consumed by a by-value use, a second use of the same value is the error `recipe already consumed: to traverse it twice use (seq r), (doall r), (vec r) or (cache r)`, a consumer that stops after at most one element (`first empty? some every? not-any?`) takes its argument `:borrow`, and a closure that consumes a captured recipe may be called once (Rust's `FnOnce`); and a **warning** for a recipe dropped unconsumed as a statement (Clojure accepts `(map println xs)` and does nothing, so that is a lint). **Medium to large**: a type attribute and a use-after-move check in the checker, and a new diagnostic class (the compiler has no non-fatal diagnostic of any kind: `grep -rniE warning crates/fibref/src crates/fibc/src` finds one test-harness name) | today's checker moves nothing: a non-Copy struct passed to a function twice gives 6 and `explain` says `arg 1 w: borrow` for both calls, and with a stored (owned) parameter `retain` for both ([R] A12 aff1, aff2); the use-count rule fails, a recipe mentioned once and traversed three times calls `f` 6 times, `[6]` and `[6]` (A12 q34); the run-time form, a flag cell in each recipe, traps `recipe already consumed` (A12 aff3) but a recipe that holds a `Cell` cannot cross a task (A10 col) | T2 (the owner's §9 Q34; until it lands S14) |
 | L14 | a keyword that unifies with `(fn (S) T)` elaborates to `(fn (x) (. x k))` when `S` is a struct with that field and to `get` when `S` is a `(Map keyword v)`; `(:k x)` in head position is the same rule; `(:k x d)` supplies a default. L21 generalises it to `Map`, `Set` and `Vec`. The narrow rule needs no choice of call-position semantics; the alternative is a reader form `.name` for `(fn (x) (. x name))` | `(:a {:a 1})` is `cannot unify keyword with (fn (a) b)` (A6, [R] A11 k1); `(map :name ps)`, `(sort-by :age ps)`, `(group-by :dept ps)`, `(filter :active ps)` are the commonest Clojure lines, and the group-by-then-count idiom is 46 tokens against Clojure's 29 without it | T2 |
 | L15 | `def` initialisers: **any expression**, evaluated once before `main` in module order by an init function per module (Clojure evaluates them at load); a top-level `atom` is allowed; **the type of a `def` may not contain a `Cell` or a `Weak`** (not `Send`: a global `Cell` is reachable from every task, §5 M1); top-level forms that register (`defmethod`, `add-tap`) run in the init | `(def ok: (Set i64) (set [1 3]))` is `def ok: initialiser is not a constant expression`; so are `(def v: i64 (f 2))` and `(def counter: (Atom i64) (atom 0))` ([R] A10 def, A11 t56, n8b), while `(def v: (Vec i64) [1 2 3])` and `(def m: (Map i64 i64) {1 2})` run; `(def c: (Cell i64) (cell 0))` is the same error (n8); `#{1 2}` becomes `(hash-set ..)` with E8 | T2 (`(def stopwords #{"a" "the"})`, `(def table (zipmap ..))`), T4 (`rand`, `atom`s) |
 | L16 | **Decided** (owner, 2026-10-01, by the rule). An impl's context (and a method's own variable) may name a type variable that a constraint determines from the head through a protocol's determined parameter (`(Cursable c k)` determines `k`): the liberal coverage condition, as Jones's functional dependencies give. It gives `Lookup` for `(Option s)` (a lookup through `nil`), bufferless cursors for `Mapped Dropped Taken Zipped`, and push visitors with a bound | `(impl (Cursable (Wrap k)) (Src c) :where ((Cursable c k)) ..)` is `type variable k is not a parameter of the impl head` ([R] A10 cur-impl, A11 t23, t61b); the same rule rejects an impl for the cursor of an adaptor and a push `Each` protocol whose visitor is a protocol parameter (`push1.fib`), and `a method is (name (self qual* x: T qual*) -> type)` rejects a bound on a method's own variable (`push2.fib`, A10 push); a nested head `(Option (Map k v))` is `an instance head is a type constructor applied to distinct variables` (A11 e5) | T2 (`(get (get m :a) :b)`; adaptor cursors without the buffer); C1's push chain |
-| L17 | `derive Debug` and `ToStr` (and the text of every type of §2.7); **`defstruct` and `defenum` derive `Eq Ord Hash Show Debug ToStr` by default when every field has them** (settled by the rule: a Clojure record is `=`, `hash` and printable); `(derive ..)` stays for the rest and a qualifier opts out | `(derive Debug P)` is `cannot derive Debug: only Eq, Ord, Hash and Show` under both tools; `(= (P 1 "x") (P 1 "x"))` is `no implementation of Eq for P` (A10 dd); derived `Show` prints `(P 1 x)` | T1 (`Debug`), T2 (the default) |
+| L17 | `derive Debug` and `ToStr` (and the text of every type of §2.7); **`defstruct` and `defenum` derive `Eq Ord Hash Show Debug ToStr` by default when every field has them** (settled by the rule: a Clojure record is `=`, `hash` and printable); `(derive ..)` stays for the rest and a qualifier opts out | `(derive Debug P)` is `cannot derive Debug: only Eq, Ord, Hash and Show` under both tools; `(= (P 1 "x") (P 1 "x"))` is `no implementation of Eq for P` (A10 dd); derived `Show` prints `(P 1 x)` today, and the page's text is `#m.P{:x 1, :y x}` (§2.7) | T1 (`Debug`), T2 (the default) |
 | L18 | builtins `(str-byte-at s i)` (one byte, no allocation, traps out of range) and `(str-find s pat from)` (the first byte offset at or after `from`) in both tools | `(str-bytes s)` allocates a fresh array per call: 100 objects for 100 calls (A10 str), so `str/index-of` from an offset is O(n) copying per call and a tokenizer O(n²) | T1 (every string function of §4.7) |
 | L19 | **Decided** (owner, 2026-10-01, by the rule): an integer literal whose value is exactly representable adopts a float type when it unifies with one; a variable never does through this rule. L26 extends the same mechanism to the integer widths | `(* 2 1.5)` is `cannot unify f64 with i64` (A6, [R] A11 n2); `(+ x 1)` with `x: i32` is `cannot unify i64 with i32` (n3c) | T2 (`(* 2 x)`, `(/ x 2)`, `(+ x 1)` on doubles) |
 | L20 | **Truthiness, typed.** A test of `if`, `when`, `while`, `cond`, `and`, `or`, `not`, `when-not`, `if-not`, `cond->` and `some->` accepts `bool` or `(Option T)` (truthy when `true` or `(some _)`; `(Option bool)` truthy when `(some true)`, Clojure's `false`); `and` has the type of its last operand; `or` is typed by its last operand (`(or (Option T) T)` is `T`, `(or (Option T) (Option T))` is `(Option T)`, `(or bool bool)` is `bool`); a one-armed `if`/`when`/`cond`/`when-let` is `unit` for a unit body and `(Option T)` with `some` around the body otherwise; any other type as a condition is a compile error. Both tools; `and`, `or` and `when` become checker forms. **[sketch]** | `(if (get m 1) 1 2)` and `(or (get m 2) 7)` are `cannot unify (Option i64) with bool` ([R] A11 t01, t02), `(if 5 1 2)` `cannot unify i64 with bool` (t03), `(when c 5)` `cannot unify unit with i64` (t82); the library form runs: `Truthy` and macros give `if`, `or`, `and`, `when` over `bool` and `Option`, 127 under both tools (t04), a predicate with a `Truthy` result 4 (t05), a macro that wraps in `some` 12 (t83); `(if* (some false) 1 0)` is 1, so `(Option bool)` needs its own rule (e2b); one `or` for two result types overlaps, `overlapping instances: Or2 for (Option a)` (e2, t70); no blanket impl, `an instance head must not be a type variable` (t06); the elaboration is a direct call to an identity (`fibc emit`, A11 e1z); run-time cost nil. small-medium | T2 (`if-let`, `when-let`, `some`, `filter` over `Option`) |
 | L21 | **Callable collections and keywords.** A `Map`, `Set`, `Vec` and keyword in call position, and where a `(fn (A) R)` is expected, elaborate to the `get` eta-expansion of §2.11; `(assoc r :k v)` and `(update r :k f)` on a struct with a literal keyword elaborate to `with`; after C1 `Fn` is a protocol and each is one `impl`. **[sketch]** | `cannot unify (Map i64 i64) with (fn (a) b)` ([R] A11 t51, n5), `(Set i64)` with `(fn (a) bool)` (n6), `keyword` (k1), `(Vec i64)` (k2); `(assoc p :x 5)` is `no implementation of Associative for P` (t53); the literal-keyword macros run, 30 31 32 (e14). medium | T2 (keyword), T3 (the collections) |
-| L22 | **Arity-reading forms**: `partial`, `comp`, `complement`, `juxt`, `every-pred`, `some-fn`, `memoize`, `fnil`, `constantly` (arity from the expected type) and `apply` (a literal vector spreads; a runtime collection checks its count; a table names the variadic folds) are core forms the checker elaborates from the `(fn (A..) R)` of their function arguments; `some->` and `some->>` (a step that returns an `Option` is kept, a plain value wrapped) are the same mechanism. **[sketch]** | `(partial add3 1)` is `cannot unify (fn :send (i64 i64 i64) i64) with (fn (a b) c)`, `(comp inc add2)` `cannot unify (fn :send (i64 i64) i64) with (fn (a) i64)`, `(constantly 7)` where `(fn (i64 i64) i64)` is expected `cannot unify (fn (a) i64) with (fn (i64 i64) i64)` ([R] A11 arity..arity4); `apply` as a macro runs for a literal vector and the named folds: 6, 3, 6, `312` (e12); a library cannot tell an `Option`-returning step from a plain one (t06). medium | T3 |
-| L23 | **Multi-parameter dispatch** (**owner's decision**: a type-system change): a protocol may declare several dispatch parameters, an instance is keyed by the heads of all of them, an overlap check runs on the product and ambiguity is reported (types §3.3, §4), with L16. As library code it gives `or`/`and` by operand types, `=` across families, `(into {} [[1 2]])` (a two-element `Vec` entry beside the `Pair` entry), `merge` with `nil`, `str/replace` by replacement type, `(Option bool)` in predicate position and the numeric protocols of L26. Every use has a cheaper checker rule (L20, L24) if the owner does not take it (§9 Q39) | `overlapping instances: OrHit for (Option a) is already implemented` ([R] A11 t70), `overlapping instances: Collection for (Map k v) is already implemented` (t71), `an instance head is a type constructor applied to distinct variables` (t61), `type variable k is not a parameter of the impl head` (t23, t61b). large | none required; T3 if taken |
+| L22 | **Arity-reading forms**: `partial`, `comp`, `complement`, `juxt`, `every-pred`, `some-fn`, `memoize`, `fnil`, `constantly` (arity from the expected type) and `apply` (a literal vector spreads; a runtime collection checks its count; a table names the variadic folds) are core forms the checker elaborates from the `(fn (A..) R)` of their function arguments; `some->` and `some->>` (a step that returns an `Option` is kept, a plain value wrapped) are the same mechanism, and so is a **`fn` literal with several arities or a rest parameter, and `%&`**: at a call site whose expected type `(fn (A B) R)` is known (`reduce`, `map`, `sort-by` comparators, `apply`) the literal keeps the clause of that arity (the rest parameter binds the `Vec` of the remaining arguments when they unify); a multi-arity function that is stored or returned has no single type and stays out (§5 T2). **[sketch]** | `(partial add3 1)` is `cannot unify (fn :send (i64 i64 i64) i64) with (fn (a b) c)`, `(comp inc add2)` `cannot unify (fn :send (i64 i64) i64) with (fn (a) i64)`, `(constantly 7)` where `(fn (i64 i64) i64)` is expected `cannot unify (fn (a) i64) with (fn (i64 i64) i64)` ([R] A11 arity..arity4); `apply` as a macro runs for a literal vector and the named folds: 6, 3, 6, `312` (e12); a library cannot tell an `Option`-returning step from a plain one (t06). medium | T3 |
+| L23 | **Multi-parameter dispatch** (**owner's decision**: a type-system change): a protocol may declare several dispatch parameters, an instance is keyed by the heads of all of them, an overlap check runs on the product and ambiguity is reported (types §3.3, §4), with L16. As library code it gives `or`/`and` by operand types, `=` across families, `(into {} [[1 2]])` (a two-element `Vec` entry beside the `Pair` entry), `merge` with `nil`, `str/replace` by replacement type, `(Option bool)` in predicate position and the numeric protocols of L26. Every use has a cheaper checker rule (L20, L24) if the owner does not take it (§9 Q39) | `overlapping instances: OrHit for (Option a) is already implemented` ([R] A11 t70), `overlapping instances: Collection for (Map k v) is already implemented` (t71), `an instance head is a type constructor applied to distinct variables` (t61), `type variable k is not a parameter of the impl head` (t23, t61b). large | T3 (taken: §9 Q39) |
 | L24 | **Joins and families.** (a) At an `if` or `match` join whose arms are distinct types that are both `Reducible` of one element type (recipes, `Vec`, `List`), unify at `(dyn (Reducible e))`: C1's erasure rule extended to recipes; (b) `(= a b)` with operand types of one family (sequential, map, set) elaborates to `seq=` or its map and set twins. **[sketch]** | `(if flag (filter p v) v)` is `cannot unify (Vec i64) with (Filtered (Vec i64) i64)` ([R] A10 join); `(seq-of ..)` at both arms runs; `(= [1] (range ..))` is `cannot unify Range with (Vec i64)` (A11 n4), `seq=` runs (A10 showseq). medium | T3 |
 | L25 | **Heterogeneous literals.** A map literal whose values do not unify elaborates to `(Map keyword Val)` with `to-val` on each value; a two- or three-element vector literal whose elements do not unify is a `Pair`/`Triple` (a homogeneous one stays a `Vec`), so `(into {} [[:a 1]])` and `(map vector ks vs)` follow Clojure; `Val` is `fib.data`. **[sketch]** | `[1 "a"]` and `{:a 1 :b "x"}` are `cannot unify i64 with str` ([R] A11 k8, t91, t92); `Val` with `to-val` runs, `{:name "ann", :inner {:tags ["a" "b"], :x 1}}` and a runtime `get-in-v` (e17). small-medium | T3 (literals), T5 (`Val`) |
-| L26 | **Numbers.** (a) literal adoption across integer widths and `f32` (L19's mechanism); (b) operator-level promotion for variables along `i8 < i16 < i32 < i64 < f64`, `f32 < f64` at the numeric builtins and at parameters declared `f64`/`f32` or a wider integer, never narrowing and never at `let`, return or field; (b) lifts types §1.1 D3 and is §9 Q36. A deferred constraint in the checker and in `fibref`; a generic `(defun add (a b) (+ a b))` stays `∀a. (Num a) ⇒ a a → a`. **[sketch]** | `(+ n 2.5)` is `cannot unify f64 with i64` ([R] A11 n1), `(< n 2.5)` (n10), `(f 2)` for `(f x: f64)` (n11), `(/ (reduce-sum xs) (count xs))` into an `f64` (t85), `(* x 2)` with `x: f64` (t63), `(+ x 1)` with `x: i32` (n3c); `(/ (sitofp f64 n) (sitofp f64 m))` is 25 (t84). medium | T3 (a), T4 (b, if signed) |
+| L26 | **Numbers.** (a) literal adoption across integer widths and `f32` (L19's mechanism); (b) operator-level promotion for variables along `i8 < i16 < i32 < i64 < f64`, `f32 < f64` at the numeric builtins and at parameters declared `f64`/`f32` or a wider integer, never narrowing and never at `let`, return or field; (b) lifts types §1.1 D3 and is settled by the rule (§9.1 Q36). A deferred constraint in the checker and in `fibref`; a generic `(defun add (a b) (+ a b))` stays `∀a. (Num a) ⇒ a a → a`. **[sketch]** | `(+ n 2.5)` is `cannot unify f64 with i64` ([R] A11 n1), `(< n 2.5)` (n10), `(f 2)` for `(f x: f64)` (n11), `(/ (reduce-sum xs) (count xs))` into an `f64` (t85), `(* x 2)` with `x: f64` (t63), `(+ x 1)` with `x: i32` (n3c); `(/ (sitofp f64 n) (sitofp f64 m))` is 25 (t84). medium | T3 (a), T4 (b, if signed) |
 | L27 | **Metadata**: a `(Option (Map keyword Val))` field on the four collection headers and on structs, ignored by `Eq` and `Hash`; `^{..}` and `^:k` read as `with-meta` forms. **[sketch]** | none: no program of the review needs it; `meta` and friends are Clojure names (§4.3) | T5 |
-| L28 | **Exceptions**: `throw`, `try`, `catch`, `finally` by unwinding: either a landing-pad `invoke` in lIR, or a transitively inferred "may throw" effect that makes each such function return a hidden `Result` and reuses the release code of the normal return; the first step is a task's trap returned by `join`. **The owner's decision** (amends types §2.11, §9 Q35). **[sketch]** | `trap` in a spawned task: `trap: boom` then `Aborted` under `fibc`, `trapped:` under `fibref` ([R] A11 t40, e9); lir.md `(trap)` is `llvm.trap` "without unwinding"; the ownership checker already computes the live owned locals of every scope exit (types §6.3). large | T5 (after viability) |
-| L29 | **Dynamic vars**: the `:dynamic` qualifier on `def` and a `binding` core form that pushes and pops at the scope exit and is conveyed into `spawn` as a captured `Send` value (runtime C11); `*out*`, `*in*`, `*print-length*`, `with-out-str`, `with-redefs` are libraries over it. **[sketch]** | `(def :dynamic *x*: i64 1)` does not exist; no program can show it | T5 |
+| L28 | **Exceptions**: `throw`, `try`, `catch`, `finally` by unwinding: either a landing-pad `invoke` in lIR, or a transitively inferred "may throw" effect that makes each such function return a hidden `Result` and reuses the release code of the normal return; the first step is a task's trap returned by `join`. **The owner's decision** (amends types §2.11; the rule settles it, §9.1 Q35). **[sketch]** | `trap` in a spawned task: `trap: boom` then `Aborted` under `fibc`, `trapped:` under `fibref` ([R] A11 t40, e9); lir.md `(trap)` is `llvm.trap` "without unwinding"; the ownership checker already computes the live owned locals of every scope exit (types §6.3). large | T5 (after viability) |
+| L29 | **Dynamic vars**: the `:dynamic` qualifier on `def` and a `binding` core form that pushes and pops at the scope exit and is conveyed into `spawn` as a captured `Send` value (runtime C11); `*out*`, `*in*`, `*print-length*`, `with-out-str`, `with-redefs` are libraries over it; `with-redefs` marks, for the whole program, each function that some `with-redefs` names, and calls it through a global `Atom` slot. **[sketch]** | `(def :dynamic *x*: i64 1)` does not exist; no program can show it | T5 |
+| L30 | **Integer `/` is exact** (§2.8, §5 D4): on two integers `/` elaborates to `rdiv`, a `(Ratio t)` over the operand type (`(Ratio BigInt)` for `BigInt` operands); the builtin truncating method is named `quot`; `(Ratio t)` is a library type with `Num Eq Ord Hash Show` that traps on overflow at its width (`Num` and `Show` ran, A12 ratio). Types §2.12's wording of integer `/` is amended (§7.4); the compiler's one `(/ limit radix)` (`compiler/syntax/number.fib`), the three case files that divide integers, the generator and two unit tests migrate to `quot` (§8.3). Small in the checker, a library type | `(/ 7 2)` is `3` today ([R] A11 k9); a generic `Ratio` over `i64` and `i32` runs under both tools: `[7/2 2 -3/2 -7/2]`, `5/6`, `7/2`, and the overflow trap `integer overflow in * at i64` (A12 ratio) | T3 (`Ratio` is in the tranche; S17 until then) |
+| L31 | **Static predicates** (§4.18): `string? vector? seq? number? satisfies? ...` are checker forms that fold to the constant `true` or `false` of the argument's static type, and over `Val` and `Form` are variant tests. **[sketch]** small | `(string? "a")` is `unbound name string?` ([R] A12 pred1); no program of the review exercises the fold | T3 |
 | E1 | the thirty-two Rust prelude macros of §6.3 (`str println print prn pr swap!`, the variadic folds, `{..}`, `#{..}`, `if-not`, `when-not`, `defn`, `defn-`, `some`, `update`, `list`), and the retargeted counting loop of `for-each`, `range` and `run!`/`doseq` over a literal range; a macro and the prelude function of one name coexist today (`swap!` over the builtin: 30 under both tools, A10 swap) | `+ takes 2 argument(s), got 3`, `unbound name str`, `println 5` is `cannot unify i64 with str` (A6); the fused loop of `(for-each (range 0 1000) (fn (i) ..))` has no call in `main`, the library spelling has a retain and two indirect calls per iteration (A10 forloop) | T0 |
 | E2 | the macro runner compiles all of a program's macros in one module (or runs small ones in the evaluator); calls to functions of required **and used** modules work at expansion time (the macro-time module is the transitive closure of both), and the two tools say the same thing when they do not. **Unproven**: syntax §3.16 says `(var m/f)` works, and no program of the review made it work | 1, 5, 20 macros: 0.20, 0.50, 1.70 s under `fibc` (A9). A macro that calls `(u/bump 3)`, or `((var u/bump) 3)`, of a required module is `macro twice failed: f4.fib:2:46: unbound name u/bump`/`var: no definition named u/bump` under both tools, and with `(:use mu)` and a bare `(bump 3)` `fibc` says `unbound name bump` while `fibref` says `macro twice calls bump, which is not available at expansion time; move bump to a required module`, although the module IS required ([R] A10 mh) | T2 |
 | E3 | bracket binding forms accepted beside the parenthesised: `let loop fn doseq for if-let when-let dotimes` | `(let ([a 1 b 2]) ..)` is `malformed let: a binding is (pattern expression) or (name: type expression)` (A6) | T2 |
@@ -2051,10 +2287,10 @@ feasible and no memory-safety failure forbids it. They change types or syntax th
 | E11 | a free symbol in a macro template resolves in the macro's **defining module** (Clojure's syntax-quote qualification), not at the use site; binders stay unrenamed (`gensym` covers them, syntax §3.16 declines hygiene), or at least the `fib.prelude/` treatment extends to every implicit `fib.*` module | a library macro `` `(first ,v) `` gives 1000, the user's `first`, from a module that defines one, and `no implementation of Seq` from one that does not (A10 hyg); the library's fibber macros (`for get-in case update-in`) and the Rust macros that expand to a `fib.coll` method (`conj assoc dissoc merge`) change meaning when the user writes `(defun filter ..)` or `(defun get ..)` | T2 (the first fibber macro that calls another function) |
 | E12 | two `:use`d modules that export one name: an error when the name is referenced unqualified, as `spec/syntax.md` §5 says; the code takes the first `:use` silently | `(:use y.m1 y.m2)` then `(peek 3)` is 3, `(:use y.m2 y.m1)` is 4, under both tools (A10 use). A spec rule and the code disagree; **reported, not changed** (§9 Q27) | T0 |
 | E13 | `if-let` expands to `(match e ((some p) a) (_ b))` so that a refutable pattern falls to the else (§2.4) | `(if-let ([a b] o) ..)` is `non-exhaustive match: missing (some [])` (A10 iflet); the same `match` written by hand returns 9 under both tools | T1 |
-| E14 | **Clojure's reader**: `~x` and `~@x` with the comma as whitespace (`[1,2]` is `[1 2]`); `x#` auto-gensym in a quasiquote; `#'x`; `#"re"`; radix literals `2r1010 36rZZ`; `1N 1M 1/2`; `##Inf ##-Inf ##NaN` (desugared to `f64-inf` and `f64-nan`); `#?(:fib x :default y)`; `#tag form`; `^T x`, `^{..}`, `^:k`; `::kw`. The M6 reader and its dump change in the same commit, and **every `,x` of `lib/`, `compiler/` and the cases migrates to `~x`** (§9 Q38) | `unknown reader syntax #(: only #_ is defined` (A6); syntax §1.1: a comma touching a form is the unquote, so `[1,2]` unquotes the 2; the 218 reader tests of `compiler/tests/reader/` pin today's reads. small each, large churn | T2 (with E8), T3 |
+| E14 | **Clojure's reader**: `~x` and `~@x` with the comma as whitespace (`[1,2]` is `[1 2]`); `x#` auto-gensym in a quasiquote; `#'x`; `#"re"`; radix literals `2r1010 36rZZ`; `1N 1M 1/2`; `##Inf ##-Inf ##NaN` (desugared to `f64-inf` and `f64-nan`); `#?(:fib x :default y)`; `#tag form`; `^T x`, `^{..}`, `^:k`; `::kw`. The M6 reader and its dump change in the same commit, and **every `,x` of `lib/`, `compiler/` and the cases migrates to `~x`** (§9 Q38) | `unknown reader syntax #(: only #_ is defined` (A6); syntax §1.1: a comma touching a form is the unquote, so `[1,2]` unquotes the 2; the 218 reader tests of `compiler/tests/reader/` pin today's reads. small each, large churn | T2 (E14a: `~x`, `~@x`, the comma as whitespace, `x#`, `#"re"`, with E8), T3 (E14b: `#'x`, `^T`, `::kw`, `##Inf`, radix literals), T5 (E14c: `1N 1M 1/2`, `#?`, `#tag`, `^{..}`) |
 | E15 | **Modules and names**: the Java class names `Math Long Integer Double Character System Thread` are implicit aliases of modules of that name; `ns` accepts `:refer`, `:only`, `:exclude` and `:rename` and a top-level `(require ..)`, `(use ..)`, `(alias ..)`, `(refer-clojure ..)` is hoisted into the `ns`; `declare` is a no-op | a module named `Long` gives `Long/MAX_VALUE` and `(Long/bitCount 255)` verbatim, `9223372036854775807` and 8 ([R] A11 e19); `ns` takes `:require` and `:use` only (syntax §5). small | T4 |
 | D1 | diagnostics: a type other than `bool` or `(Option T)` where a condition is wanted says `a value of type i64 is always true; write the test`; a transducer where a function is wanted says `compose with xf`; a call with one argument too many to `get`, `nth`, `reduce`, `sort`, `range` says `use get-or`, `nth-or`, `reduce1`, `sort-with`, `range-by` (until L1) | `cannot unify i64 with bool` (A11 t03), `cannot unify (Xf i64 i64) with (fn (a) b)` (A10 comp), `get takes 2 argument(s), got 3` | T1 |
-| H1 | the case harness reads an object count: a header `allocs: <= N` (a maximum), checked against the `A` lines of `fibc run --trace` (and `fibc itrace`, which gives the same count) | a case header is `spec expect result audit error trap`: no count (§2.5); `fibc run --trace` and `fibc itrace` print identical `A` counts, 2099 for the chain of A1 | **T0** (the count cases of §8.1 item 5 cannot be written without it) |
+| H1 | the case harness reads an object count: a header `allocs: <= N` (a maximum), checked against the `A` lines of `fibc run --trace` (and `fibc itrace`, which gives the same count) | a case header is `spec expect result audit error trap`: no count (§2.5); `fibc run --trace` and `fibc itrace` print identical `A` counts, 2099 for the chain of A1 | **T0** (the count cases of §8.1 item 5 cannot be written without it); **update:** `spec/method.md` of the working tree now defines the `allocs: <= N` header, and the case runners of `fibref` and `fibc` are modified there; whether both implement it was not run in this revision |
 
 ### 7.3 Compiler performance and runtime (medium each; the gates of P2 and P3, and of the rule's items)
 
@@ -2068,8 +2304,8 @@ feasible and no memory-safety failure forbids it. They change types or syntax th
 | C5 | unboxed `(Option scalar)` and small enums and structs by value (lIR already has by-value aggregates) | 100 calls returning `(Option i64)` and `(Step i64)`: 200 allocations (A5); `get` on a `(Map i64 i64)` allocates per lookup; `(first v)` in a loop of 1000 is +1000 objects, `zip` +1003, `keep` +1002 (A10 alloc) | medium-large | `get`, `first`, `reduce-while`, `Step`, `zip`, `keep`; scheduled with tranche 3, whose count cases for these stay `open` until it lands |
 | C7 | a `match` or field read on an owned shell that is dead afterwards **moves the payload out**: no retain of the field, no release of it with the shell | `bump` that matches an owned `(E1 n arr)` and writes `arr` through a cell: four chained calls on unique temporaries cost 10 objects (A10 own); a `self :owned` method on a struct with an array field, 1000 times in a loop: 2002 objects, `explain`: `(cell ..) arg 1 (. self a): retain`, `release [self] (exit)`; a struct held in a cell updates in place: 1000 `set-field! &c n ..` allocate nothing | medium | P3 for the existing `Vec` and `Map` (C2 to C4 fix only the caller's side, §2.5); the alternative is the struct `Vec` of §9 Q18 |
 | C8 | **one closure environment for a group of mutually recursive local functions** (`letfn`); no cycle is needed, as a local recursive closure already calls itself through its code pointer (ownership.md §6) | two local functions that reach each other through two cells run and `audit: clean=false leak-cycles=4 leaks=0 errors=0` under `fibref` ([R] A11 t55): a leak, not a safety failure | medium | `letfn` (T3) |
-| C9 | **a runtime mutex** `(Mutex a)` that owns its value: `locking`, and a run-once `LSeq`/`Delay` that crosses tasks | two tasks writing one `Cell` is rejected, `cell cannot be shared between threads` ([R] A11 t41); the `Cell` memo cannot cross (e8d), the `Atom` memo can but may run a thunk twice under a race (e8e) | medium | `locking`, thread-safe `LSeq` (T5) |
-| C10 | **an ASCII flag in the `str` header**, computed in the UTF-8 validation pass that already scans every constructed `str`: `count`, `nth`, `subs` and `index-of` by character offset are O(1) for ASCII text and a byte walk otherwise; a layout change in both tools **[sketch]** | validation happens at construction: `str-from-bytes: invalid UTF-8`, `str-slice [0, 1) splits a character` ([R] A11 t13, t12); a user `Reducible char` over `str` gives the semantics today (e3a, e3b) at O(n) | medium | the cost of Clojure's string unit (§9 Q37) |
+| C9 | **a runtime mutex** `(Mutex a)` that owns its value, the identity-keyed reentrant monitor table that `locking` needs (an entry made on the first lock and dropped when the last holder leaves), and a run-once `LSeq`/`Delay` that crosses tasks | two tasks writing one `Cell` is rejected, `cell cannot be shared between threads` ([R] A11 t41); the `Cell` memo cannot cross (e8d), the `Atom` memo can but may run a thunk twice under a race (e8e) | medium | `locking`, thread-safe `LSeq` (T5) |
+| C10 | **an ASCII flag in the `str` header**, computed in the UTF-8 validation pass that already scans every constructed `str`: `count`, `nth`, `subs` and `index-of` by character offset are O(1) for ASCII text and a byte walk otherwise; a layout change in both tools **[sketch]** | validation happens at construction: `str-from-bytes: invalid UTF-8`, `str-slice [0, 1) splits a character` ([R] A11 t13, t12); a user `Reducible char` over `str` gives the semantics today (e3a, e3b) at O(n) | medium | the cost of Clojure's string unit (§9.1 Q37) |
 | C11 | **a per-task binding slot** in the task header, copied into a spawned task's header from a `Send` capture | none: depends on L29 | medium | `binding`, `*out*` (T5) |
 
 An alternative to C1 that was proposed, specialising a callee on a literal closure passed to a
@@ -2078,6 +2314,26 @@ in an adaptor struct, so it does not reach the chain's user functions; it is not
 
 **What is not needed.** A transient API (the Clojure names are identity wrappers, §4.4); a Perceus-style reuse of matched shells (large; considered only
 if C2 to C4 leave the `Vec` header as the measured bottleneck); a rank-2 type; a second sequence protocol (the `Seqable` of §2.1 is the closed-rest form of the one that exists).
+
+### 7.4 Edits to the other specs (tasks, not made here)
+
+method.md says a decision is recorded in the spec chapter it affects, with the owner's sign-off. This page changes none of the other specs (the repository's
+other chapters are updated when each item is implemented); each item below lists what that edit is, so that it is not forgotten, and the owner's four decisions
+of 2026-10-01 are first (§9.1).
+
+| Item | Edit | Where |
+|---|---|---|
+| L19 (**Decided**) | an integer literal whose value is exactly representable adopts a float type when it unifies with one; the text "no literal polymorphism ... `(+ x 1)` pins" and the type-error example `(+ (i32 1) 2)` change, and L26 a extends it to the integer widths | types §1.1, §2.12; syntax §1.2 (literals); the cases that pin `cannot unify f64 with i64` |
+| L16 (**Decided**) | an impl's context and a method's own variable may name a type variable that a constraint determines from the head (the liberal coverage condition) | types §3.3 (Paterson condition), §4.1; syntax protocol declarations |
+| Q15 (**Decided**) | the integer hash becomes a 64-bit finaliser in one commit with the cases that pin its values (169, 178, 198 to 201) and the orders of maps of more than 8 entries; wrapping builtins (L10); `fibc build` at `-O 2` and `fibc run` at `-O 0` (C6) | types §2.12 (the `hash` of an integer is its value); compiler.md (build options); ROADMAP M7 rule 4 |
+| Q28 (**Decided**) | `first` of a `List` returns `(Option e)`: cases 01 and 61 are ported | cases 01, 61; the prelude; ROADMAP where case 01 is listed |
+| L30 (§5 D4) | integer `/` is a `Ratio`; the builtin integer division is `quot` | types §2.12 ("`/` rounds toward zero"); cases 102, 103, 190, `compiler/syntax/number.fib`, `crates/fibgen/src/gen/nums.rs` |
+| L26 b, Q36 (§5 D2) | mixed numeric operands promote at the operator | types §1.1 D3, §2.12 ("never a promotion") |
+| L20, L21, L22 | a condition accepts `(Option T)`; `Map`, `Set`, `Vec`, keyword callable; arity-reading forms; multi-arity literals at an expected type | syntax §3.4 (`if`), §4.3; types §1.4, §2.4 |
+| Q35, L28 (§5 D1) | `throw`, `try`, `catch`, `finally` | types §2.11 (abort-only, **Decided** 2026-09-28), syntax |
+| `Ord str` (§2.7) | strings order by UTF-16 code unit, not by scalar | types §2.12 (`Ord` for `str`); syntax §4.3 |
+| L2, E14 | `& xs` as the rest marker; Clojure's reader (`~x`, the comma as whitespace, `#'x`, `^T`, ...) | syntax §1.1, §1.2; spec/bootstrap.md §2 (the dump); the 218 pinned reader tests |
+| L13 (§5.7 K1) | recipes are affine | types §6 (ownership), ownership.md |
 
 ## 8. Implementation plan
 
@@ -2138,18 +2394,21 @@ method.md applies: nothing is done until a test that can fail says so. A tranche
 
 | T | Content | Needs (§7) | Test emphasis | Rows |
 |---|---|---|---|---|
-| 0 | the library root and re-export; the thirty-two Rust macros of §6.3; `Hash f64`; `derive Hash` and `Hash (List a)` over `hash-combine`; the quasiquote fix; the protocol-mangling fix; the duplicate-`:use` check (if the owner agrees, §9 Q27); the harness's `allocs` header; the disjointness test of the four implicit modules as a CI gate | E7, E1, B2, B3, E10, E12, H1 | cases for each macro's expansion text; a `hash` of 14 strings and of a two-string struct that does not trap; both tools agree on B3's program | |
-| 1 | **what stage 2 needs.** `Pair Triple Step Result Unit`; `unwrap unwrap-or map-opt and-then`; `min max abs inc dec mod compare` (Clojure's, built on `<`); `hash-combine hash-ordered-coll hash-unordered-coll`; `Eq Ord Hash Show Debug ToStr` for `Vec Map Set Pair Triple` (`derive Debug`; `Ord` of a `Vec` by length first); `Reducible`, its sources (`Vec List Array Option Range Map Set Chars`) and `map filter remove take drop take-while concat mapcat`; `reduce reduce1 reduce-while first last nth find-first find-map every? not-any? any? count empty? run! quot`; `into vec set` (bulk builders); `sort sort-by sort-with sort-by-with reverse` (a comparator is a `Cmp`); `Lookup Assoc Dissoc Keyed Collection Emptyable Stack` with `get get-or assoc dissoc update update-or update-opt fnil contains? includes? keys vals key val merge group-by frequencies select-keys`; strings: `str` (`ToStr`), and qualified `str/join str/split str/split-lines str/trim str/triml str/trimr str/index-of str/includes? str/starts-with? str/ends-with? str/blank? str/chars`, with `subs str-len str-byte-at str-find`, `parse-long`, `digit? whitespace?`; `println print prn`, and their generic twins; `newline`; `write-file`; the builtins' names and Clojure aliases as §4.1; `defn defn-` (one clause) | T0, L3 (`Pair`, `Triple` in the prelude), L12 (`Result`), L17 (`Debug`), L18 (`str-byte-at`, `str-find`), E13 (`if-let` over `Option`), D1 | model tests for `Vec Map Set` and `sort`; laws; a hash law over strings; the integration test | 154 |
-| 2 | **the Clojure surface.** the rest of the sequence functions (`partition* interleave zip zip-with seq-of seq= map-indexed keep reductions distinct interpose drop-while second mapv filterv repeat iterate cycle some`), `Cursor` and the buffering `Cursable` adaptors; `Seqable seq rest next ffirst`; `LSeq lazy-seq lazy-cat doall dorun repeatedly` (effect-sourced sequences memoised); the small insertion-ordered `Map`; Clojure's printed forms; `for doseq cond if-not when-not as->`, `if-some when-some when-first declare defonce`; **truthiness (L20), the keyword in call position (L14, L21), `and`/`or` typed**; `partial` (one free) `partial2 complement constantly`; `with try-let defrecord ->Name vector volatile!`; the arity forms of §4 on L1, deleting the stand-ins; patterns in parameters, bracket forms; the reader additions of E8 and E14 | L1, L3b, L7, L8, L14, L15, L17, L19, L20, L21 (keyword), E3, E4, E8, E14, E11, L13, E2, B4, B5, E6 (`List`), E10 (`List`), L16 (**Decided**: adaptor cursors without the buffer, `Lookup` for `Option`) | the 60 programs of the design record (20 each from three designs, all ran) ported as cases; expansion texts; a recipe sent to a task; polymorphic recursion rejected by both tools; the failing programs of §5.5 S1, S2, S7, S8 flip from `open` | 82 |
-| 3 | **collections.** `get-in assoc-in update-in update-keys update-vals`; `condp case juxt dedupe flatten`; `fib.set`; `fib.sorted` (B-tree, `Queue`); `Slice`/`subvec`; `rseq`; `Xf`, `Stepper`, `transduce`, `into/3`, `xf`; the multiplicative hash finaliser; `unchecked-*` and the aliases of §4.1 and §4.3 (`aget`, `long-array`, `transient`); `ex-info` as data; **arity-reading forms (L22: `partial comp juxt apply some->`), joins and families (L24), heterogeneous literals (L25), literal widths (L26 a), `letfn` (C8)**; chunked `pmap`; the in-place paths of `Vec` and `Map` (C2 to C4 and C7, or the struct `Vec`, §9 Q18) | L2 (user variadics), L4, L6, L9, L10, E5, L22, L24, L25, L26, C2, C3, C4, C7, C8, C5 (the `first`/`get`/`zip` count cases stay `open` until it lands) | B-tree model with `valid?`; the `conj` count case at n + c moves from `open` to required | 170 |
-| 4 | **strings and numbers.** `str` as a `Reducible char` and `fib.string` in full (character offsets, `Pattern`), `fib.char`, `fib.regex` (non-backtracking core), `fib.math`, `fib.random` (the global generator, L15 init), `fib.walk`, `fib.sys`, the Java-name modules (E15), `fib.io`, `format printf`, `read-string`; **variable promotion (L26 b) if the owner signs §9 Q36** | L11, L12, L15 (top-level atoms), E15, L26 (b), C10 for O(1) character offsets | strings against a byte-loop reference over generated UTF-8 (every scalar width, boundaries) and against a character-offset reference; regex against a bounded backtracking reference; math bit for bit between the interpreter and the compiled program on 3000 generated patterns, and against libm in a Rust test (exact functions equal, the others within a stated number of ulps); `Rng` against known first values | 93 |
-| 5 | **the long tail.** dynamic vars and `binding` (L29, C11) with `*out*` and `with-out-str`; metadata (L27); `defmulti` and hierarchies; `locking` and a thread-safe `LSeq` (C9); `BigInt Ratio BigDecimal` and their literals; `fib.data` (`Val`, `diff`), `pprint`, `sequence eduction` (after C1), `iteration`, `subseq`, the relational `set/project index join`, `seque`, `add-watch`, `with-redefs`, `file-seq`, `re-matcher`, lazy `pmap`; the backtracking regex fallback; **exceptions (L28) after the owner's §9 Q35** | C1, L12, L27, L28, L29, C9, C11 | as above | 84 |
+| 0 | the library root and re-export; the thirty-two Rust macros of §6.3; `Hash f64`; `derive Hash` and `Hash (List a)` over `hash-combine`; the quasiquote fix; the protocol-mangling fix; the duplicate-`:use` check (if the owner agrees, §9 Q27); the harness's `allocs` header; the disjointness test of the four implicit modules as a CI gate; `fibc build` at `-O 2` and `fibc run` at `-O 0` (C6, Q15) | E7, E1, B2, B3, E10, E12, H1, C6 | cases for each macro's expansion text; a `hash` of 14 strings and of a two-string struct that does not trap; both tools agree on B3's program | |
+| 1 | **what stage 2 needs.** `Pair Triple Step Result Unit`; `unwrap unwrap-or map-opt and-then`; `min max abs inc dec mod compare` (Clojure's, built on `<`); `hash-combine hash-ordered-coll hash-unordered-coll`; `Eq Ord Hash Show Debug ToStr` for `Vec Map Set Pair Triple` (`derive Debug`; `Ord` of a `Vec` by length first); `Reducible`, its sources (`Vec List Array Option Range Map Set Chars`, `VSeq` (with `Collection` and `Show`: `conj` conses at the front, parentheses), and `str` as a `Reducible char` with `Lookup` and `Keyed`: scalar offsets, O(n) until C10, §2.9) and `map filter remove take drop take-while concat mapcat`; `reduce reduce1 reduce-while first last nth find-first find-map every? not-any? any? count empty? run! quot`; `into vec set` (bulk builders); `sort sort-by sort-with sort-by-with reverse` (a comparator is a `Cmp`); `Truthy` and `Payload` (a predicate's result), `Cmp`, `Lookup Assoc Dissoc Keyed Collection Emptyable` with `get get-or assoc dissoc update update-or update-opt fnil contains? includes? empty keys vals key val merge group-by frequencies select-keys`; strings: `str` (`ToStr`), `Ord str` in Clojure's UTF-16 order (§2.7), `slurp` and `try-slurp`, and qualified `str/join str/split str/split-lines str/trim str/triml str/trimr str/index-of str/includes? str/starts-with? str/ends-with? str/blank? str/chars`, with `subs str-len str-byte-at str-find`, `parse-long`, `digit? whitespace?`; `println print prn`, and their generic twins; `newline`; `write-file`; the builtins' names and Clojure aliases as §4.1; `defn defn-` (one clause) | T0, L3 (`Pair`, `Triple` in the prelude), L12 (`Result`), L17 (`Debug`), L18 (`str-byte-at`, `str-find`), E13 (`if-let` over `Option`), D1 | model tests for `Vec Map Set` and `sort`; laws; a hash law over strings; the integration test | 146 |
+| 2 | **the Clojure surface.** the rest of the sequence functions (`partition* interleave zip zip-with seq-of seq= map-indexed keep reductions distinct interpose drop-while second mapv filterv repeat iterate cycle some`), `Cursor` and the buffering `Cursable` adaptors; `Stack` with `peek pop`; `Seqable seq rest next ffirst` (the seq of a `Vec` is the `VSeq` of tranche 1); recipes are affine (L13, §9 Q34: S14 until it lands); `LSeq lazy-seq lazy-cat doall dorun repeatedly` (effect-sourced sequences memoised); the small insertion-ordered `Map`; Clojure's printed forms; `for doseq cond if-not when-not as->`, `if-some when-some when-first declare defonce`; **truthiness (L20), the keyword in call position (L14, L21), `and`/`or` typed**; `partial` (one free) `partial2 complement constantly`; `with try-let defrecord ->Name vector volatile!`; the arity forms of §4 on L1, deleting the stand-ins; patterns in parameters, bracket forms; the reader additions of E8 and E14 (a) | L1, L3b, L7, L8, L13, L14, L15, L17, L19, L20, L21 (keyword), E3, E4, E8, E14 (a), E11, E2, B4, B5, E6 (`List`), E10 (`List`), L16 (**Decided**: adaptor cursors without the buffer, `Lookup` for `Option`) | the 60 programs of the design record (20 each from three designs, all ran) ported as cases; expansion texts; a recipe sent to a task; polymorphic recursion rejected by both tools; the failing programs of §5.5 S1, S2, S7, S8 flip from `open` | 84 |
+| 3 | **collections.** `get-in assoc-in update-in update-keys update-vals`; `condp case juxt dedupe flatten`; `fib.set`; `fib.sorted` (B-tree, `Queue`); `SubVec`/`subvec`; `sort-by-cached`; `partitionv` and the vector forms; the mutable arrays of §2.11 (`MArray`, `long-array`, `aget`, `aset`, `make-array`) and `try-parse-int`; `(Ratio t)` and exact integer `/` (L30), `quot` stays the builtin; `rseq`; `Xf`, `Stepper`, `transduce`, `into/3`, `xf`; the multiplicative hash finaliser; `unchecked-*` and the aliases of §4.1 and §4.3 (`aget`, `long-array`, `transient`); `ex-info` as data; **arity-reading forms and multi-arity literals at an expected type (L22: `partial comp juxt apply some->`), callable `Map` `Set` `Vec` (L21), multi-parameter dispatch (L23: `(into {} [[1 2]])`, `merge` over `Option`), joins and families (L24), heterogeneous literals (L25), literal widths (L26 a), static predicates (L31), `letfn` (C8)**; the reader additions of E14 (b); chunked `pmap`; the in-place paths of `Vec` and `Map` (C2 to C4 and C7, or the struct `Vec`, §9 Q18) | L2 (user variadics), L4, L6, L9, L10, E5, L21 (the collections), L22, L23, L24, L25, L26 (a), L30, L31, E14 (b), C2, C3, C4, C7, C8, C5 (the `first`/`get`/`zip` count cases stay `open` until it lands) | B-tree model with `valid?`; the `conj` count case at n + c moves from `open` to required | 200 |
+| 4 | **strings and numbers.** `fib.string` in full (`Pattern`, case mappings, `replace-with`; the character-offset functions and `str` as a `Reducible char` are tranche 1), `fib.char`, `fib.regex` (non-backtracking core), `fib.math`, `fib.random` (the global generator, L15 init), `fib.walk`, `fib.sys`, the Java-name modules (E15), `fib.io`, `format printf`, `read-string`; **variable promotion (L26 b), which the rule settles (§9.1 Q36); the owner signs the item** | L11, L12, L15 (top-level atoms), E15, L26 (b), C10 for O(1) character offsets | strings against a byte-loop reference over generated UTF-8 (every scalar width, boundaries) and against a character-offset reference; regex against a bounded backtracking reference; math bit for bit between the interpreter and the compiled program on 3000 generated patterns, and against libm in a Rust test (exact functions equal, the others within a stated number of ulps); `Rng` against known first values | 113 |
+| 5 | **the long tail.** dynamic vars and `binding` (L29, C11) with `*out*` and `with-out-str`; metadata (L27); `defmulti` and hierarchies; `locking` (identity-keyed monitors) and a thread-safe `LSeq` (C9); `BigInt`, `BigDecimal`, `(Ratio BigInt)` and their literals; `fib.data` (`Val`, `diff`), `pprint`, `sequence eduction` (after C1), `iteration`, `subseq`, the relational `set/project index join`, `seque`, `add-watch`, `with-redefs`, `file-seq`, `re-matcher`, lazy `pmap`; the backtracking regex fallback; **exceptions (L28), which the rule settles (§9.1 Q35), after the library is viable** | B1, C1, L12, L27, L28, L29, C9, C11, E14 (c) | as above | 84 |
 
-The Rows column counts the survey names assigned to the tranche in §4 (154 + 82 + 170 + 93 + 84 =
-583 names, plus 42 names Clojure lacks that the library adds; the other 89 survey names are not offered (§4.17), and
+The Rows column counts the survey names assigned to the tranche in §4 (146 + 84 + 200 + 113 + 84 =
+627 names, plus 48 names Clojure lacks that the library adds; the other 45 survey names are not offered (§4.17), and
 `#"..."` shares the row of `#"regex"`). Tranche 1 includes the core forms and builtins that already exist. The Needs
 column was checked against §7's "Needed by" column row by row in the review; the first version omitted B3,
-L3, L12, L10, L2, E6, E10 and C5.
+L3, L12, L10, L2, E6, E10 and C5. The rule check found six more, which this revision placed: L21 (the collections, tranche 3), L23 (taken, §9 Q39, tranche 3), C6
+(`fibc build` at `-O 2`, tranche 0), E14 split into (a) tranche 2, (b) tranche 3 and (c) tranche 5, L13 (affine recipes, tranche 2), and L30 and L31 (tranche 3); and it moved
+`str` as a `Reducible char` and the character-offset functions from tranche 4 to tranche 1, because §4.3, §4.7 and `count` already said so and the tranche-1 rows
+needed them (§10.4.8 C1, C2).
 After tranche 3 the library is *viable* in ROADMAP rule 5's sense, and the benchmark suite (fibber
 and Rust kernels, a ratio per kernel against the aim of within 1.5x) is designed then, not here. The order
 is still led by what the compiler needs: tranches 0 and 1 are the same as before the rule, and what the rule
@@ -2161,7 +2420,8 @@ Clojure surface it makes terse.
 A. Add the library modules beside `fib.prelude`; names that collide (`map count range first rest`) are
 shadowed by the `:use`, which the module system does silently ([R] A6), and the library's protocols that reuse a
 prelude name (`Collection`, `Seq`, `Indexable`) need §7 B3 first, or step C in the same commit as step A.
-B. Port the cases that use the names being replaced. Counted by grep over the 191 `.fib` files of
+B. Port the cases that use the names being replaced; **`/` on integers becomes `quot`** when L30 lands: in three case files, 102, 103 and 190 (`grep -rn '(/ '` finds 21 files, but the other 18 divide floats, which stay `/`; the headers of 102 and 103 pin
+the traps `integer overflow` and `integer / by zero`, which `quot` keeps), in `compiler/syntax/number.fib` (one use), in the generator `crates/fibgen/src/gen/nums.rs` (integer `/` is one of its operators) and in two Rust unit tests of `fibref`. Counted by grep over the 191 `.fib` files of
 `cases/ownership`: `range` in 7, `for-each` in 5, `pmap` in 4, `filter-iter` in 2, `iter` in 2, `(map` in 1,
 `collect` in 1, `Countable` in 1, and, found by the review, `first` in 2 (cases 01 and 61: `first` on a `List`
 changes type from `e` to `(Option e)`), `(list ` in 4, `(next ` in 2, `map-put!`, `map-del!` and `disj` in 1 each (`append`, `length` and `set-contains?` stay as aliases, §6.5), and `(. e key)`/`(. e val)` on a map entry in case
@@ -2177,37 +2437,43 @@ parentheses, a small `Map` in insertion order), and no case pins printed text: t
 ## 9. Open questions for the owner
 
 The owner prefers a recommendation to an open question; each row has one, with the evidence it rests on. "Decide" means
-the owner's sign-off turns it **Decided** in the page it changes. The rule (§1.1) settled most of the first version's 32
-questions; §10.4 lists each with the verdict. What is left is what the rule does not settle: a collision between the
-owner's two aims (Clojure's semantics against Rust's speed), a decision made before the rule that the rule would
-reverse, a sequencing question, and implementation choices.
+the owner's sign-off turns it **Decided** in the page it changes (§7.4 lists the edit of each other chapter). §9.1 holds what the owner has decided and,
+in §9.1b, the answers that the rule derives (the first version's questions the rule settles, including the decisions made before the rule that
+it reverses): the owner signs the §7 item for each. §9.2 holds **only what the rule does not settle**: the one collision of the owner's two aims
+(Q34), a sequencing question, and implementation choices.
 
 ### 9.1 Decided
 
-| # | Decision | Owner, date | Where it lands |
-|---|---|---|---|
-| Q15 | Checked arithmetic: overflow traps by default; wrapping builtins (L10, tranche 3); `fibc build` at `-O 2` and `fibc run` at `-O 0` (C6); the rotate-and-xor `hash-combine` in tranches 0 and 1 so no combiner traps; the integer hash replaced by a 64-bit finaliser in one commit with types §2.12 and the cases' expected orders | 2026-10-01, by the rule | §2.7, §2.8, §7 L10, C6 |
-| Q24 (L19) | An integer literal whose value is exactly representable adopts a float type when it unifies with one; a variable never does through this rule | 2026-10-01, by the rule | §2.8, §5 C1, §7 L19 |
-| Q28 | `(first xs)` on a `List` returns `(Option e)`; case 01 (one of the 20 owner-decided cases) and case 61 are ported to it | 2026-10-01, by the rule | §6.5, §8.3 |
-| Q30 (L16) | An impl's context and a method's own variable may name a type variable that a constraint determines from the head | 2026-10-01, by the rule | §2.1 rule 5, §7 L16 |
+| # | Decision | Owner, date | Settled by the rule? | Where it lands, and the other chapters' edits (§7.4) |
+|---|---|---|---|---|
+| Q15 | Checked arithmetic: overflow traps by default; wrapping builtins (L10, tranche 3); `fibc build` at `-O 2` and `fibc run` at `-O 0` (C6); the rotate-and-xor `hash-combine` in tranches 0 and 1 so no combiner traps; the integer hash replaced by a 64-bit finaliser in one commit with types §2.12 and the cases' expected orders | 2026-10-01 | checked arithmetic yes (Clojure's `+` throws on overflow); `-O 2` and the finaliser no (the owner's) | §2.7, §2.8, §7 L10, C6; types §2.12, compiler.md, ROADMAP M7 rule 4 |
+| Q24 (L19) | An integer literal whose value is exactly representable adopts a float type when it unifies with one; a variable never does through this rule | 2026-10-01 | yes (Clojure's `(* 2 1.5)`) | §2.8, §5 C1, §7 L19; types §1.1, §2.12, syntax §1.2 |
+| Q28 | `(first xs)` on a `List` returns `(Option e)`; case 01 (one of the 20 owner-decided cases) and case 61 are ported to it | 2026-10-01 | yes (T1: `nil` is `Option`) | §6.5, §8.3; cases 01, 61 |
+| Q30 (L16) | An impl's context and a method's own variable may name a type variable that a constraint determines from the head | 2026-10-01 | no (the owner's choice of mechanism: Clojure has no counterpart) | §2.1 rule 5, §7 L16; types §3.3, §4.1 |
 
 Q14 (push as the primitive, with a pull `Cursor`) was recommended "conditional on L16"; L16 is decided, so the push design stands without the condition:
 pull is cheaper today (3 indirect calls against 6) and runs `f` twice per surviving element (1500 calls for 1000, A10 d1c); push is one loop
 per source, early exit is a value, and its bufferless static form needs L16 ([R] A10 push).
 
+### 9.1b Settled by the rule (the answers the rule derives; the owner signs the §7 item)
+
+| # | Question of the first rewrite | Answer the rule gives | Why |
+|---|---|---|---|
+| Q33 | Does the owner exempt any of the sharp edges that the rule replicates? | **Replicate all of them**; the owner may strike any row, each is a one-line change (§5.6). The eight of the first rewrite plus `sort-by`'s two key calls per comparison, chunking, the UTF-16 order of strings and `hash-map`'s hash order. `Hash`/`Eq` on `-0.0` stays the contract that `=` implies equal hashes until Clojure's `(hash -0.0)` is verified | none is a memory-safety matter (a merge sort over arrays reads only checked indices, [R] A11 nan); the two auditors flagged them "bug-compat" and left the call to the owner, and the rule leaves none: Clojure's behaviour is Clojure's |
+| Q35 | Exceptions: amend types §2.11 (abort-only, **Decided** 2026-09-28) so that `throw`/`try`/`catch`/`finally` exist? | **Yes, after the library is viable**: `ex-info` as data now, a task's trap isolated by `join` next, unwinding last (§2.10, L28), and the types amendment written before the work | no memory-safety failure prevents them (a caught exception that skips releases leaks, §1.1); D1 is a decision of the owner's that the rule reverses (§5 D1); unwinding is a large change in lIR, the ownership checker and `fibref` and cannot be prototyped without editing them; ported Clojure code that catches cannot run until it exists |
+| Q36 | Do the numeric builtins promote for variables (`(+ n 2.5)` with `n: i64`), lifting types §1.1 D3? | **Yes, operator-level along `i8 < i16 < i32 < i64 < f64`, `f32 < f64`, never narrowing, never at `let`, return or field (§2.8, L26 b)**; a generic `(add n 2.5)` still fails | Clojure promotes at every mixed operation, the lattice is statically typable and has no safety content, and the owner already accepted the literal case (L19: the same D3); today `(+ n 2.5)`, `(< n 2.5)`, `(f 2)` for `(f x: f64)` and `(/ (reduce-sum xs) (count xs))` into an `f64` are `cannot unify f64 with i64` ([R] A11 n1, n10, n11, t85) |
+| Q37 | Character offsets in a UTF-8 `str` are O(n). Take the ASCII flag in the `str` header (C10)? | **Yes**: computed in the validation pass that already scans every constructed `str`, it makes `count`, `nth`, `subs` and `index-of` O(1) for ASCII text and a byte walk otherwise; the byte layer (`str-len`, `str-byte-at`, `str-find`, `str-slice`) stays for tokenizers | cost is not a reason (§1.1), so the unit is Clojure's characters (scalars, §5 T10) and the flag is the cost's cure, a representation change in both tools and not a language change |
+| Q40 | Integer `/` (§5 D4): Rust's truncation (types §2.12, **Decided** 2026-09-27) or Clojure's exact value? | **Exact: `/` on two integers is a `(Ratio t)`, `quot` truncates (L30)** | the result type of Clojure's `/` depends on the values (T5), whose twin keeps the value as `+'` does (a `BigInt` always); truncation changed the value silently, and it had no safety or typing reason; cost: a gcd and, until C5, an object per division, as Clojure's, and the loop that wants the machine's division writes `quot`; the compiler's one use, three case files, the generator and two unit tests migrate (§8.3) |
+
 ### 9.2 What the rule does not settle
 
 | # | Question | Recommendation | Why |
 |---|---|---|---|
-| Q33 | Does the owner exempt any of the sharp edges that the rule replicates, because they are bugs and not ergonomics? The eight: `compare` built on `<` (a NaN compares 0 against everything, so a float `sort` with a NaN is input-order dependent), `compare` of vectors by length first, `(take-nth 0 c)` repeating the first element, `(range 0 1 0.1)` accumulating, a step of 0 repeating the start, `update-keys`/`map-invert`/`rename-keys` keeping the last of a collision, `partition` dropping an incomplete group, and `(hash 0.0)` against `(hash -0.0)` if Clojure's differ (not verified) | **Replicate all of them (the rule), except that `Hash`/`Eq` agree on `-0.0` whatever Clojure does** (the HAMT must find a stored key), and let the owner strike any other row; each is a one-line change either way | none is a memory-safety matter (a merge sort over arrays reads only checked indices, [R] A11 nan); the two auditors flagged them "bug-compat" and left the call to the owner; the cost of replicating `compare` is the nondeterministic float sort of §2.7 |
-| Q34 | Memoised or recipe: is the default for **every** adaptor a memoised `LSeq`, as Clojure's lazy seqs are cached? | **Recipes for pure adaptors, memoised `LSeq` for sources that run effects (§2.1 rule 2), and the checker inserts `cache` where the use count of a recipe variable exceeds one** (the L13 type attribute plus the ownership checker's use count), so a single-use pipeline stays at the loop a Rust iterator chain makes and a reused one behaves as Clojure's | the rule says Clojure (the only observable difference is an effectful `f`: 6 calls where Clojure makes 3, [R] A11 t20) and the other aim says zero cost; a memoising default costs a `Lazy` cell per element ([R] A11 t21); the use-count insertion is [sketch]; the two audits agreed that this is the one collision of the two aims |
-| Q35 | Exceptions: amend types §2.11 (abort-only, **Decided** 2026-09-28) so that `throw`/`try`/`catch`/`finally` exist? | **Yes, after the library is viable**: `ex-info` as data now, a task's trap isolated by `join` next, unwinding last (§2.10, L28), and the types amendment written before the work | no memory-safety failure prevents them (a caught exception that skips releases leaks, §1.1); the abort model was chosen for simplicity before the rule; unwinding is a large change in lIR, the ownership checker and `fibref`, and cannot be prototyped without editing them; ported Clojure code that catches cannot run until it exists |
-| Q36 | Do the numeric builtins promote for variables (`(+ n 2.5)` with `n: i64`), lifting types §1.1 D3? | **Yes, operator-level along `i8 < i16 < i32 < i64 < f64`, `f32 < f64`, never narrowing, never at `let`, return or field (§2.8, L26)**; a generic `(add n 2.5)` still fails | Clojure promotes at every mixed operation, the lattice is statically typable and has no safety content, and the owner already accepted the literal case; today `(+ n 2.5)`, `(< n 2.5)`, `(f 2)` for `(f x: f64)` and `(/ (reduce-sum xs) (count xs))` into an `f64` are `cannot unify f64 with i64` ([R] A11 n1, n10, n11, t85); Rust's answer (no) is the other defensible one; the auditors split (one recommended lifting D3, one kept it and left the call to the owner) |
-| Q37 | Character offsets in a UTF-8 `str` are O(n) (`count`, `nth`, `subs`, `index-of`). Take the ASCII flag in the `str` header (C10)? | **Yes**: computed in the validation pass that already scans every constructed `str`, it makes the four O(1) for ASCII text and a byte walk otherwise; the byte layer (`str-len`, `str-byte-at`, `str-find`, `str-slice`) stays for tokenizers | the rule says the unit is Clojure's characters and cost is not a reason (§2.9); the aim of Rust-class speed says an O(n) `count` is not acceptable in a loop; the flag is a representation change in both tools and not a language change |
+| Q34 | Memoised or consumed once: is the default for **every** adaptor a memoised cell per element, as Clojure's lazy seqs are cached, or is a recipe consumed once (affine) with `seq`, `doall`, `vec` and `cache` making a value that is traversed twice? | **Consumed once, checked by the compiler (L13)**, which is what §2.1 rule 2 specifies; the memoising default is the Clojure-faithful alternative and costs a `Lazy` cell and an object per element per stage | the rule says Clojure and the other aim says zero cost, so this is the one collision, and the two audits agreed. Evidence: a recipe that re-runs calls `f` twice as often (6 against 3, [R] A11 t20) and a cached `LSeq` once per element at an object per element (5 calls, t21); **the first rewrite's use-count rule is unsound** (A12 q34: a recipe mentioned once and traversed three times, in a loop and in a closure, calls `f` 6 times where Clojure's make 2); today's checker moves nothing, so affinity is a checker change (A12 aff1, aff2: result 6 both times, `explain` says `borrow` and `retain` for the repeated use); the run-time flag form traps `recipe already consumed` today (A12 aff3) but a recipe that holds a `Cell` cannot cross a task. What differs from Clojure observably: a peeked recipe (`first`, `empty?`) runs its first element's `f` again, which only an effectful `f` shows, and Clojure text that traverses one lazy value twice is rejected with its cure in the message |
 | Q38 | Sequencing the reader changes: `#(..)`, `#{..}` (E8) and the rest of Clojure's reader (E14, including the comma as whitespace and `~x`), against M6 step 1 (the reader port) and the 218 pinned reader tests | **Land E8 and E14 in one commit after M6 step 1 closes, extending the reader dump of spec/bootstrap.md §2 once, and migrate every `,x` of `lib/`, `compiler/` and the cases in the same commit** | the rule requires Clojure's text; each reader change costs two readers (Rust and fibber) and the churn of the macros; doing it once avoids doing it twice |
 | Q39 | Multi-parameter dispatch (L23), a type-system change, or the checker rules (L20, L24) alone? | **Take L23**: it removes the rest of the overlaps (A11 t70, t71) as library code, with `(into {} [[1 2]])`, `merge` with `nil`, `str/replace` by replacement type and `(Option bool)` predicates; **keep L20 and L24 as checker rules anyway** because they are cheaper and give better messages | the two auditors named it "the largest lever" (one) and "expensive, with a checker rule for each use" (the other); the rule needs the uses, not the mechanism; it costs an instance lookup keyed by several heads and an overlap check on the product |
 | Q17 | Closure types (C1) or fusion macros? | **C1; no fusion macros.** | a fused `->>` covers only a visible literal pipeline, costs 80 to 95 ms per distinct macro, and is Rust-side code that stage 2 must re-implement; C1 serves every call site |
-| Q18 | Does `Vec` become a struct with a spare-capacity tail, held in a cell and updated through `set-field!`? | **Yes, decided before tranche 3, not after its counts**: the struct `Vec` plus C2 and C3. C7 (moving a payload out of an owned shell) is the alternative that keeps the enum, and is a medium ownership-checker change that also serves `Map`. | the evidence moved: C2 to C4 alone do not make the existing `Vec` update in place (2002 objects for 1000 puts on an owned struct with an array field, A10 own), a struct held in a cell updates in place today (1000 `set-field!` allocate nothing), and a required count case cannot wait for a measurement that §2.5 already predicts; the layout is shared by `fibc` (`rt/vec.lir`, `lower/pattern.rs`, `macros/abi.rs`) and `fibref` (`eval/vecs.rs`), so both change together. Subvectors and `rest` want an offset field in the same struct (`Slice`, §2.1 rule 8) |
+| Q18 | Does `Vec` become a struct with a spare-capacity tail, held in a cell and updated through `set-field!`? | **Yes, decided before tranche 3, not after its counts**: the struct `Vec` plus C2 and C3. C7 (moving a payload out of an owned shell) is the alternative that keeps the enum, and is a medium ownership-checker change that also serves `Map`. | the evidence moved: C2 to C4 alone do not make the existing `Vec` update in place (2002 objects for 1000 puts on an owned struct with an array field, A10 own), a struct held in a cell updates in place today (1000 `set-field!` allocate nothing), and a required count case cannot wait for a measurement that §2.5 already predicts; the layout is shared by `fibc` (`rt/vec.lir`, `lower/pattern.rs`, `macros/abi.rs`) and `fibref` (`eval/vecs.rs`), so both change together. Subvectors and `rest` want an offset field in the same struct (`SubVec` and `VSeq`, §2.1 rule 8, §4.5): `subvec` then returns a `Vec` itself |
 | Q19 | Which macros are Rust? | **The thirty-two of §6.3 (`comp` and `partial` leave for the checker; `defn`, `defn-`, `some`, `update` join), then shrink the list once E2 lands.** | stage 2 pays for each Rust macro; every program pays 80 to 95 ms for each fibber macro it uses, and these are on every program's path |
 | Q26 | A string builder (ROADMAP M7 rule 4: `str` building without quadratic copies) | **`StrBuf` in `fib.string` over a growable `(Array i8)`, after C4; until then `str/join` and `format` build in one pass.** | `str-concat` in a loop copies (4006 objects for 1000 characters, [R] A11 e3f); the compiler's own `hex-upper` and reader dump need building text; `with-out-str` is built on it |
 | Q27 | `:use` collisions: the first `:use` wins, `spec/syntax.md` §5 says an error | **Make the checker raise the error §5 documents, with a case; until then the disjointness test of §6.2 is the protection.** | spec and code disagree (A10 use); this page changes neither, per method.md |
@@ -2327,6 +2593,8 @@ gave as a reason was a memory-safety reason**: the one the page did give, for `a
 first version were classified one by one; the tables below record every item that changed, with what it was, what it is and why. An **outcome** is the first word of
 "Now": *reversed* (Clojure's behaviour, no deviation left), *adapted* (Clojure's text with a typed twist, or a deviation narrowed), *kept* (the deviation stands, with
 its reason in §5), *same* (the page already did what Clojure does), *decided* (the owner decided it).
+
+§10.4.1 to §10.4.7 record the first rule revision and keep its wording (`Slice`, `:redefinable`, M3 to M6); §10.4.8 records the second revision, which changes some of their outcomes.
 
 #### 10.4.1 Principles and non-goals
 
@@ -2597,6 +2865,56 @@ ownership no-leak promise. §5.1 takes the union and says, for each row, which p
 | `Character/isDigit` | Unicode `Nd`, as Java | alias module | **both**: `Character/isDigit` is Unicode, `digit?` the ASCII test the compiler uses |
 | `letfn` | adapt: a macro over cells leaks a cycle | reverse: lower to one environment | **both**: a macro leaks a cycle (A11 t55), C8 removes it; `letfn` ships with C8 |
 
+#### 10.4.8 Second revision: the rule check's 28 findings
+
+An adversarial checker ran the rewrite against the rule (its programs are in `rcheck/`, re-run in A12) and raised 28 findings: **F1 to F15** deviations without a reason,
+**R1 to R6** safety reasons that a safe program refutes or that have no program, **C1 to C6** inconsistencies after the rewrite, and **X0**, the re-run of every `ran:` block (which
+reproduced). The second revision resolved each: **accepted** (the page changed), **accepted in part** (the page changed and the rest is rejected, with the reason) or **rejected**.
+Result: 27 accepted, 1 accepted in part, none rejected; the rows of §4 changed text in 185 places (44 of them the predicates moved from omit to adapt) and 30 changed tranche, 7 `(new)` rows were added and `Slice` was replaced by `SubVec` and `VSeq`, and
+§4's counts were recomputed by `count.py` (keep 145, adapt 427, alias 55, omit 45; tranches 146, 84, 200, 113, 84; 48 `(new)` rows). Facts of Clojure that the checker or this revision
+gives from knowledge are marked **[K]** where they matter and were not verified (there is no Clojure on the machine).
+
+| Finding | Verdict | What changed | Evidence |
+|---|---|---|---|
+| F1 recipes re-run `f`; the use-count cure is unsound; no §5 row | accepted | recipes are affine (§2.1 rule 2, L13); the use-count rule is withdrawn; `seq`, `doall`, `vec`, `cache` make a re-traversable value; K1 in §5.7, S14, Q34 rewritten with the evidence and what differs observably | A12 q34 (`[6]` `[6]`), aff1, aff2 (the checker has no move rule), aff3 (the run-time trap) |
+| F2 `reverse`, `sort`, `sort-by`, `take-last`, `partition*`, `split-at`, `split-with` return `Vec`s | accepted | `reverse` is a `List`; `sort`, `sort-by`, `take-last`, `doall` return a `VSeq`; `partition*` yield `VSeq` groups and the `v` forms `Vec`s; `split-at`, `split-with` a `Pair` of `VSeq`s; §2.7 print table | A12 q_sortconj (the first rewrite), vseq |
+| F3 one `Slice` for `rest` and `subvec` | accepted | `VSeq` (the seq: `conj` at the front, parentheses) and `SubVec` (a vector: `conj` at the end, brackets) | A12 q_slice, vseq |
+| F4 `with-redefs` opt-in for a cost reason | accepted | works on any function; the compiler makes a slot for each function that some `with-redefs` names (§2.11, L29); `:redefinable` is gone | [sketch]: no program exercises it |
+| F5 `sort-by` calls the key once | accepted | the key runs twice per comparison; `sort-by-cached` (new) is the one-call form; §5.6 | A12 sortby `[18 5]` |
+| F6 records print `(Name f1 f2)` | accepted | `#m.P{:x 1, :y "x"}` with the `pr`/`println` difference at a string field (§2.7); `str` of a record is believed to be the `pr` text **[K]** | the table row |
+| F7 `hash-map` and `array-map` are one thing | accepted | two shapes of one `Map`: `hash-map` builds the HAMT, the literal, `array-map`, `into {}`, `zipmap` the array shape (§2.7, §4.4, §4.5) | A11 e13 ran the array shape; the tag is **[H]** |
+| F8 functions return a value where Clojure throws | accepted | `Integer/parseInt`, `Long/parseLong`, `Double/parseDouble`, `slurp`, `re-pattern`, `read-string`, `max-key`/`min-key` trap (P5); the typed twins are `try-<name>` (§3 N13); D1 is not the reason and is not cited | rows of §4.3, §4.4, §4.9, §4.14 |
+| F9 transducer arities missing | accepted | the list and the `x<name>` stand-ins (§2.1 rule 7); nine ran in A12 xf2, five before, eight are the same shape and were not written | A12 xf2 (and the mutation: `FAIL remove`) |
+| F10 chunking not in §5.6 | accepted | replicated: §5.6 lists it, a 32-slot buffer per traversal of a mapping stage, written for `map` | A12 chunk `[32 32 64 64 10 0]`; Clojure's counts **[K]** |
+| F11 `Ord str` by scalar, Clojure's by UTF-16 unit | accepted | `Ord str` is Clojure's order (§2.7), one fix-up at the first differing byte; the unit of `count` is a separate question (T10) | A12 u16cmp `[5184 0 1068]` |
+| F12 integer `/` is Rust's though a typed twin exists | accepted | `/` on integers is a `(Ratio t)`, `quot` truncates (§2.8, D4, L30, Q40); why `+'` is accepted and the first `/` was not: the twin keeps the value; the compiler's 1 use, three case files, the generator and two unit tests migrate (§8.3) | A12 ratio |
+| F13 type predicates omitted though constants; `(int \a)` | accepted | §4.18: 44 predicates as checker forms (L31) and variant tests over `Val` and `Form`; `ToInt` and `ToLong` for `char` | A12 int1, int2, pred1 (the fold is [sketch]) |
+| F14 multi-arity `fn`, `%&`, variadic `fn` out while T2 says twinned | accepted in part | a multi-arity or rest-parameter literal (and `%&`) takes the arity of its expected type (L22, §5 T2, §4.2); rejected: a multi-arity function stored or returned has no single type, so a hand-written transducer `(fn [rf] (fn ([] ..) ([r] ..) ([r x] ..)))` is an `Xf` (T2 now says so) | types §1.4 |
+| F15 rest parameter is `...` | accepted | `& xs` (L2); `...` accepted in `defmacro` until `lib/` and `compiler/` migrate | A6 (`&` compiles today as a parameter) |
+| R1 M2: an aliased write is not a safety failure | accepted | M2 rewritten to the cross-task race; arrays are `(MArray t)`, shared and written in place inside one task, rejected across tasks (§2.11, §5 M2) | A12 p1, p10, p11, aset1, aset2, aset3 |
+| R2 M4: only a lone surrogate is a safety matter | accepted | M4 removed; the unit is `char`'s, a decided typing fact (T10), with the failing program | A12 p2, p2b, unit |
+| R3 M6: the failing program does not involve `locking` | accepted | M6 removed; `locking` is Clojure's `(locking x body)`; a lock from two `Atom`s runs; the identity-keyed monitor is **[sketch]** (C9); `Mutex` stays as an addition | A12 p3 (600) |
+| R4 M1 and `volatile!` | accepted | `volatile!` is an `Atom` (§2.11, §4.1); M1 narrowed to `Cell`, `Weak` and `MArray` in a `def` | A12 p12 |
+| R5 M3 and M5 have no failing program | accepted | M3 removed (`make-array` of an object type is an `(MArray (Option T))`, T1); M5 removed (`future-cancel` is Clojure's; the interrupt needs L28 step 2, S16) | none: neither had a program |
+| R6 §10.4 does not show the deciding re-runs of the five auditor-a rows | accepted | the table below | A12 |
+| C1 the tranche plan omits L21, L23, C6, E14 and others | accepted | L21 and L23 in T3, C6 in T0, E14 split (a) T2 (b) T3 (c) T5, L13 T2, L30 and L31 T3, B1 in T5; `vector`, `empty`, `peek` and `pop`, `hash-map`, `~x`, `*command-line-args*` and 20 math rows moved or noted; a script checks the rows against the Needs columns | `cons.py`, `cons2.py` |
+| C2 strings are seqable against the tranche column | accepted | `str` as a `Reducible char`, `Lookup` and `Keyed`, and the character-offset functions are tranche 1 (O(n) until C10); `Keyed` and `Lookup` on `str` and `Array`; `str/last-index-of` takes `from` | A12 keyed |
+| C3 stale printer text | accepted | the twins and `str/join` and `format` are over `ToStr`, `Show`, `Debug` as §2.7 says (§2.10, §4.7, §4.14) | |
+| C4 other stale lines (nine) | accepted | `first` is a function (rule 8); `subseq` returns `(SubSeq s)`; `math/random` is `(math/random)`; `*in*` and `*print-length*` notes; `not-empty` returns the collection; §2.3 `merge`; `unchecked-long` and the other float conversions; T6 moved to S4; `concat` of zero or one argument; §6.1: 491 lines at HEAD, **522** in the working tree (the checker said 524; `wc -l` says 522), where `hash-combine` is a different mixer (§2.7) | |
+| C5 decisions recorded only in this page | accepted | §9.1 records each with whether the rule settles it, and §7.4 lists the edit of types, syntax, ROADMAP, compiler.md and the cases; none of them is edited here | |
+| C6 §9 holds items the rule settles | accepted | Q33, Q35, Q36, Q37 moved to §9.1b with the rule's answer; Q40 added; §9.2 holds only Q34 (the collision), Q38, Q39, Q17, Q18, Q19, Q26, Q27, Q29 | |
+| X0 two `ran:` blocks contain `..` | accepted | `fib.seq` is marked an excerpt; `fib.seqable` is now a complete block that ran (A12 vseq) | A12 |
+
+**R6: the deciding re-runs of the five auditor-a rows** (the table of §10.4.7 gave `future-cancel` only):
+
+| Row | Auditor a kept it on | Re-run | Decision |
+|---|---|---|---|
+| `aset` | value semantics against an alias | the aliased write through a shared cell is Clojure's and safe (A12 p1, p10); an `MArray` shared by a second binding and a closure (aset2); across two tasks the cell-capture check rejects it (aset3) | **reversed** to Clojure's text; M2 is the race only |
+| `locking` | a shared `Cell` | the cited program is rejected whatever `locking` is (t41); a ticket lock from two `Atom`s gives 600 (p3) | **reversed**; M6 removed |
+| `make-array` of an object type | an uninitialised slot | no program can show it: the array is an `(MArray (Option T))` filled with `nil`, as `object-array` | **reversed** (T1) |
+| the UTF-16 unit | an invalid `str` | UTF-16 `count` and `subs` run as user code, a bound inside a pair traps (p2, p2b); with count in UTF-16 units and `nth` by element the idiom `(dotimes [i (count s)] (nth s i))` traps (unit) | **re-filed** as T10 (`char` is a scalar, types §1.1), not as safety |
+| `future-cancel` | an asynchronous kill | Java's interrupt is cooperative too; nothing was run: no cancel primitive exists | **reversed**; the interrupt needs L28 step 2 (S16) |
+
 ## Appendix A. Evidence
 
 Programs run in the session that wrote this page, with the compiler binaries of that session
@@ -2826,7 +3144,7 @@ leak-cycles=0 leaks=0 errors=0`. Counts are the `A` lines of `fibc run --trace`.
 * **run.** `(run! (fn (x) (swap! a (fn (n) (+ n x)))) [1 2 3])` returns `@a` 6.
 * **swap.** `(defmacro swap! (a f ... args) `(fib.prelude/swap! ,a (fn (x__) (,f x__ ,@args))))`, then `(swap! a +
   5)` and `(swap! a * 2)` on `(atom 10)`: 30.
-* **twin.** `(defun str (x: a) :where ((Show a)) -> str (show x))` and the same for `println`: `(run! println [1 2 3])`
+* **twin.** `(defun str (x: a) :where ((Show a)) -> str (show x))` and the same for `println` (over `Show` there; the page's `str` twin is over `ToStr`, §2.7): `(run! println [1 2 3])`
   prints 1, 2, 3, `(join "," (map str [10 20]))` is `10,20`.
 * **pm.** A variadic `println` macro that joins with `(str-concat " " ..)`: `(println 5 "a" true)` prints `5 a true`,
   `(println)` an empty line, and the function in value position (`(apply1 println "v")`) prints `v`.
@@ -2922,7 +3240,7 @@ leak-cycles=0 leaks=0 errors=0`. A tag such as `t04` or `e8c` is a file of `a/` 
 | e8d, e8e | that memo captured by `spawn`; the same memo over an `Atom` | `cell cannot be shared between threads: closure capture s, field box of Cached has type (Cell (Option (Vec i64)))`; 6 |
 | e16 | every adaptor `Cursable` by buffering (`rb/curbuf.fib`): `(zip xs (map inc xs))`, `(zip (map inc xs) xs)`, `(zip-with .. (rest xs) xs)`, `(zip xs (filter odd? xs))` | `[[1 2] [2 3] [3 4] [4 5] [5 6]]`, `[[2 1] [3 2] [4 3] [5 4] [6 5]]`, `[1 1 1 1]`, `[[1 1] [2 3] [3 5]]` |
 | count (p/count.fib) | the A10 `count` program with `Mapped` no longer overriding `size` | `[2 2]`, `[3 4]`, `[1 100000]` (A10 had `[2 0]`, `[3 2]`) |
-| seq1 (p/seq1.fib) | `Seqable` with `seq` and `rest` over `Vec`, `Slice`, `List`; the generic `len` of §2.1 rule 8; `next` | `4`, `3`, `0`, result 0 |
+| seq1 (p/seq1.fib; superseded by A12 vseq, which has `VSeq` for `Slice`) | `Seqable` with `seq` and `rest` over `Vec`, `Slice`, `List`; the generic `len` of §2.1 rule 8; `next` | `4`, `3`, `0`, result 0 |
 | t80 | a `Consed` recipe (`(cons 0 [1 2 3])`) and an insertion-ordered small map `OMap` that becomes a `Map` at the ninth key | `[100 93 86 79]` (keys of four insertions in order), `[0 1 2 3]`, `[65 100 72 44 79 51 86 58 93]` (nine insertions, hash order), result 0 |
 | t1r (p/t1r.fib) | the 48 checks of A10 on the changed prototype: `compare` on `<`, `Vec` order by length first, `Mapped` without `size`, recipes shown in parentheses, two new checks (`sort-vec-length-first`, `count-calls-f`) | result 0 under both tools (50 checks) |
 | showseq, showmap (p/) | `(show (map inc [1 2 3]))`, `(show (take 3 (iterate inc 5)))`, `(show (filter odd? (range2 0 10)))`, `seq=`; a map of twelve integer keys and `(show (set [3 1 2]))` | `(2 3 4)`, `(5 6 7)`, `(1 3 5 7 9)`, `true`; `{0 0, 1 1, 2 4, ..., 11 121}` (iteration order, the integer hash being the identity), `true`, `#{1 2 3}`, `{b 2, a 1}` |
@@ -2944,7 +3262,7 @@ leak-cycles=0 leaks=0 errors=0`. A tag such as `t04` or `e8c` is a file of `a/` 
 | t50, k9 | a `Ratio` struct with `(impl Num Ratio ..)`, `Eq` and a generic `(twice x)`; `(/ 7 2)` | 507; `3` |
 | e19 | a module named `Long` with `MAX_VALUE` and `bitCount` | `9223372036854775807`, 8 |
 | t56, n8, n8b | `(def counter: (Atom i64) (atom 0))`; `(def c: (Cell i64) (cell 0))`; `(def a: (Atom i64) (atom 0))` | `def .. : initialiser is not a constant expression` |
-| t41, t54, t90 | two tasks writing one `Cell`; `array-set!` with a second holder; `(array 3)` | `cell cannot be shared between threads: closure capture c has type (Cell i64)`; 9 (Clojure: 99); `array takes 2 argument(s), got 1` |
+| t41, t54, t90 | two tasks writing one `Cell`; `array-set!` with a second holder; `(array 3)` | `cell cannot be shared between threads: closure capture c has type (Cell i64)`; 9 (Clojure: 99); `array takes 2 argument(s), got 1` (the value-semantics reason that t54 served is withdrawn: A12 aset1, aset2; §10.4.8 R1) |
 | t40, e9 | `trap` in a spawned task | `trap: boom` then `Aborted` under `fibc`; `trapped:` under `fibref`, `audit:  clean at the abort` |
 | t55 | two local functions that reach each other through two cells | 1; `fibref`: `clean=false leak-cycles=4` |
 | t42, e18 | `add-watch` and a validator as a library: an `(Atom (Vec (fn :send (a a) unit)))` and a `(fn :send (a) bool)` | 50; 42 |
@@ -2958,3 +3276,34 @@ leak-cycles=0 leaks=0 errors=0`. A tag such as `t04` or `e8c` is a file of `a/` 
 | t23, t61, t61b, t70, t71, e5 | `(impl (Lookup k v) (Option s) :where ((Lookup s k v)) ..)`; the same for an `AsMap` protocol; two `OrHit` instances for `(Option a)`; two `Collection` instances for `(Map k v)`; a nested head | `type variable k is not a parameter of the impl head`; `a method is (name (self qual* x: T qual*) -> type)` and `type variable m is not a parameter of the impl head`; `overlapping instances: OrHit for (Option a) is already implemented at t70.fib:2:1`; `overlapping instances: Collection for (Map k v) is already implemented at t71.fib:2:1`; `an instance head is a type constructor applied to distinct variables (or, at a colour parameter, a colour)` |
 | e17 | a `Val` enum with `ToVal`, `hmap2` and a runtime `get-in-v` | `{:name "ann", :inner {:tags ["a" "b"], :x 1}}`, `(some 1)`, `(some ["a" "b"])`, `nil` |
 | t10 | a `str` as a `Reducible char`: `count`, `first`, `map`, `filter`, `take`, `get`, `nth`, `subs` by character, `reverse` on `"aé€😀z"` | result 0 (nine checks) |
+
+**A12. Evidence of the second revision (the rule check's 28 findings).** Programs run with `fibc run` and then `fibref run` (the binaries of the second
+revision, `bin3`), one process at a time, `timeout 300`; their directory is `stdlib/rrevise2/` of the session's scratch directory, **not in the repository**, with the
+A10 prototype `sl/` unchanged (`rc/` holds the rule check's own programs, which were re-run and not trusted). Unless an entry says otherwise the output is the same under both
+tools and `fibref` ends `audit:  clean=true leak-cycles=0 leaks=0 errors=0`. Before the edits `t1r` (result 0), `seq1` (`4 3 0`), `t10` (result 0), `e8c` (`12 12 3`) and the rule check's `q_slice` and
+`q_sortconj` were re-run.
+
+| Tag | Program | Output |
+|---|---|---|
+| p1, p10, p11 | two closures that share one `Cell`; an array in a shared cell written by one closure with `(array-set! &a i x)` and read by the other; an `&a` parameter over a `(cell (array 3 0))` variable | `3`; `49`; `9` |
+| p12 | `volatile!` as an `Atom`, two tasks each doing 300 `(reset! v (+ @v 1))` | `1`: the result lies in 1 to 600 and the audit is clean |
+| p3 | `locking` as a macro over a lock from two `Atom`s (a ticket lock), two tasks, 300 `(locking lk (reset! n (+ @n 1)))` each | `600` |
+| p2, p2b | Clojure's UTF-16 `count` and `subs` as user code over `str-chars`; a bound inside a pair | `4`, `a😀`, `z`, `3`, result 4; with the bound inside the pair `trap: subs: index splits a surrogate pair` (`trapped:`, `audit: clean at the abort`) |
+| unit | `(units-len "a😀z")` against `(count (str-chars s))`, and `(dotimes [i n] (nth cs i))` with each | `[4 3]`, `128731`, then `trap: nth: index out of range` for the UTF-16 count |
+| u16cmp | `cmp-u16`, the byte loop with the fix-up, against an explicit UTF-16 encoding, over 72 strings of 8 code points (all 5184 pairs); and the plain byte order | `[5184 0 1068]` (pairs, disagreements of `cmp-u16`, disagreements of the byte order); `(cmp-u16 "😀" "\uFFFF")` is `-1`, the byte order `1`; result 0 |
+| aff1, aff2 | a non-Copy struct passed to a function twice (a borrowed parameter; a stored, owned one); `fibref explain` | `6` and `6` under both tools; `explain`: `arg 1 w: borrow` twice; `params: w owned (rule 1: stored)` and `arg 1 w: retain` twice. `:owned` on a `defun` parameter is `:owned is not a parameter` |
+| aff3 | a recipe with a flag cell (`OnceMapped`) traversed once, then `vec`, then a second time | `12`, `3`, `[12 3 3]`, then `trap: recipe already consumed` (`trapped:` under `fibref`, `audit: clean at the abort`) |
+| q34 | a counting `map`, one mention in a loop body and one in a closure called three times | `[6]`, `[6]`: Clojure's cached seq makes 2 calls in each |
+| q_slice, q_sortconj | the first rewrite's one `Slice` for `rest` and `subvec`; `sort` returning a `Vec` | `[2 3 0]` and `[2 3 0]` where Clojure has `(0 2 3)` and `[2 3 0]`; `[1 2 3 0]` and `[1 2 3]` where Clojure has `(0 1 2 3)` and `(1 2 3)` |
+| vseq | `VSeq` and `SubVec`: `(conj2 (rest v) 0)`, `(conj2 (subvec v 1 3) 0)`, `(conj2 (sort-seq [3 1 2]) 0)`, `(sort-seq [3 1 2])`, `len` at `Vec` and `VSeq`, `to-vec` | `(0 2 3)`, `[2 3 0]`, `(0 1 2 3)`, `(1 2 3)`, `[3 2 0 3]`, `[2 3]`, `[true true true]`, result 0 |
+| sortby | `sort-by` as `(sort-with (fn (a b) (cmp (f a) (f b))))` against `sort-by-with`, a counting key over 5 elements | `[18 5]` calls, both results `[1 2 3 4 5]` |
+| aset1, aset2 | `(Cell (Array i64))` handles; an `(MArray t)` struct with `aget`, `aset`, `alength` and `Reducible`, shared by a second binding and a closure, over `i64` and `str` | `49`; `[9 4 0]`, `[y x]`, `13` |
+| aset3 | two tasks that each `aset` one `MArray` | `cell cannot be shared between threads: closure capture a, field c of MArray has type (Cell (Array i64))` |
+| ratio | `(Ratio t)` over `i64` and `i32` with `rdiv` and the numeric protocol | `[7/2 2 -3/2 -7/2]`, `5/6`, `7/2`, `3` for the builtin `/`, then `trap: integer overflow in * at i64` for `1/3037000500 + 1/3037000501` (`trapped:`, clean at the abort) |
+| xf2 | nine transducers in the Stepper form (`xremove xtake-while xdrop-while xtake-nth xmap-indexed xdedupe xinterpose xpartition-by xdistinct`) and a composition, ten checks | result 0; with one expectation edited `FAIL remove` and result 1 |
+| chunk | `map` over a chunked source with a 32-slot buffer (`cmap`), counting the calls of `f` for `take` 1, 32, 33, 40 over `(range 0 100)`, 1 over `(range 0 10)`, 5 over `(range 0 0)` | `[32 32 64 64 10 0]` |
+| keyed | `Keyed` and `Lookup` for `str` and `Array` | `[true false]`, `(some c)`, `[true false]`, `nil` |
+| int1, int2, pred1 | `(- (int \a) (int \0))` today; `ToInt` and `ToLong` instances for `char`; `(string? "a")` today | `unbound name int`; `104`; `unbound name string?` |
+
+The edits of this revision that touch a `ran:` block were re-run with the program that exercises it: `fib.seqable` (vseq), `fib.xf` (t10 and xf2), `fib.coll` (keyed), `fib.core` (u16cmp), `fib.array` (aset2); the other blocks (`fib.seq`, `fib.seq.cursor`,
+`fib.cmp`, `fib.truthy`) are unchanged but for the marker of `fib.seq`, which now says that it is an excerpt.
