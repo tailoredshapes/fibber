@@ -1,8 +1,9 @@
 //! `unsafe` memory (syntax §3.15, types §6.13): `alloc`, `free`, the
 //! loads and stores, `ptr+`, `raw`, `raw-retained`, `release-raw`, and
-//! the one `extern` the prelude declares (`write`). Raw memory is a
-//! byte arena of its own: fibber objects are never raw memory, and
-//! `raw` hands out a tagged address that only `release-raw` reads back.
+//! the one `extern` the prelude declares (`write`; `strtod.rs` has the
+//! others). Raw memory is a byte arena of its own: fibber objects are
+//! never raw memory, and `raw` hands out a tagged address that only
+//! `release-raw` reads back.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -56,6 +57,24 @@ impl RawMemory {
                 RunError::trap(format!("access of {len} bytes at {p:#x} out of bounds"))
             })?;
         Ok(&mut block[off..end])
+    }
+
+    /// The bytes from `p` up to its terminating NUL, which must lie in
+    /// the same block (a C string in raw memory).
+    pub fn c_string(&mut self, p: u64) -> R<Vec<u8>> {
+        let (b, off) = split(p)?;
+        let block = self
+            .blocks
+            .get(b)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| RunError::trap(format!("access to {p:#x}, not a live block")))?;
+        let tail = block.get(off..).unwrap_or_default();
+        match tail.iter().position(|c| *c == 0) {
+            Some(n) => Ok(tail[..n].to_vec()),
+            None => Err(RunError::trap(format!(
+                "the string at {p:#x} has no NUL before the end of its block"
+            ))),
+        }
     }
 
     /// A little-endian load of `len` bytes, sign-extended.

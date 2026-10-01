@@ -5,8 +5,8 @@
 (declare fclose i32 (ptr))
 (declare fread i64 (ptr i64 i64 ptr))
 (declare fwrite i64 (ptr i64 i64 ptr))
-(declare fseek i32 (ptr i64 i32))
-(declare ftell i64 (ptr))
+(declare ferror i32 (ptr))
+(declare realloc ptr (ptr i64))
 (global internal fib.argc i32 (i32 0))
 (global internal fib.argv ptr (ptr null))
 
@@ -49,31 +49,58 @@
   (block next (let ((i2 (add i (i64 1)))) (br loop)))
   (block done (ret)))
 
-;; (read-file path): the whole file as a str, or null when it cannot
-;; be opened or read, or is not UTF-8.
-(define internal (fib.read-file ptr) ((ptr path))
+;; Whether path names a file at all: fopen reads its name as a C string,
+;; so a NUL inside the str would silently name the file before it. The
+;; interpreter's std::fs refuses such a name.
+(define internal (fib.path-ok i1) ((ptr path))
   (block entry
+    (ret (icmp eq (call @strlen (call @fib.str-bytes-ptr path)) (call @fib.str-len path)))))
+
+;; (read-file path): the whole file as a str, or null when the path
+;; cannot be opened, cannot be read to its end, or is not UTF-8. A
+;; directory opens and then fails its first read (EISDIR), so every
+;; file is read until fread falls short, and a short read is the end of
+;; the file only when ferror says it was not an error. (A size from
+;; fseek and ftell is no help: lseek says LONG_MAX for a directory on
+;; ext4 and fails on a /proc file, whose text the interpreter does read.)
+(define internal (fib.read-file ptr) ((ptr path))
+  (block entry (br (call @fib.path-ok path) open none))
+  (block none (ret (ptr null)))
+  (block open
     (let ((f (call @fopen (call @fib.str-bytes-ptr path) (string "rb"))))
       (br (icmp eq f (ptr null)) none opened)))
-  (block none (ret (ptr null)))
   (block opened
-    (call @fseek f (i64 0) (i32 2))
-    (let ((n (call @ftell f)))
-      (call @fseek f (i64 0) (i32 0))
-      (br (icmp slt n (i64 0)) fail read)))
-  (block fail (call @fclose f) (ret (ptr null)))
-  (block read
-    (let ((s (call @fib.str-new n))
-          (p (call @fib.str-bytes-ptr s))
-          (got (call @fread p (i64 1) n f)))
+    (let ((b0 (call @malloc (i64 4096))))
+      (br (icmp eq b0 (ptr null)) nomem loop)))
+  (block nomem (call @fclose f) (ret (ptr null)))
+  (block loop
+    (let ((buf (phi ptr (opened b0) (grown b1)))
+          (len (phi i64 (opened (i64 0)) (grown len2)))
+          (cap (phi i64 (opened (i64 4096)) (grown cap2)))
+          (room (sub cap len))
+          (got (call @fread (getelementptr i8 buf len) (i64 1) room f))
+          (len2 (add len got)))
+      (br (icmp eq got room) grow done)))
+  (block grow
+    (let ((cap2 (mul cap (i64 2)))
+          (b1 (call @realloc buf cap2)))
+      (br (icmp eq b1 (ptr null)) nomem2 grown)))
+  (block nomem2 (call @free buf) (call @fclose f) (ret (ptr null)))
+  (block grown (br loop))
+  (block done
+    (let ((bad (call @ferror f)))
       (call @fclose f)
-      (br (and (icmp eq got n) (call @fib.utf8-valid p n)) ok bad)))
-  (block ok (ret s))
-  (block bad (call @fib.release s) (ret (ptr null))))
+      (br (and (icmp eq bad (i32 0)) (call @fib.utf8-valid buf len2)) ok fail)))
+  (block ok
+    (let ((s (call @fib.str-from-bytes buf len2)))
+      (call @free buf)
+      (ret s)))
+  (block fail (call @free buf) (ret (ptr null))))
 
 ;; (write-file path text): whether the whole text was written.
 (define internal (fib.write-file i1) ((ptr path) (ptr text))
-  (block entry
+  (block entry (br (call @fib.path-ok path) open no))
+  (block open
     (let ((f (call @fopen (call @fib.str-bytes-ptr path) (string "wb"))))
       (br (icmp eq f (ptr null)) no opened)))
   (block no (ret (i1 0)))

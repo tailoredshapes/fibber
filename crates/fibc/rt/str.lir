@@ -64,9 +64,25 @@
   (block yes (ret (call @fib.str-from-bytes (string "true") (i64 4))))
   (block no (ret (call @fib.str-from-bytes (string "false") (i64 5)))))
 
-;; show of a float (types §2.12): the shortest %e text that reads back
-;; at the value's width, laid out positionally with .0 when integral;
-;; NaN, inf, -inf. Written with the shortest digits into `out`.
+;; show of a float (types §2.12): the shortest decimal that reads back
+;; at the value's width, the one nearest the value among those of that
+;; length (an exact tie goes up), laid out positionally with .0 when
+;; integral; NaN, inf, -inf. This is the text of Rust's `{}`, which the
+;; interpreter prints (eval/arith.rs float_text), found with libc:
+;;
+;; - `%.800e` writes the exact decimal expansion of the value (a double
+;;   has at most 767 significant digits), whose first n digits D are
+;;   the n-digit decimal just below it in magnitude;
+;; - for n = 1, 2, .. the decimals of n digits that can read back are
+;;   D and D plus one unit in the last place, the two that bracket the
+;;   value (every other n-digit decimal is farther, and the values that
+;;   read back to x are an interval around it);
+;; - each one is read back with strtod (strtof at single width), so the
+;;   boundaries of the interval and the narrow interval below a power
+;;   of two are decided by libc's rounding and not by a rule of ours;
+;; - the first n where one reads back wins; when both do, the nearer:
+;;   D plus a unit is nearer when the next digit of the expansion is 5
+;;   or more (a tie, 5 then zeros, goes up).
 (declare strtod double (ptr ptr))
 (declare strtof float (ptr ptr))
 (declare memset ptr (ptr i32 i64))
@@ -149,30 +165,100 @@
       (call @memcpy (getelementptr i8 out (add o2 z)) digits n)
       (ret (add (add o2 z) n)))))
 
+;; Whether the decimal d.ddd e<e> of the n digits, with a leading - when
+;; neg, reads back to x: it is written into buf (at least 40 bytes) and
+;; read with strtod or strtof.
+(define internal (fib.fp-reads i1) ((ptr buf) (ptr digits) (i64 n) (i64 e) (i1 neg) (double x) (i1 single))
+  (block entry
+    (store (i8 45) buf)
+    (let ((at (getelementptr i8 buf (select neg (i64 1) (i64 0))))
+          (first (zext i32 (load i8 digits)))
+          (prec (trunc i32 (sub n (i64 1))))
+          (rest (getelementptr i8 digits (i64 1))))
+      (call @snprintf at (i64 40) (string "%c.%.*se%d") first prec rest (trunc i32 e))
+      (ret (call @fib.fp-exact buf x single)))))
+
+;; Adds one to the n-digit decimal at d, in place. Returns whether it
+;; was all nines: then it is now 1 then zeros, and the caller adds one
+;; to the exponent.
+(define internal (fib.fp-bump i1) ((ptr d) (i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry n) (nine k))))
+      (br (icmp eq i (i64 0)) carry step)))
+  (block step
+    (let ((k (sub i (i64 1)))
+          (p (getelementptr i8 d k))
+          (c (load i8 p)))
+      (br (icmp eq c (i8 57)) nine bump)))
+  (block nine
+    (store (i8 48) p)
+    (br loop))
+  (block bump
+    (store (add c (i8 1)) p)
+    (ret (i1 0)))
+  (block carry
+    (store (i8 49) d)
+    (ret (i1 1))))
+
+;; The n-digit decimal to show, if one reads back: ds holds the digits of
+;; the exact expansion and e its exponent. Of the two decimals that
+;; bracket the value, D (the first n digits) and D plus a unit, the one
+;; that reads back is written into cand with its exponent into eout and
+;; 1 is returned; when both read back, the nearer; when neither, 0.
+(define internal (fib.fp-at i1) ((ptr ds) (i64 n) (i64 e) (ptr cand) (ptr buf) (i1 neg) (double x) (i1 single) (ptr eout))
+  (block entry
+    (call @memcpy cand ds n)
+    (let ((down (call @fib.fp-reads buf cand n e neg x single))
+          (carry (call @fib.fp-bump cand n))
+          (e2 (add e (zext i64 carry)))
+          (up (call @fib.fp-reads buf cand n e2 neg x single))
+          (half (icmp uge (load i8 (getelementptr i8 ds n)) (i8 53)))
+          (nearer (or half (xor down (i1 1)))))
+      (br (and up nearer) take-up check-down)))
+  (block take-up
+    (store e2 eout)
+    (ret (i1 1)))
+  (block check-down (br down take-down none))
+  (block take-down
+    (call @memcpy cand ds n)
+    (store e eout)
+    (ret (i1 1)))
+  (block none (ret (i1 0))))
+
 (define internal (fib.show-fp ptr) ((double x) (i1 single))
   (block entry (br (fcmp uno x x) nan finite))
   (block nan (ret (call @fib.str-from-bytes (string "NaN") (i64 3))))
   (block finite
-    (let ((buf (alloca i8 (i32 64)))
-          (len0 (call @snprintf buf (i64 64) (string "%.0e") x))
+    (let ((buf (alloca i8 (i32 832)))
+          (len0 (call @snprintf buf (i64 832) (string "%.800e") x))
           (c0 (load i8 buf))
           (c1 (load i8 (getelementptr i8 buf (i64 1)))))
-      (br (or (icmp eq c0 (i8 105)) (icmp eq c1 (i8 105))) inf search)))
+      (br (or (icmp eq c0 (i8 105)) (icmp eq c1 (i8 105))) inf prep)))
   (block inf (ret (call @fib.str-from-bytes buf (sext i64 len0))))
-  (block search
-    (let ((p (phi i32 (finite (i32 0)) (more p2))))
-      (call @snprintf buf (i64 64) (string "%.*e") p x)
-      (br (call @fib.fp-exact buf x single) found more)))
-  (block more
-    (let ((p2 (add p (i32 1))))
-      (br (icmp sgt p2 (i32 17)) found search)))
-  (block found
-    (let ((digits (alloca i8 (i32 32)))
+  (block prep
+    (let ((ds (alloca i8 (i32 832)))
           (exp (alloca i64))
-          (out (alloca i8 (i32 400)))
-          (n (call @fib.fp-parse buf digits exp))
-          (neg (icmp eq (load i8 buf) (i8 45)))
-          (m (call @fib.fp-layout out digits n (load i64 exp) neg)))
+          (eout (alloca i64))
+          (cand (alloca i8 (i32 24)))
+          (cbuf (alloca i8 (i32 48)))
+          (neg (icmp eq c0 (i8 45))))
+      (call @fib.fp-parse buf ds exp)
+      (let ((e0 (load i64 exp)))
+        (br search))))
+  (block search
+    (let ((n (phi i64 (prep (i64 1)) (more n2)))
+          (hit (call @fib.fp-at ds n e0 cand cbuf neg x single eout)))
+      (br hit found more)))
+  (block more
+    (let ((n2 (add n (i64 1))))
+      (br (icmp sgt n2 (i64 17)) bad search)))
+  (block bad
+    (call @fib.trap-c (string "show: no shortest digits"))
+    (unreachable))
+  (block found
+    (let ((out (alloca i8 (i32 400)))
+          (m (call @fib.fp-layout out cand n (load i64 eout) neg)))
       (ret (call @fib.str-from-bytes out m)))))
 
 (define internal (fib.show-double ptr) ((double x))

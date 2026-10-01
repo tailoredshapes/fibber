@@ -59,10 +59,12 @@ impl Interp<'_> {
         }
     }
 
-    /// A call to an `extern`: only the prelude's `write` exists here.
+    /// A call to an `extern`: only `write` (the prelude's), `strtod` and
+    /// `strtof` (syntax §3.15) exist here.
     pub fn call_extern(&mut self, x: ExternId, a: &[Val]) -> R<Val> {
         let ext = self.p.globals.ext(x);
         match (ext.name.as_str(), a) {
+            (name @ ("strtod" | "strtof"), _) => self.strto(name, &ext.ty.clone(), a),
             ("write", [fd, Val::Ptr(p), n]) => {
                 let w = self.raw.write(fd.as_int()?, *p, n.as_int()?)?;
                 Ok(Val::Int(w, crate::types::ty::Scalar::I64))

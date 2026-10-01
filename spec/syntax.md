@@ -954,6 +954,22 @@ extern, an argument past the fixed parameters of type `bool`, `i8`,
 promotes it; lIR rejects the unpromoted argument (lir.md §7.1,
 **Decided**, owner, 2026-09-28).
 
+The reference interpreter has no C library, so it provides three externs
+and stops at any other with `unsupported: extern NAME is not available in
+the reference interpreter`: the prelude's `write` (descriptors 1 and 2),
+and `strtod` and `strtof`, which must be declared `(ptr ptr) -> f64` and
+`(ptr ptr) -> f32`. They convert the start of the NUL-terminated string
+in raw memory as C does in the C locale: white space, a sign, then `inf`,
+`infinity`, `nan` or `nan(chars)` in any case, or decimal digits with an
+optional `.` and exponent; the value is correctly rounded at the result's
+own width and overflows to infinity; with no number the result is 0 and
+the end is the start; the end address is stored through the second
+argument unless that is null (`(load-ptr c)` after `(store-i64 c 0)`).
+Decimal only: a hexadecimal float (`0x1p3`) stops the run with
+`unsupported: hex float`, so that the interpreter never converts it as
+the `0` before the `x` and disagrees with the compiled program silently
+(**Proposed**; case 189 pins the rest).
+
 ### 3.16 `quote`, `quasiquote`, `defmacro`, `Form`
 
 ```
@@ -1363,7 +1379,7 @@ expander treat them as calls.
 | conversions (target type first) | `trunc zext sext fptrunc fpext fptosi fptoui sitofp uitofp char->i32 i32->char` |
 | arrays (types §2.13) | `array array-len array-get array-with array-copy array-set!` |
 | structs | `set-field!` |
-| the program's surroundings (M5) | `(args) -> (Vec str)`, the command line after the program (`fibc run FILE -- a b`, `fibref run FILE -- a b`, or a built executable's own); `(read-file path: str) -> (Option str)`, the whole file, `nil` when it cannot be read or is not UTF-8; `(write-file path: str text: str) -> bool`, whether the whole text was written |
+| the program's surroundings (M5) | `(args) -> (Vec str)`, the command line after the program (`fibc run FILE -- a b`, `fibref run FILE -- a b`, or a built executable's own); `(read-file path: str) -> (Option str)`, the whole file, `nil` when it cannot be read (a directory, a missing or unreadable file, a path with a NUL in it) or is not UTF-8, `(some "")` only for a file that is empty; `(write-file path: str text: str) -> bool`, whether the whole text was written (false for a path with a NUL in it) |
 | strings | `str-len str-bytes str-from-bytes str-concat str-slice str-eq starts-with?` and `Countable`/`Eq`/`Ord`/`Hash` instances; `(str-from-bytes a: (Array i8)) -> str` is a fresh string of the bytes and traps `str-from-bytes: invalid UTF-8` unless they are the shortest UTF-8 encodings of scalar values (M5) |
 | forms | `Form` constructors, `gensym`, `struct?`, `struct-fields`, `struct-params`, `struct-field-types`, `enum?`, `enum-params`, `enum-variants` (§3.16) |
 | `Option` (built in, §3.9) | `some` (constructor), `nil` (a literal, §1.1); `nil?`, `some?`, `if-let` are prelude definitions (§4.4, §4.5) |

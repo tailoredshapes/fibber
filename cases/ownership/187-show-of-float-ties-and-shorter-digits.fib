@@ -1,0 +1,43 @@
+;; spec:   types §2.12
+;; expect: accept
+;; result: 12
+;; audit:  clean
+;; The text of show on a float is the shortest digits that read back at
+;; the value's width, and among those of that length the nearest to the
+;; value, an exact tie going up (types §2.12). The first rounding that
+;; reads back is not always that text, and printf rounds a tie to even.
+;; Three kinds of value, each checked against the expected text (a hit
+;; counts 1, so a wrong digit lowers the verdict):
+;;   - exact ties: 2^-25 and 2^-24 (a 5 and no more digits after the 17th
+;;     and after the 16th),
+;;     222507385850720.125 and 1125899906842624.25 (not powers of two),
+;;     and at f32 2^-12 and 2097152.25;
+;;   - powers of two, whose interval is narrower below than above: the
+;;     nearest digits of 2^-44 and 2^-77 lie below the value, outside
+;;     it, and the shortest reading lies above; 2^-1017 (a text of 324
+;;     characters: its length and last sixteen are checked) and, at f32,
+;;     2^90 are the same;
+;;   - 0.1 + 0.2, whose shortest text really has 17 digits.
+(defun chk (s: str e: str) -> i64 (if (str-eq s e) 1 0))
+
+;; A long text by its length and its last sixteen characters.
+(defun chk-long (s: str n: i64 tail: str) -> i64
+  (if (= (str-len s) n) (chk (str-slice s (- n 16) n) tail) 0))
+
+(defun sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (acc 0))
+    (if (= i (count v)) acc (recur (+ i 1) (+ acc (nth v i))))))
+
+(defun main () -> i64
+  (sum [(chk (show 2.9802322387695313e-8) "0.000000029802322387695313")
+        (chk (show -2.9802322387695313e-8) "-0.000000029802322387695313")
+        (chk (show 5.960464477539063e-8) "0.00000005960464477539063")
+        (chk (show 222507385850720.13) "222507385850720.13")
+        (chk (show 1125899906842624.3) "1125899906842624.3")
+        (chk (show 5.684341886080802e-14) "0.00000000000005684341886080802")
+        (chk (show 6.617444900424222e-24) "0.000000000000000000000006617444900424222")
+        (chk-long (show 7.120236347223045e-307) 324 "7120236347223045")
+        (chk (show 2.44140625e-4f32) "0.00024414063")
+        (chk (show 2097152.3f32) "2097152.3")
+        (chk (show 1.2379401e27f32) "1237940100000000000000000000.0")
+        (chk (show (+ 0.1 0.2)) "0.30000000000000004")]))

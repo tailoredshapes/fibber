@@ -245,3 +245,30 @@ Cases 185 and 186 pin the program's surroundings (M5; syntax §4.3,
 be written (185, 124); and `(args)`, none under the harness so their
 count is 0, after a `println` that the harness's compiled side reads
 past (186, 0; `fibc run FILE -- a b` gives 2, `crates/fibc/tests/cli.rs`).
+
+Case 187 pins the text of `show` on floats where the first `%.*e`
+that reads back is not the shortest nearest text (types §2.12): exact
+ties, which go up and not to even (2^-25, 2^-24, 222507385850720.125,
+1125899906842624.25 and, at f32, 2^-12 and 2097152.25), powers of two,
+whose rounding interval is narrower below than above (2^-44, 2^-77,
+2^-1017 and, at f32, 2^90), and 0.1 + 0.2; twelve texts, each hit
+counting 1 (187, 12; the runtime that took the first `%.*e` that read
+back scored 1).
+
+Case 188 pins `read-file`'s failures (syntax §4.3): `nil` for a
+directory, which opens and then fails to read, for a path that does not
+exist and for a path with a NUL in it (which names no file, not the
+file before the NUL), `(some "")` only for a file that is really empty,
+a repo file read whole from the repo root or a crate's directory, and
+`write-file` of a NUL path false (188, 111111; the runtime that sized
+the read with ftell crashed on a directory where lseek says LONG_MAX
+and answered `(some "")` where it says 0).
+
+Case 189 pins the `strtod` and `strtof` externs that the reader's
+number.fib declares (syntax §3.15), in the interpreter as compiled:
+overflow to infinity, `2.5e-3`, 0.1 at f32 against f64, a tie and a hair
+above a tie at f32, trailing garbage and the end pointer's offsets, no
+number, -Infinity, nan, a null end pointer, `1e` and `.5.`, and 1e39 at
+both widths (189, 9250558984191; the interpreter that had only `write`
+stopped at `extern strtod is not available`, and one that rounded
+through f64 for strtof scored 8 less).

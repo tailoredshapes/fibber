@@ -1,0 +1,32 @@
+;; spec:   syntax §4.3 (M5)
+;; expect: accept
+;; result: 111111
+;; audit:  clean
+;; read-file is nil whenever the file cannot be read, and (some "") only
+;; for a file that is really empty. A directory opens and then fails to
+;; read (EISDIR): nil, not an empty string (1). A path that does not
+;; exist is nil (10). A repo file reads whole (100); the harness runs
+;; from the repo root or from a crate's directory, so the path is tried
+;; both ways. A file the program just wrote with no bytes is (some "")
+;; (1000). A path with a NUL in it names no file: read-file of it is nil
+;; (10000), not the empty file just before the NUL, and write-file of it
+;; is false (100000), not a write to the file before the NUL.
+(defun repo-file (rel: str) -> (Option str)
+  (match (read-file rel)
+    ((some t) (some t))
+    (nil (read-file (str-concat "../../" rel)))))
+
+(defun main () -> i64
+  (let ((empty "/tmp/fibber-case-188-empty.txt")
+        (nul (str-join ["/tmp/fibber-case-188-empty.txt" "\0" "x"]))
+        (nul-w (str-join ["/tmp/fibber-case-188-nul-w.txt" "\0" "x"])))
+    (+ (match (read-file "/") ((some _) -1) (nil 1))
+       (+ (match (read-file "/tmp/fibber-no-such-dir/x") ((some _) -10) (nil 10))
+          (+ (match (repo-file "spec/method.md")
+               ((some t) (if (starts-with? t "# Method\n") 100 -100))
+               (nil -100))
+             (+ (if (write-file empty "")
+                    (match (read-file empty) ((some t) (if (= (str-len t) 0) 1000 -1000)) (nil -1000))
+                    -1000)
+                (+ (match (read-file nul) ((some _) -10000) (nil 10000))
+                   (if (write-file nul-w "a") -100000 100000))))))))

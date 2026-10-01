@@ -3,6 +3,7 @@
 
 mod atoms;
 mod calls;
+mod externs;
 mod macros;
 mod memory;
 mod objects;

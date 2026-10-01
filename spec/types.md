@@ -584,10 +584,12 @@ its decimal digits with a leading `-` when negative; a `bool` as
 `true` or `false`; a `char` as its UTF-8 encoding; a keyword as `:`
 and its name; a field-less enum as its variant's name; unit as `()`; a
 float as the shortest decimal that reads back to the same value at
-its width, written positionally (never with an exponent, however
-large or small), with `.0` added when it has no fraction, so `100.0`,
-`-0.0`, `0.0000001` and `1000000000000000000000.0`, and `NaN`, `inf`
-and `-inf` for the values that are not finite. `hash` of an integer is
+its width (among those of that length the one nearest the value, an
+exact tie going to the larger magnitude, as Rust's `{}` prints it),
+written positionally (never with an exponent, however large or small),
+with `.0` added when it has no fraction, so `100.0`, `-0.0`,
+`0.0000001` and `1000000000000000000000.0`, and `NaN`, `inf` and `-inf`
+for the values that are not finite. `hash` of an integer is
 its value, of a `bool` or a `char` its code, of a field-less enum its
 variant index, of a keyword the 64-bit FNV-1a of its name and of a
 `str` of its bytes, of a float the bits of its value as an `f64`, of

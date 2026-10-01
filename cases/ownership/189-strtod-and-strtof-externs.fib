@@ -1,0 +1,99 @@
+;; spec:   syntax §3.15 (M6, method.md rule 6)
+;; expect: accept
+;; result: 9250558984191
+;; audit:  clean
+;; The libc conversions the reader's number.fib declares as externs,
+;; strtod and strtof, in the interpreter as compiled. Fourteen checks of
+;; the converted value are bits of the result (1, 2, 4 ...): 1e999
+;; overflows to infinity; 2.5e-3; 0.1 rounded once at f32 and once at
+;; f64 (the two differ); 16777217 at both widths (a tie at f32, which
+;; rounds to even) and a hair above the tie (rounds up: converting to
+;; f64 first would turn it into the tie); garbage after the number;
+;; white space and a sign before it; no number at all (0); -Infinity;
+;; nan; a null end pointer; an exponent without digits (1e); ".5.";
+;; and 1e39, finite at f64 and infinity at f32. The end pointer's
+;; offsets are the rest, as decimal digits in the order of the parses
+;; that have one: 5 6 4 6 0 9 3 1 2.
+(extern strtod :private (ptr ptr) -> f64)
+(extern strtof :private (ptr ptr) -> f32)
+
+;; What a conversion gave: the value, and how many bytes it consumed
+;; (-1 when the end pointer was null).
+(defstruct Got (x: f64 used: i64))
+
+;; A NUL-terminated copy of s, for the caller to free.
+(defun c-string (s: str) -> ptr
+  (let ((bs (str-bytes s))
+        (n (array-len bs)))
+    (unsafe
+      (let ((p (alloc (+ n 1))))
+        (do (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+            (store-i8 (ptr+ p n) 0i8)
+            p)))))
+
+;; A null pointer: (alloc) memory is not zeroed when compiled, so the
+;; zero is stored first.
+(defun null-ptr () -> ptr
+  (unsafe
+    (let ((c (alloc 8)))
+      (do (store-i64 c 0)
+          (let ((n (load-ptr c)))
+            (do (free c) n))))))
+
+(defun dec (s: str null-end: bool) -> Got
+  (unsafe
+    (let ((p (c-string s))
+          (e (alloc 8))
+          (b (alloc 8)))
+      (do (store-ptr b p)
+          (let ((x (strtod p (if null-end (null-ptr) e)))
+                (used (if null-end -1 (- (load-i64 e) (load-i64 b)))))
+            (do (free e) (free b) (free p) (Got x used)))))))
+
+;; strtof's value widened to f64 (exact), with the same offset.
+(defun sgl (s: str) -> Got
+  (unsafe
+    (let ((p (c-string s))
+          (e (alloc 8))
+          (b (alloc 8)))
+      (do (store-ptr b p)
+          (let ((x (strtof p e))
+                (used (- (load-i64 e) (load-i64 b))))
+            (do (free e) (free b) (free p) (Got (fpext f64 x) used)))))))
+
+(defun bit (c: bool w: i64) -> i64 (if c w 0))
+
+(defun main () -> i64
+  (let ((big (dec "1e999" false))
+        (small (dec "2.5e-3" false))
+        (tenth (dec "0.1" false))
+        (tenth32 (sgl "0.1"))
+        (tie32 (sgl "16777217"))
+        (tie64 (dec "16777217" false))
+        (dust32 (sgl "16777217.00000000000000001"))
+        (kg (dec "12.5kg" false))
+        (padded (dec "  -7e2xyz" false))
+        (none (dec "abc" false))
+        (ninf (dec "-Infinity!" false))
+        (nan (dec "nan" false))
+        (nullend (dec "3.75e1 rest" true))
+        (bare-e (dec "1e" false))
+        (dots (dec ".5." false))
+        (wide (dec "1e39" false))
+        (narrow (sgl "1e39")))
+    (+ (+ (+ (+ (bit (> (. big x) 1.7976931348623157e308) 1)
+                 (bit (= (. small x) 0.0025) 2))
+              (+ (bit (and (= (. tenth x) 0.1) (and (= (. tenth32 x) (fpext f64 0.1f32)) (!= (. tenth32 x) 0.1))) 4)
+                 (bit (and (= (. tie32 x) 16777216.0) (and (= (. tie64 x) 16777217.0) (= (. dust32 x) 16777218.0))) 8)))
+           (+ (+ (bit (= (. kg x) 12.5) 16)
+                 (bit (= (. padded x) -700.0) 32))
+              (+ (bit (and (= (. none x) 0.0) (= (. none used) 0)) 64)
+                 (bit (< (. ninf x) -1.7976931348623157e308) 128))))
+       (+ (+ (+ (bit (!= (. nan x) (. nan x)) 256)
+                (bit (= (. nullend x) 37.5) 512))
+             (+ (bit (= (. bare-e x) 1.0) 1024)
+                (bit (= (. dots x) 0.5) 2048)))
+          (+ (+ (bit (and (< (. wide x) 1.7976931348623157e308) (> (. wide x) 1e38)) 4096)
+                (bit (> (. narrow x) 1.7976931348623157e308) 8192))
+             (* 16384 (loop ((i 0) (acc 0) (us [(. big used) (. small used) (. kg used) (. padded used) (. none used) (. ninf used) (. nan used) (. bare-e used) (. dots used)]))
+                        (if (< i (count us)) (recur (+ i 1) (+ (* acc 10) (nth us i)) us) acc))))))))

@@ -57,21 +57,29 @@
   (block entry (ret (load i8 (getelementptr i8 @fib.classes (zext i64 tid))))))
 
 ;; §8.2: malloc; count 1, tid, flags 0. In trace mode 16 bytes in
-;; front hold the ordinal (compiler.md §4).
+;; front hold the ordinal (compiler.md §4). A failed malloc is the trap
+;; "out of memory", not a write through a null pointer.
 (define internal (fib.alloc ptr) ((i64 size) (i32 tid))
   (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain))
   (block plain
     (let ((p (call @malloc size)))
-      (call @fib.init-hdr p tid (i32 0))
-      (ret p)))
+      (br (icmp eq p (ptr null)) oom plainok)))
+  (block plainok
+    (call @fib.init-hdr p tid (i32 0))
+    (ret p))
   (block traced
-    (let ((q (call @malloc (add size (i64 16))))
-          (n (call @fib.next-ordinal))
+    (let ((q (call @malloc (add size (i64 16)))))
+      (br (icmp eq q (ptr null)) oom tracedok)))
+  (block tracedok
+    (let ((n (call @fib.next-ordinal))
           (p2 (getelementptr i8 q (i64 16))))
       (store n q)
       (call @fib.init-hdr p2 tid (i32 0))
       (call @fib.trace-line (i8 65) n (call @fib.class tid))
-      (ret p2))))
+      (ret p2)))
+  (block oom
+    (call @fib.trap-c (string "out of memory"))
+    (unreachable)))
 
 (define internal (fib.init-hdr void) ((ptr p) (i32 tid) (i32 flags))
   (block entry

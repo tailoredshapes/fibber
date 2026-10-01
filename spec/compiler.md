@@ -328,9 +328,15 @@ as described.
     width, positional, with `.0` when integral, and `NaN`, `inf`,
     `-inf`. The interpreter printed both with Rust's `{:?}`, which the
     runtime could not reproduce; it now follows §2.12 (eval/arith.rs
-    `float_text`), and the runtime finds the shortest digits by trying
-    `%.*e` from 0 up until `strtod` (or `strtof`) reads the value back
-    (`rt/str.lir` `fib.show-fp`).
+    `float_text`), and the runtime finds the same digits with libc:
+    the exact expansion from `%.800e`, then for each length n the two
+    n-digit decimals that bracket the value, kept if `strtod` (or
+    `strtof`) reads them back, the nearer winning and a tie going up
+    (`rt/str.lir` `fib.show-fp`; `fibc/tests/floats.rs` compares tens of
+    thousands of values with `float_text`, case 187 pins the ties). The
+    first version took the first `%.*e` from 0 up that read back, which
+    rounds a tie to even and misses a shorter reading above a power of
+    two.
 12. **A threaded run that traps has no comparable trace** (**Decided**,
     owner, 2026-09-30; §4). Found by `fibc gen` (fibgen seed 162, size
     6): the interpreter's threads had allocated 38 objects when one
