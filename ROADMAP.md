@@ -230,6 +230,69 @@ State (spec/bootstrap.md, **Proposed**; `compiler/`):
 - [ ] step 2, the expander; then types, ownership, the lIR emitter
 
 `lair` (lIR to native, via LLVM) stays in Rust, as LLVM stays in C++.
+The C interface to `lair` (spec/compiler.md §9) is a stopgap, not a
+design to polish: once there is a compiler, `lair` itself is to be
+rewritten in fibber (owner, 2026-10-01), at which point this line and
+that interface go.
+
+## M7. A standard library as ergonomic as Clojure's, as fast as Rust's
+
+**Aim** (owner, 2026-10-01): "steal Clojure's, or as close to it";
+improve inconsistencies and un-idiomatic corners where there is a reason;
+the language is to be as ergonomic as Clojure with a run-time
+performance that rivals Rust. Status: **Proposed**, not started; the
+rules below are mine, for the owner to amend.
+
+Rules:
+
+1. **Clojure's names and shapes first.** `map filter reduce assoc conj
+   get first rest nth into take drop partition group-by frequencies
+   sort-by update assoc-in get-in merge select-keys keys vals str ...`,
+   with Clojure's argument order (sequence functions take the
+   collection last, collection functions first, so `->` and `->>` keep
+   working). A deviation is recorded with its reason in a table
+   (spec/stdlib.md), the way spec/bootstrap.md §4 records gaps. The
+   known inconsistencies to decide, not inherit: `contains?` on a
+   vector (index, not element), `nil` punning against fibber's
+   `Option`, `rest` versus `next`, `=` across numeric types, `first` of
+   a map, `conj` onto a list versus a vector, `empty?` versus `seq`.
+2. **Zero-cost by construction.** Everything generic is monomorphised
+   and protocol calls are static (compiler.md §7). Sequence functions
+   work over `Traversable`/`Iter` and return fused adaptors, not lazy
+   cells: `(->> v (map f) (filter p) (reduce g 0))` must compile to the
+   loop a Rust iterator chain does, with no allocation per element.
+   Materialising is explicit (`vec`, `into`, `set`, `zipmap`), and
+   transducers (`transduce`, `into` with an `xf`) compose the same way.
+3. **Persistent in the API, in place when unique.** `assoc` and `conj`
+   keep the value semantics of Clojure; where the ownership checker
+   proves the collection unique (types §6, the unique write) they
+   update in place, so a loop of `assoc`s is Clojure's transient
+   without the transient API. Whether that holds for each collection is
+   a test, not a belief.
+4. **Unboxed elements, good hashing.** A `(Vec i64)` stores `i64`s; the
+   hash is a real one (the FNV-1a of types §2.12 is a spec text and
+   slow on integers; decide a replacement before the HAMT's speed is
+   judged); sorted maps and sets (a B-tree), queues, a small-vector fast
+   path, `str` building without quadratic copies.
+5. **Measured against Rust, not asserted.** A benchmark suite of
+   programs written in fibber and in Rust (`Vec`, `HashMap`,
+   `BTreeMap`, iterator chains, string building, sorting) records the
+   ratio per kernel on the same machine; the target is within 1.5x on
+   typical kernels, and each kernel above it is an open item with its
+   cause. Ratios are tracked in a file and checked for regression;
+   they are not a CI gate until they are stable. The first deliverable
+   is the baseline of today's `Vec`/`Map`, before any redesign.
+6. **Every function has an executable test** (cases both ways, method
+   rule 6; generated programs against a model, rule 5), and the
+   compiler (M6) uses the library as it grows: what stage 2 needs
+   (`sort`, `Map` iteration order, formatting for diagnostics) comes
+   first.
+
+Order: baseline benchmarks and spec/stdlib.md (the table of names and
+deviations); sequences, transducers and `Iter` fusion; maps, sets and
+sorted collections; strings and formatting; then the long tail. It
+interleaves with M6: library items the compiler needs land first.
+
 
 ## Decisions
 
