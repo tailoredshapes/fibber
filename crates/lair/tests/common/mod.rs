@@ -5,6 +5,8 @@
 
 #![allow(dead_code)] // each test binary uses some of it
 
+pub mod bounded;
+
 use std::ffi::c_char;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -189,6 +191,15 @@ impl Drop for Watchdog {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
+}
+
+/// Says on the real standard error that `test` did not run, and why. A
+/// test that needs a tool the machine may lack (a sanitizer runtime, a C++
+/// compiler) ends with this instead of failing; the line is in the output
+/// of `cargo test`. (Not `eprintln!`: the test harness captures that and
+/// drops it when the test passes.)
+pub fn skip(test: &str, why: &str) {
+    let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {why}");
 }
 
 /// A scratch directory under the temp dir, removed when dropped, also

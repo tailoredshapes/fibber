@@ -31,11 +31,14 @@ Decisions taken on the way are in spec/types.md §10.
 - [x] evaluator following the checker's plan (`fibref run`), with
       threads, atoms and an async executor that is deterministic and
       fair (types §8.8, "The reference interpreter's schedule")
-- [x] case harness and CI: 184 cases in cases/ownership, all passing
-      with a clean audit (its README lists them by origin: the 20
-      decided, the promoted proposals, the rule-4 adversary's findings
-      81 to 95, the rule-5 generator's, and the owner's decisions of
-      2026-09-27 and 2026-09-28)
+- [x] case harness and CI: 191 cases in cases/ownership, all passing
+      with a clean audit (`fibref cases cases/ownership`, run
+      2026-10-01: "191 cases: 191 pass, 0 fail, 0 pending"; there were
+      184 when M5 closed and 187 to 190 and 192 to 194 came with M6,
+      case numbers 30, 35 and 191 being unused; its README lists them
+      by origin: the 20 decided, the promoted proposals, the rule-4
+      adversary's findings 81 to 95, the rule-5 generator's, and the
+      owner's decisions of 2026-09-27 and 2026-09-28)
 - [x] method rule 4: an adversary attacking the running interpreter;
       its 15 findings are cases 81 to 95
 - [x] method rule 5: `fibgen` generates random well-typed programs and
@@ -136,7 +139,8 @@ State (spec/compiler.md, **Decided**, owner, 2026-09-30; `crates/fibc`):
       compiler.md §4
 - [x] method rule 6 harness: `fibc cases` runs every case interpreted
       and compiled and compares results, rejections, traps and free
-      traces; all 184 cases pass both ways, 0 fail, 0 pending
+      traces; all 191 cases pass both ways, 0 fail, 0 pending
+      (`fibc cases cases/ownership`, run 2026-10-01)
 - [x] macros through the JIT: one macro-time module per `defmacro`,
       `gensym` and reflection through hooks into the expander;
       `tests/macros.rs` shows the expansions equal `fibref`'s on every
@@ -215,19 +219,53 @@ interpreted and compiled:
    suite and for the compiler itself, and the stage-3 compiler passes
    every case with a clean audit.
 
-State (spec/bootstrap.md, **Proposed**; `compiler/`):
+State (spec/bootstrap.md, **Proposed**; `compiler/`; the counts below
+are from runs on 2026-10-01):
 
 - [x] step 1, the reader: `compiler/syntax/*.fib` reads text to `Stx`
       (a form with its position) and prints it; `compiler/read.fib`
-      prints the same dump as `fibref read`, byte for byte, in dump and
-      `--print` mode over every `.fib` of the repo, ~980 edge inputs,
-      417 Unicode-class inputs and 300 generated ones
-      (`cargo test -p fibc --test bootstrap`). A review by mutation
-      (1797 mutants) found the gaps in that test; their killing inputs
-      are `compiler/tests/reader/rmut-*`. It found and fixed four
-      stage-1 bugs (spec/bootstrap.md §4)
-- [ ] a second mutation round against the print mode, not yet run
-- [ ] step 2, the expander; then types, ownership, the lIR emitter
+      prints what `fibref read` prints, in dump and in `--print` mode,
+      byte for byte and with the same exit status.
+      `cargo test -p fibc --test bootstrap` compares, in each mode:
+      1212 inputs (the 1211 `.fib` files of `cases/`, `lib/` and
+      `compiler/`, 983 of them the edge inputs of
+      `compiler/tests/reader/`, and the expander's prelude), 4
+      unreadable paths, 417 Unicode-class files and 300 generated
+      inputs; it reports a changed output of the real tool (the canary)
+      and reads five large inputs against a time bound of 5 s (the
+      slowest took 0.06 s). Two one-off mutation reviews (the first of
+      1797 mutants) found the gaps in that test; the scripts and mutant
+      lists are not in the repo, only the killing inputs are:
+      `compiler/tests/reader/rmut-001..021` and `rmut2-001..006`
+      (`rmut2-004..006` are the 250 KB timing inputs).
+- [x] the C interface to `lair` (spec/compiler.md §9): 21 `lair_*`
+      functions in `liblair.so` (`nm -D --defined-only
+      target/debug/liblair.so | grep -c ' T lair_'` prints 21),
+      declared in `crates/lair/include/lair.h`, which a unit test keeps
+      equal to the exports; the fibber bindings `compiler/lair/*.fib`
+      and `compiler/jit-demo.fib`, which runs the macro modules of
+      `cases/ownership` from fibber and compares them with the Rust
+      runner (`cargo test -p lair`, `crates/fibc/tests/capi.rs`).
+      `fibc build FILE -o OUT -L DIR -l LIB` links with an absolute
+      rpath per `-L` (`lair::aot::Options::lib_dirs`,
+      `crates/lair/tests/link.rs`). Not yet reachable through the C
+      interface: a library directory for `lair_build_executable`.
+- [x] stage-1 faults the compiler work found, each fixed with a case or
+      a test (spec/bootstrap.md §4 has 13 rows): float `show` (case
+      187), `read-file` (188), `strtod`/`strtof` in the interpreter
+      (189), `alloc` zeroed (190), `println` writes (192), a raw `ptr`
+      counted as an object (193), float bit casts (194), the macro
+      module's keyword table, `(args)` bytes, `fibc build -L`, and out
+      of memory in the runtime; two more rows are notes. Open: a failed
+      `(alloc 1000000000000000)` aborts the interpreter ("memory
+      allocation of 1000000000000000 bytes failed") and gives the
+      compiled program a null pointer that it carries on with; syntax
+      §3.15 is silent and no case pins either.
+- [ ] a mutation review that can be repeated: both reviews of the
+      reader ran from scripts that are not in the repo
+- [ ] step 2, the expander (`compiler/lair/expand.fib` runs one macro
+      from fibber; the expander itself is not started); then types,
+      ownership, the lIR emitter
 
 `lair` (lIR to native, via LLVM) stays in Rust, as LLVM stays in C++.
 The C interface to `lair` (spec/compiler.md §9) is a stopgap, not a

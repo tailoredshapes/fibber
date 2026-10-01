@@ -7,9 +7,11 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use super::bounded;
 
 /// How long one run of the demo may take: a macro that loops, or a
 /// mailbox that waits for a reply that never comes, fails the test and
@@ -68,7 +70,7 @@ fn build_lair() -> PathBuf {
     if let Some(t) = std::env::var_os("CARGO_TARGET_DIR") {
         cargo.env("CARGO_TARGET_DIR", t);
     }
-    let out = cargo.output().expect("cargo runs");
+    let out = bounded::output_within(&mut cargo, bounded::CARGO);
     assert!(
         out.status.success(),
         "cargo build -p lair failed:\n{}",
@@ -81,20 +83,18 @@ fn build_lair() -> PathBuf {
 
 /// `fibc build compiler/jit-demo.fib -o OUT -L LIB -l lair`.
 fn build_demo(lib_dir: &Path) -> PathBuf {
-    let out_dir =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("capi-{}", std::process::id()));
-    std::fs::create_dir_all(&out_dir).expect("a directory for the demo");
-    let demo = out_dir.join("jit-demo");
-    let built = Command::new(env!("CARGO_BIN_EXE_fibc"))
-        .arg("build")
-        .arg(repo().join("compiler/jit-demo.fib"))
-        .arg("-o")
-        .arg(&demo)
-        .arg("-L")
-        .arg(lib_dir)
-        .args(["-l", "lair"])
-        .output()
-        .expect("fibc runs");
+    let demo = shared_dir("demo").join("jit-demo");
+    let built = bounded::output_within(
+        Command::new(env!("CARGO_BIN_EXE_fibc"))
+            .arg("build")
+            .arg(repo().join("compiler/jit-demo.fib"))
+            .arg("-o")
+            .arg(&demo)
+            .arg("-L")
+            .arg(lib_dir)
+            .args(["-l", "lair"]),
+        bounded::COMPILE,
+    );
     assert!(
         built.status.success(),
         "fibc build compiler/jit-demo.fib failed:\n{}{}",
@@ -102,6 +102,68 @@ fn build_demo(lib_dir: &Path) -> PathBuf {
         text(&built.stderr)
     );
     demo
+}
+
+/// A directory under `target/tmp` named for this process, for what the
+/// tests of the process share (the demo, built once; the macro modules
+/// written for it), made on first use and removed when the process
+/// exits: a static is never dropped, so `atexit` does it. A failed run
+/// removes it too (the demo is built again by the next).
+pub fn shared_dir(label: &str) -> PathBuf {
+    static DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static REGISTER: Once = Once::new();
+    extern "C" {
+        fn atexit(callback: extern "C" fn()) -> i32;
+    }
+    extern "C" fn remove_all() {
+        if let Ok(dirs) = DIRS.lock() {
+            for dir in dirs.iter() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("capi-{label}-{}", std::process::id()));
+    let mut dirs = DIRS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !dirs.contains(&dir) {
+        std::fs::create_dir_all(&dir).expect("a shared scratch directory");
+        dirs.push(dir.clone());
+    }
+    // SAFETY: `atexit` takes a function that takes and returns nothing,
+    // which `remove_all` is; it is registered once.
+    REGISTER.call_once(|| unsafe {
+        atexit(remove_all);
+    });
+    dir
+}
+
+/// A scratch directory under `target/tmp` for one test: removed when
+/// dropped, and kept, with its path printed, when the test panicked, as
+/// the other tests' scratch directories are.
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    pub fn new(label: &str) -> Scratch {
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("capi-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("a scratch directory");
+        Scratch(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!("the scratch files are kept in {}", self.0.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 }
 
 /// The library, the binary and the demo, built on first use by whichever

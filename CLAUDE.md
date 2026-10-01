@@ -23,11 +23,14 @@ test says so; claims in docs, commit messages and chat carry no weight.
 | Path | What |
 |------|------|
 | `spec/` | the specification; its executable form is `fibref` |
-| `cases/` | test programs with verdicts fixed in their headers |
+| `cases/` | test programs with verdicts fixed in their headers: `ownership/` (`fibref cases`, and `fibc cases` interpreted and compiled), `modules/` (programs of several modules), `lir/` (`lair cases`) |
 | `crates/fibref` | the reference interpreter and memory audit |
 | `crates/fibgen` | the random program generator (method rule 5) |
 | `crates/lir` | lIR's reader, AST and whole-module checker; no LLVM |
-| `crates/lair` | lIR to native through LLVM 21: JIT, AOT, the lIR case harness. Needs `LLVM_SYS_211_PREFIX` |
+| `crates/lair` | lIR to native through LLVM 21: JIT, AOT, the lIR case harness; also a `cdylib`, `liblair.so`, with the C interface in `include/lair.h` (spec/compiler.md §9). Needs `LLVM_SYS_211_PREFIX` |
+| `crates/fibc` | the compiler in Rust (stage 1): `fibref`'s front end lowered to lIR through `lair`, the runtime `fib.rt` in `rt/*.lir`, the rule-6 harness (`fibc cases`, `fibc gen`); `tests/bootstrap` compares stage 2's reader with the Rust one |
+| `lib/` | `prelude.fib`, the library in fibber |
+| `compiler/` | stage 2, the compiler in fibber (spec/bootstrap.md): `syntax/` the reader, `util/`, `lair/` the bindings of lair's C interface, `read.fib` and `jit-demo.fib` its programs, `tests/reader/` the reader's edge inputs |
 | `lir-audit/` | findings from auditing liar's lIR, each re-established as a case in `cases/lir/audit` |
 
 ## Rust standards

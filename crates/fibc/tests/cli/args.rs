@@ -18,7 +18,7 @@ use std::process::Command;
 use super::io_support::{
     bytes_lines, first_difference, os_words, sh, words, TempDir, BYTES_PROGRAM,
 };
-use super::{build, fibc};
+use super::{bounded, build, fibc};
 
 /// Prints `some` or `nil` for each path it is given: whether the compiled
 /// `read-file` found a file of UTF-8 text.
@@ -44,7 +44,7 @@ fn a_built_executable_reads_arguments_that_are_not_utf8_as_from_utf8_lossy_makes
     let argv: Vec<OsString> = std::iter::once(exe.into_os_string())
         .chain(os_words(&words))
         .collect();
-    let out = sh("", "", &argv).output().expect("the executable runs");
+    let out = bounded::output(&mut sh("", "", &argv));
     let stdout = text(&out.stdout);
     if let Some(d) = first_difference(&words, &stdout, &bytes_lines(&words)) {
         panic!("{d}\n{}", text(&out.stderr));
@@ -58,13 +58,7 @@ fn fibc_run_reads_arguments_that_are_not_utf8_as_from_utf8_lossy_makes_them() {
     let dir = TempDir::new("run-args");
     let src = dir.file("bytes.fib", BYTES_PROGRAM);
     let words = words();
-    let out = fibc()
-        .arg("run")
-        .arg(&src)
-        .arg("--")
-        .args(os_words(&words))
-        .output()
-        .expect("fibc runs");
+    let out = bounded::output(fibc().arg("run").arg(&src).arg("--").args(os_words(&words)));
     let stdout = text(&out.stdout);
     // The result of main, 0, is the last line after the program's own.
     let lines = stdout.strip_suffix("0\n").unwrap_or(&stdout);
@@ -103,10 +97,7 @@ fn the_compiled_read_file_agrees_with_from_utf8_on_every_word() {
             path.into_os_string()
         })
         .collect();
-    let out = Command::new(&exe)
-        .args(&paths)
-        .output()
-        .expect("the reader runs");
+    let out = bounded::output(Command::new(&exe).args(&paths));
     let got = text(&out.stdout);
     let want: String = inputs
         .iter()
@@ -132,7 +123,7 @@ fn the_compiled_read_file_agrees_with_from_utf8_on_every_word() {
 fn a_name_before_the_dashes_that_is_not_utf8_is_refused() {
     let bad = OsString::from_vec(b"a\xffb.fib".to_vec());
     for command in ["run", "build"] {
-        let out = fibc().arg(command).arg(&bad).output().expect("fibc runs");
+        let out = bounded::output(fibc().arg(command).arg(&bad));
         let stderr = text(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{command}: {stderr}");
         assert!(

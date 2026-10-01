@@ -95,6 +95,10 @@ unsafe fn arguments<'a>(addr: usize, args: *const i64, n: usize) -> Option<&'a [
 #[no_mangle]
 pub unsafe extern "C" fn lair_call_i64(addr: usize, args: *const i64, n: usize) -> i64 {
     shield(0, || {
+        #[cfg(feature = "test-panic")]
+        if addr == super::error::TEST_PANIC_ADDRESS {
+            panic!("injected by the test-panic feature");
+        }
         arguments(addr, args, n).map_or(0, |a| invoke(addr, a))
     })
 }
@@ -107,6 +111,10 @@ pub unsafe extern "C" fn lair_call_i64(addr: usize, args: *const i64, n: usize) 
 #[no_mangle]
 pub unsafe extern "C" fn lair_call_f64(addr: usize, args: *const i64, n: usize) -> f64 {
     shield(0.0, || {
+        #[cfg(feature = "test-panic")]
+        if addr == super::error::TEST_PANIC_ADDRESS {
+            panic!("injected by the test-panic feature");
+        }
         arguments(addr, args, n).map_or(0.0, |a| invoke_f64(addr, a))
     })
 }

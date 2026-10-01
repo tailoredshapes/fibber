@@ -153,10 +153,14 @@ impl<'a> Cx<'_, 'a> {
                 self.store(&v, &p);
                 V::Unit
             }
-            // syntax §3.15: the block is zeroed, as the interpreter's is.
+            // syntax §3.15: the block is zeroed, as the interpreter's is,
+            // and one that cannot be had is the trap `out of memory`, as
+            // the interpreter's is (`fib.alloc-check`).
             "alloc" => {
-                let v = vec![V::int(LirTy::I64, 1), arg(0)?.clone()];
-                self.rt_call("calloc", &v, Some(LirTy::Raw))
+                let n = arg(0)?.clone();
+                let v = vec![V::int(LirTy::I64, 1), n.clone()];
+                let block = self.rt_call("calloc", &v, Some(LirTy::Raw));
+                self.rt_call("fib.alloc-check", &[block, n], Some(LirTy::Raw))
             }
             "free" => self.rt_call("free", a, None),
             "raw" | "raw-retained" => {

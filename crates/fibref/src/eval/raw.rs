@@ -30,9 +30,20 @@ pub struct RawMemory {
 }
 
 impl RawMemory {
-    /// `(alloc n)`: a fresh zeroed block.
+    /// `(alloc n)`: a fresh zeroed block, or the trap `out of memory` when
+    /// there is none (a size that is negative, or more than the system can
+    /// give), as the compiled `alloc` traps when `calloc` fails (syntax
+    /// §3.15).
     pub fn alloc(&mut self, n: i64) -> R<u64> {
-        let n = usize::try_from(n).map_err(|_| RunError::trap(format!("alloc of {n} bytes")))?;
+        let no_memory = || RunError::trap("out of memory");
+        let n = usize::try_from(n).map_err(|_| no_memory())?;
+        // `vec![0; n]` aborts the process when the memory is not there, and
+        // `try_reserve_exact` on a vector of its own asks for the same
+        // memory, answers an error instead and touches none of it (so a
+        // block of gigabytes stays as lazy as `vec![0; n]` makes it).
+        let mut probe: Vec<u8> = Vec::new();
+        probe.try_reserve_exact(n).map_err(|_| no_memory())?;
+        drop(probe);
         self.blocks.push(Some(vec![0; n]));
         Ok((self.blocks.len() as u64) << 32)
     }
@@ -167,6 +178,7 @@ impl RawMemory {
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::RunErrorKind;
     use super::*;
 
     #[test]
@@ -181,6 +193,21 @@ mod tests {
         m.free(p).expect("free");
         assert!(m.free(p).is_err());
         assert!(m.load(p, 1).is_err());
+    }
+
+    /// A block that cannot be had is the trap `out of memory`, not an
+    /// abort of the process (`vec![0; n]`'s way), and the arena is as it
+    /// was: the next block is the first.
+    #[test]
+    fn a_block_that_cannot_be_had_is_the_trap_out_of_memory() {
+        let mut m = RawMemory::default();
+        for n in [1_000_000_000_000_000, i64::MAX, -1, i64::MIN] {
+            let err = m.alloc(n).expect_err("no such block");
+            assert!(err.to_string().contains("out of memory"), "{n}: {err}");
+            assert_eq!(err.kind, RunErrorKind::Trap, "{n}");
+        }
+        assert_eq!(m.alloc(0), Ok(1 << 32));
+        assert_eq!(m.alloc(16), Ok(2 << 32));
     }
 
     /// A sink that takes at most `.0` bytes of each write.

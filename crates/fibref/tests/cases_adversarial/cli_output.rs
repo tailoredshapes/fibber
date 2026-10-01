@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use super::support::{accept_case, reject_case, TempDir};
+use super::support::{accept_case, ownership_case_count, reject_case, TempDir};
 
 fn fibref(args: &[&str], cwd: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fibref"))
@@ -149,10 +149,13 @@ fn the_real_cases_print_a_pass_row_each_and_no_pending_line() {
         .lines()
         .filter(|l| l.trim_end().ends_with(" pass"))
         .count();
-    assert_eq!(pass_rows, 191, "{out}");
+    let count = ownership_case_count();
+    assert_eq!(pass_rows, count, "{out}");
     assert!(!out.contains("PENDING"), "{out}");
     assert!(
-        out.contains("191 cases: 191 pass, 0 fail, 0 pending, 0 header error"),
+        out.contains(&format!(
+            "{count} cases: {count} pass, 0 fail, 0 pending, 0 header error"
+        )),
         "{out}"
     );
 }

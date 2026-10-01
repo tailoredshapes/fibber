@@ -13,10 +13,14 @@
 //! `f32::from_bits`. The interpreter, the JIT and the expected value must
 //! all give one number.
 
+#[path = "../../fibref/tests/io_support/mod.rs"]
+mod io_support;
+
 use std::process::Command;
 
 use fibc::harness::interp;
 use fibref::cases::{Outcome, Value};
+use io_support::TempDir;
 
 const SEED: u64 = 88_172_645_463_325_252;
 const COUNT: u64 = 3000;
@@ -113,10 +117,8 @@ fn the_casts_are_to_bits_and_from_bits_in_the_interpreter_and_compiled() {
         }
         other => panic!("the interpreter did not run it: {other:?}"),
     }
-    let dir = std::env::temp_dir().join(format!("fibc-float-bits-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a temp dir");
-    let file = dir.join("bits.fib");
-    std::fs::write(&file, &src).expect("the program is written");
+    let dir = TempDir::new("float-bits");
+    let file = dir.file("bits.fib", &src);
     let out = Command::new(env!("CARGO_BIN_EXE_fibc"))
         .arg("run")
         .arg(&file)
@@ -130,6 +132,5 @@ fn the_casts_are_to_bits_and_from_bits_in_the_interpreter_and_compiled() {
         "compiled: {text}{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = std::fs::remove_dir_all(&dir);
     println!("{} patterns at each width and form, fold {want}", COUNT);
 }

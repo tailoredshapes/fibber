@@ -8,6 +8,8 @@ use fibref::cases::{
     list_cases_recursive, read_header, run_dir, AuditExpect, PendingEvaluator, Verdict,
 };
 
+use super::support::walk_fib_files;
+
 const CASES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../cases");
 /// The curated suite. `cases/found/` holds untriaged findings from the
 /// adversary and the generator, which need not follow these rules until
@@ -29,9 +31,14 @@ const REJECT: &[u32] = &[
 ];
 const LEAK_CYCLE: [u32; 2] = [15, 80];
 /// The cases whose verdict is a run-time trap (method.md rule 3).
-const TRAP: [u32; 7] = [101, 102, 103, 104, 172, 173, 184];
-/// The last case number of this suite.
-const LAST: u32 = 194;
+const TRAP: [u32; 8] = [101, 102, 103, 104, 172, 173, 184, 195];
+/// Numbers below the last that no case has: 30 and 35 were withdrawn when
+/// D1 removed field places, and 191 was never written.
+const WITHDRAWN: [u32; 3] = [30, 35, 191];
+/// The last case number that existed when this was written. The suite
+/// only grows, so a directory whose highest number is lower has lost its
+/// last cases, which the contiguity of the numbers below it cannot show.
+const LAST_KNOWN: u32 = 195;
 
 fn number_of(path: &Path) -> u32 {
     let name = path.file_name().unwrap().to_string_lossy();
@@ -39,19 +46,6 @@ fn number_of(path: &Path) -> u32 {
         .next()
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("{name} does not start with a number"))
-}
-
-/// An independent walk of `cases/`, so the harness's own listing is
-/// checked against something that does not share its code.
-fn walk_fib_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("readable") {
-        let path = entry.expect("entry").path();
-        if path.is_dir() {
-            walk_fib_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "fib") {
-            out.push(path);
-        }
-    }
 }
 
 #[test]
@@ -75,8 +69,7 @@ fn every_real_case_header_parses() {
 
 #[test]
 fn the_ownership_directory_holds_cases_1_to_last_less_the_withdrawn() {
-    // 30 and 35 were withdrawn when D1 removed field places, and 191 was
-    // never written ((args) with a word that is not UTF-8 needs a command
+    // 191 was never written ((args) with a word that is not UTF-8 needs a command
     // line, which the case harness does not give; the tests of
     // crates/fibc/tests/cli/args.rs and crates/fibref/tests/run_io.rs
     // are its evidence, and case 186 has the empty (args)); 81 to 95
@@ -100,13 +93,21 @@ fn the_ownership_directory_holds_cases_1_to_last_less_the_withdrawn() {
     // zeroed, 192 the normal path of println and its loop of writes, 193 a
     // raw ptr uncounted in every container that can hold one (types §8.1),
     // 194 the bit casts of a float (f64->bits, bits->f64, f32->bits,
-    // bits->f32).
+    // bits->f32), 195 (alloc) of a block that cannot be had traps.
+    // The last number is the highest on disk (and at least LAST_KNOWN), so
+    // a new case changes nothing here; a lost one is a gap, or a highest
+    // number below LAST_KNOWN.
     // The listing is by name, so 100 sorts after 10: compare as numbers.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();
     let mut numbers: Vec<u32> = cases.iter().map(|p| number_of(p)).collect();
     numbers.sort_unstable();
-    let expected: Vec<u32> = (1..=LAST).filter(|n| ![30, 35, 191].contains(n)).collect();
+    let last = *numbers.last().expect("the directory holds cases");
+    assert!(
+        last >= LAST_KNOWN,
+        "the highest case is {last}, and {LAST_KNOWN} existed: cases were lost"
+    );
+    let expected: Vec<u32> = (1..=last).filter(|n| !WITHDRAWN.contains(n)).collect();
     assert_eq!(numbers, expected);
 }
 

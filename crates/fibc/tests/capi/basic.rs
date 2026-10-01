@@ -8,7 +8,7 @@ use std::process::Command;
 
 use lair::{Jit, JitOptions};
 
-use super::support::{built, demo_stdout};
+use super::support::{built, demo_stdout, Scratch};
 
 const SQUARE: &str = "(define (square i64) ((i64 x)) (block entry (ret (mul x x))))
 (define (sum3 i64) ((i64 a) (i64 b) (i64 c)) (block entry (ret (add a (add b c)))))
@@ -89,18 +89,15 @@ wait again: done
 result of the call that was parked: 1000005
 ";
 
-fn run_basic(tag: &str) -> (String, std::path::PathBuf) {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("capi-basic-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a directory for the executables");
-    let out = demo_stdout(&["basic", dir.to_str().expect("utf-8")]);
+fn run_basic(tag: &str) -> (String, Scratch) {
+    let dir = Scratch::new(&format!("basic-{tag}"));
+    let out = demo_stdout(&["basic", dir.path().to_str().expect("utf-8")]);
     (out, dir)
 }
 
 #[test]
 fn the_demo_reports_what_lair_reports() {
-    let (out, dir) = run_basic("report");
+    let (out, _dir) = run_basic("report");
     let session = expected_session();
     assert!(
         out.starts_with(&session),
@@ -115,21 +112,19 @@ fn the_demo_reports_what_lair_reports() {
         "{linker}"
     );
     assert_eq!(format!("add hooked: ok\n{hooks}"), EXPECTED_HOOKS);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn the_executables_the_demo_builds_run_and_the_refused_ones_are_not_left_behind() {
     let (_, dir) = run_basic("exe");
     for (name, status) in [("hello", 42), ("exit7", 7)] {
-        let exe = dir.join(name);
+        let exe = dir.path().join(name);
         let run = Command::new(&exe).output().expect("the executable runs");
         assert_eq!(run.status.code(), Some(status), "{name}");
     }
     for name in ["nomain", "nolib"] {
-        assert!(!dir.join(name).exists(), "{name} must not exist");
+        assert!(!dir.path().join(name).exists(), "{name} must not exist");
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The demo's text for a module that fails the checker is what `lair
@@ -138,7 +133,7 @@ fn the_executables_the_demo_builds_run_and_the_refused_ones_are_not_left_behind(
 #[test]
 fn the_checkers_text_is_what_lair_check_prints() {
     let (out, dir) = run_basic("check");
-    let file = dir.join("bad.lir");
+    let file = dir.path().join("bad.lir");
     for (label, src) in [
         ("-- check a module that fails the checker\n", BAD),
         ("-- check a module that fails the parser\n", BROKEN),
@@ -160,5 +155,4 @@ fn the_checkers_text_is_what_lair_check_prints() {
         let from_demo: Vec<&str> = after.lines().take(from_lair.len()).collect();
         assert_eq!(from_demo, from_lair, "{label}");
     }
-    let _ = std::fs::remove_dir_all(dir);
 }

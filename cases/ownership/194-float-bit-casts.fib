@@ -19,6 +19,8 @@
 ;;   negative f64, 6 NaN payloads at f64 (quiet, negative, signalling),
 ;;   7 the same by 400 patterns of a xorshift generator at run time and
 ;;   the same with the exponent forced to all ones (NaNs and infinities),
+;;   and the order of the floats the patterns of two successive draws make
+;;   (see below),
 ;;   8 1.0 and 0.1 as f32, 9 -0.0 as f32, 10 the f32 maximum and the
 ;;   smallest subnormal, 11 an f32 made from a pattern, 12 NaN payloads at
 ;;   f32 (quiet, negative, signalling: an f32 held widened to f64 by the
@@ -29,6 +31,15 @@
 ;;   bits of a float literal and build a float literal from bits, which
 ;;   runs the casts in the interpreter's macro evaluator and in the JIT
 ;;   that fibc expands macros with.
+;; A round trip `(f64->bits (bits->f64 n))` is `n` whatever the casts do,
+;; as long as each undoes the other, and compiled the pair is two
+;; `bitcast`s that cancel: it cannot fail there. So probes 7 and 13 also
+;; compare floats: positive finite floats are ordered as their patterns
+;; are, so for any two patterns with the sign bit and the lowest exponent
+;; bit cleared (the exponent is not all ones, the float is not negative)
+;; `x < y` as floats holds exactly when it holds for the patterns. A cast
+;; that moved a bit, or made a float from the number of the pattern,
+;; breaks the order, and a bitcast and its inverse still cancel.
 ;; Not here: the bits of a value produced by float arithmetic on a NaN,
 ;; which the hardware chooses.
 (defstruct Pair (a: f64 b: f32))
@@ -58,6 +69,27 @@
 
 (defun same64 (n: i64) -> bool (= (f64->bits (bits->f64 n)) n))
 (defun same32 (n: i32) -> bool (= (f32->bits (bits->f32 n)) n))
+
+(defun finite64 (n: i64) -> i64 (bit-and n 0x7FEFFFFFFFFFFFFF))
+(defun finite32 (n: i32) -> i32 (bit-and n 0x7F7FFFFFi32))
+
+;; The floats of the finite positive patterns of a and b are ordered and
+;; equal as the patterns are.
+(defun ordered64 (a: i64 b: i64) -> bool
+  (let ((pa (finite64 a))
+        (pb (finite64 b))
+        (x (bits->f64 pa))
+        (y (bits->f64 pb)))
+    (and (if (< x y) (< pa pb) (>= pa pb))
+         (if (= x y) (= pa pb) (!= pa pb)))))
+
+(defun ordered32 (a: i32 b: i32) -> bool
+  (let ((pa (finite32 a))
+        (pb (finite32 b))
+        (x (bits->f32 pa))
+        (y (bits->f32 pb)))
+    (and (if (< x y) (< pa pb) (>= pa pb))
+         (if (= x y) (= pa pb) (!= pa pb)))))
 
 (defun nan? (x: f64) -> bool (!= x x))
 (defun nan32? (x: f32) -> bool (!= x x))
@@ -115,11 +147,13 @@
   (bit-or (bit-and n (bit-not 0x7FF0000000000000)) 0x7FF0000000000000))
 
 (defun p7 () -> bool
-  (loop ((i 0) (x 88172645463325252) (good 0))
+  (loop ((i 0) (x 88172645463325252) (prev 1) (good 0))
     (if (< i 400)
         (let ((y (next x)))
-          (recur (+ i 1) y
-                 (if (and (same64 y) (same64 (exp-ones y))) (+ good 1) good)))
+          (recur (+ i 1) y y
+                 (if (and (same64 y) (same64 (exp-ones y)) (ordered64 prev y))
+                     (+ good 1)
+                     good)))
         (= good 400))))
 
 (defun p8 () -> bool
@@ -159,12 +193,14 @@
   (bit-or (bit-and n (bit-not 0x7F800000i32)) 0x7F800000i32))
 
 (defun p13 () -> bool
-  (loop ((i 0) (x 88172645463325252) (good 0))
+  (loop ((i 0) (x 88172645463325252) (prev 1i32) (good 0))
     (if (< i 400)
         (let ((y (next x)))
           (let ((n (trunc i32 (shr y 17))))
-            (recur (+ i 1) y
-                   (if (and (same32 n) (same32 (exp-ones32 n))) (+ good 1) good))))
+            (recur (+ i 1) y n
+                   (if (and (same32 n) (same32 (exp-ones32 n)) (ordered32 prev n))
+                       (+ good 1)
+                       good))))
         (= good 400))))
 
 (defun p14 () -> bool

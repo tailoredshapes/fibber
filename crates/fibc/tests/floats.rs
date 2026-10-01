@@ -14,11 +14,15 @@
 //! most digits, the 1e15..1e22 band, subnormals, the extremes and a
 //! random sample of bit patterns; every one with both signs.
 
+#[path = "../../fibref/tests/io_support/mod.rs"]
+mod io_support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fibref::eval::arith::float_text;
 use fibref::types::ty::Scalar;
+use io_support::TempDir;
 
 /// Reads one float per line of `argv[1]` as `argv[0]` (`f64` or `f32`)
 /// and prints `(show x)` for each.
@@ -286,12 +290,6 @@ fn bit_patterns(w: Width, seed: u64) -> Vec<u64> {
     kept
 }
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("fibc-floats-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a temp dir");
-    dir
-}
-
 /// The executable that shows the floats of a file.
 fn build(dir: &Path) -> PathBuf {
     let src = dir.join("show.fib");
@@ -365,7 +363,8 @@ fn squeeze(text: &str) -> String {
 
 #[test]
 fn the_compiled_show_of_a_float_is_the_interpreters() {
-    let dir = scratch();
+    let scratch = TempDir::new("floats");
+    let dir = scratch.path().to_path_buf();
     let exe = build(&dir);
     let mut failures = Vec::new();
     for (w, seed) in [(Width::F64, 0x5EED_0064), (Width::F32, 0x5EED_0032)] {
@@ -391,5 +390,4 @@ fn the_compiled_show_of_a_float_is_the_interpreters() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    let _ = std::fs::remove_dir_all(&dir);
 }

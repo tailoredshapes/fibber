@@ -17,13 +17,14 @@ Rust module they replace, so a reviewer can put the two side by side:
 | Module | Replaces | What |
 |---|---|---|
 | `util.result` | (`Result`) | `(Result a b)`: `Ok` or `Err`; the prelude has `Option` only |
-| `util.text` | | string helpers the passes share |
+| `util.text` | (none) | string helpers the passes share |
 | `syntax.pos` | `syntax/pos.rs` | `Pos` (file, line, col, byte range) |
 | `syntax.form` | `syntax/form.rs` | `Stx` (a `StxKind` and its `Pos`), `IntWidth`, `FltWidth` |
 | `syntax.error` | `syntax/error.rs` | `ErrKind`, `ReadError`, the messages |
 | `syntax.chars`, `syntax.cursor` | `chars.rs`, `cursor.rs` | character classes; a cursor over the UTF-8 bytes |
 | `syntax.number`, `syntax.literal` | `number.rs`, `literal.rs` | numbers; strings and characters |
-| `syntax.reader` | `lexer.rs`, `reader.rs` | text to `Stx` |
+| `syntax.lexer` | `lexer.rs` | tokens: delimiters, the prefix reader macros, `#_`, and atoms (through `syntax.number` and `syntax.literal`); skips whitespace, comments and separator commas |
+| `syntax.reader` | `reader.rs` | the tokens of `syntax.lexer` to `Stx`, the explicit stack of open frames written as recursion bounded by the nesting cap of 1000 |
 | `syntax.print` | `print.rs` | `Stx` to text that reads back |
 | `syntax.dump` | `crates/fibref/src/dump.rs` | the reader dump (§2) |
 | `lair.ffi` | (the C side of `lair`'s `capi/`) | the bytes and words C reads (a `str` copied into a raw buffer, out-parameter slots), a `lair_error` as a `(Result .. str)`; every C handle is an `i64` (below) |
@@ -106,25 +107,39 @@ and compares its output and exit status, byte for byte, with
 
 1. every `.fib` file under `cases/`, `lib/` and `compiler/`, and the
    prelude of the expander;
-2. the files of `compiler/tests/reader/`, written to hit each rule of
-   syntax §1 and each read error, every line of the Rust reader's own
-   tests, and the inputs that killed the mutants of the reader that the
-   test alone had let survive (`rmut-*`);
+2. the files of `compiler/tests/reader/` (983 `.fib` files when this
+   was written), written to hit each rule of syntax §1 and each
+   read error, and the inputs that killed the mutants of the reader that
+   the test alone had let survive (`rmut-*`, `rmut2-*`). Every variant of
+   `ReadErrorKind` occurs among them: `fibref read
+   compiler/tests/reader/*.fib | grep -a '^error ' | awk '{print $2}' |
+   sort -u | wc -l` prints 19, and the enum has 19 variants; no test
+   derives that count from the enum, so a variant added later is not
+   noticed. Nothing checks that the inputs of the Rust reader's own unit
+   tests (`crates/fibref/src/syntax/tests/`) are among these files;
 3. one small file for every scalar value that the whitespace and
    control classes decide, with its neighbours and look-alikes;
 4. inputs generated from a seed by mutating the corpus and by composing
    tokens, equal in number on every run of the test (a few hundred,
-   never thousands: the machine has been taken down by sweeps before);
+   never thousands: the machine has been taken down by sweeps before).
+   A unit test (`crates/fibc/tests/bootstrap/fuzz.rs`) checks that the
+   standard run reaches each of 19 named read errors at least twice and
+   each node kind at least ten times; the 19 names are a list in the
+   test, not derived from `ReadErrorKind`;
 5. paths that cannot be read, and the tool with no file.
 
 The test fails if the two outputs differ in any byte. Unit tests show
 that a difference in one position digit, a missing line, another exit
 status or a missing final newline is each reported, and a *canary* runs
 the real pipeline with a fault planted in the real reader and shows it
-reported. A review of the reader by mutation (1797 mutants of the
-fibber source, 1886 inputs each) is how the inputs of item 2 were found:
-a test that agrees with the oracle everywhere it looks says nothing
-about where it does not look.
+reported. The `rmut-*` and `rmut2-*` inputs of item 2 come from two
+one-off reviews of the reader by mutation (the first: 1797 mutants of
+the fibber source, each run over 1886 inputs): a test that agrees with
+the oracle everywhere it looks says nothing about where it does not
+look, so each mutant the test let survive became an input. The mutants,
+the scripts and the per-mutant tables of those reviews were not kept in
+the repository, so the counts are a record of what was done and cannot
+be re-run from here; what the repository keeps of them is the inputs.
 
 ## 4. Gaps found on the way
 
@@ -139,7 +154,7 @@ each one is decided by the owner or recorded as a proposal here.
 | the interpreter had no `strtod`/`strtof` for `extern`, so the reader could not be run under the audit on any float literal | `compiler/syntax/number.fib` | added to the interpreter, decimal only (syntax §3.15, **Proposed**; case 189) |
 | a failed `malloc` was a write through a null pointer (SIGSEGV) | robustness review | fixed: the trap `out of memory` (`crates/fibc/tests/cli.rs`) |
 | `(alloc n)` is zeroed by the interpreter and is plain `malloc` compiled; the spec is silent | the `strtod` work | fixed: `(alloc n)` is `n` zero bytes in both (compiled: `calloc`), specified in syntax §3.15; case 190 (a block freed and allocated again reads zero; compiled with `malloc` it read about 200 of the 196631 bytes as zero) |
-| the audited interpreter keeps memory proportional to work (about 100 KB per top-level form, 1.3 GB for a 1000-deep nest) | robustness review | noted: run the interpreter audit on small inputs only; the compiled reader is linear (8 MB in 0.5 s) |
+| the audited interpreter keeps memory proportional to work, and the work is the tree: 80 to 90 KB per node read (a lone top-level symbol 80 KB, a form `(a 1)` of three nodes 250 KB, a symbol in a list of 100 about 90 KB), and a nest grows faster, with the square of its depth: maximum resident set of `fibref run compiler/read.fib` 25848 KB at depth 100, 55188 KB at 200, 171428 KB at 400 and 744668 KB at 800, so about 1.2 GB at the cap of 1000 by extrapolation (not run) | robustness review | noted: run the interpreter audit on small inputs only. The compiled reader is linear in the size of the input, at a rate that depends on its kind. Measured on 2026-10-01 with a reader built by `target/debug/fibc build compiler/read.fib`, dump to `/dev/null`, one process at a time, at 1, 4 and 8 MiB (each kind took twice as long at twice the size). At 8 MiB: a comment (`;xxxx..`) 0.5 s and 17396 KB; commas 0.5 s and 17804 KB; forms `(a 1)` 3.0 s and 906188 KB; one string 4.6 s and 572204 KB; one symbol 4.9 s and 572060 KB; integers `12345 ` 6.8 s and 469536 KB; the digit `1 ` repeated 19.4 s and 1080300 KB (the tree is held whole). The cost goes with the number of tokens (about 4.6 microseconds for each of the 4.2 million atoms of the last), not with the bytes. So "8 MB in 0.5 s" is the best case, a comment or a run of commas, and 19.4 s the worst measured |
 | `(args)` traps on an argument that is not UTF-8 | robustness review | fixed, and the description was wrong: a built executable did not trap, it made a `str` that was not UTF-8, and `fibc run` and `fibref run` panicked in `std::env::args`; now each invalid sequence is U+FFFD as `String::from_utf8_lossy` makes it, in all three (syntax §4.3; `crates/fibc/tests/cli/args.rs`, `crates/fibref/tests/run_io.rs`); a tool's own word before `--` that is not UTF-8 is refused (exit 2) |
 | `println` ignores a failed write (a full device exits 0) | robustness review | fixed: `println` and `eprintln` write in a loop until every byte has gone and trap `println: write failed` (`eprintln: write failed`) on an error (syntax §4.5; `crates/fibc/tests/cli/writes.rs`, `crates/fibref/tests/run_io.rs`, case 192 for the normal path) |
 | the reader needs 480 to 512 KB of native stack at nesting 1000 (about 500 bytes a level) | robustness review | noted: a worker thread gets the main thread's soft limit, 8 MB here, and all the reader's inputs were read correctly in `pmap` workers |

@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use super::support::{accept_case, accept_header, reject_case, TempDir};
+use super::support::{accept_case, accept_header, ownership_case_count, reject_case, TempDir};
 
 const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
@@ -156,43 +156,27 @@ fn default_directory_is_cases_ownership_relative_to_cwd() {
         "stdout:\n{out}\nstderr:\n{}",
         stderr(&output)
     );
-    assert!(out.contains("01-return-part-of-argument.fib"), "{out}");
-    assert!(out.contains("20-weak-ref-to-dead-object.fib"), "{out}");
+    for name in [
+        "01-return-part-of-argument.fib",
+        "20-weak-ref-to-dead-object.fib",
+        "80-unique-write-closes-cycle-through-cell.fib",
+        "95-option-of-scalar-is-a-heap-object.fib",
+        "100-annotated-let-loop-and-plet-bindings.fib",
+        "149-element-outlives-its-vector.fib",
+        "153-two-inout-arguments-one-written-by-argument.fib",
+        "154-float-comparisons-are-ieee-not-ord-defaults.fib",
+        "161-rigid-impl-stores-send-closure-at-both-colours.fib",
+        "165-captured-inout-at-non-tail-call-unchanged.fib",
+        "168-swap-contention-between-threads.fib",
+    ] {
+        assert!(out.contains(name), "{name} is not in the table:\n{out}");
+    }
+    let count = ownership_case_count();
+    assert!(out.contains(&format!("{count} cases:")), "{out}");
     assert!(
-        out.contains("80-unique-write-closes-cycle-through-cell.fib"),
+        out.contains(&format!("{count} pass, 0 fail, 0 pending")),
         "{out}"
     );
-    assert!(
-        out.contains("95-option-of-scalar-is-a-heap-object.fib"),
-        "{out}"
-    );
-    assert!(
-        out.contains("100-annotated-let-loop-and-plet-bindings.fib"),
-        "{out}"
-    );
-    assert!(out.contains("149-element-outlives-its-vector.fib"), "{out}");
-    assert!(
-        out.contains("153-two-inout-arguments-one-written-by-argument.fib"),
-        "{out}"
-    );
-    assert!(
-        out.contains("154-float-comparisons-are-ieee-not-ord-defaults.fib"),
-        "{out}"
-    );
-    assert!(
-        out.contains("161-rigid-impl-stores-send-closure-at-both-colours.fib"),
-        "{out}"
-    );
-    assert!(
-        out.contains("165-captured-inout-at-non-tail-call-unchanged.fib"),
-        "{out}"
-    );
-    assert!(
-        out.contains("168-swap-contention-between-threads.fib"),
-        "{out}"
-    );
-    assert!(out.contains("191 cases:"), "{out}");
-    assert!(out.contains("191 pass, 0 fail, 0 pending"), "{out}");
     assert!(out.contains("0 header error"), "{out}");
 }
 

@@ -111,13 +111,24 @@ pub fn repo_root() -> PathBuf {
         .expect("the repository root exists")
 }
 
-/// Builds `compiler/read.fib` into `dir` with `fibc build` and returns
-/// the tool.
+/// The reader's source: `compiler/read.fib`, or the file that
+/// `BOOTSTRAP_READER` names, which is how a mutation review runs this
+/// test on a mutated copy of `compiler/` (its modules load from its own
+/// directory; the corpus is still the repository's).
+pub fn reader_source() -> PathBuf {
+    std::env::var_os("BOOTSTRAP_READER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("compiler/read.fib"))
+}
+
+/// Builds the reader ([`reader_source`]) into `dir` with `fibc build` and
+/// returns the tool.
 pub fn build_reader(dir: &Path) -> Tool {
     let exe = dir.join("read");
+    let source = reader_source();
     let out = Command::new(env!("CARGO_BIN_EXE_fibc"))
         .arg("build")
-        .arg(repo_root().join("compiler/read.fib"))
+        .arg(&source)
         .arg("-o")
         .arg(&exe)
         .current_dir(repo_root())
@@ -125,7 +136,8 @@ pub fn build_reader(dir: &Path) -> Tool {
         .expect("fibc runs");
     assert!(
         out.status.success(),
-        "fibc build compiler/read.fib failed ({}):\n{}{}",
+        "fibc build {} failed ({}):\n{}{}",
+        source.display(),
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)

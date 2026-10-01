@@ -19,6 +19,8 @@
 
 #[path = "capi/basic.rs"]
 mod basic;
+#[path = "../../lair/tests/common/bounded.rs"]
+mod bounded;
 #[path = "capi/macros.rs"]
 mod macros;
 #[path = "capi/recording.rs"]

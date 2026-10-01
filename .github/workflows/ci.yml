@@ -12,31 +12,42 @@ jobs:
   # job stays fast and is the one to watch.
   fibref:
     runs-on: ubuntu-latest
+    # A hung test would hold the job for GitHub's default of 6 hours;
+    # every job and every step that runs something has a limit, a few
+    # times what it takes on a cold cache.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 5
 
       - name: Install stable toolchain with rustfmt and clippy
+        timeout-minutes: 10
         run: |
           rustup update stable
           rustup default stable
           rustup component add rustfmt clippy
 
       - uses: Swatinem/rust-cache@v2
+        timeout-minutes: 10
         with:
           prefix-key: fibref
 
       - name: Format
+        timeout-minutes: 5
         run: cargo fmt --all --check
 
       - name: Clippy
+        timeout-minutes: 15
         run: cargo clippy -p fibref -p fibgen -p lir --all-targets --all-features -- -D warnings
 
       - name: Test
+        timeout-minutes: 20
         run: cargo test -p fibref -p fibgen -p lir
 
       # Pending cases exit 0 and are listed; a Fail, a bad header or a
       # run that found no cases exits 1 and must fail the build.
       - name: Ownership cases
+        timeout-minutes: 10
         run: |
           cargo run -p fibref -- cases cases/ownership
           cargo run -p fibref -- cases cases/modules
@@ -47,12 +58,17 @@ jobs:
   # builds the workspace once: one LLVM install, one cache.
   lair:
     runs-on: ubuntu-latest
+    # The sum of the step limits below is more than this; a cold cache
+    # builds LLVM's static link once, in the first step that needs it.
+    timeout-minutes: 90
     env:
       LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 5
 
       - name: Install stable toolchain with clippy
+        timeout-minutes: 10
         run: |
           rustup update stable
           rustup default stable
@@ -65,6 +81,7 @@ jobs:
       # `llvm-config --system-libs --link-static` lists: zlib, zstd
       # (as /usr/lib/x86_64-linux-gnu/libzstd.a) and libxml2.
       - name: Install LLVM 21
+        timeout-minutes: 15
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
@@ -74,10 +91,12 @@ jobs:
           /usr/lib/llvm-21/bin/llvm-config --system-libs --link-static
 
       - uses: Swatinem/rust-cache@v2
+        timeout-minutes: 10
         with:
           prefix-key: lair
 
       - name: Clippy
+        timeout-minutes: 30
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       # cargo test -p lair runs every lIR case through the JIT and AOT
@@ -86,6 +105,7 @@ jobs:
       # link step (crates/lair/tests/link.rs). It is the quick one, so it
       # goes first.
       - name: Test lair
+        timeout-minutes: 45
         run: cargo test -p lair
 
       # crates/fibc is not in the fibref job: it needs LLVM. Its tests
@@ -99,4 +119,5 @@ jobs:
       # program runs a child process that compiles through the JIT, and
       # the generator's jobs each hold an interpreter's heap trace.
       - name: Test fibc
+        timeout-minutes: 45
         run: cargo test -p fibc -- --test-threads=2

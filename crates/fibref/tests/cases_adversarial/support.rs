@@ -55,6 +55,37 @@ impl Drop for TempDir {
     }
 }
 
+/// Every `.fib` file under `dir`, in no order: a walk of the directory
+/// that shares no code with the harness's own listing, so that this is
+/// something to check that listing against.
+pub fn walk_fib_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).expect("readable") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            walk_fib_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "fib") {
+            out.push(path);
+        }
+    }
+}
+
+/// How many cases `cases/ownership` holds now. The tests that run all of
+/// them ask this and do not hold the number, which a new case would
+/// change in several files; a case that is lost is the business of
+/// `real_cases` (the numbers are 1 up to the last, less the withdrawn).
+pub fn ownership_case_count() -> usize {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cases/ownership");
+    let mut files = Vec::new();
+    walk_fib_files(&dir, &mut files);
+    assert!(
+        files.len() > 100,
+        "{} cases under {}",
+        files.len(),
+        dir.display()
+    );
+    files.len()
+}
+
 /// An evaluator scripted by a directive somewhere in the source:
 ///
 /// - `(scripted-compiled N)`: `Compiled` returning `N` with a clean audit

@@ -141,13 +141,16 @@ pub fn compile_macro(
     );
     emit_all(&mut p)?;
     // No keyword is interned after the bodies are emitted: the table
-    // the module exports is complete here.
+    // the module exports is complete here, and sealed, so that one that
+    // is interned later (assembling the text, rendering the module) panics
+    // in every macro test and does not leave an id the table lacks.
     let keyword_strs = p
         .statics
         .keywords()
         .iter()
         .map(|k| p.statics.string(k, 0))
         .collect();
+    p.statics.seal_keywords();
     let layout = FormLayout {
         sname,
         tid,

@@ -14,6 +14,7 @@ pub struct Statics {
     string_index: HashMap<Vec<u8>, String>,
     keywords: Vec<String>,
     keyword_index: HashMap<String, i64>,
+    keywords_sealed: bool,
     closures: Vec<(String, String, u32)>,
     closure_index: HashMap<String, String>,
     vtables: Vec<(String, Vec<String>)>,
@@ -34,14 +35,32 @@ impl Statics {
     }
 
     /// The interned id of a keyword.
+    ///
+    /// # Panics
+    /// When the table has been sealed ([`Statics::seal_keywords`]) and `k`
+    /// is not in it: the invariant it guards is broken.
     pub fn keyword(&mut self, k: &str) -> i64 {
         if let Some(id) = self.keyword_index.get(k) {
             return *id;
         }
+        assert!(
+            !self.keywords_sealed,
+            "the keyword :{k} was interned after the keyword table was sealed"
+        );
         let id = self.keywords.len() as i64;
         self.keywords.push(k.to_string());
         self.keyword_index.insert(k.to_string(), id);
         id
+    }
+
+    /// Seals the table: the ids given out so far are the table a macro
+    /// module exports (`fibm.kw.K`, compiler.md §6), so a keyword that is
+    /// not already in it must not be interned from here on, or the module
+    /// would name its id `#N` from a table that does not have it. From
+    /// here a new keyword panics; one that is in the table is answered as
+    /// before.
+    pub fn seal_keywords(&mut self) {
+        self.keywords_sealed = true;
     }
 
     /// Every keyword interned so far, by id.
@@ -124,6 +143,28 @@ impl Statics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sealed_keyword_table_answers_its_keywords_and_refuses_a_new_one() {
+        let mut s = Statics::default();
+        assert_eq!(s.keyword("i8"), 0);
+        assert_eq!(s.keyword("f16"), 1);
+        s.seal_keywords();
+        assert_eq!(
+            s.keyword("f16"),
+            1,
+            "a keyword in the table is still answered"
+        );
+        assert_eq!(s.keyword("i8"), 0);
+        assert_eq!(s.keywords(), ["i8", "f16"]);
+        let late = std::panic::catch_unwind(move || s.keyword("late"));
+        let said = late.expect_err("a new keyword after the seal must panic");
+        let said = said.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            said.contains("the keyword :late was interned after the keyword table was sealed"),
+            "{said}"
+        );
+    }
 
     #[test]
     fn strings_are_shared_and_render_as_constants() {

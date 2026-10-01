@@ -17,14 +17,20 @@
 //! Every input is run in both modes (dump, print) with the one build of
 //! the tool, and a failure says which mode. The tool with no file (and
 //! with `--print` alone) must print nothing, say its usage on standard
-//! error and end with status 2 (`usage.rs`).
+//! error and end with status 2; a first argument that looks like a flag
+//! but is not `--print` (`--x`) is a file name, as it is to `fibref read`
+//! (`usage.rs`).
+//!
+//! Speed is judged apart (`perf.rs`): the inputs named `-perf-` and two
+//! large generated ones are each read within five seconds, in both modes,
+//! since a reader that is quadratic prints what a linear one prints.
 //!
 //! The comparison is byte for byte on standard output and on the exit
 //! status (`compare.rs`); a failure names the first line that differs and
 //! keeps the input in the scratch directory. Unit tests show that each
 //! kind of difference is reported, and a stand-in tool run through the
 //! same pipeline shows that it passes when faithful and fails when
-//! damaged (`standin.rs`).
+//! damaged, or right and slow (`standin.rs`, `perf.rs`).
 //!
 //! Run it with `LLVM_SYS_211_PREFIX=... cargo test -p fibc --test
 //! bootstrap`. It starts at most four processes at a time (`fibc build` and
@@ -32,7 +38,9 @@
 //! command it runs), each tool run capped at 4 GiB of address space and two
 //! minutes, and keeps its inputs small: the machine has been taken down by
 //! sweeps before. `BOOTSTRAP_FUZZ_COUNT` and `BOOTSTRAP_FUZZ_SEED` size a
-//! bigger manual run, below.
+//! bigger manual run, below; `BOOTSTRAP_READER=/path/to/read.fib` builds
+//! another reader (a mutated copy of `compiler/`) in place of
+//! `compiler/read.fib`, to see what the test says of it.
 
 #![cfg(unix)]
 
@@ -46,6 +54,8 @@ mod corpus;
 mod fuzz;
 #[path = "bootstrap/nest.rs"]
 mod nest;
+#[path = "bootstrap/perf.rs"]
+mod perf;
 #[path = "bootstrap/rng.rs"]
 mod rng;
 #[path = "bootstrap/soup.rs"]
@@ -76,8 +86,9 @@ struct Stage {
 }
 
 /// Runs every stage in both modes and returns the report and whether all
-/// passed, then the usage check (the tool with no file).
-fn run_stages(tool: &Tool, stages: &[Stage]) -> (String, bool) {
+/// passed, then the usage check (the tool with no file) and the first
+/// arguments that look like flags, whose files are made in `dir`.
+fn run_stages(tool: &Tool, stages: &[Stage], dir: &Path) -> (String, bool) {
     let mut text = String::new();
     let mut ok = true;
     for stage in stages {
@@ -91,6 +102,9 @@ fn run_stages(tool: &Tool, stages: &[Stage]) -> (String, bool) {
     let usage: Vec<Failure> = usage::check_usage(tool);
     ok &= usage.is_empty();
     text.push_str(&report("usage (no file)", Mode::ALL.len(), &usage));
+    let flags: Vec<Failure> = usage::check_flag_like_names(tool, &dir.join("flags"));
+    ok &= flags.is_empty();
+    text.push_str(&report("flag-like names", usage::flag_like_runs(), &flags));
     (text, ok)
 }
 
@@ -143,12 +157,22 @@ fn the_self_hosted_reader_matches_the_rust_reader() {
     let (mut stages, texts) = fixed_stages(dir.path());
     let runs: Vec<(u64, usize)> = fuzz::SEEDS.iter().map(|s| (*s, fuzz::PER_SEED)).collect();
     stages.push(generated_stage(dir.path(), &texts, &runs));
-    let (mut text, ok) = run_stages(&tool, &stages);
+    let (mut text, mut ok) = run_stages(&tool, &stages, dir.path());
+    let (speed, fast_enough) = perf::run_all(&tool, dir.path());
+    ok &= fast_enough;
+    text.push_str(&speed);
     match standin::fault_in_the_real_tool_is_noticed(dir.path(), &tool) {
         Ok(()) => text.push_str(
             "canary: a fault planted in the real reader is reported on 3 of 3 in each mode\n",
         ),
         Err(why) => panic!("the pipeline missed a fault planted in the real tool: {why}\n{text}"),
+    }
+    match perf::slow_real_tool_is_noticed(dir.path(), &tool) {
+        Ok(()) => text.push_str(
+            "canary: a right but slow copy of the real reader is reported slow on every \
+             `-perf-` input in each mode\n",
+        ),
+        Err(why) => panic!("the speed check missed a slow real tool: {why}\n{text}"),
     }
     assert!(
         ok,
@@ -169,7 +193,7 @@ fn the_self_hosted_reader_matches_on_a_bigger_generated_run() {
     let tool = build_reader(dir.path());
     let texts = corpus::texts(&corpus::corpus_files(&repo_root()));
     let stage = generated_stage(dir.path(), &texts, &[(seed, count)]);
-    let (text, ok) = run_stages(&tool, &[stage]);
+    let (text, ok) = run_stages(&tool, &[stage], dir.path());
     assert!(
         ok,
         "the self-hosted reader differs from the Rust reader:\n{text}"

@@ -16,7 +16,7 @@ use fibref::expand::{
 use fibref::syntax::{read_all, Form, FormKind, Pos};
 use fibref::types::prelude_forms;
 
-use super::support::{clean_stdout, run_demo};
+use super::support::{clean_stdout, run_demo, shared_dir};
 
 /// One run of a macro, with what the Rust runner made of it.
 pub struct Run {
@@ -165,10 +165,7 @@ pub fn expand(source: &str, wanted: Option<&'static str>) -> (Vec<Run>, Vec<(Str
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("capi-macros-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir.join(name)
+    shared_dir("macros").join(name)
 }
 
 /// What `jit-demo macro` must print for a run: the expansion and the

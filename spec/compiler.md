@@ -409,10 +409,17 @@ print (the text `lair::Error` displays: one diagnostic per line, no
 file name) and is freed by the caller. A null argument the callee needs
 is an error, not undefined behaviour, and no panic crosses the
 boundary: it becomes an error (or `-1`, or a null) whose text starts
-`internal error:`. No state is global: everything is in the handles,
-and handles may be used from any one thread at a time, different
-handles from different threads at once. `lair.h` has the exact C types
-(every length is a `size_t`; an address is a `size_t`).
+`internal error:`. `lair` keeps no state of its own outside the handles:
+the one process-wide thing is LLVM's native target registry, initialised
+once, on first use, behind a `Once` (`crates/lair/src/llvm/target.rs`);
+handles may be used from any one thread at a time, different handles
+from different threads at once (`crates/lair/tests/capi.rs`,
+`capi_mailbox.rs` run sessions and mailboxes in several threads).
+`lair.h` has the exact C types (every length is a `size_t`; an address is
+a `size_t`). The interface is 21 functions, the two tables below: `nm -D
+--defined-only target/debug/liblair.so | grep -c ' T lair_'` prints 21,
+and a unit test (`crates/lair/src/capi/header.rs`) keeps `lair.h` equal
+to the `#[no_mangle]` functions of the source, parameter counts included.
 
 | Function | Does |
 |---|---|

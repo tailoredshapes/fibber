@@ -10,8 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use super::fibc;
 use super::io_support::TempDir;
+use super::{bounded, fibc};
 
 const TRIPLE_C: &str = "long fibtest_triple(long n) { return 3 * n; }\n";
 const ADD_C: &str = "long fibtwo_add(long a, long b) { return a + b; }\n";
@@ -45,37 +45,39 @@ fn library(dir: &TempDir, name: &str, source: &str) -> PathBuf {
     let lib_dir = dir.path().join(format!("{name}-dir"));
     std::fs::create_dir_all(&lib_dir).expect("a library directory");
     let c = dir.file(&format!("{name}.c"), source);
-    let built = Command::new("cc")
-        .args(["-shared", "-fPIC", "-o"])
-        .arg(lib_dir.join(format!("lib{name}.so")))
-        .arg(&c)
-        .output()
-        .expect("cc runs");
+    let built = bounded::output_within(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(lib_dir.join(format!("lib{name}.so")))
+            .arg(&c),
+        bounded::COMPILE,
+    );
     assert!(built.status.success(), "{}", text(&built.stderr));
     lib_dir
 }
 
 /// `fibc build SRC -o EXE ARGS..` run in `cwd`.
 fn build(cwd: &Path, src: &Path, exe: &Path, args: &[&str]) -> Output {
-    fibc()
-        .current_dir(cwd)
-        .arg("build")
-        .arg(src)
-        .arg("-o")
-        .arg(exe)
-        .args(args)
-        .output()
-        .expect("fibc runs")
+    bounded::output_within(
+        fibc()
+            .current_dir(cwd)
+            .arg("build")
+            .arg(src)
+            .arg("-o")
+            .arg(exe)
+            .args(args),
+        bounded::COMPILE,
+    )
 }
 
 /// The executable, with `LD_LIBRARY_PATH` removed so that only what the
 /// link recorded can find a library.
 fn run(exe: &Path, cwd: &Path) -> Output {
-    Command::new(exe)
-        .current_dir(cwd)
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .expect("the executable runs")
+    bounded::output(
+        Command::new(exe)
+            .current_dir(cwd)
+            .env_remove("LD_LIBRARY_PATH"),
+    )
 }
 
 #[test]
@@ -114,15 +116,13 @@ fn the_rpath_is_what_finds_the_library() {
     std::fs::rename(&lib, &moved).expect("the library directory moves");
     let lost = run(&exe, dir.path());
     assert_ne!(lost.status.code(), Some(19));
+    // The loader's words differ between libcs; it names the library.
     assert!(
-        text(&lost.stderr).contains("libfibtest.so: cannot open shared object file"),
+        text(&lost.stderr).contains("libfibtest.so"),
         "{}",
         text(&lost.stderr)
     );
-    let found = Command::new(&exe)
-        .env("LD_LIBRARY_PATH", &moved)
-        .output()
-        .expect("the executable runs");
+    let found = bounded::output(Command::new(&exe).env("LD_LIBRARY_PATH", &moved));
     assert_eq!(found.status.code(), Some(19), "{}", text(&found.stderr));
 }
 
@@ -195,10 +195,12 @@ fn without_the_flags_the_link_fails_and_names_what_is_missing() {
 
     let bare = build(dir.path(), &src, &exe, &[]);
     assert_eq!(bare.status.code(), Some(5), "{}", text(&bare.stderr));
+    // GNU ld says "undefined reference to `sym'", lld "undefined symbol:
+    // sym": the test asks for the word and the name.
+    let said = text(&bare.stderr);
     assert!(
-        text(&bare.stderr).contains("undefined reference to `fibtest_triple'"),
-        "{}",
-        text(&bare.stderr)
+        said.contains("undefined") && said.contains("fibtest_triple"),
+        "{said}"
     );
     assert!(!exe.exists(), "no executable is left behind");
 
@@ -253,7 +255,7 @@ fn a_directory_an_rpath_cannot_hold_is_refused() {
 
 #[test]
 fn the_usage_text_says_what_build_takes() {
-    let out = fibc().args(["build", "x.fib"]).output().expect("fibc runs");
+    let out = bounded::output(fibc().args(["build", "x.fib"]));
     assert_eq!(out.status.code(), Some(2));
     assert!(
         text(&out.stderr).contains("build <file> -o <out> [-L dir].. [-l lib].."),

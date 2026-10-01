@@ -18,12 +18,13 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Output, Stdio};
 
-use super::build;
 use super::io_support::{
     case_192_stdout, chunking_shim, full_device, limited, long_stdout_program, sh,
     stderr_long_stderr, TempDir, CASE_192, CASE_192_RESULT, STDERR_LONG_PROGRAM,
     STDERR_THEN_STDOUT, STDOUT_THEN_STDERR,
 };
+
+use super::{bounded, build};
 
 const SIGABRT: i32 = 6;
 
@@ -70,7 +71,13 @@ fn run_on_a_full_device(way: Way, source: &str, out_full: bool) -> Output {
     } else {
         command.stderr(full_device()).stdout(Stdio::piped());
     }
-    command.output().expect("the program runs")
+    // Standard output or error is the device, not a pipe, so the child is
+    // started here and only waited for with a deadline.
+    let child = command
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("the program starts");
+    bounded::wait_with_output(child, bounded::RUN, "a program on a full device")
 }
 
 #[test]
@@ -109,11 +116,7 @@ fn a_write_cut_short_is_continued_and_the_failure_after_it_is_a_trap() {
         let dir = TempDir::new(&format!("{way:?}-short"));
         let argv = way.argv(&dir, &dir.file("p.fib", &long_stdout_program()));
         let out_file = dir.path().join("stdout.txt");
-        let out = limited(1, &argv)
-            .env("OUT", &out_file)
-            .stderr(Stdio::piped())
-            .output()
-            .expect("the program runs");
+        let out = bounded::output(limited(1, &argv).env("OUT", &out_file));
         let stderr = text(&out.stderr);
         assert_eq!(out.status.signal(), Some(SIGABRT), "{way:?}: {stderr}");
         assert_eq!(stderr, "trap: println: write failed\n", "{way:?}");
@@ -141,7 +144,7 @@ fn assert_every_byte_is_written(way: Way, preload: Option<&Path>) {
         if let Some(library) = preload {
             command.env("LD_PRELOAD", library);
         }
-        command.output().expect("the program runs")
+        bounded::output(&mut command)
     };
     // An executable is built into the one place `argv` builds it, so the
     // second program replaces the first.

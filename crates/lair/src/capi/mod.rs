@@ -21,7 +21,10 @@
 //! - No panic crosses the boundary: each entry catches it and reports
 //!   it as an error (or `-1`, or a null) whose text starts `internal
 //!   error:`. A handle whose operation panicked may only be freed.
-//! - No state is global. Handles are plain heap objects; a handle may
+//! - `lair` keeps no state of its own outside the handles: the one
+//!   process-wide thing is LLVM's native target registry, which
+//!   `llvm::target::init` initialises once, on first use, behind a
+//!   `std::sync::Once`. Handles are plain heap objects; a handle may
 //!   be used from one thread at a time, any thread, and different
 //!   handles from different threads at once.
 //!
@@ -43,6 +46,8 @@ pub use aot::lair_build_executable;
 pub use call::{lair_call_f64, lair_call_i64};
 pub use check::lair_check_source;
 pub use error::{lair_error_free, lair_error_text, LairError};
+#[cfg(feature = "test-panic")]
+pub use error::{TEST_PANIC_ADDRESS, TEST_PANIC_SOURCE};
 pub use jit::{
     lair_jit_add_source, lair_jit_address, lair_jit_c_entry, lair_jit_free, lair_jit_new, LairJit,
 };

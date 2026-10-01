@@ -22,6 +22,8 @@
 
 #![cfg(unix)]
 
+#[path = "../../lair/tests/common/bounded.rs"]
+mod bounded;
 #[path = "../../fibref/tests/io_support/mod.rs"]
 mod io_support;
 
@@ -41,13 +43,10 @@ fn fibc() -> Command {
 
 /// `fibc build SRC -o EXE`, which must succeed.
 fn build(src: &Path, exe: &Path) {
-    let built = fibc()
-        .arg("build")
-        .arg(src)
-        .arg("-o")
-        .arg(exe)
-        .output()
-        .expect("fibc builds");
+    let built = bounded::output_within(
+        fibc().arg("build").arg(src).arg("-o").arg(exe),
+        bounded::COMPILE,
+    );
     assert!(
         built.status.success(),
         "{}",
@@ -63,12 +62,12 @@ fn case(name: &str) -> PathBuf {
 
 #[test]
 fn run_hands_the_arguments_after_the_dashes_to_args() {
-    let out = fibc()
-        .args(["run"])
-        .arg(case("186-args-and-println.fib"))
-        .args(["--", "a", "b"])
-        .output()
-        .expect("fibc runs");
+    let out = bounded::output(
+        fibc()
+            .args(["run"])
+            .arg(case("186-args-and-println.fib"))
+            .args(["--", "a", "b"]),
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -80,14 +79,10 @@ fn run_hands_the_arguments_after_the_dashes_to_args() {
 
 #[test]
 fn a_built_executable_returns_mains_result_and_prints_nothing_of_its_own() {
-    let dir = std::env::temp_dir().join(format!("fibc-cli-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a temp dir");
-    let exe = dir.join("args");
+    let dir = io_support::TempDir::new("cli-exe");
+    let exe = dir.path().join("args");
     build(&case("186-args-and-println.fib"), &exe);
-    let out = Command::new(&exe)
-        .args(["x", "y", "z"])
-        .output()
-        .expect("the executable runs");
+    let out = bounded::output(Command::new(&exe).args(["x", "y", "z"]));
     assert_eq!(
         out.status.code(),
         Some(3),
@@ -95,31 +90,41 @@ fn a_built_executable_returns_mains_result_and_prints_nothing_of_its_own() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello from fibber\n");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A failed allocation is the trap "out of memory" (SIGABRT after the
 /// message), not a write through a null pointer (a segmentation fault,
-/// which is what malloc returning NULL used to be).
+/// which is what malloc returning NULL used to be): the runtime's own
+/// (`array`) and the program's (`alloc`, whose `calloc` was not checked;
+/// case 195 is the same for the interpreter).
 #[test]
 fn an_allocation_that_fails_traps_with_out_of_memory() {
     use std::os::unix::process::ExitStatusExt;
-    let dir = std::env::temp_dir().join(format!("fibc-cli-oom-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a temp dir");
-    let src = dir.join("oom.fib");
+    let dir = io_support::TempDir::new("cli-oom");
     // 8e15 bytes: more than any address space, so malloc fails.
-    std::fs::write(
-        &src,
-        "(defun main () -> i64 (array-len (array 1000000000000000 0)))\n",
-    )
-    .expect("the program is written");
-    let exe = dir.join("oom");
-    build(&src, &exe);
-    let out = Command::new(&exe).output().expect("the executable runs");
-    assert_eq!(out.status.signal(), Some(6), "{:?}", out.status);
-    assert_eq!(
-        String::from_utf8_lossy(&out.stderr),
-        "trap: out of memory\n"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
+    for (name, program) in [
+        (
+            "array",
+            "(defun main () -> i64 (array-len (array 1000000000000000 0)))\n",
+        ),
+        (
+            "alloc",
+            "(defun main () -> i64 (unsafe (let ((p (alloc 1000000000000000))) (do (free p) 7))))\n",
+        ),
+        (
+            "alloc-negative",
+            "(defun main () -> i64 (unsafe (let ((p (alloc -1))) (do (free p) 7))))\n",
+        ),
+    ] {
+        let src = dir.file(&format!("{name}.fib"), program);
+        let exe = dir.path().join(name);
+        build(&src, &exe);
+        let out = bounded::output(&mut Command::new(&exe));
+        assert_eq!(out.status.signal(), Some(6), "{name}: {:?}", out.status);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "trap: out of memory\n",
+            "{name}"
+        );
+    }
 }

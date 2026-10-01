@@ -73,4 +73,10 @@ fn alloc_is_lowered_to_calloc_so_that_its_block_is_zeroed() {
         !text.contains("(call @malloc (i64 24))"),
         "the program's alloc is a plain malloc"
     );
+    // And what calloc returns is checked: null is the trap "out of memory"
+    // (case 195), not a pointer the program writes through.
+    assert!(
+        text.contains("(call @fib.alloc-check "),
+        "the program's alloc does not check the block"
+    );
 }

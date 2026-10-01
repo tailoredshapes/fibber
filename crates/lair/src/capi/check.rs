@@ -14,6 +14,10 @@ use super::error::{guard, text, LairError};
 pub unsafe extern "C" fn lair_check_source(src: *const c_char, src_len: usize) -> *mut LairError {
     guard(|| {
         let src = text("src", src, src_len)?;
+        #[cfg(feature = "test-panic")]
+        if src == super::error::TEST_PANIC_SOURCE {
+            panic!("injected by the test-panic feature");
+        }
         crate::check_source(src)
             .map(drop)
             .map_err(|e| e.to_string())

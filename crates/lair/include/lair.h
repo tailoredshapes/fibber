@@ -22,10 +22,14 @@
  *  - No panic crosses this boundary: an internal failure is an error
  *    (or -1, or NULL) whose text starts "internal error:". The handle
  *    that was in use is then suspect and may only be freed.
- *  - Nothing is global. A handle may be used from one thread at a time
- *    (any thread); different handles may be used from different
- *    threads at once. Handles are heap objects; they do not depend on
- *    the thread that made them.
+ *  - lair keeps no state of its own outside the handles. The one thing
+ *    the process shares is LLVM's native target registry, which lair
+ *    initialises once, on first use, behind a std::sync::Once (the
+ *    initialisation is idempotent and can be reached from any thread).
+ *    A handle may be used from one thread at a time (any thread);
+ *    different handles may be used from different threads at once.
+ *    Handles are heap objects; they do not depend on the thread that
+ *    made them.
  *  - Memory: a handle is freed by its own free function; an address
  *    lair gives out is owned by the JIT session it came from and dies
  *    with lair_jit_free.

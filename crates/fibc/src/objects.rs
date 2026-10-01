@@ -354,10 +354,50 @@ mod tests {
         assert!(src.contains("(defstruct o.List.v1 (i64 i32 i32 i32 ptr ptr))"));
     }
 
+    /// A raw pointer slot is laid out and written as an object pointer's
+    /// is, in every object that can hold one, so the lIR that the walkers
+    /// see and the C code that shares the block agree on the layout: the
+    /// same `defstruct`, size and offsets as the same object holding a
+    /// `ptr`. What differs is what is counted, which `walk.rs` shows.
     #[test]
-    fn a_raw_pointer_slot_has_the_size_and_text_of_a_pointer() {
-        assert_eq!(LirTy::Raw.text(), LirTy::Ptr.text());
-        assert_eq!(crate::layout::size_align(LirTy::Raw), (8, 8));
-        assert_ne!(LirTy::Raw, LirTy::Ptr);
+    fn a_raw_pointer_slot_is_laid_out_and_written_as_a_pointer_slot_is() {
+        let layouts = |t: LirTy| {
+            let mut o = Objects::default();
+            o.intern(
+                "o.S",
+                "S",
+                ObjKind::Struct(vec![Some(LirTy::I32), Some(t), None, Some(LirTy::I8)]),
+            );
+            o.intern(
+                "o.E",
+                "E",
+                ObjKind::Enum(vec![vec![], vec![Some(LirTy::I8), Some(t)]]),
+            );
+            o.intern("o.C", "C", ObjKind::Cell(t));
+            o.intern("o.A", "A", ObjKind::Atom(t));
+            o.intern("o.R", "R", ObjKind::Array(t));
+            o.intern("o.K", "K", ObjKind::Closure(vec![LirTy::I8, t]));
+            let structs: Vec<String> = o
+                .render()
+                .lines()
+                .filter(|l| l.starts_with("(defstruct"))
+                .map(String::from)
+                .collect();
+            let sizes: Vec<u64> = (0..o.len() as u32).map(|i| o.get(i).size()).collect();
+            let offsets = (o.get(0).offsets(None), o.get(1).offsets(Some(1)));
+            (structs, sizes, offsets)
+        };
+        let (raw, object) = (layouts(LirTy::Raw), layouts(LirTy::Ptr));
+        assert_eq!(raw, object);
+        // Not vacuous: the struct has the i32 at 16, the pointer at 24
+        // and the i8 at 32 (its unit field has no slot), and its text
+        // says `ptr`.
+        assert_eq!(raw.2 .0, vec![16, 24, 32]);
+        assert!(
+            raw.0
+                .contains(&"(defstruct o.S (i64 i32 i32 i32 ptr i8))".to_string()),
+            "{:?}",
+            raw.0
+        );
     }
 }

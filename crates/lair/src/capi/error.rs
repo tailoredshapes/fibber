@@ -35,6 +35,17 @@ pub(super) fn raise(text: &str) -> *mut LairError {
     Box::into_raw(Box::new(Message::new(text))).cast::<LairError>()
 }
 
+/// The source text on which `lair_check_source` panics, and the address at
+/// which `lair_call_i64` and `lair_call_f64` panic, in a build with the
+/// feature `test-panic` (tests/capi_panic.rs): a panic at a real exported
+/// entry, which the entry must catch.
+#[cfg(feature = "test-panic")]
+pub const TEST_PANIC_SOURCE: &str = "(test-panic)";
+
+/// See [`TEST_PANIC_SOURCE`].
+#[cfg(feature = "test-panic")]
+pub const TEST_PANIC_ADDRESS: usize = 1;
+
 /// What `lair_error_text` returns for a null error.
 const NO_ERROR: &[u8] = b"\0";
 

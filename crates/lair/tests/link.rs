@@ -15,6 +15,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use common::bounded;
 use common::Scratch;
 use lair::aot::{build_executable, Options};
 use lair::Error;
@@ -45,12 +46,13 @@ fn library(dir: &Path, name: &str, source: &str) -> PathBuf {
     std::fs::create_dir_all(&lib_dir).expect("a library directory");
     let c = dir.join(format!("{name}.c"));
     std::fs::write(&c, source).expect("the C file is written");
-    let built = Command::new("cc")
-        .args(["-shared", "-fPIC", "-o"])
-        .arg(lib_dir.join(format!("lib{name}.so")))
-        .arg(&c)
-        .output()
-        .expect("cc runs");
+    let built = bounded::output_within(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(lib_dir.join(format!("lib{name}.so")))
+            .arg(&c),
+        bounded::COMPILE,
+    );
     assert!(built.status.success(), "{}", text(&built.stderr));
     lib_dir
 }
@@ -74,20 +76,21 @@ fn build(program: &str, exe: &Path, opts: &Options) -> Result<(), Error> {
 /// The executable, with `LD_LIBRARY_PATH` removed so that only what the
 /// link recorded can find a library.
 fn run(exe: &Path, cwd: &Path) -> Output {
-    Command::new(exe)
-        .current_dir(cwd)
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .expect("the executable runs")
+    bounded::output(
+        Command::new(exe)
+            .current_dir(cwd)
+            .env_remove("LD_LIBRARY_PATH"),
+    )
 }
 
 /// `lair ARGS..` run in `cwd`.
 fn lair(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lair"))
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .expect("lair runs")
+    bounded::output_within(
+        Command::new(env!("CARGO_BIN_EXE_lair"))
+            .current_dir(cwd)
+            .args(args),
+        bounded::COMPILE,
+    )
 }
 
 #[test]
@@ -115,15 +118,13 @@ fn the_rpath_is_what_finds_the_library() {
     std::fs::rename(&lib, &moved).expect("the library directory moves");
     let lost = run(&exe, scratch.path());
     assert_ne!(lost.status.code(), Some(42));
+    // The loader's words differ between libcs; it names the library.
     assert!(
-        text(&lost.stderr).contains("liblairtest.so: cannot open shared object file"),
+        text(&lost.stderr).contains("liblairtest.so"),
         "{}",
         text(&lost.stderr)
     );
-    let found = Command::new(&exe)
-        .env("LD_LIBRARY_PATH", &moved)
-        .output()
-        .expect("the executable runs");
+    let found = bounded::output(Command::new(&exe).env("LD_LIBRARY_PATH", &moved));
     assert_eq!(found.status.code(), Some(42), "{}", text(&found.stderr));
 }
 
@@ -197,12 +198,14 @@ fn a_library_the_linker_cannot_find_gives_the_linkers_message() {
     assert!(msg.starts_with("error: linker failed:"), "{msg}");
     assert!(msg.contains("-llairnosuch"), "{msg}");
 
-    // The symbol is named and the library is not: the symbol is undefined.
+    // The symbol is named and the library is not: the symbol is undefined
+    // (GNU ld says "undefined reference to `sym'", lld "undefined symbol:
+    // sym": the test asks for the word and the name).
     let err = build(ONE_LIBRARY, &exe, &options(&[&lib], &[])).expect_err("no -l");
+    let msg = err.to_string();
     assert!(
-        err.to_string()
-            .contains("undefined reference to `lairtest_triple'"),
-        "{err}"
+        msg.contains("undefined") && msg.contains("lairtest_triple"),
+        "{msg}"
     );
 
     // And the library is there: the same module with both links.

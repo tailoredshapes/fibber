@@ -36,6 +36,10 @@ pub enum Difference {
     /// A tool started with no file wrote nothing to standard error; it
     /// should say how it is used there (spec/bootstrap.md §2).
     NoUsageLine,
+    /// The tool did not finish within the bound it was given (`perf.rs`):
+    /// it was killed there, and its output is not compared. Times are in
+    /// milliseconds.
+    TooSlow { bound_ms: u128, took_ms: u128 },
 }
 
 /// An output split into lines, remembering whether the last one ended in
@@ -145,6 +149,11 @@ impl fmt::Display for Difference {
             Difference::NoUsageLine => {
                 write!(f, "standard error is empty: a usage line is expected")
             }
+            Difference::TooSlow { bound_ms, took_ms } => write!(
+                f,
+                "too slow: not finished after {took_ms} ms, the bound is {bound_ms} ms \
+                 (the run is killed there, so the real time is longer)"
+            ),
         }
     }
 }
