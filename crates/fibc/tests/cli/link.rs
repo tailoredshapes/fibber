@@ -258,7 +258,7 @@ fn the_usage_text_says_what_build_takes() {
     let out = bounded::output(fibc().args(["build", "x.fib"]));
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        text(&out.stderr).contains("build <file> -o <out> [-L dir].. [-l lib].."),
+        text(&out.stderr).contains("build <file> -o <out> [-O N] [-L dir].. [-l lib].."),
         "{}",
         text(&out.stderr)
     );

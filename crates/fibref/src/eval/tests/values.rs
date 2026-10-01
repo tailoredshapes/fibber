@@ -124,15 +124,17 @@ fn a_vector_past_one_trie_level_reads_back_in_order() {
 }
 
 #[test]
-fn show_of_a_str_is_itself_and_of_a_float_is_positional_with_a_fraction() {
-    // types §2.12 (Decided, 2026-09-30): no quotes, no exponent, `.0`.
+fn show_of_a_str_is_itself_and_of_a_float_is_clojures_text() {
+    // types §2.12 (Decided 2026-10-01): no quotes; Java's text of a float.
     let src = "(defun main () -> i64
                  (if (and (str-eq (show \"a b\") \"a b\")
                           (and (str-eq (show 100.0) \"100.0\")
-                               (and (str-eq (show 1e21) \"1000000000000000000000.0\")
+                               (and (str-eq (show 1e21) \"1.0E21\")
                                     (and (str-eq (show 0.1f32) \"0.1\")
                                          (and (str-eq (show -0.0) \"-0.0\")
-                                              (str-eq (show (/ -1.0 0.0)) \"-inf\"))))))
+                                              (and (str-eq (show 1e7) \"1.0E7\")
+                                                   (and (str-eq (show 1e-4) \"1.0E-4\")
+                                                        (str-eq (show (/ -1.0 0.0)) \"-Infinity\"))))))))
                      1 0))";
     super::clean(src, 1);
     assert_eq!(
@@ -141,6 +143,6 @@ fn show_of_a_str_is_itself_and_of_a_float_is_positional_with_a_fraction() {
     );
     assert_eq!(
         super::super::arith::float_text(1e-7, crate::types::ty::Scalar::F64),
-        "0.0000001"
+        "1.0E-7"
     );
 }

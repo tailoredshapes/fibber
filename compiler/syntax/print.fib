@@ -11,18 +11,25 @@
 ;;  - A form is printed into one (Vec str) of pieces and joined once, so
 ;;    printing is linear in the size of the form, not quadratic.
 ;;
-;; Floats: `show` (types §2.12) already gives the shortest round-trip
-;; digits, positionally with `.0`. The layout is derived from that text:
-;; the significant digits and the decimal exponent are read off it and laid
-;; out again by Rust's rule (exponent below -4 or at least 16: scientific).
-;; The digits are therefore `show`'s. The interpreter's are Rust's, and the
-;; compiled `show` (crates/fibc/rt/str.lir, fib.show-fp) gives the same
-;; digits since the fix recorded in spec/bootstrap.md §4: it once took the
-;; first `%.Ne` that reads back, which differs from Rust's shortest digits
-;; on exact ties (printf rounds to even, Rust up) and where a shorter
-;; spelling is not the correctly rounded one. Case 187,
-;; crates/fibc/tests/floats.rs (both widths, tens of thousands of values)
-;; and compiler/tests/reader/print-009-*.fib pin both.
+;; Floats: `show` (types §2.12, Decided 2026-10-01) is Clojure's text, Java's
+;; Double.toString: the shortest digits that read back, positional with a
+;; `.0` for 1e-3 <= |x| < 1e7 and otherwise `d.dddE<exp>`. The layout here
+;; is Rust's `{:?}`, so it is derived from that text: the significant
+;; digits and the decimal exponent are read off either form of it and laid
+;; out again by Rust's rule (exponent below -4 or at least 16: scientific),
+;; and `NaN`, `Infinity`, `-Infinity` print as Rust's Debug does (`NaN`,
+;; `inf`, `-inf`). The digits are `show`'s. The interpreter's are Rust's
+;; (the same digits as Java's, shortest, nearest, a tie going up) and the
+;; compiled `show` (crates/fibc/rt/str.lir, fib.show-fp) gives them too,
+;; with one exception that is Java's own rule: when one digit would do,
+;; Java writes the nearest decimal of two (4.9E-324, not 5E-324), which
+;; changes the digits only of the subnormals whose spelling is one digit,
+;; and Rust writes the one digit (`5e-324`, `1e-45f32`). `rust-digits`
+;; takes the two digits of `show` back to Rust's one: when a decimal of
+;; one digit that is next to them reads back (`strtod`, or `strtof` at f32,
+;; as the reader's own number parser does), it is Rust's.
+;; Case 187, crates/fibc/tests/floats.rs (both widths, tens of thousands
+;; of values) and compiler/tests/reader/print-009-*.fib pin the digits.
 (ns syntax.print (:use syntax.form syntax.chars util.text))
 
 ;; n zeros.
@@ -66,6 +73,73 @@
            (unicode-escape (char->i32 c))
            (str-concat "\\" (char->str c))))))
 
+(extern strtod :private (ptr ptr) -> f64)
+(extern strtof :private (ptr ptr) -> f32)
+
+;; A NUL-terminated copy of s, to be freed by the caller (syntax.number
+;; has the same; it requires this module, so it cannot be shared).
+(defun c-string :private (s: str) -> ptr
+  (let ((bs (str-bytes s))
+        (n (array-len bs)))
+    (unsafe
+      (let ((p (alloc (+ n 1))))
+        (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+        (store-i8 (ptr+ p n) 0i8)
+        p))))
+
+(defun read-f64 :private (s: str) -> f64
+  (unsafe
+    (let ((p (c-string s))
+          (e (alloc 8))
+          (r (strtod p e)))
+      (do (free e) (free p) r))))
+
+(defun read-f32 :private (s: str) -> f32
+  (unsafe
+    (let ((p (c-string s))
+          (e (alloc 8))
+          (r (strtof p e)))
+      (do (free e) (free p) r))))
+
+;; Whether the decimal text reads back to v at width w (an f32 form holds
+;; an f32 value widened to f64).
+(defun reads-back? :private (text: str v: f64 w: FltWidth) -> bool
+  (match w
+    ((F64) (= (read-f64 text) v))
+    ((F32) (= (read-f32 text) (fptrunc f32 v)))))
+
+;; Significant digits (no leading or trailing zero) and the decimal
+;; exponent of the first.
+(defstruct FltDigits (sig: str exp: i64))
+
+;; Rust's digits for the digits sig, exponent exp, that `show` gave for v.
+;; They are `show`'s unless `show` wrote two digits a.b where one would do
+;; (see the header). Then Rust's are the one digit a, or a plus one, that
+;; reads back; when both do, the nearer to the value, which is a when b is
+;; below 5 and a plus one when it is above (the nearest decimal of two
+;; digits a.b is within half a unit of the second digit of the value).
+;; b = 5 with both reading back does not happen: both read back only where
+;; the interval that reads back to v is wider than a unit of its first
+;; digit, which is true of the two smallest f64 and the seven smallest f32
+;; subnormals alone (4.9E-324, 9.9E-324; 1.4E-45, 2.8E-45, 4.2E-45,
+;; 5.6E-45, 7.0E-45, 8.4E-45, 9.8E-45) and none has b = 5
+;; (compiler/tests/reader/t0c-001-* and t0c-002-*). Were there one, the
+;; larger would be taken, as a tie goes up.
+(defun rust-digits :private (sig: str exp: i64 v: f64 w: FltWidth) -> FltDigits
+  (if (!= (str-len sig) 2)
+      (FltDigits sig exp)
+      (let ((bs (str-bytes sig))
+            (a (- (sext i64 (array-get bs 0)) 48))
+            (b (- (sext i64 (array-get bs 1)) 48))
+            (carry (= a 9))
+            (hi (if carry (FltDigits "1" (+ exp 1)) (FltDigits (show (+ a 1)) exp)))
+            (lo (FltDigits (show a) exp))
+            (lo-ok (reads-back? (str-join [(show a) "e" (show exp)]) v w))
+            (hi-ok (reads-back? (str-join [(. hi sig) "e" (show (. hi exp))]) v w)))
+        (if (and lo-ok hi-ok)
+            (if (< b 5) lo hi)
+            (if lo-ok lo (if hi-ok hi (FltDigits sig exp)))))))
+
 ;; The layout of sig, the significant digits (no leading or trailing
 ;; zero), whose first digit has decimal exponent exp: Rust's Debug rule.
 (defun layout-digits :private (sig: str exp: i64) -> str
@@ -93,52 +167,59 @@
     (if (and (> i 0) (= (array-get bs (- i 1)) 48i8)) (recur (- i 1)) i)))
 
 ;; The layout of the digits a, of which the first li are before the
-;; decimal point, as the text of a number of the given sign.
-(defun layout-number :private (neg: bool a: str li: i64) -> str
+;; decimal point, as the text of the number v (at width w) of the given
+;; sign (rust-digits reads its magnitude).
+(defun layout-number :private (neg: bool a: str li: i64 v: f64 w: FltWidth) -> str
   (let ((bs (str-bytes a))
         (z (first-nonzero bs))
         (e (end-of-digits bs))
         (sign (if neg "-" "")))
     (if (>= z e)
         (str-concat sign "0.0")
-        (str-concat sign (layout-digits (str-slice a z e) (- (- li z) 1))))))
+        (let ((d (rust-digits (str-slice a z e) (- (- li z) 1) (if neg (- 0.0 v) v) w)))
+          (str-concat sign (layout-digits (. d sig) (. d exp)))))))
 
-;; True when the bytes of a `show` text are an optional `-`, digits and
-;; at most the one `.`: a finite number.
-(defun finite-text? :private (bs: (Array i8)) -> bool
-  (let ((n (array-len bs)))
-    (and (> n 0)
-         (loop ((i (if (= (array-get bs 0) 45i8) 1 0)))
-           (if (< i n)
-               (let ((b (array-get bs i)))
-                 (if (or (and (>= b 48i8) (<= b 57i8)) (= b 46i8)) (recur (+ i 1)) false))
-               true)))))
-
-;; The index of the first `.` in bs, or its length.
-(defun point-index :private (bs: (Array i8)) -> i64
+;; The index of the first byte of bs equal to b, or its length.
+(defun index-of :private (bs: (Array i8) b: i8) -> i64
   (let ((n (array-len bs)))
     (loop ((i 0))
-      (if (and (< i n) (!= (array-get bs i) 46i8)) (recur (+ i 1)) i))))
+      (if (and (< i n) (!= (array-get bs i) b)) (recur (+ i 1)) i))))
 
-;; Rust's `{:?}` of the float whose `show` text is given.
-(defun debug-layout :private (text: str) -> str
-  (let ((bs (str-bytes text)))
-    (if (finite-text? bs)
-        (let ((n (array-len bs))
-              (neg (= (array-get bs 0) 45i8))
-              (from (if (= (array-get bs 0) 45i8) 1 0))
-              (dot (point-index bs))
-              (whole (str-slice text from dot)))
-          (layout-number neg
-                         (str-concat whole (if (< dot n) (str-slice text (+ dot 1) n) ""))
-                         (str-len whole)))
-        text)))
+;; The integer that the bytes of bs from `from` on spell: digits with an
+;; optional leading `-`, the exponent after the E of a `show` text.
+(defun exp-value :private (bs: (Array i8) from: i64) -> i64
+  (let ((n (array-len bs))
+        (neg (= (array-get bs from) 45i8)))
+    (loop ((i (if neg (+ from 1) from)) (acc 0))
+      (if (< i n)
+          (recur (+ i 1) (+ (* acc 10) (- (sext i64 (array-get bs i)) 48)))
+          (if neg (- 0 acc) acc)))))
+
+;; Rust's `{:?}` of the float v (at width w) whose `show` text is given:
+;; `NaN`, `Infinity` and `-Infinity` become `NaN`, `inf` and `-inf`; a
+;; finite text is an optional `-`, digits, `.`, digits and optionally `E`
+;; and an exponent, from which the digits and the point's place are read.
+(defun debug-layout :private (text: str v: f64 w: FltWidth) -> str
+  (cond ((= text "NaN") "NaN")
+        ((= text "Infinity") "inf")
+        ((= text "-Infinity") "-inf")
+        (true
+         (let ((bs (str-bytes text))
+               (n (array-len bs))
+               (neg (= (array-get bs 0) 45i8))
+               (from (if (= (array-get bs 0) 45i8) 1 0))
+               (e (index-of bs 69i8))
+               (dot (index-of bs 46i8))
+               (whole (str-slice text from (if (< dot e) dot e)))
+               (frac (if (< dot e) (str-slice text (+ dot 1) e) ""))
+               (shift (if (< e n) (exp-value bs (+ e 1)) 0)))
+           (layout-number neg (str-concat whole frac) (+ (str-len whole) shift) v w)))))
 
 ;; An f32 form holds an f32 value widened to f64: it shows as the f32.
 (defun flt-lit :private (v: f64 w: FltWidth) -> str
   (match w
-    ((F32) (str-concat (debug-layout (show (fptrunc f32 v))) "f32"))
-    ((F64) (debug-layout (show v)))))
+    ((F32) (str-concat (debug-layout (show (fptrunc f32 v)) v w) "f32"))
+    ((F64) (debug-layout (show v) v w))))
 
 (defun int-lit :private (v: i64 w: IntWidth) -> str
   (match w

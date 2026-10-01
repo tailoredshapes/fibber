@@ -14,16 +14,20 @@ beside the file, then under each -I dir in order, then under each directory of
 $FIB_LIB, then in the library the executable carries (spec/syntax.md §5).
 
 commands:
-  run [--trace] <file> [-- arg..]
+  run [--trace] [-O N] <file> [-- arg..]
                          compile file through the JIT and run its main; the
                          args after -- are (args), a byte that is not UTF-8 in
                          one becoming U+FFFD as Rust's from_utf8_lossy makes it
-  build <file> -o <out> [-L dir].. [-l lib]..
+  build <file> -o <out> [-O N] [-L dir].. [-l lib]..
                          compile file to an executable; each -l lib links
                          -llib, each -L dir is searched for libraries and
                          becomes an rpath (as an absolute path), so the
                          executable finds its libraries without
                          LD_LIBRARY_PATH (-Ldir and -llib are also taken)
+
+-O N (N from 0 to 3, or -ON) is the LLVM optimisation level of run and build:
+build defaults to 2, run to 0 (a run compiles the program afresh every time,
+and -O 2 costs about two and a half times as long to compile as -O 0).
   emit <file>            print the lIR module of file
   explain <file>         print the ownership checker's decisions (types §9)
   itrace <file>          run file in the reference interpreter and print its
@@ -40,6 +44,15 @@ commands:
 
 pub const DEFAULT_CASES_DIR: &str = "cases/ownership";
 
+/// The LLVM optimisation level of `run` without `-O`: none, because a run
+/// compiles the program afresh every time and `-O 2` costs about two and
+/// a half times as long to compile (stdlib design §6.4, C6).
+pub const RUN_OPT_LEVEL: u8 = 0;
+
+/// The level of `build` without `-O`: the executable is compiled once and
+/// run many times (stdlib design §7 C6).
+pub const BUILD_OPT_LEVEL: u8 = 2;
+
 /// What `build` links besides the program: the `-L` directories and
 /// the `-l` library names, each in the order given.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -54,11 +67,13 @@ pub enum Command {
         file: String,
         trace: bool,
         args: Vec<String>,
+        opt: u8,
     },
     Build {
         file: String,
         out: String,
         link: Link,
+        opt: u8,
     },
     Emit {
         file: String,
@@ -107,14 +122,14 @@ fn parse_gen(args: &[&str]) -> Command {
 }
 
 /// A flag and its value, as `cc` takes them: `-L DIR` or `-LDIR`,
-/// `-l LIB` or `-lLIB`, `-o OUT`. `None` when the value is missing or
-/// empty.
+/// `-l LIB` or `-lLIB`, `-O N` or `-ON`, `-o OUT`. `None` when the value
+/// is missing or empty.
 fn flag_value<'a>(
     flag: &'a str,
     rest: &mut impl Iterator<Item = &'a &'a str>,
 ) -> Option<(&'a str, &'a str)> {
     let glued = match flag.get(..2) {
-        Some(name @ ("-L" | "-l")) if flag.len() > 2 => Some((name, &flag[2..])),
+        Some(name @ ("-L" | "-l" | "-O")) if flag.len() > 2 => Some((name, &flag[2..])),
         _ => None,
     };
     let (name, value) = match glued {
@@ -124,10 +139,22 @@ fn flag_value<'a>(
     (!value.is_empty()).then_some((name, value))
 }
 
-/// `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, in any
-/// order after the file; `-o` exactly once. Anything else is `Invalid`.
+/// An optimisation level: one digit, 0 to 3.
+fn opt_level(text: &str) -> Option<u8> {
+    match text {
+        "0" => Some(0),
+        "1" => Some(1),
+        "2" => Some(2),
+        "3" => Some(3),
+        _ => None,
+    }
+}
+
+/// `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, and at
+/// most one `-O N`, in any order after the file; `-o` exactly once.
+/// Anything else is `Invalid`.
 fn parse_build(file: &str, rest: &[&str]) -> Command {
-    let (mut out, mut link) = (None, Link::default());
+    let (mut out, mut link, mut opt) = (None, Link::default(), None);
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
         let Some((name, value)) = flag_value(flag, &mut it) else {
@@ -137,6 +164,10 @@ fn parse_build(file: &str, rest: &[&str]) -> Command {
             "-o" if out.is_none() => out = Some(value),
             "-L" => link.dirs.push(value.to_string()),
             "-l" => link.libs.push(value.to_string()),
+            "-O" if opt.is_none() => match opt_level(value) {
+                Some(n) => opt = Some(n),
+                None => return Command::Invalid,
+            },
             _ => return Command::Invalid,
         }
     }
@@ -145,8 +176,47 @@ fn parse_build(file: &str, rest: &[&str]) -> Command {
             file: file.to_string(),
             out: out.to_string(),
             link,
+            opt: opt.unwrap_or(BUILD_OPT_LEVEL),
         },
         None => Command::Invalid,
+    }
+}
+
+/// `run [--trace] [-O N] FILE [-- ARG..]`: the flags in either order
+/// before the file. A flag has to be followed by a word that is not `--`,
+/// the file, so `run --trace` is the file `--trace` as it always was.
+fn parse_run(rest: &[&str]) -> Command {
+    let (mut trace, mut opt, mut at) = (false, None, 0);
+    while rest.get(at + 1).is_some_and(|next| *next != "--") {
+        let word = rest[at];
+        if word == "--trace" && !trace {
+            trace = true;
+            at += 1;
+        } else if word.starts_with("-O") && opt.is_none() {
+            let (value, used) = match word.get(2..) {
+                Some("") => (rest[at + 1], 2),
+                Some(glued) => (glued, 1),
+                None => return Command::Invalid,
+            };
+            match opt_level(value) {
+                Some(n) => opt = Some(n),
+                None => return Command::Invalid,
+            }
+            at += used;
+        } else {
+            break;
+        }
+    }
+    let (file, args) = match &rest[at..] {
+        [file] => (file, Vec::new()),
+        [file, "--", args @ ..] => (file, args.iter().map(|s| s.to_string()).collect()),
+        _ => return Command::Invalid,
+    };
+    Command::Run {
+        file: file.to_string(),
+        trace,
+        args,
+        opt: opt.unwrap_or(RUN_OPT_LEVEL),
     }
 }
 
@@ -157,26 +227,7 @@ pub fn parse(args: &[String]) -> Command {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["run", file] => Command::Run {
-            file: file.to_string(),
-            trace: false,
-            args: Vec::new(),
-        },
-        ["run", "--trace", file] => Command::Run {
-            file: file.to_string(),
-            trace: true,
-            args: Vec::new(),
-        },
-        ["run", file, "--", rest @ ..] => Command::Run {
-            file: file.to_string(),
-            trace: false,
-            args: rest.iter().map(|s| s.to_string()).collect(),
-        },
-        ["run", "--trace", file, "--", rest @ ..] => Command::Run {
-            file: file.to_string(),
-            trace: true,
-            args: rest.iter().map(|s| s.to_string()).collect(),
-        },
+        ["run", rest @ ..] => parse_run(rest),
         ["build", file, rest @ ..] => parse_build(file, rest),
         ["emit", file] => Command::Emit {
             file: file.to_string(),
@@ -208,6 +259,10 @@ mod tests {
     }
 
     fn build(file: &str, out: &str, dirs: &[&str], libs: &[&str]) -> Command {
+        build_at(file, out, dirs, libs, BUILD_OPT_LEVEL)
+    }
+
+    fn build_at(file: &str, out: &str, dirs: &[&str], libs: &[&str], opt: u8) -> Command {
         Command::Build {
             file: file.into(),
             out: out.into(),
@@ -215,6 +270,16 @@ mod tests {
                 dirs: dirs.iter().map(|s| s.to_string()).collect(),
                 libs: libs.iter().map(|s| s.to_string()).collect(),
             },
+            opt,
+        }
+    }
+
+    fn run_at(file: &str, trace: bool, words: &[&str], opt: u8) -> Command {
+        Command::Run {
+            file: file.into(),
+            trace,
+            args: words.iter().map(|s| s.to_string()).collect(),
+            opt,
         }
     }
 
@@ -222,19 +287,11 @@ mod tests {
     fn parses_each_command() {
         assert_eq!(
             parse(&args(&["run", "--trace", "a.fib"])),
-            Command::Run {
-                file: "a.fib".into(),
-                trace: true,
-                args: Vec::new()
-            }
+            run_at("a.fib", true, &[], 0)
         );
         assert_eq!(
             parse(&args(&["run", "a.fib", "--", "x", "y"])),
-            Command::Run {
-                file: "a.fib".into(),
-                trace: false,
-                args: vec!["x".into(), "y".into()]
-            }
+            run_at("a.fib", false, &["x", "y"], 0)
         );
         assert_eq!(
             parse(&args(&["build", "a.fib", "-o", "a"])),
@@ -299,5 +356,94 @@ mod tests {
             ])),
             build("a.fib", "a", &["-x"], &["-y"])
         );
+    }
+
+    #[test]
+    fn build_defaults_to_level_2_and_run_to_level_0() {
+        assert_eq!(BUILD_OPT_LEVEL, 2);
+        assert_eq!(RUN_OPT_LEVEL, 0);
+        assert_eq!(
+            parse(&args(&["build", "a.fib", "-o", "a"])),
+            build_at("a.fib", "a", &[], &[], 2)
+        );
+        assert_eq!(
+            parse(&args(&["run", "a.fib"])),
+            run_at("a.fib", false, &[], 0)
+        );
+    }
+
+    #[test]
+    fn build_takes_the_level_apart_or_glued_in_any_place_after_the_file() {
+        for (line, level) in [
+            (&["build", "a.fib", "-o", "a", "-O", "0"][..], 0),
+            (&["build", "a.fib", "-O", "1", "-o", "a"][..], 1),
+            (&["build", "a.fib", "-O3", "-o", "a"][..], 3),
+            (
+                &["build", "a.fib", "-o", "a", "-L", "d", "-O2", "-l", "m"][..],
+                2,
+            ),
+        ] {
+            let (dirs, libs): (&[&str], &[&str]) = if line.contains(&"-L") {
+                (&["d"], &["m"])
+            } else {
+                (&[], &[])
+            };
+            assert_eq!(
+                parse(&args(line)),
+                build_at("a.fib", "a", dirs, libs, level),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_takes_the_level_and_trace_in_either_order_before_the_file() {
+        for (line, trace, level) in [
+            (&["run", "-O", "2", "a.fib"][..], false, 2),
+            (&["run", "-O1", "a.fib"][..], false, 1),
+            (&["run", "--trace", "-O", "3", "a.fib"][..], true, 3),
+            (&["run", "-O0", "--trace", "a.fib"][..], true, 0),
+        ] {
+            assert_eq!(
+                parse(&args(line)),
+                run_at("a.fib", trace, &[], level),
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            parse(&args(&["run", "-O", "2", "a.fib", "--", "-O", "7"])),
+            run_at("a.fib", false, &["-O", "7"], 2)
+        );
+    }
+
+    #[test]
+    fn the_level_is_a_digit_from_0_to_3_and_given_once() {
+        let bad: [&[&str]; 13] = [
+            &["build", "a.fib", "-o", "a", "-O"],
+            &["build", "a.fib", "-o", "a", "-O", "4"],
+            &["build", "a.fib", "-o", "a", "-O", "-1"],
+            &["build", "a.fib", "-o", "a", "-O", "+2"],
+            &["build", "a.fib", "-o", "a", "-O", "02"],
+            &["build", "a.fib", "-o", "a", "-O", "s"],
+            &["build", "a.fib", "-o", "a", "-O", ""],
+            &["build", "a.fib", "-o", "a", "-O2", "-O", "1"],
+            &["run", "-O", "a.fib"],
+            &["run", "-O", "4", "a.fib"],
+            &["run", "-O2", "-O", "1", "a.fib"],
+            &["run", "-O", "2"],
+            &["run", "--trace", "--trace", "a.fib"],
+        ];
+        for line in bad {
+            assert_eq!(parse(&args(line)), Command::Invalid, "{line:?}");
+        }
+        // A last word is the file, as `run --trace` always was.
+        assert_eq!(parse(&args(&["run", "-O2"])), run_at("-O2", false, &[], 0));
+    }
+
+    #[test]
+    fn the_usage_names_the_level_and_its_defaults() {
+        assert!(USAGE.contains("run [--trace] [-O N] <file>"));
+        assert!(USAGE.contains("build <file> -o <out> [-O N]"));
+        assert!(USAGE.contains("build defaults to 2, run to 0"));
     }
 }

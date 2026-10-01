@@ -75,12 +75,12 @@ fn no_llvm(what: &str) -> ExitCode {
 }
 
 #[cfg(not(feature = "llvm"))]
-fn run(_file: &str, _roots: &Roots, _trace: bool, _args: &[String]) -> ExitCode {
+fn run(_file: &str, _roots: &Roots, _trace: bool, _args: &[String], _opt: u8) -> ExitCode {
     no_llvm("run")
 }
 
 #[cfg(not(feature = "llvm"))]
-fn build(_file: &str, _roots: &Roots, _out: &str, _link: &Link) -> ExitCode {
+fn build(_file: &str, _roots: &Roots, _out: &str, _link: &Link, _opt: u8) -> ExitCode {
     no_llvm("build")
 }
 
@@ -151,7 +151,7 @@ fn gen(cfg: GenConfig) -> ExitCode {
 }
 
 #[cfg(feature = "llvm")]
-fn run(file: &str, roots: &Roots, trace: bool, args: &[String]) -> ExitCode {
+fn run(file: &str, roots: &Roots, trace: bool, args: &[String], opt: u8) -> ExitCode {
     let lir = match lower(file, roots) {
         Ok(l) => l,
         Err(code) => return code,
@@ -167,7 +167,7 @@ fn run(file: &str, roots: &Roots, trace: bool, args: &[String]) -> ExitCode {
         Ok(m) => m,
         Err(e) => return fail(e),
     };
-    let mut jit = match Jit::new(JitOptions::default()) {
+    let mut jit = match Jit::new(JitOptions { opt_level: opt }) {
         Ok(j) => j,
         Err(e) => return fail(e),
     };
@@ -197,7 +197,7 @@ fn run(file: &str, roots: &Roots, trace: bool, args: &[String]) -> ExitCode {
 /// rpath) each `-L` directory. A directory that cannot be one is refused
 /// here first, before anything is compiled (exit 2); `lair` checks again.
 #[cfg(feature = "llvm")]
-fn build(file: &str, roots: &Roots, out: &str, link: &Link) -> ExitCode {
+fn build(file: &str, roots: &Roots, out: &str, link: &Link, opt: u8) -> ExitCode {
     if let Some(message) = link.dirs.iter().find_map(|d| library_dir(d).err()) {
         eprintln!("fibc: {message}");
         return ExitCode::from(2);
@@ -215,9 +215,9 @@ fn build(file: &str, roots: &Roots, out: &str, link: &Link) -> ExitCode {
         Err(e) => return fail(e),
     };
     let opts = Options {
+        opt_level: opt,
         lib_dirs: link.dirs.clone(),
         libs: link.libs.clone(),
-        ..Options::default()
     };
     match build_executable(&module, file, Path::new(out), &opts) {
         Ok(()) => ExitCode::SUCCESS,
@@ -329,8 +329,18 @@ fn main() -> ExitCode {
     }
     let roots = Roots::from_env(&dirs, std::env::var_os("FIB_LIB").as_deref());
     match command {
-        Command::Run { file, trace, args } => run(&file, &roots, trace, &args),
-        Command::Build { file, out, link } => build(&file, &roots, &out, &link),
+        Command::Run {
+            file,
+            trace,
+            args,
+            opt,
+        } => run(&file, &roots, trace, &args, opt),
+        Command::Build {
+            file,
+            out,
+            link,
+            opt,
+        } => build(&file, &roots, &out, &link, opt),
         Command::Emit { file } => emit(&file, &roots),
         Command::Explain { file } => explain(&file, &roots),
         Command::Itrace { file } => itrace(&file, &roots),

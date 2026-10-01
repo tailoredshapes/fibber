@@ -1,18 +1,23 @@
-//! The compiled `show` of a float is the interpreter's text (types
-//! §2.12, method rule 6): the shortest decimal that reads back at the
-//! value's width, the nearest to the value among those of that length,
-//! an exact tie going up. The interpreter's text is Rust's `{}` (eval/
-//! arith.rs `float_text`); the runtime's is `fib.show-fp` in
+//! The text of `show` on a float (types §2.12, Decided, owner,
+//! 2026-10-01: Clojure's, which is Java's `Double.toString`) is the same
+//! in both tools and is Java's (method rule 6). The interpreter's text is
+//! `float_text` (eval/floattext.rs); the runtime's is `fib.show-fp` in
 //! `rt/str.lir`, which prints through libc.
 //!
 //! Rust writes a seeded list of values as `{:e}` text that reads back
 //! exactly, a fibber program built with `fibc build` reads each line with
 //! `strtod` or `strtof` and prints `(show x)`, and every line is compared
-//! with `float_text` of the same value. The values are chosen where a
-//! shortest-digits routine goes wrong: both neighbours of every binade
-//! boundary, exact ties `k / 2^m`, values whose shortest spelling has the
-//! most digits, the 1e15..1e22 band, subnormals, the extremes and a
-//! random sample of bit patterns; every one with both signs.
+//! with `float_text` of the same value and with `java::text`, a model of
+//! Java's rule that shares no code with either (`floats/java.rs`). The
+//! values are chosen where a shortest-digits routine goes wrong: both
+//! neighbours of every binade boundary, exact ties `k / 2^m`, values whose
+//! shortest spelling has the most digits, the 1e15..1e22 band, subnormals,
+//! the extremes and a random sample of bit patterns; every one with both
+//! signs. A second test compares both tools with the texts Java gave for
+//! 91 hand-written values (`java::F64_TEXTS`, `java::F32_TEXTS`).
+
+#[path = "floats/java.rs"]
+mod java;
 
 #[path = "../../fibref/tests/io_support/mod.rs"]
 mod io_support;
@@ -310,38 +315,48 @@ fn build(dir: &Path) -> PathBuf {
     exe
 }
 
-/// Compares the compiled `show` of every pattern with the interpreter's
-/// and returns the number compared and the lines that differ.
-fn compare(dir: &Path, exe: &Path, w: Width, seed: u64) -> (usize, Vec<String>) {
-    let patterns = bit_patterns(w, seed);
-    let input = dir.join(format!("{}.txt", w.name()));
-    let text: String = patterns.iter().map(|&b| w.input(b) + "\n").collect();
-    std::fs::write(&input, text).expect("the input is written");
+/// What the compiled program prints for each line of `input`, read as
+/// `width` (`f64` or `f32`); one output line per input line.
+fn run(dir: &Path, exe: &Path, width: &str, input: &[String]) -> Vec<String> {
+    let file = dir.join(format!("{width}.txt"));
+    let text: String = input.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(&file, text).expect("the input is written");
     let out = Command::new(exe)
-        .args([w.name()])
-        .arg(&input)
+        .arg(width)
+        .arg(&file)
         .output()
         .expect("the program runs");
     let shown = String::from_utf8_lossy(&out.stdout);
-    let lines: Vec<&str> = shown.lines().collect();
+    let lines: Vec<String> = shown.lines().map(str::to_string).collect();
     assert_eq!(
         lines.len(),
-        patterns.len(),
+        input.len(),
         "the program printed {} of {} values: {}",
         lines.len(),
-        patterns.len(),
+        input.len(),
         String::from_utf8_lossy(&out.stderr)
     );
+    lines
+}
+
+/// Compares the compiled `show` of every pattern with the interpreter's
+/// and with the model's, and returns the number compared and the lines
+/// that differ.
+fn compare(dir: &Path, exe: &Path, w: Width, seed: u64) -> (usize, Vec<String>) {
+    let patterns = bit_patterns(w, seed);
+    let input: Vec<String> = patterns.iter().map(|&b| w.input(b)).collect();
+    let lines = run(dir, exe, w.name(), &input);
     let bad = patterns
         .iter()
         .zip(&lines)
-        .filter(|(&b, line)| w.expected(b) != **line)
+        .filter(|(&b, line)| w.expected(b) != **line || java::text(w, b) != **line)
         .map(|(&b, line)| {
             format!(
-                "{}: interpreter {} compiled {}",
+                "{}: interpreter {} compiled {} model {}",
                 w.input(b),
                 squeeze(&w.expected(b)),
-                squeeze(line)
+                squeeze(line),
+                squeeze(&java::text(w, b))
             )
         })
         .collect();
@@ -390,4 +405,49 @@ fn the_compiled_show_of_a_float_is_the_interpreters() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Both tools and the model against the texts Java gave: the hand-written
+/// values of `java`, and the values that are not numbers or have a sign.
+#[test]
+fn both_tools_print_the_texts_java_gives() {
+    let scratch = TempDir::new("floats-java");
+    let dir = scratch.path().to_path_buf();
+    let exe = build(&dir);
+    let specials: [(&str, &str); 5] = [
+        ("nan", "NaN"),
+        ("inf", "Infinity"),
+        ("-inf", "-Infinity"),
+        ("0.0", "0.0"),
+        ("-0.0", "-0.0"),
+    ];
+    for (w, table) in [(Width::F64, java::F64_TEXTS), (Width::F32, java::F32_TEXTS)] {
+        let rows: Vec<(&str, &str)> = table.iter().chain(&specials).copied().collect();
+        let input: Vec<String> = rows.iter().map(|(v, _)| v.to_string()).collect();
+        let compiled = run(&dir, &exe, w.name(), &input);
+        for ((value, java_text), shown) in rows.iter().zip(&compiled) {
+            let bits = match w {
+                Width::F64 => value.parse::<f64>().expect("a float").to_bits(),
+                Width::F32 => u64::from(value.parse::<f32>().expect("a float").to_bits()),
+            };
+            assert_eq!(shown, java_text, "{} {value}: compiled", w.name());
+            assert_eq!(
+                &w.expected(bits),
+                java_text,
+                "{} {value}: interpreter",
+                w.name()
+            );
+            assert_eq!(
+                &java::text(w, bits),
+                java_text,
+                "{} {value}: model",
+                w.name()
+            );
+        }
+        println!(
+            "{}: {} texts of Java matched by both tools",
+            w.name(),
+            rows.len()
+        );
+    }
 }

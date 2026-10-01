@@ -14,6 +14,8 @@ use super::error::{RunError, R};
 use super::interp::Interp;
 use super::value::{bits, wrap, Val};
 
+pub use super::floattext::float_text;
+
 impl Interp<'_> {
     /// Method `m` of the built-in instance `inst` on `args`.
     pub fn native_method(&mut self, inst: usize, m: usize, args: &[Val]) -> R<Val> {
@@ -118,28 +120,6 @@ pub fn float_hash(f: f64) -> i64 {
         0
     } else {
         f.to_bits() as i64
-    }
-}
-
-/// A float's `show` text (types §2.12): the shortest decimal that reads
-/// back at its width, positional, with `.0` when integral; `NaN`,
-/// `inf`, `-inf`.
-pub fn float_text(f: f64, w: Scalar) -> String {
-    if f.is_nan() {
-        return "NaN".into();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 { "inf" } else { "-inf" }.into();
-    }
-    let s = if w == Scalar::F32 {
-        format!("{}", f as f32)
-    } else {
-        format!("{f}")
-    };
-    if s.contains('.') {
-        s
-    } else {
-        format!("{s}.0")
     }
 }
 

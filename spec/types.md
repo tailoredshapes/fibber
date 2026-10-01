@@ -583,13 +583,23 @@ gives a fresh `str` each time: a `str` shows as itself; an integer as
 its decimal digits with a leading `-` when negative; a `bool` as
 `true` or `false`; a `char` as its UTF-8 encoding; a keyword as `:`
 and its name; a field-less enum as its variant's name; unit as `()`; a
-float as the shortest decimal that reads back to the same value at
-its width (among those of that length the one nearest the value, an
-exact tie going to the larger magnitude, as Rust's `{}` prints it),
-written positionally (never with an exponent, however large or small),
-with `.0` added when it has no fraction, so `100.0`, `-0.0`,
-`0.0000001` and `1000000000000000000000.0`, and `NaN`, `inf` and `-inf`
-for the values that are not finite. `hash` of an integer is
+float as Clojure's text, Java's `Double.toString` (**Decided**, owner,
+2026-10-01; it amends the decision of 2026-09-30, which wrote every
+float positionally and `NaN`, `inf` and `-inf`; stdlib design §7 C12):
+the shortest decimal that reads back to the same value at its width
+(among those of that length the one nearest the value, an exact tie
+going to the larger magnitude, as Rust's `{:e}` prints it; Java takes
+the even digit of a tie, and this is the one place the text is not
+Java's: `2^-25` is `2.9802322387695313E-8` here and
+`2.9802322387695312E-8` there), except that where one digit would do
+the nearest decimal of two is written, as Java does (`4.9E-324`, and
+`1.4E-45` at `f32`, not `5E-324` and `1E-45`). The layout is
+positional for `1e-3 <= |x| < 1e7` with `.0` added when it has no
+fraction (`100.0`, `0.001`, `1234567.0`) and otherwise a digit, a
+point, at least one more digit, `E` and the exponent, with `-` when it
+is negative and no `+` (`1.0E7`, `1.0E-4`, `1.2345E10`, `1.0E21`);
+`-0.0` is `-0.0`, and the values that are not finite are `NaN`,
+`Infinity` and `-Infinity`. `hash` of an integer is
 its value, of a `bool` or a `char` its code, of a field-less enum its
 variant index, of a keyword the 64-bit FNV-1a of its name and of a
 `str` of its bytes, of a float the bits of its value as an `f64`, of

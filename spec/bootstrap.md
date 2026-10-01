@@ -68,7 +68,7 @@ not in columns):
 |---|---|
 | symbol, keyword | `sym "name"`, `kw "name"` |
 | integer | `int 42 i64` (value, width always written) |
-| float | `flt 2.5 f32` (the `show` text of types §2.12 at its width, then the width) |
+| float | `flt 2.5 f32` (the `show` text of types §2.12 at its width, then the width; since 2026-10-01 that text is Clojure's, Java's `Double.toString`: `flt 0.001 f64`, `flt 1.0E7 f64`, `flt 1.4E-45 f32`) |
 | string | `str "text"` |
 | character | `chr U+0041` (four or more uppercase hex digits) |
 | boolean, nil | `bool true`, `nil` |
@@ -94,7 +94,9 @@ of `syntax/print.rs` (`syntax.print`): prefix forms in their long spelling
 (`'x` is `(quote x)`), an integer with its width suffix unless `i64`, a
 float in Rust's `{:?}` layout (the shortest digits that read back,
 positional from 1e-4 up to 1e16, scientific outside, `-0.0`, `f32` after
-an f32 float), a string and a character escaped as in syntax §1.1 with
+an f32 float; the printer's layout is its own and is not `show`'s, so
+`1e-5` prints as `1e-5` where the dump says `1.0E-5`, and `5e-324` where
+the dump says `4.9E-324`), a string and a character escaped as in syntax §1.1 with
 every forbidden character as `\u{HEX}`. The text has no line break and
 reads back to an equal form. A file that does not read prints the line
 `error ...` of the dump, and the exit statuses are those of the dump.
@@ -149,7 +151,7 @@ each one is decided by the owner or recorded as a proposal here.
 
 | Gap | Found by | Resolution |
 |---|---|---|
-| the compiled `show` of a float differed from the interpreter's in exact ties (`2^-25`) and just above powers of two: `fib.show-fp` took the first `printf` precision that reads back | the dump of float literals, the printer (`print-009`) | fixed: `show` is the shortest digits that read back, the nearest of them, a tie going up (types §2.12), as Rust prints; `crates/fibc/tests/floats.rs` compares 64 000 values, case 187 |
+| the compiled `show` of a float differed from the interpreter's in exact ties (`2^-25`) and just above powers of two: `fib.show-fp` took the first `printf` precision that reads back | the dump of float literals, the printer (`print-009`) | fixed: `show` is the shortest digits that read back, the nearest of them, a tie going up (types §2.12), as Rust prints; `crates/fibc/tests/floats.rs` compares 64 000 values, case 187; since 2026-10-01 the layout of `show` is Clojure's (types §2.12, stdlib design C12) and the printer reads the digits off either form of it (`syntax/print.fib`), taking Java's two digits where one would do back to Rust's one by reading candidates back with `strtod`/`strtof` (`print-*`, `t0c-001-*` to `t0c-003-*`) |
 | `read-file` of a directory was `(some "")` compiled and `nil` interpreted; of a file in `/proc` or a pipe the compiled one read nothing; a path with a NUL was cut at it | `compiler/read.fib` on a directory | fixed: reads to the end and checks the error flag, a NUL in a path is `nil` (and `false` for `write-file`) (syntax §4.3; `crates/fibc/tests/files.rs`, case 188) |
 | the interpreter had no `strtod`/`strtof` for `extern`, so the reader could not be run under the audit on any float literal | `compiler/syntax/number.fib` | added to the interpreter, decimal only (syntax §3.15, **Proposed**; case 189) |
 | a failed `malloc` was a write through a null pointer (SIGSEGV) | robustness review | fixed: the trap `out of memory` (`crates/fibc/tests/cli.rs`) |

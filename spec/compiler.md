@@ -25,8 +25,9 @@ itself, exactly as the evaluator does (`fibref` `eval/`). A program the
 front end rejects is rejected by `fibc` with the same message.
 
 ```
-fibc run   FILE.fib [-- ARG..] ; compile through the JIT and run main; print its result; ARG.. are (args)
-fibc build FILE.fib -o OUT [-L DIR].. [-l LIB]..
+fibc run   [--trace] [-O N] FILE.fib [-- ARG..]
+                               ; compile through the JIT and run main; print its result; ARG.. are (args)
+fibc build FILE.fib -o OUT [-O N] [-L DIR].. [-l LIB]..
                                ; an executable (lair's AOT), linked against the libraries
 fibc emit  FILE.fib            ; print the lIR module
 fibc explain FILE.fib          ; the plan, as `fibref explain` prints it (types §9)
@@ -43,6 +44,22 @@ standard error and aborts (SIGABRT, as types §8.12 says), so the exit
 status is 134 under a shell; the command line after the program (or
 after `--` for `fibc run`) is `(args)`. With `FIB_TRACE=1` in the
 environment the runtime also prints the trace of §4 on standard error.
+
+**Optimisation level** (**Proposed**, stdlib design §7 C6; the owner's decision of
+2026-10-01, §9 Q15). `-O N` (or `-ON`; `N` is one digit, 0 to 3, given at most once; `run`
+takes it before the file, in either order with `--trace`, and `build` anywhere after the
+file) is the LLVM optimisation level: the IR pipeline `default<ON>` and the code
+generator's level (`lair::aot::Options::opt_level` for `build`,
+`lair::JitOptions::opt_level` for `run`; `lair`'s own defaults stay 0). **`fibc build`
+compiles at level 2 unless told otherwise and `fibc run` at level 0**: an executable is
+compiled once and run many times, and a run compiles the program afresh every time, at
+a cost that level 2 multiplies by about two and a half (a main of 17,256 lIR lines takes
+0.40 s at level 0 and 1.00 s at level 2 under `lair run`, stdlib design §6.4). A level
+that is not one digit from 0 to 3 is a usage error (exit 2) before anything is read.
+The macro-time JIT of §6 stays at level 0. Tested by `crates/fibc/src/command.rs` (the
+parse and the two defaults) and `crates/fibc/tests/cli/opt.rs` (the executable that
+`build` writes without `-O` is the same bytes as `-O 2`'s and not `-O 0`'s, less than half
+its size for a small loop; `run` takes every level and gives one result).
 
 **Libraries** (**Proposed**: the owner asked on 2026-10-01 for `-L`, `-l` and an
 rpath to close the gap of §9; the details below are not yet signed). A program reaches a
@@ -399,20 +416,28 @@ as described.
     emits the same two allocations (`lower/cells.rs`). A weak
     reference to any other object type still allocates nothing.
 11. **The text of `show` on a float and on a `str`** (**Decided**,
-    owner, 2026-09-30; types §2.12; case 178): a `str` shows as itself,
-    unquoted; a float as the shortest decimal that reads back at its
-    width, positional, with `.0` when integral, and `NaN`, `inf`,
-    `-inf`. The interpreter printed both with Rust's `{:?}`, which the
-    runtime could not reproduce; it now follows §2.12 (eval/arith.rs
-    `float_text`), and the runtime finds the same digits with libc:
-    the exact expansion from `%.800e`, then for each length n the two
+    owner, 2026-09-30, amended 2026-10-01; types §2.12; cases 178 and
+    187): a `str` shows as itself, unquoted; a float as Clojure's text,
+    Java's `Double.toString` (stdlib design §7 C12): the shortest
+    decimal that reads back at its width (the nearest of that length, a
+    tie going up; two digits where one would do, `4.9E-324`), positional
+    with `.0` when integral for `1e-3 <= |x| < 1e7`, otherwise
+    `d.dddE<exp>` with no plus sign, and `NaN`, `Infinity`, `-Infinity`.
+    The interpreter printed both with Rust's `{:?}`, which the runtime
+    could not reproduce; it now follows §2.12 (eval/floattext.rs
+    `float_text`: Rust's `{:e}` digits, and `{:.1e}` where one digit
+    would do), and the runtime finds the same digits with libc: the
+    exact expansion from `%.800e`, then for each length n from 2 the two
     n-digit decimals that bracket the value, kept if `strtod` (or
-    `strtof`) reads them back, the nearer winning and a tie going up
-    (`rt/str.lir` `fib.show-fp`; `fibc/tests/floats.rs` compares tens of
-    thousands of values with `float_text`, case 187 pins the ties). The
-    first version took the first `%.*e` from 0 up that read back, which
-    rounds a tie to even and misses a shorter reading above a power of
-    two.
+    `strtof`) reads them back, the nearer winning and a tie going up,
+    the trailing zero of a length-2 result dropped, and the layout laid
+    out by `fib.fp-text` (`rt/str.lir` `fib.show-fp`;
+    `fibc/tests/floats.rs` compares 64,000 values with `float_text`
+    and with a model of the rule that shares no code with either, and
+    91 hand-written values with the texts Java gave; case 187 pins
+    the ties). The first version took the first `%.*e` from 0 up that
+    read back, which rounds a tie to even and misses a shorter reading
+    above a power of two.
 12. **A threaded run that traps has no comparable trace** (**Decided**,
     owner, 2026-09-30; §4). Found by `fibc gen` (fibgen seed 162, size
     6): the interpreter's threads had allocated 38 objects when one

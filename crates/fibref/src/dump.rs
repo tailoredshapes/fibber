@@ -13,7 +13,9 @@
 //! ```
 //!
 //! An error is one line, `error Kind L:C S..E: message`, where `Kind` is
-//! the variant's name and the message is its `Display`.
+//! the variant's name and the message is its `Display`. A float's line is
+//! its `show` text at its width (types §2.12, Clojure's: `0.001`, `1.0E7`,
+//! `4.9E-324`) and the width, `flt 1.0E7 f64`.
 //!
 //! The print mode ([`print_source`]) compares the printer instead of the
 //! positions: one line per top-level form, the text `Display` gives it.

@@ -16,6 +16,9 @@
 //!   found under after the main file's directory, in that order, on `run`
 //!   and `build`, and the rule-6 harness gives the child the roots of the
 //!   case's header and not `FIB_LIB`;
+//! - `opt.rs`: `fibc build` compiles at `-O 2` unless `-O N` says another
+//!   level, `fibc run` at `-O 0` (the default is the same bytes as `-O 2`
+//!   and not `-O 0`'s, which are more than twice the size);
 //! - `args.rs`: an argument that is not UTF-8 reaches `(args)` as
 //!   `String::from_utf8_lossy` makes it (seeded byte strings of every kind
 //!   of invalid sequence), and `read-file` and `str-from-bytes` agree with
@@ -35,6 +38,8 @@ mod io_support;
 mod args;
 #[path = "cli/link.rs"]
 mod link;
+#[path = "cli/opt.rs"]
+mod opt;
 #[path = "cli/roots.rs"]
 mod roots;
 #[path = "cli/writes.rs"]
@@ -49,8 +54,13 @@ fn fibc() -> Command {
 
 /// `fibc build SRC -o EXE`, which must succeed.
 fn build(src: &Path, exe: &Path) {
+    build_with(src, exe, &[]);
+}
+
+/// `fibc build SRC -o EXE` and then `flags`, which must succeed.
+fn build_with(src: &Path, exe: &Path, flags: &[&str]) {
     let built = bounded::output_within(
-        fibc().arg("build").arg(src).arg("-o").arg(exe),
+        fibc().arg("build").arg(src).arg("-o").arg(exe).args(flags),
         bounded::COMPILE,
     );
     assert!(
@@ -103,28 +113,39 @@ fn a_built_executable_returns_mains_result_and_prints_nothing_of_its_own() {
 /// which is what malloc returning NULL used to be): the runtime's own
 /// (`array`) and the program's (`alloc`, whose `calloc` was not checked;
 /// case 195 is the same for the interpreter).
+///
+/// The `alloc` programs are built at `-O 0`. A pointer that is only
+/// allocated, perhaps stored through and freed never leaves the function,
+/// and at `-O 2` (the default of `build`, stdlib design §7 C6) LLVM takes
+/// the allocation to succeed and removes it with its null check, so that
+/// `(alloc 1000000000000000)` is no trap and the program returns 7 (or 5,
+/// with a store and a load of it): an observable difference from the
+/// interpreter and from `fibc run` that this test does not pin.
 #[test]
 fn an_allocation_that_fails_traps_with_out_of_memory() {
     use std::os::unix::process::ExitStatusExt;
     let dir = io_support::TempDir::new("cli-oom");
     // 8e15 bytes: more than any address space, so malloc fails.
-    for (name, program) in [
+    for (name, program, level) in [
         (
             "array",
             "(defun main () -> i64 (array-len (array 1000000000000000 0)))\n",
+            "2",
         ),
         (
             "alloc",
             "(defun main () -> i64 (unsafe (let ((p (alloc 1000000000000000))) (do (free p) 7))))\n",
+            "0",
         ),
         (
             "alloc-negative",
             "(defun main () -> i64 (unsafe (let ((p (alloc -1))) (do (free p) 7))))\n",
+            "0",
         ),
     ] {
         let src = dir.file(&format!("{name}.fib"), program);
         let exe = dir.path().join(name);
-        build(&src, &exe);
+        build_with(&src, &exe, &["-O", level]);
         let out = bounded::output(&mut Command::new(&exe));
         assert_eq!(out.status.signal(), Some(6), "{name}: {:?}", out.status);
         assert_eq!(

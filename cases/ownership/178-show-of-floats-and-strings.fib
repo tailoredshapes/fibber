@@ -1,23 +1,45 @@
 ;; spec:   types §2.12
 ;; expect: accept
-;; result: 75
+;; result: 151
 ;; audit:  clean
-;; The texts of show on floats and on str (types §2.12, Decided
-;; 2026-09-30): a str shows as itself, unquoted; a float as the
-;; shortest decimal that reads back at its width, positional, with .0
-;; when integral, and NaN, inf, -inf. Each text is checked against the
-;; expected one and its length added, so a wrong text costs 1000.
+;; The texts of show on floats and on str (types §2.12): a str shows as
+;; itself, unquoted; a float as Clojure's text, Java's Double.toString
+;; (Decided, owner, 2026-10-01; it replaced the positional text of
+;; 2026-09-30, which is why the expected texts and the result of this
+;; case changed): the shortest digits that read back at the width, laid
+;; out positionally with at least one digit after the point for
+;; 1e-3 <= |x| < 1e7 and as d.dddE<exp> otherwise (no plus sign), and
+;; NaN, Infinity, -Infinity. A value that one digit spells shows two
+;; (the smallest double is 4.9E-324, the smallest f32 1.4E-45). Each text
+;; is checked against the expected one and its length added, so a wrong
+;; text costs 1000.
 (defun chk (s: str e: str) -> i64 (if (str-eq s e) (str-len s) -1000))
 
-(defun main () -> i64
+(defun plain () -> i64
   (+ (chk (show "abc") "abc")
      (+ (chk (show 1.5) "1.5")
         (+ (chk (show 100.0) "100.0")
            (+ (chk (show -0.0) "-0.0")
               (+ (chk (show 0.1f32) "0.1")
-                 (+ (chk (show 1e21) "1000000000000000000000.0")
-                    (+ (chk (show 1e-7) "0.0000001")
-                       (+ (chk (show 123.456) "123.456")
-                          (+ (chk (show (/ 0.0 0.0)) "NaN")
-                             (+ (chk (show (/ -1.0 0.0)) "-inf")
-                                (chk (show 16777217.0f32) "16777216.0"))))))))))))
+                 (+ (chk (show 123.456) "123.456")
+                    (+ (chk (show 0.001) "0.001")
+                       (+ (chk (show 1234567.0) "1234567.0")
+                          (chk (show 9999999.0) "9999999.0"))))))))))
+
+(defun scientific () -> i64
+  (+ (chk (show 1e21) "1.0E21")
+     (+ (chk (show 1e-7) "1.0E-7")
+        (+ (chk (show 1e7) "1.0E7")
+           (+ (chk (show 0.0001) "1.0E-4")
+              (+ (chk (show 1.7976931348623157e308) "1.7976931348623157E308")
+                 (+ (chk (show 16777217.0f32) "1.6777216E7")
+                    (+ (chk (show 3.4028235e38f32) "3.4028235E38")
+                       (chk (show 1e-45f32) "1.4E-45")))))))))
+
+(defun special () -> i64
+  (+ (chk (show (/ 0.0 0.0)) "NaN")
+     (+ (chk (show (/ 1.0 0.0)) "Infinity")
+        (+ (chk (show (/ -1.0 0.0)) "-Infinity")
+           (chk (show 5e-324) "4.9E-324")))))
+
+(defun main () -> i64 (+ (plain) (+ (scientific) (special))))

@@ -64,19 +64,30 @@
   (block yes (ret (call @fib.str-from-bytes (string "true") (i64 4))))
   (block no (ret (call @fib.str-from-bytes (string "false") (i64 5)))))
 
-;; show of a float (types §2.12): the shortest decimal that reads back
-;; at the value's width, the one nearest the value among those of that
-;; length (an exact tie goes up), laid out positionally with .0 when
-;; integral; NaN, inf, -inf. This is the text of Rust's `{}`, which the
-;; interpreter prints (eval/arith.rs float_text), found with libc:
+;; show of a float (types §2.12, Decided 2026-10-01, stdlib design C12):
+;; Clojure's text, which is Java's Double.toString (Float.toString at
+;; single width), the interpreter's (eval/floattext.rs float_text). The
+;; digits are the shortest decimal that reads back at the value's width,
+;; the one nearest the value among those of that length (an exact tie
+;; goes up, where Java takes the even digit), except that when one digit
+;; would do the nearest decimal of two is written, as Java does (4.9E-324
+;; for the smallest double, not 5E-324). The layout is positional with at
+;; least one digit after the point for 1e-3 <= |x| < 1e7, else d.dddE<e>
+;; with at least one digit after the point and `-` on a negative
+;; exponent only; NaN, Infinity, -Infinity. The digits are found with
+;; libc:
 ;;
 ;; - `%.800e` writes the exact decimal expansion of the value (a double
 ;;   has at most 767 significant digits), whose first n digits D are
 ;;   the n-digit decimal just below it in magnitude;
-;; - for n = 1, 2, .. the decimals of n digits that can read back are
+;; - for n = 2, 3, .. the decimals of n digits that can read back are
 ;;   D and D plus one unit in the last place, the two that bracket the
 ;;   value (every other n-digit decimal is farther, and the values that
-;;   read back to x are an interval around it);
+;;   read back to x are an interval around it). Starting at 2 gives the
+;;   two-digit rule: if a one-digit decimal reads back, so does one of
+;;   the two brackets at n = 2 (the interval is convex and holds the
+;;   one-digit decimal, a two-digit decimal), and the nearer is written;
+;;   its trailing zero, if any, is dropped again by `fib.fp-text`;
 ;; - each one is read back with strtod (strtof at single width), so the
 ;;   boundaries of the interval and the narrow interval below a power
 ;;   of two are decided by libc's rounding and not by a rule of ours;
@@ -133,7 +144,9 @@
     (ret n)))
 
 ;; The positional text of the value d1.d2..dn x 10^e into out, with a
-;; leading - when neg and .0 when integral; returns its length.
+;; leading - when neg and .0 when integral; returns its length. Used for
+;; -3 <= e <= 6 (fib.fp-text), where the text is at most 17 digits, the
+;; point and the zeros that pad to it.
 (define internal (fib.fp-layout i64) ((ptr out) (ptr digits) (i64 n) (i64 e) (i1 neg))
   (block entry
     (store (i8 45) out)
@@ -164,6 +177,46 @@
       (call @memset (getelementptr i8 out o2) (i32 48) z)
       (call @memcpy (getelementptr i8 out (add o2 z)) digits n)
       (ret (add (add o2 z) n)))))
+
+;; The scientific text of the value d1.d2..dn x 10^e into out, as Java
+;; writes it: d1, a point, the other digits or a 0, E, the exponent with
+;; a - when it is negative; with a leading - when neg. Returns its length.
+(define internal (fib.fp-sci i64) ((ptr out) (ptr digits) (i64 n) (i64 e) (i1 neg))
+  (block entry
+    (store (i8 45) out)
+    (let ((o0 (select neg (i64 1) (i64 0)))
+          (more (icmp sgt n (i64 1)))
+          (nf (select more (sub n (i64 1)) (i64 1)))
+          (end (add (add o0 (i64 2)) nf)))
+      (store (load i8 digits) (getelementptr i8 out o0))
+      (store (i8 46) (getelementptr i8 out (add o0 (i64 1))))
+      (br more fraction zero)))
+  (block fraction
+    (call @memcpy (getelementptr i8 out (add o0 (i64 2))) (getelementptr i8 digits (i64 1)) nf)
+    (br tail))
+  (block zero
+    (store (i8 48) (getelementptr i8 out (add o0 (i64 2))))
+    (br tail))
+  (block tail
+    (let ((k (call @snprintf (getelementptr i8 out end) (i64 16) (string "E%d") (trunc i32 e))))
+      (ret (add end (sext i64 k))))))
+
+;; The Java text of the value d1.d2..dn x 10^e into out (n digits, the
+;; last of which may be a 0, and then dropped), with a leading - when
+;; neg; returns its length: positional for -3 <= e <= 6, else scientific.
+(define internal (fib.fp-text i64) ((ptr out) (ptr digits) (i64 n) (i64 e) (i1 neg))
+  (block entry (br trim))
+  (block trim
+    (let ((k (phi i64 (entry n) (drop k2)))
+          (last (load i8 (getelementptr i8 digits (sub k (i64 1))))))
+      (br (and (icmp sgt k (i64 1)) (icmp eq last (i8 48))) drop done)))
+  (block drop
+    (let ((k2 (sub k (i64 1))))
+      (br trim)))
+  (block done
+    (br (or (icmp slt e (i64 -3)) (icmp sgt e (i64 6))) sci pos))
+  (block sci (ret (call @fib.fp-sci out digits k e neg)))
+  (block pos (ret (call @fib.fp-layout out digits k e neg))))
 
 ;; Whether the decimal d.ddd e<e> of the n digits, with a leading - when
 ;; neg, reads back to x: it is written into buf (at least 40 bytes) and
@@ -235,7 +288,10 @@
           (c0 (load i8 buf))
           (c1 (load i8 (getelementptr i8 buf (i64 1)))))
       (br (or (icmp eq c0 (i8 105)) (icmp eq c1 (i8 105))) inf prep)))
-  (block inf (ret (call @fib.str-from-bytes buf (sext i64 len0))))
+  (block inf
+    (br (icmp eq c0 (i8 45)) minus plus))
+  (block minus (ret (call @fib.str-from-bytes (string "-Infinity") (i64 9))))
+  (block plus (ret (call @fib.str-from-bytes (string "Infinity") (i64 8))))
   (block prep
     (let ((ds (alloca i8 (i32 832)))
           (exp (alloca i64))
@@ -247,7 +303,7 @@
       (let ((e0 (load i64 exp)))
         (br search))))
   (block search
-    (let ((n (phi i64 (prep (i64 1)) (more n2)))
+    (let ((n (phi i64 (prep (i64 2)) (more n2)))
           (hit (call @fib.fp-at ds n e0 cand cbuf neg x single eout)))
       (br hit found more)))
   (block more
@@ -258,7 +314,7 @@
     (unreachable))
   (block found
     (let ((out (alloca i8 (i32 400)))
-          (m (call @fib.fp-layout out cand n (load i64 eout) neg)))
+          (m (call @fib.fp-text out cand n (load i64 eout) neg)))
       (ret (call @fib.str-from-bytes out m)))))
 
 (define internal (fib.show-double ptr) ((double x))

@@ -37,6 +37,7 @@ pub mod closure;
 pub mod error;
 pub mod expr;
 pub mod float_bits;
+pub mod floattext;
 pub mod forms;
 pub mod fx;
 pub mod interp;
