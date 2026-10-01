@@ -274,23 +274,25 @@ Rules:
    slow on integers; decide a replacement before the HAMT's speed is
    judged); sorted maps and sets (a B-tree), queues, a small-vector fast
    path, `str` building without quadratic copies.
-5. **Measured against Rust, not asserted.** A benchmark suite of
-   programs written in fibber and in Rust (`Vec`, `HashMap`,
-   `BTreeMap`, iterator chains, string building, sorting) records the
-   ratio per kernel on the same machine; the target is within 1.5x on
-   typical kernels, and each kernel above it is an open item with its
-   cause. Ratios are tracked in a file and checked for regression;
-   they are not a CI gate until they are stable. The first deliverable
-   is the baseline of today's `Vec`/`Map`, before any redesign.
+5. **Performance comes after a viable library** (owner, 2026-10-01):
+   no benchmarking and no optimisation work until the library is
+   usable. Terse, elegant code that performs well hinges on a good
+   library that compiles well, so the work now is the library's
+   *design* (rules 1 to 4: what makes `(->> v (map f) (filter p))`
+   compile to a plain loop is the shape of the protocols and
+   adaptors, decided here). When it is viable, a benchmark suite of
+   fibber and Rust programs measures the ratio per kernel against the
+   aim of within 1.5x, and each kernel above it is an open item with
+   its cause.
 6. **Every function has an executable test** (cases both ways, method
    rule 6; generated programs against a model, rule 5), and the
    compiler (M6) uses the library as it grows: what stage 2 needs
    (`sort`, `Map` iteration order, formatting for diagnostics) comes
    first.
 
-Order: baseline benchmarks and spec/stdlib.md (the table of names and
-deviations); sequences, transducers and `Iter` fusion; maps, sets and
-sorted collections; strings and formatting; then the long tail. It
+Order: spec/stdlib.md (the table of names and deviations); sequences,
+transducers and `Iter` fusion; maps, sets and sorted collections;
+strings and formatting; then the long tail; then measurement. It
 interleaves with M6: library items the compiler needs land first.
 
 
