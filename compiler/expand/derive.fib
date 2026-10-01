@@ -1,0 +1,443 @@
+;; compiler/expand/derive.fib: `(derive P Name)` for P one of Eq, Ord,
+;; Hash, Show (syntax §3.16, §4.4), over the structs and enums the context
+;; has seen. It replaces crates/fibref/src/expand/derive/{mod,structs,enums}.rs
+;; (223 + 63 + 134 = 420 lines, as library tranche 0 left them: `derive
+;; Hash` writes `(fib.prelude/hash-combine h (hash f))`). Where syntax
+;; §3.16 fixes the shape the builders follow it; the choices it leaves
+;; open are the Rust header's, copied into the port's when it is
+;; written (wave B).
+;;
+;; CALLING IT: `derive` is also the language's own form, and a call
+;; `(derive a b c)` written with the name unqualified is expanded as
+;; that form (arity error "macro derive takes 2 argument(s)") even when
+;; a module `:use`s this one. So call it qualified: `(:require
+;; [expand.derive :as dv])` and `(dv/derive ctx items pos)`. The name is
+;; the Rust one (the layout of spec/bootstrap.md §5.3); a function of
+;; another name would break nothing, but the porter of `expand.top`
+;; should not have to guess.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `&ExpandCtx` is the shared `ExpandCtx` (its mutable parts are
+;;   Cells); gensyms come from `ctx-gensym`, struct and enum info from
+;;   `ctx-struct-info` and `ctx-enum-info`; `Vec<Form>` is `(Vec Stx)`;
+;;   `Result<Form, ExpandError>` is `(Result Stx ExpandError)`.
+;; - the private enum `Proto` has the variants of the Rust one, `Eq`,
+;;   `Ord`, `Hash`, `Show`; they are bare words in an expression
+;;   (`Hash`) and `((Hash) ..)` in a pattern.
+;; - the three Rust files are one module here unless it outgrows 500
+;;   lines, when the helpers move to `expand.derive.*` modules that
+;;   nobody else sees; `derive` stays what is exported.
+;; - a Rust `Vec<(Form, Form)>` of pairs compared is a vector of the
+;;   private struct `Cmp`; `&[&str]` method parameters are `(Vec str)`;
+;;   the iterator chains of the Rust are `loop`s, in the same order, so
+;;   the gensyms of an enum's patterns are handed out in the Rust order
+;;   (for each variant, the variables of `self`'s pattern, then those of
+;;   `y`'s, `Eq` and `Ord` alike).
+;; - `Form::to_string` of the error text is `stx-show` of syntax.print;
+;;   `as_sym().unwrap_or("")` is `sym-or-empty`.
+(ns expand.derive (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build)
+  (:require [syntax.print :as pr]))
+
+;; A derivable protocol. (Proto)
+(defenum Proto :private Eq Ord Hash Show)
+
+;; The prelude's mixer, qualified so that no binding of the program's can
+;; shadow it. (HASH_COMBINE)
+(def hash-combine-name: str :private "fib.prelude/hash-combine")
+
+;; The two forms of a comparison: `(= a b)` or `(< a b)` over each pair.
+(defstruct Cmp :private (a: Stx b: Stx))
+
+;; The protocol for the symbol `name`. (Proto::parse)
+(defun proto-parse :private (name: str) -> (Option Proto)
+  (cond
+    ((= name "Eq") (some Eq))
+    ((= name "Ord") (some Ord))
+    ((= name "Hash") (some Hash))
+    ((= name "Show") (some Show))
+    (true nil)))
+
+;; (Proto::name)
+(defun proto-name :private (p: Proto) -> str
+  (match p
+    ((Eq) "Eq")
+    ((Ord) "Ord")
+    ((Hash) "Hash")
+    ((Show) "Show")))
+
+;; The name of a symbol form, "" for any other. (`as_sym().unwrap_or("")`)
+(defun sym-or-empty :private (form: Stx) -> str
+  (match (. form kind)
+    ((SSym s) s)
+    (_ "")))
+
+;; The name of a symbol form, if it is one. (`Form::as_sym`)
+(defun sym-of :private (form: Stx) -> (Option str)
+  (match (. form kind)
+    ((SSym s) (some s))
+    (_ nil)))
+
+;; Expands `(derive P Name)`: `items` is the whole form (`derive` at 0),
+;; `pos` its position, which every built node carries. The errors are
+;; MacroArity (not two operands, at `pos`), DeriveProtocol (at the
+;; protocol) and DeriveTarget (at the target); an enum none of whose
+;; variants has fields derives nothing: an empty `(do)`. (derive)
+(defun derive (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (match (check-arity "derive" items 2 (some 2) pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (proto-parse (sym-or-empty (nth items 1)))
+       (nil (Err (ExpandError (DeriveProtocol (pr/stx-show (nth items 1))) (. (nth items 1) pos))))
+       ((some proto) (derive-target ctx proto items pos))))))
+
+;; The struct or enum `(derive P Name)` names.
+(defun derive-target :private (ctx: ExpandCtx proto: Proto items: (Vec Stx) pos: Pos)
+    -> (Result Stx ExpandError)
+  (let ((target (sym-or-empty (nth items 2))))
+    (match (ctx-struct-info ctx target)
+      ((some info) (Ok (derive-struct proto info pos)))
+      (nil
+       (match (ctx-enum-info ctx target)
+         ((some info)
+          (if (all-fieldless info)
+              (Ok (call "do" (vec-empty) pos))
+              (Ok (derive-enum ctx proto info pos))))
+         (nil (Err (ExpandError (DeriveTarget (pr/stx-show (nth items 2)))
+                                (. (nth items 2) pos)))))))))
+
+;; Whether no variant of the enum has a field.
+(defun all-fieldless :private (info: EnumInfo) -> bool
+  (let ((vs (. info variants)))
+    (loop ((i 0))
+      (if (>= i (count vs))
+          true
+          (if (= (count (. (nth vs i) fields)) 0) (recur (+ i 1)) false)))))
+
+;; `(impl P head :where (...) methods...)`. `types` are the field types
+;; of every field; `:where` lists `(P t)` for each parameter some of them
+;; mention, and is left out when empty. (impl_form)
+(defun impl-form :private (proto: Proto name: str params: (Vec Stx) types: (Vec Stx)
+                           methods: (Vec Stx) pos: Pos) -> Stx
+  (let ((pnames (param-names params))
+        (head (impl-head name pnames pos))
+        (context (where-context proto pnames types pos)))
+    (list-form (concat-vec (concat-vec [(sym "impl" pos) (sym (proto-name proto) pos) head]
+                                       (if (= (count context) 0)
+                                           (vec-empty)
+                                           [(keyword "where" pos) (list-form context pos)]))
+                           methods)
+               pos)))
+
+;; The symbol parameters among the forms. (`filter_map(Form::as_sym)`)
+(defun param-names :private (params: (Vec Stx)) -> (Vec str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (>= i (count params))
+        acc
+        (match (sym-of (nth params i))
+          ((some s) (recur (+ i 1) (conj acc s)))
+          (nil (recur (+ i 1) acc))))))
+
+;; `Name`, or `(Name p...)` when it has parameters.
+(defun impl-head :private (name: str pnames: (Vec str) pos: Pos) -> Stx
+  (if (= (count pnames) 0)
+      (sym name pos)
+      (list-form (concat-vec [(sym name pos)] (map-syms pnames pos)) pos)))
+
+;; Each name as a symbol form at `pos`.
+(defun map-syms :private (names: (Vec str) pos: Pos) -> (Vec Stx)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (>= i (count names))
+        acc
+        (recur (+ i 1) (conj acc (sym (nth names i) pos))))))
+
+;; `(P p)` for each parameter some field type mentions (`(Ord t)`
+;; entails `(Eq t)`, its supertrait, types §4.1).
+(defun where-context :private (proto: Proto pnames: (Vec str) types: (Vec Stx) pos: Pos) -> (Vec Stx)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (>= i (count pnames))
+        acc
+        (if (mentioned-in types (nth pnames i))
+            (recur (+ i 1) (conj acc (call (proto-name proto) [(sym (nth pnames i) pos)] pos)))
+            (recur (+ i 1) acc)))))
+
+;; Whether any of the type forms mentions the symbol `name`.
+(defun mentioned-in :private (types: (Vec Stx) name: str) -> bool
+  (loop ((i 0))
+    (if (>= i (count types))
+        false
+        (if (mentions (nth types i) name) true (recur (+ i 1))))))
+
+;; `a` then `b`.
+(defun concat-vec :private (a: (Vec Stx) b: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 0) (acc a))
+    (if (>= i (count b)) acc (recur (+ i 1) (conj acc (nth b i))))))
+
+;; `(name (params...) body)`. (method)
+(defun method :private (name: str params: (Vec str) body: Stx pos: Pos) -> Stx
+  (list-form [(sym name pos) (list-form (map-syms params pos) pos) body] pos))
+
+;; `!=` from `=`. (not_equal)
+(defun not-equal :private (pos: Pos) -> Stx
+  (let ((eq (call "=" [(sym "self" pos) (sym "y" pos)] pos)))
+    (method "!=" ["self" "y"] (call "not" [eq] pos) pos)))
+
+;; `<=`, `>`, `>=` from `<`. (ord_rest)
+(defun ord-rest :private (pos: Pos) -> (Vec Stx)
+  [(method "<=" ["self" "y"] (call "not" [(less-of "y" "self" pos)] pos) pos)
+   (method ">" ["self" "y"] (less-of "y" "self" pos) pos)
+   (method ">=" ["self" "y"] (call "not" [(less-of "self" "y" pos)] pos) pos)])
+
+;; `(< a b)` of two symbols.
+(defun less-of :private (a: str b: str pos: Pos) -> Stx
+  (call "<" [(sym a pos) (sym b pos)] pos))
+
+;; The pairs compared with `=` and `and`ed: `true` for none, the one
+;; comparison for one (as §3.16's `(= r r2)`). (eq_all)
+(defun eq-all :private (pairs: (Vec Cmp) pos: Pos) -> Stx
+  (let ((tests (loop ((i 0) (acc (vec-empty)))
+                 (if (>= i (count pairs))
+                     acc
+                     (recur (+ i 1) (conj acc (call "=" [(. (nth pairs i) a) (. (nth pairs i) b)] pos)))))))
+    (cond
+      ((= (count tests) 0) (boolean true pos))
+      ((= (count tests) 1) (nth tests 0))
+      (true (call "and" tests pos)))))
+
+;; Lexicographic `<` over the pairs: `(or (< a1 b1) (and (= a1 b1) ...))`,
+;; the last pair just `(< an bn)`, `false` for none. (lex_less)
+(defun lex-less :private (pairs: (Vec Cmp) pos: Pos) -> Stx
+  (if (= (count pairs) 0)
+      (boolean false pos)
+      (let ((last (- (count pairs) 1)))
+        (loop ((i (- last 1)) (acc (less-pair (nth pairs last) pos)))
+          (if (< i 0)
+              acc
+              (let ((p (nth pairs i))
+                    (same (call "and" [(call "=" [(. p a) (. p b)] pos) acc] pos)))
+                (recur (- i 1) (call "or" [(less-pair p pos) same] pos))))))))
+
+;; `(< a b)` of a pair.
+(defun less-pair :private (p: Cmp pos: Pos) -> Stx
+  (call "<" [(. p a) (. p b)] pos))
+
+;; `h := seed; h := (hash-combine h (hash f))` for each field. (combine)
+(defun combine :private (seed: i64 fields: (Vec Stx) pos: Pos) -> Stx
+  (loop ((i 0) (acc (int seed pos)))
+    (if (>= i (count fields))
+        acc
+        (recur (+ i 1)
+               (call hash-combine-name [acc (call "hash" [(nth fields i)] pos)] pos)))))
+
+;; `"(Name " (show f1) " " (show f2) ")"` joined with `str-concat`, or
+;; `"Name"` for no fields. (show_call)
+(defun show-call :private (name: str fields: (Vec Stx) pos: Pos) -> Stx
+  (if (= (count fields) 0)
+      (string name pos)
+      (let ((pieces (show-pieces name fields pos))
+            (n (count pieces)))
+        (loop ((i (- n 2)) (acc (nth pieces (- n 1))))
+          (if (< i 0)
+              acc
+              (recur (- i 1) (call "str-concat" [(nth pieces i) acc] pos)))))))
+
+;; The pieces: a string, then `(show f)`, for each field, then `")"`.
+(defun show-pieces :private (name: str fields: (Vec Stx) pos: Pos) -> (Vec Stx)
+  (let ((all (loop ((i 0) (acc (vec-empty)))
+               (if (>= i (count fields))
+                   acc
+                   (recur (+ i 1)
+                          (conj (conj acc (string (if (= i 0) (str-join ["(" name " "]) " ") pos))
+                                (call "show" [(nth fields i)] pos)))))))
+    (conj all (string ")" pos))))
+
+;; ------------------------------------------------------------ structs
+;; (derive/structs.rs): methods field by field. For `(defstruct Pair (a b))`
+;;
+;;   (impl Eq (Pair a b) :where ((Eq a) (Eq b))
+;;     (= (self y) (and (= (. self a) (. y a)) (= (. self b) (. y b))))
+;;     (!= (self y) (not (= self y))))
+
+;; `(. who field)`. (field_of)
+(defun field-of :private (who: str field: Stx pos: Pos) -> Stx
+  (call "." [(sym who pos) (sym (sym-or-empty field) pos)] pos))
+
+;; `((. self f) (. y f))` for each field. (pairs)
+(defun field-pairs :private (info: StructInfo pos: Pos) -> (Vec Cmp)
+  (let ((fs (. info fields)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (>= i (count fs))
+          acc
+          (let ((f (. (nth fs i) name)))
+            (recur (+ i 1) (conj acc (Cmp (field-of "self" f pos) (field-of "y" f pos)))))))))
+
+;; `(. self f)` for each field. (the closure `selfs`)
+(defun field-selfs :private (info: StructInfo pos: Pos) -> (Vec Stx)
+  (let ((fs (. info fields)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (>= i (count fs))
+          acc
+          (recur (+ i 1) (conj acc (field-of "self" (. (nth fs i) name) pos)))))))
+
+;; The field types of a struct.
+(defun struct-types :private (info: StructInfo) -> (Vec Stx)
+  (let ((fs (. info fields)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (>= i (count fs))
+          acc
+          (recur (+ i 1) (conj acc (. (nth fs i) ty)))))))
+
+;; The methods of `proto` on a struct.
+(defun struct-methods :private (proto: Proto info: StructInfo pos: Pos) -> (Vec Stx)
+  (match proto
+    ((Eq) [(method "=" ["self" "y"] (eq-all (field-pairs info pos) pos) pos) (not-equal pos)])
+    ((Ord) (concat-vec [(method "<" ["self" "y"] (lex-less (field-pairs info pos) pos) pos)]
+                       (ord-rest pos)))
+    ((Hash) [(method "hash" ["self"] (combine 0 (field-selfs info pos) pos) pos)])
+    ((Show) [(method "show" ["self"] (show-call (. info name) (field-selfs info pos) pos) pos)])))
+
+;; The `impl` for `proto` on the struct `info`. (structs::derive)
+(defun derive-struct :private (proto: Proto info: StructInfo pos: Pos) -> Stx
+  (impl-form proto (. info name) (. info params) (struct-types info)
+             (struct-methods proto info pos) pos))
+
+;; ------------------------------------------------------------- enums
+;; (derive/enums.rs): a `match` on `self` with, for `Eq` and `Ord`, a
+;; nested `match` on `y`, pattern variables gensyms (§3.16). For
+;; `(defenum Shape (Circle r: f64) (Rect w: f64 h: f64))`:
+;;
+;;   (impl Eq Shape
+;;     (= (self y)
+;;       (match self
+;;         ((Circle r) (match y ((Circle r2) (= r r2)) (_ false)))
+;;         ((Rect w h) (match y ((Rect w2 h2) (and (= w w2) (= h h2))) (_ false)))))
+;;     (!= (self y) (not (= self y))))
+
+;; Fresh pattern variables for a variant's fields, named after the
+;; fields (`x` when unnamed) with `suffix` appended. (vars)
+(defun vars :private (ctx: ExpandCtx v: VariantInfo suffix: str pos: Pos) -> (Vec Stx)
+  (let ((fs (. v fields)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (>= i (count fs))
+          acc
+          (let ((base (match (. (nth fs i) name) ((some n) n) (nil "x"))))
+            (recur (+ i 1) (conj acc (ctx-gensym ctx (str-concat base suffix) pos))))))))
+
+;; `(Variant pats...)`. (pattern)
+(defun pattern :private (v: VariantInfo pats: (Vec Stx) pos: Pos) -> Stx
+  (list-form (concat-vec [(sym (. v name) pos)] pats) pos))
+
+;; `(Variant _ ...)`. (wild)
+(defun wild :private (v: VariantInfo pos: Pos) -> Stx
+  (pattern v (loop ((i 0) (acc (vec-empty)))
+               (if (>= i (count (. v fields))) acc (recur (+ i 1) (conj acc (sym "_" pos)))))
+           pos))
+
+;; `(match who clauses...)`. (match_on)
+(defun match-on :private (who: str clauses: (Vec Stx) pos: Pos) -> Stx
+  (list-form (concat-vec [(sym "match" pos) (sym who pos)] clauses) pos))
+
+;; `(pat body)`. (clause)
+(defun clause :private (pat: Stx body: Stx pos: Pos) -> Stx
+  (list-form [pat body] pos))
+
+;; The variables of `self` against those of `y`, pair by pair.
+(defun zip-cmp :private (xs: (Vec Stx) ys: (Vec Stx)) -> (Vec Cmp)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (>= i (count xs))
+        acc
+        (recur (+ i 1) (conj acc (Cmp (nth xs i) (nth ys i)))))))
+
+;; The body of `=`. (eq_body)
+(defun eq-body :private (ctx: ExpandCtx info: EnumInfo pos: Pos) -> Stx
+  (let ((vs (. info variants))
+        (many (> (count (. info variants)) 1)))
+    (match-on "self"
+      (loop ((i 0) (acc (vec-empty)))
+        (if (>= i (count vs))
+            acc
+            (recur (+ i 1) (conj acc (eq-clause ctx (nth vs i) many pos)))))
+      pos)))
+
+;; The clause of `self` for one variant, with the nested match on `y`.
+(defun eq-clause :private (ctx: ExpandCtx v: VariantInfo many: bool pos: Pos) -> Stx
+  (let ((xs (vars ctx v "" pos))
+        (ys (vars ctx v "2" pos))
+        (same (clause (pattern v ys pos) (eq-all (zip-cmp xs ys) pos) pos))
+        (inner (if many [same (clause (sym "_" pos) (boolean false pos) pos)] [same])))
+    (clause (pattern v xs pos) (match-on "y" inner pos) pos)))
+
+;; The body of `<`: declaration order of the variants, then the fields
+;; lexicographically; the inner match lists every variant of `y`.
+;; (less_body)
+(defun less-body :private (ctx: ExpandCtx info: EnumInfo pos: Pos) -> Stx
+  (let ((vs (. info variants)))
+    (match-on "self"
+      (loop ((i 0) (acc (vec-empty)))
+        (if (>= i (count vs))
+            acc
+            (recur (+ i 1) (conj acc (less-clause ctx vs i pos)))))
+      pos)))
+
+;; The clause of `self` for variant `i`; its `y` match has a clause for
+;; every variant `j`: a constant `j > i` unless it is the same variant.
+(defun less-clause :private (ctx: ExpandCtx vs: (Vec VariantInfo) i: i64 pos: Pos) -> Stx
+  (let ((v (nth vs i))
+        (xs (vars ctx (nth vs i) "" pos))
+        (inner (loop ((j 0) (acc (vec-empty)))
+                 (if (>= j (count vs))
+                     acc
+                     (recur (+ j 1) (conj acc (less-inner ctx vs i j xs pos)))))))
+    (clause (pattern v xs pos) (match-on "y" inner pos) pos)))
+
+;; The clause of the match on `y` of variant `i`'s clause, for variant `j`.
+(defun less-inner :private (ctx: ExpandCtx vs: (Vec VariantInfo) i: i64 j: i64 xs: (Vec Stx) pos: Pos)
+    -> Stx
+  (if (!= j i)
+      (clause (wild (nth vs j) pos) (boolean (> j i) pos) pos)
+      (let ((ys (vars ctx (nth vs i) "2" pos)))
+        (clause (pattern (nth vs i) ys pos) (lex-less (zip-cmp xs ys) pos) pos))))
+
+;; The body of `hash` or `show`: one clause per variant over its fields.
+;; (per_variant)
+(defun per-variant :private (ctx: ExpandCtx info: EnumInfo proto: Proto pos: Pos) -> Stx
+  (let ((vs (. info variants)))
+    (match-on "self"
+      (loop ((i 0) (acc (vec-empty)))
+        (if (>= i (count vs))
+            acc
+            (let ((v (nth vs i))
+                  (xs (vars ctx (nth vs i) "" pos))
+                  (body (match proto
+                          ((Hash) (combine i xs pos))
+                          (_ (show-call (. (nth vs i) name) xs pos)))))
+              (recur (+ i 1) (conj acc (clause (pattern v xs pos) body pos))))))
+      pos)))
+
+;; The field types of every variant.
+(defun enum-types :private (info: EnumInfo) -> (Vec Stx)
+  (let ((vs (. info variants)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (>= i (count vs))
+          acc
+          (recur (+ i 1) (variant-types (nth vs i) acc))))))
+
+(defun variant-types :private (v: VariantInfo acc: (Vec Stx)) -> (Vec Stx)
+  (let ((fs (. v fields)))
+    (loop ((k 0) (out acc))
+      (if (>= k (count fs))
+          out
+          (recur (+ k 1) (conj out (. (nth fs k) ty)))))))
+
+;; The methods of `proto` on an enum.
+(defun enum-methods :private (ctx: ExpandCtx proto: Proto info: EnumInfo pos: Pos) -> (Vec Stx)
+  (match proto
+    ((Eq) [(method "=" ["self" "y"] (eq-body ctx info pos) pos) (not-equal pos)])
+    ((Ord) (concat-vec [(method "<" ["self" "y"] (less-body ctx info pos) pos)] (ord-rest pos)))
+    ((Hash) [(method "hash" ["self"] (per-variant ctx info proto pos) pos)])
+    ((Show) [(method "show" ["self"] (per-variant ctx info proto pos) pos)])))
+
+;; The `impl` for `proto` on the enum `info`, which has at least one
+;; variant with fields. (enums::derive)
+(defun derive-enum :private (ctx: ExpandCtx proto: Proto info: EnumInfo pos: Pos) -> Stx
+  (impl-form proto (. info name) (. info params) (enum-types info)
+             (enum-methods ctx proto info pos) pos))

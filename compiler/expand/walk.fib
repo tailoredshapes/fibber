@@ -1,0 +1,179 @@
+;; compiler/expand/walk.fib: the walk of a tree by roles, as
+;; crates/fibref/src/expand/walk.rs (166 lines): applies the `Role`s of
+;; expand.core to a whole tree of forms with an explicit stack of frames,
+;; so that the nesting depth of a program costs heap and not native stack
+;; (macros build trees 2,000 levels deep; the native stack is 8 MB). Each
+;; form in expression position is entered (counted against max-depth),
+;; expanded at its head, planned (expand.expr), its items walked by the
+;; plan and finished (the syntax §1.4 rewrite, `nil`); patterns are
+;; normalised the same way (syntax §3.9, §1.4).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `Frame` and `Step` are structs and enums of this module: `Frame`
+;;   is `WalkFrame` (a private `Frame` of expand.ctx has its name, and the
+;;   compiler's lowering takes two types of one name for one: see the
+;;   report of porter 5), `Step` is `Step`. The stack is a chain of frames
+;;   (`Stack`) threaded through a `loop`, a frame's pending items an index
+;;   into its item vector; `Move` carries a step and the stack out of the
+;;   helpers that Rust gives `&mut stack`.
+;; - `Result<Form, ExpandError>` is `(Result Stx ExpandError)`; the
+;;   Rust `&mut Expander` is the one `Expander` of expand.expr.
+(ns expand.walk
+  (:use syntax.pos syntax.form util.result expand.error expand.core expand.expr))
+
+;; Which kind of form a frame rebuilds from its walked items (Rust's
+;; `Rebuild`, a function pointer to `FormKind::List`, `Vec` or `Map`).
+(defenum Shape ShList ShVec ShMap)
+
+;; One form whose items are being walked: where it was, how it is
+;; rebuilt, its items and the index of the next to look at, the items
+;; walked so far, the role of its items, how to finish it and whether
+;; it was entered (counted against max-depth, so left when done).
+(defstruct WalkFrame
+  (pos: Pos shape: Shape items: (Vec Stx) next: i64 done: (Vec Stx)
+   role: Role finish: Finish entered: bool))
+
+;; The frames that wait for the form being walked, the innermost first
+;; (Rust's `Vec<Frame>`: a Vec has no pop here, so a chain of frames).
+(defenum Stack
+  Bottom
+  (Open frame: WalkFrame below: Stack))
+
+;; What the machine does next.
+(defenum Step
+  ;; walk this form by this role
+  (Todo form: Stx role: Role)
+  ;; this form is finished: hand it to the frame below
+  (Done form: Stx))
+
+;; The next step and the stack it runs on (Rust passes `&mut stack`).
+(defstruct Move (step: Step stack: Stack))
+
+;; The kind of form a frame rebuilds, from its walked items.
+(defun rebuild :private (shape: Shape items: (Vec Stx)) -> StxKind
+  (match shape
+    ((ShList) (SList items))
+    ((ShVec) (SVec items))
+    ((ShMap) (SMap items))))
+
+;; The role of item i under the `Items` role role. (item_role)
+(defun item-role :private (role: Role i: i64) -> Role
+  (match role
+    ((Items roles rest) (if (< i (count roles)) (nth roles i) rest))
+    (_ role)))
+
+;; The frame with value walked: its next item's turn.
+(defun resume :private (frame: WalkFrame value: Stx) -> WalkFrame
+  (WalkFrame (. frame pos) (. frame shape) (. frame items) (. frame next)
+         (conj (. frame done) value) (. frame role) (. frame finish) (. frame entered)))
+
+;; Leaves the level a form entered, if it did. (the `if entered` of Rust)
+(defun leave-if :private (ex: Expander entered: bool) -> unit
+  (if entered (expander-leave ex) ()))
+
+;; The frame done at its last item: rebuilt, finished, handed down.
+(defun close :private (ex: Expander frame: WalkFrame stack: Stack) -> Move
+  (do (leave-if ex (. frame entered))
+      (Move (Done (finish-form (Stx (rebuild (. frame shape) (. frame done)) (. frame pos))
+                               (. frame finish)))
+            stack)))
+
+;; Moves frame on to its next item that needs walking, pushing the frame
+;; back, or finishes it when none is left. (advance)
+(defun advance :private (ex: Expander frame: WalkFrame stack: Stack) -> Move
+  (let ((items (. frame items))
+        (n (count (. frame items))))
+    (loop ((i (. frame next))
+           (done (. frame done)))
+      (if (< i n)
+          (let ((item (nth items i))
+                (role (item-role (. frame role) (count done))))
+            (match role
+              ((Keep) (recur (+ i 1) (conj done item)))
+              (_ (Move (Todo item role)
+                       (Open (WalkFrame (. frame pos) (. frame shape) items (+ i 1) done
+                                    (. frame role) (. frame finish) (. frame entered))
+                             stack)))))
+          (close ex (WalkFrame (. frame pos) (. frame shape) items n done
+                           (. frame role) (. frame finish) (. frame entered))
+                 stack)))))
+
+;; A form with no items to walk: left if it was entered, finished.
+(defun settle :private (ex: Expander form: Stx finish: Finish entered: bool stack: Stack) -> Move
+  (do (leave-if ex entered)
+      (Move (Done (finish-form form finish)) stack)))
+
+;; Opens a frame to walk the items of form by role, or finishes a form
+;; that has no items to walk. (open)
+(defun open :private (ex: Expander form: Stx role: Role finish: Finish entered: bool
+                      stack: Stack) -> Move
+  (let ((pos (. form pos)))
+    (match role
+      ((Items _ _)
+       (match (. form kind)
+         ((SList items)
+          (advance ex (WalkFrame pos ShList items 0 (vec-empty) role finish entered) stack))
+         ((SVec items)
+          (advance ex (WalkFrame pos ShVec items 0 (vec-empty) role finish entered) stack))
+         ((SMap items)
+          (advance ex (WalkFrame pos ShMap items 0 (vec-empty) role finish entered) stack))
+         (_ (settle ex form finish entered stack))))
+      (_ (settle ex form finish entered stack)))))
+
+;; A pattern: the symbol `nil` becomes `(Nil)`; braces are an error; the
+;; items of a list or of a vector pattern (§1.4, §3.6) are patterns.
+;; (pattern)
+(defun pattern :private (ex: Expander form: Stx stack: Stack) -> (Result Move ExpandError)
+  (let ((pos (. form pos)))
+    (match (. form kind)
+      ((SSym s)
+       (Ok (settle ex (if (= s "nil") (Stx SNil pos) form) FinSame true stack)))
+      ((SMap _) (Err (ExpandError BraceInPattern pos)))
+      ((SList _) (Ok (open ex form (role-after 0 Pattern) FinSame true stack)))
+      ((SVec _) (Ok (open ex form (role-after 0 Pattern) FinSame true stack)))
+      (_ (Ok (settle ex form FinSame true stack))))))
+
+;; A form in expression or argument position: entered, its head expanded,
+;; planned, and its items opened by the plan.
+(defun start-expr :private (ex: Expander form: Stx is-arg: bool stack: Stack) -> (Result Move ExpandError)
+  (match (expander-enter ex (. form pos))
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (plan-expr ex form is-arg)
+       ((Err e) (Err e))
+       ((Ok p) (Ok (open ex (. p form) (. p role) (. p finish) true stack)))))))
+
+;; Begins walking form by role. (start)
+(defun start :private (ex: Expander form: Stx role: Role stack: Stack) -> (Result Move ExpandError)
+  (match role
+    ((Keep) (Ok (Move (Done form) stack)))
+    ((Expr) (start-expr ex form false stack))
+    ((Arg) (start-expr ex form true stack))
+    ((Pattern)
+     (match (expander-enter ex (. form pos))
+       ((Err e) (Err e))
+       ((Ok _) (pattern ex form stack))))
+    ((Items _ _) (Ok (open ex form role FinSame false stack)))))
+
+;; Walks form by role: returns the form with every operand the role names
+;; expanded, or the first error. The stack of open frames is explicit, so
+;; no input makes this recurse. (walk)
+(defun walk (ex: Expander form: Stx role: Role) -> (Result Stx ExpandError)
+  (loop ((step (Todo form role))
+         (stack Bottom))
+    (match step
+      ((Todo f r)
+       (match (start ex f r stack)
+         ((Err e) (Err e))
+         ((Ok m) (recur (. m step) (. m stack)))))
+      ((Done value)
+       (match stack
+         ((Bottom) (Ok value))
+         ((Open frame below)
+          (let ((m (advance ex (resume frame value) below)))
+            (recur (. m step) (. m stack)))))))))
+
+;; Expands a form in expression position: `walk` with the role Expr.
+;; (expr)
+(defun expr (ex: Expander form: Stx) -> (Result Stx ExpandError)
+  (walk ex form Expr))

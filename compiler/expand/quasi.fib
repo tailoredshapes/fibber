@@ -1,0 +1,190 @@
+;; compiler/expand/quasi.fib: the quasiquote rewrite of syntax §3.16, as
+;; crates/fibref/src/expand/quasi.rs (162 lines, as library tranche 0
+;; left it: the heads are written `fib.prelude/List`, `fib.prelude/Vec`,
+;; `fib.prelude/Map` and `fib.prelude/concat`):
+;;
+;;   `atom                => (quote atom)
+;;   `(a ,b ,@cs d)       => (fib.prelude/List (fib.prelude/concat ['a] [b] cs ['d]))
+;;   `[ ... ]  `{ ... }   => the same with fib.prelude/Vec / fib.prelude/Map
+;;
+;; Nesting follows the usual levels; a `,@` at level 1 that is not an item
+;; of a list, vector or map is SpliceOutsideList. Every built form takes
+;; the position of the template form it was built for. The template is
+;; walked with an explicit stack (the Rust `Task` and value stacks), so
+;; macros that build templates 2,000 levels deep cost no native stack.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `rewrite(form: Form)` is `(rewrite form: Stx)`: it takes the form
+;;   `(quasiquote template)` and needs no context.
+;; - `Result<Form, ExpandError>` is `(Result Stx ExpandError)`.
+;; - the Rust `Task` and value stacks are one stack of FRAMES, a private
+;;   linked list one frame per level of template nesting, and a machine
+;;   that is either visiting a template form (`Visit`), handing a value
+;;   to the top frame (`Ret`) or advancing the top sequence frame to its
+;;   next item (`Adv`). fibber's `Vec` has no `pop`, and a linked list of
+;;   one node per item would overflow the native stack when it is freed
+;;   (about 400,000 nodes, measured), so the items of a list stay in
+;;   their `Vec` behind an index and the stack is as deep as the nesting
+;;   (at most the reader's 1000, or what a macro builds), as Rust's is.
+;; - the order in which errors are found is the Rust's: on entering a
+;;   list, vector or map at level 1 the operand of every `unquote-
+;;   splicing` item is checked, last item first, before any item is
+;;   visited; then the items are visited in order, each subtree whole
+;;   before the next item. (Rust pushes the tasks of the items in
+;;   reverse, checking a splice operand as it pushes.)
+;; - a state the Rust reports as `Malformed quasiquote "internal: ..."`
+;;   (an unbalanced rewrite) cannot happen; the same record is returned
+;;   at the position of the `(quasiquote ..)` form where a frame is not
+;;   the one expected.
+(ns expand.quasi (:use syntax.pos syntax.form util.result expand.error expand.build expand.collections))
+
+;; Work to do for the next step of the machine.
+(defenum Mode :private
+  ;; rewrite this template form at this level
+  (Visit t: Stx level: i64)
+  ;; hand this finished expression to the top frame
+  (Ret v: Stx)
+  ;; the top frame is a sequence: take its next item
+  (Adv))
+
+;; What is waiting for expressions, innermost first.
+(defenum Frames :private
+  (FNil)
+  ;; a list, vector or map being rewritten: `ctor` is List, Vec or Map;
+  ;; `idx` the item being visited (or next to take), `parts` the
+  ;; expressions of the items before it (each `[x]` or a spliced operand)
+  (FSeq ctor: str pos: Pos level: i64 items: (Vec Stx) idx: i64 parts: (Vec Stx) rest: Frames)
+  ;; an inner quasiquote, unquote or unquote-splicing rebuilt as data
+  (FWrap head: str pos: Pos rest: Frames))
+
+;; One step of the machine: the next state, or the finished expression.
+(defenum Machine :private
+  (Next mode: Mode frames: Frames)
+  (Done v: Stx))
+
+;; Rewrites the form `(quasiquote template)` into the expression that
+;; builds the template as data; its position is the call's. (rewrite)
+(defun rewrite (form: Stx) -> (Result Stx ExpandError)
+  (match (operand form "quasiquote")
+    ((Err e) (Err e))
+    ((Ok template)
+     (let ((qpos (. form pos)))
+       (loop ((mode (Visit template 1)) (frames FNil))
+         (match (step mode frames qpos)
+           ((Err e) (Err e))
+           ((Ok (Done v)) (Ok v))
+           ((Ok (Next m f)) (recur m f))))))))
+
+(defun step :private (mode: Mode frames: Frames qpos: Pos) -> (Result Machine ExpandError)
+  (match mode
+    ((Visit t level) (visit t level frames))
+    ((Ret v) (deliver v frames qpos))
+    ((Adv) (advance frames qpos))))
+
+(defun unbalanced :private (qpos: Pos) -> ExpandError
+  (malformed-error "quasiquote" "internal: unbalanced rewrite" qpos))
+
+;; Whether `t` is a list whose head is the symbol `name`.
+(defun head-is :private (t: Stx name: str) -> bool
+  (match (head-name t)
+    ((some h) (= h name))
+    (nil false)))
+
+;; Rewrites the template form `t` at `level`. (visit)
+(defun visit :private (t: Stx level: i64 frames: Frames) -> (Result Machine ExpandError)
+  (cond
+    ((and (head-is t "unquote") (= level 1))
+     (match (operand t "unquote")
+       ((Err e) (Err e))
+       ((Ok x) (Ok (Next (Ret x) frames)))))
+    ((and (head-is t "unquote-splicing") (= level 1))
+     (Err (ExpandError SpliceOutsideList (. t pos))))
+    ((head-is t "quasiquote") (wrapped t "quasiquote" (+ level 1) frames))
+    ((head-is t "unquote") (wrapped t "unquote" (- level 1) frames))
+    ((head-is t "unquote-splicing") (wrapped t "unquote-splicing" (- level 1) frames))
+    (true (sequence t level frames))))
+
+;; An inner quasiquote, unquote or unquote-splicing: its operand is
+;; rewritten at `inner`, and the result rebuilt as `(head x)` data.
+(defun wrapped :private (t: Stx head: str inner: i64 frames: Frames) -> (Result Machine ExpandError)
+  (match (operand t head)
+    ((Err e) (Err e))
+    ((Ok x) (Ok (Next (Visit x inner) (FWrap head (. t pos) frames))))))
+
+;; A list, vector or map with no special head, or an atom. (sequence)
+(defun sequence :private (t: Stx level: i64 frames: Frames) -> (Result Machine ExpandError)
+  (let ((pos (. t pos)))
+    (match (. t kind)
+      ((SList items) (seq-start "List" items pos level frames))
+      ((SVec items) (seq-start "Vec" items pos level frames))
+      ((SMap items) (seq-start "Map" items pos level frames))
+      (_ (Ok (Next (Ret (call "quote" [t] pos)) frames))))))
+
+(defun seq-start :private (ctor: str items: (Vec Stx) pos: Pos level: i64 frames: Frames)
+    -> (Result Machine ExpandError)
+  (match (check-splices items level)
+    ((Err e) (Err e))
+    ((Ok _) (Ok (Next Adv (FSeq ctor pos level items 0 (vec-empty) frames))))))
+
+;; Whether the item is `(unquote-splicing ..)` at level 1, which is
+;; spliced into the sequence instead of being wrapped.
+(defun spliced? :private (item: Stx level: i64) -> bool
+  (and (= level 1) (head-is item "unquote-splicing")))
+
+;; The operand of every spliced item, checked last item first, as the
+;; Rust pushes the tasks. The first malformed one is the error.
+(defun check-splices :private (items: (Vec Stx) level: i64) -> (Result unit ExpandError)
+  (loop ((i (- (count items) 1)))
+    (if (< i 0)
+        (Ok ())
+        (if (spliced? (nth items i) level)
+            (match (operand (nth items i) "unquote-splicing")
+              ((Err e) (Err e))
+              ((Ok _) (recur (- i 1))))
+            (recur (- i 1))))))
+
+;; Takes the next item of the sequence on top: a spliced item is its
+;; operand as it is; any other is visited, and wrapped when it returns.
+;; When no items are left the sequence is `(ctor (concat parts...))`.
+(defun advance :private (frames: Frames qpos: Pos) -> (Result Machine ExpandError)
+  (match frames
+    ((FSeq ctor pos level items idx parts rest)
+     (cond
+       ((>= idx (count items))
+        (Ok (Next (Ret (finish-seq ctor parts pos)) rest)))
+       ((spliced? (nth items idx) level)
+        (match (operand (nth items idx) "unquote-splicing")
+          ((Err e) (Err e))
+          ((Ok x)
+           (Ok (Next Adv (FSeq ctor pos level items (+ idx 1) (conj parts x) rest))))))
+       (true
+        (Ok (Next (Visit (nth items idx) level) (FSeq ctor pos level items idx parts rest))))))
+    (_ (Err (unbalanced qpos)))))
+
+;; `(fib.prelude/CTOR (fib.prelude/concat parts...))`.
+(defun finish-seq :private (ctor: str parts: (Vec Stx) pos: Pos) -> Stx
+  (call (prelude-name ctor) [(call (prelude-name "concat") parts pos)] pos))
+
+;; Hands the finished expression `v` to the top frame: a sequence wraps
+;; it as `[v]` (at the position of its item) and goes on; a rebuilt
+;; `(head x)` becomes `(fib.prelude/List (fib.prelude/concat ['head] [v]))`.
+(defun deliver :private (v: Stx frames: Frames qpos: Pos) -> (Result Machine ExpandError)
+  (match frames
+    ((FNil) (Ok (Done v)))
+    ((FSeq ctor pos level items idx parts rest)
+     (let ((wrap (vector [v] (. (nth items idx) pos))))
+       (Ok (Next Adv (FSeq ctor pos level items (+ idx 1) (conj parts wrap) rest)))))
+    ((FWrap head pos rest)
+     (let ((quoted (vector [(call "quote" [(sym head pos)] pos)] pos))
+           (parts [quoted (vector [v] pos)])
+           (concat (call (prelude-name "concat") parts pos)))
+       (Ok (Next (Ret (call (prelude-name "List") [concat] pos)) rest))))))
+
+;; The one operand of `(head x)`. (operand)
+(defun operand :private (t: Stx head: str) -> (Result Stx ExpandError)
+  (match (. t kind)
+    ((SList items)
+     (if (= (count items) 2)
+         (Ok (nth items 1))
+         (Err (malformed-error head "expected one operand" (. t pos)))))
+    (_ (Err (malformed-error head "expected one operand" (. t pos))))))

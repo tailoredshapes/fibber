@@ -1,0 +1,190 @@
+;; compiler/expand/roots.fib: where a module is found (syntax §5,
+;; compiler.md §1; stdlib design §7 E7, Proposed), as
+;; crates/fibref/src/roots.rs (about 110 lines of Rust, its tests not
+;; counted). A module `a.b` is the file `a/b.fib` under a root. The roots,
+;; in the order they are tried:
+;;
+;;   1. the directory of the main file;
+;;   2. each `-I DIR` of the command line, in the order given;
+;;   3. each directory of the environment variable `FIB_LIB` (a list like
+;;      PATH: `:` on Unix), in order;
+;;   4. the built-in root.
+;;
+;; The first root that has the file wins and the others are not read; a
+;; directory that does not exist is skipped. The roots are an explicit
+;; value (`Roots`): the command line makes them and hands them down, and
+;; nothing below it reads the environment.
+;;
+;; What differs from the Rust, and why (each is a rule the port decides
+;; where the Rust has no counterpart in a compiled fibber program):
+;; - The built-in root. Rust embeds `lib/**/*.fib` but `lib/prelude.fib`
+;;   in the executable (`build.rs`); fibber has no `include_str`, so the
+;;   port reads the directory `lib` under the working directory, as the
+;;   tool reads `lib/prelude.fib` (spec/bootstrap.md §5.1: the test makes
+;;   the repository root the working directory). `Roots.builtin` is that
+;;   directory, or `nil` for no built-in root; the file name positions
+;;   show is `lib/a/b.fib`, as the embedded one is. The embedded table is
+;;   keyed by the name its file gives (`lib/a/b.fib` is `a.b`; the
+;;   prelude, `lib/prelude.fib`, is not in it), so a name that is not
+;;   such a name (an empty part, a `/`, or `prelude`) finds nothing there
+;;   even if the file it spells is.
+;; - Missing and unreadable are one thing. `read-file` is `nil` for a
+;;   file that is not there, a directory, a file that is not UTF-8 and one
+;;   that cannot be read alike (syntax §4.3), and fibber has no other
+;;   call that tells them apart (the interpreter's `extern` table holds
+;;   `write`, `strtod` and `strtof` only). Rust stops at a root whose
+;;   file is there and cannot be read (`Lookup::Unreadable`: the file
+;;   named is that one, and no later root is tried); the port goes on to
+;;   the next root and ends in `LookupMissing` with the main directory's
+;;   file. The two differ only when such a file is not at the main
+;;   directory's root, or when a later root holds a readable module of the
+;;   name (the Rust reports the broken file, the port finds that one). The
+;;   expansion dump gives both the record `ModuleMissing`, with a message
+;;   that names the file; no input of `crates/fibc/tests/bootstrap_expand`
+;;   has such a file. Reported to the lead as a language gap (§5.7).
+;; - `Lookup::Missing` carries the operating system's words (`cause`, and
+;;   the other places tried, `also`). The expansion dump prints neither
+;;   (spec/bootstrap.md §5.1: "a module that is not at its file says
+;;   `module NS is not at FILE` and not why"), so the port keeps only the
+;;   file.
+;; - `Roots::with_builtin` (a table for the tests) and `Roots::dirs` (a
+;;   field read) have no counterpart.
+;; - A path is a `str`. `path-parent` and `path-join` are what
+;;   `Path::parent` and `Path::join` give, written out: the tests of
+;;   `compiler/tests/expand/` and a Rust program run over the same
+;;   strings are what says so.
+(ns expand.roots)
+
+;; The directories searched after the main file's, in order, and the
+;; directory of the built-in root's files (`nil`: none).
+(defstruct Roots (dirs: (Vec str) builtin: (Option str)))
+
+;; What looking for one module found.
+(defenum Lookup
+  ;; The module's file name (as positions show it) and its source.
+  (LookupFound file: str source: str)
+  ;; Nowhere (or nowhere readable): where the main file's directory would
+  ;; have it.
+  (LookupMissing file: str))
+
+;; The directory of the built-in root's files.
+(def builtin-dir: str :private "lib")
+
+;; These directories, in order, then the built-in root.
+(defun roots-new (dirs: (Vec str)) -> Roots
+  (Roots dirs (some builtin-dir)))
+
+;; No directories, and the built-in root (`Roots::default`).
+(defun roots-default () -> Roots
+  (roots-new (vec-empty)))
+
+;; The `-I` directories, then those of the value of `FIB_LIB` (the caller
+;; reads the variable: nothing here does), then the built-in root. An
+;; empty entry of the list names nothing and is skipped.
+(defun roots-from-env (dirs: (Vec str) fib-lib: (Option str)) -> Roots
+  (match fib-lib
+    (nil (roots-new dirs))
+    ((some list) (roots-new (concat dirs (split-list list))))))
+
+;; The entries of a `:`-separated list that are not empty
+;; (`std::env::split_paths` on Unix, empty ones filtered).
+(defun split-list :private (list: str) -> (Vec str)
+  (let ((bs (str-bytes list))
+        (n (str-len list)))
+    (loop ((i 0) (start 0) (out (vec-empty)))
+      (cond ((> i n) out)
+            ((or (= i n) (= (array-get bs i) 58i8))
+             (recur (+ i 1) (+ i 1) (if (> i start) (conj out (str-slice list start i)) out)))
+            (else (recur (+ i 1) start out))))))
+
+;; `a.b` as `a/b.fib`.
+(defun relative-file :private (ns: str) -> str
+  (let ((cs (str-chars ns))
+        (n (count cs)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i n)
+          (recur (+ i 1) (conj out (if (= (nth cs i) \.) "/" (char->str (nth cs i)))))
+          (str-join (conj out ".fib"))))))
+
+;; Whether `ns` is the name some file of `lib` gives: parts between dots,
+;; none empty, none holding a `/`, and not the prelude's.
+(defun library-name? :private (ns: str) -> bool
+  (let ((cs (str-chars ns))
+        (n (count cs)))
+    (and (> n 0)
+         (not (= ns "prelude"))
+         (loop ((i 0) (part 0))
+           (cond ((= i n) (> part 0))
+                 ((= (nth cs i) \/) false)
+                 ((= (nth cs i) \.) (if (= part 0) false (recur (+ i 1) 0)))
+                 (else (recur (+ i 1) (+ part 1))))))))
+
+;; Looks for module `ns` (`a.b` is `a/b.fib`) beside the main file (in
+;; `main-dir`), under each directory, and last in the built-in root.
+(defun roots-find (roots: Roots main-dir: str ns: str) -> Lookup
+  (let ((rel (relative-file ns))
+        (all (concat [main-dir] (. roots dirs)))
+        (n (+ 1 (count (. roots dirs)))))
+    (loop ((i 0))
+      (if (< i n)
+          (let ((file (path-join (nth all i) rel)))
+            (match (read-file file)
+              ((some source) (LookupFound file source))
+              (nil (recur (+ i 1)))))
+          (find-builtin (. roots builtin) ns rel (path-join main-dir rel))))))
+
+;; The module in the built-in root, if the name is one it carries; else
+;; the missing module at `missing`.
+(defun find-builtin :private (builtin: (Option str) ns: str rel: str missing: str) -> Lookup
+  (match builtin
+    (nil (LookupMissing missing))
+    ((some dir)
+     (let ((file (path-join dir rel)))
+       (if (library-name? ns)
+           (match (read-file file)
+             ((some source) (LookupFound file source))
+             (nil (LookupMissing missing)))
+           (LookupMissing missing))))))
+
+;; The byte ranges of the components of a path as `Path::components`
+;; gives them on Unix, less the root: the parts between `/`, none empty,
+;; a `.` kept only at the very start of the path.
+(defstruct Span :private (lo: i64 hi: i64))
+
+(defun components :private (bs: (Array i8)) -> (Vec Span)
+  (let ((n (array-len bs)))
+    (loop ((i 0) (start 0) (out (vec-empty)))
+      (cond ((> i n) out)
+            ((or (= i n) (= (array-get bs i) 47i8))
+             (recur (+ i 1) (+ i 1)
+                    (if (and (> i start) (not (skipped-dot? bs start i))) (conj out (Span start i)) out)))
+            (else (recur (+ i 1) start out))))))
+
+;; Whether the part `lo..hi` is a `.` that is not the path's first.
+(defun skipped-dot? :private (bs: (Array i8) lo: i64 hi: i64) -> bool
+  (and (> lo 0) (= hi (+ lo 1)) (= (array-get bs lo) 46i8)))
+
+;; The directory of a file path as `Path::new(file).parent()` gives it
+;; with `None` as "": `main.fib` has "", `a/b/m.fib` has `a/b`, `/m.fib`
+;; has `/`, and a repeated or trailing separator is dropped.
+(defun path-parent (file: str) -> str
+  (let ((bs (str-bytes file))
+        (comps (components bs))
+        (k (count comps)))
+    (cond ((= k 0) "")
+          ((= k 1) (if (= (array-get bs 0) 47i8) "/" ""))
+          (else (str-slice file 0 (. (nth comps (- k 2)) hi))))))
+
+;; Whether the last byte of `s`, which is not empty, is `/`.
+(defun ends-with-slash? :private (s: str) -> bool
+  (let ((bs (str-bytes s)))
+    (= (array-get bs (- (array-len bs) 1)) 47i8)))
+
+;; `Path::new(dir).join(rel)` as a string: `rel` under `dir`, with a
+;; repeated or trailing `/` of `dir` dropped and `rel` alone when `dir`
+;; is "".
+(defun path-join (dir: str rel: str) -> str
+  (cond ((starts-with? rel "/") rel)
+        ((= dir "") rel)
+        ((ends-with-slash? dir) (str-concat dir rel))
+        (else (str-join [dir "/" rel]))))

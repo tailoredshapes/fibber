@@ -1,0 +1,330 @@
+;; compiler/expand/modules.fib: modules (syntax §5), as
+;; crates/fibref/src/modules.rs (345 lines of Rust, its tests not
+;; counted) and the library roots of `expand.roots`. A program is the
+;; file given and the modules its `ns` clauses `:require`, `:use` or
+;; `:export-from`, found beside that file and then under the library
+;; roots (`a.b` at `a/b.fib`; the order is that of `expand.roots`), read
+;; once each in dependency order, the main module last. A module's macros
+;; reach the modules that `:use` it unqualified and the ones that
+;; `:require` it through the alias, a `:private` macro its own module
+;; only (`ctx-macro-def`).
+;;
+;; The types are `expand.types`'s (the skeleton): `ModuleSpec`, `Loaded`,
+;; `LoadErr` (`LoadError`), `Expanded`. What the Rust has and the port
+;; does not, and why:
+;; - `load` and `load_in` return their error as a `String` that holds the
+;;   operating system's words for a missing module. The dump never prints
+;;   them (spec/bootstrap.md §5.1) and `LoadMissing` carries none, so a
+;;   port could not print the Rust's text; the callers of stage 2 take
+;;   `try-load` and `try-load-in`.
+;; - `ModuleSpec::main` is `module-spec-main` (`expand.types`), `deps` is
+;;   `module-spec-deps` below.
+;;
+;; - `spec_of` returns its error as the text of the `LoadError::Spec`
+;;   (`FILE:L:C: what`), as Rust's does; `spec-in`, which the loader
+;;   uses, keeps the `LoadErr`, and `spec-of` shows it with
+;;   `load-err-message`.
+;; - `Loader` (the modules read and the ones being read) holds its three
+;;   changing parts in Cells, and `visit` is the Rust one: a module read
+;;   already is skipped, one being read is `LoadCycle` with the path to
+;;   it, a file that declares another name is `LoadMismatch`, and the
+;;   dependencies of a module (requires, then uses) are read before it.
+;;   A module not found is `LoadMissing` whether it is not there or
+;;   cannot be read (`expand.roots` says why).
+;;
+;; Decisions (how Rust's `&mut` threads through): `begin-spec` and
+;; `expand-all` take the `ExpandCtx`, whose mutable parts are Cells, and
+;; the `Runner`; `expand-all` returns the `Expanded`s in the dependency
+;; order of `try-load`, or the first `ExpandError`, which ends it.
+(ns expand.modules
+  (:require [syntax.reader :as reader] [expand.program :as prog])
+  (:use syntax.pos syntax.form syntax.error util.result expand.error expand.types expand.ctx
+        expand.roots))
+
+;; Every module a spec depends on: its requires and its uses, in that
+;; order (`ModuleSpec::deps`).
+(defun module-spec-deps (spec: ModuleSpec) -> (Vec str)
+  (let ((rs (. spec requires))
+        (us (. spec uses))
+        (nr (count (. spec requires)))
+        (nu (count (. spec uses))))
+    (loop ((i 0) (out (vec-empty)))
+      (cond ((< i nr) (recur (+ i 1) (conj out (. (nth rs i) ns))))
+            ((< i (+ nr nu)) (recur (+ i 1) (conj out (nth us (- i nr)))))
+            (else out)))))
+
+;; The Display text of a load failure (`impl Display for LoadError`),
+;; with no operating system words for a module that is not at its file.
+(defun load-err-message (e: LoadErr) -> str
+  (match e
+    ((LoadRead error)
+     (str-join [(pos-display (. error pos)) ": " (err-message (. error kind))]))
+    ((LoadSpec pos what) (str-join [(pos-display pos) ": " what]))
+    ((LoadMissing ns file) (str-join ["module " ns " is not at " file]))
+    ((LoadCycle path ns)
+     (str-join ["modules require each other in a cycle: " (str-join-with " -> " path) " -> " ns]))
+    ((LoadMismatch file declared required)
+     (str-join [file " declares (ns " declared ") but is required as " required]))))
+
+;; The strings with `sep` between each pair.
+(defun str-join-with :private (sep: str parts: (Vec str)) -> str
+  (let ((n (count parts)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i n)
+          (recur (+ i 1) (conj (if (> i 0) (conj out sep) out) (nth parts i)))
+          (str-join out)))))
+
+;; The spec a module's forms give: the first form when it is an `ns`,
+;; else the default with no clauses and `default-ns` as its name. The
+;; error is the Display text of the `LoadSpec` (`FILE:L:C: what`).
+(defun spec-of (forms: (Vec Stx) default-ns: str) -> (Result ModuleSpec str)
+  (match (spec-in forms default-ns)
+    ((Ok spec) (Ok spec))
+    ((Err e) (Err (load-err-message e)))))
+
+(defun default-spec :private (default-ns: str) -> ModuleSpec
+  (ModuleSpec default-ns (vec-empty) (vec-empty) (vec-empty)))
+
+;; `spec_in`: the spec, or the `LoadSpec` for the `ns` form at fault.
+(defun spec-in :private (forms: (Vec Stx) default-ns: str) -> (Result ModuleSpec LoadErr)
+  (if (= (count forms) 0)
+      (Ok (default-spec default-ns))
+      (let ((first (nth forms 0)))
+        (match (. first kind)
+          ((SList items)
+           (if (is-ns-head? items)
+               (ns-form first items)
+               (Ok (default-spec default-ns))))
+          (_ (Ok (default-spec default-ns)))))))
+
+(defun is-ns-head? :private (items: (Vec Stx)) -> bool
+  (and (> (count items) 0)
+       (match (. (nth items 0) kind)
+         ((SSym s) (= s "ns"))
+         (_ false))))
+
+;; The `LoadSpec` for the `ns` form `first`.
+(defun bad-spec :private (first: Stx what: str) -> (Result ModuleSpec LoadErr)
+  (Err (LoadSpec (. first pos) what)))
+
+;; The spec of the `ns` form `first`, whose items are `items`.
+(defun ns-form :private (first: Stx items: (Vec Stx)) -> (Result ModuleSpec LoadErr)
+  (if (< (count items) 2)
+      (bad-spec first "ns needs a name")
+      (match (. (nth items 1) kind)
+        ((SSym name)
+         (match (ns-clauses (ModuleSpec name (vec-empty) (vec-empty) (vec-empty)) items)
+           ((Ok spec) (Ok spec))
+           ((Err what) (bad-spec first what))))
+        (_ (bad-spec first "ns needs a name")))))
+
+;; `spec` with the clauses of `items` (those after the name) added, in
+;; order; the first clause that is wrong is the error.
+(defun ns-clauses :private (spec: ModuleSpec items: (Vec Stx)) -> (Result ModuleSpec str)
+  (let ((n (count items)))
+    (loop ((i 2) (acc spec))
+      (if (< i n)
+          (match (ns-clause acc (nth items i))
+            ((Ok next) (recur (+ i 1) next))
+            ((Err what) (Err what)))
+          (Ok acc)))))
+
+(def clause-shape: str :private
+  "an ns clause is a list: (:require ..), (:use ..) or (:export-from ..)")
+
+;; One clause of an `ns` form, added to `spec`.
+(defun ns-clause :private (spec: ModuleSpec clause: Stx) -> (Result ModuleSpec str)
+  (match (. clause kind)
+    ((SList parts)
+     (if (> (count parts) 0)
+         (match (. (nth parts 0) kind)
+           ((SKw key) (keyed-clause spec key (rest-of parts)))
+           (_ (Err "an ns clause starts with :require, :use or :export-from")))
+         (Err "an ns clause starts with :require, :use or :export-from")))
+    (_ (Err clause-shape))))
+
+;; The items of a clause: its parts after the keyword.
+(defun rest-of :private (parts: (Vec Stx)) -> (Vec Stx)
+  (let ((n (count parts)))
+    (loop ((i 1) (out (vec-empty)))
+      (if (< i n) (recur (+ i 1) (conj out (nth parts i))) out))))
+
+(defun keyed-clause :private (spec: ModuleSpec key: str items: (Vec Stx)) -> (Result ModuleSpec str)
+  (cond ((= key "require") (require-clause spec items))
+        ((= key "use")
+         (match (module-names items)
+           ((some names) (Ok (add-uses spec names)))
+           (nil (Err "a :use item is a module name"))))
+        ((= key "export-from")
+         (match (module-names items)
+           ((some names) (Ok (add-exports spec names)))
+           (nil (Err "an :export-from item is a module name"))))
+        (else (Err (str-join ["unknown ns clause :" key])))))
+
+;; The module names of a `:use` or `:export-from` clause, if every item
+;; is a symbol.
+(defun module-names :private (items: (Vec Stx)) -> (Option (Vec str))
+  (let ((n (count items)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i n)
+          (match (. (nth items i) kind)
+            ((SSym name) (recur (+ i 1) (conj out name)))
+            (_ nil))
+          (some out)))))
+
+(defun add-uses :private (spec: ModuleSpec names: (Vec str)) -> ModuleSpec
+  (ModuleSpec (. spec ns) (. spec requires) (concat (. spec uses) names) (. spec exports)))
+
+;; An `:export-from` module is also one the module `:use`s, once.
+(defun add-exports :private (spec: ModuleSpec names: (Vec str)) -> ModuleSpec
+  (let ((n (count names)))
+    (loop ((i 0) (uses (. spec uses)) (exports (. spec exports)))
+      (if (< i n)
+          (let ((name (nth names i)))
+            (recur (+ i 1) (if (has-name? uses name) uses (conj uses name)) (conj exports name)))
+          (ModuleSpec (. spec ns) (. spec requires) uses exports)))))
+
+(defun has-name? :private (names: (Vec str) name: str) -> bool
+  (let ((n (count names)))
+    (loop ((i 0))
+      (cond ((>= i n) false)
+            ((= (nth names i) name) true)
+            (else (recur (+ i 1)))))))
+
+(def require-shape: str :private "a :require item is [name :as alias]")
+
+;; The items of a `:require` clause: `[name :as alias]` each.
+(defun require-clause :private (spec: ModuleSpec items: (Vec Stx)) -> (Result ModuleSpec str)
+  (let ((n (count items)))
+    (loop ((i 0) (acc (. spec requires)))
+      (if (< i n)
+          (match (require-item (nth items i))
+            ((some r) (recur (+ i 1) (conj acc r)))
+            (nil (Err require-shape)))
+          (Ok (ModuleSpec (. spec ns) acc (. spec uses) (. spec exports)))))))
+
+;; `[name :as alias]`, exactly three items, as the `Require` of alias and
+;; module.
+(defun require-item :private (item: Stx) -> (Option Require)
+  (match (. item kind)
+    ((SVec v)
+     (if (= (count v) 3)
+         (match [(. (nth v 0) kind) (. (nth v 1) kind) (. (nth v 2) kind)]
+           ([(SSym name) (SKw k) (SSym alias)] (if (= k "as") (some (Require alias name)) nil))
+           (_ nil))
+         nil))
+    (_ nil)))
+
+;; Loads the program whose main module is `source` (read from `file`):
+;; every module it depends on, found beside `file` or under the built-in
+;; root only, once each in dependency order, then the main module
+;; (`try_load`: the failure says which way it was).
+(defun try-load (source: str file: str) -> (Result (Vec Loaded) LoadErr)
+  (try-load-in source file (roots-default)))
+
+;; The modules read so far and the ones being read (`Loader`).
+(defstruct Loader :private
+  (main-dir: str roots: Roots
+   ;; the modules whose dependencies are being read, outermost first
+   active: (Cell (Vec str))
+   done: (Cell (Map str bool))
+   out: (Cell (Vec Loaded))))
+
+;; `try-load` with the library roots of the command line: a module is
+;; found beside `file`, then under each root in order, then in the
+;; built-in root (`try_load_in`).
+(defun try-load-in (source: str file: str roots: Roots) -> (Result (Vec Loaded) LoadErr)
+  (match (reader/read-all source file)
+    ((Err e) (Err (LoadRead e)))
+    ((Ok forms)
+     (match (spec-in forms "main")
+       ((Err e) (Err e))
+       ((Ok spec)
+        (let ((ld (Loader (path-parent file) roots (cell [(. spec ns)]) (cell (map-empty))
+                          (cell (vec-empty)))))
+          (match (visit-all ld (module-spec-deps spec))
+            ((Err e) (Err e))
+            ((Ok _) (Ok (conj @(. ld out) (Loaded spec file forms)))))))))))
+
+;; Visits each module of `deps` in order; the first failure ends it.
+(defun visit-all :private (ld: Loader deps: (Vec str)) -> (Result unit LoadErr)
+  (let ((n (count deps)))
+    (loop ((i 0))
+      (if (< i n)
+          (match (visit ld (nth deps i))
+            ((Err e) (Err e))
+            ((Ok _) (recur (+ i 1))))
+          (Ok ())))))
+
+;; Reads module `ns` and, first, the modules it depends on (`Loader::visit`).
+(defun visit :private (ld: Loader ns: str) -> (Result unit LoadErr)
+  (cond ((some? (get @(. ld done) ns)) (Ok ()))
+        ((has-name? @(. ld active) ns) (Err (LoadCycle @(. ld active) ns)))
+        (else
+         (match (roots-find (. ld roots) (. ld main-dir) ns)
+           ((LookupMissing file) (Err (LoadMissing ns file)))
+           ((LookupFound file source) (visit-source ld ns file source))))))
+
+(defun visit-source :private (ld: Loader ns: str file: str source: str) -> (Result unit LoadErr)
+  (match (reader/read-all source file)
+    ((Err e) (Err (LoadRead e)))
+    ((Ok forms)
+     (match (spec-in forms ns)
+       ((Err e) (Err e))
+       ((Ok spec)
+        (if (= (. spec ns) ns)
+            (visit-spec ld spec file forms)
+            (Err (LoadMismatch file (. spec ns) ns))))))))
+
+;; Reads the dependencies of a module whose spec is `spec`, then adds it
+;; to what is read.
+(defun visit-spec :private (ld: Loader spec: ModuleSpec file: str forms: (Vec Stx))
+    -> (Result unit LoadErr)
+  (do (set! (. ld active) (conj @(. ld active) (. spec ns)))
+      (match (visit-all ld (module-spec-deps spec))
+        ((Err e) (Err e))
+        ((Ok _)
+         (do (set! (. ld active) (pop-last @(. ld active)))
+             (set! (. ld done) (assoc @(. ld done) (. spec ns) true))
+             (set! (. ld out) (conj @(. ld out) (Loaded spec file forms)))
+             (Ok ()))))))
+
+;; The strings without the last.
+(defun pop-last :private (names: (Vec str)) -> (Vec str)
+  (let ((n (- (count names) 1)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i n) (recur (+ i 1) (conj out (nth names i))) out))))
+
+;; Starts expanding the module `spec` describes in `ctx`: its `:use`s and
+;; `:require` aliases are what a macro name reaches (`ctx-begin-module`),
+;; and its `:export-from`s are what it re-exports (`ctx-reexport`).
+;; `expand-all` does this for each module; the expansion dump does it step
+;; by step.
+(defun begin-spec (ctx: ExpandCtx spec: ModuleSpec) -> unit
+  (do (ctx-begin-module ctx (. spec ns) (. spec uses) (alias-map (. spec requires)))
+      (ctx-reexport ctx (. spec ns) (. spec exports))))
+
+;; The `:require` aliases as a map, a later one of the same alias
+;; replacing an earlier (`collect` into a `HashMap`).
+(defun alias-map :private (requires: (Vec Require)) -> (Map str str)
+  (let ((n (count requires)))
+    (loop ((i 0) (acc (map-empty)))
+      (if (< i n)
+          (recur (+ i 1) (assoc acc (. (nth requires i) alias) (. (nth requires i) ns)))
+          acc))))
+
+;; Expands every loaded module in order in one context, each ended for the
+;; next (syntax §5: private types), with the macro runner.
+(defun expand-all (loaded: (Vec Loaded) ctx: ExpandCtx runner: Runner)
+    -> (Result (Vec Expanded) ExpandError)
+  (let ((n (count loaded)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i n)
+          (let ((l (nth loaded i)))
+            (do (begin-spec ctx (. l spec))
+                (match (prog/expand-program (. l forms) ctx runner)
+                  ((Err e) (Err e))
+                  ((Ok forms)
+                   (do (ctx-end-module ctx)
+                       (recur (+ i 1) (conj out (Expanded (. l spec) forms))))))))
+          (Ok out)))))

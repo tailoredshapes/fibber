@@ -29,7 +29,9 @@
 ;;   (a clean decimal text is all this module passes).
 ;; - Every digit is ASCII, so runs are found on the token's bytes and cut
 ;;   with byte offsets; any other character ends a run.
-(ns syntax.number (:use syntax.form syntax.error util.result))
+(ns syntax.number
+  (:require [syntax.print :as printer])
+  (:use syntax.form syntax.error util.result))
 
 ;; Parses a token that starts with a digit or with `-` and a digit: an
 ;; SInt or SFlt, or the error kind with the text and reason of
@@ -287,3 +289,61 @@
           (e (alloc 8))
           (r (strtof p e)))
       (do (free e) (free p) r))))
+
+;; ---- the check of a literal a macro built (added for the expander) ----
+
+;; Checks a literal the reader did not read (a form a macro built, syntax
+;; §3.16) as the reader checks one it reads (§1.1): an SInt must fit its
+;; width (IntegerOutOfRange), an SFlt must be a number (InvalidNumber
+;; "NaN is not a literal") and finite once an f32 one is rounded to the f32
+;; nearest its value (FloatOutOfRange); the kind returned is the one given,
+;; with that rounded value in an f32 SFlt. Every other kind passes
+;; unchanged. The error's position is the caller's. (number.rs
+;; `check_literal`, which rounds in place)
+;;
+;; Decided here: the text of an error is the `{v:?}` of the f64 value and
+;; the width's suffix, as Rust writes it, so a finite float is laid out by
+;; syntax.print's Debug layout (this module `:require`s it for that: print
+;; does not use this module, so there is no cycle). NaN and the infinities
+;; are written here, `NaN`, `inf` and `-inf` as Debug prints them, so that
+;; the message does not depend on how the printer lays out a value that is
+;; not a finite number.
+(defun check-literal (kind: StxKind) -> (Result StxKind ErrKind)
+  (match kind
+    ((SInt v w) (check-int-range kind v w))
+    ((SFlt v w) (check-float-value v w))
+    (_ (Ok kind))))
+
+;; Whether v fits the width: an SInt holds an i64, so only the narrower
+;; widths can fail (number.rs `IntWidth::range`).
+(defun check-int-range :private (kind: StxKind v: i64 w: IntWidth) -> (Result StxKind ErrKind)
+  (let ((fits (match w
+                ((I8) (and (>= v -128) (<= v 127)))
+                ((I16) (and (>= v -32768) (<= v 32767)))
+                ((I32) (and (>= v -2147483648) (<= v 2147483647)))
+                ((I64) true))))
+    (if fits
+        (Ok kind)
+        (Err (IntegerOutOfRange (str-concat (show v) (int-width-suffix w)) w)))))
+
+;; Rust's `{:?}` of v.
+(defun debug-text :private (v: f64) -> str
+  (if (!= v v)
+      "NaN"
+      (if (= (- v v) 0.0)
+          (printer/kind-show (SFlt v F64))
+          (if (< v 0.0) "-inf" "inf"))))
+
+;; NaN is not a literal; a value that is infinite at its width (an f32 one
+;; after it is rounded to the f32 nearest) is out of range; else the
+;; kind with the rounded value.
+(defun check-float-value :private (v: f64 w: FltWidth) -> (Result StxKind ErrKind)
+  (let ((text (str-concat (debug-text v) (flt-width-suffix w))))
+    (if (!= v v)
+        (Err (InvalidNumber text "NaN is not a literal"))
+        (let ((near (match w
+                      ((F32) (fpext f64 (fptrunc f32 v)))
+                      ((F64) v))))
+          (if (= (- near near) 0.0)
+              (Ok (SFlt near w))
+              (Err (FloatOutOfRange text w)))))))

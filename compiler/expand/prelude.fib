@@ -1,0 +1,337 @@
+;; compiler/expand/prelude.fib: the prelude macros of syntax §4.4 as
+;; rewrites, as crates/fibref/src/expand/prelude/{mod,logic,forms,loops}.rs
+;; (76 + 133 + 137 + 146 = 492 lines of Rust). Each takes the whole call
+;; form and returns its expansion, which the expander expands again; a form
+;; a macro builds carries the call's position, a form taken from the
+;; arguments keeps its own (syntax §1.3); the expansions are unhygienic
+;; (syntax §3.16): `if`, `cons`, `spawn`, `trap` are plain symbols and only
+;; the bindings a macro introduces itself are gensyms.
+;;
+;; TABLE-DRIVEN, as Rust's mod.rs: one function per macro, in the order of
+;; the Rust files (logic, forms, loops), and `expand-call` is the Rust
+;; `match` on the head, so a later change of a Rust macro is a mirror of one
+;; function and a new macro is one function, one line of `prelude-macros`
+;; and one line of `expand-call`. This port is of the CURRENT Rust macros
+;; only.
+;;
+;; Decided here, where the Rust is silent or a name would clash:
+;; - `PRELUDE_MACROS` is the vector `prelude-macros`. The Rust functions
+;;   are private to their module (`pub(super)`) and so are here; those
+;;   whose Rust name is itself a prelude macro or a core form (`when`,
+;;   `cond`, `list`, `assert`, `dbg`, `doto`, `range`, `if-let`,
+;;   `when-let`, `plet`, `while`, `dotimes`, `for-each`: a call of one in
+;;   fibber source would be expanded as the macro) end in `-macro`;
+;;   `and_or` is `and-or`, `thread` is `thread`.
+;; - `Outcome::Expanded` is `Rewritten`: `Expanded` is a struct of
+;;   expand.types, and two modules exporting one name make that name an
+;;   error where it is used unqualified (syntax §5).
+;; - A Rust `Option<(Form, Form)>` or a tuple of forms is a `(Vec Stx)` of
+;;   the parts in order; `Vec<Form>` iterated with `skip(n)` is `tail-from`.
+;; - the Rust's second check of a `cond` clause cannot fire after its first
+;;   and is not ported (`bad-clause` is the one check).
+;; - the call `()` is sent to `derive` (`name` is `""`), as the Rust does;
+;;   its arity error is the answer.
+;; - `list`, `plet`, `->`, `->>`, `doto`, `assert` and `dbg` (the Rust
+;;   forms.rs) are the module expand.prelude.forms, and the helpers the two
+;;   share (`tail-from`, `items-of`, `body-form`...) are expand.prelude.parts,
+;;   to keep each file under 500 lines.
+;; - `derive` is the one macro that is not a rewrite of this module,
+;;   `expand.derive` (porter 3) answers it. Module dependency: expand.prelude
+;;   uses expand.derive, expand.build, expand.core, expand.ctx and
+;;   expand.error, and is used by expand.expr.
+(ns expand.prelude
+  (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build
+        expand.prelude.parts expand.prelude.forms)
+  (:require [expand.derive :as dv]))
+
+;; The prelude macros, by name, in the order of the Rust table (the soup
+;; of crates/fibc/tests/bootstrap_expand picks them from it).
+(def prelude-macros: (Vec str)
+  ["when" "unless" "cond" "and" "or" "if-let" "when-let" "list" "plet" "while"
+   "dotimes" "for-each" "range" "->" "->>" "doto" "assert" "dbg" "derive"])
+
+;; What a prelude macro did with a call.
+(defenum Outcome
+  ;; the call's expansion
+  (Rewritten form: Stx)
+  ;; the call, unchanged: it is not a use of the macro (only `for-each`
+  ;; and the one-argument `range` decline, when they are the library
+  ;; functions, §4.4)
+  (Declined form: Stx))
+
+;; Whether name is a prelude macro. (mod.rs `is_macro`)
+(defun is-macro (name: str) -> bool
+  (let ((n (count prelude-macros)))
+    (loop ((i 0))
+      (if (< i n)
+          (if (= (nth prelude-macros i) name) true (recur (+ i 1)))
+          false))))
+
+;; The call's expansion, as an outcome.
+(defun rewritten :private (r: (Result Stx ExpandError)) -> (Result Outcome ExpandError)
+  (match r
+    ((Err e) (Err e))
+    ((Ok f) (Ok (Rewritten f)))))
+
+;; logic.rs: when unless cond and or if-let when-let
+;; `(when c body...)` ==> `(if c body ())`; `(unless c body...)` ==> `(if
+;; c () body)`.
+(defun when-macro :private (items: (Vec Stx) pos: Pos negate: bool) -> (Result Stx ExpandError)
+  (match (check-arity (if negate "unless" "when") items 1 nil pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (let ((test (nth items 1))
+           (body (body-form (tail-from items 2) pos)))
+       (Ok (call "if" (if negate [test (unit pos) body] [test body (unit pos)]) pos))))))
+
+;; `(and)` ==> `true`, `(and a)` ==> `a`, `(and a b ...)` ==> `(if a (and b
+;; ...) false)`; `or` dually with `(if a true (or b ...))`.
+(defun and-or :private (items: (Vec Stx) pos: Pos is-and: bool) -> Stx
+  (let ((args (tail-from items 1)))
+    (if (<= (count args) 1)
+        (item-or-boolean args is-and pos)
+        (let ((rest (call (if is-and "and" "or") (tail-from args 1) pos)))
+          (call "if" (if is-and
+                         [(nth args 0) rest (boolean false pos)]
+                         [(nth args 0) (boolean true pos) rest])
+                pos)))))
+
+;; The only argument, or the boolean the empty `and`/`or` is.
+(defun item-or-boolean :private (args: (Vec Stx) b: bool pos: Pos) -> Stx
+  (if (= (count args) 1) (nth args 0) (boolean b pos)))
+
+;; Whether a `cond` clause test is the catch-all `else` or `:else`.
+(defun is-else :private (test: Stx) -> bool
+  (match (. test kind)
+    ((SSym s) (= s "else"))
+    ((SKw k) (= k "else"))
+    (_ false)))
+
+;; The first clause of `cond` that is not a list of two or more forms.
+(defun bad-clause :private (clauses: (Vec Stx)) -> (Option Stx)
+  (loop ((i 0))
+    (if (< i (count clauses))
+        (match (items-of (nth clauses i))
+          ((some parts) (if (< (count parts) 2) (some (nth clauses i)) (recur (+ i 1))))
+          (nil (some (nth clauses i))))
+        nil)))
+
+;; `(cond (test body+)*)`: nested `if`s, tried in order. A final clause
+;; whose test is `else` or `:else` is the default; without one, falling
+;; off the end is `(trap "cond: no clause matched at POS")`, which has
+;; every type, so `(cond)` is that trap.
+(defun cond-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (let ((clauses (tail-from items 1)))
+    (match (bad-clause clauses)
+      ((some bad) (Err (malformed "cond" "a clause is (test body+)" (. bad pos))))
+      (nil
+       (let ((message (str-join ["cond: no clause matched at " (pos-display pos)])))
+         (cond-fold clauses (call "trap" [(string message pos)] pos) pos))))))
+
+;; The clauses, last first, folded onto the trap: clause j is the default
+;; only when it is the last one.
+(defun cond-fold :private (clauses: (Vec Stx) trap: Stx pos: Pos) -> (Result Stx ExpandError)
+  (let ((last (- (count clauses) 1)))
+    (loop ((j last) (acc trap))
+      (if (< j 0)
+          (Ok acc)
+          (let ((cpos (. (nth clauses j) pos))
+                (parts (unwrap-or (items-of (nth clauses j)) (vec-empty)))
+                (test (nth parts 0))
+                (body (body-form (tail-from parts 1) cpos)))
+            (if (is-else test)
+                (if (!= j last)
+                    (Err (malformed "cond" "else must be the last clause" cpos))
+                    (recur (- j 1) body))
+                (recur (- j 1) (call "if" [test body acc] pos))))))))
+
+;; The `x e` of the `(x e)` binding of `if-let`/`when-let`.
+(defun option-binding :private (name: str form: Stx) -> (Result (Vec Stx) ExpandError)
+  (match (items-of form)
+    ((some parts)
+     (if (= (count parts) 2)
+         (Ok parts)
+         (Err (malformed name "the binding is (pattern expression)" (. form pos)))))
+    (nil (Err (malformed name "the binding is (pattern expression)" (. form pos))))))
+
+;; `(match e ((some x) then) (nil other))`.
+(defun option-match :private (x: Stx e: Stx then: Stx other: Stx pos: Pos) -> Stx
+  (let ((some-clause (list-form [(call "some" [x] pos) then] pos))
+        (none-clause (list-form [(Stx SNil pos) other] pos)))
+    (list-form [(sym "match" pos) e some-clause none-clause] pos)))
+
+;; `(if-let (x e) a b)` ==> `(match e ((some x) a) (nil b))` (§4.4).
+(defun if-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (match (check-arity "if-let" items 3 (some 3) pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (option-binding "if-let" (nth items 1))
+       ((Err e) (Err e))
+       ((Ok b) (Ok (option-match (nth b 0) (nth b 1) (nth items 2) (nth items 3) pos)))))))
+
+;; `(when-let (x e) body...)` ==> `(match e ((some x) body) (nil ()))`.
+(defun when-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (match (check-arity "when-let" items 1 nil pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (option-binding "when-let" (nth items 1))
+       ((Err e) (Err e))
+       ((Ok b)
+        (Ok (option-match (nth b 0) (nth b 1) (body-form (tail-from items 2) pos)
+                          (unit pos) pos)))))))
+
+;; loops.rs: while dotimes for-each range
+;; `(while c body...)`.
+(defun while-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (match (check-arity "while" items 1 nil pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (let ((steps (conj (tail-from items 2) (call "recur" (vec-empty) pos)))
+           (body (call "if" [(nth items 1) (call "do" steps pos) (unit pos)] pos)))
+       (Ok (call "loop" [(unit pos) body] pos))))))
+
+;; The counting loop shared by `dotimes` and `for-each`: `bounds` are
+;; the `(gensym expr)` pairs bound, in order, before the loop; `start`
+;; and `limit` name the bound values.
+(defstruct Counting :private (i: Stx bounds: (Vec Stx) start: Stx limit: Stx))
+
+(defun counting-loop :private (c: Counting body: (Vec Stx) pos: Pos) -> Stx
+  (let ((next (call "+" [(. c i) (int 1 pos)] pos))
+        (steps (conj body (call "recur" [next] pos)))
+        (test (call "<" [(. c i) (. c limit)] pos))
+        (branch (call "if" [test (call "do" steps pos) (unit pos)] pos))
+        (vars (list-form [(list-form [(. c i) (. c start)] pos)] pos))
+        (lp (call "loop" [vars branch] pos)))
+    (call "let" [(list-form (. c bounds) pos) lp] pos)))
+
+;; `(dotimes (i n) body...)`.
+(defun dotimes-macro :private (ctx: ExpandCtx items: (Vec Stx) pos: Pos)
+    -> (Result Stx ExpandError)
+  (match (check-arity "dotimes" items 1 nil pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (counter-spec (nth items 1))
+       (nil (Err (malformed "dotimes" "expected (dotimes (sym count) body)" (. (nth items 1) pos))))
+       ((some spec)
+        (let ((m (ctx-gensym ctx "m" pos)))
+          (Ok (counting-loop (Counting (nth spec 0) [(list-form [m (nth spec 1)] pos)] (int 0 pos) m)
+                             (tail-from items 2)
+                             pos))))))))
+
+;; The `i n` of a `(i n)` with `i` a symbol.
+(defun counter-spec :private (form: Stx) -> (Option (Vec Stx))
+  (match (items-of form)
+    (nil nil)
+    ((some xs) (if (and (= (count xs) 2) (some? (sym-of (nth xs 0)))) (some xs) nil))))
+
+;; The `a b` of a literal `(range a b)`, or `0 n` of `(range n)`
+;; (Decided, owner, 2026-09-27: `(range n)` is `(range 0 n)`).
+(defun literal-range :private (form: Stx) -> (Option (Vec Stx))
+  (match (items-of form)
+    (nil nil)
+    ((some xs)
+     (cond ((and (= (count xs) 3) (is-sym (nth xs 0) "range")) (some [(nth xs 1) (nth xs 2)]))
+           ((and (= (count xs) 2) (is-sym (nth xs 0) "range")) (some [(int 0 (. form pos)) (nth xs 1)]))
+           (true nil)))))
+
+;; `(range a b)` ==> `(range-between a b)`; `(range n)` is declined and
+;; stays a call of the library function `range` (§4.4, §4.5). There is
+;; no arity overloading, so the two-argument form is this rewrite.
+(defun range-macro :private (items: (Vec Stx) pos: Pos) -> (Result Outcome ExpandError)
+  (match (check-arity "range" items 1 (some 2) pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (if (= (count items) 3)
+         (Ok (Rewritten (call "range-between" [(nth items 1) (nth items 2)] pos)))
+         (Ok (Declined (list-form items pos)))))))
+
+;; The `i` and body of a literal `(fn (i) body+)`, as `i` then the body:
+;; no name, one unannotated parameter, no result annotation.
+(defun literal-fn :private (form: Stx) -> (Option (Vec Stx))
+  (match (items-of form)
+    (nil nil)
+    ((some xs)
+     (if (and (>= (count xs) 3) (is-sym (nth xs 0) "fn"))
+         (fn-parameter xs)
+         nil))))
+
+;; The parameter of `(fn (p) body+)` and its body, when `p` is a plain name.
+(defun fn-parameter :private (xs: (Vec Stx)) -> (Option (Vec Stx))
+  (match (items-of (nth xs 1))
+    (nil nil)
+    ((some ps)
+     (if (= (count ps) 1)
+         (match (sym-of (nth ps 0))
+           (nil nil)
+           ((some name)
+            (if (or (ends-with-colon name) (= name "nil") (is-sym (nth xs 2) "->"))
+                nil
+                (some (concat-forms [(nth ps 0)] (tail-from xs 2))))))
+         nil))))
+
+(defun ends-with-colon :private (s: str) -> bool
+  (and (> (str-len s) 0) (= (str-slice s (- (str-len s) 1) (str-len s)) ":")))
+
+;; `(for-each (range a b) (fn (i) body...))` becomes the loop; any other
+;; `for-each` call is declined and stays a call of the library function.
+(defun for-each-macro :private (ctx: ExpandCtx items: (Vec Stx) pos: Pos)
+    -> (Result Outcome ExpandError)
+  (if (= (count items) 3)
+      (match (literal-range (nth items 1))
+        (nil (Ok (Declined (list-form items pos))))
+        ((some bounds)
+         (match (literal-fn (nth items 2))
+           (nil (Ok (Declined (list-form items pos))))
+           ((some fun) (Ok (Rewritten (for-each-loop ctx bounds fun pos)))))))
+      (Ok (Declined (list-form items pos)))))
+
+;; The loop of a `for-each` over `a b` with the parameter and body `fun`;
+;; `s` is handed out before `m`.
+(defun for-each-loop :private (ctx: ExpandCtx bounds: (Vec Stx) fun: (Vec Stx) pos: Pos) -> Stx
+  (let ((start (ctx-gensym ctx "s" pos))
+        (m (ctx-gensym ctx "m" pos)))
+    (counting-loop (Counting (nth fun 0)
+                             [(list-form [start (nth bounds 0)] pos)
+                              (list-form [m (nth bounds 1)] pos)]
+                             start
+                             m)
+                   (tail-from fun 1)
+                   pos)))
+
+;; mod.rs: the table
+;; The call `items` of the macro `name`, at pos. (the `match` of `expand`)
+(defun expand-call :private (ctx: ExpandCtx name: str items: (Vec Stx) pos: Pos)
+    -> (Result Outcome ExpandError)
+  (match name
+    ("when" (rewritten (when-macro items pos false)))
+    ("unless" (rewritten (when-macro items pos true)))
+    ("cond" (rewritten (cond-macro items pos)))
+    ("and" (Ok (Rewritten (and-or items pos true))))
+    ("or" (Ok (Rewritten (and-or items pos false))))
+    ("if-let" (rewritten (if-let-macro items pos)))
+    ("when-let" (rewritten (when-let-macro items pos)))
+    ("list" (Ok (Rewritten (list-macro items pos))))
+    ("plet" (rewritten (plet-macro ctx items pos)))
+    ("->" (rewritten (thread items pos true)))
+    ("->>" (rewritten (thread items pos false)))
+    ("doto" (rewritten (doto-macro ctx items pos)))
+    ("assert" (rewritten (assert-macro items pos)))
+    ("dbg" (rewritten (dbg-macro ctx items pos)))
+    ("while" (rewritten (while-macro items pos)))
+    ("dotimes" (rewritten (dotimes-macro ctx items pos)))
+    ("for-each" (for-each-macro ctx items pos))
+    ("range" (range-macro items pos))
+    (_ (rewritten (dv/derive ctx items pos)))))
+
+;; Expands one call of a prelude macro: the form must be a list whose head
+;; is one of prelude-macros (a form that is not a list is declined as it
+;; is). The context gives the gensyms of `plet`, `doto`, `dbg`, `dotimes`
+;; and `for-each`, and `derive` its reflection. (mod.rs `expand`)
+(defun expand (ctx: ExpandCtx form: Stx) -> (Result Outcome ExpandError)
+  (match (. form kind)
+    ((SList items)
+     (expand-call ctx
+                  (if (> (count items) 0) (unwrap-or (sym-of (nth items 0)) "") "")
+                  items
+                  (. form pos)))
+    (_ (Ok (Declined form)))))

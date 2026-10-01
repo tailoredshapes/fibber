@@ -32,8 +32,13 @@
           (str-join (conj acc "\""))))))
 
 (defun indent-of :private (depth: i64) -> str
-  (loop ((i 0) (acc ""))
-    (if (< i depth) (recur (+ i 1) (str-concat acc "  ")) acc)))
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i depth) (recur (+ i 1) (conj acc "  ")) (str-join acc))))
+
+;; The indent of the children of a node at indent ind: one more level,
+;; built once per sequence and shared by its items.
+(defun deeper :private (ind: str) -> str
+  (str-concat ind "  "))
 
 ;; A float's text as `show` prints it at its width: an f32 form holds an
 ;; f32 value widened to f64, which shows as the f32 it is.
@@ -44,8 +49,11 @@
 
 ;; The lines of s and what it holds, at depth, after acc.
 (defun dump-stx (acc: (Vec str) s: Stx depth: i64) -> (Vec str)
-  (let ((ind (indent-of depth))
-        (at (span (. s pos))))
+  (dump-at acc s (indent-of depth)))
+
+;; dump-stx for a node whose indent is ind already.
+(defun dump-at :private (acc: (Vec str) s: Stx ind: str) -> (Vec str)
+  (let ((at (span (. s pos))))
     (match (. s kind)
       ((SSym name) (conj acc (str-join [ind "sym " (quote-text name) " " at])))
       ((SKw name) (conj acc (str-join [ind "kw " (quote-text name) " " at])))
@@ -57,15 +65,16 @@
        (conj acc (str-join [ind "chr U+" (hex-upper (zext i64 (char->i32 c)) 4) " " at])))
       ((SBool b) (conj acc (str-join [ind "bool " (show b) " " at])))
       ((SNil) (conj acc (str-join [ind "nil " at])))
-      ((SList items) (dump-seq acc "list" items depth ind at))
-      ((SVec items) (dump-seq acc "vec" items depth ind at))
-      ((SMap items) (dump-seq acc "map" items depth ind at)))))
+      ((SList items) (dump-seq acc "list" items ind at))
+      ((SVec items) (dump-seq acc "vec" items ind at))
+      ((SMap items) (dump-seq acc "map" items ind at)))))
 
-(defun dump-seq :private (acc: (Vec str) tag: str items: (Vec Stx) depth: i64 ind: str at: str) -> (Vec str)
-  (let ((n (count items)))
+(defun dump-seq :private (acc: (Vec str) tag: str items: (Vec Stx) ind: str at: str) -> (Vec str)
+  (let ((n (count items))
+        (inner (deeper ind)))
     (loop ((i 0) (a (conj acc (str-join [ind tag " " (show n) " " at]))))
       (if (< i n)
-          (recur (+ i 1) (dump-stx a (nth items i) (+ depth 1)))
+          (recur (+ i 1) (dump-at a (nth items i) inner))
           a))))
 
 (defun dump-forms (forms: (Vec Stx)) -> (Vec str)
@@ -100,3 +109,58 @@
       (if (< i n)
           (recur (+ i 1) (conj acc (printer/stx-show (nth forms i))))
           acc))))
+
+;; ---------------------------------------------- the expansion dump's lines
+;; (dump.rs `span_in`, `dump_form` with a home, `dump_forms_in`; spec/
+;; bootstrap.md §5.1). The same lines as the reader dump above, except that
+;; a position in another file than home, the file of the module being
+;; dumped, ends `@FILE`: a form that a macro or a definition of another
+;; file brings, and the built-in `<builtin>` and `<prelude>`. These
+;; functions are additive: the reader's dump does not change.
+
+;; "line:col start..end", and "@FILE" after it when p is not in home.
+(defun span-in (p: Pos home: str) -> str
+  (if (= (. p file) home)
+      (span p)
+      (str-join [(span p) "@" (. p file)])))
+
+;; The lines of s and what it holds, at depth, after acc: dump-stx with
+;; the positions as span-in prints them.
+(defun dump-stx-in (acc: (Vec str) s: Stx depth: i64 home: str) -> (Vec str)
+  (dump-in acc s (indent-of depth) home))
+
+;; dump-stx-in for a node whose indent is ind already.
+(defun dump-in :private (acc: (Vec str) s: Stx ind: str home: str) -> (Vec str)
+  (let ((at (span-in (. s pos) home)))
+    (match (. s kind)
+      ((SSym name) (conj acc (str-join [ind "sym " (quote-text name) " " at])))
+      ((SKw name) (conj acc (str-join [ind "kw " (quote-text name) " " at])))
+      ((SInt v w) (conj acc (str-join [ind "int " (show v) " " (int-width-suffix w) " " at])))
+      ((SFlt v w)
+       (conj acc (str-join [ind "flt " (flt-text v w) " " (flt-width-suffix w) " " at])))
+      ((SStr v) (conj acc (str-join [ind "str " (quote-text v) " " at])))
+      ((SChr c)
+       (conj acc (str-join [ind "chr U+" (hex-upper (zext i64 (char->i32 c)) 4) " " at])))
+      ((SBool b) (conj acc (str-join [ind "bool " (show b) " " at])))
+      ((SNil) (conj acc (str-join [ind "nil " at])))
+      ((SList items) (dump-seq-in acc "list" items ind at home))
+      ((SVec items) (dump-seq-in acc "vec" items ind at home))
+      ((SMap items) (dump-seq-in acc "map" items ind at home)))))
+
+(defun dump-seq-in :private (acc: (Vec str) tag: str items: (Vec Stx) ind: str at: str home: str) -> (Vec str)
+  (let ((n (count items))
+        (inner (deeper ind)))
+    (loop ((i 0) (a (conj acc (str-join [ind tag " " (show n) " " at]))))
+      (if (< i n)
+          (recur (+ i 1) (dump-in a (nth items i) inner home))
+          a))))
+
+;; The lines of a sequence of top-level forms of the file home, after acc
+;; (the forms a module's expansion made: `dump_forms_in` with the lines
+;; appended to acc instead of returned as text).
+(defun dump-forms-in (acc: (Vec str) forms: (Vec Stx) home: str) -> (Vec str)
+  (let ((n (count forms)))
+    (loop ((i 0) (a acc))
+      (if (< i n)
+          (recur (+ i 1) (dump-stx-in a (nth forms i) 0 home))
+          a))))

@@ -1,0 +1,143 @@
+;; compiler/expand/prelude/forms.fib: `list`, `plet` (§3.12), `->`, `->>`,
+;; `doto` (call rewriting) and `assert`, `dbg` (over `if` and `trap`), as
+;; crates/fibref/src/expand/prelude/forms.rs (137 lines of Rust). The
+;; functions are those of the Rust, named as expand.prelude says
+;; (`list-macro`, `plet-macro`, `thread`, `doto-macro`, `assert-macro`,
+;; `dbg-macro`); each takes the call's items and position (and the context,
+;; for the gensyms) and returns the expansion.
+(ns expand.prelude.forms
+  (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build
+        expand.prelude.parts)
+  (:require [expand.core :as core] [syntax.print :as pr]))
+
+;; `(list a b)` ==> `(cons a (cons b empty))`; `(list)` ==> `empty`.
+(defun list-macro (items: (Vec Stx) pos: Pos) -> Stx
+  (loop ((i (- (count items) 1)) (acc (sym "empty" pos)))
+    (if (>= i 1)
+        (recur (- i 1) (call "cons" [(nth items i) acc] pos))
+        acc)))
+
+;; A `plet` binding `(s e)` or `(s: T e)` (§1.5) as its parts, the name
+;; forms and then the expression.
+(defun plet-shape :private (pair: Stx) -> (Option (Vec Stx))
+  (match (items-of pair)
+    (nil nil)
+    ((some xs)
+     (cond ((and (= (count xs) 2) (some? (sym-of (nth xs 0)))) (some xs))
+           ((and (= (count xs) 3) (core/annotated-name (nth xs 0))) (some xs))
+           (true nil)))))
+
+;; `s` without the colons that end it: the gensym's prefix.
+(defun trim-colons :private (s: str) -> str
+  (loop ((n (str-len s)))
+    (if (and (> n 0) (= (str-slice s (- n 1) n) ":"))
+        (recur (- n 1))
+        (str-slice s 0 n))))
+
+;; One `plet` binding as the pair of bindings it makes: the spawn of its
+;; thunk to a fresh `t`, and the join of `t` to the name.
+(defun plet-pair :private (ctx: ExpandCtx pair: Stx pos: Pos) -> (Result (Vec Stx) ExpandError)
+  (match (plet-shape pair)
+    (nil (Err (malformed "plet" "a binding is (sym expr) or (sym: type expr)" (. pair pos))))
+    ((some xs)
+     (let ((e (nth xs (- (count xs) 1)))
+           (base (trim-colons (unwrap-or (sym-of (nth xs 0)) "t")))
+           (t (ctx-gensym ctx base pos))
+           (thunk (list-form [(sym "fn" pos) (unit pos) e] pos))
+           (join (call "join" [t] pos)))
+       (Ok [(list-form [t (call "spawn" [thunk] pos)] pos)
+            (list-form (conj (head-of xs (- (count xs) 1)) join) pos)])))))
+
+;; `(plet ((s1 e1) ...) body)` ==> `(let ((t1 (spawn (fn () e1))) ...)
+;; (let ((s1 (join t1)) ...) body))`, `t1 ...` gensyms (§3.12).
+(defun plet-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (match (check-arity "plet" items 2 nil pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (items-of (nth items 1))
+       ((some pairs)
+        (if (> (count pairs) 0)
+            (plet-build ctx pairs (tail-from items 2) pos)
+            (Err (malformed "plet" "expected ((sym expr)+)" (. (nth items 1) pos)))))
+       (nil (Err (malformed "plet" "expected ((sym expr)+)" (. (nth items 1) pos))))))))
+
+;; The two nested `let`s of a `plet` of these bindings and body.
+(defun plet-build :private (ctx: ExpandCtx pairs: (Vec Stx) body: (Vec Stx) pos: Pos)
+    -> (Result Stx ExpandError)
+  (loop ((i 0) (spawns (vec-empty)) (joins (vec-empty)))
+    (if (< i (count pairs))
+        (match (plet-pair ctx (nth pairs i) pos)
+          ((Err e) (Err e))
+          ((Ok made) (recur (+ i 1) (conj spawns (nth made 0)) (conj joins (nth made 1)))))
+        (let ((inner (concat-forms [(sym "let" pos) (list-form joins pos)] body)))
+          (Ok (list-form [(sym "let" pos) (list-form spawns pos) (list-form inner pos)] pos))))))
+
+;; Puts `x` into the step: first argument when `first`, else last. A
+;; symbol step `f` is the call `(f x)`.
+(defun thread-step :private (step: Stx x: Stx first: bool) -> (Result Stx ExpandError)
+  (match (. step kind)
+    ((SSym _) (Ok (list-form [step x] (. step pos))))
+    ((SList items)
+     (if (> (count items) 0)
+         (Ok (Stx (SList (if first
+                             (concat-forms [(nth items 0) x] (tail-from items 1))
+                             (conj items x)))
+                  (. step pos)))
+         (Err (ExpandError ThreadStep (. step pos)))))
+    (_ (Err (ExpandError ThreadStep (. step pos))))))
+
+;; `(-> x (f a) g)` ==> `(g (f x a))`; `->>` puts `x` last instead.
+(defun thread (items: (Vec Stx) pos: Pos first: bool) -> (Result Stx ExpandError)
+  (match (check-arity (if first "->" "->>") items 1 nil pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (loop ((i 2) (acc (nth items 1)))
+       (if (< i (count items))
+           (match (thread-step (nth items i) acc first)
+             ((Err e) (Err e))
+             ((Ok next) (recur (+ i 1) next)))
+           (Ok acc))))))
+
+;; `(doto x (f a) g)` ==> `(let ((t x)) (f t a) (g t) t)`, `t` a gensym.
+(defun doto-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (match (check-arity "doto" items 1 nil pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (let ((t (ctx-gensym ctx "doto" pos))
+           (binding (list-form [(list-form [t (nth items 1)] pos)] pos)))
+       (loop ((i 2) (out [(sym "let" pos) binding]))
+         (if (< i (count items))
+             (match (thread-step (nth items i) t true)
+               ((Err e) (Err e))
+               ((Ok step) (recur (+ i 1) (conj out step))))
+             (Ok (list-form (conj out t) pos))))))))
+
+;; `(assert c)` / `(assert c msg)` ==> `(if c () (trap msg))`, the default
+;; message naming the call's position and the test.
+(defun assert-macro (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (match (check-arity "assert" items 1 (some 2) pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (let ((test (nth items 1))
+           (message (if (> (count items) 2)
+                        (nth items 2)
+                        (string (str-join ["assert failed at " (pos-display pos) ": "
+                                           (pr/stx-show (nth items 1))])
+                                pos))))
+       (Ok (call "if" [test (unit pos) (call "trap" [message] pos)] pos))))))
+
+;; `(dbg e)` ==> `(let ((t e)) (eprintln (str-concat "dbg POS: e = " (show t))) t)`:
+;; evaluates `e` once, prints it with `Show` to standard error with the
+;; call's position and the form as written, and returns it (§4.4).
+(defun dbg-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (match (check-arity "dbg" items 1 (some 1) pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (let ((e (nth items 1))
+           (t (ctx-gensym ctx "dbg" pos))
+           (label (string (str-join ["dbg " (pos-display pos) ": " (pr/stx-show (nth items 1)) " = "])
+                          pos))
+           (text (call "str-concat" [label (call "show" [t] pos)] pos))
+           (binding (list-form [(list-form [t e] pos)] pos)))
+       (Ok (call "let" [binding (call "eprintln" [text] pos) t] pos))))))
+

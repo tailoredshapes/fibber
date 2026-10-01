@@ -1,0 +1,257 @@
+;; compiler/expand/dumpctx.fib: the context lines of the expansion dump
+;; (`--context`, spec/bootstrap.md §5.2), as
+;; crates/fibref/src/expand_dump/context.rs (203 lines of Rust): what an
+;; `ExpandCtx` remembers after a module is expanded, in an order that does
+;; not depend on the maps it is kept in (names sorted as byte strings), so
+;; that the context of this expander can be compared with the Rust one's
+;; line by line. The prelude's own types are most of any context, so a
+;; program's dump lists only the macros, structs and enums that are not as
+;; they were when the prelude had been expanded (a `Baseline`): new ones
+;; and redefined ones. The dump of a prelude lists them all.
+;;
+;; Decided here, where the Rust is silent or the language differs:
+;; - Rust appends to an `&mut String`; `dump-context` takes the lines so
+;;   far and returns them with its own appended, each line without its
+;;   newline, as syntax.dump's functions do. A line never holds a newline:
+;;   every text in it is quoted.
+;; - `Baseline` is a Map from the entry's kind and name, `"macro KEY"`,
+;;   `"struct NAME"` or `"enum NAME"` (Rust's key is the pair), to the
+;;   entry's text as it prints with no home file: the lines joined by a
+;;   newline, so that every position names its file and the text does not
+;;   depend on which module is being dumped.
+;; - The context's counters, gensym count, scope and re-exports are read
+;;   through the accessors of expand.ctx (`ctx-counters`,
+;;   `ctx-gensym-count`, `ctx-scope`, and `ctx-reexports`, which gives
+;;   Rust's `reexports()`: sorted by module), not from the fields of
+;;   `ExpandCtx`.
+;; - Rust's `Entry<'a>` is `CtxEntry`, whose variants are named for what
+;;   they hold (`Entry` is a prelude struct, the `Map`'s). A Map is walked
+;;   with the prelude's `for-each` for a scope's aliases, which are then
+;;   sorted by alias; every other order comes from the accessors of
+;;   expand.ctx.
+;; - Module dependency for the port: expand.dumpctx uses syntax.dump
+;;   (`span-in`, `dump-stx-in`, `quote-text`), util.sort (for what the
+;;   accessors do not sort, such as a scope's aliases), expand.types and
+;;   expand.ctx (the `ctx-*-by-key`/`-by-name` and `-type-names`
+;;   accessors, which return sorted vectors); expand.dump uses it.
+(ns expand.dumpctx
+  (:require [syntax.dump :as dump] [util.sort :as sort])
+  (:use syntax.pos syntax.form util.result expand.types expand.ctx))
+
+;; What the context held when the entries it lists are compared with: the
+;; text of each macro, struct and enum by what it is and its name, as
+;; described above.
+(defstruct Baseline (texts: (Map str str)))
+
+;; No entry: everything the context holds is listed. (`Baseline::empty`)
+(defun baseline-empty () -> Baseline
+  (Baseline (map-empty)))
+
+;; ---------------------------------------------------------- the entries
+
+;; One macro, struct or enum of the context.
+(defenum CtxEntry
+  (CtxMacro m: MacroDef)
+  (CtxStruct s: StructInfo)
+  (CtxEnum e: EnumInfo))
+
+(defun entry-kind :private (e: CtxEntry) -> str
+  (match e
+    ((CtxMacro _) "macro")
+    ((CtxStruct _) "struct")
+    ((CtxEnum _) "enum")))
+
+;; The name it is kept under: a macro's `ns/name`.
+(defun entry-name :private (e: CtxEntry) -> str
+  (match e
+    ((CtxMacro m) (. m key))
+    ((CtxStruct s) (. s name))
+    ((CtxEnum x) (. x name))))
+
+(defun vec-extend :private (acc: (Vec t) more: (Vec t)) -> (Vec t)
+  (loop ((i 0) (a acc))
+    (if (< i (count more)) (recur (+ i 1) (conj a (nth more i))) a)))
+
+;; The macros by key, then the structs by name, then the enums by name.
+(defun entries :private (ctx: ExpandCtx) -> (Vec CtxEntry)
+  (let ((ms (ctx-macros-by-key ctx))
+        (ss (ctx-structs-by-name ctx))
+        (es (ctx-enums-by-name ctx)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i (+ (count ms) (+ (count ss) (count es))))
+          (recur (+ i 1)
+                 (conj acc (if (< i (count ms))
+                               (CtxMacro (nth ms i))
+                               (if (< i (+ (count ms) (count ss)))
+                                   (CtxStruct (nth ss (- i (count ms))))
+                                   (CtxEnum (nth es (- i (+ (count ms) (count ss)))))))))
+          acc))))
+
+;; ---------------------------------------------------------- the lines
+
+;; The forms at depth, as the expansion dump prints them.
+(defun forms-at :private (acc: (Vec str) forms: (Vec Stx) depth: i64 home: str) -> (Vec str)
+  (loop ((i 0) (a acc))
+    (if (< i (count forms))
+        (recur (+ i 1) (dump/dump-stx-in a (nth forms i) depth home))
+        a)))
+
+;; A word list as ` "a" "b"`: each quoted, a space before each.
+(defun quoted-words :private (words: (Vec str)) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i (count words))
+        (recur (+ i 1) (str-join [acc " " (dump/quote-text (nth words i))]))
+        acc)))
+
+;; One macro: its key, whether it is private, its position, its
+;; parameters (and rest parameter) and its expanded body.
+(defun macro-lines :private (acc: (Vec str) m: MacroDef home: str) -> (Vec str)
+  (let ((a (conj acc (str-join ["macro " (dump/quote-text (. m key)) (if (. m private) " private" " public")])))
+        (a2 (conj a (str-join ["  at " (dump/span-in (. m pos) home)])))
+        (a3 (conj a2 (str-concat "  params" (quoted-words (. m params)))))
+        (a4 (conj a3 (match (. m rest)
+                       (nil "  rest -")
+                       ((some r) (str-concat "  rest " (dump/quote-text r))))))
+        (a5 (conj a4 (str-concat "  body " (show (count (. m body)))))))
+    (forms-at a5 (. m body) 2 home)))
+
+;; One struct: its parameters, then each field as the name form and the
+;; type form.
+(defun struct-lines :private (acc: (Vec str) s: StructInfo home: str) -> (Vec str)
+  (let ((a (conj acc (str-concat "struct " (dump/quote-text (. s name)))))
+        (a2 (conj a (str-concat "  params " (show (count (. s params))))))
+        (a3 (forms-at a2 (. s params) 2 home))
+        (fields (. s fields)))
+    (loop ((i 0) (b (conj a3 (str-concat "  fields " (show (count fields))))))
+      (if (< i (count fields))
+          (recur (+ i 1)
+                 (dump/dump-stx-in (dump/dump-stx-in b (. (nth fields i) name) 2 home)
+                                   (. (nth fields i) ty) 2 home))
+          b))))
+
+;; One variant's lines: its name and field count, then each field (the
+;; name when written, `-` when not) and the type form below it.
+(defun variant-lines :private (acc: (Vec str) v: VariantInfo home: str) -> (Vec str)
+  (let ((fields (. v fields)))
+    (loop ((i 0) (b (conj acc (str-join ["    variant " (dump/quote-text (. v name)) " " (show (count fields))]))))
+      (if (< i (count fields))
+          (let ((f (nth fields i))
+                (line (match (. f name)
+                        (nil "      field -")
+                        ((some n) (str-concat "      field " (dump/quote-text n))))))
+            (recur (+ i 1) (dump/dump-stx-in (conj b line) (. f ty) 4 home)))
+          b))))
+
+;; One enum: its parameters, then each variant.
+(defun enum-lines :private (acc: (Vec str) e: EnumInfo home: str) -> (Vec str)
+  (let ((a (conj acc (str-concat "enum " (dump/quote-text (. e name)))))
+        (a2 (conj a (str-concat "  params " (show (count (. e params))))))
+        (a3 (forms-at a2 (. e params) 2 home))
+        (vs (. e variants)))
+    (loop ((i 0) (b (conj a3 (str-concat "  variants " (show (count vs))))))
+      (if (< i (count vs))
+          (recur (+ i 1) (variant-lines b (nth vs i) home))
+          b))))
+
+;; The lines of an entry, with positions in files other than home ending
+;; `@FILE`, after acc.
+(defun entry-lines :private (acc: (Vec str) e: CtxEntry home: str) -> (Vec str)
+  (match e
+    ((CtxMacro m) (macro-lines acc m home))
+    ((CtxStruct s) (struct-lines acc s home))
+    ((CtxEnum x) (enum-lines acc x home))))
+
+;; An entry's text as the baseline keeps it: no home file, the lines
+;; joined by a newline.
+(defun entry-text :private (e: CtxEntry) -> str
+  (let ((lines (entry-lines (vec-empty) e "")))
+    (loop ((i 0) (acc ""))
+      (if (< i (count lines))
+          (recur (+ i 1) (if (= i 0) (nth lines i) (str-join [acc "\n" (nth lines i)])))
+          acc))))
+
+(defun baseline-key :private (e: CtxEntry) -> str
+  (str-join [(entry-kind e) " " (entry-name e)]))
+
+;; The entries of ctx as they are. (`Baseline::of`)
+(defun baseline-of (ctx: ExpandCtx) -> Baseline
+  (let ((all (entries ctx)))
+    (loop ((i 0) (m (map-empty)))
+      (if (< i (count all))
+          (recur (+ i 1) (assoc m (baseline-key (nth all i)) (entry-text (nth all i))))
+          (Baseline m)))))
+
+;; Whether the baseline holds this entry exactly as it is.
+(defun holds :private (b: Baseline e: CtxEntry) -> bool
+  (match (get (. b texts) (baseline-key e))
+    (nil false)
+    ((some t) (= t (entry-text e)))))
+
+;; ----------------------------------------------------------- the scope
+
+(defstruct AliasPair :private (alias: str ns: str))
+
+(defun aliases-sorted :private (aliases: (Map str str)) -> (Vec AliasPair)
+  (let ((acc (cell (vec-empty))))
+    (do (for-each aliases (fn (e: (Entry str str)) (set! acc (conj @acc (AliasPair (. e key) (. e val))))))
+        (sort/sort-by @acc (fn (x: AliasPair y: AliasPair) (< (. x alias) (. y alias)))))))
+
+;; `  use "M"` for each module the scope uses, in the order written.
+(defun use-lines :private (acc: (Vec str) uses: (Vec str)) -> (Vec str)
+  (loop ((i 0) (a acc))
+    (if (< i (count uses))
+        (recur (+ i 1) (conj a (str-concat "  use " (dump/quote-text (nth uses i)))))
+        a)))
+
+;; `  alias "A" "M"` for each alias, sorted by alias.
+(defun alias-lines :private (acc: (Vec str) aliases: (Vec AliasPair)) -> (Vec str)
+  (loop ((i 0) (a acc))
+    (if (< i (count aliases))
+        (recur (+ i 1) (conj a (str-join ["  alias " (dump/quote-text (. (nth aliases i) alias))
+                                          " " (dump/quote-text (. (nth aliases i) ns))])))
+        a)))
+
+;; `reexport "M" "N" ..` for each module that re-exports, by module.
+(defun reexport-lines :private (acc: (Vec str) res: (Vec Reexport)) -> (Vec str)
+  (loop ((i 0) (a acc))
+    (if (< i (count res))
+        (recur (+ i 1) (conj a (str-join ["reexport " (dump/quote-text (. (nth res i) ns))
+                                          (quoted-words (. (nth res i) modules))])))
+        a)))
+
+;; The module being expanded as macro lookup sees it: its name, then the
+;; modules it uses in the order written, then its aliases by alias; then
+;; the modules each module re-exports, by module.
+(defun scope-lines :private (acc: (Vec str) ctx: ExpandCtx) -> (Vec str)
+  (let ((scope (ctx-scope ctx)))
+    (reexport-lines
+      (alias-lines
+        (use-lines (conj acc (str-concat "scope " (dump/quote-text (. scope ns)))) (. scope uses))
+        (aliases-sorted (. scope aliases)))
+      (ctx-reexports ctx))))
+
+;; `private "T"` or `hidden "T"` for each name.
+(defun type-name-lines :private (acc: (Vec str) tag: str names: (Vec str)) -> (Vec str)
+  (loop ((i 0) (a acc))
+    (if (< i (count names))
+        (recur (+ i 1) (conj a (str-join [tag " " (dump/quote-text (nth names i))])))
+        a)))
+
+;; Appends the context of ctx, the module ns of file home just expanded
+;; (and not yet ended), to acc: `-- context NS`, the gensyms, the counters
+;; and the scope, the private and hidden type names, and the macros,
+;; structs and enums that are not in baseline. Positions in other files
+;; than home end `@FILE`, as in the dump of the forms. (`dump_context`)
+(defun dump-context (acc: (Vec str) ctx: ExpandCtx ns: str home: str baseline: Baseline) -> (Vec str)
+  (let ((c (ctx-counters ctx))
+        (a (conj acc (str-concat "-- context " ns)))
+        (a2 (conj a (str-concat "gensyms " (show (ctx-gensym-count ctx)))))
+        (a3 (conj a2 (str-join ["counters steps " (show (. c steps)) " forms " (show (. c forms))])))
+        (a4 (scope-lines a3 ctx))
+        (a5 (type-name-lines a4 "private" (ctx-private-type-names ctx)))
+        (a6 (type-name-lines a5 "hidden" (ctx-hidden-type-names ctx)))
+        (all (entries ctx)))
+    (loop ((i 0) (b a6))
+      (if (< i (count all))
+          (recur (+ i 1) (if (holds baseline (nth all i)) b (entry-lines b (nth all i) home)))
+          b))))

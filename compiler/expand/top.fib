@@ -1,0 +1,367 @@
+;; compiler/expand/top.fib: the top-level forms of a module (syntax §2),
+;; as crates/fibref/src/expand/top.rs (223 lines) and `parse_params` of
+;; runner.rs (35 lines): definitions are walked and registered in order, a
+;; top-level `do` is spliced (with an explicit stack of pending forms, so
+;; nesting them costs no native stack), `defmacro` is expanded and
+;; recorded in the context and stays in the program, a `:private` marker
+;; is taken off while a definition is parsed and registered and put back
+;; for name resolution, and anything else is ExpressionAtTopLevel.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `out: &mut Vec<Form>` is a vector passed in and returned:
+;;   `(top-form ex form out)` is the `(Result (Vec Stx) ExpandError)` of
+;;   `out` with what the form stands for appended (the Rust test "is out
+;;   empty" is `(= (count out) 0)` of what is passed in). The caller
+;;   starts with `(vec-empty)` and threads the result through.
+;; - `parse_params` returns a tuple `(Vec<String>, Option<String>)`, which
+;;   fibber has not: it is the struct `Params`.
+;; - the Rust `pending` stack of `top_form` and the stack of `check_depth`
+;;   are chains of frames, `Pending` and `Visits` (a Vec has no pop in
+;;   the library): the first form of a spliced `do` is on top, and
+;;   `check_depth` visits the last item of a form before its first, as
+;;   the Rust stack does, so that the position it reports is the Rust one.
+;; - `skip` of an `Option`-returning `get(1)` is a helper per use: the
+;;   tests are `is_none_or(|n| n.as_sym().is_none())` and the like.
+(ns expand.top
+  (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx
+        expand.build expand.heads expand.private expand.core expand.expr expand.walk))
+
+;; The parameters of a `defmacro`: the fixed ones in order, and the one
+;; after `...` if any. (the tuple parse_params returns)
+(defstruct Params (params: (Vec str) rest: (Option str)))
+
+;; Forms still to expand, the next first (Rust's `pending`).
+(defenum Pending
+  Drained
+  (Next form: Stx rest: Pending))
+
+;; Forms still to measure with their depth, the next first (Rust's
+;; `stack` in `check_depth`).
+(defenum Visits
+  NoMore
+  (Visit form: Stx depth: i64 rest: Visits))
+
+;; ---------------------------------------------------- small helpers
+
+;; The items of a list form; none for any other.
+(defun items-of :private (form: Stx) -> (Vec Stx)
+  (match (. form kind)
+    ((SList items) items)
+    (_ (vec-empty))))
+
+;; The name of the head symbol of a form, or "" (`head_name(..).unwrap_or("")`).
+(defun head-or-empty :private (form: Stx) -> str
+  (unwrap-or (head-name form) ""))
+
+;; The symbol of item i of items, if there is one.
+(defun sym-at :private (items: (Vec Stx) i: i64) -> (Option str)
+  (if (< i (count items))
+      (match (. (nth items i) kind)
+        ((SSym s) (some s))
+        (_ nil))
+      nil))
+
+;; Whether the string ends in a colon. (`ends_with(':')`; the last byte
+;; is read as a byte, since a slice may not split a character and a
+;; continuation byte is never 58.)
+(defun ends-with-colon? :private (s: str) -> bool
+  (let ((bs (str-bytes s)))
+    (and (> (array-len bs) 0)
+         (= (array-get bs (- (array-len bs) 1)) 58i8))))
+
+;; `n` Keep roles after the ones in first.
+(defun keeps :private (first: (Vec Role) n: i64) -> (Vec Role)
+  (loop ((acc first))
+    (if (< (count acc) n) (recur (conj acc Keep)) acc)))
+
+;; ----------------------------------------------------- depth check
+
+;; Fails if a form that is kept without walking nests deeper than the
+;; limit (only a runner could build one), so later passes over it stay
+;; bounded too. (check_depth)
+(defun check-depth :private (ex: Expander form: Stx) -> (Result unit ExpandError)
+  (let ((limit (. (ctx-limits (. ex ctx)) max-depth)))
+    (loop ((todo (Visit form 1 NoMore)))
+      (match todo
+        ((NoMore) (Ok ()))
+        ((Visit f d rest)
+         (if (> d limit)
+             (Err (ExpandError (TooDeep limit) (. f pos)))
+             (recur (visit-children f d rest))))))))
+
+;; The children of f one level deeper, the last on top.
+(defun visit-children :private (f: Stx d: i64 rest: Visits) -> Visits
+  (match (. f kind)
+    ((SList items) (visit-items items d rest))
+    ((SVec items) (visit-items items d rest))
+    ((SMap items) (visit-items items d rest))
+    (_ rest)))
+
+(defun visit-items :private (items: (Vec Stx) d: i64 rest: Visits) -> Visits
+  (let ((n (count items)))
+    (loop ((i 0) (acc rest))
+      (if (< i n)
+          (recur (+ i 1) (Visit (nth items i) (+ d 1) acc))
+          acc))))
+
+;; ------------------------------------------------------ the plans
+
+;; `(defun name (param*) where? ret? body)` (§3.1).
+(defun defun-plan :private (form: Stx) -> (Result Role ExpandError)
+  (let ((items (items-of form)))
+    (if (< (count items) 2)
+        (Err (malformed "defun" "expected a name" (. form pos)))
+        (match (. (nth items 1) kind)
+          ((SSym _)
+           (match (body-start "defun" items 2 (. form pos))
+             ((Err e) (Err e))
+             ((Ok start) (Ok (role-after start Expr)))))
+          (_ (Err (malformed "defun" "expected a name" (. form pos))))))))
+
+;; `(def name expr)` or `(def name: type expr)` (§3.19).
+(defun def-plan :private (form: Stx) -> (Result Role ExpandError)
+  (let ((items (items-of form))
+        (annotated (match (sym-at (items-of form) 1)
+                     ((some s) (ends-with-colon? s))
+                     (nil false))))
+    (let ((len (if annotated 4 3)))
+      (if (!= (count items) len)
+          (Err (malformed "def" "expected (def name expr) or (def name: type expr)" (. form pos)))
+          (Ok (role-after (- len 1) Expr))))))
+
+;; The role of a protocol method: a default body is expanded (types
+;; §4.1), the rest kept.
+(defun method-role :private (m: Stx) -> Role
+  (match (. m kind)
+    ((SList parts) (if (> (count parts) 4) (role-after 4 Expr) Keep))
+    (_ Keep)))
+
+;; `(defprotocol head (:requires (..))? method+)`, `method ::= (mname
+;; (self ..) -> type body*)` (§3.10). (protocol_plan)
+(defun protocol-plan :private (form: Stx) -> (Result Role ExpandError)
+  (let ((items (items-of form))
+        (start (if (and (> (count (items-of form)) 2) (requires-kw? (nth (items-of form) 2))) 4 2)))
+    (if (<= (count items) start)
+        (Err (malformed "defprotocol" "expected a name and methods" (. form pos)))
+        (Ok (role-items (loop ((i start) (roles (keeps (vec-empty) start)))
+                          (if (< i (count items))
+                              (recur (+ i 1) (conj roles (method-role (nth items i))))
+                              roles))
+                        Keep)))))
+
+(defun requires-kw? :private (f: Stx) -> bool
+  (match (. f kind)
+    ((SKw k) (= k "requires"))
+    (_ false)))
+
+;; The role of the method-impl m of an impl: its body is expanded.
+(defun method-impl-role :private (m: Stx) -> (Result Role ExpandError)
+  (match (. m kind)
+    ((SList parts)
+     (match (body-start "impl" parts 1 (. m pos))
+       ((Err e) (Err e))
+       ((Ok body) (Ok (role-after body Expr)))))
+    (_ (Err (malformed "impl" "a method is (name (self param*) body)" (. m pos))))))
+
+;; The roles of the methods of items from start on, after start Keeps.
+(defun method-impl-roles :private (items: (Vec Stx) start: i64) -> (Result Role ExpandError)
+  (loop ((i start) (roles (keeps (vec-empty) start)))
+    (if (< i (count items))
+        (match (method-impl-role (nth items i))
+          ((Err e) (Err e))
+          ((Ok r) (recur (+ i 1) (conj roles r))))
+        (Ok (role-items roles Keep)))))
+
+;; `(impl P type where? method-impl*)`, `method-impl ::= (mname (self
+;; sym*) ret? body)` (§3.10); a method with a default may be omitted, so
+;; an `impl` may have none (types §4.1). (impl_plan)
+(defun impl-plan :private (form: Stx) -> (Result Role ExpandError)
+  (let ((items (items-of form)))
+    (let ((start (skip-annotations items 3)))
+      (if (or (< (count items) 3) (> start (count items)))
+          (Err (malformed "impl" "expected a protocol, a type and methods" (. form pos)))
+          (method-impl-roles items start)))))
+
+;; ---------------------------------------------------------- defmacro
+
+;; Parses the parameter list of a `defmacro`: a list of symbols, with at
+;; most one `...` that must be followed by exactly one last symbol that is
+;; not `...`; Malformed "defmacro" otherwise, at the list or the item the
+;; Rust names. (runner.rs parse_params)
+(defun parse-params (form: Stx) -> (Result Params ExpandError)
+  (match (. form kind)
+    ((SList items) (parse-param-items items))
+    (_ (Err (malformed "defmacro" "parameters must be a list" (. form pos))))))
+
+(defun parse-param-items :private (items: (Vec Stx)) -> (Result Params ExpandError)
+  (let ((n (count items)))
+    (loop ((i 0) (params (vec-empty)))
+      (if (>= i n)
+          (Ok (Params params nil))
+          (match (. (nth items i) kind)
+            ((SSym name)
+             (if (!= name "...")
+                 (recur (+ i 1) (conj params name))
+                 (parse-rest items i params)))
+            (_ (Err (malformed "defmacro" "a parameter must be a symbol" (. (nth items i) pos)))))))))
+
+;; The `...` at items[i]: it must be followed by one last symbol that is
+;; not `...`.
+(defun parse-rest :private (items: (Vec Stx) i: i64 params: (Vec str)) -> (Result Params ExpandError)
+  (match (sym-at items (+ i 1))
+    ((some r)
+     (if (and (= (+ i 2) (count items)) (!= r "..."))
+         (Ok (Params params (some r)))
+         (Err (malformed "defmacro" "... must be followed by one last symbol" (. (nth items i) pos)))))
+    (nil (Err (malformed "defmacro" "... must be followed by one last symbol" (. (nth items i) pos))))))
+
+;; The checks of a defmacro form before its body is expanded: its name,
+;; or the error.
+(defun macro-name :private (form: Stx) -> (Result str ExpandError)
+  (let ((items (items-of form)))
+    (if (< (count items) 4)
+        (Err (malformed "defmacro" "expected (defmacro name (param*) body)" (. form pos)))
+        (match (. (nth items 1) kind)
+          ((SSym name)
+           (if (or (is-core name) (is-quasi-form name) (= name "nil"))
+               (Err (ExpandError (MacroNamesCoreForm name) (. (nth items 1) pos)))
+               (Ok name)))
+          (_ (Err (malformed "defmacro" "the name must be a symbol" (. (nth items 1) pos))))))))
+
+;; The items of a form from index from on.
+(defun items-from :private (form: Stx from: i64) -> (Vec Stx)
+  (let ((items (items-of form)))
+    (loop ((i from) (acc (vec-empty)))
+      (if (< i (count items)) (recur (+ i 1) (conj acc (nth items i))) acc))))
+
+;; Records the macro the walked defmacro form defines.
+(defun record-macro :private (ex: Expander name: str params: Params form: Stx) -> unit
+  (ctx-define-macro (. ex ctx)
+                    (MacroDef name "" "" false (. params params) (. params rest)
+                              (items-from form 3) (. form pos))))
+
+;; `(defmacro name (param*) body)` (§3.16): expands the body, records the
+;; macro, and keeps the (expanded) definition in the program. (the fn `defmacro`)
+(defun macro-definition :private (ex: Expander form: Stx) -> (Result Stx ExpandError)
+  (match (macro-name form)
+    ((Err e) (Err e))
+    ((Ok name)
+     (match (parse-params (nth (items-of form) 2))
+       ((Err e) (Err e))
+       ((Ok params)
+        (match (walk ex form (role-after 3 Expr))
+          ((Err e) (Err e))
+          ((Ok walked) (do (record-macro ex name params walked) (Ok walked)))))))))
+
+;; ----------------------------------------------------- definitions
+
+;; Records the struct or enum of a form that is kept as it is: its depth
+;; is checked, then the parser of the context registers it.
+(defun register-type :private (ex: Expander form: Stx name: str) -> (Result Role ExpandError)
+  (match (check-depth ex form)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (if (= name "defstruct")
+                (ctx-add-struct (. ex ctx) form)
+                (ctx-add-enum (. ex ctx) form))
+       ((Err e) (Err e))
+       ((Ok _) (Ok Keep))))))
+
+;; Kept as it is, after its depth is checked (`ns`, `extern`).
+(defun keep-checked :private (ex: Expander form: Stx) -> (Result Role ExpandError)
+  (match (check-depth ex form)
+    ((Err e) (Err e))
+    ((Ok _) (Ok Keep))))
+
+;; The role of a top-level form that is not a `defmacro`, or its error.
+(defun definition-role :private (ex: Expander form: Stx name: str first: bool) -> (Result Role ExpandError)
+  (cond ((and (= name "ns") (not first)) (Err (ExpandError NsNotFirst (. form pos))))
+        ((or (= name "defstruct") (= name "defenum")) (register-type ex form name))
+        ((or (= name "ns") (= name "extern")) (keep-checked ex form))
+        ((= name "defprotocol") (protocol-plan form))
+        ((= name "defun") (defun-plan form))
+        ((= name "def") (def-plan form))
+        ((= name "impl") (impl-plan form))
+        ((is-definition name) (Ok Keep))
+        (else (Err (ExpandError ExpressionAtTopLevel (. form pos))))))
+
+;; One definition with its `:private` marker already off. (definition_of)
+(defun definition-of :private (ex: Expander form: Stx first: bool) -> (Result Stx ExpandError)
+  (let ((name (head-or-empty form)))
+    (if (= name "defmacro")
+        (macro-definition ex form)
+        (match (definition-role ex form name first)
+          ((Err e) (Err e))
+          ((Ok role) (walk ex form role))))))
+
+;; The name of the macro a walked defmacro form defines, if it has one.
+(defun defined-name :private (form: Stx) -> (Option str)
+  (sym-at (items-of form) 1))
+
+;; What is done to the registered definition once it is expanded: a
+;; private macro is made so in the context.
+(defun after-definition :private (ex: Expander kind: str marker: (Option Stx) out: Stx) -> unit
+  (if (and (= kind "defmacro") (some? marker))
+      (match (defined-name out)
+        ((some name) (ctx-make-macro-private (. ex ctx) name))
+        (nil ()))
+      ()))
+
+;; A `:private` struct or enum is noted before it is registered.
+(defun note-private :private (ex: Expander kind: str form: Stx) -> unit
+  (if (or (= kind "defstruct") (= kind "defenum"))
+      (match (type-name form)
+        ((some name) (ctx-add-private-type (. ex ctx) name))
+        (nil ()))
+      ()))
+
+;; A definition that carries the `:private` marker at index at: the
+;; marker is taken off while it is parsed and registered, and put back
+;; for name resolution.
+(defun marked-definition :private (ex: Expander form: Stx first: bool at: i64) -> (Result Stx ExpandError)
+  (let ((taken (take-marker form at)))
+    (let ((bare (. taken form))
+          (marker (. taken marker))
+          (kind (head-or-empty (. taken form))))
+      (do (note-private ex kind bare)
+          (match (definition-of ex bare first)
+            ((Err e) (Err e))
+            ((Ok out)
+             (do (after-definition ex kind marker out)
+                 (Ok (match marker
+                       ((some m) (put-marker out at m))
+                       (nil out))))))))))
+
+;; One top-level form that is not a `do`. (definition)
+(defun definition :private (ex: Expander form: Stx first: bool) -> (Result Stx ExpandError)
+  (match (marker-index form)
+    (nil (definition-of ex form first))
+    ((some at) (marked-definition ex form first at))))
+
+;; Expands one top-level form, appending what it stands for to out and
+;; returning the result: a spliced `do` stands for the forms of its items,
+;; each expanded in turn; `defstruct` and `defenum` are registered before
+;; the next form is expanded; `defmacro` is recorded. The errors are the
+;; Rust ones (ExpressionAtTopLevel, NsNotFirst, Malformed, MacroNamesCoreForm,
+;; the limits, ...) at the Rust positions. (top_form)
+(defun top-form (ex: Expander form: Stx out: (Vec Stx)) -> (Result (Vec Stx) ExpandError)
+  (loop ((pending (Next form Drained))
+         (out out))
+    (match pending
+      ((Drained) (Ok out))
+      ((Next f rest)
+       (match (expand-head ex f)
+         ((Err e) (Err e))
+         ((Ok g)
+          (if (= (head-or-empty g) "do")
+              (recur (splice (items-of g) rest) out)
+              (match (definition ex g (= (count out) 0))
+                ((Err e) (Err e))
+                ((Ok d) (recur rest (conj out d)))))))))))
+
+;; The items of a `do` after its head, pushed so that the first is next.
+(defun splice :private (items: (Vec Stx) rest: Pending) -> Pending
+  (loop ((i (- (count items) 1)) (acc rest))
+    (if (> i 0)
+        (recur (- i 1) (Next (nth items i) acc))
+        acc)))

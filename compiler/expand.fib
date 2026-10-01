@@ -1,0 +1,48 @@
+;; compiler/expand.fib: the expansion tool, as `fibref expand`
+;; (crates/fibref/src/main.rs `expand_files`, expand_dump/mod.rs
+;; `expand_files`): prints the expansion dump of each file named on the
+;; command line, each under a `== FILE` header (spec/bootstrap.md §5.1).
+;; The words before the files are the options of `expand.args`
+;; (`--prelude`, `--context`, `--no-runner`, `--max-steps N`,
+;; `--max-depth N`, `--max-forms N`; a lone `--` ends them). With no file,
+;; an option that is not one, or a limit that is not decimal digits it
+;; prints a usage line to stderr, nothing to stdout, and exits 2.
+;;
+;; Exit status: 0 if every file expanded, 1 if one ended in an error
+;; record (it did not read, load or expand), 2 if one could not be read at
+;; all (its dump is the line `unreadable`) or the words were refused; the
+;; larger wins. Stage 2's expander is correct when this prints what
+;; `fibref expand` prints, byte for byte (crates/fibc/tests/bootstrap_expand.rs).
+;;
+;; The Rust tool builds the whole text and prints it at the end; this one
+;; prints each file's section as soon as it is made, which gives the same
+;; bytes and holds one file's lines in memory at a time.
+(ns main (:require [expand.args :as cli] [expand.dump :as dump]))
+
+(def usage: str
+  "usage: expand [--prelude] [--context] [--no-runner] [--max-steps N] [--max-depth N] [--max-forms N] [--] FILE..")
+
+(defun max-status (a: i64 b: i64) -> i64 (if (> a b) a b))
+
+;; Prints the lines of a dump, each ended by a newline (the Rust tool
+;; prints their join, and println ends the last line).
+(defun print-lines (lines: (Vec str))
+  (loop ((i 0))
+    (if (< i (count lines))
+        (do (println (nth lines i)) (recur (+ i 1)))
+        ())))
+
+;; Prints the output of each of files in order, and returns the largest
+;; status.
+(defun expand-files (files: (Vec str) opts: cli/Options) -> i64
+  (loop ((i 0) (status 0))
+    (if (< i (count files))
+        (let ((d (dump/expand-file (nth files i) opts)))
+          (do (print-lines (. d lines))
+              (recur (+ i 1) (max-status status (. d status)))))
+        status)))
+
+(defun main () -> i64
+  (match (cli/parse-args (args))
+    (nil (do (eprintln usage) 2))
+    ((some parsed) (expand-files (. parsed files) (. parsed opts)))))

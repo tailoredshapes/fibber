@@ -1,0 +1,186 @@
+;; compiler/expand/core.fib: which operands of the core forms of syntax §3
+;; are expressions (expanded), which are patterns (normalised, not
+;; expanded) and which are names, parameter lists or types (left alone),
+;; as a `Role` per operand. It replaces crates/fibref/src/expand/core.rs
+;; (154 lines). Planning is separate from walking (expand.walk) so that
+;; the shape checks and the choice of roles happen in calls that have
+;; returned before the walk descends.
+;;
+;; Shapes decided where Rust and fibber differ (nothing the Rust is silent
+;; on):
+;; - `Result<T, ExpandError>` is `(Result T ExpandError)` of util.result;
+;;   `&[Form]` is `(Vec Stx)`, `&Pos` a `Pos`, `usize` an `i64`.
+;; - `Role::Items(Vec<Role>, Box<Role>)` is `(Items roles: (Vec Role) rest:
+;;   Role)`: an object is already behind a pointer, so no Box.
+;; - fibber's `Vec` has no `Eq`, so `Role` has none either (Rust's
+;;   `#[derive(PartialEq)]`, used as `role == Role::Arg` and `*role ==
+;;   Role::Keep` in walk.rs, is a `match` on the variant here).
+;; - the field-less variants are written bare in an expression: `Keep`,
+;;   `Expr`, `Arg`, `Pattern`; and `((Keep) ..)` in a pattern.
+;; - `Role::after` and `Role::items` are the functions `role-after` and
+;;   `role-items`; there are no associated functions.
+;; - the shape errors are `Malformed` at the positions core.rs gives
+;;   them (built here with `malformed-error` of expand.error).
+;; - the Rust closures `exact` and the match arms that `map` a `Result`
+;;   are the private functions `exact-plan` and `plan-fn`; `let_plan` and
+;;   `match_plan` keep their names, with `-` (`let-plan`, `match-plan`).
+;; - the Rust loops over bindings and clauses are `loop`s that return the
+;;   first error, in order, as the Rust `for` does.
+(ns expand.core (:use syntax.pos syntax.form util.result expand.error))
+
+;; What the walk does with a form.
+(defenum Role
+  ;; leave it alone
+  Keep
+  ;; expand it in expression position
+  Expr
+  ;; expand it in argument position of a call, where `(& x)` may stand
+  Arg
+  ;; normalise it as a pattern
+  Pattern
+  ;; walk its items: item i by the ith role, the rest by `rest`
+  (Items roles: (Vec Role) rest: Role))
+
+;; `n` kept items, then every other item with `rest`. (Role::after)
+(defun role-after (n: i64 rest: Role) -> Role
+  (Items (loop ((i 0) (acc (vec-empty)))
+           (if (< i n) (recur (+ i 1) (conj acc Keep)) acc))
+         rest))
+
+;; The roles `first`, then every other item with `rest`. (Role::items)
+(defun role-items (first: (Vec Role) rest: Role) -> Role
+  (Items first rest))
+
+;; `role` when `items` has exactly `len` items, else the Malformed error.
+;; (the closure `exact` of expr_plan)
+(defun exact-plan :private (name: str items: (Vec Stx) len: i64 role: Role pos: Pos)
+    -> (Result Role ExpandError)
+  (if (= (count items) len)
+      (Ok role)
+      (Err (malformed-error name "wrong number of operands" pos))))
+
+;; The role of the core expression form `name` (not a definition) whose
+;; items are `items` (the head at 0), after checking its shape; `pos` is
+;; the form's. (expr_plan)
+(defun expr-plan (name: str items: (Vec Stx) pos: Pos) -> (Result Role ExpandError)
+  (cond
+    ((or (= name "quote") (= name "var")) (exact-plan name items 2 Keep pos))
+    ((= name "if") (exact-plan name items 4 (role-after 1 Expr) pos))
+    ((= name "await") (exact-plan name items 2 (role-after 1 Expr) pos))
+    ((= name ".") (exact-plan name items 3 (role-items [Keep Expr] Keep) pos))
+    ((= name "fn") (plan-fn name items pos))
+    ((or (= name "let") (= name "loop")) (let-plan name items pos))
+    ((= name "match") (match-plan items pos))
+    ;; do, async, unsafe, recur: every operand is an expression.
+    (true (Ok (role-after 1 Expr)))))
+
+;; `(fn name? (params) ret? body+)`: item 1 is the name when it is a symbol.
+(defun plan-fn :private (name: str items: (Vec Stx) pos: Pos) -> (Result Role ExpandError)
+  (let ((i (if (and (> (count items) 1) (some? (sym-name (nth items 1)))) 2 1)))
+    (match (body-start name items i pos)
+      ((Err e) (Err e))
+      ((Ok start) (Ok (role-after start Expr))))))
+
+;; The name of a symbol form. (Form::as_sym)
+(defun sym-name :private (form: Stx) -> (Option str)
+  (match (. form kind)
+    ((SSym s) (some s))
+    (_ nil)))
+
+;; The items of a list form. (Form::as_list)
+(defun list-items :private (form: Stx) -> (Option (Vec Stx))
+  (match (. form kind)
+    ((SList items) (some items))
+    (_ nil)))
+
+;; Skips `:where C` and `-> T` annotations starting at `i`: the index of
+;; the first item that is not one, at most `(count items)`. (skip_annotations)
+(defun skip-annotations (items: (Vec Stx) i: i64) -> i64
+  (let ((n (count items)))
+    (loop ((j i))
+      (if (and (< j n) (annotation? (nth items j)))
+          (recur (+ j 2))
+          (if (< j n) j n)))))
+
+;; `:where` or `->`.
+(defun annotation? :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SKw k) (= k "where"))
+    ((SSym s) (= s "->"))
+    (_ false)))
+
+;; Where the body starts in `params ret? body+`, `items[i]` being the
+;; parameter list; `head` names the form in the error; the body must not
+;; be empty (`Malformed head "expected a parameter list"` or `"missing
+;; body"` at `pos`). (body_start)
+(defun body-start (head: str items: (Vec Stx) i: i64 pos: Pos) -> (Result i64 ExpandError)
+  (if (not (and (< i (count items)) (some? (list-items (nth items i)))))
+      (Err (malformed-error head "expected a parameter list" pos))
+      (let ((start (skip-annotations items (+ i 1))))
+        (if (>= start (count items))
+            (Err (malformed-error head "missing body" pos))
+            (Ok start)))))
+
+;; `(let (binding*) body)` (§3.3) and `(loop (binding*) body)` (§3.18),
+;; `binding ::= (pat expr) | (sym: type expr)` (§1.5).
+(defun let-plan :private (head: str items: (Vec Stx) pos: Pos) -> (Result Role ExpandError)
+  (if (< (count items) 3)
+      (Err (malformed-error head "expected bindings and a body" pos))
+      (match (list-items (nth items 1))
+        (nil (Err (malformed-error head "bindings must be a list" (. (nth items 1) pos))))
+        ((some pairs)
+         (match (binding-roles head pairs)
+           ((Err e) (Err e))
+           ((Ok roles)
+            (Ok (role-items [Keep (role-items roles Keep)] Expr))))))))
+
+;; The role of each binding, or the first malformed one.
+(defun binding-roles :private (head: str pairs: (Vec Stx)) -> (Result (Vec Role) ExpandError)
+  (let ((n (count pairs)))
+    (loop ((i 0) (roles (vec-empty)))
+      (if (< i n)
+          (match (binding-role head (nth pairs i))
+            ((Err e) (Err e))
+            ((Ok role) (recur (+ i 1) (conj roles role))))
+          (Ok roles)))))
+
+;; `(pat expr)` or `(name: type expr)`.
+(defun binding-role :private (head: str pair: Stx) -> (Result Role ExpandError)
+  (let ((parts (unwrap-or (list-items pair) (vec-empty))))
+    (cond
+      ((and (some? (list-items pair)) (= (count parts) 2))
+       (Ok (role-items [Pattern Expr] Keep)))
+      ((and (= (count parts) 3) (annotated-name (nth parts 0)))
+       (Ok (role-items [Keep Keep Expr] Keep)))
+      (true (Err (malformed-error head
+                   "a binding is (pattern expression) or (name: type expression)"
+                   (. pair pos)))))))
+
+;; Whether the form is `x:`, the name of an annotated binding (syntax
+;; §1.5): a symbol of at least two bytes ending in `:`. (annotated_name)
+(defun annotated-name (form: Stx) -> bool
+  (match (sym-name form)
+    (nil false)
+    ((some s)
+     (let ((n (str-len s)))
+       (and (>= n 2) (= (str-slice s (- n 1) n) ":"))))))
+
+;; `(match expr clause+)`, `clause ::= (pat body)` (§3.6).
+(defun match-plan :private (items: (Vec Stx) pos: Pos) -> (Result Role ExpandError)
+  (if (< (count items) 3)
+      (Err (malformed-error "match" "expected a scrutinee and clauses" pos))
+      (match (bad-clause items 2)
+        ((some clause) (Err (malformed-error "match" "a clause is (pattern body+)" (. clause pos))))
+        (nil (Ok (role-items [Keep Expr] (role-items [Pattern] Expr)))))))
+
+;; The first clause from `i` that is not a list of two items or more.
+(defun bad-clause :private (items: (Vec Stx) i: i64) -> (Option Stx)
+  (let ((n (count items)))
+    (loop ((j i))
+      (if (>= j n)
+          nil
+          (if (match (list-items (nth items j))
+                ((some c) (>= (count c) 2))
+                (nil false))
+              (recur (+ j 1))
+              (some (nth items j)))))))

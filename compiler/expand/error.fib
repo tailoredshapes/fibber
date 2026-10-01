@@ -1,12 +1,21 @@
 ;; compiler/expand/error.fib: expansion errors, as
-;; crates/fibref/src/expand/error.rs. Every malformed input to the
-;; expander is one of these values, with the position of the offending
-;; form; the expander never traps on input (a `trap` here is for a state
-;; that cannot happen).
+;; crates/fibref/src/expand/error.rs (260 lines of Rust). Every malformed
+;; input to the expander is one of these values, with the position of the
+;; offending form; the expander never traps on input (a `trap` here is
+;; for a state that cannot happen).
 ;;
 ;; THE SHARED BASE of M6 step 2 (spec/bootstrap.md §5): the types are
-;; fixed; the functions that say `todo:` belong to the porter of this
-;; module. Nothing here may change without telling the other porters.
+;; fixed. `expand-err-message` was a `todo:` stub and is written (porter
+;; 1); `pos-display` and `expand-error-text` are added (the Display of a
+;; `Pos` and of an `ExpandError`, which `types::prelude_forms`' error
+;; text and the messages of `expand.modules` need). Nothing here may
+;; change without telling the other porters.
+;;
+;; `TooDeep` is also a variant of the reader's `ErrKind` (syntax.error),
+;; and a variant's name is global to the modules that `:use` its module: a
+;; module that `:use`s both this one and syntax.error must write
+;; `expand.error/TooDeep` (the compiler says so where the bare name is
+;; used). Every other name of the two modules is different.
 (ns expand.error (:use syntax.pos syntax.form syntax.error))
 
 ;; The variants of ExpandErrorKind, with the same names and fields (a
@@ -76,7 +85,50 @@
 ;; The kind's Display text: the message after the position, word for
 ;; word as `impl Display for ExpandErrorKind` writes it.
 (defun expand-err-message (k: ExpandErrKind) -> str
-  (trap "todo: expand.error expand-err-message"))
+  (match k
+    ((MacroNeedsEvaluator name)
+     (str-join ["macro " name " needs the evaluator to expand (pending)"]))
+    ((MacroPhase name fun)
+     (str-join ["macro " name " calls " fun ", which is not available at expansion time; move "
+                fun " to a required module"]))
+    ((MacroFailed name message) (str-join ["macro " name " failed: " message]))
+    ((MacroArity name expected found)
+     (str-join ["macro " name " takes " expected " argument(s), got " (show found)]))
+    ((AmbiguousMacro name a b)
+     (str-join [name " is exported by both " a " and " b "; write " a "/" name " or " b "/" name]))
+    ((UnquoteOutsideQuasiquote head) (str-join [head " outside quasiquote"]))
+    ((SpliceOutsideList) "unquote-splicing outside a list, vector or map")
+    ((Malformed head reason) (str-join ["malformed " head ": " reason]))
+    ((MacroNamesCoreForm name) (str-join ["defmacro cannot redefine core form " name]))
+    ((DeriveProtocol name) (str-join ["cannot derive " name ": only Eq, Ord, Hash and Show"]))
+    ((DeriveTarget name) (str-join ["cannot derive for " name ": not a struct or enum"]))
+    ((NotAStruct op name) (str-join [op ": " name " is not a struct"]))
+    ((NotAnEnum op name) (str-join [op ": " name " is not an enum"]))
+    ((BadReflection op) (str-join ["bad reflection call " op ": expects one symbol"]))
+    ((ThreadStep) "threading step must be a symbol or a non-empty list")
+    ((InOutOutsideArgument) "& x is only allowed on a symbol, as an argument of a call")
+    ((NilCalled) "nil is a constant, not a function; write nil")
+    ((BraceInPattern) "braces are not allowed in patterns")
+    ((ExpressionAtTopLevel) "expression at top level")
+    ((DefinitionInExpression head) (str-join [head " is only allowed at top level"]))
+    ((NsNotFirst) "ns must be the first form of the module")
+    ((TooManySteps limit)
+     (str-join ["more than " (show limit) " macro expansions in one top-level form"]))
+    ((TooDeep limit) (str-join ["expansion nested deeper than " (show limit) " levels"]))
+    ((TooLarge limit)
+     (str-join ["macro expansions of one top-level form produced more than " (show limit)
+                " forms"]))
+    ((BadLiteral e) (str-join ["a macro built an invalid literal: " (err-message e)]))))
+
+;; A position as Rust's `Pos` Display writes it: FILE:LINE:COL (not the
+;; dump's `LINE:COL START..END`, which is `syntax.dump`'s `span`).
+(defun pos-display (p: Pos) -> str
+  (str-join [(. p file) ":" (show (. p line)) ":" (show (. p col))]))
+
+;; The error's Display text: `FILE:LINE:COL: MESSAGE`
+;; (`impl Display for ExpandError`; `types::prelude_forms` returns it).
+(defun expand-error-text (e: ExpandError) -> str
+  (str-join [(pos-display (. e pos)) ": " (expand-err-message (. e kind))]))
 
 ;; An error of kind at pos, as a value to return.
 (defun expand-error (kind: ExpandErrKind pos: Pos) -> ExpandError

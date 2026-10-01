@@ -1,0 +1,133 @@
+;; compiler/expand/admit.fib: what the result of every expansion step must
+;; pass before the walk goes on (syntax §3.16), as
+;; crates/fibref/src/expand/admit.rs (38 lines of Rust): its forms count
+;; against max-forms, and its literals are checked as the reader checks the
+;; literals it reads (§1.1), since a macro can build `(Int 300 :i8)`, which
+;; no source text can spell. `ctx-admit` of expand.ctx is the method of the
+;; Rust context; it calls `admit-form` here with the context's counter, so
+;; that this module does not need the context (and expand.ctx stays under
+;; the 500 lines a file may have).
+;;
+;; Decided here, where Rust and fibber differ:
+;; - Rust counts and checks in the order of an explicit stack (the root,
+;;   then the last item of a list before the first, each subtree completely,
+;;   so the error that fires first is the same) and rounds an f32 literal in
+;;   place. A form is immutable here: `admit-form` first counts and checks
+;;   in the same order, changing nothing, and only if some f32 literal had to
+;;   be rounded rebuilds the tree, again with an explicit stack of open
+;;   frames. A result is not yet known to be within the depth limit, so
+;;   neither walk recurses on the native stack.
+;; - The counter is a `Cell` that the caller keeps; every form counted is
+;;   written to it as it is counted, so that after TooLarge it holds the
+;;   count that failed (Rust's `self.forms`).
+;; - The prelude's `(List a)` (`cons`, `empty`) is the stack.
+(ns expand.admit
+  (:require [syntax.number :as number])
+  (:use syntax.pos syntax.form syntax.error util.result expand.error))
+
+;; The items of a list, vector or map form, none for an atom.
+(defun seq-items :private (k: StxKind) -> (Vec Stx)
+  (match k
+    ((SList items) items)
+    ((SVec items) items)
+    ((SMap items) items)
+    (_ (vec-empty))))
+
+;; The literal checked as the reader checks it: the kind with an f32
+;; rounded, or the error. Only integers and floats can fail.
+(defun check-kind :private (k: StxKind) -> (Result StxKind ErrKind)
+  (match k
+    ((SInt _ _) (number/check-literal k))
+    ((SFlt _ _) (number/check-literal k))
+    (_ (Ok k))))
+
+;; Whether checking changed the literal: an f32 float it rounded.
+(defun rounded? :private (old: StxKind new: StxKind) -> bool
+  (match old
+    ((SFlt a _) (match new ((SFlt c _) (!= a c)) (_ false)))
+    (_ false)))
+
+;; `items` pushed on the stack in order, so the last pops first.
+(defun push-items :private (stack: (List Stx) items: (Vec Stx)) -> (List Stx)
+  (let ((n (count items)))
+    (loop ((i 0) (acc stack))
+      (if (< i n)
+          (recur (+ i 1) (cons (nth items i) acc))
+          acc))))
+
+;; Counts the forms of `form` in `used`, failing with TooLarge at pos once
+;; it passes limit, and checks its literals, failing with BadLiteral at the
+;; literal; whether any literal was rounded.
+(defun admit-count :private (form: Stx pos: Pos used: (Cell i64) limit: i64) -> (Result bool ExpandError)
+  (loop ((stack (cons form empty)) (changed false))
+    (match stack
+      ((empty) (Ok changed))
+      ((cons f rest)
+       (let ((n (+ @used 1)))
+         (do (set! used n)
+             (if (> n limit)
+                 (Err (ExpandError (TooLarge limit) pos))
+                 (match (check-kind (. f kind))
+                   ((Err e) (Err (ExpandError (BadLiteral e) (. f pos))))
+                   ((Ok k)
+                    (recur (push-items rest (seq-items (. f kind)))
+                           (or changed (rounded? (. f kind) k))))))))))))
+
+;; An open list, vector or map of the rebuild: its original kind (the
+;; items to do), the index of the next, and the items done.
+(defstruct Frame :private (kind: StxKind pos: Pos idx: i64 done: (Vec Stx)))
+
+(defun frame-of :private (f: Stx) -> (Option Frame)
+  (match (. f kind)
+    ((SList _) (some (Frame (. f kind) (. f pos) 0 (vec-empty))))
+    ((SVec _) (some (Frame (. f kind) (. f pos) 0 (vec-empty))))
+    ((SMap _) (some (Frame (. f kind) (. f pos) 0 (vec-empty))))
+    (_ nil)))
+
+;; The frame with one more item done.
+(defun frame-add :private (fr: Frame item: Stx) -> Frame
+  (Frame (. fr kind) (. fr pos) (+ (. fr idx) 1) (conj (. fr done) item)))
+
+;; The form a finished frame stands for.
+(defun frame-form :private (fr: Frame) -> Stx
+  (Stx (match (. fr kind)
+         ((SList _) (SList (. fr done)))
+         ((SVec _) (SVec (. fr done)))
+         (_ (SMap (. fr done))))
+       (. fr pos)))
+
+;; An atom with its literal rounded (it has passed `check-kind`).
+(defun round-leaf :private (f: Stx) -> Stx
+  (match (check-kind (. f kind))
+    ((Ok k) (Stx k (. f pos)))
+    ((Err _) f)))
+
+;; The form with every f32 literal rounded.
+(defun round-tree :private (root: Stx) -> Stx
+  (match (frame-of root)
+    (nil (round-leaf root))
+    ((some fr) (round-frames (cons fr empty)))))
+
+(defun round-frames :private (frames: (List Frame)) -> Stx
+  (loop ((frames frames))
+    (match frames
+      ((empty) (trap "expand.admit: no frame"))
+      ((cons top rest)
+       (let ((items (seq-items (. top kind))))
+         (if (< (. top idx) (count items))
+             (let ((child (nth items (. top idx))))
+               (match (frame-of child)
+                 ((some cf) (recur (cons cf frames)))
+                 (nil (recur (cons (frame-add top (round-leaf child)) rest)))))
+             (match rest
+               ((empty) (frame-form top))
+               ((cons parent more) (recur (cons (frame-add parent (frame-form top)) more))))))))))
+
+;; Admits `form`, the result of an expansion of the call at pos: the form
+;; with its f32 literals rounded, or TooLarge or BadLiteral. `used` is the
+;; count of forms so far for the top-level form, against limit.
+;; (admit.rs `admit`)
+(defun admit-form (form: Stx pos: Pos used: (Cell i64) limit: i64) -> (Result Stx ExpandError)
+  (match (admit-count form pos used limit)
+    ((Err e) (Err e))
+    ((Ok changed) (Ok (if changed (round-tree form) form)))))

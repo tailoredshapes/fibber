@@ -1,0 +1,116 @@
+;; compiler/expand/private.fib: `:private` after a definition's name
+;; (syntax §5), as crates/fibref/src/expand/private.rs (48 lines of
+;; Rust). The expander takes the marker off while it parses and registers
+;; the definition, puts it back for name resolution, and hides a private
+;; struct or enum from the reflection of every later module (§3.16).
+;;
+;; Rust's `take_marker` returns a pair `(Form, Option<Form>)`; fibber has
+;; no tuples, so it returns a `Taken`.
+(ns expand.private (:use syntax.pos syntax.form))
+
+;; What `take-marker` made of a form: the form without the item, and the
+;; item (`nil` when there was nothing to take: the form is not a list or
+;; `at` is past its end).
+(defstruct Taken (form: Stx marker: (Option Stx)))
+
+;; The index of the `:private` marker a definition form may carry: right
+;; after the name, or after a `def`'s `name: type`.
+(defun marker-index (form: Stx) -> (Option i64)
+  (match (. form kind)
+    ((SList items) (marker-in items))
+    (_ nil)))
+
+;; Whether the symbol is an annotated name: longer than the colon and
+;; ending in one.
+(defun annotated? :private (f: Stx) -> bool
+  (match (. f kind)
+    ((SSym s) (and (> (str-len s) 1) (ends-with-colon? s)))
+    (_ false)))
+
+;; `str-slice` traps when it would split a character, so the last byte is
+;; read as a byte (a continuation byte is never 58, the colon).
+(defun ends-with-colon? :private (s: str) -> bool
+  (let ((bs (str-bytes s)))
+    (= (array-get bs (- (array-len bs) 1)) 58i8)))
+
+;; Where the marker would be in a list whose head is `head`, if the head
+;; is one that takes one.
+(defun marker-slot :private (items: (Vec Stx) head: str) -> (Option i64)
+  (cond ((and (= head "def") (> (count items) 1) (annotated? (nth items 1))) (some 3))
+        ((or (= head "def") (= head "defun") (= head "defmacro") (= head "defstruct")
+             (= head "defenum") (= head "defprotocol") (= head "extern"))
+         (some 2))
+        (else nil)))
+
+(defun marker-in :private (items: (Vec Stx)) -> (Option i64)
+  (if (= (count items) 0)
+      nil
+      (match (. (nth items 0) kind)
+        ((SSym head)
+         (match (marker-slot items head)
+           ((some at) (if (is-private-marker? items at) (some at) nil))
+           (nil nil)))
+        (_ nil))))
+
+(defun is-private-marker? :private (items: (Vec Stx) at: i64) -> bool
+  (if (< at (count items))
+      (match (. (nth items at) kind)
+        ((SKw k) (= k "private"))
+        (_ false))
+      false))
+
+;; `form` without the item at `at`, and that item.
+(defun take-marker (form: Stx at: i64) -> Taken
+  (match (. form kind)
+    ((SList items)
+     (if (< at (count items))
+         (Taken (Stx (SList (without items at)) (. form pos)) (some (nth items at)))
+         (Taken form nil)))
+    (_ (Taken form nil))))
+
+;; `form` with `marker` put back at `at`; a form that is not a list, or
+;; whose list is shorter than `at`, is returned as it is.
+(defun put-marker (form: Stx at: i64 marker: Stx) -> Stx
+  (match (. form kind)
+    ((SList items)
+     (if (<= at (count items))
+         (Stx (SList (inserted items at marker)) (. form pos))
+         form))
+    (_ form)))
+
+;; The items without the one at `at`.
+(defun without :private (items: (Vec Stx) at: i64) -> (Vec Stx)
+  (let ((n (count items)))
+    (loop ((i 0) (out (vec-empty)))
+      (cond ((>= i n) out)
+            ((= i at) (recur (+ i 1) out))
+            (else (recur (+ i 1) (conj out (nth items i))))))))
+
+;; The items with `item` inserted before the one at `at` (after them all
+;; when `at` is their count).
+(defun inserted :private (items: (Vec Stx) at: i64 item: Stx) -> (Vec Stx)
+  (let ((n (count items)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (> i n)
+          out
+          (let ((with-item (if (= i at) (conj out item) out)))
+            (recur (+ i 1) (if (< i n) (conj with-item (nth items i)) with-item)))))))
+
+;; The name of a `defstruct`/`defenum` form: `Name` or `(Name a..)`.
+(defun type-name (form: Stx) -> (Option str)
+  (match (. form kind)
+    ((SList items)
+     (if (> (count items) 1)
+         (match (. (nth items 1) kind)
+           ((SSym name) (some name))
+           ((SList inner) (head-symbol inner))
+           (_ nil))
+         nil))
+    (_ nil)))
+
+(defun head-symbol :private (items: (Vec Stx)) -> (Option str)
+  (if (> (count items) 0)
+      (match (. (nth items 0) kind)
+        ((SSym name) (some name))
+        (_ nil))
+      nil))

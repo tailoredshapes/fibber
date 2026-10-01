@@ -1,0 +1,68 @@
+;; compiler/expand/reflect.fib: expansion-time reflection (syntax §3.16:
+;; `struct?`, `struct-fields`, `struct-params`, `struct-field-types`,
+;; `enum?`, `enum-params`, `enum-variants`), as
+;; crates/fibref/src/expand/reflect.rs (92 lines of Rust). `ctx-reflect` of
+;; expand.ctx is the method of the Rust context; it looks the name up in
+;; the context and calls `reflect-answer` here, so that this module needs
+;; no context (and expand.ctx stays under the 500 lines a file may have).
+;;
+;; Decided here, where Rust and fibber differ: the Rust error carries the
+;; `'static` spelling of the call (`static_name`); a call that reaches the
+;; struct or enum answers is always one of the seven, so the text given is
+;; the same.
+(ns expand.reflect
+  (:require [expand.build :as b])
+  (:use syntax.pos syntax.form util.result expand.error expand.types))
+
+(defun bad-reflection :private (op: str pos: Pos) -> ExpandError
+  (ExpandError (BadReflection op) pos))
+
+;; The answer to `(op name)` at pos, given what the context holds under
+;; name: the struct and the enum of that name, if any (a private type of an
+;; earlier module is none). A Bool form for `struct?` and `enum?`, a Vec
+;; form for the others, NotAStruct or NotAnEnum when the name is not one,
+;; BadReflection for a call that is none of the seven. Returned field
+;; names and types are the forms of the declaration, with their own
+;; positions. (reflect.rs `reflect`, after the operand is known to be a
+;; symbol, `reflect_struct`, `reflect_enum`)
+(defun reflect-answer (op: str name: str pos: Pos st: (Option StructInfo) en: (Option EnumInfo))
+    -> (Result Stx ExpandError)
+  (cond ((= op "struct?") (Ok (b/boolean (some? st) pos)))
+        ((= op "enum?") (Ok (b/boolean (some? en) pos)))
+        ((or (= op "struct-fields") (or (= op "struct-params") (= op "struct-field-types")))
+         (reflect-struct op name pos st))
+        ((or (= op "enum-params") (= op "enum-variants")) (reflect-enum op name pos en))
+        (true (Err (bad-reflection op pos)))))
+
+(defun reflect-struct :private (op: str name: str pos: Pos st: (Option StructInfo))
+    -> (Result Stx ExpandError)
+  (match st
+    (nil (Err (ExpandError (NotAStruct op name) pos)))
+    ((some info)
+     (Ok (b/vector (if (= op "struct-params")
+                       (. info params)
+                       (field-parts (. info fields) (= op "struct-fields")))
+                   pos)))))
+
+;; The names (or the types) of the fields.
+(defun field-parts :private (fields: (Vec FieldPair) names: bool) -> (Vec Stx)
+  (let ((n (count fields)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n)
+          (recur (+ i 1) (conj acc (if names (. (nth fields i) name) (. (nth fields i) ty))))
+          acc))))
+
+(defun reflect-enum :private (op: str name: str pos: Pos en: (Option EnumInfo))
+    -> (Result Stx ExpandError)
+  (match en
+    (nil (Err (ExpandError (NotAnEnum op name) pos)))
+    ((some info)
+     (Ok (b/vector (if (= op "enum-params") (. info params) (variant-forms (. info variants) pos))
+                   pos)))))
+
+(defun variant-forms :private (variants: (Vec VariantInfo) pos: Pos) -> (Vec Stx)
+  (let ((n (count variants)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n)
+          (recur (+ i 1) (conj acc (variant-as-form (nth variants i) pos)))
+          acc))))

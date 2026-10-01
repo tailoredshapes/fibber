@@ -1,12 +1,34 @@
 ;; compiler/expand/types.fib: the data the expander keeps and passes
-;; around, as crates/fibref/src/expand/{types,runner,ctx}.rs and
-;; crates/fibref/src/modules.rs define them.
+;; around, and the parsing of what it keeps. It replaces
+;; crates/fibref/src/expand/types.rs (307 lines) and the structs of
+;; runner.rs (the struct `MacroDef`), ctx.rs (`Limits`,
+;; `ModuleScope`) and modules.rs (`ModuleSpec`, `Loaded`, `LoadError`).
 ;;
 ;; THE SHARED BASE of M6 step 2 (spec/bootstrap.md §5): the types are
-;; fixed; the functions that say `todo:` belong to the porter of the
-;; Rust file named beside them. Nothing here may change without telling
-;; the other porters.
-(ns expand.types (:use syntax.pos syntax.form syntax.error))
+;; fixed and written fully here; the functions of the second half
+;; (`---- the parsing`) are porter 2's (wave B). Nothing above that line
+;; may change without telling the other porters.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `TypeTable` has no counterpart: its two maps and two sets
+;;   are fields of `ExpandCtx` (expand.ctx), so `add_struct`, `add_enum`
+;;   and `end_module` of it are `ctx-add-struct`, `ctx-add-enum` and
+;;   `ctx-end-module` there. This module holds only what does not need
+;;   the context: the parsers and `builtin-enums`, which gives the table
+;;   `with_builtins` made (`Option` and `Form`), as a `Map` by name.
+;; - `Vec<(Form, Form)>` is a vector of `FieldPair`, `(Option<String>,
+;;   Form)` a `VariantField`; a `Form` is a `Stx`, a `Result<T,
+;;   ExpandError>` a `(Result T ExpandError)`.
+;; - `MacroDef::accepts` and `arity_text` (runner.rs) are private helpers of
+;;   expand.expr, their only caller (`run_user`), not functions here.
+;; - the private helpers of types.rs (`parse_head`, `annotation_name`,
+;;   `parse_variant`) are private functions of the second half.
+;; - Rust's `missing name` error of `parse_head` is for a head that is not
+;;   there; both callers have checked the form's length first, so it cannot
+;;   arise and is not ported.
+(ns expand.types
+  (:require [expand.build :as b] [syntax.reader :as reader])
+  (:use syntax.pos syntax.form syntax.error util.result expand.error))
 
 ;; ------------------------------------------------------- struct and enum
 ;; (expand/types.rs). A Rust `Vec<(Form, Form)>` is a vector of FieldPair.
@@ -84,3 +106,244 @@
 ;; The ModuleSpec of a single-file program with no `ns` form.
 (defun module-spec-main () -> ModuleSpec
   (ModuleSpec "main" (vec-empty) (vec-empty) (vec-empty)))
+
+;; ---------------------------------------------------- the parsing
+;; (expand/types.rs). Everything above this line is data; below are the
+;; functions of this module, which no other module's skeleton defines.
+
+;; The position of built-in definitions: file "<builtin>", 0:0, 0..0.
+;; (types.rs `builtin_pos`)
+(defun builtin-pos () -> Pos
+  (Pos "<builtin>" 0 0 0 0))
+
+;; §3.16's built-in `Form` enum, in the spelling §3.16 gives it, exactly
+;; as types.rs FORM_ENUM spells it (its line breaks and indentation give
+;; the positions `--prelude --context` prints for its field types).
+(def form-enum-source: str
+  "(defenum Form\n  (Sym name: str) (Kw name: str)\n  (Int v: i64 width: keyword) (Flt v: f64 width: keyword)\n  (Str v: str) (Chr v: char) (Bool v: bool) (Nil)\n  (List items: (Vec Form)) (Vec items: (Vec Form)) (Map items: (Vec Form)))")
+
+;; The built-in enums `Option` (variants `nil` and `(some v: a)`, its
+;; `a` at the built-in position) and `Form` (parsed from form-enum-source
+;; read as "<builtin>"), by name: what `ctx-new` starts the context's
+;; enums with. (types.rs `TypeTable::with_builtins`, §3.9, §3.16)
+(defun builtin-enums () -> (Map str EnumInfo)
+  (let ((a (b/sym "a" (builtin-pos)))
+        (none (VariantInfo "nil" (vec-empty)))
+        (some-variant (VariantInfo "some" [(VariantField (some "v") a)]))
+        (option (EnumInfo "Option" [a] [none some-variant])))
+    (assoc (assoc (map-empty) "Option" option) "Form" (form-enum))))
+
+;; FORM_ENUM read and parsed. It is a constant that cannot fail to read
+;; or to parse (the Rust `expect`s the same two steps, checked by its test
+;; `builtin_form_enum_parses`; so is this one, by the comparison of
+;; `--prelude --context` with the oracle), so a failure is a trap.
+(defun form-enum :private () -> EnumInfo
+  (match (reader/read-all form-enum-source "<builtin>")
+    ((Err _) (trap "expand.types: FORM_ENUM does not read"))
+    ((Ok forms)
+     (match (parse-defenum (nth forms 0))
+       ((Err _) (trap "expand.types: FORM_ENUM does not parse"))
+       ((Ok info) info)))))
+
+;; ----------------------------------------------------------- helpers
+
+;; The symbol's name, if the form is a symbol (`Form::as_sym`).
+(defun sym-name :private (f: Stx) -> (Option str)
+  (match (. f kind)
+    ((SSym n) (some n))
+    (_ nil)))
+
+;; The items of a list form, none for any other form (`as_list` with
+;; `unwrap_or(&[])`).
+(defun list-items :private (f: Stx) -> (Vec Stx)
+  (match (. f kind)
+    ((SList items) items)
+    (_ (vec-empty))))
+
+;; `x:` as `(some "x")`: a symbol of one or more characters and a last
+;; `:`. (types.rs `annotation_name`)
+(defun annotation-name :private (f: Stx) -> (Option str)
+  (match (sym-name f)
+    (nil nil)
+    ((some s)
+     (let ((bs (str-bytes s))
+           (n (array-len bs)))
+       (if (and (> n 1) (= (array-get bs (- n 1)) 58i8))
+           (some (str-slice s 0 (- n 1)))
+           nil)))))
+
+;; ---------------------------------------------------------- the head
+
+;; The name and the declared parameters of a `Name` or `(Name tvar+)`
+;; head (types.rs `parse_head`). Rust's `missing name` error is for a
+;; head that is not there; both callers have checked the length of the
+;; form first, so it cannot arise and is not ported.
+(defstruct Head :private (name: str params: (Vec Stx)))
+
+(defun colour? :private (f: Stx) -> bool
+  (match (. f kind)
+    ((SKw k) (= k "colour"))
+    (_ false)))
+
+;; A parameter may be followed by `:colour` (types §1.3), which is not a
+;; parameter of its own: item i is a `:colour` after a symbol (i > 1).
+(defun colour-after-param? :private (items: (Vec Stx) i: i64) -> bool
+  (and (> i 1)
+       (colour? (nth items i))
+       (some? (sym-name (nth items (- i 1))))))
+
+(defun all-heads? :private (items: (Vec Stx)) -> bool
+  (let ((n (count items)))
+    (loop ((i 0))
+      (if (< i n)
+          (if (or (some? (sym-name (nth items i))) (colour-after-param? items i))
+              (recur (+ i 1))
+              false)
+          true))))
+
+;; The symbols of items after the first.
+(defun head-params :private (items: (Vec Stx)) -> (Vec Stx)
+  (let ((n (count items)))
+    (loop ((i 1) (acc (vec-empty)))
+      (if (< i n)
+          (recur (+ i 1) (if (some? (sym-name (nth items i))) (conj acc (nth items i)) acc))
+          acc))))
+
+(defun bad-head :private (head: str form: Stx) -> ExpandError
+  (malformed-error head "name must be a symbol or (Name tvar+)" (. form pos)))
+
+(defun parse-head :private (head: str form: Stx) -> (Result Head ExpandError)
+  (match (sym-name form)
+    ((some name) (Ok (Head name (vec-empty))))
+    (nil
+     (let ((items (list-items form))
+           (params (head-params items))
+           (name (if (> (count items) 0) (sym-name (nth items 0)) nil)))
+       (match name
+         ((some n)
+          (if (and (> (count params) 0) (all-heads? items))
+              (Ok (Head n params))
+              (Err (bad-head head form))))
+         (nil (Err (bad-head head form))))))))
+
+;; ------------------------------------------------------- the struct
+
+;; The fields of the declaration decl, `sym: type` or `sym`, after the
+;; head's parameters, which an unannotated field adds to.
+(defun struct-fields :private (name: str params0: (Vec Stx) decl: (Vec Stx))
+    -> (Result StructInfo ExpandError)
+  (let ((n (count decl)))
+    (loop ((i 0) (params params0) (fields (vec-empty)))
+      (if (>= i n)
+          (Ok (StructInfo name params fields))
+          (let ((f (nth decl i)))
+            (match (annotation-name f)
+              ((some fname)
+               (if (< (+ i 1) n)
+                   (recur (+ i 2) params
+                          (conj fields (FieldPair (b/sym fname (. f pos)) (nth decl (+ i 1)))))
+                   (Err (malformed-error "defstruct" "annotation without a type" (. f pos)))))
+              (nil
+               (match (sym-name f)
+                 ((some _) (recur (+ i 1) (conj params f) (conj fields (FieldPair f f))))
+                 (nil (Err (malformed-error "defstruct" "a field is sym: type or sym"
+                                            (. f pos))))))))))))
+
+;; Parses `(defstruct Name (field+))` or `(defstruct (Name tvar+)
+;; (field+))`, `field ::= sym: type | sym` (§3.7): the Malformed errors
+;; of types.rs at the positions it gives. (types.rs `parse_defstruct`)
+(defun parse-defstruct (form: Stx) -> (Result StructInfo ExpandError)
+  (let ((items (list-items form)))
+    (if (!= (count items) 3)
+        (Err (malformed-error "defstruct" "expected (defstruct Name (field+))" (. form pos)))
+        (match (parse-head "defstruct" (nth items 1))
+          ((Err e) (Err e))
+          ((Ok h)
+           (let ((fields-form (nth items 2))
+                 (decl (list-items fields-form)))
+             (if (= (count decl) 0)
+                 (Err (malformed-error "defstruct" "expected a non-empty field list"
+                                       (. fields-form pos)))
+                 (struct-fields (. h name) (. h params) decl))))))))
+
+;; --------------------------------------------------------- the enum
+
+;; `variant ::= (Variant) | (Variant field+) | Variant`, `field ::= sym:
+;; type | type` (types.rs `parse_variant`).
+(defun variant-fields :private (items: (Vec Stx)) -> (Result (Vec VariantField) ExpandError)
+  (let ((n (count items)))
+    (loop ((i 1) (fields (vec-empty)))
+      (if (>= i n)
+          (Ok fields)
+          (let ((f (nth items i)))
+            (match (annotation-name f)
+              ((some fname)
+               (if (< (+ i 1) n)
+                   (recur (+ i 2) (conj fields (VariantField (some fname) (nth items (+ i 1)))))
+                   (Err (malformed-error "defenum" "annotation without a type" (. f pos)))))
+              (nil (recur (+ i 1) (conj fields (VariantField nil f))))))))))
+
+(defun parse-variant :private (form: Stx) -> (Result VariantInfo ExpandError)
+  (match (sym-name form)
+    ((some name) (Ok (VariantInfo name (vec-empty))))
+    (nil
+     (let ((items (list-items form)))
+       (match (if (> (count items) 0) (sym-name (nth items 0)) nil)
+         (nil (Err (malformed-error "defenum" "a variant is (Variant field*) or Variant"
+                                    (. form pos))))
+         ((some name)
+          (match (variant-fields items)
+            ((Err e) (Err e))
+            ((Ok fields) (Ok (VariantInfo name fields))))))))))
+
+;; The variants of items from index 2, the first error ending the parse.
+(defun parse-variants :private (items: (Vec Stx)) -> (Result (Vec VariantInfo) ExpandError)
+  (let ((n (count items)))
+    (loop ((i 2) (acc (vec-empty)))
+      (if (>= i n)
+          (Ok acc)
+          (match (parse-variant (nth items i))
+            ((Err e) (Err e))
+            ((Ok v) (recur (+ i 1) (conj acc v))))))))
+
+;; Parses `(defenum Name variant+)` or `(defenum (Name tvar+) variant+)`
+;; (§3.9), `variant ::= (Variant) | (Variant field+) | Variant`, `field ::=
+;; sym: type | type`. (types.rs `parse_defenum`)
+(defun parse-defenum (form: Stx) -> (Result EnumInfo ExpandError)
+  (let ((items (list-items form)))
+    (if (< (count items) 3)
+        (Err (malformed-error "defenum" "expected (defenum Name variant+)" (. form pos)))
+        (match (parse-head "defenum" (nth items 1))
+          ((Err e) (Err e))
+          ((Ok h)
+           (match (parse-variants items)
+             ((Err e) (Err e))
+             ((Ok variants) (Ok (EnumInfo (. h name) (. h params) variants)))))))))
+
+;; The variant as §3.16's `enum-variants` returns it: `(List [(Sym
+;; "Variant") type*])`, every built node at pos. (types.rs
+;; `VariantInfo::as_form`)
+(defun variant-as-form (v: VariantInfo pos: Pos) -> Stx
+  (let ((fields (. v fields))
+        (n (count fields)))
+    (loop ((i 0) (items [(b/sym (. v name) pos)]))
+      (if (< i n)
+          (recur (+ i 1) (conj items (. (nth fields i) ty)))
+          (b/list-form items pos)))))
+
+;; Whether the symbol `name` occurs anywhere in the type form `ty`: in a
+;; symbol, or at any depth of a list, vector or map. (types.rs `mentions`)
+(defun mentions (ty: Stx name: str) -> bool
+  (match (. ty kind)
+    ((SSym s) (= s name))
+    ((SList items) (any-mentions? items name))
+    ((SVec items) (any-mentions? items name))
+    ((SMap items) (any-mentions? items name))
+    (_ false)))
+
+(defun any-mentions? :private (items: (Vec Stx) name: str) -> bool
+  (let ((n (count items)))
+    (loop ((i 0))
+      (if (< i n)
+          (if (mentions (nth items i) name) true (recur (+ i 1)))
+          false))))

@@ -1,0 +1,92 @@
+;; compiler/expand/build.fib: the small constructors for the forms the
+;; expander builds, as crates/fibref/src/expand/build.rs (97 lines of
+;; Rust). Every built form takes the position it is given: the macro
+;; call's, per syntax §1.3. A form is a `Stx` here (a StxKind and its Pos).
+;;
+;; Names are the Rust ones with `_` as `-`, except:
+;; - `list` is `list-form`: `list` is a prelude macro (`PRELUDE_MACROS`),
+;;   and a macro is expanded before a function of the same name is looked
+;;   for, so a function called `list` could never be called;
+;; - `malformed` is `malformed-error` of `expand.error` (the skeleton put
+;;   it there); `malformed` below is the same function under the Rust
+;;   name, so a call ported from `malformed(..)` reads the same.
+;; A Rust `&[Form]` is a `(Vec Stx)`, `usize` an `i64`, `Option<usize>`
+;; an `(Option i64)`, and `Result<(), ExpandError>` a `(Result unit
+;; ExpandError)`.
+(ns expand.build (:use syntax.pos syntax.form util.result expand.error))
+
+;; `(Sym name)`.
+(defun sym (name: str pos: Pos) -> Stx
+  (Stx (SSym name) pos))
+
+;; `(List items)`.
+(defun list-form (items: (Vec Stx) pos: Pos) -> Stx
+  (Stx (SList items) pos))
+
+;; `(Vec items)`.
+(defun vector (items: (Vec Stx) pos: Pos) -> Stx
+  (Stx (SVec items) pos))
+
+;; A call `(head args...)` with a symbol head.
+(defun call (head: str args: (Vec Stx) pos: Pos) -> Stx
+  (let ((n (count args)))
+    (loop ((i 0) (items [(sym head pos)]))
+      (if (< i n)
+          (recur (+ i 1) (conj items (nth args i)))
+          (list-form items pos)))))
+
+;; `()`, the unit value.
+(defun unit (pos: Pos) -> Stx
+  (list-form (vec-empty) pos))
+
+;; An `i64` literal.
+(defun int (v: i64 pos: Pos) -> Stx
+  (Stx (SInt v I64) pos))
+
+;; A string literal.
+(defun string (s: str pos: Pos) -> Stx
+  (Stx (SStr s) pos))
+
+;; A boolean literal.
+(defun boolean (b: bool pos: Pos) -> Stx
+  (Stx (SBool b) pos))
+
+;; A keyword, name without the colon.
+(defun keyword (name: str pos: Pos) -> Stx
+  (Stx (SKw name) pos))
+
+;; The name of the head symbol of a list form, if it has one.
+(defun head-name (form: Stx) -> (Option str)
+  (match (. form kind)
+    ((SList items)
+     (if (> (count items) 0)
+         (match (. (nth items 0) kind)
+           ((SSym name) (some name))
+           (_ nil))
+         nil))
+    (_ nil)))
+
+;; A `Malformed` error.
+(defun malformed (head: str reason: str pos: Pos) -> ExpandError
+  (malformed-error head reason pos))
+
+;; A `MacroArity` error unless `min <= n <= max` (`max` of `nil` means
+;; unbounded), where `n` counts the arguments after the head of `items`.
+(defun check-arity (name: str items: (Vec Stx) min: i64 max: (Option i64) pos: Pos)
+    -> (Result unit ExpandError)
+  (let ((found (if (> (count items) 0) (- (count items) 1) 0)))
+    (if (and (>= found min) (within-max found max))
+        (Ok ())
+        (Err (ExpandError (MacroArity name (arity-expected min max) found) pos)))))
+
+(defun within-max :private (found: i64 max: (Option i64)) -> bool
+  (match max
+    ((some m) (<= found m))
+    (nil true)))
+
+;; What the arity admits, as the message says it: "2", "1 to 3" or "at
+;; least 1".
+(defun arity-expected :private (min: i64 max: (Option i64)) -> str
+  (match max
+    ((some m) (if (= m min) (show min) (str-join [(show min) " to " (show m)])))
+    (nil (str-join ["at least " (show min)]))))

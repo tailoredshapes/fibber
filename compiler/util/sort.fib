@@ -1,0 +1,46 @@
+;; compiler/util/sort.fib: the sort the compiler passes share. fibber's
+;; library has no sort, and the expansion dump (spec/bootstrap.md §5.2)
+;; must list the macros, structs, enums, aliases and re-exports of a
+;; context in the order of their names as byte strings, because a `Map`
+;; has no order the dump may rely on. Rust's `sort_by` and `sort_unstable`
+;; over `String`s are what this replaces.
+;;
+;; `sort-by` is a stable merge sort: of two elements that neither is less
+;; than the other, the one that came first stays first (Rust's `sort_by`
+;; is stable too, and `sort_unstable` of equal strings cannot tell the
+;; difference). It halves the index range of its argument, sorts each half
+;; and merges, so its recursion is as deep as the binary logarithm of the
+;; count. `less` is a strict order: `(less x y)` is true when x goes
+;; before y. `sort-strs` orders strings byte by byte, as `<` on `str`
+;; does in both tools (`(< "é" "z")` is false).
+(ns util.sort)
+
+;; The elements of a, then those of b, ordered by less; when neither of
+;; two is less than the other the one of a goes first.
+(defun merge-sorted :private (a: (Vec t) b: (Vec t) less: (fn (t t) bool) :borrow) -> (Vec t)
+  (let ((na (count a))
+        (nb (count b)))
+    (loop ((i 0) (j 0) (acc (vec-empty)))
+      (if (< i na)
+          (if (and (< j nb) (less (nth b j) (nth a i)))
+              (recur i (+ j 1) (conj acc (nth b j)))
+              (recur (+ i 1) j (conj acc (nth a i))))
+          (if (< j nb)
+              (recur i (+ j 1) (conj acc (nth b j)))
+              acc)))))
+
+;; The elements of v from lo up to, not including, hi, sorted.
+(defun sort-range :private (v: (Vec t) lo: i64 hi: i64 less: (fn (t t) bool) :borrow) -> (Vec t)
+  (let ((n (- hi lo)))
+    (if (< n 2)
+        (if (= n 1) [(nth v lo)] (vec-empty))
+        (let ((mid (+ lo (shr n 1))))
+          (merge-sorted (sort-range v lo mid less) (sort-range v mid hi less) less)))))
+
+;; v ordered by less, stably.
+(defun sort-by (v: (Vec t) less: (fn (t t) bool) :borrow) -> (Vec t)
+  (sort-range v 0 (count v) less))
+
+;; v ordered as byte strings.
+(defun sort-strs (v: (Vec str)) -> (Vec str)
+  (sort-by v (fn (x: str y: str) (< x y))))

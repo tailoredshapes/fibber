@@ -1,0 +1,48 @@
+;; compiler/expand/prelude/parts.fib: the small helpers the prelude macros
+;; share (expand.prelude and expand.prelude.forms): the Rust's
+;; `iter().skip(n)`, `Form::as_list`, `Form::as_sym` and `body_form`
+;; (prelude/logic.rs) over a `(Vec Stx)`.
+(ns expand.prelude.parts (:use syntax.pos syntax.form expand.build))
+
+;; The items of items from index `from` on (Rust `.skip(from)`).
+(defun tail-from (items: (Vec Stx) from: i64) -> (Vec Stx)
+  (loop ((i from) (acc (vec-empty)))
+    (if (< i (count items)) (recur (+ i 1) (conj acc (nth items i))) acc)))
+
+;; The forms of a followed by those of b.
+(defun concat-forms (a: (Vec Stx) b: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 0) (acc a))
+    (if (< i (count b)) (recur (+ i 1) (conj acc (nth b i))) acc)))
+
+;; The first n forms of items.
+(defun head-of (items: (Vec Stx) n: i64) -> (Vec Stx)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj acc (nth items i))) acc)))
+
+;; Item i of items, `()` when there is none (Rust `unwrap_or_else(unit)`).
+(defun item-or-unit (items: (Vec Stx) i: i64 pos: Pos) -> Stx
+  (if (< i (count items)) (nth items i) (unit pos)))
+
+;; The items of a list form. (Form::as_list)
+(defun items-of (form: Stx) -> (Option (Vec Stx))
+  (match (. form kind)
+    ((SList items) (some items))
+    (_ nil)))
+
+;; The name of a symbol form. (Form::as_sym)
+(defun sym-of (form: Stx) -> (Option str)
+  (match (. form kind)
+    ((SSym s) (some s))
+    (_ nil)))
+
+;; Whether the form is the symbol `name`.
+(defun is-sym (form: Stx name: str) -> bool
+  (match (sym-of form)
+    ((some s) (= s name))
+    (nil false)))
+
+;; The body forms as one expression: the form itself when there is one,
+;; `(do body...)` otherwise (`(do)`, unit, when there are none).
+(defun body-form (body: (Vec Stx) pos: Pos) -> Stx
+  (if (= (count body) 1) (nth body 0) (call "do" body pos)))
+

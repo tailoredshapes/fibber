@@ -1,0 +1,114 @@
+;; compiler/expand/program.fib: the expander's entry points, as
+;; crates/fibref/src/expand/mod.rs (121 lines: its module list, `use`s and
+;; doc comment are this header and the `ns` form) and `prelude_forms` of
+;; crates/fibref/src/types/mod.rs: `expand-program` expands the top-level
+;; forms of one module, in order, into a context; `expand-expr` one form
+;; in expression position; `prelude-source`, `expand-prelude` and
+;; `prelude-forms` make the context every program expands in.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `&mut dyn MacroRunner` is a `Runner` (expand.ctx): stage 2a
+;;   passes `(no-runner)`, stage 2b a closure over the state of
+;;   compiler/lair/expand.fib. `Result<Vec<Form>, ExpandError>` is
+;;   `(Result (Vec Stx) ExpandError)`.
+;; - `PRELUDE_SOURCE` is the constant `prelude-source`, the same text byte
+;;   for byte (the continuation `\` at the start of the Rust literal
+;;   drops its first newline: this one begins at `(defenum`), so that the
+;;   positions of the forms read from it are the Rust ones.
+;; - `types::prelude_forms(ctx)` includes `lib/prelude.fib` in the Rust
+;;   executable at build time (`include_str!`); a fibber tool reads it. So
+;;   `prelude-forms-of ctx lib` takes the text of `lib/prelude.fib` (read
+;;   as the file `lib/prelude.fib`, so that the positions and the file
+;;   names of the messages are the Rust ones), and `prelude-forms ctx`
+;;   reads it from the working directory (spec/bootstrap.md §5.1: the
+;;   test makes that the repository root); a file that cannot be read
+;;   is the error text `cannot read lib/prelude.fib`. Both give the error
+;;   as text, the `Display` of the `ReadError` or `ExpandError` that
+;;   stopped it (`FILE:L:C: MESSAGE`), as Rust does.
+;; - `expand_program`'s `for form in forms` is a loop over the vector that
+;;   threads the output vector `top-form` takes and returns; the one
+;;   `Expander` (and so its depth Cell) serves the whole module.
+;; - `expand_prelude` reads a constant that cannot fail to read (the Rust
+;;   says so with an `expect`: the unit test `prelude_expands` reads it),
+;;   so a read error is a `trap` here, not an error value.
+(ns expand.program
+  (:require [syntax.reader :as reader])
+  (:use syntax.pos syntax.form syntax.error util.result expand.error expand.types
+        expand.ctx expand.expr expand.walk expand.top))
+
+;; The prelude forms the expander itself needs (syntax §4.4, §4.5): the
+;; `List` enum, and `derive` of Eq, Ord, Hash and Show for Option and
+;; List. The rest of the prelude is library code, not here.
+;; (PRELUDE_SOURCE)
+(def prelude-source: str
+  "(defenum (List a) (empty) (cons head: a tail: (List a)))\n(derive Eq Option) (derive Ord Option) (derive Hash Option) (derive Show Option)\n(derive Eq List) (derive Ord List) (derive Hash List) (derive Show List)\n")
+
+;; Expands the top-level forms of one module, in order, into ctx: stops at
+;; the first error. The steps and forms counters start again at 0 for each
+;; top-level form. (expand_program)
+(defun expand-program (forms: (Vec Stx) ctx: ExpandCtx runner: Runner) -> (Result (Vec Stx) ExpandError)
+  (let ((ex (expander-new ctx runner))
+        (n (count forms)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i n)
+          (do (ctx-reset-counters ctx)
+              (match (top-form ex (nth forms i) out)
+                ((Err e) (Err e))
+                ((Ok next) (recur (+ i 1) next))))
+          (Ok out)))))
+
+;; Expands one form in expression position (for a test); the counters
+;; start at 0. (expand_expr)
+(defun expand-expr (form: Stx ctx: ExpandCtx runner: Runner) -> (Result Stx ExpandError)
+  (do (ctx-reset-counters ctx)
+      (expr (expander-new ctx runner) form)))
+
+;; Reads and expands prelude-source into ctx with no runner, registering
+;; `List`, and returns the expanded forms (the `defenum` and eight
+;; `impl`s). (expand_prelude)
+(defun expand-prelude (ctx: ExpandCtx) -> (Result (Vec Stx) ExpandError)
+  (match (reader/read-all prelude-source "<prelude>")
+    ;; prelude-source is a constant that reads (the Rust `expect` says
+    ;; the same), so this cannot happen.
+    ((Err _) (trap "expand-prelude: prelude-source does not read"))
+    ((Ok forms) (expand-program forms ctx (no-runner)))))
+
+;; The read error's Display text: `FILE:L:C: MESSAGE`.
+(defun read-error-text :private (e: ReadError) -> str
+  (str-join [(pos-display (. e pos)) ": " (err-message (. e kind))]))
+
+;; The forms of a followed by those of b.
+(defun append-forms :private (a: (Vec Stx) b: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 0) (acc a))
+    (if (< i (count b)) (recur (+ i 1) (conj acc (nth b i))) acc)))
+
+;; The forms of lib, read as the file `lib/prelude.fib` and expanded in
+;; ctx with no runner, after own; the error as text.
+(defun library-forms :private (ctx: ExpandCtx own: (Vec Stx) lib: str) -> (Result (Vec Stx) str)
+  (match (reader/read-all lib "lib/prelude.fib")
+    ((Err e) (Err (read-error-text e)))
+    ((Ok read)
+     (match (expand-program read ctx (no-runner))
+       ((Err e) (Err (expand-error-text e)))
+       ((Ok forms) (Ok (append-forms own forms)))))))
+
+;; The prelude's forms after expansion: those of `expand-prelude`, then
+;; those of lib (the text of lib/prelude.fib) read as the file
+;; `lib/prelude.fib` and expanded with no runner; the context ends the
+;; module. Registers the prelude's types in ctx, so that a module expanded
+;; afterwards in the same ctx can derive over them. The error is text.
+;; (types::prelude_forms)
+(defun prelude-forms-of (ctx: ExpandCtx lib: str) -> (Result (Vec Stx) str)
+  (match (expand-prelude ctx)
+    ((Err e) (Err (expand-error-text e)))
+    ((Ok own)
+     (match (library-forms ctx own lib)
+       ((Err m) (Err m))
+       ((Ok forms) (do (ctx-end-module ctx) (Ok forms)))))))
+
+;; `prelude-forms-of` over the file `lib/prelude.fib` of the working
+;; directory.
+(defun prelude-forms (ctx: ExpandCtx) -> (Result (Vec Stx) str)
+  (match (read-file "lib/prelude.fib")
+    ((some lib) (prelude-forms-of ctx lib))
+    (nil (Err "cannot read lib/prelude.fib"))))

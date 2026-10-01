@@ -1,0 +1,193 @@
+;; compiler/expand/args.fib: the words `fibref expand` and
+;; `compiler/expand.fib` take before the files (spec/bootstrap.md §5.1), as
+;; crates/fibref/src/expand_dump/args.rs (184 lines of Rust, 99 of them
+;; tests) and the types of `expand_dump/mod.rs` that it reads and writes
+;; (`RunnerKind`, `LimitOverrides`, `Options`). They are defined here and
+;; not in expand.dump (porter 5), which uses this module: a module may not
+;; use the one that uses it.
+;;
+;; The words that start with `--` before the first file are options
+;; (`--prelude`, `--context`, `--no-runner`, `--max-steps N`, `--max-depth
+;; N`, `--max-forms N`, each number decimal digits), and a lone `--` ends
+;; them, so that a file named like an option can follow it. No file, a
+;; word that is not an option, or a number that is not digits is refused.
+;;
+;; Decided here, where the Rust is silent or the types differ:
+;; - `Option<(Options, Vec<String>)>` is `(Option ParsedArgs)`; `&[String]`
+;;   is the `(Vec str)` that `(args)` returns, with no program name (the
+;;   tool is `compiler/expand.fib FILE..`, and `fibref expand` hands over
+;;   the words after `expand`).
+;; - `usize` is `i64` (the limits of expand.types are `i64`). A limit of
+;;   decimal digits is refused when it does not fit a u64 (as Rust's
+;;   `parse::<usize>` refuses it), and one from 2^63 up to 2^64 - 1, which
+;;   Rust takes and `i64` cannot hold, is kept as 9223372036854775807: the
+;;   steps, forms or depth of any input are below it, so no expansion can
+;;   tell the two apart, but `flags` of such an `Options` writes the
+;;   clamped number and not the one parsed.
+;; - `RunnerKind::None` is `NoRunner` (what it selects: the Rust struct
+;;   `NoRunner`, the `no-runner` of expand.ctx): `None` reads as an
+;;   Option's variant.
+(ns expand.args)
+
+;; What runs a user macro: the interpreter's evaluator (stage 2b's runner
+;; stands for it here, stage 2a has none), or nothing: a call of a user
+;; macro is `MacroNeedsEvaluator`.
+(defenum RunnerKind Evaluator NoRunner)
+
+;; Limits to expand under instead of the defaults, set once the prelude is
+;; expanded. nil keeps the default.
+(defstruct LimitOverrides (steps: (Option i64) depth: (Option i64) forms: (Option i64)))
+
+;; How the dump expands and what it prints.
+(defstruct Options
+  (prelude: bool       ;; `--prelude`: each file is a library prelude
+   context: bool       ;; `--context`: the context each module leaves
+   runner: RunnerKind  ;; `--no-runner`
+   limits: LimitOverrides))
+
+;; The options and the files of the words after the tool's name.
+(defstruct ParsedArgs (opts: Options files: (Vec str)))
+
+;; Options::default(): not a prelude, no context, the evaluator, the
+;; default limits.
+(defun options-default () -> Options
+  (Options false false Evaluator (LimitOverrides nil nil nil)))
+
+;; ------------------------------------------------ the numbers of the limits
+
+(def u64-max-text: str "18446744073709551615")
+(def i64-max-text: str "9223372036854775807")
+(def i64-max: i64 9223372036854775807)
+
+;; Whether every byte of s is an ASCII digit and there is one.
+(defun all-digits :private (s: str) -> bool
+  (let ((bs (str-bytes s))
+        (n (array-len bs)))
+    (and (> n 0)
+         (loop ((i 0))
+           (if (< i n)
+               (let ((b (array-get bs i)))
+                 (if (and (>= b 48i8) (<= b 57i8)) (recur (+ i 1)) false))
+               true)))))
+
+;; s without its leading zeros (a lone 0 stays one zero).
+(defun strip-zeros :private (s: str) -> str
+  (let ((n (str-len s)))
+    (loop ((i 0))
+      (if (and (< i (- n 1)) (= (str-slice s i (+ i 1)) "0"))
+          (recur (+ i 1))
+          (str-slice s i n)))))
+
+;; The value of d, which is at most 19 digits and no leading zeros: the
+;; digits folded in, which an i64 holds when d is not above i64-max-text.
+(defun fold-digits :private (d: str) -> i64
+  (let ((bs (str-bytes d))
+        (n (array-len bs)))
+    (loop ((i 0) (acc 0))
+      (if (< i n)
+          (recur (+ i 1) (+ (* acc 10) (- (zext i64 (array-get bs i)) 48)))
+          acc))))
+
+;; Whether d (digits, no leading zeros) is above the maximum of the same
+;; length: a longer number is above, a shorter one is not.
+(defun above :private (d: str max: str) -> bool
+  (let ((nd (str-len d))
+        (nm (str-len max)))
+    (if (> nd nm) true (if (< nd nm) false (> d max)))))
+
+;; The number of a limit: nil unless s is decimal digits that fit a u64
+;; (Rust's `parse::<usize>`); from 2^63 up, which an i64 cannot hold, it is
+;; i64-max (see the header).
+(defun parse-limit :private (s: str) -> (Option i64)
+  (if (all-digits s)
+      (let ((d (strip-zeros s)))
+        (if (above d u64-max-text)
+            nil
+            (some (if (above d i64-max-text) i64-max (fold-digits d)))))
+      nil))
+
+;; ------------------------------------------------------ the options
+
+(defun with-limits :private (o: Options l: LimitOverrides) -> Options
+  (Options (. o prelude) (. o context) (. o runner) l))
+
+(defun with-steps :private (o: Options n: i64) -> Options
+  (let ((l (. o limits)))
+    (with-limits o (LimitOverrides (some n) (. l depth) (. l forms)))))
+
+(defun with-depth :private (o: Options n: i64) -> Options
+  (let ((l (. o limits)))
+    (with-limits o (LimitOverrides (. l steps) (some n) (. l forms)))))
+
+(defun with-forms :private (o: Options n: i64) -> Options
+  (let ((l (. o limits)))
+    (with-limits o (LimitOverrides (. l steps) (. l depth) (some n)))))
+
+;; The words from index i on, as the files, or nil when there are none.
+(defun files-from :private (words: (Vec str) i: i64 o: Options) -> (Option ParsedArgs)
+  (let ((n (count words)))
+    (if (< i n)
+        (some (ParsedArgs o (loop ((j i) (acc (vec-empty)))
+                              (if (< j n) (recur (+ j 1) (conj acc (nth words j))) acc))))
+        nil)))
+
+;; The option at i takes the number at i + 1: the options with that number
+;; set by set, and the words from i + 2 on, or nil for a number that is
+;; missing or not one.
+(defun with-limit :private (words: (Vec str) i: i64 o: Options set: (fn (Options i64) Options) :borrow) -> (Option ParsedArgs)
+  (if (< (+ i 1) (count words))
+      (match (parse-limit (nth words (+ i 1)))
+        (nil nil)
+        ((some n) (parse-from words (+ i 2) (set o n))))
+      nil))
+
+;; The options from index i on, then the files. (args.rs `parse_args`'s
+;; loop and its final check)
+(defun parse-from :private (words: (Vec str) i: i64 o: Options) -> (Option ParsedArgs)
+  (if (>= i (count words))
+      nil
+      (let ((w (nth words i)))
+        (cond
+          ((= w "--") (files-from words (+ i 1) o))
+          ((= w "--prelude")
+           (parse-from words (+ i 1) (Options true (. o context) (. o runner) (. o limits))))
+          ((= w "--context")
+           (parse-from words (+ i 1) (Options (. o prelude) true (. o runner) (. o limits))))
+          ((= w "--no-runner")
+           (parse-from words (+ i 1) (Options (. o prelude) (. o context) NoRunner (. o limits))))
+          ((= w "--max-steps") (with-limit words i o with-steps))
+          ((= w "--max-depth") (with-limit words i o with-depth))
+          ((= w "--max-forms") (with-limit words i o with-forms))
+          ((starts-with? w "--") nil)
+          (true (files-from words i o))))))
+
+;; The options and files of words, or nil for a word that is not an
+;; option, a number that is not digits, or no file. (args.rs `parse_args`)
+(defun parse-args (words: (Vec str)) -> (Option ParsedArgs)
+  (parse-from words 0 (options-default)))
+
+;; The words of a limit, if set: its option and its number.
+(defun limit-words :private (word: str v: (Option i64)) -> (Vec str)
+  (match v
+    (nil (vec-empty))
+    ((some n) [word (show n)])))
+
+(defun append-words :private (a: (Vec str) b: (Vec str)) -> (Vec str)
+  (loop ((i 0) (acc a))
+    (if (< i (count b)) (recur (+ i 1) (conj acc (nth b i))) acc)))
+
+;; The option words that make parse-args read opts, in the order
+;; `--prelude`, `--context`, `--no-runner`, `--max-steps`, `--max-depth`,
+;; `--max-forms`; none for the defaults. (args.rs `flags`)
+(defun flags (opts: Options) -> (Vec str)
+  (let ((l (. opts limits))
+        (on (fn (b: bool word: str) (if b [word] (vec-empty)))))
+    (append-words
+      (append-words
+        (append-words
+          (append-words
+            (append-words (on (. opts prelude) "--prelude") (on (. opts context) "--context"))
+            (match (. opts runner) ((NoRunner) ["--no-runner"]) ((Evaluator) (vec-empty))))
+          (limit-words "--max-steps" (. l steps)))
+        (limit-words "--max-depth" (. l depth)))
+      (limit-words "--max-forms" (. l forms)))))

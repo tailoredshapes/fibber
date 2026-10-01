@@ -1,0 +1,52 @@
+;; compiler/expand/heads.fib: what the head of a list form means to the
+;; expander (syntax §4.2, §4.3), as crates/fibref/src/expand/heads.rs (72
+;; lines of Rust). The Rust arrays are `def`s of `(Vec str)`; the tests
+;; `contains` are loops over them, as `is-core`, `is-definition` and
+;; `is-quasi-form` (Rust's `QUASI_FORMS.contains(..)` call site).
+(ns expand.heads)
+
+;; The twenty-three core forms of §4.2, in the order of the Rust array.
+(def core-forms: (Vec str)
+  ["defun" "def" "fn" "let" "if" "do" "match" "loop" "recur" "defstruct" "."
+   "defenum" "defprotocol" "impl" "&" "async" "await" "unsafe" "extern" "quote"
+   "defmacro" "ns" "var"])
+
+;; The core forms that §2 admits only at top level.
+(def definitions: (Vec str)
+  ["defun" "def" "defstruct" "defenum" "defprotocol" "impl" "defmacro" "extern" "ns"])
+
+;; The conversions of §4.3 whose first operand is a target type.
+(def conversions: (Vec str) :private
+  ["trunc" "zext" "sext" "fptrunc" "fpext" "fptosi" "fptoui" "sitofp" "uitofp"])
+
+;; Forms that exist only until expansion (§4.2).
+(def quasi-forms: (Vec str) ["quasiquote" "unquote" "unquote-splicing"])
+
+(defun member-of :private (names: (Vec str) name: str) -> bool
+  (let ((n (count names)))
+    (loop ((i 0))
+      (cond ((>= i n) false)
+            ((= (nth names i) name) true)
+            (else (recur (+ i 1)))))))
+
+;; Whether `name` is a core form.
+(defun is-core (name: str) -> bool
+  (member-of core-forms name))
+
+;; Whether `name` is a top-level-only core form.
+(defun is-definition (name: str) -> bool
+  (member-of definitions name))
+
+;; Whether `name` is one of the forms that exist only until expansion.
+(defun is-quasi-form (name: str) -> bool
+  (member-of quasi-forms name))
+
+;; For a primitive form of §4.3, the index (in the list, head at 0) of
+;; the operand that is not an expression and that the expander leaves
+;; alone: the field name of `set-field!`, the protocol of `dyn`, the
+;; target type of a conversion.
+(defun primitive-operand (name: str) -> (Option i64)
+  (cond ((= name "set-field!") (some 2))
+        ((= name "dyn") (some 1))
+        ((member-of conversions name) (some 1))
+        (else nil)))

@@ -1,0 +1,269 @@
+;; compiler/expand/expr.fib: the expression walker's decisions about one
+;; form, as crates/fibref/src/expand/expr.rs (207 lines): expand macros at
+;; the head outermost-first (a user macro, which shadows a prelude macro
+;; of the same name, then a prelude macro, then `quasiquote`), count each
+;; expansion as a step, admit its result (size and literals), then plan
+;; the walk of what remains (the roles of its items) and say how to finish
+;; it once its items are walked (the syntax §1.4 rewrite of `[..]` and
+;; `{..}`, and `nil` as `(Nil)`). `expand.walk` applies these decisions to
+;; a whole tree with an explicit stack.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `Expander { ctx: &mut ExpandCtx, runner: &mut dyn
+;;   MacroRunner, depth }` is `(Expander ctx runner depth)`: the shared
+;;   `ExpandCtx` (its mutable parts are Cells), a `Runner` (a struct of
+;;   one function, expand.ctx) and the nesting depth in a `Cell`. Its
+;;   methods are functions of the `expander-` prefix: `new`, `enter`
+;;   (Result), `leave`; `run_user` is a private helper.
+;; - `Result<(Form, Role, Finish), ExpandError>` is `(Result Planned
+;;   ExpandError)`, `Planned` a struct of the three: fibber has no tuples.
+;; - the variants of `Finish` are `FinSame FinNil FinVec FinMap` (Rust:
+;;   `Same Nil VecLiteral MapLiteral`): a variant called `Nil` would read
+;;   as the form `(Nil)` that this very pass writes for `nil`, and a
+;;   variant's name is global to the module that `:use`s it. Bare words
+;;   in an expression, `((FinNil) ..)` in a pattern.
+;; - `MacroDef::accepts` and `arity_text` (runner.rs) have no caller but
+;;   `run_user`, so they are private helpers of this module, as
+;;   the header of expand.types says: expand.types does not define them;
+;;   the Rust fields and methods of the context that `run_user` and
+;;   `expand_head` reach (`limits`, `call_pos`, `step`, `admit`,
+;;   `macro_def`, `macro_ambiguity`) are the `ctx-` functions of expand.ctx.
+;; - the Rust `&mut Expander` is the one `Expander` the walk threads
+;;   through; `expand-head`, `plan-expr` and `finish-form` take it (the
+;;   last does not need it).
+;; - `expand_head`'s loop is a `loop`/`recur` (a macro whose expansion is
+;;   its own call again chains up to max-steps expansions, 100,000 by
+;;   default, which no native stack holds); what one pass of it decides is
+;;   the enum `Rewriting` (not `Head`: the compiler's lowering takes the
+;;   private `Head` of expand.types for it), `Settled` (return the form)
+;;   or `Rewrote` (admit the result, go again).
+;; - `plan` is private and gives the `Planned` of the form it was given
+;;   (Rust's `(Role, Finish)` and the form beside them).
+(ns expand.expr
+  (:require [expand.prelude :as prelude] [expand.quasi :as quasi])
+  (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.core
+        expand.build expand.heads expand.collections))
+
+;; The state of one expansion: the context, the runner for user macros
+;; and the current nesting depth.
+(defstruct Expander (ctx: ExpandCtx runner: Runner depth: (Cell i64)))
+
+;; What to do with a form after its items are walked (Rust `Finish`):
+;; nothing; `nil` is `(Nil)`; `[..]` is a chain of `conj`; `{..}` is a
+;; chain of `assoc`.
+(defenum Finish FinSame FinNil FinVec FinMap)
+
+;; What `plan-expr` decides: the form with its macros expanded at the
+;; head, the role of its items and how to finish it.
+(defstruct Planned (form: Stx role: Role finish: Finish))
+
+;; An expander at depth 0. (Expander::new)
+(defun expander-new (ctx: ExpandCtx runner: Runner) -> Expander
+  (Expander ctx runner (cell 0)))
+
+;; Enters one level of nesting, failing past the depth limit: TooDeep at
+;; pos with the limit. (Expander::enter)
+(defun expander-enter (ex: Expander pos: Pos) -> (Result unit ExpandError)
+  (let ((depth (+ @(. ex depth) 1))
+        (limit (. (ctx-limits (. ex ctx)) max-depth)))
+    (do (set! (. ex depth) depth)
+        (if (> depth limit)
+            (Err (ExpandError (TooDeep limit) pos))
+            (Ok ())))))
+
+;; Leaves the level entered last; never below 0. (Expander::leave)
+(defun expander-leave (ex: Expander) -> unit
+  (let ((depth @(. ex depth)))
+    (set! (. ex depth) (if (> depth 0) (- depth 1) 0))))
+
+;; Whether the macro accepts n arguments. (MacroDef::accepts)
+(defun accepts? :private (def: MacroDef n: i64) -> bool
+  (match (. def rest)
+    ((some _) (>= n (count (. def params))))
+    (nil (= n (count (. def params))))))
+
+;; The accepted argument count, in words, for an arity error.
+;; (MacroDef::arity_text)
+(defun arity-text :private (def: MacroDef) -> str
+  (match (. def rest)
+    ((some _) (str-join ["at least " (show (count (. def params)))]))
+    (nil (show (count (. def params))))))
+
+;; The items of a call after its head; none for a form that is not a list.
+(defun call-args :private (form: Stx) -> (Vec Stx)
+  (match (. form kind)
+    ((SList items)
+     (loop ((i 1) (acc (vec-empty)))
+       (if (< i (count items)) (recur (+ i 1) (conj acc (nth items i))) acc)))
+    (_ (vec-empty))))
+
+;; Runs the user macro name on the call form: its arity is checked, the
+;; call's position noted in the context, and the runner called.
+;; (Expander::run_user)
+(defun run-user :private (ex: Expander name: str form: Stx) -> (Result Stx ExpandError)
+  (let ((pos (. form pos))
+        (args (call-args form)))
+    (match (ctx-macro-def (. ex ctx) name)
+      (nil (Err (malformed name "not a macro" pos)))
+      ((some def)
+       (if (accepts? def (count args))
+           (do (ctx-set-call-pos (. ex ctx) pos)
+               (runner-run (. ex runner) def args (. ex ctx)))
+           (Err (ExpandError (MacroArity name (arity-text def) (count args)) pos)))))))
+
+;; What one pass of `expand-head` made of a form.
+(defenum Rewriting
+  ;; the form is not a macro call (or a declined one): the answer
+  (Settled form: Stx)
+  ;; the call's expansion, still to be admitted and looked at again
+  (Rewrote form: Stx))
+
+;; A prelude macro call: counted as a step and rewritten, or declined.
+(defun prelude-step :private (ex: Expander form: Stx) -> (Result Rewriting ExpandError)
+  (match (ctx-step (. ex ctx) (. form pos))
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (prelude/expand (. ex ctx) form)
+       ((Err e) (Err e))
+       ((Ok (prelude/Rewritten f)) (Ok (Rewrote f)))
+       ((Ok (prelude/Declined f)) (Ok (Settled f)))))))
+
+;; A user macro call: counted as a step and run.
+(defun user-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
+  (match (ctx-step (. ex ctx) (. form pos))
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (run-user ex name form)
+       ((Err e) (Err e))
+       ((Ok f) (Ok (Rewrote f)))))))
+
+;; A call whose head is name, neither `quasiquote` nor ambiguous: a user
+;; macro shadows a prelude macro, anything else is left alone.
+(defun macro-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
+  (match (ctx-macro-def (. ex ctx) name)
+    ((some _) (user-step ex form name))
+    (nil (if (prelude/is-macro name)
+             (prelude-step ex form)
+             (Ok (Settled form))))))
+
+;; One pass over a form whose head is the symbol name.
+(defun head-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
+  (let ((ctx (. ex ctx))
+        (pos (. form pos)))
+    (if (= name "quasiquote")
+        (match (ctx-step ctx pos)
+          ((Err e) (Err e))
+          ((Ok _)
+           (match (quasi/rewrite form)
+             ((Err e) (Err e))
+             ((Ok f) (Ok (Rewrote f))))))
+        (match (ctx-macro-ambiguity ctx name)
+          ((some a) (Err (ExpandError (AmbiguousMacro name (. a first) (. a second)) pos)))
+          (nil (macro-step ex form name))))))
+
+;; Expands form while its head is a macro (a user macro, which shadows a
+;; prelude macro of the same name, then a prelude macro) or `quasiquote`,
+;; counting each expansion as a step and admitting its result. Returns the
+;; first form that is not a macro call, or a `for-each` or `range` the
+;; prelude declined. (expand_head)
+(defun expand-head (ex: Expander form: Stx) -> (Result Stx ExpandError)
+  (loop ((form form))
+    (match (head-name form)
+      (nil (Ok form))
+      ((some name)
+       (match (head-step ex form name)
+         ((Err e) (Err e))
+         ((Ok (Settled f)) (Ok f))
+         ((Ok (Rewrote f))
+          (match (ctx-admit (. ex ctx) f (. form pos))
+            ((Err e) (Err e))
+            ((Ok admitted) (recur admitted)))))))))
+
+;; A call: the head in expression position, every argument in argument
+;; position except the operand at skip, which is left alone. (call_role)
+(defun call-role :private (skip: (Option i64)) -> Role
+  (match skip
+    (nil (role-items [Expr] Arg))
+    ((some at)
+     (role-items (loop ((first [Expr]))
+                   (if (< (count first) at)
+                       (recur (conj first Arg))
+                       (conj first Keep)))
+                 Arg))))
+
+;; The role of a list in expression position whose head is the symbol
+;; name. (the symbol arm of list_plan)
+(defun named-plan :private (name: str items: (Vec Stx) pos: Pos is-arg: bool) -> (Result Role ExpandError)
+  (cond ((= name "nil") (Err (ExpandError NilCalled pos)))
+        ((= name "unquote") (Err (ExpandError (UnquoteOutsideQuasiquote "unquote") pos)))
+        ((= name "unquote-splicing")
+         (Err (ExpandError (UnquoteOutsideQuasiquote "unquote-splicing") pos)))
+        ((= name "&")
+         (if (and is-arg (= (count items) 2) (operand-symbol? (nth items 1)))
+             (Ok Keep)
+             (Err (ExpandError InOutOutsideArgument pos))))
+        ((is-definition name) (Err (ExpandError (DefinitionInExpression name) pos)))
+        ((is-core name) (expr-plan name items pos))
+        (else (Ok (call-role (primitive-operand name))))))
+
+;; Whether f is a symbol other than `nil`: what `& x` may mark.
+(defun operand-symbol? :private (f: Stx) -> bool
+  (match (. f kind)
+    ((SSym s) (!= s "nil"))
+    (_ false)))
+
+;; The role of a non-empty list in expression position. (list_plan)
+(defun list-plan :private (items: (Vec Stx) pos: Pos is-arg: bool) -> (Result Role ExpandError)
+  (match (. (nth items 0) kind)
+    ((SNil) (Err (ExpandError NilCalled pos)))
+    ((SSym name) (named-plan name items pos is-arg))
+    (_ (Ok (call-role nil)))))
+
+;; The plan of a list that is not empty: its role, how it finishes.
+(defun plan-list :private (form: Stx items: (Vec Stx) is-arg: bool) -> (Result Planned ExpandError)
+  (match (list-plan items (. form pos) is-arg)
+    ((Err e) (Err e))
+    ((Ok role) (Ok (Planned form role FinSame)))))
+
+;; The role of a form in expression position that is not a macro call.
+;; (plan)
+(defun plan :private (form: Stx is-arg: bool) -> (Result Planned ExpandError)
+  (match (. form kind)
+    ((SSym s) (Ok (if (= s "nil")
+                      (Planned form Keep FinNil)
+                      (Planned form Keep FinSame))))
+    ((SVec _) (Ok (Planned form (role-after 0 Expr) FinVec)))
+    ((SMap items)
+     (if (= (rem (count items) 2) 1)
+         (Err (malformed "map literal" "odd number of forms" (. form pos)))
+         (Ok (Planned form (role-after 0 Expr) FinMap))))
+    ((SList items)
+     (if (> (count items) 0)
+         (plan-list form items is-arg)
+         (Ok (Planned form Keep FinSame))))
+    (_ (Ok (Planned form Keep FinSame)))))
+
+;; Expands macros at the head of form in expression position (in argument
+;; position when is-arg, where `(& x)` may stand) and plans the walk of
+;; what remains. (plan_expr)
+(defun plan-expr (ex: Expander form: Stx is-arg: bool) -> (Result Planned ExpandError)
+  (match (expand-head ex form)
+    ((Err e) (Err e))
+    ((Ok expanded) (plan expanded is-arg))))
+
+;; Applies finish to a walked form: `nil` becomes `(Nil)`, `[..]` and
+;; `{..}` become calls of fib.prelude/conj and assoc; every node it builds
+;; takes the form's position. (finish_form)
+(defun finish-form (form: Stx finish: Finish) -> Stx
+  (let ((pos (. form pos)))
+    (match finish
+      ((FinSame) form)
+      ((FinNil) (Stx SNil pos))
+      ((FinVec)
+       (match (. form kind)
+         ((SVec items) (vec-literal items pos))
+         (_ form)))
+      ((FinMap)
+       (match (. form kind)
+         ((SMap items) (map-literal items pos))
+         (_ form))))))

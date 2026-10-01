@@ -1,22 +1,50 @@
-;; compiler/expand/ctx.fib: the expansion context, as
-;; crates/fibref/src/expand/{ctx,inspect,reflect,admit,private}.rs:
-;; everything the expander remembers between forms, passed explicitly
-;; (no global state). Rust's `&mut ExpandCtx` is an `ExpandCtx` whose
-;; mutable parts are Cells: every function takes it and changes it
-;; through `set!`, as the reader's cursor does.
+;; compiler/expand/ctx.fib: the expansion context: everything the expander
+;; remembers between forms, passed explicitly (no global state). It
+;; replaces crates/fibref/src/expand/ctx.rs (317 lines), inspect.rs (111),
+;; reflect.rs (92), admit.rs (38) and the `MacroRunner` and `NoRunner` of
+;; runner.rs (129, of which `MacroDef` is in expand.types and
+;; `parse_params` in expand.top): 558 lines of Rust in all.
 ;;
-;; THE SHARED BASE of M6 step 2 (spec/bootstrap.md §5): the struct is
-;; fixed; the functions that say `todo:` belong to the porter of the Rust
-;; file named beside them. Nothing here may change without telling the
-;; other porters.
+;; Rust's `&mut ExpandCtx` is an `ExpandCtx` whose mutable parts are
+;; Cells: every function takes it and changes it through `set!`, as the
+;; reader's cursor does.
+;;
+;; THE SHARED BASE of M6 step 2 (spec/bootstrap.md §5): the struct and the
+;; signatures are fixed and were written by wave A; the bodies are porter
+;; 2's (wave B). Nothing above the line `---- what the passes added` may
+;; change without telling the other porters; what is below it was added by
+;; wave A for the pub(crate) fields and methods of the Rust context that
+;; other modules reach (a Rust field read or written from outside is a
+;; function here).
+;;
+;; Two helper modules hold what does not need the context, so that this
+;; file stays under 500 lines: expand.reflect (the answers of reflect.rs)
+;; and expand.admit (admit.rs: the count and check, and the rebuild that
+;; rounds an f32 literal). `ctx-reflect` and `ctx-admit` here are the
+;; context's methods and call them.
 ;;
 ;; The Maps are keyed by `ns/name` (macros), by name (structs, enums) and
 ;; by `ns` (exports). The two sets of type names are Maps of `true`, as
 ;; the prelude's Set is. A Map has no order the dump may rely on: the
 ;; context dump sorts by key (expand_dump/context.rs), so the accessors
 ;; at the end return sorted vectors.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `TypeTable` (types.rs) is not a type: its maps and sets are
+;;   the `structs`, `enums`, `private-types` and `hidden-types` of the
+;;   context, and its `add_struct`, `add_enum` and `end_module` are
+;;   `ctx-add-struct`, `ctx-add-enum` and `ctx-end-module`.
+;; - `reflect` (reflect.rs), `admit` (admit.rs), `step` (ctx.rs) and the
+;;   rest are `ctx-NAME` functions of the context; `Result<(), E>` is
+;;   `(Result unit ExpandError)`. `admit` takes a form and gives back the
+;;   admitted one (the Rust one rounds an f32 literal in place), counting
+;;   in the order the Rust stack does: the root, then the last item of a
+;;   list before the first (see expand.admit).
+;; - the `MacroRunner` trait is the struct `Runner` of one function; a
+;;   Rust `&mut dyn MacroRunner` is a `Runner`.
 (ns expand.ctx
-  (:use syntax.pos syntax.form syntax.error util.result expand.error expand.types))
+  (:require [expand.admit :as admit] [expand.reflect :as refl])
+  (:use syntax.pos syntax.form syntax.error util.result util.sort expand.error expand.types))
 
 (defstruct ExpandCtx
   (limits: (Cell Limits)
@@ -54,37 +82,66 @@
 ;; from the text in expand/types.rs FORM_ENUM read as "<builtin>") and the
 ;; default limits. (ctx.rs `ExpandCtx::new`, types.rs)
 (defun ctx-new () -> ExpandCtx
-  (trap "todo: expand.ctx ctx-new"))
+  (ExpandCtx (cell (limits-default))
+             (cell 0)
+             (cell (map-empty))
+             (cell (map-empty))
+             (cell (scope-of prelude-ns))
+             (cell (map-empty))
+             (cell (builtin-enums))
+             (cell (map-empty))
+             (cell (map-empty))
+             (cell (none-pos))
+             (cell 0)
+             (cell 0)))
 
 ;; A fresh symbol `#PREFIX.N` at pos, N one more than the count so far.
 ;; (ctx.rs `gensym`)
 (defun ctx-gensym (ctx: ExpandCtx prefix: str pos: Pos) -> Stx
-  (trap "todo: expand.ctx ctx-gensym"))
+  (let ((n (+ @(. ctx gensyms) 1)))
+    (do (set! (. ctx gensyms) n)
+        (Stx (SSym (str-join ["#" prefix "." (show n)])) pos))))
 
 ;; Starts expanding module ns with these uses and aliases (alias to
 ;; module). (ctx.rs `begin_module`)
 (defun ctx-begin-module (ctx: ExpandCtx ns: str uses: (Vec str) aliases: (Map str str)) -> unit
-  (trap "todo: expand.ctx ctx-begin-module"))
+  (set! (. ctx scope) (ModuleScope ns uses aliases)))
 
 ;; Records that module ns re-exports these modules. (ctx.rs `reexport`)
 (defun ctx-reexport (ctx: ExpandCtx ns: str exports: (Vec str)) -> unit
-  (trap "todo: expand.ctx ctx-reexport"))
+  (if (> (count exports) 0)
+      (set! (. ctx exports) (assoc @(. ctx exports) ns exports))
+      ()))
 
 ;; Ends the module being expanded: its private types are hidden from the
 ;; next, and the scope is a program with no ns clauses. (ctx.rs
 ;; `end_module`, types.rs `end_module`)
 (defun ctx-end-module (ctx: ExpandCtx) -> unit
-  (trap "todo: expand.ctx ctx-end-module"))
+  (do (set! (. ctx hidden-types) (union-names @(. ctx hidden-types) @(. ctx private-types)))
+      (set! (. ctx private-types) (map-empty))
+      (set! (. ctx scope) (scope-of "main"))))
 
 ;; Defines the macro in the module being expanded: its ns and key are
 ;; filled in. (ctx.rs `define_macro`)
 (defun ctx-define-macro (ctx: ExpandCtx def: MacroDef) -> unit
-  (trap "todo: expand.ctx ctx-define-macro"))
+  (let ((ns (. @(. ctx scope) ns))
+        (key (str-join [(. @(. ctx scope) ns) "/" (. def name)])))
+    (set! (. ctx macros)
+          (assoc @(. ctx macros) key
+                 (MacroDef (. def name) ns key (. def private) (. def params) (. def rest)
+                           (. def body) (. def pos))))))
 
 ;; Makes the macro name of the module being expanded :private.
 ;; (ctx.rs `make_macro_private`)
 (defun ctx-make-macro-private (ctx: ExpandCtx name: str) -> unit
-  (trap "todo: expand.ctx ctx-make-macro-private"))
+  (let ((key (str-join [(. @(. ctx scope) ns) "/" name])))
+    (match (map-get @(. ctx macros) key)
+      (nil ())
+      ((some d)
+       (set! (. ctx macros)
+             (assoc @(. ctx macros) key
+                    (MacroDef (. d name) (. d ns) (. d key) true (. d params) (. d rest)
+                              (. d body) (. d pos))))))))
 
 ;; The user macro name reaches from the module being expanded: alias/x in
 ;; the module the alias names, or by the full ns of the prelude or of
@@ -92,57 +149,79 @@
 ;; then in the prelude; a :private macro only in its own module. (ctx.rs
 ;; `macro_def`, `exported_macro`)
 (defun ctx-macro-def (ctx: ExpandCtx name: str) -> (Option MacroDef)
-  (trap "todo: expand.ctx ctx-macro-def"))
+  (let ((slash (slash-index name)))
+    (if (>= slash 0)
+        (qualified-macro ctx (str-slice name 0 slash) (str-slice name (+ slash 1) (str-len name)))
+        (bare-macro ctx name))))
 
 ;; The two modules of the scope whose uses export different macros called
 ;; name (first, second), which makes the bare name an error. (ctx.rs
 ;; `macro_ambiguity`)
 (defstruct Ambiguity (first: str second: str))
 (defun ctx-macro-ambiguity (ctx: ExpandCtx name: str) -> (Option Ambiguity)
-  (trap "todo: expand.ctx ctx-macro-ambiguity"))
+  (let ((scope @(. ctx scope))
+        (own (some? (map-get @(. ctx macros) (str-join [(. scope ns) "/" name])))))
+    (if (or (>= (slash-index name) 0) own)
+        nil
+        (ambiguity-from ctx (. scope uses) name))))
 
 ;; A struct or enum seen so far, by name; not a private one of an earlier
 ;; module. (ctx.rs `struct_info`, `enum_info`)
 (defun ctx-struct-info (ctx: ExpandCtx name: str) -> (Option StructInfo)
-  (trap "todo: expand.ctx ctx-struct-info"))
+  (if (some? (map-get @(. ctx hidden-types) name))
+      nil
+      (map-get @(. ctx structs) name)))
 
 (defun ctx-enum-info (ctx: ExpandCtx name: str) -> (Option EnumInfo)
-  (trap "todo: expand.ctx ctx-enum-info"))
+  (if (some? (map-get @(. ctx hidden-types) name))
+      nil
+      (map-get @(. ctx enums) name)))
 
 ;; Counts one macro expansion against max-steps: the error TooManySteps at
 ;; pos once past it. (ctx.rs `step`)
 (defun ctx-step (ctx: ExpandCtx pos: Pos) -> (Result unit ExpandError)
-  (trap "todo: expand.ctx ctx-step"))
+  (let ((n (+ @(. ctx steps) 1))
+        (limit (. @(. ctx limits) max-steps)))
+    (do (set! (. ctx steps) n)
+        (if (> n limit)
+            (Err (ExpandError (TooManySteps limit) pos))
+            (Ok ())))))
 
 ;; The reflection call (op arg), arg a Sym form (expand/reflect.rs
 ;; `reflect`): struct? and enum? give a Bool form, the others a Vec form;
 ;; NotAStruct, NotAnEnum or BadReflection otherwise.
 (defun ctx-reflect (ctx: ExpandCtx op: str arg: Stx pos: Pos) -> (Result Stx ExpandError)
-  (trap "todo: expand.ctx ctx-reflect"))
+  (match (. arg kind)
+    ((SSym name)
+     (refl/reflect-answer op name pos (ctx-struct-info ctx name) (ctx-enum-info ctx name)))
+    (_ (Err (ExpandError (BadReflection op) pos)))))
 
 ;; Counts the forms of an expansion's result and checks its literals
 ;; (expand/admit.rs `admit`): TooLarge or BadLiteral, else the form with
 ;; an f32 literal rounded.
 (defun ctx-admit (ctx: ExpandCtx form: Stx pos: Pos) -> (Result Stx ExpandError)
-  (trap "todo: expand.ctx ctx-admit"))
+  (admit/admit-form form pos (. ctx forms) (. @(. ctx limits) max-forms)))
 
 ;; ------------------------------------------------- the context's view
 ;; (expand/inspect.rs): sorted, for the context dump.
 
 (defun ctx-macros-by-key (ctx: ExpandCtx) -> (Vec MacroDef)
-  (trap "todo: expand.ctx ctx-macros-by-key"))
+  (sort-by (map-values @(. ctx macros))
+           (fn (a: MacroDef b: MacroDef) (< (. a key) (. b key)))))
 
 (defun ctx-structs-by-name (ctx: ExpandCtx) -> (Vec StructInfo)
-  (trap "todo: expand.ctx ctx-structs-by-name"))
+  (sort-by (map-values @(. ctx structs))
+           (fn (a: StructInfo b: StructInfo) (< (. a name) (. b name)))))
 
 (defun ctx-enums-by-name (ctx: ExpandCtx) -> (Vec EnumInfo)
-  (trap "todo: expand.ctx ctx-enums-by-name"))
+  (sort-by (map-values @(. ctx enums))
+           (fn (a: EnumInfo b: EnumInfo) (< (. a name) (. b name)))))
 
 (defun ctx-private-type-names (ctx: ExpandCtx) -> (Vec str)
-  (trap "todo: expand.ctx ctx-private-type-names"))
+  (sort-strs (map-keys @(. ctx private-types))))
 
 (defun ctx-hidden-type-names (ctx: ExpandCtx) -> (Vec str)
-  (trap "todo: expand.ctx ctx-hidden-type-names"))
+  (sort-strs (map-keys @(. ctx hidden-types))))
 
 ;; ------------------------------------------------------- the macro runner
 ;; (expand/runner.rs `MacroRunner`, `NoRunner`): what runs a user macro's
@@ -162,3 +241,213 @@
 ;; Runs the macro: (. runner run) applied to its arguments.
 (defun runner-run (r: Runner def: MacroDef args: (Vec Stx) ctx: ExpandCtx) -> (Result Stx ExpandError)
   ((. r run) def args ctx))
+
+;; ----------------------------------------- what the passes added
+;; The pub(crate) fields and methods of the Rust context that the other
+;; modules reach, as functions (wave A): the Rust name is beside each.
+
+;; Records a `defstruct` form, replacing any earlier one of the name; the
+;; name is no longer hidden. The parse errors of `parse-defstruct`.
+;; (types.rs `TypeTable::add_struct`; top.rs `ex.ctx.types.add_struct`)
+(defun ctx-add-struct (ctx: ExpandCtx form: Stx) -> (Result unit ExpandError)
+  (match (parse-defstruct form)
+    ((Err e) (Err e))
+    ((Ok info)
+     (do (set! (. ctx hidden-types) (dissoc @(. ctx hidden-types) (. info name)))
+         (set! (. ctx structs) (assoc @(. ctx structs) (. info name) info))
+         (Ok ())))))
+
+;; Records a `defenum` form likewise. (types.rs `TypeTable::add_enum`)
+(defun ctx-add-enum (ctx: ExpandCtx form: Stx) -> (Result unit ExpandError)
+  (match (parse-defenum form)
+    ((Err e) (Err e))
+    ((Ok info)
+     (do (set! (. ctx hidden-types) (dissoc @(. ctx hidden-types) (. info name)))
+         (set! (. ctx enums) (assoc @(. ctx enums) (. info name) info))
+         (Ok ())))))
+
+;; Notes that the struct or enum name of the module being expanded is
+;; :private. (top.rs `ex.ctx.types.private.insert(name)`)
+(defun ctx-add-private-type (ctx: ExpandCtx name: str) -> unit
+  (set! (. ctx private-types) (assoc @(. ctx private-types) name true)))
+
+;; The gensyms handed out so far: the number in the name of the last one.
+;; (ctx.rs `gensym_count`)
+(defun ctx-gensym-count (ctx: ExpandCtx) -> i64
+  @(. ctx gensyms))
+
+;; The macro expansions and the forms they produced that the current (or,
+;; after it, the last) top-level form has counted. (ctx.rs `counters`,
+;; which returns the pair)
+(defstruct Counters (steps: i64 forms: i64))
+(defun ctx-counters (ctx: ExpandCtx) -> Counters
+  (Counters @(. ctx steps) @(. ctx forms)))
+
+;; Starts the counts again at zero, as each top-level form does.
+;; (mod.rs `ex.ctx.steps = 0; ex.ctx.forms = 0`)
+(defun ctx-reset-counters (ctx: ExpandCtx) -> unit
+  (do (set! (. ctx steps) 0)
+      (set! (. ctx forms) 0)))
+
+;; The module being expanded, as macro lookup sees it. (ctx.rs `scope`)
+(defun ctx-scope (ctx: ExpandCtx) -> ModuleScope
+  @(. ctx scope))
+
+;; The position of the macro call being expanded: the position a runner
+;; gives the forms it builds that are not input forms (syntax §1.3).
+;; (ctx.rs `call_pos`; expr.rs `self.ctx.call_pos = pos`)
+(defun ctx-call-pos (ctx: ExpandCtx) -> Pos
+  @(. ctx call-pos))
+
+(defun ctx-set-call-pos (ctx: ExpandCtx pos: Pos) -> unit
+  (set! (. ctx call-pos) pos))
+
+;; The limits in force, and a change of them (the tool's `--max-steps`,
+;; `--max-depth` and `--max-forms`). (ctx.rs `limits`)
+(defun ctx-limits (ctx: ExpandCtx) -> Limits
+  @(. ctx limits))
+
+(defun ctx-set-limits (ctx: ExpandCtx limits: Limits) -> unit
+  (set! (. ctx limits) limits))
+
+;; A module that re-exports others, and the modules it re-exports in the
+;; order written.
+(defstruct Reexport (ns: str modules: (Vec str)))
+
+;; The modules each module re-exports (those that re-export none are not
+;; listed), sorted by ns as byte strings. (ctx.rs `reexports`)
+(defun ctx-reexports (ctx: ExpandCtx) -> (Vec Reexport)
+  (sort-by (map-entries-as-reexports @(. ctx exports))
+           (fn (a: Reexport b: Reexport) (< (. a ns) (. b ns)))))
+
+;; The reflection calls, by name: the ones `ctx-reflect` answers.
+;; (reflect.rs `REFLECTION_CALLS`)
+(defun reflection-calls () -> (Vec str)
+  ["struct?" "struct-fields" "struct-params" "struct-field-types"
+   "enum?" "enum-params" "enum-variants"])
+
+;; ---------------------------------------------------- private helpers
+;; Decided here, where Rust and fibber differ (the Rust names are in the
+;; comments of the functions above):
+;; - A `HashMap`'s iteration order is unspecified, and nothing here
+;;   depends on it: the values and keys a function returns are sorted by
+;;   the caller (`ctx-*-by-key`, `-by-name`, `-type-names`, `ctx-reexports`)
+;;   or only collected into another map.
+;; - `reexport` with no modules leaves an earlier entry of the module as it
+;;   is (Rust inserts only a non-empty list).
+
+(defun scope-of :private (ns: str) -> ModuleScope
+  (ModuleScope ns (vec-empty) (map-empty)))
+
+;; The values of a map, in no order.
+(defun map-values :private (m: (Map k v)) -> (Vec v)
+  (let ((acc (cell (vec-empty))))
+    (do (for-each m (fn (e: (Entry k v)) (set! acc (conj @acc (. e val)))))
+        @acc)))
+
+;; The keys of a map, in no order.
+(defun map-keys :private (m: (Map k v)) -> (Vec k)
+  (let ((acc (cell (vec-empty))))
+    (do (for-each m (fn (e: (Entry k v)) (set! acc (conj @acc (. e key)))))
+        @acc)))
+
+;; The names of a and of b (`HashSet::extend`).
+(defun union-names :private (a: (Map str bool) b: (Map str bool)) -> (Map str bool)
+  (let ((names (map-keys b))
+        (n (count names)))
+    (loop ((i 0) (acc a))
+      (if (< i n)
+          (recur (+ i 1) (assoc acc (nth names i) true))
+          acc))))
+
+(defun map-entries-as-reexports :private (m: (Map str (Vec str))) -> (Vec Reexport)
+  (let ((acc (cell (vec-empty))))
+    (do (for-each m (fn (e: (Entry str (Vec str))) (set! acc (conj @acc (Reexport (. e key) (. e val))))))
+        @acc)))
+
+;; ------------------------------------------------------- macro lookup
+
+;; The index of the first `/` of name, or -1 (`split_once('/')`; `/` is
+;; ASCII, so both halves cut at a character boundary).
+(defun slash-index :private (name: str) -> i64
+  (let ((bs (str-bytes name))
+        (n (array-len bs)))
+    (loop ((i 0))
+      (if (< i n)
+          (if (= (array-get bs i) 47i8) i (recur (+ i 1)))
+          -1))))
+
+;; The macro `name` that module `ns` exports to the module being
+;; expanded: its own (a :private one only to itself), else one that a
+;; module it re-exports exports. (ctx.rs `exported_macro`)
+(defun exported-macro :private (ctx: ExpandCtx ns: str name: str) -> (Option MacroDef)
+  (let ((own (match (map-get @(. ctx macros) (str-join [ns "/" name]))
+               (nil nil)
+               ((some d)
+                (if (or (= (. d private) false) (= (. d ns) (. @(. ctx scope) ns)))
+                    (some d)
+                    nil)))))
+    (match own
+      ((some d) (some d))
+      (nil (match (map-get @(. ctx exports) ns)
+             (nil nil)
+             ((some rs) (first-exported ctx rs name)))))))
+
+;; The first macro `name` that one of the modules rs exports.
+(defun first-exported :private (ctx: ExpandCtx rs: (Vec str) name: str) -> (Option MacroDef)
+  (let ((n (count rs)))
+    (loop ((i 0))
+      (if (< i n)
+          (match (exported-macro ctx (nth rs i) name)
+            ((some d) (some d))
+            (nil (recur (+ i 1))))
+          nil))))
+
+;; `q/base`: in the module the alias q names, or by the full ns of the
+;; prelude or of this module; no other qualifier reaches a macro.
+(defun qualified-macro :private (ctx: ExpandCtx q: str base: str) -> (Option MacroDef)
+  (let ((scope @(. ctx scope)))
+    (match (map-get (. scope aliases) q)
+      ((some ns) (exported-macro ctx ns base))
+      (nil (if (or (= q prelude-ns) (= q (. scope ns)))
+               (exported-macro ctx q base)
+               nil)))))
+
+;; A bare name: in this module, then in what its :uses export in order,
+;; then in the prelude.
+(defun bare-macro :private (ctx: ExpandCtx name: str) -> (Option MacroDef)
+  (let ((scope @(. ctx scope))
+        (uses (. scope uses))
+        (n (count uses)))
+    (match (exported-macro ctx (. scope ns) name)
+      ((some d) (some d))
+      (nil
+       (loop ((i 0))
+         (if (< i n)
+             (match (exported-macro ctx (nth uses i) name)
+               ((some d) (some d))
+               (nil (recur (+ i 1))))
+             (exported-macro ctx prelude-ns name)))))))
+
+;; The first :use that exports a macro `name`, and the next after it
+;; whose macro is another one (a different key).
+(defun ambiguity-from :private (ctx: ExpandCtx uses: (Vec str) name: str) -> (Option Ambiguity)
+  (let ((n (count uses)))
+    (loop ((i 0))
+      (if (< i n)
+          (match (exported-macro ctx (nth uses i) name)
+            ((some d) (ambiguity-after ctx uses name i (. d key)))
+            (nil (recur (+ i 1))))
+          nil))))
+
+(defun ambiguity-after :private (ctx: ExpandCtx uses: (Vec str) name: str first-at: i64 key: str)
+    -> (Option Ambiguity)
+  (let ((n (count uses)))
+    (loop ((j (+ first-at 1)))
+      (if (< j n)
+          (match (exported-macro ctx (nth uses j) name)
+            ((some d) (if (!= (. d key) key)
+                          (some (Ambiguity (nth uses first-at) (nth uses j)))
+                          (recur (+ j 1))))
+            (nil (recur (+ j 1))))
+          nil))))
