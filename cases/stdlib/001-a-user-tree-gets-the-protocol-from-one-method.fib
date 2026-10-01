@@ -1,0 +1,39 @@
+;; spec:   stdlib §2.3 (Reducible: the defaults of size, nth, last, to-vec)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; A user type implements each-while and nothing else, and gets count, size,
+;; nth, last and to-vec from the protocol's defaults, each a walk of the
+;; one method: the library's promise to every type a program defines.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+
+(impl (Reducible a) (Tree a)
+  (each-while (self k) (tree-each self k)))
+
+(defun sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (acc 0)) (if (< i (count v)) (recur (+ i 1) (+ acc (nth v i))) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (t (Node (Node Leaf 1 Leaf) 2 (Node (Node Leaf 3 Leaf) 4 Leaf)))
+        (none: (Tree i64) Leaf))
+    (do (check c (= (count t) 4))
+        (check c (= (size t) 4))
+        (check c (= (nth t 0) 1))
+        (check c (= (nth t 2) 3))
+        (check c (= (nth t 3) 4))
+        (check c (match (last t) ((some x) (= x 4)) (nil false)))
+        (check c (match (last none) ((some _) false) (nil true)))
+        (check c (= (count none) 0))
+        (check c (= (sum (to-vec t)) 10))
+        (check c (= (count (to-vec t)) 4))
+        (check c (= (nth (to-vec t) 1) 2))
+        (checks-result c))))

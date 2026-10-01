@@ -1,0 +1,43 @@
+;; spec:   stdlib §2.3 (Reducible), tranche 1 plan PC-13 (to-lseq)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; to-lseq is the lazy seq of any source. On an LSeq it is the seq itself,
+;; so two lazy adaptors stacked on a lazy source do not realise the source
+;; in full: a counter in the source's thunks shows that asking for the head
+;; of (to-lseq (to-lseq s)) realises one node, where a default that walked
+;; the source into a Vec would realise all five. On a Vec and on a user
+;; type the default builds the lazy seq of the elements.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 calls: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! calls (+ @calls 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) calls)) LNil)))))
+
+(defun head-or (s: (LSeq i64) d: i64) -> i64
+  (match (lnode s) ((LCons h _) h) ((LNil) d)))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (src (countdown 4 calls))
+        (twice (to-lseq (to-lseq src)))
+        (t (Node (Node Leaf 7 Leaf) 8 Leaf)))
+    (do (check c (= @calls 0))
+        (check c (= (head-or twice 0) 4))
+        (check c (= @calls 1))
+        (check c (= (count twice) 4))
+        (check c (= @calls 5))
+        (check c (= (count (to-lseq (to-lseq [4 5 6]))) 3))
+        (check c (= (head-or (to-lseq t) 0) 7))
+        (check c (= (count (to-lseq t)) 2))
+        (checks-result c))))

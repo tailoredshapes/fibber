@@ -1,7 +1,10 @@
 //! The rule-6 suite (spec/compiler.md §5): every case in
 //! cases/ownership runs interpreted and compiled. A case the compiler
 //! reports unsupported is Pending: listed, never a pass; the test fails
-//! on any Fail or header error, and says how many are pending.
+//! on any Fail or header error, and says how many are pending. A case
+//! whose header carries `open:` and that fails as it says (cases/stdlib)
+//! is OPEN: listed with its items, not a pass and not a failure; one that
+//! passes is a failure ("the item landed: remove `open`").
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +27,13 @@ fn ownership_cases_agree_interpreted_and_compiled() {
 #[test]
 fn module_cases_agree_interpreted_and_compiled() {
     suite_agrees("modules");
+}
+
+/// The library's cases (stdlib §8.1): `fibc cases cases/stdlib` is what
+/// each package of the tranche runs on its own block with `--only`.
+#[test]
+fn stdlib_cases_agree_interpreted_and_compiled() {
+    suite_agrees("stdlib");
 }
 
 fn suite_agrees(suite: &str) {
@@ -53,6 +63,26 @@ fn suite_agrees(suite: &str) {
             pending.len(),
             report.counts.total(),
             pending.join(" ")
+        );
+    }
+    let open: Vec<String> = report
+        .results
+        .iter()
+        .filter(|r| matches!(r.status, Status::Open(_)))
+        .map(|r| {
+            format!(
+                "{} [{}]",
+                r.name(),
+                r.status.detail().split(':').next().unwrap_or("")
+            )
+        })
+        .collect();
+    if !open.is_empty() {
+        eprintln!(
+            "OPEN ({} of {}): {}",
+            open.len(),
+            report.counts.total(),
+            open.join(" ")
         );
     }
 }

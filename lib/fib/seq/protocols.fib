@@ -1,0 +1,46 @@
+;; fib.seq.protocols: Reducible, the pull side (Cursor, Cursable), Seqable, and `count` (stdlib §2.1, §2.3;
+;; tranche 1 plan §4.2; owner P0, the instances for the other sources L5a, L7).
+;; Replaces the prelude's Countable, Seq and the walk of Traversable, which M deletes. Decided here:
+;;  - Reducible has a sixth method after the page's five, to-lseq (plan PC-13), with a default through
+;;    to-vec and an override on LSeq itself, so two lazy adaptors do not realise their source in full.
+;;  - the defaults trap with the function's name: `nth: index out of range`.
+;;  - the default `last` keeps an (Option e) in a cell, so until C5 it allocates one per element; a source
+;;    that knows its end overrides it (the Vec does), case 022.
+;;  - count is a function over size, not a method, so a user type implements Reducible only.
+;;  - a module that does not :use fib.seq gets the prelude's count, which does not know these types.
+(ns fib.seq.protocols (:use fib.core fib.seq.types))
+;; internal iteration with early exit: false from k stops the walk; the result says whether it ran to the end
+(defprotocol (Reducible s e)
+  (each-while (self k: (fn (e) bool) :borrow) -> bool)
+  (size (self) -> i64
+    (let ((n (cell 0)))
+      (do (each-while self (fn (x) (do (set! n (+ @n 1)) true))) @n)))
+  (nth (self i: i64) -> e
+    (let ((n (cell 0)) (r (cell nil)))
+      (do (each-while self (fn (x) (if (= @n i) (do (set! r (some x)) false) (do (set! n (+ @n 1)) true))))
+          (match @r (nil (trap "nth: index out of range")) ((some x) x)))))
+  (last (self) -> (Option e)
+    (let ((r (cell nil))) (do (each-while self (fn (x) (do (set! r (some x)) true))) @r)))
+  (to-vec (self) -> (Vec e)
+    (let ((acc (cell (vec-empty))))
+      (do (each-while self (fn (x) (do (set! acc (fib.prelude/conj @acc x)) true))) @acc)))
+  ;; the lazy seq of the elements: a lazy source overrides it, so two lazy adaptors stay lazy end to end
+  (to-lseq (self) -> (LSeq e) (lseq-vec (to-vec self))))
+(defun count (c: c) :where ((Reducible c e)) -> i64 (size c))
+;; the pull side, for the lockstep walks of tranche 2
+(defprotocol (Cursor c e) (advance! (self) -> bool) (current (self) -> e))
+(defprotocol (Cursable s c) (cursor (self) -> c))
+;; seq/rest/next: one closed seq type per collection, so recursion on rest is not polymorphic recursion
+(defprotocol (Seqable c s) (seq (self) -> (Option s)) (rest (self) -> s))
+;; seed instances (P0): Vec and Option. L5a adds List, Array, Map, Set, Range.
+(impl (Reducible a) (Vec a)
+  (each-while (self k)
+    (let ((n (fib.prelude/count self)))
+      (loop ((i 0)) (if (< i n) (if (k (fib.prelude/nth self i)) (recur (+ i 1)) false) true))))
+  (size (self) (fib.prelude/count self))
+  (nth (self i) (fib.prelude/nth self i))
+  (last (self) (let ((n (fib.prelude/count self))) (if (> n 0) (some (fib.prelude/nth self (- n 1))) nil)))
+  (to-vec (self) self))
+(impl (Reducible a) (Option a)
+  (each-while (self k) (match self (nil true) ((some x) (k x))))
+  (size (self) (match self (nil 0) ((some _) 1))))

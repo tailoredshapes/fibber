@@ -8,7 +8,9 @@
 //! runs each case through an [`Evaluator`] ([`runner`]), compares what
 //! came back with the header ([`verdict`]) and renders the result
 //! ([`table`]). A case whose rules are not implemented yet is Pending,
-//! which is reported separately and is not a pass.
+//! which is reported separately and is not a pass. A case that
+//! carries an `open` label (the §7 items it waits for) is judged by
+//! [`judge_labelled`]: OPEN while it fails, a failure when it passes.
 
 pub mod evaluator;
 pub mod header;
@@ -18,9 +20,12 @@ pub mod verdict;
 
 pub use evaluator::{AuditSummary, Evaluator, Outcome, PendingEvaluator, Value};
 pub use header::{
-    case_roots, parse_header, read_header, AuditExpect, Expected, Header, HeaderError,
-    HeaderErrorKind, Verdict,
+    case_roots, parse_header, parse_labels, read_header, AuditExpect, Expected, Header,
+    HeaderError, HeaderErrorKind, Labels, Verdict,
 };
-pub use runner::{list_cases, list_cases_recursive, run_case, run_dir, CaseResult, Counts, Report};
+pub use runner::{
+    list_cases, list_cases_recursive, run_case, run_dir, run_dir_only, select_cases, CaseResult,
+    Counts, Report, SelectError,
+};
 pub use table::render;
-pub use verdict::{judge, judge_counted, Status};
+pub use verdict::{judge, judge_counted, judge_labelled, Status};

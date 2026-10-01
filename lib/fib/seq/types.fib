@@ -1,0 +1,25 @@
+;; fib.seq.types: the seq types fib.seq and fib.coll share (stdlib §2.1 rules 2 and 8), and the three functions
+;; that make an LSeq, because Reducible's default to-lseq needs them and Reducible comes after this part
+;; (tranche 1 plan §4.2; owner P0). They live here and not in fib.coll, where the page's §6.2 first put
+;; VSeq, so that fib.seq and fib.coll do not import each other (plan C-7). Decided here: a node that is
+;; demanded while it is being computed traps `lazy-seq: a seq forced itself` (Clojure's lazy seq throws
+;; there too); a node that merely refers to itself is fine.
+(ns fib.seq.types)
+;; Clojure's memoised lazy seq: a node realised once by a thunk held in one cell
+(defenum (LNode a) LNil (LCons h: a t: (LSeq a)))
+(defenum (LState a) (Pending f: (fn () (LNode a))) (Ready n: (LNode a)) Forcing)
+(defstruct (LSeq a) (box: (Cell (LState a))))
+;; the seq of a Vec and the result of sort: consed front elements over a Vec and an offset
+(defstruct (VSeq a) (front: (List a) v: (Vec a) lo: i64))
+(defun lazy-node (f: (fn () (LNode a))) -> (LSeq a) (LSeq (cell (Pending f))))
+;; realise once; a seq that forces itself traps, a seq that merely refers to itself is fine
+(defun lnode (s: (LSeq a)) -> (LNode a)
+  (match @(. s box)
+    ((Ready n) n)
+    ((Forcing) (trap "lazy-seq: a seq forced itself"))
+    ((Pending f) (do (set! (. s box) Forcing)
+                     (let ((n (f))) (do (set! (. s box) (Ready n)) n))))))
+;; the nodes of a Vec from index i, made as they are demanded (no copy of the Vec)
+(defun lseq-vec-from :private (v: (Vec a) i: i64) -> (LSeq a)
+  (lazy-node (fn () (if (< i (fib.prelude/count v)) (LCons (fib.prelude/nth v i) (lseq-vec-from v (+ i 1))) LNil))))
+(defun lseq-vec (v: (Vec a)) -> (LSeq a) (lseq-vec-from v 0))

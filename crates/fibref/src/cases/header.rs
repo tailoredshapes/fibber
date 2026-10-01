@@ -18,17 +18,25 @@
 //! as the `A` lines of the free trace (`spec/compiler.md` §4); `roots`
 //! (optional, any verdict): library directories, separated by white
 //! space and relative to the case file's directory, that the case is run
-//! with as `-I` flags are (`cases/modules/README.md`, [`case_roots`]).
+//! with as `-I` flags are (`cases/modules/README.md`, [`case_roots`]);
+//! `covers` (optional, any verdict): the names of the function table of
+//! `spec/stdlib.md` §4 that the case calls, separated by white space;
+//! `open` (optional, `accept` only): the items of `spec/stdlib.md` §7
+//! whose absence is why the case fails today, separated by white space
+//! (`cases/stdlib/README.md`, [`parse_labels`]). Neither changes the
+//! verdict the other keys fix; [`judge_labelled`] reads `open`.
 //! Anything else is a [`HeaderError`] naming the file and line; parsing
 //! never panics.
+//!
+//! [`judge_labelled`]: super::verdict::judge_labelled
 
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The keys a header may contain, in the order the README lists them.
-const KEYS: [&str; 8] = [
-    "spec", "expect", "result", "audit", "allocs", "roots", "error", "trap",
+const KEYS: [&str; 10] = [
+    "spec", "expect", "result", "audit", "allocs", "roots", "error", "trap", "covers", "open",
 ];
 
 /// The value `main` is expected to return. Only integers exist today;
@@ -286,6 +294,7 @@ impl<'a> Fields<'a> {
         self.forbidden("audit")?;
         self.forbidden("allocs")?;
         self.forbidden("trap")?;
+        self.forbidden("open")?;
         Ok(Verdict::Reject { error })
     }
 
@@ -295,6 +304,7 @@ impl<'a> Fields<'a> {
         self.forbidden("audit")?;
         self.forbidden("allocs")?;
         self.forbidden("error")?;
+        self.forbidden("open")?;
         Ok(Verdict::Trap { trap })
     }
 
@@ -310,6 +320,7 @@ impl<'a> Fields<'a> {
             "reject" => self.reject()?,
             _ => self.trap()?,
         };
+        self.labels()?;
         Ok(Header { spec, verdict })
     }
 }
@@ -355,6 +366,9 @@ pub fn case_roots(path: &Path, source: &str) -> Result<Vec<PathBuf>, HeaderError
     }
     Ok(dirs)
 }
+
+mod labels;
+pub use labels::{parse_labels, Labels};
 
 #[cfg(test)]
 mod tests;

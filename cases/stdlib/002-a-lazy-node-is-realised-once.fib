@@ -1,0 +1,30 @@
+;; spec:   stdlib §2.1 rule 2 (the memoised lazy seq), tranche 1 plan §5 (lnode)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; Clojure's lazy seq runs its body once: lnode forces the thunk of a node
+;; the first time and returns the stored node every time after. A counter
+;; in a cell shows how often the thunk ran, through lnode, through a walk
+;; with each-while, and through count; and a seq whose tail refers to the
+;; node it belongs to is fine (case 017 runs that one).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun head-or (s: (LSeq i64) d: i64) -> i64
+  (match (lnode s) ((LCons h _) h) ((LNil) d)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (s (lazy-node (fn () (do (set! calls (+ @calls 1))
+                                 (LCons 5 (lazy-node (fn () LNil))))))))
+    (do (check c (= @calls 0))
+        (check c (= (head-or s 0) 5))
+        (check c (= @calls 1))
+        (check c (= (head-or s 0) 5))
+        (check c (= @calls 1))
+        (check c (= (count s) 1))
+        (check c (= (count s) 1))
+        (check c (= (match (last s) ((some x) x) (nil 0)) 5))
+        (check c (= @calls 1))
+        (checks-result c))))

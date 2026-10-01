@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use fibref::cases::{render, run_dir, Outcome};
+use fibref::cases::{render, run_dir, run_dir_only, Outcome, SelectError};
 use fibref::eval::{run_source_in, Interpreter};
 use fibref::expand_dump::Options;
 use fibref::roots::Roots;
@@ -20,8 +20,13 @@ use fibref::roots::Roots;
 const USAGE: &str = "usage: fibref <command>
 
 commands:
-  cases [dir]     run every case in dir (default cases/ownership) against
-                  the verdict in its header
+  cases [dir [--only prefix..]]
+                  run every case in dir (default cases/ownership) against
+                  the verdict in its header; with --only, the cases whose
+                  names start with one of the prefixes (a prefix that
+                  matches no case is an error, exit 2). A case with an
+                  `open` label that fails as it says is OPEN: listed, not
+                  a failure (cases/stdlib/README.md)
   explain [-I dir].. <file>
                   print the ownership checker's decisions for file (types §9)
   run [-I dir].. <file> [-- arg..]
@@ -54,7 +59,7 @@ const DEFAULT_CASES_DIR: &str = "cases/ownership";
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     /// Run the cases in a directory.
-    Cases { dir: String },
+    Cases { dir: String, only: Vec<String> },
     /// Print the ownership decisions for a file.
     Explain { file: String },
     /// Run a file's `main`.
@@ -75,8 +80,20 @@ fn parse(args: &[String]) -> Command {
     match args {
         [cmd] if cmd == "cases" => Command::Cases {
             dir: DEFAULT_CASES_DIR.to_string(),
+            only: Vec::new(),
         },
-        [cmd, dir] if cmd == "cases" => Command::Cases { dir: dir.clone() },
+        [cmd, dir] if cmd == "cases" => Command::Cases {
+            dir: dir.clone(),
+            only: Vec::new(),
+        },
+        [cmd, dir, flag, prefixes @ ..]
+            if cmd == "cases" && flag == "--only" && !prefixes.is_empty() =>
+        {
+            Command::Cases {
+                dir: dir.clone(),
+                only: prefixes.to_vec(),
+            }
+        }
         [cmd, file] if cmd == "explain" => Command::Explain { file: file.clone() },
         [cmd, file] if cmd == "run" => Command::Run {
             file: file.clone(),
@@ -108,10 +125,19 @@ fn parse(args: &[String]) -> Command {
 }
 
 /// Runs the cases in `dir` through the current evaluator and prints the report.
-fn run_cases(dir: &str) -> ExitCode {
-    let report = match run_dir(Path::new(dir), &Interpreter) {
+fn run_cases(dir: &str, only: &[String]) -> ExitCode {
+    let ran = if only.is_empty() {
+        run_dir(Path::new(dir), &Interpreter).map_err(SelectError::Io)
+    } else {
+        run_dir_only(Path::new(dir), &Interpreter, only)
+    };
+    let report = match ran {
         Ok(report) => report,
-        Err(e) => {
+        Err(SelectError::NoMatch(prefix)) => {
+            eprintln!("fibref: no case matches {prefix} in {dir}");
+            return ExitCode::from(2);
+        }
+        Err(SelectError::Io(e)) => {
             eprintln!("fibref: cannot read cases in {dir}: {e}");
             return ExitCode::from(2);
         }
@@ -259,7 +285,7 @@ fn main() -> ExitCode {
     }
     let roots = Roots::from_env(&dirs, std::env::var_os("FIB_LIB").as_deref());
     match command {
-        Command::Cases { dir } => run_cases(&dir),
+        Command::Cases { dir, only } => run_cases(&dir, &only),
         Command::Explain { file } => run_explain(&file, &roots),
         Command::Run { file, args } => run_file(&file, &args, &roots),
         Command::Read { files, print } => read_files(&files, print),
@@ -288,8 +314,26 @@ mod tests {
         assert_eq!(
             parse(&args(&["cases", "cases/other"])),
             Command::Cases {
-                dir: "cases/other".to_string()
+                dir: "cases/other".to_string(),
+                only: Vec::new()
             }
+        );
+    }
+
+    #[test]
+    fn cases_only_takes_one_or_more_prefixes_after_the_directory() {
+        assert_eq!(
+            parse(&args(&["cases", "d", "--only", "240-", "241-"])),
+            Command::Cases {
+                dir: "d".to_string(),
+                only: vec!["240-".to_string(), "241-".to_string()]
+            }
+        );
+        assert_eq!(parse(&args(&["cases", "d", "--only"])), Command::Invalid);
+        assert_eq!(parse(&args(&["cases", "--only", "1"])), Command::Invalid);
+        assert_eq!(
+            parse(&args(&["cases", "d", "-only", "1"])),
+            Command::Invalid
         );
     }
 
@@ -298,7 +342,8 @@ mod tests {
         assert_eq!(
             parse(&args(&["cases"])),
             Command::Cases {
-                dir: "cases/ownership".to_string()
+                dir: "cases/ownership".to_string(),
+                only: Vec::new()
             }
         );
     }

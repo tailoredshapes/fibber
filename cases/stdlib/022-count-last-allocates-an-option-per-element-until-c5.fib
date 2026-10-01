@@ -1,0 +1,25 @@
+;; spec:   stdlib §1.2 P2 (an Option of a scalar is a heap object until C5), §2.3 (Reducible.last)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 100007
+;; roots:  ../../lib support
+;; The default last keeps the element it has seen in a cell of Option, and
+;; until C5 an (Option i64) is a heap object, so walking n elements
+;; allocates n of them: the bound is n + 7, the count as measured (n =
+;; 100000), not a promise of the design. A source that knows its last
+;; element overrides last (the Vec does) and allocates none per element.
+;; When C5 lands the count drops and this bound still passes; lower it then.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Upto (n: i64))
+
+(impl (Reducible i64) Upto
+  (each-while (self k)
+    (loop ((i 0)) (if (< i (. self n)) (if (k i) (recur (+ i 1)) false) true))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (match (last (Upto 100000)) ((some x) (= x 99999)) (nil false)))
+        (check c (match (last (Upto 0)) ((some _) false) (nil true)))
+        (checks-result c))))

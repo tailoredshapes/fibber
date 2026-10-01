@@ -45,6 +45,22 @@ rests on anyone's word, including the author's.
    A rule change that flips a verdict needs the case's header changed
    in the same commit, with the reason.
 
+   Two more header keys say what a case is about and do not change its
+   verdict:
+   - `covers: NAME ..` (any verdict): the names of the standard
+     library's function table (`spec/stdlib.md` §4) that the case calls.
+     The test `stdlib_table` fails a row of a delivered tranche that no
+     case covers, a name that is no row, and a name that the case's code
+     never calls: a `covers:` line alone cannot fail.
+   - `open: ITEM ..` (`accept` only): the items (`spec/stdlib.md` §7) whose
+     absence is why the case fails today. The case runs. A failure that is
+     the program's own (the checker refuses it, it traps, it answers
+     differently, the two tools agreeing and the audit clean) is listed as
+     OPEN with its items and counted apart: it is not a pass, and it does not
+     fail the suite. A pass is a failure, "the item landed: remove `open`",
+     so the label cannot outlive its reason; a failure of the tools
+     themselves (they disagree, the audit finds an error) stays a failure.
+
 4. **Adversarial cases are written by someone trying to break it.** A
    separate agent, given only the spec, writes programs intended to be
    accepted yet corrupt memory, or be rejected yet be safe. Each one it

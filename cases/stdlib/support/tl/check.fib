@@ -1,0 +1,33 @@
+;; tl.check: how a ref-, law- or count- case reports (cases/stdlib/README.md
+;; §9.4). A case never prints to compare: it makes a Checks, calls `check`
+;; once per property and returns `checks-result`, which is 0 when every
+;; check held and otherwise a bit mask in which bit i is the i-th check
+;; (counting from 0) that failed, for the first 62 checks (a later failure
+;; sets bit 62, so a result of 0 never hides one). A failing case therefore
+;; names its failing check in the header-less number the harness prints.
+;;
+;; A case shows that it can fail by planting a fault: a second Checks `p`
+;; runs the same comparisons against a reference that is wrong in one way,
+;; and `check-detects` records that the planted run did fail.
+(ns tl.check)
+
+(defstruct Checks (n: (Cell i64) mask: (Cell i64)))
+
+(defun checks () -> Checks (Checks (cell 0) (cell 0)))
+
+(defun check (c: Checks ok: bool) -> unit
+  (let ((i @(. c n)))
+    (do (set! (. c n) (+ i 1))
+        (if ok
+            ()
+            (set! (. c mask) (bit-or @(. c mask) (shl 1 (if (< i 62) i 62))))))))
+
+;; 0 when every check held
+(defun checks-result (c: Checks) -> i64 @(. c mask))
+
+;; how many checks were made, to assert that a case ran the loop it means to
+(defun checks-made (c: Checks) -> i64 @(. c n))
+
+;; the planted fault `p` must have set at least one bit, else c fails here
+(defun check-detects (c: Checks p: Checks) -> unit
+  (check c (!= (checks-result p) 0)))

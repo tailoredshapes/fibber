@@ -1,0 +1,60 @@
+;; spec:   cases/stdlib/README.md (the support modules tl.rng, tl.check, tl.gen)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; Every ref-, law- and count- case of the library stands on these three
+;; modules, so they are tested here against values computed outside
+;; fibber (a transcription in Python of Marsaglia's xorshift64 with the
+;; shifts 13, 7, 17): the first four numbers of seed 1, the first of the
+;; default seed that seed 0 stands for, and rng-below 100 over six draws. A
+;; generated Vec stays within its bound, a generated string has the scalars
+;; it was asked for in all four widths, and the checker records the index of
+;; each failing check as a bit, saturating at bit 62, and `check-detects`
+;; fails the case when a planted fault went unnoticed.
+(ns main (:use fib.core fib.seq tl.rng tl.check tl.gen))
+
+(defun all-below (v: (Vec i64) bound: i64) -> bool
+  (loop ((i 0)) (if (< i (count v)) (if (and (>= (nth v i) 0) (< (nth v i) bound)) (recur (+ i 1)) false) true)))
+
+;; how many of the n scalars of s are w bytes wide
+(defun of-width (s: str w: i64) -> i64
+  (let ((cs (str-chars s)))
+    (loop ((i 0) (n 0))
+      (if (< i (fib.prelude/count cs))
+          (recur (+ i 1) (if (= (str-len (char->str (fib.prelude/nth cs i))) w) (+ n 1) n))
+          n))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (r (rng 1))
+        (z (rng 0))
+        (d (rng 1))
+        (g (rng 7))
+        (p (checks))
+        (q (checks))
+        (s (gen-str (rng 3) 400)))
+    (do (check c (= (rng-next r) 1082269761))
+        (check c (= (rng-next r) 1152992998833853505))
+        (check c (= (rng-next r) -7269227409276787159))
+        (check c (= (rng-next r) -768720241707614171))
+        (check c (= (rng-next z) 8748534153485358512))
+        (check c (= (rng-below d 100) 80))
+        (check c (= (rng-below d 100) 52))
+        (check c (= (rng-below d 100) 28))
+        (check c (= (rng-below d 100) 22))
+        (check c (= (rng-below d 100) 66))
+        (check c (= (rng-below d 100) 4))
+        (check c (let ((v (rng-vec g 300 17))) (and (= (count v) 300) (all-below v 17))))
+        (check c (= (count (rng-vec g 0 5)) 0))
+        (check c (= (fib.prelude/count (str-chars s)) 400))
+        (check c (and (> (of-width s 1) 40) (and (> (of-width s 2) 40) (and (> (of-width s 3) 40) (> (of-width s 4) 40)))))
+        (check c (= (+ (of-width s 1) (+ (of-width s 2) (+ (of-width s 3) (of-width s 4)))) 400))
+        (check c (= (str-len (gen-str (rng 5) 0)) 0))
+        (check p true) (check p false) (check p true) (check p false)
+        (check c (= (checks-result p) 10))
+        (check c (= (checks-made p) 4))
+        (dotimes (i 70) (check q false))
+        (check c (= (checks-result q) 9223372036854775807))
+        (check-detects c p)
+        (checks-result c))))

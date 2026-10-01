@@ -32,8 +32,13 @@ and -O 2 costs about two and a half times as long to compile as -O 0).
   explain <file>         print the ownership checker's decisions (types §9)
   itrace <file>          run file in the reference interpreter and print its
                          canonical trace (compiler.md §4)
-  cases [dir]            run every case in dir (default cases/ownership)
-                         interpreted and compiled, and compare (method.md rule 6)
+  cases [dir [--only prefix..]]
+                         run every case in dir (default cases/ownership)
+                         interpreted and compiled, and compare (method.md rule 6);
+                         with --only, the cases whose names start with one of the
+                         prefixes (a prefix that matches no case is an error);
+                         a case with an `open` label that fails as it says is
+                         OPEN: listed, not a failure (cases/stdlib/README.md)
   gen --seed S --count N [--size K] [--jobs J] [--dir D]
                          generate N programs with fibgen from seed S (size K, or
                          sizes 1..=6 in turn) and run each interpreted and
@@ -86,6 +91,7 @@ pub enum Command {
     },
     Cases {
         dir: String,
+        only: Vec<String>,
     },
     Gen(GenConfig),
     Help,
@@ -240,9 +246,15 @@ pub fn parse(args: &[String]) -> Command {
         },
         ["cases"] => Command::Cases {
             dir: DEFAULT_CASES_DIR.to_string(),
+            only: Vec::new(),
         },
         ["cases", dir] => Command::Cases {
             dir: dir.to_string(),
+            only: Vec::new(),
+        },
+        ["cases", dir, "--only", prefixes @ ..] if !prefixes.is_empty() => Command::Cases {
+            dir: dir.to_string(),
+            only: prefixes.iter().map(|p| p.to_string()).collect(),
         },
         ["gen", rest @ ..] => parse_gen(rest),
         ["help" | "--help" | "-h"] => Command::Help,
@@ -300,9 +312,19 @@ mod tests {
         assert_eq!(
             parse(&args(&["cases"])),
             Command::Cases {
-                dir: DEFAULT_CASES_DIR.into()
+                dir: DEFAULT_CASES_DIR.into(),
+                only: Vec::new()
             }
         );
+        assert_eq!(
+            parse(&args(&["cases", "d", "--only", "240-", "241-"])),
+            Command::Cases {
+                dir: "d".into(),
+                only: vec!["240-".into(), "241-".into()]
+            }
+        );
+        assert_eq!(parse(&args(&["cases", "d", "--only"])), Command::Invalid);
+        assert_eq!(parse(&args(&["cases", "--only", "1"])), Command::Invalid);
         assert_eq!(parse(&args(&["run"])), Command::Invalid);
         assert_eq!(parse(&args(&[])), Command::Invalid);
         assert_eq!(parse(&args(&["-h"])), Command::Help);

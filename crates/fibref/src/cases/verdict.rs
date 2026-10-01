@@ -35,11 +35,23 @@
 //! evaluator that ran the case and handed to [`judge_counted`]. More
 //! than `N` is a Fail, never a Pending; so is an evaluator that gave no
 //! count, since a bound nobody checked is a test that cannot fail.
+//!
+//! A case that carries an `open` label (`header::Labels`) fails today
+//! for the §7 items it names, and [`judge_labelled`] says so: it judges
+//! as above and then, for an `accept` case whose failure is the program
+//! being refused or giving another answer, reports [`Status::Open`]
+//! (listed, counted apart, not a failure, never a pass); a pass is
+//! [`Status::OpenPassed`], a failure, because the label is out of date;
+//! and any failure that is not the program's own (the two tools
+//! disagreeing, a memory error, a run that failed) stays a failure.
 
 use std::fmt;
 
 use super::evaluator::{AuditSummary, Outcome, Value};
 use super::header::{AuditExpect, Expected, Header, HeaderError, Verdict};
+
+/// What an `open` case that passed is told.
+const OPEN_PASSED: &str = "the item landed: remove `open`";
 
 /// How one case fared against its header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +62,13 @@ pub enum Status {
     Fail(String),
     /// The evaluator could not decide the case; the string says why.
     Pending(String),
+    /// The case carries an `open` label and failed as the label says it
+    /// does; the string names the items and how it failed. Not a
+    /// pass, and not a failure of the suite.
+    Open(String),
+    /// The case carries an `open` label and passed: the items landed,
+    /// so the label is out of date. A failure of the suite.
+    OpenPassed,
     /// The header could not be parsed, so nothing ran.
     HeaderError(HeaderError),
 }
@@ -61,6 +80,8 @@ impl Status {
             Status::Pass => "pass",
             Status::Fail(_) => "FAIL",
             Status::Pending(_) => "PENDING",
+            Status::Open(_) => "OPEN",
+            Status::OpenPassed => "FAIL",
             Status::HeaderError(_) => "HEADER",
         }
     }
@@ -69,7 +90,8 @@ impl Status {
     pub fn detail(&self) -> String {
         match self {
             Status::Pass => String::new(),
-            Status::Fail(why) | Status::Pending(why) => why.clone(),
+            Status::Fail(why) | Status::Pending(why) | Status::Open(why) => why.clone(),
+            Status::OpenPassed => OPEN_PASSED.to_string(),
             Status::HeaderError(e) => format!("line {}: {}", e.line, e.kind),
         }
     }
@@ -110,6 +132,49 @@ pub fn judge_counted(header: &Header, outcome: &Outcome, allocs: Option<u64>) ->
         ) => judge_accept(result, *audit, *maximum, allocs, outcome),
         (Verdict::Reject { error }, outcome) => judge_reject(error, outcome),
         (Verdict::Trap { trap }, outcome) => judge_trap(trap, outcome),
+    }
+}
+
+/// [`judge_counted`] for a case whose header carries the `open` items
+/// `open` (empty when it has none, and then this is [`judge_counted`]).
+///
+/// With items, a pass becomes [`Status::OpenPassed`] and a failure
+/// [`Status::Open`] when it is the program's own: the checker refused it,
+/// it trapped or it finished with a different answer, and in each case
+/// both tools agreed and the audit found nothing. A failure of another
+/// kind (`Outcome::Failed`, which is a run that broke or two tools that
+/// disagree, and an audit error or a divergent trace) stays a
+/// [`Status::Fail`]: an excuse for the program is not an excuse for the
+/// tools, and a divergence between them must never read as OPEN.
+pub fn judge_labelled(
+    header: &Header,
+    open: &[String],
+    outcome: &Outcome,
+    allocs: Option<u64>,
+) -> Status {
+    let status = judge_counted(header, outcome, allocs);
+    if open.is_empty() {
+        return status;
+    }
+    match status {
+        Status::Pass => Status::OpenPassed,
+        Status::Fail(why) if programs_own_failure(outcome) => {
+            Status::Open(format!("{}: {why}", open.join(" ")))
+        }
+        other => other,
+    }
+}
+
+/// True when the outcome says the program is wrong and nothing else is:
+/// refused by the checker, trapped, or finished with a clean audit.
+fn programs_own_failure(outcome: &Outcome) -> bool {
+    match outcome {
+        Outcome::Rejected { .. } => true,
+        Outcome::Trapped { errors, .. } => errors.is_empty(),
+        Outcome::Compiled { audit, .. } => {
+            audit.errors.is_empty() && audit.leaks == 0 && (audit.clean || audit.leak_cycles > 0)
+        }
+        Outcome::Failed { .. } | Outcome::Unsupported { .. } => false,
     }
 }
 
@@ -241,3 +306,6 @@ fn audit_mismatch(expected: AuditExpect, summary: &AuditSummary) -> Option<Strin
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod open_tests;

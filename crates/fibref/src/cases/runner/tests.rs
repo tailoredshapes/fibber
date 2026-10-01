@@ -98,6 +98,7 @@ fn run_dir_orders_by_file_name_and_counts_every_status() {
             fail: 1,
             pending: 1,
             header_error: 1,
+            open: 0,
         }
     );
     assert_eq!(report.counts.total(), 5);
@@ -214,6 +215,30 @@ fn recursive_listing_finds_nested_cases_only() {
     assert_eq!(list_cases(&dir.0).unwrap(), [dir.0.join("00.fib")]);
 }
 
+#[test]
+fn a_support_directory_holds_modules_and_no_case() {
+    let dir = TempDir::new("support");
+    dir.write("01.fib", "");
+    dir.write("support/tl/rng.fib", "");
+    dir.write("sub/support/x.fib", "");
+    dir.write("sub/02.fib", "");
+    dir.write("03-prog/main.fib", "");
+    dir.write("03-prog/support/y.fib", "");
+    let found = list_cases_recursive(&dir.0).unwrap();
+    let relative: Vec<PathBuf> = found
+        .iter()
+        .map(|p| p.strip_prefix(&dir.0).unwrap().to_path_buf())
+        .collect();
+    assert_eq!(
+        relative,
+        [
+            PathBuf::from("01.fib"),
+            PathBuf::from("03-prog/main.fib"),
+            PathBuf::from("sub/02.fib")
+        ]
+    );
+}
+
 /// The test CI runs against the real cases: every header under
 /// `cases/` must parse. It does not run the cases.
 #[test]
@@ -297,4 +322,104 @@ fn an_evaluator_that_does_not_count_fails_a_bounded_case_never_passes_it() {
     let report = run_dir(&dir.0, &Scripted).unwrap();
     assert_eq!(report.counts.fail, 1, "{report:?}");
     assert_eq!(report.counts.pass, 0);
+}
+
+fn only(dir: &TempDir, prefixes: &[&str]) -> Result<Vec<String>, String> {
+    let prefixes: Vec<String> = prefixes.iter().map(|p| p.to_string()).collect();
+    run_dir_only(&dir.0, &Scripted, &prefixes)
+        .map(|report| names(&report))
+        .map_err(|e| e.to_string())
+}
+
+fn numbered_dir(name: &str) -> TempDir {
+    let dir = TempDir::new(name);
+    for file in ["200-a.fib", "201-b.fib", "240-c.fib", "241-d.fib"] {
+        dir.write(file, &format!("{ACCEPT_3}(return 3)\n"));
+    }
+    dir.write("250-prog/main.fib", &format!("{ACCEPT_3}(return 3)\n"));
+    dir
+}
+
+#[test]
+fn only_runs_the_cases_with_one_of_the_prefixes_in_file_order() {
+    let dir = numbered_dir("only");
+    assert_eq!(only(&dir, &["24"]).unwrap(), ["240-c.fib", "241-d.fib"]);
+    assert_eq!(
+        only(&dir, &["241-", "200"]).unwrap(),
+        ["200-a.fib", "241-d.fib"]
+    );
+    assert_eq!(only(&dir, &["250"]).unwrap(), ["250-prog/main.fib"]);
+    assert_eq!(only(&dir, &[]).unwrap().len(), 5, "no prefix is every case");
+}
+
+#[test]
+fn a_prefix_is_a_prefix_and_not_a_substring() {
+    let dir = TempDir::new("substring");
+    dir.write("125-b.fib", &format!("{ACCEPT_3}(return 3)\n"));
+    dir.write("250-a.fib", &format!("{ACCEPT_3}(return 3)\n"));
+    assert_eq!(only(&dir, &["25"]).unwrap(), ["250-a.fib"]);
+}
+
+#[test]
+fn a_prefix_that_matches_no_case_is_an_error_even_beside_one_that_does() {
+    let dir = numbered_dir("nomatch");
+    assert_eq!(
+        only(&dir, &["999-"]),
+        Err("no case matches 999-".to_string())
+    );
+    assert_eq!(
+        only(&dir, &["240", "999-"]),
+        Err("no case matches 999-".to_string())
+    );
+}
+
+#[test]
+fn a_prefix_is_matched_against_the_name_not_the_directory_or_the_extension() {
+    let dir = numbered_dir("key");
+    assert!(only(&dir, &["main"]).is_err());
+    assert!(only(&dir, &["fib"]).is_err());
+    assert!(only(&dir, &["240-c.fib"]).is_ok());
+}
+
+#[test]
+fn only_on_a_missing_directory_is_an_io_error() {
+    let missing = Path::new("/nonexistent/fibref/cases");
+    let got = run_dir_only(missing, &Scripted, &["1".to_string()]);
+    assert!(matches!(got, Err(SelectError::Io(_))));
+}
+
+const OPEN: &str =
+    ";; spec: §5.5\n;; expect: accept\n;; result: 3\n;; audit: clean\n;; open: L20 C9\n";
+
+#[test]
+fn an_open_case_is_counted_apart_and_does_not_fail_the_report() {
+    let dir = TempDir::new("open");
+    dir.write("01-pass.fib", &format!("{ACCEPT_3}(return 3)\n"));
+    dir.write("02-open.fib", &format!("{OPEN}(reject-me)\n"));
+    let report = run_dir(&dir.0, &Scripted).unwrap();
+    assert_eq!((report.counts.pass, report.counts.open), (1, 1));
+    assert_eq!((report.counts.fail, report.counts.total()), (0, 2));
+    assert!(report.ok(), "an open case is not a failure of the run");
+    match &report.results[1].status {
+        Status::Open(why) => assert!(why.starts_with("L20 C9: "), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_open_case_that_passes_is_a_failure() {
+    let dir = TempDir::new("openpassed");
+    dir.write("01-open.fib", &format!("{OPEN}(return 3)\n"));
+    let report = run_dir(&dir.0, &Scripted).unwrap();
+    assert_eq!(report.results[0].status, Status::OpenPassed);
+    assert_eq!((report.counts.fail, report.counts.open), (1, 0));
+    assert!(!report.ok(), "the label is out of date: the run fails");
+}
+
+#[test]
+fn an_open_label_on_a_reject_case_is_a_header_error() {
+    let dir = TempDir::new("openreject");
+    dir.write("01.fib", &format!("{REJECT};; open: L20\n(reject-me)\n"));
+    let report = run_dir(&dir.0, &Scripted).unwrap();
+    assert_eq!(report.counts.header_error, 1, "{report:?}");
 }

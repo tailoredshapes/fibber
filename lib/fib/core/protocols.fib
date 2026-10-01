@@ -1,0 +1,37 @@
+;; fib.core.protocols: the protocols of stdlib §2.3 that decide what a predicate, a comparator, a number
+;; and a printed form are (tranche 1 plan §4.2; owner P0, the instances for the other types L1, L11).
+;; Replaces nothing in the prelude. Decided here, where the page is silent:
+;;  - payload of nil traps with the message `payload: nil` (it names the function, plan §4.3 rule 8; the
+;;    page's sketch said `unwrap: nil`, which is L2's function).
+;;  - Truthy over (Option a) is `some` and not Clojure's falsy `false` inside it: (Option bool) needs
+;;    L20's checker rule, a library instance cannot tell (stdlib §2.4).
+;;  - `/` is Div's method here: in every module that :uses fib.core the builtin `/` is shadowed, and Div
+;;    has no instance until L1, so integer division is `quot` (R3) and library code never writes `/`
+;;    on integers (plan PC-14; case 018).
+(ns fib.core.protocols (:use fib.core.base))
+;; a predicate's result is bool or an Option; Payload says what `some` returns
+(defprotocol Truthy (truthy? (self) -> bool))
+(impl Truthy bool (truthy? (self) self))
+(impl Truthy (Option a) (truthy? (self) (match self (nil false) ((some _) true))))
+(defprotocol (Payload s p) (payload (self) -> p))
+(impl (Payload bool) bool (payload (self) self))
+(impl (Payload a) (Option a) (payload (self) (match self ((some x) x) (nil (trap "payload: nil")))))
+;; a comparator's result: an i64 (negative, zero, positive) or Clojure's predicate form
+(defprotocol Cmp (resolve (self k: (fn () Self) :borrow) -> i64))
+(impl Cmp i64 (resolve (self k) self))
+(impl Cmp bool (resolve (self k) (if self -1 (if (k) 1 0))))
+;; the witness inc, dec, abs, zero? take, because a literal has one type
+(defprotocol Unit (zero (self) -> Self) (one (self) -> Self))
+(impl Unit i8 (zero (self) 0i8) (one (self) 1i8))
+(impl Unit i16 (zero (self) 0i16) (one (self) 1i16))
+(impl Unit i32 (zero (self) 0i32) (one (self) 1i32))
+(impl Unit i64 (zero (self) 0) (one (self) 1))
+(impl Unit f32 (zero (self) 0.0f32) (one (self) 1.0f32))
+(impl Unit f64 (zero (self) 0.0) (one (self) 1.0))
+;; `/` is Div's method: the instance determines the result type (L30)
+(defprotocol (Div a r) (/ (self y: a) -> r))
+;; the printers: str is ToStr, pr is Debug, println is the builtin Show
+(defprotocol ToStr (to-str (self) -> str))
+(defprotocol Debug (debug (self) -> str))
+(impl ToStr str (to-str (self) self))
+(impl Debug str (debug (self) (str-concat "\"" (str-concat self "\""))))

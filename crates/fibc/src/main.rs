@@ -21,7 +21,7 @@ use fibc::harness::gen::GenConfig;
 #[cfg(feature = "llvm")]
 use fibc::harness::Harness;
 #[cfg(feature = "llvm")]
-use fibref::cases::{render, Report, Status};
+use fibref::cases::{render, Report, SelectError, Status};
 use fibref::roots::Roots;
 #[cfg(feature = "llvm")]
 use lair::aot::{build_executable, library_dir, Options};
@@ -85,7 +85,7 @@ fn build(_file: &str, _roots: &Roots, _out: &str, _link: &Link, _opt: u8) -> Exi
 }
 
 #[cfg(not(feature = "llvm"))]
-fn cases(_dir: &str) -> ExitCode {
+fn cases(_dir: &str, _only: &[String]) -> ExitCode {
     no_llvm("cases")
 }
 
@@ -261,7 +261,7 @@ fn itrace(file: &str, roots: &Roots) -> ExitCode {
 }
 
 #[cfg(feature = "llvm")]
-fn cases(dir: &str) -> ExitCode {
+fn cases(dir: &str, only: &[String]) -> ExitCode {
     let fibc = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -269,9 +269,13 @@ fn cases(dir: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let report = match (Harness { fibc }).run_dir(Path::new(dir)) {
+    let report = match (Harness { fibc }).run_dir_only(Path::new(dir), only) {
         Ok(r) => r,
-        Err(e) => {
+        Err(SelectError::NoMatch(prefix)) => {
+            eprintln!("fibc: no case matches {prefix} in {dir}");
+            return ExitCode::from(2);
+        }
+        Err(SelectError::Io(e)) => {
             eprintln!("fibc: cannot read cases in {dir}: {e}");
             return ExitCode::from(2);
         }
@@ -344,7 +348,7 @@ fn main() -> ExitCode {
         Command::Emit { file } => emit(&file, &roots),
         Command::Explain { file } => explain(&file, &roots),
         Command::Itrace { file } => itrace(&file, &roots),
-        Command::Cases { dir } => cases(&dir),
+        Command::Cases { dir, only } => cases(&dir, &only),
         Command::Gen(cfg) => gen(cfg),
         Command::Help => {
             println!("{USAGE}");

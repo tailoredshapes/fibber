@@ -1,0 +1,35 @@
+;; tl.rng: the seeded generator of the library's differential and law cases
+;; (cases/stdlib/README.md, spec/stdlib.md §8.1 items 2 and 4). Marsaglia's
+;; xorshift64 (13, 7, 17) over `shl`, `shr` (logical) and `bit-xor`, which
+;; never trap, so a case that draws a million numbers cannot abort on
+;; arithmetic. A generator is a struct holding one Cell; the same seed gives
+;; the same sequence under both tools, which is how a failing index in a
+;; case's result mask is reproduced. Decided here: seed 0 (a fixed point of
+;; the recurrence) is replaced by Marsaglia's own default seed.
+(ns tl.rng)
+
+(defstruct Rng (state: (Cell i64)))
+
+(defun rng (seed: i64) -> Rng
+  (Rng (cell (if (= seed 0) 88172645463325252 seed))))
+
+;; the next value: any i64, negative included
+(defun rng-next (r: Rng) -> i64
+  (let ((x0 @(. r state))
+        (x1 (bit-xor x0 (shl x0 13)))
+        (x2 (bit-xor x1 (shr x1 7)))
+        (x3 (bit-xor x2 (shl x2 17))))
+    (do (set! (. r state) x3) x3)))
+
+;; a value in [0, n); n must be positive
+(defun rng-below (r: Rng n: i64) -> i64
+  (if (> n 0)
+      (rem (shr (rng-next r) 1) n)
+      (trap "rng-below: the bound must be positive")))
+
+;; len values each in [0, bound), as a Vec built by the prelude's vec-conj
+(defun rng-vec (r: Rng len: i64 bound: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i len)
+        (recur (+ i 1) (fib.prelude/conj acc (rng-below r bound)))
+        acc)))

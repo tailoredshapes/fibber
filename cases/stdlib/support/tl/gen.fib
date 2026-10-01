@@ -1,0 +1,29 @@
+;; tl.gen: generated values for the cases that need more than a Vec of
+;; integers (cases/stdlib/README.md). `gen-str` makes UTF-8 text with every
+;; scalar width in it, so a string function is tried on one-, two-, three-
+;; and four-byte characters and on the boundaries between them; the
+;; surrogate range, which is no scalar value, is never drawn. The pipeline
+;; generator of spec/stdlib.md §8.1 item 3 is Rust (fibgen), not here.
+(ns tl.gen (:use tl.rng))
+
+;; a scalar value of one width: 1 is ASCII (0x20 to 0x7E), 2 is 0x80 to
+;; 0x7FF, 3 is 0x800 to 0xFFFF without 0xD800 to 0xDFFF, 4 is 0x10000 to
+;; 0x10FFFF; any other width is drawn from all four
+(defun gen-char-of (r: Rng width: i64) -> char
+  (i32->char
+    (trunc i32
+      (match width
+        (1 (+ 32 (rng-below r 95)))
+        (2 (+ 128 (rng-below r 1920)))
+        (3 (let ((n (rng-below r 61440))) (if (< n 53248) (+ 2048 n) (+ 4096 n))))
+        (4 (+ 65536 (rng-below r 1048576)))
+        (_ (+ 32 (rng-below r 95)))))))
+
+(defun gen-char (r: Rng) -> char (gen-char-of r (+ 1 (rng-below r 4))))
+
+;; n scalars, each of a width drawn independently
+(defun gen-str (r: Rng n: i64) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i n)
+        (recur (+ i 1) (str-concat acc (char->str (gen-char r))))
+        acc)))

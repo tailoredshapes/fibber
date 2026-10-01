@@ -1,0 +1,27 @@
+;; spec:   stdlib §2.1 (the walk is a push loop), §8.1 item 5 (count cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 8
+;; roots:  ../../lib support
+;; each-while, size and the walk that nth makes cost heap objects per call
+;; (a closure, a cell for the running value) and none per element (last is
+;; not here: its default holds an Option per element, case 022):
+;; the source here is a user type that counts from 0 to n-1 without storing
+;; anything, so every object the run allocates belongs to a call, not to an
+;; element. 100000 elements and 10 elements allocate the same number
+;; (checked here by walking both and by the bound, which is the count).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Upto (n: i64))
+
+(impl (Reducible i64) Upto
+  (each-while (self k)
+    (loop ((i 0)) (if (< i (. self n)) (if (k i) (recur (+ i 1)) false) true))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (count (Upto 100000)) 100000))
+        (check c (= (nth (Upto 100000) 99999) 99999))
+        (check c (= (count (Upto 10)) 10))
+        (checks-result c))))

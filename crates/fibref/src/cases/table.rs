@@ -66,13 +66,27 @@ pub fn render(report: &Report) -> String {
 /// The summary lines under the table.
 fn render_counts(counts: &Counts) -> String {
     let mut out = format!(
-        "\n{} cases: {} pass, {} fail, {} pending, {} header error\n",
+        "\n{} cases: {} pass, {} fail, {} pending, {} header error",
         counts.total(),
         counts.pass,
         counts.fail,
         counts.pending,
         counts.header_error
     );
+    // The open count is shown only when there is one, so the line of a
+    // suite with no open case stays what it has always been.
+    if counts.open > 0 {
+        let _ = write!(out, ", {} open", counts.open);
+    }
+    out.push('\n');
+    if counts.open > 0 {
+        let _ = writeln!(
+            out,
+            "OPEN: {} of {} cases fail as their `open` label says; an open case is not a pass.",
+            counts.open,
+            counts.total()
+        );
+    }
     if counts.pending > 0 {
         let _ = writeln!(
             out,
@@ -129,6 +143,28 @@ case                status   detail
 PENDING: 1 of 4 cases did not run; pending is not a pass.
 ";
         assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn open_rows_show_their_items_and_the_counts_line_names_them() {
+        let report = Report::from_results(vec![
+            result("01-a.fib", Status::Pass),
+            result(
+                "900-open-x.fib",
+                Status::Open("L20: cannot unify (Option i64) with bool".into()),
+            ),
+            result("901-open-y.fib", Status::OpenPassed),
+        ]);
+        let expected = "\
+case            status  detail
+01-a.fib        pass
+900-open-x.fib  OPEN    L20: cannot unify (Option i64) with bool
+901-open-y.fib  FAIL    the item landed: remove `open`
+
+3 cases: 1 pass, 1 fail, 0 pending, 0 header error, 1 open
+OPEN: 1 of 3 cases fail as their `open` label says; an open case is not a pass.
+";
+        assert_eq!(render(&report), expected);
     }
 
     #[test]

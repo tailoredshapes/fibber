@@ -1,0 +1,22 @@
+;; spec:   stdlib §2.1 rule 2, ownership §6 (a cycle through cells is a leak, not a violation)
+;; expect: accept
+;; result: 0
+;; audit:  leak-cycle
+;; roots:  ../../lib support
+;; ones = (cons 1 ones): a node whose tail is the node itself, reached
+;; through a cell set after the node is made. Walking it with each-while
+;; and stopping after four elements is fine (a node that merely refers to
+;; itself is not a node that forces itself, case 003), and the cycle
+;; through the cell is the one leak the audit reports apart from errors
+;; (ownership §6). Nothing else is live at the end.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (r: (Cell (Option (LSeq i64))) (cell nil)))
+    (let ((ones (lazy-node (fn () (LCons 1 (match @r ((some s) s) (nil (lazy-node (fn () LNil)))))))))
+      (let ((taken (cell 0)))
+        (do (set! r (some ones))
+            (check c (not (each-while ones (fn (x) (do (set! taken (+ @taken x)) (< @taken 4))))))
+            (check c (= @taken 4))
+            (checks-result c))))))

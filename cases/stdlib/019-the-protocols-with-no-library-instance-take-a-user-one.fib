@@ -1,0 +1,73 @@
+;; spec:   stdlib §2.3 (Assoc Dissoc Keyed Stack Reversible KeyReducible Cursor Cursable Seqable)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; P0 declares every protocol of §2.3 and seeds instances for Vec, Option,
+;; VSeq, List and LSeq only. The others exist so that tranches 1 to 3 can
+;; add instances without changing a signature, and this case pins each
+;; signature by implementing it once for a user type, the way a program
+;; would: the shapes (which parameter is Self, what the result is) are what
+;; the other packages build on. A Pile is n items numbered 0 to n-1 whose
+;; item i is 10 * i.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct Pile (n: i64))
+
+(impl (Stack i64) Pile
+  (peek (self) (if (> (. self n) 0) (some (* 10 (- (. self n) 1))) nil))
+  (pop (self) (Pile (if (> (. self n) 0) (- (. self n) 1) 0))))
+
+(impl (Keyed i64) Pile
+  (contains? (self key) (if (>= key 0) (< key (. self n)) false)))
+
+(impl (Assoc i64 i64) Pile
+  (assoc (self key val) (if (< key (. self n)) self (Pile (+ key 1)))))
+
+(impl (Dissoc i64) Pile
+  (dissoc (self key) (if (= key (- (. self n) 1)) (Pile key) self)))
+
+(impl (Reversible i64) Pile
+  (each-while-rev (self k)
+    (loop ((i (- (. self n) 1))) (if (>= i 0) (if (k (* 10 i)) (recur (- i 1)) false) true))))
+
+(impl (KeyReducible i64 i64) Pile
+  (each-kv-while (self k)
+    (loop ((i 0)) (if (< i (. self n)) (if (k i (* 10 i)) (recur (+ i 1)) false) true))))
+
+(defstruct Walker (at: (Cell i64) n: i64))
+
+(impl (Cursor i64) Walker
+  (advance! (self) (do (set! (. self at) (+ @(. self at) 1)) (< @(. self at) (. self n))))
+  (current (self) (* 10 @(. self at))))
+
+(impl (Cursable Walker) Pile
+  (cursor (self) (Walker (cell -1) (. self n))))
+
+(impl (Seqable Pile) Pile
+  (seq (self) (if (> (. self n) 0) (some self) nil))
+  (rest (self) (Pile (if (> (. self n) 0) (- (. self n) 1) 0))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (Pile 3))
+        (hits (cell 0)))
+    (do (check c (match (peek p) ((some x) (= x 20)) (nil false)))
+        (check c (match (peek (pop p)) ((some x) (= x 10)) (nil false)))
+        (check c (match (peek (Pile 0)) ((some _) false) (nil true)))
+        (check c (and (contains? p 2) (not (contains? p 3))))
+        (check c (contains? (assoc p 5 0) 5))
+        (check c (not (contains? (dissoc p 2) 2)))
+        (check c (contains? (dissoc p 1) 1))
+        (check c (do (each-while-rev p (fn (x) (do (set! hits (+ (* @hits 100) x)) true)))
+                     (= @hits 201000)))
+        (check c (do (set! hits 0)
+                     (each-kv-while p (fn (k v) (do (set! hits (+ @hits (+ k v))) (< k 1))))
+                     (= @hits 11)))
+        (let ((w (cursor p)) (sum (cell 0)))
+          (do (loop ((more (advance! w)))
+                (if more (do (set! sum (+ @sum (current w))) (recur (advance! w))) ()))
+              (check c (= @sum 30))))
+        (check c (match (seq p) ((some s) (= (. s n) 3)) (nil false)))
+        (check c (= (. (rest p) n) 2))
+        (checks-result c))))

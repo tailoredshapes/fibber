@@ -9,8 +9,8 @@ pub mod interp;
 use std::path::{Path, PathBuf};
 
 use fibref::cases::{
-    case_roots, judge_counted, list_cases, parse_header, AuditSummary, CaseResult, HeaderError,
-    HeaderErrorKind, Outcome, Report, Status, Value,
+    case_roots, judge_labelled, list_cases, parse_header, parse_labels, select_cases, AuditSummary,
+    CaseResult, HeaderError, HeaderErrorKind, Outcome, Report, SelectError, Status, Value,
 };
 
 use crate::trace::{compare, Trace};
@@ -29,6 +29,15 @@ impl Harness {
         Ok(Report::from_results(results))
     }
 
+    /// [`Harness::run_dir`] over the cases whose names start with one of
+    /// `prefixes` (`fibc cases DIR --only PREFIX..`); a prefix that
+    /// matches no case is [`SelectError::NoMatch`], never a silent pass.
+    pub fn run_dir_only(&self, dir: &Path, prefixes: &[String]) -> Result<Report, SelectError> {
+        let cases = select_cases(list_cases(dir)?, prefixes)?;
+        let results = cases.iter().map(|p| self.run_case(p)).collect();
+        Ok(Report::from_results(results))
+    }
+
     /// Runs one case both ways and judges the compiled outcome.
     pub fn run_case(&self, path: &Path) -> CaseResult {
         let status = match std::fs::read_to_string(path) {
@@ -39,11 +48,11 @@ impl Harness {
             }),
             Ok(source) => match parse_header(path, &source) {
                 Err(e) => Status::HeaderError(e),
-                Ok(header) => match case_roots(path, &source) {
-                    Err(e) => Status::HeaderError(e),
-                    Ok(roots) => {
+                Ok(header) => match (case_roots(path, &source), parse_labels(path, &source)) {
+                    (Err(e), _) | (_, Err(e)) => Status::HeaderError(e),
+                    (Ok(roots), Ok(labels)) => {
                         let (outcome, allocs) = self.counted_in(path, &source, &roots);
-                        judge_counted(&header, &outcome, allocs)
+                        judge_labelled(&header, &labels.open, &outcome, allocs)
                     }
                 },
             },

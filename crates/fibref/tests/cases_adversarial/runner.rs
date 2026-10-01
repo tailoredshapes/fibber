@@ -79,6 +79,7 @@ fn run_dir_counts_every_status_and_orders_by_file_name() {
             fail: 2,
             pending: 1,
             header_error: 1,
+            open: 0,
         }
     );
     assert_eq!(report.counts.total(), 6);
@@ -184,6 +185,7 @@ fn run_dir_with_pending_evaluator_is_ok_but_all_pending() {
             fail: 0,
             pending: 2,
             header_error: 0,
+            open: 0,
         }
     );
     assert!(report.ok(), "pending alone must not fail the report");

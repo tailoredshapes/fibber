@@ -1,0 +1,43 @@
+;; spec:   stdlib §2.3 (Reducible), §5 of the tranche 1 plan (interfaces)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; each-while is the one primitive every sequence function is built on: it
+;; visits the elements in order and stops when the visitor says false; its
+;; result says whether the walk ran to the end. Here on a Vec, an Option, a
+;; VSeq (a Vec with a consed front), an LSeq and a List. This module does
+;; not :use fib.coll, whose `empty` method is the List variant's name until
+;; R2 renames the variants (so `list` expands here without it).
+(ns main (:use fib.core fib.seq tl.check))
+
+;; the sum of the elements before the first one at or above limit, and
+;; whether the walk reached the end
+(defun sum-below (c: c limit: i64) :where ((Reducible c i64)) -> (Pair i64 bool)
+  (let ((acc (cell 0)))
+    (let ((done (each-while c (fn (x) (if (< x limit) (do (set! acc (+ @acc x)) true) false)))))
+      (Pair @acc done))))
+
+(defun expect (c: Checks p: (Pair i64 bool) sum: i64 done: bool) -> unit
+  (check c (and (= (. p fst) sum) (= (. p snd) done))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [1 2 3 4 5])
+        (none: (Option i64) nil)
+        (vs (VSeq (list 1) [2 3] 0))
+        (ls (lcons 1 (lcons 2 (lcons 9 (lcons 3 (lazy-node (fn () LNil)))))))
+        (xs (list 1 2 3 4)))
+    (do (expect c (sum-below v 100) 15 true)
+        (expect c (sum-below v 4) 6 false)
+        (expect c (sum-below v 1) 0 false)
+        (expect c (sum-below (some 7) 100) 7 true)
+        (expect c (sum-below (some 7) 7) 0 false)
+        (expect c (sum-below none 7) 0 true)
+        (expect c (sum-below vs 100) 6 true)
+        (expect c (sum-below vs 3) 3 false)
+        (expect c (sum-below ls 100) 15 true)
+        (expect c (sum-below ls 9) 3 false)
+        (expect c (sum-below xs 100) 10 true)
+        (expect c (sum-below xs 3) 3 false)
+        (checks-result c))))
