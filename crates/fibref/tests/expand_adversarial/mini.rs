@@ -161,7 +161,7 @@ fn eval_call(
     let built = |kind: FormKind| Val::F(Form::new(kind, pos.clone()));
     Ok(match head {
         "fib.prelude/vec-empty" => Val::V(Vec::new()),
-        "fib.prelude/conj" => {
+        "fib.prelude/vec-conj" => {
             let mut v = vector(next()?, &pos)?;
             v.push(form(next()?, &pos)?);
             Val::V(v)

@@ -31,11 +31,11 @@ fn cond_nests_ifs_and_traps_when_nothing_matches() {
     assert_eq!(ex("(cond (a 1) (else 4))"), "(if a 1 4)");
     assert_eq!(
         ex("(cond (a 1))"),
-        "(if a 1 (trap \"cond: no clause matched at t.fib:1:1\"))"
+        "(if a 1 (fib.prelude/trap \"cond: no clause matched at t.fib:1:1\"))"
     );
     assert_eq!(
         ex("(cond)"),
-        "(trap \"cond: no clause matched at t.fib:1:1\")"
+        "(fib.prelude/trap \"cond: no clause matched at t.fib:1:1\")"
     );
 }
 
@@ -52,10 +52,13 @@ fn cond_rejects_bad_clauses() {
 
 #[test]
 fn if_let_and_when_let_are_match() {
-    assert_eq!(ex("(if-let (x e) a b)"), "(match e ((some x) a) (nil b))");
+    assert_eq!(
+        ex("(if-let (x e) a b)"),
+        "(match e ((fib.prelude/some x) a) (nil b))"
+    );
     assert_eq!(
         ex("(when-let (x e) a b)"),
-        "(match e ((some x) (do a b)) (nil ()))"
+        "(match e ((fib.prelude/some x) (do a b)) (nil ()))"
     );
     let e = ex_err("(if-let (x e) a)");
     let expected = "3".to_string();
@@ -73,16 +76,19 @@ fn if_let_and_when_let_are_match() {
 
 #[test]
 fn list_is_cons_cells() {
-    assert_eq!(ex("(list a b)"), "(cons a (cons b empty))");
-    assert_eq!(ex("(list)"), "empty");
+    assert_eq!(
+        ex("(list a b)"),
+        "(fib.prelude/Cons a (fib.prelude/Cons b fib.prelude/Empty))"
+    );
+    assert_eq!(ex("(list)"), "fib.prelude/Empty");
 }
 
 #[test]
 fn plet_spawns_then_joins() {
     assert_eq!(
         ex("(plet ((a e1) (b e2)) (f a b))"),
-        "(let ((#a.1 (spawn (fn () e1))) (#b.2 (spawn (fn () e2)))) \
-         (let ((a (join #a.1)) (b (join #b.2))) (f a b)))"
+        "(let ((#a.1 (fib.prelude/spawn (fn () e1))) (#b.2 (fib.prelude/spawn (fn () e2)))) \
+         (let ((a (fib.prelude/join #a.1)) (b (fib.prelude/join #b.2))) (f a b)))"
     );
     let e = ex_err("(plet ((1 e)) x)");
     assert!(matches!(e.kind, K::Malformed { ref head, .. } if head == "plet"));
@@ -99,7 +105,7 @@ fn while_is_the_table_loop() {
 fn dotimes_is_the_table_loop() {
     assert_eq!(
         ex("(dotimes (i n) (f i))"),
-        "(let ((#m.1 n)) (loop ((i 0)) (if (< i #m.1) (do (f i) (recur (+ i 1))) ())))"
+        "(let ((#m.1 n)) (loop ((i 0)) (if (fib.prelude/< i #m.1) (do (f i) (recur (fib.prelude/+ i 1))) ())))"
     );
     let e = ex_err("(dotimes i (f i))");
     assert!(matches!(e.kind, K::Malformed { ref head, .. } if head == "dotimes"));
@@ -109,12 +115,12 @@ fn dotimes_is_the_table_loop() {
 fn for_each_over_a_literal_range_is_a_loop() {
     assert_eq!(
         ex("(for-each (range a b) (fn (i) (f i) (g i)))"),
-        "(let ((#s.1 a) (#m.2 b)) (loop ((i #s.1)) (if (< i #m.2) (do (f i) (g i) (recur (+ i 1))) ())))"
+        "(let ((#s.1 a) (#m.2 b)) (loop ((i #s.1)) (if (fib.prelude/< i #m.2) (do (f i) (g i) (recur (fib.prelude/+ i 1))) ())))"
     );
     // (range n) is (range 0 n) (Decided, owner, 2026-09-27; case 86).
     assert_eq!(
         ex("(for-each (range n) (fn (i) i))"),
-        "(let ((#s.1 0) (#m.2 n)) (loop ((i #s.1)) (if (< i #m.2) (do i (recur (+ i 1))) ())))"
+        "(let ((#s.1 0) (#m.2 n)) (loop ((i #s.1)) (if (fib.prelude/< i #m.2) (do i (recur (fib.prelude/+ i 1))) ())))"
     );
 }
 
@@ -122,7 +128,7 @@ fn for_each_over_a_literal_range_is_a_loop() {
 fn range_takes_one_or_two_arguments() {
     // (range a b) is the rewrite to the library's range-between; (range
     // n) stays the library function, which is also range's value.
-    assert_eq!(ex("(range a b)"), "(range-between a b)");
+    assert_eq!(ex("(range a b)"), "(fib.prelude/range-between a b)");
     assert_eq!(ex("(range n)"), "(range n)");
     assert_eq!(ex("(map range xs)"), "(map range xs)");
     let e = ex_err("(range a b c)");
@@ -140,21 +146,21 @@ fn any_other_for_each_is_the_library_call() {
     assert_eq!(ex("(for-each (range n) f)"), "(for-each (range n) f)");
     assert_eq!(
         ex("(for-each (range a b) f)"),
-        "(for-each (range-between a b) f)"
+        "(for-each (fib.prelude/range-between a b) f)"
     );
     assert_eq!(
         ex("(for-each (range a b) (fn g (i) i))"),
-        "(for-each (range-between a b) (fn g (i) i))"
+        "(for-each (fib.prelude/range-between a b) (fn g (i) i))"
     );
     // An annotated parameter: loop variables take no annotation, so the
     // library function runs the fn and checks it (case 86).
     assert_eq!(
         ex("(for-each (range a b) (fn (i: i64) i))"),
-        "(for-each (range-between a b) (fn (i: i64) i))"
+        "(for-each (fib.prelude/range-between a b) (fn (i: i64) i))"
     );
     assert_eq!(
         ex("(for-each (range a b) (fn (i) -> i64 i))"),
-        "(for-each (range-between a b) (fn (i) -> i64 i))"
+        "(for-each (fib.prelude/range-between a b) (fn (i) -> i64 i))"
     );
 }
 
@@ -187,10 +193,13 @@ fn doto_binds_once() {
 
 #[test]
 fn assert_is_if_and_trap() {
-    assert_eq!(ex("(assert c \"no\")"), "(if c () (trap \"no\"))");
+    assert_eq!(
+        ex("(assert c \"no\")"),
+        "(if c () (fib.prelude/trap \"no\"))"
+    );
     assert_eq!(
         ex("(assert (< a b))"),
-        "(if (< a b) () (trap \"assert failed at t.fib:1:1: (< a b)\"))"
+        "(if (< a b) () (fib.prelude/trap \"assert failed at t.fib:1:1: (< a b)\"))"
     );
     assert!(matches!(ex_err("(assert)").kind, K::MacroArity { .. }));
     assert!(matches!(
@@ -203,7 +212,7 @@ fn assert_is_if_and_trap() {
 fn dbg_evaluates_once_prints_with_show_and_returns_the_value() {
     assert_eq!(
         ex("(dbg (f x))"),
-        "(let ((#dbg.1 (f x))) (eprintln (str-concat \"dbg t.fib:1:1: (f x) = \" (show #dbg.1))) #dbg.1)"
+        "(let ((#dbg.1 (f x))) (fib.prelude/eprintln (fib.prelude/str-concat \"dbg t.fib:1:1: (f x) = \" (fib.prelude/show #dbg.1))) #dbg.1)"
     );
     assert!(matches!(ex_err("(dbg)").kind, K::MacroArity { .. }));
     assert!(matches!(ex_err("(dbg a b)").kind, K::MacroArity { .. }));

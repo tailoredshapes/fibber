@@ -3,16 +3,20 @@
 ;; (76 + 133 + 137 + 146 = 492 lines of Rust). Each takes the whole call
 ;; form and returns its expansion, which the expander expands again; a form
 ;; a macro builds carries the call's position, a form taken from the
-;; arguments keeps its own (syntax §1.3); the expansions are unhygienic
-;; (syntax §3.16): `if`, `cons`, `spawn`, `trap` are plain symbols and only
-;; the bindings a macro introduces itself are gensyms.
+;; arguments keeps its own (syntax §1.3); the expansions are hygienic in
+;; the one way a rewrite can be (stdlib design §6.3, tranche 1 R2): every
+;; head or constant that is not a core form is `fib.prelude/NAME`
+;; (`prelude-name`); the macros an expansion names (`and`, `or`), the core
+;; forms and the bindings a macro introduces itself (gensyms) are plain.
 ;;
 ;; TABLE-DRIVEN, as Rust's mod.rs: one function per macro, in the order of
 ;; the Rust files (logic, forms, loops), and `expand-call` is the Rust
 ;; `match` on the head, so a later change of a Rust macro is a mirror of one
 ;; function and a new macro is one function, one line of `prelude-macros`
-;; and one line of `expand-call`. This port is of the CURRENT Rust macros
-;; only.
+;; and one line of `expand-call`. (The Rust is a registry of rows,
+;; `MACROS`, and `PRELUDE_MACROS` the names of its rows; a name that is
+;; no row is declined, which the last line of `expand-call` does.) This
+;; port is of the CURRENT Rust macros only.
 ;;
 ;; Decided here, where the Rust is silent or a name would clash:
 ;; - `PRELUDE_MACROS` is the vector `prelude-macros`. The Rust functions
@@ -29,8 +33,8 @@
 ;;   the parts in order; `Vec<Form>` iterated with `skip(n)` is `tail-from`.
 ;; - the Rust's second check of a `cond` clause cannot fire after its first
 ;;   and is not ported (`bad-clause` is the one check).
-;; - the call `()` is sent to `derive` (`name` is `""`), as the Rust does;
-;;   its arity error is the answer.
+;; - a call whose head names no row (`()`, which `is-macro` never lets
+;;   through) is declined, as the Rust does.
 ;; - `list`, `plet`, `->`, `->>`, `doto`, `assert` and `dbg` (the Rust
 ;;   forms.rs) are the module expand.prelude.forms, and the helpers the two
 ;;   share (`tail-from`, `items-of`, `body-form`...) are expand.prelude.parts,
@@ -41,7 +45,7 @@
 ;;   expand.error, and is used by expand.expr.
 (ns expand.prelude
   (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build
-        expand.prelude.parts expand.prelude.forms)
+        expand.collections expand.prelude.parts expand.prelude.forms)
   (:require [expand.derive :as dv]))
 
 ;; The prelude macros, by name, in the order of the Rust table (the soup
@@ -126,7 +130,7 @@
       ((some bad) (Err (malformed "cond" "a clause is (test body+)" (. bad pos))))
       (nil
        (let ((message (str-join ["cond: no clause matched at " (pos-display pos)])))
-         (cond-fold clauses (call "trap" [(string message pos)] pos) pos))))))
+         (cond-fold clauses (call (prelude-name "trap") [(string message pos)] pos) pos))))))
 
 ;; The clauses, last first, folded onto the trap: clause j is the default
 ;; only when it is the last one.
@@ -154,13 +158,14 @@
          (Err (malformed name "the binding is (pattern expression)" (. form pos)))))
     (nil (Err (malformed name "the binding is (pattern expression)" (. form pos))))))
 
-;; `(match e ((some x) then) (nil other))`.
+;; `(match e ((fib.prelude/some x) then) (nil other))`.
 (defun option-match :private (x: Stx e: Stx then: Stx other: Stx pos: Pos) -> Stx
-  (let ((some-clause (list-form [(call "some" [x] pos) then] pos))
+  (let ((some-clause (list-form [(call (prelude-name "some") [x] pos) then] pos))
         (none-clause (list-form [(Stx SNil pos) other] pos)))
     (list-form [(sym "match" pos) e some-clause none-clause] pos)))
 
-;; `(if-let (x e) a b)` ==> `(match e ((some x) a) (nil b))` (§4.4).
+;; `(if-let (x e) a b)` ==> `(match e ((fib.prelude/some x) a) (nil b))`
+;; (§4.4).
 (defun if-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "if-let" items 3 (some 3) pos)
     ((Err e) (Err e))
@@ -169,7 +174,8 @@
        ((Err e) (Err e))
        ((Ok b) (Ok (option-match (nth b 0) (nth b 1) (nth items 2) (nth items 3) pos)))))))
 
-;; `(when-let (x e) body...)` ==> `(match e ((some x) body) (nil ()))`.
+;; `(when-let (x e) body...)` ==> `(match e ((fib.prelude/some x) body)
+;; (nil ()))`.
 (defun when-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "when-let" items 1 nil pos)
     ((Err e) (Err e))
@@ -196,9 +202,9 @@
 (defstruct Counting :private (i: Stx bounds: (Vec Stx) start: Stx limit: Stx))
 
 (defun counting-loop :private (c: Counting body: (Vec Stx) pos: Pos) -> Stx
-  (let ((next (call "+" [(. c i) (int 1 pos)] pos))
+  (let ((next (call (prelude-name "+") [(. c i) (int 1 pos)] pos))
         (steps (conj body (call "recur" [next] pos)))
-        (test (call "<" [(. c i) (. c limit)] pos))
+        (test (call (prelude-name "<") [(. c i) (. c limit)] pos))
         (branch (call "if" [test (call "do" steps pos) (unit pos)] pos))
         (vars (list-form [(list-form [(. c i) (. c start)] pos)] pos))
         (lp (call "loop" [vars branch] pos)))
@@ -234,7 +240,7 @@
            ((and (= (count xs) 2) (is-sym (nth xs 0) "range")) (some [(int 0 (. form pos)) (nth xs 1)]))
            (true nil)))))
 
-;; `(range a b)` ==> `(range-between a b)`; `(range n)` is declined and
+;; `(range a b)` ==> `(fib.prelude/range-between a b)`; `(range n)` is declined and
 ;; stays a call of the library function `range` (§4.4, §4.5). There is
 ;; no arity overloading, so the two-argument form is this rewrite.
 (defun range-macro :private (items: (Vec Stx) pos: Pos) -> (Result Outcome ExpandError)
@@ -242,7 +248,7 @@
     ((Err e) (Err e))
     ((Ok _)
      (if (= (count items) 3)
-         (Ok (Rewritten (call "range-between" [(nth items 1) (nth items 2)] pos)))
+         (Ok (Rewritten (call (prelude-name "range-between") [(nth items 1) (nth items 2)] pos)))
          (Ok (Declined (list-form items pos)))))))
 
 ;; The `i` and body of a literal `(fn (i) body+)`, as `i` then the body:
@@ -321,7 +327,8 @@
     ("dotimes" (rewritten (dotimes-macro ctx items pos)))
     ("for-each" (for-each-macro ctx items pos))
     ("range" (range-macro items pos))
-    (_ (rewritten (dv/derive ctx items pos)))))
+    ("derive" (rewritten (dv/derive ctx items pos)))
+    (_ (Ok (Declined (list-form items pos))))))
 
 ;; Expands one call of a prelude macro: the form must be a list whose head
 ;; is one of prelude-macros (a form that is not a list is declined as it

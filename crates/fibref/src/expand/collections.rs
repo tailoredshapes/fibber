@@ -3,16 +3,21 @@
 //!
 //! ```text
 //! []              ⟹ (vec-empty)
-//! [e1 e2 ... en]  ⟹ (conj (conj ... (conj (vec-empty) e1) ...) en)
+//! [e1 e2 ... en]  ⟹ (vec-conj (vec-conj ... (vec-conj (vec-empty) e1) ...) en)
 //! {}              ⟹ (map-empty)
-//! {k1 v1 ...}     ⟹ (assoc (assoc (map-empty) k1 v1) ...)
+//! {k1 v1 ...}     ⟹ (map-assoc (map-assoc (map-empty) k1 v1) ...)
 //! ```
 //!
 //! §1.4: "the rewrite resolves them in the prelude, not in the current
 //! namespace". A form can only carry that as a qualified symbol, so the
-//! heads are written `fib.prelude/conj` etc. ([`PRELUDE_NS`]), which a
-//! user binding of `conj` cannot shadow. The built calls take the
-//! position of the literal; the elements keep their own (§1.3).
+//! heads are written `fib.prelude/vec-conj` etc. ([`PRELUDE_NS`]), which a
+//! user binding of `vec-conj` cannot shadow. The targets are the prelude's
+//! ordinary functions on `Vec` and `Map`, not the methods of its
+//! `Collection` and `Associative` protocols (stdlib design C-5): the
+//! library's `fib.coll` defines `conj` and `assoc` of its own, and the
+//! prelude's protocols are deleted by the flip, so a literal must not
+//! depend on them. The built calls take the position of the literal; the
+//! elements keep their own (§1.3).
 
 use crate::syntax::{Form, Pos};
 
@@ -28,7 +33,7 @@ pub(crate) fn prelude_name(name: &str) -> String {
 
 /// The rewrite of `[items...]`, the items already expanded.
 pub(crate) fn vec_literal(items: Vec<Form>, pos: &Pos) -> Form {
-    let conj = prelude_name("conj");
+    let conj = prelude_name("vec-conj");
     let mut acc = call(&prelude_name("vec-empty"), Vec::new(), pos);
     for item in items {
         acc = call(&conj, vec![acc, item], pos);
@@ -41,7 +46,7 @@ pub(crate) fn vec_literal(items: Vec<Form>, pos: &Pos) -> Form {
 /// one) is paired with nothing and dropped by `chunks_exact`, so callers
 /// check the count first.
 pub(crate) fn map_literal(items: Vec<Form>, pos: &Pos) -> Form {
-    let assoc = prelude_name("assoc");
+    let assoc = prelude_name("map-assoc");
     let mut acc = call(&prelude_name("map-empty"), Vec::new(), pos);
     let mut it = items.into_iter();
     while let (Some(k), Some(v)) = (it.next(), it.next()) {

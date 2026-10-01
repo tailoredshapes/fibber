@@ -22,6 +22,8 @@
 ;;   message may) being one element. Rust's thread of STACK_BYTES is not
 ;;   needed: the walks of the port use explicit stacks.
 ;; - `expand_kind_name` is `expand-err-name` of expand.error.
+;; - `dump_module` (the section of one module, with the implicit ones left
+;;   out unless `--implicit`) is the body of the loop of `dump-modules`.
 ;; - the runner of the default `Evaluator` kind is stage 2b's
 ;;   (compiler/lair/expand.fib); stage 2a has none, so `runner-of` gives
 ;;   `no-runner` for both kinds and a user macro call is
@@ -37,7 +39,7 @@
   (:require [syntax.reader :as reader] [syntax.dump :as sdump] [expand.modules :as mods]
             [expand.program :as prog] [expand.dumpctx :as dctx])
   (:use syntax.pos syntax.form syntax.error util.result expand.error expand.types expand.ctx
-        expand.args))
+        expand.args expand.roots))
 
 ;; One file's output: its lines and the status it adds (0 expanded, 1
 ;; ended in an error record, 2 unreadable). A line has no newline.
@@ -88,26 +90,30 @@
 ;; The sections of the modules of loaded, in order, after lines: each
 ;; begun in ctx, headed `-- module NS FILE`, expanded, dumped, followed
 ;; by the context when asked (before the module is ended) and ended; the
-;; first expansion error is the last record.
+;; first expansion error is the last record. An implicit module, or one
+;; read for one, is expanded all the same but has no section unless
+;; `--implicit` is given (the header is then written for an error in it
+;; all the same) (`dump_module`).
 (defun dump-modules :private (lines: (Vec str) ctx: ExpandCtx loaded: (Vec Loaded) runner: Runner
-                              baseline: dctx/Baseline context: bool) -> Dumped
+                              baseline: dctx/Baseline opts: Options) -> Dumped
   (let ((n (count loaded)))
     (loop ((i 0) (acc lines))
       (if (< i n)
           (let ((l (nth loaded i))
                 (spec (. l spec))
-                (file (. l file)))
+                (file (. l file))
+                (show (or (. opts implicit) (not (. l implicit))))
+                (head (str-join ["-- module " (. spec ns) " " file])))
             (do (mods/begin-spec ctx spec)
-                (let ((head (conj acc (str-join ["-- module " (. spec ns) " " file]))))
-                  (match (prog/expand-program (. l forms) ctx runner)
-                    ((Err e) (failed head (expand-record e file)))
-                    ((Ok forms)
-                     (let ((body (sdump/dump-forms-in head forms file))
-                           (full (if context
-                                     (dctx/dump-context body ctx (. spec ns) file baseline)
-                                     body)))
-                       (do (ctx-end-module ctx)
-                           (recur (+ i 1) full))))))))
+                (match (prog/expand-program (. l forms) ctx runner)
+                  ((Err e) (failed (conj acc head) (expand-record e file)))
+                  ((Ok forms)
+                   (let ((body (if show (sdump/dump-forms-in (conj acc head) forms file) acc))
+                         (full (if (and show (. opts context))
+                                   (dctx/dump-context body ctx (. spec ns) file baseline (. opts implicit))
+                                   body)))
+                     (do (ctx-end-module ctx)
+                         (recur (+ i 1) full)))))))
           (Dumped acc 0)))))
 
 ;; The dump of the program whose main module is source (the file `file`):
@@ -120,10 +126,17 @@
       ((Ok _)
        (do (apply-limits ctx (. opts limits))
            (let ((baseline (dctx/baseline-of ctx)))
-             (match (mods/try-load source file)
+             (match (mods/try-load-with source file (roots-default) (implicit-of opts))
                ((Err e) (failed lines (load-record e file)))
                ((Ok loaded)
-                (dump-modules lines ctx loaded (runner-of (. opts runner)) baseline (. opts context))))))))))
+                (dump-modules lines ctx loaded (runner-of (. opts runner)) baseline opts)))))))))
+
+;; The implicit modules of the dump: those of `--implicit-lib`, else the
+;; library's (`IMPLICIT_LIB`).
+(defun implicit-of :private (opts: Options) -> (Vec str)
+  (match (. opts implicit-lib)
+    (nil (mods/implicit-lib))
+    ((some names) names)))
 
 ;; The dump of source (the file `file`) as a library prelude, which is what
 ;; `prelude-forms` makes of `lib/prelude.fib`: expanded with no runner in
@@ -146,7 +159,7 @@
                 ((Ok forms)
                  (let ((body (sdump/dump-forms-in (sdump/dump-forms-in head own file) forms file)))
                    (Dumped (if (. opts context)
-                               (dctx/dump-context body ctx prelude-ns file (dctx/baseline-empty))
+                               (dctx/dump-context body ctx prelude-ns file (dctx/baseline-empty) false)
                                body)
                            0)))))))))))
 

@@ -22,7 +22,7 @@ impl Machine<'_> {
             ("str-concat", [V::Str(x), V::Str(y)]) => Ok(V::str(&format!("{x}{y}"))),
             ("inc1", [V::Int(x)]) => arith("+", *x, 1),
             ("some", [x]) => Ok(V::Opt(Some(Rc::new(x.clone())))),
-            ("cons", [x, V::List(t)]) => Ok(V::List(Rc::new(prepend(x, t)))),
+            ("Cons", [x, V::List(t)]) => Ok(V::List(Rc::new(prepend(x, t)))),
             ("list", items) => Ok(V::List(Rc::new(items.to_vec()))),
             (
                 "Pt" | "Wrap" | "Holder" | "Box" | "Circle" | "Rect" | "Named" | "Hook" | "Ver"

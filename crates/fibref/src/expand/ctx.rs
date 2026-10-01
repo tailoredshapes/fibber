@@ -90,11 +90,13 @@ pub struct ExpandCtx {
 }
 
 /// The module being expanded, for macro lookup (syntax §5): its `ns`,
-/// the modules it `:use`s and its `:require` aliases.
+/// the modules it `:use`s, the implicit modules it sees (after its
+/// `:use`s, before the prelude) and its `:require` aliases.
 #[derive(Clone, Debug)]
 pub struct ModuleScope {
     pub ns: String,
     pub uses: Vec<String>,
+    pub implicit: Vec<String>,
     pub aliases: HashMap<String, String>,
 }
 
@@ -103,6 +105,7 @@ impl ModuleScope {
         ModuleScope {
             ns: ns.to_string(),
             uses: Vec::new(),
+            implicit: Vec::new(),
             aliases: HashMap::new(),
         }
     }
@@ -189,21 +192,24 @@ impl ExpandCtx {
 
     /// The user macro `name` reaches from the module being expanded
     /// (syntax §5): `alias/x` in the module the alias names, or by the
-    /// full `ns` of the prelude or of this module; a bare name in this
-    /// module, then in what its `:use`s export, then in the prelude; a
-    /// `:private` macro only in its own module.
+    /// full `ns` of the prelude, of an implicit module or of this module;
+    /// a bare name in this module, then in what its `:use`s export, then
+    /// in the implicit modules, then in the prelude; a `:private` macro
+    /// only in its own module.
     pub fn macro_def(&self, name: &str) -> Option<&MacroDef> {
         let scope = &self.scope;
         if let Some((q, base)) = name.split_once('/') {
             let ns = match scope.aliases.get(q) {
                 Some(ns) => ns.as_str(),
                 None if q == super::PRELUDE_NS || q == scope.ns => q,
+                None if scope.implicit.iter().any(|i| i == q) => q,
                 None => return None,
             };
             return self.exported_macro(ns, base);
         }
         std::iter::once(scope.ns.as_str())
             .chain(scope.uses.iter().map(String::as_str))
+            .chain(scope.implicit.iter().map(String::as_str))
             .chain(std::iter::once(super::PRELUDE_NS))
             .find_map(|ns| self.exported_macro(ns, name))
     }
@@ -229,11 +235,18 @@ impl ExpandCtx {
             .map(|(second, _)| (first, second))
     }
 
-    /// Starts expanding module `ns` with these `:use`s and aliases.
-    pub fn begin_module(&mut self, ns: &str, uses: &[String], aliases: HashMap<String, String>) {
+    /// Starts expanding module `ns` with these `:use`s, implicit modules
+    /// (`modules::IMPLICIT_LIB`) and aliases.
+    pub fn begin_module(
+        &mut self,
+        ns: &str,
+        (uses, implicit): (&[String], &[String]),
+        aliases: HashMap<String, String>,
+    ) {
         self.scope = ModuleScope {
             ns: ns.to_string(),
             uses: uses.to_vec(),
+            implicit: implicit.to_vec(),
             aliases,
         };
     }

@@ -26,7 +26,12 @@
 //!   in the program cannot capture it;
 //! - `Show`: `"(Name f1 f2)"` built with `str-concat` from `(show f)`;
 //!   a field-less variant shows as its bare name, as it is written in
-//!   an expression (§3.9).
+//!   an expression (§3.9);
+//! - hygiene (stdlib design C-4): every function the bodies call (`=`,
+//!   `<`, `not`, `hash`, `show`, `str-concat`) is written
+//!   `fib.prelude/NAME`, as `hash-combine` is, so that a program's own
+//!   `show` or `<` is not what a derived instance calls. The macros `and`
+//!   and `or` and the core forms stay plain.
 
 mod enums;
 mod structs;
@@ -34,6 +39,7 @@ mod structs;
 use crate::syntax::{Form, Pos};
 
 use super::build::{boolean, call, check_arity, int, keyword, list, string, sym};
+use super::collections::prelude_name;
 use super::ctx::ExpandCtx;
 use super::error::{ExpandError, ExpandErrorKind};
 use super::types::mentions;
@@ -141,14 +147,19 @@ fn method(name: &str, params: &[&str], body: Form, pos: &Pos) -> Form {
 
 /// `!=` from `=`.
 fn not_equal(pos: &Pos) -> Form {
-    let eq = call("=", vec![sym("self", pos), sym("y", pos)], pos);
-    method("!=", &["self", "y"], call("not", vec![eq], pos), pos)
+    let eq = call(
+        &prelude_name("="),
+        vec![sym("self", pos), sym("y", pos)],
+        pos,
+    );
+    let not = call(&prelude_name("not"), vec![eq], pos);
+    method("!=", &["self", "y"], not, pos)
 }
 
 /// `<=`, `>`, `>=` from `<`.
 fn ord_rest(pos: &Pos) -> Vec<Form> {
-    let less = |a: &str, b: &str| call("<", vec![sym(a, pos), sym(b, pos)], pos);
-    let not = |f: Form| call("not", vec![f], pos);
+    let less = |a: &str, b: &str| call(&prelude_name("<"), vec![sym(a, pos), sym(b, pos)], pos);
+    let not = |f: Form| call(&prelude_name("not"), vec![f], pos);
     vec![
         method("<=", &["self", "y"], not(less("y", "self")), pos),
         method(">", &["self", "y"], less("y", "self"), pos),
@@ -161,7 +172,7 @@ fn ord_rest(pos: &Pos) -> Vec<Form> {
 fn eq_all(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
     let mut tests: Vec<Form> = pairs
         .into_iter()
-        .map(|(a, b)| call("=", vec![a, b], pos))
+        .map(|(a, b)| call(&prelude_name("="), vec![a, b], pos))
         .collect();
     match tests.len() {
         0 => boolean(true, pos),
@@ -175,11 +186,12 @@ fn eq_all(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
 fn lex_less(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
     let mut acc: Option<Form> = None;
     for (a, b) in pairs.into_iter().rev() {
-        let less = call("<", vec![a.clone(), b.clone()], pos);
+        let less = call(&prelude_name("<"), vec![a.clone(), b.clone()], pos);
         acc = Some(match acc {
             None => less,
             Some(rest) => {
-                let same = call("and", vec![call("=", vec![a, b], pos), rest], pos);
+                let equal = call(&prelude_name("="), vec![a, b], pos);
+                let same = call("and", vec![equal, rest], pos);
                 call("or", vec![less, same], pos)
             }
         });
@@ -191,7 +203,7 @@ fn lex_less(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
 fn combine(seed: i64, fields: Vec<Form>, pos: &Pos) -> Form {
     let mut acc = int(seed, pos);
     for f in fields {
-        let hashed = call("hash", vec![f], pos);
+        let hashed = call(&prelude_name("hash"), vec![f], pos);
         acc = call(HASH_COMBINE, vec![acc, hashed], pos);
     }
     acc
@@ -211,13 +223,13 @@ fn show_call(name: &str, fields: Vec<Form>, pos: &Pos) -> Form {
             " ".to_string()
         };
         pieces.push(string(&text, pos));
-        pieces.push(call("show", vec![f], pos));
+        pieces.push(call(&prelude_name("show"), vec![f], pos));
     }
     pieces.push(string(")", pos));
     let mut it = pieces.into_iter().rev();
     let mut acc = it.next().unwrap_or_else(|| string("", pos));
     for p in it {
-        acc = call("str-concat", vec![p, acc], pos);
+        acc = call(&prelude_name("str-concat"), vec![p, acc], pos);
     }
     acc
 }

@@ -58,7 +58,7 @@ mod tests {
 
     fn expanded(source: &str) -> ExpandCtx {
         let mut ctx = ExpandCtx::new();
-        ctx.begin_module("main", &[], Default::default());
+        ctx.begin_module("main", (&[], &[]), Default::default());
         let forms = read_all(source, "t").expect("reads");
         expand_program(forms, &mut ctx, &mut NoRunner).expect("expands");
         ctx

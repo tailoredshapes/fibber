@@ -4,6 +4,7 @@
 use crate::syntax::{Form, FormKind, Pos};
 
 use crate::expand::build::{boolean, call, check_arity, list, malformed, string, sym, unit};
+use crate::expand::collections::prelude_name;
 use crate::expand::error::ExpandError;
 
 /// The body forms as one expression: the form itself when there is one,
@@ -63,8 +64,8 @@ fn is_else(test: &Form) -> bool {
 
 /// `(cond (test body+)*)`: nested `if`s, tried in order. A final clause
 /// whose test is `else` or `:else` is the default; without one, falling
-/// off the end is `(trap "cond: no clause matched at POS")`, which has
-/// every type, so `(cond)` is that trap.
+/// off the end is `(fib.prelude/trap "cond: no clause matched at POS")`,
+/// which has every type, so `(cond)` is that trap.
 pub(super) fn cond(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     let clauses: Vec<Form> = items.into_iter().skip(1).collect();
     if let Some(bad) = clauses
@@ -74,7 +75,7 @@ pub(super) fn cond(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
         return Err(malformed("cond", "a clause is (test body+)", &bad.pos));
     }
     let message = format!("cond: no clause matched at {pos}");
-    let mut acc = call("trap", vec![string(&message, pos)], pos);
+    let mut acc = call(&prelude_name("trap"), vec![string(&message, pos)], pos);
     for (i, clause) in clauses.into_iter().rev().enumerate() {
         let cpos = clause.pos;
         let mut parts = match clause.kind {
@@ -107,14 +108,15 @@ fn option_binding(name: &str, form: &Form) -> Result<(Form, Form), ExpandError> 
     }
 }
 
-/// `(match e ((some x) then) (nil other))`.
+/// `(match e ((fib.prelude/some x) then) (nil other))`.
 fn option_match(x: Form, e: Form, then: Form, other: Form, pos: &Pos) -> Form {
-    let some = list(vec![call("some", vec![x], pos), then], pos);
+    let some = list(vec![call(&prelude_name("some"), vec![x], pos), then], pos);
     let none = list(vec![Form::new(FormKind::Nil, pos.clone()), other], pos);
     list(vec![sym("match", pos), e, some, none], pos)
 }
 
-/// `(if-let (x e) a b)` ⟹ `(match e ((some x) a) (nil b))` (§4.4).
+/// `(if-let (x e) a b)` ⟹ `(match e ((fib.prelude/some x) a) (nil b))`
+/// (§4.4).
 pub(super) fn if_let(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     check_arity("if-let", &items, 3, Some(3), pos)?;
     let (x, e) = option_binding("if-let", &items[1])?;
@@ -124,7 +126,8 @@ pub(super) fn if_let(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     Ok(option_match(x, e, then, other, pos))
 }
 
-/// `(when-let (x e) body...)` ⟹ `(match e ((some x) body) (nil ()))`.
+/// `(when-let (x e) body...)` ⟹ `(match e ((fib.prelude/some x) body)
+/// (nil ()))`.
 pub(super) fn when_let(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     check_arity("when-let", &items, 1, None, pos)?;
     let (x, e) = option_binding("when-let", &items[1])?;

@@ -24,6 +24,10 @@
 ;; - the private enum `Proto` has the variants of the Rust one, `Eq`,
 ;;   `Ord`, `Hash`, `Show`; they are bare words in an expression
 ;;   (`Hash`) and `((Hash) ..)` in a pattern.
+;; - hygiene (stdlib design C-4): every function the bodies call (`=`, `<`,
+;;   `not`, `hash`, `show`, `str-concat`) is `fib.prelude/NAME` (`prelude-name`
+;;   of expand.collections), as `hash-combine` is; the macros `and` and `or`
+;;   and the core forms stay plain.
 ;; - the three Rust files are one module here unless it outgrows 500
 ;;   lines, when the helpers move to `expand.derive.*` modules that
 ;;   nobody else sees; `derive` stays what is exported.
@@ -35,7 +39,8 @@
 ;;   `y`'s, `Eq` and `Ord` alike).
 ;; - `Form::to_string` of the error text is `stx-show` of syntax.print;
 ;;   `as_sym().unwrap_or("")` is `sym-or-empty`.
-(ns expand.derive (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build)
+(ns expand.derive (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build
+                        expand.collections)
   (:require [syntax.print :as pr]))
 
 ;; A derivable protocol. (Proto)
@@ -178,18 +183,18 @@
 
 ;; `!=` from `=`. (not_equal)
 (defun not-equal :private (pos: Pos) -> Stx
-  (let ((eq (call "=" [(sym "self" pos) (sym "y" pos)] pos)))
-    (method "!=" ["self" "y"] (call "not" [eq] pos) pos)))
+  (let ((eq (call (prelude-name "=") [(sym "self" pos) (sym "y" pos)] pos)))
+    (method "!=" ["self" "y"] (call (prelude-name "not") [eq] pos) pos)))
 
 ;; `<=`, `>`, `>=` from `<`. (ord_rest)
 (defun ord-rest :private (pos: Pos) -> (Vec Stx)
-  [(method "<=" ["self" "y"] (call "not" [(less-of "y" "self" pos)] pos) pos)
+  [(method "<=" ["self" "y"] (call (prelude-name "not") [(less-of "y" "self" pos)] pos) pos)
    (method ">" ["self" "y"] (less-of "y" "self" pos) pos)
-   (method ">=" ["self" "y"] (call "not" [(less-of "self" "y" pos)] pos) pos)])
+   (method ">=" ["self" "y"] (call (prelude-name "not") [(less-of "self" "y" pos)] pos) pos)])
 
 ;; `(< a b)` of two symbols.
 (defun less-of :private (a: str b: str pos: Pos) -> Stx
-  (call "<" [(sym a pos) (sym b pos)] pos))
+  (call (prelude-name "<") [(sym a pos) (sym b pos)] pos))
 
 ;; The pairs compared with `=` and `and`ed: `true` for none, the one
 ;; comparison for one (as §3.16's `(= r r2)`). (eq_all)
@@ -197,7 +202,7 @@
   (let ((tests (loop ((i 0) (acc (vec-empty)))
                  (if (>= i (count pairs))
                      acc
-                     (recur (+ i 1) (conj acc (call "=" [(. (nth pairs i) a) (. (nth pairs i) b)] pos)))))))
+                     (recur (+ i 1) (conj acc (call (prelude-name "=") [(. (nth pairs i) a) (. (nth pairs i) b)] pos)))))))
     (cond
       ((= (count tests) 0) (boolean true pos))
       ((= (count tests) 1) (nth tests 0))
@@ -213,12 +218,12 @@
           (if (< i 0)
               acc
               (let ((p (nth pairs i))
-                    (same (call "and" [(call "=" [(. p a) (. p b)] pos) acc] pos)))
+                    (same (call "and" [(call (prelude-name "=") [(. p a) (. p b)] pos) acc] pos)))
                 (recur (- i 1) (call "or" [(less-pair p pos) same] pos))))))))
 
 ;; `(< a b)` of a pair.
 (defun less-pair :private (p: Cmp pos: Pos) -> Stx
-  (call "<" [(. p a) (. p b)] pos))
+  (call (prelude-name "<") [(. p a) (. p b)] pos))
 
 ;; `h := seed; h := (hash-combine h (hash f))` for each field. (combine)
 (defun combine :private (seed: i64 fields: (Vec Stx) pos: Pos) -> Stx
@@ -226,7 +231,7 @@
     (if (>= i (count fields))
         acc
         (recur (+ i 1)
-               (call hash-combine-name [acc (call "hash" [(nth fields i)] pos)] pos)))))
+               (call hash-combine-name [acc (call (prelude-name "hash") [(nth fields i)] pos)] pos)))))
 
 ;; `"(Name " (show f1) " " (show f2) ")"` joined with `str-concat`, or
 ;; `"Name"` for no fields. (show_call)
@@ -238,7 +243,7 @@
         (loop ((i (- n 2)) (acc (nth pieces (- n 1))))
           (if (< i 0)
               acc
-              (recur (- i 1) (call "str-concat" [(nth pieces i) acc] pos)))))))
+              (recur (- i 1) (call (prelude-name "str-concat") [(nth pieces i) acc] pos)))))))
 
 ;; The pieces: a string, then `(show f)`, for each field, then `")"`.
 (defun show-pieces :private (name: str fields: (Vec Stx) pos: Pos) -> (Vec Stx)
@@ -247,7 +252,7 @@
                    acc
                    (recur (+ i 1)
                           (conj (conj acc (string (if (= i 0) (str-join ["(" name " "]) " ") pos))
-                                (call "show" [(nth fields i)] pos)))))))
+                                (call (prelude-name "show") [(nth fields i)] pos)))))))
     (conj all (string ")" pos))))
 
 ;; ------------------------------------------------------------ structs

@@ -117,7 +117,7 @@ fn list(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
         2 => {
             let h = g.expr(cx, &Ty::Int, d);
             let t = g.expr(cx, &Ty::List, d);
-            Expr::call(Ty::List, "cons", vec![h, t])
+            Expr::call(Ty::List, "Cons", vec![h, t])
         }
         _ => {
             let l = g.expr(cx, &Ty::List, d);
@@ -244,7 +244,7 @@ pub fn fresh_object(g: &mut Gen, cx: &Ctx, ty: &Ty) -> Expr {
 }
 
 /// `nil`, `empty` or `[]` of `ty`, written `(if false (some x) nil)`,
-/// `(if false (list x) empty)` or `(if false [x] [])`, so that the type
+/// `(if false (list x) Empty)` or `(if false [x] [])`, so that the type
 /// is fixed by the expression
 /// itself (the value is still empty): a pattern variable bound from it
 /// and only compared with itself would otherwise be ambiguous.

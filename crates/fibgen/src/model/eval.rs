@@ -378,8 +378,8 @@ pub fn bind_pat(p: &Pat, v: &V, env: &Env) -> Option<Env> {
             Some(env2)
         }
         (Pat::Ctor(c, ps), V::List(items)) => match (c.as_str(), items.split_first()) {
-            ("empty", None) => Some(env.clone()),
-            ("cons", Some((h, t))) if ps.len() == 2 => {
+            ("Empty", None) => Some(env.clone()),
+            ("Cons", Some((h, t))) if ps.len() == 2 => {
                 let env2 = bind_pat(&ps[0], h, env)?;
                 bind_pat(&ps[1], &V::List(Rc::new(t.to_vec())), &env2)
             }

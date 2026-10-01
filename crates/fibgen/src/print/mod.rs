@@ -151,7 +151,7 @@ pub(crate) fn expr(e: &Expr) -> Sexp {
         Kind::Str(s) => atom(format!("{s:?}")),
         Kind::Unit => atom("()"),
         Kind::Nil => atom("nil"),
-        Kind::Empty => atom("empty"),
+        Kind::Empty => atom("Empty"),
         Kind::VecLit(es) => Sexp::Vector(es.iter().map(expr).collect()),
         Kind::Var(n) | Kind::Global(n) => atom(n.clone()),
         Kind::Let(bs, b) => {

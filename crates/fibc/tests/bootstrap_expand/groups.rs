@@ -121,6 +121,58 @@ fn over(
     groups
 }
 
+/// The directory of the programs that are run with implicit modules.
+const IMPLICIT_DIR: &str = "compiler/tests/expand/implicit";
+
+/// The implicit modules and the words each group of the implicit programs
+/// is run with: `--implicit-lib`, then `--implicit` and `--context`.
+const IMPLICIT_RUNS: [(&str, bool, bool); 6] = [
+    ("fib.x,fib.y", false, false),
+    ("fib.x,fib.y", true, false),
+    ("fib.x,fib.y", true, true),
+    ("fib.x,fib.y", false, true),
+    ("fib.y,fib.x", true, false),
+    ("", true, true),
+];
+
+/// The groups of the programs `main-*.fib` of `compiler/tests/expand/implicit`,
+/// which the groups above run with no implicit module (the default, today):
+/// each is run with implicit modules as well (`--implicit-lib`), their
+/// sections printed or left out (`--implicit`) and with the context.
+fn implicit_groups(stage: Stage, programs: &[Program]) -> Vec<Group> {
+    let files: Vec<PathBuf> = programs
+        .iter()
+        .map(|p| &p.main)
+        .filter(|m| m.parent().is_some_and(|d| d.ends_with(IMPLICIT_DIR)))
+        .filter(|m| {
+            m.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("main-"))
+        })
+        .cloned()
+        .collect();
+    let mut groups = Vec::new();
+    for runner in runners(stage).into_iter().filter(|_| !files.is_empty()) {
+        for (lib, implicit, context) in IMPLICIT_RUNS {
+            let opts = Options {
+                context,
+                implicit,
+                implicit_lib: Some(
+                    lib.split(',')
+                        .filter(|n| !n.is_empty())
+                        .map(String::from)
+                        .collect(),
+                ),
+                runner,
+                ..Options::default()
+            };
+            let what = format!("implicit-lib {lib:?}, implicit {implicit}, context {context}");
+            let label = format!("implicit modules ({}, {what})", runner_word(runner));
+            groups.push(Group::new(&label, files.clone(), opts));
+        }
+    }
+    groups
+}
+
 /// The groups of the programs a limit must stop: each with the option
 /// that stops it and a small value for it, under the evaluator only (with
 /// no runner the call is pending before a limit is reached).
@@ -230,6 +282,7 @@ pub fn plan(
         groups.extend(over("corpus", runner, &corpus, None));
         groups.extend(over("generated", runner, &generated, cap));
     }
+    groups.extend(implicit_groups(stage, programs));
     if stage == Stage::B {
         groups.extend(limit_groups(written));
     }
@@ -373,5 +426,40 @@ mod tests {
         assert_eq!(cap("generated (evaluator, plain)").steps, Some(500));
         assert_eq!(cap("generated (evaluator, plain)").forms, Some(50_000));
         assert_eq!(cap("corpus (evaluator, plain)"), LimitOverrides::default());
+    }
+
+    #[test]
+    fn the_implicit_programs_are_run_with_implicit_modules_and_each_way_of_printing_them() {
+        let dir = format!("/r/{IMPLICIT_DIR}");
+        let programs = [
+            program("a.fib", false),
+            program(&format!("{dir}/main-a.fib"), false),
+            program(&format!("{dir}/util.fib"), false),
+            program(&format!("{dir}/fib/main-b.fib"), false),
+        ];
+        for stage in [Stage::A, Stage::B] {
+            let p = plan(stage, &programs, &[], Path::new("p.fib"), &[]);
+            let ours: Vec<&Group> = p
+                .groups
+                .iter()
+                .filter(|g| g.label.starts_with("implicit modules"))
+                .collect();
+            assert_eq!(ours.len(), IMPLICIT_RUNS.len() * runners(stage).len());
+            let main = PathBuf::from(format!("{dir}/main-a.fib"));
+            assert!(ours.iter().all(|g| g.files == [main.clone()]));
+            let words: Vec<Vec<String>> = ours.iter().map(|g| flags(&g.opts)).collect();
+            let has = |w: &[&str]| words.contains(&w.iter().map(|s| s.to_string()).collect());
+            let (x, y) = ("fib.x,fib.y", "fib.y,fib.x");
+            let with = |w: &[&str]| has(&[w, &["--no-runner"]].concat());
+            assert!(with(&["--context", "--implicit", "--implicit-lib", x]));
+            assert!(with(&["--implicit", "--implicit-lib", y]));
+            assert!(with(&["--context", "--implicit", "--implicit-lib", ""]));
+            // the evaluator's groups are stage 2b's
+            assert_eq!(has(&["--implicit", "--implicit-lib", y]), stage == Stage::B);
+        }
+        let only = [program("a.fib", false)];
+        let none = plan(Stage::A, &only, &[], Path::new("p.fib"), &[]);
+        let ours = |g: &Group| g.label.starts_with("implicit modules");
+        assert!(none.groups.iter().all(|g| !ours(g)));
     }
 }

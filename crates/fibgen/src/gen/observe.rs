@@ -59,10 +59,10 @@ fn var(name: &str, ty: &Ty, kind: VarKind) -> Var {
     }
 }
 
-/// `(match l ((cons h _) h) (_ k))`.
+/// `(match l ((Cons h _) h) (_ k))`.
 fn list_head(g: &mut Gen, e: Expr) -> Expr {
     let h = g.fresh("h");
-    let pat = Pat::Ctor("cons".into(), vec![Pat::Bind(h.clone()), Pat::Wild]);
+    let pat = Pat::Ctor("Cons".into(), vec![Pat::Bind(h.clone()), Pat::Wild]);
     let clauses = vec![
         (pat, Expr::var(&h, Ty::Int)),
         (Pat::Wild, Expr::int(g.small())),

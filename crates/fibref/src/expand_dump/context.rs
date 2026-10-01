@@ -92,21 +92,21 @@ fn entries(ctx: &ExpandCtx) -> Vec<Entry<'_>> {
 }
 
 /// Appends the context of `ctx`, the module `ns` of file `home` just
-/// expanded (and not yet ended), to `out`: what is not in `baseline`.
+/// expanded (and not yet ended), to `out`: what is not in `baseline`, and
+/// the implicit modules the module sees when `implicit` is set.
 /// Positions in other files than `home` end with `@FILE`, as in the dump
 /// of the forms.
 pub(super) fn dump_context(
     ctx: &ExpandCtx,
-    ns: &str,
-    home: &str,
-    baseline: &Baseline,
+    (ns, home): (&str, &str),
+    (baseline, implicit): (&Baseline, bool),
     out: &mut String,
 ) {
     let _ = writeln!(out, "-- context {ns}");
     let _ = writeln!(out, "gensyms {}", ctx.gensym_count());
     let (steps, forms) = ctx.counters();
     let _ = writeln!(out, "counters steps {steps} forms {forms}");
-    scope_lines(ctx, out);
+    scope_lines(ctx, implicit, out);
     for name in ctx.private_type_names() {
         let _ = writeln!(out, "private {}", quote(name));
     }
@@ -119,13 +119,17 @@ pub(super) fn dump_context(
 }
 
 /// The module being expanded as macro lookup sees it: its name, then the
-/// modules it uses in the order written, then its aliases by alias; then
-/// the modules each module re-exports, by module.
-fn scope_lines(ctx: &ExpandCtx, out: &mut String) {
+/// modules it uses in the order written, then (with `implicit`) the
+/// implicit modules it sees, then its aliases by alias; then the modules
+/// each module re-exports, by module.
+fn scope_lines(ctx: &ExpandCtx, implicit: bool, out: &mut String) {
     let scope = ctx.scope();
     let _ = writeln!(out, "scope {}", quote(&scope.ns));
     for u in &scope.uses {
         let _ = writeln!(out, "  use {}", quote(u));
+    }
+    for i in scope.implicit.iter().filter(|_| implicit) {
+        let _ = writeln!(out, "  implicit {}", quote(i));
     }
     let mut aliases: Vec<(&String, &String)> = scope.aliases.iter().collect();
     aliases.sort();

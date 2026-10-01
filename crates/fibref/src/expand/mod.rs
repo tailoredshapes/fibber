@@ -15,7 +15,7 @@
 //!   Rust rewrites in `prelude` and `derive`;
 //! - `quasiquote` is rewritten to `Form`-constructing calls (§3.16);
 //! - `[..]` and `{..}` in expression position become calls of
-//!   `fib.prelude/vec-empty`, `conj`, `map-empty`, `assoc` (§1.4);
+//!   `fib.prelude/vec-empty`, `vec-conj`, `map-empty`, `map-assoc` (§1.4);
 //!   inside `quote` they stay data;
 //! - the symbol `nil` becomes the form `(Nil)` in expressions and
 //!   patterns (§3.9);
@@ -103,16 +103,21 @@ pub fn expand_expr(
 }
 
 /// The prelude forms the expander itself needs (§4.4, §4.5): the `List`
-/// enum, and `derive` of `Eq`, `Ord`, `Hash` and `Show` for `Option`
-/// and `List`. The rest of the prelude is library code, not here.
+/// enum, whose variants are `Empty` and `Cons` (stdlib design C-3: the
+/// library defines a function `cons` and a method `empty`, which a variant
+/// of the same name would collide with), and `derive` of `Eq`, `Ord` and
+/// `Hash` for `Option` and `List`. `Show` of the two is written by hand in
+/// `lib/prelude.fib` (stdlib design §2.7: a present `Option` prints as its
+/// payload, a `List` as `(1 2)`, which a derived instance cannot say). The
+/// rest of the prelude is library code, not here.
 pub const PRELUDE_SOURCE: &str = "\
-(defenum (List a) (empty) (cons head: a tail: (List a)))
-(derive Eq Option) (derive Ord Option) (derive Hash Option) (derive Show Option)
-(derive Eq List) (derive Ord List) (derive Hash List) (derive Show List)
+(defenum (List a) (Empty) (Cons head: a tail: (List a)))
+(derive Eq Option) (derive Ord Option) (derive Hash Option)
+(derive Eq List) (derive Ord List) (derive Hash List)
 ";
 
 /// Reads and expands [`PRELUDE_SOURCE`] into `ctx`, registering `List`,
-/// and returns the expanded forms (the `defenum` and eight `impl`s).
+/// and returns the expanded forms (the `defenum` and six `impl`s).
 pub fn expand_prelude(ctx: &mut ExpandCtx) -> Result<Vec<Form>, ExpandError> {
     // PRELUDE_SOURCE is a constant that the unit test
     // `prelude_expands` reads, so this cannot fail.

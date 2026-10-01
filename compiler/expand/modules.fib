@@ -1,6 +1,7 @@
 ;; compiler/expand/modules.fib: modules (syntax §5), as
-;; crates/fibref/src/modules.rs (345 lines of Rust, its tests not
-;; counted) and the library roots of `expand.roots`. A program is the
+;; crates/fibref/src/modules.rs and `modules/{spec,load}.rs` (about 400
+;; lines of Rust, their tests not counted) and the library roots of
+;; `expand.roots`. A program is the
 ;; file given and the modules its `ns` clauses `:require`, `:use` or
 ;; `:export-from`, found beside that file and then under the library
 ;; roots (`a.b` at `a/b.fib`; the order is that of `expand.roots`), read
@@ -8,6 +9,14 @@
 ;; reach the modules that `:use` it unqualified and the ones that
 ;; `:require` it through the alias, a `:private` macro its own module
 ;; only (`ctx-macro-def`).
+;;
+;; The implicit modules (`implicit-lib`, `IMPLICIT_LIB`: empty until the
+;; library is complete) are loaded before all of these and seen by every
+;; module that is not the library's own (`sees-implicit`) as the prelude
+;; is, after its `:use`s (`ModuleSpec.implicit`, set by the loader);
+;; `try-load-with` takes the list, as `try_load_with` does, for the dump's
+;; `--implicit-lib` and the tests. A `Loaded` says whether it is one of
+;; them or was read for one (`implicit`).
 ;;
 ;; The types are `expand.types`'s (the skeleton): `ModuleSpec`, `Loaded`,
 ;; `LoadErr` (`LoadError`), `Expanded`. What the Rust has and the port
@@ -83,7 +92,7 @@
     ((Err e) (Err (load-err-message e)))))
 
 (defun default-spec :private (default-ns: str) -> ModuleSpec
-  (ModuleSpec default-ns (vec-empty) (vec-empty) (vec-empty)))
+  (ModuleSpec default-ns (vec-empty) (vec-empty) (vec-empty) (vec-empty)))
 
 ;; `spec_in`: the spec, or the `LoadSpec` for the `ns` form at fault.
 (defun spec-in :private (forms: (Vec Stx) default-ns: str) -> (Result ModuleSpec LoadErr)
@@ -113,7 +122,7 @@
       (bad-spec first "ns needs a name")
       (match (. (nth items 1) kind)
         ((SSym name)
-         (match (ns-clauses (ModuleSpec name (vec-empty) (vec-empty) (vec-empty)) items)
+         (match (ns-clauses (ModuleSpec name (vec-empty) (vec-empty) (vec-empty) (vec-empty)) items)
            ((Ok spec) (Ok spec))
            ((Err what) (bad-spec first what))))
         (_ (bad-spec first "ns needs a name")))))
@@ -173,7 +182,8 @@
           (some out)))))
 
 (defun add-uses :private (spec: ModuleSpec names: (Vec str)) -> ModuleSpec
-  (ModuleSpec (. spec ns) (. spec requires) (concat (. spec uses) names) (. spec exports)))
+  (ModuleSpec (. spec ns) (. spec requires) (concat (. spec uses) names) (. spec exports)
+              (. spec implicit)))
 
 ;; An `:export-from` module is also one the module `:use`s, once.
 (defun add-exports :private (spec: ModuleSpec names: (Vec str)) -> ModuleSpec
@@ -182,7 +192,7 @@
       (if (< i n)
           (let ((name (nth names i)))
             (recur (+ i 1) (if (has-name? uses name) uses (conj uses name)) (conj exports name)))
-          (ModuleSpec (. spec ns) (. spec requires) uses exports)))))
+          (ModuleSpec (. spec ns) (. spec requires) uses exports (. spec implicit))))))
 
 (defun has-name? :private (names: (Vec str) name: str) -> bool
   (let ((n (count names)))
@@ -201,7 +211,7 @@
           (match (require-item (nth items i))
             ((some r) (recur (+ i 1) (conj acc r)))
             (nil (Err require-shape)))
-          (Ok (ModuleSpec (. spec ns) acc (. spec uses) (. spec exports)))))))
+          (Ok (ModuleSpec (. spec ns) acc (. spec uses) (. spec exports) (. spec implicit)))))))
 
 ;; `[name :as alias]`, exactly three items, as the `Require` of alias and
 ;; module.
@@ -215,6 +225,19 @@
          nil))
     (_ nil)))
 
+;; The library modules every module of a program sees without naming
+;; them (syntax §5), in the order they are loaded: empty until the library
+;; is complete (`IMPLICIT_LIB`).
+(defun implicit-lib () -> (Vec str)
+  (vec-empty))
+
+;; Whether a module named ns sees the implicit modules `implicit`
+;; unqualified: every module but the library's own, named `fib.*` (and
+;; `Long` and `Math`), and but the implicit modules themselves
+;; (`sees_implicit`).
+(defun sees-implicit (ns: str implicit: (Vec str)) -> bool
+  (not (or (starts-with? ns "fib.") (= ns "Long") (= ns "Math") (has-name? implicit ns))))
+
 ;; Loads the program whose main module is `source` (read from `file`):
 ;; every module it depends on, found beside `file` or under the built-in
 ;; root only, once each in dependency order, then the main module
@@ -224,7 +247,10 @@
 
 ;; The modules read so far and the ones being read (`Loader`).
 (defstruct Loader :private
-  (main-dir: str roots: Roots
+  (main-dir: str roots: Roots implicit: (Vec str)
+   ;; whether the modules read now are the implicit ones and what they
+   ;; depend on
+   in-implicit: (Cell bool)
    ;; the modules whose dependencies are being read, outermost first
    active: (Cell (Vec str))
    done: (Cell (Map str bool))
@@ -232,19 +258,48 @@
 
 ;; `try-load` with the library roots of the command line: a module is
 ;; found beside `file`, then under each root in order, then in the
-;; built-in root (`try_load_in`).
+;; built-in root (`try_load_in`), and the implicit modules of
+;; `implicit-lib` come before the program's.
 (defun try-load-in (source: str file: str roots: Roots) -> (Result (Vec Loaded) LoadErr)
+  (try-load-with source file roots (implicit-lib)))
+
+;; `try-load-in` with the implicit modules `implicit` instead of
+;; `implicit-lib`, in the order they are loaded: the program sees them as
+;; it sees the prelude, unless its main module is the library's own or an
+;; implicit module, which loads none of them. Each is read, with what it
+;; depends on, before anything else, and its `Loaded` says so
+;; (`try_load_with`).
+(defun try-load-with (source: str file: str roots: Roots implicit: (Vec str))
+    -> (Result (Vec Loaded) LoadErr)
   (match (reader/read-all source file)
     ((Err e) (Err (LoadRead e)))
     ((Ok forms)
      (match (spec-in forms "main")
        ((Err e) (Err e))
        ((Ok spec)
-        (let ((ld (Loader (path-parent file) roots (cell [(. spec ns)]) (cell (map-empty))
-                          (cell (vec-empty)))))
-          (match (visit-all ld (module-spec-deps spec))
+        (let ((ld (Loader (path-parent file) roots implicit (cell false) (cell [(. spec ns)])
+                          (cell (map-empty)) (cell (vec-empty)))))
+          (match (load-implicit ld spec)
             ((Err e) (Err e))
-            ((Ok _) (Ok (conj @(. ld out) (Loaded spec file forms)))))))))))
+            ((Ok spec)
+             (match (visit-all ld (module-spec-deps spec))
+               ((Err e) (Err e))
+               ((Ok _) (Ok (conj @(. ld out) (Loaded spec file forms false)))))))))))))
+
+;; The implicit modules read first, when the main module sees them: the
+;; spec of the main module, with them given to it.
+(defun load-implicit :private (ld: Loader spec: ModuleSpec) -> (Result ModuleSpec LoadErr)
+  (if (sees-implicit (. spec ns) (. ld implicit))
+      (do (set! (. ld in-implicit) true)
+          (match (visit-all ld (. ld implicit))
+            ((Err e) (Err e))
+            ((Ok _)
+             (do (set! (. ld in-implicit) false)
+                 (Ok (with-implicit spec (. ld implicit)))))))
+      (Ok spec)))
+
+(defun with-implicit :private (spec: ModuleSpec implicit: (Vec str)) -> ModuleSpec
+  (ModuleSpec (. spec ns) (. spec requires) (. spec uses) (. spec exports) implicit))
 
 ;; Visits each module of `deps` in order; the first failure ends it.
 (defun visit-all :private (ld: Loader deps: (Vec str)) -> (Result unit LoadErr)
@@ -273,8 +328,15 @@
        ((Err e) (Err e))
        ((Ok spec)
         (if (= (. spec ns) ns)
-            (visit-spec ld spec file forms)
+            (visit-spec ld (give-implicit ld spec) file forms)
             (Err (LoadMismatch file (. spec ns) ns))))))))
+
+;; The spec with the implicit modules, all of which are read before it
+;; (those loading them have none) (`give_implicit`).
+(defun give-implicit :private (ld: Loader spec: ModuleSpec) -> ModuleSpec
+  (if (and (not @(. ld in-implicit)) (sees-implicit (. spec ns) (. ld implicit)))
+      (with-implicit spec (. ld implicit))
+      spec))
 
 ;; Reads the dependencies of a module whose spec is `spec`, then adds it
 ;; to what is read.
@@ -286,7 +348,7 @@
         ((Ok _)
          (do (set! (. ld active) (pop-last @(. ld active)))
              (set! (. ld done) (assoc @(. ld done) (. spec ns) true))
-             (set! (. ld out) (conj @(. ld out) (Loaded spec file forms)))
+             (set! (. ld out) (conj @(. ld out) (Loaded spec file forms @(. ld in-implicit))))
              (Ok ()))))))
 
 ;; The strings without the last.
@@ -295,13 +357,14 @@
     (loop ((i 0) (out (vec-empty)))
       (if (< i n) (recur (+ i 1) (conj out (nth names i))) out))))
 
-;; Starts expanding the module `spec` describes in `ctx`: its `:use`s and
-;; `:require` aliases are what a macro name reaches (`ctx-begin-module`),
+;; Starts expanding the module `spec` describes in `ctx`: its `:use`s,
+;; implicit modules and `:require` aliases are what a macro name reaches
+;; (`ctx-begin-module`),
 ;; and its `:export-from`s are what it re-exports (`ctx-reexport`).
 ;; `expand-all` does this for each module; the expansion dump does it step
 ;; by step.
 (defun begin-spec (ctx: ExpandCtx spec: ModuleSpec) -> unit
-  (do (ctx-begin-module ctx (. spec ns) (. spec uses) (alias-map (. spec requires)))
+  (do (ctx-begin-module ctx (. spec ns) (. spec uses) (. spec implicit) (alias-map (. spec requires)))
       (ctx-reexport ctx (. spec ns) (. spec exports))))
 
 ;; The `:require` aliases as a map, a later one of the same alias

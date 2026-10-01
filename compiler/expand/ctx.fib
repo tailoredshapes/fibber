@@ -102,10 +102,11 @@
     (do (set! (. ctx gensyms) n)
         (Stx (SSym (str-join ["#" prefix "." (show n)])) pos))))
 
-;; Starts expanding module ns with these uses and aliases (alias to
-;; module). (ctx.rs `begin_module`)
-(defun ctx-begin-module (ctx: ExpandCtx ns: str uses: (Vec str) aliases: (Map str str)) -> unit
-  (set! (. ctx scope) (ModuleScope ns uses aliases)))
+;; Starts expanding module ns with these uses, implicit modules and
+;; aliases (alias to module). (ctx.rs `begin_module`)
+(defun ctx-begin-module (ctx: ExpandCtx ns: str uses: (Vec str) implicit: (Vec str)
+                         aliases: (Map str str)) -> unit
+  (set! (. ctx scope) (ModuleScope ns uses implicit aliases)))
 
 ;; Records that module ns re-exports these modules. (ctx.rs `reexport`)
 (defun ctx-reexport (ctx: ExpandCtx ns: str exports: (Vec str)) -> unit
@@ -337,18 +338,18 @@
 ;;   is (Rust inserts only a non-empty list).
 
 (defun scope-of :private (ns: str) -> ModuleScope
-  (ModuleScope ns (vec-empty) (map-empty)))
+  (ModuleScope ns (vec-empty) (vec-empty) (map-empty)))
 
 ;; The values of a map, in no order.
 (defun map-values :private (m: (Map k v)) -> (Vec v)
   (let ((acc (cell (vec-empty))))
-    (do (for-each m (fn (e: (Entry k v)) (set! acc (conj @acc (. e val)))))
+    (do (for-each m (fn (e: (Pair k v)) (set! acc (conj @acc (. e snd)))))
         @acc)))
 
 ;; The keys of a map, in no order.
 (defun map-keys :private (m: (Map k v)) -> (Vec k)
   (let ((acc (cell (vec-empty))))
-    (do (for-each m (fn (e: (Entry k v)) (set! acc (conj @acc (. e key)))))
+    (do (for-each m (fn (e: (Pair k v)) (set! acc (conj @acc (. e fst)))))
         @acc)))
 
 ;; The names of a and of b (`HashSet::extend`).
@@ -362,7 +363,7 @@
 
 (defun map-entries-as-reexports :private (m: (Map str (Vec str))) -> (Vec Reexport)
   (let ((acc (cell (vec-empty))))
-    (do (for-each m (fn (e: (Entry str (Vec str))) (set! acc (conj @acc (Reexport (. e key) (. e val))))))
+    (do (for-each m (fn (e: (Pair str (Vec str))) (set! acc (conj @acc (Reexport (. e fst) (. e snd))))))
         @acc)))
 
 ;; ------------------------------------------------------- macro lookup
@@ -404,30 +405,37 @@
           nil))))
 
 ;; `q/base`: in the module the alias q names, or by the full ns of the
-;; prelude or of this module; no other qualifier reaches a macro.
+;; prelude, of an implicit module or of this module; no other qualifier
+;; reaches a macro.
 (defun qualified-macro :private (ctx: ExpandCtx q: str base: str) -> (Option MacroDef)
   (let ((scope @(. ctx scope)))
     (match (map-get (. scope aliases) q)
       ((some ns) (exported-macro ctx ns base))
-      (nil (if (or (= q prelude-ns) (= q (. scope ns)))
+      (nil (if (or (= q prelude-ns) (= q (. scope ns)) (has-ns? (. scope implicit) q))
                (exported-macro ctx q base)
                nil)))))
 
+;; Whether the list of module names holds q.
+(defun has-ns? :private (names: (Vec str) q: str) -> bool
+  (let ((n (count names)))
+    (loop ((i 0))
+      (cond ((>= i n) false)
+            ((= (nth names i) q) true)
+            (else (recur (+ i 1)))))))
+
 ;; A bare name: in this module, then in what its :uses export in order,
-;; then in the prelude.
+;; then in the implicit modules in order, then in the prelude.
 (defun bare-macro :private (ctx: ExpandCtx name: str) -> (Option MacroDef)
-  (let ((scope @(. ctx scope))
-        (uses (. scope uses))
-        (n (count uses)))
+  (let ((scope @(. ctx scope)))
     (match (exported-macro ctx (. scope ns) name)
       ((some d) (some d))
       (nil
-       (loop ((i 0))
-         (if (< i n)
-             (match (exported-macro ctx (nth uses i) name)
-               ((some d) (some d))
-               (nil (recur (+ i 1))))
-             (exported-macro ctx prelude-ns name)))))))
+       (match (first-exported ctx (. scope uses) name)
+         ((some d) (some d))
+         (nil
+          (match (first-exported ctx (. scope implicit) name)
+            ((some d) (some d))
+            (nil (exported-macro ctx prelude-ns name)))))))))
 
 ;; The first :use that exports a macro `name`, and the next after it
 ;; whose macro is another one (a different key).

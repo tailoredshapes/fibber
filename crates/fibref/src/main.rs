@@ -48,8 +48,11 @@ commands:
                   read, load or expand, 2 if a file cannot be read. Options,
                   before the files: --prelude (each file is a library
                   prelude), --context (print what the context holds after
-                  each module), --no-runner (a user macro call is pending),
-                  --max-steps N, --max-depth N, --max-forms N (smaller limits)
+                  each module), --implicit (print the sections of the
+                  implicit modules too), --implicit-lib A,B (the implicit
+                  modules of this dump), --no-runner (a user macro call is
+                  pending), --max-steps N, --max-depth N, --max-forms N
+                  (smaller limits)
   help            print this message";
 
 /// The directory `cases` runs when none is given.

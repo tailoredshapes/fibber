@@ -2,6 +2,7 @@
 
 mod derive;
 mod errors;
+mod hygiene;
 mod limits;
 mod positions;
 mod prelude;
@@ -63,7 +64,7 @@ fn prog_err(src: &str) -> ExpandErrorKind {
 fn v(items: &[&str]) -> String {
     let mut acc = "(fib.prelude/vec-empty)".to_string();
     for i in items {
-        acc = format!("(fib.prelude/conj {acc} {i})");
+        acc = format!("(fib.prelude/vec-conj {acc} {i})");
     }
     acc
 }

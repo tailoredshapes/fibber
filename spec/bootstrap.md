@@ -204,11 +204,16 @@ and then one of
   test gives normalized absolute paths; a module not beside it is looked
   for in the built-in root of `roots.rs`, **Proposed**, which tranche 0
   adds with `-I DIR` and `FIB_LIB`: neither is an option of `expand` yet,
-  the dump uses `modules::try_load`, the default), then the module's
+  the dump uses `modules::try_load_with` with the default roots), then the module's
   **expanded top-level forms** in the line format of the reader dump (§2:
   one line per node, depth first, two spaces a level, `LINE:COL
   START..END` at the end of each), or, instead of them, one error record,
-  which ends the file's dump (a later module is not expanded).
+  which ends the file's dump (a later module is not expanded). The
+  **implicit modules** (syntax §5, `modules::IMPLICIT_LIB`, empty until the
+  library is complete: today only `--implicit-lib` makes any) and the modules
+  they depend on are loaded and expanded first, as the prelude is, and have
+  no section of their own, unless `--implicit` is given; an error in one of
+  them is still the last record, under its `-- module` line.
 
 The exit status is 0 if every file expanded, 1 if one ended in an error
 record, 2 if one was unreadable (the larger wins). With no file, with only
@@ -250,6 +255,8 @@ repository root. The prelude's output is not part of a program's dump;
 |---|---|
 | `--prelude` | each FILE is a library prelude, not a program: one section `-- module fib.prelude FILE`, holding the expanded forms of `PRELUDE_SOURCE` (every position `@<prelude>`) and then those of FILE, which both are expanded in the one scope and with no runner. With `lib/prelude.fib` it is the prelude every program expands in |
 | `--context` | after the forms of each module, before it is ended, `-- context NS` and the lines of §5.2 |
+| `--implicit` | print the sections of the implicit modules and of the modules read for them (they come first), and, with `--context`, a line `  implicit "M"` under `scope` for each implicit module the scope sees, after the `use` lines |
+| `--implicit-lib LIST` | the implicit modules of this dump are those of LIST, module names separated by commas, in the order they are loaded, instead of `modules::IMPLICIT_LIB`; the empty text is none; an empty name is refused. It makes the rule above testable before the library is implicit |
 | `--no-runner` | a call of a user macro is `MacroNeedsEvaluator` (`NoRunner`); the default is the interpreter's macro evaluator, for the stage that has a runner (§5.4) |
 | `--max-steps N`, `--max-depth N`, `--max-forms N` | the limits of `ExpandCtx` (syntax §3.16) once the prelude is expanded, so that a small one reaches its error on a small input |
 

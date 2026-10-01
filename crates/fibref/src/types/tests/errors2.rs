@@ -129,9 +129,9 @@ fn dyn_requires_an_object_type() {
 #[test]
 fn constant_is_not_a_function() {
     fails(
-        "(defun main () -> i64 (count (empty)))",
+        "(defun main () -> i64 (count (Empty)))",
         K::ConstantCalled,
-        "empty is a constant, not a function; write empty",
+        "Empty is a constant, not a function; write Empty",
     );
 }
 

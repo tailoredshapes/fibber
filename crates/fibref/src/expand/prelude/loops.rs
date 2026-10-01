@@ -3,10 +3,10 @@
 //!
 //! ```text
 //! (while c body)          ⟹ (loop () (if c (do body (recur)) ()))
-//! (dotimes (i n) body)    ⟹ (let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))
+//! (dotimes (i n) body)    ⟹ (let ((m n)) (loop ((i 0)) (if (fib.prelude/< i m) (do body (recur (fib.prelude/+ i 1))) ())))
 //! (for-each (range a b) (fn (i) body))
-//!                         ⟹ (let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))
-//! (range a b)             ⟹ (range-between a b)
+//!                         ⟹ (let ((s a) (m b)) (loop ((i s)) (if (fib.prelude/< i m) (do body (recur (fib.prelude/+ i 1))) ())))
+//! (range a b)             ⟹ (fib.prelude/range-between a b)
 //! ```
 //!
 //! with `s` and `m` gensyms; `(range n)` is `(range 0 n)` in the loop.
@@ -18,6 +18,7 @@ use crate::syntax::{Form, FormKind, Pos};
 
 use super::Outcome;
 use crate::expand::build::{call, check_arity, int, list, malformed, unit};
+use crate::expand::collections::prelude_name;
 use crate::expand::ctx::ExpandCtx;
 use crate::expand::error::ExpandError;
 
@@ -43,10 +44,10 @@ struct Counting {
 }
 
 fn counting_loop(c: Counting, body: Vec<Form>, pos: &Pos) -> Form {
-    let next = call("+", vec![c.i.clone(), int(1, pos)], pos);
+    let next = call(&prelude_name("+"), vec![c.i.clone(), int(1, pos)], pos);
     let mut steps = body;
     steps.push(call("recur", vec![next], pos));
-    let test = call("<", vec![c.i.clone(), c.limit], pos);
+    let test = call(&prelude_name("<"), vec![c.i.clone(), c.limit], pos);
     let branch = call("if", vec![test, call("do", steps, pos), unit(pos)], pos);
     let vars = list(vec![list(vec![c.i, c.start], pos)], pos);
     let lp = call("loop", vec![vars, branch], pos);
@@ -87,13 +88,17 @@ fn literal_range(form: &Form) -> Option<(Form, Form)> {
     }
 }
 
-/// `(range a b)` ⟹ `(range-between a b)`; `(range n)` is declined and
+/// `(range a b)` ⟹ `(fib.prelude/range-between a b)`; `(range n)` is declined and
 /// stays a call of the library function `range` (§4.4, §4.5). There is
 /// no arity overloading, so the two-argument form is this rewrite.
 pub(super) fn range(items: Vec<Form>, pos: Pos) -> Result<Outcome, ExpandError> {
     check_arity("range", &items, 1, Some(2), &pos)?;
     if let [_, a, b] = items.as_slice() {
-        let call = call("range-between", vec![a.clone(), b.clone()], &pos);
+        let call = call(
+            &prelude_name("range-between"),
+            vec![a.clone(), b.clone()],
+            &pos,
+        );
         return Ok(Outcome::Expanded(call));
     }
     Ok(Outcome::Declined(Form::new(FormKind::List(items), pos)))

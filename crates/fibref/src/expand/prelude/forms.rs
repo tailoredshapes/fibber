@@ -1,23 +1,30 @@
 //! `list`, `plet` (§3.12), `->`, `->>`, `doto` (call rewriting) and
-//! `assert`, `dbg` (over `if` and `trap`), §4.4.
+//! `assert`, `dbg` (over `if` and `trap`), §4.4. The heads and constants
+//! they emit that are not core forms are `fib.prelude/NAME`.
 
 use crate::syntax::{Form, FormKind, Pos};
 
 use crate::expand::build::{call, check_arity, list, malformed, string, sym, unit};
+use crate::expand::collections::prelude_name;
 use crate::expand::ctx::ExpandCtx;
 use crate::expand::error::{ExpandError, ExpandErrorKind};
 
-/// `(list a b)` ⟹ `(cons a (cons b empty))`; `(list)` ⟹ `empty`.
+/// `(list a b)` ⟹ `(fib.prelude/Cons a (fib.prelude/Cons b
+/// fib.prelude/Empty))`; `(list)` ⟹ `fib.prelude/Empty`. The variants are
+/// qualified so that a function or a method named `cons` or `empty` in
+/// scope (stdlib design C-3, C-4) is not what the list is built with.
 pub(super) fn list_macro(items: Vec<Form>, pos: &Pos) -> Form {
-    let mut acc = sym("empty", pos);
+    let cons = prelude_name("Cons");
+    let mut acc = sym(&prelude_name("Empty"), pos);
     for item in items.into_iter().skip(1).rev() {
-        acc = call("cons", vec![item, acc], pos);
+        acc = call(&cons, vec![item, acc], pos);
     }
     acc
 }
 
-/// `(plet ((s1 e1) ...) body)` ⟹ `(let ((t1 (spawn (fn () e1))) ...)
-/// (let ((s1 (join t1)) ...) body))`, `t1 ...` gensyms (§3.12).
+/// `(plet ((s1 e1) ...) body)` ⟹ `(let ((t1 (fib.prelude/spawn (fn ()
+/// e1))) ...) (let ((s1 (fib.prelude/join t1)) ...) body))`, `t1 ...`
+/// gensyms (§3.12).
 pub(super) fn plet(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     check_arity("plet", &items, 2, None, pos)?;
     let mut it = items.into_iter().skip(1);
@@ -44,9 +51,10 @@ pub(super) fn plet(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form,
         let base = name[0].as_sym().map(|s| s.trim_end_matches(':'));
         let t = ctx.gensym(base.unwrap_or("t"), pos);
         let thunk = list(vec![sym("fn", pos), unit(pos), e.clone()], pos);
-        spawns.push(list(vec![t.clone(), call("spawn", vec![thunk], pos)], pos));
+        let spawn = call(&prelude_name("spawn"), vec![thunk], pos);
+        spawns.push(list(vec![t.clone(), spawn], pos));
         let mut join = name;
-        join.push(call("join", vec![t], pos));
+        join.push(call(&prelude_name("join"), vec![t], pos));
         joins.push(list(join, pos));
     }
     let mut inner = vec![sym("let", pos), list(joins, pos)];
@@ -103,7 +111,7 @@ pub(super) fn doto(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form,
     Ok(list(out, pos))
 }
 
-/// `(assert c)` / `(assert c msg)` ⟹ `(if c () (trap msg))`, the default
+/// `(assert c)` / `(assert c msg)` ⟹ `(if c () (fib.prelude/trap msg))`, the default
 /// message naming the call's position and the test.
 pub(super) fn assert(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     let name = "assert";
@@ -114,24 +122,22 @@ pub(super) fn assert(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
         Some(m) => m,
         None => string(&format!("{name} failed at {pos}: {test}"), pos),
     };
-    let fail = call("trap", vec![message], pos);
+    let fail = call(&prelude_name("trap"), vec![message], pos);
     Ok(call("if", vec![test, unit(pos), fail], pos))
 }
 
-/// `(dbg e)` ⟹ `(let ((t e)) (eprintln (str-concat "dbg POS: e = " (show t))) t)`:
-/// evaluates `e` once, prints it with `Show` to standard error with the
-/// call's position and the form as written, and returns it (§4.4).
+/// `(dbg e)` ⟹ `(let ((t e)) (fib.prelude/eprintln (fib.prelude/str-concat
+/// "dbg POS: e = " (fib.prelude/show t))) t)`: evaluates `e` once, prints
+/// it with `Show` to standard error with the call's position and the
+/// form as written, and returns it (§4.4).
 pub(super) fn dbg(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     check_arity("dbg", &items, 1, Some(1), pos)?;
     let e = items.into_iter().nth(1).unwrap_or_else(|| unit(pos));
     let t = ctx.gensym("dbg", pos);
     let label = string(&format!("dbg {pos}: {e} = "), pos);
-    let text = call(
-        "str-concat",
-        vec![label, call("show", vec![t.clone()], pos)],
-        pos,
-    );
-    let print = call("eprintln", vec![text], pos);
+    let shown = call(&prelude_name("show"), vec![t.clone()], pos);
+    let text = call(&prelude_name("str-concat"), vec![label, shown], pos);
+    let print = call(&prelude_name("eprintln"), vec![text], pos);
     let binding = list(vec![list(vec![t.clone(), e], pos)], pos);
     Ok(call("let", vec![binding, print, t], pos))
 }

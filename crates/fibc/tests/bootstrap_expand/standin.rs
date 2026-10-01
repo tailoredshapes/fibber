@@ -214,7 +214,7 @@ mod tests {
         ];
         for (damage, file, what) in damages {
             let s = sut(&dir, &fs, &opts, damage);
-            let failures = check_group(&s, &group(fs.clone(), opts));
+            let failures = check_group(&s, &group(fs.clone(), opts.clone()));
             assert_eq!(
                 failures.len(),
                 1,

@@ -31,7 +31,7 @@ pub enum Kind {
     Unit,
     /// `nil`.
     Nil,
-    /// `empty`, the empty `List`.
+    /// `Empty`, the empty `List`.
     Empty,
     /// `[e ...]`, a literal vector (syntax §1.4).
     VecLit(Vec<Expr>),

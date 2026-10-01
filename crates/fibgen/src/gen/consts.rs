@@ -53,7 +53,7 @@ pub fn constant(g: &mut Gen, ty: &Ty, d: u32) -> Expr {
         Ty::Opt(_) => Expr::new(ty.clone(), Kind::Nil),
         Ty::Boxed(t) => call("Box", vec![constant(g, t, sub)]),
         Ty::List if d > 0 && g.rng.chance(70) => call(
-            "cons",
+            "Cons",
             vec![Expr::int(g.small()), constant(g, &Ty::List, sub)],
         ),
         Ty::List => Expr::new(Ty::List, Kind::Empty),

@@ -10,7 +10,7 @@ fn literal_collections_become_library_calls() {
     assert_eq!(ex("{}"), "(fib.prelude/map-empty)");
     assert_eq!(
         ex("{:a 1 :b 2}"),
-        "(fib.prelude/assoc (fib.prelude/assoc (fib.prelude/map-empty) :a 1) :b 2)"
+        "(fib.prelude/map-assoc (fib.prelude/map-assoc (fib.prelude/map-empty) :a 1) :b 2)"
     );
     assert_eq!(ex("[[a]]"), v(&[&v(&["a"])]));
 }
@@ -41,31 +41,31 @@ fn let_fn_match_loop_positions() {
     assert_eq!(
         ex("(match (or a b) ((some (list x)) (list x)) (nil []))"),
         format!(
-            "(match (if a true b) ((some (list x)) (cons x empty)) (nil {}))",
+            "(match (if a true b) ((some (list x)) (fib.prelude/Cons x fib.prelude/Empty)) (nil {}))",
             v(&[])
         )
     );
     assert_eq!(
         ex("(loop ((i 0)) (if (< i 3) (recur (+ i 1)) (list i)))"),
-        "(loop ((i 0)) (if (< i 3) (recur (+ i 1)) (cons i empty)))"
+        "(loop ((i 0)) (if (< i 3) (recur (+ i 1)) (fib.prelude/Cons i fib.prelude/Empty)))"
     );
     assert_eq!(ex("(. (-> x f) (list a))"), "(. (f x) (list a))");
     assert_eq!(
         ex("(async (await (list)) [])"),
-        format!("(async (await empty) {})", v(&[]))
+        format!("(async (await fib.prelude/Empty) {})", v(&[]))
     );
-    assert_eq!(ex("(unsafe (list))"), "(unsafe empty)");
+    assert_eq!(ex("(unsafe (list))"), "(unsafe fib.prelude/Empty)");
 }
 
 #[test]
 fn primitive_operands_are_left_alone() {
     assert_eq!(
         ex("(set-field! &c x (list x))"),
-        "(set-field! (& c) x (cons x empty))"
+        "(set-field! (& c) x (fib.prelude/Cons x fib.prelude/Empty))"
     );
     assert_eq!(ex("(set-field! &c list 1)"), "(set-field! (& c) list 1)");
     assert_eq!(ex("(dyn Show [1])"), format!("(dyn Show {})", v(&["1"])));
-    assert_eq!(ex("(trunc i8 (list))"), "(trunc i8 empty)");
+    assert_eq!(ex("(trunc i8 (list))"), "(trunc i8 fib.prelude/Empty)");
     assert_eq!(ex("(sitofp (list) x)"), "(sitofp (list) x)");
 }
 
@@ -105,13 +105,13 @@ fn definitions_expand_their_bodies() {
     assert_eq!(
         out[7],
         format!(
-            "(defun f (x (& y:) i64) :where ((Eq a)) -> i64 (if x {} ()) empty)",
+            "(defun f (x (& y:) i64) :where ((Eq a)) -> i64 (if x {} ()) fib.prelude/Empty)",
             v(&["1"])
         )
     );
     assert_eq!(
         out[8],
-        "(impl Q P (q (self) -> i64 empty) (r (self) (if a b false)))"
+        "(impl Q P (q (self) -> i64 fib.prelude/Empty) (r (self) (if a b false)))"
     );
 }
 

@@ -20,6 +20,12 @@
 //! ([`RunnerKind::Evaluator`]) or, to judge an expander that has no
 //! evaluator yet, fails as `NoRunner` makes it ([`RunnerKind::None`]).
 //! The context a file starts from is fresh each time.
+//!
+//! The implicit modules (`modules::IMPLICIT_LIB`, or the list of
+//! `--implicit-lib`) are loaded and expanded first, as the prelude is, and
+//! their sections are left out like the prelude's: `--implicit` prints
+//! them (and the scope lines of `--context` name the implicit modules a
+//! module sees).
 
 mod args;
 mod context;
@@ -35,7 +41,8 @@ use crate::expand::{
     expand_prelude, expand_program, ExpandCtx, ExpandError, ExpandErrorKind, MacroRunner, NoRunner,
     PRELUDE_NS,
 };
-use crate::modules::{begin_spec, try_load, LoadError};
+use crate::modules::{begin_spec, try_load_with, LoadError, Loaded, IMPLICIT_LIB};
+use crate::roots::Roots;
 use crate::syntax::{read_all, Form, Pos, ReadError};
 use crate::types::prelude_forms;
 
@@ -70,12 +77,20 @@ impl LimitOverrides {
 }
 
 /// How `expand_files` expands and what it prints.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     /// Each file is a library prelude (`--prelude`): see [`dump_prelude`].
     pub prelude: bool,
     /// After each module, the context it left (`--context`, [`context`]).
     pub context: bool,
+    /// Print the sections of the implicit modules and what they were
+    /// read for too (`--implicit`).
+    pub implicit: bool,
+    /// The implicit modules instead of [`IMPLICIT_LIB`], in the order
+    /// they are loaded (`--implicit-lib A,B`; `Some` of none is no
+    /// implicit module), so that what a program does once the library is
+    /// implicit can be seen before it is.
+    pub implicit_lib: Option<Vec<String>>,
     pub runner: RunnerKind,
     pub limits: LimitOverrides,
 }
@@ -152,7 +167,11 @@ fn dump_program(source: &str, file: &str, opts: &Options) -> Dump {
     };
     opts.limits.apply(&mut ctx);
     let baseline = context::Baseline::of(&ctx);
-    let loaded = match try_load(source, file) {
+    let implicit: Vec<&str> = match &opts.implicit_lib {
+        Some(list) => list.iter().map(String::as_str).collect(),
+        None => IMPLICIT_LIB.to_vec(),
+    };
+    let loaded = match try_load_with(source, file, &Roots::default(), &implicit) {
         Ok(l) => l,
         Err(e) => return Dump::failure(load_record(&e, file)),
     };
@@ -163,21 +182,45 @@ fn dump_program(source: &str, file: &str, opts: &Options) -> Dump {
     };
     let mut out = String::new();
     for l in loaded {
-        begin_spec(&mut ctx, &l.spec);
-        let _ = writeln!(out, "-- module {} {}", l.spec.ns, l.file);
-        match expand_program(l.forms, &mut ctx, runner.as_mut()) {
-            Ok(forms) => out.push_str(&dump_forms_in(&forms, &l.file)),
-            Err(e) => {
-                out.push_str(&expand_record(&e, &l.file));
-                return Dump::failure(out);
-            }
+        let ended = dump_module(l, (&mut ctx, runner.as_mut()), (opts, &baseline), &mut out);
+        if let Err(failed) = ended {
+            return failed;
         }
-        if opts.context {
-            context::dump_context(&ctx, &l.spec.ns, &l.file, &baseline, &mut out);
-        }
-        ctx.end_module();
     }
     Dump::ok(out)
+}
+
+/// Expands the module `l` in `ctx` and appends its section to `out`,
+/// unless it is an implicit one and `--implicit` is not given; an error
+/// ends the dump with its record, in a section of its own then.
+fn dump_module(
+    l: Loaded,
+    (ctx, runner): (&mut ExpandCtx, &mut dyn MacroRunner),
+    (opts, baseline): (&Options, &context::Baseline),
+    out: &mut String,
+) -> Result<(), Dump> {
+    let show = opts.implicit || !l.implicit;
+    begin_spec(ctx, &l.spec);
+    let head = format!("-- module {} {}\n", l.spec.ns, l.file);
+    if show {
+        out.push_str(&head);
+    }
+    match expand_program(l.forms, ctx, runner) {
+        Ok(forms) if show => out.push_str(&dump_forms_in(&forms, &l.file)),
+        Ok(_) => {}
+        Err(e) => {
+            if !show {
+                out.push_str(&head);
+            }
+            out.push_str(&expand_record(&e, &l.file));
+            return Err(Dump::failure(std::mem::take(out)));
+        }
+    }
+    if opts.context && show {
+        context::dump_context(ctx, (&l.spec.ns, &l.file), (baseline, opts.implicit), out);
+    }
+    ctx.end_module();
+    Ok(())
 }
 
 /// The dump of `source` (the file `file`) as a library prelude, which is
@@ -206,13 +249,8 @@ fn dump_prelude(source: &str, file: &str, opts: &Options) -> Dump {
         Err(e) => return Dump::failure(out + &expand_record(&e, file)),
     }
     if opts.context {
-        context::dump_context(
-            &ctx,
-            PRELUDE_NS,
-            file,
-            &context::Baseline::empty(),
-            &mut out,
-        );
+        let (home, empty) = ((PRELUDE_NS, file), context::Baseline::empty());
+        context::dump_context(&ctx, home, (&empty, false), &mut out);
     }
     Dump::ok(out)
 }

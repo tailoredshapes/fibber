@@ -181,7 +181,7 @@ fn case_05_list_becomes_cons_cells() {
         printed(&out),
         [
             "(defun make-counter () (let ((n (cell 0))) \
-             (cons (fn () (set! n (+ (deref n) 1)) (deref n)) (cons (fn () (deref n)) empty))))",
+             (fib.prelude/Cons (fn () (set! n (+ (deref n) 1)) (deref n)) (fib.prelude/Cons (fn () (deref n)) fib.prelude/Empty))))",
             "(defun main () -> i64 (let ((c (make-counter))) \
              (let ((inc (nth c 0)) (get (nth c 1))) (inc) (inc) (get))))",
         ]
@@ -194,14 +194,16 @@ fn case_10_plet_spawns_and_joins_and_pmap_stays_a_call() {
     assert_eq!(
         printed(&out),
         ["(defun main () -> i64 \
-          (let ((#a.1 (spawn (fn () (atom (fib.prelude/vec-empty)))))) \
-          (let ((a (join #a.1))) \
+          (let ((#a.1 (fib.prelude/spawn (fn () (atom (fib.prelude/vec-empty)))))) \
+          (let ((a (fib.prelude/join #a.1))) \
           (pmap (fn (i) (let ((snapshot (deref a))) (swap! a (fn (c) (conj c i))) (count snapshot))) \
           (range 1000)) \
           (count (deref a)))))"]
     );
     let h = heads(&out);
-    assert!(h.contains(&"spawn".to_string()) && h.contains(&"join".to_string()));
+    assert!(
+        h.contains(&"fib.prelude/spawn".to_string()) && h.contains(&"fib.prelude/join".to_string())
+    );
     assert!(!h.contains(&"plet".to_string()));
 }
 
@@ -223,7 +225,7 @@ fn case_15_vector_literals_are_prelude_calls() {
         [
             "(defstruct Knot (items: (Cell (Vec Knot))))",
             "(defun main () -> i64 (let ((k (Knot (cell (fib.prelude/vec-empty))))) \
-             (set! (. k items) (fib.prelude/conj (fib.prelude/vec-empty) k)) \
+             (set! (. k items) (fib.prelude/vec-conj (fib.prelude/vec-empty) k)) \
              (count (deref (. k items)))))",
         ]
     );
@@ -241,7 +243,7 @@ fn case_19_if_let_becomes_match() {
             "(defun add-child (parent) (let ((c (Node (some (weak parent)) (cell (fib.prelude/vec-empty))))) \
              (set! (. parent children) (conj (deref (. parent children)) c)) c))",
             "(defun depth (n: Node) -> i64 (match (. n parent) (nil 0) \
-             ((some w) (match (deref w) ((some p) (+ 1 (depth p))) (nil 0)))))",
+             ((some w) (match (deref w) ((fib.prelude/some p) (+ 1 (depth p))) (nil 0)))))",
             "(defun main () -> i64 (let ((root (Node nil (cell (fib.prelude/vec-empty))))) \
              (let ((a (add-child root))) (let ((b (add-child a))) (depth b)))))",
         ]

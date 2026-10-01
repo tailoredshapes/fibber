@@ -1,10 +1,16 @@
 ;; fib.prelude: the library of syntax §4.5 that the cases in
 ;; cases/ownership use, written in fibber over the primitives of syntax
 ;; §4.3. The expander's own prelude (expand::PRELUDE_SOURCE) comes first
-;; and supplies the List enum and the derived Eq/Ord/Hash/Show instances
-;; of Option and List. The helpers marked :private (syntax §5) are not
-;; exported: the trie's nodes and their functions, and the raw write
-;; under println and eprintln.
+;; and supplies the List enum (variants Empty and Cons) and the derived
+;; Eq/Ord/Hash instances of Option and List; their Show is written here,
+;; below, because a derived Show cannot print an Option as its payload.
+;; The helpers marked :private (syntax §5) are not exported: the trie's
+;; nodes and their functions, and the raw write under println, eprintln
+;; and print-str.
+;;
+;; Pair, Triple and Result (stdlib design §2.3, L4) are the library's tuple
+;; types: the entry a Map hands to for-each is a Pair, the one tuple type, and
+;; map-each and set-each are the walks over a Map and a Set that can stop early.
 ;;
 ;; Vec is the persistent vector of types §2.13: a 32-way trie of
 ;; (Array a) nodes with a tail of up to 32 elements, as in Clojure. A
@@ -37,6 +43,18 @@
   (let ((m (bit-xor (bit-xor (bit-or (shl h 7) (shr h 57)) x) -7046029254386353131))
         (a (hash-xorshift (hash-xorshift (hash-xorshift (hash-xorshift m -36) 11) -15) 23)))
     (hash-xorshift (hash-xorshift (hash-xorshift (hash-xorshift a -2) 31) -39) 15)))
+
+;; Tuples (stdlib design §2.3, §4.3; L4). Pair is the one tuple type: the
+;; entry a Map yields, what the library's zip and juxt give. Triple is its
+;; three-field twin and Result the value of a function that can fail. Each
+;; derives Eq, Ord and Hash; their Show is the library's (fib.print.show prints
+;; a Pair as [1 2]), which a derived Show would overlap, so none is derived.
+(defstruct (Pair a b) (fst: a snd: b))
+(defstruct (Triple a b c) (fst: a snd: b thd: c))
+(defenum (Result a b) (Ok v: a) (Err e: b))
+(derive Eq Pair) (derive Ord Pair) (derive Hash Pair)
+(derive Eq Triple) (derive Ord Triple) (derive Hash Triple)
+(derive Eq Result) (derive Ord Result) (derive Hash Result)
 
 ;; Protocols (syntax §4.5)
 (defprotocol Countable (count (self) -> i64))
@@ -133,46 +151,69 @@
   (for-each (self f)
     (dotimes (i (vec-count self)) (f (vec-nth self i)))))
 
-;; List (the enum is in the expander's prelude)
+;; List (the enum is in the expander's prelude: Empty and Cons, stdlib design
+;; C-3; the library's own `empty` and `cons` are a method and a function)
 (impl Countable (List a)
   (count (self)
     (match self
-      ((empty) 0)
-      ((cons _ t) (+ 1 (count t))))))
+      ((Empty) 0)
+      ((Cons _ t) (+ 1 (count t))))))
 
 (impl (Indexable a) (List a)
   (nth (self i)
     (match self
-      ((empty) (trap "nth: index out of range"))
-      ((cons h t) (if (= i 0) h (nth t (- i 1)))))))
+      ((Empty) (trap "nth: index out of range"))
+      ((Cons h t) (if (= i 0) h (nth t (- i 1)))))))
 
 (impl (Seq a) (List a)
   (first (self)
     (match self
-      ((empty) (trap "first: empty list"))
-      ((cons h _) h)))
+      ((Empty) (trap "first: empty list"))
+      ((Cons h _) h)))
   (rest (self)
     (match self
-      ((empty) empty)
-      ((cons _ t) t))))
+      ((Empty) Empty)
+      ((Cons _ t) t))))
 
 (impl (Collection a) (List a)
-  (conj (self x) (cons x self)))
+  (conj (self x) (Cons x self)))
 
 (impl (Traversable a) (List a)
   (for-each (self f)
     (match self
-      ((empty) ())
-      ((cons h t) (do (f h) (for-each t f))))))
+      ((Empty) ())
+      ((Cons h t) (do (f h) (for-each t f))))))
+
+;; Show of Option and List as Clojure prints them (stdlib design §2.7): a
+;; present value is its payload's text (a nested Option is as ambiguous as
+;; Clojure's nested nil), nil is `nil`, and a List is its elements in
+;; parentheses, a space apart: `(1 2)`, `()`. The two are here, not
+;; derived, because a derived Show says `(some 3)` and `(Cons 1 (Cons 2
+;; Empty))`.
+(impl Show (Option a) :where ((Show a))
+  (show (self)
+    (match self
+      (nil "nil")
+      ((some x) (show x)))))
+
+(defun list-text :private (l: (List a)) :where ((Show a)) -> str
+  (loop ((rest l) (acc "") (first true))
+    (match rest
+      ((Empty) acc)
+      ((Cons h t)
+       (recur t (str-concat (if first acc (str-concat acc " ")) (show h)) false)))))
+
+(impl Show (List a) :where ((Show a))
+  (show (self) (str-concat "(" (str-concat (list-text self) ")"))))
 
 ;; Map: a hash array mapped trie (types §2.13, syntax §4.5) over the
 ;; keys' hash: 32-way bitmap nodes five bits of the hash at a time, a
 ;; leaf per key, a bucket for keys whose hashes collide. Keys need Hash
 ;; and Eq. assoc and dissoc share structure with the previous version.
-(defstruct (Entry k v) (key: k val: v))
+;; A bucket holds its entries as Pairs (key fst, value snd).
 (defenum (MNode k v) :private
   (MLeaf hash: i64 key: k val: v)
-  (MColl hash: i64 items: (Array (Entry k v)))
+  (MColl hash: i64 items: (Array (Pair k v)))
   (MBits bitmap: i64 kids: (Array (MNode k v))))
 (defenum (Map k v)
   (MapEmpty)
@@ -212,11 +253,11 @@
             (MBits (bit-or (shl 1 c0) (shl 1 c1)) (array-push (array 1 a) b))
             (MBits (bit-or (shl 1 c0) (shl 1 c1)) (array-push (array 1 b) a))))))
 
-(defun mcoll-find :private (items: (Array (Entry k v)) key: k) -> i64
+(defun mcoll-find :private (items: (Array (Pair k v)) key: k) -> i64
   (loop ((i 0))
     (if (>= i (array-len items))
         -1
-        (if (= (. (array-get items i) key) key) i (recur (+ i 1))))))
+        (if (= (. (array-get items i) fst) key) i (recur (+ i 1))))))
 
 (defun mnode-get :private (node: (MNode k v) shift: i64 h: i64 key: k) :where ((Eq k)) -> (Option v)
   (match node
@@ -224,7 +265,7 @@
     ((MColl h0 items)
      (if (= h0 h)
          (let ((i (mcoll-find items key)))
-           (if (< i 0) nil (some (. (array-get items i) val))))
+           (if (< i 0) nil (some (. (array-get items i) snd))))
          nil))
     ((MBits bitmap kids)
      (let ((bit (shl 1 (mchunk h shift))))
@@ -238,14 +279,14 @@
      (if (= h0 h)
          (if (= k0 key)
              (MRes (MLeaf h key val) false)
-             (MRes (MColl h (array-push (array 1 (Entry k0 v0)) (Entry key val))) true))
+             (MRes (MColl h (array-push (array 1 (Pair k0 v0)) (Pair key val))) true))
          (MRes (mnode-two shift h0 node h (MLeaf h key val)) true)))
     ((MColl h0 items)
      (if (= h0 h)
          (let ((i (mcoll-find items key)))
            (if (< i 0)
-               (MRes (MColl h (array-push items (Entry key val))) true)
-               (MRes (MColl h (array-with items i (Entry key val))) false)))
+               (MRes (MColl h (array-push items (Pair key val))) true)
+               (MRes (MColl h (array-with items i (Pair key val))) false)))
          (MRes (mnode-two shift h0 node h (MLeaf h key val)) true)))
     ((MBits bitmap kids)
      (let ((bit (shl 1 (mchunk h shift)))
@@ -265,7 +306,7 @@
            (some node)
            (if (= (array-len items) 2)
                (let ((e (array-get items (- 1 i))))
-                 (some (MLeaf h0 (. e key) (. e val))))
+                 (some (MLeaf h0 (. e fst) (. e snd))))
                (some (MColl h0 (array-remove items i)))))))
     ((MBits bitmap kids)
      (let ((bit (shl 1 (mchunk h shift)))
@@ -309,11 +350,34 @@
 
 (defun contains? (m: (Map k v) key: k) -> bool (some? (map-get m key)))
 
-(defun mnode-for-each :private (node: (MNode k v) f: (fn ((Entry k v)) unit) :borrow) -> unit
+(defun mnode-for-each :private (node: (MNode k v) f: (fn ((Pair k v)) unit) :borrow) -> unit
   (match node
-    ((MLeaf _ k0 v0) (f (Entry k0 v0)))
+    ((MLeaf _ k0 v0) (f (Pair k0 v0)))
     ((MColl _ items) (dotimes (i (array-len items)) (f (array-get items i))))
     ((MBits _ kids) (dotimes (i (array-len kids)) (mnode-for-each (array-get kids i) f)))))
+
+;; The walk that can stop (stdlib design §4.2, L4): f is given each key and
+;; its value, in the trie's order, and says whether to go on; the result is
+;; whether the walk ran to the end. No Pair is built, unlike for-each's.
+(defun mnode-each :private (node: (MNode k v) f: (fn (k v) bool) :borrow) -> bool
+  (match node
+    ((MLeaf _ k0 v0) (f k0 v0))
+    ((MColl _ items)
+     (loop ((i 0))
+       (if (< i (array-len items))
+           (let ((e (array-get items i)))
+             (if (f (. e fst) (. e snd)) (recur (+ i 1)) false))
+           true)))
+    ((MBits _ kids)
+     (loop ((i 0))
+       (if (< i (array-len kids))
+           (if (mnode-each (array-get kids i) f) (recur (+ i 1)) false)
+           true)))))
+
+(defun map-each (m: (Map k v) f: (fn (k v) bool) :borrow) -> bool
+  (match m
+    ((MapEmpty) true)
+    ((MapOf _ root) (mnode-each root f))))
 
 (impl (Associative k v) (Map k v) :where ((Hash k) (Eq k))
   (assoc (self key val) (map-assoc self key val))
@@ -322,7 +386,7 @@
 (impl Countable (Map k v)
   (count (self) (match self ((MapEmpty) 0) ((MapOf cnt _) cnt))))
 
-(impl (Traversable (Entry k v)) (Map k v)
+(impl (Traversable (Pair k v)) (Map k v)
   (for-each (self f)
     (match self
       ((MapEmpty) ())
@@ -346,7 +410,13 @@
   (count (self) (count (. self m))))
 
 (impl (Traversable k) (Set k)
-  (for-each (self f) (for-each (. self m) (fn (e) (f (. e key))))))
+  (for-each (self f) (for-each (. self m) (fn (e) (f (. e fst))))))
+
+;; The elements of a Set, as map-each walks a Map: f says whether to go on.
+;; The call is bound before it is returned: a closure given to a call in tail
+;; position is a heap closure (types §6.10), which would capture the borrowed f.
+(defun set-each (s: (Set k) f: (fn (k) bool) :borrow) -> bool
+  (let ((r (map-each (. s m) (fn (x y) (f x))))) r))
 
 ;; Strings
 (impl Countable str
@@ -460,9 +530,16 @@
 (defun append (&v x) (push! &v x))
 
 ;; Threads and tasks (syntax §3.12, §3.14)
+;; pmap spawns one task per element and joins them in order; it is written
+;; over spawn and join alone, so that the Vec-only map can go (stdlib design §8.3 C).
 (defun pmap (f: (fn :send (a) b) xs: (Vec a)) -> (Vec b)
-  (let ((tasks (map (fn (x) (spawn (fn () (f x)))) xs)))
-    (map (fn (t) (join t)) tasks)))
+  (let ((n (vec-count xs))
+        (tasks (loop ((i 0) (acc (vec-empty)))
+                 (if (< i n)
+                     (let ((x (vec-nth xs i))) (recur (+ i 1) (vec-conj acc (spawn (fn () (f x))))))
+                     acc))))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i n) (recur (+ i 1) (vec-conj out (join (vec-nth tasks i)))) out))))
 
 (defun yield () -> (Task unit) (async ()))
 (defun block-on (t) (join t))
@@ -502,3 +579,8 @@
 
 (defun println (s: str) -> unit
   (do (write-str "println" 1i32 s) (write-str "println" 1i32 "\n")))
+
+;; print-str writes s without the newline: what the print macro of the
+;; library (tranche 1, R5) expands to, and Clojure's print.
+(defun print-str (s: str) -> unit
+  (write-str "print-str" 1i32 s))

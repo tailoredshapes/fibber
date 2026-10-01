@@ -6,10 +6,12 @@ use super::{LimitOverrides, Options, RunnerKind};
 
 /// The options and the files of the words after `expand`: the words that
 /// start with `--` before the first file are options (`--prelude`,
-/// `--context`, `--no-runner`, `--max-steps N`, `--max-depth N`,
-/// `--max-forms N`, each number decimal digits), and a lone `--` ends
-/// them, so that a file named like an option can follow it. `None` for a
-/// word that is not an option, a number that is not digits, or no file.
+/// `--context`, `--implicit`, `--implicit-lib LIST`, `--no-runner`,
+/// `--max-steps N`, `--max-depth N`, `--max-forms N`, each number decimal
+/// digits, LIST module names separated by commas, or nothing), and a lone
+/// `--` ends them, so that a file named like an option can follow it.
+/// `None` for a word that is not an option, a number that is not digits,
+/// a LIST with an empty name, or no file.
 pub fn parse_args(args: &[String]) -> Option<(Options, Vec<String>)> {
     let mut opts = Options::default();
     let mut rest = args;
@@ -27,6 +29,17 @@ pub fn parse_args(args: &[String]) -> Option<(Options, Vec<String>)> {
                 opts.context = true;
                 tail
             }
+            "--implicit" => {
+                opts.implicit = true;
+                tail
+            }
+            "--implicit-lib" => {
+                let [list, after @ ..] = tail else {
+                    return None;
+                };
+                opts.implicit_lib = Some(module_list(list)?);
+                after
+            }
             "--no-runner" => {
                 opts.runner = RunnerKind::None;
                 tail
@@ -41,6 +54,16 @@ pub fn parse_args(args: &[String]) -> Option<(Options, Vec<String>)> {
     (!rest.is_empty()).then(|| (opts, rest.to_vec()))
 }
 
+/// The module names of a `--implicit-lib` list: none for the empty text,
+/// else one per comma, each not empty.
+fn module_list(list: &str) -> Option<Vec<String>> {
+    if list.is_empty() {
+        return Some(Vec::new());
+    }
+    let names: Vec<String> = list.split(',').map(str::to_string).collect();
+    names.iter().all(|n| !n.is_empty()).then_some(names)
+}
+
 /// Reads the number that starts `tail` into `slot`; the words after it.
 fn limit<'a>(slot: &mut Option<usize>, tail: &'a [String]) -> Option<&'a [String]> {
     let [n, after @ ..] = tail else { return None };
@@ -52,18 +75,23 @@ fn limit<'a>(slot: &mut Option<usize>, tail: &'a [String]) -> Option<&'a [String
 }
 
 /// The option words that make [`parse_args`] read `opts`, in the order
-/// `--prelude`, `--context`, `--no-runner`, `--max-steps`, `--max-depth`,
-/// `--max-forms`; none for the defaults.
+/// `--prelude`, `--context`, `--implicit`, `--implicit-lib`, `--no-runner`,
+/// `--max-steps`, `--max-depth`, `--max-forms`; none for the defaults.
 pub fn flags(opts: &Options) -> Vec<String> {
     let mut words = Vec::new();
-    let mut flag = |on: bool, word: &str| {
+    let flag = |words: &mut Vec<String>, on: bool, word: &str| {
         if on {
             words.push(word.to_string());
         }
     };
-    flag(opts.prelude, "--prelude");
-    flag(opts.context, "--context");
-    flag(opts.runner == RunnerKind::None, "--no-runner");
+    flag(&mut words, opts.prelude, "--prelude");
+    flag(&mut words, opts.context, "--context");
+    flag(&mut words, opts.implicit, "--implicit");
+    if let Some(lib) = &opts.implicit_lib {
+        words.push("--implicit-lib".to_string());
+        words.push(lib.join(","));
+    }
+    flag(&mut words, opts.runner == RunnerKind::None, "--no-runner");
     let LimitOverrides {
         steps,
         depth,
@@ -95,6 +123,8 @@ mod tests {
         let opts = Options {
             prelude: true,
             context: true,
+            implicit: true,
+            implicit_lib: Some(words(&["fib.a", "fib.b"])),
             runner: RunnerKind::None,
             limits: LimitOverrides {
                 steps: Some(3),
@@ -105,6 +135,9 @@ mod tests {
         let all = words(&[
             "--prelude",
             "--context",
+            "--implicit",
+            "--implicit-lib",
+            "fib.a,fib.b",
             "--no-runner",
             "--max-steps",
             "3",
@@ -134,6 +167,11 @@ mod tests {
             &["--max-steps", "+1", "a.fib"],
             &["--max-steps", "", "a.fib"],
             &["--max-steps", "99999999999999999999999", "a.fib"],
+            &["--implicit-lib"],
+            &["--implicit-lib", "a.fib"],
+            &["--implicit-lib", "a,,b", "a.fib"],
+            &["--implicit-lib", ",a", "a.fib"],
+            &["--implicit-lib", "a,", "a.fib"],
         ] {
             assert_eq!(parse_args(&words(bad)), None, "{bad:?}");
         }
@@ -160,6 +198,15 @@ mod tests {
                 ..Options::default()
             },
             Options {
+                implicit: true,
+                implicit_lib: Some(Vec::new()),
+                ..Options::default()
+            },
+            Options {
+                implicit_lib: Some(words(&["fib.core", "fib.seq"])),
+                ..Options::default()
+            },
+            Options {
                 context: true,
                 runner: RunnerKind::None,
                 limits: LimitOverrides {
@@ -173,12 +220,14 @@ mod tests {
         for opts in all {
             let mut line = flags(&opts);
             line.push("f.fib".to_string());
-            assert_eq!(
-                parse_args(&line),
-                Some((opts, words(&["f.fib"]))),
-                "{opts:?}"
-            );
+            let read = parse_args(&line);
+            assert_eq!(read, Some((opts.clone(), words(&["f.fib"]))), "{opts:?}");
         }
         assert_eq!(flags(&Options::default()), Vec::<String>::new());
+        let none = Options {
+            implicit_lib: Some(Vec::new()),
+            ..Options::default()
+        };
+        assert_eq!(flags(&none), words(&["--implicit-lib", ""]));
     }
 }

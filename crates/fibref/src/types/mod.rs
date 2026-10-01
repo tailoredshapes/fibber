@@ -50,7 +50,7 @@ use crate::syntax::{read_all, Form};
 pub use error::{ErrorKind, TypeError};
 pub use program::TypedProgram;
 
-use decls::ModuleId;
+use decls::{Links, ModuleId};
 
 use crate::modules::ModuleSpec;
 use infer::Checker;
@@ -163,8 +163,8 @@ pub fn lower_program(forms: &[Form], prelude: &[Form]) -> Result<Lowered, Vec<Ty
 /// Steps 1–3 of §3.5 for the prelude and the program's modules, given
 /// in dependency order with the main module last (`modules::load`):
 /// each is declared against the ones before it, sees its `:use`s
-/// unqualified and its `:require`s by alias, and the last defines
-/// `main`. Same stack requirement as [`lower_program`].
+/// unqualified, its implicit modules after them (`ModuleSpec::implicit`)
+/// and its `:require`s by alias, and the last defines `main`. Same stack requirement as [`lower_program`].
 pub fn lower_modules(
     modules: &[(ModuleSpec, Vec<Form>)],
     prelude: &[Form],
@@ -178,29 +178,7 @@ pub fn lower_modules(
     let mut ids: HashMap<String, ModuleId> = HashMap::new();
     let mut items = Vec::new();
     for (spec, forms) in modules {
-        let pos = forms
-            .first()
-            .map(|f| f.pos.clone())
-            .unwrap_or_else(init::builtin_pos);
-        let mut aliases = HashMap::new();
-        for (alias, ns) in &spec.requires {
-            let id = *ids.get(ns).ok_or_else(|| {
-                vec![TypeError::other(&pos, format!("module {ns} is not loaded"))]
-            })?;
-            aliases.insert(alias.clone(), id);
-        }
-        let mut uses = Vec::new();
-        for ns in &spec.uses {
-            let id = *ids.get(ns).ok_or_else(|| {
-                vec![TypeError::other(&pos, format!("module {ns} is not loaded"))]
-            })?;
-            uses.push(id);
-        }
-        let mut reexports = Vec::new();
-        for ns in &spec.exports {
-            reexports.extend(ids.get(ns).copied());
-        }
-        let m = g.add_module(&spec.ns, (&uses, &reexports), aliases);
+        let m = add_linked(&mut g, spec, &ids, forms)?;
         ids.insert(spec.ns.clone(), m);
         g.main = m;
         let (forms, private) = lower::strip_private(forms);
@@ -213,6 +191,51 @@ pub fn lower_modules(
         prelude: prelude_items,
         modules: items,
     })
+}
+
+/// Adds the module `spec` describes (whose forms are `forms`) to `g`,
+/// linked to the modules `ids` of the program that came before it.
+fn add_linked(
+    g: &mut decls::Globals,
+    spec: &ModuleSpec,
+    ids: &HashMap<String, ModuleId>,
+    forms: &[Form],
+) -> Result<ModuleId, Vec<TypeError>> {
+    let pos = forms
+        .first()
+        .map(|f| f.pos.clone())
+        .unwrap_or_else(init::builtin_pos);
+    let loaded = |ns: &String| {
+        ids.get(ns)
+            .copied()
+            .ok_or_else(|| vec![TypeError::other(&pos, format!("module {ns} is not loaded"))])
+    };
+    let mut aliases = HashMap::new();
+    for (alias, ns) in &spec.requires {
+        aliases.insert(alias.clone(), loaded(ns)?);
+    }
+    let uses = spec
+        .uses
+        .iter()
+        .map(loaded)
+        .collect::<Result<Vec<_>, _>>()?;
+    let implicit = spec
+        .implicit
+        .iter()
+        .map(loaded)
+        .collect::<Result<Vec<_>, _>>()?;
+    let reexports: Vec<ModuleId> = spec
+        .exports
+        .iter()
+        .filter_map(|ns| ids.get(ns))
+        .copied()
+        .collect();
+    let links = Links {
+        uses: &uses,
+        reexports: &reexports,
+        implicit: &implicit,
+    };
+    Ok(g.add_module(&spec.ns, links, aliases))
 }
 
 /// Steps 4–7 of §3.5 on a lowered program; with `main`, requires `main

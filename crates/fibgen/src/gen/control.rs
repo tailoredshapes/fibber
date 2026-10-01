@@ -266,10 +266,10 @@ pub fn clause_patterns(g: &mut Gen, st: &Ty) -> Vec<(Pat, Vec<Var>)> {
                 var(&h, &Ty::Int, VarKind::Pattern),
                 var(&t, &Ty::List, VarKind::Pattern),
             ];
-            let cons = Pat::Ctor("cons".into(), vec![Pat::Bind(h), Pat::Bind(t)]);
+            let cons = Pat::Ctor("Cons".into(), vec![Pat::Bind(h), Pat::Bind(t)]);
             vec![
                 (cons, vars),
-                (Pat::Ctor("empty".into(), Vec::new()), Vec::new()),
+                (Pat::Ctor("Empty".into(), Vec::new()), Vec::new()),
             ]
         }
         _ => vec![irrefutable(g, st, 2)],

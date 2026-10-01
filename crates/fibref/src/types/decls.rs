@@ -6,9 +6,11 @@
 //! built-in protocols of §2.9 and §2.12), the prelude `fib.prelude`, and
 //! the user module. A name defined in a module shadows one it `:use`s
 //! (syntax §5), so user names shadow prelude names, which shadow
-//! builtins; `fib.prelude/x` skips the user module (syntax §1.4).
+//! builtins; `fib.prelude/x` skips the user module (syntax §1.4). The
+//! implicit modules of `modules::IMPLICIT_LIB` sit between a module's
+//! `:use`s and the prelude.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::syntax::Pos;
 
@@ -45,15 +47,18 @@ pub struct ModuleInfo {
     /// The names it binds.
     pub names: Names,
     /// The modules a name used in it is looked up in, in order: itself,
-    /// its `:use`s, the prelude, the builtins.
+    /// its `:use`s, the implicit modules, the prelude, the builtins.
     pub chain: Vec<ModuleId>,
     /// Its `:use`s, in the order written: `chain[1..=uses.len()]`.
     pub uses: Vec<ModuleId>,
+    /// The implicit modules it sees (empty for the library's own), in the
+    /// order they were loaded: the next `implicit.len()` of the chain.
+    pub implicit: Vec<ModuleId>,
     /// The modules it re-exports (`(:export-from m)`, syntax §5), each
     /// also one of its `uses`: what they export, it exports.
     pub reexports: Vec<ModuleId>,
-    /// Its `:require`s, alias to module, and every module it requires or
-    /// uses under its full `ns` name.
+    /// Its `:require`s, alias to module, and every module it requires,
+    /// uses or sees implicitly under its full `ns` name.
     pub aliases: HashMap<String, ModuleId>,
 }
 
@@ -328,6 +333,17 @@ pub struct Globals {
     pub expr_count: u32,
 }
 
+/// The modules one being added links to (syntax §5).
+#[derive(Clone, Copy, Debug)]
+pub struct Links<'a> {
+    /// Its `:use`s.
+    pub uses: &'a [ModuleId],
+    /// What it re-exports (`:export-from`), each also one of its `uses`.
+    pub reexports: &'a [ModuleId],
+    /// The implicit modules it sees.
+    pub implicit: &'a [ModuleId],
+}
+
 impl Globals {
     /// The names of `m`.
     pub fn names(&self, m: ModuleId) -> &Names {
@@ -349,33 +365,70 @@ impl Globals {
         &self.modules[m.index()].ns
     }
 
-    /// Adds a program module named `ns` that `:use`s `uses` and
-    /// `:require`s `aliases`, after the modules it depends on; its
-    /// chain is itself, its uses, the prelude, the builtins.
+    /// Adds a program module named `ns` that links to `links` and
+    /// `:require`s `aliases`, after the modules it depends on; its chain
+    /// is itself, its uses, the implicit modules, the prelude, the
+    /// builtins. A `:require` alias shadows the full name of an implicit
+    /// module, and the full name of a used one shadows an alias.
     pub fn add_module(
         &mut self,
         ns: &str,
-        (uses, reexports): (&[ModuleId], &[ModuleId]),
+        links: Links,
         aliases: HashMap<String, ModuleId>,
     ) -> ModuleId {
         let id = ModuleId(self.modules.len() as u32);
         let mut chain = vec![id];
-        chain.extend(uses.iter().copied());
+        chain.extend(links.uses.iter().copied());
+        chain.extend(links.implicit.iter().copied());
         chain.push(ModuleId::PRELUDE);
         chain.push(ModuleId::BUILTIN);
-        let mut aliases = aliases;
-        for u in uses {
-            aliases.insert(self.modules[u.index()].ns.clone(), *u);
+        let mut all: HashMap<String, ModuleId> = links
+            .implicit
+            .iter()
+            .map(|i| (self.modules[i.index()].ns.clone(), *i))
+            .collect();
+        all.extend(aliases);
+        for u in links.uses {
+            all.insert(self.modules[u.index()].ns.clone(), *u);
         }
         self.modules.push(ModuleInfo {
             ns: ns.to_string(),
             names: Names::default(),
             chain,
-            uses: uses.to_vec(),
-            reexports: reexports.to_vec(),
-            aliases,
+            uses: links.uses.to_vec(),
+            implicit: links.implicit.to_vec(),
+            reexports: links.reexports.to_vec(),
+            aliases: all,
         });
         id
+    }
+
+    /// The program module named `ns`, if one was added (the builtins and
+    /// the prelude are not looked up by name).
+    pub fn module_id(&self, ns: &str) -> Option<ModuleId> {
+        let at = self.modules.iter().skip(2).position(|m| m.ns == ns)?;
+        Some(ModuleId(at as u32 + 2))
+    }
+
+    /// Every name module `m` exports (syntax §5): its own definitions that
+    /// are not `:private`, in all three spaces (a struct is its type and
+    /// its constructor), and what the modules it re-exports export.
+    pub fn exports(&self, m: ModuleId) -> BTreeSet<String> {
+        let names = self.names(m);
+        let public = |space: Space, keys: Vec<&String>| -> Vec<String> {
+            keys.into_iter()
+                .filter(|k| !names.is_private(space, k))
+                .cloned()
+                .collect()
+        };
+        let mut out = BTreeSet::new();
+        out.extend(public(Space::Value, names.values.keys().collect()));
+        out.extend(public(Space::Type, names.types.keys().collect()));
+        out.extend(public(Space::Proto, names.protos.keys().collect()));
+        for &r in &self.module(m).reexports {
+            out.extend(self.exports(r));
+        }
+        out
     }
 
     /// The definition of a nominal type.

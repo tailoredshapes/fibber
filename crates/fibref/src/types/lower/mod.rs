@@ -360,7 +360,7 @@ fn const_head(g: &Globals, head: &Expr) -> bool {
             _ => false,
         };
     }
-    ["vec-empty", "conj", "map-empty", "assoc"]
+    ["vec-empty", "vec-conj", "map-empty", "map-assoc"]
         .iter()
         .any(|n| g.value(ModuleId::PRELUDE, n) == Some(*r))
 }

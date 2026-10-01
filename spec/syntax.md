@@ -1622,6 +1622,27 @@ unqualified and the ones that `:require` it through the alias, and a
 `fib.prelude` is implicitly `:use`d. Protocol implementations are global
 facts and are always visible once their module is required.
 
+**Implicit modules** (**Proposed**, stdlib design §6.2, §4.4). A program
+may have modules that every one of its modules sees without naming them: the
+reference implementation lists them in `modules::IMPLICIT_LIB`, which is
+empty until the library is complete and then names the facades `fib.core`,
+`fib.seq`, `fib.coll` and `fib.print`. They are loaded before the program's
+other modules, in the order listed, and seen as the prelude is, between a
+module's `:use`s and the prelude: a module's own definition and a `:use`d
+module's name shadow an implicit module's, with no clash (an implicit module
+is not a second `:use`), and the full name of an implicit module
+(`fib.seq/x`) names its exports from any module that sees it, without a
+`:require`, so that a macro's template can name the library function it
+needs by the facade's name and be expanded in a module that has never
+mentioned it (a `:require` alias spelled the same shadows it). Two implicit
+modules that export one name differently make it an error where it is
+referenced bare, as two `:use`s do (the library keeps its four facades
+disjoint, `crates/fibref/tests/lib_disjoint.rs`, and its parts one facade's
+each). A module whose name starts `fib.` (the library's own), `Long` and
+`Math` see no implicit module, and neither does an implicit module: they
+write their `:use` lines by hand. `fibref expand` leaves the implicit
+modules out of its dump as it does the prelude (spec/bootstrap.md §5.1).
+
 A protocol belongs to its module like any other definition, and so do its
 methods: two modules may each define a protocol of one name with methods of
 one name (case 008), and a program's own protocol `Collection` with a method

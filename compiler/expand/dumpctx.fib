@@ -25,7 +25,7 @@
 ;;   Rust's `reexports()`: sorted by module), not from the fields of
 ;;   `ExpandCtx`.
 ;; - Rust's `Entry<'a>` is `CtxEntry`, whose variants are named for what
-;;   they hold (`Entry` is a prelude struct, the `Map`'s). A Map is walked
+;;   they hold (the `Map`'s own entry is the prelude's `Pair`). A Map is walked
 ;;   with the prelude's `for-each` for a scope's aliases, which are then
 ;;   sorted by alias; every other order comes from the accessors of
 ;;   expand.ctx.
@@ -193,7 +193,7 @@
 
 (defun aliases-sorted :private (aliases: (Map str str)) -> (Vec AliasPair)
   (let ((acc (cell (vec-empty))))
-    (do (for-each aliases (fn (e: (Entry str str)) (set! acc (conj @acc (AliasPair (. e key) (. e val))))))
+    (do (for-each aliases (fn (e: (Pair str str)) (set! acc (conj @acc (AliasPair (. e fst) (. e snd))))))
         (sort/sort-by @acc (fn (x: AliasPair y: AliasPair) (< (. x alias) (. y alias)))))))
 
 ;; `  use "M"` for each module the scope uses, in the order written.
@@ -219,14 +219,26 @@
                                           (quoted-words (. (nth res i) modules))])))
         a)))
 
+;; `  implicit "M"` for each implicit module the scope sees, in the order
+;; they were loaded, when asked.
+(defun implicit-lines :private (acc: (Vec str) implicit: (Vec str) shown: bool) -> (Vec str)
+  (loop ((i 0) (a acc))
+    (if (and shown (< i (count implicit)))
+        (recur (+ i 1) (conj a (str-concat "  implicit " (dump/quote-text (nth implicit i)))))
+        a)))
+
 ;; The module being expanded as macro lookup sees it: its name, then the
-;; modules it uses in the order written, then its aliases by alias; then
-;; the modules each module re-exports, by module.
-(defun scope-lines :private (acc: (Vec str) ctx: ExpandCtx) -> (Vec str)
+;; modules it uses in the order written, then (with `implicit`) the
+;; implicit modules it sees, then its aliases by alias; then the modules
+;; each module re-exports, by module.
+(defun scope-lines :private (acc: (Vec str) ctx: ExpandCtx implicit: bool) -> (Vec str)
   (let ((scope (ctx-scope ctx)))
     (reexport-lines
       (alias-lines
-        (use-lines (conj acc (str-concat "scope " (dump/quote-text (. scope ns)))) (. scope uses))
+        (implicit-lines
+          (use-lines (conj acc (str-concat "scope " (dump/quote-text (. scope ns)))) (. scope uses))
+          (. scope implicit)
+          implicit)
         (aliases-sorted (. scope aliases)))
       (ctx-reexports ctx))))
 
@@ -239,15 +251,17 @@
 
 ;; Appends the context of ctx, the module ns of file home just expanded
 ;; (and not yet ended), to acc: `-- context NS`, the gensyms, the counters
-;; and the scope, the private and hidden type names, and the macros,
-;; structs and enums that are not in baseline. Positions in other files
-;; than home end `@FILE`, as in the dump of the forms. (`dump_context`)
-(defun dump-context (acc: (Vec str) ctx: ExpandCtx ns: str home: str baseline: Baseline) -> (Vec str)
+;; and the scope (with the implicit modules it sees when `implicit`), the
+;; private and hidden type names, and the macros, structs and enums that
+;; are not in baseline. Positions in other files than home end `@FILE`, as
+;; in the dump of the forms. (`dump_context`)
+(defun dump-context (acc: (Vec str) ctx: ExpandCtx ns: str home: str baseline: Baseline
+                     implicit: bool) -> (Vec str)
   (let ((c (ctx-counters ctx))
         (a (conj acc (str-concat "-- context " ns)))
         (a2 (conj a (str-concat "gensyms " (show (ctx-gensym-count ctx)))))
         (a3 (conj a2 (str-join ["counters steps " (show (. c steps)) " forms " (show (. c forms))])))
-        (a4 (scope-lines a3 ctx))
+        (a4 (scope-lines a3 ctx implicit))
         (a5 (type-name-lines a4 "private" (ctx-private-type-names ctx)))
         (a6 (type-name-lines a5 "hidden" (ctx-hidden-type-names ctx)))
         (all (entries ctx)))

@@ -7,14 +7,17 @@
 ;; for the gensyms) and returns the expansion.
 (ns expand.prelude.forms
   (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build
-        expand.prelude.parts)
+        expand.collections expand.prelude.parts)
   (:require [expand.core :as core] [syntax.print :as pr]))
 
-;; `(list a b)` ==> `(cons a (cons b empty))`; `(list)` ==> `empty`.
+;; `(list a b)` ==> `(fib.prelude/Cons a (fib.prelude/Cons b
+;; fib.prelude/Empty))`; `(list)` ==> `fib.prelude/Empty`. The variants are
+;; qualified so that a function or a method named `cons` or `empty` in
+;; scope is not what the list is built with (stdlib design C-3, C-4).
 (defun list-macro (items: (Vec Stx) pos: Pos) -> Stx
-  (loop ((i (- (count items) 1)) (acc (sym "empty" pos)))
+  (loop ((i (- (count items) 1)) (acc (sym (prelude-name "Empty") pos)))
     (if (>= i 1)
-        (recur (- i 1) (call "cons" [(nth items i) acc] pos))
+        (recur (- i 1) (call (prelude-name "Cons") [(nth items i) acc] pos))
         acc)))
 
 ;; A `plet` binding `(s e)` or `(s: T e)` (§1.5) as its parts, the name
@@ -44,12 +47,13 @@
            (base (trim-colons (unwrap-or (sym-of (nth xs 0)) "t")))
            (t (ctx-gensym ctx base pos))
            (thunk (list-form [(sym "fn" pos) (unit pos) e] pos))
-           (join (call "join" [t] pos)))
-       (Ok [(list-form [t (call "spawn" [thunk] pos)] pos)
+           (join (call (prelude-name "join") [t] pos)))
+       (Ok [(list-form [t (call (prelude-name "spawn") [thunk] pos)] pos)
             (list-form (conj (head-of xs (- (count xs) 1)) join) pos)])))))
 
-;; `(plet ((s1 e1) ...) body)` ==> `(let ((t1 (spawn (fn () e1))) ...)
-;; (let ((s1 (join t1)) ...) body))`, `t1 ...` gensyms (§3.12).
+;; `(plet ((s1 e1) ...) body)` ==> `(let ((t1 (fib.prelude/spawn (fn ()
+;; e1))) ...) (let ((s1 (fib.prelude/join t1)) ...) body))`, `t1 ...`
+;; gensyms (§3.12).
 (defun plet-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "plet" items 2 nil pos)
     ((Err e) (Err e))
@@ -112,7 +116,7 @@
                ((Ok step) (recur (+ i 1) (conj out step))))
              (Ok (list-form (conj out t) pos))))))))
 
-;; `(assert c)` / `(assert c msg)` ==> `(if c () (trap msg))`, the default
+;; `(assert c)` / `(assert c msg)` ==> `(if c () (fib.prelude/trap msg))`, the default
 ;; message naming the call's position and the test.
 (defun assert-macro (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "assert" items 1 (some 2) pos)
@@ -124,11 +128,12 @@
                         (string (str-join ["assert failed at " (pos-display pos) ": "
                                            (pr/stx-show (nth items 1))])
                                 pos))))
-       (Ok (call "if" [test (unit pos) (call "trap" [message] pos)] pos))))))
+       (Ok (call "if" [test (unit pos) (call (prelude-name "trap") [message] pos)] pos))))))
 
-;; `(dbg e)` ==> `(let ((t e)) (eprintln (str-concat "dbg POS: e = " (show t))) t)`:
-;; evaluates `e` once, prints it with `Show` to standard error with the
-;; call's position and the form as written, and returns it (§4.4).
+;; `(dbg e)` ==> `(let ((t e)) (fib.prelude/eprintln (fib.prelude/str-concat
+;; "dbg POS: e = " (fib.prelude/show t))) t)`: evaluates `e` once, prints
+;; it with `Show` to standard error with the call's position and the form
+;; as written, and returns it (§4.4).
 (defun dbg-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "dbg" items 1 (some 1) pos)
     ((Err e) (Err e))
@@ -137,7 +142,7 @@
            (t (ctx-gensym ctx "dbg" pos))
            (label (string (str-join ["dbg " (pos-display pos) ": " (pr/stx-show (nth items 1)) " = "])
                           pos))
-           (text (call "str-concat" [label (call "show" [t] pos)] pos))
+           (text (call (prelude-name "str-concat") [label (call (prelude-name "show") [t] pos)] pos))
            (binding (list-form [(list-form [t e] pos)] pos)))
-       (Ok (call "let" [binding (call "eprintln" [text] pos) t] pos))))))
+       (Ok (call "let" [binding (call (prelude-name "eprintln") [text] pos) t] pos))))))
 

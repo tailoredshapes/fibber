@@ -88,9 +88,9 @@ fn prelude_gensyms_do_not_capture_user_names() {
     assert_eq!(
         out,
         "(defun f (m doto) \
-         (let ((#m.1 m)) (loop ((i 0)) (if (< i #m.1) (do (g m doto) (recur (+ i 1))) ()))) \
+         (let ((#m.1 m)) (loop ((i 0)) (if (fib.prelude/< i #m.1) (do (g m doto) (recur (fib.prelude/+ i 1))) ()))) \
          (let ((#doto.2 m)) (h #doto.2 doto) #doto.2) \
-         (let ((#a.3 (spawn (fn () m)))) (let ((a (join #a.3))) a)))"
+         (let ((#a.3 (fib.prelude/spawn (fn () m)))) (let ((a (fib.prelude/join #a.3))) a)))"
     );
 }
 
@@ -124,7 +124,7 @@ fn splicing_at_several_levels() {
     let src =
         "(defmacro wrap (... xs) `(f [,@xs] (g ,@xs ,@xs) '(h ,@xs)))\n(defun k () (wrap a b))";
     let out = last(src);
-    let v = "(fib.prelude/conj (fib.prelude/conj (fib.prelude/vec-empty) a) b)";
+    let v = "(fib.prelude/vec-conj (fib.prelude/vec-conj (fib.prelude/vec-empty) a) b)";
     assert_eq!(
         out,
         format!("(defun k () (f {v} (g a b a b) (quote (h a b))))")
@@ -188,7 +188,10 @@ fn reflection_from_a_macro() {
                (defmacro fields (n) `(list ,@(struct-fields n)))\n\
                (defmacro no (n) (struct-fields n))\n\
                (defun f (p) (fields P))";
-    assert_eq!(last(src), "(defun f (p) (cons x (cons y empty)))");
+    assert_eq!(
+        last(src),
+        "(defun f (p) (fib.prelude/Cons x (fib.prelude/Cons y fib.prelude/Empty)))"
+    );
     let e = err("(defenum E (A x: i64))\n(defmacro no (n) (struct-fields n))\n(defun f () (no E))");
     assert_eq!(
         e.kind,
@@ -211,7 +214,7 @@ fn expr(src: &str) -> Result<String, ExpandError> {
 fn cond_with_no_clauses_is_a_trap() {
     assert_eq!(
         expr("(cond)").ok(),
-        Some("(trap \"cond: no clause matched at adv.fib:1:1\")".into())
+        Some("(fib.prelude/trap \"cond: no clause matched at adv.fib:1:1\")".into())
     );
 }
 
@@ -244,7 +247,7 @@ fn derive_on_a_generic_enum_with_a_recursive_field() {
         let head = format!("(impl {p} (Tree a) :where {ctx} ");
         assert!(form.starts_with(&head), "{form}");
     }
-    assert!(out[1].contains("((node #v.1 #l.2 #r.3) (match y ((node #v2.4 #l2.5 #r2.6) (if (= #v.1 #v2.4) (if (= #l.2 #l2.5) (= #r.3 #r2.6) false) false)) (_ false)))"), "{}", out[1]);
+    assert!(out[1].contains("((node #v.1 #l.2 #r.3) (match y ((node #v2.4 #l2.5 #r2.6) (if (fib.prelude/= #v.1 #v2.4) (if (fib.prelude/= #l.2 #l2.5) (fib.prelude/= #r.3 #r2.6) false) false)) (_ false)))"), "{}", out[1]);
 }
 
 #[test]
@@ -290,8 +293,8 @@ fn loop_bodies_with_recur_looking_user_symbols() {
     assert_eq!(
         out.ok(),
         Some(
-            "(let ((#m.1 n)) (loop ((i 0)) (if (< i #m.1) (do (recur-count i) \
-             (let ((recur 1) (m 2)) (+ recur m)) (recur (+ i 1))) ())))"
+            "(let ((#m.1 n)) (loop ((i 0)) (if (fib.prelude/< i #m.1) (do (recur-count i) \
+             (let ((recur 1) (m 2)) (+ recur m)) (recur (fib.prelude/+ i 1))) ())))"
                 .into()
         )
     );
@@ -308,7 +311,7 @@ fn loop_bodies_with_recur_looking_user_symbols() {
         out.ok(),
         Some(
             "(let ((#s.1 0) (#m.2 k)) (loop ((recur #s.1)) \
-             (if (< recur #m.2) (do (f recur) (recur (+ recur 1))) ())))"
+             (if (fib.prelude/< recur #m.2) (do (f recur) (recur (fib.prelude/+ recur 1))) ())))"
                 .into()
         )
     );
@@ -355,8 +358,8 @@ fn proposed_case_41_expands_with_an_evaluator() {
     assert_eq!(out[1], "(defstruct Point (x: i64 y: i64))");
     assert_eq!(
         out[2],
-        "(impl Eq Point (= (self y) (if (= (. self x) (. y x)) (= (. self y) (. y y)) false)) \
-         (!= (self y) (not (= self y))))"
+        "(impl Eq Point (= (self y) (if (fib.prelude/= (. self x) (. y x)) (fib.prelude/= (. self y) (. y y)) false)) \
+         (!= (self y) (fib.prelude/not (fib.prelude/= self y))))"
     );
     assert_eq!(
         out[3],
@@ -416,7 +419,7 @@ fn loop_bounds_are_evaluated_before_the_loop_variable_exists() {
         out.ok(),
         Some(
             "(let ((i 5)) (let ((#m.1 i)) (loop ((i 0)) \
-             (if (< i #m.1) (do (f i) (recur (+ i 1))) ()))))"
+             (if (fib.prelude/< i #m.1) (do (f i) (recur (fib.prelude/+ i 1))) ()))))"
                 .into()
         )
     );
@@ -425,7 +428,7 @@ fn loop_bounds_are_evaluated_before_the_loop_variable_exists() {
         out.ok(),
         Some(
             "(let ((#s.1 0) (#m.2 i)) (loop ((i #s.1)) \
-             (if (< i #m.2) (do (f i) (recur (+ i 1))) ())))"
+             (if (fib.prelude/< i #m.2) (do (f i) (recur (fib.prelude/+ i 1))) ())))"
                 .into()
         )
     );

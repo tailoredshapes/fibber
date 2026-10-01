@@ -20,7 +20,7 @@
 ;; - The counter is a `Cell` that the caller keeps; every form counted is
 ;;   written to it as it is counted, so that after TooLarge it holds the
 ;;   count that failed (Rust's `self.forms`).
-;; - The prelude's `(List a)` (`cons`, `empty`) is the stack.
+;; - The prelude's `(List a)` (`Cons`, `Empty`) is the stack.
 (ns expand.admit
   (:require [syntax.number :as number])
   (:use syntax.pos syntax.form syntax.error util.result expand.error))
@@ -52,17 +52,17 @@
   (let ((n (count items)))
     (loop ((i 0) (acc stack))
       (if (< i n)
-          (recur (+ i 1) (cons (nth items i) acc))
+          (recur (+ i 1) (Cons (nth items i) acc))
           acc))))
 
 ;; Counts the forms of `form` in `used`, failing with TooLarge at pos once
 ;; it passes limit, and checks its literals, failing with BadLiteral at the
 ;; literal; whether any literal was rounded.
 (defun admit-count :private (form: Stx pos: Pos used: (Cell i64) limit: i64) -> (Result bool ExpandError)
-  (loop ((stack (cons form empty)) (changed false))
+  (loop ((stack (Cons form Empty)) (changed false))
     (match stack
-      ((empty) (Ok changed))
-      ((cons f rest)
+      ((Empty) (Ok changed))
+      ((Cons f rest)
        (let ((n (+ @used 1)))
          (do (set! used n)
              (if (> n limit)
@@ -106,22 +106,22 @@
 (defun round-tree :private (root: Stx) -> Stx
   (match (frame-of root)
     (nil (round-leaf root))
-    ((some fr) (round-frames (cons fr empty)))))
+    ((some fr) (round-frames (Cons fr Empty)))))
 
 (defun round-frames :private (frames: (List Frame)) -> Stx
   (loop ((frames frames))
     (match frames
-      ((empty) (trap "expand.admit: no frame"))
-      ((cons top rest)
+      ((Empty) (trap "expand.admit: no frame"))
+      ((Cons top rest)
        (let ((items (seq-items (. top kind))))
          (if (< (. top idx) (count items))
              (let ((child (nth items (. top idx))))
                (match (frame-of child)
-                 ((some cf) (recur (cons cf frames)))
-                 (nil (recur (cons (frame-add top (round-leaf child)) rest)))))
+                 ((some cf) (recur (Cons cf frames)))
+                 (nil (recur (Cons (frame-add top (round-leaf child)) rest)))))
              (match rest
-               ((empty) (frame-form top))
-               ((cons parent more) (recur (cons (frame-add parent (frame-form top)) more))))))))))
+               ((Empty) (frame-form top))
+               ((Cons parent more) (recur (Cons (frame-add parent (frame-form top)) more))))))))))
 
 ;; Admits `form`, the result of an expansion of the call at pos: the form
 ;; with its f32 literals rounded, or TooLarge or BadLiteral. `used` is the

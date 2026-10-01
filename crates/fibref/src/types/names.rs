@@ -114,13 +114,29 @@ impl Globals {
                 return Found::One(t);
             }
         }
+        self.layer(
+            (from, &self.module(o).reexports),
+            (space, base, private_ok),
+            get,
+        )
+    }
+
+    /// What a layer of modules (a module's `:use`s, or its implicit
+    /// modules) exports under `base` to the module `from`: the one
+    /// definition they all agree on, or the two modules that differ.
+    fn layer<T: Copy + PartialEq>(
+        &self,
+        (from, mods): (ModuleId, &[ModuleId]),
+        key: (Space, &str, bool),
+        get: &impl Fn(&Names, &str) -> Option<T>,
+    ) -> Found<T> {
         let mut first: Option<(ModuleId, T)> = None;
-        for &r in &self.module(o).reexports {
-            match self.exported((from, r), (space, base, private_ok), get) {
+        for &u in mods {
+            match self.exported((from, u), key, get) {
                 Found::One(t) => match first {
-                    Some((f, other)) if other != t => return Found::Twice(f, r),
+                    Some((f, other)) if other != t => return Found::Twice(f, u),
                     Some(_) => {}
-                    None => first = Some((r, t)),
+                    None => first = Some((u, t)),
                 },
                 twice @ Found::Twice(..) => return twice,
                 Found::Nowhere => {}
@@ -133,7 +149,11 @@ impl Globals {
     /// module's binding of a base name; `private_ok`: `(var m/x)` sees
     /// private definitions too). The module's own definition shadows
     /// every other; else what its `:use`d modules export, which must not
-    /// disagree (syntax §5), shadows the prelude and the builtins.
+    /// disagree (syntax §5), shadows what its implicit modules export
+    /// (which must not disagree either: a bare name two of them export
+    /// differently is an error, and so is one that two parts of one
+    /// implicit module do; the library's gate `lib_disjoint` keeps that
+    /// from happening), which shadows the prelude and the builtins.
     fn find<T: Copy + PartialEq>(
         &self,
         (m, name): (ModuleId, &str),
@@ -149,22 +169,15 @@ impl Globals {
         if let Some(t) = own(owner) {
             return Found::One(t);
         }
-        let mut first: Option<(ModuleId, T)> = None;
-        for &u in &info.uses {
-            match self.exported((m, u), (space, base, private_ok), &get) {
-                Found::One(t) => match first {
-                    Some((f, other)) if other != t => return Found::Twice(f, u),
-                    Some(_) => {}
-                    None => first = Some((u, t)),
-                },
-                twice @ Found::Twice(..) => return twice,
+        let key = (space, base, private_ok);
+        for layer in [&info.uses, &info.implicit] {
+            match self.layer((m, layer), key, &get) {
                 Found::Nowhere => {}
+                found => return found,
             }
         }
-        if let Some((_, t)) = first {
-            return Found::One(t);
-        }
-        info.chain[1 + info.uses.len()..]
+        let rest = 1 + info.uses.len() + info.implicit.len();
+        info.chain[rest..]
             .iter()
             .find_map(|o| own(*o))
             .map_or(Found::Nowhere, Found::One)
