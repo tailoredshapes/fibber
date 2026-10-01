@@ -1,5 +1,6 @@
 //! Cells (types §8.6): `@c`, `(set! c v)`, `(cell e)`, and
-//! `set-field!`. Atoms and weak references come with threads.
+//! `set-field!`. Atoms and weak references come with threads; `@t` of
+//! a task is `join` (threads.rs).
 
 use fibref::types::ast::{BindingId, Expr, Place};
 use fibref::types::decls::Shape;
@@ -28,9 +29,14 @@ impl<'a> Cx<'_, 'a> {
 
     pub fn deref_val(&mut self, c: &V, t: &Ty) -> R<V> {
         let (con, content) = match t {
-            Ty::Con(con @ (Con::Cell | Con::Atom | Con::Weak), args) => (*con, args[0].clone()),
+            Ty::Con(con @ (Con::Cell | Con::Atom | Con::Weak | Con::Task), args) => {
+                (*con, args[0].clone())
+            }
             _ => return Err(Unsupported("deref of a non-cell".into())),
         };
+        if con == Con::Task {
+            return self.join_value(c, &content);
+        }
         if con == Con::Weak {
             return self.upgrade(c, &content);
         }

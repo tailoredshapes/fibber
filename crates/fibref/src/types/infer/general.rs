@@ -234,7 +234,7 @@ impl Cx<'_> {
                 ),
                 DKind::Deref(_, _, text) => (
                     ErrorKind::DerefUnresolved,
-                    format!("cannot infer whether {text} is a cell, an atom or a weak reference"),
+                    format!("cannot infer whether {text} is a cell, an atom, a weak reference or a task"),
                 ),
                 DKind::Float(t) => (
                     ErrorKind::Ambiguous,

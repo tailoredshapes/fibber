@@ -45,8 +45,42 @@ const SAMPLES: &[(&str, &str)] = &[
         "derive",
         "(defstruct (P t) (a: i64 b: t)) (derive Eq P) (derive Ord P) (derive Hash P) \
          (derive Show P) (defenum T (K) (L x: i64 y: str)) (derive Eq T) (derive Ord T) \
-         (derive Hash T) (derive Show T)",
+         (derive Hash T) (derive Show T) (derive Debug P) (derive ToStr P) (derive Debug T) \
+         (derive ToStr T)",
     ),
+    ("defn", "(defn m \"doc\" [x: i64] -> i64 (f x))"),
+    ("defn-", "(defn- m [x] (f x))"),
+    (
+        "update",
+        "(defun m () (do (update a b f x) (update a b (fnil g d)) (update a b (fnil g d) x)))",
+    ),
+    (
+        "reduce",
+        "(defun m () (do (reduce f c) (reduce + c) (reduce (fn (a x) (if p (reduced a) (g a x))) 0 c)))",
+    ),
+    ("str", "(defun m () (str a \"s\" nil (f b)))"),
+    ("println", "(defun m () (println a \"s\" nil (f b)))"),
+    ("print", "(defun m () (print a \"s\" nil (f b)))"),
+    ("prn", "(defun m () (prn a \"s\" nil (f b)))"),
+    ("pr", "(defun m () (pr a \"s\" nil (f b)))"),
+    ("+", "(defun m () (+ a b c))"),
+    ("-", "(defun m () (- a b c))"),
+    ("*", "(defun m () (* a b c))"),
+    ("<", "(defun m () (< a (f b) c))"),
+    (">", "(defun m () (> a (f b) c))"),
+    ("<=", "(defun m () (<= a (f b) c))"),
+    (">=", "(defun m () (>= a (f b) c))"),
+    ("=", "(defun m () (= a (f b) c))"),
+    ("max", "(defun m () (max a b c))"),
+    ("min", "(defun m () (min a b c))"),
+    ("bit-and", "(defun m () (bit-and a b c))"),
+    ("bit-or", "(defun m () (bit-or a b c))"),
+    ("bit-xor", "(defun m () (bit-xor a b c))"),
+    ("conj", "(defun m () (conj c x y))"),
+    ("assoc", "(defun m () (assoc m a 1 b 2))"),
+    ("dissoc", "(defun m () (dissoc m a b))"),
+    ("merge", "(defun m () (merge a nil b c))"),
+    ("swap!", "(defun m () (swap! a f x))"),
 ];
 
 /// Every symbol the text uses, anywhere.
@@ -96,13 +130,19 @@ fn heads(f: &Form, out: &mut Vec<String>) {
 
 /// The heads of `out` that are not core forms, gensyms, `self` and `y`
 /// (the derived methods' parameters), `_` (a wildcard clause), qualified
-/// into the prelude, or names the sample's own text uses.
+/// into the prelude or a library facade (`fib.core`: R5's `to-str` and
+/// `debug`, R6b's `Done` and `More`; `fib.seq` and `fib.coll`: R6b's
+/// `reduce-while`, `update-or`), or names
+/// the sample's own text uses.
 fn bare_heads(text: &BTreeSet<String>, out: &[Form]) -> Vec<String> {
     let mut all = Vec::new();
     out.iter().for_each(|f| heads(f, &mut all));
     all.retain(|h| {
         let own = text.contains(h) || ["self", "y", "_"].contains(&h.as_str());
-        !(is_core(h) || h.starts_with('#') || h.starts_with("fib.prelude/") || own)
+        let qualified = ["fib.prelude/", "fib.core/", "fib.seq/", "fib.coll/"]
+            .iter()
+            .any(|ns| h.starts_with(ns));
+        !(is_core(h) || h.starts_with('#') || qualified || own)
     });
     all
 }
@@ -141,4 +181,22 @@ fn the_walk_flags_a_bare_head() {
     let mut text = BTreeSet::new();
     text_symbols(&read("(derive Eq P)"), &mut text);
     assert_eq!(bare_heads(&text, &derived), ["=", "not", "="]);
+}
+
+#[test]
+fn an_operator_macro_emits_none_of_its_own_bare_name() {
+    // The sample's text must write the operator, so the check above would
+    // let a bare `+` through (R6a): these samples call it with arguments
+    // that are not calls of it, so every head of the output is the
+    // expansion's.
+    for name in [
+        "+", "-", "*", "<", ">", "<=", ">=", "=", "max", "min", "bit-and", "bit-or", "bit-xor",
+        "conj", "assoc", "dissoc", "merge", "swap!",
+    ] {
+        let src = SAMPLES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
+        let out = program(src.unwrap_or("")).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut all = Vec::new();
+        out.iter().for_each(|f| heads(f, &mut all));
+        assert!(!all.iter().any(|h| h == name), "{name}: heads {all:?}");
+    }
 }

@@ -47,11 +47,16 @@ impl<'p> Interp<'p> {
     }
 
     /// `@c` on a value; on an atom or a weak reference, a scheduling
-    /// point first. `at` places an upgrade's `Option`.
+    /// point first. `at` places an upgrade's `Option`. On a task it is
+    /// `join` (types §2.9, owner's rule 2026-10-01): the task's result
+    /// retained for the caller, the scheduling point and the waiting
+    /// those of `join`.
     pub fn deref_val(&mut self, c: &Val, at: Placement) -> R<Val> {
         let id = c.expect_obj("the operand of @")?;
-        if matches!(self.objs.get(&self.heap, id)?, Obj::Atom(_) | Obj::Weak(_)) {
-            self.tick()?;
+        match self.objs.get(&self.heap, id)? {
+            Obj::Task(_) => return self.join(c),
+            Obj::Atom(_) | Obj::Weak(_) => self.tick()?,
+            _ => {}
         }
         if let Obj::Weak(target) = self.objs.get(&self.heap, id)? {
             let target = *target;

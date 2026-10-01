@@ -5,9 +5,9 @@
 ;;    page's sketch said `unwrap: nil`, which is L2's function).
 ;;  - Truthy over (Option a) is `some` and not Clojure's falsy `false` inside it: (Option bool) needs
 ;;    L20's checker rule, a library instance cannot tell (stdlib §2.4).
-;;  - `/` is Div's method here: in every module that :uses fib.core the builtin `/` is shadowed, and Div
-;;    has no instance until L1, so integer division is `quot` (R3) and library code never writes `/`
-;;    on integers (plan PC-14; case 018).
+;;  - `/` is Div's method here: in every module that :uses fib.core the builtin `/` is shadowed (the
+;;    instances are fib.core.num's), so integer division is `quot` (R3) and library code never writes `/`
+;;    on integers (plan PC-14).
 (ns fib.core.protocols (:use fib.core.base))
 ;; a predicate's result is bool or an Option; Payload says what `some` returns
 (defprotocol Truthy (truthy? (self) -> bool))
@@ -34,4 +34,26 @@
 (defprotocol ToStr (to-str (self) -> str))
 (defprotocol Debug (debug (self) -> str))
 (impl ToStr str (to-str (self) self))
-(impl Debug str (debug (self) (str-concat "\"" (str-concat self "\""))))
+;; Debug of a string is Clojure's pr: quoted, with the seven characters char-escape-string names written as
+;; \" \\ \n \t \r \f \b and every other character, NUL and every scalar width included, as it is. Each escaped
+;; character is one ASCII byte, which no byte of a longer UTF-8 sequence is, so the text is cut and joined on bytes.
+(defun debug-escape :private (b: i8) -> str
+  (cond ((= b 34i8) "\\\"")
+        ((= b 92i8) "\\\\")
+        ((= b 10i8) "\\n")
+        ((= b 9i8) "\\t")
+        ((= b 13i8) "\\r")
+        ((= b 12i8) "\\f")
+        ((= b 8i8) "\\b")
+        (true "")))
+(defun debug-str :private (s: str) -> str
+  (let ((bs (str-bytes s))
+        (n (str-len s)))
+    (loop ((i 0) (from 0) (parts (vec-conj (vec-empty) "\"")))
+      (if (< i n)
+          (let ((e (debug-escape (array-get bs i))))
+            (if (= (str-len e) 0)
+                (recur (+ i 1) from parts)
+                (recur (+ i 1) (+ i 1) (vec-conj (vec-conj parts (str-slice s from i)) e))))
+          (str-join (vec-conj (vec-conj parts (str-slice s from n)) "\""))))))
+(impl Debug str (debug (self) (debug-str self)))

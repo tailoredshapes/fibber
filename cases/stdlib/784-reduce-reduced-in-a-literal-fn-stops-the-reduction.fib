@@ -1,0 +1,59 @@
+;; spec:   stdlib §2.1 rule 3, §4.4 (rows reduce reduced), §6.3 (R6b, PC-6), Appendix A11 e20
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce reduced
+;; (reduce (fn (acc x) (if (> acc 10) (reduced acc) (+ acc x))) 0 [5 6 7 8 9]) is 11
+;; (A11 e20): the macro rewrites each tail of a literal fn, (reduced e) to a Done and
+;; any other value to a More, and calls reduce-while, so f's type stays (fn (a e) a).
+;; The same through the forms a tail passes (let, do, match, cond, if-let, loop), over an infinite source that only the stop ends (Nat, whose each-while
+;; never runs out: 105 as the page says), over every kind of source, with f called
+;; exactly as many times as it takes to stop, and with a string accumulator.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Nat (from: i64))
+
+(impl (Reducible i64) Nat
+  (each-while (self k)
+    (loop ((i (. self from))) (if (k i) (recur (+ i 1)) false))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (do (check c (= (reduce (fn (acc x) (if (> acc 10) (reduced acc) (+ acc x))) 0 [5 6 7 8 9]) 11))
+        (check c (= (reduce (fn (acc x) (do (set! calls (+ @calls 1))
+                                            (if (> acc 10) (reduced acc) (+ acc x))))
+                            0 [5 6 7 8 9])
+                    11))
+        (check c (= @calls 3))
+        (check c (= (reduce (fn (acc x) (if (>= acc 100) (reduced acc) (+ acc x))) 0 (Nat 0)) 105))
+        (check c (= (reduce (fn (acc x) (if (> x 9) (reduced acc) (+ acc x))) 0 (Nat 1)) 45))
+        (check c (= (reduce (fn (acc x) (if (> acc 3) (reduced -1) (+ acc x))) 0 (list 1 2 3 4 5)) -1))
+        (check c (= (reduce (fn (acc x) (if (> acc 3) (reduced acc) (+ acc x))) 0 (some 9)) 9))
+        (check c (= (reduce (fn (acc x) (reduced 7)) 0 (VSeq (list 1) [2 3] 0)) 7))
+        (check c (= (reduce (fn (acc x) (reduced 7)) 0 (vec-empty)) 0))
+        (check c (= (reduce (fn (acc x) (let ((n (+ acc x)))
+                                          (do (if (> n 20) (reduced n) (+ n 0)))))
+                            0 [4 8 12 16])
+                    24))
+        (check c (= (reduce (fn (acc x) (match x
+                                          (3 (reduced (* acc 100)))
+                                          (_ (+ acc x))))
+                            0 [1 2 3 4])
+                    300))
+        (check c (= (reduce (fn (acc x) (cond ((> acc 6) (reduced acc))
+                                              ((= x 0) acc)
+                                              (true (+ acc x))))
+                            0 [1 0 2 0 3 4 5])
+                    10))
+        (check c (= (reduce (fn (acc x) (if-let (y (if (> x 2) (some x) nil)) (reduced (+ acc y)) (+ acc 1)))
+                            0 [1 2 3 4])
+                    5))
+        (check c (= (reduce (fn (acc x) (loop ((i 0) (t acc))
+                                          (if (< i x) (recur (+ i 1) (+ t 1)) (if (> t 5) (reduced t) t))))
+                            0 [2 2 2 2])
+                    6))
+        (check c (= (reduce (fn (acc x) (if (= (str-len acc) 3) (reduced acc) (str-concat acc x))) "" ["a" "b" "c" "d"])
+                    "abc"))
+        (checks-result c))))

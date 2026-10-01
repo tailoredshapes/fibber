@@ -1,0 +1,27 @@
+;; spec:   types §2.9, §8.8; syntax §3.11
+;; expect: accept
+;; result: 255
+;; audit:  clean
+;; @t of a task is (join t), as Clojure's @f of a future is: the thread's result, retained for the
+;; caller. Each probe sets one bit of the result, so a probe that fails lowers it in its own bit:
+;; an i64 result, `@` of the very expression (spawn ..) and `@` beside `join` on one handle, a Vec,
+;; a str, a struct, an Option and a unit result. An object result is read through `@` and the task
+;; still holds its own count, so the audit is what shows a missing or a doubled retain.
+(defstruct P (x: i64 name: str))
+
+(defun main () -> i64
+  (let ((ti (spawn (fn () 40)))
+        (tv (spawn (fn () [1 2 3])))
+        (ts (spawn (fn () "four")))
+        (tp (spawn (fn () (P 5 "five"))))
+        (to (spawn (fn () (some 6))))
+        (tn (spawn (fn () (if (< 1 0) (some 7) nil))))
+        (tu (spawn (fn () ()))))
+    (+ (if (= @ti 40) 1 0)
+       (+ (if (= @(spawn (fn () 41)) 41) 2 0)
+          (+ (if (= (+ @ti (join ti)) 80) 4 0)
+             (+ (if (and (= (count @tv) 3) (= (nth @tv 2) 3)) 8 0)
+                (+ (if (= (str-len @ts) 4) 16 0)
+                   (+ (if (and (= (. @tp x) 5) (= (str-len (. @tp name)) 4)) 32 0)
+                      (+ (if (match @to ((some x) (= x 6)) (nil false)) 64 0)
+                         (if (and (nil? @tn) (= (do @tu 1) 1)) 128 0))))))))))

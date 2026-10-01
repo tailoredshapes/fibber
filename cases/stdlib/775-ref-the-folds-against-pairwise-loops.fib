@@ -1,0 +1,94 @@
+;; spec:   stdlib §8.1 item 2 (a differential test against a naive reference), §6.3 (R6a)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: + * - < > <= >= = max min bit-and bit-or
+;; The folds of R6a against five-line loops over the prelude's own vec-count and vec-nth (the
+;; data structure is not under test), on 300 seeded rows of five values below 6 (small, so that
+;; ties, which decide < against <=, are common): each of + * - max min bit-and bit-or bit-xor
+;; at three, four and five operands against the binary builtin applied from the left, and each of
+;; < > <= >= = at three, four and five operands against the pairwise test of every neighbour. The
+;; last check is the planted fault: the same sweep with a reference that is wrong by one, run
+;; against a second Checks; the case fails unless that run found a difference.
+(ns main (:use fib.core tl.rng tl.check))
+
+(defun vlen (v: (Vec i64)) -> i64 (fib.prelude/count v))
+(defun vat (v: (Vec i64) i: i64) -> i64 (fib.prelude/nth v i))
+
+;; the operation `op` (0 + 1 * 2 - 3 max 4 min 5 bit-and 6 bit-or 7 bit-xor) on two values
+(defun step (op: i64 a: i64 b: i64) -> i64
+  (cond ((= op 0) (+ a b))
+        ((= op 1) (* a b))
+        ((= op 2) (- a b))
+        ((= op 3) (max a b))
+        ((= op 4) (min a b))
+        ((= op 5) (bit-and a b))
+        ((= op 6) (bit-or a b))
+        (true (bit-xor a b))))
+
+;; the first n values of v folded from the left by op, plus skew
+(defun ref-fold (v: (Vec i64) n: i64 op: i64 skew: i64) -> i64
+  (loop ((i 1) (acc (vat v 0)))
+    (if (< i n) (recur (+ i 1) (step op acc (vat v i))) (+ acc skew))))
+
+;; the relation `rel` (0 < 1 > 2 <= 3 >= 4 =) between two values
+(defun relation (rel: i64 a: i64 b: i64) -> bool
+  (cond ((= rel 0) (< a b))
+        ((= rel 1) (> a b))
+        ((= rel 2) (<= a b))
+        ((= rel 3) (>= a b))
+        (true (= a b))))
+
+;; does it hold between every two neighbours of the first n values of v? (skewed: the opposite)
+(defun ref-chain (v: (Vec i64) n: i64 rel: i64 skew: i64) -> bool
+  (let ((all (loop ((i 0) (ok true))
+               (if (< (+ i 1) n) (recur (+ i 1) (and ok (relation rel (vat v i) (vat v (+ i 1))))) ok))))
+    (if (= skew 0) all (not all))))
+
+(defun fold-checks (c: Checks v: (Vec i64) op: i64 skew: i64) -> unit
+  (let ((a (vat v 0)) (b (vat v 1)) (d (vat v 2)) (e (vat v 3)) (f (vat v 4)))
+    (do (check c (= (fold3 op a b d) (ref-fold v 3 op skew)))
+        (check c (= (fold4 op a b d e) (ref-fold v 4 op skew)))
+        (check c (= (fold5 op a b d e f) (ref-fold v 5 op skew))))))
+
+;; the macro forms, one call each: op selects which
+(defun fold3 (op: i64 a: i64 b: i64 c: i64) -> i64
+  (cond ((= op 0) (+ a b c)) ((= op 1) (* a b c)) ((= op 2) (- a b c)) ((= op 3) (max a b c))
+        ((= op 4) (min a b c)) ((= op 5) (bit-and a b c)) ((= op 6) (bit-or a b c)) (true (bit-xor a b c))))
+(defun fold4 (op: i64 a: i64 b: i64 c: i64 d: i64) -> i64
+  (cond ((= op 0) (+ a b c d)) ((= op 1) (* a b c d)) ((= op 2) (- a b c d)) ((= op 3) (max a b c d))
+        ((= op 4) (min a b c d)) ((= op 5) (bit-and a b c d)) ((= op 6) (bit-or a b c d)) (true (bit-xor a b c d))))
+(defun fold5 (op: i64 a: i64 b: i64 c: i64 d: i64 e: i64) -> i64
+  (cond ((= op 0) (+ a b c d e)) ((= op 1) (* a b c d e)) ((= op 2) (- a b c d e)) ((= op 3) (max a b c d e))
+        ((= op 4) (min a b c d e)) ((= op 5) (bit-and a b c d e)) ((= op 6) (bit-or a b c d e)) (true (bit-xor a b c d e))))
+
+(defun chain3 (rel: i64 a: i64 b: i64 c: i64) -> bool
+  (cond ((= rel 0) (< a b c)) ((= rel 1) (> a b c)) ((= rel 2) (<= a b c)) ((= rel 3) (>= a b c)) (true (= a b c))))
+(defun chain4 (rel: i64 a: i64 b: i64 c: i64 d: i64) -> bool
+  (cond ((= rel 0) (< a b c d)) ((= rel 1) (> a b c d)) ((= rel 2) (<= a b c d)) ((= rel 3) (>= a b c d)) (true (= a b c d))))
+(defun chain5 (rel: i64 a: i64 b: i64 c: i64 d: i64 e: i64) -> bool
+  (cond ((= rel 0) (< a b c d e)) ((= rel 1) (> a b c d e)) ((= rel 2) (<= a b c d e)) ((= rel 3) (>= a b c d e))
+        (true (= a b c d e))))
+
+(defun chain-checks (c: Checks v: (Vec i64) rel: i64 skew: i64) -> unit
+  (let ((a (vat v 0)) (b (vat v 1)) (d (vat v 2)) (e (vat v 3)) (f (vat v 4)))
+    (do (check c (= (chain3 rel a b d) (ref-chain v 3 rel skew)))
+        (check c (= (chain4 rel a b d e) (ref-chain v 4 rel skew)))
+        (check c (= (chain5 rel a b d e f) (ref-chain v 5 rel skew))))))
+
+(defun sweep (c: Checks seed: i64 skew: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (n 300)
+      (let ((v (rng-vec r 5 6)))
+        (do (dotimes (op 8) (fold-checks c v op skew))
+            (dotimes (rel 5) (chain-checks c v rel skew)))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 31 0)
+        (sweep p 31 1)
+        (check c (= (checks-made c) 11700))
+        (check-detects c p)
+        (checks-result c))))

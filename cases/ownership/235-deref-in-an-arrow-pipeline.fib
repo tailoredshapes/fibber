@@ -1,0 +1,22 @@
+;; spec:   types §2.9; syntax §3.11
+;; expect: accept
+;; result: 127
+;; audit:  clean
+;; @ on a task wherever a cell's @ may stand, and `deref` as a name. One bit per probe: `@t` as the
+;; first form of a `->`, the name `deref` as a step of a `->` and of a `->>`, a task made in the
+;; pipeline's head, `deref` as a function value over a Vec of tasks (the method of the Deref instance
+;; of (Task a), which the interpreter and the compiled run each carry as a native method), and the
+;; same value through a parameter of a generic function that reads it with @ and a bound on nothing
+;; else (the head is known where the call is typed, so the instance is found, not deferred).
+(defun read-it (t: (Task a)) -> a @t)
+
+(defun main () -> i64
+  (let ((t (spawn (fn () 10)))
+        (ts [(spawn (fn () 1)) (spawn (fn () 2)) (spawn (fn () 3))]))
+    (+ (if (= (-> @t (+ 1)) 11) 1 0)
+       (+ (if (= (-> t deref (+ 2)) 12) 2 0)
+          (+ (if (= (->> t deref (- 30)) 20) 4 0)
+             (+ (if (= (-> (spawn (fn () 5)) deref (* 3)) 15) 8 0)
+                (+ (if (= (nth (map deref ts) 2) 3) 16 0)
+                   (+ (if (= (read-it t) 10) 32 0)
+                      (if (= (count (map deref ts)) 3) 64 0)))))))))

@@ -1,0 +1,26 @@
+;; spec:   stdlib §2.1 rule 2 (a recipe made by the rewrite occurs once, so it may be fused), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map count sum
+;; The rewrite builds a recipe only as the argument of the consumer or stage that holds it, which
+;; is why the stages under it may run once per element without a memo. A program that builds a recipe itself
+;; (the constructors are exported, case 260) may hold it and walk it twice, so the rewrite does not look
+;; inside it: here the source of a hand-made `Mapped` is a bound-free lazy `(map f ..)`, which is a memoised seq,
+;; and two walks of the recipe call g six times and f three times, as they would without the rewrite. Had the
+;; rewrite fused the source into the recipe, f would have run six times.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (fcalls (cell 0))
+        (gcalls (cell 0)))
+    (let ((f (fn (x: i64) (do (set! fcalls (+ @fcalls 1)) (* x 2))))
+          (g (fn (x: i64) (do (set! gcalls (+ @gcalls 1)) (+ x 1)))))
+      (let ((r (Mapped (map f [1 2 3]) g)))
+        (do (check c (= (count r) 3))
+            (check c (= (sum r) 15))
+            (check c (= @fcalls 3))
+            (check c (= @gcalls 6))
+            (checks-result c))))))

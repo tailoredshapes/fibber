@@ -52,26 +52,57 @@ fn cond_rejects_bad_clauses() {
 
 #[test]
 fn if_let_and_when_let_are_match() {
+    // The else is a wildcard, so a refutable pattern falls to it (E13).
     assert_eq!(
         ex("(if-let (x e) a b)"),
-        "(match e ((fib.prelude/some x) a) (nil b))"
+        "(match e ((fib.prelude/some x) a) (_ b))"
     );
     assert_eq!(
         ex("(when-let (x e) a b)"),
-        "(match e ((fib.prelude/some x) (do a b)) (nil ()))"
-    );
-    let e = ex_err("(if-let (x e) a)");
-    let expected = "3".to_string();
-    assert_eq!(
-        e.kind,
-        K::MacroArity {
-            name: "if-let".into(),
-            expected,
-            found: 2
-        }
+        "(match e ((fib.prelude/some x) (do a b)) (_ ()))"
     );
     let e = ex_err("(if-let x a b)");
     assert!(matches!(e.kind, K::Malformed { ref head, .. } if head == "if-let"));
+}
+
+#[test]
+fn if_let_takes_any_pattern_and_has_an_optional_else() {
+    // E13: `[a b]` is refutable; the expansion puts it under `some` and
+    // leaves the mismatch to the wildcard clause.
+    assert_eq!(
+        ex("(if-let ([a b] o) a b)"),
+        "(match o ((fib.prelude/some [a b]) a) (_ b))"
+    );
+    assert_eq!(
+        ex("(if-let ((P a b) o) a b)"),
+        "(match o ((fib.prelude/some (P a b)) a) (_ b))"
+    );
+    assert_eq!(
+        ex("(when-let ([a & r] o) a)"),
+        "(match o ((fib.prelude/some [a & r]) a) (_ ()))"
+    );
+    // The else may be left out: it is `()`.
+    assert_eq!(
+        ex("(if-let (x e) a)"),
+        "(match e ((fib.prelude/some x) a) (_ ()))"
+    );
+}
+
+#[test]
+fn if_let_arity_is_two_or_three() {
+    for (src, found) in [("(if-let)", 0), ("(if-let (x e) a b c)", 4)] {
+        let e = ex_err(src);
+        let expected = "2 to 3".to_string();
+        assert_eq!(
+            e.kind,
+            K::MacroArity {
+                name: "if-let".into(),
+                expected,
+                found
+            },
+            "{src}"
+        );
+    }
 }
 
 #[test]
@@ -125,15 +156,18 @@ fn for_each_over_a_literal_range_is_a_loop() {
 }
 
 #[test]
-fn range_takes_one_or_two_arguments() {
+fn range_takes_one_or_two_arguments_and_declines_three() {
     // (range a b) is the rewrite to the library's range-between; (range
     // n) stays the library function, which is also range's value.
     assert_eq!(ex("(range a b)"), "(fib.prelude/range-between a b)");
     assert_eq!(ex("(range n)"), "(range n)");
     assert_eq!(ex("(map range xs)"), "(map range xs)");
-    let e = ex_err("(range a b c)");
-    assert!(matches!(e.kind, K::MacroArity { ref name, .. } if name == "range"));
+    // (range a b step) is the library's range-by: declined, so the
+    // checker's arity error of the library function names it (D1).
+    assert_eq!(ex("(range a b c)"), "(range a b c)");
     let e = ex_err("(range)");
+    assert!(matches!(e.kind, K::MacroArity { ref name, .. } if name == "range"));
+    let e = ex_err("(range a b c d)");
     assert!(matches!(e.kind, K::MacroArity { ref name, .. } if name == "range"));
 }
 

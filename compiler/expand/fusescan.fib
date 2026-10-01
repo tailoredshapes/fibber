@@ -1,0 +1,241 @@
+;; compiler/expand/fusescan.fib: what the fusion rewrite reads off the
+;; expanded forms before it rewrites any, as
+;; crates/fibref/src/expand/fuse/scan.rs: the names a top-level form binds
+;; anywhere (**B**), the names a module defines at top level, and whether a
+;; form calls a terminal consumer at all. Every scan over-approximates: a
+;; name that is bound, defined or called where it need not be only keeps a
+;; call from being fused, never the other way.
+;;
+;; Shapes decided where Rust and fibber differ: the Rust `HashSet<String>`s
+;; are `(Map str bool)` of `true`, as the context's are; the Rust scans use
+;; an explicit stack, here a vector that grows as the items of a form are
+;; appended and is read by index (the scans make a set or a boolean, so the
+;; order does not matter); `Defined { all, public }` is the struct
+;; `Defined`. The small helpers that expand.fuse shares are exported with
+;; the prefix `fuse-`.
+(ns expand.fusescan
+  (:use syntax.pos syntax.form expand.build expand.private expand.fusetab))
+
+;; Whether the set has the name.
+(defun fuse-has-name? (m: (Map str bool) k: str) -> bool
+  (some? (map-get m k)))
+
+;; The items of a list, vector or map form, none for an atom.
+(defun items-in :private (f: Stx) -> (Vec Stx)
+  (match (. f kind)
+    ((SList items) items)
+    ((SVec items) items)
+    ((SMap items) items)
+    (_ (vec-empty))))
+
+;; The items of a list; none for any other form.
+(defun fuse-list-items (f: Stx) -> (Vec Stx)
+  (match (. f kind)
+    ((SList items) items)
+    (_ (vec-empty))))
+
+(defun fuse-list-form? (f: Stx) -> bool
+  (match (. f kind)
+    ((SList _) true)
+    (_ false)))
+
+(defun fuse-sym-of (f: Stx) -> (Option str)
+  (match (. f kind)
+    ((SSym s) (some s))
+    (_ nil)))
+
+;; The symbol of item i, if there is one.
+(defun fuse-item-sym (items: (Vec Stx) i: i64) -> (Option str)
+  (if (< i (count items)) (fuse-sym-of (nth items i)) nil))
+
+;; The items of `more` after those of `work`.
+(defun append-items :private (work: (Vec Stx) more: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 0) (acc work))
+    (if (< i (count more)) (recur (+ i 1) (conj acc (nth more i))) acc)))
+
+;; `s` without its colon, if it ends in one. (`strip_suffix(':')`)
+(defun strip-colon :private (s: str) -> (Option str)
+  (let ((bs (str-bytes s)))
+    (if (and (> (array-len bs) 0) (= (array-get bs (- (array-len bs) 1)) 58i8))
+        (some (str-slice s 0 (- (str-len s) 1)))
+        nil)))
+
+;; The set with the symbol `s`, and, if it is written `x:`, `x` (not the
+;; empty name).
+(defun add-name :private (out: (Map str bool) s: str) -> (Map str bool)
+  (let ((with-s (assoc out s true)))
+    (match (strip-colon s)
+      ((some bare) (if (> (str-len bare) 0) (assoc with-s bare true) with-s))
+      (nil with-s))))
+
+;; Adds every symbol inside `form` to `out`. (scan::add_symbols)
+(defun add-symbols :private (form: Stx out: (Map str bool)) -> (Map str bool)
+  (loop ((work [form]) (i 0) (acc out))
+    (if (< i (count work))
+        (let ((f (nth work i)))
+          (match (. f kind)
+            ((SSym s) (recur work (+ i 1) (add-name acc s)))
+            (_ (recur (append-items work (items-in f)) (+ i 1) acc))))
+        acc)))
+
+;; Adds the symbols of item i of `items`, if there is one.
+(defun add-item :private (items: (Vec Stx) i: i64 out: (Map str bool)) -> (Map str bool)
+  (if (< i (count items)) (add-symbols (nth items i) out) out))
+
+;; `fn`: its name and its parameters.
+(defun binds-fn :private (items: (Vec Stx) out: (Map str bool)) -> (Map str bool)
+  (let ((named (and (> (count items) 1) (some? (fuse-sym-of (nth items 1))))))
+    (add-item items (if named 2 1) (if named (add-item items 1 out) out))))
+
+;; `let` and `loop`: `(pattern expr)` binds the pattern; `(name: type expr)`
+;; binds the name and says the type: never the expression.
+(defun binds-let :private (items: (Vec Stx) out: (Map str bool)) -> (Map str bool)
+  (let ((pairs (if (> (count items) 1) (fuse-list-items (nth items 1)) (vec-empty))))
+    (loop ((i 0) (acc out))
+      (if (< i (count pairs))
+          (let ((parts (fuse-list-items (nth pairs i))))
+            (recur (+ i 1)
+                   (if (= (count parts) 3)
+                       (add-item parts 1 (add-item parts 0 acc))
+                       (add-item parts 0 acc))))
+          acc))))
+
+;; `match`: the pattern of each clause.
+(defun binds-match :private (items: (Vec Stx) out: (Map str bool)) -> (Map str bool)
+  (loop ((i 2) (acc out))
+    (if (< i (count items))
+        (recur (+ i 1) (add-item (fuse-list-items (nth items i)) 0 acc))
+        acc)))
+
+;; `defun`: its name and the first list after it, its parameters.
+(defun binds-defun :private (items: (Vec Stx) out: (Map str bool)) -> (Map str bool)
+  (let ((named (add-item items 1 out)))
+    (loop ((i 2))
+      (cond ((>= i (count items)) named)
+            ((fuse-list-form? (nth items i)) (add-symbols (nth items i) named))
+            (else (recur (+ i 1)))))))
+
+;; `impl` and `defprotocol`: the parameter list of each method.
+(defun binds-methods :private (items: (Vec Stx) out: (Map str bool)) -> (Map str bool)
+  (loop ((i 2) (acc out))
+    (if (< i (count items))
+        (let ((method (fuse-list-items (nth items i))))
+          (recur (+ i 1)
+                 (if (and (> (count method) 1) (fuse-list-form? (nth method 1)))
+                     (add-symbols (nth method 1) acc)
+                     acc)))
+        acc)))
+
+;; The names the list `items` (head `head`) binds in its own positions.
+;; (scan::binds)
+(defun fuse-binds :private (head: str items: (Vec Stx) out: (Map str bool)) -> (Map str bool)
+  (cond ((= head "fn") (binds-fn items out))
+        ((or (= head "let") (= head "loop")) (binds-let items out))
+        ((= head "match") (binds-match items out))
+        ((= head "defun") (binds-defun items out))
+        ((or (= head "impl") (= head "defprotocol")) (binds-methods items out))
+        (else out)))
+
+;; **B** for one top-level form: every symbol it binds anywhere; the
+;; operand of a `quote` is data and is not looked into. (scan::bound_names)
+(defun fuse-bound-names (form: Stx) -> (Map str bool)
+  (loop ((work [form]) (i 0) (out (map-empty)))
+    (if (< i (count work))
+        (let ((f (nth work i)))
+          (match (. f kind)
+            ((SList items)
+             (let ((head (unwrap-or (head-name f) "")))
+               (if (= head "quote")
+                   (recur work (+ i 1) out)
+                   (recur (append-items work items) (+ i 1) (fuse-binds head items out)))))
+            (_ (recur (append-items work (items-in f)) (+ i 1) out))))
+        out)))
+
+;; Whether the call `f` (a list of `items`) is of a terminal consumer by
+;; name and arity.
+(defun terminal-named? :private (f: Stx items: (Vec Stx)) -> bool
+  (match (head-name f)
+    (nil false)
+    ((some head)
+     (some? (fuse-terminal (. (fuse-split-head head) base) (- (count items) 1))))))
+
+;; Whether `form` has a call of a terminal consumer anywhere (a prefilter:
+;; a form without one is not walked again). (scan::calls_a_terminal)
+(defun fuse-calls-a-terminal? (form: Stx) -> bool
+  (loop ((work [form]) (i 0))
+    (if (< i (count work))
+        (let ((f (nth work i)))
+          (match (. f kind)
+            ((SList items)
+             (if (terminal-named? f items)
+                 true
+                 (recur (append-items work items) (+ i 1))))
+            (_ (recur (append-items work (items-in f)) (+ i 1)))))
+        false)))
+
+;; The names a module defines at top level, and which are public.
+(defstruct Defined (all: (Map str bool) public: (Map str bool)))
+
+;; The name of a variant of a `defenum` form: a bare symbol or `(Name ..)`.
+(defun variant-name :private (f: Stx) -> (Option str)
+  (match (. f kind)
+    ((SSym s) (some s))
+    ((SList parts) (fuse-item-sym parts 0))
+    (_ nil)))
+
+;; The name of a method of a `defprotocol`: a list `(name (self ..) ..)`.
+(defun method-name :private (f: Stx) -> (Option str)
+  (let ((parts (fuse-list-items f)))
+    (if (and (> (count parts) 1) (fuse-list-form? (nth parts 1)))
+        (fuse-item-sym parts 0)
+        nil)))
+
+;; The names of the items from index 2 that `pick` finds a name in.
+(defun picked-names :private (items: (Vec Stx) pick: (fn (Stx) (Option str))) -> (Vec str)
+  (loop ((i 2) (acc (vec-empty)))
+    (if (< i (count items))
+        (recur (+ i 1) (match (pick (nth items i)) ((some n) (conj acc n)) (nil acc)))
+        acc)))
+
+;; The names of a `defenum`: its own and its variants'.
+(defun enum-names :private (form: Stx items: (Vec Stx)) -> (Vec str)
+  (let ((own (match (type-name form) ((some n) [n]) (nil (vec-empty)))))
+    (append-strs own (picked-names items variant-name))))
+
+(defun append-strs :private (a: (Vec str) b: (Vec str)) -> (Vec str)
+  (loop ((i 0) (acc a))
+    (if (< i (count b)) (recur (+ i 1) (conj acc (nth b i))) acc)))
+
+;; The names one top-level form defines. (scan::names_of)
+(defun names-of :private (form: Stx) -> (Vec str)
+  (let ((items (fuse-list-items form)))
+    (match (head-name form)
+      (nil (vec-empty))
+      ((some head)
+       (cond ((or (= head "defun") (= head "extern"))
+              (match (fuse-item-sym items 1) ((some n) [n]) (nil (vec-empty))))
+             ((= head "def")
+              (match (fuse-item-sym items 1)
+                ((some n) [(unwrap-or (strip-colon n) n)])
+                (nil (vec-empty))))
+             ((= head "defstruct") (match (type-name form) ((some n) [n]) (nil (vec-empty))))
+             ((= head "defenum") (enum-names form items))
+             ((= head "defprotocol") (picked-names items method-name))
+             (else (vec-empty)))))))
+
+;; The names the top-level forms define: functions, constants, externs,
+;; the methods of protocols, structs, enums and their variants; `public`
+;; leaves out those of a `:private` definition. (scan::defined_names)
+(defun fuse-defined-names (forms: (Vec Stx)) -> Defined
+  (loop ((i 0) (all (map-empty)) (public (map-empty)))
+    (if (< i (count forms))
+        (let ((names (names-of (nth forms i)))
+              (private (some? (marker-index (nth forms i)))))
+          (let ((added (loop ((j 0) (a all) (p public))
+                         (if (< j (count names))
+                             (recur (+ j 1) (assoc a (nth names j) true)
+                                    (if private p (assoc p (nth names j) true)))
+                             (Defined a p)))))
+            (recur (+ i 1) (. added all) (. added public))))
+        (Defined all public))))
+

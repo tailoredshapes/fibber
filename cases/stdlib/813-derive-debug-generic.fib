@@ -1,0 +1,37 @@
+;; spec:   stdlib §2.7 (Debug of a record), §7 L17; R8: generic types get a :where of Debug
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; A generic struct and a generic enum derive Debug with `:where ((fib.core/Debug
+;; t))` for each type parameter some field mentions, so one derive serves every
+;; instantiation whose parameters have Debug: a Wrapper of an integer, of a
+;; string, of a Vec of options, and of another Wrapper, each printing its
+;; payload's own Debug text. A parameter no field mentions (u) gets no
+;; constraint, so a Tagged whose phantom parameter has no Debug still prints.
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check))
+
+(defstruct (Wrapper t) (n: i64 inner: t))
+(derive Debug Wrapper)
+
+(defenum (Slot t) Free (Held v: t) (Both a: t b: i64))
+(derive Debug Slot)
+
+(defstruct (Tagged t u) (v: t))
+(derive Debug Tagged)
+
+;; a type with no Debug at all stands for the phantom parameter
+(defstruct NoDebug (z: i64))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (ph: (Tagged i64 NoDebug) (Tagged 4)))
+    (do (check c (= (debug (Wrapper 1 2)) "#main.Wrapper{:n 1, :inner 2}"))
+        (check c (= (debug (Wrapper 1 "s")) "#main.Wrapper{:n 1, :inner \"s\"}"))
+        (check c (= (debug (Wrapper 1 [(some 1) nil])) "#main.Wrapper{:n 1, :inner [1 nil]}"))
+        (check c (= (debug (Wrapper 1 (Wrapper 2 \c))) "#main.Wrapper{:n 1, :inner #main.Wrapper{:n 2, :inner \\c}}"))
+        (check c (= (debug (Held "h")) "#main.Held{:v \"h\"}"))
+        (check c (= (debug (Both 1.5 2)) "#main.Both{:a 1.5, :b 2}"))
+        (check c (let ((f: (Slot i64) Free)) (= (debug f) "Free")))
+        (check c (= (debug ph) "#main.Tagged{:v 4}"))
+        (checks-result c))))

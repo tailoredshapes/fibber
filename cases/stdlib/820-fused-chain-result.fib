@@ -1,0 +1,38 @@
+;; spec:   stdlib §2.1 rule 2 (the fused path, A13 lz1), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter reduce vec count
+;; The page's chain, filter odd? then map f over [1 2 3 4] and sum, is 8 with two calls
+;; of f (A13 lz1: `[8 2]`), written the way a program writes it, with `->>`: the
+;; expander reads the nested calls and gives the terminal consumer the recipes
+;; (case 825 counts what that saves). Then each of the other stages under a consumer
+;; that reads its chain once, and a chain with two functions that run once per element.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2))))
+          (odd (fn (x: i64) (= (rem x 2) 1)))
+          (small (fn (x: i64) (< x 3))))
+      (do ;; the page's chain: the result and the number of calls of f
+          (check c (= (->> [1 2 3 4] (filter odd) (map f) (reduce (fn (a x) (+ a x)) 0)) 8))
+          (check c (= @calls 2))
+          ;; a chain of every stage, each under a terminal consumer
+          (check c (= (vec (map f [1 2 3])) [2 4 6]))
+          (check c (= (vec (filter odd [1 2 3 4 5])) [1 3 5]))
+          (check c (= (vec (remove odd [1 2 3 4 5])) [2 4]))
+          (check c (= (vec (take 2 [5 6 7])) [5 6]))
+          (check c (= (vec (drop 2 [5 6 7])) [7]))
+          (check c (= (vec (take-while small [1 2 3 1])) [1 2]))
+          (check c (= (vec (mapcat (fn (x: i64) [x x]) [1 2])) [1 1 2 2]))
+          (check c (= (vec (concat [1 2] [3])) [1 2 3]))
+          ;; two stages and three: each element passes through all of them before the next
+          (set! calls 0)
+          (check c (= (count (take 2 (map f (filter odd [1 2 3 4 5 6 7])))) 2))
+          (check c (= @calls 2))
+          (check c (= (vec (drop 1 (take-while small (remove (fn (x: i64) (= x 0)) [0 1 2 3 4])))) [2]))
+          (check c (= (vec (concat (map f [1 2]) (take 1 (filter odd [4 5 7])))) [2 4 5]))
+          (checks-result c)))))

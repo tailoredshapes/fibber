@@ -1,0 +1,35 @@
+;; spec:   stdlib §2.1 rule 2 (a head written fib.seq/h is a library call always), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map take vec count
+;; This module defines its own `map` and `count`, so the bare names are the program's (case 823)
+;; and the rewrite leaves them. A head written `fib.seq/map` or `fib.coll/vec` names the library
+;; whatever the module defines, so a chain written with them is fused: over the source of case 821, which ends
+;; after a hundred thousand elements and counts the ones it hands out, the source is asked for 2
+;; elements and not for all of them, which only the recipes do.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun map (f: (fn (i64) i64) v: (Vec i64)) -> (Vec i64) [100])
+(defun count (v: (Vec i64)) -> i64 99)
+
+(defstruct Naturals (from: i64 pulled: (Cell i64)))
+(impl (Reducible i64) Naturals
+  (each-while (self k)
+    (loop ((i (. self from)))
+      (if (< i 100000)
+          (do (set! (. self pulled) (+ @(. self pulled) 1))
+              (if (k i) (recur (+ i 1)) false))
+          true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (pulled (cell 0)))
+    (do (check c (= (count (map (fn (x: i64) x) [1 2 3])) 99))
+        (check c (= (fib.coll/vec (fib.seq/take 2 (fib.seq/map (fn (x: i64) (* x 2)) (Naturals 0 pulled)))) [0 2]))
+        (check c (= @pulled 2))
+        (set! pulled 0)
+        (check c (= (fib.seq/count (fib.seq/take 3 (Naturals 5 pulled))) 3))
+        (check c (= @pulled 3))
+        (checks-result c))))

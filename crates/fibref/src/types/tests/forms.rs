@@ -209,3 +209,46 @@ fn errors_are_reported_in_evaluation_order() {
     );
     assert_eq!(e.pos.col, 28, "the position of the method +");
 }
+
+#[test]
+fn deref_of_a_task_is_its_result() {
+    // types §2.9: the fourth built-in `Deref` instance, `(Deref (Task a) a)`,
+    // whose `deref` is `join`.
+    let p = ok("(defun get (t: (Task str)) -> str @t)
+                (defun fun (t: (Task i64)) -> i64 (deref t))
+                (defun main () -> i64 (str-len (get (spawn (fn () \"ab\")))))");
+    assert_eq!(
+        p.show_fun("get").as_deref(),
+        Some("(fn :send ((Task str)) str)")
+    );
+    assert_eq!(
+        p.show_fun("fun").as_deref(),
+        Some("(fn :send ((Task i64)) i64)")
+    );
+    // A task of unresolved type is fixed by the `join` that comes first
+    // (§3.4); a bare `@t` is the deferred constraint, unresolved at the end.
+    ok("(defun get (t) (do (join t) @t)) (defun main () -> i64 (get (spawn (fn () 1))))");
+    fails(
+        "(defun get (t) @t) (defun main () -> i64 0)",
+        K::DerefUnresolved,
+        "cannot infer whether t is a cell, an atom, a weak reference or a task",
+    );
+    // The result type is the task's, so a mismatch is the usual one.
+    fails(
+        "(defun main () -> str @(spawn (fn () 1)))",
+        K::Unify,
+        "cannot unify i64 with str",
+    );
+}
+
+#[test]
+fn a_user_deref_of_a_task_overlaps_the_builtin_instance() {
+    // Before the instance existed the program below was accepted and `@`
+    // ignored it; now it is `overlapping instances` as for `Cell` (§2.9).
+    fails(
+        "(impl (Deref a) (Task a) (deref (self) (trap \"mine\")))
+         (defun main () -> i64 @(spawn (fn () 1)))",
+        K::Other,
+        "overlapping instances: Deref for (Task a) is already implemented",
+    );
+}

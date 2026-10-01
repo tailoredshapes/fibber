@@ -1,0 +1,59 @@
+;; spec:   stdlib §4.1 (rows < > <= >= =), §6.3 (R6a)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: < > <= >= =
+;; (< a b c) is true when a < b and b < c. Every operand that is a call is evaluated once,
+;; before the first comparison and left to right, as the arguments of a
+;; function are (a chain whose first test fails still evaluates the third
+;; operand: the cell holds the digits of the calls in the order they ran).
+;; (< a) and (= a) are true; the binary call is the builtin's. The chain
+;; works on any ordered type: integers, floats, strings and characters.
+(ns main (:use fib.core tl.check))
+
+;; v, after appending its digit to the trail: the trail says what ran, in what order
+(defun note (trail: (Cell i64) v: i64) -> i64 (do (set! trail (+ (* @trail 10) v)) v))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (trail (cell 0))
+        (x 5) (s "b"))
+    (do (check c (< 1 2 3))
+        (check c (not (< 1 3 3)))
+        (check c (not (< 3 2 1)))
+        (check c (< 1 x 10 20 30))
+        (check c (not (< 1 x 10 20 20)))
+        (check c (> 3 2 1))
+        (check c (not (> 3 3 1)))
+        (check c (<= 1 1 2 2 3))
+        (check c (not (<= 1 2 1)))
+        (check c (>= 3 3 2 2 1))
+        (check c (not (>= 1 2 1)))
+        (check c (= 4 4 4 4))
+        (check c (not (= 4 4 5)))
+        (check c (not (= 4 5 4)))
+        (check c (< "a" s "c"))
+        (check c (= s "b" s))
+        (check c (< \a \b \c))
+        (check c (< 1.5 2.5 3.5))
+        (check c (= 2.5 2.5 2.5))
+        (check c (< 1i8 2i8 3i8))
+        (check c (< x))
+        (check c (= s))
+        ;; the third operand is evaluated although the first test fails: 9, 1, 5 in order
+        (check c (not (< (note trail 9) (note trail 1) (note trail 5))))
+        (check c (= @trail 915))
+        (set! trail 0)
+        ;; once each, left to right, then the test: 1 2 3
+        (check c (< (note trail 1) (note trail 2) (note trail 3)))
+        (check c (= @trail 123))
+        (set! trail 0)
+        ;; the second test is made on the same value, not on a second call
+        (check c (= (note trail 7) (note trail 7) (note trail 7)))
+        (check c (= @trail 777))
+        (set! trail 0)
+        ;; a chain of one operand evaluates it once and is true
+        (check c (< (note trail 4)))
+        (check c (= @trail 4))
+        (checks-result c))))

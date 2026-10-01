@@ -21,7 +21,7 @@ pub enum ErrorKind {
     NoField,
     /// `cannot infer the struct type of e for field f; annotate it` (§3.4).
     FieldUnresolved,
-    /// `cannot infer whether x is a cell, an atom or a weak reference` (§3.4).
+    /// `cannot infer whether x is a cell, an atom, a weak reference or a task` (§3.4).
     DerefUnresolved,
     /// `no implementation of P for T` (§3.3).
     NoInstance,

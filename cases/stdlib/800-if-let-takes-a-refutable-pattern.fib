@@ -1,0 +1,73 @@
+;; spec:   stdlib §2.4 (row if-let), §7 E13, syntax §3.6 (patterns)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: if-let
+;; `(if-let (p e) a b)` is `(match e ((some p) a) (_ b))`: the pattern `p`
+;; may be any pattern, a refutable one included, and the else is taken both
+;; when `e` is nil and when the payload does not match `p`. (Before E13 the
+;; macro put `nil` for the else and a vector pattern was refused, `non-exhaustive
+;; match: missing (some [])`.)
+;;  * `[a b]` matches a vector of exactly two, `[a & r]` one of one or more,
+;;    `([a b] :as all)` binds the whole beside the parts;
+;;  * a variant pattern matches that variant and sends the others (and a
+;;    variant of no fields) to the else; a struct pattern is irrefutable;
+;;    a literal matches that value only;
+;;  * `e` is evaluated once, whichever branch is taken, and only one branch
+;;    runs;
+;;  * the payload may be a heap value and the binding is released on both
+;;    paths (the audit is the check).
+(ns main (:use tl.check))
+
+(defenum Shape (Circle r: i64) (Rect w: i64 h: i64) Dot)
+(defstruct Pt (x: i64 y: i64))
+
+(def miss: i64 100)
+
+(defun pair (o: (Option (Vec i64))) -> i64 (if-let ([a b] o) (+ a b) miss))
+(defun head (o: (Option (Vec i64))) -> i64 (if-let ([a & r] o) (+ a (count r)) miss))
+(defun whole (o: (Option (Vec i64))) -> i64 (if-let (([a b] :as all) o) (+ a (count all)) miss))
+(defun radius (o: (Option Shape)) -> i64 (if-let ((Circle r) o) r miss))
+(defun area (o: (Option Shape)) -> i64 (if-let ((Rect w h) o) (* w h) miss))
+(defun coords (o: (Option Pt)) -> i64 (if-let ((Pt x y) o) (+ x y) miss))
+(defun seven (o: (Option i64)) -> i64 (if-let (7 o) 1 2))
+
+;; the expression is asked once, and the branch not taken does not run
+(defun counted (n: (Cell i64) o: (Option (Vec i64))) -> (Option (Vec i64)) (do (set! n (+ @n 1)) o))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (n (cell 0))
+        (ran (cell 0)))
+    (do
+      (check c (= (pair (some [1 2])) 3))
+      (check c (= (pair (some [1 2 3])) 100))
+      (check c (= (pair (some [1])) 100))
+      (check c (= (pair (some [])) 100))
+      (check c (= (pair nil) 100))
+      (check c (= (head (some [5 6 7])) 7))
+      (check c (= (head (some [5])) 5))
+      (check c (= (head (some [])) 100))
+      (check c (= (head nil) 100))
+      (check c (= (whole (some [1 2])) 3))
+      (check c (= (whole (some [1 2 3])) 100))
+      (check c (= (radius (some (Circle 4))) 4))
+      (check c (= (radius (some (Rect 1 2))) 100))
+      (check c (= (radius (some Dot)) 100))
+      (check c (= (radius nil) 100))
+      (check c (= (area (some (Rect 3 5))) 15))
+      (check c (= (area (some (Circle 3))) 100))
+      (check c (= (coords (some (Pt 3 4))) 7))
+      (check c (= (coords nil) 100))
+      (check c (= (seven (some 7)) 1))
+      (check c (= (seven (some 8)) 2))
+      (check c (= (seven nil) 2))
+      ;; once, and one branch
+      (check c (= (if-let ([a b] (counted n (some [4 5]))) (do (set! ran (+ @ran 1)) (+ a b)) (do (set! ran (+ @ran 10)) 0)) 9))
+      (check c (= @n 1))
+      (check c (= @ran 1))
+      (check c (= (if-let ([a b] (counted n (some [4]))) (do (set! ran (+ @ran 1)) (+ a b)) (do (set! ran (+ @ran 10)) 0)) 0))
+      (check c (= @n 2))
+      (check c (= @ran 11))
+      (checks-result c))))

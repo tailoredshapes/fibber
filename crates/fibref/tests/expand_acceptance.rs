@@ -51,6 +51,22 @@ fn residue(forms: &[Form]) -> Option<&Form> {
                     // `(range n)` is the library function; only `(range
                     // a b)` must have been rewritten.
                     "range" => items.len() == 3,
+                    // `update` and `reduce` are also library functions (R6b):
+                    // only the calls the function cannot serve are rewritten,
+                    // `(update m k f x ..)`, `(update m k (fnil g d))` and
+                    // `(reduce f c)`; the rest is not judged here.
+                    "update" => is_update_rewrite(items),
+                    "reduce" => items.len() == 3,
+                    // The operators, the collection functions and `swap!`
+                    // (R6a) are the builtins' and the library's own functions
+                    // for the binary call and are rewritten only for more:
+                    // three or more operands (`assoc`: five, a collection
+                    // and two pairs).
+                    "+" | "-" | "*" | "<" | ">" | "<=" | ">=" | "=" | "max" | "min" | "bit-and"
+                    | "bit-or" | "bit-xor" | "conj" | "dissoc" | "merge" | "swap!" => {
+                        items.len() >= 4
+                    }
+                    "assoc" => items.len() >= 6,
                     _ => PRELUDE_MACROS.contains(&head),
                 };
                 if macro_use || quasi.contains(&head) {
@@ -107,6 +123,16 @@ fn is_range_loop(items: &[Form]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `(update m k f ..)` is a call the macro rewrites: one with
+/// extra arguments, or with a literal `(fnil g d)` for `f`.
+fn is_update_rewrite(items: &[Form]) -> bool {
+    let fnil = |f: &Form| {
+        let l = f.as_list().unwrap_or(&[]);
+        l.len() == 3 && l[0].as_sym() == Some("fnil")
+    };
+    items.len() >= 5 || (items.len() == 4 && fnil(&items[3]))
 }
 
 /// Every list head in `forms` outside `quote`, sorted and deduplicated.
@@ -172,6 +198,28 @@ fn residue_detector_fires() {
     let src = "(defun f () (for-each xs (fn (i) i)))";
     let forms = read_all(src, "t").unwrap_or_else(|e| panic!("{e}"));
     assert!(residue(&forms).is_none());
+    // R6b: the macros that are also functions are residue only when rewritten
+    for (src, residue_expected) in [
+        ("(defun f () (defn g [x] x))", true),
+        ("(defun f () (update m k f x))", true),
+        ("(defun f () (update m k (fnil g d)))", true),
+        ("(defun f () (update m k f))", false),
+        ("(defun f () (reduce f c))", true),
+        ("(defun f () (reduce f 0 c))", false),
+        // R6a: the binary call is the function's; three operands are a macro call
+        ("(defun f () (+ a b))", false),
+        ("(defun f () (+ a b c))", true),
+        ("(defun f () (< a b c))", true),
+        ("(defun f () (max a b))", false),
+        ("(defun f () (max a b c))", true),
+        ("(defun f () (assoc m k v))", false),
+        ("(defun f () (assoc m k v k2 v2))", true),
+        ("(defun f () (swap! a f))", false),
+        ("(defun f () (swap! a f x))", true),
+    ] {
+        let forms = read_all(src, "t").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(residue(&forms).is_some(), residue_expected, "{src}");
+    }
 }
 
 #[test]
@@ -243,7 +291,7 @@ fn case_19_if_let_becomes_match() {
             "(defun add-child (parent) (let ((c (Node (some (weak parent)) (cell (fib.prelude/vec-empty))))) \
              (set! (. parent children) (conj (deref (. parent children)) c)) c))",
             "(defun depth (n: Node) -> i64 (match (. n parent) (nil 0) \
-             ((some w) (match (deref w) ((fib.prelude/some p) (+ 1 (depth p))) (nil 0)))))",
+             ((some w) (match (deref w) ((fib.prelude/some p) (+ 1 (depth p))) (_ 0)))))",
             "(defun main () -> i64 (let ((root (Node nil (cell (fib.prelude/vec-empty))))) \
              (let ((a (add-child root))) (let ((b (add-child a))) (depth b)))))",
         ]

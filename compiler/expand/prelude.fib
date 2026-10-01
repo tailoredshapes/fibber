@@ -39,20 +39,37 @@
 ;;   forms.rs) are the module expand.prelude.forms, and the helpers the two
 ;;   share (`tail-from`, `items-of`, `body-form`...) are expand.prelude.parts,
 ;;   to keep each file under 500 lines.
+;; - `defn` and `defn-` (Rust defn.rs), `update` (update.rs) and `reduce`
+;;   (reduce.rs), the stdlib tranche 1 package R6b, are the modules
+;;   expand.prelude.defn, .update and .reduce. A Rust macro that can decline
+;;   (`update`, `reduce`) returns the `Outcome`, whose type is this module's:
+;;   here the submodule answers `(Option Stx)`, `nil` for a decline, and
+;;   `declinable` makes the outcome.
+;; - `+ - * < > <= >= = max min bit-and bit-or bit-xor` (Rust fold.rs),
+;;   `conj assoc dissoc merge` (colls.rs) and `swap!` (atoms.rs), the stdlib
+;;   tranche 1 package R6a, are the modules expand.prelude.fold, .colls and
+;;   .atoms. Each declines the binary call the builtin or the library
+;;   function serves, so each answers `nil` as `update` does (`-`, `assoc`
+;;   and `merge` can also fail: `declinable-result`).
 ;; - `derive` is the one macro that is not a rewrite of this module,
 ;;   `expand.derive` (porter 3) answers it. Module dependency: expand.prelude
 ;;   uses expand.derive, expand.build, expand.core, expand.ctx and
 ;;   expand.error, and is used by expand.expr.
 (ns expand.prelude
   (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build
-        expand.collections expand.prelude.parts expand.prelude.forms)
+        expand.collections expand.prelude.parts expand.prelude.forms expand.prelude.print
+        expand.prelude.defn expand.prelude.update expand.prelude.reduce
+        expand.prelude.fold expand.prelude.colls expand.prelude.atoms)
   (:require [expand.derive :as dv]))
 
 ;; The prelude macros, by name, in the order of the Rust table (the soup
 ;; of crates/fibc/tests/bootstrap_expand picks them from it).
 (def prelude-macros: (Vec str)
   ["when" "unless" "cond" "and" "or" "if-let" "when-let" "list" "plet" "while"
-   "dotimes" "for-each" "range" "->" "->>" "doto" "assert" "dbg" "derive"])
+   "dotimes" "for-each" "range" "->" "->>" "doto" "assert" "dbg" "derive"
+   "defn" "defn-" "update" "reduce" "str" "println" "print" "prn" "pr"
+   "+" "-" "*" "<" ">" "<=" ">=" "=" "max" "min" "bit-and" "bit-or" "bit-xor"
+   "conj" "assoc" "dissoc" "merge" "swap!"])
 
 ;; What a prelude macro did with a call.
 (defenum Outcome
@@ -70,6 +87,19 @@
       (if (< i n)
           (if (= (nth prelude-macros i) name) true (recur (+ i 1)))
           false))))
+
+;; A macro that declines answers `nil`: the call, unchanged, is the outcome.
+(defun declinable :private (r: (Option Stx) items: (Vec Stx) pos: Pos) -> (Result Outcome ExpandError)
+  (match r
+    ((some f) (Ok (Rewritten f)))
+    (nil (Ok (Declined (list-form items pos))))))
+
+;; The same for a macro that can decline and fail.
+(defun declinable-result :private (r: (Result (Option Stx) ExpandError) items: (Vec Stx) pos: Pos)
+    -> (Result Outcome ExpandError)
+  (match r
+    ((Err e) (Err e))
+    ((Ok o) (declinable o items pos))))
 
 ;; The call's expansion, as an outcome.
 (defun rewritten :private (r: (Result Stx ExpandError)) -> (Result Outcome ExpandError)
@@ -158,24 +188,29 @@
          (Err (malformed name "the binding is (pattern expression)" (. form pos)))))
     (nil (Err (malformed name "the binding is (pattern expression)" (. form pos))))))
 
-;; `(match e ((fib.prelude/some x) then) (nil other))`.
+;; `(match e ((fib.prelude/some p) then) (_ other))`. The else is a
+;; wildcard, not `nil`: the pattern `p` may be refutable (`[a b]` matches
+;; a vector of two and no other), and the else is taken on a mismatch of
+;; the pattern as well as on `nil` (stdlib §2.4, §7 E13; tranche 1 R7).
 (defun option-match :private (x: Stx e: Stx then: Stx other: Stx pos: Pos) -> Stx
   (let ((some-clause (list-form [(call (prelude-name "some") [x] pos) then] pos))
-        (none-clause (list-form [(Stx SNil pos) other] pos)))
-    (list-form [(sym "match" pos) e some-clause none-clause] pos)))
+        (rest-clause (list-form [(sym "_" pos) other] pos)))
+    (list-form [(sym "match" pos) e some-clause rest-clause] pos)))
 
-;; `(if-let (x e) a b)` ==> `(match e ((fib.prelude/some x) a) (nil b))`
-;; (§4.4).
+;; `(if-let (p e) a b)` ==> `(match e ((fib.prelude/some p) a) (_ b))`;
+;; `(if-let (p e) a)` has `()` as its else (§4.4, stdlib §2.4).
 (defun if-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
-  (match (check-arity "if-let" items 3 (some 3) pos)
+  (match (check-arity "if-let" items 2 (some 3) pos)
     ((Err e) (Err e))
     ((Ok _)
      (match (option-binding "if-let" (nth items 1))
        ((Err e) (Err e))
-       ((Ok b) (Ok (option-match (nth b 0) (nth b 1) (nth items 2) (nth items 3) pos)))))))
+       ((Ok b)
+        (Ok (option-match (nth b 0) (nth b 1) (nth items 2)
+                          (if (> (count items) 3) (nth items 3) (unit pos)) pos)))))))
 
-;; `(when-let (x e) body...)` ==> `(match e ((fib.prelude/some x) body)
-;; (nil ()))`.
+;; `(when-let (p e) body...)` ==> `(match e ((fib.prelude/some p) body)
+;; (_ ()))`.
 (defun when-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "when-let" items 1 nil pos)
     ((Err e) (Err e))
@@ -242,14 +277,20 @@
 
 ;; `(range a b)` ==> `(fib.prelude/range-between a b)`; `(range n)` is declined and
 ;; stays a call of the library function `range` (§4.4, §4.5). There is
-;; no arity overloading, so the two-argument form is this rewrite.
+;; no arity overloading, so the two-argument form is this rewrite. A call
+;; of three arguments is declined too: it is Clojure's `(range a b step)`,
+;; the library's `range-by`, and the checker's arity error of the library
+;; function says so (stdlib §7 D1, `use range-by`), which a macro's own
+;; arity error could not.
 (defun range-macro :private (items: (Vec Stx) pos: Pos) -> (Result Outcome ExpandError)
-  (match (check-arity "range" items 1 (some 2) pos)
-    ((Err e) (Err e))
-    ((Ok _)
-     (if (= (count items) 3)
-         (Ok (Rewritten (call (prelude-name "range-between") [(nth items 1) (nth items 2)] pos)))
-         (Ok (Declined (list-form items pos)))))))
+  (if (= (count items) 4)
+      (Ok (Declined (list-form items pos)))
+      (match (check-arity "range" items 1 (some 2) pos)
+        ((Err e) (Err e))
+        ((Ok _)
+         (if (= (count items) 3)
+             (Ok (Rewritten (call (prelude-name "range-between") [(nth items 1) (nth items 2)] pos)))
+             (Ok (Declined (list-form items pos))))))))
 
 ;; The `i` and body of a literal `(fn (i) body+)`, as `i` then the body:
 ;; no name, one unannotated parameter, no result annotation.
@@ -328,6 +369,33 @@
     ("for-each" (for-each-macro ctx items pos))
     ("range" (range-macro items pos))
     ("derive" (rewritten (dv/derive ctx items pos)))
+    ("defn" (rewritten (defn-macro items pos false)))
+    ("defn-" (rewritten (defn-macro items pos true)))
+    ("update" (declinable (update-macro ctx items pos) items pos))
+    ("reduce" (declinable (reduce-macro items pos) items pos))
+    ("str" (Ok (Rewritten (str-macro items pos))))
+    ("println" (Ok (Rewritten (printer-macro items pos Println))))
+    ("print" (Ok (Rewritten (printer-macro items pos Print))))
+    ("prn" (Ok (Rewritten (printer-macro items pos Prn))))
+    ("pr" (Ok (Rewritten (printer-macro items pos Pr))))
+    ("+" (declinable (sum-or-product items pos "+" 0) items pos))
+    ("-" (declinable-result (difference items pos) items pos))
+    ("*" (declinable (sum-or-product items pos "*" 1) items pos))
+    ("<" (declinable (comparison ctx items pos "<") items pos))
+    (">" (declinable (comparison ctx items pos ">") items pos))
+    ("<=" (declinable (comparison ctx items pos "<=") items pos))
+    (">=" (declinable (comparison ctx items pos ">=") items pos))
+    ("=" (declinable (comparison ctx items pos "=") items pos))
+    ("max" (declinable (extremum items pos "max") items pos))
+    ("min" (declinable (extremum items pos "min") items pos))
+    ("bit-and" (declinable (bits-macro items pos "bit-and") items pos))
+    ("bit-or" (declinable (bits-macro items pos "bit-or") items pos))
+    ("bit-xor" (declinable (bits-macro items pos "bit-xor") items pos))
+    ("conj" (declinable (conj-macro items pos) items pos))
+    ("assoc" (declinable-result (assoc-macro items pos) items pos))
+    ("dissoc" (declinable (dissoc-macro items pos) items pos))
+    ("merge" (declinable-result (merge-macro items pos) items pos))
+    ("swap!" (declinable (swap-macro ctx items pos) items pos))
     (_ (Ok (Declined (list-form items pos))))))
 
 ;; Expands one call of a prelude macro: the form must be a list whose head

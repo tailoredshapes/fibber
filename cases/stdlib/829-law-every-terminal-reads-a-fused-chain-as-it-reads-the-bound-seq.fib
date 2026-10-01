@@ -1,0 +1,72 @@
+;; spec:   stdlib §2.1 rule 2 (the set T: the same answer as the memoised seq), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce reduce1 reduce-while count empty? last nth vec set into run!
+;; The law of the rewrite: a terminal consumer gives the same answer whether its collection is the
+;; chain itself, which the expander turns into recipes, or the same chain bound to a name first,
+;; which is a memoised lazy seq that the consumer reads. The terminals are every member of T the
+;; library has but `find-map group-by frequencies sort sort-by sort-with sort-by-with sum`, which are
+;; case 830; each is called with the chain in its own argument position (`nth` takes it first, every
+;; other one last). 300 seeded draws of a Vec of 0 to 9 elements and two drawn functions. The last check
+;; plants a fault (the lazy side filters with another predicate) and requires it to be noticed. Seed 829.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun fmap (k: i64) -> (fn (i64) i64) (fn (x) (+ (* x 3) k)))
+(defun fkeep (k: i64) -> (fn (i64) bool) (fn (x) (= (rem (+ x k) 3) 0)))
+
+;; the folds
+(defun folds (c: Checks v: (Vec i64) f: (fn (i64) i64) p: (fn (i64) bool) q: (fn (i64) bool)) -> unit
+  (let ((s (map f (filter q v)))
+        (g (fn (a: i64 x: i64) (+ (* a 2) x)))
+        (h (fn (a: i64 x: i64) (if (> a 30) (Done a) (More (+ a x))))))
+    (do (check c (= (reduce g 7 (map f (filter p v))) (reduce g 7 s)))
+        (check c (= (reduce1 g (map f (filter p v))) (reduce1 g s)))
+        (check c (= (reduce-while h 0 (map f (filter p v))) (reduce-while h 0 s)))
+        (check c (= (count (map f (filter p v))) (count s)))
+        (check c (= (empty? (map f (filter p v))) (empty? s)))
+        (check c (= (last (map f (filter p v))) (last s)))
+        ;; the planted run's two sides may differ in length: ask only what both have
+        (let ((last-i (- (min (count s) (count (map f (filter p v)))) 1)))
+          (if (>= last-i 0)
+              (do (check c (= (reduce-nonempty g (map f (filter p v))) (reduce-nonempty g s)))
+                  (check c (= (nth (map f (filter p v)) last-i) (nth s last-i))))
+              ())))))
+
+;; the queries and the builders
+(defun queries (c: Checks v: (Vec i64) f: (fn (i64) i64) p: (fn (i64) bool) q: (fn (i64) bool)) -> unit
+  (let ((s (map f (filter q v)))
+        (big (fn (x: i64) (> x 20)))
+        (pick (fn (x: i64) (if (> x 20) (some (* x 2)) nil)))
+        (n1 (cell 0))
+        (n2 (cell 0)))
+    (do (check c (= (vec (map f (filter p v))) (vec s)))
+        (check c (= (set (map f (filter p v))) (set s)))
+        (check c (= (into [] (map f (filter p v))) (into [] s)))
+        (check c (= (every? big (map f (filter p v))) (every? big s)))
+        (check c (= (not-any? big (map f (filter p v))) (not-any? big s)))
+        (check c (= (find-first big (map f (filter p v))) (find-first big s)))
+        (do (run! (fn (x: i64) (set! n1 (+ @n1 x))) (map f (filter p v)))
+            (run! (fn (x: i64) (set! n2 (+ @n2 x))) s)
+            (check c (= @n1 @n2))))))
+
+(defun draw (r: Rng c: Checks fault: bool) -> unit
+  (let ((v (rng-vec r (+ 1 (rng-below r 9)) 20))
+        (k (rng-below r 6))
+        (j (rng-below r 6)))
+    (let ((f (fmap k)) (p (fkeep j)) (q (fkeep (if fault (+ j 1) j))))
+      (do (folds c v f p q)
+          (queries c v f p q)))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 829)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (and (>= (checks-made c) 3900) (<= (checks-made c) 4500)))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

@@ -124,6 +124,13 @@ impl Soup<'_> {
             "for-each" => self.for_each(d),
             "->" | "->>" | "doto" => self.threaded(name, d),
             "derive" => self.derive(),
+            "defn" | "defn-" => self.defn(name, d),
+            "update" => self.update(d),
+            "reduce" => self.reduce(d),
+            "+" | "-" | "*" | "<" | ">" | "<=" | ">=" | "=" | "max" | "min" | "bit-and"
+            | "bit-or" | "bit-xor" | "conj" | "assoc" | "dissoc" | "merge" | "swap!" => {
+                self.variadic(name, d)
+            }
             _ => format!("({name} {})", self.exprs(n, d)),
         }
     }
@@ -211,6 +218,129 @@ impl Soup<'_> {
             })
             .collect();
         format!("({name} {} {})", self.expr(d), steps.join(" "))
+    }
+
+    /// `defn` and `defn-` (stdlib R6b): mostly well formed, with a
+    /// docstring, annotations, and now and then a rest marker, a list of
+    /// clauses, a parameter list that is not a vector, or no parameters.
+    fn defn(&mut self, name: &str, d: usize) -> String {
+        let doc = if self.rng.one_in(3) { "\"doc\" " } else { "" };
+        let params = self.rng.pick(&[
+            "[]",
+            "[x]",
+            "[x: i64 y: i64]",
+            "[x: i64]",
+            "[x & r]",
+            "[& r]",
+            "(x)",
+            "x",
+        ]);
+        let note = self
+            .rng
+            .pick(&["", "", "-> i64 ", ":where ((Eq a)) ", ":private "]);
+        let n = self.rng.between(0, 2);
+        let body = self.exprs(n, d);
+        match self.rng.below(12) {
+            0 => format!("({name} f ([x] {}) ([x y] {}))", self.expr(d), self.expr(d)),
+            1 => format!("({name} f{})", if doc.is_empty() { "" } else { " \"doc\"" }),
+            2 => format!("({name} 1 [x] {})", self.expr(d)),
+            3 => format!("({name})"),
+            _ => format!("({name} f {doc}{params} {note}{body})"),
+        }
+    }
+
+    /// The operators, the collection functions and `swap!` (stdlib R6a): a
+    /// call of none to five operands, among them now and then a literal
+    /// `nil` (`merge` skips it), a field path and a call (a comparison
+    /// binds the calls first), so the folds, the binary calls they decline
+    /// and the errors of `-`, `assoc` and `merge` are all reached.
+    fn variadic(&mut self, name: &str, d: usize) -> String {
+        let n = self.rng.between(0, 5);
+        let operands: Vec<String> = (0..n)
+            .map(|_| match self.rng.below(7) {
+                0 => "nil".to_string(),
+                1 => "(. p f)".to_string(),
+                _ => self.expr(d),
+            })
+            .collect();
+        format!("({name} {})", operands.join(" "))
+    }
+
+    /// `update`: with extra arguments, a literal `fnil`, and the calls the
+    /// macro declines.
+    fn update(&mut self, d: usize) -> String {
+        let f = match self.rng.below(6) {
+            0 => format!("(fnil {} {})", self.expr(d), self.expr(d)),
+            1 => format!("(fnil {})", self.expr(d)),
+            2 => format!("(fnil {} {} {})", self.expr(d), self.expr(d), self.expr(d)),
+            3 => self.rng.pick(&["+", "inc", "f"]).to_string(),
+            _ => self.expr(d),
+        };
+        let extra = self.some_exprs(2, d);
+        match self.rng.below(8) {
+            0 => format!("(update {})", self.some_exprs(2, d)),
+            _ => format!("(update {} {} {f} {extra})", self.expr(d), self.expr(d)),
+        }
+    }
+
+    /// A form whose tails are `reduced`, plain values and `recur`, through
+    /// the forms a tail passes (the rewrite of `reduce`, stdlib R6b).
+    fn tail(&mut self, d: usize) -> String {
+        if d == 0 {
+            return match self.rng.below(5) {
+                0 => "(reduced a)".to_string(),
+                1 => "(recur 1)".to_string(),
+                2 => format!("(reduced {})", self.atom()),
+                3 => self.rng.pick(&["(reduced)", "(reduced a b)"]).to_string(),
+                _ => self.atom(),
+            };
+        }
+        let e = self.expr(d - 1);
+        let (t, u) = (self.tail(d - 1), self.tail(d - 1));
+        match self.rng.below(11) {
+            0 => format!("(if {e} {t} {u})"),
+            1 => format!("(let ((y {e})) {t})"),
+            2 => format!("(do {e} {t})"),
+            3 => format!("(match {e} (1 {t}) (_ {u}))"),
+            4 => format!("(cond ({e} {t}) (else {u}))"),
+            5 => format!("(when {e} {t})"),
+            6 => format!("(unless {e} {t})"),
+            7 => format!("(if-let (p {e}) {t} {u})"),
+            8 => format!("(when-let (p {e}) {t})"),
+            9 => format!("(loop ((i 0)) {t})"),
+            _ => t,
+        }
+    }
+
+    /// `reduce`: two arguments, a literal head, a literal `fn` with a
+    /// `reduced` in its tails, or a call the macro declines.
+    fn reduce(&mut self, d: usize) -> String {
+        let c = self.expr(d);
+        match self.rng.below(10) {
+            0 => format!("(reduce {})", self.some_exprs(1, d)),
+            1 => format!(
+                "(reduce {} {} {} {c})",
+                self.expr(d),
+                self.expr(d),
+                self.expr(d)
+            ),
+            2 => format!(
+                "(reduce {} {c})",
+                self.rng
+                    .pick(&["+", "*", "str", "conj", "merge", "concat", "-", "f"])
+            ),
+            3 => format!("(reduce {} {c})", self.expr(d)),
+            4 => format!("(reduce {} 0 {c})", self.expr(d)),
+            _ => {
+                let note = self.rng.pick(&["", "", "", "-> i64 ", ":where ((Eq a)) "]);
+                let params = self
+                    .rng
+                    .pick(&["(a x)", "(a x)", "(a)", "(a x y)", "go (a x)"]);
+                let depth = self.rng.between(0, 3);
+                let body = self.tail(depth);
+                format!("(reduce (fn {params} {note}{body}) {} {c})", self.expr(d))
+            }
+        }
     }
 
     fn derive(&mut self) -> String {

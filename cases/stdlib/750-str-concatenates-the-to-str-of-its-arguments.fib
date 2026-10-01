@@ -1,0 +1,40 @@
+;; spec:   stdlib §2.7 (three printers), §4.14 (row str), §6.3 (the Rust macro, R5)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str
+;; (str a b ..) in head position is a macro: a right fold of str-concat over each
+;; argument's ToStr, a string literal taken whole and a literal nil as the empty text
+;; (the macro sees the nil, the checker never could: a bare nil has no type). Decided
+;; in R5 (the plan's text); the expansions are quoted by the Rust tests of
+;; crates/fibref/src/expand/tests/prelude_print.rs. Each argument is evaluated once,
+;; left to right, which the log records, and the macros nest: (str (str 1 2) 3).
+;; (str ["a"]) is the Debug text of the Vec, as case 601's table says.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+(impl ToStr Pt
+  (to-str (self) (str-concat "<" (str-concat (show (. self x)) (str-concat "," (str-concat (show (. self y)) ">"))))))
+
+(defun note (log: (Cell str) tag: str v: i64) -> i64
+  (do (set! log (str-concat @log tag)) v))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Option i64) nil)
+        (log (cell "")))
+    (do (check c (= (str) ""))
+        (check c (= (str 1 "a" \x 2.5) "1ax2.5"))
+        (check c (= (str "a" nil "b") "ab"))
+        (check c (= (str nil) ""))
+        (check c (= (str "only") "only"))
+        (check c (= (str 7) "7"))
+        (check c (= (str (some 1) none "!") "1!"))
+        (check c (= (str ["a"]) "[\"a\"]"))
+        (check c (= (str "n=" 3 "," (Pt 1 2)) "n=3,<1,2>"))
+        (check c (= (str (str 1 2) 3) "123"))
+        (check c (= (str true false) "truefalse"))
+        (check c (= (str (note log "a" 1) (note log "b" 2) (note log "c" 3)) "123"))
+        (check c (= @log "abc"))
+        (checks-result c))))

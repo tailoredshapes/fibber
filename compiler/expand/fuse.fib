@@ -1,0 +1,209 @@
+;; compiler/expand/fuse.fib: the fusion rewrite's environments and stage
+;; rewriting (stdlib design §2.1 rule 2, tranche 1 plan R9), as
+;; crates/fibref/src/expand/fuse/stage.rs and the helpers of fuse.rs. The
+;; rule, its decisions and the soundness argument are in the header of
+;; fuse.rs; the tables are expand.fusetab, the scans expand.fusescan, this
+;; file does what does not need the walk. The driver that walks a module's
+;; forms is expand.fuserun, and the planning of a form in the fusing walk
+;; is `plan-fuse` of expand.expr (Rust's `fuse::plan`, which calls
+;; `list_plan` of expr.rs: fibber has no import cycles, so the plan that
+;; needs `list-plan` is in the module that has it).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `HashSet<String>`s are `(Map str bool)` of `true`, as the
+;;   context's are; `Env<'a>` holding `&'a ModuleEnv` is `FuseEnv` holding
+;;   its `ModuleEnv`.
+;; - the Rust `Result<(Form, Role), Form>` of `rewrite` is `Staged`.
+(ns expand.fuse
+  (:use syntax.pos syntax.form expand.types expand.ctx expand.core expand.build
+        expand.collections expand.fusetab expand.fusescan))
+
+;; ------------------------------------------------------ environments
+
+;; What a module is, for the rewrite: the names that are not the
+;; library's (its own definitions, what the non-library modules it uses
+;; export) and which implicit modules it sees. (stage::ModuleEnv)
+(defstruct ModuleEnv (shadow: (Map str bool) seq: bool coll: bool core: bool))
+
+;; What the rewrite knows about the top-level form it is walking: `bound`
+;; is **B**. (stage::Env)
+(defstruct FuseEnv (module: ModuleEnv bound: (Map str bool)))
+
+;; Whether the module sees the facade.
+(defun fuse-sees :private (env: FuseEnv facade: Facade) -> bool
+  (match facade
+    ((FacSeq) (. (. env module) seq))
+    ((FacColl) (. (. env module) coll))))
+
+;; The bare name of `head` when it is the library's name of `facade`:
+;; written `fib.seq/base` it always is; bare, it is when the module sees
+;; the facade and the name is not bound by the form, defined by the module
+;; or exported by a non-library module it uses. (Env::library)
+(defun fuse-library :private (env: FuseEnv head: str facade: Facade) -> (Option str)
+  (let ((sp (fuse-split-head head)))
+    (match (. sp facade)
+      ((some q) (if (facade-same? q facade) (some (. sp base)) nil))
+      (nil (let ((free (and (not (fuse-has-name? (. env bound) (. sp base)))
+                            (not (fuse-has-name? (. (. env module) shadow) (. sp base))))))
+             (if (and free (fuse-sees env facade)) (some (. sp base)) nil))))))
+
+;; The row of **T** this call is, if its head is the library's.
+;; (Env::terminal_call)
+(defun fuse-terminal-call (env: FuseEnv items: (Vec Stx)) -> (Option Terminal)
+  (match (fuse-item-sym items 0)
+    (nil nil)
+    ((some head)
+     (match (fuse-terminal (. (fuse-split-head head) base) (- (count items) 1))
+       (nil nil)
+       ((some row)
+        (match (fuse-library env head (. row facade))
+          (nil nil)
+          ((some _) (some row))))))))
+
+;; Whether the evaluation of `form` has no effect and can move: a symbol,
+;; a literal, or a `fn` form. (stage::atomic)
+(defun fuse-atomic? :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SList items) (= (fuse-item-sym items 0) (some "fn")))
+    ((SVec _) false)
+    ((SMap _) false)
+    (_ true)))
+
+;; Whether item 2 is an annotation: `->` or `:where`.
+(defun annotation-at? :private (items: (Vec Stx) i: i64) -> bool
+  (and (< i (count items))
+       (match (. (nth items i) kind)
+         ((SSym s) (= s "->"))
+         ((SKw k) (= k "where"))
+         (_ false))))
+
+;; `(fn (params) body+)`, with no name, `->` or `:where`. (stage::plain_fn)
+(defun fuse-plain-fn? :private (form: Stx) -> bool
+  (let ((items (fuse-list-items form)))
+    (and (>= (count items) 3)
+         (= (fuse-item-sym items 0) (some "fn"))
+         (fuse-list-form? (nth items 1))
+         (not (annotation-at? items 2)))))
+
+;; The row of **A** this call is, if its head is the library's, it has two
+;; arguments and they are ones the rewrite can take. (Env::stage_call)
+(defun fuse-stage-call :private (env: FuseEnv items: (Vec Stx)) -> (Option FuseStage)
+  (match (fuse-item-sym items 0)
+    (nil nil)
+    ((some head)
+     (match (fuse-library env head FacSeq)
+       (nil nil)
+       ((some base)
+        (match (fuse-stage-named base)
+          (nil nil)
+          ((some row) (if (stage-args-ok? env row items) (some row) nil))))))))
+
+(defun stage-args-ok? :private (env: FuseEnv row: FuseStage items: (Vec Stx)) -> bool
+  (and (= (count items) 3)
+       (match (. row shape)
+         ((FsTwo) true)
+         ((FsParam) (fuse-atomic? (nth items 1)))
+         ((FsComplement)
+          (and (. (. env module) core)
+               (or (some? (fuse-sym-of (nth items 1))) (fuse-plain-fn? (nth items 1))))))))
+
+;; ----------------------------------------------------- stage rewriting
+
+;; `(fib.prelude/not (fib.core/truthy? form))`. (stage::complement)
+(defun fuse-complement :private (form: Stx pos: Pos) -> Stx
+  (call (prelude-name "not") [(call "fib.core/truthy?" [form] pos)] pos))
+
+;; The items without the last.
+(defun without-last :private (items: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (- (count items) 1)) (recur (+ i 1) (conj acc (nth items i))) acc)))
+
+;; The predicate of `Filtered` that is the complement of `p`, a symbol or
+;; a plain `fn` literal: the literal with its last form wrapped, or `(fn
+;; (g) (not (truthy? (p g))))` with a fresh `g`. (stage::complement_of)
+(defun fuse-complement-of :private (p: Stx ctx: ExpandCtx pos: Pos) -> Stx
+  (match (. p kind)
+    ((SList items)
+     (if (> (count items) 0)
+         (Stx (SList (conj (without-last items) (fuse-complement (nth items (- (count items) 1)) pos)))
+              (. p pos))
+         p))
+    (_ (let ((g (ctx-gensym ctx "fuse" pos)))
+         (call "fn" [(list-form [g] pos) (fuse-complement (list-form [p g] pos) pos)] pos)))))
+
+;; The roles of a recipe call `(R c x)`: the head is kept, `c` is the next
+;; stage or the source, `x` the other collection of a `Cat` (a stage too)
+;; or an expression. (stage::recipe_role)
+(defun fuse-recipe-role :private (shape: FuseShape) -> Role
+  (role-items [Keep Fuse (match shape ((FsTwo) Fuse) (_ Expr))] Expr))
+
+;; What `fuse-rewrite` made of a form: the recipe call and the roles of its
+;; items, or the form as it was (the Rust `Result<(Form, Role), Form>`).
+(defenum Staged
+  (StageRewritten form: Stx role: Role)
+  (StageKept form: Stx))
+
+;; The arguments of the recipe call for the stage `(name p c)`.
+(defun recipe-args :private (shape: FuseShape p: Stx c: Stx ctx: ExpandCtx pos: Pos) -> (Vec Stx)
+  (match shape
+    ((FsParam) [c p])
+    ((FsTwo) [p c])
+    ((FsComplement) [c (fuse-complement-of p ctx pos)])))
+
+;; The rewrite of `form` as a stage in the collection position of a
+;; terminal consumer or of another stage; `form` itself when it is not a
+;; stage the rewrite can take. (stage::rewrite)
+(defun fuse-rewrite (env: FuseEnv ctx: ExpandCtx form: Stx) -> Staged
+  (let ((items (fuse-list-items form)))
+    (match (fuse-stage-call env items)
+      (nil (StageKept form))
+      ((some row)
+       (let ((pos (. form pos)))
+         (StageRewritten (call (. row recipe)
+                               (recipe-args (. row shape) (nth items 1) (nth items 2) ctx pos)
+                               pos)
+                         (fuse-recipe-role (. row shape))))))))
+
+;; The roles of a terminal consumer's items: the head, the arguments, and
+;; the collection (the first argument or the last) in the fusing role.
+;; (fuse::terminal_role)
+(defun fuse-terminal-role (n: i64 row: Terminal) -> Role
+  (let ((at (if (. row coll-first) 1 (- n 1))))
+    (role-items (conj (loop ((first [Expr]))
+                        (if (< (count first) at) (recur (conj first Arg)) first))
+                      Fuse)
+                Arg)))
+
+;; ------------------------------------------------------ the module
+
+;; Whether a module is the library's own. (fuse::is_library)
+(defun fuse-library-ns? (ns: str) -> bool
+  (starts-with? ns "fib."))
+
+(defun sees-ns? :private (uses: (Vec str) implicit: (Vec str) ns: str) -> bool
+  (or (fuse-any-name? uses ns) (fuse-any-name? implicit ns)))
+
+(defun fuse-any-name? :private (names: (Vec str) ns: str) -> bool
+  (loop ((i 0))
+    (cond ((>= i (count names)) false)
+          ((= (nth names i) ns) true)
+          (else (recur (+ i 1))))))
+
+;; The shadowing names: `defined` and what each non-library module in
+;; `uses` exports.
+(defun shadow-names :private (ctx: ExpandCtx defined: (Map str bool) uses: (Vec str)) -> (Map str bool)
+  (loop ((i 0) (acc defined))
+    (if (< i (count uses))
+        (recur (+ i 1)
+               (if (fuse-library-ns? (nth uses i)) acc (ctx-add-exported ctx acc (nth uses i))))
+        acc)))
+
+;; What the module `ctx` is expanding is, for the rewrite. (fuse::module_env)
+(defun fuse-module-env (ctx: ExpandCtx defined: (Map str bool)) -> ModuleEnv
+  (let ((scope @(. ctx scope)))
+    (let ((uses (. scope uses))
+          (implicit (. scope implicit)))
+      (ModuleEnv (shadow-names ctx defined uses)
+                 (sees-ns? uses implicit "fib.seq")
+                 (sees-ns? uses implicit "fib.coll")
+                 (sees-ns? uses implicit "fib.core")))))

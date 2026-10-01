@@ -1,0 +1,27 @@
+;; spec:   stdlib §2.1 rule 2 and P2 (a fused chain allocates nothing per element), §8.1 item 5 (count cases), tranche 1 plan R9
+;; expect: accept
+;; result: 867
+;; audit:  clean
+;; allocs: <= 4
+;; roots:  ../../lib support
+;; covers: map filter reduce
+;; The chain of the page's A1, written as a program writes it with `->>`: map, then filter, then a fold,
+;; over a Vec of 50 elements. The expander gives the fold the recipes, so the loop is one each-while over
+;; two recipe structs and the two closures they store: 4 heap objects (the free trace of both tools), and
+;; nothing per element. The same chain over 500 elements has the same bound (case 826), so a stage that
+;; allocated per element would fail one of the two. Bound to a name and summed, the same chain is a lazy
+;; seq of about 12 objects per element (A13 lz3: +17526 for 1000), which case 827 runs. The Vec is a
+;; `def`, whose objects the trace leaves out (compiler.md §4); a literal of more than 500 elements
+;; overflows the lowering stack (case 203's note).
+(ns main (:use fib.core fib.seq))
+
+(def xs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+  20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+  40 41 42 43 44 45 46 47 48 49])
+
+(defun main () -> i64
+  (->> xs
+       (map (fn (x: i64) (+ (* x 2) 1)))
+       (filter (fn (x: i64) (= (rem x 3) 0)))
+       (reduce (fn (a: i64 x: i64) (+ a x)) 0)))

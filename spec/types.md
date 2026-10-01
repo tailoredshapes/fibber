@@ -270,8 +270,9 @@ are (§8.1). The prelude derives `Eq`, `Ord` (`nil` before `some`),
   (§8.7); a `(Weak (dyn P))` is that box and the vtable, by value
   (**Decided**, owner, 2026-09-27; §8.1). `T` is never an `Option`
   (§2.11).
-- `(Task T)`: the result of `spawn` and of `async`; `join`, `block-on`
-  and `await` take it. `Send (Task T) = Send T`. Any number of holders
+- `(Task T)`: the result of `spawn` and of `async`; `join`, `block-on`,
+  `await` and `@` (its `Deref` instance, §2.9: `@t` is `(join t)`) take it.
+  `Send (Task T) = Send T`. Any number of holders
   may join or await one task; the runtime resumes it on one thread at a
   time (§8.8).
 
@@ -294,7 +295,7 @@ C ::= (P T₁ .. Tₙ)          ; protocol constraint; T₁ is the dispatch posi
     | κ₁ ⊑ κ₂               ; colour order, send ⊑ local (§5.4)
     | κ ⊒ Caps{T₁ .. Tₖ}    ; a closure is at least as local as its captures demand
     | HasField(T, f, R)     ; deferred: T is a struct with field f : R (§3.4); never in a scheme
-    | HasDeref(T, R)        ; deferred: T is a Cell, Atom or Weak (§3.4); never in a scheme
+    | HasDeref(T, R)        ; deferred: T is a Cell, Atom, Weak or Task (§3.4); never in a scheme
 σ ::= ∀ā ς̄. C̄ ⇒ T           ; a type scheme
 ```
 
@@ -488,11 +489,25 @@ the operand of `@`; these two positions and `&v` are the only ones in
 which `v` may occur.
 
 `Deref` is the built-in protocol `(defprotocol (Deref c t) (deref (self) -> t))`
-with the built-in instances `(Deref (Cell a) a)`, `(Deref (Atom a) a)` and
-`(Deref (Weak a) (Option a))`; `t` is determined by `c`. `@x` on a
+with the built-in instances `(Deref (Cell a) a)`, `(Deref (Atom a) a)`,
+`(Deref (Weak a) (Option a))` and `(Deref (Task a) a)`; `t` is determined
+by `c`. `@x` on a
 variable of unresolved type is the deferred constraint `HasDeref` (§3.4),
 resolved when the head becomes known; unresolved at generalisation it is
-the error `cannot infer whether x is a cell, an atom or a weak reference`.
+the error `cannot infer whether x is a cell, an atom, a weak reference or a task`.
+
+The instance for `(Task a)` is **Proposed** (owner's rule, 2026-10-01: unless it
+breaks memory safety, Clojure's ergonomics are the ones fibber replicates, and
+`@f` of a future is `(join f)` there). Its `deref` is `join` (§2.11): it blocks
+until the task is done (a scheduling point, §8.8) and gives the task's result,
+retained for the caller and `Owned`, with the ownership behaviour of the call
+`(join t)`: the operand is borrowed, never consumed. So `@t` may be read as often
+as anyone asks and from several threads, as a task may be joined (§6.8, §8.8),
+and a task that traps aborts the program as it does under `join` (§2.11). Until
+this amendment the list above had three instances and the checker rejected `@t`
+of a task with `no implementation of Deref for (Task a)`; case stdlib/658
+pinned that rejection and now pins the acceptance, and cases ownership/232 to
+236 pin the behaviour in both tools.
 
 ### 2.10 `atom`, `swap!`, `reset!`
 
@@ -954,7 +969,7 @@ bound, and again at the end of the SCC:
 | `(P T₁ .. Tₙ)` | head of `T₁` known: look up the unique instance for `(P, head T₁)`, instantiate it, unify its `S` with `T₁` and its determined arguments with `T₂ .. Tₙ` (the improvement `T₁ → T₂..`), then replace the constraint by the instance's declared context (§2.7). `T₁` a rigid variable: must be entailed by a bound, or by a supertrait of one (§4.1 rule 2). `T₁ = (dyn P)` or `(dyn P :send)`: satisfied, and so is `(Q (dyn P) ..)` for a supertrait `Q` of `P` (§4.1 rule 3). `T₁` an unbound variable at generalisation: becomes a bound of the scheme if `T₁` occurs in the type, else `ambiguous constraint P a in f; add an annotation` | `no implementation of P for T₁` |
 | `(Send T)`, `(Object T)`, `(Weakable T)` | evaluated structurally once the head is known (§5.1, §2.11); a quantified variable's constraint becomes a bound | `cell cannot be shared between threads: …` (§5.3) / `value of type T cannot be shared between threads: …` / `dyn requires an object type` / `weak requires an object type` / `weak of an Option is not allowed` |
 | `HasField(T, f, R)` | `T` becomes a struct: `R ~` field type | `T has no field f`; unresolved at generalisation: `cannot infer the struct type of e for field f; annotate it` |
-| `HasDeref(T, R)` | `T` becomes `Cell`/`Atom`/`Weak`: `R ~ T'`/`T'`/`(Option T')` | unresolved: `cannot infer whether x is a cell, an atom or a weak reference` |
+| `HasDeref(T, R)` | `T` becomes `Cell`/`Atom`/`Weak`/`Task`: `R ~ T'`/`T'`/`(Option T')`/`T'` | unresolved: `cannot infer whether x is a cell, an atom, a weak reference or a task` |
 | colour constraints | §5.4, after all type constraints of the SCC | `cell cannot be shared between threads: closure capture n has type (Cell T)` |
 
 Termination: each step binds a variable, removes a constraint, or
@@ -1064,6 +1079,8 @@ runs the program; that divergence is open (stdlib design §7 B4).
   sendable argument.
 - **Weak.** `(weak e)` emits `(Weakable T)`; `@w` resolves through the
   `Deref` instance to `(Option T)`. `(dyn P e)` emits `(Object T)`.
+- **Task.** `@t` on a `(Task T)` resolves through the `Deref` instance to
+  `T` (§2.9) and is `(join t)`; it adds no `Send` obligation of its own.
 - **Protocols.** A method call emits `(P τ θ̄)` with τ the receiver's
   type and the result typed with `self := τ`, `d̄ := θ̄`; resolution and
   improvement happen in §3.3 step 1; what remains after zonking is a
@@ -1496,7 +1513,7 @@ relies on exactly this distinction.
 | variable naming a `def` | `Borrowed(g)`, `g` the global binding (§6.1); its value is immortal like a literal |
 | struct or variant constructor call, rewritten `[...]`/`{...}` | `Owned` |
 | call of a `defun`, protocol method, primitive or closure value returning an object | `Owned` (**Decided**, §4: results are owned) |
-| `@c` on a cell or atom; `@w` on a weak | `Owned` (§6.7) |
+| `@c` on a cell or atom; `@w` on a weak; `@t` on a task (as `(join t)`, §2.9) | `Owned` (§6.7) |
 | `(cell e)`, `(atom e)`, `(weak e)`, `(fn ..)`, `(async ..)`, `(spawn ..)`, `(join ..)`, `(await ..)`, `(swap! ..)` | `Owned` |
 | variable `x` | as its binding says (§6.1) |
 | `(. e f)` | `Derived(b)` if `e` is `Borrowed(b)` or `Derived(b)`; if `e` is `Owned`, `e` becomes an implicit owning temporary `t` of the current step and the result is `Derived(t)` |
@@ -2448,7 +2465,7 @@ object, or returned one that others still hold: case 01's `h` is the
 box inside `l`'s list, retained by `first`); a literal collection,
 whose rewrite is a chain of prelude calls (syntax §1.4; a fused
 allocation would have to be specified before it could qualify); the
-result of a scope exit or a join; a cell, atom or weak read; `swap!`,
+result of a scope exit or a join; a cell, atom, weak or task read; `swap!`,
 `join`, `await`; an immortal; the rest vector of a vector pattern,
 which `fib.vec-drop` makes (§6.3, §8.3). A parameter's object arrived from
 elsewhere, and a loop variable is rebound by every `recur` to an object
@@ -2620,7 +2637,7 @@ and a double release as a count going negative.
 | function with & parameters is not a value | §2.1, §2.13 |
 | T has no field f | §2.5, §2.13, §3.3 |
 | cannot infer the struct type of e for field f; annotate it | §3.4, §2.13 |
-| cannot infer whether x is a cell, an atom or a weak reference | §3.4 |
+| cannot infer whether x is a cell, an atom, a weak reference or a task | §3.4 |
 | no implementation of P for T | §3.3 |
 | ambiguous constraint P a in f; add an annotation | §3.3 |
 | cannot construct the infinite type | §3.2 |
@@ -3152,6 +3169,10 @@ way, box then vtable (lir.md §2).
 - `@a` on an atom: `fib.lock a` (`cmpxchg` spinlock, acquire), `v = load`,
   `fib.retain v`, `fib.unlock a` (release store) — the single atomic step
   §7 requires.
+- `@t` on a task (**Proposed**, §2.9): the lowering of `(join t)` (§8.8),
+  nothing of its own: `fib.drive t`, then the result read from the task's
+  result atom as `@a` reads an atom, retained for the caller. The task is
+  not consumed, so `@t` may be repeated.
 - `(swap! a f)`: loop { `old = @a` (retained: the snapshot);
   `fib.retain old` and `fib.retain f` (the call's counts: `f` is called
   through a function value, which consumes the closure and each object

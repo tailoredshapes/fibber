@@ -1,0 +1,31 @@
+;; spec:   stdlib §2.1 rule 2 and §2.4 (a predicate answers a bool or an Option), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: remove take vec count
+;; The recipe of `remove` is Filtered over the complement of the predicate, and the predicate may
+;; answer an Option as well as a bool, as `filter`'s may (a `some` is a pass): the complement is
+;; `(not (truthy? (p x)))`, not `(not (p x))`, which does not type-check for an Option. The
+;; predicate is a symbol (the recipe wraps a call of it), a plain `fn` literal (the recipe wraps the last
+;; form of its body, so its other forms still run, once per element) or a literal that has a result
+;; type (not taken: the lazy form answers the same). The predicate runs once per element each way.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((big (fn (x: i64) (do (set! calls (+ @calls 1)) (> x 2))))
+          (pick (fn (x: i64) (do (set! calls (+ @calls 1)) (if (> x 2) (some x) nil)))))
+      (do (check c (= (vec (remove big [1 2 3 4])) [1 2]))
+          (check c (= @calls 4))
+          (set! calls 0)
+          (check c (= (vec (remove pick [1 2 3 4])) [1 2]))
+          (check c (= @calls 4))
+          (set! calls 0)
+          (check c (= (vec (remove (fn (x: i64) (do (set! calls (+ @calls 1)) (> x 2))) [1 2 3 4])) [1 2]))
+          (check c (= @calls 4))
+          (check c (= (vec (remove (fn (x: i64) (if (> x 2) (some x) nil)) [1 2 3 4])) [1 2]))
+          (check c (= (count (remove (fn (x: i64) -> bool (> x 2)) [1 2 3 4])) 2))
+          (check c (= (vec (take 1 (remove big (map (fn (x: i64) (+ x 1)) [0 1 2 3])))) [1]))
+          (checks-result c)))))

@@ -10,13 +10,12 @@
 ;;    A Set is Keyed, Dissoc, Collection and Emptyable.
 ;;  - keys and vals answer an LSeq of the keys or values in the walk's order, which is the hash's; the
 ;;    two are in one order. The walk of the map happens when keys is called (it collects a Vec, and the
-;;    seq is the lazy view of that Vec, to-lseq), as the table's note "an empty recipe, not nil" allows. They read any source of Pairs through Reducible, so a Map is one once
-;;    L5a lands its instance and a Vec of Pairs is one today.
+;;    seq is the lazy view of that Vec, to-lseq), as the table's note "an empty recipe, not nil" allows.
+;;    They read any source of Pairs through Reducible: a Map is one (fib.seq.sources), and so is a Vec of Pairs.
 ;;  - merge is right-biased over two maps (Clojure's: the later map wins a conflict). The macro that
 ;;    nests more operands is Rust (R6a).
-;;  - the only walk of a Map this part makes itself is `map-entries`, because the prelude's early-exit
-;;    walk (L4's map-each) does not exist yet and the prelude's for-each hands out Entry structs: when L4
-;;    replaces Entry with Pair, that one function changes and nothing else.
+;;  - this part walks a Map only through Reducible (each-while), whose Map instance is L5a's and stops at
+;;    the first false; it names no entry type of the prelude.
 ;; Every instance for Map and Set needs (Hash k) (Eq k).
 (ns fib.coll.map (:use fib.core fib.seq fib.coll.protocols))
 
@@ -49,12 +48,6 @@
 ;; (disj s x): s without x; the page's `disj` is the Dissoc method under its Clojure name
 (defun disj (s: s x: k) :where ((Dissoc s k)) -> s (dissoc s x))
 
-;; every entry of a map, as a Vec of Pairs, in the walk's order
-(defun map-entries :private (m: (Map k v)) -> (Vec (Pair k v))
-  (let ((acc (cell (vec-empty))))
-    (do (fib.prelude/for-each m (fn (e) (set! acc (fib.prelude/vec-conj @acc (Pair (. e fst) (. e snd))))))
-        @acc)))
-
 (defun keys (m: m) :where ((Reducible m (Pair k v))) -> (LSeq k)
   (let ((acc (cell (vec-empty))))
     (do (each-while m (fn (p) (do (set! acc (fib.prelude/vec-conj @acc (. p fst))) true)))
@@ -68,7 +61,7 @@
 ;; (merge a b): a with every entry of b, b's value winning a conflict
 (defun merge (a: (Map k v) b: (Map k v)) :where ((Hash k) (Eq k)) -> (Map k v)
   (let ((acc (cell a)))
-    (do (each-while (map-entries b)
+    (do (each-while b
           (fn (p) (do (set! acc (fib.prelude/map-assoc @acc (. p fst) (. p snd))) true)))
         @acc)))
 

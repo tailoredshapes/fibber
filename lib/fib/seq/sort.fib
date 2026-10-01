@@ -11,10 +11,9 @@
 ;;    true means "before" and a false asks the swapped call (`resolve`, fib.core.protocols). Two
 ;;    elements that compare equal keep their input order: the left one is taken unless the comparator
 ;;    says it is strictly after the right one.
-;;  - `sort` and `sort-by` compare with `<` alone (the private `ord-compare`, which is what L1's
-;;    `compare` is: built on `<`, so a NaN compares 0 against everything and `sort` over floats
-;;    holding a NaN is memory safe with an unspecified order, §2.7). It is restated here because
-;;    fib.core.num is a separate part; once `compare` is exported by fib.core this body may call it.
+;;  - `sort` and `sort-by` compare with fib.core's `compare` (L1's: built on `<` alone, so a NaN compares 0
+;;    against everything and `sort` over floats holding a NaN is memory safe with an unspecified order,
+;;    §2.7).
 ;;  - `sort-by` calls the key twice per comparison, as Clojure's `(sort (fn [x y] (compare (key x)
 ;;    (key y))) c)` does (§4.4 row sort-by); `sort-by-cached` (tranche 3) decorates instead. The key
 ;;    is not declared :borrow, as the row says; the comparator is, for it is only called.
@@ -22,14 +21,9 @@
 ;;  - `group-by` and `frequencies` fill a Map held in a cell in one pass; each group is a Vec in
 ;;    encounter order. They go through the prelude's `map-get` and `map-assoc` (`fib.prelude/NAME`,
 ;;    plan §4.3 rule 4) because fib.coll's `get` and `assoc` are above this part.
-;;  - the empty List is `(list)` and a cons onto it `fib.prelude/conj`, so the part names no List
-;;    variant and reads the same before and after R2 renames `empty`/`cons` to `Empty`/`Cons`.
+;;  - the empty List is `(list)` and a cons onto it `fib.prelude/conj`, so the part names no List variant.
 ;;  - no `/` on integers (plan PC-14) and no `min`/`max` (L1's): the one clamp is `imin`.
 (ns fib.seq.sort (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
-
-;; L1's compare, built on `<`: negative, zero or positive, 0 when neither is less (so for a NaN)
-(defun ord-compare :private (a: e b: e) :where ((Ord e)) -> i64
-  (if (< a b) -1 (if (< b a) 1 0)))
 
 (defun imin :private (a: i64 b: i64) -> i64 (if (< a b) a b))
 
@@ -64,19 +58,19 @@
               (loop ((i 0) (out (vec-empty)))
                 (if (< i n) (recur (+ i 1) (fib.prelude/conj out (array-get @cur i))) out)))))))
 
-;; (sort-with cmp c): the 2-arity of Clojure's sort until L1; the comparator's result is a Cmp
+;; (sort-with cmp c): the 2-arity of Clojure's sort until L1 (arity overloading); the comparator's result is a Cmp
 (defun sort-with (cmp: (fn (e e) r) :borrow c: c) :where ((Reducible c e) (Cmp r)) -> (VSeq e)
   (vseq-of (sort-vec (fn (a b) (resolve (cmp a b) (fn () (cmp b a)))) (to-vec c))))
 
 (defun sort (c: c) :where ((Reducible c e) (Ord e)) -> (VSeq e)
-  (vseq-of (sort-vec (fn (a b) (ord-compare a b)) (to-vec c))))
+  (vseq-of (sort-vec (fn (a b) (compare a b)) (to-vec c))))
 
 ;; (sort-by-with key cmp c): the 3-arity of Clojure's sort-by until L1; cmp compares two keys
 (defun sort-by-with (key: (fn (e) k) cmp: (fn (k k) r) :borrow c: c) :where ((Reducible c e) (Cmp r)) -> (VSeq e)
   (vseq-of (sort-vec (fn (a b) (resolve (cmp (key a) (key b)) (fn () (cmp (key b) (key a))))) (to-vec c))))
 
 (defun sort-by (key: (fn (e) k) c: c) :where ((Reducible c e) (Ord k)) -> (VSeq e)
-  (vseq-of (sort-vec (fn (a b) (ord-compare (key a) (key b))) (to-vec c))))
+  (vseq-of (sort-vec (fn (a b) (compare (key a) (key b))) (to-vec c))))
 
 ;; a List of the elements, last first
 (defun reverse (c: c) :where ((Reducible c e)) -> (List e)

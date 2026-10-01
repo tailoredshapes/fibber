@@ -13,8 +13,9 @@
 
 use crate::syntax::{Form, Pos};
 
+use super::record::{debug_of, label, record_text};
 use super::{combine, eq_all, impl_form, lex_less, method, not_equal, ord_rest, show_call, Proto};
-use crate::expand::build::{boolean, list, sym};
+use crate::expand::build::{boolean, list, string, sym};
 use crate::expand::ctx::ExpandCtx;
 use crate::expand::types::{EnumInfo, VariantInfo};
 
@@ -86,12 +87,26 @@ fn less_body(ctx: &ExpandCtx, info: &EnumInfo, pos: &Pos) -> Form {
     match_on("self", clauses.collect(), pos)
 }
 
-/// The body of `hash` or `show`: one clause per variant over its fields.
+/// The text of `Debug` and `ToStr` of one variant: its bare name when it
+/// has no field, else the record `#m.V{:f x, ..}` over its variables.
+fn variant_record(ctx: &ExpandCtx, v: &VariantInfo, xs: Vec<Form>, pos: &Pos) -> Form {
+    if v.fields.is_empty() {
+        return string(&v.name, pos);
+    }
+    let names = v.fields.iter().enumerate();
+    let labels = names.map(|(i, (n, _))| label(n.as_deref(), i)).collect();
+    let texts = xs.into_iter().map(|x| debug_of(x, pos)).collect();
+    record_text(&ctx.scope().ns, &v.name, labels, texts, pos)
+}
+
+/// The body of `hash`, `show`, `debug` or `to-str`: one clause per variant
+/// over its fields.
 fn per_variant(ctx: &ExpandCtx, info: &EnumInfo, proto: Proto, pos: &Pos) -> Form {
     let clauses = info.variants.iter().enumerate().map(|(i, v)| {
         let xs = vars(ctx, v, "", pos);
         let body = match proto {
             Proto::Hash => combine(i as i64, xs.clone(), pos),
+            Proto::Debug | Proto::ToStr => variant_record(ctx, v, xs.clone(), pos),
             _ => show_call(&v.name, xs.clone(), pos),
         };
         clause(pattern(v, xs, pos), body, pos)
@@ -100,7 +115,7 @@ fn per_variant(ctx: &ExpandCtx, info: &EnumInfo, proto: Proto, pos: &Pos) -> For
 }
 
 /// The `impl` for `proto` on the enum `info`, which has at least one
-/// variant with fields.
+/// variant with fields, or is for `Debug` or `ToStr`.
 pub(super) fn derive(ctx: &ExpandCtx, proto: Proto, info: &EnumInfo, pos: &Pos) -> Form {
     let methods = match proto {
         Proto::Eq => vec![
@@ -118,8 +133,8 @@ pub(super) fn derive(ctx: &ExpandCtx, proto: Proto, info: &EnumInfo, pos: &Pos) 
             per_variant(ctx, info, proto, pos),
             pos,
         )],
-        Proto::Show => vec![method(
-            "show",
+        Proto::Show | Proto::Debug | Proto::ToStr => vec![method(
+            proto.text_method(),
             &["self"],
             per_variant(ctx, info, proto, pos),
             pos,

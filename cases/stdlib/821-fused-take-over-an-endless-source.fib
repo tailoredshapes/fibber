@@ -1,0 +1,49 @@
+;; spec:   stdlib §2.1 rule 2 (an infinite source is fine: the fused loop has no seq and no chunk), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter take vec reduce-while
+;; A source that is endless as far as a chain is concerned: a user type whose each-while counts
+;; up to a hundred thousand and counts every element it hands out. The lazy form of an adaptor
+;; over a source that is not a seq converts it first, with the default to-lseq, which walks the
+;; whole source (the page's iterate is endless, and there it would never come back; this one ends so
+;; that a regression is a count and not a hang). The fused path stops the source at the n-th
+;; element: `(vec (take 2 (map f (iterate inc 0))))` is [0 2] with 2 calls of f (A13 lz1) and the
+;; source is asked for 2 elements, not 100000. A walk that took one element too many would show
+;; as 3 pulls or a third call of f.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct Naturals (from: i64 pulled: (Cell i64)))
+(impl (Reducible i64) Naturals
+  (each-while (self k)
+    (loop ((i (. self from)))
+      (if (< i 100000)
+          (do (set! (. self pulled) (+ @(. self pulled) 1))
+              (if (k i) (recur (+ i 1)) false))
+          true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (pulled (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2))))
+          (even (fn (x: i64) (= (rem x 2) 0))))
+      (do (check c (= (vec (take 2 (map f (Naturals 0 pulled)))) [0 2]))
+          (check c (= @calls 2))
+          (check c (= @pulled 2))
+          (set! calls 0)
+          (set! pulled 0)
+          (check c (= (vec (take 3 (filter even (map f (Naturals 1 pulled))))) [2 4 6]))
+          (check c (= @calls 3))
+          (check c (= @pulled 3))
+          (set! pulled 0)
+          (check c (= (vec (take-while (fn (x: i64) (< x 5)) (Naturals 2 pulled))) [2 3 4]))
+          (check c (= @pulled 4))
+          (set! pulled 0)
+          (check c (= (vec (take 2 (drop 3 (Naturals 0 pulled)))) [3 4]))
+          (check c (= @pulled 5))
+          (set! pulled 0)
+          (check c (= (reduce-while (fn (a: i64 x: i64) (if (> x 3) (reduced a) (More (+ a x)))) 0 (Naturals 0 pulled)) 6))
+          (check c (= @pulled 5))
+          (checks-result c)))))

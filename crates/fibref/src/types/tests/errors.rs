@@ -137,11 +137,11 @@ fn cannot_infer_the_struct_type() {
 }
 
 #[test]
-fn cannot_infer_cell_atom_or_weak() {
+fn cannot_infer_cell_atom_weak_or_task() {
     fails(
         "(defun get (c) @c) (defun main () -> i64 0)",
         K::DerefUnresolved,
-        "cannot infer whether c is a cell, an atom or a weak reference",
+        "cannot infer whether c is a cell, an atom, a weak reference or a task",
     );
     // Any later use that fixes the head resolves it (§3.4).
     ok("(defun get (c) (do (set! c 1) @c)) (defun main () -> i64 (get (cell 2)))");
@@ -194,10 +194,12 @@ fn cannot_unify() {
         K::Unify,
         "cannot unify i64 with i32",
     );
+    // A test that is not a bool: a primitive says why (D1, `conditions.rs`),
+    // anything else is the plain mismatch.
     fails(
-        "(defun main () -> i64 (if 1 2 3))",
+        "(defun main () -> i64 (if (some 1) 2 3))",
         K::Unify,
-        "cannot unify i64 with bool",
+        "cannot unify (Option i64) with bool",
     );
     // §2.10: set! on an atom.
     fails(

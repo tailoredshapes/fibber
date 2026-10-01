@@ -54,6 +54,10 @@
    macros: (Cell (Map str MacroDef))
    ;; the modules each module re-exports, by ns
    exports: (Cell (Map str (Vec str)))
+   ;; the public names each module defined at top level, by ns, as the
+   ;; modules expanded so far left them (the fusion rewrite asks whether a
+   ;; module it uses exports a name; expand.fuse)
+   defined: (Cell (Map str (Map str bool)))
    ;; the module being expanded
    scope: (Cell ModuleScope)
    ;; the structs and enums seen so far, by name (Option and Form built in)
@@ -86,6 +90,7 @@
              (cell 0)
              (cell (map-empty))
              (cell (map-empty))
+             (cell (map-empty))
              (cell (scope-of prelude-ns))
              (cell (map-empty))
              (cell (builtin-enums))
@@ -113,6 +118,34 @@
   (if (> (count exports) 0)
       (set! (. ctx exports) (assoc @(. ctx exports) ns exports))
       ()))
+
+;; Records the public names module ns defines at top level.
+;; (ctx.rs `record_names`)
+(defun ctx-record-names (ctx: ExpandCtx ns: str names: (Map str bool)) -> unit
+  (set! (. ctx defined) (assoc @(. ctx defined) ns names)))
+
+;; The names `acc` has and those module ns exports: what it defines
+;; publicly and what the modules it re-exports export, as far as they have
+;; been expanded. (ctx.rs `exported_names`, added to a set)
+(defun ctx-add-exported (ctx: ExpandCtx acc: (Map str bool) ns: str) -> (Map str bool)
+  (loop ((pending [ns]) (i 0) (seen (map-empty)) (out acc))
+    (if (< i (count pending))
+        (let ((m (nth pending i)))
+          (if (some? (map-get seen m))
+              (recur pending (+ i 1) seen out)
+              (recur (append-names pending (reexported-by ctx m))
+                     (+ i 1)
+                     (assoc seen m true)
+                     (union-names out (unwrap-or (map-get @(. ctx defined) m) (map-empty))))))
+        out)))
+
+;; The modules ns re-exports, none when it re-exports none.
+(defun reexported-by :private (ctx: ExpandCtx ns: str) -> (Vec str)
+  (unwrap-or (map-get @(. ctx exports) ns) (vec-empty)))
+
+(defun append-names :private (a: (Vec str) b: (Vec str)) -> (Vec str)
+  (loop ((i 0) (acc a))
+    (if (< i (count b)) (recur (+ i 1) (conj acc (nth b i))) acc)))
 
 ;; Ends the module being expanded: its private types are hidden from the
 ;; next, and the scope is a program with no ns clauses. (ctx.rs

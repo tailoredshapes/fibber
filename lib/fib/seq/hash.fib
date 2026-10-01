@@ -17,19 +17,13 @@
 ;;  - hash-unordered-coll xors the hashes of the elements (commutative, and it never traps) and then
 ;;    combines the count, so `[1 1]` and `[]`, whose xor is the same, differ.
 ;;  - Hash (Set k) is hash-unordered-coll of its elements. Hash (Map k v) is the same fold over the
-;;    entries, an entry's hash being `(hash-combine (hash key) (hash val))`. Both are independent of the
-;;    order of the walk, which for keys whose hashes collide is the order of insertion.
+;;    entries, an entry's hash being the hash of its (Pair k v), which the prelude derives. Both are
+;;    independent of the order of the walk, which for keys whose hashes collide is the order of insertion.
 ;;  - Eq (Map k v): the counts are equal and every entry of one is in the other with an equal value.
 ;;    Eq (Set k): the counts are equal and every element of one is in the other. Neither depends on the
 ;;    order of the walk.
 ;;  - never `*` in a combiner (the h*31 + x that the prelude's first Hash (List a) used trapped at three
 ;;    strings): every combiner is `hash-combine` or `bit-xor`.
-;;
-;; Stand-ins (the plan §7.5): Reducible has no instance for Map and Set until L5a, so a Map and a Set
-;; are walked by the prelude's `for-each` through the four private helpers below (the entry it hands
-;; out is a prelude Pair, `fst` and `snd`, since L4), and counted by the prelude's Countable. The
-;; prelude has had the early-exit walks `map-each` and `set-each` since L4; moving the helpers onto
-;; them, or onto Reducible, changes only those lines.
 (ns fib.seq.hash (:use fib.seq.protocols))
 
 ;; the hash of any source in its own order: equal elements in equal order, equal hash
@@ -68,42 +62,22 @@
 (impl Hash (Vec a) :where ((Hash a))
   (hash (self) (hash-ordered-coll self)))
 
-;; the four stand-ins: how a Map and a Set are walked and counted until L5a and L4 land
-(defun map-walk :private (m: (Map k v) f: (fn (k v) unit) :borrow) -> unit
-  (for-each m (fn (e) (f (. e fst) (. e snd)))))
-
-(defun set-walk :private (s: (Set k) f: (fn (k) unit) :borrow) -> unit
-  (for-each s f))
-
-(defun map-size :private (m: (Map k v)) -> i64 (fib.prelude/count m))
-
-(defun set-size :private (s: (Set k)) -> i64 (fib.prelude/count s))
-
+;; Map and Set are Reducible (fib.seq.sources: a Map yields (Pair k v), a Set its elements, both walks stop at the
+;; first false), so the instances below are written over each-while and size like every other source here.
 (impl Eq (Map k v) :where ((Hash k) (Eq k) (Eq v))
   (= (self y)
-    (if (= (map-size self) (map-size y))
-        (let ((ok (cell true)))
-          (do (map-walk self (fn (k v)
-                (if @ok (set! ok (match (map-get y k) ((some w) (= v w)) (nil false))) ())))
-              @ok))
+    (if (= (size self) (size y))
+        (each-while self (fn (e) (match (map-get y (. e fst)) ((some w) (= (. e snd) w)) (nil false))))
         false)))
 
 (impl Hash (Map k v) :where ((Hash k) (Hash v))
-  (hash (self)
-    (let ((h (cell 0)))
-      (do (map-walk self (fn (k v) (set! h (bit-xor @h (hash-combine (hash k) (hash v))))))
-          (hash-combine @h (map-size self))))))
+  (hash (self) (hash-unordered-coll self)))
 
 (impl Eq (Set k) :where ((Hash k) (Eq k))
   (= (self y)
-    (if (= (set-size self) (set-size y))
-        (let ((ok (cell true)))
-          (do (set-walk self (fn (x) (if (set-contains? y x) () (set! ok false))))
-              @ok))
+    (if (= (size self) (size y))
+        (each-while self (fn (x) (set-contains? y x)))
         false)))
 
 (impl Hash (Set k) :where ((Hash k))
-  (hash (self)
-    (let ((h (cell 0)))
-      (do (set-walk self (fn (x) (set! h (bit-xor @h (hash x)))))
-          (hash-combine @h (set-size self))))))
+  (hash (self) (hash-unordered-coll self)))

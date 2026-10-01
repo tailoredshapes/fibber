@@ -1,0 +1,175 @@
+;; compiler/expand/prelude/reduce.fib: `reduce`, the macro that declines by
+;; default (stdlib design §2.1 rule 3, tranche 1 R6b, PC-6), as
+;; crates/fibref/src/expand/prelude/reduce.rs (about 190 lines of Rust).
+;; The library function `fib.seq/reduce` is the three-argument fold; the
+;; macro answers the two calls the function cannot:
+;;
+;;   (reduce f c)   ==> (fib.seq/reduce-nonempty f c)
+;;   (reduce + c)   ==> (fib.seq/reduce + 0 c)     ; * 1, str "", conj [], merge {}, concat []
+;;   (reduce (fn (a x) .. (reduced e) ..) init c)
+;;                  ==> (fib.seq/reduce-while (fn (a x) ..) init c)
+;;
+;; In the last form every tail position of the literal `fn`'s body is
+;; rewritten, through `if`, `let`, `do`, `match`, `cond`, `when`, `unless`,
+;; `if-let`, `when-let` and `loop`: a tail `(reduced e)` becomes
+;; `(fib.core/Done e)`, any other tail `v` becomes `(fib.core/More v)`, and
+;; a tail `(recur ..)` is left alone. A call is declined (`reduce-macro`
+;; answers `nil`, which expand.prelude turns into `Declined`: the Rust
+;; returns the `Outcome`, whose type is expand.prelude's) when it has any
+;; other number of arguments than 2 or 3, or when it is the three-argument
+;; form and `f` is not a literal unnamed `(fn (a x) body+)` with no `->` or
+;; `:where` after its parameters or has no `(reduced e)` in a tail
+;; position. The Rust finds the tails with an explicit stack; here the
+;; rewrite recurses along the tail spine, which the reader's depth limit
+;; bounds. Called by expand.prelude (the registry row `reduce`).
+(ns expand.prelude.reduce
+  (:use syntax.pos syntax.form expand.build expand.prelude.parts))
+
+;; The identity of the literal heads whose `(f)` Clojure's reduce calls
+;; (`(+)` is 0): the value `(reduce f c)` starts from.
+(defun identity-of :private (f: Stx pos: Pos) -> (Option Stx)
+  (match (sym-of f)
+    (nil nil)
+    ((some s)
+     (cond ((= s "+") (some (int 0 pos)))
+           ((= s "*") (some (int 1 pos)))
+           ((= s "str") (some (string "" pos)))
+           ((or (= s "conj") (= s "concat")) (some (Stx (SVec (vec-empty)) pos)))
+           ((= s "merge") (some (Stx (SMap (vec-empty)) pos)))
+           (true nil)))))
+
+;; Where the tail sub-forms of a form are: none (the form is a leaf tail),
+;; every item from an index on (the branches of an `if`), the last item (the
+;; body of `let`, `do`, `loop`, `when`..), or the last item of every clause
+;; from an index on (`match`, `cond`).
+(defenum TailShape :private
+  TailLeaf
+  (TailFrom n: i64)
+  TailLast
+  (TailClauses n: i64))
+
+(defun tail-shape :private (form: Stx) -> TailShape
+  (match (items-of form)
+    (nil TailLeaf)
+    ((some items)
+     (let ((head (if (> (count items) 0) (unwrap-or (sym-of (nth items 0)) "") ""))
+           (n (count items)))
+       (cond ((and (or (= head "if") (= head "if-let")) (= n 4)) (TailFrom 2))
+             ((and (= head "do") (>= n 2)) TailLast)
+             ((and (or (= head "let") (= head "loop") (= head "when") (= head "unless")
+                       (= head "when-let"))
+                   (>= n 3))
+              TailLast)
+             ((and (= head "match") (>= n 3)) (TailClauses 2))
+             ((and (= head "cond") (>= n 2)) (TailClauses 1))
+             (true TailLeaf))))))
+
+;; A form with its tails rewritten, and whether one was a `reduced`.
+(defstruct TailForm :private (form: Stx found: bool))
+
+;; Items with the tails rewritten, and whether one was a `reduced`.
+(defstruct TailItems :private (items: (Vec Stx) found: bool))
+
+;; A leaf tail: `(reduced e)` is `(fib.core/Done e)`; `(reduced)` and
+;; `(reduced a b)` are left for the checker; `(recur ..)` is not a value;
+;; anything else is `(fib.core/More v)`.
+(defun leaf-tail :private (form: Stx pos: Pos) -> TailForm
+  (match (items-of form)
+    (nil (TailForm (call "fib.core/More" [form] pos) false))
+    ((some xs)
+     (cond ((and (>= (count xs) 1) (is-sym (nth xs 0) "reduced"))
+            (if (= (count xs) 2)
+                (TailForm (call "fib.core/Done" [(nth xs 1)] pos) true)
+                (TailForm form true)))
+           ((and (>= (count xs) 1) (is-sym (nth xs 0) "recur")) (TailForm form false))
+           (true (TailForm (call "fib.core/More" [form] pos) false))))))
+
+(defun list-items :private (form: Stx) -> (Vec Stx)
+  (unwrap-or (items-of form) (vec-empty)))
+
+;; `form` with its tails rewritten.
+(defun tails-of-form :private (form: Stx pos: Pos) -> TailForm
+  (match (tail-shape form)
+    ((TailLeaf) (leaf-tail form pos))
+    ((TailFrom n) (rebuilt form (items-from (list-items form) n pos)))
+    ((TailLast) (rebuilt form (items-from (list-items form) (- (count (list-items form)) 1) pos)))
+    ((TailClauses n) (rebuilt form (items-clauses (list-items form) n pos)))))
+
+(defun rebuilt :private (form: Stx r: TailItems) -> TailForm
+  (TailForm (Stx (SList (. r items)) (. form pos)) (. r found)))
+
+;; Every item from index `from` on, rewritten as a tail.
+(defun items-from :private (items: (Vec Stx) from: i64 pos: Pos) -> TailItems
+  (loop ((i 0) (acc (vec-empty)) (found false))
+    (if (< i (count items))
+        (if (>= i from)
+            (let ((r (tails-of-form (nth items i) pos)))
+              (recur (+ i 1) (conj acc (. r form)) (or found (. r found))))
+            (recur (+ i 1) (conj acc (nth items i)) found))
+        (TailItems acc found))))
+
+;; The last part of every clause `(head body+)` from index `from` on; a
+;; clause that is not a list of two or more forms is left as it is.
+(defun items-clauses :private (items: (Vec Stx) from: i64 pos: Pos) -> TailItems
+  (loop ((i 0) (acc (vec-empty)) (found false))
+    (if (< i (count items))
+        (if (>= i from)
+            (let ((r (clause-tail (nth items i) pos)))
+              (recur (+ i 1) (conj acc (. r form)) (or found (. r found))))
+            (recur (+ i 1) (conj acc (nth items i)) found))
+        (TailItems acc found))))
+
+(defun clause-tail :private (clause: Stx pos: Pos) -> TailForm
+  (match (items-of clause)
+    (nil (TailForm clause false))
+    ((some parts)
+     (if (>= (count parts) 2)
+         (rebuilt clause (items-from parts (- (count parts) 1) pos))
+         (TailForm clause false)))))
+
+;; Whether the form is `->` or `:where`, which a literal fn may carry
+;; after its parameters.
+(defun is-annotation :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SSym s) (= s "->"))
+    ((SKw k) (= k "where"))
+    (_ false)))
+
+;; Whether the form is a literal `(fn (acc x) body+)`: no name, two
+;; parameters, no `->` or `:where` before the body.
+(defun literal-fn :private (form: Stx) -> bool
+  (match (items-of form)
+    (nil false)
+    ((some items)
+     (and (>= (count items) 3)
+          (is-sym (nth items 0) "fn")
+          (match (items-of (nth items 1))
+            (nil false)
+            ((some ps) (= (count ps) 2)))
+          (if (is-annotation (nth items 2)) false true)))))
+
+;; `f` with its tails rewritten, when it is a literal `fn` that has a
+;; `reduced` in a tail position.
+(defun with-reduced-tails :private (f: Stx pos: Pos) -> (Option Stx)
+  (if (literal-fn f)
+      (let ((items (list-items f))
+            (r (items-from items (- (count items) 1) pos)))
+        (if (. r found) (some (Stx (SList (. r items)) (. f pos))) nil))
+      nil))
+
+;; `(reduce f c)`: `reduce-nonempty`, or `reduce` over the identity of a
+;; literal head.
+(defun two-argument-reduce :private (items: (Vec Stx) pos: Pos) -> Stx
+  (match (identity-of (nth items 1) pos)
+    ((some init) (call "fib.seq/reduce" [(nth items 1) init (nth items 2)] pos))
+    (nil (call "fib.seq/reduce-nonempty" [(nth items 1) (nth items 2)] pos))))
+
+;; One call of `reduce`: its rewrite, or `nil` when it is declined.
+(defun reduce-macro (items: (Vec Stx) pos: Pos) -> (Option Stx)
+  (let ((n (count items)))
+    (cond ((= n 3) (some (two-argument-reduce items pos)))
+          ((= n 4)
+           (match (with-reduced-tails (nth items 1) pos)
+             (nil nil)
+             ((some f) (some (call "fib.seq/reduce-while" [f (nth items 2) (nth items 3)] pos)))))
+          (true nil))))

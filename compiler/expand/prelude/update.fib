@@ -1,0 +1,55 @@
+;; compiler/expand/prelude/update.fib: `update` with Clojure's extra arguments
+;; and the `fnil` routing (stdlib design §2.4, tranche 1 R6b), as
+;; crates/fibref/src/expand/prelude/update.rs (79 lines of Rust). The
+;; library function `fib.coll/update` is the three-argument form; this macro
+;; answers the calls the function cannot:
+;;
+;;   (update m k f x ..)          ==> (fib.coll/update m k (fn (v) (f v x ..)))
+;;   (update m k (fnil g d))      ==> (fib.coll/update-or m k g d)
+;;   (update m k (fnil g d) x ..) ==> (fib.coll/update-or m k (fn (v) (g v x ..)) d)
+;;
+;; with `v` a gensym. A call with fewer than three arguments, and a
+;; three-argument call whose `f` is not a literal `(fnil g d)`, is declined:
+;; `update-macro` answers `nil`, which expand.prelude turns into
+;; `Declined` (the Rust returns the `Outcome` itself; the type is
+;; expand.prelude's and a submodule cannot name it). Only a literal `fnil`
+;; of one function and one default is routed. Called by expand.prelude (the
+;; registry row `update`).
+(ns expand.prelude.update
+  (:use syntax.pos syntax.form expand.ctx expand.build expand.prelude.parts))
+
+;; The `g` and `d` of a literal `(fnil g d)`, in that order.
+(defun fnil-literal :private (form: Stx) -> (Option (Vec Stx))
+  (match (items-of form)
+    (nil nil)
+    ((some xs)
+     (if (and (= (count xs) 3) (is-sym (nth xs 0) "fnil"))
+         (some [(nth xs 1) (nth xs 2)])
+         nil))))
+
+;; `(fn (v) (f v x ..))` with `v` a gensym: `f` called with the value and the
+;; extra arguments.
+(defun closure :private (ctx: ExpandCtx f: Stx extra: (Vec Stx) pos: Pos) -> Stx
+  (let ((v (ctx-gensym ctx "v" pos)))
+    (list-form [(sym "fn" pos)
+                (list-form [v] pos)
+                (list-form (concat-forms [f v] extra) pos)]
+               pos)))
+
+;; One call of `update`: its rewrite, or `nil` when it is declined.
+(defun update-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Option Stx)
+  (if (< (count items) 4)
+      nil
+      (let ((m (nth items 1))
+            (k (nth items 2))
+            (f (nth items 3))
+            (extra (tail-from items 4)))
+        (match (fnil-literal f)
+          ((some gd)
+           (if (= (count extra) 0)
+               (some (call "fib.coll/update-or" [m k (nth gd 0) (nth gd 1)] pos))
+               (some (call "fib.coll/update-or" [m k (closure ctx (nth gd 0) extra pos) (nth gd 1)] pos))))
+          (nil
+           (if (= (count extra) 0)
+               nil
+               (some (call "fib.coll/update" [m k (closure ctx f extra pos)] pos))))))))

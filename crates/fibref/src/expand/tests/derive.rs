@@ -1,7 +1,9 @@
 //! `derive` (§3.16, §4.4): the spec's own examples exactly, then the
 //! other protocols, generic and recursive types, and the prelude.
 
-use super::{one, prog, prog_err, read};
+use std::collections::HashMap;
+
+use super::{one, prog, prog_err, program, read};
 use crate::expand::derive::derive;
 use crate::expand::error::ExpandErrorKind as K;
 use crate::expand::{expand_prelude, expand_program, ExpandCtx, NoRunner};
@@ -10,7 +12,15 @@ use crate::syntax::FormKind;
 /// Registers `decls` in a fresh context, then runs the `derive` rewrite
 /// once on `call` and prints the result (not expanded further).
 fn derive_once(decls: &str, call: &str) -> String {
+    derive_in(None, decls, call)
+}
+
+/// [`derive_once`] in the module `ns` (the module a record's text names).
+fn derive_in(ns: Option<&str>, decls: &str, call: &str) -> String {
     let mut ctx = ExpandCtx::new();
+    if let Some(ns) = ns {
+        ctx.begin_module(ns, (&[], &[]), HashMap::new());
+    }
     expand_program(read(decls), &mut ctx, &mut NoRunner).unwrap_or_else(|e| panic!("{e}"));
     let form = one(call);
     let pos = form.pos.clone();
@@ -186,6 +196,158 @@ fn derive_sees_only_earlier_definitions() {
             name: "Later".into()
         }
     );
+}
+
+/// The `derive` rewrite of `derive` in module `ns`, printed.
+fn derived(decls: &str, derive: &str, ns: &str) -> String {
+    derive_in(Some(ns), decls, derive)
+}
+
+#[test]
+fn debug_on_a_struct_is_the_record_text() {
+    let got = derived("(defstruct S (x: i64 y: str))", "(derive Debug S)", "m");
+    assert_eq!(
+        one(&got),
+        one("(impl fib.core/Debug S (debug (self) \
+             (fib.prelude/str-concat \"#m.S{:x \" (fib.prelude/str-concat (fib.core/debug (. self x)) \
+             (fib.prelude/str-concat \", :y \" (fib.prelude/str-concat (fib.core/debug (. self y)) \"}\"))))))")
+    );
+}
+
+#[test]
+fn tostr_on_a_struct_is_the_same_text_by_to_str() {
+    let got = derived("(defstruct S (x: i64 y: str))", "(derive ToStr S)", "m");
+    assert_eq!(
+        one(&got),
+        one("(impl fib.core/ToStr S (to-str (self) \
+             (fib.prelude/str-concat \"#m.S{:x \" (fib.prelude/str-concat (fib.core/debug (. self x)) \
+             (fib.prelude/str-concat \", :y \" (fib.prelude/str-concat (fib.core/debug (. self y)) \"}\"))))))")
+    );
+}
+
+#[test]
+fn the_module_is_the_one_being_expanded() {
+    let got = derived("(defstruct S (x: i64))", "(derive Debug S)", "a.b");
+    assert!(got.contains("\"#a.b.S{:x \""), "{got}");
+}
+
+#[test]
+fn debug_on_a_generic_struct_asks_debug_of_the_parameters_it_uses() {
+    let got = derived("(defstruct (P t u) (x: i64 y: t))", "(derive Debug P)", "m");
+    assert!(
+        got.starts_with("(impl fib.core/Debug (P t u) :where ((fib.core/Debug t)) (debug (self) "),
+        "{got}"
+    );
+    // ToStr is built from the fields' Debug, so it asks for Debug too
+    let got = derived("(defstruct (P t u) (x: i64 y: t))", "(derive ToStr P)", "m");
+    assert!(
+        got.starts_with("(impl fib.core/ToStr (P t u) :where ((fib.core/Debug t)) (to-str (self) "),
+        "{got}"
+    );
+}
+
+#[test]
+fn debug_on_a_struct_of_unannotated_fields_names_the_synthesised_parameters() {
+    let got = derived("(defstruct Pair (a b))", "(derive Debug Pair)", "m");
+    assert!(
+        got.starts_with(
+            "(impl fib.core/Debug (Pair a b) :where ((fib.core/Debug a) (fib.core/Debug b)) "
+        ),
+        "{got}"
+    );
+}
+
+#[test]
+fn debug_on_a_private_struct_is_the_same_text() {
+    let mut ctx = ExpandCtx::new();
+    ctx.begin_module("m", (&[], &[]), HashMap::new());
+    let out = expand_program(
+        read("(defstruct S :private (x: i64)) (derive Debug S)"),
+        &mut ctx,
+        &mut NoRunner,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        out[1].to_string(),
+        "(impl fib.core/Debug S (debug (self) (fib.prelude/str-concat \"#m.S{:x \" \
+         (fib.prelude/str-concat (fib.core/debug (. self x)) \"}\"))))"
+    );
+}
+
+#[test]
+fn debug_on_an_enum_is_a_record_per_variant_with_fields_and_a_name_without() {
+    let got = derived(
+        "(defenum T (A) (B x: i64) (C i64 str))",
+        "(derive Debug T)",
+        "m",
+    );
+    assert_eq!(
+        got,
+        "(impl fib.core/Debug T (debug (self) (match self ((A) \"A\") \
+         ((B #x.1) (fib.prelude/str-concat \"#m.B{:x \" (fib.prelude/str-concat (fib.core/debug #x.1) \"}\"))) \
+         ((C #x.2 #x.3) (fib.prelude/str-concat \"#m.C{:0 \" (fib.prelude/str-concat (fib.core/debug #x.2) \
+         (fib.prelude/str-concat \", :1 \" (fib.prelude/str-concat (fib.core/debug #x.3) \"}\"))))))))"
+    );
+}
+
+#[test]
+fn tostr_on_a_generic_enum_asks_debug_of_the_parameters_it_uses() {
+    let got = derived(
+        "(defenum (Step a u) (Done v: a) (Stop))",
+        "(derive ToStr Step)",
+        "m",
+    );
+    assert_eq!(
+        got,
+        "(impl fib.core/ToStr (Step a u) :where ((fib.core/Debug a)) (to-str (self) (match self \
+         ((Done #v.1) (fib.prelude/str-concat \"#m.Done{:v \" (fib.prelude/str-concat (fib.core/debug #v.1) \"}\"))) \
+         ((Stop) \"Stop\"))))"
+    );
+}
+
+#[test]
+fn an_enum_of_no_fields_derives_debug_and_tostr_but_not_the_rest() {
+    let decls = "(defenum C (R) G B)";
+    assert_eq!(derive_once(decls, "(derive Eq C)"), "(do)");
+    assert_eq!(derive_once(decls, "(derive Show C)"), "(do)");
+    assert_eq!(
+        derived(decls, "(derive Debug C)", "m"),
+        "(impl fib.core/Debug C (debug (self) (match self ((R) \"R\") ((G) \"G\") ((B) \"B\"))))"
+    );
+    assert_eq!(
+        derived(decls, "(derive ToStr C)", "m"),
+        "(impl fib.core/ToStr C (to-str (self) (match self ((R) \"R\") ((G) \"G\") ((B) \"B\"))))"
+    );
+}
+
+#[test]
+fn debug_expands_fully_in_a_program() {
+    let out = prog("(defstruct S (x: i64)) (derive Debug S) (derive ToStr S)");
+    assert_eq!(out.len(), 3);
+    assert!(
+        out[1].starts_with("(impl fib.core/Debug S (debug (self) "),
+        "{}",
+        out[1]
+    );
+    assert!(
+        out[2].starts_with("(impl fib.core/ToStr S (to-str (self) "),
+        "{}",
+        out[2]
+    );
+}
+
+#[test]
+fn the_protocol_error_names_all_six() {
+    let err = program("(defstruct P (a)) (derive Foo P)")
+        .err()
+        .map(|e| e.to_string());
+    let msg = err.unwrap_or_default();
+    assert!(
+        msg.contains("cannot derive Foo: only Eq, Ord, Hash, Show, Debug and ToStr"),
+        "{msg}"
+    );
+    // Debug and ToStr are protocols now, not errors
+    assert!(program("(defstruct P (a)) (derive Debug P) (derive ToStr P)").is_ok());
 }
 
 #[test]

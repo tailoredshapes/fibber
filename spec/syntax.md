@@ -86,7 +86,7 @@ Each rewrites to a list form. There are exactly six.
 | `` `x `` | `(quasiquote x)` | template (§3.16) |
 | `,x` | `(unquote x)` | inside a quasiquote: splice one form |
 | `,@x` | `(unquote-splicing x)` | inside a quasiquote: splice a `(Vec Form)` |
-| `@x` | `(deref x)` | read a cell, atom or weak reference (§3.11) |
+| `@x` | `(deref x)` | read a cell, atom, weak reference or task (§3.11) |
 | `&x` | `(& x)` | in-out argument or parameter (§3.13); `x` must be a symbol |
 
 A comma immediately followed by a character that can start a form is
@@ -706,7 +706,7 @@ a rule for each (types §2.9–§2.11). None is a special form.
 | Call | Type | Meaning |
 |---|---|---|
 | `(cell v)` | `a -> (Cell a)` | a new cell holding `v` |
-| `(deref c)`, `@c` | protocol `Deref` | cell → its value; atom → its value; weak → `(Option T)`. Every object result is owned (+1). `c` is an expression, or the name of an `&` parameter (§3.13) |
+| `(deref c)`, `@c` | protocol `Deref` | cell → its value; atom → its value; weak → `(Option T)`; task → its result, as `(join c)` (**Proposed**, owner's rule 2026-10-01: Clojure's `@f` of a future; types §2.9). Every object result is owned (+1). `c` is an expression, or the name of an `&` parameter (§3.13) |
 | `(set! c v)` | `(Cell a) a -> unit` | store `v`, release the old value; the target `c` is an expression of cell type (a field path among them, §3.8) or the name of an `&` parameter, which is not an expression but may stand here and as the operand of `@` (§3.13; types §2.9) |
 | `(atom v)` | `a -> (Atom a)`, `Send a` | a new atom |
 | `(swap! a f)` | `(Atom a) (fn (a) a) -> a` | replace atomically with `(f old)`; `f` may run more than once, and `swap!` may never finish under contention or when `f` itself changes the atom each time (**Decided**, ownership.md §7); returns the new value (owned) |

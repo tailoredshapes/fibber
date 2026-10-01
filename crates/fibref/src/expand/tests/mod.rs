@@ -2,10 +2,17 @@
 
 mod derive;
 mod errors;
+mod fuse;
 mod hygiene;
 mod limits;
 mod positions;
 mod prelude;
+mod prelude_colls;
+mod prelude_defn;
+mod prelude_fold;
+mod prelude_print;
+mod prelude_reduce;
+mod prelude_update;
 mod quasi;
 mod reflect;
 mod walk;

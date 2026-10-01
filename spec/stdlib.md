@@ -1219,7 +1219,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `atom` | keep | `(atom v)` | `a -> (Atom a) \| Send a` | 1 | builtin; an atom of a type that is not `Send` is a compile error; a top-level `(def a (atom 0))` is allowed (§2.11) |
 | `swap!` | adapt | `(swap! a f arg ..)` | `(Atom a) (fn (a ..) a) .. -> a` | 1 | a prelude macro over the builtin: `(swap! a + 5)` is `(swap! a (fn (x) (+ x 5)))`, and the macro and the builtin coexist ([R] A10 swap: 30 under both tools); returns the new value; `f` may run more than once |
 | `reset!` | keep | `(reset! a v)` | `(Atom a) a -> unit` | 1 | builtin |
-| `deref` | keep | `@x` | `(Atom a) -> a` | 1 | builtin |
+| `deref` | keep | `@x` | `(Atom a) -> a` | 1 | builtin; also a `Cell` (its value), a `Weak` (an `Option`) and, **Proposed** (owner's rule 2026-10-01), a `Task`, whose `@t` is `(join t)` (types §2.9; cases ownership/232 to 236) |
 | `set!` | adapt | `(set! c v)` | `(Cell a) a -> unit` | 1 | builtin on a `Cell`; also `(set! (. obj field) v)`, and on a dynamic var inside `binding` (§2.11) |
 | `volatile!` | alias | `(volatile! x)` | `a -> (Atom a) \| Send a` | 2 | an `Atom` (§2.11): visible across tasks and `vswap!` not atomic, as Clojure's volatile ([R] A12 p12); `Cell` is the thread-confined form |
 | `vswap!` | adapt | `(vswap! v f arg ..)` | `(Atom a) (fn (a) a) .. -> a` | 2 | a macro for `(reset! v (f @v arg ..))`: not atomic, as Clojure's; returns the new value |
@@ -1306,7 +1306,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | ``x` | adapt | ``x` | reader | 1 | quasiquote with the `x#` auto-gensym (E14) and, with E11, qualification of free symbols in the macro's defining module |
 | `~x` | keep | `~x` | reader | 2 | Clojure's unquote; the comma becomes whitespace (E14: `[1,2]` is `[1 2]`); `,x` is the spelling of today and migrates with the macros of `lib/` and `compiler/` |
 | `~@x` | keep | `~@x` | reader | 2 | as `~x`, splicing a `(Vec Form)` |
-| `@x` | keep | `@x` | reader | 1 | cells, atoms and weak references |
+| `@x` | keep | `@x` | reader | 1 | cells, atoms, weak references and tasks |
 | `#'x` | adapt | `#'x` | core form | 3 | reads as `(var x)` (E14) |
 | `#_` | keep | `#_` | reader | 1 | syntax §1.1 |
 | `#(...)` | adapt | `#(f % %2)` | reader | 2 | reads as `(fn (%1 %2) (f %1 %2))`; `%` is `%1`; `%&` binds the rest as a `Vec` where the expected function type fixes the arity (L22); nesting is an error (§7 E8) |
@@ -1900,7 +1900,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `cancelled?` (new) | new | `(cancelled?)` | `-> bool` | 5 | the poll of the running task's interrupt flag, which `future-cancel` sets (§2.11); not a Clojure name |
 | `promise` | adapt | `(promise)` | `-> (Promise a) \| Send a` | 5 | an `Atom` and a wait; needs a blocking wait primitive |
 | `deliver` | adapt | `(deliver p v)` | `(Promise a) a -> bool` | 5 | true when this call delivered |
-| `future` | adapt | `(future body ..)` | macro `-> (Task a)` | 1 | a macro over `spawn`; `@f` is `(join f)`; the closure is `:send`, so a `Cell` capture is rejected ([R] A11 t41: `cell cannot be shared between threads: closure capture c has type (Cell i64)`) |
+| `future` | adapt | `(future body ..)` | macro `-> (Task a)` | 1 | a macro over `spawn`; `@f` is `(join f)` (the `Deref` instance of a `Task`, types §2.9, **Proposed**, owner's rule 2026-10-01; case 658); the closure is `:send`, so a `Cell` capture is rejected ([R] A11 t41: `cell cannot be shared between threads: closure capture c has type (Cell i64)`) |
 | `future-call` | adapt | `(future-call f)` | `(fn :send () a) -> (Task a)` | 1 | `(spawn f)` |
 | `future-done?` | adapt | `(future-done? t)` | `(Task a) -> bool` | 5 | alias `done?` |
 | `pmap` | keep | `(pmap f c)` | `(fn :send (a) b) c -> (Vec b) \| Reducible c a` | 1 | eager, one task per element today; chunked over `ncpu + 2` tasks with the order kept in tranche 3 ([R] A11 e15: `[1 4 9 16 25 36 49 64 81 100]`); lazy over an `LSeq` of futures in tranche 5 |

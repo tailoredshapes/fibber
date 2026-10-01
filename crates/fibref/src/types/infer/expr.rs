@@ -4,7 +4,7 @@
 use crate::syntax::Pos;
 
 use crate::types::ast::{Clause, ConvOp, Expr, ExprKind, FnLit, Lit, Pattern, Place};
-use crate::types::error::{TResult, TypeError};
+use crate::types::error::{ErrorKind, TResult, TypeError};
 use crate::types::ty::{Con, Scalar, Ty};
 
 use super::cx::{CapsCon, Cx, DKind};
@@ -60,7 +60,7 @@ impl Cx<'_> {
             ExprKind::Let(bs, body) => self.let_expr(bs, body),
             ExprKind::If(c, t, f) => {
                 let ct = self.infer(c)?;
-                self.unify(&ct, &Ty::bool(), &c.pos)?;
+                self.condition(&ct, &c.pos)?;
                 self.join(&[t, f], pos)
             }
             ExprKind::Do(steps) => self.do_expr(steps),
@@ -79,6 +79,28 @@ impl Cx<'_> {
             ExprKind::Convert(op, target, x) => self.convert(*op, *target, x),
             ExprKind::Concat(parts) => self.concat(parts, pos),
         }
+    }
+
+    /// The test of an `if` (so of `when`, `while`, `cond`, `and`, `or`,
+    /// which expand to it) has type `bool`. A test of a primitive type
+    /// that is not `bool` can never be false, which is the mistake a
+    /// Clojure habit makes (`(if n ..)`, `(when s ..)`), so the error
+    /// says that instead of `cannot unify i64 with bool` (stdlib §7 D1).
+    /// Any other type, `(Option T)` included, is the usual mismatch.
+    fn condition(&mut self, t: &Ty, pos: &Pos) -> TResult<()> {
+        let always_true = match self.st.resolve(t) {
+            Ty::Con(Con::Scalar(s), _) => !matches!(s, Scalar::Bool | Scalar::Unit | Scalar::Ptr),
+            Ty::Con(Con::Str, _) => true,
+            _ => false,
+        };
+        if always_true {
+            let msg = format!(
+                "a value of type {} is always true; write the test",
+                self.show(t)
+            );
+            return Err(TypeError::new(ErrorKind::Unify, pos, msg));
+        }
+        self.unify(t, &Ty::bool(), pos)
     }
 
     fn let_expr(&mut self, bs: &[(Pattern, Expr)], body: &Expr) -> TResult<Ty> {

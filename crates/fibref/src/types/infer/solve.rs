@@ -353,7 +353,7 @@ impl Cx<'_> {
         let rt = self.st.resolve(t);
         let content = match &rt {
             Ty::Var(_) => return Ok(Step::Stuck),
-            Ty::Con(Con::Cell | Con::Atom, a) => a[0].clone(),
+            Ty::Con(Con::Cell | Con::Atom | Con::Task, a) => a[0].clone(),
             Ty::Con(Con::Weak, a) => Ty::nominal(self.g.option, vec![a[0].clone()]),
             _ => {
                 let Some(p) = self.g.deref_proto else {

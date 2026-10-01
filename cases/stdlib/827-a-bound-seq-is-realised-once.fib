@@ -1,0 +1,24 @@
+;; spec:   stdlib §2.1 rule 2 (a bound chain is a real seq: realised once, paid for as Clojure pays), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter reduce count
+;; The chain of case 825 bound to a name first is not a collection position of a consumer, so it
+;; stays the lazy form: a memoised seq, one node per element, which the fold and the count then
+;; read (the second read runs neither function again). There is no bound on the objects it
+;; makes: they are Clojure's cost, about 12 per node (A13 lz3), paid where Clojure pays them. The result and the
+;; two counters say that the stages ran once per element, not once per read.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (+ (* x 2) 1))))
+          (p (fn (x: i64) (do (set! calls (+ @calls 100)) (= (rem x 3) 0)))))
+      (let ((s (filter p (map f [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20]))))
+        (do (check c (= (reduce (fn (a: i64 x: i64) (+ a x)) 0 s) 147))
+            (check c (= @calls 2121))
+            (check c (= (count s) 7))
+            (check c (= @calls 2121))
+            (checks-result c))))))

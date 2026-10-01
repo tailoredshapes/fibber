@@ -31,8 +31,8 @@ const REJECT: &[u32] = &[
 ];
 const LEAK_CYCLE: [u32; 2] = [15, 80];
 /// The cases whose verdict is a run-time trap (method.md rule 3).
-const TRAP: [u32; 15] = [
-    101, 102, 103, 104, 172, 173, 184, 195, 209, 212, 214, 215, 216, 217, 224,
+const TRAP: [u32; 16] = [
+    101, 102, 103, 104, 172, 173, 184, 195, 209, 212, 214, 215, 216, 217, 224, 234,
 ];
 /// Numbers below the last that no case has: 30 and 35 were withdrawn when
 /// D1 removed field places, 191 was never written, and 219 was taken by

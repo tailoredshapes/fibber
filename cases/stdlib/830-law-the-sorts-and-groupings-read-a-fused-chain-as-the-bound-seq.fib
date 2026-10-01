@@ -1,0 +1,49 @@
+;; spec:   stdlib §2.1 rule 2 (the set T: the same answer as the memoised seq), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter find-map group-by frequencies sort sort-by sort-with sort-by-with sum vec
+;; The rest of the terminals (case 829 has the others): a fused chain and the same chain bound to a
+;; name give one answer under find-map, group-by, frequencies, sum and the four sorts, which
+;; return a seq the case reads through `vec`, as a program reads it. The sorts take a key or a
+;; comparator before the collection, and two of them take both. 300 seeded draws of a Vec of 0 to 9
+;; elements and two drawn functions. The last check plants a fault (the bound side filters with
+;; another predicate) and requires it to be noticed. Seed 830.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun fmap (k: i64) -> (fn (i64) i64) (fn (x) (+ (* x 3) k)))
+(defun fkeep (k: i64) -> (fn (i64) bool) (fn (x) (= (rem (+ x k) 3) 0)))
+
+(defun draw (r: Rng c: Checks fault: bool) -> unit
+  (let ((v (rng-vec r (rng-below r 10) 20))
+        (k (rng-below r 6))
+        (j (rng-below r 6)))
+    (let ((f (fmap k)) (p (fkeep j)) (q (fkeep (if fault (+ j 1) j)))
+          (key (fn (x: i64) (rem x 4)))
+          (neg (fn (x: i64) (- 0 x)))
+          (desc (fn (a: i64 b: i64) (> a b)))
+          (cmp (fn (a: i64 b: i64) (- a b)))
+          (pick (fn (x: i64) (if (> x 20) (some (* x 2)) nil))))
+      (let ((s (map f (filter q v))) (sk (map key (filter q v))))
+        (do (check c (= (find-map pick (map f (filter p v))) (find-map pick s)))
+            (check c (= (group-by key (map f (filter p v))) (group-by key s)))
+            (check c (= (frequencies (map key (filter p v))) (frequencies sk)))
+            (check c (= (sum (map f (filter p v))) (sum s)))
+            (check c (= (vec (sort (map f (filter p v)))) (vec (sort s))))
+            (check c (= (vec (sort-by neg (map f (filter p v)))) (vec (sort-by neg s))))
+            (check c (= (vec (sort-with desc (map f (filter p v)))) (vec (sort-with desc s))))
+            (check c (= (vec (sort-with cmp (map f (filter p v)))) (vec (sort-with cmp s))))
+            (check c (= (vec (sort-by-with key desc (map f (filter p v)))) (vec (sort-by-with key desc s)))))))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 830)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 2700))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

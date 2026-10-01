@@ -1,0 +1,38 @@
+;; spec:   stdlib §4.1 (rows < = >=), §6.3 (R6a: a symbol is read where it stands)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: < = >=
+;; A comparison chain over strings and a struct with derived Eq and Ord, over the fields of
+;; structs, and over an operand that is a call between two that are not. The operands that
+;; are symbols, literals and field paths are read where they stand and again by the second
+;; comparison, which does not consume them (they are used after the chain, and the audit is
+;; clean); an operand that is a call is bound once.
+(ns main (:use fib.core tl.check))
+
+(defstruct Pt (n: i64 s: str))
+(derive Eq Pt)
+(derive Ord Pt)
+
+(defun ordered (a: str b: str c: str) -> i64 (if (< a b c) (+ (str-len a) (str-len c)) -1))
+(defun same (a: str b: str c: str) -> i64 (if (= a b c) (+ (str-len a) (str-len b) (str-len c)) -1))
+(defun not-below (a: Pt b: Pt c: Pt) -> i64 (if (>= a b c) (+ (. a n) (. b n) (. c n)) -1))
+(defun fields (p: Pt q: Pt r: Pt) -> i64 (if (= (. p s) (. q s) (. r s)) (str-len (. p s)) -1))
+(defun middle-call (a: str c: str) -> i64 (if (< a (str-concat "b" "") c) (str-len a) -1))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (Pt 1 "x")) (q (Pt 1 "x")) (r (Pt 0 "y")))
+    (do (check c (= (ordered "a" "bb" "ccc") 4))
+        (check c (= (ordered "a" "ccc" "bb") -1))
+        (check c (= (same "k" "k" "k") 3))
+        (check c (= (same "k" "k" "j") -1))
+        (check c (= (not-below p q r) 2))
+        (check c (= (not-below r q p) -1))
+        (check c (= (fields p q (Pt 2 "x")) 1))
+        (check c (= (fields p q r) -1))
+        (check c (= (middle-call "a" "c") 1))
+        (check c (= (middle-call "b" "c") -1))
+        (check c (= (. p n) 1))
+        (checks-result c))))

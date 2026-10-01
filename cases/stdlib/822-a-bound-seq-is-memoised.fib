@@ -1,0 +1,27 @@
+;; spec:   stdlib §2.1 rule 2 (the rule is syntactic: a seq bound to a name is a real memoising seq), tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter sum count
+;; A13 lz1: a `map` with a counting f, bound to a name and summed twice, is `[12 12 3]`: f ran
+;; once per element, however often the seq is read. The rewrite must not fuse a stage that is
+;; bound (a `let` is not a collection position of a consumer), or the second read would run f
+;; again: 6 calls. A bound seq that is the source of two fused chains is realised once as well
+;; (the page's `[0 0 3]`): the chains hold the seq as their source, and a walk of a seq reads it.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2)))))
+      (do (let ((s (map f [1 2 3])))
+            (do (check c (= (sum s) 12))
+                (check c (= (sum s) 12))
+                (check c (= @calls 3))))
+          (set! calls 0)
+          (let ((s (map f [1 2 3])))
+            (do (check c (= (count (filter (fn (x: i64) (> x 2)) s)) 2))
+                (check c (= (sum (map (fn (x: i64) (+ x 1)) s)) 15))
+                (check c (= @calls 3))))
+          (checks-result c)))))

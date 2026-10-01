@@ -1,0 +1,79 @@
+;; compiler/expand/fuserun.fib: the pass over one module's expanded forms,
+;; as `run`, `fuse_form` and `restore` of crates/fibref/src/expand/fuse.rs
+;; (the header of that file has the rule, its decisions and the soundness
+;; argument): records the names the module exports (for the modules that
+;; `:use` it), then rewrites each top-level form that calls a terminal
+;; consumer, unless the module is the library's or does not see `fib.seq`.
+;; A form is walked a second time with the machinery of expand.walk, the
+;; role `Fuse` marking a collection position and the expander made by
+;; `expander-fusing`; a walk that fails (too deep) leaves the form as the
+;; first pass made it.
+;;
+;; Shapes decided where Rust and fibber differ: the Rust `Option<(usize,
+;; Form)>` of a `:private` marker taken off is `(Option Marker)`; the
+;; expander is given `(no-runner)` as Rust is given `NoRunner`; Rust's
+;; `definition_role` of top.rs is `definition-item-roles` (top.fib has a
+;; private `definition-role` of another meaning).
+(ns expand.fuserun
+  (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.core
+        expand.private expand.expr expand.walk expand.top expand.fusetab expand.fusescan
+        expand.fuse))
+
+;; A `:private` marker taken off a definition, and where it was.
+(defstruct Marker (at: i64 marker: Stx))
+
+;; `form` with its `:private` marker back, if it had one. (restore)
+(defun restore :private (form: Stx marker: (Option Marker)) -> Stx
+  (match marker
+    ((some m) (put-marker form (. m at) (. m marker)))
+    (nil form)))
+
+;; The walk of a definition `body` (marker already off), its result or, if
+;; the walk fails, `body` itself; both with the marker put back.
+(defun fuse-body :private (body: Stx module: ModuleEnv ctx: ExpandCtx marker: (Option Marker)) -> Stx
+  (match (definition-item-roles body)
+    (nil (restore body marker))
+    ((some role)
+     (let ((ex (expander-fusing ctx (no-runner) (FuseEnv module (fuse-bound-names body)))))
+       (match (walk ex body role)
+         ((Ok fused) (restore fused marker))
+         ((Err _) (restore body marker)))))))
+
+;; The marker of what `take-marker` took, if it took one.
+(defun marker-of :private (at: i64 taken: Taken) -> (Option Marker)
+  (match (. taken marker)
+    ((some m) (some (Marker at m)))
+    (nil nil)))
+
+;; One top-level form, rewritten; as it was if it calls no terminal, is not
+;; a definition with expressions, or its walk fails. (fuse_form)
+(defun fuse-form :private (form: Stx module: ModuleEnv ctx: ExpandCtx) -> Stx
+  (if (fuse-calls-a-terminal? form)
+      (match (marker-index form)
+        ((some at)
+         (let ((taken (take-marker form at)))
+           (fuse-body (. taken form) module ctx (marker-of at taken))))
+        (nil (fuse-body form module ctx nil)))
+      form))
+
+;; Every top-level form, in order (a `remove` of a symbol takes a gensym, so
+;; the order is observable).
+(defun fuse-each :private (forms: (Vec Stx) module: ModuleEnv ctx: ExpandCtx) -> (Vec Stx)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count forms))
+        (recur (+ i 1) (conj out (fuse-form (nth forms i) module ctx)))
+        out)))
+
+;; The pass over one module's expanded forms: records the names the module
+;; exports, then rewrites each top-level form unless the module is the
+;; library's or does not see `fib.seq`. (run)
+(defun fuse-run (forms: (Vec Stx) ctx: ExpandCtx) -> (Vec Stx)
+  (let ((ns (. @(. ctx scope) ns)))
+    (if (fuse-library-ns? ns)
+        forms
+        (let ((defined (fuse-defined-names forms)))
+          (do (ctx-record-names ctx ns (. defined public))
+              (let ((module (fuse-module-env ctx (. defined all))))
+                (if (. module seq)
+                    (fuse-each forms module ctx)
+                    forms)))))))

@@ -1,0 +1,27 @@
+;; compiler/expand/prelude/atoms.fib: `swap!` with Clojure's extra arguments
+;; (stdlib design §4.1, tranche 1 R6a), as
+;; crates/fibref/src/expand/prelude/atoms.rs:
+;;
+;;   (swap! a f x ..) ==> (fib.prelude/swap! a (fn (v) (f v x ..)))
+;;
+;; with `v` a gensym. The call of two arguments is the builtin's and is
+;; declined (`swap-macro` answers `nil`); so is a call of fewer than two. The
+;; extra arguments are evaluated inside the closure. Called by
+;; expand.prelude (the registry row `swap!`).
+(ns expand.prelude.atoms
+  (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.prelude.parts))
+
+;; `(fn (v) (f v x ..))` with `v` a gensym.
+(defun swap-closure :private (ctx: ExpandCtx f: Stx extra: (Vec Stx) pos: Pos) -> Stx
+  (let ((v (ctx-gensym ctx "v" pos)))
+    (list-form [(sym "fn" pos)
+                (list-form [v] pos)
+                (list-form (concat-forms [f v] extra) pos)]
+               pos)))
+
+;; One call of `swap!`: the rewrite from three arguments, else `nil`.
+(defun swap-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Option Stx)
+  (if (< (count items) 4)
+      nil
+      (let ((f (swap-closure ctx (nth items 2) (tail-from items 3) pos)))
+        (some (call (prelude-name "swap!") [(nth items 1) f] pos)))))

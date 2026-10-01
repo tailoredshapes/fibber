@@ -1,0 +1,24 @@
+;; spec:   types §2.9, §8.8; syntax §3.12
+;; expect: accept
+;; result: 63
+;; audit:  clean
+;; An async task nobody has started runs when it is first joined, on the joining thread's own stack;
+;; @t joins it the same way, so a task that awaits another still finishes and its result is the
+;; value of @t. One bit per probe: a task that awaits a yielding task, @ of an async literal in
+;; place, an async body that itself reads another task with @ (a blocking read, not an await: the
+;; inner task is driven on this task's stack), a Vec result, @ and await of one task in two
+;; consumers, and the same shared task read by main last.
+(defun main () -> i64
+  (let ((a (async (do (await (yield)) 5)))
+        (inner (async (do (await (yield)) 20)))
+        (outer (async (+ 1 @inner)))
+        (v (async [4 5 6]))
+        (shared (async (do (await (yield)) 9)))
+        (x (async (+ 1 (await shared))))
+        (y (async (+ 2 @shared))))
+    (+ (if (= @a 5) 1 0)
+       (+ (if (= @(async 7) 7) 2 0)
+          (+ (if (= @outer 21) 4 0)
+             (+ (if (and (= (count @v) 3) (= (nth @v 0) 4)) 8 0)
+                (+ (if (= (+ @x @y) 21) 16 0)
+                   (if (= @shared 9) 32 0))))))))

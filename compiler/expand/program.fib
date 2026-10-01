@@ -34,7 +34,7 @@
 (ns expand.program
   (:require [syntax.reader :as reader])
   (:use syntax.pos syntax.form syntax.error util.result expand.error expand.types
-        expand.ctx expand.expr expand.walk expand.top))
+        expand.ctx expand.expr expand.walk expand.top expand.fuserun))
 
 ;; The prelude forms the expander itself needs (syntax §4.4, §4.5): the
 ;; `List` enum, whose variants are `Empty` and `Cons` (stdlib design C-3),
@@ -46,7 +46,8 @@
 
 ;; Expands the top-level forms of one module, in order, into ctx: stops at
 ;; the first error. The steps and forms counters start again at 0 for each
-;; top-level form. (expand_program)
+;; top-level form. The expanded forms then go through the fusion rewrite
+;; (expand.fuserun). (expand_program)
 (defun expand-program (forms: (Vec Stx) ctx: ExpandCtx runner: Runner) -> (Result (Vec Stx) ExpandError)
   (let ((ex (expander-new ctx runner))
         (n (count forms)))
@@ -56,7 +57,7 @@
               (match (top-form ex (nth forms i) out)
                 ((Err e) (Err e))
                 ((Ok next) (recur (+ i 1) next))))
-          (Ok out)))))
+          (Ok (fuse-run out ctx))))))
 
 ;; Expands one form in expression position (for a test); the counters
 ;; start at 0. (expand_expr)

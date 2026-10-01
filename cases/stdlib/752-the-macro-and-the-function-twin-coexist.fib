@@ -1,0 +1,39 @@
+;; spec:   stdlib §2.10 (the function twins), §6.3 (R5), §4.14 (rows str println)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str println
+;; str and println are a macro in head position and a function of one argument in value
+;; position, one name each: (str 1 2) is "12" where (map str [1 2]) calls the
+;; function and gives ["1" "2"]; a function parameter takes str as it takes any
+;; function, and the head of a call that is not the name (a parameter called f
+;; bound to str) is the function. The twin is ToStr's to-str, so (str x) and (f x)
+;; agree on every type with an instance, a user's included. A (println x) in head
+;; position and (run! println xs) in value position write the same line.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+(impl ToStr Pt (to-str (self) (str-concat "Pt" (show (+ (. self x) (. self y))))))
+
+(defun apply1 (f: (fn (i64) str) n: i64) -> str (f n))
+(defun apply-pt (f: (fn (Pt) str) p: Pt) -> str (f p))
+
+(defun unit? (u: unit) -> bool true)
+
+(defun main () -> i64
+  (let ((c (checks))
+        (texts (to-vec (map str [1 2 3])))
+        (pts (to-vec (map str [(Pt 1 2) (Pt 3 4)]))))
+    (do (check c (= (str 1 2) "12"))
+        (check c (= (apply1 str 5) "5"))
+        (check c (= (nth texts 0) "1"))
+        (check c (= (nth texts 2) "3"))
+        (check c (= (count texts) 3))
+        (check c (= (nth pts 1) "Pt7"))
+        (check c (= (apply-pt str (Pt 1 1)) (str (Pt 1 1))))
+        (check c (= (reduce (fn (acc s) (str-concat acc s)) "" texts) "123"))
+        (check c (unit? (println 7)))
+        (check c (unit? (run! println [1 2])))
+        (newline)
+        (checks-result c))))

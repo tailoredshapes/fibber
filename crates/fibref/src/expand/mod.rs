@@ -22,6 +22,9 @@
 //! - the non-expression operands of the primitive forms `set-field!`,
 //!   `dyn` and the conversions (§4.3), and the names, parameter lists,
 //!   types and patterns of core forms, are not expanded.
+//! - after the whole module is expanded, the fusion rewrite (`fuse`,
+//!   stdlib design §2.1 rule 2) turns a chain of sequence functions that a
+//!   terminal consumer reads once into recipe structs.
 //!
 //! Positions follow §1.3: a form a macro builds carries the position of
 //! the macro call; a form taken from the input keeps its own. Errors are
@@ -45,6 +48,7 @@ mod ctx;
 mod derive;
 mod error;
 mod expr;
+mod fuse;
 mod heads;
 mod inspect;
 mod prelude;
@@ -87,7 +91,7 @@ pub fn expand_program(
         ex.ctx.forms = 0;
         top::top_form(&mut ex, form, &mut out)?;
     }
-    Ok(out)
+    Ok(fuse::run(out, ctx))
 }
 
 /// Expands one form in expression position (for a REPL or a test).

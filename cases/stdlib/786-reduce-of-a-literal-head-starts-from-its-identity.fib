@@ -1,0 +1,43 @@
+;; spec:   stdlib §4.4 (row reduce), §6.3 (R6b), §2.1 rule 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce
+;; (reduce f c) is the first element folded with the rest, and for the literal heads
+;; whose (f) Clojure calls it starts from their identity so the empty source answers:
+;; (reduce + []) is 0 and (reduce * []) is 1 (the literal is an i64: for another number
+;; type, the item L19), (reduce conj c) starts from [] and (reduce merge c) from {}.
+;; Any other head, a lambda, a named function, - and max (which have no identity) go
+;; through reduce-nonempty: (reduce - [10 3 2]) is 5, the left fold of Clojure's.
+;; Over a Vec, a List, an Option, a VSeq and an LSeq.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun minus (a: i64 x: i64) -> i64 (- a x))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (ev: (Vec i64) (vec-empty))
+        (none: (Option i64) nil)
+        (nomaps: (Vec (Map str i64)) (vec-empty))
+        (m1 (assoc (map-empty) "a" 1))
+        (m2 (assoc (map-empty) "b" 2)))
+    (do (check c (= (reduce + ev) 0))
+        (check c (= (reduce + none) 0))
+        (check c (= (reduce * ev) 1))
+        (check c (= (reduce + [1 2 3 4]) 10))
+        (check c (= (reduce * [2 3 4]) 24))
+        (check c (= (reduce + (list 5 6)) 11))
+        (check c (= (reduce + (some 7)) 7))
+        (check c (= (reduce + (VSeq (list 1) [2 3] 0)) 6))
+        (check c (= (reduce * (lcons 2 (lcons 5 (lazy-node (fn () LNil))))) 10))
+        (check c (= (count (reduce conj ev)) 0))
+        (check c (= (nth (reduce conj (list 7 8 9)) 2) 9))
+        (check c (= (count (reduce merge [m1 m2])) 2))
+        (check c (= (count (reduce merge nomaps)) 0))
+        (check c (= (reduce - [10 3 2]) 5))
+        (check c (= (reduce minus [10 3 2]) 5))
+        (check c (= (reduce max [3 9 4]) 9))
+        (check c (= (reduce (fn (a x) (str-concat a x)) ["a" "b" "c"]) "abc"))
+        (check c (= (reduce minus (some 4)) 4))
+        (checks-result c))))

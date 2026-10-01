@@ -1,0 +1,40 @@
+;; spec:   stdlib §6.3 (a macro's expansion names its functions by qualified heads), §6.3 (R6b)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: update reduce reduced
+;; The program defines the names the expansions of update and reduce call, with
+;; answers that would show: update-or, reduce-nonempty and reduce-while return -1,
+;; and its own enum has variants More and Done. A bare head would be captured by them;
+;; the macros write fib.coll/update, fib.coll/update-or, fib.seq/reduce, fib.seq/
+;; reduce-nonempty, fib.seq/reduce-while, fib.core/Done and fib.core/More, which a
+;; definition of the program's cannot shadow (the hygiene of cases/modules/020, case
+;; 755). The program's own names are still its own: the user's Done and More are the
+;; user's, and its update-or is called where the program writes it.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defenum Phase (More n: i64) (Done n: i64))
+
+(defun update-or (m: (Map str i64) k: str f: (fn (i64) i64) :borrow d: i64) -> i64 -1)
+(defun reduce-nonempty (f: (fn (i64 i64) i64) :borrow c: (Vec i64)) -> i64 -1)
+(defun reduce-while (f: (fn (i64 i64) i64) :borrow init: i64 c: (Vec i64)) -> i64 -1)
+
+(defun phase-n (p: Phase) -> i64 (match p ((More n) n) ((Done n) (+ n 1000))))
+
+(defun at (m: (Map str i64) k: str) -> i64 (match (get m k) (nil -9) ((some x) x)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (assoc (map-empty) "a" 5)))
+    (do (check c (= (at (update m "w" (fnil + 100) 7) "w") 107))
+        (check c (= (at (update m "a" + 10) "a") 15))
+        (check c (= (reduce (fn (acc x) (if (> acc 10) (reduced acc) (+ acc x))) 0 [5 6 7 8 9]) 11))
+        (check c (= (reduce (fn (a x) (+ a x)) [4 5]) 9))
+        (check c (= (reduce + [4 5]) 9))
+        (check c (= (update-or m "a" (fn (v) v) 0) -1))
+        (check c (= (reduce-nonempty (fn (a x) a) [1]) -1))
+        (check c (= (reduce-while (fn (a x) a) 0 [1]) -1))
+        (check c (= (phase-n (More 3)) 3))
+        (check c (= (phase-n (Done 3)) 1003))
+        (checks-result c))))

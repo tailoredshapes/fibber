@@ -1,0 +1,71 @@
+;; compiler/expand/prelude/colls.fib: the variadic collection functions
+;; (stdlib design §6.3, §4.5; tranche 1 R6a), as
+;; crates/fibref/src/expand/prelude/colls.rs: `conj`, `assoc`, `dissoc` and
+;; `merge`. Each answers `nil` (declined) for the call its function serves
+;; (expand.prelude makes the outcome).
+;;
+;; Decided (the Rust's header says why): `(conj c)` is `c`, `(conj c x y ..)`
+;; the left fold of `fib.coll/conj`; `(assoc m k v k2 v2 ..)` the left fold
+;; of `fib.coll/assoc` by pairs, a key without a value the error `malformed
+;; assoc: a key without a value`, `(assoc m)` and the three-argument call
+;; declined; `(dissoc m)` is `m`, `(dissoc m k1 k2 ..)` the left fold of
+;; `fib.coll/dissoc`; `(merge)` is the error `malformed merge: needs at
+;; least one argument`, a literal `nil` operand is skipped, what is left is
+;; the operand for one, the left fold of `fib.coll/merge` for more, `nil`
+;; for none, and two operands none of which is a literal `nil` are declined.
+(ns expand.prelude.colls
+  (:use syntax.pos syntax.form util.result expand.error expand.build
+        expand.prelude.parts expand.prelude.fold))
+
+;; `conj`: `c` for one argument, a fold from three.
+(defun conj-macro (items: (Vec Stx) pos: Pos) -> (Option Stx)
+  (fold items pos "fib.coll/conj" AloneItself))
+
+;; `dissoc`: `m` for one argument, a fold from three.
+(defun dissoc-macro (items: (Vec Stx) pos: Pos) -> (Option Stx)
+  (fold items pos "fib.coll/dissoc" AloneItself))
+
+;; The pairs of `(assoc m k v k2 v2 ..)` one at a time.
+(defun assoc-pairs :private (items: (Vec Stx) pos: Pos) -> Stx
+  (loop ((i 2) (acc (nth items 1)))
+    (if (< (+ i 1) (count items))
+        (recur (+ i 2) (call "fib.coll/assoc" [acc (nth items i) (nth items (+ i 1))] pos))
+        acc)))
+
+;; `(assoc m k v k2 v2 ..)`: the pairs one at a time. (colls.rs `assoc`)
+(defun assoc-macro (items: (Vec Stx) pos: Pos) -> (Result (Option Stx) ExpandError)
+  (let ((n (- (count items) 1)))
+    (cond ((or (< n 2) (= n 3)) (Ok nil))
+          ((= (rem n 2) 0) (Err (malformed "assoc" "a key without a value" pos)))
+          (true (Ok (some (assoc-pairs items pos)))))))
+
+(defun is-nil-literal :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SNil) true)
+    (_ false)))
+
+;; Whether any item of items is a literal `nil`.
+(defun any-nil :private (items: (Vec Stx)) -> bool
+  (loop ((i 0))
+    (if (< i (count items))
+        (if (is-nil-literal (nth items i)) true (recur (+ i 1)))
+        false)))
+
+;; The operands of the call that are not a literal `nil`.
+(defun operands-of :private (items: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 1) (acc (vec-empty)))
+    (if (< i (count items))
+        (recur (+ i 1) (if (is-nil-literal (nth items i)) acc (conj acc (nth items i))))
+        acc)))
+
+;; `(merge a nil b)`: the operands that are not a literal `nil`, folded.
+;; (colls.rs `merge`)
+(defun merge-macro (items: (Vec Stx) pos: Pos) -> (Result (Option Stx) ExpandError)
+  (let ((n (- (count items) 1)))
+    (cond ((= n 0) (Err (malformed "merge" "needs at least one argument" pos)))
+          ((and (= n 2) (not (any-nil items))) (Ok nil))
+          (true
+           (let ((operands (operands-of items)))
+             (if (= (count operands) 0)
+                 (Ok (some (Stx SNil pos)))
+                 (Ok (some (left-fold "fib.coll/merge" operands pos)))))))))

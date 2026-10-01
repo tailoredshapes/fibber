@@ -1,0 +1,71 @@
+;; compiler/expand/derive/record.fib: the text of a record for `derive
+;; Debug` and `derive ToStr` (stdlib §2.7, L17; tranche 1 R8), as
+;; crates/fibref/src/expand/derive/record.rs (63 lines of Rust) and the
+;; two `record` builders of structs.rs and enums.rs (the struct's is in
+;; expand.derive, which owns `field-of`; the variant's is here). The text
+;; of a record is `#m.P{:x 1, :y "x"}`, built as a right-nested chain of
+;; `fib.prelude/str-concat` over literal pieces and the fields' `debug`
+;; (`fib.core/debug`, by the facade's name: the library's Debug is not the
+;; prelude's). A field written without a name is called by its position,
+;; and a variant with no field is its bare name (the Rust header says why).
+(ns expand.derive.record (:use syntax.pos syntax.form expand.types expand.build expand.collections))
+
+;; The method every field's text comes from. (DEBUG)
+(def debug-name: str :private "fib.core/debug")
+
+;; `(fib.core/debug f)`. (debug_of)
+(defun debug-of (f: Stx pos: Pos) -> Stx
+  (call debug-name [f] pos))
+
+;; What a field is called in the text: its name, or its position when it
+;; was written without one. (label)
+(defun field-label (name: (Option str) index: i64) -> str
+  (match name
+    ((some n) n)
+    (nil (show index))))
+
+;; The pieces joined with `str-concat`, nested to the right: `(a (b c))`.
+;; There is at least one piece. (concat)
+(defun concat-pieces :private (pieces: (Vec Stx) pos: Pos) -> Stx
+  (let ((n (count pieces)))
+    (loop ((i (- n 2)) (acc (nth pieces (- n 1))))
+      (if (< i 0)
+          acc
+          (recur (- i 1) (call (prelude-name "str-concat") [(nth pieces i) acc] pos))))))
+
+;; `#m.Name{:l1 v1, :l2 v2}` for the labels and the already built field
+;; texts, which are the same in number; `#m.Name{}` for none. (record_text)
+(defun record-text (module: str name: str labels: (Vec str) texts: (Vec Stx) pos: Pos) -> Stx
+  (if (= (count texts) 0)
+      (string (str-join ["#" module "." name "{}"]) pos)
+      (concat-pieces (record-pieces module name labels texts pos) pos)))
+
+;; A literal lead, then the field's text, for each field, then `"}"`.
+(defun record-pieces :private (module: str name: str labels: (Vec str) texts: (Vec Stx) pos: Pos)
+    -> (Vec Stx)
+  (let ((all (loop ((i 0) (acc (vec-empty)))
+               (if (>= i (count texts))
+                   acc
+                   (let ((lead (if (= i 0)
+                                   (str-join ["#" module "." name "{:" (nth labels i) " "])
+                                   (str-join [", :" (nth labels i) " "]))))
+                     (recur (+ i 1) (conj (conj acc (string lead pos)) (nth texts i))))))))
+    (conj all (string "}" pos))))
+
+;; The text of `Debug` and `ToStr` of one variant: its bare name when it
+;; has no field, else the record `#m.V{:f x, ..}` over its variables `xs`.
+;; `module` is the module being expanded. (variant_record)
+(defun variant-record (module: str v: VariantInfo xs: (Vec Stx) pos: Pos) -> Stx
+  (if (= (count (. v fields)) 0)
+      (string (. v name) pos)
+      (let ((fs (. v fields)))
+        (record-text module (. v name)
+                     (loop ((i 0) (acc (vec-empty)))
+                       (if (>= i (count fs))
+                           acc
+                           (recur (+ i 1) (conj acc (field-label (. (nth fs i) name) i)))))
+                     (loop ((i 0) (acc (vec-empty)))
+                       (if (>= i (count xs))
+                           acc
+                           (recur (+ i 1) (conj acc (debug-of (nth xs i) pos)))))
+                     pos))))

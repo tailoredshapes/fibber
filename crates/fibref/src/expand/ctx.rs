@@ -1,7 +1,7 @@
 //! The expansion context: everything the expander remembers between
 //! forms, passed explicitly (no global or thread-local state).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -79,6 +79,10 @@ pub struct ExpandCtx {
     pub(crate) macros: HashMap<String, MacroDef>,
     /// The modules each module re-exports (`(:export-from ..)`), by `ns`.
     exports: HashMap<String, Vec<String>>,
+    /// The public names each module defined at top level, by `ns`, as the
+    /// modules expanded so far left them (the fusion rewrite asks whether a
+    /// module it `:use`s exports a name).
+    defined: HashMap<String, HashSet<String>>,
     /// The module being expanded: which macros a name reaches.
     pub(crate) scope: ModuleScope,
     pub(crate) types: TypeTable,
@@ -126,6 +130,7 @@ impl ExpandCtx {
             gensyms: AtomicU64::new(0),
             macros: HashMap::new(),
             exports: HashMap::new(),
+            defined: HashMap::new(),
             scope: ModuleScope::of(super::PRELUDE_NS),
             types: TypeTable::with_builtins(),
             call_pos: Pos {
@@ -258,6 +263,33 @@ impl ExpandCtx {
         if !exports.is_empty() {
             self.exports.insert(ns.to_string(), exports.to_vec());
         }
+    }
+
+    /// Records the public names module `ns` defines at top level.
+    pub(crate) fn record_names(&mut self, ns: &str, names: HashSet<String>) {
+        self.defined.insert(ns.to_string(), names);
+    }
+
+    /// The names module `ns` exports: what it defines publicly and what the
+    /// modules it re-exports export, as far as they have been expanded.
+    pub(crate) fn exported_names(&self, ns: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut pending = vec![ns];
+        while let Some(m) = pending.pop() {
+            if !seen.insert(m) {
+                continue;
+            }
+            out.extend(self.defined.get(m).into_iter().flatten().cloned());
+            pending.extend(
+                self.exports
+                    .get(m)
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            );
+        }
+        out
     }
 
     /// The modules each module re-exports, by the module's `ns` (those

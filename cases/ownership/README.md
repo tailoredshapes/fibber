@@ -423,3 +423,22 @@ nested (8191). 223 is `=` on `unit` and arrays and Vecs of `unit`
 (`expect: trap`). Before the fixes, under the binaries of the commit that
 precedes them: 220 and 221 failed (exit 139 and 261632 where 2097151 is
 expected), 222, 223 and 224 were pending (`unsupported`).
+
+Cases 232 to 236 pin the owner's rule of 2026-10-01 that `@t` on a `(Task a)` is
+`(join t)`, a fourth built-in instance of `Deref` beside `Cell`, `Atom` and `Weak`
+(types §2.9, syntax §3.11; Clojure's `@f` of a future, which breaks no memory
+safety because `join` is already safe). Before it the checker said `no
+implementation of Deref for (Task i64)` and every one of the five was rejected by
+both tools. All accept with a clean audit except 234 (`expect: trap`), and each
+result has one bit per probe. 232: a spawned task's result of every kind, an `i64`,
+a `Vec`, a `str`, a struct, an `Option` (`some` and `nil`) and `unit`, and `@` of
+the `(spawn ..)` expression itself (255). 233: an `async` task nobody has started
+is driven by `@`, one that awaits, one read with `@` inside another async body, and
+one task read by `@` and by `await` (63). 234: a task that traps aborts the program
+through `@` as it does through `join`. 235: `@` as the first form of a `->`, the
+name `deref` in a `->` and a `->>`, `deref` as a function value over a `Vec` of
+tasks, and `@` in a generic function over `(Task a)` (127). 236: `@` twice, `@`
+beside `join` in either order, two live reads of one `Vec` result, a task read from
+two threads through `plet`, and a `str` result read twice (127). Case
+stdlib/658 pinned the old rejection and is flipped to the accepted behaviour; 655
+gets its `@f` checks.

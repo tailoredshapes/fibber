@@ -1,0 +1,43 @@
+;; spec:   stdlib §4.2 (row list: expands to Cons and Empty), §2.3 (Reducible, Collection over a List)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: list
+;; (list a b c) is the prelude macro, kept, that builds a (List a) of Cons and Empty in
+;; the order written: (list) is the empty list. Its expansion names the prelude's own
+;; variants, so a function named `cons` in the program (and the `empty` method of fib.coll,
+;; which a program that uses fib.coll has in scope) do not capture it: the program's `cons`
+;; here adds its arguments, and the list is built all the same (cases/modules 020, 022, 023
+;; are the same without the library). The library then takes the list apart: count, nth,
+;; first, last, a match on Empty and Cons, conj at the front, into, and a Vec of the elements.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun cons (a: i64 b: i64) -> i64 (+ a b))
+
+(defun len (l: (List i64)) -> i64
+  (match l ((Empty) 0) ((Cons _ t) (+ 1 (len t)))))
+
+(defun head-or (l: (List i64) d: i64) -> i64
+  (match l ((Empty) d) ((Cons h _) h)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (e: (List i64) (list))
+        (l (list 10 20 30)))
+    (do (check c (= (len e) 0))
+        (check c (= (len l) 3))
+        (check c (= (count l) 3))
+        (check c (= (head-or l -1) 10))
+        (check c (= (head-or e -1) -1))
+        (check c (= (nth l 2) 30))
+        (check c (= (first l) (some 10)))
+        (check c (= (last l) (some 30)))
+        (check c (match (first e) (nil true) ((some _) false)))
+        (check c (= (len (conj l 5)) 4))
+        (check c (= (head-or (conj l 5) -1) 5))
+        (check c (= (head-or (into e [1 2 3]) -1) 3))
+        (check c (= (count (to-vec (list 1 2 3 4))) 4))
+        (check c (= (nth (to-vec l) 1) 20))
+        (check c (= (cons 1 2) 3))
+        (checks-result c))))

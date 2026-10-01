@@ -1,0 +1,32 @@
+;; spec:   stdlib §2.1 rule 2 (the memoised lazy seq), §4.4 rows map count; types §8 (release)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map count
+;; A lazy seq of sixty thousand elements, each node holding the next, is walked while it is held
+;; and released when its binding ends. The compiled program once released such a chain by
+;; recursion, one frame per node, and overflowed its stack at about fifty thousand where the
+;; interpreter finished (the runtime now frees iteratively, cases/ownership 225 to 231): the same
+;; value in both tools, with the free traces equal, is what this case asks. A seq bound to a name
+;; is memoised, so the counting function runs once per element however often the seq is walked,
+;; and the whole chain stays alive until the let ends. The source is a Vec built by a loop, so no
+;; literal of that size is written.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun upto (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (vec-conj acc i)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (v (upto 60000)))
+    (do (check c (= (count (to-lseq v)) 60000))
+        (let ((s (map (fn (x) (do (set! calls (+ @calls 1)) (+ x 1))) v)))
+          (do (check c (= (count s) 60000))
+              (check c (= @calls 60000))
+              (check c (= (count s) 60000))
+              (check c (= @calls 60000))
+              (check c (= (nth s 59999) 60000))))
+        (checks-result c))))

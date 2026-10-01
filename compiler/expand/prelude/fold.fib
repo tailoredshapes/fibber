@@ -1,0 +1,130 @@
+;; compiler/expand/prelude/fold.fib: the variadic folds of the operators
+;; (stdlib design §4.1, §4.3, §6.3; tranche 1 R6a), as
+;; crates/fibref/src/expand/prelude/fold.rs. `+ - * < > <= >= =`, `max min`
+;; and `bit-and bit-or bit-xor`: each is a builtin or a library function of
+;; two arguments, so the macro answers the calls the binary function cannot
+;; and DECLINES the binary call (a macro that declines answers `nil`, which
+;; expand.prelude turns into `Declined`; the Rust returns the `Outcome`
+;; itself, whose type is expand.prelude's).
+;;
+;; Decided (the Rust's header says why): `(+)` is `0`, `(*)` is `1`, `(+ a)`
+;; is `a`, three or more fold from the left over `fib.prelude/+`; `(-)` is
+;; the arity error, `(- a)` is `(fib.prelude/neg a)`; `(< a b c)` is `(and (<
+;; a b) (< b c))` with every operand that is not a symbol, a literal or a
+;; field path `(. x f)` bound first, in order, to a gensym `#cmp.N`, and `(<
+;; a)` is `(let ((#cmp.N a)) true)`; `(max a b c)` is a left fold of
+;; `fib.core/max` (and `min`), `bit-and bit-or bit-xor` of
+;; `fib.prelude/bit-and` and so on, from three arguments.
+(ns expand.prelude.fold
+  (:use syntax.pos syntax.form util.result expand.error expand.ctx expand.build
+        expand.collections expand.prelude.parts))
+
+;; What a fold does with a call of one argument: the argument itself, or
+;; nothing (the call is declined and the function's arity error stands).
+(defenum Alone AloneItself AloneDeclined)
+
+(defun is-itself :private (alone: Alone) -> bool
+  (match alone
+    ((AloneItself) true)
+    ((AloneDeclined) false)))
+
+;; `(head (head a b) c)`: the arguments folded from the left by the binary
+;; function `head`; no argument is `()`. (fold.rs `left_fold`)
+(defun left-fold (head: str args: (Vec Stx) pos: Pos) -> Stx
+  (if (= (count args) 0)
+      (unit pos)
+      (loop ((i 1) (acc (nth args 0)))
+        (if (< i (count args))
+            (recur (+ i 1) (call head [acc (nth args i)] pos))
+            acc))))
+
+;; A fold of the binary function `head` over the call's arguments: `nil`
+;; (declined) below three arguments, below two for `AloneItself`, which
+;; answers one argument with itself. (fold.rs `fold`)
+(defun fold (items: (Vec Stx) pos: Pos head: str alone: Alone) -> (Option Stx)
+  (let ((n (- (count items) 1)))
+    (cond ((and (= n 1) (is-itself alone)) (some (nth items 1)))
+          ((>= n 3) (some (left-fold head (tail-from items 1) pos)))
+          (true nil))))
+
+;; `max`, `min`: a fold of the library's function through `fib.core`.
+(defun extremum (items: (Vec Stx) pos: Pos name: str) -> (Option Stx)
+  (fold items pos (str-join ["fib.core/" name]) AloneDeclined))
+
+;; `bit-and`, `bit-or`, `bit-xor`: a fold of the builtin.
+(defun bits-macro (items: (Vec Stx) pos: Pos name: str) -> (Option Stx)
+  (fold items pos (prelude-name name) AloneDeclined))
+
+;; `+` and `*`: `identity` for no argument, the argument itself for one.
+(defun sum-or-product (items: (Vec Stx) pos: Pos name: str identity: i64) -> (Option Stx)
+  (if (= (count items) 1)
+      (some (int identity pos))
+      (fold items pos (prelude-name name) AloneItself)))
+
+;; `-`: `(-)` is an error, `(- a)` is `(fib.prelude/neg a)`.
+(defun difference (items: (Vec Stx) pos: Pos) -> (Result (Option Stx) ExpandError)
+  (match (check-arity "-" items 1 nil pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (if (= (count items) 2)
+         (Ok (some (call (prelude-name "neg") [(nth items 1)] pos)))
+         (Ok (fold items pos (prelude-name "-") AloneDeclined))))))
+
+;; Whether every item of items from index i on is simple.
+(defun all-simple :private (items: (Vec Stx) i: i64) -> bool
+  (loop ((j i))
+    (if (< j (count items))
+        (if (is-simple (nth items j)) (recur (+ j 1)) false)
+        true)))
+
+;; Whether evaluating the form twice is the same as once and borrows: a
+;; symbol, a literal or a field path `(. x f)` of such. (fold.rs `is_simple`)
+(defun is-simple :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SVec _) false)
+    ((SMap _) false)
+    ((SList items)
+     (if (and (> (count items) 1) (is-sym (nth items 0) "."))
+         (all-simple items 1)
+         false))
+    (_ true)))
+
+;; `(and (op o1 o2) (op o2 o3) ..)` over the operands.
+(defun chain-body :private (op: str bindings: (Vec Stx) operands: (Vec Stx) pos: Pos) -> Stx
+  (let ((n (count operands)))
+    (let ((body (call "and"
+                      (loop ((i 0) (tests (vec-empty)))
+                        (if (< (+ i 1) n)
+                            (recur (+ i 1)
+                                   (conj tests (call op [(nth operands i) (nth operands (+ i 1))] pos)))
+                            tests))
+                      pos)))
+      (if (= (count bindings) 0)
+          body
+          (call "let" [(list-form bindings pos) body] pos)))))
+
+;; The chain over the operands, an operand that is not simple bound first,
+;; in order, to a gensym. (fold.rs `chain`)
+(defun chain :private (ctx: ExpandCtx op: str args: (Vec Stx) pos: Pos) -> Stx
+  (let ((n (count args)))
+    (loop ((i 0) (bindings (vec-empty)) (operands (vec-empty)))
+      (if (< i n)
+          (let ((arg (nth args i)))
+            (if (is-simple arg)
+                (recur (+ i 1) bindings (conj operands arg))
+                (let ((g (ctx-gensym ctx "cmp" pos)))
+                  (recur (+ i 1) (conj bindings (list-form [g arg] pos)) (conj operands g)))))
+          (chain-body op bindings operands pos)))))
+
+;; `(let ((#cmp.N arg)) true)`: `arg` evaluated once, then `true`.
+(defun evaluate-then-true :private (ctx: ExpandCtx arg: Stx pos: Pos) -> Stx
+  (let ((g (ctx-gensym ctx "cmp" pos)))
+    (call "let" [(list-form [(list-form [g arg] pos)] pos) (boolean true pos)] pos)))
+
+;; `< > <= >= =`: a chain from three arguments, `true` after evaluating the
+;; one argument of a call of one, the binary call declined.
+(defun comparison (ctx: ExpandCtx items: (Vec Stx) pos: Pos name: str) -> (Option Stx)
+  (let ((n (- (count items) 1)))
+    (cond ((= n 1) (some (evaluate-then-true ctx (nth items 1) pos)))
+          ((>= n 3) (some (chain ctx (prelude-name name) (tail-from items 1) pos)))
+          (true nil))))

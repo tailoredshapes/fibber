@@ -1,0 +1,101 @@
+;; compiler/expand/fusetab.fib: the two sets of the fusion rewrite (stdlib
+;; design §2.1 rule 2, tranche 1 plan R9), as
+;; crates/fibref/src/expand/fuse/tables.rs: **A**, the sequence functions
+;; that have a recipe, with the recipe's constructor (the structs of
+;; lib/fib/seq/recipes.fib, source first), and **T**, the terminal
+;; consumers, with how many arguments the call has and where its collection
+;; is (the last argument, except for `nth`, which reads `(nth c i)`). The
+;; rewrite itself is expand.fuse, its scans expand.fusescan.
+;;
+;; Shapes decided where Rust and fibber differ: a Rust `Terminal` row is a
+;; `Terminal`, a `Stage` row a `FuseStage`; `Shape` is `FuseShape`
+;; (`FsParam FsComplement FsTwo`) and `Facade` has the variants `FacSeq` and
+;; `FacColl` (a variant's name is global to the modules that `:use` this
+;; one, and expand.walk has a `Shape`, expand.quasi an `FSeq`).
+(ns expand.fusetab)
+
+;; The implicit module a name is defined in.
+(defenum Facade FacSeq FacColl)
+
+;; A terminal consumer: the call `(name arg ..)` with `args` arguments,
+;; whose collection is the first argument or the last. (tables::Terminal)
+(defstruct Terminal (name: str args: i64 coll-first: bool facade: Facade))
+
+;; **T**, as the Rust `TERMINALS`.
+(def terminal-rows: (Vec Terminal)
+  [(Terminal "reduce" 3 false FacSeq)
+   (Terminal "reduce1" 2 false FacSeq)
+   (Terminal "reduce-while" 3 false FacSeq)
+   (Terminal "reduce-nonempty" 2 false FacSeq)
+   (Terminal "count" 1 false FacSeq)
+   (Terminal "empty?" 1 false FacSeq)
+   (Terminal "last" 1 false FacSeq)
+   (Terminal "nth" 2 true FacSeq)
+   (Terminal "into" 2 false FacColl)
+   (Terminal "vec" 1 false FacColl)
+   (Terminal "set" 1 false FacColl)
+   (Terminal "run!" 2 false FacSeq)
+   (Terminal "every?" 2 false FacSeq)
+   (Terminal "not-any?" 2 false FacSeq)
+   (Terminal "find-first" 2 false FacSeq)
+   (Terminal "find-map" 2 false FacSeq)
+   (Terminal "group-by" 2 false FacSeq)
+   (Terminal "frequencies" 1 false FacSeq)
+   (Terminal "sort" 1 false FacSeq)
+   (Terminal "sort-by" 2 false FacSeq)
+   (Terminal "sort-with" 2 false FacSeq)
+   (Terminal "sort-by-with" 3 false FacSeq)
+   (Terminal "sum" 1 false FacSeq)])
+
+;; What a stage of a chain becomes: `(name p c)` is `(Recipe c p)`
+;; (`FsParam`); `remove` is Filtered over the complement of its predicate
+;; (`FsComplement`); `(concat a b)` is `(Cat a b)`, two collections
+;; (`FsTwo`). (tables::Shape)
+(defenum FuseShape FsParam FsComplement FsTwo)
+
+;; A member of **A**: the name, the recipe constructor, the shape.
+(defstruct FuseStage (name: str recipe: str shape: FuseShape))
+
+;; **A**, as the Rust `STAGES`: every one has two arguments, in `fib.seq`.
+(def stage-rows: (Vec FuseStage)
+  [(FuseStage "map" "fib.seq/Mapped" FsParam)
+   (FuseStage "filter" "fib.seq/Filtered" FsParam)
+   (FuseStage "remove" "fib.seq/Filtered" FsComplement)
+   (FuseStage "take" "fib.seq/Taken" FsParam)
+   (FuseStage "drop" "fib.seq/Dropped" FsParam)
+   (FuseStage "take-while" "fib.seq/TakenWhile" FsParam)
+   (FuseStage "mapcat" "fib.seq/Mapcat" FsParam)
+   (FuseStage "concat" "fib.seq/Cat" FsTwo)])
+
+;; A head split into the facade it names and the bare name. (split_head)
+(defstruct SplitHead (facade: (Option Facade) base: str))
+
+(defun fuse-split-head (head: str) -> SplitHead
+  (cond ((starts-with? head "fib.seq/") (SplitHead (some FacSeq) (str-slice head 8 (str-len head))))
+        ((starts-with? head "fib.coll/") (SplitHead (some FacColl) (str-slice head 9 (str-len head))))
+        (else (SplitHead nil head))))
+
+;; The row of **T** for a call of `args` arguments by this bare name.
+;; (tables::terminal)
+(defun fuse-terminal (name: str args: i64) -> (Option Terminal)
+  (loop ((i 0))
+    (if (< i (count terminal-rows))
+        (let ((row (nth terminal-rows i)))
+          (if (and (= (. row name) name) (= (. row args) args))
+              (some row)
+              (recur (+ i 1))))
+        nil)))
+
+;; The row of **A** for this bare name. (tables::stage_named)
+(defun fuse-stage-named (name: str) -> (Option FuseStage)
+  (loop ((i 0))
+    (if (< i (count stage-rows))
+        (let ((row (nth stage-rows i)))
+          (if (= (. row name) name) (some row) (recur (+ i 1))))
+        nil)))
+
+(defun facade-same? (a: Facade b: Facade) -> bool
+  (match a
+    ((FacSeq) (match b ((FacSeq) true) (_ false)))
+    ((FacColl) (match b ((FacColl) true) (_ false)))))
+

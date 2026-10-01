@@ -1,0 +1,33 @@
+;; spec:   stdlib §2.7 (an enum variant with fields is a record of the variant: #m.Done{:v 3}; a field-less one is its name)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; (derive Debug E) writes one text per variant: a variant with fields is the
+;; record `#main.Done{:v 3}` (the variant's name, not the enum's), a variant with
+;; no field is its bare name, as a field-less enum shows (types §2.12). A field
+;; written without a name (`(Wrap i64 str)`) is called by its position, `:0`,
+;; `:1`: decided here (R8), the page having no such field. An enum with no field
+;; in any variant has no derived Eq, Ord, Hash or Show (the compilers have them),
+;; but has no Debug either, so the derive writes it: case 816.
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check))
+
+(defenum Shape (Dot) (Circle r: f64) (Rect w: f64 h: f64) (Wrap i64 str))
+(derive Debug Shape)
+
+(defenum One (Only v: i64))
+(derive Debug One)
+
+;; the variant a Debug text of a Shape is of, to show the derive visits all four
+(defun kind (s: Shape) -> i64
+  (match s ((Dot) 0) ((Circle _) 1) ((Rect _ _) 2) ((Wrap _ _) 3)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (debug Dot) "Dot"))
+        (check c (= (debug (Circle 2.5)) "#main.Circle{:r 2.5}"))
+        (check c (= (debug (Rect 1.0 2.0)) "#main.Rect{:w 1.0, :h 2.0}"))
+        (check c (= (debug (Wrap 3 "q")) "#main.Wrap{:0 3, :1 \"q\"}"))
+        (check c (= (debug (Only 9)) "#main.Only{:v 9}"))
+        (check c (= (kind (Wrap 1 "a")) 3))
+        (checks-result c))))

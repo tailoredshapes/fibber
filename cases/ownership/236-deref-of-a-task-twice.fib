@@ -1,0 +1,24 @@
+;; spec:   types §2.9, §6.8, §8.8
+;; expect: accept
+;; result: 127
+;; audit:  clean
+;; `join` of a joined task returns the same result again, retained for each caller (§6.8: a task may
+;; be joined as often as anyone asks), and so does @. One bit per probe: @t twice in one sum, two
+;; readers of one Vec result alive at once (two counts on one object, both released), @ after join and
+;; join after @, a task read by two threads through plet (the task is joined from two threads, §8.8),
+;; and a task whose handle is read after the spawning closure's own captures are gone.
+(defun main () -> i64
+  (let ((t (spawn (fn () 20)))
+        (tv (spawn (fn () [1 2 3 4])))
+        (u (spawn (fn () 3)))
+        (w (spawn (fn () 4)))
+        (s (spawn (fn () "same"))))
+    (let ((a @tv)
+          (b @tv))
+      (+ (if (= (+ @t @t) 40) 1 0)
+         (+ (if (and (= (count a) 4) (= (count b) 4) (= (nth a 3) (nth b 3))) 2 0)
+            (+ (if (= (+ (join u) @u) 6) 4 0)
+               (+ (if (= (+ @w (join w)) 8) 8 0)
+                  (+ (if (plet ((p @t) (q @t)) (= (+ p q) 40)) 16 0)
+                     (+ (if (plet ((p @tv) (q (join tv))) (= (+ (count p) (count q)) 8)) 32 0)
+                        (if (and (= @s "same") (= (str-len @s) 4)) 64 0))))))))))

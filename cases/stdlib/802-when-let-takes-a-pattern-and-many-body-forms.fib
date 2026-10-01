@@ -1,0 +1,53 @@
+;; spec:   stdlib §2.4 (row when-let), §7 E13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: when-let
+;; `(when-let (p e) body ..)` is `(match e ((some p) (do body ..)) (_ ()))`:
+;; the pattern may be refutable (a mismatch does nothing), the body forms run
+;; in order with the pattern's variables bound, and a body of no forms is
+;; unit. (The forms over a value body or a bool are L20, case 723.)
+(ns main (:use tl.check))
+
+(defenum Shape (Circle r: i64) (Rect w: i64 h: i64) Dot)
+
+(defun sum-pair (acc: (Cell i64) o: (Option (Vec i64))) -> unit
+  (when-let ([a b] o) (set! acc (+ @acc a)) (set! acc (+ @acc b))))
+
+(defun grow (acc: (Cell i64) o: (Option Shape)) -> unit
+  (when-let ((Rect w h) o) (set! acc (* w h))))
+
+(defun nothing (o: (Option i64)) -> unit
+  (when-let (x o)))
+
+(defun the-nil () -> (Option i64) nil)
+
+(defun main () -> i64
+  (let ((c (checks))
+        (acc (cell 0))
+        (n (cell 0)))
+    (do
+      (sum-pair acc (some [3 4]))
+      (check c (= @acc 7))
+      (sum-pair acc (some [3]))
+      (sum-pair acc (some [3 4 5]))
+      (sum-pair acc nil)
+      (check c (= @acc 7))
+      (grow acc (some (Rect 6 7)))
+      (check c (= @acc 42))
+      (grow acc (some (Circle 1)))
+      (grow acc (some Dot))
+      (grow acc nil)
+      (check c (= @acc 42))
+      ;; a body of no forms is unit, whatever the payload
+      (nothing (some 1))
+      (nothing nil)
+      ;; the expression is evaluated once
+      (when-let (x (do (set! n (+ @n 1)) (some 9))) (set! acc (+ @acc x)))
+      (check c (= @n 1))
+      (check c (= @acc 51))
+      (when-let (x (do (set! n (+ @n 1)) (the-nil))) (set! acc (+ @acc x)))
+      (check c (= @n 2))
+      (check c (= @acc 51))
+      (checks-result c))))

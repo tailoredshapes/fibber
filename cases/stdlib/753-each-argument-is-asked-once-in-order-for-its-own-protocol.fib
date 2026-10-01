@@ -1,0 +1,41 @@
+;; spec:   stdlib §2.7 (three printers), §6.3 (R5), §4.14 (rows str println print prn)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str println print prn pr
+;; A macro that repeats an argument would run it twice and one that reorders would
+;; run it out of order. The tags record which protocol each printer asks of each
+;; argument and when: Show for println and print, Debug for prn and pr, ToStr for str,
+;; each argument once, left to right. A tag's text is its own name, so the case also
+;; checks that the pieces reach the text in the order they were written. What the
+;; four writers print is judged by case 751 and the Rust tests; the print and pr
+;; calls are followed by a (newline) because the runner reads the result from the last
+;; line of standard output.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defstruct Tag (name: str log: (Cell str)))
+(impl Show Tag (show (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "S" (. self name)))) (. self name))))
+(impl Debug Tag (debug (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "D" (. self name)))) (. self name))))
+(impl ToStr Tag (to-str (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "T" (. self name)))) (. self name))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (log (cell "")))
+    (do (check c (= (str (Tag "a" log) (Tag "b" log) (Tag "c" log)) "abc"))
+        (check c (= @log "TaTbTc"))
+        (set! log "")
+        (println (Tag "x" log) (Tag "y" log) (Tag "z" log))
+        (check c (= @log "SxSySz"))
+        (set! log "")
+        (print (Tag "x" log) (Tag "y" log))
+        (newline)
+        (check c (= @log "SxSy"))
+        (set! log "")
+        (prn (Tag "p" log) (Tag "q" log) (Tag "r" log))
+        (check c (= @log "DpDqDr"))
+        (set! log "")
+        (pr (Tag "p" log) (Tag "q" log))
+        (newline)
+        (check c (= @log "DpDq"))
+        (checks-result c))))

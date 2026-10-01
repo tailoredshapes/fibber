@@ -90,8 +90,15 @@ fn literal_range(form: &Form) -> Option<(Form, Form)> {
 
 /// `(range a b)` ⟹ `(fib.prelude/range-between a b)`; `(range n)` is declined and
 /// stays a call of the library function `range` (§4.4, §4.5). There is
-/// no arity overloading, so the two-argument form is this rewrite.
+/// no arity overloading, so the two-argument form is this rewrite. A call
+/// of three arguments is declined too: it is Clojure's `(range a b step)`,
+/// the library's `range-by`, and the checker's arity error of the library
+/// function says so (stdlib §7 D1, `use range-by`), which a macro's own
+/// arity error could not.
 pub(super) fn range(items: Vec<Form>, pos: Pos) -> Result<Outcome, ExpandError> {
+    if items.len() == 4 {
+        return Ok(Outcome::Declined(Form::new(FormKind::List(items), pos)));
+    }
     check_arity("range", &items, 1, Some(2), &pos)?;
     if let [_, a, b] = items.as_slice() {
         let call = call(

@@ -213,8 +213,14 @@ impl<'a> Cx<'_, 'a> {
     /// then its result, retained.
     pub fn join(&mut self, e: &Expr, t: &V) -> R<V> {
         let result_ty = self.ty(e)?;
+        self.join_value(t, &result_ty)
+    }
+
+    /// `(join t)` of a task whose result has type `result_ty`; also
+    /// `@t` (types §2.9, the `Deref` instance of `(Task a)`).
+    pub fn join_value(&mut self, t: &V, result_ty: &Ty) -> R<V> {
         self.b.stmt(&format!("(call @fib.drive {})", t.text()));
-        self.task_value(t, &result_ty)
+        self.task_value(t, result_ty)
     }
 
     /// The result of a task that is done, retained (under its atom's

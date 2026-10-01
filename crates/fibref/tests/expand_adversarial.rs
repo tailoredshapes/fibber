@@ -107,7 +107,7 @@ fn an_unhygienic_macro_does_capture_as_the_spec_decides() {
 #[test]
 fn a_macro_defining_macro_with_nested_quasiquote_and_splicing() {
     let src = "(defmacro defalias (new old) `(defmacro ,new (... args) `(,',old ,@args)))\n\
-               (defalias plus +)\n\
+               (defalias plus g)\n\
                (defun f () (plus 1 2 3))";
     let out = ok(src);
     assert_eq!(out.len(), 3);
@@ -116,7 +116,10 @@ fn a_macro_defining_macro_with_nested_quasiquote_and_splicing() {
         "{}",
         out[1]
     );
-    assert_eq!(out[2], "(defun f () (+ 1 2 3))");
+    // `g` and not `+`: since R6a a call of `+` with three operands is the
+    // prelude macro's and is expanded again (`(fib.prelude/+ (fib.prelude/+
+    // 1 2) 3)`), which is not what this test is about.
+    assert_eq!(out[2], "(defun f () (g 1 2 3))");
 }
 
 #[test]

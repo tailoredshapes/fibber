@@ -136,7 +136,7 @@ fn builtin_protocols(g: &mut Globals) -> TResult<()> {
 
 /// `Num` for the integers and floats, `Float` for the floats, `Bits` for
 /// the integers, `Eq`, `Ord`, `Hash`, `Show` for every scalar and `str`
-/// (§2.12); `Deref` for `Cell`, `Atom`, `Weak` (§2.9).
+/// (§2.12); `Deref` for `Cell`, `Atom`, `Weak` and `Task` (§2.9).
 fn builtin_instances(g: &mut Globals) -> TResult<()> {
     let mut plain: Vec<(&str, Con)> = Vec::new();
     for s in Scalar::ALL {
@@ -161,6 +161,7 @@ fn builtin_instances(g: &mut Globals) -> TResult<()> {
     }
     add_instance(g, "Deref", Con::Cell, 1, vec![Ty::Gen(0)])?;
     add_instance(g, "Deref", Con::Atom, 1, vec![Ty::Gen(0)])?;
+    add_instance(g, "Deref", Con::Task, 1, vec![Ty::Gen(0)])?;
     let opt = Ty::nominal(g.option, vec![Ty::Gen(0)]);
     add_instance(g, "Deref", Con::Weak, 1, vec![opt])
 }

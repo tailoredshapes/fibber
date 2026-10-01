@@ -8,6 +8,11 @@
 ;; plan and finished (the syntax §1.4 rewrite, `nil`); patterns are
 ;; normalised the same way (syntax §3.9, §1.4).
 ;;
+;; The fusion rewrite (expand.fuserun, stdlib tranche 1 R9) walks the forms of
+;; a module a second time with this machine: `start-expr` takes the role
+;; (Expr, Arg or Fuse, a collection position) because `plan-expr` of
+;; expand.expr plans a form of the fusing walk by it.
+;;
 ;; Shapes decided where Rust and fibber differ:
 ;; - the Rust `Frame` and `Step` are structs and enums of this module: `Frame`
 ;;   is `WalkFrame` (a private `Frame` of expand.ctx has its name, and the
@@ -135,11 +140,11 @@
 
 ;; A form in expression or argument position: entered, its head expanded,
 ;; planned, and its items opened by the plan.
-(defun start-expr :private (ex: Expander form: Stx is-arg: bool stack: Stack) -> (Result Move ExpandError)
+(defun start-expr :private (ex: Expander form: Stx role: Role stack: Stack) -> (Result Move ExpandError)
   (match (expander-enter ex (. form pos))
     ((Err e) (Err e))
     ((Ok _)
-     (match (plan-expr ex form is-arg)
+     (match (plan-expr ex form role)
        ((Err e) (Err e))
        ((Ok p) (Ok (open ex (. p form) (. p role) (. p finish) true stack)))))))
 
@@ -147,8 +152,9 @@
 (defun start :private (ex: Expander form: Stx role: Role stack: Stack) -> (Result Move ExpandError)
   (match role
     ((Keep) (Ok (Move (Done form) stack)))
-    ((Expr) (start-expr ex form false stack))
-    ((Arg) (start-expr ex form true stack))
+    ((Expr) (start-expr ex form role stack))
+    ((Arg) (start-expr ex form role stack))
+    ((Fuse) (start-expr ex form role stack))
     ((Pattern)
      (match (expander-enter ex (. form pos))
        ((Err e) (Err e))

@@ -1,11 +1,9 @@
-;; compiler/expand/derive.fib: `(derive P Name)` for P one of Eq, Ord,
-;; Hash, Show (syntax §3.16, §4.4), over the structs and enums the context
-;; has seen. It replaces crates/fibref/src/expand/derive/{mod,structs,enums}.rs
-;; (223 + 63 + 134 = 420 lines, as library tranche 0 left them: `derive
-;; Hash` writes `(fib.prelude/hash-combine h (hash f))`). Where syntax
-;; §3.16 fixes the shape the builders follow it; the choices it leaves
-;; open are the Rust header's, copied into the port's when it is
-;; written (wave B).
+;; compiler/expand/derive.fib: `(derive P Name)` for P one of Eq, Ord, Hash,
+;; Show, Debug, ToStr (syntax §3.16, §4.4, stdlib §2.7), over the structs
+;; and enums the context has seen. It replaces crates/fibref/src/expand/
+;; derive/{mod,structs,enums}.rs (as library tranche 1 R8 left them). Where
+;; syntax §3.16 fixes the shape the builders follow it; the choices it
+;; leaves open are the Rust header's.
 ;;
 ;; CALLING IT: `derive` is also the language's own form, and a call
 ;; `(derive a b c)` written with the name unqualified is expanded as
@@ -22,15 +20,20 @@
 ;;   `ctx-struct-info` and `ctx-enum-info`; `Vec<Form>` is `(Vec Stx)`;
 ;;   `Result<Form, ExpandError>` is `(Result Stx ExpandError)`.
 ;; - the private enum `Proto` has the variants of the Rust one, `Eq`,
-;;   `Ord`, `Hash`, `Show`; they are bare words in an expression
-;;   (`Hash`) and `((Hash) ..)` in a pattern.
+;;   `Ord`, `Hash`, `Show`, `Debug`, `ToStr`; they are bare words in an
+;;   expression (`Hash`) and `((Hash) ..)` in a pattern.
+;; - `Debug` and `ToStr` (tranche 1 R8): the text of a record, `#m.P{:x 1,
+;;   :y "x"}`, `m` the module being expanded (`ctx-scope`), each field's text
+;;   its `fib.core/debug`; `ToStr` is the same text, so it asks for the
+;;   Debug of the parameters (`proto-context`). The builders are in
+;;   expand.derive.record; `proto-head`, `proto-context`,
+;;   `builtin-for-fieldless` and `text-method` are the Rust `Proto`'s.
 ;; - hygiene (stdlib design C-4): every function the bodies call (`=`, `<`,
 ;;   `not`, `hash`, `show`, `str-concat`) is `fib.prelude/NAME` (`prelude-name`
 ;;   of expand.collections), as `hash-combine` is; the macros `and` and `or`
 ;;   and the core forms stay plain.
-;; - the three Rust files are one module here unless it outgrows 500
-;;   lines, when the helpers move to `expand.derive.*` modules that
-;;   nobody else sees; `derive` stays what is exported.
+;; - the three Rust files are one module here, the record text (record.rs)
+;;   its own, `expand.derive.record`; `derive` stays what is exported.
 ;; - a Rust `Vec<(Form, Form)>` of pairs compared is a vector of the
 ;;   private struct `Cmp`; `&[&str]` method parameters are `(Vec str)`;
 ;;   the iterator chains of the Rust are `loop`s, in the same order, so
@@ -41,10 +44,10 @@
 ;;   `as_sym().unwrap_or("")` is `sym-or-empty`.
 (ns expand.derive (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build
                         expand.collections)
-  (:require [syntax.print :as pr]))
+  (:require [syntax.print :as pr] [expand.derive.record :as rec]))
 
 ;; A derivable protocol. (Proto)
-(defenum Proto :private Eq Ord Hash Show)
+(defenum Proto :private Eq Ord Hash Show Debug ToStr)
 
 ;; The prelude's mixer, qualified so that no binding of the program's can
 ;; shadow it. (HASH_COMBINE)
@@ -60,15 +63,44 @@
     ((= name "Ord") (some Ord))
     ((= name "Hash") (some Hash))
     ((= name "Show") (some Show))
+    ((= name "Debug") (some Debug))
+    ((= name "ToStr") (some ToStr))
     (true nil)))
 
-;; (Proto::name)
-(defun proto-name :private (p: Proto) -> str
+;; The protocol as the `impl` names it: the library's two by the facade's
+;; name. (Proto::head)
+(defun proto-head :private (p: Proto) -> str
   (match p
     ((Eq) "Eq")
     ((Ord) "Ord")
     ((Hash) "Hash")
-    ((Show) "Show")))
+    ((Show) "Show")
+    ((Debug) "fib.core/Debug")
+    ((ToStr) "fib.core/ToStr")))
+
+;; What a type parameter must have for the instance: the protocol itself,
+;; except for `ToStr`, which is built from the fields' `Debug`.
+;; (Proto::context)
+(defun proto-context :private (p: Proto) -> str
+  (match p
+    ((ToStr) (proto-head Debug))
+    (_ (proto-head p))))
+
+;; Whether the compilers have the protocol for an enum with no field.
+;; (Proto::builtin_for_fieldless)
+(defun builtin-for-fieldless :private (p: Proto) -> bool
+  (match p
+    ((Debug) false)
+    ((ToStr) false)
+    (_ true)))
+
+;; The name of the one method of `Show`, `Debug` and `ToStr`.
+;; (Proto::text_method)
+(defun text-method :private (p: Proto) -> str
+  (match p
+    ((Debug) "debug")
+    ((ToStr) "to-str")
+    (_ "show")))
 
 ;; The name of a symbol form, "" for any other. (`as_sym().unwrap_or("")`)
 (defun sym-or-empty :private (form: Stx) -> str
@@ -100,11 +132,11 @@
     -> (Result Stx ExpandError)
   (let ((target (sym-or-empty (nth items 2))))
     (match (ctx-struct-info ctx target)
-      ((some info) (Ok (derive-struct proto info pos)))
+      ((some info) (Ok (derive-struct ctx proto info pos)))
       (nil
        (match (ctx-enum-info ctx target)
          ((some info)
-          (if (all-fieldless info)
+          (if (and (all-fieldless info) (builtin-for-fieldless proto))
               (Ok (call "do" (vec-empty) pos))
               (Ok (derive-enum ctx proto info pos))))
          (nil (Err (ExpandError (DeriveTarget (pr/stx-show (nth items 2)))
@@ -126,7 +158,7 @@
   (let ((pnames (param-names params))
         (head (impl-head name pnames pos))
         (context (where-context proto pnames types pos)))
-    (list-form (concat-vec (concat-vec [(sym "impl" pos) (sym (proto-name proto) pos) head]
+    (list-form (concat-vec (concat-vec [(sym "impl" pos) (sym (proto-head proto) pos) head]
                                        (if (= (count context) 0)
                                            (vec-empty)
                                            [(keyword "where" pos) (list-form context pos)]))
@@ -162,7 +194,7 @@
     (if (>= i (count pnames))
         acc
         (if (mentioned-in types (nth pnames i))
-            (recur (+ i 1) (conj acc (call (proto-name proto) [(sym (nth pnames i) pos)] pos)))
+            (recur (+ i 1) (conj acc (call (proto-context proto) [(sym (nth pnames i) pos)] pos)))
             (recur (+ i 1) acc)))))
 
 ;; Whether any of the type forms mentions the symbol `name`.
@@ -291,19 +323,36 @@
           acc
           (recur (+ i 1) (conj acc (. (nth fs i) ty)))))))
 
+;; `#m.P{:x .., :y ..}`, `m` the module being expanded: the text of
+;; `Debug` and `ToStr`. (structs::record)
+(defun struct-record :private (ctx: ExpandCtx info: StructInfo pos: Pos) -> Stx
+  (let ((fs (. info fields)))
+    (rec/record-text (. (ctx-scope ctx) ns) (. info name)
+                     (loop ((i 0) (acc (vec-empty)))
+                       (if (>= i (count fs))
+                           acc
+                           (recur (+ i 1) (conj acc (rec/field-label (sym-of (. (nth fs i) name)) i)))))
+                     (loop ((i 0) (acc (vec-empty)))
+                       (if (>= i (count fs))
+                           acc
+                           (recur (+ i 1)
+                                  (conj acc (rec/debug-of (field-of "self" (. (nth fs i) name) pos) pos)))))
+                     pos)))
+
 ;; The methods of `proto` on a struct.
-(defun struct-methods :private (proto: Proto info: StructInfo pos: Pos) -> (Vec Stx)
+(defun struct-methods :private (ctx: ExpandCtx proto: Proto info: StructInfo pos: Pos) -> (Vec Stx)
   (match proto
     ((Eq) [(method "=" ["self" "y"] (eq-all (field-pairs info pos) pos) pos) (not-equal pos)])
     ((Ord) (concat-vec [(method "<" ["self" "y"] (lex-less (field-pairs info pos) pos) pos)]
                        (ord-rest pos)))
     ((Hash) [(method "hash" ["self"] (combine 0 (field-selfs info pos) pos) pos)])
-    ((Show) [(method "show" ["self"] (show-call (. info name) (field-selfs info pos) pos) pos)])))
+    ((Show) [(method "show" ["self"] (show-call (. info name) (field-selfs info pos) pos) pos)])
+    (_ [(method (text-method proto) ["self"] (struct-record ctx info pos) pos)])))
 
 ;; The `impl` for `proto` on the struct `info`. (structs::derive)
-(defun derive-struct :private (proto: Proto info: StructInfo pos: Pos) -> Stx
+(defun derive-struct :private (ctx: ExpandCtx proto: Proto info: StructInfo pos: Pos) -> Stx
   (impl-form proto (. info name) (. info params) (struct-types info)
-             (struct-methods proto info pos) pos))
+             (struct-methods ctx proto info pos) pos))
 
 ;; ------------------------------------------------------------- enums
 ;; (derive/enums.rs): a `match` on `self` with, for `Eq` and `Ord`, a
@@ -402,8 +451,8 @@
       (let ((ys (vars ctx (nth vs i) "2" pos)))
         (clause (pattern (nth vs i) ys pos) (lex-less (zip-cmp xs ys) pos) pos))))
 
-;; The body of `hash` or `show`: one clause per variant over its fields.
-;; (per_variant)
+;; The body of `hash`, `show`, `debug` or `to-str`: one clause per variant
+;; over its fields. (per_variant)
 (defun per-variant :private (ctx: ExpandCtx info: EnumInfo proto: Proto pos: Pos) -> Stx
   (let ((vs (. info variants)))
     (match-on "self"
@@ -414,6 +463,8 @@
                   (xs (vars ctx (nth vs i) "" pos))
                   (body (match proto
                           ((Hash) (combine i xs pos))
+                          ((Debug) (rec/variant-record (. (ctx-scope ctx) ns) v xs pos))
+                          ((ToStr) (rec/variant-record (. (ctx-scope ctx) ns) v xs pos))
                           (_ (show-call (. (nth vs i) name) xs pos)))))
               (recur (+ i 1) (conj acc (clause (pattern v xs pos) body pos))))))
       pos)))
@@ -439,10 +490,10 @@
     ((Eq) [(method "=" ["self" "y"] (eq-body ctx info pos) pos) (not-equal pos)])
     ((Ord) (concat-vec [(method "<" ["self" "y"] (less-body ctx info pos) pos)] (ord-rest pos)))
     ((Hash) [(method "hash" ["self"] (per-variant ctx info proto pos) pos)])
-    ((Show) [(method "show" ["self"] (per-variant ctx info proto pos) pos)])))
+    (_ [(method (text-method proto) ["self"] (per-variant ctx info proto pos) pos)])))
 
 ;; The `impl` for `proto` on the enum `info`, which has at least one
-;; variant with fields. (enums::derive)
+;; variant with fields, or is for `Debug` or `ToStr`. (enums::derive)
 (defun derive-enum :private (ctx: ExpandCtx proto: Proto info: EnumInfo pos: Pos) -> Stx
   (impl-form proto (. info name) (. info params) (enum-types info)
              (enum-methods ctx proto info pos) pos))

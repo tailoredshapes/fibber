@@ -1,0 +1,54 @@
+;; spec:   stdlib §2.3 (Lookup: get answers an Option of the value), §5 T1 (absent versus nil-valued)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: get get-or assoc update-opt contains?
+;; A Map whose values are Options holds three states for a key: absent, present
+;; with nil, present with a value. `get` answers (Option (Option i64)) for it,
+;; so nil is "absent" and (some nil) is "present, nil-valued": the two stay apart
+;; because a nested Option is a heap enum, not a collapsed pointer (types §2.2).
+;; `get-or` therefore answers its default only for an absent key, and a key that
+;; holds nil answers nil; `update-opt` hands its function
+;; the value as an Option of it: nil for an absent key, (some nil) for a nil
+;; value. Both tools agree on all of it (the compiled one once collapsed
+;; (some nil) to nil: cases/ownership 220).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; 0 absent, 1 present with nil, 10 + x present with a value
+(defun state (o: (Option (Option i64))) -> i64
+  (match o
+    (nil 0)
+    ((some nil) 1)
+    ((some (some x)) (+ 10 x))))
+
+(defun inner (o: (Option i64)) -> i64 (match o (nil -1) ((some x) x)))
+
+;; what update-opt hands its function is the outer Option: nil for an absent key
+(defun bump (o: (Option (Option i64))) -> (Option i64)
+  (match o
+    (nil (some 100))
+    ((some nil) (some 2))
+    ((some (some x)) (some (+ x 1)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Option i64) nil)
+        (m (assoc (assoc (map-empty) "a" (some 5)) "b" none)))
+    (do (check c (= (state (get m "a")) 15))
+        (check c (= (state (get m "b")) 1))
+        (check c (= (state (get m "c")) 0))
+        (check c (contains? m "a"))
+        (check c (contains? m "b"))
+        (check c (not (contains? m "c")))
+        (check c (= (inner (get-or m "a" (some 9))) 5))
+        (check c (= (inner (get-or m "b" (some 9))) -1))
+        (check c (= (inner (get-or m "c" (some 9))) 9))
+        (check c (= (count m) 2))
+        (check c (= (state (get (assoc m "b" (some 7)) "b")) 17))
+        (check c (= (state (get (assoc m "a" none) "a")) 1))
+        (check c (= (count (assoc m "a" none)) 2))
+        (check c (= (inner (get-or (update-opt m "c" bump) "c" none)) 100))
+        (check c (= (inner (get-or (update-opt m "a" bump) "a" none)) 6))
+        (check c (= (inner (get-or (update-opt m "b" bump) "b" none)) 2))
+        (checks-result c))))

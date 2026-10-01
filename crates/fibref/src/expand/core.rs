@@ -21,6 +21,10 @@ pub(crate) enum Role {
     Expr,
     /// Expand it in argument position of a call, where `(& x)` may stand.
     Arg,
+    /// A collection position of a terminal consumer or of a stage, in the
+    /// fusion walk (`fuse`): an argument, which a stage of a chain becomes
+    /// a recipe in. In the first walk it does not occur.
+    Fuse,
     /// Normalise it as a pattern.
     Pattern,
     /// Walk its items: item `i` by the `i`th role, the rest by the last.

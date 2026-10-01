@@ -1,0 +1,35 @@
+;; spec:   stdlib §4.4 (rows reduce reduce-while), §6.3 (R6b: a macro that declines by default)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce reduce-while
+;; The macro answers only (reduce f c) and a literal fn that has a (reduced e) in a tail
+;; position; every other three-argument call is a call of the library function: a named
+;; function, a bound closure, a parameter, a literal fn with no reduced, one that holds a
+;; reduced only inside a closure it does not return, and a literal with three parameters
+;; is the checker's. A function that returns a Step is reduce-while's, whose result is
+;; the Done or the last More.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun plus (a: i64 x: i64) -> i64 (+ a x))
+
+(defun step (a: i64 x: i64) -> (Step i64) (if (> a 5) (Done a) (More (+ a x))))
+
+(defun fold-with (f: (fn (i64 i64) i64) :borrow c: (Vec i64)) -> i64 (reduce f 0 c))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (g (fn (a x) (+ a (* 2 x))))
+        (calls (cell 0)))
+    (do (check c (= (reduce plus 0 [1 2 3]) 6))
+        (check c (= (reduce g 0 [1 2 3]) 12))
+        (check c (= (reduce (fn (a x) (+ a x)) 10 [1 2 3]) 16))
+        (check c (= (fold-with plus [4 5]) 9))
+        (check c (= (fold-with (fn (a x) (do (set! calls (+ @calls 1)) (+ a x))) [1 2 3]) 6))
+        (check c (= @calls 3))
+        (check c (= (reduce (fn (a x) (let ((later (fn () (reduced a)))) (+ a x))) 0 [1 2]) 3))
+        (check c (= (reduce-while step 0 [1 2 3 4 5]) 6))
+        (check c (= (reduce-while step 0 [1 1]) 2))
+        (check c (= (reduce-while (fn (a x) (if (> x 2) (Done a) (More (+ a x)))) 0 [1 2 3 4]) 3))
+        (checks-result c))))

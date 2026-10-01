@@ -42,11 +42,12 @@
 (ns expand.expr
   (:require [expand.prelude :as prelude] [expand.quasi :as quasi])
   (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.core
-        expand.build expand.heads expand.collections))
+        expand.build expand.heads expand.collections expand.fuse))
 
 ;; The state of one expansion: the context, the runner for user macros
-;; and the current nesting depth.
-(defstruct Expander (ctx: ExpandCtx runner: Runner depth: (Cell i64)))
+;; and the current nesting depth; in the fusion walk, what it knows of the
+;; form it rewrites (`fuse`: nil in the first walk).
+(defstruct Expander (ctx: ExpandCtx runner: Runner depth: (Cell i64) fuse: (Option FuseEnv)))
 
 ;; What to do with a form after its items are walked (Rust `Finish`):
 ;; nothing; `nil` is `(Nil)`; `[..]` is a chain of `conj`; `{..}` is a
@@ -59,7 +60,13 @@
 
 ;; An expander at depth 0. (Expander::new)
 (defun expander-new (ctx: ExpandCtx runner: Runner) -> Expander
-  (Expander ctx runner (cell 0)))
+  (Expander ctx runner (cell 0) nil))
+
+;; An expander for the fusion walk of one top-level form: the forms it
+;; walks are expanded already, and it rewrites the chains in them.
+;; (Expander::fusing)
+(defun expander-fusing (ctx: ExpandCtx runner: Runner env: FuseEnv) -> Expander
+  (Expander ctx runner (cell 0) (some env)))
 
 ;; Enters one level of nesting, failing past the depth limit: TooDeep at
 ;; pos with the limit. (Expander::enter)
@@ -243,13 +250,55 @@
          (Ok (Planned form Keep FinSame))))
     (_ (Ok (Planned form Keep FinSame)))))
 
+;; Whether the role is an argument position: `Arg`, or `Fuse`, which is
+;; one.
+(defun arg-position? :private (role: Role) -> bool
+  (match role
+    ((Arg) true)
+    ((Fuse) true)
+    (_ false)))
+
+;; The plan of a call in the fusing walk: a terminal consumer has its
+;; collection position marked, any other call is planned as the first
+;; walk plans it. (the second half of fuse.rs `plan`)
+(defun plan-fused-call :private (env: FuseEnv form: Stx role: Role) -> (Result Planned ExpandError)
+  (let ((items (match (. form kind) ((SList items) items) (_ (vec-empty)))))
+    (if (= (count items) 0)
+        (Ok (Planned form Keep FinSame))
+        (match (fuse-terminal-call env items)
+          ((some row) (Ok (Planned form (fuse-terminal-role (count items) row) FinSame)))
+          (nil (match (list-plan items (. form pos) (arg-position? role))
+                 ((Err e) (Err e))
+                 ((Ok roles) (Ok (Planned form roles FinSame)))))))))
+
+;; The plan of a form in expression position in the fusing walk: a stage in
+;; a collection position is rewritten, every other form is planned by
+;; `plan-fused-call`; forms are expanded already, so a literal collection
+;; or `nil` is not looked at again. (fuse.rs `plan`)
+(defun plan-fuse :private (env: FuseEnv ctx: ExpandCtx form: Stx role: Role) -> (Result Planned ExpandError)
+  (match role
+    ((Fuse)
+     (match (fuse-rewrite env ctx form)
+       ((StageRewritten rewritten roles) (Ok (Planned rewritten roles FinSame)))
+       ((StageKept kept) (plan-fused-call env kept role))))
+    (_ (plan-fused-call env form role))))
+
 ;; Expands macros at the head of form in expression position (in argument
-;; position when is-arg, where `(& x)` may stand) and plans the walk of
-;; what remains. (plan_expr)
-(defun plan-expr (ex: Expander form: Stx is-arg: bool) -> (Result Planned ExpandError)
-  (match (expand-head ex form)
-    ((Err e) (Err e))
-    ((Ok expanded) (plan expanded is-arg))))
+;; position when `role` is Arg, where `(& x)` may stand) and plans the walk
+;; of what remains; in the fusion walk the form is expanded already and
+;; `role` says whether it is a collection position. (plan_expr)
+(defun plan-expr (ex: Expander form: Stx role: Role) -> (Result Planned ExpandError)
+  (match (. ex fuse)
+    ((some env) (plan-fuse env (. ex ctx) form role))
+    (nil (match (expand-head ex form)
+           ((Err e) (Err e))
+           ((Ok expanded) (plan expanded (arg-position-only? role)))))))
+
+;; Whether the role is `Arg` itself (Rust: `*role == Role::Arg`).
+(defun arg-position-only? :private (role: Role) -> bool
+  (match role
+    ((Arg) true)
+    (_ false)))
 
 ;; Applies finish to a walked form: `nil` becomes `(Nil)`, `[..]` and
 ;; `{..}` become calls of fib.prelude/conj and assoc; every node it builds

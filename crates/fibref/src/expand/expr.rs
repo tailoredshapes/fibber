@@ -12,17 +12,20 @@ use super::collections::{map_literal, vec_literal};
 use super::core::{expr_plan, Role};
 use super::ctx::ExpandCtx;
 use super::error::{ExpandError, ExpandErrorKind as K};
+use super::fuse::{self, Env};
 use super::heads::{is_core, is_definition, primitive_operand};
 use super::prelude::{self, Outcome};
 use super::quasi;
 use super::runner::MacroRunner;
 
 /// The state of one expansion: the context, the runner for user macros
-/// and the current nesting depth.
+/// and the current nesting depth; in the fusion walk, what it knows of the
+/// form it rewrites (`fuse`).
 pub(crate) struct Expander<'a> {
     pub(crate) ctx: &'a mut ExpandCtx,
     runner: &'a mut dyn MacroRunner,
     depth: usize,
+    pub(crate) fuse: Option<Env<'a>>,
 }
 
 impl<'a> Expander<'a> {
@@ -31,6 +34,20 @@ impl<'a> Expander<'a> {
             ctx,
             runner,
             depth: 0,
+            fuse: None,
+        }
+    }
+
+    /// An expander for the fusion walk of one top-level form: the forms it
+    /// walks are expanded already, and it rewrites the chains in them.
+    pub(crate) fn fusing(
+        ctx: &'a mut ExpandCtx,
+        runner: &'a mut dyn MacroRunner,
+        env: Env<'a>,
+    ) -> Self {
+        Expander {
+            fuse: Some(env),
+            ..Expander::new(ctx, runner)
         }
     }
 
@@ -122,12 +139,18 @@ pub(crate) enum Finish {
 }
 
 /// Expands macros at the head of a form in expression (or, with
-/// `is_arg`, argument) position and plans the walk of what remains.
+/// `is_arg`, argument) position and plans the walk of what remains; in the
+/// fusion walk (`fuse`) the form is expanded already and `role` says
+/// whether it is a collection position.
 pub(crate) fn plan_expr(
     ex: &mut Expander,
     form: Form,
-    is_arg: bool,
+    role: &Role,
 ) -> Result<(Form, Role, Finish), ExpandError> {
+    if let Some(env) = &ex.fuse {
+        return fuse::plan(env, ex.ctx, form, role);
+    }
+    let is_arg = *role == Role::Arg;
     let form = expand_head(ex, form)?;
     let (role, finish) = plan(&form, is_arg)?;
     Ok((form, role, finish))
@@ -162,7 +185,7 @@ pub(crate) fn finish_form(form: Form, finish: Finish) -> Form {
 }
 
 /// The role of a non-empty list in expression position.
-fn list_plan(items: &[Form], pos: &Pos, is_arg: bool) -> Result<Role, ExpandError> {
+pub(crate) fn list_plan(items: &[Form], pos: &Pos, is_arg: bool) -> Result<Role, ExpandError> {
     let name = match &items[0].kind {
         FormKind::Nil => return Err(ExpandError::new(K::NilCalled, pos)),
         FormKind::Sym(s) => s.as_str(),

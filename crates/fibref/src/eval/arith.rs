@@ -1,7 +1,7 @@
 //! The methods of the built-in instances (types §2.9, §2.12): `Num`,
 //! `Bits`, `Eq`, `Ord`, `Hash`, `Show` on scalars and `str` (a
-//! field-less enum by variant index), `Deref` on cells, atoms and weak
-//! references; and the conversions. Integer arithmetic has Rust's
+//! field-less enum by variant index), `Deref` on cells, atoms, weak
+//! references and tasks; and the conversions. Integer arithmetic has Rust's
 //! semantics (§2.12, Decided): division and remainder by zero and
 //! signed overflow trap, shift amounts are masked to the width, and
 //! float-to-integer conversion saturates.

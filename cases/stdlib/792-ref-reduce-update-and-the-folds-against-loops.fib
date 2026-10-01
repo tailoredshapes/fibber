@@ -1,0 +1,77 @@
+;; spec:   stdlib §8.1 item 2 (a differential test against a naive reference), §6.3 (R6b)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce reduced update fnil
+;; The macros of R6b against five-line loops over the prelude's own vec-count and vec-nth
+;; (the data structure is not under test), on 300 seeded Vecs of 0 to 11 elements below 20
+;; with a seeded threshold, index and extra argument: (reduce f 0 v) with a reduced in an
+;; if, a cond and a let, and the number of times f runs; the two-argument (reduce f v), (reduce
+;; + v) and (reduce * v); (update v i + x) on a present index and (update v n (fnil + d) x)
+;; one past the end, which makes the Vec longer. The last check is the planted fault: the
+;; same sweep with a reference whose threshold is one too high, run against a second Checks,
+;; and the case fails unless that run found a difference.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+(defun vlen (v: (Vec i64)) -> i64 (fib.prelude/count v))
+(defun vat (v: (Vec i64) i: i64) -> i64 (fib.prelude/nth v i))
+
+;; the sum of the elements until the running sum is over the threshold (then that sum), and
+;; how many times f runs (the stopping call included): the test is made before the element is added
+(defun ref-stop (v: (Vec i64) thr: i64) -> i64
+  (loop ((i 0) (a 0))
+    (if (< i (vlen v)) (if (> a thr) a (recur (+ i 1) (+ a (vat v i)))) a)))
+
+(defun ref-reads (v: (Vec i64) thr: i64) -> i64
+  (loop ((i 0) (a 0))
+    (if (< i (vlen v)) (if (> a thr) (+ i 1) (recur (+ i 1) (+ a (vat v i)))) (vlen v))))
+
+(defun ref-fold (v: (Vec i64)) -> i64
+  (loop ((i 1) (a (vat v 0))) (if (< i (vlen v)) (recur (+ i 1) (- (* a 3) (vat v i))) a)))
+
+(defun ref-sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (a 0)) (if (< i (vlen v)) (recur (+ i 1) (+ a (vat v i))) a)))
+
+(defun ref-product (v: (Vec i64)) -> i64
+  (loop ((i 0) (a 1)) (if (< i (vlen v)) (recur (+ i 1) (* a (vat v i))) a)))
+
+;; is w the Vec v with element i replaced by e (and e appended when i is the length)?
+(defun same-but (w: (Vec i64) v: (Vec i64) i: i64 e: i64) -> bool
+  (and (= (vlen w) (if (= i (vlen v)) (+ (vlen v) 1) (vlen v)))
+       (loop ((j 0) (ok true))
+         (if (< j (vlen w))
+             (recur (+ j 1) (and ok (= (vat w j) (if (= j i) e (vat v j)))))
+             ok))))
+
+(defun sweep (c: Checks seed: i64 skew: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (n 300)
+      (let ((v (rng-vec r (rng-below r 12) 20))
+            (thr (rng-below r 60))
+            (i (rng-below r 12))
+            (x (rng-below r 9))
+            (d (rng-below r 9))
+            (reads (cell 0)))
+        (let ((len (vlen v))
+              (t (+ thr skew)))
+          (do (check c (= (reduce (fn (a e) (if (> a thr) (reduced a) (+ a e))) 0 v) (ref-stop v t)))
+              (check c (= (reduce (fn (a e) (cond ((> a thr) (reduced a)) (true (+ a e)))) 0 v) (ref-stop v t)))
+              (check c (= (reduce (fn (a e) (let ((s (+ a e))) (if (> a thr) (reduced a) s))) 0 v) (ref-stop v t)))
+              (check c (= (reduce (fn (a e) (do (set! reads (+ @reads 1)) (if (> a thr) (reduced a) (+ a e)))) 0 v)
+                          (ref-stop v t)))
+              (check c (= @reads (ref-reads v t)))
+              (check c (= (reduce + v) (ref-sum v)))
+              (check c (= (reduce * v) (ref-product v)))
+              (check c (if (> len 0) (= (reduce (fn (a e) (- (* a 3) e)) v) (ref-fold v)) true))
+              (check c (if (< i len) (same-but (update v i + x) v i (+ (vat v i) x)) true))
+              (check c (same-but (update v len (fnil + d) x) v len (+ d x)))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 29 0)
+        (sweep p 29 1)
+        (check c (= (checks-made c) 3000))
+        (check-detects c p)
+        (checks-result c))))

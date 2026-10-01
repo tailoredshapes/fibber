@@ -100,3 +100,38 @@ fn a_macro_body_runs_threads_on_the_same_executor() {
         3,
     );
 }
+
+#[test]
+fn deref_of_a_task_is_join() {
+    // types §2.9: `@t` joins, retaining the result for the caller each
+    // time, so two reads of a Vec result are two counts on one object.
+    clean(
+        "(defun main () -> i64
+           (let ((t (spawn (fn () [1 2 3]))))
+             (let ((a @t) (b (join t)))
+               (+ (count a) (+ (count b) (count @t))))))",
+        9,
+    );
+    clean(
+        "(defun main () -> i64 (+ @(spawn (fn () 40)) @(async 2)))",
+        42,
+    );
+}
+
+#[test]
+fn deref_of_a_trapping_task_is_its_trap() {
+    let m = failed("(defun main () -> i64 @(spawn (fn () (+ 1 (trap \"in the task\")))))");
+    assert!(m.contains("trap: in the task"), "{m}");
+}
+
+#[test]
+fn a_thread_dereferencing_its_own_task_is_a_reported_deadlock() {
+    let m = failed(
+        "(defun wait-deref (s: (Atom (Option (Task i64)))) -> i64
+           (loop () (match @s ((some x) @x) (nil (recur)))))
+         (defun main () -> i64
+           (let ((s1 (atom nil)) (t (spawn (fn () (wait-deref s1)))))
+             (do (reset! s1 (some t)) (join t))))",
+    );
+    assert!(m.contains("its own thread is driving"), "{m}");
+}

@@ -1,0 +1,107 @@
+;; spec:   stdlib §2.1 rule 2 (the fused path gives what the loops give), §8.1 item 2, tranche 1 plan R9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map filter remove take drop take-while mapcat concat vec count reduce
+;; Each of the eight adaptors alone and in nested chains of two and three, written as a program
+;; writes them, under a consumer that reads the chain once: the expander turns each into recipes
+;; (case 825 counts the objects). Each is compared with an eager reference of loops over the
+;; prelude's vec-conj and vec-nth, over 300 seeded draws of two Vecs of 0 to 9 elements and drawn
+;; parameters, with a count, a sum and a fold for the consumers other than `vec`. The functions
+;; are bound to names before the chain, because a stage whose function is the result of a call is
+;; not fused (the call would run after the source, case 830). The last check plants a fault in
+;; the reference (take keeps one element too many) and requires it to be noticed. Seed 828.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+;; ---- the reference
+(defun push (v: (Vec i64) x: i64) -> (Vec i64) (vec-conj v x))
+(defun r-map (v: (Vec i64) k: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty))) (if (< i (vec-count v)) (recur (+ i 1) (push acc (+ (* (vec-nth v i) 3) k))) acc)))
+(defun r-filter (v: (Vec i64) k: i64 keep: bool) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (recur (+ i 1) (if (= (= (rem (+ (vec-nth v i) k) 3) 0) keep) (push acc (vec-nth v i)) acc))
+        acc)))
+(defun r-take (v: (Vec i64) n: i64 fault: bool) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (and (< i (vec-count v)) (< i (if fault (+ n 1) n))) (recur (+ i 1) (push acc (vec-nth v i))) acc)))
+(defun r-drop (v: (Vec i64) n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v)) (recur (+ i 1) (if (< i n) acc (push acc (vec-nth v i)))) acc)))
+(defun r-while (v: (Vec i64) k: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (and (< i (vec-count v)) (< (vec-nth v i) k)) (recur (+ i 1) (push acc (vec-nth v i))) acc)))
+(defun r-fan (v: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (let ((x (vec-nth v i)))
+          (recur (+ i 1) (if (= (rem x 2) 0) (push (push acc x) x) (push acc x))))
+        acc)))
+(defun r-cat (a: (Vec i64) b: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc a)) (if (< i (vec-count b)) (recur (+ i 1) (push acc (vec-nth b i))) acc)))
+(defun r-sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (acc 0)) (if (< i (vec-count v)) (recur (+ i 1) (+ acc (vec-nth v i))) acc)))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; ---- the parameters of the stages, the same functions the reference spells out
+(defun fmap (k: i64) -> (fn (i64) i64) (fn (x) (+ (* x 3) k)))
+(defun fkeep (k: i64) -> (fn (i64) bool) (fn (x) (= (rem (+ x k) 3) 0)))
+(defun fbelow (k: i64) -> (fn (i64) bool) (fn (x) (< x k)))
+(defun ffan (x: i64) -> (Vec i64) (if (= (rem x 2) 0) [x x] [x]))
+
+;; the single stages, each under its consumer
+(defun singles (c: Checks fault: bool v: (Vec i64) w: (Vec i64) k: i64 n: i64 b: i64) -> unit
+  (let ((fm (fmap k)) (fk (fkeep k)) (fb (fbelow b)))
+    (do (check c (same (vec (map fm v)) (r-map v k)))
+        (check c (same (vec (filter fk v)) (r-filter v k true)))
+        (check c (same (vec (remove fk v)) (r-filter v k false)))
+        (check c (same (vec (take n v)) (r-take v n fault)))
+        (check c (same (vec (drop n v)) (r-drop v n)))
+        (check c (same (vec (take-while fb v)) (r-while v b)))
+        (check c (same (vec (mapcat ffan v)) (r-fan v)))
+        (check c (same (vec (concat v w)) (r-cat v w)))
+        (check c (= (count (filter fk v)) (vec-count (r-filter v k true))))
+        (check c (= (reduce (fn (a: i64 x: i64) (+ a x)) 0 (map fm v)) (r-sum (r-map v k))))
+        (check c (= (count (take n v)) (vec-count (r-take v n fault)))))))
+
+;; chains of two and three stages
+(defun chains (c: Checks fault: bool v: (Vec i64) w: (Vec i64) k: i64 j: i64 n: i64 m: i64 b: i64) -> unit
+  (let ((fm (fmap k)) (fm2 (fmap j)) (fk (fkeep k)) (fk2 (fkeep j))
+        (fb (fbelow (+ b 8))) (fb2 (fbelow (+ n 30))))
+    (do (check c (same (vec (map fm2 (filter fk v))) (r-map (r-filter v k true) j)))
+        (check c (same (vec (filter fk2 (map fm v))) (r-filter (r-map v k) j true)))
+        (check c (same (vec (take n (map fm v))) (r-take (r-map v k) n fault)))
+        (check c (same (vec (drop n (filter fk v))) (r-drop (r-filter v k true) n)))
+        (check c (same (vec (concat (take n v) (drop m w))) (r-cat (r-take v n fault) (r-drop w m))))
+        (check c (same (vec (mapcat ffan (take-while fb v))) (r-fan (r-while v (+ b 8)))))
+        (check c (same (vec (take-while fb2 (map fm v))) (r-while (r-map v k) (+ n 30))))
+        (check c (same (vec (take m (map fm2 (remove fk v)))) (r-take (r-map (r-filter v k false) j) m fault)))
+        (check c (same (vec (drop m (filter fk2 (map fm v)))) (r-drop (r-filter (r-map v k) j true) m)))
+        (check c (= (count (filter fk2 (map fm (drop n v)))) (vec-count (r-filter (r-map (r-drop v n) k) j true)))))))
+
+(defun draw (r: Rng c: Checks fault: bool) -> unit
+  (let ((v (rng-vec r (rng-below r 10) 20))
+        (w (rng-vec r (rng-below r 10) 20))
+        (k (rng-below r 6))
+        (j (rng-below r 6))
+        (n (rng-below r 8))
+        (m (rng-below r 8))
+        (b (rng-below r 20)))
+    (do (singles c fault v w k n b)
+        (chains c fault v w k j n m b))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 828)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 6300))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

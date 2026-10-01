@@ -6,6 +6,7 @@
 mod bindings;
 mod cases;
 mod colours;
+mod diagnostics;
 mod dyn_send;
 mod errors;
 mod errors2;

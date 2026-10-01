@@ -1,0 +1,124 @@
+//! The two diagnostics of stdlib §7 D1 that are the checker's: a test that
+//! can never be false, and the stand-in a library function has for the
+//! arity a call wrote.
+
+use crate::types::ErrorKind as K;
+
+use super::{fails, ok};
+
+/// The message of a program that must fail with a mismatch.
+fn unify(src: &str, text: &str) {
+    fails(src, K::Unify, text);
+}
+
+#[test]
+fn a_primitive_that_is_not_a_bool_is_never_false() {
+    for (ty, value) in [
+        ("i64", "1"),
+        ("i32", "1i32"),
+        ("i8", "1i8"),
+        ("f64", "1.5"),
+        ("f32", "1.5f32"),
+        ("char", "\\a"),
+        ("str", "\"x\""),
+    ] {
+        let src = format!("(defun main () -> i64 (if {value} 2 3))");
+        let text = format!("a value of type {ty} is always true; write the test");
+        let e = fails(&src, K::Unify, &text);
+        assert_eq!(e.message, text, "{src}");
+        assert_eq!(
+            (e.pos.line, e.pos.col),
+            (1, 27),
+            "the position of the test: {src}"
+        );
+    }
+}
+
+#[test]
+fn the_forms_that_expand_to_if_say_it_too() {
+    let always = "a value of type i64 is always true; write the test";
+    for body in [
+        "(when 1 2)",
+        "(unless 1 2)",
+        "(do (while 1 (set! c 1)) 0)",
+        "(cond (1 2) (else 3))",
+        "(and 1 true)",
+        "(or 1 true)",
+        "(if (if true 1 2) 3 4)",
+    ] {
+        let src = format!("(defun main () -> i64 (let ((c (cell 0))) (do {body} 0)))");
+        let e = fails(&src, K::Unify, always);
+        assert_eq!(e.message, always, "{src}");
+    }
+}
+
+#[test]
+fn a_test_of_any_other_type_is_the_plain_mismatch() {
+    // `unit` has no use as a test and no Clojure habit behind it;
+    // an Option is the case stdlib §7 L20 is about, and says what it did.
+    unify(
+        "(defun main () -> i64 (if (do) 2 3))",
+        "cannot unify unit with bool",
+    );
+    unify(
+        "(defun main () -> i64 (if (some 1) 2 3))",
+        "cannot unify (Option i64) with bool",
+    );
+    unify(
+        "(defun main () -> i64 (if [1] 2 3))",
+        "cannot unify (Vec i64) with bool",
+    );
+}
+
+#[test]
+fn a_bool_test_and_a_test_that_becomes_a_bool_are_accepted() {
+    ok("(defun main () -> i64 (if (< 1 2) 3 4))");
+    ok("(defun f (x) (if x 1 2)) (defun main () -> i64 (f true))");
+    ok("(defun main () -> i64 (do (when true (do)) 0))");
+}
+
+#[test]
+fn a_library_functions_arity_error_names_the_stand_in_for_the_arity_written() {
+    // The prelude's `get` and `nth` are methods, its `range` a function.
+    let get = "(defun main () -> i64 (get (map-empty) 1 0))";
+    let e = fails(get, K::Other, "get takes 2 argument(s), got 3; use get-or");
+    assert_eq!(e.message, "get takes 2 argument(s), got 3; use get-or");
+    fails(
+        "(defun main () -> i64 (nth [1 2] 1 0))",
+        K::Other,
+        "nth takes 2 argument(s), got 3; use nth-or",
+    );
+    fails(
+        "(defun main () -> i64 (range 0 10 2))",
+        K::Other,
+        "range takes 1 argument(s), got 3; use range-by",
+    );
+}
+
+#[test]
+fn the_hint_is_for_the_arity_of_the_stand_in_and_no_other() {
+    // Too few, and one too many of another count: the plain error.
+    let e = fails(
+        "(defun main () -> i64 (get (map-empty)))",
+        K::Other,
+        "get takes 2 argument(s), got 1",
+    );
+    assert_eq!(e.message, "get takes 2 argument(s), got 1");
+    let e = fails(
+        "(defun main () -> i64 (nth [1 2] 1 0 0))",
+        K::Other,
+        "nth takes 2 argument(s), got 4",
+    );
+    assert_eq!(e.message, "nth takes 2 argument(s), got 4");
+}
+
+#[test]
+fn a_programs_own_function_of_that_name_has_no_hint() {
+    let e = fails(
+        "(defun get (a: i64 b: i64) -> i64 (+ a b))
+         (defun main () -> i64 (get 1 2 3))",
+        K::Other,
+        "get takes 2 argument(s), got 3",
+    );
+    assert_eq!(e.message, "get takes 2 argument(s), got 3");
+}

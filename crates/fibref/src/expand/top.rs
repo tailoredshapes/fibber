@@ -89,6 +89,21 @@ fn definition_of(ex: &mut Expander, form: Form, first: bool) -> Result<Form, Exp
     walk(ex, form, role)
 }
 
+/// The roles of the items of a definition whose bodies hold expressions
+/// (`defun`, `def`, `impl`, `defprotocol`), for a later walk of the
+/// expanded program: the `:private` marker taken off. `None` for any
+/// other form.
+pub(crate) fn definition_role(form: &Form) -> Option<Role> {
+    let role = match head_name(form)? {
+        "defun" => defun_plan(form),
+        "def" => def_plan(form),
+        "impl" => impl_plan(form),
+        "defprotocol" => protocol_plan(form),
+        _ => return None,
+    };
+    role.ok()
+}
+
 /// Fails if a form that is kept without walking nests deeper than the
 /// limit (only a runner could build one), so later passes over it stay
 /// bounded too.

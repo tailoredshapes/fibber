@@ -1,0 +1,75 @@
+;; compiler/expand/prelude/defn.fib: `defn` and `defn-` (stdlib design §4.2,
+;; tranche 1 R6b), as crates/fibref/src/expand/prelude/defn.rs (73 lines of
+;; Rust), Clojure's spelling of `defun`:
+;;
+;;   (defn  name doc? [x: T ..] -> R body ..) ==> (defun name (x: T ..) -> R body ..)
+;;   (defn- name doc? [x: T ..] -> R body ..) ==> (defun name :private (x: T ..) -> R body ..)
+;;
+;; The docstring is dropped; everything after the parameter vector is passed
+;; on as written. A `&` in the vector (rest parameters, L2) and a list of
+;; clauses `([x] ..) ([x y] ..)` (several arities, L1) are errors that name
+;; the stdlib item that adds them. The built `defun` takes the call's
+;; position; the parameter list takes the vector's. Called by expand.prelude
+;; (the registry rows `defn` and `defn-`).
+(ns expand.prelude.defn
+  (:use syntax.pos syntax.form util.result expand.error expand.build expand.prelude.parts))
+
+;; `(defn name doc? [params] rest..)` and, with `private`, `(defn- ..)`.
+;; (defn.rs `defn`)
+(defun defn-macro (items: (Vec Stx) pos: Pos private: bool) -> (Result Stx ExpandError)
+  (let ((name (if private "defn-" "defn")))
+    (match (check-arity name items 2 nil pos)
+      ((Err e) (Err e))
+      ((Ok _)
+       (match (sym-of (nth items 1))
+         (nil (Err (malformed name "the name must be a symbol" (. (nth items 1) pos))))
+         ((some _) (defn-parameters name items pos private)))))))
+
+;; The index of the form after the docstring, when there is one: a string
+;; is a docstring only in this place.
+(defun doc-skip :private (items: (Vec Stx)) -> i64
+  (match (. (nth items 2) kind)
+    ((SStr _) 3)
+    (_ 2)))
+
+(defun is-vector :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SVec _) true)
+    (_ false)))
+
+;; The parameter vector (Rust `parameters`): a vector is the parameters, a
+;; list of clauses that starts with one is several arities, anything else,
+;; or nothing, is not a parameter vector.
+(defun defn-parameters :private (name: str items: (Vec Stx) pos: Pos private: bool)
+    -> (Result Stx ExpandError)
+  (let ((at (doc-skip items)))
+    (if (>= at (count items))
+        (Err (malformed name "expected a parameter vector" pos))
+        (let ((form (nth items at)))
+          (match (. form kind)
+            ((SVec params) (defn-rest-check name items pos private form params (+ at 1)))
+            ((SList clauses)
+             (if (and (> (count clauses) 0) (is-vector (nth clauses 0)))
+                 (Err (malformed name "several arities need L1" (. form pos)))
+                 (Err (malformed name "expected a parameter vector" (. form pos)))))
+            (_ (Err (malformed name "expected a parameter vector" (. form pos)))))))))
+
+(defun has-rest-marker :private (params: (Vec Stx)) -> bool
+  (loop ((i 0))
+    (if (< i (count params))
+        (if (is-sym (nth params i) "&") true (recur (+ i 1)))
+        false)))
+
+;; The `defun` of the call: `rest-at` is the index of the first form after
+;; the parameter vector.
+(defun defn-rest-check :private (name: str items: (Vec Stx) pos: Pos private: bool form: Stx
+                                 params: (Vec Stx) rest-at: i64)
+    -> (Result Stx ExpandError)
+  (if (has-rest-marker params)
+      (Err (malformed name "rest parameters need L2" (. form pos)))
+      (let ((head (if private
+                      [(sym "defun" pos) (nth items 1) (keyword "private" pos)]
+                      [(sym "defun" pos) (nth items 1)])))
+        (Ok (list-form (concat-forms (conj head (Stx (SList params) (. form pos)))
+                                     (tail-from items rest-at))
+                       pos)))))

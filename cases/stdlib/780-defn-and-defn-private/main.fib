@@ -1,0 +1,58 @@
+;; spec:   stdlib §4.2 (rows defn defn-), §6.3 (R6b), syntax §5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../../lib ../support
+;; covers: defn defn-
+;; (defn name doc? [x: T ..] -> R body ..) is (defun name (x: T ..) -> R body ..): the
+;; parameters are a vector, a docstring is dropped, and what follows the vector
+;; (`:where`, `-> R`, the body, several body forms) is a defun's own. (defn- ..) is
+;; the same with :private, so the helper that util's public function calls is not
+;; reachable by name from here (case 781 is that reject), and a defn- of this
+;; module is private to it. A defn and a defun call each other, a defn recurses, a
+;; generic defn carries its `:where`, and a parameter keeps its `:borrow`.
+(ns main (:require [util :as u]) (:use fib.core fib.seq tl.check))
+
+(defn add [a: i64 b: i64] -> i64 (+ a b))
+
+(defn seven [] -> i64 7)
+
+(defn scaled "a docstring is dropped" [x: i64] -> i64
+  (let ((k (seven)))
+    (* k x)))
+
+(defn pick [a: t b: t] :where ((Ord t)) -> t (if (< a b) b a))
+
+(defn twice [f: (fn (i64) i64) :borrow x: i64] -> i64 (f (f x)))
+
+(defn sum-to [n: i64 acc: i64] -> i64 (if (= n 0) acc (sum-to (- n 1) (+ acc n))))
+
+(defn- hidden [x: i64] -> i64 (+ x 100))
+
+(defun plain (x: i64) -> i64 (add x (scaled x)))
+
+(defn two-forms [x: i64] -> i64
+  (let ((y (cell x)))
+    (do (set! y (+ @y 1))
+        (set! y (* @y 2))
+        @y)))
+
+(defn from-vec [v: (Vec i64)] -> i64 (reduce add 0 v))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (add 2 3) 5))
+        (check c (= (seven) 7))
+        (check c (= (scaled 6) 42))
+        (check c (= (plain 1) 8))
+        (check c (= (pick 3 9) 9))
+        (check c (= (pick "b" "a") "b"))
+        (check c (= (pick 2.5 1.5) 2.5))
+        (check c (= (twice (fn (x) (* x 3)) 2) 18))
+        (check c (= (sum-to 10 0) 55))
+        (check c (= (hidden 1) 101))
+        (check c (= (two-forms 4) 10))
+        (check c (= (from-vec [1 2 3 4]) 10))
+        (check c (= (u/open 1) 42))
+        (check c (= (u/doubled 21) 42))
+        (checks-result c))))

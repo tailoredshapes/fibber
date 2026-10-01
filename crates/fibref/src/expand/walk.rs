@@ -7,6 +7,10 @@
 //! `Limits::max_depth`), expanded at its head, planned (`expr`), its
 //! items walked by the plan, and finished (the §1.4 rewrite, `nil`).
 //! Patterns are normalised the same way (§3.9, §1.4).
+//!
+//! The fusion rewrite (`fuse`) walks the forms of a module a second time
+//! with this machine: `Role::Fuse` marks a collection position, and
+//! `plan_expr` plans a form of that walk by its role.
 
 use crate::syntax::{Form, FormKind, Pos};
 
@@ -68,9 +72,9 @@ fn start(
 ) -> Result<Step, ExpandError> {
     match role {
         Role::Keep => Ok(Step::Done(form)),
-        Role::Expr | Role::Arg => {
+        Role::Expr | Role::Arg | Role::Fuse => {
             ex.enter(&form.pos)?;
-            let (form, role, finish) = plan_expr(ex, form, role == Role::Arg)?;
+            let (form, role, finish) = plan_expr(ex, form, &role)?;
             Ok(open(ex, form, role, finish, true, stack))
         }
         Role::Pattern => {

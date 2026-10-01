@@ -1,0 +1,44 @@
+;; spec:   stdlib §2.4 (row update), §4.5, §6.3 (R6b), Appendix A11 t24
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: update update-or fnil
+;; The three calls of Appendix A11 t24 in one program: (update m "a" inc) is 6 (the
+;; library function, f sees the value), (update m "w" (fnil + 100) 7) is 107 (a
+;; literal fnil is routed to update-or: the missing key is 100, f is + with 7 as
+;; its extra argument) and (update m "a" + 10) is 15 (extra arguments, as Clojure's
+;; (update m k f x ..): f gets the value and then them). Beside them: several extra
+;; arguments, a computed f with extra arguments, a literal fnil on a present key and
+;; with no extra argument, an update of a Vec by index, f called once, and the
+;; original map left as it was (update never changes its argument).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun at (m: (Map str i64) k: str) -> i64 (match (get m k) (nil -1) ((some x) x)))
+
+(defun muladd (v: i64 x: i64 y: i64) -> i64 (+ (* v x) y))
+
+(defun adder (n: i64) -> (fn (i64 i64) i64) (fn (v x) (+ v (* n x))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (assoc (assoc (map-empty) "a" 5) "z" 2))
+        (calls (cell 0)))
+    (do (check c (= (at (update m "a" inc) "a") 6))
+        (check c (= (at (update m "w" (fnil + 100) 7) "w") 107))
+        (check c (= (at (update m "a" + 10) "a") 15))
+        (check c (= (at (update m "a" muladd 3 4) "a") 19))
+        (check c (= (at (update m "a" (adder 10) 2) "a") 25))
+        (check c (= (at (update m "a" (fnil + 100) 7) "a") 12))
+        (check c (= (at (update m "w" (fnil inc 0)) "w") 1))
+        (check c (= (at (update m "a" (fnil inc 0)) "a") 6))
+        (check c (= (at (update-or m "w" inc 41) "w") 42))
+        (check c (= (at (update m "z" (fn (v x) (do (set! calls (+ @calls 1)) (+ v x))) 8) "z") 10))
+        (check c (= @calls 1))
+        (check c (= (count (update m "w" (fnil + 100) 7)) 3))
+        (check c (= (count m) 2))
+        (check c (= (at m "a") 5))
+        (check c (= (at m "w") -1))
+        (check c (= (nth (update [10 20 30] 1 + 5) 1) 25))
+        (check c (= (nth (update [10 20 30] 3 (fnil + 7) 5) 3) 12))
+        (checks-result c))))

@@ -108,17 +108,22 @@ fn option_binding(name: &str, form: &Form) -> Result<(Form, Form), ExpandError> 
     }
 }
 
-/// `(match e ((fib.prelude/some x) then) (nil other))`.
+/// `(match e ((fib.prelude/some p) then) (_ other))`. The else is a
+/// wildcard, not `nil`: the pattern `p` may be refutable (`[a b]` matches
+/// a vector of two and no other), and the else is taken on a mismatch of
+/// the pattern as well as on `nil` (stdlib §2.4, §7 E13). With a `nil`
+/// clause the match would be non-exhaustive (`missing (some [])`) for every
+/// pattern that does not cover its type.
 fn option_match(x: Form, e: Form, then: Form, other: Form, pos: &Pos) -> Form {
     let some = list(vec![call(&prelude_name("some"), vec![x], pos), then], pos);
-    let none = list(vec![Form::new(FormKind::Nil, pos.clone()), other], pos);
-    list(vec![sym("match", pos), e, some, none], pos)
+    let rest = list(vec![sym("_", pos), other], pos);
+    list(vec![sym("match", pos), e, some, rest], pos)
 }
 
-/// `(if-let (x e) a b)` ⟹ `(match e ((fib.prelude/some x) a) (nil b))`
-/// (§4.4).
+/// `(if-let (p e) a b)` ⟹ `(match e ((fib.prelude/some p) a) (_ b))`;
+/// `(if-let (p e) a)` has `()` as its else (§4.4, stdlib §2.4).
 pub(super) fn if_let(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
-    check_arity("if-let", &items, 3, Some(3), pos)?;
+    check_arity("if-let", &items, 2, Some(3), pos)?;
     let (x, e) = option_binding("if-let", &items[1])?;
     let mut it = items.into_iter().skip(2);
     let then = it.next().unwrap_or_else(|| unit(pos));
@@ -126,8 +131,8 @@ pub(super) fn if_let(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     Ok(option_match(x, e, then, other, pos))
 }
 
-/// `(when-let (x e) body...)` ⟹ `(match e ((fib.prelude/some x) body)
-/// (nil ()))`.
+/// `(when-let (p e) body...)` ⟹ `(match e ((fib.prelude/some p) body)
+/// (_ ()))`.
 pub(super) fn when_let(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     check_arity("when-let", &items, 1, None, pos)?;
     let (x, e) = option_binding("when-let", &items[1])?;

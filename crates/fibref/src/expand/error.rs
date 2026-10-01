@@ -98,7 +98,7 @@ pub enum ExpandErrorKind {
         /// The name.
         name: String,
     },
-    /// `(derive P Name)` with `P` not one of `Eq Ord Hash Show` (§4.4).
+    /// `(derive P Name)` with `P` not one of `Eq Ord Hash Show Debug ToStr` (§4.4).
     DeriveProtocol {
         /// The protocol named.
         name: String,
@@ -217,7 +217,7 @@ impl fmt::Display for ExpandErrorKind {
                 write!(f, "defmacro cannot redefine core form {name}")
             }
             K::DeriveProtocol { name } => {
-                write!(f, "cannot derive {name}: only Eq, Ord, Hash and Show")
+                write!(f, "cannot derive {name}: only Eq, Ord, Hash, Show, Debug and ToStr")
             }
             K::DeriveTarget { name } => write!(f, "cannot derive for {name}: not a struct or enum"),
             K::NotAStruct { op, name } => write!(f, "{op}: {name} is not a struct"),

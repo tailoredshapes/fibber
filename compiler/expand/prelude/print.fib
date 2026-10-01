@@ -1,0 +1,96 @@
+;; compiler/expand/prelude/print.fib: `str`, `println`, `print`, `prn`, `pr`
+;; (stdlib §2.7, §2.10, §4.14; tranche 1 R5), as
+;; crates/fibref/src/expand/prelude/print.rs (112 lines of Rust). The
+;; functions are those of the Rust, named as expand.prelude says
+;; (`str-macro` for `str_macro`, `printer-macro` for `printer`); each takes
+;; the call's items and position and returns the expansion.
+;;
+;; Decided (the Rust's header says why): `(str a b ..)` is a right fold of
+;; `fib.prelude/str-concat` over the pieces, a piece being a string literal
+;; as it is, a literal `nil` as `""` and anything else `(fib.core/to-str
+;; x)`; `(println a b ..)` is `(fib.prelude/println S)` and `(print ..)`
+;; `(fib.prelude/print-str S)`, `S` the pieces joined by one space, a piece
+;; being a literal `nil` as `"nil"` and anything else `(fib.prelude/show x)`
+;; (a string literal included); `prn` and `pr` are the same over
+;; `(fib.core/debug x)`.
+(ns expand.prelude.print
+  (:use syntax.pos syntax.form expand.build expand.collections expand.prelude.parts))
+
+;; Which of the four printers a macro is: `println` (Show, newline), `print`
+;; (Show), `prn` (Debug, newline), `pr` (Debug).
+(defenum Printer Println Print Prn Pr)
+
+;; Whether the form is a string literal / the literal `nil`.
+(defun is-string-literal :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SStr _) true)
+    (_ false)))
+
+(defun is-nil-literal :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SNil) true)
+    (_ false)))
+
+;; `a` then `b` as one text: `(fib.prelude/str-concat a b)`.
+(defun concat-text :private (a: Stx b: Stx pos: Pos) -> Stx
+  (call (prelude-name "str-concat") [a b] pos))
+
+;; The pieces as one text, `sep` between two (none for `str`): a right fold.
+;; No pieces is `""`.
+(defun join-pieces :private (pieces: (Vec Stx) sep: (Option str) pos: Pos) -> Stx
+  (let ((n (count pieces)))
+    (if (= n 0)
+        (string "" pos)
+        (loop ((i (- n 2)) (acc (nth pieces (- n 1))))
+          (if (>= i 0)
+              (let ((spaced (match sep
+                              (nil acc)
+                              ((some s) (concat-text (string s pos) acc pos)))))
+                (recur (- i 1) (concat-text (nth pieces i) spaced pos)))
+              acc)))))
+
+;; The piece of one argument of `str`.
+(defun str-piece :private (x: Stx pos: Pos) -> Stx
+  (cond ((is-nil-literal x) (string "" pos))
+        ((is-string-literal x) x)
+        (true (call "fib.core/to-str" [x] pos))))
+
+;; The piece of one argument of a printer; `debug` is `prn`/`pr`.
+(defun printer-piece :private (x: Stx pos: Pos debug: bool) -> Stx
+  (cond ((is-nil-literal x) (string "nil" pos))
+        (debug (call "fib.core/debug" [x] pos))
+        (true (call (prelude-name "show") [x] pos))))
+
+;; `(str a b ..)`: the pieces of the call's arguments, joined.
+(defun str-macro (items: (Vec Stx) pos: Pos) -> Stx
+  (loop ((i 1) (pieces (vec-empty)))
+    (if (< i (count items))
+        (recur (+ i 1) (conj pieces (str-piece (nth items i) pos)))
+        (join-pieces pieces nil pos))))
+
+;; The function a printer writes with: `println` or `print-str`.
+(defun printer-write :private (which: Printer) -> str
+  (match which
+    ((Println) "println")
+    ((Print) "print-str")
+    ((Prn) "println")
+    ((Pr) "print-str")))
+
+;; Whether a printer is over `Debug`.
+(defun printer-debug :private (which: Printer) -> bool
+  (match which
+    ((Println) false)
+    ((Print) false)
+    ((Prn) true)
+    ((Pr) true)))
+
+;; `(println a b ..)`, `(print ..)`, `(prn ..)`, `(pr ..)`: one write of the
+;; arguments' texts joined by a space.
+(defun printer-macro (items: (Vec Stx) pos: Pos which: Printer) -> Stx
+  (let ((debug (printer-debug which)))
+    (loop ((i 1) (pieces (vec-empty)))
+      (if (< i (count items))
+          (recur (+ i 1) (conj pieces (printer-piece (nth items i) pos debug)))
+          (call (prelude-name (printer-write which))
+                [(join-pieces pieces (some " ") pos)]
+                pos)))))

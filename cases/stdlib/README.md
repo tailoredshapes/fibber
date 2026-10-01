@@ -32,13 +32,11 @@ plan's step M flips the list:
 (ns main (:use fib.core fib.seq fib.coll fib.print))   ; or the subset it needs
 ```
 
-Three things a case may not do before the flip, each decided by a probe in
-the tranche 1 plan: write `/` on integers (it is `Div`'s method in every
-module that `:use`s `fib.core`; write `quot` once R3 has landed); write
-`list` or match `(empty)` and `(cons ..)` in a module that `:use`s `fib.coll`
-(its `empty` method is the `List` variant's name until R2 renames the
-variants `Empty` and `Cons`); name a part (`fib.seq.vseq`) where a facade
-will do.
+Two things a case may not do: write `/` on integers (it is `Div`'s method in
+every module that `:use`s `fib.core`, and means a ratio; write `quot` for the
+truncated quotient), and name a part (`fib.seq.vseq`) where a facade will do.
+The `List` variants are `Empty` and `Cons`, so `list` and a match on them work
+in a module that `:use`s `fib.coll`, whose `empty` is a method.
 
 ## Numbering
 
@@ -134,6 +132,11 @@ package ids of the plan a case may wait for.
   failure sets bit 62), `(checks-made c)`, `(check-detects c planted)`.
 * `tl.gen`: `(gen-char r)`, `(gen-char-of r width)`, `(gen-str r n)`: UTF-8 with
   scalars of every width, never a surrogate.
+* `tl.model` (V1): the key types `Kc Kh Kd Kw` (hash id mod 7, `(id mod 4) << 20`, a
+  chain, `id << 59`) with `mk-*`/`id-*` for them, for `i64` and for `str`; `run-map-seq`,
+  `run-set-seq`, `run-drain` (a seeded run of a Map or Set against an id-indexed model:
+  0 or the failing step); `Cover`, to assert what a run reached; `each-entry` and
+  `each-elem` (the prelude's `map-each` and `set-each`).
 
 A case never prints to compare: it computes a result.
 
@@ -164,10 +167,10 @@ A test that cannot fail is worse than none.
   and `one` at six widths; 010 a user `Div` instance; 011 `to-str` and `debug` of a
   string; 012 `empty` of a `Vec`; 013 `get` of a `Vec`; 014 two facades through aliases
   and uses; 015 (reject) a part that uses one below it closes a cycle; 016 (trap) `nth` past
-  the end; 017 a seq that refers to itself is a leak cycle; 018 (reject) integer `/` until
-  `Div` has integer instances; 019 the protocols with no library instance take a user one;
-  020 the support modules against values computed outside fibber; 021 and 022 (`count-`) the
-  allocations of a walk.
+  the end; 017 a seq that refers to itself is a leak cycle; 019 the protocols with no library
+  instance take a user one; 020 the support modules against values computed outside fibber;
+  021 and 022 (`count-`) the allocations of a walk; 023 (trap) `payload` of nil; 024 `Step` and
+  the prelude's tuples.
 * 900 to 911 (`open-`) the failing programs of §5.5, one per item still open: S1 L20,
   S2 L21, S3 L22, S4 L23, S5 L24, S6 L26, S7 L1, S8 L15, S10 C9, S12 E14, S15 L29, S16 L28
   (S9, S11, S13, S14, S17 and S18 are other packages' rows). Each program was refused or

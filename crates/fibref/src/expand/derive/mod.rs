@@ -1,5 +1,6 @@
-//! `(derive P Name)` for `P` one of `Eq`, `Ord`, `Hash`, `Show` (§3.16,
-//! §4.4), over the structs and enums the context has seen.
+//! `(derive P Name)` for `P` one of `Eq`, `Ord`, `Hash`, `Show`, `Debug`
+//! and `ToStr` (§3.16, §4.4, stdlib §2.7), over the structs and enums
+//! the context has seen.
 //!
 //! The head is `Name` applied to its parameters (bare when it has none);
 //! `:where` lists `(P t)` for each parameter some field type mentions
@@ -31,9 +32,27 @@
 //!   `<`, `not`, `hash`, `show`, `str-concat`) is written
 //!   `fib.prelude/NAME`, as `hash-combine` is, so that a program's own
 //!   `show` or `<` is not what a derived instance calls. The macros `and`
-//!   and `or` and the core forms stay plain.
+//!   and `or` and the core forms stay plain;
+//! - `Debug` and `ToStr` (stdlib §2.7, L17; decided in the tranche 1 plan,
+//!   R8): the text of a record, `#m.P{:x 1, :y "x"}`, `m` being the module
+//!   the `derive` form is expanded in (the type table does not record the
+//!   module a type was defined in, so a `derive` in another module than the
+//!   type's prints the deriving module), each field's text the `debug` of
+//!   the field. A variant with fields is such a record of the variant's
+//!   name, `#m.Done{:v 3}`; a field written without a name is called by its
+//!   position, `#m.W{:0 5}`; a variant with no field is its bare name.
+//!   `ToStr` of a derived type is that same text, built from the fields'
+//!   `Debug` (the page: a record's `str` is its `pr` text), so it needs
+//!   no `Debug` instance of the type itself. The protocol and its methods
+//!   are written with the facade's name, `fib.core/Debug`, `fib.core/debug`
+//!   (a Debug is not the prelude's, so the head `fib.prelude/` does not
+//!   reach it): the module needs `fib.core` in scope, which `:use` gives it
+//!   until the library modules are implicit. An enum none of whose variants
+//!   has a field derives nothing for `Eq Ord Hash Show` (the compilers
+//!   have those) but does derive `Debug` and `ToStr`, which they do not.
 
 mod enums;
+mod record;
 mod structs;
 
 use crate::syntax::{Form, Pos};
@@ -55,6 +74,8 @@ pub(crate) enum Proto {
     Ord,
     Hash,
     Show,
+    Debug,
+    ToStr,
 }
 
 impl Proto {
@@ -64,16 +85,45 @@ impl Proto {
             "Ord" => Some(Proto::Ord),
             "Hash" => Some(Proto::Hash),
             "Show" => Some(Proto::Show),
+            "Debug" => Some(Proto::Debug),
+            "ToStr" => Some(Proto::ToStr),
             _ => None,
         }
     }
 
-    fn name(self) -> &'static str {
+    /// The protocol as the `impl` names it: the library's two by the
+    /// facade's name.
+    fn head(self) -> &'static str {
         match self {
             Proto::Eq => "Eq",
             Proto::Ord => "Ord",
             Proto::Hash => "Hash",
             Proto::Show => "Show",
+            Proto::Debug => "fib.core/Debug",
+            Proto::ToStr => "fib.core/ToStr",
+        }
+    }
+
+    /// What a type parameter must have for the instance: the protocol
+    /// itself, except for `ToStr`, which is built from the fields' `Debug`.
+    fn context(self) -> &'static str {
+        match self {
+            Proto::ToStr => Proto::Debug.head(),
+            p => p.head(),
+        }
+    }
+
+    /// Whether the compilers have the protocol for an enum with no field.
+    fn builtin_for_fieldless(self) -> bool {
+        !matches!(self, Proto::Debug | Proto::ToStr)
+    }
+
+    /// The name of the one method of `Show`, `Debug` and `ToStr`.
+    fn text_method(self) -> &'static str {
+        match self {
+            Proto::Debug => "debug",
+            Proto::ToStr => "to-str",
+            _ => "show",
         }
     }
 }
@@ -91,10 +141,11 @@ pub(crate) fn derive(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<For
     };
     let target = items[2].as_sym().unwrap_or("");
     if let Some(info) = ctx.struct_info(target) {
-        return Ok(structs::derive(proto, info, pos));
+        return Ok(structs::derive(ctx, proto, info, pos));
     }
     if let Some(info) = ctx.enum_info(target) {
-        if info.variants.iter().all(|v| v.fields.is_empty()) {
+        let fieldless = info.variants.iter().all(|v| v.fields.is_empty());
+        if fieldless && proto.builtin_for_fieldless() {
             return Ok(call("do", Vec::new(), pos));
         }
         return Ok(enums::derive(ctx, proto, info, pos));
@@ -115,7 +166,7 @@ fn impl_form(
     methods: Vec<Form>,
     pos: &Pos,
 ) -> Form {
-    let mut out = vec![sym("impl", pos), sym(proto.name(), pos)];
+    let mut out = vec![sym("impl", pos), sym(proto.head(), pos)];
     let param_names: Vec<&str> = params.iter().filter_map(Form::as_sym).collect();
     if param_names.is_empty() {
         out.push(sym(name, pos));
@@ -128,7 +179,7 @@ fn impl_form(
     for p in param_names {
         if types.iter().any(|t| mentions(t, p)) {
             // `(Ord t)` entails `(Eq t)`, its supertrait (types §4.1).
-            context.push(call(proto.name(), vec![sym(p, pos)], pos));
+            context.push(call(proto.context(), vec![sym(p, pos)], pos));
         }
     }
     if !context.is_empty() {
@@ -226,10 +277,5 @@ fn show_call(name: &str, fields: Vec<Form>, pos: &Pos) -> Form {
         pieces.push(call(&prelude_name("show"), vec![f], pos));
     }
     pieces.push(string(")", pos));
-    let mut it = pieces.into_iter().rev();
-    let mut acc = it.next().unwrap_or_else(|| string("", pos));
-    for p in it {
-        acc = call(&prelude_name("str-concat"), vec![p, acc], pos);
-    }
-    acc
+    record::concat(pieces, pos)
 }

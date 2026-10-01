@@ -1,0 +1,43 @@
+;; spec:   stdlib §2.7 (the printers: a record of module m is #m.P{:x 1, :y "x"}), §7 L17
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; (derive Debug P) writes the page's text of a record: `#`, the module the
+;; derive is expanded in (here main), `.`, the struct's name, then each field's
+;; own Debug text after its name as a keyword, with ", " between and a closing
+;; brace. A string field is quoted (Debug of a str), a char is in its
+;; reader form, a nested Vec is in brackets and an Option is its payload. Decided
+;; where the page is silent (R8): the module is the one being expanded, since the
+;; expander's type table does not record where a type was defined; a struct has
+;; at least one field (defstruct says so), so there is no `#m.P{}`.
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check))
+
+(defstruct P (x: i64 y: str))
+(derive Debug P)
+
+(defstruct Mixed (flag: bool c: char f: f64 v: (Vec i64) o: (Option str)))
+(derive Debug Mixed)
+
+(defstruct One (only: i64))
+(derive Debug One)
+
+;; the same text written out by hand, with the library's own Debug: the derived
+;; instance must say nothing a person writing the page's rule would not
+(defun by-hand (p: P) -> str
+  (str-concat "#main.P{:x " (str-concat (debug (. p x)) (str-concat ", :y " (str-concat (debug (. p y)) "}")))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (P 1 "x"))
+        (q (P -7 "a b ü"))
+        (m (Mixed true \a 1.5 [1 2 3] (some "s")))
+        (n (Mixed false \space 0.0 (vec-empty) nil)))
+    (do (check c (= (debug p) "#main.P{:x 1, :y \"x\"}"))
+        (check c (= (debug q) "#main.P{:x -7, :y \"a b ü\"}"))
+        (check c (= (debug p) (by-hand p)))
+        (check c (= (debug q) (by-hand q)))
+        (check c (= (debug m) "#main.Mixed{:flag true, :c \\a, :f 1.5, :v [1 2 3], :o \"s\"}"))
+        (check c (= (debug n) "#main.Mixed{:flag false, :c \\space, :f 0.0, :v [], :o nil}"))
+        (check c (= (debug (One 5)) "#main.One{:only 5}"))
+        (checks-result c))))

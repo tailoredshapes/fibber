@@ -17,9 +17,16 @@
 //! function that expands a call of it. [`PRELUDE_MACROS`] is the names
 //! of the rows.
 
+mod atoms;
+mod colls;
+mod defn;
+mod fold;
 mod forms;
 mod logic;
 mod loops;
+mod print;
+mod reduce;
+mod update;
 
 use crate::syntax::{Form, FormKind, Pos};
 
@@ -32,8 +39,11 @@ pub(crate) enum Outcome {
     /// The call's expansion.
     Expanded(Form),
     /// The call, unchanged: it is not a use of the macro (only
-    /// `for-each` and the one-argument `range` decline, when they are
-    /// the library functions, §4.4).
+    /// `for-each`, the one-argument `range`, `update` and `reduce`
+    /// decline, when they are the library functions, §4.4; and the
+    /// operators and collection functions of R6a, `+ < max conj assoc
+    /// merge swap!` and the rest, when the call is the binary one the
+    /// builtin or the function serves).
     Declined(Form),
 }
 
@@ -47,6 +57,11 @@ type MacroFn = fn(&ExpandCtx, Vec<Form>, Pos) -> Answer;
 /// `Ok(Expanded(form))` for a macro that always expands.
 fn expanded(form: Result<Form, ExpandError>) -> Answer {
     form.map(Outcome::Expanded)
+}
+
+/// `Ok(Expanded(form))` for one of the printing macros (R5).
+fn printing(items: Vec<Form>, pos: &Pos, which: print::Printer) -> Answer {
+    expanded(Ok(print::printer(items, pos, which)))
 }
 
 /// The registry, in the order of the table of §4.4: one row per macro.
@@ -70,6 +85,35 @@ const MACROS: &[(&str, MacroFn)] = &[
     ("assert", |_, i, p| expanded(forms::assert(i, &p))),
     ("dbg", |c, i, p| expanded(forms::dbg(c, i, &p))),
     ("derive", |c, i, p| expanded(derive::derive(c, i, &p))),
+    ("defn", |_, i, p| expanded(defn::defn(i, &p, false))),
+    ("defn-", |_, i, p| expanded(defn::defn(i, &p, true))),
+    ("update", |c, i, p| update::update(c, i, p)),
+    ("reduce", |_, i, p| reduce::reduce(i, p)),
+    ("str", |_, i, p| expanded(Ok(print::str_macro(i, &p)))),
+    ("println", |_, i, p| {
+        printing(i, &p, print::Printer::Println)
+    }),
+    ("print", |_, i, p| printing(i, &p, print::Printer::Print)),
+    ("prn", |_, i, p| printing(i, &p, print::Printer::Prn)),
+    ("pr", |_, i, p| printing(i, &p, print::Printer::Pr)),
+    ("+", |_, i, p| Ok(fold::sum_or_product(i, &p, "+", 0))),
+    ("-", |_, i, p| fold::difference(i, &p)),
+    ("*", |_, i, p| Ok(fold::sum_or_product(i, &p, "*", 1))),
+    ("<", |c, i, p| Ok(fold::comparison(c, i, &p, "<"))),
+    (">", |c, i, p| Ok(fold::comparison(c, i, &p, ">"))),
+    ("<=", |c, i, p| Ok(fold::comparison(c, i, &p, "<="))),
+    (">=", |c, i, p| Ok(fold::comparison(c, i, &p, ">="))),
+    ("=", |c, i, p| Ok(fold::comparison(c, i, &p, "="))),
+    ("max", |_, i, p| Ok(fold::extremum(i, &p, "max"))),
+    ("min", |_, i, p| Ok(fold::extremum(i, &p, "min"))),
+    ("bit-and", |_, i, p| Ok(fold::bits(i, &p, "bit-and"))),
+    ("bit-or", |_, i, p| Ok(fold::bits(i, &p, "bit-or"))),
+    ("bit-xor", |_, i, p| Ok(fold::bits(i, &p, "bit-xor"))),
+    ("conj", |_, i, p| Ok(colls::conj(i, &p))),
+    ("assoc", |_, i, p| colls::assoc(i, &p)),
+    ("dissoc", |_, i, p| Ok(colls::dissoc(i, &p))),
+    ("merge", |_, i, p| colls::merge(i, &p)),
+    ("swap!", |c, i, p| Ok(atoms::swap(c, i, &p))),
 ];
 
 /// The names of the registry's rows: the prelude macros, by name.

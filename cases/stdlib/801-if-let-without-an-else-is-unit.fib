@@ -1,0 +1,46 @@
+;; spec:   stdlib §2.4 (row if-let), §7 E13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: if-let
+;; `(if-let (p e) a)` has `()` as its else, so `a` is a unit expression, as
+;; `(if c a)` is (an `if` needs both arms; stdlib §2.4 says a value body
+;; becomes an Option, which is L20, case 720). The pattern may be refutable
+;; here too: a mismatch is the else, and nothing happens.
+(ns main (:use tl.check))
+
+(defstruct Pt (x: i64 y: i64))
+
+(defun add-payload (acc: (Cell i64) o: (Option i64)) -> unit
+  (if-let (x o) (set! acc (+ @acc x))))
+
+(defun add-pair (acc: (Cell i64) o: (Option (Vec i64))) -> unit
+  (if-let ([a b] o) (set! acc (+ @acc (+ a b)))))
+
+(defun add-x (acc: (Cell i64) o: (Option Pt)) -> unit
+  (if-let ((Pt x _) o) (set! acc (+ @acc x))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (acc (cell 0)))
+    (do
+      (add-payload acc (some 5))
+      (check c (= @acc 5))
+      (add-payload acc nil)
+      (check c (= @acc 5))
+      (add-pair acc (some [10 20]))
+      (check c (= @acc 35))
+      (add-pair acc (some [10 20 30]))
+      (check c (= @acc 35))
+      (add-pair acc (some []))
+      (add-pair acc nil)
+      (check c (= @acc 35))
+      (add-x acc (some (Pt 100 7)))
+      (check c (= @acc 135))
+      (add-x acc nil)
+      (check c (= @acc 135))
+      ;; it is a unit expression: it may stand where a statement does
+      (if-let (x (some 1)) (set! acc (+ @acc x)))
+      (check c (= @acc 136))
+      (checks-result c))))
