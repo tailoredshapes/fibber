@@ -8,15 +8,16 @@
 use fibref::expand::{ExpandCtx, ExpandError};
 use fibref::syntax::{Form, FormKind, Pos};
 
-use super::module::Fns;
+use super::module::{Fns, Inputs};
 
 /// What a running macro's hooks see: the expander's context, the
-/// module's conversion functions, the call position, and the first
-/// reflection error, which ends the expansion.
+/// module's conversion functions, the call position, the forms the macro
+/// was given, and the first reflection error, which ends the expansion.
 pub struct Current<'a> {
     pub ctx: &'a ExpandCtx,
     pub fns: &'a Fns,
     pub pos: Pos,
+    pub inputs: &'a Inputs<'a>,
     pub error: Option<ExpandError>,
 }
 
@@ -34,7 +35,9 @@ pub unsafe extern "C" fn gensym_hook(cur: *mut Current<'_>, prefix: *const u8) -
 }
 
 /// `(struct? f)` and the other reflection builtins: the expander's
-/// answer, a `Bool` or a `Vec` form.
+/// answer, a `Bool` or a `Vec` form. The argument is read back as a
+/// result is: an input form keeps its own position (the interpreter's
+/// `value_form`).
 ///
 /// # Safety
 /// As [`gensym_hook`]; `name` is a NUL-terminated string constant of
@@ -48,7 +51,7 @@ pub unsafe extern "C" fn reflect_hook(
     let name = std::ffi::CStr::from_ptr(name)
         .to_string_lossy()
         .into_owned();
-    let f = match cur.fns.to_form(form, &cur.pos) {
+    let f = match cur.fns.to_form(form, &cur.pos, cur.inputs) {
         Ok(f) => f,
         Err(_) => Form::new(FormKind::Nil, cur.pos.clone()),
     };

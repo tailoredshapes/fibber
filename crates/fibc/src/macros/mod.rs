@@ -2,7 +2,10 @@
 //! §3.16): each `defmacro` is compiled, with the prelude, into a
 //! macro-time module the `Jit` holds; an application converts the
 //! argument forms into the module's `Form` objects, calls the entry
-//! through `lair`'s C trampoline, and reads the result back.
+//! through `lair`'s C trampoline, and reads the result back; a node of
+//! the result that is one of the arguments (or part of one) keeps the
+//! position it was read at, every other node takes the call's (syntax
+//! §1.3; `module.rs`).
 
 pub mod abi;
 #[cfg(feature = "llvm")]
@@ -25,7 +28,7 @@ mod runner {
     use lair::{Jit, JitOptions};
 
     use super::bridge::Current;
-    use super::module::Fns;
+    use super::module::{Fns, Inputs};
     use crate::compile::{compile_macro, Unsupported};
 
     /// The runner: one `Jit` for the whole expansion, one module per
@@ -97,14 +100,21 @@ mod runner {
             let pos = ctx.call_pos().clone();
             let fns = self.module(m).map_err(|k| ExpandError::new(k, &pos))?;
             let fixed = m.params.len().min(args.len());
-            let mut objs: Vec<*const u8> = args[..fixed].iter().map(|a| fns.to_object(a)).collect();
+            // The forms the macro is given, by the address of their
+            // objects: what it returns of them keeps their positions.
+            let mut inputs = Inputs::default();
+            let mut objs: Vec<*const u8> = args[..fixed]
+                .iter()
+                .map(|a| fns.input_object(a, &mut inputs))
+                .collect();
             if m.rest.is_some() {
-                objs.push(fns.items(&args[fixed..]));
+                objs.push(fns.input_items(&args[fixed..], &mut inputs));
             }
             let mut cur = Current {
                 ctx,
                 fns: &fns,
                 pos: pos.clone(),
+                inputs: &inputs,
                 error: None,
             };
             let cur_ptr: *mut Current<'_> = &mut cur;
@@ -117,7 +127,7 @@ mod runner {
             if let Some(e) = cur.error.take() {
                 return Err(e);
             }
-            fns.to_form(result, &pos).map_err(|message| {
+            fns.to_form(result, &pos, &inputs).map_err(|message| {
                 ExpandError::new(
                     ExpandErrorKind::MacroFailed {
                         name: m.name.clone(),

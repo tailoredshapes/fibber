@@ -3,6 +3,20 @@
 //! through `fibm.kw-count` and `fibm.kw`, as the stage-2 compiler reads
 //! it), and the conversions between the expander's forms and the
 //! module's `Form` objects.
+//!
+//! Positions (syntax §1.3): a form a macro produces carries the position
+//! of the macro call, unless the macro built it from an input form, which
+//! keeps its own. The objects of the arguments are made immortal by
+//! `fibm.form` and never freed, so each has an address that is its
+//! identity for the whole run: [`Inputs`] maps the address of every
+//! node built for an argument to the form it came from, and `to_form`
+//! reads a result back through it. A node whose address is in the table
+//! is that form, subtree and positions included, as the interpreter's
+//! `value_form` answers; any other node is new, takes the call's
+//! position, and its children are read by the same rule (a new list of
+//! old children: the list at the call, the children at their own).
+
+use std::collections::HashMap;
 
 use fibref::syntax::{FltWidth, Form, FormKind, IntWidth, Pos};
 use lair::Jit;
@@ -11,6 +25,26 @@ use super::abi::{VARIANTS, WIDTHS};
 use crate::compile::Unsupported;
 
 type P = *const u8;
+
+/// The forms a macro run was given, by the address of the `Form` object
+/// made for each node of them (the arguments, their descendants, and the
+/// elements of a rest argument; not the rest vector, which is no form).
+/// Borrowed from the arguments, which outlive the run.
+#[derive(Default)]
+pub struct Inputs<'a> {
+    by_address: HashMap<usize, &'a Form>,
+}
+
+impl<'a> Inputs<'a> {
+    /// The input form behind `o`, if `o` is the object made for one.
+    fn get(&self, o: P) -> Option<&'a Form> {
+        self.by_address.get(&(o as usize)).copied()
+    }
+
+    fn record(&mut self, o: P, f: &'a Form) {
+        self.by_address.insert(o as usize, f);
+    }
+}
 
 /// The function pointers of a module.
 #[derive(Clone)]
@@ -127,10 +161,29 @@ impl Fns {
             .map_or(-1, |i| self.widths[i])
     }
 
-    /// A form as a `Form` object of the module.
+    /// A new form as a `Form` object of the module (a `gensym` or a
+    /// reflection answer): read back from a result it takes the call's
+    /// position, as nothing records it.
     pub fn to_object(&self, f: &Form) -> P {
+        self.build(f, None)
+    }
+
+    /// An argument of a macro as a `Form` object of the module, every
+    /// node of it recorded in `inputs`.
+    pub fn input_object<'a>(&self, f: &'a Form, inputs: &mut Inputs<'a>) -> P {
+        self.build(f, Some(inputs))
+    }
+
+    /// A `(Vec Form)` object of the rest arguments of a macro, each form
+    /// recorded in `inputs`.
+    pub fn input_items<'a>(&self, items: &'a [Form], inputs: &mut Inputs<'a>) -> P {
+        self.build_items(items, Some(inputs))
+    }
+
+    /// The object of `f`, and of its tree, recorded in `rec` if there is one.
+    fn build<'a>(&self, f: &'a Form, mut rec: Option<&mut Inputs<'a>>) -> P {
         let null = std::ptr::null();
-        match &f.kind {
+        let o = match &f.kind {
             FormKind::Sym(s) => (self.form)(Self::tag_of("Sym"), 0, 0, self.str_object(s)),
             FormKind::Kw(s) => (self.form)(Self::tag_of("Kw"), 0, 0, self.str_object(s)),
             FormKind::Str(s) => (self.form)(Self::tag_of("Str"), 0, 0, self.str_object(s)),
@@ -153,15 +206,31 @@ impl Fns {
             FormKind::Chr(c) => (self.form)(Self::tag_of("Chr"), i64::from(u32::from(*c)), 0, null),
             FormKind::Bool(b) => (self.form)(Self::tag_of("Bool"), i64::from(*b), 0, null),
             FormKind::Nil => (self.form)(Self::tag_of("Nil"), 0, 0, null),
-            FormKind::List(items) => (self.form)(Self::tag_of("List"), 0, 0, self.items(items)),
-            FormKind::Vec(items) => (self.form)(Self::tag_of("Vec"), 0, 0, self.items(items)),
-            FormKind::Map(items) => (self.form)(Self::tag_of("Map"), 0, 0, self.items(items)),
+            FormKind::List(items) => {
+                let v = self.build_items(items, rec.as_deref_mut());
+                (self.form)(Self::tag_of("List"), 0, 0, v)
+            }
+            FormKind::Vec(items) => {
+                let v = self.build_items(items, rec.as_deref_mut());
+                (self.form)(Self::tag_of("Vec"), 0, 0, v)
+            }
+            FormKind::Map(items) => {
+                let v = self.build_items(items, rec.as_deref_mut());
+                (self.form)(Self::tag_of("Map"), 0, 0, v)
+            }
+        };
+        if let Some(inputs) = rec {
+            inputs.record(o, f);
         }
+        o
     }
 
     /// A `(Vec Form)` object of these forms.
-    pub fn items(&self, items: &[Form]) -> P {
-        let objs: Vec<P> = items.iter().map(|f| self.to_object(f)).collect();
+    fn build_items<'a>(&self, items: &'a [Form], mut rec: Option<&mut Inputs<'a>>) -> P {
+        let objs: Vec<P> = items
+            .iter()
+            .map(|f| self.build(f, rec.as_deref_mut()))
+            .collect();
         (self.vec)(objs.as_ptr().cast(), objs.len() as i64)
     }
 
@@ -174,8 +243,12 @@ impl Fns {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
-    /// A `Form` object of the module as a form.
-    pub fn to_form(&self, o: P, pos: &Pos) -> Result<Form, String> {
+    /// A `Form` object of the module as a form: the input form it was
+    /// made for, if `inputs` has it, else a new form at `pos`.
+    pub fn to_form(&self, o: P, pos: &Pos, inputs: &Inputs) -> Result<Form, String> {
+        if let Some(f) = inputs.get(o) {
+            return Ok(f.clone());
+        }
         let tag = (self.tag)(o) as usize;
         let name = VARIANTS.get(tag).copied().unwrap_or("Nil");
         let kind = match name {
@@ -202,9 +275,9 @@ impl Fns {
             }
             "Chr" => FormKind::Chr(char::from_u32((self.f0_i32)(o) as u32).unwrap_or('\0')),
             "Bool" => FormKind::Bool((self.f0_i1)(o) != 0),
-            "List" => FormKind::List(self.read_items((self.f0_ptr)(o), pos)?),
-            "Vec" => FormKind::Vec(self.read_items((self.f0_ptr)(o), pos)?),
-            "Map" => FormKind::Map(self.read_items((self.f0_ptr)(o), pos)?),
+            "List" => FormKind::List(self.read_items((self.f0_ptr)(o), pos, inputs)?),
+            "Vec" => FormKind::Vec(self.read_items((self.f0_ptr)(o), pos, inputs)?),
+            "Map" => FormKind::Map(self.read_items((self.f0_ptr)(o), pos, inputs)?),
             _ => FormKind::Nil,
         };
         Ok(Form::new(kind, pos.clone()))
@@ -220,10 +293,10 @@ impl Fns {
             .unwrap_or_else(|| format!("#{id}"))
     }
 
-    fn read_items(&self, v: P, pos: &Pos) -> Result<Vec<Form>, String> {
+    fn read_items(&self, v: P, pos: &Pos, inputs: &Inputs) -> Result<Vec<Form>, String> {
         let n = (self.vec_len)(v);
         (0..n)
-            .map(|i| self.to_form((self.vec_elem)(v, i), pos))
+            .map(|i| self.to_form((self.vec_elem)(v, i), pos, inputs))
             .collect()
     }
 }

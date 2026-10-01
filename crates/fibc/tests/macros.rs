@@ -1,11 +1,17 @@
 //! Macros through the JIT (spec/compiler.md §6): on every case that
 //! defines a macro, the expansion the JIT runner produces must equal
-//! the reference interpreter's, form for form.
+//! the reference interpreter's, form for form and position for position
+//! (syntax §1.3), and so must the expansion of the generated macros of
+//! `positions`.
+
+#[path = "macros/positions.rs"]
+mod positions;
 
 use std::path::Path;
 
 use fibc::macros::JitRunner;
 use fibref::cases::list_cases;
+use fibref::dump::dump_forms_in;
 use fibref::eval::MacroEvaluator;
 use fibref::expand::{expand_program, ExpandCtx};
 use fibref::syntax::{read_all, Form};
@@ -38,7 +44,10 @@ fn jit_expansions_equal_the_interpreters() {
         let a = expand_with(&source, name, false);
         let b = expand_with(&source, name, true);
         match (&a, &b) {
-            (Ok(x), Ok(y)) if x == y => compared += 1,
+            // `Form` equality ignores positions; the dump prints them all.
+            (Ok(x), Ok(y)) if x == y && dump_forms_in(x, name) == dump_forms_in(y, name) => {
+                compared += 1
+            }
             (Err(x), Err(y)) if x == y => compared += 1,
             _ => bad.push(format!(
                 "{name}:\n  interpreter: {a:?}\n  jit:         {b:?}"
@@ -92,16 +101,13 @@ fn first_difference(a: &Result<String, String>, b: &Result<String, String>) -> S
     }
 }
 
-/// **Known to fail** (syntax §1.3, spec/bootstrap.md §4 and §5.7): the
-/// interpreter's evaluator gives a form a macro took from its arguments
-/// the position it had (`int 5 i64 12:13 437..438`), and `JitRunner` gives
-/// every node of a result the position of the call (`12:6 430..439`:
-/// `fns.to_form(result, &pos)`), so the two expansions differ in the
-/// position of what the macro was given, in three of the module cases.
-/// `jit_expansions_equal_the_interpreters` cannot see it: `Form` equality
-/// ignores positions.
+/// Syntax §1.3, spec/bootstrap.md §4 and §5.7: a form a macro took from
+/// its arguments keeps the position it had (`int 5 i64 12:13 437..438`),
+/// every other node of a result has the position of the call. Compared
+/// through the expansion dump, which prints every position of every node
+/// (`Form` equality ignores positions, so
+/// `jit_expansions_equal_the_interpreters` cannot see them).
 #[test]
-#[ignore = "a divergence in positions between JitRunner and the interpreter, reported, not fixed"]
 fn jit_and_interpreter_expand_the_module_cases_alike_at_every_position() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cases/modules");
     let mut mains: Vec<_> = std::fs::read_dir(&dir)
