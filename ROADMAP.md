@@ -256,16 +256,29 @@ are from runs on 2026-10-01):
       (189), `alloc` zeroed (190), `println` writes (192), a raw `ptr`
       counted as an object (193), float bit casts (194), the macro
       module's keyword table, `(args)` bytes, `fibc build -L`, and out
-      of memory in the runtime; two more rows are notes. Open: a failed
-      `(alloc 1000000000000000)` aborts the interpreter ("memory
-      allocation of 1000000000000000 bytes failed") and gives the
-      compiled program a null pointer that it carries on with; syntax
-      §3.15 is silent and no case pins either.
+      of memory in the runtime; two more rows are notes. A failed
+      `(alloc n)` traps `out of memory` in both tools (case 195).
 - [ ] a mutation review that can be repeated: both reviews of the
       reader ran from scripts that are not in the repo
-- [ ] step 2, the expander (`compiler/lair/expand.fib` runs one macro
-      from fibber; the expander itself is not started); then types,
-      ownership, the lIR emitter
+- [x] step 2a, the expander (`compiler/expand/`, tool
+      `compiler/expand.fib`): its dump equals `fibref expand
+      --no-runner` on 2,533 programs in five modes (plain, `--context`
+      and three limit modes), 0 failing
+      (`cargo test -p fibc --test bootstrap_expand`). The JIT macro
+      runner now keeps the positions of the forms a macro was given, as
+      the interpreter does. Stage 2b, user macros through lair, needs
+      the later passes.
+- [ ] types (10,800 Rust lines), ownership (4,400), the lIR emitter
+      (8,000), macros through lair (750), the driver (830)
+
+**Paused** (owner, 2026-10-01) after step 2a until M7's library is
+viable. The faithful ports so far are 0.8 times the Rust's code lines
+and 1.25 times its bytes, because the prelude lacks what makes Clojure
+terse (`try-let`, `reduce`, `pop`, destructuring, sort); porting the
+remaining 25,000 lines in that style would mean rewriting them. Until
+then step 2a stays in step with the Rust expander: a library package
+that changes the Rust expander or the prelude mirrors the change in
+`compiler/expand/` and keeps `bootstrap_expand` at 0 failing.
 
 `lair` (lIR to native, via LLVM) stays in Rust, as LLVM stays in C++.
 The C interface to `lair` (spec/compiler.md §9) is a stopgap, not a
