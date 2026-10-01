@@ -272,3 +272,29 @@ number, -Infinity, nan, a null end pointer, `1e` and `.5.`, and 1e39 at
 both widths (189, 9250558984191; the interpreter that had only `write`
 stopped at `extern strtod is not available`, and one that rounded
 through f64 for strtof scored 8 less).
+
+Case 190 pins that `(alloc n)` is `n` zero bytes in the interpreter as
+compiled (syntax §3.15, **Decided**, owner, 2026-10-01): it stores a
+non-zero byte in every position of blocks of 1 to 65536 bytes (the
+8-byte store-i64, free, alloc, load-i64 pattern; sizes that are not a
+multiple of eight; a page and more; four blocks held together and
+recycled), frees them, allocates the same sizes again and counts the
+bytes that read zero, so each non-zero byte lowers the result from 196631
+(190, 196631; compiled with plain `malloc` it gave between 196 and 231
+over four runs, the allocator's own links and the program's old bytes
+being what a freed block comes back with).
+
+Case 192 is the normal path of `println` (syntax §4.5, M6): 64 short
+lines and one of 81920 bytes (more than a pipe holds), written by the
+prelude's loop of write(2) calls, result 81984 (192). The traps
+(`println: write failed` on a full device, a write cut short and then
+failing) and the byte-for-byte output, whole and seven bytes at a time,
+are checked by `crates/fibc/tests/cli.rs` and
+`crates/fibref/tests/run_io.rs`, which a case cannot do; they also run
+the standard-error twin of the case, because a case cannot use `eprintln`
+(under the rule-6 harness the compiled trace shares standard error, and
+the text of an `eprintln` was glued to a trace record, `err 0F 274`, and
+spoiled the comparison). There is no case 191: `(args)` with a word that is
+not UTF-8 needs a command line, which the case harness does not give, so
+`crates/fibc/tests/cli/args.rs` and `crates/fibref/tests/run_io.rs` are
+the evidence for it (case 186 has the empty `(args)`).

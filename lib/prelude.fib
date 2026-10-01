@@ -4,7 +4,7 @@
 ;; and supplies the List enum and the derived Eq/Ord/Hash/Show instances
 ;; of Option and List. The helpers marked :private (syntax §5) are not
 ;; exported: the trie's nodes and their functions, and the raw write
-;; under eprintln.
+;; under println and eprintln.
 ;;
 ;; Vec is the persistent vector of types §2.13: a 32-way trie of
 ;; (Array a) nodes with a tail of up to 32 elements, as in Clojure. A
@@ -455,21 +455,37 @@
 (defun block-on (t) (join t))
 (defun panic (msg: str) (trap msg))
 
-;; I/O (syntax §4.5): eprintln writes s and a newline to stderr, through
-;; the C write(2) on fd 2, copying the string's bytes to a raw buffer.
+;; I/O (syntax §4.5): println and eprintln write s and a newline to fd 1
+;; and fd 2 through the C write(2), copying the string's bytes to a raw
+;; buffer first. write may take fewer bytes than it is given, so each
+;; string is written in a loop until every byte has gone, and a call
+;; that fails (-1) or makes no progress (0 bytes of a non-empty rest,
+;; which would loop for ever) is the trap `NAME: write failed`, NAME
+;; being the function the program called.
 (extern write :private (i32 ptr i64) -> i64)
 
-(defun write-str :private (fd: i32 s: str) -> unit
+;; The n bytes at p to fd, from the first to the last.
+(defun write-bytes :private (who: str fd: i32 p: ptr n: i64) -> unit
+  (unsafe
+    (loop ((done 0))
+      (if (< done n)
+          (let ((w (write fd (ptr+ p done) (- n done))))
+            (if (> w 0)
+                (recur (+ done w))
+                (trap (str-concat who ": write failed"))))
+          ()))))
+
+(defun write-str :private (who: str fd: i32 s: str) -> unit
   (let ((bs (str-bytes s))
         (n (array-len bs)))
     (unsafe
       (let ((p (alloc n)))
-        (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
-        (write fd p n)
-        (free p)))))
+        (do (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+            (write-bytes who fd p n)
+            (free p))))))
 
 (defun eprintln (s: str) -> unit
-  (do (write-str 2i32 s) (write-str 2i32 "\n")))
+  (do (write-str "eprintln" 2i32 s) (write-str "eprintln" 2i32 "\n")))
 
 (defun println (s: str) -> unit
-  (do (write-str 1i32 s) (write-str 1i32 "\n")))
+  (do (write-str "println" 1i32 s) (write-str "println" 1i32 "\n")))

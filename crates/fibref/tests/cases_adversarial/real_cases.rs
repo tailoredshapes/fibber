@@ -31,7 +31,7 @@ const LEAK_CYCLE: [u32; 2] = [15, 80];
 /// The cases whose verdict is a run-time trap (method.md rule 3).
 const TRAP: [u32; 7] = [101, 102, 103, 104, 172, 173, 184];
 /// The last case number of this suite.
-const LAST: u32 = 189;
+const LAST: u32 = 192;
 
 fn number_of(path: &Path) -> u32 {
     let name = path.file_name().unwrap().to_string_lossy();
@@ -75,7 +75,11 @@ fn every_real_case_header_parses() {
 
 #[test]
 fn the_ownership_directory_holds_cases_1_to_last_less_the_withdrawn() {
-    // 30 and 35 were withdrawn when D1 removed field places; 81 to 95
+    // 30 and 35 were withdrawn when D1 removed field places, and 191 was
+    // never written ((args) with a word that is not UTF-8 needs a command
+    // line, which the case harness does not give; the tests of
+    // crates/fibc/tests/cli/args.rs and crates/fibref/tests/run_io.rs
+    // are its evidence, and case 186 has the empty (args)); 81 to 95
     // are the promoted findings of the rule-4 adversary, 96 to 99 those
     // of the rule-5 generator, 100 the annotated bindings of syntax §1.5,
     // 101 to 127 the owner's decisions of 2026-09-28 lifting the v1
@@ -92,13 +96,14 @@ fn the_ownership_directory_holds_cases_1_to_last_less_the_withdrawn() {
     // 183 and 184 str-from-bytes, str-join, str-chars and char->str (M5),
     // 185 and 186 read-file, write-file, args and println (M5), 187 the
     // digits of show on floats, 188 the read errors of read-file, 189 the
-    // strtod and strtof externs in the interpreter.
+    // strtod and strtof externs in the interpreter, 190 (alloc) memory
+    // zeroed, 192 the normal path of println and its loop of writes.
     // The listing is by name, so 100 sorts after 10: compare as numbers.
     let ownership = Path::new(CASES_DIR).join("ownership");
     let cases = list_cases_recursive(&ownership).unwrap();
     let mut numbers: Vec<u32> = cases.iter().map(|p| number_of(p)).collect();
     numbers.sort_unstable();
-    let expected: Vec<u32> = (1..=LAST).filter(|n| ![30, 35].contains(n)).collect();
+    let expected: Vec<u32> = (1..=LAST).filter(|n| ![30, 35, 191].contains(n)).collect();
     assert_eq!(numbers, expected);
 }
 

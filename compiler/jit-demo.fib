@@ -1,0 +1,396 @@
+;; compiler/jit-demo.fib: the C interface to lair (spec/compiler.md §9)
+;; used from fibber, the way the stage-2 compiler will use it. Built
+;; with `fibc build compiler/jit-demo.fib -o OUT -L DIR -l lair`, DIR
+;; holding liblair.so; crates/fibc/tests/capi.rs builds it and checks
+;; every line it prints. Two modes:
+;;
+;;   jit-demo basic DIR
+;;     a JIT session, a call through `call-i64` and `call-f64`, modules
+;;     that fail the checker (their error text is printed after a `-- `
+;;     line), `check-source`, executables built into DIR (the test runs
+;;     them), and the hook round trip with a hand-written lIR module: a
+;;     fibber loop answers the hook calls the module makes, 1000 of them
+;;     in one call, through `call-wait`/`call-hook-arg`/`call-hook-reply`.
+;;
+;;   jit-demo macro LIR K START NFIXED REST CALL ANSWERS TIMES
+;;     one macro of a real macro-time module, as `fibc` makes it: LIR is
+;;     the file with the module's text (K its index: its functions are
+;;     `fibm.NAME.K`), CALL the text of the macro call, read by the stage-2
+;;     reader, whose first NFIXED arguments are the fixed parameters and,
+;;     when REST is `rest`, the others the rest parameter's; START the
+;;     gensym counter before the call; ANSWERS the compiler's table of
+;;     reflection answers, as text: `(OP NAME FORM) ..` for each answer
+;;     and `(OP NAME :error "MESSAGE")` for each error (the table
+;;     `ExpandCtx::reflect` is); TIMES how many times the call is run, one
+;;     after the other on the one module, initialised once, the gensym
+;;     counter passed on. It prints, each time, the form
+;;     the macro returned as `syntax.print` writes it (what `Display` of
+;;     `Form` prints for the Rust runner), then the counter after, or the
+;;     error that ended the expansion.
+;;
+;; The answers reach the demo as text, read by the stage-2 reader, so a
+;; Sym named `nil` inside one (the empty variant of `Option` in
+;; `enum-variants`) comes back as the literal `nil`: a loss of the text
+;; table, which the stage-2 expander, holding forms, does not have.
+;;
+;; The exit status is 0, or 1 when something that must work did not.
+(ns main
+  (:require [lair.jit :as jit] [lair.call :as call] [lair.fibm :as fibm] [lair.expand :as expand]
+            [syntax.reader :as reader] [syntax.dump :as dump] [syntax.print :as printer])
+  (:use util.result syntax.form syntax.pos))
+
+(def square-lir: str
+  "(define (square i64) ((i64 x)) (block entry (ret (mul x x))))
+(define (sum3 i64) ((i64 a) (i64 b) (i64 c)) (block entry (ret (add a (add b c)))))
+(define (half double) () (block entry (ret (double 0.5))))")
+
+;; Fails the checker: the body returns an i64 from an i32 function.
+(def bad-lir: str "(define (h i32) () (block entry (ret (i64 1))))")
+
+;; Fails the parser: unclosed.
+(def broken-lir: str "(define (broken i64")
+
+(def hello-lir: str "(define (main i32) ((i32 argc) (ptr argv)) (block entry (ret (i32 42))))")
+(def exit7-lir: str "(define (main i32) ((i32 argc) (ptr argv)) (block entry (ret (i32 7))))")
+
+;; Fails the `main` rule of lIR §7.2: valid, and no `main`.
+(def no-main-lir: str "(define (helper i64) () (block entry (ret (i64 1))))")
+
+;; A macro-time module in the shape fibm.set-hooks makes: two hook
+;; pointers and a context in globals, set by `install`; `one`, `two` and
+;; `many` call them as the lowered `gensym` and reflection builtins do.
+(def hooked-lir: str
+  "(global hook1 ptr (ptr null))
+(global hook2 ptr (ptr null))
+(global cx ptr (ptr null))
+(define (install void) ((ptr h1) (ptr h2) (ptr c))
+  (block entry (store h1 @hook1) (store h2 @hook2) (store c @cx) (ret)))
+(define (ask1 i64) ((i64 x))
+  (block entry
+    (let ((h (load ptr @hook1)) (c (load ptr @cx)))
+      (ret (indirect-call h (fn i64 (ptr i64)) c x)))))
+(define (ask2 i64) ((i64 x) (i64 y))
+  (block entry
+    (let ((h (load ptr @hook2)) (c (load ptr @cx)))
+      (ret (indirect-call h (fn i64 (ptr i64 i64)) c x y)))))
+(define (one i64) ((i64 x)) (block entry (ret (add (call @ask1 x) (i64 1000000)))))
+(define (two i64) ((i64 x) (i64 y)) (block entry (ret (add (call @ask2 x y) (i64 2000000)))))
+(define (many i64) ((i64 n))
+  (block entry (br head))
+  (block head
+    (let ((i (phi i64 (entry (i64 0)) (body i2)))
+          (acc (phi i64 (entry (i64 0)) (body acc2))))
+      (br (icmp slt i n) body exit)))
+  (block body
+    (let ((r (call @ask1 i))
+          (acc2 (add acc r))
+          (i2 (add i (i64 1))))
+      (br head)))
+  (block exit (ret acc)))")
+
+;; ---------------------------------------------------------------- output
+
+(defun say (label: str text: str) -> unit
+  (println (str-join [label ": " text])))
+
+;; The text of an error, after a `-- LABEL` line of its own.
+(defun say-error (label: str text: str) -> unit
+  (do (println (str-concat "-- " label)) (println text)))
+
+(defun report-unit (label: str r: (Result unit str)) -> unit
+  (match r
+    ((Ok _) (say label "ok"))
+    ((Err m) (say-error label m))))
+
+(defun report-word (label: str r: (Result i64 str)) -> unit
+  (match r
+    ((Ok v) (say label (show v)))
+    ((Err m) (say-error label m))))
+
+(defun report-f64 (label: str r: (Result f64 str)) -> unit
+  (match r
+    ((Ok v) (say label (show v)))
+    ((Err m) (say-error label m))))
+
+;; --------------------------------------------------------------- basic
+
+;; The c entry of the function `name` of the session, called with args.
+(defun call-named (j: jit/Jit name: str args: (Vec i64)) -> (Result i64 str)
+  (match (jit/jit-c-entry j name)
+    ((Err m) (Err m))
+    ((Ok a) (call/call-i64 a args))))
+
+(defun call-named-f64 (j: jit/Jit name: str args: (Vec i64)) -> (Result f64 str)
+  (match (jit/jit-c-entry j name)
+    ((Err m) (Err m))
+    ((Ok a) (call/call-f64 a args))))
+
+(defun session (j: jit/Jit) -> unit
+  (do (report-unit "add square" (jit/jit-add-source j "square" square-lir))
+      (report-word "square(12)" (call-named j "square" [12]))
+      (report-word "sum3(1, 20, 300)" (call-named j "sum3" [1 20 300]))
+      (report-f64 "half()" (call-named-f64 j "half" []))
+      (report-word "call-i64 with 9 arguments" (call/call-i64 1 [1 2 3 4 5 6 7 8 9]))
+      (report-word "call-i64 at address 0" (call/call-i64 0 []))
+      (report-word "address of a missing function" (jit/jit-address j "nope"))
+      (report-unit "add a module that fails the checker" (jit/jit-add-source j "bad" bad-lir))
+      (report-unit "add a module that fails the parser" (jit/jit-add-source j "broken" broken-lir))
+      (report-unit "add square again" (jit/jit-add-source j "again" square-lir))
+      (report-word "square(9) after the failures" (call-named j "square" [9]))))
+
+(defun checks () -> unit
+  (do (report-unit "check square" (jit/check-source square-lir))
+      (report-unit "check a module that fails the checker" (jit/check-source bad-lir))
+      (report-unit "check a module that fails the parser" (jit/check-source broken-lir))))
+
+(defun executables (dir: str) -> unit
+  (do (report-unit "build hello"
+                   (jit/build-executable hello-lir (str-concat dir "/hello") 0 []))
+      (report-unit "build exit7 with libm at -O2"
+                   (jit/build-executable exit7-lir (str-concat dir "/exit7") 2 ["m"]))
+      (report-unit "build a module with no main"
+                   (jit/build-executable no-main-lir (str-concat dir "/nomain") 0 []))
+      (report-unit "build with a library that does not exist"
+                   (jit/build-executable hello-lir (str-concat dir "/nolib") 0 ["no-such-lib-fibber"]))))
+
+;; ---------------------------------------------------------- hand hooks
+
+;; What the demo answers: hook 1 doubles its argument, hook 2 is a*100+b.
+(defun answer (mb: call/Mailbox arity: i64) -> i64
+  (if (= arity 1)
+      (* (call/call-hook-arg mb 0) 2)
+      (+ (* (call/call-hook-arg mb 0) 100) (call/call-hook-arg mb 1))))
+
+;; Answers every hook call of the running call until it returns: how many
+;; hooks of each arity were served, as `(Vec i64)` [arity-1 arity-2], or
+;; the first error.
+(defun serve-counting (mb: call/Mailbox) -> (Result (Vec i64) str)
+  (loop ((ones 0) (twos 0))
+    (match (call/call-wait mb)
+      ((Err e) (Err e))
+      ((Ok (call/Done)) (Ok [ones twos]))
+      ((Ok (call/Hook k))
+       (do (call/call-hook-reply mb (answer mb k))
+           (if (= k 1) (recur (+ ones 1) twos) (recur ones (+ twos 1))))))))
+
+;; A call of a function that returns nothing: its result word is garbage.
+(defun void-result (r: (Result i64 str)) -> (Result unit str)
+  (match r
+    ((Ok _) (Ok ()))
+    ((Err m) (Err m))))
+
+;; Installs the hooks, runs the function at addr with args on the mailbox's
+;; worker, serves it, and prints its result and the hooks served.
+(defun hooked-call (label: str mb: call/Mailbox addr: i64 args: (Vec i64)) -> unit
+  (match (call/call-start mb addr args)
+    ((Err e) (say-error label e))
+    ((Ok _)
+     (match (serve-counting mb)
+       ((Err e) (say-error label e))
+       ((Ok served)
+        (say label (str-join [(show (call/call-result mb)) " after "
+                              (show (nth served 0)) " hooks of arity 1 and "
+                              (show (nth served 1)) " of arity 2"])))))))
+
+;; The function `name` of the session as an address, or a trap: the
+;; module is the demo's own, so a missing function is a bug.
+(defun entry (j: jit/Jit name: str) -> i64
+  (match (jit/jit-c-entry j name)
+    ((Ok a) a)
+    ((Err m) (trap m))))
+
+(defun hooked-session (j: jit/Jit mb: call/Mailbox) -> unit
+  (let ((h (call/hook-addresses)))
+    (do (report-unit "install the hooks"
+                     (void-result (call/call-i64 (entry j "install") [(. h one) (. h two) (. mb handle)])))
+        (hooked-call "one(21)" mb (entry j "one") [21])
+        (hooked-call "two(3, 4)" mb (entry j "two") [3 4])
+        (hooked-call "many(1000)" mb (entry j "many") [1000])
+        (hooked-call "one(5) again on the same mailbox" mb (entry j "one") [5]))))
+
+;; What a wait found, as text.
+(defun wait-text (mb: call/Mailbox) -> str
+  (match (call/call-wait mb)
+    ((Ok (call/Done)) "done")
+    ((Ok (call/Hook k)) (str-concat "a hook of arity " (show k)))
+    ((Err e) (str-concat "error: " e))))
+
+;; A call that is parked at a hook, then misused three ways, then
+;; answered and collected: the call is untouched by the misuses.
+(defun misuse-while-parked (j: jit/Jit mb: call/Mailbox) -> unit
+  (do (report-unit "start one(1)" (call/call-start mb (entry j "one") [1]))
+      (say "wait" (wait-text mb))
+      (report-unit "start again while it is parked" (call/call-start mb (entry j "two") [1 2]))
+      (say "argument 5 of a hook that has one" (show (call/call-hook-arg mb 5)))
+      (call/call-hook-reply mb 5)
+      (say "wait after the misuses" (wait-text mb))
+      (say "wait again" (wait-text mb))
+      (say "result of the call that was parked" (show (call/call-result mb)))))
+
+;; Misuse of a mailbox is an error, not a crash (spec/compiler.md §9).
+(defun misuse (j: jit/Jit mb: call/Mailbox) -> unit
+  (do (call/call-hook-reply mb 1)
+      (say "wait after a reply with no hook waiting" (wait-text mb))
+      (say "the fault text" (unwrap-or (call/call-fault mb) "none"))
+      (report-unit "start at address 0" (call/call-start mb 0 []))
+      (report-unit "start with 9 arguments"
+                   (call/call-start mb (entry j "one") [1 2 3 4 5 6 7 8 9]))
+      (misuse-while-parked j mb)))
+
+(defun hooks () -> unit
+  (match (jit/jit-new 0)
+    ((Err m) (say-error "jit-new" m))
+    ((Ok j)
+     (match (call/call-new)
+       ((Err m) (say-error "call-new" m))
+       ((Ok mb)
+        (do (report-unit "add hooked" (jit/jit-add-source j "hooked" hooked-lir))
+            (hooked-session j mb)
+            (misuse j mb)
+            (call/call-free mb)
+            (jit/jit-free j)))))))
+
+(defun basic (dir: str) -> i64
+  (match (jit/jit-new 0)
+    ((Err m) (do (say-error "jit-new" m) 1))
+    ((Ok j)
+     (do (session j)
+         (jit/jit-free j)
+         (checks)
+         (executables dir)
+         (hooks)
+         0))))
+
+;; --------------------------------------------------------------- macro
+
+;; The one form of text, read by the stage-2 reader, or the error line.
+(defun read-one (text: str what: str) -> (Result Stx str)
+  (match (reader/read-all text what)
+    ((Err e) (Err (str-join (dump/dump-error e))))
+    ((Ok forms)
+     (if (= (count forms) 1)
+         (Ok (nth forms 0))
+         (Err (str-join [what " is not one form"]))))))
+
+(defun slice (xs: (Vec Stx) from: i64 to: i64) -> (Vec Stx)
+  (loop ((i from) (acc (vec-empty)))
+    (if (< i to) (recur (+ i 1) (conj acc (nth xs i))) acc)))
+
+(defun sym-name (s: Stx) -> (Option str)
+  (match (. s kind)
+    ((SSym n) (some n))
+    (_ nil)))
+
+;; One answer of the compiler's reflection table, as text: `(OP NAME FORM)`
+;; or `(OP NAME :error "MESSAGE")`.
+(defstruct Answer (key: str result: (Result Stx str)))
+
+(defun answer-of (s: Stx) -> (Result Answer str)
+  (match (. s kind)
+    ((SList items)
+     (if (< (count items) 3)
+         (Err "an answer is (OP NAME FORM) or (OP NAME :error MESSAGE)")
+         (answer-named (sym-name (nth items 0)) (sym-name (nth items 1)) items)))
+    (_ (Err "an answer is a list"))))
+
+(defun answer-named :private (op: (Option str) name: (Option str) items: (Vec Stx)) -> (Result Answer str)
+  (match op
+    (nil (Err "the operation of an answer is a symbol"))
+    ((some o)
+     (match name
+       (nil (Err "the name of an answer is a symbol"))
+       ((some n) (answer-body (expand/answer-key o n) items))))))
+
+(defun answer-body :private (key: str items: (Vec Stx)) -> (Result Answer str)
+  (match (. (nth items 2) kind)
+    ((SKw k)
+     (match (. (nth items (- (count items) 1)) kind)
+       ((SStr why)
+        (if (and (= k "error") (= (count items) 4))
+            (Ok (Answer key (Err why)))
+            (Err "an error answer is (OP NAME :error MESSAGE)")))
+       (_ (Err "an error answer has a message"))))
+    (_ (if (= (count items) 3)
+           (Ok (Answer key (Ok (nth items 2))))
+           (Err "an answer is (OP NAME FORM)")))))
+
+;; The compiler's table of answers, from the text `(OP NAME ..) ..`.
+(defun answers-of (text: str) -> (Result (Map str (Result Stx str)) str)
+  (match (reader/read-all text "answers")
+    ((Err e) (Err (str-join (dump/dump-error e))))
+    ((Ok forms)
+     (loop ((i 0) (acc (map-empty)))
+       (if (< i (count forms))
+           (match (answer-of (nth forms i))
+             ((Err m) (Err m))
+             ((Ok a) (recur (+ i 1) (assoc acc (. a key) (. a result)))))
+           (Ok acc))))))
+
+(defun expansion-text (e: expand/Expansion) -> str
+  (str-join [(printer/stx-show (. e form)) "\ncounter: " (show (. (. e ctx) gensyms))]))
+
+(defun call-once :private (m: fibm/Fibm nfixed: i64 rest: bool call: Stx ctx: expand/Ctx) -> (Result expand/Expansion str)
+  (match (. call kind)
+    ((SList items)
+     (if (>= (- (count items) 1) nfixed)
+         (let ((fixed (slice items 1 (+ nfixed 1)))
+               (more (if rest (some (slice items (+ nfixed 1) (count items))) nil)))
+           (expand/expand-call m fixed more (. call pos) ctx))
+         (Err "the call has fewer arguments than the macro has fixed parameters")))
+    (_ (Err "the call is not a list"))))
+
+;; Runs the call `times` times in a row on the one module, the context
+;; (the gensym counter) passed from each to the next, printing each.
+(defun run-calls (m: fibm/Fibm nfixed: i64 rest: bool call: Stx ctx: expand/Ctx times: i64) -> unit
+  (loop ((i 0) (ctx ctx))
+    (if (< i times)
+        (match (call-once m nfixed rest call ctx)
+          ((Err msg) (say-error "expansion failed" msg))
+          ((Ok e) (do (say "expansion" (expansion-text e))
+                      (recur (+ i 1) (. e ctx)))))
+        ())))
+
+(defun parse-int (s: str) -> i64
+  (loop ((cs (str-chars s)) (i 0) (acc 0))
+    (if (< i (count cs))
+        (recur cs (+ i 1) (+ (* acc 10) (- (char->i32-i64 (nth cs i)) 48)))
+        acc)))
+
+(defun char->i32-i64 (c: char) -> i64 (zext i64 (char->i32 c)))
+
+(defun macro-in-session (j: jit/Jit k: i64 start: i64 nfixed: i64 rest: bool call: Stx answers: (Map str (Result Stx str)) times: i64) -> i64
+  (match (fibm/fibm-lookup j k)
+    ((Err msg) (do (say-error "the macro module" msg) 1))
+    ((Ok m)
+     (do (fibm/fibm-init m)
+         (run-calls m nfixed rest call (expand/ctx-new answers start) times)
+         0))))
+
+(defun macro-run (module: str k: i64 start: i64 nfixed: i64 rest: bool call-text: str answers-text: str times: i64) -> i64
+  (match (jit/jit-new 0)
+    ((Err m) (do (say-error "jit-new" m) 1))
+    ((Ok j)
+     (let ((status
+            (match (jit/jit-add-source j "macro" module)
+              ((Err m) (do (say-error "add the macro module" m) 1))
+              ((Ok _)
+               (match (read-one call-text "call")
+                 ((Err m) (do (say-error "the call" m) 1))
+                 ((Ok call)
+                  (match (answers-of answers-text)
+                    ((Err m) (do (say-error "the reflection answers" m) 1))
+                    ((Ok answers) (macro-in-session j k start nfixed rest call answers times)))))))))
+       (do (jit/jit-free j) status)))))
+
+(defun macro-mode (a: (Vec str)) -> i64
+  (match (read-file (nth a 1))
+    (nil (do (eprintln (str-concat "cannot read " (nth a 1))) 2))
+    ((some module)
+     (macro-run module (parse-int (nth a 2)) (parse-int (nth a 3)) (parse-int (nth a 4))
+                (= (nth a 5) "rest") (nth a 6) (nth a 7) (parse-int (nth a 8))))))
+
+(defun main () -> i64
+  (let ((a (args)))
+    (cond ((and (= (count a) 2) (= (nth a 0) "basic")) (basic (nth a 1)))
+          ((and (= (count a) 9) (= (nth a 0) "macro")) (macro-mode a))
+          (true (do (eprintln "usage: jit-demo basic DIR | macro LIR K START NFIXED rest|fixed CALL ANSWERS TIMES") 2)))))

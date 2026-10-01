@@ -1,0 +1,250 @@
+;; compiler/lair/fibm.fib: a macro-time module as the compiler sees it
+;; (spec/compiler.md §6, crates/fibc/src/macros/abi.rs and module.rs): the
+;; C-callable surface `fibm.NAME.K` of the module made for the K-th macro,
+;; reached through lair.jit and lair.call, and the conversions between the
+;; compiler's tree (`Stx`) and the module's `Form` objects. This is what
+;; the Rust `Fns` does for the Rust expander, and what the stage-2
+;; expander does at the macro boundary (bootstrap.md §1).
+;;
+;; A `Form` object is plain heap data of the module, an `i64` here (an
+;; address): it is made by `form-object`, `str-object` and `vec-object`
+;; and read by the accessors, every one a call of a function of the
+;; module through `call-i64`. Objects made at expansion time are never
+;; freed, as in §6: the process is the compiler's.
+;;
+;; Where the Rust `Fns` is silent or fibber cannot follow, and what this
+;; module does:
+;;
+;; - The `Form` variant tags are positions in `abi.rs`'s VARIANTS: Sym
+;;   Kw Int Flt Str Chr Bool Nil List Vec Map are 0 to 10
+;;   (`compile_macro` refuses any other order). A tag that is none of them
+;;   reads as Nil, as in Rust.
+;; - The width of an Int or Flt form is a keyword id. The ids of i8 i16
+;;   i32 i64 f32 f64 are 0 to 5 (`compile_macro` interns them first; the
+;;   test asserts it), so those are the ids written and read. The table
+;;   of the other keywords is not in the module text, so an id past 5 is
+;;   named `#ID` in the error where Rust names the keyword.
+;;; - fibber has no f64 -> bits cast and `lair_call_i64` passes no double,
+;;   but `fibm.form` takes the bits of a Flt form's double as an integer.
+;;   `flt-bits` gets them through the C library: `(show v)` is the
+;;   shortest text that reads back (types §2.12) and `sscanf` of it with
+;;   `%lf` stores the double in memory, where `load-i64` reads the bits.
+;;   Reading a Flt form needs none of that: `call-f64`.
+(ns lair.fibm
+  (:require [lair.jit :as jit] [lair.call :as call] [lair.ffi :as ffi])
+  (:use syntax.pos syntax.form util.result))
+
+(extern sscanf :private (ptr ptr ptr) -> i32 :varargs)
+
+;; The addresses of the module's functions, from `jit-c-entry`.
+(defstruct Fibm
+  (entry: i64 str-new: i64 form: i64 vec: i64 tag: i64 f0-ptr: i64 f0-i64: i64 f0-f64: i64
+   f0-i32: i64 f0-i1: i64 f1-i64: i64 str-len: i64 str-ptr: i64 vec-len: i64 vec-elem: i64
+   set-hooks: i64 init: i64))
+
+;; The names of those functions, in the order of the fields of `Fibm`.
+(def names: (Vec str) :private ["entry" "str" "form" "vec" "tag" "f0-ptr" "f0-i64" "f0-f64"
+                          "f0-i32" "f0-i1" "f1-i64" "str-len" "str-ptr" "vec-len" "vec-elem"
+                          "set-hooks" "init"])
+
+;; The addresses of `fibm.NAME.K` for each NAME, in order, or the first
+;; failure.
+(defun addresses :private (j: jit/Jit k: i64) -> (Result (Vec i64) str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count names))
+        (match (jit/jit-c-entry j (str-join ["fibm." (nth names i) "." (show k)]))
+          ((Ok a) (recur (+ i 1) (conj acc a)))
+          ((Err m) (Err m)))
+        (Ok acc))))
+
+;; The surface of the module made for the K-th macro, added to j.
+(defun fibm-lookup (j: jit/Jit k: i64) -> (Result Fibm str)
+  (match (addresses j k)
+    ((Err m) (Err m))
+    ((Ok a)
+     (Ok (Fibm (nth a 0) (nth a 1) (nth a 2) (nth a 3) (nth a 4) (nth a 5) (nth a 6) (nth a 7)
+               (nth a 8) (nth a 9) (nth a 10) (nth a 11) (nth a 12) (nth a 13) (nth a 14)
+               (nth a 15) (nth a 16))))))
+
+;; Initialises the module's runtime (`fibm.init`): once, after the module
+;; is added and before its first macro runs, as the Rust runner does.
+(defun fibm-init (m: Fibm) -> unit
+  (do (word (. m init) []) ()))
+
+;; The result of the function at addr applied to args. The address is a
+;; function of the module and the arguments are at most 8 by construction
+;; here, so the call is always made.
+(defun word :private (addr: i64 args: (Vec i64)) -> i64
+  (match (call/call-i64 addr args)
+    ((Ok v) v)
+    ((Err m) (trap m))))
+
+;; A 32-bit result (`i32` of a C function has unspecified high bits).
+(defun low32 :private (v: i64) -> i64 (bit-and v 4294967295))
+
+;; ---------------------------------------------------------------- objects
+
+;; A `str` object of the module with the bytes of s.
+(defun str-object (m: Fibm s: str) -> i64
+  (let ((p (ffi/bytes-new s))
+        (a (ffi/ptr->addr p))
+        (o (word (. m str-new) [a (str-len s)])))
+    (do (unsafe (free p)) o)))
+
+;; A `(Vec Form)` object holding the objects, which are `Form` objects.
+(defun vec-object (m: Fibm items: (Vec i64)) -> i64
+  (let ((buf (ffi/words-new items))
+        (o (word (. m vec) [(ffi/ptr->addr buf) (count items)])))
+    (do (unsafe (free buf)) o)))
+
+;; A `Form` object of variant tag (0 to 10) with the payload the variant
+;; has: a and b are the words of an Int (value, width id), a Chr or a Bool
+;; (a), p the pointer of the other variants (a `str` object, or a `(Vec
+;; Form)` object for List, Vec and Map).
+(defun form-object (m: Fibm tag: i64 a: i64 b: i64 p: i64) -> i64
+  (word (. m form) [tag a b p]))
+
+;; A Sym, Kw or Str form (tag 0, 1 or 4) with the text s.
+(defun text-form (m: Fibm tag: i64 s: str) -> i64
+  (form-object m tag 0 0 (str-object m s)))
+
+;; The tag of a `Form` object.
+(defun form-tag (m: Fibm o: i64) -> i64
+  (low32 (word (. m tag) [o])))
+
+;; The text of a `str` object.
+(defun str-text (m: Fibm s: i64) -> str
+  (ffi/text-at (word (. m str-ptr) [s]) (word (. m str-len) [s])))
+
+;; The text of the Sym, Kw or Str form o.
+(defun form-text (m: Fibm o: i64) -> str
+  (str-text m (word (. m f0-ptr) [o])))
+
+;; The elements of a `(Vec Form)` object.
+(defun vec-items (m: Fibm v: i64) -> (Vec i64)
+  (let ((n (word (. m vec-len) [v])))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n) (recur (+ i 1) (conj acc (word (. m vec-elem) [v i]))) acc))))
+
+;; -------------------------------------------------------------- widths
+
+(defun width-name :private (id: i64) -> str
+  (match id
+    (0 "i8") (1 "i16") (2 "i32") (3 "i64") (4 "f32") (5 "f64")
+    (_ (str-concat "#" (show id)))))
+
+(defun int-width-of :private (id: i64) -> (Option IntWidth)
+  (match id
+    (0 (some I8)) (1 (some I16)) (2 (some I32)) (3 (some I64))
+    (_ nil)))
+
+(defun flt-width-of :private (id: i64) -> (Option FltWidth)
+  (match id
+    (4 (some F32)) (5 (some F64))
+    (_ nil)))
+
+(defun int-width-id :private (w: IntWidth) -> i64
+  (match w ((I8) 0) ((I16) 1) ((I32) 2) ((I64) 3)))
+
+(defun flt-width-id :private (w: FltWidth) -> i64
+  (match w ((F32) 4) ((F64) 5)))
+
+;; The IEEE 754 bits of v, as Rust's `f64::to_bits`: see the head of this
+;; file. The C locale is the program's (it never calls setlocale), so the
+;; text `show` makes reads back exactly.
+(defun flt-bits :private (v: f64) -> i64
+  (let ((text (ffi/bytes-new (show v)))
+        (fmt (ffi/bytes-new "%lf"))
+        (out (ffi/slot-new)))
+    (unsafe
+      (let ((n (sscanf text fmt out))
+            (bits (load-i64 out)))
+        (do (free text) (free fmt) (free out)
+            (if (= n 1i32) bits (trap "flt-bits: sscanf cannot read what show printed")))))))
+
+;; ----------------------------------------------------- object to Stx
+
+;; The character of a code point as Rust's `char::from_u32(c)
+;; .unwrap_or('\0')` reads it.
+(defun code-char :private (n: i64) -> char
+  (if (or (< n 55296) (and (> n 57343) (< n 1114112)))
+      (i32->char (trunc i32 n))
+      (i32->char 0i32)))
+
+(defun int-kind :private (m: Fibm o: i64) -> (Result StxKind str)
+  (let ((id (word (. m f1-i64) [o])))
+    (match (int-width-of id)
+      ((some w) (Ok (SInt (word (. m f0-i64) [o]) w)))
+      (nil (Err (str-concat "trap: an Int form of width :" (width-name id)))))))
+
+(defun flt-kind :private (m: Fibm o: i64) -> (Result StxKind str)
+  (let ((id (word (. m f1-i64) [o])))
+    (match (flt-width-of id)
+      ((some w)
+       (match (call/call-f64 (. m f0-f64) [o])
+         ((Ok v) (Ok (SFlt v w)))
+         ((Err e) (Err e))))
+      (nil (Err (str-concat "trap: a Flt form of width :" (width-name id)))))))
+
+;; The List, Vec or Map (tag 8, 9 or 10) form o.
+(defun seq-kind :private (m: Fibm o: i64 tag: i64 pos: Pos) -> (Result StxKind str)
+  (match (stx-items m (vec-items m (word (. m f0-ptr) [o])) pos)
+    ((Err e) (Err e))
+    ((Ok xs) (Ok (match tag (8 (SList xs)) (9 (SVec xs)) (_ (SMap xs)))))))
+
+(defun to-kind :private (m: Fibm o: i64 pos: Pos) -> (Result StxKind str)
+  (let ((tag (form-tag m o)))
+    (match tag
+      (0 (Ok (SSym (form-text m o))))
+      (1 (Ok (SKw (form-text m o))))
+      (2 (int-kind m o))
+      (3 (flt-kind m o))
+      (4 (Ok (SStr (form-text m o))))
+      (5 (Ok (SChr (code-char (low32 (word (. m f0-i32) [o]))))))
+      (6 (Ok (SBool (not (= (low32 (word (. m f0-i1) [o])) 0)))))
+      (8 (seq-kind m o tag pos))
+      (9 (seq-kind m o tag pos))
+      (10 (seq-kind m o tag pos))
+      (_ (Ok SNil)))))
+
+;; The tree of the `Form` object o, every node at pos (a macro's result
+;; has no positions of its own: the call's, syntax §1.3).
+(defun to-stx (m: Fibm o: i64 pos: Pos) -> (Result Stx str)
+  (match (to-kind m o pos)
+    ((Err e) (Err e))
+    ((Ok k) (Ok (Stx k pos)))))
+
+(defun stx-items :private (m: Fibm objs: (Vec i64) pos: Pos) -> (Result (Vec Stx) str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count objs))
+        (match (to-stx m (nth objs i) pos)
+          ((Ok s) (recur (+ i 1) (conj acc s)))
+          ((Err e) (Err e)))
+        (Ok acc))))
+
+;; ----------------------------------------------------- Stx to object
+
+;; The `Form` objects of the trees, in order.
+(defun to-objects (m: Fibm xs: (Vec Stx)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count xs))
+        (recur (+ i 1) (conj acc (to-object m (nth xs i))))
+        acc)))
+
+(defun seq-object :private (m: Fibm tag: i64 xs: (Vec Stx)) -> i64
+  (form-object m tag 0 0 (vec-object m (to-objects m xs))))
+
+;; The `Form` object of the tree s (what the macro is given).
+(defun to-object (m: Fibm s: Stx) -> i64
+  (match (. s kind)
+    ((SSym n) (text-form m 0 n))
+    ((SKw n) (text-form m 1 n))
+    ((SStr n) (text-form m 4 n))
+    ((SInt v w) (form-object m 2 v (int-width-id w) 0))
+    ((SFlt v w) (form-object m 3 (flt-bits v) (flt-width-id w) 0))
+    ((SChr c) (form-object m 5 (zext i64 (char->i32 c)) 0 0))
+    ((SBool b) (form-object m 6 (if b 1 0) 0 0))
+    ((SNil) (form-object m 7 0 0 0))
+    ((SList xs) (seq-object m 8 xs))
+    ((SVec xs) (seq-object m 9 xs))
+    ((SMap xs) (seq-object m 10 xs))))

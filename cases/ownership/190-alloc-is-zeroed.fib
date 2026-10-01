@@ -1,0 +1,86 @@
+;; spec:   syntax §3.15 (M6, method.md rule 6)
+;; expect: accept
+;; result: 196631
+;; audit:  clean
+;; (alloc n) is n bytes, every one of them zero, in the interpreter as
+;; compiled (syntax §3.15): a program may read memory it did not write.
+;; The compiled runtime used to answer with plain malloc, whose block
+;; is zero only when it is fresh from the system; a block the program
+;; freed comes back with what it left in it, so each check below
+;; stores a non-zero value in every position of a block, frees it,
+;; allocates the same size again and counts the bytes that read zero.
+;; The result is the total of the sizes, 196631, and each byte that is
+;; not zero lowers it by one (compiled with malloc it was between 196
+;; and 231 over four runs, nearly every byte being left over):
+;;   - 8 bytes, the pattern of syntax §3.15: store-i64, free, alloc
+;;     again, load-i64, which must be 0: it counts 8 when it is;
+;;   - sizes that are not a multiple of eight (1, 13, 4097), so that
+;;     the tail of a block counts too;
+;;   - 4096, 8192 and 65536 bytes, blocks of a page and more, which the
+;;     allocator takes from the top of its heap or splits from a larger
+;;     free chunk rather than from a list of one size;
+;;   - 4 blocks of 4096 and 4 of 8192 bytes taken together, filled,
+;;     freed in one order and taken again, so that each of the second
+;;     four is a recycled block.
+;; 8 + 1 + 13 + 4097 + 4096 + 8192 + 65536 + 4*4096 + 4*8192 + 65536 =
+;; 196631.
+(def pattern: i64 -6148914691236517206)
+
+;; Stores pattern in every word of the n bytes at p (n a multiple of 8).
+(defun fill-words (p: ptr n: i64) -> unit
+  (unsafe
+    (dotimes (i (/ n 8)) (store-i64 (ptr+ p (* i 8)) pattern))))
+
+;; Stores a non-zero byte in each of the n bytes at p.
+(defun fill-bytes (p: ptr n: i64) -> unit
+  (unsafe
+    (dotimes (i n) (store-i8 (ptr+ p i) 85i8))))
+
+;; How many of the n bytes at p read zero.
+(defun zero-bytes (p: ptr n: i64) -> i64
+  (unsafe
+    (loop ((i 0) (z 0))
+      (if (< i n)
+          (recur (+ i 1) (if (= (load-i8 (ptr+ p i)) 0i8) (+ z 1) z))
+          z))))
+
+;; Allocates n bytes, fills them, frees them, allocates n again and
+;; counts the zero bytes of the second block.
+(defun recycled (n: i64) -> i64
+  (unsafe
+    (let ((a (alloc n)))
+      (do (fill-bytes a n)
+          (free a)
+          (let ((b (alloc n))
+                (z (zero-bytes b n)))
+            (do (free b) z))))))
+
+;; The pattern of syntax §3.15 written out: a stored word, freed, the
+;; same size again, the word loaded. Counts 8 when it is zero.
+(defun recycled-word () -> i64
+  (unsafe
+    (let ((a (alloc 8)))
+      (do (store-i64 a pattern)
+          (free a)
+          (let ((b (alloc 8))
+                (w (load-i64 b)))
+            (do (free b) (if (= w 0) 8 0)))))))
+
+;; Four blocks of n bytes held together, filled, freed first to last,
+;; then four again: the zero bytes of all of the second four.
+(defun recycled-four (n: i64) -> i64
+  (unsafe
+    (let ((a (alloc n)) (b (alloc n)) (c (alloc n)) (d (alloc n)))
+      (do (fill-words a n) (fill-words b n) (fill-words c n) (fill-words d n)
+          (free a) (free b) (free c) (free d)
+          (let ((e (alloc n)) (f (alloc n)) (g (alloc n)) (h (alloc n)))
+            (let ((z (+ (+ (zero-bytes e n) (zero-bytes f n))
+                        (+ (zero-bytes g n) (zero-bytes h n)))))
+              (do (free e) (free f) (free g) (free h) z)))))))
+
+(defun main () -> i64
+  (+ (+ (+ (recycled-word) (recycled 1))
+        (+ (recycled 13) (recycled 4097)))
+     (+ (+ (+ (recycled 4096) (recycled 8192))
+           (+ (recycled 65536) (recycled-four 4096)))
+        (+ (recycled-four 8192) (recycled 65536)))))

@@ -1,0 +1,121 @@
+;; compiler/lair/jit.fib: lair's JIT sessions, the checker and the
+;; ahead-of-time build, as safe fibber functions over the C interface of
+;; spec/compiler.md §9 (crates/lair/include/lair.h). The Rust functions
+;; behind each are `Jit::new`, `Jit::add_source`, `Jit::address`,
+;; `Jit::c_entry`, `lair::check_source` and `aot::build_executable`; the
+;; error text is the one lair prints (a diagnostic per line, no file
+;; name), copied out of the `lair_error` and the error freed.
+;;
+;; A program that uses this module is built with
+;; `fibc build FILE -o OUT -L DIR -l lair`, DIR holding liblair.so.
+;;
+;; Ownership. A `Jit` holds the C handle of a session. fibber has no
+;; destructor, so the session is ended by calling `jit-free` once, after
+;; which the handle and every address the session gave out are dead
+;; (lair.h): `jit-free` takes the session by value to say so, but the
+;; compiler cannot stop a copy of the struct being used afterwards. Every
+;; raw buffer made here is freed before the function returns.
+(ns lair.jit (:require [lair.ffi :as ffi]) (:use util.result))
+
+(defstruct Jit (handle: i64))
+
+(extern lair_jit_new :private (i32 ptr) -> i64)
+(extern lair_jit_free :private (i64) -> unit)
+(extern lair_jit_add_source :private (i64 ptr i64 ptr i64) -> i64)
+(extern lair_jit_address :private (i64 ptr i64 ptr) -> i64)
+(extern lair_jit_c_entry :private (i64 ptr i64 ptr) -> i64)
+(extern lair_check_source :private (ptr i64) -> i64)
+(extern lair_build_executable :private (ptr i64 ptr i64 i32 ptr ptr i64) -> i64)
+
+;; A session at optimisation level opt (0 to 3, as `-O`).
+(defun jit-new (opt: i64) -> (Result Jit str)
+  (unsafe
+    (let ((out (ffi/slot-new))
+          (e (lair_jit_new (trunc i32 opt) out)))
+      (match (ffi/word-result e out)
+        ((Ok h) (Ok (Jit h)))
+        ((Err m) (Err m))))))
+
+;; Ends the session; its addresses die with it.
+(defun jit-free (j: Jit) -> unit
+  (unsafe (lair_jit_free (. j handle))))
+
+;; Parses, checks, lowers, verifies and adds the module `src`, named
+;; `name` in the messages. On `Err` nothing was added and the session
+;; stays usable.
+(defun jit-add-source (j: Jit name: str src: str) -> (Result unit str)
+  (unsafe
+    (let ((nm (ffi/bytes-new name))
+          (sp (ffi/bytes-new src))
+          (e (lair_jit_add_source (. j handle) nm (str-len name) sp (str-len src))))
+      (do (free nm) (free sp) (ffi/status e)))))
+
+;; The address of the exported function `name`, compiled if need be. A
+;; function that is not `ccc` is at an address of its own convention:
+;; use `jit-c-entry` to call one.
+(defun jit-address (j: Jit name: str) -> (Result i64 str)
+  (unsafe
+    (let ((nm (ffi/bytes-new name))
+          (out (ffi/slot-new))
+          (e (lair_jit_address (. j handle) nm (str-len name) out)))
+      (do (free nm) (ffi/word-result e out)))))
+
+;; A `ccc` entry to `name`: the function itself when it is `ccc`, else a
+;; trampoline the session makes once. Valid until `jit-free`.
+(defun jit-c-entry (j: Jit name: str) -> (Result i64 str)
+  (unsafe
+    (let ((nm (ffi/bytes-new name))
+          (out (ffi/slot-new))
+          (e (lair_jit_c_entry (. j handle) nm (str-len name) out)))
+      (do (free nm) (ffi/word-result e out)))))
+
+;; Parses and checks `src` as a whole module and makes no code: `Ok ()`
+;; or the diagnostics `lair check` prints, without a file name.
+(defun check-source (src: str) -> (Result unit str)
+  (unsafe
+    (let ((sp (ffi/bytes-new src))
+          (e (lair_check_source sp (str-len src))))
+      (do (free sp) (ffi/status e)))))
+
+;; The names of libs as the arguments of `lair_build_executable`: an
+;; array of n pointers to NUL-terminated copies (each a `bytes-new`) and an
+;; array of n lengths. The blocks are held as addresses (`i64`): a raw
+;; `ptr` in a struct is released as if it were an object by the compiled
+;; drop of the struct (see the head of lair.ffi), so no struct of these
+;; modules has one. `libs-free` releases the arrays and the copies.
+(defstruct Libs :private (names: i64 lens: i64 copies: (Vec i64)))
+
+(defun copies-of :private (libs: (Vec str)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count libs))
+        (recur (+ i 1) (conj acc (ffi/ptr->addr (ffi/bytes-new (nth libs i)))))
+        acc)))
+
+(defun lens-of :private (libs: (Vec str)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count libs)) (recur (+ i 1) (conj acc (str-len (nth libs i)))) acc)))
+
+(defun libs-new :private (libs: (Vec str)) -> Libs
+  (let ((copies (copies-of libs)))
+    (Libs (ffi/ptr->addr (ffi/words-new copies))
+          (ffi/ptr->addr (ffi/words-new (lens-of libs)))
+          copies)))
+
+(defun libs-free :private (l: Libs) -> unit
+  (do (dotimes (i (count (. l copies))) (ffi/free-addr (nth (. l copies) i)))
+      (ffi/free-addr (. l names))
+      (ffi/free-addr (. l lens))))
+
+;; Compiles the module `src`, which must satisfy lIR's `main` rule
+;; (lir.md §7.2), at optimisation level opt and links it into the
+;; executable `path`, with `-lNAME` for each of libs. The executable's
+;; exit status is main's result.
+(defun build-executable (src: str path: str opt: i64 libs: (Vec str)) -> (Result unit str)
+  (let ((l (libs-new libs)))
+    (unsafe
+      (let ((sp (ffi/bytes-new src))
+            (pp (ffi/bytes-new path))
+            (e (lair_build_executable sp (str-len src) pp (str-len path) (trunc i32 opt)
+                                      (ffi/addr->ptr (. l names)) (ffi/addr->ptr (. l lens))
+                                      (count (. l copies)))))
+        (do (free sp) (free pp) (libs-free l) (ffi/status e))))))

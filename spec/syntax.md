@@ -984,6 +984,18 @@ extern, an argument past the fixed parameters of type `bool`, `i8`,
 promotes it; lIR rejects the unpromoted argument (lir.md §7.1,
 **Decided**, owner, 2026-09-28).
 
+**`alloc` is zeroed** (**Proposed**, implemented at the owner's request, 2026-10-01). `(alloc n)` is `n`
+bytes of raw memory, every byte of them zero, in the reference interpreter
+and in compiled code alike: the compiled `alloc` is `calloc`. Before, it
+was `malloc`, whose block is zero only when the system has just given it,
+so a program that read memory it had not written saw zeroes interpreted
+and, compiled, whatever a freed block had held. A program may therefore
+read a block it has not stored to. It must still stay inside the `n`
+bytes and not touch a block after `(free p)`: the interpreter traps on
+both, compiled code does not look. Case 190 stores a non-zero byte in
+every position of blocks of 1 to 65536 bytes, frees them, allocates the
+same sizes again and counts the bytes that read zero.
+
 The reference interpreter has no C library, so it provides three externs
 and stops at any other with `unsupported: extern NAME is not available in
 the reference interpreter`: the prelude's `write` (descriptors 1 and 2),
@@ -999,6 +1011,20 @@ Decimal only: a hexadecimal float (`0x1p3`) stops the run with
 `unsupported: hex float`, so that the interpreter never converts it as
 the `0` before the `x` and disagrees with the compiled program silently
 (**Proposed**; case 189 pins the rest).
+
+**`write`** (**Proposed**, implemented at the owner's request, 2026-10-01), declared `(i32 ptr i64) ->
+i64`, is one write(2) of the `n` bytes at `p` to descriptor 1 or 2: it
+returns the number of bytes written, which may be fewer than `n`, or -1
+when the call failed (a full device, for one), as the C function does;
+the interpreter writes to a duplicate of the descriptor, unbuffered, and
+gives the same answers, except for a descriptor that was closed when the
+program started: a compiled program gets -1 (EBADF), while the Rust
+runtime that the interpreter is opens `/dev/null` in the place of a
+closed standard descriptor, and so succeeds. The prelude's `println` and
+`eprintln` rest on it (§4.5); the tests make it fail on `/dev/full`, cut
+it short and then fail under a file-size limit, and take seven bytes at a
+time through a preloaded library (`crates/fibref/tests/run_io.rs`,
+`crates/fibc/tests/cli.rs`).
 
 ### 3.16 `quote`, `quasiquote`, `defmacro`, `Form`
 
@@ -1409,11 +1435,11 @@ expander treat them as calls.
 | conversions (target type first) | `trunc zext sext fptrunc fpext fptosi fptoui sitofp uitofp char->i32 i32->char` |
 | arrays (types §2.13) | `array array-len array-get array-with array-copy array-set!` |
 | structs | `set-field!` |
-| the program's surroundings (M5) | `(args) -> (Vec str)`, the command line after the program (`fibc run FILE -- a b`, `fibref run FILE -- a b`, or a built executable's own); `(read-file path: str) -> (Option str)`, the whole file, `nil` when it cannot be read (a directory, a missing or unreadable file, a path with a NUL in it) or is not UTF-8, `(some "")` only for a file that is empty; `(write-file path: str text: str) -> bool`, whether the whole text was written (false for a path with a NUL in it) |
+| the program's surroundings (M5) | `(args) -> (Vec str)`, the command line after the program (`fibc run FILE -- a b`, `fibref run FILE -- a b`, or a built executable's own), each word a `str` whatever its bytes: an invalid UTF-8 sequence in it becomes U+FFFD exactly as Rust's `String::from_utf8_lossy` makes it, one replacement for each maximal prefix of a sequence (a stray continuation byte; a lead cut short by the next byte or by the end of the word; `FE` and `FF`), so an overlong encoding, an encoded surrogate and a value above 10FFFF are replaced byte by byte, and `(args)` never traps (**Decided**, owner, 2026-10-01; a built executable did not convert, and its `str` was not UTF-8, and `fibc run` and `fibref run` panicked on such a word; the tools' own words before `--` must be UTF-8 and are refused otherwise, exit 2; `crates/fibc/tests/cli.rs` compares the three ways with `from_utf8_lossy` over 792 seeded byte strings); `(read-file path: str) -> (Option str)`, the whole file, `nil` when it cannot be read (a directory, a missing or unreadable file, a path with a NUL in it) or is not UTF-8, `(some "")` only for a file that is empty; `(write-file path: str text: str) -> bool`, whether the whole text was written (false for a path with a NUL in it) |
 | strings | `str-len str-bytes str-from-bytes str-concat str-slice str-eq starts-with?` and `Countable`/`Eq`/`Ord`/`Hash` instances; `(str-from-bytes a: (Array i8)) -> str` is a fresh string of the bytes and traps `str-from-bytes: invalid UTF-8` unless they are the shortest UTF-8 encodings of scalar values (M5) |
 | forms | `Form` constructors, `gensym`, `struct?`, `struct-fields`, `struct-params`, `struct-field-types`, `enum?`, `enum-params`, `enum-variants` (§3.16) |
 | `Option` (built in, §3.9) | `some` (constructor), `nil` (a literal, §1.1); `nil?`, `some?`, `if-let` are prelude definitions (§4.4, §4.5) |
-| unsafe | `ptr+ load-i8 load-i16 load-i32 load-i64 load-ptr store-i8 ... store-ptr alloc free raw raw-retained release-raw` |
+| unsafe | `ptr+ load-i8 load-i16 load-i32 load-i64 load-ptr store-i8 ... store-ptr alloc free raw raw-retained release-raw`; `(alloc n)` is `n` zero bytes (§3.15) |
 | dynamic dispatch | `(dyn P e)`, `(dyn P :send e)` |
 
 `set-field!`, `dyn` and the conversions that name a target type
@@ -1467,7 +1493,7 @@ function is `(range n: i64) -> (Vec i64)`, and the two-argument form is
 the prelude macro's rewrite to `(range-between a: i64 b: i64) -> (Vec
 i64)`, §4.4), `pmap`, `append` (=
 `push!`), `even?`, `length` (string length), `starts-with?`, `box`/`unbox`
-over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O (`(println s: str) -> unit` and `(eprintln s: str) -> unit`, which write `s` and a newline to standard output and to standard error; `dbg` uses the latter; `read-file`, `write-file` and `args` are builtins, §4.3).
+over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O (`(println s: str) -> unit` and `(eprintln s: str) -> unit`, which write `s` and then a newline to standard output and to standard error, each as write(2) calls (§3.15) repeated until every byte has been written, a call being free to take fewer; a call that fails (-1) or takes no byte of a rest that is not empty is the trap `println: write failed` (`eprintln: write failed`), naming the function the program called, so a full device is a trap and never a success; the prelude does not retry an interrupted call, as it cannot read `errno`; the string may have gone out when the newline fails (**Decided**, owner, 2026-10-01; case 192, `crates/fibc/tests/cli.rs`, `crates/fibref/tests/run_io.rs`); `dbg` uses the latter; `read-file`, `write-file` and `args` are builtins, §4.3).
 
 `for-each`, `map`, `filter`, `reduce`, `swap!` take their function
 parameter `:borrow`; `pmap`'s function parameter escapes (its body

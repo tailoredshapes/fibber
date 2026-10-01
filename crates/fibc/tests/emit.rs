@@ -50,3 +50,27 @@ fn every_emitted_module_rereads_and_rechecks() {
         pending.join(", ")
     );
 }
+
+/// `(alloc n)` is `n` zero bytes (syntax §3.15): the lowering is `calloc`
+/// of one block, not `malloc`, whose block is zero only when the system
+/// has just given it. Case 190 shows the difference at run time; this
+/// shows which call the compiler emits for the program's own `alloc`
+/// (the runtime's `fib.alloc` for objects stays `malloc`: it initialises
+/// every field itself).
+#[test]
+fn alloc_is_lowered_to_calloc_so_that_its_block_is_zeroed() {
+    let source = "(defun main () -> i64 \
+        (unsafe (let ((p (alloc 24))) (let ((v (load-i64 p))) (do (free p) v)))))";
+    let Front::Checked(checked) = check(source, "alloc.fib") else {
+        panic!("the front end rejected the program");
+    };
+    let text = compile(&checked).expect("the program lowers");
+    assert!(
+        text.contains("(call @calloc (i64 1) (i64 24))"),
+        "no calloc of the block in the emitted lIR"
+    );
+    assert!(
+        !text.contains("(call @malloc (i64 24))"),
+        "the program's alloc is a plain malloc"
+    );
+}

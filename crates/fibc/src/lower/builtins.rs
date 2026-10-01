@@ -150,7 +150,11 @@ impl<'a> Cx<'_, 'a> {
                 self.store(&v, &p);
                 V::Unit
             }
-            "alloc" => self.rt_call("malloc", a, Some(LirTy::Ptr)),
+            // syntax §3.15: the block is zeroed, as the interpreter's is.
+            "alloc" => {
+                let v = vec![V::int(LirTy::I64, 1), arg(0)?.clone()];
+                self.rt_call("calloc", &v, Some(LirTy::Ptr))
+            }
             "free" => self.rt_call("free", a, None),
             "raw" | "raw-retained" => match arg(0)? {
                 V::Val(s, LirTy::Ptr) => V::Val(s.clone(), LirTy::Ptr),

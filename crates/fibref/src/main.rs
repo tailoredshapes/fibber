@@ -21,8 +21,11 @@ commands:
   cases [dir]     run every case in dir (default cases/ownership) against
                   the verdict in its header
   explain <file>  print the ownership checker's decisions for file (types §9)
-  run <file>      run file's main with the reference interpreter and print
-                  its result and the memory audit (exit 1 if rejected or failed)
+  run <file> [-- arg..]
+                  run file's main with the reference interpreter and print
+                  its result and the memory audit (exit 1 if rejected or failed);
+                  the args after -- are (args), a byte that is not UTF-8 in
+                  one becoming U+FFFD as Rust's from_utf8_lossy makes it
   read [--print] <file>..
                   print the reader's dump of each file (spec/bootstrap.md §2),
                   or with --print each top-level form as the printer writes
@@ -101,16 +104,7 @@ fn run_cases(dir: &str) -> ExitCode {
     } else {
         ExitCode::from(1)
     };
-    match write_stdout(&render(&report)) {
-        Ok(()) => verdict,
-        // The reader went away (`fibref cases | head`): the report was
-        // computed, so its exit code stands and nothing is said.
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => verdict,
-        Err(e) => {
-            eprintln!("fibref: cannot write the report: {e}");
-            ExitCode::from(2)
-        }
-    }
+    finish(&render(&report), verdict)
 }
 
 /// Checks `file` through the ownership pass and prints its decisions,
@@ -130,10 +124,7 @@ fn run_explain(file: &str) -> ExitCode {
         ),
         Err(e) => (format!("rejected:\n{e}\n"), ExitCode::from(1)),
     };
-    match write_stdout(&text) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => ExitCode::from(2),
-        _ => code,
-    }
+    finish(&text, code)
 }
 
 /// Runs `file` through the whole pipeline and prints `main`'s result and
@@ -165,10 +156,7 @@ fn run_file(file: &str, args: &[String]) -> ExitCode {
         Outcome::Failed { message } => (format!("failed:\n{message}\n"), ExitCode::from(1)),
         Outcome::Unsupported { reason } => (format!("unsupported: {reason}\n"), ExitCode::from(1)),
     };
-    match write_stdout(&text) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => ExitCode::from(2),
-        _ => code,
-    }
+    finish(&text, code)
 }
 
 /// Prints the reader's dump of each file, or with `print` its forms as the
@@ -198,9 +186,22 @@ fn read_files(files: &[String], print: bool) -> ExitCode {
             }
         }
     }
-    match write_stdout(&text) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => ExitCode::from(2),
-        _ => ExitCode::from(status),
+    finish(&text, ExitCode::from(status))
+}
+
+/// Prints `text` to stdout and returns `code`, the verdict of the
+/// command, unless the report could not be written: then it says why on
+/// stderr and exits 2, so that a full device is not a pass. A reader that
+/// went away (`fibref cases | head`) is not a failure: the report was
+/// computed, so its exit code stands and nothing is said.
+fn finish(text: &str, code: ExitCode) -> ExitCode {
+    match write_stdout(text) {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => code,
+        Err(e) => {
+            eprintln!("fibref: cannot write the report: {e}");
+            ExitCode::from(2)
+        }
+        Ok(()) => code,
     }
 }
 
@@ -213,7 +214,16 @@ fn write_stdout(text: &str) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = match fibref::cmdline::from_os(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(word) => {
+            eprintln!(
+                "fibref: an argument before `--` is not UTF-8: {}",
+                word.to_string_lossy()
+            );
+            return ExitCode::from(2);
+        }
+    };
     match parse(&args) {
         Command::Cases { dir } => run_cases(&dir),
         Command::Explain { file } => run_explain(&file),

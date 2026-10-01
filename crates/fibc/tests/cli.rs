@@ -2,12 +2,57 @@
 //! arguments to `(args)` and prints the result after the program's own
 //! output; a built executable returns `main`'s result as its exit
 //! status and prints nothing of its own.
+//!
+//! More families of tests ask what the program's surroundings do at
+//! their edges (syntax §4.3, §4.5), of `fibc run` and of a built
+//! executable, with the questions and inputs that `fibref run` is asked
+//! in `crates/fibref/tests/run_io.rs`, and what `fibc build` does with
+//! the libraries a program names:
+//!
+//! - `link.rs`: `-L DIR` and `-l LIB` link a program against a shared
+//!   library built with `cc`, and the executable finds it without
+//!   `LD_LIBRARY_PATH` (each `-L` is also an rpath, an absolute one);
+//! - `args.rs`: an argument that is not UTF-8 reaches `(args)` as
+//!   `String::from_utf8_lossy` makes it (seeded byte strings of every kind
+//!   of invalid sequence), and `read-file` and `str-from-bytes` agree with
+//!   `from_utf8` on the same bytes;
+//! - `writes.rs`: `println` and `eprintln` finish a write that is cut
+//!   short and trap `println: write failed` when one fails (a full
+//!   device), and a normal run writes every byte.
+
+#![cfg(unix)]
+
+#[path = "../../fibref/tests/io_support/mod.rs"]
+mod io_support;
+
+#[path = "cli/args.rs"]
+mod args;
+#[path = "cli/link.rs"]
+mod link;
+#[path = "cli/writes.rs"]
+mod writes;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fibc() -> Command {
     Command::new(env!("CARGO_BIN_EXE_fibc"))
+}
+
+/// `fibc build SRC -o EXE`, which must succeed.
+fn build(src: &Path, exe: &Path) {
+    let built = fibc()
+        .arg("build")
+        .arg(src)
+        .arg("-o")
+        .arg(exe)
+        .output()
+        .expect("fibc builds");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
 }
 
 fn case(name: &str) -> PathBuf {
@@ -38,18 +83,7 @@ fn a_built_executable_returns_mains_result_and_prints_nothing_of_its_own() {
     let dir = std::env::temp_dir().join(format!("fibc-cli-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a temp dir");
     let exe = dir.join("args");
-    let built = fibc()
-        .args(["build"])
-        .arg(case("186-args-and-println.fib"))
-        .arg("-o")
-        .arg(&exe)
-        .output()
-        .expect("fibc builds");
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
+    build(&case("186-args-and-println.fib"), &exe);
     let out = Command::new(&exe)
         .args(["x", "y", "z"])
         .output()
@@ -80,18 +114,7 @@ fn an_allocation_that_fails_traps_with_out_of_memory() {
     )
     .expect("the program is written");
     let exe = dir.join("oom");
-    let built = fibc()
-        .args(["build"])
-        .arg(&src)
-        .arg("-o")
-        .arg(&exe)
-        .output()
-        .expect("fibc builds");
-    assert!(
-        built.status.success(),
-        "{}",
-        String::from_utf8_lossy(&built.stderr)
-    );
+    build(&src, &exe);
     let out = Command::new(&exe).output().expect("the executable runs");
     assert_eq!(out.status.signal(), Some(6), "{:?}", out.status);
     assert_eq!(

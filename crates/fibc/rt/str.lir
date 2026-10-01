@@ -373,44 +373,101 @@
     (let ((b (zext i32 (load i8 (getelementptr i8 p j)))))
       (ret (and (icmp sge b lo) (icmp sle b hi))))))
 
-;; Whether the n bytes at p are UTF-8: the shortest encodings of the
-;; scalar values, as Rust's from_utf8 checks them (the interpreter's
-;; rule for str-from-bytes).
+;; The UTF-8 sequence at byte i of the n at p, as Rust's from_utf8
+;; reads it (the shortest encodings of the scalar values): its length,
+;; 1 to 4, or when the bytes there are not UTF-8 minus the length of the
+;; longest prefix of a sequence that they do begin, -1 to -3: the
+;; "maximal subpart" that String::from_utf8_lossy replaces as one.
+(define internal (fib.utf8-step i64) ((ptr p) (i64 n) (i64 i))
+  (block entry
+    (let ((b (zext i32 (load i8 (getelementptr i8 p i)))))
+      (br (icmp slt b (i32 128)) one two?)))
+  (block one (ret (i64 1)))
+  (block two? (br (and (icmp sge b (i32 194)) (icmp sle b (i32 223))) two three?))
+  (block two
+    (ret (select (call @fib.utf8-cont p n (add i (i64 1)) (i32 128) (i32 191)) (i64 2) (i64 -1))))
+  (block three? (br (and (icmp sge b (i32 224)) (icmp sle b (i32 239))) three four?))
+  (block three
+    (let ((lo3 (select (icmp eq b (i32 224)) (i32 160) (i32 128)))
+          (hi3 (select (icmp eq b (i32 237)) (i32 159) (i32 191)))
+          (c31 (call @fib.utf8-cont p n (add i (i64 1)) lo3 hi3))
+          (c32 (call @fib.utf8-cont p n (add i (i64 2)) (i32 128) (i32 191))))
+      (ret (select c31 (select c32 (i64 3) (i64 -2)) (i64 -1)))))
+  (block four? (br (and (icmp sge b (i32 240)) (icmp sle b (i32 244))) four bad))
+  (block four
+    (let ((lo4 (select (icmp eq b (i32 240)) (i32 144) (i32 128)))
+          (hi4 (select (icmp eq b (i32 244)) (i32 143) (i32 191)))
+          (c41 (call @fib.utf8-cont p n (add i (i64 1)) lo4 hi4))
+          (c42 (call @fib.utf8-cont p n (add i (i64 2)) (i32 128) (i32 191)))
+          (c43 (call @fib.utf8-cont p n (add i (i64 3)) (i32 128) (i32 191))))
+      (ret (select c41 (select c42 (select c43 (i64 4) (i64 -3)) (i64 -2)) (i64 -1)))))
+  (block bad (ret (i64 -1))))
+
+;; Whether the n bytes at p are UTF-8 (the interpreter's rule for
+;; str-from-bytes: Rust's from_utf8).
 (define internal (fib.utf8-valid i1) ((ptr p) (i64 n))
   (block entry (br loop))
   (block loop
     (let ((i (phi i64 (entry (i64 0)) (adv inext))))
       (br (icmp sge i n) ok head)))
   (block head
-    (let ((b (zext i32 (load i8 (getelementptr i8 p i)))))
-      (br (icmp slt b (i32 128)) one two?)))
-  (block one (let ((s1 (add i (i64 1)))) (br adv)))
-  (block two? (br (and (icmp sge b (i32 194)) (icmp sle b (i32 223))) two three?))
-  (block two
-    (let ((s2 (add i (i64 2))))
-      (br (call @fib.utf8-cont p n (add i (i64 1)) (i32 128) (i32 191)) adv bad)))
-  (block three? (br (and (icmp sge b (i32 224)) (icmp sle b (i32 239))) three four?))
-  (block three
-    (let ((s3 (add i (i64 3)))
-          (lo (select (icmp eq b (i32 224)) (i32 160) (i32 128)))
-          (hi (select (icmp eq b (i32 237)) (i32 159) (i32 191))))
-      (br (and (call @fib.utf8-cont p n (add i (i64 1)) lo hi)
-               (call @fib.utf8-cont p n (add i (i64 2)) (i32 128) (i32 191)))
-          adv bad)))
-  (block four? (br (and (icmp sge b (i32 240)) (icmp sle b (i32 244))) four bad))
-  (block four
-    (let ((s4 (add i (i64 4)))
-          (lo4 (select (icmp eq b (i32 240)) (i32 144) (i32 128)))
-          (hi4 (select (icmp eq b (i32 244)) (i32 143) (i32 191))))
-      (br (and (call @fib.utf8-cont p n (add i (i64 1)) lo4 hi4)
-               (and (call @fib.utf8-cont p n (add i (i64 2)) (i32 128) (i32 191))
-                    (call @fib.utf8-cont p n (add i (i64 3)) (i32 128) (i32 191))))
-          adv bad)))
-  (block adv
-    (let ((inext (phi i64 (one s1) (two s2) (three s3) (four s4))))
-      (br loop)))
+    (let ((k (call @fib.utf8-step p n i)))
+      (br (icmp sgt k (i64 0)) adv bad)))
+  (block adv (let ((inext (add i k))) (br loop)))
   (block ok (ret (i1 1)))
   (block bad (ret (i1 0))))
+
+;; The length of the lossy conversion of the n bytes at p: a valid
+;; sequence stays as it is, each maximal invalid prefix is the 3 bytes
+;; of U+FFFD.
+(define internal (fib.lossy-len i64) ((ptr p) (i64 n))
+  (block entry (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (step i2)))
+          (len (phi i64 (entry (i64 0)) (step len2))))
+      (br (icmp slt i n) step done)))
+  (block step
+    (let ((k (call @fib.utf8-step p n i))
+          (ok (icmp sgt k (i64 0)))
+          (i2 (add i (select ok k (sub (i64 0) k))))
+          (len2 (add len (select ok k (i64 3)))))
+      (br loop)))
+  (block done (ret len)))
+
+;; A fresh str of the n bytes at p, which need not be UTF-8: each
+;; invalid sequence is replaced by U+FFFD (EF BF BD) exactly as Rust's
+;; String::from_utf8_lossy replaces it, one for each maximal prefix of
+;; a sequence (a stray continuation byte, an overlong or surrogate
+;; lead, a lead cut short by the next byte or by the end, FE, FF).
+;; The command line of a built executable is read through it (syntax
+;; §4.3, `(args)`); `fibc run` and `fibref run` make the same strings
+;; in Rust, in fibref::cmdline, before the program starts.
+(define internal (fib.str-from-lossy ptr) ((ptr p) (i64 n))
+  (block entry
+    (let ((s (call @fib.str-new (call @fib.lossy-len p n)))
+          (dst (call @fib.str-bytes-ptr s)))
+      (br loop)))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (next i2)))
+          (o (phi i64 (entry (i64 0)) (next o2))))
+      (br (icmp slt i n) step done)))
+  (block step
+    (let ((k (call @fib.utf8-step p n i))
+          (ok (icmp sgt k (i64 0))))
+      (br ok copy replace)))
+  (block copy
+    (call @memcpy (getelementptr i8 dst o) (getelementptr i8 p i) k)
+    (br next))
+  (block replace
+    (store (i8 -17) (getelementptr i8 dst o))
+    (store (i8 -65) (getelementptr i8 dst (add o (i64 1))))
+    (store (i8 -67) (getelementptr i8 dst (add o (i64 2))))
+    (br next))
+  (block next
+    (let ((i2 (add i (select ok k (sub (i64 0) k))))
+          (o2 (add o (select ok k (i64 3)))))
+      (br loop)))
+  (block done (ret s)))
 
 ;; (str-from-bytes a): a fresh str of the array's bytes, which must be
 ;; UTF-8 (the interpreter traps with the same message).

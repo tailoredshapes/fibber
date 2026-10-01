@@ -26,7 +26,8 @@ front end rejects is rejected by `fibc` with the same message.
 
 ```
 fibc run   FILE.fib [-- ARG..] ; compile through the JIT and run main; print its result; ARG.. are (args)
-fibc build FILE.fib -o OUT     ; an executable (lair's AOT)
+fibc build FILE.fib -o OUT [-L DIR].. [-l LIB]..
+                               ; an executable (lair's AOT), linked against the libraries
 fibc emit  FILE.fib            ; print the lIR module
 fibc explain FILE.fib          ; the plan, as `fibref explain` prints it (types §9)
 fibc cases [DIR]               ; the rule-6 harness (§5); default cases/ownership
@@ -42,6 +43,32 @@ standard error and aborts (SIGABRT, as types §8.12 says), so the exit
 status is 134 under a shell; the command line after the program (or
 after `--` for `fibc run`) is `(args)`. With `FIB_TRACE=1` in the
 environment the runtime also prints the trace of §4 on standard error.
+
+**Libraries** (**Proposed**: the owner asked on 2026-10-01 for `-L`, `-l` and an
+rpath to close the gap of §9; the details below are not yet signed). A program reaches a
+foreign function by `extern` (syntax §3.15); `fibc build` links it
+against libc and libm and libpthread always, and against more with
+`-l LIB` (linked as `-lLIB`, after the program) and `-L DIR` (a
+directory the linker searches), each repeatable, in any order after the
+file, and `-LDIR` and `-lLIB` as `cc` takes them. Each `-L DIR` is also
+an **rpath**, of the directory's absolute canonical path, so that the
+executable finds its libraries when it is run from any directory and
+without `LD_LIBRARY_PATH`; a relative `-L` is relative to where `fibc`
+ran. A directory that does not exist, is not a directory, or whose
+canonical name holds `:` or `$` (an rpath reads the first as a
+separator and the second as a variable such as `$ORIGIN`) is refused
+before anything is compiled, with `fibc: -L DIR: REASON` and exit 2; a
+symbol or library the linker cannot find is `compile failed:` with the
+linker's own words and exit 5. `-l` and `-L` belong to `build`: `fibc
+run` resolves an `extern` in its own process (libc, and what the process
+has loaded) and reports `undefined symbol` for any other. The step is
+`crates/fibc/src/link.rs` (the object is `lair::aot::emit`'s; the
+`cc` command is built there, because `lair::aot::Options` has `libs` and
+no directories, and the step moves into `lair` when that has them). Tested
+by `crates/fibc/tests/cli/link.rs`: a shared library built with `cc`, the
+executable run without `LD_LIBRARY_PATH` and from another directory, the
+same executable failing once the library is moved, and the link failing
+without the flags.
 
 ## 2. Modules
 
@@ -346,3 +373,103 @@ as described.
     the live tally nor the allocation counts are determined. The
     harness compares only the message and the exit status for a trap
     when either side spawned a thread.
+
+## 9. The C interface to lair (M6)
+
+**Decided** (owner, 2026-10-01): the self-hosted compiler reaches `lair`
+through a C interface, as LLVM stays in C++ and `lair` in Rust
+(ROADMAP M6). Stage 2 is a fibber program: it calls the functions below
+through `extern` (syntax §3.15), and `fibc build FILE -o OUT -L DIR -l lair`
+links it against `liblair.so`, a `cdylib` of the `lair` crate whose
+header is `crates/lair/include/lair.h`. The function list is
+**Proposed**; the operations are the ones `fibc`'s own runner already
+performs through `Jit` (§6), so the Rust runner and the C interface
+cannot drift apart: both are `lair`'s `Jit` and `aot`. The bindings are
+`compiler/lair/*.fib` (bootstrap.md §1); `compiler/jit-demo.fib` uses
+them, and `crates/fibc/tests/capi.rs` builds it with `-L` and `-l` (§1) and
+runs it: a JIT session, the checker, executables, a hook round trip, and
+real macro modules (the cases of `cases/ownership`) run from fibber and
+compared with `JitRunner`.
+
+Conventions. A string is a pointer and a byte length (UTF-8, not NUL
+terminated; a null pointer only with length 0). A function that can
+fail returns a `lair_error *` (null on success) and gives its value
+through an out-parameter; the error holds the message `lair` would
+print (the text `lair::Error` displays: one diagnostic per line, no
+file name) and is freed by the caller. A null argument the callee needs
+is an error, not undefined behaviour, and no panic crosses the
+boundary: it becomes an error (or `-1`, or a null) whose text starts
+`internal error:`. No state is global: everything is in the handles,
+and handles may be used from any one thread at a time, different
+handles from different threads at once. `lair.h` has the exact C types
+(every length is a `size_t`; an address is a `size_t`).
+
+| Function | Does |
+|---|---|
+| `lair_error *lair_jit_new(int opt_level, lair_jit **out)` | a JIT session (`Jit::new`) |
+| `void lair_jit_free(lair_jit *)` | ends it; the addresses it gave die with it |
+| `lair_error *lair_jit_add_source(lair_jit *, name, len, src, len)` | parse, check, lower, verify and add a module (`Jit::add_source`) |
+| `lair_error *lair_jit_address(lair_jit *, name, len, size_t *out)` | the address of a defined function (`Jit::address`) |
+| `lair_error *lair_jit_c_entry(lair_jit *, name, len, size_t *out)` | its `ccc` entry, a trampoline when it is not `ccc` (`Jit::c_entry`) |
+| `lair_error *lair_check_source(src, len)` | parse and check, no code |
+| `lair_error *lair_build_executable(src, len, path, len, int opt_level, const char *const *libs, const size_t *lib_lens, size_t n)` | compile a module that satisfies the `main` rule and link it; each of the `n` names is linked as `-lNAME` (`aot::build_executable`) |
+| `const char *lair_error_text(const lair_error *, size_t *len)`, `void lair_error_free(lair_error *)` | the message |
+| `int64_t lair_call_i64(size_t addr, const int64_t *args, size_t n)`, `double lair_call_f64(...)` | call a C-ABI function at `addr` with `n <= 8` integer or pointer arguments (a float or double *parameter* cannot be passed; a double *result* is `lair_call_f64`); fibber cannot call a function pointer itself. These two have no error channel, so a call that cannot be made (`addr` 0, `n > 8`, null `args` with `n > 0`) is not made and returns 0. A result narrower than 64 bits has unspecified high bits |
+
+**Hooks, without a function pointer from fibber.** A macro-time module
+calls back into the compiler for `gensym` and the reflection builtins
+(§6): two hook pointers and a context pointer installed with
+`fibm.set-hooks`. The compiler here is fibber code, which has no way to
+give C a pointer to one of its functions, so `lair` supplies the hooks
+and turns each call into a request the compiler answers. The macro runs
+on a worker thread of `lair` (64 MiB of stack); a hook call parks that
+thread and wakes the compiler's thread, which reads the request, builds
+the answer with the module's own constructors, and replies:
+
+| Function | Does |
+|---|---|
+| `lair_call *lair_call_new(void)`, `void lair_call_free(lair_call *)` | a mailbox |
+| `size_t lair_hook1_address(void)`, `size_t lair_hook2_address(void)` | the hook pointers, `(cx, a) -> word` and `(cx, a, b) -> word`; the compiler installs them with the mailbox as `cx` |
+| `void lair_call_start(lair_call *, size_t addr, const int64_t *args, size_t n)` | run `addr(args..)` on the worker |
+| `int lair_call_wait(lair_call *)` | block until the call returned (0) or a hook is waiting (its arity, 1 or 2); -1, once, after a misuse of the mailbox (below) |
+| `int64_t lair_call_hook_arg(lair_call *, size_t i)`, `void lair_call_hook_reply(lair_call *, int64_t)` | the waiting request's arguments; the answer, which resumes the worker |
+| `int64_t lair_call_result(lair_call *)` | the value of the finished call |
+| `const char *lair_call_fault(lair_call *, size_t *len)` | the text of the first misuse since the last accepted start, or null (**added**: the `void` functions above cannot report one) |
+
+A mailbox used out of order is defined, not undefined. The call that
+was out of order does nothing and returns 0 (if it returns a value);
+the mailbox keeps the first such "fault" text for `lair_call_fault`
+until the next accepted `lair_call_start`, and the next
+`lair_call_wait` returns -1 once; the call that was running is left as
+it was and is collected by waiting again. Refused: a start while a
+call is running or parked (the call goes on), with address 0, with
+`n > 8` or with a null `args` and `n > 0`; a reply with no hook
+waiting; `lair_call_hook_arg` with no hook waiting or an index not
+below its arity; `lair_call_result` before the call is done. A hook
+called by any thread but the call's worker, or with no call running,
+returns 0 at once (waiting would deadlock the compiler's own thread).
+`lair_call_wait` on a mailbox that never started returns -1; on a
+finished call, 0 again; on a parked one, its arity again. A mailbox
+may be reused for the next call once the last has finished. Freeing a
+mailbox whose call is still running or parked **detaches** it: the
+worker keeps its own reference to the shared state, so nothing it
+touches is freed, but it is not stopped (it cannot be, safely): it
+runs on and its result is dropped, or, parked, stays parked forever;
+that thread and a few words leak until the process ends, and the
+session must not be freed while a detached worker might still run its
+code (freeing it under a running call is undefined). Free after the
+call is done joins the worker and leaves nothing. Null handles
+do nothing (wait gives -1, the value readers 0).
+
+The objects a macro builds and reads are plain heap data of its module;
+the worker runs from `lair_call_start`, and again from each
+`lair_call_hook_reply`, until its next hook call or its return; the
+compiler's thread touches the module's objects only after
+`lair_call_wait` has returned and before the next `lair_call_hook_reply`
+or `lair_call_start`. So the two never run on the module's data at
+once, and each hands the other the mailbox's lock, so the module's
+non-atomic counts are safe. The rule is the compiler's to keep: nothing
+here can see it broken.
+A trap in the module aborts the process, as every trap does (types
+§2.11). Memory is the process's and is not freed at expansion time, as
+in §6.

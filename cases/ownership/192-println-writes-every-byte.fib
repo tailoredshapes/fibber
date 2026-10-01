@@ -1,0 +1,40 @@
+;; spec:   syntax §4.5 (M6)
+;; expect: accept
+;; result: 81984
+;; audit:  clean
+;; println writes the whole string and the newline, however the system
+;; splits the write: the prelude's write-str calls write(2) in a loop
+;; until every byte has gone and traps `println: write failed` when a
+;; call fails or makes no progress (syntax §4.5; a case cannot make a
+;; write fail, so the trap is checked by crates/fibc/tests/cli.rs and
+;; crates/fibref/tests/run_io.rs, which also compare the output of this
+;; program byte for byte, whole and a few bytes at a time). This is the
+;; normal path, run interpreted and compiled:
+;;   - 64 short lines, "line 0" to "line 63", each two writes (the
+;;     string, then the newline);
+;;   - one line of 81920 bytes, more than a pipe holds (65536), whose
+;;     write blocks until the reader has drained it (the line is the 10
+;;     bytes "01234567é", of which "é" is two, 8192 times over).
+;; The result is the bytes of the long line plus the 64 short lines
+;; written: 81920 + 64 = 81984; a trap would change the verdict. There
+;; is no eprintln here: under the rule-6 harness the compiled program's
+;; allocation trace goes to standard error, and the text of an eprintln
+;; (two writes, the string and the newline) would be glued to a trace
+;; record ("err 0F 274") and spoil the comparison.
+(defun lines (n: i64) -> i64
+  (loop ((k 0))
+    (if (< k n)
+        (do (println (str-concat "line " (show k)))
+            (recur (+ k 1)))
+        n)))
+
+;; 10 bytes doubled 13 times: 81920 bytes.
+(defun long-text () -> str
+  (loop ((s "01234567é") (i 0))
+    (if (< i 13) (recur (str-concat s s) (+ i 1)) s)))
+
+(defun main () -> i64
+  (let ((big (long-text)))
+    (do (lines 64)
+        (println big)
+        (+ (str-len big) 64))))

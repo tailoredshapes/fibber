@@ -1,0 +1,150 @@
+;; compiler/lair/call.fib: calling an address lair gave out, and the
+;; mailbox of a call the compiler answers (spec/compiler.md §9,
+;; crates/lair/include/lair.h), as safe fibber functions.
+;;
+;; fibber cannot call a function pointer and cannot give C one, so:
+;;
+;; - `call-i64` and `call-f64` call the C-ABI function at an address with
+;;   up to 8 integer or pointer arguments, on the calling thread;
+;; - a macro-time module calls back into the compiler through hooks lair
+;;   supplies (`hook-addresses`). The macro runs on a worker thread of a
+;;   `Mailbox`; a hook call parks it, `call-wait` tells the compiler
+;;   which hook (its arity), `call-hook-arg` reads the request,
+;;   `call-hook-reply` answers it and resumes the worker, and
+;;   `call-result` reads the value the call returned.
+;;
+;; A misuse of a mailbox is defined, not undefined (§9): the C function
+;; does nothing, the mailbox keeps the text of the first misuse since the
+;; last accepted start, and the next `call-wait` is `Err` of it (once).
+;; `call-start` returns its own refusal at once, which is exact because an
+;; accepted start clears the text; `call-hook-reply`, `call-hook-arg` and
+;; `call-result` cannot, since an accepted call does not clear it, so a
+;; misuse of theirs (a reply with no hook waiting, an argument that is not
+;; there, a result before the call is done) shows at the next `call-wait`
+;; and in `call-fault`, and the call itself answers 0 or does nothing.
+;;
+;; The rule of the shared module data (§9) is the caller's: between
+;; `call-start` or `call-hook-reply` and the `call-wait` that follows, the
+;; compiler's thread must not touch the module's objects (call-i64 on
+;; one of its functions included). A `Mailbox` is freed by `call-free`,
+;; once, after the call has finished (a call still running is detached
+;; and leaks its thread; §9).
+(ns lair.call (:require [lair.ffi :as ffi]) (:use util.result))
+
+(extern lair_call_i64 :private (i64 ptr i64) -> i64)
+(extern lair_call_f64 :private (i64 ptr i64) -> f64)
+(extern lair_call_new :private () -> i64)
+(extern lair_call_free :private (i64) -> unit)
+(extern lair_hook1_address :private () -> i64)
+(extern lair_hook2_address :private () -> i64)
+(extern lair_call_start :private (i64 i64 ptr i64) -> unit)
+(extern lair_call_wait :private (i64) -> i32)
+(extern lair_call_hook_arg :private (i64 i64) -> i64)
+(extern lair_call_hook_reply :private (i64 i64) -> unit)
+(extern lair_call_result :private (i64) -> i64)
+(extern lair_call_fault :private (i64 ptr) -> i64)
+
+;; The most arguments a call of lair takes.
+(def max-args: i64 8)
+
+;; Why a call with n arguments at addr cannot be made, which lair would
+;; answer with 0 and no call (it has no error channel here), or nil.
+(defun refusal :private (who: str addr: i64 n: i64) -> (Option str)
+  (cond ((= addr 0) (some (str-concat who ": address 0")))
+        ((> n max-args) (some (str-concat who ": more than 8 arguments")))
+        (true nil)))
+
+;; Calls the C-ABI function at addr with the arguments, each as a 64-bit
+;; integer or pointer, and returns its result as a 64-bit integer. A
+;; result narrower than 64 bits has unspecified high bits: mask it. `Err`
+;; when the call is not made (address 0, more than 8 arguments).
+(defun call-i64 (addr: i64 args: (Vec i64)) -> (Result i64 str)
+  (match (refusal "call-i64" addr (count args))
+    ((some why) (Err why))
+    (nil
+     (unsafe
+       (let ((buf (ffi/words-new args))
+             (r (lair_call_i64 addr buf (count args))))
+         (do (free buf) (Ok r)))))))
+
+;; As `call-i64` for a function that returns a double. (A float or double
+;; parameter cannot be passed.)
+(defun call-f64 (addr: i64 args: (Vec i64)) -> (Result f64 str)
+  (match (refusal "call-f64" addr (count args))
+    ((some why) (Err why))
+    (nil
+     (unsafe
+       (let ((buf (ffi/words-new args))
+             (r (lair_call_f64 addr buf (count args))))
+         (do (free buf) (Ok r)))))))
+
+;; The two hook pointers, `(cx, a) -> word` and `(cx, a, b) -> word`.
+(defstruct Hooks (one: i64 two: i64))
+
+(defun hook-addresses () -> Hooks
+  (unsafe (Hooks (lair_hook1_address) (lair_hook2_address))))
+
+(defstruct Mailbox (handle: i64))
+
+;; What `call-wait` found: the call returned, or the worker is parked at
+;; a hook call of this arity (1 or 2).
+(defenum Wait (Done) (Hook arity: i64))
+
+;; A new, idle mailbox.
+(defun call-new () -> (Result Mailbox str)
+  (unsafe
+    (let ((h (lair_call_new)))
+      (if (= h 0) (Err "lair_call_new: the mailbox could not be made") (Ok (Mailbox h))))))
+
+(defun call-free (c: Mailbox) -> unit
+  (unsafe (lair_call_free (. c handle))))
+
+;; The text of the first misuse of the mailbox since the last accepted
+;; start, or nil.
+(defun call-fault (c: Mailbox) -> (Option str)
+  (unsafe
+    (let ((len (ffi/slot-new))
+          (at (lair_call_fault (. c handle) len)))
+      (let ((r (if (= at 0) nil (some (ffi/text-at at (load-i64 len))))))
+        (do (free len) r)))))
+
+;; Runs the function at addr with the arguments (n <= 8, copied) on the
+;; mailbox's worker and returns at once. `Err` when it is refused: address
+;; 0, more than 8 arguments, or a call is running or parked (then the text
+;; is the mailbox's: lair's own words for it).
+(defun call-start (c: Mailbox addr: i64 args: (Vec i64)) -> (Result unit str)
+  (match (refusal "call-start" addr (count args))
+    ((some why) (Err why))
+    (nil
+     (unsafe
+       (let ((buf (ffi/words-new args)))
+         (do (lair_call_start (. c handle) addr buf (count args))
+             (free buf)
+             (match (call-fault c)
+               ((some why) (Err why))
+               (nil (Ok ())))))))))
+
+;; Blocks until the call returned (`Done`) or the worker is parked at a
+;; hook call (`Hook` of its arity). `Err` of the fault text after a
+;; misuse, once (the call that was running is untouched: wait again).
+(defun call-wait (c: Mailbox) -> (Result Wait str)
+  (let ((k (unsafe (sext i64 (lair_call_wait (. c handle))))))
+    (cond ((= k 0) (Ok Done))
+          ((or (= k 1) (= k 2)) (Ok (Hook k)))
+          (true (Err (unwrap-or (call-fault c) "the mailbox is not usable"))))))
+
+;; Argument i (0 or 1) of the hook call the worker is parked at; 0 when
+;; there is none or i is not below its arity (a misuse).
+(defun call-hook-arg (c: Mailbox i: i64) -> i64
+  (unsafe (lair_call_hook_arg (. c handle) i)))
+
+;; Answers the hook call the worker is parked at; the worker resumes and
+;; the hook returns v. With no hook waiting nothing happens and the next
+;; `call-wait` is `Err`.
+(defun call-hook-reply (c: Mailbox v: i64) -> unit
+  (unsafe (lair_call_hook_reply (. c handle) v)))
+
+;; The value of the finished call, as `call-i64` reads one; 0 before the
+;; call is done (a misuse).
+(defun call-result (c: Mailbox) -> i64
+  (unsafe (lair_call_result (. c handle))))

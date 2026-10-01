@@ -6,7 +6,9 @@
 //! `release-raw` reads back.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::AsFd;
 
 use crate::heap::ObjId;
 
@@ -21,6 +23,10 @@ pub struct RawMemory {
     blocks: Vec<Option<Vec<u8>>>,
     /// The objects `raw` has given addresses to.
     objects: HashMap<u64, ObjId>,
+    /// Duplicates of descriptors 1 and 2, made at the first `write` to
+    /// each, so that a write is the system call and nothing buffers it.
+    out: Option<File>,
+    err: Option<File>,
 }
 
 impl RawMemory {
@@ -98,18 +104,41 @@ impl RawMemory {
         Ok(())
     }
 
-    /// The `extern write(fd, p, n)` of the prelude: fd 1 and 2 only.
+    /// The `extern write(fd, p, n)` of the prelude, on descriptor 1 or
+    /// 2: one write(2) of the `n` bytes at `p`, giving the number of
+    /// bytes written, which may be fewer than `n`, or -1 when the call
+    /// failed (a full device, for one), as the C function does in
+    /// compiled code.
     pub fn write(&mut self, fd: i64, p: u64, n: i64) -> R<i64> {
         let n = usize::try_from(n).map_err(|_| RunError::trap(format!("write of {n} bytes")))?;
         let bytes = self.bytes(p, n)?.to_vec();
-        let written = match fd {
-            1 => std::io::stdout().write_all(&bytes),
-            2 => std::io::stderr().write_all(&bytes),
+        let slot = match fd {
+            1 => &mut self.out,
+            2 => &mut self.err,
             _ => return Err(RunError::unsupported(format!("write to fd {fd}"))),
         };
-        written.map_err(|e| RunError::trap(format!("write failed: {e}")))?;
-        Ok(n as i64)
+        if slot.is_none() {
+            *slot = duplicate(fd).ok();
+        }
+        Ok(slot.as_mut().map_or(-1, |f| write_some(f, &bytes)))
     }
+}
+
+/// A duplicate of descriptor 1 or 2. The Rust runtime opens `/dev/null`
+/// for a standard descriptor that is closed at start, so this fails only
+/// when the process has no descriptor to spare, and then `write` is -1.
+fn duplicate(fd: i64) -> io::Result<File> {
+    let owned = if fd == 1 {
+        io::stdout().as_fd().try_clone_to_owned()?
+    } else {
+        io::stderr().as_fd().try_clone_to_owned()?
+    };
+    Ok(File::from(owned))
+}
+
+/// One write to `sink`: the bytes it took, or -1.
+fn write_some(sink: &mut impl Write, bytes: &[u8]) -> i64 {
+    sink.write(bytes).map_or(-1, |n| n as i64)
 }
 
 fn split(p: u64) -> R<(usize, usize)> {
@@ -152,6 +181,47 @@ mod tests {
         m.free(p).expect("free");
         assert!(m.free(p).is_err());
         assert!(m.load(p, 1).is_err());
+    }
+
+    /// A sink that takes at most `.0` bytes of each write.
+    struct Short(usize);
+
+    impl Write for Short {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len().min(self.0))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_gives_the_bytes_taken_possibly_fewer_than_given() {
+        assert_eq!(write_some(&mut Short(3), b"hello"), 3);
+        assert_eq!(write_some(&mut Short(100), b"hello"), 5);
+        assert_eq!(write_some(&mut Short(3), b""), 0);
+    }
+
+    #[test]
+    fn a_failed_write_is_minus_one() {
+        let mut full = File::options()
+            .write(true)
+            .open("/dev/full")
+            .expect("open /dev/full");
+        assert_eq!(write_some(&mut full, b"x"), -1);
+        let mut null = File::options()
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        assert_eq!(write_some(&mut null, b"xyz"), 3);
+    }
+
+    #[test]
+    fn a_write_to_another_descriptor_is_unsupported() {
+        let mut m = RawMemory::default();
+        let p = m.alloc(1).expect("alloc");
+        assert!(m.write(3, p, 1).is_err());
+        assert!(m.write(1, p, -1).is_err());
     }
 
     #[test]

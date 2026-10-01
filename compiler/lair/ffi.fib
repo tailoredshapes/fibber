@@ -1,0 +1,126 @@
+;; compiler/lair/ffi.fib: what every binding of lair's C interface
+;; (spec/compiler.md §9, crates/lair/include/lair.h) shares: moving bytes
+;; and words between fibber values and the raw memory C reads, and turning
+;; a `lair_error *` into a `(Result .. str)`.
+;;
+;; Conventions of the bindings (lair.jit, lair.call, lair.fibm):
+;;
+;; - A C handle, an address or any pointer fibber only passes back or
+;;   compares with 0 is an `i64` (a pointer is 64 bits wide; the C ABI
+;;   passes both in one integer register). `ptr` is used only for memory
+;;   fibber itself allocates and reads or writes: a string copy, an
+;;   out-parameter slot, an argument array. fibber has no null `ptr`, and
+;;   the library answers NULL.
+;; - A `ptr` is never stored in a struct, an enum, a cell, an option or a
+;;   vector: fibc drops such an object by `fib.release` of the pointer, as
+;;   if it addressed an object (a stage-1 bug, reported with its repro in
+;;   crates/fibc/tests/capi/stage1.rs), which decrements the first word of the
+;;   caller's raw block and frees it. A block that must live in a value is
+;;   held as its address, an `i64`.
+;; - Every `ptr` a function here returns was made by `(alloc)` and is the
+;;   caller's to `(free)`: each function says which it is. A function
+;;   that takes a `ptr` borrows it and frees nothing.
+;; - A `str` has no C pointer: it is copied into a raw buffer of its
+;;   bytes (`bytes-new`) for as long as one call needs it, then freed.
+;;   lair takes strings as a pointer and a byte length, not NUL
+;;   terminated; the NUL `bytes-new` adds is for the C strings of the
+;;   hooks and costs nothing.
+;; - Out-parameters are 8-byte slots (`slot-new`), stored to zero before
+;;   the call and read with `load-i64` only after a call that reported
+;;   success: lair leaves an out-parameter untouched on failure.
+(ns lair.ffi (:use util.result))
+
+(extern lair_error_text :private (i64 ptr) -> i64)
+(extern lair_error_free :private (i64) -> unit)
+
+;; The pointer whose address is a: eight bytes holding a, read back as a
+;; pointer (fibber has no cast; the idiom of case 189).
+(defun addr->ptr (a: i64) -> ptr
+  (unsafe
+    (let ((c (alloc 8)))
+      (do (store-i64 c a)
+          (let ((p (load-ptr c)))
+            (do (free c) p))))))
+
+;; The address of the pointer p, as a word.
+(defun ptr->addr (p: ptr) -> i64
+  (unsafe
+    (let ((c (alloc 8)))
+      (do (store-ptr c p)
+          (let ((a (load-i64 c)))
+            (do (free c) a))))))
+
+;; Frees the block at address a (made by `(alloc)`), for a block held as an
+;; address.
+(defun free-addr (a: i64) -> unit
+  (let ((p (addr->ptr a)))
+    (unsafe (free p))))
+
+;; A copy of the bytes of s, and a NUL after them: `(+ (str-len s) 1)`
+;; bytes, for the caller to `(free)`. Never null, even for "".
+(defun bytes-new (s: str) -> ptr
+  (let ((bs (str-bytes s))
+        (n (array-len bs)))
+    (unsafe
+      (let ((p (alloc (+ n 1))))
+        (do (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+            (store-i8 (ptr+ p n) 0i8)
+            p)))))
+
+;; An out-parameter slot: eight bytes, zero, for the caller to `(free)`.
+(defun slot-new () -> ptr
+  (unsafe
+    (let ((p (alloc 8)))
+      (do (store-i64 p 0) p))))
+
+;; The words of v, one `int64_t` each, in an array of `(+ (* 8 n) 8)`
+;; bytes (never null, even for an empty vector) for the caller to `(free)`.
+(defun words-new (v: (Vec i64)) -> ptr
+  (let ((n (count v)))
+    (unsafe
+      (let ((p (alloc (+ (* n 8) 8))))
+        (do (dotimes (i n) (store-i64 (ptr+ p (* i 8)) (nth v i)))
+            p)))))
+
+;; The n bytes at address a as a string. They must be UTF-8: a string of
+;; lair is, and `str-from-bytes` traps `invalid UTF-8` otherwise. Nothing
+;; is freed.
+(defun text-at (a: i64 n: i64) -> str
+  (let ((p (addr->ptr a))
+        (c (cell (array n 0i8))))
+    (unsafe
+      (do (dotimes (i n) (array-set! &c i (load-i8 (ptr+ p i))))
+          (str-from-bytes @c)))))
+
+;; The length of the NUL-terminated string at address a.
+(defun c-string-len (a: i64) -> i64
+  (let ((p (addr->ptr a)))
+    (unsafe
+      (loop ((i 0))
+        (if (= (load-i8 (ptr+ p i)) 0i8) i (recur (+ i 1)))))))
+
+;; The NUL-terminated string at address a, copied.
+(defun c-string-at (a: i64) -> str
+  (text-at a (c-string-len a)))
+
+;; The message of the `lair_error` e (not null), copied out; e is freed.
+(defun error-text (e: i64) -> str
+  (unsafe
+    (let ((len (slot-new))
+          (at (lair_error_text e len))
+          (text (text-at at (load-i64 len))))
+      (do (free len)
+          (lair_error_free e)
+          text))))
+
+;; What a call that returns a `lair_error *` came to: `Ok ()` for NULL,
+;; else `Err` of the message, the error freed.
+(defun status (e: i64) -> (Result unit str)
+  (if (= e 0) (Ok ()) (Err (error-text e))))
+
+;; The same for a call that also gave a word through the slot `out`: the
+;; word when e is NULL, else the message. `out` is freed either way.
+(defun word-result (e: i64 out: ptr) -> (Result i64 str)
+  (unsafe
+    (let ((r (if (= e 0) (Ok (load-i64 out)) (Err (error-text e)))))
+      (do (free out) r))))
