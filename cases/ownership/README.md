@@ -23,8 +23,11 @@ trace (the compiled program holds a `def`'s value as static data), so a
 case that wants a large input without its building cost counted
 puts it in a `def`; stack objects (`S` lines) are not heap objects. To
 find the count of a program, `fibc itrace FILE | grep -c '^A '` (the
-interpreter's) or `FIB_TRACE=1` through `fibc run --trace FILE 2>&1 >/dev/null
-| grep -c '^A '` (the compiled run's).
+interpreter's; its standard output is the trace alone, the result and the
+audit follow on standard error) or `fibc run --trace FILE 2>&1 >/dev/null
+| grep -c '^A '` (the compiled run's: `--trace` sets `FIB_TRACE`, and so
+does setting it yourself, and neither counts the objects a `def`
+allocates while the compiler evaluates it).
 `trap` cases must type-check and pass the ownership checker, then trap
 at run time with a message containing the `trap` text. A trap aborts
 the program (spec/types.md §2.11), so the objects live at it are not
@@ -401,3 +404,22 @@ objects and says `<= 7`. The tests `a_bound_one_below_the_count_fails`
 with the bound lowered by one and require the failure that names the
 count, and the header parser's, the verdict's and the runner's unit tests
 pin the rest of the key's rules.
+
+Cases 220 to 224 are the stage-1 fixes of the library packages' bug
+reports (fibc diverged from fibref; each result has one bit per probe, so
+a probe that fails lowers it in its own bit). 220 is a generic function
+instantiated at an `(Option i64)` or an `(Option (Option i64))`, where
+fibc keyed the instance by the layout class `ptr` and built `(Option a)`
+as a nullable pointer: `wrap`, `nil?`, `(Map i64 (Option i64))`, a fold
+over a Vec of Options and a closure returning an `(Option (Option i64))`
+(16383; the `box` class of compiler.md §7). 221 is `<`, `<=`, `>` and
+`>=` on bool, directly and through an `Ord` bound, with every integer
+width, the characters, floats, strings and keywords beside it (2097151;
+fibc compared an `i1` signed, so true was below false, and keywords by
+interned id, not by name). 222 is a `def` naming an earlier `def` and a
+`def` of an `(Option scalar)`, `nil` and `some`, alone, in a Vec, and
+nested (8191). 223 is `=` on `unit` and arrays and Vecs of `unit`
+(2097151). 224 is the bounds trap of `array-get` on an array of `unit`
+(`expect: trap`). Before the fixes, under the binaries of the commit that
+precedes them: 220 and 221 failed (exit 139 and 261632 where 2097151 is
+expected), 222, 223 and 224 were pending (`unsupported`).

@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 
-use super::decls::Globals;
+use super::decls::{Globals, ModuleId};
 use super::ty::{Colour, Con, Pred, TvId, Ty};
 
 /// Prints types against the global tables.
@@ -21,6 +21,9 @@ pub struct Printer<'a> {
     gen_names: &'a [String],
     rigid_names: &'a [String],
     vars: RefCell<Vec<TvId>>,
+    /// What to write before the name of a type or protocol defined in a
+    /// given module, if the names are to be qualified.
+    qualifier: Option<&'a dyn Fn(ModuleId) -> String>,
 }
 
 impl<'a> Printer<'a> {
@@ -37,6 +40,25 @@ impl<'a> Printer<'a> {
             gen_names,
             rigid_names,
             vars: RefCell::new(Vec::new()),
+            qualifier: None,
+        }
+    }
+
+    /// A printer that writes every nominal type's and protocol's name
+    /// behind `prefix` of the module that defines it, so that two
+    /// modules' types of one name print differently (the compiler's
+    /// symbols, compiler.md §2).
+    pub fn qualified(g: &'a Globals, prefix: &'a dyn Fn(ModuleId) -> String) -> Self {
+        Printer {
+            qualifier: Some(prefix),
+            ..Printer::with_names(g, &[], &[])
+        }
+    }
+
+    fn qualify(&self, m: ModuleId, name: &str) -> String {
+        match self.qualifier {
+            Some(prefix) => format!("{}{name}", prefix(m)),
+            None => name.to_string(),
         }
     }
 
@@ -136,9 +158,13 @@ impl<'a> Printer<'a> {
             Con::Atom => "Atom".to_string(),
             Con::Weak => "Weak".to_string(),
             Con::Task => "Task".to_string(),
-            Con::Nominal(id) => self.g.ty(id).name.clone(),
+            Con::Nominal(id) => {
+                let def = self.g.ty(id);
+                self.qualify(def.module, &def.name)
+            }
             Con::Dyn(p, send) => {
-                let pname = self.g.proto(p).name.clone();
+                let proto = self.g.proto(p);
+                let pname = self.qualify(proto.module, &proto.name);
                 out.push_str("(dyn ");
                 if args.is_empty() {
                     out.push_str(&pname);

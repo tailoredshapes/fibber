@@ -11,8 +11,11 @@ use fibc::program::Program;
 use fibref::cases::list_cases;
 
 /// The constants' text with each header's type id replaced by the
-/// type's name: the two backends register object types in a
-/// different order, so the ids differ where the types do not.
+/// object type's symbol (`sname`): the two backends register object
+/// types in a different order, so the ids differ where the types do
+/// not. The symbol, not the display name: every `(Array T)` of a
+/// pointer is one object type, `fib.array.ptr`, whose display name is the
+/// first array registered, which is not the same array in both backends.
 fn by_type_name(text: &str, p: &Program<'_>) -> String {
     let mut out = String::new();
     for line in text.lines() {
@@ -21,7 +24,7 @@ fn by_type_name(text: &str, p: &Program<'_>) -> String {
             let start = i + "(i64 0) (i32 ".len();
             let end = start + line[start..].find(')').unwrap_or(0);
             if let Ok(tid) = line[start..end].parse::<u32>() {
-                let name = p.objects.get(tid).name.clone();
+                let name = p.objects.get(tid).sname.clone();
                 line.replace_range(start..end, &name);
             }
         }

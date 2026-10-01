@@ -1,0 +1,53 @@
+;; spec:   types §2.2, §8.1; compiler.md §7; method.md rule 6 (an Option of a scalar or of an Option is a heap enum)
+;; expect: accept
+;; result: 16383
+;; audit:  clean
+;; A generic function instantiated at a type argument that is itself an
+;; Option held as a heap enum ((Option i64), (Option (Option i64))) must
+;; see (Option a) as a heap enum too, as its caller built it. fibc keyed
+;; such an instance by the layout class `ptr`, whose representative is
+;; `str`, so inside it (Option a) was a nullable pointer: wrap turned
+;; (some nil) into nil, a present inner value crashed the next match, the
+;; prelude's nil? of a nil (Option (Option i64)) said false, and a Map of
+;; Options could not tell an absent key from a nil value. Each check is
+;; its own bit of the result: 1 + 2 + ... + 8192 = 16383.
+(defun wrap (x: a) -> (Option a) (some x))
+(defun inner (b: i64) -> (Option i64) (if (> b 0) (some b) nil))
+(defun bit (c: bool n: i64) -> i64 (if c n 0))
+
+(defun fold-vec (v: (Vec a) init: b f: (fn (b a) b)) -> b
+  (loop ((i 0) (acc init))
+    (if (< i (count v)) (recur (+ i 1) (f acc (nth v i))) acc)))
+
+(defun apply-to (f: (fn (a) b) x: a) -> b (f x))
+
+(defun tag-of (o: (Option (Option i64))) -> i64
+  (match o (nil 1) ((some nil) 2) ((some (some x)) (+ 10 x))))
+
+(defun main () -> i64
+  (let ((absent: (Option (Option i64)) nil)
+        (hole: (Option (Option i64)) (some nil))
+        (held: (Option (Option i64)) (some (some 3)))
+        (w0 (wrap (inner 0)))
+        (w5 (wrap (inner 5)))
+        (ws (wrap (some "s")))
+        (wn (wrap (let ((n: (Option str) nil)) n)))
+        (m0 (assoc (map-empty) 1 (inner 0)))
+        (m5 (assoc m0 2 (inner 5)))
+        (mk (fn (n: i64) -> (Option (Option i64)) (if (> n 0) (some (inner (- n 1))) nil)))
+        (bumped (fold-vec [(some 1) nil (some 5)] 0
+                  (fn (acc: i64 o: (Option i64)) -> i64 (+ acc (unwrap-or o 100))))))
+    (+ (bit (nil? absent) 1)
+    (+ (bit (and (not (nil? hole)) (some? hole)) 2)
+    (+ (bit (and (some? held) (= held (some (some 3)))) 4)
+    (+ (bit (= (tag-of w0) 2) 8)
+    (+ (bit (= (tag-of w5) 15) 16)
+    (+ (bit (= (match ws ((some (some s)) s) (_ "")) "s") 32)
+    (+ (bit (match wn ((some nil) true) (_ false)) 64)
+    (+ (bit (and (nil? (get m0 7)) (not (nil? (get m0 1)))) 128)
+    (+ (bit (= (match (get m0 1) ((some nil) 1) ((some (some _)) 2) (nil 3)) 1) 256)
+    (+ (bit (= (match (get m5 2) ((some (some x)) x) (_ 0)) 5) 512)
+    (+ (bit (= bumped 106) 1024)
+    (+ (bit (and (= (tag-of (apply-to mk 3)) 12) (= (tag-of (apply-to mk 1)) 2) (= (tag-of (apply-to mk 0)) 1)) 2048)
+    (+ (bit (= (unwrap-or (wrap held) absent) held) 4096)
+       (bit (nil? (unwrap-or hole (some 9))) 8192))))))))))))))))

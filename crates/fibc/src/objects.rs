@@ -242,10 +242,13 @@ impl Objects {
         }
         for o in &self.list {
             out.push_str(&walk::walker(o, "drop", |child| {
-                format!("(call @fib.release {child})")
+                format!("(call @fib.defer wl {child})")
             }));
             out.push_str(&walk::walker(o, "trace", |child| {
                 format!("(indirect-call cb (fn void (ptr)) {child})")
+            }));
+            out.push_str(&walk::walker(o, "share", |child| {
+                format!("(call @fib.share-queue wl {child})")
             }));
         }
         self.render_tables(&mut out);
@@ -283,11 +286,12 @@ impl Objects {
             .iter()
             .map(|o| {
                 format!(
-                    "(%struct.fib.typerec @drop.{} @trace.{} (string \"{}\") (i64 {}))",
+                    "(%struct.fib.typerec @drop.{} @trace.{} (string \"{}\") (i64 {}) @share.{})",
                     o.tid,
                     o.tid,
                     o.name.replace('\\', "\\\\").replace('"', "\\\""),
-                    o.size()
+                    o.size(),
+                    o.tid
                 )
             })
             .collect();
@@ -345,7 +349,7 @@ mod tests {
         assert_eq!(o.get(1).offsets(Some(1)), vec![24, 32]);
         assert_eq!(o.get(1).offsets(Some(0)), Vec::<u64>::new());
         let src = format!(
-            "(defstruct fib.typerec (ptr ptr ptr i64))\n(declare fib.release void (ptr))\n{}",
+            "(defstruct fib.typerec (ptr ptr ptr i64 ptr))\n(declare fib.defer void (ptr ptr))\n(declare fib.share-queue void (ptr ptr))\n{}",
             o.render()
         );
         if let Err(e) = lir::parse_and_check(&src) {

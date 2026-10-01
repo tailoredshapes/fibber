@@ -1,0 +1,44 @@
+;; spec:   syntax §5; compiler.md §2
+;; expect: accept
+;; result: 8191
+;; audit:  clean
+;; Two modules each define types of one name with different layouts: a
+;; struct Pt, a private struct Hidden, a generic struct (Wrap Pt), an
+;; enum Shape, each with an impl of the protocol Sz of the same name,
+;; and the main module defines a Box of its own beside the prelude's.
+;; fibc named an object struct by the type's bare name, so the second
+;; module's Pt was laid out as the first's (`getelementptr: field index 4
+;; out of range for %struct.o.Pt`) and the specialisations of one generic
+;; function at the two Pts, and the two impls, were one symbol (`duplicate
+;; definition of @m.Sz.size.Pt`). A type's symbol carries the defining
+;; module's name, as a protocol's does (case 008). Each check is its own
+;; bit: 2^13 - 1 = 8191.
+(ns main (:require [a :as a] [b :as b]))
+
+(defstruct (Box t) (s: str n: t))
+(defun id (x: t) -> t x)
+(defun first-of (v: (Vec t)) -> t (nth v 0))
+(defun bit (c: bool n: i64) -> i64 (if c n 0))
+(defun sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i (count v)) (recur (+ i 1) (+ acc (nth v i))) acc)))
+
+(defun main () -> i64
+  (let ((pa (a/make 5))
+        (pb (b/make 5))
+        (b1 (Box "q" 4))
+        (b2 (box 9)))
+    (sum [(bit (= (a/get-x pa) 5) 1)
+          (bit (= (b/get-x pb) 15) 2)
+          (bit (and (= (a/get-x (id pa)) 5) (= (b/get-x (id pb)) 15)) 4)
+          (bit (and (= (a/get-x (first-of [pa pa])) 5) (= (b/get-x (first-of [pb pb])) 15)) 8)
+          (bit (and (= (a/size pa) 1) (= (b/size pb) 2)) 16)
+          (bit (and (= (a/hidden 3) 13) (= (b/hidden 3) 25)) 32)
+          (bit (and (= (a/get-x (. (a/wrapped 6) v)) 6) (= (b/get-x (. (b/wrapped 6) v)) 12) (= (. (b/wrapped 6) w) 7)) 64)
+          (bit (and (= (a/of-shape (a/shape 4)) 4) (= (a/of-shape (a/shape 0)) 0)) 128)
+          (bit (and (= (b/of-shape (b/shape 4)) 4) (= (b/of-shape (b/shape 0)) 100)) 256)
+          (bit (and (= (str-len (. b1 s)) 1) (= (. b1 n) 4) (= (unbox b2) 9)) 512)
+          (bit (= (count [(Some-pt pa) (Some-pt pa)]) 2) 1024)
+          (bit (match (some pb) ((some p) (= (. p y) 10)) (nil false)) 2048)
+          (bit (match (some pa) ((some p) (= (. p x) 5)) (nil false)) 4096)])))
+(defun Some-pt (p: a/Pt) -> (Option a/Pt) (some p))

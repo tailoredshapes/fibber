@@ -31,14 +31,15 @@ const REJECT: &[u32] = &[
 ];
 const LEAK_CYCLE: [u32; 2] = [15, 80];
 /// The cases whose verdict is a run-time trap (method.md rule 3).
-const TRAP: [u32; 14] = [
-    101, 102, 103, 104, 172, 173, 184, 195, 209, 212, 214, 215, 216, 217,
+const TRAP: [u32; 15] = [
+    101, 102, 103, 104, 172, 173, 184, 195, 209, 212, 214, 215, 216, 217, 224,
 ];
 /// Numbers below the last that no case has: 30 and 35 were withdrawn when
-/// D1 removed field places, and 191 was never written. (205 was reserved
+/// D1 removed field places, 191 was never written, and 219 was taken by
+/// the stage-1 fixes of the library work before they were renumbered. (205 was reserved
 /// for the standard library's hygiene package, R2; its case is
 /// `205-show-of-option-and-list`.)
-const WITHDRAWN: [u32; 3] = [30, 35, 191];
+const WITHDRAWN: [u32; 4] = [30, 35, 191, 219];
 /// The last case number that existed when this was written. The suite
 /// only grows, so a directory whose highest number is lower has lost its
 /// last cases, which the contiguity of the numbers below it cannot show.

@@ -6,7 +6,8 @@
 //! and is not one. The number before the first dash is the case's number and
 //! belongs to one case; the word after it is the kind: `open-` says the
 //! header has `open:` items, `count-` and `bound-` that it has an `allocs`
-//! bound (the rest of the kinds, `ref-` `law-` `rule-`, are judged by what
+//! bound (the kind words are reserved: a unit case's slug does not begin
+//! with one, whatever it is about; the rest of the kinds, `ref-` `law-` `rule-`, are judged by what
 //! they compute, README §9.4).
 
 use std::path::{Path, PathBuf};
@@ -130,7 +131,9 @@ pub fn naming(cases: &[Case]) -> Vec<String> {
         }
         if (kind == "count" || kind == "bound") && !case.bounded {
             found.push(format!(
-                "{}: a {kind}- case has an `allocs: <= N` header",
+                "{}: a {kind}- case needs an `allocs: <= N` header; a unit case's slug must \
+                 not begin with the word {kind} (kind words are reserved, README \"Kinds\"): \
+                 rename it, say `the-{kind}-of-..`",
                 case.name
             ));
         }
@@ -206,6 +209,9 @@ mod tests {
             case("022-bound-x.fib", &[], false),
         ];
         assert_eq!(naming(&unbounded).len(), 2);
+        // The finding says what to do about a unit case that only starts
+        // with the word, which is the usual reason for it.
+        assert!(naming(&unbounded)[0].contains("must not begin with the word count"));
     }
 
     #[test]

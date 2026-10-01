@@ -256,8 +256,26 @@ fn itrace(file: &str, roots: &Roots) -> ExitCode {
         Err(code) => return code,
     };
     let run = fibc::harness::interp::run_in(&source, file, roots);
-    eprintln!("{:?}", run.outcome);
-    write_stdout(&run.trace.render())
+    // The trace is the whole of standard output; the outcome follows it
+    // on standard error, in the words `fibref run` uses, so that
+    // `2>&1 | grep -c '^A '` counts the allocations and nothing else.
+    let code = write_stdout(&run.trace.render());
+    eprintln!("{}", describe(&run.outcome));
+    code
+}
+
+/// What `itrace` reports of the interpreter's run besides the trace.
+fn describe(outcome: &fibref::cases::Outcome) -> String {
+    use fibref::cases::Outcome;
+    match outcome {
+        Outcome::Compiled { result, audit } => format!("result: {result}\naudit:  {audit}"),
+        Outcome::Rejected { message } => format!("rejected: {message}"),
+        Outcome::Trapped { message, errors } => {
+            format!("trap: {message}\naudit errors: {}", errors.len())
+        }
+        Outcome::Failed { message } => format!("failed: {message}"),
+        Outcome::Unsupported { reason } => format!("unsupported: {reason}"),
+    }
 }
 
 #[cfg(feature = "llvm")]

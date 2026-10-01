@@ -62,7 +62,24 @@ No two cases share a number (the test `cases_are_named_and_labelled_alike`).
 
 ## Kinds
 
-The kind is the first word of the slug after the number.
+The kind is the first word of the slug after the number, and **the kind
+words are reserved**: `ref`, `law`, `count`, `bound`, `rule`, `open` (and
+`reject` and `trap`, below) mean their kind wherever they begin a slug. A
+unit case about counting is not called `NNN-count-of-nothing.fib`: that
+slug is a `count-` case, so the tests demand its `allocs: <= N` header and
+`a_stdlib_count_bound_one_below_the_count_fails` lowers it by one; write
+`NNN-the-count-of-nothing.fib`. The test `cases_are_named_and_labelled_alike`
+and both `allocs.rs` tests read the kind the same way (the characters
+after the number up to the next `-` or `.`), so the rule has no judgement in
+it: a slug is a `count-` case exactly when its first word is `count`, and
+every `count-` case has an `allocs` header. (A slug that merely begins with
+the word, as `204-count-of-nothing-is-zero`, `254-count-of-a-map-calls-f` and
+`500-count-str-chars` did, is a finding of the first test and a panic of the
+second; the three are now `the-count-of-..`.)
+A `count-` case whose count is 0 is allowed: nothing can be lowered below 0,
+so `allocs.rs` skips the lowered half for it, and
+`a_bound_of_zero_passes_when_nothing_allocates_and_fails_when_something_does`
+shows with fixtures that a bound of 0 does fail a program that allocates.
 
 | Kind | What it is |
 |---|---|

@@ -1,0 +1,44 @@
+;; spec:   types §1.5 and §8.1 (an Option of an Option is a heap enum, so (some nil) and nil stay distinct), method.md rule 6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: nil? some? unwrap unwrap-or map-opt and-then
+;; This case reported a stage-1 bug in fibc (a divergence from fibref, not a
+;; library fault) and is its regression test; the fix is the `box` layout
+;; class of crates/fibc/src/mono.rs (cases/ownership/220 is the program of
+;; the bug without the library).
+;; The program: a generic function (every function of the Option part is
+;; one) instantiated at `a = (Option i64)`, an Option of an Option of a scalar.
+;; fibc used to key the instance by the layout class of `a`; the class of
+;; `(Option i64)` was `ptr`, whose representative is `str`, so inside the
+;; instance `(Option a)` was `(Option str)`, a nullable pointer, while the
+;; caller built an `(Option (Option i64))` as a boxed enum: `(nil? n)` of a
+;; nil `(Option (Option i64))` was false, `(unwrap (some (some 5)))` handed
+;; back a pointer where the inner Option was, and a generic `wrap` returned
+;; a value that crashed the next match (exit 139).
+;; Each check is its own bit of the result, so the failing ones name which
+;; function reads the wrong layout.
+(ns main (:use fib.core tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (absent: (Option (Option i64)) nil)
+        (hole: (Option (Option i64)) (some nil))
+        (held: (Option (Option i64)) (some (some 3))))
+    (do
+      (check c (nil? absent))
+      (check c (not (some? absent)))
+      (check c (some? hole))
+      (check c (not (nil? hole)))
+      (check c (some? held))
+      (check c (nil? (unwrap hole)))
+      (check c (= (unwrap held) (some 3)))
+      (check c (= (unwrap (unwrap (some held))) (some 3)))
+      (check c (nil? (unwrap-or hole (some 9))))
+      (check c (= (unwrap-or absent (some 9)) (some 9)))
+      (check c (= (unwrap-or held (some 9)) (some 3)))
+      (check c (= (map-opt (fn (o) (unwrap-or o 0)) held) (some 3)))
+      (check c (= (and-then (fn (o) o) held) (some 3)))
+      (check c (nil? (and-then (fn (o) o) hole)))
+      (checks-result c))))

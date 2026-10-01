@@ -1247,13 +1247,19 @@ scheme (**Decided**):
 - every other variable (unconstrained, or constrained only by `Send`)
   is keyed by the **layout class** of its argument: the scalar lIR
   types (`i1 i8 i16 i32 i64 float double`), `ptr` (every object type
-  except the next), `opt` (an `(Option T)` with `T` of class `ptr`: a
-  nullable pointer, §8.1), and the two-word `dyn`.
+  except the next two), `opt` (an `(Option T)` with `T` of class `ptr`: a
+  nullable pointer, §8.1), `box` (an `(Option T)` with `T` of a scalar
+  class, of `unit`, or itself an `Option`: a heap enum, §8.1), and the
+  two-word `dyn`.
 
-The separate `opt` class is what keeps the `Option` representation rule
-of §8.1 intact under monomorphisation: `(Option a)` at `a` of class
-`opt` or of a scalar class takes the heap-enum row, and only at `a` of
-class `ptr` the null row. So `(Vec (Box i64))` and `(Vec str)` share
+The separate `opt` and `box` classes are what keep the `Option`
+representation rule of §8.1 intact under monomorphisation: `(Option a)`
+at `a` of class `opt`, `box` or a scalar class takes the heap-enum row,
+and only at `a` of class `ptr` the null row. (Until the stage-1 fix
+s1a there was no `box` class: an `(Option i64)` was of class `ptr`, so a
+body keyed by class built `(Option a)` as a nullable pointer where its
+caller built a heap enum; `(some nil)` at `a = (Option i64)` became `nil`
+and a present value crashed. Case 220.) So `(Vec (Box i64))` and `(Vec str)` share
 one specialisation of `count`, whose element type is unconstrained,
 while `(defun describe (x) (str-len (show x)))`, of type `∀a. (Show a)
 ⇒ (fn (a) i64)`, gets one specialisation per receiver type
@@ -2790,8 +2796,8 @@ non-null object with tag `some` and a null payload, distinct from the
 outer `nil`, as §1.5 requires; with a bare nullable pointer the two
 would be the same bit pattern and a compiled `(match (some nil) ((some
 _) 1) (nil 0))` would answer 0 where the interpreter, which carries
-real tags (§4.5), answers 1 (method.md rule 6). The layout class `opt`
-(§4.3) keeps the rule intact under monomorphisation.
+real tags (§4.5), answers 1 (method.md rule 6). The layout classes `opt` and `box`
+(§4.3) keep the rule intact under monomorphisation.
 
 Scalars inside objects are stored unboxed at their lIR type. A struct
 `(defstruct P (x: i64 s: str))` is `(defstruct P.obj (i64 i32 i32 i64
@@ -2825,15 +2831,27 @@ an lIR `constant`, a literal allocated by the interpreter, a stack
 object's `alloca` and `fib.immortalise` all initialise it so
 (**Decided**).
 `type-id` indexes the table `fib.types` of per-type records
-`(defstruct fib.typerec (ptr ptr ptr i64))` — `drop`, `trace`, `name`,
-`size` — one per monomorphised object type: `drop` releases the
-object's counted children; `trace` calls a callback on each child
-pointer (used by share-marking, §8.8, by `fib.immortalise` and by the
-interpreter's audit). The table is **static data** (**Decided**,
+`(defstruct fib.typerec (ptr ptr ptr i64 ptr))` — `drop`, `trace`, `name`,
+`size`, `share` — one per monomorphised object type: `drop (ptr p, ptr
+wl)` queues the object's counted children on the worklist `wl`, last
+child first; `share (ptr p, ptr wl)` queues every child pointer that is
+not yet SHARED or IMMORTAL, marking it (share-marking, §8.8); `trace
+(ptr p, ptr cb)` calls the callback `cb` on each child pointer (the
+retains of the children of a copy, §8.3, and `fib.immortalise`; the
+interpreter's audit walks its own heap). Neither `drop` nor `share`
+recurses: `fib.drop` and `fib.share` keep the worklist, a stack of pointers that starts in
+the frame and moves to the heap when it fills, and take entries off it
+until it is empty, so a drop or a share-marking of a chain of a million
+objects needs no more native stack than one of two (**Decided**: the
+compiled program overflowed its stack where the interpreter did not,
+method rule 6). A drop takes the entries off in the order a recursion
+would have released the children (the first child with all that its
+release frees, then the second), which is the order of the `F` lines
+of the trace (compiler.md §4). The table is **static data** (**Decided**,
 owner, 2026-09-28, lir.md §14 item 3): the whole program has one,
 `(constant fib.types [n x %struct.fib.typerec] ([n x
 %struct.fib.typerec] (%struct.fib.typerec @drop.T @trace.T @name.T
-(i64 size)) ..))`, and record `tid`'s field `k` is `(getelementptr [n x
+(i64 size) @share.T) ..))`, and record `tid`'s field `k` is `(getelementptr [n x
 %struct.fib.typerec] @fib.types (i32 0) tid (i32 k))`; `fib.types[tid].drop`
 below is that load. Every other **static object** — string and `Form`
 literals with their headers (§8.3), the constant closures of named
@@ -2874,9 +2892,12 @@ fib.release (ptr p) -> void
     if p == null or flags(p) & (STACK|IMMORTAL): return
     if flags(p) & SHARED: old = atomicrmw sub count 1 (acq_rel); if old == 1: fib.drop p
     else:                 if count == 1: fib.drop p  else: count -= 1
-fib.drop    (ptr p) -> void
+fib.drop    (ptr p) -> void                      ; wl := a fresh, empty worklist
+    drop-one p; while wl is not empty: q = pop wl; release q, as fib.release does,
+                                                 ; but a count reaching zero runs drop-one q
+drop-one    (ptr p) -> void
     if flags(p) & HAS-WEAK: fib.weak-clear p     ; §8.7
-    call fib.types[tid].drop p                   ; releases children
+    call fib.types[tid].drop p wl                ; queues the children, last first
     free p
 fib.unique? (ptr p) -> i1
     if flags(p) & (SHARED|IMMORTAL|STACK|HAS-WEAK): return 0
@@ -2891,8 +2912,9 @@ fib.immortalise (ptr p) -> void                  ; def initialisation (syntax §
 ```
 
 A `STACK` object has the same layout in an `alloca` of the frame,
-never passed to `fib.release`; the compiler emits `fib.types[tid].drop`
-inline at scope exit. The object is `(alloca %struct.T.obj)` (lIR's
+never passed to `fib.release`; the compiler emits `fib.drop-fields`, the
+`fib.types[tid].drop` and the draining of its worklist, inline at scope
+exit. The object is `(alloca %struct.T.obj)` (lIR's
 `alloca` takes any sized type; **Decided**, owner, 2026-09-28, lir.md
 §14 item 3), which gives it the struct's own size and alignment, and
 its fields are addressed through `(getelementptr %struct.T.obj p (i32

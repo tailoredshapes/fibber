@@ -1,0 +1,22 @@
+;; spec:   types §8.2; compiler.md §4; method.md rule 6
+;; expect: accept
+;; result: 1
+;; audit:  clean
+;; allocs: <= 400001
+;; A tree 100000 levels deep: every node holds a `Vec` of one child, so a
+;; level is four objects (the node, the `Vec`, its leaf and the leaf's
+;; array), and the release passes through an array of counted elements
+;; at every level. A drop that recurses once per level overflows the
+;; native stack; this one must not.
+(defenum Tree (Leaf) (Node kids: (Vec Tree)))
+
+(defun deep (n: i64) -> Tree
+  (loop ((i 0) (t Leaf))
+    (if (< i n)
+        (recur (+ i 1) (Node [t]))
+        t)))
+
+(defun main () -> i64
+  (match (deep 100000)
+    ((Node kids) (count kids))
+    ((Leaf) 0)))

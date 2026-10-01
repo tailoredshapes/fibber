@@ -35,6 +35,11 @@ pub enum Class {
     Scalar(LirTy),
     Ptr,
     Opt,
+    /// An `(Option T)` held as a heap enum (types §8.1): a payload that
+    /// is a scalar, a unit or itself an `Option`. It is a pointer like
+    /// `Ptr`, but `(Option it)` is a heap enum too, where `(Option str)`
+    /// is a nullable pointer.
+    Boxed,
     Dyn,
     Unit,
 }
@@ -45,8 +50,11 @@ pub fn class_of(g: &Globals, t: &Ty) -> Result<Class, Unsupported> {
         None => Class::Unit,
         Some(LirTy::Dyn) => Class::Dyn,
         Some(LirTy::Ptr) => match option_payload(g, t) {
-            Some(p) if option_rep(g, p)? == OptRep::Null => Class::Opt,
-            _ => Class::Ptr,
+            Some(p) => match option_rep(g, p)? {
+                OptRep::Null => Class::Opt,
+                OptRep::Boxed => Class::Boxed,
+            },
+            None => Class::Ptr,
         },
         Some(s) => Class::Scalar(s),
     })
@@ -67,6 +75,7 @@ pub fn representative(g: &Globals, c: Class) -> Ty {
         Class::Unit => Ty::unit(),
         Class::Ptr => Ty::str(),
         Class::Opt => Ty::nominal(g.option, vec![Ty::str()]),
+        Class::Boxed => Ty::nominal(g.option, vec![Ty::i64()]),
         Class::Dyn => Ty::Con(Con::Dyn(ProtoId(0), false), Vec::new()),
     }
 }
@@ -201,7 +210,22 @@ mod tests {
         let opt = Ty::nominal(g.option, vec![Ty::str()]);
         assert_eq!(class_of(g, &opt).unwrap(), Class::Opt);
         let opt2 = Ty::nominal(g.option, vec![opt.clone()]);
-        assert_eq!(class_of(g, &opt2).unwrap(), Class::Ptr);
+        assert_eq!(class_of(g, &opt2).unwrap(), Class::Boxed);
+        let opt_i64 = Ty::nominal(g.option, vec![Ty::i64()]);
+        assert_eq!(class_of(g, &opt_i64).unwrap(), Class::Boxed);
+        assert_eq!(representative(g, Class::Boxed), opt_i64);
+        // The representative of a class is in that class, and an
+        // `Option` of it has the representation of an `Option` of the
+        // member: a pointer for `Ptr` and `Opt` that is plain only for `Ptr`.
+        for t in [&Ty::str(), &opt, &opt2, &opt_i64] {
+            let c = class_of(g, t).unwrap();
+            assert_eq!(class_of(g, &representative(g, c)).unwrap(), c);
+            let (a, b) = (
+                Ty::nominal(g.option, vec![t.clone()]),
+                Ty::nominal(g.option, vec![representative(g, c)]),
+            );
+            assert_eq!(class_of(g, &a).unwrap(), class_of(g, &b).unwrap());
+        }
         assert_eq!(class_of(g, &Ty::i64()).unwrap(), Class::Scalar(LirTy::I64));
         assert_eq!(representative(g, Class::Opt), opt);
         let vec = g.vec.unwrap();

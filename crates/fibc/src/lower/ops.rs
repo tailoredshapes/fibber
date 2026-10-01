@@ -88,21 +88,7 @@ impl<'a> Cx<'_, 'a> {
             // A stack closure holds only aliases: nothing to release.
             return Ok(());
         }
-        let tid = self
-            .b
-            .val(&format!("(call @fib.tid {w})"), crate::ir::LirTy::I32);
-        let rec = self.b.val(
-            &format!(
-                "(getelementptr %struct.fib.typerec @fib.types {} (i32 0))",
-                tid.text()
-            ),
-            crate::ir::LirTy::Ptr,
-        );
-        let drop = self.load(crate::ir::LirTy::Ptr, rec.text());
-        self.b.stmt(&format!(
-            "(indirect-call {} (fn void (ptr)) {w})",
-            drop.text()
-        ));
+        self.b.stmt(&format!("(call @fib.drop-fields {w})"));
         Ok(())
     }
 }

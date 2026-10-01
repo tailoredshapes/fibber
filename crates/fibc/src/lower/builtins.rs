@@ -267,10 +267,13 @@ impl<'a> Cx<'_, 'a> {
             _ => return Err(Unsupported(format!("{name} on a non-array"))),
         };
         let (tid, sname) = self.p.object(&arr_ty)?;
-        let el = self
-            .p
-            .lir(&elem_ty)?
-            .ok_or_else(|| Unsupported("arrays of unit".into()))?;
+        // An element of `unit` has no value, but takes the `i1` slot a
+        // cell of `unit` takes (program.rs `elem_lir`), so that the
+        // array has its length and a place for every element, and
+        // `array-get` reads a unit (the interpreter's view: the elements
+        // count, and `array-len` counts them).
+        let unit_elem = self.p.lir(&elem_ty)?.is_none();
+        let el = self.p.lir(&elem_ty)?.unwrap_or(LirTy::I1);
         let esize = crate::layout::size_align(el).0;
         let counted = matches!(el, LirTy::Ptr | LirTy::Dyn);
         match name {
@@ -290,12 +293,7 @@ impl<'a> Cx<'_, 'a> {
                 let lp = self.gep(&sname, a[0].text(), LEN);
                 Ok(self.load(LirTy::I64, &lp))
             }
-            "array-get" => {
-                let ep = self.array_index(&sname, a[0].text(), &a[1])?;
-                let v = self.load(el, &ep);
-                self.retain(&v);
-                Ok(v)
-            }
+            "array-get" => self.array_get(&sname, a, el, unit_elem),
             "array-with" => {
                 let copy = self.array_dup(&sname, tid, esize, a[0].text());
                 let ep = self.array_index(&sname, copy.text(), &a[1])?;
@@ -319,6 +317,18 @@ impl<'a> Cx<'_, 'a> {
             }
             _ => self.array_set(&tys[0], &sname, tid, esize, el, &elem_ty, a),
         }
+    }
+
+    /// `(array-get a i)`: the element, retained; a `unit` element is
+    /// no value, and only the bounds check is made.
+    fn array_get(&mut self, sname: &str, a: &[V], el: LirTy, unit_elem: bool) -> R<V> {
+        let ep = self.array_index(sname, a[0].text(), &a[1])?;
+        if unit_elem {
+            return Ok(V::Unit);
+        }
+        let v = self.load(el, &ep);
+        self.retain(&v);
+        Ok(v)
     }
 
     /// Stores `x` into every element of a fresh array of `n`, taking

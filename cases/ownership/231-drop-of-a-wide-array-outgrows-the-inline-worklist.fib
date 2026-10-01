@@ -1,0 +1,18 @@
+;; spec:   types §8.2; compiler.md §4; method.md rule 6
+;; expect: accept
+;; result: 5000
+;; audit:  clean
+;; allocs: <= 5002
+;; An array of 5000 distinct objects is released: its drop queues all
+;; 5000 elements at once, many more than the 32 entries the worklist
+;; starts with on the native stack, so the worklist is moved to the heap
+;; and doubled several times (and freed after the drop). The frees of the
+;; elements are compared in order with the interpreter's, which frees
+;; them in index order: the queue is filled from the last element down
+;; so that the first is the next one released.
+(defstruct Z (v: i64))
+
+(defun main () -> i64
+  (let ((a (cell (array 5000 (Z 0)))))
+    (do (dotimes (i 5000) (array-set! &a i (Z i)))
+        (array-len @a))))

@@ -129,8 +129,14 @@ running (types §8.8), and then, under `fibc run`, prints the result
 and returns 0, or, in an executable, returns the result.
 
 Names. A fibber type prints as types §1 writes it; its **mangled form**
-replaces `(` by `$`, `)` by `_` and a space by `.`: `(Vec (Box i64))`
-is `$Vec.$Box.i64__`. A function specialisation is `f.NAME` followed by
+replaces `(` by `$`, `)` by `_` and a space by `.`, and writes each
+nominal type behind the module that defines it and a `/` (none for the
+main module): `(Vec (Box i64))` of the prelude is
+`$fib.prelude/Vec.$fib.prelude/Box.i64__`, a main-module `Pt` is `Pt`
+and module `a`'s is `a/Pt`, so that two modules' types of one name,
+which are different object layouts and different instance heads, have
+different symbols (**Proposed**, stage-1 fix s1a, case
+`cases/modules/025`). A function specialisation is `f.NAME` followed by
 the mangled key of §7 (`f.count.$Vec.i64_`); an all-owned body adds
 `.owned`; a method implementation is `m.PROTO.METHOD.` + the head's
 mangling, where `PROTO` is the protocol's name behind its module's prefix
@@ -317,10 +323,14 @@ macros with `fibref`'s evaluator instead.
 As types §4.3: a specialisation's key has one component per quantified
 variable of the scheme, the full type when the variable carries a
 protocol bound, else its layout class (`i1 i8 i16 i32 i64 float double
-ptr opt dyn`). Inside a class-keyed specialisation the compiler
+ptr opt box dyn`). Inside a class-keyed specialisation the compiler
 substitutes a **representative** type of the class for the variable
-(`str` for `ptr`, `(Option str)` for `opt`, a `dyn` for `dyn`, the
-scalar itself), so every expression has a concrete layout; nothing in
+(`str` for `ptr`, `(Option str)` for `opt`, `(Option i64)` for `box`, a
+`dyn` for `dyn`, the scalar itself), so every expression has a concrete
+layout; `opt` is an `(Option T)` held as a nullable pointer and `box`
+one held as a heap enum (types §8.1: a scalar, unit or `Option`
+payload), kept apart because an `(Option a)` is a nullable pointer when
+`a` is a `ptr` and a heap enum when `a` is `opt` or `box`; nothing in
 such a body can dispatch on the variable, since it has no bound. Method
 calls whose resolution is a bound of the scheme are resolved per
 specialisation to the instance of the key's full type. Bodies are
@@ -379,9 +389,14 @@ as described.
    functions) are found by address and shared. The interpreter backend
    (`defs/interp.rs`) remains the executable spec of the same values
    and the fallback of a build without `llvm`; `tests/defs.rs` requires
-   the two to emit the same constants, text for text. Still
+   the two to emit the same constants, text for text. A boxed `Option`
+   (`nil` and `some` of a scalar or of an `Option`) is a constant
+   enum object of tag 0 or 1 in both backends (a null `nil` the JIT
+   reads is emitted as the nil object, as the interpreter's is), and
+   the value of each `def` is recorded as it is made, so a later
+   initialiser may name an earlier `def` (cases/ownership/222). Still
    unsupported in a `def`: a closure other than a named function, a
-   `dyn`, a boxed `Option`, a cell, an atom.
+   `dyn`, a cell, an atom.
 5. **A boxed `Option`'s `nil` may be null.** §8.3 gives every
    non-null `Option` a heap enum with tag 0 for `nil`. The
    interpreter allocates that object only where the plan decides the

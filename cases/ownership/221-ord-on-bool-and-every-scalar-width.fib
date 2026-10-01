@@ -1,0 +1,47 @@
+;; spec:   types §2.12, §8.12; method.md rule 6 (Ord on every scalar)
+;; expect: accept
+;; result: 2097151
+;; audit:  clean
+;; false is below true: `<`, `<=`, `>` and `>=` on bool, directly and
+;; through an Ord bound, order them as the integers 0 and 1. fibc lowered
+;; them as signed compares of an i1, which reads true as -1: `(< false
+;; true)` was false and `(lt true false)` true. The other scalars are
+;; checked at the same operators so that no width is left on the wrong
+;; sign: i8, i16, i32 and i64 are signed (a negative is below zero and
+;; the minimum below the maximum), a char compares by code point, up to
+;; the last scalar value, f32 and f64 by value, and a keyword by its name
+;; (fibc compared the interned ids, which order by first use: `:zz`, met
+;; first, was below `:aa`). Each check is its own bit: 2^21 - 1 = 2097151.
+(defun lt (a: t b: t) :where ((Ord t)) -> bool (< a b))
+(defun le (a: t b: t) :where ((Ord t)) -> bool (<= a b))
+(defun gt (a: t b: t) :where ((Ord t)) -> bool (> a b))
+(defun ge (a: t b: t) :where ((Ord t)) -> bool (>= a b))
+(defun bit (c: bool n: i64) -> i64 (if c n 0))
+
+(defun sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (a 0))
+    (if (< i (count v)) (recur (+ i 1) (+ a (nth v i))) a)))
+
+(defun main () -> i64
+  (sum [
+    (bit (and (< false true) (not (< true false)) (not (< false false)) (not (< true true))) 1)
+    (bit (and (<= false true) (not (<= true false)) (<= false false) (<= true true)) 2)
+    (bit (and (> true false) (not (> false true)) (not (> true true)) (not (> false false))) 4)
+    (bit (and (>= true false) (not (>= false true)) (>= true true) (>= false false)) 8)
+    (bit (and (lt false true) (not (lt true false)) (not (lt true true))) 16)
+    (bit (and (le false true) (not (le true false)) (le true true)) 32)
+    (bit (and (gt true false) (not (gt false true)) (not (gt false false))) 64)
+    (bit (and (ge true false) (not (ge false true)) (ge false false)) 128)
+    (bit (and (= (< false true) (< 0 1)) (= (> true false) (> 1 0))) 256)
+    (bit (and (< -128i8 127i8) (gt 1i8 -1i8) (le -1i8 0i8) (ge 127i8 -128i8)) 512)
+    (bit (and (< -32768i16 32767i16) (gt 1i16 -1i16) (lt -1i16 0i16) (ge 0i16 -1i16)) 1024)
+    (bit (and (< -2147483648i32 2147483647i32) (gt 1i32 -1i32) (lt -1i32 0i32) (ge 0i32 -1i32)) 2048)
+    (bit (and (< -9223372036854775808 9223372036854775807) (gt 1 -1) (lt -1 0) (ge 0 -1)) 4096)
+    (bit (and (< \a \b) (gt \b \a) (lt \a \u{10FFFF}) (le \u{10FFFF} \u{10FFFF}) (ge \u{10FFFF} \u{D7FF})) 8192)
+    (bit (and (lt \a \b) (gt \u{10FFFF} \u{0}) (not (lt \b \a)) (ge \a \a)) 16384)
+    (bit (and (< -1.5 1.5) (gt 1.5f32 -1.5f32) (lt -1.5f32 0.0f32) (ge 0.0 -1.0)) 32768)
+    (bit (and (lt -1 0) (lt 0 1) (lt -9223372036854775808 0) (not (lt 0 -1))) 65536)
+    (bit (and (le "a" "b") (lt "a" "b") (gt "b" "a") (not (lt "b" "a"))) 131072)
+    (bit (and (= (lt false true) true) (= (gt false true) false)) 262144)
+    (bit (match (< false true) (true (match (> true false) (true (not (>= false true))) (false false))) (false false)) 524288)
+    (bit (and (not (lt :zz :aa)) (lt :aa :zz) (gt :zz :aa) (ge :zz :zz) (le :aa :zz) (< :aa :zz) (not (>= :aa :zz))) 1048576)]))

@@ -1,0 +1,24 @@
+;; spec:   types §8.2; compiler.md §4 (the trace); method.md rule 6
+;; expect: accept
+;; result: 999999
+;; audit:  clean
+;; allocs: <= 1000001
+;; A `List` of a million cells is built by a loop and released when `main`
+;; ends. The release of a cell releases its tail: if the compiled drop
+;; called itself once per cell, a million frames of native stack (about
+;; 8 MB is the budget) would overflow where the interpreter, which keeps
+;; its own stack on the heap, succeeds, and the tools would disagree
+;; (it did: `thread 'main' has overflowed its stack`). The drop of a
+;; chain must take no native stack per link. The head is read out before
+;; the end of the scope so that the whole chain is live until the drop.
+(defun build (n: i64) -> (List i64)
+  (loop ((i 0) (acc (list)))
+    (if (< i n)
+        (recur (+ i 1) (Cons i acc))
+        acc)))
+
+(defun main () -> i64
+  (let ((l (build 1000000)))
+    (match l
+      ((Cons h _) h)
+      ((Empty) 0))))

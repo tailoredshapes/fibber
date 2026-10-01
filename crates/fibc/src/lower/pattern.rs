@@ -134,10 +134,9 @@ impl<'a> Cx<'_, 'a> {
         let (tnode, _) = self.p.object(&node_ty)?;
         let (tarr, _) = self.p.object(&Ty::Con(Con::Array, vec![elem.clone()]))?;
         let (tnarr, _) = self.p.object(&Ty::Con(Con::Array, vec![node_ty]))?;
-        let el = self
-            .p
-            .lir(elem)?
-            .ok_or_else(|| Unsupported("a Vec of unit".into()))?;
+        // The nodes of a Vec of `unit` are arrays of the `i1` slot an
+        // element of `unit` takes (builtins.rs `array_builtin`).
+        let el = self.p.lir(elem)?.unwrap_or(LirTy::I1);
         Ok(VecIds {
             esize: crate::layout::size_align(el).0,
             counted: match el {

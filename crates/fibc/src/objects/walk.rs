@@ -3,6 +3,16 @@
 //! acts on each. A slot is a child when its lIR type says it is a counted
 //! pointer (`ptr`, an object's) or a `dyn`; a raw `ptr` (`LirTy::Raw`,
 //! types §8.1) is an address with no count and is never one.
+//!
+//! A `drop` does not release its children: it queues them on the
+//! worklist of the drop in progress (`fib.defer`, rt/core.lir), last
+//! child first, so that taking them off in turn releases them in field
+//! order, each with its whole subtree before the next, as the recursion
+//! did, without a native stack frame per object of a chain. A `share`
+//! queues them on the worklist of a share-marking (`fib.share-queue`,
+//! rt/atom.lir) for the same reason. A `trace` is the one-level walk
+//! that calls a callback on each child (the copies of a unique write
+//! retain the children of the copied object with it).
 
 use std::fmt::Write;
 
@@ -60,34 +70,29 @@ fn child_fields(o: &ObjInfo) -> Vec<(String, Vec<(usize, LirTy)>)> {
     }
 }
 
-/// A `drop.N` or `trace.N` function: `act` on each child pointer of
-/// the object, in field order (an enum's by its tag through `switch`;
-/// an array's elements in a loop).
+/// A `drop.N`, `trace.N` or `share.N` function: `act` on each child
+/// pointer of the object (an enum's by its tag through `switch`; an
+/// array's elements in a loop). A drop goes through the fields in
+/// reverse, for the worklist (module comment).
 pub(super) fn walker(o: &ObjInfo, what: &str, act: impl Fn(&str) -> String) -> String {
+    let drop = what == "drop";
     let params = if what == "trace" {
         "((ptr p) (ptr cb))"
     } else {
-        "((ptr p))"
+        "((ptr p) (ptr wl))"
     };
     let mut s = format!("(define internal ({what}.{} void) {params}\n", o.tid);
     if let ObjKind::Array(LirTy::Ptr | LirTy::Dyn) = o.kind {
-        let _ = write!(
-            s,
-            "  (block entry (let ((n (load i64 (getelementptr %struct.{sn} p (i32 0) (i32 {LEN}))))) (br loop)))
-  (block loop (let ((i (phi i64 (entry (i64 0)) (next i2)))) (br (icmp slt i n) body done)))
-  (block body (let ((e (load ptr (getelementptr %struct.{sn} p (i32 0) (i32 {ELEMS}) i)))) {} (br next)))
-  (block next (let ((i2 (add i (i64 1)))) (br loop)))
-  (block done (ret)))\n",
-            act("e"),
-            sn = o.sname
-        );
-        return s;
+        return array_walker(s, o, drop, &act);
     }
-    if let (ObjKind::Weak, "drop") = (&o.kind, what) {
+    if let (ObjKind::Weak, true) = (&o.kind, drop) {
         s.push_str("  (block entry (call @fib.weak-drop p) (ret)))\n");
         return s;
     }
-    let groups = child_fields(o);
+    let mut groups = child_fields(o);
+    if drop {
+        groups.iter_mut().for_each(|(_, fields)| fields.reverse());
+    }
     if let ObjKind::Enum(_) = o.kind {
         let cases: Vec<String> = (0..groups.len())
             .map(|i| format!("((i32 {i}) v{i})"))
@@ -106,6 +111,28 @@ pub(super) fn walker(o: &ObjInfo, what: &str, act: impl Fn(&str) -> String) -> S
         let (sn, fields) = &groups[0];
         let _ = writeln!(s, "  (block entry {} (ret)))", releases(sn, fields, &act));
     }
+    s
+}
+
+/// The walker of an array of counted elements: a loop up, or down for
+/// a drop.
+fn array_walker(mut s: String, o: &ObjInfo, down: bool, act: &impl Fn(&str) -> String) -> String {
+    let sn = &o.sname;
+    let n = format!("(load i64 (getelementptr %struct.{sn} p (i32 0) (i32 {LEN})))");
+    let (start, more, step) = if down {
+        ("last", "(icmp sge i (i64 0))", "(sub i (i64 1))")
+    } else {
+        ("(i64 0)", "(icmp slt i n)", "(add i (i64 1))")
+    };
+    let _ = write!(
+        s,
+        "  (block entry (let ((n {n}) (last (sub n (i64 1)))) (br loop)))
+  (block loop (let ((i (phi i64 (entry {start}) (next i2)))) (br {more} body done)))
+  (block body (let ((e (load ptr (getelementptr %struct.{sn} p (i32 0) (i32 {ELEMS}) i)))) {} (br next)))
+  (block next (let ((i2 {step})) (br loop)))
+  (block done (ret)))\n",
+        act("e")
+    );
     s
 }
 
@@ -156,7 +183,7 @@ mod tests {
                 o.intern(&format!("o.K{i}"), &format!("K{i}"), k);
             }
             let src = format!(
-                "(defstruct fib.typerec (ptr ptr ptr i64))\n(declare fib.release void (ptr))\n{}",
+                "(defstruct fib.typerec (ptr ptr ptr i64 ptr))\n(declare fib.defer void (ptr ptr))\n(declare fib.share-queue void (ptr ptr))\n{}",
                 o.render()
             );
             if let Err(e) = lir::parse_and_check(&src) {
@@ -166,9 +193,13 @@ mod tests {
         };
         let (raw, object) = (render(LirTy::Raw), render(LirTy::Ptr));
         for i in 0..kinds(LirTy::Ptr).len() {
-            let (drop, trace) = (format!("drop.{i}"), format!("trace.{i}"));
+            let (drop, trace, share) = (
+                format!("drop.{i}"),
+                format!("trace.{i}"),
+                format!("share.{i}"),
+            );
             assert!(
-                !function(&raw, &drop).contains("fib.release"),
+                !function(&raw, &drop).contains("fib.defer"),
                 "{}",
                 function(&raw, &drop)
             );
@@ -177,7 +208,13 @@ mod tests {
                 "{}",
                 function(&raw, &trace)
             );
-            assert!(function(&object, &drop).contains("fib.release"));
+            assert!(
+                !function(&raw, &share).contains("fib.share-queue"),
+                "{}",
+                function(&raw, &share)
+            );
+            assert!(function(&object, &share).contains("fib.share-queue"));
+            assert!(function(&object, &drop).contains("fib.defer"));
             assert!(function(&object, &trace).contains("indirect-call"));
         }
     }

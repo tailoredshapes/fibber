@@ -235,7 +235,10 @@ pub fn expected_repeated(run: &Run, times: u64) -> String {
 /// arguments it was given.
 pub fn demo_run(label: &str, run: &Run, text: &str, times: u64) -> (Vec<String>, Output) {
     let k = run.k.expect("the macro has a module");
-    let module = scratch(&format!("{label}-{k}-{}.lir", run.start));
+    // The thread's id keeps two tests that run the same macro at once from
+    // writing, and then removing, one file.
+    let thread = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+    let module = scratch(&format!("{label}-{k}-{}-{thread}.lir", run.start));
     std::fs::write(&module, text).expect("the module text is written");
     let rest = if run.def.rest.is_some() {
         "rest"

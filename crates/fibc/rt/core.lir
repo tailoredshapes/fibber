@@ -18,7 +18,7 @@
 (declare trunc double (double))
 (declare truncf float (float))
 (defstruct fib.hdr (i64 i32 i32))
-(defstruct fib.typerec (ptr ptr ptr i64))
+(defstruct fib.typerec (ptr ptr ptr i64 ptr))
 ;; The prefix every closure object shares: header, code (§8.4).
 (defstruct fib.closure (i64 i32 i32 ptr))
 
@@ -160,9 +160,12 @@
   (block drop (call @fib.drop p) (br done))
   (block done (ret)))
 
-;; §8.2: weak-clear if flagged, the type's drop (releases children),
-;; then free — from 16 bytes before the object in trace mode.
-(define internal (fib.drop void) ((ptr p))
+;; §8.2: the drop of an object whose count reached zero: weak-clear if
+;; flagged, the type's drop (hands the children to the worklist `wl`),
+;; then free, from 16 bytes before the object in trace mode. The drop
+;; never releases a child itself: a chain a million objects long would
+;; otherwise be a recursion a million frames deep (spec/types.md §8.2).
+(define internal (fib.drop-one void) ((ptr wl) (ptr p))
   (block entry
     (let ((f (call @fib.flags p)))
       (br (icmp ne (and f (i32 2)) (i32 0)) weak children)))
@@ -172,7 +175,7 @@
           (rec (getelementptr %struct.fib.typerec @fib.types tid (i32 0))))
       (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain)))
   (block plain
-    (indirect-call (load ptr rec) (fn void (ptr)) p)
+    (indirect-call (load ptr rec) (fn void (ptr ptr)) p wl)
     (call @free p)
     (ret))
   (block traced
@@ -181,8 +184,147 @@
     ;; releases of what the object held).
     (let ((q (getelementptr i8 p (i64 -16))))
       (call @fib.trace-line (i8 70) (load i64 q) (i8 0))
-      (indirect-call (load ptr rec) (fn void (ptr)) p)
+      (indirect-call (load ptr rec) (fn void (ptr ptr)) p wl)
       (call @free q)
+      (ret))))
+
+;; The worklist of a drop: the objects whose release is still to run,
+;; as a stack in the order of the recursion it replaces (the type's drop
+;; pushes its children last to first, so the first is released first and
+;; its whole subtree before the second). Its fields: the buffer, the
+;; number of entries, the capacity, and the inline buffer that a drop
+;; starts with on its own stack frame. It is private to one drop, so
+;; there is no state shared between threads.
+(defstruct fib.wl (ptr i64 i64 ptr))
+
+;; A worklist on the buffer `buf` of `cap` entries.
+(define internal (fib.wl-init void) ((ptr wl) (ptr buf) (i64 cap))
+  (block entry
+    (store buf (getelementptr %struct.fib.wl wl (i32 0) (i32 0)))
+    (store (i64 0) (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))
+    (store cap (getelementptr %struct.fib.wl wl (i32 0) (i32 2)))
+    (store buf (getelementptr %struct.fib.wl wl (i32 0) (i32 3)))
+    (ret)))
+
+;; Doubles the capacity, moving to the heap; the inline buffer is never
+;; freed. A failed malloc is the trap "out of memory".
+(define internal (fib.wl-grow void) ((ptr wl))
+  (block entry
+    (let ((base (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 0))))
+          (len (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1))))
+          (cap (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 2))))
+          (inline (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 3))))
+          (cap2 (mul cap (i64 2)))
+          (bigger (call @malloc (mul cap2 (i64 8)))))
+      (br (icmp eq bigger (ptr null)) oom copy)))
+  (block copy
+    (call @memcpy bigger base (mul len (i64 8)))
+    (store bigger (getelementptr %struct.fib.wl wl (i32 0) (i32 0)))
+    (store cap2 (getelementptr %struct.fib.wl wl (i32 0) (i32 2)))
+    (br (icmp eq base inline) done old))
+  (block old (call @free base) (br done))
+  (block done (ret))
+  (block oom
+    (call @fib.trap-c (string "out of memory"))
+    (unreachable)))
+
+;; Frees the heap buffer, if the worklist moved to one.
+(define internal (fib.wl-free void) ((ptr wl))
+  (block entry
+    (let ((base (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 0))))
+          (inline (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 3)))))
+      (br (icmp eq base inline) done heap)))
+  (block heap (call @free base) (br done))
+  (block done (ret)))
+
+;; Appends p to the worklist, growing it when it is full.
+(define internal (fib.wl-push void) ((ptr wl) (ptr p))
+  (block entry
+    (let ((len (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1))))
+          (cap (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 2)))))
+      (br (icmp eq len cap) grow push)))
+  (block grow (call @fib.wl-grow wl) (br push))
+  (block push
+    (let ((base (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 0))))
+          (n (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))))
+      (store p (getelementptr ptr base n))
+      (store (add n (i64 1)) (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))
+      (ret))))
+
+;; Removes and returns the last entry; the worklist is not empty.
+(define internal (fib.wl-pop ptr) ((ptr wl))
+  (block entry
+    (let ((n1 (sub (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1))) (i64 1)))
+          (base (load ptr (getelementptr %struct.fib.wl wl (i32 0) (i32 0)))))
+      (store n1 (getelementptr %struct.fib.wl wl (i32 0) (i32 1)))
+      (ret (load ptr (getelementptr ptr base n1))))))
+
+(define internal (fib.wl-empty i1) ((ptr wl))
+  (block entry
+    (ret (icmp eq (load i64 (getelementptr %struct.fib.wl wl (i32 0) (i32 1))) (i64 0)))))
+
+;; What a drop does in place of releasing a child: queue it. Null and
+;; the objects no count reaches (IMMORTAL, STACK) are skipped now, as
+;; their flags never change; the count is touched only when the entry
+;; is taken off the worklist, so every release runs in the order the
+;; recursion ran it (the order of the frees in the trace, compiler.md §4).
+(define internal (fib.defer void) ((ptr wl) (ptr p))
+  (block entry (br (icmp eq p (ptr null)) done check))
+  (block check
+    (let ((f (call @fib.flags p)))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done push)))
+  (block push (call @fib.wl-push wl p) (br done))
+  (block done (ret)))
+
+;; fib.release of a queued object (never null, immortal or a stack
+;; object): a count that reaches zero drops it into the same worklist.
+(define internal (fib.release-queued void) ((ptr wl) (ptr p))
+  (block entry
+    (let ((f (call @fib.flags p))
+          (cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
+      (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
+  (block shared
+    (let ((old (atomicrmw sub acq_rel cp (i64 1))))
+      (br (icmp eq old (i64 1)) drop done)))
+  (block local
+    (let ((c (load i64 cp)))
+      (br (icmp eq c (i64 1)) drop dec)))
+  (block dec (store (sub c (i64 1)) cp) (br done))
+  (block drop (call @fib.drop-one wl p) (br done))
+  (block done (ret)))
+
+;; Releases the queued objects, last in first out, until none is left.
+(define internal (fib.drain void) ((ptr wl))
+  (block entry (br loop))
+  (block loop (br (call @fib.wl-empty wl) done pop))
+  (block pop
+    (call @fib.release-queued wl (call @fib.wl-pop wl))
+    (br loop))
+  (block done (ret)))
+
+;; §8.2: the drop of an object whose count reached zero, with every
+;; release it causes: the native stack stays as deep as one drop.
+(define internal (fib.drop void) ((ptr p))
+  (block entry
+    (let ((wl (alloca %struct.fib.wl))
+          (buf (alloca (align 8) i8 (i32 256))))
+      (call @fib.wl-init wl buf (i64 32))
+      (call @fib.drop-one wl p)
+      (call @fib.drain wl)
+      (call @fib.wl-free wl)
+      (ret))))
+
+;; A stack object's scope end (§6.11): its children are released; it
+;; is not freed. The type's drop is slot 0 of the type table.
+(define internal (fib.drop-fields void) ((ptr p))
+  (block entry
+    (let ((wl (alloca %struct.fib.wl))
+          (buf (alloca (align 8) i8 (i32 256)))
+          (rec (getelementptr %struct.fib.typerec @fib.types (call @fib.tid p) (i32 0))))
+      (call @fib.wl-init wl buf (i64 32))
+      (indirect-call (load ptr rec) (fn void (ptr ptr)) p wl)
+      (call @fib.drain wl)
+      (call @fib.wl-free wl)
       (ret))))
 
 ;; §8.2: neither SHARED, IMMORTAL, STACK nor HAS-WEAK, and count 1.

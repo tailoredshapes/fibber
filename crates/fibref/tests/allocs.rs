@@ -95,23 +95,28 @@ fn status(path: &Path) -> Status {
 }
 
 /// The bound as written passes, one below it fails and names the count,
-/// one above it passes: the check fires, and the bound is the count.
+/// one above it passes: the check fires, and the bound is the count. A
+/// case that allocates nothing has no bound below its count (`0 - 1` is
+/// no bound): the lowered half is skipped for it, and the fixtures of
+/// `a_bound_of_zero_...` show that a bound of 0 can fail.
 fn bound_is_exact(path: &Path, label: &str) {
     let n = bound(path);
     assert_eq!(status(path), Status::Pass, "case {label} as written");
-    let (low, dir) = with_bound(path, n - 1, label);
-    let lowered = status(&low);
-    let _ = fs::remove_dir_all(&dir);
-    match lowered {
-        Status::Fail(why) => {
-            for needle in [format!("at most {}", n - 1), format!("allocated {n}")] {
-                assert!(
-                    why.contains(&needle),
-                    "case {label}: {why:?} lacks {needle:?}"
-                );
+    if let Some(below) = n.checked_sub(1) {
+        let (low, dir) = with_bound(path, below, label);
+        let lowered = status(&low);
+        let _ = fs::remove_dir_all(&dir);
+        match lowered {
+            Status::Fail(why) => {
+                for needle in [format!("at most {below}"), format!("allocated {n}")] {
+                    assert!(
+                        why.contains(&needle),
+                        "case {label}: {why:?} lacks {needle:?}"
+                    );
+                }
             }
+            other => panic!("case {label} with the bound {below}: {other:?}"),
         }
-        other => panic!("case {label} with the bound {}: {other:?}", n - 1),
     }
     let (high, dir) = with_bound(path, n + 1, label);
     let raised = status(&high);
@@ -122,6 +127,43 @@ fn bound_is_exact(path: &Path, label: &str) {
         "case {label} with the bound {}",
         n + 1
     );
+}
+
+/// A fixture case of `main`'s source with the bound `<= 0`, written to a
+/// directory of its own, which the caller removes.
+fn zero_bound_fixture(body: &str, tag: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("fibref-allocs-zero-{}-{tag}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let out = dir.join(format!("900-{tag}.fib"));
+    let header = ";; spec:   method.md rule 3\n;; expect: accept\n;; result: 3\n;; audit:  clean\n;; allocs: <= 0\n";
+    fs::write(&out, format!("{header}{body}\n")).expect("write");
+    (out, dir)
+}
+
+/// A bound of 0 is a bound: a case that allocates nothing passes it (so
+/// a case of that kind is not an underflow in `bound_is_exact`), and a
+/// program that allocates one object fails it, naming the count.
+#[test]
+fn a_bound_of_zero_passes_when_nothing_allocates_and_fails_when_something_does() {
+    let (quiet, dir) = zero_bound_fixture("(defun main () -> i64 (+ 1 2))", "nothing");
+    // The same check the library's `count-` cases go through: for a
+    // bound of 0 it has nothing to lower, and must not underflow.
+    bound_is_exact(&quiet, "nothing");
+    let _ = fs::remove_dir_all(&dir);
+    let (loud, dir) = zero_bound_fixture(
+        "(defun main () -> i64 (str-len (str-concat \"ab\" \"c\")))",
+        "one-string",
+    );
+    let loud_status = status(&loud);
+    let _ = fs::remove_dir_all(&dir);
+    match loud_status {
+        Status::Fail(why) => {
+            for needle in ["at most 0", "allocated 1"] {
+                assert!(why.contains(needle), "{why:?} lacks {needle:?}");
+            }
+        }
+        other => panic!("a program that allocates, under the bound 0: {other:?}"),
+    }
 }
 
 #[test]

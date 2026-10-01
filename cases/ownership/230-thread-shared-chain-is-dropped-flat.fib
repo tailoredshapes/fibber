@@ -1,0 +1,24 @@
+;; spec:   types §8.2, §8.8; compiler.md §4; method.md rule 6
+;; expect: accept
+;; result: 299999
+;; audit:  clean
+;; A list of 300000 cells is captured by a spawned task, which reads its
+;; head, and is released after the join. Capture marks the list shared,
+;; so its counts are atomic and the release takes the shared path of the
+;; drop; that path is flat too. The two tools agree on the tally of
+;; objects live at exit and on the allocations (a run with a thread is
+;; compared by tally, compiler.md §4).
+(defun build (n: i64) -> (List i64)
+  (loop ((i 0) (acc (list)))
+    (if (< i n)
+        (recur (+ i 1) (Cons i acc))
+        acc)))
+
+(defun head (l: (List i64)) -> i64
+  (match l
+    ((Cons x _) x)
+    ((Empty) 0)))
+
+(defun main () -> i64
+  (let ((l (build 300000)))
+    (join (spawn (fn () (head l))))))

@@ -85,14 +85,20 @@ impl Reader {
             }
             Val::Ptr(x) => format!("(i64 {x})"),
             Val::Tag(_, i) => format!("(i32 {i})"),
-            Val::None => "(ptr null)".into(),
+            Val::None => match option_payload(p.g(), t).map(|x| option_rep(p.g(), x)) {
+                Some(Ok(OptRep::Boxed)) => defs.emit_object(p, t, Some(0), &[])?,
+                _ => "(ptr null)".into(),
+            },
             Val::Some(inner) => {
                 let payload = option_payload(p.g(), t)
                     .cloned()
                     .ok_or_else(|| Unsupported("some at a non-Option type".into()))?;
                 match option_rep(p.g(), &payload)? {
                     OptRep::Null => self.value(defs, p, it, inner, &payload)?,
-                    OptRep::Boxed => return Err(Unsupported("a def holding a boxed some".into())),
+                    OptRep::Boxed => {
+                        let text = self.value(defs, p, it, inner, &payload)?;
+                        defs.emit_object(p, t, Some(1), &[text])?
+                    }
                 }
             }
             Val::Obj(id) => self.object(defs, p, it, *id, t)?,

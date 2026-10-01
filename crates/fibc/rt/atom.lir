@@ -16,19 +16,37 @@
   (block entry (atomic-store release (i32 0) lockp) (ret)))
 
 ;; §8.8: set SHARED with atomicrmw or, stopping at objects already
-;; SHARED and at IMMORTAL ones, then walk the children.
-(define internal (fib.share void) ((ptr p))
+;; SHARED and at IMMORTAL ones, then walk the children. Each type's share
+;; function (slot 4 of the type table; slot 1, the trace function, calls
+;; a callback and serves the retains of copies) queues the children it
+;; finds on a worklist (core.lir), so that a chain of a million objects
+;; takes no native frame per link. An object is marked when it is queued,
+;; so it is queued once.
+(define internal (fib.share-queue void) ((ptr wl) (ptr p))
   (block entry (br (icmp eq p (ptr null)) done check))
   (block check
     (let ((f (call @fib.flags p)))
       (br (icmp ne (and f (i32 9)) (i32 0)) done mark)))
   (block mark
     (atomicrmw or monotonic (getelementptr %struct.fib.hdr p (i32 0) (i32 2)) (i32 1))
-    (let ((tid (call @fib.tid p))
-          (rec (getelementptr %struct.fib.typerec @fib.types tid (i32 1))))
-      (indirect-call (load ptr rec) (fn void (ptr ptr)) p @fib.share)
-      (br done)))
+    (call @fib.wl-push wl p)
+    (br done))
   (block done (ret)))
+
+(define internal (fib.share void) ((ptr p))
+  (block entry
+    (let ((wl (alloca %struct.fib.wl))
+          (buf (alloca (align 8) i8 (i32 256))))
+      (call @fib.wl-init wl buf (i64 32))
+      (call @fib.share-queue wl p)
+      (br loop)))
+  (block loop (br (call @fib.wl-empty wl) done walk))
+  (block walk
+    (let ((q (call @fib.wl-pop wl))
+          (rec (getelementptr %struct.fib.typerec @fib.types (call @fib.tid q) (i32 4))))
+      (indirect-call (load ptr rec) (fn void (ptr ptr)) q wl)
+      (br loop)))
+  (block done (call @fib.wl-free wl) (ret)))
 
 ;; Share-marks v when the holder h is SHARED (§8.6: a value stored
 ;; into a shared atom is marked before the store).

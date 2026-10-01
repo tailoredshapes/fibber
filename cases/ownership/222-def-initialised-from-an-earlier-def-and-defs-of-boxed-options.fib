@@ -1,0 +1,56 @@
+;; spec:   syntax §3.19; types §8.10; compiler.md §8 item 4; method.md rule 6
+;; expect: accept
+;; result: 8191
+;; audit:  clean
+;; A `def` initialiser may name an earlier `def` (§3.19's grammar: `name`,
+;; "an earlier def"), and a `def` may hold an (Option scalar) or an
+;; (Option (Option T)), `nil` and `some` included: the constants are
+;; heap enums (types §8.1). fibc said `unsupported: a def read before its
+;; value was made` for the first and `unsupported: a def holding a boxed
+;; some` for the second, where the interpreter ran both. Each check is its
+;; own bit: 2^13 - 1 = 8191.
+(defstruct Limits (low: i64 high: i64))
+(defun twice (n: i64) -> i64 (* n 2))
+
+(def limit: i64 1000)
+(def alias: i64 limit)
+(def label: str "abc")
+(def label-again: str label)
+(def table: (Vec i64) [10 20 30])
+(def again: (Vec i64) table)
+(def pair: (Vec i64) [limit 2])
+(def bounds: Limits (Limits 3 limit))
+(def top: Limits bounds)
+(def double-it: (fn (i64) i64) twice)
+(def same-fn: (fn (i64) i64) double-it)
+(def absent: (Option i64) nil)
+(def maybe: (Option i64) (some 9))
+(def maybe-again: (Option i64) maybe)
+(def mixed: (Vec (Option i64)) [(some 1) nil maybe])
+(def hole: (Option (Option i64)) (some nil))
+(def held: (Option (Option i64)) (some maybe))
+(def never: (Option (Option i64)) nil)
+(def cell-ish: (Vec (Option (Option i64))) [never hole held])
+
+(defun bit (c: bool n: i64) -> i64 (if c n 0))
+(defun sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (a 0))
+    (if (< i (count v)) (recur (+ i 1) (+ a (nth v i))) a)))
+(defun opt (o: (Option i64)) -> i64 (match o (nil -1) ((some x) x)))
+(defun deep (o: (Option (Option i64))) -> i64
+  (match o (nil 1) ((some nil) 2) ((some (some x)) (+ 10 x))))
+
+(defun main () -> i64
+  (sum [(bit (= alias 1000) 1)
+        (bit (and (= label-again "abc") (= (nth again 1) 20) (= (count again) 3)) 2)
+        (bit (and (= (nth pair 0) 1000) (= (nth pair 1) 2)) 4)
+        (bit (and (= (. top low) 3) (= (. top high) 1000)) 8)
+        (bit (and (= (same-fn 21) 42) (= (double-it 4) 8)) 16)
+        (bit (= (opt absent) -1) 32)
+        (bit (and (= (opt maybe) 9) (= (opt maybe-again) 9)) 64)
+        (bit (and (= (opt (nth mixed 0)) 1) (= (opt (nth mixed 1)) -1) (= (opt (nth mixed 2)) 9)) 128)
+        (bit (= (deep hole) 2) 256)
+        (bit (= (deep held) 19) 512)
+        (bit (= (deep never) 1) 1024)
+        (bit (and (= (deep (nth cell-ish 0)) 1) (= (deep (nth cell-ish 1)) 2) (= (deep (nth cell-ish 2)) 19)) 2048)
+        (bit (and (nil? absent) (some? maybe) (not (nil? hole))) 4096)]))

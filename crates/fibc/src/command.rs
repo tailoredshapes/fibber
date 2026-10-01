@@ -31,7 +31,8 @@ and -O 2 costs about two and a half times as long to compile as -O 0).
   emit <file>            print the lIR module of file
   explain <file>         print the ownership checker's decisions (types §9)
   itrace <file>          run file in the reference interpreter and print its
-                         canonical trace (compiler.md §4)
+                         canonical trace (compiler.md §4) on standard output;
+                         the result and the audit follow on standard error
   cases [dir [--only prefix..]]
                          run every case in dir (default cases/ownership)
                          interpreted and compiled, and compare (method.md rule 6);

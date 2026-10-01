@@ -1,0 +1,26 @@
+;; spec:   types §6.11, §8.2; compiler.md §4; method.md rule 6
+;; expect: accept
+;; result: 499999
+;; audit:  clean
+;; allocs: <= 500001
+;; A stack object (`Holder`: it never leaves `main`) holds the head of a
+;; list of half a million cells. Its scope's end runs its inline drop,
+;; which releases the list: that path has to be as flat as the drop of a
+;; heap object, or the native stack overflows where the interpreter does
+;; not. (The `S` and `D` lines of the trace are compared like the rest.)
+(defstruct Holder (items: (List i64)))
+
+(defun build (n: i64) -> (List i64)
+  (loop ((i 0) (acc (list)))
+    (if (< i n)
+        (recur (+ i 1) (Cons i acc))
+        acc)))
+
+(defun first-of (h: Holder :borrow) -> i64
+  (match (. h items)
+    ((Cons x _) x)
+    ((Empty) 0)))
+
+(defun main () -> i64
+  (let ((h (Holder (build 500000))))
+    (first-of h)))

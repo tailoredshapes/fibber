@@ -68,3 +68,11 @@ every machine. A subdirectory of a case that holds roots has no
   a struct and its constructor, a protocol and its method and a macro,
   bare through a `:use` and through the alias of a `:require` (716).
 - 016: a module in no root (reject: `module ext.nowhere is not at`).
+- 025: two modules each define types of one name with different layouts
+  (a struct `Pt`, a private struct `Hidden`, a generic struct `(Wrap Pt)`,
+  an enum `Shape`, each with an impl of a protocol `Sz` of one name), and
+  the main module a `Box` beside the prelude's: an object struct and a
+  specialisation carry the defining module's name, as a protocol's
+  symbols do (8191). `fibc` named them by the bare type name: `getelementptr:
+  field index 4 out of range for %struct.o.Pt` and `duplicate definition
+  of @m.Sz.size.Pt`.

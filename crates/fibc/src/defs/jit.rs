@@ -39,8 +39,11 @@ pub fn emit_defs(p: &mut Program<'_>) -> Result<Defs, Unsupported> {
             ),
             None => format!("(define ({entry} void) () (block entry (call @{body}) (ret)))\n"),
         });
+        // Not `fib.init`: it would also read FIB_TRACE, and the objects
+        // a `def` allocates at compile time are not in the trace of the
+        // run (compiler.md §4), whatever the environment says.
         text.push_str(&format!(
-            "(define ({init} void) () (block entry (call @fib.init) (ret)))\n"
+            "(define ({init} void) () (block entry (call @fib.rq-init) (ret)))\n"
         ));
         // The statics a value may point to are `internal`, so each gets
         // an exported getter of its address, for sharing over copying.
@@ -50,11 +53,7 @@ pub fn emit_defs(p: &mut Program<'_>) -> Result<Defs, Unsupported> {
             .chain(p.statics.closure_names().iter())
             .cloned()
             .collect();
-        for (i, name) in known.iter().enumerate() {
-            text.push_str(&format!(
-                "(define (fib.defaddr.{k}.{i} ptr) () (block entry (ret {name})))\n"
-            ));
-        }
+        text.push_str(&address_getters(k, &known));
         let fail = |e: lair::Error| Unsupported(format!("def {k}: {e}"));
         let mut jit = Jit::new(JitOptions::default()).map_err(fail)?;
         jit.add_source(&format!("def.{k}"), &text).map_err(fail)?;
@@ -66,9 +65,22 @@ pub fn emit_defs(p: &mut Program<'_>) -> Result<Defs, Unsupported> {
         };
         let raw = call_entry(&mut jit, &entry, lt)?;
         let value = reader.value(&mut defs, p, raw, &t)?;
+        // The initialisers after this one see the value (syntax §3.19).
+        p.def_values.insert(d, (value.clone(), lt));
         defs.values.insert(d, (value, lt));
     }
     Ok(defs)
+}
+
+/// The exported getter of each static's address (`fib.defaddr.K.I`).
+fn address_getters(k: usize, known: &[String]) -> String {
+    let mut text = String::new();
+    for (i, name) in known.iter().enumerate() {
+        text.push_str(&format!(
+            "(define (fib.defaddr.{k}.{i} ptr) () (block entry (ret {name})))\n"
+        ));
+    }
+    text
 }
 
 /// What a `def`'s entry returned.
@@ -197,14 +209,14 @@ impl Reader {
             (Raw::F64(x), Some(l)) => format!("({} {})", l.text(), crate::lower::float_text(x)),
             (Raw::Ptr(a), Some(LirTy::Ptr)) => {
                 if let Some(payload) = option_payload(p.g(), t).cloned() {
-                    if a == 0 {
-                        return Ok("(ptr null)".into());
-                    }
-                    match option_rep(p.g(), &payload)? {
-                        OptRep::Null => self.object(defs, p, a, &payload)?,
-                        OptRep::Boxed => {
-                            return Err(Unsupported("a def holding a boxed some".into()))
-                        }
+                    match (option_rep(p.g(), &payload)?, a) {
+                        (OptRep::Null, 0) => "(ptr null)".into(),
+                        (OptRep::Null, _) => self.object(defs, p, a, &payload)?,
+                        // A boxed nil may be null (a generic payload gave
+                        // the plan no allocation): the constant is the
+                        // nil object either way, as the interpreter's.
+                        (OptRep::Boxed, 0) => defs.emit_object(p, t, Some(0), &[])?,
+                        (OptRep::Boxed, _) => self.object(defs, p, a, t)?,
                     }
                 } else {
                     self.object(defs, p, a, t)?

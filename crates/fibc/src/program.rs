@@ -276,10 +276,12 @@ impl<'a> Program<'a> {
         self.externs.concat()
     }
 
-    /// `kw.show` and `kw.hash`, switching on the keyword id (types
-    /// §2.12: `show` is `:` and the name, `hash` the FNV-1a of the
-    /// name), when a body needed them; interns the names' strings, so
-    /// this runs before the statics are rendered.
+    /// `kw.show`, `kw.hash` and `kw.rank`, switching on the keyword id
+    /// (types §2.12: `show` is `:` and the name, `hash` the FNV-1a of the
+    /// name, and keywords order by name, as the interpreter's
+    /// `compare` does: `kw.rank` is the keyword's place among the names
+    /// by their bytes), when a body needed them; interns the names'
+    /// strings, so this runs before the statics are rendered.
     pub fn render_keyword_helpers(&mut self) -> String {
         if !self.keyword_helpers {
             return String::new();
@@ -294,9 +296,17 @@ impl<'a> Program<'a> {
             let _ = writeln!(hash, "  (block k{i} (ret (call @fib.str-hash {name})))");
         }
         let cases = cases.join(" ");
+        let mut order: Vec<usize> = (0..self.statics.keywords().len()).collect();
+        let names = self.statics.keywords();
+        order.sort_by(|a, b| names[*a].as_bytes().cmp(names[*b].as_bytes()));
+        let mut rank = String::new();
+        for (r, i) in order.iter().enumerate() {
+            let _ = writeln!(rank, "  (block k{i} (ret (i64 {r})))");
+        }
         format!(
             "(define internal (kw.show ptr) ((i64 k))\n  (block entry (switch k bad {cases}))\n{show}  (block bad (unreachable)))\n\
-             (define internal (kw.hash i64) ((i64 k))\n  (block entry (switch k bad {cases}))\n{hash}  (block bad (unreachable)))\n"
+             (define internal (kw.hash i64) ((i64 k))\n  (block entry (switch k bad {cases}))\n{hash}  (block bad (unreachable)))\n\
+             (define internal (kw.rank i64) ((i64 k))\n  (block entry (switch k bad {cases}))\n{rank}  (block bad (unreachable)))\n"
         )
     }
 

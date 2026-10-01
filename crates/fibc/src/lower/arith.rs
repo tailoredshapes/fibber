@@ -32,10 +32,15 @@ impl<'a> Cx<'_, 'a> {
                 if matches!(tys[0], Ty::Con(Con::Str, _)) {
                     return self.str_compare(method, &x, y.as_ref()).map(Some);
                 }
-                let t = x
-                    .ty()
-                    .ok_or_else(|| Unsupported(format!("{method} on unit")))?;
+                let Some(t) = x.ty() else {
+                    return unit_compare(method).map(Some);
+                };
                 let _ = rt;
+                if let (Ty::Con(Con::Scalar(Scalar::Keyword), _), Some(y)) = (&tys[0], &y) {
+                    if matches!(method, "<" | "<=" | ">" | ">=") {
+                        return self.keyword_order(method, &x, y);
+                    }
+                }
                 match (t, y) {
                     (LirTy::Float | LirTy::Double, Some(y)) => {
                         Ok(Some(self.float_binary(method, &x, &y)))
@@ -50,6 +55,17 @@ impl<'a> Cx<'_, 'a> {
         }
     }
 
+    /// `<` and its fellows on keywords: by name, as the interpreter's,
+    /// where the interned ids only order by first use.
+    fn keyword_order(&mut self, method: &str, x: &V, y: &V) -> R<Option<V>> {
+        self.p.keyword_helpers = true;
+        let rank = |cx: &mut Self, k: &V| {
+            cx.b.val(&format!("(call @kw.rank {})", k.text()), LirTy::I64)
+        };
+        let (a, b) = (rank(self, x), rank(self, y));
+        self.int_binary(method, &a, &b)
+    }
+
     fn str_compare(&mut self, method: &str, x: &V, y: Option<&V>) -> R<V> {
         let y =
             y.ok_or_else(|| Unsupported("a string comparison without its second operand".into()))?;
@@ -57,7 +73,7 @@ impl<'a> Cx<'_, 'a> {
             &format!("(call @fib.str-cmp {} {})", x.text(), y.text()),
             LirTy::I32,
         );
-        let pred = compare_pred(method)?;
+        let pred = compare_pred(method, false)?;
         Ok(self
             .b
             .val(&format!("(icmp {pred} {} (i32 0))", c.text()), LirTy::I1))
@@ -130,7 +146,11 @@ impl<'a> Cx<'_, 'a> {
                 self.b.val(&format!("({op} {a} {})", m.text()), t)
             }
             other => {
-                let pred = compare_pred(other)?;
+                // `false` is below `true`: an `i1` is compared as the
+                // unsigned 0 and 1 it holds, where `slt` would read
+                // `true` as -1. The signed integers and the characters
+                // (code points, never negative) compare signed.
+                let pred = compare_pred(other, t == LirTy::I1)?;
                 self.b.val(&format!("(icmp {pred} {a} {b})"), LirTy::I1)
             }
         }))
@@ -227,14 +247,30 @@ impl<'a> Cx<'_, 'a> {
     }
 }
 
-fn compare_pred(method: &str) -> R<&'static str> {
-    Ok(match method {
-        "=" => "eq",
-        "!=" => "ne",
-        "<" => "slt",
-        "<=" => "sle",
-        ">" => "sgt",
-        ">=" => "sge",
-        other => return Err(Unsupported(format!("native method {other}"))),
+/// A comparison of two units: `unit` has one value, so it equals
+/// itself and is neither below nor above it (types §2.12, the
+/// interpreter's `compare` on `Val::Unit`).
+fn unit_compare(method: &str) -> R<V> {
+    match method {
+        "=" | "<=" | ">=" => Ok(V::int(LirTy::I1, 1)),
+        "!=" | "<" | ">" => Ok(V::int(LirTy::I1, 0)),
+        other => Err(Unsupported(format!("{other} on unit"))),
+    }
+}
+
+/// The `icmp` predicate of a comparison method, unsigned for an `i1`.
+fn compare_pred(method: &str, unsigned: bool) -> R<&'static str> {
+    Ok(match (method, unsigned) {
+        ("=", _) => "eq",
+        ("!=", _) => "ne",
+        ("<", false) => "slt",
+        ("<=", false) => "sle",
+        (">", false) => "sgt",
+        (">=", false) => "sge",
+        ("<", true) => "ult",
+        ("<=", true) => "ule",
+        (">", true) => "ugt",
+        (">=", true) => "uge",
+        (other, _) => return Err(Unsupported(format!("native method {other}"))),
     })
 }

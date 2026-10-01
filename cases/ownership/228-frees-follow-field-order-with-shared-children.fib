@@ -1,0 +1,26 @@
+;; spec:   types §8.2; compiler.md §4 (the trace); method.md rule 6
+;; expect: accept
+;; result: 7
+;; audit:  clean
+;; allocs: <= 4
+;; The order in which a drop frees objects is part of the trace, which
+;; the two tools must agree on line for line. `P` holds a `C1` and then
+;; the `Z` that the `C1` also holds, and the `C1` holds the `Z` before a
+;; `W`. Released in field order, depth first: the `P` is freed, the `C1`
+;; is freed, the `Z` loses one of its two references (not freed), the
+;; `W` is freed, and only then does the `P`'s own reference to the `Z`
+;; go and free it: P, C1, W, Z. A drop that took a child's count down
+;; when it was queued, and not when its turn came, would free the `Z`
+;; before the `W`, and the trace would not match the interpreter's.
+(defstruct Z (v: i64))
+(defstruct W (v: i64))
+(defstruct C1 (z: Z w: W))
+(defstruct P (c: C1 z: Z))
+
+(defun build (n: i64) -> P
+  (let ((z (Z n)))
+    (P (C1 z (W n)) z)))
+
+(defun main () -> i64
+  (let ((p (build 7)))
+    (. (. p z) v)))

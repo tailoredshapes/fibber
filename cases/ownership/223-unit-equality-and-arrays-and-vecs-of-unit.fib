@@ -1,0 +1,65 @@
+;; spec:   types §2.12, §8.3; method.md rule 6 (Eq and Ord on every scalar, `unit` included)
+;; expect: accept
+;; result: 2097151
+;; audit:  clean
+;; `=` and its fellows on `unit` (one value: it equals itself, is neither
+;; below nor above it), directly, through an Eq bound, in a derived Eq and
+;; inside an Option; and arrays and Vecs of `unit`, which have a length
+;; and a slot for every element (an element has no value to store, so
+;; the compiled array keeps the `i1` placeholder a cell of `unit` keeps).
+;; fibc said `unsupported: = on unit` and `unsupported: arrays of unit`,
+;; where the interpreter ran both. Each check is its own bit:
+;; 2^21 - 1 = 2097151.
+(defstruct Tagged (u: unit n: i64))
+(derive Eq Tagged)
+(defenum (Slot a) (Full v: a) (Hole))
+
+(defun same (a: t b: t) :where ((Eq t)) -> bool (= a b))
+(defun bit (c: bool n: i64) -> i64 (if c n 0))
+(defun sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (a 0))
+    (if (< i (count v)) (recur (+ i 1) (+ a (nth v i))) a)))
+(defun units (n: i64) -> (Vec unit)
+  (loop ((i 0) (v (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj v ())) v)))
+(defun nested (n: i64) -> (Vec (Vec unit))
+  (loop ((i 0) (v (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj v (units i))) v)))
+
+(defun main () -> i64
+  (let ((a (array 3 ()))
+        (b (array-with a 1 ()))
+        (c (array-copy a 1 3))
+        (cl (cell (array 4 ())))
+        (u70 (units 70))
+        (nest (nested 40))
+        (held (let ((v (units 5))) (fn () (count v))))
+        (vc (cell (vec-empty)))
+        (m (assoc (map-empty) 1 ())))
+    (do
+      (array-set! &cl 2 ())
+      (let ((alias @cl))
+        (array-set! &cl 3 ())
+        (set! vc (conj @vc ()))
+        (set! vc (conj @vc ()))
+        (sum [(bit (= () ()) 1)
+              (bit (and (not (!= () ())) (<= () ()) (>= () ()) (not (< () ())) (not (> () ()))) 2)
+              (bit (and (same () ()) (same (some ()) (some ())) (not (same (some ()) nil))) 4)
+              (bit (and (= (Tagged () 1) (Tagged () 1)) (not (= (Tagged () 1) (Tagged () 2)))) 8)
+              (bit (and (= (array-len a) 3) (= (array-len b) 3) (= (array-len c) 2) (= (array-len (array 0 ())) 0)) 16)
+              (bit (and (= (array-get a 0) ()) (= (array-get b 2) ()) (= (array-get c 1) ())) 32)
+              (bit (and (= (array-len alias) 4) (= (array-len @cl) 4) (= (array-get @cl 3) ())) 64)
+              (bit (and (= (count (vec-empty)) 0) (= (count (conj (vec-empty) ())) 1)) 128)
+              (bit (and (= (count u70) 70) (= (nth u70 0) ()) (= (nth u70 33) ()) (= (nth u70 69) ())) 256)
+              (bit (= (count (conj u70 ())) 71) 512)
+              (bit (= (count (conj (units 32) ())) 33) 1024)
+              (bit (and (= (count nest) 40) (= (count (nth nest 39)) 39) (= (count (nth nest 33)) 33)) 2048)
+              (bit (= (held) 5) 4096)
+              (bit (= (count @vc) 2) 8192)
+              (bit (= (get m 1) (some ())) 16384)
+              (bit (and (nil? (get m 2)) (= (count (assoc m 7 ())) 2)) 32768)
+              (bit (match (units 4) ([x y & rest] (and (= x ()) (= y ()) (= (count rest) 2))) (_ false)) 65536)
+              (bit (match (Full ()) ((Full u) (= u ())) ((Hole) false)) 131072)
+              (bit (= (count [() () ()]) 3) 262144)
+              (bit (let ((s (array 2 (some ())))) (and (= (array-len s) 2) (= (array-get s 1) (some ())))) 524288)
+              (bit (= (count (units 0)) 0) 1048576)])))))
