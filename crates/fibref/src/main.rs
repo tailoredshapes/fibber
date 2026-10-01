@@ -23,8 +23,11 @@ commands:
   explain <file>  print the ownership checker's decisions for file (types §9)
   run <file>      run file's main with the reference interpreter and print
                   its result and the memory audit (exit 1 if rejected or failed)
-  read <file>..   print the reader's dump of each file (spec/bootstrap.md §2);
-                  exit 1 if any file does not read, 2 if one cannot be read
+  read [--print] <file>..
+                  print the reader's dump of each file (spec/bootstrap.md §2),
+                  or with --print each top-level form as the printer writes
+                  it, one per line; exit 1 if any file does not read, 2 if
+                  one cannot be read
   help            print this message";
 
 /// The directory `cases` runs when none is given.
@@ -39,8 +42,9 @@ enum Command {
     Explain { file: String },
     /// Run a file's `main`.
     Run { file: String, args: Vec<String> },
-    /// Print the reader's dump of each file.
-    Read { files: Vec<String> },
+    /// Print the reader's dump of each file, or (`print`) its forms as
+    /// the printer writes them.
+    Read { files: Vec<String>, print: bool },
     /// Print usage and exit successfully.
     Help,
     /// Print usage and exit with an error: the arguments made no sense.
@@ -63,9 +67,18 @@ fn parse(args: &[String]) -> Command {
             file: file.clone(),
             args: rest.to_vec(),
         },
-        [cmd, files @ ..] if cmd == "read" && !files.is_empty() => Command::Read {
-            files: files.to_vec(),
-        },
+        [cmd, flag, files @ ..] if cmd == "read" && flag == "--print" && !files.is_empty() => {
+            Command::Read {
+                files: files.to_vec(),
+                print: true,
+            }
+        }
+        [cmd, files @ ..] if cmd == "read" && !files.is_empty() && files[0] != "--print" => {
+            Command::Read {
+                files: files.to_vec(),
+                print: false,
+            }
+        }
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
         _ => Command::Invalid,
     }
@@ -158,17 +171,22 @@ fn run_file(file: &str, args: &[String]) -> ExitCode {
     }
 }
 
-/// Prints the reader's dump of each file, headed by `== file`: exit 1 if
-/// a file does not read, 2 if one cannot be read (its dump is the line
+/// Prints the reader's dump of each file, or with `print` its forms as the
+/// printer writes them (`dump::print_source`), headed by `== file`: exit 1
+/// if a file does not read, 2 if one cannot be read (its dump is the line
 /// `unreadable`).
-fn read_files(files: &[String]) -> ExitCode {
+fn read_files(files: &[String], print: bool) -> ExitCode {
     let mut text = String::new();
     let mut status = 0u8;
     for file in files {
         text.push_str(&format!("== {file}\n"));
         match std::fs::read_to_string(file) {
             Ok(source) => {
-                let dump = fibref::dump::dump_source(&source, file);
+                let dump = if print {
+                    fibref::dump::print_source(&source, file)
+                } else {
+                    fibref::dump::dump_source(&source, file)
+                };
                 if dump.starts_with("error ") {
                     status = status.max(1);
                 }
@@ -200,7 +218,7 @@ fn main() -> ExitCode {
         Command::Cases { dir } => run_cases(&dir),
         Command::Explain { file } => run_explain(&file),
         Command::Run { file, args } => run_file(&file, &args),
-        Command::Read { files } => read_files(&files),
+        Command::Read { files, print } => read_files(&files, print),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -280,10 +298,31 @@ mod tests {
         assert_eq!(
             parse(&args(&["read", "a.fib", "b.fib"])),
             Command::Read {
-                files: vec!["a.fib".to_string(), "b.fib".to_string()]
+                files: vec!["a.fib".to_string(), "b.fib".to_string()],
+                print: false
             }
         );
         assert_eq!(parse(&args(&["read"])), Command::Invalid);
+    }
+
+    #[test]
+    fn read_print_is_a_flag_before_the_files() {
+        assert_eq!(
+            parse(&args(&["read", "--print", "a.fib", "b.fib"])),
+            Command::Read {
+                files: vec!["a.fib".to_string(), "b.fib".to_string()],
+                print: true
+            }
+        );
+        // The flag alone names no file; after a file it is a file name.
+        assert_eq!(parse(&args(&["read", "--print"])), Command::Invalid);
+        assert_eq!(
+            parse(&args(&["read", "a.fib", "--print"])),
+            Command::Read {
+                files: vec!["a.fib".to_string(), "--print".to_string()],
+                print: false
+            }
+        );
     }
 
     #[test]

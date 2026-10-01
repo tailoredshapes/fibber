@@ -1,0 +1,69 @@
+;; compiler/syntax/chars.fib: the character classes of syntax §1.1 and
+;; §1.2, as crates/fibref/src/syntax/chars.rs.
+(ns syntax.chars)
+
+;; Whitespace that separates tokens: space, tab, newline (§1.1), and CR
+;; so that CRLF line endings read like LF ones.
+(defun is-space (c: char) -> bool
+  (let ((n (char->i32 c)))
+    (or (= n 32i32) (= n 9i32) (= n 10i32) (= n 13i32))))
+
+;; Rust's char::is_control: the Cc category.
+(defun is-control :private (n: i32) -> bool
+  (or (and (>= n 0i32) (<= n 31i32)) (and (>= n 127i32) (<= n 159i32))))
+
+;; Rust's char::is_whitespace: the White_Space property.
+(defun is-unicode-space :private (n: i32) -> bool
+  (or (and (>= n 9i32) (<= n 13i32))
+      (= n 32i32) (= n 133i32) (= n 160i32) (= n 5760i32)
+      (and (>= n 8192i32) (<= n 8202i32))
+      (= n 8232i32) (= n 8233i32) (= n 8239i32) (= n 8287i32) (= n 12288i32)))
+
+;; Characters rejected outside strings and comments: control characters
+;; and Unicode whitespace other than is-space, and a byte order mark
+;; after the start of the text.
+(defun is-forbidden (c: char) -> bool
+  (let ((n (char->i32 c)))
+    (or (and (or (is-control n) (is-unicode-space n)) (not (is-space c)))
+        (= n 65279i32))))
+
+;; The characters §1.1 excludes from symbols besides whitespace:
+;; ( ) [ ] { } " ; ' ` , @ \
+(defun is-terminating (c: char) -> bool
+  (match c
+    (\( true) (\) true) (\[ true) (\] true) (\{ true) (\} true)
+    (\" true) (\; true) (\' true) (\` true) (\, true) (\@ true) (\\ true)
+    (_ false)))
+
+;; A character that may continue a symbol, keyword or number token.
+(defun is-constituent (c: char) -> bool
+  (and (not (is-space c)) (not (is-terminating c)) (not (is-forbidden c))))
+
+;; §1.2: "a character that can start a form", other than a comma:
+;; anything but whitespace, a closing delimiter, `;`, a forbidden
+;; character or the end.
+(defun starts-form-char (c: (Option char)) -> bool
+  (match c
+    (nil false)
+    ((some ch)
+     (and (not (is-space ch)) (not (is-forbidden ch))
+          (not (match ch (\) true) (\] true) (\} true) (\; true) (_ false)))))))
+
+;; §1.1: `/` once between two non-empty parts, or `/` alone.
+(defun valid-slashes (name: str) -> bool
+  (let ((bs (str-bytes name))
+        (n (array-len bs)))
+    (if (= name "/")
+        true
+        (let ((first (loop ((i 0))
+                       (if (< i n)
+                           (if (= (array-get bs i) 47i8) i (recur (+ i 1)))
+                           -1))))
+          (if (< first 0)
+              true
+              (and (> first 0)
+                   (< first (- n 1))
+                   (loop ((i (+ first 1)))
+                     (if (< i n)
+                         (if (= (array-get bs i) 47i8) false (recur (+ i 1)))
+                         true))))))))

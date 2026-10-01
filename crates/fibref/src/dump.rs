@@ -14,6 +14,9 @@
 //!
 //! An error is one line, `error Kind L:C S..E: message`, where `Kind` is
 //! the variant's name and the message is its `Display`.
+//!
+//! The print mode ([`print_source`]) compares the printer instead of the
+//! positions: one line per top-level form, the text `Display` gives it.
 
 use std::fmt::Write;
 
@@ -25,6 +28,17 @@ use crate::types::ty::Scalar;
 pub fn dump_source(source: &str, file: &str) -> String {
     match read_all(source, file) {
         Ok(forms) => dump_forms(&forms),
+        Err(e) => dump_error(&e),
+    }
+}
+
+/// The printed text of reading `source` as `file`: one line per top-level
+/// form, its `Display` text (which has no line break: strings and
+/// characters escape every one), or the one line of the read error, as in
+/// [`dump_source`].
+pub fn print_source(source: &str, file: &str) -> String {
+    match read_all(source, file) {
+        Ok(forms) => forms.iter().map(|f| format!("{f}\n")).collect(),
         Err(e) => dump_error(&e),
     }
 }
@@ -189,6 +203,29 @@ mod tests {
             d,
             "error IntegerOutOfRange 1:1 0..5: integer literal 300i8 does not fit i8 (-128 to 127)\n"
         );
+    }
+
+    #[test]
+    fn print_source_is_one_line_per_form() {
+        let p = print_source("'x [1 2.50f32 \"a\\tb\"]\n{\\a nil}", "t");
+        assert_eq!(p, "(quote x)\n[1 2.5f32 \"a\\tb\"]\n{\\a nil}\n");
+        assert_eq!(print_source("", "t"), "");
+    }
+
+    #[test]
+    fn print_source_of_an_error_is_the_dump_line() {
+        assert_eq!(print_source("(a", "t"), dump_source("(a", "t"));
+        assert_eq!(
+            print_source("(a", "t"),
+            "error Unclosed 1:1 0..1: unclosed (\n"
+        );
+    }
+
+    #[test]
+    fn print_source_keeps_a_form_with_awkward_text_on_one_line() {
+        // A string with a line break and a forbidden character prints escaped.
+        let p = print_source("\"a\\nb\\u{A0}\\0\" 1e16 0.00001", "t");
+        assert_eq!(p, "\"a\\nb\\u{A0}\\0\"\n1e16\n1e-5\n");
     }
 
     #[test]

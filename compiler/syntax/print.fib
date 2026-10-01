@@ -1,0 +1,177 @@
+;; compiler/syntax/print.fib: the printer, as crates/fibref/src/syntax/print.rs
+;; (Display of Form): text that reads back to an equal form, prefix
+;; lists in their long spelling (`'x` is `(quote x)`), integers with their
+;; suffix unless i64, floats in Rust's Debug layout (shortest digits that
+;; read back to the same value, positional from 1e-4 up to 1e16, else
+;; scientific) with the suffix f32 for an f32 form.
+;;
+;; Rules decided where the Rust printer is silent:
+;;  - A float that is not finite (a hand-built form; the reader never makes
+;;    one) prints as `show` prints it: NaN, inf, -inf, as Rust's Debug does.
+;;  - A form is printed into one (Vec str) of pieces and joined once, so
+;;    printing is linear in the size of the form, not quadratic.
+;;
+;; Floats: `show` (types §2.12) already gives the shortest round-trip
+;; digits, positionally with `.0`. The layout is derived from that text:
+;; the significant digits and the decimal exponent are read off it and laid
+;; out again by Rust's rule (exponent below -4 or at least 16: scientific).
+;; The digits are therefore `show`'s. The interpreter's are Rust's, so the
+;; two printers agree on every value tried; fibc's runtime `show`
+;; (crates/fibc/rt/str.lir, fib.show-fp) takes the first `%.Ne` that reads
+;; back, which differs from Rust's shortest digits on exact ties (printf
+;; rounds to even, Rust up) and where a shorter spelling is not the correctly
+;; rounded one (compiler/tests/reader/print-009-*.fib pins both). Until that
+;; is fixed the compiled printer prints those values with other digits that
+;; still read back to the same float.
+(ns syntax.print (:use syntax.form syntax.chars util.text))
+
+;; n zeros.
+(defun zeros :private (n: i64) -> str
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj acc "0")) (str-join acc))))
+
+;; \u{HEX}, the spelling of a forbidden character, as Rust's `\u{{{:X}}}`.
+(defun unicode-escape :private (n: i32) -> str
+  (str-join ["\\u{" (hex-upper (zext i64 n) 1) "}"]))
+
+;; One character of a string literal.
+(defun str-char :private (c: char) -> str
+  (let ((n (char->i32 c)))
+    (match c
+      (\" "\\\"")
+      (\\ "\\\\")
+      (\newline "\\n")
+      (\tab "\\t")
+      (\return "\\r")
+      (_ (if (= n 0i32)
+             "\\0"
+             (if (is-forbidden c) (unicode-escape n) (char->str c)))))))
+
+(defun str-lit :private (s: str) -> str
+  (let ((cs (str-chars s))
+        (n (count cs)))
+    (loop ((i 0) (acc ["\""]))
+      (if (< i n)
+          (recur (+ i 1) (conj acc (str-char (nth cs i))))
+          (str-join (conj acc "\""))))))
+
+;; A character literal: `\a`, the named ones, `\u{HEX}` when forbidden.
+(defun chr-lit :private (c: char) -> str
+  (match c
+    (\newline "\\newline")
+    (\space "\\space")
+    (\tab "\\tab")
+    (\return "\\return")
+    (_ (if (is-forbidden c)
+           (unicode-escape (char->i32 c))
+           (str-concat "\\" (char->str c))))))
+
+;; The layout of sig, the significant digits (no leading or trailing
+;; zero), whose first digit has decimal exponent exp: Rust's Debug rule.
+(defun layout-digits :private (sig: str exp: i64) -> str
+  (let ((k (str-len sig)))
+    (if (or (< exp -4) (>= exp 16))
+        (str-join [(str-slice sig 0 1)
+                   (if (> k 1) "." "")
+                   (if (> k 1) (str-slice sig 1 k) "")
+                   "e" (show exp)])
+        (if (>= exp 0)
+            (if (<= k (+ exp 1))
+                (str-join [sig (zeros (- (+ exp 1) k)) ".0"])
+                (str-join [(str-slice sig 0 (+ exp 1)) "." (str-slice sig (+ exp 1) k)]))
+            (str-join ["0." (zeros (- (- 0 exp) 1)) sig])))))
+
+;; The index of the first byte of bs that is not '0', or its length.
+(defun first-nonzero :private (bs: (Array i8)) -> i64
+  (let ((n (array-len bs)))
+    (loop ((i 0))
+      (if (and (< i n) (= (array-get bs i) 48i8)) (recur (+ i 1)) i))))
+
+;; One past the index of the last byte of bs that is not '0', or 0.
+(defun end-of-digits :private (bs: (Array i8)) -> i64
+  (loop ((i (array-len bs)))
+    (if (and (> i 0) (= (array-get bs (- i 1)) 48i8)) (recur (- i 1)) i)))
+
+;; The layout of the digits a, of which the first li are before the
+;; decimal point, as the text of a number of the given sign.
+(defun layout-number :private (neg: bool a: str li: i64) -> str
+  (let ((bs (str-bytes a))
+        (z (first-nonzero bs))
+        (e (end-of-digits bs))
+        (sign (if neg "-" "")))
+    (if (>= z e)
+        (str-concat sign "0.0")
+        (str-concat sign (layout-digits (str-slice a z e) (- (- li z) 1))))))
+
+;; True when the bytes of a `show` text are an optional `-`, digits and
+;; at most the one `.`: a finite number.
+(defun finite-text? :private (bs: (Array i8)) -> bool
+  (let ((n (array-len bs)))
+    (and (> n 0)
+         (loop ((i (if (= (array-get bs 0) 45i8) 1 0)))
+           (if (< i n)
+               (let ((b (array-get bs i)))
+                 (if (or (and (>= b 48i8) (<= b 57i8)) (= b 46i8)) (recur (+ i 1)) false))
+               true)))))
+
+;; The index of the first `.` in bs, or its length.
+(defun point-index :private (bs: (Array i8)) -> i64
+  (let ((n (array-len bs)))
+    (loop ((i 0))
+      (if (and (< i n) (!= (array-get bs i) 46i8)) (recur (+ i 1)) i))))
+
+;; Rust's `{:?}` of the float whose `show` text is given.
+(defun debug-layout :private (text: str) -> str
+  (let ((bs (str-bytes text)))
+    (if (finite-text? bs)
+        (let ((n (array-len bs))
+              (neg (= (array-get bs 0) 45i8))
+              (from (if (= (array-get bs 0) 45i8) 1 0))
+              (dot (point-index bs))
+              (whole (str-slice text from dot)))
+          (layout-number neg
+                         (str-concat whole (if (< dot n) (str-slice text (+ dot 1) n) ""))
+                         (str-len whole)))
+        text)))
+
+;; An f32 form holds an f32 value widened to f64: it shows as the f32.
+(defun flt-lit :private (v: f64 w: FltWidth) -> str
+  (match w
+    ((F32) (str-concat (debug-layout (show (fptrunc f32 v))) "f32"))
+    ((F64) (debug-layout (show v)))))
+
+(defun int-lit :private (v: i64 w: IntWidth) -> str
+  (match w
+    ((I64) (show v))
+    (_ (str-concat (show v) (int-width-suffix w)))))
+
+;; acc with the pieces of the items, between open and close, added.
+(defun put-seq :private (acc: (Vec str) open: str items: (Vec Stx) close: str) -> (Vec str)
+  (let ((n (count items)))
+    (loop ((i 0) (a (conj acc open)))
+      (if (< i n)
+          (recur (+ i 1) (put-kind (if (> i 0) (conj a " ") a) (. (nth items i) kind)))
+          (conj a close)))))
+
+;; acc with the pieces of k added.
+(defun put-kind :private (acc: (Vec str) k: StxKind) -> (Vec str)
+  (match k
+    ((SSym name) (conj acc name))
+    ((SKw name) (conj (conj acc ":") name))
+    ((SInt v w) (conj acc (int-lit v w)))
+    ((SFlt v w) (conj acc (flt-lit v w)))
+    ((SStr v) (conj acc (str-lit v)))
+    ((SChr c) (conj acc (chr-lit c)))
+    ((SBool b) (conj acc (show b)))
+    ((SNil) (conj acc "nil"))
+    ((SList items) (put-seq acc "(" items ")"))
+    ((SVec items) (put-seq acc "[" items "]"))
+    ((SMap items) (put-seq acc "{" items "}"))))
+
+;; The text of a form's kind.
+(defun kind-show (k: StxKind) -> str
+  (str-join (put-kind (vec-empty) k)))
+
+;; The text of a form.
+(defun stx-show (s: Stx) -> str
+  (kind-show (. s kind)))

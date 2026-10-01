@@ -1,0 +1,131 @@
+;; compiler/syntax/reader.fib: text to forms (syntax §1), as
+;; crates/fibref/src/syntax/reader.rs over the tokens of syntax.lexer.
+;;
+;; The Rust reader keeps an explicit stack of open frames (a delimiter,
+;; a pending prefix macro, a pending `#_`) and feeds it one token at a
+;; time. This port is the same machine written as recursion: a frame is
+;; a call, so the stack is the call stack, and `depth` is the length the
+;; Rust stack would have. The recursion is bounded by `max-depth`, every
+;; open delimiter, pending prefix and pending `#_` counting one, so no
+;; input makes the native stack deeper than 1000 levels of three calls
+;; (compiled, a nest of 1000 needs under 512 KB of stack; the default
+;; is 8 MB). The errors, and the order they are found in, are the Rust
+;; ones:
+;;
+;; - a token is lexed (its own error first) and then acted on;
+;; - a closing token arriving where a prefix or `#_` is waiting for its
+;;   form is that frame's error (PrefixWithoutForm, DiscardWithoutForm at
+;;   its position), whichever delimiter it is;
+;; - the end of the input is the error of the innermost open frame;
+;; - `TooDeep` is reported at the token that would be the 1001st frame.
+;;
+;; The end of the input is the token `TEof` here where Rust has `None`;
+;; that is the only difference of shape. Where the Rust is silent, this
+;; port decides nothing of its own.
+(ns syntax.reader (:use syntax.pos syntax.form syntax.error syntax.lexer util.result))
+
+;; The deepest nesting the reader accepts.
+(def max-depth: i64 1000)
+
+;; What reading one token's worth of input produced.
+(defenum Item :private
+  (IForm s: Stx)
+  (IDiscarded)
+  (IClose found: Delim pos: Pos)
+  (IEnd))
+
+(defun too-deep :private (pos: Pos) -> ReadError
+  (ReadError (TooDeep max-depth) pos))
+
+;; Reads every top-level form of source, attributing positions to file.
+;; Stops at the first error.
+(defun read-all (source: str file: str) -> (Result (Vec Stx) ReadError)
+  (let ((lx (lexer-new source file)))
+    (loop ((out (vec-empty)))
+      (match (read-item lx 0)
+        ((Err e) (Err e))
+        ((Ok (IForm s)) (recur (conj out s)))
+        ((Ok (IDiscarded)) (recur out))
+        ((Ok (IEnd)) (Ok out))
+        ((Ok (IClose found pos)) (Err (ReadError (UnexpectedClose (delim-close found)) pos)))))))
+
+;; Reads from the next token: a finished form, a discarded one, a closing
+;; delimiter (left to the frame that owns it) or the end. depth is the
+;; number of frames open around the token.
+(defun read-item :private (lx: Lexer depth: i64) -> (Result Item ReadError)
+  (match (next-token lx)
+    ((Err e) (Err e))
+    ((Ok tok)
+     (let ((pos (. tok pos)))
+       (match (. tok kind)
+         ((TEof) (Ok IEnd))
+         ((TClose d) (Ok (IClose d pos)))
+         ((TAtom k) (Ok (IForm (Stx k pos))))
+         (opener (if (>= depth max-depth)
+                     (Err (too-deep pos))
+                     (read-opened lx (+ depth 1) opener pos))))))))
+
+;; The form or discard an opening token starts; depth counts its frame.
+(defun read-opened :private (lx: Lexer depth: i64 tok: TokenKind pos: Pos) -> (Result Item ReadError)
+  (match tok
+    ((TOpen d) (item-of (read-seq lx depth d pos)))
+    ((TPrefix p)
+     (match (read-operand lx depth (ReadError (PrefixWithoutForm (prefix-text p)) pos))
+       ((Err e) (Err e))
+       ((Ok form) (item-of (apply-prefix p pos form)))))
+    (_
+     (match (read-operand lx depth (ReadError DiscardWithoutForm pos))
+       ((Err e) (Err e))
+       ((Ok _) (Ok IDiscarded))))))
+
+(defun item-of :private (r: (Result Stx ReadError)) -> (Result Item ReadError)
+  (match r
+    ((Err e) (Err e))
+    ((Ok s) (Ok (IForm s)))))
+
+;; The one form a prefix or `#_` is waiting for, skipping discarded forms;
+;; a closing delimiter or the end there is unfinished, the frame's error.
+(defun read-operand :private (lx: Lexer depth: i64 unfinished: ReadError) -> (Result Stx ReadError)
+  (match (read-item lx depth)
+    ((Err e) (Err e))
+    ((Ok (IForm s)) (Ok s))
+    ((Ok (IDiscarded)) (read-operand lx depth unfinished))
+    ((Ok _) (Err unfinished))))
+
+;; The forms of a list, vector or map up to its closing delimiter, which
+;; must be d. open is the position of the opening delimiter.
+(defun read-seq :private (lx: Lexer depth: i64 d: Delim open: Pos) -> (Result Stx ReadError)
+  (loop ((items (vec-empty)))
+    (match (read-item lx depth)
+      ((Err e) (Err e))
+      ((Ok (IForm s)) (recur (conj items s)))
+      ((Ok (IDiscarded)) (recur items))
+      ((Ok (IEnd)) (Err (ReadError (Unclosed (delim-open d)) open)))
+      ((Ok (IClose found close))
+       (if (same-delim found d)
+           (build-seq d (pos-through open close) items)
+           (Err (ReadError (MismatchedClose (delim-open d) (. open line) (. open col) (delim-close found))
+                           close)))))))
+
+(defun build-seq :private (d: Delim pos: Pos items: (Vec Stx)) -> (Result Stx ReadError)
+  (match d
+    ((DParen) (Ok (Stx (SList items) pos)))
+    ((DBracket) (Ok (Stx (SVec items) pos)))
+    ((DBrace)
+     (if (= (bit-and (count items) 1) 0)
+         (Ok (Stx (SMap items) pos))
+         (Err (ReadError (OddMapEntries (count items)) pos))))))
+
+;; §1.2: `'x` is `(quote x)`, and so on; `&` requires a symbol. The list
+;; spans from the prefix through the form, its head symbol is the prefix
+;; characters.
+(defun apply-prefix :private (p: Prefix pos: Pos form: Stx) -> (Result Stx ReadError)
+  (let ((whole (pos-through pos (. form pos))))
+    (if (and (in-out? p) (not (is-sym? (. form kind))))
+        (Err (ReadError InOutNotSymbol whole))
+        (Ok (Stx (SList [(Stx (SSym (prefix-head p)) pos) form]) whole)))))
+
+(defun is-sym? :private (k: StxKind) -> bool
+  (match k
+    ((SSym _) true)
+    (_ false)))

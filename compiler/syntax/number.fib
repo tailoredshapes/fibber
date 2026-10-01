@@ -1,0 +1,288 @@
+;; compiler/syntax/number.fib: integer and float literals (syntax §1.1),
+;; as crates/fibref/src/syntax/number.rs, with its grammar:
+;;
+;;   number  ::= -? (0x HEX | 0b BIN) isuffix?
+;;             | -? DEC isuffix?
+;;             | -? DEC (. DEC)? ([eE] [+-]? DEC)? fsuffix?   ; `.` or exponent present
+;;   isuffix ::= i8 | i16 | i32 | i64
+;;   fsuffix ::= f32 | f64
+;;
+;; D is a run of digits of the radix in which `_` may only stand between
+;; two digits. The decisions and their order are the Rust code's; where
+;; fibber has no counterpart, the difference is here:
+;;
+;; - Rust accumulates an integer in a u128 and checks it against the
+;;   width's range. fibber has no i128, so the magnitude is accumulated
+;;   as a NEGATIVE i64 (every magnitude of every width fits that way,
+;;   -2^63 included) and checked against the width's limit at each digit,
+;;   as Java's Long.parseLong does. A digit run that overflows u128, one
+;;   that exceeds i128, and one that exceeds the width all give the same
+;;   IntegerOutOfRange, so this reports exactly what Rust reports.
+;; - Rust calls str::parse::<f64> (or ::<f32>, so there is no double
+;;   rounding) on the clean text `-?int.frac(e sign digits)?`, then
+;;   rejects a result that is not finite. Here libc's strtod / strtof
+;;   read the same clean text, both correctly rounded. Rust's "not a
+;;   float" reason cannot arise on a clean text, so it is not ported.
+;;   NOTE: fibref (the interpreter) has no strtod; a float literal read
+;;   under `fibref run` stops with "extern strtod is not available in the
+;;   reference interpreter". The compiled program is unaffected.
+;; - Every digit is ASCII, so runs are found on the token's bytes and cut
+;;   with byte offsets; any other character ends a run.
+(ns syntax.number (:use syntax.form syntax.error util.result))
+
+;; Parses a token that starts with a digit or with `-` and a digit: an
+;; SInt or SFlt, or the error kind with the text and reason of
+;; number.rs. The error's position is the caller's.
+(defun parse-number (text: str) -> (Result StxKind ErrKind)
+  (let ((bs (str-bytes text))
+        (neg (byte-is? bs 0 45i8))
+        (body (if neg 1 0)))
+    (if (and (byte-is? bs body 48i8) (byte-is? bs (+ body 1) 120i8))
+        (parse-radix text bs neg (+ body 2) 16)
+        (if (and (byte-is? bs body 48i8) (byte-is? bs (+ body 1) 98i8))
+            (parse-radix text bs neg (+ body 2) 2)
+            (parse-decimal text bs neg body)))))
+
+;; ---- scanning ----
+
+(defun byte-is? :private (bs: (Array i8) i: i64 b: i8) -> bool
+  (and (>= i 0) (< i (array-len bs)) (= (array-get bs i) b)))
+
+;; The value of byte b as a digit of radix (2, 10 or 16, ASCII only, as
+;; Rust's char::to_digit), or -1 if it is not one.
+(defun digit-value :private (b: i64 radix: i64) -> i64
+  (let ((v (if (and (>= b 48) (<= b 57))
+               (- b 48)
+               (if (and (>= b 97) (<= b 102))
+                   (- b 87)
+                   (if (and (>= b 65) (<= b 70)) (- b 55) -1)))))
+    (if (< v radix) v -1)))
+
+;; The end of the run of digits of radix and `_` that starts at from.
+(defun run-end :private (bs: (Array i8) from: i64 radix: i64) -> i64
+  (let ((n (array-len bs)))
+    (loop ((i from))
+      (if (and (< i n)
+               (or (= (array-get bs i) 95i8)
+                   (>= (digit-value (zext i64 (array-get bs i)) radix) 0)))
+          (recur (+ i 1))
+          i))))
+
+;; Rust's check_digits on the run bs[from..to]: nil if it is well
+;; formed, else the error.
+(defun check-run :private (text: str bs: (Array i8) from: i64 to: i64) -> (Option ErrKind)
+  (if (or (= from to) (byte-is? bs from 95i8))
+      (some (InvalidNumber text "expected a digit"))
+      (if (or (byte-is? bs (- to 1) 95i8) (has-double-underscore? bs from to))
+          (some (InvalidNumber text "`_` may only stand between two digits"))
+          nil)))
+
+(defun has-double-underscore? :private (bs: (Array i8) from: i64 to: i64) -> bool
+  (loop ((i from))
+    (if (< (+ i 1) to)
+        (if (and (= (array-get bs i) 95i8) (= (array-get bs (+ i 1)) 95i8)) true (recur (+ i 1)))
+        false)))
+
+;; The text of the token from byte from to its end.
+(defun tail-from :private (text: str from: i64) -> str
+  (str-slice text from (str-len text)))
+
+;; The text without its underscores.
+(defun strip-underscores :private (s: str) -> str
+  (let ((bs (str-bytes s))
+        (n (array-len bs)))
+    (loop ((i 0) (from 0) (parts (vec-empty)))
+      (if (< i n)
+          (if (= (array-get bs i) 95i8)
+              (recur (+ i 1) (+ i 1) (conj parts (str-slice s from i)))
+              (recur (+ i 1) from parts))
+          (str-join (conj parts (str-slice s from n)))))))
+
+;; ---- suffixes ----
+
+(defun int-width-of :private (suffix: str) -> (Option IntWidth)
+  (if (= suffix "i8") (some I8)
+      (if (= suffix "i16") (some I16)
+          (if (= suffix "i32") (some I32)
+              (if (= suffix "i64") (some I64) nil)))))
+
+(defun flt-suffix? :private (suffix: str) -> bool
+  (or (= suffix "f32") (= suffix "f64")))
+
+(defun int-suffix :private (text: str suffix: str) -> (Result IntWidth ErrKind)
+  (if (= suffix "")
+      (Ok I64)
+      (match (int-width-of suffix)
+        ((some w) (Ok w))
+        (nil
+         (Err (InvalidNumber text
+                (if (starts-with? suffix "u")
+                    "there are no unsigned types; an integer suffix is i8, i16, i32 or i64"
+                    (if (flt-suffix? suffix)
+                        "a float suffix needs a `.` or an exponent (write 1.0f32)"
+                        "trailing characters are not a width suffix (i8 i16 i32 i64)"))))))))
+
+(defun float-suffix :private (text: str suffix: str) -> (Result FltWidth ErrKind)
+  (if (= suffix "")
+      (Ok F64)
+      (if (= suffix "f32")
+          (Ok F32)
+          (if (= suffix "f64")
+              (Ok F64)
+              (Err (InvalidNumber text
+                     (match (int-width-of suffix)
+                       ((some _) "an integer suffix cannot go on a float literal")
+                       (nil "trailing characters are not a width suffix (f32 f64)"))))))))
+
+;; ---- integers ----
+
+;; 0x and 0b bodies: rest starts at byte from.
+(defun parse-radix :private (text: str bs: (Array i8) neg: bool from: i64 radix: i64) -> (Result StxKind ErrKind)
+  (let ((to (run-end bs from radix)))
+    (match (check-run text bs from to)
+      ((some e) (Err e))
+      (nil
+       (match (int-suffix text (tail-from text to))
+         ((Err e) (Err e))
+         ((Ok width) (make-int text neg (str-slice text from to) radix width)))))))
+
+;; The negative limit the accumulated magnitude may not pass: minus the
+;; width's largest value, or its smallest for a negative literal.
+(defun width-limit :private (w: IntWidth neg: bool) -> i64
+  (match w
+    ((I8) (if neg -128 -127))
+    ((I16) (if neg -32768 -32767))
+    ((I32) (if neg -2147483648 -2147483647))
+    ((I64) (if neg -9223372036854775808 -9223372036854775807))))
+
+;; The magnitude of the digits (underscores skipped) as a negative
+;; number, or nil if it passes limit (a negative number). Nothing here
+;; overflows: acc >= limit / radix before the multiplication, so
+;; acc * radix >= limit, and limit + d is not below the i64 minimum.
+(defun accumulate :private (bs: (Array i8) radix: i64 limit: i64) -> (Option i64)
+  (let ((multmin (/ limit radix))
+        (n (array-len bs)))
+    (loop ((i 0) (acc 0))
+      (if (>= i n)
+          (some acc)
+          (if (= (array-get bs i) 95i8)
+              (recur (+ i 1) acc)
+              (if (< acc multmin)
+                  nil
+                  (let ((d (digit-value (zext i64 (array-get bs i)) radix))
+                        (scaled (* acc radix)))
+                    (if (< scaled (+ limit d))
+                        nil
+                        (recur (+ i 1) (- scaled d))))))))))
+
+(defun make-int :private (text: str neg: bool digits: str radix: i64 width: IntWidth) -> (Result StxKind ErrKind)
+  (match (accumulate (str-bytes digits) radix (width-limit width neg))
+    (nil (Err (IntegerOutOfRange text width)))
+    ((some acc) (Ok (SInt (if neg acc (- 0 acc)) width)))))
+
+;; ---- decimals and floats ----
+
+;; A decimal token cut into its parts, underscores kept in the digits:
+;; the integer digits, the fraction digits if there was a `.`, the
+;; exponent as `e<sign><digits>` without underscores if there was one,
+;; and what follows.
+(defstruct Scan (int-part: str frac: (Option str) exp: (Option str) suffix: str))
+
+(defun parse-decimal :private (text: str bs: (Array i8) neg: bool from: i64) -> (Result StxKind ErrKind)
+  (match (scan-decimal text bs from)
+    ((Err e) (Err e))
+    ((Ok sc)
+     (match (. sc frac)
+       (nil
+        (match (. sc exp)
+          (nil
+           (match (int-suffix text (. sc suffix))
+             ((Err e) (Err e))
+             ((Ok width) (make-int text neg (. sc int-part) 10 width))))
+          ((some _) (parse-float text neg sc))))
+       ((some _) (parse-float text neg sc))))))
+
+(defun scan-decimal :private (text: str bs: (Array i8) from: i64) -> (Result Scan ErrKind)
+  (let ((int-end (run-end bs from 10)))
+    (match (check-run text bs from int-end)
+      ((some e) (Err e))
+      (nil
+       (if (byte-is? bs int-end 46i8)
+           (scan-fraction text bs (str-slice text from int-end) (+ int-end 1))
+           (scan-exponent text bs (str-slice text from int-end) nil int-end))))))
+
+;; The fraction digits start at from, just after the `.`.
+(defun scan-fraction :private (text: str bs: (Array i8) int-part: str from: i64) -> (Result Scan ErrKind)
+  (let ((to (run-end bs from 10)))
+    (match (check-run text bs from to)
+      ((some e) (Err e))
+      (nil (scan-exponent text bs int-part (some (str-slice text from to)) to)))))
+
+;; An exponent (`e` or `E`, an optional sign, digits) at byte at, if
+;; there is one; the suffix is what follows.
+(defun scan-exponent :private (text: str bs: (Array i8) int-part: str frac: (Option str) at: i64) -> (Result Scan ErrKind)
+  (if (or (byte-is? bs at 101i8) (byte-is? bs at 69i8))
+      (let ((signed (or (byte-is? bs (+ at 1) 43i8) (byte-is? bs (+ at 1) 45i8)))
+            (from (+ at (if signed 2 1)))
+            (to (run-end bs from 10)))
+        (match (check-run text bs from to)
+          ((some e) (Err e))
+          (nil
+           (let ((sign (if signed (str-slice text (+ at 1) (+ at 2)) "")))
+             (Ok (Scan int-part frac
+                       (some (str-join ["e" sign (strip-underscores (str-slice text from to))]))
+                       (tail-from text to)))))))
+      (Ok (Scan int-part frac nil (tail-from text at)))))
+
+(defun parse-float :private (text: str neg: bool sc: Scan) -> (Result StxKind ErrKind)
+  (match (float-suffix text (. sc suffix))
+    ((Err e) (Err e))
+    ((Ok width)
+     (make-float text
+                 (str-join [(if neg "-" "")
+                            (strip-underscores (. sc int-part))
+                            "."
+                            (match (. sc frac)
+                              ((some f) (strip-underscores f))
+                              (nil "0"))
+                            (unwrap-or (. sc exp) "")])
+                 width))))
+
+;; The finite f64 or f32 (widened) nearest the clean text, or
+;; FloatOutOfRange when it would be infinite.
+(defun make-float :private (text: str clean: str width: FltWidth) -> (Result StxKind ErrKind)
+  (let ((v (match width
+             ((F64) (read-f64 clean))
+             ((F32) (fpext f64 (read-f32 clean))))))
+    (if (= (- v v) 0.0)
+        (Ok (SFlt v width))
+        (Err (FloatOutOfRange text width)))))
+
+;; ---- libc ----
+
+(extern strtod :private (ptr ptr) -> f64)
+(extern strtof :private (ptr ptr) -> f32)
+
+;; A NUL-terminated copy of s, to be freed by the caller.
+(defun c-string :private (s: str) -> ptr
+  (let ((bs (str-bytes s))
+        (n (array-len bs)))
+    (unsafe
+      (let ((p (alloc (+ n 1))))
+        (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+        (store-i8 (ptr+ p n) 0i8)
+        p))))
+
+(defun read-f64 :private (s: str) -> f64
+  (unsafe
+    (let ((p (c-string s))
+          (e (alloc 8))
+          (r (strtod p e)))
+      (do (free e) (free p) r))))
+
+(defun read-f32 :private (s: str) -> f32
+  (unsafe
+    (let ((p (c-string s))
+          (e (alloc 8))
+          (r (strtof p e)))
+      (do (free e) (free p) r))))

@@ -1,0 +1,90 @@
+;; compiler/syntax/error.fib: read errors, as crates/fibref/src/syntax/error.rs.
+;; Every malformed input is one of these values, with the position of the
+;; offending text; the reader never traps on input.
+(ns syntax.error (:use syntax.pos syntax.form util.text))
+
+;; The variants of ReadErrorKind, with the same names and fields (strings
+;; for the `&'static str` ones, `(Option char)` for UnknownDispatch).
+(defenum ErrKind
+  (UnterminatedString)
+  (BadEscape text: str reason: str)
+  (BadUnicodeEscape text: str reason: str)
+  (BadCharLiteral text: str)
+  (InvalidCharacter c: char)
+  (InvalidNumber text: str reason: str)
+  (IntegerOutOfRange text: str width: IntWidth)
+  (FloatOutOfRange text: str width: FltWidth)
+  (InvalidSymbol text: str)
+  (InvalidKeyword text: str)
+  (UnknownDispatch c: (Option char))
+  (PrefixWithoutForm text: str)
+  (DiscardWithoutForm)
+  (InOutNotSymbol)
+  (Unclosed open: char)
+  (UnexpectedClose found: char)
+  (MismatchedClose open: char open-line: i64 open-col: i64 found: char)
+  (OddMapEntries count: i64)
+  (TooDeep limit: i64))
+
+(defstruct ReadError (kind: ErrKind pos: Pos))
+
+;; The variant's own name: "UnterminatedString", "BadEscape", ...
+(defun err-name (k: ErrKind) -> str
+  (match k
+    ((UnterminatedString) "UnterminatedString")
+    ((BadEscape _ _) "BadEscape")
+    ((BadUnicodeEscape _ _) "BadUnicodeEscape")
+    ((BadCharLiteral _) "BadCharLiteral")
+    ((InvalidCharacter _) "InvalidCharacter")
+    ((InvalidNumber _ _) "InvalidNumber")
+    ((IntegerOutOfRange _ _) "IntegerOutOfRange")
+    ((FloatOutOfRange _ _) "FloatOutOfRange")
+    ((InvalidSymbol _) "InvalidSymbol")
+    ((InvalidKeyword _) "InvalidKeyword")
+    ((UnknownDispatch _) "UnknownDispatch")
+    ((PrefixWithoutForm _) "PrefixWithoutForm")
+    ((DiscardWithoutForm) "DiscardWithoutForm")
+    ((InOutNotSymbol) "InOutNotSymbol")
+    ((Unclosed _) "Unclosed")
+    ((UnexpectedClose _) "UnexpectedClose")
+    ((MismatchedClose _ _ _ _) "MismatchedClose")
+    ((OddMapEntries _) "OddMapEntries")
+    ((TooDeep _) "TooDeep")))
+
+;; The kind's Display text: the message after the position.
+(defun err-message (k: ErrKind) -> str
+  (match k
+    ((UnterminatedString) "unterminated string")
+    ((BadEscape text reason)
+     (str-join ["bad escape " text " in string: " reason]))
+    ((BadUnicodeEscape text reason)
+     (str-join ["bad unicode escape " text ": " reason]))
+    ((BadCharLiteral t)
+     (str-join ["bad character literal " t ": expected \\c for one character, \\newline, \\space, \\tab, \\return or \\u{HHHH}"]))
+    ((InvalidCharacter c)
+     (str-join ["invalid character U+" (hex-upper (zext i64 (char->i32 c)) 4) " outside a string or comment"]))
+    ((InvalidNumber text reason)
+     (str-join ["invalid number " text ": " reason]))
+    ((IntegerOutOfRange text w)
+     (str-join ["integer literal " text " does not fit " (int-width-suffix w) " (" (int-width-range-text w) ")"]))
+    ((FloatOutOfRange text w)
+     (str-join ["float literal " text " is too large for " (flt-width-suffix w)]))
+    ((InvalidSymbol s)
+     (str-join ["invalid symbol " s ": `/` may appear once, between a namespace and a name, or alone"]))
+    ((InvalidKeyword s) (str-join ["invalid keyword " s]))
+    ((UnknownDispatch c)
+     (match c
+       ((some ch) (str-join ["unknown reader syntax #" (char->str ch) ": only #_ is defined"]))
+       (nil "unknown reader syntax # at end of input")))
+    ((PrefixWithoutForm p) (str-join [p " must be followed immediately by a form"]))
+    ((DiscardWithoutForm) "#_ must be followed by a form")
+    ((InOutNotSymbol) "& must be followed by a symbol")
+    ((Unclosed open) (str-join ["unclosed " (char->str open)]))
+    ((UnexpectedClose found) (str-join ["unexpected " (char->str found) " with nothing open"]))
+    ((MismatchedClose open line col found)
+     (str-join [(char->str found) " does not close " (char->str open)
+                " opened at " (show line) ":" (show col)]))
+    ((OddMapEntries count)
+     (str-join ["map literal has " (show count) " forms; keys and values must pair up"]))
+    ((TooDeep limit)
+     (str-join ["forms nested deeper than " (show limit) " levels"]))))

@@ -1,0 +1,102 @@
+;; compiler/syntax/dump.fib: the reader dump of spec/bootstrap.md §2, as
+;; crates/fibref/src/dump.rs: the same text, line for line. Lines are
+;; returned without their newline.
+(ns syntax.dump
+  (:require [syntax.reader :as reader] [syntax.print :as printer])
+  (:use syntax.pos syntax.form syntax.error util.result util.text))
+
+;; "line:col start..end"
+(defun span (p: Pos) -> str
+  (str-join [(show (. p line)) ":" (show (. p col)) " " (show (. p start)) ".." (show (. p end))]))
+
+;; One character of a quoted text: `"`, `\` and the control characters
+;; escaped, every other character as it is.
+(defun quote-char :private (c: char) -> str
+  (let ((n (char->i32 c)))
+    (match c
+      (\" "\\\"")
+      (\\ "\\\\")
+      (\newline "\\n")
+      (\tab "\\t")
+      (\return "\\r")
+      (_ (if (or (< n 32i32) (= n 127i32))
+             (str-concat "\\x" (hex-upper (zext i64 n) 2))
+             (char->str c))))))
+
+(defun quote-text (s: str) -> str
+  (let ((cs (str-chars s))
+        (n (count cs)))
+    (loop ((i 0) (acc ["\""]))
+      (if (< i n)
+          (recur (+ i 1) (conj acc (quote-char (nth cs i))))
+          (str-join (conj acc "\""))))))
+
+(defun indent-of :private (depth: i64) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i depth) (recur (+ i 1) (str-concat acc "  ")) acc)))
+
+;; A float's text as `show` prints it at its width: an f32 form holds an
+;; f32 value widened to f64, which shows as the f32 it is.
+(defun flt-text :private (v: f64 w: FltWidth) -> str
+  (match w
+    ((F32) (show (fptrunc f32 v)))
+    ((F64) (show v))))
+
+;; The lines of s and what it holds, at depth, after acc.
+(defun dump-stx (acc: (Vec str) s: Stx depth: i64) -> (Vec str)
+  (let ((ind (indent-of depth))
+        (at (span (. s pos))))
+    (match (. s kind)
+      ((SSym name) (conj acc (str-join [ind "sym " (quote-text name) " " at])))
+      ((SKw name) (conj acc (str-join [ind "kw " (quote-text name) " " at])))
+      ((SInt v w) (conj acc (str-join [ind "int " (show v) " " (int-width-suffix w) " " at])))
+      ((SFlt v w)
+       (conj acc (str-join [ind "flt " (flt-text v w) " " (flt-width-suffix w) " " at])))
+      ((SStr v) (conj acc (str-join [ind "str " (quote-text v) " " at])))
+      ((SChr c)
+       (conj acc (str-join [ind "chr U+" (hex-upper (zext i64 (char->i32 c)) 4) " " at])))
+      ((SBool b) (conj acc (str-join [ind "bool " (show b) " " at])))
+      ((SNil) (conj acc (str-join [ind "nil " at])))
+      ((SList items) (dump-seq acc "list" items depth ind at))
+      ((SVec items) (dump-seq acc "vec" items depth ind at))
+      ((SMap items) (dump-seq acc "map" items depth ind at)))))
+
+(defun dump-seq :private (acc: (Vec str) tag: str items: (Vec Stx) depth: i64 ind: str at: str) -> (Vec str)
+  (let ((n (count items)))
+    (loop ((i 0) (a (conj acc (str-join [ind tag " " (show n) " " at]))))
+      (if (< i n)
+          (recur (+ i 1) (dump-stx a (nth items i) (+ depth 1)))
+          a))))
+
+(defun dump-forms (forms: (Vec Stx)) -> (Vec str)
+  (let ((n (count forms)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n)
+          (recur (+ i 1) (dump-stx acc (nth forms i) 0))
+          acc))))
+
+;; The one line of a read error: `error Kind L:C S..E: message`.
+(defun dump-error (e: ReadError) -> (Vec str)
+  [(str-join ["error " (err-name (. e kind)) " " (span (. e pos)) ": " (err-message (. e kind))])])
+
+;; The dump of reading source as file: the lines of its forms, or the one
+;; line of its error.
+(defun dump-source (source: str file: str) -> (Vec str)
+  (match (reader/read-all source file)
+    ((Ok forms) (dump-forms forms))
+    ((Err e) (dump-error e))))
+
+;; The printed text of reading source as file: one line per top-level
+;; form, its text as syntax.print writes it, or the one line of the read
+;; error (dump.rs's print_source, for `read --print`).
+(defun print-source (source: str file: str) -> (Vec str)
+  (match (reader/read-all source file)
+    ((Ok forms) (print-forms forms))
+    ((Err e) (dump-error e))))
+
+(defun print-forms :private (forms: (Vec Stx)) -> (Vec str)
+  (let ((n (count forms)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n)
+          (recur (+ i 1) (conj acc (printer/stx-show (nth forms i))))
+          acc))))

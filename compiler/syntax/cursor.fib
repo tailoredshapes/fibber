@@ -1,0 +1,108 @@
+;; compiler/syntax/cursor.fib: a character cursor over the source that
+;; tracks line, column and byte offset, as crates/fibref/src/syntax/cursor.rs
+;; (the representation is documented in syntax.pos). The source is held
+;; once as its bytes; offsets are byte offsets; a character is decoded
+;; from its UTF-8 bytes where the offset stands. The position state is
+;; three cells inside the cursor, which every function takes explicitly.
+(ns syntax.cursor (:use syntax.pos))
+
+(defstruct Cursor
+  (file: str src: str bytes: (Array i8)
+   off: (Cell i64) line: (Cell i64) col: (Cell i64)))
+
+;; A saved cursor location, turned into a Pos once the end is known.
+(defstruct Mark (off: i64 line: i64 col: i64))
+
+(defun byte-at (bs: (Array i8) i: i64) -> i64 (zext i64 (array-get bs i)))
+
+;; The length in bytes of the character whose first byte is b.
+(defun utf8-len (b: i64) -> i64
+  (if (< b 128) 1 (if (< b 224) 2 (if (< b 240) 3 4))))
+
+(defun cont :private (bs: (Array i8) i: i64) -> i64
+  (bit-and (byte-at bs i) 63))
+
+;; The character whose UTF-8 bytes start at byte i (the text is valid).
+(defun decode-at (bs: (Array i8) i: i64) -> char
+  (let ((b (byte-at bs i))
+        (len (utf8-len b)))
+    (i32->char
+      (trunc i32
+        (if (= len 1)
+            b
+            (if (= len 2)
+                (bit-or (shl (bit-and b 31) 6) (cont bs (+ i 1)))
+                (if (= len 3)
+                    (bit-or (shl (bit-and b 15) 12)
+                            (bit-or (shl (cont bs (+ i 1)) 6) (cont bs (+ i 2))))
+                    (bit-or (shl (bit-and b 7) 18)
+                            (bit-or (shl (cont bs (+ i 1)) 12)
+                                    (bit-or (shl (cont bs (+ i 2)) 6) (cont bs (+ i 3))))))))))))
+
+;; A cursor at the start of src, past a leading byte order mark.
+(defun cursor-new (src: str file: str) -> Cursor
+  (let ((bytes (str-bytes src))
+        (bom (and (>= (array-len bytes) 3)
+                  (= (byte-at bytes 0) 239) (= (byte-at bytes 1) 187) (= (byte-at bytes 2) 191))))
+    (Cursor file src bytes (cell (if bom 3 0)) (cell 1) (cell 1))))
+
+;; The next character, not consumed.
+(defun cursor-peek (c: Cursor) -> (Option char)
+  (let ((off @(. c off)))
+    (if (< off (array-len (. c bytes)))
+        (some (decode-at (. c bytes) off))
+        nil)))
+
+;; The character n places ahead (0 is cursor-peek).
+(defun cursor-peek-nth (c: Cursor n: i64) -> (Option char)
+  (let ((bs (. c bytes)))
+    (loop ((off @(. c off)) (k n))
+      (if (>= off (array-len bs))
+          nil
+          (if (= k 0)
+              (some (decode-at bs off))
+              (recur (+ off (utf8-len (byte-at bs off))) (- k 1)))))))
+
+;; The byte offset of the next character.
+(defun cursor-offset (c: Cursor) -> i64 @(. c off))
+
+;; The length of the source in bytes.
+(defun cursor-len (c: Cursor) -> i64 (array-len (. c bytes)))
+
+;; The source bytes from..to as text (both on character boundaries).
+(defun cursor-slice (c: Cursor from: i64 to: i64) -> str
+  (str-slice (. c src) from to))
+
+;; The byte at offset i of the source, 0 to 255.
+(defun cursor-byte (c: Cursor i: i64) -> i64 (byte-at (. c bytes) i))
+
+;; Consumes and returns the next character.
+(defun cursor-bump (c: Cursor) -> (Option char)
+  (match (cursor-peek c)
+    (nil nil)
+    ((some ch)
+     (do (set! (. c off) (+ @(. c off) (utf8-len (byte-at (. c bytes) @(. c off)))))
+         (if (= (char->i32 ch) 10i32)
+             (do (set! (. c line) (+ @(. c line) 1))
+                 (set! (. c col) 1))
+             (set! (. c col) (+ @(. c col) 1)))
+         (some ch)))))
+
+;; Consumes characters while keep holds.
+(defun cursor-bump-while (c: Cursor keep: (fn (char) bool) :borrow) -> unit
+  (loop ()
+    (match (cursor-peek c)
+      (nil ())
+      ((some ch) (if (keep ch) (do (cursor-bump c) (recur)) ())))))
+
+;; The current location.
+(defun cursor-mark (c: Cursor) -> Mark
+  (Mark @(. c off) @(. c line) @(. c col)))
+
+;; The position from mark to the current location.
+(defun cursor-pos-from (c: Cursor m: Mark) -> Pos
+  (Pos (. c file) (. m line) (. m col) (. m off) @(. c off)))
+
+;; The source text from mark to the current location.
+(defun cursor-text-from (c: Cursor m: Mark) -> str
+  (str-slice (. c src) (. m off) @(. c off)))

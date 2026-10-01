@@ -1,0 +1,57 @@
+;; compiler/read.fib: the reader tool, as `fibref read`: prints the
+;; reader dump of each file named on the command line, headed by
+;; `== file`. With `--print` as the first argument it prints instead,
+;; under the same header, each top-level form as the printer writes it,
+;; one per line (`--print` anywhere else is a file name). With no file
+;; it prints a usage line to stderr and exits 2.
+;;
+;; Exit status: 0 if every file read, 1 if one did not read, 2 if one
+;; could not be read at all (its dump is the line `unreadable`) or no
+;; file was named. Stage 2's reader is correct when this prints what
+;; `fibref read` prints (crates/fibc/tests/bootstrap.rs).
+(ns main (:require [syntax.dump :as dump]))
+
+;; The lines of one file's output and the status it adds.
+(defstruct Dumped (lines: (Vec str) status: i64))
+
+;; The lines of the file at path: its dump, or, when printing, the text
+;; of its forms. A read error is one line starting `error `.
+(defun dump-file (path: str printing: bool) -> Dumped
+  (match (read-file path)
+    (nil (Dumped ["unreadable"] 2))
+    ((some source)
+     (let ((lines (if printing (dump/print-source source path) (dump/dump-source source path))))
+       (Dumped lines (if (and (> (count lines) 0) (starts-with? (nth lines 0) "error ")) 1 0))))))
+
+(defun append-all (acc: (Vec str) more: (Vec str)) -> (Vec str)
+  (loop ((i 0) (a acc))
+    (if (< i (count more)) (recur (+ i 1) (conj a (nth more i))) a)))
+
+;; The lines with a newline between each pair, as the parts of one string.
+(defun join-lines (lines: (Vec str)) -> (Vec str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count lines))
+        (recur (+ i 1) (conj (if (> i 0) (conj acc "\n") acc) (nth lines i)))
+        acc)))
+
+(defun max-status (a: i64 b: i64) -> i64 (if (> a b) a b))
+
+;; Prints the output of the files from index first on; returns the status.
+(defun read-files (files: (Vec str) first: i64 printing: bool) -> i64
+  (loop ((i first) (lines (vec-empty)) (status 0))
+    (if (< i (count files))
+        (let ((path (nth files i))
+              (d (dump-file path printing)))
+          (recur (+ i 1)
+                 (append-all (conj lines (str-concat "== " path)) (. d lines))
+                 (max-status status (. d status))))
+        (do (println (str-join (join-lines lines)))
+            status))))
+
+(defun main () -> i64
+  (let ((all (args))
+        (printing (and (> (count all) 0) (= (nth all 0) "--print")))
+        (first (if printing 1 0)))
+    (if (> (count all) first)
+        (read-files all first printing)
+        (do (eprintln "usage: read [--print] FILE..") 2))))

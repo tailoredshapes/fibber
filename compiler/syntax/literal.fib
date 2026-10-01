@@ -1,0 +1,194 @@
+;; compiler/syntax/literal.fib: string and character literals (syntax
+;; §1.1), as crates/fibref/src/syntax/literal.rs.
+;;
+;; Strings: any characters up to the closing `"` (raw newlines kept byte
+;; for byte, so a CRLF stays `\r\n`), with the escapes `\n \t \r \0 \\ \"
+;; \xNN \u{H..}`; `\xNN` is at most 7F and `\u{..}` takes one to six hex
+;; digits naming a Unicode scalar value. Characters: `\` and one
+;; character taken literally, a constituent run being one of the names
+;; `newline space tab return` or one character; `\u{..}` as in strings.
+;;
+;; Every error's position runs from a mark to wherever the cursor stands
+;; when the error is built, and the marks and the order of consuming are
+;; those of the Rust functions: the error branches are the same ones, the
+;; cursor stands in the same place in each.
+;;
+;; Where the Rust is silent: a string is built from the slices of the
+;; source between escapes plus one piece per decoded escape, joined once,
+;; so a long string costs linear time. `\u{..}` with a value that is not
+;; a scalar returns the error here before `i32->char` could trap.
+(ns syntax.literal (:use syntax.pos syntax.form syntax.error syntax.cursor syntax.chars util.result))
+
+;; The error of kind from mark to the cursor.
+(defun err-at :private (cur: Cursor mark: Mark kind: ErrKind) -> ReadError
+  (ReadError kind (cursor-pos-from cur mark)))
+
+(defun bad-escape :private (cur: Cursor mark: Mark reason: str) -> ReadError
+  (err-at cur mark (BadEscape (cursor-text-from cur mark) reason)))
+
+(defun bad-unicode :private (cur: Cursor mark: Mark reason: str) -> ReadError
+  (err-at cur mark (BadUnicodeEscape (cursor-text-from cur mark) reason)))
+
+(defun bad-char :private (cur: Cursor mark: Mark) -> ReadError
+  (err-at cur mark (BadCharLiteral (cursor-text-from cur mark))))
+
+;; True when the next character is c.
+(defun next-is :private (cur: Cursor c: char) -> bool
+  (match (cursor-peek cur)
+    (nil false)
+    ((some x) (= x c))))
+
+;; The value of an ASCII hex digit, or -1 (Rust's to_digit(16)).
+(defun hex-digit :private (c: char) -> i64
+  (let ((n (zext i64 (char->i32 c))))
+    (if (and (>= n 48) (<= n 57))
+        (- n 48)
+        (if (and (>= n 97) (<= n 102))
+            (- n 87)
+            (if (and (>= n 65) (<= n 70)) (- n 55) -1)))))
+
+(defun is-hex-digit :private (c: char) -> bool (>= (hex-digit c) 0))
+
+;; The value of the next character as a hex digit, or -1.
+(defun peek-hex :private (cur: Cursor) -> i64
+  (match (cursor-peek cur)
+    (nil -1)
+    ((some c) (hex-digit c))))
+
+;; The value of text, all ASCII hex digits and at most six of them.
+(defun hex-value :private (digits: str) -> i64
+  (let ((cs (str-chars digits))
+        (n (str-len digits)))
+    (loop ((i 0) (v 0))
+      (if (< i n)
+          (recur (+ i 1) (+ (* v 16) (hex-digit (nth cs i))))
+          v))))
+
+;; `\xNN` after the `x`: exactly two hex digits, at most 7F.
+(defun lex-hex-escape :private (cur: Cursor mark: Mark) -> (Result char ReadError)
+  (loop ((k 0) (value 0))
+    (if (< k 2)
+        (let ((d (peek-hex cur)))
+          (if (< d 0)
+              (Err (bad-escape cur mark "\\x takes exactly two hex digits"))
+              (do (cursor-bump cur) (recur (+ k 1) (+ (* value 16) d)))))
+        (if (<= value 127)
+            (Ok (i32->char (trunc i32 value)))
+            (Err (bad-escape cur mark "\\xNN must be at most 7F, one ASCII byte; write \\u{...} for other characters"))))))
+
+;; The scalar value of the digits of `\u{H..}`, read and closed.
+(defun unicode-scalar :private (cur: Cursor mark: Mark digits: str) -> (Result char ReadError)
+  (let ((n (str-len digits)))
+    (if (or (= n 0) (> n 6))
+        (Err (bad-unicode cur mark "expected one to six hex digits"))
+        (let ((v (hex-value digits)))
+          (if (or (> v 1114111) (and (>= v 55296) (<= v 57343)))
+              (Err (bad-unicode cur mark "not a Unicode scalar value (a surrogate, or above 10FFFF)"))
+              (Ok (i32->char (trunc i32 v))))))))
+
+;; `\u{H..}` after the `u`: one to six hex digits naming a scalar value.
+(defun lex-unicode :private (cur: Cursor mark: Mark) -> (Result char ReadError)
+  (if (not (next-is cur \{))
+      (Err (bad-unicode cur mark "expected { after \\u"))
+      (do (cursor-bump cur)
+          (let ((digits-mark (cursor-mark cur)))
+            (do (cursor-bump-while cur is-hex-digit)
+                (let ((digits (cursor-text-from cur digits-mark)))
+                  (if (not (next-is cur \}))
+                      (Err (bad-unicode cur mark "expected hex digits and a closing }"))
+                      (do (cursor-bump cur)
+                          (unicode-scalar cur mark digits)))))))))
+
+(defun some-char :private (r: (Result char ReadError)) -> (Result (Option char) ReadError)
+  (match r
+    ((Ok c) (Ok (some c)))
+    ((Err e) (Err e))))
+
+(defun chr-kind :private (r: (Result char ReadError)) -> (Result StxKind ReadError)
+  (match r
+    ((Ok c) (Ok (SChr c)))
+    ((Err e) (Err e))))
+
+;; One escape, the cursor on the `\`; none when the input ends right
+;; after the `\` (the caller then finds the string unterminated).
+(defun lex-escape :private (cur: Cursor) -> (Result (Option char) ReadError)
+  (let ((mark (cursor-mark cur)))
+    (do (cursor-bump cur)
+        (match (cursor-bump cur)
+          (nil (Ok nil))
+          ((some \n) (Ok (some \newline)))
+          ((some \t) (Ok (some \tab)))
+          ((some \r) (Ok (some \return)))
+          ((some \0) (Ok (some (i32->char 0i32))))
+          ((some \\) (Ok (some \\)))
+          ((some \") (Ok (some \")))
+          ((some \x) (some-char (lex-hex-escape cur mark)))
+          ((some \u) (some-char (lex-unicode cur mark)))
+          (_ (Err (bad-escape cur mark "the escapes are \\n \\t \\r \\0 \\\\ \\\" \\xNN \\u{HHHH}")))))))
+
+;; pieces with the source text from offset from up to the cursor added.
+(defun add-run :private (pieces: (Vec str) cur: Cursor from: i64) -> (Vec str)
+  (if (< from (cursor-offset cur))
+      (conj pieces (cursor-slice cur from (cursor-offset cur)))
+      pieces))
+
+(defun add-char :private (pieces: (Vec str) c: (Option char)) -> (Vec str)
+  (match c
+    (nil pieces)
+    ((some ch) (conj pieces (char->str ch)))))
+
+;; The characters of a string after its opening quote, to the closing one.
+(defun string-body :private (cur: Cursor start: Mark) -> (Result StxKind ReadError)
+  (loop ((pieces (vec-empty)) (run (cursor-offset cur)))
+    (match (cursor-peek cur)
+      (nil (Err (err-at cur start UnterminatedString)))
+      ((some \")
+       (let ((done (add-run pieces cur run)))
+         (do (cursor-bump cur) (Ok (SStr (str-join done))))))
+      ((some \\)
+       (let ((before (add-run pieces cur run)))
+         (match (lex-escape cur)
+           ((Err e) (Err e))
+           ((Ok decoded) (recur (add-char before decoded) (cursor-offset cur))))))
+      ((some _) (do (cursor-bump cur) (recur pieces run))))))
+
+;; Reads a string literal; the cursor is on the opening `"`.
+(defun lex-string (cur: Cursor) -> (Result StxKind ReadError)
+  (let ((start (cursor-mark cur)))
+    (do (cursor-bump cur) (string-body cur start))))
+
+;; The constituent run after `\c` (c already consumed, a constituent):
+;; one of the four names, or c alone.
+(defun char-name :private (cur: Cursor mark: Mark c: char) -> (Result StxKind ReadError)
+  (let ((after-c (cursor-offset cur)))
+    (do (cursor-bump-while cur is-constituent)
+        (match (cursor-slice cur (+ (. mark off) 1) (cursor-offset cur))
+          ("newline" (Ok (SChr \newline)))
+          ("space" (Ok (SChr \space)))
+          ("tab" (Ok (SChr \tab)))
+          ("return" (Ok (SChr \return)))
+          (_ (if (= (cursor-offset cur) after-c)
+                 (Ok (SChr c))
+                 (Err (bad-char cur mark))))))))
+
+;; The literal whose first character after the `\` was c, now consumed.
+(defun char-after :private (cur: Cursor mark: Mark c: char) -> (Result StxKind ReadError)
+  (if (is-space c)
+      (Err (bad-char cur mark))
+      (if (and (= c \u) (next-is cur \{))
+          (chr-kind (lex-unicode cur mark))
+          (if (is-constituent c)
+              (char-name cur mark c)
+              (Ok (SChr c))))))
+
+;; Reads a character literal; the cursor is on the `\`.
+(defun lex-char (cur: Cursor) -> (Result StxKind ReadError)
+  (let ((mark (cursor-mark cur)))
+    (do (cursor-bump cur)
+        (match (cursor-peek cur)
+          (nil (Err (bad-char cur mark)))
+          ((some c)
+           (if (is-forbidden c)
+               (let ((at (cursor-mark cur)))
+                 (do (cursor-bump cur) (Err (err-at cur at (InvalidCharacter c)))))
+               (do (cursor-bump cur) (char-after cur mark c))))))))

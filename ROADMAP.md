@@ -215,6 +215,20 @@ interpreted and compiled:
    suite and for the compiler itself, and the stage-3 compiler passes
    every case with a clean audit.
 
+State (spec/bootstrap.md, **Proposed**; `compiler/`):
+
+- [x] step 1, the reader: `compiler/syntax/*.fib` reads text to `Stx`
+      (a form with its position) and prints it; `compiler/read.fib`
+      prints the same dump as `fibref read`, byte for byte, in dump and
+      `--print` mode over every `.fib` of the repo, ~980 edge inputs,
+      417 Unicode-class inputs and 300 generated ones
+      (`cargo test -p fibc --test bootstrap`). A review by mutation
+      (1797 mutants) found the gaps in that test; their killing inputs
+      are `compiler/tests/reader/rmut-*`. It found and fixed four
+      stage-1 bugs (spec/bootstrap.md §4)
+- [ ] a second mutation round against the print mode, not yet run
+- [ ] step 2, the expander; then types, ownership, the lIR emitter
+
 `lair` (lIR to native, via LLVM) stays in Rust, as LLVM stays in C++.
 
 ## Decisions

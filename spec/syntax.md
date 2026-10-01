@@ -136,6 +136,36 @@ position, is it a vector pattern.
 types §1). `-> T` after a parameter list annotates the result. Both are
 optional everywhere except where types §3.8 says they are required.
 
+### 1.6 What the reader decides where §1 is silent (**Proposed**)
+
+The reference reader (`crates/fibref/src/syntax/`, each choice pinned by
+a test there) and the self-hosted one (`compiler/syntax/`, which reads
+the same text the same way, `spec/bootstrap.md`) decide these points,
+which the rules above leave open:
+
+- A carriage return is whitespace, and `\r\n` ends one line; a lone
+  `\r` does not end a line or a `;` comment. A byte order mark is
+  skipped at offset 0 and is an error anywhere else.
+- A control character, and any Unicode white space other than space,
+  tab, line feed and carriage return, is an error outside a string and a
+  comment (it would otherwise be an invisible symbol constituent).
+- `'` and `` ` `` may be separated from their form by whitespace and
+  comments; `@`, `&`, `,` and `,@` must touch theirs. `&` not followed
+  by a form is the symbol `&`; `&` applied to anything but a symbol is
+  a read error. A run of commas followed by a form is that many nested
+  unquotes.
+- Hexadecimal and binary literals are values, so `0xFFi8` is out of
+  range; `_` may only stand between two digits; `1f32` is invalid (a
+  float needs a `.` or an exponent); a float that overflows its width
+  is an error and one that underflows rounds.
+- `\xNN` is at most `7F` (a string is UTF-8); `\u{..}` takes one to six
+  hex digits naming a Unicode scalar value; after `\` in a character
+  literal a character that cannot continue a symbol is the character
+  itself, otherwise the whole run must be one character or one of
+  `newline`, `space`, `tab`, `return`.
+- Forms nest at most 1000 deep, counting every open delimiter, every
+  pending prefix and every pending `#_`; deeper is a read error.
+
 ---
 
 ## 2. Programs, expressions, evaluation order
