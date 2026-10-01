@@ -13,15 +13,23 @@
 //! same); `error` (non-empty text the compile error must contain,
 //! required for `reject`, forbidden otherwise); `trap` (non-empty text
 //! the run-time trap must contain, required for `trap`, forbidden
-//! otherwise). Anything else is a [`HeaderError`] naming the file and
-//! line; parsing never panics.
+//! otherwise); `allocs` (`<= N`, `N` a non-negative integer; optional,
+//! `accept` only): the most heap objects the run may allocate, counted
+//! as the `A` lines of the free trace (`spec/compiler.md` §4); `roots`
+//! (optional, any verdict): library directories, separated by white
+//! space and relative to the case file's directory, that the case is run
+//! with as `-I` flags are (`cases/modules/README.md`, [`case_roots`]).
+//! Anything else is a [`HeaderError`] naming the file and line; parsing
+//! never panics.
 
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The keys a header may contain, in the order the README lists them.
-const KEYS: [&str; 6] = ["spec", "expect", "result", "audit", "error", "trap"];
+const KEYS: [&str; 8] = [
+    "spec", "expect", "result", "audit", "allocs", "roots", "error", "trap",
+];
 
 /// The value `main` is expected to return. Only integers exist today;
 /// other kinds are added here as the language grows.
@@ -60,10 +68,12 @@ impl fmt::Display for AuditExpect {
 /// The verdict a case header fixes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Must compile, run, return `result` and finish with `audit`.
+    /// Must compile, run, return `result` and finish with `audit`,
+    /// allocating at most `allocs` heap objects when that is given.
     Accept {
         result: Expected,
         audit: AuditExpect,
+        allocs: Option<u64>,
     },
     /// Must fail to compile with an error containing `error`.
     Reject { error: String },
@@ -197,6 +207,16 @@ fn collect<'a>(path: &'a Path, source: &'a str) -> Result<Fields<'a>, HeaderErro
     Ok(Fields { path, fields, end })
 }
 
+/// The maximum in an `allocs` value: `<=`, then a non-negative integer
+/// written in decimal digits (so no sign, no `<` or `=`, nothing after).
+fn allocs_maximum(value: &str) -> Option<u64> {
+    let digits = value.strip_prefix("<=")?.trim_start();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 impl<'a> Fields<'a> {
     fn error(&self, line: usize, kind: HeaderErrorKind) -> HeaderError {
         HeaderError {
@@ -247,15 +267,24 @@ impl<'a> Fields<'a> {
             "leak-cycle" => Some(AuditExpect::LeakCycle),
             _ => None,
         })?;
+        let allocs = match self.get("allocs") {
+            Some(_) => Some(self.parsed("allocs", allocs_maximum)?),
+            None => None,
+        };
         self.forbidden("error")?;
         self.forbidden("trap")?;
-        Ok(Verdict::Accept { result, audit })
+        Ok(Verdict::Accept {
+            result,
+            audit,
+            allocs,
+        })
     }
 
     fn reject(&self) -> Result<Verdict, HeaderError> {
         let error = self.parsed("error", |v| (!v.is_empty()).then(|| v.to_string()))?;
         self.forbidden("result")?;
         self.forbidden("audit")?;
+        self.forbidden("allocs")?;
         self.forbidden("trap")?;
         Ok(Verdict::Reject { error })
     }
@@ -264,6 +293,7 @@ impl<'a> Fields<'a> {
         let trap = self.parsed("trap", |v| (!v.is_empty()).then(|| v.to_string()))?;
         self.forbidden("result")?;
         self.forbidden("audit")?;
+        self.forbidden("allocs")?;
         self.forbidden("error")?;
         Ok(Verdict::Trap { trap })
     }
@@ -297,6 +327,33 @@ pub fn read_header(path: &Path) -> Result<Header, HeaderError> {
         kind: HeaderErrorKind::Unreadable(e.to_string()),
     })?;
     parse_header(path, &source)
+}
+
+/// The library directories the header of `source` (read from `path`)
+/// names with `roots`, in order, each joined to the directory of `path`
+/// (an absolute one stays as it is); none when the key is absent. These
+/// are the roots both harnesses run the case with, `-I` for `-I`
+/// (spec/compiler.md §1). A key with no directory is a bad value.
+pub fn case_roots(path: &Path, source: &str) -> Result<Vec<PathBuf>, HeaderError> {
+    let fields = collect(path, source)?;
+    let Some(field) = fields.get("roots") else {
+        return Ok(Vec::new());
+    };
+    let base = path.parent().unwrap_or(Path::new(""));
+    let dirs: Vec<PathBuf> = field
+        .value
+        .split_whitespace()
+        .map(|d| base.join(d))
+        .collect();
+    if dirs.is_empty() {
+        let value = field.value.to_string();
+        let kind = HeaderErrorKind::BadValue {
+            key: "roots",
+            value,
+        };
+        return Err(fields.error(field.line, kind));
+    }
+    Ok(dirs)
 }
 
 #[cfg(test)]

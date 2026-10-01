@@ -11,7 +11,7 @@ use super::call::Target;
 use super::{Cx, R};
 use crate::compile::Unsupported;
 use crate::ir::{LirTy, V};
-use crate::names::mangle;
+use crate::names::{mangle, proto_qualified};
 
 impl<'a> Cx<'_, 'a> {
     /// `(dyn P e)`: the value with the vtable of `(P, head type of e)`,
@@ -39,7 +39,7 @@ impl<'a> Cx<'_, 'a> {
     /// then one per supertrait in the order of the transitive closure.
     fn vtable_for(&mut self, p: ProtoId, head: &Ty) -> R<String> {
         let g = self.p.g();
-        let name = format!("{}.vt.{}", g.proto(p).name, mangle(g, head));
+        let name = format!("{}.vt.{}", proto_qualified(g, p), mangle(g, head));
         if self.p.statics.has_vtable(&name) {
             return Ok(self.p.statics.vtable(&name, Vec::new()));
         }
@@ -78,7 +78,12 @@ impl<'a> Cx<'_, 'a> {
         let g = self.p.g();
         let proto = g.proto(p);
         let md = &proto.methods[i];
-        let name = format!("m.{}.{}.{}", proto.name, md.name, mangle(g, head));
+        let name = format!(
+            "m.{}.{}.{}",
+            proto_qualified(g, p),
+            md.name,
+            mangle(g, head)
+        );
         if self.p.has_helper(&name) {
             return Ok(name);
         }

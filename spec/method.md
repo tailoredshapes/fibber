@@ -22,7 +22,18 @@ rests on anyone's word, including the author's.
    expected verdict in its header before the rules that decide it are
    final:
    - `accept`: must type-check, run, produce the stated result, and
-     finish with a clean memory audit.
+     finish with a clean memory audit. A header may add `allocs: <= N`:
+     the run allocates at most `N` heap objects, the `A` lines of its
+     free trace (compiler.md §4). `fibref cases` counts them in the
+     interpreter's trace and `fibc cases` in the `FIB_TRACE=1` trace of
+     the compiled run; the two traces are the same lines, so the counts
+     are the same, except in a threaded run, where the compiled program
+     may allocate more. More than `N` is a failure, never pending, and
+     so is an evaluator that gives no count: a bound nobody checked
+     would pass whatever the program did. A `<=` fails only when the
+     count goes up, so a bound is worth having when `N` is the count,
+     and a case that claims that has a test that lowers `N` by one and
+     requires the failure.
    - `reject`: must fail to compile, with an error containing the
      stated text.
    - `trap`: must type-check and pass the ownership checker, then

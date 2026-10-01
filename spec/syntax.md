@@ -1077,6 +1077,14 @@ Quasiquote is rewritten by the expander, not evaluated:
 `[ ... ]  `{ ... }   ⟹ the same with Vec / Map
 ```
 
+The rewrite's heads are the prelude's, written `fib.prelude/List`,
+`fib.prelude/Vec`, `fib.prelude/Map` and `fib.prelude/concat` as the
+literals of §1.4 write theirs, so that a program's or a library's own
+`concat`, or an enum with a variant named `List`, is not what a template
+is built with (**Proposed**, stdlib design §7 B2; case 012 of
+`cases/modules`). `` `() `` is `(List (concat))`, the empty list, which
+both tools expand.
+
 `(gensym "prefix")` returns a fresh `Sym` that cannot collide with any
 source symbol. There is no automatic hygiene (**Decided**: renaming
 hygiene is a much larger expander, and `gensym` covers the cases).
@@ -1187,7 +1195,11 @@ variants, with gensyms for the pattern variables:
   inner match enumerates the variants of `y` in order, so no `_` clause
   is needed; `<=`, `>`, `>=` follow from `<` and `=`.
 - `Hash`: combines the variant's index with the hashes of its fields,
-  as the struct derive combines its fields' hashes.
+  as the struct derive combines its fields' hashes: each step is the
+  prelude's `(hash-combine h x)`, called as `fib.prelude/hash-combine`
+  so that a binding of the name in the program cannot capture it, from
+  the seed `h` of the variant's index (0 for a struct); see types
+  §2.12.
 - `Show`: the variant name followed by the shown fields, as a call form.
 
 The inner matches enumerate the variants, so the expansion is
@@ -1515,7 +1527,7 @@ or uses `conj`, which shares structure with the previous version (§5).
 
 ```
 (ns name clause*)
-clause ::= (:require [name :as alias]+) | (:use name+)
+clause ::= (:require [name :as alias]+) | (:use name+) | (:export-from name+)
 ```
 
 One `ns` form, first in the file, names the module (dotted; `a.b` lives
@@ -1523,7 +1535,29 @@ at `a/b.fib` under a root given to the compiler). `:require` makes
 `alias/x` refer to `x` in that module; `:use` brings all of a module's
 exported top-level names in unqualified. A name defined locally shadows a
 `:use`d one; two `:use`d modules exporting the same name make that name
-an error when referenced unqualified.
+an error when referenced unqualified. The prelude is not counted as a
+second `:use`: a `:use`d module's name shadows the prelude's, as a local
+definition does.
+
+**Roots and re-exports** (**Proposed**, stdlib design §6.2, §7 E7). A
+*root* is a directory under which a module `a.b` is the file `a/b.fib`.
+A module is looked for in the directory of the main file, then in each
+library root in order: first each `-I DIR` of the command line
+(compiler.md §1) in the order given, then each directory of the
+environment variable `FIB_LIB`, then the library that the executable
+carries (the modules of the repository's `lib/` other than the prelude,
+which every executable has). The first place that has the file wins and
+the others are not read: a program's module shadows a library module of
+the same name, and a module found in two roots is the first one's. A
+module found in no place is an error that names the file it was expected
+at and the others it was looked for in.
+`(:export-from m ..)` is a `:use` that is also an export: the module
+exports what the modules named export, as if it had defined them (their
+`:private` definitions are not exported), so that one name, `fib.coll`, can
+stand for several files. Two modules re-exported under one name make that
+name an error where it is referenced unqualified, as two `:use`s do, and the
+same definition re-exported by two modules is one name. The modules a
+`:export-from` names are required, so they may not require the module back.
 
 **Private names** (**Decided**, owner, 2026-09-28; replaces "every
 top-level definition is exported, no private names in v1"). The keyword
@@ -1576,8 +1610,9 @@ its helpers free to change, and `var` is visible in the text wherever
 it is used. A macro defined in the module that uses it needs neither.
 
 The reference implementation loads a program's modules from the main
-file's directory, `a.b` at `a/b.fib`, once each in dependency order
-(M5; `cases/modules`), and checks every rule above between them and
+file's directory and then the library roots above, `a.b` at `a/b.fib`,
+once each in dependency order (M5; `cases/modules`, whose README says how
+a case names its roots), and checks every rule above between them and
 with the prelude: a reference to a private definition, unqualified or
 qualified, reflection on a private type, and `(var m/x)` (cases 113 to
 116 for the prelude, cases/modules for other modules), macros
@@ -1586,6 +1621,15 @@ unqualified and the ones that `:require` it through the alias, and a
 `:private` macro its own module only. Requires may not be cyclic.
 `fib.prelude` is implicitly `:use`d. Protocol implementations are global
 facts and are always visible once their module is required.
+
+A protocol belongs to its module like any other definition, and so do its
+methods: two modules may each define a protocol of one name with methods of
+one name (case 008), and a program's own protocol `Collection` with a method
+`conj`, implemented for `(Vec a)`, shadows the prelude's for a bare `conj`
+while the literal `[1 2 3]` and `fib.prelude/conj` stay the prelude's
+(case 007, **Proposed**, stdlib design §7 B3). A compiler names a method's
+code and a protocol's vtables with the defining module, so that two such
+protocols cannot be taken for one (compiler.md §2).
 
 A module compiles against the **interfaces** of its requires and never
 re-infers a dependency: every exported function's generalised type

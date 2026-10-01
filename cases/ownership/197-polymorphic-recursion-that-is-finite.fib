@@ -1,0 +1,22 @@
+;; spec:   types §3.6; stdlib design §7 B4
+;; expect: accept
+;; result: 20
+;; audit:  clean
+;; Polymorphic recursion stays where it is finite (case 196 rejects the
+;; kind that is not): f calls itself at a different type for x, (Vec b)
+;; for a, but b is fed back as b, so the instances are (i64, i64) and
+;; ((Vec i64), i64) and no more; swap-rec calls itself with its two
+;; variables exchanged, two instances, whichever way round it began. Both
+;; tools run it: f 1 5 3 is 3 steps and the size of 5, 8; swap-rec 10 [1 2]
+;; 5 is five exchanges, so x is [1 2] and y is 10 at the end: 12.
+(defprotocol Sz (size (self) -> i64))
+(impl Sz i64 (size (self) self))
+(impl Sz (Vec a) (size (self) (count self)))
+
+(defun f (x: a y: b n: i64) :where ((Sz b)) -> i64
+  (if (= n 0) (size y) (+ 1 (f [y] y (- n 1)))))
+
+(defun swap-rec (x: a y: b n: i64) :where ((Sz a) (Sz b)) -> i64
+  (if (= n 0) (+ (size x) (size y)) (swap-rec y x (- n 1))))
+
+(defun main () -> i64 (+ (f 1 5 3) (swap-rec 10 [1 2] 5)))

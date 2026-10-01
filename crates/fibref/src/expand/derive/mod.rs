@@ -16,9 +16,14 @@
 //!   b a))`, `(> a b)` is `(< b a)`, `(>= a b)` is `(not (< a b))`, the
 //!   built-in `Ord`'s defaults written out (types §2.12); the instance
 //!   needs an `Eq` instance of `Name`, `Ord`'s supertrait (types §4.1);
-//! - `Hash`: `h := seed; h := (+ (* h 31) (hash field))` for each field
-//!   in order, the seed being the variant index for an enum and `0` for
-//!   a struct (a struct is its one variant);
+//! - `Hash`: `h := seed; h := (hash-combine h (hash field))` for each
+//!   field in order, the seed being the variant index for an enum and
+//!   `0` for a struct (a struct is its one variant); `hash-combine` is
+//!   the prelude's rotate-and-xor mixer, built from `shl`, `shr`,
+//!   `bit-or` and `bit-xor`, none of which traps (the `h*31 + x` this
+//!   replaced trapped on integer overflow at two strings); it is
+//!   written `fib.prelude/hash-combine` so that a binding of the name
+//!   in the program cannot capture it;
 //! - `Show`: `"(Name f1 f2)"` built with `str-concat` from `(show f)`;
 //!   a field-less variant shows as its bare name, as it is written in
 //!   an expression (§3.9).
@@ -32,6 +37,10 @@ use super::build::{boolean, call, check_arity, int, keyword, list, string, sym};
 use super::ctx::ExpandCtx;
 use super::error::{ExpandError, ExpandErrorKind};
 use super::types::mentions;
+
+/// The prelude's mixer, qualified so that no binding of the program's
+/// can shadow it (as the collection literals' heads are, §1.4).
+const HASH_COMBINE: &str = "fib.prelude/hash-combine";
 
 /// A derivable protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,12 +187,12 @@ fn lex_less(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
     acc.unwrap_or_else(|| boolean(false, pos))
 }
 
-/// `h := seed; h := (+ (* h 31) (hash f))` for each field.
+/// `h := seed; h := (hash-combine h (hash f))` for each field.
 fn combine(seed: i64, fields: Vec<Form>, pos: &Pos) -> Form {
     let mut acc = int(seed, pos);
     for f in fields {
-        let scaled = call("*", vec![acc, int(31, pos)], pos);
-        acc = call("+", vec![scaled, call("hash", vec![f], pos)], pos);
+        let hashed = call("hash", vec![f], pos);
+        acc = call(HASH_COMBINE, vec![acc, hashed], pos);
     }
     acc
 }

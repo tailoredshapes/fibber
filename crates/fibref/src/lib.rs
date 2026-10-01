@@ -13,9 +13,11 @@ pub mod cmdline;
 pub mod dump;
 pub mod eval;
 pub mod expand;
+pub mod expand_dump;
 pub mod heap;
 pub mod modules;
 pub mod own;
+pub mod roots;
 pub mod syntax;
 pub mod types;
 

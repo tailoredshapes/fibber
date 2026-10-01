@@ -49,3 +49,76 @@ fn jit_expansions_equal_the_interpreters() {
     assert!(compared > 0, "no case defines a macro");
     eprintln!("compared {compared} expansions");
 }
+
+/// The expanded modules of the program whose main file is `main` with the
+/// interpreter's evaluator or the JIT's runner, as the expansion dump
+/// prints them (every position of every node).
+fn expand_modules(main: &Path, jit: bool) -> Result<String, String> {
+    let source = std::fs::read_to_string(main).map_err(|e| e.to_string())?;
+    let file = main.to_string_lossy();
+    let loaded = fibref::modules::load(&source, &file)?;
+    let mut ctx = ExpandCtx::new();
+    let prelude = prelude_forms(&mut ctx)?;
+    let all: Vec<Form> = loaded.iter().flat_map(|l| l.forms.clone()).collect();
+    let files: Vec<String> = loaded.iter().map(|l| l.file.clone()).collect();
+    let modules = if jit {
+        let mut runner = JitRunner::new(prelude).map_err(|u| u.0)?;
+        fibref::modules::expand_all(loaded, &mut ctx, &mut runner)
+    } else {
+        let mut runner = MacroEvaluator::new(&all, prelude);
+        fibref::modules::expand_all(loaded, &mut ctx, &mut runner)
+    }
+    .map_err(|e| e.to_string())?;
+    let dumps = modules
+        .iter()
+        .zip(&files)
+        .map(|((_, forms), f)| format!("-- {f}\n{}", fibref::dump::dump_forms_in(forms, f)));
+    Ok(dumps.collect())
+}
+
+/// The first line at which two expansions differ, each side quoted.
+fn first_difference(a: &Result<String, String>, b: &Result<String, String>) -> String {
+    let (Ok(x), Ok(y)) = (a, b) else {
+        return format!("  interpreter: {a:?}\n  jit:         {b:?}");
+    };
+    let (mut xs, mut ys) = (x.lines(), y.lines());
+    let mut n = 0;
+    loop {
+        n += 1;
+        match (xs.next(), ys.next()) {
+            (Some(p), Some(q)) if p == q => {}
+            (p, q) => return format!("  line {n}\n  interpreter: {p:?}\n  jit:         {q:?}"),
+        }
+    }
+}
+
+/// **Known to fail** (syntax §1.3, spec/bootstrap.md §4 and §5.7): the
+/// interpreter's evaluator gives a form a macro took from its arguments
+/// the position it had (`int 5 i64 12:13 437..438`), and `JitRunner` gives
+/// every node of a result the position of the call (`12:6 430..439`:
+/// `fns.to_form(result, &pos)`), so the two expansions differ in the
+/// position of what the macro was given, in three of the module cases.
+/// `jit_expansions_equal_the_interpreters` cannot see it: `Form` equality
+/// ignores positions.
+#[test]
+#[ignore = "a divergence in positions between JitRunner and the interpreter, reported, not fixed"]
+fn jit_and_interpreter_expand_the_module_cases_alike_at_every_position() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cases/modules");
+    let mut mains: Vec<_> = std::fs::read_dir(&dir)
+        .expect("cases/modules readable")
+        .flatten()
+        .map(|e| e.path().join("main.fib"))
+        .filter(|p| p.is_file())
+        .collect();
+    mains.sort();
+    let mut bad = Vec::new();
+    for main in &mains {
+        let (a, b) = (expand_modules(main, false), expand_modules(main, true));
+        if a != b {
+            bad.push(format!("{}:\n{}", main.display(), first_difference(&a, &b)));
+        }
+    }
+    assert!(bad.is_empty(), "expansions differ:\n{}", bad.join("\n"));
+    assert!(mains.len() >= 6, "{} module cases", mains.len());
+    eprintln!("compared {} module programs", mains.len());
+}

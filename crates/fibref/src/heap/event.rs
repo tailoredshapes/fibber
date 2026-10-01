@@ -87,3 +87,26 @@ impl Event {
         Some(id)
     }
 }
+
+/// The events of `events` that the free trace is made of
+/// (`spec/compiler.md` §4): those after the last `Immortalised`. What
+/// happens before it is the evaluation of the `def`s (syntax §3.19),
+/// whose objects the compiled program holds as static data, so neither
+/// side traces it.
+pub fn traced(events: &[Event]) -> &[Event] {
+    let start = events
+        .iter()
+        .rposition(|e| matches!(e, Event::Immortalised { .. }))
+        .map_or(0, |i| i + 1);
+    &events[start..]
+}
+
+/// The number of heap objects the run allocated: the `A` lines of its
+/// free trace (`spec/compiler.md` §4), which the case header key
+/// `allocs` bounds. A stack object (`S` line) is not one.
+pub fn trace_allocs(events: &[Event]) -> u64 {
+    traced(events)
+        .iter()
+        .filter(|e| matches!(e, Event::Alloc { .. }))
+        .count() as u64
+}

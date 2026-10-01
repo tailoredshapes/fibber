@@ -1,0 +1,65 @@
+;; spec:   types §2.12 (hash), syntax §3.16 (derive); stdlib design 2.7 and E10
+;; expect: accept
+;; result: 2047
+;; audit:  clean
+;; The prelude's `hash-combine`, which `derive Hash` and the Hash instances
+;; of Option and List fold their fields with. It replaced `h*31 + x`, which
+;; trapped on integer overflow as soon as two hashes were as large as a
+;; string's (cases 199, 200). It is built from shl, shr, bit-or and bit-xor,
+;; which do not trap: an input at either end of the i64 range must not.
+;; The expected values are not this implementation's output: they are what
+;; an independent Python transcription of the definition in lib/prelude.fib
+;; (rotate h left by 7, xor x, xor 0x9e3779b97f4a7c15, then the eight
+;; xorshift steps r36 l11 r15 l23 r2 l31 r39 l15) and of FNV-1a over the
+;; bytes (types §2.12) gives. The result has bit k set when probe k holds,
+;; so all eleven give 2^11 - 1 = 2047 and a probe that fails lowers it.
+;;   0..3 four ordinary inputs, 4 the largest i64 as h, 5 the smallest as
+;;   both arguments, 6 order: folding 1 then 2 is not folding 2 then 1,
+;;   7 a run of zero hashes changes with its length (0, 00 and 000 differ),
+;;   8 fourteen strings folded with their FNV-1a hashes, the case the old
+;;   combiner could not do past the second,
+;;   9 diffusion: flipping any one bit of x, or of h, changes at least 27
+;;   bits of the result (the mixer is linear over the bits, so what a flip
+;;   does to the result does not depend on the other inputs, and 27 is the
+;;   least over the 128 single-bit flips), 10 and always changes one of
+;;   the low five bits, which the first level of a Map's trie reads.
+(defun bit (k: i64 ok: bool) -> i64 (if ok (shl 1 k) 0))
+
+(defun fold-words (words: (Vec str)) -> i64
+  (loop ((i 0) (h 0))
+    (if (< i (count words))
+        (recur (+ i 1) (hash-combine h (hash (nth words i))))
+        h)))
+
+(defun flips (b: i64) -> (Vec i64)
+  (let ((base (hash-combine 0 0)))
+    [(bit-xor (hash-combine 0 (shl 1 b)) base)
+     (bit-xor (hash-combine (shl 1 b) 0) base)]))
+
+;; Whether every one of the 128 single-bit flips satisfies ok.
+(defun every-flip (ok: (fn (i64) bool)) -> bool
+  (loop ((b 0))
+    (if (= b 64)
+        true
+        (let ((d (flips b)))
+          (if (and (ok (nth d 0)) (ok (nth d 1))) (recur (+ b 1)) false)))))
+
+(defun main () -> i64
+  (let ((words ["alpha" "bravo" "charlie" "delta" "echo" "foxtrot" "golf"
+                "hotel" "india" "juliet" "kilo" "lima" "mike" "november"])
+        (lo -9223372036854775808))
+    (+ (bit 0 (= (hash-combine 0 0) 3586121663886595427))
+    (+ (bit 1 (= (hash-combine 1 2) 6884267090522850522))
+    (+ (bit 2 (= (hash-combine -1 5) -5184333529689177187))
+    (+ (bit 3 (= (hash-combine 123456789 -7) 3665516966997782734))
+    (+ (bit 4 (= (hash-combine 9223372036854775807 0) -8908110562667773076))
+    (+ (bit 5 (= (hash-combine lo lo) 308915620595379072))
+    (+ (bit 6 (!= (hash-combine (hash-combine 0 1) 2) (hash-combine (hash-combine 0 2) 1)))
+    (+ (bit 7 (and (!= (hash-combine 0 0) (hash-combine (hash-combine 0 0) 0))
+                   (and (!= (hash-combine (hash-combine 0 0) 0)
+                            (hash-combine (hash-combine (hash-combine 0 0) 0) 0))
+                        (!= (hash-combine 0 0)
+                            (hash-combine (hash-combine (hash-combine 0 0) 0) 0)))))
+    (+ (bit 8 (= (fold-words words) -8725242650154927767))
+    (+ (bit 9 (every-flip (fn (d) (>= (popcount d) 27))))
+       (bit 10 (every-flip (fn (d) (!= (bit-and d 31) 0))))))))))))))))

@@ -25,6 +25,19 @@
 (defun some? (o) (match o (nil false) ((some _) true)))
 (defun unwrap-or (o d) (match o ((some x) x) (nil d)))
 
+;; hash-combine folds the hash x of the next field into the running hash h
+;; (derive Hash and the derived Option and List use it): rotate h left by 7,
+;; xor in x and a constant, then eight invertible xorshift steps, a positive
+;; amount shl and a negative one shr. Only shl, shr, bit-or and bit-xor,
+;; which never trap: the h*31 + x it replaced trapped at two strings. Case
+;; 198 tests it against an independent transcription (types §2.12).
+(defun hash-xorshift :private (m: i64 s: i64) -> i64
+  (if (> s 0) (bit-xor m (shl m s)) (bit-xor m (shr m (- 0 s)))))
+(defun hash-combine (h: i64 x: i64) -> i64
+  (let ((m (bit-xor (bit-xor (bit-or (shl h 7) (shr h 57)) x) -7046029254386353131))
+        (a (hash-xorshift (hash-xorshift (hash-xorshift (hash-xorshift m -36) 11) -15) 23)))
+    (hash-xorshift (hash-xorshift (hash-xorshift (hash-xorshift a -2) 31) -39) 15)))
+
 ;; Protocols (syntax §4.5)
 (defprotocol Countable (count (self) -> i64))
 (defprotocol (Indexable s e) (nth (self i: i64) -> e))

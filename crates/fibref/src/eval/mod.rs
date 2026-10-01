@@ -67,6 +67,7 @@ pub use error::{RunError, RunErrorKind, R};
 pub use interp::{Interp, MACRO_STACK_BUDGET, STACK_BUDGET};
 pub use macros::MacroEvaluator;
 pub use pipeline::{
-    run_checked, run_checked_with, run_source, run_source_with, summary, Interpreter, STACK_BYTES,
+    run_checked, run_checked_with, run_source, run_source_in, run_source_with, summary,
+    Interpreter, STACK_BYTES,
 };
 pub use value::Val;

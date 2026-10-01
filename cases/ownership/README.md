@@ -7,11 +7,24 @@ Each file starts with a header that fixes the expected verdict:
 ;; expect: accept | reject | trap
 ;; result: value main returns (accept only)
 ;; audit:  clean | leak-cycle (accept only)
+;; allocs: <= N   at most N heap objects allocated (accept only, optional)
 ;; error:  text the compile error must contain (reject only)
 ;; trap:   text the run-time trap must contain (trap only)
 ```
 
 `accept` cases must also pass the memory audit (spec/method.md, rule 2).
+`allocs: <= N` bounds the heap objects the run allocates (rule 3): the
+`A` lines of the free trace (spec/compiler.md §4), counted by `fibref
+cases` in the interpreter's trace and by `fibc cases` in the compiled
+run's `FIB_TRACE=1` trace. `N` is a non-negative integer in decimal
+digits after `<=`; any other value is a header error. A count over `N`
+is a failure, not pending. The objects a `def` allocates are not in the
+trace (the compiled program holds a `def`'s value as static data), so a
+case that wants a large input without its building cost counted
+puts it in a `def`; stack objects (`S` lines) are not heap objects. To
+find the count of a program, `fibc itrace FILE | grep -c '^A '` (the
+interpreter's) or `FIB_TRACE=1` through `fibc run --trace FILE 2>&1 >/dev/null
+| grep -c '^A '` (the compiled run's).
 `trap` cases must type-check and pass the ownership checker, then trap
 at run time with a message containing the `trap` text. A trap aborts
 the program (spec/types.md §2.11), so the objects live at it are not
@@ -28,7 +41,7 @@ Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
 Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109,
 112, 113, 114, 118, 119, 121, 123, 125, 126, 127, 138, 139, 142, 144,
-145, 146 and 147 must be rejected; 101 to 104 must trap; 15
+145, 146, 147 and 196 must be rejected; 101 to 104 must trap; 15
 and 80 are the permitted cycle leaks; every other case is accept with a
 clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
 pins the copy-in, copy-out meaning of `&` (§5); 19 and 20 cover weak
@@ -333,3 +346,58 @@ The signalling `f32` NaN is the probe that matters: the interpreter
 holds an `f32` widened to `f64`, and the hardware conversion quiets it
 (an interpreter that widened with `as` answered 151551 here, probes 12,
 13, 15 and 16 failing).
+
+Cases 196 and 197 pin the rule on polymorphic recursion that never ends
+(types §3.6, stdlib design §7 B4). 196 is `len` over anything with a size,
+recursing at `(Dropped c)`, a wrapper of its own variable: `fibref`
+returned 3, and `fibc` never finished monomorphising it (`memory allocation
+of 102524 bytes failed` after 33 s under `ulimit -v 4000000`); both now
+reject it, at the occurrence, with `len recurses at (Dropped c): polymorphic
+recursion is not supported; use loop or a List`. 197 is the recursion that
+stays accepted because its instances are finite, run in both tools: `f`
+calls itself at `(Vec b)` for one variable while the other is fed back as
+itself, and `swap-rec` exchanges its two variables (20). The `fibc` limit
+on the size of a specialisation's types, the net under what the rule does
+not see (an `impl` method recursing at a larger type), is
+`compile::tests::an_impl_method_wanted_at_ever_larger_types_stops_with_a_message`.
+
+Cases 198 to 201 pin the hash combiner and the hashes built on it
+(stdlib design §2.7, §7 E10), which folded with `h*31 + hash x` and so
+trapped on integer overflow under both tools as soon as two hashes were
+as large as a string's. Their expected values are not this
+implementation's output: an independent Python transcription of the
+definitions (`hash-combine` in `lib/prelude.fib`, FNV-1a for strings,
+variant indexes as seeds) gave them, and the interpreter and the compiler
+both match it. Case 198 is `hash-combine` itself, at ordinary and
+extreme inputs, order and length sensitivity, a fold of fourteen strings
+and the diffusion of all 128 single-bit flips (27 or more of the 64
+bits, and at least one of the low five, which the first level of a
+`Map`'s trie reads), 2^11 - 1 = 2047. Case 199 is `hash` of a `List` of
+strings, fourteen of them, three of them, `("a" "b" "c")` and the
+neighbours that must differ, 255. Case 200 is `derive Hash` on a struct
+of two strings, a struct holding it, an enum with string fields, and a
+`Map` keyed by the struct, 255, in a program that defines its own
+`hash-combine` (it traps: the derived instances name the prelude's as
+`fib.prelude/hash-combine`, so the program's does not capture it). Case 201 is `hash` of floats, 255: `-0.0`
+hashes as `0.0` and every NaN of either width as one value
+(0x7ff8000000000000, so `=` implies equal hashes and the two tools agree
+on `(hash (/ 0.0 0.0))`), the other floats keep their bits, and a `Map`
+finds the key `0.0` by `-0.0`. Each case's result has one bit per probe,
+so a probe that fails lowers it in its own bit. Run against the tree
+before the change the four were: 198 rejected (`hash-combine` unbound),
+199 and 200 `trap: integer overflow in * at i64`, 201 result 48 where 255
+is expected.
+
+Cases 202 to 204 use the header key `allocs` (rule 3; the harness reads
+it, §7 H1 of the stdlib design). 202 and 203 are one program, a
+three-stage `Mapped`, `Filtered`, `reduce-sum` pipeline over a `Vec` of
+50 and of 500 elements (the `Vec` is a `def`, which the trace leaves
+out), with the same bound, `allocs: <= 4`: the two recipe structs and the
+two closures they store, none per element (the design's A1). 204 is a
+bound that holds exactly: a chain of six `Link`s and an `End` allocates 7
+objects and says `<= 7`. The tests `a_bound_one_below_the_count_fails`
+(`crates/fibref/tests/allocs.rs` for the interpreter and
+`crates/fibc/tests/allocs.rs` for the compiled run) run 204, 202 and 203
+with the bound lowered by one and require the failure that names the
+count, and the header parser's, the verdict's and the runner's unit tests
+pin the rest of the key's rules.

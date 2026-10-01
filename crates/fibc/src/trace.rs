@@ -96,11 +96,7 @@ impl Trace {
         // The events of `def` evaluation (everything up to the last
         // `Immortalised`, syntax §3.19) are not traced: the compiled
         // program holds those objects as static data (compiler.md §4).
-        let start = events
-            .iter()
-            .rposition(|e| matches!(e, Event::Immortalised { .. }))
-            .map_or(0, |i| i + 1);
-        for e in &events[start..] {
+        for e in fibref::heap::traced(events) {
             match *e {
                 Event::Alloc { id, kind } => {
                     let n = number(id, &mut ids);
@@ -131,6 +127,17 @@ impl Trace {
     pub fn parse(text: &str) -> Trace {
         let lines = text.lines().filter_map(parse_line).collect();
         Trace { lines }
+    }
+
+    /// The number of heap objects allocated: the `A` lines, which the
+    /// case header key `allocs` bounds. It equals the interpreter's
+    /// `fibref::heap::trace_allocs` on the same run, since the two
+    /// traces are the same lines.
+    pub fn allocs(&self) -> u64 {
+        self.lines
+            .iter()
+            .filter(|l| matches!(l, Line::Alloc(..)))
+            .count() as u64
     }
 
     /// Whether a thread was spawned.
@@ -287,6 +294,23 @@ mod tests {
             Trace::from_events(heap.trace()).render(),
             "A 1 c\nS 2 o\nD 2\nF 1\n"
         );
+    }
+
+    #[test]
+    fn allocs_are_the_a_lines_on_both_sides() {
+        let tr = t("A 1 o\nS 2 c\nA 3 a\nF 1\nD 2\nA 4 c\n");
+        assert_eq!(tr.allocs(), 3);
+        assert_eq!(t("").allocs(), 0);
+        // The interpreter's count and its trace's A lines are one number.
+        use fibref::{Heap, Value};
+        let mut heap = Heap::new();
+        heap.alloc_immortal(Kind::Immutable, vec![]).unwrap();
+        heap.alloc(Kind::Cell, vec![Value::Nil]).unwrap();
+        let scope = heap.open_scope();
+        heap.alloc_in_scope(scope, Kind::Immutable, vec![]).unwrap();
+        heap.alloc(Kind::Atom, vec![Value::Nil]).unwrap();
+        assert_eq!(Trace::from_events(heap.trace()).allocs(), 2);
+        assert_eq!(fibref::heap::trace_allocs(heap.trace()), 2);
     }
 
     #[test]

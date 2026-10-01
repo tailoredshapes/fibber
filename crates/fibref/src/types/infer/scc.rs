@@ -14,6 +14,7 @@ use crate::types::ty::{Colour, Leaf, Pred, Ty};
 
 use super::cx::{Cx, DKind, MonoSig};
 use super::general::{keys, Closed, GenMap, Key};
+use super::polyrec::poly_vars;
 
 impl Cx<'_> {
     /// The monomorphic signature of an SCC member, binding its
@@ -125,6 +126,8 @@ impl Cx<'_> {
             let (sig, poly) = self.member_sig(f)?;
             self.u.mono.insert(*id, sig);
             if let Some(p) = poly {
+                let vars = poly_vars(&p.var_names, &self.u.rigid_map);
+                self.u.poly_vars.insert(*id, vars);
                 self.u.poly.insert(*id, p);
             }
             maps.push(std::mem::take(&mut self.u.rigid_map));
@@ -144,6 +147,7 @@ impl Cx<'_> {
         for ((f, id), map) in members.iter().zip(ids).zip(maps) {
             self.u.rigid_map = map.clone();
             self.u.fun = f.name.clone();
+            self.u.cur = Some(*id);
             let bounds = self.bounds(f)?;
             for b in &bounds {
                 self.defer(pred_kind(b.clone(), &f.name), &f.pos, None);
@@ -208,6 +212,7 @@ impl Cx<'_> {
             .collect();
         let closed = self.close(&roots)?;
         self.check_poly_bounds(members, ids, &maps, &declared, &closed)?;
+        self.check_polymorphic_recursion(members, ids)?;
         for f in members {
             self.check_matches(&f.body)?;
         }

@@ -1,0 +1,20 @@
+;; spec:   types §3.6; stdlib design §7 B4
+;; expect: reject
+;; error:  len recurses at (Dropped c): polymorphic recursion is not supported; use loop or a List
+;; len calls itself at (Dropped c), a type built from its own variable c,
+;; so it would be wanted at c, at (Dropped c), at (Dropped (Dropped c)),
+;; without end. The interpreter ran it (3) while fibc never finished
+;; monomorphising it: "memory allocation of 102524 bytes failed" after
+;; 33 s under ulimit -v 4000000. Both tools reject it now, in the
+;; checker they share, with a message that names the function and the
+;; type. (Case 197 is the finite recursion that stays accepted.)
+(defstruct (Dropped c) (inner: c n: i64))
+(defprotocol Sz (size (self) -> i64))
+(impl Sz (Vec a) (size (self) (count self)))
+(impl Sz (Dropped c) :where ((Sz c))
+  (size (self) (- (size (. self inner)) (. self n))))
+
+(defun len (xs: c) :where ((Sz c)) -> i64
+  (if (= (size xs) 0) 0 (+ 1 (len (Dropped xs 1)))))
+
+(defun main () -> i64 (len [1 2 3]))

@@ -56,7 +56,7 @@ mod value;
 
 pub use audit::{AuditReport, DanglingRef, Leak, LeakClass};
 pub use error::{AuditError, Op, Uniqueness};
-pub use event::Event;
+pub use event::{trace_allocs, traced, Event};
 pub use value::{Kind, ObjId, ScopeId, Value};
 
 use object::Object;

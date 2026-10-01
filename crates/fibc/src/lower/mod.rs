@@ -382,7 +382,7 @@ impl<'p, 'a> Cx<'p, 'a> {
             ExprKind::Async(..) => self.make_async(e)?,
             ExprKind::Await(x) => self.await_task(x)?,
             ExprKind::Quote(f) => self.quote(e, f)?,
-            ExprKind::Concat(es) => self.concat(es)?,
+            ExprKind::Concat(es) => self.concat(e, es)?,
         };
         Ok(Flow::Val(v))
     }

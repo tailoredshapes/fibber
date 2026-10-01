@@ -1,0 +1,55 @@
+;; spec:   types §6.11 and §8.1; compiler.md section 4; stdlib design 8.1 item 5 and H1
+;; expect: accept
+;; result: 19600
+;; audit:  clean
+;; allocs: <= 4
+;; The zero-cost claim of a lazy pipeline, made executable: map, filter and
+;; reduce over a `Vec` of 50 elements allocate at most 4 heap objects, however
+;; many elements there are. Case 203 is the same program over 500 elements,
+;; with the same bound.
+;; The bound is the `allocs` header (cases/ownership/README.md): the `A`
+;; lines of the free trace, which `fibc run --trace` writes for the compiled
+;; run and the interpreter's trace gives, and the two tools count alike.
+;; The four are the two recipe structs (`Mapped`, `Filtered`) and the two
+;; closures they store, none per element (the design's A1: +4 for 1000
+;; elements). The reduction's closure and cell and the visitors that the
+;; stages build are scope-local, stack objects (`S` lines, types §6.11),
+;; which are not heap objects. A stage that allocated per element would
+;; need 50 more and fail this case, which is why the bound is the count
+;; and not a round number: it is tight, and each stage costs two (`reduce`
+;; alone allocates none, one stage two, both four).
+;; The `Vec` is a `def`, whose objects the trace leaves out (compiler.md §4:
+;; the compiled program holds a `def`'s value as static data, and the
+;; interpreter's events up to its last `Immortalised` are skipped), so what
+;; is counted is main's: building 50 elements by `conj` costs about two
+;; allocations each and would drown the pipeline's own.
+;; The stages are `Traversable` recipes (each holds its source and its
+;; function and runs its source's `for-each` with a visitor); the prelude
+;; has no such adaptors yet (stdlib design, tranche 1).
+;; Why 50 and 500 and not 100 and 1000: lowering a literal recurses as deep
+;; as the literal is long, and one of 1000 elements overflows the 2 MB stack
+;; of the thread `crates/fibc/tests/defs.rs` checks every `def` on (one of
+;; 10000 overflows the stack of `fibc run` itself).
+(def xs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+    20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+    40 41 42 43 44 45 46 47 48 49])
+
+(defstruct (Mapped s e r) (src: s f: (fn (e) r)))
+(impl (Traversable r) (Mapped s e r) :where ((Traversable s e))
+  (for-each (self g)
+    (for-each (. self src) (fn (x) (g ((. self f) x))))))
+
+(defstruct (Filtered s e) (src: s p: (fn (e) bool)))
+(impl (Traversable e) (Filtered s e) :where ((Traversable s e))
+  (for-each (self g)
+    (for-each (. self src) (fn (x) (if ((. self p) x) (g x) ())))))
+
+(defun reduce-sum (src: s f: (fn (i64 i64) i64)) :where ((Traversable s i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (for-each src (fn (x) (set! acc (f @acc x))))
+        @acc)))
+
+(defun main () -> i64
+  (reduce-sum (Filtered (Mapped xs (fn (x) (* x x))) (fn (x) (even? x)))
+              (fn (a x) (+ a x))))

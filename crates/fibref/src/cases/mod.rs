@@ -18,8 +18,9 @@ pub mod verdict;
 
 pub use evaluator::{AuditSummary, Evaluator, Outcome, PendingEvaluator, Value};
 pub use header::{
-    parse_header, read_header, AuditExpect, Expected, Header, HeaderError, HeaderErrorKind, Verdict,
+    case_roots, parse_header, read_header, AuditExpect, Expected, Header, HeaderError,
+    HeaderErrorKind, Verdict,
 };
 pub use runner::{list_cases, list_cases_recursive, run_case, run_dir, CaseResult, Counts, Report};
 pub use table::render;
-pub use verdict::{judge, Status};
+pub use verdict::{judge, judge_counted, Status};

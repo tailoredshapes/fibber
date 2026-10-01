@@ -196,7 +196,11 @@ pub fn lower_modules(
             })?;
             uses.push(id);
         }
-        let m = g.add_module(&spec.ns, &uses, aliases);
+        let mut reexports = Vec::new();
+        for ns in &spec.exports {
+            reexports.extend(ids.get(ns).copied());
+        }
+        let m = g.add_module(&spec.ns, (&uses, &reexports), aliases);
         ids.insert(spec.ns.clone(), m);
         g.main = m;
         let (forms, private) = lower::strip_private(forms);

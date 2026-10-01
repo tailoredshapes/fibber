@@ -120,6 +120,7 @@ fn inline_header(line: &Option<String>) -> Option<Header> {
         Verdict::Accept {
             result: Expected::Int(n),
             audit: AuditExpect::Clean,
+            allocs: None,
         }
     };
     Some(Header {

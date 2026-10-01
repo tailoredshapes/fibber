@@ -106,16 +106,68 @@ pub fn fun_key(g: &Globals, s: &Scheme, tys: &[Ty]) -> Result<Vec<Ty>, Unsupport
         .collect()
 }
 
+/// How deep a type may nest and how many nodes it may have to key a
+/// specialisation. A body that is wanted at ever larger types (a
+/// polymorphic recursion that never ends, through a method of an `impl`
+/// or a cycle of functions and methods, which the checker's rule on
+/// functions (types §3.6) does not see) would otherwise be compiled for
+/// ever, its names growing with it, until memory ran out. No program
+/// that was run needed more than a few dozen nodes.
+const MAX_TYPE_DEPTH: usize = 64;
+const MAX_TYPE_SIZE: usize = 1000;
+
+/// The depth and the node count of a type.
+fn extent(t: &Ty) -> (usize, usize) {
+    let kids: Vec<&Ty> = match t {
+        Ty::Con(_, args) => args.iter().collect(),
+        Ty::Fn(_, params, ret) => params.iter().chain(std::iter::once(&**ret)).collect(),
+        _ => Vec::new(),
+    };
+    let (mut depth, mut size) = (0, 1);
+    for k in kids {
+        let (d, n) = extent(k);
+        depth = depth.max(d);
+        size += n;
+    }
+    (depth + 1, size)
+}
+
+/// What a body is called in a message: a function's name, or `the
+/// method m of P`.
+fn describe(g: &Globals, key: BodyKey) -> String {
+    match key {
+        BodyKey::Fun(f) | BodyKey::AllOwned(f) => g.fun(f).name.clone(),
+        BodyKey::Def(d) => g.def(d).name.clone(),
+        BodyKey::Method(i, m) | BodyKey::MethodOwned(i, m) => {
+            let inst = &g.instances[i];
+            let proto = g.proto(inst.proto);
+            let method = &proto.methods[inst.methods[m].index].name;
+            format!("the method {method} of {}", proto.name)
+        }
+    }
+}
+
 /// The bodies still to emit, and the name of every one requested.
 #[derive(Debug, Default)]
 pub struct Queue {
     pending: VecDeque<Inst>,
     names: HashMap<Inst, String>,
+    overflow: Option<String>,
 }
 
 impl Queue {
-    /// The name of the specialisation, queued for emission if new.
+    /// The name of the specialisation, queued for emission if new. A
+    /// request at a type past the limits above is not queued, and what
+    /// it was is kept for [`Queue::overflow`].
     pub fn request(&mut self, g: &Globals, inst: Inst) -> String {
+        let big = |t: &Ty| {
+            let (depth, size) = extent(t);
+            depth > MAX_TYPE_DEPTH || size > MAX_TYPE_SIZE
+        };
+        if self.overflow.is_some() || inst.tys.iter().any(big) {
+            let _ = self.overflow.get_or_insert_with(|| describe(g, inst.key));
+            return "@overflow".to_string();
+        }
         if let Some(n) = self.names.get(&inst) {
             return n.clone();
         }
@@ -128,6 +180,12 @@ impl Queue {
     /// The next body to emit.
     pub fn pop(&mut self) -> Option<Inst> {
         self.pending.pop_front()
+    }
+
+    /// The first body that was requested at a type past the limits, if
+    /// any: the compilation cannot finish.
+    pub fn overflow(&self) -> Option<&str> {
+        self.overflow.as_deref()
     }
 }
 

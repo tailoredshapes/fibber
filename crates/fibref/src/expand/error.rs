@@ -64,6 +64,17 @@ pub enum ExpandErrorKind {
         /// How many arguments the call had.
         found: usize,
     },
+    /// A bare macro name that two `:use`d modules both define (§5: two
+    /// `:use`d modules exporting one name make it an error when
+    /// referenced unqualified).
+    AmbiguousMacro {
+        /// The macro.
+        name: String,
+        /// The module whose `:use` comes first.
+        first: String,
+        /// The other.
+        second: String,
+    },
     /// `(unquote e)` or `(unquote-splicing e)` outside any quasiquote
     /// (§1.2: "inside a quasiquote").
     UnquoteOutsideQuasiquote {
@@ -191,6 +202,14 @@ impl fmt::Display for ExpandErrorKind {
             } => {
                 write!(f, "macro {name} takes {expected} argument(s), got {found}")
             }
+            K::AmbiguousMacro {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "{name} is exported by both {first} and {second}; write {first}/{name} or {second}/{name}"
+            ),
             K::UnquoteOutsideQuasiquote { head } => write!(f, "{head} outside quasiquote"),
             K::SpliceOutsideList => write!(f, "unquote-splicing outside a list, vector or map"),
             K::Malformed { head, reason } => write!(f, "malformed {head}: {reason}"),

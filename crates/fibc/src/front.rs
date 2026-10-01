@@ -7,6 +7,7 @@
 use fibref::cases::Outcome;
 use fibref::expand::{ExpandCtx, MacroRunner};
 use fibref::own::{check_modules, CheckError, Checked};
+use fibref::roots::Roots;
 use fibref::types::prelude_forms;
 
 /// What the front end said about a program.
@@ -34,12 +35,18 @@ impl Front {
 /// Reads, expands, types and checks `source` (named `file` in
 /// positions), exactly as `fibref run` does before it evaluates.
 pub fn check(source: &str, file: &str) -> Front {
+    check_in(source, file, &Roots::default())
+}
+
+/// [`check`] with the library roots of the command line
+/// (spec/compiler.md §1, `fibref::roots`).
+pub fn check_in(source: &str, file: &str, roots: &Roots) -> Front {
     let mut ctx = ExpandCtx::new();
     let prelude = match prelude_forms(&mut ctx) {
         Ok(p) => p,
         Err(m) => return Front::Failed(format!("the prelude does not expand: {m}")),
     };
-    let loaded = match fibref::modules::load(source, file) {
+    let loaded = match fibref::modules::load_in(source, file, roots) {
         Ok(l) => l,
         Err(m) => return Front::Rejected(m),
     };

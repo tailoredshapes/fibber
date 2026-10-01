@@ -1,0 +1,29 @@
+;; spec:   types §8.1; compiler.md section 4; stdlib design H1
+;; expect: accept
+;; result: 15
+;; audit:  clean
+;; allocs: <= 7
+;; A bound that holds exactly: this program allocates 7 heap objects, six
+;; `Link`s and the one `End` that ends the chain (an enum with fields is an
+;; object type, so each of its variants is an object, types §8.1: `(build 0)`
+;; allocates 1), under the interpreter and compiled alike, so `allocs: <= 7`
+;; passes and `<= 6` does not. That the bound can fail is itself tested, not
+;; assumed: the tests `a_bound_one_below_the_count_fails`
+;; (crates/fibref/tests/allocs.rs runs the interpreter, and
+;; crates/fibc/tests/allocs.rs the compiled program) run this file with the
+;; bound lowered to 6 and require the failure to say that 7 objects were
+;; allocated. A `<=` only fails when the count goes up, so a bound that is
+;; exact is the only kind that notices a stray allocation; the pipeline
+;; cases 202 and 203 are exact too.
+(defenum Chain (End) (Link v: i64 next: Chain))
+
+(defun build (n: i64) -> Chain
+  (loop ((i 0) (acc End))
+    (if (< i n) (recur (+ i 1) (Link i acc)) acc)))
+
+(defun total (c: Chain) -> i64
+  (match c
+    ((End) 0)
+    ((Link v next) (+ v (total next)))))
+
+(defun main () -> i64 (total (build 6)))

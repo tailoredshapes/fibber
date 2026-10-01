@@ -62,6 +62,7 @@ fn a_multi_line_compiler_message_does_not_break_the_table_into_extra_rows() {
         verdict: Verdict::Accept {
             result: Expected::Int(1),
             audit: AuditExpect::Clean,
+            allocs: None,
         },
     };
     let status = judge(

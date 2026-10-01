@@ -12,6 +12,7 @@ use crate::types::ty::{Colour, Pred, Ty};
 
 use super::cx::{CapsCon, ColourCon, Cx, DKind, Instantiation, MonoSig};
 use super::expr::amp_not_cell;
+use super::polyrec::PolyCall;
 
 /// A function's signature at a call: parameter types, `&` flags, names.
 struct Sig {
@@ -168,6 +169,17 @@ impl Cx<'_> {
             Source::Value => return Ok(None),
         };
         let ty = self.instantiate(&scheme, id, &name, pos, method);
+        if let (GlobalRef::Fun(callee), Some(caller)) = (r, self.u.cur) {
+            if self.u.poly.contains_key(&callee) {
+                let call = PolyCall {
+                    caller,
+                    callee,
+                    site: id,
+                    pos: pos.clone(),
+                };
+                self.u.poly_calls.push(call);
+            }
+        }
         let Ty::Fn(_, params, ret) = ty else {
             return Err(TypeError::other(
                 pos,

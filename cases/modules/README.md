@@ -8,6 +8,19 @@ directory's `main.fib` as one case (`fibref cases cases/modules`,
 `fibc cases cases/modules`), and every case runs interpreted and
 compiled with matching results and free traces (method.md rule 6).
 
+**Library roots** (syntax §5, compiler.md §1; **Proposed**). A module is
+found beside the main file, then under each root in order. A case that
+needs a root says so in its header, with the key `roots`: directories
+separated by white space, relative to the case's directory, in the order
+they are searched (`;; roots: first second`). The interpreter side of
+the harness gets them as the roots of `fibref::roots::Roots`, and the
+child `fibc run` as one `-I DIR` each, so `fibref run -I DIR main.fib` and
+`fibc run -I DIR main.fib` run the case by hand. A case's roots are its
+header's alone: `FIB_LIB` is not read by either side (the harness removes
+it from the child's environment), so a case gives the same answer on
+every machine. A subdirectory of a case that holds roots has no
+`main.fib`, so it is not mistaken for a case.
+
 - 001: a `:require` under an alias and a `:use`, three modules read
   once each in dependency order (17).
 - 002: a `:private` definition of a required module is not reachable by
@@ -21,3 +34,37 @@ compiled with matching results and free traces (method.md rule 6).
   modules' macros of one name told apart (40).
 - 006: a `:private` macro is not reached through an alias (reject:
   `unbound name u/hidden`).
+- 007: the program's own protocol `Collection` with a method `conj`,
+  implemented for `(Vec a)`, beside the prelude's: the program's method
+  shadows the prelude's for a bare `conj` (syntax §5) and the vector
+  literal and `fib.prelude/conj` are the prelude's (43). `fibc` named both
+  `m.Collection.conj.$Vec..` and said `duplicate definition`; the symbol of
+  a protocol's method and of its vtable now carries the defining module.
+- 008: two modules each define a protocol `Sized` with a method `size`
+  and implement it for `str`: two protocols, called directly and through
+  `(dyn Sized)` (2121). `fibc` named both `m.Sized.size.str`, and a
+  vtable of the second would have been the first's.
+- 009: two `:use`d modules export `peek`, and a bare `(peek 3)` is an
+  error naming both modules (reject: `peek is exported by both one and two;
+  write one/peek or two/peek`). Syntax §5 says so; the code took the first
+  `:use` silently (3 with `(:use one two)`, 4 with `(:use two one)`). The
+  prelude is not a second `:use`: a `:use`d module's name shadows the
+  prelude's, as it always did.
+- 010: what 009 does not reject: a name this module defines itself
+  shadows both, a name only one exports is no clash, and `one/peek`,
+  `two/peek` name each module's (1630).
+- 011: the same rule for a macro two `:use`d modules both define
+  (reject: `twice is exported by both one and two`).
+- 012: a quasiquote template is rewritten into calls that resolve in the
+  prelude, so a library's own `concat` and an enum with variants named
+  `List`, `Vec` and `Map` do not capture them, and `` `() `` expands under
+  `fibc` as it does in the interpreter (62).
+- 013: a library module found under a root, and the module it needs
+  found there too (43).
+- 014: the order of the search: the main file's directory, then each root
+  in order; a module in all three places is the main directory's, in two
+  roots the first's, and the second's file is never read (108).
+- 015: a facade that re-exports with `(:export-from a b)`: functions,
+  a struct and its constructor, a protocol and its method and a macro,
+  bare through a `:use` and through the alias of a `:require` (716).
+- 016: a module in no root (reject: `module ext.nowhere is not at`).

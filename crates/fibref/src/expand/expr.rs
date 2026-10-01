@@ -87,6 +87,16 @@ pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, Exp
         if name == "quasiquote" {
             ex.ctx.step(&pos)?;
             form = quasi::rewrite(form)?;
+        } else if let Some((first, second)) = ex.ctx.macro_ambiguity(&name) {
+            let (first, second) = (first.to_string(), second.to_string());
+            return Err(ExpandError::new(
+                K::AmbiguousMacro {
+                    name,
+                    first,
+                    second,
+                },
+                &pos,
+            ));
         } else if ex.ctx.macro_def(&name).is_some() {
             ex.ctx.step(&pos)?;
             form = ex.run_user(&name, form)?;

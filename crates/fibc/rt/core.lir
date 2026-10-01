@@ -231,3 +231,15 @@
           (len (call @snprintf buf (i64 96) (string "array index %lld out of range 0..%lld") i n)))
       (call @fib.trap-bytes buf (sext i64 len))
       (unreachable))))
+
+;; (hash x) on a float (types §2.12): the bits of the value as a double,
+;; except that -0.0 hashes as 0.0 and every NaN as the quiet NaN's bits
+;; 0x7ff8000000000000, so that = implies equal hashes (eval/arith.rs
+;; float_hash). A float is widened first: the hash of an f32 is that of
+;; its f64.
+(define internal (fib.double-hash i64) ((double x))
+  (block entry
+    (let ((bits (bitcast i64 x))
+          (is-zero (fcmp oeq x (double 0.0)))
+          (is-nan (fcmp uno x x)))
+      (ret (select is-nan (i64 9221120237041090560) (select is-zero (i64 0) bits))))))

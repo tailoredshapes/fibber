@@ -15,6 +15,7 @@ fn accept(audit: AuditExpect) -> Header {
         verdict: Verdict::Accept {
             result: Expected::Int(1),
             audit,
+            allocs: None,
         },
     }
 }

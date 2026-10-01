@@ -126,7 +126,8 @@ mod tests {
             h.verdict,
             fibref::cases::Verdict::Accept {
                 result: fibref::cases::Expected::Int(3),
-                audit: fibref::cases::AuditExpect::Clean
+                audit: fibref::cases::AuditExpect::Clean,
+                allocs: None,
             }
         );
     }

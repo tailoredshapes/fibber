@@ -5,8 +5,9 @@ use fibref::cases::{Outcome, Value};
 use fibref::eval::pipeline::{abort_errors, summary};
 use fibref::eval::{run_checked, RunErrorKind, STACK_BYTES};
 
-use crate::front::{check, Front};
+use crate::front::{check_in, Front};
 use crate::trace::Trace;
+use fibref::roots::Roots;
 
 /// What the interpreter said: the outcome and, when it ran, the trace
 /// of its heap (empty when it did not run).
@@ -18,11 +19,16 @@ pub struct InterpRun {
 /// Runs `source` in the reference interpreter on a thread with the
 /// stack the evaluator needs.
 pub fn run(source: &str, file: &str) -> InterpRun {
+    run_in(source, file, &Roots::default())
+}
+
+/// [`run`] with the library roots of the command line.
+pub fn run_in(source: &str, file: &str, roots: &Roots) -> InterpRun {
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new()
             .name("fibc-interp".into())
             .stack_size(STACK_BYTES)
-            .spawn_scoped(scope, || run_here(source, file));
+            .spawn_scoped(scope, || run_here(source, file, roots));
         match worker.map(|h| h.join()) {
             Ok(Ok(run)) => run,
             Ok(Err(_)) => failed("internal error: the evaluator panicked"),
@@ -40,8 +46,8 @@ fn failed(message: &str) -> InterpRun {
     }
 }
 
-fn run_here(source: &str, file: &str) -> InterpRun {
-    let checked = match check(source, file) {
+fn run_here(source: &str, file: &str, roots: &Roots) -> InterpRun {
+    let checked = match check_in(source, file, roots) {
         Front::Checked(c) => c,
         other => {
             return match other.outcome() {

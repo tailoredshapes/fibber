@@ -12,6 +12,10 @@
 //! - `link.rs`: `-L DIR` and `-l LIB` link a program against a shared
 //!   library built with `cc`, and the executable finds it without
 //!   `LD_LIBRARY_PATH` (each `-L` is also an rpath, an absolute one);
+//! - `roots.rs`: `-I DIR` and `FIB_LIB` name the library roots a module is
+//!   found under after the main file's directory, in that order, on `run`
+//!   and `build`, and the rule-6 harness gives the child the roots of the
+//!   case's header and not `FIB_LIB`;
 //! - `args.rs`: an argument that is not UTF-8 reaches `(args)` as
 //!   `String::from_utf8_lossy` makes it (seeded byte strings of every kind
 //!   of invalid sequence), and `read-file` and `str-from-bytes` agree with
@@ -31,6 +35,8 @@ mod io_support;
 mod args;
 #[path = "cli/link.rs"]
 mod link;
+#[path = "cli/roots.rs"]
+mod roots;
 #[path = "cli/writes.rs"]
 mod writes;
 

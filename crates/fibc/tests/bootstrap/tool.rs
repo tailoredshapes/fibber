@@ -185,18 +185,37 @@ pub fn run_tool(tool: &Tool, mode: Mode, files: &[PathBuf]) -> Run {
 /// Runs the tool in `mode` on `files` (the mode's flag, if any, comes
 /// first) and waits at most `limit` for it.
 pub fn run_tool_within(tool: &Tool, mode: Mode, files: &[PathBuf], limit: Duration) -> Run {
-    let spawned = Command::new("sh")
+    let flags: Vec<String> = mode.flag().map(String::from).into_iter().collect();
+    run_with_flags(tool, &flags, files, limit, None)
+}
+
+/// Runs the tool with the words `flags` before `files`, from the
+/// directory `cwd` when one is given, and waits at most `limit` for it.
+/// The expander's tests (`bootstrap_expand.rs`) run it this way: its
+/// words are not the reader's one flag, and it reads the prelude from
+/// the repository.
+pub fn run_with_flags(
+    tool: &Tool,
+    flags: &[String],
+    files: &[PathBuf],
+    limit: Duration,
+    cwd: Option<&Path>,
+) -> Run {
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(WRAPPER)
         .arg(&tool.program)
         .args(&tool.leading)
-        .args(mode.flag())
+        .args(flags)
         .args(files)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match spawned {
+        .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return failed_to_start(&tool.program, &e),
     };

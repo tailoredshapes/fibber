@@ -45,6 +45,7 @@ pub use top::analyse;
 
 use crate::expand::{ExpandCtx, NoRunner};
 use crate::modules::ModuleSpec;
+use crate::roots::Roots;
 use crate::syntax::Form;
 use crate::types::{infer_lowered, lower_modules, prelude_forms, TypedProgram, CHECK_STACK};
 
@@ -60,9 +61,15 @@ pub struct Checked {
 /// Reads, expands, types and checks the ownership of `source` as the
 /// user module, with the prelude.
 pub fn check_source(source: &str, file: &str) -> Result<Checked, CheckError> {
+    check_source_in(source, file, &Roots::default())
+}
+
+/// [`check_source`] with the library roots of the command line
+/// (`roots.rs`).
+pub fn check_source_in(source: &str, file: &str, roots: &Roots) -> Result<Checked, CheckError> {
     let mut ctx = ExpandCtx::new();
     let prelude = prelude_forms(&mut ctx).map_err(CheckError::Prelude)?;
-    let loaded = crate::modules::load(source, file).map_err(CheckError::Read)?;
+    let loaded = crate::modules::load_in(source, file, roots).map_err(CheckError::Read)?;
     let modules = crate::modules::expand_all(loaded, &mut ctx, &mut NoRunner)
         .map_err(|e| CheckError::Expand(e.to_string()))?;
     check_modules(&modules, &prelude)

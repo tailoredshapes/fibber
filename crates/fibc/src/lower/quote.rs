@@ -127,12 +127,15 @@ impl<'a> Cx<'_, 'a> {
     }
 
     /// `(concat v..)`: a fresh vector of every part's elements, built
-    /// as `build_vec` builds it.
-    pub fn concat(&mut self, parts: &'a [fibref::types::ast::Expr]) -> R<V> {
-        let Some(first) = parts.first() else {
-            return Err(Unsupported("concat of nothing".into()));
-        };
-        let t = self.ty(first)?;
+    /// as `build_vec` builds it. `e` is the whole call, whose type is
+    /// the vector's even when there are no parts (`` `() `` is `(List
+    /// (concat))`).
+    pub fn concat(
+        &mut self,
+        e: &fibref::types::ast::Expr,
+        parts: &'a [fibref::types::ast::Expr],
+    ) -> R<V> {
+        let t = self.ty(e)?;
         let elem = match &t {
             Ty::Con(Con::Nominal(_), args) => args
                 .first()

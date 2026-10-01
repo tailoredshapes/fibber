@@ -6,6 +6,8 @@
 //! |----------|-------------------------------------------|---------|
 //! | accept   | Compiled, result and audit both match     | Pass    |
 //! | accept   | Compiled, result or audit differs          | Fail    |
+//! | accept, `allocs: <= N` | Compiled, more than N allocations | Fail |
+//! | accept, `allocs: <= N` | Compiled, no count reported       | Fail |
 //! | accept   | Rejected                                  | Fail    |
 //! | reject   | Rejected, message contains the error text | Pass    |
 //! | reject   | Rejected, message lacks it                | Fail    |
@@ -27,6 +29,12 @@
 //! no check fired. `audit: leak-cycle` means the only thing wrong is at
 //! least one cycle through cells: `leak_cycles > 0`, no other leaks, no
 //! errors. Pending is reported separately and is never a pass.
+//!
+//! `allocs: <= N` means the run allocated at most `N` heap objects: the
+//! `A` lines of its free trace (`spec/compiler.md` §4), counted by the
+//! evaluator that ran the case and handed to [`judge_counted`]. More
+//! than `N` is a Fail, never a Pending; so is an evaluator that gave no
+//! count, since a bound nobody checked is a test that cannot fail.
 
 use std::fmt;
 
@@ -78,11 +86,28 @@ impl fmt::Display for Status {
     }
 }
 
-/// Decides the status of a case from its header and the evaluator's outcome.
+/// Decides the status of a case from its header and the evaluator's
+/// outcome, knowing no allocation count: a header with `allocs` fails
+/// (see [`judge_counted`]).
 pub fn judge(header: &Header, outcome: &Outcome) -> Status {
+    judge_counted(header, outcome, None)
+}
+
+/// [`judge`] given the number of heap objects the run allocated, when
+/// the evaluator counts them ([`Evaluator::run_counted`]).
+///
+/// [`Evaluator::run_counted`]: super::evaluator::Evaluator::run_counted
+pub fn judge_counted(header: &Header, outcome: &Outcome, allocs: Option<u64>) -> Status {
     match (&header.verdict, outcome) {
         (_, Outcome::Unsupported { reason }) => Status::Pending(reason.clone()),
-        (Verdict::Accept { result, audit }, outcome) => judge_accept(result, *audit, outcome),
+        (
+            Verdict::Accept {
+                result,
+                audit,
+                allocs: maximum,
+            },
+            outcome,
+        ) => judge_accept(result, *audit, *maximum, allocs, outcome),
         (Verdict::Reject { error }, outcome) => judge_reject(error, outcome),
         (Verdict::Trap { trap }, outcome) => judge_trap(trap, outcome),
     }
@@ -121,7 +146,15 @@ fn judge_trap(expected: &str, outcome: &Outcome) -> Status {
     }
 }
 
-fn judge_accept(expected: &Expected, audit: AuditExpect, outcome: &Outcome) -> Status {
+/// `accept`: the result and the audit must match, and the allocation
+/// count `counted` must be within the `maximum`, when there is one.
+fn judge_accept(
+    expected: &Expected,
+    audit: AuditExpect,
+    maximum: Option<u64>,
+    counted: Option<u64>,
+    outcome: &Outcome,
+) -> Status {
     match outcome {
         Outcome::Compiled {
             result,
@@ -130,6 +163,7 @@ fn judge_accept(expected: &Expected, audit: AuditExpect, outcome: &Outcome) -> S
             let mismatches: Vec<String> = result_mismatch(expected, result)
                 .into_iter()
                 .chain(audit_mismatch(audit, summary))
+                .chain(allocs_mismatch(maximum, counted))
                 .collect();
             if mismatches.is_empty() {
                 Status::Pass
@@ -175,6 +209,19 @@ fn result_mismatch(expected: &Expected, got: &Value) -> Option<String> {
         (Expected::Int(e), Value::Int(g)) => e == g,
     };
     (!matches).then(|| format!("result: expected {expected}, got {got}"))
+}
+
+fn allocs_mismatch(maximum: Option<u64>, counted: Option<u64>) -> Option<String> {
+    match (maximum, counted) {
+        (None, _) => None,
+        (Some(max), Some(n)) if n <= max => None,
+        (Some(max), Some(n)) => Some(format!(
+            "allocs: expected at most {max} heap objects, the run allocated {n}"
+        )),
+        (Some(max), None) => Some(format!(
+            "allocs: the header says `<= {max}` but the evaluator reported no allocation count"
+        )),
+    }
 }
 
 fn audit_mismatch(expected: AuditExpect, summary: &AuditSummary) -> Option<String> {

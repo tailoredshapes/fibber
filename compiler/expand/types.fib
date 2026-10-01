@@ -1,0 +1,86 @@
+;; compiler/expand/types.fib: the data the expander keeps and passes
+;; around, as crates/fibref/src/expand/{types,runner,ctx}.rs and
+;; crates/fibref/src/modules.rs define them.
+;;
+;; THE SHARED BASE of M6 step 2 (spec/bootstrap.md §5): the types are
+;; fixed; the functions that say `todo:` belong to the porter of the
+;; Rust file named beside them. Nothing here may change without telling
+;; the other porters.
+(ns expand.types (:use syntax.pos syntax.form syntax.error))
+
+;; ------------------------------------------------------- struct and enum
+;; (expand/types.rs). A Rust `Vec<(Form, Form)>` is a vector of FieldPair.
+
+(defstruct FieldPair (name: Stx ty: Stx))
+
+;; A struct as `defstruct` declared it: the type parameters in order
+;; (those synthesised from unannotated fields appended in field order),
+;; and the field names and type forms in order.
+(defstruct StructInfo (name: str params: (Vec Stx) fields: (Vec FieldPair)))
+
+;; A variant's field: its name if written, and its type form.
+(defstruct VariantField (name: (Option str) ty: Stx))
+
+(defstruct VariantInfo (name: str fields: (Vec VariantField)))
+
+(defstruct EnumInfo (name: str params: (Vec Stx) variants: (Vec VariantInfo)))
+
+;; ------------------------------------------------------------- macros
+;; (expand/runner.rs). `rest` is the parameter after `...`, if any; `body`
+;; is already expanded; `key` is "ns/name"; `ns` and `key` are filled in
+;; when the macro is defined in a module.
+
+(defstruct MacroDef
+  (name: str ns: str key: str private: bool
+   params: (Vec str) rest: (Option str)
+   body: (Vec Stx) pos: Pos))
+
+;; ------------------------------------------------------------- limits
+;; (expand/ctx.rs). The defaults are 100000, 2000 and 4000000.
+
+(defstruct Limits (max-steps: i64 max-depth: i64 max-forms: i64))
+
+(def default-max-steps: i64 100000)
+(def default-max-depth: i64 2000)
+(def default-max-forms: i64 4000000)
+
+(defun limits-default () -> Limits
+  (Limits default-max-steps default-max-depth default-max-forms))
+
+;; ------------------------------------------------------------- scope
+;; (expand/ctx.rs `ModuleScope`): the module being expanded, the modules
+;; it `:use`s in order, and its `:require` aliases (alias to module).
+
+(defstruct ModuleScope (ns: str uses: (Vec str) aliases: (Map str str)))
+
+;; ----------------------------------------------------------- modules
+;; (modules.rs). A module as `ns` describes it, and as it was read.
+
+;; `requires` pairs an alias with a module; `exports` are the modules an
+;; `:export-from` names.
+(defstruct Require (alias: str ns: str))
+(defstruct ModuleSpec
+  (ns: str requires: (Vec Require) uses: (Vec str) exports: (Vec str)))
+
+(defstruct Loaded (spec: ModuleSpec file: str forms: (Vec Stx)))
+
+;; A module as expanded: what the next pass (the checker) takes, in
+;; dependency order with the main module last (modules.rs `expand_all`
+;; returns a vector of `(ModuleSpec, Vec<Form>)`).
+(defstruct Expanded (spec: ModuleSpec forms: (Vec Stx)))
+
+;; Why a program could not be loaded (modules.rs `LoadError`). A module
+;; that is not at its file carries no operating system text: the dump
+;; (spec/bootstrap.md §5) does not print one.
+(defenum LoadErr
+  (LoadRead error: ReadError)
+  (LoadSpec pos: Pos what: str)
+  (LoadMissing ns: str file: str)
+  (LoadCycle path: (Vec str) ns: str)
+  (LoadMismatch file: str declared: str required: str))
+
+;; ---------------------------------------------------------- the helpers
+
+;; The ModuleSpec of a single-file program with no `ns` form.
+(defun module-spec-main () -> ModuleSpec
+  (ModuleSpec "main" (vec-empty) (vec-empty) (vec-empty)))

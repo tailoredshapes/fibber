@@ -13,24 +13,38 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use fibref::cases::{render, run_dir, Outcome};
-use fibref::eval::{run_source_with, Interpreter};
+use fibref::eval::{run_source_in, Interpreter};
+use fibref::expand_dump::Options;
+use fibref::roots::Roots;
 
 const USAGE: &str = "usage: fibref <command>
 
 commands:
   cases [dir]     run every case in dir (default cases/ownership) against
                   the verdict in its header
-  explain <file>  print the ownership checker's decisions for file (types §9)
-  run <file> [-- arg..]
+  explain [-I dir].. <file>
+                  print the ownership checker's decisions for file (types §9)
+  run [-I dir].. <file> [-- arg..]
                   run file's main with the reference interpreter and print
                   its result and the memory audit (exit 1 if rejected or failed);
                   the args after -- are (args), a byte that is not UTF-8 in
-                  one becoming U+FFFD as Rust's from_utf8_lossy makes it
+                  one becoming U+FFFD as Rust's from_utf8_lossy makes it;
+                  a module is found beside file, then under each -I dir in
+                  order, then under each directory of $FIB_LIB, then in the
+                  library the executable carries (spec/syntax.md §5)
   read [--print] <file>..
                   print the reader's dump of each file (spec/bootstrap.md §2),
                   or with --print each top-level form as the printer writes
                   it, one per line; exit 1 if any file does not read, 2 if
                   one cannot be read
+  expand [options] <file>..
+                  print the dump of each program after expansion, module by
+                  module (spec/bootstrap.md §5); exit 1 if a program does not
+                  read, load or expand, 2 if a file cannot be read. Options,
+                  before the files: --prelude (each file is a library
+                  prelude), --context (print what the context holds after
+                  each module), --no-runner (a user macro call is pending),
+                  --max-steps N, --max-depth N, --max-forms N (smaller limits)
   help            print this message";
 
 /// The directory `cases` runs when none is given.
@@ -48,6 +62,8 @@ enum Command {
     /// Print the reader's dump of each file, or (`print`) its forms as
     /// the printer writes them.
     Read { files: Vec<String>, print: bool },
+    /// Print the expansion dump of each file (`fibref::expand_dump`).
+    Expand { files: Vec<String>, opts: Options },
     /// Print usage and exit successfully.
     Help,
     /// Print usage and exit with an error: the arguments made no sense.
@@ -82,6 +98,10 @@ fn parse(args: &[String]) -> Command {
                 print: false,
             }
         }
+        [cmd, rest @ ..] if cmd == "expand" => match fibref::expand_dump::parse_args(rest) {
+            Some((opts, files)) => Command::Expand { files, opts },
+            None => Command::Invalid,
+        },
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
         _ => Command::Invalid,
     }
@@ -109,7 +129,7 @@ fn run_cases(dir: &str) -> ExitCode {
 
 /// Checks `file` through the ownership pass and prints its decisions,
 /// or its errors (exit 1); exit 2 if it cannot be read.
-fn run_explain(file: &str) -> ExitCode {
+fn run_explain(file: &str, roots: &Roots) -> ExitCode {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -117,7 +137,7 @@ fn run_explain(file: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (text, code) = match fibref::own::check_source(&source, file) {
+    let (text, code) = match fibref::own::check_source_in(&source, file, roots) {
         Ok(c) => (
             fibref::own::explain::explain(&c.typed, &c.owned),
             ExitCode::SUCCESS,
@@ -130,7 +150,7 @@ fn run_explain(file: &str) -> ExitCode {
 /// Runs `file` through the whole pipeline and prints `main`'s result and
 /// the audit: exit 0 if it ran (whatever the audit says, which is
 /// printed), 1 if it was rejected or its run failed, 2 if unreadable.
-fn run_file(file: &str, args: &[String]) -> ExitCode {
+fn run_file(file: &str, args: &[String], roots: &Roots) -> ExitCode {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -138,7 +158,7 @@ fn run_file(file: &str, args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (text, code) = match run_source_with(&source, file, args) {
+    let (text, code) = match run_source_in(&source, file, args, roots).0 {
         Outcome::Compiled { result, audit } => (
             format!("result: {result}\naudit:  {audit}\n"),
             ExitCode::SUCCESS,
@@ -189,6 +209,13 @@ fn read_files(files: &[String], print: bool) -> ExitCode {
     finish(&text, ExitCode::from(status))
 }
 
+/// Prints the expansion dump of each file (`fibref::expand_dump`): exit 1
+/// if a program ends in an error record, 2 if a file cannot be read.
+fn expand_files(files: &[String], opts: &Options) -> ExitCode {
+    let (text, status) = fibref::expand_dump::expand_files(files, opts);
+    finish(&text, ExitCode::from(status))
+}
+
 /// Prints `text` to stdout and returns `code`, the verdict of the
 /// command, unless the report could not be written: then it says why on
 /// stderr and exits 2, so that a full device is not a pass. A reader that
@@ -224,11 +251,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match parse(&args) {
+    let (dirs, args) = fibref::cmdline::split_roots(&args);
+    let command = parse(&args);
+    if !dirs.is_empty() && !matches!(command, Command::Run { .. } | Command::Explain { .. }) {
+        eprintln!("fibref: -I belongs to `run` and `explain`\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let roots = Roots::from_env(&dirs, std::env::var_os("FIB_LIB").as_deref());
+    match command {
         Command::Cases { dir } => run_cases(&dir),
-        Command::Explain { file } => run_explain(&file),
-        Command::Run { file, args } => run_file(&file, &args),
+        Command::Explain { file } => run_explain(&file, &roots),
+        Command::Run { file, args } => run_file(&file, &args, &roots),
         Command::Read { files, print } => read_files(&files, print),
+        Command::Expand { files, opts } => expand_files(&files, &opts),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -333,6 +368,23 @@ mod tests {
                 print: false
             }
         );
+    }
+
+    #[test]
+    fn expand_takes_its_options_and_files_from_the_shared_parser() {
+        let opts = Options {
+            context: true,
+            ..Options::default()
+        };
+        assert_eq!(
+            parse(&args(&["expand", "--context", "a.fib", "b.fib"])),
+            Command::Expand {
+                files: vec!["a.fib".to_string(), "b.fib".to_string()],
+                opts
+            }
+        );
+        assert_eq!(parse(&args(&["expand"])), Command::Invalid);
+        assert_eq!(parse(&args(&["expand", "--context"])), Command::Invalid);
     }
 
     #[test]

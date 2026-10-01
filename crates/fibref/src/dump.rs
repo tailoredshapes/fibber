@@ -47,7 +47,19 @@ pub fn print_source(source: &str, file: &str) -> String {
 pub fn dump_forms(forms: &[Form]) -> String {
     let mut out = String::new();
     for f in forms {
-        dump_form(f, 0, &mut out);
+        dump_form(f, 0, None, &mut out);
+    }
+    out
+}
+
+/// The dump of a sequence of top-level forms of the file `home`, as the
+/// expansion dump prints them (spec/bootstrap.md §5): the reader dump's
+/// lines, except that a position in another file than `home` ends with
+/// `@FILE` (see [`span_in`]).
+pub fn dump_forms_in(forms: &[Form], home: &str) -> String {
+    let mut out = String::new();
+    for f in forms {
+        dump_form(f, 0, Some(home), &mut out);
     }
     out
 }
@@ -66,13 +78,28 @@ fn span(p: &Pos) -> String {
     format!("{}:{} {}..{}", p.line, p.col, p.start, p.end)
 }
 
-fn dump_form(f: &Form, depth: usize, out: &mut String) {
+/// A position as the expansion dump prints it: [`span`], and `@FILE`
+/// after it when the position is in another file than `home`, the file of
+/// the module being dumped. A form a macro of another module built from
+/// its own template, or a built-in definition (`<builtin>`), is the case.
+pub(crate) fn span_in(p: &Pos, home: &str) -> String {
+    let at = span(p);
+    if &*p.file == home {
+        at
+    } else {
+        format!("{at}@{}", p.file)
+    }
+}
+
+/// One node of the dump and what it holds, at `depth`: the reader dump
+/// with no `home`, the expansion dump with one.
+pub(crate) fn dump_form(f: &Form, depth: usize, home: Option<&str>, out: &mut String) {
     let indent = "  ".repeat(depth);
-    let at = span(&f.pos);
+    let at = home.map_or_else(|| span(&f.pos), |h| span_in(&f.pos, h));
     let seq = |tag: &str, items: &[Form], out: &mut String| {
         let _ = writeln!(out, "{indent}{tag} {} {at}", items.len());
         for item in items {
-            dump_form(item, depth + 1, out);
+            dump_form(item, depth + 1, home, out);
         }
     };
     match &f.kind {
@@ -117,7 +144,7 @@ fn dump_form(f: &Form, depth: usize, out: &mut String) {
 
 /// `"`, `\` and the control characters escaped, every other character
 /// as it is: the text is unambiguous and needs no printer to produce.
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
@@ -226,6 +253,18 @@ mod tests {
         // A string with a line break and a forbidden character prints escaped.
         let p = print_source("\"a\\nb\\u{A0}\\0\" 1e16 0.00001", "t");
         assert_eq!(p, "\"a\\nb\\u{A0}\\0\"\n1e16\n1e-5\n");
+    }
+
+    #[test]
+    fn a_position_in_another_file_than_home_ends_with_that_file() {
+        let forms = crate::syntax::read_all("(a [b])", "other.fib").expect("reads");
+        let same = dump_forms_in(&forms, "other.fib");
+        assert_eq!(same, dump_forms(&forms));
+        assert_eq!(
+            dump_forms_in(&forms, "home.fib"),
+            "list 2 1:1 0..7@other.fib\n  sym \"a\" 1:2 1..2@other.fib\n  \
+             vec 1 1:4 3..6@other.fib\n    sym \"b\" 1:5 4..5@other.fib\n"
+        );
     }
 
     #[test]

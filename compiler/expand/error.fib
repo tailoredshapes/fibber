@@ -1,0 +1,87 @@
+;; compiler/expand/error.fib: expansion errors, as
+;; crates/fibref/src/expand/error.rs. Every malformed input to the
+;; expander is one of these values, with the position of the offending
+;; form; the expander never traps on input (a `trap` here is for a state
+;; that cannot happen).
+;;
+;; THE SHARED BASE of M6 step 2 (spec/bootstrap.md §5): the types are
+;; fixed; the functions that say `todo:` belong to the porter of this
+;; module. Nothing here may change without telling the other porters.
+(ns expand.error (:use syntax.pos syntax.form syntax.error))
+
+;; The variants of ExpandErrorKind, with the same names and fields (a
+;; `&'static str` is a str, a usize an i64, BadLiteral's ReadErrorKind
+;; the reader's ErrKind).
+(defenum ExpandErrKind
+  (MacroNeedsEvaluator name: str)
+  (MacroPhase name: str fun: str)
+  (MacroFailed name: str message: str)
+  (MacroArity name: str expected: str found: i64)
+  (AmbiguousMacro name: str first: str second: str)
+  (UnquoteOutsideQuasiquote head: str)
+  (SpliceOutsideList)
+  (Malformed head: str reason: str)
+  (MacroNamesCoreForm name: str)
+  (DeriveProtocol name: str)
+  (DeriveTarget name: str)
+  (NotAStruct op: str name: str)
+  (NotAnEnum op: str name: str)
+  (BadReflection op: str)
+  (ThreadStep)
+  (InOutOutsideArgument)
+  (NilCalled)
+  (BraceInPattern)
+  (ExpressionAtTopLevel)
+  (DefinitionInExpression head: str)
+  (NsNotFirst)
+  (TooManySteps limit: i64)
+  (TooDeep limit: i64)
+  (TooLarge limit: i64)
+  (BadLiteral error: ErrKind))
+
+;; An expansion error: what went wrong and where (a macro call's position
+;; for a macro).
+(defstruct ExpandError (kind: ExpandErrKind pos: Pos))
+
+;; The variant's own name, as `expand_kind_name` of
+;; crates/fibref/src/expand_dump/mod.rs prints it in the dump record.
+(defun expand-err-name (k: ExpandErrKind) -> str
+  (match k
+    ((MacroNeedsEvaluator _) "MacroNeedsEvaluator")
+    ((MacroPhase _ _) "MacroPhase")
+    ((MacroFailed _ _) "MacroFailed")
+    ((MacroArity _ _ _) "MacroArity")
+    ((AmbiguousMacro _ _ _) "AmbiguousMacro")
+    ((UnquoteOutsideQuasiquote _) "UnquoteOutsideQuasiquote")
+    ((SpliceOutsideList) "SpliceOutsideList")
+    ((Malformed _ _) "Malformed")
+    ((MacroNamesCoreForm _) "MacroNamesCoreForm")
+    ((DeriveProtocol _) "DeriveProtocol")
+    ((DeriveTarget _) "DeriveTarget")
+    ((NotAStruct _ _) "NotAStruct")
+    ((NotAnEnum _ _) "NotAnEnum")
+    ((BadReflection _) "BadReflection")
+    ((ThreadStep) "ThreadStep")
+    ((InOutOutsideArgument) "InOutOutsideArgument")
+    ((NilCalled) "NilCalled")
+    ((BraceInPattern) "BraceInPattern")
+    ((ExpressionAtTopLevel) "ExpressionAtTopLevel")
+    ((DefinitionInExpression _) "DefinitionInExpression")
+    ((NsNotFirst) "NsNotFirst")
+    ((TooManySteps _) "TooManySteps")
+    ((TooDeep _) "TooDeep")
+    ((TooLarge _) "TooLarge")
+    ((BadLiteral _) "BadLiteral")))
+
+;; The kind's Display text: the message after the position, word for
+;; word as `impl Display for ExpandErrorKind` writes it.
+(defun expand-err-message (k: ExpandErrKind) -> str
+  (trap "todo: expand.error expand-err-message"))
+
+;; An error of kind at pos, as a value to return.
+(defun expand-error (kind: ExpandErrKind pos: Pos) -> ExpandError
+  (ExpandError kind pos))
+
+;; `Malformed head reason` at pos (expand/build.rs `malformed`).
+(defun malformed-error (head: str reason: str pos: Pos) -> ExpandError
+  (ExpandError (Malformed head reason) pos))

@@ -1,0 +1,78 @@
+;; spec:   syntax §3.16 and §4.5 (derive, Map); types §2.12; stdlib design 2.7 and E10
+;; expect: accept
+;; result: 255
+;; audit:  clean
+;; `derive Hash` on a struct of two strings, on a struct holding it and on
+;; an enum with string fields, and a Map keyed by the struct: the symbol
+;; table of a compiler. The derived instance folded the fields with
+;; `h*31 + hash x`, so `(hash (P2 "hello" "world"))` was `trap: integer
+;; overflow in * at i64` under both tools (stdlib design §7 E10, A10 hash)
+;; and a Map keyed by such a struct failed at its first `assoc`. It folds
+;; with `hash-combine` now (case 198). The expected values come from an
+;; independent Python transcription of the definitions: a struct is its one
+;; variant, seeded with 0, and an enum variant with its index; each field's
+;; `hash` is folded in order; the strings hash as FNV-1a (types §2.12).
+;; The result has bit k set when probe k holds, so all eight give
+;; 2^8 - 1 = 255.
+;;   0 (P2 "hello" "world") hashes as Python says, 1 the swapped struct
+;;   differs, 2 ("ab" "c") and ("a" "bc") differ, 3 an equal struct built
+;;   separately has an equal hash; 4 a struct holding a struct, an int and
+;;   a string hashes as Python says; 5 the variants of an enum: `(Word "x")`
+;;   is the fold of "x" from the seed 0, `(Both "x" "y")` the fold of "x" and
+;;   "y" from the seed 1 and the field-less `Stop` is its index, 2;
+;;   6 a Map keyed by P2 holds three long keys, finds each by a separately
+;;   built equal key and does not find a fourth; 7 `assoc` over an existing
+;;   equal key replaces its value: the count stays three and the new value
+;;   is found.
+;; The program also defines its own `hash-combine`, which traps: the derived
+;; instances name the prelude's as `fib.prelude/hash-combine`, so a binding
+;; of the name in the program does not capture it, and a derive that used
+;; the program's would trap in every probe.
+(defstruct P2 (a: str b: str))
+(derive Eq P2)
+(derive Hash P2)
+
+(defstruct Q (p: P2 n: i64 s: str))
+(derive Eq Q)
+(derive Hash Q)
+
+(defenum Tok (Word s: str) (Both a: str b: str) (Stop))
+(derive Eq Tok)
+(derive Hash Tok)
+
+(defun hash-combine (h: i64 x: i64) -> i64
+  (trap "derive Hash used the program's hash-combine, not the prelude's"))
+
+(defun bit (k: i64 ok: bool) -> i64 (if ok (shl 1 k) 0))
+
+(defun key (n: i64) -> P2
+  (match n
+    (0 (P2 "the-first-qualified-name" "a-member-of-the-first"))
+    (1 (P2 "the-second-qualified-name" "a-member-of-the-second"))
+    (2 (P2 "the-third-qualified-name" "a-member-of-the-third"))
+    (_ (P2 "no-such-qualified-name" "no-such-member"))))
+
+(defun table () -> (Map P2 i64)
+  (assoc (assoc (assoc (map-empty) (key 0) 10) (key 1) 20) (key 2) 30))
+
+(defun found (m: (Map P2 i64) n: i64) -> i64
+  (match (get m (key n))
+    ((some v) v)
+    (nil -1)))
+
+(defun main () -> i64
+  (let ((hw (hash (P2 "hello" "world")))
+        (m (table)))
+    (+ (bit 0 (= hw 3860865108586487084))
+    (+ (bit 1 (!= hw (hash (P2 "world" "hello"))))
+    (+ (bit 2 (!= (hash (P2 "ab" "c")) (hash (P2 "a" "bc"))))
+    (+ (bit 3 (= hw (hash (P2 "hello" "world"))))
+    (+ (bit 4 (= (hash (Q (P2 "hello" "world") 7 "tail")) -2367888535558872695))
+    (+ (bit 5 (and (= (hash (Word "x")) -4010485839152257598)
+                   (and (= (hash (Both "x" "y")) 3147012248054918213)
+                        (= (hash Stop) 2))))
+    (+ (bit 6 (and (= (+ (found m 0) (+ (found m 1) (found m 2))) 60)
+                   (and (= (found m 0) 10) (= (found m 3) -1))))
+       (bit 7 (let ((m2 (assoc m (key 1) 99)))
+                (and (= (count m) 3)
+                     (and (= (count m2) 3) (= (found m2 1) 99))))))))))))))

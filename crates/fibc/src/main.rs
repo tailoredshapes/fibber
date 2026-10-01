@@ -15,13 +15,14 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use fibc::compile::{compile, compile_executable};
-use fibc::front::{check, Front};
+use fibc::front::{check_in, Front};
 use fibc::harness::child::{EXIT_COMPILE_FAILED, EXIT_REJECTED, EXIT_UNSUPPORTED};
 use fibc::harness::gen::GenConfig;
 #[cfg(feature = "llvm")]
 use fibc::harness::Harness;
 #[cfg(feature = "llvm")]
 use fibref::cases::{render, Report, Status};
+use fibref::roots::Roots;
 #[cfg(feature = "llvm")]
 use lair::aot::{build_executable, library_dir, Options};
 #[cfg(feature = "llvm")]
@@ -38,14 +39,14 @@ fn read(file: &str) -> Result<String, ExitCode> {
 
 /// The front end and the lowering: the lIR text, or the exit code that
 /// says why not (its message already printed).
-fn lower(file: &str) -> Result<String, ExitCode> {
-    lower_kind(file, false)
+fn lower(file: &str, roots: &Roots) -> Result<String, ExitCode> {
+    lower_kind(file, roots, false)
 }
 
 /// [`lower`], for an executable when `executable` (compiler.md §1).
-fn lower_kind(file: &str, executable: bool) -> Result<String, ExitCode> {
+fn lower_kind(file: &str, roots: &Roots, executable: bool) -> Result<String, ExitCode> {
     let source = read(file)?;
-    let checked = match check(&source, file) {
+    let checked = match check_in(&source, file, roots) {
         Front::Checked(c) => c,
         Front::Rejected(m) => {
             eprintln!("rejected:\n{m}");
@@ -74,12 +75,12 @@ fn no_llvm(what: &str) -> ExitCode {
 }
 
 #[cfg(not(feature = "llvm"))]
-fn run(_file: &str, _trace: bool, _args: &[String]) -> ExitCode {
+fn run(_file: &str, _roots: &Roots, _trace: bool, _args: &[String]) -> ExitCode {
     no_llvm("run")
 }
 
 #[cfg(not(feature = "llvm"))]
-fn build(_file: &str, _out: &str, _link: &Link) -> ExitCode {
+fn build(_file: &str, _roots: &Roots, _out: &str, _link: &Link) -> ExitCode {
     no_llvm("build")
 }
 
@@ -150,8 +151,8 @@ fn gen(cfg: GenConfig) -> ExitCode {
 }
 
 #[cfg(feature = "llvm")]
-fn run(file: &str, trace: bool, args: &[String]) -> ExitCode {
-    let lir = match lower(file) {
+fn run(file: &str, roots: &Roots, trace: bool, args: &[String]) -> ExitCode {
+    let lir = match lower(file, roots) {
         Ok(l) => l,
         Err(code) => return code,
     };
@@ -196,12 +197,12 @@ fn run(file: &str, trace: bool, args: &[String]) -> ExitCode {
 /// rpath) each `-L` directory. A directory that cannot be one is refused
 /// here first, before anything is compiled (exit 2); `lair` checks again.
 #[cfg(feature = "llvm")]
-fn build(file: &str, out: &str, link: &Link) -> ExitCode {
+fn build(file: &str, roots: &Roots, out: &str, link: &Link) -> ExitCode {
     if let Some(message) = link.dirs.iter().find_map(|d| library_dir(d).err()) {
         eprintln!("fibc: {message}");
         return ExitCode::from(2);
     }
-    let lir = match lower_kind(file, true) {
+    let lir = match lower_kind(file, roots, true) {
         Ok(l) => l,
         Err(code) => return code,
     };
@@ -224,19 +225,19 @@ fn build(file: &str, out: &str, link: &Link) -> ExitCode {
     }
 }
 
-fn emit(file: &str) -> ExitCode {
-    match lower(file) {
+fn emit(file: &str, roots: &Roots) -> ExitCode {
+    match lower(file, roots) {
         Ok(l) => write_stdout(&l),
         Err(code) => code,
     }
 }
 
-fn explain(file: &str) -> ExitCode {
+fn explain(file: &str, roots: &Roots) -> ExitCode {
     let source = match read(file) {
         Ok(s) => s,
         Err(code) => return code,
     };
-    match check(&source, file) {
+    match check_in(&source, file, roots) {
         Front::Checked(c) => write_stdout(&fibref::own::explain::explain(&c.typed, &c.owned)),
         Front::Rejected(m) => {
             eprintln!("rejected:\n{m}");
@@ -249,12 +250,12 @@ fn explain(file: &str) -> ExitCode {
     }
 }
 
-fn itrace(file: &str) -> ExitCode {
+fn itrace(file: &str, roots: &Roots) -> ExitCode {
     let source = match read(file) {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let run = fibc::harness::interp::run(&source, file);
+    let run = fibc::harness::interp::run_in(&source, file, roots);
     eprintln!("{:?}", run.outcome);
     write_stdout(&run.trace.render())
 }
@@ -312,12 +313,27 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match parse(&args) {
-        Command::Run { file, trace, args } => run(&file, trace, &args),
-        Command::Build { file, out, link } => build(&file, &out, &link),
-        Command::Emit { file } => emit(&file),
-        Command::Explain { file } => explain(&file),
-        Command::Itrace { file } => itrace(&file),
+    let (dirs, args) = fibref::cmdline::split_roots(&args);
+    let command = parse(&args);
+    let takes_roots = matches!(
+        command,
+        Command::Run { .. }
+            | Command::Build { .. }
+            | Command::Emit { .. }
+            | Command::Explain { .. }
+            | Command::Itrace { .. }
+    );
+    if !dirs.is_empty() && !takes_roots {
+        eprintln!("fibc: -I belongs to a command that reads a program\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let roots = Roots::from_env(&dirs, std::env::var_os("FIB_LIB").as_deref());
+    match command {
+        Command::Run { file, trace, args } => run(&file, &roots, trace, &args),
+        Command::Build { file, out, link } => build(&file, &roots, &out, &link),
+        Command::Emit { file } => emit(&file, &roots),
+        Command::Explain { file } => explain(&file, &roots),
+        Command::Itrace { file } => itrace(&file, &roots),
         Command::Cases { dir } => cases(&dir),
         Command::Gen(cfg) => gen(cfg),
         Command::Help => {

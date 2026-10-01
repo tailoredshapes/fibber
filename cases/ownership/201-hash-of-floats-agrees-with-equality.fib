@@ -1,0 +1,81 @@
+;; spec:   types §2.12 (hash, `=` on floats); stdlib design 2.7 and E10
+;; expect: accept
+;; result: 255
+;; audit:  clean
+;; `hash` of a float agrees with `=` on floats: `(= 0.0 -0.0)` is true, so
+;; the two must hash alike, and a NaN is not `=` to anything, itself
+;; included, so every NaN may as well hash as one value. The hash was the
+;; bits of the float as an f64, so `-0.0` and `0.0` hashed apart (a Map
+;; holding the key 0.0 did not find it by -0.0, stdlib design §7 E10, A6)
+;; and the NaNs hashed by their payloads, which hardware and constant
+;; folding choose differently: `(hash (/ 0.0 0.0))` was -2251799813685248
+;; in the interpreter (the hardware's negative quiet NaN) and
+;; 9221120237041090560 compiled (the folded positive one), a rule-6
+;; disagreement. Now `-0.0` hashes as `0.0` (the bits 0) and every NaN as
+;; the bits of the quiet NaN, 0x7ff8000000000000, 9221120237041090560, at
+;; both widths; every other float keeps its bits as an f64, as case 169
+;; pins for 1.5 and 2.5f32.
+;; The result has bit k set when probe k holds, so all eight give
+;; 2^8 - 1 = 255.
+;;   0 `0.0` and `-0.0` hash as 0, 1 so do the f32 ones, 2 six f64 NaNs
+;;   (quiet, negative quiet, signalling, all payload bits, negative
+;;   signalling, and 0.0 / 0.0) all hash as 9221120237041090560, 3 so do
+;;   the f32 NaNs (quiet, negative, signalling) and the one `(fpext f64 ..)`
+;;   makes, 4 the finite and infinite floats keep their bits (1.5, -1.5, the
+;;   smallest subnormal, the infinities), 5 an f32 hashes as the f64 it
+;;   widens to, 6 `=` implies equal hash over every pair of a list that has
+;;   both zeros, both infinities and ordinary numbers, 7 a Map holding the
+;;   key 0.0 finds it by -0.0 and the other way round, assoc by -0.0 over
+;;   0.0 replaces the value (count 1), and a NaN key is never found, as in
+;;   Clojure.
+(defun bit (k: i64 ok: bool) -> i64 (if ok (shl 1 k) 0))
+
+(def nan-hash: i64 9221120237041090560)
+
+(defun nan64 (bits: i64) -> bool
+  (= (hash (bits->f64 bits)) nan-hash))
+
+(defun nan32 (bits: i32) -> bool
+  (= (hash (bits->f32 bits)) nan-hash))
+
+(defun law (xs: (Vec f64) i: i64 j: i64) -> bool
+  (if (= i (count xs))
+      true
+      (if (= j (count xs))
+          (law xs (+ i 1) 0)
+          (if (and (= (nth xs i) (nth xs j)) (!= (hash (nth xs i)) (hash (nth xs j))))
+              false
+              (law xs i (+ j 1))))))
+
+(defun found (m: (Map f64 i64) k: f64) -> i64
+  (match (get m k) ((some v) v) (nil -1)))
+
+(defun main () -> i64
+  (let ((zero (assoc (map-empty) 0.0 1))
+        (negzero (assoc (map-empty) -0.0 2))
+        (nan (/ 0.0 0.0))
+        (floats [0.0 -0.0 1.5 -1.5 2.5 100.0 -100.0 0.1 5e-324 (/ 1.0 0.0) (/ -1.0 0.0)]))
+    (+ (bit 0 (and (= (hash 0.0) 0) (= (hash -0.0) 0)))
+    (+ (bit 1 (and (= (hash 0.0f32) 0) (= (hash -0.0f32) 0)))
+    (+ (bit 2 (and (nan64 9221120237041090560)
+              (and (nan64 -2251799813685248)
+              (and (nan64 9218868437227405313)
+              (and (nan64 9223372036854775807)
+              (and (nan64 -4503599627370495)
+                   (= (hash nan) nan-hash)))))))
+    (+ (bit 3 (and (nan32 2143289344i32)
+              (and (nan32 -4194304i32)
+              (and (nan32 2139095041i32)
+                   (= (hash (fpext f64 (bits->f32 2143289344i32))) nan-hash)))))
+    (+ (bit 4 (and (= (hash 1.5) 4609434218613702656)
+              (and (= (hash -1.5) -4613937818241073152)
+              (and (= (hash (bits->f64 1)) 1)
+              (and (= (hash (/ 1.0 0.0)) 9218868437227405312)
+                   (= (hash (/ -1.0 0.0)) -4503599627370496))))))
+    (+ (bit 5 (and (= (hash 2.5f32) (hash 2.5)) (= (hash 2.5f32) 4612811918334230528)))
+    (+ (bit 6 (law floats 0 0))
+       (bit 7 (and (= (found zero -0.0) 1)
+              (and (= (found negzero 0.0) 2)
+              (and (= (count (assoc zero -0.0 3)) 1)
+              (and (= (found (assoc zero -0.0 3) 0.0) 3)
+                   (= (found (assoc zero nan 4) nan) -1)))))))))))))))

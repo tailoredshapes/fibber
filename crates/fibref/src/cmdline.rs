@@ -27,6 +27,35 @@ pub fn from_os(args: impl IntoIterator<Item = OsString>) -> Result<Vec<String>, 
     Ok(words)
 }
 
+/// The library roots named on a command line (spec/compiler.md §1,
+/// **Proposed**): every `-I DIR` and `-IDIR` among the words before the
+/// first `--`, in order, and the words that are left, in order. The
+/// flag may stand anywhere there, as `cc`'s may, so each command parses
+/// what is left as before. A `-I` without a directory, or with an empty
+/// one or `--`, is left in the words, which the command's own parse
+/// refuses.
+pub fn split_roots(words: &[String]) -> (Vec<String>, Vec<String>) {
+    let (mut dirs, mut rest) = (Vec::new(), Vec::new());
+    let mut it = words.iter().peekable();
+    let mut program = false;
+    while let Some(word) = it.next() {
+        program = program || word == "--";
+        if program {
+            rest.push(word.clone());
+            continue;
+        }
+        match word.strip_prefix("-I") {
+            Some("") => match it.next_if(|d| !d.is_empty() && *d != "--") {
+                Some(dir) => dirs.push(dir.clone()),
+                None => rest.push(word.clone()),
+            },
+            Some(dir) => dirs.push(dir.to_string()),
+            None => rest.push(word.clone()),
+        }
+    }
+    (dirs, rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -34,6 +63,36 @@ mod tests {
 
     fn os(bytes: &[u8]) -> OsString {
         OsString::from_vec(bytes.to_vec())
+    }
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn roots_are_taken_from_anywhere_before_the_dashes_in_order() {
+        let (dirs, rest) = split_roots(&words(&[
+            "run", "-I", "a", "f.fib", "-Ib", "-I", "c", "--", "-I", "d", "x",
+        ]));
+        assert_eq!(dirs, ["a", "b", "c"]);
+        assert_eq!(rest, ["run", "f.fib", "--", "-I", "d", "x"]);
+    }
+
+    #[test]
+    fn a_flag_without_a_directory_is_left_for_the_command_to_refuse() {
+        let (dirs, rest) = split_roots(&words(&["run", "f.fib", "-I"]));
+        assert!(dirs.is_empty());
+        assert_eq!(rest, ["run", "f.fib", "-I"]);
+        let (dirs, rest) = split_roots(&words(&["run", "-I", "", "f.fib"]));
+        assert!(dirs.is_empty());
+        assert_eq!(rest, ["run", "-I", "", "f.fib"]);
+    }
+
+    #[test]
+    fn words_that_only_start_with_i_are_not_roots() {
+        let (dirs, rest) = split_roots(&words(&["run", "-i", "Inc.fib", "I"]));
+        assert!(dirs.is_empty());
+        assert_eq!(rest, ["run", "-i", "Inc.fib", "I"]);
     }
 
     #[test]

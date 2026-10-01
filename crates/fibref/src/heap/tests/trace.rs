@@ -1,8 +1,8 @@
 //! The trace records every operation, in order, with the documented
 //! events (`spec/method.md`, rule 6).
 
-use super::{cell, imm};
-use crate::heap::{Event, Heap, Kind, ObjId, Value};
+use super::{atom, cell, imm};
+use crate::heap::{trace_allocs, traced, Event, Heap, Kind, ObjId, Value};
 
 /// The events the scripted run below must produce, for a cell `c`
 /// holding an immutable `v`.
@@ -82,4 +82,39 @@ fn failed_operations_leave_no_trace() {
     assert!(heap.read(v, 5).is_err());
     assert!(heap.alloc(Kind::Cell, vec![]).is_err());
     assert_eq!(heap.trace().len(), before);
+}
+
+#[test]
+fn allocs_are_the_a_lines_of_the_trace() {
+    let mut heap = Heap::new();
+    assert_eq!(trace_allocs(heap.trace()), 0);
+    heap.alloc_immortal(Kind::Immutable, vec![])
+        .expect("a literal is not an A line");
+    let a = imm(&mut heap, vec![]);
+    cell(&mut heap, Value::Int(0));
+    atom(&mut heap, Value::Int(0));
+    let s = heap.open_scope();
+    heap.alloc_in_scope(s, Kind::Immutable, vec![Value::Ref(a)])
+        .expect("a stack object is an S line");
+    assert_eq!(trace_allocs(heap.trace()), 3);
+}
+
+#[test]
+fn what_the_defs_allocated_is_not_traced() {
+    let mut heap = Heap::new();
+    let leaf = imm(&mut heap, vec![]);
+    let root = imm(&mut heap, vec![Value::Ref(leaf)]);
+    heap.release(leaf).expect("root holds leaf");
+    heap.immortalise(root).expect("a def's value");
+    assert_eq!(trace_allocs(heap.trace()), 0);
+    let kept = imm(&mut heap, vec![]);
+    imm(&mut heap, vec![Value::Ref(kept)]);
+    assert_eq!(trace_allocs(heap.trace()), 2);
+    assert_eq!(
+        traced(heap.trace()).first(),
+        Some(&Event::Alloc {
+            id: kept,
+            kind: Kind::Immutable
+        })
+    );
 }

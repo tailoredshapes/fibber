@@ -240,3 +240,61 @@ fn a_report_with_no_cases_is_not_ok() {
     assert_eq!(report.counts.total(), 0);
     assert!(!report.ok(), "zero cases must never read as a green run");
 }
+
+/// [`Scripted`], which also counts: `(allocs N)` in the source is the
+/// number of objects the run allocated.
+struct Counting;
+
+impl Evaluator for Counting {
+    fn run(&self, source: &str) -> Outcome {
+        Scripted.run(source)
+    }
+
+    fn run_counted(&self, source: &str, path: &Path) -> (Outcome, Option<u64>) {
+        let counted = source.find("(allocs ").map(|at| {
+            let rest = &source[at + "(allocs ".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().unwrap()
+        });
+        (self.run_at(source, path), counted)
+    }
+}
+
+const BOUNDED: &str =
+    ";; spec: §4\n;; expect: accept\n;; result: 3\n;; audit: clean\n;; allocs: <= 7\n";
+
+#[test]
+fn the_runner_hands_the_evaluators_count_to_the_verdict() {
+    let dir = TempDir::new("allocs");
+    dir.write("1-under.fib", &format!("{BOUNDED}(return 3) (allocs 0)\n"));
+    dir.write("2-exact.fib", &format!("{BOUNDED}(return 3) (allocs 7)\n"));
+    dir.write("3-over.fib", &format!("{BOUNDED}(return 3) (allocs 8)\n"));
+    dir.write("4-none.fib", &format!("{BOUNDED}(return 3)\n"));
+    let report = run_dir(&dir.0, &Counting).unwrap();
+    let statuses: Vec<String> = report
+        .results
+        .iter()
+        .map(|r| r.status.to_string())
+        .collect();
+    assert_eq!(statuses[0], "pass", "{statuses:?}");
+    assert_eq!(statuses[1], "pass", "{statuses:?}");
+    assert_eq!(
+        statuses[2],
+        "FAIL: allocs: expected at most 7 heap objects, the run allocated 8"
+    );
+    assert_eq!(
+        statuses[3],
+        "FAIL: allocs: the header says `<= 7` but the evaluator reported no allocation count"
+    );
+    assert_eq!(report.counts.fail, 2);
+    assert!(!report.ok(), "an exceeded bound fails the run");
+}
+
+#[test]
+fn an_evaluator_that_does_not_count_fails_a_bounded_case_never_passes_it() {
+    let dir = TempDir::new("uncounted");
+    dir.write("a.fib", &format!("{BOUNDED}(return 3) (allocs 0)\n"));
+    let report = run_dir(&dir.0, &Scripted).unwrap();
+    assert_eq!(report.counts.fail, 1, "{report:?}");
+    assert_eq!(report.counts.pass, 0);
+}

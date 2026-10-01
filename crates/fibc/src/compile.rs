@@ -74,6 +74,12 @@ pub(crate) fn emit_all(p: &mut Program<'_>) -> Result<(), Unsupported> {
             Work::Body(inst) => emit_body(p, inst)?,
             Work::Closure { owner, lit, name } => emit_closure(p, owner, lit, &name)?,
         }
+        if let Some(body) = p.queue.overflow() {
+            return Err(Unsupported(format!(
+                "{body} is wanted at ever larger types, a polymorphic recursion that never \
+                 ends (types §3.6): the compilation would never finish"
+            )));
+        }
     }
     Ok(())
 }
@@ -218,6 +224,30 @@ mod tests {
     fn lir_of(src: &str) -> String {
         let c = fibref::own::check_source(src, "t").expect("checks");
         compile(&c).expect("compiles")
+    }
+
+    /// A method of an `impl` that is wanted at ever larger types: the
+    /// checker's rule on functions (case 196) does not see it, the
+    /// interpreter runs it, and the compiler used to compile it until
+    /// memory ran out (a 60 s timeout, a 4 GB limit hit, in the check
+    /// that this test replaces by an answer).
+    #[test]
+    fn an_impl_method_wanted_at_ever_larger_types_stops_with_a_message() {
+        let c = fibref::own::check_source(
+            "(defprotocol Sz (size (self) -> i64))
+             (defstruct (W a) (x: a))
+             (impl Sz i64 (size (self) 1))
+             (impl Sz (W a) :where ((Sz a))
+               (size (self) (if false (size (W (W (. self x)))) (size (. self x)))))
+             (defun main () -> i64 (size (W 5)))",
+            "t",
+        )
+        .expect("checks");
+        let Err(Unsupported(m)) = compile(&c) else {
+            panic!("compiled")
+        };
+        assert!(m.contains("a polymorphic recursion that never ends"), "{m}");
+        assert!(m.starts_with("the method size of Sz is wanted"), "{m}");
     }
 
     #[test]

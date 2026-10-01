@@ -178,6 +178,13 @@ pub struct Unit {
     pub poly: HashMap<FunId, Scheme>,
     /// The members whose annotation scheme was instantiated.
     pub poly_used: std::collections::HashSet<FunId>,
+    /// The member whose body is being inferred.
+    pub cur: Option<FunId>,
+    /// Each occurrence of a member at its annotation, in a member's body.
+    pub poly_calls: Vec<super::polyrec::PolyCall>,
+    /// The rigid variable behind each quantified variable of a member's
+    /// annotation scheme, in the scheme's order.
+    pub poly_vars: HashMap<FunId, Vec<u32>>,
     /// The variable types of the enclosing loops.
     pub loops: Vec<Vec<Ty>>,
     /// In an `impl` body: the declared context (§2.7).

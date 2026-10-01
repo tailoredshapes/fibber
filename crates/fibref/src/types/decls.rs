@@ -47,6 +47,11 @@ pub struct ModuleInfo {
     /// The modules a name used in it is looked up in, in order: itself,
     /// its `:use`s, the prelude, the builtins.
     pub chain: Vec<ModuleId>,
+    /// Its `:use`s, in the order written: `chain[1..=uses.len()]`.
+    pub uses: Vec<ModuleId>,
+    /// The modules it re-exports (`(:export-from m)`, syntax §5), each
+    /// also one of its `uses`: what they export, it exports.
+    pub reexports: Vec<ModuleId>,
     /// Its `:require`s, alias to module, and every module it requires or
     /// uses under its full `ns` name.
     pub aliases: HashMap<String, ModuleId>,
@@ -350,7 +355,7 @@ impl Globals {
     pub fn add_module(
         &mut self,
         ns: &str,
-        uses: &[ModuleId],
+        (uses, reexports): (&[ModuleId], &[ModuleId]),
         aliases: HashMap<String, ModuleId>,
     ) -> ModuleId {
         let id = ModuleId(self.modules.len() as u32);
@@ -366,6 +371,8 @@ impl Globals {
             ns: ns.to_string(),
             names: Names::default(),
             chain,
+            uses: uses.to_vec(),
+            reexports: reexports.to_vec(),
             aliases,
         });
         id

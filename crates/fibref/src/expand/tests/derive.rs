@@ -93,7 +93,8 @@ fn hash_and_show_on_a_struct() {
     let got = derive_once("(defstruct S (a: i64 b: str))", "(derive Hash S)");
     assert_eq!(
         one(&got),
-        one("(impl Hash S (hash (self) (+ (* (+ (* 0 31) (hash (. self a))) 31) (hash (. self b)))))")
+        one("(impl Hash S (hash (self) (fib.prelude/hash-combine \
+             (fib.prelude/hash-combine 0 (hash (. self a))) (hash (. self b)))))")
     );
     let got = derive_once("(defstruct S (a: i64 b: str))", "(derive Show S)");
     assert_eq!(
@@ -110,7 +111,8 @@ fn hash_and_show_on_an_enum() {
     let got = derive_once("(defenum T (A) (B x: i64))", "(derive Hash T)");
     assert_eq!(
         got,
-        "(impl Hash T (hash (self) (match self ((A) 0) ((B #x.1) (+ (* 1 31) (hash #x.1))))))"
+        "(impl Hash T (hash (self) (match self ((A) 0) \
+         ((B #x.1) (fib.prelude/hash-combine 1 (hash #x.1))))))"
     );
     let got = derive_once("(defenum T (A) (B x: i64))", "(derive Show T)");
     assert_eq!(

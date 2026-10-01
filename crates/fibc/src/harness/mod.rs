@@ -9,12 +9,13 @@ pub mod interp;
 use std::path::{Path, PathBuf};
 
 use fibref::cases::{
-    judge, list_cases, parse_header, AuditSummary, CaseResult, HeaderError, HeaderErrorKind,
-    Outcome, Report, Status, Value,
+    case_roots, judge_counted, list_cases, parse_header, AuditSummary, CaseResult, HeaderError,
+    HeaderErrorKind, Outcome, Report, Status, Value,
 };
 
 use crate::trace::{compare, Trace};
 use child::Said;
+use fibref::roots::Roots;
 
 /// Where the compiler binary is.
 pub struct Harness {
@@ -38,7 +39,13 @@ impl Harness {
             }),
             Ok(source) => match parse_header(path, &source) {
                 Err(e) => Status::HeaderError(e),
-                Ok(header) => judge(&header, &self.outcome(path, &source)),
+                Ok(header) => match case_roots(path, &source) {
+                    Err(e) => Status::HeaderError(e),
+                    Ok(roots) => {
+                        let (outcome, allocs) = self.counted_in(path, &source, &roots);
+                        judge_counted(&header, &outcome, allocs)
+                    }
+                },
             },
         };
         CaseResult {
@@ -50,10 +57,32 @@ impl Harness {
     /// The compiled outcome of a case, checked against the
     /// interpreter's (compiler.md §5 step 4).
     pub fn outcome(&self, path: &Path, source: &str) -> Outcome {
+        self.counted(path, source).0
+    }
+
+    /// [`Harness::outcome`] and the number of heap objects the compiled
+    /// program allocated, the `A` lines of its `FIB_TRACE=1` trace
+    /// (`None` unless it ran): what the header key `allocs` bounds.
+    /// A single-threaded run's trace is the interpreter's line for line
+    /// or the outcome says so, so the two counts are one number there.
+    pub fn counted(&self, path: &Path, source: &str) -> (Outcome, Option<u64>) {
+        self.counted_in(path, source, &[])
+    }
+
+    /// [`Harness::counted`] with the library roots the case's header
+    /// names (`case_roots`), which both sides are given alike: the
+    /// interpreter as roots, the child as `-I` flags.
+    pub fn counted_in(
+        &self,
+        path: &Path,
+        source: &str,
+        roots: &[PathBuf],
+    ) -> (Outcome, Option<u64>) {
         let file = path.to_string_lossy();
-        let i = interp::run(source, &file);
-        let c = child::run(&self.fibc, path);
-        combine(i.outcome, &i.trace, c.said, &c.trace)
+        let i = interp::run_in(source, &file, &Roots::new(roots.to_vec()));
+        let c = child::run_in(&self.fibc, path, roots);
+        let allocs = matches!(c.said, Said::Result(_)).then(|| c.trace.allocs());
+        (combine(i.outcome, &i.trace, c.said, &c.trace), allocs)
     }
 }
 

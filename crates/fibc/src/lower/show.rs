@@ -55,12 +55,12 @@ impl<'a> Cx<'_, 'a> {
                     conv(self, &format!("(sext i64 {})", x.text()))
                 }
                 Scalar::Bool | Scalar::Char => conv(self, &format!("(zext i64 {})", x.text())),
-                Scalar::F64 => conv(self, &format!("(bitcast i64 {})", x.text())),
+                Scalar::F64 => conv(self, &format!("(call @fib.double-hash {})", x.text())),
                 Scalar::F32 => {
                     let d = self
                         .b
                         .val(&format!("(fpext double {})", x.text()), LirTy::Double);
-                    conv(self, &format!("(bitcast i64 {})", d.text()))
+                    conv(self, &format!("(call @fib.double-hash {})", d.text()))
                 }
                 Scalar::Ptr => conv(self, &format!("(ptrtoint i64 {})", x.text())),
                 Scalar::Unit => V::int(LirTy::I64, 0),

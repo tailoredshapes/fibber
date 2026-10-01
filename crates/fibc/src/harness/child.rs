@@ -3,7 +3,7 @@
 //! and what its exit status and streams say.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -48,7 +48,12 @@ pub struct ChildRun {
 
 /// Runs `fibc run --trace file` as a child and reads it.
 pub fn run(fibc: &Path, file: &Path) -> ChildRun {
-    let out = match spawn(fibc, file) {
+    run_in(fibc, file, &[])
+}
+
+/// [`run`] with `-I dir` for each of the case's library roots, in order.
+pub fn run_in(fibc: &Path, file: &Path, roots: &[PathBuf]) -> ChildRun {
+    let out = match spawn(fibc, file, roots) {
         Ok(o) => o,
         Err(m) => {
             return ChildRun {
@@ -122,11 +127,15 @@ fn untraced(stderr: &str) -> String {
         .collect()
 }
 
-fn spawn(fibc: &Path, file: &Path) -> Result<Output, String> {
+fn spawn(fibc: &Path, file: &Path, roots: &[PathBuf]) -> Result<Output, String> {
+    // The case's roots are its header's alone: FIB_LIB, which the child
+    // would read, is not part of the case (the interpreter side does not).
     let mut child = Command::new(fibc)
         .arg("run")
         .arg("--trace")
+        .args(roots.iter().flat_map(|r| ["-I".as_ref(), r.as_os_str()]))
         .arg(file)
+        .env_remove("FIB_LIB")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

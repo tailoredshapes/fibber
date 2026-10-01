@@ -593,7 +593,19 @@ for the values that are not finite. `hash` of an integer is
 its value, of a `bool` or a `char` its code, of a field-less enum its
 variant index, of a keyword the 64-bit FNV-1a of its name and of a
 `str` of its bytes, of a float the bits of its value as an `f64`, of
-unit 0.
+unit 0. **Proposed** (stdlib design §2.7, §7 E10; it amends the sentence
+above for two floats and needs the owner's sign-off): a float hashes as
+those bits except that `-0.0` hashes as `0.0` (0) and every NaN as the
+bits of the quiet NaN, `0x7ff8000000000000`, at both widths, so that `=`
+implies equal hashes (`(= 0.0 -0.0)` is true, and a `Map` holding the
+key `0.0` must find it by `-0.0`) and the two tools agree on the hash of
+a NaN whose bits the hardware or the constant folder chose; a NaN is not
+`=` to itself, so a NaN key is never found. Implemented in both tools;
+case 201 pins it and case 169 the rest. `derive Hash` and the prelude's
+`Hash (List a)` and `Hash (Option a)` fold their fields' hashes with the
+prelude's `hash-combine` (a rotate-and-xor mixer that never traps) from
+a seed, the variant index (0 for a struct); the `h*31 + x` they used
+trapped on integer overflow at two strings (cases 198 to 200).
 
 `Self` in a signature stands for the dispatch type, so `(+ a b)` unifies
 both operands: `(+ (i32 1) 2)` is a type error, never a promotion.
@@ -982,6 +994,27 @@ parameters are never generalised. Polymorphic recursion (a `defun` used
 at two instantiations inside its own SCC) requires the full annotation of
 that `defun`; the annotation is then its scheme for the recursive
 occurrences. Mutually recursive `defun`s get one scheme each.
+
+**Polymorphic recursion that never ends** (**Proposed**, stdlib design §7
+B4). A compiler builds a body once for each type a bounded variable takes
+(§4.3), so a `defun` whose recursive occurrence instantiates a variable `v`
+of a member with a type that is more than a variable and mentions a variable
+`r` of the caller, where `v` leads back to `r` through the instantiations of
+the SCC's other occurrences (`r` at `(Vec r)`; `c` at `(Dropped c e)`), is
+wanted at an ever larger type and has no finite set of instances. It is an
+error in both tools, at the occurrence: `len recurses at (Dropped c):
+polymorphic recursion is not supported; use loop or a List` (`f recurses
+through g at T` when the cycle passes through another member). A cycle that
+only exchanges the variables (`f y x` for `f x y`), a type none of whose
+variables is the caller's (`f` at `i64`), and a growing instantiation that
+no cycle feeds back (`a` at `(Vec b)` with `b` at `b`) have finitely many
+instances and stay accepted (cases 196 and 197; `types/tests/polyrec.rs`).
+What the rule does not see, an `impl` method or a cycle through functions
+and methods that grows a type, `fibc` stops: a specialisation keyed by a
+type nested deeper than 64 or of more than 1000 nodes is `unsupported:
+.. wanted at ever larger types, a polymorphic recursion that never ends`
+(exit 4, a Pending case), where the interpreter, which compiles nothing,
+runs the program; that divergence is open (stdlib design §7 B4).
 
 ### 3.7 How each feature is handled
 

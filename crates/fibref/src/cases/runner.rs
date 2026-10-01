@@ -11,8 +11,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::evaluator::Evaluator;
-use super::header::{parse_header, HeaderError, HeaderErrorKind};
-use super::verdict::{judge, Status};
+use super::header::{case_roots, parse_header, HeaderError, HeaderErrorKind};
+use super::verdict::{judge_counted, Status};
+use crate::roots::Roots;
 
 /// The extension of a case file.
 const CASE_EXTENSION: &str = "fib";
@@ -104,7 +105,14 @@ pub fn run_case(path: &Path, evaluator: &dyn Evaluator) -> CaseResult {
         }),
         Ok(source) => match parse_header(path, &source) {
             Err(e) => Status::HeaderError(e),
-            Ok(header) => judge(&header, &evaluator.run_at(&source, path)),
+            Ok(header) => match case_roots(path, &source) {
+                Err(e) => Status::HeaderError(e),
+                Ok(dirs) => {
+                    let roots = Roots::new(dirs);
+                    let (outcome, allocs) = evaluator.run_counted_in(&source, path, &roots);
+                    judge_counted(&header, &outcome, allocs)
+                }
+            },
         },
     };
     CaseResult {

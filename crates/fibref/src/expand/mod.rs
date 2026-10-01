@@ -46,6 +46,7 @@ mod derive;
 mod error;
 mod expr;
 mod heads;
+mod inspect;
 mod prelude;
 mod private;
 mod quasi;
@@ -61,7 +62,7 @@ mod tests;
 use crate::syntax::{read_all, Form};
 
 pub use collections::PRELUDE_NS;
-pub use ctx::{ExpandCtx, Limits, MAX_EXPANDED_FORMS, MAX_EXPAND_DEPTH, MAX_STEPS};
+pub use ctx::{ExpandCtx, Limits, ModuleScope, MAX_EXPANDED_FORMS, MAX_EXPAND_DEPTH, MAX_STEPS};
 pub use error::{ExpandError, ExpandErrorKind};
 pub use heads::{is_core, CORE_FORMS};
 pub use prelude::PRELUDE_MACROS;

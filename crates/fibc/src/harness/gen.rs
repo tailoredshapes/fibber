@@ -125,7 +125,8 @@ mod tests {
             parsed.verdict,
             Verdict::Accept {
                 result: Expected::Int(3),
-                audit: AuditExpect::Clean
+                audit: AuditExpect::Clean,
+                allocs: None,
             }
         );
         let h = header(7, 2, &Err(ModelError::Trap("integer / by zero".into()))).expect("a trap");

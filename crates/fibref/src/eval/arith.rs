@@ -71,7 +71,7 @@ impl Interp<'_> {
         Ok(match x {
             Val::Obj(_) => fnv(self.string(x)?.as_bytes()),
             Val::Int(n, _) => *n,
-            Val::Float(f, _) => f.to_bits() as i64,
+            Val::Float(f, _) => float_hash(*f),
             Val::Bool(b) => i64::from(*b),
             Val::Char(c) => i64::from(u32::from(*c)),
             Val::Kw(k) => fnv(self.keyword_name(*k)?.as_bytes()),
@@ -100,6 +100,24 @@ impl Interp<'_> {
             Val::Ptr(p) => format!("#ptr{p:x}"),
             v => return Err(RunError::internal(format!("show of {v:?}"))),
         })
+    }
+}
+
+/// The bits of the quiet NaN that every NaN hashes as (`hash` of a
+/// float, types §2.12); `fib.double-hash` in `rt/core.lir` has the same.
+const NAN_HASH: i64 = 0x7ff8_0000_0000_0000;
+
+/// `hash` of a float (types §2.12): the bits of its value as an `f64`,
+/// except that `-0.0` hashes as `0.0` and every NaN as [`NAN_HASH`], so
+/// that `(= x y)` implies `(= (hash x) (hash y))` for floats too: a
+/// `Map` finds the key `0.0` by `-0.0`.
+pub fn float_hash(f: f64) -> i64 {
+    if f.is_nan() {
+        NAN_HASH
+    } else if f == 0.0 {
+        0
+    } else {
+        f.to_bits() as i64
     }
 }
 

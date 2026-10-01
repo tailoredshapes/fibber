@@ -1,0 +1,184 @@
+//! The words `fibref expand` and `compiler/expand.fib` take before the
+//! files (spec/bootstrap.md §5), read by the one function the binary and
+//! the tests share, and written from an [`Options`] by [`flags`].
+
+use super::{LimitOverrides, Options, RunnerKind};
+
+/// The options and the files of the words after `expand`: the words that
+/// start with `--` before the first file are options (`--prelude`,
+/// `--context`, `--no-runner`, `--max-steps N`, `--max-depth N`,
+/// `--max-forms N`, each number decimal digits), and a lone `--` ends
+/// them, so that a file named like an option can follow it. `None` for a
+/// word that is not an option, a number that is not digits, or no file.
+pub fn parse_args(args: &[String]) -> Option<(Options, Vec<String>)> {
+    let mut opts = Options::default();
+    let mut rest = args;
+    while let [word, tail @ ..] = rest {
+        rest = match word.as_str() {
+            "--" => {
+                rest = tail;
+                break;
+            }
+            "--prelude" => {
+                opts.prelude = true;
+                tail
+            }
+            "--context" => {
+                opts.context = true;
+                tail
+            }
+            "--no-runner" => {
+                opts.runner = RunnerKind::None;
+                tail
+            }
+            "--max-steps" => limit(&mut opts.limits.steps, tail)?,
+            "--max-depth" => limit(&mut opts.limits.depth, tail)?,
+            "--max-forms" => limit(&mut opts.limits.forms, tail)?,
+            w if w.starts_with("--") => return None,
+            _ => break,
+        };
+    }
+    (!rest.is_empty()).then(|| (opts, rest.to_vec()))
+}
+
+/// Reads the number that starts `tail` into `slot`; the words after it.
+fn limit<'a>(slot: &mut Option<usize>, tail: &'a [String]) -> Option<&'a [String]> {
+    let [n, after @ ..] = tail else { return None };
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    *slot = Some(n.parse::<usize>().ok()?);
+    Some(after)
+}
+
+/// The option words that make [`parse_args`] read `opts`, in the order
+/// `--prelude`, `--context`, `--no-runner`, `--max-steps`, `--max-depth`,
+/// `--max-forms`; none for the defaults.
+pub fn flags(opts: &Options) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut flag = |on: bool, word: &str| {
+        if on {
+            words.push(word.to_string());
+        }
+    };
+    flag(opts.prelude, "--prelude");
+    flag(opts.context, "--context");
+    flag(opts.runner == RunnerKind::None, "--no-runner");
+    let LimitOverrides {
+        steps,
+        depth,
+        forms,
+    } = opts.limits;
+    for (word, value) in [
+        ("--max-steps", steps),
+        ("--max-depth", depth),
+        ("--max-forms", forms),
+    ] {
+        if let Some(n) = value {
+            words.push(word.to_string());
+            words.push(n.to_string());
+        }
+    }
+    words
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn options_come_before_one_or_more_files() {
+        let opts = Options {
+            prelude: true,
+            context: true,
+            runner: RunnerKind::None,
+            limits: LimitOverrides {
+                steps: Some(3),
+                depth: Some(4),
+                forms: Some(5),
+            },
+        };
+        let all = words(&[
+            "--prelude",
+            "--context",
+            "--no-runner",
+            "--max-steps",
+            "3",
+            "--max-depth",
+            "4",
+            "--max-forms",
+            "5",
+            "a.fib",
+            "b.fib",
+        ]);
+        assert_eq!(parse_args(&all), Some((opts, words(&["a.fib", "b.fib"]))));
+        assert_eq!(
+            parse_args(&words(&["a.fib"])),
+            Some((Options::default(), words(&["a.fib"])))
+        );
+    }
+
+    #[test]
+    fn no_file_an_unknown_option_and_a_limit_that_is_not_digits_are_refused() {
+        for bad in [
+            &["--context"][..],
+            &[],
+            &["--bogus", "a.fib"],
+            &["--max-steps", "x", "a.fib"],
+            &["--max-steps"],
+            &["--max-steps", "-1", "a.fib"],
+            &["--max-steps", "+1", "a.fib"],
+            &["--max-steps", "", "a.fib"],
+            &["--max-steps", "99999999999999999999999", "a.fib"],
+        ] {
+            assert_eq!(parse_args(&words(bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_named_like_an_option_follows_two_dashes_or_a_file() {
+        assert_eq!(
+            parse_args(&words(&["--", "--context"])),
+            Some((Options::default(), words(&["--context"])))
+        );
+        assert_eq!(
+            parse_args(&words(&["a.fib", "--context"])),
+            Some((Options::default(), words(&["a.fib", "--context"])))
+        );
+    }
+
+    #[test]
+    fn the_flags_of_options_read_back_as_those_options() {
+        let all = [
+            Options::default(),
+            Options {
+                prelude: true,
+                ..Options::default()
+            },
+            Options {
+                context: true,
+                runner: RunnerKind::None,
+                limits: LimitOverrides {
+                    steps: Some(0),
+                    depth: None,
+                    forms: Some(12),
+                },
+                ..Options::default()
+            },
+        ];
+        for opts in all {
+            let mut line = flags(&opts);
+            line.push("f.fib".to_string());
+            assert_eq!(
+                parse_args(&line),
+                Some((opts, words(&["f.fib"]))),
+                "{opts:?}"
+            );
+        }
+        assert_eq!(flags(&Options::default()), Vec::<String>::new());
+    }
+}

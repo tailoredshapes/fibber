@@ -5,7 +5,7 @@
 use fibref::own::program::BodyKey;
 use fibref::types::decls::Globals;
 use fibref::types::display::Printer;
-use fibref::types::ty::{Colour, Ty};
+use fibref::types::ty::{Colour, ProtoId, Ty};
 
 /// The mangled form of a type: `(` is `$`, `)` is `_`, a space is `.`.
 /// Colours are erased first, since they have no representation.
@@ -27,9 +27,22 @@ pub fn mangle(g: &Globals, t: &Ty) -> String {
 fn module_prefix(g: &Globals, m: fibref::types::decls::ModuleId) -> String {
     if m == g.main {
         String::new()
+    } else if m == fibref::types::decls::ModuleId::BUILTIN {
+        // Its name is for messages ("the builtins"); the symbol has no
+        // spaces. The protocols of the checker (`Eq`, `Show`, ..) are its.
+        "fib.builtin.".to_string()
     } else {
         format!("{}.", g.module_name(m))
     }
+}
+
+/// A protocol's name as a symbol: its own, behind its module's prefix
+/// (none for the main module), so that two modules' protocols of one
+/// name, each with a method of one name, have different methods' symbols
+/// (a user `Collection` with a `conj`, and the prelude's).
+pub fn proto_qualified(g: &Globals, p: ProtoId) -> String {
+    let proto = g.proto(p);
+    format!("{}{}", module_prefix(g, proto.module), proto.name)
 }
 
 /// The name of a body's specialisation at `tys`.
@@ -54,7 +67,7 @@ pub fn body_name(g: &Globals, key: BodyKey, tys: &[Ty]) -> String {
             };
             format!(
                 "m.{}.{}.{}{owned}",
-                proto.name,
+                proto_qualified(g, inst.proto),
                 method,
                 mangle(g, &inst.head)
             )

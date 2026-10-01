@@ -21,7 +21,8 @@ use super::build::call;
 /// The namespace the §1.4 rewrite qualifies its heads with.
 pub const PRELUDE_NS: &str = "fib.prelude";
 
-fn prelude_name(name: &str) -> String {
+/// `fib.prelude/name`: a head no user binding of `name` can shadow.
+pub(crate) fn prelude_name(name: &str) -> String {
     format!("{PRELUDE_NS}/{name}")
 }
 

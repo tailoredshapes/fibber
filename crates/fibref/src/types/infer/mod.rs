@@ -11,6 +11,7 @@ mod exhaust;
 mod expr;
 mod general;
 mod pattern;
+mod polyrec;
 mod scc;
 mod send;
 mod solve;

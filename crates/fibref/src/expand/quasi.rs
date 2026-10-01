@@ -6,6 +6,12 @@
 //! `[ ... ]  `{ ... }   ⟹ the same with Vec / Map
 //! ```
 //!
+//! The heads `List`, `Vec`, `Map` and `concat` are written
+//! `fib.prelude/List` and so on (`collections::prelude_name`, as §1.4's
+//! literals are): a program's or a library's own `concat`, or a variant of
+//! another enum called `List`, would otherwise be what a macro's template
+//! built with. `concat` of no parts (`` `() ``) is the empty vector.
+//!
 //! Nesting follows the usual levels: an inner `quasiquote` raises the
 //! level, an `unquote` or `unquote-splicing` lowers it, and only one at
 //! level 1 is evaluated; deeper ones are rebuilt as data with their
@@ -20,6 +26,7 @@
 use crate::syntax::{Form, FormKind, Pos};
 
 use super::build::{call, head_name, malformed, sym, vector};
+use super::collections::prelude_name;
 use super::error::{ExpandError, ExpandErrorKind as K};
 
 /// Work still to do; results go on a value stack.
@@ -52,13 +59,15 @@ pub(crate) fn rewrite(form: Form) -> Result<Form, ExpandError> {
             }
             Task::Seq(ctor, n, pos) => {
                 let parts = values.split_off(values.len().saturating_sub(n));
-                values.push(call(ctor, vec![call("concat", parts, &pos)], &pos));
+                let parts = call(&prelude_name("concat"), parts, &pos);
+                values.push(call(&prelude_name(ctor), vec![parts], &pos));
             }
             Task::Wrapped(head, pos) => {
                 let x = pop(&mut values, &pos)?;
                 let quoted = vector(vec![call("quote", vec![sym(head, &pos)], &pos)], &pos);
                 let parts = vec![quoted, vector(vec![x], &pos)];
-                values.push(call("List", vec![call("concat", parts, &pos)], &pos));
+                let parts = call(&prelude_name("concat"), parts, &pos);
+                values.push(call(&prelude_name("List"), vec![parts], &pos));
             }
         }
     }

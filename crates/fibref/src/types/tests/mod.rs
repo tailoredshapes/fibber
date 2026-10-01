@@ -12,6 +12,7 @@ mod errors2;
 mod forms;
 mod impl_colours;
 mod patterns;
+mod polyrec;
 mod private;
 mod supers;
 

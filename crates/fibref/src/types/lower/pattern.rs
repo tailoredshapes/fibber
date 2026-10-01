@@ -170,12 +170,16 @@ fn irrefutable(lw: &Lowerer<'_>, p: &Pattern) -> bool {
     }
 }
 
-/// `V is not a variant or struct`, or `V is private to m` when a private
-/// definition of another module has the name (syntax §5).
+/// `V is not a variant or struct`, `V is private to m` when a private
+/// definition of another module has the name, or `V is exported by both
+/// a and b` when two `:use`d modules export it (syntax §5).
 fn not_a_ctor(lw: &Lowerer<'_>, head: &str) -> String {
     let space = crate::types::decls::Space::Value;
-    match lw.g.private_owner(lw.m, space, head) {
-        Some(_) => lw.g.unknown(lw.m, space, head, ""),
-        None => format!("{head} is not a variant or struct"),
+    match (
+        lw.g.private_owner(lw.m, space, head),
+        lw.g.ambiguity(lw.m, space, head),
+    ) {
+        (None, None) => format!("{head} is not a variant or struct"),
+        _ => lw.g.unknown(lw.m, space, head, ""),
     }
 }

@@ -30,7 +30,9 @@ pub struct MacroEvaluator {
     prelude: Vec<Form>,
     /// The names the module being expanded defines (`defun`, `def`).
     module_names: HashSet<String>,
-    /// Each macro's checked macro-time module, or why it did not check.
+    /// Each macro's checked macro-time module, or why it did not check,
+    /// by the macro's `ns/name` (`MacroDef::key`): two modules' macros of
+    /// one name are two macros.
     checked: HashMap<String, Result<Arc<Checked>, ExpandErrorKind>>,
 }
 
@@ -50,14 +52,14 @@ impl MacroEvaluator {
     }
 
     fn macro_module(&mut self, m: &MacroDef) -> Result<Arc<Checked>, ExpandErrorKind> {
-        if let Some(c) = self.checked.get(&m.name) {
+        if let Some(c) = self.checked.get(&m.key) {
             return c.clone();
         }
         let forms = macro_forms(m);
         let c = check_forms(&forms, &self.prelude)
             .map(Arc::new)
             .map_err(|e| self.check_error(m, e));
-        self.checked.insert(m.name.clone(), c.clone());
+        self.checked.insert(m.key.clone(), c.clone());
         c
     }
 

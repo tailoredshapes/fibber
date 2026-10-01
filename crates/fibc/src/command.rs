@@ -8,6 +8,11 @@ use fibc::harness::gen::GenConfig;
 
 pub const USAGE: &str = "usage: fibc <command>
 
+Every command that reads a program (run, build, emit, explain, itrace) takes
+-I dir (or -Idir), any number of times, anywhere before --: a module is found
+beside the file, then under each -I dir in order, then under each directory of
+$FIB_LIB, then in the library the executable carries (spec/syntax.md §5).
+
 commands:
   run [--trace] <file> [-- arg..]
                          compile file through the JIT and run its main; the

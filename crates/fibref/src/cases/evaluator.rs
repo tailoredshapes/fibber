@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+use crate::roots::Roots;
+
 /// A value `main` returned. Only integers exist today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -101,6 +103,36 @@ pub trait Evaluator {
     /// main file's directory); by default the path is ignored.
     fn run_at(&self, source: &str, _path: &std::path::Path) -> Outcome {
         self.run(source)
+    }
+
+    /// [`Evaluator::run_at`] and, when the program ran, the number of
+    /// heap objects it allocated: the `A` lines of its free trace
+    /// (`spec/compiler.md` §4), which the header key `allocs` bounds.
+    /// By default an evaluator counts nothing (`None`), and a case with
+    /// an `allocs` header then fails: a bound nobody checked would pass
+    /// whatever the program did.
+    fn run_counted(&self, source: &str, path: &std::path::Path) -> (Outcome, Option<u64>) {
+        (self.run_at(source, path), None)
+    }
+
+    /// [`Evaluator::run_counted`] with the library roots the case's
+    /// header names (`roots`, [`case_roots`](super::header::case_roots)),
+    /// under which its modules are found after the ones beside the case.
+    /// An evaluator that does not take roots runs a case that has none as
+    /// before, and fails one that has: the program would not find its
+    /// modules, and saying so is better than a rejection that blames the
+    /// program.
+    fn run_counted_in(
+        &self,
+        source: &str,
+        path: &std::path::Path,
+        roots: &Roots,
+    ) -> (Outcome, Option<u64>) {
+        if roots.dirs().is_empty() {
+            return self.run_counted(source, path);
+        }
+        let message = "this evaluator does not take the library roots of the case".to_string();
+        (Outcome::Failed { message }, None)
     }
 }
 

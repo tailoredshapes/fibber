@@ -80,3 +80,31 @@ fn reflection_does_not_see_a_private_type_of_the_prelude() {
                (defun main () -> i64 (seen))";
     clean(src, 5);
 }
+
+#[test]
+fn two_modules_macros_of_one_name_are_told_apart_by_module() {
+    // The run of a macro is checked once; that check is kept per macro,
+    // and the macro is the one of its module (syntax §5), not the first
+    // of its name: this read 200 (both `same`s the used module's `*`) and
+    // the JIT's runner read 102.
+    let dir = std::env::temp_dir().join(format!("fibref-same-macro-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).expect("writable");
+    write(
+        "util.fib",
+        "(ns util)\n(defmacro same (x) (List [(Sym \"+\") x (Int 1 :i64)]))\n",
+    );
+    write(
+        "more.fib",
+        "(ns more)\n(defmacro same (x) (List [(Sym \"*\") x (Int 100 :i64)]))\n",
+    );
+    let main = "(ns main (:require [more :as m]) (:use util))\n\
+                (defun main () -> i64 (+ (m/same 1) (same 1)))\n";
+    let file = dir.join("main.fib").to_string_lossy().into_owned();
+    let outcome = crate::eval::run_source(main, &file);
+    let _ = std::fs::remove_dir_all(&dir);
+    match outcome {
+        Outcome::Compiled { result, .. } => assert_eq!(result, crate::cases::Value::Int(102)),
+        other => panic!("{other:?}"),
+    }
+}

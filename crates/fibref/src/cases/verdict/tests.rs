@@ -11,6 +11,7 @@ fn accept(result: i64, audit: AuditExpect) -> Header {
         verdict: Verdict::Accept {
             result: Expected::Int(result),
             audit,
+            allocs: None,
         },
     }
 }
@@ -329,4 +330,67 @@ fn a_trap_fails_an_accept_and_a_reject() {
 fn a_blank_trap_text_never_passes() {
     let out = trapped("trap: boom", &[]);
     fail_containing(judge(&trap("  "), &out), &["empty"]);
+}
+
+fn bounded(result: i64, max: u64) -> Header {
+    let mut header = accept(result, AuditExpect::Clean);
+    if let Verdict::Accept { allocs, .. } = &mut header.verdict {
+        *allocs = Some(max);
+    }
+    header
+}
+
+#[test]
+fn allocs_within_the_maximum_passes_at_every_count_up_to_it() {
+    for counted in [0, 1, 6, 7] {
+        let status = judge_counted(
+            &bounded(5, 7),
+            &compiled(5, AuditSummary::clean()),
+            Some(counted),
+        );
+        assert_eq!(status, Status::Pass, "{counted} <= 7");
+    }
+}
+
+#[test]
+fn allocs_over_the_maximum_fails_by_one_and_says_both_numbers() {
+    let status = judge_counted(&bounded(5, 7), &compiled(5, AuditSummary::clean()), Some(8));
+    fail_containing(status, &["allocs", "at most 7", "allocated 8"]);
+}
+
+#[test]
+fn allocs_over_the_maximum_fails_beside_a_wrong_result_and_reports_both() {
+    let status = judge_counted(&bounded(5, 0), &compiled(6, AuditSummary::clean()), Some(1));
+    fail_containing(status, &["expected 5, got 6", "at most 0", "allocated 1"]);
+}
+
+#[test]
+fn a_header_with_allocs_fails_when_nobody_counted() {
+    // `judge` knows no count; the evaluator that gave none cannot have
+    // checked the bound, and an unchecked bound would pass whatever the
+    // program did.
+    let good = compiled(5, AuditSummary::clean());
+    fail_containing(
+        judge(&bounded(5, 7), &good),
+        &["allocs", "no allocation count"],
+    );
+    let status = judge_counted(&bounded(5, 7), &good, None);
+    fail_containing(status, &["allocs", "no allocation count"]);
+}
+
+#[test]
+fn no_allocs_header_ignores_the_count() {
+    let good = compiled(5, AuditSummary::clean());
+    let header = accept(5, AuditExpect::Clean);
+    assert_eq!(judge_counted(&header, &good, Some(u64::MAX)), Status::Pass);
+    assert_eq!(judge_counted(&header, &good, None), Status::Pass);
+}
+
+#[test]
+fn allocs_never_makes_an_unsupported_case_fail_or_pass() {
+    let pending = Outcome::Unsupported {
+        reason: "later".to_string(),
+    };
+    let status = judge_counted(&bounded(5, 0), &pending, None);
+    assert_eq!(status, Status::Pending("later".to_string()));
 }

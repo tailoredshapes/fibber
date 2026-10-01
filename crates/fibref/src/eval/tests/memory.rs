@@ -2,6 +2,8 @@
 //! weak references, shared objects, audit failures.
 
 use super::{clean, count, traced};
+use crate::cases::{run_dir, Evaluator, Outcome, Status};
+use crate::eval::Interpreter;
 use crate::heap::{Event, Kind};
 
 #[test]
@@ -195,4 +197,71 @@ fn a_private_cell_ends_after_a_later_arguments_stack_temporary() {
         .find(|(id, _)| drop_at(*id) > drop_at(boxed[0].0))
         .expect("a private cell dropped after the Box");
     assert!(drop_at(private.0).is_some());
+}
+
+/// A program that allocates heap objects: two cells, each holding a
+/// struct.
+const COUNTED: &str = "(defstruct Pt (x: i64 y: i64))
+(defun main () -> i64
+  (let ((a (cell (Pt 1 2)))
+        (b (cell (Pt 3 4))))
+    (+ (. @a x) (. @b y))))";
+
+/// The interpreter's count of a run is the `A` lines of its trace.
+#[test]
+fn the_interpreter_counts_the_a_lines_of_its_trace() {
+    let (n, report) = traced(COUNTED);
+    assert_eq!(n, 5);
+    let a_lines = count(&report, |e| matches!(e, Event::Alloc { .. }));
+    assert_eq!(crate::heap::trace_allocs(&report.trace), a_lines as u64);
+    let path = std::path::Path::new("<test>");
+    let (outcome, allocs) = Interpreter.run_counted(COUNTED, path);
+    assert!(matches!(outcome, Outcome::Compiled { .. }), "{outcome:?}");
+    assert_eq!(allocs, Some(a_lines as u64));
+    assert!(a_lines >= 2, "the two cells are heap objects: {a_lines}");
+}
+
+/// A rejected program has no count, a trapped one has the count up to
+/// the abort.
+#[test]
+fn a_run_that_did_not_start_has_no_count() {
+    let path = std::path::Path::new("<test>");
+    let (outcome, allocs) = Interpreter.run_counted("(defun main () -> i64 oops)", path);
+    assert!(matches!(outcome, Outcome::Rejected { .. }), "{outcome:?}");
+    assert_eq!(allocs, None);
+    let trap = "(defun main () -> i64 (let ((v [1 2 3])) (/ (nth v 0) 0)))";
+    let (outcome, allocs) = Interpreter.run_counted(trap, path);
+    assert!(matches!(outcome, Outcome::Trapped { .. }), "{outcome:?}");
+    assert!(matches!(allocs, Some(n) if n > 0), "{allocs:?}");
+}
+
+/// The bound is tight: the count of the program is `N`, so `<= N` passes
+/// and `<= N-1` fails, through the real runner and the real interpreter.
+#[test]
+fn a_bound_one_below_the_count_fails_in_the_real_runner() {
+    let (_, report) = traced(COUNTED);
+    let n = crate::heap::trace_allocs(&report.trace);
+    let dir = std::env::temp_dir().join(format!("fibref-allocs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let write = |name: &str, max: u64| {
+        let head = format!(
+            ";; spec: §4\n;; expect: accept\n;; result: 5\n;; audit: clean\n;; allocs: <= {max}\n"
+        );
+        std::fs::write(dir.join(name), format!("{head}{COUNTED}\n")).expect("write");
+    };
+    write("1-exact.fib", n);
+    write("2-below.fib", n - 1);
+    write("3-above.fib", n + 1);
+    let report = run_dir(&dir, &Interpreter).expect("runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = |i: usize| report.results[i].status.clone();
+    assert_eq!(status(0), Status::Pass, "{:?}", report.results);
+    assert_eq!(
+        status(1),
+        Status::Fail(format!(
+            "allocs: expected at most {} heap objects, the run allocated {n}",
+            n - 1
+        ))
+    );
+    assert_eq!(status(2), Status::Pass);
 }

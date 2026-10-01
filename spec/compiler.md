@@ -72,6 +72,33 @@ shared library built with `cc`, the executable run without
 once the library is moved, and the link failing without the flags) and by
 `crates/lair/tests/link.rs` (the same on `Options`).
 
+**Library roots** (**Proposed**, stdlib design §7 E7; the rule is syntax §5).
+Every command that reads a program (`run`, `build`, `emit`, `explain`,
+`itrace`; `fibref run` and `fibref explain` likewise) takes `-I DIR` (or
+`-IDIR`), repeatable and anywhere before a `--`, and reads the environment
+variable `FIB_LIB` (directories separated as `PATH`'s are; an empty entry
+is skipped). A module `a.b` is looked for at `a/b.fib` in the main file's
+directory, then in each `-I DIR` in the order given, then in each directory
+of `FIB_LIB` in order, then in the library the executable carries: the
+`.fib` files of the repository's `lib/` other than `lib/prelude.fib`,
+embedded by `crates/fibref/build.rs` as the prelude is by `include_str!`
+(`a/b.fib` there is the module `a.b`). The first that has the file wins and
+the rest are not read; a directory that is not there is skipped; a file that
+is there and cannot be read (a directory, not UTF-8) is an error, not a
+reason to try the next root. A module found nowhere is `module a.b is not at
+FILE: REASON; nor at FILE2, ..`, the first file being the main directory's.
+`-I` on a command that reads no program (`cases`, `gen`) is a usage error
+(exit 2), not ignored. An executable that `fibc build` makes carries the
+modules it was built from and needs no root when it runs. The roots are
+values passed down from the command line (`fibref::roots::Roots`);
+nothing below it reads the environment. The case harness (§5) gives a case
+the roots of its header's `roots` key (`cases/modules/README.md`), to the
+interpreter as roots and to the child `fibc run --trace` as `-I` flags, and
+removes `FIB_LIB` from the child's environment, so a case does not depend
+on the machine. Tested by `crates/fibref/src/roots.rs`,
+`crates/fibref/tests/roots.rs`, `crates/fibc/tests/cli/roots.rs` and
+`cases/modules` 013 to 016.
+
 ## 2. Modules
 
 One compilation produces one lIR module: the runtime (§3), the type
@@ -89,10 +116,14 @@ replaces `(` by `$`, `)` by `_` and a space by `.`: `(Vec (Box i64))`
 is `$Vec.$Box.i64__`. A function specialisation is `f.NAME` followed by
 the mangled key of §7 (`f.count.$Vec.i64_`); an all-owned body adds
 `.owned`; a method implementation is `m.PROTO.METHOD.` + the head's
-mangling; a closure body `l.` + the body's name + the literal's
+mangling, where `PROTO` is the protocol's name behind its module's prefix
+(`NS.`; none for the main module, `fib.builtin.` for the checker's own
+protocols `Eq`, `Ord`, `Hash`, `Show`), so that two modules' protocols of
+one name have different symbols (**Proposed**, stdlib design §7 B3); a
+closure body `l.` + the body's name + the literal's
 expression id; an object struct `%struct.o.` + the mangled type; a
 string literal `str.N`; the type table `fib.types`; a vtable
-`vt.PROTO.` + head; a runtime function `fib.NAME` as §8 names it.
+`vt.PROTO.` + head (the same `PROTO`); a runtime function `fib.NAME` as §8 names it.
 
 ## 3. The runtime module `fib.rt`
 
@@ -218,7 +249,15 @@ For every `.fib` file of the directory, in name order:
    interpreter reported a leak cycle; an error naming the first
    differing line otherwise. A rejection must carry the same message on
    both sides (they share the front end; the harness checks that it
-   still does), and a trap the same message.
+   still does), and a trap the same message;
+5. a header with `allocs: <= N` (method.md rule 3) is checked against
+   the number of `A` lines of the **compiled** run's trace
+   (`Trace::allocs`), which is the interpreter's count
+   (`fibref::heap::trace_allocs`) whenever the traces agree under §4;
+   in a threaded run the compiled program may allocate more (§4), and
+   the count that is checked is the compiled one. A case whose child
+   did not run (rejected, unsupported, trapped) has no count, and
+   `allocs` is for `accept` cases only.
 
 `cargo test -p fibc` runs the same over `cases/ownership` and fails on
 any case that is not a pass or an explicitly pending one; a pending

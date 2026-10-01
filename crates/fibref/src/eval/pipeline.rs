@@ -4,9 +4,10 @@
 
 use crate::cases::{AuditSummary, Evaluator, Outcome, Value};
 use crate::expand::ExpandCtx;
-use crate::heap::{AuditReport, LeakClass};
+use crate::heap::{trace_allocs, AuditReport, LeakClass};
 use crate::own::program::BodyKey;
 use crate::own::{check_modules, CheckError, Checked};
+use crate::roots::Roots;
 use crate::syntax::Form;
 use crate::types::infer::UnitRef;
 use crate::types::prelude_forms;
@@ -38,6 +39,19 @@ impl Evaluator for Interpreter {
     fn run_at(&self, source: &str, path: &std::path::Path) -> Outcome {
         run_source(source, &path.to_string_lossy())
     }
+
+    fn run_counted(&self, source: &str, path: &std::path::Path) -> (Outcome, Option<u64>) {
+        run_source_counted(source, &path.to_string_lossy(), &[])
+    }
+
+    fn run_counted_in(
+        &self,
+        source: &str,
+        path: &std::path::Path,
+        roots: &Roots,
+    ) -> (Outcome, Option<u64>) {
+        run_source_in(source, &path.to_string_lossy(), &[], roots)
+    }
 }
 
 /// Runs the program `source` (named `file` in positions) on a thread
@@ -48,31 +62,56 @@ pub fn run_source(source: &str, file: &str) -> Outcome {
 
 /// [`run_source`] with the command line `(args)` gives the program.
 pub fn run_source_with(source: &str, file: &str, args: &[String]) -> Outcome {
+    run_source_counted(source, file, args).0
+}
+
+/// [`run_source_with`] and the number of heap objects the run allocated
+/// (the `A` lines of its trace, [`trace_allocs`]), when it ran.
+pub fn run_source_counted(source: &str, file: &str, args: &[String]) -> (Outcome, Option<u64>) {
+    run_source_in(source, file, args, &Roots::default())
+}
+
+/// [`run_source_counted`] with the library roots of the command line
+/// (`roots.rs`): modules are found beside `file`, then under them.
+pub fn run_source_in(
+    source: &str,
+    file: &str,
+    args: &[String],
+    roots: &Roots,
+) -> (Outcome, Option<u64>) {
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new()
             .name("fibref-eval".into())
             .stack_size(STACK_BYTES)
-            .spawn_scoped(scope, || run_here(source, file, args));
+            .spawn_scoped(scope, || run_here(source, file, args, roots));
         match worker.map(|h| h.join()) {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => Outcome::Failed {
-                message: "internal error: the evaluator panicked".into(),
-            },
-            Err(e) => Outcome::Failed {
-                message: format!("cannot start the evaluator: {e}"),
-            },
+            Ok(Ok(run)) => run,
+            Ok(Err(_)) => (
+                Outcome::Failed {
+                    message: "internal error: the evaluator panicked".into(),
+                },
+                None,
+            ),
+            Err(e) => (
+                Outcome::Failed {
+                    message: format!("cannot start the evaluator: {e}"),
+                },
+                None,
+            ),
         }
     })
 }
 
-/// The pipeline on the calling thread.
-fn run_here(source: &str, file: &str, args: &[String]) -> Outcome {
-    let checked = match check(source, file) {
+/// The pipeline on the calling thread, with the allocation count of a
+/// run that finished or trapped.
+fn run_here(source: &str, file: &str, args: &[String], roots: &Roots) -> (Outcome, Option<u64>) {
+    let checked = match check(source, file, roots) {
         Ok(c) => c,
-        Err(outcome) => return outcome,
+        Err(outcome) => return (outcome, None),
     };
     let (result, report) = run_checked_with(&checked, args);
-    match result {
+    let allocs = Some(trace_allocs(&report.trace));
+    let outcome = match result {
         Ok(n) => Outcome::Compiled {
             result: Value::Int(n),
             audit: summary(&report),
@@ -84,7 +123,8 @@ fn run_here(source: &str, file: &str, args: &[String]) -> Outcome {
         Err(e) => Outcome::Failed {
             message: e.to_string(),
         },
-    }
+    };
+    (outcome, allocs)
 }
 
 /// The audit of a run that a trap aborted (types §2.12): what is live
@@ -103,13 +143,13 @@ fn dangling_text(d: &crate::heap::DanglingRef) -> String {
 
 /// The front end with user macros run: the checked program, or the
 /// outcome that stops the pipeline.
-fn check(source: &str, file: &str) -> Result<Checked, Outcome> {
+fn check(source: &str, file: &str, roots: &Roots) -> Result<Checked, Outcome> {
     let mut ctx = ExpandCtx::new();
     let prelude = prelude_forms(&mut ctx).map_err(|m| Outcome::Failed {
         message: format!("the prelude does not expand: {m}"),
     })?;
-    let loaded =
-        crate::modules::load(source, file).map_err(|m| Outcome::Rejected { message: m })?;
+    let loaded = crate::modules::load_in(source, file, roots)
+        .map_err(|m| Outcome::Rejected { message: m })?;
     let all: Vec<Form> = loaded
         .iter()
         .flat_map(|l| l.forms.iter().cloned())

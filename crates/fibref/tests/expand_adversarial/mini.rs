@@ -150,7 +150,9 @@ fn eval_call(
     for a in &items[1..] {
         args.push(eval(a, env, ctx)?);
     }
-    if head == "concat" {
+    // The quasiquote rewrite writes its heads as the prelude's
+    // (`fib.prelude/concat`, `fib.prelude/List`, stdlib design §7 B2).
+    if head == "concat" || head == "fib.prelude/concat" {
         let parts = args.into_iter().map(|a| vector(a, &pos));
         return Ok(Val::V(parts.collect::<Result<Vec<_>, _>>()?.concat()));
     }
@@ -164,8 +166,8 @@ fn eval_call(
             v.push(form(next()?, &pos)?);
             Val::V(v)
         }
-        "List" => built(FormKind::List(vector(next()?, &pos)?)),
-        "Vec" => built(FormKind::Vec(vector(next()?, &pos)?)),
+        "List" | "fib.prelude/List" => built(FormKind::List(vector(next()?, &pos)?)),
+        "Vec" | "fib.prelude/Vec" => built(FormKind::Vec(vector(next()?, &pos)?)),
         "Sym" => built(FormKind::Sym(string(next()?, &pos)?)),
         "gensym" => Val::F(ctx.gensym(&string(next()?, &pos)?, &pos)),
         "=" => {

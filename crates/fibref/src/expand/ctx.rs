@@ -77,6 +77,8 @@ pub struct ExpandCtx {
     gensyms: AtomicU64,
     /// Every user macro, by `ns/name`.
     pub(crate) macros: HashMap<String, MacroDef>,
+    /// The modules each module re-exports (`(:export-from ..)`), by `ns`.
+    exports: HashMap<String, Vec<String>>,
     /// The module being expanded: which macros a name reaches.
     pub(crate) scope: ModuleScope,
     pub(crate) types: TypeTable,
@@ -120,6 +122,7 @@ impl ExpandCtx {
             limits: Limits::default(),
             gensyms: AtomicU64::new(0),
             macros: HashMap::new(),
+            exports: HashMap::new(),
             scope: ModuleScope::of(super::PRELUDE_NS),
             types: TypeTable::with_builtins(),
             call_pos: Pos {
@@ -153,33 +156,77 @@ impl ExpandCtx {
         &self.call_pos
     }
 
+    /// How many gensyms this context has handed out: the number in the
+    /// name of the last one, and the number of the next less one.
+    pub fn gensym_count(&self) -> u64 {
+        self.gensyms.load(Ordering::Relaxed)
+    }
+
+    /// The macro expansions and the forms they produced that the current
+    /// (or, after it, the last) top-level form has counted against
+    /// [`Limits::max_steps`] and [`Limits::max_forms`]; both start again
+    /// at zero with each top-level form.
+    pub fn counters(&self) -> (usize, usize) {
+        (self.steps, self.forms)
+    }
+
+    /// The module being expanded, as macro lookup sees it.
+    pub fn scope(&self) -> &ModuleScope {
+        &self.scope
+    }
+
+    /// The macro `name` that module `ns` exports to the module being
+    /// expanded: its own (a `:private` one only to itself), else one that
+    /// a module it re-exports exports.
+    fn exported_macro(&self, ns: &str, name: &str) -> Option<&MacroDef> {
+        let own = self.macros.get(&format!("{ns}/{name}"));
+        let own = own.filter(|d| !d.private || d.ns == self.scope.ns);
+        own.or_else(|| {
+            let reexported = self.exports.get(ns)?;
+            reexported.iter().find_map(|r| self.exported_macro(r, name))
+        })
+    }
+
     /// The user macro `name` reaches from the module being expanded
     /// (syntax §5): `alias/x` in the module the alias names, or by the
     /// full `ns` of the prelude or of this module; a bare name in this
-    /// module, then in its `:use`s, then in the prelude; a `:private`
-    /// macro only in its own module.
+    /// module, then in what its `:use`s export, then in the prelude; a
+    /// `:private` macro only in its own module.
     pub fn macro_def(&self, name: &str) -> Option<&MacroDef> {
         let scope = &self.scope;
-        let visible = |def: &MacroDef| !def.private || def.ns == scope.ns;
         if let Some((q, base)) = name.split_once('/') {
             let ns = match scope.aliases.get(q) {
                 Some(ns) => ns.as_str(),
                 None if q == super::PRELUDE_NS || q == scope.ns => q,
                 None => return None,
             };
-            return self
-                .macros
-                .get(&format!("{ns}/{base}"))
-                .filter(|d| visible(d));
+            return self.exported_macro(ns, base);
         }
         std::iter::once(scope.ns.as_str())
             .chain(scope.uses.iter().map(String::as_str))
             .chain(std::iter::once(super::PRELUDE_NS))
-            .find_map(|ns| {
-                self.macros
-                    .get(&format!("{ns}/{name}"))
-                    .filter(|d| visible(d))
-            })
+            .find_map(|ns| self.exported_macro(ns, name))
+    }
+
+    /// The two `:use`d modules of the module being expanded that export
+    /// different macros called `name`, which makes the bare name an error
+    /// (syntax §5, as for any other name); `None` for a qualified name,
+    /// for a name this module defines itself (a local definition shadows
+    /// the `:use`d ones) and for a name at most one `:use` exports.
+    pub fn macro_ambiguity(&self, name: &str) -> Option<(&str, &str)> {
+        let scope = &self.scope;
+        let own = self.macros.contains_key(&format!("{}/{name}", scope.ns));
+        if name.contains('/') || own {
+            return None;
+        }
+        let mut found = scope
+            .uses
+            .iter()
+            .filter_map(|u| Some((u.as_str(), self.exported_macro(u, name)?)));
+        let (first, def) = found.next()?;
+        found
+            .find(|(_, d)| d.key != def.key)
+            .map(|(second, _)| (first, second))
     }
 
     /// Starts expanding module `ns` with these `:use`s and aliases.
@@ -189,6 +236,28 @@ impl ExpandCtx {
             uses: uses.to_vec(),
             aliases,
         };
+    }
+
+    /// Records that module `ns`, which is being expanded or was, re-exports
+    /// the modules `exports` (`(:export-from ..)`, syntax §5): the macros
+    /// they export are its own to whoever uses it.
+    pub fn reexport(&mut self, ns: &str, exports: &[String]) {
+        if !exports.is_empty() {
+            self.exports.insert(ns.to_string(), exports.to_vec());
+        }
+    }
+
+    /// The modules each module re-exports, by the module's `ns` (those
+    /// that re-export none are not listed), sorted by `ns` as byte
+    /// strings; each module's list in the order written.
+    pub fn reexports(&self) -> Vec<(&str, &[String])> {
+        let mut all: Vec<(&str, &[String])> = self
+            .exports
+            .iter()
+            .map(|(ns, list)| (ns.as_str(), list.as_slice()))
+            .collect();
+        all.sort_unstable_by_key(|(ns, _)| *ns);
+        all
     }
 
     /// Defines macro `def` in the module being expanded.

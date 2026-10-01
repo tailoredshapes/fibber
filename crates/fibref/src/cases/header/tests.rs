@@ -28,6 +28,7 @@ fn valid_accept_header() {
             verdict: Verdict::Accept {
                 result: Expected::Int(1),
                 audit: AuditExpect::Clean,
+                allocs: None,
             },
         })
     );
@@ -54,6 +55,7 @@ fn accept_with_leak_cycle_and_negative_result() {
         Ok(Verdict::Accept {
             result: Expected::Int(-7),
             audit: AuditExpect::LeakCycle,
+            allocs: None,
         })
     );
 }
@@ -300,5 +302,150 @@ fn trap_header_needs_its_text_and_forbids_the_others() {
     assert_eq!(
         kind_at(&on_reject),
         (4, HeaderErrorKind::ForbiddenKey("trap"))
+    );
+}
+
+#[test]
+fn accept_with_an_allocation_maximum() {
+    for (value, max) in [
+        ("<= 12", 12),
+        ("<=12", 12),
+        ("<=   0", 0),
+        ("<= 007", 7),
+        ("<= 18446744073709551615", u64::MAX),
+    ] {
+        let source = format!("{ACCEPT};; allocs: {value}\n");
+        assert_eq!(
+            parse(&source).map(|h| h.verdict),
+            Ok(Verdict::Accept {
+                result: Expected::Int(1),
+                audit: AuditExpect::Clean,
+                allocs: Some(max),
+            }),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn allocs_is_a_maximum_in_decimal_digits_and_nothing_else() {
+    for value in [
+        "",
+        "12",
+        "<=",
+        "<= ",
+        "< 12",
+        "= 12",
+        ">= 12",
+        "== 12",
+        "<= -1",
+        "<= +1",
+        "<= 1.5",
+        "<= 12 objects",
+        "<= 1 2",
+        "<= \u{661}",
+        "<= 0x10",
+        "<= 18446744073709551616",
+    ] {
+        let source = format!("{ACCEPT};; allocs: {value}\n");
+        assert_eq!(
+            kind_at(&source),
+            (
+                5,
+                HeaderErrorKind::BadValue {
+                    key: "allocs",
+                    value: value.trim().to_string()
+                }
+            ),
+            "{value:?}"
+        );
+    }
+}
+
+#[test]
+fn allocs_is_for_accept_cases_only() {
+    for (base, line) in [(REJECT, 4), (TRAP, 4)] {
+        let source = format!("{base};; allocs: <= 3\n");
+        assert_eq!(
+            kind_at(&source),
+            (line, HeaderErrorKind::ForbiddenKey("allocs"))
+        );
+    }
+}
+
+#[test]
+fn allocs_twice_is_a_duplicate_key() {
+    let source = format!("{ACCEPT};; allocs: <= 3\n;; allocs: <= 4\n");
+    assert_eq!(
+        kind_at(&source),
+        (6, HeaderErrorKind::DuplicateKey("allocs".to_string()))
+    );
+}
+
+#[test]
+fn allocs_after_the_header_is_prose() {
+    // As every key: a line after the header's end is a comment.
+    let source = format!("{ACCEPT}\n;; allocs: <= 3\n");
+    assert_eq!(
+        parse(&source).map(|h| h.verdict),
+        Ok(Verdict::Accept {
+            result: Expected::Int(1),
+            audit: AuditExpect::Clean,
+            allocs: None,
+        })
+    );
+}
+
+fn roots(path: &str, source: &str) -> Result<Vec<PathBuf>, HeaderError> {
+    case_roots(Path::new(path), source)
+}
+
+#[test]
+fn roots_are_the_listed_directories_joined_to_the_cases_directory_in_order() {
+    let source = format!("{ACCEPT};; roots:  lib   other/lib\n");
+    assert_eq!(
+        roots("cases/modules/013/main.fib", &source),
+        Ok(vec![
+            PathBuf::from("cases/modules/013/lib"),
+            PathBuf::from("cases/modules/013/other/lib")
+        ])
+    );
+    // The key does not change the verdict, and an absolute directory stays.
+    assert_eq!(parse(&source).map(|h| h.spec), Ok("§4".to_string()));
+    let absolute = format!("{REJECT};; roots: /abs/lib\n");
+    assert_eq!(
+        roots("d/main.fib", &absolute),
+        Ok(vec![PathBuf::from("/abs/lib")])
+    );
+}
+
+#[test]
+fn a_header_without_roots_has_none() {
+    assert_eq!(roots("d/main.fib", ACCEPT), Ok(Vec::new()));
+}
+
+#[test]
+fn a_roots_key_with_no_directory_is_a_bad_value_at_its_line() {
+    let source = format!("{ACCEPT};; roots:   \n");
+    let e = roots("d/main.fib", &source).expect_err("no directory");
+    assert_eq!(
+        (e.line, e.kind),
+        (
+            5,
+            HeaderErrorKind::BadValue {
+                key: "roots",
+                value: String::new()
+            }
+        )
+    );
+}
+
+#[test]
+fn roots_given_twice_are_a_duplicate_key() {
+    let source = format!("{ACCEPT};; roots: a\n;; roots: b\n");
+    let e = roots("d/main.fib", &source).expect_err("twice");
+    assert_eq!(
+        (e.line, e.kind),
+        (6, HeaderErrorKind::DuplicateKey("roots".to_string()))
     );
 }

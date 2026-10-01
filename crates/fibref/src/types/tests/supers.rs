@@ -55,8 +55,10 @@ fn a_determined_supertrait_must_agree_with_the_impl() {
 
 #[test]
 fn a_bound_entails_its_supertraits_in_a_polymorphically_recursive_defun() {
+    // The recursion is at i64, not at a type built from a, which §7 B4
+    // rejects (types §3.6: it never ends under `fibc`).
     ok("(defun f (x: a n: i64) :where ((Ord a)) -> bool
-          (if (= n 0) (= x x) (f (some x) (- n 1))))
+          (if (= n 0) (= x x) (f 1 (- n 1))))
         (defun main () -> i64 (if (f 1 3) 1 0))");
 }
 
