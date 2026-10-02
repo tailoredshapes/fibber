@@ -1,0 +1,47 @@
+;; compiler/expand/prelude/vector.fib: `vector`, `hash-set`, `array-map` and
+;; `hash-map`, the collection constructors that are one rewrite each (stdlib
+;; §4.3, §4.8; tranche 2 X3), as crates/fibref/src/expand/prelude/vector.rs:
+;;
+;;   (vector a ..)      ==> [a ..]
+;;   (hash-set a ..)    ==> (fib.coll/conj (fib.coll/conj (fib.prelude/set-empty) a) ..)
+;;   (array-map k v ..) ==> {k v ..}
+;;   (hash-map k v ..)  ==> (fib.prelude/map-assoc (fib.prelude/map-assoc
+;;                             (fib.prelude/map-empty-hashed) k v) ..)
+;;
+;; An odd number of arguments to `array-map` or `hash-map` is `malformed
+;; NAME: a key without a value`. The functions end in `-macro`: `vector` is
+;; also the constructor of expand.build.
+(ns expand.prelude.vector
+  (:use syntax.pos syntax.form expand.error expand.build expand.collections expand.prelude.parts))
+
+;; The arguments of the call, which must pair up. (`pairs`)
+(defun pairs :private (name: str items: (Vec Stx) pos: Pos) -> (Result (Vec Stx) ExpandError)
+  (let ((args (tail-from items 1)))
+    (if (= (mod (count args) 2) 1)
+        (Err (malformed name "a key without a value" pos))
+        (Ok args))))
+
+;; `(vector a ..)` is the literal. (`vector_macro`)
+(defun vector-macro (items: (Vec Stx) pos: Pos) -> Stx
+  (vector (tail-from items 1) pos))
+
+;; `(hash-set a ..)`: one `conj` per element over the empty set. (`hash_set`)
+(defun hash-set-macro (items: (Vec Stx) pos: Pos) -> Stx
+  (reduce (fn (set a) (call "fib.coll/conj" [set a] pos))
+          (call (prelude-name "set-empty") (vec-empty) pos)
+          (tail-from items 1)))
+
+;; `(array-map k v ..)` is the literal `{k v ..}`, the array shape.
+;; (`array_map`)
+(defun array-map-macro (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (try-let ((args (pairs "array-map" items pos)))
+    (Ok (Stx (SMap args) pos))))
+
+;; `(hash-map k v ..)`: one `map-assoc` per pair over the empty hashed Map.
+;; (`hash_map`)
+(defun hash-map-macro (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (try-let ((args (pairs "hash-map" items pos)))
+    (Ok (loop ((i 0) (acc (call (prelude-name "map-empty-hashed") (vec-empty) pos)))
+          (if (< i (count args))
+              (recur (+ i 2) (call (prelude-name "map-assoc") [acc (nth args i) (nth args (+ i 1))] pos))
+              acc)))))

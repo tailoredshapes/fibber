@@ -1,0 +1,163 @@
+;; compiler/expand/params.fib: pattern parameters (stdlib spec §7 L7), as
+;; crates/fibref/src/expand/params.rs (175 lines; stdlib X4): a parameter
+;; that destructures is sugar for a plain parameter and a `let` around the
+;; body.
+;;
+;;   (fn (acc [k v]) body)          (fn (acc #param.1) (let (([k v] #param.1)) body))
+;;   (fn (a ([k v] :as p)) body)    (fn (a p) (let (([k v] p)) body))
+;;   (defun f (a ([k v] :as p: T)) body)
+;;                                  (defun f (a p: T) (let (([k v] p)) body))
+;;
+;; A `fn` literal takes the bare vector `[k v]` or `(PAT :as p)`, whose type
+;; is inferred; a `defun` takes only `(PAT :as p: T)`, because a top-level
+;; function states its types. The `let` is the checker's: the pattern in it
+;; is refutable or not as it would be written there (§7 L8). A type after
+;; `x:` is never read as a pattern.
+;;
+;; Shapes decided where Rust and fibber differ: the Rust `Param::Plain` and
+;; `Param::Pattern` are `PlainParam` and `PatternParam` (`Pattern` is a
+;; `Role` of expand.core); the Rust tuple `(Vec<Form>, Vec<Form>)` is the
+;; struct `Rebuilt`; `gensym("param")` is handed out per pattern parameter
+;; in the order written, after the shape of the body is checked.
+(ns expand.params
+  (:require [fib.string :as str])
+  (:use syntax.pos syntax.form expand.error expand.ctx expand.build expand.core
+        expand.prelude.parts))
+
+;; One item of a parameter list as the desugar sees it: items that stay as
+;; they are (`x`, or `x:` and its type), or a pattern parameter: the
+;; pattern, the symbol that stands for it in the `let`, the items it leaves
+;; in the parameter list and whether it was written with a type.
+(defenum Param :private
+  (PlainParam items: (Vec Stx))
+  (PatternParam pat: Stx name: (Option Stx) kept: (Vec Stx) typed: bool))
+
+;; The plain parameter list and the `(pat name)` bindings of the `let`.
+(defstruct Rebuilt :private (params: (Vec Stx) bindings: (Vec Stx)))
+
+;; The index of the parameter list in `(fn name? (params) ..)` or
+;; `(defun name (params) ..)`. (`params_at`)
+(defun params-at :private (items: (Vec Stx) is-defun: bool) -> i64
+  (if (or is-defun (and (> (count items) 1) (some? (sym-of (nth items 1))))) 2 1))
+
+;; The parameter list of the form at index `at`, when there is one.
+(defun params-of :private (items: (Vec Stx) at: i64) -> (Option (Vec Stx))
+  (if (< at (count items)) (items-of (nth items at)) nil))
+
+;; Whether a parameter is a symbol that ends in a colon: `x:`.
+(defun typed-name? :private (p: Stx) -> bool
+  (match (sym-of p)
+    ((some s) (str/ends-with? s ":"))
+    (nil false)))
+
+;; Whether item 1 of `(PAT :as ..)` is the keyword `:as`.
+(defun as-keyword? :private (items: (Vec Stx)) -> bool
+  (and (> (count items) 1)
+       (match (. (nth items 1) kind)
+         ((SKw k) (= k "as"))
+         (_ false))))
+
+;; `(PAT :as p)` or `(PAT :as p: T)`: nil for any other list. (the list arm
+;; of `pattern_param`)
+(defun as-param :private (items: (Vec Stx)) -> (Option Param)
+  (let ((n (count items))
+        (var (if (> (count items) 2) (sym-of (nth items 2)) nil)))
+    (if-some [v var]
+      (let ((colon (str/ends-with? v ":")))
+        (cond ((or (not (as-keyword? items)) (= v "_") (and colon (!= n 4))) nil)
+              ((and (= n 3) (not colon))
+               (some (PatternParam (nth items 0) (some (nth items 2)) [(nth items 2)] false)))
+              ((and (= n 4) colon (> (str-len v) 1))
+               (some (PatternParam (nth items 0)
+                                   (some (sym (str-slice v 0 (- (str-len v) 1)) (. (nth items 2) pos)))
+                                   [(nth items 2) (nth items 3)]
+                                   true)))
+              (else nil)))
+      nil)))
+
+;; `[pat]` or `(pat :as p)` or `(pat :as p: T)`. (`pattern_param`)
+(defun pattern-param :private (p: Stx) -> (Option Param)
+  (match (. p kind)
+    ((SVec _) (some (PatternParam p nil (vec-empty) false)))
+    ((SList items) (as-param items))
+    (_ nil)))
+
+;; Splits a parameter list into plain items and pattern parameters. (`split`)
+(defun split :private (params: (Vec Stx)) -> (Vec Param)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count params))
+        out
+        (let ((p (nth params i)))
+          (if (and (typed-name? p) (< (+ i 1) (count params)))
+              (recur (+ i 2) (conj out (PlainParam [p (nth params (+ i 1))])))
+              (recur (+ i 1) (conj out (match (pattern-param p)
+                                         ((some pp) pp)
+                                         (nil (PlainParam [p]))))))))))
+
+(defun pattern? :private (p: Param) -> bool
+  (match p
+    ((PatternParam _ _ _ _) true)
+    (_ false)))
+
+;; Whether `form` is a `fn` literal with a pattern among its parameters.
+;; (`fn_has_patterns`)
+(defun fn-has-patterns (form: Stx) -> bool
+  (match (items-of form)
+    (nil false)
+    ((some items)
+     (and (> (count items) 0)
+          (is-sym (nth items 0) "fn")
+          (match (params-of items (params-at items false))
+            ((some ps) (some? (some pattern? (split ps))))
+            (nil false))))))
+
+;; The plain parameter list and the `(pat name)` bindings of the `let`:
+;; a defun refuses a pattern with no type. (`rebuild`)
+(defun rebuild :private (ctx: ExpandCtx parsed: (Vec Param) is-defun: bool pos: Pos)
+    -> (Result Rebuilt ExpandError)
+  (loop ((i 0) (ps (vec-empty)) (bs (vec-empty)))
+    (if (>= i (count parsed))
+        (Ok (Rebuilt ps bs))
+        (match (nth parsed i)
+          ((PlainParam items) (recur (+ i 1) (concat-forms ps items) bs))
+          ((PatternParam pat name kept typed)
+           (if (and is-defun (not typed))
+               (Err (malformed "defun" "a pattern parameter is (pattern :as name: type)" (. pat pos)))
+               (let ((nm (match name
+                           ((some x) x)
+                           (nil (ctx-gensym ctx "param" (. pat pos))))))
+                 (recur (+ i 1)
+                        (concat-forms ps (if (= (count kept) 0) [nm] kept))
+                        (conj bs (list-form [pat nm] pos))))))))))
+
+;; The items of `items` from `from` up to, not including, `to`.
+(defun slice :private (items: (Vec Stx) from: i64 to: i64) -> (Vec Stx)
+  (head-of (tail-from items from) (- to from)))
+
+;; `form` with its pattern parameters replaced (see the header): `is-defun`
+;; says whether it is a `defun`, which wants every pattern typed. A form
+;; with no pattern parameter is returned as it is. (`desugar`)
+(defun desugar (ctx: ExpandCtx form: Stx is-defun: bool) -> (Result Stx ExpandError)
+  (match (items-of form)
+    (nil (Ok form))
+    ((some items)
+     (let ((at (params-at items is-defun))
+           (pos (. form pos)))
+       (match (params-of items at)
+         (nil (Ok form))
+         ((some params)
+          (let ((parsed (split params)))
+            (if (not (some? (some pattern? parsed)))
+                (Ok form)
+                (try-let ((start (body-start (if is-defun "defun" "fn") items at pos))
+                          (rebuilt (rebuild ctx parsed is-defun pos)))
+                  (Ok (list-form
+                       (concat-forms
+                        (concat-forms (head-of items at)
+                                      [(list-form (. rebuilt params) (. (nth items at) pos))])
+                        (concat-forms
+                         (slice items (+ at 1) start)
+                         [(list-form (concat-forms [(sym "let" pos) (list-form (. rebuilt bindings) pos)]
+                                                   (tail-from items start))
+                                     pos)]))
+                       pos)))))))))))

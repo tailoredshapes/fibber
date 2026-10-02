@@ -51,6 +51,16 @@
 ;;   .atoms. Each declines the binary call the builtin or the library
 ;;   function serves, so each answers `nil` as `update` does (`-`, `assoc`
 ;;   and `merge` can also fail: `declinable-result`).
+;; - the rows of stdlib tranche 2 (X3, re-synced in E1) are the modules
+;;   expand.prelude.guard (`if-not some declare if-some when-some
+;;   when-first`; `when-not` is `unless` under its name, `when-macro` here
+;;   with the name the arity error says), .vector (`vector hash-set
+;;   array-map hash-map`), .extremum (`max-key min-key`), .trylet, .comp
+;;   (`for doseq`) and .text (`print-str pr-str println-str prn-str`, over
+;;   the pieces of expand.prelude.print), and `vswap!` is in
+;;   expand.prelude.atoms. `some` can decline (the constructor), so it is
+;;   `declinable-result`. `option-match`, which `if-let` and the presence
+;;   macros share, is in expand.prelude.parts.
 ;; - `derive` is the one macro that is not a rewrite of this module,
 ;;   `expand.derive` (porter 3) answers it. Module dependency: expand.prelude
 ;;   uses expand.derive, expand.build, expand.core, expand.ctx and
@@ -59,7 +69,9 @@
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.build
         expand.collections expand.prelude.parts expand.prelude.forms expand.prelude.print
         expand.prelude.defn expand.prelude.update expand.prelude.reduce
-        expand.prelude.fold expand.prelude.colls expand.prelude.atoms)
+        expand.prelude.fold expand.prelude.colls expand.prelude.atoms
+        expand.prelude.guard expand.prelude.vector expand.prelude.extremum
+        expand.prelude.text expand.prelude.trylet expand.prelude.comp)
   (:require [expand.own :as own] [expand.derive :as dv]))
 
 ;; The prelude macros, by name, in the order of the Rust table (the soup
@@ -69,7 +81,10 @@
    "dotimes" "for-each" "range" "->" "->>" "doto" "assert" "dbg" "derive"
    "defn" "defn-" "update" "reduce" "str" "println" "print" "prn" "pr"
    "+" "-" "*" "<" ">" "<=" ">=" "=" "max" "min" "bit-and" "bit-or" "bit-xor"
-   "conj" "assoc" "dissoc" "merge" "swap!"])
+   "conj" "assoc" "dissoc" "merge" "swap!"
+   "if-not" "when-not" "some" "declare" "if-some" "when-some" "when-first" "try-let"
+   "for" "doseq" "vector" "hash-set" "array-map" "hash-map" "max-key" "min-key"
+   "vswap!" "print-str" "pr-str" "println-str" "prn-str"])
 
 ;; What a prelude macro did with a call.
 (defenum Outcome
@@ -134,10 +149,11 @@
     ((Ok f) (Ok (Rewritten f)))))
 
 ;; logic.rs: when unless cond and or if-let when-let
-;; `(when c body...)` ==> `(if c body ())`; `(unless c body...)` ==> `(if
-;; c () body)`.
-(defun when-macro :private (items: (Vec Stx) pos: Pos negate: bool) -> (Result Stx ExpandError)
-  (match (check-arity (if negate "unless" "when") items 1 nil pos)
+;; `(when c body...)` ==> `(if c body ())`; `(unless c body...)` and
+;; `(when-not c body...)` ==> `(if c () body)`; `name` is the one the arity
+;; error names.
+(defun when-macro :private (items: (Vec Stx) pos: Pos negate: bool name: str) -> (Result Stx ExpandError)
+  (match (check-arity name items 1 nil pos)
     ((Err e) (Err e))
     ((Ok _)
      (let ((test (nth items 1))
@@ -213,15 +229,6 @@
          (Ok parts)
          (Err (malformed name "the binding is (pattern expression)" (. form pos)))))
     (nil (Err (malformed name "the binding is (pattern expression)" (. form pos))))))
-
-;; `(match e ((fib.prelude/some p) then) (_ other))`. The else is a
-;; wildcard, not `nil`: the pattern `p` may be refutable (`[a b]` matches
-;; a vector of two and no other), and the else is taken on a mismatch of
-;; the pattern as well as on `nil` (stdlib §2.4, §7 E13; tranche 1 R7).
-(defun option-match :private (x: Stx e: Stx then: Stx other: Stx pos: Pos) -> Stx
-  (let ((some-clause (list-form [(call (prelude-name "some") [x] pos) then] pos))
-        (rest-clause (list-form [(sym "_" pos) other] pos)))
-    (list-form [(sym "match" pos) e some-clause rest-clause] pos)))
 
 ;; `(if-let (p e) a b)` ==> `(match e ((fib.prelude/some p) a) (_ b))`;
 ;; `(if-let (p e) a)` has `()` as its else (§4.4, stdlib §2.4).
@@ -381,13 +388,17 @@
                    (tail-from fun 1)
                    pos)))
 
-;; mod.rs: the table
+;; mod.rs: the table, in three `match`es to keep each function short: the
+;; rows of syntax §4.4 (`expand-call`), those of stdlib tranche 1
+;; (`expand-terse`: `defn` to `swap!`) and those of tranche 2, X3
+;; (`expand-more`: `if-not` to `prn-str`); a name that is no row is
+;; declined by the last.
 ;; The call `items` of the macro `name`, at pos. (the `match` of `expand`)
 (defun expand-call :private (ctx: ExpandCtx name: str items: (Vec Stx) pos: Pos)
     -> (Result Outcome ExpandError)
   (match name
-    ("when" (rewritten (when-macro items pos false)))
-    ("unless" (rewritten (when-macro items pos true)))
+    ("when" (rewritten (when-macro items pos false "when")))
+    ("unless" (rewritten (when-macro items pos true "unless")))
     ("cond" (rewritten (cond-macro items pos)))
     ("and" (Ok (Rewritten (and-or items pos true))))
     ("or" (Ok (Rewritten (and-or items pos false))))
@@ -405,6 +416,12 @@
     ("for-each" (for-each-macro ctx items pos))
     ("range" (range-macro items pos))
     ("derive" (rewritten (dv/derive ctx items pos)))
+    (_ (expand-terse ctx name items pos))))
+
+;; The rows of stdlib tranche 1 (R5 to R6b).
+(defun expand-terse :private (ctx: ExpandCtx name: str items: (Vec Stx) pos: Pos)
+    -> (Result Outcome ExpandError)
+  (match name
     ("defn" (rewritten (defn-macro items pos false)))
     ("defn-" (rewritten (defn-macro items pos true)))
     ("update" (declinable (update-macro ctx items pos) items pos))
@@ -432,12 +449,40 @@
     ("dissoc" (declinable (dissoc-macro items pos) items pos))
     ("merge" (declinable-result (merge-macro items pos) items pos))
     ("swap!" (declinable (swap-macro ctx items pos) items pos))
+    (_ (expand-more ctx name items pos))))
+
+;; The rows of tranche 2, X3.
+(defun expand-more :private (ctx: ExpandCtx name: str items: (Vec Stx) pos: Pos)
+    -> (Result Outcome ExpandError)
+  (match name
+    ("if-not" (rewritten (if-not-macro items pos)))
+    ("when-not" (rewritten (when-macro items pos true "when-not")))
+    ("some" (declinable-result (some-macro items pos) items pos))
+    ("declare" (rewritten (declare-macro items pos)))
+    ("if-some" (rewritten (if-some-macro items pos)))
+    ("when-some" (rewritten (when-some-macro items pos)))
+    ("when-first" (rewritten (when-first-macro items pos)))
+    ("try-let" (rewritten (try-let-macro ctx items pos)))
+    ("for" (rewritten (for-macro ctx items pos)))
+    ("doseq" (rewritten (doseq-macro ctx items pos)))
+    ("vector" (Ok (Rewritten (vector-macro items pos))))
+    ("hash-set" (Ok (Rewritten (hash-set-macro items pos))))
+    ("array-map" (rewritten (array-map-macro items pos)))
+    ("hash-map" (rewritten (hash-map-macro items pos)))
+    ("max-key" (rewritten (key-extremum ctx items pos "max-key" "fib.seq/max-key-pair")))
+    ("min-key" (rewritten (key-extremum ctx items pos "min-key" "fib.seq/min-key-pair")))
+    ("vswap!" (rewritten (vswap-macro ctx items pos)))
+    ("print-str" (Ok (Rewritten (text-macro items pos false false))))
+    ("pr-str" (Ok (Rewritten (text-macro items pos true false))))
+    ("println-str" (Ok (Rewritten (text-macro items pos false true))))
+    ("prn-str" (Ok (Rewritten (text-macro items pos true true))))
     (_ (Ok (Declined (list-form items pos))))))
 
 ;; Expands one call of a prelude macro: the form must be a list whose head
 ;; is one of prelude-macros (a form that is not a list is declined as it
 ;; is). The context gives the gensyms of `plet`, `doto`, `dbg`, `dotimes`
-;; and `for-each`, and `derive` its reflection. (mod.rs `expand`)
+;; `for-each`, `try-let`, `for`, `doseq`, `max-key`, `min-key` and `vswap!`, and
+;; `derive` its reflection. (mod.rs `expand`)
 (defun expand (ctx: ExpandCtx form: Stx) -> (Result Outcome ExpandError)
   (match (. form kind)
     ((SList items)

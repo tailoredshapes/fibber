@@ -2,7 +2,7 @@
 ;; share (expand.prelude and expand.prelude.forms): the Rust's
 ;; `iter().skip(n)`, `Form::as_list`, `Form::as_sym` and `body_form`
 ;; (prelude/logic.rs) over a `(Vec Stx)`.
-(ns expand.prelude.parts (:use syntax.pos syntax.form expand.build))
+(ns expand.prelude.parts (:use syntax.pos syntax.form expand.build expand.collections))
 
 ;; The items of items from index `from` on (Rust `.skip(from)`).
 (defun tail-from (items: (Vec Stx) from: i64) -> (Vec Stx)
@@ -46,3 +46,14 @@
 (defun body-form (body: (Vec Stx) pos: Pos) -> Stx
   (if (= (count body) 1) (nth body 0) (call "do" body pos)))
 
+
+;; `(match e ((fib.prelude/some p) then) (_ other))`. The else is a
+;; wildcard, not `nil`: the pattern `p` may be refutable (`[a b]` matches
+;; a vector of two and no other), and the else is taken on a mismatch of
+;; the pattern as well as on `nil` (stdlib §2.4, §7 E13; tranche 1 R7).
+;; Shared by `if-let`/`when-let` (expand.prelude) and `if-some`,
+;; `when-some`, `when-first` (expand.prelude.guard). (logic.rs `option_match`)
+(defun option-match (x: Stx e: Stx then: Stx other: Stx pos: Pos) -> Stx
+  (let ((some-clause (list-form [(call (prelude-name "some") [x] pos) then] pos))
+        (rest-clause (list-form [(sym "_" pos) other] pos)))
+    (list-form [(sym "match" pos) e some-clause rest-clause] pos)))

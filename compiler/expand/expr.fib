@@ -40,7 +40,7 @@
 ;; - `plan` is private and gives the `Planned` of the form it was given
 ;;   (Rust's `(Role, Finish)` and the form beside them).
 (ns expand.expr
-  (:require [expand.prelude :as prelude] [expand.quasi :as quasi])
+  (:require [expand.prelude :as prelude] [expand.quasi :as quasi] [expand.params :as params])
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.core
         expand.build expand.heads expand.collections expand.fuse))
 
@@ -154,6 +154,16 @@
        ((Err e) (Err e))
        ((Ok f) (Ok (Rewrote f)))))))
 
+;; A `fn` literal with a pattern parameter is one more rewriting step, to a
+;; plain parameter and a `let` (X4, expand.params); any other form is
+;; settled. (the last arm of `expand_head`)
+(defun params-step :private (ex: Expander form: Stx) -> (Result Rewriting ExpandError)
+  (if (params/fn-has-patterns form)
+      (try-let ((_ (ctx-step (. ex ctx) (. form pos)))
+                (f (params/desugar (. ex ctx) form false)))
+        (Ok (Rewrote f)))
+      (Ok (Settled form))))
+
 ;; A call whose head is name, neither `quasiquote` nor ambiguous: a user
 ;; macro shadows a prelude macro, anything else is left alone.
 (defun macro-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
@@ -161,7 +171,7 @@
     ((some _) (user-step ex form name))
     (nil (if (some? (prelude/macro-of (. ex ctx) name))
              (prelude-step ex form name)
-             (Ok (Settled form))))))
+             (params-step ex form)))))
 
 ;; One pass over a form whose head is the symbol name.
 (defun head-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
@@ -182,7 +192,8 @@
 ;; prelude macro of the same name, then a prelude macro) or `quasiquote`,
 ;; counting each expansion as a step and admitting its result. Returns the
 ;; first form that is not a macro call, or a `for-each` or `range` the
-;; prelude declined. (expand_head)
+;; prelude declined; a `fn` with a pattern parameter is rewritten on the way
+;; (X4). (expand_head)
 (defun expand-head (ex: Expander form: Stx) -> (Result Stx ExpandError)
   (loop ((form form))
     (match (head-name form)

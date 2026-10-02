@@ -1,0 +1,52 @@
+;; compiler/expand/prelude/trylet.fib: `try-let` (stdlib §2.10, §4.3; L12,
+;; tranche 2 X3), as crates/fibref/src/expand/prelude/trylet.rs: the block
+;; macro that threads a `Result`, because the language has no early return.
+;;
+;;   (try-let ((x e) (y f)) body)
+;;     ==> (match e ((fib.prelude/Ok x) (match f ((fib.prelude/Ok y) body)
+;;                                               ((fib.prelude/Err g) (fib.prelude/Err g))))
+;;               ((fib.prelude/Err g) (fib.prelude/Err g)))
+;;
+;; each `g` its own gensym (`err`, the innermost step's first): each `Ok`
+;; payload is bound in turn, the first `Err` is the value of the whole form
+;; (rebuilt, so its type is that of `body`), and no binding is `body`. A
+;; binding list is `((x e) ..)` or the flat bracket `[x e y f]`; the body
+;; may be several forms, as `let`'s.
+(ns expand.prelude.trylet
+  (:use syntax.pos syntax.form expand.error expand.ctx expand.build expand.collections
+        expand.prelude.parts))
+
+;; The `[pattern expression]` pairs of a binding list. (`bindings`)
+(defun try-bindings :private (form: Stx) -> (Result (Vec (Vec Stx)) ExpandError)
+  (let ((bad (malformed "try-let" "the bindings are ((pattern expression) ..)" (. form pos))))
+    (match (. form kind)
+      ((SList items)
+       (loop ((i 0) (acc (vec-empty)))
+         (if (< i (count items))
+             (match (items-of (nth items i))
+               ((some [x e]) (recur (+ i 1) (conj acc [x e])))
+               (_ (Err bad)))
+             (Ok acc))))
+      ((SVec items)
+       (if (= (mod (count items) 2) 0)
+           (Ok (loop ((i 0) (acc (vec-empty)))
+                 (if (< i (count items))
+                     (recur (+ i 2) (conj acc [(nth items i) (nth items (+ i 1))]))
+                     acc)))
+           (Err bad)))
+      (_ (Err bad)))))
+
+;; `(match e ((Ok x) rest) ((Err g) (Err g)))`. (`step`)
+(defun try-step :private (ctx: ExpandCtx x: Stx e: Stx rest: Stx pos: Pos) -> Stx
+  (let ((g (ctx-gensym ctx "err" pos))
+        (ok (list-form [(call (prelude-name "Ok") [x] pos) rest] pos))
+        (bad (list-form [(call (prelude-name "Err") [g] pos) (call (prelude-name "Err") [g] pos)] pos)))
+    (list-form [(sym "match" pos) e ok bad] pos)))
+
+;; `(try-let ((x e) ..) body..)`. (`try_let`)
+(defun try-let-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (try-let ((_ (check-arity "try-let" items 2 nil pos))
+            (pairs (try-bindings (nth items 1))))
+    (Ok (reduce (fn (rest [x e]) (try-step ctx x e rest pos))
+                (body-form (tail-from items 2) pos)
+                (reverse pairs)))))

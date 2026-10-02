@@ -9,7 +9,7 @@
 ;; extra arguments are evaluated inside the closure. Called by
 ;; expand.prelude (the registry row `swap!`).
 (ns expand.prelude.atoms
-  (:use syntax.pos syntax.form expand.ctx expand.build expand.collections expand.prelude.parts))
+  (:use syntax.pos syntax.form expand.error expand.ctx expand.build expand.collections expand.prelude.parts))
 
 ;; `(fn (v) (f v x ..))` with `v` a gensym.
 (defun swap-closure :private (ctx: ExpandCtx f: Stx extra: (Vec Stx) pos: Pos) -> Stx
@@ -25,3 +25,17 @@
       nil
       (let ((f (swap-closure ctx (nth items 2) (tail-from items 3) pos)))
         (some (call (prelude-name "swap!") [(nth items 1) f] pos)))))
+
+;; `(vswap! v f a ..)`: not atomic, as Clojure's, and the value is the new
+;; one; `@c` and `reset!` are written `fib.prelude/deref` and
+;; `fib.prelude/reset!`. (atoms.rs `vswap`)
+(defun vswap-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (try-let ((_ (check-arity "vswap!" items 2 nil pos)))
+    (let ((c (ctx-gensym ctx "c" pos))
+          (n (ctx-gensym ctx "n" pos))
+          (applied (list-form (concat-forms [(nth items 2) (call (prelude-name "deref") [c] pos)]
+                                            (tail-from items 3))
+                              pos))
+          (done (call "do" [(call (prelude-name "reset!") [c n] pos) n] pos))
+          (inner (call "let" [(list-form [(list-form [n applied] pos)] pos) done] pos)))
+      (Ok (call "let" [(list-form [(list-form [c (nth items 1)] pos)] pos) inner] pos)))))

@@ -9,7 +9,7 @@
 ;; `fib.prelude/str-concat` over the pieces, a piece being a string literal
 ;; as it is, a literal `nil` as `""` and anything else `(fib.core/to-str
 ;; x)`; `(println a b ..)` is `(fib.prelude/println S)` and `(print ..)`
-;; `(fib.prelude/print-str S)`, `S` the pieces joined by one space, a piece
+;; `(fib.prelude/print-raw S)`, `S` the pieces joined by one space, a piece
 ;; being a literal `nil` as `"nil"` and anything else `(fib.prelude/show x)`
 ;; (a string literal included); `prn` and `pr` are the same over
 ;; `(fib.core/debug x)`.
@@ -32,12 +32,12 @@
     (_ false)))
 
 ;; `a` then `b` as one text: `(fib.prelude/str-concat a b)`.
-(defun concat-text :private (a: Stx b: Stx pos: Pos) -> Stx
+(defun concat-text (a: Stx b: Stx pos: Pos) -> Stx
   (call (prelude-name "str-concat") [a b] pos))
 
 ;; The pieces as one text, `sep` between two (none for `str`): a right fold.
 ;; No pieces is `""`.
-(defun join-pieces :private (pieces: (Vec Stx) sep: (Option str) pos: Pos) -> Stx
+(defun join-pieces (pieces: (Vec Stx) sep: (Option str) pos: Pos) -> Stx
   (let ((n (count pieces)))
     (if (= n 0)
         (string "" pos)
@@ -68,13 +68,23 @@
         (recur (+ i 1) (conj pieces (str-piece (nth items i) pos)))
         (join-pieces pieces nil pos))))
 
-;; The function a printer writes with: `println` or `print-str`.
+;; The text of each argument of the call: a literal `nil` is the word,
+;; anything else its `Show` (`Debug` when `debug`, a string literal quoted
+;; then). Shared with expand.prelude.text. (print.rs `pieces`)
+(defun printer-pieces (items: (Vec Stx) pos: Pos debug: bool) -> (Vec Stx)
+  (loop ((i 1) (acc (vec-empty)))
+    (if (< i (count items))
+        (recur (+ i 1) (conj acc (printer-piece (nth items i) pos debug)))
+        acc)))
+
+;; The function a printer writes with: `println` or `print-raw` (`print-str`
+;; is the macro of expand.prelude.text now).
 (defun printer-write :private (which: Printer) -> str
   (match which
     ((Println) "println")
-    ((Print) "print-str")
+    ((Print) "print-raw")
     ((Prn) "println")
-    ((Pr) "print-str")))
+    ((Pr) "print-raw")))
 
 ;; Whether a printer is over `Debug`.
 (defun printer-debug :private (which: Printer) -> bool
@@ -87,10 +97,6 @@
 ;; `(println a b ..)`, `(print ..)`, `(prn ..)`, `(pr ..)`: one write of the
 ;; arguments' texts joined by a space.
 (defun printer-macro (items: (Vec Stx) pos: Pos which: Printer) -> Stx
-  (let ((debug (printer-debug which)))
-    (loop ((i 1) (pieces (vec-empty)))
-      (if (< i (count items))
-          (recur (+ i 1) (conj pieces (printer-piece (nth items i) pos debug)))
-          (call (prelude-name (printer-write which))
-                [(join-pieces pieces (some " ") pos)]
-                pos)))))
+  (call (prelude-name (printer-write which))
+        [(join-pieces (printer-pieces items pos (printer-debug which)) (some " ") pos)]
+        pos))

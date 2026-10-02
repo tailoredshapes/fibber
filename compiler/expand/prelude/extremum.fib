@@ -1,0 +1,24 @@
+;; compiler/expand/prelude/extremum.fib: `max-key` and `min-key` (stdlib
+;; §4.6; tranche 2 X3), as crates/fibref/src/expand/prelude/extremum.rs:
+;; Clojure's text, a macro that folds its arguments.
+;;
+;;   (max-key k x)       ==> x
+;;   (max-key k x y z)   ==> (let ((g k)) (fib.seq/max-key-pair g (fib.seq/max-key-pair g x y) z))
+;;
+;; `g` is a gensym (`k`), so `k` is evaluated once however many arguments
+;; there are, and it is handed out only when there is a pair to fold; the
+;; pair function returns the second of two equal keys, so a tie goes to the
+;; last argument. `(max-key k x)` does not evaluate `k`.
+(ns expand.prelude.extremum
+  (:use syntax.pos syntax.form expand.error expand.ctx expand.build expand.prelude.parts))
+
+;; `(max-key k x y ..)` over the pair function `pair`, named `name` in the
+;; arity error. (`key_extremum`)
+(defun key-extremum (ctx: ExpandCtx items: (Vec Stx) pos: Pos name: str pair: str)
+    -> (Result Stx ExpandError)
+  (try-let ((_ (check-arity name items 2 nil pos)))
+    (if (= (count items) 3)
+        (Ok (nth items 2))
+        (let ((g (ctx-gensym ctx "k" pos))
+              (fold (reduce (fn (acc x) (call pair [g acc x] pos)) (nth items 2) (tail-from items 3))))
+          (Ok (call "let" [(list-form [(list-form [g (nth items 1)] pos)] pos) fold] pos))))))

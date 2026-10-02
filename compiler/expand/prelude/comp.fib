@@ -1,0 +1,190 @@
+;; compiler/expand/prelude/comp.fib: `for` and `doseq` (stdlib §4.3, §4.4;
+;; tranche 2 X3, D2), as crates/fibref/src/expand/prelude/comp.rs: the
+;; comprehensions, macros of the expander because stage 2a has no macro
+;; runner.
+;;
+;; `(for [x xs :when p :let [y e] z zs] body)` and `doseq` take a binding
+;; vector of levels, `pattern source`, each followed by its modifiers
+;; `:when p`, `:while p`, `:let [pattern e ..]`. A level is one nesting.
+;; The expansions, innermost level first:
+;;
+;;   (for [x xs] b)             ==> (fib.seq/map (fn (x) b) xs)
+;;   (for [x xs :when p] b)     ==> (fib.seq/map (fn (x) b) (fib.seq/filter (fn (x) p) xs))
+;;   (for [x xs :while p] b)    ==> (fib.seq/map (fn (x) b) (fib.seq/take-while (fn (x) p) xs))
+;;   (for [x xs :let [y e]] b)  ==> (fib.seq/map (fn (x) (let ((y e)) b)) xs)
+;;   (for [x xs :let [y e] :when p] b)
+;;                              ==> (fib.seq/keep (fn (x) (let ((y e)) (if p (fib.prelude/some b) nil))) xs)
+;;   (for [x xs y ys] b)        ==> (fib.seq/mapcat (fn (x) (fib.seq/map (fn (y) b) ys)) xs)
+;;   (doseq [x xs ..] b..)      the same levels over (fib.prelude/for-each xs (fn (x) ..)),
+;;                              a guard after a :let being (if p .. ())
+;;
+;; A `:when` or `:while` before the level's first `:let` is applied to the
+;; source (`filter`, `take-while`, in the order written); one after a `:let`
+;; guards the level's body (`keep` over an `Option` for the innermost level
+;; of a `for`, an `if` over the empty `take 0` of the inner sequence for an
+;; outer one). A `:while` after a `:let` is `malformed`.
+;;
+;; Shapes decided where Rust and fibber differ: the Rust `Kind` is the bool
+;; `is-for` (false for `doseq`); the Rust `Step` is `Modifier`, `Step` being
+;; a prelude type; `(Form, Vec<Step>)` is the struct `Leading`; the Rust
+;; `out.last_mut()` is `peek` and `pop` of the levels so far.
+(ns expand.prelude.comp
+  (:use syntax.pos syntax.form expand.error expand.ctx expand.build expand.collections
+        expand.prelude.parts))
+
+;; A modifier of a level.
+(defenum Modifier :private
+  (ModWhen test: Stx)
+  (ModWhile test: Stx)
+  (ModLet pairs: (Vec Stx)))
+
+;; One `pattern source` with its modifiers.
+(defstruct Level :private (pat: Stx src: Stx steps: (Vec Modifier)))
+
+;; The level's source with the modifiers before its first `:let` applied,
+;; and the modifiers from the `:let` on.
+(defstruct Leading :private (src: Stx steps: (Vec Modifier)))
+
+;; The items of a vector or list form: the bracket and the parenthesis are
+;; alike here.
+(defun seq-items :private (form: Stx) -> (Option (Vec Stx))
+  (match (. form kind)
+    ((SVec xs) (some xs))
+    ((SList xs) (some xs))
+    (_ nil)))
+
+;; A modifier from its keyword and argument. (`step`)
+(defun modifier :private (name: str kw: str arg: Stx) -> (Result Modifier ExpandError)
+  (match kw
+    ("when" (Ok (ModWhen arg)))
+    ("while" (Ok (ModWhile arg)))
+    ("let" (let-modifier name arg))
+    (_ (Err (malformed name "a modifier is :when, :while or :let" (. arg pos))))))
+
+;; `:let [pattern e ..]`: the pairs, each a list at the argument's position.
+(defun let-modifier :private (name: str arg: Stx) -> (Result Modifier ExpandError)
+  (if-some [b (seq-items arg)]
+    (if (= (mod (count b) 2) 0)
+        (Ok (ModLet (loop ((i 0) (acc (vec-empty)))
+                      (if (< i (count b))
+                          (recur (+ i 2) (conj acc (list-form [(nth b i) (nth b (+ i 1))] (. arg pos))))
+                          acc))))
+        (Err (malformed name ":let takes [pattern expression ..]" (. arg pos))))
+    (Err (malformed name ":let takes [pattern expression ..]" (. arg pos)))))
+
+;; The levels so far with one more binding: a keyword adds a modifier to the
+;; last level, anything else starts a level. (the body of `levels`' loop)
+(defun add-binding :private (name: str out: (Vec Level) head: Stx arg: Stx)
+    -> (Result (Vec Level) ExpandError)
+  (match (. head kind)
+    ((SKw kw)
+     (match (peek out)
+       (nil (Err (malformed name "a modifier follows a binding" (. head pos))))
+       ((some lv)
+        (try-let ((m (modifier name kw arg)))
+          (Ok (conj (pop out) (Level (. lv pat) (. lv src) (conj (. lv steps) m))))))))
+    (_ (Ok (conj out (Level head arg (vec-empty)))))))
+
+;; The levels of a binding vector. (`levels`)
+(defun levels :private (name: str form: Stx) -> (Result (Vec Level) ExpandError)
+  (let ((bad (malformed name "the bindings are [pattern source ..]" (. form pos))))
+    (if-some [items (seq-items form)]
+      (if (= (count items) 0)
+          (Err bad)
+          (loop ((i 0) (out (vec-empty)))
+            (cond ((>= i (count items)) (Ok out))
+                  ((= (+ i 1) (count items))
+                   (Err (malformed name "a binding is a pattern and a source" (. (nth items i) pos))))
+                  (else
+                   (try-let ((next (add-binding name out (nth items i) (nth items (+ i 1)))))
+                     (recur (+ i 2) next))))))
+      (Err bad))))
+
+;; `(fn (pat) body)`. (`lambda`)
+(defun lambda-form :private (pat: Stx body: Stx pos: Pos) -> Stx
+  (call "fn" [(list-form [pat] pos) body] pos))
+
+;; (`leading`)
+(defun leading :private (level: Level pos: Pos) -> Leading
+  (let ((steps (. level steps)))
+    (loop ((i 0) (src (. level src)))
+      (if (< i (count steps))
+          (match (nth steps i)
+            ((ModWhen p) (recur (+ i 1) (call "fib.seq/filter" [(lambda-form (. level pat) p pos) src] pos)))
+            ((ModWhile p) (recur (+ i 1) (call "fib.seq/take-while" [(lambda-form (. level pat) p pos) src] pos)))
+            ((ModLet _) (Leading src (vec (drop i steps)))))
+          (Leading src (vec-empty))))))
+
+;; What a guard `:when p` makes of `acc`, the form of the rest of the level:
+;; an `if` with the empty value of its kind for the else. (`guard`)
+(defun guard :private (ctx: ExpandCtx is-for: bool inner: bool p: Stx acc: Stx pos: Pos) -> Stx
+  (cond ((not is-for) (call "if" [p acc (unit pos)] pos))
+        (inner (call "if" [p acc (Stx SNil pos)] pos))
+        (else
+         (let ((s (ctx-gensym ctx "s" pos))
+               (none (call "fib.seq/take" [(int 0 pos) s] pos))
+               (test (call "if" [p s none] pos)))
+           (call "let" [(list-form [(list-form [s acc] pos)] pos) test] pos)))))
+
+;; The body of a level's function: the leaf under the modifiers after the
+;; first `:let`, innermost last. (`wrap`)
+(defun wrap :private (ctx: ExpandCtx name: str is-for: bool inner: bool steps: (Vec Modifier)
+                      leaf: Stx pos: Pos)
+    -> (Result Stx ExpandError)
+  (loop ((i (- (count steps) 1)) (acc leaf))
+    (if (< i 0)
+        (Ok acc)
+        (match (nth steps i)
+          ((ModWhen p) (recur (- i 1) (guard ctx is-for inner p acc pos)))
+          ((ModLet pairs) (recur (- i 1) (call "let" [(list-form pairs pos) acc] pos)))
+          ((ModWhile p)
+           (Err (malformed name ":while after :let is not supported; write it before the :let"
+                           (. p pos))))))))
+
+;; Whether a modifier is a `:when`.
+(defun when-step? :private (m: Modifier) -> bool
+  (match m
+    ((ModWhen _) true)
+    (_ false)))
+
+;; One level around `acc`, the form of the levels inside it (the body for
+;; the innermost). (`level_form`)
+(defun level-form :private (ctx: ExpandCtx name: str is-for: bool level: Level acc: Stx
+                            inner: bool pos: Pos)
+    -> (Result Stx ExpandError)
+  (let ((lead (leading level pos))
+        (keep (and is-for inner (some? (some when-step? (. lead steps))))))
+    (try-let ((body (wrap ctx name is-for inner (. lead steps)
+                          (if keep (call (prelude-name "some") [acc] pos) acc)
+                          pos)))
+      (let ((f (lambda-form (. level pat) body pos))
+            (src (. lead src)))
+        (Ok (cond ((not is-for) (call (prelude-name "for-each") [src f] pos))
+                  ((not inner) (call "fib.seq/mapcat" [f src] pos))
+                  (keep (call "fib.seq/keep" [f src] pos))
+                  (else (call "fib.seq/map" [f src] pos))))))))
+
+;; `(for [x xs ..] body..)` and `(doseq [x xs ..] body..)`. A doseq body is
+;; for effect: its value is dropped, so a guard's unit else unifies with it.
+;; (`comprehension`)
+(defun comprehension :private (ctx: ExpandCtx items: (Vec Stx) pos: Pos is-for: bool)
+    -> (Result Stx ExpandError)
+  (let ((name (if is-for "for" "doseq")))
+    (try-let ((_ (check-arity name items (if is-for 2 1) nil pos))
+              (lvls (levels name (nth items 1))))
+      (let ((forms (tail-from items 2))
+            (n (count lvls)))
+        (loop ((i (- n 1))
+               (acc (if is-for (body-form forms pos) (call "do" (conj forms (unit pos)) pos))))
+          (if (< i 0)
+              (Ok acc)
+              (try-let ((next (level-form ctx name is-for (nth lvls i) acc (= i (- n 1)) pos)))
+                (recur (- i 1) next))))))))
+
+;; `(for [x xs ..] body..)`. (`for_macro`)
+(defun for-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (comprehension ctx items pos true))
+
+;; `(doseq [x xs ..] body..)`. (`doseq`)
+(defun doseq-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (comprehension ctx items pos false))
