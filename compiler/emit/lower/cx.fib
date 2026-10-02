@@ -1,0 +1,48 @@
+;; compiler/emit/lower/cx.fib: the context of lowering one function and the small data every lowering module shares (spec/compiler.md §4).
+;; The data of crates/fibc/src/lower/mod.rs (`Flow`, `Local`, `LoopCx`, `LowerCx`), lower/call.rs (`Target`),
+;; lower/pattern.rs (`VecIds`) and lower/threads.rs (`AsyncFrame`) is here, in a module below all of them, because the
+;; Rust modules call each other in a cycle (`expr` -> `call` -> `expr`, ..) and fibber modules cannot. DECISION FOR
+;; E4/E5: cut the cycle as the checker did (types/infer/call.fib: `infer` is a borrowed function parameter that
+;; types.infer.expr passes), i.e. each `lcx-NAME` that calls back takes `lower: (fn (LowerCx Expr) (Result Flow str))`
+;; last, or keep the cycle's members in one module. A `Cx` method of Rust is `lcx-NAME` here; `LowerCx` is a struct
+;; of Cells passed borrowed (plan D2); `p` is the same `Program` handle (all its mutation is in Cells), so two
+;; handles are safe; `lits` holds counted `Expr` handles; the 15 fields are Rust's, in its order.
+;; STATUS: every public function below is a STUB of package E4, `(trap "todo: PACKAGE NAME")`,
+;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/mod.rs, 501 lines of Rust).
+;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
+;; the data it names is the porter's to extend.
+(ns emit.lower.cx
+  (:use types.ty types.ast own.program emit.value emit.ir emit.mono emit.program))
+
+;; What an expression yielded: a value, or a jump (the block ended). Rust: lower/mod.rs:38 Flow
+(defenum Flow (FlowVal v: V) FlowJump)
+
+;; A local: a value, or a stack slot and its type. Rust: lower/mod.rs:47 Local
+(defenum Local (LocalVal v: V) (LocalSlot name: str ty: (Option LirTy)))
+
+;; One loop variable. Rust: lower/mod.rs:54 `(BindingId, String, Option<LirTy>)`
+(defstruct LoopVar (binding: i64 name: str ty: (Option LirTy)))
+;; An enclosing loop. Rust: lower/mod.rs:54 LoopCx
+(defstruct LoopCx (vars: (Vec LoopVar) head: str))
+
+;; A rest binding of a vector pattern. Rust: lower/mod.rs:79 `(BindingId, V, usize, Ty)`
+(defstruct RestSlot (binding: i64 v: V start: i64 ty: Ty))
+
+;; The frame of an async body. Rust: lower/threads.rs:25 AsyncFrame
+(defstruct AsyncFrame (tsname: str point: i64 states: (Vec str)))
+
+;; The type ids of a vector type. Rust: lower/pattern.rs:17 VecIds
+(defstruct VecIds (esize: i64 counted: i64 tvec: i64 tnode: i64 tarr: i64 tnarr: i64))
+
+;; What a call goes to. Rust: lower/call.rs:18 Target
+(defenum Target
+  (TgDirect name: str env: bool) (TgValue v: V) (TgBuiltin name: str) (TgNative proto: str method: str)
+  (TgCtor type: i64 variant: (Option i64)) (TgCode code: str this: str) (TgExtern name: str))
+
+;; The context of one function. Rust: lower/mod.rs:60 Cx (15 fields)
+(defstruct LowerCx
+  (p: Program inst: Inst own: BodyOwn name: str b: FnBuilder
+   locals: (Cell (Map i64 Local)) values: (Cell (Map i64 V)) value-sites: (Set i64)
+   env: (Cell (Option V)) loops: (Cell (Vec LoopCx)) stack-slots: (Cell (Map i64 str))
+   lits: (Map i64 Expr) rests: (Cell (Vec RestSlot)) closure-slots: (Cell (Set str))
+   async-frame: (Cell (Option AsyncFrame))))

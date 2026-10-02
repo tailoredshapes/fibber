@@ -1,0 +1,122 @@
+;; compiler/emit/layout.fib: the representation of every type (types §8.1) and
+;; the layout of every object (§8.2-§8.7): the lIR type of a fibber type, the
+;; `Option` rule, and sizes. Replaces crates/fibc/src/layout.rs (157 lines of
+;; Rust before its tests).
+;;
+;; Shapes decided where Rust and fibber differ: `R<T>` is `(Result T str)`, the
+;; error the text of the `Unsupported` (plan D5); `Option<LirTy>` is `(Option
+;; LirTy)` (`nil` for `unit`); `(u64, u64)` is a `Pair` of i64; `Variant` is the
+;; struct below; the constants `HEADER`, `SHARED`.. are `layout-header` and
+;; `flag-shared`..; `OptRep` has the prefix `Opt`.
+(ns emit.layout
+  (:use types.ty types.table types.decls types.display emit.value))
+
+;; Rust: layout.rs:12 lir_ty
+(defun lir-ty (g: Globals t: Ty) -> (Result (Option LirTy) str)
+  (match t
+    ((TCon (KScalar s) _)
+     (Ok (match s
+           ((SBool) (some LirI1)) ((SI8) (some LirI8)) ((SI16) (some LirI16))
+           ((SI32) (some LirI32)) ((SChar) (some LirI32))
+           ((SI64) (some LirI64)) ((SKeyword) (some LirI64))
+           ((SF32) (some LirFloat)) ((SF64) (some LirDouble))
+           ((SPtr) (some LirRaw)) ((SUnit) nil))))
+    ((TCon (KWeak) args)
+     (Ok (some (match (first args)
+                 ((some (TCon (KDyn _ _) _)) LirDyn)
+                 (_ LirPtr)))))
+    ((TCon (KDyn _ _) _) (Ok (some LirDyn)))
+    ((TCon (KNominal id) _)
+     (Ok (some (if (typedef-is-fieldless-enum (g-ty g id)) LirI32 LirPtr))))
+    ((TCon _ _) (Ok (some LirPtr)))
+    ((TFn _ _ _) (Ok (some LirPtr)))
+    (_ (Err (str-join ["a type variable reached the lowering: " (printer-ty (printer-new g) t)])))))
+
+;; Whether a type is an object type: its values are counted pointers (or a
+;; `dyn`, whose object word is). Rust: layout.rs:42 is_object
+(defun is-object (g: Globals t: Ty) -> bool
+  (match t
+    ((TCon (KScalar _) _) false)
+    ((TCon (KNominal id) _) (not (typedef-is-fieldless-enum (g-ty g id))))
+    (_ true)))
+
+;; How an `(Option T)` is represented (§8.1): `OptNull`, a nullable pointer
+;; (`nil` is null, `some` allocates nothing), or `OptBoxed`, a heap enum with a
+;; tag and the payload.
+(defenum OptRep OptNull OptBoxed)
+(derive Eq OptRep)
+
+;; The payload type of an `Option`, if `t` is one. Rust: layout.rs:60 option_payload
+(defun option-payload (g: Globals t: Ty) -> (Option Ty)
+  (match t
+    ((TCon (KNominal id) args) (if (= id @(. g option)) (first args) nil))
+    (_ nil)))
+
+;; The representation of `(Option payload)`. Rust: layout.rs:68 option_rep
+(defun option-rep (g: Globals payload: Ty) -> (Result OptRep str)
+  (try-let ((l (lir-ty g payload)))
+    (Ok (if (and (= l (some LirPtr)) (nil? (option-payload g payload))) OptNull OptBoxed))))
+
+;; The types of the fields of a struct or of one variant, in declaration order,
+;; at the concrete arguments. Rust: layout.rs:80 field_tys
+(defun field-tys (fields: (Vec FieldDef) args: (Vec Ty)) -> (Result (Vec Ty) str)
+  (Ok (mapv (fn (f: FieldDef) (ty-subst-gen (. f ty) args [])) fields)))
+
+;; A variant: its name (`nil` for a struct) and its field types.
+(defstruct Variant (name: (Option str) tys: (Vec Ty)))
+(derive Eq Variant)
+
+;; The names and field types of a nominal type's variants (one entry, `nil`-named,
+;; for a struct). Rust: layout.rs:92 variants
+(defun variants (g: Globals id: i64 args: (Vec Ty)) -> (Result (Vec Variant) str)
+  (match (. (g-ty g id) shape)
+    ((TsStruct fs) (try-let ((tys (field-tys fs args))) (Ok [(Variant nil tys)])))
+    ((TsEnum vs)
+     (reduce (fn (acc: (Result (Vec Variant) str) v: VariantDef)
+               (try-let ((rows acc) (tys (field-tys (. v fields) args)))
+                 (Ok (conj rows (Variant (some (. v name)) tys)))))
+             (Ok []) vs))))
+
+;; The size and alignment of an lIR type on the targets lIR supports.
+;; Rust: layout.rs:108 size_align
+(defun size-align (t: LirTy) -> (Pair i64 i64)
+  (match t
+    ((LirI1) (Pair 1 1)) ((LirI8) (Pair 1 1)) ((LirI16) (Pair 2 2))
+    ((LirI32) (Pair 4 4)) ((LirFloat) (Pair 4 4))
+    ((LirI64) (Pair 8 8)) ((LirDouble) (Pair 8 8)) ((LirPtr) (Pair 8 8)) ((LirRaw) (Pair 8 8))
+    ((LirDyn) (Pair 16 8))))
+
+;; `off` rounded up to a multiple of `a` (Rust's `div_ceil(a) * a`).
+(defun round-up :private (off: i64 a: i64) -> i64
+  (* (quot (+ off (- a 1)) a) a))
+
+;; The size of a struct of these (size, alignment) pairs, laid out as LLVM lays
+;; out a non-packed struct: each field at its alignment, the whole rounded up to
+;; the largest alignment. Rust: layout.rs:139 struct_size_of
+(defun struct-size-of (fields: (Vec (Pair i64 i64))) -> i64
+  (let ((end (reduce (fn (off: i64 f: (Pair i64 i64)) (+ (round-up off (. f snd)) (. f fst))) 0 fields))
+        (max-align (reduce (fn (m: i64 f: (Pair i64 i64)) (max m (. f snd))) 1 fields)))
+    (round-up end max-align)))
+
+;; The size of a struct of these fields. Rust: layout.rs:121 struct_size
+(defun struct-size (fields: (Vec LirTy)) -> i64
+  (struct-size-of (mapv size-align fields)))
+
+;; The offset of each field of a struct laid out as `struct-size-of` lays it out.
+;; Rust: layout.rs:127 field_offsets
+(defun field-offsets (fields: (Vec (Pair i64 i64))) -> (Vec i64)
+  (let ((off (cell 0)) (out (cell [])))
+    (do (doseq [f fields]
+          (do (set! off (round-up @off (. f snd)))
+              (set! out (conj @out @off))
+              (set! off (+ @off (. f fst)))))
+        @out)))
+
+;; The header of every object (§8.2). Rust: layout.rs:150 HEADER
+(defun layout-header () -> (Vec LirTy) [LirI64 LirI32 LirI32])
+
+;; Header flag bits (§8.2). Rust: layout.rs:153
+(def flag-shared: i64 1)
+(def flag-has-weak: i64 2)
+(def flag-stack: i64 4)
+(def flag-immortal: i64 8)

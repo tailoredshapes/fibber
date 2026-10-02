@@ -1,0 +1,93 @@
+;; compiler/tests/emit/unit-layout.fib: compiler/emit/layout.fib. The three Rust tests of layout.rs
+;; (sizes_follow_the_c_layout, option_of_an_object_is_a_null_pointer_and_of_a_scalar_a_box,
+;; a_raw_ptr_is_not_an_object_pointer) on a hand-built Globals, and each arm of `lir_ty`,
+;; `is_object`, `option_rep`, `variants`, `field_offsets`, the type-variable error. The
+;; layout of whole programs is judged by the `--layout` dump (spec/bootstrap.md) once the
+;; oracle prints it; these checks are the Rust rules read arm by arm.
+;; Build: fibc build compiler/tests/emit/unit-layout.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.table types.decls types.check emit.value emit.layout))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+(defun nom (id: i64 args: (Vec Ty)) -> Ty (TCon (KNominal id) args))
+
+;; types 0 Option (enum none, some), 1 Color (fieldless enum), 2 Pt (struct x y), 3 Shape (enum Circle r, Dot)
+(defun globals () -> Globals
+  (let ((g (globals-new)))
+    (do (table-add (. g types)
+          (TypeDef "Option" 1 ["a"] []
+            (TsEnum [(VariantDef "none" []) (VariantDef "some" [(FieldDef "v" (TGen 0))])]) p0))
+        (table-add (. g types)
+          (TypeDef "Color" 2 [] [] (TsEnum [(VariantDef "Red" []) (VariantDef "Green" [])]) p0))
+        (table-add (. g types)
+          (TypeDef "Pt" 2 [] [] (TsStruct [(FieldDef "x" (ty-i64)) (FieldDef "y" (ty-str))]) p0))
+        (table-add (. g types)
+          (TypeDef "Shape" 2 ["a"] []
+            (TsEnum [(VariantDef "Circle" [(FieldDef "r" (TGen 0))]) (VariantDef "Dot" [])]) p0))
+        (set! (. g option) 0)
+        g)))
+
+(defun lt (g: Globals t: Ty) -> str
+  (match (lir-ty g t)
+    ((Ok (some l)) (if (= l LirRaw) "raw" (lir-ty-text l)))
+    ((Ok nil) "unit")
+    ((Err e) (str-join ["err " (str-slice e 0 6)]))))
+
+(defun rep (g: Globals t: Ty) -> str
+  (match (option-rep g t) ((Ok (OptNull)) "null") ((Ok (OptBoxed)) "boxed") ((Err _) "err")))
+
+(defun main () -> i64
+  (let ((cs (checks-new)) (g (globals)))
+    (do
+      (check cs "the header is 16 bytes" (= (struct-size (layout-header)) 16))
+      (check cs "i64 i32 i32 i64 ptr is 32" (= (struct-size [LirI64 LirI32 LirI32 LirI64 LirPtr]) 32))
+      (check cs "i64 i32 i32 i32 ptr is 32" (= (struct-size [LirI64 LirI32 LirI32 LirI32 LirPtr]) 32))
+      (check cs "i64 i32 i32 i1 is 24" (= (struct-size [LirI64 LirI32 LirI32 LirI1]) 24))
+      (check cs "i64 i32 i32 dyn is 32" (= (struct-size [LirI64 LirI32 LirI32 LirDyn]) 32))
+      (check cs "an empty struct is 0" (= (struct-size []) 0))
+      (check cs "offsets of the header and a dyn"
+             (= (field-offsets (mapv size-align [LirI64 LirI32 LirI32 LirDyn])) [0 8 12 16]))
+      (check cs "offsets pad to the alignment"
+             (= (field-offsets (mapv size-align [LirI1 LirI16 LirI8 LirFloat LirI64 LirI1])) [0 2 4 8 16 24]))
+      (check cs "size-align of each" 
+             (= (mapv size-align [LirI1 LirI8 LirI16 LirI32 LirFloat LirI64 LirDouble LirPtr LirRaw LirDyn])
+                [(Pair 1 1) (Pair 1 1) (Pair 2 2) (Pair 4 4) (Pair 4 4) (Pair 8 8) (Pair 8 8) (Pair 8 8) (Pair 8 8) (Pair 16 8)]))
+      (check cs "the flags" (= [flag-shared flag-has-weak flag-stack flag-immortal] [1 2 4 8]))
+      (check cs "scalars"
+             (= (mapv (fn (s: Scalar) (lt g (ty-scalar s))) (scalar-all))
+                ["i1" "i8" "i16" "i32" "i64" "float" "double" "i32" "i64" "unit" "raw"]))
+      (check cs "str, cell, task, array, fn are pointers"
+             (= [(lt g (ty-str)) (lt g (ty-cell (ty-i64))) (lt g (ty-task (ty-i64)))
+                 (lt g (TCon KArray [(ty-i64)])) (lt g (TFn CLocal [] (ty-unit)))]
+                ["ptr" "ptr" "ptr" "ptr" "ptr"]))
+      (check cs "a weak of a dyn is a dyn, any other weak a pointer"
+             (= [(lt g (TCon KWeak [(TCon (KDyn 0 false) [])])) (lt g (TCon KWeak [(ty-str)]))] ["{ ptr ptr }" "ptr"]))
+      (check cs "a dyn" (= (lt g (TCon (KDyn 0 true) [])) "{ ptr ptr }"))
+      (check cs "a fieldless enum is an i32, a struct and a data enum pointers"
+             (= [(lt g (nom 1 [])) (lt g (nom 2 [])) (lt g (nom 3 [(ty-i64)])) (lt g (nom 0 [(ty-i64)]))]
+                ["i32" "ptr" "ptr" "ptr"]))
+      (check cs "a type variable is refused"
+             (= [(lt g (TVar 0)) (lt g (TGen 0)) (lt g (TRigid 0))] ["err a type" "err a type" "err a type"]))
+      (check cs "a raw ptr is not an object pointer"
+             (and (= (lt g (ty-scalar SPtr)) "raw") (not (= (lir-ty g (ty-scalar SPtr)) (lir-ty g (ty-str))))))
+      (check cs "is-object"
+             (= [(is-object g (ty-bool)) (is-object g (ty-str)) (is-object g (nom 1 [])) (is-object g (nom 2 []))
+                 (is-object g (TFn CLocal [] (ty-unit))) (is-object g (ty-scalar SPtr))]
+                [false true false true true false]))
+      (check cs "option-payload" (= [(option-payload g (nom 0 [(ty-i64)])) (option-payload g (nom 2 []))] [(some (ty-i64)) nil]))
+      (check cs "an option of an object is a null pointer, of a scalar a box"
+             (= [(rep g (ty-str)) (rep g (ty-i64)) (rep g (nom 0 [(ty-str)])) (rep g (ty-unit))
+                 (rep g (ty-scalar SPtr)) (rep g (nom 1 [])) (rep g (nom 2 [])) (rep g (TFn CLocal [] (ty-unit)))]
+                ["null" "boxed" "boxed" "boxed" "boxed" "boxed" "null" "null"]))
+      (check cs "an option is a pointer" (= (lt g (nom 0 [(ty-str)])) "ptr"))
+      (check cs "an option of a type variable is refused" (= (rep g (TVar 3)) "err"))
+      (check cs "field types are substituted"
+             (match (field-tys [(FieldDef "v" (TGen 0)) (FieldDef "w" (ty-bool))] [(ty-str)])
+               ((Ok tys) (= tys [(ty-str) (ty-bool)])) ((Err _) false)))
+      (check cs "variants of a struct have one unnamed row"
+             (match (variants g 2 [])
+               ((Ok vs) (= vs [(Variant nil [(ty-i64) (ty-str)])])) ((Err _) false)))
+      (check cs "variants of an enum are named, at the arguments"
+             (match (variants g 3 [(ty-i64)])
+               ((Ok vs) (= vs [(Variant (some "Circle") [(ty-i64)]) (Variant (some "Dot") [])])) ((Err _) false)))
+      (finish cs))))

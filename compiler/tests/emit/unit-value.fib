@@ -1,0 +1,24 @@
+;; compiler/tests/emit/unit-value.fib: compiler/emit/value.fib (crates/fibc/src/value.rs has no
+;; unit tests; each method is checked on every variant) and the integer text rule of
+;; compiler/emit/text.fib: the extremes of i64 print as Rust's `{n}` does.
+;; Build: fibc build compiler/tests/emit/unit-value.fib -I compiler -I lib -o OUT
+(ns main (:use types.check emit.value))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (all [LirI1 LirI8 LirI16 LirI32 LirI64 LirFloat LirDouble LirPtr LirRaw LirDyn]))
+    (do
+      (check cs "text of each type"
+             (= (mapv lir-ty-text all) ["i1" "i8" "i16" "i32" "i64" "float" "double" "ptr" "ptr" "{ ptr ptr }"]))
+      (check cs "raw and object pointers print alike and differ" (and (= (lir-ty-text LirRaw) (lir-ty-text LirPtr)) (not (= LirRaw LirPtr))))
+      (check cs "is-int" (= (mapv lir-ty-is-int all) [true true true true true false false false false false]))
+      (check cs "bits" (= (mapv lir-ty-bits all) [1 8 16 32 64 32 64 64 64 128]))
+      (check cs "unit has no text and no type" (and (= (v-text VUnit) "") (nil? (v-ty VUnit))))
+      (check cs "a value has both" (let ((v (VVal "t1" LirI32))) (and (= (v-text v) "t1") (= (v-ty v) (some LirI32)))))
+      (check cs "null" (and (= (v-text (v-null)) "(ptr null)") (= (v-ty (v-null)) (some LirPtr))))
+      (check cs "an int literal" (= (v-int LirI64 5) (VVal "(i64 5)" LirI64)))
+      (check cs "a negative int literal" (= (v-text (v-int LirI8 -3)) "(i8 -3)"))
+      (check cs "the extremes of i64"
+             (= [(v-text (v-int LirI64 9223372036854775807)) (v-text (v-int LirI64 (- (- 0 9223372036854775807) 1)))]
+                ["(i64 9223372036854775807)" "(i64 -9223372036854775808)"]))
+      (finish cs))))

@@ -1,0 +1,128 @@
+;; compiler/emit/text.fib: how numbers and strings are written in lIR text,
+;; decided once for every site that writes them (the plan's G2). The Rust
+;; spellings are `float_text` (crates/fibc/src/lower/mod.rs:493, used by
+;; lower/mod.rs:403, lower/pattern.rs:196, lower/quote.rs:58, defs/jit.rs:207
+;; and :209), `{n}` of an i64 (value.rs:91) and the escape of objects.rs:292.
+;;
+;; DECISIONS.
+;; 1. A float is Rust's `{:?}` of an f64: the shortest digits that read back
+;;    to the same f64; a decimal with at least one digit after the point when
+;;    1e-4 <= |x| < 1e16 (`1.0`, `0.0001`, `1000000000000000.0`), else the
+;;    exponent form `DIGITS e EXP` with the point after the first digit only
+;;    when there is more than one (`1e16`, `1.5e-7`, `1.2345678901234568e17`,
+;;    `1e-5`), no `+` and no padding in the exponent; `0.0` and `-0.0`;
+;;    `nan`, `inf`, `-inf` (what `float_text` writes for those three). The
+;;    lIR reader (crates/lir/src/parse/literal.rs:96 `str::parse::<f64>`)
+;;    also reads fibber's own `1.0E16`, so the Rust could print `(str x)` and
+;;    this module would go; the owner asked to port Rust's rule, so the text
+;;    stays byte-equal with `fibc emit` and nobody changes the oracle.
+;;    `float-lir-text` takes the digits and the exponent from fibber's `(str
+;;    x)` and re-renders them with Rust's thresholds. The two print the same
+;;    digits in all 119 values of unit-text.fib (edges of both thresholds, digit
+;;    counts, random values over six decades, random bit patterns); the one
+;;    difference known from the algorithms is a SUBNORMAL whose shortest form is
+;;    one digit: Rust writes `5e-324`, fibber's `(str x)` `4.9E-324` (the
+;;    two-digit rule of Java's `Double.toString`), so this function writes
+;;    `4.9e-324`. A program with such a literal is a probe, not a program; if
+;;    one ever matters, the round trip through a `parse-double` decides it.
+;;    An f32 literal is widened to f64 first, as defs/jit.rs:207 does.
+;; 2. An integer is its decimal digits, `-` for a negative one, no `+`: what
+;;    fibber's `(str n)` of an i64 prints and Rust's `{n}` does (the extremes
+;;    are checked in compiler/tests/emit/unit-text.fib).
+;; 3. A string in lIR text is written between double quotes with `\` as `\\`
+;;    and `"` as `\"` and every other byte as it is (objects.rs:292). The
+;;    emitter writes the bytes of a program's string literals as `(i8 N)`
+;;    lists (statics.rs:111), never in quotes, so only names and the
+;;    compiler's own messages are quoted, and `lir-quote` is for the former.
+(ns emit.text)
+
+;; The byte of s at i as 0..255.
+(defun byte-of :private (s: str i: i64) -> i64
+  (zext i64 (str-byte-at s i)))
+
+;; The value of the decimal text s: digits with an optional `-` or `+` before them.
+(defun parse-int :private (s: str) -> i64
+  (let ((neg (and (> (str-len s) 0) (= (byte-of s 0) 45)))
+        (from (if (and (> (str-len s) 0) (or (= (byte-of s 0) 45) (= (byte-of s 0) 43))) 1 0)))
+    (let ((n (loop ((i from) (acc 0))
+               (if (< i (str-len s)) (recur (+ i 1) (+ (* acc 10) (- (byte-of s i) 48))) acc))))
+      (if neg (- 0 n) n))))
+
+;; The index of the first byte of s that is c, or the length.
+(defun index-byte :private (s: str c: i64) -> i64
+  (loop ((i 0))
+    (if (and (< i (str-len s)) (not (= (byte-of s i) c))) (recur (+ i 1)) i)))
+
+;; How many leading bytes of s are the byte c.
+(defun count-leading :private (s: str c: i64) -> i64
+  (loop ((i 0))
+    (if (and (< i (str-len s)) (= (byte-of s i) c)) (recur (+ i 1)) i)))
+
+;; s without its trailing bytes c.
+(defun trim-trailing :private (s: str c: i64) -> str
+  (loop ((n (str-len s)))
+    (if (and (> n 0) (= (byte-of s (- n 1)) c)) (recur (- n 1)) (str-slice s 0 n))))
+
+;; n copies of the string z.
+(defun repeat-str :private (z: str n: i64) -> str
+  (str-join (mapv (fn (i: i64) z) (range n))))
+
+;; The digits and the decimal exponent of the finite nonzero text t of
+;; fibber's `(str x)` without its sign: value = d1.d2d3.. x 10^exp, the digits
+;; without leading or trailing zeros.
+(defstruct Sci (digits: str exp: i64))
+
+(defun sci-of :private (t: str) -> Sci
+  (let ((e-at (index-byte t 69))
+        (mant (str-slice t 0 e-at))
+        (exp (if (< e-at (str-len t)) (parse-int (str-slice t (+ e-at 1) (str-len t))) 0))
+        (dot (index-byte mant 46)))
+    (let ((int-part (str-slice mant 0 dot))
+          (all (str-join [(str-slice mant 0 dot)
+                          (if (< dot (str-len mant)) (str-slice mant (+ dot 1) (str-len mant)) "")])))
+      (let ((lead (count-leading all 48)))
+        (Sci (trim-trailing (str-slice all lead (str-len all)) 48)
+             (+ (- (- (str-len int-part) lead) 1) exp))))))
+
+;; Rust's `{:?}` of the f64 whose fibber text is t (not nan or infinite),
+;; without sign.
+(defun float-body :private (t: str) -> str
+  (let ((s (sci-of t)) (ds (. s digits)) (e (. s exp)))
+    (if (= (str-len ds) 0)
+        "0.0"
+        (if (or (>= e 16) (<= e -5))
+            (str-join [(str-slice ds 0 1)
+                       (if (> (str-len ds) 1) (str-join ["." (str-slice ds 1 (str-len ds))]) "")
+                       "e" (str e)])
+            (if (< e 0)
+                (str-join ["0." (repeat-str "0" (- (- 0 e) 1)) ds])
+                (let ((n (str-len ds)))
+                  (if (>= (+ e 1) n)
+                      (str-join [ds (repeat-str "0" (- (+ e 1) n)) ".0"])
+                      (str-join [(str-slice ds 0 (+ e 1)) "." (str-slice ds (+ e 1) n)]))))))))
+
+;; A float literal as lIR writes it. Rust: lower/mod.rs:493 float_text
+(defun float-lir-text (x: f64) -> str
+  (let ((t (str x)))
+    (if (= t "NaN")
+        "nan"
+        (if (= t "Infinity")
+            "inf"
+            (if (= t "-Infinity")
+                "-inf"
+                (if (starts-with? t "-")
+                    (str-join ["-" (float-body (str-slice t 1 (str-len t)))])
+                    (float-body t)))))))
+
+;; An integer as lIR writes it (decision 2).
+(defun int-lir-text (n: i64) -> str (str n))
+
+;; s as the text between the quotes of an lIR string (decision 3).
+(defun lir-escape (s: str) -> str
+  (str-join (mapv (fn (c: char)
+                    (if (= c \\) "\\\\" (if (= c \") "\\\"" (char->str c))))
+                  (str-chars s))))
+
+;; s as an lIR string, quotes included.
+(defun lir-quote (s: str) -> str
+  (str-join ["\"" (lir-escape s) "\""]))

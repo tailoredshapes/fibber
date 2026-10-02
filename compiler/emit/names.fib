@@ -1,0 +1,75 @@
+;; compiler/emit/names.fib: the names of emitted things (spec/compiler.md §2): a
+;; fibber type's mangled form and the names of specialisations, methods, closures
+;; and object structs. Replaces crates/fibc/src/names.rs (107 lines of Rust).
+;;
+;; Shapes decided where Rust and fibber differ: `ModuleId`, `ProtoId`, `TypeId`
+;; are `i64` (types.decls); `BodyKey` is `own.program`'s (variants `BodyFun`,
+;; `BodyAllOwned`, `BodyMethod`, `BodyMethodOwned`, `BodyDef`); the Rust `u32` of
+;; `closure_name` is an i64; the symbols are the Rust ones, character for
+;; character (`$fib.prelude/Vec.i64_`).
+(ns emit.names
+  (:require [fib.string :as s])
+  (:use types.ty types.table types.decls types.display own.program))
+
+;; The prefix a definition of module `m` carries: none in the main module, else
+;; its `ns` and a dot, so that two modules' `f` differ. The builtins' name is
+;; for messages ("the builtins"); the symbol has no spaces, and the protocols of
+;; the checker (`Eq`, `Show`, ..) are its. Rust: names.rs:43 module_prefix
+(defun module-prefix (g: Globals m: i64) -> str
+  (if (= m @(. g main))
+      ""
+      (if (= m module-builtin)
+          "fib.builtin."
+          (str-join [(g-module-name g m) "."]))))
+
+;; The mangled form of a type: `(` is `$`, `)` is `_`, a space is `.`. Colours
+;; are erased first, since they have no representation. A nominal type (and the
+;; protocol of a `dyn`) is written behind the module that defines it and a `/`
+;; (none for the main module), so that two modules' types of one name, each a
+;; different object layout with its own methods, have different symbols:
+;; `$Vec.i64_` of the prelude is `$fib.prelude/Vec.i64_`, a main module's own
+;; `Pt` is `Pt`, and `a`'s is `a/Pt`. Rust: names.rs:21 mangle
+(defun mangle (g: Globals t: Ty) -> str
+  (let ((erased (ty-map-colours t (fn (k: Colour) CLocal)))
+        (prefix (fn (m: i64)
+                  (let ((p (module-prefix g m)))
+                    (if (s/ends-with? p ".")
+                        (str-join [(str-slice p 0 (- (str-len p) 1)) "/"])
+                        p)))))
+    (str-join (mapv (fn (c: char)
+                      (if (= c \() "$" (if (= c \)) "_" (if (= c \space) "." (char->str c)))))
+                    (str-chars (printer-ty (printer-qualified g prefix) erased))))))
+
+;; A protocol's name as a symbol: its own, behind its module's prefix (none for
+;; the main module), so that two modules' protocols of one name, each with a
+;; method of one name, have different methods' symbols. Rust: names.rs:59
+;; proto_qualified
+(defun proto-qualified (g: Globals p: i64) -> str
+  (let ((proto (g-proto g p)))
+    (str-join [(module-prefix g (. proto module)) (. proto name)])))
+
+;; The name of method `m` of instance `i`, as `body-name` writes it.
+(defun method-body-name :private (g: Globals i: i64 m: i64 owned: bool) -> str
+  (let ((inst (table-get (. g instances) i))
+        (proto (g-proto g (. (table-get (. g instances) i) proto))))
+    (str-join ["m." (proto-qualified g (. inst proto)) "."
+               (. (nth (. proto methods) (. (nth (. inst methods) m) index)) name) "."
+               (mangle g (. inst head)) (if owned ".owned" "")])))
+
+;; The name of a body's specialisation at `tys`. Rust: names.rs:65 body_name
+(defun body-name (g: Globals key: BodyKey tys: (Vec Ty)) -> str
+  (let ((base (match key
+                ((BodyFun f)
+                 (let ((d (g-fun g f))) (str-join ["f." (module-prefix g (. d module)) (. d name)])))
+                ((BodyAllOwned f)
+                 (let ((d (g-fun g f))) (str-join ["f." (module-prefix g (. d module)) (. d name) ".owned"])))
+                ((BodyMethod i m) (method-body-name g i m false))
+                ((BodyMethodOwned i m) (method-body-name g i m true))
+                ((BodyDef d)
+                 (let ((def (g-def g d))) (str-join ["d." (module-prefix g (. def module)) (. def name)]))))))
+    (str-join (into [base] (mapv (fn (t: Ty) (str-join ["." (mangle g t)])) tys)))))
+
+;; The name of the closure code for literal `lit` inside body `owner`.
+;; Rust: names.rs:104 closure_name
+(defun closure-name (owner: str lit: i64) -> str
+  (str-join ["l." owner "." (str lit)]))

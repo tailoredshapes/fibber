@@ -1,0 +1,170 @@
+;; compiler/tests/emit/unit-ir.fib: the inline tests of crates/fibc/src/ir.rs
+;; (renders_lets_around_void_instructions, terminators_name_their_targets,
+;; a_block_no_live_branch_names_is_discarded, phis_and_allocas_come_first), with
+;; the `lir::parse` calls replaced by the text they accept, plus two GOLDEN
+;; functions: `f.f` and `f.g` below are the text `fibc emit` printed for
+;; `(defun f (x: i64) -> i64 (if (> x 0) (+ x 1) (- x 1)))` and
+;; `(defun g (x: i64) -> i64 (let ((p (P x 2))) (+ (. p a) (f (. p b)))))` (P a
+;; struct of two i64), and the builder calls that made them are replayed, so the
+;; expected side is the Rust FnBuilder's own render. The unterminated-block text
+;; has no Rust test: it is read from `render_items`. Also a block of 100,000
+;; statements (appends must not copy the block).
+;; Build: fibc build compiler/tests/emit/unit-ir.fib -I compiler -I lib -o OUT
+(ns main (:require [fib.string :as s]) (:use types.check emit.value emit.ir))
+
+(defun has (text: str sub: str) -> bool (s/includes? text sub))
+
+(defun renders-lets-around-void (cs: Checks) -> unit
+  (let ((f (fb-new "f" (some LirI64) [(LirParam LirI64 "x")] true))
+        (a (fb-val f "(add x (i64 1))" LirI64)))
+    (do (fb-stmt f "(call @g)")
+        (let ((b (fb-val f (str-join ["(mul " (v-text a) " (i64 2))"]) LirI64)))
+          (fb-term f (str-join ["(ret " (v-text b) ")"])))
+        (let ((text (fb-render f)))
+          (do (check cs "define line and entry block"
+                     (s/starts-with? text "(define internal tailcc (f i64) ((i64 x))\n  (block entry\n"))
+              (check cs "a let around the first void instruction"
+                     (has text "(let ((t1 (add x (i64 1))))\n      (call @g))"))
+              (check cs "a let around the terminator"
+                     (has text "(let ((t2 (mul t1 (i64 2))))\n      (ret t2))"))
+              (check cs "the define closes with two parens" (s/ends-with? text "  ))\n"))
+              (check cs "the whole text"
+                     (= text "(define internal tailcc (f i64) ((i64 x))\n  (block entry\n    (let ((t1 (add x (i64 1))))\n      (call @g))\n    (let ((t2 (mul t1 (i64 2))))\n      (ret t2))\n  ))\n")))))))
+
+(defun terminators-name-targets (cs: Checks) -> unit
+  (do (check cs "br l" (= (ir-targets "(br next)") ["next"]))
+      (check cs "br c l1 l2" (= (ir-targets "(br t1 yes no)") ["yes" "no"]))
+      (check cs "br with a literal condition" (= (ir-targets "(br (i1 1) yes no)") ["yes" "no"]))
+      (check cs "switch" (= (ir-targets "(switch t2 done ((i32 0) v0) ((i32 1) v1))") ["done" "v0" "v1"]))
+      (check cs "ret" (empty? (ir-targets "(ret t3)")))
+      (check cs "unreachable" (empty? (ir-targets "(unreachable)")))))
+
+(defun dead-block-discarded (cs: Checks) -> unit
+  (let ((f (fb-new "h" (some LirI64) [] false)))
+    (do (fb-stmt f "(call @fib.trap-c (string \"boom\"))")
+        (fb-term f "(unreachable)")
+        (let ((c (fb-val f "(icmp eq (i64 1) (i64 1))" LirI1)))
+          (fb-term f (str-join ["(br " (v-text c) " yes no)"])))
+        (fb-open f "yes") (fb-term f "(br join)")
+        (fb-open f "no") (fb-term f "(br join)")
+        (fb-open f "join")
+        (let ((p (fb-phi f LirI64 [(PhiEdge "yes" "(i64 6)") (PhiEdge "no" "(i64 8)")])))
+          (fb-term f (str-join ["(ret " (v-text p) ")"])))
+        (let ((text (fb-render f)))
+          (do (check cs "no block yes" (not (has text "(block yes")))
+              (check cs "no phi" (not (has text "phi")))
+              (check cs "ends at the unreachable" (s/ends-with? text "(unreachable)\n  ))\n"))
+              (check cs "the whole text"
+                     (= text "(define internal (h i64) ()\n  (block entry\n    (call @fib.trap-c (string \"boom\"))\n    (unreachable)\n  ))\n"))))))
+  (let ((g (fb-new "k" (some LirI64) [(LirParam LirI1 "c")] false)))
+    (do (fb-term g "(br c yes done)")
+        (fb-open g "yes") (fb-term g "(br done)")
+        (fb-open g "dead") (fb-term g "(br done)")
+        (fb-open g "done")
+        (let ((p (fb-phi g LirI64 [(PhiEdge "entry" "(i64 1)") (PhiEdge "yes" "(i64 2)") (PhiEdge "dead" "(i64 3)")])))
+          (fb-term g (str-join ["(ret " (v-text p) ")"])))
+        (let ((text (fb-render g)))
+          (do (check cs "a live join keeps only its live edges"
+                     (has text "(phi i64 (entry (i64 1)) (yes (i64 2)))"))
+              (check cs "the dead block is not printed" (not (has text "(block dead")))
+              (check cs "a block is dead only if no live branch named it"
+                     (and (fb-is-dead g "dead") (not (fb-is-dead g "yes")) (not (fb-is-dead g "nowhere"))))))))
+  (let ((h (fb-new "m" nil [] false)))
+    (do (fb-term h "(br x)")
+        (fb-term h "(ret)")
+        (check cs "a closed block takes no more" (not (has (fb-render h) "(ret)"))))))
+
+(defun phis-and-allocas-first (cs: Checks) -> unit
+  (let ((f (fb-new "g" nil [] false))
+        (slot (fb-entry-alloca f "i64" 8)))
+    (do (fb-stmt f (str-join ["(store (i64 0) " slot ")"]))
+        (fb-term f "(br next)")
+        (fb-open f "next")
+        (let ((p (fb-phi f LirI64 [(PhiEdge "entry" "(i64 1)")])))
+          (fb-term f (str-join ["(store " (v-text p) " " slot ")"])))
+        (let ((text (fb-render f)))
+          (do (check cs "the alloca is bound first in the entry block"
+                     (has text "(let ((t1 (alloca i64)))\n      (store (i64 0) t1))"))
+              (check cs "the phi is bound first in its block"
+                     (has text "(block next\n    (let ((t2 (phi i64 (entry (i64 1)))))"))
+              (check cs "patch_phi adds an edge and not from a dead block"
+                     (do (fb-open f "late")
+                         (fb-patch-phi f "next" "t2" "entry" "(i64 5)")
+                         (fb-patch-phi f "next" "t2" "late" "(i64 6)")
+                         (has (fb-render f) "(phi i64 (entry (i64 1)) (entry (i64 5)))"))))))))
+
+(defun overflow-arm (f: FnBuilder op: str) -> unit
+  (let ((t5 (fb-val f (str-join ["(" op "-overflow p0 (i64 1))"]) LirI64))
+        (t6 (fb-val f (str-join ["(extractvalue " (v-text t5) " 1)"]) LirI1))
+        (trap (fb-label f "trap")) (ok (fb-label f "ok")))
+    (do (fb-term f (str-join ["(br " (v-text t6) " " trap " " ok ")"]))
+        (fb-open f trap)
+        (fb-stmt f (str-join ["(call @fib.trap-c (string \"integer overflow in " (if (= op "sadd") "+" "-") " at i64\"))"]))
+        (fb-term f "(unreachable)")
+        (fb-open f ok)
+        (let ((r (fb-val f (str-join ["(extractvalue " (v-text t5) " 0)"]) LirI64)))
+          (fb-term f (str-join ["(ret " (v-text r) ")"]))))))
+
+(defun golden-f (cs: Checks) -> unit
+  (let ((f (fb-new "f.f" (some LirI64) [(LirParam LirI64 "p0")] true))
+        (c (fb-val f "(icmp sgt p0 (i64 0))" LirI1))
+        (th (fb-label f "then")) (el (fb-label f "else")) (jn (fb-label f "join")))
+    (do (fb-term f (str-join ["(br " (v-text c) " " th " " el ")"]))
+        (fb-open f th) (overflow-arm f "sadd")
+        (fb-open f el) (overflow-arm f "ssub")
+        (check cs "labels share the counter with names" (= [th el jn] ["then2" "else3" "join4"]))
+        (check cs "f.f as the Rust FnBuilder printed it" (= (fb-render f) "(define internal tailcc (f.f i64) ((i64 p0))\n  (block entry\n    (let ((t1 (icmp sgt p0 (i64 0))))\n      (br t1 then2 else3))\n  )\n  (block then2\n    (let ((t5 (sadd-overflow p0 (i64 1)))\n          (t6 (extractvalue t5 1)))\n      (br t6 trap7 ok8))\n  )\n  (block trap7\n    (call @fib.trap-c (string \"integer overflow in + at i64\"))\n    (unreachable)\n  )\n  (block ok8\n    (let ((t9 (extractvalue t5 0)))\n      (ret t9))\n  )\n  (block else3\n    (let ((t10 (ssub-overflow p0 (i64 1)))\n          (t11 (extractvalue t10 1)))\n      (br t11 trap12 ok13))\n  )\n  (block trap12\n    (call @fib.trap-c (string \"integer overflow in - at i64\"))\n    (unreachable)\n  )\n  (block ok13\n    (let ((t14 (extractvalue t10 0)))\n      (ret t14))\n  ))\n")))))
+
+(defun golden-g (cs: Checks) -> unit
+  (let ((g (fb-new "f.g" (some LirI64) [(LirParam LirI64 "p0")] true))
+        (t1 (fb-entry-alloca g "%struct.o.P" 16)))
+    (do (fb-stmt g "(call @fib.stack-init t1 (i32 4))")
+        (let ((t2 (fb-val g "(getelementptr %struct.o.P t1 (i32 0) (i32 3))" LirPtr)))
+          (fb-stmt g (str-join ["(store p0 " (v-text t2) ")"])))
+        (let ((t3 (fb-val g "(getelementptr %struct.o.P t1 (i32 0) (i32 4))" LirPtr)))
+          (fb-stmt g (str-join ["(store (i64 2) " (v-text t3) ")"])))
+        (fb-label g "join")
+        (let ((bound (fb-label g "bound")))
+          (do (fb-term g (str-join ["(br " bound ")"]))
+              (fb-open g bound)))
+        (let ((t6 (fb-val g "(getelementptr %struct.o.P t1 (i32 0) (i32 3))" LirPtr))
+              (t7 (fb-val g "(load i64 t6)" LirI64))
+              (t8 (fb-val g "(getelementptr %struct.o.P t1 (i32 0) (i32 4))" LirPtr))
+              (t9 (fb-val g "(load i64 t8)" LirI64))
+              (t10 (fb-val g "(call @f.f t9)" LirI64)))
+          (fb-stmt g "(call @fib.stack-end t1)"))
+        (fb-stmt g "(call @fib.drop-fields t1)")
+        (let ((t11 (fb-val g "(sadd-overflow t7 t10)" LirI64))
+              (t12 (fb-val g "(extractvalue t11 1)" LirI1))
+              (trap (fb-label g "trap")) (ok (fb-label g "ok")))
+          (do (fb-term g (str-join ["(br t12 " trap " " ok ")"]))
+              (fb-open g trap)
+              (fb-stmt g "(call @fib.trap-c (string \"integer overflow in + at i64\"))")
+              (fb-term g "(unreachable)")
+              (fb-open g ok)
+              (let ((t15 (fb-val g "(extractvalue t11 0)" LirI64)))
+                (fb-term g (str-join ["(ret " (v-text t15) ")"])))))
+        (check cs "f.g as the Rust FnBuilder printed it"
+               (= (fb-render g) "(define internal tailcc (f.g i64) ((i64 p0))\n  (block entry\n    (let ((t1 (alloca %struct.o.P)))\n      (call @fib.stack-init t1 (i32 4)))\n    (let ((t2 (getelementptr %struct.o.P t1 (i32 0) (i32 3))))\n      (store p0 t2))\n    (let ((t3 (getelementptr %struct.o.P t1 (i32 0) (i32 4))))\n      (store (i64 2) t3))\n    (br bound5)\n  )\n  (block bound5\n    (let ((t6 (getelementptr %struct.o.P t1 (i32 0) (i32 3)))\n          (t7 (load i64 t6))\n          (t8 (getelementptr %struct.o.P t1 (i32 0) (i32 4)))\n          (t9 (load i64 t8))\n          (t10 (call @f.f t9)))\n      (call @fib.stack-end t1))\n    (call @fib.drop-fields t1)\n    (let ((t11 (sadd-overflow t7 t10))\n          (t12 (extractvalue t11 1)))\n      (br t12 trap13 ok14))\n  )\n  (block trap13\n    (call @fib.trap-c (string \"integer overflow in + at i64\"))\n    (unreachable)\n  )\n  (block ok14\n    (let ((t15 (extractvalue t11 0)))\n      (ret t15))\n  ))\n")))))
+
+(defun unterminated-and-big (cs: Checks) -> unit
+  (do (let ((f (fb-new "u" nil [] false)))
+        (do (fb-val f "(add x (i64 1))" LirI64)
+            (check cs "bindings with no statement after them are printed as unreachable"
+                   (has (fb-render f) "  (block entry\n    (let ((t1 (add x (i64 1))) ) (unreachable))\n  )"))))
+      (let ((f (fb-new "big" nil [] false)))
+        (do (doseq [i (range 100000)] (fb-stmt f (str-join ["(call @fib.retain %t" (str i) ")"])))
+            (fb-term f "(ret)")
+            (check cs "100000 statements render"
+                   (= (count (s/split-lines (fb-render f))) 100004))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (renders-lets-around-void cs)
+        (terminators-name-targets cs)
+        (dead-block-discarded cs)
+        (phis-and-allocas-first cs)
+        (golden-f cs)
+        (golden-g cs)
+        (unterminated-and-big cs)
+        (finish cs))))

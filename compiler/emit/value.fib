@@ -1,0 +1,61 @@
+;; compiler/emit/value.fib: the lIR types the emitter uses and the values it
+;; passes around while lowering (an SSA name, a global address or a literal,
+;; with its type). Replaces crates/fibc/src/value.rs (94 lines of Rust).
+;;
+;; Shapes decided where Rust and fibber differ (spec/bootstrap.md; the plan is
+;; scratchpad m6/emit-plan.md D4):
+;; - the variants of a type are global names, so `LirTy`'s carry the prefix
+;;   `Lir` (`LirI64`, `LirDyn`), and `V`'s are `VVal` and `VUnit`.
+;; - Rust's `Option<LirTy>` is `(Option LirTy)`; `None` is `unit`'s type.
+;; - Rust's `u32` of `bits` is an i64.
+(ns emit.value)
+
+;; An lIR first-class type this compiler uses, as text. `LirPtr` is the
+;; pointer to an object (types §8.2), a counted pointer which retain, release,
+;; drop and trace follow; `LirRaw` is a raw `ptr` of a program (types §8.1,
+;; syntax §3.15), uncounted, `ptr` in lIR text and in layout but its own
+;; variant, because the compiler decides from this type whether a slot is
+;; counted; `LirDyn` is a `(dyn P)` value, `{ ptr ptr }` by value.
+(defenum LirTy LirI1 LirI8 LirI16 LirI32 LirI64 LirFloat LirDouble LirPtr LirRaw LirDyn)
+(derive Eq LirTy) (derive Hash LirTy)
+
+;; Rust: value.rs:29 text
+(defun lir-ty-text (t: LirTy) -> str
+  (match t
+    ((LirI1) "i1") ((LirI8) "i8") ((LirI16) "i16") ((LirI32) "i32") ((LirI64) "i64")
+    ((LirFloat) "float") ((LirDouble) "double") ((LirPtr) "ptr") ((LirRaw) "ptr")
+    ((LirDyn) "{ ptr ptr }")))
+
+;; Rust: value.rs:43 is_int
+(defun lir-ty-is-int (t: LirTy) -> bool
+  (match t
+    ((LirI1) true) ((LirI8) true) ((LirI16) true) ((LirI32) true) ((LirI64) true)
+    (_ false)))
+
+;; Rust: value.rs:50 bits
+(defun lir-ty-bits (t: LirTy) -> i64
+  (match t
+    ((LirI1) 1) ((LirI8) 8) ((LirI16) 16) ((LirI32) 32) ((LirI64) 64)
+    ((LirDouble) 64) ((LirPtr) 64) ((LirRaw) 64) ((LirFloat) 32) ((LirDyn) 128)))
+
+;; A value: an SSA name, a global address or a literal, with its type; `VUnit`
+;; is no value (`unit`).
+(defenum V (VVal text: str ty: LirTy) VUnit)
+(derive Eq V)
+
+;; Rust: value.rs:73 text (the text of `unit` is empty)
+(defun v-text (v: V) -> str
+  (match v ((VUnit) "") ((VVal s _) s)))
+
+;; Rust: value.rs:80 ty
+(defun v-ty (v: V) -> (Option LirTy)
+  (match v ((VUnit) nil) ((VVal _ t) (some t))))
+
+;; Rust: value.rs:87 null
+(defun v-null () -> V (VVal "(ptr null)" LirPtr))
+
+;; An integer literal of type t; the text of n is the decimal digits with a
+;; `-` for a negative one and no `+`: Rust's `{n}` of an i64 and fibber's `str`
+;; of an i64 agree (unit-value.fib checks the extremes). Rust: value.rs:91 int
+(defun v-int (t: LirTy n: i64) -> V
+  (VVal (str-join ["(" (lir-ty-text t) " " (str n) ")"]) t))

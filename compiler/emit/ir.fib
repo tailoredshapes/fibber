@@ -1,0 +1,276 @@
+;; compiler/emit/ir.fib: a builder for the text of one lIR function (spec/lir.md
+;; §5): blocks, fresh SSA names, `let`s that keep nesting shallow, `phi`s first in
+;; their block, and `alloca`s in the entry block for stack objects (types §8.2).
+;; A block that no live branch names is dead, and what is emitted into it is
+;; discarded: the lowering keeps emitting after a call that does not return,
+;; and lIR refuses a use of a name bound in code nothing reaches (lir.md §5).
+;; Replaces crates/fibc/src/ir.rs (326 lines of Rust before its tests); the
+;; render is byte-exact, instruction by instruction.
+;;
+;; Shapes decided where Rust and fibber differ (plan D3):
+;; - the builder is a struct of Cells, passed borrowed (the pattern of `Store`
+;;   and `ExpandCtx`): `fb-fresh f` changes `f`. A block is a struct of Cells
+;;   too (items, phis, closed), so that an instruction appended to a block of
+;;   a hundred thousand is `(set! items (conj @items x))`, in place, not a
+;;   copy of the block; `blocks` is a Cell of a Vec of those shared handles.
+;; - Rust's tuples `(String, String)`, `(LirTy, String)` are the structs
+;;   `PhiEdge` and `LirParam`; `IrItem::Bind(n, text, ty)` is `ItBind`.
+;; - the methods of `FnBuilder` are `fb-NAME`; `targets` is `ir-targets`.
+;; - the live labels are a `(Set str)`, as Rust's `HashSet`: it is only asked
+;;   `contains?`, so no iteration order reaches the text.
+(ns emit.ir (:use emit.value))
+
+;; One instruction of a block, as it will be printed: a value bound to a fresh
+;; name, or a void instruction or the terminator.
+(defenum IrItem (ItBind name: str text: str ty: LirTy) (ItStmt text: str))
+
+;; A `phi` of a block: its name, its text, its type.
+(defstruct Phi (name: str text: str ty: LirTy))
+
+;; An `alloca`: its name, its text, the size of what it holds.
+(defstruct Alloca (name: str text: str size: i64))
+
+;; A parameter of the function: its type and name.
+(defstruct LirParam (ty: LirTy name: str))
+
+;; An edge of a `phi`: the label of the block it comes from and the value.
+(defstruct PhiEdge (label: str value: str))
+
+;; A block; `dead` (opened with no live branch to it) keeps it out of the text.
+(defstruct Block
+  (label: str phis: (Cell (Vec Phi)) items: (Cell (Vec IrItem)) closed: (Cell bool) dead: bool))
+
+;; The function under construction.
+(defstruct FnBuilder
+  (name: str ret: (Option LirTy) params: (Vec LirParam) tailcc: bool
+   blocks: (Cell (Vec Block)) cur: (Cell i64) counter: (Cell i64)
+   allocas: (Cell (Vec Alloca)) live-targets: (Cell (Set str))))
+
+(defun block-new :private (label: str dead: bool) -> Block
+  (Block label (cell []) (cell []) (cell false) dead))
+
+;; A function with its entry block open. Rust: ir.rs:52 new
+(defun fb-new (name: str ret: (Option LirTy) params: (Vec LirParam) tailcc: bool) -> FnBuilder
+  (FnBuilder name ret params tailcc (cell [(block-new "entry" false)]) (cell 0) (cell 0)
+             (cell []) (cell (set-empty))))
+
+;; A fresh SSA name. Rust: ir.rs:70 fresh
+(defun fb-fresh (f: FnBuilder) -> str
+  (do (set! (. f counter) (+ @(. f counter) 1))
+      (str-join ["t" (str @(. f counter))])))
+
+;; A fresh block label with `hint` in it. Rust: ir.rs:76 label
+(defun fb-label (f: FnBuilder hint: str) -> str
+  (do (set! (. f counter) (+ @(. f counter) 1))
+      (str-join [hint (str @(. f counter))])))
+
+;; The block instructions go to now.
+(defun fb-block (f: FnBuilder) -> Block (nth @(. f blocks) @(. f cur)))
+
+;; The label of the block instructions go to now. Rust: ir.rs:82 current
+(defun fb-current (f: FnBuilder) -> str (. (fb-block f) label))
+
+;; Whether the current block already ended in a terminator. Rust: ir.rs:87 closed
+(defun fb-closed (f: FnBuilder) -> bool @(. (fb-block f) closed))
+
+;; Opens a new block and makes it current; dead unless a live terminator has
+;; named it. Rust: ir.rs:93 open
+(defun fb-open (f: FnBuilder label: str) -> unit
+  (do (set! (. f blocks)
+            (conj @(. f blocks) (block-new label (not (contains? @(. f live-targets) label)))))
+      (set! (. f cur) (- (count @(. f blocks)) 1))))
+
+;; Whether some block of that label is dead. Rust: ir.rs:103 is_dead
+(defun fb-is-dead (f: FnBuilder label: str) -> bool
+  (not (nil? (find-first (fn (b: Block) (and (= (. b label) label) (. b dead))) @(. f blocks)))))
+
+;; Appends to the current block unless it is closed or dead. Rust: ir.rs:130 push
+(defun fb-push :private (f: FnBuilder item: IrItem) -> unit
+  (let ((b (fb-block f)))
+    (when (and (not @(. b closed)) (not (. b dead)))
+      (set! (. b items) (conj @(. b items) item)))))
+
+;; Binds `instr`'s value to a fresh name and returns it. Rust: ir.rs:108 val
+(defun fb-val (f: FnBuilder instr: str ty: LirTy) -> V
+  (let ((n (fb-fresh f)))
+    (do (fb-push f (ItBind n instr ty))
+        (VVal n ty))))
+
+;; Emits a void instruction. Rust: ir.rs:115 stmt
+(defun fb-stmt (f: FnBuilder instr: str) -> unit
+  (fb-push f (ItStmt instr)))
+
+;; Emits the terminator of the current block; the labels it names are live
+;; when the block is. Rust: ir.rs:121 term
+(defun fb-term (f: FnBuilder instr: str) -> unit
+  (let ((b (fb-block f)))
+    (do (when (and (not @(. b closed)) (not (. b dead)))
+          (doseq [l (ir-targets instr)]
+            (set! (. f live-targets) (conj @(. f live-targets) l))))
+        (fb-push f (ItStmt instr))
+        (set! (. b closed) true))))
+
+;; A `phi` at the head of the current block, without the edges from dead
+;; blocks. Rust: ir.rs:139 phi
+(defun fb-phi (f: FnBuilder ty: LirTy incoming: (Vec PhiEdge)) -> V
+  (let ((n (fb-fresh f)) (b (fb-block f)))
+    (if (. b dead)
+        (VVal n ty)
+        (let ((edges (mapv (fn (e: PhiEdge) (str-join [" (" (. e label) " " (. e value) ")"]))
+                           (filterv (fn (e: PhiEdge) (not (fb-is-dead f (. e label)))) incoming))))
+          (do (set! (. b phis)
+                    (conj @(. b phis)
+                          (Phi n (str-join ["(phi " (lir-ty-text ty) (str-join edges) ")"]) ty)))
+              (VVal n ty))))))
+
+;; The text of a phi with one more edge: the last `)` is replaced.
+(defun phi-add-edge :private (text: str from: str value: str) -> str
+  (str-join [(str-slice text 0 (- (str-len text) 1)) " (" from " " value "))"]))
+
+;; Adds an incoming edge to the `phi` bound to `name` in block `label` (a loop's
+;; back edge, known only once the body is done); no edge comes from a dead
+;; block. Rust: ir.rs:158 patch_phi
+(defun fb-patch-phi (f: FnBuilder label: str name: str from: str value: str) -> unit
+  (when (not (fb-is-dead f from))
+    (doseq [b @(. f blocks)]
+      (when (= (. b label) label)
+        (set! (. b phis)
+              (mapv (fn (p: Phi)
+                      (if (= (. p name) name)
+                          (Phi (. p name) (phi-add-edge (. p text) from value) (. p ty))
+                          p))
+                    @(. b phis)))))))
+
+;; An `alloca` of `ty`, holding `size` bytes, in the entry block, reused by
+;; every execution of its site (types §8.2). Rust: ir.rs:177 entry_alloca
+(defun fb-entry-alloca (f: FnBuilder ty: str size: i64) -> str
+  (let ((n (fb-fresh f)))
+    (do (set! (. f allocas) (conj @(. f allocas) (Alloca n (str-join ["(alloca " ty ")"]) size)))
+        n)))
+
+;; The `(let (..) s)` of the pending bindings around the statement s.
+(defun let-text :private (binds: (Vec (Pair str str)) s: str) -> str
+  (str-join ["    (let ("
+             (str-join (mapv (fn (i: i64)
+                               (let ((b (nth binds i)))
+                                 (str-join [(if (= i 0) "" "\n          ")
+                                            "(" (. b fst) " " (. b snd) ")"])))
+                             (range (count binds))))
+             ")\n      " s ")\n"]))
+
+;; Bindings no statement follows: an unterminated block, which lIR's checker
+;; reports; they are printed so that the diagnostic names the function.
+(defun dangling-text :private (binds: (Vec (Pair str str))) -> str
+  (str-join ["    (let ("
+             (str-join (mapv (fn (b: (Pair str str)) (str-join ["(" (. b fst) " " (. b snd) ") "])) binds))
+             ") (unreachable))\n"]))
+
+;; Prints a block's items: bindings accumulate into one `let` whose body is the
+;; next void instruction, so a `let` never nests in a `let` and the block stays
+;; within lIR's nesting limit (§1). `binds` are the phis (and allocas) first.
+;; Rust: ir.rs:295 render_items
+(defun render-items :private (binds: (Vec (Pair str str)) items: (Vec IrItem)) -> (Vec str)
+  (let ((out (cell [])) (pending (cell binds)))
+    (do (doseq [item items]
+          (match item
+            ((ItBind n v _) (set! pending (conj @pending (Pair n v))))
+            ((ItStmt s)
+             (if (empty? @pending)
+                 (set! out (conj @out (str-join ["    " s "\n"])))
+                 (do (set! out (conj @out (let-text @pending s)))
+                     (set! pending []))))))
+        (if (empty? @pending) @out (conj @out (dangling-text @pending))))))
+
+;; The lines of a live block `b`, which is the `i`th of the function.
+(defun render-block :private (f: FnBuilder i: i64 b: Block) -> (Vec str)
+  (let ((binds (mapv (fn (p: Phi) (Pair (. p name) (. p text))) @(. b phis)))
+        (all (if (= i 0)
+                 (into binds (mapv (fn (a: Alloca) (Pair (. a name) (. a text))) @(. f allocas)))
+                 binds)))
+    (into (into [(str-join ["  (block " (. b label) "\n"])] (render-items all @(. b items)))
+          ["  )\n"])))
+
+;; The function's text. Rust: ir.rs:185 render
+(defun fb-render (f: FnBuilder) -> str
+  (let ((cc (if (. f tailcc) "tailcc " ""))
+        (ret (match (. f ret) ((some t) (lir-ty-text t)) (nil "void")))
+        (params (mapv (fn (p: LirParam) (str-join ["(" (lir-ty-text (. p ty)) " " (. p name) ")"]))
+                      (. f params)))
+        (body (cell [])))
+    (do (doseq [i (range (count @(. f blocks)))]
+          (let ((b (nth @(. f blocks) i)))
+            (when (not (. b dead))
+              (set! body (into @body (render-block f i b))))))
+        ;; The define's closing paren: the last line becomes `  ))`.
+        (let ((text (str-join @body)))
+          (str-join ["(define internal " cc "(" (. f name) " " ret ") (" (str-join (vec (interpose " " params))) ")\n"
+                     (str-slice text 0 (- (str-len text) 1)) ")\n"])))))
+
+;; ---- the labels a terminator names
+
+;; The shape of an instruction's text.
+(defenum Sx (SxAtom text: str) (SxList items: (Vec Sx)))
+
+;; What the parser read and where it stopped.
+(defstruct SxRes (sx: Sx next: i64))
+
+(defun byte-at :private (s: str i: i64) -> i64 (zext i64 (str-byte-at s i)))
+
+(defun skip-ws :private (s: str i: i64) -> i64
+  (loop ((j i))
+    (if (and (< j (str-len s))
+             (let ((c (byte-at s j))) (or (= c 32) (= c 10) (= c 9) (= c 13))))
+        (recur (+ j 1))
+        j)))
+
+;; Rust: ir.rs:259 parse_sx
+(defun sx-parse :private (s: str at: i64) -> SxRes
+  (let ((i (skip-ws s at)) (n (str-len s)))
+    (if (and (< i n) (= (byte-at s i) 40))
+        (loop ((j (+ i 1)) (items []))
+          (let ((k (skip-ws s j)))
+            (if (>= k n)
+                (SxRes (SxList items) k)
+                (if (= (byte-at s k) 41)
+                    (SxRes (SxList items) (+ k 1))
+                    (let ((r (sx-parse s k)))
+                      (recur (. r next) (conj items (. r sx))))))))
+        (let ((e (loop ((k i))
+                   (if (and (< k n)
+                            (let ((c (byte-at s k)))
+                              (not (or (= c 32) (= c 10) (= c 9) (= c 13) (= c 40) (= c 41)))))
+                       (recur (+ k 1))
+                       k))))
+          (SxRes (SxAtom (str-slice s i e)) e)))))
+
+(defun sx-atom :private (x: Sx) -> (Option str)
+  (match x ((SxAtom a) (some a)) (_ nil)))
+
+;; The `item`th element of items as an atom, or nothing.
+(defun atom-at :private (items: (Vec Sx) i: i64) -> (Vec str)
+  (if (< i (count items))
+      (match (sx-atom (nth items i)) ((some a) [a]) (nil []))
+      []))
+
+;; The labels a terminator names: `(br l)`, `(br c l1 l2)`, and a `switch`'s
+;; default and case labels; none for `ret` and `unreachable`.
+;; Rust: ir.rs:226 targets
+(defun ir-targets (term: str) -> (Vec str)
+  (match (. (sx-parse term 0) sx)
+    ((SxList items)
+     (match (if (empty? items) nil (sx-atom (nth items 0)))
+       ((some head)
+        (if (= head "br")
+            (if (= (count items) 2)
+                (atom-at items 1)
+                (if (= (count items) 4) (into (atom-at items 2) (atom-at items 3)) []))
+            (if (= head "switch")
+                (reduce (fn (acc: (Vec str) c: Sx)
+                          (match c
+                            ((SxList cs) (if (empty? cs) acc (into acc (atom-at cs (- (count cs) 1)))))
+                            (_ acc)))
+                        (atom-at items 2)
+                        (drop 3 items))
+                [])))
+       (nil [])))
+    (_ [])))
