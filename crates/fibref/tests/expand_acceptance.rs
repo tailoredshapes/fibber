@@ -59,6 +59,9 @@ fn residue(forms: &[Form]) -> Option<&Form> {
                     // `(reduce f c)`; the rest is not judged here.
                     "update" => is_update_rewrite(items),
                     "reduce" => items.len() == 3,
+                    // `(some x)` is `Option`'s constructor and stays a call
+                    // (X3): only `(some pred c)` is rewritten.
+                    "some" => items.len() == 3,
                     // The operators, the collection functions and `swap!`
                     // (R6a) are the builtins' and the library's own functions
                     // for the binary call and are rewritten only for more:

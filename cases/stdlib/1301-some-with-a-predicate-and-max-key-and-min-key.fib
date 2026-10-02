@@ -1,0 +1,36 @@
+;; spec:   stdlib §4.6 (rows some max-key min-key), §2.4, §6.3 (E1)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: some max-key min-key
+;; (some pred c) is (fib.seq/some-p pred c): the payload of the first truthy result, and it stops there (the
+;; counter sees three calls for [1 2 5 9]); (some x) is still Option's constructor and a pattern `some` is
+;; untouched. (max-key k x y ..) folds the arguments through the pair function with k evaluated once; a tie
+;; goes to the last argument for max-key and min-key alike (Clojure's), and (max-key k x) is x.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (atom 0))
+        (evals (atom 0))
+        (no: (Option bool) nil)
+        (none: (Option i64) nil)
+        (o (some 5)))
+    (do (check c (= (some even? [1 3 4 5]) (some true)))
+        (check c (= (some even? [1 3 5]) no))
+        (check c (= (some (fn (x: i64) (if (> x 2) (some (* x 10)) nil)) [1 2 3 4]) (some 30)))
+        (check c (= (some (fn (x: i64) (if (> x 20) (some x) nil)) [1 2 3]) none))
+        (check c (= (some (fn (x: i64) (do (swap! calls + 1) (> x 3))) [1 2 5 9]) (some true)))
+        (check c (= @calls 3))
+        (check c (= (match o ((some v) v) (_ 0)) 5))
+        (check c (= (max-key (fn (x: i64) (- 0 x)) 4 2 8) 2))
+        (check c (= (min-key (fn (x: i64) (- 0 x)) 4 2 8) 8))
+        (check c (= (max-key (fn (x: i64) (rem x 3)) 3 6 9) 9))
+        (check c (= (min-key (fn (x: i64) (rem x 3)) 3 6 9) 9))
+        (check c (= (max-key (fn (x: i64) 0) 7) 7))
+        (check c (= (max-key (do (swap! evals + 1) (fn (x: i64) x)) 1 5 3 4) 5))
+        (check c (= @evals 1))
+        (check c (= (min-key (do (swap! evals + 1) (fn (x: i64) x)) 6 5 3 4) 3))
+        (check c (= @evals 2))
+        (checks-result c))))

@@ -1,0 +1,40 @@
+;; spec:   stdlib §4.3 (row try-let), §2.10, L12; [R] A10 try
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: try-let
+;; (try-let ((x e) ..) body) binds each Ok payload in turn and the first Err is the value of the whole form,
+;; with nothing after it run (the counter). The language has no early return, so the block is nested matches.
+;; A binding is read later by the next one, the body is a Result, the bracket form [x e y f] and an empty
+;; binding list are accepted.
+(ns main (:use tl.check))
+
+(defun half (n: i64) -> (Result i64 str)
+  (if (= (rem n 2) 0) (Ok (quot n 2)) (Err "odd")))
+
+(defun quarter (n: i64) -> (Result i64 str)
+  (try-let ((a (half n)) (b (half a))) (Ok (+ a b))))
+
+(defun ok-or (r: (Result i64 str) d: i64) -> i64
+  (match r ((Ok v) v) ((Err _) d)))
+
+(defun why (r: (Result i64 str)) -> str
+  (match r ((Ok _) "ok") ((Err e) e)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (steps (atom 0))
+        (stopped (try-let ((a (do (swap! steps + 1) (half 3)))
+                           (b (do (swap! steps + 1) (half a))))
+                   (Ok b))))
+    (do (check c (= (ok-or (quarter 8) -1) 6))
+        (check c (= (ok-or (quarter 6) -1) -1))
+        (check c (= (why (quarter 6)) "odd"))
+        (check c (= (why (quarter 3)) "odd"))
+        (check c (= (why stopped) "odd"))
+        (check c (= @steps 1))
+        (check c (= (ok-or (try-let [a (half 8) b (half a)] (Ok (* a b))) -1) 8))
+        (check c (= (ok-or (try-let () (Ok 7)) -1) 7))
+        (check c (= (ok-or (try-let ((a (half 4))) (Ok a) (Ok (+ a 100))) -1) 102))
+        (checks-result c))))

@@ -12,7 +12,7 @@
 //!   `(str a)` is that piece alone, so `(str a)` is `(fib.core/to-str a)`
 //!   for any `a` that is not a literal.
 //! - `(println a b ..)` is `(fib.prelude/println S)` and `(print a b ..)`
-//!   `(fib.prelude/print-str S)`, `S` the fold of the pieces joined by one
+//!   `(fib.prelude/print-raw S)`, `S` the fold of the pieces joined by one
 //!   space, a piece being a literal `nil` as `"nil"` (the page's table:
 //!   `(println nil)` prints `nil`) and anything else
 //!   `(fib.prelude/show x)`, a string literal included (the plan's text
@@ -51,14 +51,14 @@ fn is_string(form: &Form) -> bool {
 }
 
 /// `a` then `b` as one text: `(fib.prelude/str-concat a b)`.
-fn concat(a: Form, b: Form, pos: &Pos) -> Form {
+pub(super) fn concat(a: Form, b: Form, pos: &Pos) -> Form {
     call(&prelude_name("str-concat"), vec![a, b], pos)
 }
 
 /// The pieces as one text, `sep` between two (none for `str`): a right
 /// fold, so `(a b c)` is `(str-concat a (str-concat sep (str-concat b
 /// c)))`. No pieces is `""`.
-fn join(pieces: Vec<Form>, sep: Option<&str>, pos: &Pos) -> Form {
+pub(super) fn join(pieces: Vec<Form>, sep: Option<&str>, pos: &Pos) -> Form {
     let mut it = pieces.into_iter().rev();
     let Some(mut acc) = it.next() else {
         return string("", pos);
@@ -86,16 +86,11 @@ pub(super) fn str_macro(items: Vec<Form>, pos: &Pos) -> Form {
     join(pieces, None, pos)
 }
 
-/// `(println a b ..)`, `(print ..)`, `(prn ..)`, `(pr ..)`: one write of
-/// the arguments' texts joined by a space.
-pub(super) fn printer(items: Vec<Form>, pos: &Pos, which: Printer) -> Form {
-    let (write, debug) = match which {
-        Printer::Println => ("println", false),
-        Printer::Print => ("print-str", false),
-        Printer::Prn => ("println", true),
-        Printer::Pr => ("print-str", true),
-    };
-    let pieces = items
+/// The text of each argument of the call: a literal `nil` is the word,
+/// anything else its `Show` (`Debug` when `debug`, a string literal
+/// quoted then).
+pub(super) fn pieces(items: Vec<Form>, pos: &Pos, debug: bool) -> Vec<Form> {
+    items
         .into_iter()
         .skip(1)
         .map(|x| match x.kind {
@@ -103,7 +98,20 @@ pub(super) fn printer(items: Vec<Form>, pos: &Pos, which: Printer) -> Form {
             _ if debug => call("fib.core/debug", vec![x], pos),
             _ => call(&prelude_name("show"), vec![x], pos),
         })
-        .collect();
+        .collect()
+}
+
+/// `(println a b ..)`, `(print ..)`, `(prn ..)`, `(pr ..)`: one write of
+/// the arguments' texts joined by a space. The write without a newline is
+/// `fib.prelude/print-raw` (`print-str` is the macro of `text.rs` now).
+pub(super) fn printer(items: Vec<Form>, pos: &Pos, which: Printer) -> Form {
+    let (write, debug) = match which {
+        Printer::Println => ("println", false),
+        Printer::Print => ("print-raw", false),
+        Printer::Prn => ("println", true),
+        Printer::Pr => ("print-raw", true),
+    };
+    let pieces = pieces(items, pos, debug);
     call(
         &prelude_name(write),
         vec![join(pieces, Some(" "), pos)],

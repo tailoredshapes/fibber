@@ -1,0 +1,32 @@
+;; spec:   stdlib §4.4 (rows if-some when-some when-first), §2.4, §6.3 (D2)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: if-some when-some when-first
+;; (if-some [x e] a b) is (match e ((some x) a) (_ b)): the presence test, so an (Option bool) holding false
+;; takes the first arm with x false. when-some and the one-armed if-some have the unit else; when-first binds
+;; the first element of a collection and does nothing for an empty one. The binding is [x e] or (x e).
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (total (atom 0))
+        (no: (Option i64) nil)
+        (f: (Option bool) (some false))
+        (empty: (Vec i64) []))
+    (do (check c (= (if-some [x (some 3)] (* x 2) -1) 6))
+        (check c (= (if-some [x no] x -1) -1))
+        (check c (= (if-some (x (some 4)) x -1) 4))
+        (check c (= (if-some [x f] (if x "true" "false") "none") "false"))
+        (if-some [x (some 5)] (do (swap! total + x) ()))
+        (if-some [x no] (do (swap! total + 1000) ()))
+        (when-some [x (some 7)] (do (swap! total + x) ()))
+        (when-some [x no] (do (swap! total + 2000) ()))
+        (check c (= @total 12))
+        (when-first [h [20 30]] (do (swap! total + h) ()))
+        (when-first [h empty] (do (swap! total + 4000) ()))
+        (check c (= @total 32))
+        (when-first [h (range 3 9)] (swap! total + h) (swap! total + h) ())
+        (check c (= @total 38))
+        (checks-result c))))

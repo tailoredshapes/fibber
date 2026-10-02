@@ -24,14 +24,20 @@
 
 mod atoms;
 mod colls;
+mod comp;
 mod defn;
+mod extremum;
 mod fold;
 mod forms;
+mod guard;
 mod logic;
 mod loops;
 mod print;
 mod reduce;
+mod text;
+mod trylet;
 mod update;
+mod vector;
 
 use crate::syntax::{Form, FormKind, Pos};
 
@@ -72,8 +78,12 @@ fn printing(items: Vec<Form>, pos: &Pos, which: print::Printer) -> Answer {
 
 /// The registry, in the order of the table of §4.4: one row per macro.
 const MACROS: &[(&str, MacroFn)] = &[
-    ("when", |_, i, p| expanded(logic::when(i, &p, false))),
-    ("unless", |_, i, p| expanded(logic::when(i, &p, true))),
+    ("when", |_, i, p| {
+        expanded(logic::when(i, &p, false, "when"))
+    }),
+    ("unless", |_, i, p| {
+        expanded(logic::when(i, &p, true, "unless"))
+    }),
     ("cond", |_, i, p| expanded(logic::cond(i, &p))),
     ("and", |_, i, p| expanded(Ok(logic::and_or(i, &p, true)))),
     ("or", |_, i, p| expanded(Ok(logic::and_or(i, &p, false)))),
@@ -120,6 +130,54 @@ const MACROS: &[(&str, MacroFn)] = &[
     ("dissoc", |_, i, p| Ok(colls::dissoc(i, &p))),
     ("merge", |_, i, p| colls::merge(i, &p)),
     ("swap!", |c, i, p| Ok(atoms::swap(c, i, &p))),
+    // tranche 2, X3
+    ("if-not", |_, i, p| expanded(guard::if_not(i, &p))),
+    ("when-not", |_, i, p| expanded(guard::when_not(i, &p))),
+    ("some", |_, i, p| guard::some(i, p)),
+    ("declare", |_, i, p| expanded(guard::declare(i, &p))),
+    ("if-some", |_, i, p| expanded(guard::if_some(i, &p))),
+    ("when-some", |_, i, p| expanded(guard::when_some(i, &p))),
+    ("when-first", |_, i, p| expanded(guard::when_first(i, &p))),
+    ("try-let", |c, i, p| expanded(trylet::try_let(c, i, &p))),
+    ("for", |c, i, p| expanded(comp::for_macro(c, i, &p))),
+    ("doseq", |c, i, p| expanded(comp::doseq(c, i, &p))),
+    ("vector", |_, i, p| {
+        expanded(Ok(vector::vector_macro(i, &p)))
+    }),
+    ("hash-set", |_, i, p| expanded(Ok(vector::hash_set(i, &p)))),
+    ("array-map", |_, i, p| expanded(vector::array_map(i, &p))),
+    ("hash-map", |_, i, p| expanded(vector::hash_map(i, &p))),
+    ("max-key", |c, i, p| {
+        expanded(extremum::key_extremum(
+            c,
+            i,
+            &p,
+            "max-key",
+            "fib.seq/max-key-pair",
+        ))
+    }),
+    ("min-key", |c, i, p| {
+        expanded(extremum::key_extremum(
+            c,
+            i,
+            &p,
+            "min-key",
+            "fib.seq/min-key-pair",
+        ))
+    }),
+    ("vswap!", |c, i, p| expanded(atoms::vswap(c, i, &p))),
+    ("print-str", |_, i, p| {
+        expanded(Ok(text::text(i, &p, false, false)))
+    }),
+    ("pr-str", |_, i, p| {
+        expanded(Ok(text::text(i, &p, true, false)))
+    }),
+    ("println-str", |_, i, p| {
+        expanded(Ok(text::text(i, &p, false, true)))
+    }),
+    ("prn-str", |_, i, p| {
+        expanded(Ok(text::text(i, &p, true, true)))
+    }),
 ];
 
 /// The names of the registry's rows: the prelude macros, by name.

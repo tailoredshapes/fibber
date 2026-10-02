@@ -1,0 +1,35 @@
+;; spec:   stdlib §4.3 (rows if-not when-not declare vector), §6.3 (E1)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: if-not when-not declare vector
+;; (if-not c a b) is (if (not c) a b) and runs only the arm it takes; the one-armed form has the unit else
+;; (the core `if` takes two arms until L20), and so has when-not, which is `unless` under Clojure's name.
+;; (declare n..) is a top-level (do): it expands to nothing and the program still runs. (vector a ..) is the
+;; literal [a ..], so it is a (Vec a) equal to it and an empty (vector) is the empty literal.
+(ns main (:use tl.check))
+
+(declare later)
+
+(defun later (n: i64) -> i64 (* n 2))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (hits (atom 0))
+        (none: (Vec i64) (vector)))
+    (do (check c (= (if-not false 1 2) 1))
+        (check c (= (if-not true 1 2) 2))
+        (check c (= (if-not (> 1 2) "no" "yes") "no"))
+        (if-not false (do (swap! hits + 1) ()))
+        (if-not true (do (swap! hits + 10) ()))
+        (when-not false (do (swap! hits + 100) ()))
+        (when-not true (do (swap! hits + 1000) ()))
+        (when-not false (swap! hits + 10000) (swap! hits + 100000) ())
+        (check c (= @hits 110101))
+        (check c (= (later 4) 8))
+        (check c (= (vector 1 2 3) [1 2 3]))
+        (check c (= (count (vector "a" "b")) 2))
+        (check c (= (count none) 0))
+        (check c (= (nth (vector (+ 1 1) (* 3 3)) 1) 9))
+        (checks-result c))))

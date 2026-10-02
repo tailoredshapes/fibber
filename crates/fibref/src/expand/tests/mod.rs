@@ -14,6 +14,7 @@ mod prelude_fold;
 mod prelude_print;
 mod prelude_reduce;
 mod prelude_update;
+mod prelude_x3;
 mod quasi;
 mod reflect;
 mod walk;

@@ -81,6 +81,28 @@ const SAMPLES: &[(&str, &str)] = &[
     ("dissoc", "(defun m () (dissoc m a b))"),
     ("merge", "(defun m () (merge a nil b c))"),
     ("swap!", "(defun m () (swap! a f x))"),
+    // tranche 2, X3
+    ("if-not", "(defun m () (if-not a b c))"),
+    ("when-not", "(defun m () (when-not a b c))"),
+    ("some", "(defun m () (some a b))"),
+    ("declare", "(defun m () (declare a b))"),
+    ("if-some", "(defun m () (if-some [x a] b c))"),
+    ("when-some", "(defun m () (when-some [x a] b c))"),
+    ("when-first", "(defun m () (when-first [x a] b c))"),
+    ("try-let", "(defun m () (try-let ((x a) (y b)) (f x y)))"),
+    ("for", "(defun m () (for [x a :when (f x) y b :let [z x] :when (g z)] (h z y)))"),
+    ("doseq", "(defun m () (doseq [x a :let [y (f x)] :when (g y)] (h x y)))"),
+    ("vector", "(defun m () (vector a b))"),
+    ("hash-set", "(defun m () (hash-set a b))"),
+    ("array-map", "(defun m () (array-map a b c d))"),
+    ("hash-map", "(defun m () (hash-map a b c d))"),
+    ("max-key", "(defun m () (max-key k a b c))"),
+    ("min-key", "(defun m () (min-key k a b c))"),
+    ("vswap!", "(defun m () (vswap! v f x))"),
+    ("print-str", "(defun m () (print-str a b))"),
+    ("pr-str", "(defun m () (pr-str a b))"),
+    ("println-str", "(defun m () (println-str a b))"),
+    ("prn-str", "(defun m () (prn-str a b))"),
 ];
 
 /// Every symbol the text uses, anywhere.

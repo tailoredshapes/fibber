@@ -21,9 +21,10 @@ use crate::syntax::{Form, Pos};
 
 use super::fold::declined;
 use super::Outcome;
-use crate::expand::build::{call, list, sym, unit};
+use crate::expand::build::{call, check_arity, list, sym, unit};
 use crate::expand::collections::prelude_name;
 use crate::expand::ctx::ExpandCtx;
+use crate::expand::error::ExpandError;
 
 /// `(fn (v) (f v x ..))` with `v` a gensym.
 fn closure(ctx: &ExpandCtx, f: Form, extra: Vec<Form>, pos: &Pos) -> Form {
@@ -32,6 +33,36 @@ fn closure(ctx: &ExpandCtx, f: Form, extra: Vec<Form>, pos: &Pos) -> Form {
     body.extend(extra);
     let params = list(vec![v], pos);
     list(vec![sym("fn", pos), params, list(body, pos)], pos)
+}
+
+/// `(vswap! v f a ..)` (the row `vswap!`, stdlib §4.9): not atomic, as
+/// Clojure's, and the value is the new one.
+///
+/// ```text
+/// (let ((c v)) (let ((n (f @c a ..))) (do (reset! c n) n)))
+/// ```
+///
+/// `c` and `n` are gensyms, `@c` and `reset!` are written
+/// `fib.prelude/deref` and `fib.prelude/reset!`. The new value is read
+/// after the `reset!`, so it is for a `Copy` value (a number, a bool);
+/// a value that the `reset!` moves is the ownership checker's error.
+pub(super) fn vswap(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
+    check_arity("vswap!", &items, 2, None, pos)?;
+    let mut it = items.into_iter().skip(1);
+    let v = it.next().unwrap_or_else(|| unit(pos));
+    let f = it.next().unwrap_or_else(|| unit(pos));
+    let (c, n) = (ctx.gensym("c", pos), ctx.gensym("n", pos));
+    let current = call(&prelude_name("deref"), vec![c.clone()], pos);
+    let apply = list([vec![f, current], it.collect()].concat(), pos);
+    let reset = call(&prelude_name("reset!"), vec![c.clone(), n.clone()], pos);
+    let done = call("do", vec![reset, n.clone()], pos);
+    let inner = call(
+        "let",
+        vec![list(vec![list(vec![n, apply], pos)], pos), done],
+        pos,
+    );
+    let outer = list(vec![list(vec![c, v], pos)], pos);
+    Ok(call("let", vec![outer, inner], pos))
 }
 
 /// One call of `swap!`: the rewrite from three arguments, else declined.

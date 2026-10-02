@@ -18,10 +18,15 @@ pub(crate) fn body_form(mut body: Vec<Form>, pos: &Pos) -> Form {
     call("do", body, pos)
 }
 
-/// `(when c body...)` ⟹ `(if c body ())`; `(unless c body...)` ⟹ `(if
-/// c () body)`.
-pub(super) fn when(items: Vec<Form>, pos: &Pos, negate: bool) -> Result<Form, ExpandError> {
-    let name = if negate { "unless" } else { "when" };
+/// `(when c body...)` ⟹ `(if c body ())`; `(unless c body...)` and
+/// `(when-not c body...)` ⟹ `(if c () body)`; `name` is the one the
+/// arity error names.
+pub(super) fn when(
+    items: Vec<Form>,
+    pos: &Pos,
+    negate: bool,
+    name: &str,
+) -> Result<Form, ExpandError> {
     check_arity(name, &items, 1, None, pos)?;
     let mut it = items.into_iter().skip(1);
     let test = it.next().unwrap_or_else(|| unit(pos));
@@ -117,7 +122,7 @@ fn option_binding(name: &str, form: &Form) -> Result<(Form, Form), ExpandError> 
 /// the pattern as well as on `nil` (stdlib §2.4, §7 E13). With a `nil`
 /// clause the match would be non-exhaustive (`missing (some [])`) for every
 /// pattern that does not cover its type.
-fn option_match(x: Form, e: Form, then: Form, other: Form, pos: &Pos) -> Form {
+pub(super) fn option_match(x: Form, e: Form, then: Form, other: Form, pos: &Pos) -> Form {
     let some = list(vec![call(&prelude_name("some"), vec![x], pos), then], pos);
     let rest = list(vec![sym("_", pos), other], pos);
     list(vec![sym("match", pos), e, some, rest], pos)

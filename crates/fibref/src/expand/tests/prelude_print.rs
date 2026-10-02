@@ -92,15 +92,15 @@ fn a_string_literal_is_shown_like_any_argument_and_a_literal_nil_is_the_word_nil
 
 #[test]
 fn print_is_println_without_the_newline() {
-    assert_eq!(ex("(print)"), "(fib.prelude/print-str \"\")");
+    assert_eq!(ex("(print)"), "(fib.prelude/print-raw \"\")");
     assert_eq!(
         ex("(print a)"),
-        "(fib.prelude/print-str (fib.prelude/show a))"
+        "(fib.prelude/print-raw (fib.prelude/show a))"
     );
     assert_eq!(
         ex("(print a \"b\")"),
         format!(
-            "(fib.prelude/print-str ({CONCAT} (fib.prelude/show a) \
+            "(fib.prelude/print-raw ({CONCAT} (fib.prelude/show a) \
              ({CONCAT} \" \" (fib.prelude/show \"b\"))))"
         )
     );
@@ -114,12 +114,12 @@ fn prn_and_pr_are_the_same_over_debug() {
         ex("(prn \"s\" nil)"),
         format!("(fib.prelude/println ({CONCAT} (fib.core/debug \"s\") ({CONCAT} \" \" \"nil\")))")
     );
-    assert_eq!(ex("(pr)"), "(fib.prelude/print-str \"\")");
-    assert_eq!(ex("(pr a)"), "(fib.prelude/print-str (fib.core/debug a))");
+    assert_eq!(ex("(pr)"), "(fib.prelude/print-raw \"\")");
+    assert_eq!(ex("(pr a)"), "(fib.prelude/print-raw (fib.core/debug a))");
     assert_eq!(
         ex("(pr a b)"),
         format!(
-            "(fib.prelude/print-str ({CONCAT} (fib.core/debug a) ({CONCAT} \" \" (fib.core/debug b))))"
+            "(fib.prelude/print-raw ({CONCAT} (fib.core/debug a) ({CONCAT} \" \" (fib.core/debug b))))"
         )
     );
 }

@@ -1,0 +1,37 @@
+;; spec:   stdlib §4.4 (row doseq), §6.3 (D2)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: doseq
+;; (doseq [x xs ..] body..) runs for effect, with the modifiers of `for` and the same nesting; its value is
+;; unit. Each form below adds a distinct amount to one atom, so the running total says which iterations ran:
+;; a :let before a :when, a :when after a :let guarding an inner level, and a literal (range a b) with a
+;; one-parameter body, which `for-each` turns into the counting loop.
+(ns main (:use tl.check))
+
+(defun unit? (u: unit) -> bool true)
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a (atom 0)))
+    (do (doseq [x [1 2 3]] (swap! a + x))
+        (check c (= @a 6))
+        (doseq [x [1 2 3 4 5 6] :when (even? x)] (swap! a + x))
+        (check c (= @a 18))
+        (doseq [x [1 2 3 4 5 6] :while (< x 4)] (swap! a + x))
+        (check c (= @a 24))
+        (doseq [x [1 2 3] :let [y (* x 100)]] (swap! a + y))
+        (check c (= @a 624))
+        (doseq [x [1 2 3 4] :let [y (* x 1000)] :when (> x 2)] (swap! a + y))
+        (check c (= @a 7624))
+        (doseq [x [1 2] y [10 20]] (swap! a + (* x y)))
+        (check c (= @a 7714))
+        (doseq [i (range 0 4) j (range 0 i)] (swap! a + 10000))
+        (check c (= @a 67714))
+        (doseq [x [1 2 3] :let [d (* x 2)] :when (odd? x) y [d (+ d 1)]] (swap! a + y))
+        (check c (= @a 67732))
+        (doseq [i (range 0 5)] (swap! a + 1) (swap! a + 1))
+        (check c (= @a 67742))
+        (check c (unit? (doseq [x [1]] (swap! a + x))))
+        (checks-result c))))
