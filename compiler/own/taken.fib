@@ -1,15 +1,73 @@
 ;; compiler/own/taken.fib: the functions whose value is taken and the method implementations a
 ;; method value may run (spec/types.md §8.4), as crates/fibref/src/own/taken.rs (92 lines of
-;; Rust). Package O2; every public function is a stub of its final signature.
+;; Rust). Package O2.
+;;
+;; A method value is dispatched like a method call (§4.2, §4.5): where the checker resolved the
+;; use to an instance, the value runs that instance's implementation; where it resolved it to a
+;; bound of the enclosing scheme or to `dyn`, every instance of the protocol with an
+;; implementation of the method may be run.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `for_each_value` with its callback is `taken-values`, the `(expression, global)` pairs a
+;;   body names as values, collected in pre-order; both functions read that list.
+;; - the instances are read once from the table (`table-rows` copies it) and not for each value.
 (ns own.taken
-  (:use types.program))
+  (:use types.ast types.decls types.table types.program types.infer.cx))
+
+;; A global named as a value: the expression and the global.
+(defstruct TakenValue (expr: i64 ref: GlobalRef))
+
+;; Rust: taken.rs:80 `values_in`: appends to acc the globals named as a value in e (not as the
+;; head of a call), in pre-order.
+(defun values-in :private (e: Expr acc: (Vec TakenValue)) -> (Vec TakenValue)
+  (match (. e kind)
+    ((EGlobal r) (conj acc (TakenValue (. e id) r)))
+    ((ECall h _)
+     (reduce (fn (a: (Vec TakenValue) c: Expr) (values-in c a))
+             acc
+             (match (. h kind) ((EGlobal _) (vec (rest (expr-children e)))) (_ (expr-children e)))))
+    (_ (reduce (fn (a: (Vec TakenValue) c: Expr) (values-in c a)) acc (expr-children e)))))
+
+;; Rust: taken.rs:66 `for_each_value`: the globals named as a value in every body of the program,
+;; `defun`s, `impl` methods, then `def`s.
+(defun taken-values :private (p: TypedProgram) -> (Vec TakenValue)
+  (let ((g (. p globals))
+        (a (reduce (fn (acc: (Vec TakenValue) d: FunDef) (values-in (. d body) acc))
+                   [] (table-rows (. g funs))))
+        (b (reduce (fn (acc: (Vec TakenValue) i: InstanceDef)
+                     (reduce (fn (x: (Vec TakenValue) m: ImplMethod) (values-in (. m body) x))
+                             acc (. i methods)))
+                   a (table-rows (. g instances)))))
+    (reduce (fn (acc: (Vec TakenValue) d: DefDef) (values-in (. d init) acc))
+            b (table-rows (. g defs)))))
 
 ;; Rust: taken.rs:22 `value_taken`: the `defun`s used as values anywhere: a function name in any
 ;; position but the head of a call (§8.4); they have an all-owned body.
 (defun value-taken (p: TypedProgram) -> (Set i64)
-  (trap "todo: value-taken"))
+  (reduce (fn (acc: (Set i64) v: TakenValue)
+            (match (. v ref) ((GFun f) (conj acc f)) (_ acc)))
+          (set-empty) (taken-values p)))
+
+;; Rust: taken.rs:47 `implementations`: the implementations `(instance, method)` that the method
+;; value e of method i of proto may run.
+(defun implementations :private (p: TypedProgram insts: (Vec InstanceDef) e: i64 proto: i64 i: i64)
+  -> (Vec (Pair i64 i64))
+  (let ((candidates (match (get (. p resolutions) e)
+                      ((some (ResInstance k _)) [k])
+                      (_ (filterv (fn (k: i64) (= (. (nth insts k) proto) proto)) (range (count insts)))))))
+    (vec (keep (fn (k: i64)
+                 (if-some [m (find-first (fn (m: i64) (= (. (nth (. (nth insts k) methods) m) index) i))
+                                         (range (count (. (nth insts k) methods))))]
+                   (some (Pair k m))
+                   nil))
+               candidates))))
 
 ;; Rust: taken.rs:35 `methods_taken`: the method implementations `(instance, method)` that a method
 ;; value may run; a built-in instance has no implementation to run and is left out.
 (defun methods-taken (p: TypedProgram) -> (Set (Pair i64 i64))
-  (trap "todo: methods-taken"))
+  (let ((insts (table-rows (. (. p globals) instances))))
+    (reduce (fn (acc: (Set (Pair i64 i64)) v: TakenValue)
+              (match (. v ref)
+                ((GMethod proto i) (into acc (implementations p insts (. v expr) proto i)))
+                (_ acc)))
+            (set-empty) (taken-values p))))

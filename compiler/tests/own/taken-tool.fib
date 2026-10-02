@@ -1,0 +1,45 @@
+;; compiler/tests/own/taken-tool.fib: `compiler/own.fib` as far as package O2 reaches, to compare
+;; with `fibref own --sections error,taken` (compare.sh -c own -o "--sections taken"): the same
+;; file loop and records (own.dump's `own-file` pieces), but the ownership pass is replaced by what
+;; exists of it, `value-taken` and `methods-taken` (`analyse` still traps until package O7). The
+;; sections `body`, `facts`, `summary` and `explain` have nothing to print here, so only
+;; `--sections error`, `taken` and `error,taken` are comparable.
+;; Build: fibc build compiler/tests/own/taken-tool.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [types.dump :as td] [types.dump.sections :as sec] [types.driver :as tdr]
+            [types.args :as ta] [own.args :as cli])
+  (:use syntax.form expand.types own.error own.program own.driver own.syntactic own.taken
+        own.dump))
+
+;; `own-check` of own.dump with the ownership pass reduced to the taken sets.
+(defun taken-check (oo: cli/OwnOptions lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx)
+                    layout: (Vec sec/Shown) home: str opts: ta/Options) -> td/Dumped
+  (let ((show (cli/own-wants oo cli/OsError)))
+    (match (tdr/lower-modules modules prelude)
+      ((Err errs) (td/error-dump lines errs home show))
+      ((Ok l)
+       (let ((amp (syntactic-check (. l globals))))
+         (if (not (empty? amp))
+             (own-error-dump lines amp home show)
+             (match (tdr/infer-lowered l (not (. opts library)))
+               ((Err errs) (td/error-dump lines errs home show))
+               ((Ok typed)
+                (let ((o (OwnedProgram (map-empty) [] (map-empty) (value-taken typed) (methods-taken typed) []))
+                      (c (Checked typed o)))
+                  (td/Dumped (reduce (fn (acc: (Vec str) s: sec/Shown) (module-lines acc c s oo)) lines layout)
+                             0))))))))))
+
+(defun own-files (files: (Vec str) opts: cli/OwnOptions) -> i64
+  (reduce (fn (status: i64 file: str)
+            (let ((d (td/dump-file file (cli/base-options opts)
+                                   (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx)
+                                        layout: (Vec sec/Shown) home: str o: ta/Options)
+                                     (taken-check opts lines modules prelude layout home o)))))
+              (do (doseq [line (. d lines)] (println line))
+                  (max status (. d status)))))
+          0 files))
+
+(defun main () -> i64
+  (match (cli/own-parse-args (args))
+    (nil (do (eprintln "usage: taken-tool [--sections LIST] [--library] [--implicit] [--implicit-lib LIST] [--prelude] [--] FILE..") 2))
+    ((some parsed) (own-files (. parsed files) (. parsed opts)))))

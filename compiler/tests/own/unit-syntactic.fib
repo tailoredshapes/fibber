@@ -1,0 +1,245 @@
+;; compiler/tests/own/unit-syntactic.fib: own.syntactic, own.captured and own.taken. The four tests
+;; of crates/fibref/src/own/syntactic.rs (`errors` over a lowered program), then what Rust tests
+;; only through the whole pass: the kind, position and order of the errors, a variable three
+;; times, the name of each kind of call head, `is-amp`, the carriers of an `&` parameter and
+;; `captured-at` (captured.rs has no tests), the functions and methods whose value is taken
+;; (taken.rs has none either) on typed programs, and `visit`'s order.
+;; Needs lib/prelude.fib in the working directory (run from the repository root). Prints `ok NAME`
+;; or `FAIL NAME`; the status is the number of failures, 0 or 1.
+;; Build: fibc build compiler/tests/own/unit-syntactic.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [syntax.reader :as reader] [expand.program :as prog])
+  (:use syntax.pos syntax.form expand.ctx expand.types types.ast types.decls types.table
+        types.program types.driver types.builtins types.check own.error own.syntactic own.captured
+        own.taken))
+
+;; The globals of the lowered program src (no type checking).
+(defun lowered (src: str) -> Globals
+  (let ((ctx (ctx-new)))
+    (match (prelude-forms ctx)
+      ((Err m) (trap m))
+      ((Ok prelude)
+       (match (reader/read-all src "t.fib")
+         ((Err _) (trap "unit-syntactic: the source does not read"))
+         ((Ok forms)
+          (match (prog/expand-program forms ctx (no-runner))
+            ((Err _) (trap "unit-syntactic: the source does not expand"))
+            ((Ok ex)
+             (match (lower-program ex prelude)
+               ((Err _) (trap "unit-syntactic: the source does not lower"))
+               ((Ok l) (. l globals)))))))))))
+
+(defun typed (src: str) -> TypedProgram
+  (match (check-source src "t.fib")
+    ((Ok p) p)
+    ((Err _) (trap "unit-syntactic: the source does not type"))))
+
+(defun errors-of (src: str) -> (Vec OwnError) (syntactic-check (lowered src)))
+(defun messages (src: str) -> (Vec str) (mapv (fn (e: OwnError) (. e message)) (errors-of src)))
+
+(defun fun-named (g: Globals name: str) -> i64
+  (unwrap (find-first (fn (i: i64) (= (. (g-fun g i) name) name)) (range (table-count (. g funs))))))
+
+;; Every call in e, in pre-order.
+(defun calls-in (e: Expr) -> (Vec Expr)
+  (let ((out (cell [])))
+    (do (visit e (fn (x: Expr) (match (. x kind) ((ECall _ _) (set! out (conj @out x))) (_ ()))))
+        @out)))
+
+;; The call of the function named callee in the body of the function named in.
+(defun call-of (g: Globals in: str callee: str) -> Expr
+  (unwrap (find-first (fn (c: Expr) (match (. c kind) ((ECall h _) (= (head-name g h) callee)) (_ false)))
+                      (calls-in (. (g-fun g (fun-named g in)) body)))))
+
+(defun call-args (c: Expr) -> (Vec Arg) (match (. c kind) ((ECall _ as) as) (_ [])))
+
+(defun amp-binding (g: Globals f: str) -> i64
+  (. (nth (. (g-fun g (fun-named g f)) params) 0) binding))
+
+(defun position-tests (cs: Checks)
+  (let ((src "(defun bar (&a &b) (push! &a 1))\n(defun main () -> i64 (let ((x (cell [3]))) (do (bar &x &x) 0)))")
+        (es (errors-of src)))
+    (do (check cs "the same variable twice is reported once per call"
+               (= (messages src) ["variable x passed to more than one & parameter in call to bar"]))
+        (check cs "its kind is AmpTwice" (= (mapv (fn (e: OwnError) (. e kind)) es) [AmpTwice]))
+        (check cs "and its position is the call's (line 2, column 49)"
+               (= (mapv (fn (e: OwnError) (str-join [(show (. (. e pos) line)) ":" (show (. (. e pos) col))])) es)
+                  ["2:49"]))
+        (check cs "two names for one cell pass the check"
+               (empty? (messages "(defun bar (&a &b) (push! &a 1))\n(defun main () -> i64 (let ((x (cell [3]))) (let ((y x)) (do (bar &x &y) 0))))")))
+        (check cs "a variable three times is reported once"
+               (= (messages "(defun bar (&a &b &c) (push! &a 1))\n(defun main () -> i64 (let ((x (cell [3]))) (do (bar &x &x &x) 0)))")
+                  ["variable x passed to more than one & parameter in call to bar"]))
+        (check cs "two variables are reported in the order of their second occurrence"
+               (= (messages "(defun bar (&a &b &c &d) (push! &a 1))\n(defun main () -> i64 (let ((x (cell [3])) (y (cell [4]))) (do (bar &x &y &y &x) 0)))")
+                  ["variable y passed to more than one & parameter in call to bar"
+                   "variable x passed to more than one & parameter in call to bar"]))
+        (check cs "each call is reported on its own, in order"
+               (= (count (errors-of "(defun bar (&a &b) (push! &a 1))\n(defun main () -> i64 (let ((x (cell [3]))) (do (bar &x &x) (bar &x &x) 0)))")) 2))
+        (check cs "a call whose head is not a name is called `the function at POS`"
+               (= (messages "(defun bar (&a &b) (push! &a 1))\n(defun main () -> i64 (let ((x (cell [3]))) (do ((do bar) &x &x) 0)))")
+                  ["variable x passed to more than one & parameter in call to the function at t.fib:2:50"])))))
+
+(defun async-tests (cs: Checks)
+  (let ((mention (messages "(defun fill2 (&buf) (do (async (push! &buf 1)) ()))")))
+    (do (check cs "an async mentioning the parameter is async"
+               (= mention ["& parameter in async function: buf in fill2"]))
+        (check cs "its kind is AmpInAsync"
+               (= (mapv (fn (e: OwnError) (. e kind)) (errors-of "(defun fill2 (&buf) (do (async (push! &buf 1)) ()))")) [AmpInAsync]))
+        (check cs "an async in tail position is async"
+               (= (messages "(defun fill3 (&buf) (do (push! &buf 1) (async 5)))")
+                  ["& parameter in async function: buf in fill3"]))
+        (check cs "an async inside a nested fn is found"
+               (= (messages "(defun f (&v) (do (async (fn () @v)) 0))") ["& parameter in async function: v in f"]))
+        (check cs "a driven task that does not mention the parameter is not async"
+               (empty? (messages "(defun bump (&v) (let ((n (block-on (async (do (await (yield)) 1))))) (push! &v n)))")))
+        (check cs "an async in the branch of a tail if is a tail async"
+               (= (count (errors-of "(defun f (&v c) (if c (async 1) 2))")) 1))
+        (check cs "an async in a clause of a tail match is a tail async"
+               (= (count (errors-of "(defun f (&v c) (match c (true (async 1)) (false 2)))")) 1))
+        (check cs "an async in the body of a tail let is a tail async"
+               (= (count (errors-of "(defun f (&v) (let ((a 1)) (async a)))")) 1))
+        (check cs "an async that is not in tail position and does not mention it is not async"
+               (empty? (messages "(defun f (&v) (do (async 1) 2))")))
+        (check cs "an async inside a fn is not a tail async"
+               (empty? (messages "(defun f (&v) (fn () (async 1)))")))
+        (check cs "each &-parameter that makes the function async is reported"
+               (= (messages "(defun f (&a &b) (do (async (push! &a 1)) (async (push! &b 2))))")
+                  ["& parameter in async function: a in f" "& parameter in async function: b in f"]))
+        (check cs "a function with no & parameter has no async error"
+               (empty? (messages "(defun f (a) (async a))")))
+        (check cs "the errors of impl methods are looked for too"
+               (= (count (errors-of "(defstruct W (n: i64))\n(defun g (&p &q) 0)\n(defprotocol Score (score (self) -> i64))\n(impl Score W (score (self) (let ((x (cell [3]))) (do (g &x &x) 0))))")) 1)))))
+
+;; The id of the row of table t that satisfies p.
+(defun row-where (n: i64 p: (fn (i64) bool) :borrow) -> i64
+  (unwrap (find-first p (range n))))
+
+(defun head-tests (cs: Checks)
+  (let ((g (lowered "(defenum E (A) (B))\n(defstruct P (x: i64))\n(defprotocol Score (score (self) -> i64))\n(def k: i64 5)\n(extern strtod :private (ptr ptr) -> f64)\n(defun bar (&a &b) 0)\n(defun plain (x) 0)"))
+        (at (Pos "t.fib" 3 4 20 30))
+        (ty (fn (n: str) (row-where (table-count (. g types)) (fn (i: i64) (= (. (g-ty g i) name) n)))))
+        (head (fn (r: GlobalRef) (Expr 0 (Pos "t.fib" 3 4 20 30) (EGlobal r)))))
+    (do (check cs "head-name of a function is its name" (= (head-name g (head (GFun (fun-named g "bar")))) "bar"))
+        (check cs "of a struct constructor, the struct's name" (= (head-name g (head (GCtor (ty "P") nil))) "P"))
+        (check cs "of an enum variant, the variant's name" (= (head-name g (head (GCtor (ty "E") (some 1)))) "B"))
+        (check cs "of an enum with no variant, the enum's name" (= (head-name g (head (GCtor (ty "E") nil))) "E"))
+        (check cs "of a method, the method's name"
+               (= (head-name g (head (GMethod (row-where (table-count (. g protos)) (fn (i: i64) (= (. (g-proto g i) name) "Score"))) 0)))
+                  "score"))
+        (check cs "of a def, its name"
+               (= (head-name g (head (GDef (row-where (table-count (. g defs)) (fn (i: i64) (= (. (g-def g i) name) "k"))))))
+                  "k"))
+        (check cs "of an extern, its name"
+               (= (head-name g (head (GExtern (row-where (table-count (. g externs)) (fn (i: i64) (= (. (g-ext g i) name) "strtod"))))))
+                  "strtod"))
+        (check cs "of a builtin, the table's name" (= (head-name g (head (GBuiltin 0))) (. (nth (builtin-table) 0) name)))
+        (check cs "of a builtin that is not in the table, nothing" (= (head-name g (head (GBuiltin 1000000))) ""))
+        (check cs "of a local, the binding's name" (= (head-name g (Expr 0 at (ELocal (amp-binding g "bar")))) "a"))
+        (check cs "of anything else, the function at its position"
+               (= (head-name g (Expr 0 at (ELit LitUnit))) "the function at t.fib:3:4"))
+        (check cs "is-amp is true of an & parameter" (is-amp g (amp-binding g "bar")))
+        (check cs "and false of a plain one"
+               (not (is-amp g (. (nth (. (g-fun g (fun-named g "plain")) params) 0) binding)))))))
+
+(defun names-of (g: Globals bs: (Set i64)) -> (Vec str)
+  (vec (sort (mapv (fn (b: i64) (. (g-binding g b) name)) (vec bs)))))
+
+(def captured-src: str
+  "(defun g (&p q r) -> i64 0)
+(defun f (&v)
+  (let ((a (fn () @v)) (b (fn () (a))) (c (fn () 1)) (x @v) (d (let ((e (fn () @v))) e)))
+    (g &v b c)))
+(defun f2 (&v) (g &v (fn () @v) 1))
+(defun f3 (&v) (g &v 1 2))
+(defun f4 (&v) (g &v &v 2))
+(defun f5 (&v) (let ((a (fn () (set-field! &v n 1)))) (g &v a 2)))")
+
+(defun captured-tests (cs: Checks)
+  (let ((g (lowered captured-src))
+        (v (amp-binding g "f"))
+        (cars (carriers (. (g-fun g (fun-named g "f")) body) v))
+        (args (call-args (call-of g "f" "g")))
+        (args2 (call-args (call-of g "f2" "g")))
+        (args3 (call-args (call-of g "f3" "g")))
+        (args4 (call-args (call-of g "f4" "g")))
+        (v5 (amp-binding g "f5"))
+        (cars5 (carriers (. (g-fun g (fun-named g "f5")) body) v5)))
+    (do (check cs "the carriers are the lets bound directly to a fn that mentions the parameter or a carrier"
+               (= (names-of g cars) ["a" "b" "e"]))
+        (check cs "a let that is not directly a fn (c, x, d) is not a carrier, one inside a let's initialiser is"
+               (= (count cars) 3))
+        (check cs "a fn that mentions the parameter by set-field! is a carrier" (= (names-of g cars5) ["a"]))
+        (check cs "a body with no closure has no carriers"
+               (empty? (carriers (. (g-fun g (fun-named g "f3")) body) (amp-binding g "f3"))))
+        (check cs "an &v is captured by an argument that is a carrier"
+               (captured-at args 0 v cars))
+        (check cs "but not when the carriers are not known" (not (captured-at args 0 v (set-empty))))
+        (check cs "an &v is captured by an argument that is a fn mentioning v"
+               (captured-at args2 0 (amp-binding g "f2") (set-empty)))
+        (check cs "an &v with no such argument is not captured"
+               (not (captured-at args3 0 (amp-binding g "f3") (set-empty))))
+        (check cs "an &v is captured by a second &v" (captured-at args4 0 (amp-binding g "f4") (set-empty)))
+        (check cs "the children of a call are its head and its expression arguments, not its & ones"
+               (= (count (children-of (call-of g "f4" "g"))) 2))
+        (check cs "mentions sees @v inside a fn"
+               (own.captured/mentions (. (g-fun g (fun-named g "f2")) body) (amp-binding g "f2") (set-empty)))
+        (check cs "and not another variable" (not (own.captured/mentions (. (g-fun g (fun-named g "f3")) body) v (set-empty)))))))
+
+(def taken-src: str
+  "(defprotocol Score (score (self) -> i64))
+(impl Score i64 (score (self) self))
+(impl Score bool (score (self) (if self 1 0)))
+(defun inc (x: i64) -> i64 (+ x 1))
+(defun twice (x: i64) -> i64 (* x 2))
+(defun apply-it (f: (fn (a) i64) x: a) -> i64 (f x))
+(defun main () -> i64 (+ (apply-it inc 1) (twice 2) (apply-it score 2)))")
+
+(def bound-src: str
+  "(defprotocol Score (score (self) -> i64))
+(impl Score i64 (score (self) self))
+(impl Score bool (score (self) (if self 1 0)))
+(defun apply-it (f: (fn (a) i64) x: a) -> i64 (f x))
+(defun gen (x: a) :where ((Score a)) -> i64 (apply-it score x))
+(defun main () -> i64 (gen 3))")
+
+;; The names of the main module's functions in s.
+(defun main-names (p: TypedProgram s: (Set i64)) -> (Vec str)
+  (let ((g (. p globals)))
+    (vec (sort (mapv (fn (f: i64) (. (g-fun g f) name))
+                     (filterv (fn (f: i64) (= (. (g-fun g f) module) @(. g main))) (vec s)))))))
+
+;; The implementations of the main module's instances in s, as `I.M`.
+(defun main-methods (p: TypedProgram s: (Set (Pair i64 i64))) -> (Vec str)
+  (let ((g (. p globals)))
+    (vec (sort (mapv (fn ([i m]) (str-join [(show i) "." (show m)]))
+                     (filterv (fn ([i _]) (= (. (table-get (. g instances) i) module) @(. g main))) (vec s)))))))
+
+(defun taken-tests (cs: Checks)
+  (let ((p (typed taken-src)) (q (typed bound-src)))
+    (do (check cs "the functions whose value is taken are the ones named in no head position"
+               (= (main-names p (value-taken p)) ["inc"]))
+        (check cs "a method value resolved to an instance takes that instance's implementation"
+               (= (count (main-methods p (methods-taken p))) 1))
+        (check cs "a method value resolved to a bound takes every instance's implementation"
+               (= (count (main-methods q (methods-taken q))) 2))
+        (check cs "a function only called takes nothing" (empty? (main-names q (value-taken q)))))))
+
+(defun visit-tests (cs: Checks)
+  (let ((g (lowered "(defun f (a b) (if a (do b 1) (let ((x 2)) x)))"))
+        (kinds (cell [])))
+    (do (visit (. (g-fun g (fun-named g "f")) body)
+               (fn (e: Expr)
+                 (set! kinds (conj @kinds (match (. e kind)
+                                            ((EIf _ _ _) "if") ((EDo _) "do") ((ELet _ _) "let")
+                                            ((ELocal _) "local") ((ELit _) "lit") (_ "other"))))))
+        (check cs "visit goes through every expression in pre-order"
+               (= @kinds ["if" "local" "do" "local" "lit" "let" "lit" "local"]))
+        (check cs "children-of is the direct sub-expressions in evaluation order"
+               (= (count (children-of (. (g-fun g (fun-named g "f")) body))) 3)))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (position-tests cs) (async-tests cs) (head-tests cs) (captured-tests cs)
+        (taken-tests cs) (visit-tests cs)
+        (finish cs))))

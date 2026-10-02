@@ -1,33 +1,137 @@
 ;; compiler/own/syntactic.fib: the syntactic `&` checks of spec/types.md §6.5 and §6.9, which
 ;; run after lowering and before any type error, as crates/fibref/src/own/syntactic.rs (271
 ;; lines of Rust), with the tree walkers it shares (`visit`, `children-of`, `head-name`).
-;; Package O2; every public function is a stub of its final signature, but for `syntactic-check`,
-;; which finds nothing until O2 lands, so that own.driver can run inference and the tool can
-;; print the type errors of programs (it is the one stub that does not trap: a trap here would
-;; stop every program with a type error, and the `&` errors are rare).
+;; Package O2.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `children_of` is types.ast's `expr-children` (the port of `Expr::children`, same order);
+;;   `children-of` is that function under the name the walks use.
+;; - the searches that Rust writes as `visit` with a flag (`mentions`, `mentioning_async`) are
+;;   recursions over `expr-children` that stop at the first hit, `or` and `find-map` for Rust's
+;;   `found.is_none()`; the first hit in pre-order is the same. `mentions-amp` is the one search
+;;   (own.captured's `mentions` is that function, and syntactic.rs's `mentions` is it with no
+;;   carriers); it is here because own.captured uses this module.
+;; - the errors of one body are collected through a Cell that `visit`'s function appends to
+;;   (the closure cannot return them).
 (ns own.syntactic
-  (:use types.ast types.decls own.error))
+  (:require [expand.error :as ee])
+  (:use syntax.pos types.ast types.decls types.table types.builtins own.error))
 
 ;; Rust: syntactic.rs:24 `check`: both checks over every body of the program, in definition
 ;; order (`defun`s and macros, `impl` methods, `def`s): the `AmpTwice` and `AmpInAsync` errors.
-;; NEUTRAL until O2: finds none.
 (defun syntactic-check (g: Globals) -> (Vec OwnError)
-  [])
+  (let ((in-funs (reduce (fn (acc: (Vec OwnError) f: FunDef)
+                           (into (into acc (async-function f)) (distinct-amps g (. f body))))
+                         [] (table-rows (. g funs))))
+        (in-impls (reduce (fn (acc: (Vec OwnError) i: InstanceDef)
+                            (reduce (fn (a: (Vec OwnError) m: ImplMethod)
+                                      (into a (distinct-amps g (. m body))))
+                                    acc (. i methods)))
+                          in-funs (table-rows (. g instances)))))
+    (reduce (fn (acc: (Vec OwnError) d: DefDef) (into acc (distinct-amps g (. d init))))
+            in-impls (table-rows (. g defs)))))
 
 ;; Rust: syntactic.rs:43 `visit`: calls f on e and every expression inside it, `fn` and `async`
 ;; bodies included, in pre-order.
 (defun visit (e: Expr f: (fn (Expr) unit) :borrow) -> unit
-  (trap "todo: visit"))
+  (do (f e)
+      (doseq [c (expr-children e)] (visit c f))))
 
 ;; Rust: syntactic.rs:50 `children_of`: the direct sub-expressions of e, in evaluation order (what
 ;; Rust's `Expr::children` visits; types.ast's `expr-children` is the port's, to compare).
 (defun children-of (e: Expr) -> (Vec Expr)
-  (trap "todo: children-of"))
+  (expr-children e))
 
 ;; Rust: syntactic.rs:103 `head_name`: the name a call's head is printed as in messages.
 (defun head-name (g: Globals head: Expr) -> str
-  (trap "todo: head-name"))
+  (match (. head kind)
+    ((EGlobal r)
+     (match r
+       ((GFun f) (. (g-fun g f) name))
+       ((GBuiltin b) (match (get (builtin-table) b) ((some s) (. s name)) (nil "")))
+       ((GMethod p i) (. (nth (. (g-proto g p) methods) i) name))
+       ((GExtern x) (. (g-ext g x) name))
+       ((GDef d) (. (g-def g d) name))
+       ((GCtor t v)
+        (let ((def (g-ty g t)))
+          (match v
+            ((some i) (match (. def shape) ((TsEnum vs) (. (nth vs i) name)) (_ (. def name))))
+            (nil (. def name)))))))
+    ((ELocal b) (. (g-binding g b) name))
+    (_ (str-concat "the function at " (ee/pos-display (. head pos))))))
 
 ;; Rust: syntactic.rs:213 `is_amp`: whether the binding b is an `&` parameter.
 (defun is-amp (g: Globals b: i64) -> bool
-  (trap "todo: is-amp"))
+  (= (. (g-binding g b) kind) BkAmpParam))
+
+;; Whether e mentions the `&` parameter v (`@v`, `&v`, the target of `set!` or `set-field!`) or a
+;; binding of carriers, at any depth, `fn` and `async` included (syntactic.rs:185 and captured.rs:51).
+(defun mentions-amp (e: Expr v: i64 carriers: (Set i64)) -> bool
+  (or (match (. e kind)
+        ((EDeref (PlAmp b) _) (= b v))
+        ((ESet (PlAmp b) _) (= b v))
+        ((ESetField b _ _) (= b v))
+        ((ELocal b) (contains? carriers b))
+        ((ECall _ args) (some? (find-first (fn (a: Arg) (match a ((ArgAmp b _) (= b v)) (_ false))) args)))
+        (_ false))
+      (some? (find-first (fn (c: Expr) (mentions-amp c v carriers)) (expr-children e)))))
+
+;; `variable x passed to more than one & parameter in call to f`, once for each variable that is
+;; the argument `&x` of the call e (head, args) more than once, at its second occurrence.
+(defun amp-twice :private (g: Globals e: Expr head: Expr args: (Vec Arg)) -> (Vec OwnError)
+  (loop ((i 0) (seen (set-empty)) (reported (set-empty)) (out []))
+    (if (= i (count args))
+        out
+        (match (nth args i)
+          ((ArgAmp b _)
+           (if (and (contains? seen b) (not (contains? reported b)))
+               (recur (+ i 1) seen (conj reported b)
+                      (conj out (own-error AmpTwice (. e pos)
+                                           (str-join ["variable " (. (g-binding g b) name)
+                                                      " passed to more than one & parameter in call to "
+                                                      (head-name g head)]))))
+               (recur (+ i 1) (conj seen b) reported out)))
+          (_ (recur (+ i 1) seen reported out))))))
+
+;; The `AmpTwice` errors of the calls inside body, in pre-order.
+(defun distinct-amps :private (g: Globals body: Expr) -> (Vec OwnError)
+  (let ((out (cell [])))
+    (do (visit body (fn (e: Expr)
+                      (match (. e kind)
+                        ((ECall head args) (set! out (into @out (amp-twice g e head args))))
+                        (_ ()))))
+        @out)))
+
+;; The position of the first `async` form in e that mentions the `&` parameter v.
+(defun mentioning-async :private (e: Expr v: i64) -> (Option Pos)
+  (let ((here (match (. e kind)
+                ((EAsync inner _) (if (mentions-amp inner v (set-empty)) (some (. e pos)) nil))
+                (_ nil))))
+    (if-some [pos here]
+      (some pos)
+      (find-map (fn (c: Expr) (mentioning-async c v)) (expr-children e)))))
+
+;; The position of an `async` form in tail position of e (syntax §3.1 (ii): the last step of a
+;; `do`, a branch of a tail `if`/`match`, the body of a tail `let` or `loop`, transitively; not
+;; inside a `fn`).
+(defun tail-async :private (e: Expr) -> (Option Pos)
+  (match (. e kind)
+    ((EAsync _ _) (some (. e pos)))
+    ((EDo es) (if-some [l (last es)] (tail-async l) nil))
+    ((EIf _ t f) (if-some [pos (tail-async t)] (some pos) (tail-async f)))
+    ((ELet _ body) (tail-async body))
+    ((ELoop _ body) (tail-async body))
+    ((EMatch _ cls) (find-map (fn (c: Clause) (tail-async (. c body))) cls))
+    (_ nil)))
+
+;; `& parameter in async function: v in f` for each `&` parameter of f that makes it an async
+;; function, at the `async` form responsible.
+(defun async-function :private (f: FunDef) -> (Vec OwnError)
+  (let ((amps (filterv (fn (p: ParamDecl) (. p amp)) (. f params)))
+        (tail (tail-async (. f body))))
+    (reduce (fn (out: (Vec OwnError) p: ParamDecl)
+              (if-some [pos (if-some [at (mentioning-async (. f body) (. p binding))] (some at) tail)]
+                (conj out (own-error AmpInAsync pos
+                                     (str-join ["& parameter in async function: " (. p name) " in " (. f name)])))
+                out))
+            [] amps)))

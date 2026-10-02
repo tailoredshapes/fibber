@@ -1,19 +1,54 @@
 ;; compiler/own/captured.fib: the carriers of an `&` parameter and the arguments that capture it
 ;; (spec/types.md §6.5, §6.6), as crates/fibref/src/own/captured.rs (80 lines of Rust). Package
-;; O2; every public function is a stub of its final signature.
+;; O2.
+;;
+;; `mentions` is own.syntactic's `mentions-amp` (the search is shared with the `async` check and
+;; own.syntactic is the lower module); the `let` bindings of closures are collected with `visit`
+;; into a Cell, in the order Rust's recursion pushes them (a `let`'s own, then its children's).
 (ns own.captured
-  (:use types.ast))
+  (:use types.ast own.syntactic))
+
+;; The `let` binding of a `fn` literal, and the literal.
+(defstruct ClosureLet (binding: i64 init: Expr))
+
+;; The binding of b and its initialiser, when b binds one name to a `fn` literal.
+(defun closure-let :private (b: LetBind) -> (Option ClosureLet)
+  (match (. (. b pat) kind)
+    ((PBind v) (match (. (. b init) kind) ((EFn _) (some (ClosureLet v (. b init)))) (_ nil)))
+    (_ nil)))
+
+;; Rust: captured.rs:35 `closure_lets`: every `let` binding in e whose initialiser is directly
+;; a `fn` literal, with that literal, in pre-order.
+(defun closure-lets :private (e: Expr) -> (Vec ClosureLet)
+  (let ((out (cell [])))
+    (do (visit e (fn (x: Expr)
+                   (match (. x kind)
+                     ((ELet bs _) (set! out (into @out (keep closure-let bs))))
+                     (_ ()))))
+        @out)))
 
 ;; Rust: captured.rs:16 `carriers`: the carriers of the `&` parameter v in the body.
 (defun carriers (body: Expr v: i64) -> (Set i64)
-  (trap "todo: carriers"))
+  (let ((lets (closure-lets body)))
+    (loop ((out (set-empty)))
+      (let ((next (reduce (fn (acc: (Set i64) l: ClosureLet)
+                            (if (and (not (contains? acc (. l binding))) (mentions (. l init) v acc))
+                                (conj acc (. l binding))
+                                acc))
+                          out lets)))
+        (if (= (count next) (count out)) next (recur next))))))
 
 ;; Rust: captured.rs:51 `mentions`: whether e mentions the `&` parameter v (`@v`, `&v`, the target
 ;; of `set!` or `set-field!`) or one of the bindings carriers, at any depth, `fn` and `async` included.
 (defun mentions (e: Expr v: i64 carriers: (Set i64)) -> bool
-  (trap "todo: mentions"))
+  (mentions-amp e v carriers))
 
 ;; Rust: captured.rs:67 `captured_at`: whether argument i, an `&v`, is captured by another
 ;; argument of the call whose arguments are args.
 (defun captured-at (args: (Vec Arg) i: i64 v: i64 carriers: (Set i64)) -> bool
-  (trap "todo: captured-at"))
+  (some? (find-first (fn (j: i64)
+                       (and (not (= j i))
+                            (match (nth args j)
+                              ((ArgExpr x) (mentions x v carriers))
+                              ((ArgAmp b _) (= b v)))))
+                     (range (count args)))))
