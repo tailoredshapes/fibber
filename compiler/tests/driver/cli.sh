@@ -37,6 +37,8 @@ ck "no root: the module is not found, and why" "$($s2 emit "$t/prog/main.fib" 2>
 ck "roots tried are named: beside the file, then each root" "$($s2 emit -I "$t/b" "$t/prog/main.fib" 2>&1 | sed -n 2p)" "module geo.point is not at $t/prog/geo/point.fib: No such file or directory (os error 2); nor at $t/b/geo/point.fib"
 ck "emit-dump reads the roots" "$($s2 emit-dump --sections main -I "$t/a" -I "$t/b" "$t/prog/main.fib" | sed -n 2p; echo $?)" "$(printf ';; == section main\n0')"
 ck "emit-dump --layout reads the roots" "$($s2 emit-dump --layout -I "$t/a" -I "$t/b" "$t/prog/main.fib" | sed -n 3p | cut -c1-14)" "bool mangle bo"
+ck "emit into a pipe that is closed is not death by SIGPIPE: exit 0, as the Rust's" "$($s2 emit "$t/three.fib" | true; echo ${PIPESTATUS[0]})" 0
+ck "emit into a pipe that is closed: nothing on standard error" "$($s2 emit "$t/three.fib" 2>"$t/pipe.err" | true; cat "$t/pipe.err")" ""
 ck "explain reads the roots" "$($s2 explain -I "$t/a" -I "$t/b" "$t/prog/main.fib" | head -1 | cut -c1-5)" "defun"
 $s2 build "$t/seven.fib" -o "$t/seven" > /dev/null 2>&1; ck "build makes an executable whose status is main's" "$("$t/seven" > /dev/null; echo $?)" 7
 $s2 build "$t/three.fib" -o "$t/three" -O 0 > /dev/null 2>&1; ck "build -O 0" "$("$t/three"; echo $?)" 3

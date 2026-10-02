@@ -17,6 +17,15 @@
 (extern close :private (i32) -> i32)
 (extern __errno_location :private () -> ptr)
 (extern strerror :private (i32) -> ptr)
+(extern signal :private (i32 i64) -> i64)
+(extern write :private (i32 ptr i64) -> i64)
+
+;; Makes a write to a closed pipe an error (EPIPE) and not a death by SIGPIPE: `fibc emit FILE | head` ends with status 0, as the Rust
+;; (whose runtime sets SIGPIPE to ignored before `main`, and whose `write_stdout` takes a broken pipe for success). Signal 13 is SIGPIPE
+;; and 1 is SIG_IGN on Linux and macOS alike. Called first thing in `main`; the previous handler comes back and is of no use.
+;; As in the Rust, `run` inherits it: a program run by the JIT that writes to a closed pipe gets the error from its write, not the signal.
+(defun ignore-sigpipe () -> i64
+  (unsafe (signal 13i32 1)))
 
 ;; Why a file cannot be read: the operating system's code (0 if it opens and reads, so the text is not UTF-8) and the words Rust's
 ;; `io::Error` prints for it, `No such file or directory (os error 2)`.
@@ -39,6 +48,33 @@
     (do (ffi/free-addr (ffi/ptr->addr p))
         (ffi/free-addr (ffi/ptr->addr buf))
         f)))
+
+;; The n bytes at p written to standard output, all of them: the first failure (a write that takes nothing is the Rust's `WriteZero`),
+;; or the fault with code 0 for none. A write cut short by a signal (EINTR, 4) is made again.
+(defun write-all :private (p: ptr n: i64) -> Fault
+  (unsafe
+    (loop ((done 0))
+      (if (< done n)
+          (let ((w (write 1i32 (ptr+ p done) (- n done))))
+            (if (> w 0)
+                (recur (+ done w))
+                (if (= w 0)
+                    (Fault 1 "failed to write whole buffer")
+                    (let ((code (sext i64 (load-i32 (__errno_location)))))
+                      (if (= code 4) (recur done) (errno-fault code))))))
+          (Fault 0 "")))))
+
+;; `text` on standard output, as one write of the whole: 0 when it all went or the reader had gone (EPIPE, 32: a pipe that is closed is
+;; not an error, as `fibc emit FILE | head` shows), else the words of the failure on standard error and 2. The `print-raw` of the
+;; prelude traps on a failed write (syntax §4.5), which is right for a program and not for the compiler printing its result.
+;; Rust: main.rs:325 `write_stdout`
+(defun write-stdout (text: str) -> i64
+  (let ((p (ffi/bytes-new text))
+        (f (write-all p (str-len text))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (or (= (. f code) 0) (= (. f code) 32))
+            0
+            (do (eprintln (str-join ["fibc: cannot write: " (. f text)])) 2)))))
 
 ;; The value of the environment variable `name`, or nil if it is not set.
 (defun getenv-opt (name: str) -> (Option str)

@@ -13,21 +13,27 @@
 (defun cmd-emit (file: str roots: Roots rm: mk/RunnerMaker) -> i64
   (match (front/lower-kind file roots rm false)
     ((Err code) code)
-    ((Ok text) (do (print-raw text) 0))))
+    ((Ok text) (native/write-stdout text))))
 
 ;; `explain FILE`: the ownership checker's decisions. Rust: main.rs:245 `explain`
 (defun cmd-explain (file: str roots: Roots rm: mk/RunnerMaker) -> i64
   (match (front/check-file file roots rm)
     ((Err code) code)
-    ((Ok c) (do (print-raw (oe/explain (. c typed) (. c owned))) 0))))
+    ((Ok c) (native/write-stdout (oe/explain (. c typed) (. c owned))))))
 
-;; `emit-dump`: each file's output in turn, and the largest status. Rust: main.rs:237 `emit_dump`
+;; The lines of a dump, each with its newline, as one text.
+(defun lines-text :private (lines: (Vec str)) -> str
+  (str-join (mapv (fn (l: str) (str-concat l "\n")) lines)))
+
+;; `emit-dump`: each file's output in turn, written at the end as one text (as the Rust does), and the largest status; a failed write
+;; is the status of the write, a closed pipe is no failure. Rust: main.rs:237 `emit_dump`
 (defun cmd-emit-dump (files: (Vec str) o: ea/EmitOptions roots: Roots rm: mk/RunnerMaker) -> i64
-  (reduce (fn (status: i64 file: str)
-            (let ((d (ed/emit-file-with file o roots rm)))
-              (do (doseq [line (. d lines)] (println line))
-                  (max status (. d status)))))
-          0 files))
+  (loop ((i 0) (texts (vec-empty)) (status 0))
+    (if (< i (count files))
+        (let ((d (ed/emit-file-with (nth files i) o roots rm)))
+          (recur (+ i 1) (conj texts (lines-text (. d lines))) (max status (. d status))))
+        (let ((w (native/write-stdout (str-join texts))))
+          (if (= w 0) status w)))))
 
 ;; `run`: the module through the JIT, `main` called, its status the status. Rust: main.rs:154 `run`
 (defun cmd-run (file: str trace: bool args: (Vec str) opt: i64 roots: Roots rm: mk/RunnerMaker) -> i64
