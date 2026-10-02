@@ -1,0 +1,31 @@
+;; spec:   stdlib §2.3 (KeyReducible: each-kv-while, the walk that can stop), §4.4 row reduce-kv
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The two instances of KeyReducible are the walks reduce-kv is made of: each-kv-while hands the key and the value to a
+;; function that says whether to go on, and answers whether the walk ran to the end. Over a Vec the visits are in index
+;; order, so a walk that stops when the index is 2 has seen 0, 1 and 2 (three visits, the answer false); a walk that never says
+;; false answers true. Over a Map the order is the structure's, so the case counts visits: a walk that stops after 2 entries
+;; makes 2 visits and answers false, one that goes on makes as many visits as there are entries and answers true, and every
+;; entry the walk gives is one that the map has.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m {1 10 2 20 3 30 4 40})
+        (seen (cell 0))
+        (idx (cell 0)))
+    (do (check c (not (each-kv-while [7 8 9 10] (fn (i x) (do (set! seen (+ @seen 1)) (set! idx (+ (* @idx 10) i)) (< i 2))))))
+        (check c (= @seen 3))
+        (check c (= @idx 12))
+        (set! seen 0)
+        (check c (each-kv-while [7 8 9 10] (fn (i x) (do (set! seen (+ @seen 1)) true))))
+        (check c (= @seen 4))
+        (set! seen 0)
+        (check c (not (each-kv-while m (fn (k v) (do (set! seen (+ @seen 1)) (< @seen 2))))))
+        (check c (= @seen 2))
+        (set! seen 0)
+        (check c (each-kv-while m (fn (k v) (do (set! seen (+ @seen 1)) (= (get m k) (some v))))))
+        (check c (= @seen 4))
+        (checks-result c))))

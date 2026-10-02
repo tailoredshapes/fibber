@@ -1,0 +1,46 @@
+;; spec:   stdlib §2.3 (Stack), §4.4 row peek, §8.1 item 4 (laws over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: peek
+;; The law of a stack: whatever was last conj-ed is what peek answers, (peek (conj s x)) is (some x), at every depth. It is
+;; written once, over the protocols (Stack s e) and (Collection s s e), and run on 150 seeded Vecs and 150 seeded Lists of
+;; 0 to 70 elements with a seeded element, so the same text proves both instances. The planted fault is a stack of this
+;; case's own that is wrong in one way, a peek that reads the bottom of the stack instead of the top: the same law run over
+;; 40 of those must fail in a Checks of its own (check-detects), or this case fails. The seed is a constant.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+;; the faulty stack: conj pushes at the end, peek reads the first element
+(defstruct (Bad a) (v: (Vec a)))
+(impl (Collection (Bad a) a) (Bad a) (conj (self x) (Bad (conj (. self v) x))))
+(impl (Stack a) (Bad a)
+  (peek (self) (let ((v (. self v))) (if (> (count v) 0) (some (nth v 0)) nil)))
+  (pop (self) self))
+
+;; the law
+(defun peek-is-the-conj (s: s x: e) :where ((Stack s e) (Collection s s e) (Eq e)) -> bool
+  (match (peek (conj s x))
+    (nil false)
+    ((some y) (= y x))))
+
+;; the list with the elements of v in order
+(defun list-of (v: (Vec i64)) -> (List i64)
+  (loop ((i (- (count v) 1)) (acc Empty))
+    (if (>= i 0) (recur (- i 1) (Cons (nth v i) acc)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (r (rng 20262550)))
+    (do (dotimes (i 150)
+          (let ((v (rng-vec r (rng-below r 71) 1000))
+                (x (rng-below r 1000)))
+            (do (check c (peek-is-the-conj v x))
+                (check c (peek-is-the-conj (list-of v) x)))))
+        (dotimes (i 40)
+          (let ((v (rng-vec r (rng-below r 71) 1000)))
+            (check p (peek-is-the-conj (Bad v) (rng-below r 1000)))))
+        (check-detects c p)
+        (check c (= (checks-made c) 301))
+        (checks-result c))))

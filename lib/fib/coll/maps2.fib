@@ -1,5 +1,54 @@
-;; owner: Y5
-;; fib.coll.maps2: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold `find merge-with reduce-kv` and the `KeyReducible` instances of `Map` and `Vec`.
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
+;; fib.coll.maps2: `find`, `merge-with`, `reduce-kv` and the `KeyReducible` instances of `Map` and `Vec` (stdlib §2.3, §4.5 rows
+;; `find` and `merge-with`, §4.4 row `reduce-kv`; tranche 2 plan Y5, owner Y5). Exports `find merge-with reduce-kv`; the protocol
+;; `KeyReducible` and its method `each-kv-while` are fib.coll.protocols'. The prelude had none of the four.
+;; Decided here, where the page is silent:
+;;  - `find` is written over `Lookup`, so a `Map`, a `Vec`, an `Array` and a user type have it. The entry is a `Pair` of the key the
+;;    caller gave and the value `get` found; Clojure's entry carries the key the map stores, which is `=` to the one given (a
+;;    difference only for a program that tests identity, which fibber has no way to). A miss is nil, as `get`'s.
+;;  - `merge-with` takes the function first and two maps, as the row's signature says; `(merge-with f a b c)` is `merge-with takes
+;;    3 argument(s), got 4` and a program that has more maps folds with `reduce` (the plan: "more maps are a user's reduce").
+;;    A key only one map has keeps its value and `f` is not called for it; for a key in both, the result holds `(f old new)`, `old`
+;;    being a's value and `new` b's, as Clojure's. `f` is called once per shared key, in b's walk order, and the function parameter
+;;    is :borrow (it is called, never stored). The result is a with b's entries added one by one (a's other entries are shared,
+;;    not copied), and its walk order is the hash's, as every Map's today (task P1 changes the order of small maps).
+;;  - `reduce-kv` takes the function first and the collection last (§3 N3), `(reduce-kv f init m)`; `f` sees the accumulator, the key
+;;    and the value, and the walk is `each-kv-while`, which hands the key and the value as two arguments and builds no `Pair`. The
+;;    walk never stops early: `reduced` inside the `f` of `reduce-kv` (Clojure's) is NOT read here, because `reduce-kv` is a function
+;;    and the rewrite that reads `reduced` is the Rust macro `reduce`'s; `reduce-while` over the entries is the early exit.
+;;  - the `KeyReducible` instance of a `Map` is the prelude's `map-each` itself: the entries in the trie's order, the walk
+;;    stopping at the first false, no `Pair`. That of a `Vec` is the index and the element, in order, stopping at the first false.
+;; Never `/` on integers; the prelude's `count` and `nth` are not used (fib.seq's replace them).
 (ns fib.coll.maps2 (:use fib.core fib.seq fib.coll.protocols fib.coll.seqs fib.coll.map fib.coll.ops))
+
+;; (find m k): the entry of key k as a Pair, or nil
+(defun find (m: s k: k) :where ((Lookup s k v)) -> (Option (Pair k v))
+  (match (get m k)
+    (nil nil)
+    ((some v) (some (Pair k v)))))
+
+;; the entries of a Map as the walk of key and value (no Pair per entry), in the trie's order
+(impl (KeyReducible k v) (Map k v)
+  (each-kv-while (self f) (fib.prelude/map-each self f)))
+
+;; the index and the element of a Vec, in order
+(impl (KeyReducible i64 a) (Vec a)
+  (each-kv-while (self f)
+    (let ((n (vec-count self)))
+      (loop ((i 0)) (if (< i n) (if (f i (vec-nth self i)) (recur (+ i 1)) false) true)))))
+
+;; (reduce-kv f init m): f of the accumulator, the key and the value, over every entry
+(defun reduce-kv (f: (fn (a k v) a) :borrow init: a m: m) :where ((KeyReducible m k v)) -> a
+  (let ((acc (cell init)))
+    (do (each-kv-while m (fn (k v) (do (set! acc (f @acc k v)) true)))
+        @acc)))
+
+;; (merge-with f a b): a with the entries of b added; for a key in both, (f old new)
+(defun merge-with (f: (fn (v v) v) :borrow a: (Map k v) b: (Map k v)) :where ((Hash k) (Eq k)) -> (Map k v)
+  (let ((acc (cell a)))
+    (do (fib.prelude/map-each b
+          (fn (k nv)
+            (do (set! acc (match (fib.prelude/map-get @acc k)
+                            (nil (fib.prelude/map-assoc @acc k nv))
+                            ((some ov) (fib.prelude/map-assoc @acc k (f ov nv)))))
+                true)))
+        @acc)))

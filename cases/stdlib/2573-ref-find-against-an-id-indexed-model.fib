@@ -1,0 +1,58 @@
+;; spec:   stdlib §4.5 row find, §8.1 item 2 (a library function against a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: find assoc
+;; 300 seeded maps over keys that collide in the hash (a K's hash is its id mod 7, so the 24 ids share 7 hashes and the HAMT
+;; keeps buckets), each built by 12 to 30 seeded assocs of ids 0 .. 23 with seeded values, against a model that is two
+;; plain arrays indexed by id: whether the id is in, and its value (the last assoc wins). For every id 0 .. 23 the answer
+;; of (find m (K id)) is the model's: nil when the id is not in, else (some entry) whose key is the id asked for and whose
+;; value is the model's. The reference never calls find or get. The seed is a constant.
+;; The planted faults, 30 maps each, each in a Checks of its own that must find a difference: (1) a model that forgets the
+;; id 0 (it answers a miss for it); (2) a model whose values are one too high.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+(defstruct K (id: i64))
+(derive Eq K)
+(impl Hash K (hash (self) (rem (. self id) 7)))
+
+;; the model: has[id] (0 or 1) and val[id]
+(defstruct Model (has: (Array i64) val: (Array i64)))
+
+(defun m-assoc (m: Model id: i64 v: i64) -> Model
+  (Model (array-with (. m has) id 1) (array-with (. m val) id v)))
+
+;; whether the library's answer for id is the model's
+(defun answer-is-right (o: (Option (Pair K i64)) m: Model id: i64 fault: i64) -> bool
+  (let ((in (and (= (array-get (. m has) id) 1) (not (and (= fault 1) (= id 0)))))
+        (want (+ (array-get (. m val) id) (if (= fault 2) 1 0))))
+    (match o
+      (nil (not in))
+      ((some p) (and in (and (= (. (. p fst) id) id) (= (. p snd) want)))))))
+
+(defun all-ids-right (mp: (Map K i64) m: Model fault: i64) -> bool
+  (loop ((id 0))
+    (if (< id 24)
+        (if (answer-is-right (find mp (K id)) m id fault) (recur (+ id 1)) false)
+        true)))
+
+;; one seeded map: its find answers against the model, true when all 24 ids are right
+(defun one-map (seed: i64 fault: i64) -> bool
+  (let ((r (rng seed))
+        (n (+ 12 (rng-below r 19))))
+    (loop ((i 0) (mp (empty {(K 0) 0})) (m (Model (array 24 0) (array 24 0))))
+      (if (< i n)
+          (let ((id (rng-below r 24)) (v (rng-below r 1000)))
+            (recur (+ i 1) (assoc mp (K id) v) (m-assoc m id v)))
+          (all-ids-right mp m fault)))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)))
+    (do (dotimes (i 240) (check c (one-map (+ 20262573 i) 0)))
+        (dotimes (i 30) (check p1 (one-map (+ 20262573 i) 1)))
+        (dotimes (i 30) (check p2 (one-map (+ 20262573 i) 2)))
+        (check-detects c p1)
+        (check-detects c p2)
+        (check c (= (checks-made c) 242))
+        (checks-result c))))

@@ -1,0 +1,46 @@
+;; spec:   stdlib §2.3 (Stack), §4.4 row pop, types §2.13 (the Vec is a 32-way trie with a tail of up to 32 elements)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: peek pop
+;; The Vec's pop is a rebuild of the first n-1 elements until the prelude's vec-pop lands (task P1), and the counts where a
+;; trie changes shape are where a pop could go wrong: the tail of one element, whose removal must take the last leaf back
+;; out of the trie (counts 33, 65, 1025 and 1057), a full tail, and the counts at which the trie gains a level (1056
+;; elements fill the root's 32 leaves). For each of 20 counts n the vector of 0 .. n-1 is popped and must equal the vector
+;; of 0 .. n-2 built another way (the bulk builder over a range), have n-1 elements and the top n-2; and a chain of 40 pops
+;; from 1057 elements down to 1017 is compared at every step, so the pop is also correct on the result of a pop.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; the vector 0 .. n-1 and the vector 0 .. n-2
+(defun upto (n: i64) -> (Vec i64) (vec (range n)))
+
+(defun pop-is-right (n: i64) -> bool
+  (let ((p (pop (upto n))))
+    (and (= p (upto (- n 1)))
+         (and (= (count p) (- n 1))
+              (= (peek p) (if (> n 1) (some (- n 2)) nil))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (dotimes (i 6) (check c (pop-is-right (+ 1 i))))
+        (check c (pop-is-right 31))
+        (check c (pop-is-right 32))
+        (check c (pop-is-right 33))
+        (check c (pop-is-right 34))
+        (check c (pop-is-right 64))
+        (check c (pop-is-right 65))
+        (check c (pop-is-right 66))
+        (check c (pop-is-right 1024))
+        (check c (pop-is-right 1025))
+        (check c (pop-is-right 1026))
+        (check c (pop-is-right 1056))
+        (check c (pop-is-right 1057))
+        (check c (pop-is-right 1058))
+        (check c (pop-is-right 2080))
+        (check c (loop ((i 0) (v (upto 1057)) (ok true))
+                   (if (< i 40)
+                       (recur (+ i 1) (pop v) (and ok (= (pop v) (upto (- 1056 i)))))
+                       ok)))
+        (check c (= (checks-made c) 21))
+        (checks-result c))))

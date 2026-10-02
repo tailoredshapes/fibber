@@ -1,0 +1,32 @@
+;; spec:   stdlib §4.4 row peek, §1.2 P5, §5 T1 (absent and nil-valued differ by construction)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: peek
+;; peek is the function that is undefined on an empty stack, so it answers (Option e) where Clojure answers nil: an empty
+;; Vec and an empty List give nil, and a stack whose top is itself nil (a Vec of Option) gives (some nil), which is a
+;; different answer from the empty stack's nil: the two cannot be confused. The stacks of Option are Vec and List of
+;; (Option i64).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; whether the answer of peek is nil, and whether it is (some nil)
+(defun absent? (o: (Option (Option i64))) -> bool (match o (nil true) ((some _) false)))
+(defun top-is-nil? (o: (Option (Option i64))) -> bool (match o ((some inner) (match inner (nil true) ((some _) false))) (nil false)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none (pop [(some 1)]))
+        (nones (pop (list (some 1))))
+        (nilv [(some 1) nil])
+        (nill (list nil (some 1))))
+    (do (check c (absent? (peek none)))
+        (check c (absent? (peek nones)))
+        (check c (not (absent? (peek nilv))))
+        (check c (top-is-nil? (peek nilv)))
+        (check c (not (absent? (peek nill))))
+        (check c (top-is-nil? (peek nill)))
+        (check c (not (top-is-nil? (peek none))))
+        (check c (not (top-is-nil? (peek (pop nilv)))))
+        (check c (= (peek (pop nilv)) (some (some 1))))
+        (checks-result c))))

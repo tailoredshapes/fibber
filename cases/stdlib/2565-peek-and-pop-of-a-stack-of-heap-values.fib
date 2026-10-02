@@ -1,0 +1,40 @@
+;; spec:   stdlib §2.3 (Stack), §4.4 rows peek and pop, ownership (borrow first, count second)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: peek pop
+;; The elements here are heap objects, a str and a Vec, so that every peek hands out a value that the stack still holds (a
+;; count taken, not a copy) and every pop drops one count of the removed element and keeps the others: the audit that ends the
+;; run fails on a use after free, a double free, a count that goes negative and a leak, which is what this case is for. The
+;; stack is popped to the bottom, the top is read at every step, the original is read after all of it, and a stack that is
+;; popped and pushed again reads back what it should, for a Vec and for a List.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun text-or (o: (Option str)) -> str (match o ((some s) s) (nil "-")))
+(defun count-or (o: (Option (Vec i64))) -> i64 (match o ((some v) (count v)) (nil -1)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (ss ["one" "two" "three"])
+        (vs [[1] [2 3] [4 5 6]])
+        (ls (list "one" "two" "three"))
+        (top (peek ss)))
+    (do (check c (= (text-or (peek ss)) "three"))
+        (check c (= (text-or (peek (pop ss))) "two"))
+        (check c (= (text-or (peek (pop (pop ss)))) "one"))
+        (check c (= (text-or (peek (pop (pop (pop ss))))) "-"))
+        (check c (= (text-or top) "three"))
+        (check c (= ss ["one" "two" "three"]))
+        (check c (= (count-or (peek vs)) 3))
+        (check c (= (count-or (peek (pop vs))) 2))
+        (check c (= (count-or (peek (pop (pop vs)))) 1))
+        (check c (= (count-or (peek (pop (pop (pop vs))))) -1))
+        (check c (= vs [[1] [2 3] [4 5 6]]))
+        (check c (= (text-or (peek ls)) "one"))
+        (check c (= (text-or (peek (pop ls))) "two"))
+        (check c (= (text-or (peek (pop (pop (pop ls))))) "-"))
+        (check c (= (text-or (peek (conj (pop ss) "again"))) "again"))
+        (check c (= (pop (conj (pop ss) "again")) ["one" "two"]))
+        (check c (= ls (list "one" "two" "three")))
+        (checks-result c))))

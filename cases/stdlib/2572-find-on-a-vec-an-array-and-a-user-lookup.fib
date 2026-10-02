@@ -1,0 +1,34 @@
+;; spec:   stdlib §4.5 row find, §2.3 (Lookup: find is written over it, so every instance has it)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: find
+;; find is one function over (Lookup s k v), so it is for every type that has the instance: a Vec and an Array find by index
+;; ((find [10 20 30] 1) is (some (Pair 1 20)); an index out of range, negative included, is nil), and a type of the
+;; program's own that implements Lookup gets find with no more code. The Ledger below is a pair of parallel Vecs, key
+;; and value, looked up by a scan.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct Ledger (names: (Vec str) sums: (Vec i64)))
+
+(impl (Lookup str i64) Ledger
+  (get (self name)
+    (loop ((i 0))
+      (if (< i (count (. self names)))
+          (if (= (nth (. self names) i) name) (some (nth (. self sums) i)) (recur (+ i 1)))
+          nil))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (l (Ledger ["rent" "food"] [900 300])))
+    (do (check c (= (find [10 20 30] 1) (some (Pair 1 20))))
+        (check c (= (find [10 20 30] 0) (some (Pair 0 10))))
+        (check c (= (find [10 20 30] 3) nil))
+        (check c (= (find [10 20 30] -1) nil))
+        (check c (= (find (array 3 7) 2) (some (Pair 2 7))))
+        (check c (= (find (array 3 7) 3) nil))
+        (check c (= (find l "food") (some (Pair "food" 300))))
+        (check c (= (find l "rent") (some (Pair "rent" 900))))
+        (check c (= (find l "gym") nil))
+        (checks-result c))))

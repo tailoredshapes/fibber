@@ -1,0 +1,29 @@
+;; spec:   stdlib §4.5 row find, §5 T1 (nil is a value of every type), §1.2 P5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: find
+;; In Clojure (find {:a nil} :a) is [:a nil], a hit, and (find {} :a) is nil, a miss, which is what get cannot tell apart
+;; (both nil). Here the entry is a Pair and the hit is (some (Pair k v)): over a Map whose values are themselves Options a
+;; key whose value is nil is a hit holding nil, and an absent key is nil, two different answers, so find is the test
+;; that is true to the map's keys where a get of an Option value is ambiguous (case 437 shows that for get).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun hit? (o: (Option (Pair str (Option i64)))) -> bool (match o ((some _) true) (nil false)))
+
+;; the value of the entry: nil for a miss and for a nil value alike, which find tells apart by hit?
+(defun entry-value (o: (Option (Pair str (Option i64)))) -> (Option i64)
+  (match o ((some p) (. p snd)) (nil nil)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m {"has" (some 5) "none" nil}))
+    (do (check c (hit? (find m "has")))
+        (check c (hit? (find m "none")))
+        (check c (not (hit? (find m "absent"))))
+        (check c (= (entry-value (find m "has")) (some 5)))
+        (check c (= (entry-value (find m "none")) nil))
+        (check c (= (entry-value (find m "absent")) nil))
+        (check c (= (find m "none") (some (Pair "none" nil))))
+        (checks-result c))))

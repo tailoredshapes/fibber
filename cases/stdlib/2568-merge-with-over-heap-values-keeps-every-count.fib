@@ -1,0 +1,27 @@
+;; spec:   stdlib §4.5 row merge-with, ownership (borrow first, count second)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: merge-with
+;; The keys are strs and the values are Vecs, heap objects both: the merge reads a's values and b's, hands the old one and the new
+;; one to f (a concatenation of the two vectors) and stores the answer, so every entry of the result is made of objects the
+;; two argument maps still hold. After the merge the two maps read as they did, the result has the concatenations in the
+;; order old then new, and the audit that ends the run fails on any use after free, double free or leak.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun cat (o: (Vec i64) n: (Vec i64)) -> (Vec i64) (into o n))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a {"x" [1 2] "y" [3]})
+        (b {"y" [4 5] "z" [6]})
+        (m (merge-with cat a b)))
+    (do (check c (= (count m) 3))
+        (check c (= (get m "x") (some [1 2])))
+        (check c (= (get m "y") (some [3 4 5])))
+        (check c (= (get m "z") (some [6])))
+        (check c (= a {"x" [1 2] "y" [3]}))
+        (check c (= b {"y" [4 5] "z" [6]}))
+        (check c (= (get (merge-with cat b a) "y") (some [4 5 3])))
+        (checks-result c))))

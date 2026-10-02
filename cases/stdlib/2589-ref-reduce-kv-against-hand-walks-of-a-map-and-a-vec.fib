@@ -1,0 +1,85 @@
+;; spec:   stdlib §4.4 row reduce-kv, §8.1 item 2 (a library function against a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce-kv assoc
+;; reduce-kv on both of its collections against a reference that is a loop. MAP: 140 seeded maps over keys that collide in the
+;; hash (a K's hash is its id mod 7), of 0 to 24 seeded assocs of ids 0 .. 23, folded by an order-independent step, the sum of
+;; 3 times the id plus the value, and by xor of 1000 times the id plus the value, against a model of two arrays indexed by id
+;; (is it in, its value) walked id by id. VEC: 100 seeded vectors of 0 to 70 elements folded by a step that depends on the
+;; order and on the index, (31 acc + i + x) mod 1000003, against a loop over the indexes 0 .. n-1 with vec-nth. The reference
+;; never calls reduce-kv. The seed is a constant. The Vec's walk is judged in order by the order-dependent step: a walk from the
+;; end, or one that skips an index, gives another number for any vector of two or more elements.
+;; The planted faults, 30 draws each, each in a Checks of its own that must find a difference: (1) a model whose step is the
+;; id plus 3 times the value (key and value in the wrong places); (2) a model that walks the vectors from the last index down;
+;; (3) a model that skips index 0.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+(defstruct K (id: i64))
+(derive Eq K)
+(impl Hash K (hash (self) (rem (. self id) 7)))
+
+(defstruct Model (has: (Array i64) val: (Array i64)))
+
+(defun m-assoc (m: Model id: i64 v: i64) -> Model
+  (Model (array-with (. m has) id 1) (array-with (. m val) id v)))
+
+;; the model's two folds, id by id, with fault 1 behind a number
+(defun model-sum (m: Model fault: i64) -> i64
+  (loop ((id 0) (acc 0))
+    (if (< id 24)
+        (recur (+ id 1)
+               (if (= (array-get (. m has) id) 1)
+                   (+ acc (if (= fault 1)
+                              (+ id (* 3 (array-get (. m val) id)))
+                              (+ (* 3 id) (array-get (. m val) id))))
+                   acc))
+        acc)))
+
+(defun model-xor (m: Model) -> i64
+  (loop ((id 0) (acc 0))
+    (if (< id 24)
+        (recur (+ id 1)
+               (if (= (array-get (. m has) id) 1)
+                   (bit-xor acc (+ (* 1000 id) (array-get (. m val) id)))
+                   acc))
+        acc)))
+
+(defun one-map (seed: i64 fault: i64) -> bool
+  (let ((r (rng seed)))
+    (loop ((i (rng-below r 25)) (mp (empty {(K 0) 0})) (m (Model (array 24 0) (array 24 0))))
+      (if (> i 0)
+          (let ((id (rng-below r 24)) (v (rng-below r 1000)))
+            (recur (- i 1) (assoc mp (K id) v) (m-assoc m id v)))
+          (and (= (reduce-kv (fn (acc k v) (+ acc (+ (* 3 (. k id)) v))) 0 mp) (model-sum m fault))
+               (= (reduce-kv (fn (acc k v) (bit-xor acc (+ (* 1000 (. k id)) v))) 0 mp) (model-xor m)))))))
+
+(defun step (acc: i64 i: i64 x: i64) -> i64 (rem (+ (* 31 acc) (+ i x)) 1000003))
+
+;; the reference: a loop over the indexes, from 0 up, or from the last down (fault 2), or from 1 (fault 3)
+(defun model-vec (v: (Vec i64) fault: i64) -> i64
+  (let ((n (vec-count v)))
+    (if (= fault 2)
+        (loop ((i (- n 1)) (acc 0))
+          (if (>= i 0) (recur (- i 1) (step acc i (vec-nth v i))) acc))
+        (loop ((i (if (= fault 3) 1 0)) (acc 0))
+          (if (< i n) (recur (+ i 1) (step acc i (vec-nth v i))) acc)))))
+
+(defun one-vec (seed: i64 fault: i64) -> bool
+  (let ((r (rng seed)))
+    (let ((v (rng-vec r (rng-below r 71) 1000)))
+      (= (reduce-kv step 0 v) (model-vec v fault)))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (dotimes (i 140) (check c (one-map (+ 20262589 i) 0)))
+        (dotimes (i 100) (check c (one-vec (+ 20262589 i) 0)))
+        (dotimes (i 30) (check p1 (one-map (+ 20262589 i) 1)))
+        (dotimes (i 30) (check p2 (one-vec (+ 20262589 i) 2)))
+        (dotimes (i 30) (check p3 (one-vec (+ 20262589 i) 3)))
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (check c (= (checks-made c) 243))
+        (checks-result c))))

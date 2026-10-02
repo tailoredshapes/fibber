@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.5 rows merge-with and merge, §8.1 item 4 (laws over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: merge-with merge
+;; Laws of merge-with over 250 pairs of seeded maps (keys 0 .. 29 drawn with repeats, so the maps overlap in about half their
+;; keys, values 0 .. 99): (1) with the combiner that keeps the new value it is merge, (merge-with (fn (o n) n) a b) equals
+;; (merge a b); (2) with the commutative +, merging in either order gives the same map; (3) the count of the result is
+;; the count of a plus the count of b less the keys they share; (4) merging with an empty map is the identity on either side.
+;; The planted fault is a merge-with of this case's own whose combiner is called with the new value first: law (1) over it must fail
+;; on 30 pairs, in a Checks of its own. The seed is a constant.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+;; the fault: f sees (new old)
+(defun merge-with-swapped (f: (fn (i64 i64) i64) :borrow a: (Map i64 i64) b: (Map i64 i64)) -> (Map i64 i64)
+  (let ((acc (cell a)))
+    (do (each-while b
+          (fn (p) (do (set! acc (match (get @acc (key p))
+                                  (nil (assoc @acc (key p) (val p)))
+                                  ((some old) (assoc @acc (key p) (f (val p) old)))))
+                      true)))
+        @acc)))
+
+(defun seeded-map (r: Rng) -> (Map i64 i64)
+  (loop ((i (rng-below r 20)) (m (empty {0 0})))
+    (if (> i 0) (recur (- i 1) (assoc m (rng-below r 30) (rng-below r 100))) m)))
+
+(defun shared (a: (Map i64 i64) b: (Map i64 i64)) -> i64
+  (let ((n (cell 0)))
+    (do (each-while a (fn (p) (do (if (contains? b (key p)) (set! n (+ @n 1)) ()) true)))
+        @n)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p (checks)) (r (rng 20262577)) (e (empty {0 0})))
+    (do (dotimes (i 250)
+          (let ((a (seeded-map r)) (b (seeded-map r)))
+            (do (check c (= (merge-with (fn (o n) n) a b) (merge a b)))
+                (check c (= (merge-with + a b) (merge-with + b a)))
+                (check c (= (count (merge-with + a b)) (- (+ (count a) (count b)) (shared a b))))
+                (check c (and (= (merge-with + a e) a) (= (merge-with + e b) b))))))
+        (dotimes (i 30)
+          (let ((a (seeded-map r)) (b (seeded-map r)))
+            (check p (= (merge-with-swapped (fn (o n) n) a b) (merge a b)))))
+        (check-detects c p)
+        (check c (= (checks-made c) 1001))
+        (checks-result c))))

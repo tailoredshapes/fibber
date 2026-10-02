@@ -1,0 +1,39 @@
+;; spec:   stdlib §4.5 row merge-with
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: merge-with
+;; f is the combiner of a conflict and nothing else: a key in only one map keeps its value and f is not called for it,
+;; and a key in both calls it exactly once, with the old value and the new one. a has keys 1 to 5 (value 10 times the key),
+;; b has keys 4 to 8 (value 100 times the key): the shared keys are 4 and 5, so f is called twice, with (40 400) and (50 500);
+;; the calls are recorded in a cell, the sum of the olds (90) and of the news (900) and the number of calls (2).
+;; A merge of disjoint maps makes no call, and merging a map with itself calls f once per key.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun scaled (from: i64 to: i64 by: i64) -> (Map i64 i64)
+  (loop ((k from) (m (empty {0 0})))
+    (if (<= k to) (recur (+ k 1) (assoc m k (* k by))) m)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (olds (cell 0))
+        (news (cell 0))
+        (a (scaled 1 5 10))
+        (b (scaled 4 8 100)))
+    (do (let ((m (merge-with (fn (o n) (do (set! calls (+ @calls 1)) (set! olds (+ @olds o)) (set! news (+ @news n)) (+ o n))) a b)))
+          (do (check c (= @calls 2))
+              (check c (= @olds 90))
+              (check c (= @news 900))
+              (check c (= (count m) 8))
+              (check c (= (get m 1) (some 10)))
+              (check c (= (get m 4) (some 440)))
+              (check c (= (get m 5) (some 550)))
+              (check c (= (get m 8) (some 800)))))
+        (set! calls 0)
+        (merge-with (fn (o n) (do (set! calls (+ @calls 1)) o)) (scaled 1 3 1) (scaled 4 6 1))
+        (check c (= @calls 0))
+        (merge-with (fn (o n) (do (set! calls (+ @calls 1)) o)) a a)
+        (check c (= @calls 5))
+        (checks-result c))))

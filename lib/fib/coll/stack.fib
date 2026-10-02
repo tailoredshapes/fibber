@@ -1,5 +1,33 @@
-;; owner: Y5
-;; fib.coll.stack: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the `Stack` instances of `Vec` and `List` (`peek` and `pop` are the protocol's methods, which `fib.coll.protocols` already exports).
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
+;; fib.coll.stack: the `Stack` instances of `Vec` and `List` (stdlib §2.3, §4.5 rows `peek` and `pop`; tranche 2 plan Y5, owner Y5).
+;; `peek` and `pop` are the methods of the protocol `Stack` that fib.coll.protocols declares and exports; this part exports no name of its
+;; own, it holds the instances (and a private helper). The prelude had no stack, and the tranche 1 part fib.coll.seqs left the instances
+;; out on purpose ("peek and pop are tranche 2"). The page's other instances (`SubVec`, `Queue`) wait for their types (tranche 3).
+;; Decided here, where the page is silent:
+;;  - the end that `conj` adds at is the end that `peek` reads and `pop` removes (Clojure's): the last element of a `Vec`, the first
+;;    of a `List`. `peek` of an empty stack is nil, never a trap; `pop` of an empty stack traps `pop: empty`, where Clojure's `pop`
+;;    throws (§1.2 P5), and the trap names the function (tranche 1 plan §4.3 rule 8). There is no `try-pop` here.
+;;  - `pop` of a `Vec` is the rebuild of the first n-1 elements by the prelude's bulk builder `vec-collect`: correct, O(n), one
+;;    pass, two heap objects for every 32 elements. The in-place pop (the tail first, then the last leaf of the trie) needs the trie's
+;;    private nodes and is the prelude's, task P1's `vec-pop`. WHEN `vec-pop` LANDS, THE ONE LINE TO CHANGE is the body of `pop` in the
+;;    `Vec` instance below, `(vec-pop-rebuilt self)` becomes `(vec-pop self)`, and the helper is deleted with it. Until then a loop
+;;    that pops a stack of 10,000 items does 10,000 rebuilds of about 5,000 elements on average: the plan accepts that only until P1.
+;;  - `pop` of a `List` is its tail, shared, not copied; the tail of a list of one is the empty list.
+;; Never `/` on integers; the prelude's `count` and `nth` are not used here (a part calls the prelude's vec-count and vec-nth).
 (ns fib.coll.stack (:use fib.core fib.seq fib.coll.protocols fib.coll.seqs))
+
+;; the first n-1 elements of v, which has n > 0 elements, in one pass of the bulk builder
+(defun vec-pop-rebuilt :private (v: (Vec a)) -> (Vec a)
+  (let ((m (- (vec-count v) 1)))
+    (if (< m 0)
+        (trap "pop: empty")
+        (vec-collect (fn (k) (loop ((i 0)) (if (< i m) (if (k (vec-nth v i)) (recur (+ i 1)) false) true)))))))
+
+;; a Vec: the end
+(impl (Stack a) (Vec a)
+  (peek (self) (let ((n (vec-count self))) (if (> n 0) (some (vec-nth self (- n 1))) nil)))
+  (pop (self) (vec-pop-rebuilt self)))
+
+;; a List: the front
+(impl (Stack a) (List a)
+  (peek (self) (match self ((Cons h _) (some h)) ((Empty) nil)))
+  (pop (self) (match self ((Cons _ t) t) ((Empty) (trap "pop: empty")))))

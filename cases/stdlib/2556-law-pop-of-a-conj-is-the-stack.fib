@@ -1,0 +1,45 @@
+;; spec:   stdlib §2.3 (Stack), §4.4 row pop, §8.1 item 4 (laws over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: pop
+;; The second law of a stack: (pop (conj s x)) equals s, at every depth, so pop undoes conj exactly. It is written once over
+;; (Stack s e), (Collection s s e) and (Eq s), and run on 150 seeded Vecs and 150 seeded Lists of 0 to 70 elements with a
+;; seeded element; a Vec compares by elements and a List by its cells. The Vecs cross the 32-element tail of the trie (a
+;; conj of the 33rd element makes the first leaf, and the pop of it must put the elements back). The planted fault is a
+;; stack of this case's own whose pop removes nothing: the law over 40 of those must fail in a Checks of its own.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+;; the faulty stack: conj pushes at the end, pop leaves the stack as it was
+(defstruct (Bad a) (v: (Vec a)))
+(derive Eq Bad)
+(impl (Collection (Bad a) a) (Bad a) (conj (self x) (Bad (conj (. self v) x))))
+(impl (Stack a) (Bad a)
+  (peek (self) (let ((v (. self v))) (if (> (count v) 0) (some (nth v (- (count v) 1))) nil)))
+  (pop (self) self))
+
+;; the law
+(defun pop-undoes-conj (s: s x: e) :where ((Stack s e) (Collection s s e) (Eq s)) -> bool
+  (= (pop (conj s x)) s))
+
+;; the list with the elements of v in order
+(defun list-of (v: (Vec i64)) -> (List i64)
+  (loop ((i (- (count v) 1)) (acc Empty))
+    (if (>= i 0) (recur (- i 1) (Cons (nth v i) acc)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (r (rng 20262556)))
+    (do (dotimes (i 150)
+          (let ((v (rng-vec r (rng-below r 71) 1000))
+                (x (rng-below r 1000)))
+            (do (check c (pop-undoes-conj v x))
+                (check c (pop-undoes-conj (list-of v) x)))))
+        (dotimes (i 40)
+          (let ((v (rng-vec r (rng-below r 71) 1000)))
+            (check p (pop-undoes-conj (Bad v) (rng-below r 1000)))))
+        (check-detects c p)
+        (check c (= (checks-made c) 301))
+        (checks-result c))))

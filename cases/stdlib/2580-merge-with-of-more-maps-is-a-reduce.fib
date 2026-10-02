@@ -1,0 +1,24 @@
+;; spec:   stdlib §4.5 row merge-with, tranche 2 plan Y5 ("more maps are a user's reduce")
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: merge-with reduce
+;; The way a program merges three or more maps with a combiner, since merge-with takes two: a reduce whose step is
+;; merge-with, (reduce (fn (acc m) (merge-with + acc m)) first rest). Over {1 1 2 2}, {2 10 3 3} and {2 100 4 4} the keys
+;; are 1 to 4 and key 2 holds 2 + 10 + 100 = 112; the order the maps are folded in does not matter for +, which the second
+;; check shows (the same maps in the other order give the same map).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun merge-all (head: (Map i64 i64) more: (Vec (Map i64 i64))) -> (Map i64 i64)
+  (reduce (fn (acc: (Map i64 i64) m: (Map i64 i64)) (merge-with + acc m)) head more))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a {1 1 2 2})
+        (b {2 10 3 3})
+        (d {2 100 4 4}))
+    (do (check c (= (merge-all a [b d]) {1 1 2 112 3 3 4 4}))
+        (check c (= (merge-all d [b a]) {1 1 2 112 3 3 4 4}))
+        (check c (= (merge-all a (vec-empty)) a))
+        (checks-result c))))

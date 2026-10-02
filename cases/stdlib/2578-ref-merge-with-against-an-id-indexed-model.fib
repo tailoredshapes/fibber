@@ -1,0 +1,76 @@
+;; spec:   stdlib §4.5 row merge-with, §8.1 item 2 (a library function against a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: merge-with assoc
+;; 300 seeded pairs of maps over keys that collide in the hash (a K's hash is its id mod 7, so the 24 ids share 7 hashes and
+;; the HAMT keeps buckets), each map of 0 to 20 seeded assocs of ids 0 .. 23, against a model of two arrays indexed by id (is
+;; it in, its value). The combiner is not commutative and not associative, f(old, new) = 2 old - new, so a swap of its
+;; arguments, a key lost on either side and a combiner applied to a key in one map only each change an answer. The model
+;; merges id by id with the formula: in both, 2 a - b; in one, its value; in neither, absent. The result must have, for every
+;; id 0 .. 23, the model's presence (contains?) and value (get), and the count of the entries the model has. The reference
+;; never calls merge-with. The seed is a constant.
+;; The planted faults, 30 pairs each, each in a Checks of its own that must find a difference: (1) a model whose combiner is
+;; 2 new - old (the arguments swapped); (2) a model that loses the ids that only b has.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+(defstruct K (id: i64))
+(derive Eq K)
+(impl Hash K (hash (self) (rem (. self id) 7)))
+
+(defstruct Model (has: (Array i64) val: (Array i64)))
+
+(defun m-assoc (m: Model id: i64 v: i64) -> Model
+  (Model (array-with (. m has) id 1) (array-with (. m val) id v)))
+
+;; the model's merge, id by id, with its planted faults behind a number
+(defun m-merge (a: Model b: Model fault: i64) -> Model
+  (loop ((id 0) (out (Model (array 24 0) (array 24 0))))
+    (if (< id 24)
+        (let ((ha (= (array-get (. a has) id) 1))
+              (hb (= (array-get (. b has) id) 1))
+              (va (array-get (. a val) id))
+              (vb (array-get (. b val) id)))
+          (recur (+ id 1)
+                 (if (and ha hb)
+                     (m-assoc out id (if (= fault 1) (- (* 2 vb) va) (- (* 2 va) vb)))
+                     (if ha
+                         (m-assoc out id va)
+                         (if (and hb (not (= fault 2))) (m-assoc out id vb) out)))))
+        out)))
+
+(defun combine (o: i64 n: i64) -> i64 (- (* 2 o) n))
+
+;; the map and the model of one seeded draw
+(defun draw (r: Rng) -> (Pair (Map K i64) Model)
+  (loop ((i (rng-below r 21)) (mp (empty {(K 0) 0})) (m (Model (array 24 0) (array 24 0))))
+    (if (> i 0)
+        (let ((id (rng-below r 24)) (v (rng-below r 1000)))
+          (recur (- i 1) (assoc mp (K id) v) (m-assoc m id v)))
+        (Pair mp m))))
+
+(defun result-is-right (mp: (Map K i64) m: Model) -> bool
+  (loop ((id 0) (n 0))
+    (if (< id 24)
+        (let ((in (= (array-get (. m has) id) 1)))
+          (if (and (= (contains? mp (K id)) in)
+                   (or (not in) (= (get mp (K id)) (some (array-get (. m val) id)))))
+              (recur (+ id 1) (+ n (if in 1 0)))
+              false))
+        (= (count mp) n))))
+
+(defun one-pair (seed: i64 fault: i64) -> bool
+  (let ((r (rng seed)))
+    (let ((a (draw r)) (b (draw r)))
+      (result-is-right (merge-with combine (. a fst) (. b fst)) (m-merge (. a snd) (. b snd) fault)))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)))
+    (do (dotimes (i 240) (check c (one-pair (+ 20262578 i) 0)))
+        (dotimes (i 30) (check p1 (one-pair (+ 20262578 i) 1)))
+        (dotimes (i 30) (check p2 (one-pair (+ 20262578 i) 2)))
+        (check-detects c p1)
+        (check-detects c p2)
+        (check c (= (checks-made c) 242))
+        (checks-result c))))

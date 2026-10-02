@@ -1,0 +1,44 @@
+;; spec:   stdlib §2.3 (Stack, Collection), §4.4 rows peek and pop, §8.1 item 2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: peek pop
+;; The protocol is the interface: one function written over (Stack s e) drains a stack of anything, taking the top, popping
+;; it, until peek says nil. It sums a Vec and a List of the same numbers (the same 10 numbers, in opposite orders at the top),
+;; and it is run on a user type too (a Pile, as in case 019) so that the library's two instances and a program's own are
+;; reached by one call. `drain` also returns how many it popped, so the loop is shown to end exactly at the bottom, and
+;; `drain-order` shows the end each type pops from: a Vec gives its last element first, a List its first.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; the sum of the elements and the number of pops of a stack of i64
+(defun drain (s: s) :where ((Stack s i64)) -> (Pair i64 i64)
+  (loop ((st s) (sum 0) (n 0))
+    (match (peek st)
+      (nil (Pair sum n))
+      ((some x) (recur (pop st) (+ sum x) (+ n 1))))))
+
+;; the elements in the order they pop, as a number whose digits they are (single digits only)
+(defun drain-order (s: s) :where ((Stack s i64)) -> i64
+  (loop ((st s) (acc 0))
+    (match (peek st)
+      (nil acc)
+      ((some x) (recur (pop st) (+ (* acc 10) x))))))
+
+;; a Pile of n holds 0 .. n-1 and pops from the top
+(defstruct Pile (n: i64))
+(impl (Stack i64) Pile
+  (peek (self) (if (> (. self n) 0) (some (- (. self n) 1)) nil))
+  (pop (self) (Pile (if (> (. self n) 0) (- (. self n) 1) 0))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (drain [1 2 3 4 5 6 7 8 9 10]) (Pair 55 10)))
+        (check c (= (drain (list 10 9 8 7 6 5 4 3 2 1)) (Pair 55 10)))
+        (check c (= (drain (Pile 11)) (Pair 55 11)))
+        (check c (= (drain (vec-empty)) (Pair 0 0)))
+        (check c (= (drain (list)) (Pair 0 0)))
+        (check c (= (drain-order [1 2 3]) 321))
+        (check c (= (drain-order (list 1 2 3)) 123))
+        (check c (= (drain-order (Pile 4)) 3210))
+        (checks-result c))))

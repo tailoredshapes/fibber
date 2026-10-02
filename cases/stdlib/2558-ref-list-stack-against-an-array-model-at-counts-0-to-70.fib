@@ -1,0 +1,101 @@
+;; spec:   stdlib §2.3 (Stack), §4.4 rows peek and pop, §8.1 item 2 (a library function against a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: peek pop
+;; 300 seeded operations on a List used as a stack, against a model that is a plain array of 71 slots and a length: a push
+;; copies the whole array with one slot replaced (array-with), a pop writes -1 over the top slot and shortens the length, peek
+;; reads the slot below the length. The top of the List is its first element, so the element at index i of the List is the
+;; slot n - 1 - i of the model. After every operation the List and the model have the same count, the same element at every
+;; index (nth), and the same peek (nil at 0). The main run is 210 operations: 70 pushes from empty to 70 elements, 70 pops
+;; back to none, then 70 more moves toward seeded targets in 0 to 70; so every count from 0 to 70 is visited, the last check of
+;; the run asserts that all 71 were. The reference never calls peek, pop or conj.
+;; The planted faults, 30 operations each (300 inputs in all), each in a Checks of its own that must find a difference:
+;; (1) a model whose pop shortens by two once it holds more than 3 elements, over a run that pops from 40 elements;
+;; (2) a model whose peek reads the second slot from the top once it holds 2 or more, over the same run;
+;; (3) a model whose push stores x + 1 at the 21st element, over a run that pushes from empty.
+(ns main (:use fib.core fib.seq fib.coll tl.rng tl.check))
+
+;; the model: the slots (71 of them) and how many are in use
+(defstruct Model (a: (Array i64) n: i64))
+
+(defun m-new () -> Model (Model (array 71 -1) 0))
+
+(defun m-push (m: Model x: i64 fault: i64) -> Model
+  (let ((n (. m n)))
+    (Model (array-with (. m a) n (if (and (= fault 3) (= n 20)) (+ x 1) x)) (+ n 1))))
+
+(defun m-pop (m: Model fault: i64) -> Model
+  (let ((n (. m n))
+        (k (if (and (= fault 1) (> (. m n) 3)) 2 1)))
+    (Model (array-with (. m a) (- n 1) -1) (- n k))))
+
+(defun m-peek (m: Model fault: i64) -> (Option i64)
+  (let ((n (. m n)))
+    (if (= n 0)
+        nil
+        (some (array-get (. m a) (- n (if (and (= fault 2) (>= n 2)) 2 1)))))))
+
+(defun same-peek (a: (Option i64) b: (Option i64)) -> bool
+  (match a
+    (nil (match b (nil true) ((some _) false)))
+    ((some x) (match b (nil false) ((some y) (= x y))))))
+
+;; whether the List and the model agree in count, in every element and in what peek answers
+(defun agree (v: (List i64) m: Model fault: i64) -> bool
+  (let ((n (. m n)))
+    (and (= (count v) n)
+         (and (same-peek (peek v) (m-peek m fault))
+              (loop ((i 0))
+                (if (< i n)
+                    (if (= (nth v i) (array-get (. m a) (- (- n 1) i))) (recur (+ i 1)) false)
+                    true))))))
+
+;; a List and a model of `start` elements, built the same way
+(defun filled (start: i64 fault: i64) -> (Pair (List i64) Model)
+  (loop ((i 0) (v Empty) (m (m-new)))
+    (if (< i start) (recur (+ i 1) (conj v (* i 7)) (m-push m (* i 7) 0)) (Pair v m))))
+
+;; `ops` operations toward a target count: 70 first, then 0, then seeded; after each, one check. A target that is reached
+;; and a new one that equals the count are not operations. With fault 0 the run ends by checking that every count 0..70 was seen.
+(defun run-ops (c: Checks seed: i64 fault: i64 ops: i64 start: i64 t0: i64) -> unit
+  (let ((r (rng seed))
+        (seen (cell (array 71 0)))
+        (init (filled start fault)))
+    (do (loop ((k 0) (v (. init fst)) (m (. init snd)) (target t0) (reached 0))
+          (if (< k ops)
+              (let ((n (. m n)))
+                (if (= n target)
+                    (recur k v m (if (= reached 0) (if (= t0 70) 0 70) (rng-below r 71)) (+ reached 1))
+                    (if (< n target)
+                        (let ((x (rng-below r 1000)))
+                          (let ((v2 (conj v x))
+                                (m2 (m-push m x fault)))
+                            (do (array-set! &seen (. m2 n) 1)
+                                (check c (agree v2 m2 fault))
+                                (recur (+ k 1) v2 m2 target reached))))
+                        (let ((v2 (pop v))
+                              (m2 (m-pop m fault)))
+                          (do (array-set! &seen (. m2 n) 1)
+                              (check c (agree v2 m2 fault))
+                              (recur (+ k 1) v2 m2 target reached))))))
+              ()))
+        (if (= fault 0)
+            (check c (= (loop ((i 0) (s 0)) (if (< i 71) (recur (+ i 1) (+ s (array-get @seen i))) s)) 71))
+            ()))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (p3 (checks)))
+    (do (run-ops c 20262557 0 210 0 70)
+        (run-ops p1 20262558 1 30 40 0)
+        (run-ops p2 20262559 2 30 40 0)
+        (run-ops p3 20262560 3 30 0 70)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (check c (= (checks-made c) 214))
+        (checks-result c))))

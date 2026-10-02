@@ -1,0 +1,32 @@
+;; spec:   stdlib §4.4 row reduce-kv, ownership (borrow first, count second)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce-kv
+;; The accumulator, the keys and the values are heap objects: reduce-kv over a Map of str to Vec builds a Map from the lengths
+;; of the vectors to the keys' text lists (a Map i64 (Vec str)), grouping the keys by the length of their value, and over a Vec
+;; of str builds a Map from each text to its index. The groups' order inside a Vec depends on the walk's order, so the case
+;; looks at the sizes and the membership, not the order. The audit that ends the run fails on any leak, use after free or
+;; double free in the accumulator's turn over.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun group (m: (Map str (Vec i64))) -> (Map i64 (Vec str))
+  (reduce-kv (fn (acc k v)
+               (assoc acc (count v) (conj (match (get acc (count v)) ((some ks) ks) (nil (vec-empty))) k)))
+             (empty {1 ["x"]})
+             m))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (g (group {"a" [1] "b" [2 3] "c" [4] "d" [5 6] "e" [7 8 9]}))
+        (idx (reduce-kv (fn (acc i s) (assoc acc s i)) (empty {"" 0}) ["x" "y" "z"])))
+    (do (check c (= (count g) 3))
+        (check c (= (match (get g 1) ((some ks) (count ks)) (nil -1)) 2))
+        (check c (= (match (get g 2) ((some ks) (count ks)) (nil -1)) 2))
+        (check c (= (get g 3) (some ["e"])))
+        (check c (includes? "a" (match (get g 1) ((some ks) ks) (nil (vec-empty)))))
+        (check c (includes? "c" (match (get g 1) ((some ks) ks) (nil (vec-empty)))))
+        (check c (includes? "b" (match (get g 2) ((some ks) ks) (nil (vec-empty)))))
+        (check c (= idx {"x" 0 "y" 1 "z" 2}))
+        (checks-result c))))
