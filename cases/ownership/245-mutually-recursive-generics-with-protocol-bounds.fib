@@ -1,0 +1,36 @@
+;; spec:   types §3.6, §4.3
+;; expect: accept
+;; result: 34
+;; audit:  clean
+;; Two `defun`s that call each other, each generic in two variables with
+;; a protocol bound, form one SCC whose members share their quantified
+;; variables (§3.6): the scheme of each has four. A recursive occurrence
+;; of a fully annotated member is typed at its annotation, which has two,
+;; so the call that `ping` makes to `pong` fixes only the two variables
+;; `pong` writes, and `pong`'s other two are `ping`'s own. The compiler
+;; once counted the occurrence's two types against the scheme's four and
+;; stopped with `call of pong instantiates 2 of 4 variables`, while the
+;; interpreter, which compiles nothing, ran the program; the pair also
+;; swaps its arguments, so the right type must reach the right variable.
+;; Found by the types plan (M6, P2): the type checker in fibber over an
+;; annotation environment, written with a function parameter to avoid it.
+(defprotocol Weigh (weigh (self) -> i64))
+
+(defstruct Box (n: i64))
+(defstruct Crate (n: i64))
+
+(impl Weigh Box (weigh (self) (. self n)))
+(impl Weigh Crate (weigh (self) (. self n)))
+
+(defun ping (n: i64 x: a y: b) :where ((Weigh a) (Weigh b)) -> i64
+  (if (= n 0)
+      (+ (weigh x) (* 10 (weigh y)))
+      (pong (- n 1) y x)))
+
+(defun pong (n: i64 p: b q: a) :where ((Weigh b) (Weigh a)) -> i64
+  (if (= n 0)
+      (+ (weigh p) (* 10 (weigh q)))
+      (ping (- n 1) q p)))
+
+(defun main () -> i64
+  (ping 1 (Box 3) (Crate 4)))

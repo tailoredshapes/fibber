@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::ast::ExprId;
+use crate::types::ast::{ExprId, FunId};
 use crate::types::display::letter_name;
 use crate::types::error::{ErrorKind, TResult, TypeError};
 use crate::types::scheme::{ColourBound, Scheme};
@@ -112,6 +112,16 @@ impl GenMap {
             colours,
             colour_gen,
         }
+    }
+
+    /// The number of quantified type variables.
+    pub fn n_vars(&self) -> u32 {
+        self.vars.len() as u32
+    }
+
+    /// The index the map gives `k`, if it quantifies it.
+    pub fn gen_of(&self, k: Key) -> Option<u32> {
+        self.vars.get(&k).copied()
     }
 
     /// The number of quantified colour variables.
@@ -385,10 +395,38 @@ impl Cx<'_> {
         self.finalize_uses(map);
     }
 
+    /// The instantiation of an occurrence of a fully annotated member of
+    /// the unit, typed at the member's annotation (§3.6), as one of the
+    /// member's scheme. The members of an SCC share their quantified
+    /// variables, so the scheme has the unit's variables, where the
+    /// annotation has only the member's own: each of those goes to the
+    /// variable it is in the scheme, and every other variable is the
+    /// caller's own, by index, as at an occurrence that has no
+    /// instantiation. `tys` are already under the map.
+    fn scheme_instantiation(&self, map: &GenMap, callee: FunId, tys: Vec<Ty>) -> Vec<Ty> {
+        let mut full: Vec<Ty> = (0..map.n_vars()).map(Ty::Gen).collect();
+        let vars = self.u.poly_vars.get(&callee).map_or(&[][..], Vec::as_slice);
+        for (r, t) in vars.iter().zip(tys) {
+            if let Some(k) = map.gen_of(Key::Rigid(*r)) {
+                full[k as usize] = t;
+            }
+        }
+        full
+    }
+
     fn finalize_uses(&mut self, map: &GenMap) {
+        let poly: HashMap<ExprId, FunId> = self
+            .u
+            .poly_calls
+            .iter()
+            .map(|c| (c.site, c.callee))
+            .collect();
         for id in std::mem::take(&mut self.u.insts) {
             if let Some(mut i) = self.t.instantiations.get(&id).cloned() {
                 i.tys = i.tys.iter().map(|t| map.apply(self.st, t)).collect();
+                if let Some(callee) = poly.get(&id) {
+                    i.tys = self.scheme_instantiation(map, *callee, i.tys);
+                }
                 i.colours = i.colours.iter().map(|k| map.colour(*k)).collect();
                 self.t.instantiations.insert(id, i);
             }

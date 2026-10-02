@@ -250,6 +250,34 @@ mod tests {
         assert!(m.starts_with("the method size of Sz is wanted"), "{m}");
     }
 
+    /// Two members of an SCC, fully annotated and generic in a variable
+    /// with a bound each, call each other: the occurrence is typed at the
+    /// callee's annotation, one variable, and the callee's scheme has the
+    /// SCC's two. The compiler used to stop with `call of pong
+    /// instantiates 1 of 2 variables`, where the interpreter ran it.
+    #[test]
+    fn mutually_recursive_members_generic_in_a_bounded_variable_compile_once_per_type() {
+        let text = lir_of(
+            "(defprotocol Weigh (weigh (self) -> i64))
+             (impl Weigh i64 (weigh (self) self))
+             (defun ping (n: i64 x: a) :where ((Weigh a)) -> i64
+               (if (= n 0) (weigh x) (pong (- n 1) x)))
+             (defun pong (n: i64 y: b) :where ((Weigh b)) -> i64
+               (if (= n 0) (weigh y) (ping (- n 1) y)))
+             (defun main () -> i64 (ping 3 7))",
+        );
+        if let Err(e) = lir::parse_and_check(&text) {
+            panic!("{}\n{text}", e[0]);
+        }
+        // The names carry the key: the SCC's two variables, at i64 each.
+        for f in ["f.ping.i64.i64", "f.pong.i64.i64"] {
+            let defs = text
+                .matches(&format!("(define internal tailcc ({f} "))
+                .count();
+            assert_eq!(defs, 1, "{f}\n{text}");
+        }
+    }
+
     #[test]
     fn a_scalar_program_checks_as_lir() {
         let text =

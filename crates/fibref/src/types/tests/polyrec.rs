@@ -4,6 +4,7 @@
 //! that stay finite is not.
 
 use super::{fails, ok, ErrorKind as K};
+use crate::types::ty::Ty;
 
 /// `len` over anything with a size, recursing at a wrapper of its own
 /// variable: the stdlib design's `(len (drop 1 xs))`.
@@ -85,4 +86,45 @@ fn a_function_that_is_not_fully_annotated_cannot_recurse_polymorphically_at_all(
         K::Infinite,
         "cannot construct the infinite type",
     );
+}
+
+/// Two members that call each other, each fully annotated and generic in
+/// two variables with a bound: the SCC's members share their quantified
+/// variables, so each scheme has four.
+const PING_PONG: &str = "(defprotocol Weigh (weigh (self) -> i64))
+    (impl Weigh i64 (weigh (self) self))
+    (defun ping (n: i64 x: a y: b) :where ((Weigh a) (Weigh b)) -> i64
+      (if (= n 0) (+ (weigh x) (weigh y)) (pong (- n 1) y x)))
+    (defun pong (n: i64 p: b q: a) :where ((Weigh b) (Weigh a)) -> i64
+      (if (= n 0) (+ (weigh p) (weigh q)) (ping (- n 1) q p)))
+    (defun main () -> i64 (ping 1 2 3))";
+
+#[test]
+fn an_occurrence_of_a_member_is_instantiated_at_every_variable_of_its_scheme() {
+    // The occurrence is typed at the member's annotation, which has two
+    // variables; the scheme it is recorded against has the SCC's four.
+    // The instantiation is as wide as the scheme, the callee's own
+    // variables get the caller's types, and the others are the caller's,
+    // by index. Numbering: ping a b, pong b a (the schemes' names).
+    let p = ok(PING_PONG);
+    let four: Vec<&Vec<String>> = p
+        .fun_schemes
+        .iter()
+        .flatten()
+        .filter(|s| s.n_vars == 4)
+        .map(|s| &s.var_names)
+        .collect();
+    assert_eq!(four.len(), 2, "ping and pong have four variables each");
+    assert!(four.iter().all(|n| **n == ["a", "b", "b", "a"]));
+    let g = Ty::Gen;
+    let wide: Vec<Vec<Ty>> = p
+        .instantiations
+        .values()
+        .filter(|i| i.tys.len() == 4)
+        .map(|i| i.tys.clone())
+        .collect();
+    // main's call of ping, ping's of pong (at y x), pong's of ping (at q p).
+    assert_eq!(wide.len(), 3, "{wide:?}");
+    assert!(wide.contains(&vec![g(0), g(1), g(1), g(0)]), "{wide:?}");
+    assert!(wide.contains(&vec![g(3), g(2), g(2), g(3)]), "{wide:?}");
 }
