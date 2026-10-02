@@ -1,0 +1,167 @@
+;; compiler/types/dump.fib: the types dump of spec/bootstrap.md §6.1, as
+;; crates/fibref/src/types_dump/mod.rs (430 lines): for a file, the header `== FILE`
+;; and then the sections of every module of the program that the checker accepts,
+;; or the expander's error record, or the `error` records of the step that failed,
+;; or the line `unreadable`. The sections are in types.dump.sections, the numbering
+;; of variables in types.dump.normal.
+;;
+;; Shapes decided where Rust and fibber differ (see also expand.dump, whose
+;; shapes these are):
+;; - `types_files(files, opts) -> (String, u8)` is the loop of the tool
+;;   (compiler/types.fib), which prints each file's output as it is made:
+;;   `types-file` is one iteration, giving the lines of the file's section (the
+;;   header first, a line that holds a line break being one element) and the
+;;   status it adds (0 typed, 1 an error record, 2 unreadable).
+;; - the `builtins` table `--tables` prints once before the first file is part
+;;   of the `tables` section (P13).
+;; - the record functions of expand.dump are private there, so the three that
+;;   print the expander's record (`read-record`, `expand-record`, `load-record`)
+;;   are written here again, with the same text.
+;; - no runner: stage 2a has no evaluator (see expand.dump `runner-of`), so a
+;;   call of a user macro is `MacroNeedsEvaluator` as under `--no-runner`.
+(ns types.dump
+  (:require [syntax.reader :as reader] [syntax.dump :as sdump] [expand.modules :as mods]
+            [expand.program :as prog] [types.driver :as driver])
+  (:use syntax.pos syntax.form syntax.error expand.error expand.types expand.ctx expand.roots
+        types.args types.error types.decls types.dump.normal types.dump.sections))
+
+;; One file's output: its lines and the status it adds. A line has no newline.
+(defstruct Dumped (lines: (Vec str) status: i64))
+
+;; The position of an error that has none: a module that cannot be found.
+(def no-position: str "0:0 0..0")
+
+;; `error KIND L:C S..E: MESSAGE`: the record of the reader dump.
+(defun record :private (kind: str at: str message: str) -> str
+  (str-join ["error " kind " " at ": " message]))
+
+(defun read-record :private (e: ReadError home: str) -> str
+  (record (err-name (. e kind)) (sdump/span-in (. e pos) home) (err-message (. e kind))))
+
+(defun expand-record :private (e: ExpandError home: str) -> str
+  (record (expand-err-name (. e kind)) (sdump/span-in (. e pos) home) (expand-err-message (. e kind))))
+
+;; The record of a program that could not be loaded.
+(defun load-record :private (e: LoadErr home: str) -> str
+  (match e
+    ((LoadRead r) (read-record r home))
+    ((LoadSpec pos what) (record "BadNs" (sdump/span-in pos home) what))
+    ((LoadMissing _ _) (record "ModuleMissing" no-position (mods/load-err-message e)))
+    ((LoadCycle _ _) (record "ModuleCycle" no-position (mods/load-err-message e)))
+    ((LoadMismatch _ _ _) (record "ModuleMismatch" no-position (mods/load-err-message e)))))
+
+;; The file's output ended by a record: status 1.
+(defun failed :private (lines: (Vec str) text: str) -> Dumped
+  (Dumped (conj lines text) 1))
+
+;; The `error` records of a failed step, in order, their positions relative to
+;; the main file `home` (`error_dump`); nothing prints when `--sections` leaves
+;; `error` out, and the status is 1 all the same.
+(defun error-dump :private (lines: (Vec str) errs: (Vec TypeError) home: str opts: Options) -> Dumped
+  (Dumped (if (wants opts SecError)
+              (reduce (fn (acc: (Vec str) e: TypeError)
+                        (push acc (str-join ["error " (error-kind-name (. e kind)) " "
+                                             (sdump/span-in (. e pos) home) ": " (. e message)])))
+                      lines errs)
+              lines)
+          1))
+
+;; The lines of the sections of every module of layout (`sections_text`).
+(defun sections-text :private (lines: (Vec str) v: View layout: (Vec Shown) opts: Options) -> (Vec str)
+  (reduce (fn (acc: (Vec str) s: Shown) (module-lines acc v s opts)) lines layout))
+
+;; Checks the expanded modules against prelude as far as opts says and prints the
+;; sections of the modules of layout, or the errors of the first failing step
+;; (`check_and_dump`).
+(defun check-and-dump :private (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx)
+                                layout: (Vec Shown) home: str opts: Options) -> Dumped
+  (match (driver/lower-modules modules prelude)
+    ((Err errs) (error-dump lines errs home opts))
+    ((Ok l)
+     (if (= (. opts stage) StLower)
+         (Dumped (sections-text lines (View (. l globals) nil) layout opts) 0)
+         (match (driver/infer-lowered l (not (. opts library)))
+           ((Err errs) (error-dump lines errs home opts))
+           ((Ok t) (Dumped (sections-text lines (View (. t globals) (some t)) layout opts) 0)))))))
+
+;; ---- a program
+
+;; The modules that have a section, in order: the prelude first with `--implicit`,
+;; then each program module (module i is id i + 2, after the builtins and the
+;; prelude), the implicit ones only with `--implicit` (`layout_of`).
+(defun layout-of :private (loaded: (Vec Loaded) opts: Options) -> (Vec Shown)
+  (loop ((i 0) (out (if (. opts implicit) [(Shown module-prelude prelude-ns "lib/prelude.fib")] [])))
+    (if (>= i (count loaded))
+        out
+        (let ((l (nth loaded i)))
+          (recur (+ i 1)
+                 (if (or (. opts implicit) (not (. l implicit)))
+                     (conj out (Shown (+ i 2) (. (. l spec) ns) (. l file)))
+                     out))))))
+
+;; The modules of loaded expanded in order in ctx, each begun, expanded and ended;
+;; the first expansion error ends the dump under its `-- module NS FILE` line.
+(defun expand-modules :private (lines: (Vec str) ctx: ExpandCtx loaded: (Vec Loaded))
+    -> (Result (Vec Expanded) Dumped)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count loaded))
+        (Ok out)
+        (let ((l (nth loaded i)))
+          (do (mods/begin-spec ctx (. l spec))
+              (match (prog/expand-program (. l forms) ctx (no-runner))
+                ((Err e) (Err (failed (conj lines (str-join ["-- module " (. (. l spec) ns) " " (. l file)]))
+                                      (expand-record e (. l file)))))
+                ((Ok forms) (do (ctx-end-module ctx)
+                                (recur (+ i 1) (conj out (Expanded (. l spec) forms)))))))))))
+
+;; The implicit modules of the dump: those of `--implicit-lib`, else the library's.
+(defun implicit-of :private (opts: Options) -> (Vec str)
+  (unwrap-or (. opts implicit-lib) (mods/implicit-lib)))
+
+;; The dump of the program whose main module is source (the file `file`)
+;; (`dump_program`).
+(defun dump-program :private (lines: (Vec str) source: str file: str opts: Options) -> Dumped
+  (let ((ctx (ctx-new)))
+    (match (driver/prelude-forms ctx)
+      ((Err m) (failed lines (record "Prelude" no-position m)))
+      ((Ok prelude)
+       (match (mods/try-load-with source file (roots-default) (implicit-of opts))
+         ((Err e) (failed lines (load-record e file)))
+         ((Ok loaded)
+          (match (expand-modules lines ctx loaded)
+            ((Err d) d)
+            ((Ok modules)
+             (check-and-dump lines modules prelude (layout-of loaded opts) file opts)))))))))
+
+;; ---- a library prelude
+
+;; The dump of source (the file `file`) as a library prelude: the expander's own
+;; prelude, then the forms of the file, expanded with no runner in the module
+;; `fib.prelude`, which is then checked alone (no `main`) (`dump_prelude`).
+(defun dump-prelude :private (lines: (Vec str) source: str file: str opts: Options) -> Dumped
+  (match (reader/read-all source file)
+    ((Err e) (failed lines (read-record e file)))
+    ((Ok lib)
+     (let ((ctx (ctx-new))
+           (head (conj lines (str-join ["-- module " prelude-ns " " file]))))
+       (match (prog/expand-prelude ctx)
+         ((Err e) (failed head (expand-record e file)))
+         ((Ok own)
+          (match (prog/expand-program lib ctx (no-runner))
+            ((Err e) (failed head (expand-record e file)))
+            ((Ok forms)
+             (check-and-dump lines [] (into own forms) [(Shown module-prelude prelude-ns file)] file
+                             (Options (. opts stage) (. opts sections) true (. opts implicit)
+                                      (. opts implicit-lib) (. opts prelude) (. opts ast)
+                                      (. opts tables)))))))))))
+
+;; What `fibref types` prints for one file: the line `== FILE`, then its dump or
+;; the line `unreadable` (the body of `types_here`'s loop).
+(defun types-file (file: str opts: Options) -> Dumped
+  (let ((header [(str-concat "== " file)]))
+    (match (read-file file)
+      (nil (Dumped (conj header "unreadable") 2))
+      ((some source)
+       (if (. opts prelude)
+           (dump-prelude header source file opts)
+           (dump-program header source file opts))))))

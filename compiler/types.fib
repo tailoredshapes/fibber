@@ -1,10 +1,22 @@
-;; compiler/types.fib: the type checker's tool (spec/bootstrap.md §5 for
-;; the layout, the plan of M6 step 3). A STUB until the driver (package
-;; P6) lands: it links every module of compiler/types/, so that
-;; `fibc build compiler/types.fib` proves every stub compiles; it prints
-;; nothing. The modules are in dependency order.
+;; compiler/types.fib: the type checker's tool, as `fibref types` (crates/fibref/src/
+;; main.rs, types_dump/mod.rs `types_files`): prints the types dump of each file named
+;; on the command line, each under a `== FILE` header (spec/bootstrap.md §6.1).
+;; The words before the files are the options of `types.args` (`--stage lower|infer`,
+;; `--sections LIST`, `--library`, `--implicit`, `--implicit-lib LIST`, `--prelude`,
+;; `--ast`, `--tables`; a lone `--` ends them). With no file, or an option that is not
+;; one, it prints a usage line to stderr, nothing to stdout, and exits 2.
+;;
+;; Exit status: 0 if every file was typed, 1 if one ended in an error record (it did not
+;; read, load, expand or check), 2 if one could not be read at all (its dump is the line
+;; `unreadable`) or the words were refused; the larger wins.
+;;
+;; The Rust tool builds the whole text and prints it at the end; this one prints each
+;; file's section as soon as it is made, which gives the same bytes and holds one file's
+;; lines in memory at a time. It links every module of compiler/types/, so that
+;; `fibc build compiler/types.fib` proves every module of the port compiles; the
+;; modules are in dependency order.
 (ns main
-  (:require [types.driver :as driver])
+  (:require [types.args :as cli] [types.dump :as dump])
   (:use types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.names types.display types.annot types.builtins types.init
         types.lower.typeform types.lower.decl types.lower.private types.lower.defaults
@@ -15,6 +27,24 @@
         types.infer.colour types.infer.solve types.infer.general types.infer.polyrec
         types.infer.deps types.infer.scc types.infer.pattern types.infer.call
         types.infer.expr types.infer.mod types.exhaust.matrix types.exhaust.show
-        types.exhaust types.program))
+        types.exhaust types.program types.driver))
 
-(defun main () -> i64 0)
+(def usage: str
+  "usage: types [--stage lower|infer] [--sections LIST] [--library] [--implicit] [--implicit-lib LIST] [--prelude] [--ast] [--tables] [--] FILE..")
+
+;; Prints the lines of a dump, each ended by a newline.
+(defun print-lines (lines: (Vec str))
+  (doseq [line lines] (println line)))
+
+;; Prints the output of each of files in order, and returns the largest status.
+(defun types-files (files: (Vec str) opts: cli/Options) -> i64
+  (reduce (fn (status: i64 file: str)
+            (let ((d (dump/types-file file opts)))
+              (do (print-lines (. d lines))
+                  (max status (. d status)))))
+          0 files))
+
+(defun main () -> i64
+  (match (cli/parse-args (args))
+    (nil (do (eprintln usage) 2))
+    ((some parsed) (types-files (. parsed files) (. parsed opts)))))

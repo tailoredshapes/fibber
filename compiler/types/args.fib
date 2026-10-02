@@ -1,0 +1,157 @@
+;; compiler/types/args.fib: the words `fibref types` and `compiler/types.fib`
+;; take before the files (spec/bootstrap.md §6.1, §6.2), as
+;; crates/fibref/src/types_dump/args.rs (`parse_args`) and the `Options`,
+;; `Stage` and `Section` of types_dump/mod.rs that it reads.
+;;
+;; The words that start with `--` before the first file are options
+;; (`--stage lower|infer`, `--sections LIST`, `--library`, `--implicit`,
+;; `--implicit-lib LIST`, `--prelude`, `--ast`, `--tables`; LIST of
+;; `--sections` section names separated by commas, of `--implicit-lib`
+;; module names separated by commas or nothing), and a lone `--` ends them,
+;; so that a file named like an option can follow it. No file, a word that
+;; is not an option, a stage or section that is not one, or a LIST with an
+;; empty name is refused (`nil`); a later option of the same name replaces
+;; an earlier one.
+;;
+;; Decided here, where the Rust is silent or the types differ:
+;; - `Option<(Options, Vec<String>)>` is `(Option ParsedArgs)`; the variants
+;;   carry a prefix (`StLower`, `SecType`): a variant's name is global.
+;; - `Options::sections` is `(Option (Vec Section))` in the order written
+;;   (Rust's `BTreeSet`): only membership is read (`wants`).
+;; - the comma lists split with `split-limit` and -1, which keeps the empty
+;;   pieces at the end as Rust's `split(',')` does (`split` drops them, as
+;;   Java's does: `type,` would be a list of one name).
+;; - `flags` (the inverse of `parse-args`, which Rust's tests round-trip)
+;;   is not ported: the tool does not need it.
+(ns types.args (:use fib.string))
+
+(defenum Stage StLower StInfer)
+(derive Eq Stage)
+
+;; What a module's section is made of, in the order it is printed.
+(defenum Section
+  SecType SecProtocol SecInstance SecFun SecDef SecExtern SecUnit SecError SecAst SecTables)
+(derive Eq Section)
+
+;; How the tool checks and what it prints.
+(defstruct Options
+  (stage: Stage
+   sections: (Option (Vec Section))   ;; `--sections LIST`; nil prints all but ast and tables
+   library: bool                      ;; `--library`: `main` is not required
+   implicit: bool                     ;; `--implicit`: the implicit modules' sections too
+   implicit-lib: (Option (Vec str))   ;; `--implicit-lib LIST`; nil keeps the library's
+   prelude: bool                      ;; `--prelude`: each file is a library prelude
+   ast: bool                          ;; `--ast`
+   tables: bool))                     ;; `--tables`
+
+;; The options and the files of the words after the tool's name.
+(defstruct ParsedArgs (opts: Options files: (Vec str)))
+
+;; Options::default(): infer, every section but ast and tables, a program
+;; with `main`, no implicit sections, the library's implicit modules.
+(defun options-default () -> Options
+  (Options StInfer nil false false nil false false false))
+
+;; ------------------------------------------------------ the sections
+
+(defun section-name (s: Section) -> str
+  (match s
+    ((SecType) "type") ((SecProtocol) "protocol") ((SecInstance) "instance")
+    ((SecFun) "fun") ((SecDef) "def") ((SecExtern) "extern") ((SecUnit) "unit")
+    ((SecError) "error") ((SecAst) "ast") ((SecTables) "tables")))
+
+(defun section-all () -> (Vec Section)
+  [SecType SecProtocol SecInstance SecFun SecDef SecExtern SecUnit SecError SecAst SecTables])
+
+(defun section-from-name (word: str) -> (Option Section)
+  (find-first (fn (s: Section) (= (section-name s) word)) (section-all)))
+
+;; Whether the dump prints section s: listed by `--sections`, or by default
+;; every one but `ast` and `tables`, which `--ast` and `--tables` add.
+(defun wants (o: Options s: Section) -> bool
+  (or (match (. o sections)
+        ((some l) (some? (find-first (fn (x: Section) (= x s)) l)))
+        (nil (not (or (= s SecAst) (= s SecTables)))))
+      (and (= s SecAst) (. o ast))
+      (and (= s SecTables) (. o tables))))
+
+;; ------------------------------------------------------ the words
+
+;; The names of a `--sections` list, nil when one is not a section.
+(defun section-list :private (list: str) -> (Option (Vec Section))
+  (let ((found (mapv section-from-name (split-limit list "," -1))))
+    (if (every? some? found) (some (mapv unwrap found)) nil)))
+
+;; The module names of a `--implicit-lib` list: none for the empty text,
+;; else one per comma, each not empty (`module_list`).
+(defun module-list :private (list: str) -> (Option (Vec str))
+  (if (= list "")
+      (some (vec-empty))
+      (let ((names (split-limit list "," -1)))
+        (if (every? (fn (n: str) (> (str-len n) 0)) names) (some names) nil))))
+
+(defun with-stage :private (o: Options word: str) -> (Option Options)
+  (let ((set (fn (s: Stage) (some (Options s (. o sections) (. o library) (. o implicit)
+                                          (. o implicit-lib) (. o prelude) (. o ast) (. o tables))))))
+    (cond ((= word "lower") (set StLower))
+          ((= word "infer") (set StInfer))
+          (else nil))))
+
+(defun with-sections :private (o: Options word: str) -> (Option Options)
+  (if-some [l (section-list word)]
+    (some (Options (. o stage) (some l) (. o library) (. o implicit)
+                   (. o implicit-lib) (. o prelude) (. o ast) (. o tables)))
+    nil))
+
+(defun with-implicit-lib :private (o: Options word: str) -> (Option Options)
+  (if-some [l (module-list word)]
+    (some (Options (. o stage) (. o sections) (. o library) (. o implicit)
+                   (some l) (. o prelude) (. o ast) (. o tables)))
+    nil))
+
+;; The options with the flag `word` set, nil when it is not a flag.
+(defun with-flag :private (o: Options word: str) -> (Option Options)
+  (let ((st (. o stage)) (se (. o sections)) (lib (. o library)) (imp (. o implicit))
+        (il (. o implicit-lib)) (pre (. o prelude)) (ast (. o ast)) (tab (. o tables)))
+    (cond ((= word "--library") (some (Options st se true imp il pre ast tab)))
+          ((= word "--implicit") (some (Options st se lib true il pre ast tab)))
+          ((= word "--prelude") (some (Options st se lib imp il true ast tab)))
+          ((= word "--ast") (some (Options st se lib imp il pre true tab)))
+          ((= word "--tables") (some (Options st se lib imp il pre ast true)))
+          (else nil))))
+
+;; The words from i on as the files, nil when there are none.
+(defun files-from :private (words: (Vec str) i: i64 o: Options) -> (Option ParsedArgs)
+  (if (< i (count words))
+      (some (ParsedArgs o (vec (drop i words))))
+      nil))
+
+;; The option at i takes the word after it: the options with it read by
+;; set, and the words from i + 2 on; nil for a word that is missing or
+;; refused.
+(defun with-value :private (words: (Vec str) i: i64 o: Options
+                            set: (fn (Options str) (Option Options)) :borrow) -> (Option ParsedArgs)
+  (if (< (+ i 1) (count words))
+      (if-some [o2 (set o (nth words (+ i 1)))]
+        (parse-from words (+ i 2) o2)
+        nil)
+      nil))
+
+;; The options from index i on, then the files (args.rs `parse_args`'s loop
+;; and its final check).
+(defun parse-from :private (words: (Vec str) i: i64 o: Options) -> (Option ParsedArgs)
+  (if (>= i (count words))
+      nil
+      (let ((w (nth words i)))
+        (cond ((= w "--") (files-from words (+ i 1) o))
+              ((= w "--stage") (with-value words i o with-stage))
+              ((= w "--sections") (with-value words i o with-sections))
+              ((= w "--implicit-lib") (with-value words i o with-implicit-lib))
+              (else (if-some [o2 (with-flag o w)]
+                      (parse-from words (+ i 1) o2)
+                      (if (starts-with? w "--") nil (files-from words i o))))))))
+
+;; The options and files of words, or nil for a word that is not an option,
+;; a stage or section that is not one, or no file (args.rs `parse_args`).
+(defun parse-args (words: (Vec str)) -> (Option ParsedArgs)
+  (parse-from words 0 (options-default)))

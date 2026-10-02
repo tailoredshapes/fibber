@@ -1,0 +1,66 @@
+;; compiler/types/dump/sections.fib: the sections of one module of the types
+;; dump (spec/bootstrap.md §6.3), as crates/fibref/src/types_dump/sections.rs
+;; (302 lines): each over a `Vec` table of the global tables in index order,
+;; filtered to the module's own definitions. The `type` section is here
+;; (package P6, the spine); the packages that own the others add their
+;; section function and one line to `module-lines`, in the order of
+;; `Section`: protocol, instance (P4), fun, def, extern (P5), unit
+;; (P10..P13), ast (P7), tables (P13).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - a section appends its lines to a `(Vec str)` (the Rust `&mut String` it
+;;   pushes to); a line is `normalise`d as Rust's `push` does, and a record
+;;   that holds a line break (an error's message) is one element.
+;; - `View` carries the typed program as an `Option`, as Rust's does.
+(ns types.dump.sections
+  (:require [syntax.dump :as sdump])
+  (:use fib.string syntax.pos types.ty types.table types.decls types.display types.program
+        types.args types.dump.normal))
+
+;; A module that has a section: its id in the tables, its `ns`, its file.
+(defstruct Shown (id: i64 ns: str file: str))
+
+;; The tables a section reads: the global tables, and the typed program when
+;; inference ran.
+(defstruct View (g: Globals typed: (Option TypedProgram)))
+
+;; Appends one record to acc, its variable ids normalised.
+(defun push (acc: (Vec str) text: str) -> (Vec str)
+  (conj acc (normalise text)))
+
+;; The line `-- module NS FILE` and the sections of the module s the options ask for.
+(defun module-lines (acc: (Vec str) v: View s: Shown opts: Options) -> (Vec str)
+  (let ((head (conj acc (str-join ["-- module " (. s ns) " " (. s file)])))
+        (types (if (wants opts SecType) (type-section head (. v g) s) head)))
+    types))
+
+;; ---- type
+
+;; `type NAME (PARAMS) struct|enum POS`, then a line per field or variant, of
+;; each type the module defines, in declaration order.
+(defun type-section (acc: (Vec str) g: Globals s: Shown) -> (Vec str)
+  (reduce (fn (a: (Vec str) d: TypeDef) (type-lines a g d (. s file)))
+          acc
+          (filterv (fn (d: TypeDef) (= (. d module) (. s id))) (table-rows (. g types)))))
+
+;; The parameters, a colour parameter as `k:colour`.
+(defun type-params :private (d: TypeDef) -> str
+  (join " " (map-indexed (fn (i: i64 p: str) (if (typedef-is-colour d i) (str-join [p ":colour"]) p))
+                         (. d params))))
+
+(defun type-lines :private (acc: (Vec str) g: Globals d: TypeDef file: str) -> (Vec str)
+  (let ((p (printer-with-names g (. d params) []))
+        (shape (match (. d shape) ((TsStruct _) "struct") ((TsEnum _) "enum")))
+        (head (push acc (str-join ["type " (. d name) " (" (type-params d) ") " shape " "
+                                   (sdump/span-in (. d pos) file)]))))
+    (match (. d shape)
+      ((TsStruct fields)
+       (reduce (fn (a: (Vec str) f: FieldDef)
+                 (push a (str-join ["  field " (. f name) " : " (printer-ty p (. f ty))])))
+               head fields))
+      ((TsEnum variants)
+       (reduce (fn (a: (Vec str) v: VariantDef)
+                 (push a (str-join ["  variant " (. v name) " ("
+                                    (join " " (mapv (fn (f: FieldDef) (printer-ty p (. f ty))) (. v fields)))
+                                    ")"])))
+               head variants)))))

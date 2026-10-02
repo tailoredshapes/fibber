@@ -1,0 +1,42 @@
+;; compiler/tests/types/unit-builtins.fib: the inline tests of crates/fibref/
+;; src/types/builtins.rs (every_builtin_has_one_escape_kind_per_parameter,
+;; names_are_unique) over the generated table of types.builtins, and the
+;; table's size and ends (the table is data copied from the Rust one).
+;; Build: fibc build compiler/tests/types/unit-builtins.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [syntax.reader :as reader])
+  (:use syntax.form types.builtins types.check))
+
+;; The number of parameters a builtin's signature `(fn (P..) R)` writes.
+(defun sig-params (sig: str) -> i64
+  (match (reader/read-all sig "<builtin>")
+    ((Err _) -1)
+    ((Ok forms)
+     (match (. (nth forms 0) kind)
+       ((SList [_ ps _]) (match (. ps kind) ((SList xs) (count xs)) (_ -1)))
+       (_ -1)))))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (t (builtin-table)))
+    (do
+      (check cs "the table has 59 rows" (= (count t) 59))
+      (check cs "cell is the first" (= (builtin-index "cell") (some 0)))
+      (check cs "release-raw is the last" (= (builtin-index "release-raw") (some 58)))
+      (check cs "an unknown name has no index" (nil? (builtin-index "no-such-builtin")))
+      (check cs "every builtin has one escape kind per parameter"
+             (every? (fn (s: BuiltinSig) (= (sig-params (. s sig)) (count (. s escapes)))) t))
+      (check cs "names are unique, each at its own index"
+             (every? (fn (i: i64) (= (builtin-index (. (nth t i) name)) (some i)))
+                     (range (count t))))
+      (check cs "spawn takes a thread" (= (. (nth t 6) escapes) [EscThread]))
+      (check cs "raw and raw-retained are unsafe with bounds"
+             (and (. (nth t 56) unsafe-only) (= (. (nth t 56) bounds) "((Object a))")
+                  (. (nth t 57) unsafe-only)))
+      (check cs "set-field!, dyn and the conversions are not builtins"
+             (and (nil? (builtin-index "set-field!")) (nil? (builtin-index "dyn"))
+                  (nil? (builtin-index "trunc"))))
+      (check cs "nine conversions" (= (count conversions) 9))
+      (check cs "the protocols text starts with Deref"
+             (starts-with? builtin-protocols "\n(defprotocol (Deref c t)"))
+      (finish cs))))

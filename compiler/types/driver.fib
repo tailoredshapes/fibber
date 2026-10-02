@@ -1,10 +1,25 @@
-;; compiler/types/driver.fib: the checker's entry points: lower the modules, then infer (package P6).
-;; Replaces crates/fibref/src/types/mod.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; compiler/types/driver.fib: the checker's entry points: lower the modules, then
+;; infer (package P6). Replaces crates/fibref/src/types/mod.rs (285 lines).
+;;
+;; Shapes decided where Rust and fibber differ (see also types.init):
+;; - Form is Stx, `&[(ModuleSpec, Vec<Form>)]` is `(Vec Expanded)`, Result is
+;;   the prelude's, an id an i64; the `HashMap<String, ModuleId>` of `lower_modules`
+;;   is a `(Map str i64)` passed down a loop.
+;; - the Rust `?` is `try-let` (`try-map` for a loop), and `map_err(|e| vec![e])`
+;;   is `errs-of`.
+;; - the Rust `thread::scope` of `CHECK_STACK` around `check_modules`, `check` and
+;;   the dump is not ported: the compiled program runs on the stack the process
+;;   has (deep programs need `ulimit -s`), and a trap is not a caught panic
+;;   (`the checker panicked`).
+;; - `prelude_forms` is `prelude-forms` of expand.program, which reads
+;;   `lib/prelude.fib` of the working directory (the Rust carries it in the
+;;   executable): `Err` is its text.
 (ns types.driver
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.lower.mod types.program expand.ctx expand.types))
+  (:require [syntax.reader :as reader] [expand.program :as prog] [expand.error :as ee])
+  (:use syntax.pos syntax.form syntax.error expand.ctx expand.types expand.error
+        types.ty types.scheme types.error types.store types.table types.ast types.decls
+        types.init types.lower.private types.lower.mod types.infer.cx types.infer.mod
+        types.program))
 
 ;; Rust `Lowered` (mod.rs:147): the globals and the items of the prelude and
 ;; of each module.
@@ -17,34 +32,126 @@
   (SeExpand message: str)
   (SeType errors: (Vec TypeError)))
 
-;; Rust: mod.rs:66 prelude_forms
+;; The prelude's forms after expansion: the expander's own prelude followed by
+;; `lib/prelude.fib`, expanded with no runner in ctx (mod.rs:66).
 (defun prelude-forms (ctx: ExpandCtx) -> (Result (Vec Stx) str)
-  (trap "todo: prelude-forms"))
+  (prog/prelude-forms ctx))
 
-;; Rust: mod.rs:76
+(defun errs-of :private (r: (Result a TypeError)) -> (Result a (Vec TypeError))
+  (match r
+    ((Ok v) (Ok v))
+    ((Err e) (Err [e]))))
+
+;; Checks a program: its module's forms after expansion, against the
+;; prelude's. Requires `main : (fn () i64)` (mod.rs:76).
 (defun check-program (forms: (Vec Stx) prelude: (Vec Stx)) -> (Result TypedProgram (Vec TypeError))
-  (trap "todo: check-program"))
+  (try-let ((l (lower-program forms prelude)))
+    (infer-lowered l true)))
 
-;; Rust: mod.rs:82 (Vec Expanded) is Vec<(ModuleSpec, Vec<Form>)>
+;; Checks a program of several modules, expanded, in dependency order with the
+;; main module last. Requires `main` (mod.rs:82).
 (defun check-modules (modules: (Vec Expanded) prelude: (Vec Stx)) -> (Result TypedProgram (Vec TypeError))
-  (trap "todo: check-modules"))
+  (try-let ((l (lower-modules modules prelude)))
+    (infer-lowered l true)))
 
-;; Rust: mod.rs:107
+;; Checks a module that need not define `main` (the prelude alone, a library)
+;; (mod.rs:107).
 (defun check-library (forms: (Vec Stx) prelude: (Vec Stx)) -> (Result TypedProgram (Vec TypeError))
-  (trap "todo: check-library"))
+  (try-let ((l (lower-program forms prelude)))
+    (infer-lowered l false)))
 
-;; Rust: mod.rs:159
+;; Steps 1 to 3 of §3.5 for the prelude and one program module with no `ns`
+;; clauses (mod.rs:159).
 (defun lower-program (forms: (Vec Stx) prelude: (Vec Stx)) -> (Result Lowered (Vec TypeError))
-  (trap "todo: lower-program"))
+  (lower-modules [(Expanded (module-spec-main) forms)] prelude))
 
-;; Rust: mod.rs:168
+;; The prelude declared (its private names marked, the builtin functions
+;; defined once its types exist) and defined: its items.
+(defun lower-prelude :private (g: Globals prelude: (Vec Stx)) -> (Result ModuleItems (Vec TypeError))
+  (let (([forms private] (strip-private prelude)))
+    (try-let ((d (declare g module-prelude forms)))
+      (do (mark-private g module-prelude private)
+          (try-let ((done (errs-of (finish-builtins g))))
+            (define g d))))))
+
+;; One program module added to g, linked to the modules before it, declared and
+;; defined: its id and items.
+(defun lower-module :private (g: Globals e: Expanded ids: (Map str i64))
+    -> (Result (Pair i64 ModuleItems) (Vec TypeError))
+  (try-let ((m (add-linked g (. e spec) ids (. e forms))))
+    (do (set! (. g main) m)
+        (let (([forms private] (strip-private (. e forms))))
+          (try-let ((d (declare g m forms)))
+            (do (mark-private g m private)
+                (try-let ((items (define g d)))
+                  (Ok (Pair m items)))))))))
+
+;; The items of each of modules in order, each lowered against the ones before it.
+(defun lower-each :private (g: Globals modules: (Vec Expanded)) -> (Result (Vec ModuleItems) (Vec TypeError))
+  (loop ((i 0) (ids (map-empty)) (items (vec-empty)))
+    (if (>= i (count modules))
+        (Ok items)
+        (let ((e (nth modules i)))
+          (match (lower-module g e ids)
+            ((Err es) (Err es))
+            ((Ok [m its]) (recur (+ i 1) (assoc ids (. (. e spec) ns) m) (conj items its))))))))
+
+;; Steps 1 to 3 of §3.5 for the prelude and the program's modules, given in
+;; dependency order with the main module last: each is declared against the ones
+;; before it, sees its `:use`s unqualified, its implicit modules after them and
+;; its `:require`s by alias, and the last defines `main` (mod.rs:168).
 (defun lower-modules (modules: (Vec Expanded) prelude: (Vec Stx)) -> (Result Lowered (Vec TypeError))
-  (trap "todo: lower-modules"))
+  (try-let ((g (errs-of (new-globals)))
+            (prelude-items (lower-prelude g prelude))
+            (items (lower-each g modules)))
+    (Ok (Lowered g prelude-items items))))
 
-;; Rust: mod.rs:243
+;; Adds the module `spec` describes (whose forms are `forms`) to g, linked to the
+;; modules `ids` of the program that came before it (mod.rs:197): a module it
+;; names that is not loaded is an error at the module's first form.
+(defun add-linked (g: Globals spec: ModuleSpec ids: (Map str i64) forms: (Vec Stx))
+    -> (Result i64 (Vec TypeError))
+  (let ((pos (if-some [f (first forms)] (. f pos) (types.init/builtin-pos)))
+        (loaded (fn (ns: str)
+                  (if-some [m (get ids ns)]
+                    (Ok m)
+                    (Err [(type-error-other pos (str-join ["module " ns " is not loaded"]))])))))
+    (try-let ((required (try-map (fn (r: Require) (loaded (. r ns))) (. spec requires)))
+              (uses (try-map loaded (. spec uses)))
+              (implicit (try-map loaded (. spec implicit))))
+      (Ok (g-add-module g (. spec ns)
+                        (Links uses (vec (keep (fn (ns: str) (get ids ns)) (. spec exports))) implicit)
+                        (zipmap (mapv (fn (r: Require) (. r alias)) (. spec requires)) required))))))
+
+;; Steps 4 to 7 of §3.5 on a lowered program; with `main`, requires `main :
+;; (fn () i64)` (mod.rs:243).
 (defun infer-lowered (l: Lowered main: bool) -> (Result TypedProgram (Vec TypeError))
-  (trap "todo: infer-lowered"))
+  (let ((g (. l globals))
+        (ck (checker-new (. l globals))))
+    (do (checker-module ck (. l prelude))
+        (doseq [items (. l modules)] (checker-module ck items))
+        (when main (checker-check-main ck))
+        (if (empty? @(. ck errors))
+            (Ok (program-new g (. ck env) (. ck t) @(. ck order)))
+            (Err @(. ck errors))))))
 
-;; Rust: mod.rs:278
+;; The text of a read error: `FILE:L:C: MESSAGE`.
+(defun read-error-text :private (e: ReadError) -> str
+  (str-join [(ee/pos-display (. e pos)) ": " (err-message (. e kind))]))
+
+;; Reads, expands and checks `source` (the file `file`) as the user module,
+;; with the prelude: the whole front end, for tests and tools (mod.rs:278).
 (defun check-source (source: str file: str) -> (Result TypedProgram SourceError)
-  (trap "todo: check-source"))
+  (let ((ctx (ctx-new)))
+    (match (prelude-forms ctx)
+      ((Err m) (Err (SePrelude m)))
+      ((Ok prelude)
+       (match (reader/read-all source file)
+         ((Err e) (Err (SeRead (read-error-text e))))
+         ((Ok forms)
+          (match (prog/expand-program forms ctx (no-runner))
+            ((Err e) (Err (SeExpand (expand-error-text e))))
+            ((Ok expanded)
+             (match (check-program expanded prelude)
+               ((Ok t) (Ok t))
+               ((Err es) (Err (SeType es))))))))))))

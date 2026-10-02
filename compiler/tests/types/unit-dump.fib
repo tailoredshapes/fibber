@@ -1,0 +1,64 @@
+;; compiler/tests/types/unit-dump.fib: the `type` section of types.dump.sections
+;; (crates/fibref/src/types_dump/sections.rs `types`) over tables built by hand, the
+;; format of spec/bootstrap.md §6.3, §6.5: `type NAME (PARAMS) struct|enum POS` with a
+;; colour parameter as `k:colour`, a `field` or `variant` line each, only the types of
+;; the module shown, in table order, and the module header line; and that a section the
+;; options leave out is not printed. (The lowering that makes the tables is P3's: this
+;; test does not need it.)
+;; Build: fibc build compiler/tests/types/unit-dump.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [types.args :as a] [types.dump.sections :as s])
+  (:use syntax.pos types.ty types.table types.decls types.program types.check))
+
+(defun module (g: Globals ns: str) -> i64
+  (g-add-module g ns (Links [] [] []) (map-empty)))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (g (globals-new)))
+    (do
+      (module g "the builtins") (module g "fib.prelude")
+      (let ((m (module g "main"))
+            (other (module g "other")))
+        (do
+          (table-add (. g types)
+                     (TypeDef "Sq" m [] [] (TsStruct [(FieldDef "n" (ty-i64))]) (Pos "t.fib" 1 1 0 23)))
+          (table-add (. g types)
+                     (TypeDef "Hidden" other [] [] (TsStruct []) (Pos "u.fib" 1 1 0 5)))
+          (table-add (. g types)
+                     (TypeDef "Shape" m [] []
+                              (TsEnum [(VariantDef "Circle" [(FieldDef "r" (ty-i64))])
+                                       (VariantDef "Rect" [(FieldDef "w" (ty-i64)) (FieldDef "h" (ty-i64))])
+                                       (VariantDef "Empty" [])])
+                              (Pos "t.fib" 2 1 24 82)))
+          (table-add (. g types)
+                     (TypeDef "Wrap" m ["a" "k"] [false true]
+                              (TsEnum [(VariantDef "Mk" [(FieldDef "v" (TGen 0))])])
+                              (Pos "<prelude>" 4 2 10 30)))
+          (let ((view (s/View g nil))
+                (shown (s/Shown m "main" "t.fib"))
+                (opts (a/options-default)))
+            (do
+              (check cs "the module's types, in order, with their fields and variants"
+                     (= (s/module-lines [] view shown opts)
+                        ["-- module main t.fib"
+                         "type Sq () struct 1:1 0..23"
+                         "  field n : i64"
+                         "type Shape () enum 2:1 24..82"
+                         "  variant Circle (i64)"
+                         "  variant Rect (i64 i64)"
+                         "  variant Empty ()"
+                         "type Wrap (a k:colour) enum 4:2 10..30@<prelude>"
+                         "  variant Mk (a)"]))
+              (check cs "another module's types are its own"
+                     (= (s/module-lines [] view (s/Shown other "other" "u.fib") opts)
+                        ["-- module other u.fib" "type Hidden () struct 1:1 0..5"]))
+              (check cs "a module with no type has the header only"
+                     (= (s/module-lines [] view (s/Shown 1 "fib.prelude" "lib/prelude.fib") opts)
+                        ["-- module fib.prelude lib/prelude.fib"]))
+              (check cs "--sections without type prints the header only"
+                     (= (s/module-lines [] view shown (. (unwrap (a/parse-args ["--sections" "error" "f"])) opts))
+                        ["-- module main t.fib"]))
+              (check cs "the lines are appended to what is there"
+                     (= (s/module-lines ["x"] view (s/Shown 1 "p" "f") opts) ["x" "-- module p f"]))))))
+      (finish cs))))

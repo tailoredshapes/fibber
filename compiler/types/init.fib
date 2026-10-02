@@ -1,19 +1,247 @@
-;; compiler/types/init.fib: the builtin module and the globals at start (package P6).
-;; Replaces crates/fibref/src/types/init.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; compiler/types/init.fib: the builtin module and the globals at start (package
+;; P6), as crates/fibref/src/types/init.rs (289 lines of Rust): the built-in enums
+;; `Option` and `Form` (§1.5, syntax §3.16), the built-in protocols with their
+;; instances (§2.9, §2.12), and the builtin functions of the table in
+;; types.builtins.
+;;
+;; Shapes decided where Rust and fibber differ (see also types.decls):
+;; - `TResult<T>` is `(Result T TypeError)`; the Rust `?` over a sequence is
+;;   `try-let`, over a loop `try-each` and `try-map` (public here: types.driver
+;;   uses them too: no early return in the language).
+;; - `ExpandCtx::new()` is `ctx-new`; its `enum_info` is `ctx-enum-info`.
+;; - the Rust `GenEnv::default()` is `gen-env-new`, whose `names` and `colours`
+;;   are Cells (types.annot).
+;; - `Scalar::ALL` is `scalar-all` (the order of the instances: it is the
+;;   order of `Globals::instances`, which the dump prints).
 (ns types.init
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.builtins))
+  (:require [syntax.reader :as reader] [expand.ctx :as ctx] [expand.error :as ee]
+            [expand.types :as ex])
+  (:use syntax.pos syntax.form syntax.error types.ty types.scheme types.error types.store
+        types.table types.ast types.decls types.builtins types.names types.display types.annot
+        types.lower.typeform types.lower.decl types.lower.protos))
 
-;; Rust: init.rs:25
+;; ---- the Rust `?` over a loop
+
+;; The `Ok` values of f over xs in order, or the first `Err`.
+(defun try-map (f: (fn (a) (Result b e)) xs: (Vec a)) -> (Result (Vec b) e)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count xs))
+        (match (f (nth xs i))
+          ((Ok v) (recur (+ i 1) (conj out v)))
+          ((Err e) (Err e)))
+        (Ok out))))
+
+;; f over xs in order for its effect, stopping at the first `Err`.
+(defun try-each (f: (fn (a) (Result unit e)) xs: (Vec a)) -> (Result unit e)
+  (match (try-map f xs)
+    ((Ok _) (Ok ()))
+    ((Err e) (Err e))))
+
+;; The position of built-in definitions (init.rs:25).
 (defun builtin-pos () -> Pos
-  (trap "todo: builtin-pos"))
+  (Pos "<builtin>" 0 0 0 0))
 
-;; Rust: init.rs:36
+(defun other-error :private (message: str) -> TypeError
+  (type-error-other (builtin-pos) message))
+
+;; The text of a read error: `FILE:L:C: MESSAGE` (its `Display`).
+(defun read-error-text :private (e: ReadError) -> str
+  (str-join [(ee/pos-display (. e pos)) ": " (err-message (. e kind))]))
+
+;; ---- the builtin enums
+
+;; The symbols of the parameter forms of an enum, as text.
+(defun symbol-names :private (params: (Vec Stx)) -> (Vec str)
+  (vec (keep (fn (p: Stx) (match (. p kind) ((SSym n) (some n)) (_ nil))) params)))
+
+;; Declares `Option` or `Form` with its variant names (fields later), as
+;; the expander has it; the variants but `nil` are values of the builtins.
+(defun declare-builtin-enum :private (g: Globals name: str) -> (Result i64 TypeError)
+  (match (ctx/ctx-enum-info (ctx/ctx-new) name)
+    (nil (Err (other-error (str-join ["the expander has no " name]))))
+    ((some info)
+     (let ((id (table-count (. g types)))
+           (names (g-names g module-builtin)))
+       (do (table-add (. g types)
+                      (TypeDef name module-builtin (symbol-names (. info params)) [] (TsEnum [])
+                               (builtin-pos)))
+           (set! (. names types) (assoc @(. names types) name id))
+           (try-let ((done (try-each (fn ([i v]) (define-ctor g id i v))
+                                     (vec (zip (range (count (. info variants))) (. info variants))))))
+             (Ok id)))))))
+
+;; The value a variant but `nil` defines in the builtins.
+(defun define-ctor :private (g: Globals id: i64 i: i64 v: ex/VariantInfo) -> (Result unit TypeError)
+  (if (= (. v name) "nil")
+      (Ok ())
+      (define-value g module-builtin (. v name) (GCtor id (some i)) (builtin-pos))))
+
+;; ---- the builtin protocols and their instances
+
+(defun builtin-protocols-in :private (g: Globals) -> (Result unit TypeError)
+  (match (reader/read-all builtin-protocols "<builtin>")
+    ((Err e) (Err (other-error (str-join ["builtin protocols: " (read-error-text e)]))))
+    ((Ok forms)
+     (try-let ((done (try-each (fn (form: Stx)
+                                 (try-let ((id (declare-proto g module-builtin form)))
+                                   (resolve-proto g module-builtin id form)))
+                               forms)))
+       (do (set! (. g deref-proto) (g-proto-name g module-builtin "Deref"))
+           (Ok ()))))))
+
+;; Registers the instance of the builtin protocol `proto` at `con`, over
+;; `vars` variables, with the determined arguments `dets`.
+(defun add-instance :private (g: Globals proto: str con: Con vars: i64 dets: (Vec Ty)) -> (Result unit TypeError)
+  (match (g-proto-name g module-builtin proto)
+    (nil (Err (other-error (str-join ["no builtin protocol " proto]))))
+    ((some p)
+     (match (register-instance g (InstanceDef p con module-builtin
+                                              (mapv letter-name (range vars))
+                                              (TCon con (mapv (fn (i: i64) (TGen i)) (range vars))) dets [] [] (builtin-pos)))
+       ((Ok _) (Ok ()))
+       ((Err e) (Err e))))))
+
+;; The plain instances of a scalar, in order: `Eq`, `Ord`, `Hash`, `Show`
+;; for every one, `Num` for the integers and floats, `Float` for the
+;; floats, `Bits` for the integers (§2.12).
+(defun scalar-instances :private (s: Scalar) -> (Vec (Pair str Con))
+  (let ((con (KScalar s))
+        (is-int (scalar-is-int s))
+        (is-float (scalar-is-float s)))
+    (mapv (fn (p: str) (Pair p con))
+          (into (into (into ["Eq" "Ord" "Hash" "Show"] (if (or is-int is-float) ["Num"] []))
+                      (if is-float ["Float"] []))
+                (if is-int ["Bits"] [])))))
+
+;; `Num`, `Float`, `Bits`, `Eq`, `Ord`, `Hash`, `Show` for the scalars and
+;; `str` (§2.12); `Deref` for `Cell`, `Atom`, `Weak` and `Task` (§2.9).
+(defun builtin-instances :private (g: Globals) -> (Result unit TypeError)
+  (let ((plain (vec (concat (mapcat scalar-instances (scalar-all))
+                            (mapv (fn (p: str) (Pair p KStr)) ["Eq" "Ord" "Hash" "Show"]))))
+        (opt (ty-nominal @(. g option) [(TGen 0)])))
+    (try-let ((a (try-each (fn ([p con]) (add-instance g p con 0 [])) plain))
+              (b (add-instance g "Deref" KCell 1 [(TGen 0)]))
+              (c (add-instance g "Deref" KAtom 1 [(TGen 0)]))
+              (d (add-instance g "Deref" KTask 1 [(TGen 0)])))
+      (add-instance g "Deref" KWeak 1 [opt]))))
+
+;; ---- the globals at start
+
+(defun builtin-module :private (ns: str chain: (Vec i64)) -> ModuleInfo
+  (ModuleInfo ns (names-new) chain [] [] [] (map-empty)))
+
+;; The type d with another shape.
+(defun with-shape :private (d: TypeDef shape: TypeShape) -> TypeDef
+  (TypeDef (. d name) (. d module) (. d params) (. d colours) shape (. d pos)))
+
+;; Option's variants: `nil` and `some` with one field `v` of type `(TGen 0)`.
+(defun option-shape :private () -> TypeShape
+  (TsEnum [(VariantDef "nil" []) (VariantDef "some" [(FieldDef "v" (TGen 0))])]))
+
+;; Tables holding the builtin module, before the prelude (init.rs:36).
 (defun new-globals () -> (Result Globals TypeError)
-  (trap "todo: new-globals"))
+  (let ((g (globals-new)))
+    (do (table-add (. g modules) (builtin-module "the builtins" [module-builtin]))
+        (table-add (. g modules) (builtin-module ctx/prelude-ns [module-prelude module-builtin]))
+        (try-let ((o (declare-builtin-enum g "Option"))
+                  (form (declare-builtin-enum g "Form")))
+          (do (set! (. g form) (some form))
+              (table-set (. g types) 0 (with-shape (g-ty g 0) (option-shape)))
+              (try-let ((p (builtin-protocols-in g))
+                        (i (builtin-instances g)))
+                (Ok g)))))))
 
-;; Rust: init.rs:196
+;; ---- after the prelude's types are declared
+
+;; `Form`'s variants with the types of their fields, which mention the
+;; prelude's `Vec` (init.rs `form_fields`).
+(defun form-fields :private (g: Globals) -> (Result unit TypeError)
+  (if-some [info (ctx/ctx-enum-info (ctx/ctx-new) "Form")]
+    (if-some [form @(. g form)]
+      (try-let ((variants (try-map (fn (v: ex/VariantInfo) (variant-def g v)) (. info variants))))
+        (Ok (table-set (. g types) form (with-shape (g-ty g form) (TsEnum variants)))))
+      (Ok ()))
+    (Ok ())))
+
+(defun variant-def :private (g: Globals v: ex/VariantInfo) -> (Result VariantDef TypeError)
+  (try-let ((fields (try-map (fn ([i f]) (field-def g i f))
+                             (vec (zip (range (count (. v fields))) (. v fields))))))
+    (Ok (VariantDef (. v name) fields))))
+
+(defun field-def :private (g: Globals i: i64 f: ex/VariantField) -> (Result FieldDef TypeError)
+  (try-let ((ann (type-ann g module-prelude (. f ty) false))
+            (ty (ann-to-ty ann (gen-env-new) (. (. f ty) pos))))
+    (Ok (FieldDef (unwrap-or (. f name) (show i)) ty))))
+
+;; Defines the builtin functions of the table and `Form`'s fields (init.rs:196).
 (defun finish-builtins (g: Globals) -> (Result unit TypeError)
-  (trap "todo: finish-builtins"))
+  (do (set! (. g vec) (g-type-name g module-prelude "Vec"))
+      (try-let ((fields (form-fields g)))
+        (try-each (fn ([i sig]) (define-builtin g i sig))
+                  (vec (zip (range (count (builtin-table))) (builtin-table)))))))
+
+;; Adds the scheme of the builtin `sig` and defines its name.
+(defun define-builtin :private (g: Globals i: i64 sig: BuiltinSig) -> (Result unit TypeError)
+  (match (builtin-scheme g (. sig sig) (. sig bounds))
+    ((Err e) (Err (other-error (str-join ["builtin " (. sig name) ": " (. e message)]))))
+    ((Ok scheme)
+     (do (table-add (. g builtin-schemes) scheme)
+         (define-value g module-builtin (. sig name) (GBuiltin i) (builtin-pos))))))
+
+;; ---- the signature text of a builtin
+
+;; The `(& T)` of a parameter: its type form and whether it is `&`.
+(defun amp-param :private (p: Stx) -> (Pair Stx bool)
+  (match (. p kind)
+    ((SList [h t]) (match (. h kind)
+                     ((SSym n) (if (= n "&") (Pair t true) (Pair p false)))
+                     (_ (Pair p false))))
+    (_ (Pair p false))))
+
+(defun malformed :private (sig: str) -> TypeError
+  (other-error (str-join ["malformed builtin signature " sig])))
+
+(defun read-text :private (s: str) -> (Result (Vec Stx) TypeError)
+  (match (reader/read-all s "<builtin>")
+    ((Err e) (Err (other-error (read-error-text e))))
+    ((Ok forms) (Ok forms))))
+
+(defun list-items :private (f: Stx) -> (Option (Vec Stx))
+  (match (. f kind) ((SList items) (some items)) (_ nil)))
+
+(defun form-ty :private (g: Globals env: GenEnv t: Stx) -> (Result Ty TypeError)
+  (try-let ((ann (type-ann g module-prelude t false)))
+    (ann-to-ty ann env (builtin-pos))))
+
+;; The predicates of a builtin's bounds `((C T..) ..)`.
+(defun bound-preds :private (g: Globals env: GenEnv sig: str bounds: str) -> (Result (Vec Pred) TypeError)
+  (try-let ((forms (read-text bounds)))
+    (try-map (fn (c: Stx)
+               (match (list-items c)
+                 (nil (Err (malformed sig)))
+                 ((some [head & args])
+                  (match (. head kind)
+                    ((SSym name) (try-let ((tys (try-map (fn (t: Stx) (form-ty g env t)) args)))
+                                   (pred-of g module-builtin name tys (builtin-pos))))
+                    (_ (Err (malformed sig)))))
+                 ((some _) (Err (malformed sig)))))
+             (unwrap-or (and-then list-items (first forms)) []))))
+
+;; Parses `(fn (P..) R)` with `(& T)` positions, and `((C T..) ..)`
+;; (init.rs `builtin_scheme`).
+(defun builtin-scheme :private (g: Globals sig: str bounds: str) -> (Result Scheme TypeError)
+  (try-let ((forms (read-text sig)))
+    (match (and-then list-items (first forms))
+      ((some [_ params ret])
+       (match (list-items params)
+         (nil (Err (malformed sig)))
+         ((some ps)
+          (let ((env (gen-env-new))
+                (marked (mapv amp-param ps)))
+            (try-let ((tys (try-map (fn (m: (Pair Stx bool)) (form-ty g env (. m fst))) marked))
+                      (r (form-ty g env ret))
+                      (preds (bound-preds g env sig bounds)))
+              (Ok (Scheme (count @(. env names)) @(. env colours) @(. env names) preds []
+                          (TFn CSend tys r) (mapv (fn (m: (Pair Stx bool)) (. m snd)) marked)
+                          (mapv (fn (i: i64) (show (+ i 1))) (range (count tys))))))))))
+      (_ (Err (malformed sig))))))

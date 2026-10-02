@@ -1,0 +1,78 @@
+;; compiler/tests/types/unit-args.fib: the inline tests of crates/fibref/src/
+;; types_dump/args.rs (options come before one or more files; no file, an
+;; unknown option, stage or section are refused; a file named like an option
+;; follows `--` or a file; `wants`) and of normal.rs (normalise), over
+;; types.args and types.dump.normal.
+;; Build: fibc build compiler/tests/types/unit-args.fib -I compiler -I lib -o OUT
+(ns main (:require [types.args :as a] [types.dump.normal :as n]) (:use types.check))
+
+(defun parsed (words: (Vec str)) -> (Option a/ParsedArgs) (a/parse-args words))
+
+(defun refused (cs: Checks words: (Vec str)) -> unit
+  (check cs (str-join ["refused " (str-join words)]) (nil? (parsed words))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (let ((all (parsed ["--stage" "lower" "--sections" "type,error" "--library" "--implicit"
+                          "--implicit-lib" "fib.a,fib.b" "--prelude" "--ast" "--tables" "a.fib" "b.fib"])))
+        (do (check cs "all options" (some? all))
+            (if-some [p all]
+              (let ((o (. p opts)))
+                (do (check cs "files" (= (. p files) ["a.fib" "b.fib"]))
+                    (check cs "stage" (= (. o stage) a/StLower))
+                    (check cs "sections" (= (. o sections) (some [a/SecType a/SecError])))
+                    (check cs "flags" (and (. o library) (. o implicit) (. o prelude) (. o ast) (. o tables)))
+                    (check cs "implicit-lib" (= (. o implicit-lib) (some ["fib.a" "fib.b"])))))
+              ())))
+      (let ((d (parsed ["a.fib"])))
+        (check cs "no options is the default" (and (some? d) (= (. (unwrap d) files) ["a.fib"])
+                                                   (= (. (. (unwrap d) opts) stage) a/StInfer)
+                                                   (nil? (. (. (unwrap d) opts) sections)))))
+      (refused cs (vec-empty))
+      (refused cs ["--stage" "lower"])
+      (refused cs ["--bogus" "a.fib"])
+      (refused cs ["--stage" "middle" "a.fib"])
+      (refused cs ["--stage"])
+      (refused cs ["--sections" "type,nope" "a.fib"])
+      (refused cs ["--sections" "type,,fun" "a.fib"])
+      (refused cs ["--sections" "type," "a.fib"])
+      (refused cs ["--sections" "" "a.fib"])
+      (refused cs ["--implicit-lib" "fib.a,,fib.b" "a.fib"])
+      (refused cs ["--implicit-lib"])
+      (refused cs ["--"])
+      (check cs "-- ends the options"
+             (= (. (unwrap (parsed ["--" "--ast"])) files) ["--ast"]))
+      (check cs "a file ends the options"
+             (= (. (unwrap (parsed ["a.fib" "--ast"])) files) ["a.fib" "--ast"]))
+      (check cs "an empty implicit-lib is no library"
+             (= (. (. (unwrap (parsed ["--implicit-lib" "" "f"])) opts) implicit-lib) (some (vec-empty))))
+      (check cs "a later --stage wins"
+             (= (. (. (unwrap (parsed ["--stage" "lower" "--stage" "infer" "f"])) opts) stage) a/StInfer))
+      (let ((plain (a/options-default))
+            (only (. (unwrap (parsed ["--sections" "fun,tables" "f"])) opts))
+            (ast (. (unwrap (parsed ["--sections" "type" "--ast" "f"])) opts)))
+        (do (check cs "by default every section but ast and tables"
+                   (and (every? (fn (s: a/Section) (a/wants plain s)) (take 8 (a/section-all)))
+                        (not (a/wants plain a/SecAst)) (not (a/wants plain a/SecTables))))
+            (check cs "--sections lists only those" (and (a/wants only a/SecFun) (a/wants only a/SecTables)
+                                                         (not (a/wants only a/SecType)) (not (a/wants only a/SecAst))))
+            (check cs "--ast adds to --sections" (and (a/wants ast a/SecAst) (a/wants ast a/SecType)
+                                                      (not (a/wants ast a/SecFun))))))
+      (check cs "section names round-trip"
+             (every? (fn (s: a/Section) (= (a/section-from-name (a/section-name s)) (some s))) (a/section-all)))
+      ;; normal.rs: the variables are renumbered by first occurrence, the two kinds apart
+      (check cs "text without a variable is as it is" (= (n/normalise "(fn (a) a)") "(fn (a) a)"))
+      (check cs "type variables renumbered" (= (n/normalise "(Vec ?40) and ?7 ?40") "(Vec ?1) and ?2 ?1"))
+      (check cs "colour variables renumbered apart"
+             (= (n/normalise "(fn ?ς40 (?5) ?ς9) ?ς40") "(fn ?ς1 (?1) ?ς2) ?ς1"))
+      (check cs "only whole tokens are variables"
+             (= (n/normalise "a?7 ?7x ?ς ? ?ς7a (?7) \"?7\" x,?3") "a?7 ?7x ?ς ? ?ς7a (?1) \"?1\" x,?2"))
+      (check cs "the Rust example: both kinds, a break after a comma"
+             (= (n/normalise "?ς7 ⊑ ?ς12 and ?ς7, ?9 then ?4 ?9") "?ς1 ⊑ ?ς2 and ?ς1, ?1 then ?2 ?1"))
+      (check cs "more tokens that are not variables"
+             (every? (fn (s: str) (= (n/normalise s) s)) ["a?7" "?7x" "?ς" "?" "x ?ςa" "??7" "ς7" "?-7"]))
+      (check cs "a line break breaks a token" (= (n/normalise "a ?3\n?5 ?3") "a ?1\n?2 ?1"))
+      (check cs "a variable ends the text" (= (n/normalise "x ?12") "x ?1"))
+      (check cs "a variable starts the text" (= (n/normalise "?12 ?3") "?1 ?2"))
+      (finish cs))))

@@ -1,0 +1,59 @@
+;; compiler/types/dump/normal.fib: the renumbering of variable ids of the
+;; types dump (spec/bootstrap.md §6.4), as crates/fibref/src/types_dump/
+;; normal.rs: the checker prints an unsolved colour variable as `?ς7` and a
+;; type variable as `?7`, with the number the order of allocation gave it,
+;; which a port that allocates in another order would not reproduce. The dump
+;; prints them renumbered by first occurrence within each record.
+(ns types.dump.normal (:require [fib.char :as char]))
+
+;; The characters that end a token: whitespace, a parenthesis, bracket,
+;; brace, quotation mark, comma, quote, backquote or semicolon.
+(defun break? :private (c: char) -> bool
+  (or (char/whitespace? c)
+      (some? (str-find "()[]{}\",'`;" (char->str c) 0))))
+
+;; The variable whose digits (after an optional `ς`) start at `at`: whether
+;; it is a colour, its digits and where it ends; nil when there is none or
+;; it is not a whole token.
+(defun variable :private (cs: (Vec char) at: i64) -> (Option (Triple bool str i64))
+  (let ((n (count cs))
+        (colour (and (< at n) (= (char->i32 (nth cs at)) 962i32)))
+        (from (if colour (+ at 1) at))
+        (end (loop ((j from))
+               (if (and (< j n) (char/digit? (nth cs j))) (recur (+ j 1)) j))))
+    (if (and (> end from) (or (>= end n) (break? (nth cs end))))
+        (some (Triple colour (str-join (mapv char->str (take (- end from) (drop from cs)))) end))
+        nil)))
+
+;; Where digits are in seen, plus one; seen with them added when they are new.
+(defun number-of :private (seen: (Vec str) digits: str) -> (Pair i64 (Vec str))
+  (let ((at (loop ((j 0))
+              (cond ((>= j (count seen)) nil)
+                    ((= (nth seen j) digits) (some j))
+                    (else (recur (+ j 1)))))))
+    (if-some [k at]
+      (Pair (+ k 1) seen)
+      (Pair (+ (count seen) 1) (conj seen digits)))))
+
+;; text with each colour variable `?ςN` and type variable `?N` renamed
+;; `?ς1`, `?ς2`, .. and `?1`, `?2`, .. in the order of their first occurrence
+;; (the two kinds count apart). A variable is a whole token: it starts the
+;; text or follows a break, and ends the text or is followed by one; anything
+;; else (`a?7`, `?7x`, `?ς`) is left as it is.
+(defun normalise (text: str) -> str
+  (if (nil? (str-find text "?" 0))
+      text
+      (let ((cs (str-chars text))
+            (n (count cs)))
+        (loop ((i 0) (out (vec-empty)) (colours (vec-empty)) (types (vec-empty)))
+          (if (>= i n)
+              (str-join out)
+              (let ((c (nth cs i))
+                    (v (if (and (= (char->i32 c) 63i32) (or (= i 0) (break? (nth cs (- i 1)))))
+                           (variable cs (+ i 1))
+                           nil)))
+                (if-some [[colour digits end] v]
+                  (let (([k seen] (number-of (if colour colours types) digits)))
+                    (recur end (conj out (str-join [(if colour "?ς" "?") (show k)]))
+                           (if colour seen colours) (if colour types seen)))
+                  (recur (+ i 1) (conj out (char->str c)) colours types))))))))
