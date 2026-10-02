@@ -1,0 +1,30 @@
+;; spec:   stdlib §2.7 (the table: a record and an enum variant under `println`), §7 L17, §4.14 (row print-str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: print-str println-str
+;; open:   L17
+;; The page's table says `(println r)` of a record of module m is `#m.P{:x 1, :y x}` (the string field
+;; bare: Show leaves strings bare at every depth) and that an enum variant with fields is a record of the
+;; variant, `#m.Done{:v 3}`. The code gives the derived Show of the builtin, `(P 1 x)` (spec §7 L17 says
+;; so itself: "derived Show prints `(P 1 x)`, and the page's text is `#m.P{:x 1, :y x}`"; the table's row
+;; and `defrecord`'s judge in the plan, `(println r)` is `#main.P{:x 1, :y a}`, both rest on it). The
+;; derived Debug and ToStr do print the record text (cases 810 to 817 and 2950), so only the Show half is
+;; open. This case is the page's text for the twins `print-str` and `println-str`; it passes the day a
+;; derived Show writes the record text, and whoever lands that removes the label. Not changed here: the
+;; spec and the code disagree and the plan gives the derive to no package (a report to the lead).
+(ns main (:use tl.check))
+
+(defstruct P (x: i64 y: str))
+(derive Show P)
+(defenum Ev (Done v: i64) (Idle))
+(derive Show Ev)
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (print-str (P 1 "x")) "#main.P{:x 1, :y x}"))
+        (check c (= (println-str (P 1 "x")) "#main.P{:x 1, :y x}\n"))
+        (check c (= (print-str (Done 3)) "#main.Done{:v 3}"))
+        (check c (= (print-str [(P 1 "a")]) "[#main.P{:x 1, :y a}]"))
+        (checks-result c))))

@@ -1,0 +1,56 @@
+;; spec:   stdlib §2.7 (the table of the three printers, the `println` column), §2.10 (the function twins), §4.14 (row print-str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: print-str
+;; `print-str` in value position is the function twin of the macro; it takes one argument and gives the Show
+;; text, the text `print` would write: a string bare at every depth, a char as itself, a keyword as it is,
+;; an empty `Option` as `nil` and a present one as its payload, the seqs in parentheses, a Vec, a Pair and a
+;; Triple in brackets, a Set in `#{}` and a Map in `{k v, k v}`. The Show text of a record and of an enum
+;; variant with fields is case 2952's, which is open: the derived Show of the code is `(P 1 x)` and the
+;; page's text is `#main.P{:x 1, :y x}` (spec §7 L17). The checks that differ from case 2950's are the ones
+;; that tell Show from Debug: a quoted string is bare here, a char is not in its reader form, and a
+;; string inside a collection is bare at every depth. A Set or Map of two elements accepts either order.
+(ns main (:use tl.check))
+
+(defun via (f: (fn (a) str) x: a) -> str (f x))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Option i64) nil)
+        (s2 (conj (conj (set-empty) 1) 2))
+        (m2 (assoc (assoc (map-empty) 1 2) 3 4))
+        (texts (vec (map print-str ["a" "b\"c"])))
+        (kinds (vec (map print-str [1 2]))))
+    (do (check c (= (print-str "a") "a"))
+        (check c (= (print-str "") ""))
+        (check c (= (print-str "a\nb") "a\nb"))
+        (check c (= (print-str ["a" "b"]) "[a b]"))
+        (check c (= (print-str [["a"] ["b" "c"]]) "[[a] [b c]]"))
+        (check c (= (print-str \a) "a"))
+        (check c (= (print-str \space) " "))
+        (check c (= (print-str :k) ":k"))
+        (check c (= (print-str [:a :b]) "[:a :b]"))
+        (check c (= (print-str none) "nil"))
+        (check c (= (print-str (some "a")) "a"))
+        (check c (= (print-str (some 3)) "3"))
+        (check c (= (print-str (list 1 2)) "(1 2)"))
+        (check c (= (print-str (list "a")) "(a)"))
+        (check c (= (print-str (range 1 3)) "(1 2)"))
+        (check c (= (print-str (map inc [1 2])) "(2 3)"))
+        (check c (= (print-str (rest [0 1 2])) "(1 2)"))
+        (check c (= (print-str (rest ["a" "b"])) "(b)"))
+        (check c (= (print-str [1 2]) "[1 2]"))
+        (check c (= (print-str (Pair 1 2)) "[1 2]"))
+        (check c (= (print-str (Pair 1 "a")) "[1 a]"))
+        (check c (= (print-str (Triple 1 "a" \b)) "[1 a b]"))
+        (check c (= (print-str (conj (set-empty) "a")) "#{a}"))
+        (check c (let ((x (print-str s2))) (or (= x "#{1 2}") (= x "#{2 1}"))))
+        (check c (= (print-str (assoc (map-empty) "a" "b")) "{a b}"))
+        (check c (let ((x (print-str m2))) (or (= x "{1 2, 3 4}") (= x "{3 4, 1 2}"))))
+        (check c (= (via print-str "a") "a"))
+        (check c (= (via print-str [1 2]) "[1 2]"))
+        (check c (and (= (count texts) 2) (and (= (nth texts 0) "a") (= (nth texts 1) "b\"c"))))
+        (check c (and (= (count kinds) 2) (= (nth kinds 1) "2")))
+        (checks-result c))))

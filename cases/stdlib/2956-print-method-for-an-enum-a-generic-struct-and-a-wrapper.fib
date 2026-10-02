@@ -1,0 +1,67 @@
+;; spec:   stdlib §4.3 (row print-method: the static form of the extension point), §2.7 (three printers)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: print-method pr-str print-str prn-str
+;; The instances of case 2955 on the other shapes of user type. An enum chooses its text by `match` in the
+;; instance, one text per variant. A generic struct writes `(impl Debug (Tagged a) :where ((Debug a)) ..)`:
+;; its text is built from the Debug text of the payload, so what a `Tagged` of a `Tagged` of a number
+;; prints depends on the instance of each layer, chosen statically. A library type's text cannot be
+;; replaced, because Clojure's `(defmethod print-method clojure.lang.PersistentVector ..)` would be an
+;; overlapping instance here (case 2957, a reject); the way to another text for an `i64` is a wrapper of
+;; its own, `Hex`, which is a user type with the two instances. The texts are all the case's own
+;; strings; the library's Vec, Pair, Option and List print the elements through them.
+(ns main (:use tl.check))
+
+(defenum Shape (Circle r: i64) (Square s: i64))
+(impl Show Shape
+  (show (self)
+    (match self
+      ((Circle r) (str-concat "circle " (show r)))
+      ((Square s) (str-concat "square " (show s))))))
+(impl Debug Shape
+  (debug (self)
+    (match self
+      ((Circle r) (str-concat "#shape/circle " (show r)))
+      ((Square s) (str-concat "#shape/square " (show s))))))
+
+(defstruct (Tagged a) (tag: str v: a))
+(impl Show (Tagged a) :where ((Show a))
+  (show (self) (str-concat (. self tag) (str-concat "=" (show (. self v))))))
+(impl Debug (Tagged a) :where ((Debug a))
+  (debug (self) (str-join ["#tagged[" (. self tag) " " (debug (. self v)) "]"])))
+
+(defstruct Hex (n: i64))
+(impl Show Hex (show (self) (str-concat "0x" (hex-digits (. self n)))))
+(impl Debug Hex (debug (self) (str-concat "#hex " (show (. self n)))))
+
+(defun hex-digits (n: i64) -> str
+  (if (< n 16)
+      (char->str (nth "0123456789abcdef" n))
+      (str-concat (hex-digits (quot n 16)) (hex-digits (rem n 16)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (print-str (Circle 1)) "circle 1"))
+        (check c (= (pr-str (Square 2)) "#shape/square 2"))
+        (check c (= (println-str (Circle 7)) "circle 7\n"))
+        (check c (= (prn-str (Circle 7)) "#shape/circle 7\n"))
+        (check c (= (print-str (Tagged "n" "s")) "n=s"))
+        (check c (= (pr-str (Tagged "n" "s")) "#tagged[n \"s\"]"))
+        (check c (= (print-str (Tagged "n" 1)) "n=1"))
+        (check c (= (pr-str (Tagged "n" 1)) "#tagged[n 1]"))
+        (check c (= (print-str (Tagged "k" (Circle 3))) "k=circle 3"))
+        (check c (= (pr-str (Tagged "k" (Circle 3))) "#tagged[k #shape/circle 3]"))
+        (check c (= (pr-str (Tagged "o" (Tagged "i" \c))) "#tagged[o #tagged[i \\c]]"))
+        (check c (= (print-str (Tagged "o" (Tagged "i" \c))) "o=i=c"))
+        (check c (= (pr-str [(Circle 1) (Square 2)]) "[#shape/circle 1 #shape/square 2]"))
+        (check c (= (print-str [(Circle 1) (Square 2)]) "[circle 1 square 2]"))
+        (check c (= (pr-str (list (Tagged "a" 1))) "(#tagged[a 1])"))
+        (check c (= (pr-str (some (Square 4))) "#shape/square 4"))
+        (check c (= (print-str (Tagged "v" [(Circle 1)])) "v=[circle 1]"))
+        (check c (= (print-str (Hex 255)) "0xff"))
+        (check c (= (pr-str (Hex 255)) "#hex 255"))
+        (check c (= (print-str [(Hex 16) (Hex 7)]) "[0x10 0x7]"))
+        (check c (= (print-str 255) "255"))
+        (checks-result c))))

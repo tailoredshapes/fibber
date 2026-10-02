@@ -1,0 +1,53 @@
+;; spec:   stdlib §4.14 (rows println-str prn-str), §2.10 (the function twins)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: println-str prn-str
+;; `println-str` is `print-str` and a newline and `prn-str` is `pr-str` and a newline (the rows' own words),
+;; so the newline is added once, after the text, and after whatever the text ends with: `(println-str
+;; "a\n")` ends in two. The empty string gives the newline alone from `println-str` and the two quotes and
+;; a newline from `prn-str`. Show leaves a string bare and Debug quotes it, so the pair tells the two
+;; protocols apart as `println` and `prn` do (case 607 asks the same of the macros). Both are functions of
+;; one argument here, usable as values, which is what the twin is for.
+(ns main (:use tl.check))
+
+(defstruct Spy (shows: (Cell i64) debugs: (Cell i64)))
+(impl Show Spy (show (self) (do (set! (. self shows) (+ @(. self shows) 1)) "S")))
+(impl Debug Spy (debug (self) (do (set! (. self debugs) (+ @(. self debugs) 1)) "D")))
+
+(defun via (f: (fn (a) str) x: a) -> str (f x))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (spy (Spy (cell 0) (cell 0)))
+        (none: (Option i64) nil)
+        (lines (vec (map println-str [1 2])))
+        (quoted (vec (map prn-str ["a" "b"]))))
+    (do (check c (= (println-str "a") "a\n"))
+        (check c (= (prn-str "a") "\"a\"\n"))
+        (check c (= (println-str "") "\n"))
+        (check c (= (prn-str "") "\"\"\n"))
+        (check c (= (println-str "a\n") "a\n\n"))
+        (check c (= (prn-str "a\n") "\"a\\n\"\n"))
+        (check c (= (println-str 12) "12\n"))
+        (check c (= (prn-str 12) "12\n"))
+        (check c (= (println-str ["a" "b"]) "[a b]\n"))
+        (check c (= (prn-str ["a" "b"]) "[\"a\" \"b\"]\n"))
+        (check c (= (println-str \a) "a\n"))
+        (check c (= (prn-str \a) "\\a\n"))
+        (check c (= (println-str none) "nil\n"))
+        (check c (= (prn-str none) "nil\n"))
+        (check c (= (println-str (some "a")) "a\n"))
+        (check c (= (prn-str (some "a")) "\"a\"\n"))
+        (check c (= (println-str (list 1 2)) "(1 2)\n"))
+        (check c (= (str-len (println-str 12)) 3))
+        (check c (= (via println-str "x") "x\n"))
+        (check c (= (via prn-str "x") "\"x\"\n"))
+        (check c (and (= (count lines) 2) (and (= (nth lines 0) "1\n") (= (nth lines 1) "2\n"))))
+        (check c (and (= (count quoted) 2) (and (= (nth quoted 0) "\"a\"\n") (= (nth quoted 1) "\"b\"\n"))))
+        (check c (= (println-str spy) "S\n"))
+        (check c (and (= @(. spy shows) 1) (= @(. spy debugs) 0)))
+        (check c (= (prn-str spy) "D\n"))
+        (check c (and (= @(. spy shows) 1) (= @(. spy debugs) 1)))
+        (checks-result c))))

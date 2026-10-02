@@ -1,0 +1,68 @@
+;; spec:   stdlib §2.7 (Show and Debug of the collections), §4.14 (rows print-str pr-str println-str prn-str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: print-str pr-str println-str prn-str
+;; A twin must not walk its argument twice or in another order: a tag whose Show and Debug log their
+;; own letter and name shows, through each collection of the page's table, that `print-str` and
+;; `println-str` ask Show of every element exactly once and `pr-str` and `prn-str` ask Debug of every element
+;; exactly once, in the order of the walk, and never the other protocol or ToStr. A Vec, a List, a seq of
+;; the adaptors (an `LSeq` and a `VSeq`) and a Pair walk in order; the one element of a Set and a Map
+;; (key then value) has no order to disagree on. A `Some` asks its payload and an empty `Option` asks
+;; nothing. The twin of one printer called twice asks twice (nothing is cached between calls).
+(ns main (:use tl.check))
+
+(defstruct Tag (name: str log: (Cell str)))
+(impl Show Tag (show (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "S" (. self name)))) (. self name))))
+(impl Debug Tag (debug (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "D" (. self name)))) (. self name))))
+(impl ToStr Tag (to-str (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "T" (. self name)))) (. self name))))
+(impl Eq Tag (= (self o) (= (. self name) (. o name))))
+(impl Hash Tag (hash (self) (hash (. self name))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (log (cell ""))
+        (none: (Option i64) nil))
+    (do (check c (= (print-str [(Tag "a" log) (Tag "b" log) (Tag "c" log)]) "[a b c]"))
+        (check c (= @log "SaSbSc"))
+        (set! log "")
+        (check c (= (pr-str [(Tag "a" log) (Tag "b" log) (Tag "c" log)]) "[a b c]"))
+        (check c (= @log "DaDbDc"))
+        (set! log "")
+        (check c (= (println-str (list (Tag "l" log) (Tag "m" log))) "(l m)\n"))
+        (check c (= @log "SlSm"))
+        (set! log "")
+        (check c (= (prn-str (list (Tag "l" log) (Tag "m" log))) "(l m)\n"))
+        (check c (= @log "DlDm"))
+        (set! log "")
+        (check c (= (print-str (map identity [(Tag "i" log) (Tag "j" log)])) "(i j)"))
+        (check c (= @log "SiSj"))
+        (set! log "")
+        (check c (= (pr-str (rest [(Tag "h" log) (Tag "i" log) (Tag "j" log)])) "(i j)"))
+        (check c (= @log "DiDj"))
+        (set! log "")
+        (check c (= (print-str (Pair (Tag "f" log) (Tag "s" log))) "[f s]"))
+        (check c (= @log "SfSs"))
+        (set! log "")
+        (check c (= (pr-str (Triple (Tag "x" log) (Tag "y" log) (Tag "z" log))) "[x y z]"))
+        (check c (= @log "DxDyDz"))
+        (set! log "")
+        (check c (= (pr-str (some (Tag "o" log))) "o"))
+        (check c (= @log "Do"))
+        (set! log "")
+        (check c (= (print-str none) "nil"))
+        (check c (= @log ""))
+        (check c (= (print-str (conj (set-empty) (Tag "k" log))) "#{k}"))
+        (check c (= @log "Sk"))
+        (set! log "")
+        (check c (= (pr-str (assoc (map-empty) (Tag "k" log) (Tag "v" log))) "{k v}"))
+        (check c (= @log "DkDv"))
+        (set! log "")
+        (check c (= (print-str [[(Tag "a" log) (Tag "b" log)] [(Tag "c" log)]]) "[[a b] [c]]"))
+        (check c (= @log "SaSbSc"))
+        (set! log "")
+        (let ((t (Tag "t" log)))
+          (do (check c (= (str-concat (pr-str t) (pr-str t)) "tt"))
+              (check c (= @log "DtDt"))))
+        (checks-result c))))

@@ -1,12 +1,26 @@
 ;; fib.print.io: the function twins of the printing macros, and the files (stdlib §2.10, §4.14; tranche 1 plan
-;; §4.2; owner L11). Exports: str println print prn pr newline slurp try-slurp spit.
-;; Each printing name is a macro too (R5): the macro expands in head position and the function serves value
-;; position, `(run! println [1 2 3])` and `(map str xs)`. The twins take one argument and are the macros'
-;; one-argument expansions: str is ToStr, println and print are Show, prn and pr are Debug (§2.7). The
-;; prelude's own one-string `println` stays reachable as fib.prelude/println and is what the twin calls.
+;; §4.2; owner L11 and, since tranche 2, Y10). Exports: str println print prn pr newline print-str pr-str
+;; println-str prn-str slurp try-slurp spit.
+;; Each printing name is a macro too (R5; the four -str names are X3's): the macro expands in head position
+;; and the function serves value position, `(run! println [1 2 3])` and `(map str xs)`. The twins take one
+;; argument and are the macros' one-argument expansions: str is ToStr, println, print, print-str and
+;; println-str are Show, prn, pr, pr-str and prn-str are Debug (§2.7). The prelude's own one-string
+;; `println` stays reachable as fib.prelude/println and is what the twin calls.
 ;; Replaces the prelude's println in a module that uses fib.print: a `:use`d name shadows the prelude's, and
 ;; a string argument prints as before, because Show of a string is the string.
-;; Decided here, where the page is silent:
+;; Decided here, where the page is silent (Y10, plan §5):
+;;  - print-str, pr-str, println-str and prn-str return the text print, pr, println and prn write, and write
+;;    nothing: the text of one argument, println-str and prn-str with one "\n" added (§4.14 rows). Zero or
+;;    several arguments, and a literal nil, need the head-position macros of X3 (`(println-str 1 2)` is
+;;    "1 2\n" only then; cases 2970 and 2971 are open until it lands).
+;;  - Until X3 renames the prelude's one-string writer to print-raw (plan PC2-8, Proposed), the name
+;;    print-str is two things: this part's function, which is what a module that `:use`s fib.print (every
+;;    module, since the flip) means by it, and the prelude's writer, which the print, pr and newline twins
+;;    below call by its qualified name fib.prelude/print-str. X3's rename changes those three calls and no
+;;    other line of this part.
+;;  - The twins of the four printers have no instance of their own and ask the protocol once: Show for
+;;    print-str and println-str, Debug for pr-str and prn-str. A type with no such instance is the
+;;    checker's refusal (cases 2961 to 2965), not a message of this part.
 ;;  - try-slurp answers (Err "cannot read PATH") for a path that read-file refuses (missing, unreadable, a
 ;;    directory, not UTF-8: the builtin says nil for all of them and the library cannot tell which), and
 ;;    slurp is the same text behind the trap `slurp: cannot read PATH` (plan §4.3 rule 8).
@@ -21,6 +35,11 @@
 (defun prn (x: a) :where ((Debug a)) -> unit (fib.prelude/println (debug x)))
 (defun pr (x: a) :where ((Debug a)) -> unit (fib.prelude/print-str (debug x)))
 (defun newline () -> unit (fib.prelude/print-str "\n"))
+
+(defun print-str (x: a) :where ((Show a)) -> str (show x))
+(defun pr-str (x: a) :where ((Debug a)) -> str (debug x))
+(defun println-str (x: a) :where ((Show a)) -> str (str-concat (show x) "\n"))
+(defun prn-str (x: a) :where ((Debug a)) -> str (str-concat (debug x) "\n"))
 
 (defun try-slurp (path: str) -> (Result str str)
   (match (read-file path)

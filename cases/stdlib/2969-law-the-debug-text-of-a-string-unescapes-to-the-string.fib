@@ -1,0 +1,79 @@
+;; spec:   stdlib §2.7 (Debug of a str: quoted, the seven characters of char-escape-string escaped), §4.14 (row pr-str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: pr-str prn-str
+;; The text `pr-str` gives for a string is a text a reader can read back: the reference here is the
+;; inverse, an `unescape` that drops the two quotes and turns each backslash and the character after it
+;; into the character the page says it stands for (`\n` newline, `\t` tab, `\r` return, `\f` formfeed,
+;; `\b` backspace, `\"` and `\\` themselves). Over 300 seeded strings of 0 to 11 characters drawn from the
+;; seven escaped ones, a letter, a space, a NUL and one character of each width, `(unescape (pr-str s))`
+;; is `s`, the text begins and ends with a quote, has no raw newline, tab, return, formfeed or
+;; backspace inside it (an escaped text is one line of printable text), and `prn-str` is the same text and
+;; one newline. The inverse is written from the table, not from the library, and walks the text by
+;; scalar (`str-chars`). The last check is the planted fault: the same sweep against an `unescape` that
+;; forgets `\t` (it keeps the `t`), run into a second Checks, and the case fails unless it found a difference.
+(ns main (:use tl.rng tl.check))
+
+(defun alphabet () -> (Vec char)
+  [\" \\ \newline \tab \return \u{000C} \u{0008} \a \space \u{0000} \u{00E9} \u{20AC} \u{1F600}])
+
+(defun gen-text (r: Rng) -> str
+  (let ((abc (alphabet)))
+    (loop ((i 0) (n (rng-below r 12)) (acc ""))
+      (if (< i n)
+          (recur (+ i 1) n (str-concat acc (char->str (vec-nth abc (rng-below r (vec-count abc))))))
+          acc))))
+
+;; the character an escape letter stands for; `tab-known` false is the planted fault
+(defun unescape-char (ch: char tab-known: bool) -> str
+  (match ch
+    (\n "\n")
+    (\t (if tab-known "\t" "t"))
+    (\r "\r")
+    (\f (char->str (i32->char 12i32)))
+    (\b (char->str (i32->char 8i32)))
+    (_ (char->str ch))))
+
+;; the text between the quotes, each backslash and its next character read as one
+(defun unescape (text: str tab-known: bool) -> str
+  (let ((chars (str-chars text))
+        (end (- (vec-count chars) 1)))
+    (loop ((i 1) (acc ""))
+      (if (< i end)
+          (if (= (vec-nth chars i) \\)
+              (recur (+ i 2) (str-concat acc (unescape-char (vec-nth chars (+ i 1)) tab-known)))
+              (recur (+ i 1) (str-concat acc (char->str (vec-nth chars i)))))
+          acc))))
+
+(defun raw-control? (ch: char) -> bool
+  (let ((code (char->i32 ch)))
+    (or (= code 10i32) (or (= code 9i32) (or (= code 13i32) (or (= code 12i32) (= code 8i32)))))))
+
+(defun has-raw-control? (text: str) -> bool
+  (let ((chars (str-chars text)))
+    (loop ((i 0))
+      (if (< i (vec-count chars))
+          (if (raw-control? (vec-nth chars i)) true (recur (+ i 1)))
+          false))))
+
+(defun sweep (c: Checks seed: i64 tab-known: bool) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k 300)
+      (let ((s (gen-text r))
+            (text (pr-str s))
+            (n (str-len text)))
+        (do (check c (= (unescape text tab-known) s))
+            (check c (and (>= n 2) (and (= (str-slice text 0 1) "\"") (= (str-slice text (- n 1) n) "\""))))
+            (check c (not (has-raw-control? text)))
+            (check c (= (prn-str s) (str-concat text "\n"))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 2969 true)
+        (sweep p 2969 false)
+        (check c (= (checks-made c) 1200))
+        (check-detects c p)
+        (checks-result c))))

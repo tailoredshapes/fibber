@@ -1,0 +1,60 @@
+;; spec:   stdlib §4.14 (row pr), §2.7 (pr is Debug), §2.10 (the function twins)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: pr pr-str run!
+;; The row `pr` says tranche 2 and the macro and its twin were written in tranche 1 beside `prn` (R5, spec
+;; §7.5.2 item 3); this is the case of the row. `pr` is Debug, never Show or ToStr: a tag whose three
+;; instances each append their own letter and name to a log shows that `(pr a b c)` asks Debug of each
+;; argument once, left to right, and nothing else, that `(pr)` asks nothing, that the function twin in
+;; `(run! pr tags)` asks Debug of each element once in order, and that a collection and a Pair are asked
+;; through the Debug of their elements, each once. What `pr` writes is not a case's result: the report
+;; quotes it, case 751's text is judged by `crates/fibref/tests/print_macros.rs`, and what the text asked
+;; for is `pr-str`'s answer, which is compared here: `(pr-str t)` is the name the tag's Debug returned.
+;; Every call that writes without a newline is followed by `(newline)`: the compiled runner reads the
+;; result from the last line of standard output.
+(ns main (:use tl.check))
+
+(defstruct Tag (name: str log: (Cell str)))
+(impl Show Tag (show (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "S" (. self name)))) (. self name))))
+(impl Debug Tag (debug (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "D" (. self name)))) (. self name))))
+(impl ToStr Tag (to-str (self) (do (set! (. self log) (str-concat @(. self log) (str-concat "T" (. self name)))) (. self name))))
+
+(defun unit? (u: unit) -> bool true)
+
+(defun main () -> i64
+  (let ((c (checks))
+        (log (cell "")))
+    (do (check c (unit? (pr (Tag "a" log))))
+        (newline)
+        (check c (= @log "Da"))
+        (set! log "")
+        (pr (Tag "a" log) (Tag "b" log) (Tag "c" log))
+        (newline)
+        (check c (= @log "DaDbDc"))
+        (set! log "")
+        (check c (unit? (pr)))
+        (newline)
+        (check c (= @log ""))
+        (run! pr [(Tag "x" log) (Tag "y" log)])
+        (newline)
+        (check c (= @log "DxDy"))
+        (set! log "")
+        (pr [(Tag "p" log) (Tag "q" log)])
+        (newline)
+        (check c (= @log "DpDq"))
+        (set! log "")
+        (pr (Pair (Tag "l" log) (Tag "r" log)) (Tag "z" log))
+        (newline)
+        (check c (= @log "DlDrDz"))
+        (set! log "")
+        (pr "str" 1 nil \c)
+        (newline)
+        (check c (= @log ""))
+        (check c (= (pr-str (Tag "t" log)) "t"))
+        (check c (= @log "Dt"))
+        (set! log "")
+        (check c (= (pr-str [(Tag "m" log) (Tag "n" log)]) "[m n]"))
+        (check c (= @log "DmDn"))
+        (checks-result c))))

@@ -1,0 +1,66 @@
+;; spec:   stdlib §4.14 (row pr), §4.3 (row print-method: the static form of the extension point), §2.7 (three printers)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: print-method pr print-str pr-str
+;; Clojure's `(defmethod print-method Money [m w] ..)` chooses the text `pr` and `println` write for a
+;; type; here the type is static, so the choice is an instance: `(impl Debug Money ..)` is what `pr`, `prn`
+;; and `pr-str` print and `(impl Show Money ..)` is what `print`, `println` and `print-str` print. The case
+;; defines both for two types, with texts that differ (Show `$1.50`, Debug `#money 150`), and prints
+;; through `println` and `prn` and `pr` and `print`. A case never prints to compare, so what the four
+;; write is checked two ways: each instance logs its own letter, so the log says that `println` and
+;; `print` asked Show once each and `prn` and `pr` asked Debug once each and nobody asked ToStr, and the
+;; texts the instances return are those of `print-str` and `pr-str`, which are the same calls (the report
+;; quotes what the program writes). A Vec of the type, a Pair, an Option and a List of it print through the
+;; element's own instance. `Money` has no ToStr: `str` would be a reject (case 756's shape).
+(ns main (:use tl.check))
+
+(defstruct Money (cents: i64 log: (Cell str)))
+(impl Show Money
+  (show (self)
+    (do (set! (. self log) (str-concat @(. self log) "S"))
+        (str-concat "$" (str-concat (show (quot (. self cents) 100))
+                                    (str-concat "." (show (rem (. self cents) 100))))))))
+(impl Debug Money
+  (debug (self)
+    (do (set! (. self log) (str-concat @(. self log) "D"))
+        (str-concat "#money " (show (. self cents))))))
+
+(defstruct Temp (deg: i64))
+(impl Show Temp (show (self) (str-concat (show (. self deg)) "C")))
+(impl Debug Temp (debug (self) (str-concat "#temp " (show (. self deg)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m (Money 150 (cell "")))
+        (n (Money 275 (cell "")))
+        (t (Temp 21)))
+    (do (println m)
+        (check c (= @(. m log) "S"))
+        (prn m)
+        (check c (= @(. m log) "SD"))
+        (print m)
+        (newline)
+        (check c (= @(. m log) "SDS"))
+        (pr m)
+        (newline)
+        (check c (= @(. m log) "SDSD"))
+        (println t)
+        (prn t)
+        (check c (= (print-str t) "21C"))
+        (check c (= (pr-str t) "#temp 21"))
+        (check c (= (print-str n) "$2.75"))
+        (check c (= (pr-str n) "#money 275"))
+        (check c (= @(. n log) "SD"))
+        (check c (= (println-str n) "$2.75\n"))
+        (check c (= (prn-str n) "#money 275\n"))
+        (check c (= (pr-str [n]) "[#money 275]"))
+        (check c (= (print-str [n]) "[$2.75]"))
+        (check c (= (pr-str (Pair t n)) "[#temp 21 #money 275]"))
+        (check c (= (print-str (Pair t n)) "[21C $2.75]"))
+        (check c (= (pr-str (some t)) "#temp 21"))
+        (check c (= (print-str (list t t)) "(21C 21C)"))
+        (check c (= @(. n log) "SDSDDSDS"))
+        (check c (= (str [t]) "[#temp 21]"))
+        (checks-result c))))

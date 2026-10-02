@@ -1,0 +1,67 @@
+;; spec:   stdlib §8.1 item 2 (a differential test against a naive reference), §2.7 (Debug of a str), §4.14 (row pr-str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: pr-str print-str prn-str
+;; `pr-str` of a string is the string in double quotes with the seven characters of Clojure's
+;; `char-escape-string` written as `\"` `\\` `\n` `\t` `\r` `\f` `\b` and every other character, NUL and
+;; the scalars of two, three and four bytes included, as it is. The reference walks the characters of
+;; the string (`str-chars`, so by scalar, where the library cuts on bytes) and writes each one through a
+;; `match` on the character, over 300 seeded strings of 0 to 11 characters drawn from the seven escaped
+;; ones, a letter, a space, a NUL and one character of each width. The same text is checked through `prn-str`
+;; (and a newline), through a Vec of two such strings and through an `Option`, and `print-str` of the
+;; string is the string itself. The last check is the planted fault: the same sweep against a reference
+;; that leaves the tab unescaped, run into a second Checks, and the case fails unless it found a difference.
+(ns main (:use tl.rng tl.check))
+
+;; the alphabet: one entry per kind of character the escape table distinguishes
+(defun alphabet () -> (Vec char)
+  [\" \\ \newline \tab \return \u{000C} \u{0008} \a \space \u{0000} \u{00E9} \u{20AC} \u{1F600}])
+
+(defun gen-text (r: Rng) -> str
+  (let ((abc (alphabet)))
+    (loop ((i 0) (n (rng-below r 12)) (acc ""))
+      (if (< i n)
+          (recur (+ i 1) n (str-concat acc (char->str (vec-nth abc (rng-below r (vec-count abc))))))
+          acc))))
+
+;; what the page says one character becomes; `tab-escaped` false is the planted fault
+(defun escape-char (ch: char tab-escaped: bool) -> str
+  (match ch
+    (\" "\\\"")
+    (\\ "\\\\")
+    (\newline "\\n")
+    (\tab (if tab-escaped "\\t" "\t"))
+    (\return "\\r")
+    (\u{000C} "\\f")
+    (\u{0008} "\\b")
+    (_ (char->str ch))))
+
+(defun quoted-text (s: str tab-escaped: bool) -> str
+  (let ((chars (str-chars s)))
+    (loop ((i 0) (acc "\""))
+      (if (< i (vec-count chars))
+          (recur (+ i 1) (str-concat acc (escape-char (vec-nth chars i) tab-escaped)))
+          (str-concat acc "\"")))))
+
+(defun sweep (c: Checks seed: i64 tab-escaped: bool) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k 300)
+      (let ((s (gen-text r))
+            (t (gen-text r))
+            (want (quoted-text s tab-escaped)))
+        (do (check c (= (pr-str s) want))
+            (check c (= (prn-str s) (str-concat want "\n")))
+            (check c (= (print-str s) s))
+            (check c (= (pr-str [s t]) (str-join ["[" want " " (quoted-text t tab-escaped) "]"])))
+            (check c (= (pr-str (some s)) want)))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 2967 true)
+        (sweep p 2967 false)
+        (check c (= (checks-made c) 1500))
+        (check-detects c p)
+        (checks-result c))))

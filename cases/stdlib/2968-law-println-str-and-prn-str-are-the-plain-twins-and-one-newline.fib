@@ -1,0 +1,59 @@
+;; spec:   stdlib §4.14 (rows println-str prn-str: `print-str` and a newline, `pr-str` and a newline), §2.7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: print-str pr-str println-str prn-str
+;; The laws that tie the four twins to each other, over 300 seeded values of five types (an integer, a
+;; word, a Vec of integers, a Vec of words, an `Option` of an integer, a Pair of the integer and the word):
+;; `(println-str x)` is `(print-str x)` and one newline, `(prn-str x)` is `(pr-str x)` and one newline,
+;; each one byte longer than its plain twin and ending in the newline, and the plain twins agree where
+;; Show and Debug do: `print-str` of a string is the string, `pr-str` and `print-str` of an integer and of a
+;; Vec of integers are one text. The law holds at the type of each argument, so each type is its own
+;; monomorphisation of the four functions. The last check is the planted fault: the same sweep with a
+;; law that has the newline missing (`nl` the empty text), run into a second Checks, and the case fails
+;; unless the sweep found a difference.
+(ns main (:use tl.rng tl.gen tl.check))
+
+(defun gen-ints (r: Rng) -> (Vec i64)
+  (loop ((i 0) (n (rng-below r 6)) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) n (vec-conj acc (- (rng-below r 2001) 1000))) acc)))
+
+(defun gen-words (r: Rng) -> (Vec str)
+  (loop ((i 0) (n (rng-below r 5)) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) n (vec-conj acc (gen-str r (rng-below r 5)))) acc)))
+
+;; the four twins of one value agree with each other: nl is "\n", or "" for the planted fault
+(defun tie (c: Checks nl: str x: a) :where ((Show a) (Debug a)) -> unit
+  (do (check c (= (println-str x) (str-concat (print-str x) nl)))
+      (check c (= (prn-str x) (str-concat (pr-str x) nl)))
+      (check c (= (str-len (println-str x)) (+ (str-len (print-str x)) (str-len nl))))
+      (check c (= (str-len (prn-str x)) (+ (str-len (pr-str x)) (str-len nl))))
+      (check c (= (str-slice (println-str x) (- (str-len (println-str x)) 1) (str-len (println-str x))) "\n"))))
+
+(defun sweep (c: Checks seed: i64 nl: str) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k 300)
+      (let ((n (- (rng-below r 2001) 1000))
+            (w (gen-str r (rng-below r 6)))
+            (v (gen-ints r))
+            (ws (gen-words r))
+            (o (if (= (rng-below r 3) 0) (some n) nil)))
+        (do (tie c nl n)
+            (tie c nl w)
+            (tie c nl v)
+            (tie c nl ws)
+            (tie c nl o)
+            (tie c nl (Pair n w))
+            (check c (= (print-str w) w))
+            (check c (= (pr-str n) (print-str n)))
+            (check c (= (pr-str v) (print-str v))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (sweep c 2968 "\n")
+        (sweep p 2968 "")
+        (check c (= (checks-made c) 9900))
+        (check-detects c p)
+        (checks-result c))))

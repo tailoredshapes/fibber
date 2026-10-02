@@ -1,0 +1,38 @@
+;; spec:   stdlib §2.10 (the function twins), §4.14 (rows print-str pr-str println-str prn-str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: print-str pr-str println-str prn-str
+;; The point of a function twin is value position, which a macro cannot be: the four names are handed to
+;; `map`, to a `reduce` lambda, to a parameter of function type, bound with `let`, composed with `comp`
+;; and handed on to a second function of the case, at the types they are used at (`i64`, `str`, a Vec of
+;; ints). Each use is one monomorphisation of the same generic function, and a name bound with `let` is
+;; one of them (a bound function value has one type), which is why `f` is only ever called on integers. What a function value cannot do is
+;; take two arguments or none: `(println-str 1 2)` is the head-position macro of X3 (cases 2970 and 2971).
+(ns main (:use tl.check))
+
+(defun twice (f: (fn (a) str) x: a) -> str (str-concat (f x) (f x)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (f print-str)
+        (g (comp str-len pr-str))
+        (h (comp str-len println-str))
+        (all (reduce (fn (acc x) (str-concat acc (pr-str x))) "" [1 2 3]))
+        (joined (str-join (vec (map pr-str ["a" "b"]))))
+        (bare (str-join (vec (map print-str ["a" "b"]))))
+        (lens (vec (map (comp str-len prn-str) ["a" "bb"]))))
+    (do (check c (= (f 1) "1"))
+        (check c (= (f 12) "12"))
+        (check c (= (g "abc") 5))
+        (check c (= (h "abc") 4))
+        (check c (= all "123"))
+        (check c (= joined "\"a\"\"b\""))
+        (check c (= bare "ab"))
+        (check c (and (= (count lens) 2) (and (= (nth lens 0) 4) (= (nth lens 1) 5))))
+        (check c (= (twice println-str 7) "7\n7\n"))
+        (check c (= (twice pr-str "z") "\"z\"\"z\""))
+        (check c (= (twice prn-str [1]) "[1]\n[1]\n"))
+        (check c (= (twice print-str [1]) "[1][1]"))
+        (checks-result c))))

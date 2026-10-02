@@ -1,0 +1,69 @@
+;; spec:   stdlib §2.7 (the table of the three printers, the `pr` column), §2.10 (the function twins), §4.14 (row pr-str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: pr-str str
+;; `pr-str` in value position is the function twin of the macro (X3 owns the macro, which serves head
+;; position); it takes one argument and gives the Debug text, the text `pr` would write: strings quoted
+;; and escaped at every depth, a char with its backslash, a keyword as it is, an empty `Option` as `nil`
+;; and a present one as its payload's Debug text, the seqs (List, Range, LSeq, VSeq) in parentheses, a Vec,
+;; a Pair and a Triple in brackets, a Set in `#{}`, a Map in `{k v, k v}`, a record as `#main.P{:x 1, :y "x"}`
+;; and an enum variant with fields as a record of the variant. The page's row `["a" 1]` is here a Vec of
+;; strings and a Triple, because a Vec has one element type (case 601 says so too). Each row is reached
+;; through `(map pr-str xs)` or a function parameter, which a macro cannot be, so the case also shows the
+;; twin is a value. A Set or Map of two elements is in the order its walk gives, which the page leaves
+;; open, so those checks accept either order. The two `str` checks of a keyword are the `ToStr` instance of
+;; `:k` that tranche 2's Y10 added to fib.print.show beside its Debug: the page's table says `:k` for all three.
+(ns main (:use tl.check))
+
+(defstruct P (x: i64 y: str))
+(derive Debug P)
+(defenum Ev (Done v: i64) (Idle))
+(derive Debug Ev)
+
+(defun via (f: (fn (a) str) x: a) -> str (f x))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Option i64) nil)
+        (s2 (conj (conj (set-empty) 1) 2))
+        (m2 (assoc (assoc (map-empty) 1 2) 3 4))
+        (texts (vec (map pr-str ["a" "b\"c"])))
+        (kinds (vec (map pr-str [1 2]))))
+    (do (check c (= (pr-str "a") "\"a\""))
+        (check c (= (pr-str "") "\"\""))
+        (check c (= (pr-str "a\nb") "\"a\\nb\""))
+        (check c (= (pr-str ["a" "b"]) "[\"a\" \"b\"]"))
+        (check c (= (pr-str [["a"] ["b" "c"]]) "[[\"a\"] [\"b\" \"c\"]]"))
+        (check c (= (pr-str \a) "\\a"))
+        (check c (= (pr-str \space) "\\space"))
+        (check c (= (pr-str :k) ":k"))
+        (check c (= (pr-str [:a :b]) "[:a :b]"))
+        (check c (= (str :k) ":k"))
+        (check c (= (str [:a :b]) "[:a :b]"))
+        (check c (= (pr-str none) "nil"))
+        (check c (= (pr-str (some "a")) "\"a\""))
+        (check c (= (pr-str (some 3)) "3"))
+        (check c (= (pr-str (list 1 2)) "(1 2)"))
+        (check c (= (pr-str (list "a")) "(\"a\")"))
+        (check c (= (pr-str (range 1 3)) "(1 2)"))
+        (check c (= (pr-str (map inc [1 2])) "(2 3)"))
+        (check c (= (pr-str (rest [0 1 2])) "(1 2)"))
+        (check c (= (pr-str (rest ["a" "b"])) "(\"b\")"))
+        (check c (= (pr-str [1 2]) "[1 2]"))
+        (check c (= (pr-str (Pair 1 2)) "[1 2]"))
+        (check c (= (pr-str (Pair 1 "a")) "[1 \"a\"]"))
+        (check c (= (pr-str (Triple 1 "a" \b)) "[1 \"a\" \\b]"))
+        (check c (= (pr-str (conj (set-empty) "a")) "#{\"a\"}"))
+        (check c (let ((x (pr-str s2))) (or (= x "#{1 2}") (= x "#{2 1}"))))
+        (check c (= (pr-str (assoc (map-empty) "a" 1)) "{\"a\" 1}"))
+        (check c (let ((x (pr-str m2))) (or (= x "{1 2, 3 4}") (= x "{3 4, 1 2}"))))
+        (check c (= (pr-str (P 1 "x")) "#main.P{:x 1, :y \"x\"}"))
+        (check c (= (pr-str (Done 3)) "#main.Done{:v 3}"))
+        (check c (= (pr-str Idle) "Idle"))
+        (check c (= (via pr-str "a") "\"a\""))
+        (check c (= (via pr-str (P 2 "y")) "#main.P{:x 2, :y \"y\"}"))
+        (check c (and (= (count texts) 2) (and (= (nth texts 0) "\"a\"") (= (nth texts 1) "\"b\\\"c\""))))
+        (check c (and (= (count kinds) 2) (= (nth kinds 1) "2")))
+        (checks-result c))))
