@@ -1,0 +1,33 @@
+;; spec:   stdlib §2.3 (the conversions are static protocol calls), §4.3 (rows byte short int long float double char)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 0
+;; roots:  ../../lib support
+;; covers: byte short int long float double char
+;; A conversion allocates no heap object: a loop of 1000 turns each runs a value through every
+;; one of the seven (an i64 down to an i8 and up to an i32, an i64 and an f32 and an f64, a
+;; char to its code point and back, a float cut to an int) and adds what comes out; the sum
+;; is the answer, so the loop is not dead, and the free trace has no `A` line at all.
+(ns main)
+
+(defun turn (i: i64) -> i64
+  (let ((b (byte (rem i 100)))
+        (s (short (+ i 1000)))
+        (n (int (* i 3)))
+        (f (float (+ i 1)))
+        (d (double i))
+        (ch (char (+ 65 (rem i 26)))))
+    (+ (sext i64 b)
+       (+ (long s)
+          (+ (long n)
+             (+ (long f)
+                (+ (long d)
+                   (+ (long (int d))
+                      (+ (long (double f))
+                         (+ (long ch) (long (int 2.5))))))))))))
+
+(defun main () -> i64
+  (let ((sum (loop ((i 0) (acc 0))
+               (if (< i 1000) (recur (+ i 1) (+ acc (turn i))) acc))))
+    (if (= sum 5126916) 0 1)))

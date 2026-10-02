@@ -1,0 +1,74 @@
+;; spec:   stdlib §4.3 (rows byte short int long), §2.8 (floats truncate toward zero), §8.1 item 2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: byte short int long
+;; A float that is the quotient n/d of two integers (n below 2^52, d from 1 to 1000, so the
+;; f64 division is never rounded up to the next integer) is cut toward zero by the library's
+;; conversions to the integer quotient `(quot n d)` that the builtin integer division gives
+;; with no float in it, with the sign of n. The same through an f32 (the f32 of the f64, then
+;; the builtin `fptosi` of that, which is exact in range). The width a value fits is decided
+;; by the round trip `(= (sext i64 (trunc iN q)) q)`, so a value is only converted by the
+;; width it fits (the traps are cases 2883 to 2899); the tallies are checked, so a generator
+;; that made no small value would fail. 300 seeded values. The last run plants a fault, a
+;; reference that flips the low bit of the quotient, in a second Checks, and `check-detects`
+;; fails the case if that run found nothing.
+(ns main (:use tl.rng tl.check))
+
+;; the numerator: 1 to 2^51 at a random magnitude, either sign
+(defun numerator-of (r: Rng) -> i64
+  (let ((m (+ 1 (shr (rng-next r) (+ 13 (rng-below r 50))))))
+    (if (= (rng-below r 2) 0) m (neg m))))
+
+(defun fits8 (x: i64) -> bool (= (sext i64 (trunc i8 x)) x))
+(defun fits16 (x: i64) -> bool (= (sext i64 (trunc i16 x)) x))
+(defun fits32 (x: i64) -> bool (= (sext i64 (trunc i32 x)) x))
+
+(defstruct Seen (b: (Cell i64) s: (Cell i64) i: (Cell i64)))
+
+(defun bump (cell: (Cell i64)) -> unit (set! cell (+ @cell 1)))
+
+;; the checks of the float n/d; `wrong` makes the reference quotient q xor 1
+(defun judge (c: Checks n: i64 d: i64 wrong: bool seen: Seen) -> unit
+  (let ((x (/ (sitofp f64 n) (sitofp f64 d)))
+        (q0 (quot n d))
+        (y (fptrunc f32 x)))
+    (let ((q (if wrong (bit-xor 1 q0) q0))
+          (qf (fptosi i64 (fpext f64 y))))
+      (do (check c (= (long x) q))
+          (check c (= (long y) qf))
+          (check c (= (long (double y)) qf))
+          (if (fits8 q0)
+              (do (bump (. seen b))
+                  (check c (= (sext i64 (byte x)) q)))
+              ())
+          (if (fits16 q0)
+              (do (bump (. seen s))
+                  (check c (= (sext i64 (short x)) q)))
+              ())
+          (if (fits32 q0)
+              (do (bump (. seen i))
+                  (check c (= (sext i64 (int x)) q)))
+              ())
+          (if (fits32 qf)
+              (check c (= (sext i64 (int y)) (if wrong (bit-xor 1 qf) qf)))
+              ())))))
+
+(defun sweep (c: Checks seed: i64 n: i64 wrong: bool seen: Seen) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k n)
+      (judge c (numerator-of r) (+ 1 (rng-below r 1000)) wrong seen))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (seen (Seen (cell 0) (cell 0) (cell 0))))
+    (do (sweep c 2861 300 false seen)
+        (check c (> @(. seen b) 50))
+        (check c (> @(. seen s) 80))
+        (check c (> @(. seen i) 150))
+        (check c (< @(. seen i) 290))
+        (sweep p 2861 40 true (Seen (cell 0) (cell 0) (cell 0)))
+        (check-detects c p)
+        (checks-result c))))

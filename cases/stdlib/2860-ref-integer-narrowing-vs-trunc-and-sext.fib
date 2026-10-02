@@ -1,0 +1,81 @@
+;; spec:   stdlib §4.3 (rows byte short int long), §8.1 item 2 (a naive reference), cases/stdlib/README.md
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: byte short int long
+;; The checked conversions of an i64 against the builtins that do not check. The oracle for
+;; "this value fits an iN" is the round trip `(= (sext i64 (trunc iN x)) x)`, which compares
+;; no limit and so shares nothing with the library's tests against -128 and 127; a value
+;; that fits must come out of `byte`, `short` or `int` equal to `(trunc iN x)` (and, widened
+;; again, to x), also when it is reached through a narrower conversion first. (A value that
+;; does not fit traps, so it is not called here: the traps are cases 2880 to 2890; what this
+;; case adds is that nothing that fits is refused, and that the generator reached the
+;; widths: the tallies are checked.) 300 seeded values, half drawn at a random magnitude and
+;; half within two of a limit of the three widths, either sign. The last run plants a fault,
+;; a reference that flips the low bit, in a second Checks, and `check-detects` fails the case
+;; if that run found nothing.
+(ns main (:use tl.rng tl.check))
+
+;; any magnitude from 1 to 2^63 - 1, either sign
+(defun spread (r: Rng) -> i64
+  (let ((m (shr (rng-next r) (+ 1 (rng-below r 63)))))
+    (if (= (rng-below r 2) 0) m (neg m))))
+
+;; within two of a limit of an i8, an i16 or an i32, above or below, either sign
+(defun near (r: Rng) -> i64
+  (let ((base (match (rng-below r 6) (0 127) (1 128) (2 32767) (3 32768) (4 2147483647) (_ 2147483648)))
+        (d (- (rng-below r 5) 2)))
+    (if (= (rng-below r 2) 0) (+ base d) (neg (+ base d)))))
+
+(defun fits8 (x: i64) -> bool (= (sext i64 (trunc i8 x)) x))
+(defun fits16 (x: i64) -> bool (= (sext i64 (trunc i16 x)) x))
+(defun fits32 (x: i64) -> bool (= (sext i64 (trunc i32 x)) x))
+
+;; the tallies: how many values fitted each width
+(defstruct Seen (b: (Cell i64) s: (Cell i64) i: (Cell i64)))
+
+(defun bump (cell: (Cell i64)) -> unit (set! cell (+ @cell 1)))
+
+;; the checks for one value; `wrong` makes the reference flip the low bit
+(defun judge (c: Checks x: i64 wrong: bool seen: Seen) -> unit
+  (do (if (fits8 x)
+          (let ((want (if wrong (bit-xor 1i8 (trunc i8 x)) (trunc i8 x))))
+            (do (bump (. seen b))
+                (check c (= (byte x) want))
+                (check c (= (sext i64 (byte x)) x))
+                (check c (= (byte (trunc i16 x)) want))
+                (check c (= (byte (trunc i32 x)) want))))
+          ())
+      (if (fits16 x)
+          (let ((want (if wrong (bit-xor 1i16 (trunc i16 x)) (trunc i16 x))))
+            (do (bump (. seen s))
+                (check c (= (short x) want))
+                (check c (= (sext i64 (short x)) x))
+                (check c (= (short (trunc i32 x)) want))))
+          ())
+      (if (fits32 x)
+          (let ((want (if wrong (bit-xor 1i32 (trunc i32 x)) (trunc i32 x))))
+            (do (bump (. seen i))
+                (check c (= (int x) want))
+                (check c (= (sext i64 (int x)) x))
+                (check c (= (long (int x)) x))))
+          ())))
+
+(defun sweep (c: Checks seed: i64 n: i64 wrong: bool seen: Seen) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k n)
+      (judge c (if (= (rem k 2) 0) (spread r) (near r)) wrong seen))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (seen (Seen (cell 0) (cell 0) (cell 0))))
+    (do (sweep c 2860 300 false seen)
+        (check c (> @(. seen b) 30))
+        (check c (> @(. seen s) 60))
+        (check c (> @(. seen i) 120))
+        (check c (< @(. seen i) 250))
+        (sweep p 2860 40 true (Seen (cell 0) (cell 0) (cell 0)))
+        (check-detects c p)
+        (checks-result c))))

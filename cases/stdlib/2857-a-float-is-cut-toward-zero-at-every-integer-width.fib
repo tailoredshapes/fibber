@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.3 (rows byte short int long), §2.8 (floats truncate toward zero)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: byte short int long
+;; One column of floats through the four integer conversions: a float is cut toward zero (not
+;; floored, not rounded), so 2.7 is 2, -2.7 is -2, 0.9 and -0.9 and -0.5 are 0 (a negative
+;; zero is no value of an integer), 1.999999 is 1. The check on the range is made after the
+;; cut: 127.9 is a byte but 128.0 is not, -128.9 is a byte but -129.0 is not (the same
+;; cases at every width are traps 2883, 2888, 2891 and 2897).
+(ns main (:use tl.check))
+
+;; whether the four conversions of x are the integers b s i l
+(defun cuts (c: Checks x: f64 b: i8 s: i16 i: i32 l: i64) -> unit
+  (do (check c (= (byte x) b))
+      (check c (= (short x) s))
+      (check c (= (int x) i))
+      (check c (= (long x) l))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (cuts c 2.7 2i8 2i16 2i32 2)
+        (cuts c -2.7 -2i8 -2i16 -2i32 -2)
+        (cuts c 0.9 0i8 0i16 0i32 0)
+        (cuts c -0.9 0i8 0i16 0i32 0)
+        (cuts c -0.5 0i8 0i16 0i32 0)
+        (cuts c 0.0 0i8 0i16 0i32 0)
+        (cuts c -0.0 0i8 0i16 0i32 0)
+        (cuts c 1.999999 1i8 1i16 1i32 1)
+        (cuts c -1.999999 -1i8 -1i16 -1i32 -1)
+        (cuts c 100.5 100i8 100i16 100i32 100)
+        (cuts c 127.9 127i8 127i16 127i32 127)
+        (cuts c -128.9 -128i8 -128i16 -128i32 -128)
+        (check c (= (short 32767.9) 32767i16))
+        (check c (= (short -32768.9) -32768i16))
+        (check c (= (int 2147483647.9) 2147483647i32))
+        (check c (= (int -2147483648.9) -2147483648i32))
+        (check c (= (long 1e15) 1000000000000000))
+        (check c (= (long -1.5e15) -1500000000000000))
+        (checks-result c))))

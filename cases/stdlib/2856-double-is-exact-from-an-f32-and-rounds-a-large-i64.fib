@@ -1,0 +1,33 @@
+;; spec:   stdlib §4.3 (row double), §2.3 (ToDouble), §2.8
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: double
+;; `(double x)` over an i8, an i16, an i32, an i64, an f32 and an f64 (itself). The widths up
+;; to an i32 and an f32 are exact; an i64 above 2^53 is rounded to the nearest f64
+;; (9007199254740993 is 9007199254740992.0, a tie to even, and the maximum is 2^63); the f32
+;; 0.1 is 0.10000000149011612 as an f64, so nothing is rounded to a shorter decimal; a NaN
+;; stays a NaN and an infinity an infinity. No conversion to a double traps.
+(ns main (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (nan (/ 0.0 0.0))
+        (inf (/ 1.0 0.0)))
+    (do (check c (= (double 0) 0.0))
+        (check c (= (double -128i8) -128.0))
+        (check c (= (double 32767i16) 32767.0))
+        (check c (= (double -2147483648i32) -2147483648.0))
+        (check c (= (double 9007199254740992) 9007199254740992.0))
+        (check c (= (double 9007199254740993) 9007199254740992.0))
+        (check c (= (double 9223372036854775807) 9223372036854775808.0))
+        (check c (= (double -9223372036854775808) -9223372036854775808.0))
+        (check c (= (double 0.5f32) 0.5))
+        (check c (= (double 0.1f32) 0.10000000149011612))
+        (check c (= (double 3.4028234663852886e38f32) 3.4028234663852886e38))
+        (check c (= (double 2.5) 2.5))
+        (check c (!= (double nan) (double nan)))
+        (check c (= (double inf) inf))
+        (check c (= (double (fptrunc f32 inf)) inf))
+        (checks-result c))))

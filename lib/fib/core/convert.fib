@@ -1,5 +1,113 @@
-;; owner: Y9
-;; fib.core.convert: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the numeric conversions `char byte short int long float double` and the protocols `ToChar ToByte ToShort ToInt ToLong ToFloat ToDouble`.
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
-(ns fib.core.convert (:use fib.core.base fib.core.protocols fib.core.num))
+;; fib.core.convert: the checked numeric conversions of stdlib §2.8 and §4.3 (tranche 2 plan §5, package Y9).
+;; Exports the protocols ToChar ToByte ToShort ToInt ToLong ToFloat ToDouble, whose methods are Clojure's
+;; `char byte short int long float double` (§2.3); `clojure.math/to-int-exact` is `(int x)` over an i64 (§4.10).
+;; Replaces nothing in the prelude. The wrapping builtins stay what they are: `(trunc i8 x)` keeps the low
+;; bits, `(sext i64 x)` widens, `(fptosi i64 x)` saturates, and none of them traps; these functions check.
+;; One instance of a protocol per source type, one line each; a conversion allocates nothing.
+;; Decided here, where the page is silent:
+;;  - a value that does not fit traps `NAME: value out of range`, NAME the function the program called (`char`,
+;;    `byte`, `short`, `int`, `long`, `float`); an integer fits when it lies in the target's signed range, so
+;;    `(byte 127)` and `(byte -128)` are bytes and `(byte 128)` and `(byte -129)` trap.
+;;  - a float is truncated toward zero first and the integer must then fit: `(int 2147483647.9)` is 2147483647
+;;    and `(int 2147483648.0)` traps. A NaN and the infinities trap for every integer target: a NaN has no
+;;    integer (the plan's judge names NaN; the page is silent). The test is made on the cut value in the
+;;    float's own type, against 2^(w-1), which an f64 holds exactly at every width, so no limit is rounded.
+;;  - `(float x)` of an f64 traps when x lies beyond the greatest f32, an infinity included; the test is on
+;;    the f64, so a value between the greatest f32 and the next halfway point traps although rounding would
+;;    have kept it. A NaN passes through as a NaN: it overflows nothing. An integer rounds to the nearest
+;;    float (`sitofp`) and never traps: the value 16777217 is 16777216.0 as an f32.
+;;  - `char` takes an i32 or an i64, as the row says (an i8, an i16, an f32, an f64 and a char are not
+;;    offered), and traps below 0, above 0x10FFFF and in the surrogate range 0xD800 to 0xDFFF: a `char` is a
+;;    Unicode scalar (types §1.1), so the message is the same.
+;;  - `int` and `long` take a `char` and give its code point, so `(- (int c) (int \0))` is Clojure's text;
+;;    `byte`, `short`, `float` and `double` of a `char`, and any conversion of a `bool` or a `str`, are not offered.
+;;  - every numeric type converts to every numeric target, the identity included (`(long 5)` is 5), so a
+;;    generic caller needs no case for the type it already has.
+;;  - the `unchecked-*` family (§4.3, tranche 3) and `clojure.math/round` (tranche 4) are not here.
+(ns fib.core.convert)
+
+(defprotocol ToChar (char (self) -> char))
+(defprotocol ToByte (byte (self) -> i8))
+(defprotocol ToShort (short (self) -> i16))
+(defprotocol ToInt (int (self) -> i32))
+(defprotocol ToLong (long (self) -> i64))
+(defprotocol ToFloat (float (self) -> f32))
+(defprotocol ToDouble (double (self) -> f64))
+
+;; an integer, taken as an i64, narrowed to the width that names the function in the trap
+(defun i8-of :private (x: i64) -> i8
+  (if (and (>= x -128) (<= x 127)) (trunc i8 x) (trap "byte: value out of range")))
+(defun i16-of :private (x: i64) -> i16
+  (if (and (>= x -32768) (<= x 32767)) (trunc i16 x) (trap "short: value out of range")))
+(defun i32-of :private (x: i64) -> i32
+  (if (and (>= x -2147483648) (<= x 2147483647)) (trunc i32 x) (trap "int: value out of range")))
+
+;; whether x, truncated toward zero, lies in [-hi, hi): hi is 2^(w-1) of the target's width w, exact in an f64
+;; at every width, so no integer limit that an f64 cannot hold is compared. A NaN is in no range.
+(defun whole? :private (x: f64 hi: f64) -> bool
+  (let ((cut (quot x 1.0))) (and (>= cut (neg hi)) (< cut hi))))
+(defun i8-of-f :private (x: f64) -> i8
+  (if (whole? x 128.0) (fptosi i8 x) (trap "byte: value out of range")))
+(defun i16-of-f :private (x: f64) -> i16
+  (if (whole? x 32768.0) (fptosi i16 x) (trap "short: value out of range")))
+(defun i32-of-f :private (x: f64) -> i32
+  (if (whole? x 2147483648.0) (fptosi i32 x) (trap "int: value out of range")))
+(defun i64-of-f :private (x: f64) -> i64
+  (if (whole? x 9223372036854775808.0) (fptosi i64 x) (trap "long: value out of range")))
+
+;; 3.4028234663852886e38 is the greatest f32, as an f64
+(defun f32-of :private (x: f64) -> f32
+  (if (or (> x 3.4028234663852886e38) (< x -3.4028234663852886e38))
+      (trap "float: value out of range")
+      (fptrunc f32 x)))
+(defun char-of :private (x: i64) -> char
+  (if (and (>= x 0) (<= x 0x10FFFF) (not (and (>= x 0xD800) (<= x 0xDFFF))))
+      (i32->char (trunc i32 x))
+      (trap "char: value out of range")))
+
+(impl ToChar i32 (char (self) (char-of (sext i64 self))))
+(impl ToChar i64 (char (self) (char-of self)))
+
+(impl ToByte i8 (byte (self) self))
+(impl ToByte i16 (byte (self) (i8-of (sext i64 self))))
+(impl ToByte i32 (byte (self) (i8-of (sext i64 self))))
+(impl ToByte i64 (byte (self) (i8-of self)))
+(impl ToByte f32 (byte (self) (i8-of-f (fpext f64 self))))
+(impl ToByte f64 (byte (self) (i8-of-f self)))
+
+(impl ToShort i8 (short (self) (sext i16 self)))
+(impl ToShort i16 (short (self) self))
+(impl ToShort i32 (short (self) (i16-of (sext i64 self))))
+(impl ToShort i64 (short (self) (i16-of self)))
+(impl ToShort f32 (short (self) (i16-of-f (fpext f64 self))))
+(impl ToShort f64 (short (self) (i16-of-f self)))
+
+(impl ToInt i8 (int (self) (sext i32 self)))
+(impl ToInt i16 (int (self) (sext i32 self)))
+(impl ToInt i32 (int (self) self))
+(impl ToInt i64 (int (self) (i32-of self)))
+(impl ToInt f32 (int (self) (i32-of-f (fpext f64 self))))
+(impl ToInt f64 (int (self) (i32-of-f self)))
+(impl ToInt char (int (self) (char->i32 self)))
+
+(impl ToLong i8 (long (self) (sext i64 self)))
+(impl ToLong i16 (long (self) (sext i64 self)))
+(impl ToLong i32 (long (self) (sext i64 self)))
+(impl ToLong i64 (long (self) self))
+(impl ToLong f32 (long (self) (i64-of-f (fpext f64 self))))
+(impl ToLong f64 (long (self) (i64-of-f self)))
+(impl ToLong char (long (self) (sext i64 (char->i32 self))))
+
+(impl ToFloat i8 (float (self) (sitofp f32 self)))
+(impl ToFloat i16 (float (self) (sitofp f32 self)))
+(impl ToFloat i32 (float (self) (sitofp f32 self)))
+(impl ToFloat i64 (float (self) (sitofp f32 self)))
+(impl ToFloat f32 (float (self) self))
+(impl ToFloat f64 (float (self) (f32-of self)))
+
+(impl ToDouble i8 (double (self) (sitofp f64 self)))
+(impl ToDouble i16 (double (self) (sitofp f64 self)))
+(impl ToDouble i32 (double (self) (sitofp f64 self)))
+(impl ToDouble i64 (double (self) (sitofp f64 self)))
+(impl ToDouble f32 (double (self) (fpext f64 self)))
+(impl ToDouble f64 (double (self) self))

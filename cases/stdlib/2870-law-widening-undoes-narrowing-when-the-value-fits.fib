@@ -1,0 +1,65 @@
+;; spec:   stdlib §4.3 (rows byte short int long float double), §8.1 item 4 (a property over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: byte short int long float double
+;; Laws of the checked conversions, each over 300 seeded values: `(long (int x))` is x when x
+;; fits an i32 (the round trip is decided by the builtins `trunc` and `sext`, so a value that
+;; does not fit is never converted); `(int (long y))` is y for every i32 y; `(long (double x))`
+;; is x for |x| up to 2^53, where an f64 holds every integer, and `(long (float x))` for |x|
+;; up to 2^24, where an f32 does; `(short (int s))` is s for every i16 s and `(byte (short b))`
+;; is b for every i8 b. The last run plants a fault, a law that says `(long (int x))` is x
+;; with its low bit flipped, in a second Checks, and `check-detects` fails the case if that
+;; run found nothing.
+(ns main (:use tl.rng tl.check))
+
+;; any i64 of a random magnitude, either sign: 1 to 2^63 - 1
+(defun spread (r: Rng) -> i64
+  (let ((m (shr (rng-next r) (+ 1 (rng-below r 63)))))
+    (if (= (rng-below r 2) 0) m (neg m))))
+
+;; below 2^bits in magnitude, either sign
+(defun below (r: Rng bits: i64) -> i64
+  (let ((m (shr (rng-next r) (- 64 bits))))
+    (if (= (rng-below r 2) 0) m (neg m))))
+
+(defun fits32 (x: i64) -> bool (= (sext i64 (trunc i32 x)) x))
+
+(defstruct Seen (fit: (Cell i64) other: (Cell i64)))
+
+(defun bump (cell: (Cell i64)) -> unit (set! cell (+ @cell 1)))
+
+(defun judge (c: Checks r: Rng wrong: bool seen: Seen) -> unit
+  (let ((x (spread r))
+        (y (trunc i32 (rng-next r)))
+        (w (below r 53))
+        (v (below r 24))
+        (s (trunc i16 (rng-next r)))
+        (b (trunc i8 (rng-next r))))
+    (do (if (fits32 x)
+            (do (bump (. seen fit))
+                (check c (= (long (int x)) (if wrong (bit-xor 1 x) x))))
+            (bump (. seen other)))
+        (check c (= (int (long y)) y))
+        (check c (= (long (double w)) w))
+        (check c (= (double (long (double w))) (double w)))
+        (check c (= (long (float v)) v))
+        (check c (= (short (int s)) s))
+        (check c (= (byte (short b)) b))
+        (check c (= (long (int (short (byte b)))) (sext i64 b))))))
+
+(defun sweep (c: Checks seed: i64 n: i64 wrong: bool seen: Seen) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k n) (judge c r wrong seen))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (seen (Seen (cell 0) (cell 0))))
+    (do (sweep c 2870 300 false seen)
+        (check c (> @(. seen fit) 100))
+        (check c (> @(. seen other) 50))
+        (sweep p 2870 40 true (Seen (cell 0) (cell 0)))
+        (check-detects c p)
+        (checks-result c))))

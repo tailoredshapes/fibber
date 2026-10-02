@@ -1,0 +1,32 @@
+;; spec:   stdlib §2.3 (ToInt, ToLong are protocols with user instances), §4.3 (rows int long)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: int long
+;; The conversions are protocols (`ToInt`, `ToLong`), so a user type gets `int` and `long`
+;; from one instance each, a generic function bounded by the protocol takes an i64, an f64
+;; and a char alike (each dispatched statically), and `int` and `long` are values: a source
+;; mapped through them gives a Vec of the target type. The instance for `Pennies` checks its
+;; own range, which is the user's to decide.
+(ns main (:use tl.check))
+
+(defstruct Pennies (n: i64))
+
+(impl ToLong Pennies (long (self) (. self n)))
+(impl ToInt Pennies (int (self) (int (. self n))))
+
+(defun whole (x: t) :where ((ToInt t)) -> i32 (int x))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (long (Pennies 250)) 250))
+        (check c (= (int (Pennies 250)) 250i32))
+        (check c (= (whole (Pennies -7)) -7i32))
+        (check c (= (whole 41) 41i32))
+        (check c (= (whole 41.9) 41i32))
+        (check c (= (whole \a) 97i32))
+        (check c (= (vec (map int [1.5 2.5 -3.5])) [1i32 2i32 -3i32]))
+        (check c (= (vec (map long (str-chars "az"))) [97 122]))
+        (check c (= (reduce + 0 (map long [1i8 2i8 3i8])) 6))
+        (checks-result c))))

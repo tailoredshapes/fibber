@@ -1,0 +1,62 @@
+;; spec:   stdlib §4.3 (rows char int long), §8.1 item 2 (a naive reference), types §1.1 (a char is a Unicode scalar)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: char int long
+;; `(char n)` over seeded code points, half drawn over the whole range and half at the
+;; edges of the UTF-8 widths (0x7F, 0x80, 0x7FF, 0x800, 0xD7FF, 0xE000, 0xFFFF, 0x10000,
+;; 0x10FFFF, each within one). A value is a scalar when it is in 0 to 0x10FFFF and not in
+;; 0xD800 to 0xDFFF, which this case writes out as the definition; only scalars are
+;; converted (a non-scalar traps: cases 2900 to 2905) and the tallies say how many were
+;; and were not. For a scalar v the character reads back as v through `char->i32`, `int` and
+;; `long`, the i32 and the i64 source give the same character, and its UTF-8 text has the
+;; width the code point's range says (1, 2, 3 or 4 bytes), which no code of the
+;; conversion decides. The last run plants a fault, a reference that flips the low bit of v,
+;; in a second Checks, and `check-detects` fails the case if that run found nothing.
+(ns main (:use tl.rng tl.check))
+
+(defun scalar? (v: i64) -> bool
+  (and (>= v 0) (<= v 1114111) (not (and (>= v 55296) (<= v 57343)))))
+
+(defun width-of (v: i64) -> i64
+  (if (< v 128) 1 (if (< v 2048) 2 (if (< v 65536) 3 4))))
+
+(defun drawn (r: Rng) -> i64 (rng-below r 1114112))
+
+(defun edge (r: Rng) -> i64
+  (let ((base (match (rng-below r 9)
+                (0 127) (1 128) (2 2047) (3 2048) (4 55295) (5 57344) (6 65535) (7 65536) (_ 1114111))))
+    (+ base (- (rng-below r 3) 1))))
+
+(defstruct Seen (yes: (Cell i64) no: (Cell i64)))
+
+(defun bump (cell: (Cell i64)) -> unit (set! cell (+ @cell 1)))
+
+(defun judge (c: Checks v: i64 wrong: bool seen: Seen) -> unit
+  (if (scalar? v)
+      (let ((want (if wrong (bit-xor 1 v) v))
+            (ch (char v)))
+        (do (bump (. seen yes))
+            (check c (= (sext i64 (char->i32 ch)) want))
+            (check c (= (sext i64 (int ch)) want))
+            (check c (= (long ch) want))
+            (check c (= (char (trunc i32 v)) ch))
+            (check c (= (str-len (char->str ch)) (width-of want)))))
+      (bump (. seen no))))
+
+(defun sweep (c: Checks seed: i64 n: i64 wrong: bool seen: Seen) -> unit
+  (let ((r (rng seed)))
+    (dotimes (k n)
+      (judge c (if (= (rem k 2) 0) (drawn r) (edge r)) wrong seen))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (seen (Seen (cell 0) (cell 0))))
+    (do (sweep c 2862 300 false seen)
+        (check c (> @(. seen yes) 250))
+        (check c (> @(. seen no) 10))
+        (sweep p 2862 40 true (Seen (cell 0) (cell 0)))
+        (check-detects c p)
+        (checks-result c))))

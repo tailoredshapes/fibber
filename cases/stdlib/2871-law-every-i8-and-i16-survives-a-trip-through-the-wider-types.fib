@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.3 (rows byte short int long float double), §8.1 item 4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: byte short int long float double
+;; The whole of two small domains, not a sample: each of the 256 values of an i8 goes up through
+;; `short`, `int`, `long`, `float` and `double` and back down through `byte` (and, for the
+;; floats, through the conversion that cuts), and each of the 65536 values of an i16 goes up
+;; through `int`, `long`, `float` and `double` and back through `short`; every one comes back
+;; as itself, and the value that went up is the sign extension the builtin `sext` gives.
+;; An f32 holds every i16 exactly (24 bits), so nothing is rounded on the way. The last run
+;; plants a fault, a reference that flips the low bit of the value, over the i8s in a second
+;; Checks, and `check-detects` fails the case if that run found nothing.
+(ns main (:use tl.check))
+
+(defun up-down8 (c: Checks b: i8 wrong: bool) -> unit
+  (let ((want (if wrong (bit-xor 1i8 b) b)))
+    (do (check c (= (byte (short b)) want))
+        (check c (= (byte (int b)) want))
+        (check c (= (byte (long b)) want))
+        (check c (= (byte (float b)) want))
+        (check c (= (byte (double b)) want))
+        (check c (= (long (int (short b))) (sext i64 want))))))
+
+(defun up-down16 (c: Checks s: i16) -> unit
+  (do (check c (= (short (int s)) s))
+      (check c (= (short (long s)) s))
+      (check c (= (short (float s)) s))
+      (check c (= (short (double s)) s))
+      (check c (= (long (int s)) (sext i64 s)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (dotimes (k 256) (up-down8 c (trunc i8 k) false))
+        (dotimes (k 65536) (up-down16 c (trunc i16 k)))
+        (check c (= (checks-made c) (+ 1536 327680)))
+        (dotimes (k 256) (up-down8 p (trunc i8 k) true))
+        (check-detects c p)
+        (checks-result c))))
