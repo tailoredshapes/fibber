@@ -1,0 +1,208 @@
+;; compiler/types/ty.fib: the type grammar of spec/types.md §1 as data, as
+;; crates/fibref/src/types/ty.rs (398 lines of Rust).
+;;
+;; THE SHARED BASE of M6 step 3 (spec/bootstrap.md §5): the data and the
+;; signatures are fixed by package P1; nothing here may change without
+;; telling the other porters.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the ids `TypeId`, `ProtoId`, `TvId`, `CvId` (and ast.rs's `ExprId`,
+;;   `BindingId`, `FunId`, `DefId`, `ExternId`, `BuiltinId`, decls.rs's
+;;   `ModuleId`) are plain `i64`s: a struct per id would allocate. The
+;;   names are in the field names (`tv`, `proto`, `type`) and the comments.
+;; - a variant's name is global to the modules that `:use` its module, so
+;;   the variants carry a prefix, one letter or two per enum: `Scalar` `S`,
+;;   `Con` `K`, `Colour` `C`, `Ty` `T`, `Leaf` `L`, `Pred` `P`
+;;   (`TVar` is Rust's `Ty::Var`, `CGen` `Colour::Gen`, `KNominal`
+;;   `Con::Nominal`, `PProto` `Pred::Proto`).
+;; - the Rust methods are functions named `ty-NAME`, `pred-NAME`,
+;;   `scalar-NAME`; `&mut dyn FnMut` is a function parameter: OWNED where
+;;   the function recurses through a closure (`ty-map-leaves`, `ty-map-colours`,
+;;   `pred-map-tys`: a closure that captures a `:borrow` parameter is
+;;   rejected as an escape), `:borrow` where it only calls it (`ty-visit`),
+;;   and `Vec<T>` is `(Vec T)`. `Con::Dyn(ProtoId, bool)` is `(KDyn proto
+;;   send)`: the bool is the Rust one.
+(ns types.ty)
+
+(defenum Scalar SBool SI8 SI16 SI32 SI64 SF32 SF64 SChar SKeyword SUnit SPtr)
+(derive Eq Scalar) (derive Ord Scalar) (derive Hash Scalar)
+
+;; The head of a type application: a scalar, a built-in constructor, a
+;; nominal type (`type` is an index into the type table) or the trait
+;; object of a protocol (`proto`; `send` whether it is the sendable one).
+(defenum Con
+  (KScalar scalar: Scalar)
+  KStr KArray KCell KAtom KWeak KTask
+  (KNominal type: i64)
+  (KDyn proto: i64 send: bool))
+(derive Eq Con) (derive Ord Con) (derive Hash Con)
+
+;; A colour (§1.4): send, local, a colour variable (`cv` the allocation
+;; counter of the store), a quantified colour of a scheme, or a rigid one.
+(defenum Colour
+  CSend CLocal
+  (CVar cv: i64)
+  (CGen index: i64)
+  (CRigid index: i64))
+(derive Eq Colour) (derive Ord Colour) (derive Hash Colour)
+
+;; A type: a unification variable (a key of the store), a quantified
+;; variable of a scheme, a rigid variable, a constructor applied to
+;; arguments, or a function type with a colour.
+(defenum Ty
+  (TVar tv: i64)
+  (TGen index: i64)
+  (TRigid index: i64)
+  (TCon con: Con args: (Vec Ty))
+  (TFn colour: Colour params: (Vec Ty) ret: Ty))
+(derive Eq Ty) (derive Hash Ty)
+
+;; What `ty-visit` hands its function: a variable, a quantified or rigid
+;; variable, or the colour of a function type.
+(defenum Leaf
+  (LVar tv: i64)
+  (LGen index: i64)
+  (LRigid index: i64)
+  (LColour colour: Colour))
+(derive Eq Leaf)
+
+;; A predicate: a protocol applied to types, `Send`, `Object`, `Weakable`.
+(defenum Pred
+  (PProto proto: i64 args: (Vec Ty))
+  (PSend ty: Ty)
+  (PObject ty: Ty)
+  (PWeakable ty: Ty))
+(derive Eq Pred) (derive Hash Pred)
+
+;; ---- scalars
+
+(defun scalar-all () -> (Vec Scalar)
+  [SBool SI8 SI16 SI32 SI64 SF32 SF64 SChar SKeyword SUnit SPtr])
+
+(defun scalar-name (s: Scalar) -> str
+  (match s
+    ((SBool) "bool") ((SI8) "i8") ((SI16) "i16") ((SI32) "i32") ((SI64) "i64")
+    ((SF32) "f32") ((SF64) "f64") ((SChar) "char") ((SKeyword) "keyword")
+    ((SUnit) "unit") ((SPtr) "ptr")))
+
+(defun scalar-from-name (name: str) -> (Option Scalar)
+  (first (filterv (fn (s: Scalar) (= (scalar-name s) name)) (scalar-all))))
+
+(defun scalar-is-int (s: Scalar) -> bool
+  (match s ((SI8) true) ((SI16) true) ((SI32) true) ((SI64) true) (_ false)))
+
+(defun scalar-is-float (s: Scalar) -> bool
+  (match s ((SF32) true) ((SF64) true) (_ false)))
+
+;; ---- constructors of common types
+
+(defun ty-scalar (s: Scalar) -> Ty (TCon (KScalar s) []))
+(defun ty-i64 () -> Ty (ty-scalar SI64))
+(defun ty-bool () -> Ty (ty-scalar SBool))
+(defun ty-unit () -> Ty (ty-scalar SUnit))
+(defun ty-str () -> Ty (TCon KStr []))
+(defun ty-cell (t: Ty) -> Ty (TCon KCell [t]))
+(defun ty-task (t: Ty) -> Ty (TCon KTask [t]))
+(defun ty-nominal (id: i64 args: (Vec Ty)) -> Ty (TCon (KNominal id) args))
+
+;; A colour in a type-argument position: a function type with no
+;; parameters and the colour.
+(defun ty-colour-arg (k: Colour) -> Ty (TFn k [] (ty-unit)))
+
+;; ---- substitution and traversal
+
+;; The colour of quantified colour variable i of `colours`; k itself when
+;; it is not a quantified one or is out of range.
+(defun subst-colour (k: Colour colours: (Vec Colour)) -> Colour
+  (match k
+    ((CGen i) (if (< i (count colours)) (nth colours i) k))
+    (_ k)))
+
+;; t with the quantified variables replaced by tys and the quantified
+;; colours by colours (a variable out of range stays).
+(defun ty-subst-gen (t: Ty tys: (Vec Ty) colours: (Vec Colour)) -> Ty
+  (match t
+    ((TGen i) (if (< i (count tys)) (nth tys i) t))
+    ((TCon c args)
+     (TCon c (mapv (fn (a: Ty) (ty-subst-gen a tys colours)) args)))
+    ((TFn k ps r)
+     (TFn (subst-colour k colours)
+          (mapv (fn (p: Ty) (ty-subst-gen p tys colours)) ps)
+          (ty-subst-gen r tys colours)))
+    (_ t)))
+
+;; t with every leaf variable (var, gen, rigid) that f maps to a type
+;; replaced by it.
+(defun ty-map-leaves (t: Ty f: (fn (Ty) (Option Ty))) -> Ty
+  (match t
+    ((TCon c args) (TCon c (mapv (fn (a: Ty) (ty-map-leaves a f)) args)))
+    ((TFn k ps r)
+     (TFn k (mapv (fn (p: Ty) (ty-map-leaves p f)) ps) (ty-map-leaves r f)))
+    (_ (unwrap-or (f t) t))))
+
+;; t with the rigid variables replaced by tys (those out of range stay).
+(defun ty-subst-rigid (t: Ty tys: (Vec Ty)) -> Ty
+  (ty-map-leaves t
+    (fn (l: Ty)
+      (match l
+        ((TRigid i) (if (< i (count tys)) (some (nth tys i)) nil))
+        (_ nil)))))
+
+;; t with the colour of every function type mapped by f.
+(defun ty-map-colours (t: Ty f: (fn (Colour) Colour)) -> Ty
+  (match t
+    ((TCon c args) (TCon c (mapv (fn (a: Ty) (ty-map-colours a f)) args)))
+    ((TFn k ps r)
+     (TFn (f k) (mapv (fn (p: Ty) (ty-map-colours p f)) ps) (ty-map-colours r f)))
+    (_ t)))
+
+;; Calls f on every leaf of t, left to right, a function's colour before
+;; its parameters and result.
+(defun ty-visit (t: Ty f: (fn (Leaf) unit) :borrow) -> unit
+  (match t
+    ((TVar v) (f (LVar v)))
+    ((TGen i) (f (LGen i)))
+    ((TRigid i) (f (LRigid i)))
+    ((TCon _ args) (run! (fn (a: Ty) (ty-visit a f)) args))
+    ((TFn k ps r)
+     (do (f (LColour k))
+         (run! (fn (p: Ty) (ty-visit p f)) ps)
+         (ty-visit r f)))))
+
+;; The unification variables of t, each once, in order of first
+;; occurrence.
+(defun ty-vars (t: Ty) -> (Vec i64)
+  (let ((out (cell (vec-empty))))
+    (do (ty-visit t
+          (fn (l: Leaf)
+            (match l
+              ((LVar v) (if (includes? v @out) () (set! out (conj @out v))))
+              (_ ()))))
+        @out)))
+
+;; The colour each type argument stands for: a function type with no
+;; parameters gives its colour, any other type `local`.
+(defun colour-args (args: (Vec Ty)) -> (Vec Colour)
+  (mapv (fn (a: Ty)
+          (match a
+            ((TFn k ps _) (if (empty? ps) k CLocal))
+            (_ CLocal)))
+        args))
+
+;; ---- predicates
+
+;; p with f applied to each of its types.
+(defun pred-map-tys (p: Pred f: (fn (Ty) Ty)) -> Pred
+  (match p
+    ((PProto id args) (PProto id (mapv f args)))
+    ((PSend t) (PSend (f t)))
+    ((PObject t) (PObject (f t)))
+    ((PWeakable t) (PWeakable (f t)))))
+
+;; The types of p, in order.
+(defun pred-tys (p: Pred) -> (Vec Ty)
+  (match p
+    ((PProto _ args) args)
+    ((PSend t) [t])
+    ((PObject t) [t])
+    ((PWeakable t) [t])))

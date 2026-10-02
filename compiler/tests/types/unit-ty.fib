@@ -1,0 +1,44 @@
+;; compiler/tests/types/unit-ty.fib: the inline tests of crates/fibref/src/
+;; types/ty.rs (scalar_names_round_trip, subst_gen_replaces_types_and_
+;; colours, vars_are_listed_once_in_order), plus subst_rigid, map_colours,
+;; colour_args and the derived equality and hash of Ty as a Map key.
+;; Build: fibc build compiler/tests/types/unit-ty.fib -I compiler -I lib -o OUT
+(ns main (:use types.ty types.check))
+
+(defun scalars () -> bool
+  (every? (fn (s: Scalar) (= (scalar-from-name (scalar-name s)) (some s))) (scalar-all)))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (check cs "scalar names round trip" (scalars))
+      (check cs "scalar from-name of int is nil" (nil? (scalar-from-name "int")))
+      (check cs "scalar is-int and is-float"
+             (and (scalar-is-int SI32) (not (scalar-is-int SF32)) (scalar-is-float SF64)))
+      (check cs "subst-gen replaces types and colours"
+        (= (ty-subst-gen (TFn (CGen 0) [(TGen 0)] (TGen 1)) [(ty-i64) (ty-str)] [CLocal])
+           (TFn CLocal [(ty-i64)] (ty-str))))
+      (check cs "subst-gen leaves out-of-range gens and colours"
+        (= (ty-subst-gen (TFn (CGen 3) [(TGen 2)] (TVar 1)) [(ty-i64)] [])
+           (TFn (CGen 3) [(TGen 2)] (TVar 1))))
+      (check cs "vars are listed once in order"
+        (= (ty-vars (TCon KArray [(TFn CSend [(TVar 2) (TVar 1)] (TVar 2))])) [2 1]))
+      (check cs "subst-rigid replaces rigid only"
+        (= (ty-subst-rigid (TCon KCell [(TRigid 1)]) [(ty-i64) (ty-str)]) (ty-cell (ty-str))))
+      (check cs "map-colours maps every function colour"
+        (= (ty-map-colours (TFn CSend [(TFn CLocal [] (ty-unit))] (ty-i64))
+                           (fn (k: Colour) (match k ((CSend) CLocal) (_ CSend))))
+           (TFn CLocal [(TFn CSend [] (ty-unit))] (ty-i64))))
+      (check cs "colour-args"
+        (= (colour-args [(ty-colour-arg CSend) (ty-i64) (TFn CSend [(ty-i64)] (ty-i64))])
+           [CSend CLocal CLocal]))
+      (check cs "pred-tys and pred-map-tys"
+        (let ((p (PProto 3 [(ty-i64) (ty-str)])))
+          (= (pred-tys (pred-map-tys p (fn (t: Ty) (ty-cell t))))
+             [(ty-cell (ty-i64)) (ty-cell (ty-str))])))
+      (check cs "a Ty is a Map key"
+        (let ((m (assoc (assoc (map-empty) (ty-i64) 1) (TFn CLocal [(TVar 0)] (ty-str)) 2)))
+          (and (= (get m (ty-i64)) (some 1))
+               (= (get m (TFn CLocal [(TVar 0)] (ty-str))) (some 2))
+               (nil? (get m (TFn CLocal [(TVar 1)] (ty-str)))))))
+      (finish cs))))

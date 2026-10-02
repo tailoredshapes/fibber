@@ -1,0 +1,189 @@
+;; compiler/types/ast.fib: the resolved core AST that lowering produces
+;; from expanded forms, as crates/fibref/src/types/ast.rs (380 lines of
+;; Rust).
+;;
+;; Every expression has an `ExprId` and a position; every binding site has
+;; a `BindingId` unique in the whole program; every name is resolved to a
+;; binding or a `GlobalRef`.
+;;
+;; THE SHARED BASE of M6 step 3 (spec/bootstrap.md §5): the data is fixed
+;; by package P1. Shapes decided where Rust and fibber differ (see also
+;; types.ty):
+;; - every id (`ExprId`, `BindingId`, `FunId`, `DefId`, `ExternId`,
+;;   `BuiltinId`) is an `i64`; `Option<usize>` is `(Option i64)`.
+;; - the variants carry a prefix, as their names are global: `ExprKind`
+;;   `E`, `GlobalRef` `G`, `BindingKind` `Bk`, `Lit` `Lit`, `Place` `Pl`,
+;;   `Arg` `Arg`, `ConvOp` `Cv`, `Rest` `Rest`, `PatKind` `P`, `TypeAnn`
+;;   `A`, `ColourAnn` `Ca`; `IntConv` keeps `Trunc` `Zext` `Sext`.
+;; - the Rust tuples `(Pattern, Expr)`, `(BindingId, Expr)`,
+;;   `(BindingId, Option<TypeAnn>)` are the structs `LetBind`, `LoopBind`,
+;;   `FnParam`; `Box<Expr>` is an `Expr`; `Form` in `Quote` is the reader's
+;;   `Stx`; `char` is a `char`.
+;; - `Expr::children(f)` is `expr-children`, the children in the same
+;;   order as a `Vec`: a closure that captures a borrowed function is
+;;   rejected as an escape, and the `Vec` is what a caller iterates.
+(ns types.ast (:use syntax.pos syntax.form types.ty))
+
+(defenum GlobalRef
+  (GFun fun: i64)
+  (GCtor type: i64 variant: (Option i64))
+  (GMethod proto: i64 index: i64)
+  (GBuiltin builtin: i64)
+  (GDef def: i64)
+  (GExtern extern: i64))
+(derive Eq GlobalRef) (derive Hash GlobalRef)
+
+(defenum BindingKind BkParam BkAmpParam BkLet BkPattern BkLoop BkFnSelf)
+(derive Eq BindingKind)
+
+;; A binding site: its name, how it binds, where, and its annotation.
+(defstruct BindingInfo (name: str kind: BindingKind pos: Pos ann: (Option TypeAnn)))
+
+(defenum Lit
+  (LitInt v: i64 width: IntWidth)
+  (LitFloat v: f64 width: FltWidth)
+  (LitStr v: str)
+  (LitChar v: char)
+  (LitBool v: bool)
+  (LitKeyword v: str)
+  LitUnit)
+(derive Eq Lit)
+
+(defstruct Expr (id: i64 pos: Pos kind: ExprKind))
+
+;; The target of a deref or set: an expression, or an `&` binding.
+(defenum Place
+  (PlExpr e: Expr)
+  (PlAmp binding: i64))
+
+;; A call argument: an expression, or an `&` binding at a position.
+(defenum Arg
+  (ArgExpr e: Expr)
+  (ArgAmp binding: i64 pos: Pos))
+
+(defstruct LetBind (pat: Pattern init: Expr))
+(defstruct LoopBind (binding: i64 init: Expr))
+(defstruct FnParam (binding: i64 ann: (Option TypeAnn)))
+
+;; A `fn` literal: its self-name binding, parameters, return annotation,
+;; body and capture set.
+(defstruct FnLit
+  (name: (Option i64) params: (Vec FnParam) ret: (Option TypeAnn)
+   body: Expr captures: (Vec i64)))
+
+(defenum IntConv Trunc Zext Sext)
+(derive Eq IntConv)
+
+(defenum ConvOp
+  (CvIntToInt conv: IntConv)
+  CvFloatToFloat
+  (CvFloatToInt signed: bool)
+  (CvIntToFloat signed: bool))
+(derive Eq ConvOp)
+
+(defenum ExprKind
+  (ELit lit: Lit)
+  (ELocal binding: i64)
+  (EGlobal ref: GlobalRef)
+  (ECall head: Expr args: (Vec Arg))
+  (EFn lit: FnLit)
+  (ELet binds: (Vec LetBind) body: Expr)
+  (EIf cond: Expr then: Expr else: Expr)
+  (EDo exprs: (Vec Expr))
+  (EMatch scrutinee: Expr clauses: (Vec Clause))
+  (ELoop binds: (Vec LoopBind) body: Expr)
+  (ERecur exprs: (Vec Expr))
+  ;; `(. e f)`: the operand, the field, the printed operand for messages
+  (EField e: Expr field: str text: str)
+  ;; `(deref p)`, `@p`; the printed operand
+  (EDeref place: Place text: str)
+  (ESet place: Place value: Expr)
+  ;; `(set-field! &x f e)`: the cell variable, the field, the value
+  (ESetField binding: i64 field: str value: Expr)
+  (EAsync body: Expr captures: (Vec i64))
+  (EAwait e: Expr)
+  (EUnsafe e: Expr)
+  (EQuote form: Stx)
+  ;; `(dyn P e)` / `(dyn (P D..) e)`, `:send` the bool
+  (EDyn proto: i64 args: (Vec TypeAnn) send: bool e: Expr)
+  (EConvert op: ConvOp to: Scalar e: Expr)
+  (EConcat exprs: (Vec Expr)))
+
+(defstruct Clause (pat: Pattern guard: (Option Expr) body: Expr))
+
+(defenum Rest
+  RestExact
+  RestIgnore
+  (RestBind binding: i64))
+(derive Eq Rest)
+
+(defstruct Pattern (pos: Pos kind: PatKind))
+
+(defenum PatKind
+  PWild
+  (PBind binding: i64)
+  (PLit lit: Lit)
+  (PCtor type: i64 variant: (Option i64) pats: (Vec Pattern))
+  (PAs pat: Pattern binding: i64)
+  (PVec pats: (Vec Pattern) rest: Rest))
+
+;; A type as written, resolved by lowering (the names of types and
+;; protocols are ids) but not yet a `Ty`.
+(defenum TypeAnn
+  (AVar name: str)
+  ASelf
+  (AScalar scalar: Scalar)
+  AStr
+  (ABuiltin con: Con arg: TypeAnn)
+  (ANominal type: i64 args: (Vec TypeAnn))
+  ;; `(fn κ? (A..) R)`; no colour when it is omitted (§1.4)
+  (AFn colour: (Option ColourAnn) params: (Vec TypeAnn) ret: TypeAnn)
+  ;; the argument of a nominal type at a colour parameter (§1.3)
+  (AColourArg colour: ColourAnn)
+  ;; `(dyn P)` / `(dyn (P D..))`, with `:send` the bool
+  (ADyn proto: i64 args: (Vec TypeAnn) send: bool))
+(derive Eq TypeAnn)
+
+(defenum ColourAnn
+  (CaFixed colour: Colour)
+  (CaNamed name: str))
+(derive Eq ColourAnn)
+
+;; The place's expression, if it has one.
+(defun place-children :private (p: Place) -> (Vec Expr)
+  (match p
+    ((PlExpr e) [e])
+    ((PlAmp _) [])))
+
+(defun arg-exprs :private (args: (Vec Arg)) -> (Vec Expr)
+  (reduce (fn (acc: (Vec Expr) a: Arg)
+            (match a ((ArgExpr e) (conj acc e)) ((ArgAmp _ _) acc)))
+          [] args))
+
+;; The direct subexpressions of e, in the order Rust's `Expr::children`
+;; calls its function: a call's head then its expression arguments, a
+;; clause's guard then its body, a loop's initialisers then its body.
+(defun expr-children (e: Expr) -> (Vec Expr)
+  (match (. e kind)
+    ((ECall h args) (into [h] (arg-exprs args)))
+    ((EFn lit) [(. lit body)])
+    ((ELet bs body) (conj (mapv (fn (b: LetBind) (. b init)) bs) body))
+    ((EIf c t f) [c t f])
+    ((EDo es) es)
+    ((ERecur es) es)
+    ((EConcat es) es)
+    ((EMatch s cls)
+     (reduce (fn (acc: (Vec Expr) c: Clause)
+               (conj (match (. c guard) ((some g) (conj acc g)) (nil acc)) (. c body)))
+             [s] cls))
+    ((ELoop bs body) (conj (mapv (fn (b: LoopBind) (. b init)) bs) body))
+    ((EDeref p _) (place-children p))
+    ((ESet p v) (conj (place-children p) v))
+    ((EField x _ _) [x])
+    ((ESetField _ _ x) [x])
+    ((EAsync x _) [x])
+    ((EAwait x) [x])
+    ((EUnsafe x) [x])
+    ((EDyn _ _ _ x) [x])
+    ((EConvert _ _ x) [x])
+    (_ [])))

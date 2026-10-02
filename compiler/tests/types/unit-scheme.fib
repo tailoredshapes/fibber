@@ -1,0 +1,36 @@
+;; compiler/tests/types/unit-scheme.fib: the inline test of crates/fibref/
+;; src/types/scheme.rs (instantiation_substitutes_everywhere), the mono
+;; scheme and the display of a type error (error.rs display_names_the_
+;; position).
+;; Build: fibc build compiler/tests/types/unit-scheme.fib -I compiler -I lib -o OUT
+(ns main (:use types.ty types.scheme types.error types.check syntax.pos))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (s (Scheme 1 1 ["a"] [(PProto 0 [(TGen 0)])] [(BCaps (CGen 0) (TGen 0))]
+                   (TFn (CGen 0) [(TGen 0)] (TGen 0)) [false] ["x"]))
+        (i (scheme-instantiate-with s [(ty-i64)] [CSend])))
+    (do
+      (check cs "instantiation substitutes the context" (= (. i preds) [(PProto 0 [(ty-i64)])]))
+      (check cs "instantiation substitutes the colour bounds"
+             (= (. i colour-bounds) [(BCaps CSend (ty-i64))]))
+      (check cs "instantiation substitutes the type"
+             (= (. i ty) (TFn CSend [(ty-i64)] (ty-i64))))
+      (check cs "has-amp is false for no & parameter" (not (scheme-has-amp s)))
+      (check cs "has-amp is true for an & parameter"
+             (scheme-has-amp (Scheme 0 0 [] [] [] (ty-i64) [false true] ["a" "b"])))
+      (check cs "mono has no variables"
+             (= (scheme-mono (ty-str)) (Scheme 0 0 [] [] [] (ty-str) [] [])))
+      (check cs "flow bounds instantiate their colours"
+             (= (. (scheme-instantiate-with
+                     (Scheme 0 2 [] [] [(BFlow (CGen 0) (CGen 1))] (ty-unit) [] [])
+                     [] [CLocal CSend]) colour-bounds)
+                [(BFlow CLocal CSend)]))
+      (check cs "a type error displays its position and message"
+             (= (type-error-text (type-error Unify (Pos "f.fib" 3 7 0 1) "cannot unify i64 with str"))
+                "f.fib:3:7: cannot unify i64 with str"))
+      (check cs "error kinds are named" (= (error-kind-name DefCycle) "DefCycle"))
+      (check cs "the constructors set the kind"
+             (and (= (. (type-error-resolve (Pos "f" 1 1 0 0) "m") kind) Resolve)
+                  (= (. (type-error-other (Pos "f" 1 1 0 0) "m") kind) Other)))
+      (finish cs))))

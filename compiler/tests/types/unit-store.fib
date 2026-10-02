@@ -1,0 +1,65 @@
+;; compiler/tests/types/unit-store.fib: the inline tests of crates/fibref/
+;; src/types/store.rs (resolve_follows_links_and_zonk_substitutes,
+;; binding_lowers_levels, occurs_sees_through_links), and what the Rust
+;; ones leave to the types: ids and levels, colour variables, `leave` at
+;; level 0, and a store at scale (50,000 variables bound in a chain and
+;; resolved: the guard of plan G1, a Vec indexed by id would take minutes).
+;; Build: fibc build compiler/tests/types/unit-store.fib -I compiler -I lib -o OUT
+(ns main (:use types.ty types.store types.check))
+
+(defun var-id (t: Ty) -> i64
+  (match t ((TVar v) v) (_ -1)))
+
+;; n variables, each bound to the previous one, the first to i64.
+(defun chain (s: Store n: i64) -> Ty
+  (loop ((i 0) (prev (ty-i64)))
+    (if (< i n)
+        (let ((v (store-fresh s)))
+          (do (store-bind s (var-id v) prev) (recur (+ i 1) v)))
+        prev)))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (let ((s (store-new))
+            (a (store-fresh s))
+            (b (store-fresh s)))
+        (do (store-bind s (var-id a) b)
+            (store-bind s (var-id b) (ty-i64))
+            (check cs "resolve follows links" (= (store-resolve s a) (ty-i64)))
+            (check cs "zonk substitutes" (= (store-zonk s (ty-cell a)) (ty-cell (ty-i64))))))
+      (let ((s (store-new)))
+        (do (store-enter s)
+            (let ((outer (store-fresh s)))
+              (do (store-enter s)
+                  (let ((inner (store-fresh s)))
+                    (do (check cs "inner variable is at level 2"
+                               (= (store-level-of s (var-id inner)) (some 2)))
+                        (store-bind s (var-id outer) (ty-cell inner))
+                        (check cs "binding lowers levels"
+                               (= (store-level-of s (var-id inner)) (some 1)))
+                        (check cs "a bound variable has no level"
+                               (nil? (store-level-of s (var-id outer))))))))))
+      (let ((s (store-new))
+            (a (store-fresh s))
+            (b (store-fresh s)))
+        (do (store-bind s (var-id b) (ty-cell a))
+            (check cs "occurs sees through links" (store-occurs s (var-id a) b))
+            (check cs "occurs is false for an unrelated variable"
+                   (not (store-occurs s (var-id b) a)))))
+      (let ((s (store-new)))
+        (check cs "variables are numbered from 0 in order"
+               (= [(store-fresh s) (store-fresh s) (store-fresh s)] [(TVar 0) (TVar 1) (TVar 2)])))
+      (let ((s (store-new)))
+        (check cs "colour variables are numbered from 0"
+               (= [(store-fresh-colour s) (store-fresh-colour s)] [(CVar 0) (CVar 1)])))
+      (let ((s (store-new)))
+        (do (store-leave s)
+            (check cs "leave stops at level 0" (= (store-level s) 0))
+            (store-enter s) (store-enter s) (store-leave s)
+            (check cs "enter and leave" (= (store-level s) 1))))
+      (let ((s (store-new))
+            (end (chain s 50000)))
+        (do (check cs "a chain of 50000 resolves to its end" (= (store-resolve s end) (ty-i64)))
+            (check cs "and zonks to it" (= (store-zonk s (ty-cell end)) (ty-cell (ty-i64))))))
+      (finish cs))))

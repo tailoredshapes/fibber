@@ -1,0 +1,55 @@
+;; compiler/types/error.fib: type and resolution errors, as
+;; crates/fibref/src/types/error.rs (138 lines of Rust). The message of
+;; each starts with the canonical text of spec/types.md §6.14 where the
+;; catalogue has one; `ErrorKind` names the catalogue entry so tests need
+;; not match on text alone.
+;;
+;; Shapes: the variants of `ErrorKind` keep the Rust names (the dump of
+;; spec/bootstrap.md prints them: `error-kind-name`, Rust's `{:?}`);
+;; `TResult<T>` is `(Result T TypeError)`; `TypeError::new`, `resolve`,
+;; `other` are `type-error`, `type-error-resolve`, `type-error-other`; the
+;; `Display` is `type-error-text`. A `Pos` is the reader's.
+(ns types.error
+  (:require [expand.error :as ee])
+  (:use syntax.pos))
+
+(defenum ErrorKind
+  Resolve Unify Infinite NoField FieldUnresolved DerefUnresolved NoInstance
+  ImplContext Ambiguous CellNotSend ValueNotSend RigidColour AmpArgument
+  AmpParamValue AmpPosition AmpFunctionValue NonExhaustive Redundant
+  AwaitOutsideAsync WeakScalar WeakOption NotObject ConstantCalled
+  RecurOutsideLoop RecurNotTail DefUnresolved DefNotConstant DefCycle Other)
+(derive Eq ErrorKind) (derive Hash ErrorKind)
+
+(defstruct TypeError (kind: ErrorKind pos: Pos message: str))
+
+(defun type-error (kind: ErrorKind pos: Pos message: str) -> TypeError
+  (TypeError kind pos message))
+
+(defun type-error-resolve (pos: Pos message: str) -> TypeError
+  (TypeError Resolve pos message))
+
+(defun type-error-other (pos: Pos message: str) -> TypeError
+  (TypeError Other pos message))
+
+;; `FILE:LINE:COL: MESSAGE`.
+(defun type-error-text (e: TypeError) -> str
+  (str-join [(ee/pos-display (. e pos)) ": " (. e message)]))
+
+;; The variant's own name, as Rust's `{:?}` prints it.
+(defun error-kind-name (k: ErrorKind) -> str
+  (match k
+    ((Resolve) "Resolve") ((Unify) "Unify") ((Infinite) "Infinite")
+    ((NoField) "NoField") ((FieldUnresolved) "FieldUnresolved")
+    ((DerefUnresolved) "DerefUnresolved") ((NoInstance) "NoInstance")
+    ((ImplContext) "ImplContext") ((Ambiguous) "Ambiguous")
+    ((CellNotSend) "CellNotSend") ((ValueNotSend) "ValueNotSend")
+    ((RigidColour) "RigidColour") ((AmpArgument) "AmpArgument")
+    ((AmpParamValue) "AmpParamValue") ((AmpPosition) "AmpPosition")
+    ((AmpFunctionValue) "AmpFunctionValue") ((NonExhaustive) "NonExhaustive")
+    ((Redundant) "Redundant") ((AwaitOutsideAsync) "AwaitOutsideAsync")
+    ((WeakScalar) "WeakScalar") ((WeakOption) "WeakOption")
+    ((NotObject) "NotObject") ((ConstantCalled) "ConstantCalled")
+    ((RecurOutsideLoop) "RecurOutsideLoop") ((RecurNotTail) "RecurNotTail")
+    ((DefUnresolved) "DefUnresolved") ((DefNotConstant) "DefNotConstant")
+    ((DefCycle) "DefCycle") ((Other) "Other")))

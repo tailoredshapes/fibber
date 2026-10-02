@@ -1,0 +1,235 @@
+;; compiler/types/decls.fib: the global tables, as crates/fibref/src/types/
+;; decls.rs (475 lines of Rust): structs and enums, protocols, instances,
+;; `defun`s, `def`s, `extern`s, binding sites, and the names each module
+;; binds (spec/types.md §2.7, §3.5 step 3; syntax §5). Three namespaces are
+;; chained: the builtins, the prelude `fib.prelude`, and the user module;
+;; a name defined in a module shadows one it `:use`s.
+;;
+;; THE SHARED BASE of M6 step 3 (spec/bootstrap.md §5): the data is fixed
+;; by package P1, and its functions are written. Shapes decided where Rust
+;; and fibber differ (see also types.ty, types.ast):
+;; - `Globals` is a struct whose tables are `(Table X)` (types.table: a
+;;   Cell over a `(Map i64 X)`, the Rust Vecs, which lowering edits in
+;;   place: `resolve_shape`, `resolve_proto`, the placeholder funs); a
+;;   row is read with `table-get`, replaced with `table-set`, added with
+;;   `table-add` (its id is the Rust index). The scalars the Rust
+;;   struct sets later (`main`, `form`, `vec`, `deref_proto`,
+;;   `expr_count`) are Cells. Read-only (borrowed) during inference.
+;; - the Rust methods of `impl Globals` that decls.rs holds are `g-NAME`
+;;   functions here (`g-ty`, `g-proto`, `g-binding`, `g-fun`, `g-def`,
+;;   `g-ext`, `g-instance`, `g-module`, `g-module-name`, `g-names`, ...);
+;;   `names_mut` is `g-names` too (a `Names` is a struct of Cells, so the
+;;   one is the other). The methods of names.rs (`value`, `type_name`,
+;;   `chain`, ...) are in types.names, as stubs, except `Names`, `Space`,
+;;   `is_private` and `make_private`, which decls.rs re-exports and `exports`
+;;   needs: they are here (`names-is-private`, `names-make-private`).
+;; - `ModuleId` is an `i64`: `module-builtin` 0, `module-prelude` 1,
+;;   `module-main` 2 (the Rust constants).
+;; - `Shape` is `TypeShape` (`TsStruct`, `TsEnum`): `expand.walk` has a
+;;   `Shape` and a variant's and a type's name are global.
+;; - `HashMap<(ProtoId, Con), usize>` is `(Map InstKey i64)`; `HashSet`
+;;   is the prelude's `Set`; `BTreeSet` of `exports` is a sorted `(Vec str)`.
+(ns types.decls
+  (:use syntax.pos syntax.form util.sort types.ty types.scheme types.ast types.table))
+
+(def module-builtin: i64 0)
+(def module-prelude: i64 1)
+(def module-main: i64 2)
+
+;; The three namespaces of a module's names.
+(defenum Space SpValue SpType SpProto)
+(derive Eq Space)
+
+;; The names a module binds, by space (a value is a `GlobalRef`, a type a
+;; `TypeId`, a protocol a `ProtoId`), and which are `:private`. A struct of
+;; Cells: lowering adds names through it.
+(defstruct Names
+  (values: (Cell (Map str GlobalRef)) types: (Cell (Map str i64))
+   protos: (Cell (Map str i64))
+   private-values: (Cell (Set str)) private-types: (Cell (Set str))
+   private-protos: (Cell (Set str))))
+
+(defun names-new () -> Names
+  (Names (cell (map-empty)) (cell (map-empty)) (cell (map-empty))
+         (cell (set-empty)) (cell (set-empty)) (cell (set-empty))))
+
+(defun private-cell :private (n: Names space: Space) -> (Cell (Set str))
+  (match space
+    ((SpValue) (. n private-values))
+    ((SpType) (. n private-types))
+    ((SpProto) (. n private-protos))))
+
+(defun names-is-private (n: Names space: Space name: str) -> bool
+  (contains? @(private-cell n space) name))
+
+(defun names-make-private (n: Names space: Space name: str) -> unit
+  (let ((c (private-cell n space)))
+    (set! c (conj @c name))))
+
+;; A module: its namespace, names, resolution chain (itself, its `:use`s,
+;; its implicit modules, the prelude, the builtins), re-exports, and the
+;; namespaces (and aliases) it can name a module by.
+(defstruct ModuleInfo
+  (ns: str names: Names chain: (Vec i64) uses: (Vec i64) implicit: (Vec i64)
+   reexports: (Vec i64) aliases: (Map str i64)))
+
+;; The links `g-add-module` is given.
+(defstruct Links (uses: (Vec i64) reexports: (Vec i64) implicit: (Vec i64)))
+
+(defstruct FieldDef (name: str ty: Ty))
+(defstruct VariantDef (name: str fields: (Vec FieldDef)))
+
+(defenum TypeShape
+  (TsStruct fields: (Vec FieldDef))
+  (TsEnum variants: (Vec VariantDef)))
+
+;; A struct or enum: params, which params are colour params (`k :colour`;
+;; empty when none is), its shape and position.
+(defstruct TypeDef
+  (name: str module: i64 params: (Vec str) colours: (Vec bool)
+   shape: TypeShape pos: Pos))
+
+(defstruct MethodParam (name: str borrow: bool owned: bool))
+
+;; A protocol method: `self-elsewhere` is whether `Self` occurs anywhere but
+;; the receiver (then it is not callable through `dyn`, §4.4); `default` is
+;; the default body, a form.
+(defstruct MethodDef
+  (name: str params: (Vec MethodParam) scheme: Scheme self-elsewhere: bool
+   default: (Option Stx) pos: Pos))
+
+(defstruct ProtoDef
+  (name: str module: i64 params: (Vec str) methods: (Vec MethodDef)
+   supers: (Vec Pred) pos: Pos))
+
+(defstruct ImplMethod
+  (index: i64 params: (Vec i64) ret: (Option TypeAnn) body: Expr pos: Pos))
+
+;; An instance `(impl (P D..) (K ā) :where C̄)`: head `(K ā)`, determined
+;; arguments `dets` (`D̄`), context.
+(defstruct InstanceDef
+  (proto: i64 con: Con module: i64 var-names: (Vec str) head: Ty dets: (Vec Ty)
+   context: (Vec Pred) methods: (Vec ImplMethod) pos: Pos))
+
+(defstruct ParamDecl
+  (binding: i64 name: str amp: bool ann: (Option TypeAnn) borrow: bool))
+
+(defenum PredAnn
+  (PaProto proto: i64 args: (Vec TypeAnn))
+  (PaSend ann: TypeAnn))
+
+(defstruct FunDef
+  (name: str module: i64 params: (Vec ParamDecl) ret: (Option TypeAnn)
+   bounds: (Vec PredAnn) body: Expr is-macro: bool pos: Pos))
+
+(defstruct DefDef (name: str module: i64 ann: (Option TypeAnn) init: Expr pos: Pos))
+
+;; `(extern NAME (fn :send (T̄) R))`; `varargs` for `:varargs`.
+(defstruct ExternDef (name: str ty: Ty varargs: bool pos: Pos))
+
+;; The key of `instance-index`: a protocol and the head constructor.
+(defstruct InstKey (proto: i64 con: Con))
+(derive Eq InstKey) (derive Hash InstKey)
+
+(defstruct Globals
+  (types: (Table TypeDef) protos: (Table ProtoDef) instances: (Table InstanceDef)
+   funs: (Table FunDef) defs: (Table DefDef) externs: (Table ExternDef)
+   builtin-schemes: (Table Scheme) bindings: (Table BindingInfo)
+   modules: (Table ModuleInfo)
+   main: (Cell i64)
+   instance-index: (Cell (Map InstKey i64))
+   option: (Cell i64)
+   form: (Cell (Option i64))
+   vec: (Cell (Option i64))
+   deref-proto: (Cell (Option i64))
+   expr-count: (Cell i64)))
+
+;; Empty tables; `main` is the main module (2), `option` 0 until
+;; `new_globals` declares it.
+(defun globals-new () -> Globals
+  (Globals (table-new) (table-new) (table-new) (table-new) (table-new)
+           (table-new) (table-new) (table-new) (table-new)
+           (cell module-main) (cell (map-empty)) (cell 0) (cell nil) (cell nil)
+           (cell nil) (cell 0)))
+
+;; ---- TypeDef
+
+(defun typedef-is-colour (d: TypeDef i: i64) -> bool
+  (and (< i (count (. d colours))) (nth (. d colours) i)))
+
+;; `(K a..)` over the quantified variables of the type: a colour
+;; parameter is a colour argument, any other a `TGen`.
+(defun typedef-head-args (d: TypeDef) -> (Vec Ty)
+  (mapv (fn (i: i64) (if (typedef-is-colour d i) (ty-colour-arg (CGen i)) (TGen i)))
+        (range (count (. d params)))))
+
+(defun typedef-is-fieldless-enum (d: TypeDef) -> bool
+  (match (. d shape)
+    ((TsEnum vs) (every? (fn (v: VariantDef) (empty? (. v fields))) vs))
+    ((TsStruct _) false)))
+
+;; ---- Globals: the tables by id
+
+(defun g-names (g: Globals m: i64) -> Names
+  (. (table-get (. g modules) m) names))
+
+(defun g-module (g: Globals m: i64) -> ModuleInfo (table-get (. g modules) m))
+(defun g-module-name (g: Globals m: i64) -> str (. (table-get (. g modules) m) ns))
+(defun g-ty (g: Globals id: i64) -> TypeDef (table-get (. g types) id))
+(defun g-proto (g: Globals id: i64) -> ProtoDef (table-get (. g protos) id))
+(defun g-binding (g: Globals b: i64) -> BindingInfo (table-get (. g bindings) b))
+(defun g-fun (g: Globals f: i64) -> FunDef (table-get (. g funs) f))
+(defun g-def (g: Globals d: i64) -> DefDef (table-get (. g defs) d))
+(defun g-ext (g: Globals x: i64) -> ExternDef (table-get (. g externs) x))
+
+;; The instance of protocol `proto` at head constructor `con`.
+(defun g-instance (g: Globals proto: i64 con: Con) -> (Option InstanceDef)
+  (match (get @(. g instance-index) (InstKey proto con))
+    ((some i) (table-find (. g instances) i))
+    (nil nil)))
+
+;; The next expression id (`ExprId(expr_count)`, then one more).
+(defun g-next-expr (g: Globals) -> i64
+  (let ((id @(. g expr-count)))
+    (do (set! (. g expr-count) (+ id 1)) id)))
+
+;; Adds a module: its chain is itself, its uses, its implicit modules, the
+;; prelude and the builtins; its aliases are the implicit modules by
+;; namespace, then `aliases`, then the uses by namespace (a later one
+;; replaces an earlier). The new module's id.
+(defun g-add-module (g: Globals ns: str links: Links aliases: (Map str i64)) -> i64
+  (let ((id (table-count (. g modules)))
+        (by-ns (fn (acc: (Map str i64) m: i64) (assoc acc (g-module-name g m) m)))
+        (implicit (reduce by-ns (map-empty) (. links implicit)))
+        (all (reduce by-ns (merge implicit aliases) (. links uses))))
+    (table-add (. g modules)
+      (ModuleInfo ns (names-new)
+                  (into (into (into [id] (. links uses)) (. links implicit))
+                        [module-prelude module-builtin])
+                  (. links uses) (. links implicit) (. links reexports) all))))
+
+;; The id of the module of namespace ns, not counting the builtins and the
+;; prelude.
+(defun g-module-id (g: Globals ns: str) -> (Option i64)
+  (let ((n (table-count (. g modules))))
+    (loop ((i 2))
+      (if (< i n)
+          (if (= (g-module-name g i) ns) (some i) (recur (+ i 1)))
+          nil))))
+
+;; The public names of module m (values, types and protocols) and of the
+;; modules it re-exports, each once, in byte order (Rust's `BTreeSet`).
+(defun g-exports (g: Globals m: i64) -> (Vec str)
+  (sort-strs (vec (exports-set g m))))
+
+(defun exports-set :private (g: Globals m: i64) -> (Set str)
+  (let ((n (g-names g m))
+        (own (reduce (fn (acc: (Set str) k: str) (conj acc k)) (set-empty)
+                     (concat (public-keys n SpValue (keys @(. n values)))
+                             (concat (public-keys n SpType (keys @(. n types)))
+                                     (public-keys n SpProto (keys @(. n protos))))))))
+    (reduce (fn (acc: (Set str) r: i64) (reduce (fn (a: (Set str) k: str) (conj a k)) acc (exports-set g r)))
+            own (. (g-module g m) reexports))))
+
+(defun public-keys :private (n: Names space: Space ks: (LSeq str)) -> (Vec str)
+  (filterv (fn (k: str) (not (names-is-private n space k))) ks))

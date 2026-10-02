@@ -1,0 +1,48 @@
+;; compiler/types/table.fib: a table of rows by dense id, what the Rust
+;; `Vec<T>` indexed by an id is in `Globals` (decls.rs) and in the unit
+;; worklists. NEW (no Rust file).
+;;
+;; An `assoc` at an index of a Vec is O(n) in the library today (plan G1),
+;; so a row is kept in a `(Map i64 a)` and a new row gets the id
+;; `table-count`, as `Vec::push` gives the index: the ids are the Rust
+;; ones, in the same order. The Map is reached only through these
+;; functions, so a Vec with an O(log n) `assoc` changes this file alone.
+;; A table is a struct of a Cell, passed explicitly like `ExpandCtx`.
+;; `table-get` of an id that is not a row traps, as Rust's index panics.
+(ns types.table)
+
+(defstruct (Table a) (rows: (Cell (Map i64 a))))
+
+(defun table-new () -> (Table a)
+  (Table (cell (map-empty))))
+
+(defun table-count (t: (Table a)) -> i64
+  (map-count @(. t rows)))
+
+;; Adds a row; its id.
+(defun table-add (t: (Table a) row: a) -> i64
+  (let ((id (map-count @(. t rows))))
+    (do (set! (. t rows) (assoc @(. t rows) id row))
+        id)))
+
+(defun table-find (t: (Table a) id: i64) -> (Option a)
+  (get @(. t rows) id))
+
+(defun table-get (t: (Table a) id: i64) -> a
+  (match (get @(. t rows) id)
+    ((some row) row)
+    (nil (trap (str-join ["table-get: no row " (show id)])))))
+
+;; Replaces the row id (which must exist).
+(defun table-set (t: (Table a) id: i64 row: a) -> unit
+  (if (contains? @(. t rows) id)
+      (set! (. t rows) (assoc @(. t rows) id row))
+      (trap (str-join ["table-set: no row " (show id)]))))
+
+;; The rows in id order.
+(defun table-rows (t: (Table a)) -> (Vec a)
+  (let ((m @(. t rows)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i (map-count m))
+          (recur (+ i 1) (conj acc (unwrap (get m i))))
+          acc))))

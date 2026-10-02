@@ -1,0 +1,61 @@
+;; compiler/types/scheme.fib: type schemes `∀ā ς̄. C̄ ⇒ T` (spec/types.md
+;; §1.8), as crates/fibref/src/types/scheme.rs (124 lines of Rust). Shapes
+;; as in types.ty: the variants of `ColourBound` carry the prefix `B`
+;; (`BFlow` is Rust's `ColourBound::Flow`); a method is a function named
+;; `scheme-NAME`.
+(ns types.scheme (:use types.ty))
+
+;; A colour constraint kept in a scheme (§5.4 step 4): between quantified
+;; colour variables (`from ⊑ to`), or the symbolic `colour ⊒ Caps{ty}` of
+;; a capture whose type is a quantified variable: the colour is `local`
+;; unless `Send ty`.
+(defenum ColourBound
+  (BFlow from: Colour to: Colour)
+  (BCaps colour: Colour ty: Ty))
+(derive Eq ColourBound) (derive Hash ColourBound)
+
+;; A closed type scheme. The quantified variables are `(TGen 0..n-vars)`
+;; and `(CGen 0..n-colours)` in `ty`, `preds` and `colour-bounds`.
+;; var-names: a display name for each quantified type variable. preds: the
+;; context (for a protocol method the first is the dispatch constraint
+;; `(P s d..)`). ty: a function type for functions, constructors and
+;; methods; the value's type for a field-less variant or a `def`. amps: for
+;; a function, which parameters are `&` (then `ty`'s parameter is the value
+;; type `T` of the `(& T)` position and the function is not a value; empty
+;; for a value). params: for a function, the parameter names, for messages.
+(defstruct Scheme
+  (n-vars: i64 n-colours: i64 var-names: (Vec str) preds: (Vec Pred)
+   colour-bounds: (Vec ColourBound) ty: Ty amps: (Vec bool) params: (Vec str)))
+(derive Eq Scheme)
+
+;; A scheme instantiated at particular types: the type, the context to
+;; discharge and the colour constraints to solve.
+(defstruct Instance (ty: Ty preds: (Vec Pred) colour-bounds: (Vec ColourBound)))
+(derive Eq Instance)
+
+;; A monomorphic scheme with no context.
+(defun scheme-mono (ty: Ty) -> Scheme
+  (Scheme 0 0 [] [] [] ty [] []))
+
+;; Whether some parameter is `&`, so the function is not a value.
+(defun scheme-has-amp (s: Scheme) -> bool
+  (any-true (. s amps)))
+
+(defun any-true :private (bs: (Vec bool)) -> bool
+  (loop ((i 0))
+    (if (< i (count bs))
+        (if (nth bs i) true (recur (+ i 1)))
+        false)))
+
+;; The scheme's parts with the quantified variables replaced by tys and
+;; colours.
+(defun scheme-instantiate-with (s: Scheme tys: (Vec Ty) colours: (Vec Colour)) -> Instance
+  (Instance
+    (ty-subst-gen (. s ty) tys colours)
+    (mapv (fn (p: Pred) (pred-map-tys p (fn (t: Ty) (ty-subst-gen t tys colours))))
+          (. s preds))
+    (mapv (fn (b: ColourBound)
+            (match b
+              ((BFlow a c) (BFlow (subst-colour a colours) (subst-colour c colours)))
+              ((BCaps k t) (BCaps (subst-colour k colours) (ty-subst-gen t tys colours)))))
+          (. s colour-bounds))))

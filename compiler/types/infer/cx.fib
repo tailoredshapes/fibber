@@ -1,0 +1,121 @@
+;; compiler/types/infer/cx.fib: the inference context, the tables and the per-unit worklists (package P8).
+;; Replaces crates/fibref/src/types/infer/cx.rs.
+;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
+;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
+;; package that owns this module writes the bodies and the data marked below.
+(ns types.infer.cx
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.display))
+
+;; ---- the data of infer/cx.rs, fixed by P1 (P8 may add to it)
+
+;; What is known of the functions and defs checked so far: the scheme of a
+;; FunId and the type of a DefId (Rust `Vec<Option<_>>`: a Map, a missing
+;; key is `None`).
+(defstruct Env (funs: (Cell (Map i64 Scheme)) defs: (Cell (Map i64 Ty))))
+
+;; How a use of a scheme was instantiated (cx.rs:28).
+(defstruct Instantiation (tys: (Vec Ty) colours: (Vec Colour)))
+
+;; What a method call resolved to (cx.rs:37): instance `index` at `args`, a
+;; bound of the context, or a trait object.
+(defenum Resolution
+  (ResInstance index: i64 args: (Vec Ty))
+  (ResBound pred: Pred)
+  ResDyn)
+
+;; What a unit's inference produced, by expression and binding (cx.rs:56).
+(defstruct Tables
+  (expr-types: (Cell (Map i64 Ty)) binding-types: (Cell (Map i64 Ty))
+   instantiations: (Cell (Map i64 Instantiation))
+   resolutions: (Cell (Map i64 Resolution)) fn-colours: (Cell (Map i64 Colour))))
+
+;; A constraint waiting for its types to be known (cx.rs:73, :86).
+(defenum DKind
+  (DkProto proto: i64 args: (Vec Ty) method: (Option i64))
+  (DkSend ty: Ty path: (Vec str))
+  (DkObject ty: Ty what: str)
+  (DkWeakable ty: Ty)
+  (DkField obj: Ty field: str result: Ty text: str)
+  (DkDeref cell: Ty result: Ty text: str)
+  (DkFloat ty: Ty))
+(defstruct Deferred (kind: DKind pos: Pos site: (Option i64) fun: str))
+
+;; Why a type is not `Send`: the path to the offending type (cx.rs:107).
+(defstruct Witness (path: (Vec str) offending: Ty))
+
+;; Colour constraints (cx.rs:117, :132): `from ⊑ to`, and `colour ⊒ Caps{ty}`.
+(defstruct ColourCon
+  (from: Colour to: Colour label: (Option str) origin: (Option Witness) pos: Pos))
+(defstruct CapsCon (colour: Colour ty: Ty label: str pos: Pos))
+
+;; The monomorphic signature of a function of the SCC being inferred.
+(defstruct MonoSig (params: (Vec Ty) amps: (Vec bool) names: (Vec str) ret: Ty))
+
+;; A call of a polymorphically recursive function (Rust: infer/polyrec.rs:37;
+;; here so that `Unit` need not depend on `types.infer.polyrec`).
+(defstruct PolyCall (caller: i64 callee: i64 site: i64 pos: Pos))
+
+;; The worklists of one unit (an SCC, an impl method, a def): a fresh one
+;; per unit (Rust `Unit::default()`), every field a Cell.
+(defstruct Unit
+  (deferred: (Cell (Vec Deferred)) colours: (Cell (Vec ColourCon))
+   caps: (Cell (Vec CapsCon)) rigid-names: (Cell (Vec str))
+   rigid-map: (Cell (Map str i64)) rigid-colours: (Cell (Map str Colour))
+   fun: (Cell str) mono: (Cell (Map i64 MonoSig)) poly: (Cell (Map i64 Scheme))
+   poly-used: (Cell (Set i64)) cur: (Cell (Option i64))
+   poly-calls: (Cell (Vec PolyCall)) poly-vars: (Cell (Map i64 (Vec i64)))
+   loops: (Cell (Vec (Vec Ty))) givens: (Cell (Option (Vec Pred)))
+   exprs: (Cell (Vec i64)) bindings: (Cell (Vec i64))
+   fn-lits: (Cell (Vec (Pair i64 Colour))) insts: (Cell (Vec i64))
+   sites: (Cell (Vec i64))))
+
+;; The inference context (cx.rs:205): the globals (read only), the
+;; environment, the store, the tables and the unit. Every function of
+;; infer takes it first.
+(defstruct Cx (g: Globals env: Env st: Store t: Tables u: Unit))
+
+;; ---- constructors (written by P1)
+
+(defun env-new () -> Env (Env (cell (map-empty)) (cell (map-empty))))
+
+(defun tables-new () -> Tables
+  (Tables (cell (map-empty)) (cell (map-empty)) (cell (map-empty))
+          (cell (map-empty)) (cell (map-empty))))
+
+(defun unit-new () -> Unit
+  (Unit (cell []) (cell []) (cell []) (cell []) (cell (map-empty)) (cell (map-empty))
+        (cell "") (cell (map-empty)) (cell (map-empty)) (cell (set-empty)) (cell nil)
+        (cell []) (cell (map-empty)) (cell []) (cell nil) (cell []) (cell [])
+        (cell []) (cell []) (cell [])))
+
+;; Rust: infer/cx.rs:220 fresh
+(defun cx-fresh (cx: Cx) -> Ty
+  (trap "todo: cx-fresh"))
+
+;; Rust: infer/cx.rs:225 record
+(defun cx-record (cx: Cx id: i64 ty: Ty) -> unit
+  (trap "todo: cx-record"))
+
+;; Rust: infer/cx.rs:231 bind
+(defun cx-bind (cx: Cx b: i64 ty: Ty) -> unit
+  (trap "todo: cx-bind"))
+
+;; Rust: infer/cx.rs:237 binding
+(defun cx-binding (cx: Cx b: i64 pos: Pos) -> (Result Ty TypeError)
+  (trap "todo: cx-binding"))
+
+;; Rust: infer/cx.rs:248 defer
+(defun cx-defer (cx: Cx kind: DKind pos: Pos site: (Option i64)) -> unit
+  (trap "todo: cx-defer"))
+
+;; Rust: infer/cx.rs:259 zonk
+(defun cx-zonk (cx: Cx t: Ty) -> Ty
+  (trap "todo: cx-zonk"))
+
+;; Rust: infer/cx.rs:264 show
+(defun cx-show (cx: Cx t: Ty) -> str
+  (trap "todo: cx-show"))
+
+;; Rust: infer/cx.rs:270 mismatch
+(defun cx-mismatch (cx: Cx a: Ty b: Ty pos: Pos) -> TypeError
+  (trap "todo: cx-mismatch"))
