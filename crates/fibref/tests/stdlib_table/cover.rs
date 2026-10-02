@@ -5,14 +5,16 @@
 //! text of its strings blanked, has a token that is the row's spelling or
 //! its name; a token with a module prefix counts by the part after its last
 //! `/` (`char/digit?` calls `digit?`, `fib.prelude/nth` calls `nth`). The
-//! rows that are reader syntax (`@x`, `'x`, `` `x ``) are called by the
-//! prefix character in front of anything. The point is that a header that
-//! lists a name cannot make it covered by itself.
+//! rows that are syntax or a name that is also a constructor (`@x`, `~@x`,
+//! `#(..)`, `(:k x)`, `->Name`, `some`) have no such token and are judged by
+//! the rules of `syntax`. The point is that a header that lists a name
+//! cannot make it covered by itself.
 
 use std::collections::BTreeMap;
 
 use super::cases::Case;
 use super::rows::Row;
+use super::syntax;
 
 /// The most names one case may cover: a longer list tests nothing in
 /// particular (README §9.1).
@@ -70,35 +72,18 @@ fn unqualified(token: &str) -> &str {
     }
 }
 
-/// A spelling that is a reader prefix and a placeholder: `@x`, `'x`, `` `x ``.
-fn reader_prefix(spelling: &str) -> Option<char> {
-    let mut chars = spelling.chars();
-    match (chars.next(), chars.next(), chars.next()) {
-        (Some(p), Some('x'), None) if "@'`".contains(p) => Some(p),
-        _ => None,
-    }
-}
-
 /// Whether the code of a case calls the row.
 pub fn calls(code: &str, row: &Row) -> bool {
-    if let Some(prefix) = reader_prefix(&row.spelling).or_else(|| reader_prefix(&row.name)) {
-        let found = code.char_indices().any(|(i, c)| {
-            c == prefix
-                && code[i + 1..]
-                    .chars()
-                    .next()
-                    .is_some_and(|n| !n.is_whitespace())
-        });
-        if found {
-            return true;
-        }
+    if syntax::called(code, row) {
+        return true;
     }
-    tokens(code).any(|t| {
-        let bare = unqualified(t);
-        [t, bare]
-            .iter()
-            .any(|s| *s == row.spelling || *s == row.name)
-    })
+    !syntax::judged_here(row)
+        && tokens(code).any(|t| {
+            let bare = unqualified(t);
+            [t, bare]
+                .iter()
+                .any(|s| *s == row.spelling || *s == row.name)
+        })
 }
 
 /// The rows of the tranche that no case covers.
@@ -299,6 +284,43 @@ mod tests {
             found[0].contains("covers `filter` but its code never calls `filter`"),
             "{found:?}"
         );
+    }
+
+    /// Canary 4 (C2-23): `some` is `Option`'s constructor, and its token is in
+    /// nearly every case. A case that covers the row is found unless it calls
+    /// `(some pred c)` with two operands.
+    #[test]
+    fn canary_a_case_that_only_matches_some_does_not_cover_the_row() {
+        let rows = vec![row("some", "some", 2), row("map", "map", 1)];
+        let constructor = "(match (get m 1) ((some x) x) (nil (unwrap-or (some 0) 1)))";
+        let found = claims(&rows, &[case("2450-a.fib", &["some"], constructor)]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("covers `some` but its code never calls `some`"),
+            "{found:?}"
+        );
+        let call = "(some even? [1 3 4])";
+        assert!(claims(&rows, &[case("2450-b.fib", &["some"], call)]).is_empty());
+    }
+
+    /// The syntax rows of tranche 2 are covered by a case that has the
+    /// syntax, and by nothing else (the rules are `syntax`'s).
+    #[test]
+    fn a_syntax_row_is_covered_by_a_case_that_has_the_syntax() {
+        let rows = vec![
+            row("#(...)", "#(f", 2),
+            row("#{...}", "#{a", 2),
+            row(":k", ":k", 2),
+            row("->Name", "->Point", 2),
+            row("print-method", "Debug", 2),
+        ];
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        let source = "(impl Debug P (debug (self) \"p\")) (map #(* % 2) #{1}) (:age (->P 1))";
+        let good = case("1000-a.fib", &names, source);
+        assert_eq!(claims(&rows, &[good]), Vec::<String>::new());
+        let bare = "(impl Show P (show (self) \"p\")) (map (fn (x) x) [1]) (get m :age)";
+        let found = claims(&rows, &[case("1000-b.fib", &names, bare)]);
+        assert_eq!(found.len(), 5, "{found:?}");
     }
 
     #[test]

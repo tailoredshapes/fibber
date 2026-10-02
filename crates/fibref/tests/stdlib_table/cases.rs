@@ -30,11 +30,20 @@ pub struct Case {
 }
 
 /// The §7 items that a case may still wait for, and the package ids of the
-/// tranche 1 plan a case may wait for (`open: L6` fails as `OpenPassed` the
-/// day that package lands, which is how the flip of the plan's step M is
-/// forced). Anything else in an `open:` line is a typo or a reason that is
-/// not one: the test `open_cases_are_allowed` fails on it.
+/// tranche 1 and tranche 2 plans a case may wait for (`open: L6` fails as
+/// `OpenPassed` the day that package lands, which is how the flip of the
+/// plan's step M is forced). Anything else in an `open:` line is a typo or a
+/// reason that is not one: the test `open_cases_are_allowed` fails on it.
+///
+/// Tranche 2 (Z0, stdlib plan t2 §4.4) added the items `L3b L7 L8 L14 L16 L17
+/// L19 E2 E8 E11 B5` and the packages a case may wait for, `X3` to `X12`,
+/// `P1`, `Y3`, `Y4`, `Y5`, `Y11`, `Y12`: a package that finds it needs
+/// another id asks for it, and a case never waits for a package of an
+/// earlier wave (X1, X2, Y1, Y2 land before the cases that would wait for
+/// them are written). `L7` was already a package id of tranche 1; it is now
+/// also the spec item L7 (patterns in parameters), and one entry serves both.
 pub const ALLOWED_OPEN: &[&str] = &[
+    // tranche 1: §7 items, and the package ids of its plan
     "L1",
     "L15",
     "L20",
@@ -56,6 +65,34 @@ pub const ALLOWED_OPEN: &[&str] = &[
     "L8b",
     "L11",
     "T2-sources",
+    // tranche 2: §7 items
+    "L3b",
+    "L8",
+    "L14",
+    "L16",
+    "L17",
+    "L19",
+    "E2",
+    "E8",
+    "E11",
+    "B5",
+    // tranche 2: packages
+    "X3",
+    "X4",
+    "X5",
+    "X6",
+    "X7",
+    "X8",
+    "X9",
+    "X10",
+    "X11",
+    "X12",
+    "P1",
+    "Y3",
+    "Y4",
+    "Y5",
+    "Y11",
+    "Y12",
 ];
 
 /// The cases of `dir`, with their labels and code.
@@ -220,6 +257,57 @@ mod tests {
         let found = open_items_outside(&cases, ALLOWED_OPEN);
         assert_eq!(found.len(), 1);
         assert!(found[0].contains("`open: L99`"), "{found:?}");
+    }
+
+    /// Tranche 2's items and package ids may be waited for (Z0), the ones the
+    /// plan did not name may not, and the list has no entry twice.
+    #[test]
+    fn tranche_two_items_and_packages_may_be_open_and_nothing_else_new() {
+        let items = "L3b L7 L8 L14 L16 L17 L19 E2 E8 E11 B5";
+        let packages = "X3 X4 X5 X6 X7 X8 X9 X10 X11 X12 P1 Y3 Y4 Y5 Y11 Y12";
+        for id in items.split(' ').chain(packages.split(' ')) {
+            let cases = [case("1000-open-x.fib", &[id], false)];
+            assert!(open_items_outside(&cases, ALLOWED_OPEN).is_empty(), "{id}");
+        }
+        for id in ["X1", "X2", "X13", "Y1", "Y2", "Y10", "E3", "E4", "Z0"] {
+            let cases = [case("1000-open-x.fib", &[id], false)];
+            assert_eq!(open_items_outside(&cases, ALLOWED_OPEN).len(), 1, "{id}");
+        }
+        let mut sorted = ALLOWED_OPEN.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ALLOWED_OPEN.len(), "an id is listed twice");
+    }
+
+    /// Four digits are a number (plan t2 §4.4: `1000` to `5999`), and the
+    /// number is the whole run of digits: `1000-x` is not `100-x`, so the
+    /// two never count as one case's number, and two cases of one four-digit
+    /// number do.
+    #[test]
+    fn a_four_digit_number_is_a_number_and_1000_x_is_not_100_x() {
+        let split = |n: &str| number_and_kind(n);
+        assert_eq!(split("1000-open-x.fib"), ("1000".into(), "open".into()));
+        assert_eq!(split("2250-ref-x.fib"), ("2250".into(), "ref".into()));
+        assert_eq!(
+            split("1650-reject-x/main.fib"),
+            ("1650".into(), "reject".into())
+        );
+        assert_ne!(split("1000-x.fib").0, split("100-x.fib").0);
+        let apart = [
+            case("100-x.fib", &[], false),
+            case("1000-x.fib", &[], false),
+        ];
+        assert_eq!(naming(&apart), Vec::<String>::new());
+        let same = [
+            case("1000-x.fib", &[], false),
+            case("1000-y.fib", &[], false),
+        ];
+        assert!(naming(&same)[0].contains("the number 1000 is also 1000-x.fib's"));
+        let kinds = [
+            case("1000-open-x.fib", &[], false),
+            case("2100-count-x.fib", &[], false),
+        ];
+        assert_eq!(naming(&kinds).len(), 2, "{:?}", naming(&kinds));
     }
 
     #[test]

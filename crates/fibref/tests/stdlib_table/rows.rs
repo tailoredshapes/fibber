@@ -76,12 +76,22 @@ fn name_of(cell: &str) -> String {
 }
 
 /// The first symbol of a spelling cell: `(subs s a b)` is `subs`, `@x` is
-/// `@x`, `[a b & r]` is `a` (the name cell carries the `&`).
+/// `@x`, `[a b & r]` is `a` (the name cell carries the `&`). The one
+/// exception is a definition form, `(impl Debug T ..)`, whose first symbol
+/// is no more than the form's name: it is spelled by the protocol it
+/// instantiates, `Debug`, which is what a case that defines one contains.
 fn spelling_of(cell: &str) -> String {
     let span = strip_span(cell);
-    let first = span.split_whitespace().next().unwrap_or("");
-    let first = first.trim_start_matches(['(', '[']);
-    first.split(')').next().unwrap_or("").to_string()
+    let mut words = span.split_whitespace();
+    let symbol = |w: Option<&str>| {
+        let w = w.unwrap_or("").trim_start_matches(['(', '[']);
+        w.split(')').next().unwrap_or("").to_string()
+    };
+    let first = symbol(words.next());
+    if first == "impl" {
+        return symbol(words.next());
+    }
+    first
 }
 
 /// Reads the table out of the text of `spec/stdlib.md`.
@@ -207,6 +217,10 @@ intro | not a row
         assert_eq!(spelling_of("`(if-let [x e] a b)`"), "if-let");
         assert_eq!(spelling_of("`(m)`"), "m");
         assert_eq!(spelling_of("`Long/MAX_VALUE`"), "Long/MAX_VALUE");
+        // an `impl` form is spelled by its protocol; a bare one has none
+        assert_eq!(spelling_of("`(impl Debug T ..)`"), "Debug");
+        assert_eq!(spelling_of("`(impl (Reducible e) T ..)`"), "Reducible");
+        assert_eq!(spelling_of("`(impl)`"), "");
     }
 
     #[test]

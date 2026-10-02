@@ -11,7 +11,8 @@ fibc   cases cases/stdlib --only 240- 241-     # interpreter and compiled, your 
 ```
 
 `--only` takes name prefixes; a prefix that matches no case is exit 2
-(`no case matches 999-`), never an empty pass. A run ends with the counts
+(`no case matches 999-`), never an empty pass. A prefix ends with the dash: `100-` is
+the cases numbered 100 and not the ones numbered 1000 to 1009. A run ends with the counts
 line, `N cases: .. pass, .. fail, .. pending, .. header error`, which must
 read `0 fail, 0 pending, 0 header error`; when an `open-` case ran there is
 also `, N open`, and each open case is a row of its own that names its items.
@@ -41,6 +42,14 @@ in a module that `:use`s `fib.coll`, whose `empty` is a method.
 
 ## Numbering
 
+Tranche 1 numbered its cases with three digits; the numbers 000 to 999 are used up. Tranche 2
+numbers its cases with **four digits, `1000` to `5999`, a block per package**
+(spec/stdlib.md §8.2.1 item 1). The number is the whole run of digits before the first dash, so
+`1000-x` and `100-x` are two numbers, and the test `cases_are_named_and_labelled_alike` reads it
+that way (a unit test fixes it).
+
+Tranche 1 (three digits):
+
 | Block | Package | Block | Package |
 |---|---|---|---|
 | 000-049, 900-949 | P0 | 050-099 | L1 |
@@ -58,6 +67,59 @@ in a module that `:use`s `fib.coll`, whose `empty` is a method.
 | 870-879 | M | | |
 
 No two cases share a number (the test `cases_are_named_and_labelled_alike`).
+
+Tranche 2 (four digits; the package ids are those of the tranche 2 plan, spec/stdlib.md §8.2.1):
+
+| Block | Package | Block | Package |
+|---|---|---|---|
+| 1000-1049 | Z0 | 1100-1199 | X1 |
+| 1200-1299 | X2 | 1300-1399 | X3 |
+| 1400-1499 | X4 | 1500-1599 | X5 |
+| 1600-1649 | X6 | 1650-1699 | X7 |
+| 1700-1749 | X8 | 1750-1849 | X9 |
+| 1850-1949 | X10 | 1950-1999 | X11 |
+| 2000-2049 | X12 | 2050-2099 | X13 |
+| 2100-2199 | P1 | 2200-2249 | Y1 |
+| 2250-2349 | Y2 | 2350-2449 | Y3 |
+| 2450-2549 | Y4 | 2550-2649 | Y5 |
+| 2650-2749 | Y6 | 2750-2799 | Y7 |
+| 2800-2849 | Y8 | 2850-2949 | Y9 |
+| 2950-2999 | Y10 | 3000-3059 | Y11 |
+| 3060-3119 | Y12 | 3200-3249 | Z2 |
+| 3500-3599 | integration and the flips | 5000-5999 | mutation additions, fifty a package |
+
+A package writes only in its block. A case that waits for another package's work stays in the block of
+the package that wrote it and names the item or package it waits for in `open:`; when that lands the case
+flips and loses its `open-` and its `open:` line, and keeps its number.
+
+### Conventions of tranche 2
+
+* Every case keeps `;; roots: ../../lib support` until tranche 2's gate: the binaries embed the
+  library of an older tree, and the working tree's `lib/` is the one under test. (The `support/` root
+  is where the `tl` modules are.)
+* **`open:` takes an item of spec/stdlib.md §7 or a package id**, from the list in the test
+  (`ALLOWED_OPEN`, `crates/fibref/tests/stdlib_table/cases.rs`). Tranche 2 added the items `L3b L7 L8 L14
+  L16 L17 L19 E2 E8 E11 B5` and the packages `X3 X4 X5 X6 X7 X8 X9 X10 X11 X12 P1 Y3 Y4 Y5 Y11 Y12`. A
+  case never waits for a package of an earlier wave (X1, X2, Y1, Y2), and one that needs an id the list
+  lacks asks for it. The label is a promise to flip: the day the item lands the case passes, the run
+  fails, and the commit that lands the item removes the label.
+* A macro that fails at expansion is a `reject` case whose header expects `macro NAME failed: NAME: message`.
+  A case for a fibber macro uses it in head position only, and a library macro's body uses prelude
+  names (`vec-count`, `vec-nth`) until E2 (spec/stdlib.md §6.3).
+* A `ref-` case draws at most 300 seeded inputs. `tl.rng` has `(rng-vec r len bound)` for a vector of integers of
+  a given length, and a length drawn per input is `(rng-below r n)`: `(rng-vec r (rng-below r 20) 100)`.
+* **The `some` row.** The row `some` (`(some pred c)`, tranche 2) is the name of `Option`'s constructor, so
+  its token is in nearly every case and says nothing. `stdlib_table` therefore counts a case as
+  calling the row only when its code has `(some a b)`, a call of exactly two operands; `(some x)` in a
+  pattern or as the constructor never covers it, and a case that lists `some` in `covers:` and has no
+  such call fails `every_case_covers_real_rows_it_calls`. The case that covers `some` is read by the lead
+  by hand besides: it must show a predicate result that is truthy and one that is not, and `some` over an
+  `Option` payload.
+* The rows that are syntax have no token of their own and are judged by `crates/fibref/tests/stdlib_table/syntax.rs`:
+  `@x`, `~x` and `~@x` by that prefix in front of a form; `#(..)` and `#{..}` by the dispatch in the code;
+  `:k` (the row of `(:k m)`: a name in `covers:` has no space, so the cell says `:k`) by a keyword right after an open parenthesis; `->Name` by any token `->Upper` (the record
+  `Point` has `->Point`); `print-method` by the protocol `Debug`, so the case that covers it defines `(impl Debug ..)`.
+  Write the case with the syntax in its code, in a string it does not count.
 
 ## Kinds
 
@@ -109,10 +171,13 @@ shows with fixtures that a bound of 0 does fail a program that allocates.
 `covers` names a row only if the case's code calls the row's spelling: the
 test `stdlib_table` reads the table of `spec/stdlib.md` §4 and fails when a
 covered name is no row, when the code never calls it, or when a case covers
-more than 12 names. A row of the delivered tranche that no case covers is
-listed by `cargo test -p fibref --test stdlib_table -- --ignored`, which the
-final gate of the tranche runs without `--ignored`. The names are the first
-cell of the row, as written, without the code span and without `(new)`.
+more than 12 names. A row of the delivered tranche (`TRANCHE` in the test, 1 today) that no case
+covers fails `every_row_of_the_tranche_is_covered`. The rows of the tranche being
+written are listed by `cargo test -p fibref --test stdlib_table -- --ignored`
+(`every_row_of_the_next_tranche_is_covered`, which fails until the last row is
+covered); the gate of the tranche raises `TRANCHE` and removes that test. The
+names are the first cell of the row, as written, without the code span and
+without `(new)`.
 
 `open` is for `accept` cases. A case with `open:` is judged as usual and then:
 it fails as the label says (the checker refuses it, it traps, it answers
@@ -179,10 +244,16 @@ A test that cannot fail is worse than none.
   876 the vector and map literals and `def` initialisers with the library implicit; 877 the function of
   873 at floats.
 * 900 to 911 (`open-`) the failing programs of §5.5, one per item still open: S1 L20,
-  S2 L21, S3 L22, S4 L23, S5 L24, S6 L26, S7 L1, S8 L15, S10 C9, S12 E14, S15 L29, S16 L28
+  S2 L21 (the collections half: `(m k)` and `(v i)`; the keyword half is case 1000, `open:` L14), S3 L22, S4 L23, S5 L24, S6 L26, S7 L1, S8 L15, S10 C9, S12 E14, S15 L29, S16 L28
   (S9, S11, S13, S14, S17 and S18 are other packages' rows). Each program was refused or
   trapped as its header says when it was written; its `result` is worked out by hand
   for the day the item lands, not run.
+
+## The cases of Z0 (tranche 2)
+
+* 1000 (`open-`, L14) `(:k x)`: a keyword in call position reads a field of a struct and the value of a
+  `(Map keyword v)`, and `(map :age ps)` takes the keyword where a function is expected. This is the
+  keyword half of S2; case 901 keeps the collections (`(m k)`, `(v i)`).
 
 ## Mutation review (`fibmut`)
 
