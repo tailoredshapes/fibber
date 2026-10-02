@@ -1,0 +1,43 @@
+;; compiler/types/dump/units.fib: the `unit` section of one module of the types dump
+;; (spec/bootstrap.md §6.3), as `unit_module`, `impl_method_name`, `unit_line` and `units`
+;; of crates/fibref/src/types_dump/sections.rs (package P12, with the checker loop whose
+;; order it shows). It appends one line per unit of the module, in the order the units
+;; were checked; types.dump.sections calls it from `module-lines` between `extern` and
+;; `ast`. Without a typed program (`--stage lower`) it appends nothing. With `tables` (the
+;; `tables` section is asked for) the records of the unit's bodies follow each line
+;; (types.dump.tables, package P13).
+(ns types.dump.units
+  (:use fib.string types.table types.decls types.program types.infer.mod types.dump.normal
+        types.dump.tables))
+
+;; The module a unit belongs to.
+(defun unit-module :private (g: Globals u: UnitRef) -> i64
+  (match u
+    ((UScc fs) (. (g-fun g (nth fs 0)) module))
+    ((UDef d) (. (g-def g d) module))
+    ((UImplMethod i _) (. (table-get (. g instances) i) module))
+    ((UMacro f) (. (g-fun g f) module))))
+
+;; The name of method `k` of instance `i`.
+(defun impl-method-name :private (g: Globals i: i64 k: i64) -> str
+  (let ((inst (table-get (. g instances) i)))
+    (. (nth (. (g-proto g (. inst proto)) methods) (. (nth (. inst methods) k) index)) name)))
+
+(defun unit-line :private (g: Globals u: UnitRef) -> str
+  (match u
+    ((UScc fs) (str-join ["unit scc " (join " " (mapv (fn (f: i64) (. (g-fun g f) name)) fs))]))
+    ((UDef d) (str-join ["unit def " (. (g-def g d) name)]))
+    ((UImplMethod i k) (str-join ["unit impl " (show i) " " (impl-method-name g i k)]))
+    ((UMacro f) (str-join ["unit macro " (. (g-fun g f) name)]))))
+
+;; `unit scc NAME.. | def NAME | impl INDEX METHOD | macro NAME` of every unit module m
+;; defines (its file `file`), in the order checked, each followed by its tables when `tables` is set.
+(defun unit-section (acc: (Vec str) g: Globals typed: (Option TypedProgram) m: i64 file: str tables: bool)
+    -> (Vec str)
+  (match typed
+    (nil acc)
+    ((some t) (reduce (fn (a: (Vec str) u: UnitRef)
+                        (let ((head (conj a (normalise (unit-line g u)))))
+                          (if tables (unit-tables head t u file) head)))
+                      acc
+                      (filterv (fn (u: UnitRef) (= (unit-module g u) m)) (. t units))))))

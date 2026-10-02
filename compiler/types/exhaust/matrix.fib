@@ -1,21 +1,240 @@
 ;; compiler/types/exhaust/matrix.fib: Maranget usefulness over pattern matrices (package P12).
 ;; Replaces crates/fibref/src/types/infer/exhaust/matrix.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; The usefulness matrix over the constructors of §2.6: variants, `bool`s,
+;; other literals (infinitely many) and the lengths of a `(Vec T)`. In a vector
+;; column with bound `L` (one more than the longest fixed-length pattern, or
+;; the longest prefix of a rest pattern if that is more) the constructors are
+;; `CtLen n` for `n < L` and `CtAtLeast L`, which no pattern of the column can
+;; split; the set is complete, so every one is tried.
+;;
+;; Shapes where Rust and fibber differ: `Matrix` holds the globals and the
+;; store (Rust `&Globals`, `&mut Store`) and a Cell for `mixed`; the Rust loops
+;; that return the first witness are `(first (keep ..))`, which stops at the
+;; first `some` as the loop does (the order of the `mixed` effect is the Rust
+;; one); `Ctor::Len(n)` is `CtLen`, `P::Wild` is `XWild`.
 (ns types.exhaust.matrix
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.infer.solve))
 
 ;; Rust `Ctor`, `P` and `Matrix<'a>` (infer/exhaust/matrix.rs:15, :30,
 ;; :37). The variants are prefixed (a variant's name is global): `Ct`, `X`.
 (defenum Ctor (CtVariant index: i64) (CtBool v: bool) (CtLit text: str) (CtLen n: i64) (CtAtLeast n: i64))
+(derive Eq Ctor)
 (defenum XP XWild (XCtor ctor: Ctor args: (Vec XP)) (XSlice pats: (Vec XP)))
+(derive Eq XP)
 (defstruct Matrix (g: Globals st: Store mixed: (Cell bool)))
 
 ;; Rust: infer/exhaust/matrix.rs:46 Matrix::new
 (defun matrix-new (g: Globals st: Store) -> Matrix
-  (trap "todo: matrix-new"))
+  (Matrix g st (cell false)))
 
-;; Rust: infer/exhaust/matrix.rs:55 useful
+;; ---- small helpers over rows
+
+(defun tail-of :private (v: (Vec a)) -> (Vec a) (vec (drop 1 v)))
+(defun wilds :private (n: i64) -> (Vec XP) (vec (take n (repeat XWild))))
+(defun heads-of :private (rows: (Vec (Vec XP))) -> (Vec XP) (mapv (fn (r: (Vec XP)) (nth r 0)) rows))
+(defun prepend :private (head: (Vec XP) r: (Vec XP)) -> (Vec XP) (into head (tail-of r)))
+
+;; Rust `arity` (matrix.rs:196).
+(defun ctor-arity :private (c: Ctor) -> i64
+  (match c
+    ((CtLen n) n)
+    ((CtAtLeast n) n)
+    (_ 0)))
+
+(defun vec-pat? :private (p: XP) -> bool
+  (match p
+    ((XSlice _) true)
+    ((XCtor (CtLen _) _) true)
+    (_ false)))
+
+;; Rust `rebuild` (matrix.rs:276): the first `arity` entries of the witness
+;; become the arguments of constructor `c`.
+(defun rebuild :private (c: Ctor arity: i64 w: (Vec XP)) -> (Vec XP)
+  (let ((k (min arity (count w))))
+    (into [(XCtor c (vec (take k w)))] (vec (drop k w)))))
+
+;; ---- constructors of a type
+
+;; The field types of the one variant of a struct or of each variant of an
+;; enum at the arguments `args`.
+(defun field-tys (fs: (Vec FieldDef) args: (Vec Ty)) -> (Vec Ty)
+  (let ((cs (colour-args args)))
+    (mapv (fn (f: FieldDef) (ty-subst-gen (. f ty) args cs)) fs)))
+
+;; Rust `signature` (matrix.rs:221): the complete constructor set of a type,
+;; with each constructor's field types; `nil` when it is infinite or unknown.
+(defun signature (g: Globals st: Store t: Ty) -> (Option (Vec (Pair Ctor (Vec Ty))))
+  (match (store-zonk st t)
+    ((TCon (KScalar (SBool)) _) (some [(Pair (CtBool true) []) (Pair (CtBool false) [])]))
+    ((TCon (KNominal id) args)
+     (some (match (. (g-ty g id) shape)
+             ((TsStruct fs) [(Pair (CtVariant 0) (field-tys fs args))])
+             ((TsEnum vs) (mapv (fn ([i v]) (Pair (CtVariant i) (field-tys (. v fields) args)))
+                                (zip (range (count vs)) vs))))))
+    (_ nil)))
+
+;; Rust `fields_of` (matrix.rs:182).
+(defun fields-of :private (m: Matrix t: Ty c: Ctor n: i64) -> (Vec Ty)
+  (let ((found (find-first (fn (e: (Pair Ctor (Vec Ty))) (= (. e fst) c))
+                           (get-or-empty (signature (. m g) (. m st) t)))))
+    (if-some [e found]
+      (. e snd)
+      (vec (take n (repeat (ty-unit)))))))
+
+(defun get-or-empty :private (s: (Option (Vec (Pair Ctor (Vec Ty))))) -> (Vec (Pair Ctor (Vec Ty)))
+  (match s
+    ((some v) v)
+    (nil [])))
+
+;; ---- the rows of a constructor
+
+;; Rust `specialise` (matrix.rs:260): the rows whose first column is `c`
+;; (with its arguments spread) or a wildcard (as `arity` wildcards).
+(defun specialise :private (rows: (Vec (Vec XP)) c: Ctor arity: i64) -> (Vec (Vec XP))
+  (vec (keep (fn (r: (Vec XP))
+               (match (nth r 0)
+                 ((XCtor d args) (if (= d c) (some (prepend args r)) nil))
+                 ((XSlice _) nil)
+                 ((XWild) (some (prepend (wilds arity) r)))))
+             rows)))
+
+;; Rust `expand` (matrix.rs:205): the sub-patterns `p` has under the vector
+;; constructor `c`, or `nil` when `p` cannot match it.
+(defun expand :private (p: XP c: Ctor) -> (Option (Vec XP))
+  (let ((n (ctor-arity c)))
+    (match p
+      ((XWild) (some (wilds n)))
+      ((XCtor d args) (if (= d c) (some args) nil))
+      ((XSlice pre) (if (<= (count pre) n)
+                        (some (into pre (wilds (- n (count pre)))))
+                        nil)))))
+
+;; ---- the algorithm
+
+;; Rust: infer/exhaust/matrix.rs:55 useful. A vector of patterns `q` not
+;; covered by `rows`, as a witness.
 (defun matrix-useful (m: Matrix rows: (Vec (Vec XP)) q: (Vec XP) tys: (Vec Ty)) -> (Option (Vec XP))
-  (trap "todo: matrix-useful"))
+  (if (empty? q)
+      (if (empty? rows) (some []) nil)
+      (if-some [[rows2 q2] (tuple-column m rows q tys)]
+        (matrix-useful m rows2 q2 tys)
+        (let ((head (nth q 0)))
+          (if-some [l (vec-bound m rows head)]
+            (useful-vec m rows q tys l)
+            (match head
+              ((XCtor c args) (useful-ctor m rows q tys c args))
+              ((XWild) (useful-wild m rows q tys))
+              ((XSlice _) nil)))))))
+
+;; The head is a constructor: specialise the matrix and the query.
+(defun useful-ctor :private (m: Matrix rows: (Vec (Vec XP)) q: (Vec XP) tys: (Vec Ty) c: Ctor args: (Vec XP))
+    -> (Option (Vec XP))
+  (let ((fields (fields-of m (nth tys 0) c (count args)))
+        (w (matrix-useful m (specialise rows c (count args)) (prepend args q)
+                          (into fields (tail-of tys)))))
+    (map-opt (fn (w: (Vec XP)) (rebuild c (count args) w)) w)))
+
+;; Rust `tuple_column` (matrix.rs:92): when column 0 is a `Pair` or `Triple`
+;; (§7 L3b) and holds vector patterns, the matrix with each of them as the
+;; struct's one constructor over its fields; `nil` when there is nothing to
+;; change.
+(defun tuple-column :private (m: Matrix rows: (Vec (Vec XP)) q: (Vec XP) tys: (Vec Ty))
+    -> (Option (Pair (Vec (Vec XP)) (Vec XP)))
+  (match (store-zonk (. m st) (nth tys 0))
+    ((TCon (KNominal id) _)
+     (match (. (g-ty (. m g) id) shape)
+       ((TsStruct fs)
+        (if (and (solve-is-tuple (. m g) id)
+                 (not (every? (fn (p: XP) (not (vec-pat? p))) (conj (heads-of rows) (nth q 0)))))
+            (some (Pair (mapv (fn (r: (Vec XP)) (tuple-fix r (count fs))) rows)
+                        (tuple-fix q (count fs))))
+            nil))
+       (_ nil)))
+    (_ nil)))
+
+;; A row with a vector pattern in column 0 as the tuple's constructor.
+(defun tuple-fix :private (row: (Vec XP) n: i64) -> (Vec XP)
+  (let ((head (match (nth row 0)
+                ((XSlice subs) (tuple-ctor subs n))
+                ((XCtor (CtLen _) subs) (tuple-ctor subs n))
+                (other other))))
+    (prepend [head] row)))
+
+(defun tuple-ctor :private (subs: (Vec XP) n: i64) -> XP
+  (XCtor (CtVariant 0) (into (vec (take n subs)) (wilds (max 0 (- n (count subs)))))))
+
+;; Rust `vec_bound` (matrix.rs:130): `L` when column 0 holds a vector pattern;
+;; notes a mix with variant patterns.
+(defun vec-bound :private (m: Matrix rows: (Vec (Vec XP)) head: XP) -> (Option i64)
+  (let ((ps (conj (heads-of rows) head))
+        (bound (reduce (fn (b: (Option i64) p: XP)
+                         (match p
+                           ((XCtor (CtLen n) _) (some (max-of b (+ n 1))))
+                           ((XSlice pre) (some (max-of b (count pre))))
+                           (_ b)))
+                       nil ps))
+        (variant (not (every? (fn (p: XP) (match p ((XCtor (CtVariant _) _) false) (_ true))) ps))))
+    (do (set! (. m mixed) (or @(. m mixed) (and (some? bound) variant)))
+        bound)))
+
+(defun max-of :private (b: (Option i64) l: i64) -> i64
+  (match b
+    ((some x) (max x l))
+    (nil l)))
+
+;; Rust `useful_vec` (matrix.rs:157): tries every length constructor of the
+;; column in turn.
+(defun useful-vec :private (m: Matrix rows: (Vec (Vec XP)) q: (Vec XP) tys: (Vec Ty) l: i64)
+    -> (Option (Vec XP))
+  (let ((elem (match (store-zonk (. m st) (nth tys 0))
+                ((TCon (KNominal _) args) (nth-or args 0 (ty-unit)))
+                (_ (ty-unit))))
+        (ctors (conj (mapv (fn (n: i64) (CtLen n)) (range l)) (CtAtLeast l))))
+    (first (keep (fn (c: Ctor) (vec-ctor-witness m rows q tys c elem)) ctors))))
+
+;; The witness under one length constructor `c`, if the query can match it.
+(defun vec-ctor-witness :private (m: Matrix rows: (Vec (Vec XP)) q: (Vec XP) tys: (Vec Ty) c: Ctor elem: Ty)
+    -> (Option (Vec XP))
+  (let ((n (ctor-arity c)))
+    (if-some [q-head (expand (nth q 0) c)]
+      (let ((rows2 (vec (keep (fn (r: (Vec XP))
+                                (map-opt (fn (h: (Vec XP)) (prepend h r)) (expand (nth r 0) c)))
+                              rows)))
+            (tys2 (into (vec (take n (repeat elem))) (tail-of tys))))
+        (map-opt (fn (w: (Vec XP)) (rebuild c n w))
+                 (matrix-useful m rows2 (into q-head (tail-of q)) tys2)))
+      nil)))
+
+;; Rust `useful_wild` (matrix.rs:180): a wildcard query. When the rows' first
+;; column holds every constructor of the type, try each; otherwise the default
+;; matrix, with a missing constructor as the witness's head.
+(defun useful-wild :private (m: Matrix rows: (Vec (Vec XP)) q: (Vec XP) tys: (Vec Ty)) -> (Option (Vec XP))
+  (let ((used (vec (keep (fn (r: (Vec XP)) (match (nth r 0) ((XCtor c _) (some c)) (_ nil))) rows)))
+        (sig (signature (. m g) (. m st) (nth tys 0))))
+    (if (and (some? sig) (every? (fn (e: (Pair Ctor (Vec Ty))) (includes? (. e fst) used)) (unwrap sig)))
+        (first (keep (fn (e: (Pair Ctor (Vec Ty))) (wild-ctor m rows q tys e)) (unwrap sig)))
+        (wild-default m rows q tys used sig))))
+
+;; The witness under one constructor of the complete signature.
+(defun wild-ctor :private (m: Matrix rows: (Vec (Vec XP)) q: (Vec XP) tys: (Vec Ty) e: (Pair Ctor (Vec Ty)))
+    -> (Option (Vec XP))
+  (let ((c (. e fst))
+        (fields (. e snd)))
+    (map-opt (fn (w: (Vec XP)) (rebuild c (count fields) w))
+             (matrix-useful m (specialise rows c (count fields))
+                            (into (wilds (count fields)) (tail-of q))
+                            (into fields (tail-of tys))))))
+
+;; The signature is infinite, unknown or not complete in the rows: the rows
+;; with a wildcard first, their first column dropped.
+(defun wild-default :private (m: Matrix rows: (Vec (Vec XP)) q: (Vec XP) tys: (Vec Ty) used: (Vec Ctor)
+                              sig: (Option (Vec (Pair Ctor (Vec Ty))))) -> (Option (Vec XP))
+  (let ((default (vec (keep (fn (r: (Vec XP)) (if (= (nth r 0) XWild) (some (tail-of r)) nil)) rows))))
+    (if-some [w (matrix-useful m default (tail-of q) (tail-of tys))]
+      (let ((missing (if-some [s sig]
+                       (find-first (fn (e: (Pair Ctor (Vec Ty))) (not (includes? (. e fst) used))) s)
+                       nil)))
+        (some (into [(if-some [e missing] (XCtor (. e fst) (wilds (count (. e snd)))) XWild)] w)))
+      nil)))

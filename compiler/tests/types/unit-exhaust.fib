@@ -1,0 +1,337 @@
+;; compiler/tests/types/unit-exhaust.fib: the exhaustiveness check of package P12
+;; (types.exhaust, types.exhaust.matrix, types.exhaust.show), ported from
+;; crates/fibref/src/types/tests/patterns.rs (the lengths of vector patterns,
+;; guards, the mix with Vec's variants, the trap clause of a refutable let) and
+;; the `match` tests of tests/errors2.rs. The Rust tests run the whole checker
+;; on source text; these hand-build the resolved AST of a `match` (what the
+;; lowering and the inference leave) and run `cx-check-matches` on it, so the
+;; errors, their kinds, messages and positions are the Rust ones, and the
+;; witness of the matrix and its printer are shown directly at the end.
+;; Build: fibc build compiler/tests/types/unit-exhaust.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.exhaust types.exhaust.matrix types.exhaust.show
+               types.check))
+
+(def p0: Pos (Pos "t" 100 1 0 0))
+
+(defun tdef (name: str module: i64 params: (Vec str) shape: TypeShape) -> TypeDef
+  (TypeDef name module params [] shape p0))
+
+(defun tv (i: i64) -> Ty (TGen i))
+(defun field (name: str t: Ty) -> FieldDef (FieldDef name t))
+
+;; Types 0 Option (nil, some), 1 Vec (a variant of no fields, then `VecOf n a b c`:
+;; the first is printed `[]`, the rest `[_ & _]`), 2 Pair and 5 Triple (the
+;; prelude's, so tuples), 3 Shape (Circle, Sq, Leaf), 4 P (a struct).
+(defun world () -> Globals
+  (let ((g (globals-new)))
+    (do (table-add (. g types) (tdef "Option" module-prelude ["a"]
+                                     (TsEnum [(VariantDef "nil" []) (VariantDef "some" [(field "v" (tv 0))])])))
+        (table-add (. g types) (tdef "Vec" module-prelude ["a"]
+                                     (TsEnum [(VariantDef "VecEmpty" [])
+                                              (VariantDef "VecOf" [(field "n" (ty-i64)) (field "x" (tv 0))
+                                                                   (field "y" (tv 0)) (field "z" (tv 0))])])))
+        (table-add (. g types) (tdef "Pair" module-prelude ["a" "b"]
+                                     (TsStruct [(field "fst" (tv 0)) (field "snd" (tv 1))])))
+        (table-add (. g types) (tdef "Shape" 2 []
+                                     (TsEnum [(VariantDef "Circle" [(field "r" (ty-i64))])
+                                              (VariantDef "Sq" [(field "s" (ty-i64))])
+                                              (VariantDef "Leaf" [])])))
+        (table-add (. g types) (tdef "P" 2 [] (TsStruct [(field "x" (ty-i64)) (field "y" (ty-i64))])))
+        (table-add (. g types) (tdef "Triple" module-prelude ["a" "b" "c"]
+                                     (TsStruct [(field "a" (tv 0)) (field "b" (tv 1)) (field "c" (tv 2))])))
+        (set! (. g option) 0)
+        (set! (. g vec) (some 1))
+        g)))
+
+(defun cx-of () -> Cx (Cx (world) (env-new) (store-new) (tables-new) (unit-new)))
+
+(defun option-of (t: Ty) -> Ty (ty-nominal 0 [t]))
+(defun vec-of (t: Ty) -> Ty (ty-nominal 1 [t]))
+(defun pair-of (a: Ty b: Ty) -> Ty (ty-nominal 2 [a b]))
+(defun shape () -> Ty (ty-nominal 3 []))
+(defun point () -> Ty (ty-nominal 4 []))
+(defun vi () -> Ty (vec-of (ty-i64)))
+
+;; ---- patterns, the way the lowering leaves them
+
+(defun pat (k: PatKind) -> Pattern (Pattern p0 k))
+(defun wild () -> Pattern (pat PWild))
+(defun bind (b: i64) -> Pattern (pat (PBind b)))
+(defun int (n: i64) -> Pattern (pat (PLit (LitInt n I64))))
+(defun bool (b: bool) -> Pattern (pat (PLit (LitBool b))))
+(defun ctor (t: i64 v: i64 subs: (Vec Pattern)) -> Pattern (pat (PCtor t (some v) subs)))
+(defun nil-p () -> Pattern (ctor 0 0 []))
+(defun some-p (x: Pattern) -> Pattern (ctor 0 1 [x]))
+;; `[a b]`, `[a b & _]`, `[a b & r]`
+(defun vx (subs: (Vec Pattern)) -> Pattern (pat (PVec subs RestExact)))
+(defun vi- (subs: (Vec Pattern)) -> Pattern (pat (PVec subs RestIgnore)))
+(defun vb (subs: (Vec Pattern)) -> Pattern (pat (PVec subs (RestBind 9))))
+
+;; A clause: its pattern, whether it is guarded, whether it is the trap clause
+;; of a refutable let.
+(defstruct Cl (p: Pattern guard: bool fallback: bool))
+(defun u (p: Pattern) -> Cl (Cl p false false))
+(defun w (p: Pattern) -> Cl (Cl p true false))
+(defun fb (p: Pattern) -> Cl (Cl p false true))
+
+(defun body () -> Expr (Expr 0 p0 (ELit (LitInt 0 I64))))
+
+;; The clauses, each pattern at its own line (1, 2, ..).
+(defun clauses (cs: (Vec Cl)) -> (Vec Clause)
+  (mapv (fn (x: (Pair i64 Cl))
+          (let (([i c] x))
+            (Clause (Pattern (Pos "t" (+ i 1) 1 0 0) (. (. c p) kind))
+                    (if (. c guard) (some (body)) nil)
+                    (body) (. c fallback))))
+        (zip (range (count cs)) cs)))
+
+;; `(match s clauses)` at line 50, the scrutinee (id 100) of type `st`.
+(defun the-match (id: i64 line: i64 scrut: Expr cs: (Vec Cl)) -> Expr
+  (Expr id (Pos "t" line 1 0 0) (EMatch scrut (clauses cs))))
+(defun scrutinee (id: i64) -> Expr (Expr id p0 (ELocal 0)))
+
+(defun run (st: Ty cs: (Vec Cl)) -> (Result unit TypeError)
+  (let ((cx (cx-of)))
+    (do (cx-record cx 100 st)
+        (cx-check-matches cx (the-match 101 50 (scrutinee 100) cs)))))
+
+(defun ok? (r: (Result unit TypeError)) -> bool
+  (match r
+    ((Ok _) true)
+    ((Err e) (do (println (str-join ["  got " (error-kind-name (. e kind)) ": " (. e message)])) false))))
+
+(defun fails? (r: (Result unit TypeError) kind: ErrorKind msg: str line: i64) -> bool
+  (match r
+    ((Err e) (or (and (= (. e kind) kind) (= (. e message) msg) (= (. (. e pos) line) line))
+                 (do (println (str-join ["  got " (error-kind-name (. e kind)) " line " (show (. (. e pos) line))
+                                         ": " (. e message)]))
+                     false)))
+    (_ (do (println "  got no error") false))))
+
+(defun missing (r: (Result unit TypeError) what: str) -> bool
+  (fails? r NonExhaustive (str-join ["non-exhaustive match: missing " what]) 50))
+
+(defun redundant-at (r: (Result unit TypeError) line: i64) -> bool
+  (fails? r Redundant "redundant match clause" line))
+
+;; ---- the tests of patterns.rs
+
+(defun length-tests (cs: Checks) -> unit
+  (do
+    (check cs "[] and [x & r] cover every length"
+           (ok? (run (vi) [(u (vx [])) (u (vb [(bind 1)]))])))
+    (check cs "[] [x] [x y & _]"
+           (ok? (run (vi) [(u (vx [])) (u (vx [(bind 1)])) (u (vi- [(bind 1) (bind 2)]))])))
+    (check cs "[& r] alone"
+           (ok? (run (vi) [(u (vb []))])))
+    (check cs "(Vec bool): [] [true & _] [false & _]"
+           (ok? (run (vec-of (ty-bool)) [(u (vx [])) (u (vi- [(bool true)])) (u (vi- [(bool false)]))])))
+    (check cs "(Option (Vec i64)): nil (some []) (some [_ & _])"
+           (ok? (run (option-of (vi)) [(u (nil-p)) (u (some-p (vx []))) (u (some-p (vi- [(wild)])))])))
+    (check cs "missing []"
+           (missing (run (vi) [(u (vx [(bind 1)]))]) "[]"))
+    (check cs "missing [_]"
+           (missing (run (vi) [(u (vx [])) (u (vx [(bind 1) (bind 2)]))]) "[_]"))
+    (check cs "missing [_ _ & _]"
+           (missing (run (vi) [(u (vx [])) (u (vx [(bind 1)]))]) "[_ _ & _]"))
+    (check cs "missing [false & _]"
+           (missing (run (vec-of (ty-bool)) [(u (vx [])) (u (vi- [(bool true)]))]) "[false & _]"))
+    (check cs "every vector clause guarded: Vec's own variants print as lengths"
+           (missing (run (vi) [(w (vi- []))]) "[]"))))
+
+(defun guard-tests (cs: Checks) -> unit
+  (do
+    (check cs "a guarded clause covers nothing"
+           (missing (run (vi) [(u (vx [])) (w (vb [(bind 1)]))]) "[_ & _]"))
+    (check cs "guarded first, then the same unguarded, is fine"
+           (ok? (run (vi) [(w (vb [(bind 1)])) (u (vb [(bind 1)])) (u (vx []))])))
+    (check cs "a clause after a wildcard is redundant, guarded or not"
+           (redundant-at (run (vi) [(u (wild)) (w (bind 1))]) 2))
+    (check cs "[x] after [& r] is redundant"
+           (redundant-at (run (vi) [(u (vb [])) (u (vx [(bind 1)]))]) 2))
+    (check cs "a guarded clause is checked against the unguarded ones above it"
+           (redundant-at (run (vi) [(u (wild)) (w (vx []))]) 2))
+    (check cs "an unguarded clause above a guarded one: the guarded one is redundant"
+           (redundant-at (run (vi) [(u (vb [])) (w (vx [(bind 1)])) (u (wild))]) 2))
+    (check cs "vector patterns do not mix with the variants of Vec"
+           (fails? (run (vi) [(u (vx [])) (u (ctor 1 1 [(wild) (wild) (wild) (wild)]))])
+                   Other "vector patterns cannot be mixed with patterns of Vec's variants" 2))
+    (check cs "the variants of Vec alone: lengths again"
+           (missing (run (vi) [(u (ctor 1 1 [(wild) (wild) (wild) (wild)]))]) "[]"))))
+
+(defun let-tests (cs: Checks) -> unit
+  (do
+    (check cs "the trap clause of a refutable let is not redundant after [& r]"
+           (ok? (run (vi) [(u (vb [])) (fb (wild))])))
+    (check cs "the same clause the program wrote is redundant"
+           (redundant-at (run (vi) [(u (vb [])) (u (wild))]) 2))
+    (check cs "an irrefutable struct pattern then _ written by the program is redundant"
+           (redundant-at (run (point) [(u (ctor 4 0 [(bind 1) (wild)])) (u (wild))]) 2))
+    (check cs "the trap clause is a row of its own: it covers what the guarded clause above leaves"
+           (ok? (run (option-of (ty-i64)) [(u (some-p (bind 1))) (w (nil-p)) (fb (wild))])))
+    (check cs "without the trap clause the same match is missing nil"
+           (missing (run (option-of (ty-i64)) [(u (some-p (bind 1))) (w (nil-p))]) "nil"))))
+
+;; ---- the tests of errors2.rs
+
+(defun errors-tests (cs: Checks) -> unit
+  (do
+    (check cs "missing nil"
+           (missing (run (option-of (ty-i64)) [(u (some-p (bind 1)))]) "nil"))
+    (check cs "missing (Sq _)"
+           (missing (run (shape) [(u (ctor 3 0 [(bind 1)]))]) "(Sq _)"))
+    (check cs "a variant with no field prints with its parentheses"
+           (missing (run (shape) [(u (ctor 3 0 [(bind 1)])) (u (ctor 3 1 [(bind 1)]))]) "(Leaf)"))
+    (check cs "missing false"
+           (missing (run (ty-bool) [(u (bool true))]) "false"))
+    (check cs "an integer has infinitely many values: missing _"
+           (missing (run (ty-i64) [(u (int 1)) (u (int 2))]) "_"))
+    (check cs "missing (some nil)"
+           (missing (run (option-of (option-of (ty-i64))) [(u (some-p (some-p (bind 1)))) (u (nil-p))]) "(some nil)"))
+    (check cs "(some x) and nil are exhaustive"
+           (ok? (run (option-of (ty-i64)) [(u (some-p (bind 1))) (u (nil-p))])))
+    (check cs "a constructor after a wildcard is redundant (the wildcard row is specialised)"
+           (redundant-at (run (option-of (ty-i64)) [(u (wild)) (u (some-p (bind 1)))]) 2))
+    (check cs "an incomplete signature: the first missing constructor is the witness, whatever the fields leave"
+           (missing (run (pair-of (shape) (ty-bool))
+                         [(u (ctor 2 0 [(ctor 3 0 [(wild)]) (bool true)])) (u (ctor 2 0 [(ctor 3 1 [(wild)]) (bool true)]))])
+                    "(Pair (Leaf) true)"))
+    (check cs "true false _: the third is redundant"
+           (redundant-at (run (ty-bool) [(u (bool true)) (u (bool false)) (u (wild))]) 3))
+    (check cs "x then 2: the second is redundant"
+           (redundant-at (run (ty-i64) [(u (bind 1)) (u (int 2))]) 2))
+    (check cs "the same literal twice is redundant"
+           (redundant-at (run (ty-i64) [(u (int 2)) (u (int 2)) (u (wild))]) 2))
+    (check cs "different literals are not"
+           (ok? (run (ty-i64) [(u (int 2)) (u (int 3)) (u (wild))])))
+    (check cs "an as-pattern is its inner pattern"
+           (ok? (run (option-of (ty-i64)) [(u (pat (PAs (some-p (wild)) 4))) (u (nil-p))])))
+    (check cs "the unit pattern is a wildcard"
+           (redundant-at (run (ty-unit) [(u (pat (PLit LitUnit))) (u (wild))]) 2))
+    (check cs "a string literal does not cover str"
+           (missing (run (ty-str) [(u (pat (PLit (LitStr "a"))))]) "_"))))
+
+;; ---- the rest of the module: tuples, unresolved types, nesting
+
+(defun other-tests (cs: Checks) -> unit
+  (let ((pi (pair-of (ty-i64) (ty-bool))))
+    (do
+      (check cs "a vector pattern on a Pair is the struct's one constructor over its fields"
+             (missing (run pi [(u (vx [(int 1) (bool true)])) (u (vx [(wild) (bool false)]))]) "(Pair _ true)"))
+      (check cs "a Pair covered by vector patterns"
+             (ok? (run pi [(u (vx [(wild) (bool true)])) (u (vx [(wild) (bool false)]))])))
+      (check cs "a Pair pattern after a vector pattern (the struct constructor and the vector, mixed rows)"
+             (redundant-at (run pi [(u (vx [(wild) (wild)])) (u (ctor 2 0 [(wild) (wild)]))]) 2))
+      (check cs "a Pair of Vec patterns: every pair of lengths"
+             (missing (run (pair-of (vi) (vi)) [(u (vx [(vx []) (wild)])) (u (vx [(vi- [(wild)]) (vx [])]))])
+                      "(Pair [_ & _] [_ & _])"))))
+  (let ((cx (cx-of)) (v (cx-fresh cx)))
+    (do (cx-record cx 100 v)
+        (check cs "a scrutinee whose type is a variable: a constructor pattern is not exhaustive"
+               (missing (cx-check-matches cx (the-match 101 50 (scrutinee 100) [(u (some-p (bind 1)))])) "_"))))
+  (let ((cx (cx-of)))
+    (check cs "a scrutinee with no recorded type is unit: a wildcard covers it"
+           (ok? (cx-check-matches cx (the-match 101 50 (scrutinee 100) [(u (wild))])))))
+  (let ((cx (cx-of)) (v (cx-fresh cx)))
+    (do (cx-record cx 100 v)
+        (check cs "a wildcard covers a variable's type"
+               (ok? (cx-check-matches cx (the-match 101 50 (scrutinee 100) [(u (bind 1))]))))))
+  (nest-tests cs))
+
+;; `(match (match s2 ..) ..)`: the outer is checked first, then the children in
+;; order (scrutinee, then each clause's guard and body), the first error ends it.
+(defun nest-tests (cs: Checks) -> unit
+  (let ((inner-bad (the-match 103 60 (scrutinee 102) [(u (some-p (bind 1)))]))
+        (inner-ok (the-match 103 60 (scrutinee 102) [(u (wild))])))
+    (do
+      (let ((cx (cx-of)))
+        (do (cx-record cx 102 (option-of (ty-i64)))
+            (cx-record cx 103 (ty-i64))
+            (let ((e (Expr 104 (Pos "t" 50 1 0 0) (EMatch inner-bad (clauses [(u (int 1)) (u (wild))])))))
+              (check cs "a non-exhaustive match inside the scrutinee of an exhaustive one"
+                     (fails? (cx-check-matches cx e) NonExhaustive "non-exhaustive match: missing nil" 60)))))
+      (let ((cx (cx-of)))
+        (do (cx-record cx 102 (option-of (ty-i64)))
+            (cx-record cx 103 (ty-i64))
+            (let ((e (Expr 104 (Pos "t" 50 1 0 0) (EMatch inner-bad (clauses [(u (int 1))])))))
+              (check cs "the outer match is reported before the one inside it"
+                     (missing (cx-check-matches cx e) "_")))))
+      (let ((cx (cx-of)))
+        (do (cx-record cx 102 (option-of (ty-i64)))
+            (cx-record cx 103 (ty-i64))
+            (let ((e (Expr 104 (Pos "t" 50 1 0 0)
+                           (EMatch inner-ok (clauses [(u (int 1)) (u (wild))])))))
+              (check cs "both exhaustive: nothing to report"
+                     (ok? (cx-check-matches cx e)))))))))
+
+;; ---- the matrix and the printer directly
+
+(defun matrix-tests (cs: Checks) -> unit
+  (let ((g (world)) (st (store-new)))
+    (let ((m (matrix-new g st)))
+      (do
+        (check cs "no columns and no rows: the empty row is useful"
+               (= (matrix-useful m [] [] []) (some [])))
+        (check cs "no columns and a row: nothing is"
+               (= (matrix-useful m [[]] [] []) nil))
+        (check cs "a wildcard against nothing, over bool: true is the first constructor"
+               (= (matrix-useful m [] [XWild] [(ty-bool)]) (some [(XCtor (CtBool true) [])])))
+        (check cs "a wildcard against true: false is the first missing"
+               (= (matrix-useful m [[(XCtor (CtBool true) [])]] [XWild] [(ty-bool)])
+                  (some [(XCtor (CtBool false) [])])))
+        (check cs "a wildcard against true and false: covered"
+               (= (matrix-useful m [[(XCtor (CtBool true) [])] [(XCtor (CtBool false) [])]] [XWild] [(ty-bool)])
+                  nil))
+        (check cs "a two-column query: the second column's witness"
+               (= (matrix-useful m [[XWild (XCtor (CtBool true) [])]] [XWild XWild] [(ty-i64) (ty-bool)])
+                  (some [XWild (XCtor (CtBool false) [])])))
+        (check cs "a slice in a column makes it a vector column; [_ & _] is the missing one"
+               (= (matrix-useful m [[(XCtor (CtLen 0) [])]] [XWild] [(vi)])
+                  (some [(XCtor (CtAtLeast 1) [XWild])])))
+        (check cs "a vector column mixed with a Vec variant sets `mixed`"
+               (do (matrix-useful m [[(XCtor (CtLen 0) [])]] [(XCtor (CtVariant 1) [XWild XWild XWild XWild])] [(vi)])
+                   @(. m mixed)))))))
+
+(defun show-tests (cs: Checks) -> unit
+  (let ((g (world)) (st (store-new)))
+    (do
+      (check cs "a wildcard is _"
+             (= (exhaust-show g st XWild (ty-i64)) "_"))
+      (check cs "a slice is _ too"
+             (= (exhaust-show g st (XSlice []) (vi)) "_"))
+      (check cs "bool"
+             (= (exhaust-show g st (XCtor (CtBool true) []) (ty-bool)) "true"))
+      (check cs "nil alone, without parentheses"
+             (= (exhaust-show g st (XCtor (CtVariant 0) []) (option-of (ty-i64))) "nil"))
+      (check cs "(some _)"
+             (= (exhaust-show g st (XCtor (CtVariant 1) [XWild]) (option-of (ty-i64))) "(some _)"))
+      (check cs "the fields are shown at their types: (some false)"
+             (= (exhaust-show g st (XCtor (CtVariant 1) [(XCtor (CtBool false) [])]) (option-of (ty-bool)))
+                "(some false)"))
+      (check cs "a struct shows under its own name"
+             (= (exhaust-show g st (XCtor (CtVariant 0) [XWild (XCtor (CtBool true) [])]) (pair-of (ty-i64) (ty-bool)))
+                "(Pair _ true)"))
+      (check cs "a variant of no fields keeps its parentheses"
+             (= (exhaust-show g st (XCtor (CtVariant 2) []) (shape)) "(Leaf)"))
+      (check cs "Vec's variants are lengths"
+             (and (= (exhaust-show g st (XCtor (CtVariant 0) []) (vi)) "[]")
+                  (= (exhaust-show g st (XCtor (CtVariant 1) [XWild]) (vi)) "[_ & _]")))
+      (check cs "a length and a least length"
+             (and (= (exhaust-show g st (XCtor (CtLen 2) [XWild XWild]) (vi)) "[_ _]")
+                  (= (exhaust-show g st (XCtor (CtLen 0) []) (vi)) "[]")
+                  (= (exhaust-show g st (XCtor (CtAtLeast 2) [XWild (XCtor (CtBool true) [])]) (vec-of (ty-bool)))
+                     "[_ true & _]")))
+      (check cs "a variant at a type that is not nominal is _"
+             (= (exhaust-show g st (XCtor (CtVariant 0) []) (ty-i64)) "_")))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (length-tests cs)
+        (guard-tests cs)
+        (let-tests cs)
+        (errors-tests cs)
+        (other-tests cs)
+        (matrix-tests cs)
+        (show-tests cs)
+        (finish cs))))

@@ -1,0 +1,204 @@
+;; compiler/tests/types/unit-infer-mod.fib: the checker loop of package P12
+;; (types.infer.mod, crates/fibref/src/types/infer/mod.rs): the units of a
+;; program in the order they are checked (dependencies first; a def alone; the
+;; impl methods after the functions and the macros after them), a failed unit
+;; blocking the ones that use it, the errors in unit order, the scheme and the
+;; type of each unit that passed (and none for the others), the level of the
+;; store back at 0 after every unit, and `main : (fn () i64)`. Each program is
+;; read, expanded and lowered as `check-source` does, against the prelude, then
+;; run through `checker-module` and `checker-check-main` directly (not through
+;; `infer-lowered`, which builds the typed program of package P13).
+;; The multi-module order and the corpus are judged by `compare.sh` against
+;; `fibref types --stage infer --sections unit,error` (infer-cases/).
+;; Run from the repository root (the prelude is read from lib/).
+;; Build: fibc build compiler/tests/types/unit-infer-mod.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [syntax.reader :as reader] [expand.program :as prog])
+  (:use fib.string syntax.pos syntax.form syntax.error expand.ctx types.ty types.scheme types.error
+        types.store types.table types.ast types.decls types.lower.mod types.infer.cx types.infer.mod
+        types.driver types.check))
+
+;; The checker after the prelude and the program, and where the program's own
+;; units and expressions start.
+(defstruct Run (ck: Checker units: i64 exprs: i64))
+
+(defun run-checker (l: Lowered main: bool) -> Run
+  (let ((ck (checker-new (. l globals))))
+    (do (checker-module ck (. l prelude))
+        (let ((units (count @(. ck order)))
+              (exprs (count @(. (. ck t) expr-types))))
+          (do (doseq [items (. l modules)] (checker-module ck items))
+              (when main (checker-check-main ck))
+              (Run ck units exprs))))))
+
+;; `src` read, expanded, lowered and checked: the run, or where it failed.
+(defun checked (src: str main: bool) -> (Result Run str)
+  (let ((ctx (ctx-new)))
+    (match (prelude-forms ctx)
+      ((Err m) (Err m))
+      ((Ok prelude)
+       (match (reader/read-all src "t.fib")
+         ((Err _) (Err "read error"))
+         ((Ok forms)
+          (match (prog/expand-program forms ctx (no-runner))
+            ((Err _) (Err "expand error"))
+            ((Ok expanded)
+             (match (lower-program expanded prelude)
+               ((Err es) (Err (str-join ["lowering: " (. (nth es 0) message)])))
+               ((Ok l) (Ok (run-checker l main))))))))))))
+
+(defun fun-id :private (r: Run name: str) -> (Option i64)
+  (let ((g (. (. r ck) g)))
+    (match (get @(. (g-names g @(. g main)) values) name)
+      ((some (GFun f)) (some f))
+      (_ nil))))
+
+(defun unit-name :private (r: Run u: UnitRef) -> str
+  (let ((g (. (. r ck) g)))
+    (match u
+      ((UScc fs) (str-join ["scc " (join " " (mapv (fn (f: i64) (. (g-fun g f) name)) fs))]))
+      ((UDef d) (str-join ["def " (. (g-def g d) name)]))
+      ((UImplMethod _ m) (str-join ["impl method " (show m)]))
+      ((UMacro f) (str-join ["macro " (. (g-fun g f) name)])))))
+
+;; The units the program's own modules were checked as, in order.
+(defun units-of (r: Run) -> (Vec str)
+  (mapv (fn (u: UnitRef) (unit-name r u)) (vec (drop (. r units) @(. (. r ck) order)))))
+
+(defun errors-of (r: Run) -> (Vec str)
+  (mapv (fn (e: TypeError) (. e message)) @(. (. r ck) errors)))
+
+;; Whether function `name` has a scheme.
+(defun typed? (r: Run name: str) -> bool
+  (match (fun-id r name)
+    ((some f) (contains? @(. (. (. r ck) env) funs) f))
+    (nil false)))
+
+;; Whether some macro of the program has a scheme.
+(defun macro-typed? (r: Run) -> bool
+  (not (every? (fn (u: UnitRef)
+                 (match u
+                   ((UMacro f) (not (contains? @(. (. (. r ck) env) funs) f)))
+                   (_ true)))
+               @(. (. r ck) order))))
+
+(defun level0? (r: Run) -> bool (= (store-level (. (. r ck) st)) 0))
+(defun tables-grew? (r: Run) -> bool (> (count @(. (. (. r ck) t) expr-types)) (. r exprs)))
+
+;; Runs `src` and applies `p` to the run; a stage that failed is a failed check.
+(defun with-run (src: str main: bool p: (fn (Run) bool) :borrow) -> bool
+  (match (checked src main)
+    ((Ok r) (p r))
+    ((Err m) (do (println (str-join ["  stage failed: " m])) false))))
+
+(defun show-run (r: Run) -> unit
+  (println (str-join ["  units " (show (units-of r)) " errors " (show (errors-of r))])))
+
+(defun order-tests (cs: Checks) -> unit
+  (do
+    (check cs "dependencies first, then the user of them; every unit has its scheme"
+           (with-run "(defun a () -> i64 (b)) (defun b () -> i64 1) (defun main () -> i64 (a))" true
+             (fn (r: Run)
+               (or (and (= (units-of r) ["scc b" "scc a" "scc main"]) (empty? (errors-of r))
+                        (typed? r "a") (typed? r "b") (typed? r "main") (level0? r) (tables-grew? r))
+                   (do (show-run r) false)))))
+    (check cs "mutually recursive functions are one unit"
+           (with-run "(defun even? (n: i64) -> bool (if (= n 0) true (odd? (- n 1))))
+                      (defun odd? (n: i64) -> bool (if (= n 0) false (even? (- n 1))))
+                      (defun main () -> i64 (if (even? 4) 1 0))" true
+             (fn (r: Run)
+               (or (and (= (units-of r) ["scc even? odd?" "scc main"]) (empty? (errors-of r))
+                        (typed? r "even?") (typed? r "odd?"))
+                   (do (show-run r) false)))))
+    (check cs "a def is a unit of its own, before its user"
+           (with-run "(def d: i64 3) (defun main () -> i64 (+ d 1))" true
+             (fn (r: Run)
+               (or (and (= (units-of r) ["def d" "scc main"]) (empty? (errors-of r))
+                        (= (count @(. (. (. r ck) env) defs)) 1))
+                   (do (show-run r) false)))))
+    (check cs "impl methods after the functions, macros after the methods"
+           (with-run "(defprotocol Score (score (self) -> i64))
+                      (defstruct Pt (x: i64))
+                      (defmacro twice (x) `(do ,x ,x))
+                      (impl Score Pt (score (self) (. self x)))
+                      (defun main () -> i64 (score (Pt 3)))" true
+             (fn (r: Run)
+               (or (and (= (units-of r) ["scc main" "impl method 0" "macro twice"]) (empty? (errors-of r))
+                        (macro-typed? r) (level0? r))
+                   (do (show-run r) false)))))))
+
+(defun failure-tests (cs: Checks) -> unit
+  (do
+    (check cs "a failed unit blocks the ones that use it, not the others; the first error of each unit"
+           (with-run "(defun f () -> i64 (+ 1 true))
+                      (defun g () -> i64 (f))
+                      (defun h () -> i64 1)
+                      (defun main () -> i64 (+ (g) (h)))" true
+             (fn (r: Run)
+               (or (and (= (units-of r) ["scc f" "scc h"]) (= (errors-of r) ["cannot unify bool with i64"])
+                        (typed? r "h") (not (typed? r "f")) (not (typed? r "g")) (not (typed? r "main"))
+                        (level0? r))
+                   (do (show-run r) false)))))
+    (check cs "the errors are in unit order"
+           (with-run "(defun a () -> i64 (match true (true 1)))
+                      (defun b () -> i64 (match false (false 1)))
+                      (defun main () -> i64 (+ (a) (b)))" true
+             (fn (r: Run)
+               (or (and (= (errors-of r) ["non-exhaustive match: missing false" "non-exhaustive match: missing true"])
+                        (= (units-of r) ["scc a" "scc b"]) (level0? r))
+                   (do (show-run r) false)))))
+    (check cs "an SCC that fails is skipped by what calls it"
+           (with-run "(defun a (n: i64) -> i64 (b n))
+                      (defun b (n: i64) -> i64 (+ (a n) true))
+                      (defun c () -> i64 (a 1))
+                      (defun main () -> i64 (c))" true
+             (fn (r: Run)
+               (or (and (= (units-of r) ["scc a b"]) (= (count (errors-of r)) 1) (level0? r))
+                   (do (show-run r) false)))))
+    (check cs "an impl method that uses a failed function is skipped; main does not use it"
+           (with-run "(defprotocol Score (score (self) -> i64))
+                      (defstruct Pt (x: i64))
+                      (defun bad () -> i64 (+ 1 true))
+                      (impl Score Pt (score (self) (bad)))
+                      (defun main () -> i64 (score (Pt 3)))" true
+             (fn (r: Run)
+               (or (and (= (units-of r) ["scc bad" "scc main"]) (= (count (errors-of r)) 1))
+                   (do (show-run r) false)))))
+    (check cs "a def and a function that use each other are an error at the def"
+           (with-run "(def d: (fn () i64) f) (defun f () -> i64 (d)) (defun main () -> i64 (f))" true
+             (fn (r: Run)
+               (or (and (= (errors-of r) ["def d and defun f depend on each other"]) (empty? (units-of r)))
+                   (do (show-run r) false)))))
+    (check cs "a failed function blocks the def that names it"
+           (with-run "(defun f () -> i64 (+ 1 true)) (def d: (fn () i64) f) (defun main () -> i64 (d))" true
+             (fn (r: Run)
+               (or (and (= (units-of r) ["scc f"]) (= (count (errors-of r)) 1))
+                   (do (show-run r) false)))))))
+
+(defun main-tests (cs: Checks) -> unit
+  (do
+    (check cs "no main"
+           (with-run "(defun f () -> i64 1)" true
+             (fn (r: Run) (= (errors-of r) ["the program has no main"]))))
+    (check cs "a library need not have one"
+           (with-run "(defun f () -> i64 1)" false
+             (fn (r: Run) (and (empty? (errors-of r)) (typed? r "f")))))
+    (check cs "main must be (fn () i64): the result"
+           (with-run "(defun main () -> bool true)" true
+             (fn (r: Run) (= (errors-of r) ["main must have type (fn () i64), not (fn :send () bool)"]))))
+    (check cs "main must be (fn () i64): the parameter"
+           (with-run "(defun main (x: i64) -> i64 x)" true
+             (fn (r: Run) (= (errors-of r) ["main must have type (fn () i64), not (fn :send (i64) i64)"]))))
+    (check cs "a main that failed to type is not reported again"
+           (with-run "(defun main () -> i64 (+ 1 true))" true
+             (fn (r: Run) (= (errors-of r) ["cannot unify bool with i64"]))))
+    (check cs "a def named main is no main"
+           (with-run "(def main: i64 1)" true
+             (fn (r: Run) (= (errors-of r) ["the program has no main"]))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (order-tests cs)
+        (failure-tests cs)
+        (main-tests cs)
+        (finish cs))))

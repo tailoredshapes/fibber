@@ -1,0 +1,170 @@
+;; compiler/tests/types/unit-program.fib: the typed program of package P13 (types.program,
+;; crates/fibref/src/types/program.rs) and the tables printer (types.dump.tables, crates/fibref/
+;; src/types_dump/tables.rs): a program of five units is read, expanded, lowered and checked as
+;; `check-source` does, then the accessors of the typed program (`fun`, `scheme`, `show_fun`,
+;; `show_scheme`, `show_in`, `def_type`, the tables `new` moved out of the checker) are asked
+;; for what they print, and `unit-tables` prints the records of every unit: each line is the text
+;; `fibref types --implicit-lib "" --tables` prints for the same file, with the ids that depend
+;; on the size of the prelude (`E3092`, `B428`, the instance index) masked to `E#`, `B#`, `N`.
+;; The whole `--tables` text over the corpus is judged by `compare.sh -o "--stage infer --tables"`.
+;; Run from the repository root (the prelude is read from lib/).
+;; Build: fibc build compiler/tests/types/unit-program.fib -I compiler -I lib -o OUT
+(ns main
+  (:use fib.string syntax.pos types.ty types.scheme types.table types.ast types.decls types.builtins
+        types.infer.mod types.program types.driver types.check types.dump.tables))
+
+(defun source () -> str
+  (str-join ["(defstruct Sq (n: i64))\n"
+             "(defun twice (f x) (f (f x)))\n"
+             "(def limit 10)\n"
+             "(defun area (s: Sq) -> i64 (* (. s n) (. s n)))\n"
+             "(defun dbl (x) (+ x x))\n"
+             "(defun main () -> i64\n"
+             "  (let ((v (twice (fn (x) (+ x 1)) limit)))\n"
+             "    (match v (0 0) (n (+ n (area (Sq 2)))))))\n"]))
+
+;; A record with its ids masked: the id of the second word, the index after `instance`.
+(defun mask (line: str) -> str
+  (let ((ws (split (trim line) " ")))
+    (str-join ["  " (join " " (map-indexed (fn (i: i64 w: str)
+                                             (cond ((= i 1) (str-join [(str-slice w 0 1) "#"]))
+                                                   ((and (= i 3) (= (nth ws 2) "instance")) "N")
+                                                   (else w)))
+                                           ws))])))
+
+(defun units-of (p: TypedProgram) -> (Vec UnitRef)
+  (vec (drop (- (count (. p units)) 5) (. p units))))
+
+(defun unit-of (p: TypedProgram i: i64) -> (Vec str)
+  (mapv mask (unit-tables [] p (nth (units-of p) i) "t.fib")))
+
+(def twice-lines: (Vec str)
+  ["  binding B# f param (fn ς0 (a) a)"
+   "  binding B# x param a"
+   "  expr E# 2:20 43..52 a"
+   "  expr E# 2:21 44..45 (fn ς0 (a) a)"
+   "  expr E# 2:23 46..51 a"
+   "  expr E# 2:24 47..48 (fn ς0 (a) a)"
+   "  expr E# 2:26 49..50 a"])
+
+(def area-lines: (Vec str)
+  ["  binding B# s param Sq"
+   "  expr E# 4:28 96..115 i64"
+   "  expr E# 4:29 97..98 (fn :send (i64 i64) i64)"
+   "  inst E# i64 |"
+   "  res E# instance N"
+   "  expr E# 4:31 99..106 i64"
+   "  expr E# 4:34 102..103 Sq"
+   "  expr E# 4:39 107..114 i64"
+   "  expr E# 4:42 110..111 Sq"])
+
+;; `res .. bound PRED`: the method was discharged by the context.
+(def dbl-lines: (Vec str)
+  ["  binding B# x param a"
+   "  expr E# 5:16 132..139 a"
+   "  expr E# 5:17 133..134 (fn :send (a a) a)"
+   "  inst E# a |"
+   "  res E# bound (Num a)"
+   "  expr E# 5:19 135..136 a"
+   "  expr E# 5:21 137..138 a"])
+
+(def limit-lines: (Vec str)
+  ["  expr E# 3:12 65..67 i64"])
+
+;; `inst .. | send` (a colour instantiated), `fn E# send`, a let and a pattern binding.
+(def main-lines: (Vec str)
+  ["  expr E# 7:3 165..251 i64"
+   "  binding B# v let i64"
+   "  expr E# 7:12 174..204 i64"
+   "  expr E# 7:13 175..180 (fn :send ((fn :send (i64) i64) i64) i64)"
+   "  inst E# i64 | send"
+   "  expr E# 7:19 181..197 (fn :send (i64) i64)"
+   "  fn E# send"
+   "  binding B# x param i64"
+   "  expr E# 7:27 189..196 i64"
+   "  expr E# 7:28 190..191 (fn :send (i64 i64) i64)"
+   "  inst E# i64 |"
+   "  res E# instance N"
+   "  expr E# 7:30 192..193 i64"
+   "  expr E# 7:32 194..195 i64"
+   "  expr E# 7:36 198..203 i64"
+   "  expr E# 8:5 211..250 i64"
+   "  expr E# 8:12 218..219 i64"
+   "  expr E# 8:17 223..224 i64"
+   "  binding B# n pattern i64"
+   "  expr E# 8:23 229..248 i64"
+   "  expr E# 8:24 230..231 (fn :send (i64 i64) i64)"
+   "  inst E# i64 |"
+   "  res E# instance N"
+   "  expr E# 8:26 232..233 i64"
+   "  expr E# 8:28 234..247 i64"
+   "  expr E# 8:29 235..239 (fn :send (Sq) i64)"
+   "  inst E# |"
+   "  expr E# 8:34 240..246 Sq"
+   "  expr E# 8:35 241..243 (fn :send (i64) Sq)"
+   "  inst E# |"
+   "  expr E# 8:38 244..245 i64"])
+
+;; The units of the program (the last five: those of the prelude come first), in the order
+;; checked: twice, area, dbl, the def (before main, which uses it), main.
+(defun run (cs: Checks p: TypedProgram) -> unit
+  (let ((twice (unwrap-or (program-fun p "twice") -1)))
+    (do
+      (check cs "the units are the SCC of twice, area, dbl, the def, main"
+             (= (units-of p) [(UScc [twice]) (UScc [(unwrap-or (program-fun p "area") -1)])
+                             (UScc [(unwrap-or (program-fun p "dbl") -1)]) (nth (units-of p) 3)
+                             (UScc [(unwrap-or (program-fun p "main") -1)])]))
+      (check cs "the fourth unit is a def"
+             (match (nth (units-of p) 3) ((UDef _) true) (_ false)))
+      (check cs "fun finds a defun of the user module" (some? (program-fun p "twice")))
+      (check cs "fun does not find a def" (nil? (program-fun p "limit")))
+      (check cs "fun does not find a name that is not there" (nil? (program-fun p "nope")))
+      (check cs "scheme of twice has one type and one colour variable"
+             (match (program-scheme p "twice")
+               ((some s) (and (= (. s var-names) ["a"]) (= (. s n-colours) 1)))
+               (nil false)))
+      (check cs "show_fun of a generic with a colour"
+             (= (program-show-fun p "twice") (some "∀a ς0. (fn :send ((fn ς0 (a) a) a) a)")))
+      (check cs "show_fun of a bounded generic"
+             (= (program-show-fun p "dbl") (some "∀a. (Num a) ⇒ (fn :send (a) a)")))
+      (check cs "show_fun of a closed function prints the bare type"
+             (= (program-show-fun p "area") (some "(fn :send (Sq) i64)")))
+      (check cs "show_fun of nothing is none" (nil? (program-show-fun p "nope")))
+      (check cs "show_scheme is show_fun's text"
+             (= (match (program-scheme p "dbl") ((some s) (some (program-show-scheme p s))) (nil nil))
+                (program-show-fun p "dbl")))
+      (check cs "def_type of a def" (= (program-def-type p "limit") (some (ty-i64))))
+      (check cs "def_type of a defun is none" (nil? (program-def-type p "twice")))
+      (check cs "show_in prints the quantified names of the function's scheme"
+             (match (get (. p binding-types) (. (nth (. (g-fun (. p globals) twice) params) 0) binding))
+               ((some t) (= (program-show-in p twice t) "(fn ς0 (a) a)"))
+               (nil false)))
+      (check cs "the builtin table is the checker's" (= (count (. p builtins)) (count (builtin-table))))
+      (check cs "twice's tables" (= (unit-of p 0) twice-lines))
+      (check cs "area's tables: an instance resolution" (= (unit-of p 1) area-lines))
+      (check cs "a def's tables" (= (unit-of p 3) limit-lines))
+      (check cs "dbl's tables: a bound resolution" (= (unit-of p 2) dbl-lines))
+      (check cs "main's tables: an instantiated colour, an fn colour, let and pattern bindings"
+             (= (unit-of p 4) main-lines)))))
+
+(defun builtin-checks (cs: Checks) -> unit
+  (let ((ls (builtins-lines))
+        (find (fn (name: str) (find-first (fn (l: str) (includes? l (str-join [" " name " "]))) ls))))
+    (do
+      (check cs "the builtins table is a header and a row each"
+             (and (= (nth ls 0) "-- builtins") (= (count ls) (+ 1 (count (builtin-table))))))
+      (check cs "a row: index, name, signature, escapes"
+             (= (nth ls 1) "builtin 0 cell (fn (a) (Cell a)) escapes store"))
+      (check cs "a row with bounds"
+             (= (find "atom") (some "builtin 2 atom (fn (a) (Atom a)) where ((Send a)) escapes store")))
+      (check cs "a row with an in-out escape"
+             (= (find "array-set!") (some "builtin 15 array-set! (fn ((& (Array a)) i64 a) unit) escapes inout scalar store")))
+      (check cs "a row that is unsafe" (ends-with? (unwrap-or (find "release-raw") "") " unsafe")))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (match (check-source (source) "t.fib")
+          ((Ok p) (run cs p))
+          ((Err _) (check cs "the program checks" false)))
+        (builtin-checks cs)
+        (finish cs))))

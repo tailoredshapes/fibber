@@ -4,23 +4,11 @@
 ;; The units that are not generalised (spec/types.md §3.5 steps 5-6): a `def`
 ;; (closed and monomorphic, §2.16) and an `impl` method body (checked against
 ;; its signature under the declared context, §2.7).
-;;
-;; TODO(P12): `check-matches` below is a stub. The Rust `check_matches` is a
-;; method of `Cx` (infer/exhaust/mod.rs:46), but P1's stub in types.exhaust is
-;; `checker-check-matches` over a `Checker`, which makes types.exhaust use
-;; types.infer.mod, which uses this module (types.infer.scc calls it too): a
-;; cycle. P12 should give types.exhaust `(cx-check-matches (cx: Cx e: Expr))`
-;; and no import of types.infer.mod; then delete the stub, `:use` types.exhaust
-;; and call `cx-check-matches`.
 (ns types.infer.units
   (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.annot types.lower.impl-head types.lower.supers
         types.infer.cx types.infer.unify types.infer.expr types.infer.call
-        types.infer.solve types.infer.general))
-
-;; Rust: infer/exhaust/mod.rs:46 check_matches. STUB, see the TODO above.
-(defun check-matches :private (cx: Cx e: Expr) -> (Result unit TypeError)
-  (trap "todo: cx-check-matches"))
+        types.infer.solve types.infer.general types.exhaust))
 
 ;; ---- a def
 
@@ -53,7 +41,7 @@
 ;; The unit is closed: its matches are checked and its colours settled.
 (defun def-closed :private (cx: Cx def: DefDef ty: Ty) -> (Result Ty TypeError)
   (try-let ((closed (cx-close cx []))
-            (_ (check-matches cx (. def init))))
+            (_ (cx-check-matches cx (. def init))))
     (let ((map (genmap-new cx [] (. closed colours) []))
           (out (genmap-apply map (. cx st) ty)))
       (do (cx-finalize cx map closed)
@@ -75,7 +63,7 @@
                     (body (cx-infer cx (. m body)))
                     (_ (cx-flow cx body (. sig ret) (. (. m body) pos)))
                     (closed (cx-close cx []))
-                    (_ (check-matches cx (. m body))))
+                    (_ (cx-check-matches cx (. m body))))
             (let ((order (mapv (fn (i: i64) (KeyRigid i)) (range (count @(. (. cx u) rigid-names)))))
                   (map (genmap-new cx order (. closed colours) [])))
               (do (cx-finalize cx map closed)

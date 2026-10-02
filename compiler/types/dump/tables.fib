@@ -1,0 +1,191 @@
+;; compiler/types/dump/tables.fib: the `tables` section of the types dump (spec/bootstrap.md
+;; §6.3) and the `builtins` table, as `unit_tables`, `builtins_text` and their helpers of
+;; crates/fibref/src/types_dump/tables.rs (:195-333) and texts.rs (package P13). Under each
+;; `unit` line, two spaces in, for each expression and binding of the unit's bodies in the order
+;; the `ast` walk meets them: `expr E POS TYPE`, `binding B NAME KIND TYPE`, `inst E TYPE.. |
+;; COLOUR..`, `res E instance I TYPE.. | bound PRED | dyn`, `fn E COLOUR`, the types zonked (the
+;; typed program's are) and printed with the quantified names of the unit's function.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust walk takes a visitor over events (`Ev`), of which the tables look at expressions,
+;;   bindings and patterns; here the walk is the one function `walk` that threads the lines
+;;   (a `(Vec str)`, a line one element, normalised as Rust's `push` does) and calls the
+;;   record functions at those nodes. The nodes the tables ignore (`clause`, `amp`, `ret`,
+;;   `quote`) are not visited.
+;; - `unit-tables` takes the typed program (its globals are the View's) and the unit.
+(ns types.dump.tables
+  (:require [syntax.dump :as sdump] [types.dump.ast :as ast])
+  (:use fib.string syntax.pos types.ty types.table types.ast types.decls types.display types.builtins
+        types.infer.cx types.infer.mod types.program types.dump.normal types.dump.scheme))
+
+;; What the records of one body read: the typed program, the printer of its types and the
+;; file the positions are relative to.
+(defstruct Tc (typed: TypedProgram p: Printer home: str))
+
+(defun emit :private (acc: (Vec str) text: str) -> (Vec str)
+  (conj acc (normalise text)))
+
+(defun type-text :private (tc: Tc t: Ty) -> str
+  (printer-ty (. tc p) t))
+
+;; ---- the records of one node
+
+;; `binding B NAME KIND TYPE`, the type `_` when the binding has none.
+(defun binding-record :private (acc: (Vec str) tc: Tc b: i64) -> (Vec str)
+  (let ((info (g-binding (. (. tc typed) globals) b))
+        (ty (match (get (. (. tc typed) binding-types) b)
+              ((some x) (type-text tc x))
+              (nil "_"))))
+    (emit acc (str-join ["  binding B" (show b) " " (. info name) " " (ast/binding-kind-text (. info kind)) " " ty]))))
+
+(defun resolution-text :private (tc: Tc r: Resolution) -> str
+  (match r
+    ((ResInstance index args)
+     (str-join ["instance " (show index) (str-join (mapv (fn (a: Ty) (str-join [" " (type-text tc a)])) args))]))
+    ((ResBound pred) (str-join ["bound " (printer-pred (. tc p) pred)]))
+    ((ResDyn) "dyn")))
+
+;; `inst E TYPE.. | COLOUR..`: the `|` is always there.
+(defun inst-text :private (tc: Tc i: Instantiation) -> str
+  (join " " (into (conj (mapv (fn (x: Ty) (type-text tc x)) (. i tys)) "|")
+                  (mapv (fn (k: Colour) (scheme-colour k)) (. i colours)))))
+
+;; The `expr`, `inst`, `res` and `fn` records of expression e, those it has.
+(defun expr-records :private (acc: (Vec str) tc: Tc e: Expr) -> (Vec str)
+  (let ((t (. tc typed))
+        (n (str-join ["E" (show (. e id))]))
+        (a1 (if-some [ty (get (. t expr-types) (. e id))]
+              (emit acc (str-join ["  expr " n " " (sdump/span-in (. e pos) (. tc home)) " " (type-text tc ty)]))
+              acc))
+        (a2 (if-some [i (get (. t instantiations) (. e id))]
+              (emit a1 (str-join ["  inst " n " " (inst-text tc i)]))
+              a1))
+        (a3 (if-some [r (get (. t resolutions) (. e id))]
+              (emit a2 (str-join ["  res " n " " (resolution-text tc r)]))
+              a2)))
+    (if-some [k (get (. t fn-colours) (. e id))]
+      (emit a3 (str-join ["  fn " n " " (scheme-colour k)]))
+      a3)))
+
+;; ---- the walk (tables.rs walk_*: the order the `ast` walk meets the nodes)
+
+(defun pattern-bindings :private (p: Pattern) -> (Vec i64)
+  (match (. p kind)
+    ((PBind b) [b])
+    ((PAs _ b) [b])
+    ((PVec _ (RestBind b)) [b])
+    (_ [])))
+
+;; The bindings of pattern p, then those of its sub-patterns, depth first.
+(defun walk-pat :private (acc: (Vec str) tc: Tc p: Pattern) -> (Vec str)
+  (let ((here (reduce (fn (a: (Vec str) b: i64) (binding-record a tc b)) acc (pattern-bindings p)))
+        (sub (fn (a: (Vec str) s: Pattern) (walk-pat a tc s))))
+    (match (. p kind)
+      ((PCtor _ _ subs) (reduce sub here subs))
+      ((PVec subs _) (reduce sub here subs))
+      ((PAs inner _) (sub here inner))
+      (_ here))))
+
+(defun walk-place :private (acc: (Vec str) tc: Tc p: Place) -> (Vec str)
+  (match p
+    ((PlExpr e) (walk acc tc e))
+    ((PlAmp _) acc)))
+
+(defun walk-all :private (acc: (Vec str) tc: Tc es: (Vec Expr)) -> (Vec str)
+  (reduce (fn (a: (Vec str) x: Expr) (walk a tc x)) acc es))
+
+(defun walk-fn :private (acc: (Vec str) tc: Tc lit: FnLit) -> (Vec str)
+  (let ((named (match (. lit name) ((some b) (binding-record acc tc b)) (nil acc)))
+        (ps (reduce (fn (a: (Vec str) p: FnParam) (binding-record a tc (. p binding))) named (. lit params))))
+    (walk ps tc (. lit body))))
+
+(defun walk-clause :private (acc: (Vec str) tc: Tc c: Clause) -> (Vec str)
+  (let ((pat (walk-pat acc tc (. c pat)))
+        (guarded (match (. c guard) ((some x) (walk pat tc x)) (nil pat))))
+    (walk guarded tc (. c body))))
+
+;; The expression e: its records, then those of its children.
+(defun walk (acc: (Vec str) tc: Tc e: Expr) -> (Vec str)
+  (let ((here (expr-records acc tc e)))
+    (match (. e kind)
+      ((ELit _) here)
+      ((ELocal _) here)
+      ((EGlobal _) here)
+      ((EQuote _) here)
+      ((ECall head args)
+       (reduce (fn (a: (Vec str) x: Arg)
+                 (match x
+                   ((ArgExpr y) (walk a tc y))
+                   ((ArgAmp _ _) a)))
+               (walk here tc head) args))
+      ((EFn lit) (walk-fn here tc lit))
+      ((ELet bs body)
+       (walk (reduce (fn (a: (Vec str) b: LetBind) (walk (walk-pat a tc (. b pat)) tc (. b init))) here bs)
+             tc body))
+      ((EIf c t f) (walk-all here tc [c t f]))
+      ((EDo es) (walk-all here tc es))
+      ((ERecur es) (walk-all here tc es))
+      ((EConcat es) (walk-all here tc es))
+      ((EMatch s cs)
+       (reduce (fn (a: (Vec str) c: Clause) (walk-clause a tc c)) (walk here tc s) cs))
+      ((ELoop vs body)
+       (walk (reduce (fn (a: (Vec str) v: LoopBind) (walk (binding-record a tc (. v binding)) tc (. v init)))
+                     here vs)
+             tc body))
+      ((EDeref p _) (walk-place here tc p))
+      ((ESet p v) (walk (walk-place here tc p) tc v))
+      ((EField x _ _) (walk here tc x))
+      ((ESetField _ _ x) (walk here tc x))
+      ((EAsync x _) (walk here tc x))
+      ((EAwait x) (walk here tc x))
+      ((EUnsafe x) (walk here tc x))
+      ((EDyn _ _ _ x) (walk here tc x))
+      ((EConvert _ _ x) (walk here tc x)))))
+
+;; ---- the units
+
+;; The records of a body printed with the variable names `names`: its parameters' bindings,
+;; then its expression.
+(defun body-tables :private (acc: (Vec str) t: TypedProgram names: (Vec str) params: (Vec i64) body: Expr
+                             home: str) -> (Vec str)
+  (let ((tc (Tc t (printer-with-names (. t globals) names []) home)))
+    (walk (reduce (fn (a: (Vec str) b: i64) (binding-record a tc b)) acc params) tc body)))
+
+;; The records of `defun` or `defmacro` f, with the names of its scheme.
+(defun fun-tables :private (acc: (Vec str) t: TypedProgram f: i64 home: str) -> (Vec str)
+  (let ((def (g-fun (. t globals) f))
+        (names (match (get (. t fun-schemes) f) ((some s) (. s var-names)) (nil []))))
+    (body-tables acc t names (mapv (fn (p: ParamDecl) (. p binding)) (. def params)) (. def body) home)))
+
+;; The records of the tables under a unit, two spaces in, in the order a walk of the bodies
+;; meets the expressions and bindings (home: the file the positions are relative to).
+(defun unit-tables (acc: (Vec str) t: TypedProgram u: UnitRef home: str) -> (Vec str)
+  (let ((g (. t globals)))
+    (match u
+      ((UScc fs) (reduce (fn (a: (Vec str) f: i64) (fun-tables a t f home)) acc fs))
+      ((UMacro f) (fun-tables acc t f home))
+      ((UDef d) (body-tables acc t [] [] (. (g-def g d) init) home))
+      ((UImplMethod i k)
+       (let ((inst (table-get (. g instances) i))
+             (m (nth (. inst methods) k)))
+         (body-tables acc t (. inst var-names) (. m params) (. m body) home))))))
+
+;; ---- the builtin table
+
+;; An escape kind as the table prints it: the variant's name in lower case.
+(defun escape-name :private (e: Escape) -> str
+  (match e
+    ((EscScalar) "scalar") ((EscBorrow) "borrow") ((EscStore) "store") ((EscThread) "thread")
+    ((EscInOut) "inout") ((EscWeak) "weak") ((EscRaw) "raw")))
+
+;; `builtin INDEX NAME SIG [where BOUNDS] escapes ESCAPE.. [unsafe]` of row i.
+(defun builtin-line :private (i: i64 b: BuiltinSig) -> str
+  (str-join ["builtin " (show i) " " (. b name) " " (. b sig)
+             (if (empty? (. b bounds)) "" (str-join [" where " (. b bounds)]))
+             " escapes" (str-join (mapv (fn (e: Escape) (str-join [" " (escape-name e)])) (. b escapes)))
+             (if (. b unsafe-only) " unsafe" "")]))
+
+;; The static table of builtins, printed once per run when `tables` is asked for: the line
+;; `-- builtins` and a line per row (not normalised: it holds no variable ids).
+(defun builtins-lines () -> (Vec str)
+  (into ["-- builtins"] (map-indexed builtin-line (builtin-table))))

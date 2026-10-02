@@ -1,11 +1,60 @@
 ;; compiler/types/exhaust/show.fib: the text of a witness pattern (package P12).
 ;; Replaces crates/fibref/src/types/infer/exhaust/show.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; A missing case in the spelling of syntax §3.6: `nil`, `(some _)`, `(Leaf)`,
+;; `(Circle _)`, `true`, `[_ _ & _]`, `_`.
 (ns types.exhaust.show
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.exhaust.matrix))
+  (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.exhaust.matrix))
 
-;; Rust: infer/exhaust/show.rs:10 show
+;; Rust: infer/exhaust/show.rs:10 show. The witness `p` of type `t` as a pattern.
 (defun exhaust-show (g: Globals st: Store p: XP t: Ty) -> str
-  (trap "todo: exhaust-show"))
+  (match p
+    ((XCtor c args) (show-ctor g st c args (store-zonk st t)))
+    (_ "_")))
+
+(defun show-ctor :private (g: Globals st: Store c: Ctor args: (Vec XP) zt: Ty) -> str
+  (match c
+    ((CtBool b) (if b "true" "false"))
+    ((CtLit l) l)
+    ((CtLen _) (show-vector g st c args zt))
+    ((CtAtLeast _) (show-vector g st c args zt))
+    ((CtVariant i)
+     (match zt
+       ((TCon (KNominal id) targs)
+        (if (is-vec-type g id)
+            ;; A variant of the prelude's Vec is a set of lengths (§2.6).
+            (if (= i 0) "[]" "[_ & _]")
+            (show-variant g st id i targs args)))
+       (_ "_")))))
+
+(defun is-vec-type :private (g: Globals id: i64) -> bool
+  (match @(. g vec)
+    ((some v) (= v id))
+    (nil false)))
+
+;; `[a..]` for a length, `[a.. & _]` for a least length.
+(defun show-vector :private (g: Globals st: Store c: Ctor args: (Vec XP) t: Ty) -> str
+  (let ((elem (match t
+                ((TCon _ targs) (nth-or targs 0 (ty-unit)))
+                (_ (ty-unit))))
+        (items (mapv (fn (a: XP) (exhaust-show g st a elem)) args))
+        (tail (match c ((CtAtLeast _) ["&" "_"]) (_ []))))
+    (str-join ["[" (join-spaces (into items tail)) "]"])))
+
+(defun join-spaces :private (xs: (Vec str)) -> str
+  (reduce (fn (acc: str x: str) (if (= acc "") x (str-join [acc " " x]))) "" xs))
+
+;; A struct is its one variant; an enum's variant `i`: `(Name arg..)`, with
+;; `nil` alone when it has no arguments.
+(defun show-variant :private (g: Globals st: Store id: i64 i: i64 targs: (Vec Ty) args: (Vec XP)) -> str
+  (let ((def (g-ty g id))
+        ([name fields] (match (. def shape)
+                         ((TsStruct fs) (Pair (. def name) (field-tys fs targs)))
+                         ((TsEnum vs) (let ((v (nth vs i))) (Pair (. v name) (field-tys (. v fields) targs)))))))
+    (if (and (= name "nil") (empty? args))
+        name
+        (str-join (conj (into ["(" name]
+                              (mapv (fn ([a ft]) (str-join [" " (exhaust-show g st a ft)]))
+                                    (zip args fields)))
+                        ")")))))

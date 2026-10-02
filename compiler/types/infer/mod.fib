@@ -1,10 +1,20 @@
 ;; compiler/types/infer/mod.fib: the checker loop over the units (package P12).
 ;; Replaces crates/fibref/src/types/infer/mod.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; Inference (spec/types.md §3): the per-module algorithm over the lowered AST,
+;; one unit at a time, with one substitution for the whole program. A unit that
+;; fails reports its first error; the units that depend on it are skipped rather
+;; than reporting consequences of it.
+;;
+;; Shapes where Rust and fibber differ: Form is Stx, an id is an i64, `&mut Foo`
+;; is the Foo of Cells; `Checker::cx` is `checker-cx`, a fresh `Cx` over the
+;; checker's own globals, environment, store and tables with a fresh `Unit`; the
+;; Rust `HashMap<Node, Vec<Node>>` is a `(Map Node (Vec Node))`; the SCC loop and
+;; the other units are `scc-unit`, `impl-unit` and `macro-unit`.
 (ns types.infer.mod
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx types.infer.deps types.lower.mod))
+  (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast types.decls
+        types.display types.init types.lower.mod
+        types.infer.cx types.infer.deps types.infer.scc types.infer.units))
 
 ;; Rust `UnitRef` (infer/mod.rs:37): a unit in the order it was checked.
 (defenum UnitRef
@@ -23,12 +33,164 @@
 
 ;; Rust: infer/mod.rs:66 Checker::new
 (defun checker-new (g: Globals) -> Checker
-  (trap "todo: checker-new"))
+  (Checker g (env-new) (store-new) (tables-new) (cell []) (cell []) (cell (set-empty))))
 
-;; Rust: infer/mod.rs:100 module
+;; Rust: infer/mod.rs:81 cx. A fresh context for one unit.
+(defun checker-cx :private (ck: Checker) -> Cx
+  (Cx (. ck g) (. ck env) (. ck st) (. ck t) (unit-new)))
+
+(defun push-error :private (ck: Checker e: TypeError) -> unit
+  (set! (. ck errors) (conj @(. ck errors) e)))
+
+(defun push-unit :private (ck: Checker u: UnitRef) -> unit
+  (set! (. ck order) (conj @(. ck order) u)))
+
+(defun set-fun-scheme :private (ck: Checker f: i64 s: Scheme) -> unit
+  (set! (. (. ck env) funs) (assoc @(. (. ck env) funs) f s)))
+
+;; ---- the dependency graph
+
+;; The functions and defs `e` names, each once, in the order they are met.
+(defun refs-of :private (e: Expr) -> (Vec Node)
+  (let ((out (cell [])))
+    (do (deps-refs e out)
+        @out)))
+
+(defun node-expr :private (g: Globals n: Node) -> Expr
+  (match n
+    ((NFun f) (. (g-fun g f) body))
+    ((NDef d) (. (g-def g d) init))))
+
+;; Rust: infer/mod.rs:91 blocked. Whether `e` names a unit that failed.
+(defun blocked :private (ck: Checker e: Expr) -> bool
+  (not (every? (fn (n: Node) (not (contains? @(. ck failed) n))) (refs-of e))))
+
+(defun fail :private (ck: Checker scc: (Vec Node) e: TypeError) -> unit
+  (do (push-error ck e)
+      (set! (. ck failed) (into @(. ck failed) scc))))
+
+;; ---- the units of a module
+
+;; Rust: infer/mod.rs:100 module. Steps 4 to 6 for one module: the functions and
+;; defs by SCC, then the impl methods, then the macros.
 (defun checker-module (ck: Checker items: ModuleItems) -> unit
-  (trap "todo: checker-module"))
+  (let ((g (. ck g))
+        (nodes (into (mapv (fn (f: i64) (NFun f)) (. items funs))
+                     (mapv (fn (d: i64) (NDef d)) (. items defs))))
+        (edges (reduce (fn (m: (Map Node (Vec Node)) n: Node)
+                         (assoc m n (filterv (fn (x: Node) (includes? x nodes)) (refs-of (node-expr g n)))))
+                       (map-empty) nodes)))
+    (do (doseq (scc (deps-sccs nodes edges)) (scc-unit ck scc edges))
+        (doseq (inst (. items impls))
+          (doseq (m (range (count (. (table-get (. g instances) inst) methods))))
+            (impl-unit ck inst m)))
+        (doseq (f (. items macros)) (macro-unit ck f)))))
 
-;; Rust: infer/mod.rs:226 check_main
+;; Rust: infer/mod.rs:133 scc_unit. One SCC: skipped when it uses a unit that
+;; failed, a def cycle is an error, a lone def is typed alone, the rest is a
+;; group of functions.
+(defun scc-unit :private (ck: Checker scc: (Vec Node) edges: (Map Node (Vec Node))) -> unit
+  (if (not (every? (fn (n: Node) (not (blocked ck (node-expr (. ck g) n)))) scc))
+      (set! (. ck failed) (into @(. ck failed) scc))
+      (match (def-cycle ck scc edges)
+        ((Err e) (fail ck scc e))
+        ((Ok _) (if-some [d (single-def scc)]
+                  (def-unit ck scc d)
+                  (fun-scc ck scc))))))
+
+;; The def of an SCC that is one def and nothing else.
+(defun single-def :private (scc: (Vec Node)) -> (Option i64)
+  (if (= (count scc) 1)
+      (match (nth scc 0)
+        ((NDef d) (some d))
+        (_ nil))
+      nil))
+
+(defun def-unit :private (ck: Checker scc: (Vec Node) d: i64) -> unit
+  (do (push-unit ck (UDef d))
+      (match (cx-infer-def (checker-cx ck) d)
+        ((Ok t) (set! (. (. ck env) defs) (assoc @(. (. ck env) defs) d t)))
+        ((Err e) (fail ck scc e)))))
+
+;; Rust: infer/mod.rs:172 def_cycle. `def g and defun f depend on each other`
+;; (§2.16).
+(defun def-cycle :private (ck: Checker scc: (Vec Node) edges: (Map Node (Vec Node))) -> (Result unit TypeError)
+  (let ((g (. ck g))
+        (self-loop (fn (n: Node) (includes? n (get-or edges n []))))
+        (def (first (keep (fn (n: Node)
+                            (match n
+                              ((NDef d) (if (or (> (count scc) 1) (self-loop n)) (some d) nil))
+                              (_ nil)))
+                          scc))))
+    (match def
+      (nil (Ok ()))
+      ((some d)
+       (let ((dd (g-def g d))
+             (other (first (keep (fn (n: Node)
+                                   (match n
+                                     ((NFun f) (some (. (g-fun g f) name)))
+                                     ((NDef e) (if (= e d) nil (some (. (g-def g e) name))))))
+                                 scc)))
+             (other-name (match other
+                           ((some o) o)
+                           (nil (. dd name)))))
+         (Err (type-error DefCycle (. dd pos)
+                (str-join ["def " (. dd name) " and defun " other-name " depend on each other"]))))))))
+
+;; Rust: infer/mod.rs:197 fun_scc. A group of functions, generalised together.
+(defun fun-scc :private (ck: Checker scc: (Vec Node)) -> unit
+  (let ((g (. ck g))
+        (ids (vec (keep (fn (n: Node) (match n ((NFun f) (some f)) (_ nil))) scc))))
+    (do (push-unit ck (UScc ids))
+        (store-enter (. ck st))
+        (let ((r (cx-infer-scc (checker-cx ck) (mapv (fn (f: i64) (g-fun g f)) ids) ids)))
+          (do (store-leave (. ck st))
+              (match r
+                ((Ok schemes) (doseq [[f s] (zip ids schemes)] (set-fun-scheme ck f s)))
+                ((Err e) (fail ck scc e))))))))
+
+;; Rust: infer/mod.rs:219 impl_unit. One method body of an instance, skipped
+;; when it uses a unit that failed.
+(defun impl-unit :private (ck: Checker inst: i64 m: i64) -> unit
+  (let ((body (. (nth (. (table-get (. (. ck g) instances) inst) methods) m) body)))
+    (when-not (blocked ck body)
+      (do (push-unit ck (UImplMethod inst m))
+          (store-enter (. ck st))
+          (let ((r (cx-infer-impl-method (checker-cx ck) inst m)))
+            (do (store-leave (. ck st))
+                (match r
+                  ((Err e) (push-error ck e))
+                  (_ ()))))))))
+
+;; Rust: infer/mod.rs:235 macro_unit. A `defmacro` body, typed as a function of
+;; its own.
+(defun macro-unit :private (ck: Checker f: i64) -> unit
+  (let ((fd (g-fun (. ck g) f)))
+    (when-not (blocked ck (. fd body))
+      (do (push-unit ck (UMacro f))
+          (store-enter (. ck st))
+          (let ((r (cx-infer-scc (checker-cx ck) [fd] [f])))
+            (do (store-leave (. ck st))
+                (match r
+                  ((Ok schemes) (when-some [s (peek schemes)] (set-fun-scheme ck f s)))
+                  ((Err e) (push-error ck e)))))))))
+
+;; ---- step 7
+
+;; Rust: infer/mod.rs:226 check_main. `main : (fn () i64)`.
 (defun checker-check-main (ck: Checker) -> unit
-  (trap "todo: checker-check-main"))
+  (let ((g (. ck g)))
+    (match (get @(. (g-names g @(. g main)) values) "main")
+      ((some (GFun f))
+       (when-some [s (get @(. (. ck env) funs) f)]
+         (when-not (main-type? s)
+           (push-error ck (type-error-other (. (g-fun g f) pos)
+                            (str-join ["main must have type (fn () i64), not "
+                                       (printer-ty (printer-with-names g (. s var-names) []) (. s ty))]))))))
+      (_ (push-error ck (type-error-other (builtin-pos) "the program has no main"))))))
+
+(defun main-type? :private (s: Scheme) -> bool
+  (and (empty? (. s preds))
+       (match (. s ty)
+         ((TFn (CSend) ps r) (and (empty? ps) (= r (ty-i64))))
+         (_ false))))

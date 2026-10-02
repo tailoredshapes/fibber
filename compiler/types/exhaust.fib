@@ -1,14 +1,95 @@
 ;; compiler/types/exhaust.fib: exhaustiveness and redundancy of matches (package P12).
 ;; Replaces crates/fibref/src/types/infer/exhaust/mod.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; Exhaustiveness and redundancy of `match` (spec/types.md §2.6), decided after
+;; the unit's types are solved, on the resolved scrutinee type, by the
+;; usefulness algorithm (Maranget). A scrutinee whose type is still a variable
+;; admits only `_`/variable clauses as exhaustive.
+;;
+;; A guarded clause is checked for redundancy against the unguarded clauses
+;; above it and then left out: it covers nothing. A column of type `(Vec T)`
+;; with a vector pattern has one constructor per length below `L` and one for
+;; every length from `L` up (types.exhaust.matrix).
+;;
+;; The Rust `check_matches` is a method of `Cx` (the `Checker` of P1's stub
+;; would make types.exhaust use types.infer.mod, which uses types.infer.units
+;; and types.infer.scc, which call it: a cycle): this module imports only
+;; types.infer.cx.
 (ns types.exhaust
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.exhaust.matrix types.infer.cx))
+  (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.exhaust.matrix types.exhaust.show types.infer.cx))
 
-;; Rust: infer/exhaust/mod.rs:46 check_matches, a method of `Cx`: it takes the
-;; `Cx` (not P1's `Checker`) and this module imports only types.infer.cx, so
-;; that types.exhaust, types.infer.mod, types.infer.units and types.infer.scc
-;; (which call it) form no cycle.
+(def mixed-message: str "vector patterns cannot be mixed with patterns of Vec's variants")
+
+;; Any injective text of a literal will do (the Rust is its `{:?}`): the text
+;; is only compared, a literal never shows in a witness.
+(defun lit-text :private (l: Lit) -> str
+  (match l
+    ((LitInt v _) (str-join ["int " (show v)]))
+    ((LitFloat v _) (str-join ["flt " (show v)]))
+    ((LitStr s) (str-join ["str " s]))
+    ((LitChar c) (str-join ["chr " (show (zext i64 (char->i32 c)))]))
+    ((LitBool b) (if b "true" "false"))
+    ((LitKeyword k) (str-join ["kw " k]))
+    ((LitUnit) "unit")))
+
+;; Rust `simplify` (exhaust/mod.rs:23): a pattern as a row entry.
+(defun simplify :private (p: Pattern) -> XP
+  (match (. p kind)
+    ((PWild) XWild)
+    ((PBind _) XWild)
+    ((PLit (LitUnit)) XWild)
+    ((PAs inner _) (simplify inner))
+    ((PLit (LitBool b)) (XCtor (CtBool b) []))
+    ((PLit l) (XCtor (CtLit (lit-text l)) []))
+    ((PCtor _ v subs) (XCtor (CtVariant (get-or-zero v)) (mapv simplify subs)))
+    ((PVec subs (RestExact)) (XCtor (CtLen (count subs)) (mapv simplify subs)))
+    ((PVec subs _) (XSlice (mapv simplify subs)))))
+
+(defun get-or-zero :private (v: (Option i64)) -> i64
+  (match v
+    ((some i) i)
+    (nil 0)))
+
+;; Rust: infer/exhaust/mod.rs:46 check_matches, a method of `Cx`. Checks every
+;; `match` in `e`; the first error ends the walk.
 (defun cx-check-matches (cx: Cx e: Expr) -> (Result unit TypeError)
-  (trap "todo: cx-check-matches"))
+  (try-let ((_ (match (. e kind)
+                 ((EMatch s clauses)
+                  (check-match cx e (get-or @(. (. cx t) expr-types) (. s id) (ty-unit)) clauses))
+                 (_ (Ok ())))))
+    (check-children cx (expr-children e))))
+
+(defun check-children :private (cx: Cx cs: (Vec Expr)) -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (>= i (count cs))
+        (Ok ())
+        (match (cx-check-matches cx (nth cs i))
+          ((Ok _) (recur (+ i 1)))
+          ((Err err) (Err err))))))
+
+;; Rust: infer/exhaust/mod.rs:60 check_match. Each clause is useful against the
+;; unguarded ones above it (or the trap clause of a refutable let, which
+;; never is redundant); then `_` must not be useful against all of them.
+(defun check-match :private (cx: Cx e: Expr st: Ty clauses: (Vec Clause)) -> (Result unit TypeError)
+  (let ((m (matrix-new (. cx g) (. cx st)))
+        (tys [st]))
+    (try-let ((rows (check-clauses m clauses tys)))
+      (if-some [w (matrix-useful m rows [XWild] tys)]
+        (Err (type-error NonExhaustive (. e pos)
+               (str-join ["non-exhaustive match: missing " (exhaust-show (. cx g) (. cx st) (nth w 0) st)])))
+        (Ok ())))))
+
+;; The unguarded rows after the clauses, or the error of the first one that
+;; mixes vector patterns with Vec's variants or is redundant.
+(defun check-clauses :private (m: Matrix clauses: (Vec Clause) tys: (Vec Ty)) -> (Result (Vec (Vec XP)) TypeError)
+  (loop ((i 0) (rows []))
+    (if (>= i (count clauses))
+        (Ok rows)
+        (let ((c (nth clauses i))
+              (row [(simplify (. c pat))])
+              (useful (some? (matrix-useful m rows row tys))))
+          (cond (@(. m mixed) (Err (type-error-other (. (. c pat) pos) mixed-message)))
+                ((and (not useful) (not (. c fallback)))
+                 (Err (type-error Redundant (. (. c pat) pos) "redundant match clause")))
+                (else (recur (+ i 1) (if (some? (. c guard)) rows (conj rows row)))))))))
