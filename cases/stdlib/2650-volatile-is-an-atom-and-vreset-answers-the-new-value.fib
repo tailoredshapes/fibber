@@ -1,0 +1,33 @@
+;; spec:   stdlib §4.3 (rows volatile! vreset!), §2.11, tranche 2 plan Y6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: volatile! vreset!
+;; (volatile! x) is an Atom, shared by whoever holds it: two closures that capture one volatile both see each
+;; other's writes, and so does a task that is spawned with it. (vreset! v x) stores x and answers x, where reset!
+;; answers unit. A volatile of a string and of a pair is the same Atom, so the payload is any Send type.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (n (volatile! 0)))
+    (do (check c (= @n 0))
+        (check c (= (vreset! n 9) 9))
+        (check c (= @n 9))
+        (let ((bump (fn () (vreset! n (+ @n 1))))
+              (tens (fn () (vreset! n (+ @n 10)))))
+          (do (check c (= (bump) 10))
+              (check c (= (tens) 20))
+              (check c (= (bump) 21))
+              (check c (= @n 21))
+              (check c (= (tens) 31))))
+        (let ((t (spawn (fn () (vreset! n 100)))))
+          (do (join t)
+              (check c (= @n 100))))
+        (let ((s (volatile! "a")))
+          (do (check c (= (vreset! s "bc") "bc"))
+              (check c (= @s "bc"))
+              (check c (= (vswap! s str "d") "bcd"))
+              (check c (= @s "bcd"))))
+        (checks-result c))))

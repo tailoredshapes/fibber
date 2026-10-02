@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.3 (row partial), §2.2, tranche 2 plan Y6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: partial
+;; (partial f a) for f of two parameters is the function of the second, with a evaluated once, when partial is
+;; called: a counter in the argument is 1 however often the result runs. The argument may be a collection, which the
+;; closure keeps and lends to every call; f may be a named function, a closure or another partial's result; the
+;; result is a function value, so it goes to map and filter.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun add (a: i64 b: i64) -> i64 (+ a b))
+(defun sub (a: i64 b: i64) -> i64 (- a b))
+(defun vsum (v: (Vec i64) k: i64) -> i64 (+ (reduce + 0 v) k))
+(defun same (a: i64 b: i64) -> bool (= a b))
+(defun tag (p: str s: str) -> str (str p ":" s))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (do (check c (= ((partial add 4) 5) 9))
+        (check c (= ((partial sub 10) 3) 7))
+        (check c (= (to-vec (map (partial add 100) [1 2 3])) [101 102 103]))
+        (check c (= (to-vec (filter (partial same 2) [1 2 3 2])) [2 2]))
+        (let ((p (partial vsum [1 2 3])))
+          (do (check c (= (p 10) 16))
+              (check c (= (p 20) 26))
+              (check c (= (p 0) 6))))
+        (let ((g (partial (fn (a: i64 b: i64) (* a b)) 6)))
+          (check c (= (g 7) 42)))
+        (let ((hello (partial tag "hello")))
+          (do (check c (= (hello "a") "hello:a"))
+              (check c (= (hello "b") "hello:b"))))
+        (let ((once (partial add (do (set! calls (+ @calls 1)) 1000))))
+          (do (check c (= @calls 1))
+              (check c (= (once 1) 1001))
+              (check c (= (once 2) 1002))
+              (check c (= (once 3) 1003))
+              (check c (= @calls 1))))
+        (checks-result c))))

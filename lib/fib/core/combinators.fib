@@ -1,5 +1,44 @@
-;; owner: Y6
-;; fib.core.combinators: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the functions `volatile! vreset! partial complement constantly *command-line-args*`.
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
+;; fib.core.combinators: the functions that return or wrap functions and values (stdlib §4.3 rows volatile! vreset! partial
+;; complement constantly; tranche 2 plan §5, package Y6). Exports volatile!, vreset!, partial, complement and constantly.
+;; Replaces nothing in the prelude. The sixth row of the stub, `*command-line-args*`, is not here: it is
+;; `(def *command-line-args*: (Vec str) (args))`, and a `def` initialiser that is a call is `initialiser is not a constant
+;; expression` until L15 (package X8), so a part that held it would not check. Case 2657 (`open-`, X8) is the program that
+;; flips when L15 lands, and the line moves into this part in that commit.
+;;
+;; The closures here are made once per call of the combinator, not once per element (stdlib §2.2): `(map (constantly 7) c)`
+;; allocates one closure however long c is. A function parameter that the result keeps is never :borrow (plan §4.3 rule 7).
+;;
+;; Decided here, where the page is silent:
+;;  - volatile! is an `Atom` and vreset! is `reset!` that answers the new value, so a volatile is visible across tasks
+;;    (the page: Clojure's volatile is) and `Cell` stays the thread-confined form. `Send a` is the constraint of `atom`.
+;;  - partial is the one-free-parameter form: `f: (fn (a b) c)` and one argument give `(fn (b) c)` (the arity-reading form
+;;    is L22 and T3). The argument is a value made once, when partial is called, and the closure keeps it; f is kept the
+;;    same way, so `(partial f (next!))` calls next! once however often the result is called. partial2 (the macro of
+;;    fib.core.forms) is the same for two free parameters.
+;;  - complement is `(not (truthy? (p x)))` over any Truthy result, as the row says, so a predicate that answers an Option
+;;    is complemented as `filter` reads it: a `nil` result is kept, a `some` result is dropped, and a `bool` is negated.
+;;    The result is always a `bool`. Unary only, as the page says (the arity-reading form is L22).
+;;  - constantly is unary: the closure ignores its argument and answers the value it was made with. The value is returned
+;;    by a copy or a move out of the closure each call as the type allows, which for a type that is not `Copy` is the
+;;    checker's rule for any closure, not a decision of the library.
 (ns fib.core.combinators (:use fib.core.base fib.core.protocols fib.core.opt))
+
+;; a shared mutable value, visible across tasks: an Atom, as Clojure's volatile (vswap! is the macro of the same family)
+(defun volatile! (x: a) :where ((Send a)) -> (Atom a)
+  (atom x))
+
+;; reset! that answers the value it stored
+(defun vreset! (v: (Atom a) x: a) -> a
+  (do (reset! v x) x))
+
+;; f with its first argument fixed: a closure made once
+(defun partial (f: (fn (a b) c) x: a) -> (fn (b) c)
+  (fn (y) (f x y)))
+
+;; the predicate that says the opposite, over any Truthy answer
+(defun complement (p: (fn (a) b)) :where ((Truthy b)) -> (fn (a) bool)
+  (fn (x) (not (truthy? (p x)))))
+
+;; the function of one argument that answers x whatever it is given
+(defun constantly (x: b) -> (fn (a) b)
+  (fn (y) x))

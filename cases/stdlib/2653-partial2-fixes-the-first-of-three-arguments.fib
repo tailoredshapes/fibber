@@ -1,0 +1,34 @@
+;; spec:   stdlib §4.3 (row partial2), tranche 2 plan Y6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: partial2
+;; (partial2 f a) is (fn (b c) (f a b c)): the stand-in for the two free parameters, until L22 reads the arity from
+;; f's type. f and a are evaluated once, when the closure is made, so a counter in either argument is 1 however
+;; often the closure runs; the closure's own parameters are gensyms, so an argument that names a variable b or c
+;; still means the caller's (the last check).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun add3 (a: i64 b: i64 c: i64) -> i64 (+ a (* 10 b) (* 100 c)))
+(defun join3 (s: str x: str y: str) -> str (str s x y))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (made (cell 0)))
+    (do (check c (= ((partial2 add3 1) 2 3) 321))
+        (check c (= ((partial2 add3 7) 0 0) 7))
+        (check c (= ((partial2 join3 "<") "a" ">") "<a>"))
+        (let ((f (partial2 (fn (p: i64 q: i64 r: i64) (- p q r)) 100)))
+          (do (check c (= (f 1 2) 97))
+              (check c (= (f 10 20) 70))))
+        (let ((g (partial2 (do (set! made (+ @made 1)) add3) (do (set! made (+ @made 10)) 5))))
+          (do (check c (= @made 11))
+              (check c (= (g 1 1) 115))
+              (check c (= (g 2 2) 225))
+              (check c (= @made 11))))
+        (let ((b 1000)
+              (cc 2000)
+              (h (partial2 add3 (+ b cc))))
+          (check c (= (h 1 1) 3110)))
+        (checks-result c))))

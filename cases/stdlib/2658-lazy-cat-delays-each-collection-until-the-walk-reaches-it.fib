@@ -1,0 +1,38 @@
+;; spec:   stdlib §4.4 (row lazy-cat), §2.1 rule 2, tranche 2 plan Y6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: lazy-cat
+;; (lazy-cat c ..) is (lazy-seq (concat c ..)) with each collection expression delayed. Nothing is evaluated when it
+;; is made; the first expression runs when the first element is asked for, the next only once the walk has used the
+;; first up, and a node is realised once, so a second walk runs no expression again. The counter below adds 1, 10
+;; and 100 in the three expressions. Any source may be a part (a Vec, a List, a Range, a lazy seq), and a function
+;; that calls lazy-cat on itself is an infinite seq whose first elements need no more than their own part.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun nat (n: i64) -> (LSeq i64)
+  (lazy-cat [n] (nat (+ n 1))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (n (cell 0))
+        (empty: (Vec i64) (vec-empty)))
+    (do (check c (= (to-vec (lazy-cat [1 2])) [1 2]))
+        (check c (= (to-vec (lazy-cat [1 2] [3])) [1 2 3]))
+        (check c (= (to-vec (lazy-cat [1] (list 2 3) (map inc [3 4]) (Range 10 12 1))) [1 2 3 4 5 10 11]))
+        (check c (= (to-vec (lazy-cat empty [1] empty [2])) [1 2]))
+        (check c (= (to-vec (take 5 (nat 0))) [0 1 2 3 4]))
+        (let ((s (lazy-cat (do (set! n (+ @n 1)) [1 2])
+                           (do (set! n (+ @n 10)) [3])
+                           (do (set! n (+ @n 100)) [4]))))
+          (do (check c (= @n 0))
+              (check c (= (first s) (some 1)))
+              (check c (= @n 1))
+              (check c (= (to-vec (take 2 s)) [1 2]))
+              (check c (= @n 1))
+              (check c (= (to-vec s) [1 2 3 4]))
+              (check c (= @n 111))
+              (check c (= (to-vec s) [1 2 3 4]))
+              (check c (= @n 111))))
+        (checks-result c))))

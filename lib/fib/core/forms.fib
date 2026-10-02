@@ -1,5 +1,36 @@
-;; owner: Y6
-;; fib.core.forms: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the macros `partial2 try-let if-some when-some when-first as-> defonce`.
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
+;; fib.core.forms: the binding macros of the library that are fibber macros (stdlib §4.3 rows partial2 as-> defonce; tranche 2
+;; plan §5, package Y6). Exports the macros partial2, as-> and defonce. try-let, if-some, when-some and when-first are
+;; Rust prelude macros since X3 (E1) and have no source here; their rows are judged by X3's cases. Replaces nothing in the
+;; prelude. A macro body here uses prelude names and builtins only (`vec-count`, `vec-nth`, `gensym`, `loop`: the library
+;; is not in the macro-time module, stdlib §6.3 and C2-25), and a template names a function through the facade.
+;;
+;; Decided here, where the page is silent:
+;;  - (partial2 f a) is `(let ((gf f) (ga a)) (fn (b c) (gf ga b c)))` with all four names gensyms: f and a are evaluated
+;;    once, when the closure is made, exactly as `partial` does, and b and c cannot capture a name the caller wrote in f
+;;    or a. The two free parameters are fixed at two: a stand-in until L22 reads the arity from f's type (the row).
+;;  - (as-> x v form ..) rebinds v in order, each form seeing the value of the one before: it expands to
+;;    `(let ((v (let ((v x)) form1))) form2)`, the same shadowing a `let` of v in a row would give, so a form that uses v
+;;    in two places sees one value, and x is evaluated outside the scope of v. With no form the answer is x (Clojure's).
+;;    The macro does not check the name: one that is not a symbol is what `let` makes of it. A macro that traps is no
+;;    check either, because under fibc a trap at expansion aborts the compiler where fibref says `macro NAME failed`.
+;;  - (defonce name: T v) is `(def name: T v)`: a `def` is evaluated once before `main` (L15), so no guard is needed. The
+;;    macro passes everything after the name to `def`, so the annotated and the plain spelling both work. A `def`
+;;    initialiser that is not a constant is refused until L15 (X8), and so is defonce of it: case 2657.
 (ns fib.core.forms (:use fib.core.base fib.core.protocols fib.core.opt fib.core.combinators))
+
+;; (partial2 f a) is (fn (b c) (f a b c)) with f and a evaluated once
+(defmacro partial2 (f a)
+  (let ((gf (gensym "f")) (ga (gensym "a")) (b (gensym "b")) (c (gensym "c")))
+    `(let ((,gf ,f) (,ga ,a))
+       (fn (,b ,c) (,gf ,ga ,b ,c)))))
+
+;; (as-> x v (f a v) ..): v is bound to x, then to each form in turn; the value of the last form is the answer
+(defmacro as-> (x v ... forms)
+  (loop ((i 0) (acc x))
+    (if (< i (vec-count forms))
+        (recur (+ i 1) `(let ((,v ,acc)) ,(vec-nth forms i)))
+        acc)))
+
+;; (defonce name: T v) is (def name: T v)
+(defmacro defonce (name ... rest)
+  `(def ,name ,@rest))
