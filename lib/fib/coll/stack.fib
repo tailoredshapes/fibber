@@ -6,26 +6,16 @@
 ;;  - the end that `conj` adds at is the end that `peek` reads and `pop` removes (Clojure's): the last element of a `Vec`, the first
 ;;    of a `List`. `peek` of an empty stack is nil, never a trap; `pop` of an empty stack traps `pop: empty`, where Clojure's `pop`
 ;;    throws (§1.2 P5), and the trap names the function (tranche 1 plan §4.3 rule 8). There is no `try-pop` here.
-;;  - `pop` of a `Vec` is the rebuild of the first n-1 elements by the prelude's bulk builder `vec-collect`: correct, O(n), one
-;;    pass, two heap objects for every 32 elements. The in-place pop (the tail first, then the last leaf of the trie) needs the trie's
-;;    private nodes and is the prelude's, task P1's `vec-pop`. WHEN `vec-pop` LANDS, THE ONE LINE TO CHANGE is the body of `pop` in the
-;;    `Vec` instance below, `(vec-pop-rebuilt self)` becomes `(vec-pop self)`, and the helper is deleted with it. Until then a loop
-;;    that pops a stack of 10,000 items does 10,000 rebuilds of about 5,000 elements on average: the plan accepts that only until P1.
+;;  - `pop` of a `Vec` is the prelude's `vec-pop` (task P1): the tail without its last element, and when the tail holds one the
+;;    last leaf of the trie becomes the tail, a new tail array and a new header for a pop and one new path of the trie for 1 pop in 32.
 ;;  - `pop` of a `List` is its tail, shared, not copied; the tail of a list of one is the empty list.
 ;; Never `/` on integers; the prelude's `count` and `nth` are not used here (a part calls the prelude's vec-count and vec-nth).
 (ns fib.coll.stack (:use fib.core fib.seq fib.coll.protocols fib.coll.seqs))
 
-;; the first n-1 elements of v, which has n > 0 elements, in one pass of the bulk builder
-(defun vec-pop-rebuilt :private (v: (Vec a)) -> (Vec a)
-  (let ((m (- (vec-count v) 1)))
-    (if (< m 0)
-        (trap "pop: empty")
-        (vec-collect (fn (k) (loop ((i 0)) (if (< i m) (if (k (vec-nth v i)) (recur (+ i 1)) false) true)))))))
-
 ;; a Vec: the end
 (impl (Stack a) (Vec a)
   (peek (self) (let ((n (vec-count self))) (if (> n 0) (some (vec-nth self (- n 1))) nil)))
-  (pop (self) (vec-pop-rebuilt self)))
+  (pop (self) (vec-pop self)))
 
 ;; a List: the front
 (impl (Stack a) (List a)

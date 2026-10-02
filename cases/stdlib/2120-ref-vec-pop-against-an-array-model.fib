@@ -1,0 +1,71 @@
+;; spec:   stdlib §1.2 P3, §2.5, §4.4 row pop, task P1 item 2 (the prelude's vec-pop)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: pop
+;; vec-pop against an (Array i64) model. For every count from 0 to 70 and for 95..97, 127..129, 1023..1026, 1055..1058,
+;; 1087..1090 and 2000 (past the 31/32/33 of a leaf, the 1024/1025/1056 where a root of leaves fills and a root two levels
+;; deep begins), a Vec built by the prelude's vec-conj is popped down to nothing. After every pop the count is one less
+;; and, for the counts up to 70 and at the steps where the remaining count is 0, 1 or 31 modulo 32 (the leaf boundaries,
+;; where the last leaf of the trie becomes the tail and the root loses a level), every element is the model's; and a
+;; conj onto the popped vector puts the new element last and leaves the one before it as it was, so the shift, the tail
+;; and the leaves a pop leaves are the ones conj expects. The last checks plant a fault in the reference, one at a
+;; time (1: it expects a wrong element at index 32, which only a vector with a trie shows; 2: it expects the count to
+;; be one more), and require each to be noticed. Seed-free: the counts and the steps are fixed.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun fill (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (+ (* i 3) 1))) acc)))
+
+;; what the reference expects at index i: the model's element, the fault planted in it
+(defun want (i: i64 fault: i64) -> i64
+  (if (and (= fault 1) (= i 32)) -1 (+ (* i 3) 1)))
+
+;; v has k elements, each the reference's (a loop that stops at the first wrong one)
+(defun prefix-ok (v: (Vec i64) k: i64 fault: i64) -> bool
+  (loop ((i 0))
+    (if (< i k) (if (= (fib.prelude/vec-nth v i) (want i fault)) (recur (+ i 1)) false) true)))
+
+;; a conj of 4242 onto v, which has k elements: it is last and the element before it is the reference's
+(defun conj-ok (v: (Vec i64) k: i64 fault: i64) -> bool
+  (let ((w (fib.prelude/vec-conj v 4242)))
+    (and (= (fib.prelude/vec-count w) (+ k 1))
+         (= (fib.prelude/vec-nth w k) 4242)
+         (or (< k 1) (= (fib.prelude/vec-nth w (- k 1)) (want (- k 1) fault))))))
+
+(defun full-step? (n: i64 k: i64) -> bool
+  (or (<= n 70) (= (rem k 32) 0) (= (rem k 32) 1) (= (rem k 32) 31)))
+
+;; pop v (n elements to begin with, k left) down to nothing, one check a pop
+(defun pop-down (c: Checks v: (Vec i64) n: i64 k: i64 fault: i64) -> unit
+  (if (> k 0)
+      (let ((p (fib.prelude/vec-pop v)))
+        (do (check c (and (= (fib.prelude/vec-count p) (+ (- k 1) (if (= fault 2) 1 0)))
+                          (if (full-step? n (- k 1)) (prefix-ok p (- k 1) fault) true)
+                          (conj-ok p (- k 1) fault)))
+            (pop-down c p n (- k 1) fault)))
+      ()))
+
+(defun one-count (c: Checks n: i64 fault: i64) -> unit
+  (pop-down c (fill n) n n fault))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (do (dotimes (n 71) (one-count c n fault))
+      (dotimes (j 3) (one-count c (+ 95 j) fault))
+      (dotimes (j 3) (one-count c (+ 127 j) fault))
+      (dotimes (j 4) (one-count c (+ 1023 j) fault))
+      (dotimes (j 4) (one-count c (+ 1055 j) fault))
+      (dotimes (j 4) (one-count c (+ 1087 j) fault))
+      (one-count c 2000 fault)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)))
+    (do (run-all c 0)
+        (run-all p1 1)
+        (run-all p2 2)
+        (check c (= (checks-made c) 17835))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

@@ -167,6 +167,53 @@
                        (nil (trap "assoc: index out of range"))
                        ((some r) (VecOf cnt shift (some (vnode-assoc r shift i x)) tail)))))))))))
 
+;; The leaf of the trie that holds index i, as its array of 32.
+(defun vnode-leaf :private (node: (VNode a) level: i64 i: i64) -> (Array a)
+  (match node
+    ((VLeaf items) items)
+    ((VBranch kids) (vnode-leaf (array-get kids (bit-and (shr i level) 31)) (- level 5) i))))
+
+;; node, a branch at level (5 or more), without its last leaf; nil when that leaves nothing. One new array and one
+;; new node for each level of the path to the last leaf, the other kids shared.
+(defun vnode-pop :private (node: (VNode a) level: i64) -> (Option (VNode a))
+  (match node
+    ((VLeaf _) nil)
+    ((VBranch kids)
+     (let ((n (array-len kids)))
+       (if (= level 5)
+           (if (= n 1) nil (some (VBranch (array-copy kids 0 (- n 1)))))
+           (match (vnode-pop (array-get kids (- n 1)) (- level 5))
+             (nil (if (= n 1) nil (some (VBranch (array-copy kids 0 (- n 1))))))
+             ((some sub) (some (VBranch (array-with kids (- n 1) sub))))))))))
+
+;; the root of a trie that has lost its last leaf; a root with a single kid above level 5 is that kid, one level down
+(defun vec-pop-root :private (cnt: i64 shift: i64 root: (VNode a) tail: (Array a)) -> (Vec a)
+  (match (vnode-pop root shift)
+    (nil (VecOf cnt 5 nil tail))
+    ((some r)
+     (match r
+       ((VBranch kids)
+        (if (and (> shift 5) (= (array-len kids) 1))
+            (VecOf cnt (- shift 5) (some (array-get kids 0)) tail)
+            (VecOf cnt shift (some r) tail)))
+       ((VLeaf _) (trap "vec: a leaf where a branch belongs"))))))
+
+;; (vec-pop v) is v without its last element (stdlib §1.2 P3, §4.4 row pop): the tail without its last element,
+;; and when the tail holds one element, the last leaf of the trie becomes the tail; v is unchanged. An empty
+;; vector traps `pop: empty`. Popping the only element answers VecEmpty, so a vector of no elements has one form.
+(defun vec-pop (v: (Vec a)) -> (Vec a)
+  (match v
+    ((VecEmpty) (trap "pop: empty"))
+    ((VecOf cnt shift root tail)
+     (let ((t (array-len tail)))
+       (if (= cnt 1)
+           VecEmpty
+           (if (> t 1)
+               (VecOf (- cnt 1) shift root (array-copy tail 0 (- t 1)))
+               (match root
+                 (nil (trap "vec: a vector with no leaves and no tail"))
+                 ((some r) (vec-pop-root (- cnt 1) shift r (vnode-leaf r shift (- cnt 2)))))))))))
+
 ;; The bulk builder (stdlib design §2.5; tranche 1 plan L9). A Vec built by conj spends 2.09 heap
 ;; objects an element (the tail is copied, and one path of the trie every 32); built here, 2 objects
 ;; for every 32 elements (a leaf's array and its node, and the same one level up for every 32 nodes)

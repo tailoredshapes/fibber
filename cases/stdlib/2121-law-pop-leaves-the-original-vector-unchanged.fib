@@ -1,0 +1,45 @@
+;; spec:   stdlib §2.5, §1.2 (a persistent vector), §4.4 row pop, task P1 item 2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: pop
+;; Persistence of vec-pop: from a Vec of n elements (33, where the first pop empties the trie; 1025, where it takes a leaf from
+;; a full root of 32 leaves; 1056, where it pops within the tail; and 1057, where the first pop makes the root lose a level),
+;; p = pop v, q = pop p, and r = pop of v again: v still has its n elements, p its first n-1, q its first n-2, and r is p again;
+;; and a conj onto p shows in neither v nor q. The last checks run the same comparisons against a reference that is wrong in one
+;; way (it expects v to have lost its last element) and require the noticing.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun fill (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (* i 10))) acc)))
+
+;; v has k elements, each ten times its index
+(defun holds (v: (Vec i64) k: i64) -> bool
+  (and (= (fib.prelude/vec-count v) k)
+       (loop ((i 0)) (if (< i k) (if (= (fib.prelude/vec-nth v i) (* i 10)) (recur (+ i 1)) false) true))))
+
+(defun try (c: Checks n: i64 fault: i64) -> unit
+  (let ((v (fill n)))
+    (let ((p (fib.prelude/vec-pop v)))
+      (let ((q (fib.prelude/vec-pop p))
+            (r (fib.prelude/vec-pop v))
+            (w (fib.prelude/vec-conj p -1)))
+        (do (check c (holds v (if (= fault 1) (- n 1) n)))
+            (check c (holds p (- n 1)))
+            (check c (holds q (- n 2)))
+            (check c (holds r (- n 1)))
+            (check c (and (= (fib.prelude/vec-count w) n) (= (fib.prelude/vec-nth w (- n 1)) -1)))
+            (check c (holds p (- n 1))))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (do (try c 33 fault) (try c 1025 fault) (try c 1056 fault) (try c 1057 fault)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)))
+    (do (run-all c 0)
+        (run-all p1 1)
+        (check c (= (checks-made c) 24))
+        (check-detects c p1)
+        (checks-result c))))
