@@ -351,6 +351,20 @@
 (impl Show (List a) :where ((Show a))
   (show (self) (str-concat "(" (str-concat (list-text self) ")"))))
 
+;; Hash of a List is the hash of the Vec of the same elements, as Clojure's (= (hash [1 2]) (hash '(1 2))): the fold
+;; of hash-combine over the elements' hashes in order from the seed 1, then combined with the count, which is what
+;; fib.seq.hash's hash-ordered-coll gives any source. It is here and not derived because the prelude must hash a List
+;; with no library module loaded (ownership case 199) and a derived instance folds the variant index and the fields,
+;; which is a different number (and 0 for the empty list). Case 2140 pins the equality with the Vec's.
+(defun list-hash :private (l: (List a)) :where ((Hash a)) -> i64
+  (loop ((rest l) (h 1) (n 0))
+    (match rest
+      ((Empty) (hash-combine h n))
+      ((Cons x t) (recur t (hash-combine h (hash x)) (+ n 1))))))
+
+(impl Hash (List a) :where ((Hash a))
+  (hash (self) (list-hash self)))
+
 ;; Map: a hash array mapped trie (types §2.13, syntax §4.5) over the
 ;; keys' hash: 32-way bitmap nodes five bits of the hash at a time, a
 ;; leaf per key, a bucket for keys whose hashes collide. Keys need Hash

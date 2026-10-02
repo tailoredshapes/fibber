@@ -354,9 +354,9 @@ fn the_protocol_error_names_all_six() {
 fn prelude_expands() {
     let mut ctx = ExpandCtx::new();
     let out = expand_prelude(&mut ctx).unwrap_or_else(|e| panic!("{e}"));
-    // the defenum and six impls: Eq, Ord, Hash of Option and of List;
-    // Show of both is written by hand in lib/prelude.fib.
-    assert_eq!(out.len(), 7);
+    // the defenum and five impls: Eq, Ord, Hash of Option and Eq, Ord of List;
+    // Show of both and Hash of List are written by hand in lib/prelude.fib.
+    assert_eq!(out.len(), 6);
     assert_eq!(
         out[0].to_string(),
         "(defenum (List a) (Empty) (Cons head: a tail: (List a)))"
@@ -380,6 +380,8 @@ fn prelude_expands() {
     );
     let all: String = out.iter().map(|f| f.to_string()).collect();
     assert!(!all.contains("(cons ") && !all.contains("(empty)"), "{all}");
+    // no derived Hash of List: the prelude's own equals the hash of an equal Vec (P1 item 4)
+    assert!(!all.contains("(impl Hash (List a)"), "{all}");
 }
 
 #[test]

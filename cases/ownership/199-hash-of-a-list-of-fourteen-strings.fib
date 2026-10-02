@@ -2,26 +2,31 @@
 ;; expect: accept
 ;; result: 255
 ;; audit:  clean
-;; `hash` of a List of strings, which is the prelude's derived `Hash (List a)`.
+;; `hash` of a List of strings, which is the prelude's `Hash (List a)`.
 ;; It folded each cell with `h*31 + hash x`, and a list of three strings was
 ;; `trap: integer overflow in * at i64` under both tools (stdlib design §7
 ;; E10, A10 hash): the hash of a string is 64 bits (FNV-1a, types §2.12), so
-;; the product overflows at the second string. It folds with `hash-combine`
-;; now (case 198). The expected values come from an independent Python
-;; transcription of the definitions, not from this implementation: the
-;; derived instance gives `empty` the hash 0 (its variant index, no fields)
-;; and `(cons h t)` the fold of `hash h` then `hash t` from the seed 1 (its
-;; index), with FNV-1a for the strings. The result has bit k set when probe
-;; k holds, so all eight give 2^8 - 1 = 255.
+;; the product overflows at the second string. It folded with `hash-combine`
+;; after that (case 198), as a derived instance does, the variant index and
+;; the fields; P1 item 4 made it the hash of the Vec of the same elements,
+;; which Clojure's (= (hash [1 2]) (hash '(1 2))) is, so the numbers below are
+;; those of the new definition: `hash-combine` folded over the hashes of the
+;; elements in order from the seed 1, then combined with the count (case 2140
+;; pins the equality with a Vec). The expected values come from an independent
+;; Python transcription of the definitions, not from this implementation
+;; (hash-combine as in case 198, FNV-1a for the strings; the transcription
+;; gives case 198's values for hash-combine 0 0 and 1 2). The result has bit k
+;; set when probe k holds, so all eight give 2^8 - 1 = 255.
 ;;   0 a list of fourteen strings has the hash Python gives, and 1 the list
 ;;   of its first three; 2 a list of the three strings "a" "b" "c" is
-;;   6665263451557199024 (the program that trapped); 3 an equal list built
+;;   8895193082117208126 (the program that trapped); 3 an equal list built
 ;;   separately has an equal hash (`=` implies equal `hash`); 4 the same
 ;;   fourteen with two neighbours swapped, with the last dropped and with
 ;;   one appended all differ from it and from each other; 5 where a string
 ;;   ends is not forgotten: ("ab" "c") and ("a" "bc") differ; 6 the empty
-;;   list, which `rest` of a one-element list is, has the hash 0 and a
-;;   one-element list does not; 7 an Option holding the list hashes without
+;;   list, which `rest` of a one-element list is, has the hash
+;;   6497672654643564748 (the fold of nothing from the seed, then the count 0)
+;;   and a one-element list does not; 7 an Option holding the list hashes without
 ;;   a trap and differently from the Option holding a shorter one.
 (defun bit (k: i64 ok: bool) -> i64 (if ok (shl 1 k) 0))
 
@@ -41,12 +46,13 @@
         (longer (hash (list "alpha" "bravo" "charlie" "delta" "echo" "foxtrot" "golf"
                             "hotel" "india" "juliet" "kilo" "lima" "mike" "november" "oscar")))
         (empty-list (rest (list "x"))))
-    (+ (bit 0 (= base -8355922636763242903))
-    (+ (bit 1 (= (hash (list "alpha" "bravo" "charlie")) 5124957455152575342))
-    (+ (bit 2 (= (hash (list "a" "b" "c")) 6665263451557199024))
+    (+ (bit 0 (= base -28164466409358448))
+    (+ (bit 1 (= (hash (list "alpha" "bravo" "charlie")) 757941616644550978))
+    (+ (bit 2 (= (hash (list "a" "b" "c")) 8895193082117208126))
     (+ (bit 3 (= base (hash (words14))))
     (+ (bit 4 (and (distinct3 base swapped shorter)
                    (and (distinct3 base shorter longer) (!= swapped longer))))
     (+ (bit 5 (!= (hash (list "ab" "c")) (hash (list "a" "bc"))))
-    (+ (bit 6 (and (= (hash empty-list) 0) (!= (hash (list "x")) 0)))
+    (+ (bit 6 (and (= (hash empty-list) 6497672654643564748)
+                (!= (hash (list "x")) 6497672654643564748)))
        (bit 7 (!= (hash (some (words14))) (hash (some (list "alpha" "bravo"))))))))))))))

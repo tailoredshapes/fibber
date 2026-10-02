@@ -1,0 +1,42 @@
+;; spec:   stdlib §2.7 (hash of the collections), types §2.12 (hash), task P1 item 4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: hash
+;; Clojure's (= (hash [1 2]) (hash '(1 2))) is true, and so is it here: the Hash of a List is the Hash of the Vec of the
+;; same elements (the prelude's list-hash against fib.seq.hash's hash-ordered-coll). Checked for the lists of 0, 1, 2, 5 and 40
+;; integers and for a list of strings, built apart from the Vec they are compared with. The number is pinned for the list of
+;; two integers by an independent Python transcription of hash-combine from the seed 1 (case 198 pins hash-combine, case 199
+;; the lists of strings). Three checks show the equality is not a constant function: lists of different lengths and the
+;; same elements in another order differ. The last check plants a fault in the reference (it expects the hash of the Vec with
+;; one more element) and requires it to be noticed.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun vec-of (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (* i 7))) acc)))
+
+(defun list-of (n: i64) -> (List i64)
+  (loop ((i n) (acc Empty))
+    (if (> i 0) (recur (- i 1) (Cons (* (- i 1) 7) acc)) acc)))
+
+(defun agree (c: Checks n: i64 fault: i64) -> unit
+  (check c (= (hash (list-of n)) (hash (vec-of (+ n fault))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (do (agree c 0 fault) (agree c 1 fault) (agree c 2 fault) (agree c 5 fault) (agree c 40 fault)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)))
+    (do (run-all c 0)
+        (run-all p1 1)
+        (check c (= (hash (list "alpha" "bravo" "charlie")) (hash ["alpha" "bravo" "charlie"])))
+        (check c (= (hash (list 0 1)) (hash [0 1])))
+        (check c (= (hash (list 0 1)) -2456415094048603605))
+        (check c (!= (hash (list 0 1)) (hash (list 1 0))))
+        (check c (!= (hash (list 0 1)) (hash (list 0 1 2))))
+        (check c (!= (hash (list-of 0)) (hash (list-of 1))))
+        (check c (= (checks-made c) 11))
+        (check-detects c p1)
+        (checks-result c))))

@@ -639,10 +639,14 @@ key `0.0` must find it by `-0.0`) and the two tools agree on the hash of
 a NaN whose bits the hardware or the constant folder chose; a NaN is not
 `=` to itself, so a NaN key is never found. Implemented in both tools;
 case 201 pins it and case 169 the rest. `derive Hash` and the prelude's
-`Hash (List a)` and `Hash (Option a)` fold their fields' hashes with the
+`Hash (Option a)` fold their fields' hashes with the
 prelude's `hash-combine` (a rotate-and-xor mixer that never traps) from
 a seed, the variant index (0 for a struct); the `h*31 + x` they used
-trapped on integer overflow at two strings (cases 198 to 200).
+trapped on integer overflow at two strings (cases 198 to 200). `Hash (List a)`
+is not derived: it is the hash of the `Vec` of the same elements, `hash-combine`
+folded over the elements' hashes from the seed 1 and then combined with the
+count, as Clojure's `(= (hash [1 2]) (hash '(1 2)))` (P1 item 4; cases 199
+and 2140).
 
 `quot` and `fdiv` (**Decided**, owner, 2026-10-01, stdlib §7 L30, Q40: the
 names and the split; the float details below are **Proposed**, the first

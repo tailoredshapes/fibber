@@ -114,19 +114,21 @@ pub fn expand_expr(
 /// The prelude forms the expander itself needs (§4.4, §4.5): the `List`
 /// enum, whose variants are `Empty` and `Cons` (stdlib design C-3: the
 /// library defines a function `cons` and a method `empty`, which a variant
-/// of the same name would collide with), and `derive` of `Eq`, `Ord` and
-/// `Hash` for `Option` and `List`. `Show` of the two is written by hand in
+/// of the same name would collide with), `derive` of `Eq`, `Ord` and `Hash`
+/// for `Option` and of `Eq` and `Ord` for `List`. `Hash` of a `List` is written
+/// in `lib/prelude.fib`: it must equal the hash of an equal `Vec`, which a
+/// derived instance (the variant index and the fields) cannot give. `Show` of the two is written by hand in
 /// `lib/prelude.fib` (stdlib design §2.7: a present `Option` prints as its
 /// payload, a `List` as `(1 2)`, which a derived instance cannot say). The
 /// rest of the prelude is library code, not here.
 pub const PRELUDE_SOURCE: &str = "\
 (defenum (List a) (Empty) (Cons head: a tail: (List a)))
 (derive Eq Option) (derive Ord Option) (derive Hash Option)
-(derive Eq List) (derive Ord List) (derive Hash List)
+(derive Eq List) (derive Ord List)
 ";
 
 /// Reads and expands [`PRELUDE_SOURCE`] into `ctx`, registering `List`,
-/// and returns the expanded forms (the `defenum` and six `impl`s).
+/// and returns the expanded forms (the `defenum` and five `impl`s).
 pub fn expand_prelude(ctx: &mut ExpandCtx) -> Result<Vec<Form>, ExpandError> {
     // PRELUDE_SOURCE is a constant that the unit test
     // `prelude_expands` reads, so this cannot fail.
