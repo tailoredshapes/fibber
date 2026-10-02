@@ -33,6 +33,7 @@ mod context;
 use std::fmt::Write;
 use std::thread;
 
+pub(crate) use args::module_list;
 pub use args::{flags, parse_args};
 
 use crate::dump::{dump_forms_in, kind_name, span_in};
@@ -258,16 +259,16 @@ fn dump_prelude(source: &str, file: &str, opts: &Options) -> Dump {
 /// `error KIND L:C S..E: MESSAGE`: the record of the reader dump. A
 /// position in another file than `home` ends `@FILE`; an error with no
 /// position (a module that cannot be found) is at `0:0 0..0`.
-fn record(kind: &str, pos: Option<&Pos>, home: &str, message: &str) -> String {
+pub(crate) fn record(kind: &str, pos: Option<&Pos>, home: &str, message: &str) -> String {
     let at = pos.map_or_else(|| "0:0 0..0".to_string(), |p| span_in(p, home));
     format!("error {kind} {at}: {message}\n")
 }
 
-fn read_record(e: &ReadError, home: &str) -> String {
+pub(crate) fn read_record(e: &ReadError, home: &str) -> String {
     record(kind_name(&e.kind), Some(&e.pos), home, &e.kind.to_string())
 }
 
-fn expand_record(e: &ExpandError, home: &str) -> String {
+pub(crate) fn expand_record(e: &ExpandError, home: &str) -> String {
     let kind = expand_kind_name(&e.kind);
     record(kind, Some(&e.pos), home, &e.kind.to_string())
 }
@@ -275,7 +276,7 @@ fn expand_record(e: &ExpandError, home: &str) -> String {
 /// The record of a program that could not be loaded. A module that is not
 /// at its file prints no operating system text: it is not the same
 /// words in every language a tool is written in.
-fn load_record(e: &LoadError, home: &str) -> String {
+pub(crate) fn load_record(e: &LoadError, home: &str) -> String {
     match e {
         LoadError::Read(r) => read_record(r, home),
         LoadError::Spec { pos, what } => record("BadNs", Some(pos), home, what),

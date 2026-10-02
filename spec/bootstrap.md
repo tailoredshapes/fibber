@@ -578,3 +578,309 @@ passed or reported through the real build, run and comparison.
   evaluator's; if the JIT's differ the porter reports it and does not
   change either.
 | `JitRunner` (and `lair.fibm`'s `to-stx`) gives every node of a macro's result the position of the call, so a form the macro took from its arguments loses its own position; the interpreter's evaluator keeps it, as syntax §1.3 says ("a form taken from the input keeps its own"): `(+ (m/thrice 5) ..)` has `int 5 i64 12:13 437..438` interpreted and `int 5 i64 12:6 430..439` compiled | the position-sensitive comparison of the two runners over `cases/modules` (cases 005, 006 and 012 of the module cases differ; `jit_expansions_equal_the_interpreters` compares `Form`s, which ignore positions, so nothing saw it) | **open, reported, not fixed**: `crates/fibc/tests/macros.rs` `jit_and_interpreter_expand_the_module_cases_alike_at_every_position` fails and is `#[ignore]`d with this reason. The oracle of stage 2b (§5.4) is the interpreter's evaluator, which follows §1.3; a 2b port that follows `JitRunner` will differ from it in these positions until the JIT's runner records the objects it made of the arguments and gives a result node that is one of them its position (the interpreter's `recording_inputs`), or the port does |
+
+## 6. The type checker (M6 step 3)
+
+The checker of `crates/fibref/src/types/` (resolution, lowering to the
+resolved AST, inference) is ported to `compiler/types/`, judged as the
+reader and the expander were: by a dump that the oracle and the port print
+and that must be the same text, byte for byte (method rule 3). The port is
+done when `bootstrap_types` (not yet written) says so over the programs of
+`cases/`, and not before. This section is the format of the dump; the plan
+of the port is outside the spec.
+
+### 6.1 The types dump
+
+`fibref types [OPTION..] [--] FILE..` and `compiler/types.fib` with the
+same words print the same text. The words, the statuses and the header are
+those of §5.1: for each FILE the line `== FILE`, then one of
+
+- the line `unreadable`;
+- the **expander's error record** unchanged (§5.1: a read error, a load
+  error (`BadNs`, `ModuleMissing`, `ModuleCycle`, `ModuleMismatch`), or an
+  expansion error under the `-- module NS FILE` line of the module that did
+  not expand), when the file does not read, load or expand: every module is
+  expanded before the first is checked, so no section of the file precedes
+  it;
+- the **sections** of every module, in dependency order and the main module
+  last (below), when the checker accepts the program;
+- the `error` records (§6.4) of the step that failed, and nothing else, when
+  it does not.
+
+The exit status is 0 if every file was accepted, 1 if one ended in an error
+record (a record of the expander or an `error` record of the checker, also
+when `--sections` leaves it out of the text), 2 if one was unreadable, the
+larger winning. The arguments are read by `fibref::types_dump::parse_args`
+(the one function the binary and the tests share): the words that start
+with `--` before the first file are options, a lone `--` ends them, and no
+file, a word that is not an option, a stage or section that is not one, or
+an empty or repeated-comma list refuses with a usage line on standard
+error, nothing on standard output, and status 2.
+
+**What the tool runs**, which the port runs in the same order: the
+expander's prelude and `lib/prelude.fib` expanded with no runner
+(`types::prelude_forms`); the program loaded (`modules::try_load_with` with
+the default roots and the implicit modules of `--implicit-lib`) and each
+module expanded in one context with the interpreter's macro evaluator, as
+`fibref run` does (there is no `--no-runner`); then `types::lower_modules`
+(steps 1 to 3 of types §3.5: the builtin module, every name declared, field
+types, protocol signatures, instance heads, then the bodies lowered to the
+AST) and, unless `--stage lower`, `types::infer_lowered` (steps 4 to 7) with
+`main` required unless `--library`. The ownership pass is not run. The
+checker runs on a thread of `CHECK_STACK`; a panic is the line `internal
+error: the types dump panicked` and status 2.
+
+### 6.2 Options
+
+| Option | What it does |
+|---|---|
+| `--stage lower\|infer` | `lower` stops after `lower_modules`: the `fun` and `def` lines print the signatures as they were written (below) and there are no `unit` lines or tables; a type error is not found. `infer` (the default) runs the whole checker |
+| `--sections LIST` | print only the sections of LIST: section names separated by commas, from `type`, `protocol`, `instance`, `fun`, `def`, `extern`, `unit`, `error`, `ast`, `tables`; the order of the dump is not the order of LIST. Without it every section but `ast` and `tables` prints |
+| `--ast` | also print the `ast` section (after lowering, at either stage) |
+| `--tables` | also print the `tables` section and, once per run, the `builtins` table; `--ast` and `--tables` add to `--sections`, so `--sections ast` alone prints the `ast` section too |
+| `--library` | `main` is not required (`infer_lowered(l, false)`, what `check_library` does): the 56 files of `lib/` are modules with no `main` |
+| `--implicit` | print the sections of the implicit modules and of the modules read for them (they come first, as in §5.1) and the section of the prelude (`-- module fib.prelude lib/prelude.fib`, first of all) |
+| `--implicit-lib LIST` | the implicit modules of this dump are those of LIST (§5.1: `--implicit-lib ""` is no library, which most tests run with, the default checks the whole library, about forty modules, before the program) |
+| `--prelude` | each FILE is a library prelude, as in §5.1 for the expander: the expander's own prelude and FILE expanded in the module `fib.prelude`, which is then checked alone, with no `main` (`--library` is implied) and no other module; one section `-- module fib.prelude FILE`. With `lib/prelude.fib` its lines are those the `fib.prelude` section of `--implicit` has, under another file name |
+
+### 6.3 The sections of a module
+
+Every module with a section starts with `-- module NS FILE` (as in §5.1).
+The sections follow in this order, each over a table of the global tables
+**in index order** (declaration order: ids are allocated as the forms are
+lowered), keeping what the module defines. A line ends with the position of
+its definition, `LINE:COL START..END`, printed as the reader dump prints it
+and with `@FILE` after it when its file is not the module's (a definition
+that came from the expander's prelude ends `@<prelude>`). Types are printed
+by `display.rs`'s `Printer`, schemes by `show_scheme` (`∀a b. (P a) ⇒ (fn
+(a) b)`, with `(& T)` for an `&` parameter, `ς0` a quantified colour and
+`κ`/`⊑`/`⊒ Caps{..}` colour bounds); the port reproduces their text.
+
+```
+type NAME (PARAMS) struct|enum POS            PARAMS: names, a colour parameter as `k:colour`
+  field F : TYPE                              one line per field of a struct, TYPE over the parameters
+  variant V (TYPE..)                          one line per variant of an enum
+protocol NAME (PARAMS) supers [PRED..] POS    the word `supers` is always there
+  method M : SCHEME params P[:borrow][:owned]..
+instance N (P TYPE..) vars K [where PRED..] POS
+  method M : SCHEME                           the protocol's own scheme of the method
+fun NAME : SCHEME params [&]NAME[:borrow].. POS
+macro NAME : SCHEME params [&]NAME[:borrow].. POS     a `defmacro`, in the place of the `fun` lines of the defuns
+def NAME : TYPE POS
+extern NAME : TYPE [varargs] POS
+unit scc NAME.. | unit def NAME | unit impl INDEX METHOD | unit macro NAME
+error KIND LINE:COL START..END[@FILE]: MESSAGE
+```
+
+- `type`: every struct and enum of the module, `Option` and `Form` of the
+  builtin module excluded (the builtin module has no section).
+- `protocol`: every protocol; `supers` and its predicates are over the
+  protocol's parameters (the dispatch parameter is `Self`). A method's
+  `params` are its parameter names with the `:borrow` and `:owned` the
+  protocol declared (`MethodDef` is what the ownership pass reads).
+- `instance`: `N` is the index in `Globals::instances`, which counts the
+  built-in instances too (the first instance of a program is not 0:
+  `res` lines refer to it), `P TYPE..` is the dispatch type then the
+  determined types, `K` the number of instance variables, `where` the
+  declared context (absent when empty). The method lines are those of the
+  bodies the instance has, in order, with the protocol's scheme.
+- `fun`: `SCHEME` is the inferred scheme after `--stage infer`. At `--stage
+  lower` it is the signature as written, with no quantifier: `(fn (A..) R)`
+  where each `A` is the annotation of the parameter and `R` of the result,
+  or `_` when there is none, `(& A)` for an `&` parameter, then ` where
+  B..` for the bounds of `:where` (`(P A..)`, `(Send A)`); annotations are
+  printed as written (`Self`, a type variable by its name, `(Array T)`,
+  `(Name A..)`, `(fn [COLOUR] (A..) R)`, `(dyn P A.. [:send])`). Parameters
+  are listed by name with `&` for an `&` parameter and `:borrow` for a
+  declared `:borrow`.
+- `def`: the closed type after inference, the annotation or `_` at `lower`.
+- `extern`: the type of the declaration; the module that binds the name owns
+  it (the tables record no module for an extern).
+- `unit`: the units of the module in the order they were checked (types
+  §3.5, steps 5 and 6: the SCCs of `defun`s and `def`s in dependency order
+  with ties in source order, then the `impl` method bodies, then the
+  macros), only after inference. `unit impl INDEX METHOD` is the instance
+  index and the method's name.
+- `error`: see §6.4; it is not in the section of a module.
+- `ast`: for each body, a line `ast fun NAME`, `ast def NAME`, `ast impl
+  INDEX METHOD` or `ast macro NAME`, in this order (the `defun`s, the `def`s,
+  the instances' methods, the macros, each in index order), and the tree
+  of the body two spaces in, one node per line, depth first, two spaces a
+  level, as the AST of `types/ast.rs` has it. A node is `E<id> KIND
+  DETAIL POS` for an expression (`ExprId`, allocated in the order the bodies
+  are lowered, a node's after its operands', while the tree prints parents
+  first: the port must lower in the same order, which is what makes
+  lowering testable alone), with `KIND DETAIL` one of `lit int V W`
+  (`flt`, `str`, `chr U+XXXX`, `bool`, `kw` as the reader dump prints
+  them, `unit`), `local B<id> NAME`, `global fun|def|extern NAME` |
+  `ctor TYPE VARIANT|-` | `method PROTO NAME` | `builtin NAME`, `call N`
+  (children: the head, then the arguments), `fn N captures[B<id>,..]`,
+  `let N`, `if`, `do N`, `match N`, `loop N`, `recur N`, `field F "TEXT"`,
+  `deref "TEXT"`, `set`, `set-field B<id> NAME F`, `async captures[..]`,
+  `await`, `unsafe`, `quote` (its child is the quoted form as the
+  reader dump prints it), `dyn PROTO [:send] ANN..`, `convert OP SCALAR`,
+  `concat N`. The other nodes: a binding introduced outside a pattern,
+  `B<id> KIND NAME [: ANN] POS` (KIND `param`, `ampparam`, `let`,
+  `pattern`, `loop`, `fnself`: a parameter of a body or an `fn`, the name of
+  a named `fn`, a `loop` variable); a pattern, `P wild POS`, `P bind B<id>
+  NAME [: ANN] POS`, `P lit LIT POS`, `P ctor TYPE VARIANT|- N POS`, `P as
+  B<id> NAME POS`, `P vec N exact|ignore|B<id> POS` with its sub-patterns
+  below; `clause` or `clause guard` (children: the pattern, the guard, the
+  body); `amp B<id> NAME [POS]` (an `&x` argument, or the place of a `deref`
+  or `set!`, which has no position); `ret ANN`. A `let` has for each binding
+  the pattern and then the initialiser, then the body; a `loop` the
+  variable and its initialiser, then the body.
+- `tables` (only after inference): after each `unit` line of the module,
+  two spaces in, for each expression and binding of its bodies in the order
+  the `ast` walk meets them: `expr E<id> POS TYPE` (the type of the
+  expression), `binding B<id> NAME KIND TYPE`, `inst E<id> TYPE.. |
+  COLOUR..` (the types and colours a global with a scheme was instantiated
+  at: the `|` is always there), `res E<id> instance I TYPE..` or `res E<id>
+  bound PRED` or `res E<id> dyn` (how a method's dispatch was discharged),
+  `fn E<id> COLOUR` (the colour of an `fn`: `send`, `local`, `ς3`, `κ0`).
+  A type is printed with the quantified variable names of the scheme of the
+  function the body belongs to (those of the instance, then `t0`, `t1`..,
+  inside an `impl` method, none inside a `def`). The `unit` lines print
+  when `unit` or `tables` is asked for. Once per run, before the first
+  file, `--tables` prints `-- builtins` and a line `builtin INDEX NAME SIG
+  [where BOUNDS] escapes ESCAPE.. [unsafe]` for each of the builtin table
+  (`types/builtins.rs`, the escape kinds in lower case).
+
+### 6.4 Errors, ordering and what is never printed
+
+- The checker returns the errors of the first step that fails: lowering
+  stops at the first declaration or body that does not lower (every later
+  module is never lowered), inference reports the first error of each unit
+  that fails, in the order of the units, and skips the units that depend
+  on one that failed. The `error` records print in that order. A failed
+  step returns no tables, so **a rejected file prints no section**, and a
+  file that failed in lowering has nothing from inference. The position's
+  `@FILE` is relative to the **main** file, the file given.
+- `KIND` is the name of a variant of `types::ErrorKind` (the 29 of
+  `error.rs`, `types_dump::kind_name`; a new variant is a compile error there
+  until it is named): `Resolve`, `Unify`, `Infinite`, `NoField`,
+  `FieldUnresolved`, `DerefUnresolved`, `NoInstance`, `ImplContext`,
+  `Ambiguous`, `CellNotSend`, `ValueNotSend`, `RigidColour`, `AmpArgument`,
+  `AmpParamValue`, `AmpPosition`, `AmpFunctionValue`, `NonExhaustive`,
+  `Redundant`, `AwaitOutsideAsync`, `WeakScalar`, `WeakOption`, `NotObject`,
+  `ConstantCalled`, `RecurOutsideLoop`, `RecurNotTail`, `DefUnresolved`,
+  `DefNotConstant`, `DefCycle`, `Other`. `MESSAGE` is the error's message
+  and may hold line breaks, so a dump is a sequence of lines only up to its
+  error records.
+- **Nothing iterates a hash table.** The checker uses `HashMap`s for names,
+  its tables and the instance index; the dump reads the `Vec`s of the global
+  tables, looks names up one at a time, and walks the AST for the tables of
+  inference. A unit test runs every program twice in one process (hash
+  tables get a new seed each time) and compares the text.
+- **Normalisation.** An unsolved colour variable prints as `?ς7` and a type
+  variable as `?7`, with the number the order of allocation gave it, which
+  a port that allocates in another order would not reproduce. In every
+  `error` record, and in every scheme, type and predicate the sections print
+  (not in the `ast` section, which prints what the program wrote), the
+  variables are renumbered by first occurrence **within the record**:
+  `?ς1`, `?ς2`, .. for colour variables and `?1`, `?2`, .. for type
+  variables, counted apart (`types_dump::normalise`). A variable is a whole
+  token: it starts the record or follows a space, parenthesis, bracket,
+  brace, quotation mark or comma, and ends the record or is followed by
+  one; `a?7` is not one. A record is a line, or the whole of an error with
+  its line breaks.
+
+### 6.5 A worked example, accepted
+
+The program (`t.fib`):
+
+```
+(defstruct Sq (n: i64))
+(defenum Shape (Circle r: i64) (Rect w: i64 h: i64) Empty)
+(defprotocol Area (area (self) -> i64))
+(impl Area Sq (area (self) (* (. self n) (. self n))))
+(extern puts (ptr) -> i32)
+(def limit 10)
+(defun twice (f x) (f (f x)))
+(defun main () -> i64
+  (twice (fn (n) (+ n 1)) (area (Sq limit))))
+```
+
+`fibref types --implicit-lib "" t.fib` prints, status 0 (instance 81: the
+built-in instances come first):
+
+```
+== t.fib
+-- module main t.fib
+type Sq () struct 1:1 0..23
+  field n : i64
+type Shape () enum 2:1 24..82
+  variant Circle (i64)
+  variant Rect (i64 i64)
+  variant Empty ()
+protocol Area (Self) 3:1 83..122 supers
+  method area : ∀Self. (Area Self) ⇒ (fn :send (Self) i64) params self
+instance 81 (Area Sq) vars 0 4:1 123..177
+  method area : ∀Self. (Area Self) ⇒ (fn :send (Self) i64) params self
+fun twice : ∀a ς0. (fn :send ((fn ς0 (a) a) a) a) params f x 7:1 220..249
+fun main : (fn :send () i64) params 8:1 250..317
+def limit : i64 6:1 205..219
+extern puts : (fn :send (ptr) i32) 5:1 178..204
+unit scc twice
+unit def limit
+unit scc main
+unit impl 81 area
+```
+
+With `--stage lower` the `fun` and `def` lines read `fun twice : (fn (_ _) _)
+params f x 7:1 220..249`, `fun main : (fn () i64) params 8:1 250..317` and
+`def limit : _ 6:1 205..219`, and there are no `unit` lines. With
+`--sections unit,tables` the first unit reads (the ids are those of this
+run: the prelude and the program's own placeholders are numbered before
+the first body, and the expression of a call is numbered after its
+operands):
+
+```
+unit scc twice
+  binding B384 f param (fn ς0 (a) a)
+  binding B385 x param a
+  expr E2756 7:20 239..248 a
+  expr E2752 7:21 240..241 (fn ς0 (a) a)
+  expr E2755 7:23 242..247 a
+  expr E2753 7:24 243..244 (fn ς0 (a) a)
+  expr E2754 7:26 245..246 a
+```
+
+With `--stage lower --sections ast` the same body is:
+
+```
+ast fun twice
+  B384 param f 7:15 234..235
+  B385 param x 7:17 236..237
+  E2756 call 1 7:20 239..248
+    E2752 local B384 f 7:21 240..241
+    E2755 call 1 7:23 242..247
+      E2753 local B384 f 7:24 243..244
+      E2754 local B385 x 7:26 245..246
+```
+
+### 6.6 A worked example, rejected
+
+`(defun f () -> i64 "a") (defun g () -> bool 1) (defun main () -> i64 0)`
+in `t.fib`: `fibref types --implicit-lib "" t.fib` prints, status 1, no
+section (two units failed, in the order of the units):
+
+```
+== t.fib
+error Unify 1:20 19..22: cannot unify str with i64
+error Unify 1:45 44..45: cannot unify i64 with bool
+```
+
+A file that does not expand (`(defun main () -> i64 (when))`) prints the
+expander's record under its module line, status 1:
+
+```
+== t.fib
+-- module main t.fib
+error MacroArity 1:23 22..28: macro when takes at least 1 argument(s), got 0
+```
+
+`fibref types` is tested by `crates/fibref/src/types_dump/` (every section
+and option, 25 error kinds from short programs, the check that the text is
+the same on every run); the harness that runs the port against it,
+`crates/fibc/tests/bootstrap_types.rs`, is not written yet.

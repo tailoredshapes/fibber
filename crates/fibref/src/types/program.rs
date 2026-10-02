@@ -143,48 +143,7 @@ impl TypedProgram {
     /// constraints print after the predicates as `κ ⊑ κ'` and `κ ⊒
     /// Caps{T}`.
     pub fn show_scheme(&self, s: &Scheme) -> String {
-        let p = Printer::with_names(&self.globals, &s.var_names, &[]);
-        let ty = match &s.ty {
-            Ty::Fn(_, ps, r) if s.has_amp() => {
-                let params: Vec<String> = ps
-                    .iter()
-                    .zip(&s.amps)
-                    .map(|(t, amp)| {
-                        if *amp {
-                            format!("(& {})", p.ty(t))
-                        } else {
-                            p.ty(t)
-                        }
-                    })
-                    .collect();
-                format!("(fn ({}) {})", params.join(" "), p.ty(r))
-            }
-            t => p.ty(t),
-        };
-        let mut ctx: Vec<String> = s.preds.iter().map(|q| p.pred(q)).collect();
-        for b in &s.colour_bounds {
-            ctx.push(match b {
-                super::scheme::ColourBound::Flow(a, c) => {
-                    format!("{} ⊑ {}", colour(*a), colour(*c))
-                }
-                super::scheme::ColourBound::Caps(k, t) => {
-                    format!("{} ⊒ Caps{{{}}}", colour(*k), p.ty(t))
-                }
-            });
-        }
-        let mut vars = s.var_names.clone();
-        vars.extend((0..s.n_colours).map(|i| format!("ς{i}")));
-        let head = if vars.is_empty() {
-            String::new()
-        } else {
-            format!("∀{}. ", vars.join(" "))
-        };
-        let ctx = if ctx.is_empty() {
-            String::new()
-        } else {
-            format!("{} ⇒ ", ctx.join(" "))
-        };
-        format!("{head}{ctx}{ty}")
+        show_scheme_in(&self.globals, s)
     }
 
     /// The scheme of the `defun` `name` as text.
@@ -211,6 +170,53 @@ impl TypedProgram {
             _ => None,
         }
     }
+}
+
+/// [`TypedProgram::show_scheme`] over the global tables alone, so that a
+/// scheme can be printed before inference (the lowered protocol methods).
+pub fn show_scheme_in(g: &Globals, s: &Scheme) -> String {
+    let p = Printer::with_names(g, &s.var_names, &[]);
+    let ty = match &s.ty {
+        Ty::Fn(_, ps, r) if s.has_amp() => {
+            let params: Vec<String> = ps
+                .iter()
+                .zip(&s.amps)
+                .map(|(t, amp)| {
+                    if *amp {
+                        format!("(& {})", p.ty(t))
+                    } else {
+                        p.ty(t)
+                    }
+                })
+                .collect();
+            format!("(fn ({}) {})", params.join(" "), p.ty(r))
+        }
+        t => p.ty(t),
+    };
+    let mut ctx: Vec<String> = s.preds.iter().map(|q| p.pred(q)).collect();
+    for b in &s.colour_bounds {
+        ctx.push(match b {
+            super::scheme::ColourBound::Flow(a, c) => {
+                format!("{} ⊑ {}", colour(*a), colour(*c))
+            }
+            super::scheme::ColourBound::Caps(k, t) => {
+                format!("{} ⊒ Caps{{{}}}", colour(*k), p.ty(t))
+            }
+        });
+    }
+    let mut vars = s.var_names.clone();
+    vars.extend((0..s.n_colours).map(|i| format!("ς{i}")));
+    let head = if vars.is_empty() {
+        String::new()
+    } else {
+        format!("∀{}. ", vars.join(" "))
+    };
+    let ctx = if ctx.is_empty() {
+        String::new()
+    } else {
+        format!("{} ⇒ ", ctx.join(" "))
+    };
+    format!("{head}{ctx}{ty}")
 }
 
 fn colour(k: Colour) -> String {

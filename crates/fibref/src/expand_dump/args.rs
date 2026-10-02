@@ -56,7 +56,7 @@ pub fn parse_args(args: &[String]) -> Option<(Options, Vec<String>)> {
 
 /// The module names of a `--implicit-lib` list: none for the empty text,
 /// else one per comma, each not empty.
-fn module_list(list: &str) -> Option<Vec<String>> {
+pub(crate) fn module_list(list: &str) -> Option<Vec<String>> {
     if list.is_empty() {
         return Some(Vec::new());
     }

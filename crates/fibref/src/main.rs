@@ -53,7 +53,16 @@ commands:
                   modules of this dump), --no-runner (a user macro call is
                   pending), --max-steps N, --max-depth N, --max-forms N
                   (smaller limits)
-  help            print this message";
+  types [options] <file>..
+                  print the dump of each program after type checking, module
+                  by module (spec/bootstrap.md §6); exit 1 if a program does
+                  not read, load, expand or type, 2 if a file cannot be
+                  read. Options, before the files: --stage lower|infer,
+                  --sections A,B (type, protocol, instance, fun, def,
+                  extern, unit, error, ast, tables), --library (no main
+                  needed), --prelude (each file is a library prelude),
+                  --implicit, --implicit-lib A,B, --ast, --tables
+  help           print this message";
 
 /// The directory `cases` runs when none is given.
 const DEFAULT_CASES_DIR: &str = "cases/ownership";
@@ -72,6 +81,11 @@ enum Command {
     Read { files: Vec<String>, print: bool },
     /// Print the expansion dump of each file (`fibref::expand_dump`).
     Expand { files: Vec<String>, opts: Options },
+    /// Print the types dump of each file (`fibref::types_dump`).
+    Types {
+        files: Vec<String>,
+        opts: fibref::types_dump::Options,
+    },
     /// Print usage and exit successfully.
     Help,
     /// Print usage and exit with an error: the arguments made no sense.
@@ -120,6 +134,10 @@ fn parse(args: &[String]) -> Command {
         }
         [cmd, rest @ ..] if cmd == "expand" => match fibref::expand_dump::parse_args(rest) {
             Some((opts, files)) => Command::Expand { files, opts },
+            None => Command::Invalid,
+        },
+        [cmd, rest @ ..] if cmd == "types" => match fibref::types_dump::parse_args(rest) {
+            Some((opts, files)) => Command::Types { files, opts },
             None => Command::Invalid,
         },
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
@@ -245,6 +263,13 @@ fn expand_files(files: &[String], opts: &Options) -> ExitCode {
     finish(&text, ExitCode::from(status))
 }
 
+/// Prints the types dump of each file (`fibref::types_dump`): exit 1 if
+/// a program ends in an error record, 2 if a file cannot be read.
+fn types_files(files: &[String], opts: &fibref::types_dump::Options) -> ExitCode {
+    let (text, status) = fibref::types_dump::types_files(files, opts);
+    finish(&text, ExitCode::from(status))
+}
+
 /// Prints `text` to stdout and returns `code`, the verdict of the
 /// command, unless the report could not be written: then it says why on
 /// stderr and exits 2, so that a full device is not a pass. A reader that
@@ -293,6 +318,7 @@ fn main() -> ExitCode {
         Command::Run { file, args } => run_file(&file, &args, &roots),
         Command::Read { files, print } => read_files(&files, print),
         Command::Expand { files, opts } => expand_files(&files, &opts),
+        Command::Types { files, opts } => types_files(&files, &opts),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -433,6 +459,27 @@ mod tests {
         );
         assert_eq!(parse(&args(&["expand"])), Command::Invalid);
         assert_eq!(parse(&args(&["expand", "--context"])), Command::Invalid);
+    }
+
+    #[test]
+    fn types_takes_its_options_and_files_from_the_shared_parser() {
+        let opts = fibref::types_dump::Options {
+            stage: fibref::types_dump::Stage::Lower,
+            tables: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            parse(&args(&["types", "--stage", "lower", "--tables", "a.fib"])),
+            Command::Types {
+                files: vec!["a.fib".to_string()],
+                opts
+            }
+        );
+        assert_eq!(parse(&args(&["types"])), Command::Invalid);
+        assert_eq!(
+            parse(&args(&["types", "--stage", "x", "a.fib"])),
+            Command::Invalid
+        );
     }
 
     #[test]

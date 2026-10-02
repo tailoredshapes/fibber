@@ -20,6 +20,7 @@ pub mod own;
 pub mod roots;
 pub mod syntax;
 pub mod types;
+pub mod types_dump;
 
 pub use heap::{
     AuditError, AuditReport, Event, Heap, Kind, Leak, LeakClass, ObjId, Op, ScopeId, Uniqueness,
