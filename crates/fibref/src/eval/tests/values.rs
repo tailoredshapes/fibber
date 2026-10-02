@@ -134,12 +134,12 @@ fn show_of_a_str_is_itself_and_of_a_float_is_clojures_text() {
                                          (and (str-eq (show -0.0) \"-0.0\")
                                               (and (str-eq (show 1e7) \"1.0E7\")
                                                    (and (str-eq (show 1e-4) \"1.0E-4\")
-                                                        (str-eq (show (/ -1.0 0.0)) \"-Infinity\"))))))))
+                                                        (str-eq (show (/ -1.0 0.0)) \"##-Inf\"))))))))
                      1 0))";
     super::clean(src, 1);
     assert_eq!(
         super::super::arith::float_text(f64::NAN, crate::types::ty::Scalar::F64),
-        "NaN"
+        "##NaN"
     );
     assert_eq!(
         super::super::arith::float_text(1e-7, crate::types::ty::Scalar::F64),

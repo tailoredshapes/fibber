@@ -19,7 +19,7 @@
 //!   otherwise a digit, a point, at least one more digit, `E` and the
 //!   exponent, with `-` when it is negative and no `+` (`1.0E7`,
 //!   `1.0E-4`, `4.9E-324`).
-//! - `NaN`, `Infinity`, `-Infinity`, and `-0.0`.
+//! - `##NaN`, `##Inf`, `##-Inf` (Clojure's reader forms, X3), and `-0.0`.
 //!
 //! The compiled runtime has the same text (`fib.show-fp` in
 //! `crates/fibc/rt/str.lir`); `crates/fibc/tests/floats.rs` compares the
@@ -31,10 +31,10 @@ use crate::types::ty::Scalar;
 /// A float's `show` text at the width `w`.
 pub fn float_text(f: f64, w: Scalar) -> String {
     if f.is_nan() {
-        return "NaN".into();
+        return "##NaN".into();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "Infinity" } else { "-Infinity" }.into();
+        return if f > 0.0 { "##Inf" } else { "##-Inf" }.into();
     }
     let (digits, exp) = digits_of(f.abs(), w);
     let sign = if f.is_sign_negative() { "-" } else { "" };
@@ -142,9 +142,9 @@ mod tests {
 
     #[test]
     fn the_special_values() {
-        assert_eq!(d(f64::NAN), "NaN");
-        assert_eq!(d(f64::INFINITY), "Infinity");
-        assert_eq!(d(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(d(f64::NAN), "##NaN");
+        assert_eq!(d(f64::INFINITY), "##Inf");
+        assert_eq!(d(f64::NEG_INFINITY), "##-Inf");
         assert_eq!(d(0.0), "0.0");
         assert_eq!(d(-0.0), "-0.0");
         assert_eq!(s(-0.0), "-0.0");

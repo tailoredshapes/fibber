@@ -349,14 +349,14 @@ fn compare(dir: &Path, exe: &Path, w: Width, seed: u64) -> (usize, Vec<String>) 
     let bad = patterns
         .iter()
         .zip(&lines)
-        .filter(|(&b, line)| w.expected(b) != **line || java::text(w, b) != **line)
+        .filter(|(&b, line)| w.expected(b) != **line || show_text(&java::text(w, b)) != **line)
         .map(|(&b, line)| {
             format!(
                 "{}: interpreter {} compiled {} model {}",
                 w.input(b),
                 squeeze(&w.expected(b)),
                 squeeze(line),
-                squeeze(&java::text(w, b))
+                squeeze(&show_text(&java::text(w, b)))
             )
         })
         .collect();
@@ -407,6 +407,18 @@ fn the_compiled_show_of_a_float_is_the_interpreters() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The text `show` gives where Java's is `java`: the same, except that a
+/// non-finite float is Clojure's reader form (`##Inf`, `##-Inf`, `##NaN`;
+/// X3), where Java's `Double.toString` says `Infinity`.
+fn show_text(java: &str) -> String {
+    match java {
+        "NaN" => "##NaN".into(),
+        "Infinity" => "##Inf".into(),
+        "-Infinity" => "##-Inf".into(),
+        other => other.into(),
+    }
+}
+
 /// Both tools and the model against the texts Java gave: the hand-written
 /// values of `java`, and the values that are not numbers or have a sign.
 #[test]
@@ -430,10 +442,11 @@ fn both_tools_print_the_texts_java_gives() {
                 Width::F64 => value.parse::<f64>().expect("a float").to_bits(),
                 Width::F32 => u64::from(value.parse::<f32>().expect("a float").to_bits()),
             };
-            assert_eq!(shown, java_text, "{} {value}: compiled", w.name());
+            let tool_text = show_text(java_text);
+            assert_eq!(shown, &tool_text, "{} {value}: compiled", w.name());
             assert_eq!(
-                &w.expected(bits),
-                java_text,
+                w.expected(bits),
+                tool_text,
                 "{} {value}: interpreter",
                 w.name()
             );
