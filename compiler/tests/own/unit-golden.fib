@@ -1,0 +1,200 @@
+;; compiler/tests/own/unit-golden.fib: the printers of the ownership dump over data built by hand that
+;; has the shape of real programs: the expected text is that of `fibref own --implicit-lib ""` on
+;; golden/worked.fib (the program of spec/bootstrap.md §7.5, whole) and on golden/full.fib (the
+;; bodies `grow` and `bar` with their facts and summaries), copied from golden/*.txt line for line,
+;; ids included. Together with unit-dump.fib they show every kind of line the dump has. Prints
+;; `ok NAME` or `FAIL NAME`.
+;; Build: fibc build compiler/tests/own/unit-golden.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [own.args :as a] [own.dump :as d] [types.dump.sections :as s] [types.args :as ta])
+  (:use syntax.pos types.ty types.scheme types.table types.ast types.decls types.builtins types.program
+        types.infer.mod types.check own.program own.driver))
+
+(def pos: Pos (Pos "t.fib" 1 1 0 1))
+
+(defun fun-of (name: str) -> FunDef (FunDef name 2 [] nil [] (Expr 1 pos (ELocal 0)) false pos))
+
+(defun proto-of (name: str method: str) -> ProtoDef
+  (ProtoDef name 1 [] [(MethodDef method [] (scheme-mono (ty-i64)) false nil pos)] [] pos))
+
+;; The bindings 0..427 are the prelude's; the names of the next ones are given.
+(defun bindings-from-428 (g: Globals names: (Vec str)) -> unit
+  (do (doseq [i (range 428)] (table-add (. g bindings) (BindingInfo "_" BkParam pos nil)))
+      (doseq [n names] (table-add (. g bindings) (BindingInfo n BkParam pos nil)))))
+
+;; Modules 0 and 1 are the builtins and the prelude, 2 is `main`; the functions are those named.
+(defun tables (funs: (Vec str) names: (Vec str)) -> Globals
+  (let ((g (globals-new)))
+    (do (g-add-module g "the builtins" (Links [] [] []) (map-empty))
+        (g-add-module g "fib.prelude" (Links [] [] []) (map-empty))
+        (g-add-module g "main" (Links [] [] []) (map-empty))
+        (bindings-from-428 g names)
+        (doseq [f funs] (table-add (. g funs) (fun-of f)))
+        (table-add (. g protos) (proto-of "Num" "+"))
+        (table-add (. g protos) (proto-of "Ord" ">"))
+        g)))
+
+(defun tbl (rows: (Vec (Pair i64 v))) -> (Map i64 v)
+  (reduce (fn (m: (Map i64 v) [k x]) (assoc m k x)) (map-empty) rows))
+
+;; The bodies by their keys.
+(defun body-tbl (rows: (Vec (Pair BodyKey BodyOwn))) -> (Map BodyKey BodyOwn)
+  (reduce (fn (m: (Map BodyKey BodyOwn) [k x]) (assoc m k x)) (map-empty) rows))
+
+(defun program-of (g: Globals) -> TypedProgram
+  (TypedProgram g (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (builtin-table) []))
+
+(defun lines-of (g: Globals o: OwnedProgram file: str) -> (Vec str)
+  (d/module-lines [] (Checked (program-of g) o) (s/Shown 2 "main" file) (. (unwrap (a/own-parse-args ["x"])) opts)))
+
+(def worked-expected: (Vec str)
+  ["-- module main compiler/tests/own/golden/worked.fib"
+   "body fun keep"
+   "  param B428 s owned:rule1(returned) escapes=1 declared-borrow=0"
+   "  expr E3087 borrowed b:428"
+   "  binding B428 s owned-param scope-local=0"
+   "body fun mk"
+   "  param B429 n scalar escapes=0 declared-borrow=0"
+   "  expr E3089 scalar"
+   "  expr E3090 scalar"
+   "  expr E3091 scalar"
+   "  expr E3092 owned"
+   "  binding B429 n scalar scope-local=0"
+   "  binding B430 x scalar scope-local=0"
+   "  call E3091 method Num.+ tail=tail head=scalar args=scalar,scalar write-backs= jump=release env:3092 jump"
+   "  closure E3092 async=0 captures=429:scalar escaping=yes(returned) heap=yes(returned)"
+   "    closure-param E3092 B430 x scalar escapes=0 declared-borrow=0"
+   "  alloc E3092 heap"
+   "body fun main"
+   "  expr E3095 scalar"
+   "  expr E3096 scalar"
+   "  expr E3097 owned"
+   "  expr E3098 owned"
+   "  expr E3099 scalar after release v:3098 scope-exit"
+   "  call E3097 ctor tail=none head=scalar args=scalar,scalar write-backs= jump="
+   "  call E3098 fun keep tail=none head=scalar args=move write-backs= jump="
+   "  alloc E3097 heap"
+   "facts fun keep"
+   "  owned B428 rule1(returned)"
+   "  escapes B428 returned"
+   "facts fun mk"
+   "  escaping E3092 returned"
+   "  heap E3092 returned"
+   "facts fun main"
+   "summary keep (1,1)"
+   "summary mk (0,0)"
+   "summary main"])
+
+(def grow-expected: (Vec str)
+  ["-- module main compiler/tests/own/golden/full.fib"
+   "body fun grow"
+   "  param B430 v owned:loop(through loop variable x) escapes=1 declared-borrow=0"
+   "  expr E3096 borrowed b:430 after retain v:3096 loop-init"
+   "  expr E3099 borrowed b:431"
+   "  expr E3100 scalar"
+   "  expr E3101 scalar"
+   "  expr E3102 scalar"
+   "  expr E3103 borrowed b:431"
+   "  expr E3105 borrowed b:431"
+   "  expr E3106 scalar"
+   "  expr E3107 owned"
+   "  expr E3108 scalar"
+   "  expr E3109 borrowed b:431"
+   "  expr E3110 owned after release b:430 param-exit"
+   "  binding B430 v owned-param scope-local=0"
+   "  binding B431 x owns scope-local=0"
+   "  call E3100 fun vec-count tail=none head=scalar args=borrow write-backs= jump="
+   "  call E3102 method Ord.> tail=none head=scalar args=scalar,scalar write-backs= jump="
+   "  call E3107 fun vec-conj tail=none head=scalar args=borrow,scalar write-backs= jump="
+   "  recur E3108 args=move jump=release b:431 recur-old"
+   "body fun bar"
+   "  param B432 a amp escapes=0 declared-borrow=0"
+   "  expr E3112 scalar"
+   "  expr E3113 scalar"
+   "  binding B432 a amp-param scope-local=0"
+   "  call E3113 fun append tail=tail head=scalar args=forward,scalar write-backs= jump="
+   "facts fun grow"
+   "  owned B430 loop(through loop variable x)"
+   "  escapes B430 through loop variable x: the loop's value"
+   "  escapes B431 the loop's value"
+   "  loop-rule1 B431"
+   "facts fun bar"
+   "summary grow (1,1)"
+   "summary bar (0,0)"])
+
+;; golden/worked.fib: keep, mk (a closure that is returned), main (a temporary released after the projection)
+(defun worked-owned () -> OwnedProgram
+  (let ((keep (BodyOwn [(ParamOwn 428 (PkOwned [(OwRule1 "returned")]) true false)]
+                       (tbl [(Pair 3087 (ExprOwn (MBorrowed (SiteBind 428)) []))])
+                       (tbl [(Pair 428 (BindingOwn BnOwnedParam false))])
+                       (map-empty) (map-empty) (map-empty) (map-empty) (set-empty) (map-empty)))
+        (mk (BodyOwn [(ParamOwn 429 PkScalar false false)]
+                     (tbl [(Pair 3089 (ExprOwn MScalar [])) (Pair 3090 (ExprOwn MScalar [])) (Pair 3091 (ExprOwn MScalar []))
+                           (Pair 3092 (ExprOwn (MOwned false) []))])
+                     (tbl [(Pair 429 (BindingOwn BnScalar false)) (Pair 430 (BindingOwn BnScalar false))])
+                     (tbl [(Pair 3091 (CallOwn (CalMethod 0 0) TlTailCall PsScalar [PsScalar PsScalar] []
+                                               [(Op OpRelease (SiteEnv 3092) WhyJump)]))])
+                     (map-empty)
+                     (tbl [(Pair 3092 (ClosureOwn false (some "returned") (some "returned") [(CaptureOwn 429 PsScalar)]
+                                                  [(ParamOwn 430 PkScalar false false)]))])
+                     (tbl [(Pair 3092 AlHeap)]) (set-empty) (map-empty)))
+        (main (BodyOwn []
+                       (tbl [(Pair 3095 (ExprOwn MScalar [])) (Pair 3096 (ExprOwn MScalar []))
+                             (Pair 3097 (ExprOwn (MOwned false) [])) (Pair 3098 (ExprOwn (MOwned false) []))
+                             (Pair 3099 (ExprOwn MScalar [(Op OpRelease (SiteValue 3098) WhyScopeExit)]))])
+                       (map-empty)
+                       (tbl [(Pair 3097 (CallOwn CalCtor TlNotInTail PsScalar [PsScalar PsScalar] [] []))
+                             (Pair 3098 (CallOwn (CalFun 0) TlNotInTail PsScalar [PsMove] [] []))])
+                       (map-empty) (map-empty) (tbl [(Pair 3097 AlHeap)]) (set-empty) (map-empty))))
+    (OwnedProgram (body-tbl [(Pair (BodyFun 0) keep) (Pair (BodyFun 1) mk) (Pair (BodyFun 2) main)])
+                  [(BodyFun 0) (BodyFun 1) (BodyFun 2)]
+                  (tbl [(Pair 0 (Summary [(Pair true true)])) (Pair 1 (Summary [(Pair false false)])) (Pair 2 (Summary []))])
+                  (set-empty) (set-empty)
+                  [(UnitFacts [(BodyFun 0)]
+                              (Facts (tbl [(Pair 428 (conj (set-empty) (OwRule1 "returned")))]) (tbl [(Pair 428 "returned")])
+                                     (set-empty) (map-empty) (map-empty) (set-empty) (set-empty) (map-empty)))
+                   (UnitFacts [(BodyFun 1)]
+                              (Facts (map-empty) (map-empty) (set-empty) (tbl [(Pair 3092 "returned")]) (tbl [(Pair 3092 "returned")])
+                                     (set-empty) (set-empty) (map-empty)))
+                   (UnitFacts [(BodyFun 2)] (facts-empty))])))
+
+;; golden/full.fib: grow (a loop whose variable is owned by rule 1), bar (an & parameter)
+(defun grow-owned () -> OwnedProgram
+  (let ((lp "through loop variable x")
+        (grow (BodyOwn [(ParamOwn 430 (PkOwned [(OwLoop "through loop variable x")]) true false)]
+                       (tbl [(Pair 3096 (ExprOwn (MBorrowed (SiteBind 430)) [(Op OpRetain (SiteValue 3096) WhyLoopInit)]))
+                             (Pair 3099 (ExprOwn (MBorrowed (SiteBind 431)) [])) (Pair 3100 (ExprOwn MScalar []))
+                             (Pair 3101 (ExprOwn MScalar [])) (Pair 3102 (ExprOwn MScalar []))
+                             (Pair 3103 (ExprOwn (MBorrowed (SiteBind 431)) [])) (Pair 3105 (ExprOwn (MBorrowed (SiteBind 431)) []))
+                             (Pair 3106 (ExprOwn MScalar [])) (Pair 3107 (ExprOwn (MOwned false) []))
+                             (Pair 3108 (ExprOwn MScalar [])) (Pair 3109 (ExprOwn (MBorrowed (SiteBind 431)) []))
+                             (Pair 3110 (ExprOwn (MOwned false) [(Op OpRelease (SiteBind 430) WhyParamExit)]))])
+                       (tbl [(Pair 430 (BindingOwn BnOwnedParam false)) (Pair 431 (BindingOwn BnOwns false))])
+                       (tbl [(Pair 3100 (CallOwn (CalFun 3) TlNotInTail PsScalar [PsBorrow] [] []))
+                             (Pair 3102 (CallOwn (CalMethod 1 0) TlNotInTail PsScalar [PsScalar PsScalar] [] []))
+                             (Pair 3107 (CallOwn (CalFun 4) TlNotInTail PsScalar [PsBorrow PsScalar] [] []))])
+                       (tbl [(Pair 3108 (RecurOwn [PsMove] [(Op OpRelease (SiteBind 431) WhyRecurOld)]))])
+                       (map-empty) (map-empty) (set-empty) (map-empty)))
+        (bar (BodyOwn [(ParamOwn 432 PkAmp false false)]
+                      (tbl [(Pair 3112 (ExprOwn MScalar [])) (Pair 3113 (ExprOwn MScalar []))])
+                      (tbl [(Pair 432 (BindingOwn BnAmpParam false))])
+                      (tbl [(Pair 3113 (CallOwn (CalFun 5) TlTailCall PsScalar [PsForward PsScalar] [] []))])
+                      (map-empty) (map-empty) (map-empty) (set-empty) (map-empty))))
+    (OwnedProgram (body-tbl [(Pair (BodyFun 0) grow) (Pair (BodyFun 1) bar)]) [(BodyFun 0) (BodyFun 1)]
+                  (tbl [(Pair 0 (Summary [(Pair true true)])) (Pair 1 (Summary [(Pair false false)]))])
+                  (set-empty) (set-empty)
+                  [(UnitFacts [(BodyFun 0)]
+                              (Facts (tbl [(Pair 430 (conj (set-empty) (OwLoop lp)))])
+                                     (tbl [(Pair 430 "through loop variable x: the loop's value") (Pair 431 "the loop's value")])
+                                     (conj (set-empty) 431) (map-empty) (map-empty) (set-empty) (set-empty) (map-empty)))
+                   (UnitFacts [(BodyFun 1)] (facts-empty))])))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (gw (tables ["keep" "mk" "main"] ["s" "n" "x"]))
+        (gg (tables ["grow" "bar" "x" "vec-count" "vec-conj" "append"] ["_" "_" "v" "x" "a"])))
+    (do (check cs "golden/worked.fib: the example of spec §7.5, every line of its module"
+               (= (lines-of gw (worked-owned) "compiler/tests/own/golden/worked.fib") worked-expected))
+        (check cs "golden/full.fib: a loop, a recur, an & parameter, the facts of a loop variable, the summaries"
+               (= (lines-of gg (grow-owned) "compiler/tests/own/golden/full.fib") grow-expected))
+        (finish cs))))

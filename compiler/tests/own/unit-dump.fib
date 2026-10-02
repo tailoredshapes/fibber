@@ -1,44 +1,68 @@
 ;; compiler/tests/own/unit-dump.fib: the printers of the ownership dump (own.dump.text,
 ;; own.dump.bodies, own.dump.units, own.dump) over tables and an `OwnedProgram` built by hand,
-;; and the words of own.args. The words of the dump are provisional (package O1: the oracle's
-;; spec will fix them); the checks hold the shape: each variant has its word, a body prints its
-;; header and then its records kind by kind with the keys sorted, a section the options leave out
-;; is not printed, and a module sees only its own bodies, units and functions. Prints `ok NAME`
-;; or `FAIL NAME`.
+;; and the words of own.args, against the format of spec/bootstrap.md §7.3 and the text of
+;; `fibref own`: each variant has its word, a body prints its header and then its records kind by
+;; kind with the keys sorted, a section the options leave out is not printed, and a module sees
+;; only its own bodies, units and functions. The records written here have the shape of those in
+;; golden/*.txt; unit-golden.fib prints whole modules of those files. Prints `ok NAME` or `FAIL NAME`.
 ;; Build: fibc build compiler/tests/own/unit-dump.fib -I compiler -I lib -o OUT
 (ns main
   (:require [own.args :as a] [own.dump :as d] [own.dump.text :as t] [own.dump.bodies :as b]
             [own.dump.units :as u] [types.dump.sections :as s] [types.args :as ta])
-  (:use syntax.pos types.ty types.table types.ast types.decls types.builtins types.program
+  (:use syntax.pos types.ty types.scheme types.table types.ast types.decls types.builtins types.program
         types.infer.mod types.check own.error own.program own.driver))
 
 (def pos: Pos (Pos "t.fib" 3 5 10 20))
 
 (defun word-checks (cs: Checks p: TypedProgram) -> unit
-  (do (check cs "sites" (= (mapv t/site-text [(SiteBind 3) (SiteValue 4) (SiteCapture 5 6) (SiteEnv 7) (SiteGlobal 8)])
-                           ["b:3" "v:4" "cap:5:6" "env:7" "def:8"]))
-      (check cs "modes" (= (mapv t/mode-text [MScalar (MOwned false) (MOwned true) (MBorrowed (SiteBind 1)) (MDerived (SiteValue 2))])
-                           ["scalar" "owned" "owned!" "borrowed b:1" "derived v:2"]))
-      (check cs "an operation is kind, site, why"
-             (= (t/ops-text [(Op OpRetain (SiteBind 1) WhyJoin) (Op OpRelease (SiteValue 2) WhyScopeExit)
-                             (Op OpEndStack (SiteEnv 3) WhyJump)])
-                "retain b:1 join; release v:2 scope-exit; end-stack env:3 jump"))
-      (check cs "passes" (= (t/passes-text [PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv])
-                            "scalar,borrow,move,retain,acquire,forward,own-cell,alias,keep-env"))
-      (check cs "tails" (= (mapv t/tail-text [TlNotInTail TlTailCall (TlOrdinary BcAmpArgument) (TlOrdinary (BcAmpCaptured 4))
-                                              (TlOrdinary (BcFrameOwned 2)) (TlOrdinary BcAsyncBody)])
-                           ["not-in-tail" "tail-call" "ordinary:amp-argument" "ordinary:amp-captured:4"
-                            "ordinary:frame-owned:2" "ordinary:async-body"]))
-      (check cs "callees, a builtin by its name"
-             (= (mapv (fn (c: Callee) (t/callee-text p c))
-                      [(CalFun 1) (CalAllOwned 2) (CalMethod 3 4) (CalBuiltin 0) CalCtor CalExtern CalValue])
-                ["fun:1" "all-owned:2" "method:3.4" "builtin:cell" "ctor" "extern" "value"]))
-      (check cs "parameter kinds, the reasons in order"
-             (= (mapv t/param-kind-text [PkScalar PkAmp PkBorrowed (PkOwned [(OwRule1 "returned") OwDeclared (OwLoop "x")])])
-                ["scalar" "amp" "borrowed" "owned:rule1(returned):declared:loop(x)"]))
-      (check cs "binding kinds"
-             (= (mapv t/bind-kind-text [BnScalar BnOwns (BnAliasOf (SiteBind 1)) (BnDerivedOf (SiteValue 2)) BnBorrowedParam BnOwnedParam BnAmpParam])
-                ["scalar" "owns" "alias b:1" "derived v:2" "borrowed-param" "owned-param" "amp-param"]))))
+  (let ((g (. p globals)))
+    (do (check cs "ids: B and E before a number" (and (= (t/bid 428) "B428") (= (t/eid 3087) "E3087")))
+        (check cs "sites" (= (mapv t/site-text [(SiteBind 3) (SiteValue 4) (SiteCapture 5 6) (SiteEnv 7) (SiteGlobal 8)])
+                             ["b:3" "v:4" "cap:5:6" "env:7" "def:8"]))
+        (check cs "modes" (= (mapv t/mode-text [MScalar (MOwned false) (MOwned true) (MBorrowed (SiteBind 1)) (MDerived (SiteValue 2))])
+                             ["scalar" "owned" "owned!" "borrowed b:1" "derived v:2"]))
+        (check cs "an operation is kind, site, why, and every why has its word"
+               (= (t/ops-text [(Op OpRetain (SiteBind 1) WhyReturn) (Op OpRelease (SiteValue 2) WhyStore)
+                               (Op OpEndStack (SiteEnv 3) WhyJoin) (Op OpRetain (SiteBind 1) WhyScopeExit)
+                               (Op OpRetain (SiteBind 1) WhyStepEnd) (Op OpRetain (SiteBind 1) WhyDerivedExit)
+                               (Op OpRetain (SiteBind 1) WhyDiscard) (Op OpRetain (SiteBind 1) WhyParamExit)
+                               (Op OpRetain (SiteBind 1) WhyLoopInit) (Op OpRetain (SiteBind 1) WhyJump)
+                               (Op OpRetain (SiteBind 1) WhyRecurOld)])
+                  (str-join ["retain b:1 return; release v:2 store; end-stack env:3 join; retain b:1 scope-exit; "
+                             "retain b:1 step-end; retain b:1 derived-exit; retain b:1 discard; retain b:1 param-exit; "
+                             "retain b:1 loop-init; retain b:1 jump; retain b:1 recur-old"])))
+        (check cs "no operation is no text" (= (t/ops-text []) ""))
+        (check cs "passes" (= (t/passes-text [PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv])
+                              "scalar,borrow,move,retain,acquire,forward,own-cell,alias,keep-env"))
+        (check cs "tails"
+               (= (mapv t/tail-text [TlNotInTail TlTailCall (TlOrdinary BcAmpArgument) (TlOrdinary (BcAmpCaptured 4))
+                                     (TlOrdinary (BcFrameOwned 2)) (TlOrdinary BcAsyncBody) (TlOrdinary BcExtern) (TlOrdinary BcStore)])
+                  ["none" "tail" "ordinary:amp-argument" "ordinary:amp-captured:4" "ordinary:frame-owned:2"
+                   "ordinary:async-body" "ordinary:extern" "ordinary:store"]))
+        (check cs "callees by name: a builtin, a method of its protocol"
+               (= (mapv (fn (c: Callee) (t/callee-text p c))
+                        [(CalFun 0) (CalAllOwned 1) (CalMethod 0 1) (CalBuiltin 0) CalCtor CalExtern CalValue])
+                  ["fun f" "allowned g" "method Area.perim" "builtin cell" "ctor" "extern" "value"]))
+        (check cs "parameter kinds: the reasons in the order given, owned alone if none is left"
+               (= (mapv t/param-kind-text [PkScalar PkAmp PkBorrowed (PkOwned [(OwRule1 "returned") OwDeclared (OwLoop "x")]) (PkOwned [])])
+                  ["scalar" "amp" "borrowed" "owned:rule1(returned),declared,loop(x)" "owned"]))
+        (check cs "the reasons, each of the five"
+               (= (t/whys-text [(OwRule1 "a") (OwRule2 "b") (OwRule3 "c") (OwLoop "d") OwDeclared])
+                  "rule1(a),rule2(b),rule3(c),loop(d),declared"))
+        (check cs "a parameter: B, its name from the table, kind, escapes, declared-borrow"
+               (= (t/param-text g (ParamOwn 1 (PkOwned [OwDeclared]) false true)) "B1 y owned:declared escapes=0 declared-borrow=1"))
+        (check cs "binding kinds"
+               (= (mapv t/bind-kind-text [BnScalar BnOwns (BnAliasOf (SiteBind 1)) (BnDerivedOf (SiteValue 2)) BnBorrowedParam BnOwnedParam BnAmpParam])
+                  ["scalar" "owns" "alias-of b:1" "derived-of v:2" "borrowed-param" "owned-param" "amp-param"]))
+        (check cs "allocations and flags" (and (= (mapv t/alloc-text [AlHeap AlStack AlNothing]) ["heap" "stack" "nothing"])
+                                               (= (t/flag-text true) "1") (= (t/flag-text false) "0")))
+        (check cs "the reason of a closure: no, or yes(REASON)" (and (= (t/reason-text nil) "no") (= (t/reason-text (some "async")) "yes(async)")))
+        (check cs "body keys: the method by instance and name, the all-owned ones by their own word"
+               (= (mapv (fn (k: BodyKey) (t/body-key-text g k))
+                        [(BodyFun 0) (BodyAllOwned 1) (BodyMethod 0 1) (BodyMethodOwned 0 0) (BodyDef 0)])
+                  ["fun f" "allowned g" "method 0 perim" "methodowned 0 area" "def k"]))
+        (check cs "the module of a body: that of its function, instance or def"
+               (= (mapv (fn (k: BodyKey) (t/body-module g k)) [(BodyFun 0) (BodyAllOwned 1) (BodyMethod 0 1) (BodyDef 0)]) [2 3 2 2])))))
 
 ;; the tables: modules 0 and 1 are the builtins and the prelude, 2 is `main`, 3 is `other`
 (defun tables () -> Globals
@@ -54,10 +78,14 @@
         (table-add (. g funs) (FunDef "g" 3 [] nil [] (Expr 2 pos (ELocal 0)) false pos))
         (table-add (. g defs) (DefDef "k" 2 nil (Expr 3 pos (ELocal 0)) pos))
         (table-add (. g instances) (InstanceDef 0 KStr 2 [] (ty-str) [] []
-                                                [(ImplMethod 0 [] nil (Expr 4 pos (ELocal 0)) pos) (ImplMethod 0 [] nil (Expr 5 pos (ELocal 0)) pos)]
+                                                [(ImplMethod 0 [] nil (Expr 4 pos (ELocal 0)) pos) (ImplMethod 1 [] nil (Expr 5 pos (ELocal 0)) pos)]
                                                 pos))
+        (table-add (. g protos) (ProtoDef "Area" 2 [] [(MethodDef "area" [] (scheme-mono (ty-i64)) false nil pos)
+                                                        (MethodDef "perim" [] (scheme-mono (ty-i64)) false nil pos)]
+                                          [] pos))
         g)))
 
+;; The guard 14 has no operation on its false edge; the closure 7 is on the stack.
 (defun body () -> BodyOwn
   (BodyOwn [(ParamOwn 0 (PkOwned [(OwRule1 "returned")]) true false) (ParamOwn 1 PkScalar false true)]
            (assoc (assoc (map-empty) 9 (ExprOwn MScalar [])) 2 (ExprOwn (MBorrowed (SiteBind 0)) [(Op OpRetain (SiteBind 0) WhyReturn)]))
@@ -67,57 +95,69 @@
            (assoc (map-empty) 7 (ClosureOwn false (some "returned") nil [(CaptureOwn 0 PsAlias)] [(ParamOwn 1 PkBorrowed false false)]))
            (assoc (assoc (map-empty) 8 AlStack) 4 AlHeap)
            (conj (conj (set-empty) 12) 11)
-           (assoc (map-empty) 3 [(Op OpRelease (SiteValue 3) WhyStepEnd)])))
+           (assoc (assoc (map-empty) 14 []) 3 [(Op OpRelease (SiteValue 3) WhyStepEnd)])))
 
 (def body-expected: (Vec str)
-  ["body Fun f"
-   "  param 0 x owned:rule1(returned) escapes=1 declared-borrow=0"
-   "  param 1 y scalar escapes=0 declared-borrow=1"
-   "  expr 2 borrowed b:0 after retain b:0 return"
-   "  expr 9 scalar"
-   "  binding 0 owned-param scope-local=1"
-   "  call 5 builtin:cell not-in-tail head=scalar args=move,borrow write-backs=1:0 jump="
-   "  recur 6 args=retain jump=release b:1 recur-old"
-   "  closure 7 async=0 escaping=returned heap=no captures=0:alias params=1:borrowed"
-   "  alloc 4 heap"
-   "  alloc 8 stack"
-   "  stack-temp 11"
-   "  stack-temp 12"
-   "  guard-fail 3 release v:3 step-end"])
+  ["body fun f"
+   "  param B0 x owned:rule1(returned) escapes=1 declared-borrow=0"
+   "  param B1 y scalar escapes=0 declared-borrow=1"
+   "  expr E2 borrowed b:0 after retain b:0 return"
+   "  expr E9 scalar"
+   "  binding B0 x owned-param scope-local=1"
+   "  call E5 builtin cell tail=none head=scalar args=move,borrow write-backs=1:0 jump="
+   "  recur E6 args=retain jump=release b:1 recur-old"
+   "  closure E7 async=0 captures=0:alias escaping=yes(returned) heap=no"
+   "    closure-param E7 B1 y borrowed escapes=0 declared-borrow=0"
+   "  alloc E4 heap"
+   "  alloc E8 stack"
+   "  stack-temp E11"
+   "  stack-temp E12"
+   "  guard-fail E3 release v:3 step-end"
+   "  guard-fail E14"])
+
+(def facts-expected: (Vec str)
+  ["facts fun f, fun g"
+   "  owned B0 rule1(returned),declared"
+   "  escapes B1 stored"
+   "  loop-rule1 B1"
+   "  escaping E7 returned"
+   "  heap E7 arg-of-recur"])
 
 (defun program-of (g: Globals units: (Vec UnitRef)) -> TypedProgram
   (TypedProgram g (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (builtin-table) units))
 
+;; The facts of one unit with two bodies, which belongs to the module of the first (f, module 2),
+;; and of one with the all-owned body of g (module 3).
 (defun owned-of () -> OwnedProgram
   (OwnedProgram (assoc (assoc (map-empty) (BodyFun 0) (body)) (BodyFun 1) (body-own-new))
                 [(BodyFun 0) (BodyFun 1)]
-                (assoc (assoc (map-empty) 0 (Summary [(Pair true true) (Pair false false)])) 1 (Summary []))
+                (assoc (assoc (map-empty) 1 (Summary [])) 0 (Summary [(Pair true true) (Pair false false)]))
                 (conj (conj (set-empty) 1) 0)
                 (conj (set-empty) (Pair 0 1))
-                [(UnitFacts (UScc [0])
+                [(UnitFacts [(BodyFun 0) (BodyFun 1)]
                             (Facts (assoc (map-empty) 0 (conj (conj (set-empty) OwDeclared) (OwRule1 "returned")))
                                    (assoc (map-empty) 1 "stored") (conj (set-empty) 1)
                                    (assoc (map-empty) 7 "returned") (assoc (map-empty) 7 "arg-of-recur")
-                                   (set-empty) (set-empty) (map-empty)))]))
+                                   (set-empty) (set-empty) (map-empty)))
+                 (UnitFacts [(BodyAllOwned 1)] (facts-empty))]))
 
 (defun section-checks (cs: Checks p: TypedProgram o: OwnedProgram) -> unit
   (let ((g (. p globals)))
     (do (check cs "a body: its header, then its records kind by kind, each sorted"
                (= (b/body-lines [] p (BodyFun 0) (body)) body-expected))
         (check cs "bodies of a module: its own only, in the order decided"
-               (= (b/bodies-section [] p o 2) (b/body-lines [] p (BodyFun 0) (body)))
-               )
-        (check cs "an empty body is its header" (= (b/bodies-section [] p o 3) ["body Fun g"]))
-        (check cs "the facts of a unit of the module"
-               (= (u/facts-section [] g o 2)
-                  ["unit-facts scc f" "    owned 0 rule1(returned),declared" "    loop-rule1 1" "    escapes 1 stored"
-                   "    escaping 7 returned" "    heap 7 arg-of-recur"]))
-        (check cs "the facts of another module's unit are not printed" (= (u/facts-section [] g o 3) []))
+               (= (b/bodies-section [] p o 2) (b/body-lines [] p (BodyFun 0) (body))))
+        (check cs "an empty body is its header" (= (b/bodies-section [] p o 3) ["body fun g"]))
+        (check cs "the facts of a unit under the module of its first body"
+               (= (u/facts-section [] g o 2) facts-expected))
+        (check cs "a unit with no fact is its header" (= (u/facts-section [] g o 3) ["facts allowned g"]))
         (check cs "a summary is `(OWNED,ESCAPES)` for each parameter"
                (= (u/summary-section [] p o 2) ["summary f (1,1) (0,0)"]))
-        (check cs "the summaries follow the module" (= (u/summary-section [] p o 3) ["summary g"]))
-        (check cs "taken: functions by id and methods by pair, for the module"
-               (= (u/taken-section [] g o 2) ["taken value f" "taken method 0.1"])))))
+        (check cs "the summaries follow the module, a function with no parameter is its name"
+               (= (u/summary-section [] p o 3) ["summary g"]))
+        (check cs "taken: a line for each function by id and each method by pair, of the module"
+               (= (u/taken-section [] g o 2) ["taken value f" "taken method 0 perim"]))
+        (check cs "taken in another module" (= (u/taken-section [] g o 3) ["taken value g"])))))
 
 (defun dump-checks (cs: Checks p: TypedProgram o: OwnedProgram) -> unit
   (let ((c (Checked p o))
@@ -125,12 +165,14 @@
         (opts (fn (words: (Vec str)) (. (unwrap (a/own-parse-args (into words ["f.fib"]))) opts))))
     (do (check cs "a module's lines: header, bodies, facts, summary, taken"
                (= (d/module-lines [] c shown (opts []))
-                  (into (into (into ["-- module main t.fib"] body-expected)
-                              ["unit-facts scc f" "    owned 0 rule1(returned),declared" "    loop-rule1 1" "    escapes 1 stored"
-                               "    escaping 7 returned" "    heap 7 arg-of-recur"])
-                        ["summary f (1,1) (0,0)" "taken value f" "taken method 0.1"])))
+                  (into (into (into ["-- module main t.fib"] body-expected) facts-expected)
+                        ["summary f (1,1) (0,0)" "taken value f" "taken method 0 perim"])))
         (check cs "--sections taken prints the header and that section only"
-               (= (d/module-lines [] c shown (opts ["--sections" "taken"])) ["-- module main t.fib" "taken value f" "taken method 0.1"]))
+               (= (d/module-lines [] c shown (opts ["--sections" "taken"]))
+                  ["-- module main t.fib" "taken value f" "taken method 0 perim"]))
+        (check cs "--sections in any order, each once, in the order of the dump"
+               (= (d/module-lines [] c shown (opts ["--sections" "summary,facts"]))
+                  (into (into ["-- module main t.fib"] facts-expected) ["summary f (1,1) (0,0)"])))
         (check cs "--sections error prints the header only"
                (= (d/module-lines [] c shown (opts ["--sections" "error"])) ["-- module main t.fib"]))
         (check cs "an ownership error is a record, its position relative to the file"
@@ -156,11 +198,15 @@
                (let ((o (a/base-options (. (unwrap (parse ["--library" "x"])) opts))))
                  (and (. o library) (= (. o stage) ta/StInfer) (not (. o ast)))))
         (check cs "a lone -- ends the options" (= (. (unwrap (parse ["--" "--library"])) files) ["--library"]))
+        (check cs "--implicit-lib \"\" is no library, and a file may be named like an option after a file"
+               (and (= (. (. (unwrap (parse ["--implicit-lib" "" "x"])) opts) implicit-lib) (some (vec-empty)))
+                    (= (. (unwrap (parse ["x" "--library"])) files) ["x" "--library"])))
         (check cs "refused: no file, an unknown word, a section that is not one, an empty name"
                (and (= (parse []) nil) (= (parse ["--library"]) nil) (= (parse ["--nope" "x"]) nil)
                     (= (parse ["--sections" "type" "x"]) nil) (= (parse ["--sections" "body," "x"]) nil)
                     (= (parse ["--sections"]) nil) (= (parse ["--implicit-lib" "a,,b" "x"]) nil)
-                    (= (parse ["--stage" "infer" "x"]) nil))))))
+                    (= (parse ["--stage" "infer" "x"]) nil) (= (parse ["--ast" "x"]) nil) (= (parse ["--implicit-lib"]) nil)
+                    (= (parse ["--sections" "" "x"]) nil) (= (parse ["--sections" "Body" "x"]) nil))))))
 
 (defun main () -> i64
   (let ((cs (checks-new))

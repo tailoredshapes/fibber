@@ -1,15 +1,22 @@
-;; compiler/own/dump/text.fib: the words and short phrases of the ownership dump (plan 1.2;
-;; spec/bootstrap.md §7 once it lands): a site, a mode, an operation, a pass, a tail decision, a
-;; callee, a binding kind, a parameter kind, an allocation. Each is a pure function of one value;
-;; the lines that use them are in own.dump.bodies and own.dump.units. Package O1; the words are
-;; provisional until the oracle (`fibref own`, package O0) fixes them: this is the one module that
-;; holds them.
+;; compiler/own/dump/text.fib: the words and short phrases of the ownership dump, as
+;; spec/bootstrap.md §7.3 defines them and crates/fibref/src/own_dump/texts.rs prints them: an id,
+;; a site, a mode, an operation, a pass, a tail decision, a callee, a binding kind, a parameter
+;; kind, an allocation, a body key. Each is a pure function of one value; the lines that use
+;; them are in own.dump.bodies and own.dump.units. This is the one module that holds the words.
 ;;
-;; The words: a site is `b:B` (a binding), `v:E` (the value of an expression), `cap:E:B` (a
+;; The words: a binding id is `B428` and an expression id `E3087` after a record word, bare
+;; inside a phrase; a site is `b:B` (a binding), `v:E` (the value of an expression), `cap:E:B` (a
 ;; capture), `env:E`, `def:D`; a mode `scalar`, `owned`, `owned!` (immortal), `borrowed SITE`,
-;; `derived SITE`; an operation `retain|release|end-stack SITE WHY`; a list of them is joined by `; `.
+;; `derived SITE`; an operation `retain|release|end-stack SITE WHY`, a list of them joined by `; `;
+;; a list of passes, captures and write-backs by `,`.
 (ns own.dump.text
-  (:use fib.string types.program types.builtins own.program))
+  (:use fib.string types.table types.decls types.program types.builtins types.infer.mod own.program))
+
+;; `B428`: a binding after a record word.
+(defun bid (b: i64) -> str (str-concat "B" (show b)))
+
+;; `E3087`: an expression after a record word.
+(defun eid (e: i64) -> str (str-concat "E" (show e)))
 
 ;; `b:B | v:E | cap:E:B | env:E | def:D`.
 (defun site-text (s: Site) -> str
@@ -63,22 +70,24 @@
     ((BcFrameOwned a) (str-concat "frame-owned:" (show a)))
     ((BcAsyncBody) "async-body") ((BcExtern) "extern") ((BcStore) "store")))
 
-;; `not-in-tail`, `tail-call`, `ordinary:WHY`.
+;; `none` (not in tail position), `tail`, `ordinary:BECAUSE`.
 (defun tail-text (t: Tail) -> str
   (match t
-    ((TlNotInTail) "not-in-tail")
-    ((TlTailCall) "tail-call")
+    ((TlNotInTail) "none")
+    ((TlTailCall) "tail")
     ((TlOrdinary b) (str-concat "ordinary:" (because-text b)))))
 
-;; `fun:F | all-owned:F | method:P.I | builtin:NAME | ctor | extern | value`: a builtin by its
-;; name, not its index, so that a change of the table that renumbers it does not show.
+;; `fun NAME | allowned NAME | method PROTOCOL.NAME | builtin NAME | ctor | extern | value`: a
+;; builtin by its name, not its index, so that a change of the table that renumbers it does not show.
 (defun callee-text (p: TypedProgram c: Callee) -> str
-  (match c
-    ((CalFun f) (str-concat "fun:" (show f)))
-    ((CalAllOwned f) (str-concat "all-owned:" (show f)))
-    ((CalMethod proto i) (str-join ["method:" (show proto) "." (show i)]))
-    ((CalBuiltin id) (str-concat "builtin:" (. (nth (. p builtins) id) name)))
-    ((CalCtor) "ctor") ((CalExtern) "extern") ((CalValue) "value")))
+  (let ((g (. p globals)))
+    (match c
+      ((CalFun f) (str-concat "fun " (. (g-fun g f) name)))
+      ((CalAllOwned f) (str-concat "allowned " (. (g-fun g f) name)))
+      ((CalMethod proto i)
+       (let ((d (g-proto g proto))) (str-join ["method " (. d name) "." (. (nth (. d methods) i) name)])))
+      ((CalBuiltin id) (str-concat "builtin " (. (nth (. p builtins) id) name)))
+      ((CalCtor) "ctor") ((CalExtern) "extern") ((CalValue) "value"))))
 
 (defun owned-why-text (w: OwnedWhy) -> str
   (match w
@@ -88,18 +97,28 @@
     ((OwLoop x) (str-join ["loop(" x ")"]))
     ((OwDeclared) "declared")))
 
-;; `scalar | amp | borrowed | owned:WHY..`, the reasons in the order found, each after a `:`.
+;; The reasons joined by `,`, in the order given.
+(defun whys-text (ws) -> str
+  (join "," (mapv owned-why-text ws)))
+
+;; `scalar | amp | borrowed | owned | owned:WHY,WHY..`: the reasons in the order the pass holds
+;; them (that of their derived `Ord`); `owned` alone when none is left.
 (defun param-kind-text (k: ParamKind) -> str
   (match k
     ((PkScalar) "scalar") ((PkAmp) "amp") ((PkBorrowed) "borrowed")
-    ((PkOwned whys) (join ":" (into ["owned"] (mapv owned-why-text whys))))))
+    ((PkOwned whys) (if (empty? whys) "owned" (str-concat "owned:" (whys-text whys))))))
 
-;; `scalar | owns | alias SITE | derived SITE | borrowed-param | owned-param | amp-param`.
+;; `B NAME KIND escapes=0|1 declared-borrow=0|1`: a parameter of a body or a closure.
+(defun param-text (g: Globals pa: ParamOwn) -> str
+  (str-join [(bid (. pa binding)) " " (. (g-binding g (. pa binding)) name) " " (param-kind-text (. pa kind))
+             " escapes=" (flag-text (. pa escapes)) " declared-borrow=" (flag-text (. pa declared-borrow))]))
+
+;; `scalar | owns | alias-of SITE | derived-of SITE | borrowed-param | owned-param | amp-param`.
 (defun bind-kind-text (k: BindKind) -> str
   (match k
     ((BnScalar) "scalar") ((BnOwns) "owns")
-    ((BnAliasOf s) (str-concat "alias " (site-text s)))
-    ((BnDerivedOf s) (str-concat "derived " (site-text s)))
+    ((BnAliasOf s) (str-concat "alias-of " (site-text s)))
+    ((BnDerivedOf s) (str-concat "derived-of " (site-text s)))
     ((BnBorrowedParam) "borrowed-param") ((BnOwnedParam) "owned-param") ((BnAmpParam) "amp-param")))
 
 (defun alloc-text (a: Alloc) -> str
@@ -109,6 +128,31 @@
 ;; `1` or `0`.
 (defun flag-text (b: bool) -> str (if b "1" "0"))
 
-;; The reason of an `Option`al `escaping`/`heap`: the text, or `no`.
+;; The reason of an `Option`al `escaping`/`heap`: `yes(REASON)`, or `no`.
 (defun reason-text (r: (Option str)) -> str
-  (unwrap-or r "no"))
+  (match r
+    ((some why) (str-join ["yes(" why ")"]))
+    (nil "no")))
+
+;; The name of method `k` of instance `i`, as the `unit impl` lines of the types dump write it.
+(defun impl-method-name (g: Globals i: i64 k: i64) -> str
+  (let ((inst (table-get (. g instances) i)))
+    (. (nth (. (g-proto g (. inst proto)) methods) (. (nth (. inst methods) k) index)) name)))
+
+;; `fun NAME | allowned NAME | method I NAME | methodowned I NAME | def NAME`.
+(defun body-key-text (g: Globals k: BodyKey) -> str
+  (match k
+    ((BodyFun f) (str-concat "fun " (. (g-fun g f) name)))
+    ((BodyAllOwned f) (str-concat "allowned " (. (g-fun g f) name)))
+    ((BodyMethod i m) (str-join ["method " (show i) " " (impl-method-name g i m)]))
+    ((BodyMethodOwned i m) (str-join ["methodowned " (show i) " " (impl-method-name g i m)]))
+    ((BodyDef d) (str-concat "def " (. (g-def g d) name)))))
+
+;; The module that defines the body `k`.
+(defun body-module (g: Globals k: BodyKey) -> i64
+  (match k
+    ((BodyFun f) (. (g-fun g f) module))
+    ((BodyAllOwned f) (. (g-fun g f) module))
+    ((BodyMethod i _) (. (table-get (. g instances) i) module))
+    ((BodyMethodOwned i _) (. (table-get (. g instances) i) module))
+    ((BodyDef d) (. (g-def g d) module))))
