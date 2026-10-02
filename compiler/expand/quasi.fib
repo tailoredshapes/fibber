@@ -93,16 +93,16 @@
 ;; Rewrites the template form `t` at `level`. (visit)
 (defun visit :private (t: Stx level: i64 frames: Frames) -> (Result Machine ExpandError)
   (cond
-    ((and (head-is t "unquote") (= level 1))
+    (and (head-is t "unquote") (= level 1))
      (match (operand t "unquote")
        ((Err e) (Err e))
-       ((Ok x) (Ok (Next (Ret x) frames)))))
-    ((and (head-is t "unquote-splicing") (= level 1))
-     (Err (ExpandError SpliceOutsideList (. t pos))))
-    ((head-is t "quasiquote") (wrapped t "quasiquote" (+ level 1) frames))
-    ((head-is t "unquote") (wrapped t "unquote" (- level 1) frames))
-    ((head-is t "unquote-splicing") (wrapped t "unquote-splicing" (- level 1) frames))
-    (true (sequence t level frames))))
+       ((Ok x) (Ok (Next (Ret x) frames))))
+    (and (head-is t "unquote-splicing") (= level 1))
+     (Err (ExpandError SpliceOutsideList (. t pos)))
+    (head-is t "quasiquote") (wrapped t "quasiquote" (+ level 1) frames)
+    (head-is t "unquote") (wrapped t "unquote" (- level 1) frames)
+    (head-is t "unquote-splicing") (wrapped t "unquote-splicing" (- level 1) frames)
+    true (sequence t level frames)))
 
 ;; An inner quasiquote, unquote or unquote-splicing: its operand is
 ;; rewritten at `inner`, and the result rebuilt as `(head x)` data.
@@ -150,15 +150,15 @@
   (match frames
     ((FSeq ctor pos level items idx parts rest)
      (cond
-       ((>= idx (count items))
-        (Ok (Next (Ret (finish-seq ctor parts pos)) rest)))
-       ((spliced? (nth items idx) level)
+       (>= idx (count items))
+        (Ok (Next (Ret (finish-seq ctor parts pos)) rest))
+       (spliced? (nth items idx) level)
         (match (operand (nth items idx) "unquote-splicing")
           ((Err e) (Err e))
           ((Ok x)
-           (Ok (Next Adv (FSeq ctor pos level items (+ idx 1) (conj parts x) rest))))))
-       (true
-        (Ok (Next (Visit (nth items idx) level) (FSeq ctor pos level items idx parts rest))))))
+           (Ok (Next Adv (FSeq ctor pos level items (+ idx 1) (conj parts x) rest)))))
+       true
+        (Ok (Next (Visit (nth items idx) level) (FSeq ctor pos level items idx parts rest)))))
     (_ (Err (unbalanced qpos)))))
 
 ;; `(fib.prelude/CTOR (fib.prelude/concat parts...))`.

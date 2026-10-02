@@ -58,19 +58,19 @@
           ((Err e) (Err e))))))
 
 (defun list-pattern :private (lw: Lowerer items: (Vec Stx) form: Stx kind: BindingKind names: (Cell (Vec str))) -> (Result PatKind TypeError)
-  (cond ((and (= (count items) 3) (stx-kw? (nth items 1) "as"))
+  (cond (and (= (count items) 3) (stx-kw? (nth items 1) "as"))
          (match (stx-as-sym (nth items 2))
            (nil (resolve-err (. (nth items 2) pos) ":as binds a symbol"))
            ((some xn)
             (try-let ((inner (lower-pattern lw (nth items 0) kind names))
                       (b (bind-once lw xn kind (nth items 2) names)))
-              (Ok (PAs inner b))))))
-        ((and (= (count items) 1) (nil-form? (nth items 0)))
-         (Ok (PCtor @(. (. lw g) option) (some 0) [])))
-        (else
+              (Ok (PAs inner b)))))
+        (and (= (count items) 1) (nil-form? (nth items 0)))
+         (Ok (PCtor @(. (. lw g) option) (some 0) []))
+        :else
          (match (stx-as-sym (nth items 0))
            (nil (no-pattern form))
-           ((some head) (ctor-pattern lw items form head kind names))))))
+           ((some head) (ctor-pattern lw items form head kind names)))))
 
 ;; The number of fields of the constructor `id` `variant`.
 (defun ctor-arity :private (lw: Lowerer id: i64 variant: (Option i64)) -> i64
@@ -104,9 +104,9 @@
 ;; The index of the first symbol `&` of items, or their count.
 (defun amp-index :private (items: (Vec Stx)) -> i64
   (loop ((i 0))
-    (cond ((>= i (count items)) i)
-          ((= (stx-as-sym (nth items i)) (some "&")) i)
-          (else (recur (+ i 1))))))
+    (cond (>= i (count items)) i
+          (= (stx-as-sym (nth items i)) (some "&")) i
+          :else (recur (+ i 1)))))
 
 ;; The elements before the `&`: `(& r)` reads as `&r`, an error reported before the element
 ;; is lowered; the first error ends the list.
@@ -132,14 +132,14 @@
   (resolve-err (. at pos) "& in a vector pattern is followed by one symbol or _"))
 
 (defun vec-rest :private (lw: Lowerer tail: (Vec Stx) kind: BindingKind names: (Cell (Vec str))) -> (Result Rest TypeError)
-  (cond ((empty? tail) (Ok RestExact))
-        ((= (count tail) 2)
+  (cond (empty? tail) (Ok RestExact)
+        (= (count tail) 2)
          (let ((r (nth tail 1)))
            (match (stx-as-sym r)
              ((some "_") (Ok RestIgnore))
              ((some n) (if (= n "&") (bad-rest r) (try-let ((b (bind-once lw n kind r names))) (Ok (RestBind b)))))
-             (nil (bad-rest r)))))
-        (else (bad-rest (nth tail 0)))))
+             (nil (bad-rest r))))
+        :else (bad-rest (nth tail 0))))
 
 ;; Rust: lower/pattern.rs:149 let_pattern: the pattern of a `let` or `loop` binding (§3.3,
 ;; stdlib §7 L8): a vector pattern in binding position takes a prefix, so `[a b]` is

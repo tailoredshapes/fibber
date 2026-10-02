@@ -92,12 +92,12 @@
       (if (= (count items) 0)
           (Err bad)
           (loop ((i 0) (out (vec-empty)))
-            (cond ((>= i (count items)) (Ok out))
-                  ((= (+ i 1) (count items))
-                   (Err (malformed name "a binding is a pattern and a source" (. (nth items i) pos))))
-                  (else
+            (cond (>= i (count items)) (Ok out)
+                  (= (+ i 1) (count items))
+                   (Err (malformed name "a binding is a pattern and a source" (. (nth items i) pos)))
+                  :else
                    (try-let ((next (add-binding name out (nth items i) (nth items (+ i 1)))))
-                     (recur (+ i 2) next))))))
+                     (recur (+ i 2) next)))))
       (Err bad))))
 
 ;; `(fn (pat) body)`. (`lambda`)
@@ -118,13 +118,13 @@
 ;; What a guard `:when p` makes of `acc`, the form of the rest of the level:
 ;; an `if` with the empty value of its kind for the else. (`guard`)
 (defun guard :private (ctx: ExpandCtx is-for: bool inner: bool p: Stx acc: Stx pos: Pos) -> Stx
-  (cond ((not is-for) (call "if" [p acc (unit pos)] pos))
-        (inner (call "if" [p acc (Stx SNil pos)] pos))
-        (else
+  (cond (not is-for) (call "if" [p acc (unit pos)] pos)
+        inner (call "if" [p acc (Stx SNil pos)] pos)
+        :else
          (let ((s (ctx-gensym ctx "s" pos))
                (none (call "fib.seq/take" [(int 0 pos) s] pos))
                (test (call "if" [p s none] pos)))
-           (call "let" [(list-form [(list-form [s acc] pos)] pos) test] pos)))))
+           (call "let" [(list-form [(list-form [s acc] pos)] pos) test] pos))))
 
 ;; The body of a level's function: the leaf under the modifiers after the
 ;; first `:let`, innermost last. (`wrap`)
@@ -159,10 +159,10 @@
                           pos)))
       (let ((f (lambda-form (. level pat) body pos))
             (src (. lead src)))
-        (Ok (cond ((not is-for) (call (prelude-name "for-each") [src f] pos))
-                  ((not inner) (call "fib.seq/mapcat" [f src] pos))
-                  (keep (call "fib.seq/keep" [f src] pos))
-                  (else (call "fib.seq/map" [f src] pos))))))))
+        (Ok (cond (not is-for) (call (prelude-name "for-each") [src f] pos)
+                  (not inner) (call "fib.seq/mapcat" [f src] pos)
+                  keep (call "fib.seq/keep" [f src] pos)
+                  :else (call "fib.seq/map" [f src] pos)))))))
 
 ;; `(for [x xs ..] body..)` and `(doseq [x xs ..] body..)`. A doseq body is
 ;; for effect: its value is dropped, so a guard's unit else unifies with it.
