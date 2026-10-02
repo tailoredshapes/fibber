@@ -34,7 +34,7 @@ fn macros_are_typed_as_functions_over_form() {
 fn quoted_forms_are_form_values() {
     let p = ok(
         "(defun items (f: Form) -> (Vec Form) (match f ((List xs) xs) (_ [])))
-                (defun main () -> i64 (count (items '(a b))))",
+                (defun main () -> i64 (vec-count (items '(a b))))",
     );
     assert_eq!(
         p.show_fun("items").as_deref(),

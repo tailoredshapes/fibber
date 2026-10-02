@@ -9,8 +9,17 @@
 ;; and print-str.
 ;;
 ;; Pair, Triple and Result (stdlib design §2.3, L4) are the library's tuple
-;; types: the entry a Map hands to for-each is a Pair, the one tuple type, and
+;; types: the entry a Map yields is a Pair, the one tuple type, and
 ;; map-each and set-each are the walks over a Map and a Set that can stop early.
+;;
+;; The flip (tranche 1, M): the protocols Countable, Indexable, Seq, Collection,
+;; Traversable, Iter and Associative, their instances, the Vec-only map, range,
+;; for-each (the function), iter, collect, filter-iter and the iterators are
+;; gone; the library's four implicit modules (fib.core, fib.seq, fib.coll,
+;; fib.print) are what a program sees first, the prelude after them. What stays
+;; are the types and their raw operations (vec-count vec-nth vec-conj map-get
+;; map-assoc map-count set-count map-each set-each ..), which the library is
+;; built on, and the names of stdlib §6.5.
 ;;
 ;; Vec is the persistent vector of types §2.13: a 32-way trie of
 ;; (Array a) nodes with a tail of up to 32 elements, as in Clojure. A
@@ -55,14 +64,6 @@
 (derive Eq Pair) (derive Ord Pair) (derive Hash Pair)
 (derive Eq Triple) (derive Ord Triple) (derive Hash Triple)
 (derive Eq Result) (derive Ord Result) (derive Hash Result)
-
-;; Protocols (syntax §4.5)
-(defprotocol Countable (count (self) -> i64))
-(defprotocol (Indexable s e) (nth (self i: i64) -> e))
-(defprotocol (Seq s e) (first (self) -> e) (rest (self) -> Self))
-(defprotocol (Collection s e) (conj (self x: e) -> Self))
-(defprotocol (Traversable s e) (for-each (self f: (fn (e) unit) :borrow) -> unit))
-(defprotocol (Iter s e) (next (self) -> (Option e)))
 
 ;; Vec
 (defenum (VNode a) :private (VLeaf items: (Array a)) (VBranch kids: (Array (VNode a))))
@@ -249,51 +250,9 @@
           (nil VecEmpty)
           ((some b) (vb-done b))))))
 
-(impl Countable (Vec a)
-  (count (self) (vec-count self)))
-
-(impl (Indexable a) (Vec a)
-  (nth (self i) (vec-nth self i)))
-
-(impl (Collection a) (Vec a)
-  (conj (self x) (vec-conj self x)))
-
-(impl (Traversable a) (Vec a)
-  (for-each (self f)
-    (dotimes (i (vec-count self)) (f (vec-nth self i)))))
-
 ;; List (the enum is in the expander's prelude: Empty and Cons, stdlib design
-;; C-3; the library's own `empty` and `cons` are a method and a function)
-(impl Countable (List a)
-  (count (self)
-    (match self
-      ((Empty) 0)
-      ((Cons _ t) (+ 1 (count t))))))
-
-(impl (Indexable a) (List a)
-  (nth (self i)
-    (match self
-      ((Empty) (trap "nth: index out of range"))
-      ((Cons h t) (if (= i 0) h (nth t (- i 1)))))))
-
-(impl (Seq a) (List a)
-  (first (self)
-    (match self
-      ((Empty) (trap "first: empty list"))
-      ((Cons h _) h)))
-  (rest (self)
-    (match self
-      ((Empty) Empty)
-      ((Cons _ t) t))))
-
-(impl (Collection a) (List a)
-  (conj (self x) (Cons x self)))
-
-(impl (Traversable a) (List a)
-  (for-each (self f)
-    (match self
-      ((Empty) ())
-      ((Cons h t) (do (f h) (for-each t f))))))
+;; C-3; the library's own `empty` and `cons` are a method and a function).
+;; The protocols a List answers (count first rest nth conj ..) are the library's.
 
 ;; Show of Option and List as Clojure prints them (stdlib design §2.7): a
 ;; present value is its payload's text (a nested Option is as ambiguous as
@@ -330,10 +289,6 @@
   (MapEmpty)
   (MapOf cnt: i64 root: (MNode k v)))
 (defstruct (MRes k v) :private (node: (MNode k v) added: bool))
-
-(defprotocol (Associative m k v)
-  (assoc (self key: k val: v) -> Self)
-  (get (self key: k) -> (Option v)))
 
 (defun map-empty () MapEmpty)
 
@@ -449,27 +404,27 @@
     ((MapOf cnt root)
      (match (mnode-dissoc root 0 (hash key) key)
        (nil MapEmpty)
-       ((some r) (if (= (map-count r) (map-count root)) m (MapOf (- cnt 1) r)))))))
+       ((some r) (if (= (mnode-count r) (mnode-count root)) m (MapOf (- cnt 1) r)))))))
 
-(defun map-count :private (node: (MNode k v)) -> i64
+(defun mnode-count :private (node: (MNode k v)) -> i64
   (match node
     ((MLeaf _ _ _) 1)
     ((MColl _ items) (array-len items))
     ((MBits _ kids)
      (loop ((i 0) (n 0))
-       (if (< i (array-len kids)) (recur (+ i 1) (+ n (map-count (array-get kids i)))) n)))))
+       (if (< i (array-len kids)) (recur (+ i 1) (+ n (mnode-count (array-get kids i)))) n)))))
+
+;; The number of entries, as vec-count is the number of elements.
+(defun map-count (m: (Map k v)) -> i64
+  (match m
+    ((MapEmpty) 0)
+    ((MapOf cnt _) cnt)))
 
 (defun contains? (m: (Map k v) key: k) -> bool (some? (map-get m key)))
 
-(defun mnode-for-each :private (node: (MNode k v) f: (fn ((Pair k v)) unit) :borrow) -> unit
-  (match node
-    ((MLeaf _ k0 v0) (f (Pair k0 v0)))
-    ((MColl _ items) (dotimes (i (array-len items)) (f (array-get items i))))
-    ((MBits _ kids) (dotimes (i (array-len kids)) (mnode-for-each (array-get kids i) f)))))
-
 ;; The walk that can stop (stdlib design §4.2, L4): f is given each key and
 ;; its value, in the trie's order, and says whether to go on; the result is
-;; whether the walk ran to the end. No Pair is built, unlike for-each's.
+;; whether the walk ran to the end. No Pair is built.
 (defun mnode-each :private (node: (MNode k v) f: (fn (k v) bool) :borrow) -> bool
   (match node
     ((MLeaf _ k0 v0) (f k0 v0))
@@ -490,21 +445,8 @@
     ((MapEmpty) true)
     ((MapOf _ root) (mnode-each root f))))
 
-(impl (Associative k v) (Map k v) :where ((Hash k) (Eq k))
-  (assoc (self key val) (map-assoc self key val))
-  (get (self key) (map-get self key)))
-
-(impl Countable (Map k v)
-  (count (self) (match self ((MapEmpty) 0) ((MapOf cnt _) cnt))))
-
-(impl (Traversable (Pair k v)) (Map k v)
-  (for-each (self f)
-    (match self
-      ((MapEmpty) ())
-      ((MapOf _ root) (mnode-for-each root f)))))
-
 ;; In-place updates through & (syntax §3.13).
-(defun map-put! (&m key val) (set! m (assoc @m key val)))
+(defun map-put! (&m key val) (set! m (map-assoc @m key val)))
 (defun map-del! (&m key) (set! m (dissoc @m key)))
 
 ;; Set: the keys of a Map.
@@ -514,14 +456,8 @@
 (defun set-contains? (s: (Set k) x: k) -> bool (contains? (. s m) x))
 (defun disj (s: (Set k) x: k) -> (Set k) (Set (dissoc (. s m) x)))
 
-(impl (Collection k) (Set k) :where ((Hash k) (Eq k))
-  (conj (self x) (Set (assoc (. self m) x true))))
-
-(impl Countable (Set k)
-  (count (self) (count (. self m))))
-
-(impl (Traversable k) (Set k)
-  (for-each (self f) (for-each (. self m) (fn (e) (f (. e fst))))))
+;; The number of elements.
+(defun set-count (s: (Set k)) -> i64 (map-count (. s m)))
 
 ;; The elements of a Set, as map-each walks a Map: f says whether to go on.
 ;; The call is bound before it is returned: a closure given to a call in tail
@@ -530,22 +466,19 @@
   (let ((r (map-each (. s m) (fn (x y) (f x))))) r))
 
 ;; Strings
-(impl Countable str
-  (count (self) (str-len self)))
-
 (defun length (s: str) -> i64 (str-len s))
 
 ;; Building and characters (M5): str-join concatenates a vector of
 ;; strings in one allocation; str-chars decodes the UTF-8 bytes into
 ;; chars; char->str encodes one char.
 (defun str-join (parts: (Vec str)) -> str
-  (let ((n (count parts))
+  (let ((n (vec-count parts))
         (total (loop ((i 0) (t 0))
-                 (if (< i n) (recur (+ i 1) (+ t (str-len (nth parts i)))) t)))
+                 (if (< i n) (recur (+ i 1) (+ t (str-len (vec-nth parts i)))) t)))
         (c (cell (array total 0i8))))
     (loop ((i 0) (pos 0))
       (if (< i n)
-          (let ((bs (str-bytes (nth parts i))))
+          (let ((bs (str-bytes (vec-nth parts i))))
             (dotimes (j (array-len bs)) (array-set! &c (+ pos j) (array-get bs j)))
             (recur (+ i 1) (+ pos (array-len bs))))
           ()))
@@ -574,7 +507,7 @@
       (if (< i n)
           (let ((b (zext i32 (array-get bs i)))
                 (len (utf8-len b)))
-            (recur (+ i len) (conj acc (i32->char (utf8-code bs i b len)))))
+            (recur (+ i len) (vec-conj acc (i32->char (utf8-code bs i b len)))))
           acc))))
 
 (defun char->str (c: char) -> str
@@ -589,55 +522,11 @@
                   (array-push (array-push (array 1 (trunc i8 (bit-or 224i32 (shr code 12i32)))) (cont 6i32)) (cont 0i32))
                   (array-push (array-push (array-push (array 1 (trunc i8 (bit-or 240i32 (shr code 18i32)))) (cont 12i32)) (cont 6i32)) (cont 0i32))))))))
 
-;; Iterators
-(defstruct (VecIter a) (vec: (Vec a) pos: (Cell i64)))
-
-(defun iter (v: (Vec a)) -> (VecIter a) (VecIter v (cell 0)))
-
-(impl (Iter a) (VecIter a)
-  (next (self)
-    (let ((i @(. self pos)))
-      (if (< i (count (. self vec)))
-          (do (set! (. self pos) (+ i 1))
-              (some (nth (. self vec) i)))
-          nil))))
-
-(defstruct (FilterIter i e) (inner: i pred: (fn (e) bool)))
-
-(defun filter-iter (it: i p: (fn (e) bool)) :where ((Iter i e)) -> (FilterIter i e)
-  (FilterIter it p))
-
-(impl (Iter e) (FilterIter i e) :where ((Iter i e))
-  (next (self)
-    (loop ()
-      (match (next (. self inner))
-        (nil nil)
-        ((some x) (if ((. self pred) x) (some x) (recur)))))))
-
-(defun collect (it)
-  (loop ((acc (vec-empty)))
-    (match (next it)
-      (nil acc)
-      ((some x) (recur (conj acc x))))))
-
-;; Sequences of numbers and whole-vector operations
+;; Numbers
 (defun even? (n: i64) -> bool (= (rem n 2) 0))
 
-(defun range-between (a: i64 b: i64) -> (Vec i64)
-  (loop ((i a) (acc (vec-empty)))
-    (if (< i b) (recur (+ i 1) (vec-conj acc i)) acc)))
-
-;; (range n) is (range 0 n); (range a b) is the prelude macro's rewrite
-;; to range-between (syntax §4.4, §4.5).
-(defun range (n: i64) -> (Vec i64) (range-between 0 n))
-
-(defun map (f v: (Vec a))
-  (let ((n (vec-count v)))
-    (loop ((i 0) (acc (vec-empty)))
-      (if (< i n) (recur (+ i 1) (vec-conj acc (f (vec-nth v i)))) acc))))
-
 ;; In-place updates through & (syntax §3.13): append is push!.
-(defun push! (&v x) (set! v (conj @v x)))
+(defun push! (&v x) (set! v (vec-conj @v x)))
 (defun append (&v x) (push! &v x))
 
 ;; Threads and tasks (syntax §3.12, §3.14)

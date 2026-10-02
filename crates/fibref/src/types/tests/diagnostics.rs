@@ -4,7 +4,7 @@
 
 use crate::types::ErrorKind as K;
 
-use super::{fails, ok};
+use super::{fails, fails_lib, ok};
 
 /// The message of a program that must fail with a mismatch.
 fn unify(src: &str, text: &str) {
@@ -79,16 +79,16 @@ fn a_bool_test_and_a_test_that_becomes_a_bool_are_accepted() {
 
 #[test]
 fn a_library_functions_arity_error_names_the_stand_in_for_the_arity_written() {
-    // The prelude's `get` and `nth` are methods, its `range` a function.
+    // `get` and `nth` are methods of the library's protocols, `range` its function.
     let get = "(defun main () -> i64 (get (map-empty) 1 0))";
-    let e = fails(get, K::Other, "get takes 2 argument(s), got 3; use get-or");
+    let e = fails_lib(get, K::Other, "get takes 2 argument(s), got 3; use get-or");
     assert_eq!(e.message, "get takes 2 argument(s), got 3; use get-or");
-    fails(
+    fails_lib(
         "(defun main () -> i64 (nth [1 2] 1 0))",
         K::Other,
         "nth takes 2 argument(s), got 3; use nth-or",
     );
-    fails(
+    fails_lib(
         "(defun main () -> i64 (range 0 10 2))",
         K::Other,
         "range takes 1 argument(s), got 3; use range-by",
@@ -98,13 +98,13 @@ fn a_library_functions_arity_error_names_the_stand_in_for_the_arity_written() {
 #[test]
 fn the_hint_is_for_the_arity_of_the_stand_in_and_no_other() {
     // Too few, and one too many of another count: the plain error.
-    let e = fails(
+    let e = fails_lib(
         "(defun main () -> i64 (get (map-empty)))",
         K::Other,
         "get takes 2 argument(s), got 1",
     );
     assert_eq!(e.message, "get takes 2 argument(s), got 1");
-    let e = fails(
+    let e = fails_lib(
         "(defun main () -> i64 (nth [1 2] 1 0 0))",
         K::Other,
         "nth takes 2 argument(s), got 4",

@@ -1,7 +1,7 @@
 //! The implicit modules (spec/syntax.md §5, stdlib design §6.2): modules
 //! that every module of a program that is not the library's own sees
 //! without a `:use`, as it sees the prelude. The list is
-//! `modules::IMPLICIT_LIB`, empty until the library is complete, so these
+//! `modules::IMPLICIT_LIB`, the four facades of the library since the flip, so these
 //! tests give the loader a list of their own (`try_load_with`) and
 //! run the whole front end and the interpreter over a few files in a
 //! scratch directory.

@@ -1,7 +1,7 @@
 //! Cases 01–10 of `cases/ownership`: the decisions types §7 states for
 //! each, and the count traces of §6.3 and §6.6 where there is one.
 
-use super::super::program::{Because, BindKind, BodyKey, OwnedWhy, ParamKind, Pass, Tail};
+use super::super::program::{Because, BindKind, OwnedWhy, ParamKind, Pass, Tail};
 use super::*;
 
 fn owned(p: &ParamOwn) -> Vec<OwnedWhy> {
@@ -15,45 +15,26 @@ fn has(ops: &[String], op: &str) -> bool {
     ops.iter().any(|o| o == op)
 }
 
-/// §6.3: `first`'s body returns `Derived(self)` → retained (the
-/// prelude's `impl (Seq a) (List a)`; its other clause is a `trap`, a
-/// call and so `Owned`, so the retain is the join's, on the `h` branch).
+/// §6.3 after the flip: `first` is the library's and answers an
+/// `(Option e)`, so `head` matches it. The element it returns is memory
+/// the list owns: `head` retains it at the join of the match's branches
+/// (the `some` clause returns the bound `x`, the other traps) and releases
+/// the `Option` temporary at its exit, so the caller's binding and the list
+/// each hold a count. `xs` is borrowed, and the call that reads it is not in
+/// tail position (its result is matched), so it passes the borrow on.
 #[test]
 fn case_01_first_retains_the_part_it_returns() {
     let c = case("01");
-    let g = &c.typed.globals;
-    let key = c
-        .owned
-        .order
-        .iter()
-        .find(|k| match k {
-            BodyKey::Method(i, m) => {
-                let inst = &g.instances[*i];
-                let md = &g.proto(inst.proto).methods[inst.methods[*m].index];
-                g.proto(inst.proto).name == "Seq"
-                    && md.name == "first"
-                    && crate::types::display::Printer::new(g)
-                        .ty(&inst.head)
-                        .starts_with("(List")
-            }
-            _ => false,
-        })
-        .expect("List's first");
-    let b = &c.owned.bodies[key];
-    let retains: usize = b
-        .exprs
-        .values()
-        .flat_map(|o| &o.after)
-        .filter(|o| matches!(o.why, Why::Return | Why::Join) && o.kind == OpKind::Retain)
-        .count();
-    assert_eq!(retains, 1);
-    // head's (first xs) is a tail call whose borrowed argument emits nothing.
     let (_, first) = call(&c, "head", "first");
     assert_eq!(
         (first.tail, first.args.clone()),
-        (Tail::TailCall, vec![Pass::Borrow])
+        (Tail::NotInTail, vec![Pass::Borrow])
     );
     assert_eq!(param(&c, "head", "xs").kind, ParamKind::Borrowed);
+    assert_eq!(
+        ops(&c, "head"),
+        vec!["retain x (join)", "release (first) (exit)"]
+    );
     // main's h owns one count (a call result, never scope-local).
     for b in ["l", "h"] {
         assert_eq!(binding(&c, "main", b).kind, BindKind::Owns);
@@ -198,7 +179,7 @@ fn case_07_accumulator_is_owned_and_the_self_call_is_a_tail_call() {
 #[test]
 fn case_08_stack_closure_capturing_the_private_cell() {
     let c = case("08");
-    let (_, fe) = call(&c, "dup-all", "for-each");
+    let (_, fe) = call(&c, "dup-all", "run!");
     assert_eq!(fe.tail, Tail::Ordinary(Because::FrameOwned { arg: 0 }));
     assert_eq!(fe.args, vec![Pass::Borrow, Pass::Borrow]);
     let cl = closures(&c, "dup-all");
@@ -212,7 +193,7 @@ fn case_08_stack_closure_capturing_the_private_cell() {
         .into_iter()
         .filter(|o| o.ends_with("(step)"))
         .collect();
-    assert_eq!(steps, vec!["end-stack fn (step)", "release @ (step)"]);
+    assert_eq!(steps, vec!["release @ (step)", "end-stack fn (step)"]);
     let (_, d) = call(&c, "main", "dup-all");
     assert_eq!(
         (d.args.clone(), d.write_backs.len()),
@@ -227,19 +208,20 @@ fn case_08_stack_closure_capturing_the_private_cell() {
     assert!(has(&main_ops, "release @ (step)"));
 }
 
-/// `iter` stores `v` (E2, retain at the call); `evens`'s tail call to
-/// `filter-iter` moves the iterator; `v`'s `let` releases it.
+/// `filter` stores `v` in the recipe it returns (the parameter escapes,
+/// and is borrowed from `evens`'s caller); `evens`'s call to `filter` is a
+/// tail call that moves the predicate and passes `v` on as a borrow, the
+/// callee taking its own count; `v`'s `let` releases it.
 #[test]
 fn case_09_iterator_retains_its_vector() {
     let c = case("09");
     let v = param(&c, "evens", "v");
     assert!(v.escapes);
     assert_eq!(v.kind, ParamKind::Borrowed);
-    assert_eq!(call(&c, "evens", "iter").1.args, vec![Pass::Retain]);
-    let (_, fi) = call(&c, "evens", "filter-iter");
+    let (_, fi) = call(&c, "evens", "filter");
     assert_eq!(
         (fi.tail, fi.args.clone()),
-        (Tail::TailCall, vec![Pass::Move, Pass::Move])
+        (Tail::TailCall, vec![Pass::Move, Pass::Borrow])
     );
     assert!(has(&ops(&c, "main"), "release v (exit)"));
 }

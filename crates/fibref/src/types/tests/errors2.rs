@@ -129,7 +129,7 @@ fn dyn_requires_an_object_type() {
 #[test]
 fn constant_is_not_a_function() {
     fails(
-        "(defun main () -> i64 (count (Empty)))",
+        "(defun main () -> i64 (vec-count (Empty)))",
         K::ConstantCalled,
         "Empty is a constant, not a function; write Empty",
     );
@@ -189,7 +189,7 @@ fn def_has_an_unresolved_type() {
         crate::types::display::Printer::new(&p.globals).ty(t),
         "(fn :send (i64) i64)"
     );
-    ok("(def e: (Vec i64) []) (defun main () -> i64 (count e))");
+    ok("(def e: (Vec i64) []) (defun main () -> i64 (vec-count e))");
 }
 
 #[test]
@@ -204,13 +204,13 @@ fn def_initialiser_is_not_a_constant_expression() {
         K::DefNotConstant,
         "def f: initialiser is not a constant expression",
     );
-    ok("(def primes [2 3 5]) (defun main () -> i64 (nth primes 0))");
+    ok("(def primes [2 3 5]) (defun main () -> i64 (vec-nth primes 0))");
 }
 
 #[test]
 fn def_and_defun_depend_on_each_other() {
     fails(
-        "(def t [f]) (defun f () (count t)) (defun main () -> i64 (f))",
+        "(def t [f]) (defun f () (vec-count t)) (defun main () -> i64 (f))",
         K::DefCycle,
         "def t and defun f depend on each other",
     );

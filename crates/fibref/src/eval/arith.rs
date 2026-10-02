@@ -142,7 +142,9 @@ fn compare(name: &str, o: std::cmp::Ordering) -> R<Val> {
 /// trap; a signed result that does not fit `w` traps (`+ - * /`, and
 /// `rem` of the minimum by -1, as Rust's does); the shift amount is
 /// taken modulo the width. `quot` is the division the builtin `/` was
-/// (stdlib §7 L30), and its traps keep the texts that name `/`.
+/// (stdlib §7 L30: `/` is no longer a method of `Num`), and its traps
+/// keep the texts that name `/`, which the headers of cases 102 and 103
+/// pin.
 fn int_binary(name: &str, a: i64, b: i64, w: Scalar) -> R<Val> {
     let name = if name == "quot" { "/" } else { name };
     let mask = u64::MAX >> (64 - bits(w));
@@ -202,7 +204,7 @@ fn float_binary(name: &str, a: f64, b: f64, w: Scalar) -> R<Val> {
         "+" => a + b,
         "-" => a - b,
         "*" => a * b,
-        "/" | "fdiv" => a / b,
+        "fdiv" => a / b,
         "quot" => round(a / b, w).trunc(),
         "rem" => a % b,
         _ => {
@@ -431,7 +433,7 @@ mod tests {
     fn integer_quot_is_the_division_it_replaces() {
         use Scalar::{I64, I8};
         for (a, b) in [(7, 2), (-7, 2), (7, -2), (-7, -2), (0, 5), (5, 7)] {
-            assert_eq!(int_binary("quot", a, b, I64), int_binary("/", a, b, I64));
+            assert_eq!(int_binary("quot", a, b, I64), int(a / b, I64));
         }
         assert_eq!(int_binary("quot", 7, -2, I64), int(-3, I64));
         assert_eq!(int_binary("quot", -7, 2, I8), int(-3, I8));

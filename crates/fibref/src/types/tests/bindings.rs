@@ -8,7 +8,7 @@ use super::{binding_type, fails, ok};
 
 #[test]
 fn an_annotated_let_binding_has_its_annotation() {
-    let p = ok("(defun main () -> i64 (let ((v: (Vec str) []) (n: i64 (count v))) n))");
+    let p = ok("(defun main () -> i64 (let ((v: (Vec str) []) (n: i64 (vec-count v))) n))");
     assert_eq!(binding_type(&p, "v"), "(Vec str)");
     assert_eq!(binding_type(&p, "n"), "i64");
     fails(
@@ -22,7 +22,7 @@ fn an_annotated_let_binding_has_its_annotation() {
 fn an_annotated_loop_variable_has_its_annotation() {
     let p = ok("(defun main () -> i64
                   (loop ((i: i64 0) (acc: (Vec i8) []))
-                    (if (< i 2) (recur (+ i 1) acc) (count acc))))");
+                    (if (< i 2) (recur (+ i 1) acc) (vec-count acc))))");
     assert_eq!(binding_type(&p, "acc"), "(Vec i8)");
     fails(
         "(defun main () -> i64 (loop ((i: str 0)) 0))",
@@ -33,7 +33,7 @@ fn an_annotated_loop_variable_has_its_annotation() {
 
 #[test]
 fn an_annotated_plet_binding_has_its_annotation() {
-    let p = ok("(defun main () -> i64 (plet ((a: (Vec i16) []) (b 1)) (+ b (count a))))");
+    let p = ok("(defun main () -> i64 (plet ((a: (Vec i16) []) (b 1)) (+ b (vec-count a))))");
     assert_eq!(binding_type(&p, "a"), "(Vec i16)");
 }
 

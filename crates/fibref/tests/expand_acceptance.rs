@@ -296,7 +296,7 @@ fn case_10_plet_spawns_and_joins_and_pmap_stays_a_call() {
           (let ((#a.1 (fib.prelude/spawn (fn () (atom (fib.prelude/vec-empty)))))) \
           (let ((a (fib.prelude/join #a.1))) \
           (pmap (fn (i) (let ((snapshot (deref a))) (swap! a (fn (c) (conj c i))) (count snapshot))) \
-          (range 1000)) \
+          (vec (range 1000))) \
           (count (deref a)))))"]
     );
     let h = heads(&out);
@@ -312,7 +312,7 @@ fn case_13_pmap_is_a_call_over_a_closure_capturing_the_cell() {
     assert_eq!(
         printed(&out),
         ["(defun main () -> i64 (let ((n (cell 0))) \
-          (pmap (fn (i) (set! n (+ (deref n) i))) (range 10)) (deref n)))"]
+          (pmap (fn (i) (set! n (+ (deref n) i))) (vec (range 10))) (deref n)))"]
     );
 }
 

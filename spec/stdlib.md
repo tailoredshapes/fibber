@@ -216,9 +216,8 @@ Rules:
      pattern variables, with quoted data skipped), (2) the module does not define it at top level, (3) no non-library module that this one uses, re-exports
      included, exports it, and (4) the module sees the implicit module that holds it: `fib.seq`, or `fib.coll` for `vec`, `set` and `into`. A head written
      `fib.seq/map` or `fib.coll/vec` is the library's whatever the module defines (case 833). Modules whose `ns` starts with `fib.` and modules that do not
-     see `fib.seq` are not rewritten. A `:require` alias (`s/map`) is not recognised. Until the implicit list is filled (`IMPLICIT_LIB`, §6.2) rule (3) cannot be
-     run end to end, because two `:use`d modules that both export `map` are already an E12 error: Rust unit tests and the dump comparison cover it, and a
-     case belongs to the flip.
+     see `fib.seq` are not rewritten. A `:require` alias (`s/map`) is not recognised. With the implicit list filled (`IMPLICIT_LIB`, §6.2, the flip) rule (3) runs end to end: a program that `:use`s a module that exports `first` or `map`
+     calls its own (case 872), and a program's own `map` is not an error (case 871).
    * **The dump** of a program that sees `fib.seq` shows the recipes and the gensyms `#fuse.N`; its format is unchanged (bootstrap §2, §5.3).
 
    **Not adopted.** The second revision's affine recipes (a value consumed once, a compile error on the second use) and the first
@@ -934,11 +933,12 @@ integers (102, 103, 190), the generator and two unit tests write `quot` (§8.3).
 values (a `Long` when the denominator is 1), which §5 T5 forbids: `(/ 6 3)` is a `(Ratio i64)` that prints `2`, and the predicates
 look at the value, so `(ratio? (/ 6 3))` is `false` and `(integer? (/ 6 3))` `true`, as Clojure's are (A13 div: `[true false]`).
 Until L30 lands the builtin `/` truncates (`(/ 7 2)` is `3`, [R] A11 k9; §5 S17), and a generic `(/ x (+ x x))` at `i64` is `0`
-([R] A13 quot), which is the inconsistency the `Div` protocol removes. L30 has landed in two of its three steps (§7.5): `quot` and `Float.fdiv`
-(commit `3d63d00`) and the library's `Div` and `(Ratio t)` (`fib.core.num`, commit `4485838`, with the instances of §2.3 and `numerator`, `denominator`, and
-the Ratio's `Show`, `ToStr` and `Debug` text `7/2`, `2` for a denominator of 1); in a module that `:use`s `fib.core`, `/` is `Div`'s method. The third step, `/`
-leaving `Num` and the builtin, is the flip's: until then `Num` has both `/` and `quot`, and the library writes `quot` and never `/` on integers (plan PC-14).
-Its `Num` instance for `Ratio` defines `/` as the ratio division, one line the flip deletes.
+([R] A13 quot), which is the inconsistency the `Div` protocol removes. L30 has landed (§7.5): `quot` and `Float.fdiv`
+(commit `3d63d00`), the library's `Div` and `(Ratio t)` (`fib.core.num`, commit `4485838`, with the instances of §2.3 and `numerator`, `denominator`, and
+the Ratio's `Show`, `ToStr` and `Debug` text `7/2`, `2` for a denominator of 1), and, with the flip, the third step: `/` left `Num` and the builtin (the checker's table, the
+interpreter and `fibc`'s lowering) and the `Num` instance of `Ratio` lost its `/`, so `/` is `Div`'s method in every module (case 873: a function whose bound is `Num t` and whose body
+divides two `t`s takes `Div`'s `/`, the checker adds the `Div` bound, and a call at `i64` is rejected because the quotient is a ratio; case 877: the same function at floats). The library writes
+`quot` and never `/` on integers (plan PC-14).
 
 **`(Ratio t)`** (tranche 1) is a struct of a numerator and a denominator of one integer width, normalised (lowest terms, a
 positive denominator), with `Num`, `Div`, `Eq`, `Ord`, `Hash` and `Show`; `numerator`, `denominator`, `ratio?`, `rationalize`
@@ -947,7 +947,9 @@ reader literal `7/2` is E14 (a); a mixed operation adopts (an integer literal be
 extended to `Ratio`) or promotes (`i64 < (Ratio i64) < f64` in the lattice of L26 b, so `(+ r 1.5)` is a float, as Clojure's is);
 `compare` and `=` over two ratios are by value (`(< 1/3 1/2)`, `(= (/ 2 4) (/ 1 2))` and equal hashes: `[true true true]`, A13 div).
 Its components are 64-bit (the operand width) and **trap on overflow** (`(+ 1/3037000500 1/3037000501)` is `trap: integer overflow
-in * at i64`, [R] A12 ratio), where Clojure's `BigInteger` ratio is exact: `(Ratio BigInt)` is the exact form, tranche 5 with
+in * at i64`, [R] A12 ratio), only when a component of the *normalised* ratio, or an intermediate product, does not fit: a ratio is reduced by the gcd before its
+sign is fixed, so `(/ -128i8 -2i8)` is `64/1` at `i8` (cases 093 to 098) while `(/ -128i8 -1i8)` is `128/1` and traps `integer overflow in / at i8`
+(the exact division of the numerator by the common divisor), where Clojure's `BigInteger` ratio is exact: `(Ratio BigInt)` is the exact form, tranche 5 with
 `BigInt`, and Clojure's auto-promotion to it is the one value-dependent result type that stays a deviation (§5 T5).
 
 Literals have one type, so `inc`, `dec`,
@@ -1072,8 +1074,8 @@ A recoverable failure is a value where Clojure has no counterpart for a typed re
 is the only abort today (types §2.11, **Decided** 2026-09-28), and the rule says to follow Clojure unless memory safety
 forbids. The two halves:
 
-**Values.** `(Result a e)`, with `Ok` and `Err`, is in the prelude (it is `compiler/util/result.fib` today, which is deleted in the
-commit that adds `Result`, §6.2), and `(try-let ((x e) (y f)) body)` binds each `Ok` payload in turn and yields the first `Err` as
+**Values.** `(Result a e)`, with `Ok` and `Err`, is in the prelude (`compiler/util/result.fib` was deleted when
+the compiler's modules were ported, M2, §8.3), and `(try-let ((x e) (y f)) body)` binds each `Ok` payload in turn and yields the first `Err` as
 the value of the whole expression. This is Rust's `?` ergonomics where Clojure has no typed counterpart. **It is not
 `try!`**: the language has no early return, so a macro that leaves the enclosing function cannot be written
 (`(return (Err e))` is `unbound name return`, [R] A10 try), and `try-let` is a block macro over nested `match` that runs
@@ -1256,7 +1258,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `+` | adapt | `(+ a b ..) (+)` | `t t -> t \| Num t; -> t \| Num t` | 1 | the builtin is binary on one type, overflow traps (Clojure's `+` throws on a `long` overflow too); a macro folds more arguments; `(+)` is `0`, an `i64` until L19 (tranche 2) lets the literal adopt its context's numeric type (**landed**, R6a: `(+ a b c)` is the left fold, so the first sum that overflows traps even if a later argument would cancel it); a variable of another numeric type promotes at the operator (§2.8, L26 b, tranche 4) |
 | `-` | adapt | `(- a b ..) (- a)` | `t t -> t \| Num t; t -> t \| Num t` | 1 | binary builtin, `neg` for one argument; macro folds; `(-)` is an arity error, as Clojure's |
 | `*` | adapt | `(* a b ..) (*)` | `t t -> t \| Num t; -> t \| Num t` | 1 | as `+`; `(*)` is `1`; `product` for a collection |
-| `/` | adapt | `(/ a b)` | `t t -> r \| Div t r` | 1 | **exact on two integers: a `(Ratio t)`** (Q40, **Decided**, owner, 2026-10-01): `(/ 7 2)` is `7/2` and `(/ 6 3)` prints `2`; IEEE on floats; a ratio over ratios; the method of `Div`, whose instance fixes the result type, so generic code has one answer ([R] A13 div, §2.8); `quot` truncates; a literal operand adopts the other's type (L19); `Div` and `(Ratio t)` are the library's (`fib.core.num`, landed) and `/` is `Div`'s method in a module that `:use`s `fib.core`, but the builtin `/` still truncates until the flip removes it from `Num` (L30's last step, §7.5; §5 S17) |
+| `/` | adapt | `(/ a b)` | `t t -> r \| Div t r` | 1 | **exact on two integers: a `(Ratio t)`** (Q40, **Decided**, owner, 2026-10-01): `(/ 7 2)` is `7/2` and `(/ 6 3)` prints `2`; IEEE on floats; a ratio over ratios; the method of `Div`, whose instance fixes the result type, so generic code has one answer ([R] A13 div, §2.8); `quot` truncates; a literal operand adopts the other's type (L19); `Div` and `(Ratio t)` are the library's (`fib.core.num`, landed) and `/` is `Div`'s method in every module: the builtin `/` left `Num` with the flip (L30's last step, §7.5), so `(/ 7 2)` is the ratio `7/2` and integer division is `quot` |
 | `quot` | adapt | `(quot a b)` | `t t -> t \| Num t` | 1 | the builtin truncating division (the integer `/` of `36ed472`, LLVM's `sdiv`): toward zero, traps on zero (`integer / by zero`, the text keeps naming `/`); **landed** (R3, commit `3d63d00`). On floats the quotient rounded to the width and then toward zero, libm's `trunc` of the `fdiv`, `(quot 7.5 2.0)` is `3.0` as Clojure's ([R] A13 div); a zero divisor gives an infinity or a NaN and does not trap (**Proposed**, §2.8, types §2.12; `cases/ownership` 206 to 209). Cases 102, 103 and 190 and the generator write `quot`; the compiler's one integer `/` (`compiler/syntax/number.fib`) is ported at the flip (§8.3) |
 | `rem` | keep | `(rem a b)` | `t t -> t \| Num t` | 1 | builtin; the sign of the dividend; on floats `fmod` (types §2.12): `(rem 7.5 2.0)` is `1.5` ([R] A13 div) |
 | `<` | adapt | `(< a b ..)` | `t t -> bool \| Ord t` | 1 | builtin `Ord` method on any ordered type; a macro chains more arguments ; mixed numeric operands: literals adopt (L19), variables promote at the operator (L26 b) |
@@ -1483,7 +1485,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `distinct?` | adapt | `(distinct? x y ..)` | macro `a a .. -> bool \| Hash a, Eq a` | 3 | Clojure's varargs: a macro nests, and `(distinct? x)` is `true` as Clojure's; the collection form is `(apply distinct? c)` (§4.2 `apply`), so a one-argument call keeps Clojure's meaning |
 | `defn` | adapt | `(defn name doc? [x: T ..] -> R body)` | macro | 1 | a Rust macro over `defun` (§6.3; **landed** for one clause, R6b, `605a26e`: bracket parameters, a docstring that is dropped, `defn-` is `:private`; a `&` in the vector is the error `rest parameters need L2` and a clause list `several arities need L1`, syntax §4.4, cases 780 and 781); multi-arity in Clojure's shape `(defn name ([x: T] -> R body) ([x: T y: T] -> R body))`, each clause with its own result type, by §7 L1 (the parameter vector tells a clause from a single-arity body, so no `:arity` marker is needed, [R] A11 e10: `defn`, `let*`, `loop*` with `[a 1 b 2]` as macros over `defun`/`let`/`loop` run, 13 under both tools); `defun` stays |
 | `36rZZ 2r1010` | keep | `2r1010 36rZZ` | reader | 3 | radix literals (E14); `0x1F` and `0b1010` stay |
-| `Result` (new) | new | `(defenum (Result a e) (Ok v: a) (Err e: e))` | type | 1 | the prelude gets the `Result` of `compiler/util/result.fib`, which is deleted in the same commit (two types of one name cannot exchange values, §6.2); `(try-let ..)` threads `Err` |
+| `Result` (new) | new | `(defenum (Result a e) (Ok v: a) (Err e: e))` | type | 1 | the prelude has the `Result` of `compiler/util/result.fib`, which M2 deleted (two types of one name cannot exchange values, §6.2); `(try-let ..)` threads `Err` |
 | `unwrap` (new) | new | `(unwrap o)` | `(Option a) -> a` | 1 | traps `unwrap: nil` |
 | `unwrap-or` (new) | new | `(unwrap-or o d)` | `(Option a) a -> a` | 1 | in the prelude today |
 | `map-opt` (new) | new | `(map-opt f o)` | `(fn (a) b) (Option a) -> (Option b)` | 1 | function first, `Option` last (§3 N11) |
@@ -2164,7 +2166,7 @@ filled with `nil`, §5 T1); **M4**, the UTF-16 unit (Clojure's counts run and au
 | S14 | `(->> c (map f) (filter p) (reduce + 0))` allocates nothing per element | the fusion rewrite is an expander pass that does not exist: today the chain is written with the recipes by hand, or fused by the `fuse` macros of the prototype ([R] A13 lz1, lz2) | E16 |
 | S15 | `(with-redefs [f g] ..)` on any function | no program of the review exercises it; `f` is a direct call today | L29 |
 | S16 | `(future-cancel f)` interrupts a blocked thread | a task's trap ends the process (A11 t40, e9), so a blocking call cannot answer the interrupt with an exception; the flag is polled with `(cancelled?)` | L28 step 2 (a task's trap isolated by `join`) |
-| S17 | `(/ 7 2)` is `7/2` | the builtin `/` truncates, `3` ([R] A11 k9), and a generic `(/ x (+ x x))` at `i64` is `0` ([R] A13 quot); `(Ratio t)` and the `Div` protocol run as library code ([R] A13 div) | L30 |
+| S17 | `(/ 7 2)` is `7/2` | the builtin `/` truncates, `3` ([R] A11 k9), and a generic `(/ x (+ x x))` at `i64` is `0` ([R] A13 quot); `(Ratio t)` and the `Div` protocol run as library code ([R] A13 div). **Closed by the flip**: `/` is `Div`'s, `(/ 7 2)` is `7/2` (case 877) | L30 |
 | S18 | `(str 1e21)` is `1.0E21`, `(str (/ 1.0 0.0))` `Infinity` | `1000000000000000000000.0` and `inf` ([R] A13 fl); the library function of A13 fltfmt gives Clojure's text over today's `show` | C12 |
 
 ### 5.6 Sharp edges of Clojure that this page replicates
@@ -2194,7 +2196,7 @@ is an optimisation under the syntactic rule of §2.1 rule 2, which changes no ob
 **Updated by tranche 0 (E7, E12, commit `8adeaa6`) and R1 (commit `5ea989f`):** modules are found under the main file's directory, then each `-I DIR`, each
 directory of `FIB_LIB`, then the roots embedded in the binary (`crates/fibref/src/roots.rs`, cases `cases/modules` 013 to 016); `(:export-from ..)` exists; two
 `:use`d modules that export one name make a bare reference an error, as syntax §5 says (cases 009 to 011; E12 is closed and the paragraph below is the state of
-`36ed472`); the loader reads the **implicit modules** (`modules::IMPLICIT_LIB`, **empty until the flip**) first and lets every module that is not the library's own see
+`36ed472`); the loader reads the **implicit modules** (`modules::IMPLICIT_LIB`, **`fib.core fib.seq fib.coll fib.print` since the flip**, M) first and lets every module that is not the library's own see
 them as it sees the prelude (`fibref expand` omits them like the prelude, `--implicit` and `--implicit-lib` print or replace them, bootstrap §5.1). Own definitions
 come first, then `:use`s, then the implicit layer, then the prelude and the builtins; `fib.x/name` resolves from any module that sees `fib.x`; two implicit modules
 that export one name make a bare use `x is exported by both A and B; write A/x or B/x`, and the gate `lib_disjoint` fails the build before that can happen.
@@ -2254,11 +2256,10 @@ is `:require`d with an alias, so `str/join` never meets the task-wait builtin `j
 found under the main file's directory, then under each `-I DIR` (also `FIB_LIB`), then under the
 roots embedded in the binary, as `include_str!` embeds the prelude today (§7 E7); a facade module
 re-exports with `(:export-from m ..)`. The compiler's own modules (`compiler/`) keep working
-unchanged, because a local definition shadows a library name; the one exception is `compiler/util/result.fib`:
+unchanged, because a local definition shadows a library name; the one exception was `compiler/util/result.fib`:
 a library `Result` and that file's `Result` are two types of one name, so a module that `:use`s it cannot
-exchange values with one that does not, and the file is deleted in the commit that adds `Result` to the library
-(three public names of `compiler/` collide with the library's unqualified names today: `Result`, `entry`, and the
-private `digit-value`; with `Entry` and `entry` gone only `Result` remains).
+exchange values with one that does not, and M2 deleted the file and removed `util.result` from the `:use` of
+the 32 modules that named it (the prelude's `Result` has the same name, variants and fields: `(Ok v)`, `(Err e)`).
 
 ### 6.3 Macros
 
@@ -2325,6 +2326,12 @@ repeats in every program), the one item that touches the dominant cost, which (2
 (4) are hypotheses; (2) and (3) are not needed below about 20,000 library lines, and (4) is needed as soon as a
 typical program instantiates a few hundred library functions.
 
+**Measured at the flip (M1, 2026-10-02; one run each, other jobs on the machine).** `fibc run` of `(defun main () -> i64 0)`: 0.094 to 0.107 s before
+(five runs of the committed binary), 0.113 to 0.125 s after (five runs, the `dev` build): the four implicit facades, thirty files, are read, expanded and checked with every program
+(about 20 ms), and the library's instances are monomorphised only where used. `fibc cases cases/ownership` (240 cases, both tools): 65 s before and 75 s after;
+`fibref cases cases/ownership`: 20 s after. The expansion dump of a program expands the same thirty files first: 23 ms in Rust, 40 to 100 ms in the self-hosted expander, and the byte-for-byte test
+of the expander (`bootstrap_expand`) went from 292 s to 681 s for that reason.
+
 ### 6.5 Names the prelude already uses
 
 | Name | Today | Resolution |
@@ -2334,7 +2341,7 @@ typical program instantiates a few hundred library functions.
 | `empty`, `cons` | the `List` variants | variants became `Empty`, `Cons` (**landed**, R2, commit `5ea989f`, cases `cases/modules` 020 to 024); `empty` is `Emptyable`, `cons` a function (Clojure's names are the functions) |
 | `next` | the `Iter` method | removed with `Iter`; Clojure's `next` is `Seqable` (§2.1 rule 8) |
 | `join` | the task-wait builtin | stays; the string join is `str/join` |
-| `range` | a macro for two arguments and a function for one | one function overloaded by arity (L1), returning `Range` |
+| `range` | a macro for two arguments and a function for one | after the flip: `(range n)` is the library function `fib.seq/range`, returning `Range`, and the macro rewrites `(range a b)` to `(fib.seq/range-by a b 1)`; the three-argument form is spelled `range-by` until arity overloading (tranche 2, L1) makes `range` one function |
 | `map count first rest nth get assoc conj` | exist at narrower types (`map` on `Vec` only; `first`, `rest` on `List`) | widened by `Reducible`, `Seqable` and the protocols of §2.3 |
 | `derive`, `defstruct` | a prelude macro, a core form | `derive` is also Clojure's hierarchy form, told apart by the first argument's kind (§4.2); `defstruct` stays fibber's record form (§4.17) |
 | `println` | the one-`str` function | a macro over `Show` in head position (**landed**, R5); a function generic over `Show` serves value position (`fib.print`, L11), and `fib.prelude/println`, which the macro calls, stays reachable ([R] A6, A10 twin) |
@@ -2413,7 +2420,7 @@ programs that justify each item.
 | L9 | named-field struct patterns `(Name :field p ..)` and `{:keys [a b] :or {a 1}}`, `:strs`, `:syms`: on a struct they bind fields, on a `(Map keyword v)` they bind `(get m :a)` (an `Option`, or `(unwrap-or ..)` for a key with `:or`) | `(match 1 ({:keys [a]} a) (_ 0))` is `braces are not allowed in patterns` (A6) | T3 |
 | L10 | wrapping integer builtins `unchecked-add -subtract -multiply -negate -inc -dec` at the operand's width; `lIR`'s `add sub mul` already carry no overflow flags | `(+ 9223372036854775807 1)` is `trap: integer overflow in + at i64` (A6) | T3 (the multiplicative hash finaliser, generators). **Not T1**: the rotate-and-xor `hash-combine` of tranche 1 needs only `shl shr bit-or bit-xor`, which do not trap ([R] A10 hash) |
 | L11 | exact math as builtins (`sqrt floor ceil rint copysign`); `extern` accepted by `fibref` | `(unsafe (fptosi i64 (sqrt 49.0)))` with `(extern sqrt :private (f64) -> f64)`: `fibc` prints 7, `fibref` says `unsupported: extern sqrt is not available in the reference interpreter` (A6) | T4 |
-| L12 | `Result` in the prelude, and a scope-exit hook (a `Drop`-like protocol) for non-memory cleanup; **not `try!`**: there is no early return, so the threading form is the block macro `try-let` (§2.10), which needs no language change | `Result` is `compiler/util/result.fib` only; `(defmacro try! (r) `(match ,r ((Ok v) v) ((Err e) (return (Err e)))))` is `unbound name return`, and `try-let` runs, 106 under both tools ([R] A10 try) | T1 (`Result`), T2 (`try-let`), T5 (`with-open`, `line-seq`) |
+| L12 | `Result` in the prelude, and a scope-exit hook (a `Drop`-like protocol) for non-memory cleanup; **not `try!`**: there is no early return, so the threading form is the block macro `try-let` (§2.10), which needs no language change | `Result` was `compiler/util/result.fib` only (deleted by M2); `(defmacro try! (r) `(match ,r ((Ok v) v) ((Err e) (return (Err e)))))` is `unbound name return`, and `try-let` runs, 106 under both tools ([R] A10 try) | T1 (`Result`), T2 (`try-let`), T5 (`with-open`, `line-seq`) |
 | L13 | **withdrawn.** The second revision's affine recipes (a recipe consumed once, a second use a compile error, a `FnOnce` closure kind): the owner decided Q34 for Clojure's memoised seqs (§9.1), and the closure kind the check needed is excluded by types §1.4 (**Decided**). The fused loop is E16, an optimisation with no checker rule | A12 aff1, aff2, aff3, q34; A13 ev1, ev2 (the residual claim was wrong by the sequence length) | none |
 | L14 | a keyword that unifies with `(fn (S) T)` elaborates to `(fn (x) (. x k))` when `S` is a struct with that field and to `get` when `S` is a `(Map keyword v)`; `(:k x)` in head position is the same rule; `(:k x d)` supplies a default. L21 generalises it to `Map`, `Set` and `Vec`. The narrow rule needs no choice of call-position semantics; the alternative is a reader form `.name` for `(fn (x) (. x name))` | `(:a {:a 1})` is `cannot unify keyword with (fn (a) b)` (A6, [R] A11 k1); `(map :name ps)`, `(sort-by :age ps)`, `(group-by :dept ps)`, `(filter :active ps)` are the commonest Clojure lines, and the group-by-then-count idiom is 46 tokens against Clojure's 29 without it | T2 |
 | L15 | `def` initialisers: **any expression**, evaluated once before `main` in module order by an init function per module (Clojure evaluates them at load); a top-level `atom` is allowed; **the type of a `def` may not contain a `Cell` or a `Weak`** (not `Send`: a global `Cell` is reachable from every task, §5 M1; so not an `LSeq`, a `Delay` or an `MArray` until the run-once cell of C9, §9.2 Q41); top-level forms that register (`defmethod`, `add-tap`) run in the init | `(def ok: (Set i64) (set [1 3]))` is `def ok: initialiser is not a constant expression`; so are `(def v: i64 (f 2))` and `(def counter: (Atom i64) (atom 0))` ([R] A10 def, A11 t56, n8b), while `(def v: (Vec i64) [1 2 3])` and `(def m: (Map i64 i64) {1 2})` run; `(def c: (Cell i64) (cell 0))` is the same error (n8); `#{1 2}` becomes `(hash-set ..)` with E8 | T2 (`(def stopwords #{"a" "the"})`, `(def table (zipmap ..))`), T4 (`rand`, `atom`s) |
@@ -2535,12 +2542,12 @@ edited the specs only, and the commit messages that say they were carry no weigh
 | L12 `Result`, scope-exit hook | **partly**: `Result` landed; the hook and `try-let` open | `5ea989f` | `cases/stdlib` 142, 143 |
 | L17 `derive Debug`, `ToStr`; derive by default | **partly**: `derive Debug` and `ToStr` landed, the default derive (T2) open | `605a26e` | `cases/stdlib` 810 to 817 |
 | L18 `str-byte-at`, `str-find` | **landed**; `str-find` allocates one `Option` object per call | `3d63d00` | `cases/ownership` 210 to 218 |
-| L30 `/` as `Div`, `quot`, `Float.fdiv` | **2 of 3 steps**: `quot` and `Float.fdiv` landed; `Div` and `(Ratio t)` in the library; `/` leaves `Num` at the flip | `3d63d00`; `4485838` | `cases/ownership` 206 to 209; `cases/stdlib` 010, 059 to 067, 071, 073, 075, 076, 079 |
+| L30 `/` as `Div`, `quot`, `Float.fdiv` | **landed**: `quot` and `Float.fdiv`; `Div` and `(Ratio t)` in the library; `/` left `Num` and the builtin with the flip (M) | `3d63d00`; `4485838` | `cases/ownership` 206 to 209; `cases/stdlib` 010, 059 to 067, 071, 073, 075, 076, 079, 873, 877 |
 | E13 `if-let` takes any pattern | **landed** | `605a26e` | `cases/stdlib` 800 to 802 |
 | D1 diagnostics | **partly**: the condition message and the five arity hints landed; `compose with xf` open (no `Xf`) | `605a26e` | `cases/stdlib` 803 to 808 |
 | E16 the fusion rewrite | **landed** (restricted sets, §2.1) | `605a26e` | `cases/stdlib` 820 to 836 |
 | `@t` of a `Task` is `join` (**Proposed**, types §2.9) | **landed**; the owner's sign-off is not given | `605a26e` | `cases/ownership` 232 to 236; `cases/stdlib` 658 |
-| Implicit modules (§6.2, plan R1) | **landed with an empty list**: `IMPLICIT_LIB` is `&[]` until the flip | `5ea989f` | `crates/fibref/tests/implicit.rs`, `lib_disjoint.rs` |
+| Implicit modules (§6.2, plan R1) | **landed with an empty list** (`5ea989f`); **the list is `fib.core fib.seq fib.coll fib.print` since the flip (M)**, the prelude's protocols are deleted (§8.3 C) | `5ea989f`; the flip | `crates/fibref/tests/implicit.rs`, `lib_disjoint.rs`; `cases/stdlib` 870 to 877 |
 | The judge (plan P0): `covers:` and `open:`, `--only`, `stdlib_table` | **landed**; the check that every row of the tranche is covered is `#[ignore]`d until the tranche's final gate | `5ecab83` | `crates/fibref/tests/stdlib_table.rs` |
 | Wave 1 of the library: numbers and `Ratio`, options, hashing and ordering, sources and consumers, recipes, lazy seqs and adaptors, sorting and grouping, collections, strings, `Pattern`, printing, aliases and the Java-named modules | **landed** under `lib/fib/` | `4485838`, `605a26e` | `cases/stdlib` |
 
@@ -2643,15 +2650,17 @@ method.md applies: nothing is done until a test that can fail says so. A tranche
 | 4 | **strings and numbers.** `fib.string` in full (the `Regex` instance of `Pattern`, case mappings, `replace-with`; the character-offset functions and `str` as a `Reducible char` are tranche 1), `fib.char`, `fib.regex` (non-backtracking core), `fib.math`, `fib.random` (the global generator, L15 init), `fib.walk`, `fib.sys`, the Java-name modules (E15), `fib.io`, `format printf`, `read-string`; **variable promotion (L26 b), which the rule settles (§9.1 Q36); the owner signs the item** | L11, L12, L15 (top-level atoms), E15, L26 (b), C10 for O(1) character offsets | strings against a byte-loop reference over generated UTF-8 (every scalar width, boundaries) and against a character-offset reference; regex against a bounded backtracking reference; math bit for bit between the interpreter and the compiled program on 3000 generated patterns, and against libm in a Rust test (exact functions equal, the others within a stated number of ulps); `Rng` against known first values | 113 |
 | 5 | **the long tail.** dynamic vars and `binding` (L29, C11) with `*out*` and `with-out-str`; metadata (L27); `defmulti` and hierarchies; `locking` (identity-keyed monitors) and a thread-safe `LSeq` (C9); `BigInt`, `BigDecimal`, `(Ratio BigInt)` and their literals; `fib.data` (`Val`, `diff`), `pprint`, `sequence eduction` (after C1), `iteration`, `subseq`, the relational `set/project index join`, `seque`, `add-watch`, `with-redefs`, `file-seq`, `re-matcher`, lazy `pmap`; the backtracking regex fallback; **exceptions (L28), which the rule settles (§9.1 Q35), after the library is viable** | B1, C1, L12, L27, L28, L29, C9, C11, E14 (c) | as above | 81 |
 
-**Status (2026-10-02; the evidence is §7.5).** **Tranche 0 is done except five of the thirty-two macros of E1** (`if-not`, `when-not`, `some`, `{..}`, `#{..}`): E7, B2, B3, E10, E12, H1, C6 and C12 are
+**Status (2026-10-02; the evidence is §7.5 for tranche 0 and the Rust half, and the lines below for the flip).** **Tranche 0 is done except five of the thirty-two macros of E1** (`if-not`, `when-not`, `some`, `{..}`, `#{..}`): E7, B2, B3, E10, E12, H1, C6 and C12 are
 **landed** (`8adeaa6`, `dfdd4ba`), with the disjointness gate of the four implicit modules (`crates/fibref/tests/lib_disjoint.rs`, `5ea989f`) and the harness's `allocs` header; 28 of the 33 macros
 are in the registry (27 added). **The Rust half of tranche 1 is done**: L3 (`Pair`, `Triple`), L12's `Result`, L17's `derive Debug` and `ToStr`, L18, L30's `quot` and `Float.fdiv` (and `Div` and `Ratio` in the library),
 E13, E16 and D1 except its `compose with xf` message, with the macros of R5 to R7 (`str println print prn pr`, the folds, `defn`, `update`, `reduce`, `swap!`) and `@t` as `join` (**Proposed**); the library half of tranche 1
-has its first wave (`4485838`, fifteen packages under `lib/fib/`) and the follow-ups of `605a26e`, and `cases/stdlib` is 505 cases of which 479 pass in the interpreter and 26 are OPEN for items of
-later tranches (§7.5.3). **Tranche 1 is not complete**, and none of the following has happened: the flip (`IMPLICIT_LIB` filled with `fib.core`, `fib.seq`, `fib.coll`, `fib.print` in one commit, the prelude's
-protocols deleted, §8.3 B and C, the cases and `compiler/` ported, `/` removed from `Num` with a case quoting the checker's words for a generic `(/ a b)` under a `Num t` bound, `compiler/util/result.fib` deleted); the final gate
-(`every_row_of_the_tranche_is_covered` un-ignored and `TRANCHE` checked, §8.1 item 1); the mutation reviews of §8.1 item 6 (no `MUT-*` package has started); the generator's forms for the new features
-(R13 and R3 report that `fibgen` does not generate `@t` and generates float `quot` thinly, a planted fault in the model's `floor` being caught once in about 4000 programs; not re-run here). M6 stays
+has its first wave (`4485838`, fifteen packages under `lib/fib/`), the follow-ups of `605a26e`, and the mutation reviews of the fourteen library packages (`8b1e777`). **The flip has happened (M1 and M2, uncommitted when this was written)**: `IMPLICIT_LIB` is `fib.core`, `fib.seq`, `fib.coll`, `fib.print`, the prelude's protocols (`Countable Indexable Seq Collection Traversable Iter Associative`), `iter`, `collect`, `filter-iter`,
+`VecIter`, `FilterIter`, the `for-each` function, the Vec-only `map` and `range`/`range-between` are deleted (§8.3 C), `/` is out of `Num`, the macros `for-each` and `range` name `fib.seq/run!` and `fib.seq/range-by`, the cases and the Rust tests are ported,
+and `compiler/` is ported and `compiler/util/result.fib` deleted (§8.3, "What the flip did" and "What the port of `compiler/` did"). The run of the tree with the flip: `fibref cases` and `fibc cases` each give `cases/ownership` 240 cases, 240 pass; `cases/modules` 25 cases, 25 pass;
+`cases/stdlib` 556 cases, 529 pass, 0 fail, 0 pending, 0 header error, 27 open (the `open-` cases of §7.5.3); `cargo test -p fibc --test bootstrap` 58 passed, `--test bootstrap_expand` 80 passed, `--test capi` 19 passed.
+**Tranche 1 is not complete**, and none of the following has happened: the final gate's
+last step (`every_row_of_the_tranche_is_covered` is still `#[ignore]`; run with `--ignored` against the tree of this status it passes, and the step is to remove the attribute, §8.1 item 1); the by-hand mutation reviews of the Rust packages (§6 MUT-P; no report of them is in the tree); the generator's forms for the new features
+(R13 and R3 report that `fibgen` does not generate `@t` and generates float `quot` thinly, a planted fault in the model's `floor` being caught once in about 4000 programs; not re-run here); the commit of the flip. M6 stays
 paused after step 2a until the library is viable (ROADMAP).
 
 The Rows column counts the survey names assigned to the tranche in §4 (153 + 81 + 199 + 113 + 81 =
@@ -2687,6 +2696,25 @@ the library holds their instances, and moving them is a task of its own. No case
 literal and `compiler/` calls `str-len` (19 uses), so making `count` of a `str` count characters costs nothing that
 was found; the compiler's own errors list any other use. The printed forms change (an `Option` prints its payload, a seq prints in
 parentheses, a small `Map` in insertion order), and no case pins printed text: the headers pin results and traps (§6.5).
+
+**What the flip did (M1, the compiler side, 2026-10-02).** `IMPLICIT_LIB` is `fib.core`, `fib.seq`, `fib.coll`, `fib.print`. `Num` lost `/` (the checker's protocol, the interpreter's
+`float_binary`, `fibc`'s `float_binary`; `quot` keeps the integer division and its texts), and the `Ratio` instance of `Num` lost its `/`. The `for-each` macro's
+declined path is `(fib.seq/run! f c)` (arguments swapped; any other arity is the macro's arity error) and `range`'s two arguments are `(fib.seq/range-by a b 1)`;
+the self-hosted expander (`compiler/expand/prelude.fib`, `modules.fib`) mirrors both and the default implicit list. The prelude lost `Countable Indexable Seq Collection
+Traversable Iter Associative`, their instances, `VecIter`, `FilterIter`, `iter`, `collect`, `filter-iter`, the `for-each` function, the Vec-only `map`, `range` and
+`range-between`; `push!` and `map-put!` and `str-join`, `str-chars` are written over `vec-conj`, `vec-nth`, `vec-count`, `map-assoc`; the prelude gained `map-count` and `set-count`
+(the node counter became `mnode-count`), which the library's `Reducible` instances of `Map` and `Set` use. Ported: `cases/ownership` 01, 09, 10, 13, 16, 31, 61, 83, 91, 92, 95, 131, 183, 202, 203 (bodies only,
+headers unchanged; Appendix A of syntax.md follows for the five of the twenty), `cases/modules` 007, 52 cases of `cases/stdlib` that wrote `fib.prelude/count`, `nth` or `conj`,
+the Rust tests that embed fibber text, the generator (`map` and `range` are wrapped in `vec`, its `nargs` macro counts with `vec-count`). Found by the flip: a user macro's body is
+run in a module that holds the prelude and not the implicit library, so `count`, `conj`, `first`, `map` are unbound there (syntax §3.16); and a generic function whose bound is `Num t` and whose
+body writes `/` is not rejected: the checker adds `Div t t` (case 873). 
+
+**What the port of `compiler/` did (M2, 2026-10-02).** With M1's tree the three tools `compiler/read.fib`, `compiler/expand.fib` and `compiler/jit-demo.fib` already built and passed the
+differential tests, so the port is small: `compiler/util/result.fib` is deleted and `util.result` is out of the `:use` of the 32 modules that named it (`syntax/{dump,lexer,literal,number,reader}`,
+`expand/**`, `lair/**`, `jit-demo`), so that `Result`, `Ok` and `Err` are the prelude's (same type name, variants and fields). No other name of `compiler/` needed a port: the local
+variables and parameters that the library's `first`, `rest`, `count` shadow need nothing (§6.1), `Entry` is gone (`CtxEntry` and `entry-*` are the compiler's own), the `for-each` calls of
+`expand/ctx.fib` and `expand/dumpctx.fib` take the macro's declined path to `fib.seq/run!` and walk a `Map` as `Pair`s, and `admit.fib` and `program.fib` already used the `Cons` and
+`Empty` variants. The port is faithful and not idiomatic: M6 resumes with the library in view. The `Ratio` normaliser of `lib/fib/core/num.fib` was changed (§2.8, cases 093 to 098).
 
 ## 9. Open questions for the owner
 

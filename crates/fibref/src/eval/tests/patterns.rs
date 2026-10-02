@@ -80,7 +80,7 @@ fn a_deep_rest_recursion_frees_every_rest() {
     clean(
         "(defun sum (v: (Vec i64) acc: i64) -> i64
            (match v ([x & r] (sum r (+ acc x))) ([] acc)))
-         (defun main () -> i64 (sum (range 100) 0))",
+         (defun main () -> i64 (sum (vec (range 100)) 0))",
         4950,
     );
 }
@@ -101,7 +101,7 @@ fn a_nested_rest_inside_an_option_inside_a_struct() {
 fn a_guard_that_traps_is_a_trap_not_a_fallthrough() {
     let m = failed(
         "(defun main () -> i64
-           (match [1] ([x] :when (> (/ 1 (- x 1)) 0) 1) (_ 2)))",
+           (match [1] ([x] :when (> (quot 1 (- x 1)) 0) 1) (_ 2)))",
     );
     assert!(m.contains("trap: integer / by zero"), "{m}");
 }

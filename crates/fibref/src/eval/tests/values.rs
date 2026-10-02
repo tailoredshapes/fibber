@@ -8,10 +8,10 @@ fn arithmetic_traps_on_overflow_and_division_by_zero() {
     clean("(defun main () -> i64 (sext i64 (+ 126i8 1i8)))", 127);
     let msg = failed("(defun main () -> i64 (sext i64 (+ 127i8 1i8)))");
     assert!(msg.contains("trap: integer overflow in + at i8"), "{msg}");
-    let msg = failed("(defun main () -> i64 (/ 1 (- 1 1)))");
+    let msg = failed("(defun main () -> i64 (quot 1 (- 1 1)))");
     assert!(msg.contains("trap: integer / by zero"), "{msg}");
     let min = "(- (- 0 9223372036854775807) 1)";
-    let msg = failed(&format!("(defun main () -> i64 (/ {min} -1))"));
+    let msg = failed(&format!("(defun main () -> i64 (quot {min} -1))"));
     assert!(msg.contains("trap: integer overflow in / at i64"), "{msg}");
     let msg = failed(&format!("(defun main () -> i64 (neg {min}))"));
     assert!(msg.contains("trap: integer overflow in neg"), "{msg}");

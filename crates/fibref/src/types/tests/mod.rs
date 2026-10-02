@@ -28,6 +28,25 @@ fn check(src: &str) -> Result<TypedProgram, Vec<TypeError>> {
     }
 }
 
+/// Checks `src` as a program with the implicit library (`fib.core`,
+/// `fib.seq`, `fib.coll`, `fib.print`, which every program sees after the
+/// flip), through the module loader: the type errors, or the typed program.
+fn check_lib(src: &str) -> Result<TypedProgram, Vec<TypeError>> {
+    match crate::own::check_source(src, "t.fib") {
+        Ok(c) => Ok(c.typed),
+        Err(crate::own::CheckError::Type(es)) => Err(es),
+        Err(e) => panic!("{src}\ndoes not check: {e}"),
+    }
+}
+
+/// [`ok`] with the implicit library.
+fn ok_lib(src: &str) -> TypedProgram {
+    check_lib(src).unwrap_or_else(|es| {
+        let text: Vec<String> = es.iter().map(|e| e.to_string()).collect();
+        panic!("{src}\nfailed:\n{}", text.join("\n"))
+    })
+}
+
 /// Checks `src`, which must type-check.
 fn ok(src: &str) -> TypedProgram {
     check(src).unwrap_or_else(|es| {
@@ -39,7 +58,21 @@ fn ok(src: &str) -> TypedProgram {
 /// Checks `src`, which must fail; its first error must be of `kind`
 /// and its message must start with `text`.
 fn fails(src: &str, kind: ErrorKind, text: &str) -> TypeError {
-    let es = match check(src) {
+    fails_with(check(src), src, kind, text)
+}
+
+/// [`fails`] with the implicit library.
+fn fails_lib(src: &str, kind: ErrorKind, text: &str) -> TypeError {
+    fails_with(check_lib(src), src, kind, text)
+}
+
+fn fails_with(
+    checked: Result<TypedProgram, Vec<TypeError>>,
+    src: &str,
+    kind: ErrorKind,
+    text: &str,
+) -> TypeError {
+    let es = match checked {
         Ok(_) => panic!("{src}\ntype-checked; expected {kind:?}: {text}"),
         Err(es) => es,
     };

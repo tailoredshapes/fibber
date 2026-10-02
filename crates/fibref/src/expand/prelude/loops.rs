@@ -6,13 +6,15 @@
 //! (dotimes (i n) body)    ⟹ (let ((m n)) (loop ((i 0)) (if (fib.prelude/< i m) (do body (recur (fib.prelude/+ i 1))) ())))
 //! (for-each (range a b) (fn (i) body))
 //!                         ⟹ (let ((s a) (m b)) (loop ((i s)) (if (fib.prelude/< i m) (do body (recur (fib.prelude/+ i 1))) ())))
-//! (range a b)             ⟹ (fib.prelude/range-between a b)
+//! (for-each c f)          ⟹ (fib.seq/run! f c)      f not a literal one-parameter fn, or c not a literal range
+//! (range a b)             ⟹ (fib.seq/range-by a b 1)
 //! ```
 //!
 //! with `s` and `m` gensyms; `(range n)` is `(range 0 n)` in the loop.
 //! The bounds are evaluated once, left to right, before the loop
-//! variable exists. Any other `for-each`, and `(range n)` outside it,
-//! is the library function.
+//! variable exists. Any other `for-each` is the library's `run!` with
+//! its arguments swapped (Clojure's `run!` takes the function first),
+//! and `(range n)` outside the loop is the library function `range`.
 
 use crate::syntax::{Form, FormKind, Pos};
 
@@ -21,6 +23,11 @@ use crate::expand::build::{call, check_arity, int, list, malformed, unit};
 use crate::expand::collections::prelude_name;
 use crate::expand::ctx::ExpandCtx;
 use crate::expand::error::ExpandError;
+
+/// The library functions the declined paths name, through the facade
+/// (`fib.seq`), which every module that sees the library resolves.
+const RANGE_BY: &str = "fib.seq/range-by";
+const RUN: &str = "fib.seq/run!";
 
 /// `(while c body...)`.
 pub(super) fn while_loop(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
@@ -88,7 +95,7 @@ fn literal_range(form: &Form) -> Option<(Form, Form)> {
     }
 }
 
-/// `(range a b)` ⟹ `(fib.prelude/range-between a b)`; `(range n)` is declined and
+/// `(range a b)` ⟹ `(fib.seq/range-by a b 1)`; `(range n)` is declined and
 /// stays a call of the library function `range` (§4.4, §4.5). There is
 /// no arity overloading, so the two-argument form is this rewrite. A call
 /// of three arguments is declined too: it is Clojure's `(range a b step)`,
@@ -101,11 +108,7 @@ pub(super) fn range(items: Vec<Form>, pos: Pos) -> Result<Outcome, ExpandError> 
     }
     check_arity("range", &items, 1, Some(2), &pos)?;
     if let [_, a, b] = items.as_slice() {
-        let call = call(
-            &prelude_name("range-between"),
-            vec![a.clone(), b.clone()],
-            &pos,
-        );
+        let call = call(RANGE_BY, vec![a.clone(), b.clone(), int(1, &pos)], &pos);
         return Ok(Outcome::Expanded(call));
     }
     Ok(Outcome::Declined(Form::new(FormKind::List(items), pos)))
@@ -130,18 +133,23 @@ fn literal_fn(form: &Form) -> Option<(Form, Vec<Form>)> {
 }
 
 /// `(for-each (range a b) (fn (i) body...))` becomes the loop; any other
-/// `for-each` call is declined and stays a call of the library function.
+/// `(for-each c f)` is `(fib.seq/run! f c)`, the library's walk with the
+/// function first; any other number of arguments is the macro's arity
+/// error.
 pub(super) fn for_each(
     ctx: &ExpandCtx,
     items: Vec<Form>,
     pos: Pos,
 ) -> Result<Outcome, ExpandError> {
+    check_arity("for-each", &items, 2, Some(2), &pos)?;
     let shape = match items.as_slice() {
         [_, r, f] => literal_range(r).zip(literal_fn(f)),
         _ => None,
     };
     let Some(((a, b), (i, body))) = shape else {
-        return Ok(Outcome::Declined(Form::new(FormKind::List(items), pos)));
+        // two arguments, which `check_arity` ensured
+        let (c, f) = (items[1].clone(), items[2].clone());
+        return Ok(Outcome::Expanded(call(RUN, vec![f, c], &pos)));
     };
     let start = ctx.gensym("s", &pos);
     let m = ctx.gensym("m", &pos);

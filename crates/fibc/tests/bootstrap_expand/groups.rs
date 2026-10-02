@@ -136,9 +136,11 @@ const IMPLICIT_RUNS: [(&str, bool, bool); 6] = [
 ];
 
 /// The groups of the programs `main-*.fib` of `compiler/tests/expand/implicit`,
-/// which the groups above run with no implicit module (the default, today):
-/// each is run with implicit modules as well (`--implicit-lib`), their
-/// sections printed or left out (`--implicit`) and with the context.
+/// which the groups above run with the library implicit (the default since
+/// the flip: `fib.core`, `fib.seq`, `fib.coll`, `fib.print`): each is run
+/// with the small stand-in modules `fib.x` and `fib.y` as the implicit ones
+/// as well (`--implicit-lib`), their sections printed or left out
+/// (`--implicit`) and with the context.
 fn implicit_groups(stage: Stage, programs: &[Program]) -> Vec<Group> {
     let files: Vec<PathBuf> = programs
         .iter()

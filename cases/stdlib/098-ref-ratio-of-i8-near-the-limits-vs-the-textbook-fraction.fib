@@ -1,0 +1,54 @@
+;; spec:   stdlib §2.8 ((Ratio t): normalised), tranche 1 plan §9.4 (ref- cases), review finding of L1
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: / numerator denominator
+;; Every pair of a 20-value grid of i8 numerators and denominators (the
+;; minimum, the maximum, powers of two and their neighbours, small values,
+;; zero) against the fraction reduced by subtraction in i64. A ratio whose
+;; lowest terms fit an i8 must be exactly those terms. A pair whose lowest
+;; terms do not fit (-128/-1, 1/-128: 15 of the 380 pairs with a nonzero
+;; denominator) would trap, and the case skips it: cases 095 and 097 hold
+;; those traps. The case counts the pairs it checked. The planted fault is
+;; the reference with the sign of the numerator dropped, run in a second
+;; Checks; it must fail somewhere.
+(ns main (:use fib.core tl.check))
+
+(defun gcd-naive (a: i64 b: i64) -> i64
+  (loop ((x a) (y b))
+    (if (= x y) x (if (> x y) (recur (- x y) y) (recur x (- y x))))))
+
+(defun magnitude (x: i64) -> i64 (if (< x 0) (- 0 x) x))
+
+;; the numerator in lowest terms with a positive denominator
+(defun red-n (n: i64 d: i64) -> i64
+  (if (= n 0)
+      0
+      (let ((q (quot n (gcd-naive (magnitude n) (magnitude d)))))
+        (if (< d 0) (- 0 q) q))))
+(defun red-d (n: i64 d: i64) -> i64
+  (if (= n 0) 1 (magnitude (quot d (gcd-naive (magnitude n) (magnitude d))))))
+
+(defun fits? (x: i64) -> bool (and (>= x -128) (<= x 127)))
+
+(defun grid () -> (Vec i64)
+  [-128 -127 -126 -100 -65 -64 -63 -3 -2 -1 0 1 2 3 63 64 65 100 126 127])
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (vs (grid)))
+    (do (dotimes (i (count vs))
+          (dotimes (j (count vs))
+            (let ((n (nth vs i))
+                  (d (nth vs j)))
+              (when (and (!= d 0) (fits? (red-n n d)) (fits? (red-d n d)))
+                (let ((r (/ (trunc i8 n) (trunc i8 d))))
+                  (do (check c (= (sext i64 (numerator r)) (red-n n d)))
+                      (check c (= (sext i64 (denominator r)) (red-d n d)))
+                      (check p (= (sext i64 (numerator r)) (magnitude (red-n n d))))
+                      (check p (= (sext i64 (denominator r)) (red-d n d)))))))))
+        (check c (= (checks-made c) 730))
+        (check-detects c p)
+        (checks-result c))))

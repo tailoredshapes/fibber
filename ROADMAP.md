@@ -347,6 +347,24 @@ Rules:
    (`sort`, `Map` iteration order, formatting for diagnostics) comes
    first.
 
+**Tranche 0 and 1 state** (2026-10-02, measured on the working tree, uncommitted):
+tranche 0 is done but for five of the thirty-two macros of E1; tranche 1 is
+implemented and **not complete**. The implicit library (`fib.core`,
+`fib.seq`, `fib.coll`, `fib.print`) is on, the prelude's old protocols are
+gone, `/` is `Div`'s, and `compiler/` is ported (`compiler/util/result.fib`
+is deleted; the prelude's `Result` is used). Evidence, each run on this
+tree: `fibref cases` and `fibc cases` both give `cases/ownership` 240 pass of
+240, `cases/modules` 25 of 25, `cases/stdlib` 556 cases, 529 pass, 0 fail,
+0 pending, 0 header error, 27 `open-` (items of later tranches);
+`cargo test --workspace` 1993 passed, 0 failed, 4 ignored (the passes include
+`bootstrap` 58, `bootstrap_expand` 80, `capi` 19); `cargo fmt --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`every_row_of_the_tranche_is_covered`, run with `--ignored`, passes. Not done:
+removing that `#[ignore]` (the last step of the gate), the by-hand mutation
+reviews of the Rust packages, the generator's forms for `@t` and float
+`quot`, and the commit. The compiler's sources are ported faithfully, not
+idiomatically: M6 resumes with the library in view.
+
 Order: spec/stdlib.md (the table of names and deviations); sequences,
 transducers and `Iter` fusion; maps, sets and sorted collections;
 strings and formatting; then the long tail; then measurement. It

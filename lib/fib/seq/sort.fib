@@ -21,7 +21,7 @@
 ;;  - `group-by` and `frequencies` fill a Map held in a cell in one pass; each group is a Vec in
 ;;    encounter order. They go through the prelude's `map-get` and `map-assoc` (`fib.prelude/NAME`,
 ;;    plan §4.3 rule 4) because fib.coll's `get` and `assoc` are above this part.
-;;  - the empty List is `(list)` and a cons onto it `fib.prelude/conj`, so the part names no List variant.
+;;  - the empty List is `(list)` and a cons onto it `fib.prelude/Cons`, the prelude's own variant.
 ;;  - no `/` on integers (plan PC-14) and no `min`/`max` (L1's): the one clamp is `imin`.
 (ns fib.seq.sort (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq))
 
@@ -44,11 +44,11 @@
 
 ;; the elements of v in the order of the three-way comparator cmp, stable; fewer than two come back as v
 (defun sort-vec :private (cmp: (fn (e e) i64) :borrow v: (Vec e)) -> (Vec e)
-  (let ((n (fib.prelude/count v)))
+  (let ((n (vec-count v)))
     (if (< n 2)
         v
-        (let ((cur (cell (array n (fib.prelude/nth v 0)))) (tmp (cell (array n (fib.prelude/nth v 0)))))
-          (do (dotimes (i n) (array-set! &cur i (fib.prelude/nth v i)))
+        (let ((cur (cell (array n (vec-nth v 0)))) (tmp (cell (array n (vec-nth v 0)))))
+          (do (dotimes (i n) (array-set! &cur i (vec-nth v i)))
               (loop ((width 1))
                 (if (< width n)
                     (do (merge-runs cmp @cur tmp n width)
@@ -56,7 +56,7 @@
                         (recur (* width 2)))
                     ()))
               (loop ((i 0) (out (vec-empty)))
-                (if (< i n) (recur (+ i 1) (fib.prelude/conj out (array-get @cur i))) out)))))))
+                (if (< i n) (recur (+ i 1) (vec-conj out (array-get @cur i))) out)))))))
 
 ;; (sort-with cmp c): the 2-arity of Clojure's sort until L1 (arity overloading); the comparator's result is a Cmp
 (defun sort-with (cmp: (fn (e e) r) :borrow c: c) :where ((Reducible c e) (Cmp r)) -> (VSeq e)
@@ -75,7 +75,7 @@
 ;; a List of the elements, last first
 (defun reverse (c: c) :where ((Reducible c e)) -> (List e)
   (let ((acc (cell (list))))
-    (do (each-while c (fn (x) (do (set! acc (fib.prelude/conj @acc x)) true)))
+    (do (each-while c (fn (x) (do (set! acc (fib.prelude/Cons x @acc)) true)))
         @acc)))
 
 ;; one pass: the Vec of the elements for each key, in encounter order
@@ -85,7 +85,7 @@
           (fn (x)
             (let ((key (f x)))
               (do (set! m (fib.prelude/map-assoc @m key
-                            (fib.prelude/conj (match (fib.prelude/map-get @m key) (nil (vec-empty)) ((some g) g)) x)))
+                            (vec-conj (match (fib.prelude/map-get @m key) (nil (vec-empty)) ((some g) g)) x)))
                   true))))
         @m)))
 

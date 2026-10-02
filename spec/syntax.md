@@ -1064,6 +1064,14 @@ the namespace it compiles). A macro that calls a function of the module
 it is defined in is an expansion error: `macro m calls f, which is not
 available at expansion time; move f to a required module`.
 
+**After the flip of stdlib tranche 1** the macro-time module is still the prelude and
+the macro, with the modules the module requires: the implicit library (`fib.core`, `fib.seq`,
+`fib.coll`) is not in it, so a macro body that calls `count`, `conj`, `first` or `map` is
+rejected at expansion time under both tools (`fibref` says `macro m calls count, which is not available at expansion time`, `fibc` `macro m failed: .. unbound name count`), and writes the prelude's raw operations
+(`vec-count`, `vec-conj`, `vec-nth`) instead (cases `cases/ownership` 83, 91, 92). Whether the
+implicit modules should join the macro-time module is an open decision of the owner (reported
+by the flip; it makes every macro run compile the library).
+
 `Form` is the built-in enum
 
 ```
@@ -1507,14 +1515,14 @@ of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
 | `if-let`, `when-let`, `nil?`-free option tests | `match`: `(if-let (p e) a b)` ⟹ `(match e ((some p) a) (_ b))`, `(when-let (p e) body ..)` ⟹ `(match e ((some p) body) (_ ()))`. `p` may be any pattern (§3.6): a name, a vector pattern, a variant pattern, a literal; the else is taken on `nil` and on a mismatch of `p`, so a refutable `p` is exhaustive (an else of `(nil b)` made it `missing (some [])`). `(if-let (p e) a)` has `()` as its else (arity 2 to 3; stdlib design §2.4, §7 E13) |
 | `list` | `(list a b)` ⟹ `(fib.prelude/Cons a (fib.prelude/Cons b fib.prelude/Empty))`, `(list)` ⟹ `fib.prelude/Empty` (`Empty` is `List`'s field-less variant, used bare: §3.9; the variants are qualified so that the library's function `cons` and method `empty` cannot capture them) |
 | `plet` | §3.12 |
-| `while`, `dotimes`, `for-each` over a `range` | `loop`/`recur` (§3.18): `(while c body)` ⟹ `(loop () (if c (do body (recur)) ()))`; `(dotimes (i n) body)` ⟹ `(let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))` with `m` a gensym; `(for-each (range a b) (fn (i) body))`, with a literal `(range a b)` or `(range n)` (read as `(range 0 n)`) and a literal `fn` with no name, one unannotated parameter and no result annotation, ⟹ `(let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))` with `s` and `m` gensyms, the body spliced in with no closure. A loop variable takes no annotation, so a `fn` whose parameter is annotated (`(fn (i: i64) ..)`) is left to the library function, which checks it (case 86). The bounds are evaluated once, left to right, before the loop variable exists, so a bound that mentions a variable named like `i` sees the outer one (**Decided**, owner, 2026-09-27; the earlier `(loop ((i 0) (m n)) ..)` bound `n` inside the loop's own `i`); any other `for-each` is the library function (§4.5) |
-| `range` | `(range a b)` ⟹ `(range-between a b)`; `(range n)` is not rewritten: it is the library function `range`, which is also what `range` names as a value (§4.5). A call of three arguments, Clojure's `(range a b step)`, is declined as well and stays a call of the library function, whose arity error says `use range-by` (stdlib §7 D1); `(range)` and four or more arguments are the macro's own arity error. There is no arity overloading, so the two-argument form exists as this rewrite (**Decided**, owner, 2026-09-27: both arities) |
+| `while`, `dotimes`, `for-each` over a `range` | `loop`/`recur` (§3.18): `(while c body)` ⟹ `(loop () (if c (do body (recur)) ()))`; `(dotimes (i n) body)` ⟹ `(let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))` with `m` a gensym; `(for-each (range a b) (fn (i) body))`, with a literal `(range a b)` or `(range n)` (read as `(range 0 n)`) and a literal `fn` with no name, one unannotated parameter and no result annotation, ⟹ `(let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))` with `s` and `m` gensyms, the body spliced in with no closure. A loop variable takes no annotation, so a `fn` whose parameter is annotated (`(fn (i: i64) ..)`) is left to the library function, which checks it (case 86). The bounds are evaluated once, left to right, before the loop variable exists, so a bound that mentions a variable named like `i` sees the outer one (**Decided**, owner, 2026-09-27; the earlier `(loop ((i 0) (m n)) ..)` bound `n` inside the loop's own `i`); any other `(for-each c f)` is `(fib.seq/run! f c)`, the library's walk with the function first (the prelude's `for-each` function and its `Traversable` protocol are gone, stdlib §8.3 C), and a call of any other number of arguments is the macro's own arity error |
+| `range` | `(range a b)` ⟹ `(fib.seq/range-by a b 1)`, a `Range`; `(range n)` is not rewritten: it is the library function `range`, which is also what `range` names as a value (§4.5). A call of three arguments, Clojure's `(range a b step)`, is declined as well and stays a call of the library function, whose arity error says `use range-by` (stdlib §7 D1); `(range)` and four or more arguments are the macro's own arity error. There is no arity overloading, so the two-argument form exists as this rewrite (**Decided**, owner, 2026-09-27: both arities) |
 | `->`, `->>`, `doto` | call rewriting |
 | `assert` | `(assert c)` / `(assert c msg)` ⟹ `(if c () (trap msg))`, the default message naming the position and the test |
 | `dbg` | `(dbg e)` ⟹ `(let ((t e)) (eprintln (str-concat "dbg FILE:LINE:COL: E = " (show t))) t)` (every head written `fib.prelude/NAME`) with `t` a gensym and the literal text naming the call's position and `e` as written: evaluates `e` once, prints it with `Show` to stderr, returns it (**Decided**, owner, 2026-09-27) |
 | `derive` | `(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`, `Debug`, `ToStr` (any other is `cannot derive X: only Eq, Ord, Hash, Show, Debug and ToStr`; the last two, §3.16): one `impl` whose head comes from `struct-params` or `enum-params`, whose `:where` lists `(P t)` for each parameter used by a field (`struct-field-types`, `enum-variants`; for `Ord` too, whose supertrait `Eq` the context then entails, types §4.1) and whose methods go field by field over `struct-fields` for a struct, or variant by variant over `enum-variants` for an enum, with a nested `match` on both operands (§3.16); `(do)` for a field-less enum, whose instances are built in; several protocols are several `derive` forms, which a macro may return in one top-level `do`. The prelude itself contains `(derive Eq Option)`, `(derive Ord Option)`, `(derive Hash Option)` and the same three for `List`; their `Show` is written by hand in `lib/prelude.fib` (§4.5) |
 | `defn`, `defn-` | `(defn name doc? [x: T ..] -> R body ..)` ⟹ `(defun name (x: T ..) -> R body ..)`; `defn-` puts `:private` after the name; the docstring is dropped; everything after the vector (`-> R`, `:where`, the body) is passed on. A `&` in the vector is the error `rest parameters need L2`, a list of clauses `([x] ..) ..` is `several arities need L1` (stdlib §7). The built `defun` takes the call's position and the parameter list the vector's |
-| `str`, `println`, `print`, `prn`, `pr` | `(str)` ⟹ `""`; `(str a b ..)` ⟹ the right fold of `fib.prelude/str-concat` over the pieces, a string-literal piece as it is, a literal `nil` as `""`, any other piece `(fib.core/to-str x)`. `(println a b ..)` ⟹ `(fib.prelude/println S)` and `(print a b ..)` ⟹ `(fib.prelude/print-str S)`, `S` the pieces joined by one space, a literal `nil` piece as `"nil"` (a bare `nil` has no type, so it would otherwise be an ambiguous-constraint error) and any other piece, a string literal included, `(fib.prelude/show x)`; `(println)` and `(print)` write `""`. `prn` and `pr` are `println` and `print` over `(fib.core/debug x)`, with the same literal-`nil` rule. A name in value position (`(map str xs)`) is not a call and is left alone: the function twins of `fib.print` serve it (stdlib §2.7, §4.14). A `fib.core/` head resolves only in a module that has `fib.core` in scope, a `:use fib.core` until the implicit list is filled (§5): `(str ..)`, `(prn ..)` and `(pr ..)` without it are `unbound name fib.core/to-str`, and `println` and `print` need only the prelude |
+| `str`, `println`, `print`, `prn`, `pr` | `(str)` ⟹ `""`; `(str a b ..)` ⟹ the right fold of `fib.prelude/str-concat` over the pieces, a string-literal piece as it is, a literal `nil` as `""`, any other piece `(fib.core/to-str x)`. `(println a b ..)` ⟹ `(fib.prelude/println S)` and `(print a b ..)` ⟹ `(fib.prelude/print-str S)`, `S` the pieces joined by one space, a literal `nil` piece as `"nil"` (a bare `nil` has no type, so it would otherwise be an ambiguous-constraint error) and any other piece, a string literal included, `(fib.prelude/show x)`; `(println)` and `(print)` write `""`. `prn` and `pr` are `println` and `print` over `(fib.core/debug x)`, with the same literal-`nil` rule. A name in value position (`(map str xs)`) is not a call and is left alone: the function twins of `fib.print` serve it (stdlib §2.7, §4.14). A `fib.core/` head resolves in every module that sees `fib.core`, which is every module but the library's own since the flip (§5), and in those by a `:use` |
 | `+ - * < > <= >= = max min bit-and bit-or bit-xor` | the variadic folds, each answering only the calls the binary builtin or function cannot and **declining** the rest: `(+)` ⟹ `0` and `(*)` ⟹ `1` (`i64`s); `(+ a)`, `(* a)` ⟹ `a`; from three arguments `(+ a b c)` ⟹ `(fib.prelude/+ (fib.prelude/+ a b) c)`, a left fold, so the first sum that overflows traps; `(-)` is the arity error `macro - takes at least 1 argument(s), got 0`, `(- a)` ⟹ `(fib.prelude/neg a)`; `(< a b c)` ⟹ `(and (< a b) (< b c))` with every operand evaluated once, in order, before the first test (an operand that is not a symbol, a literal or a field path `(. x f)` is first bound to a gensym), and `(< a)` ⟹ `(let ((t a)) true)`; `max`, `min` and the three `bit-` operations fold from three arguments (`fib.core/max`, `fib.prelude/bit-and` ..) and decline below that |
 | `conj`, `assoc`, `dissoc`, `merge` | `(conj c)`, `(dissoc m)` ⟹ the collection itself; `(conj c x y ..)`, `(dissoc m k1 k2 ..)` ⟹ the left fold of `fib.coll/conj`, `fib.coll/dissoc`; `(assoc m k v k2 v2 ..)` ⟹ the left fold of `fib.coll/assoc` by pairs, and a key without a value is the error `malformed assoc: a key without a value`; `(merge)` is the error `malformed merge: needs at least one argument`, a literal `nil` operand is skipped (`(merge a nil b)` is `(merge a b)`, and `nil` when every operand is one); the two- and three-argument calls (and `(merge a b)` with no literal `nil`) are declined: the method or function serves them. Clojure's rules for a literal `nil` first argument, `(conj nil x)` as `(list x)` and `(assoc nil k v)` as a map, are not implemented (stdlib §2.4) |
 | `swap!` | `(swap! a f x ..)` ⟹ `(fib.prelude/swap! a (fn (v) (f v x ..)))`, `v` a gensym, the extra arguments evaluated inside the closure each time the builtin calls it (which may be more than once, §3.11); the two-argument call is the builtin's and is declined |
@@ -1588,21 +1596,19 @@ stdlib design C-3); `(Pair a b)` with fields `fst` and `snd`, `(Triple a b
 c)` with `fst`, `snd`, `thd`, and `(Result a b)` with `(Ok v)` and `(Err e)`
 (`Eq`, `Ord`, `Hash` derived and no `Show` in the prelude: `fib.print` supplies one for `Pair` and `Triple`, and none exists for `Result` yet); a
 public `print-str` writing a string without the newline; `Vec`, `Map`, `Set` as
-persistent structures over `(Array T)` with `vec-empty conj nth count
-push! pop! vec-set! map-empty assoc get dissoc contains? map-put!
-map-del! set-empty disj set-contains?` (`Map` and `Set` are an HAMT over
-the keys' `hash`, keys needing `Hash` and `Eq`; `for-each` over a `Map`
-visits `(Pair k v)` structs with fields `fst` and `snd`, and `map-each` and
-`set-each` walk without building the `Pair`); the
-protocols `Seq Countable Indexable Collection Associative Traversable
-Iter Hash Show` with `first rest count nth conj for-each map filter
-reduce iter next collect filter-iter`; `range` (**Decided**, owner,
-2026-09-27: `(range n)` is `(range 0 n)`, and `(range a b)` is the `i64`s
-from `a` up to but not including `b`, empty when `b ≤ a`; the library
-function is `(range n: i64) -> (Vec i64)`, and the two-argument form is
-the prelude macro's rewrite to `(range-between a: i64 b: i64) -> (Vec
-i64)`, §4.4), `pmap`, `append` (=
-`push!`), `even?`, `length` (string length), `starts-with?`, `box`/`unbox`
+persistent structures over `(Array T)` with the raw operations `vec-empty vec-conj
+vec-nth vec-count map-empty map-assoc map-get map-count dissoc contains? map-put!
+map-del! set-empty set-count disj set-contains?` (`Map` and `Set` are an HAMT over
+the keys' `hash`, keys needing `Hash` and `Eq`; `map-each` and
+`set-each` walk them and can stop early); the protocols `Hash` and `Show`. Since the
+flip (stdlib §8.3) the prelude has no `Seq Countable Indexable Collection Associative
+Traversable Iter`, no `iter collect filter-iter for-each map range`: `first rest count nth
+conj map filter reduce range` and the rest of the sequence functions are the library's
+(`fib.seq`, `fib.coll`, implicit in every module, stdlib §4). `(range n)` is `(range 0 n)`
+(**Decided**, owner, 2026-09-27), and `(range a b)` is the prelude macro's rewrite to
+`(fib.seq/range-by a b 1)`, a `Range` of the `i64`s from `a` up to but not including `b`,
+empty when `b ≤ a` (§4.4); `pmap` (over a `Vec`), `append` (=
+`push!`, over a `Vec`), `even?`, `length` (string length), `starts-with?`, `box`/`unbox`
 over `(defstruct (Box a) (v: a))`, `yield`, `block-on`, I/O (`(println s: str) -> unit` and `(eprintln s: str) -> unit`, which write `s` and then a newline to standard output and to standard error, each as write(2) calls (§3.15) repeated until every byte has been written, a call being free to take fewer; a call that fails (-1) or takes no byte of a rest that is not empty is the trap `println: write failed` (`eprintln: write failed`), naming the function the program called, so a full device is a trap and never a success; the prelude does not retry an interrupted call, as it cannot read `errno`; the string may have gone out when the newline fails (**Decided**, owner, 2026-10-01; case 192, `crates/fibc/tests/cli.rs`, `crates/fibref/tests/run_io.rs`); `dbg` uses the latter; `read-file`, `write-file` and `args` are builtins, §4.3).
 
 `for-each`, `map`, `filter`, `reduce`, `swap!` take their function
@@ -1713,14 +1719,14 @@ qualified, reflection on a private type, and `(var m/x)` (cases 113 to
 included: a module's macros reach the modules that `:use` it
 unqualified and the ones that `:require` it through the alias, and a
 `:private` macro its own module only. Requires may not be cyclic.
-`fib.prelude` is implicitly `:use`d. Protocol implementations are global
+`fib.prelude` and the implicit modules (below) are implicitly `:use`d. Protocol implementations are global
 facts and are always visible once their module is required.
 
-**Implicit modules** (**Proposed**, stdlib design §6.2, §4.4). A program
+**Implicit modules** (stdlib design §6.2, §4.4; in force since the flip of
+tranche 1). A program
 may have modules that every one of its modules sees without naming them: the
-reference implementation lists them in `modules::IMPLICIT_LIB`, which is
-empty until the library is complete and then names the facades `fib.core`,
-`fib.seq`, `fib.coll` and `fib.print`. They are loaded before the program's
+reference implementation lists them in `modules::IMPLICIT_LIB`, which names the
+facades `fib.core`, `fib.seq`, `fib.coll` and `fib.print`. They are loaded before the program's
 other modules, in the order listed, and seen as the prelude is, between a
 module's `:use`s and the prelude: a module's own definition and a `:use`d
 module's name shadow an implicit module's, with no clash (an implicit module
@@ -1740,9 +1746,9 @@ modules out of its dump as it does the prelude (spec/bootstrap.md §5.1).
 A protocol belongs to its module like any other definition, and so do its
 methods: two modules may each define a protocol of one name with methods of
 one name (case 008), and a program's own protocol `Collection` with a method
-`conj`, implemented for `(Vec a)`, shadows the prelude's for a bare `conj`
-while the literal `[1 2 3]` and `fib.prelude/conj` stay the prelude's
-(case 007, **Proposed**, stdlib design §7 B3). A compiler names a method's
+`conj`, implemented for `(Vec a)`, shadows the library's for a bare `conj`
+while the literal `[1 2 3]` stays the prelude's `vec-conj` and `fib.coll/conj` the library's
+(case 007, stdlib design §7 B3). A compiler names a method's
 code and a protocol's vtables with the defining module, so that two such
 protocols cannot be taken for one (compiler.md §2).
 
@@ -1774,19 +1780,22 @@ rule that produces the verdict. Library names used are listed in §4.5.
 ;; audit:  clean
 ;; A function returns memory owned by its argument. The callee retains
 ;; it on return, so the caller's binding and the list each hold a count.
-(defun head (xs) (first xs))
+(defun head (xs)
+  (match (first xs)
+    ((some x) x)
+    (nil (trap "head: empty list"))))
 
 (defun main () -> i64
   (let ((l (list (box 1) (box 2))))
     (let ((h (head l)))
       (unbox h))))
 ```
-Unchanged. `list` is the prelude macro (`(fib.prelude/Cons (box 1)
-(fib.prelude/Cons (box 2) fib.prelude/Empty))`, §4.4), `box`/`unbox` the prelude `Box` struct, `first` the
-`Seq` method (traps on an empty list; **Decided**: `first?`/`nth?`
-return `(Option T)`). `head` is inferred as `∀s e. (Seq s e) ⇒ (fn (s)
-e)`; `(first xs)` is a tail call of `head` whose argument, a borrowed
-parameter, needs no count operation (types §6.10).
+The body of `head` changed with the flip of tranche 1 (stdlib §8.3, the owner's Q28): `first` is the
+library's, and it returns `(Option e)`, so `head` matches it and traps on nil, and answers the element
+as it did. `list` is the prelude macro (`(fib.prelude/Cons (box 1)
+(fib.prelude/Cons (box 2) fib.prelude/Empty))`, §4.4), `box`/`unbox` the prelude `Box` struct. `head`'s
+parameter is inferred as `∀c e. (Reducible c e) ⇒ (fn (c) e)`; the element it returns is memory the
+list owns, which the callee retains on return.
 
 ### 02-structural-sharing.fib
 
@@ -1950,14 +1959,15 @@ in-place push.
 ;; audit:  clean
 ;; The returned iterator refers to a vector that the caller's scope
 ;; has already let go of.
-(defun evens (v) (filter-iter (iter v) even?))
+(defun evens (v) (filter even? v))
 
 (defun main () -> i64
   (let ((it (let ((v [1 2 3 4])) (evens v))))
-    (count (collect it))))
+    (count (vec it))))
 ```
-Unchanged. `iter` stores `v` into the iterator struct; that store is the
-escape that retains it.
+The body changed with the flip (stdlib §8.3): the prelude's `Iter` protocol, `iter`, `filter-iter` and
+`collect` are gone; the library's `filter` is the lazy sequence, `vec` the collector. `filter` stores `v`
+into the recipe it returns; that store is the escape that retains it.
 
 ### 10-atom-old-value.fib
 
@@ -1973,10 +1983,11 @@ escape that retains it.
             (let ((snapshot @a))
               (swap! a (fn (c) (conj c i)))
               (count snapshot)))
-          (range 1000))
+          (vec (range 1000)))
     (count @a)))
 ```
-Unchanged. The result of `pmap` is a discarded `do` step.
+The argument of `pmap` changed with the flip (stdlib §8.3): `(range 1000)` is a `Range`, and `pmap`
+takes a `Vec`, so the case writes `(vec (range 1000))`. The result of `pmap` is a discarded `do` step.
 
 ### 11-borrow-across-await.fib
 
@@ -2021,10 +2032,10 @@ Unchanged.
 ;; error:  cell cannot be shared between threads
 (defun main () -> i64
   (let ((n (cell 0)))
-    (pmap (fn (i) (set! n (+ @n i))) (range 10))
+    (pmap (fn (i) (set! n (+ @n i))) (vec (range 10)))
     @n))
 ```
-Unchanged.
+The argument of `pmap` changed with the flip, as in 10.
 
 ### 14-reject-inout-in-async.fib
 
@@ -2088,11 +2099,11 @@ exercise their rule).
     (pmap (fn (i)
             (transfer accts 1)
             (let ((snap @accts)) (+ (. snap a) (. snap b))))
-          (range 1000))
+          (vec (range 1000)))
     (let ((final @accts))
       (+ (. final a) (. final b)))))
 ```
-Unchanged. `(transfer accts 1)` is a discarded `do` step whose owned
+The argument of `pmap` changed with the flip, as in 10. `(transfer accts 1)` is a discarded `do` step whose owned
 result is released at the step's end.
 
 ### 17-inout-and-borrow-same-call.fib

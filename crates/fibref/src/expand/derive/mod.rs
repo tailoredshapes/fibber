@@ -46,8 +46,8 @@
 //!   no `Debug` instance of the type itself. The protocol and its methods
 //!   are written with the facade's name, `fib.core/Debug`, `fib.core/debug`
 //!   (a Debug is not the prelude's, so the head `fib.prelude/` does not
-//!   reach it): the module needs `fib.core` in scope, which `:use` gives it
-//!   until the library modules are implicit. An enum none of whose variants
+//!   reach it): the module needs `fib.core` in scope, which every module but
+//!   the library's own has since the library modules are implicit. An enum none of whose variants
 //!   has a field derives nothing for `Eq Ord Hash Show` (the compilers
 //!   have those) but does derive `Debug` and `ToStr`, which they do not.
 

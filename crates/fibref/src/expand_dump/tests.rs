@@ -28,6 +28,18 @@ impl Drop for Dir {
     }
 }
 
+/// The options of a dump with no implicit module: these tests are about
+/// the program's own forms and context, which the library's sections and
+/// definitions would fill with the library's (the default dump leaves its
+/// sections out, but its definitions are in the context: see
+/// `the_library_is_implicit_by_default`).
+fn plain() -> Options {
+    Options {
+        implicit_lib: Some(Vec::new()),
+        ..Options::default()
+    }
+}
+
 fn run(dir: &Dir, name: &str, opts: &Options) -> (String, u8) {
     expand_files(&[dir.file(name)], opts)
 }
@@ -48,7 +60,7 @@ fn a_program_prints_its_expanded_forms_under_its_module_and_the_positions_of_the
         "simple",
         &[("m.fib", "(defun f (x: i64) -> i64 (when x 1 2))\n")],
     );
-    let (text, status) = shown(&dir, "m.fib", &Options::default());
+    let (text, status) = shown(&dir, "m.fib", &plain());
     assert_eq!(status, 0);
     let expected = "== D/m.fib
 -- module main D/m.fib
@@ -76,7 +88,7 @@ list 6 1:1 0..38
 fn the_expansion_of_the_prelude_is_the_context_a_program_derives_over() {
     let source = "(defstruct P (a: i64))\n(derive Eq P)\n(derive Eq Option)\n";
     let dir = Dir::new("derive", &[("m.fib", source)]);
-    let (text, status) = run(&dir, "m.fib", &Options::default());
+    let (text, status) = run(&dir, "m.fib", &plain());
     assert_eq!(status, 0, "{text}");
     assert_eq!(text.matches("sym \"impl\"").count(), 2, "{text}");
 }
@@ -84,7 +96,7 @@ fn the_expansion_of_the_prelude_is_the_context_a_program_derives_over() {
 #[test]
 fn an_expansion_error_is_one_record_with_the_variant_and_the_message() {
     let dir = Dir::new("err", &[("m.fib", "(defun f () -> i64 1)\n(f)\n")]);
-    let (text, status) = shown(&dir, "m.fib", &Options::default());
+    let (text, status) = shown(&dir, "m.fib", &plain());
     assert_eq!(status, 1);
     assert_eq!(
         text,
@@ -96,7 +108,7 @@ fn an_expansion_error_is_one_record_with_the_variant_and_the_message() {
 #[test]
 fn a_file_that_does_not_read_is_the_record_of_the_reader_dump() {
     let dir = Dir::new("read", &[("m.fib", "(a\n")]);
-    let (text, status) = shown(&dir, "m.fib", &Options::default());
+    let (text, status) = shown(&dir, "m.fib", &plain());
     assert_eq!(status, 1);
     assert_eq!(text, "== D/m.fib\nerror Unclosed 1:1 0..1: unclosed (\n");
     let file = dir.file("m.fib");
@@ -122,15 +134,12 @@ fn a_file_that_cannot_be_read_is_unreadable_and_the_largest_status_wins() {
         dir.file("bad.fib"),
         dir.file("not-utf8.fib"),
     ];
-    let (text, status) = expand_files(&files, &Options::default());
+    let (text, status) = expand_files(&files, &plain());
     assert_eq!(status, 2);
     assert!(text.ends_with("unreadable\n"), "{text}");
-    assert_eq!(expand_files(&files[..2], &Options::default()).1, 1);
-    assert_eq!(expand_files(&files[..1], &Options::default()).1, 0);
-    assert_eq!(
-        expand_files(&[dir.file("absent.fib")], &Options::default()).1,
-        2
-    );
+    assert_eq!(expand_files(&files[..2], &plain()).1, 1);
+    assert_eq!(expand_files(&files[..1], &plain()).1, 0);
+    assert_eq!(expand_files(&[dir.file("absent.fib")], &plain()).1, 2);
 }
 
 const WITH_MACRO: &str = "(defmacro twice (x) `(+ ,x ,x))\n(defun main () -> i64 (twice 21))\n";
@@ -138,7 +147,7 @@ const WITH_MACRO: &str = "(defmacro twice (x) `(+ ,x ,x))\n(defun main () -> i64
 #[test]
 fn a_user_macro_runs_in_the_evaluator_and_is_pending_without_a_runner() {
     let dir = Dir::new("macro", &[("m.fib", WITH_MACRO)]);
-    let (text, status) = run(&dir, "m.fib", &Options::default());
+    let (text, status) = run(&dir, "m.fib", &plain());
     assert_eq!(status, 0, "{text}");
     assert!(
         text.contains("sym \"+\" 2:23 "),
@@ -150,7 +159,7 @@ fn a_user_macro_runs_in_the_evaluator_and_is_pending_without_a_runner() {
     );
     let none = Options {
         runner: RunnerKind::None,
-        ..Options::default()
+        ..plain()
     };
     let (text, status) = shown(&dir, "m.fib", &none);
     assert_eq!(status, 1);
@@ -172,7 +181,7 @@ fn modules_print_in_dependency_order_each_under_its_own_file() {
             ("u.fib", "(ns u)\n(defun one () -> i64 1)\n"),
         ],
     );
-    let (text, status) = shown(&dir, "main.fib", &Options::default());
+    let (text, status) = shown(&dir, "main.fib", &plain());
     assert_eq!(status, 0, "{text}");
     let headers: Vec<&str> = text.lines().filter(|l| l.starts_with("-- ")).collect();
     assert_eq!(
@@ -197,7 +206,7 @@ fn a_program_that_cannot_be_loaded_is_a_record_of_its_kind() {
         ],
     );
     let first_record = |name: &str| {
-        let (text, status) = shown(&dir, name, &Options::default());
+        let (text, status) = shown(&dir, name, &plain());
         assert_eq!(status, 1, "{name}: {text}");
         text.lines().nth(1).expect("a record").to_string()
     };
@@ -231,7 +240,7 @@ fn the_prelude_mode_dumps_the_expanders_own_prelude_then_the_file_in_one_module(
     );
     let opts = Options {
         prelude: true,
-        ..Options::default()
+        ..plain()
     };
     let (text, status) = shown(&dir, "lib.fib", &opts);
     assert_eq!(status, 0, "{text}");
@@ -261,7 +270,7 @@ fn the_context_lists_what_the_module_registered_in_sorted_order() {
     let opts = Options {
         context: true,
         runner: RunnerKind::None,
-        ..Options::default()
+        ..plain()
     };
     let (text, status) = shown(&dir, "m.fib", &opts);
     assert_eq!(status, 0, "{text}");
@@ -304,7 +313,7 @@ fn a_program_lists_what_differs_from_the_prelude_and_the_prelude_lists_everythin
     let dir = Dir::new("baseline", &[("m.fib", source)]);
     let program = Options {
         context: true,
-        ..Options::default()
+        ..plain()
     };
     let (text, _) = run(&dir, "m.fib", &program);
     let structs: Vec<&str> = text.lines().filter(|l| l.starts_with("struct ")).collect();
@@ -316,7 +325,7 @@ fn a_program_lists_what_differs_from_the_prelude_and_the_prelude_lists_everythin
     let lib = Options {
         prelude: true,
         context: true,
-        ..Options::default()
+        ..plain()
     };
     let (text, _) = run(&dir, "m.fib", &lib);
     for listed in [
@@ -338,7 +347,7 @@ fn the_context_of_a_module_program_adds_up_and_shows_the_scope_of_each_module() 
     let opts = Options {
         context: true,
         runner: RunnerKind::None,
-        ..Options::default()
+        ..plain()
     };
     let (text, status) = shown(&dir, "main.fib", &opts);
     assert_eq!(status, 0, "{text}");
@@ -377,7 +386,7 @@ fn the_context_counts_the_gensyms_and_the_steps_of_the_last_form() {
     );
     let opts = Options {
         context: true,
-        ..Options::default()
+        ..plain()
     };
     let (text, _) = run(&dir, "m.fib", &opts);
     // The prelude's expansion has used some gensyms already; `dotimes` one.
@@ -404,10 +413,7 @@ fn smaller_limits_than_the_defaults_reach_their_errors_on_small_inputs() {
     let source = "(defun f () -> i64 (when true (when true (when true 1))))\n";
     let dir = Dir::new("limits", &[("m.fib", source)]);
     let one = |limits| {
-        let opts = Options {
-            limits,
-            ..Options::default()
-        };
+        let opts = Options { limits, ..plain() };
         let (text, status) = run(&dir, "m.fib", &opts);
         (text.lines().last().unwrap_or("").to_string(), status)
     };
@@ -454,4 +460,35 @@ fn every_expansion_error_has_the_name_of_its_variant() {
         }),
         "BadLiteral"
     );
+}
+
+#[test]
+fn the_library_is_implicit_by_default() {
+    // No option: the four facades of the library are the implicit modules
+    // (`modules::IMPLICIT_LIB`), so the program's scope sees them and its
+    // context lists the library's macros, while no `-- module fib.` section
+    // is printed (spec/bootstrap.md §5.1).
+    let dir = Dir::new(
+        "library",
+        &[("m.fib", "(defun f () -> i64 (count [1 2]))\n")],
+    );
+    let (text, status) = run(&dir, "m.fib", &Options::default());
+    assert_eq!(status, 0, "{text}");
+    let sections: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("-- module"))
+        .collect();
+    assert_eq!(sections.len(), 1, "{sections:?}");
+    assert!(sections[0].starts_with("-- module main "), "{sections:?}");
+    let with = Options {
+        context: true,
+        implicit: true,
+        ..Options::default()
+    };
+    let (text, _) = run(&dir, "m.fib", &with);
+    for m in IMPLICIT_LIB {
+        assert!(text.contains(&format!("  implicit \"{m}\"")), "{m}: {text}");
+    }
+    assert!(text.contains("-- module fib.core.base "), "{text}");
+    assert!(text.contains("-- module fib.print "), "{text}");
 }

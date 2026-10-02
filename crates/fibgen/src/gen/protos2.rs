@@ -91,7 +91,7 @@ fn method_fn(g: &mut Gen, cx: &Ctx, t: &Ty, p: Proto, d: u32) -> Expr {
     Expr::new(fty, Kind::Fn(vec![(e, t.clone())], Box::new(body)))
 }
 
-/// `(sum-vec (map (fn (e: (dyn P)) (m e)) v))`: each element of a
+/// `(sum-vec (vec (map (fn (e: (dyn P)) (m e)) v)))`: each element of a
 /// heterogeneous vector called through its own vtable.
 fn map_dyn(g: &mut Gen, cx: &Ctx, p: Proto, d: u32) -> Expr {
     let send = g.rng.chance(30);
@@ -101,7 +101,8 @@ fn map_dyn(g: &mut Gen, cx: &Ctx, p: Proto, d: u32) -> Expr {
     let v = Expr::new(Ty::vec(et.clone()), Kind::VecLit(items));
     let f = method_fn(g, cx, &et, p, d - 1);
     let mapped = Expr::call(Ty::vec(Ty::Int), "map", vec![f, v]);
-    Expr::call(Ty::Int, "sum-vec", vec![mapped])
+    let realised = Expr::call(Ty::vec(Ty::Int), "vec", vec![mapped]);
+    Expr::call(Ty::Int, "sum-vec", vec![realised])
 }
 
 /// `(let ((dn (dyn P :send e))) cross)`, where `cross` uses `dn` on

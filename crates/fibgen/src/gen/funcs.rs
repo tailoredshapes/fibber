@@ -88,13 +88,16 @@ pub fn immediate(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
     )
 }
 
-/// `(map (fn (x: i64) ..) v)`: `map` takes its function `:borrow`
-/// (syntax §4.5), so the closure may be non-escaping.
+/// `(vec (map (fn (x: i64) ..) v))`: `map` takes its function `:borrow`
+/// (syntax §4.5), so the closure may be non-escaping; its answer is a lazy
+/// sequence since the flip, which `vec` realises where the program needs
+/// the vector.
 pub fn map_form(g: &mut Gen, cx: &Ctx, d: u32) -> Expr {
     let escaping = g.rng.chance(50);
     let f = literal(g, cx, &[Ty::Int], &Ty::Int, escaping, d);
     let v = g.expr(cx, &Ty::vec(Ty::Int), d);
-    Expr::call(Ty::vec(Ty::Int), "map", vec![f, v])
+    let mapped = Expr::call(Ty::vec(Ty::Int), "map", vec![f, v]);
+    Expr::call(Ty::vec(Ty::Int), "vec", vec![mapped])
 }
 
 /// `(fn (x: i64) stmt)` for `for-each`: non-escaping.

@@ -17,7 +17,7 @@ use crate::syntax::{Form, FormKind};
 
 /// The program that uses each macro. It writes none of the names the
 /// expansions call (`cons trap show + < = not hash str-concat spawn join
-/// eprintln some range-between`), so a bare one in the output is the
+/// eprintln some`), so a bare one in the output is the
 /// macro's.
 const SAMPLES: &[(&str, &str)] = &[
     ("when", "(defun m () (when a b c))"),

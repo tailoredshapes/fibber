@@ -157,7 +157,7 @@ fn a_macro_calling_a_function_of_its_module_is_a_phase_error() {
 /// A macro that calls a prelude function (a required module) expands.
 #[test]
 fn a_macro_calling_a_prelude_function_expands() {
-    let src = "(defmacro twice (x) `(+ ,x ,(nth [x] 0)))
+    let src = "(defmacro twice (x) `(+ ,x ,(vec-nth [x] 0)))
                (defun main () -> i64 (twice 21))";
     clean(src, 42);
 }

@@ -79,12 +79,13 @@ impl<'a> Cx<'_, 'a> {
             .val(&format!("(icmp {pred} {} (i32 0))", c.text()), LirTy::I1))
     }
 
-    /// `fdiv`, the method of `Float`, is the division `/` is on floats;
-    /// `quot` is that quotient rounded toward zero by the C library's
-    /// `trunc` or `truncf` (lIR has no float truncation, and the
-    /// formula `(a - (rem a b)) / b` differs from `(a / b).trunc()`,
-    /// the interpreter's and Clojure's: 2.9999999999999996 for 9.6 and
-    /// 2.8, where the truncated quotient is 3.0).
+    /// `fdiv`, the method of `Float`, is the division the `Div` instances
+    /// of the float types wrap; `quot` is that quotient rounded toward
+    /// zero by the C library's `trunc` or `truncf` (lIR has no float
+    /// truncation, and the formula `(a - (rem a b)) / b` differs from
+    /// `(a / b).trunc()`, the interpreter's and Clojure's:
+    /// 2.9999999999999996 for 9.6 and 2.8, where the truncated quotient
+    /// is 3.0).
     fn float_binary(&mut self, method: &str, x: &V, y: &V) -> V {
         let t = x.ty().unwrap_or(LirTy::Double);
         let (a, b) = (x.text(), y.text());
@@ -92,7 +93,7 @@ impl<'a> Cx<'_, 'a> {
             "+" => (format!("(fadd {a} {b})"), t),
             "-" => (format!("(fsub {a} {b})"), t),
             "*" => (format!("(fmul {a} {b})"), t),
-            "/" | "fdiv" => (format!("(fdiv {a} {b})"), t),
+            "fdiv" => (format!("(fdiv {a} {b})"), t),
             "quot" => {
                 let q = self.b.val(&format!("(fdiv {a} {b})"), t);
                 let f = if t == LirTy::Float { "truncf" } else { "trunc" };

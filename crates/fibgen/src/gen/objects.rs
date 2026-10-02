@@ -93,7 +93,9 @@ fn vector(g: &mut Gen, cx: &Ctx, t: &Ty, d: u32) -> Expr {
         }
         4 if *t == Ty::Int => {
             if g.rng.chance(50) {
-                Expr::call(vt, "range", vec![Expr::int(g.rng.range(0, 5))])
+                // a `Range` since the flip: `vec` makes the vector the type asks for
+                let r = Expr::call(vt.clone(), "range", vec![Expr::int(g.rng.range(0, 5))]);
+                Expr::call(vt, "vec", vec![r])
             } else {
                 funcs::map_form(g, cx, d)
             }

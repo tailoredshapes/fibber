@@ -13,7 +13,7 @@ fn f(clauses: &str) -> String {
 #[test]
 fn elements_have_the_element_type_and_a_rest_the_vector_type() {
     let p = ok(
-        "(defun main () -> i64 (match [\"a\"] ([s & rest] (+ (str-len s) (count rest))) (_ 0)))",
+        "(defun main () -> i64 (match [\"a\"] ([s & rest] (+ (str-len s) (vec-count rest))) (_ 0)))",
     );
     assert_eq!(binding_type(&p, "s"), "str");
     assert_eq!(binding_type(&p, "rest"), "(Vec str)");
@@ -139,7 +139,7 @@ fn malformed_vector_patterns_and_guarded_clauses() {
 
 #[test]
 fn only_the_bare_rest_pattern_binds_a_let() {
-    ok("(defun main () -> i64 (let (([& r] [1 2])) (count r)))");
+    ok("(defun main () -> i64 (let (([& r] [1 2])) (vec-count r)))");
     let es =
         check("(defun main () -> i64 (let (([& r] [1 2]) ([a & _] r)) a))").expect_err("refutable");
     assert!(

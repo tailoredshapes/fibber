@@ -9,7 +9,7 @@ fn struct_reflection_in_a_user_macro() {
     // Adversary 011: struct-* are not string builtins.
     clean(
         "(defstruct P (a: i64 b: str))
-         (defmacro nfields (name) (Int (count (struct-fields name)) :i64))
+         (defmacro nfields (name) (Int (vec-count (struct-fields name)) :i64))
          (defmacro isstruct (name) (if (struct? name) '100 '0))
          (defun main () -> i64 (+ (nfields P) (isstruct P)))",
         102,
@@ -20,7 +20,7 @@ fn struct_reflection_in_a_user_macro() {
 fn enum_reflection_returns_a_vec_and_a_bool() {
     // Adversary 012: (Vec Form) and bool, not a Form.
     clean(
-        "(defmacro nvariants (name) (Int (count (enum-variants name)) :i64))
+        "(defmacro nvariants (name) (Int (vec-count (enum-variants name)) :i64))
          (defmacro isenum (name) (if (enum? name) (quote 10) (quote 0)))
          (defun main () -> i64 (+ (nvariants Option) (isenum Option)))",
         12,
@@ -45,7 +45,7 @@ fn a_macro_run_that_leaks_a_cell_cycle_expands() {
     clean(
         "(defmacro knot (x)
            (let ((c (cell [])))
-             (do (set! c (conj @c (fn () (count @c)))) x)))
+             (do (set! c (vec-conj @c (fn () (vec-count @c)))) x)))
          (defun main () -> i64 (knot 5))",
         5,
     );

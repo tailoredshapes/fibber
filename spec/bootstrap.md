@@ -16,7 +16,6 @@ Rust module they replace, so a reviewer can put the two side by side:
 
 | Module | Replaces | What |
 |---|---|---|
-| `util.result` | (`Result`) | `(Result a b)`: `Ok` or `Err`; the prelude has `Option` only |
 | `util.text` | (none) | string helpers the passes share |
 | `syntax.pos` | `syntax/pos.rs` | `Pos` (file, line, col, byte range) |
 | `syntax.form` | `syntax/form.rs` | `Stx` (a `StxKind` and its `Pos`), `IntWidth`, `FltWidth` |
@@ -209,8 +208,10 @@ and then one of
   one line per node, depth first, two spaces a level, `LINE:COL
   START..END` at the end of each), or, instead of them, one error record,
   which ends the file's dump (a later module is not expanded). The
-  **implicit modules** (syntax §5, `modules::IMPLICIT_LIB`, empty until the
-  library is complete: today only `--implicit-lib` makes any) and the modules
+  **implicit modules** (syntax §5, `modules::IMPLICIT_LIB`: `fib.core`,
+  `fib.seq`, `fib.coll` and `fib.print` since the flip of stdlib tranche 1, so a dump with
+  no option loads and expands the library, about thirty files, before the program; the
+  expansion dump keeps them out, PC-12) and the modules
   they depend on are loaded and expanded first, as the prelude is, and have
   no section of their own, unless `--implicit` is given; an error in one of
   them is still the last record, under its `-- module` line.
@@ -256,7 +257,7 @@ repository root. The prelude's output is not part of a program's dump;
 | `--prelude` | each FILE is a library prelude, not a program: one section `-- module fib.prelude FILE`, holding the expanded forms of `PRELUDE_SOURCE` (every position `@<prelude>`) and then those of FILE, which both are expanded in the one scope and with no runner. With `lib/prelude.fib` it is the prelude every program expands in |
 | `--context` | after the forms of each module, before it is ended, `-- context NS` and the lines of §5.2 |
 | `--implicit` | print the sections of the implicit modules and of the modules read for them (they come first), and, with `--context`, a line `  implicit "M"` under `scope` for each implicit module the scope sees, after the `use` lines |
-| `--implicit-lib LIST` | the implicit modules of this dump are those of LIST, module names separated by commas, in the order they are loaded, instead of `modules::IMPLICIT_LIB`; the empty text is none; an empty name is refused. It makes the rule above testable before the library is implicit |
+| `--implicit-lib LIST` | the implicit modules of this dump are those of LIST, module names separated by commas, in the order they are loaded, instead of `modules::IMPLICIT_LIB`; the empty text is none; an empty name is refused. It makes the rule above testable with small modules, and `--implicit-lib ""` is a dump with no library at all, which is what the byte-for-byte test of the expander runs most inputs with (the default, with the real library, costs its expansion per file and is run on a sample) |
 | `--no-runner` | a call of a user macro is `MacroNeedsEvaluator` (`NoRunner`); the default is the interpreter's macro evaluator, for the stage that has a runner (§5.4) |
 | `--max-steps N`, `--max-depth N`, `--max-forms N` | the limits of `ExpandCtx` (syntax §3.16) once the prelude is expanded, so that a small one reaches its error on a small input |
 
@@ -391,7 +392,7 @@ from that cycle.
 
 **The order of work.** First, each porter makes its modules with every
 public function as a `todo:` stub of its final signature (the Rust one,
-`Form` as `Stx`, `Result` as `util.result`'s), so that the others compile
+`Form` as `Stx`, `Result` as the prelude's), so that the others compile
 against it; the porters of `ctx` and of `build` finish those first, since
 every other module calls them. The porter of the driver wires `walk`,
 `top` and `program` early, so that `compiler/expand.fib` runs on programs

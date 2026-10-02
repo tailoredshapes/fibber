@@ -157,9 +157,9 @@ fn for_each_over_a_literal_range_is_a_loop() {
 
 #[test]
 fn range_takes_one_or_two_arguments_and_declines_three() {
-    // (range a b) is the rewrite to the library's range-between; (range
-    // n) stays the library function, which is also range's value.
-    assert_eq!(ex("(range a b)"), "(fib.prelude/range-between a b)");
+    // (range a b) is the rewrite to the library's range-by with step 1;
+    // (range n) stays the library function, which is also range's value.
+    assert_eq!(ex("(range a b)"), "(fib.seq/range-by a b 1)");
     assert_eq!(ex("(range n)"), "(range n)");
     assert_eq!(ex("(map range xs)"), "(map range xs)");
     // (range a b step) is the library's range-by: declined, so the
@@ -172,30 +172,37 @@ fn range_takes_one_or_two_arguments_and_declines_three() {
 }
 
 #[test]
-fn any_other_for_each_is_the_library_call() {
+fn any_other_for_each_is_run_with_the_function_first() {
     assert_eq!(
         ex("(for-each xs (fn (i) (f i)))"),
-        "(for-each xs (fn (i) (f i)))"
+        "(fib.seq/run! (fn (i) (f i)) xs)"
     );
-    assert_eq!(ex("(for-each (range n) f)"), "(for-each (range n) f)");
+    assert_eq!(ex("(for-each (range n) f)"), "(fib.seq/run! f (range n))");
     assert_eq!(
         ex("(for-each (range a b) f)"),
-        "(for-each (fib.prelude/range-between a b) f)"
+        "(fib.seq/run! f (fib.seq/range-by a b 1))"
     );
     assert_eq!(
         ex("(for-each (range a b) (fn g (i) i))"),
-        "(for-each (fib.prelude/range-between a b) (fn g (i) i))"
+        "(fib.seq/run! (fn g (i) i) (fib.seq/range-by a b 1))"
     );
     // An annotated parameter: loop variables take no annotation, so the
     // library function runs the fn and checks it (case 86).
     assert_eq!(
         ex("(for-each (range a b) (fn (i: i64) i))"),
-        "(for-each (fib.prelude/range-between a b) (fn (i: i64) i))"
+        "(fib.seq/run! (fn (i: i64) i) (fib.seq/range-by a b 1))"
     );
     assert_eq!(
         ex("(for-each (range a b) (fn (i) -> i64 i))"),
-        "(for-each (fib.prelude/range-between a b) (fn (i) -> i64 i))"
+        "(fib.seq/run! (fn (i) -> i64 i) (fib.seq/range-by a b 1))"
     );
+    for src in ["(for-each xs)", "(for-each)", "(for-each xs f g)"] {
+        let e = ex_err(src);
+        assert!(
+            matches!(e.kind, K::MacroArity { ref name, .. } if name == "for-each"),
+            "{src}"
+        );
+    }
 }
 
 #[test]

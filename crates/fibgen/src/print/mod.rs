@@ -45,7 +45,7 @@ const PREAMBLE: [(&[&str], &str); 13] = [
         // A fold that sees every element and its place; `fib.prelude/..`
         // so that it does not use the library the pipeline tests.
         &["digest"],
-        "(defun digest (v: (Vec i64)) -> i64\n  (loop ((i 0) (h 7))\n    (if (< i (fib.prelude/count v))\n        (recur (+ i 1) (rem (+ (* h 31) (fib.prelude/nth v i)) 1000003))\n        h)))",
+        "(defun digest (v: (Vec i64)) -> i64\n  (loop ((i 0) (h 7))\n    (if (< i (vec-count v))\n        (recur (+ i 1) (rem (+ (* h 31) (vec-nth v i)) 1000003))\n        h)))",
     ),
     (
         &["sum-vec"],

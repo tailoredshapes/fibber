@@ -45,7 +45,7 @@ const REFLECTION: Scenario = Scenario {
 (defmacro describe (name)
   (let ((g (gensym \"d\")))
     (if (struct? name)
-        `(let ((,g ,(Int (count (struct-fields name)) :i64))) (do ,@(struct-fields name) ,g))
+        `(let ((,g ,(Int (vec-count (struct-fields name)) :i64))) (do ,@(struct-fields name) ,g))
         `(quote ,name))))
 (defun main () -> i64 (do (describe P) (describe Q) 0))",
     wanted: "describe",

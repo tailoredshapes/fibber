@@ -9,11 +9,9 @@ use crate::types::ast::{ExprKind, FunId};
 use crate::types::decls::ModuleId;
 use crate::types::scheme::Scheme;
 use crate::types::ty::{Colour, Leaf, Pred, Ty};
-use crate::types::{
-    check_library, check_source, prelude_forms, ErrorKind, SourceError, TypedProgram,
-};
+use crate::types::{check_library, prelude_forms, ErrorKind, TypedProgram};
 
-use super::{binding_type, ok};
+use super::{binding_type, ok_lib};
 
 fn case_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cases/ownership")
@@ -24,8 +22,9 @@ fn case_source(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// The case through the module loader, with the implicit library.
 fn case(name: &str) -> TypedProgram {
-    ok(&case_source(name))
+    ok_lib(&case_source(name))
 }
 
 fn fun(p: &TypedProgram, name: &str) -> FunId {
@@ -70,11 +69,7 @@ fn the_prelude_type_checks() {
         show("pmap"),
         "∀a b. (Send b) (Send a) ⇒ (fn :send ((fn :send (a) b) (Vec a)) (Vec b))"
     );
-    assert_eq!(show("collect"), "∀a b. (Iter a b) ⇒ (fn :send (a) (Vec b))");
-    assert_eq!(
-        show("push!"),
-        "∀a b. (Collection a b) ⇒ (fn ((& a) b) unit)"
-    );
+    assert_eq!(show("push!"), "∀a. (fn ((& (Vec a)) a) unit)");
     assert_eq!(show("unbox"), "∀a. (fn :send ((Box a)) a)");
     assert_eq!(show("nil?"), "∀a. (fn :send ((Option a)) bool)");
     assert_eq!(show("block-on"), "∀a. (fn :send ((Task a)) a)");
@@ -110,7 +105,7 @@ fn every_accept_case_type_checks_and_13_and_14_do_not() {
         if case_source(name).contains("(defmacro") {
             continue;
         }
-        let r = check_source(&case_source(name), name);
+        let r = crate::own::check_source(&case_source(name), name);
         // By number: "13" is a prefix of "131".
         match (name.split('-').next().unwrap_or_default(), r) {
             ("13" | "14", r) => assert!(r.is_err(), "{name} type-checked"),
@@ -125,10 +120,12 @@ fn every_accept_case_type_checks_and_13_and_14_do_not() {
 
 #[test]
 fn case_13_fails_with_the_canonical_text_and_witness() {
-    let err = match check_source(&case_source("13-reject-cell-crosses-thread.fib"), "13.fib") {
-        Err(SourceError::Type(es)) => es[0].clone(),
-        other => panic!("expected a type error, got {:?}", other.map(|_| ())),
-    };
+    let err =
+        match crate::own::check_source(&case_source("13-reject-cell-crosses-thread.fib"), "13.fib")
+        {
+            Err(crate::own::CheckError::Type(es)) => es[0].clone(),
+            other => panic!("expected a type error, got {:?}", other.map(|_| ())),
+        };
     assert_eq!(err.kind, ErrorKind::CellNotSend);
     assert_eq!(
         err.message,
@@ -147,8 +144,11 @@ fn case_13_fails_with_the_canonical_text_and_witness() {
 /// type-check".
 #[test]
 fn case_14_is_rejected_by_the_async_send_rule() {
-    let err = match check_source(&case_source("14-reject-inout-in-async.fib"), "14.fib") {
-        Err(SourceError::Type(es)) => es[0].clone(),
+    // the typing rules alone, with the prelude only: the library's `count` is
+    // not in scope there, so the prelude's `vec-count` stands for it
+    let src = case_source("14-reject-inout-in-async.fib").replace("(count @b)", "(vec-count @b)");
+    let err = match crate::types::check_source(&src, "14.fib") {
+        Err(crate::types::SourceError::Type(es)) => es[0].clone(),
         other => panic!("expected a type error, got {:?}", other.map(|_| ())),
     };
     assert_eq!(err.kind, ErrorKind::CellNotSend);
@@ -160,15 +160,23 @@ fn case_14_is_rejected_by_the_async_send_rule() {
 }
 
 #[test]
-fn case_01_head_is_generic_over_seq() {
+fn case_01_head_is_generic_over_reducible() {
     let p = case("01-return-part-of-argument.fib");
     let s = scheme(&p, "head");
-    // §Appendix A: head : ∀s e. (Seq s e) ⇒ (fn (s) e).
-    let seq = p.globals.proto_name(ModuleId::PRELUDE, "Seq").expect("Seq");
+    // §Appendix A: head : ∀c e. (Reducible c e) ⇒ (fn (c) e), the library's.
+    let proto = p
+        .globals
+        .protos
+        .iter()
+        .position(|g| g.name == "Reducible")
+        .expect("Reducible");
     assert_eq!(s.n_vars, 2);
     assert_eq!(
         s.preds,
-        vec![Pred::Proto(seq, vec![Ty::Gen(0), Ty::Gen(1)])]
+        vec![Pred::Proto(
+            crate::types::ty::ProtoId(proto as u32),
+            vec![Ty::Gen(0), Ty::Gen(1)]
+        )]
     );
     assert_eq!(
         s.ty,
@@ -236,7 +244,7 @@ fn case_19_depth_without_its_annotation_is_an_error() {
     // §3.4: depth has only a field access and a recursive call.
     let src = case_source("19-weak-parent-pointer.fib")
         .replace("(defun depth (n: Node) -> i64", "(defun depth (n)");
-    super::fails(
+    super::fails_lib(
         &src,
         ErrorKind::FieldUnresolved,
         "cannot infer the struct type of n for field parent; annotate it",
@@ -341,7 +349,8 @@ fn method_uses_record_their_instances() {
     }
     heads.sort_by(|a, b| a.0.cmp(&b.0));
     let names: Vec<&str> = heads.iter().map(|h| h.0.as_str()).collect();
-    assert_eq!(names, ["+", "count", "nth"]);
+    // `count` is the library's function over `size` now, not a method
+    assert_eq!(names, ["+", "nth"]);
     for (name, r) in &heads {
         let Some(crate::types::infer::Resolution::Instance { index, args }) = r else {
             panic!("{name}: {r:?}")

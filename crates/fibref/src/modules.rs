@@ -24,10 +24,10 @@ pub use load::{load, load_in, sees_implicit, try_load, try_load_in, try_load_wit
 pub use spec::{spec_of, ModuleSpec};
 
 /// The library modules every module of a program sees without naming
-/// them (syntax §5), in the order they are loaded: empty until the
-/// library is complete, so that nothing in an existing program changes
-/// (stdlib design §6.2: `fib.core`, `fib.seq`, `fib.coll`, `fib.print`).
-pub const IMPLICIT_LIB: &[&str] = &[];
+/// them (syntax §5), in the order they are loaded (stdlib design §6.2:
+/// `fib.core`, `fib.seq`, `fib.coll`, `fib.print`, each a facade of the
+/// parts under `lib/fib/`).
+pub const IMPLICIT_LIB: &[&str] = &["fib.core", "fib.seq", "fib.coll", "fib.print"];
 
 /// A module as read: its spec, its file and its forms before expansion.
 #[derive(Clone, Debug)]

@@ -202,9 +202,13 @@ impl Queue {
 mod tests {
     use super::*;
 
+    /// A generic function of two type variables and no bounds: the prelude
+    /// has none since the flip (its `map` was one), so the test brings it.
+    const TWIN: &str = "(defun twin (x: a y: b) -> a x) (defun main () -> i64 1)";
+
     #[test]
     fn classes_and_representatives() {
-        let checked = fibref::own::check_source("(defun main () -> i64 1)", "t").expect("checks");
+        let checked = fibref::own::check_source(TWIN, "t").expect("checks");
         let g = &checked.typed.globals;
         assert_eq!(class_of(g, &Ty::str()).unwrap(), Class::Ptr);
         let opt = Ty::nominal(g.option, vec![Ty::str()]);
@@ -229,8 +233,8 @@ mod tests {
         assert_eq!(class_of(g, &Ty::i64()).unwrap(), Class::Scalar(LirTy::I64));
         assert_eq!(representative(g, Class::Opt), opt);
         let vec = g.vec.unwrap();
-        let s = checked.typed.scheme("map").unwrap().clone();
-        // map : (fn ((fn (a) b) (Vec a)) (Vec b)) has no bounds.
+        let s = checked.typed.scheme("twin").unwrap().clone();
+        // twin : (fn (a b) a) has no bounds.
         let key = fun_key(g, &s, &[Ty::nominal(vec, vec![Ty::i64()]), Ty::bool()]).unwrap();
         assert_eq!(key, vec![Ty::str(), Ty::bool()]);
     }
@@ -239,12 +243,12 @@ mod tests {
     /// would be taken on an address (types §4.3, §8.1).
     #[test]
     fn a_raw_ptr_is_a_scalar_class_of_its_own() {
-        let checked = fibref::own::check_source("(defun main () -> i64 1)", "t").expect("checks");
+        let checked = fibref::own::check_source(TWIN, "t").expect("checks");
         let g = &checked.typed.globals;
         let ptr = Ty::scalar(Scalar::Ptr);
         assert_eq!(class_of(g, &ptr).unwrap(), Class::Scalar(LirTy::Raw));
         assert_eq!(representative(g, Class::Scalar(LirTy::Raw)), ptr);
-        let s = checked.typed.scheme("map").unwrap().clone();
+        let s = checked.typed.scheme("twin").unwrap().clone();
         let key = fun_key(g, &s, &[ptr.clone(), Ty::bool()]).unwrap();
         assert_eq!(key, vec![ptr, Ty::bool()]);
         assert_ne!(key[0], fun_key(g, &s, &[Ty::str(), Ty::bool()]).unwrap()[0]);

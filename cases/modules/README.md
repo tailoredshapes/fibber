@@ -35,9 +35,10 @@ every machine. A subdirectory of a case that holds roots has no
 - 006: a `:private` macro is not reached through an alias (reject:
   `unbound name u/hidden`).
 - 007: the program's own protocol `Collection` with a method `conj`,
-  implemented for `(Vec a)`, beside the prelude's: the program's method
-  shadows the prelude's for a bare `conj` (syntax §5) and the vector
-  literal and `fib.prelude/conj` are the prelude's (43). `fibc` named both
+  implemented for `(Vec a)`, beside the library's (`fib.coll`, implicit
+  since the flip): the program's method shadows the library's for a bare
+  `conj` (syntax §5), the vector literal is the prelude's `vec-conj` and
+  `fib.coll/conj` the library's (43). `fibc` named both
   `m.Collection.conj.$Vec..` and said `duplicate definition`; the symbol of
   a protocol's method and of its vtable now carries the defining module.
 - 008: two modules each define a protocol `Sized` with a method `size`

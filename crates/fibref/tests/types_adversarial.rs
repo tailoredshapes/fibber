@@ -212,7 +212,7 @@ fn local_closure_reaches_pmap_through_two_higher_order_functions() {
                (defun par2 (g ys) (par g ys))
                (defun main () -> i64
                  (let ((n (cell 0)))
-                   (do (par2 (fn (i) (+ @n i)) (range 3)) 0)))";
+                   (do (par2 (fn (i) (+ @n i)) [0 1 2]) 0)))";
     let e = fails(
         src,
         ErrorKind::CellNotSend,
@@ -233,7 +233,7 @@ fn local_closure_reaches_pmap_through_two_higher_order_functions() {
     // And a closure that is not local passes.
     ok(
         "(defun par (f xs) (pmap f xs)) (defun par2 (g ys) (par g ys))
-        (defun main () -> i64 (let ((k 1)) (count (par2 (fn (i) (+ k i)) (range 3)))))",
+        (defun main () -> i64 (let ((k 1)) (vec-count (par2 (fn (i) (+ k i)) [0 1 2]))))",
     );
 }
 
@@ -267,7 +267,7 @@ fn send_is_checked_through_a_struct_field_and_an_option() {
     // Through an element of a Vec (the library's Vec is a trie over Array;
     // the witness is the first path found, through the trie's root).
     let e = fails(
-        "(defun main () -> i64 (let ((v [(cell 0)])) (do (spawn (fn () (count v))) 0)))",
+        "(defun main () -> i64 (let ((v [(cell 0)])) (do (spawn (fn () (vec-count v))) 0)))",
         ErrorKind::CellNotSend,
         "cell cannot be shared between threads: closure capture v, payload 2 of VecOf, payload of some, payload of VLeaf, element of (Array (Cell i64)) has type (Cell i64)",
     );
@@ -321,10 +321,10 @@ fn closure_colours_are_quantified_and_reinstantiated() {
             && matches!(**r, Ty::Fn(Colour::Gen(_), _, _))
     );
     ok("(defun twice (f) (fn (x) (f (f x))))
-        (defun main () -> i64 (count (pmap (twice (fn (x) (+ x 1))) (range 3))))");
+        (defun main () -> i64 (vec-count (pmap (twice (fn (x) (+ x 1))) [0 1 2])))");
     fails(
         "(defun twice (f) (fn (x) (f (f x))))
-         (defun main () -> i64 (let ((c (cell 1))) (count (pmap (twice (fn (x) (+ x @c))) (range 3)))))",
+         (defun main () -> i64 (let ((c (cell 1))) (vec-count (pmap (twice (fn (x) (+ x @c))) [0 1 2]))))",
         ErrorKind::CellNotSend,
         "cell cannot be shared between threads",
     );
@@ -359,7 +359,7 @@ fn prelude_names_are_shadowed_by_user_definitions() {
         .expect("prelude Box");
     assert_ne!(user_box, prelude_box);
     // The literal rewrite still reaches the prelude's conj.
-    ok("(defun conj (a b) a) (defun main () -> i64 (count [1 2 3]))");
+    ok("(defun conj (a b) a) (defun main () -> i64 (vec-count [1 2 3]))");
 }
 
 #[test]
@@ -425,5 +425,5 @@ fn deep_nesting_does_not_exhaust_the_stack() {
     let args = vec!["true"; 1990].join(" ");
     ok(&format!("(defun main () -> i64 (if (and {args}) 1 0))"));
     let args = vec!["(some 1)"; 1990].join(" ");
-    ok(&format!("(defun main () -> i64 (count (list {args})))"));
+    ok(&format!("(defun main () -> i64 (do (list {args}) 0))"));
 }

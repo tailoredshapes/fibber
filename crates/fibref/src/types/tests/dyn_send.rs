@@ -68,14 +68,14 @@ fn dyn_send_and_dyn_do_not_unify_but_convert_explicitly() {
     fails(
         &with(
             "(defun main () -> i64
-               (let ((s (dyn Show :send (Named \"a\")))) (count [(dyn Show (Named \"b\")) s])))",
+               (let ((s (dyn Show :send (Named \"a\")))) (vec-count [(dyn Show (Named \"b\")) s])))",
         ),
         K::Unify,
         "cannot unify",
     );
     ok(&with(
         "(defun main () -> i64
-           (let ((s (dyn Show :send (Named \"a\")))) (count [(dyn Show (Named \"b\")) (dyn Show s)])))",
+           (let ((s (dyn Show :send (Named \"a\")))) (vec-count [(dyn Show (Named \"b\")) (dyn Show s)])))",
     ));
 }
 

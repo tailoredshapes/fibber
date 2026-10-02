@@ -95,7 +95,7 @@ impl Machine<'_> {
     fn collection(&mut self, h: &str, a: Vec<V>) -> Res {
         match (h, a.as_slice()) {
             ("count", [V::Vector(xs) | V::List(xs)]) => Ok(V::Int(xs.len() as i64)),
-            ("count", [V::Str(s)]) => Ok(V::Int(s.len() as i64)),
+            ("count", [V::Str(s)]) => Ok(V::Int(s.chars().count() as i64)),
             ("nth", [V::Vector(xs) | V::List(xs), V::Int(i)]) => usize::try_from(*i)
                 .ok()
                 .and_then(|i| xs.get(i).cloned())
@@ -118,6 +118,9 @@ impl Machine<'_> {
                 (V::Int(a), V::Int(b)) => arith("+", *a, *b),
                 (_, v) => Err(unsupported(format!("sum-vec over {v:?}"))),
             }),
+            // `vec` of a vector: the generator wraps every `map` in it (a lazy
+            // sequence since the flip), and the model's `map` already is the vector
+            ("vec", [V::Vector(xs)]) => Ok(V::Vector(xs.clone())),
             ("map" | "pmap", [f, V::Vector(xs)]) => {
                 let mut out = Vec::new();
                 for x in xs.iter() {

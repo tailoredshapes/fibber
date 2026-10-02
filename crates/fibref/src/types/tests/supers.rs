@@ -5,6 +5,11 @@ use crate::types::ErrorKind as K;
 
 use super::{fails, ok};
 
+/// The protocol the prelude had before the flip, which these programs
+/// write themselves (the library's `Reducible` has other methods).
+const INDEXABLE: &str = "(defprotocol (Indexable s e) (nth (self i: i64) -> e))
+         (impl (Indexable a) (Vec a) (nth (self i) (vec-nth self i)))";
+
 #[test]
 fn a_protocol_that_requires_itself_is_refused() {
     fails(
@@ -19,14 +24,20 @@ fn a_protocol_that_requires_itself_is_refused() {
 #[test]
 fn a_supertrait_names_the_dispatch_parameter_first() {
     fails(
-        "(defprotocol (Coll s e) :requires ((Indexable e s)) (c (self) -> i64))
-         (defun main () -> i64 0)",
+        &format!(
+            "{INDEXABLE}
+         (defprotocol (Coll s e) :requires ((Indexable e s)) (c (self) -> i64))
+         (defun main () -> i64 0)"
+        ),
         K::Resolve,
         "a supertrait is Indexable or (Indexable s ..)",
     );
     fails(
-        "(defprotocol (Coll s e) :requires (Indexable) (c (self) -> i64))
-         (defun main () -> i64 0)",
+        &format!(
+            "{INDEXABLE}
+         (defprotocol (Coll s e) :requires (Indexable) (c (self) -> i64))
+         (defun main () -> i64 0)"
+        ),
         K::Resolve,
         "a supertrait is Indexable or (Indexable s ..)",
     );
@@ -34,7 +45,10 @@ fn a_supertrait_names_the_dispatch_parameter_first() {
 
 #[test]
 fn a_determined_supertrait_must_agree_with_the_impl() {
-    let proto = "(defprotocol (Coll s e) :requires ((Indexable s e)) (first-of (self) -> e))";
+    let proto = format!(
+        "{INDEXABLE}
+         (defprotocol (Coll s e) :requires ((Indexable s e)) (first-of (self) -> e))"
+    );
     ok(&format!(
         "{proto}
          (impl (Coll a) (Vec a) (first-of (self) (nth self 0)))

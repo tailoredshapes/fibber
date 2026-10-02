@@ -56,7 +56,7 @@
 ;;   uses expand.derive, expand.build, expand.core, expand.ctx and
 ;;   expand.error, and is used by expand.expr.
 (ns expand.prelude
-  (:use syntax.pos syntax.form util.result expand.error expand.types expand.ctx expand.build
+  (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.build
         expand.collections expand.prelude.parts expand.prelude.forms expand.prelude.print
         expand.prelude.defn expand.prelude.update expand.prelude.reduce
         expand.prelude.fold expand.prelude.colls expand.prelude.atoms)
@@ -301,7 +301,7 @@
            ((and (= (count xs) 2) (is-sym (nth xs 0) "range")) (some [(int 0 (. form pos)) (nth xs 1)]))
            (true nil)))))
 
-;; `(range a b)` ==> `(fib.prelude/range-between a b)`; `(range n)` is declined and
+;; `(range a b)` ==> `(fib.seq/range-by a b 1)`; `(range n)` is declined and
 ;; stays a call of the library function `range` (§4.4, §4.5). There is
 ;; no arity overloading, so the two-argument form is this rewrite. A call
 ;; of three arguments is declined too: it is Clojure's `(range a b step)`,
@@ -315,7 +315,7 @@
         ((Err e) (Err e))
         ((Ok _)
          (if (= (count items) 3)
-             (Ok (Rewritten (call (prelude-name "range-between") [(nth items 1) (nth items 2)] pos)))
+             (Ok (Rewritten (call "fib.seq/range-by" [(nth items 1) (nth items 2) (int 1 pos)] pos)))
              (Ok (Declined (list-form items pos))))))))
 
 ;; The `i` and body of a literal `(fn (i) body+)`, as `i` then the body:
@@ -346,17 +346,27 @@
   (and (> (str-len s) 0) (= (str-slice s (- (str-len s) 1) (str-len s)) ":")))
 
 ;; `(for-each (range a b) (fn (i) body...))` becomes the loop; any other
-;; `for-each` call is declined and stays a call of the library function.
+;; `(for-each c f)` is `(fib.seq/run! f c)`, the library's walk with the
+;; function first; any other number of arguments is the macro's arity
+;; error.
 (defun for-each-macro :private (ctx: ExpandCtx items: (Vec Stx) pos: Pos)
     -> (Result Outcome ExpandError)
-  (if (= (count items) 3)
-      (match (literal-range (nth items 1))
-        (nil (Ok (Declined (list-form items pos))))
-        ((some bounds)
-         (match (literal-fn (nth items 2))
-           (nil (Ok (Declined (list-form items pos))))
-           ((some fun) (Ok (Rewritten (for-each-loop ctx bounds fun pos)))))))
-      (Ok (Declined (list-form items pos)))))
+  (match (check-arity "for-each" items 2 (some 2) pos)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (for-each-shape items)
+       (nil (Ok (Rewritten (call "fib.seq/run!" [(nth items 2) (nth items 1)] pos))))
+       ((some fun-bounds)
+        (Ok (Rewritten (for-each-loop ctx (nth fun-bounds 0) (nth fun-bounds 1) pos))))))))
+
+;; The `[a b]` and the parameter and body of a literal-range literal-fn pair.
+(defun for-each-shape :private (items: (Vec Stx)) -> (Option (Vec (Vec Stx)))
+  (match (literal-range (nth items 1))
+    (nil nil)
+    ((some bounds)
+     (match (literal-fn (nth items 2))
+       (nil nil)
+       ((some fun) (some [bounds fun]))))))
 
 ;; The loop of a `for-each` over `a b` with the parameter and body `fun`;
 ;; `s` is handed out before `m`.

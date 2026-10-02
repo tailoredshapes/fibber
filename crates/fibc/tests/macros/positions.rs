@@ -89,7 +89,7 @@ const TEMPLATES: [Template; 35] = [
     ),
     t(
         "(x)",
-        "(match x ((List items) (List (map (fn (c) (List [(Sym \"do\") c])) items))) (_ x))",
+        "(match x ((List items) (List (loop ((i 0) (acc [])) (if (< i (vec-count items)) (recur (+ i 1) (vec-conj acc (List [(Sym \"do\") (vec-nth items i)]))) acc)))) (_ x))",
         Args::Fixed(1),
     ),
     t(
@@ -110,7 +110,7 @@ const TEMPLATES: [Template; 35] = [
     t("(a b)", "`(do ,b ,a)", Args::Fixed(2)),
     t("(a b)", "(List [(Sym \"do\") a (Int 1 :i64) b (Str \"s\") a])", Args::Fixed(2)),
     t("(a b)", "(Vec [a (Vec [b]) (Map [b a]) (List [])])", Args::Fixed(2)),
-    t("(a b)", "(match a ((List items) (List (conj items b))) (_ (List [a b])))", Args::Fixed(2)),
+    t("(a b)", "(match a ((List items) (List (vec-conj items b))) (_ (List [a b])))", Args::Fixed(2)),
     t("(a b)", "(match b ((List items) (List (concat [a] items))) (_ b))", Args::Fixed(2)),
     t("(a b c)", "`(do ,c (,b) ,a [,c ,a])", Args::Fixed(3)),
     // Forms the macro made itself: quoted, gensym'd, nil, `(do)`.
@@ -253,7 +253,7 @@ const SPECIAL: [&str; 6] = [
     "(defmacro m (x) (List (struct-fields x)))\n(defun f () -> i64 (m P))\n(defun g () -> i64 (do (m P)))\n",
     "(defmacro m (x) (Bool (struct? x)))\n(defun f () -> i64 (m P))\n(defun g () -> i64 (m Q))\n",
     "(defmacro m (x) (List [(Sym \"do\") x (List (struct-fields x))]))\n(defun f () -> i64 (m P))\n",
-    "(defmacro m (x) (Int (count (enum-variants x)) :i64))\n(defun f () -> i64 (m Option))\n",
+    "(defmacro m (x) (Int (vec-count (enum-variants x)) :i64))\n(defun f () -> i64 (m Option))\n",
     "(defmacro defpair (a b) `(do (def ,a 1) (def ,b 2)))\n(defpair x\n  y)\n(defpair é 日)\n",
     "(defmacro m (... xs) `(do ,@xs))\n(m)\n(m (def a 1) (def b 2))\n(m (m (def c 1)))\n",
 ];

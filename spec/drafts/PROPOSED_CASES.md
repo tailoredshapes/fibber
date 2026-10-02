@@ -37,7 +37,7 @@ noted.
 (defun main () -> i64
   (let ((x (cell [1 2 3])))
     (let ((c (leak &x)))
-      (count @c))))
+      (vec-count @c))))
 ```
 
 Pins syntax §3.13 rule 5 / types §2.14: an `&` parameter occurs only as
@@ -147,7 +147,7 @@ anyway. `str-concat` keeps the string off the `IMMORTAL` path.
 (defun main () -> i64
   (let ((x (cell [])))
     (fill &x 3)
-    (count @x)))
+    (vec-count @x)))
 ```
 
 Pins types §6.10 step 2 and syntax §3.13 (self tail call with `&v` at
@@ -168,7 +168,7 @@ place.
 ;; The task handle is discarded while the thread is still running. The
 ;; thread holds its own count on the task; main's return waits for it.
 (defun main () -> i64
-  (do (spawn (fn () (count (range 100000))))
+  (do (spawn (fn () (vec-count (range 100000))))
       0))
 ```
 
@@ -236,7 +236,7 @@ value.
     @v))
 
 (defun main () -> i64
-  (count (iota 5)))
+  (vec-count (iota 5)))
 ```
 
 Pins syntax §3.18 and §4.4 (`dotimes` expands to `loop`/`recur`, not to
@@ -294,6 +294,8 @@ Under `unique?` alone the field was taken, `@wk` upgraded and
 ;; the write; the cycle is broken by the set!, so nothing leaks.
 (defstruct Bag (back: (Cell (Option (Cell Bag)))))
 
+(defprotocol Countable (count (self) -> i64))
+
 (impl Countable Bag
   (count (self)
     (match @(. self back)
@@ -338,7 +340,7 @@ expansion of `dotimes` this was rejected with `await outside async`.
 ;; result: 2
 ;; audit:  clean
 ;; The normative list expansion ends in the bare constant empty.
-(defun main () -> i64 (count (list 1 2)))
+(defun main () -> i64 (vec-count (list 1 2)))
 ```
 
 Pins syntax §3.9 / §4.4 and types §2.2: `(list 1 2)` expands to `(cons
@@ -384,7 +386,7 @@ is rejected earlier with `no implementation of Describe for a; add
 (defun main () -> i64
   (let ((s (cell (P [] "b"))))
     (push! &(. s items) 1)
-    (count (. @s items))))
+    (vec-count (. @s items))))
 ```
 
 Pins syntax §3.13's place grammar (`(. sym field)` for any variable of
@@ -443,7 +445,7 @@ Cases 37 onward came out of the second round of confirmed findings on
   (let ((q '(a b)))
     (let ((c (cell (items q))))
       (push! &c 'z)
-      (count (items q)))))
+      (vec-count (items q)))))
 ```
 
 Pins types §8.2 / §6.6 (`fib.unique?` is false on `IMMORTAL`, `STACK`
@@ -482,7 +484,7 @@ compiler's does.
 (defun main () -> i64
   (let ((x (cell [])))
     (bump &x)
-    (count @x)))
+    (vec-count @x)))
 ```
 
 Pins syntax §3.1 / §3.13 rule 3 and types §6.9: a `defun` is an async
@@ -535,7 +537,7 @@ reduces through the `Vec` instance to the listed `(Eq a)`.
 ;; error:  declared :borrow but escapes
 (defun keep (xs: (Vec i64) :borrow) -> (Vec i64) xs)
 
-(defun main () -> i64 (count (keep [1 2])))
+(defun main () -> i64 (vec-count (keep [1 2])))
 ```
 
 Pins syntax §3.1's `param` grammar (`sym :borrow`, `sym: type
@@ -598,7 +600,7 @@ normative `derive`/`defrecord` shape had no representation. Variant:
 (def primes [2 3 5 7 11 13])
 
 (defun main () -> i64
-  (plet ((a (count primes))
+  (plet ((a (vec-count primes))
          (b (nth primes 0)))
     (+ a b)))
 ```
@@ -803,13 +805,13 @@ field-less enum).
 ;; it: the jump releases x before the next iteration calls g. The
 ;; closure is on the heap whatever spin's summary for g says, so it
 ;; retains x and frees it with itself, after its own body has read it.
-(defun make () (conj [] 1))
+(defun make () (vec-conj [] 1))
 
 (defun spin (g n)
   (let ((x (make)))
     (if (= n 0)
         (g)
-        (spin (fn () (count x)) (- n 1)))))
+        (spin (fn () (vec-count x)) (- n 1)))))
 
 (defun main () -> i64 (spin (fn () 0) 1))
 ```
@@ -933,11 +935,11 @@ candidates that D5 and D6 call for (types §7): 53 to 57 are those, and
 ;; hop's vector dies at that hop's jump.
 (defstruct K (f: (fn ((Vec i64) i64 K) i64)))
 
-(defun mk () (conj [] 1))
+(defun mk () (vec-conj [] 1))
 
 (defun hop (s: (Vec i64) n: i64 k: K) -> i64
   (if (= n 0)
-      (count s)
+      (vec-count s)
       ((. k f) (mk) (- n 1) k)))
 
 (defun main () -> i64 (hop (mk) 1000000 (K hop)))
@@ -1049,7 +1051,7 @@ last hop reads its box, returns 2 and releases it. Clean.
 (defun main () -> i64
   (let ((x (cell [])))
     (twice &x)
-    (count @x)))
+    (vec-count @x)))
 ```
 
 Pins types §6.10 rule (b) and syntax §3.13: only a self tail call with
@@ -1112,7 +1114,7 @@ scope-local: its initialiser is a `let`, not an allocation (§6.11).
 ;; A returned closure whose body ends in a call that borrows one of its
 ;; captures. The capture is held by the closure object, which the body
 ;; releases when it leaves, so that call must not be a tail call.
-(defun mk () (let ((v [1 2 3])) (fn () (count v))))
+(defun mk () (let ((v [1 2 3])) (fn () (vec-count v))))
 
 (defun main () -> i64 (+ ((mk)) 0))
 ```
@@ -1277,9 +1279,9 @@ with `audit: leak-cycle`: `C` holds `G`, which captures `C` (§6).
 (defun head (xs) (first xs))
 
 (defun main () -> i64
-  (let ((l (list (box (conj [] 1)))))
+  (let ((l (list (box (vec-conj [] 1)))))
     (let ((h (head l)))
-      (count (unbox h)))))
+      (vec-count (unbox h)))))
 ```
 
 Pins types §6.11 (only an initialiser that allocates in this frame — a
@@ -1452,7 +1454,7 @@ a heap object, is released by its inline drop.
 (defun main () -> i64
   (let ((c (cell [1 2 3])))
     (for-each @c (fn (x) (push! &c x)))
-    (count @c)))
+    (vec-count @c)))
 ```
 
 Pins types §6.3 and §6.7 (a cell read is an acquire, never elided),
@@ -1518,9 +1520,9 @@ the write-back undoes it.
 ;; vector without passing it on. The frame releases it before the jump;
 ;; the base case returns it through the if.
 (defun last-of (acc n)
-  (if (= n 0) acc (last-of (conj [] n) (- n 1))))
+  (if (= n 0) acc (last-of (vec-conj [] n) (- n 1))))
 
-(defun main () -> i64 (count (last-of (conj [] 0) 1000)))
+(defun main () -> i64 (vec-count (last-of (vec-conj [] 0) 1000)))
 ```
 
 Pins types §6.10 step 3 (the frame's owned parameters that step 2 did
@@ -1822,7 +1824,7 @@ the result after `str-len` (freed).
 
 (defun last-or (default xs)
   (loop ((best default) (i 0))
-    (if (< i (count xs)) (recur (nth xs i) (+ i 1)) best)))
+    (if (< i (vec-count xs)) (recur (nth xs i) (+ i 1)) best)))
 
 (defun main () -> i64
   (let ((r (last-or (Named (str-concat "a" "b")) [])))
@@ -1854,11 +1856,11 @@ releases `r` (freed, with its string). Clean. Companions, on use (b) of
   (let ((k (let ((s (str-concat "ab" "c"))) (mk s))))
     (k)))                                        ; accept, 3, clean
 
-(defun leak (&v) (keep (fn () (set! v (conj [] 9)))))
+(defun leak (&v) (keep (fn () (set! v (vec-conj [] 9)))))
 (defun main () -> i64
-  (let ((c (cell (conj [] 1))))
+  (let ((c (cell (vec-conj [] 1))))
     (let ((k (leak &c)))
-      (do (k) (count @c)))))                     ; reject: & parameter captured by escaping closure
+      (do (k) (vec-count @c)))))                     ; reject: & parameter captured by escaping closure
 ```
 
 `keep`'s `f` escapes (the initialiser and the `recur` retain it into
@@ -1961,11 +1963,11 @@ acquires `Sq3` (2), the call dispatches through the vtable and returns
   (do (push! &v 0)
       (let ((snap @v))
         (do (set! v [])
-            (count snap)))))
+            (vec-count snap)))))
 
 (defun main () -> i64
   (let ((c (cell [1 2 3])))
-    (+ (swap-out &c) (count @c))))
+    (+ (swap-out &c) (vec-count @c))))
 ```
 
 Pins syntax §3.13's "a value read from `v` and still in use always holds

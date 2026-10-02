@@ -25,15 +25,16 @@ case: it holds the modules the generated cases share. The library itself is
 `lib/fib/`, found by the header key `roots` (`;; roots: ../../lib support`)
 until the embedded copy of `lib/` is rebuilt into every binary.
 
-A case lists the facades it needs, because no module is implicit until the
-plan's step M flips the list:
+The four facades are the implicit modules since the flip (step M of the plan),
+so a case needs no `:use` of them; the cases written before it list the facades they
+use, which stays valid (an explicit `:use` of an implicit module is the same module):
 
 ```
 (ns main (:use fib.core fib.seq fib.coll fib.print))   ; or the subset it needs
 ```
 
 Two things a case may not do: write `/` on integers (it is `Div`'s method in
-every module that `:use`s `fib.core`, and means a ratio; write `quot` for the
+every module, and means a ratio; write `quot` for the
 truncated quotient), and name a part (`fib.seq.vseq`) where a facade will do.
 The `List` variants are `Empty` and `Cons`, so `list` and a match on them work
 in a module that `:use`s `fib.coll`, whose `empty` is a method.
@@ -171,6 +172,12 @@ A test that cannot fail is worse than none.
   instance take a user one; 020 the support modules against values computed outside fibber;
   021 and 022 (`count-`) the allocations of a walk; 023 (trap) `payload` of nil; 024 `Step` and
   the prelude's tuples.
+* 870 to 877 (the flip, step M): 870 a program with no `ns` and no `:use` sees `count map sort str get
+  into println`; 871 its own `map`, `first` and `get` shadow the library's; 872 (a directory) a used
+  module's `first` beats the library's; 873 (reject) `/` in a `Num` generic is `Div`'s, so at `i64` the
+  quotient is a ratio; 874 `(range a b)` is a `Range`; 875 `for-each` with a function value is `run!`;
+  876 the vector and map literals and `def` initialisers with the library implicit; 877 the function of
+  873 at floats.
 * 900 to 911 (`open-`) the failing programs of §5.5, one per item still open: S1 L20,
   S2 L21, S3 L22, S4 L23, S5 L24, S6 L26, S7 L1, S8 L15, S10 C9, S12 E14, S15 L29, S16 L28
   (S9, S11, S13, S14, S17 and S18 are other packages' rows). Each program was refused or

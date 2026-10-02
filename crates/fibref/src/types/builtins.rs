@@ -187,15 +187,14 @@ pub fn builtin_index(name: &str) -> Option<usize> {
 /// The built-in protocols: `Deref` (§2.9) and the arithmetic,
 /// comparison, bit, hash and show protocols of §2.12, whose built-in
 /// instances are registered by `init`. `Num` has `quot`, the truncating
-/// division, beside `/` (which leaves it when `/` becomes the method of
-/// the library's `Div`, stdlib §7 L30), and `Float` has `fdiv`, the IEEE
-/// division of the two float types, which the `Div` instances of `f32`
-/// and `f64` will wrap.
+/// division, and no `/`: `/` is the method of the library's `Div`
+/// (stdlib §7 L30, `fib.core`), whose instances for `f32` and `f64` wrap
+/// `fdiv`, the IEEE division that `Float` gives the two float types.
 pub const BUILTIN_PROTOCOLS: &str = "
 (defprotocol (Deref c t) (deref (self) -> t))
 (defprotocol Num
   (+ (self y: Self) -> Self) (- (self y: Self) -> Self) (* (self y: Self) -> Self)
-  (/ (self y: Self) -> Self) (quot (self y: Self) -> Self) (rem (self y: Self) -> Self)
+  (quot (self y: Self) -> Self) (rem (self y: Self) -> Self)
   (neg (self) -> Self))
 (defprotocol Float (fdiv (self y: Self) -> Self))
 (defprotocol Eq (= (self y: Self) -> bool) (!= (self y: Self) -> bool (not (= self y))))
@@ -251,6 +250,23 @@ mod tests {
         assert_eq!(int, ["no implementation of Float for i64"]);
         let own = "(defstruct P (x: i64)) (defun main () -> i64 (do (quot (P 1) (P 2)) 0))";
         assert_eq!(type_errors(own), ["no implementation of Num for P"]);
+    }
+
+    #[test]
+    fn slash_is_no_method_of_num() {
+        // `/` is `Div`'s, in the library (fib.core): with the prelude alone it is
+        // unbound, whatever the operands, and a `Num` bound does not supply it.
+        for src in [
+            "(defun main () -> i64 (/ 4 2))",
+            "(defun main () -> i64 (do (/ 4.0 2.0) 0))",
+            "(defun d (a: t b: t) :where ((Num t)) -> t (/ a b)) (defun main () -> i64 0)",
+        ] {
+            assert_eq!(type_errors(src), ["unbound name /"], "{src}");
+        }
+        assert_eq!(
+            type_errors("(defun main () -> i64 (quot 4 2))"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

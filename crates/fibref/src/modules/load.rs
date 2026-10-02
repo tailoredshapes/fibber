@@ -193,7 +193,16 @@ mod tests {
         let file = dir.join("main.fib").to_string_lossy().into_owned();
         let loaded = load(main, &file).expect("loads");
         let order: Vec<&str> = loaded.iter().map(|l| l.spec.ns.as_str()).collect();
-        assert_eq!(order, ["util", "geo.point", "main"]);
+        // the implicit library first, with what it depends on, then the program
+        let user: Vec<&str> = order
+            .iter()
+            .copied()
+            .filter(|n| !n.starts_with("fib."))
+            .collect();
+        assert_eq!(user, ["util", "geo.point", "main"]);
+        assert_eq!(&order[order.len() - 3..], ["util", "geo.point", "main"]);
+        assert_eq!(order[0], "fib.core.base");
+        assert!(order.contains(&"fib.print"), "{order:?}");
         std::fs::write(
             dir.join("util.fib"),
             "(ns util (:use geo.point))\n(defun u () -> i64 1)",

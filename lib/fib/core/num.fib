@@ -23,8 +23,6 @@
 ;;    and rem is a - b*quot(a,b), as Clojure's on ratios. Unit has a ratio instance so that zero?, pos?, neg?,
 ;;    abs, inc and dec are total over every number the library has.
 ;;  - Show, ToStr and Debug of a ratio are one text, `7/2`, and `2` for a denominator of 1 (the page: (/ 6 3) prints 2).
-;;  - while Num still has `/` (it leaves in the plan's step M), the Num instance of Ratio defines it as the ratio
-;;    division; M deletes that one line.
 (ns fib.core.num (:use fib.core.base fib.core.protocols))
 
 (defun inc (x: t) :where ((Num t) (Unit t)) -> t (+ x (one x)))
@@ -50,19 +48,23 @@
 (defun numerator (r: (Ratio t)) -> t (. r n))
 (defun denominator (r: (Ratio t)) -> t (. r d))
 
-;; Euclid's algorithm; the sign of the result is whatever the last remainder had
+;; Euclid's algorithm; the sign of the result is whatever the last remainder had. A divisor of -1 leaves
+;; remainder 0 without calling rem, which traps for the minimum of the width and -1.
 (defun ratio-gcd :private (a: t b: t) :where ((Num t) (Eq t) (Unit t)) -> t
-  (loop ((x a) (y b)) (if (= y (zero a)) x (recur y (rem x y)))))
+  (let ((z (zero a)) (m1 (neg (one a))))
+    (loop ((x a) (y b)) (if (= y z) x (recur y (if (= y m1) z (rem x y)))))))
 
+;; Lowest terms with a positive denominator, reducing first and negating last: the common divisor is
+;; applied with the sign of the denominator, so both signs are fixed by the one exact division and a
+;; component traps only if its normalised value does not fit the width (-128/-2 at i8 is 64/1; -128/-1 is
+;; 128/1 and traps `integer overflow in quot at i8`).
 (defun ratio-make :private (n: t d: t) :where ((Num t) (Ord t) (Unit t)) -> (Ratio t)
   (let ((z (zero n)))
     (if (= d z)
         (trap "ratio: divide by zero")
-        (if (< d z)
-            (ratio-make (neg n) (neg d))
-            (let ((g0 (ratio-gcd n d))
-                  (g (if (< g0 z) (neg g0) g0)))
-              (Ratio (quot n g) (quot d g)))))))
+        (let ((g (ratio-gcd n d))
+              (h (if (= (< g z) (< d z)) g (neg g))))
+          (Ratio (quot n h) (quot d h))))))
 
 (defun ratio-add :private (a: (Ratio t) b: (Ratio t)) :where ((Num t) (Ord t) (Unit t)) -> (Ratio t)
   (ratio-make (+ (* (. a n) (. b d)) (* (. b n) (. a d))) (* (. a d) (. b d))))
@@ -108,7 +110,6 @@
   (+ (self y) (ratio-add self y))
   (- (self y) (ratio-sub self y))
   (* (self y) (ratio-mul self y))
-  (/ (self y) (ratio-div self y))
   (quot (self y) (ratio-quot self y))
   (rem (self y) (ratio-sub self (ratio-mul y (ratio-quot self y))))
   (neg (self) (Ratio (neg (. self n)) (. self d))))

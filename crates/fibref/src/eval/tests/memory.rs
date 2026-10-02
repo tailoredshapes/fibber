@@ -229,7 +229,7 @@ fn a_run_that_did_not_start_has_no_count() {
     let (outcome, allocs) = Interpreter.run_counted("(defun main () -> i64 oops)", path);
     assert!(matches!(outcome, Outcome::Rejected { .. }), "{outcome:?}");
     assert_eq!(allocs, None);
-    let trap = "(defun main () -> i64 (let ((v [1 2 3])) (/ (nth v 0) 0)))";
+    let trap = "(defun main () -> i64 (let ((v [1 2 3])) (quot (nth v 0) 0)))";
     let (outcome, allocs) = Interpreter.run_counted(trap, path);
     assert!(matches!(outcome, Outcome::Trapped { .. }), "{outcome:?}");
     assert!(matches!(allocs, Some(n) if n > 0), "{allocs:?}");

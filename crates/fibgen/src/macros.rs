@@ -63,7 +63,7 @@ impl Mac {
             Mac::SwapSub => "(defmacro swap-sub (form)\n  (match form ((List [(Sym \"-\") a b]) `(- ,b ,a)) (_ form)))",
             Mac::FlipIf => "(defmacro flip-if (form)\n  (match form ((List [(Sym \"if\") c t e]) `(if (not ,c) ,e ,t)) (_ form)))",
             Mac::SumAll => "(defmacro sum-all (... xs)\n  (match xs ([] '0) ([x & more] `(+ ,x (sum-all ,@more)))))",
-            Mac::Nargs => "(defmacro nargs (... xs) (Int (count xs) :i64))",
+            Mac::Nargs => "(defmacro nargs (... xs) (Int (vec-count xs) :i64))",
             Mac::Seq => "(defmacro seq (... steps) `(do ,@steps))",
         }
     }

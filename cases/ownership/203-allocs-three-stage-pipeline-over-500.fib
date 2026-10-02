@@ -23,9 +23,10 @@
 ;; interpreter's events up to its last `Immortalised` are skipped), so what
 ;; is counted is main's: building 500 elements by `conj` costs about two
 ;; allocations each and would drown the pipeline's own.
-;; The stages are `Traversable` recipes (each holds its source and its
-;; function and runs its source's `for-each` with a visitor); the prelude
-;; has no such adaptors yet (stdlib design, tranche 1).
+;; The stages are `Reducible` recipes (each holds its source and its
+;; function and runs its source's `each-while` with a visitor); they are
+;; the case's own and shadow the library's `Mapped` and `Filtered`, so the
+;; count is that of the pipeline written out here.
 ;; Why 50 and 500 and not 100 and 1000: lowering a literal recurses as deep
 ;; as the literal is long, and one of 1000 elements overflows the 2 MB stack
 ;; of the thread `crates/fibc/tests/defs.rs` checks every `def` on (one of
@@ -58,18 +59,18 @@
     480 481 482 483 484 485 486 487 488 489 490 491 492 493 494 495 496 497 498 499])
 
 (defstruct (Mapped s e r) (src: s f: (fn (e) r)))
-(impl (Traversable r) (Mapped s e r) :where ((Traversable s e))
-  (for-each (self g)
-    (for-each (. self src) (fn (x) (g ((. self f) x))))))
+(impl (Reducible r) (Mapped s e r) :where ((Reducible s e))
+  (each-while (self g)
+    (each-while (. self src) (fn (x) (g ((. self f) x))))))
 
 (defstruct (Filtered s e) (src: s p: (fn (e) bool)))
-(impl (Traversable e) (Filtered s e) :where ((Traversable s e))
-  (for-each (self g)
-    (for-each (. self src) (fn (x) (if ((. self p) x) (g x) ())))))
+(impl (Reducible e) (Filtered s e) :where ((Reducible s e))
+  (each-while (self g)
+    (each-while (. self src) (fn (x) (if ((. self p) x) (g x) true)))))
 
-(defun reduce-sum (src: s f: (fn (i64 i64) i64)) :where ((Traversable s i64)) -> i64
+(defun reduce-sum (src: s f: (fn (i64 i64) i64)) :where ((Reducible s i64)) -> i64
   (let ((acc (cell 0)))
-    (do (for-each src (fn (x) (set! acc (f @acc x))))
+    (do (each-while src (fn (x) (do (set! acc (f @acc x)) true)))
         @acc)))
 
 (defun main () -> i64

@@ -35,14 +35,20 @@ pub fn programs(root: &Path) -> Vec<Program> {
 
 /// Whether the program whose main file is `main` defines a macro in any
 /// module: a `defmacro` form anywhere in the forms of the modules it
-/// loads, or, when it does not load, in the text of the file.
+/// loads, or, when it does not load, in the text of the file. The implicit
+/// library (since the flip every program loads it, and `fib.seq.lazy`
+/// defines `lazy-seq`) is not the program's: only a macro of its own needs
+/// the macro runner of stage 2b.
 pub fn defines_macro(main: &Path) -> bool {
     let Ok(source) = std::fs::read_to_string(main) else {
         return false;
     };
     let file = main.to_string_lossy();
     match fibref::modules::try_load(&source, &file) {
-        Ok(loaded) => loaded.iter().any(|l| l.forms.iter().any(mentions_defmacro)),
+        Ok(loaded) => loaded
+            .iter()
+            .filter(|l| !l.implicit)
+            .any(|l| l.forms.iter().any(mentions_defmacro)),
         Err(_) => source.contains("defmacro"),
     }
 }

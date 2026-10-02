@@ -175,7 +175,7 @@ fn a_program_with_a_pipeline_names_the_facades_and_the_digest() {
         src.starts_with("(ns main (:use fib.core fib.seq fib.coll fib.print))\n\n(defun digest")
     );
     // the digest does not use the library the pipeline tests
-    assert!(src.contains("fib.prelude/count") && src.contains("fib.prelude/nth"));
+    assert!(src.contains("vec-count") && src.contains("vec-nth"));
     let none = source(&program(pipe(&[1], vec![], Term::Count, Shape::Nested)));
     assert!(!none.contains("digest"));
 }

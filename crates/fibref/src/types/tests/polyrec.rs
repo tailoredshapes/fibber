@@ -9,7 +9,7 @@ use super::{fails, ok, ErrorKind as K};
 /// variable: the stdlib design's `(len (drop 1 xs))`.
 const DROPPED: &str = "(defstruct (Dropped c) (inner: c n: i64))
     (defprotocol Sz (size (self) -> i64))
-    (impl Sz (Vec a) (size (self) (count self)))
+    (impl Sz (Vec a) (size (self) (vec-count self)))
     (impl Sz (Dropped c) :where ((Sz c)) (size (self) (- (size (. self inner)) (. self n))))";
 
 #[test]

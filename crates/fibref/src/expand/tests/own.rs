@@ -182,7 +182,7 @@ fn what_a_qualified_head_does_not_expand_stays_the_call() {
         "(fib.prelude/swap! a f)",
         "(fib.prelude/conj x y)",
         "(fib.prelude/range x)",
-        "(fib.prelude/for-each x f)",
+        "(fib.prelude/push! x f)",
         "(fib.prelude/trap x)",
         "(fib.prelude/nonesuch x)",
     ] {
