@@ -182,6 +182,11 @@ fn removals_new(e: &Expr) -> Vec<Expr> {
                 out.push(with(Kind::Macro(*m, a2)));
             }
         }
+        // A pipeline loses a stage, a terminal, or its shape.
+        Kind::Pipe(p) => {
+            let smaller = crate::pipe::variants(p);
+            out.extend(smaller.into_iter().map(|v| with(Kind::Pipe(Box::new(v)))));
+        }
         // A guarded clause covers nothing (types §2.6): dropping one
         // keeps the match exhaustive and every other clause useful.
         Kind::GMatch(s, cl) => {

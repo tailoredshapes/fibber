@@ -21,9 +21,11 @@ mod builtins;
 mod eval;
 mod nums;
 mod patterns;
+mod pipelines;
 mod protos;
 mod value;
 
+pub use pipelines::digest;
 pub use value::V;
 
 use crate::ast::Program;

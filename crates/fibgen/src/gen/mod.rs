@@ -24,10 +24,12 @@ mod helpers;
 mod hooks;
 mod inout;
 mod jobs;
+mod lambdas;
 mod mcalls;
 mod nums;
 mod objects;
 mod observe;
+mod pipelines;
 mod protos;
 mod protos2;
 mod scalar;
@@ -36,6 +38,7 @@ mod vpat;
 mod vpat2;
 
 pub use ctx::{Ctx, Region, Var, VarKind};
+pub use pipelines::generate_pipeline;
 pub use protos::self_as_value;
 
 use crate::ast::{Expr, FunDef, ImplDef, Kind, Param, Program};

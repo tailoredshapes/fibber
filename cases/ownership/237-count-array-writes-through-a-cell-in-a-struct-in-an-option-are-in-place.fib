@@ -1,0 +1,31 @@
+;; spec:   types §6.6 (a unique write); the bulk builder of the standard library (plan L9)
+;; expect: accept
+;; result: 2998
+;; audit:  clean
+;; allocs: <= 4
+;; The shape the bulk builder of the prelude writes its buffer in: the first element of a walk
+;; makes the state, so the state is `(Cell (Option (Slot a)))`, and the array that is written is
+;; the content of a `(Cell (Array a))` that is a field of the struct, fetched into a local and
+;; written through `&` by `array-set!`. 1000 writes allocate nothing: the four objects are the
+;; array, its cell, the counter's cell and the struct, the same four as for 10 writes. The cell holds
+;; the array alone, which is what makes the write unique (a field of an owned shell is never
+;; unique to its callee, stdlib design §2.5); a write that copied would cost an array each and fail
+;; the bound by a thousand. Case 238 is the other half: an array that something else holds is
+;; copied by the next write.
+(defstruct (Slot a) (arr: (Cell (Array a)) n: (Cell i64)))
+
+(defun put (s: (Slot i64) i: i64 x: i64) -> unit
+  (let ((c (. s arr)))
+    (do (array-set! &c i x)
+        (set! (. s n) (+ @(. s n) 1)))))
+
+(defun main () -> i64
+  (let ((st (cell nil)))
+    (do (set! st (some (Slot (cell (array 1000 0)) (cell 0))))
+        (dotimes (i 1000)
+          (match @st
+            (nil ())
+            ((some s) (put s i (* 2 i)))))
+        (match @st
+          (nil -1)
+          ((some s) (+ @(. s n) (array-get @(. s arr) 999)))))))

@@ -4,13 +4,14 @@ use crate::ast::{Arg, Expr, Kind, Program};
 use crate::ty::Ty;
 
 mod items;
+mod pipelines;
 
 pub use items::is_private;
 
 use items::{fundef, impl_def, pat};
 
 /// The preamble's declarations: (the names that use them, the text).
-const PREAMBLE: [(&[&str], &str); 12] = [
+const PREAMBLE: [(&[&str], &str); 13] = [
     (&["Pt", "Shape", "Rect", "Circle", "Named"], "(defstruct Pt (x: i64 y: i64))"),
     (&["Wrap", "Shape", "Rect", "Circle", "Named"], "(defstruct Wrap (s: str v: (Vec i64)))"),
     (&["Holder"], "(defstruct Holder (f: (fn (i64) i64) c: (Cell i64)))"),
@@ -40,6 +41,12 @@ const PREAMBLE: [(&[&str], &str); 12] = [
         "(defenum Lvl (Low) (Mid n: i64) (High a: i64 b: str))\n(derive Eq Lvl)\n(derive Ord Lvl)",
     ),
     (&["inc1"], "(defun inc1 (x: i64) -> i64 (+ x 1))"),
+    (
+        // A fold that sees every element and its place; `fib.prelude/..`
+        // so that it does not use the library the pipeline tests.
+        &["digest"],
+        "(defun digest (v: (Vec i64)) -> i64\n  (loop ((i 0) (h 7))\n    (if (< i (fib.prelude/count v))\n        (recur (+ i 1) (rem (+ (* h 31) (fib.prelude/nth v i)) 1000003))\n        h)))",
+    ),
     (
         &["sum-vec"],
         "(defun sum-vec (v: (Vec i64)) -> i64\n  (loop ((i 0) (s 0))\n    (if (< i (count v)) (recur (+ i 1) (+ s (nth v i))) s)))",
@@ -98,8 +105,14 @@ pub fn program(p: &Program) -> String {
     ]);
     body.push_str(&layout(&main, 0));
     body.push('\n');
-    preamble(&body) + &body
+    let uses = if p.uses_library() { LIBRARY_NS } else { "" };
+    format!("{uses}{}{body}", preamble(&body))
 }
+
+/// The line a program with a library pipeline starts with: the four
+/// facades, so that it means the same before the library is implicit
+/// and after (tranche 1 plan §4.4).
+const LIBRARY_NS: &str = "(ns main (:use fib.core fib.seq fib.coll fib.print))\n\n";
 
 /// The preamble declarations and macros that `body` names.
 fn preamble(body: &str) -> String {
@@ -200,6 +213,7 @@ fn expr_more(e: &Expr) -> Sexp {
         | Kind::IntW(..)
         | Kind::Flt(..)
         | Kind::Conv(..) => items::expr_new(e),
+        Kind::Pipe(p) => pipelines::pipe(p),
         Kind::WeakDead(n, t) => {
             let bind = list(vec![list(vec![atom(n.clone()), expr(t)])]);
             list(vec![
@@ -228,6 +242,12 @@ fn list_or_unit(items: Vec<Sexp>) -> Sexp {
     } else {
         list(items)
     }
+}
+
+/// An expression's source on one line, whatever its length.
+#[cfg(test)]
+pub(crate) fn expr_flat(e: &Expr) -> String {
+    flat(&expr(e))
 }
 
 /// The text of `s` on one line.

@@ -593,6 +593,17 @@ declaration order and shows as its variant name) and for `str`:
 not : (fn :send (bool) bool)
 ```
 
+**The order and equality of the scalars the paragraph above leaves open**
+(**Proposed**: the reference interpreter's, which the compiler followed from
+commit `179cb18` on; cases 221 and 223 run it in both tools): `false < true`; a
+`char` orders by code point; a keyword orders by its name, byte by byte, and not
+by the compiler's interning id; unit equals itself, so `=`, `<=` and `>=` on
+two units are `true` and `!=`, `<` and `>` are `false`; an array or a `Vec` of
+unit compares as any other, its elements being the unit placeholder of a cell of
+unit. Until that commit the compiled `<` on a `bool` used a signed compare (an
+`i1` `true` is -1, so `(< true false)` was `true`) and ordered keywords by
+interning id.
+
 The texts of the built-in `show` and the values of the built-in
 `hash` (**Decided**, owner, 2026-09-30; cases 169 and 178). `show`
 gives a fresh `str` each time: a `str` shows as itself; an integer as

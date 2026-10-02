@@ -1,0 +1,71 @@
+;; spec:   stdlib §2.5 (bulk operations build in one function), §8.1 item 2 (a model test of Vec's trie)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; vec-from-array (the prelude's bulk builder for an array of known length, L9) makes
+;; the vector a conj loop makes. For every count from 0 to 70 (the empty vector, the
+;; tail alone up to 32, the first leaf, the second and third) and for the counts around
+;; the edges of the trie (1023 1024 1025, the full root branch with a full tail 1056,
+;; the new root level at 1057 and its neighbours, 2000) the vector built from an array
+;; holding elem 0 .. elem (n-1) has n elements and every nth is the formula's, no array
+;; of the library on the reference side. It is then grown by 40 conj, which crosses a tail
+;; that fills, a leaf that joins the trie and, from 1055 on, the root that gains a level,
+;; and read in full again: a vector whose shift, tail length or leaf placement were wrong
+;; would read right and then conj wrongly. The bulk vector is read again after the
+;; growth, because the growth shares its nodes. One check per count (bit i is the i-th
+;; count in order; the later ones set bit 62); the last two are planted faults, the same
+;; comparison against a source with one element wrong, at the 65th element (the first of
+;; the second leaf) and at the 1057th (the one that gives the root its second level),
+;; which must fail. The aliasing check: an array of at most 32 elements is the tail of
+;; its vector itself, and a write to the array afterwards must not reach it (the write
+;; copies: the vector holds a count).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun elem (i: i64) -> i64 (+ (* i 7919) 13))
+
+;; an array of n elements whose element at bad (-1: none) is wrong
+(defun source (n: i64 bad: i64) -> (Array i64)
+  (let ((c (cell (array n 0))))
+    (do (dotimes (i n) (array-set! &c i (if (= i bad) (+ (elem i) 1) (elem i))))
+        @c)))
+
+;; v has n elements and element i is the formula's
+(defun reads (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (= (nth v i) (elem i)) (recur (+ i 1)) false) true))))
+
+(defun grown (v: (Vec i64) n: i64) -> (Vec i64)
+  (loop ((w v)) (if (< (count w) n) (recur (conj w (elem (count w)))) w)))
+
+;; the bulk vector, then the same grown by 40 conj, then the bulk vector once more
+(defun agrees (n: i64 bad: i64) -> bool
+  (let ((v (vec-from-array (source n bad))))
+    (and (reads v n)
+         (and (reads (grown v (+ n 40)) (+ n 40))
+              (reads v n)))))
+
+(defun agrees-all (counts: (Vec i64) c: Checks) -> unit
+  (dotimes (j (count counts)) (check c (agrees (nth counts j) -1))))
+
+(defun counts () -> (Vec i64)
+  (loop ((i 0) (v (vec-empty)))
+    (if (< i 71)
+        (recur (+ i 1) (conj v i))
+        (conj (conj (conj (conj (conj (conj (conj (conj (conj (conj v 1023) 1024) 1025) 1055) 1056) 1057) 1058) 1088) 1089) 2000))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks))
+        (xs (cell (source 5 -1))))
+    (do (agrees-all (counts) c)
+        (check c (= (checks-made c) 81))
+        (let ((v (vec-from-array @xs)))
+          (do (array-set! &xs 0 999)
+              (check c (reads v 5))))
+        (check p1 (agrees 65 64))
+        (check p2 (agrees 1057 1056))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

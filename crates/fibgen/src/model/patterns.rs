@@ -59,6 +59,7 @@ impl Machine<'_> {
                 let v = self.ev(x, env)?;
                 super::nums::convert(op, *to, &v)
             }
+            Kind::Pipe(p) => self.ev_pipe(p, env),
             other => Err(unsupported(format!("node {other:?}"))),
         }
     }

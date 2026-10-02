@@ -4,6 +4,7 @@
 //! requires without the interpreter.
 
 use crate::macros::Mac;
+use crate::pipe::Pipe;
 use crate::ty::{NumTy, Proto, Ty};
 
 /// The target type of a conversion: `i64` or another number type.
@@ -90,6 +91,9 @@ pub enum Kind {
     Flt(f64, NumTy),
     /// `(op T e)`: a conversion (types §2.12), the target type first.
     Conv(String, NumOrInt, Box<Expr>),
+    /// A library pipeline and its terminals, of type `i64` (stdlib §8.1
+    /// item 3); the program that holds one uses the library's facades.
+    Pipe(Box<Pipe>),
 }
 
 /// A clause of a [`Kind::GMatch`].
@@ -279,6 +283,7 @@ impl Expr {
             | Kind::Async(e)
             | Kind::Await(e)
             | Kind::WeakDead(_, e) => vec![e],
+            Kind::Pipe(p) => p.exprs(),
             _ => Vec::new(),
         }
     }
@@ -329,6 +334,7 @@ impl Expr {
             | Kind::Async(e)
             | Kind::Await(e)
             | Kind::WeakDead(_, e) => vec![e],
+            Kind::Pipe(p) => p.exprs_mut(),
             _ => Vec::new(),
         }
     }
@@ -389,6 +395,16 @@ impl Program {
     /// The total node count.
     pub fn size(&self) -> usize {
         self.bodies().iter().map(|e| e.size()).sum()
+    }
+
+    /// Whether the program holds a library pipeline, and so must say
+    /// which facades of the library it uses.
+    pub fn uses_library(&self) -> bool {
+        let mut found = false;
+        for b in self.bodies() {
+            b.walk(&mut |e| found |= matches!(e.kind, Kind::Pipe(_)));
+        }
+        found
     }
 }
 

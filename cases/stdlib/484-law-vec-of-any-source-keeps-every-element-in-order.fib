@@ -1,0 +1,59 @@
+;; spec:   stdlib §8.1 item 4 (laws), §2.1 rule 4 (vec is the one place a chain is built), §2.5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec map filter take range
+;; The law, for any source, (vec src) has as many elements as the source offers, the i-th of them
+;; the source's i-th. 300 seeded draws (seed 20261002), each a length n in [0, 150] and one of five
+;; sources: an Array filled by a formula, (range n), a lazy map of a range, a lazy filter of a
+;; range twice as long (every second element survives), and a take of n from a longer lazy map.
+;; The reference side is the formula, so no library function but the one under test is used to
+;; make the expected elements. One check per draw (bit i is draw i; a later failure sets bit 62).
+;; The planted fault is the same draws read against a formula that is wrong at index 33 of any
+;; vector that long, which must fail somewhere: the law shows it can.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun triple (x: i64) -> i64 (* 3 x))
+(defun even-x (x: i64) -> bool (= (rem x 2) 0))
+
+(defun array-of (n: i64) -> (Array i64)
+  (let ((c (cell (array n 0))))
+    (do (dotimes (i n) (array-set! &c i (+ (* i 7919) 13))) @c)))
+
+;; the formula of element i of source kind k
+(defun expected (k: i64 i: i64 planted: bool) -> i64
+  (let ((x (if (= k 0) (+ (* i 7919) 13) (if (= k 1) i (if (= k 3) (* 2 i) (triple i))))))
+    (if (and planted (= i 33)) (+ x 1) x)))
+
+(defun vec-of (k: i64 n: i64) -> (Vec i64)
+  (if (= k 0)
+      (vec (array-of n))
+      (if (= k 1)
+          (vec (range n))
+          (if (= k 2)
+              (vec (map triple (range n)))
+              (if (= k 3)
+                  (vec (filter even-x (range (* 2 n))))
+                  (vec (take n (map triple (range 400)))))))))
+
+(defun holds (k: i64 n: i64 planted: bool) -> bool
+  (let ((v (vec-of k n)))
+    (and (= (count v) n)
+         (loop ((i 0)) (if (< i n) (if (= (nth v i) (expected k i planted)) (recur (+ i 1)) false) true)))))
+
+(defun draws (seed: i64 planted: bool c: Checks) -> unit
+  (let ((r (rng seed)))
+    (dotimes (j 300)
+      (let ((k (rng-below r 5))
+            (n (rng-below r 151)))
+        (check c (holds k n planted))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks)))
+    (do (draws 20261002 false c)
+        (check c (= (checks-made c) 300))
+        (draws 20261002 true p)
+        (check-detects c p)
+        (checks-result c))))

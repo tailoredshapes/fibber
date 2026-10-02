@@ -336,15 +336,37 @@ modules; the line counts are the Rust files' at the date of this section
 | `expand.core` | `core.rs` | 154 | `Role`, `expr-plan`, `skip-annotations`, `body-start`, `annotated-name` | 3 |
 | `expand.quasi` | `quasi.rs` | 162 | the quasiquote rewrite, with an explicit stack | 3 |
 | `expand.derive` | `derive/{mod,structs,enums}.rs` | 420 | `derive` | 3 |
-| `expand.prelude` | `prelude/{mod,logic,forms,loops}.rs` | 492 | the macros of syntax §4.4 (`when` .. `dbg`, `for-each`, `range`) | 4 |
+| `expand.prelude` | `prelude/{mod,logic,forms,loops}.rs` | 492 (592 at `605a26e`: the registry `MACROS`, the `Outcome` of a macro that may decline, if-let and when-let over any pattern, `range` that declines three arguments) | the macros of syntax §4.4 (`when` .. `dbg`, `for-each`, `range`) and the registry rows of the tranche 1 macros below | 4 |
 | `expand.dumpctx` | `expand_dump/context.rs` | 197 | the context lines of §5.2 | 4 |
 | `expand.args` | `expand_dump/args.rs` | 184 | the words of §5.1 | 4 |
 | `syntax.dump` | `dump.rs`'s `span_in`, `dump_form` with a home | 60 | `dump-stx` with a home file (an additive function: the reader's dump does not change) | 4 |
-| `expand.expr` | `expr.rs` | 207 | `Expander`, `expand-head`, `plan-expr`, `finish-form`, the user-macro call | 5 |
+| `expand.expr` | `expr.rs` | 207 | `Expander` (with its `fuse` field, an `(Option FuseEnv)`), `expand-head`, `plan-expr` (which takes a `Role`, `Fuse` among them, since R9), `plan-fuse`, `plan-fused-call`, `finish-form`, the user-macro call | 5 |
 | `expand.walk` | `walk.rs` | 166 | the walk of a tree by roles | 5 |
 | `expand.top` | `top.rs`, `runner.rs`'s `parse_params` | 258 | the top-level forms, `defmacro`, the `:private` markers | 5 |
 | `expand.program` | `expand/mod.rs` | 121 | `expand-program`, `expand-expr`, `prelude-source`, `expand-prelude`, `prelude-forms` | 5 |
 | `expand.dump` and `compiler/expand.fib` | `expand_dump/mod.rs`, `main.rs`'s `expand` | 286 | the dump of §5.1, the tool | 5 |
+| `expand.roots` | `roots.rs` | 274 (about 110 without its tests) | where a module is found: the main file's directory, `-I DIR`, `FIB_LIB`, the roots the binary carries (tranche 0, E7) | tranche 0 |
+| `expand.prelude.parts` | Rust's `iter().skip(n)`, `Form::as_list`, `Form::as_sym` and `body_form` of `prelude/logic.rs`, which the macros share | | `tail-from` and its fellows over a `(Vec Stx)` | tranche 1 |
+| `expand.prelude.print` | `prelude/print.rs` | 112 | `str println print prn pr` (R5) | tranche 1 |
+| `expand.prelude.fold` | `prelude/fold.rs` | 183 | `+ - * < > <= >= = max min bit-and bit-or bit-xor`, which decline the binary call (R6a) | tranche 1 |
+| `expand.prelude.colls` | `prelude/colls.rs` | 86 | `conj assoc dissoc merge` (R6a) | tranche 1 |
+| `expand.prelude.atoms` | `prelude/atoms.rs` | 48 | `swap!` with extra arguments (R6a) | tranche 1 |
+| `expand.prelude.defn` | `prelude/defn.rs` | 69 | `defn`, `defn-` (R6b) | tranche 1 |
+| `expand.prelude.update` | `prelude/update.rs` | 74 | `update` with extra arguments and the `fnil` routing (R6b) | tranche 1 |
+| `expand.prelude.reduce` | `prelude/reduce.rs` | 235 | `reduce`: `reduce-nonempty`, the identity heads, `reduce-while` with the tails of a literal `fn` rewritten, with an explicit stack (R6b) | tranche 1 |
+| `expand.derive.record` | `derive/record.rs` | 60 | the text of a record for `derive Debug` and `derive ToStr` (R8); the struct's builder stays in `expand.derive` | tranche 1 |
+| `expand.fusetab` | `fuse/tables.rs` | 188 | the sets **A** and **T** of the fusion rewrite (stdlib §2.1 rule 2) | tranche 1 (R9) |
+| `expand.fusescan` | `fuse/scan.rs` | 253 | what the rewrite reads off the forms before it rewrites any: the names a top-level form binds, the names a module defines, whether a form calls a terminal | tranche 1 (R9) |
+| `expand.fuse` | `fuse/stage.rs` (179) and the helpers of `fuse.rs` | 191 for `fuse.rs`, shared with `expand.fuserun` | the environment and the rewriting of one stage | tranche 1 (R9) |
+| `expand.fuserun` | `run`, `fuse_form` and `restore` of `fuse.rs` | | the pass over one module's expanded forms: records the module's public names, then walks each top-level form that calls a terminal a second time with `expand.walk`'s machinery and the role `Fuse` | tranche 1 (R9) |
+
+The rows after `expand.dump` are the modules that tranche 0 and tranche 1 of
+the library added (stdlib §7.5): each is a port of the Rust file named, written
+in the same commit as the Rust change (`5ea989f`, `605a26e`), judged by
+`bootstrap_expand` as every module is (§5.6; that test was not run while this
+section was written), and the Rust files' line counts are those of `605a26e`. The expansion dump of a program that sees
+`fib.seq` shows the recipes the fusion pass makes and gensyms named `#fuse.N`;
+the format of the dump (§5.1) is unchanged.
 
 About 900 lines of Rust each: 873, 900, 736, 933 and 1,038 for the
 porters 1 to 5 (4,480 in all, the tests of `modules.rs` not counted). The
@@ -486,11 +508,13 @@ standard run, and the list of programs that need a runner and of those
 that do not, are printed (`--nocapture`) and the lists written to
 `target/tmp/bootstrap_expand/stage-2a.list` and `stage-2b.list`.
 
-**The tool does not exist yet**, so until `compiler/expand.fib` does the test
-`the_self_hosted_expander_matches_the_rust_expander` prints a loud message
-and skips; it fails once the file exists and the output differs
+**The tool exists** (`compiler/expand.fib`, M6 step 2a, commit `970e25c`), so the test
+`the_self_hosted_expander_matches_the_rust_expander` runs and fails when the
+output differs; it prints a loud message and skips only if the file is absent
 (`BOOTSTRAP_EXPANDER=path` builds another source in its place, and a path
-that is not a file is an error, not a skip). Everything it is made of is
+that is not a file is an error, not a skip). The comment at the head of
+`crates/fibc/tests/bootstrap_expand.rs` still says the tool does not exist;
+it is stale. Everything it is made of is
 judged without the tool: the oracle runs over every group of stage 2b and
 reaches each of 31 named kinds of error (the 25 of `ExpandErrorKind`, the
 four of loading, two of reading; a list in the test, not derived from the
@@ -516,6 +540,18 @@ passed or reported through the real build, run and comparison.
   `quasi`, `derive`, `prelude`, `ctx`, `modules` (which now looks for a
   module under library roots too: `roots.rs`). A port finished before
   tranche 0 lands is a port that tranche 0 reopens.
+- **The oracle and the port read the library at different times.** `fibref`
+  carries `lib/prelude.fib` (`types::PRELUDE_LIB`) and the other library
+  modules (`LIB_MODULES`, which `build.rs` embeds) as they were when it was
+  built, and its `expand` ignores `FIB_LIB`; `compiler/expand.fib` reads
+  `lib/` from its working directory as it is on disk. After an edit of `lib/`
+  and before `fibref` is rebuilt the two dumps differ, for example by a
+  `fib.core.text` mismatch, which is no one's bug; and a run of
+  `bootstrap_expand` while another process edits `lib/`, `cases/stdlib` or
+  `compiler/expand/*.fib` can fail on a file changed between the oracle's read
+  and the tool's (`a_fault_planted_in_the_replay_of_the_whole_corpus_is_reported_and_localized`
+  then reports another count than one failing file). Run it on a quiet tree or
+  on a copy.
 - `crates/fibref/src/syntax/number.rs`'s `check_literal` (an `Int` must fit
   its width, a `Flt` must be finite and an `f32` one is rounded) has no
   counterpart in `compiler/syntax/number.fib`, and `admit` needs it.

@@ -6,6 +6,8 @@
 ;;  - the defaults trap with the function's name: `nth: index out of range`.
 ;;  - the default `last` keeps an (Option e) in a cell, so until C5 it allocates one per element; a source
 ;;    that knows its end overrides it (the Vec does), case 022.
+;;  - the default to-vec is the prelude's bulk builder (vec-collect, L9), not a conj loop: about 2 heap objects
+;;    for every 32 elements where a conj loop spends 2.09 for each one.
 ;;  - count is a function over size, not a method, so a user type implements Reducible only.
 ;;  - a module that does not :use fib.seq gets the prelude's count, which does not know these types.
 (ns fib.seq.protocols (:use fib.core fib.seq.types))
@@ -21,9 +23,7 @@
           (match @r (nil (trap "nth: index out of range")) ((some x) x)))))
   (last (self) -> (Option e)
     (let ((r (cell nil))) (do (each-while self (fn (x) (do (set! r (some x)) true))) @r)))
-  (to-vec (self) -> (Vec e)
-    (let ((acc (cell (vec-empty))))
-      (do (each-while self (fn (x) (do (set! acc (fib.prelude/conj @acc x)) true))) @acc)))
+  (to-vec (self) -> (Vec e) (fib.prelude/vec-collect (fn (k) (each-while self k))))
   ;; the lazy seq of the elements: a lazy source overrides it, so two lazy adaptors stay lazy end to end
   (to-lseq (self) -> (LSeq e) (lseq-vec (to-vec self))))
 (defun count (c: c) :where ((Reducible c e)) -> i64 (size c))

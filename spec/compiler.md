@@ -43,7 +43,14 @@ nothing of its own: `main`'s result is its exit status, as C gives it
 standard error and aborts (SIGABRT, as types §8.12 says), so the exit
 status is 134 under a shell; the command line after the program (or
 after `--` for `fibc run`) is `(args)`. With `FIB_TRACE=1` in the
-environment the runtime also prints the trace of §4 on standard error.
+environment the runtime also prints the trace of §4 on standard error;
+`FIB_TRACE=1 fibc run FILE` and `fibc run --trace FILE` print the same trace,
+because the evaluation of the program's `def`s before `main` (§8, item 4) starts the
+runtime with `fib.rq-init` and not `fib.init`, which is the one that reads
+`FIB_TRACE`, so those objects are not traced (they were: case 203 counted 1050
+objects with the variable set and 4 without). `fibc itrace FILE` runs the
+interpreter and prints its trace alone on standard output; the result and the
+audit follow on standard error in `fibref`'s words.
 
 **Optimisation level** (**Proposed**, stdlib design §7 C6; the owner's decision of
 2026-10-01, §9 Q15). `-O N` (or `-ON`; `N` is one digit, 0 to 3, given at most once; `run`
@@ -160,6 +167,7 @@ the C functions it uses (`malloc`, `free`, `memcpy`, `write`, `abort`,
 |---|---|---|
 | `fib.alloc` | `(i64 size, i32 tid) -> ptr` | `malloc`; header count 1, tid, flags 0; a trace line in trace mode |
 | `fib.retain`, `fib.release`, `fib.drop`, `fib.unique?`, `fib.share`, `fib.immortalise` | as §8.2 | |
+| `fib.drop-one`, `fib.drain`, `fib.drop-fields`, `fib.share-queue` | `(ptr wl, ptr p) -> void`, `(ptr wl) -> void`, `(ptr p) -> void`, `(ptr wl, ptr p) -> void` | the **iterative** drop and share-marking of types §8.2: `fib.drop` makes a worklist (32 entries in a 256-byte `alloca` on its own frame, spilling to a heap buffer that doubles; one per top-level drop, private to the thread, no global) and calls `fib.drop-one`, which clears weak references, calls the type's `drop` function (slot 0 of `fib.types`; it **queues** the children last first and releases none) and frees the object, then `fib.drain` pops the worklist and releases each entry as `fib.release` does; the decrement is made when the entry is popped and not when it is queued, which keeps the `F` lines in the order a recursion would produce when a child is shared (case 228). `fib.drop-fields` is the same for a `STACK` object at its scope end: the children, not the object. `fib.share` marks a task's captures SHARED the same way, through the type table's slot 4 (`share.N` per type); the one-level `trace.N` callback walker of slot 1 (the retains of a copy, `fib.immortalise`) is unchanged (`cases/ownership` 225 to 231) |
 | `fib.trap` | `(ptr str) -> void` | writes `trap: ` and the `str` object's bytes and a newline to fd 2, then `abort` |
 | `fib.trap-c` | `(ptr cstring) -> void` | the same for a NUL-terminated C string (the arithmetic messages of §8.12) |
 | `fib.stack-init` | `(ptr p, i32 tid) -> void` | stores the header of a `STACK` object (count 0, tid, flags `STACK`) and, in trace mode, its trace ordinal (§4) |

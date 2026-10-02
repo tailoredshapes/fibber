@@ -1,0 +1,86 @@
+;; spec:   stdlib §2.5 (bulk operations), §8.1 item 2 (the trie against a plain reference across the 32 and 1024 boundaries)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec range
+;; vec (the default to-vec of a source whose length the builder does not use, L9) takes the
+;; elements of a walk into a buffer of 32, a leaf at the 33rd of each run, and a leaves array
+;; that doubles when it is full. The counts here are the edges of each of those: 0 to 70
+;; (nothing, the tail alone, the first leaf, the second and third), the leaf counts at which the
+;; leaves array doubles (it starts at 4 slots: the 5th leaf is the 161st element, the 9th the 289th,
+;; the 17th the 545th, the 33rd the 1057th, the 65th the 2081st) with a neighbour either side, the
+;; full tail after a full root branch (1056) and the new root level (1057), and 2000. Each count is
+;; built from two sources, an Array and a (range n), and each is read in full against the formula
+;; (elem i for the array, i for the range), then grown by 40 conj and read again, which would
+;; expose a wrong shift or tail length; the first vector is read once more after the growth. A Set
+;; of n integers is a walk in the HAMT's order, so its vector is checked as a set: n elements, each
+;; a member, their sum the sum of the formula. One check per count (bit i is the i-th count; later
+;; ones set bit 62); the last two are planted faults (an element wrong at the 33rd, and at the 1057th)
+;; that the comparison must catch.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun elem (i: i64) -> i64 (+ (* i 7919) 13))
+
+(defun source (n: i64 bad: i64) -> (Array i64)
+  (let ((c (cell (array n 0))))
+    (do (dotimes (i n) (array-set! &c i (if (= i bad) (+ (elem i) 1) (elem i))))
+        @c)))
+
+;; v has n elements and element i is f of i for i below m (the built part) and i after it (what grown adds)
+(defun reads-to (v: (Vec i64) n: i64 m: i64 f: (fn (i64) i64) :borrow) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (= (nth v i) (if (< i m) (f i) i)) (recur (+ i 1)) false) true))))
+
+(defun reads (v: (Vec i64) n: i64 f: (fn (i64) i64) :borrow) -> bool (reads-to v n n f))
+
+(defun grown (v: (Vec i64) n: i64) -> (Vec i64)
+  (loop ((w v)) (if (< (count w) n) (recur (conj w (count w))) w)))
+
+(defun same-index (i: i64) -> i64 i)
+
+(defun array-agrees (n: i64 bad: i64) -> bool
+  (let ((v (vec (source n bad))))
+    (and (reads v n elem)
+         (and (reads-to (grown v (+ n 40)) (+ n 40) n elem) (reads v n elem)))))
+
+(defun range-agrees (n: i64) -> bool
+  (let ((v (vec (range n))))
+    (and (reads v n same-index)
+         (and (reads-to (grown v (+ n 40)) (+ n 40) n same-index) (reads v n same-index)))))
+
+(defun set-of (n: i64) -> (Set i64)
+  (loop ((i 0) (s (empty (set (vec-empty)))))
+    (if (< i n) (recur (+ i 1) (conj s (elem i))) s)))
+
+(defun sum-of (v: (Vec i64)) -> i64
+  (loop ((i 0) (a 0)) (if (< i (count v)) (recur (+ i 1) (+ a (nth v i))) a)))
+
+(defun set-agrees (n: i64) -> bool
+  (let ((s (set-of n)))
+    (let ((v (vec s)))
+      (and (= (count v) n)
+           (and (= (sum-of v) (sum-of (vec (source n -1))))
+                (loop ((i 0)) (if (< i (count v)) (if (contains? s (nth v i)) (recur (+ i 1)) false) true)))))))
+
+(defun counts () -> (Vec i64)
+  (let ((edges [159 160 161 162 288 289 290 544 545 546 1023 1024 1025 1056 1057 1058 2000 2080 2081 2082]))
+    (loop ((i 0) (v (vec-empty)))
+      (if (< i 91)
+          (recur (+ i 1) (conj v (if (< i 71) i (nth edges (- i 71)))))
+          v))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p1 (checks))
+        (p2 (checks)))
+    (do (dotimes (j (count (counts)))
+          (let ((n (nth (counts) j)))
+            (check c (and (array-agrees n -1) (range-agrees n)))))
+        (check c (= (checks-made c) 91))
+        (dotimes (j 5) (check c (set-agrees (nth [0 1 33 200 700] j))))
+        (check p1 (array-agrees 40 32))
+        (check p2 (array-agrees 1100 1056))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

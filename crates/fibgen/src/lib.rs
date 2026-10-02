@@ -16,6 +16,7 @@ pub mod driver;
 pub mod gen;
 pub mod macros;
 pub mod model;
+pub mod pipe;
 pub mod print;
 pub mod report;
 pub mod rng;

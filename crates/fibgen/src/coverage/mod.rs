@@ -1,6 +1,7 @@
 //! Which constructs the generated programs exercised, and how often.
 
 mod more;
+mod pipelines;
 mod protos;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -153,6 +154,7 @@ fn node_labels(e: &Expr, out: &mut Vec<String>) {
             }
         }
         Kind::Call(h, args) => call_labels(h, args, out),
+        Kind::Pipe(p) => pipelines::labels(p, out),
         _ => {}
     }
 }

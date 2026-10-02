@@ -176,3 +176,68 @@ A test that cannot fail is worse than none.
   (S9, S11, S13, S14, S17 and S18 are other packages' rows). Each program was refused or
   trapped as its header says when it was written; its `result` is worked out by hand
   for the day the item lands, not run.
+
+## Mutation review (`fibmut`)
+
+`crates/fibmut` is the tool of the mutation reviews (plan MUT0; `spec/bootstrap.md` §3
+kept the inputs of the reader's two reviews and lost the tool, so they cannot be
+rerun). It mutates one library module, runs the cases that exercise it against each
+mutant, and tells how every mutant ended. A mutant no case kills is a case the library
+lacks; the procedure below turns it into one. The code is std only; it needs a built
+`fibref` (or `fibc`) and runs from the repository root:
+
+```
+cargo build -j2 -p fibmut
+fibmut --module lib/fib/seq/protocols.fib --only '00*,01*,02*' --bin PATH/fibref
+fibmut --module lib/fib/core/num.fib --only '05*,06*,07*,08*,09*' --max 40 --tool fibc --bin PATH/fibc
+fibmut --module lib/fib/seq/protocols.fib --only '00*,01*,02*' --lines 42 --ops const   # one line again
+fibmut --module lib/fib/seq/protocols.fib --list                                        # the sites, run nothing
+```
+
+`--only` takes comma separated patterns over the case names (`*` and `?` match; a
+pattern with neither is a prefix, as the tools' own `--only`; one that matches no case is
+an error); without it every case of `--cases` (default `cases/stdlib`) is used. `--max N`
+(default 150) runs a seeded sample (`--seed`, default 1) of the module's mutants, the
+same sample for the same seed; `--timeout` (default 20 s) and `--vmem` (default
+4000000 KB) limit each process; `--out DIR` writes the report and each survivor's diff;
+`--verbose` lists every mutant with the case that killed it. `fibmut --help` has the rest.
+
+**It never edits `lib/` or `cases/`.** The library and the cases are copied into a
+temporary directory laid out as the repository is, so the relative `roots:` of a header
+find the copy; the mutant is written there, `FIB_LIB` names the copy (a case with no
+`roots` still loads it), and every process is run `ulimit -v`, `timeout` and `nice`, one
+at a time, in that directory. Before any mutant:
+
+1. the **baseline** runs every selected case on the unmutated copy; a case that does not
+   pass (an `open-` case, a case that needs more `--vmem`) is dropped and listed with its
+   reason. The cases that start threads fail at 4000000 KB (`657-pmap-keeps-the-order-of-its-source`
+   passes at 8000000): they are dropped unless `--vmem` is raised or 0;
+2. the **control** runs them again with the module made unreadable. The cases that then fail
+   are the ones that load the module; with none, every mutant would survive and the run stops.
+
+Each mutant is then checked to compile by a program that only loads the module (`invalid`
+when it does not, no case run) and run against the loading cases, stopping at the first that
+fails; the case that killed goes first for the next mutant. A module with no `ns` form has no
+compile check: a mutant that does not compile is then killed by a case, as `compile`.
+
+| operator | edit (only in code: a body, not a signature, a type, a pattern or quoted data) |
+|---|---|
+| `cmp` | `<` and `<=`, `>` and `>=`, `=` and `!=` change places |
+| `arith` | `+` to `-`, `-` to `+`, `*` to `+` |
+| `bool` | `true` and `false`, `and` and `or` change places; `(not x)` becomes `x` |
+| `const` | an integer literal `n` to `n+1`, `n-1` and `0`, in its width and in range |
+| `branch` | `(if c a b)` to `(if c b a)` and to `(if (not c) a b)` |
+| `clause` | one clause of a `match` or a `cond` is deleted (most such mutants are `invalid`: not exhaustive) |
+| `swap` | `(f a b)` of two variables to `(f b a)`; not for `+ * = != bit-and bit-or bit-xor`, whose result cannot change |
+| `stmt` | a `(set! ..)`, or a form of a `do` before the last, becomes `()` |
+| `exit` | a `true` or `false` in a tail of the callback of `(each-while c (fn ..))` flips |
+
+The report counts the mutants killed by `result` (a wrong answer), `trap`, `audit`,
+`allocs`, `compile` (a case that the checker refuses), `failed`, `timeout` and `crash` (the
+tool died: a finding of its own), then survived and invalid, and the same by operator.
+A survivor is printed with its diff.
+
+For a survivor (plan MUT-P): (1) show it is not equivalent, with an input on which the two
+programs answer differently; (2) write a case that kills it (`ref-` or `law-` when it was in
+generic code); (3) rerun that line (`--lines N --ops OP`) and show it killed; (4) an
+equivalent one is listed with the argument, and code no input reaches is deleted.

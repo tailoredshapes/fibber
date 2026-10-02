@@ -138,6 +138,117 @@
                  (nil (trap "nth: index out of range"))
                  ((some r) (vnode-get r shift i)))))))))
 
+;; The bulk builder (stdlib design §2.5; tranche 1 plan L9). A Vec built by conj spends 2.09 heap
+;; objects an element (the tail is copied, and one path of the trie every 32); built here, 2 objects
+;; for every 32 elements (a leaf's array and its node, and the same one level up for every 32 nodes)
+;; and a few constants. The layout is the one above, unchanged, because rt/vec.lir and eval/vecs.rs
+;; read it: VecOf cnt shift root tail with the last 1..32 elements exactly in the tail, full leaves
+;; in the trie, shift 5 for a root of leaves, and an empty vector VecEmpty. The result is the vector
+;; a conj loop builds, as far as a program can tell (cases 480 and 481 read every element of a built
+;; vector and of the same grown by conj, which depends on the shift, the tail and the leaves being
+;; where a conj loop puts them); eval/vecs.rs build_vec stacks the branches the same way.
+;; Decided here:
+;;  - two entry points, both public: vec-from-array for an array whose length is known, and
+;;    vec-collect for a walk of unknown length (what the library's default to-vec is);
+;;  - the buffer of a collect has 32 slots, made from the first element (an (Array a) of a generic
+;;    a cannot be made without one) and written in place by array-set!; it becomes a leaf, itself
+;;    and not a copy, when the 33rd element of its run arrives, so a full buffer that ends the walk
+;;    is the tail without a copy;
+;;  - every mutable part of the state is a cell holding its array alone, because only then does
+;;    array-set! write in place (the count of a callee's owned parameter is two: §2.5);
+;;  - the leaves are an array that doubles from 4, made when the first leaf is full;
+;;  - the price is a constant: the state is a cell, a struct and three cells, so a collect of one element
+;;    allocates 6 more objects than the conj loop it replaced, of two 4 more, of three 2 more, of four the
+;;    same and of five or more fewer (cases 483 and 489 pin the counts).
+
+;; The branches one level up: nodes[0..n) in groups of 32, an array of ceil(n/32) branches.
+(defun vnodes-up :private (nodes: (Array (VNode a)) n: i64) -> (Array (VNode a))
+  (let ((groups (shr (+ n 31) 5))
+        (out (cell (array groups (array-get nodes 0)))))
+    (do (dotimes (g groups)
+          (let ((lo (shl g 5)))
+            (array-set! &out g (VBranch (array-copy nodes lo (if (< (+ lo 32) n) (+ lo 32) n))))))
+        @out)))
+
+;; The vector of cnt elements whose full leaves are nodes[0..n) and whose last 1..32 are tail:
+;; branches are stacked until one is left, as build_vec of eval/vecs.rs stacks them. The root
+;; branch is the nodes themselves when the array holds exactly n of them (nothing writes it again).
+(defun vec-trie :private (cnt: i64 shift: i64 nodes: (Array (VNode a)) n: i64 tail: (Array a)) -> (Vec a)
+  (if (<= n 32)
+      (VecOf cnt shift (some (VBranch (if (= n (array-len nodes)) nodes (array-copy nodes 0 n)))) tail)
+      (vec-trie cnt (+ shift 5) (vnodes-up nodes n) (shr (+ n 31) 5) tail)))
+
+;; The vector of the elements of xs, in order, built in one pass: a leaf per 32 elements and a
+;; branch per 32 nodes, so 2 objects for every 32 elements (the node and its array) where a conj
+;; loop spends 2.09 for each element. xs of at most 32 elements is the tail itself.
+(defun vec-from-array (xs: (Array a)) -> (Vec a)
+  (let ((n (array-len xs))
+        (split (- n (+ (bit-and (- n 1) 31) 1))))
+    (if (= n 0)
+        VecEmpty
+        (if (= split 0)
+            (VecOf n 5 nil xs)
+            (let ((leaves (cell (array (shr split 5) (VLeaf (array-copy xs 0 32))))))
+              (do (loop ((i 1))
+                    (if (< (shl i 5) split)
+                        (do (array-set! &leaves i (VLeaf (array-copy xs (shl i 5) (+ (shl i 5) 32))))
+                            (recur (+ i 1)))
+                        ()))
+                  (vec-trie n 5 @leaves (shr split 5) (array-copy xs split n))))))))
+
+;; The state of a build from a walk of unknown length: the buffer being filled (32 slots), the
+;; count of elements taken, and the full leaves so far, an array that doubles (made when the first
+;; leaf is full). Every field is a cell, so that a write goes to the array in place: the cell holds
+;; the array alone.
+(defstruct (VecBuild a) :private
+  (buf: (Cell (Array a)) n: (Cell i64) leaves: (Cell (Option (Cell (Array (VNode a)))))))
+
+;; The leaf of a full buffer goes on the leaves, doubling their array when it is full.
+(defun vb-leaf :private (b: (VecBuild a) k: i64) -> unit
+  (let ((leaf (VLeaf @(. b buf))))
+    (match @(. b leaves)
+      (nil (set! (. b leaves) (some (cell (array 4 leaf)))))
+      ((some lc)
+       (do (if (= k (array-len @lc))
+               (let ((bigger (cell (array (shl k 1) leaf))))
+                 (do (dotimes (i k) (array-set! &bigger i (array-get @lc i)))
+                     (set! lc @bigger)))
+               ())
+           (array-set! &lc k leaf))))))
+
+(defun vb-push :private (b: (VecBuild a) x: a) -> unit
+  (let ((n @(. b n))
+        (buf (. b buf)))
+    (do (if (= (bit-and n 31) 0)
+            (do (vb-leaf b (- (shr n 5) 1)) (set! buf (array 32 x)))
+            (array-set! &buf (bit-and n 31) x))
+        (set! (. b n) (+ n 1)))))
+
+(defun vb-done :private (b: (VecBuild a)) -> (Vec a)
+  (let ((n @(. b n))
+        (f (+ (bit-and (- n 1) 31) 1))
+        (buf @(. b buf)))
+    (let ((tail (if (= f 32) buf (array-copy buf 0 f))))
+      (match @(. b leaves)
+        (nil (VecOf n 5 nil tail))
+        ((some lc) (vec-trie n 5 @lc (shr (- n 1) 5) tail))))))
+
+;; The sink a walk is given: the first element makes the state, every other one is a write.
+(defun vec-take :private (st: (Cell (Option (VecBuild a))) x: a) -> bool
+  (do (match @st
+        (nil (set! st (some (VecBuild (cell (array 32 x)) (cell 1) (cell nil)))))
+        ((some b) (vb-push b x)))
+      true))
+
+;; The Vec of every element a walk offers, in one pass: walk is handed a function that takes each
+;; element and says true to go on (the visitor each-while is given), and runs it.
+(defun vec-collect (walk: (fn ((fn (a) bool)) bool) :borrow) -> (Vec a)
+  (let ((st (cell nil)))
+    (do (walk (fn (x) (vec-take st x)))
+        (match @st
+          (nil VecEmpty)
+          ((some b) (vb-done b))))))
+
 (impl Countable (Vec a)
   (count (self) (vec-count self)))
 

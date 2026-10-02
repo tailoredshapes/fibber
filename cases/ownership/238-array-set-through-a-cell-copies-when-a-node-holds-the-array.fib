@@ -1,0 +1,26 @@
+;; spec:   types §6.6 (a write through a shared array copies); the bulk builder of the standard library (plan L9)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; The bulk builder turns a full buffer into a leaf by storing the buffer's array in a node
+;; (`VLeaf`) and then replaces the buffer's cell content with a fresh array. This is the same
+;; step and the step it must not do: write the buffer's cell again while the node still
+;; holds the array. The write copies (the array's count is two), the cell gets the copy, and the
+;; node's array is unchanged: the leaf of the vector built so far must not see the next element.
+;; The result is 0 when the node still reads 1 2 3 and the cell reads 9 2 3, after the node
+;; has been put in a Vec (the container the leaf ends up in) and the Vec read through nth.
+(defenum (Leaf a) (Held items: (Array a)))
+
+(defun first-of (l: (Leaf i64)) -> i64
+  (match l ((Held items) (array-get items 0))))
+
+(defun main () -> i64
+  (let ((buf (cell (array 3 1))))
+    (do (array-set! &buf 1 2)
+        (array-set! &buf 2 3)
+        (let ((leaves (conj (vec-empty) (Held @buf))))
+          (do (array-set! &buf 0 9)
+              (+ (if (= (first-of (nth leaves 0)) 1) 0 1)
+                 (+ (if (= (array-get @buf 0) 9) 0 10)
+                    (+ (if (= (array-get @buf 1) 2) 0 100)
+                       (if (= (match (nth leaves 0) ((Held items) (array-get items 2))) 3) 0 1000)))))))))

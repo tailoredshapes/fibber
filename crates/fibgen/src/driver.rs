@@ -7,11 +7,32 @@ use std::time::{Duration, Instant};
 
 use crate::ast::Program;
 use crate::coverage::Coverage;
-use crate::gen::generate;
+use crate::gen::{generate, generate_pipeline};
 use crate::model::{expected, expected_traced, ModelError, Trace};
 use crate::print;
-use crate::run::{classify, run_with_limit, Class, Verdict};
+use crate::run::{classify, run_with_limit_in, Class, Verdict};
 use crate::shrink::shrink;
+use fibref::roots::Roots;
+
+/// Which programs a run generates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GenKind {
+    /// The general generator: every construct of the language.
+    #[default]
+    Programs,
+    /// Library pipelines (stdlib §8.1 item 3).
+    Pipelines,
+}
+
+impl GenKind {
+    /// The program for `seed` at `size`.
+    pub fn generate(self, seed: u64, size: u32) -> Program {
+        match self {
+            GenKind::Programs => generate(seed, size),
+            GenKind::Pipelines => generate_pipeline(seed, size),
+        }
+    }
+}
 
 /// What a run does.
 #[derive(Clone, Debug)]
@@ -32,6 +53,10 @@ pub struct Config {
     pub shrink_budget: usize,
     /// How many programs to keep (and minimise) per distinct failure.
     pub exemplars: usize,
+    /// Which generator.
+    pub kind: GenKind,
+    /// Where library modules are looked for before the built-in copy.
+    pub roots: Roots,
 }
 
 /// One checked program.
@@ -98,14 +123,27 @@ impl Summary {
 
 /// Checks one program: its model result and how the interpreter fared.
 pub fn check(p: &Program, timeout: Duration) -> (Verdict, Result<i64, ModelError>) {
-    let (v, e, _) = check_traced(p, timeout);
+    check_in(p, timeout, &Roots::default())
+}
+
+/// [`check`] with library modules looked for under `roots` first.
+pub fn check_in(
+    p: &Program,
+    timeout: Duration,
+    roots: &Roots,
+) -> (Verdict, Result<i64, ModelError>) {
+    let (v, e, _) = check_traced(p, timeout, roots);
     (v, e)
 }
 
 /// [`check`], and the model's trace.
-fn check_traced(p: &Program, timeout: Duration) -> (Verdict, Result<i64, ModelError>, Trace) {
+fn check_traced(
+    p: &Program,
+    timeout: Duration,
+    roots: &Roots,
+) -> (Verdict, Result<i64, ModelError>, Trace) {
     let (exp, trace) = expected_traced(p);
-    let obs = run_with_limit(&print::program(p), timeout);
+    let obs = run_with_limit_in(&print::program(p), timeout, roots);
     (classify(&obs, &exp), exp, trace)
 }
 
@@ -130,8 +168,9 @@ pub fn run_batch(cfg: &Config) -> Summary {
                             return part;
                         }
                         let (seed, size) = (cfg.seed + i as u64, size_of(cfg, i));
-                        let program = generate(seed, size);
-                        let (verdict, expected, trace) = check_traced(&program, cfg.timeout);
+                        let program = cfg.kind.generate(seed, size);
+                        let (verdict, expected, trace) =
+                            check_traced(&program, cfg.timeout, &cfg.roots);
                         part.add(
                             Sample {
                                 seed,
@@ -168,7 +207,7 @@ pub fn minimise(s: &Sample, cfg: &Config) -> (Program, Verdict, i64) {
         if expected(p).is_err() {
             return false;
         }
-        let (v, _) = check(p, cfg.timeout);
+        let (v, _) = check_in(p, cfg.timeout, &cfg.roots);
         (v.class, v.key) == want
     };
     let small = if cfg.shrink {
@@ -176,7 +215,7 @@ pub fn minimise(s: &Sample, cfg: &Config) -> (Program, Verdict, i64) {
     } else {
         s.program.clone()
     };
-    let (v, e) = check(&small, cfg.timeout);
+    let (v, e) = check_in(&small, cfg.timeout, &cfg.roots);
     let fallback = s.expected.clone().unwrap_or_default();
     (small, v, e.unwrap_or(fallback))
 }

@@ -1,0 +1,58 @@
+;; spec:   stdlib §2.1 rules 2 and 4 (the materialiser builds the chain's result once), §2.5, §4.4 (vec)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec map filter take concat range
+;; Case 405 checks vec of the library's lazy seqs and recipes on six elements; here the walks
+;; are long enough to go through the bulk builder's every state (L9): a buffer part-full
+;; (40 and 100 elements), full when the walk ends (32, 64 and 1024: the last buffer is the
+;; tail itself) and a leaves array that has doubled (1100 elements: 34 full leaves). The sources
+;; are a lazy map, a lazy filter, a take that stops the walk early (at 32, 33 and 64 of a
+;; source of 5000: the walk ends with the buffer full and with one element in a new buffer), a
+;; concat of two ranges, a chain of three, and the recipes (Mapped, Filtered, Taken) over the
+;; same. Each vector is read in full against the formula; a lazy seq that vec walked twice
+;; has called its function once per element, and the second vec equals the first. The planted
+;; fault is the same read against a formula wrong at the 33rd element, which must fail.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; v has n elements and element i is f of i
+(defun reads (v: (Vec i64) n: i64 f: (fn (i64) i64) :borrow) -> bool
+  (and (= (count v) n)
+       (loop ((i 0)) (if (< i n) (if (= (nth v i) (f i)) (recur (+ i 1)) false) true))))
+
+(defun triple (x: i64) -> i64 (* 3 x))
+(defun half (i: i64) -> i64 (* 3 (* 2 i)))
+(defun even-x (x: i64) -> bool (= (rem x 2) 0))
+(defun skewed (i: i64) -> i64 (if (= i 32) (+ (triple i) 1) (triple i)))
+(defun doubled (i: i64) -> i64 (* 2 i))
+(defun same-index (i: i64) -> i64 i)
+(defun joined (i: i64) -> i64 (if (< i 40) i (+ 1000 (- i 40))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (calls (cell 0))
+        (src (range 5000)))
+    (do (check c (reads (vec (map triple (range 40))) 40 triple))
+        (check c (reads (vec (map triple (range 1100))) 1100 triple))
+        (check c (reads (vec (filter even-x (range 200))) 100 doubled))
+        (check c (reads (vec (filter even-x (range 2200))) 1100 doubled))
+        (check c (reads (vec (take 32 (map triple src))) 32 triple))
+        (check c (reads (vec (take 33 (map triple src))) 33 triple))
+        (check c (reads (vec (take 64 (map triple src))) 64 triple))
+        (check c (reads (vec (take 1024 (map triple src))) 1024 triple))
+        (check c (reads (vec (take 0 src)) 0 triple))
+        (check c (reads (vec (concat (range 40) (map (fn (x) (+ x 1000)) (range 1060)))) 1100 joined))
+        (check c (reads (vec (take 100 (map triple (filter even-x src)))) 100 half))
+        (check c (reads (vec (Mapped (Filtered (range 2200) even-x) triple)) 1100 half))
+        (check c (reads (vec (Taken (Mapped src triple) 65)) 65 triple))
+        (let ((s (map (fn (x) (do (set! calls (+ @calls 1)) (triple x))) (range 70))))
+          (let ((a (vec s)) (b (vec s)))
+            (do (check c (reads a 70 triple))
+                (check c (reads b 70 triple))
+                (check c (= @calls 70)))))
+        (check c (= (checks-made c) 16))
+        (check p (reads (vec (take 40 (map triple src))) 40 skewed))
+        (check-detects c p)
+        (checks-result c))))

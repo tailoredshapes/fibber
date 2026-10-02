@@ -109,15 +109,18 @@ its own. Every compile error names a position. (**Decided**.)
 macro expansion the compiler rewrites them:
 
 ```
-[]              ⟹ (vec-empty)
-[e1 e2 ... en]  ⟹ (conj (conj ... (conj (vec-empty) e1) ...) en)
-{}              ⟹ (map-empty)
-{k1 v1 ...}     ⟹ (assoc (assoc (map-empty) k1 v1) ...)
+[]              ⟹ (fib.prelude/vec-empty)
+[e1 e2 ... en]  ⟹ (fib.prelude/vec-conj (fib.prelude/vec-conj ... (fib.prelude/vec-conj (fib.prelude/vec-empty) e1) ...) en)
+{}              ⟹ (fib.prelude/map-empty)
+{k1 v1 ...}     ⟹ (fib.prelude/map-assoc (fib.prelude/map-assoc (fib.prelude/map-empty) k1 v1) ...)
 ```
 
-`conj`, `assoc`, `vec-empty` and `map-empty` are prelude names (§4.4);
-the rewrite resolves them in the prelude, not in the current namespace,
-so a user binding of `conj` does not change what a literal means. The
+`vec-empty`, `vec-conj`, `map-empty` and `map-assoc` are prelude functions
+(§4.5), not the collection protocols' `conj` and `assoc`: the rewrite writes
+them `fib.prelude/NAME` (§4.4, hygiene), so a user binding of `conj` or
+`vec-conj` does not change what a literal means, and a `def` initialiser
+that writes `(conj ..)` or `(assoc ..)` by hand is not a constant expression
+while the literal is (stdlib design §6.3, tranche 1 R2). The
 compiler may fuse the chain into one allocation; that is an
 optimisation, not a semantic. Inside `quote`/`quasiquote` the brackets
 stay `Vec`/`Map` forms and are not rewritten, so macros see `[x y]` as
@@ -572,12 +575,14 @@ field   ::= sym: type | type
 ```
 
 A nominal sum type and one constructor per variant; a variant without
-fields is a constant, written bare in expressions (`empty`, `nil`) and
-as `(Variant)` in patterns (§3.6); `(empty)` as an expression is the
-error `empty is a constant, not a function` (types §2.2; **Decided**:
-`nil` already works this way, and `(empty)` as a call to a value of
-non-function type broke the normative `list` expansion of cases 01 and
-05). Variant names live in the namespace beside functions and must be
+fields is a constant, written bare in expressions (`Empty`, `nil`) and
+as `(Variant)` in patterns (§3.6); `(Empty)` as an expression is the
+error `Empty is a constant, not a function; write Empty` (types §2.2;
+**Decided**: `nil` already works this way, and `(Empty)` as a call to a
+value of non-function type broke the normative `list` expansion of cases
+01 and 05). The prelude's `List` names its variants `Empty` and `Cons`
+(§4.5), capitalised so that they do not collide with the library's method
+`empty` and function `cons` (stdlib design C-3). Variant names live in the namespace beside functions and must be
 unique there (**Decided**). An enum
 whose variants all have no fields is a scalar (types §8.1).
 
@@ -594,10 +599,10 @@ any other enum's. The expander treats the form `(Nil)` and the symbol
 the empty-variant pattern in a pattern; `(nil)` in a pattern is the
 `(Variant)` spelling of the same, and `(nil)` in an expression is the
 error `nil is a constant, not a function; write nil`, exactly as for
-`empty`. A macro that writes `nil` inside a quasiquote emits the
+`Empty`. A macro that writes `nil` inside a quasiquote emits the
 reader's `(Nil)` and needs no special case (proposed case 51). Its
-representation is in types §8.1; the prelude derives `Eq`, `Ord`,
-`Hash` and `Show` for it (§4.4) (**Decided**: the declaration `(defenum
+representation is in types §8.1; the prelude derives `Eq`, `Ord` and
+`Hash` for it and writes its `Show` by hand (§4.4, §4.5) (**Decided**: the declaration `(defenum
 (Option a) (nil) (some v: a))` cannot be read, since `nil` reads as
 `(Nil)`, and accepting the reader's form in the expander is what lets
 a macro emit `nil` through a quasiquote without a special case). There
@@ -709,7 +714,7 @@ a rule for each (types §2.9–§2.11). None is a special form.
 | `(deref c)`, `@c` | protocol `Deref` | cell → its value; atom → its value; weak → `(Option T)`; task → its result, as `(join c)` (**Proposed**, owner's rule 2026-10-01: Clojure's `@f` of a future; types §2.9). Every object result is owned (+1). `c` is an expression, or the name of an `&` parameter (§3.13) |
 | `(set! c v)` | `(Cell a) a -> unit` | store `v`, release the old value; the target `c` is an expression of cell type (a field path among them, §3.8) or the name of an `&` parameter, which is not an expression but may stand here and as the operand of `@` (§3.13; types §2.9) |
 | `(atom v)` | `a -> (Atom a)`, `Send a` | a new atom |
-| `(swap! a f)` | `(Atom a) (fn (a) a) -> a` | replace atomically with `(f old)`; `f` may run more than once, and `swap!` may never finish under contention or when `f` itself changes the atom each time (**Decided**, ownership.md §7); returns the new value (owned) |
+| `(swap! a f)` | `(Atom a) (fn (a) a) -> a` | replace atomically with `(f old)`; `f` may run more than once, and `swap!` may never finish under contention or when `f` itself changes the atom each time (**Decided**, ownership.md §7); returns the new value (owned); `(swap! a f x ..)` with extra arguments is the prelude macro of §4.4 |
 | `(reset! a v)` | `(Atom a) a -> unit` | replace, release the old value |
 | `(weak x)` | `a -> (Weak a)`, `a` an object type other than an `Option` (types §2.11) | a weak reference; does not keep `x` alive |
 
@@ -1201,6 +1206,23 @@ variants, with gensyms for the pattern variables:
   the seed `h` of the variant's index (0 for a struct); see types
   §2.12.
 - `Show`: the variant name followed by the shown fields, as a call form.
+- `Debug` and `ToStr` (stdlib design §2.7, L17; **Proposed**, the shapes
+  were decided in the tranche 1 plan, R8): the text of a record,
+  `#m.Done{:v 3}` for a variant with fields and `#m.P{:x 1, :y "x"}` for a
+  struct, each field's text the `debug` of the field (`fib.core/debug`).
+  `m` is the module the `derive` form is expanded in, because the
+  expander's type table does not record the module a type was defined in,
+  so a `derive` in another module than the type's prints the deriving
+  module. A variant field written without a name is called by its
+  position, `#m.Wrap{:0 3, :1 "q"}`, and a variant with no field prints as
+  its bare name. `ToStr` is the same text built from the fields' `Debug`,
+  so its `:where` asks for `Debug` and the type needs no `Debug` instance
+  of its own (a type that derives only `ToStr` has `to-str` and no
+  `debug`; a recursive type that derives only `ToStr` fails with `no
+  implementation of Debug for ..` at the recursive field). The protocols
+  are named `fib.core/Debug` and `fib.core/ToStr`, so the module needs
+  `fib.core` in scope: a `:use fib.core` until the implicit list is
+  filled (§5), else the error is `unknown protocol fib.core/Debug`.
 
 The inner matches enumerate the variants, so the expansion is
 quadratic in the variant count; that is the macro's cost, not the
@@ -1228,8 +1250,10 @@ this, growing with the square of the variant count (proposed case 48).
 A field-less enum is a scalar with built-in `Eq`, `Ord` (declaration
 order), `Hash` and `Show` (types §2.12), so `derive` of any of the four
 on it expands to `(do)`: the built-in instance is the one it would
-produce. The prelude derives all four for `Option` and for `List`
-(§4.4), which is why `(= (some 1) (some 1))` and `(= (list 1 2) (list 1
+produce; `Debug` and `ToStr` are not built in, so an enum with no field
+in any variant still gets those two. The prelude derives `Eq`, `Ord` and
+`Hash` for `Option` and for `List` (§4.4; their `Show` is written by hand,
+§4.5), which is why `(= (some 1) (some 1))` and `(= (list 1 2) (list 1
 2))` need nothing from the programmer.
 
 A macro that needs the constant `nil`, in a pattern or an expression,
@@ -1333,8 +1357,9 @@ const ::= literal | 'form | nil | Variant             ; a field-less variant, ba
 ```
 
 No call other than a constructor and the prelude calls that the
-literal-collection rewrite introduces (`vec-empty`, `conj`, `map-empty`,
-`assoc`, §1.4), and no `cell`, `atom`, `weak`, `fn`, `async`, `unsafe`
+literal-collection rewrite introduces (`vec-empty`, `vec-conj`,
+`map-empty`, `map-assoc`, §1.4; a hand-written `(conj ..)` or `(assoc ..)`
+is a protocol call, so it is not one), and no `cell`, `atom`, `weak`, `fn`, `async`, `unsafe`
 or `@`: a constant expression has no effect and builds only immutable
 objects. Its type is inferred as for a `let` binding (types §2.16):
 monomorphic, never generalised, and closed; `(def e [])` is the error
@@ -1479,27 +1504,75 @@ of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
 | Macro | Expands to |
 |---|---|
 | `when`, `unless`, `cond`, `and`, `or` | `if` |
-| `if-let`, `when-let`, `nil?`-free option tests | `match`: `(if-let (x e) a b)` ⟹ `(match e ((some x) a) (nil b))` |
-| `list` | `(list a b)` ⟹ `(cons a (cons b empty))` (`empty` is `List`'s field-less variant, used bare: §3.9) |
+| `if-let`, `when-let`, `nil?`-free option tests | `match`: `(if-let (p e) a b)` ⟹ `(match e ((some p) a) (_ b))`, `(when-let (p e) body ..)` ⟹ `(match e ((some p) body) (_ ()))`. `p` may be any pattern (§3.6): a name, a vector pattern, a variant pattern, a literal; the else is taken on `nil` and on a mismatch of `p`, so a refutable `p` is exhaustive (an else of `(nil b)` made it `missing (some [])`). `(if-let (p e) a)` has `()` as its else (arity 2 to 3; stdlib design §2.4, §7 E13) |
+| `list` | `(list a b)` ⟹ `(fib.prelude/Cons a (fib.prelude/Cons b fib.prelude/Empty))`, `(list)` ⟹ `fib.prelude/Empty` (`Empty` is `List`'s field-less variant, used bare: §3.9; the variants are qualified so that the library's function `cons` and method `empty` cannot capture them) |
 | `plet` | §3.12 |
 | `while`, `dotimes`, `for-each` over a `range` | `loop`/`recur` (§3.18): `(while c body)` ⟹ `(loop () (if c (do body (recur)) ()))`; `(dotimes (i n) body)` ⟹ `(let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))` with `m` a gensym; `(for-each (range a b) (fn (i) body))`, with a literal `(range a b)` or `(range n)` (read as `(range 0 n)`) and a literal `fn` with no name, one unannotated parameter and no result annotation, ⟹ `(let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))` with `s` and `m` gensyms, the body spliced in with no closure. A loop variable takes no annotation, so a `fn` whose parameter is annotated (`(fn (i: i64) ..)`) is left to the library function, which checks it (case 86). The bounds are evaluated once, left to right, before the loop variable exists, so a bound that mentions a variable named like `i` sees the outer one (**Decided**, owner, 2026-09-27; the earlier `(loop ((i 0) (m n)) ..)` bound `n` inside the loop's own `i`); any other `for-each` is the library function (§4.5) |
-| `range` | `(range a b)` ⟹ `(range-between a b)`; `(range n)` is not rewritten: it is the library function `range`, which is also what `range` names as a value (§4.5). There is no arity overloading, so the two-argument form exists as this rewrite (**Decided**, owner, 2026-09-27: both arities) |
+| `range` | `(range a b)` ⟹ `(range-between a b)`; `(range n)` is not rewritten: it is the library function `range`, which is also what `range` names as a value (§4.5). A call of three arguments, Clojure's `(range a b step)`, is declined as well and stays a call of the library function, whose arity error says `use range-by` (stdlib §7 D1); `(range)` and four or more arguments are the macro's own arity error. There is no arity overloading, so the two-argument form exists as this rewrite (**Decided**, owner, 2026-09-27: both arities) |
 | `->`, `->>`, `doto` | call rewriting |
 | `assert` | `(assert c)` / `(assert c msg)` ⟹ `(if c () (trap msg))`, the default message naming the position and the test |
-| `dbg` | `(dbg e)` ⟹ `(let ((t e)) (eprintln (str-concat "dbg FILE:LINE:COL: E = " (show t))) t)` with `t` a gensym and the literal text naming the call's position and `e` as written: evaluates `e` once, prints it with `Show` to stderr, returns it (**Decided**, owner, 2026-09-27) |
-| `derive` | `(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`: one `impl` whose head comes from `struct-params` or `enum-params`, whose `:where` lists `(P t)` for each parameter used by a field (`struct-field-types`, `enum-variants`; for `Ord` too, whose supertrait `Eq` the context then entails, types §4.1) and whose methods go field by field over `struct-fields` for a struct, or variant by variant over `enum-variants` for an enum, with a nested `match` on both operands (§3.16); `(do)` for a field-less enum, whose instances are built in; several protocols are several `derive` forms, which a macro may return in one top-level `do`. The prelude itself contains `(derive Eq Option)`, `(derive Ord Option)`, `(derive Hash Option)`, `(derive Show Option)` and the same four for `List` |
+| `dbg` | `(dbg e)` ⟹ `(let ((t e)) (eprintln (str-concat "dbg FILE:LINE:COL: E = " (show t))) t)` (every head written `fib.prelude/NAME`) with `t` a gensym and the literal text naming the call's position and `e` as written: evaluates `e` once, prints it with `Show` to stderr, returns it (**Decided**, owner, 2026-09-27) |
+| `derive` | `(derive P Name)`, for `P` one of `Eq`, `Ord`, `Hash`, `Show`, `Debug`, `ToStr` (any other is `cannot derive X: only Eq, Ord, Hash, Show, Debug and ToStr`; the last two, §3.16): one `impl` whose head comes from `struct-params` or `enum-params`, whose `:where` lists `(P t)` for each parameter used by a field (`struct-field-types`, `enum-variants`; for `Ord` too, whose supertrait `Eq` the context then entails, types §4.1) and whose methods go field by field over `struct-fields` for a struct, or variant by variant over `enum-variants` for an enum, with a nested `match` on both operands (§3.16); `(do)` for a field-less enum, whose instances are built in; several protocols are several `derive` forms, which a macro may return in one top-level `do`. The prelude itself contains `(derive Eq Option)`, `(derive Ord Option)`, `(derive Hash Option)` and the same three for `List`; their `Show` is written by hand in `lib/prelude.fib` (§4.5) |
+| `defn`, `defn-` | `(defn name doc? [x: T ..] -> R body ..)` ⟹ `(defun name (x: T ..) -> R body ..)`; `defn-` puts `:private` after the name; the docstring is dropped; everything after the vector (`-> R`, `:where`, the body) is passed on. A `&` in the vector is the error `rest parameters need L2`, a list of clauses `([x] ..) ..` is `several arities need L1` (stdlib §7). The built `defun` takes the call's position and the parameter list the vector's |
+| `str`, `println`, `print`, `prn`, `pr` | `(str)` ⟹ `""`; `(str a b ..)` ⟹ the right fold of `fib.prelude/str-concat` over the pieces, a string-literal piece as it is, a literal `nil` as `""`, any other piece `(fib.core/to-str x)`. `(println a b ..)` ⟹ `(fib.prelude/println S)` and `(print a b ..)` ⟹ `(fib.prelude/print-str S)`, `S` the pieces joined by one space, a literal `nil` piece as `"nil"` (a bare `nil` has no type, so it would otherwise be an ambiguous-constraint error) and any other piece, a string literal included, `(fib.prelude/show x)`; `(println)` and `(print)` write `""`. `prn` and `pr` are `println` and `print` over `(fib.core/debug x)`, with the same literal-`nil` rule. A name in value position (`(map str xs)`) is not a call and is left alone: the function twins of `fib.print` serve it (stdlib §2.7, §4.14). A `fib.core/` head resolves only in a module that has `fib.core` in scope, a `:use fib.core` until the implicit list is filled (§5): `(str ..)`, `(prn ..)` and `(pr ..)` without it are `unbound name fib.core/to-str`, and `println` and `print` need only the prelude |
+| `+ - * < > <= >= = max min bit-and bit-or bit-xor` | the variadic folds, each answering only the calls the binary builtin or function cannot and **declining** the rest: `(+)` ⟹ `0` and `(*)` ⟹ `1` (`i64`s); `(+ a)`, `(* a)` ⟹ `a`; from three arguments `(+ a b c)` ⟹ `(fib.prelude/+ (fib.prelude/+ a b) c)`, a left fold, so the first sum that overflows traps; `(-)` is the arity error `macro - takes at least 1 argument(s), got 0`, `(- a)` ⟹ `(fib.prelude/neg a)`; `(< a b c)` ⟹ `(and (< a b) (< b c))` with every operand evaluated once, in order, before the first test (an operand that is not a symbol, a literal or a field path `(. x f)` is first bound to a gensym), and `(< a)` ⟹ `(let ((t a)) true)`; `max`, `min` and the three `bit-` operations fold from three arguments (`fib.core/max`, `fib.prelude/bit-and` ..) and decline below that |
+| `conj`, `assoc`, `dissoc`, `merge` | `(conj c)`, `(dissoc m)` ⟹ the collection itself; `(conj c x y ..)`, `(dissoc m k1 k2 ..)` ⟹ the left fold of `fib.coll/conj`, `fib.coll/dissoc`; `(assoc m k v k2 v2 ..)` ⟹ the left fold of `fib.coll/assoc` by pairs, and a key without a value is the error `malformed assoc: a key without a value`; `(merge)` is the error `malformed merge: needs at least one argument`, a literal `nil` operand is skipped (`(merge a nil b)` is `(merge a b)`, and `nil` when every operand is one); the two- and three-argument calls (and `(merge a b)` with no literal `nil`) are declined: the method or function serves them. Clojure's rules for a literal `nil` first argument, `(conj nil x)` as `(list x)` and `(assoc nil k v)` as a map, are not implemented (stdlib §2.4) |
+| `swap!` | `(swap! a f x ..)` ⟹ `(fib.prelude/swap! a (fn (v) (f v x ..)))`, `v` a gensym, the extra arguments evaluated inside the closure each time the builtin calls it (which may be more than once, §3.11); the two-argument call is the builtin's and is declined |
+| `update` | `(update m k f x ..)` ⟹ `(fib.coll/update m k (fn (v) (f v x ..)))`, `v` a gensym; a literal `(fnil g d)` for `f` ⟹ `(fib.coll/update-or m k g d)` (with extra arguments, `g` is called with them inside the closure); a call of fewer than three arguments, and a three-argument call whose `f` is not a literal `fnil`, is declined and stays the library function `update` |
+| `reduce` | `(reduce f c)` ⟹ `(fib.seq/reduce-nonempty f c)`; for the literal heads `+ * str conj merge concat` ⟹ `(fib.seq/reduce f init c)` from `0 1 "" [] {} []`; `(reduce (fn (a x) body) init c)` whose body has `(reduced e)` in a tail position (found through `if let do match cond when unless if-let when-let loop`, with an explicit stack) ⟹ `(fib.seq/reduce-while f' init c)`, each tail `(reduced e)` rewritten to `(fib.core/Done e)`, every other value tail `v` to `(fib.core/More v)` and a `(recur ..)` left alone; any other call, a literal `fn` with a `->` or `:where` included, is declined and stays the library function. Of the six literal heads only `+ * conj merge` type-check today: the library `str` of one argument and `concat`, which returns an `LSeq`, do not fit the accumulator, and `(reduce + [1.5 2.5])` is `cannot unify f64 with i64` until L19 (cases 780-793) |
+
+**Hygiene** (stdlib design §6.3, tranche 1 R2). Every head or constant a
+Rust prelude macro emits that is not a core form is written with the name
+of the module that defines it, `fib.prelude/NAME` (`fib.core/`, `fib.coll/`
+and `fib.seq/` for the library's names), so that a binding of the
+program's own `cons`, `trap`, `show`, `+` or `update-or` is not what the
+expansion calls; the bindings a macro introduces are gensyms. The macros an
+expansion names (`and`, `or`) and the core forms (`if let match loop recur
+fn do .`) are plain, and a user `defmacro` named `and` or `or` still
+shadows them, because the expander finds a prelude macro by its bare name
+and does not recognise `fib.prelude/and`. The rule is checked by a test
+that runs one sample per registry row and requires every head of the output
+to be core or qualified (`expand/tests/hygiene.rs`).
+
+**Declining.** A row that says *declined* leaves the call unchanged, to be
+served by the builtin or the library function of that name. The expander
+knows macros and not functions, so a macro that does not decline a call
+rewrites it even when the program defines a function of that name and
+arity: a user `defun` named `str`, `print`, `println`, `prn` or `pr`, or a
+user `(defun update (a b c d) ..)` called with four arguments, is
+shadowed in head position by the macro (the same sharp edge `for-each` and
+`range` always had). A macro name in value position (`(map str xs)`,
+`(run! println xs)`) is not a call and is left alone.
+
+**Fusion** (stdlib design §2.1 rule 2, §7 E16) is not a macro: it is a
+second pass over each top-level form after the macros have run, which
+rewrites a chain of the library's sequence functions consumed by a
+terminal into recipe structs (`(->> v (map f) (filter p) (reduce g 0))`
+becomes `(reduce g 0 (fib.seq/Filtered (fib.seq/Mapped v f) p))`). Its rule
+is stated in stdlib §2.1; the expansion dump of a program that sees
+`fib.seq` shows the recipes and gensyms named `#fuse.N`, and the dump
+format is unchanged (bootstrap §2).
 
 ### 4.5 Library (written in fibber, in `lib/`)
 
 `Option` helpers (`nil?`, `some?`, `unwrap-or`; the type itself is built
 in, §3.9); `List` (`(defenum (List a)
-(empty) (cons head: a tail: (List a)))`), with `Eq`, `Ord`, `Hash` and
-`Show` derived for both (§4.4); `Vec`, `Map`, `Set` as
+(Empty) (Cons head: a tail: (List a)))`, declared in the expander's
+prelude, with `Eq`, `Ord` and `Hash` derived for it and for `Option` and
+their `Show` written by hand in `lib/prelude.fib`: a present `Option` prints
+as its payload, `nil` as `nil`, a `List` as `(1 2)` or `()`, which a derived
+instance cannot say; the variants are capitalised because the library's
+method `empty` and function `cons` would collide with lower-case ones,
+stdlib design C-3); `(Pair a b)` with fields `fst` and `snd`, `(Triple a b
+c)` with `fst`, `snd`, `thd`, and `(Result a b)` with `(Ok v)` and `(Err e)`
+(`Eq`, `Ord`, `Hash` derived and no `Show` in the prelude: `fib.print` supplies one for `Pair` and `Triple`, and none exists for `Result` yet); a
+public `print-str` writing a string without the newline; `Vec`, `Map`, `Set` as
 persistent structures over `(Array T)` with `vec-empty conj nth count
 push! pop! vec-set! map-empty assoc get dissoc contains? map-put!
 map-del! set-empty disj set-contains?` (`Map` and `Set` are an HAMT over
 the keys' `hash`, keys needing `Hash` and `Eq`; `for-each` over a `Map`
-visits `(Entry k v)` structs with fields `key` and `val`); the
+visits `(Pair k v)` structs with fields `fst` and `snd`, and `map-each` and
+`set-each` walk without building the `Pair`); the
 protocols `Seq Countable Indexable Collection Associative Traversable
 Iter Hash Show` with `first rest count nth conj for-each map filter
 reduce iter next collect filter-iter`; `range` (**Decided**, owner,
@@ -1687,8 +1760,8 @@ rule that produces the verdict. Library names used are listed in §4.5.
     (let ((h (head l)))
       (unbox h))))
 ```
-Unchanged. `list` is the prelude macro (`(cons (box 1) (cons (box 2)
-empty))`, §4.4), `box`/`unbox` the prelude `Box` struct, `first` the
+Unchanged. `list` is the prelude macro (`(fib.prelude/Cons (box 1)
+(fib.prelude/Cons (box 2) fib.prelude/Empty))`, §4.4), `box`/`unbox` the prelude `Box` struct, `first` the
 `Seq` method (traps on an empty list; **Decided**: `first?`/`nth?`
 return `(Option T)`). `head` is inferred as `∀s e. (Seq s e) ⇒ (fn (s)
 e)`; `(first xs)` is a tail call of `head` whose argument, a borrowed

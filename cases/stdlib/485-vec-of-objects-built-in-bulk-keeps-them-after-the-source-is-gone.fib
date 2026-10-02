@@ -1,0 +1,72 @@
+;; spec:   stdlib §2.5, types §6 (ownership of the elements a container stores), method rule 2 (the audit)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: vec map
+;; The bulk builder stores elements that are objects (strings, vectors, options of strings) in its
+;; buffer, its leaves and its tail, with the buffer's filler slots holding the first element of the
+;; run until they are overwritten. The audit, not the result, is what this case is for: a count
+;; that is one too many leaks, one too few frees an element twice or reads a freed one. For
+;; each length of 0, 1, 31, 32, 33, 64, 65 and 1100 (a tail alone, a full buffer ending the walk,
+;; one element in a new buffer, a leaves array that has doubled) a Vec of strings is built from an
+;; Array of strings that is dropped before the Vec is read, one of Vecs from a lazy map that
+;; makes each, and one of Options of strings through vec-from-array; each is read in full.
+;; The same string object is stored in two vectors and read from both, and a bulk vector
+;; is grown by conj and the older one read again. Every vector's elements are compared with the
+;; text the formula gives for the index. The planted fault is a read against the text of the
+;; neighbour, which must fail.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun text (i: i64) -> str (str-concat "item-" (show i)))
+
+(defun strings (n: i64) -> (Vec str)
+  (let ((c (cell (array n ""))))
+    (do (dotimes (i n) (array-set! &c i (text i)))
+        (vec @c))))
+
+(defun options (n: i64) -> (Vec (Option str))
+  (let ((c (cell (array n nil))))
+    (do (dotimes (i n) (array-set! &c i (if (= (rem i 3) 0) nil (some (text i)))))
+        (vec-from-array @c))))
+
+(defun pairs (n: i64) -> (Vec (Vec str))
+  (vec (map (fn (i) (conj (conj (vec-empty) (text i)) (text (+ i 1)))) (range n))))
+
+;; the three vectors of length n are read against the formula, shifted by off
+(defun reads (n: i64 off: i64) -> bool
+  (let ((s (strings n)) (o (options n)) (p (pairs n)))
+    (and (= (count s) n)
+         (and (= (count o) n)
+              (and (= (count p) n)
+                   (loop ((i 0))
+                     (if (< i n)
+                         (if (and (= (nth s i) (text (+ i off)))
+                                  (and (= (nth (nth p i) 1) (text (+ i (+ off 1))))
+                                       (match (nth o i)
+                                         (nil (= (rem i 3) 0))
+                                         ((some t) (= t (text i))))))
+                             (recur (+ i 1))
+                             false)
+                         true)))))))
+
+;; one string object stored in two vectors, and the older of two versions read after the newer grew
+(defun shared (n: i64) -> bool
+  (let ((t (text 7)))
+    (let ((a (vec (map (fn (i) t) (range n)))) (b (vec (map (fn (i) t) (range (+ n 1))))))
+      (let ((grown (conj a (text 8))))
+        (and (= (nth a (- n 1)) (text 7))
+             (and (= (nth b n) (text 7))
+                  (and (= (nth grown n) (text 8))
+                       (= (count a) n))))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (lens [0 1 31 32 33 64 65 1100]))
+    (do (dotimes (j 8) (check c (reads (nth lens j) 0)))
+        (dotimes (j 8) (check c (shared (+ 1 (nth lens j)))))
+        (check c (= (checks-made c) 16))
+        (check p (reads 40 1))
+        (check-detects c p)
+        (checks-result c))))

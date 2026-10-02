@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use fibref::cases::{AuditSummary, Outcome, Value};
+use fibref::roots::Roots;
 
 use crate::model::ModelError;
 
@@ -20,12 +21,20 @@ pub enum Observed {
 /// Runs `source` through `fibref::eval::run_source` on its own thread and
 /// waits at most `limit` for it.
 pub fn run_with_limit(source: &str, limit: Duration) -> Observed {
+    run_with_limit_in(source, limit, &Roots::default())
+}
+
+/// [`run_with_limit`] with the library found under `roots` first (the
+/// built-in copy of `lib/` last), which is how a scratch copy of the
+/// library with a planted fault is judged.
+pub fn run_with_limit_in(source: &str, limit: Duration, roots: &Roots) -> Observed {
     let (tx, rx) = mpsc::channel();
     let src = source.to_string();
+    let roots = roots.clone();
     let spawned = std::thread::Builder::new()
         .name("fibgen-run".into())
         .spawn(move || {
-            let outcome = fibref::eval::run_source(&src, "<gen>");
+            let (outcome, _) = fibref::eval::run_source_in(&src, "<gen>", &[], &roots);
             // The receiver is gone only after a timeout; nothing to do then.
             let _ = tx.send(outcome);
         });
