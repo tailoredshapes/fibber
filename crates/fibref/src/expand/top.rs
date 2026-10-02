@@ -9,6 +9,7 @@ use super::error::{ExpandError, ExpandErrorKind as K};
 use super::expr::{expand_head, Expander};
 use super::fuse::names_of;
 use super::heads::{is_core, is_definition, QUASI_FORMS};
+use super::params;
 use super::private::{marker_index, put_marker, take_marker, type_name as private_type_name};
 use super::runner::{parse_params, MacroDef};
 use super::walk::walk;
@@ -63,7 +64,7 @@ fn definition(ex: &mut Expander, form: Form, first: bool) -> Result<Form, Expand
     })
 }
 
-fn definition_of(ex: &mut Expander, form: Form, first: bool) -> Result<Form, ExpandError> {
+fn definition_of(ex: &mut Expander, mut form: Form, first: bool) -> Result<Form, ExpandError> {
     let name = head_name(&form).unwrap_or("").to_string();
     let role = match name.as_str() {
         "ns" if !first => return Err(ExpandError::new(K::NsNotFirst, &form.pos)),
@@ -83,7 +84,10 @@ fn definition_of(ex: &mut Expander, form: Form, first: bool) -> Result<Form, Exp
         }
         "defprotocol" => protocol_plan(&form)?,
         "defmacro" => return defmacro(ex, form),
-        "defun" => defun_plan(&form)?,
+        "defun" => {
+            form = params::desugar(ex.ctx, form, true)?;
+            defun_plan(&form)?
+        }
         "def" => def_plan(&form)?,
         "impl" => impl_plan(&form)?,
         n if is_definition(n) => Role::Keep,

@@ -53,6 +53,11 @@ impl Lowerer<'_> {
             (None, &parts[1..])
         };
         let body = self.body(body, &clause.pos, tail)?;
-        Ok(Clause { pat, guard, body })
+        Ok(Clause {
+            pat,
+            guard,
+            body,
+            fallback: false,
+        })
     }
 }

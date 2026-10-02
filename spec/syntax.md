@@ -265,9 +265,19 @@ Ownership consequences are stated briefly and decided in types §6.
 ```
 (defun name private? (param*) where? ret? body)          ; private ::= :private (§5)
 param ::= sym | sym: type | sym :borrow | sym: type :borrow | &sym | &sym: type
+       | (pat :as sym: type)            ; a pattern parameter (stdlib §7 L7)
 where ::= :where (constraint+)          ; constraint ::= (Proto type+) | (Send type)
 ret   ::= -> type
 ```
+
+A pattern parameter `(pat :as p: T)` is sugar the expander builds:
+`(defun f (a (pat :as p: T)) body)` is `(defun f (a p: T) (let ((pat p)) body))`,
+the `let` of §3.3 (so `[k v]` takes a prefix of a vector and the fields of a
+`Pair`). A `defun` states every type, so the type is required (`defun: a
+pattern parameter is (pattern :as name: type)`); a `fn` literal takes
+`(pat :as p)` as well, and a bare vector `[k v]` item (a fresh name stands
+for it), with the type inferred. `loop` takes a pattern in a binding in
+the same way (§3.18).
 
 Static: `name` is bound in the module's namespace before any body is
 checked, so functions may be mutually recursive without forward
@@ -377,11 +387,19 @@ binding ::= (pat expr) | (sym: type expr)
 Sequential bindings: each initialiser sees the earlier ones. `(sym:
 type expr)` annotates the variable `sym` (§1.5); the initialiser's type
 must fit the annotation as an argument's must fit an annotated
-parameter (types §2.4). `pat` must
-be irrefutable: a symbol, `_`, `(pat :as sym)` (§3.6), a struct pattern, a
-pattern of the only variant of an enum, or the one irrefutable vector
-pattern `[& r]` (§3.6; `r` a symbol or `_`), whose sub-patterns are
-irrefutable in turn. `[& r]` binds `r` to a new vector holding every
+parameter (types §2.4). `pat` is any pattern of §3.6.
+An irrefutable one (a symbol, `_`, `(pat :as sym)`, a struct pattern, a
+pattern of the only variant of an enum, `[& r]` with `r` a symbol or `_`,
+each with irrefutable sub-patterns) is a plain binding. A refutable one
+(stdlib §7 L8) is lowered by the checker to
+`(match expr (pat <the rest of the let>) (_ (trap "let: pattern does not match")))`,
+so it traps when the value does not fit, and that last clause is never
+reported as redundant. **A vector pattern in a binding position takes a
+prefix**: `[a b]` is `[a b & _]` at every depth, binding the first two
+elements and ignoring the rest (a vector of fewer traps), as Clojure's
+destructuring does; a `match` keeps `[a b]` exact. Against a `Pair` or
+`Triple` (§3.6) a vector pattern names the fields in order and must name
+them all. `[& r]` binds `r` to a new vector holding every
 element (§3.6: a rest variable owns a fresh copy), which the `let`
 releases at its exit like any owning binding. Shadowing an enclosing binding
 is allowed; a name may not be bound twice in one `let` (**Decided**:
@@ -443,7 +461,8 @@ pat    ::= _                    ; wildcard
          | (some pat)           ; the full variant of Option
          | (Variant pat*)       ; enum variant, positional; (Variant) for a field-less variant
          | (Struct pat*)        ; struct, positional in field order
-         | [pat*]               ; a (Vec T) of exactly that many elements
+         | [pat*]               ; a (Vec T) of exactly that many elements, or a Pair/Triple
+                                ;   field by field, all of them (stdlib §7 L3b); a prefix in a let (§3.3)
          | [pat* & rest]        ; a (Vec T) of at least that many elements
          | (pat :as sym)        ; bind the whole while matching inside
 rest   ::= sym | _
@@ -1287,6 +1306,12 @@ See §5.
 (loop ((sym expr)*) body)     ; a variable may be annotated: (sym: type expr), §1.5
 (recur expr*)                 ; only in tail position of the innermost enclosing loop body
 ```
+
+A binding `(pat expr)` whose `pat` is not a symbol (stdlib §7 L7) binds one
+hidden loop variable to `expr`, which `recur` rebinds whole, and matches `pat`
+against it at the start of the body as a `let` binding does (§3.3): `(loop
+(([a b] [1 2])) .. (recur [b (+ a b)]))`. The pattern's names are not in scope
+in the initialisers of the bindings after it.
 
 `loop` binds its variables like a sequential `let` and evaluates `body`;
 `recur` evaluates its arguments left to right, rebinds every loop

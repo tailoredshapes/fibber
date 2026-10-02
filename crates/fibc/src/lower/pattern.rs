@@ -65,6 +65,12 @@ impl<'a> Cx<'_, 'a> {
     /// read as `vec-nth` reads it with no count operation; a rest is
     /// noted for `build_rests`.
     fn vec_pattern(&mut self, subs: &[Pattern], rest: Rest, v: &V, t: &Ty, fail: &str) -> R<()> {
+        // A `Pair` or `Triple` (§7 L3b): the fields in order.
+        if let Ty::Con(Con::Nominal(id), _) = t {
+            if self.p.g().is_tuple(*id) {
+                return self.ctor_pattern(*id, None, subs, v, t, fail);
+            }
+        }
         let elem = match t {
             Ty::Con(Con::Nominal(_), args) => args
                 .first()

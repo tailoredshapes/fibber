@@ -56,6 +56,9 @@ impl<'a> Matrix<'a> {
         let Some(head) = q.first() else {
             return rows.is_empty().then(Vec::new);
         };
+        if let Some((rows, q)) = self.tuple_column(rows, q, tys) {
+            return self.useful(&rows, &q, tys);
+        }
         if let Some(l) = self.vec_bound(rows, head) {
             return self.useful_vec(rows, q, tys, l);
         }
@@ -72,6 +75,44 @@ impl<'a> Matrix<'a> {
             // A slice makes its column a vector column (above).
             P::Slice(_) => None,
         }
+    }
+
+    /// When column 0 is a `Pair` or `Triple` (§7 L3b) and holds vector
+    /// patterns, the matrix with each of them as the struct's one
+    /// constructor over its fields; `None` when there is nothing to
+    /// change.
+    fn tuple_column(
+        &mut self,
+        rows: &[Vec<P>],
+        q: &[P],
+        tys: &[Ty],
+    ) -> Option<(Vec<Vec<P>>, Vec<P>)> {
+        let Ty::Con(Con::Nominal(id), _) = self.st.zonk(&tys[0]) else {
+            return None;
+        };
+        if !self.g.is_tuple(id) {
+            return None;
+        }
+        let Shape::Struct(fields) = &self.g.ty(id).shape else {
+            return None;
+        };
+        let n = fields.len();
+        let is_vec = |p: &P| matches!(p, P::Slice(_) | P::Ctor(Ctor::Len(_), _));
+        if !rows.iter().map(|r| &r[0]).chain(q.first()).any(is_vec) {
+            return None;
+        }
+        let fix = |row: &[P]| {
+            let head = match &row[0] {
+                P::Slice(subs) | P::Ctor(Ctor::Len(_), subs) => {
+                    let mut subs = subs.clone();
+                    subs.resize(n, P::Wild);
+                    P::Ctor(Ctor::Variant(0), subs)
+                }
+                other => other.clone(),
+            };
+            [vec![head], row[1..].to_vec()].concat()
+        };
+        Some((rows.iter().map(|r| fix(r)).collect(), fix(q)))
     }
 
     /// `L` when column 0 holds a vector pattern; notes a mix with

@@ -6,6 +6,7 @@ mod fuse;
 mod hygiene;
 mod limits;
 mod own;
+mod params;
 mod positions;
 mod prelude;
 mod prelude_colls;

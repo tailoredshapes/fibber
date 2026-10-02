@@ -43,7 +43,7 @@ not changed.
 Cases 01 to 11 are the situations where lexical scope alone is not
 enough to decide when memory is freed.
 Cases 12, 13, 14, 18, 21, 34, 40, 82, 90, 93, 105, 107, 108, 109,
-112, 113, 114, 118, 119, 121, 123, 125, 126, 127, 138, 139, 142, 144,
+112, 113, 114, 118, 119, 121, 123, 125, 126, 127, 138, 139, 142,
 145, 146, 147 and 196 must be rejected; 101 to 104 must trap; 15
 and 80 are the permitted cycle leaks; every other case is accept with a
 clean audit. 16 shows the decided pattern for coordinated updates (§7); 17
@@ -127,9 +127,9 @@ calls from guarded bodies (140); forms matched by shape through `(List
 [..])` (141); `[& r]` in `let` (143); an `await` in a guard (148); an
 element that outlives its vector (149). Reject: a missing length (138),
 coverage by guarded clauses only (139), a vector pattern on a `Form`
-(142), a refutable vector pattern in `let` (144), `recur` in a guard
+(142), `recur` in a guard
 (145), a clause after `[& r]` (146), vector patterns mixed with `Vec`'s
-own variants (147).
+own variants (147). A vector pattern in `let` takes a prefix and traps when the vector is short (stdlib §7 L8), so 144, once a reject case, is an accept case.
 
 Cases 150 to 153 pin the owner's decision of 2026-09-28 that the copy-in
 of an `&` argument happens at call entry, after all of the call's

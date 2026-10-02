@@ -14,6 +14,7 @@ use super::ctx::ExpandCtx;
 use super::error::{ExpandError, ExpandErrorKind as K};
 use super::fuse::{self, Env};
 use super::heads::{is_core, is_definition, primitive_operand};
+use super::params;
 use super::prelude::{self, Outcome};
 use super::quasi;
 use super::runner::MacroRunner;
@@ -140,6 +141,9 @@ pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, Exp
                 Outcome::Expanded(f) => form = f,
                 Outcome::Declined(f) => return Ok(f),
             }
+        } else if params::fn_has_patterns(&form) {
+            ex.ctx.step(&pos)?;
+            form = params::desugar(ex.ctx, form, false)?;
         } else {
             return Ok(form);
         }

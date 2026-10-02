@@ -436,6 +436,16 @@ impl Globals {
         &self.types[id.0 as usize]
     }
 
+    /// Whether `id` is a tuple-like struct, `Pair` or `Triple` of the
+    /// prelude, which a vector pattern `[a b]` matches field by field
+    /// (stdlib spec §7 L3b).
+    pub fn is_tuple(&self, id: TypeId) -> bool {
+        let def = self.ty(id);
+        def.module == ModuleId::PRELUDE
+            && matches!(def.name.as_str(), "Pair" | "Triple")
+            && matches!(def.shape, Shape::Struct(_))
+    }
+
     /// The definition of a protocol.
     pub fn proto(&self, id: ProtoId) -> &ProtoDef {
         &self.protos[id.0 as usize]

@@ -137,16 +137,54 @@ fn malformed_vector_patterns_and_guarded_clauses() {
     }
 }
 
+const POINT: &str = "(defstruct P (x: i64 y: i64))";
+
 #[test]
-fn only_the_bare_rest_pattern_binds_a_let() {
-    ok("(defun main () -> i64 (let (([& r] [1 2])) (vec-count r)))");
-    let es =
-        check("(defun main () -> i64 (let (([& r] [1 2]) ([a & _] r)) a))").expect_err("refutable");
-    assert!(
-        es[0]
-            .message
-            .starts_with("a let pattern must be irrefutable"),
-        "{}",
-        es[0]
+fn a_refutable_let_pattern_is_a_match_whose_last_clause_traps() {
+    // Was `a let pattern must be irrefutable` (stdlib §7 L8).
+    ok("(defun main () -> i64 (let (([& r] [1 2]) ([a & _] r)) a))");
+    ok("(defun main () -> i64 (let (([a b] [1 2 3]) ((some c) (some 4))) (+ a (+ b c))))");
+    ok("(defun main () -> i64 (let ((a 1) ([b] [2]) (c 3)) (+ a (+ b c))))");
+    // An irrefutable struct pattern stays a let: it has no trap clause for
+    // the redundancy check to meet...
+    ok(&format!(
+        "{POINT} (defun main () -> i64 (let (((P x y) (P 1 2))) (+ x y)))"
+    ));
+    // ...which is the checker's own: one the program writes is redundant.
+    fails(
+        &format!("{POINT} (defun main () -> i64 (match (P 1 2) ((P x _) x) (_ 0)))"),
+        K::Redundant,
+        "redundant match clause",
     );
+}
+
+#[test]
+fn a_vector_pattern_of_a_pair_or_a_triple_takes_its_fields_exactly() {
+    let p = ok("(defun main () -> i64 (match (Pair 1 \"s\") ([a b] (+ a (str-len b)))))");
+    assert_eq!(binding_type(&p, "b"), "str");
+    ok("(defun main () -> i64 (match (Triple 1 2 3) ([a b c] (+ a (+ b c)))))");
+    ok("(defun main () -> i64 (let (([a b] (Pair 1 2))) (+ a b)))");
+    let text = "a vector pattern of a Pair takes exactly its 2 field(s) and no rest";
+    for pat in ["[a]", "[a b c]", "[a & r]"] {
+        let src = format!("(defun main () -> i64 (match (Pair 1 2) ({pat} 1)))");
+        fails(&src, K::Other, text);
+    }
+    fails(
+        "(defun main () -> i64 (match (Pair 1 2) ([1 b] b)))",
+        K::NonExhaustive,
+        "non-exhaustive match: missing (Pair _ _)",
+    );
+}
+
+#[test]
+fn a_vector_pattern_on_a_type_not_known_yet_waits_for_it() {
+    // The literal is checked before its type is known from the call.
+    let p = ok(
+        "(defun fold (f: (fn (i64 (Pair i64 str)) i64) p: (Pair i64 str)) -> i64 (f 0 p))
+        (defun main () -> i64 (fold (fn (acc [k v]) (+ acc (+ k (str-len v)))) (Pair 3 \"ab\")))",
+    );
+    assert_eq!(binding_type(&p, "v"), "str");
+    // Never known: a vector's pattern, as before.
+    let p = ok("(defun main () -> i64 (let ((f (fn (xs) (match xs ([a b] a) (_ 0))))) (f [1 2])))");
+    assert_eq!(binding_type(&p, "a"), "i64");
 }

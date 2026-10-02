@@ -54,6 +54,12 @@ impl Cx<'_> {
             DKind::Weakable(t) => self.solve_weakable(d, t),
             DKind::Field(t, f, r, _) => self.solve_field(d, t, f, r),
             DKind::Deref(t, r, _) => self.solve_deref(d, t, r),
+            DKind::VecPat(s, parts) => match self.st.resolve(s) {
+                Ty::Var(_) => Ok(Step::Stuck),
+                _ => self
+                    .settle_vec_pattern(s, parts, &d.pos)
+                    .map(|()| Step::Done(Vec::new())),
+            },
             DKind::Float(t) => match self.st.resolve(t) {
                 Ty::Var(_) => Ok(Step::Stuck),
                 Ty::Con(Con::Scalar(s), _) if s.is_float() => Ok(Step::Done(Vec::new())),

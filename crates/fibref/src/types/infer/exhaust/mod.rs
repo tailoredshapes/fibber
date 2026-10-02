@@ -68,7 +68,7 @@ impl Cx<'_> {
             if m.mixed {
                 return Err(TypeError::other(&c.pat.pos, MIXED));
             }
-            if !useful {
+            if !useful && !c.fallback {
                 let msg = "redundant match clause";
                 return Err(TypeError::new(ErrorKind::Redundant, &c.pat.pos, msg));
             }

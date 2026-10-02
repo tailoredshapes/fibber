@@ -100,6 +100,11 @@ pub enum DKind {
     Deref(Ty, Ty, String),
     /// `T` is a float type (the operand of `fptrunc` and the like).
     Float(Ty),
+    /// `[p..]` against a scrutinee `T` whose type is not known yet, the
+    /// element patterns having the given types: a `Pair` or `Triple`
+    /// gives each its field, anything else is a `(Vec a)` of them all
+    /// (§7 L3b). Settled when `T` is, else at the close of the unit.
+    VecPat(Ty, Vec<Ty>),
 }
 
 /// Why `Send` failed (§5.3): the path to the offending type.

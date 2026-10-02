@@ -5,7 +5,7 @@ use crate::syntax::Pos;
 use crate::types::ast::{BindingId, PatKind, Pattern, Rest};
 use crate::types::decls::Shape;
 use crate::types::error::{TResult, TypeError};
-use crate::types::ty::Ty;
+use crate::types::ty::{Con, Ty, TypeId};
 
 use super::cx::{Cx, DKind};
 use super::expr::lit_type;
@@ -94,6 +94,21 @@ impl Cx<'_> {
         rest: Rest,
         s: &Ty,
     ) -> TResult<()> {
+        if let Ty::Con(Con::Nominal(id), args) = self.st.zonk(s) {
+            if self.g.is_tuple(id) {
+                return self.check_tuple_pattern(p, subs, rest, id, &args);
+            }
+        }
+        if matches!(self.st.zonk(s), Ty::Var(_)) && !matches!(rest, Rest::Bind(_)) {
+            // Not known yet: a `fn` literal's parameter, say. Each element
+            // pattern takes a type of its own until the scrutinee is known.
+            let parts: Vec<Ty> = subs.iter().map(|_| self.st.fresh()).collect();
+            for (sub, t) in subs.iter().zip(&parts) {
+                self.check_pattern(sub, t)?;
+            }
+            self.defer(DKind::VecPat(s.clone(), parts), &p.pos, None);
+            return Ok(());
+        }
         let Some(vec) = self.g.vec else {
             return Err(TypeError::other(
                 &p.pos,
@@ -108,6 +123,78 @@ impl Cx<'_> {
         }
         if let Rest::Bind(b) = rest {
             self.bind(b, &vt);
+        }
+        Ok(())
+    }
+
+    /// `[p..]` against a `Pair` or `Triple` (§7 L3b): the fields in
+    /// order and exactly, each `p` at its field's type. The tail `& _`
+    /// that a `let` adds to a vector pattern (§7 L8) takes nothing.
+    fn check_tuple_pattern(
+        &mut self,
+        p: &Pattern,
+        subs: &[Pattern],
+        rest: Rest,
+        id: TypeId,
+        args: &[Ty],
+    ) -> TResult<()> {
+        let def = self.g.ty(id);
+        let fields = match &def.shape {
+            Shape::Struct(fs) => fs.clone(),
+            Shape::Enum(_) => Vec::new(),
+        };
+        if subs.len() != fields.len() || matches!(rest, Rest::Bind(_)) {
+            return Err(self.tuple_arity(id, subs.len(), &p.pos));
+        }
+        for (sub, f) in subs.iter().zip(&fields) {
+            let ft = f.ty.subst_gen(args, &crate::types::ty::colour_args(args));
+            self.check_pattern(sub, &ft)?;
+        }
+        Ok(())
+    }
+
+    fn tuple_arity(&self, id: TypeId, k: usize, pos: &Pos) -> TypeError {
+        let def = self.g.ty(id);
+        let n = match &def.shape {
+            Shape::Struct(fs) => fs.len(),
+            Shape::Enum(_) => 0,
+        };
+        let name = &def.name;
+        let msg = format!(
+            "a vector pattern of a {name} takes exactly its {n} field(s) and no rest, the pattern has {k} element(s)"
+        );
+        TypeError::other(pos, msg)
+    }
+
+    /// The deferred `[p..]` (`DKind::VecPat`) once `s` is known, or
+    /// defaulted: against a `Pair` or `Triple` each element has its
+    /// field's type, otherwise `s` is a `(Vec a)` and each element is `a`.
+    pub fn settle_vec_pattern(&mut self, s: &Ty, parts: &[Ty], pos: &Pos) -> TResult<()> {
+        if let Ty::Con(Con::Nominal(id), args) = self.st.zonk(s) {
+            if self.g.is_tuple(id) {
+                let Shape::Struct(fields) = &self.g.ty(id).shape else {
+                    return Ok(());
+                };
+                if fields.len() != parts.len() {
+                    return Err(self.tuple_arity(id, parts.len(), pos));
+                }
+                for (t, f) in parts.iter().zip(fields.clone()) {
+                    let ft = f.ty.subst_gen(&args, &crate::types::ty::colour_args(&args));
+                    self.unify(t, &ft, pos)?;
+                }
+                return Ok(());
+            }
+        }
+        let Some(vec) = self.g.vec else {
+            return Err(TypeError::other(
+                pos,
+                "vector patterns need the prelude's Vec",
+            ));
+        };
+        let a = self.st.fresh();
+        self.unify(s, &Ty::nominal(vec, vec![a.clone()]), pos)?;
+        for t in parts {
+            self.unify(t, &a, pos)?;
         }
         Ok(())
     }

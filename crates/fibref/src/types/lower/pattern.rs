@@ -2,7 +2,7 @@
 //! `(some p)`, `(Variant p..)`, `(Struct p..)`, `[p.. & r]`, `(p :as
 //! x)`. A bare symbol is always a binding; a field-less variant is
 //! matched as `(Variant)`. A variable may occur once per pattern. A
-//! `let` pattern must be irrefutable (§3.3).
+//! `let` pattern may be refutable: it traps when it does not match (§3.3).
 
 use crate::syntax::{Form, FormKind};
 
@@ -142,14 +142,36 @@ fn bad_rest(at: &Form) -> TypeError {
     TypeError::resolve(&at.pos, msg)
 }
 
-/// Lowers the pattern of a `let` binding, which must be irrefutable.
-pub fn let_pattern(lw: &mut Lowerer<'_>, form: &Form, names: &mut Vec<String>) -> TResult<Pattern> {
-    let p = pattern(lw, form, BindingKind::Let, names)?;
-    if !irrefutable(lw, &p) {
-        let msg = "a let pattern must be irrefutable";
-        return Err(TypeError::resolve(&form.pos, msg));
-    }
-    Ok(p)
+/// Lowers the pattern of a `let` or `loop` binding (§3.3, stdlib §7 L8):
+/// a vector pattern in binding position takes a prefix, so `[a b]` is
+/// `[a b & _]` at every depth. Whether the result is refutable is the
+/// second part: the binding is then a `match` whose last clause traps.
+pub fn let_pattern(
+    lw: &mut Lowerer<'_>,
+    form: &Form,
+    names: &mut Vec<String>,
+) -> TResult<(Pattern, bool)> {
+    let p = prefix(pattern(lw, form, BindingKind::Let, names)?);
+    let refutable = !irrefutable(lw, &p);
+    Ok((p, refutable))
+}
+
+/// `p` with every exact vector pattern in it open at the end.
+fn prefix(p: Pattern) -> Pattern {
+    let kind = match p.kind {
+        PatKind::Vec(subs, rest) => {
+            let rest = if rest == Rest::Exact {
+                Rest::Ignore
+            } else {
+                rest
+            };
+            PatKind::Vec(subs.into_iter().map(prefix).collect(), rest)
+        }
+        PatKind::Ctor(id, v, subs) => PatKind::Ctor(id, v, subs.into_iter().map(prefix).collect()),
+        PatKind::As(inner, b) => PatKind::As(Box::new(prefix(*inner)), b),
+        other => other,
+    };
+    Pattern { pos: p.pos, kind }
 }
 
 fn irrefutable(lw: &Lowerer<'_>, p: &Pattern) -> bool {

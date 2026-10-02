@@ -3,11 +3,11 @@
 
 use crate::syntax::{Form, FormKind};
 
-use crate::types::ast::{BindingKind, Expr, ExprKind, FnLit, GlobalRef, Lit};
+use crate::types::ast::{BindingId, BindingKind, Expr, ExprKind, FnLit, GlobalRef, Lit};
 use crate::types::decls::Space;
 use crate::types::error::{ErrorKind, TResult, TypeError};
 
-use super::bindings::bindings_of;
+use super::bindings::{bindings_of, Entry};
 use super::decl::annotation_name;
 use super::pattern::let_pattern;
 use super::scope::Lowerer;
@@ -185,38 +185,68 @@ impl Lowerer<'_> {
         let mut out = Vec::new();
         for b in pairs {
             let init = self.expr(b.init, false)?;
-            let pat = let_pattern(self, &b.pat, &mut names)?;
+            let (pat, refutable) = let_pattern(self, &b.pat, &mut names)?;
             self.annotate(&pat, b.ann)?;
-            out.push((pat, init));
+            out.push(Entry {
+                pat,
+                init,
+                refutable,
+            });
         }
         let body = self.body(&items[2..], &form.pos, tail);
         self.reset(mark);
-        let body = body?;
-        Ok(self.mk(&form.pos, ExprKind::Let(out, Box::new(body))))
+        self.let_chain(out, body?, &form.pos)
     }
 
+    /// `(loop ((x e)..) body)` (§3.18). A binding `(pat e)` whose pattern
+    /// is not a variable is a hidden loop variable bound to `e`, which
+    /// `recur` rebinds whole, and `pat` is matched against it, as a `let`
+    /// binding is (stdlib §7 L7), at the start of the body.
     fn loop_form(&mut self, items: &[Form], form: &Form, _tail: bool) -> TResult<Expr> {
         let pairs = bindings_of(items, form)?;
         let mark = self.mark();
         let mut vars = Vec::new();
-        for p in pairs {
-            let Some(n) = p.pat.as_sym() else {
-                return Err(TypeError::resolve(
-                    &p.pat.pos,
-                    "a loop variable is a symbol",
-                ));
-            };
+        let mut patterns = Vec::new();
+        for (i, p) in pairs.into_iter().enumerate() {
             let init = self.expr(p.init, false)?;
-            let b = self.bind(n, BindingKind::Loop, &p.pat.pos);
+            let name = match p.pat.as_sym() {
+                Some(n) => n.to_string(),
+                None => format!("#loop.{i}"),
+            };
+            let b = self.bind(&name, BindingKind::Loop, &p.pat.pos);
             self.annotate_binding(b, p.ann)?;
+            if p.pat.as_sym().is_none() {
+                patterns.push((p.pat, b));
+            }
             vars.push((b, init));
         }
         self.enter_loop();
-        let body = self.body(&items[2..], &form.pos, true);
+        let body = self.loop_body(patterns, &items[2..], form);
         self.leave_loop();
         self.reset(mark);
-        let body = body?;
-        Ok(self.mk(&form.pos, ExprKind::Loop(vars, Box::new(body))))
+        Ok(self.mk(&form.pos, ExprKind::Loop(vars, Box::new(body?))))
+    }
+
+    /// The body of a loop under the patterns of its hidden variables.
+    fn loop_body(
+        &mut self,
+        patterns: Vec<(Form, BindingId)>,
+        body: &[Form],
+        form: &Form,
+    ) -> TResult<Expr> {
+        let mut names = Vec::new();
+        let mut entries = Vec::new();
+        for (p, b) in patterns {
+            let (pat, refutable) = let_pattern(self, &p, &mut names)?;
+            let init = self.mk(&p.pos, ExprKind::Local(b));
+            entries.push(Entry {
+                pat,
+                init,
+                refutable,
+            });
+        }
+        let body = self.body(body, &form.pos, true)?;
+        self.let_chain(entries, body, &form.pos)
     }
 
     fn recur(&mut self, items: &[Form], form: &Form, tail: bool) -> TResult<Expr> {

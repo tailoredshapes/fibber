@@ -53,6 +53,13 @@ impl Interp<'_> {
     /// `[p.. & r]`: the length first, then the elements left to right,
     /// read through the core view (types §8.3); the rest is noted.
     fn vec_matches(&mut self, subs: &[Pattern], rest: Rest, v: &Val, rests: &mut Rests) -> R<bool> {
+        // A `Pair` or `Triple` (§7 L3b): the fields in order; the
+        // checker has made sure there are as many patterns as fields.
+        if let Val::Obj(id) = v {
+            if matches!(self.objs.get(&self.heap, *id)?, Obj::Struct { .. }) {
+                return self.sub_patterns(*id, subs, rests);
+            }
+        }
         let n = self.vec_len(v)?;
         let k = subs.len();
         if n < k || (rest == Rest::Exact && n != k) {

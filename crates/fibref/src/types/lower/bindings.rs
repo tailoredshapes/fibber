@@ -2,14 +2,17 @@
 //! or `(x: T expr)`, whose annotation types `x` as annotations do
 //! everywhere (§1.5, types §2.4).
 
-use crate::syntax::{Form, FormKind};
+use crate::syntax::{Form, FormKind, Pos};
 
-use crate::types::ast::{BindingId, PatKind, Pattern};
+use crate::types::ast::{BindingId, Clause, Expr, ExprKind, PatKind, Pattern};
 use crate::types::error::{TResult, TypeError};
 
 use super::decl::annotation_name;
 use super::scope::Lowerer;
 use super::typeform::type_ann;
+
+/// What a refutable `let` pattern traps with.
+const MISMATCH: &str = "let: pattern does not match";
 
 /// One binding as written.
 pub struct RawBinding<'f> {
@@ -59,7 +62,67 @@ fn malformed(p: &Form) -> TypeError {
     )
 }
 
+/// One lowered binding of a `let`, or of a `loop` pattern.
+pub struct Entry {
+    pub pat: Pattern,
+    pub init: Expr,
+    /// Whether `pat` can fail to match (stdlib §7 L8).
+    pub refutable: bool,
+}
+
 impl Lowerer<'_> {
+    /// The `let` of `entries` around `body`. Irrefutable bindings stay
+    /// one `Let`; a refutable one is a `match` of its initialiser whose
+    /// clause holds what follows and whose last clause traps, so no
+    /// pattern an irrefutable binding has is ever redundant.
+    pub fn let_chain(&mut self, entries: Vec<Entry>, body: Expr, pos: &Pos) -> TResult<Expr> {
+        let mut acc = body;
+        let mut run: Vec<(Pattern, Expr)> = Vec::new();
+        for e in entries.into_iter().rev() {
+            if !e.refutable {
+                run.push((e.pat, e.init));
+                continue;
+            }
+            acc = self.close_run(&mut run, acc, pos);
+            let trap = self.trap_clause(&e.pat.pos)?;
+            let clause = Clause {
+                pat: e.pat,
+                guard: None,
+                body: acc,
+                fallback: false,
+            };
+            acc = self.mk(pos, ExprKind::Match(Box::new(e.init), vec![clause, trap]));
+        }
+        Ok(self.close_run(&mut run, acc, pos))
+    }
+
+    /// `acc` under the bindings of `run` (collected last to first).
+    fn close_run(&mut self, run: &mut Vec<(Pattern, Expr)>, acc: Expr, pos: &Pos) -> Expr {
+        if run.is_empty() {
+            return acc;
+        }
+        let bindings: Vec<_> = run.drain(..).rev().collect();
+        self.mk(pos, ExprKind::Let(bindings, Box::new(acc)))
+    }
+
+    /// `(_ (trap "let: pattern does not match"))`, the clause that ends
+    /// a refutable `let`.
+    fn trap_clause(&mut self, pos: &Pos) -> TResult<Clause> {
+        let text = Form::new(FormKind::Str(MISMATCH.to_string()), pos.clone());
+        let head = Form::new(FormKind::Sym("fib.prelude/trap".to_string()), pos.clone());
+        let call = Form::new(FormKind::List(vec![head, text]), pos.clone());
+        let body = self.expr(&call, false)?;
+        Ok(Clause {
+            pat: Pattern {
+                pos: pos.clone(),
+                kind: PatKind::Wild,
+            },
+            guard: None,
+            body,
+            fallback: true,
+        })
+    }
+
     /// Records the annotation `ann` of the `let` binding `pat`, which is
     /// a variable when annotated (`_: T` is a pattern, not a name).
     pub fn annotate(&mut self, pat: &Pattern, ann: Option<&Form>) -> TResult<()> {

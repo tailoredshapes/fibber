@@ -205,6 +205,7 @@ impl Cx<'_> {
     /// none for an `impl` body or a `def`).
     pub fn close(&mut self, roots: &[Ty]) -> TResult<Closed> {
         self.solve_all()?;
+        self.default_vec_patterns()?;
         self.check_unresolved()?;
         self.reduce_sends();
         let mut sets: Vec<Vec<Key>> = roots.iter().map(|t| keys(self.st, t)).collect();
@@ -223,6 +224,22 @@ impl Cx<'_> {
             colours,
             preds,
         })
+    }
+
+    /// A vector pattern whose scrutinee is still unknown is a `Vec`'s
+    /// (§7 L3b), and what its patterns bind follows.
+    fn default_vec_patterns(&mut self) -> TResult<()> {
+        let mut changed = false;
+        for d in self.u.deferred.clone() {
+            if let DKind::VecPat(s, parts) = &d.kind {
+                self.settle_vec_pattern(s, parts, &d.pos)?;
+                changed = true;
+            }
+        }
+        if changed {
+            self.solve_all()?;
+        }
+        Ok(())
     }
 
     fn check_unresolved(&mut self) -> TResult<()> {

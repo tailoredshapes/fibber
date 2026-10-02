@@ -245,6 +245,10 @@ pub struct Clause {
     pub guard: Option<Expr>,
     /// The body.
     pub body: Expr,
+    /// The clause the checker adds to a refutable `let` pattern, whose
+    /// body traps (stdlib spec §7 L8): it is not reported as redundant
+    /// when the pattern above it already covers every value.
+    pub fallback: bool,
 }
 
 /// What follows the elements of a vector pattern (syntax §3.6).
