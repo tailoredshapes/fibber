@@ -9,6 +9,7 @@ use crate::own::program::BodyKey;
 use crate::own::{check_modules, CheckError, Checked};
 use crate::roots::Roots;
 use crate::syntax::Form;
+use crate::types::ast::DefId;
 use crate::types::infer::UnitRef;
 use crate::types::prelude_forms;
 
@@ -235,17 +236,40 @@ impl<'p> Interp<'p> {
         v.as_int()
     }
 
-    /// Evaluates every `def` (syntax §3.19, types §8.2).
+    /// Evaluates every `def` (syntax §3.19, types §8.2), in the order
+    /// the checker typed them: a `def` after the `def`s its initialiser
+    /// names, directly or through the functions it calls, modules in
+    /// dependency order.
     pub fn eval_defs(&mut self) -> R<()> {
         for u in &self.p.units {
             if let UnitRef::Def(d) = u {
-                let v = self.call_body(BodyKey::Def(*d), Vec::new())?;
-                if let Some(id) = v.obj() {
-                    self.heap.immortalise(id)?;
-                }
-                self.defs[d.0 as usize] = Some(v);
+                self.eval_def(*d)?;
             }
         }
+        self.heap.init_done();
+        Ok(())
+    }
+
+    /// Evaluates one `def`: its initialiser, once (L15), and the value
+    /// is made immortal with everything it reaches, or pinned to the
+    /// end of the run when it holds an `Atom` ([`Heap::pin`]). A trap in
+    /// the initialiser names the `def`: `def NAME: MESSAGE`.
+    pub fn eval_def(&mut self, d: DefId) -> R<()> {
+        let v = match self.call_body(BodyKey::Def(d), Vec::new()) {
+            Err(e) if e.kind == RunErrorKind::Trap => {
+                let message = format!("def {}: {}", self.p.globals.def(d).name, e.message);
+                return Err(RunError { message, ..e });
+            }
+            r => r?,
+        };
+        if let Some(id) = v.obj() {
+            if self.heap.holds_atom(id) {
+                self.heap.pin(id)?;
+            } else {
+                self.heap.immortalise(id)?;
+            }
+        }
+        self.defs[d.0 as usize] = Some(v);
         Ok(())
     }
 

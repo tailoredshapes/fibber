@@ -764,7 +764,7 @@ error KIND LINE:COL START..END[@FILE]: MESSAGE
   `AmpParamValue`, `AmpPosition`, `AmpFunctionValue`, `NonExhaustive`,
   `Redundant`, `AwaitOutsideAsync`, `WeakScalar`, `WeakOption`, `NotObject`,
   `ConstantCalled`, `RecurOutsideLoop`, `RecurNotTail`, `DefUnresolved`,
-  `DefNotConstant`, `DefCycle`, `Other`. `MESSAGE` is the error's message
+  `DefHoldsCell`, `DefCycle`, `Other`. `MESSAGE` is the error's message
   and may hold line breaks, so a dump is a sequence of lines only up to its
   error records.
 - **Nothing iterates a hash table.** The checker uses `HashMap`s for names,

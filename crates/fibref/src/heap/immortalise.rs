@@ -72,4 +72,59 @@ impl Heap {
         }
         Ok(order)
     }
+
+    /// Whether an `Atom` is reachable from `root` through `Ref` fields,
+    /// not searching through immortal objects. A `def` value that holds
+    /// one cannot become static data (its atom is written at run time),
+    /// so it is pinned instead ([`Heap::pin`]).
+    pub fn holds_atom(&self, root: ObjId) -> bool {
+        let mut seen = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            let Some(object) = self.objects.get(id.index()) else {
+                continue;
+            };
+            if object.immortal || !object.live || !seen.insert(id) {
+                continue;
+            }
+            if object.kind == Kind::Atom {
+                return true;
+            }
+            stack.extend(object.fields.iter().filter_map(|v| v.as_ref()));
+        }
+        false
+    }
+
+    /// Pins the value of a `def` that holds an `Atom` (L15): the graph
+    /// from `root` is marked shared (every task reaches it, and no
+    /// write is in place), and its reference is never released, so it
+    /// lives to the end of the run. It stays counted (an atom's value
+    /// is replaced with counted objects), and the audit does not report
+    /// what is reachable from it as a leak. A `Cell` in the graph is
+    /// `SharedCell`, as for any value that crosses to another thread.
+    pub fn pin(&mut self, root: ObjId) -> Result<(), AuditError> {
+        self.mark_shared(root)?;
+        self.pinned.push(root);
+        Ok(())
+    }
+
+    /// Ends the evaluation of the `def`s: the free trace starts here.
+    pub fn init_done(&mut self) {
+        self.trace.push(Event::InitDone);
+    }
+
+    /// The objects reachable from the pinned roots, the roots included.
+    pub(super) fn pinned_graph(&self) -> HashSet<ObjId> {
+        let mut seen = HashSet::new();
+        let mut stack = self.pinned.clone();
+        while let Some(id) = stack.pop() {
+            let Some(object) = self.objects.get(id.index()) else {
+                continue;
+            };
+            if object.live && seen.insert(id) {
+                stack.extend(object.fields.iter().filter_map(|v| v.as_ref()));
+            }
+        }
+        seen
+    }
 }

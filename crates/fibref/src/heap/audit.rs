@@ -126,10 +126,12 @@ impl Heap {
     pub fn finish(self) -> AuditReport {
         let graph = LiveGraph::build(&self);
         let classes = classify(&graph);
+        let pinned = self.pinned_graph();
         let leaks = graph
             .ids
             .iter()
             .enumerate()
+            .filter(|(_, id)| !pinned.contains(id))
             .map(|(node, &id)| Leak {
                 id,
                 kind: graph.kinds[node],

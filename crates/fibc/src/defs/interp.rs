@@ -30,8 +30,12 @@ pub fn emit_defs(p: &mut Program<'_>) -> Result<Defs, Unsupported> {
         names: HashMap::new(),
     };
     with_threads(&c.typed, &c.owned, None, |it| -> Result<(), Unsupported> {
-        it.eval_defs()
-            .map_err(|e| Unsupported(format!("a def does not evaluate: {e}")))?;
+        // Only the constants: the other defs have effects the compiler
+        // must not run (they are made by the init functions).
+        for d in &ids {
+            it.eval_def(*d)
+                .map_err(|e| Unsupported(format!("a def does not evaluate: {e}")))?;
+        }
         for d in ids {
             let v = it.defs[d.0 as usize]
                 .clone()

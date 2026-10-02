@@ -45,8 +45,9 @@ pub fn emit_defs(p: &mut Program<'_>) -> Result<Defs, Unsupported> {
     }
 }
 
-/// The `def`s of the user module, in source order.
-pub fn def_ids(p: &Program<'_>) -> Vec<DefId> {
+/// Every `def` of the program, in the order the checker typed them,
+/// which is the order they are evaluated in (syntax §3.19).
+pub fn all_def_ids(p: &Program<'_>) -> Vec<DefId> {
     p.c.typed
         .units
         .iter()
@@ -55,6 +56,16 @@ pub fn def_ids(p: &Program<'_>) -> Vec<DefId> {
             _ => None,
         })
         .collect()
+}
+
+/// The `def`s made at compile time as static data: those whose
+/// initialiser is a constant expression (`DefDef::constant`, syntax
+/// §3.19). The others are made at run time, by the init functions of
+/// `lower::init`.
+pub fn def_ids(p: &Program<'_>) -> Vec<DefId> {
+    let mut ids = all_def_ids(p);
+    ids.retain(|d| p.g().def(*d).constant);
+    ids
 }
 
 impl Defs {

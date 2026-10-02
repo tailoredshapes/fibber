@@ -235,7 +235,17 @@ impl<'a> Cx<'_, 'a> {
             GlobalRef::Def(d) => match self.p.def_values.get(&d) {
                 Some((text, Some(l))) => Ok(V::Val(text.clone(), *l)),
                 Some((_, None)) => Ok(V::Unit),
-                None => Err(Unsupported("a def read before its value was made".into())),
+                // Made at run time (inits.rs): a count-free load of its
+                // slot, which the init functions fill before `main`.
+                None => match self.p.def_slots.get(&d).cloned() {
+                    Some((slot, Some(l))) => Ok(self.load(l, &format!("@{slot}"))),
+                    Some((_, None)) => Ok(V::Unit),
+                    None => Err(Unsupported(format!(
+                        "def {} is read where it has no value: it is not a constant \
+                         and no init function makes it here",
+                        self.p.g().def(d).name
+                    ))),
+                },
             },
             GlobalRef::Extern(_) => Err(Unsupported("an extern as a value".into())),
         }

@@ -60,8 +60,9 @@ fn compile_kind(checked: &Checked, executable: bool) -> Result<String, Unsupport
         .fun("main")
         .ok_or_else(|| Unsupported("the program has no main".into()))?;
     let mut p = Program::new(checked);
+    crate::inits::plan(&mut p)?;
     let defs = crate::defs::emit_defs(&mut p)?;
-    p.def_values = defs.values;
+    p.def_values.extend(defs.values);
     let entry = p.request(BodyKey::Fun(main), Vec::new());
     emit_all(&mut p)?;
     Ok(assemble(&mut p, &defs.text, &entry, executable))
@@ -183,6 +184,7 @@ pub(crate) fn assemble_parts(p: &mut Program<'_>, defs: &str) -> String {
     out.push_str(&p.objects.render());
     out.push_str(&p.statics.render());
     out.push_str(&keyword_helpers);
+    out.push_str(&crate::inits::slot_text(p));
     out.push_str(defs);
     out.push_str(&p.quote_text);
     for f in &p.funcs {
@@ -193,6 +195,14 @@ pub(crate) fn assemble_parts(p: &mut Program<'_>, defs: &str) -> String {
 
 fn assemble(p: &mut Program<'_>, defs: &str, entry: &str, executable: bool) -> String {
     let mut out = assemble_parts(p, defs);
+    out.push_str(&crate::inits::render(p));
+    // §3.19, L15: the `def`s made at run time, after the arguments are
+    // known and before `main`.
+    let init = if p.inits.is_empty() {
+        ""
+    } else {
+        "(call @fib.defs-init)"
+    };
     let _ = LirTy::I64;
     // §8.8: main's return joins every thread still running before
     // the result is printed (fibc run) or returned (an executable).
@@ -208,6 +218,7 @@ fn assemble(p: &mut Program<'_>, defs: &str, entry: &str, executable: bool) -> S
   (block entry
     (call @fib.init)
     (call @fib.set-args argc argv)
+    {init}
     (let ((r (call @{entry})))
       (call @fib.join-all)
       (call @fib.pool-quiesce)

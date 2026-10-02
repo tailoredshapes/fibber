@@ -66,8 +66,9 @@ pub enum ErrorKind {
     RecurNotTail,
     /// `def g has an unresolved type; annotate it` (§2.16).
     DefUnresolved,
-    /// `def g: initialiser is not a constant expression` (§2.16).
-    DefNotConstant,
+    /// `def g: a def may not hold a Cell or a Weak: P has type T; use an
+    /// Atom` (§2.16, L15).
+    DefHoldsCell,
     /// `def g and defun f depend on each other` (§2.16).
     DefCycle,
     /// Any other type error: arity, `main`'s type, overlapping

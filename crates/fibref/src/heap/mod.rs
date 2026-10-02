@@ -73,6 +73,9 @@ pub struct Heap {
     scopes: Vec<Scope>,
     /// The open scopes, in opening order.
     open: Vec<ScopeId>,
+    /// The roots of the `def` values that hold an atom, held to the end
+    /// of the run ([`Heap::pin`]).
+    pinned: Vec<ObjId>,
 }
 
 impl Heap {

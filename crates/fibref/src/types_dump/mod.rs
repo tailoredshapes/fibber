@@ -482,7 +482,7 @@ pub fn kind_name(k: ErrorKind) -> &'static str {
         K::RecurOutsideLoop => "RecurOutsideLoop",
         K::RecurNotTail => "RecurNotTail",
         K::DefUnresolved => "DefUnresolved",
-        K::DefNotConstant => "DefNotConstant",
+        K::DefHoldsCell => "DefHoldsCell",
         K::DefCycle => "DefCycle",
         K::Other => "Other",
     }

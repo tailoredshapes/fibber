@@ -22,16 +22,38 @@
 ;; finds on a worklist (core.lir), so that a chain of a million objects
 ;; takes no native frame per link. An object is marked when it is queued,
 ;; so it is queued once.
+;; The flags a walk sets: SHARED (1), or SHARED and IMMORTAL (9) in
+;; fib.immortalise, which also zeroes the count (§8.2).
+(global internal fib.mark i32 (i32 1))
+
 (define internal (fib.share-queue void) ((ptr wl) (ptr p))
   (block entry (br (icmp eq p (ptr null)) done check))
   (block check
     (let ((f (call @fib.flags p)))
       (br (icmp ne (and f (i32 9)) (i32 0)) done mark)))
   (block mark
-    (atomicrmw or monotonic (getelementptr %struct.fib.hdr p (i32 0) (i32 2)) (i32 1))
+    (let ((m (load i32 @fib.mark)))
+      (atomicrmw or monotonic (getelementptr %struct.fib.hdr p (i32 0) (i32 2)) m)
+      (br (icmp eq m (i32 9)) forever push)))
+  (block forever
+    (store (i64 0) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
+    (br push))
+  (block push
     (call @fib.wl-push wl p)
     (br done))
   (block done (ret)))
+
+;; §8.2 (syntax §3.19, L15): the value of a `def` made at run time and
+;; everything reachable from it become IMMORTAL, and SHARED: every task
+;; reaches them, and an atom among them locks. Count 0, never freed,
+;; count operations no-ops. Single-threaded: the init functions run
+;; before `main`.
+(define internal (fib.immortalise void) ((ptr p))
+  (block entry
+    (store (i32 9) @fib.mark)
+    (call @fib.share p)
+    (store (i32 1) @fib.mark)
+    (ret)))
 
 (define internal (fib.share void) ((ptr p))
   (block entry

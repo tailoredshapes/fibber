@@ -340,10 +340,34 @@
   (block entry
     (ret (load i64 (getelementptr %struct.fib.typerec @fib.types tid (i32 3))))))
 
+;; While the init functions of the `def`s run (L15), the text "def NAME: "
+;; of the `def` being made, else null: a trap in an initialiser names it.
+(global internal fib.initdef ptr (ptr null))
+
+;; The init functions are done: in trace mode the line "I k", k the last
+;; ordinal handed out. The objects the initialisers allocated (and
+;; made immortal) are not part of the trace (compiler.md §4), as the
+;; interpreter's trace leaves out its `def` evaluation: the reader of
+;; the trace drops every line up to this one and numbers from k.
+(define internal (fib.init-done void) ()
+  (block entry
+    (store (ptr null) @fib.initdef)
+    (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced done))
+  (block traced
+    (call @fib.trace-line (i8 73) (load i64 @fib.ordinal) (i8 0))
+    (br done))
+  (block done (ret)))
+
 ;; §8.12, §2.11: "trap: MESSAGE\n" to fd 2, then abort.
 (define internal (fib.trap-bytes void) ((ptr bytes) (i64 n))
   (block entry
     (call @write (i32 2) (string "trap: ") (i64 6))
+    (let ((pre (load ptr @fib.initdef)))
+      (br (icmp eq pre (ptr null)) body named)))
+  (block named
+    (call @write (i32 2) pre (call @strlen pre))
+    (br body))
+  (block body
     (call @write (i32 2) bytes n)
     (call @write (i32 2) (string "\n") (i64 1))
     (call @abort)

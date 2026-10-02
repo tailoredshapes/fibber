@@ -1376,10 +1376,11 @@ and it is inside whatever `defun` or `async` encloses it. A named local
 (def name: type private? expr)
 ```
 
-A top-level **constant**: `name` is bound in the module's namespace,
-beside the functions, to the value of `expr`, which must be a
-**constant expression** (**Decided**: liar spelled every constant as a
-nullary function, which for a table allocates on every call, while the
+A top-level binding: `name` is bound in the module's namespace, beside
+the functions, to the value of `expr`, which is any expression (**Decided**,
+L15), made once before `main`. A **constant expression** is made at
+compile time as static data (**Decided**: liar spelled every constant as
+a nullary function, which for a table allocates on every call, while the
 immortal mechanism the runtime has for literals covers it exactly):
 
 ```
@@ -1397,7 +1398,7 @@ or `@`: a constant expression has no effect and builds only immutable
 objects. Its type is inferred as for a `let` binding (types §2.16):
 monomorphic, never generalised, and closed; `(def e [])` is the error
 `def e has an unresolved type; annotate it`, and a form outside the
-grammar is `def e: initialiser is not a constant expression`. A `def`
+grammar is not an error (L15): it is made at run time, below. A `def`
 may name `def`s earlier in its module or in a required module and named
 functions of its module (before or after it: names are bound before
 any body is checked, §3.1) or of a required module; it may not be
@@ -1432,8 +1433,21 @@ inside any `fn` or `async` body without a `Send` check or a
 share-marking walk (types §2.16, §5.5): like a named function it is a
 global, not a capture. That is what makes a lookup table or a keyword
 map usable from a `plet` without an atom (proposed case 42). Mutable
-global state is not a `def`: it is an `(atom ..)` created in `main`, or
-in a function it calls, and passed explicitly.
+global state is a `def` of an `Atom` (`(def counter: (Atom i64) (atom 0))`,
+L15), never of a `Cell` or a `Weak`: see below.
+
+**Run-time `def`s (L15)**: an initialiser outside the constant grammar
+(a call, `atom`, `set`, a closure) is evaluated once before `main`, after
+the arguments are known, by an init function: the `def`s in the order the
+checker typed them (a `def` after the `def`s its initialiser names, and
+those that the functions it calls read; modules in dependency order, a
+module's `def`s in source order). The value and everything it reaches become
+immortal and shared (types §8.2), so it is read as a global like a constant
+and an `Atom` among it locks. **The type of a `def` may not contain a `Cell`
+or a `Weak`** (types §2.16, case 1702); a trap in an initialiser reads
+`def NAME: MESSAGE` (case 1706). The interpreter evaluates every `def` so;
+`fibc` makes the constants as static data and the others by one init
+function per module (`crates/fibc/src/inits.rs`).
 
 Why a core form: it binds a name (§4.1, criterion 2) and introduces the
 one kind of binding that is never released. liar had no `def`, so its

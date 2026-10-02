@@ -115,9 +115,9 @@ const REJECTED: [(&str, &str, &str); 26] = [
         "DefUnresolved 1:1 0..10: def g has an unresolved type; annotate it",
     ),
     (
-        "DefNotConstant",
-        "(defun f () -> i64 1) (def g (f)) (defun main () -> i64 g)",
-        "DefNotConstant 1:30 29..32: def g: initialiser is not a constant expression",
+        "DefHoldsCell",
+        "(def c (cell 0)) (defun main () -> i64 0)",
+        "DefHoldsCell 1:1 0..16: def c: a def may not hold a Cell or a Weak: the value has type (Cell i64); use an Atom",
     ),
     (
         "CellNotSend",

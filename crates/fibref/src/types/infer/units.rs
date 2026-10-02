@@ -40,6 +40,9 @@ impl Cx<'_> {
         let map = GenMap::new(self, &[], closed.colours.clone(), &[]);
         let out = map.apply(self.st, &ty);
         self.finalize(&map, &closed);
+        if let Some(w) = super::send::def_holds_cell(self.g, &out) {
+            return Err(super::send::def_cell_error(self.g, &def.name, &w, &def.pos));
+        }
         Ok(out)
     }
 

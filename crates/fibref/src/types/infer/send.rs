@@ -107,8 +107,20 @@ fn nominal(
         return Ok(());
     }
     seen.push(key);
-    let def = g.ty(id);
-    let fields: Vec<(String, Ty)> = match &def.shape {
+    let fields = nominal_fields(g.ty(id));
+    for (label, fty) in fields {
+        path.push(label);
+        let ft = st.zonk(&fty.subst_gen(args, &colour_args(args)));
+        let r = walk(g, st, &ft, path, seen, needs);
+        path.pop();
+        r?;
+    }
+    Ok(())
+}
+
+/// The fields of a nominal type, each with its step of a witness path.
+fn nominal_fields(def: &crate::types::decls::TypeDef) -> Vec<(String, Ty)> {
+    match &def.shape {
         Shape::Struct(fs) => fs
             .iter()
             .map(|f| (format!("field {} of {}", f.name, def.name), f.ty.clone()))
@@ -127,15 +139,7 @@ fn nominal(
                 })
             })
             .collect(),
-    };
-    for (label, fty) in fields {
-        path.push(label);
-        let ft = st.zonk(&fty.subst_gen(args, &colour_args(args)));
-        let r = walk(g, st, &ft, path, seen, needs);
-        path.pop();
-        r?;
     }
-    Ok(())
 }
 
 /// The error of §5.3 for a failed `Send`.
@@ -159,4 +163,65 @@ pub fn send_error(g: &Globals, w: &Witness, pos: &Pos, rigid: &[String]) -> Type
             format!("value of type {t} cannot be shared between threads: {path}"),
         ),
     }
+}
+
+/// The first `Cell` or `Weak` in the closed type `ty` of a `def` (types
+/// §2.16, L15): a global is reachable from every task, so what it holds
+/// must be shareable, and a `Cell` or a `Weak` is not (an `Atom` is).
+/// The witness gives the path to it as `Send`'s does.
+pub fn def_holds_cell(g: &Globals, ty: &Ty) -> Option<Witness> {
+    let mut path = Vec::new();
+    let mut seen = Vec::new();
+    holds_cell(g, ty, &mut path, &mut seen).err()
+}
+
+fn holds_cell(
+    g: &Globals,
+    t: &Ty,
+    path: &mut Vec<String>,
+    seen: &mut Vec<(TypeId, Vec<Ty>)>,
+) -> Result<(), Witness> {
+    match t {
+        Ty::Con(Con::Cell | Con::Weak, _) => fail(path, t),
+        Ty::Con(c @ (Con::Array | Con::Task | Con::Atom), args) => {
+            let what = match c {
+                Con::Array => "element",
+                Con::Atom => "content",
+                _ => "result",
+            };
+            path.push(format!("{what} of {}", Printer::new(g).ty(t)));
+            let r = args.iter().try_for_each(|a| holds_cell(g, a, path, seen));
+            path.pop();
+            r
+        }
+        Ty::Con(Con::Nominal(id), args) => {
+            let key = (*id, args.to_vec());
+            if seen.contains(&key) {
+                return Ok(());
+            }
+            seen.push(key);
+            for (label, fty) in nominal_fields(g.ty(*id)) {
+                path.push(label);
+                let r = holds_cell(g, &fty.subst_gen(args, &colour_args(args)), path, seen);
+                path.pop();
+                r?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The error of a `def` whose type holds a `Cell` or a `Weak`.
+pub fn def_cell_error(g: &Globals, name: &str, w: &Witness, pos: &Pos) -> TypeError {
+    let path = if w.path.is_empty() {
+        "the value".to_string()
+    } else {
+        w.path.join(", ")
+    };
+    let t = Printer::new(g).ty(&w.offending);
+    let msg = format!(
+        "def {name}: a def may not hold a Cell or a Weak: {path} has type {t}; use an Atom"
+    );
+    TypeError::new(ErrorKind::DefHoldsCell, pos, msg)
 }

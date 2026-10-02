@@ -61,6 +61,9 @@ pub enum Event {
     /// `def` value and everything reachable from it). Its count is 0
     /// from now on and it is never freed.
     Immortalised { id: ObjId },
+    /// The `def`s have all been made (L15: `Interp::eval_defs`): what
+    /// precedes is not part of the free trace.
+    InitDone,
 }
 
 impl Event {
@@ -82,21 +85,22 @@ impl Event {
             | Event::WriteUnique { id, .. }
             | Event::Drop { id }
             | Event::Immortalised { id } => id,
-            Event::ScopeOpen { .. } | Event::ScopeEnd { .. } => return None,
+            Event::ScopeOpen { .. } | Event::ScopeEnd { .. } | Event::InitDone => return None,
         };
         Some(id)
     }
 }
 
 /// The events of `events` that the free trace is made of
-/// (`spec/compiler.md` §4): those after the last `Immortalised`. What
-/// happens before it is the evaluation of the `def`s (syntax §3.19),
-/// whose objects the compiled program holds as static data, so neither
-/// side traces it.
+/// (`spec/compiler.md` §4): those after the last `Immortalised` or
+/// `InitDone`. What happens before it is the evaluation of the `def`s
+/// (syntax §3.19), whose objects the compiled program holds as static
+/// data or makes before `main` (`fibc`'s `inits.rs`), so neither side
+/// traces it.
 pub fn traced(events: &[Event]) -> &[Event] {
     let start = events
         .iter()
-        .rposition(|e| matches!(e, Event::Immortalised { .. }))
+        .rposition(|e| matches!(e, Event::Immortalised { .. } | Event::InitDone))
         .map_or(0, |i| i + 1);
     &events[start..]
 }

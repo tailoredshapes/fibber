@@ -1,0 +1,23 @@
+;; spec:   stdlib §7 L15, §5 M1 (an Atom is allowed), types §8.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: def
+;; Four tasks add to the one atom that a `def` made, without capturing
+;; it: a global is not a capture. None of the 400 is lost, as for a local
+;; atom (case 665).
+(ns main (:use fib.core fib.async tl.check))
+
+(def hits: (Atom i64) (atom 0))
+
+(defun add-hundred () -> unit
+  (dotimes (i 100) (swap! hits (fn (x) (+ x 1)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (ts [(future (add-hundred)) (future (add-hundred))
+             (future (add-hundred)) (future (add-hundred))]))
+    (do (dotimes (i 4) (join (nth ts i)))
+        (check c (= @hits 400))
+        (checks-result c))))

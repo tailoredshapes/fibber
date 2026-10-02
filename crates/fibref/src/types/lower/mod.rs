@@ -23,7 +23,7 @@ use crate::syntax::Form;
 
 use crate::types::ast::{DefId, Expr, ExprKind, FunId, GlobalRef};
 use crate::types::decls::{DefDef, ExternDef, FunDef, Globals, InstanceDef, ModuleId, Shape};
-use crate::types::error::{ErrorKind, TResult, TypeError};
+use crate::types::error::{TResult, TypeError};
 use crate::types::ty::{Con, ProtoId, Ty};
 
 pub use decl::define_value;
@@ -158,6 +158,7 @@ fn declare_def(g: &mut Globals, m: ModuleId, form: &Form) -> TResult<DefId> {
         module: m,
         ann: None,
         init,
+        constant: false,
         pos: form.pos.clone(),
     });
     define_value(g, m, name, GlobalRef::Def(id), &form.pos)?;
@@ -318,34 +319,33 @@ fn lower_def(g: &mut Globals, m: ModuleId, id: DefId, form: &Form) -> TResult<()
     let ann = ann.map(|a| type_ann(g, m, a, false)).transpose()?;
     let mut lw = Lowerer::new(g, m, name);
     let init = lw.expr(init, false)?;
-    check_const(g, id, &init)?;
+    let constant = is_constant(g, id, &init);
     let def = &mut g.defs[id.0 as usize];
     def.ann = ann;
     def.init = init;
+    def.constant = constant;
     Ok(())
 }
 
-/// The constant grammar of syntax §3.19.
-fn check_const(g: &Globals, id: DefId, e: &Expr) -> TResult<()> {
-    let ok = match &e.kind {
+/// Whether an initialiser is in the constant grammar of syntax §3.19: no
+/// effect, only immutable objects, named defs that are themselves
+/// constant. Any initialiser is accepted (L15); this decides only how
+/// the compiler makes the value, as static data (a constant) or by the
+/// init function of the module (anything else).
+fn is_constant(g: &Globals, id: DefId, e: &Expr) -> bool {
+    match &e.kind {
         ExprKind::Lit(_) | ExprKind::Quote(_) => true,
-        ExprKind::Global(GlobalRef::Def(d)) => d.0 < id.0,
+        ExprKind::Global(GlobalRef::Def(d)) => d.0 < id.0 && g.def(*d).constant,
         ExprKind::Global(GlobalRef::Ctor(..)) | ExprKind::Global(GlobalRef::Fun(_)) => true,
         ExprKind::Call(head, args) => {
             const_head(g, head)
                 && args.iter().all(|a| match a {
-                    crate::types::ast::Arg::Expr(a) => check_const(g, id, a).is_ok(),
+                    crate::types::ast::Arg::Expr(a) => is_constant(g, id, a),
                     crate::types::ast::Arg::Amp(..) => false,
                 })
         }
         _ => false,
-    };
-    if ok {
-        return Ok(());
     }
-    let name = &g.def(id).name;
-    let msg = format!("def {name}: initialiser is not a constant expression");
-    Err(TypeError::new(ErrorKind::DefNotConstant, &e.pos, msg))
 }
 
 /// A constructor, or one of the prelude calls of the literal rewrite.

@@ -277,8 +277,13 @@ pub struct DefDef {
     pub module: ModuleId,
     /// The annotation.
     pub ann: Option<TypeAnn>,
-    /// The initialiser, a constant expression.
+    /// The initialiser: any expression (syntax §3.19, L15).
     pub init: Expr,
+    /// Whether the initialiser is in the constant grammar of syntax
+    /// §3.19 (no effect, immutable objects only, named defs that are
+    /// constant too). The compiler emits a constant as static data and
+    /// every other `def` by the init function of its module.
+    pub constant: bool,
     /// Where it is defined.
     pub pos: Pos,
 }

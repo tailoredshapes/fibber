@@ -899,8 +899,8 @@ then complete, and before the functions that read it, in an environment
 holding constructors, the `def`s it names, the named functions it names
 (`inst` of their schemes, §2.1) and the imported schemes of the prelude
 calls that the literal-collection rewrite introduces (`vec-empty`,
-`conj`, `map-empty`, `assoc`; syntax §1.4): these are the only calls a
-constant expression contains. A `def` that names a `defun` which reads
+`conj`, `map-empty`, `assoc`; syntax §1.4): an initialiser that is not a constant sees everything else a function body
+sees (L15). A `def` that names a `defun` which reads
 it, directly or through other functions, is the error `def g and defun
 f depend on each other` (**Decided**). `T` is
 never generalised, and a type variable left in it is `def g has an
@@ -911,12 +911,14 @@ omitted colour in that annotation means `send` (§1.4); the
 monomorphiser then emits the specialisation the annotation names
 (§4.3). A `def` naming a monomorphic function needs nothing: `(defun
 double (x: i64) -> i64 (+ x x))` gives `(def twice-fn double)` the
-closed type `(fn :send (i64) i64)` (proposed case 50). A form outside
-the constant grammar (a call other than a constructor or the rewrite's
-prelude calls, `cell`, `atom`, `weak`, `fn`, `async`, `unsafe`, `@`) is
-`def g: initialiser is not a constant expression`. `Send T` holds by
-construction, since no constant expression builds a cell and named
-functions are `send`, which is why a `def` name may appear in any `fn`
+closed type `(fn :send (i64) i64)` (proposed case 50). The initialiser is any expression (L15); the constant grammar of syntax
+§3.19 only decides whether the compiler makes the value at compile time or
+by an init function. **The type of a `def` may not contain a `Cell` or a
+`Weak`** (an `Atom` is allowed): `def g: a def may not hold a Cell or a Weak:
+PATH has type T; use an Atom`, found by walking the closed type through the
+fields of nominal types and the arguments of `Array`, `Atom` and `Task`
+(a global `Cell` would be reachable from every task, stdlib §5 M1). So what
+a `def` holds is shareable, and named functions are `send`, which is why a `def` name may appear in any `fn`
 or `async` body without being a capture: like a named function it is a
 global, not a free variable (§3.7). Its value is immortal (§8.2), so
 reading it is a count-free `Borrowed(g)` (§6.1).

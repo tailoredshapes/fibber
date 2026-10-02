@@ -10,6 +10,7 @@ pub mod compile;
 pub mod defs;
 pub mod front;
 pub mod harness;
+pub mod inits;
 pub mod ir;
 pub mod layout;
 pub mod lower;

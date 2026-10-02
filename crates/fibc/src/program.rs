@@ -46,6 +46,11 @@ pub struct Program<'a> {
     /// Every `def`'s value as lIR text with its type (compile-time
     /// evaluated, `defs.rs`).
     pub def_values: std::collections::HashMap<fibref::types::ast::DefId, (String, Option<LirTy>)>,
+    /// The slot (a global of the module) and type of every `def` made at
+    /// run time, and those `def`s in the order their init functions
+    /// make them (`inits.rs`).
+    pub def_slots: std::collections::HashMap<fibref::types::ast::DefId, (String, Option<LirTy>)>,
+    pub inits: Vec<crate::inits::Init>,
     /// The constant of every quoted form, by its expression, and the
     /// constants' text (`lower/quote.rs`).
     pub quotes: std::collections::HashMap<ExprId, String>,
@@ -68,6 +73,8 @@ impl<'a> Program<'a> {
             externs: Vec::new(),
             helpers: std::collections::HashSet::new(),
             def_values: std::collections::HashMap::new(),
+            def_slots: std::collections::HashMap::new(),
+            inits: Vec::new(),
             quotes: std::collections::HashMap::new(),
             quote_text: String::new(),
             quote_counter: 0,

@@ -183,3 +183,32 @@ fn immortalise_refuses_a_weak_to_a_mortal_outside_the_graph() {
         Err(AuditError::ImmortalHoldsMortal { id: other })
     );
 }
+
+#[test]
+fn a_def_value_that_holds_an_atom_is_pinned_not_a_leak_and_marked_shared() {
+    // L15: `(def counter (atom [1]))`. The atom is written at run time, so
+    // the value is not static data: it stays counted, shared, and what
+    // it reaches is not a leak at exit.
+    let mut heap = Heap::new();
+    let v = heap
+        .alloc(Kind::Immutable, vec![Value::Int(1)])
+        .expect("vec");
+    let a = heap.alloc(Kind::Atom, vec![Value::Ref(v)]).expect("atom");
+    heap.release(v).expect("the atom holds it");
+    assert!(heap.holds_atom(a));
+    assert!(!heap.holds_atom(v));
+    heap.pin(a).expect("pin");
+    assert_eq!(heap.is_shared(a), Ok(true));
+    assert_eq!(heap.is_immortal(a), Ok(false));
+    let report = heap.finish();
+    assert!(report.leaks.is_empty(), "{:?}", report.leaks);
+}
+
+#[test]
+fn a_value_that_was_not_pinned_is_still_a_leak() {
+    // The pin is what excuses it: the same graph without it is reported.
+    let mut heap = Heap::new();
+    let a = heap.alloc(Kind::Atom, vec![Value::Int(0)]).expect("atom");
+    let report = heap.finish();
+    assert_eq!(report.leaks.len(), 1, "{a:?}");
+}

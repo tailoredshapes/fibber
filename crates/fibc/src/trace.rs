@@ -124,8 +124,30 @@ impl Trace {
 
     /// The compiled side: the trace lines among the runtime's standard
     /// error output; any other line is left alone.
+    ///
+    /// A program with `def`s made at run time (`inits.rs`) prints the
+    /// marker `I k` when its init functions are done, `k` the last
+    /// ordinal they handed out. What precedes it is dropped, as the
+    /// interpreter's trace drops its `def` evaluation, and the later
+    /// lines are numbered from `k`: an object an initialiser allocated
+    /// and a later line frees (an atom's first value, replaced) has no
+    /// line, as it has none in the interpreter's.
     pub fn parse(text: &str) -> Trace {
-        let lines = text.lines().filter_map(parse_line).collect();
+        let all: Vec<&str> = text.lines().collect();
+        let marker = all
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, l)| init_marker(l).map(|k| (i, k)));
+        let (k, rest) = match marker {
+            Some((i, k)) => (k, &all[i + 1..]),
+            None => (0, &all[..]),
+        };
+        let lines = rest
+            .iter()
+            .filter_map(|l| parse_line(l))
+            .filter_map(|l| after_init(l, k))
+            .collect();
         Trace { lines }
     }
 
@@ -148,6 +170,23 @@ impl Trace {
     /// The text of the trace, one line each.
     pub fn render(&self) -> String {
         self.lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+}
+
+/// `k` of the line `I k` that ends the init functions.
+fn init_marker(s: &str) -> Option<u64> {
+    s.strip_prefix("I ")?.parse().ok()
+}
+
+/// A line after the init marker `I k`, numbered from `k`; `None` for a
+/// line about an object the init functions made.
+fn after_init(l: Line, k: u64) -> Option<Line> {
+    match l {
+        Line::Alloc(n, c) => Some(Line::Alloc(n.saturating_sub(k), c)),
+        Line::Stack(n, c) => Some(Line::Stack(n.saturating_sub(k), c)),
+        Line::Free(n) => (n > k).then(|| Line::Free(n - k)),
+        Line::End(n) => (n > k).then(|| Line::End(n - k)),
+        Line::Thread => Some(l),
     }
 }
 
@@ -268,6 +307,17 @@ mod tests {
 
     fn t(text: &str) -> Trace {
         Trace::parse(text)
+    }
+
+    #[test]
+    fn the_init_marker_drops_the_init_functions_lines_and_renumbers() {
+        // Objects 1 and 2 were made by the initialisers (L15); object 2 is
+        // freed later by `main`, which has no line in the interpreter's
+        // trace; `main`'s first allocation is the interpreter's object 1.
+        let tr = t("A 1 o\nA 2 a\nI 2\nA 3 o\nF 2\nF 3\nS 4 c\nD 4\n");
+        assert_eq!(tr.render(), "A 1 o\nF 1\nS 2 c\nD 2\n");
+        // No marker: the text is read as it was.
+        assert_eq!(t("A 1 o\nF 1\n").render(), "A 1 o\nF 1\n");
     }
 
     #[test]

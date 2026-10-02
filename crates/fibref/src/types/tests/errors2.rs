@@ -193,18 +193,21 @@ fn def_has_an_unresolved_type() {
 }
 
 #[test]
-fn def_initialiser_is_not_a_constant_expression() {
+fn def_initialiser_is_any_expression_but_its_type_holds_no_cell_or_weak() {
+    // L15: a call, an atom and a closure are initialisers now.
+    ok("(defun f () -> i64 1) (def g (f)) (defun main () -> i64 g)");
+    ok("(def a: (Atom i64) (atom 0)) (defun main () -> i64 @a)");
+    ok("(def primes [2 3 5]) (defun main () -> i64 (vec-nth primes 0))");
     fails(
         "(def c (cell 0)) (defun main () -> i64 0)",
-        K::DefNotConstant,
-        "def c: initialiser is not a constant expression",
+        K::DefHoldsCell,
+        "def c: a def may not hold a Cell or a Weak: the value has type (Cell i64); use an Atom",
     );
     fails(
-        "(def f (fn () 1)) (defun main () -> i64 0)",
-        K::DefNotConstant,
-        "def f: initialiser is not a constant expression",
+        "(defstruct H (c: (Cell i64))) (def h (H (cell 0))) (defun main () -> i64 0)",
+        K::DefHoldsCell,
+        "def h: a def may not hold a Cell or a Weak: field c of H has type (Cell i64); use an Atom",
     );
-    ok("(def primes [2 3 5]) (defun main () -> i64 (vec-nth primes 0))");
 }
 
 #[test]
