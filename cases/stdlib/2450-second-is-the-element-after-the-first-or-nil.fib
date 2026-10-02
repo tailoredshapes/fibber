@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.4 (row second), §2.4 (a miss is nil, never a trap), tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: second
+;; (second c) is the element after the first, Clojure's `(first (next c))`, as an Option: nil
+;; for an empty collection and for one of a single element (`(second [1])` is nil in Clojure),
+;; never a trap. It is one Reducible walk, so every source has it: the helper `two` is generic
+;; over a source of four elements 10 20 30 40 and runs at a Vec, a List, a VSeq, an LSeq, a
+;; Range, a string's chars and a user tree that gave only each-while.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+(defun is (o: (Option i64) n: i64) -> bool (match o (nil false) ((some x) (= x n))))
+
+(defun two (c: Checks s: s) :where ((Reducible s i64)) -> unit
+  (check c (is (second s) 20)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (empty: (Vec i64) (vec-empty)))
+    (do (two c [10 20 30 40])
+        (two c (list 10 20 30 40))
+        (two c (rest [0 10 20 30 40]))
+        (two c (map (fn (x) (* x 10)) [1 2 3 4]))
+        (two c (Range 10 50 10))
+        (two c (Node (Node Leaf 10 Leaf) 20 (Node (Node Leaf 30 Leaf) 40 Leaf)))
+        (check c (is (second [1 2]) 2))
+        (check c (nil? (second [1])))
+        (check c (nil? (second empty)))
+        (check c (nil? (second (list 1))))
+        (check c (nil? (second (some 5))))
+        (check c (nil? (second (Range 0 1 1))))
+        (check c (nil? (second (map inc empty))))
+        (check c (match (second "héllo") ((some ch) (= ch \é)) (nil false)))
+        (check c (match (second ["a" "bb" "ccc"]) ((some s) (= s "bb")) (nil false)))
+        (check c (match (second [[1] [2 3]]) ((some v) (= (count v) 2)) (nil false)))
+        (checks-result c))))

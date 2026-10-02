@@ -1,0 +1,50 @@
+;; spec:   stdlib §2.1 rule 6 (a user type joins with one impl), rule 3, tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: second fnext not-empty doall dorun not-every? product
+;; A user type that gave only each-while gets every consumer of the part, and the walks are as short
+;; as the page says: the type counts the elements it hands out, so second and fnext take two, not-empty
+;; one, not-every? and some-p stop at the first failure or hit, and doall, dorun and product take all of
+;; them, once. not-empty and doall hand the user's own value back.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Logged (v: (Vec i64) hits: (Cell i64)))
+
+(impl (Reducible i64) Logged
+  (each-while (self k)
+    (let ((n (vec-count (. self v))))
+      (loop ((i 0))
+        (if (< i n)
+            (do (set! (. self hits) (+ @(. self hits) 1))
+                (if (k (vec-nth (. self v) i)) (recur (+ i 1)) false))
+            true)))))
+
+(defun logged (xs: (Vec i64)) -> Logged (Logged xs (cell 0)))
+
+;; the elements handed out since the last reset
+(defun taken (l: Logged) -> i64 (let ((n @(. l hits))) (do (set! (. l hits) 0) n)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (l (logged [4 5 6 7])))
+    (do (check c (match (second l) (nil false) ((some x) (= x 5))))
+        (check c (= (taken l) 2))
+        (check c (match (fnext l) (nil false) ((some x) (= x 5))))
+        (check c (= (taken l) 2))
+        (check c (match (not-empty l) (nil false) ((some u) (= (sum (. u v)) 22))))
+        (check c (= (taken l) 1))
+        (check c (match (some-p (fn (x) (> x 5)) l) (nil false) ((some b) b)))
+        (check c (= (taken l) 3))
+        (check c (not-every? (fn (x) (< x 6)) l))
+        (check c (= (taken l) 3))
+        (check c (= (product l) 840))
+        (check c (= (taken l) 4))
+        (dorun l)
+        (check c (= (taken l) 4))
+        (check c (= (taken (doall l)) 4))
+        (check c (nil? (not-empty (logged (vec-empty)))))
+        (check c (nil? (second (logged [1]))))
+        (check c (= (taken l) 0))
+        (checks-result c))))

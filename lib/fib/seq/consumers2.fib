@@ -1,5 +1,98 @@
-;; owner: Y4
-;; fib.seq.consumers2: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the consumers `second ffirst fnext not-empty doall dorun not-every? product` and the helpers the Rust macros call, `some-p max-key-pair min-key-pair`.
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
-(ns fib.seq.consumers2 (:use fib.core fib.seq.types fib.seq.protocols fib.seq.consumers))
+;; fib.seq.consumers2: the consumers tranche 1 left out (stdlib §4.4 rows second ffirst fnext not-empty doall dorun
+;; not-every? product; tranche 2 plan §4.1, package Y4) and the three helpers that the Rust macros of E1 call, some-p,
+;; max-key-pair and min-key-pair. Exports those eleven names. The helpers are no rows: the precedent is
+;; reduce-nonempty, which the `reduce` macro emits and no row names. Replaces nothing in the prelude.
+;;
+;; Every function is a loop over each-while that allocates nothing per element: the running value lives in a cell
+;; made once, an early exit is a `false` from the visitor, and the visitor is a closure made once per call. The
+;; answers that are an Option of a scalar are one heap object each, until C5 (second, fnext, some-p). A function
+;; parameter is :borrow (it is only called, plan §4.2 rule 6), a collection parameter is left to inference.
+;;
+;; Decided here (the plan or the page leaves them open):
+;;  - second is the element after the first, as an Option; fnext is second. ffirst is `(first (first c))` through
+;;    two Reducible constraints, so the inner type is any source; nil when the outer is empty and when the first
+;;    inner is empty (the second inner is never looked at, as Clojure's).
+;;  - not-empty looks at one element and answers `(some c)`: c itself, which a Vec or a string is, not a copy. For
+;;    an object type the Option is the pointer, so the call makes no object. A lazy source realises one node.
+;;  - doall (plan Y4) walks c once and answers c. A lazy seq is realised by the walk and memoised, so a later walk
+;;    calls the function of the seq no more; any other collection comes back as it was. The walk is paid there as
+;;    an O(n) pass with no other effect, because a generic identity needs no instance (a defaulted method of
+;;    Reducible would let a Vec skip it: reported, not done). doall is not a terminal of the fusion rule (§2.1):
+;;    its result is a real seq. dorun walks for effect and answers unit.
+;;  - not-every? is the negation of every?: the same predicate (bool or Option), the same stop at the first
+;;    element that decides. The product of nothing is 1 and a product that does not fit an i64 traps with the
+;;    builtin's `integer overflow in * at i64`: product is for i64 only, as sum, because the generic one needs a
+;;    static `one` (item L4 of §7, tranche 3). No early exit on a zero: a zero is a product, not an answer.
+;;  - some-p is the page's some-p of A11 (§2.3) written as one walk: the payload of the first truthy result of the
+;;    predicate, as an Option, and the walk stops there. A bool predicate answers `(some true)` or nil; an Option
+;;    predicate answers the payload of its first `some`. The predicate's result is a Truthy, so `(some false)`
+;;    inside an Option counts as a hit here, which is the Truthy instance of (Option a) (fib.core.protocols), not
+;;    the checker's L20 rule for conditions.
+;;  - max-key-pair and min-key-pair are Clojure's two-argument max-key and min-key, `(if (> (k a) (k b)) a b)` and
+;;    `(if (< (k a) (k b)) a b)`: of two equal keys the second element is the answer, so the fold of the macros
+;;    keeps the last of equal keys, and when either key is a NaN neither test holds and the second element is the
+;;    answer, as Clojure's. The key function is called once on each element of each pair.
+(ns fib.seq.consumers2 (:use fib.core fib.seq.protocols fib.seq.consumers))
+
+;; the second element, or nil: the walk stops there
+(defun second (c: c) :where ((Reducible c e)) -> (Option e)
+  (let ((seen (cell false))
+        (r (cell nil)))
+    (do (each-while c
+          (fn (x)
+            (if @seen
+                (do (set! r (some x)) false)
+                (do (set! seen true) true))))
+        @r)))
+
+;; the first element of the first element; two Reducible constraints, c of d and d of e
+(defun ffirst (c: c) :where ((Reducible c d) (Reducible d e)) -> (Option e)
+  (match (first c)
+    (nil nil)
+    ((some inner) (first inner))))
+
+;; the alias of second
+(defun fnext (c: c) :where ((Reducible c e)) -> (Option e) (second c))
+
+;; c itself when it has an element, else nil
+(defun not-empty (c: c) :where ((Reducible c e)) -> (Option c)
+  (if (empty? c) nil (some c)))
+
+;; walks c once, realising a lazy seq, and answers c
+(defun doall (c: c) :where ((Reducible c e)) -> c
+  (do (each-while c (fn (x) true))
+      c))
+
+;; walks c once for the effects of its lazy functions
+(defun dorun (c: c) :where ((Reducible c e)) -> unit
+  (do (each-while c (fn (x) true))
+      ()))
+
+;; true when some element fails p: the walk stops at the first one
+(defun not-every? (p: (fn (e) r) :borrow c: c) :where ((Reducible c e) (Truthy r)) -> bool
+  (not (each-while c (fn (x) (truthy? (p x))))))
+
+;; the i64 elements multiplied: 1 for none
+(defun product (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 1)))
+    (do (each-while c (fn (x) (do (set! acc (* @acc x)) true)))
+        @acc)))
+
+;; the payload of the first truthy result of p over c, or nil: what `(some pred c)` expands to
+(defun some-p (p: (fn (e) r) :borrow c: c) :where ((Reducible c e) (Truthy r) (Payload r x)) -> (Option x)
+  (let ((out (cell nil)))
+    (do (each-while c
+          (fn (el)
+            (let ((v (p el)))
+              (if (truthy? v)
+                  (do (set! out (some (payload v))) false)
+                  true))))
+        @out)))
+
+;; the element with the larger key, the second of two equal keys
+(defun max-key-pair (k: (fn (e) o) :borrow a: e b: e) :where ((Ord o)) -> e
+  (if (> (k a) (k b)) a b))
+
+;; the element with the smaller key, the second of two equal keys
+(defun min-key-pair (k: (fn (e) o) :borrow a: e b: e) :where ((Ord o)) -> e
+  (if (< (k a) (k b)) a b))

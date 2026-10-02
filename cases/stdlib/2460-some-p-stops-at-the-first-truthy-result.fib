@@ -1,0 +1,25 @@
+;; spec:   stdlib §2.1 rule 3 (consumers stop through the bool), §2.3, tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; some-p stops the walk at the first truthy result: over a Vec the predicate has been called once
+;; per element up to the hit and never after it, and over a source that never ends (a Range of step
+;; 0 repeats its start) it terminates when something hits. With no hit it calls p on every element.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (do (check c (match (some-p (fn (x) (do (set! calls (+ @calls 1)) (> x 2))) [1 2 3 4 5]) (nil false) ((some b) b)))
+        (check c (= @calls 3))
+        (set! calls 0)
+        (check c (nil? (some-p (fn (x) (do (set! calls (+ @calls 1)) (> x 9))) [1 2 3 4 5])))
+        (check c (= @calls 5))
+        (set! calls 0)
+        (check c (match (some-p (fn (x) (do (set! calls (+ @calls 1)) (if (= x 7) (some (* 2 x)) nil))) (list 3 7 7 9))
+                   (nil false) ((some v) (= v 14))))
+        (check c (= @calls 2))
+        (check c (match (some-p (fn (x) (> x 0)) (Range 1 2 0)) (nil false) ((some b) b)))
+        (check c (match (some-p (fn (x) (if (> x 0) (some (+ x 1)) nil)) (Range 5 6 0)) (nil false) ((some v) (= v 6))))
+        (checks-result c))))

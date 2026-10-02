@@ -1,0 +1,33 @@
+;; spec:   stdlib §4.4 (row dorun), §2.1 rule 2, tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: dorun
+;; (dorun c) walks c for its effects and answers unit: `(dorun (map f c))` runs f once per element, in
+;; order, and a seq that was bound is realised by it, so a later walk calls f no more. It does not
+;; keep the elements. Over a collection that holds its elements it changes nothing.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (log (cell (vec-empty)))
+        (empty: (Vec i64) (vec-empty)))
+    (do (dorun (map (fn (x) (do (set! calls (+ @calls 1)) (set! log (vec-conj @log x)) x)) [5 6 7]))
+        (check c (= @calls 3))
+        (check c (= @log [5 6 7]))
+        (let ((s (map (fn (x) (do (set! calls (+ @calls 1)) (* x x))) [1 2 3])))
+          (do (check c (= @calls 3))
+              (dorun s)
+              (check c (= @calls 6))
+              (check c (= (sum s) 14))
+              (check c (= @calls 6))))
+        (dorun [1 2 3])
+        (dorun empty)
+        (dorun (list 1 2))
+        (dorun "héllo")
+        (dorun (Range 0 3 1))
+        (check c (= (dorun (some 1)) ()))
+        (check c (= @calls 6))
+        (checks-result c))))

@@ -1,0 +1,62 @@
+;; spec:   stdlib §4.4 (rows second fnext ffirst not-empty doall not-every? product), §8.1 item 4 (a property over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: second fnext ffirst not-empty doall not-every? product
+;; The part's functions against the library's others, on 300 seeded Vecs of 0 to 9 elements: not-empty
+;; is nil exactly when empty? holds and is otherwise the Vec itself; not-every? is the negation of
+;; every?; second is the first of the rest and fnext is second; ffirst is the first of the first;
+;; product is the multiplying reduce; doall of a lazy seq has made the one call of f per element that
+;; to-vec would, and no call is left for the later walk; some-p over a bool predicate is
+;; find-first's hit as `(some true)`; of two elements of equal keys max-key-pair and min-key-pair
+;; answer the second, and of different keys the one with the larger (smaller) key whatever the
+;; order. The planted faults are seven defective laws, each run against a second Checks that must
+;; fail: not-every? set against every? itself, second against first, and so on.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+(defun opt= (a: (Option i64) b: (Option i64)) -> bool
+  (match a
+    (nil (nil? b))
+    ((some x) (match b (nil false) ((some y) (= x y))))))
+
+(defun key (x: i64) -> i64 (rem x 4))
+
+(defun law (c: Checks seed: i64 fault: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (n 300)
+      (let ((v (rng-vec r (rng-below r 10) 5))
+            (thr (rng-below r 6))
+            (a (rng-below r 20))
+            (b (rng-below r 20))
+            (calls (cell 0)))
+        (let ((p (fn (x) (>= x thr)))
+              (g [v (rng-vec r (rng-below r 3) 5)]))
+          (do (check c (= (nil? (not-empty v)) (if (= fault 1) (not (empty? v)) (empty? v))))
+              (check c (match (not-empty v) (nil true) ((some u) (= u v))))
+              (check c (= (not-every? p v) (if (= fault 2) (every? p v) (not (every? p v)))))
+              (check c (opt= (second v) (if (= fault 3) (first v) (first (rest v)))))
+              (check c (opt= (fnext v) (second v)))
+              (check c (opt= (ffirst g) (match (first g) (nil nil) ((some row) (if (= fault 4) (second row) (first row))))))
+              (check c (= (product v) (reduce (fn (acc x) (if (= fault 5) (+ acc x) (* acc x))) 1 v)))
+              (let ((s (doall (map (fn (x) (do (set! calls (+ @calls 1)) x)) v))))
+                (do (check c (= @calls (+ (count v) (if (= fault 6) 1 0))))
+                    (check c (= (count (to-vec s)) (count v)))
+                    (check c (= @calls (count v)))))
+              (check c (opt= (match (some-p p v) (nil nil) ((some _) (some 1)))
+                             (match (find-first p v) (nil nil) ((some _) (some 1)))))
+              (check c (= (max-key-pair key a b) (if (= (key a) (key b)) (if (= fault 7) a b) (if (> (key a) (key b)) a b))))
+              (check c (= (min-key-pair key a b) (if (= (key a) (key b)) b (if (< (key a) (key b)) a b))))
+              (check c (if (= (key a) (key b)) true (= (max-key-pair key a b) (max-key-pair key b a))))))))))
+
+(defun planted (c: Checks fault: i64) -> unit
+  (let ((p (checks)))
+    (do (law p 44 fault)
+        (check-detects c p))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (law c 44 0)
+        (check c (= (checks-made c) 4200))
+        (dotimes (k 7) (planted c (+ k 1)))
+        (checks-result c))))

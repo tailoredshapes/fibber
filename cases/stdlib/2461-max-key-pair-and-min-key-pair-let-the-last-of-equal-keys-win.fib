@@ -1,0 +1,40 @@
+;; spec:   stdlib §4.4 (rows max-key min-key: "ties: the last wins, as Clojure's"), tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; (max-key-pair k a b) is `(if (> (k a) (k b)) a b)` and (min-key-pair k a b) is
+;; `(if (< (k a) (k b)) a b)`: Clojure's two-argument max-key and min-key, the step the macros of
+;; E1 fold over their arguments. Of two elements whose keys are equal the second is the answer, so
+;; a fold of them keeps the last of equal keys. The elements may be any type, the key any Ord;
+;; the key function is called on each element, and the element returned is the argument itself. A NaN
+;; key makes both tests false, so the second element is the answer, as Clojure's.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun len-of (s: str) -> i64 (str-len s))
+(defun neg-of (x: i64) -> i64 (- 0 x))
+(defun frac (x: f64) -> f64 x)
+(defun nan () -> f64 (/ 0.0 0.0))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (max-key-pair len-of "ab" "cd") "cd"))
+        (check c (= (max-key-pair len-of "abc" "d") "abc"))
+        (check c (= (max-key-pair len-of "a" "bcd") "bcd"))
+        (check c (= (min-key-pair len-of "ab" "cd") "cd"))
+        (check c (= (min-key-pair len-of "abc" "d") "d"))
+        (check c (= (min-key-pair len-of "a" "bcd") "a"))
+        (check c (= (max-key-pair neg-of 3 5) 3))
+        (check c (= (min-key-pair neg-of 3 5) 5))
+        (check c (= (max-key-pair frac 1.5 2.5) 2.5))
+        (check c (= (min-key-pair frac 2.5 1.5) 1.5))
+        (check c (= (max-key-pair frac 1.5 1.5) 1.5))
+        (check c (= (max-key-pair len-of (reduce (fn (a s) (str-concat a s)) "" ["x" "y"]) "zz") "zz"))
+        (check c (= (reduce (fn (a s) (max-key-pair len-of a s)) "" ["ab" "cd" "e" "fg"]) "fg"))
+        (check c (= (reduce (fn (a s) (min-key-pair len-of a s)) "zzz" ["ab" "cd" "e" "f"]) "f"))
+        (check c (= (max-key-pair (fn (p) (nth p 1)) [1 5] [9 5]) [9 5]))
+        (check c (= (max-key-pair frac (nan) 1.0) 1.0))
+        (check c (let ((r (max-key-pair frac 1.0 (nan)))) (!= r r)))
+        (check c (= (min-key-pair frac (nan) 1.0) 1.0))
+        (check c (let ((r (min-key-pair frac 1.0 (nan)))) (!= r r)))
+        (checks-result c))))

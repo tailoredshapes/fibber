@@ -1,0 +1,39 @@
+;; spec:   stdlib §4.4 (row not-empty), §2.4, tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: not-empty
+;; (not-empty c) is `(some c)`, the collection itself, or nil when it has no element: the type is
+;; `(Option c)`, where `seq` would give the seq type of c. It looks at one element and no more (a
+;; lazy source realises one node: the thunks below count themselves), and the collection that comes
+;; back is the argument, so a string is still a string and a Vec still the Vec.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (empty: (Vec i64) (vec-empty))
+        (nothing: (List i64) (list)))
+    (let ((s (lazy-node (fn () (do (set! calls (+ @calls 1))
+                                   (LCons 10 (lazy-node (fn () (do (set! calls (+ @calls 1))
+                                                                   (LCons 20 (lazy-node (fn () LNil))))))))))))
+      (do (check c (nil? (not-empty empty)))
+          (check c (match (not-empty [1 2]) (nil false) ((some v) (= v [1 2]))))
+          (check c (nil? (not-empty "")))
+          (check c (match (not-empty "ab") (nil false) ((some t) (= t "ab"))))
+          (check c (nil? (not-empty nothing)))
+          (check c (match (not-empty (list 1 2)) (nil false) ((some l) (= (sum l) 3))))
+          (check c (nil? (not-empty (Range 3 3 1))))
+          (check c (match (not-empty (Range 0 4 1)) (nil false) ((some r) (= (sum r) 6))))
+          (check c (nil? (not-empty (filter (fn (x) (> x 5)) [1 2 3]))))
+          (check c (match (not-empty (map inc [1 2])) (nil false) ((some l) (= (sum l) 5))))
+          (check c (nil? (not-empty (rest [1]))))
+          (check c (match (not-empty (rest [1 2 3])) (nil false) ((some r) (= (sum r) 5))))
+          (check c (match (not-empty [[1] []]) (nil false) ((some g) (= (count g) 2))))
+          (check c (= @calls 0))
+          (check c (match (not-empty s) (nil false) ((some l) (= @calls 1))))
+          (check c (= @calls 1))
+          (check c (= (sum s) 30))
+          (check c (= @calls 2))
+          (checks-result c)))))

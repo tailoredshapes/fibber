@@ -1,0 +1,82 @@
+;; spec:   stdlib §8.1 item 2 (a differential test against a naive reference), §4.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: second fnext ffirst not-empty doall dorun not-every? product
+;; Each consumer of the part against a few-line loop over the prelude's own vec-count and vec-nth
+;; (the data structure is not under test here), on 300 seeded Vecs of 0 to 11 elements, with a
+;; seeded threshold and a seeded grid of up to three rows. Eight planted faults, one per kind of
+;; reference (an index off by one for second, fnext and ffirst, a one-element Vec taken for empty,
+;; the last element skipped by not-every? and by product, a doall that loses its last element, a
+;; dorun that counts one more): each runs the same sweep with its reference made wrong in that one
+;; way, against a second Checks, and the case fails unless every one of the eight found a difference.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+(defun vlen (v: (Vec i64)) -> i64 (vec-count v))
+(defun vat (v: (Vec i64) i: i64) -> i64 (vec-nth v i))
+
+(defun opt= (a: (Option i64) b: (Option i64)) -> bool
+  (match a
+    (nil (nil? b))
+    ((some x) (match b (nil false) ((some y) (= x y))))))
+
+;; element i, or nil past either end
+(defun ref-at (v: (Vec i64) i: i64) -> (Option i64)
+  (if (and (>= i 0) (< i (vlen v))) (some (vat v i)) nil))
+
+;; the first (len - drop) elements of v
+(defun ref-prefix (v: (Vec i64) drop: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty))) (if (< i (- (vlen v) drop)) (recur (+ i 1) (vec-conj acc (vat v i))) acc)))
+
+(defun ref-product (v: (Vec i64) drop: i64) -> i64
+  (loop ((i 0) (a 1)) (if (< i (- (vlen v) drop)) (recur (+ i 1) (* a (vat v i))) a)))
+
+;; whether an element among the first (len - skip) is at least thr
+(defun ref-fails (v: (Vec i64) thr: i64 skip: i64) -> bool
+  (loop ((i 0)) (if (< i (- (vlen v) skip)) (if (>= (vat v i) thr) true (recur (+ i 1))) false)))
+
+(defun ref-ffirst (g: (Vec (Vec i64)) idx: i64) -> (Option i64)
+  (if (> (vec-count g) 0) (ref-at (vec-nth g 0) idx) nil))
+
+(defun bump (v: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty))) (if (< i (vlen v)) (recur (+ i 1) (vec-conj acc (+ (vat v i) 1))) acc)))
+
+(defun grid (r: Rng) -> (Vec (Vec i64))
+  (let ((rows (rng-below r 4)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i rows) (recur (+ i 1) (vec-conj acc (rng-vec r (rng-below r 4) 9))) acc))))
+
+;; fault 0 is the right reference; faults 1 to 8 each break one reference
+(defun sweep (c: Checks seed: i64 fault: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (n 300)
+      (let ((v (rng-vec r (rng-below r 12) 4))
+            (thr (rng-below r 5))
+            (g (grid r))
+            (visits (cell 0)))
+        (let ((w (bump v))
+              (len (vlen v)))
+          (do (check c (opt= (second v) (ref-at v (if (= fault 1) 0 1))))
+              (check c (opt= (fnext v) (ref-at v (if (= fault 2) 2 1))))
+              (check c (match (not-empty v)
+                         (nil (<= len (if (= fault 3) 1 0)))
+                         ((some u) (and (> len (if (= fault 3) 1 0)) (= u v)))))
+              (check c (= (not-every? (fn (x) (< x thr)) v) (ref-fails v thr (if (= fault 4) 1 0))))
+              (check c (= (product w) (ref-product w (if (= fault 5) 1 0))))
+              (check c (opt= (ffirst g) (ref-ffirst g (if (= fault 6) 1 0))))
+              (check c (= (doall v) (ref-prefix v (if (= fault 7) (if (> len 0) 1 0) 0))))
+              (dorun (map (fn (x) (set! visits (+ @visits 1))) v))
+              (check c (= @visits (+ len (if (= fault 8) 1 0))))))))))
+
+(defun planted (c: Checks fault: i64) -> unit
+  (let ((p (checks)))
+    (do (sweep p 21 fault)
+        (check-detects c p))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (sweep c 21 0)
+        (check c (= (checks-made c) 2400))
+        (dotimes (k 8) (planted c (+ k 1)))
+        (checks-result c))))

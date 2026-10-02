@@ -1,0 +1,39 @@
+;; spec:   stdlib §4.4 (row doall), §2.1 rule 2 (a bound LSeq is realised by its first walk and read by every later one), tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: doall
+;; (doall c) walks c once and returns c. A lazy seq is realised by the walk, so `(doall (map f c))`
+;; calls f once per element, in order, before anything reads the result, and a later walk of it
+;; calls f zero more times; nothing runs before the doall asks. Any other collection comes back as
+;; it was (decided here: a generic identity needs no instance, so the walk is paid there, O(n), and
+;; has no other effect): a Vec, a List, a string, an Option, a Range.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (log (cell (vec-empty)))
+        (empty: (Vec i64) (vec-empty)))
+    (let ((s (map (fn (x) (do (set! calls (+ @calls 1)) (set! log (vec-conj @log x)) (* x 2))) [1 2 3 4])))
+      (do (check c (= @calls 0))
+          (let ((d (doall s)))
+            (do (check c (= @calls 4))
+                (check c (= @log [1 2 3 4]))
+                (check c (= (sum d) 20))
+                (check c (= (sum d) 20))
+                (check c (= (count d) 4))
+                (check c (= (reduce (fn (a x) (+ a x)) 0 d) 20))
+                (check c (= @calls 4))
+                (check c (= (to-vec d) [2 4 6 8]))
+                (check c (= @calls 4))))
+          (check c (= (doall [1 2 3]) [1 2 3]))
+          (check c (= (doall empty) empty))
+          (check c (= (doall "héllo") "héllo"))
+          (check c (match (doall (some 5)) (nil false) ((some x) (= x 5))))
+          (check c (= (sum (doall (list 1 2 3))) 6))
+          (check c (= (sum (doall (Range 0 5 1))) 10))
+          (check c (= (count (doall (filter (fn (x) (do (set! calls (+ @calls 1)) (> x 2))) [1 2 3 4]))) 2))
+          (check c (= @calls 8))
+          (checks-result c)))))

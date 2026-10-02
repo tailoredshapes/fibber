@@ -1,0 +1,41 @@
+;; spec:   stdlib §2.1 rules 2 and 3 (a consumer borrows its collection), ownership.md, tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: second ffirst fnext not-empty doall dorun not-every?
+;; With strings and Vecs of Vecs as elements, the consumers hand back or look at the very elements
+;; the source holds and the source is used again afterwards: nothing is freed twice or early, and the
+;; audit finds every object released once. max-key-pair takes its two elements owned and answers one
+;; of them; some-p answers the payload its predicate made.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun len-of (s: str) -> i64 (str-len s))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (names ["ann" "bob" "cy" "di"])
+        (grid [["x" "y"] ["z"] []]))
+    (do (check c (match (second names) ((some s) (= s "bob")) (nil false)))
+        (check c (match (fnext names) ((some s) (= s "bob")) (nil false)))
+        (check c (match (ffirst grid) ((some s) (= s "x")) (nil false)))
+        (check c (match (second grid) ((some g) (= (count g) 1)) (nil false)))
+        (check c (match (not-empty names) ((some v) (= (count v) 4)) (nil false)))
+        (check c (match (not-empty grid) ((some g) (= (count g) 3)) (nil false)))
+        (check c (= (count (doall names)) 4))
+        (check c (= (count (doall grid)) 3))
+        (dorun names)
+        (dorun grid)
+        (check c (not-every? (fn (s) (> (str-len s) 2)) names))
+        (check c (not-every? (fn (g) (> (count g) 0)) grid))
+        (check c (match (some-p (fn (s) (if (= (str-len s) 2) (some (str-concat s "!")) nil)) names) ((some s) (= s "cy!")) (nil false)))
+        (check c (= (max-key-pair len-of (str-concat "a" "bc") "de") "abc"))
+        (check c (= (min-key-pair len-of (str-concat "a" "bc") "de") "de"))
+        (check c (= (max-key-pair len-of (str-concat "a" "bcd") "de") "abcd"))
+        (check c (= (max-key-pair count ["p" "q"] ["r"]) ["p" "q"]))
+        (check c (= (count names) 4))
+        (check c (= (count grid) 3))
+        (check c (= (nth names 0) "ann"))
+        (check c (= (nth names 3) "di"))
+        (check c (= (count (nth grid 0)) 2))
+        (checks-result c))))

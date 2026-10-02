@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.4 (row not-every?), §2.3 (Truthy), tranche 2 plan Y4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: not-every?
+;; (not-every? p c) is true when some element fails p: the complement of every?. The predicate may
+;; answer a bool or an Option (nil is false, a value is true), as Clojure's `(not-every? #(get m %) ks)`;
+;; the walk stops at the first failure, so a source that never ends is fine (a Range of step 0 repeats
+;; its start), and the predicate has been called once per element up to there. An empty collection is
+;; every?-vacuous, so not-every? of it is false.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+(defun big (x: i64) -> (Option i64) (if (> x 2) (some (* x 2)) nil))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (m (assoc (assoc (map-empty) 1 10) 2 0))
+        (empty: (Vec i64) (vec-empty)))
+    (do (check c (not-every? even? [2 4 5]))
+        (check c (not (not-every? even? [2 4 6])))
+        (check c (not (not-every? even? empty)))
+        (check c (not-every? even? [1]))
+        (check c (not-every? even? (list 2 3)))
+        (check c (not-every? even? (map inc [1 3 4])))
+        (check c (not (not-every? even? (Range 0 10 2))))
+        (check c (not-every? (fn (k) (get m k)) [1 2 3]))
+        (check c (not (not-every? (fn (k) (get m k)) [1 2])))
+        (check c (not-every? big [3 2 5]))
+        (check c (not (not-every? big [3 4 5])))
+        (check c (not-every? even? (Node (Node Leaf 2 Leaf) 4 (Node Leaf 5 Leaf))))
+        (check c (not (not-every? (fn (ch) (= ch \a)) "")))
+        (check c (not-every? (fn (ch) (= ch \a)) "aab"))
+        (check c (not-every? (fn (x) (do (set! calls (+ @calls 1)) (< x 5))) [1 2 9 3 4 5]))
+        (check c (= @calls 3))
+        (check c (not-every? (fn (x) (< x 0)) (Range 1 2 0)))
+        (checks-result c))))

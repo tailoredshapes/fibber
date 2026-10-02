@@ -1,0 +1,77 @@
+;; spec:   stdlib §8.1 item 2 (a differential test against a naive reference), §2.3 (some-p), §4.4 (rows max-key min-key)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; some-p and the key pairs against loops over vec-count and vec-nth, on 300 seeded Vecs of 0 to 11
+;; elements below 20 and a seeded threshold. some-p with a bool predicate answers `(some true)` when
+;; some element is at least the threshold and nil otherwise; with an Option predicate it answers the
+;; payload of the first hit; the predicate has been called once per element up to the first hit. The
+;; key pairs, folded over the Vec by reduce1 with the key `x mod 5` (many ties, elements that differ),
+;; answer the last element of the largest key for max and the last of the smallest for min, as
+;; Clojure's max-key and min-key. Five planted faults, each a reference wrong in one way (the last hit
+;; instead of the first, a payload one too large, a call count one too high, and the first of equal
+;; keys winning for max and for min), each run against a second Checks that must find a difference.
+(ns main (:use fib.core fib.seq tl.rng tl.check))
+
+(defun vlen (v: (Vec i64)) -> i64 (vec-count v))
+(defun vat (v: (Vec i64) i: i64) -> i64 (vec-nth v i))
+
+(defun opt= (a: (Option i64) b: (Option i64)) -> bool
+  (match a
+    (nil (nil? b))
+    ((some x) (match b (nil false) ((some y) (= x y))))))
+
+;; the index of the first element at least thr (the last one, when `last` is true), or -1
+(defun ref-hit (v: (Vec i64) thr: i64 last: bool) -> i64
+  (loop ((i 0) (found -1))
+    (if (< i (vlen v))
+        (recur (+ i 1) (if (>= (vat v i) thr) (if (or last (< found 0)) i found) found))
+        found)))
+
+(defun key (x: i64) -> i64 (rem x 5))
+
+;; the index of the element with the largest (or smallest) key; of equal keys the last, or the first when `first`
+(defun ref-extreme (v: (Vec i64) max: bool first: bool) -> i64
+  (loop ((i 1) (best 0))
+    (if (< i (vlen v))
+        (let ((better (if max (> (key (vat v i)) (key (vat v best))) (< (key (vat v i)) (key (vat v best)))))
+              (equal (= (key (vat v i)) (key (vat v best)))))
+          (recur (+ i 1) (if (or better (and equal (not first))) i best)))
+        best)))
+
+(defun at-or-nil (v: (Vec i64) i: i64 add: i64) -> (Option i64)
+  (if (< i 0) nil (some (+ (vat v i) add))))
+
+(defun sweep (c: Checks seed: i64 fault: i64) -> unit
+  (let ((r (rng seed)))
+    (dotimes (n 300)
+      (let ((v (rng-vec r (rng-below r 12) 20))
+            (thr (rng-below r 20))
+            (calls (cell 0)))
+        (let ((hit (ref-hit v thr (= fault 1)))
+              (len (vlen v)))
+          (do (check c (= (match (some-p (fn (x) (>= x thr)) v) (nil false) ((some b) b)) (>= (ref-hit v thr (= fault 1)) 0)))
+              (check c (opt= (some-p (fn (x) (if (>= x thr) (some (* x 3)) nil)) v)
+                             (if (< hit 0) nil (some (+ (* (vat v hit) 3) (if (= fault 2) 1 0))))))
+              (check c (match (some-p (fn (x) (do (set! calls (+ @calls 1)) (>= x thr))) v)
+                         (nil (= @calls (+ len (if (= fault 3) 1 0))))
+                         ((some _) (= @calls (+ (ref-hit v thr false) 1)))))
+              (if (> len 0)
+                  (do (check c (opt= (reduce1 (fn (a x) (max-key-pair key a x)) v)
+                                     (some (vat v (ref-extreme v true (= fault 4))))))
+                      (check c (opt= (reduce1 (fn (a x) (min-key-pair key a x)) v)
+                                     (some (vat v (ref-extreme v false (= fault 5)))))))
+                  ())))))))
+
+(defun planted (c: Checks fault: i64) -> unit
+  (let ((p (checks)))
+    (do (sweep p 33 fault)
+        (check-detects c p))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (sweep c 33 0)
+        (dotimes (k 5) (planted c (+ k 1)))
+        (check c (> (checks-made c) 900))
+        (checks-result c))))
