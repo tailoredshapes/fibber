@@ -1,33 +1,299 @@
-;; compiler/types/infer/call.fib: calls, instantiation and constructors (package P11).
+;; compiler/types/infer/call.fib: calls, instantiation and constructors (package P11a).
 ;; Replaces crates/fibref/src/types/infer/call.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
-;; The mutual recursion of `cx-call` and `cx-infer` (infer/expr.rs): `cx-call` and the pattern functions take `infer` as a :borrow function parameter
-;; (plan section 2), P11 decides the final signatures.
+;;
+;; Globals and calls (spec/types.md §2.1, §2.2): instantiating schemes, `&`
+;; positions, constants that are not functions, annotations. A `Cx` method is
+;; `cx-NAME`. The mutual recursion of `call` and `infer` (infer/expr.rs) is cut
+;; by `infer`, a borrowed function parameter that types.infer.expr passes as
+;; `cx-infer` (plan section 2; `cx-call` takes it last). `amp-not-cell` is
+;; infer/expr.rs's, here so that call need not depend on expr.
 (ns types.infer.call
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.annot types.builtins types.infer.cx types.infer.unify))
 
-;; Rust: infer/call.rs:54 ann
+;; A function's signature at a call: parameter types, `&` flags, names, and
+;; whether the function is the library's (§7 D1 says what its arity errors
+;; may add).
+(defstruct Sig
+  (params: (Vec Ty) amps: (Vec bool) names: (Vec str) ret: Ty name: str library: bool))
+
+;; Where a global's type comes from: its scheme (with its name and, for a
+;; method, its index), a monomorphic SCC member's signature, or nowhere (a
+;; value).
+(defenum Source
+  (SrScheme scheme: Scheme name: str method: (Option i64))
+  (SrMono sig: Sig)
+  SrValue)
+
+;; The words `; use X` a library function's arity error ends with when the
+;; call has the arguments of its stand-in, else nothing: the stand-in a library
+;; function has for the arity a call wrote, until arity overloading lands
+;; (stdlib §7 L1, diagnostic D1). `(get m k 0)` is `get takes 2 argument(s),
+;; got 3; use get-or`.
+(defun stand-in-hint :private (name: str found: i64) -> str
+  (cond ((and (= name "get") (= found 3)) "; use get-or")
+        ((and (= name "nth") (= found 3)) "; use nth-or")
+        ((and (= name "reduce") (= found 2)) "; use reduce1")
+        ((and (= name "sort") (= found 2)) "; use sort-with")
+        ((and (= name "range") (= found 3)) "; use range-by")
+        (else "")))
+
+;; Rust: infer/call.rs:54 ann. Converts an annotation in the current
+;; definition: named variables are its rigid variables, omitted colours fresh
+;; colour variables.
 (defun cx-ann (cx: Cx a: TypeAnn pos: Pos) -> (Result Ty TypeError)
-  (trap "todo: cx-ann"))
+  (let ((u (. cx u))
+        (env (RigidEnv (. u rigid-map) (. u rigid-names)
+                       (fn () (store-fresh-colour (. cx st))) (. u rigid-colours))))
+    (ann-to-ty a env pos)))
 
-;; Rust: infer/call.rs:68 instantiate
+;; `type argument a of f`.
+(defun send-root :private (s: Scheme t: Ty who: str) -> str
+  (match t
+    ((TGen i)
+     (str-join ["type argument "
+                (if (< i (count (. s var-names))) (nth (. s var-names) i) (str-join ["t" (show i)]))
+                " of " who]))
+    (_ (str-join ["a type argument of " who]))))
+
+;; The deferred constraint for the predicate `i` of the scheme at this use:
+;; the dispatch constraint of a method call is the first.
+(defun inst-pred-kind :private (s: Scheme p: Pred i: i64 who: str dispatch: (Option i64)) -> DKind
+  (match p
+    ((PProto q args) (DkProto q args dispatch))
+    ((PSend t) (DkSend t [(send-root s (match (nth (. s preds) i) ((PSend t0) t0) (_ (ty-unit))) who)]))
+    ((PObject t) (DkObject t who))
+    ((PWeakable t) (DkWeakable t))))
+
+;; The colour constraint of a scheme's bound at this use.
+(defun inst-colour-bound :private (cx: Cx b: ColourBound who: str pos: Pos) -> unit
+  (match b
+    ((BFlow a c)
+     (set! (. (. cx u) colours) (conj @(. (. cx u) colours) (ColourCon a c nil nil pos))))
+    ((BCaps k t)
+     (set! (. (. cx u) caps)
+           (conj @(. (. cx u) caps)
+                 (CapsCon k t (str-join ["a capture of a closure made by " who]) pos))))))
+
+;; Rust: infer/call.rs:68 instantiate. Instantiates `s` for the use `site` of
+;; `who`, emitting its context and colour constraints.
 (defun cx-instantiate (cx: Cx s: Scheme site: i64 who: str pos: Pos method: (Option i64)) -> Ty
-  (trap "todo: cx-instantiate"))
+  (let ((tys (mapv (fn (i: i64) (cx-fresh cx)) (range (. s n-vars))))
+        (colours (mapv (fn (i: i64) (store-fresh-colour (. cx st))) (range (. s n-colours))))
+        (inst (scheme-instantiate-with s tys colours)))
+    (do (doseq [i (range (count (. inst preds)))]
+          (let ((dispatch (if (= i 0) method nil)))
+            (cx-defer cx (inst-pred-kind s (nth (. inst preds) i) i who dispatch) pos
+                      (if (nil? dispatch) nil (some site)))))
+        (doseq [b (. inst colour-bounds)] (inst-colour-bound cx b who pos))
+        (set! (. (. cx t) instantiations)
+              (assoc @(. (. cx t) instantiations) site (Instantiation tys colours)))
+        (set! (. (. cx u) insts) (conj @(. (. cx u) insts) site))
+        (. inst ty))))
 
-;; Rust: infer/call.rs:118 global_value
+;; Rust: infer/call.rs:118 global_value. The type of a global name used as a
+;; value (§2.1).
 (defun cx-global-value (cx: Cx id: i64 r: GlobalRef pos: Pos) -> (Result Ty TypeError)
-  (trap "todo: cx-global-value"))
+  (try-let ((sig (cx-signature cx id r pos)))
+    (if-some [sg sig]
+      (if (nil? (find-first (fn (a: bool) a) (. sg amps)))
+          (Ok (TFn CSend (. sg params) (. sg ret)))
+          (Err (type-error AmpFunctionValue pos "function with & parameters is not a value")))
+      (match r
+        ((GDef d)
+         (match (get @(. (. cx env) defs) d)
+           ((some t) (Ok t))
+           (nil (Err (type-error-other pos
+                       (str-join ["def " (. (g-def (. cx g) d) name) " is not typed yet"]))))))
+        ((GCtor t v)
+         (Ok (cx-instantiate cx (ctor-scheme (. cx g) t v) id (. (g-ty (. cx g) t) name) pos nil)))
+        (_ (Err (type-error-other pos "internal: global without a type")))))))
 
-;; Rust: infer/call.rs:246 call
-(defun cx-call (cx: Cx e: Expr head: Expr args: (Vec Arg)) -> (Result Ty TypeError)
-  (trap "todo: cx-call"))
+;; A signature of a monomorphic SCC member, with the library flag of its use.
+(defun mono-sig :private (m: MonoSig name: str) -> Sig
+  (Sig (. m params) (. m amps) (. m names) (. m ret) name false))
 
-;; Rust: infer/call.rs:370
+;; Where a global's type comes from: its scheme (with its name and, for a
+;; method, its index), or a monomorphic SCC member's signature.
+(defun cx-source :private (cx: Cx r: GlobalRef pos: Pos) -> (Result Source TypeError)
+  (let ((g (. cx g)) (u (. cx u)))
+    (match r
+      ((GFun f)
+       (let ((name (. (g-fun g f) name)))
+         (if-some [s (get @(. u poly) f)]
+           (do (set! (. u poly-used) (conj @(. u poly-used) f))
+               (Ok (SrScheme s name nil)))
+           (if-some [m (get @(. u mono) f)]
+             (Ok (SrMono (mono-sig m name)))
+             (match (get @(. (. cx env) funs) f)
+               ((some s) (Ok (SrScheme s name nil)))
+               (nil (Err (type-error-other pos (str-join ["internal: " name " has no scheme"])))))))))
+      ((GMethod p m)
+       (let ((md (nth (. (g-proto g p) methods) m)))
+         (Ok (SrScheme (. md scheme) (. md name) (some m)))))
+      ((GBuiltin b)
+       (Ok (SrScheme (table-get (. g builtin-schemes) b) (. (nth (builtin-table) b) name) nil)))
+      ((GExtern x)
+       (let ((e (g-ext g x))) (Ok (SrScheme (scheme-mono (. e ty)) (. e name) nil))))
+      ((GCtor t v)
+       (if (ctor-is-fn g t v)
+           (Ok (SrScheme (ctor-scheme g t v) (variant-name g t v) nil))
+           (Ok SrValue)))
+      (_ (Ok SrValue)))))
+
+;; Whether the function or method `r` is the library's: defined in the prelude
+;; or in a module named `fib.*` (the loader's rule for the modules that are the
+;; library's own, `sees_implicit`). A program's own `get` is not, whatever its
+;; arity.
+(defun is-library :private (cx: Cx r: GlobalRef) -> bool
+  (let ((module (match r
+                  ((GFun f) (some (. (g-fun (. cx g) f) module)))
+                  ((GMethod p _) (some (. (g-proto (. cx g) p) module)))
+                  (_ nil))))
+    (match module
+      ((some m) (or (= m module-prelude) (starts-with? (g-module-name (. cx g) m) "fib.")))
+      (nil false))))
+
+;; A call of a function polymorphically recursive in the unit: recorded for
+;; the fixpoint of infer/polyrec.rs.
+(defun note-poly-call :private (cx: Cx id: i64 r: GlobalRef pos: Pos) -> unit
+  (match r
+    ((GFun callee)
+     (if-some [caller @(. (. cx u) cur)]
+       (if (some? (get @(. (. cx u) poly) callee))
+           (set! (. (. cx u) poly-calls)
+                 (conj @(. (. cx u) poly-calls) (PolyCall caller callee id pos)))
+           ())
+       ()))
+    (_ ())))
+
+;; The signature of a global function, instantiated; `None` for a `def` or a
+;; constructor that is a value.
+(defun cx-signature :private (cx: Cx id: i64 r: GlobalRef pos: Pos) -> (Result (Option Sig) TypeError)
+  (try-let ((src (cx-source cx r pos)))
+    (match src
+      ((SrMono sig)
+       (Ok (some (Sig (. sig params) (. sig amps) (. sig names) (. sig ret) (. sig name)
+                      (is-library cx r)))))
+      ((SrValue) (Ok nil))
+      ((SrScheme scheme name method)
+       (let ((ty (cx-instantiate cx scheme id name pos method)))
+         (do (note-poly-call cx id r pos)
+             (match ty
+               ((TFn _ params ret)
+                (Ok (some (Sig params
+                               (if (empty? (. scheme amps)) (mapv (fn (p: Ty) false) params) (. scheme amps))
+                               (. scheme params) ret name (is-library cx r)))))
+               (_ (Err (type-error-other pos (str-join ["internal: " name " is not a function"])))))))))))
+
+;; A constant is not called: `N is a constant, not a function; write N`.
+(defun check-ctor-called :private (cx: Cx head: Expr r: GlobalRef) -> (Result unit TypeError)
+  (match r
+    ((GCtor t v)
+     (if (ctor-is-fn (. cx g) t v)
+         (Ok ())
+         (let ((name (variant-name (. cx g) t v)))
+           (Err (type-error ConstantCalled (. head pos)
+                  (str-join [name " is a constant, not a function; write " name]))))))
+    (_ (Ok ()))))
+
+;; Rust: infer/call.rs:246 call. A call `(head args..)` (§2.2): a global
+;; function applies by its signature; anything else is inferred as a function
+;; of fresh parameters.
+(defun cx-call (cx: Cx e: Expr head: Expr args: (Vec Arg) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow) -> (Result Ty TypeError)
+  (match (. head kind)
+    ((EGlobal r)
+     (try-let ((_ (check-ctor-called cx head r))
+               (sig (cx-signature cx (. head id) r (. head pos))))
+       (if-some [sg sig]
+         (do (cx-record cx (. head id) (TFn CSend (. sg params) (. sg ret)))
+             (apply-sig cx e sg args infer))
+         (call-value cx e head args infer))))
+    (_ (call-value cx e head args infer))))
+
+;; The head is an expression: it has a function type of fresh parameters.
+(defun call-value :private (cx: Cx e: Expr head: Expr args: (Vec Arg) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow) -> (Result Ty TypeError)
+  (try-let ((ht (infer cx head)))
+    (let ((params (mapv (fn (a: Arg) (cx-fresh cx)) args))
+          (ret (cx-fresh cx))
+          (k (store-fresh-colour (. cx st))))
+      (try-let ((_ (cx-unify cx ht (TFn k params ret) (. head pos))))
+        (apply-sig cx e
+          (Sig params (mapv (fn (a: Arg) false) args)
+               (mapv (fn (i: i64) (show (+ i 1))) (range (count args))) ret "the function" false)
+          args infer)))))
+
+;; The arguments against the signature: by count, then one by one.
+(defun apply-sig :private (cx: Cx e: Expr sig: Sig args: (Vec Arg) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow) -> (Result Ty TypeError)
+  (if (not (= (count (. sig params)) (count args)))
+      (Err (type-error-other (. e pos)
+             (str-join [(. sig name) " takes " (show (count (. sig params))) " argument(s), got "
+                        (show (count args))
+                        (if (. sig library) (stand-in-hint (. sig name) (count args)) "")])))
+      (loop ((i 0))
+        (if (< i (count args))
+            (try-let ((_ (apply-arg cx sig i (nth args i) infer)))
+              (recur (+ i 1)))
+            (Ok (. sig ret))))))
+
+;; One argument: an expression flows into its parameter; an `&x` is a cell of
+;; the parameter's type; the two are not exchangeable.
+(defun apply-arg :private (cx: Cx sig: Sig i: i64 a: Arg infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow) -> (Result unit TypeError)
+  (let ((pname (if (< i (count (. sig names))) (nth (. sig names) i) (show (+ i 1))))
+        (amp (nth (. sig amps) i))
+        (param (nth (. sig params) i)))
+    (match a
+      ((ArgExpr x)
+       (if amp
+           (Err (type-error AmpPosition (. x pos)
+                  (str-join ["parameter " pname " of " (. sig name) " is &; pass &x"])))
+           (try-let ((t (infer cx x)))
+             (cx-flow cx t param (. x pos)))))
+      ((ArgAmp b pos)
+       (if amp
+           (try-let ((t (cx-binding cx b pos)))
+             (match (cx-unify cx t (ty-cell param) pos)
+               ((Ok _) (Ok ()))
+               ((Err _) (Err (amp-not-cell pos)))))
+           (Err (type-error AmpPosition pos
+                  (str-join ["parameter " pname " of " (. sig name) " is not &; pass x"]))))))))
+
+;; `& argument must be a cell variable` (§2.14). Rust: infer/expr.rs:369.
+(defun amp-not-cell (pos: Pos) -> TypeError
+  (type-error AmpArgument pos "& argument must be a cell variable"))
+
+;; ---- constructors
+
+;; Rust: infer/call.rs:370 ctor_is_fn. Whether a constructor is called (a
+;; struct, a variant with fields).
 (defun ctor-is-fn (g: Globals t: i64 v: (Option i64)) -> bool
-  (trap "todo: ctor-is-fn"))
+  (match (. (g-ty g t) shape)
+    ((TsStruct _) (nil? v))
+    ((TsEnum vs) (if-some [i v] (and (< i (count vs)) (not (empty? (. (nth vs i) fields)))) false))))
 
-;; Rust: infer/call.rs:395
+(defun variant-name :private (g: Globals t: i64 v: (Option i64)) -> str
+  (match (. (g-ty g t) shape)
+    ((TsEnum vs) (if-some [i v] (if (< i (count vs)) (. (nth vs i) name) "") (. (g-ty g t) name)))
+    (_ (. (g-ty g t) name))))
+
+;; The fields a constructor takes.
+(defun ctor-fields :private (def: TypeDef v: (Option i64)) -> (Vec FieldDef)
+  (match (. def shape)
+    ((TsStruct fs) (if (nil? v) fs []))
+    ((TsEnum vs) (if-some [i v] (if (< i (count vs)) (. (nth vs i) fields) []) []))))
+
+;; Rust: infer/call.rs:395 ctor_scheme. `N : ∀ā. (fn :send (T₁ ..) (N ā))`, or
+;; `∀ā. (N ā)` for a field-less variant (§2.7). Colour parameter `i` is
+;; `(CGen i)` in the field types and the result (§1.3).
 (defun ctor-scheme (g: Globals t: i64 v: (Option i64)) -> Scheme
-  (trap "todo: ctor-scheme"))
+  (let ((def (g-ty g t))
+        (result (ty-nominal t (typedef-head-args def)))
+        (fields (ctor-fields def v))
+        (n (count (. def params)))
+        (ncol (if (empty? (. def colours)) 0 n)))
+    (if (ctor-is-fn g t v)
+        (Scheme n ncol (. def params) [] []
+                (TFn CSend (mapv (fn (f: FieldDef) (. f ty)) fields) result)
+                (mapv (fn (f: FieldDef) false) fields)
+                (mapv (fn (f: FieldDef) (. f name)) fields))
+        (Scheme n ncol (. def params) [] [] result [] []))))

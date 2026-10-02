@@ -1,19 +1,333 @@
-;; compiler/types/infer/expr.fib: expressions (package P11).
-;; Replaces crates/fibref/src/types/infer/expr.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; compiler/types/infer/expr.fib: constraint generation for expressions (package P11b).
+;; Replaces crates/fibref/src/types/infer/expr.rs (spec/types.md §2), unifying eagerly
+;; (§3.5 step b). Calls and global names are in `call`, patterns in `pattern`.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `lit_type` and `amp_not_cell` live in types.infer.pattern and types.infer.call (P11a's
+;;   notes): pattern and call may not depend on this module.
+;; - `call` takes `infer` as a function parameter: `cx-infer` passes itself, wrapped in a
+;;   closure (the module cycle expr <-> call, plan section 2).
+;; - `for .. { ..? }` is a `loop` with `try-let`; `std::mem::take` of the loop stack is a read
+;;   of its Cell and a `set!` of `[]`; `unify(..).is_err()` is a `match` on the `Result`.
 (ns types.infer.expr
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.names types.infer.cx types.infer.unify types.infer.solve
+        types.infer.pattern types.infer.call))
 
-;; Rust: infer/expr.rs:13
-(defun lit-type (l: Lit) -> Ty
-  (trap "todo: lit-type"))
-
-;; Rust: infer/expr.rs:39 infer
+;; Rust: infer/expr.rs:39 infer. Infers the type of `e`, recording it.
+;;
+;; The worklist is retried after every call, field access and `@` (the forms that emit
+;; deferred constraints), so a constraint that cannot hold is reported at its form in
+;; evaluation order (§3.5) rather than at the end of the unit; acceptance does not depend on
+;; when it is retried.
 (defun cx-infer (cx: Cx e: Expr) -> (Result Ty TypeError)
-  (trap "todo: cx-infer"))
+  (try-let ((ty (infer-kind cx e)))
+    (do (cx-record cx (. e id) ty)
+        (if (and (infer-emits? (. e kind)) (not (empty? @(. (. cx u) deferred))))
+            (try-let ((_ (cx-solve-all cx))) (Ok ty))
+            (Ok ty)))))
 
-;; Rust: infer/expr.rs:369
-(defun amp-not-cell (pos: Pos) -> TypeError
-  (trap "todo: amp-not-cell"))
+(defun infer-emits? :private (k: ExprKind) -> bool
+  (match k
+    ((ECall _ _) true)
+    ((EField _ _ _) true)
+    ((EDeref _ _) true)
+    (_ false)))
+
+;; Rust: infer/expr.rs:53 infer_kind.
+(defun infer-kind :private (cx: Cx e: Expr) -> (Result Ty TypeError)
+  (let ((pos (. e pos)))
+    (match (. e kind)
+      ((ELit l) (Ok (lit-type l)))
+      ((ELocal b) (cx-binding cx b pos))
+      ((EGlobal r) (cx-global-value cx (. e id) r pos))
+      ((ECall head args) (cx-call cx e head args (fn (c: Cx x: Expr) (cx-infer c x))))
+      ((EFn lit) (infer-fn-lit cx e lit))
+      ((ELet bs body) (infer-let cx bs body))
+      ((EIf c t f) (infer-if cx c t f))
+      ((EDo steps) (infer-do cx steps))
+      ((EMatch s clauses) (infer-match cx s clauses))
+      ((ELoop vars body) (infer-loop cx vars body))
+      ((ERecur args) (infer-recur cx args pos))
+      ((EField x f text) (infer-field cx x f text pos))
+      ((EDeref place text) (infer-deref cx place text pos))
+      ((ESet place v) (infer-set cx place v pos))
+      ((ESetField b f v) (infer-set-field cx b f v pos))
+      ((EAsync body caps) (infer-async cx body caps pos))
+      ((EAwait x) (infer-await cx x pos))
+      ((EUnsafe b) (cx-infer cx b))
+      ((EQuote _) (infer-form-type cx pos))
+      ((EDyn p dets send x) (infer-dyn cx p dets send x pos))
+      ((EConvert op target x) (infer-convert cx op target x))
+      ((EConcat parts) (infer-concat cx parts pos)))))
+
+;; ---- conditions and branches
+
+;; Rust: infer/expr.rs:93 condition. The test of an `if` (so of `when`, `while`, `cond`,
+;; `and`, `or`, which expand to it) has type `bool`. A test of a primitive type that is not
+;; `bool` can never be false, which is the mistake a Clojure habit makes (`(if n ..)`,
+;; `(when s ..)`), so the error says that instead of `cannot unify i64 with bool` (stdlib §7
+;; D1). Any other type, `(Option T)` included, is the usual mismatch.
+(defun infer-condition :private (cx: Cx t: Ty pos: Pos) -> (Result unit TypeError)
+  (if (infer-always-true? (store-resolve (. cx st) t))
+      (Err (type-error Unify pos
+             (str-join ["a value of type " (cx-show cx t) " is always true; write the test"])))
+      (cx-unify cx t (ty-bool) pos)))
+
+(defun infer-always-true? :private (t: Ty) -> bool
+  (match t
+    ((TCon (KScalar s) _) (not (or (= s types.ty/SBool) (= s SUnit) (= s SPtr))))
+    ((TCon (KStr) _) true)
+    (_ false)))
+
+(defun infer-if :private (cx: Cx c: Expr t: Expr f: Expr) -> (Result Ty TypeError)
+  (try-let ((ct (cx-infer cx c))
+            (_ (infer-condition cx ct (. c pos))))
+    (let ((r (cx-fresh cx)))
+      (try-let ((_ (infer-branch cx r t))
+                (_ (infer-branch cx r f)))
+        (Ok r)))))
+
+;; A branch flows into the result `r` (a flow site, §3.2).
+(defun infer-branch :private (cx: Cx r: Ty b: Expr) -> (Result unit TypeError)
+  (try-let ((t (cx-infer cx b)))
+    (cx-flow cx t r (. b pos))))
+
+(defun infer-match :private (cx: Cx s: Expr clauses: (Vec Clause)) -> (Result Ty TypeError)
+  (try-let ((st (cx-infer cx s)))
+    (let ((r (cx-fresh cx)))
+      (loop ((i 0))
+        (if (< i (count clauses))
+            (try-let ((_ (infer-clause cx (nth clauses i) st r)))
+              (recur (+ i 1)))
+            (Ok r))))))
+
+(defun infer-clause :private (cx: Cx c: Clause st: Ty r: Ty) -> (Result unit TypeError)
+  (try-let ((_ (cx-check-pattern cx (. c pat) st))
+            (_ (match (. c guard)
+                 ((some g) (try-let ((gt (cx-infer cx g)))
+                             (cx-unify cx gt (ty-bool) (. g pos))))
+                 (nil (Ok ()))))
+            (_ (infer-branch cx r (. c body))))
+    (Ok ())))
+
+;; ---- binding forms
+
+(defun infer-let :private (cx: Cx bs: (Vec LetBind) body: Expr) -> (Result Ty TypeError)
+  (loop ((i 0))
+    (if (< i (count bs))
+        (let ((b (nth bs i)))
+          (try-let ((t (cx-infer cx (. b init)))
+                    (t2 (cx-let-binding-type cx (. b pat) t (. (. b init) pos)))
+                    (_ (cx-check-pattern cx (. b pat) t2)))
+            (recur (+ i 1))))
+        (cx-infer cx body))))
+
+(defun infer-do :private (cx: Cx steps: (Vec Expr)) -> (Result Ty TypeError)
+  (loop ((i 0) (last (ty-unit)))
+    (if (< i (count steps))
+        (try-let ((t (cx-infer cx (nth steps i))))
+          (recur (+ i 1) t))
+        (Ok last))))
+
+;; ---- loops
+
+(defun infer-loop :private (cx: Cx vars: (Vec LoopBind) body: Expr) -> (Result Ty TypeError)
+  (try-let ((tys (infer-loop-vars cx vars)))
+    (do (set! (. (. cx u) loops) (conj @(. (. cx u) loops) tys))
+        (let ((r (cx-infer cx body)))
+          (do (set! (. (. cx u) loops) (pop @(. (. cx u) loops)))
+              r)))))
+
+;; The variables of a `loop`: each initial value flows into its (annotated or fresh) type.
+(defun infer-loop-vars :private (cx: Cx vars: (Vec LoopBind)) -> (Result (Vec Ty) TypeError)
+  (loop ((i 0) (tys []))
+    (if (< i (count vars))
+        (let ((lb (nth vars i)))
+          (try-let ((t (cx-infer cx (. lb init)))
+                    (ann (cx-binding-ann cx (. lb binding) (. (. lb init) pos))))
+            (let ((v (match ann ((some a) a) (nil (cx-fresh cx)))))
+              (try-let ((_ (cx-flow cx t v (. (. lb init) pos))))
+                (do (cx-bind cx (. lb binding) v)
+                    (recur (+ i 1) (conj tys v)))))))
+        (Ok tys))))
+
+(defun infer-recur :private (cx: Cx args: (Vec Expr) pos: Pos) -> (Result Ty TypeError)
+  (match (peek @(. (. cx u) loops))
+    (nil (Err (type-error-other pos "recur outside loop")))
+    ((some vars)
+     (if (= (count vars) (count args))
+         (loop ((i 0))
+           (if (< i (count args))
+               (let ((a (nth args i)))
+                 (try-let ((t (cx-infer cx a))
+                           (_ (cx-flow cx t (nth vars i) (. a pos))))
+                   (recur (+ i 1))))
+               (Ok (cx-fresh cx))))
+         (Err (type-error-other pos
+                (str-join ["recur takes " (show (count vars)) " argument(s), got "
+                           (show (count args))])))))))
+
+;; ---- functions
+
+;; Rust: infer/expr.rs:200 fn_lit. The parameters and the result are annotated or fresh, the
+;; body flows into the result, and every capture constrains the colour of the function.
+(defun infer-fn-lit :private (cx: Cx e: Expr lit: FnLit) -> (Result Ty TypeError)
+  (let ((colour (store-fresh-colour (. cx st))))
+    (try-let ((params (infer-fn-params cx (. lit params) (. e pos)))
+              (ret (match (. lit ret)
+                     ((some a) (cx-ann cx a (. e pos)))
+                     (nil (Ok (cx-fresh cx))))))
+      (let ((ty (TFn colour params ret)))
+        (do (when-some [name (. lit name)] (cx-bind cx name ty))
+            (try-let ((body (cx-infer cx (. lit body)))
+                      (_ (cx-flow cx body ret (. (. lit body) pos)))
+                      (_ (infer-captures cx colour (. lit captures) (. e pos))))
+              (do (set! (. (. cx u) fn-lits) (conj @(. (. cx u) fn-lits) (Pair (. e id) colour)))
+                  (Ok ty))))))))
+
+(defun infer-fn-params :private (cx: Cx params: (Vec FnParam) pos: Pos) -> (Result (Vec Ty) TypeError)
+  (loop ((i 0) (tys []))
+    (if (< i (count params))
+        (let ((p (nth params i)))
+          (try-let ((t (match (. p ann)
+                         ((some a) (cx-ann cx a pos))
+                         (nil (Ok (cx-fresh cx))))))
+            (do (cx-bind cx (. p binding) t)
+                (recur (+ i 1) (conj tys t)))))
+        (Ok tys))))
+
+;; `colour ⊒ Caps{ty}` for each captured binding.
+(defun infer-captures :private (cx: Cx colour: Colour caps: (Vec i64) pos: Pos) -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (< i (count caps))
+        (let ((c (nth caps i)))
+          (try-let ((ct (cx-binding cx c pos)))
+            (do (set! (. (. cx u) caps)
+                      (conj @(. (. cx u) caps)
+                            (CapsCon colour ct (str-join ["closure capture " (. (g-binding (. cx g) c) name)]) pos)))
+                (recur (+ i 1)))))
+        (Ok ()))))
+
+;; ---- fields, cells, tasks
+
+;; `(. e f)`: `HasField(T, f, R)` (§2.5).
+(defun infer-field :private (cx: Cx x: Expr f: str text: str pos: Pos) -> (Result Ty TypeError)
+  (try-let ((t (cx-infer cx x)))
+    (let ((r (cx-fresh cx)))
+      (do (cx-defer cx (DkField t f r text) pos nil)
+          (Ok r)))))
+
+(defun infer-await :private (cx: Cx x: Expr pos: Pos) -> (Result Ty TypeError)
+  (try-let ((t (cx-infer cx x)))
+    (let ((r (cx-fresh cx)))
+      (try-let ((_ (cx-unify cx t (ty-task r) pos)))
+        (Ok r)))))
+
+(defun infer-deref :private (cx: Cx place: Place text: str pos: Pos) -> (Result Ty TypeError)
+  (match place
+    ((PlAmp b)
+     (try-let ((t (cx-binding cx b pos)))
+       (let ((a (cx-fresh cx)))
+         (try-let ((_ (cx-unify cx t (ty-cell a) pos)))
+           (Ok a)))))
+    ((PlExpr x)
+     (try-let ((t (cx-infer cx x)))
+       (let ((r (cx-fresh cx)))
+         (do (cx-defer cx (DkDeref t r text) pos nil)
+             (Ok r)))))))
+
+(defun infer-set :private (cx: Cx place: Place v: Expr pos: Pos) -> (Result Ty TypeError)
+  (try-let ((target (match place
+                      ((PlAmp b) (cx-binding cx b pos))
+                      ((PlExpr x) (cx-infer cx x)))))
+    (let ((a (cx-fresh cx)))
+      (try-let ((_ (cx-unify cx target (ty-cell a) pos))
+                (vt (cx-infer cx v))
+                (_ (cx-flow cx vt a (. v pos))))
+        (Ok (ty-unit))))))
+
+(defun infer-set-field :private (cx: Cx b: i64 f: str v: Expr pos: Pos) -> (Result Ty TypeError)
+  (try-let ((t (cx-binding cx b pos)))
+    (let ((s (cx-fresh cx)))
+      (match (cx-unify cx t (ty-cell s) pos)
+        ((Err _) (Err (amp-not-cell pos)))
+        ((Ok _)
+         (let ((ft (cx-fresh cx)))
+           (do (cx-defer cx (DkField s f ft (str-join ["@" (. (g-binding (. cx g) b) name)])) pos nil)
+               (try-let ((vt (cx-infer cx v))
+                         (_ (cx-flow cx vt ft (. v pos))))
+                 (Ok (ty-unit))))))))))
+
+;; An `async` block starts a new loop context: a `recur` cannot leave it. Its captures must
+;; be `Send`.
+(defun infer-async :private (cx: Cx body: Expr caps: (Vec i64) pos: Pos) -> (Result Ty TypeError)
+  (let ((saved @(. (. cx u) loops)))
+    (do (set! (. (. cx u) loops) [])
+        (let ((t (cx-infer cx body)))
+          (do (set! (. (. cx u) loops) saved)
+              (try-let ((ty t)
+                        (_ (infer-async-caps cx caps pos)))
+                (Ok (ty-task ty))))))))
+
+(defun infer-async-caps :private (cx: Cx caps: (Vec i64) pos: Pos) -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (< i (count caps))
+        (let ((c (nth caps i)))
+          (try-let ((ct (cx-binding cx c pos)))
+            (do (cx-defer cx
+                  (DkSend ct [(str-join ["async capture " (. (g-binding (. cx g) c) name)])]) pos nil)
+                (recur (+ i 1)))))
+        (Ok ()))))
+
+;; ---- forms, trait objects, conversions, concatenation
+
+(defun infer-form-type :private (cx: Cx pos: Pos) -> (Result Ty TypeError)
+  (match @(. (. cx g) form)
+    ((some f) (Ok (ty-nominal f [])))
+    (nil (Err (type-error-other pos "Form is not declared")))))
+
+;; `(dyn P e)`: the hidden type must be an object (and `Send` for `:send`, §2.15) and
+;; implement `P` at the determined types.
+(defun infer-dyn :private (cx: Cx p: i64 dets: (Vec TypeAnn) send: bool x: Expr pos: Pos) -> (Result Ty TypeError)
+  (try-let ((t (cx-infer cx x)))
+    (do (cx-defer cx (DkObject t "dyn") pos nil)
+        (when send (cx-defer cx (DkSend t []) pos nil))
+        (try-let ((dtys (infer-dyn-dets cx dets pos)))
+          (do (cx-defer cx (DkProto p (into [t] dtys) nil) pos nil)
+              (Ok (TCon (KDyn p send) dtys)))))))
+
+(defun infer-dyn-dets :private (cx: Cx dets: (Vec TypeAnn) pos: Pos) -> (Result (Vec Ty) TypeError)
+  (loop ((i 0) (dtys []))
+    (if (< i (count dets))
+        (try-let ((dt (cx-ann cx (nth dets i) pos)))
+          (recur (+ i 1) (conj dtys dt)))
+        (Ok dtys))))
+
+(defun infer-convert :private (cx: Cx op: ConvOp target: Scalar x: Expr) -> (Result Ty TypeError)
+  (try-let ((t (cx-infer cx x)))
+    (match op
+      ((CvFloatToFloat) (infer-convert-float cx t x target))
+      ((CvFloatToInt _) (infer-convert-float cx t x target))
+      (_ (match (g-proto-name (. cx g) module-builtin "Bits")
+           (nil (Err (type-error-other (. x pos) "no Bits protocol")))
+           ((some bits)
+            (do (cx-defer cx (DkProto bits [t] nil) (. x pos) nil)
+                (Ok (ty-scalar target)))))))))
+
+(defun infer-convert-float :private (cx: Cx t: Ty x: Expr target: Scalar) -> (Result Ty TypeError)
+  (do (cx-defer cx (DkFloat t) (. x pos) nil)
+      (Ok (ty-scalar target))))
+
+(defun infer-concat :private (cx: Cx parts: (Vec Expr) pos: Pos) -> (Result Ty TypeError)
+  (match @(. (. cx g) vec)
+    (nil (Err (type-error-other pos "concat needs the prelude's Vec")))
+    ((some vec)
+     (let ((vt (ty-nominal vec [(cx-fresh cx)])))
+       (loop ((i 0))
+         (if (< i (count parts))
+             (let ((p (nth parts i)))
+               (try-let ((t (cx-infer cx p))
+                         (_ (cx-unify cx t vt (. p pos))))
+                 (recur (+ i 1))))
+             (Ok vt)))))))

@@ -1,19 +1,140 @@
-;; compiler/types/infer/pattern.fib: patterns (package P11).
+;; compiler/types/infer/pattern.fib: patterns (package P11a).
 ;; Replaces crates/fibref/src/types/infer/pattern.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; Checking a pattern against the scrutinee's type (spec/types.md §2.6):
+;; `Γ ⊢ pat : S ⇝ Γ'`. A `Cx` method is `cx-NAME`; the deferred `[p..]`
+;; (`DkVecPat`) is settled in types.infer.solve (`cx-settle-vec-pattern`,
+;; `cx-tuple-arity`, which pattern.rs holds in Rust), because the solver and
+;; `default-vec-patterns` need them and pattern depends on call. `lit-type`
+;; is infer/expr.rs's; it is here so that pattern need not depend on expr
+;; (expr uses pattern): see scratchpad/m6/p11-notes.md.
 (ns types.infer.pattern
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.infer.cx types.infer.unify
+        types.infer.solve types.infer.call))
 
-;; Rust: infer/pattern.rs:16 binding_ann
+;; The type of a literal (Rust: infer/expr.rs:13 lit_type).
+(defun lit-type (l: Lit) -> Ty
+  (match l
+    ((LitInt _ w) (ty-scalar (match w ((I8) SI8) ((I16) SI16) ((I32) SI32) ((I64) SI64))))
+    ((LitFloat _ w) (ty-scalar (match w ((F32) SF32) ((F64) SF64))))
+    ((LitStr _) (ty-str))
+    ((LitChar _) (ty-scalar SChar))
+    ((LitBool _) (ty-bool))
+    ((LitKeyword _) (ty-scalar SKeyword))
+    ((LitUnit) (ty-unit))))
+
+;; Rust: infer/pattern.rs:16 binding_ann. The type the annotation of the
+;; `let` or `loop` binding `b` gives it (syntax §1.5), if it has one.
 (defun cx-binding-ann (cx: Cx b: i64 pos: Pos) -> (Result (Option Ty) TypeError)
-  (trap "todo: cx-binding-ann"))
+  (if-some [a (. (g-binding (. cx g) b) ann)]
+    (try-let ((ty (cx-ann cx a pos)))
+      (Ok (some ty)))
+    (Ok nil)))
 
-;; Rust: infer/pattern.rs:26 let_binding_type
+;; Rust: infer/pattern.rs:26 let_binding_type. The type a `let` pattern
+;; binds at: an annotated variable's annotation, which the initialiser's
+;; type `t` flows into as an argument's flows into an annotated parameter;
+;; else `t`.
 (defun cx-let-binding-type (cx: Cx p: Pattern t: Ty pos: Pos) -> (Result Ty TypeError)
-  (trap "todo: cx-let-binding-type"))
+  (match (. p kind)
+    ((PBind b)
+     (try-let ((ann (cx-binding-ann cx b pos)))
+       (match ann
+         ((some a) (try-let ((_ (cx-flow cx t a pos))) (Ok a)))
+         (nil (Ok t)))))
+    (_ (Ok t))))
 
-;; Rust: infer/pattern.rs:40 check_pattern
+;; Rust: infer/pattern.rs:40 check_pattern. Checks `p` against `s`, binding
+;; its variables.
 (defun cx-check-pattern (cx: Cx p: Pattern s: Ty) -> (Result unit TypeError)
-  (trap "todo: cx-check-pattern"))
+  (match (. p kind)
+    ((PWild) (Ok ()))
+    ((PBind b) (do (cx-bind cx b s) (Ok ())))
+    ((PLit l) (check-lit-pattern cx p l s))
+    ((PAs inner b) (do (cx-bind cx b s) (cx-check-pattern cx inner s)))
+    ((PVec subs rest) (check-vec-pattern cx p subs rest s))
+    ((PCtor t v subs) (check-ctor-pattern cx p t v subs s))))
+
+;; A literal has the scrutinee's type, which must have `Eq`.
+(defun check-lit-pattern :private (cx: Cx p: Pattern l: Lit s: Ty) -> (Result unit TypeError)
+  (let ((t (lit-type l)))
+    (try-let ((_ (cx-unify cx s t (. p pos))))
+      (if-some [eq (g-proto-name (. cx g) module-builtin "Eq")]
+        (do (cx-defer cx (DkProto eq [t] nil) (. p pos) nil)
+            (Ok ()))
+        (Err (type-error-other (. p pos) "no Eq protocol"))))))
+
+;; Each pattern against the type at its index, to the shorter.
+(defun check-each :private (cx: Cx subs: (Vec Pattern) tys: (Vec Ty)) -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (< i (min (count subs) (count tys)))
+        (try-let ((_ (cx-check-pattern cx (nth subs i) (nth tys i))))
+          (recur (+ i 1)))
+        (Ok ()))))
+
+;; The field types of `def` at `args` (Rust: `f.ty.subst_gen(args, colour_args(args))`).
+(defun field-tys :private (fields: (Vec FieldDef) args: (Vec Ty)) -> (Vec Ty)
+  (mapv (fn (f: FieldDef) (ty-subst-gen (. f ty) args (colour-args args))) fields))
+
+;; `(N p..)`: the type's parameters are fresh (a colour parameter's argument
+;; is a colour, §1.3), the sub-patterns have the fields' types.
+(defun check-ctor-pattern :private (cx: Cx p: Pattern t: i64 v: (Option i64) subs: (Vec Pattern) s: Ty) -> (Result unit TypeError)
+  (let ((def (g-ty (. cx g) t))
+        (args (mapv (fn (i: i64)
+                      (if (typedef-is-colour def i)
+                          (ty-colour-arg (store-fresh-colour (. cx st)))
+                          (cx-fresh cx)))
+                    (range (count (. def params)))))
+        (fields (match (. def shape)
+                  ((TsStruct fs) (if (nil? v) fs []))
+                  ((TsEnum vs) (if-some [i v] (. (nth vs i) fields) [])))))
+    (try-let ((_ (cx-unify cx s (ty-nominal t args) (. p pos))))
+      (check-each cx subs (field-tys fields args)))))
+
+;; The binding of a `& r` rest, if there is one.
+(defun rest-binding :private (rest: Rest) -> (Option i64)
+  (match rest ((RestBind b) (some b)) (_ nil)))
+
+;; Rust: infer/pattern.rs:90 check_vec_pattern. `[p.. & r]` against `s`:
+;; `s ~ (Vec a)` with the prelude's `Vec`, each `p : a`, `r : (Vec a)` (§2.6).
+(defun check-vec-pattern :private (cx: Cx p: Pattern subs: (Vec Pattern) rest: Rest s: Ty) -> (Result unit TypeError)
+  (match (cx-zonk cx s)
+    ((TCon (KNominal id) args)
+     (if (solve-is-tuple (. cx g) id)
+         (check-tuple-pattern cx p subs rest id args)
+         (check-vec-of cx p subs rest s)))
+    ((TVar _)
+     (if (nil? (rest-binding rest))
+         (defer-vec-pattern cx p subs s)
+         (check-vec-of cx p subs rest s)))
+    (_ (check-vec-of cx p subs rest s))))
+
+;; Not known yet: a `fn` literal's parameter, say. Each element pattern
+;; takes a type of its own until the scrutinee is known.
+(defun defer-vec-pattern :private (cx: Cx p: Pattern subs: (Vec Pattern) s: Ty) -> (Result unit TypeError)
+  (let ((parts (mapv (fn (sub: Pattern) (cx-fresh cx)) subs)))
+    (try-let ((_ (check-each cx subs parts)))
+      (do (cx-defer cx (DkVecPat s parts) (. p pos) nil)
+          (Ok ())))))
+
+;; `s` is a `(Vec a)`, every element `a`, the rest `(Vec a)`.
+(defun check-vec-of :private (cx: Cx p: Pattern subs: (Vec Pattern) rest: Rest s: Ty) -> (Result unit TypeError)
+  (if-some [vec-id @(. (. cx g) vec)]
+    (let ((a (cx-fresh cx))
+          (vt (ty-nominal vec-id [a])))
+      (try-let ((_ (cx-unify cx s vt (. p pos)))
+                (_ (check-each cx subs (mapv (fn (sub: Pattern) a) subs))))
+        (do (if-some [b (rest-binding rest)] (cx-bind cx b vt) ())
+            (Ok ()))))
+    (Err (type-error-other (. p pos) "vector patterns need the prelude's Vec"))))
+
+;; Rust: infer/pattern.rs:133 check_tuple_pattern. `[p..]` against a `Pair`
+;; or `Triple` (§7 L3b): the fields in order and exactly, each `p` at its
+;; field's type. The tail `& _` that a `let` adds to a vector pattern (§7 L8)
+;; takes nothing.
+(defun check-tuple-pattern :private (cx: Cx p: Pattern subs: (Vec Pattern) rest: Rest id: i64 args: (Vec Ty)) -> (Result unit TypeError)
+  (let ((fields (match (. (g-ty (. cx g) id) shape) ((TsStruct fs) fs) (_ []))))
+    (if (or (not (= (count subs) (count fields))) (not (nil? (rest-binding rest))))
+        (Err (cx-tuple-arity cx id (count subs) (. p pos)))
+        (check-each cx subs (field-tys fields args)))))

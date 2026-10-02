@@ -322,6 +322,33 @@
                  (and (= (get @(. tb fn-colours) 30) (some (CGen 0))) (= (get @(. tb fn-colours) 31) (some CSend))
                       (empty? @(. u fn-lits)))))))))
 
+;; S1: an occurrence of a fully annotated member of the unit is one of its scheme, at every
+;; variable of the scheme (infer/general.rs:406 scheme_instantiation).
+(defun finalize-poly-tests (cs: Checks) -> unit
+  (let ((cx (cx-new))
+        (cols (colours-of (map-empty) (set-empty) [] []))
+        (u (. cx u))
+        (tb (. cx t)))
+    (do
+      (set! (. u rigid-names) ["T" "U"])
+      (set! (. u poly-calls) [(PolyCall 1 7 3 p0)])
+      (set! (. u poly-vars) (assoc (map-empty) 7 [1 5]))
+      (set! (. tb instantiations)
+            (assoc (assoc (map-empty) 3 (Instantiation [(ty-i64) (ty-str)] [])) 4 (Instantiation [(v 1)] [])))
+      (set! (. u insts) [3 4])
+      (let ((m (genmap-new cx [(KeyVar 1) (KeyRigid 0) (KeyRigid 1)] cols []))
+            (closed (Closed [] cols [])))
+        (do
+          (cx-finalize cx m closed)
+          (check cs "finalize: a polymorphic call is one of the member's scheme, its own variable at its place and the caller's by index elsewhere"
+                 (match (get @(. tb instantiations) 3)
+                   ((some i) (= (. i tys) [(TGen 0) (TGen 1) (ty-i64)]))
+                   (_ false)))
+          (check cs "finalize: an occurrence that is not a polymorphic call is only under the map"
+                 (match (get @(. tb instantiations) 4)
+                   ((some i) (= (. i tys) [(TGen 0)]))
+                   (_ false))))))))
+
 ;; ---- scheme
 
 (defun scheme-tests (cs: Checks) -> unit
@@ -370,6 +397,7 @@
         (determined-tests cs)
         (sends-tests cs)
         (finalize-tests cs)
+        (finalize-poly-tests cs)
         (scheme-tests cs)
         (scheme-colour-tests cs)
         (finish cs))))

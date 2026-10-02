@@ -1,0 +1,454 @@
+;; compiler/tests/types/unit-expr.fib: crates/fibref/src/types/infer/expr.rs has no
+;; inline tests, so these programs are written from its code and doc comments, over
+;; hand-built ASTs: each expression kind of `cx-infer` (the types it gives and records,
+;; the constraints it defers, the errors and their texts, and when the worklist is
+;; retried), with the builtin world of types.init (`Option`, `Form`, `Bits`, ..) plus a
+;; prelude `Vec` (type 2) and a main-module struct `S { f: i64 }` (type 3).
+;; Calls, annotations and patterns are P11a's; `let`, `match` and `loop` use its
+;; `cx-check-pattern` and `cx-binding-ann` for a wildcard and a bound name.
+;; Build: fibc build compiler/tests/types/unit-expr.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.names types.init types.infer.cx types.infer.unify types.infer.solve
+               types.infer.expr types.check))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+;; Bindings 0..5 are `a`..`f`, `S` is type 3, `Vec` type 2.
+(defun world () -> Globals
+  (match (new-globals)
+    ((Ok g)
+     (do (table-add (. g types) (TypeDef "Vec" module-prelude ["a"] [] (TsStruct []) p0))
+         (table-add (. g types) (TypeDef "S" module-main [] [] (TsStruct [(FieldDef "f" (ty-i64))]) p0))
+         (set! (. g vec) (some 2))
+         (doseq [n ["a" "b" "c" "d" "e" "f"]] (table-add (. g bindings) (BindingInfo n BkLet p0 nil)))
+         g))
+    ((Err e) (trap (type-error-text e)))))
+
+;; The builtin module with nothing in it: `Bits` is not declared.
+(defun bare-world () -> Globals
+  (let ((g (globals-new)))
+    (do (table-add (. g modules) (ModuleInfo "the builtins" (names-new) [0] [] [] [] (map-empty)))
+        g)))
+
+(defun cx-of (g: Globals) -> Cx (Cx g (env-new) (store-new) (tables-new) (unit-new)))
+(defun fresh-cx () -> Cx (cx-of (world)))
+(defun s-ty () -> Ty (ty-nominal 3 []))
+(defun vec-of (a: Ty) -> Ty (ty-nominal 2 [a]))
+
+;; ---- builders: every expression has an id of its own
+
+(defun ex (id: i64 k: ExprKind) -> Expr (Expr id p0 k))
+(defun int (id: i64) -> Expr (ex id (ELit (LitInt 1 I64))))
+(defun bool-lit (id: i64 v: bool) -> Expr (ex id (ELit (LitBool v))))
+(defun str-lit (id: i64) -> Expr (ex id (ELit (LitStr "s"))))
+(defun unit-lit (id: i64) -> Expr (ex id (ELit LitUnit)))
+(defun local (id: i64 b: i64) -> Expr (ex id (ELocal b)))
+
+(defun left (cx: Cx) -> i64 (count @(. (. cx u) deferred)))
+(defun bind! (cx: Cx b: i64 t: Ty) -> unit (cx-bind cx b t))
+
+(defun ty-is? (cx: Cx r: (Result Ty TypeError) t: Ty) -> bool
+  (match r ((Ok x) (= (cx-zonk cx x) t)) (_ false)))
+(defun fails? (r: (Result Ty TypeError) kind: ErrorKind msg: str) -> bool
+  (match r ((Err e) (and (= (. e kind) kind) (= (. e message) msg))) (_ false)))
+(defun fails-kind? (r: (Result Ty TypeError) kind: ErrorKind) -> bool
+  (match r ((Err e) (= (. e kind) kind)) (_ false)))
+(defun solved? (cx: Cx) -> bool
+  (match (cx-solve-all cx) ((Ok _) (= (left cx) 0)) (_ false)))
+(defun recorded? (cx: Cx id: i64 t: Ty) -> bool
+  (match (get @(. (. cx t) expr-types) id)
+    ((some x) (and (= (cx-zonk cx x) t) (includes? id @(. (. cx u) exprs))))
+    (nil false)))
+(defun loops-depth (cx: Cx) -> i64 (count @(. (. cx u) loops)))
+
+;; ---- literals and the record of types
+
+(defun literal-tests (cs: Checks) -> unit
+  (let ((cx (fresh-cx)))
+    (do (check cs "an i8 literal is i8"
+               (ty-is? cx (cx-infer cx (ex 1 (ELit (LitInt 1 I8)))) (ty-scalar SI8)))
+        (check cs "an i32 literal is i32"
+               (ty-is? cx (cx-infer cx (ex 2 (ELit (LitInt 1 I32)))) (ty-scalar SI32)))
+        (check cs "an f32 literal is f32"
+               (ty-is? cx (cx-infer cx (ex 3 (ELit (LitFloat 1.5 F32)))) (ty-scalar SF32)))
+        (check cs "a string literal is str" (ty-is? cx (cx-infer cx (str-lit 4)) (ty-str)))
+        (check cs "a keyword literal is a keyword"
+               (ty-is? cx (cx-infer cx (ex 5 (ELit (LitKeyword "k")))) (ty-scalar SKeyword)))
+        (check cs "the unit literal is unit" (ty-is? cx (cx-infer cx (unit-lit 6)) (ty-unit)))
+        (check cs "the type of each expression is recorded, with its id in the unit's list"
+               (and (recorded? cx 1 (ty-scalar SI8)) (recorded? cx 4 (ty-str)) (recorded? cx 6 (ty-unit))
+                    (= (count @(. (. cx u) exprs)) 6)))
+        (check cs "a bound name has the type of its binding"
+               (do (bind! cx 0 (ty-str))
+                   (ty-is? cx (cx-infer cx (local 7 0)) (ty-str))))
+        (check cs "a name with no type is an internal error"
+               (fails? (cx-infer cx (local 8 1)) Other "internal: b has no type"))
+        (check cs "`unsafe` has the type of its body"
+               (ty-is? cx (cx-infer cx (ex 9 (EUnsafe (int 10)))) (ty-i64))))))
+
+;; ---- if and the test of an if
+
+(defun if-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "an `if` with a bool test has the type of its branches"
+             (ty-is? cx (cx-infer cx (ex 1 (EIf (bool-lit 2 true) (int 3) (int 4)))) (ty-i64))))
+    (let ((cx (fresh-cx)))
+      (do (cx-infer cx (ex 1 (EIf (bool-lit 2 true) (int 3) (int 4))))
+          (check cs "the test and both branches are recorded"
+                 (and (recorded? cx 2 (ty-bool)) (recorded? cx 3 (ty-i64)) (recorded? cx 4 (ty-i64))))))
+    (let ((cx (fresh-cx)))
+      (check cs "a test of type i64 can never be false"
+             (fails? (cx-infer cx (ex 1 (EIf (int 2) (int 3) (int 4)))) Unify
+                     "a value of type i64 is always true; write the test")))
+    (let ((cx (fresh-cx)))
+      (check cs "a test of type str can never be false"
+             (fails? (cx-infer cx (ex 1 (EIf (str-lit 2) (int 3) (int 4)))) Unify
+                     "a value of type str is always true; write the test")))
+    (let ((cx (fresh-cx)))
+      (check cs "a unit test is the usual mismatch"
+             (fails? (cx-infer cx (ex 1 (EIf (unit-lit 2) (int 3) (int 4)))) Unify
+                     "cannot unify unit with bool")))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-nominal 0 [(ty-i64)]))
+          (check cs "an Option test is the usual mismatch"
+                 (fails? (cx-infer cx (ex 1 (EIf (local 2 0) (int 3) (int 4)))) Unify
+                         "cannot unify (Option i64) with bool"))))
+    (let ((cx (fresh-cx)))
+      (check cs "the branches flow into one result: a second type is a mismatch"
+             (fails? (cx-infer cx (ex 1 (EIf (bool-lit 2 true) (int 3) (str-lit 4)))) Unify
+                     "cannot unify str with i64")))
+    (let ((cx (fresh-cx)))
+      (check cs "the else branch is not inferred after a failing test"
+             (and (fails-kind? (cx-infer cx (ex 1 (EIf (int 2) (int 3) (int 4)))) Unify)
+                  (nil? (get @(. (. cx t) expr-types) 3)))))))
+
+;; ---- do
+
+(defun do-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "an empty `do` is unit" (ty-is? cx (cx-infer cx (ex 1 (EDo []))) (ty-unit))))
+    (let ((cx (fresh-cx)))
+      (check cs "a `do` has the type of its last step"
+             (ty-is? cx (cx-infer cx (ex 1 (EDo [(int 2) (str-lit 3)]))) (ty-str))))
+    (let ((cx (fresh-cx)))
+      (check cs "every step is inferred, in order"
+             (and (ty-is? cx (cx-infer cx (ex 1 (EDo [(int 2) (bool-lit 3 true) (str-lit 4)]))) (ty-str))
+                  (= @(. (. cx u) exprs) [2 3 4 1]))))
+    (let ((cx (fresh-cx)))
+      (check cs "a failing step stops the `do`"
+             (and (fails-kind? (cx-infer cx (ex 1 (EDo [(ex 2 (EIf (int 3) (int 4) (int 5))) (int 6)]))) Unify)
+                  (nil? (get @(. (. cx t) expr-types) 6)))))))
+
+;; ---- fields, cells, tasks, concatenation, quote
+
+(defun field-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (s-ty))
+          (check cs "a field of a struct is the type of the field, solved at its form"
+                 (and (ty-is? cx (cx-infer cx (ex 1 (EField (local 2 0) "f" "a"))) (ty-i64))
+                      (= (left cx) 0)))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (s-ty))
+          (check cs "a missing field is a NoField error at the access"
+                 (fails? (cx-infer cx (ex 1 (EField (local 2 0) "g" "a"))) NoField "S has no field g"))))
+    (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+      (do (bind! cx 0 v)
+          (check cs "a field of an unknown type waits on the worklist"
+                 (and (ok-ty? (cx-infer cx (ex 1 (EField (local 2 0) "f" "a")))) (= (left cx) 1)))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-cell (s-ty)))
+          (check cs "set-field! on a cell variable is unit, the field waiting for the access"
+                 (and (ty-is? cx (cx-infer cx (ex 1 (ESetField 0 "f" (int 2)))) (ty-unit))
+                      (= (left cx) 1)
+                      (solved? cx)))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-cell (s-ty)))
+          (check cs "set-field! of the wrong type is a mismatch once the field is known"
+                 (and (ty-is? cx (cx-infer cx (ex 1 (ESetField 0 "f" (str-lit 2)))) (ty-unit))
+                      (match (cx-solve-all cx) ((Err e) (= (. e kind) Unify)) (_ false))))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-i64))
+          (check cs "set-field! of a variable that is not a cell is an AmpArgument error"
+                 (fails? (cx-infer cx (ex 1 (ESetField 0 "f" (int 2)))) AmpArgument
+                         "& argument must be a cell variable"))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-cell (s-ty)))
+          (check cs "set-field! defers its field with the printed cell variable"
+                 (do (cx-infer cx (ex 1 (ESetField 0 "f" (int 2))))
+                     (match (. (nth @(. (. cx u) deferred) 0) kind)
+                       ((DkField _ _ _ text) (= text "@a"))
+                       (_ false))))))))
+
+(defun ok-ty? (r: (Result Ty TypeError)) -> bool (match r ((Ok _) true) (_ false)))
+
+(defun cell-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-cell (ty-i64)))
+          (check cs "`@` of a cell variable is its content"
+                 (ty-is? cx (cx-infer cx (ex 1 (EDeref (PlAmp 0) "a"))) (ty-i64)))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-i64))
+          (check cs "`@` of a variable that is not a cell is a mismatch"
+                 (fails-kind? (cx-infer cx (ex 1 (EDeref (PlAmp 0) "a"))) Unify))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-cell (ty-i64)))
+          (check cs "`@` of an expression defers a dereference, solved at its form"
+                 (and (ty-is? cx (cx-infer cx (ex 1 (EDeref (PlExpr (local 2 0)) "a"))) (ty-i64))
+                      (= (left cx) 0)))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-i64))
+          (check cs "`@` of an i64 is a NoInstance error for Deref at the form"
+                 (fails-kind? (cx-infer cx (ex 1 (EDeref (PlExpr (local 2 0)) "a"))) NoInstance))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-cell (ty-i64)))
+          (check cs "set! of a cell variable is unit"
+                 (and (ty-is? cx (cx-infer cx (ex 1 (ESet (PlAmp 0) (int 2)))) (ty-unit))
+                      (recorded? cx 2 (ty-i64))))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-cell (ty-i64)))
+          (check cs "set! of a value of another type is a mismatch"
+                 (fails? (cx-infer cx (ex 1 (ESet (PlAmp 0) (str-lit 2)))) Unify "cannot unify str with i64"))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-cell (ty-i64)))
+          (check cs "set! of an expression place is a cell too"
+                 (ty-is? cx (cx-infer cx (ex 1 (ESet (PlExpr (local 2 0)) (int 3)))) (ty-unit)))))))
+
+(defun task-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-task (ty-str)))
+          (check cs "await of a task is its result"
+                 (ty-is? cx (cx-infer cx (ex 1 (EAwait (local 2 0)))) (ty-str)))))
+    (let ((cx (fresh-cx)))
+      (check cs "await of a value that is not a task is a mismatch"
+             (fails-kind? (cx-infer cx (ex 1 (EAwait (int 2)))) Unify)))
+    (let ((cx (fresh-cx)))
+      (check cs "an async block is a task of its body"
+             (ty-is? cx (cx-infer cx (ex 1 (EAsync (int 2) []))) (ty-task (ty-i64)))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (ty-str))
+          (check cs "an async capture defers Send of its type, by the capture's name"
+                 (and (ty-is? cx (cx-infer cx (ex 1 (EAsync (int 2) [0]))) (ty-task (ty-i64)))
+                      (= (left cx) 1)
+                      (match (. (nth @(. (. cx u) deferred) 0) kind)
+                        ((DkSend t path) (and (= t (ty-str)) (= path ["async capture a"])))
+                        (_ false))))))
+    (let ((cx (fresh-cx)))
+      (check cs "a recur in an async block cannot see the loop outside"
+             (do (set! (. (. cx u) loops) [[(ty-i64)]])
+                 (and (fails? (cx-infer cx (ex 1 (EAsync (ex 2 (ERecur [(int 3)])) []))) Other
+                              "recur outside loop")
+                      (= (loops-depth cx) 1)))))
+    (let ((cx (fresh-cx)))
+      (check cs "the loops are back after an async block"
+             (do (set! (. (. cx u) loops) [[(ty-i64)]])
+                 (and (ty-is? cx (cx-infer cx (ex 1 (EAsync (int 2) []))) (ty-task (ty-i64)))
+                      (= (loops-depth cx) 1)))))))
+
+(defun misc-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "a quoted form is a Form"
+             (ty-is? cx (cx-infer cx (ex 1 (EQuote (Stx SNil p0)))) (ty-nominal 1 []))))
+    (let ((cx (cx-of (globals-new))))
+      (check cs "a quoted form without a Form type is an error"
+             (fails? (cx-infer cx (ex 1 (EQuote (Stx SNil p0)))) Other "Form is not declared")))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (vec-of (ty-i64)))
+          (check cs "a concatenation of vectors is a vector"
+                 (and (ty-is? cx (cx-infer cx (ex 1 (EConcat [(local 2 0) (local 3 0)]))) (vec-of (ty-i64)))
+                      (recorded? cx 3 (vec-of (ty-i64)))))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 0 (vec-of (ty-i64)))
+          (check cs "the parts of a concatenation must agree"
+                 (fails-kind? (cx-infer cx (ex 1 (EConcat [(local 2 0) (int 3)]))) Unify))))
+    (let ((cx (fresh-cx)))
+      (check cs "an empty concatenation is a vector of an unknown element"
+             (match (cx-infer cx (ex 1 (EConcat [])))
+               ((Ok t) (match (cx-zonk cx t) ((TCon (KNominal 2) [(TVar _)]) true) (_ false)))
+               (_ false))))
+    (let ((cx (cx-of (globals-new))))
+      (check cs "a concatenation without the prelude's Vec is an error"
+             (fails? (cx-infer cx (ex 1 (EConcat []))) Other "concat needs the prelude's Vec")))))
+
+;; ---- trait objects and conversions
+
+(defun dyn-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "a trait object has the dyn type of its protocol, with Object and the protocol deferred"
+             (and (ty-is? cx (cx-infer cx (ex 1 (EDyn 0 [] false (int 2)))) (TCon (KDyn 0 false) []))
+                  (= (left cx) 2))))
+    (let ((cx (fresh-cx)))
+      (check cs "a sendable trait object also defers Send, with an empty path"
+             (and (ty-is? cx (cx-infer cx (ex 1 (EDyn 0 [] true (int 2)))) (TCon (KDyn 0 true) []))
+                  (= (left cx) 3)
+                  (match (. (nth @(. (. cx u) deferred) 1) kind)
+                    ((DkSend t path) (and (= t (ty-i64)) (empty? path)))
+                    (_ false)))))
+    (let ((cx (fresh-cx)))
+      (check cs "the constraints of a trait object are not solved at its form"
+             (do (cx-infer cx (ex 1 (EDyn 0 [] false (int 2))))
+                 (match (. (nth @(. (. cx u) deferred) 0) kind)
+                   ((DkObject t what) (and (= t (ty-i64)) (= what "dyn")))
+                   (_ false)))))))
+
+(defun convert-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "an integer conversion has the target type and defers Bits of the operand"
+             (and (ty-is? cx (cx-infer cx (ex 1 (EConvert (CvIntToInt Trunc) SI32 (int 2)))) (ty-scalar SI32))
+                  (= (left cx) 1)
+                  (match (. (nth @(. (. cx u) deferred) 0) kind) ((DkProto _ args _) (= args [(ty-i64)])) (_ false))
+                  (solved? cx))))
+    (let ((cx (fresh-cx)))
+      (check cs "an integer to float conversion needs Bits too"
+             (and (ty-is? cx (cx-infer cx (ex 1 (EConvert (CvIntToFloat true) SF64 (int 2)))) (ty-scalar SF64))
+                  (match (. (nth @(. (. cx u) deferred) 0) kind) ((DkProto _ _ _) true) (_ false)))))
+    (let ((cx (fresh-cx)))
+      (check cs "a float conversion defers a float constraint"
+             (and (ty-is? cx (cx-infer cx (ex 1 (EConvert CvFloatToFloat SF32 (ex 2 (ELit (LitFloat 1.5 F64)))))) (ty-scalar SF32))
+                  (match (. (nth @(. (. cx u) deferred) 0) kind) ((DkFloat t) (= t (ty-scalar SF64))) (_ false))
+                  (solved? cx))))
+    (let ((cx (fresh-cx)))
+      (check cs "a float to integer conversion defers a float constraint"
+             (and (ty-is? cx (cx-infer cx (ex 1 (EConvert (CvFloatToInt true) SI64 (ex 2 (ELit (LitFloat 1.5 F64)))))) (ty-i64))
+                  (match (. (nth @(. (. cx u) deferred) 0) kind) ((DkFloat _) true) (_ false)))))
+    (let ((cx (fresh-cx)))
+      (check cs "an integer operand of a float conversion is not a float"
+             (and (ty-is? cx (cx-infer cx (ex 1 (EConvert CvFloatToFloat SF32 (int 2)))) (ty-scalar SF32))
+                  (fails-kind? (match (cx-solve-all cx) ((Err e) (Err e)) (_ (Ok (ty-unit)))) Unify))))
+    (let ((cx (cx-of (bare-world))))
+      (check cs "an integer conversion without the Bits protocol is an error at the operand"
+             (fails? (cx-infer cx (ex 1 (EConvert (CvIntToInt Zext) SI32 (int 2)))) Other "no Bits protocol")))))
+
+;; ---- functions
+
+(defun fn-lit (name: (Option i64) params: (Vec FnParam) body: Expr captures: (Vec i64)) -> FnLit
+  (FnLit name params nil body captures))
+
+(defun fn-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "a function literal has a function type of fresh parameters and result"
+             (match (cx-infer cx (ex 1 (EFn (fn-lit nil [(FnParam 0 nil) (FnParam 1 nil)] (local 2 0) []))))
+               ((Ok t) (match (cx-zonk cx t)
+                         ((TFn (CVar _) [pa pb] r) (and (= pa r) (not= pa pb)))
+                         (_ false)))
+               (_ false))))
+    (let ((cx (fresh-cx)))
+      (check cs "the body flows into the result: the result is the body's type"
+             (match (cx-infer cx (ex 1 (EFn (fn-lit nil [(FnParam 0 nil)] (int 2) []))))
+               ((Ok t) (match (cx-zonk cx t) ((TFn _ [_] r) (= r (ty-i64))) (_ false)))
+               (_ false))))
+    (let ((cx (fresh-cx)))
+      (do (cx-infer cx (ex 1 (EFn (fn-lit nil [(FnParam 0 nil)] (int 2) []))))
+          (check cs "the parameter is bound, and the literal's colour is recorded for the unit"
+                 (and (some? (get @(. (. cx t) binding-types) 0))
+                      (= (count @(. (. cx u) fn-lits)) 1)
+                      (= (. (nth @(. (. cx u) fn-lits) 0) fst) 1)))))
+    (let ((cx (fresh-cx)))
+      (check cs "the colour of a literal is a fresh colour variable, the next one for each literal"
+             (match (cx-infer cx (ex 1 (EDo [(ex 2 (EFn (fn-lit nil [] (int 3) []))) (ex 4 (EFn (fn-lit nil [] (int 5) [])))])))
+               ((Ok _) (= (mapv (fn (p: (Pair i64 Colour)) (. p snd)) @(. (. cx u) fn-lits))
+                          [(CVar 0) (CVar 1)]))
+               (_ false))))
+    (let ((cx (fresh-cx)))
+      (do (bind! cx 2 (ty-str))
+          (check cs "a capture constrains the colour of the function by the captured type"
+                 (and (ok-ty? (cx-infer cx (ex 1 (EFn (fn-lit nil [] (int 2) [2])))))
+                      (= (count @(. (. cx u) caps)) 1)
+                      (let ((c (nth @(. (. cx u) caps) 0)))
+                        (and (= (. c colour) (CVar 0)) (= (. c ty) (ty-str))
+                             (= (. c label) "closure capture c")))))))
+    (let ((cx (fresh-cx)))
+      (check cs "a named function literal binds its name to its own type"
+             (match (cx-infer cx (ex 1 (EFn (fn-lit (some 3) [] (int 2) []))))
+               ((Ok t) (match (get @(. (. cx t) binding-types) 3) ((some b) (= b t)) (nil false)))
+               (_ false))))
+    (let ((cx (fresh-cx)))
+      (check cs "the error of a body is the error of the literal"
+             (fails-kind? (cx-infer cx (ex 1 (EFn (fn-lit nil [] (ex 2 (EIf (int 3) (int 4) (int 5))) [])))) Unify)))))
+
+;; ---- recur, and the forms that use patterns (P11a)
+
+(defun recur-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "recur outside a loop is an error"
+             (fails? (cx-infer cx (ex 1 (ERecur []))) Other "recur outside loop")))
+    (let ((cx (fresh-cx)))
+      (check cs "recur takes as many arguments as the loop has variables"
+             (do (set! (. (. cx u) loops) [[(ty-i64) (ty-str)]])
+                 (fails? (cx-infer cx (ex 1 (ERecur [(int 2)]))) Other "recur takes 2 argument(s), got 1"))))
+    (let ((cx (fresh-cx)))
+      (check cs "an argument of recur flows into its variable, the result is fresh"
+             (do (set! (. (. cx u) loops) [[(ty-i64) (ty-str)]])
+                 (and (ok-ty? (cx-infer cx (ex 1 (ERecur [(int 2) (str-lit 3)]))))
+                      (fails-kind? (cx-infer cx (ex 4 (ERecur [(int 5) (int 6)]))) Unify)))))
+    (let ((cx (fresh-cx)))
+      (check cs "the innermost loop is the one recur sees"
+             (do (set! (. (. cx u) loops) [[(ty-str)] [(ty-i64)]])
+                 (ok-ty? (cx-infer cx (ex 1 (ERecur [(int 2)])))))))))
+
+(defun wild () -> Pattern (Pattern p0 PWild))
+(defun pbind (b: i64) -> Pattern (Pattern p0 (PBind b)))
+
+(defun pattern-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "a `let` has the type of its body, a bound name its initialiser's"
+             (and (ty-is? cx (cx-infer cx (ex 1 (ELet [(LetBind (pbind 0) (str-lit 2))] (local 3 0)))) (ty-str))
+                  (some? (get @(. (. cx t) binding-types) 0)))))
+    (let ((cx (fresh-cx)))
+      (check cs "the bindings of a `let` are in scope for the next ones, in order"
+             (ty-is? cx (cx-infer cx (ex 1 (ELet [(LetBind (pbind 0) (int 2)) (LetBind (pbind 1) (local 3 0))] (local 4 1)))) (ty-i64))))
+    (let ((cx (fresh-cx)))
+      (check cs "a failing initialiser stops the `let`"
+             (and (fails-kind? (cx-infer cx (ex 1 (ELet [(LetBind (wild) (ex 2 (EIf (int 3) (int 4) (int 5)))) (LetBind (pbind 0) (int 6))] (int 7)))) Unify)
+                  (nil? (get @(. (. cx t) expr-types) 6)))))
+    (let ((cx (fresh-cx)))
+      (check cs "a match has the type of its clauses, flowing into one result"
+             (ty-is? cx (cx-infer cx (ex 1 (EMatch (int 2) [(Clause (wild) nil (str-lit 3) false) (Clause (pbind 0) nil (str-lit 4) false)]))) (ty-str))))
+    (let ((cx (fresh-cx)))
+      (check cs "a second clause of another type is a mismatch"
+             (fails? (cx-infer cx (ex 1 (EMatch (int 2) [(Clause (wild) nil (str-lit 3) false) (Clause (wild) nil (int 4) false)]))) Unify
+                     "cannot unify i64 with str")))
+    (let ((cx (fresh-cx)))
+      (check cs "a guard is a bool"
+             (and (ok-ty? (cx-infer cx (ex 1 (EMatch (int 2) [(Clause (wild) (some (bool-lit 3 true)) (int 4) false)]))))
+                  (fails? (cx-infer cx (ex 5 (EMatch (int 6) [(Clause (wild) (some (int 7)) (int 8) false)]))) Unify
+                          "cannot unify i64 with bool"))))
+    (let ((cx (fresh-cx)))
+      (check cs "a loop has the type of its body, its variables the type of their initialisers"
+             (and (ty-is? cx (cx-infer cx (ex 1 (ELoop [(LoopBind 0 (int 2))] (local 3 0)))) (ty-i64))
+                  (= (loops-depth cx) 0))))
+    (let ((cx (fresh-cx)))
+      (check cs "recur in a loop flows into the variable"
+             (and (ok-ty? (cx-infer cx (ex 1 (ELoop [(LoopBind 0 (int 2))] (ex 3 (ERecur [(int 4)]))))))
+                  (fails-kind? (cx-infer cx (ex 5 (ELoop [(LoopBind 1 (int 6))] (ex 7 (ERecur [(str-lit 8)]))))) Unify)
+                  (= (loops-depth cx) 0))))
+    (let ((cx (fresh-cx)))
+      (check cs "the loop stack is popped when the body fails"
+             (and (fails-kind? (cx-infer cx (ex 1 (ELoop [(LoopBind 0 (int 2))] (ex 3 (EIf (int 4) (int 5) (int 6)))))) Unify)
+                  (= (loops-depth cx) 0))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (literal-tests cs)
+        (if-tests cs)
+        (do-tests cs)
+        (field-tests cs)
+        (cell-tests cs)
+        (task-tests cs)
+        (misc-tests cs)
+        (dyn-tests cs)
+        (convert-tests cs)
+        (fn-tests cs)
+        (recur-tests cs)
+        (pattern-tests cs)
+        (finish cs))))
