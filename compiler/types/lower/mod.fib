@@ -1,10 +1,24 @@
 ;; compiler/types/lower/mod.fib: the module step: declare, then define (package P5).
-;; Replaces crates/fibref/src/types/lower/mod.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/mod.rs (366 lines of Rust).
+;;
+;; Lowering one module's expanded forms to the resolved core AST (types §3.5 steps 2-3):
+;; declare every name first (so definitions may refer to each other in any order, syntax
+;; §3.1), resolve the field types, then the protocol signatures and `impl` heads (instances
+;; with their declared contexts, before any body), then every body.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust `Vec<TypeError>` that `declare` and `define` push to and a `keep` closure over
+;;   it are `(Vec TypeError)` values threaded through `reduce`: `keep` appends the error of
+;;   a `Result`, if it is one; the order of the errors is the order of the Rust.
+;; - `Declared`'s fields are the Rust ones; a declared form is a `DeclItem` of `declare-one`,
+;;   which `add-item` puts in its field.
+;; - `check_const`, called by `lower_def` and (for the arguments of a call) as a bool, is
+;;   `constant?`: the error is built by `lower-def`, at the initialiser's position.
 (ns types.lower.mod
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store
+        types.table types.ast types.decls types.names types.display types.lower.typeform
+        types.lower.decl types.lower.defaults types.lower.protos types.lower.supers
+        types.lower.scope types.lower.expr types.lower.top))
 
 ;; Rust `ModuleItems` (lower/mod.rs:42): what a lowered module defines.
 (defstruct ModuleItems
@@ -16,10 +30,255 @@
   (m: i64 protos: (Vec (Pair i64 Stx)) funs: (Vec (Pair i64 Stx))
    defs: (Vec (Pair i64 Stx)) macros: (Vec Stx) impls: (Vec Stx)))
 
-;; Rust: lower/mod.rs:65
-(defun declare (g: Globals m: i64 forms: (Vec Stx)) -> (Result Declared (Vec TypeError))
-  (trap "todo: declare"))
+;; What a top-level form declares.
+(defenum DeclItem
+  (ItRaw raw: RawType) (ItProto id: i64 form: Stx) (ItFun id: i64 form: Stx)
+  (ItDef id: i64 form: Stx) (ItMacro form: Stx) (ItImpl form: Stx) ItNone)
 
-;; Rust: lower/mod.rs:221
+;; The errors of `errs` and that of `r`, if it is an `Err`.
+(defun keep :private (errs: (Vec TypeError) r: (Result a TypeError)) -> (Vec TypeError)
+  (match r
+    ((Err e) (conj errs e))
+    (_ errs)))
+
+;; Rust: lower/mod.rs:132 declare_fun: declares a `defun`'s name; its body is lowered later.
+(defun declare-fun :private (g: Globals m: i64 form: Stx) -> (Result i64 TypeError)
+  (try-let ((np (defun-parts form)))
+    (let ((id (table-count (. g funs)))
+          (body (placeholder g (. form pos))))
+      (do (table-add (. g funs) (FunDef (. np fst) m (vec-empty) nil (vec-empty) body false (. form pos)))
+          (try-let ((done (define-value g m (. np fst) (GFun id) (. form pos))))
+            (Ok id))))))
+
+;; Rust: lower/mod.rs:152 declare_def: declares a `def`'s name; its initialiser is lowered later.
+(defun declare-def :private (g: Globals m: i64 form: Stx) -> (Result i64 TypeError)
+  (try-let ((parts (def-parts form)))
+    (let ((id (table-count (. g defs)))
+          (init (placeholder g (. form pos))))
+      (do (table-add (. g defs) (DefDef (. parts fst) m nil init (. form pos)))
+          (try-let ((done (define-value g m (. parts fst) (GDef id) (. form pos))))
+            (Ok id))))))
+
+;; Rust: lower/mod.rs:168 declare_extern: declares an `extern` with its type.
+(defun declare-extern :private (g: Globals m: i64 form: Stx) -> (Result unit TypeError)
+  (try-let ((t (extern-type g m form)))
+    (let ((id (table-count (. g externs))))
+      (do (table-add (. g externs) (ExternDef (. t fst) (. t snd) (. t thd) (. form pos)))
+          (define-value g m (. t fst) (GExtern id) (. form pos))))))
+
+(defun declared :private (r: (Result unit TypeError)) -> (Result DeclItem TypeError)
+  (match r
+    ((Ok _) (Ok ItNone))
+    ((Err e) (Err e))))
+
+;; Rust: lower/mod.rs:102 declare_one: declares the names of one form.
+(defun declare-one :private (g: Globals m: i64 form: Stx) -> (Result DeclItem TypeError)
+  (match (unwrap-or (stx-nth-sym (stx-items form) 0) "")
+    ("ns" (Ok ItNone))
+    ("defstruct" (try-let ((r (declare-struct g m form))) (Ok (ItRaw r))))
+    ("defenum" (try-let ((r (declare-enum g m form))) (Ok (ItRaw r))))
+    ("defprotocol" (try-let ((id (declare-proto g m form))) (Ok (ItProto id form))))
+    ("defun" (try-let ((id (declare-fun g m form))) (Ok (ItFun id form))))
+    ("def" (try-let ((id (declare-def g m form))) (Ok (ItDef id form))))
+    ("extern" (declared (declare-extern g m form)))
+    ("defmacro" (Ok (ItMacro form)))
+    ("impl" (Ok (ItImpl form)))
+    (_ (Err (type-error-resolve (. form pos) (str-join ["expected a definition, found " (stx-show form)]))))))
+
+;; What `declare` has gathered: the forms, the raw types and the errors so far.
+(defstruct Gathered :private (d: Declared raws: (Vec RawType) errors: (Vec TypeError)))
+
+(defun add-item :private (a: Gathered r: (Result DeclItem TypeError)) -> Gathered
+  (let ((d (. a d)))
+    (match r
+      ((Err e) (Gathered d (. a raws) (conj (. a errors) e)))
+      ((Ok (ItRaw raw)) (Gathered d (conj (. a raws) raw) (. a errors)))
+      ((Ok (ItProto id f))
+       (Gathered (Declared (. d m) (conj (. d protos) (Pair id f)) (. d funs) (. d defs) (. d macros) (. d impls))
+                 (. a raws) (. a errors)))
+      ((Ok (ItFun id f))
+       (Gathered (Declared (. d m) (. d protos) (conj (. d funs) (Pair id f)) (. d defs) (. d macros) (. d impls))
+                 (. a raws) (. a errors)))
+      ((Ok (ItDef id f))
+       (Gathered (Declared (. d m) (. d protos) (. d funs) (conj (. d defs) (Pair id f)) (. d macros) (. d impls))
+                 (. a raws) (. a errors)))
+      ((Ok (ItMacro f))
+       (Gathered (Declared (. d m) (. d protos) (. d funs) (. d defs) (conj (. d macros) f) (. d impls))
+                 (. a raws) (. a errors)))
+      ((Ok (ItImpl f))
+       (Gathered (Declared (. d m) (. d protos) (. d funs) (. d defs) (. d macros) (conj (. d impls) f))
+                 (. a raws) (. a errors)))
+      ((Ok (ItNone)) a))))
+
+;; Rust: lower/mod.rs:65 declare: steps 2-3 up to the field types: declares every name of
+;; `forms` in module `m`.
+(defun declare (g: Globals m: i64 forms: (Vec Stx)) -> (Result Declared (Vec TypeError))
+  (let ((a (reduce (fn (acc: Gathered f: Stx) (add-item acc (declare-one g m f)))
+                   (Gathered (Declared m [] [] [] [] []) [] [])
+                   forms))
+        (shaped (reduce (fn (es: (Vec TypeError) r: RawType) (keep es (resolve-shape g m r)))
+                        (. a errors) (. a raws)))
+        (errors (reduce (fn (es: (Vec TypeError) r: RawType) (keep es (scalar-enum-instances g (. r id))))
+                        shaped (. a raws))))
+    (if (empty? errors) (Ok (. a d)) (Err errors))))
+
+;; Rust: lower/mod.rs:190 scalar_enum_instances: a field-less enum is a scalar with built-in
+;; `Eq`, `Ord`, `Hash` and `Show` (§2.12).
+(defun scalar-enum-instances :private (g: Globals id: i64) -> (Result unit TypeError)
+  (let ((def (g-ty g id))
+        (head (TCon (KNominal id) (mapv (fn (i: i64) (TGen i)) (range (count (. (g-ty g id) params)))))))
+    (if (typedef-is-fieldless-enum def)
+        (reduce (fn (r: (Result unit TypeError) p: str)
+                  (match r
+                    ((Ok _) (scalar-instance g id def head p))
+                    ((Err e) (Err e))))
+                (Ok ()) ["Eq" "Ord" "Hash" "Show"])
+        (Ok ()))))
+
+;; The built-in protocol `p`'s instance for the field-less enum `id`, if the builtins have `p`.
+(defun scalar-instance :private (g: Globals id: i64 def: TypeDef head: Ty p: str) -> (Result unit TypeError)
+  (match (g-proto-name g module-builtin p)
+    (nil (Ok ()))
+    ((some proto)
+     (match (register-instance g (InstanceDef proto (KNominal id) module-builtin (. def params) head
+                                              (vec-empty) (vec-empty) (vec-empty) (. def pos)))
+       ((Ok _) (Ok ()))
+       ((Err e) (Err e))))))
+
+;; ---- define
+
+;; `impl P for T`, for messages.
+(defun impl-owner :private (g: Globals inst: InstanceDef) -> str
+  (let ((head (ty-map-leaves (. inst head) (fn (t: Ty) (match t ((TGen i) (some (TRigid i))) (_ nil)))))
+        (text (printer-ty (printer-with-names g [] (. inst var-names)) head)))
+    (str-join ["impl " (. (g-proto g (. inst proto)) name) " for " text])))
+
+;; The explicit methods of an `impl`, each lowered and none twice.
+(defun explicit-methods :private (g: Globals m: i64 inst: i64 methods: (Vec Stx) owner: str)
+    -> (Result (Vec ImplMethod) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count methods))
+        (Ok out)
+        (match (lower-impl-method g m inst (nth methods i) owner)
+          ((Err e) (Err e))
+          ((Ok method)
+           (if (some? (find-first (fn (o: ImplMethod) (= (. o index) (. method index))) out))
+               (Err (type-error-other (. (nth methods i) pos) (str-join [owner " defines a method twice"])))
+               (recur (+ i 1) (conj out method))))))))
+
+;; The methods of protocol `proto` that `out` lacks, from their defaults: each the default
+;; specialised to this instance and resolved where the protocol is defined (types §4.1).
+(defun default-methods :private (g: Globals inst: i64 owner: str out: (Vec ImplMethod))
+    -> (Result (Vec ImplMethod) TypeError)
+  (let ((proto (g-proto g (. (table-get (. g instances) inst) proto))))
+    (loop ((i 0) (out out))
+      (if (>= i (count (. proto methods)))
+          (Ok out)
+          (let ((md (nth (. proto methods) i)))
+            (cond ((some? (find-first (fn (o: ImplMethod) (= (. o index) i)) out)) (recur (+ i 1) out))
+                  ((not (some? (. md default)))
+                   (Err (type-error-other (. (table-get (. g instances) inst) pos)
+                                          (str-join [owner " is missing the method " (. md name)]))))
+                  (else
+                   (match (lower-impl-method g (. proto module) inst (method-form md (unwrap (. md default))) owner)
+                     ((Err e) (Err e))
+                     ((Ok method) (recur (+ i 1) (conj out method)))))))))))
+
+;; Rust: lower/mod.rs:268 lower_impl: the bodies of the methods of instance `inst`.
+(defun lower-impl :private (g: Globals m: i64 inst: i64 methods: (Vec Stx)) -> (Result unit TypeError)
+  (let ((owner (impl-owner g (table-get (. g instances) inst))))
+    (try-let ((explicit (explicit-methods g m inst methods owner))
+              (out (default-methods g inst owner explicit)))
+      (let ((i (table-get (. g instances) inst)))
+        (Ok (table-set (. g instances) inst
+                       (InstanceDef (. i proto) (. i con) (. i module) (. i var-names) (. i head) (. i dets)
+                                    (. i context) out (. i pos))))))))
+
+;; Lowers the `impl`s of the module, in order: the errors so far and the instances declared.
+(defun declare-impls :private (g: Globals m: i64 forms: (Vec Stx) errs: (Vec TypeError))
+    -> (Pair (Vec TypeError) (Vec (Pair i64 (Vec Stx))))
+  (reduce (fn (acc: (Pair (Vec TypeError) (Vec (Pair i64 (Vec Stx)))) f: Stx)
+            (match (declare-impl g m f)
+              ((Ok x) (Pair (. acc fst) (conj (. acc snd) x)))
+              ((Err e) (Pair (conj (. acc fst) e) (. acc snd)))))
+          (Pair errs (vec-empty)) forms))
+
+;; The `defun` of `id` lowered into its row.
+(defun define-fun :private (g: Globals m: i64 id: i64 form: Stx) -> (Result unit TypeError)
+  (try-let ((f (lower-defun g m form)))
+    (Ok (table-set (. g funs) id f))))
+
+;; The macros of a module lowered, as functions appended to the table: the errors and the ids.
+(defun define-macros :private (g: Globals m: i64 forms: (Vec Stx) errs: (Vec TypeError))
+    -> (Pair (Vec TypeError) (Vec i64))
+  (reduce (fn (acc: (Pair (Vec TypeError) (Vec i64)) f: Stx)
+            (match (lower-macro g m f)
+              ((Err e) (Pair (conj (. acc fst) e) (. acc snd)))
+              ((Ok fun) (Pair (. acc fst) (conj (. acc snd) (table-add (. g funs) fun))))))
+          (Pair errs (vec-empty)) forms))
+
+;; Rust: lower/mod.rs:221 define: steps 3 (protocols, impls) and the bodies: lowers a
+;; declared module.
 (defun define (g: Globals d: Declared) -> (Result ModuleItems (Vec TypeError))
-  (trap "todo: define"))
+  (let ((m (. d m))
+        (e1 (reduce (fn (es: (Vec TypeError) p: (Pair i64 Stx)) (keep es (resolve-proto g m (. p fst) (. p snd))))
+                    (vec-empty) (. d protos)))
+        ([e2 impls] (declare-impls g m (. d impls) e1))
+        (e3 (reduce (fn (es: (Vec TypeError) p: (Pair i64 Stx)) (keep es (define-fun g m (. p fst) (. p snd))))
+                    e2 (. d funs)))
+        (e4 (reduce (fn (es: (Vec TypeError) p: (Pair i64 Stx)) (keep es (lower-def g m (. p fst) (. p snd))))
+                    e3 (. d defs)))
+        (e5 (reduce (fn (es: (Vec TypeError) p: (Pair i64 (Vec Stx))) (keep es (check-impl-supers g (. p fst))))
+                    e4 impls))
+        (e6 (reduce (fn (es: (Vec TypeError) p: (Pair i64 (Vec Stx))) (keep es (lower-impl g m (. p fst) (. p snd))))
+                    e5 impls))
+        ([errors macros] (define-macros g m (. d macros) e6)))
+    (if (empty? errors)
+        (Ok (ModuleItems (mapv (fn (p: (Pair i64 Stx)) (. p fst)) (. d funs))
+                         (mapv (fn (p: (Pair i64 Stx)) (. p fst)) (. d defs))
+                         (mapv (fn (p: (Pair i64 (Vec Stx))) (. p fst)) impls)
+                         macros))
+        (Err errors))))
+
+;; ---- def
+
+;; Rust: lower/mod.rs:316 lower_def: the annotation and initialiser of `def` `id`.
+(defun lower-def :private (g: Globals m: i64 id: i64 form: Stx) -> (Result unit TypeError)
+  (try-let ((parts (def-parts form))
+            (ann (opt-type-ann g m (. parts snd))))
+    (let ((lw (lowerer-make g m (. parts fst))))
+      (try-let ((init (lw-expr lw (. parts thd) false)))
+        (if (constant? g id init)
+            (let ((d (g-def g id)))
+              (Ok (table-set (. g defs) id (DefDef (. d name) (. d module) ann init (. d pos)))))
+            (Err (type-error DefNotConstant (. init pos)
+                             (str-join ["def " (. (g-def g id) name) ": initialiser is not a constant expression"]))))))))
+
+;; Rust: lower/mod.rs:329 check_const: the constant grammar of syntax §3.19.
+(defun constant? :private (g: Globals id: i64 e: Expr) -> bool
+  (match (. e kind)
+    ((ELit _) true)
+    ((EQuote _) true)
+    ((EGlobal (GDef d)) (< d id))
+    ((EGlobal (GCtor _ _)) true)
+    ((EGlobal (GFun _)) true)
+    ((ECall head args)
+     (and (const-head? g head)
+          (every? (fn (a: Arg) (match a ((ArgExpr x) (constant? g id x)) ((ArgAmp _ _) false))) args)))
+    (_ false)))
+
+;; A constructor, or one of the prelude calls of the literal rewrite.
+(defun const-head? :private (g: Globals head: Expr) -> bool
+  (match (. head kind)
+    ((EGlobal r)
+     (match r
+       ((GCtor id variant)
+        (match (. (g-ty g id) shape)
+          ((TsStruct _) (not (some? variant)))
+          ((TsEnum vs)
+           (match variant
+             ((some i) (match (get vs i) ((some v) (not (empty? (. v fields)))) (nil false)))
+             (nil false)))))
+       (_ (some? (find-first (fn (n: str) (= (g-value g module-prelude n) (some r)))
+                             ["vec-empty" "vec-conj" "map-empty" "map-assoc"])))))
+    (_ false)))

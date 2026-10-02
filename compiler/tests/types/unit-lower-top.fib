@@ -1,0 +1,213 @@
+;; compiler/tests/types/unit-lower-top.fib: the signatures and the module step (types.lower.top
+;; and types.lower.mod). top.rs and mod.rs have no inline test; what the tool (`fibref types
+;; --stage lower`, cases in top-cases/, judged by compare.sh) cannot show is here:
+;; - the parts the expander lets through and the errors it rejects before the Rust tool can
+;;   reach them (`defun-parts`, `raw-params`, `def-parts`, `extern-type`, a bare `defmacro`);
+;; - what `declare` and `define` return: the ids of ModuleItems, the macros appended after the
+;;   funs, a macro without `Form` or `Vec` in the world, a failing step's errors in order;
+;; - the instances a field-less enum gets from the builtin protocols (`scalar_enum_instances`).
+;; Run from the repository root.
+;; Build: fibc build compiler/tests/types/unit-lower-top.fib -I compiler -I lib -o OUT
+(ns main (:use fib.string syntax.pos syntax.form syntax.reader types.ty types.error types.ast
+               types.table types.decls types.check types.lower.typeform types.lower.top
+               types.lower.mod))
+
+(defun forms-of (src: str) -> (Vec Stx)
+  (match (read-all src "t")
+    ((Ok fs) fs)
+    ((Err _) (trap "unreadable"))))
+
+(defun form-of (src: str) -> Stx (nth (forms-of src) 0))
+
+;; builtins 0, prelude 1, main 2; the builtin protocols a field-less enum is an instance of
+(defun world () -> Globals
+  (let ((g (globals-new)))
+    (do (g-add-module g "<builtin>" (Links [] [] []) (map-empty))
+        (g-add-module g "fib.prelude" (Links [] [] []) (map-empty))
+        (g-add-module g "main" (Links [] [] []) (map-empty))
+        g)))
+
+(defun add-builtin-proto (g: Globals name: str) -> unit
+  (let ((n (g-names g module-builtin))
+        (id (table-add (. g protos) (ProtoDef name module-builtin ["a"] [] [] (Pos "t" 1 1 0 1)))))
+    (set! (. n protos) (assoc @(. n protos) name id))))
+
+;; `LINE:COL MESSAGE` of an error, or `ok`
+(defun text-of (r: (Result a TypeError)) -> str
+  (match r
+    ((Ok _) "ok")
+    ((Err e) (str-join [(show (. (. e pos) line)) ":" (show (. (. e pos) col)) " " (. e message)]))))
+
+(defun errs-text (r: (Result a (Vec TypeError))) -> (Vec str)
+  (match r
+    ((Ok _) ["ok"])
+    ((Err es) (mapv (fn (e: TypeError) (str-join [(show (. (. e pos) line)) ":" (show (. (. e pos) col)) " " (. e message)])) es))))
+
+;; got equals want; what `got` was when it is not
+(defun expect (cs: Checks name: str got: a want: a) :where ((Eq a) (Show a)) -> unit
+  (do (check cs name (= got want))
+      (if (not (= got want))
+          (println (str-join ["  want " (show want) "\n  got  " (show got)]))
+          ())))
+
+;; ---- the parts of a defun
+
+;; the parameters as `name[&][:ann][:borrow]` words
+(defun param-words (p: RawParam) -> str
+  (str-join [(if (. p amp) "&" "") (. p name) (if (some? (. p ann)) ":ann" "") (if (. p borrow) ":borrow" "")]))
+
+(defun parts-text (src: str) -> str
+  (match (defun-parts (form-of src))
+    ((Err e) (text-of (Err e)))
+    ((Ok [name parts])
+     (str-join [name " (" (join " " (mapv param-words (. parts params))) ") where=" (show (some? (. parts bounds)))
+                " ret=" (show (some? (. parts ret))) " body=" (show (count (. parts body)))]))))
+
+(defun defun-parts-checks (cs: Checks) -> unit
+  (do (expect cs "plain" (parts-text "(defun f (a b) a)")
+               "f (a b) where=false ret=false body=1")
+      (expect cs "annotated, amp, borrow" (parts-text "(defun f (a: i64 &b c :borrow d: str :borrow) -> i64 1 2)")
+               "f (a:ann &b c:borrow d:ann:borrow) where=false ret=true body=2")
+      (expect cs "an & parameter with a type" (parts-text "(defun f (&b: i64) 1)")
+               "f (&b:ann) where=false ret=false body=1")
+      (expect cs "the annotation word last has no type: `x:` is x" (parts-text "(defun f (x:) 1)")
+               "f (x) where=false ret=false body=1")
+      (expect cs "where and ->, either order" (parts-text "(defun f (a) -> i64 :where ((Eq a)) 1)")
+               "f (a) where=true ret=true body=1")
+      (expect cs "where takes the next form, even a ->" (parts-text "(defun f (a) :where -> i64 1)")
+               "f (a) where=true ret=false body=2")
+      (expect cs "not a parameter" (parts-text "(defun f (1) 2)")
+               "1:11 1 is not a parameter")
+      (expect cs "a list that is not an & form" (parts-text "(defun f ((x)) 2)")
+               "1:11 (x) is not a parameter")
+      (expect cs "repeated, at the second" (parts-text "(defun f (a b a) 2)")
+               "1:15 parameter a is repeated")
+      (expect cs "repeated through a type and an &" (parts-text "(defun f (a: i64 &a) 2)")
+               "1:18 parameter a is repeated")
+      (expect cs "no body" (parts-text "(defun f (a))")
+               "1:1 defun f has no body")
+      (expect cs "no body after options" (parts-text "(defun f (a) -> i64)")
+               "1:1 defun f has no body")
+      (expect cs "the body error comes before a parameter error" (parts-text "(defun f (1))")
+               "1:1 defun f has no body")
+      (expect cs "no name" (parts-text "(defun 5 () 1)")
+               "1:1 expected (defun name (param*) body+)")
+      (expect cs "no parameter list" (parts-text "(defun f 5 1)")
+               "1:1 expected (defun name (param*) body+)")
+      (expect cs "a vector is not a parameter list" (parts-text "(defun f [a] 1)")
+               "1:1 expected (defun name (param*) body+)")))
+
+;; ---- def and extern
+
+(defun def-text (src: str) -> str
+  (match (def-parts (form-of src))
+    ((Err e) (text-of (Err e)))
+    ((Ok [name ann init]) (str-join [name " ann=" (show (some? ann)) " init=" (show (. (. init pos) col))]))))
+
+(defun def-parts-checks (cs: Checks) -> unit
+  (do (expect cs "def" (def-text "(def a 1)")
+               "a ann=false init=8")
+      (expect cs "def with a type" (def-text "(def a: i64 1)")
+               "a ann=true init=13")
+      (expect cs "no operand" (def-text "(def)")
+               "1:1 expected (def name expr)")
+      (expect cs "one operand" (def-text "(def a)")
+               "1:1 expected (def name expr)")
+      (expect cs "a colon name with two operands" (def-text "(def a: 1)")
+               "1:1 expected (def name expr)")
+      (expect cs "three operands, none a colon name" (def-text "(def a i64 1)")
+               "1:1 expected (def name: type expr)")
+      (expect cs "five" (def-text "(def a: i64 1 2)")
+               "1:1 expected (def name expr)")
+      (expect cs "the name is not a symbol" (def-text "(def 5 1)")
+               "1:1 expected (def name expr)")))
+
+(defun extern-text (src: str) -> str
+  (match (extern-type (world) module-main (form-of src))
+    ((Err e) (text-of (Err e)))
+    ((Ok [name ty varargs])
+     (str-join [name " " (match ty ((TFn k ps r) (str-join [(show (count ps)) (if (= k CSend) " send" " other")])) (_ "?"))
+                (if varargs " varargs" "")]))))
+
+(defun extern-checks (cs: Checks) -> unit
+  (do (expect cs "extern" (extern-text "(extern c (i64 ptr) -> unit)")
+               "c 2 send")
+      (expect cs "varargs among the options" (extern-text "(extern c (ptr) -> i32 :other :varargs)")
+               "c 1 send varargs")
+      (expect cs "no parameters" (extern-text "(extern c () -> i64)")
+               "c 0 send")
+      (expect cs "no operands" (extern-text "(extern c)")
+               "1:1 expected (extern name (type*) -> type opt*)")
+      (expect cs "no arrow" (extern-text "(extern c (i64) i64)")
+               "1:1 expected (extern name (type*) -> type opt*)")
+      (expect cs "no result" (extern-text "(extern c (i64) ->)")
+               "1:1 expected (extern name (type*) -> type opt*)")
+      (expect cs "the parameters are not a list" (extern-text "(extern c i64 -> i64)")
+               "1:1 expected (extern name (type*) -> type opt*)")
+      (expect cs "a variable position" (extern-text "(extern c (a) -> i64)")
+               "1:12 extern positions are scalars, ptr or unit")
+      (expect cs "a str position" (extern-text "(extern c (i64) -> str)")
+               "1:20 extern positions are scalars, ptr or unit")))
+
+;; ---- the module step
+
+(defun items-text (it: ModuleItems) -> str
+  (str-join ["funs=" (show (. it funs)) " defs=" (show (. it defs)) " impls=" (show (. it impls)) " macros=" (show (. it macros))]))
+
+(defun lower-text (g: Globals src: str) -> (Vec str)
+  (match (declare g module-main (forms-of src))
+    ((Err es) (errs-text (Err es)))
+    ((Ok d)
+     (match (define g d)
+       ((Err es) (errs-text (Err es)))
+       ((Ok it) [(items-text it)])))))
+
+(defun module-step-checks (cs: Checks) -> unit
+  (do (expect cs "funs and defs get ids in order" (lower-text (world) "(defun f () 1) (def a 2) (defun g () 3) (def b 4) (ns x)")
+               ["funs=[0 1] defs=[0 1] impls=[] macros=[]"])
+      (expect cs "an empty module" (lower-text (world) "")
+               ["funs=[] defs=[] impls=[] macros=[]"])
+      (expect cs "declare keeps every error and goes no further" (lower-text (world) "(defun f (a a) 1) (def 5 1) (defun g () 1) (defun g () 2) 7")
+               ["1:13 parameter a is repeated" "1:19 expected (def name expr)" "1:44 g is already defined"
+                 "1:59 expected a definition, found 7"])
+      (expect cs "define keeps every error: funs, then defs" (lower-text (world) "(defun f () nowhere) (def a (fn (x) x)) (defun g () nope) (def b 1)")
+               ["1:13 unbound name nowhere" "1:53 unbound name nope" "1:29 def a: initialiser is not a constant expression"])
+      (check cs "a body error leaves the placeholder, the next funs are still lowered"
+             (let ((g (world)))
+               (do (lower-text g "(defun f () nowhere) (defun h (a) a)")
+                   (and (= (count (. (g-fun g 1) params)) 1) (empty? (. (g-fun g 0) params))))))))
+
+(defun macro-checks (cs: Checks) -> unit
+  (let ((g (world)))
+    (do (expect cs "a macro needs Form in the world" (lower-text g "(defmacro m (a) a)")
+               ["1:1 Form is not declared"])
+        (set! (. g form) (some 7))
+        (expect cs "a macro needs Vec in the world" (lower-text g "(defmacro m (a) a)")
+               ["1:1 the prelude defines no Vec"])
+        (set! (. g vec) (some 8))
+        (expect cs "a bare defmacro" (lower-text g "(defmacro m)")
+               ["1:1 expected (defmacro name (param*) body+)"])
+        (expect cs "a macro's parameter is a symbol" (lower-text g "(defmacro m (a 5) a)")
+               ["1:1 expected (defmacro name (param*) body+)"])
+        (expect cs "macros are appended after the funs, their ids from the table's count" (lower-text g "(defmacro m (a ... r) a) (defun f () 1) (defmacro n () 1)")
+               ["funs=[0] defs=[] impls=[] macros=[1 2]"])
+        (let ((m (g-fun g 1)))
+          (check cs "the macro is a function over Form with a rest of (Vec Form)"
+                 (and (. m is-macro) (= (count (. m params)) 2)
+                      (= (. (nth (. m params) 0) ann) (some (ANominal 7 [])))
+                      (= (. (nth (. m params) 1) ann) (some (ANominal 8 [(ANominal 7 [])])))))))))
+
+(defun enum-checks (cs: Checks) -> unit
+  (let ((g (world)))
+    (do (doseq [p ["Eq" "Ord" "Hash" "Show"]] (add-builtin-proto g p))
+        (expect cs "a field-less enum gets Eq, Ord, Hash and Show" (lower-text g "(defenum Colour Red Green)")
+               ["funs=[] defs=[] impls=[] macros=[]"])
+        (expect cs "four instances, in the builtin protocols' order" (mapv (fn (i: InstanceDef) (. (g-proto g (. i proto)) name)) (table-rows (. g instances)))
+               ["Eq" "Ord" "Hash" "Show"])
+        (check cs "of the builtin module, no methods" (every? (fn (i: InstanceDef) (and (= (. i module) module-builtin) (empty? (. i methods)))) (table-rows (. g instances)))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (defun-parts-checks cs) (def-parts-checks cs) (extern-checks cs)
+        (module-step-checks cs) (macro-checks cs) (enum-checks cs)
+        (finish cs))))

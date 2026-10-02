@@ -1,10 +1,27 @@
 ;; compiler/types/lower/top.fib: top-level definitions to Globals rows (package P5).
-;; Replaces crates/fibref/src/types/lower/top.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/top.rs (360 lines of Rust).
+;;
+;; `defun`, `def`, `extern`, `defmacro` and `impl` method bodies (syntax §3.1, §3.10,
+;; §3.15, §3.16, §3.19).
+;;
+;; Shapes decided where Rust and fibber differ (see also types.lower.scope):
+;; - the Rust tuples `(&str, DefunParts)`, `(&str, Option<&Form>, &Form)` and
+;;   `(String, Ty, bool)` are the `Pair` and `Triple` of the prelude; `Form` is `Stx`
+;;   and `Form::as_sym` / `as_list` of `items.get(i)` are `stx-nth-sym` / `stx-nth-list`;
+;;   an `Option<&Form>` is an `(Option Stx)`.
+;; - the Rust `Lowerer::new` is `lowerer-make` (types.lower.expr); a closure that binds
+;;   (`lw.bind`) is mapped over the parameters by `try-collect`, which runs it in order
+;;   and stops at the first `Err`, as the Rust `for` and `?` do.
+;; - `ClosedEnv` has one field (the name of the extern, unused by its two methods): a
+;;   struct has at least one.
 (ns types.lower.top
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store
+        types.table types.ast types.decls types.names types.annot types.lower.typeform
+        types.lower.decl types.lower.impl-head types.lower.scope types.lower.call
+        types.lower.expr types.lower.supers))
+
+(defun resolve-err :private (pos: Pos msg: str) -> (Result a TypeError)
+  (Err (type-error-resolve pos msg)))
 
 ;; Rust `RawParam` and `DefunParts` (lower/top.rs:26, :79): a defun's
 ;; parameters, bounds, return annotation and body forms, not yet lowered.
@@ -12,30 +29,267 @@
 (defstruct DefunParts
   (params: (Vec RawParam) bounds: (Option Stx) ret: (Option Stx) body: (Vec Stx)))
 
+;; The symbol at `i` of a list of forms (`items.get(i).and_then(Form::as_sym)`).
+(defun stx-nth-sym (items: (Vec Stx) i: i64) -> (Option str)
+  (match (get items i)
+    ((some f) (stx-as-sym f))
+    (nil nil)))
+
+;; The items of the list form at `i` (`items.get(i).and_then(Form::as_list)`).
+(defun stx-nth-list (items: (Vec Stx) i: i64) -> (Option (Vec Stx))
+  (match (get items i)
+    ((some f) (stx-as-list f))
+    (nil nil)))
+
+;; The forms of `items` from `i` on (`&items[i..]`).
+(defun stx-from (items: (Vec Stx) i: i64) -> (Vec Stx)
+  (vec (drop i items)))
+
+;; A placeholder body, replaced when bodies are lowered.
 ;; Rust: lower/top.rs:17
 (defun placeholder (g: Globals pos: Pos) -> Expr
-  (trap "todo: placeholder"))
+  (Expr (g-next-expr g) pos (ELit LitUnit)))
 
-;; Rust: lower/top.rs:87
+;; ---- defun
+
+;; The annotation of `f`, if there is one.
+(defun opt-type-ann (g: Globals m: i64 f: (Option Stx)) -> (Result (Option TypeAnn) TypeError)
+  (match f
+    ((some x) (try-let ((a (type-ann g m x false))) (Ok (some a))))
+    (nil (Ok nil))))
+
+;; Rust: lower/top.rs:35 raw_params (one parameter): the parameter at `i` of `list`
+;; (`sym | sym: type | sym :borrow | sym: type :borrow | &sym | &sym: type`) and the
+;; index after it.
+(defun raw-param (list: (Vec Stx) i: i64) -> (Result (Pair RawParam i64) TypeError)
+  (let ((f (nth list i))
+        (amp (amp-operand f))
+        (sym (if (some? amp) amp (stx-as-sym f))))
+    (match sym
+      (nil (resolve-err (. f pos) (str-join [(stx-show f) " is not a parameter"])))
+      ((some s)
+       (let ((typed (annotation-name (Stx (SSym s) (. f pos))))
+             (name (unwrap-or typed s))
+             (ann (if (some? typed) (get list (+ i 1)) nil))
+             (after (+ i (if (some? ann) 2 1)))
+             (borrow (match (get list after) ((some k) (stx-kw? k "borrow")) (nil false))))
+         (Ok (Pair (RawParam name (some? amp) ann borrow (. f pos)) (if borrow (+ after 1) after))))))))
+
+;; Rust: lower/top.rs:35 raw_params
+(defun raw-params (list: (Vec Stx)) -> (Result (Vec RawParam) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count list))
+        (Ok out)
+        (match (raw-param list i)
+          ((Err e) (Err e))
+          ((Ok [p next])
+           (if (some? (find-first (fn (q: RawParam) (= (. q name) (. p name))) out))
+               (resolve-err (. p pos) (str-join ["parameter " (. p name) " is repeated"]))
+               (recur next (conj out p))))))))
+
+(defun bad-defun :private (form: Stx) -> (Result a TypeError)
+  (resolve-err (. form pos) "expected (defun name (param*) body+)"))
+
+;; The `:where` and `->` options from index `i` of a defun: the index after them, the
+;; bounds form and the return form (a missing operand is `nil`, and the last wins).
+(defun defun-options :private (items: (Vec Stx))
+    -> (Triple i64 (Option Stx) (Option Stx))
+  (loop ((i 3) (bounds nil) (ret nil))
+    (match (get items i)
+      ((some f)
+       (cond ((stx-kw? f "where") (recur (+ i 2) (get items (+ i 1)) ret))
+             ((= (stx-as-sym f) (some "->")) (recur (+ i 2) bounds (get items (+ i 1))))
+             (else (Triple i bounds ret))))
+      (nil (Triple i bounds ret)))))
+
+;; Rust: lower/top.rs:87 defun_parts: splits `(defun name (params) :where (..)? -> R? body+)`.
 (defun defun-parts (form: Stx) -> (Result (Pair str DefunParts) TypeError)
-  (trap "todo: defun-parts"))
+  (let ((items (stx-items form)))
+    (match (Pair (stx-nth-sym items 1) (stx-nth-list items 2))
+      ((Pair (some name) (some params))
+       (let (([i bounds ret] (defun-options items)))
+         (if (>= i (count items))
+             (resolve-err (. form pos) (str-join ["defun " name " has no body"]))
+             (try-let ((ps (raw-params params)))
+               (Ok (Pair name (DefunParts ps bounds ret (stx-from items i))))))))
+      (_ (bad-defun form)))))
 
-;; Rust: lower/top.rs:118
+;; Rust: lower/top.rs:118 lower_defun: lowers a `defun` whose name is already declared.
 (defun lower-defun (g: Globals m: i64 form: Stx) -> (Result FunDef TypeError)
-  (trap "todo: lower-defun"))
+  (try-let ((np (defun-parts form))
+            (ret (opt-type-ann g m (. (. np snd) ret)))
+            (bounds (where-anns g m (. (. np snd) bounds))))
+    (let ((name (. np fst))
+          (lw (lowerer-make g m name)))
+      (try-let ((params (lower-params lw (. (. np snd) params)))
+                (body (lw-body lw (. (. np snd) body) (. form pos) false)))
+        (Ok (FunDef name m params ret bounds body false (. form pos)))))))
 
-;; Rust: lower/top.rs:196
+;; The parameters of a `defun` as declarations, each bound in order.
+(defun lower-params :private (lw: Lowerer ps: (Vec RawParam)) -> (Result (Vec ParamDecl) TypeError)
+  (try-collect ps
+    (fn (p: RawParam)
+      (try-let ((ann (opt-type-ann (. lw g) (. lw m) (. p ann))))
+        (Ok (ParamDecl (lw-bind lw (. p name) (if (. p amp) BkAmpParam BkParam) (. p pos))
+                       (. p name) (. p amp) ann (. p borrow)))))))
+
+;; `:where ((P T..) (Send T) ..)` as annotations.
+(defun where-anns :private (g: Globals m: i64 cs: (Option Stx)) -> (Result (Vec PredAnn) TypeError)
+  (match cs
+    ((some c) (try-collect (stx-items c) (fn (x: Stx) (where-ann g m x))))
+    (nil (Ok (vec-empty)))))
+
+;; `(Send T)` or `(P T₁ .. Tₙ)`, the dispatch type first.
+(defun where-ann :private (g: Globals m: i64 c: Stx) -> (Result PredAnn TypeError)
+  (let ((items (stx-items c)))
+    (match (stx-nth-sym items 0)
+      (nil (resolve-err (. c pos) "a constraint is (P T..) or (Send T)"))
+      ((some name)
+       (try-let ((tys (try-collect (stx-from items 1) (fn (t: Stx) (type-ann g m t false)))))
+         (if (and (= name "Send") (= (count tys) 1))
+             (Ok (PaSend (nth tys 0)))
+             (match (g-proto-name g m name)
+               (nil (resolve-err (. c pos) (g-unknown g m SpProto name "unknown protocol")))
+               ((some p)
+                (let ((want (count (. (g-proto g p) params))))
+                  (if (= want (count tys))
+                      (Ok (PaProto p tys))
+                      (resolve-err (. c pos) (str-join ["protocol " name " takes " (show want) " type(s)"]))))))))))))
+
+;; ---- defmacro
+
+(defun bad-macro :private (form: Stx) -> (Result a TypeError)
+  (resolve-err (. form pos) "expected (defmacro name (param*) body+)"))
+
+;; `Form`, as an annotation.
+(defun form-type :private (g: Globals pos: Pos) -> (Result TypeAnn TypeError)
+  (match @(. g form)
+    ((some f) (Ok (ANominal f (vec-empty))))
+    (nil (resolve-err pos "Form is not declared"))))
+
+;; `(Vec Form)`, as an annotation.
+(defun vec-form-type :private (g: Globals form-ann: TypeAnn pos: Pos) -> (Result TypeAnn TypeError)
+  (match @(. g vec)
+    ((some v) (Ok (ANominal v [form-ann])))
+    (nil (resolve-err pos "the prelude defines no Vec"))))
+
+;; The parameters of a macro: each a `Form`, those after `...` one `(Vec Form)`.
+(defun macro-params :private (lw: Lowerer form: Stx ps: (Vec Stx) form-ann: TypeAnn vec-ann: TypeAnn)
+    -> (Result (Vec ParamDecl) TypeError)
+  (loop ((i 0) (rest false) (out (vec-empty)))
+    (if (>= i (count ps))
+        (Ok out)
+        (match (stx-as-sym (nth ps i))
+          (nil (bad-macro form))
+          ((some n)
+           (if (= n "...")
+               (recur (+ i 1) true out)
+               (recur (+ i 1) rest
+                      (conj out (ParamDecl (lw-bind lw n BkParam (. (nth ps i) pos)) n false
+                                           (some (if rest vec-ann form-ann)) false)))))))))
+
+;; Rust: lower/top.rs:196 lower_macro: lowers `(defmacro name (p.. ... rest?) body+)` as a
+;; function over `Form` (§2.8): each parameter `Form`, the rest `(Vec Form)`, the result
+;; `Form`.
 (defun lower-macro (g: Globals m: i64 form: Stx) -> (Result FunDef TypeError)
-  (trap "todo: lower-macro"))
+  (let ((items (stx-items form)))
+    (match (Pair (stx-nth-sym items 1) (stx-nth-list items 2))
+      ((Pair (some name) (some ps))
+       (if (< (count items) 4)
+           (bad-macro form)
+           (try-let ((form-ann (form-type g (. form pos)))
+                     (vec-ann (vec-form-type g form-ann (. form pos))))
+             (let ((lw (lowerer-make g m name)))
+               (try-let ((params (macro-params lw form ps form-ann vec-ann))
+                         (body (lw-body lw (stx-from items 3) (. form pos) false)))
+                 (Ok (FunDef name m params (some form-ann) (vec-empty) body true (. form pos))))))))
+      (_ (bad-macro form)))))
 
-;; Rust: lower/top.rs:256
+;; ---- def
+
+;; Rust: lower/top.rs:256 def_parts: `(def name expr)` / `(def name: type expr)`: the name,
+;; annotation and initialiser form.
 (defun def-parts (form: Stx) -> (Result (Triple str (Option Stx) Stx) TypeError)
-  (trap "todo: def-parts"))
+  (let ((items (stx-items form)))
+    (cond ((= (count items) 3)
+           (match (stx-nth-sym items 1)
+             ((some name)
+              (if (some? (annotation-name (nth items 1)))
+                  (resolve-err (. form pos) "expected (def name expr)")
+                  (Ok (Triple name nil (nth items 2)))))
+             (nil (resolve-err (. form pos) "expected (def name expr)"))))
+          ((= (count items) 4)
+           (match (annotation-name (nth items 1))
+             ((some name) (Ok (Triple name (some (nth items 2)) (nth items 3))))
+             (nil (resolve-err (. form pos) "expected (def name: type expr)"))))
+          (else (resolve-err (. form pos) "expected (def name expr)")))))
 
-;; Rust: lower/top.rs:288
+;; ---- extern
+
+;; Extern types are closed: a variable is an error, colours are `send`.
+(defstruct ClosedEnv (extern: str))
+
+(impl AnnEnv ClosedEnv
+  (ann-var (self name pos) (resolve-err pos (str-join ["unknown type " name])))
+  (ann-colour (self) CSend))
+
+(defun bad-extern :private (form: Stx) -> (Result a TypeError)
+  (resolve-err (. form pos) "expected (extern name (type*) -> type opt*)"))
+
+;; One extern position: a scalar, `ptr` or `unit`.
+(defun extern-scalar :private (g: Globals m: i64 name: str f: Stx) -> (Result Ty TypeError)
+  (try-let ((a (type-ann g m f false)))
+    (match a
+      ((AScalar s) (ann-to-ty (AScalar s) (ClosedEnv name) (. f pos)))
+      (_ (Err (type-error-other (. f pos) "extern positions are scalars, ptr or unit"))))))
+
+;; Rust: lower/top.rs:288 extern_type: `(extern c (T̄) -> R opts)`: its type, checking that
+;; every position is a scalar, `ptr` or `unit` (§3.15).
 (defun extern-type (g: Globals m: i64 form: Stx) -> (Result (Triple str Ty bool) TypeError)
-  (trap "todo: extern-type"))
+  (let ((items (stx-items form)))
+    (match (Pair (stx-nth-sym items 1) (stx-nth-list items 2))
+      ((Pair (some name) (some ps))
+       (cond ((not (= (stx-nth-sym items 3) (some "->"))) (bad-extern form))
+             ((< (count items) 5) (bad-extern form))
+             (else
+              (let ((varargs (some? (find-first (fn (o: Stx) (stx-kw? o "varargs")) (stx-from items 5)))))
+                (try-let ((params (try-collect ps (fn (p: Stx) (extern-scalar g m name p))))
+                          (ret (extern-scalar g m name (nth items 4))))
+                  (Ok (Triple name (TFn CSend params ret) varargs)))))))
+      (_ (bad-extern form)))))
 
-;; Rust: lower/top.rs:319
+;; ---- impl methods
+
+;; Rust: lower/top.rs:319 lower_impl_method: lowers one `impl` method body
+;; `(mname (self x..) ret? body+)`.
 (defun lower-impl-method (g: Globals m: i64 inst: i64 mf: Stx owner: str) -> (Result ImplMethod TypeError)
-  (trap "todo: lower-impl-method"))
+  (let ((items (stx-items mf)))
+    (match (Pair (stx-nth-sym items 0) (stx-nth-list items 1))
+      ((Pair (some name) (some ps))
+       (let ((proto (g-proto g (. (table-get (. g instances) inst) proto))))
+         (match (var-index (mapv (fn (md: MethodDef) (. md name)) (. proto methods)) name)
+           (nil (Err (type-error-other (. mf pos) (str-join [name " is not a method of " (. proto name)]))))
+           ((some index)
+            (let ((want (count (. (nth (. proto methods) index) params))))
+              (if (or (not (= (count ps) want)) (not (= (stx-nth-sym ps 0) (some "self"))))
+                  (Err (type-error-other (. mf pos)
+                         (str-join ["method " name " takes (self ..) with " (show want) " parameter(s)"])))
+                  (impl-method-body g m mf owner items ps index)))))))
+      (_ (bad-method mf)))))
+
+(defun bad-method :private (mf: Stx) -> (Result a TypeError)
+  (resolve-err (. mf pos) "a method is (name (self x*) body+)"))
+
+;; The return annotation, parameters and body of method `index`.
+(defun impl-method-body :private (g: Globals m: i64 mf: Stx owner: str items: (Vec Stx) ps: (Vec Stx) index: i64)
+    -> (Result ImplMethod TypeError)
+  (let ((lw (lowerer-make g m owner)))
+    (try-let ((rs (lw-ret-annotation lw items 2))
+              (params (try-collect ps (fn (p: Stx)
+                                        (match (stx-as-sym p)
+                                          (nil (bad-method mf))
+                                          ((some n) (Ok (lw-bind lw n BkParam (. p pos)))))))))
+      (if (>= (. rs snd) (count items))
+          (bad-method mf)
+          (try-let ((body (lw-body lw (stx-from items (. rs snd)) (. mf pos) false)))
+            (Ok (ImplMethod index params (. rs fst) body (. mf pos))))))))

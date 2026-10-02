@@ -1,0 +1,120 @@
+;; compiler/types/dump/funs.fib: the `fun`, `def` and `extern` sections of one module of the
+;; types dump (spec/bootstrap.md §6.3), as `funs`, `defs`, `externs` and `declared` of
+;; crates/fibref/src/types_dump/sections.rs (package P5). Each takes the lines so far and
+;; appends its own, each normalised as Rust's `push` does; types.dump.sections calls them
+;; from `module-lines`, in the order of `Section`.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the section functions take the typed program as an `(Option TypedProgram)` (the `typed`
+;;   of `View`, which is in types.dump.sections, above this module): none before inference
+;;   (`--stage lower`), where a `fun` prints the scheme as declared and a `def` the annotation.
+;; - `fun_schemes[i]` and `def_types[i]`, `Vec<Option<_>>` in Rust, are `(Map i64 _)`: a missing
+;;   key is the `None` that prints `_`.
+(ns types.dump.funs
+  (:require [syntax.dump :as sdump])
+  (:use fib.string types.ty types.scheme types.table types.ast types.decls types.display
+        types.program types.dump.normal types.dump.scheme types.dump.ast))
+
+(defun emit :private (acc: (Vec str) text: str) -> (Vec str)
+  (conj acc (normalise text)))
+
+;; The annotation as written, or `_` when it is not there.
+(defun ann-or-hole :private (g: Globals a: (Option TypeAnn)) -> str
+  (match a
+    ((some x) (ann-text g x))
+    (nil "_")))
+
+(defun param-text :private (g: Globals p: ParamDecl) -> str
+  (if (. p amp)
+      (str-join ["(& " (ann-or-hole g (. p ann)) ")"])
+      (ann-or-hole g (. p ann))))
+
+(defun bound-text :private (g: Globals b: PredAnn) -> str
+  (match b
+    ((PaProto id args)
+     (str-join ["(" (. (g-proto g id) name)
+                (str-join (mapv (fn (a: TypeAnn) (str-join [" " (ann-text g a)])) args)) ")"]))
+    ((PaSend a) (str-join ["(Send " (ann-text g a) ")"]))))
+
+;; `(fn (A..) R) where B..` of a `defun` as it was written: an annotation that is not there
+;; prints `_`, an `&` parameter `(& A)`.
+(defun declared :private (g: Globals f: FunDef) -> str
+  (let ((bounds (mapv (fn (b: PredAnn) (bound-text g b)) (. f bounds))))
+    (str-join ["(fn (" (join " " (mapv (fn (p: ParamDecl) (param-text g p)) (. f params))) ") "
+               (ann-or-hole g (. f ret))
+               ")" (if (empty? bounds) "" (str-join [" where " (join " " bounds)]))])))
+
+;; ` &NAME:borrow` for each parameter, the `&` and `:borrow` when it has them.
+(defun param-words :private (params: (Vec ParamDecl)) -> str
+  (str-join (mapv (fn (p: ParamDecl)
+                    (str-join [" " (if (. p amp) "&" "") (. p name) (if (. p borrow) ":borrow" "")]))
+                  params)))
+
+;; The scheme of fun `i`: as declared before inference, the inferred one after.
+(defun fun-scheme :private (g: Globals typed: (Option TypedProgram) i: i64 f: FunDef) -> str
+  (match typed
+    (nil (declared g f))
+    ((some t)
+     (match (get (. t fun-schemes) i)
+       ((some sc) (show-scheme-in g sc))
+       (nil "_")))))
+
+;; `fun NAME : SCHEME params P.. POS` (`macro` for a `defmacro`) of every function module m
+;; defines, in declaration order.
+(defun fun-section (acc: (Vec str) g: Globals typed: (Option TypedProgram) m: i64 file: str) -> (Vec str)
+  (let ((rows (table-rows (. g funs))))
+    (loop ((i 0) (out acc))
+      (if (>= i (count rows))
+          out
+          (let ((f (nth rows i)))
+            (recur (+ i 1)
+                   (if (= (. f module) m)
+                       (emit out (str-join [(if (. f is-macro) "macro" "fun") " " (. f name) " : "
+                                            (fun-scheme g typed i f) " params" (param-words (. f params))
+                                            " " (sdump/span-in (. f pos) file)]))
+                       out)))))))
+
+;; The type of def `i`: the annotation before inference, the inferred type after.
+(defun def-type :private (g: Globals typed: (Option TypedProgram) i: i64 d: DefDef) -> str
+  (match typed
+    (nil (ann-or-hole g (. d ann)))
+    ((some t)
+     (match (get (. t def-types) i)
+       ((some ty) (printer-ty (printer-new g) ty))
+       (nil "_")))))
+
+;; `def NAME : TYPE POS` of every def module m defines, in declaration order.
+(defun def-section (acc: (Vec str) g: Globals typed: (Option TypedProgram) m: i64 file: str) -> (Vec str)
+  (let ((rows (table-rows (. g defs))))
+    (loop ((i 0) (out acc))
+      (if (>= i (count rows))
+          out
+          (let ((d (nth rows i)))
+            (recur (+ i 1)
+                   (if (= (. d module) m)
+                       (emit out (str-join ["def " (. d name) " : " (def-type g typed i d) " "
+                                            (sdump/span-in (. d pos) file)]))
+                       out)))))))
+
+;; The module that binds the extern `id`: looked up by its name in each module in turn (the
+;; tables of names are maps and are not iterated).
+(defun extern-owner :private (g: Globals id: i64) -> (Option i64)
+  (let ((name (. (g-ext g id) name)))
+    (loop ((m 0))
+      (cond ((>= m (table-count (. g modules))) nil)
+            ((= (get @(. (g-names g m) values) name) (some (GExtern id))) (some m))
+            (else (recur (+ m 1)))))))
+
+;; `extern NAME : TYPE[ varargs] POS` of every extern module m binds, in declaration order.
+(defun extern-section (acc: (Vec str) g: Globals m: i64 file: str) -> (Vec str)
+  (let ((rows (table-rows (. g externs))))
+    (loop ((i 0) (out acc))
+      (if (>= i (count rows))
+          out
+          (let ((x (nth rows i)))
+            (recur (+ i 1)
+                   (if (= (extern-owner g i) (some m))
+                       (emit out (str-join ["extern " (. x name) " : " (printer-ty (printer-new g) (. x ty))
+                                            (if (. x varargs) " varargs" "") " "
+                                            (sdump/span-in (. x pos) file)]))
+                       out)))))))
