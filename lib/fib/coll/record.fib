@@ -1,5 +1,81 @@
-;; owner: Y8
-;; fib.coll.record: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the macros `defrecord with` (and the `->Name` function `defrecord` writes).
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
-(ns fib.coll.record (:use fib.core fib.seq fib.coll.protocols fib.coll.seqs))
+;; fib.coll.record: the macros `defrecord` and `with` (stdlib §4.2 rows defrecord, ->Name, with; tranche 2 plan Y8, items L17 and
+;; PC2-5). Exports the two macros; ->Name is the function `defrecord` writes, one per record, not a name of this part. Replaces
+;; nothing in the prelude.
+;;
+;; (defrecord Name [f: T ..]) expands to the defstruct, the six derives and the positional constructor, in one top-level do:
+;;   (do (defstruct Name (f: T ..)) (derive Eq Name) .. (derive ToStr Name) (defun ->Name (f: T ..) -> Name (Name f ..)))
+;; (defrecord (Name a b) [f: a ..]) is the same with the head as the struct's own and as the result type of ->Name, so a
+;; generic record works as R8's derive does (syntax §3.16). A field with no instance of one of the six is the checker's error
+;; naming the type and the first instance missing; there is no default derive in tranche 2 (the opt-out is a defstruct with
+;; the derives its author chooses). `println` of a record is Show, whose derived text is the builtin's, not the page's: case 2806.
+;;
+;; (with e (f v) ..) is (let ((c (cell e))) (do (set-field! &c f v) .. @c)) with c a gensym: e is evaluated once, each v
+;; after it and in order against the original e, and e is not touched (probe P16).
+;;
+;; Decided here, where the page is silent:
+;;  - the fields are the vector `[f: T ..]` (a list is accepted too); a record has at least one field, and every field is
+;;    written `f: T` with its type, so the type of ->Name is known without reading the struct (the macro cannot, it expands
+;;    before the struct exists). Each of those is a `(trap "defrecord: ...")`, which fibref reports as `macro defrecord
+;;    failed: FILE:L:C: trap: defrecord: ...`; the stage-1 fibc aborts the compiler on a macro's trap instead, so these
+;;    errors are shown by fibref only (reported, not cased).
+;;  - the derives are written with the bare protocol names: `derive` takes no qualified name (`fib.core/Eq` is "cannot derive").
+;;  - `(with e)` is e; an update that is not a list of a field and a value is `(trap "with: each update is (field value)")`;
+;;    the field is not looked up, so an unknown one is set-field!'s own error (`P has no field z`, case 2808).
+;;  - macro bodies use the prelude's names only (`vec-count vec-nth vec-conj str-concat str-len str-slice str-byte-at`):
+;;    the library's `count` and `nth` are not bound at expansion time (stdlib §6.3).
+(ns fib.coll.record)
+
+;; a copy of the struct e with the named fields replaced
+
+(defmacro with (e ... updates)
+  (let ((c (gensym "with")))
+    (loop ((i 0) (sets (vec-empty)))
+      (if (< i (vec-count updates))
+          (match (vec-nth updates i)
+            ((List pair)
+             (if (= (vec-count pair) 2)
+                 (recur (+ i 1) (vec-conj sets `(set-field! (& ,c) ,(vec-nth pair 0) ,(vec-nth pair 1))))
+                 (trap "with: each update is (field value)")))
+            (_ (trap "with: each update is (field value)")))
+          `(let ((,c (fib.prelude/cell ,e)))
+             (do ,@sets @,c))))))
+
+;; the struct, its six derives and ->Name; the field names for the constructor are the written ones without the colon
+(defmacro defrecord (head fields)
+  (let ((tag (match head
+               ((Sym _) head)
+               ((List parts)
+                (if (> (vec-count parts) 0)
+                    (match (vec-nth parts 0)
+                      ((Sym _) (vec-nth parts 0))
+                      (_ (trap "defrecord: the name is Name or (Name param ..)")))
+                    (trap "defrecord: the name is Name or (Name param ..)")))
+               (_ (trap "defrecord: the name is Name or (Name param ..)"))))
+        (items (match fields
+                 ((Vec xs) xs)
+                 ((List xs) xs)
+                 (_ (trap "defrecord: the fields are a vector [f: T ..]"))))
+        (ctor (match tag
+                ((Sym s) (Sym (str-concat "->" s)))
+                (_ (trap "defrecord: the name is Name or (Name param ..)")))))
+    (loop ((i 0) (names (vec-empty)))
+      (if (< i (vec-count items))
+          (match (vec-nth items i)
+            ((Sym s)
+             (let ((n (str-len s)))
+               (if (and (> n 1)
+                        (< (+ i 1) (vec-count items))
+                        (= (str-byte-at s (- n 1)) 58i8))
+                   (recur (+ i 2) (vec-conj names (Sym (str-slice s 0 (- n 1)))))
+                   (trap "defrecord: a field is written f: T"))))
+            (_ (trap "defrecord: a field is written f: T")))
+          (if (= (vec-count names) 0)
+              (trap "defrecord: a record has at least one field")
+              `(do (defstruct ,head ,(List items))
+                   (derive Eq ,tag)
+                   (derive Ord ,tag)
+                   (derive Hash ,tag)
+                   (derive Show ,tag)
+                   (derive Debug ,tag)
+                   (derive ToStr ,tag)
+                   (defun ,ctor ,(List items) -> ,head (,tag ,@names))))))))

@@ -1,0 +1,35 @@
+;; spec:   stdlib §4.2 (row defrecord), §2.7, syntax §3.16 (derive of a generic struct), plan Y8
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: defrecord ->Name
+;; (defrecord (Box a) [v: a n: i64]) names its parameters as defstruct does, and the six derives and ->Box carry
+;; them: one record serves every instantiation whose parameter has the instances (R8, case 813). ->Box is generic
+;; too: it is used at i64, at str and at a Box of a Box in one program.
+;; Decided here: the head of the record is written once and is the result type of ->Box, so every field of a generic
+;; record is annotated with the parameters the head names.
+(ns main (:use tl.check))
+
+(defrecord (Box a) [v: a n: i64])
+(defrecord (Two a b) [l: a r: b])
+
+(defun main () -> i64
+  (let ((c (checks))
+        (bi (->Box 1 2))
+        (bs (->Box "s" 3)))
+    (do (check c (= bi (Box 1 2)))
+        (check c (= bs (->Box "s" 3)))
+        (check c (!= bs (->Box "s" 4)))
+        (check c (< bi (->Box 1 3)))
+        (check c (< bs (->Box "t" 0)))
+        (check c (= (hash bs) (hash (->Box "s" 3))))
+        (check c (= (debug bi) "#main.Box{:v 1, :n 2}"))
+        (check c (= (debug bs) "#main.Box{:v \"s\", :n 3}"))
+        (check c (= (debug (->Box (->Box 1 2) 3)) "#main.Box{:v #main.Box{:v 1, :n 2}, :n 3}"))
+        (check c (= (->Box (->Box 1 2) 3) (Box (Box 1 2) 3)))
+        (check c (= (debug (->Two 1.5 [1 2])) "#main.Two{:l 1.5, :r [1 2]}"))
+        (check c (= (->Two \a (some 1)) (->Two \a (some 1))))
+        (check c (< (->Two \a (some 1)) (->Two \b nil)))
+        (check c (= (. (->Two "l" 9) r) 9))
+        (checks-result c))))

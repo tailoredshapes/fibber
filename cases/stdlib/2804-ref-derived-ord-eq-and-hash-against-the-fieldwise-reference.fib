@@ -1,0 +1,55 @@
+;; spec:   stdlib §4.2 (row defrecord), §8.1 (ref- cases), plan Y8
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: defrecord ->Name
+;; The Eq, Ord and Hash of a record against what a person writes by hand for three fields: `=` is the three fields
+;; `=`, `<` is lexicographic from the first field, and records that are `=` have one hash. 300 seeded pairs whose
+;; fields come from three values each, so that equal records and records equal in a prefix occur (two checks at the
+;; end count the equal pairs and the ordered pairs drawn). The planted fault is a reference whose `<` forgets the last
+;; field: a second Checks runs it and must fail.
+(ns main (:use tl.rng tl.check))
+
+(defrecord T3 [a: i64 b: str c: i64])
+
+(defun strs () -> (Vec str) ["" "a" "b"])
+
+;; the reference; short-last drops the third field from the lexicographic test (the planted fault)
+(defun ref-less (x: T3 y: T3 short-last: bool) -> bool
+  (if (< (. x a) (. y a))
+      true
+      (if (!= (. x a) (. y a))
+          false
+          (if (< (. x b) (. y b))
+              true
+              (if (!= (. x b) (. y b))
+                  false
+                  (if short-last false (< (. x c) (. y c))))))))
+
+(defun ref-equal (x: T3 y: T3) -> bool
+  (and (= (. x a) (. y a)) (= (. x b) (. y b)) (= (. x c) (. y c))))
+
+(defun draw (g: Rng) -> T3
+  (->T3 (rng-below g 3) (nth (strs) (rng-below g 3)) (rng-below g 3)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (g (rng 2804))
+        (eqs (cell 0))
+        (lts (cell 0)))
+    (do (dotimes (t 300)
+          (let ((x (draw g))
+                (y (draw g)))
+            (do (check c (= (< x y) (ref-less x y false)))
+                (check p (= (< x y) (ref-less x y true)))
+                (check c (= (= x y) (ref-equal x y)))
+                (check c (= (!= x y) (not (ref-equal x y))))
+                (check c (if (= x y) (= (hash x) (hash y)) true))
+                (if (= x y) (set! eqs (+ @eqs 1)) ())
+                (if (< x y) (set! lts (+ @lts 1)) ()))))
+        (check c (> @eqs 5))
+        (check c (> @lts 50))
+        (check-detects c p)
+        (checks-result c))))

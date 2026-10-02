@@ -1,0 +1,43 @@
+;; spec:   stdlib §4.2 (rows defrecord, ->Name), §2.7, §7 L17, plan Y8
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: defrecord ->Name zip-with
+;; (defrecord P [x: i64 y: str]) is a defstruct that derives Eq, Ord, Hash, Show, Debug and ToStr, and a function
+;; ->P that takes the fields in order. Equal records are `=` and have the same hash; `<` goes field by field from the
+;; first; Debug is the record text of the page, `#main.P{:x 1, :y "a"}`, the module being the one that expanded the
+;; macro (decided in R8, case 810). ->P is a function value: it is passed to zip-with and held in a let, which the
+;; bare constructor `P` is not under fibc (B5). The field types `x: i64` are the defstruct's own, so a record is
+;; written as a struct is. The derived Show (what `println` writes) is case 2806.
+(ns main (:use tl.check))
+
+(defrecord P [x: i64 y: str])
+(defrecord Q [a: P n: i64])
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (->P 1 "a"))
+        (mk ->P)
+        (ps (zip-with ->P [1 2] ["u" "v"])))
+    (do (check c (= p (P 1 "a")))
+        (check c (= (->P 1 "a") (->P 1 "a")))
+        (check c (!= p (P 1 "b")))
+        (check c (!= p (P 2 "a")))
+        (check c (< (P 1 "a") (P 1 "b")))
+        (check c (< (P 1 "z") (P 2 "a")))
+        (check c (not (< p p)))
+        (check c (> (P 2 "a") (P 1 "z")))
+        (check c (= (hash p) (hash (P 1 "a"))))
+        (check c (!= (hash p) (hash (P 1 "b"))))
+        (check c (= (debug p) "#main.P{:x 1, :y \"a\"}"))
+        (check c (= (pr-str p) "#main.P{:x 1, :y \"a\"}"))
+        (check c (= (. (->P 7 "q") x) 7))
+        (check c (= (. (->P 7 "q") y) "q"))
+        (check c (= (mk 3 "t") (P 3 "t")))
+        (check c (= (count ps) 2))
+        (check c (= (to-vec ps) [(P 1 "u") (P 2 "v")]))
+        (check c (= (->Q p 3) (Q (P 1 "a") 3)))
+        (check c (< (->Q p 3) (->Q p 4)))
+        (check c (= (debug (->Q p 3)) "#main.Q{:a #main.P{:x 1, :y \"a\"}, :n 3}"))
+        (checks-result c))))

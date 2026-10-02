@@ -1,0 +1,47 @@
+;; spec:   stdlib §4.2 (row with), §8.1 (law- cases), plan Y8 (probe P16)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: defrecord ->Name with
+;; The law of `with`: for a record r made from drawn fields, (with r (f v)) has f = v and every other field
+;; as r's, and r is still the record it was made from (the original is untouched; compared against a second
+;; record made from the same drawn values, never against r itself). Three fields in turn, 300 seeded draws
+;; (strings of every scalar width), and one with of two fields that must equal two nested withs. The planted fault is the
+;; law stated wrongly, that the other fields come from the new value (the replaced field's value is written to
+;; the next field as well): a second Checks runs it and must fail.
+(ns main (:use tl.rng tl.gen tl.check))
+
+(defrecord R [i: i64 s: str j: i64])
+
+;; the law as stated; wrong-keep is the planted reference: the field after the replaced one is the new value too
+(defun law-holds (r: R k: i64 v: i64 w: str wrong-keep: bool) -> bool
+  (let ((i0 (. r i)) (s0 (. r s)) (j0 (. r j)))
+    (let ((r2 (if (= k 0) (with r (i v)) (if (= k 1) (with r (s w)) (with r (j v))))))
+      (if (= k 0)
+          (and (= (. r2 i) v) (= (. r2 s) s0) (= (. r2 j) (if wrong-keep v j0)))
+          (if (= k 1)
+              (and (= (. r2 i) i0) (= (. r2 s) w) (= (. r2 j) (if wrong-keep v j0)))
+              (and (= (. r2 i) i0) (= (. r2 s) s0) (= (. r2 j) v)))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p (checks))
+        (g (rng 2803)))
+    (do (dotimes (t 300)
+          (let ((i (- (rng-below g 2001) 1000))
+                (j (- (rng-below g 2001) 1000))
+                (w (gen-str g (rng-below g 6)))
+                (s (gen-str g (rng-below g 6)))
+                (k (rng-below g 3))
+                (v (- (rng-below g 2001) 1000)))
+            (let ((r (->R i s j))
+                  (copy (R i s j)))
+              (do (check c (law-holds r k v w false))
+                  (check p (law-holds r k v w true))
+                  (check c (= r copy))
+                  (check c (= (with (with r (i v)) (j (+ v 1))) (with r (i v) (j (+ v 1)))))
+                  (check c (= r copy))))))
+        (check c (= (checks-made c) 1200))
+        (check-detects c p)
+        (checks-result c))))

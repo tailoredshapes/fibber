@@ -1,0 +1,48 @@
+;; spec:   stdlib §4.2 (row with), plan Y8 (probe P16)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: defrecord ->Name with
+;; (with e (f v) ..) is a copy of the struct e with the named fields replaced; e is not touched. Each value is
+;; evaluated against the original e, in order, so `(with a (bal 5) (id (. a bal)))` gives the id the old balance;
+;; the same field twice is its last value; no update is a copy that is `=` to e. e is evaluated once, whatever
+;; the number of fields. Nested records are updated by nesting `with` (Clojure's update-in over records), and a
+;; fold that rebuilds the record at every step leaves the starting record as it was. Decided here: `(with e)` is
+;; e, an empty update list being no error.
+(ns main (:use tl.check))
+
+(defrecord Acct [id: i64 owner: str bal: i64])
+(defrecord Book [acct: Acct k: i64])
+
+(defun bump (a: Acct) -> Acct (with a (bal (+ (. a bal) 1))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a (->Acct 1 "ann" 10))
+        (n (cell 0)))
+    (let ((b (with a (bal 20)))
+          (d (with a (id 9) (owner "bob")))
+          (mk (fn () (do (set! n (+ @n 1)) (Acct @n "z" 0))))
+          (o (->Book a 5)))
+      (do (check c (= b (Acct 1 "ann" 20)))
+          (check c (= (. b id) 1))
+          (check c (= (. b owner) "ann"))
+          (check c (= a (Acct 1 "ann" 10)))
+          (check c (= d (Acct 9 "bob" 10)))
+          (check c (= (with a (bal 1) (bal 2)) (Acct 1 "ann" 2)))
+          (check c (= (with a) a))
+          (check c (= (with a (bal 5) (id (. a bal))) (Acct 10 "ann" 5)))
+          (check c (= (with (mk) (bal 7) (id 8)) (Acct 8 "z" 7)))
+          (check c (= @n 1))
+          (check c (= (with (mk) (owner "q")) (Acct 2 "q" 0)))
+          (check c (= @n 2))
+          (check c (= (bump a) (Acct 1 "ann" 11)))
+          (check c (= (bump (bump a)) (Acct 1 "ann" 12)))
+          (check c (= (with o (acct (with (. o acct) (bal 99)))) (Book (Acct 1 "ann" 99) 5)))
+          (check c (= o (Book (Acct 1 "ann" 10) 5)))
+          (check c (= (loop ((acc a) (i 0))
+                        (if (< i 3) (recur (bump acc) (+ i 1)) acc))
+                      (Acct 1 "ann" 13)))
+          (check c (= a (Acct 1 "ann" 10)))
+          (checks-result c)))))
