@@ -102,6 +102,10 @@ pub struct Options {
     /// `--implicit-lib LIST`: the implicit modules instead of
     /// `IMPLICIT_LIB`.
     pub implicit_lib: Option<Vec<String>>,
+    /// The directories modules are found under after the main file's:
+    /// each `-I`, then each of `$FIB_LIB`, as `fibref run` searches them
+    /// (spec/syntax.md §5); the built-in library comes last.
+    pub roots: Vec<std::path::PathBuf>,
     /// `--prelude`: each file is a library prelude, checked alone.
     pub prelude: bool,
 }
@@ -134,7 +138,7 @@ pub fn own_files(files: &[String], opts: &Options) -> (String, u8) {
 /// The dump of the program whose main module is `source` (the file
 /// `file`).
 fn dump_program(source: &str, file: &str, opts: &Options) -> Dump {
-    match expand_modules(source, file, &opts.implicit_lib) {
+    match expand_modules(source, file, (&opts.implicit_lib, &opts.roots)) {
         Err(dump) => dump,
         Ok(x) => {
             let layout = layout_of(&x.modules, x.shown, opts.implicit);

@@ -42,7 +42,7 @@ commands:
                   or with --print each top-level form as the printer writes
                   it, one per line; exit 1 if any file does not read, 2 if
                   one cannot be read
-  expand [options] <file>..
+  expand [-I dir].. [options] <file>..
                   print the dump of each program after expansion, module by
                   module (spec/bootstrap.md §5); exit 1 if a program does not
                   read, load or expand, 2 if a file cannot be read. Options,
@@ -53,7 +53,7 @@ commands:
                   modules of this dump), --no-runner (a user macro call is
                   pending), --max-steps N, --max-depth N, --max-forms N
                   (smaller limits)
-  types [options] <file>..
+  types [-I dir].. [options] <file>..
                   print the dump of each program after type checking, module
                   by module (spec/bootstrap.md §6); exit 1 if a program does
                   not read, load, expand or type, 2 if a file cannot be
@@ -62,13 +62,16 @@ commands:
                   extern, unit, error, ast, tables), --library (no main
                   needed), --prelude (each file is a library prelude),
                   --implicit, --implicit-lib A,B, --ast, --tables
-  own [OPTION..] <file>..
+  own [-I dir].. [OPTION..] <file>..
                   print the ownership decisions of each file (the dump
                   of spec/bootstrap.md section 7). Options, before the
                   files: --sections A,B (body, facts, summary, taken,
                   error, explain), --library, --prelude, --implicit,
                   --implicit-lib A,B
-  help           print this message";
+                  (expand, types and own find a module as run does: beside
+                  the file, under each -I dir, under each $FIB_LIB dir,
+                  then in the library the executable carries)
+  help          print this message";
 
 /// The directory `cases` runs when none is given.
 const DEFAULT_CASES_DIR: &str = "cases/ownership";
@@ -329,8 +332,16 @@ fn main() -> ExitCode {
     };
     let (dirs, args) = fibref::cmdline::split_roots(&args);
     let command = parse(&args);
-    if !dirs.is_empty() && !matches!(command, Command::Run { .. } | Command::Explain { .. }) {
-        eprintln!("fibref: -I belongs to `run` and `explain`\n{USAGE}");
+    let takes_roots = matches!(
+        command,
+        Command::Run { .. }
+            | Command::Explain { .. }
+            | Command::Expand { .. }
+            | Command::Types { .. }
+            | Command::Own { .. }
+    );
+    if !dirs.is_empty() && !takes_roots {
+        eprintln!("fibref: -I belongs to `run`, `explain`, `expand`, `types` and `own`\n{USAGE}");
         return ExitCode::from(2);
     }
     let roots = Roots::from_env(&dirs, std::env::var_os("FIB_LIB").as_deref());
@@ -339,9 +350,18 @@ fn main() -> ExitCode {
         Command::Explain { file } => run_explain(&file, &roots),
         Command::Run { file, args } => run_file(&file, &args, &roots),
         Command::Read { files, print } => read_files(&files, print),
-        Command::Expand { files, opts } => expand_files(&files, &opts),
-        Command::Types { files, opts } => types_files(&files, &opts),
-        Command::Own { files, opts } => own_files(&files, &opts),
+        Command::Expand { files, mut opts } => {
+            opts.roots = roots.dirs().to_vec();
+            expand_files(&files, &opts)
+        }
+        Command::Types { files, mut opts } => {
+            opts.roots = roots.dirs().to_vec();
+            types_files(&files, &opts)
+        }
+        Command::Own { files, mut opts } => {
+            opts.roots = roots.dirs().to_vec();
+            own_files(&files, &opts)
+        }
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS

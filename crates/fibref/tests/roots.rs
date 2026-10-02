@@ -182,7 +182,7 @@ fn a_command_that_runs_no_program_refuses_the_flag_instead_of_ignoring_it() {
             .expect("fibref runs");
         assert_eq!(out.status.code(), Some(2), "{words:?}: {}", said(&out));
         assert!(
-            said(&out).contains("-I belongs to `run` and `explain`"),
+            said(&out).contains("-I belongs to `run`, `explain`, `expand`, `types` and `own`"),
             "{}",
             said(&out)
         );

@@ -126,6 +126,10 @@ pub struct Options {
     /// `--implicit-lib LIST`: the implicit modules instead of
     /// [`IMPLICIT_LIB`].
     pub implicit_lib: Option<Vec<String>>,
+    /// The directories modules are found under after the main file's:
+    /// each `-I`, then each of `$FIB_LIB`, as `fibref run` searches them
+    /// (spec/syntax.md §5); the built-in library comes last.
+    pub roots: Vec<std::path::PathBuf>,
     /// `--prelude`: each file is a library prelude, checked alone.
     pub prelude: bool,
     /// `--ast`: also print the `ast` section.
@@ -269,7 +273,7 @@ pub(crate) struct Expanded {
 pub(crate) fn expand_modules(
     source: &str,
     file: &str,
-    implicit_lib: &Option<Vec<String>>,
+    (implicit_lib, roots): (&Option<Vec<String>>, &[std::path::PathBuf]),
 ) -> Result<Expanded, Dump> {
     let mut ctx = ExpandCtx::new();
     let prelude =
@@ -278,7 +282,7 @@ pub(crate) fn expand_modules(
         Some(list) => list.iter().map(String::as_str).collect(),
         None => IMPLICIT_LIB.to_vec(),
     };
-    let loaded = try_load_with(source, file, &Roots::default(), &implicit)
+    let loaded = try_load_with(source, file, &Roots::new(roots.to_vec()), &implicit)
         .map_err(|e| Dump::failure(load_record(&e, file)))?;
     let all: Vec<Form> = loaded.iter().flat_map(|l| l.forms.clone()).collect();
     let mut runner = MacroEvaluator::new(&all, prelude.clone());
@@ -312,7 +316,7 @@ pub(crate) fn expand_modules(
 /// The dump of the program whose main module is `source` (the file
 /// `file`).
 fn dump_program(source: &str, file: &str, opts: &Options) -> Dump {
-    match expand_modules(source, file, &opts.implicit_lib) {
+    match expand_modules(source, file, (&opts.implicit_lib, &opts.roots)) {
         Err(dump) => dump,
         Ok(x) => {
             let layout = layout_of(&x.modules, x.shown, opts.implicit);

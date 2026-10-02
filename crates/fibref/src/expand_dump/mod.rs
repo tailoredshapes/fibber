@@ -92,6 +92,10 @@ pub struct Options {
     /// implicit module), so that what a program does once the library is
     /// implicit can be seen before it is.
     pub implicit_lib: Option<Vec<String>>,
+    /// The directories modules are found under after the main file's:
+    /// each `-I`, then each of `$FIB_LIB`, as `fibref run` searches them
+    /// (spec/syntax.md §5); the built-in library comes last.
+    pub roots: Vec<std::path::PathBuf>,
     pub runner: RunnerKind,
     pub limits: LimitOverrides,
 }
@@ -172,7 +176,7 @@ fn dump_program(source: &str, file: &str, opts: &Options) -> Dump {
         Some(list) => list.iter().map(String::as_str).collect(),
         None => IMPLICIT_LIB.to_vec(),
     };
-    let loaded = match try_load_with(source, file, &Roots::default(), &implicit) {
+    let loaded = match try_load_with(source, file, &Roots::new(opts.roots.clone()), &implicit) {
         Ok(l) => l,
         Err(e) => return Dump::failure(load_record(&e, file)),
     };

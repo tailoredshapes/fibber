@@ -91,6 +91,7 @@ mod tests {
             library: true,
             implicit: true,
             implicit_lib: Some(words(&["fib.a", "fib.b"])),
+            roots: Vec::new(),
             prelude: true,
         };
         let all = words(&[

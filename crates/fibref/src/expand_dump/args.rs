@@ -125,6 +125,7 @@ mod tests {
             context: true,
             implicit: true,
             implicit_lib: Some(words(&["fib.a", "fib.b"])),
+            roots: Vec::new(),
             runner: RunnerKind::None,
             limits: LimitOverrides {
                 steps: Some(3),

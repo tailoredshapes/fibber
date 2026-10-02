@@ -258,6 +258,7 @@ repository root. The prelude's output is not part of a program's dump;
 | `--context` | after the forms of each module, before it is ended, `-- context NS` and the lines of §5.2 |
 | `--implicit` | print the sections of the implicit modules and of the modules read for them (they come first), and, with `--context`, a line `  implicit "M"` under `scope` for each implicit module the scope sees, after the `use` lines |
 | `--implicit-lib LIST` | the implicit modules of this dump are those of LIST, module names separated by commas, in the order they are loaded, instead of `modules::IMPLICIT_LIB`; the empty text is none; an empty name is refused. It makes the rule above testable with small modules, and `--implicit-lib ""` is a dump with no library at all, which is what the byte-for-byte test of the expander runs most inputs with (the default, with the real library, costs its expansion per file and is run on a sample) |
+| `-I DIR` | a module is found as `fibref run` finds it (syntax §5): beside the file, then under each `-I DIR` in the order given, then under each directory of the environment variable `FIB_LIB`, then in the library the executable carries. Any number of `-I`, before the files (as for `run`, a `-I` is taken out of the words wherever it stands before `--`). Without them, and with `FIB_LIB` unset, the dump reads the embedded library only; with them, a change under `lib/` reaches the dump at once, so the Rust dump can be made from the same library as the tool written in fibber, and their expression ids agree |
 | `--no-runner` | a call of a user macro is `MacroNeedsEvaluator` (`NoRunner`); the default is the interpreter's macro evaluator, for the stage that has a runner (§5.4) |
 | `--max-steps N`, `--max-depth N`, `--max-forms N` | the limits of `ExpandCtx` (syntax §3.16) once the prelude is expanded, so that a small one reaches its error on a small input |
 
@@ -641,6 +642,7 @@ error: the types dump panicked` and status 2.
 | `--library` | `main` is not required (`infer_lowered(l, false)`, what `check_library` does): the 56 files of `lib/` are modules with no `main` |
 | `--implicit` | print the sections of the implicit modules and of the modules read for them (they come first, as in §5.1) and the section of the prelude (`-- module fib.prelude lib/prelude.fib`, first of all) |
 | `--implicit-lib LIST` | the implicit modules of this dump are those of LIST (§5.1: `--implicit-lib ""` is no library, which most tests run with, the default checks the whole library, about forty modules, before the program) |
+| `-I DIR` | as in §5.1: the modules are found beside the file, under each `-I DIR`, under each directory of `FIB_LIB`, then in the embedded library, exactly as `fibref run` searches them |
 | `--prelude` | each FILE is a library prelude, as in §5.1 for the expander: the expander's own prelude and FILE expanded in the module `fib.prelude`, which is then checked alone, with no `main` (`--library` is implied) and no other module; one section `-- module fib.prelude FILE`. With `lib/prelude.fib` its lines are those the `fib.prelude` section of `--implicit` has, under another file name |
 
 ### 6.3 The sections of a module
@@ -939,6 +941,7 @@ status 2.
 | `--library` | `main` is not required, as in §6.2 |
 | `--implicit` | print the sections of the implicit modules, of the modules read for them and of `fib.prelude` (first of all), as in §6.2 |
 | `--implicit-lib LIST` | the implicit modules of this dump, as in §6.2 (`--implicit-lib ""` is no library, which most tests run with) |
+| `-I DIR` | as in §5.1 (and §6.2): the modules are found beside the file, under each `-I DIR`, under each directory of `FIB_LIB`, then in the embedded library, as `fibref run` searches them |
 | `--prelude` | each FILE is a library prelude, checked alone with no `main`, as in §6.2; one section `-- module fib.prelude FILE` |
 
 There is no `--stage`, `--ast` or `--tables`: the pass has one stage and
