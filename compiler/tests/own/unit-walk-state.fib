@@ -1,0 +1,366 @@
+;; compiler/tests/own/unit-walk-state.fib: own.walk.state, own.walk.callee and own.walk.pattern (package O3)
+;; on hand-built walkers: the one test of pattern.rs (`owned_scrutinee_binds_aliases_and_parts_of_its_temporary`)
+;; and a check of every function of walk/mod.rs, callee.rs and pattern.rs against what the Rust code does (the
+;; 46 tests of own/tests need the whole pass: the per-body tally of compiler/tests/own/compare-bodies.sh
+;; judges those). The program is a small one checked by the front end, so that the tables (types, builtins,
+;; globals) are real; the walker's `expr` field is a script keyed by expression id.
+;; Needs lib/prelude.fib in the working directory (run from the repository root). Prints `ok NAME` or `FAIL NAME`.
+;; Build: fibc build compiler/tests/own/unit-walk-state.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [syntax.reader :as reader] [expand.program :as prog])
+  (:use fib.coll.record syntax.pos syntax.form expand.ctx expand.types types.ast types.decls types.names
+        types.program types.builtins types.driver types.check own.program own.facts own.walk.state
+        own.walk.callee own.walk.lit own.walk.step own.walk.pattern))
+
+(def source: str
+  "(defstruct Box (v: i64))
+(defprotocol Mix (mix (self :owned a: i64 b: i64 :borrow) -> i64))
+(impl Mix i64 (mix (self a b) 0))
+(defun id-i (x: i64) -> i64 x)
+(defun keep (s: str) -> str s)
+(defun main () -> i64
+  (let ((k (fn (x: i64) -> i64 x))
+        (s \"hi\"))
+    (do (cell 1) (fn (y: i64) -> i64 y) (some 1) (Box 5) (id-i 2) (keep s) (k 3) (mix 5 1 2) (some s) 0)))
+")
+
+(defun must (r: (Result a e)) -> a (match r ((Ok x) x) ((Err _) (trap "the test program was rejected"))))
+
+(defun typed-of (src: str) -> TypedProgram
+  (let [ctx (ctx-new)
+        prelude (must (prelude-forms ctx))
+        forms (must (reader/read-all src "t.fib"))
+        expanded (must (prog/expand-program forms ctx (no-runner)))
+        l (must (lower-modules [(Expanded (module-spec-main) expanded)] prelude))]
+    (must (infer-lowered l true))))
+
+(defun fun-id (p: TypedProgram n: str) -> i64
+  (match (g-value (. p globals) @(. (. p globals) main) n) ((some (GFun f)) f) (_ (trap "no such function"))))
+
+(defun steps-of (e: Expr) -> (Vec Expr)
+  (match (. e kind) ((ELet _ b) (steps-of b)) ((EDo es) es) (_ [e])))
+
+(defun head-of (e: Expr) -> Expr (match (. e kind) ((ECall h _) h) (_ e)))
+
+(defun builtin-id (n: str) -> i64
+  (let [t (builtin-table)] (unwrap (find-first (fn (i: i64) (= (. (nth t i) name) n)) (range (count t))))))
+
+;; The walker's `expr`: a script of the modes of the expressions of the match tests, by id. Binding ids of
+;; hand-built patterns are above 900000: the program's own (the prelude's among them) have types.
+(defun script (w: Walker e: Expr tail: bool) -> Mode
+  (match (. e id)
+    (1 (MOwned false))
+    (2 (MBorrowed (SiteBind 7)))
+    (3 (MBorrowed (SiteBind 7)))
+    (4 (MBorrowed (SiteValue 1)))
+    (_ MScalar)))
+
+(defun new-walker (p: TypedProgram scc: (Vec i64) all-owned: bool sums: (Map i64 Summary) locals: (Set Site)) -> Walker
+  (walker-new (Ctx p sums (facts-empty) scc all-owned nil false locals) script))
+
+;; A walker with a frame and its first scope open.
+(defun open-walker (p: TypedProgram) -> Walker
+  (let [w (new-walker p [] false (map-empty) (hash-set (SiteBind 5)))]
+    (do (w-open-frame w FkDefun) (w-push-scope w) w)))
+
+(defun pos0 () -> Pos (Pos "t.fib" 1 1 0 1))
+(defun ex (id: i64) -> Expr (Expr id (pos0) (ELit LitUnit)))
+(defun pat (k: PatKind) -> Pattern (Pattern (pos0) k))
+(defun after-of (w: Walker e: i64) -> (Vec Op) (. (w-expr-own w e) after))
+(defun events-of (w: Walker) -> (Vec Event) @(. w events))
+(defun sites-of (sc: Scope) -> (Vec (Pair Site bool)) @(. sc sites))
+(defun release (s: Site why: Why) -> Op (Op OpRelease s why))
+(defun bn (w: Walker b: i64) -> (Option BindingOwn) (get (. @(. w out) bindings) b))
+
+(defun check-frames (cs: Checks p: TypedProgram) -> unit
+  (let [w (new-walker p [] false (map-empty) (hash-set (SiteBind 5)))]
+    (do (check cs "walker-new: nothing walked" (and (= (w-depth w) 0) (empty? (events-of w)) (empty? @(. w tails))
+                                                    (= @(. w out) (body-own-new))))
+        (check cs "kind-of-param: owned is BnOwnedParam, else BnBorrowedParam"
+               (and (= (kind-of-param true) BnOwnedParam) (= (kind-of-param false) BnBorrowedParam)))
+        (w-open-frame w FkDefun)
+        (w-push-scope w)
+        (w-open-frame w FkFn)
+        (check cs "open-frame: the innermost frame is the one opened, at depth 2"
+               (and (= (w-depth w) 2) (= (. (w-frame w) kind) FkFn)))
+        (w-close-frame w)
+        (check cs "close-frame: back to the first" (and (= (w-depth w) 1) (= (. (w-frame w) kind) FkDefun)))
+        (check cs "read: an unbound binding reads as itself, borrowed" (= (w-read w 9) (MBorrowed (SiteBind 9))))
+        (w-bind w 9 (MOwned false) BnOwns)
+        (w-bind w 5 MScalar BnScalar)
+        (check cs "bind: the mode is read back, the kind and the scope-local flag recorded"
+               (and (= (w-read w 9) (MOwned false)) (= (bn w 9) (some (BindingOwn BnOwns false)))
+                    (= (bn w 5) (some (BindingOwn BnScalar true)))))
+        (w-note w nil AtOther)
+        (w-note w (some (VB (SiteBind 1))) AtReturn)
+        (check cs "note: nothing for no value, an event for a value"
+               (= (events-of w) [(Event (VB (SiteBind 1)) AtReturn)]))
+        (w-own-site w (SiteBind 1) false)
+        (w-own-site w (SiteValue 2) true)
+        (check cs "own-site: the sites go in the innermost scope in order, and into the site's frame depth"
+               (and (= (sites-of (w-pop-scope w)) [(Pair (SiteBind 1) false) (Pair (SiteValue 2) true)])
+                    (= (get @(. w site-frame) (SiteBind 1)) (some 1))))
+        (check cs "pop-scope: the frame has no scope left" (empty? @(. (w-frame w) scopes))))))
+
+(defun check-ops (cs: Checks p: TypedProgram) -> unit
+  (let [w (open-walker p)]
+    (do (w-push-op w 2 OpRetain (SiteValue 2) WhyStore)
+        (w-add-after w 2 (release (SiteBind 1) WhyJoin))
+        (check cs "add-after: operations append in order" (= (after-of w 2) [(Op OpRetain (SiteValue 2) WhyStore) (release (SiteBind 1) WhyJoin)]))
+        (w-put-recur w 3 (RecurOwn [] []))
+        (w-add-after w 3 (release (SiteBind 1) WhyJoin))
+        (check cs "add-after: nothing after a `recur`" (empty? (after-of w 3)))
+        (w-put-call w 4 (CallOwn (CalFun 0) TlTailCall PsMove [] [] []))
+        (w-put-call w 5 (CallOwn (CalFun 0) (TlOrdinary BcExtern) PsMove [] [] []))
+        (w-put-call w 6 (CallOwn (CalFun 0) TlNotInTail PsMove [] [] []))
+        (w-push-op w 4 OpRelease (SiteBind 1) WhyJoin)
+        (w-push-op w 5 OpRelease (SiteBind 1) WhyJoin)
+        (w-push-op w 6 OpRelease (SiteBind 1) WhyJoin)
+        (check cs "add-after: nothing after an admitted tail call, an ordinary call or a call out of tail position runs on"
+               (and (empty? (after-of w 4)) (= (count (after-of w 5)) 1) (= (count (after-of w 6)) 1)))
+        (w-set-mode w 7 (MOwned true))
+        (check cs "set-mode: the mode is recorded, the operations kept"
+               (= (w-expr-own w 7) (ExprOwn (MOwned true) [])))
+        (check cs "expr-own: an expression not seen is a scalar with no operations" (= (w-expr-own w 99) (ExprOwn MScalar [])))
+        (check cs "end-op: a scope-local site is ended, any other released"
+               (and (= (w-end-op w (SiteBind 5) WhyStepEnd) (Op OpEndStack (SiteBind 5) WhyStepEnd))
+                    (= (w-end-op w (SiteBind 6) WhyScopeExit) (Op OpRelease (SiteBind 6) WhyScopeExit))))
+        (check cs "owning: a new owning binding reads as borrowed of itself" (= (w-owning 3) (MBorrowed (SiteBind 3))))
+        (w-put-alloc w 8 AlStack)
+        (w-put-guard-fail w 9 [(release (SiteBind 1) WhyScopeExit)])
+        (w-put-closure w 10 (ClosureOwn false nil nil [] []))
+        (w-out! w (fn (o: BodyOwn) -> BodyOwn o))
+        (let [o @(. w out)]
+          (check cs "put-*: the tables take the entry"
+                 (and (= (get (. o allocs) 8) (some AlStack)) (= (count (. o guard-fail)) 1) (= (count (. o closures)) 1)
+                      (= (count (. o calls)) 3) (= (count (. o recurs)) 1)))))))
+
+(defun check-sites (cs: Checks p: TypedProgram) -> unit
+  (let [w (open-walker p)]
+    (do (w-open-frame w FkFn)
+        (w-push-scope w)
+        (w-own-site w (SiteBind 1) false)
+        (set! (. (w-frame w) owned-params) [(SiteBind 2) (SiteEnv 20)])
+        (w-site-frame! w (SiteBind 2) 2)
+        (w-site-frame! w (SiteEnv 20) 2)
+        (w-site-frame! w (SiteCapture 4 8) 2)
+        (w-site-frame! w (SiteBind 3) 1)
+        (check cs "frame-owned: a counted value, a view of a site of this frame; not an immortal, a scalar or an outer site"
+               (and (w-frame-owned w (MOwned false)) (not (w-frame-owned w (MOwned true))) (not (w-frame-owned w MScalar))
+                    (w-frame-owned w (MBorrowed (SiteBind 1))) (w-frame-owned w (MDerived (SiteBind 1)))
+                    (not (w-frame-owned w (MBorrowed (SiteBind 3)))) (not (w-frame-owned w (MBorrowed (SiteBind 40))))))
+        (check cs "movable: a scope's site, an owned parameter and the env of this frame"
+               (and (w-movable w (SiteBind 1)) (w-movable w (SiteBind 2)) (w-movable w (SiteEnv 20))))
+        (check cs "movable: not a capture, a global, a site of another frame or one in no scope"
+               (and (not (w-movable w (SiteCapture 4 8))) (not (w-movable w (SiteGlobal 1))) (not (w-movable w (SiteBind 3)))
+                    (not (w-movable w (SiteBind 40)))))
+        (w-site-frame! w (SiteBind 41) 2)
+        (check cs "movable: a site that this frame owns but no scope or parameter holds is not" (not (w-movable w (SiteBind 41)))))))
+
+;; An open frame with scope A holding binding 1 and temporary 2, scope B holding binding 3 and temporary 4.
+(defun two-scopes (p: TypedProgram) -> Walker
+  (let [w (open-walker p)]
+    (do (w-own-site w (SiteBind 1) false) (w-own-site w (SiteValue 2) true)
+        (w-push-scope w)
+        (w-own-site w (SiteBind 3) false) (w-own-site w (SiteValue 4) true)
+        w)))
+
+(defun check-exits (cs: Checks p: TypedProgram) -> unit
+  (do (let [w (two-scopes p)
+            sc (w-pop-scope w)
+            m (w-exit-scope w sc 50 (MBorrowed (SiteBind 3)))]
+        (check cs "exit-scope: a borrowed value of a site the scope owns is moved out: owned, its release dropped, the others in reverse"
+               (and (= m (MOwned false)) (= (after-of w 50) [(Op OpRelease (SiteValue 4) WhyStepEnd)])
+                    (= (events-of w) [(Event (VB (SiteBind 3)) AtMoveOut)]))))
+      (let [w (two-scopes p)
+            sc (w-pop-scope w)
+            m (w-exit-scope w sc 50 (MDerived (SiteBind 3)))]
+        (check cs "exit-scope: a part of a site the scope owns is retained first, then every site released"
+               (and (= m (MOwned false))
+                    (= (after-of w 50) [(Op OpRetain (SiteValue 50) WhyDerivedExit) (Op OpRelease (SiteValue 4) WhyStepEnd)
+                                        (Op OpRelease (SiteBind 3) WhyScopeExit)]))))
+      (let [w (two-scopes p)
+            sc (w-pop-scope w)
+            m (w-exit-scope w sc 50 (MBorrowed (SiteBind 1)))]
+        (check cs "exit-scope: a view of a site of an outer scope is unchanged; every site released"
+               (and (= m (MBorrowed (SiteBind 1))) (empty? (events-of w))
+                    (= (count (after-of w 50)) 2))))
+      (let [w (two-scopes p)
+            sc (w-pop-scope w)
+            a (w-exit-scope-copy w sc 50 (MBorrowed (SiteBind 3)) false)]
+        (check cs "exit-scope-copy: no event unless `note`" (and (= a (MOwned false)) (empty? (events-of w)))))
+      (let [w (two-scopes p)
+            sc (w-pop-scope w)
+            a (w-exit-scope w sc 50 (MOwned true))]
+        (check cs "exit-scope: an owned value and a scalar are unchanged"
+               (and (= a (MOwned true)) (= (w-exit-scope w sc 51 MScalar) MScalar))))
+      (let [w (two-scopes p)
+            all (w-release-scopes w 0 (set-empty) WhyJump)
+            from1 (w-release-scopes w 1 (hash-set (SiteBind 3)) WhyReturn)]
+        (check cs "release-scopes: bindings first, innermost scope first and in reverse, then temporaries"
+               (= all [(Op OpRelease (SiteBind 3) WhyJump) (Op OpRelease (SiteBind 1) WhyJump)
+                       (Op OpRelease (SiteValue 4) WhyJump) (Op OpRelease (SiteValue 2) WhyJump)]))
+        (check cs "release-scopes: from the scope given, skipping what is moved"
+               (= from1 [(Op OpRelease (SiteValue 4) WhyReturn)])))
+      (let [w (open-walker p)]
+        (do (set! (. (w-frame w) owned-params) [(SiteBind 1) (SiteEnv 9) (SiteBind 2)])
+            (check cs "release-params: every owned parameter in order, not what is moved"
+                   (= (w-release-params w (hash-set (SiteBind 1)) false WhyParamExit)
+                      [(release (SiteEnv 9) WhyParamExit) (release (SiteBind 2) WhyParamExit)]))
+            (check cs "release-params: `keep-env` keeps the env site"
+                   (= (w-release-params w (set-empty) true WhyJump) [(release (SiteBind 1) WhyJump) (release (SiteBind 2) WhyJump)]))))))
+;; Of the program: the types its tables hold.
+(defun check-types (cs: Checks p: TypedProgram) -> unit
+  (let [w (open-walker p)
+        main (steps-of (. (g-fun (. p globals) (fun-id p "main")) body))
+        keep (g-fun (. p globals) (fun-id p "keep"))
+        idi (g-fun (. p globals) (fun-id p "id-i"))]
+    (do (check cs "is-object: a `cell`, a `fn`, an `Option` and a string are objects, an int literal is not"
+               (and (w-is-object w (nth main 0)) (w-is-object w (nth main 1)) (w-is-object w (nth main 2))
+                    (w-is-object w (nth main 5)) (not (w-is-object w (nth main 4))) (w-is-object w (ex 9999))))
+        (check cs "binding-is-object: a `str` parameter is, an `i64` is not, a binding with no type is"
+               (and (w-binding-is-object w (. (nth (. keep params) 0) binding))
+                    (not (w-binding-is-object w (. (nth (. idi params) 0) binding))) (w-binding-is-object w 987654)))
+        (check cs "option-alloc: an `Option` of a scalar is a heap enum, of an object nothing, and a call that is no `Option` none"
+               (and (= (w-option-alloc w (nth main 2)) (some AlHeap)) (= (w-option-alloc w (nth main 8)) (some AlNothing))
+                    (= (w-option-alloc w (nth main 4)) nil) (= (w-option-alloc w (ex 9999)) nil))))))
+
+(defun check-callee (cs: Checks p: TypedProgram) -> unit
+  (let [g (. p globals)
+        main (steps-of (. (g-fun g (fun-id p "main")) body))
+        idi (fun-id p "id-i")
+        w (new-walker p [idi] false (assoc (map-empty) (fun-id p "keep") (Summary [(Pair true false)])) (set-empty))
+        wo (new-walker p [idi] true (map-empty) (set-empty))
+        head (fn (i: i64) -> Expr (head-of (nth main i)))
+        mix (callee-of w (head 7))
+        sig (fn (c: Callee n: i64) -> (Vec Param) (params-of w c n))]
+    (do (w-open-frame w FkDefun)
+        (check cs "param: the class and the escape, no other flag" (= (param ClOwned true) (->Param ClOwned true false false false)))
+        (check cs "builtin-stores: `cell`, `atom`, `set!` store, `spawn` hands to a thread; `join`, `trap`, `not` do not"
+               (and (builtin-stores (builtin-id "cell")) (builtin-stores (builtin-id "atom")) (builtin-stores (builtin-id "set!"))
+                    (builtin-stores (builtin-id "spawn")) (not (builtin-stores (builtin-id "join")))
+                    (not (builtin-stores (builtin-id "trap"))) (not (builtin-stores (builtin-id "not")))))
+        (check cs "allocates: a `cell`, a `fn` and a constructor do; an `Option` constructor, a call, a literal do not"
+               (and (allocates w (nth main 0)) (allocates w (nth main 1)) (allocates w (nth main 3))
+                    (not (allocates w (nth main 2))) (not (allocates w (nth main 4))) (not (allocates w (nth main 5)))
+                    (not (allocates w (nth main 9))) (not (allocates w (ex 1)))))
+        (check cs "callee-of: a `defun`, all-owned when it is in the SCC of an all-owned unit, a constructor, a builtin, a method, a value"
+               (and (= (callee-of w (head 4)) (CalFun idi)) (= (callee-of wo (head 4)) (CalAllOwned idi))
+                    (= (callee-of w (head 5)) (CalFun (fun-id p "keep"))) (= (callee-of wo (head 5)) (CalFun (fun-id p "keep")))
+                    (= (callee-of w (head 3)) CalCtor) (= (callee-of w (head 0)) (CalBuiltin (builtin-id "cell")))
+                    (= (callee-of w (head 6)) CalValue)
+                    (match mix ((CalMethod _ 0) true) (_ false))))
+        (check cs "scc-callee: a `defun` of the SCC in a `defun` frame, else none"
+               (and (= (scc-callee w (CalFun idi)) (some idi)) (= (scc-callee w (CalAllOwned idi)) (some idi))
+                    (= (scc-callee w (CalFun (fun-id p "keep"))) nil) (= (scc-callee w CalCtor) nil)
+                    (= (scc-callee w (CalBuiltin 0)) nil)))
+        (let [wf (new-walker p [idi] false (map-empty) (set-empty))]
+          (do (w-open-frame wf FkFn)
+              (check cs "scc-callee: none in the frame of a `fn`" (= (scc-callee wf (CalFun idi)) nil))))
+        (check cs "summary-of: a unit of the SCC reads the facts, an earlier one its summary, a function of neither none"
+               (and (= (w-summary-of w (fun-id p "keep")) (some (Summary [(Pair true false)])))
+                    (= (w-summary-of w (fun-id p "main")) nil)
+                    (= (w-summary-of w idi) (some (facts-summary (facts-empty) p idi)))))
+        (check cs "params-of: a `defun` by its summary (no summary: borrowed and escaping), all-owned makes every position owned"
+               (and (= (sig (CalFun (fun-id p "keep")) 2) [(param ClOwned false) (param ClBorrow true)])
+                    (= (sig (CalAllOwned (fun-id p "keep")) 2) [(param ClOwned false) (param ClOwned true)])
+                    (= (sig (CalFun (fun-id p "main")) 1) [(param ClBorrow true)])))
+        (check cs "params-of: a method's `:owned` and `:borrow`; every other position, self included, escapes"
+               (= (sig mix 4) [(param ClOwned true) (param ClBorrow true) (param ClBorrow false) (param ClBorrow true)]))
+        (check cs "params-of: a builtin by how each argument escapes: stored, borrowed, in-out, weak, thread, raw-retained"
+               (and (= (sig (CalBuiltin (builtin-id "cell")) 1) [(param ClStore true)])
+                    (= (sig (CalBuiltin (builtin-id "set!")) 2) [(param ClBorrow false) (param ClStore true)])
+                    (= (sig (CalBuiltin (builtin-id "array-set!")) 3)
+                       [(with (param ClBorrow false) (amp true)) (param ClBorrow false) (param ClStore true)])
+                    (= (sig (CalBuiltin (builtin-id "weak")) 1) [(with (param ClBorrow true) (weak true))])
+                    (= (sig (CalBuiltin (builtin-id "spawn")) 1) [(param ClThread true)])
+                    (= (sig (CalBuiltin (builtin-id "raw-retained")) 1) [(with (param ClStore true) (raw-retained true))])
+                    (= (sig (CalBuiltin (builtin-id "not")) 1) [(param ClBorrow false)])))
+        (check cs "params-of: a constructor stores, an extern borrows, a value is called with every position owned"
+               (and (= (sig CalCtor 2) [(param ClStore true) (param ClStore true)])
+                    (= (sig CalExtern 1) [(param ClBorrow false)])
+                    (= (sig CalValue 3) [(param ClOwned true) (param ClOwned true) (param ClOwned true)])
+                    (= (sig CalValue 0) []))))))
+
+(defun check-modes (cs: Checks) -> unit
+  (let [t (SiteValue 7)
+        b (SiteBind 1)]
+    (do (check cs "pattern-modes: an owned scrutinee binds aliases and parts of its temporary (pattern.rs test)"
+               (and (= (pattern-modes (MOwned false) t) (Pair (MBorrowed t) (MDerived t)))
+                    (= (pattern-modes (MDerived b) t) (Pair (MDerived b) (MDerived b)))
+                    (= (bind-kind-of (MBorrowed b)) (BnAliasOf b))))
+        (check cs "pattern-modes: an immortal owned scrutinee is as any owned, a borrowed one binds its own site, a scalar none"
+               (and (= (pattern-modes (MOwned true) t) (Pair (MBorrowed t) (MDerived t)))
+                    (= (pattern-modes (MBorrowed b) t) (Pair (MBorrowed b) (MDerived b)))
+                    (= (pattern-modes MScalar t) (Pair MScalar MScalar))))
+        (check cs "bind-kind-of: a part of a site is `BnDerivedOf`; an owned value and a scalar are `BnScalar`"
+               (and (= (bind-kind-of (MDerived b)) (BnDerivedOf b)) (= (bind-kind-of (MOwned false)) BnScalar)
+                    (= (bind-kind-of MScalar) BnScalar))))))
+
+(defun check-bind-pattern (cs: Checks p: TypedProgram) -> unit
+  (let [w (open-walker p)
+        whole (MBorrowed (SiteValue 1))
+        inner (MDerived (SiteValue 1))
+        idi (g-fun (. p globals) (fun-id p "id-i"))
+        scalar-b (. (nth (. idi params) 0) binding)]
+    (do (bind-pattern w (pat (PCtor 0 nil [(pat (PBind 900011)) (pat (PAs (pat (PBind 900012)) 900013)) (pat PWild)])) whole inner true)
+        (bind-pattern w (pat (PAs (pat (PBind 900014)) 900015)) whole inner true)
+        (bind-pattern w (pat (PBind scalar-b)) whole inner true)
+        (check cs "bind-pattern: a whole-scrutinee variable takes the scrutinee's mode, one inside a constructor a part of it"
+               (and (= (w-read w 900014) whole) (= (w-read w 900015) whole) (= (w-read w 900011) inner) (= (w-read w 900012) inner)
+                    (= (w-read w 900013) inner)))
+        (check cs "bind-pattern: the kind is that of the mode"
+               (and (= (bn w 900014) (some (BindingOwn (BnAliasOf (SiteValue 1)) false)))
+                    (= (bn w 900011) (some (BindingOwn (BnDerivedOf (SiteValue 1)) false)))))
+        (check cs "bind-pattern: a variable of a scalar type reads as a scalar" (= (w-read w scalar-b) MScalar))
+        (bind-pattern w (pat (PVec [(pat (PBind 900021))] (RestBind 900022))) whole inner true)
+        (bind-pattern w (pat (PVec [] RestIgnore)) whole inner true)
+        (check cs "bind-pattern: a vector pattern's elements are parts of the scrutinee, its rest an owning binding of the scope"
+               (and (= (w-read w 900021) inner) (= (w-read w 900022) (MBorrowed (SiteBind 900022))) (= (bn w 900022) (some (BindingOwn BnOwns false)))
+                    (= (sites-of (w-pop-scope w)) [(Pair (SiteBind 900022) false)]))))))
+
+(defun clause (pt: Pattern guard: (Option Expr) body: Expr) -> Clause (Clause pt guard body false))
+
+(defun check-match (cs: Checks p: TypedProgram) -> unit
+  (do (let [w (open-walker p)
+            m (match-form w (ex 10) (ex 1) [(clause (pat (PBind 900020)) nil (ex 2)) (clause (pat PWild) nil (ex 3))] false)]
+        (do (check cs "match-form: branches of one borrowed value are that value; the scrutinee's temporary is released on every path"
+                   (and (= m (MBorrowed (SiteBind 7)))
+                        (= (after-of w 2) [(release (SiteValue 1) WhyScopeExit)]) (= (after-of w 3) [(release (SiteValue 1) WhyScopeExit)])))
+            (check cs "match-form: a clause's variable is a view of the scrutinee's temporary"
+                   (and (= (w-read w 900020) (MBorrowed (SiteValue 1))) (= (bn w 900020) (some (BindingOwn (BnAliasOf (SiteValue 1)) false)))))
+            (check cs "match-form: the match's own scope and the clauses' are closed; the frame's first remains"
+                   (= (count @(. (w-frame w) scopes)) 1))))
+      (let [w (open-walker p)
+            m (match-form w (ex 10) (ex 1) [(clause (pat (PBind 900020)) nil (ex 4)) (clause (pat PWild) nil (ex 2))] false)]
+        (check cs "match-form: branches that differ are retained on the paths that do not own, and the join is owned"
+               (and (= m (MOwned false))
+                    (= (after-of w 4) [(Op OpRetain (SiteValue 4) WhyJoin) (release (SiteValue 1) WhyScopeExit)])
+                    (= (after-of w 2) [(Op OpRetain (SiteValue 2) WhyJoin) (release (SiteValue 1) WhyScopeExit)])
+                    (= (events-of w) [(Event (VB (SiteValue 1)) AtJoin) (Event (VB (SiteBind 7)) AtJoin)]))))
+      (let [w (open-walker p)
+            two (pat (PCtor 0 nil [(pat (PVec [] (RestBind 900030))) (pat (PVec [] (RestBind 900031)))]))
+            m (match-form w (ex 10) (ex 1) [(clause two (some (ex 5)) (ex 2))] false)
+            rels [(release (SiteBind 900031) WhyScopeExit) (release (SiteBind 900030) WhyScopeExit)]]
+        (check cs "match-form: a false guard releases the clause's owning bindings in reverse, no value (the scrutinee is its scope's)"
+               (and (= (get (. @(. w out) guard-fail) 5) (some rels))
+                    (= (after-of w 2) (conj rels (release (SiteValue 1) WhyScopeExit)))
+                    (= m (MBorrowed (SiteBind 7))))))
+      (let [w (open-walker p)
+            ms (walk-scrutinee w (ex 1) (MBorrowed (SiteBind 3)))]
+        (check cs "walk-scrutinee: a borrowed scrutinee owns nothing, its event is recorded as another use"
+               (and (= ms (Pair (MBorrowed (SiteBind 3)) (MDerived (SiteBind 3))))
+                    (= (events-of w) [(Event (VB (SiteBind 3)) AtOther)])
+                    (empty? (sites-of (w-pop-scope w))))))
+      (let [w (open-walker p)
+            ms (walk-scrutinee w (ex 1) (MOwned false))]
+        (check cs "walk-scrutinee: an owned one is an implicit owning binding of the scope"
+               (and (= ms (Pair (MBorrowed (SiteValue 1)) (MDerived (SiteValue 1))))
+                    (= (sites-of (w-pop-scope w)) [(Pair (SiteValue 1) false)]))))))
+
+(defun main () -> i64
+  (let [cs (checks-new)
+        p (typed-of source)]
+    (do (check-frames cs p) (check-ops cs p) (check-sites cs p) (check-exits cs p) (check-types cs p)
+        (check-callee cs p) (check-modes cs) (check-bind-pattern cs p) (check-match cs p)
+        (finish cs))))

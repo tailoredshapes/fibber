@@ -1,36 +1,101 @@
 ;; compiler/own/walk/callee.fib: what a call calls and the parameter positions of the callee
 ;; (spec/types.md §6.3), as crates/fibref/src/own/walk/callee.rs (155 lines of Rust). Package O3;
-;; the functions below are stubs of the final signatures (`Walker`'s methods are functions of the
-;; walker, own.walk.state).
+;; `Walker`'s methods are functions of the walker (own.walk.state).
 (ns own.walk.callee
-  (:use fib.coll.record types.ast own.program own.walk.state))
+  (:use fib.coll.record types.ast types.decls types.builtins types.program own.program own.facts own.walk.state))
 
 ;; One parameter position of a callee: its class, whether it escapes, whether it is an `&`
 ;; position, the operand of `weak` (no count, but an escape), the operand of `raw-retained`.
 (defrecord Param [class: Class escapes: bool amp: bool weak: bool raw-retained: bool])
 
 ;; Rust: walk/callee.rs:24 `param` (a `const fn`): the position of `class` with no other flag.
-(defun param (class: Class escapes: bool) -> Param
-  (trap "todo: param"))
+(defun param (class: Class escapes: bool) -> Param (->Param class escapes false false false))
 
 ;; Rust: walk/callee.rs:36 `builtin_stores`: the builtins (by id) whose object operand is stored
 ;; or handed to a thread: stores, not calls (never tail calls, like constructors).
 (defun builtin-stores (b: i64) -> bool
-  (trap "todo: builtin-stores"))
+  (some? (find-first (fn (e: Escape) (or (= e EscStore) (= e EscThread)))
+                     (. (nth (builtin-table) b) escapes))))
 
 ;; Rust: walk/callee.rs:45 `allocates`: whether e allocates its object in this frame (§6.11): a
 ;; constructor call of a non-`Option` type, `cell`, `atom`, a `fn`.
 (defun allocates (w: Walker e: Expr) -> bool
-  (trap "todo: allocates"))
+  (match (. e kind)
+    ((EFn _) true)
+    ((ECall h _)
+     (match (. h kind)
+       ((EGlobal (GCtor t _)) (not (= t @(. (. (w-p w) globals) option))))
+       ((EGlobal (GBuiltin b)) (let [n (. (nth (builtin-table) b) name)] (or (= n "cell") (= n "atom"))))
+       (_ false)))
+    (_ false)))
+
+;; Whether f is a `defun` of the current SCC.
+(defun in-scc :private (w: Walker f: i64) -> bool
+  (some? (find-first (fn (x: i64) (= x f)) (. (. w cx) scc))))
 
 ;; Rust: walk/callee.rs:61 `Walker::callee_of`: what `head` calls.
 (defun callee-of (w: Walker head: Expr) -> Callee
-  (trap "todo: callee-of"))
+  (match (. head kind)
+    ((EGlobal (GFun f)) (if (and (. (. w cx) all-owned) (in-scc w f)) (CalAllOwned f) (CalFun f)))
+    ((EGlobal (GMethod p i)) (CalMethod p i))
+    ((EGlobal (GBuiltin b)) (CalBuiltin b))
+    ((EGlobal (GCtor _ _)) CalCtor)
+    ((EGlobal (GExtern _)) CalExtern)
+    (_ CalValue)))
 
 ;; Rust: walk/callee.rs:78 `Walker::scc_callee`: the `defun` of the current SCC that c names, if so.
 (defun scc-callee (w: Walker c: Callee) -> (Option i64)
-  (trap "todo: scc-callee"))
+  (let [f (match c ((CalFun f) (some f)) ((CalAllOwned f) (some f)) (_ nil))]
+    (if (and (some? f) (= (. (w-frame w) kind) FkDefun) (in-scc w (unwrap f))) f nil)))
+
+;; Rust: walk/mod.rs:443 `summary_of`: the `defun` summary of f in the current facts or earlier units.
+(defun w-summary-of (w: Walker f: i64) -> (Option Summary)
+  (if (in-scc w f)
+    (some (facts-summary (. (. w cx) facts) (w-p w) f))
+    (get (. (. w cx) summaries) f)))
+
+;; Rust: walk/callee.rs:129 `fun_params`: the positions of a `defun` for n arguments from its
+;; summary (an argument it has no summary for is borrowed and escaping) and its `&` parameters.
+(defun fun-params :private (w: Walker f: i64 n: i64 all-owned: bool) -> (Vec Param)
+  (let [amps (match (get (. (w-p w) fun-schemes) f) ((some s) (. s amps)) (_ []))
+        sum (match (w-summary-of w f) ((some s) (. s params)) (_ []))]
+    (vec (for [i (range n)]
+           (let [pr (get-or sum i (Pair false true))]
+             (with (param (if (or (. pr fst) all-owned) ClOwned ClBorrow) (. pr snd))
+               (amp (get-or amps i false))))))))
+
+;; Rust: walk/callee.rs:87 (the `Method` arm): every method parameter, `self` included, defaults to
+;; escaping unless `:borrow` (types §2.7, §6.4; syntax §3.10).
+(defun method-params :private (w: Walker p: i64 i: i64 n: i64) -> (Vec Param)
+  (let [ps (. (nth (. (g-proto (. (w-p w) globals) p) methods) i) params)]
+    (vec (for [j (range n)]
+           (let [mp (get ps j)
+                 owned (match mp ((some m) (. m owned)) (_ false))
+                 borrow (match mp ((some m) (. m borrow)) (_ false))]
+             (param (if owned ClOwned ClBorrow) (not borrow)))))))
+
+;; Rust: walk/callee.rs:140 `builtin_param`: the position of a builtin's argument by how it escapes.
+(defun builtin-param :private (b: i64 e: Escape) -> Param
+  (let [plain (param ClBorrow false)]
+    (match e
+      ((EscScalar) plain)
+      ((EscBorrow) plain)
+      ((EscRaw) plain)
+      ((EscStore) (with (param ClStore true) (raw-retained (= (. (nth (builtin-table) b) name) "raw-retained"))))
+      ((EscThread) (param ClThread true))
+      ((EscInOut) (with plain (amp true)))
+      ((EscWeak) (with (param ClBorrow true) (weak true))))))
+
+;; n copies of one position.
+(defun all-of :private (n: i64 p: Param) -> (Vec Param) (mapv (fn (i: i64) p) (range n)))
 
 ;; Rust: walk/callee.rs:87 `Walker::params_of`: every parameter position of c for n arguments.
 (defun params-of (w: Walker c: Callee n: i64) -> (Vec Param)
-  (trap "todo: params-of"))
+  (match c
+    ((CalFun f) (fun-params w f n false))
+    ((CalAllOwned f) (fun-params w f n true))
+    ((CalMethod p i) (method-params w p i n))
+    ((CalBuiltin b) (mapv (fn (e: Escape) (builtin-param b e)) (. (nth (builtin-table) b) escapes)))
+    ((CalCtor) (all-of n (param ClStore true)))
+    ((CalExtern) (all-of n (param ClBorrow false)))
+    ((CalValue) (all-of n (param ClOwned true)))))

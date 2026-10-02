@@ -1,13 +1,15 @@
 ;; compiler/tests/own/unit-driver.fib: own.driver's `own-check-source` on programs that stop before
 ;; the ownership pass (a read error, an expansion error, a type error: the `CheckError` variant
 ;; and its text are those of `check_source`), and the `&` checks of an empty program (own.syntactic,
-;; whose own tests are unit-syntactic.fib). A program the front end accepts reaches `analyse`, a stub
-;; that traps until package O7, so none is checked here.
+;; whose own tests are unit-syntactic.fib); and programs the front end accepts, through `analyse` (package
+;; O7): the bodies in the order the units were decided, a summary, the facts of each unit with the keys
+;; of its bodies, the all-owned body of a function whose value is taken, and a `:borrow` that escapes.
+;; The whole pass is judged by golden.sh and compare.sh.
 ;; Needs lib/prelude.fib in the working directory (run from the repository root). Prints `ok NAME`
 ;; or `FAIL NAME`.
 ;; Build: fibc build compiler/tests/own/unit-driver.fib -I compiler -I lib -o OUT
 (ns main
-  (:use types.check own.error own.driver own.syntactic types.decls))
+  (:use types.check types.program own.error own.program own.driver own.syntactic types.decls))
 
 (defun kind-of (r: (Result Checked CheckError)) -> str
   (match r
@@ -19,6 +21,69 @@
   (match r
     ((Ok _) "")
     ((Err e) (check-error-text e))))
+
+(def pt-keep: str
+  "(defstruct Pt (x: i64 y: i64))\n(defun keep (s: Pt) -> Pt s)\n(defun main () -> i64 (. (keep (Pt 1 2)) x))\n")
+
+(def taken-src: str
+  "(defun inc (x: i64) -> i64 (+ x 1))\n(defun apply (f: (fn (i64) i64) x: i64) -> i64 (f x))\n(defun size-of (v: (Vec i64)) -> i64 (vec-count v))\n(defun use (f: (fn ((Vec i64)) i64)) -> i64 (f [1 2]))\n(defun main () -> i64 (+ (apply inc 1) (use size-of)))\n")
+
+(defun checked (r: (Result Checked CheckError)) -> Checked
+  (match r
+    ((Ok c) c)
+    ((Err e) (trap (str-concat "unit-driver: rejected: " (check-error-text e))))))
+
+(defun fun-id (c: Checked name: str) -> i64 (unwrap (program-fun (. c typed) name)))
+
+(defun index-of (keys: (Vec BodyKey) k: BodyKey) -> i64
+  (unwrap-or (find-first (fn (i: i64) (= (nth keys i) k)) (range (count keys))) -1))
+
+(defun check-accepted (cs: Checks) -> unit
+  (let [c (checked (own-check-source pt-keep "t.fib"))
+        o (. c owned)
+        keep (fun-id c "keep")
+        main (fun-id c "main")
+        b (. (nth (. (g-fun (. (. c typed) globals) keep) params) 0) binding)
+        uf (find-first (fn (u: UnitFacts) (= (. u keys) [(BodyFun keep)])) (. o unit-facts))]
+    (do (check cs "accepted: a program is Ok with bodies for its functions, the callee's unit first"
+                (and (< (index-of (. o order) (BodyFun keep)) (index-of (. o order) (BodyFun main)))
+                     (contains? (. o bodies) (BodyFun keep)) (contains? (. o bodies) (BodyFun main))))
+        (check cs "accepted: a function that returns its parameter has the summary (owned, escapes)"
+                (= (get (. o summaries) keep) (some (Summary [(Pair true true)]))))
+        (check cs "accepted: its body says the parameter is owned for rule 1 and escapes"
+                (= (. (nth (. (unwrap (owned-fun o keep)) params) 0) kind) (PkOwned [(OwRule1 "returned")])))
+        (check cs "accepted: one fact record for each unit decided, with the keys of its bodies"
+                (= (mapv (fn (u: UnitFacts) (. u keys)) (filterv (fn (u: UnitFacts) (or (= (. u keys) [(BodyFun keep)]) (= (. u keys) [(BodyFun main)]))) (. o unit-facts)))
+                   [[(BodyFun keep)] [(BodyFun main)]]))
+        (check cs "accepted: the facts of keep are the fixpoint's"
+                (and (some? uf) (contains? (. (. (unwrap uf) facts) escapes) b)
+                     (= (get (. (. (unwrap uf) facts) owned) b) (some (set [(OwRule1 "returned")]))))))))
+
+(defun check-taken (cs: Checks) -> unit
+  (let [c (checked (own-check-source taken-src "t.fib"))
+        o (. c owned)
+        inc (fun-id c "inc")
+        order (. o order)]
+    (do (check cs "taken: a function used as a value is in value-taken, one passed only called is not"
+                (and (contains? (. o value-taken) inc) (not (contains? (. o value-taken) (fun-id c "apply")))))
+        (check cs "taken: its all-owned body follows its own, and each has a record of facts"
+                (and (= (index-of order (BodyAllOwned inc)) (+ (index-of order (BodyFun inc)) 1))
+                     (= (count (filterv (fn (u: UnitFacts) (= (. u keys) [(BodyAllOwned inc)])) (. o unit-facts))) 1)))
+        (check cs "taken: an object parameter of an all-owned body is owned (declared), of the ordinary body borrowed"
+                (let [first (fun-id c "size-of")
+                      kind-in (fn (k: BodyKey) (. (nth (. (unwrap (get (. o bodies) k)) params) 0) kind))]
+                  (and (= (kind-in (BodyAllOwned first)) (PkOwned [OwDeclared]))
+                       (= (kind-in (BodyFun first)) PkBorrowed))))
+        (check cs "taken: a scalar parameter stays a scalar"
+                (= (. (nth (. (unwrap (get (. o bodies) (BodyAllOwned inc))) params) 0) kind) PkScalar)))))
+
+(defun check-rejected (cs: Checks) -> unit
+  (let [r (own-check-source "(defun keep (s: (Vec i64) :borrow) -> (Vec i64) s)\n(defun main () -> i64 0)\n" "b.fib")
+        both (own-check-source "(defun twice (&a &b) 0)\n(defun main () -> i64 (let ((x (cell 0))) (+ (twice &x &x) true)))\n" "a.fib")]
+    (do (check cs "rejected: a :borrow parameter that escapes is a CeOwn after inference"
+                (and (= (kind-of r) "own") (= (text-of r) "b.fib:1:1: parameter s of keep is declared :borrow but escapes")))
+        (check cs "rejected: the `&` errors come before the type error"
+                (= (kind-of both) "own")))))
 
 (defun main () -> i64
   (let ((cs (checks-new))
@@ -32,4 +97,5 @@
         (check cs "an unbound name is a type error (resolution)" (= (kind-of bad-name) "type"))
         (check cs "and its text is the checker's" (= (text-of bad-name) "n.fib:1:24: unbound name nosuchmacro"))
         (check cs "the `&` checks find nothing in a program with no body" (empty? (syntactic-check (globals-new))))
+        (check-accepted cs) (check-taken cs) (check-rejected cs)
         (finish cs))))

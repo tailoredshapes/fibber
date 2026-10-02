@@ -1,31 +1,180 @@
-;; compiler/own/walk/expr.fib: the walk of an expression: `let`, `do`, `if`, the joins of
-;; branches, `loop` (spec/types.md §6.1 to §6.3, §6.11), as crates/fibref/src/own/walk/expr.rs
-;; (317 lines of Rust). Package O4; this is the module that builds a Walker with its own
-;; `walk-expr` as the function field (own.walk.state); every public function is a stub.
+;; compiler/own/walk/expr.fib: the walk of an expression: the mode of each form (§6.2) and the
+;; scope rules of `let`, `do`, `if` and `loop` (spec/types.md §6.1 to §6.3, §6.10), as
+;; crates/fibref/src/own/walk/expr.rs (317 lines of Rust). Package O4; this is the module that
+;; builds a Walker with its own `walk-expr` as the function field (own.walk.state), and the top of
+;; the layers of the walk: it uses own.walk.call, own.walk.pattern, own.walk.lit and own.walk.step
+;; and none of them uses it. `temp`, `step` and `join` of the Rust module are in own.walk.step,
+;; and `scrutinee` is in own.walk.pattern (own-notes.md: modules cannot require each other in a
+;; cycle).
 (ns own.walk.expr
-  (:use types.ast own.program own.walk.state))
+  (:use types.decls types.ast own.program own.walk.state own.walk.callee own.walk.step
+        own.walk.lit own.walk.pattern own.walk.call))
 
-;; Rust: walk/expr.rs:17 `Walker::expr`: walks e (`tail`: tail position of the frame's body), records
-;; and returns its mode.
+;; Rust: walk/expr.rs:80 `Walker::place`: the target of `deref` or `set!`: an `&` parameter's
+;; private cell, or an operand.
+(defun place-form :private (w: Walker p: Place) -> unit
+  (match p
+    ((PlExpr c) (do (operand w c) ()))
+    ((PlAmp _) ())))
+
+;; Rust: walk/expr.rs:86 `Walker::global`: a `def` is borrowed; a constructor allocates (an
+;; `Option` one by its representation, §8.1); a named function, method or builtin as a value is its
+;; immortal closure (§8.2, §8.4).
+(defun global-form :private (w: Walker e: Expr g: GlobalRef) -> Mode
+  (match g
+    ((GDef d) (MBorrowed (SiteGlobal d)))
+    ((GCtor t _)
+     (let [alloc (if (= t @(. (. (. (. w cx) p) globals) option)) (w-option-alloc w e) (some AlHeap))]
+       (if-some [a alloc] (w-put-alloc w (. e id) a))
+       (MOwned false)))
+    (_ (MOwned true))))
+
+;; Rust: walk/expr.rs:136 `Walker::operand`: an operand that is only read (a `deref` place, an
+;; `await`, a conversion): an `Owned` one is a temporary of the step.
+(defun operand :private (w: Walker x: Expr) -> Mode
+  (let [m (walk-expr w x false)]
+    (if (mode-owned? m)
+        (do (walk-temp w x)
+            (w-note w (some (unwrap-or (walk-val w x m) (VB (SiteValue (. x id))))) AtOther))
+        (w-note w (walk-val w x m) AtOther))
+    m))
+
+;; Rust: walk/expr.rs:149 `Walker::store`: E2: x is stored (a `set!` value, a `set-field!` value).
+(defun store :private (w: Walker x: Expr) -> unit
+  (let [m (walk-expr w x false)]
+    (w-note w (walk-val w x m) AtStore)
+    (when (mode-shared? m)
+      (w-push-op w (. x id) OpRetain (SiteValue (. x id)) WhyStore))))
+
+;; Rust: walk/expr.rs:158 `Walker::field`: a field of an object is a part of it.
+(defun field-form :private (w: Walker x: Expr) -> Mode
+  (match (walk-expr w x false)
+    ((MBorrowed s) (MDerived s))
+    ((MDerived s) (MDerived s))
+    ((MOwned _) (do (walk-temp w x) (MDerived (SiteValue (. x id)))))
+    ((MScalar) MScalar)))
+
+;; Rust: walk/expr.rs:169 `Walker::concat`: the operands are temporaries of a step of its own.
+(defun concat-form :private (w: Walker e: Expr es: (Vec Expr)) -> Mode
+  (do (w-push-scope w)
+      (doseq [x es] (operand w x))
+      (w-exit-scope w (w-pop-scope w) (. e id) (MOwned false))))
+
+;; The discarded value of a step of a `do`: an `Owned` one is released at once (and may be a
+;; stack candidate).
+(defun do-step :private (w: Walker s: Expr) -> unit
+  (let [m (walk-step w s false)
+        val (walk-val w s m)
+        id (. s id)]
+    (if (mode-owned? m)
+        (let [site (SiteValue id)]
+          (when (allocates w s) (w-candidate! w site id))
+          (w-add-after w id (w-end-op w site WhyDiscard))
+          (w-note w (some (unwrap-or val (VB site))) AtOther))
+        (w-note w val AtOther))))
+
+;; Rust: walk/expr.rs:178 `Walker::do_form`: every expression but the last is a step.
+(defun do-form :private (w: Walker es: (Vec Expr) tail: bool) -> Mode
+  (let [n (count es)]
+    (if (= n 0)
+        MScalar
+        (do (doseq [i (range (- n 1))] (do-step w (nth es i)))
+            (walk-expr w (nth es (- n 1)) tail)))))
+
+;; Rust: walk/expr.rs:71 `Walker::if_form`: the condition and each branch are steps.
+(defun if-form :private (w: Walker e: Expr c: Expr t: Expr f: Expr tail: bool) -> Mode
+  (do (walk-step w c false)
+      (let [mt (walk-step w t tail)
+            mf (walk-step w f tail)]
+        (walk-join w e [(Pair t mt) (Pair f mf)]))))
+
+;; Rust: walk/expr.rs:247 `Walker::bind_let`: a `let` of one name to the value init of mode m: an
+;; `Owned` value is owned by the binding, any other is an alias of, or a part of, a site.
+(defun bind-let :private (w: Walker x: i64 init: Expr m: Mode) -> unit
+  (do (w-note w (walk-val w init m) (AtLetInit x))
+      (cond
+        (not (w-binding-is-object w x)) (w-bind w x MScalar BnScalar)
+        (mode-owned? m)
+        (let [s (SiteBind x)]
+          (w-own-site w s false)
+          (when (allocates w init) (w-candidate! w s (. init id)))
+          (w-bind w x (w-owning x) BnOwns))
+        :else (w-bind w x m (bind-kind-of m)))))
+
+;; Rust: walk/expr.rs:233 `Walker::let_form`: the bindings in a scope, each initialiser a step.
+(defun let-form :private (w: Walker bs: (Vec LetBind) body: Expr tail: bool) -> Mode
+  (do (w-push-scope w)
+      (doseq [b bs]
+        (let [m (walk-step w (. b init) false)]
+          (match (. (. b pat) kind)
+            ((PBind x) (bind-let w x (. b init) m))
+            (_ (let [ms (walk-scrutinee w (. b init) m)]
+                 (bind-pattern w (. b pat) (. ms fst) (. ms snd) true))))))
+      (let [m (walk-expr w body tail)]
+        (w-exit-scope w (w-pop-scope w) (. body id) m))))
+
+;; Rust: walk/expr.rs:287 `Walker::loop_form`, one variable: its initialiser is consumed into it.
+(defun loop-var :private (w: Walker lb: LoopBind) -> unit
+  (let [init (. lb init)
+        v (. lb binding)
+        m (walk-step w init false)]
+    (w-note w (walk-val w init m) (AtLoopInit v))
+    (when (mode-shared? m)
+      (w-push-op w (. init id) OpRetain (SiteValue (. init id)) WhyLoopInit))
+    (if (w-binding-is-object w v)
+        (do (w-own-site w (SiteBind v) false)
+            (w-bind w v (w-owning v) BnOwns))
+        (w-bind w v MScalar BnScalar))))
+
+;; Rust: walk/expr.rs:287 `Walker::loop_form`: the variables are owning bindings of the loop's
+;; scope; `recur` finds the scope and the variables in the frame's loop stack.
+(defun loop-form :private (w: Walker vs: (Vec LoopBind) body: Expr tail: bool) -> Mode
+  (do (w-push-scope w)
+      (let [f (w-frame w)
+            scope (- (count @(. f scopes)) 1)]
+        (doseq [lb vs] (loop-var w lb))
+        (set! (. f loops) (conj @(. f loops) (LoopCtx scope (mapv (fn (lb: LoopBind) (. lb binding)) vs))))
+        (let [m (walk-step w body tail)]
+          (set! (. f loops) (pop @(. f loops)))
+          (w-exit-scope w (w-pop-scope w) (. body id) m)))))
+
+;; Rust: walk/expr.rs:37 `ExprKind::Recur`: a `recur` has no value (`Scalar`).
+(defun recur-form :private (w: Walker e: Expr args: (Vec Expr)) -> Mode
+  (let [r (walk-recur w args)]
+    (w-put-recur w (. e id) r)
+    MScalar))
+
+;; Rust: walk/expr.rs:24 `Walker::form`: the mode of e as its form gives it.
+(defun walk-form :private (w: Walker e: Expr tail: bool) -> Mode
+  (match (. e kind)
+    ((ELit (LitStr _)) (MOwned true))
+    ((EQuote _) (MOwned true))
+    ((ELit _) MScalar)
+    ((ELocal b) (w-read w b))
+    ((EGlobal g) (global-form w e g))
+    ((ECall h args) (walk-call w e h args tail))
+    ((EFn lit) (walk-fn-lit w e lit))
+    ((ELet bs body) (let-form w bs body tail))
+    ((EIf c t f) (if-form w e c t f tail))
+    ((EDo es) (do-form w es tail))
+    ((EMatch s cls) (match-form w e s cls tail))
+    ((ELoop vs body) (loop-form w vs body tail))
+    ((ERecur args) (recur-form w e args))
+    ((EField x _ _) (field-form w x))
+    ((EDeref p _) (do (place-form w p) (MOwned false)))
+    ((ESet p v) (do (place-form w p) (store w v) MScalar))
+    ((ESetField _ _ v) (do (store w v) MScalar))
+    ((EAsync b caps) (walk-async-lit w e b caps))
+    ((EAwait x) (do (operand w x) (MOwned false)))
+    ((EUnsafe b) (walk-expr w b false))
+    ((EDyn _ _ _ x) (walk-expr w x false))
+    ((EConvert _ _ x) (do (operand w x) MScalar))
+    ((EConcat es) (concat-form w e es))))
+
+;; Rust: walk/expr.rs:17 `Walker::expr`: walks e (`tail`: tail position of the frame's body),
+;; records and returns its mode.
 (defun walk-expr (w: Walker e: Expr tail: bool) -> Mode
-  (trap "todo: walk-expr"))
-
-;; Rust: walk/expr.rs:109 `Walker::temp`: registers the `Owned` value of x as a temporary of the
-;; innermost scope, a §6.11 candidate if x allocates (an immortal value is none).
-(defun walk-temp (w: Walker x: Expr) -> unit
-  (trap "todo: walk-temp"))
-
-;; Rust: walk/expr.rs:127 `Walker::step`: a step (syntax §2): its temporaries die at its end, by the
-;; scope-exit rule.
-(defun walk-step (w: Walker e: Expr tail: bool) -> Mode
-  (trap "todo: walk-step"))
-
-;; Rust: walk/expr.rs:202 `Walker::join`: the join of §6.3; retains go on the branches that are not
-;; `Owned`; a branch with no value (a `recur`) takes no part.
-(defun walk-join (w: Walker e: Expr branches: (Vec (Pair Expr Mode))) -> Mode
-  (trap "todo: walk-join"))
-
-;; Rust: walk/expr.rs:274 `Walker::scrutinee`: the scrutinee s of mode m (an `Owned` one is an implicit
-;; owning binding of the scope): the two modes `pattern-modes` gives.
-(defun walk-scrutinee (w: Walker s: Expr m: Mode) -> (Pair Mode Mode)
-  (trap "todo: walk-scrutinee"))
+  (let [form (walk-form w e tail)
+        m (if (w-is-object w e) form MScalar)]
+    (w-set-mode w (. e id) m)
+    m))

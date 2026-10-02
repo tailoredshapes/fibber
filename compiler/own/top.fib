@@ -1,12 +1,217 @@
 ;; compiler/own/top.fib: the pass over a typed program: the units in checking order, the SCC
 ;; path and the method path, the borrow and `&` checks, as crates/fibref/src/own/top.rs (308
-;; lines of Rust). Package O7; `analyse` is a stub (the functions that are private in Rust,
-;; `scc_unit`, `method_unit`, `method_owned`, `method_spec`, `borrow_checks`, `amp_captures`,
-;; `impl_escapes`, are written by O7 here).
+;; lines of Rust). Package O7. The functions that are private in Rust (`scc_unit`,
+;; `method_unit`, `method_owned`, `method_spec`, `borrow_checks`, `amp_captures`, `impl_escapes`)
+;; are here too.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the state of the pass (`prog` and `errors`, `&mut` in Rust) is a value, `TopState`, that
+;;   every step takes and returns.
+;; - `analyse_observed` and its `watch` are not ported: `analyse` stores what `watch` was told,
+;;   the keys of each unit's bodies and its finished facts, in `OwnedProgram.unit-facts`.
 (ns own.top
-  (:use types.program own.error own.program))
+  (:use syntax.pos types.ast types.decls types.table types.program types.display types.infer.mod own.error
+        own.objects own.program own.facts own.walk.state own.walk.lit own.unit own.taken))
+
+;; What the pass has so far: the program being made and the errors found.
+(defstruct TopState (prog: OwnedProgram errors: (Vec OwnError)))
+
+;; Rust: top.rs:76 `seen`: tells the program the keys of a decided unit's bodies, in the order
+;; stored, and its finished facts.
+(defun observe :private (o: OwnedProgram done: Decided) -> OwnedProgram
+  (with o (unit-facts (conj (. o unit-facts)
+                            (UnitFacts (mapv (fn (pr: (Pair BodyKey BodyOwn)) (. pr fst)) (. done bodies))
+                                       (. done facts))))))
+
+;; Rust: top.rs:81 `store`: the bodies of a decided unit, in the order of the units.
+(defun store :private (o: OwnedProgram bodies: (Vec (Pair BodyKey BodyOwn))) -> OwnedProgram
+  (reduce (fn (acc: OwnedProgram pr: (Pair BodyKey BodyOwn))
+            (with acc
+              (order (conj (. acc order) (. pr fst)))
+              (bodies (assoc (. acc bodies) (. pr fst) (. pr snd)))))
+          o bodies))
+
+;; Whether the binding `b` holds an object: any type but a scalar or a field-less enum, or none known.
+(defun object-binding? :private (p: TypedProgram b: i64) -> bool
+  (match (get (. p binding-types) b)
+    ((some t) (is-object (. p globals) t))
+    (_ true)))
+
+;; Rust: top.rs:89 `param_in`.
+(defun param-in :private (p: TypedProgram d: ParamDecl all-owned: bool) -> ParamIn
+  (cond (. d amp) PiAmp
+        (not (object-binding? p (. d binding))) PiScalar
+        :else (PiObj all-owned)))
+
+;; Rust: top.rs:104 `fun_spec`.
+(defun fun-spec :private (p: TypedProgram f: i64 all-owned: bool) -> BodySpec
+  (let [def (g-fun (. p globals) f)]
+    (BodySpec FkDefun
+              (mapv (fn (d: ParamDecl) (Pair (. d binding) (param-in p d all-owned))) (. def params))
+              (mapv (fn (d: ParamDecl) (. d borrow)) (. def params))
+              (. def body))))
+
+;; The bindings of the parameters of a `defun`.
+(defun param-bindings :private (def: FunDef) -> (Vec i64)
+  (mapv (fn (d: ParamDecl) (. d binding)) (. def params)))
+
+;; Rust: top.rs:223 `scc_bodies`: the bodies of an SCC, or of its all-owned bodies (§8.4).
+(defun scc-bodies :private (p: TypedProgram fs: (Vec i64) all-owned: bool) -> Unit
+  (Unit (mapv (fn (f: i64) (Pair (if all-owned (BodyAllOwned f) (BodyFun f)) (fun-spec p f all-owned)))
+              fs)
+        fs all-owned))
+
+;; Rust: top.rs:245 `borrow_checks`: `parameter p of f is declared :borrow but escapes` (§6.4).
+(defun borrow-checks (def: FunDef facts: Facts) -> (Vec OwnError)
+  (vec (for [d (. def params) :when (and (. d borrow) (contains? (. facts escapes) (. d binding)))]
+         (own-error BorrowEscapes (. def pos)
+                    (str-join ["parameter " (. d name) " of " (. def name)
+                               " is declared :borrow but escapes"])))))
+
+;; The `fn` literals inside e, in pre-order.
+(defun fn-literals (e: Expr acc: (Vec Expr)) -> (Vec Expr)
+  (reduce (fn (a: (Vec Expr) c: Expr) (fn-literals c a))
+          (match (. e kind) ((EFn _) (conj acc e)) (_ acc))
+          (expr-children e)))
+
+;; The `&` parameters that escaping closure `c` of literal `lit` captures, with an error for each
+;; the first time; `st` is the parameters seen so far and the errors.
+(defun capture-errors :private (p: TypedProgram def: FunDef lit: Expr c: ClosureOwn
+                                st: (Pair (Set i64) (Vec OwnError))) -> (Pair (Set i64) (Vec OwnError))
+  (reduce (fn (s: (Pair (Set i64) (Vec OwnError)) cap: CaptureOwn)
+            (if (and (= (. cap pass) PsOwnCell) (not (contains? (. s fst) (. cap binding))))
+              (Pair (conj (. s fst) (. cap binding))
+                    (conj (. s snd)
+                          (own-error AmpCaptured (. lit pos)
+                                     (str-join ["& parameter captured by escaping closure: "
+                                                (. (g-binding (. p globals) (. cap binding)) name)
+                                                " in " (. def name)]))))
+              s))
+          st (. c captures)))
+
+;; Rust: top.rs:262 `amp_captures`: `& parameter captured by escaping closure: v in f` (§6.5,
+;; case 18), once per parameter.
+(defun amp-captures (p: TypedProgram def: FunDef body: BodyOwn) -> (Vec OwnError)
+  (. (reduce (fn (st: (Pair (Set i64) (Vec OwnError)) lit: Expr)
+               (match (get (. body closures) (. lit id))
+                 ((some c) :when (some? (. c escaping)) (capture-errors p def lit c st))
+                 (_ st)))
+             (Pair (set-empty) [])
+             (fn-literals (. def body) []))
+     snd))
+
+;; Rust: top.rs:130 `scc_unit`: an SCC of `defun`s, and the all-owned bodies of those whose value
+;; is taken (§8.4).
+(defun scc-unit :private (p: TypedProgram t: TopState fs: (Vec i64)) -> TopState
+  (let [g (. p globals)
+        bindings (vec (mapcat (fn (f: i64) (param-bindings (g-fun g f))) fs))
+        members (reduce (fn (m: (Map i64 (Vec i64)) f: i64) (assoc m f (param-bindings (g-fun g f))))
+                        (map-empty) fs)
+        done (decide p (. (. t prog) summaries) (scc-bodies p fs false)
+                     (facts-new members (into (set-empty) bindings) []))
+        o1 (reduce (fn (o: OwnedProgram f: i64)
+                     (with o (summaries (assoc (. o summaries) f (facts-summary (. done facts) p f)))))
+                   (observe (. t prog) done) fs)
+        e1 (reduce (fn (es: (Vec OwnError) f: i64) (into es (borrow-checks (g-fun g f) (. done facts))))
+                   (. t errors) fs)
+        e2 (reduce (fn (es: (Vec OwnError) pr: (Pair BodyKey BodyOwn))
+                     (match (. pr fst)
+                       ((BodyFun f) (into es (amp-captures p (g-fun g f) (. pr snd))))
+                       (_ es)))
+                   e1 (. done bodies))
+        o2 (store o1 (. done bodies))]
+    (if (some? (find-first (fn (f: i64) (contains? (. o2 value-taken) f)) fs))
+      (let [owned (decide p (. o2 summaries) (scc-bodies p fs true)
+                          (facts-new members (set-empty) bindings))]
+        (TopState (store (observe o2 owned) (. owned bodies)) e2))
+      (TopState o2 e2))))
+
+;; Rust: top.rs:306 `method_spec`: a method body with its declared kinds (syntax §3.10).
+(defun method-spec (p: TypedProgram i: i64 m: i64) -> BodySpec
+  (let [g (. p globals)
+        inst (table-get (. g instances) i)
+        im (nth (. inst methods) m)
+        mps (. (nth (. (g-proto g (. inst proto)) methods) (. im index)) params)
+        flag (fn (j: i64 owned: bool)
+               (match (get mps j) ((some mp) (if owned (. mp owned) (. mp borrow))) (_ false)))]
+    (BodySpec FkMethod
+              (mapv (fn (j: i64)
+                      (let [b (nth (. im params) j)]
+                        (Pair b (if (object-binding? p b) (PiObj (flag j true)) PiScalar))))
+                    (range (count (. im params))))
+              (mapv (fn (j: i64) (flag j false)) (range (count (. im params))))
+              (. im body))))
+
+;; Rust: top.rs:280 `method_owned`: the all-owned body of a method implementation used as a value
+;; (§8.4): the body decided afresh with every object parameter owned (declared, like an
+;; all-owned body's). The declared kinds were checked on the method's own body; this one reports
+;; nothing.
+(defun method-owned :private (p: TypedProgram i: i64 m: i64 summaries: (Map i64 Summary)) -> Decided
+  (let [spec (method-spec p i m)
+        owned (with spec
+                (params (mapv (fn (pr: (Pair i64 ParamIn))
+                                (match (. pr snd)
+                                  ((PiObj _) (Pair (. pr fst) (PiObj true)))
+                                  (_ pr)))
+                              (. spec params))))
+        preset (vec (keep (fn (pr: (Pair i64 ParamIn)) (match (. pr snd) ((PiObj _) (some (. pr fst))) (_ nil)))
+                          (. owned params)))]
+    (decide p summaries (Unit [(Pair (BodyMethodOwned i m) owned)] [] false)
+            (facts-new (map-empty) (set-empty) preset))))
+
+;; Rust: top.rs:318 `impl_escapes`: `implementation of P/m for T makes parameter p escape; the
+;; protocol declares it :borrow` (§6.4).
+(defun impl-escapes (p: TypedProgram i: i64 m: i64 b: i64) -> OwnError
+  (let [g (. p globals)
+        inst (table-get (. g instances) i)
+        im (nth (. inst methods) m)
+        ty (printer-ty (printer-with-names g (. inst var-names) []) (. inst head))
+        proto (g-proto g (. inst proto))]
+    (own-error ImplEscapes (. im pos)
+               (str-join ["implementation of " (. proto name) "/" (. (nth (. proto methods) (. im index)) name)
+                          " for " ty " makes parameter " (. (g-binding g b) name)
+                          " escape; the protocol declares it :borrow"]))))
+
+;; Rust: top.rs:191 `method_unit`: an `impl` method, and its all-owned body if a method value may
+;; run it.
+(defun method-unit :private (p: TypedProgram t: TopState i: i64 m: i64) -> TopState
+  (let [im (nth (. (table-get (. (. p globals) instances) i) methods) m)
+        spec (method-spec p i m)
+        preset (vec (keep (fn (pr: (Pair i64 ParamIn)) (if (= (. pr snd) (PiObj true)) (some (. pr fst)) nil))
+                          (. spec params)))
+        done (decide p (. (. t prog) summaries) (Unit [(Pair (BodyMethod i m) spec)] [] false)
+                     (facts-new (map-empty) (set-empty) preset))
+        o1 (observe (. t prog) done)
+        errs (reduce (fn (es: (Vec OwnError) j: i64)
+                       (let [b (nth (. im params) j)]
+                         (if (and (nth (. spec declared-borrow) j) (contains? (. (. done facts) escapes) b))
+                           (conj es (impl-escapes p i m b))
+                           es)))
+                     (. t errors) (range (count (. im params))))
+        o2 (store o1 (. done bodies))]
+    (if (contains? (. o2 methods-taken) (Pair i m))
+      (let [owned (method-owned p i m (. o2 summaries))]
+        (TopState (store (observe o2 owned) (. owned bodies)) errs))
+      (TopState o2 errs))))
+
+;; One unit of the program, in checking order.
+(defun top-unit :private (p: TypedProgram t: TopState u: UnitRef) -> TopState
+  (match u
+    ((UScc fs) (scc-unit p t fs))
+    ((UMacro f) (scc-unit p t [f]))
+    ((UImplMethod i m) (method-unit p t i m))
+    ((UDef d)
+     (let [spec (BodySpec FkDef [] [] (. (g-def (. p globals) d) init))
+           done (decide p (. (. t prog) summaries) (Unit [(Pair (BodyDef d) spec)] [] false) (facts-empty))]
+       (TopState (store (observe (. t prog) done) (. done bodies)) (. t errors))))))
 
 ;; Rust: top.rs:25 `analyse`: runs the ownership pass over a typed program: the `OwnedProgram`
 ;; (with the facts of each unit in `unit-facts`), or the ownership errors.
 (defun analyse (p: TypedProgram) -> (Result OwnedProgram (Vec OwnError))
-  (trap "todo: analyse"))
+  (let [t (reduce (fn (t: TopState u: UnitRef) (top-unit p t u))
+                  (TopState (with (owned-program-new)
+                              (value-taken (value-taken p))
+                              (methods-taken (methods-taken p)))
+                            [])
+                  (. p units))]
+    (if (empty? (. t errors)) (Ok (. t prog)) (Err (. t errors)))))

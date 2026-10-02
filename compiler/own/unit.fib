@@ -1,9 +1,18 @@
 ;; compiler/own/unit.fib: the driver of one unit: the tail sites of §6.10, the fixpoint of §6.4,
 ;; the admission of tail calls, the scope-local bindings of §6.11 and the emitting walk, as
 ;; crates/fibref/src/own/unit.rs (181 lines of Rust). Package O7. `Unit` and `Decided` are data
-;; (package O1); `decide` is a stub.
+;; (package O1). A unit is walked four times over (five with every round of the fixpoint):
+;;
+;; 1. the tail sites: a walk with every inferred kind borrowed and every closure on the stack
+;;    decides which calls in tail position §6.10 admits; they are fixed from here on;
+;; 2. the fixpoint of §6.4: kinds, escape summaries and heap closures, walked until the facts
+;;    stop growing (Rust's `absorb` returns whether they grew, here the facts are compared);
+;; 3. admission: a walk that applies rule (e) to the tail sites with the finished facts; its
+;;    events decide the scope-local bindings (§6.11, E6 is the admitted tail calls);
+;; 4. emission: a last walk with the scope-local bindings known.
 (ns own.unit
-  (:use types.program own.program own.walk.lit))
+  (:use types.ast types.program own.program own.facts own.stack own.walk.state own.walk.lit
+        own.walk.expr))
 
 ;; The bodies of a unit, each with its key and spec; the `defun`s of the SCC (none for a method
 ;; or a `def`); whether the bodies are all-owned bodies.
@@ -12,6 +21,93 @@
 ;; The decisions for a unit: its bodies' tables, and the facts it ended with.
 (defstruct Decided (bodies: (Vec (Pair BodyKey BodyOwn)) facts: Facts))
 
+;; What one walk over every body of a unit found: the tables of each body, every event, the
+;; tail decisions, the allocation candidates and the `fn` literals that are not `async`.
+(defstruct Walked
+  (outs: (Vec BodyOwn) events: (Vec Event) tails: (Map i64 Tail) candidates: (Map Site i64)
+   literals: (Set i64)))
+
+;; What every walk of a unit shares.
+(defstruct Run (p: TypedProgram summaries: (Map i64 Summary) unit: Unit))
+
+;; Walks one body with a new walker and adds what it found to `w`.
+(defun walk-one :private (w: Walked cx: Ctx spec: BodySpec) -> Walked
+  (let [walker (walker-new cx walk-expr)]
+    (do (walk-body walker spec)
+        (let [out @(. walker out)]
+          (with w
+            (outs (conj (. w outs) out))
+            (events (into (. w events) @(. walker events)))
+            (tails (merge (. w tails) @(. walker tails)))
+            (candidates (merge (. w candidates) @(. walker candidates)))
+            (literals (reduce-kv (fn (s: (Set i64) lit: i64 c: ClosureOwn)
+                                   (if (. c is-async) s (conj s lit)))
+                                 (. w literals) (. out closures))))))))
+
+;; Rust `Run::walk`: a walk over every body of the unit; `sites` are the tail sites once known,
+;; `admit` whether rule (e) is applied to them with `facts`, `local` the scope-local sites.
+(defun run-walk :private (r: Run facts: Facts sites: (Option (Map i64 Tail)) admit: bool
+                          local: (Set Site)) -> Walked
+  (let [unit (. r unit)]
+    (reduce (fn (w: Walked pair: (Pair BodyKey BodySpec))
+              (walk-one w (Ctx (. r p) (. r summaries) facts (. unit scc) (. unit all-owned)
+                               sites admit local)
+                        (. pair snd)))
+            (Walked [] [] (map-empty) (map-empty) (set-empty))
+            (. unit bodies))))
+
+;; The facts of the fixpoint: walks until a walk's events add nothing.
+(defun settle :private (r: Run sites: (Map i64 Tail) facts: Facts) -> Facts
+  (loop [f facts]
+    (let [w (run-walk r f (some sites) false (set-empty))
+          g (facts-absorb f (. r p) (. w events) (. w literals))]
+      (if (= g f) f (recur g)))))
+
+;; Rust: unit.rs:150 `finish_allocs`: the allocation sites of a body that are scope-local are on the
+;; stack, and the temporaries among them are stack temporaries; a `fn` literal is decided by §6.5.
+(defun finish-allocs (out: BodyOwn cands: (Map Site i64) lits: (Set i64) local: (Set Site))
+  -> BodyOwn
+  (reduce-kv (fn (o: BodyOwn site: Site init: i64)
+               (if (or (not (contains? local site)) (contains? lits init)
+                       (not (contains? (. o allocs) init)))
+                 o
+                 (let [o2 (with o (allocs (assoc (. o allocs) init AlStack)))]
+                   (match site
+                     ((SiteValue e) (with o2 (stack-temps (conj (. o2 stack-temps) e))))
+                     (_ o2)))))
+             out cands))
+
+;; Rust: unit.rs:166 `params`: the parameters of a body as the facts decided them.
+(defun body-params (facts: Facts spec: BodySpec) -> (Vec ParamOwn)
+  (mapv (fn (i: i64)
+          (let [pr (nth (. spec params) i)
+                b (. pr fst)
+                declared (get-or (. spec declared-borrow) i false)]
+            (ParamOwn b
+                      (match (. pr snd)
+                        ((PiScalar) PkScalar)
+                        ((PiAmp) PkAmp)
+                        ((PiObj _) (match (get (. facts owned) b)
+                                     ((some ws) (PkOwned (vec (sort (vec ws)))))
+                                     (_ PkBorrowed))))
+                      (and (contains? (. facts escapes) b) (not declared))
+                      declared)))
+        (range (count (. spec params)))))
+
 ;; Rust: unit.rs:101 `decide`: decides a unit, starting from `facts`.
 (defun decide (p: TypedProgram summaries: (Map i64 Summary) unit: Unit facts: Facts) -> Decided
-  (trap "todo: decide"))
+  (let [r (Run p summaries unit)
+        sites (. (run-walk r facts nil false (set-empty)) tails)
+        settled (settle r sites facts)
+        admitted (run-walk r settled (some sites) true (set-empty))
+        done (facts-absorb settled p (. admitted events) (. admitted literals))
+        local (scope-local (. admitted events) (. admitted candidates) (. admitted literals)
+                           (. done heap))
+        emitted (run-walk r done (some sites) true local)]
+    (Decided (mapv (fn (pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
+                     (let [key (. (. pair fst) fst)
+                           spec (. (. pair fst) snd)
+                           out (finish-allocs (. pair snd) (. emitted candidates) (. emitted literals) local)]
+                       (Pair key (with out (params (body-params done spec))))))
+                   (zip (. unit bodies) (. emitted outs)))
+             done)))

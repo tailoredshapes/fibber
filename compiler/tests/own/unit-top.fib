@@ -1,0 +1,130 @@
+;; compiler/tests/own/unit-top.fib: the checks of own.top and the tables of own.unit that read only data,
+;; over real programs (typed by types.driver) and hand-built facts and tables (package O7; the
+;; whole pass is judged by the dump, golden.sh and compare.sh): `borrow-checks`, `amp-captures`,
+;; `impl-escapes` (the three error texts and positions), `method-spec` (declared kinds), and from
+;; own.unit `body-params` (the kind of each parameter from the facts) and `finish-allocs` (stack
+;; allocations and stack temporaries of the scope-local sites). Prints `ok NAME` or `FAIL NAME`.
+;; Needs lib/prelude.fib in the working directory (run from the repository root).
+;; Build: fibc build compiler/tests/own/unit-top.fib -I compiler -I lib -o OUT
+(ns main
+  (:use fib.coll.record syntax.pos types.ast types.table types.decls types.check types.driver
+        types.program own.error own.program own.walk.state own.walk.lit own.unit own.top))
+
+(defun typed (source: str) -> TypedProgram
+  (match (check-source source "t.fib")
+    ((Ok p) p)
+    ((Err _) (trap "unit-top: the source does not type"))))
+
+(defun fun-named (p: TypedProgram name: str) -> FunDef
+  (g-fun (. p globals) (unwrap (program-fun p name))))
+
+(defun same-pos (a: Pos b: Pos) -> bool
+  (and (= (. a start) (. b start)) (= (. a end) (. b end)) (= (. a line) (. b line))))
+
+(defun texts (es: (Vec OwnError)) -> (Vec str) (mapv (fn (e: OwnError) (. e message)) es))
+
+(defun check-borrow (cs: Checks) -> unit
+  (let [p (typed "(defstruct Pt (x: i64))\n(defun keep (s: Pt :borrow) -> Pt s)\n(defun plain (s: Pt) -> Pt s)\n(defun main () -> i64 0)\n")
+        keep (fun-named p "keep")
+        b (. (nth (. keep params) 0) binding)
+        escaping (with (facts-empty) (escapes (assoc (map-empty) b "returned")))
+        es (borrow-checks keep escaping)
+        plain (fun-named p "plain")
+        pb (. (nth (. plain params) 0) binding)]
+    (do (check cs "borrow: a :borrow parameter that escapes is BorrowEscapes"
+               (and (= (count es) 1) (= (. (nth es 0) kind) BorrowEscapes)))
+        (check cs "borrow: the message names the parameter and the function"
+               (= (texts es) ["parameter s of keep is declared :borrow but escapes"]))
+        (check cs "borrow: the position is the defun's" (same-pos (. (nth es 0) pos) (. keep pos)))
+        (check cs "borrow: no escape, no error" (empty? (borrow-checks keep (facts-empty))))
+        (check cs "borrow: an escape of a parameter not declared :borrow is no error here"
+               (empty? (borrow-checks plain (with (facts-empty) (escapes (assoc (map-empty) pb "x")))))))))
+
+(defun closure-own (cap: i64 pass: Pass esc: (Option str)) -> ClosureOwn
+  (ClosureOwn false esc nil [(CaptureOwn cap pass)] []))
+
+(defun check-amp (cs: Checks) -> unit
+  (let [p (typed "(defun make-pusher (&v) (fn (x) (append &v x)))\n(defun main () -> i64 0)\n")
+        def (fun-named p "make-pusher")
+        v (. (nth (. def params) 0) binding)
+        lit (nth (fn-literals (. def body) []) 0)
+        at (fn (c: ClosureOwn) (with (body-own-new) (closures (assoc (map-empty) (. lit id) c))))]
+    (do (check cs "amp: the one fn literal is found" (= (count (fn-literals (. def body) [])) 1))
+        (check cs "amp: an & parameter captured (own-cell) by an escaping closure is AmpCaptured"
+               (= (texts (amp-captures p def (at (closure-own v PsOwnCell (some "returned")))))
+                  ["& parameter captured by escaping closure: v in make-pusher"]))
+        (check cs "amp: at the position of the literal"
+               (same-pos (. (nth (amp-captures p def (at (closure-own v PsOwnCell (some "returned")))) 0) pos) (. lit pos)))
+        (check cs "amp: a closure that does not escape is fine"
+               (empty? (amp-captures p def (at (closure-own v PsOwnCell nil)))))
+        (check cs "amp: a capture that is not an own cell is fine"
+               (empty? (amp-captures p def (at (closure-own v PsRetain (some "returned"))))))
+        (check cs "amp: a body with no closure table is fine" (empty? (amp-captures p def (body-own-new))))
+        (check cs "amp: once per parameter, though two closures capture it"
+               (= (count (amp-captures p def
+                                       (at (ClosureOwn false (some "stored") nil
+                                                       [(CaptureOwn v PsOwnCell) (CaptureOwn v PsOwnCell)] []))))
+                  1)))))
+
+(def keeper: str
+  "(defprotocol Keeper (keep (self x: (Box i64) :borrow) -> (Box i64) x))\n(defstruct Jar (n: i64))\n(impl Keeper Jar)\n(defun main () -> i64 (unbox (keep (Jar 0) (Box 7))))\n")
+
+(defun check-impl (cs: Checks) -> unit
+  (let [p (typed keeper)
+        i (- (table-count (. (. p globals) instances)) 1)
+        im (nth (. (table-get (. (. p globals) instances) i) methods) 0)
+        x (nth (. im params) 1)
+        e (impl-escapes p i 0 x)
+        spec (method-spec p i 0)]
+    (do (check cs "impl: ImplEscapes" (= (. e kind) ImplEscapes))
+        (check cs "impl: the text names protocol, method, type and parameter"
+               (= (. e message) (str-join ["implementation of Keeper/keep for Jar makes parameter "
+                                           (. (g-binding (. p globals) x) name)
+                                           " escape; the protocol declares it :borrow"])))
+        (check cs "impl: at the implementation" (same-pos (. e pos) (. im pos)))
+        (check cs "method-spec: the declared kinds are the protocol's"
+               (= (. spec declared-borrow) [false true]))
+        (check cs "method-spec: object parameters are borrowed, the frame is a method's"
+               (and (= (mapv (fn (pr: (Pair i64 ParamIn)) (. pr snd)) (. spec params)) [(PiObj false) (PiObj false)])
+                    (= (. spec kind) FkMethod)
+                    (= (mapv (fn (pr: (Pair i64 ParamIn)) (. pr fst)) (. spec params)) (. im params)))))))
+
+(defun check-params (cs: Checks) -> unit
+  (let [facts (with (facts-empty)
+                (owned (assoc (assoc (map-empty) 5 (set [(OwRule1 "returned") OwDeclared])) 6 (set [OwDeclared])))
+                (escapes (assoc (assoc (map-empty) 5 "returned") 7 "stored")))
+        spec (BodySpec FkDefun [(Pair 4 PiScalar) (Pair 5 (PiObj false)) (Pair 6 (PiObj false))
+                                (Pair 7 (PiObj false)) (Pair 8 PiAmp) (Pair 9 (PiObj false))]
+                       [false false false true false false] (Expr 0 (Pos "t.fib" 1 1 0 1) (ELocal 0)))
+        ps (body-params facts spec)]
+    (do (check cs "params: one per parameter, in order" (= (mapv (fn (q: ParamOwn) (. q binding)) ps) [4 5 6 7 8 9]))
+        (check cs "params: a scalar and an & parameter" (and (= (. (nth ps 0) kind) PkScalar) (= (. (nth ps 4) kind) PkAmp)))
+        (check cs "params: owned with every reason, in the order of derived Ord"
+               (= (. (nth ps 1) kind) (PkOwned [(OwRule1 "returned") OwDeclared])))
+        (check cs "params: owned with the one reason" (= (. (nth ps 2) kind) (PkOwned [OwDeclared])))
+        (check cs "params: borrowed when the facts say nothing" (= (. (nth ps 5) kind) PkBorrowed))
+        (check cs "params: escapes comes from the facts" (and (. (nth ps 1) escapes) (not (. (nth ps 2) escapes))))
+        (check cs "params: a declared :borrow takes the escape away and is kept"
+               (and (not (. (nth ps 3) escapes)) (. (nth ps 3) declared-borrow) (not (. (nth ps 1) declared-borrow)))))))
+
+(defun check-allocs (cs: Checks) -> unit
+  (let [out (with (body-own-new) (allocs (assoc (assoc (assoc (map-empty) 10 AlHeap) 11 AlHeap) 12 AlHeap)))
+        cands (assoc (assoc (assoc (assoc (map-empty) (SiteBind 1) 10) (SiteValue 11) 11)
+                            (SiteBind 2) 12) (SiteBind 3) 13)
+        local (set [(SiteBind 1) (SiteValue 11) (SiteBind 3)])
+        done (finish-allocs out cands (set [12]) local)]
+    (do (check cs "allocs: a scope-local binding's initialiser is on the stack"
+               (= (get (. done allocs) 10) (some AlStack)))
+        (check cs "allocs: so is a scope-local temporary's, which is a stack temporary"
+               (and (= (get (. done allocs) 11) (some AlStack)) (= (. done stack-temps) (set [11]))))
+        (check cs "allocs: a binding that is not scope-local stays on the heap"
+               (= (get (. done allocs) 12) (some AlHeap)))
+        (check cs "allocs: an initialiser with no allocation entry gets none"
+               (= (get (. done allocs) 13) nil))
+        (check cs "allocs: a `fn` literal is left to §6.5"
+               (= (get (. (finish-allocs out cands (set [10]) local) allocs) 10) (some AlHeap))))))
+
+(defun main () -> i64
+  (let [cs (checks-new)]
+    (do (check-borrow cs) (check-amp cs) (check-impl cs) (check-params cs) (check-allocs cs)
+        (finish cs))))

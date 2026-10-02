@@ -1,25 +1,92 @@
 ;; compiler/own/walk/pattern.fib: the modes of the variables a pattern binds (spec/types.md
 ;; §6.2, §6.3) and the `match` form, as crates/fibref/src/own/walk/pattern.rs (148 lines of
-;; Rust). Package O3; every public function is a stub of its final signature.
+;; Rust). Package O3. `walk-scrutinee` is here and not in own.walk.expr (own-notes.md): `match-form` needs it, and
+;; own.walk.expr requires this module.
 (ns own.walk.pattern
-  (:use types.ast own.program own.walk.state))
+  (:use types.ast own.program own.walk.state own.walk.callee own.walk.lit own.walk.step))
 
 ;; Rust: walk/pattern.rs:15 `pattern_modes`: the modes of a whole-scrutinee variable and of a variable
 ;; inside a constructor pattern, for a scrutinee of mode m whose implicit owning binding (when m is
 ;; `Owned`) is temp.
 (defun pattern-modes (m: Mode temp: Site) -> (Pair Mode Mode)
-  (trap "todo: pattern-modes"))
+  (match m
+    ((MOwned _) (Pair (MBorrowed temp) (MDerived temp)))
+    ((MBorrowed s) (Pair (MBorrowed s) (MDerived s)))
+    ((MDerived s) (Pair (MDerived s) (MDerived s)))
+    ((MScalar) (Pair MScalar MScalar))))
 
 ;; Rust: walk/pattern.rs:25 `kind_of`: the kind of a binding that reads as m.
 (defun bind-kind-of (m: Mode) -> BindKind
-  (trap "todo: bind-kind-of"))
+  (match m
+    ((MBorrowed s) (BnAliasOf s))
+    ((MDerived s) (BnDerivedOf s))
+    (_ BnScalar)))
+
+;; Rust: walk/pattern.rs:119 `bind_var`: a variable that is not an object reads as a scalar.
+(defun bind-var :private (w: Walker b: i64 m: Mode) -> unit
+  (let [m2 (if (w-binding-is-object w b) m MScalar)]
+    (w-bind w b m2 (bind-kind-of m2))))
+
+;; Rust: walk/pattern.rs:60 `bind_rest`: a rest variable: an owning binding of the innermost scope
+;; (the clause's, or the `let`'s), never scope-local (§6.11).
+(defun bind-rest :private (w: Walker r: i64) -> unit
+  (do (w-own-site w (SiteBind r) false)
+      (w-bind w r (w-owning r) BnOwns)))
 
 ;; Rust: walk/pattern.rs:36 `Walker::bind_pattern`: binds the variables of pat; `top` while no
 ;; constructor pattern encloses it.
 (defun bind-pattern (w: Walker pat: Pattern whole: Mode inner: Mode top: bool) -> unit
-  (trap "todo: bind-pattern"))
+  (let [here (if top whole inner)]
+    (match (. pat kind)
+      ((PWild) (do))
+      ((PLit _) (do))
+      ((PBind b) (bind-var w b here))
+      ((PCtor _ _ subs) (doseq [s subs] (bind-pattern w s whole inner false)))
+      ((PAs p b) (do (bind-var w b here) (bind-pattern w p whole inner top)))
+      ((PVec subs rest)
+       (do (doseq [s subs] (bind-pattern w s whole inner false))
+           (match rest ((RestBind r) (bind-rest w r)) (_ (do))))))))
+
+;; Rust: walk/expr.rs:274 `Walker::scrutinee`: the scrutinee s of mode m (an `Owned` one is an implicit
+;; owning binding of the scope, a §6.11 candidate if s allocates): the two modes `pattern-modes` gives.
+(defun walk-scrutinee (w: Walker s: Expr m: Mode) -> (Pair Mode Mode)
+  (let [t (SiteValue (. s id))
+        val (walk-val w s m)]
+    (do (when (mode-owned? m)
+          (w-own-site w t false)
+          (when (allocates w s) (w-candidate! w t (. s id))))
+        (w-note w val AtOther)
+        (pattern-modes m t))))
+
+;; Rust: walk/pattern.rs:105 `guard_exit`: the releases of a false guard: the clause's owning
+;; bindings (the innermost scope's sites) in reverse order.
+(defun guard-exit :private (w: Walker) -> (Vec Op)
+  (match (peek @(. (w-frame w) scopes))
+    ((some sc) (vec (for [p (reverse @(. sc sites))] (w-end-op w (. p fst) WhyScopeExit))))
+    (_ [])))
+
+;; Rust: walk/pattern.rs:90 `clause`: one clause (§6.3): its rest variables are the owning bindings
+;; of its scope; the guard is a step, not in tail position, whose false edge exits the scope with no
+;; value; then the body.
+(defun clause :private (w: Walker c: Clause whole: Mode inner: Mode tail: bool) -> Mode
+  (do (w-push-scope w)
+      (bind-pattern w (. c pat) whole inner true)
+      (when-some [g (. c guard)]
+        (do (walk-step w g false)
+            (w-put-guard-fail w (. g id) (guard-exit w))))
+      (let [m (walk-step w (. c body) tail)
+            scope (w-pop-scope w)]
+        (w-exit-scope w scope (. (. c body) id) m))))
 
 ;; Rust: walk/pattern.rs:71 `Walker::match_form`: `(match s clause..)`: the scrutinee's scope, each clause
 ;; in a scope of its own, the join, the scrutinee's scope exit on every clause's path.
 (defun match-form (w: Walker e: Expr s: Expr cls: (Vec Clause) tail: bool) -> Mode
-  (trap "todo: match-form"))
+  (do (w-push-scope w)
+      (let [ms ((. w expr) w s false)
+            modes (walk-scrutinee w s ms)
+            branches (mapv (fn (c: Clause) (Pair (. c body) (clause w c (. modes fst) (. modes snd) tail))) cls)
+            m (walk-join w e branches)
+            scope (w-pop-scope w)]
+        (reduce-kv (fn (out: Mode i: i64 b: (Pair Expr Mode))
+                     (w-exit-scope-copy w scope (. (. b fst) id) m (= i 0)))
+                   m branches))))

@@ -1,14 +1,319 @@
 ;; compiler/own/walk/call.fib: the walk of a call and of `recur` (spec/types.md §6.3, §6.6,
 ;; §6.10): the decision of tail calls (rule (e)), the consumption of arguments, the head and
 ;; argument passes, stack literal temporaries, as crates/fibref/src/own/walk/call.rs (387 lines
-;; of Rust). Package O5; every public function is a stub of its final signature.
+;; of Rust). Package O5.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the walker's methods (`frame`, `push_scope`, `note`, `exit_scope`, `release_scopes`, ...) are
+;;   the functions `w-NAME` of own.walk.state (O3); `self.expr(x, false)` is `((. w expr) w x false)`.
+;; - `moved: &mut HashSet<Site>` is a `(Cell (Set Site))` made by `walk-call` and `walk-recur`
+;;   and passed to `consume` and to the passes (plan 2.2); the argument closures of Rust, which
+;;   capture `self`, are `reduce`s and `loop`s with explicit accumulators.
+;; - `Walker::temp` of walk/expr.rs is `walk-temp` of own.walk.step (a module cycle otherwise,
+;;   own-notes.md); this module never requires own.walk.expr.
 (ns own.walk.call
-  (:use types.ast own.program own.walk.state))
+  (:use fib.coll.record types.ast own.program own.captured own.syntactic own.walk.state
+        own.walk.callee own.walk.lit own.walk.step))
+
+;; What the argument rules need to know about the call: its id, its callee, whether it is a tail
+;; site (§6.10), whether it is an admitted tail call, whether it is in tail position, and per
+;; argument whether it is an `&v` that another argument captures (§6.6): never forwarded.
+(defstruct CallSite
+  (call: i64 callee: Callee site: bool admitted: bool tail: bool captured: (Vec bool)))
 
 ;; Rust: walk/call.rs:31 `Walker::call`: a call (§6.2: its result is `Owned`) of `head` with `args`.
 (defun walk-call (w: Walker e: Expr head: Expr args: (Vec Arg) tail: bool) -> Mode
-  (trap "todo: walk-call"))
+  (let [callee (callee-of w head)]
+    (w-push-scope w)
+    (let [head-m (if (= callee CalValue) (some ((. w expr) w head false)) nil)
+          ms (arg-modes w args)
+          params (params-of w callee (count args))
+          captured (captured-args w args)
+          d (decide w e callee params args ms tail captured)]
+      (when tail (w-tail! w (. e id) d))
+      (let [cs (CallSite (. e id) callee (tail-site? w e d) (= d TlTailCall) tail captured)
+            moved (cell (set-empty))
+            hp (head-pass w cs head head-m moved)
+            r (arg-passes w cs args ms params moved)]
+        (finish-call w e cs (CallOwn callee d hp (. r fst) (. r snd) []) @moved)
+        (record-alloc w e head)
+        (MOwned false)))))
+
+;; The mode of each argument; an `&v` has none.
+(defun arg-modes :private (w: Walker args: (Vec Arg)) -> (Vec (Option Mode))
+  (reduce (fn (acc: (Vec (Option Mode)) a: Arg)
+            (conj acc (match a
+                        ((ArgExpr x) (some ((. w expr) w x false)))
+                        ((ArgAmp _ _) nil))))
+          [] args))
+
+;; The pass of each argument, in order, and the write-backs `(index, binding)` of the `&v`
+;; arguments that are acquired.
+(defun arg-passes :private (w: Walker cs: CallSite args: (Vec Arg) ms: (Vec (Option Mode))
+                            params: (Vec Param) moved: (Cell (Set Site)))
+  -> (Pair (Vec Pass) (Vec (Pair i64 i64)))
+  (loop [i 0 passes [] wbs []]
+    (if (>= i (count args))
+      (Pair passes wbs)
+      (let [a (nth args i)
+            pass (arg-pass w cs i a (nth ms i) (nth params i) moved)]
+        (recur (+ i 1) (conj passes pass)
+               (match a
+                 ((ArgAmp b _) :when (= pass PsAcquire) (conj wbs (Pair i b)))
+                 (_ wbs)))))))
+
+;; The end of a call: the jump of a tail call (§6.10 step 3), or the release of the step's
+;; temporaries after an ordinary one; records the call.
+(defun finish-call :private (w: Walker e: Expr cs: CallSite own: CallOwn moved: (Set Site)) -> unit
+  (let [own2 (if (. cs admitted)
+               (let [keep-env (= (. own head) PsKeepEnv)
+                     ops (into (w-release-scopes w 0 moved WhyJump)
+                               (w-release-params w moved keep-env WhyJump))]
+                 (w-pop-scope w)
+                 (with own (jump ops)))
+               (let [scope (w-pop-scope w)]
+                 (w-exit-scope w scope (. e id) (MOwned false))
+                 own))]
+    (w-out! w (fn (o: BodyOwn) -> BodyOwn (with o (calls (assoc (. o calls) (. e id) own2)))))))
+
+;; Records an allocation site as a heap one; the driver turns those that §6.11 finds scope-local
+;; into stack ones.
+(defun record-alloc :private (w: Walker e: Expr head: Expr) -> unit
+  (let [g (. (. (. w cx) p) globals)
+        alloc (match (. head kind)
+                ((EGlobal (GCtor t _)) :when (= t @(. g option)) (w-option-alloc w e))
+                (_ (if (allocates w e) (some AlHeap) nil)))]
+    (when-some [a alloc]
+      (w-out! w (fn (o: BodyOwn) -> BodyOwn (with o (allocs (assoc (. o allocs) (. e id) a))))))))
+
+;; Whether the call is a tail site (§6.10): in the first walk, one the rules admit with the
+;; initial facts; later, one that walk found.
+(defun tail-site? :private (w: Walker e: Expr d: Tail) -> bool
+  (if-some [ts (. (. w cx) tail-sites)]
+    (= (get ts (. e id)) (some TlTailCall))
+    (= d TlTailCall)))
+
+;; Per argument, whether it is an `&v` forwardable here whose `v` another argument captures
+;; (§6.6).
+(defun captured-args :private (w: Walker args: (Vec Arg)) -> (Vec bool)
+  (let [carriers @(. (w-frame w) amp-carriers)]
+    (vec (map-indexed (fn (i: i64 a: Arg)
+                        (match a
+                          ((ArgAmp b _) (match (get carriers b)
+                                          ((some cs) (captured-at args i b cs))
+                                          (_ false)))
+                          ((ArgExpr _) false)))
+                      args))))
+
+;; The decision of §6.10 for a call; `tail` is tail position, `captured` the captured `&`
+;; arguments.
+(defun decide :private (w: Walker e: Expr c: Callee ps: (Vec Param) args: (Vec Arg)
+                        ms: (Vec (Option Mode)) tail: bool captured: (Vec bool)) -> Tail
+  (cond
+    (not tail) TlNotInTail
+    (= c CalCtor) (TlOrdinary BcStore)
+    (match c ((CalBuiltin b) (builtin-stores b)) (_ false)) (TlOrdinary BcStore)
+    (= c CalExtern) (TlOrdinary BcExtern)
+    (match (. (w-frame w) kind) ((FkAsync) true) ((FkDef) true) (_ false)) (TlOrdinary BcAsyncBody)
+    (not (every? (fn (a: Arg) (forwardable? w a)) args)) (TlOrdinary BcAmpArgument)
+    :else (match (caught-amp args captured)
+            ((some param) (TlOrdinary (BcAmpCaptured param)))
+            (_ (decide-by-sites w e c ps ms)))))
+
+;; The first `&v` argument that another argument captures: its binding.
+(defun caught-amp :private (args: (Vec Arg) captured: (Vec bool)) -> (Option i64)
+  (first (keep (fn (p: (Pair Arg bool))
+                 (match (. p fst)
+                   ((ArgAmp b _) :when (. p snd) (some b))
+                   (_ nil)))
+               (zip args captured))))
+
+;; The decision once the cases that need no facts are past: the tail sites of an earlier walk
+;; (admitted ones only when `admit`), else rule (e).
+(defun decide-by-sites :private (w: Walker e: Expr c: Callee ps: (Vec Param)
+                                 ms: (Vec (Option Mode))) -> Tail
+  (if-some [ts (. (. w cx) tail-sites)]
+    (match (get ts (. e id))
+      ((some (TlTailCall)) :when (. (. w cx) admit) (rule-e w c ps ms))
+      ((some d) d)
+      (_ TlNotInTail))
+    (rule-e w c ps ms)))
+
+;; Rule (e): a frame-owned argument at a borrowed position of a callee outside the current SCC
+;; makes the call ordinary.
+(defun rule-e :private (w: Walker c: Callee ps: (Vec Param) ms: (Vec (Option Mode))) -> Tail
+  (if (or (= c CalValue) (some? (scc-callee w c)))
+    TlTailCall
+    (loop [i 0]
+      (cond
+        (>= i (min (count ps) (count ms))) TlTailCall
+        (frame-owned-borrow? w (nth ps i) (nth ms i)) (TlOrdinary (BcFrameOwned i))
+        :else (recur (+ i 1))))))
+
+;; Whether an argument of mode m (none for an `&v`) at position p is frame-owned at a borrowed
+;; position that is not an `&` one.
+(defun frame-owned-borrow? :private (w: Walker p: Param m: (Option Mode)) -> bool
+  (match m
+    ((some mm) (and (= (. p class) ClBorrow) (not (. p amp)) (w-frame-owned w mm)))
+    (_ false)))
+
+;; Whether `&b` at a call in tail position forwards the private cell of an `&` parameter of the
+;; enclosing `defun` (§6.6).
+(defun forwards? :private (w: Walker b: i64) -> bool
+  (let [f (w-frame w)]
+    (and (= (. f kind) FkDefun)
+         (some? (find-first (fn (x: i64) (= x b)) @(. f amp-params))))))
+
+;; Whether an argument is forwardable in a tail call: an expression always, an `&b` if `b`
+;; is an `&` parameter of the `defun`.
+(defun forwardable? :private (w: Walker a: Arg) -> bool
+  (match a
+    ((ArgAmp b _) (forwards? w b))
+    ((ArgExpr _) true)))
+
+;; `consume` at an owned position (§6.3; at a tail call, step 2): scalars as they are, an owned
+;; value moved, a binding of the frame that an admitted tail call may move, moved once, and
+;; anything else retained.
+(defun consume :private (w: Walker m: Mode moved: (Cell (Set Site)) admitted: bool) -> Pass
+  (match m
+    ((MScalar) PsScalar)
+    ((MOwned _) PsMove)
+    ((MBorrowed s) :when (and admitted (w-movable w s) (not (contains? @moved s)))
+     (do (set! moved (conj @moved s)) PsMove))
+    (_ PsRetain)))
+
+;; How the head is handed over: a scalar when the head is not a closure value (§6.3), the
+;; self-name at its own self tail call keeps its environment, else consumed.
+(defun head-pass :private (w: Walker cs: CallSite head: Expr m: (Option Mode)
+                           moved: (Cell (Set Site))) -> Pass
+  (match m
+    (nil PsScalar)
+    ((some hm)
+     (let [self-name @(. (w-frame w) self-name)
+           self-tail (and (. cs site)
+                          (match (. head kind) ((ELocal g) (= self-name (some g))) (_ false)))
+           admitted (. cs admitted)]
+       (w-note w (walk-val w head hm)
+               (AtHead (->HeadAt (. cs call) (. cs site) admitted self-tail)))
+       (if (and self-tail admitted)
+         PsKeepEnv
+         (let [pass (consume w hm moved admitted)]
+           (stack-literal-temp w head pass)
+           pass))))))
+
+;; A stack closure literal handed over at an owned position still ends at the end of the call's
+;; step (§6.11).
+(defun stack-literal-temp :private (w: Walker x: Expr pass: Pass) -> unit
+  (when (and (match (. x kind) ((EFn _) true) (_ false))
+             (= pass PsMove)
+             (not (contains? (. (. (. w cx) facts) heap) (. x id))))
+    (walk-temp w x)))
+
+;; How argument `i` is handed over (§6.3, §6.10 step 2), with the position it reaches recorded.
+(defun arg-pass :private (w: Walker cs: CallSite i: i64 a: Arg m: (Option Mode) p: Param
+                          moved: (Cell (Set Site))) -> Pass
+  (match a
+    ((ArgAmp b _) (amp-pass w b (. cs callee) (and (. cs tail) (not (nth (. cs captured) i)))))
+    ((ArgExpr x)
+     (match m
+       (nil PsScalar)
+       ((some (MScalar)) PsScalar)
+       ((some mm) (expr-pass w cs i x mm p moved))))))
+
+;; The pass of argument `i`, the expression x of a mode m that is not a scalar.
+(defun expr-pass :private (w: Walker cs: CallSite i: i64 x: Expr m: Mode p: Param
+                           moved: (Cell (Set Site))) -> Pass
+  (if (= (. p class) ClBorrow)
+    (let [val (match m
+                ((MOwned _) (do (walk-temp w x)
+                                (some (match (walk-val w x m)
+                                        ((some v) v)
+                                        (_ (VB (SiteValue (. x id))))))))
+                (_ (walk-val w x m)))]
+      (arg-note w cs i p m val)
+      PsBorrow)
+    (let [pass (consume w m moved (. cs admitted))]
+      (stack-literal-temp w x pass)
+      (arg-note w cs i p m (walk-val w x m))
+      pass)))
+
+;; Records the position argument `i` reaches, and the `weak` position when it is one.
+(defun arg-note :private (w: Walker cs: CallSite i: i64 p: Param m: Mode val: (Option Val)) -> unit
+  (do (w-note w val (arg-at w cs i p m))
+      (when (. p weak) (w-note w val AtWeak))))
+
+;; The position argument `i` of mode `m` reaches.
+(defun arg-at :private (w: Walker cs: CallSite i: i64 p: Param m: Mode) -> At
+  (cond
+    (. p raw-retained) AtRawRetained
+    (= (. p class) ClStore) AtStore
+    (= (. p class) ClThread) AtThread
+    :else (AtArg (->ArgAt (. cs call) i (. p class) (. p escapes)
+                          (= (. cs callee) CalValue) (scc-callee w (. cs callee))
+                          (. cs site) (. cs admitted) (w-frame-owned w m)))))
+
+;; `&b` handed to a callee (§6.6); `tail`: in tail position and not captured by another argument.
+(defun amp-pass :private (w: Walker b: i64 c: Callee tail: bool) -> Pass
+  (do (when-not (is-amp (. (. (. w cx) p) globals) b)
+        (w-note w (some (VB (SiteBind b))) AtOther))
+      (cond
+        (match c ((CalBuiltin _) true) (_ false)) PsOwnCell
+        (and tail (forwards? w b)) PsForward
+        :else PsAcquire)))
 
 ;; Rust: walk/call.rs:335 `Walker::recur`: `(recur ..)`, a tail call to the loop (§6.10).
+;; Lowering rejects a `recur` outside a loop, so no loop is the empty result.
 (defun walk-recur (w: Walker args: (Vec Expr)) -> RecurOwn
-  (trap "todo: walk-recur"))
+  (match (peek @(. (w-frame w) loops))
+    ((some l) (recur-to w args l))
+    (_ (RecurOwn [] []))))
+
+;; `recur` to the loop l: the arguments walked in a step of their own, each handed to its
+;; variable, then the releases of the jump.
+(defun recur-to :private (w: Walker args: (Vec Expr) l: LoopCtx) -> RecurOwn
+  (do (w-push-scope w)
+      (let [ms (reduce (fn (acc: (Vec Mode) x: Expr) (conj acc ((. w expr) w x false))) [] args)
+            moved (cell (set-empty))
+            passes (recur-passes w args ms l moved)
+            jump (into (w-release-scopes w (+ (. l scope) 1) @moved WhyJump)
+                       (old-releases w (. l vars) @moved))]
+        (w-pop-scope w)
+        (RecurOwn passes jump))))
+
+;; The pass of each argument of a `recur`, with the position it reaches recorded.
+(defun recur-passes :private (w: Walker args: (Vec Expr) ms: (Vec Mode) l: LoopCtx
+                              moved: (Cell (Set Site))) -> (Vec Pass)
+  (loop [i 0 passes []]
+    (if (>= i (count args))
+      passes
+      (let [m (nth ms i)
+            pass (recur-pass w (. l scope) m moved)
+            val (walk-val w (nth args i) m)]
+        (when (< i (count (. l vars)))
+          (w-note w val (AtRecur (nth (. l vars) i))))
+        (recur (+ i 1) (conj passes pass))))))
+
+;; A binding of a scope the jump exits is moved once and retained after; anything else is
+;; consumed.
+(defun recur-pass :private (w: Walker scope: i64 m: Mode moved: (Cell (Set Site))) -> Pass
+  (match m
+    ((MBorrowed s) :when (and (exited? w scope s) (not (contains? @moved s)))
+     (do (set! moved (conj @moved s)) PsMove))
+    ((MBorrowed s) :when (exited? w scope s) PsRetain)
+    (_ (consume w m moved false))))
+
+;; The releases of the old values of the loop variables that the jump did not move, last
+;; variable first.
+(defun old-releases :private (w: Walker vars: (Vec i64) moved: (Set Site)) -> (Vec Op)
+  (vec (keep (fn (v: i64)
+               (if (and (w-binding-is-object w v) (not (contains? moved (SiteBind v))))
+                 (some (Op OpRelease (SiteBind v) WhyRecurOld))
+                 nil))
+             (reverse vars))))
+
+;; Whether `s` is a binding that a `recur` of the loop whose scope is `scope` exits: one of the
+;; loop's variables or of a scope inside it.
+(defun exited? :private (w: Walker scope: i64 s: Site) -> bool
+  (some? (find-first (fn (sc: Scope)
+                       (some? (find-first (fn (x: (Pair Site bool)) (= (. x fst) s)) @(. sc sites))))
+                     (drop scope @(. (w-frame w) scopes)))))

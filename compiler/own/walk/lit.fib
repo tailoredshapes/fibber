@@ -1,11 +1,14 @@
 ;; compiler/own/walk/lit.fib: the walk of a body and of the literals (`fn`, `async`, strings and
 ;; the like) (spec/types.md §6.4, §6.5, §6.9, §6.11), as crates/fibref/src/own/walk/lit.rs (287
 ;; lines of Rust). Package O4. `BodySpec` and `ParamIn` are data (package O1, they are read by
-;; own.unit and own.top); the functions are stubs.
+;; own.unit and own.top).
 ;;
-;; Shapes: `ParamIn` carries the prefix `Pi`.
+;; Shapes: `ParamIn` carries the prefix `Pi`. This is the lowest module of the walk but
+;; own.walk.state and own.walk.callee: it reaches the walk of the body of a literal through the
+;; walker's `expr` field, and own.walk.step, own.walk.pattern, own.walk.call and own.walk.expr
+;; use it.
 (ns own.walk.lit
-  (:use types.ast own.program own.walk.state))
+  (:use types.ast own.program own.captured own.syntactic own.walk.state))
 
 ;; What a parameter is when a body is walked: a scalar, an `&` parameter, an object parameter
 ;; (owned or borrowed).
@@ -17,21 +20,151 @@
 (defstruct BodySpec
   (kind: FrameKind params: (Vec (Pair i64 ParamIn)) declared-borrow: (Vec bool) body: Expr))
 
+;; Rust: walk/lit.rs:47 `Walker::param`: binds the parameter b of the frame just opened.
+(defun walk-param :private (w: Walker b: i64 p: ParamIn) -> unit
+  (match p
+    ((PiScalar) (w-bind w b MScalar BnScalar))
+    ((PiAmp)
+     (let [f (w-frame w)]
+       (set! (. f amp-params) (conj @(. f amp-params) b))
+       (w-out! w (fn (o: BodyOwn) -> BodyOwn
+                   (with o (bindings (assoc (. o bindings) b (BindingOwn BnAmpParam false))))))))
+    ((PiObj owned)
+     (let [owned (or owned (contains? (. (. (. w cx) facts) owned) b))
+           f (w-frame w)]
+       (w-bind w b (w-owning b) (kind-of-param owned))
+       (when owned
+         (w-site-frame! w (SiteBind b) (w-depth w))
+         (set! (. f owned-params) (conj @(. f owned-params) (SiteBind b))))))))
+
+;; Rust: walk/lit.rs:98 `Walker::finish_body`: the exit of a body with value m (§6.3, the E1 row):
+;; consume the value (an owned parameter that is the value is moved out), then release the final
+;; step's temporaries, then the owned parameters not moved out.
+(defun finish-body :private (w: Walker body: Expr m: Mode) -> unit
+  (let [root (w-pop-scope w)
+        id (. body id)
+        sites @(. root sites)
+        params @(. (w-frame w) owned-params)
+        moved (match m
+                ((MBorrowed s) :when (or (some? (find-first (fn (x: Site) (= x s)) params))
+                                         (some? (find-first (fn (x: (Pair Site bool)) (= (. x fst) s)) sites)))
+                 (conj (set-empty) s))
+                (_ (set-empty)))]
+    (w-note w (walk-val w body m) AtReturn)
+    (when (and (mode-shared? m) (empty? moved))
+      (w-push-op w id OpRetain (SiteValue id) WhyReturn))
+    (doseq [x (reverse sites)]
+      (when (not (contains? moved (. x fst)))
+        (w-add-after w id (w-end-op w (. x fst) WhyScopeExit))))
+    (doseq [op (w-release-params w moved false WhyParamExit)]
+      (w-add-after w id op))))
+
+;; Whether m is `Owned` (rather than a scalar or a view of some site).
+(defun mode-owned? (m: Mode) -> bool
+  (match m ((MOwned _) true) (_ false)))
+
+;; Whether m is `Borrowed` or `Derived`.
+(defun mode-shared? (m: Mode) -> bool
+  (match m ((MBorrowed _) true) ((MDerived _) true) (_ false)))
+
+;; Walks a body in the current (fresh) frame and applies its exit.
+(defun run-body :private (w: Walker body: Expr tail: bool) -> unit
+  (do (w-push-scope w)
+      (finish-body w body ((. w expr) w body tail))))
+
 ;; Rust: walk/lit.rs:73 `Walker::walk_body`: walks a `defun`, method or `def` body.
 (defun walk-body (w: Walker spec: BodySpec) -> unit
-  (trap "todo: walk-body"))
+  (do (w-open-frame w (. spec kind))
+      (doseq [p (. spec params)] (walk-param w (. p fst) (. p snd)))
+      (let [f (w-frame w)]
+        (doseq [v @(. f amp-params)]
+          (set! (. f amp-carriers) (assoc @(. f amp-carriers) v (carriers (. spec body) v)))))
+      (run-body w (. spec body) true)
+      (w-close-frame w)))
+
+(defun mode-val :private (m: Mode) -> (Option Val)
+  (match m ((MBorrowed s) (some (VB s))) ((MDerived s) (some (VD s))) (_ nil)))
 
 ;; Rust: walk/lit.rs:128 `Walker::val`: the value e with mode m is, for the events: a literal, or
 ;; `Borrowed`/`Derived` of its site; `nil` for `Owned` and scalars.
 (defun walk-val (w: Walker e: Expr m: Mode) -> (Option Val)
-  (trap "todo: walk-val"))
+  (match (. e kind)
+    ((EFn _) (some (VLit (. e id))))
+    (_ (mode-val m))))
+
+;; Rust: walk/lit.rs:141 `Walker::captures`, one capture of literal lit: how it is taken, with its
+;; mode inside the body.
+(defun capture-of :private (w: Walker lit: i64 c: i64 heap: bool) -> (Pair CaptureOwn Mode)
+  (let [outer (w-read w c)]
+    (cond
+      (is-amp (. (. (. w cx) p) globals) c) (Pair (CaptureOwn c PsOwnCell) MScalar)
+      (= outer MScalar) (Pair (CaptureOwn c PsScalar) MScalar)
+      :else (do (w-note w (mode-val outer) (AtCapture lit heap))
+                (if heap
+                    (Pair (CaptureOwn c PsRetain) (MBorrowed (SiteCapture lit c)))
+                    (Pair (CaptureOwn c PsAlias) outer))))))
+
+;; Rust: walk/lit.rs:141 `Walker::captures`: the captures of literal `lit`, in capture-set order.
+(defun walk-captures :private (w: Walker lit: i64 caps: (Vec i64) heap: bool) -> (Vec (Pair CaptureOwn Mode))
+  (let [out (cell [])]
+    (doseq [c caps] (set! out (conj @out (capture-of w lit c heap))))
+    @out))
+
+;; Rust: walk/lit.rs:182 `Walker::enter_literal`: opens the frame of literal `lit` with its captures.
+(defun enter-literal :private (w: Walker lit: i64 kind: FrameKind caps: (Vec (Pair CaptureOwn Mode))
+                               heap: bool) -> unit
+  (do (w-open-frame w kind)
+      (let [f (w-frame w)
+            d (w-depth w)]
+        (doseq [[c inner] caps]
+          (when (not (= (. c pass) PsOwnCell))
+            (set! (. f env) (assoc @(. f env) (. c binding) inner))
+            (when heap (w-site-frame! w (SiteCapture lit (. c binding)) d)))))))
+
+;; Rust: walk/lit.rs:257 `Walker::record_closure`: the closure table and allocation of literal lit.
+(defun record-closure :private (w: Walker lit: i64 is-async: bool caps: (Vec (Pair CaptureOwn Mode))
+                                params: (Vec ParamOwn)) -> unit
+  (let [f (. (. w cx) facts)
+        escaping (if is-async (some "async") (get (. f escaping) lit))
+        heap (if is-async (some "async") (get (. f heap) lit))
+        closure (ClosureOwn is-async escaping heap (mapv (fn (c: (Pair CaptureOwn Mode)) (. c fst)) caps) params)]
+    (w-put-alloc w lit (if (some? heap) AlHeap AlStack))
+    (w-put-closure w lit closure)))
+
+;; The parameter of a `fn` literal as its closure records it: an object is owned.
+(defun closure-param :private (w: Walker b: i64) -> ParamOwn
+  (ParamOwn b
+            (if (w-binding-is-object w b) (PkOwned [OwDeclared]) PkScalar)
+            (contains? (. (. (. w cx) facts) escapes) b)
+            false))
 
 ;; Rust: walk/lit.rs:203 `Walker::fn_lit`: a `fn` literal (§6.5): Owned; its body walked as a frame of
 ;; its own.
 (defun walk-fn-lit (w: Walker e: Expr lit: FnLit) -> Mode
-  (trap "todo: walk-fn-lit"))
+  (let [id (. e id)
+        heap (contains? (. (. (. w cx) facts) heap) id)
+        caps (walk-captures w id (. lit captures) heap)]
+    (record-closure w id false caps (mapv (fn (p: FnParam) (closure-param w (. p binding))) (. lit params)))
+    (enter-literal w id FkFn caps heap)
+    (doseq [p (. lit params)]
+      (walk-param w (. p binding) (if (w-binding-is-object w (. p binding)) (PiObj true) PiScalar)))
+    (let [f (w-frame w)]
+      (w-site-frame! w (SiteEnv id) (w-depth w))
+      (set! (. f owned-params) (conj @(. f owned-params) (SiteEnv id)))
+      (if-some [g (. lit name)]
+        (do (set! (. f self-name) (some g))
+            (w-bind w g (MBorrowed (SiteEnv id)) (BnAliasOf (SiteEnv id))))))
+    (run-body w (. lit body) true)
+    (w-close-frame w)
+    (MOwned false)))
 
 ;; Rust: walk/lit.rs:248 `Walker::async_lit`: an `async` literal (§6.9): an escaping heap closure with
 ;; no parameters whose body has no tail calls; caps is its capture set.
 (defun walk-async-lit (w: Walker e: Expr body: Expr caps: (Vec i64)) -> Mode
-  (trap "todo: walk-async-lit"))
+  (let [id (. e id)
+        cs (walk-captures w id caps true)]
+    (record-closure w id true cs [])
+    (enter-literal w id FkAsync cs true)
+    (run-body w body true)
+    (w-close-frame w)
+    (MOwned false)))

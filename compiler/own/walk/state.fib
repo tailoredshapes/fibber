@@ -3,7 +3,7 @@
 ;; reaches (`Val`, `Class`, `At`, `ArgAt`, `HeadAt`, `Event`: what the fixpoint of §6.4 and
 ;; the stack rule of §6.11 read), what a walk needs and does not change (`Ctx`), and the
 ;; walker itself. The data is written by package O1 so that own.facts, own.classify and
-;; own.stack (O6) and own.walk.* (O3 to O5) can be written side by side; the functions are stubs.
+;; own.stack (O6) and own.walk.* (O3 to O5) can be written side by side; the functions at the end are package O3's.
 ;;
 ;; Shapes decided where Rust and fibber differ (O3 may reshape the walker, not the events):
 ;; - variants carry a prefix: `Val` `V`, `Class` `Cl`, `At` `At`, `FrameKind` `Fk`.
@@ -17,7 +17,7 @@
 ;; - `ArgAt` and `HeadAt` are records (`defrecord`: nine and four fields, built by name with
 ;;   `with`); `Class` has the six derives that a record's fields need.
 (ns own.walk.state
-  (:use fib.coll.record syntax.pos types.ast types.program own.program))
+  (:use fib.coll.record syntax.pos types.ast types.decls types.program own.program own.objects))
 
 ;; A value as the events see it: `Borrowed(site)` (an `Owned` temporary is `Borrowed(Value(e))`),
 ;; `Derived(site)`, or a `fn` literal itself.
@@ -96,11 +96,210 @@
    events: (Cell (Vec Event)) tails: (Cell (Map i64 Tail)) candidates: (Cell (Map Site i64))
    expr: (fn (Walker Expr bool) Mode)))
 
+;; ---------------------------------------------------------------------------------------------
+;; The methods of Rust's `Walker` (walk/mod.rs:207-458) are functions `w-NAME` of the walker, which
+;; holds Cells: a mutator changes the walk in place and returns `unit`. The frames found by
+;; `w-frame` share their Cells with the stack, so a change through one is a change of the walk.
+;; Added to what O1 wrote, for the direct pokes of Rust (`self.frames.push`, `self.out.calls.insert`,
+;; `self.tails.insert`): `frame-new`, `w-open-frame`, `w-close-frame`, `w-out!`, `w-put-*`, `w-site-frame!`,
+;; `w-candidate!`, `w-tail!`, `w-env-put`.
+
 ;; Rust: walk/mod.rs:209 `Walker::new`: a walker with nothing walked; `expr` is the walk of an
 ;; expression (the cycle's function field).
 (defun walker-new (cx: Ctx expr: (fn (Walker Expr bool) Mode)) -> Walker
-  (trap "todo: walker-new"))
+  (Walker cx (cell []) (cell (map-empty)) (cell (body-own-new)) (cell []) (cell (map-empty))
+          (cell (map-empty)) expr))
 
 ;; Rust: walk/mod.rs:452 `kind_of_param`: an owned parameter is `BnOwnedParam`, else `BnBorrowedParam`.
 (defun kind-of-param (owned: bool) -> BindKind
-  (trap "todo: kind-of-param"))
+  (if owned BnOwnedParam BnBorrowedParam))
+
+;; The typed program of the walk, and its tables of declarations.
+(defun w-p (w: Walker) -> TypedProgram (. (. w cx) p))
+(defun w-g :private (w: Walker) -> Globals (. (w-p w) globals))
+
+;; A frame with nothing in it (walk/lit.rs:34 `open_frame`).
+(defun frame-new (kind: FrameKind) -> Frame
+  (Frame kind (cell (map-empty)) (cell []) (cell []) (cell []) (cell []) (cell (map-empty)) (cell nil)))
+
+;; Rust: walk/lit.rs:34 `open_frame` and the `frames.pop()` after a body.
+(defun w-open-frame (w: Walker kind: FrameKind) -> unit
+  (set! (. w frames) (conj @(. w frames) (frame-new kind))))
+(defun w-close-frame (w: Walker) -> unit
+  (set! (. w frames) (pop @(. w frames))))
+
+;; Rust: walk/mod.rs:221 `frame` (the innermost frame; the walk opens one before any expression).
+(defun w-frame (w: Walker) -> Frame (unwrap (peek @(. w frames))))
+
+;; Rust: walk/mod.rs:233 `depth`: the number of frames open.
+(defun w-depth (w: Walker) -> i64 (count @(. w frames)))
+
+;; Rust: walk/mod.rs:238 `is_object`: whether e has an object type (no type: it has).
+(defun w-is-object (w: Walker e: Expr) -> bool
+  (if-some [t (get (. (w-p w) expr-types) (. e id))] (is-object (w-g w) t) true))
+
+;; Rust: walk/mod.rs:249 `option_alloc`: the allocation of an `Option` constructor e of e's type
+;; (§8.1): a heap enum is a heap object, a nullable pointer is nothing, and in a generic body
+;; (`nil`) the evaluator decides by the payload.
+(defun w-option-alloc (w: Walker e: Expr) -> (Option Alloc)
+  (if-some [t (get (. (w-p w) expr-types) (. e id))]
+    (match (option-rep (w-g w) t)
+      ((some (OrHeapEnum)) (some AlHeap))
+      ((some (OrPointer)) (some AlNothing))
+      (_ nil))
+    nil))
+
+;; Rust: walk/mod.rs:261 `binding_is_object`: whether the binding b has an object type.
+(defun w-binding-is-object (w: Walker b: i64) -> bool
+  (if-some [t (get (. (w-p w) binding-types) b)] (is-object (w-g w) t) true))
+
+;; Rust: walk/mod.rs:268 `note`: records a position reached (nothing for no value).
+(defun w-note (w: Walker val: (Option Val) at: At) -> unit
+  (when-some [v val] (set! (. w events) (conj @(. w events) (Event v at)))))
+
+;; The tables being filled, changed by f; and the five that Rust inserts into.
+(defun w-out! (w: Walker f: (fn (BodyOwn) BodyOwn)) -> unit
+  (set! (. w out) (f @(. w out))))
+(defun w-put-call (w: Walker e: i64 c: CallOwn) -> unit
+  (let [o @(. w out)] (set! (. w out) (with o (calls (assoc (. o calls) e c))))))
+(defun w-put-recur (w: Walker e: i64 r: RecurOwn) -> unit
+  (let [o @(. w out)] (set! (. w out) (with o (recurs (assoc (. o recurs) e r))))))
+(defun w-put-closure (w: Walker e: i64 c: ClosureOwn) -> unit
+  (let [o @(. w out)] (set! (. w out) (with o (closures (assoc (. o closures) e c))))))
+(defun w-put-alloc (w: Walker e: i64 a: Alloc) -> unit
+  (let [o @(. w out)] (set! (. w out) (with o (allocs (assoc (. o allocs) e a))))))
+(defun w-put-guard-fail (w: Walker e: i64 ops: (Vec Op)) -> unit
+  (let [o @(. w out)] (set! (. w out) (with o (guard-fail (assoc (. o guard-fail) e ops))))))
+
+;; The frame depth that owns a site, the §6.11 candidate it initialises, the decision at a call in
+;; tail position.
+(defun w-site-frame! (w: Walker site: Site depth: i64) -> unit
+  (set! (. w site-frame) (assoc @(. w site-frame) site depth)))
+(defun w-candidate! (w: Walker site: Site e: i64) -> unit
+  (set! (. w candidates) (assoc @(. w candidates) site e)))
+(defun w-tail! (w: Walker e: i64 tail: Tail) -> unit
+  (set! (. w tails) (assoc @(. w tails) e tail)))
+
+;; Rust: walk/mod.rs:278 `expr_own`: what is recorded for e, or the default (`Scalar`, no
+;; operations); `w-put-expr-own` records it.
+(defun w-expr-own (w: Walker e: i64) -> ExprOwn
+  (get-or (. @(. w out) exprs) e (ExprOwn MScalar [])))
+(defun w-put-expr-own :private (w: Walker e: i64 x: ExprOwn) -> unit
+  (let [o @(. w out)] (set! (. w out) (with o (exprs (assoc (. o exprs) e x))))))
+
+;; Rust: walk/mod.rs:274 `set_mode`.
+(defun w-set-mode (w: Walker e: i64 mode: Mode) -> unit
+  (w-put-expr-own w e (with (w-expr-own w e) (mode mode))))
+
+;; Rust: walk/mod.rs:285 `push_op`: appends the operation to e's `after`.
+(defun w-push-op (w: Walker e: i64 kind: OpKind site: Site why: Why) -> unit
+  (w-add-after w e (Op kind site why)))
+
+;; Rust: walk/mod.rs:291 `add_after`: appends to e's `after`, unless e jumps (an admitted tail call
+;; or a `recur`), after which nothing of the frame runs.
+(defun w-add-after (w: Walker e: i64 op: Op) -> unit
+  (let [o @(. w out)
+        jumps (or (contains? (. o recurs) e)
+                  (match (get (. o calls) e) ((some c) (= (. c tail) TlTailCall)) (_ false)))]
+    (when (not jumps)
+      (let [x (w-expr-own w e)]
+        (w-put-expr-own w e (with x (after (conj (. x after) op))))))))
+
+;; Rust: walk/mod.rs:304 `end_op`: the operation that ends site at a scope exit or a jump.
+(defun w-end-op (w: Walker site: Site why: Why) -> Op
+  (Op (if (contains? (. (. w cx) scope-local) site) OpEndStack OpRelease) site why))
+
+;; What a frame's `env` takes (walk/lit.fib reads captures into it without a binding record).
+(defun w-env-put (w: Walker b: i64 mode: Mode) -> unit
+  (let [f (w-frame w)] (set! (. f env) (assoc @(. f env) b mode))))
+
+;; Rust: walk/mod.rs:313 `bind`: b reads as `mode` in the frame, a binding of kind `kind`.
+(defun w-bind (w: Walker b: i64 mode: Mode kind: BindKind) -> unit
+  (let [o @(. w out)]
+    (do (w-env-put w b mode)
+        (set! (. w out)
+              (with o (bindings (assoc (. o bindings) b
+                                       (BindingOwn kind (contains? (. (. w cx) scope-local) (SiteBind b))))))))))
+
+;; Rust: walk/mod.rs:325 `read`: the mode a read of b has in the current frame.
+(defun w-read (w: Walker b: i64) -> Mode
+  (get-or @(. (w-frame w) env) b (MBorrowed (SiteBind b))))
+
+;; Rust: walk/mod.rs:333 `push_scope` and :337 `pop_scope` (every push is paired with a pop).
+(defun w-push-scope (w: Walker) -> unit
+  (let [f (w-frame w)] (set! (. f scopes) (conj @(. f scopes) (Scope (cell []))))))
+(defun w-pop-scope (w: Walker) -> Scope
+  (let [f (w-frame w)
+        scopes @(. f scopes)]
+    (do (set! (. f scopes) (pop scopes))
+        (unwrap (peek scopes)))))
+
+;; Rust: walk/mod.rs:343 `own_site`: adds an owning site to the innermost scope of the frame.
+(defun w-own-site (w: Walker site: Site temp: bool) -> unit
+  (do (w-site-frame! w site (w-depth w))
+      (when-some [s (peek @(. (w-frame w) scopes))]
+        (set! (. s sites) (conj @(. s sites) (Pair site temp))))))
+
+;; Whether a frame depth is the one that owns the site.
+(defun in-this-frame :private (w: Walker s: Site) -> bool
+  (= (get @(. w site-frame) s) (some (w-depth w))))
+
+;; Rust: walk/mod.rs:352 `frame_owned`: whether m is frame-owned in the current frame (§6.4).
+(defun w-frame-owned (w: Walker m: Mode) -> bool
+  (match m
+    ((MOwned immortal) (not immortal))
+    ((MBorrowed s) (in-this-frame w s))
+    ((MDerived s) (in-this-frame w s))
+    ((MScalar) false)))
+
+(defun scope-owns :private (sites: (Vec (Pair Site bool)) s: Site) -> bool
+  (some? (find-first (fn (x: (Pair Site bool)) (= (. x fst) s)) sites)))
+
+;; Rust: walk/mod.rs:362 `movable`: whether s is an owning binding of the frame that a tail call may
+;; move (a scope's site or an owned parameter; not a capture).
+(defun w-movable (w: Walker s: Site) -> bool
+  (let [f (w-frame w)]
+    (and (match s ((SiteCapture _ _) false) ((SiteGlobal _) false) (_ true))
+         (in-this-frame w s)
+         (or (some? (find-first (fn (x: Site) (= x s)) @(. f owned-params)))
+             (some? (find-first (fn (sc: Scope) (scope-owns @(. sc sites) s)) @(. f scopes)))))))
+
+;; Rust: walk/mod.rs:378 `exit_scope_copy`: the scope exit of scope for a value m produced by e
+;; (§6.3), for one of several paths out of the same scope (the clauses of a `match`; `note` on the
+;; first only): operations appended to e's `after`, and the adjusted mode. A value of a site the
+;; scope owns is moved out (`Borrowed`: the site's release is dropped) or retained (`Derived`).
+(defun w-exit-scope-copy (w: Walker scope: Scope e: i64 m: Mode note: bool) -> Mode
+  (let [sites @(. scope sites)
+        moved (match m ((MBorrowed s) :when (scope-owns sites s) (some s)) (_ nil))
+        retained (match m ((MDerived s) (scope-owns sites s)) (_ false))]
+    (do (when-some [s moved] (when note (w-note w (some (VB s)) AtMoveOut)))
+        (when retained (w-push-op w e OpRetain (SiteValue e) WhyDerivedExit))
+        (doseq [p (reverse sites)]
+          (when (not (= (some (. p fst)) moved))
+            (w-add-after w e (w-end-op w (. p fst) (if (. p snd) WhyStepEnd WhyScopeExit)))))
+        (if (or retained (some? moved)) (MOwned false) m))))
+
+;; Rust: walk/mod.rs:372 `exit_scope`.
+(defun w-exit-scope (w: Walker scope: Scope e: i64 m: Mode) -> Mode
+  (w-exit-scope-copy w scope e m true))
+
+;; Rust: walk/mod.rs:408 `release_scopes`: the releases of the scopes `from..` of the frame, bindings
+;; first (innermost scope first, reverse order), then temporaries, skipping `moved` (§6.10 step 3).
+(defun w-release-scopes (w: Walker from: i64 moved: (Set Site) why: Why) -> (Vec Op)
+  (let [scopes (reverse (drop from @(. (w-frame w) scopes)))]
+    (vec (for [temps [false true]
+               sc scopes
+               p (reverse @(. sc sites))
+               :when (and (= (. p snd) temps) (not (contains? moved (. p fst))))]
+           (w-end-op w (. p fst) why)))))
+
+;; Rust: walk/mod.rs:424 `release_params`: the owned parameters of the frame not in `moved` (the
+;; `env` site is kept with `keep-env`).
+(defun w-release-params (w: Walker moved: (Set Site) keep-env: bool why: Why) -> (Vec Op)
+  (vec (for [s @(. (w-frame w) owned-params)
+             :when (not (or (contains? moved s)
+                            (and keep-env (match s ((SiteEnv _) true) (_ false)))))]
+         (Op OpRelease s why))))
+
+;; Rust: walk/mod.rs:438 `owning`: the mode of a new owning binding.
+(defun w-owning (b: i64) -> Mode (MBorrowed (SiteBind b)))

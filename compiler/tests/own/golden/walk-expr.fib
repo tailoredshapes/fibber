@@ -1,0 +1,52 @@
+;; The walk of expressions (own.walk.expr, own.walk.step): the mode of each form (spec/types.md §6.2),
+;; scopes and steps (§6.3), the joins, `loop`, `do`. The golden text is `fibref own` on this file.
+(defstruct Pt (x: i64 y: i64))
+(defstruct Box (p: Pt))
+(defenum Shape (Circle r: i64) (Rect w: i64 h: i64) Dot)
+(def origin: Pt (Pt 0 0))
+;; globals: a `def` is borrowed, a constructor allocates, `nil` and `some` by representation
+(defun g1 () -> Pt origin)
+(defun g2 () -> i64 (let [q origin] (. q x)))
+(defun g3 () -> (Option Pt) nil)
+(defun g4 (n: i64) -> (Option i64) (some n))
+(defun g5 () -> Shape Dot)
+(defun g6 (n: i64) -> Shape (Rect n n))
+;; a named function as a value is its immortal closure
+(defun g7 () (let [f g1] f))
+;; fields: a part of a borrowed base, of an owned temporary, a scalar field
+(defun f1 (b: Box) -> i64 (. (. b p) y))
+(defun f2 () -> i64 (. (. (Box (Pt 1 2)) p) x))
+(defun f3 (b: Box) -> Pt (. b p))
+;; `let`: scalars, aliases, owning bindings, several bindings in one scope
+(defun l1 (b: Box) -> i64 (let [p (. b p) x (. p x) q (Pt x x)] (. q y)))
+(defun l2 () -> i64 (let [a (Pt 1 2) b (Box a)] (. (. b p) x)))
+(defun l3 (n: i64) -> Pt (let [a (Pt n n)] (let [b a] b)))
+;; `if` and its join: borrowed with borrowed, owned with owned, immortal with immortal, mixed
+(defun j1 (b: bool p: Pt q: Pt) -> i64 (. (if b p q) x))
+(defun j2 (b: bool) -> Pt (if b (Pt 1 1) (Pt 2 2)))
+(defun j3 (b: bool) -> str (if b "yes" "no"))
+(defun j4 (b: bool) -> Pt (if b origin (Pt 3 3)))
+(defun j5 (b: bool p: Pt) -> i64 (. (if b (. (Box p) p) p) x))
+(defun j6 (b: bool) -> i64 (let [p (Pt 1 2)] (if b (. p x) 0)))
+(defun j7 (b: bool) -> Pt (let [p (Pt 1 2) q (Pt 3 4)] (if b p q)))
+;; `do`: an owned value that is discarded is released at once; a borrowed one is not
+(defun d1 (p: Pt) -> i64 (do (Pt 1 2) p (. p x)))
+(defun d2 () -> unit (do))
+(defun d3 (p: Pt) -> i64 (do "s" (Box p) 1))
+;; `loop`: scalar and object variables, a borrowed initialiser is retained, `recur` has no value
+(defun o1 (n: i64) -> i64 (loop [i n] (if (= i 0) i (recur (- i 1)))))
+(defun o2 (p: Pt) -> i64 (loop [q (Pt 1 1) i 3] (if (= i 0) (. q x) (recur (Pt i i) (- i 1)))))
+(defun o3 (p: Pt) -> i64 (loop [q p i 3] (if (= i 0) (. q y) (recur q (- i 1)))))
+(defun o4 (n: i64) -> Pt (loop [q (Pt n n) i n] (if (= i 0) q (recur (Pt i i) (- i 1)))))
+;; the operands that are only read: `concat`, a conversion, `unsafe`, `await`; `set-field!` stores
+(defun x1 (a: (Vec i64) b: (Vec i64)) -> (Vec i64) (concat a b))
+(defun x2 (a: (Vec i64)) -> (Vec i64) (concat a (concat a a)))
+(defun x3 (n: i64) -> i32 (trunc i32 n))
+(defun x4 (p: Pt) -> i64 (unsafe (. p x)))
+(defun x5 (n: i64) (async (await (async n))))
+(defun x6 () -> i64 (let [c (cell (Pt 1 2)) q (Pt 3 4)] (do (set-field! &c x 5) (set-field! &c x (. q x)) (. @c y))))
+(defun x7 (b: bool) -> i64 (. (deref (if b (cell (Pt 1 1)) (cell (Pt 2 2)))) x))
+;; an immortal value (a string literal) passed to a call is no temporary
+(defun u1 (s: str) -> i64 1)
+(defun u2 () -> i64 (do (u1 "abc") (u1 (if true "x" "y"))))
+(defun main () -> i64 0)

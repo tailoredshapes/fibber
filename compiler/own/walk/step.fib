@@ -1,0 +1,49 @@
+;; compiler/own/walk/step.fib: the temporaries of a step and the join of branches (spec/types.md
+;; §6.3, §6.11), as crates/fibref/src/own/walk/expr.rs lines 106-132 and 200-231. Package O4.
+;;
+;; Rust keeps these in the module of the walk of an expression; here they are a module of their
+;; own because the walk of a call (own.walk.call) and of `match` (own.walk.pattern) use them and
+;; the walk of an expression (own.walk.expr) uses both: modules cannot require each other in a
+;; cycle (own-notes.md). Everything calls back into the walk through the walker's `expr` field.
+(ns own.walk.step
+  (:use types.ast own.program own.walk.state own.walk.callee own.walk.lit))
+
+;; Rust: walk/expr.rs:109 `Walker::temp`: registers the `Owned` value of x as a temporary of the
+;; innermost scope, a §6.11 candidate if x allocates (an immortal value is none: its count
+;; operations are no-ops, §6.1).
+(defun walk-temp (w: Walker x: Expr) -> unit
+  (when (not (= (. (w-expr-own w (. x id)) mode) (MOwned true)))
+    (let [s (SiteValue (. x id))]
+      (w-own-site w s true)
+      (when (allocates w x) (w-candidate! w s (. x id))))))
+
+;; Rust: walk/expr.rs:127 `Walker::step`: a step (syntax §2): its temporaries die at its end, by the
+;; scope-exit rule.
+(defun walk-step (w: Walker e: Expr tail: bool) -> Mode
+  (do (w-push-scope w)
+      (let [m ((. w expr) w e tail)
+            scope (w-pop-scope w)]
+        (w-exit-scope w scope (. e id) m))))
+
+;; The retain of a branch that is not `Owned`, which makes the join `Owned`.
+(defun join-retain :private (w: Walker x: Expr m: Mode) -> unit
+  (when (not (mode-owned? m))
+    (w-push-op w (. x id) OpRetain (SiteValue (. x id)) WhyJoin)
+    (w-note w (walk-val w x m) AtJoin)))
+
+;; Rust: walk/expr.rs:202 `Walker::join`: the join of §6.3; retains go on the branches that are not
+;; `Owned`; a branch with no value (a `recur`) takes no part.
+(defun walk-join (w: Walker e: Expr branches: (Vec (Pair Expr Mode))) -> Mode
+  (let [vals (vec (filter (fn (b: (Pair Expr Mode)) (not (= (. b snd) MScalar))) branches))]
+    (cond
+      (not (w-is-object w e)) MScalar
+      (empty? vals) MScalar
+      :else
+      (let [first-mode (. (nth vals 0) snd)
+            same (every? (fn (b: (Pair Expr Mode)) (= (. b snd) first-mode)) vals)]
+        (cond
+          (and same (mode-shared? first-mode)) first-mode
+          (every? (fn (b: (Pair Expr Mode)) (mode-owned? (. b snd))) vals)
+          (MOwned (every? (fn (b: (Pair Expr Mode)) (= (. b snd) (MOwned true))) vals))
+          :else (do (doseq [b vals] (join-retain w (. b fst) (. b snd)))
+                    (MOwned false)))))))
