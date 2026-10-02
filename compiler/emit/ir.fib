@@ -42,7 +42,7 @@
 
 ;; The function under construction.
 (defstruct FnBuilder
-  (name: str ret: (Option LirTy) params: (Vec LirParam) tailcc: bool
+  (name: str ret: (Cell (Option LirTy)) params: (Vec LirParam) tailcc: bool
    blocks: (Cell (Vec Block)) cur: (Cell i64) counter: (Cell i64)
    allocas: (Cell (Vec Alloca)) live-targets: (Cell (Set str))))
 
@@ -51,7 +51,7 @@
 
 ;; A function with its entry block open. Rust: ir.rs:52 new
 (defun fb-new (name: str ret: (Option LirTy) params: (Vec LirParam) tailcc: bool) -> FnBuilder
-  (FnBuilder name ret params tailcc (cell [(block-new "entry" false)]) (cell 0) (cell 0)
+  (FnBuilder name (cell ret) params tailcc (cell [(block-new "entry" false)]) (cell 0) (cell 0)
              (cell []) (cell (set-empty))))
 
 ;; A fresh SSA name. Rust: ir.rs:70 fresh
@@ -193,7 +193,7 @@
 ;; The function's text. Rust: ir.rs:185 render
 (defun fb-render (f: FnBuilder) -> str
   (let ((cc (if (. f tailcc) "tailcc " ""))
-        (ret (match (. f ret) ((some t) (lir-ty-text t)) (nil "void")))
+        (ret (match @(. f ret) ((some t) (lir-ty-text t)) (nil "void")))
         (params (mapv (fn (p: LirParam) (str-join ["(" (lir-ty-text (. p ty)) " " (. p name) ")"]))
                       (. f params)))
         (body (cell [])))
@@ -224,7 +224,7 @@
         j)))
 
 ;; Rust: ir.rs:259 parse_sx
-(defun sx-parse :private (s: str at: i64) -> SxRes
+(defun sx-parse (s: str at: i64) -> SxRes
   (let ((i (skip-ws s at)) (n (str-len s)))
     (if (and (< i n) (= (byte-at s i) 40))
         (loop ((j (+ i 1)) (items []))

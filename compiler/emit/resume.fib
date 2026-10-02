@@ -1,16 +1,403 @@
-;; compiler/emit/resume.fib: resumable frames: turns the function being built into one that can suspend at its await points (spec/compiler.md §7).
-;; Replaces crates/fibc/src/resume.rs (470 lines before its tests; its private liveness analysis `Live` and the
-;; helpers are E9's). It reads a `FnBuilder` only, so it can be judged on hand-built builders (resume.rs:476-535).
-;; STATUS: every public function below is a STUB of package E9, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/resume.rs, 535 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/resume.fib: resumable frames: turns the function being built into one that can suspend at its
+;; await points (spec/compiler.md §7, §8 item 3). Replaces crates/fibc/src/resume.rs (470 lines before its
+;; tests; its private liveness analysis `Live` and the text helpers are here too). It reads and rewrites a
+;; `FnBuilder` only, so it is judged alone on hand-built builders (compiler/tests/emit/unit-resume.fib,
+;; the tests of resume.rs:476-535 and more).
+;;
+;; The body is lowered like any function, each `await` ending its block (`store point k`,
+;; `fib.await-or-park`, a branch to a `ret` or to the continuation block of state k); this pass then
+;; makes it resumable in place: the entry block keeps its prologue (the captures) and ends in a `switch`
+;; on the task's resume point to `start` (the body's first block) or to a state's continuation; every
+;; value live into a continuation lives in a slot of the task frame (stored after its definition, loaded
+;; before each use, so no SSA value crosses a park and no `phi` is rebuilt); every `alloca` becomes a
+;; byte slot of the frame; every `ret v` becomes the task's completion and a bare `ret`.
+;;
+;; Decided here (the Rust and the plan are silent or wrong):
+;; - ORDER. The Rust iterates two hash tables whose order reaches the text: the live-in set of each
+;;   continuation (the order of the frame's slots and of the `sN` names) and the `edge_loads` of a block
+;;   (the order of the loads before its terminator). `fibc emit` is therefore not deterministic on an
+;;   async body with several live values (S2 fixes it in resume.rs). This port implements the intended
+;;   behaviour through TWO functions, the only places that choose an order, so that they are easy to
+;;   change when S2's choice is read from resume.rs:
+;;   `order-live-names` (the names a point adds, per point in `points` order; now sorted by name, as
+;;   `BTreeSet<String>` would: "t12" before "t2") and `order-edge-loads` (the loads that go before one
+;;   block's terminator; now sorted by the value they load, as `BTreeMap<(usize, String), _>` would).
+;;   Fresh names are still handed out in the Rust's order (blocks in order, phis in order, edges in
+;;   order), which is deterministic.
+;; - the `Unsupported(String)` errors are `Err` strings with the Rust's text (`no continuation block L`,
+;;   `live value N of unknown type`).
+;; - a label is looked up as the FIRST block of that name (Rust: `position`); liveness used `collect` into
+;;   a map (the last wins); labels are unique so the two agree.
+;; - `atoms` and `subst_atom` have no escape inside a string literal: a `"` ends it, as in the Rust.
+;; - `FnBuilder.ret` is a Cell now (emit.ir), because `make_resumable` ends with `f.ret = None`.
 (ns emit.resume
+  (:require [fib.string :as str])
   (:use emit.value emit.ir emit.objects))
 
-;; Where the function suspends. Rust: resume.rs:27 Shape
+;; Where the function suspends: the task struct, where its prologue ends, the continuation block of each
+;; state (state k is `points[k-1]`), the completion function, and the index of the frame's first field
+;; (the resume point; the slots follow it). Rust: resume.rs:27 Shape
 (defstruct ResumeShape (tsname: str prologue: i64 points: (Vec str) complete: str point-field: i64))
 
-;; Rust: resume.rs:37
+;; ---- the text of an instruction
+
+;; A run of an instruction's text: an atom (characters that are not whitespace, a parenthesis or a quote,
+;; outside a string literal) or what lies between atoms (delimiters, whole string literals).
+(defstruct Seg :private (text: str word: bool))
+
+(defun char-at :private (s: str i: i64) -> i64 (zext i64 (str-byte-at s i)))
+
+;; Whether byte c ends an atom: ASCII whitespace, a parenthesis or a quote.
+(defun delimiter? :private (c: i64) -> bool
+  (or (= c 32) (and (>= c 9) (<= c 13)) (= c 40) (= c 41) (= c 34)))
+
+;; The text cut into runs. Outside a string a delimiter is not an atom, inside one nothing is (the
+;; closing quote included); a `"` outside opens a string, one inside closes it.
+(defun segments :private (text: str) -> (Vec Seg)
+  (let ((n (str-len text)))
+    (loop ((i 0) (from 0) (kind false) (inside false) (out []))
+      (if (= i n)
+          (if (< from n) (conj out (Seg (str-slice text from n) kind)) out)
+          (let ((c (char-at text i))
+                (word (and (not inside) (not (delimiter? c))))
+                (inside-next (if inside (not (= c 34)) (= c 34))))
+            (if (or (= i from) (= word kind))
+                (recur (+ i 1) from word inside-next out)
+                (recur (+ i 1) i word inside-next (conj out (Seg (str-slice text from i) kind)))))))))
+
+;; The atoms of an instruction's text, in order. Rust: resume.rs:385 atoms
+(defun text-atoms (text: str) -> (Vec str)
+  (mapv (fn (s: Seg) (. s text)) (filterv (fn (s: Seg) (. s word)) (segments text))))
+
+;; `text` with every atom equal to `from` replaced by `to`, string literals untouched.
+;; Rust: resume.rs:415 subst_atom
+(defun text-subst-atom (text: str from: str to: str) -> str
+  (str-join (mapv (fn (s: Seg) (if (and (. s word) (= (. s text) from)) to (. s text)))
+                  (segments text))))
+
+;; Whether an atom is an SSA name of the builder (`tN`). Rust: resume.rs:369 is_name
+(defun ssa-name? :private (a: str) -> bool
+  (and (> (str-len a) 1)
+       (= (char-at a 0) 116)
+       (every? (fn (i: i64) (let ((c (char-at a i))) (and (>= c 48) (<= c 57)))) (range 1 (str-len a)))))
+
+;; The SSA names an instruction's text mentions, each once, in order. Rust: resume.rs:374 names_in
+(defun text-names-in (text: str) -> (Vec str)
+  (reduce (fn (acc: (Vec str) a: str) (if (and (ssa-name? a) (not (includes? a acc))) (conj acc a) acc))
+          [] (text-atoms text)))
+
+(defun sx-word :private (x: Sx) -> (Option str)
+  (match x ((SxAtom a) (some a)) (_ nil)))
+
+;; The `(label value)` pairs of a `phi`'s text whose two parts are atoms. Rust: resume.rs:448 phi_edges
+(defun phi-edges (text: str) -> (Vec PhiEdge)
+  (match (. (sx-parse text 0) sx)
+    ((SxList items)
+     (reduce (fn (acc: (Vec PhiEdge) e: Sx)
+               (match e
+                 ((SxList pair)
+                  (if (>= (count pair) 2)
+                      (match (sx-word (nth pair 0))
+                        ((some l) (match (sx-word (nth pair 1))
+                                    ((some v) (conj acc (PhiEdge l v)))
+                                    (nil acc)))
+                        (nil acc))
+                      acc))
+                 (_ acc)))
+             [] (drop 2 items)))
+    (_ [])))
+
+(defun replace-all :private (text: str old: str new: str) -> str
+  (str-join (vec (interpose new (str/split-limit text old -1)))))
+
+;; The phi text with the operand of edge `from` changed from `v` to `to`. Rust: resume.rs:467
+(defun subst-phi-operand :private (text: str from: str v: str to: str) -> str
+  (replace-all text (str-join ["(" from " " v ")"]) (str-join ["(" from " " to ")"])))
+
+(defun item-text :private (it: IrItem) -> str
+  (match it ((ItBind _ t _) t) ((ItStmt t) t)))
+
+;; The address of field `k` of the task frame.
+(defun slot-address :private (tsname: str k: i64) -> str
+  (str-join ["(getelementptr %struct." tsname " env (i32 0) (i32 " (str k) "))"]))
+
+;; ---- the two places that choose an order (see the header)
+
+;; The names a point adds to the demoted values, each point's in this order. Rust: the iteration of a
+;; `HashSet<String>` (resume.rs:53); intended: sorted.
+(defun order-live-names :private (names: (Vec str)) -> (Vec str)
+  (vec (sort names)))
+
+;; A value loaded before a block's terminator for the phi operand of an edge out of that block.
+(defstruct EdgeLoad :private (value: str name: str text: str ty: LirTy))
+
+;; The loads that go before one block's terminator, in the order they are printed. Rust: the iteration of
+;; a `HashMap<(usize, String), String>` (resume.rs:295); intended: sorted by the loaded value.
+(defun order-edge-loads :private (loads: (Vec EdgeLoad)) -> (Vec EdgeLoad)
+  (vec (sort-by (fn (e: EdgeLoad) (. e value)) loads)))
+
+;; ---- the rewriting, in the order of make_resumable
+
+;; The prologue stays in `entry`; the rest of it becomes `start`. Rust: resume.rs:75 split_entry
+(defun split-entry :private (f: FnBuilder prologue: i64) -> unit
+  (let ((blocks @(. f blocks))
+        (entry (nth blocks 0))
+        (items @(. entry items))
+        (closed @(. entry closed)))
+    (do (set! (. entry items) (vec (take prologue items)))
+        (set! (. entry closed) true)
+        (set! (. f blocks)
+              (into [entry (Block "start" (cell []) (cell (vec (drop prologue items))) (cell closed) false)]
+                    (drop 1 blocks)))
+        (doseq [b @(. f blocks)]
+          (set! (. b phis)
+                (mapv (fn (p: Phi) (Phi (. p name) (text-subst-atom (. p text) "entry" "start") (. p ty)))
+                      @(. b phis)))))))
+
+;; The operand text of a block's last item when it is `(ret ..)`: empty for `(ret)`.
+(defun last-ret-operand :private (items: (Vec IrItem)) -> (Option str)
+  (match (peek items)
+    ((some (ItStmt t))
+     (if (and (starts-with? t "(ret") (str/ends-with? t ")"))
+         (some (str-slice t 4 (- (str-len t) 1)))
+         nil))
+    (_ nil)))
+
+;; `(ret v)` completes the task with `v`; `(ret)` with nothing. The `ret` of a park block (labelled
+;; `park..` by `await_task`) is the resume returning with the task parked, and stays.
+;; Rust: resume.rs:98 complete_returns
+(defun complete-returns :private (f: FnBuilder complete: str) -> unit
+  (doseq [b @(. f blocks)]
+    (when (not (starts-with? (. b label) "park"))
+      (match (last-ret-operand @(. b items))
+        ((some inner)
+         (let ((v (str/trim inner)))
+           (set! (. b items)
+                 (conj (conj (pop @(. b items))
+                             (ItStmt (str-join ["(call @" complete " env" (if (= v "") "" (str-join [" " v])) ")"])))
+                       (ItStmt "(ret)")))))
+        (nil ())))))
+
+;; Each `alloca` becomes a byte slot of the frame, its name bound to the slot's address in the prologue;
+;; `first` is the field index of the first slot. Returns the slots. Rust: resume.rs:122 move_allocas
+(defun move-allocas :private (f: FnBuilder tsname: str first: i64) -> (Vec FrameSlot)
+  (let ((allocas @(. f allocas))
+        (entry (nth @(. f blocks) 0)))
+    (do (set! (. f allocas) [])
+        (set! (. entry items)
+              (into (mapv (fn (i: i64) (ItBind (. (nth allocas i) name) (slot-address tsname (+ first i)) LirPtr))
+                          (range (count allocas)))
+                    @(. entry items)))
+        (mapv (fn (a: Alloca) (FrBytes (max (. a size) 1))) allocas))))
+
+;; ---- liveness
+
+;; The first block of each label.
+(defun label-index :private (blocks: (Vec Block)) -> (Map str i64)
+  (reduce (fn (m: (Map str i64) i: i64)
+            (let ((label (. (nth blocks i) label)))
+              (if (contains? m label) m (assoc m label i))))
+          (map-empty) (range (count blocks))))
+
+;; What a block defines and the names it uses before defining them.
+(defstruct DefUse :private (defs: (Set str) uses: (Set str)))
+
+;; A block's phis define their names first; then each item uses the names its text mentions that are not
+;; yet defined and, if it binds one, defines it.
+(defun def-use :private (b: Block) -> DefUse
+  (reduce (fn (acc: DefUse it: IrItem)
+            (let ((uses (into (. acc uses)
+                              (filter (fn (u: str) (not (contains? (. acc defs) u))) (text-names-in (item-text it))))))
+              (match it
+                ((ItBind n _ _) (DefUse (conj (. acc defs) n) uses))
+                ((ItStmt _) (DefUse (. acc defs) uses)))))
+          (DefUse (set (mapv (fn (p: Phi) (. p name)) @(. b phis))) (set-empty))
+          @(. b items)))
+
+;; The blocks a closed block's terminator names.
+(defun successors :private (b: Block index: (Map str i64)) -> (Vec i64)
+  (if @(. b closed)
+      (match (peek @(. b items))
+        ((some (ItStmt last))
+         (reduce (fn (acc: (Vec i64) l: str)
+                   (match (get index l) ((some i) (conj acc i)) (nil acc)))
+                 [] (ir-targets last)))
+        (_ []))
+      []))
+
+;; (p, s) -> the SSA names the phis of block s take from block p: a use at the end of p.
+(defun phi-uses :private (blocks: (Vec Block) index: (Map str i64)) -> (Map (Pair i64 i64) (Set str))
+  (let ((acc (cell (map-empty))))
+    (do (doseq [i (range (count blocks))
+                p @(. (nth blocks i) phis)
+                e (phi-edges (. p text))]
+          (when-some [pred (get index (. e label))]
+            (when (ssa-name? (. e value))
+              (set! acc (assoc @acc (Pair pred i) (conj (get-or @acc (Pair pred i) (set-empty)) (. e value)))))))
+        @acc)))
+
+;; The live-in set of block i given the sets of the blocks after it: what it uses, and what its
+;; successors need (and its phis take from it) that it does not define.
+(defun live-in-of :private (i: i64 du: (Vec DefUse) succ: (Vec (Vec i64)) pu: (Map (Pair i64 i64) (Set str))
+                            live: (Vec (Set str))) -> (Set str)
+  (let ((out (reduce (fn (acc: (Set str) s: i64)
+                       (let ((acc (into acc (nth live s))))
+                         (match (get pu (Pair i s)) ((some used) (into acc used)) (nil acc))))
+                     (set-empty) (nth succ i))))
+    (into (. (nth du i) uses) (filter (fn (v: str) (not (contains? (. (nth du i) defs) v))) out))))
+
+;; Backward liveness over the blocks to a fixed point. Rust: resume.rs:145 liveness
+(defun liveness :private (blocks: (Vec Block) index: (Map str i64)) -> (Vec (Set str))
+  (let ((du (mapv def-use blocks))
+        (succ (mapv (fn (b: Block) (successors b index)) blocks))
+        (pu (phi-uses blocks index)))
+    (loop ((live (mapv (fn (_: Block) (set-empty)) blocks)))
+      (let ((next (reduce (fn (acc: (Vec (Set str)) i: i64) (assoc acc i (live-in-of i du succ pu acc)))
+                          live (reverse (range (count blocks))))))
+        (if (= next live) live (recur next))))))
+
+;; The values to demote: those live into some continuation, each point's new ones in `order-live-names`
+;; order, without the prologue's definitions (`entry` runs again on a resume) and `env`.
+(defun demoted-names :private (f: FnBuilder shape: ResumeShape) -> (Result (Vec str) str)
+  (let ((blocks @(. f blocks))
+        (index (label-index blocks))
+        (live (liveness blocks index))
+        (prologue (set (reduce (fn (acc: (Vec str) it: IrItem) (match it ((ItBind n _ _) (conj acc n)) (_ acc)))
+                               [] @(. (nth blocks 0) items)))))
+    (try-let ((names (reduce (fn (acc: (Result (Vec str) str) label: str)
+                               (try-let ((so-far acc))
+                                 (match (get index label)
+                                   ((some i) (Ok (into so-far (order-live-names
+                                                               (filterv (fn (n: str) (not (includes? n so-far)))
+                                                                        (vec (nth live i)))))))
+                                   (nil (Err (str-join ["no continuation block " label]))))))
+                             (Ok []) (. shape points))))
+      (Ok (filterv (fn (n: str) (not (or (contains? prologue n) (= n "env")))) names)))))
+
+;; ---- demotion
+
+;; A demoted value: its name, the frame field that holds it (its address is `s` and the field), its type.
+(defstruct Slot :private (value: str field: i64 ty: LirTy))
+
+(defun slot-name :private (s: Slot) -> str (str-join ["s" (str (. s field))]))
+
+(defun load-text :private (s: Slot) -> str
+  (str-join ["(load " (lir-ty-text (. s ty)) " " (slot-name s) ")"]))
+
+;; The type of each value the builder binds: its phis and `ItBind`s.
+(defun value-types :private (blocks: (Vec Block)) -> (Map str LirTy)
+  (let ((m (cell (map-empty))))
+    (do (doseq [b blocks]
+          (do (doseq [p @(. b phis)] (set! m (assoc @m (. p name) (. p ty))))
+              (doseq [it @(. b items)]
+                (match it
+                  ((ItBind n _ ty) (set! m (assoc @m n ty)))
+                  ((ItStmt _) ())))))
+        @m)))
+
+;; A slot per name, from field `first` on; a value the builder never bound is an error.
+(defun slot-table :private (names: (Vec str) first: i64 types: (Map str LirTy)) -> (Result (Vec Slot) str)
+  (reduce (fn (acc: (Result (Vec Slot) str) nm: str)
+            (try-let ((slots acc))
+              (match (get types nm)
+                ((some t) (Ok (conj slots (Slot nm (+ first (count slots)) t))))
+                (nil (Err (str-join ["live value " nm " of unknown type"]))))))
+          (Ok []) names))
+
+;; The load of the slot of `v` that goes before the terminator of block p, made once per (p, v).
+(defun edge-load! :private (f: FnBuilder loads: (Cell (Map i64 (Vec EdgeLoad))) p: i64 s: Slot) -> str
+  (match (find-first (fn (e: EdgeLoad) (= (. e value) (. s value))) (get-or @loads p []))
+    ((some e) (. e name))
+    (nil (let ((n (fb-fresh f)))
+           (do (set! loads (assoc @loads p (conj (get-or @loads p []) (EdgeLoad (. s value) n (load-text s) (. s ty)))))
+               n)))))
+
+;; The operands of a phi that are demoted values come from the end of the block they come from, loaded.
+(defun rewrite-phi :private (f: FnBuilder labels: (Map str i64) table: (Map str Slot)
+                             loads: (Cell (Map i64 (Vec EdgeLoad))) p: Phi) -> Phi
+  (Phi (. p name)
+       (reduce (fn (text: str e: PhiEdge)
+                 (match (get table (. e value))
+                   ((some s) (match (get labels (. e label))
+                               ((some pred) (subst-phi-operand text (. e label) (. e value) (edge-load! f loads pred s)))
+                               (nil text)))
+                   (nil text)))
+               (. p text) (phi-edges (. p text)))
+       (. p ty)))
+
+;; One item with a load before it for each demoted value it uses, and a store after it when it binds one.
+(defun demote-item :private (f: FnBuilder table: (Map str Slot) out: (Cell (Vec IrItem)) it: IrItem) -> unit
+  (let ((text (cell (item-text it))))
+    (do (doseq [u (text-names-in (item-text it))]
+          (when-some [s (get table u)]
+            (let ((l (fb-fresh f)))
+              (do (set! out (conj @out (ItBind l (load-text s) (. s ty))))
+                  (set! text (text-subst-atom @text u l))))))
+        (match it
+          ((ItBind n _ ty)
+           (do (set! out (conj @out (ItBind n @text ty)))
+               (when-some [s (get table n)]
+                 (set! out (conj @out (ItStmt (str-join ["(store " n " " (slot-name s) ")"])))))))
+          ((ItStmt _) (set! out (conj @out (ItStmt @text))))))))
+
+;; A block's items rewritten: its demoted phis stored first, then each item, the edge loads of the block
+;; going in before its terminator.
+(defun demote-block :private (f: FnBuilder table: (Map str Slot) loads: (Cell (Map i64 (Vec EdgeLoad)))
+                              bi: i64 b: Block) -> unit
+  (let ((items @(. b items))
+        (last (max 0 (- (count items) 1)))
+        (out (cell (into [] (keep (fn (p: Phi) (match (get table (. p name))
+                                                  ((some s) (some (ItStmt (str-join ["(store " (. p name) " " (slot-name s) ")"]))))
+                                                  (nil nil)))
+                                  @(. b phis))))))
+    (do (doseq [k (range (count items))]
+          (do (when (and (= k last) @(. b closed))
+                (doseq [e (order-edge-loads (get-or @loads bi []))]
+                  (set! out (conj @out (ItBind (. e name) (. e text) (. e ty))))))
+              (demote-item f table out (nth items k))))
+        (set! (. b items) @out))))
+
+;; Gives each demoted value a slot: a store after its definition, a load before each use. Returns the
+;; frame's slots for them. Rust: resume.rs:218 demote
+(defun demote :private (f: FnBuilder tsname: str names: (Vec str) first: i64) -> (Result (Vec FrameSlot) str)
+  (let ((blocks @(. f blocks)))
+    (try-let ((slots (slot-table names first (value-types blocks))))
+      (let ((table (reduce (fn (m: (Map str Slot) s: Slot) (assoc m (. s value) s)) (map-empty) slots))
+            (labels (label-index blocks))
+            (loads (cell (map-empty)))
+            (entry (nth blocks 0)))
+        (do (set! (. entry items)
+                  (into (mapv (fn (s: Slot) (ItBind (slot-name s) (slot-address tsname (. s field)) LirPtr)) slots)
+                        @(. entry items)))
+            (doseq [b (drop 1 blocks)]
+              (set! (. b phis) (mapv (fn (p: Phi) (rewrite-phi f labels table loads p)) @(. b phis))))
+            (doseq [bi (range 1 (count blocks))]
+              (demote-block f table loads bi (nth blocks bi)))
+            (Ok (mapv (fn (s: Slot) (FrVal (. s ty))) slots)))))))
+
+;; The entry's terminator: a `switch` on the resume point. Rust: resume.rs:339 switch_entry
+(defun switch-entry :private (f: FnBuilder shape: ResumeShape) -> unit
+  (let ((pp (fb-fresh f))
+        (pt (fb-fresh f))
+        (entry (nth @(. f blocks) 0))
+        (cases (mapv (fn (i: i64) (str-join ["((i32 " (str (+ i 1)) ") " (nth (. shape points) i) ")"]))
+                     (range (count (. shape points))))))
+    (set! (. entry items)
+          (into @(. entry items)
+                [(ItBind pp (slot-address (. shape tsname) (. shape point-field)) LirPtr)
+                 (ItBind pt (str-join ["(load i32 " pp ")"]) LirI32)
+                 (ItStmt (str-join ["(switch " pt " start " (str/join " " cases) ")"]))]))))
+
+;; Rewrites `f` as described above and returns the frame's layout: the resume point, then the slots
+;; (the allocas', then the demoted values'). Rust: resume.rs:37 make_resumable
 (defun make-resumable (f: FnBuilder shape: ResumeShape) -> (Result (Vec FrameSlot) str)
-  (trap "todo: E9 make-resumable"))
+  (do (set! (. f blocks) (filterv (fn (b: Block) (not (. b dead))) @(. f blocks)))
+      (split-entry f (. shape prologue))
+      (complete-returns f (. shape complete))
+      (let ((first (+ (. shape point-field) 1))
+            (bytes (move-allocas f (. shape tsname) first)))
+        (try-let ((names (demoted-names f shape))
+                  (vals (demote f (. shape tsname) names (+ first (count bytes)))))
+          (do (switch-entry f shape)
+              (set! (. f ret) nil)
+              (Ok (into (into [(FrVal LirI32)] bytes) vals)))))))

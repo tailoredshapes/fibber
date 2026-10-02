@@ -1,0 +1,239 @@
+;; compiler/tests/emit/unit-resume.fib: the judge of compiler/emit/resume.fib (package E9r).
+;; The two tests of crates/fibc/src/resume.rs (atoms_and_substitution_respect_strings_and_parens,
+;; a_value_live_across_a_park_lives_in_the_frame) and five more hand-built builders, each a function a
+;; lowering could have made (a park with one live value; allocas and a bare `ret`; a join `phi` fed by a
+;; demoted value with a dead block; ten live names to show the order; a loop whose header `phi` names
+;; `entry` and whose back edge comes from the continuation), and the two errors.
+;;
+;; Two modes (no word on the command line is the checks):
+;;   unit-resume cases   prints `== NAME`, `frame: ..` and the text of each function (or `error: MSG`):
+;;                       compiler/tests/emit/resume.sh compares it byte for byte with the same builders
+;;                       through the Rust resume.rs (compiler/tests/emit/resume-oracle.rs);
+;;   unit-resume         the checks: the text helpers, the errors, the frame of each case, and that lair's
+;;                       whole-module checker accepts each result inside a module with its task struct, as
+;;                       the Rust test does with `lir::parse_and_check`.
+;; Build: fibc build compiler/tests/emit/unit-resume.fib -I compiler -I lib -L DIR -l lair -o OUT
+;; (DIR holds liblair.so).
+(ns main (:require [lair.jit :as jit] [fib.string :as s])
+  (:use types.check emit.value emit.ir emit.objects emit.resume))
+
+(defstruct Case (name: str f: FnBuilder prologue: i64 points: (Vec str) value: bool))
+
+(defun cap-text () -> str "(load i64 (getelementptr %struct.task.t env (i32 0) (i32 10)))")
+(defun store-point () -> str "(store (i32 1) (getelementptr %struct.task.t env (i32 0) (i32 11)))")
+(defun park-text () -> str "(call @fib.await-or-park env (ptr null))")
+(defun env-params () -> (Vec LirParam) [(LirParam LirPtr "env")])
+
+(defun add-text (a: str b: str) -> str (str-join ["(add " a " " b ")"]))
+
+(defun park-1 (name: str label: str operand: str) -> Case
+  (let ((f (fb-new "l.f.1" (some LirI64) (env-params) false))
+        (cap (fb-val f (cap-text) LirI64))
+        (x (fb-val f (add-text (v-text cap) "(i64 1)") LirI64)))
+    (do (fb-stmt f (store-point))
+        (let ((parked (fb-val f (park-text) LirI1)))
+          (do (fb-term f (str-join ["(br " (v-text parked) " park2 resume3)"]))
+              (fb-open f "park2")
+              (fb-term f "(ret)")
+              (fb-open f "resume3")
+              (fb-term f (str-join ["(ret " (if (= operand "") (v-text x) operand) ")"]))
+              (Case name f 1 [label] true))))))
+
+(defun allocas () -> Case
+  (let ((f (fb-new "l.f.2" nil (env-params) false))
+        (a (fb-entry-alloca f "i64" 24))
+        (b (fb-entry-alloca f "i64" 0))
+        (cap (fb-val f (cap-text) LirI64))
+        (x (fb-val f (add-text (v-text cap) "(i64 1)") LirI64)))
+    (do (fb-stmt f (str-join ["(store " (v-text x) " " a ")"]))
+        (fb-stmt f (store-point))
+        (let ((parked (fb-val f (park-text) LirI1)))
+          (do (fb-term f (str-join ["(br " (v-text parked) " park6 resume7)"]))
+              (fb-open f "park6")
+              (fb-term f "(ret)")
+              (fb-open f "resume7")
+              (fb-stmt f (str-join ["(store " (v-text x) " " b ")"]))
+              (fb-term f "(ret)")
+              (Case "allocas" f 1 ["resume7"] false))))))
+
+(defun join () -> Case
+  (let ((f (fb-new "l.f.3" (some LirI64) (env-params) false))
+        (cap (fb-val f (cap-text) LirI64))
+        (x (fb-val f (add-text (v-text cap) "(i64 1)") LirI64))
+        (c (fb-val f (str-join ["(icmp sgt " (v-text x) " (i64 0))"]) LirI1)))
+    (do (fb-term f (str-join ["(br " (v-text c) " a b)"]))
+        (fb-open f "a") (fb-term f "(br join)")
+        (fb-open f "b") (fb-term f "(br join)")
+        (fb-open f "join")
+        (let ((p (fb-phi f LirI64 [(PhiEdge "a" (v-text x)) (PhiEdge "b" "(i64 7)")])))
+          (do (fb-stmt f (store-point))
+              (let ((parked (fb-val f (park-text) LirI1)))
+                (do (fb-term f (str-join ["(br " (v-text parked) " park resume)"]))
+                    (fb-open f "park") (fb-term f "(ret)")
+                    (fb-open f "resume")
+                    (let ((r (fb-val f (add-text (v-text p) (v-text x)) LirI64)))
+                      (fb-term f (str-join ["(ret " (v-text r) ")"])))
+                    (fb-open f "unreached")
+                    (fb-stmt f "(call @fib.trap-c)")
+                    (fb-term f "(unreachable)")
+                    (Case "join" f 1 ["resume"] true))))))))
+
+;; t1 is the capture; t2 to t11 chain on it; the continuation uses t9, t10 and t11.
+(defun order () -> Case
+  (let ((f (fb-new "l.f.4" (some LirI64) (env-params) false))
+        (cap (fb-val f (cap-text) LirI64))
+        (made (reduce (fn (acc: (Vec str) i: i64)
+                        (conj acc (v-text (fb-val f (add-text (nth acc (- (count acc) 1)) (str-join ["(i64 " (str i) ")"])) LirI64))))
+                      [(v-text cap)] (range 1 11))))
+    (do (fb-stmt f (store-point))
+        (let ((parked (fb-val f (park-text) LirI1)))
+          (do (fb-term f (str-join ["(br " (v-text parked) " park resume)"]))
+              (fb-open f "park") (fb-term f "(ret)")
+              (fb-open f "resume")
+              (let ((r (fb-val f (add-text (nth made 8) (nth made 9)) LirI64))
+                    (r2 (fb-val f (add-text (v-text r) (nth made 10)) LirI64)))
+                (fb-term f (str-join ["(ret " (v-text r2) ")"])))
+              (Case "order" f 1 ["resume"] true))))))
+
+;; A loop: the header `phi` comes from `entry` (it becomes `start`) and, once patched, from the
+;; continuation, where the demoted counter is loaded before the branch back.
+(defun looping () -> Case
+  (let ((f (fb-new "l.f.5" (some LirI64) (env-params) false))
+        (cap (fb-val f (cap-text) LirI64))
+        (t2 (fb-val f (add-text (v-text cap) "(i64 1)") LirI64)))
+    (do (fb-term f "(br loop)")
+        (fb-open f "loop")
+        (let ((t3 (fb-phi f LirI64 [(PhiEdge "entry" (v-text t2))]))
+              (t4 (fb-val f "(add t3 (i64 1))" LirI64)))
+          (do (fb-stmt f (store-point))
+              (let ((parked (fb-val f (park-text) LirI1)))
+                (do (fb-term f (str-join ["(br " (v-text parked) " park resume)"]))
+                    (fb-open f "park") (fb-term f "(ret)")
+                    (fb-open f "resume")
+                    (fb-patch-phi f "loop" (v-text t3) "resume" (v-text t4))
+                    (let ((t6 (fb-val f (str-join ["(icmp slt " (v-text t4) " (i64 10))"]) LirI1)))
+                      (fb-term f (str-join ["(br " (v-text t6) " loop done)"])))
+                    (fb-open f "done")
+                    (fb-term f (str-join ["(ret " (v-text t4) ")"]))
+                    (Case "loop" f 1 ["resume"] true))))))))
+
+;; Two phis of one join take demoted values (t9, t10) from the same block: their loads go before its
+;; terminator, in the order of `order-edge-loads` (by value: t10 before t9) and not of their making.
+(defun edges () -> Case
+  (let ((f (fb-new "l.f.6" (some LirI64) (env-params) false))
+        (cap (fb-val f (cap-text) LirI64))
+        (made (reduce (fn (acc: (Vec str) i: i64)
+                        (conj acc (v-text (fb-val f (add-text (nth acc (- (count acc) 1)) (str-join ["(i64 " (str i) ")"])) LirI64))))
+                      [(v-text cap)] (range 1 10)))
+        (c (fb-val f (str-join ["(icmp sgt " (nth made 9) " (i64 0))"]) LirI1)))
+    (do (fb-term f (str-join ["(br " (v-text c) " a b)"]))
+        (fb-open f "a") (fb-term f "(br join)")
+        (fb-open f "b") (fb-term f "(br join)")
+        (fb-open f "join")
+        (let ((p1 (fb-phi f LirI64 [(PhiEdge "a" (nth made 8)) (PhiEdge "b" "(i64 1)")]))
+              (p2 (fb-phi f LirI64 [(PhiEdge "a" (nth made 9)) (PhiEdge "b" "(i64 2)")])))
+          (do (fb-stmt f (store-point))
+              (let ((parked (fb-val f (park-text) LirI1)))
+                (do (fb-term f (str-join ["(br " (v-text parked) " park resume)"]))
+                    (fb-open f "park") (fb-term f "(ret)")
+                    (fb-open f "resume")
+                    (let ((s1 (fb-val f (add-text (v-text p1) (v-text p2)) LirI64))
+                          (s2 (fb-val f (add-text (nth made 8) (nth made 9)) LirI64))
+                          (s3 (fb-val f (add-text (v-text s1) (v-text s2)) LirI64)))
+                      (fb-term f (str-join ["(ret " (v-text s3) ")"])))
+                    (Case "edges" f 1 ["resume"] true))))))))
+
+(defun all-cases () -> (Vec Case)
+  [(park-1 "park1" "resume3" "") (allocas) (join) (order) (looping)
+   (park-1 "no-continuation" "nope" "") (park-1 "unknown-type" "resume3" "t99") (edges)])
+
+;; ---- what a case prints: the same words as resume-oracle.rs
+
+(defun frame-word (x: FrameSlot) -> str
+  (match x
+    ((FrVal t) (str-join ["val:" (lir-ty-text t)]))
+    ((FrBytes n) (str-join ["bytes:" (str n)]))))
+
+(defstruct Ran (name: str frame: (Result (Vec FrameSlot) str) text: str value: bool))
+
+(defun run-case (c: Case) -> Ran
+  (let ((shape (ResumeShape "task.t" (. c prologue) (. c points) "fib.complete.t" 11))
+        (frame (make-resumable (. c f) shape)))
+    (Ran (. c name) frame (fb-render (. c f)) (. c value))))
+
+(defun ran-output (r: Ran) -> str
+  (match (. r frame)
+    ((Ok frame) (str-join ["== " (. r name) "\nframe: " (s/join " " (mapv frame-word frame)) "\n" (. r text)]))
+    ((Err e) (str-join ["== " (. r name) "\nerror: " e "\n"]))))
+
+;; The module lair checks: the task struct (the header's ten fields, the capture, then the frame), the
+;; two functions the body calls, and the function.
+(defun check-module (r: Ran) -> str
+  (match (. r frame)
+    ((Ok frame)
+     (str-join ["(defstruct task.t (i64 i32 i32 i32 i32 i32 ptr ptr ptr ptr i64 "
+                (s/join " " (mapv (fn (x: FrameSlot)
+                                      (match x ((FrVal t) (lir-ty-text t)) ((FrBytes n) (str-join ["[" (str n) " x i8]"]))))
+                                    frame))
+                "))\n(declare fib.await-or-park i1 (ptr ptr))\n(declare fib.complete.t void ("
+                (if (. r value) "ptr i64" "ptr") "))\n" (. r text)]))
+    ((Err _) "")))
+
+;; ---- the checks
+
+(defun check-text-helpers (cs: Checks) -> unit
+  (do (check cs "atoms of an add" (= (text-atoms "(add t1 (i64 2))") ["add" "t1" "i64" "2"]))
+      (check cs "names_in once each, in order" (= (text-names-in "(call @f t3 t12 t3)") ["t3" "t12"]))
+      (check cs "subst_atom of a name" (= (text-subst-atom "(add t1 t12)" "t1" "t9") "(add t9 t12)"))
+      (check cs "subst_atom leaves a string literal"
+             (= (text-subst-atom "(call @g (string \"t1\") t1)" "t1" "t2") "(call @g (string \"t1\") t2)"))
+      (check cs "atoms skip the contents of a string"
+             (= (text-atoms "(call @g (string \"a b (t1)\") t4)") ["call" "@g" "string" "t4"]))
+      (check cs "tabs and newlines separate atoms" (= (text-atoms "(add\tt1\n t2)") ["add" "t1" "t2"]))
+      (check cs "an atom of tN and only tN is a name"
+             (= (text-names-in "t t1x T1 t01 tt1 t7") ["t01" "t7"]))
+      (check cs "phi_edges keeps the atom pairs"
+             (= (mapv (fn (e: PhiEdge) (str-join [(. e label) ":" (. e value)])) (phi-edges "(phi i64 (entry t1) (loop3 (i64 2)))"))
+                ["entry:t1"]))
+      (check cs "phi_edges of two atom pairs"
+             (= (mapv (fn (e: PhiEdge) (str-join [(. e label) ":" (. e value)])) (phi-edges "(phi i64 (a t1) (b t2))"))
+                ["a:t1" "b:t2"]))
+      (check cs "phi_edges of a text that is no list" (empty? (phi-edges "t1")))))
+
+(defun frame-of (r: Ran) -> (Vec str)
+  (match (. r frame) ((Ok frame) (mapv frame-word frame)) ((Err _) [])))
+
+(defun error-of (r: Ran) -> str
+  (match (. r frame) ((Err e) e) ((Ok _) "")))
+
+(defun check-case (cs: Checks r: Ran) -> unit
+  (let ((module (check-module r)))
+    (if (= module "")
+        ()
+        (match (jit/check-source module)
+          ((Ok _) (check cs (str-join ["lair accepts " (. r name)]) true))
+          ((Err e) (do (println e) (check cs (str-join ["lair accepts " (. r name)]) false)))))))
+
+(defun main () -> i64
+  (let ((rs (mapv run-case (all-cases))))
+    (if (= (args) ["cases"])
+        (do (doseq [r rs] (print-raw (ran-output r))) 0)
+        (let ((cs (checks-new)))
+          (do (check-text-helpers cs)
+              (check cs "park1 frame: the resume point and the slot of t2" (= (frame-of (nth rs 0)) ["val:i32" "val:i64"]))
+              (check cs "allocas frame: two byte slots (a size of 0 is 1) then the value"
+                     (= (frame-of (nth rs 1)) ["val:i32" "bytes:24" "bytes:1" "val:i64"]))
+              (check cs "join frame: t2 then t4" (= (frame-of (nth rs 2)) ["val:i32" "val:i64" "val:i64"]))
+              (check cs "order frame: three values" (= (frame-of (nth rs 3)) ["val:i32" "val:i64" "val:i64" "val:i64"]))
+              (check cs "order: the names a point adds go in name order (t10 t11 t9: slots s12 s13 s14)"
+                     (and (s/includes? (. (nth rs 3) text) "(store t10 s12)")
+                          (s/includes? (. (nth rs 3) text) "(store t11 s13)")
+                          (s/includes? (. (nth rs 3) text) "(store t9 s14)")))
+              (check cs "edges frame: four values" (= (frame-of (nth rs 7)) ["val:i32" "val:i64" "val:i64" "val:i64" "val:i64"]))
+              (check cs "edges: the loads before the terminator of a go in value order (t10 first)"
+                     (let ((a-block (nth (s/split-limit (nth (s/split-limit (. (nth rs 7) text) "  (block a\n" -1) 1) "  (block b\n" -1) 0)))
+                       (< (unwrap (s/index-of a-block "(load i64 s12)")) (unwrap (s/index-of a-block "(load i64 s15)")))))
+              (check cs "a missing continuation block" (= (error-of (nth rs 5)) "no continuation block nope"))
+              (check cs "a live value that nothing binds" (= (error-of (nth rs 6)) "live value t99 of unknown type"))
+              (doseq [r rs] (check-case cs r))
+              (finish cs))))))
