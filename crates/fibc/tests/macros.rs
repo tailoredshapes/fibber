@@ -59,6 +59,24 @@ fn jit_expansions_equal_the_interpreters() {
     eprintln!("compared {compared} expansions");
 }
 
+/// A `trap` in a macro body rejects the program with the interpreter's
+/// text, `macro NAME failed: POS: trap: MSG`, and the compiler goes on:
+/// it did not abort the process (before, `fib.trap` ended it with exit
+/// status 134), and a second rejection in the same process follows.
+#[test]
+fn a_trap_in_a_macro_is_a_rejection_and_the_process_goes_on() {
+    let source =
+        "(defmacro boom (x) (match x ((Sym s) (Sym s)) (_ (trap \"boom: not a symbol\"))))\n\
+                  (defun main () -> i64 (boom 1))";
+    let interpreted = expand_with(source, "t.fib", false);
+    let message = interpreted.clone().expect_err("the interpreter rejects it");
+    assert!(message.contains("macro boom failed: t.fib:1:"), "{message}");
+    assert!(message.contains(": trap: boom: not a symbol"), "{message}");
+    for _ in 0..2 {
+        assert_eq!(expand_with(source, "t.fib", true), interpreted);
+    }
+}
+
 /// The expanded modules of the program whose main file is `main` with the
 /// interpreter's evaluator or the JIT's runner, as the expansion dump
 /// prints them (every position of every node).

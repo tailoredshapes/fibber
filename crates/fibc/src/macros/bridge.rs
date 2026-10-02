@@ -5,20 +5,75 @@
 //! `fibm.set-hooks` and passes the context back on every call, so no
 //! global state is involved.
 
-use fibref::expand::{ExpandCtx, ExpandError};
+use std::sync::mpsc::Sender;
+
+use fibref::expand::{ExpandCtx, ExpandError, ExpandErrorKind};
 use fibref::syntax::{Form, FormKind, Pos};
 
 use super::module::{Fns, Inputs};
 
+/// How a macro call on its own thread ends: the address of the result
+/// object, or the expansion's failure by `trap`.
+pub enum Outcome {
+    Done(usize),
+    Failed(ExpandError),
+}
+
 /// What a running macro's hooks see: the expander's context, the
 /// module's conversion functions, the call position, the forms the macro
-/// was given, and the first reflection error, which ends the expansion.
+/// was given, the first reflection error, which ends the expansion, and
+/// where a `trap` reports to (the macro's name, the thread's channel).
 pub struct Current<'a> {
     pub ctx: &'a ExpandCtx,
     pub fns: &'a Fns,
     pub pos: Pos,
     pub inputs: &'a Inputs<'a>,
     pub error: Option<ExpandError>,
+    pub name: &'a str,
+    pub done: Sender<Outcome>,
+}
+
+/// `(trap msg)` in a macro body (syntax §3.16): the macro fails and
+/// the expansion with it, as the interpreter's `MacroFailed` does, with
+/// the text `POS: trap: MSG` of its run error. The call cannot return
+/// into the macro, and a frame of compiled code cannot be unwound, so
+/// the thread that runs the macro (`JitRunner::run`) reports the failure
+/// to the thread that waits for it and stays here for good: the abort of
+/// the program's own `trap` would end the whole compiler.
+///
+/// The message is that of `trap` and of the faults of the macro's own
+/// code, which know their position; a fault of the runtime (an index
+/// out of range inside `array-get`) does not, and `pos` is null: the
+/// text is then `trap: MSG`, without the position the interpreter adds.
+///
+/// # Safety
+/// As [`gensym_hook`]; `pos` is null or a NUL-terminated string constant
+/// of the module, and `msg` points at `n` bytes.
+pub unsafe extern "C" fn trap_hook(
+    cur: *mut Current<'_>,
+    pos: *const std::os::raw::c_char,
+    msg: *const u8,
+    n: i64,
+) -> ! {
+    let cur = &mut *cur;
+    let text = String::from_utf8_lossy(std::slice::from_raw_parts(msg, n as usize));
+    let message = if pos.is_null() {
+        format!("trap: {text}")
+    } else {
+        let pos = std::ffi::CStr::from_ptr(pos).to_string_lossy();
+        format!("{pos}: trap: {text}")
+    };
+    let kind = ExpandErrorKind::MacroFailed {
+        name: cur.name.to_string(),
+        message,
+    };
+    // The waiting side is gone only if its call was abandoned.
+    let _ = cur
+        .done
+        .send(Outcome::Failed(ExpandError::new(kind, &cur.pos)));
+    loop {
+        std::thread::park();
+    }
 }
 
 /// `(gensym prefix)`: the expander's fresh symbol.

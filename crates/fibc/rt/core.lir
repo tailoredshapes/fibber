@@ -29,6 +29,9 @@
 ;; in a program, where the builtins they serve never run.
 (global internal fibm.gensym-hook ptr (ptr null))
 (global internal fibm.reflect-hook ptr (ptr null))
+;; `(trap msg)` of a macro: the hook fails the expansion and does not
+;; return (macros/bridge.rs); a program's trap is `fib.trap`.
+(global internal fibm.trap-hook ptr (ptr null))
 (global internal fibm.hook-cx ptr (ptr null))
 (global internal fib.ordinal i64 (i64 0))
 
@@ -359,8 +362,36 @@
   (block done (ret)))
 
 ;; §8.12, §2.11: "trap: MESSAGE\n" to fd 2, then abort.
+;; In a macro module (the trap hook is set) the trap fails the expansion
+;; instead (macros/bridge.rs): `pos` is the C string POS of the faulting
+;; expression, or null where the runtime does not know it. The hook does
+;; not return.
+(define internal (fib.trap-hooked void) ((ptr pos) (ptr bytes) (i64 n))
+  (block entry
+    (let ((hook (load ptr @fibm.trap-hook))
+          (cx (load ptr @fibm.hook-cx)))
+      (indirect-call hook (fn void (ptr ptr ptr i64)) cx pos bytes n)
+      (unreachable))))
+
+;; `trap` and a fault of a macro module's own code, with the position.
+(define internal (fib.trap-at void) ((ptr pos) (ptr s))
+  (block entry
+    (call @fib.trap-hooked pos (getelementptr %struct.fib.str s (i32 0) (i32 4) (i64 0))
+      (load i64 (getelementptr %struct.fib.str s (i32 0) (i32 3))))
+    (unreachable)))
+
+(define internal (fib.trap-at-c void) ((ptr pos) (ptr msg))
+  (block entry
+    (call @fib.trap-hooked pos msg (call @strlen msg))
+    (unreachable)))
+
 (define internal (fib.trap-bytes void) ((ptr bytes) (i64 n))
   (block entry
+    (br (icmp ne (load ptr @fibm.trap-hook) (ptr null)) hooked plain))
+  (block hooked
+    (call @fib.trap-hooked (ptr null) bytes n)
+    (unreachable))
+  (block plain
     (call @write (i32 2) (string "trap: ") (i64 6))
     (let ((pre (load ptr @fib.initdef)))
       (br (icmp eq pre (ptr null)) body named)))

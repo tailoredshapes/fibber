@@ -93,6 +93,8 @@ pub fn render(f: &FormLayout, body: &str, n: usize, k: usize) -> String {
   (block entry (ret (load ptr (call @fib.vec-elem-ptr v i (i64 8))))))
 (define (fibm.set-hooks.{k} void) ((ptr gensym) (ptr reflect) (ptr cx))
   (block entry (store gensym @fibm.gensym-hook) (store reflect @fibm.reflect-hook) (store cx @fibm.hook-cx) (ret)))
+(define (fibm.set-trap-hook.{k} void) ((ptr trap))
+  (block entry (store trap @fibm.trap-hook) (ret)))
 (define (fibm.init.{k} void) () (block entry (call @fib.init) (ret)))",
         f.size,
         f.tid,

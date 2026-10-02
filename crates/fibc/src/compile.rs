@@ -123,6 +123,7 @@ pub fn compile_macro(
         .position(|d| d.is_macro && d.name == name)
         .ok_or_else(|| Unsupported(format!("no macro {name}")))?;
     let mut p = Program::new(checked);
+    p.macro_module = true;
     for w in WIDTHS {
         p.statics.keyword(w);
     }

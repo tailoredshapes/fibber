@@ -19,15 +19,16 @@ pub use runner::JitRunner;
 #[cfg(feature = "llvm")]
 mod runner {
     use std::collections::HashMap;
+    use std::sync::mpsc::{Receiver, Sender};
 
     use super::macro_forms;
     use fibref::expand::MacroRunner;
     use fibref::expand::{ExpandCtx, ExpandError, ExpandErrorKind, MacroDef};
     use fibref::own::check_forms;
-    use fibref::syntax::Form;
+    use fibref::syntax::{Form, Pos};
     use lair::{Jit, JitOptions};
 
-    use super::bridge::Current;
+    use super::bridge::{Current, Outcome};
     use super::module::{Fns, Inputs};
     use crate::compile::{compile_macro, Unsupported};
 
@@ -110,12 +111,15 @@ mod runner {
             if m.rest.is_some() {
                 objs.push(fns.input_items(&args[fixed..], &mut inputs));
             }
+            let (done, outcome) = std::sync::mpsc::channel();
             let mut cur = Current {
                 ctx,
                 fns: &fns,
                 pos: pos.clone(),
                 inputs: &inputs,
                 error: None,
+                name: &m.name,
+                done: done.clone(),
             };
             let cur_ptr: *mut Current<'_> = &mut cur;
             (fns.set_hooks)(
@@ -123,7 +127,11 @@ mod runner {
                 super::bridge::reflect_hook as *const () as usize,
                 cur_ptr as usize,
             );
-            let result = call_entry(fns.entry, &objs);
+            (fns.set_trap_hook)(super::bridge::trap_hook as *const () as usize);
+            let result = match run_apart(fns.entry, &objs, done, &outcome, (&m.name, &pos))? {
+                Outcome::Done(r) => r as *const u8,
+                Outcome::Failed(e) => return Err(e),
+            };
             if let Some(e) = cur.error.take() {
                 return Err(e);
             }
@@ -137,6 +145,43 @@ mod runner {
                 )
             })
         }
+    }
+
+    /// The stack of the thread a macro runs on: the interpreter's budget
+    /// for a macro (`fibref::eval::MACRO_STACK_BUDGET`).
+    const MACRO_STACK: usize = 64 * 1024 * 1024;
+
+    /// Runs the macro entry on a thread of its own and waits for how it
+    /// ends: a `trap` in the macro cannot be returned from or unwound
+    /// (`bridge::trap_hook`), so the thread that ran it is left parked
+    /// and the compiler goes on with the rejection.
+    fn run_apart(
+        entry: usize,
+        objs: &[*const u8],
+        done: Sender<Outcome>,
+        outcome: &Receiver<Outcome>,
+        (name, pos): (&str, &Pos),
+    ) -> Result<Outcome, ExpandError> {
+        let objs: Vec<usize> = objs.iter().map(|p| *p as usize).collect();
+        let failed = |message: String| {
+            let kind = ExpandErrorKind::MacroFailed {
+                name: name.to_string(),
+                message,
+            };
+            ExpandError::new(kind, pos)
+        };
+        std::thread::Builder::new()
+            .stack_size(MACRO_STACK)
+            .spawn(move || {
+                let objs: Vec<*const u8> = objs.into_iter().map(|a| a as *const u8).collect();
+                let result = call_entry(entry, &objs);
+                // The receiver is gone only if the call was abandoned.
+                let _ = done.send(Outcome::Done(result as usize));
+            })
+            .map_err(|e| failed(format!("cannot start a thread for the macro: {e}")))?;
+        outcome
+            .recv()
+            .map_err(|_| failed("the macro's thread ended without a result".to_string()))
     }
 
     /// Calls the macro entry with `n` object arguments (the entry's type

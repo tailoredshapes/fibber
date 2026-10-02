@@ -65,6 +65,9 @@ pub struct Fns {
     vec_len: extern "C" fn(P) -> i64,
     vec_elem: extern "C" fn(P, i64) -> P,
     pub set_hooks: extern "C" fn(usize, usize, usize),
+    /// Not part of the interface a fibber-written runner uses: it sets
+    /// no trap hook, and a macro of its module that traps aborts.
+    pub set_trap_hook: extern "C" fn(usize),
     /// The keyword ids of the width suffixes, in the order of `WIDTHS`.
     widths: [i64; 6],
     /// Every keyword the module interned, by id: the module's table.
@@ -98,6 +101,7 @@ impl Fns {
                 vec_len: jit.function(&n("vec-len")).map_err(e)?,
                 vec_elem: jit.function(&n("vec-elem")).map_err(e)?,
                 set_hooks: jit.function(&n("set-hooks")).map_err(e)?,
+                set_trap_hook: jit.function(&n("set-trap-hook")).map_err(e)?,
                 widths: [0; 6],
                 keywords: Vec::new(),
             }

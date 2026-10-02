@@ -292,7 +292,8 @@ fn a_form_of_a_width_that_is_none_is_named_from_the_table_as_rust_names_it() {
 /// and compared with the Rust runner's, as the real programs of the
 /// project are, case 105 included: its `:f16` is named by the module's
 /// table in both. What is left out: a macro whose module cannot be made
-/// (a case that is refused before the macro runs).
+/// (a case that is refused before the macro runs), and one that fails
+/// by `trap`.
 #[test]
 fn the_macros_of_the_cases_run_from_fibber_as_the_rust_runner_runs_them() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cases/ownership");
@@ -309,8 +310,18 @@ fn the_macros_of_the_cases_run_from_fibber_as_the_rust_runner_runs_them() {
                 skipped.push(format!("{name}: {} has no module", run.def.name));
                 continue;
             };
+            let want = expected_output(run);
+            // A macro that fails by `trap` (cases 246, 247): the Rust
+            // runner rejects the program through its hook
+            // (`fibm.set-trap-hook`); the fibber runner sets none yet, so
+            // its module still aborts the process, as the Rust runner's
+            // did before the hook.
+            if want.contains(": trap: ") {
+                skipped.push(format!("{name}: {} fails by trap", run.def.name));
+                continue;
+            }
             let got = demo_output(name, run, &texts[k].1, 1);
-            assert_eq!(got, expected_output(run), "{name}: {}", run.call);
+            assert_eq!(got, want, "{name}: {}", run.call);
             compared.push(format!("{name}: {}", run.call));
         }
     }

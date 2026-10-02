@@ -59,6 +59,9 @@ pub struct Program<'a> {
     /// Whether a body used `show` or `hash` on a keyword, so that the
     /// module needs `kw.show` and `kw.hash` over every keyword interned.
     pub keyword_helpers: bool,
+    /// Whether this is a macro-time module (`compile_macro`): a `trap`
+    /// fails the expansion through a hook and does not abort.
+    pub macro_module: bool,
 }
 
 impl<'a> Program<'a> {
@@ -79,6 +82,7 @@ impl<'a> Program<'a> {
             quote_text: String::new(),
             quote_counter: 0,
             keyword_helpers: false,
+            macro_module: false,
         };
         // `str` is type id 0: the literals need it before any body runs;
         // the runtime's own text names the byte array and the weak box.

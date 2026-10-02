@@ -11,6 +11,7 @@ mod call;
 mod cells;
 mod ctrl;
 mod dynamic;
+mod fault;
 mod objects;
 mod ops;
 pub mod pattern;
@@ -78,6 +79,8 @@ pub struct Cx<'p, 'a> {
     pub closure_slots: HashSet<String>,
     /// Set while an `async` body is lowered (threads.rs, resume.rs).
     pub async_frame: Option<threads::AsyncFrame>,
+    /// The expression being lowered (fault.rs).
+    pub at: Option<&'a Expr>,
 }
 
 /// Emits the function of `inst` into the program.
@@ -280,6 +283,7 @@ impl<'p, 'a> Cx<'p, 'a> {
             rests: Vec::new(),
             closure_slots: HashSet::new(),
             async_frame: None,
+            at: None,
         }
     }
 
@@ -331,7 +335,9 @@ impl<'p, 'a> Cx<'p, 'a> {
 
     /// Lowers an expression: its value, then the plan's operations.
     pub fn expr(&mut self, e: &'a Expr) -> R<Flow> {
+        let outer = self.at.replace(e);
         let flow = self.form(e)?;
+        self.at = outer;
         if let Flow::Val(v) = &flow {
             if self.value_sites.contains(&e.id) {
                 self.values.insert(e.id, v.clone());
@@ -426,13 +432,6 @@ impl<'p, 'a> Cx<'p, 'a> {
             ),
             _ => None,
         }
-    }
-
-    /// A trap with a C-string message: the block ends here.
-    pub fn trap_c(&mut self, msg: &str) {
-        self.b
-            .stmt(&format!("(call @fib.trap-c (string \"{msg}\"))"));
-        self.b.term("(unreachable)");
     }
 
     /// `(getelementptr %struct.S p (i32 0) (i32 i))`.

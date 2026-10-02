@@ -4,6 +4,7 @@
 use fibref::types::ast::Expr;
 use fibref::types::ty::{Con, Ty};
 
+use super::fault::lir_text;
 use super::{Cx, R};
 use crate::compile::Unsupported;
 use crate::ir::{LirTy, V};
@@ -109,6 +110,18 @@ impl<'a> Cx<'_, 'a> {
             "not" => self
                 .b
                 .val(&format!("(xor {} (i1 1))", arg(0)?.text()), LirTy::I1),
+            "trap" if self.p.macro_module => {
+                // The macro fails the expansion with the interpreter's
+                // text, `POS: trap: MSG`, and does not return
+                // (macros/bridge.rs).
+                self.b.stmt(&format!(
+                    "(call @fib.trap-at (string \"{}\") {})",
+                    lir_text(&e.pos.to_string()),
+                    arg(0)?.text()
+                ));
+                self.b.term("(unreachable)");
+                return Ok(None);
+            }
             "trap" => {
                 self.b.stmt(&format!("(call @fib.trap {})", arg(0)?.text()));
                 self.b.term("(unreachable)");
