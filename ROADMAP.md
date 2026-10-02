@@ -277,7 +277,10 @@ land, their expander and prelude changes are not mirrored into
 `compiler/expand/` in the same commit: `bootstrap_expand` is behind the
 `mirror` feature of `crates/fibc` and each package lists what to re-sync in
 `compiler/mirror-pending/` (README there). Mutation reviews and other
-verification run in the background and gate nothing.
+verification run in the background and gate nothing. Baseline before the
+gate, on 2026-10-02 with tranche 2's library parts Y1 to Y5, Y9 and Y10 in
+tree: `cargo test -p fibc --test bootstrap_expand` 80 passed, 0 failed, 1
+ignored, in 1144 s (the self-hosted expander handles the whole library).
 
 **Paused** (owner, 2026-10-01) after step 2a until M7's library is
 viable. The faithful ports so far are 0.8 times the Rust's code lines
