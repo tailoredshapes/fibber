@@ -1,0 +1,44 @@
+;; compiler/own.fib: the ownership checker's tool, as `fibref own` (crates/fibref/src/own_dump/,
+;; package O0; plan 1.2): prints the ownership dump of each file named on the command line, each
+;; under a `== FILE` header (spec/bootstrap.md §7 once it lands). It is the types tool
+;; (compiler/types.fib) with the ownership pass after inference: the file loop and the read, load,
+;; expand and type error records are types.dump's.
+;; The words before the files are the options of `own.args` (`--sections LIST` of `body`,
+;; `facts`, `summary`, `taken`, `error`, `explain`, `--library`, `--implicit`, `--implicit-lib
+;; LIST`, `--prelude`; a lone `--` ends them). With no file, or an option that is not one, it
+;; prints a usage line to stderr, nothing to stdout, and exits 2.
+;;
+;; Exit status: 0 if every file was checked, 1 if one ended in an error record (it did not read,
+;; load, expand or check), 2 if one could not be read at all (its dump is the line `unreadable`)
+;; or the words were refused; the larger wins.
+;;
+;; It prints each file's section as soon as it is made (as compiler/types.fib), and links every
+;; module of compiler/own/, so that `fibc build compiler/own.fib` proves each compiles; the
+;; modules are in dependency order. Until packages O2 to O8 land, a program that the front end
+;; accepts stops at `analyse` with `todo: analyse`.
+(ns main
+  (:require [own.args :as cli] [own.dump :as dump])
+  (:use own.error own.objects own.program own.syntactic own.captured own.taken own.walk.state
+        own.walk.callee own.walk.pattern own.walk.lit own.walk.expr own.walk.call own.facts
+        own.classify own.stack own.unit own.top own.driver own.explain.names own.explain
+        own.dump.text own.dump.bodies own.dump.units))
+
+(def usage: str
+  "usage: own [--sections LIST] [--library] [--implicit] [--implicit-lib LIST] [--prelude] [--] FILE..")
+
+;; Prints the lines of a dump, each ended by a newline.
+(defun print-lines (lines: (Vec str))
+  (doseq [line lines] (println line)))
+
+;; Prints the output of each of files in order, and returns the largest status.
+(defun own-files (files: (Vec str) opts: cli/OwnOptions) -> i64
+  (reduce (fn (status: i64 file: str)
+            (let ((d (dump/own-file file opts)))
+              (do (print-lines (. d lines))
+                  (max status (. d status)))))
+          0 files))
+
+(defun main () -> i64
+  (match (cli/own-parse-args (args))
+    (nil (do (eprintln usage) 2))
+    ((some parsed) (own-files (. parsed files) (. parsed opts)))))

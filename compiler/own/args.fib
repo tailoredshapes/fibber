@@ -1,0 +1,112 @@
+;; compiler/own/args.fib: the words `fibref own` and `compiler/own.fib` take before the files
+;; (plan 1.2; spec/bootstrap.md §7 once it lands), as types.args reads those of `fibref types`:
+;; `--sections LIST`, `--library`, `--implicit`, `--implicit-lib LIST`, `--prelude`, and a lone
+;; `--` that ends them. No file, a word that is not an option, a section that is not one, or a
+;; LIST with an empty name is refused (`nil`); a later option of the same name replaces an earlier one.
+;;
+;; Decided here, where the plan is silent (the Rust `fibref own` is package O0's, not landed):
+;; - no `--stage`, `--ast` or `--tables`: the pass runs after inference and prints no types or tables.
+;; - the sections are `body`, `facts`, `summary`, `taken`, `error` and `explain`; with no
+;;   `--sections` every one but `explain` is printed.
+;; - the variants carry the prefix `Os` (types.args has `SecError`).
+;; - `base-options` is what types.dump (the file loop it shares) reads of the words.
+(ns own.args
+  (:use fib.string types.args))
+
+(defenum OwnSection OsBody OsFacts OsSummary OsTaken OsError OsExplain)
+(derive Eq OwnSection)
+
+;; How the tool checks and what it prints: the sections (nil: every one but `explain`), `main` is
+;; not required, the implicit modules' sections too, the implicit modules (nil: the library's),
+;; each file a library prelude.
+(defstruct OwnOptions
+  (sections: (Option (Vec OwnSection)) library: bool implicit: bool implicit-lib: (Option (Vec str))
+   prelude: bool))
+(derive Eq OwnOptions)
+
+;; The options and the files of the words after the tool's name.
+(defstruct OwnParsed (opts: OwnOptions files: (Vec str)))
+(derive Eq OwnParsed)
+
+(defun own-options-default () -> OwnOptions (OwnOptions nil false false nil false))
+
+(defun own-section-name (s: OwnSection) -> str
+  (match s
+    ((OsBody) "body") ((OsFacts) "facts") ((OsSummary) "summary") ((OsTaken) "taken")
+    ((OsError) "error") ((OsExplain) "explain")))
+
+(defun own-section-all () -> (Vec OwnSection) [OsBody OsFacts OsSummary OsTaken OsError OsExplain])
+
+(defun own-section-from-name (word: str) -> (Option OwnSection)
+  (find-first (fn (s: OwnSection) (= (own-section-name s) word)) (own-section-all)))
+
+;; Whether the dump prints section s: listed by `--sections`, or by default every one but `explain`.
+(defun own-wants (o: OwnOptions s: OwnSection) -> bool
+  (match (. o sections)
+    ((some l) (some? (find-first (fn (x: OwnSection) (= x s)) l)))
+    (nil (not (= s OsExplain)))))
+
+;; The options of types.args that the file loop of types.dump reads: the same files, the stage
+;; that infers, no `ast` or `tables`.
+(defun base-options (o: OwnOptions) -> Options
+  (Options StInfer nil (. o library) (. o implicit) (. o implicit-lib) (. o prelude) false false))
+
+;; ------------------------------------------------------ the words
+
+;; The names of a `--sections` list, nil when one is not a section.
+(defun section-list :private (list: str) -> (Option (Vec OwnSection))
+  (let ((found (mapv own-section-from-name (split-limit list "," -1))))
+    (if (every? some? found) (some (mapv unwrap found)) nil)))
+
+;; The module names of a `--implicit-lib` list: none for the empty text, else one per comma, each not empty.
+(defun module-list :private (list: str) -> (Option (Vec str))
+  (if (= list "")
+      (some (vec-empty))
+      (let ((names (split-limit list "," -1)))
+        (if (every? (fn (n: str) (> (str-len n) 0)) names) (some names) nil))))
+
+;; The options with the flag `word` set, nil when it is not a flag.
+(defun with-flag :private (o: OwnOptions word: str) -> (Option OwnOptions)
+  (let ((se (. o sections)) (lib (. o library)) (imp (. o implicit)) (il (. o implicit-lib)) (pre (. o prelude)))
+    (cond ((= word "--library") (some (OwnOptions se true imp il pre)))
+          ((= word "--implicit") (some (OwnOptions se lib true il pre)))
+          ((= word "--prelude") (some (OwnOptions se lib imp il true)))
+          (else nil))))
+
+;; The options with the value `word` of the option `name`, nil when it is refused.
+(defun with-value :private (o: OwnOptions name: str word: str) -> (Option OwnOptions)
+  (cond ((= name "--sections")
+         (if-some [l (section-list word)]
+           (some (OwnOptions (some l) (. o library) (. o implicit) (. o implicit-lib) (. o prelude)))
+           nil))
+        (else
+         (if-some [l (module-list word)]
+           (some (OwnOptions (. o sections) (. o library) (. o implicit) (some l) (. o prelude)))
+           nil))))
+
+;; The words from i on as the files, nil when there are none.
+(defun files-from :private (words: (Vec str) i: i64 o: OwnOptions) -> (Option OwnParsed)
+  (if (< i (count words))
+      (some (OwnParsed o (vec (drop i words))))
+      nil))
+
+;; The options from index i on, then the files.
+(defun parse-from :private (words: (Vec str) i: i64 o: OwnOptions) -> (Option OwnParsed)
+  (if (>= i (count words))
+      nil
+      (let ((w (nth words i)))
+        (cond ((= w "--") (files-from words (+ i 1) o))
+              ((or (= w "--sections") (= w "--implicit-lib"))
+               (if (< (+ i 1) (count words))
+                   (if-some [o2 (with-value o w (nth words (+ i 1)))]
+                     (parse-from words (+ i 2) o2)
+                     nil)
+                   nil))
+              (else (if-some [o2 (with-flag o w)]
+                      (parse-from words (+ i 1) o2)
+                      (if (starts-with? w "--") nil (files-from words i o))))))))
+
+;; The options and files of words, or nil for a word that is not an option, a section that is not
+;; one, or no file.
+(defun own-parse-args (words: (Vec str)) -> (Option OwnParsed)
+  (parse-from words 0 (own-options-default)))

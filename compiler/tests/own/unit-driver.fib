@@ -1,0 +1,34 @@
+;; compiler/tests/own/unit-driver.fib: own.driver's `own-check-source` on programs that stop before
+;; the ownership pass (a read error, an expansion error, a type error: the `CheckError` variant
+;; and its text are those of `check_source`), and the `&` checks' neutral stub. A program the
+;; front end accepts reaches `analyse`, a stub that traps until package O7, so none is checked here.
+;; Needs lib/prelude.fib in the working directory (run from the repository root). Prints `ok NAME`
+;; or `FAIL NAME`.
+;; Build: fibc build compiler/tests/own/unit-driver.fib -I compiler -I lib -o OUT
+(ns main
+  (:use types.check own.error own.driver own.syntactic types.decls))
+
+(defun kind-of (r: (Result Checked CheckError)) -> str
+  (match r
+    ((Ok _) "ok")
+    ((Err (CePrelude _)) "prelude") ((Err (CeRead _)) "read") ((Err (CeExpand _)) "expand")
+    ((Err (CeType _)) "type") ((Err (CeOwn _)) "own") ((Err (CeInternal _)) "internal")))
+
+(defun text-of (r: (Result Checked CheckError)) -> str
+  (match r
+    ((Ok _) "")
+    ((Err e) (check-error-text e))))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (bad-type (own-check-source "(defun main () -> i64 (+ 1 true))\n" "t.fib"))
+        (bad-read (own-check-source "(defun main () -> i64 (+ 1 2)\n" "r.fib"))
+        (bad-name (own-check-source "(defun main () -> i64 (nosuchmacro 1 2) 0)\n" "n.fib")))
+    (do (check cs "a type error is a CeType" (= (kind-of bad-type) "type"))
+        (check cs "its text is FILE:L:C: MESSAGE" (= (text-of bad-type) "t.fib:1:28: cannot unify bool with i64"))
+        (check cs "a read error is a CeRead" (= (kind-of bad-read) "read"))
+        (check cs "its text names the file and the position" (= (text-of bad-read) "read: r.fib:1:1: unclosed ("))
+        (check cs "an unbound name is a type error (resolution)" (= (kind-of bad-name) "type"))
+        (check cs "and its text is the checker's" (= (text-of bad-name) "n.fib:1:24: unbound name nosuchmacro"))
+        (check cs "the `&` checks find nothing until package O2" (empty? (syntactic-check (globals-new))))
+        (finish cs))))

@@ -1,0 +1,62 @@
+;; compiler/own/error.fib: the errors of the ownership checker (spec/types.md §6.14) and of the
+;; whole front end when it is run through own.driver, as crates/fibref/src/own/error.rs (131
+;; lines of Rust).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `OwnErrorKind` keeps the Rust names (the dump prints them: `own-error-kind-name`, Rust's
+;;   `{:?}`); the variants of `CheckError` carry the prefix `Ce` (a variant's name is global).
+;; - `OwnError::new` is `own-error`, `Display` is `own-error-text`, `messages` is
+;;   `check-error-messages` and the `Display` of a `CheckError` is `check-error-text`.
+(ns own.error
+  (:require [expand.error :as ee])
+  (:use fib.string syntax.pos types.error))
+
+;; Which rule of §6.14 an ownership error comes from: `AmpTwice` (§6.5, case 12) and
+;; `AmpInAsync` (§6.9, case 14) before typing, `AmpCaptured` (§6.5, case 18),
+;; `BorrowEscapes` and `ImplEscapes` (§6.4) after it.
+(defenum OwnErrorKind AmpTwice AmpInAsync AmpCaptured BorrowEscapes ImplEscapes)
+(derive Eq OwnErrorKind) (derive Hash OwnErrorKind)
+
+;; One ownership error: which rule, the form it is about, the message (the canonical part first).
+(defstruct OwnError (kind: OwnErrorKind pos: Pos message: str))
+
+(defun own-error (kind: OwnErrorKind pos: Pos message: str) -> OwnError
+  (OwnError kind pos message))
+
+;; The variant's own name, as Rust's `{:?}` prints it.
+(defun own-error-kind-name (k: OwnErrorKind) -> str
+  (match k
+    ((AmpTwice) "AmpTwice") ((AmpInAsync) "AmpInAsync") ((AmpCaptured) "AmpCaptured")
+    ((BorrowEscapes) "BorrowEscapes") ((ImplEscapes) "ImplEscapes")))
+
+;; `FILE:LINE:COL: MESSAGE`.
+(defun own-error-text (e: OwnError) -> str
+  (str-join [(ee/pos-display (. e pos)) ": " (. e message)]))
+
+;; Why a check failed, in pipeline order: the prelude did not read or expand (a bug in `lib/`),
+;; the source did not read or expand, lowering or type errors (§3), ownership errors (§6: the
+;; syntactic `&` checks before typing, or the pass after it), the checker itself failed.
+(defenum CheckError
+  (CePrelude message: str)
+  (CeRead message: str)
+  (CeExpand message: str)
+  (CeType errors: (Vec TypeError))
+  (CeOwn errors: (Vec OwnError))
+  (CeInternal message: str))
+
+;; Every message, in order.
+(defun check-error-messages (e: CheckError) -> (Vec str)
+  (match e
+    ((CePrelude m) [m]) ((CeRead m) [m]) ((CeExpand m) [m]) ((CeInternal m) [m])
+    ((CeType es) (mapv (fn (x: TypeError) (. x message)) es))
+    ((CeOwn es) (mapv (fn (x: OwnError) (. x message)) es))))
+
+;; The text of the error, one line for each of the errors it holds.
+(defun check-error-text (e: CheckError) -> str
+  (match e
+    ((CePrelude m) (str-concat "prelude: " m))
+    ((CeRead m) (str-concat "read: " m))
+    ((CeExpand m) (str-concat "expand: " m))
+    ((CeInternal m) (str-concat "internal: " m))
+    ((CeType es) (join "\n" (mapv type-error-text es)))
+    ((CeOwn es) (join "\n" (mapv own-error-text es)))))

@@ -1,0 +1,87 @@
+;; compiler/own/dump/units.fib: the `facts`, `summary` and `taken` sections of the ownership dump
+;; (plan 1.2) for one module. Package O1; provisional with the words of own.dump.text.
+;;
+;;   unit-facts scc NAME.. | def NAME | impl INDEX METHOD | macro NAME      (the unit of the facts)
+;;     owned B WHY[,WHY..]       loop-rule1 B..      escapes B TEXT      escaping E TEXT      heap E TEXT
+;;   summary FUN (OWNED,ESCAPES)..                                           in unit order
+;;   taken value FUN..                                                       by FunId
+;;   taken method I.M..                                                      by (instance, method)
+;; A line is printed only when there is something to say on it; every id list is sorted.
+(ns own.dump.units
+  (:use fib.string types.table types.decls types.program types.infer.mod own.program own.dump.text))
+
+;; The module a unit belongs to.
+(defun unit-module (g: Globals u: UnitRef) -> i64
+  (match u
+    ((UScc fs) (. (g-fun g (nth fs 0)) module))
+    ((UDef d) (. (g-def g d) module))
+    ((UImplMethod i _) (. (table-get (. g instances) i) module))
+    ((UMacro f) (. (g-fun g f) module))))
+
+;; The name of method `k` of instance `i`.
+(defun method-name :private (g: Globals i: i64 k: i64) -> str
+  (let ((inst (table-get (. g instances) i)))
+    (. (nth (. (g-proto g (. inst proto)) methods) (. (nth (. inst methods) k) index)) name)))
+
+;; `scc NAME.. | def NAME | impl INDEX METHOD | macro NAME`, as the `unit` section of types.dump.units.
+(defun unit-text (g: Globals u: UnitRef) -> str
+  (match u
+    ((UScc fs) (str-concat "scc " (join " " (mapv (fn (f: i64) (. (g-fun g f) name)) fs))))
+    ((UDef d) (str-concat "def " (. (g-def g d) name)))
+    ((UImplMethod i k) (str-join ["impl " (show i) " " (method-name g i k)]))
+    ((UMacro f) (str-concat "macro " (. (g-fun g f) name)))))
+
+;; `ID TEXT` lines of a table, in id order, under the label.
+(defun reason-lines :private (acc: (Vec str) label: str m: (Map i64 str)) -> (Vec str)
+  (reduce (fn (a: (Vec str) k: i64) (conj a (str-join ["    " label " " (show k) " " (unwrap (get m k))])))
+          acc (sort (vec (keys m)))))
+
+;; The lines of the facts of one unit.
+(defun facts-lines :private (acc: (Vec str) f: Facts) -> (Vec str)
+  (let ((owned (reduce (fn (a: (Vec str) b: i64)
+                         (conj a (str-join ["    owned " (show b) " "
+                                            (join "," (mapv owned-why-text (sort (vec (unwrap (get (. f owned) b))))))])))
+                       acc (sort (vec (keys (. f owned))))))
+        (loops (if (empty? (. f loop-rule1))
+                   owned
+                   (conj owned (str-concat "    loop-rule1 " (join " " (mapv show (sort (vec (. f loop-rule1))))))))))
+    (reason-lines (reason-lines (reason-lines loops "escapes" (. f escapes)) "escaping" (. f escaping))
+                  "heap" (. f heap))))
+
+;; `unit-facts UNIT`, then the facts, for each unit of module m that the pass decided.
+(defun facts-section (acc: (Vec str) g: Globals o: OwnedProgram m: i64) -> (Vec str)
+  (reduce (fn (a: (Vec str) uf: UnitFacts)
+            (if (= (unit-module g (. uf unit)) m)
+                (facts-lines (conj a (str-concat "unit-facts " (unit-text g (. uf unit)))) (. uf facts))
+                a))
+          acc (. o unit-facts)))
+
+;; `summary FUN (OWNED,ESCAPES)..` for each `defun` of module m with a summary, in unit order.
+(defun summary-section (acc: (Vec str) p: TypedProgram o: OwnedProgram m: i64) -> (Vec str)
+  (let ((g (. p globals)))
+    (reduce (fn (a: (Vec str) u: UnitRef)
+              (match u
+                ((UScc fs)
+                 (reduce (fn (a2: (Vec str) f: i64)
+                           (if-some [s (get (. o summaries) f)]
+                             (if (= (. (g-fun g f) module) m)
+                               (conj a2 (join " " (into ["summary" (. (g-fun g f) name)]
+                                                        (mapv (fn ([ow es]) (str-join ["(" (flag-text ow) "," (flag-text es) ")"]))
+                                                              (. s params)))))
+                               a2)
+                             a2))
+                         a fs))
+                (_ a)))
+            acc (. p units))))
+
+;; `taken value FUN..` and `taken method I.M..` for module m.
+(defun taken-section (acc: (Vec str) g: Globals o: OwnedProgram m: i64) -> (Vec str)
+  (let ((funs (filterv (fn (f: i64) (= (. (g-fun g f) module) m)) (sort (vec (. o value-taken)))))
+        (meths (filterv (fn ([i _]) (= (. (table-get (. g instances) i) module) m)) (sort (vec (. o methods-taken)))))
+        (a1 (if (empty? funs)
+                acc
+                (conj acc (str-concat "taken value " (join " " (mapv (fn (f: i64) (. (g-fun g f) name)) funs)))))))
+    (if (empty? meths)
+        a1
+        (conj a1 (str-concat "taken method "
+                             (join " " (mapv (fn ([i k]) (str-join [(show i) "." (show k)])) meths)))))))

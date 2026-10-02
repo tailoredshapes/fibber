@@ -1,0 +1,64 @@
+;; compiler/own/dump.fib: the ownership dump of one file, as `fibref own` prints it (plan 1.2,
+;; package O0's spec/bootstrap.md §7 once it lands), over the file loop of types.dump: the header
+;; `== FILE`, then the sections of every module of the program that the front end accepts, or the
+;; expander's error record, or the `error` records of the step that failed (the checker's, as
+;; types.dump prints them, or an ownership error's), or the line `unreadable`. The sections are
+;; `body` (own.dump.bodies), `facts`, `summary`, `taken` (own.dump.units) and `explain`
+;; (own.explain), in this order, after the line `-- module NS FILE`.
+;;
+;; Shapes decided where the plan is silent:
+;; - the file loop is `dump-file` of types.dump with this module's check as its parameter; the
+;;   read, load and expand records are types.dump's, so they are identical to `fibref types`.
+;; - the check is `own-check`; the options it reads are the tool's (`OwnOptions`) except
+;;   `library`, which comes with the types options it is given (`--prelude` sets it).
+;; - an ownership error prints as a type error does: `error KIND LINE:COL START..END[@FILE]:
+;;   MESSAGE`, after the header, with no section for the file, status 1; `--sections` without
+;;   `error` hides the records and not the status.
+(ns own.dump
+  (:require [syntax.dump :as sdump] [types.dump :as td] [types.dump.sections :as sec]
+            [types.driver :as tdr] [types.args :as ta])
+  (:use fib.string syntax.form expand.types own.args
+        own.error own.program own.driver own.dump.bodies own.dump.units own.explain))
+
+;; The records of ownership errors, in order, their positions relative to the main file home
+;; (nothing prints when show is false), and the status 1 all the same.
+(defun own-error-dump (lines: (Vec str) errs: (Vec OwnError) home: str show: bool) -> td/Dumped
+  (td/Dumped (if show
+                 (reduce (fn (acc: (Vec str) e: OwnError)
+                           (conj acc (str-join ["error " (own-error-kind-name (. e kind)) " "
+                                                (sdump/span-in (. e pos) home) ": " (. e message)])))
+                         lines errs)
+                 lines)
+             1))
+
+;; The lines of the sections of module s of a program that passed, as asked.
+(defun module-lines (acc: (Vec str) c: Checked s: sec/Shown oo: OwnOptions) -> (Vec str)
+  (let ((p (. c typed)) (o (. c owned)) (g (. (. c typed) globals)) (m (. s id))
+        (a0 (conj acc (str-join ["-- module " (. s ns) " " (. s file)])))
+        (a1 (if (own-wants oo OsBody) (bodies-section a0 p o m) a0))
+        (a2 (if (own-wants oo OsFacts) (facts-section a1 g o m) a1))
+        (a3 (if (own-wants oo OsSummary) (summary-section a2 p o m) a2))
+        (a4 (if (own-wants oo OsTaken) (taken-section a3 g o m) a3)))
+    (if (own-wants oo OsExplain) (into a4 (explain-lines p o m)) a4)))
+
+;; Checks the expanded modules against the prelude through the ownership pass and prints the
+;; sections of the modules of layout, or the errors of the first failing step.
+(defun own-check (oo: OwnOptions lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx)
+                  layout: (Vec sec/Shown) home: str opts: ta/Options) -> td/Dumped
+  (let ((show (own-wants oo OsError)))
+    (match (tdr/lower-modules modules prelude)
+      ((Err errs) (td/error-dump lines errs home show))
+      ((Ok l)
+       (match (own-check-lowered l (not (. opts library)))
+         ((Err (CeType errs)) (td/error-dump lines errs home show))
+         ((Err (CeOwn errs)) (own-error-dump lines errs home show))
+         ((Err e) (td/Dumped (conj lines (check-error-text e)) 1))
+         ((Ok c) (td/Dumped (reduce (fn (acc: (Vec str) s: sec/Shown) (module-lines acc c s oo)) lines layout)
+                            0)))))))
+
+;; What `fibref own` prints for one file: the line `== FILE`, then its dump or the line `unreadable`.
+(defun own-file (file: str oo: OwnOptions) -> td/Dumped
+  (td/dump-file file (base-options oo)
+                (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) layout: (Vec sec/Shown)
+                     home: str opts: ta/Options)
+                  (own-check oo lines modules prelude layout home opts))))

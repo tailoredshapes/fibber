@@ -1,0 +1,63 @@
+;; compiler/own/driver.fib: the front end through the ownership pass, as the pipeline of
+;; crates/fibref/src/own/mod.rs (118 lines of Rust): read, expand, lower (types §3.5 steps 1-3), then
+;; the syntactic `&` checks of §6.5 and §6.9 (still step 3, before any type error), then inference
+;; (steps 4-7), then the ownership pass (`analyse`, step 5f for every unit in checking order).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the functions carry the prefix `own-` (the types port has `check-modules`, `check-source`, ..
+;;   in types.driver, which a tool uses with this module).
+;; - `check_here` is `own-check-lowered`: it takes the lowered program, so that a tool that has made
+;;   the modules itself (own.dump) runs the same steps; `own-check-modules` and `own-check-forms` lower first.
+;; - `check_source_in` (with the roots of the command line) is not ported: `own-check-source` is as
+;;   types.driver's `check-source`, reading, expanding and checking one module with the prelude.
+;; - the `thread::scope` with `CHECK_STACK` is not ported (see types.driver): the compiled program
+;;   runs on the stack the process has, and a trap is not a caught panic (`CeInternal` is not made).
+(ns own.driver
+  (:require [syntax.reader :as reader] [expand.program :as prog] [expand.error :as ee])
+  (:use syntax.pos syntax.form syntax.error expand.ctx expand.types expand.error
+        types.error types.program types.driver own.error own.program own.syntactic own.top))
+
+;; A program that passed the whole front end: its types (§3) and its ownership decisions (§6).
+(defstruct Checked (typed: TypedProgram owned: OwnedProgram))
+
+;; Rust `check_here`'s second half: the `&` checks of the lowered program, inference (with `main`
+;; required if main is true), then the ownership pass.
+(defun own-check-lowered (l: Lowered main: bool) -> (Result Checked CheckError)
+  (let ((amp (syntactic-check (. l globals))))
+    (if (not (empty? amp))
+        (Err (CeOwn amp))
+        (match (infer-lowered l main)
+          ((Err errs) (Err (CeType errs)))
+          ((Ok typed)
+           (match (analyse typed)
+             ((Err errs) (Err (CeOwn errs)))
+             ((Ok owned) (Ok (Checked typed owned)))))))))
+
+;; Checks a program of several modules, expanded, in dependency order with the main module last:
+;; lowering, the `&` checks, inference, the ownership pass (`check_modules`).
+(defun own-check-modules (modules: (Vec Expanded) prelude: (Vec Stx)) -> (Result Checked CheckError)
+  (match (lower-modules modules prelude)
+    ((Err errs) (Err (CeType errs)))
+    ((Ok l) (own-check-lowered l true))))
+
+;; Checks a module's forms after expansion against the prelude's (`check_forms`).
+(defun own-check-forms (forms: (Vec Stx) prelude: (Vec Stx)) -> (Result Checked CheckError)
+  (own-check-modules [(Expanded (module-spec-main) forms)] prelude))
+
+;; The text of a read error: `FILE:L:C: MESSAGE`.
+(defun read-error-text :private (e: ReadError) -> str
+  (str-join [(ee/pos-display (. e pos)) ": " (err-message (. e kind))]))
+
+;; Reads, expands, types and checks the ownership of `source` (the file `file`) as the user
+;; module, with the prelude: the whole front end, for tests and tools (`check_source`).
+(defun own-check-source (source: str file: str) -> (Result Checked CheckError)
+  (let ((ctx (ctx-new)))
+    (match (prelude-forms ctx)
+      ((Err m) (Err (CePrelude m)))
+      ((Ok prelude)
+       (match (reader/read-all source file)
+         ((Err e) (Err (CeRead (read-error-text e))))
+         ((Ok forms)
+          (match (prog/expand-program forms ctx (no-runner))
+            ((Err e) (Err (CeExpand (expand-error-text e))))
+            ((Ok expanded) (own-check-modules [(Expanded (module-spec-main) expanded)] prelude)))))))))

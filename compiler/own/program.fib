@@ -1,0 +1,219 @@
+;; compiler/own/program.fib: the output of the ownership checker, `OwnedProgram`: what the
+;; emitter (and the reference interpreter) executes against (spec/types.md §6, §8.9, §8.10, §9),
+;; as crates/fibref/src/own/program.rs (504 lines of Rust, 330 of them the module's long
+;; description of how to read it, which is there and not repeated here).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - ids (ExprId, BindingId, FunId, DefId, ProtoId, BuiltinId) are i64, as in types.ast.
+;; - a variant's name is global, so each enum has a prefix: BodyKey `Body`, Site `Site`, Mode
+;;   `M`, OpKind `Op`, Why `Why`, Pass `Ps`, Because `Bc`, Tail `Tl`, Callee `Cal`, BindKind
+;;   `Bn`, OwnedWhy `Ow`, ParamKind `Pk`, Alloc `Al`. The Rust names follow the prefix.
+;; - `BTreeMap`/`HashMap`/`BTreeSet`/`HashSet` are `Map`/`Set`: nothing reads them in hash order
+;;   (the dump sorts by id, and `OwnedProgram.order` is a Vec); `Default` is `body-own-new`,
+;;   `owned-program-new` and `facts-empty`.
+;; - `Escaping` is `(Option str)`; `(usize, usize)` and `(BindingId, BindingId)` are `Pair`s.
+;; - `Facts` (facts.rs:20) is data here and not in own.facts, which holds the functions on it: a
+;;   unit's facts are part of the result (`OwnedProgram.unit-facts`, new: Rust drops them after
+;;   the unit's summary is made, `fibref own --sections facts` has to read them from somewhere).
+;; - the `Walker` of the walk is a value with Cells (own.walk.state); `BodyOwn` here is a plain
+;;   value of Maps, which the walk builds by replacing its Cell's content.
+(ns own.program
+  (:use types.ast types.infer.mod))
+
+;; Which body a record belongs to: a `defun` with its inferred kinds, the all-owned body of a
+;; function whose value is taken (§8.4), method `method` of instance `instance`, the all-owned
+;; body of that method's implementation, a `def` initialiser (no parameters, no tail calls).
+(defenum BodyKey
+  (BodyFun fun: i64)
+  (BodyAllOwned fun: i64)
+  (BodyMethod instance: i64 method: i64)
+  (BodyMethodOwned instance: i64 method: i64)
+  (BodyDef def: i64))
+(derive Eq BodyKey) (derive Ord BodyKey) (derive Hash BodyKey)
+
+;; What holds, or is named by, a count: a binding; the value an expression produced last in this
+;; activation (an implicit temporary); inside the body of the heap closure or task `lit` its
+;; capture of `b`; inside the body of `fn` literal `lit` the closure object; a `def` (immortal).
+(defenum Site
+  (SiteBind binding: i64)
+  (SiteValue expr: i64)
+  (SiteCapture lit: i64 binding: i64)
+  (SiteEnv lit: i64)
+  (SiteGlobal def: i64))
+(derive Eq Site) (derive Ord Site) (derive Hash Site)
+
+;; The mode of an expression (§6.1): no object; carrying a count of its own (`immortal`: a
+;; literal, a `Form` literal or a named function's closure); the value of the site; a strict
+;; part of the site's value.
+(defenum Mode
+  MScalar
+  (MOwned immortal: bool)
+  (MBorrowed site: Site)
+  (MDerived site: Site))
+(derive Eq Mode) (derive Hash Mode)
+
+;; A count operation: `fib.retain`, `fib.release`, the end of a scope-local object's scope.
+(defenum OpKind OpRetain OpRelease OpEndStack)
+(derive Eq OpKind)
+
+;; Why an operation is there (for `explain` and tests).
+(defenum Why
+  WhyReturn WhyStore WhyJoin WhyScopeExit WhyStepEnd WhyDerivedExit WhyDiscard WhyParamExit
+  WhyLoopInit WhyJump WhyRecurOld)
+(derive Eq Why)
+
+;; One operation of `ExprOwn.after`, `CallOwn.jump` or `RecurOwn.jump`.
+(defstruct Op (kind: OpKind site: Site why: Why))
+(derive Eq Op)
+
+;; How an argument (a callee value, a capture) is handed over.
+(defenum Pass PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv)
+(derive Eq Pass)
+
+;; Why a call in tail position is an ordinary call (§6.10).
+(defenum Because
+  BcAmpArgument
+  (BcAmpCaptured param: i64)
+  (BcFrameOwned arg: i64)
+  BcAsyncBody
+  BcExtern
+  BcStore)
+(derive Eq Because)
+
+;; Whether a call is a tail call: not in tail position; a tail call (§6.10); in tail position,
+;; ordinary for the reason given.
+(defenum Tail
+  TlNotInTail
+  TlTailCall
+  (TlOrdinary because: Because))
+(derive Eq Tail)
+
+;; What a call calls: a `defun`, the all-owned body of one, a protocol method (`proto`, index),
+;; a builtin (its id), a constructor, an `extern`, a closure value (every position owned).
+(defenum Callee
+  (CalFun fun: i64)
+  (CalAllOwned fun: i64)
+  (CalMethod proto: i64 index: i64)
+  (CalBuiltin id: i64)
+  CalCtor
+  CalExtern
+  CalValue)
+(derive Eq Callee)
+
+;; One call: what it calls, tail or not, how its head and arguments are handed over, the
+;; write-backs after an ordinary call (argument index, variable), and for a tail call the
+;; releases before the jump.
+(defstruct CallOwn
+  (callee: Callee tail: Tail head: Pass args: (Vec Pass)
+   write-backs: (Vec (Pair i64 i64)) jump: (Vec Op)))
+(derive Eq CallOwn)
+
+;; One `recur`: how each argument is consumed into its loop variable, and the releases before the jump.
+(defstruct RecurOwn (args: (Vec Pass) jump: (Vec Op)))
+(derive Eq RecurOwn)
+
+;; Per expression: its mode (§6.2, after its own scope exits) and the operations to run right
+;; after it has been evaluated.
+(defstruct ExprOwn (mode: Mode after: (Vec Op)))
+(derive Eq ExprOwn)
+
+;; What kind of binding (§6.1): a scalar, an owning binding, an alias of the site, a part of the
+;; site's value, a borrowed parameter, an owned parameter, an `&` parameter (a private cell).
+(defenum BindKind
+  BnScalar BnOwns (BnAliasOf site: Site) (BnDerivedOf site: Site)
+  BnBorrowedParam BnOwnedParam BnAmpParam)
+(derive Eq BindKind)
+
+;; Per binding: its kind, and whether it is scope-local (§6.11: its object is on the stack).
+(defstruct BindingOwn (kind: BindKind scope-local: bool))
+(derive Eq BindingOwn)
+
+;; Why a parameter is owned (§6.4): rule 1 with what the position was (`returned`, `stored`,
+;; ..), rule 2 (an argument of a tail site at an owned position), rule 3 (a tail call from the
+;; SCC passes a frame-owned argument), rule 1 through a loop variable, or declared (a closure
+;; parameter, an `:owned` method parameter, a parameter of an all-owned body).
+(defenum OwnedWhy
+  (OwRule1 what: str) (OwRule2 what: str) (OwRule3 what: str) (OwLoop what: str) OwDeclared)
+(derive Eq OwnedWhy) (derive Ord OwnedWhy) (derive Hash OwnedWhy)
+
+;; A parameter's count kind: no object, an `&` parameter, borrowed, or owned with every reason found.
+(defenum ParamKind PkScalar PkAmp PkBorrowed (PkOwned whys: (Vec OwnedWhy)))
+(derive Eq ParamKind)
+
+;; Per parameter of a body or closure: its binding, count kind, escape summary (a declared
+;; `:borrow` is false) and whether `:borrow` was written.
+(defstruct ParamOwn (binding: i64 kind: ParamKind escapes: bool declared-borrow: bool))
+(derive Eq ParamOwn)
+
+;; One capture of a closure or task: the captured binding of the enclosing scope and how
+;; (`PsRetain` into a heap object, `PsAlias` for a stack closure, `PsOwnCell` for an `&`
+;; parameter, `PsScalar`).
+(defstruct CaptureOwn (binding: i64 pass: Pass))
+(derive Eq CaptureOwn)
+
+;; A `fn` or `async` literal: `is-async` (always escaping and on the heap), `escaping` is
+;; `Some(reason)` iff escaping (§6.5 use (d)), `heap` `Some(reason)` iff on the heap, its
+;; captures in capture-set order, its parameters (every object parameter owned).
+(defstruct ClosureOwn
+  (is-async: bool escaping: (Option str) heap: (Option str)
+   captures: (Vec CaptureOwn) params: (Vec ParamOwn)))
+(derive Eq ClosureOwn)
+
+;; Where an allocation site's object lives: counted on the heap; scope-local (count 0, ended at
+;; its scope's exit); nothing (`some`/`nil` of a non-`Option` object type, §8.1).
+(defenum Alloc AlHeap AlStack AlNothing)
+(derive Eq Alloc)
+
+;; Everything the pass decided for one body.
+;; - params: the parameters (none for a `def`); exprs: every expression walked, including those of
+;;   nested literals; bindings: every binding bound in the body or its literals; calls, recurs,
+;;   closures, allocs: by the expression; stack-temps: scope-local implicit temporaries by the
+;;   initialising expression; guard-fail: per guard of a `match` clause the operations of its
+;;   false edge.
+(defstruct BodyOwn
+  (params: (Vec ParamOwn) exprs: (Map i64 ExprOwn) bindings: (Map i64 BindingOwn)
+   calls: (Map i64 CallOwn) recurs: (Map i64 RecurOwn) closures: (Map i64 ClosureOwn)
+   allocs: (Map i64 Alloc) stack-temps: (Set i64) guard-fail: (Map i64 (Vec Op))))
+(derive Eq BodyOwn)
+
+;; Rust `BodyOwn::default()`.
+(defun body-own-new () -> BodyOwn
+  (BodyOwn [] (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (set-empty)
+           (map-empty)))
+
+;; A `defun`'s interface for its callers: per parameter `(owned, escapes)`; `&` and scalar
+;; parameters are `(false, false)`.
+(defstruct Summary (params: (Vec (Pair bool bool))))
+(derive Eq Summary)
+
+;; The facts of one unit's fixpoint (facts.rs:20; §6.4, §6.5): which inferred parameters are
+;; owned and why, which parameters and loop variables escape, which closure literals are
+;; escaping and which on the heap; `edges`, `inferred` and `members` are what `propagate` reads.
+(defstruct Facts
+  (owned: (Map i64 (Set OwnedWhy)) escapes: (Map i64 str) loop-rule1: (Set i64)
+   escaping: (Map i64 str) heap: (Map i64 str)
+   edges: (Set (Pair i64 i64)) inferred: (Set i64) members: (Map i64 (Vec i64))))
+(derive Eq Facts)
+
+;; Rust `Facts::default()`.
+(defun facts-empty () -> Facts
+  (Facts (map-empty) (map-empty) (set-empty) (map-empty) (map-empty) (set-empty) (set-empty) (map-empty)))
+
+;; The facts a unit ended with (new: see the header).
+(defstruct UnitFacts (unit: UnitRef facts: Facts))
+
+;; A checked program's ownership decisions: every body; the bodies in the order they were
+;; decided (the units' order); every `defun`'s summary; the functions whose value is taken (they
+;; have an all-owned body); the method implementations `(instance, method)` that a method value
+;; may run (they have a `BodyMethodOwned` body); the facts of each unit, in the same order.
+(defstruct OwnedProgram
+  (bodies: (Map BodyKey BodyOwn) order: (Vec BodyKey) summaries: (Map i64 Summary)
+   value-taken: (Set i64) methods-taken: (Set (Pair i64 i64)) unit-facts: (Vec UnitFacts)))
+
+;; Rust `OwnedProgram::default()`.
+(defun owned-program-new () -> OwnedProgram
+  (OwnedProgram (map-empty) [] (map-empty) (set-empty) (set-empty) []))
+
+;; The body of the `defun` f (`OwnedProgram::fun`).
+(defun owned-fun (o: OwnedProgram f: i64) -> (Option BodyOwn)
+  (get (. o bodies) (BodyFun f)))

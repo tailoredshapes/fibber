@@ -12,6 +12,10 @@
 ;;   `types-file` is one iteration, giving the lines of the file's section (the
 ;;   header first, a line that holds a line break being one element) and the
 ;;   status it adds (0 typed, 1 an error record, 2 unreadable).
+;; - the check of an expanded program is a parameter of `dump-file` (a function from the
+;;   expanded modules to what is printed: the type checker's `check-and-dump`, or the
+;;   ownership pass's of own.dump), so that the file loop, the read, load and expand
+;;   records are written once; `types-file` is `dump-file` with the type checker's.
 ;; - the `builtins` table `--tables` prints once before the first file: `header-lines`
 ;;   gives it, and the tool (compiler/types.fib) prints it before the loop over the files.
 ;; - the record functions of expand.dump are private there, so the three that
@@ -55,10 +59,10 @@
   (Dumped (conj lines text) 1))
 
 ;; The `error` records of a failed step, in order, their positions relative to
-;; the main file `home` (`error_dump`); nothing prints when `--sections` leaves
-;; `error` out, and the status is 1 all the same.
-(defun error-dump :private (lines: (Vec str) errs: (Vec TypeError) home: str opts: Options) -> Dumped
-  (Dumped (if (wants opts SecError)
+;; the main file `home` (`error_dump`); nothing prints when `show` is false (`--sections`
+;; leaves `error` out), and the status is 1 all the same.
+(defun error-dump (lines: (Vec str) errs: (Vec TypeError) home: str show: bool) -> Dumped
+  (Dumped (if show
               (reduce (fn (acc: (Vec str) e: TypeError)
                         (push acc (str-join ["error " (error-kind-name (. e kind)) " "
                                              (sdump/span-in (. e pos) home) ": " (. e message)])))
@@ -76,12 +80,12 @@
 (defun check-and-dump :private (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx)
                                 layout: (Vec Shown) home: str opts: Options) -> Dumped
   (match (driver/lower-modules modules prelude)
-    ((Err errs) (error-dump lines errs home opts))
+    ((Err errs) (error-dump lines errs home (wants opts SecError)))
     ((Ok l)
      (if (= (. opts stage) StLower)
          (Dumped (sections-text lines (View (. l globals) nil) layout opts) 0)
          (match (driver/infer-lowered l (not (. opts library)))
-           ((Err errs) (error-dump lines errs home opts))
+           ((Err errs) (error-dump lines errs home (wants opts SecError)))
            ((Ok t) (Dumped (sections-text lines (View (. t globals) (some t)) layout opts) 0)))))))
 
 ;; ---- a program
@@ -120,7 +124,9 @@
 
 ;; The dump of the program whose main module is source (the file `file`)
 ;; (`dump_program`).
-(defun dump-program :private (lines: (Vec str) source: str file: str opts: Options) -> Dumped
+(defun dump-program :private (lines: (Vec str) source: str file: str opts: Options
+                              check: (fn ((Vec str) (Vec Expanded) (Vec Stx) (Vec Shown) str Options) Dumped) :borrow)
+    -> Dumped
   (let ((ctx (ctx-new)))
     (match (driver/prelude-forms ctx)
       ((Err m) (failed lines (record "Prelude" no-position m)))
@@ -131,14 +137,16 @@
           (match (expand-modules lines ctx loaded)
             ((Err d) d)
             ((Ok modules)
-             (check-and-dump lines modules prelude (layout-of loaded opts) file opts)))))))))
+             (check lines modules prelude (layout-of loaded opts) file opts)))))))))
 
 ;; ---- a library prelude
 
 ;; The dump of source (the file `file`) as a library prelude: the expander's own
 ;; prelude, then the forms of the file, expanded with no runner in the module
 ;; `fib.prelude`, which is then checked alone (no `main`) (`dump_prelude`).
-(defun dump-prelude :private (lines: (Vec str) source: str file: str opts: Options) -> Dumped
+(defun dump-prelude :private (lines: (Vec str) source: str file: str opts: Options
+                              check: (fn ((Vec str) (Vec Expanded) (Vec Stx) (Vec Shown) str Options) Dumped) :borrow)
+    -> Dumped
   (match (reader/read-all source file)
     ((Err e) (failed lines (read-record e file)))
     ((Ok lib)
@@ -150,21 +158,29 @@
           (match (prog/expand-program lib ctx (no-runner))
             ((Err e) (failed head (expand-record e file)))
             ((Ok forms)
-             (check-and-dump lines [] (into own forms) [(Shown module-prelude prelude-ns file)] file
+             (check lines [] (into own forms) [(Shown module-prelude prelude-ns file)] file
                              (Options (. opts stage) (. opts sections) true (. opts implicit)
                                       (. opts implicit-lib) (. opts prelude) (. opts ast)
                                       (. opts tables)))))))))))
 
-;; What `fibref types` prints for one file: the line `== FILE`, then its dump or
-;; the line `unreadable` (the body of `types_here`'s loop).
-(defun types-file (file: str opts: Options) -> Dumped
+;; What a tool prints for one file: the line `== FILE`, then its dump or the line `unreadable`
+;; (the body of `types_here`'s loop), the check of an expanded program being `check`: the
+;; lines so far, the expanded modules, the prelude's forms, the layout, the main file and the
+;; options in, what the file prints out.
+(defun dump-file (file: str opts: Options
+                  check: (fn ((Vec str) (Vec Expanded) (Vec Stx) (Vec Shown) str Options) Dumped) :borrow)
+    -> Dumped
   (let ((header [(str-concat "== " file)]))
     (match (read-file file)
       (nil (Dumped (conj header "unreadable") 2))
       ((some source)
        (if (. opts prelude)
-           (dump-prelude header source file opts)
-           (dump-program header source file opts))))))
+           (dump-prelude header source file opts check)
+           (dump-program header source file opts check))))))
+
+;; What `fibref types` prints for one file: `dump-file` with the type checker's check.
+(defun types-file (file: str opts: Options) -> Dumped
+  (dump-file file opts check-and-dump))
 
 ;; What the tool prints before its first file: the `builtins` table when the `tables` section is
 ;; asked for (`types_here`).

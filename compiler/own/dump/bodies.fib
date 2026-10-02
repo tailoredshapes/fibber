@@ -1,0 +1,95 @@
+;; compiler/own/dump/bodies.fib: the `body` section of the ownership dump (plan 1.2): for each
+;; body of a module, in the order they were decided, the header and the records of its tables, each
+;; kind sorted by id (nothing is printed in hash order). Package O1; provisional with the words of
+;; own.dump.text.
+;;
+;;   body Fun NAME | AllOwned NAME | Method I.M | MethodOwned I.M | Def NAME
+;;     param B NAME KIND escapes=0|1 declared-borrow=0|1
+;;     expr E MODE [after OP; OP..]
+;;     binding B KIND scope-local=0|1
+;;     call E CALLEE TAIL head=PASS args=PASS,.. write-backs=I:B,.. jump=OP; OP..
+;;     recur E args=PASS,.. jump=OP; OP..
+;;     closure E async=0|1 escaping=REASON|no heap=REASON|no captures=B:PASS,.. params=B:KIND,..
+;;     alloc E heap|stack|nothing
+;;     stack-temp E
+;;     guard-fail E OP; OP..
+(ns own.dump.bodies
+  (:use fib.string types.table types.ast types.decls types.program own.program own.dump.text))
+
+;; The module a body belongs to.
+(defun body-module (g: Globals k: BodyKey) -> i64
+  (match k
+    ((BodyFun f) (. (g-fun g f) module))
+    ((BodyAllOwned f) (. (g-fun g f) module))
+    ((BodyMethod i _) (. (table-get (. g instances) i) module))
+    ((BodyMethodOwned i _) (. (table-get (. g instances) i) module))
+    ((BodyDef d) (. (g-def g d) module))))
+
+;; `body Fun NAME | AllOwned NAME | Method I.M | MethodOwned I.M | Def NAME`.
+(defun body-head (g: Globals k: BodyKey) -> str
+  (match k
+    ((BodyFun f) (str-concat "body Fun " (. (g-fun g f) name)))
+    ((BodyAllOwned f) (str-concat "body AllOwned " (. (g-fun g f) name)))
+    ((BodyMethod i m) (str-join ["body Method " (show i) "." (show m)]))
+    ((BodyMethodOwned i m) (str-join ["body MethodOwned " (show i) "." (show m)]))
+    ((BodyDef d) (str-concat "body Def " (. (g-def g d) name)))))
+
+(defun param-line (g: Globals pa: ParamOwn) -> str
+  (str-join ["  param " (show (. pa binding)) " " (. (g-binding g (. pa binding)) name) " "
+             (param-kind-text (. pa kind)) " escapes=" (flag-text (. pa escapes))
+             " declared-borrow=" (flag-text (. pa declared-borrow))]))
+
+(defun expr-line (e: i64 x: ExprOwn) -> str
+  (str-join ["  expr " (show e) " " (mode-text (. x mode))
+             (if (empty? (. x after)) "" (str-concat " after " (ops-text (. x after))))]))
+
+(defun binding-line (b: i64 x: BindingOwn) -> str
+  (str-join ["  binding " (show b) " " (bind-kind-text (. x kind)) " scope-local=" (flag-text (. x scope-local))]))
+
+;; `I:B,..`: the write-backs, argument index and variable.
+(defun write-backs-text (ws: (Vec (Pair i64 i64))) -> str
+  (join "," (mapv (fn ([i b]) (str-join [(show i) ":" (show b)])) ws)))
+
+(defun call-line (p: TypedProgram e: i64 c: CallOwn) -> str
+  (str-join ["  call " (show e) " " (callee-text p (. c callee)) " " (tail-text (. c tail))
+             " head=" (pass-text (. c head)) " args=" (passes-text (. c args))
+             " write-backs=" (write-backs-text (. c write-backs)) " jump=" (ops-text (. c jump))]))
+
+(defun recur-line (e: i64 r: RecurOwn) -> str
+  (str-join ["  recur " (show e) " args=" (passes-text (. r args)) " jump=" (ops-text (. r jump))]))
+
+(defun closure-line (e: i64 c: ClosureOwn) -> str
+  (str-join ["  closure " (show e) " async=" (flag-text (. c is-async)) " escaping=" (reason-text (. c escaping))
+             " heap=" (reason-text (. c heap)) " captures="
+             (join "," (mapv (fn (x: CaptureOwn) (str-join [(show (. x binding)) ":" (pass-text (. x pass))]))
+                             (. c captures)))
+             " params="
+             (join "," (mapv (fn (x: ParamOwn) (str-join [(show (. x binding)) ":" (param-kind-text (. x kind))]))
+                             (. c params)))]))
+
+;; The lines of a table `m`, one `line` per key, the keys in order.
+(defun table-lines (acc: (Vec str) m: (Map i64 v) line: (fn (i64 v) str) :borrow) -> (Vec str)
+  (reduce (fn (a: (Vec str) k: i64) (conj a (line k (unwrap (get m k)))))
+          acc (sort (vec (keys m)))))
+
+;; The header and the records of one body.
+(defun body-lines (acc: (Vec str) p: TypedProgram k: BodyKey b: BodyOwn) -> (Vec str)
+  (let ((g (. p globals))
+        (a0 (conj acc (body-head g k)))
+        (a1 (reduce (fn (a: (Vec str) x: ParamOwn) (conj a (param-line g x))) a0 (. b params)))
+        (a2 (table-lines a1 (. b exprs) expr-line))
+        (a3 (table-lines a2 (. b bindings) binding-line))
+        (a4 (table-lines a3 (. b calls) (fn (e: i64 c: CallOwn) (call-line p e c))))
+        (a5 (table-lines a4 (. b recurs) recur-line))
+        (a6 (table-lines a5 (. b closures) closure-line))
+        (a7 (table-lines a6 (. b allocs) (fn (e: i64 x: Alloc) (str-join ["  alloc " (show e) " " (alloc-text x)]))))
+        (a8 (reduce (fn (a: (Vec str) e: i64) (conj a (str-concat "  stack-temp " (show e))))
+                    a7 (sort (vec (. b stack-temps))))))
+    (table-lines a8 (. b guard-fail)
+                 (fn (e: i64 ops: (Vec Op)) (str-join ["  guard-fail " (show e) " " (ops-text ops)])))))
+
+;; The bodies of module m that the pass decided, in the order it decided them.
+(defun bodies-section (acc: (Vec str) p: TypedProgram o: OwnedProgram m: i64) -> (Vec str)
+  (reduce (fn (a: (Vec str) k: BodyKey)
+            (if (= (body-module (. p globals) k) m) (body-lines a p k (unwrap (get (. o bodies) k))) a))
+          acc (. o order)))

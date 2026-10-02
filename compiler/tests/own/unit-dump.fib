@@ -1,0 +1,170 @@
+;; compiler/tests/own/unit-dump.fib: the printers of the ownership dump (own.dump.text,
+;; own.dump.bodies, own.dump.units, own.dump) over tables and an `OwnedProgram` built by hand,
+;; and the words of own.args. The words of the dump are provisional (package O1: the oracle's
+;; spec will fix them); the checks hold the shape: each variant has its word, a body prints its
+;; header and then its records kind by kind with the keys sorted, a section the options leave out
+;; is not printed, and a module sees only its own bodies, units and functions. Prints `ok NAME`
+;; or `FAIL NAME`.
+;; Build: fibc build compiler/tests/own/unit-dump.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [own.args :as a] [own.dump :as d] [own.dump.text :as t] [own.dump.bodies :as b]
+            [own.dump.units :as u] [types.dump.sections :as s] [types.args :as ta])
+  (:use syntax.pos types.ty types.table types.ast types.decls types.builtins types.program
+        types.infer.mod types.check own.error own.program own.driver))
+
+(def pos: Pos (Pos "t.fib" 3 5 10 20))
+
+(defun word-checks (cs: Checks p: TypedProgram) -> unit
+  (do (check cs "sites" (= (mapv t/site-text [(SiteBind 3) (SiteValue 4) (SiteCapture 5 6) (SiteEnv 7) (SiteGlobal 8)])
+                           ["b:3" "v:4" "cap:5:6" "env:7" "def:8"]))
+      (check cs "modes" (= (mapv t/mode-text [MScalar (MOwned false) (MOwned true) (MBorrowed (SiteBind 1)) (MDerived (SiteValue 2))])
+                           ["scalar" "owned" "owned!" "borrowed b:1" "derived v:2"]))
+      (check cs "an operation is kind, site, why"
+             (= (t/ops-text [(Op OpRetain (SiteBind 1) WhyJoin) (Op OpRelease (SiteValue 2) WhyScopeExit)
+                             (Op OpEndStack (SiteEnv 3) WhyJump)])
+                "retain b:1 join; release v:2 scope-exit; end-stack env:3 jump"))
+      (check cs "passes" (= (t/passes-text [PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv])
+                            "scalar,borrow,move,retain,acquire,forward,own-cell,alias,keep-env"))
+      (check cs "tails" (= (mapv t/tail-text [TlNotInTail TlTailCall (TlOrdinary BcAmpArgument) (TlOrdinary (BcAmpCaptured 4))
+                                              (TlOrdinary (BcFrameOwned 2)) (TlOrdinary BcAsyncBody)])
+                           ["not-in-tail" "tail-call" "ordinary:amp-argument" "ordinary:amp-captured:4"
+                            "ordinary:frame-owned:2" "ordinary:async-body"]))
+      (check cs "callees, a builtin by its name"
+             (= (mapv (fn (c: Callee) (t/callee-text p c))
+                      [(CalFun 1) (CalAllOwned 2) (CalMethod 3 4) (CalBuiltin 0) CalCtor CalExtern CalValue])
+                ["fun:1" "all-owned:2" "method:3.4" "builtin:cell" "ctor" "extern" "value"]))
+      (check cs "parameter kinds, the reasons in order"
+             (= (mapv t/param-kind-text [PkScalar PkAmp PkBorrowed (PkOwned [(OwRule1 "returned") OwDeclared (OwLoop "x")])])
+                ["scalar" "amp" "borrowed" "owned:rule1(returned):declared:loop(x)"]))
+      (check cs "binding kinds"
+             (= (mapv t/bind-kind-text [BnScalar BnOwns (BnAliasOf (SiteBind 1)) (BnDerivedOf (SiteValue 2)) BnBorrowedParam BnOwnedParam BnAmpParam])
+                ["scalar" "owns" "alias b:1" "derived v:2" "borrowed-param" "owned-param" "amp-param"]))))
+
+;; the tables: modules 0 and 1 are the builtins and the prelude, 2 is `main`, 3 is `other`
+(defun tables () -> Globals
+  (let ((g (globals-new)))
+    (do (g-add-module g "the builtins" (Links [] [] []) (map-empty))
+        (g-add-module g "fib.prelude" (Links [] [] []) (map-empty))
+        (g-add-module g "main" (Links [] [] []) (map-empty))
+        (g-add-module g "other" (Links [] [] []) (map-empty))
+        (table-add (. g bindings) (BindingInfo "x" BkParam pos nil))
+        (table-add (. g bindings) (BindingInfo "y" BkParam pos nil))
+        (table-add (. g funs) (FunDef "f" 2 [(ParamDecl 0 "x" false nil false) (ParamDecl 1 "y" false nil false)]
+                                      nil [] (Expr 1 pos (ELocal 0)) false pos))
+        (table-add (. g funs) (FunDef "g" 3 [] nil [] (Expr 2 pos (ELocal 0)) false pos))
+        (table-add (. g defs) (DefDef "k" 2 nil (Expr 3 pos (ELocal 0)) pos))
+        (table-add (. g instances) (InstanceDef 0 KStr 2 [] (ty-str) [] []
+                                                [(ImplMethod 0 [] nil (Expr 4 pos (ELocal 0)) pos) (ImplMethod 0 [] nil (Expr 5 pos (ELocal 0)) pos)]
+                                                pos))
+        g)))
+
+(defun body () -> BodyOwn
+  (BodyOwn [(ParamOwn 0 (PkOwned [(OwRule1 "returned")]) true false) (ParamOwn 1 PkScalar false true)]
+           (assoc (assoc (map-empty) 9 (ExprOwn MScalar [])) 2 (ExprOwn (MBorrowed (SiteBind 0)) [(Op OpRetain (SiteBind 0) WhyReturn)]))
+           (assoc (map-empty) 0 (BindingOwn BnOwnedParam true))
+           (assoc (map-empty) 5 (CallOwn (CalBuiltin 0) TlNotInTail PsScalar [PsMove PsBorrow] [(Pair 1 0)] []))
+           (assoc (map-empty) 6 (RecurOwn [PsRetain] [(Op OpRelease (SiteBind 1) WhyRecurOld)]))
+           (assoc (map-empty) 7 (ClosureOwn false (some "returned") nil [(CaptureOwn 0 PsAlias)] [(ParamOwn 1 PkBorrowed false false)]))
+           (assoc (assoc (map-empty) 8 AlStack) 4 AlHeap)
+           (conj (conj (set-empty) 12) 11)
+           (assoc (map-empty) 3 [(Op OpRelease (SiteValue 3) WhyStepEnd)])))
+
+(def body-expected: (Vec str)
+  ["body Fun f"
+   "  param 0 x owned:rule1(returned) escapes=1 declared-borrow=0"
+   "  param 1 y scalar escapes=0 declared-borrow=1"
+   "  expr 2 borrowed b:0 after retain b:0 return"
+   "  expr 9 scalar"
+   "  binding 0 owned-param scope-local=1"
+   "  call 5 builtin:cell not-in-tail head=scalar args=move,borrow write-backs=1:0 jump="
+   "  recur 6 args=retain jump=release b:1 recur-old"
+   "  closure 7 async=0 escaping=returned heap=no captures=0:alias params=1:borrowed"
+   "  alloc 4 heap"
+   "  alloc 8 stack"
+   "  stack-temp 11"
+   "  stack-temp 12"
+   "  guard-fail 3 release v:3 step-end"])
+
+(defun program-of (g: Globals units: (Vec UnitRef)) -> TypedProgram
+  (TypedProgram g (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (builtin-table) units))
+
+(defun owned-of () -> OwnedProgram
+  (OwnedProgram (assoc (assoc (map-empty) (BodyFun 0) (body)) (BodyFun 1) (body-own-new))
+                [(BodyFun 0) (BodyFun 1)]
+                (assoc (assoc (map-empty) 0 (Summary [(Pair true true) (Pair false false)])) 1 (Summary []))
+                (conj (conj (set-empty) 1) 0)
+                (conj (set-empty) (Pair 0 1))
+                [(UnitFacts (UScc [0])
+                            (Facts (assoc (map-empty) 0 (conj (conj (set-empty) OwDeclared) (OwRule1 "returned")))
+                                   (assoc (map-empty) 1 "stored") (conj (set-empty) 1)
+                                   (assoc (map-empty) 7 "returned") (assoc (map-empty) 7 "arg-of-recur")
+                                   (set-empty) (set-empty) (map-empty)))]))
+
+(defun section-checks (cs: Checks p: TypedProgram o: OwnedProgram) -> unit
+  (let ((g (. p globals)))
+    (do (check cs "a body: its header, then its records kind by kind, each sorted"
+               (= (b/body-lines [] p (BodyFun 0) (body)) body-expected))
+        (check cs "bodies of a module: its own only, in the order decided"
+               (= (b/bodies-section [] p o 2) (b/body-lines [] p (BodyFun 0) (body)))
+               )
+        (check cs "an empty body is its header" (= (b/bodies-section [] p o 3) ["body Fun g"]))
+        (check cs "the facts of a unit of the module"
+               (= (u/facts-section [] g o 2)
+                  ["unit-facts scc f" "    owned 0 rule1(returned),declared" "    loop-rule1 1" "    escapes 1 stored"
+                   "    escaping 7 returned" "    heap 7 arg-of-recur"]))
+        (check cs "the facts of another module's unit are not printed" (= (u/facts-section [] g o 3) []))
+        (check cs "a summary is `(OWNED,ESCAPES)` for each parameter"
+               (= (u/summary-section [] p o 2) ["summary f (1,1) (0,0)"]))
+        (check cs "the summaries follow the module" (= (u/summary-section [] p o 3) ["summary g"]))
+        (check cs "taken: functions by id and methods by pair, for the module"
+               (= (u/taken-section [] g o 2) ["taken value f" "taken method 0.1"])))))
+
+(defun dump-checks (cs: Checks p: TypedProgram o: OwnedProgram) -> unit
+  (let ((c (Checked p o))
+        (shown (s/Shown 2 "main" "t.fib"))
+        (opts (fn (words: (Vec str)) (. (unwrap (a/own-parse-args (into words ["f.fib"]))) opts))))
+    (do (check cs "a module's lines: header, bodies, facts, summary, taken"
+               (= (d/module-lines [] c shown (opts []))
+                  (into (into (into ["-- module main t.fib"] body-expected)
+                              ["unit-facts scc f" "    owned 0 rule1(returned),declared" "    loop-rule1 1" "    escapes 1 stored"
+                               "    escaping 7 returned" "    heap 7 arg-of-recur"])
+                        ["summary f (1,1) (0,0)" "taken value f" "taken method 0.1"])))
+        (check cs "--sections taken prints the header and that section only"
+               (= (d/module-lines [] c shown (opts ["--sections" "taken"])) ["-- module main t.fib" "taken value f" "taken method 0.1"]))
+        (check cs "--sections error prints the header only"
+               (= (d/module-lines [] c shown (opts ["--sections" "error"])) ["-- module main t.fib"]))
+        (check cs "an ownership error is a record, its position relative to the file"
+               (= (. (d/own-error-dump ["== f"] [(own-error AmpTwice pos "twice") (own-error ImplEscapes (Pos "u.fib" 1 2 3 4) "m")] "t.fib" true) lines)
+                  ["== f" "error AmpTwice 3:5 10..20: twice" "error ImplEscapes 1:2 3..4@u.fib: m"]))
+        (check cs "and it prints no record when `error` is left out, with status 1"
+               (let ((x (d/own-error-dump ["== f"] [(own-error AmpTwice pos "twice")] "t.fib" false)))
+                 (and (= (. x lines) ["== f"]) (= (. x status) 1)))))))
+
+(defun args-checks (cs: Checks) -> unit
+  (let ((parse (fn (words: (Vec str)) (a/own-parse-args words))))
+    (do (check cs "files alone: every section but explain"
+               (let ((r (unwrap (parse ["x.fib" "y.fib"]))))
+                 (and (= (. r files) ["x.fib" "y.fib"]) (a/own-wants (. r opts) a/OsBody) (not (a/own-wants (. r opts) a/OsExplain)))))
+        (check cs "--sections names the sections, in any order, and replaces an earlier list"
+               (let ((o (. (unwrap (parse ["--sections" "body" "--sections" "taken,error" "x"])) opts)))
+                 (and (a/own-wants o a/OsTaken) (a/own-wants o a/OsError) (not (a/own-wants o a/OsBody)))))
+        (check cs "explain only when asked" (a/own-wants (. (unwrap (parse ["--sections" "explain" "x"])) opts) a/OsExplain))
+        (check cs "the flags and --implicit-lib"
+               (let ((o (. (unwrap (parse ["--library" "--implicit" "--prelude" "--implicit-lib" "a,b" "x"])) opts)))
+                 (and (. o library) (. o implicit) (. o prelude) (= (. o implicit-lib) (some ["a" "b"])))))
+        (check cs "the types options are those of the file loop"
+               (let ((o (a/base-options (. (unwrap (parse ["--library" "x"])) opts))))
+                 (and (. o library) (= (. o stage) ta/StInfer) (not (. o ast)))))
+        (check cs "a lone -- ends the options" (= (. (unwrap (parse ["--" "--library"])) files) ["--library"]))
+        (check cs "refused: no file, an unknown word, a section that is not one, an empty name"
+               (and (= (parse []) nil) (= (parse ["--library"]) nil) (= (parse ["--nope" "x"]) nil)
+                    (= (parse ["--sections" "type" "x"]) nil) (= (parse ["--sections" "body," "x"]) nil)
+                    (= (parse ["--sections"]) nil) (= (parse ["--implicit-lib" "a,,b" "x"]) nil)
+                    (= (parse ["--stage" "infer" "x"]) nil))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (p (program-of (tables) [(UScc [0]) (UScc [1])]))
+        (o (owned-of)))
+    (do (word-checks cs p) (section-checks cs p o) (dump-checks cs p o) (args-checks cs)
+        (finish cs))))

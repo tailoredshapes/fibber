@@ -1,0 +1,106 @@
+;; compiler/own/walk/state.fib: the data of one walk over the bodies of a unit (spec/types.md
+;; §6), as the top of crates/fibref/src/own/walk/mod.rs (lines 1-215): the positions a value
+;; reaches (`Val`, `Class`, `At`, `ArgAt`, `HeadAt`, `Event`: what the fixpoint of §6.4 and
+;; the stack rule of §6.11 read), what a walk needs and does not change (`Ctx`), and the
+;; walker itself. The data is written by package O1 so that own.facts, own.classify and
+;; own.stack (O6) and own.walk.* (O3 to O5) can be written side by side; the functions are stubs.
+;;
+;; Shapes decided where Rust and fibber differ (O3 may reshape the walker, not the events):
+;; - variants carry a prefix: `Val` `V`, `Class` `Cl`, `At` `At`, `FrameKind` `Fk`.
+;; - the `Walker` of Rust has `&mut self` methods; this one holds Cells (plan 2.2, PROBE 2) and
+;;   is passed to every function, so the frame found by `peek` is mutated in place. `frames`,
+;;   `scopes`, `loops` and the rest are the Rust fields, their private types `Frame`, `Scope`
+;;   and `LoopCtx` too; `ScopeKind` of Rust only documents and is not here.
+;; - the cycle expr -> call, match_form, fn_lit -> expr is cut by the function field `expr`
+;;   (plan 2.2, PROBE 5): own.walk.expr is the only module that builds a Walker with its own
+;;   `walk-expr`, the others call `((. w expr) w e tail)`.
+;; - `ArgAt` and `HeadAt` are records (`defrecord`: nine and four fields, built by name with
+;;   `with`); `Class` has the six derives that a record's fields need.
+(ns own.walk.state
+  (:use fib.coll.record syntax.pos types.ast types.program own.program))
+
+;; A value as the events see it: `Borrowed(site)` (an `Owned` temporary is `Borrowed(Value(e))`),
+;; `Derived(site)`, or a `fn` literal itself.
+(defenum Val (VB site: Site) (VD site: Site) (VLit lit: i64))
+(derive Eq Val) (derive Hash Val)
+
+;; The class of a parameter position (§6.3): borrowed (or `weak`, `raw`: no count), an owned
+;; position of a call (consumed, not an escape by itself), stored (E2), `spawn` (E4).
+(defenum Class ClBorrow ClOwned ClStore ClThread)
+(derive Eq Class) (derive Ord Class) (derive Hash Class)
+(derive Show Class) (derive Debug Class) (derive ToStr Class)
+
+;; An argument position: `escapes` the parameter escapes (or the callee is a closure value),
+;; `scc-callee` the `FunId` of a callee in the current SCC, `frame-owned` the argument is
+;; frame-owned (§6.4) in the current facts.
+(defrecord ArgAt
+  [call: i64 index: i64 class: Class escapes: bool closure-value: bool scc-callee: (Option i64)
+   tail-site: bool admitted: bool frame-owned: bool])
+
+;; A head position: `self-tail` the self-name at its own self tail call.
+(defrecord HeadAt [call: i64 tail-site: bool admitted: bool self-tail: bool])
+
+;; A position a value reaches: E1 of the current frame's body, E2, E4, a join retain, the operand of
+;; `raw-retained` or `weak`, moved out by a scope exit, captured by literal `lit` (heap or not),
+;; consumed into loop variable `var` by its initialiser or by a `recur`, an argument of a call,
+;; the head of a call through a closure value, the direct initialiser of a `let` binding, anything else.
+(defenum At
+  AtReturn AtStore AtThread AtJoin AtRawRetained AtWeak AtMoveOut
+  (AtCapture lit: i64 heap: bool)
+  (AtLoopInit var: i64)
+  (AtRecur var: i64)
+  (AtArg at: ArgAt)
+  (AtHead at: HeadAt)
+  (AtLetInit binding: i64)
+  AtOther)
+(derive Eq At) (derive Hash At)
+
+;; One recorded position.
+(defstruct Event (val: Val at: At))
+(derive Eq Event) (derive Hash Event)
+
+;; What a walk needs and does not change: the typed program; the summaries of the `defun`s of
+;; earlier units; the unit's facts so far; the unit's `defun`s (none for a method or a `def`);
+;; whether the bodies walked are all-owned (§8.4); the tail sites once known (`nil` while
+;; finding them); whether tail sites are admitted by rule (e) with these facts; the
+;; scope-local sites once known.
+(defstruct Ctx
+  (p: TypedProgram summaries: (Map i64 Summary) facts: Facts scc: (Vec i64) all-owned: bool
+   tail-sites: (Option (Map i64 Tail)) admit: bool scope-local: (Set Site)))
+
+(defenum FrameKind FkDefun FkMethod FkFn FkAsync FkDef)
+(derive Eq FrameKind)
+
+;; The owning sites of a step or of a binding form (`let`, `match`, `loop`), in creation order,
+;; each with whether it is a temporary; both release them at their exit.
+(defstruct Scope (sites: (Cell (Vec (Pair Site bool)))))
+
+;; A loop: the index of its scope (its variables) in the frame, and its variables.
+(defstruct LoopCtx (scope: i64 vars: (Vec i64)))
+
+;; A body: a `defun`'s, a method's, a `fn` or `async` literal's, a `def`'s: the modes its bindings
+;; read as, its scopes and loops, the owned parameters (and `env`) released at the exits in
+;; order, the `&` parameters (a `defun` frame only) with their carriers in the body (§6.6), a
+;; named `fn`'s self-name.
+(defstruct Frame
+  (kind: FrameKind env: (Cell (Map i64 Mode)) scopes: (Cell (Vec Scope)) loops: (Cell (Vec LoopCtx))
+   owned-params: (Cell (Vec Site)) amp-params: (Cell (Vec i64))
+   amp-carriers: (Cell (Map i64 (Set i64))) self-name: (Cell (Option i64))))
+
+;; A walk in progress: `site-frame` is the frame depth that owns each owning site; `out` the
+;; tables being filled; `events` every position reached; `tails` the decision at every call in
+;; tail position; `candidates` the allocation sites that initialise an owning site (the §6.11
+;; candidates); `expr` the walk of an expression (see the header).
+(defstruct Walker
+  (cx: Ctx frames: (Cell (Vec Frame)) site-frame: (Cell (Map Site i64)) out: (Cell BodyOwn)
+   events: (Cell (Vec Event)) tails: (Cell (Map i64 Tail)) candidates: (Cell (Map Site i64))
+   expr: (fn (Walker Expr bool) Mode)))
+
+;; Rust: walk/mod.rs:209 `Walker::new`: a walker with nothing walked; `expr` is the walk of an
+;; expression (the cycle's function field).
+(defun walker-new (cx: Ctx expr: (fn (Walker Expr bool) Mode)) -> Walker
+  (trap "todo: walker-new"))
+
+;; Rust: walk/mod.rs:452 `kind_of_param`: an owned parameter is `BnOwnedParam`, else `BnBorrowedParam`.
+(defun kind-of-param (owned: bool) -> BindKind
+  (trap "todo: kind-of-param"))

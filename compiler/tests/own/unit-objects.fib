@@ -1,0 +1,44 @@
+;; compiler/tests/own/unit-objects.fib: the two unit tests of crates/fibref/src/own/objects.rs
+;; (`scalars_are_not_objects_and_everything_else_is`, `option_representation_follows_section_8_1`)
+;; and the one of own/error.rs, over the globals `new-globals` makes. Prints `ok NAME` or `FAIL NAME`.
+;; Build: fibc build compiler/tests/own/unit-objects.fib -I compiler -I lib -o OUT
+(ns main
+  (:use syntax.pos types.ty types.error types.decls types.init types.check own.objects own.error))
+
+(defun check-objects (cs: Checks g: Globals) -> unit
+  (do (check cs "scalars are not objects"
+             (and (not (is-object g (ty-i64))) (not (is-object g (ty-unit)))))
+      (check cs "a str and a cell are objects" (and (is-object g (ty-str)) (is-object g (ty-cell (ty-i64)))))
+      (check cs "a quantified variable is an object" (is-object g (TGen 0)))
+      (check cs "an Option is an object" (is-object g (ty-nominal @(. g option) [(ty-i64)])))
+      (check cs "a function type is an object" (is-object g (TFn CSend [] (ty-unit))))))
+
+(defun check-reps (cs: Checks g: Globals) -> unit
+  (let ((opt (fn (t: Ty) (ty-nominal @(. g option) [t]))))
+    (do (check cs "an Option of a str is a pointer" (= (option-rep g (opt (ty-str))) (some OrPointer)))
+        (check cs "an Option of a cell is a pointer" (= (option-rep g (opt (ty-cell (ty-i64)))) (some OrPointer)))
+        (check cs "an Option of a scalar is a heap enum" (= (option-rep g (opt (ty-i64))) (some OrHeapEnum)))
+        (check cs "an Option of unit is a heap enum" (= (option-rep g (opt (ty-unit))) (some OrHeapEnum)))
+        (check cs "an Option of an Option is a heap enum" (= (option-rep g (opt (opt (ty-str)))) (some OrHeapEnum)))
+        (check cs "an Option of a dyn is a heap enum" (= (option-rep g (opt (TCon (KDyn 0 false) []))) (some OrHeapEnum)))
+        (check cs "an Option of a quantified variable is generic" (= (option-rep g (opt (TGen 0))) (some OrGeneric)))
+        (check cs "an Option of a variable or a rigid one is generic"
+               (and (= (option-rep g (opt (TVar 3))) (some OrGeneric)) (= (option-rep g (opt (TRigid 0))) (some OrGeneric))))
+        (check cs "a type that is not an Option has none" (= (option-rep g (ty-str)) nil)))))
+
+(defun check-errors (cs: Checks) -> unit
+  (let ((pos (Pos "f.fib" 3 7 0 1))
+        (e (own-error AmpCaptured pos "text")))
+    (do (check cs "an error's text names the position, then the message" (= (own-error-text e) "f.fib:3:7: text"))
+        (check cs "the messages of a CeOwn are in order" (= (check-error-messages (CeOwn [e e])) ["text" "text"]))
+        (check cs "a CeOwn is one line for each error" (= (check-error-text (CeOwn [e e])) "f.fib:3:7: text\nf.fib:3:7: text"))
+        (check cs "the kind's name is the variant's" (= (own-error-kind-name BorrowEscapes) "BorrowEscapes"))
+        (check cs "a read error says where it came from" (= (check-error-text (CeRead "m")) "read: m")))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (match (new-globals)
+          ((Ok g) (do (check-objects cs g) (check-reps cs g)))
+          ((Err _) (check cs "new-globals" false)))
+        (check-errors cs)
+        (finish cs))))

@@ -1,0 +1,114 @@
+;; compiler/own/dump/text.fib: the words and short phrases of the ownership dump (plan 1.2;
+;; spec/bootstrap.md §7 once it lands): a site, a mode, an operation, a pass, a tail decision, a
+;; callee, a binding kind, a parameter kind, an allocation. Each is a pure function of one value;
+;; the lines that use them are in own.dump.bodies and own.dump.units. Package O1; the words are
+;; provisional until the oracle (`fibref own`, package O0) fixes them: this is the one module that
+;; holds them.
+;;
+;; The words: a site is `b:B` (a binding), `v:E` (the value of an expression), `cap:E:B` (a
+;; capture), `env:E`, `def:D`; a mode `scalar`, `owned`, `owned!` (immortal), `borrowed SITE`,
+;; `derived SITE`; an operation `retain|release|end-stack SITE WHY`; a list of them is joined by `; `.
+(ns own.dump.text
+  (:use fib.string types.program types.builtins own.program))
+
+;; `b:B | v:E | cap:E:B | env:E | def:D`.
+(defun site-text (s: Site) -> str
+  (match s
+    ((SiteBind b) (str-join ["b:" (show b)]))
+    ((SiteValue e) (str-join ["v:" (show e)]))
+    ((SiteCapture l b) (str-join ["cap:" (show l) ":" (show b)]))
+    ((SiteEnv l) (str-join ["env:" (show l)]))
+    ((SiteGlobal d) (str-join ["def:" (show d)]))))
+
+(defun mode-text (m: Mode) -> str
+  (match m
+    ((MScalar) "scalar")
+    ((MOwned imm) (if imm "owned!" "owned"))
+    ((MBorrowed s) (str-concat "borrowed " (site-text s)))
+    ((MDerived s) (str-concat "derived " (site-text s)))))
+
+(defun why-text (w: Why) -> str
+  (match w
+    ((WhyReturn) "return") ((WhyStore) "store") ((WhyJoin) "join") ((WhyScopeExit) "scope-exit")
+    ((WhyStepEnd) "step-end") ((WhyDerivedExit) "derived-exit") ((WhyDiscard) "discard")
+    ((WhyParamExit) "param-exit") ((WhyLoopInit) "loop-init") ((WhyJump) "jump")
+    ((WhyRecurOld) "recur-old")))
+
+(defun op-kind-text (k: OpKind) -> str
+  (match k
+    ((OpRetain) "retain") ((OpRelease) "release") ((OpEndStack) "end-stack")))
+
+;; `retain|release|end-stack SITE WHY`.
+(defun op-text (o: Op) -> str
+  (str-join [(op-kind-text (. o kind)) " " (site-text (. o site)) " " (why-text (. o why))]))
+
+;; The operations joined by `; ` (nothing for none).
+(defun ops-text (ops: (Vec Op)) -> str
+  (join "; " (mapv op-text ops)))
+
+(defun pass-text (x: Pass) -> str
+  (match x
+    ((PsScalar) "scalar") ((PsBorrow) "borrow") ((PsMove) "move") ((PsRetain) "retain")
+    ((PsAcquire) "acquire") ((PsForward) "forward") ((PsOwnCell) "own-cell") ((PsAlias) "alias")
+    ((PsKeepEnv) "keep-env")))
+
+;; The passes joined by `,` (nothing for none).
+(defun passes-text (xs: (Vec Pass)) -> str
+  (join "," (mapv pass-text xs)))
+
+(defun because-text (b: Because) -> str
+  (match b
+    ((BcAmpArgument) "amp-argument")
+    ((BcAmpCaptured p) (str-concat "amp-captured:" (show p)))
+    ((BcFrameOwned a) (str-concat "frame-owned:" (show a)))
+    ((BcAsyncBody) "async-body") ((BcExtern) "extern") ((BcStore) "store")))
+
+;; `not-in-tail`, `tail-call`, `ordinary:WHY`.
+(defun tail-text (t: Tail) -> str
+  (match t
+    ((TlNotInTail) "not-in-tail")
+    ((TlTailCall) "tail-call")
+    ((TlOrdinary b) (str-concat "ordinary:" (because-text b)))))
+
+;; `fun:F | all-owned:F | method:P.I | builtin:NAME | ctor | extern | value`: a builtin by its
+;; name, not its index, so that a change of the table that renumbers it does not show.
+(defun callee-text (p: TypedProgram c: Callee) -> str
+  (match c
+    ((CalFun f) (str-concat "fun:" (show f)))
+    ((CalAllOwned f) (str-concat "all-owned:" (show f)))
+    ((CalMethod proto i) (str-join ["method:" (show proto) "." (show i)]))
+    ((CalBuiltin id) (str-concat "builtin:" (. (nth (. p builtins) id) name)))
+    ((CalCtor) "ctor") ((CalExtern) "extern") ((CalValue) "value")))
+
+(defun owned-why-text (w: OwnedWhy) -> str
+  (match w
+    ((OwRule1 x) (str-join ["rule1(" x ")"]))
+    ((OwRule2 x) (str-join ["rule2(" x ")"]))
+    ((OwRule3 x) (str-join ["rule3(" x ")"]))
+    ((OwLoop x) (str-join ["loop(" x ")"]))
+    ((OwDeclared) "declared")))
+
+;; `scalar | amp | borrowed | owned:WHY..`, the reasons in the order found, each after a `:`.
+(defun param-kind-text (k: ParamKind) -> str
+  (match k
+    ((PkScalar) "scalar") ((PkAmp) "amp") ((PkBorrowed) "borrowed")
+    ((PkOwned whys) (join ":" (into ["owned"] (mapv owned-why-text whys))))))
+
+;; `scalar | owns | alias SITE | derived SITE | borrowed-param | owned-param | amp-param`.
+(defun bind-kind-text (k: BindKind) -> str
+  (match k
+    ((BnScalar) "scalar") ((BnOwns) "owns")
+    ((BnAliasOf s) (str-concat "alias " (site-text s)))
+    ((BnDerivedOf s) (str-concat "derived " (site-text s)))
+    ((BnBorrowedParam) "borrowed-param") ((BnOwnedParam) "owned-param") ((BnAmpParam) "amp-param")))
+
+(defun alloc-text (a: Alloc) -> str
+  (match a
+    ((AlHeap) "heap") ((AlStack) "stack") ((AlNothing) "nothing")))
+
+;; `1` or `0`.
+(defun flag-text (b: bool) -> str (if b "1" "0"))
+
+;; The reason of an `Option`al `escaping`/`heap`: the text, or `no`.
+(defun reason-text (r: (Option str)) -> str
+  (unwrap-or r "no"))
