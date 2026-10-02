@@ -1,0 +1,68 @@
+;; compiler/expand/own.fib: a module's own definitions beat the prelude
+;; macros (tranche 1 R14, the owner's rule of 2026-10-01), as
+;; crates/fibref/src/expand/own.rs (the part of it that reads the forms;
+;; `hide_macros`, `add_own` and `hides_macro` of ctx.rs are `ctx-hide-macros`,
+;; `ctx-add-own` and `ctx-hides-macro` here: expand.ctx is at its line limit,
+;; and the field they read, `hides`, is the context's own).
+;;
+;; A prelude macro declines in a module that defines its own name as a
+;; top-level `defun`, `defn`, `defn-`, `def`, `extern`, `defstruct`,
+;; `defenum` (its variants) or a `defprotocol` method, or that sees it
+;; exported by a program module it `:use`s; the library's modules do not
+;; count (syntax §4.4). The definitions are read off the module's
+;; unexpanded forms before the first is expanded, looking through a
+;; top-level `do`, so a function defined below its use hides the macro
+;; there too.
+;;
+;; Shapes decided where Rust and fibber differ: the Rust `HashSet` is a
+;; `(Map str bool)` of `true`, as the context's are, and the explicit
+;; stack is a vector that grows as the items of a `do` are appended and
+;; is read by index (the result is a set, so the order does not matter).
+(ns expand.own
+  (:use syntax.pos syntax.form expand.build expand.ctx expand.fusescan))
+
+;; The names the top-level forms define, looking through a top-level `do`.
+;; (own::defined_by)
+(defun own-defined-by (forms: (Vec Stx)) -> (Map str bool)
+  (loop ((work forms) (i 0) (out (map-empty)))
+    (if (< i (count work))
+        (let ((form (nth work i)))
+          (if (= (unwrap-or (head-name form) "") "do")
+              (recur (append-forms work (fuse-list-items form) 1) (+ i 1) out)
+              (recur work (+ i 1) (add-names out (fuse-names-of form)))))
+        out)))
+
+;; The forms of `more` from index `from` on, after those of `work`.
+(defun append-forms :private (work: (Vec Stx) more: (Vec Stx) from: i64) -> (Vec Stx)
+  (loop ((j from) (acc work))
+    (if (< j (count more)) (recur (+ j 1) (conj acc (nth more j))) acc)))
+
+(defun add-names :private (out: (Map str bool) names: (Vec str)) -> (Map str bool)
+  (loop ((j 0) (acc out))
+    (if (< j (count names)) (recur (+ j 1) (assoc acc (nth names j) true)) acc)))
+
+;; Starts expanding the forms of the module that `ctx-begin-module` began:
+;; the names they define (`own-defined-by`) and the names the program's own
+;; modules it uses export hide the prelude macros of the same name; the
+;; library's modules (ns `fib.`..) do not. (ctx.rs `hide_macros`)
+(defun ctx-hide-macros (ctx: ExpandCtx own: (Map str bool)) -> unit
+  (let ((uses (. (ctx-scope ctx) uses)))
+    (set! (. ctx hides)
+          (loop ((i 0) (acc own))
+            (if (< i (count uses))
+                (recur (+ i 1)
+                       (if (starts-with? (nth uses i) "fib.")
+                           acc
+                           (ctx-add-exported ctx acc (nth uses i))))
+                acc)))))
+
+;; Adds the names a form that a macro produced defines. (ctx.rs `add_own`)
+(defun ctx-add-own (ctx: ExpandCtx names: (Vec str)) -> unit
+  (set! (. ctx hides)
+        (loop ((i 0) (acc @(. ctx hides)))
+          (if (< i (count names)) (recur (+ i 1) (assoc acc (nth names i) true)) acc))))
+
+;; Whether the module being expanded has its own definition of the bare
+;; name, which a prelude macro of that name yields to. (ctx.rs `hides_macro`)
+(defun ctx-hides-macro (ctx: ExpandCtx name: str) -> bool
+  (some? (map-get @(. ctx hides) name)))

@@ -6,10 +6,21 @@
 //!
 //! ```text
 //! (reduce f c)        ⟹ (fib.seq/reduce-nonempty f c)
-//! (reduce + c)        ⟹ (fib.seq/reduce + 0 c)        ; * 1, str "", conj [], merge {}, concat []
+//! (reduce + c)        ⟹ (fib.seq/reduce + 0 c)        ; * 1, conj [], merge {}
+//! (reduce str c)      ⟹ (fib.seq/reduce (fn (a x) (fib.prelude/str a x)) "" c)
+//! (reduce concat c)   ⟹ (fib.seq/reduce concat (fib.seq/lazy-node (fn () fib.seq/LNil)) c)
 //! (reduce (fn (a x) .. (reduced e) ..) init c)
 //!                     ⟹ (fib.seq/reduce-while (fn (a x) ..) init c)
 //! ```
+//!
+//! The value `str` is the library's one-argument function, which is not
+//! the accumulator's two-argument step, so a literal `str` is the `fn` that
+//! calls the macro (gensym parameters `#r.N`), whose pieces take their
+//! `to-str` as `(str a b)` does, in the two-argument form and in
+//! `(reduce str init c)` alike; `concat` is the two-argument function, but
+//! returns an `LSeq`, so its start is the empty one. A literal head the
+//! module defines or sees exported by a program module (`hides_macro`) is
+//! that function and has no identity: it goes through `reduce-nonempty`.
 //!
 //! In the last form every tail position of the literal `fn`'s body is
 //! rewritten, through `if`, `let`, `do`, `match`, `cond`, `when`,
@@ -26,7 +37,9 @@
 use crate::syntax::{Form, FormKind, IntWidth, Pos};
 
 use super::Outcome;
-use crate::expand::build::{call, list, string};
+use crate::expand::build::{call, list, string, sym};
+use crate::expand::collections::prelude_name;
+use crate::expand::ctx::ExpandCtx;
 use crate::expand::error::ExpandError;
 
 const REDUCE: &str = "fib.seq/reduce";
@@ -34,25 +47,52 @@ const REDUCE_NONEMPTY: &str = "fib.seq/reduce-nonempty";
 const REDUCE_WHILE: &str = "fib.seq/reduce-while";
 const MORE: &str = "fib.core/More";
 const DONE: &str = "fib.core/Done";
+const LAZY_NODE: &str = "fib.seq/lazy-node";
+const LNIL: &str = "fib.seq/LNil";
 
-/// The identity of the literal heads whose `(f)` Clojure's reduce calls
-/// (`(+)` is 0): the value `(reduce f c)` starts from.
-fn identity(f: &Form, pos: &Pos) -> Option<Form> {
-    let kind = match f.as_sym()? {
-        "+" => FormKind::Int {
+/// The function a literal `str` is folded with: `(fn (a x) (str a x))`
+/// over gensyms, the call written `fib.prelude/str`, which no definition
+/// of the module's own `str` captures.
+fn str_step(ctx: &ExpandCtx, pos: &Pos) -> Form {
+    let (acc, elem) = (ctx.gensym("r", pos), ctx.gensym("r", pos));
+    let body = call(&prelude_name("str"), vec![acc.clone(), elem.clone()], pos);
+    call("fn", vec![list(vec![acc, elem], pos), body], pos)
+}
+
+/// Whether `f` is the literal `str` that the prelude macro `str` is the
+/// meaning of in this module.
+fn is_prelude_str(ctx: &ExpandCtx, f: &Form) -> bool {
+    f.as_sym() == Some("str") && !ctx.hides_macro("str")
+}
+
+/// What `(reduce f c)` folds with and starts from, for the literal heads
+/// whose `(f)` Clojure's reduce calls (`(+)` is 0): the function and the
+/// value; `None` for any other head, and for one the module defines.
+fn start(ctx: &ExpandCtx, f: &Form, pos: &Pos) -> Option<(Form, Form)> {
+    let head = f.as_sym().filter(|h| !ctx.hides_macro(h))?;
+    let literal = |kind| Form::new(kind, pos.clone());
+    let init = match head {
+        "+" => literal(FormKind::Int {
             v: 0,
             width: IntWidth::I64,
-        },
-        "*" => FormKind::Int {
+        }),
+        "*" => literal(FormKind::Int {
             v: 1,
             width: IntWidth::I64,
-        },
-        "str" => return Some(string("", pos)),
-        "conj" | "concat" => FormKind::Vec(Vec::new()),
-        "merge" => FormKind::Map(Vec::new()),
+        }),
+        "str" => return Some((str_step(ctx, pos), string("", pos))),
+        "conj" => literal(FormKind::Vec(Vec::new())),
+        "concat" => return Some((f.clone(), empty_lseq(pos))),
+        "merge" => literal(FormKind::Map(Vec::new())),
         _ => return None,
     };
-    Some(Form::new(kind, pos.clone()))
+    Some((f.clone(), init))
+}
+
+/// The empty lazy seq: `(fib.seq/lazy-node (fn () fib.seq/LNil))`.
+fn empty_lseq(pos: &Pos) -> Form {
+    let nil = call("fn", vec![list(Vec::new(), pos), sym(LNIL, pos)], pos);
+    call(LAZY_NODE, vec![nil], pos)
 }
 
 /// Where the tail sub-forms of a form are.
@@ -178,15 +218,26 @@ fn with_reduced_tails(f: &Form, pos: &Pos) -> Option<Form> {
     found.then_some(rewritten)
 }
 
+/// The three-argument call: the `fn` with its tails rewritten, or a literal
+/// `str` as the step.
+fn three_arguments(ctx: &ExpandCtx, items: &[Form], pos: &Pos) -> Option<Form> {
+    let [_, f, init, c] = items else { return None };
+    let f = match with_reduced_tails(f, pos) {
+        Some(f) => return Some(call(REDUCE_WHILE, vec![f, init.clone(), c.clone()], pos)),
+        None if is_prelude_str(ctx, f) => str_step(ctx, pos),
+        None => return None,
+    };
+    Some(call(REDUCE, vec![f, init.clone(), c.clone()], pos))
+}
+
 /// One call of `reduce`: the rewrite, or the call itself, declined.
-pub(super) fn reduce(items: Vec<Form>, pos: Pos) -> Result<Outcome, ExpandError> {
+pub(super) fn reduce(ctx: &ExpandCtx, items: Vec<Form>, pos: Pos) -> Result<Outcome, ExpandError> {
     let expansion = match items.as_slice() {
-        [_, f, c] => Some(match identity(f, &pos) {
-            Some(init) => call(REDUCE, vec![f.clone(), init, c.clone()], &pos),
+        [_, f, c] => Some(match start(ctx, f, &pos) {
+            Some((f, init)) => call(REDUCE, vec![f, init, c.clone()], &pos),
             None => call(REDUCE_NONEMPTY, vec![f.clone(), c.clone()], &pos),
         }),
-        [_, f, init, c] => with_reduced_tails(f, &pos)
-            .map(|f| call(REDUCE_WHILE, vec![f, init.clone(), c.clone()], &pos)),
+        [_, _, _, _] => three_arguments(ctx, &items, &pos),
         _ => None,
     };
     Ok(match expansion {

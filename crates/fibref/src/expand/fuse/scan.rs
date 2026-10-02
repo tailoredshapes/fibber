@@ -154,12 +154,14 @@ fn method_name(f: &Form) -> Option<&str> {
     parts.first()?.as_sym()
 }
 
-/// The names one top-level form defines.
-fn names_of(form: &Form) -> Vec<&str> {
+/// The names one top-level form defines (`defn` and `defn-`, which are
+/// macros over `defun`, as well as `defun`: a module's own definitions are
+/// also read off its unexpanded forms, `own`).
+pub(crate) fn names_of(form: &Form) -> Vec<&str> {
     let items = form.as_list().unwrap_or(&[]);
     let name = |i: usize| items.get(i).and_then(Form::as_sym);
     match head_name(form) {
-        Some("defun" | "extern") => name(1).into_iter().collect(),
+        Some("defun" | "extern" | "defn" | "defn-") => name(1).into_iter().collect(),
         Some("def") => name(1)
             .map(|n| n.strip_suffix(':').unwrap_or(n))
             .into_iter()

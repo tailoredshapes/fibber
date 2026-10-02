@@ -125,15 +125,25 @@
   ;; the call's expansion, still to be admitted and looked at again
   (Rewrote form: Stx))
 
-;; A prelude macro call: counted as a step and rewritten, or declined.
-(defun prelude-step :private (ex: Expander form: Stx) -> (Result Rewriting ExpandError)
-  (match (ctx-step (. ex ctx) (. form pos))
-    ((Err e) (Err e))
-    ((Ok _)
-     (match (prelude/expand (. ex ctx) form)
-       ((Err e) (Err e))
-       ((Ok (prelude/Rewritten f)) (Ok (Rewrote f)))
-       ((Ok (prelude/Declined f)) (Ok (Settled f)))))))
+;; A prelude macro call: counted as a step and rewritten, or declined. A
+;; call written `fib.prelude/NAME` counts a step only when it expands: the
+;; expansions name the prelude's binary builtins that way (`fib.prelude/+`),
+;; and the macro declines them. (expr.rs `prelude_step`)
+(defun prelude-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
+  (let ((qualified (prelude/is-qualified name))
+        (pos (. form pos)))
+    (match (if qualified (Ok ()) (ctx-step (. ex ctx) pos))
+      ((Err e) (Err e))
+      ((Ok _)
+       (match (prelude/expand (. ex ctx) form)
+         ((Err e) (Err e))
+         ((Ok (prelude/Declined f)) (Ok (Settled f)))
+         ((Ok (prelude/Rewritten f))
+          (if qualified
+              (match (ctx-step (. ex ctx) pos)
+                ((Err e) (Err e))
+                ((Ok _) (Ok (Rewrote f))))
+              (Ok (Rewrote f)))))))))
 
 ;; A user macro call: counted as a step and run.
 (defun user-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
@@ -149,8 +159,8 @@
 (defun macro-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
   (match (ctx-macro-def (. ex ctx) name)
     ((some _) (user-step ex form name))
-    (nil (if (prelude/is-macro name)
-             (prelude-step ex form)
+    (nil (if (some? (prelude/macro-of (. ex ctx) name))
+             (prelude-step ex form name)
              (Ok (Settled form))))))
 
 ;; One pass over a form whose head is the symbol name.

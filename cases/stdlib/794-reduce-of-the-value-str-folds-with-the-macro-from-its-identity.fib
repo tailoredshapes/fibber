@@ -1,0 +1,36 @@
+;; spec:   stdlib §4.4 (row reduce: the identity table), §6.3 (R6b, R14), §2.7 (str)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce str
+;; (reduce str c) is Clojure's: the strings of the elements joined, "" for nothing. The value
+;; `str` is the library's one-argument function, which is not the accumulator's two-argument step
+;; (before R14 the expansion (fib.seq/reduce str "" c) did not type-check), so the macro writes
+;; the step as (fn (a x) (fib.prelude/str a x)) over gensyms, and each element takes its to-str
+;; as (str a b) does: a string as itself, a number and a char as their text, a collection as its
+;; pr text. The same for (reduce str init c) with the value `str` as the function, as Clojure's
+;; (reduce str "n=" [1 2]) is "n=12". A mixed collection does not exist here (a Vec has one
+;; element type), so strings, integers and chars are folded each over a Vec of their own.
+;; Over a Vec, a List and an Option; an empty source and a one-element source.
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Vec str) (vec-empty))
+        (nums: (Vec i64) [7])
+        (cs: (Vec (Vec i64)) [[1 2] [3]]))
+    (do (check c (= (reduce str ["a" "b" "c"]) "abc"))
+        (check c (= (reduce str [1 2 3]) "123"))
+        (check c (= (reduce str [\a \b \c]) "abc"))
+        (check c (= (reduce str none) ""))
+        (check c (= (reduce str nums) "7"))
+        (check c (= (reduce str cs) "[1 2][3]"))
+        (check c (= (reduce str (list 1 2 3)) "123"))
+        (check c (= (reduce str (some 5)) "5"))
+        (check c (= (reduce str "n=" [1 2]) "n=12"))
+        (check c (= (reduce str "" none) ""))
+        (check c (= (reduce str "seed" none) "seed"))
+        (check c (= (reduce (fn (a x) (str-concat a x)) ["a" "b"]) "ab"))
+        (check c (= (reduce str (map (fn (x) (* x 2)) [1 2 3])) "246"))
+        (checks-result c))))

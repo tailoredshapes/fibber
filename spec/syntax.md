@@ -1519,30 +1519,51 @@ of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
 | `conj`, `assoc`, `dissoc`, `merge` | `(conj c)`, `(dissoc m)` ⟹ the collection itself; `(conj c x y ..)`, `(dissoc m k1 k2 ..)` ⟹ the left fold of `fib.coll/conj`, `fib.coll/dissoc`; `(assoc m k v k2 v2 ..)` ⟹ the left fold of `fib.coll/assoc` by pairs, and a key without a value is the error `malformed assoc: a key without a value`; `(merge)` is the error `malformed merge: needs at least one argument`, a literal `nil` operand is skipped (`(merge a nil b)` is `(merge a b)`, and `nil` when every operand is one); the two- and three-argument calls (and `(merge a b)` with no literal `nil`) are declined: the method or function serves them. Clojure's rules for a literal `nil` first argument, `(conj nil x)` as `(list x)` and `(assoc nil k v)` as a map, are not implemented (stdlib §2.4) |
 | `swap!` | `(swap! a f x ..)` ⟹ `(fib.prelude/swap! a (fn (v) (f v x ..)))`, `v` a gensym, the extra arguments evaluated inside the closure each time the builtin calls it (which may be more than once, §3.11); the two-argument call is the builtin's and is declined |
 | `update` | `(update m k f x ..)` ⟹ `(fib.coll/update m k (fn (v) (f v x ..)))`, `v` a gensym; a literal `(fnil g d)` for `f` ⟹ `(fib.coll/update-or m k g d)` (with extra arguments, `g` is called with them inside the closure); a call of fewer than three arguments, and a three-argument call whose `f` is not a literal `fnil`, is declined and stays the library function `update` |
-| `reduce` | `(reduce f c)` ⟹ `(fib.seq/reduce-nonempty f c)`; for the literal heads `+ * str conj merge concat` ⟹ `(fib.seq/reduce f init c)` from `0 1 "" [] {} []`; `(reduce (fn (a x) body) init c)` whose body has `(reduced e)` in a tail position (found through `if let do match cond when unless if-let when-let loop`, with an explicit stack) ⟹ `(fib.seq/reduce-while f' init c)`, each tail `(reduced e)` rewritten to `(fib.core/Done e)`, every other value tail `v` to `(fib.core/More v)` and a `(recur ..)` left alone; any other call, a literal `fn` with a `->` or `:where` included, is declined and stays the library function. Of the six literal heads only `+ * conj merge` type-check today: the library `str` of one argument and `concat`, which returns an `LSeq`, do not fit the accumulator, and `(reduce + [1.5 2.5])` is `cannot unify f64 with i64` until L19 (cases 780-793) |
+| `reduce` | `(reduce f c)` ⟹ `(fib.seq/reduce-nonempty f c)`; for the literal heads `+ * conj merge` ⟹ `(fib.seq/reduce f init c)` from `0 1 [] {}`; a literal `str` ⟹ `(fib.seq/reduce (fn (a x) (fib.prelude/str a x)) "" c)` (gensym parameters `#r.N`: the value `str` is the library's one-argument function, not the accumulator's step, so the step is the macro, and each element takes its `to-str` as `(str a b)` does; Clojure's `(reduce str c)`), and a literal `concat` ⟹ `(fib.seq/reduce concat (fib.seq/lazy-node (fn () fib.seq/LNil)) c)` (`concat` is the two-argument function and returns an `LSeq`, so the start is the empty lazy seq, not `[]`); `(reduce str init c)` is the same `fn` over the given `init`; `(reduce (fn (a x) body) init c)` whose body has `(reduced e)` in a tail position (found through `if let do match cond when unless if-let when-let loop`, with an explicit stack) ⟹ `(fib.seq/reduce-while f' init c)`, each tail `(reduced e)` rewritten to `(fib.core/Done e)`, every other value tail `v` to `(fib.core/More v)` and a `(recur ..)` left alone; any other call, a literal `fn` with a `->` or `:where` included, is declined and stays the library function. A literal head that the module defines itself or sees exported by a program module it `:use`s is that function, not the prelude's, and has no identity: `(reduce str c)` there is `reduce-nonempty` over the module's `str`. `(reduce + [1.5 2.5])` is `cannot unify f64 with i64` until L19 (cases 780-796) |
 
-**Hygiene** (stdlib design §6.3, tranche 1 R2). Every head or constant a
+**Hygiene** (stdlib design §6.3, tranche 1 R2, R14). Every head or constant a
 Rust prelude macro emits that is not a core form is written with the name
 of the module that defines it, `fib.prelude/NAME` (`fib.core/`, `fib.coll/`
 and `fib.seq/` for the library's names), so that a binding of the
 program's own `cons`, `trap`, `show`, `+` or `update-or` is not what the
-expansion calls; the bindings a macro introduces are gensyms. The macros an
-expansion names (`and`, `or`) and the core forms (`if let match loop recur
-fn do .`) are plain, and a user `defmacro` named `and` or `or` still
-shadows them, because the expander finds a prelude macro by its bare name
-and does not recognise `fib.prelude/and`. The rule is checked by a test
+expansion calls; the bindings a macro introduces are gensyms. The core
+forms (`if let match loop recur fn do .`) are plain. The macros an
+expansion names, `and` and `or` (`(and a b c)`, `(< a b c)` and the derived
+`Eq` and `Ord` write them), are written `fib.prelude/and` and
+`fib.prelude/or`, and **a head `fib.prelude/NAME` is the prelude's macro
+NAME in every module** whatever the module defines or a user `defmacro`
+named like it says (R14, the owner's rule of 2026-10-01): a user
+`defmacro and` does not change what `(< a b c)` means, and a module that
+defines a function `when` reaches the macro as `(fib.prelude/when ..)`.
+The exceptions are the heads the prelude's own expansions call as
+functions, which the macros of the same name would answer again for ever:
+`fib.prelude/println` is the function; a call written `fib.prelude/NAME`
+that the macro declines (`(fib.prelude/+ a b)`, the binary builtin) is
+that call, and counts no expansion step. The rule is checked by a test
 that runs one sample per registry row and requires every head of the output
 to be core or qualified (`expand/tests/hygiene.rs`).
 
-**Declining.** A row that says *declined* leaves the call unchanged, to be
-served by the builtin or the library function of that name. The expander
-knows macros and not functions, so a macro that does not decline a call
-rewrites it even when the program defines a function of that name and
-arity: a user `defun` named `str`, `print`, `println`, `prn` or `pr`, or a
-user `(defun update (a b c d) ..)` called with four arguments, is
-shadowed in head position by the macro (the same sharp edge `for-each` and
-`range` always had). A macro name in value position (`(map str xs)`,
-`(run! println xs)`) is not a call and is left alone.
+**Declining, and a module's own definitions** (R14, the owner's rule of
+2026-10-01: Clojure's resolution, a name is the module's own, then what its
+`:use`s export, then the implicit library, then the prelude). A row that
+says *declined* leaves the call unchanged, to be served by the builtin or
+the library function of that name. The expander knows macros by name, so
+it asks the module: **a prelude macro does not apply, and the call is an
+ordinary call of the module's function, in a module that defines the name
+itself** (a top-level `defun`, `defn`, `defn-`, `def`, `extern`,
+`defstruct` constructor, `defenum` variant or `defprotocol` method, written
+before or after the call, a top-level `do` included, or produced by a user
+macro, from the form it appears in on) **or sees it exported by a program
+module it `:use`s** (a public name; the library's modules, `fib.`, do not
+count, since their `update`, `reduce`, `str` and the rest are the twins the
+macros are designed to sit beside). So a user `defun` named `str`, `print`,
+`println`, `prn`, `pr`, `when`, `list`, `max` or `update` is called, with
+whatever arity and types it has, and a macro name in value position
+(`(map str xs)`, `(run! println xs)`) is not a call and is left alone, as
+ever. A user `defmacro` of the name still wins in the user's own module.
+A local binding (a `let` or a parameter named `when`) is not a definition
+of the module and does not hide the macro. The module reaches the macro
+with the qualified head (`(fib.prelude/str a b)`, Hygiene above).
 
 **Fusion** (stdlib design §2.1 rule 2, §7 E16) is not a macro: it is a
 second pass over each top-level form after the macros have run, which

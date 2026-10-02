@@ -37,7 +37,7 @@ fn derive_in(ns: Option<&str>, decls: &str, call: &str) -> String {
 fn eq_on_the_generic_struct_is_the_spec_text() {
     let got = derive_once("(defstruct Pair (a b))", "(derive Eq Pair)");
     let spec = "(impl Eq (Pair a b) :where ((Eq a) (Eq b)) \
-                (= (self y) (and (fib.prelude/= (. self a) (. y a)) (fib.prelude/= (. self b) (. y b)))) \
+                (= (self y) (fib.prelude/and (fib.prelude/= (. self a) (. y a)) (fib.prelude/= (. self b) (. y b)))) \
                 (!= (self y) (fib.prelude/not (fib.prelude/= self y))))";
     assert_eq!(one(&got), one(spec));
 }
@@ -52,7 +52,7 @@ fn eq_on_the_enum_is_the_spec_text_with_gensyms() {
        (= (self y) \
          (match self \
            ((Circle #r.1) (match y ((Circle #r2.2) (fib.prelude/= #r.1 #r2.2)) (_ false))) \
-           ((Rect #w.3 #h.4) (match y ((Rect #w2.5 #h2.6) (and (fib.prelude/= #w.3 #w2.5) (fib.prelude/= #h.4 #h2.6))) (_ false))))) \
+           ((Rect #w.3 #h.4) (match y ((Rect #w2.5 #h2.6) (fib.prelude/and (fib.prelude/= #w.3 #w2.5) (fib.prelude/= #h.4 #h2.6))) (_ false))))) \
        (!= (self y) (fib.prelude/not (fib.prelude/= self y))))";
     assert_eq!(
         got,
@@ -76,8 +76,8 @@ fn eq_on_a_one_variant_enum_has_no_wildcard() {
 #[test]
 fn ord_on_a_struct_is_lexicographic_and_lists_only_ord() {
     let got = derive_once("(defstruct (P t) (a: i64 b: t c: t))", "(derive Ord P)");
-    let less = "(or (fib.prelude/< (. self a) (. y a)) (and (fib.prelude/= (. self a) (. y a)) \
-                (or (fib.prelude/< (. self b) (. y b)) (and (fib.prelude/= (. self b) (. y b)) (fib.prelude/< (. self c) (. y c))))))";
+    let less = "(fib.prelude/or (fib.prelude/< (. self a) (. y a)) (fib.prelude/and (fib.prelude/= (. self a) (. y a)) \
+                (fib.prelude/or (fib.prelude/< (. self b) (. y b)) (fib.prelude/and (fib.prelude/= (. self b) (. y b)) (fib.prelude/< (. self c) (. y c))))))";
     let expected = format!(
         "(impl Ord (P t) :where ((Ord t)) (< (self y) {less}) \
          (<= (self y) (fib.prelude/not (fib.prelude/< y self))) (> (self y) (fib.prelude/< y self)) (>= (self y) (fib.prelude/not (fib.prelude/< self y))))"

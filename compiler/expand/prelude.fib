@@ -60,7 +60,7 @@
         expand.collections expand.prelude.parts expand.prelude.forms expand.prelude.print
         expand.prelude.defn expand.prelude.update expand.prelude.reduce
         expand.prelude.fold expand.prelude.colls expand.prelude.atoms)
-  (:require [expand.derive :as dv]))
+  (:require [expand.own :as own] [expand.derive :as dv]))
 
 ;; The prelude macros, by name, in the order of the Rust table (the soup
 ;; of crates/fibc/tests/bootstrap_expand picks them from it).
@@ -87,6 +87,32 @@
       (if (< i n)
           (if (= (nth prelude-macros i) name) true (recur (+ i 1)))
           false))))
+
+;; `fib.prelude/`, which a head names the prelude's own with. (mod.rs
+;; `QUALIFIER`)
+(def qualifier: str "fib.prelude/")
+
+;; Whether the head name is written `fib.prelude/NAME`. (mod.rs `is_qualified`)
+(defun is-qualified (name: str) -> bool
+  (starts-with? name qualifier))
+
+;; The head without the qualifier.
+(defun unqualified :private (name: str) -> str
+  (if (is-qualified name) (str-slice name (str-len qualifier) (str-len name)) name))
+
+;; The prelude macro that the head `name` of a call reaches in the module
+;; `ctx` is expanding (R14, stdlib §6.3; mod.rs `macro_of`): a bare name
+;; that is a prelude macro the module does not define itself or see a
+;; program module export (`ctx-hides-macro`); or `fib.prelude/NAME`, the
+;; prelude's macro NAME whatever the module defines, except `println`,
+;; which is the prelude's function (the printing macros' expansion calls
+;; it, and the macro would expand its own expansion for ever; mod.rs
+;; `FUNCTION_TWINS`). The answer is the row's own name.
+(defun macro-of (ctx: ExpandCtx name: str) -> (Option str)
+  (if (is-qualified name)
+      (let ((base (unqualified name)))
+        (if (and (is-macro base) (!= base "println")) (some base) nil))
+      (if (and (is-macro name) (= (own/ctx-hides-macro ctx name) false)) (some name) nil)))
 
 ;; A macro that declines answers `nil`: the call, unchanged, is the outcome.
 (defun declinable :private (r: (Option Stx) items: (Vec Stx) pos: Pos) -> (Result Outcome ExpandError)
@@ -124,7 +150,7 @@
   (let ((args (tail-from items 1)))
     (if (<= (count args) 1)
         (item-or-boolean args is-and pos)
-        (let ((rest (call (if is-and "and" "or") (tail-from args 1) pos)))
+        (let ((rest (call (prelude-name (if is-and "and" "or")) (tail-from args 1) pos)))
           (call "if" (if is-and
                          [(nth args 0) rest (boolean false pos)]
                          [(nth args 0) (boolean true pos) rest])
@@ -372,7 +398,7 @@
     ("defn" (rewritten (defn-macro items pos false)))
     ("defn-" (rewritten (defn-macro items pos true)))
     ("update" (declinable (update-macro ctx items pos) items pos))
-    ("reduce" (declinable (reduce-macro items pos) items pos))
+    ("reduce" (declinable (reduce-macro ctx items pos) items pos))
     ("str" (Ok (Rewritten (str-macro items pos))))
     ("println" (Ok (Rewritten (printer-macro items pos Println))))
     ("print" (Ok (Rewritten (printer-macro items pos Print))))
@@ -406,7 +432,7 @@
   (match (. form kind)
     ((SList items)
      (expand-call ctx
-                  (if (> (count items) 0) (unwrap-or (sym-of (nth items 0)) "") "")
+                  (if (> (count items) 0) (unqualified (unwrap-or (sym-of (nth items 0)) "")) "")
                   items
                   (. form pos)))
     (_ (Ok (Declined form)))))

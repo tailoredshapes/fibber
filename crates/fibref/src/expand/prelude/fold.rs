@@ -152,7 +152,7 @@ fn chain(ctx: &ExpandCtx, op: &str, args: Vec<Form>, pos: &Pos) -> Form {
         .windows(2)
         .map(|w| call(op, w.to_vec(), pos))
         .collect();
-    let body = call("and", tests, pos);
+    let body = call(&prelude_name("and"), tests, pos);
     match bindings.is_empty() {
         true => body,
         false => call("let", vec![list(bindings, pos), body], pos),

@@ -7,6 +7,7 @@ use super::build::{head_name, malformed};
 use super::core::{body_start, skip_annotations, Role};
 use super::error::{ExpandError, ExpandErrorKind as K};
 use super::expr::{expand_head, Expander};
+use super::fuse::names_of;
 use super::heads::{is_core, is_definition, QUASI_FORMS};
 use super::private::{marker_index, put_marker, take_marker, type_name as private_type_name};
 use super::runner::{parse_params, MacroDef};
@@ -29,7 +30,9 @@ pub(crate) fn top_form(
             }
             continue;
         }
-        out.push(definition(ex, form, out.is_empty())?);
+        let done = definition(ex, form, out.is_empty())?;
+        ex.ctx.add_own(names_of(&done));
+        out.push(done);
     }
     Ok(())
 }

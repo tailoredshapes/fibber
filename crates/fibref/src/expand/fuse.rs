@@ -67,12 +67,12 @@ use super::runner::NoRunner;
 use super::top::definition_role;
 use super::walk::walk;
 
-pub(crate) use scan::defined_names;
+pub(crate) use scan::{defined_names, names_of};
 pub(crate) use stage::{Env, ModuleEnv};
 use tables::Terminal;
 
 /// Whether a module is the library's own.
-fn is_library(ns: &str) -> bool {
+pub(crate) fn is_library(ns: &str) -> bool {
     ns.starts_with("fib.")
 }
 

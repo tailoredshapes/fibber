@@ -90,8 +90,26 @@ impl<'a> Expander<'a> {
     }
 }
 
+/// One call of a prelude macro, counted as a step. A call written
+/// `fib.prelude/NAME` counts a step only when it expands: the expansions
+/// name the prelude's binary builtins that way (`fib.prelude/+`), and the
+/// macro declines them.
+fn prelude_step(ex: &mut Expander, name: &str, form: Form) -> Result<Outcome, ExpandError> {
+    let pos = form.pos.clone();
+    let qualified = prelude::is_qualified(name);
+    if !qualified {
+        ex.ctx.step(&pos)?;
+    }
+    let outcome = prelude::expand(ex.ctx, form)?;
+    if qualified && matches!(outcome, Outcome::Expanded(_)) {
+        ex.ctx.step(&pos)?;
+    }
+    Ok(outcome)
+}
+
 /// Expands `form` while its head is a macro (a user macro, which shadows
-/// a prelude macro of the same name, then a prelude macro) or
+/// a prelude macro of the same name, then a prelude macro that the module
+/// does not define itself, or written `fib.prelude/NAME`) or
 /// `quasiquote`, counting each expansion as a step and admitting its
 /// result (`ExpandCtx::admit`: its size and its literals). Returns the first
 /// form that is not a macro call, or a `for-each` the prelude declined.
@@ -117,9 +135,8 @@ pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, Exp
         } else if ex.ctx.macro_def(&name).is_some() {
             ex.ctx.step(&pos)?;
             form = ex.run_user(&name, form)?;
-        } else if prelude::is_macro(&name) {
-            ex.ctx.step(&pos)?;
-            match prelude::expand(ex.ctx, form)? {
+        } else if prelude::macro_of(ex.ctx, &name).is_some() {
+            match prelude_step(ex, &name, form)? {
                 Outcome::Expanded(f) => form = f,
                 Outcome::Declined(f) => return Ok(f),
             }

@@ -4,6 +4,7 @@
 //! implies. The ```lisp blocks of `spec/drafts/PROPOSED_CASES.md` are
 //! expanded as a report, not a verdict.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -37,6 +38,7 @@ fn printed(forms: &[Form]) -> Vec<String> {
 /// or a `[..]`/`{..}` literal. `quote` bodies are data and `ns` clauses
 /// are not expressions, so neither is searched.
 fn residue(forms: &[Form]) -> Option<&Form> {
+    let own = defined(forms);
     let mut stack: Vec<&Form> = forms.iter().collect();
     while let Some(f) = stack.pop() {
         match &f.kind {
@@ -69,6 +71,8 @@ fn residue(forms: &[Form]) -> Option<&Form> {
                     "assoc" => items.len() >= 6,
                     _ => PRELUDE_MACROS.contains(&head),
                 };
+                // a module's own definition of the name beats the macro (R14)
+                let macro_use = macro_use && !own.contains(head);
                 if macro_use || quasi.contains(&head) {
                     return Some(f);
                 }
@@ -107,6 +111,36 @@ fn expressions<'f>(head: &str, items: &'f [Form]) -> Vec<&'f Form> {
         }
         _ => items.iter().collect(),
     }
+}
+
+/// The first symbol of a list form, or the symbol itself: the name of a
+/// variant of a `defenum` (`Name` or `(Name f: T ..)`), of a method of a
+/// `defprotocol` (`(name (self) ..)`).
+fn first_name(f: &Form) -> Option<&str> {
+    match &f.kind {
+        FormKind::Sym(s) => Some(s.as_str()),
+        _ => f.as_list()?.first()?.as_sym(),
+    }
+}
+
+/// The names the top-level forms define: functions, constants, externs,
+/// structs and enums with their variants, and the methods of protocols. A
+/// call of one of these is the module's own, not a use of the prelude macro
+/// of the same name.
+fn defined(forms: &[Form]) -> HashSet<&str> {
+    let mut out = HashSet::new();
+    for form in forms {
+        let items = form.as_list().unwrap_or(&[]);
+        let head = items.first().and_then(Form::as_sym).unwrap_or("");
+        let name = items.get(1).and_then(Form::as_sym);
+        match head {
+            "defun" | "extern" | "defstruct" => out.extend(name),
+            "def" => out.extend(name.map(|n| n.strip_suffix(':').unwrap_or(n))),
+            "defenum" | "defprotocol" => out.extend(items.iter().skip(2).filter_map(first_name)),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Whether `(for-each r f)` has a literal `(range a b)` or `(range n)`
@@ -198,6 +232,23 @@ fn residue_detector_fires() {
     let src = "(defun f () (for-each xs (fn (i) i)))";
     let forms = read_all(src, "t").unwrap_or_else(|e| panic!("{e}"));
     assert!(residue(&forms).is_none());
+    // R14: a call of a name the module defines is its function, not a macro use
+    for (src, residue_expected) in [
+        ("(defun when (a b) a) (defun f () (when a b))", false),
+        ("(defun f () (when a b)) (defun when (a b) a)", false),
+        ("(defun f () (when a b)) (defun g () 1)", true),
+        ("(defenum E (when x: i64)) (defun f () (when 1))", false),
+        ("(defstruct str (a: i64)) (defun f () (str 1))", false),
+        (
+            "(defprotocol P (list (self) -> i64)) (defun f (x) (list x))",
+            false,
+        ),
+        ("(def and: i64 1) (defun f () (and a b))", false),
+        ("(defun f () (str a b))", true),
+    ] {
+        let forms = read_all(src, "t").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(residue(&forms).is_some(), residue_expected, "{src}");
+    }
     // R6b: the macros that are also functions are residue only when rewritten
     for (src, residue_expected) in [
         ("(defun f () (defn g [x] x))", true),

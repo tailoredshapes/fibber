@@ -1,0 +1,33 @@
+;; spec:   stdlib §4.4 (row reduce: the identity table), §6.3 (R6b, R14), §2.1 (concat)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reduce concat
+;; (reduce concat c) is Clojure's: the collections of c joined in order, the empty seq for no
+;; collection. concat returns an LSeq, so the start is not the [] that the first table of R6b
+;; wrote (a Vec does not unify with the LSeq that concat answers) but the empty lazy seq
+;; (fib.seq/lazy-node (fn () fib.seq/LNil)); the function is the two-argument concat itself.
+;; The result is read through to-vec. An empty source answers the empty seq, a one-element
+;; source that element as a seq. The other heads of the table are unchanged: + * conj merge
+;; start from their identity, and a (reduce f init c) with a reduced still stops early (case 784).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Vec (Vec i64)) (vec-empty))
+        (three: (Vec (Vec i64)) [[1 2] [3] []])
+        (m1 (assoc (map-empty) "a" 1))
+        (m2 (assoc (map-empty) "b" 2)))
+    (do (check c (= (to-vec (reduce concat three)) [1 2 3]))
+        (check c (= (count (to-vec (reduce concat none))) 0))
+        (check c (= (to-vec (reduce concat [[9 8]])) [9 8]))
+        (check c (= (to-vec (reduce concat [[] []])) (to-vec (reduce concat none))))
+        (check c (= (to-vec (reduce concat (list [1] [2 3]))) [1 2 3]))
+        (check c (= (to-vec (reduce concat [(list 1 2) (list 3)])) [1 2 3]))
+        (check c (= (reduce + [1 2 3 4]) 10))
+        (check c (= (reduce * [2 3 4]) 24))
+        (check c (= (count (reduce conj [[1] [2] [3]])) 3))
+        (check c (= (count (reduce merge [m1 m2])) 2))
+        (check c (= (reduce (fn (acc x) (if (> acc 10) (reduced acc) (+ acc x))) 0 [5 6 7 8 9]) 11))
+        (checks-result c))))

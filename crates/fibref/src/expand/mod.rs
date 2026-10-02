@@ -12,7 +12,9 @@
 //! - macros expand outermost-first, repeatedly, until none remains
 //!   (§3.16): user macros through a [`MacroRunner`] (which shadow a
 //!   prelude macro of the same name), the prelude macros of §4.4 by the
-//!   Rust rewrites in `prelude` and `derive`;
+//!   Rust rewrites in `prelude` and `derive`, none of which applies to a
+//!   bare name that the module defines itself or sees a program module
+//!   export (`own`, R14), and all of which a head `fib.prelude/NAME` reaches;
 //! - `quasiquote` is rewritten to `Form`-constructing calls (§3.16);
 //! - `[..]` and `{..}` in expression position become calls of
 //!   `fib.prelude/vec-empty`, `vec-conj`, `map-empty`, `map-assoc` (§1.4);
@@ -51,6 +53,7 @@ mod expr;
 mod fuse;
 mod heads;
 mod inspect;
+mod own;
 mod prelude;
 mod private;
 mod quasi;
@@ -84,6 +87,7 @@ pub fn expand_program(
     ctx: &mut ExpandCtx,
     runner: &mut dyn MacroRunner,
 ) -> Result<Vec<Form>, ExpandError> {
+    ctx.hide_macros(own::defined_by(&forms));
     let mut ex = Expander::new(ctx, runner);
     let mut out = Vec::new();
     for form in forms {

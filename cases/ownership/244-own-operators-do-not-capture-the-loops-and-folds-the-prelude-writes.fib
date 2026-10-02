@@ -1,0 +1,25 @@
+;; spec:   syntax §4.4 (Declining, Hygiene)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; The module defines + and < of three parameters, answering -1 and false: its own definitions
+;; beat the fold macros, so (+ 1 2 3) is -1 and (< 1 2 3) is false. The counting loops of dotimes
+;; and for-each write fib.prelude/+ and fib.prelude/<, which the module's names cannot capture
+;; (they run 0 1 2 3, and 0 1 2), and the fold is reached by its qualified head:
+;; (fib.prelude/+ 1 2 3) is 6 and (fib.prelude/< 1 2 3) is true. The two-argument calls of the
+;; binary builtins are the module's own too (arity 3 only here), so they are not written bare.
+;; (R14, stdlib §6.3: the owner's rule of 2026-10-01.)
+(defun + (a: i64 b: i64 c: i64) -> i64 -1)
+(defun < (a: i64 b: i64 c: i64) -> bool false)
+
+(defun ck (ok: bool bit: i64) -> i64 (if ok 0 bit))
+
+(defun main () -> i64
+  (let ((acc (cell 0))
+        (n (cell 0)))
+    (do (dotimes (i 4) (set! acc (fib.prelude/+ @acc i)))
+        (for-each (range 0 3) (fn (i) (set! n (fib.prelude/+ @n 1))))
+        (fib.prelude/+ (fib.prelude/+ (ck (= (+ 1 2 3) -1) 1) (ck (not (< 1 2 3)) 2))
+                       (fib.prelude/+ (fib.prelude/+ (ck (= @acc 6) 4) (ck (= @n 3) 8))
+                                      (fib.prelude/+ (ck (= (fib.prelude/+ 1 2 3) 6) 16)
+                                                     (ck (fib.prelude/< 1 2 3) 32)))))))

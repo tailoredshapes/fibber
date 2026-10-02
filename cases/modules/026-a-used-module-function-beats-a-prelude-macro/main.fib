@@ -1,0 +1,25 @@
+;; spec:   syntax §4.4 (Declining), §5; stdlib §6.3 (R14: own definitions, then :use, then the implicit library, then the prelude)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; util exports functions called str, when, list and update, and main :uses util. A module's
+;; resolution is its own definitions, then what its :uses export, then the prelude's macros, so in
+;; main the call of each name is util's function (a call the macro could not have served: (str 4 5)
+;; of two integers is util's 45, the macro's is a call of fib.core/to-str, which main does not
+;; see; (list 1 2) is 2, not a Cons chain). Main's own definition of cond beats the macro too, and
+;; unless, which nothing defines, is still the prelude's macro: it answers the unit else.
+;; The qualified fib.prelude/when is the macro whatever util exports. The result is 0 when each
+;; call answered as it should, else the bits of those that did not.
+(ns main (:use util))
+
+(defun cond (a: i64) -> i64 (+ a 1000))
+
+(defun ck (ok: bool bit: i64) -> i64 (if ok 0 bit))
+
+(defun main () -> i64
+  (let ((x (cell 0)))
+    (do (unless false (set! x 7))
+        (fib.prelude/when true (set! x (+ @x 1)))
+        (+ (+ (ck (= (str 4 5) 45) 1) (ck (= (when 6) 106) 2))
+           (+ (+ (ck (= (list 1 2) 2) 4) (ck (= (update 1 2 3 4) 10) 8))
+              (+ (ck (= @x 8) 16) (ck (= (cond 1) 1001) 32)))))))

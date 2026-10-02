@@ -206,13 +206,15 @@
   (loop ((i 0) (acc a))
     (if (< i (count b)) (recur (+ i 1) (conj acc (nth b i))) acc)))
 
-;; The names one top-level form defines. (scan::names_of)
-(defun names-of :private (form: Stx) -> (Vec str)
+;; The names one top-level form defines; `defn` and `defn-`, which are macros
+;; over `defun`, count as it does, for the module's own definitions read off
+;; its unexpanded forms (expand.own). (scan::names_of)
+(defun fuse-names-of (form: Stx) -> (Vec str)
   (let ((items (fuse-list-items form)))
     (match (head-name form)
       (nil (vec-empty))
       ((some head)
-       (cond ((or (= head "defun") (= head "extern"))
+       (cond ((or (= head "defun") (= head "extern") (= head "defn") (= head "defn-"))
               (match (fuse-item-sym items 1) ((some n) [n]) (nil (vec-empty))))
              ((= head "def")
               (match (fuse-item-sym items 1)
@@ -229,7 +231,7 @@
 (defun fuse-defined-names (forms: (Vec Stx)) -> Defined
   (loop ((i 0) (all (map-empty)) (public (map-empty)))
     (if (< i (count forms))
-        (let ((names (names-of (nth forms i)))
+        (let ((names (fuse-names-of (nth forms i)))
               (private (some? (marker-index (nth forms i)))))
           (let ((added (loop ((j 0) (a all) (p public))
                          (if (< j (count names))

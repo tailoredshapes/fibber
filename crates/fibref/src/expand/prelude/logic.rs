@@ -35,9 +35,12 @@ pub(super) fn when(items: Vec<Form>, pos: &Pos, negate: bool) -> Result<Form, Ex
 }
 
 /// `(and)` ⟹ `true`, `(and a)` ⟹ `a`, `(and a b ...)` ⟹ `(if a (and b
-/// ...) false)`; `or` dually with `(if a true (or b ...))`.
+/// ...) false)`; `or` dually with `(if a true (or b ...))`, the inner
+/// call written `fib.prelude/and` (`fib.prelude/or`), which reaches the
+/// macro even in a module that defines an `and` of its own or a user
+/// `defmacro and` (R14).
 pub(super) fn and_or(items: Vec<Form>, pos: &Pos, is_and: bool) -> Form {
-    let name = if is_and { "and" } else { "or" };
+    let name = &prelude_name(if is_and { "and" } else { "or" });
     let mut args: Vec<Form> = items.into_iter().skip(1).collect();
     if args.len() <= 1 {
         return args.pop().unwrap_or_else(|| boolean(is_and, pos));

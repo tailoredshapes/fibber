@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::syntax::{Form, FormKind, Pos};
 
 use super::error::{ExpandError, ExpandErrorKind};
+use super::fuse::is_library;
 use super::runner::MacroDef;
 use super::types::{EnumInfo, StructInfo, TypeTable};
 
@@ -85,6 +86,11 @@ pub struct ExpandCtx {
     defined: HashMap<String, HashSet<String>>,
     /// The module being expanded: which macros a name reaches.
     pub(crate) scope: ModuleScope,
+    /// The names that hide a prelude macro in the module being expanded:
+    /// what it defines itself (`own`) and what the program's own modules
+    /// that it `:use`s export. A prelude macro of one of these names
+    /// declines in the module.
+    hides: HashSet<String>,
     pub(crate) types: TypeTable,
     pub(crate) call_pos: Pos,
     pub(crate) steps: usize,
@@ -132,6 +138,7 @@ impl ExpandCtx {
             exports: HashMap::new(),
             defined: HashMap::new(),
             scope: ModuleScope::of(super::PRELUDE_NS),
+            hides: HashSet::new(),
             types: TypeTable::with_builtins(),
             call_pos: Pos {
                 file: Arc::from("<none>"),
@@ -342,9 +349,35 @@ impl ExpandCtx {
     /// after it (syntax §5).
     pub fn end_module(&mut self) {
         self.types.end_module();
+        self.hides.clear();
         // Until `begin_module` says otherwise, what follows is a
         // program with no `ns` clauses.
         self.scope = ModuleScope::of("main");
+    }
+
+    /// Starts expanding the forms of the module that `begin_module` began:
+    /// the names they define (`own::defined_by`) and the names the program's
+    /// own modules it `:use`s export hide the prelude macros of the same
+    /// name (`own`); the library's modules do not.
+    pub(crate) fn hide_macros(&mut self, own: HashSet<String>) {
+        let used: Vec<String> = (self.scope.uses.iter())
+            .filter(|u| !is_library(u))
+            .flat_map(|u| self.exported_names(u))
+            .collect();
+        self.hides = own;
+        self.hides.extend(used);
+    }
+
+    /// Adds the names a form that a macro produced defines.
+    pub(crate) fn add_own<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
+        self.hides.extend(names.into_iter().map(str::to_string));
+    }
+
+    /// Whether the module being expanded has its own definition of the
+    /// bare `name`, which a prelude macro of that name yields to: defined
+    /// by the module, or exported by a program module it `:use`s.
+    pub(crate) fn hides_macro(&self, name: &str) -> bool {
+        self.hides.contains(name)
     }
 
     /// Counts one macro expansion against [`Limits::max_steps`].

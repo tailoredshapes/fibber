@@ -3,7 +3,19 @@
 //! the rewrite of `reduced` in a literal `fn`, each as printed, and every
 //! call it leaves to the library function.
 
-use super::ex;
+use super::{ex, program};
+
+/// Expands `call` as the last form of a module whose first form is `defs`
+/// (a program: the module's own definitions are what the macros yield to).
+fn own(defs: &str, call: &str) -> String {
+    let src = format!("{defs} (defun m () {call})");
+    let forms = program(&src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+    let body = forms
+        .last()
+        .and_then(|f| f.as_list())
+        .and_then(|l| l.last());
+    body.map(|f| f.to_string()).unwrap_or_default()
+}
 
 #[test]
 fn two_arguments_is_reduce_nonempty() {
@@ -28,14 +40,18 @@ fn the_two_argument_form_does_not_read_reduced() {
 fn the_literal_heads_start_from_their_identity() {
     assert_eq!(ex("(reduce + c)"), "(fib.seq/reduce + 0 c)");
     assert_eq!(ex("(reduce * c)"), "(fib.seq/reduce * 1 c)");
-    assert_eq!(ex("(reduce str c)"), "(fib.seq/reduce str \"\" c)");
+    assert_eq!(
+        ex("(reduce str c)"),
+        "(fib.seq/reduce (fn (#r.1 #r.2) (fib.prelude/str-concat (fib.core/to-str #r.1) \
+         (fib.core/to-str #r.2))) \"\" c)"
+    );
     assert_eq!(
         ex("(reduce conj c)"),
         "(fib.seq/reduce conj (fib.prelude/vec-empty) c)"
     );
     assert_eq!(
         ex("(reduce concat c)"),
-        "(fib.seq/reduce concat (fib.prelude/vec-empty) c)"
+        "(fib.seq/reduce concat (fib.seq/lazy-node (fn () fib.seq/LNil)) c)"
     );
     assert_eq!(
         ex("(reduce merge c)"),
@@ -48,6 +64,45 @@ fn the_literal_heads_start_from_their_identity() {
         ex("(reduce (comp f g) c)"),
         "(fib.seq/reduce-nonempty (comp f g) c)"
     );
+}
+
+#[test]
+fn a_literal_str_is_folded_with_the_macro_in_both_forms() {
+    // the value `str` is the one-argument function: the step is a `fn` over gensyms
+    let step = "(fn (#r.1 #r.2) (fib.prelude/str-concat (fib.core/to-str #r.1) \
+                (fib.core/to-str #r.2)))";
+    assert_eq!(
+        ex("(reduce str \"x\" c)"),
+        format!("(fib.seq/reduce {step} \"x\" c)")
+    );
+    // the gensyms are fresh for each use, the same two names never twice
+    assert_eq!(
+        ex("(do (reduce str c) (reduce str c))"),
+        "(do (fib.seq/reduce (fn (#r.1 #r.2) (fib.prelude/str-concat (fib.core/to-str #r.1) \
+         (fib.core/to-str #r.2))) \"\" c) (fib.seq/reduce (fn (#r.3 #r.4) \
+         (fib.prelude/str-concat (fib.core/to-str #r.3) (fib.core/to-str #r.4))) \"\" c))"
+    );
+    // a `str` that is the module's own is that function, in both forms
+    assert_eq!(
+        own("(defun str (a x) a)", "(reduce str c)"),
+        "(fib.seq/reduce-nonempty str c)"
+    );
+    assert_eq!(
+        own("(defun str (a x) a)", "(reduce str \"x\" c)"),
+        "(reduce str \"x\" c)"
+    );
+}
+
+#[test]
+fn a_head_the_module_defines_has_no_identity() {
+    for head in ["+", "*", "conj", "concat", "merge"] {
+        let defs = format!("(defun {head} (a x) a)");
+        assert_eq!(
+            own(&defs, &format!("(reduce {head} c)")),
+            format!("(fib.seq/reduce-nonempty {head} c)"),
+            "{head}"
+        );
+    }
 }
 
 #[test]

@@ -5,9 +5,20 @@
 ;; macro answers the two calls the function cannot:
 ;;
 ;;   (reduce f c)   ==> (fib.seq/reduce-nonempty f c)
-;;   (reduce + c)   ==> (fib.seq/reduce + 0 c)     ; * 1, str "", conj [], merge {}, concat []
+;;   (reduce + c)   ==> (fib.seq/reduce + 0 c)     ; * 1, conj [], merge {}
+;;   (reduce str c) ==> (fib.seq/reduce (fn (a x) (fib.prelude/str a x)) "" c)
+;;   (reduce concat c)
+;;                  ==> (fib.seq/reduce concat (fib.seq/lazy-node (fn () fib.seq/LNil)) c)
 ;;   (reduce (fn (a x) .. (reduced e) ..) init c)
 ;;                  ==> (fib.seq/reduce-while (fn (a x) ..) init c)
+;;
+;; The value `str` is the library's one-argument function, which is not the
+;; accumulator's two-argument step, so a literal `str` is the `fn` that
+;; calls the macro (gensym parameters `#r.N`) in the two-argument form and
+;; in `(reduce str init c)`; `concat` is the two-argument function but
+;; returns an `LSeq`, so its start is the empty one. A literal head the
+;; module defines or sees exported by a program module (`ctx-hides-macro`)
+;; is that function and has no identity: it goes through `reduce-nonempty`.
 ;;
 ;; In the last form every tail position of the literal `fn`'s body is
 ;; rewritten, through `if`, `let`, `do`, `match`, `cond`, `when`, `unless`,
@@ -23,20 +34,47 @@
 ;; rewrite recurses along the tail spine, which the reader's depth limit
 ;; bounds. Called by expand.prelude (the registry row `reduce`).
 (ns expand.prelude.reduce
-  (:use syntax.pos syntax.form expand.build expand.prelude.parts))
+  (:require [expand.own :as own])
+  (:use syntax.pos syntax.form expand.build expand.collections expand.ctx expand.prelude.parts))
 
-;; The identity of the literal heads whose `(f)` Clojure's reduce calls
-;; (`(+)` is 0): the value `(reduce f c)` starts from.
-(defun identity-of :private (f: Stx pos: Pos) -> (Option Stx)
+;; What `(reduce f c)` folds with and starts from.
+(defstruct Start :private (f: Stx init: Stx))
+
+;; The function a literal `str` is folded with: `(fn (a x) (str a x))` over
+;; gensyms, the call written `fib.prelude/str`, which no definition of the
+;; module's own `str` captures. The accumulator's gensym comes first.
+(defun str-step :private (ctx: ExpandCtx pos: Pos) -> Stx
+  (let ((acc (ctx-gensym ctx "r" pos))
+        (elem (ctx-gensym ctx "r" pos)))
+    (call "fn" [(list-form [acc elem] pos) (call (prelude-name "str") [acc elem] pos)] pos)))
+
+;; Whether `f` is the literal `str` that the prelude macro `str` is the
+;; meaning of in this module.
+(defun is-prelude-str :private (ctx: ExpandCtx f: Stx) -> bool
+  (and (is-sym f "str") (= (own/ctx-hides-macro ctx "str") false)))
+
+;; The empty lazy seq: `(fib.seq/lazy-node (fn () fib.seq/LNil))`.
+(defun empty-lseq :private (pos: Pos) -> Stx
+  (call "fib.seq/lazy-node"
+        [(call "fn" [(unit pos) (sym "fib.seq/LNil" pos)] pos)]
+        pos))
+
+;; What `(reduce f c)` folds with and starts from, for the literal heads
+;; whose `(f)` Clojure's reduce calls (`(+)` is 0); `nil` for any other
+;; head, and for one the module defines.
+(defun start-of :private (ctx: ExpandCtx f: Stx pos: Pos) -> (Option Start)
   (match (sym-of f)
     (nil nil)
     ((some s)
-     (cond ((= s "+") (some (int 0 pos)))
-           ((= s "*") (some (int 1 pos)))
-           ((= s "str") (some (string "" pos)))
-           ((or (= s "conj") (= s "concat")) (some (Stx (SVec (vec-empty)) pos)))
-           ((= s "merge") (some (Stx (SMap (vec-empty)) pos)))
-           (true nil)))))
+     (if (own/ctx-hides-macro ctx s)
+         nil
+         (cond ((= s "+") (some (Start f (int 0 pos))))
+               ((= s "*") (some (Start f (int 1 pos))))
+               ((= s "str") (some (Start (str-step ctx pos) (string "" pos))))
+               ((= s "conj") (some (Start f (Stx (SVec (vec-empty)) pos))))
+               ((= s "concat") (some (Start f (empty-lseq pos))))
+               ((= s "merge") (some (Start f (Stx (SMap (vec-empty)) pos))))
+               (true nil))))))
 
 ;; Where the tail sub-forms of a form are: none (the form is a leaf tail),
 ;; every item from an index on (the branches of an `if`), the last item (the
@@ -157,19 +195,25 @@
         (if (. r found) (some (Stx (SList (. r items)) (. f pos))) nil))
       nil))
 
-;; `(reduce f c)`: `reduce-nonempty`, or `reduce` over the identity of a
+;; `(reduce f c)`: `reduce-nonempty`, or `reduce` over the start of a
 ;; literal head.
-(defun two-argument-reduce :private (items: (Vec Stx) pos: Pos) -> Stx
-  (match (identity-of (nth items 1) pos)
-    ((some init) (call "fib.seq/reduce" [(nth items 1) init (nth items 2)] pos))
+(defun two-argument-reduce :private (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> Stx
+  (match (start-of ctx (nth items 1) pos)
+    ((some st) (call "fib.seq/reduce" [(. st f) (. st init) (nth items 2)] pos))
     (nil (call "fib.seq/reduce-nonempty" [(nth items 1) (nth items 2)] pos))))
 
+;; `(reduce f init c)`: the `fn` with its tails rewritten, or a literal
+;; `str` as the step.
+(defun three-argument-reduce :private (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Option Stx)
+  (match (with-reduced-tails (nth items 1) pos)
+    ((some f) (some (call "fib.seq/reduce-while" [f (nth items 2) (nth items 3)] pos)))
+    (nil (if (is-prelude-str ctx (nth items 1))
+             (some (call "fib.seq/reduce" [(str-step ctx pos) (nth items 2) (nth items 3)] pos))
+             nil))))
+
 ;; One call of `reduce`: its rewrite, or `nil` when it is declined.
-(defun reduce-macro (items: (Vec Stx) pos: Pos) -> (Option Stx)
+(defun reduce-macro (ctx: ExpandCtx items: (Vec Stx) pos: Pos) -> (Option Stx)
   (let ((n (count items)))
-    (cond ((= n 3) (some (two-argument-reduce items pos)))
-          ((= n 4)
-           (match (with-reduced-tails (nth items 1) pos)
-             (nil nil)
-             ((some f) (some (call "fib.seq/reduce-while" [f (nth items 2) (nth items 3)] pos)))))
+    (cond ((= n 3) (some (two-argument-reduce ctx items pos)))
+          ((= n 4) (three-argument-reduce ctx items pos))
           (true nil))))
