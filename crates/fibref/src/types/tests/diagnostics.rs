@@ -41,7 +41,7 @@ fn the_forms_that_expand_to_if_say_it_too() {
         "(when 1 2)",
         "(unless 1 2)",
         "(do (while 1 (set! c 1)) 0)",
-        "(cond (1 2) (else 3))",
+        "(cond 1 2 :else 3)",
         "(and 1 true)",
         "(or 1 true)",
         "(if (if true 1 2) 3 4)",

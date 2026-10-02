@@ -19,6 +19,7 @@
 use crate::syntax::{Form, FormKind, Pos};
 
 use super::Outcome;
+use crate::expand::brackets::seq_items;
 use crate::expand::build::{call, check_arity, int, list, malformed, unit};
 use crate::expand::collections::prelude_name;
 use crate::expand::ctx::ExpandCtx;
@@ -64,12 +65,12 @@ fn counting_loop(c: Counting, body: Vec<Form>, pos: &Pos) -> Form {
 /// `(dotimes (i n) body...)`.
 pub(super) fn dotimes(ctx: &ExpandCtx, items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
     check_arity("dotimes", &items, 1, None, pos)?;
-    let (i, n) = match items[1].as_list() {
+    let (i, n) = match seq_items(&items[1]) {
         Some([i, n]) if i.as_sym().is_some() => (i.clone(), n.clone()),
         _ => {
             return Err(malformed(
                 "dotimes",
-                "expected (dotimes (sym count) body)",
+                "expected (dotimes [sym count] body)",
                 &items[1].pos,
             ))
         }
@@ -121,7 +122,7 @@ fn literal_fn(form: &Form) -> Option<(Form, Vec<Form>)> {
     if items.len() < 3 || items[0].as_sym() != Some("fn") {
         return None;
     }
-    let param = match items[1].as_list()? {
+    let param = match seq_items(&items[1])? {
         [p] => p,
         _ => return None,
     };

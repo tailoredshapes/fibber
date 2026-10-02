@@ -120,7 +120,7 @@ fn reduced_in_a_literal_fn_is_reduce_while() {
 #[test]
 fn every_tail_is_found_through_the_forms_a_body_nests() {
     assert_eq!(
-        ex("(reduce (fn (a x) (let ((y (f x))) (do (g) (match y (0 (reduced a)) (_ (cond (p 1) (q (reduced 2)) (else 3))))))) 0 c)"),
+        ex("(reduce (fn (a x) (let ((y (f x))) (do (g) (match y (0 (reduced a)) (_ (cond p 1 q (reduced 2) :else 3)))))) 0 c)"),
         "(fib.seq/reduce-while (fn (a x) (let ((y (f x))) (do (g) (match y \
          (0 (fib.core/Done a)) (_ (if p (fib.core/More 1) (if q (fib.core/Done 2) \
          (fib.core/More 3)))))))) 0 c)"

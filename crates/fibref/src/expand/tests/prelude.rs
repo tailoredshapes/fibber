@@ -23,14 +23,15 @@ fn and_or() {
 }
 
 #[test]
-fn cond_nests_ifs_and_traps_when_nothing_matches() {
+fn cond_is_flat_nests_ifs_and_traps_when_nothing_matches() {
     assert_eq!(
-        ex("(cond (a 1) (b 2 3) (:else 4))"),
+        ex("(cond a 1 b (do 2 3) :else 4)"),
         "(if a 1 (if b (do 2 3) 4))"
     );
-    assert_eq!(ex("(cond (a 1) (else 4))"), "(if a 1 4)");
+    // Any keyword is a test that is always true.
+    assert_eq!(ex("(cond a 1 :default 4)"), "(if a 1 4)");
     assert_eq!(
-        ex("(cond (a 1))"),
+        ex("(cond a 1)"),
         "(if a 1 (fib.prelude/trap \"cond: no clause matched at t.fib:1:1\"))"
     );
     assert_eq!(
@@ -40,14 +41,30 @@ fn cond_nests_ifs_and_traps_when_nothing_matches() {
 }
 
 #[test]
-fn cond_rejects_bad_clauses() {
-    let e = ex_err("(cond a 1)");
+fn cond_has_no_special_symbol_else() {
+    // `else` is a variable like any other: a test, not the default.
+    assert_eq!(
+        ex("(cond a 1 else 4)"),
+        "(if a 1 (if else 4 (fib.prelude/trap \"cond: no clause matched at t.fib:1:1\")))"
+    );
+}
+
+#[test]
+fn cond_rejects_a_test_with_no_expression_and_a_keyword_before_the_end() {
+    let e = ex_err("(cond a 1 b)");
+    assert!(matches!(e.kind, K::Malformed { ref head, .. } if head == "cond"));
+    assert_eq!(
+        e.to_string(),
+        "t.fib:1:11: malformed cond: a test with no expression"
+    );
+    assert_eq!((e.pos.line, e.pos.col), (1, 11));
+    // The old paired clause is one form, so an odd count says so.
+    let e = ex_err("(cond (a 1))");
     assert!(matches!(e.kind, K::Malformed { ref head, .. } if head == "cond"));
     assert_eq!((e.pos.line, e.pos.col), (1, 7));
-    let e = ex_err("(cond (else 1) (a 2))");
+    let e = ex_err("(cond :else 1 a 2)");
     assert!(matches!(e.kind, K::Malformed { ref head, .. } if head == "cond"));
-    let e = ex_err("(cond (a))");
-    assert!(matches!(e.kind, K::Malformed { .. }));
+    assert_eq!((e.pos.line, e.pos.col), (1, 7));
 }
 
 #[test]

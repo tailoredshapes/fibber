@@ -134,8 +134,11 @@ fn clause_deletes_one_clause_of_a_match_or_a_cond() {
             body("(match a (0 1) (1 2) )"),
         ]
     );
-    let cond = body("(cond ((< a b) 1) (true 2))");
-    assert_eq!(made("clause", &cond).len(), 2);
+    let cond = body("(cond (< a b) 1 true 2)");
+    assert_eq!(
+        made("clause", &cond),
+        vec![body("(cond  true 2)"), body("(cond (< a b) 1 )")]
+    );
     assert!(made("clause", &body("(match a (_ 1))")).is_empty());
 }
 

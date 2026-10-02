@@ -340,6 +340,11 @@ same objects at the same points. The result is owned by the caller.
 param ::= sym | sym: type
 ```
 
+The parameter list may be written in brackets, `(fn [x y] body)` and `(fn name [x: i64] -> i64 body)`:
+the reader reads a vector, and the expander respells it as the list (`(fn (x y) body)`; the
+parameters of a bracket list are the items of the parenthesised one, patterns included), before
+anything else looks at the form (**Decided**, owner, stdlib E3). Both spellings are core.
+
 An anonymous function that closes over the variables it uses from
 enclosing scopes. With `name`, the body may call `name`; the call goes
 through the closure's own code pointer and environment, not through a
@@ -382,7 +387,17 @@ closure in tail position of a `defun` or `fn` body is a tail call; in an
 ```
 (let (binding+) body)
 binding ::= (pat expr) | (sym: type expr)
+(let [binding-item*] body)     ; the bracket spelling: flat pairs
 ```
+
+The bracket spelling takes the bindings as a flat vector, `(let [a 1 b 2] body)`: a pattern and its
+expression, again and again; a name that ends in `:` takes the next form as its type and the one
+after as its value (`[a: i64 1 b 2]`, three items for the first binding). The expander regroups
+the items into the parenthesised pairs, `(let ((a: i64 1) (b 2)) body)`, so the rest of this
+section, and the checker, see only the parenthesised form. A binding with no expression
+(`[a 1 b]`, `[a: i64]`) is `malformed let: a binding is a pattern and an expression, or
+name: a type and an expression`, at the first form of the incomplete binding (**Decided**, owner,
+stdlib E3). The parenthesised spelling keeps working.
 
 Sequential bindings: each initialiser sees the earlier ones. `(sym:
 type expr)` annotates the variable `sym` (§1.5); the initialiser's type
@@ -1304,6 +1319,7 @@ See §5.
 
 ```
 (loop ((sym expr)*) body)     ; a variable may be annotated: (sym: type expr), §1.5
+(loop [sym expr ..] body)     ; the bracket spelling of the bindings, as for `let` (§3.3)
 (recur expr*)                 ; only in tail position of the innermost enclosing loop body
 ```
 
@@ -1550,8 +1566,9 @@ of `set!` (§3.11, §3.13). `array-set!` and `set-field!` are not values
 
 | Macro | Expands to |
 |---|---|
-| `when`, `unless`, `cond`, `and`, `or` | `if` |
-| `if-let`, `when-let`, `nil?`-free option tests | `match`: `(if-let (p e) a b)` ⟹ `(match e ((some p) a) (_ b))`, `(when-let (p e) body ..)` ⟹ `(match e ((some p) body) (_ ()))`. `p` may be any pattern (§3.6): a name, a vector pattern, a variant pattern, a literal; the else is taken on `nil` and on a mismatch of `p`, so a refutable `p` is exhaustive (an else of `(nil b)` made it `missing (some [])`). `(if-let (p e) a)` has `()` as its else (arity 2 to 3; stdlib design §2.4, §7 E13) |
+| `when`, `unless`, `and`, `or` | `if` |
+| `cond` | `(cond t1 e1 t2 e2 ..)`, Clojure's flat pairs (stdlib E4): nested `if`s, `(cond a 1 b 2 :else 3)` ⟹ `(if a 1 (if b 2 3))`. A test that is a keyword (`:else`, or any other) is always true and must be the last test (`malformed cond: a keyword test must be the last`); the symbol `else` is not special, it is a variable. Without a keyword test falling off the end is `(fib.prelude/trap "cond: no clause matched at POS")`, which has every type, so `(cond)` is that trap (X5 changes it to `nil`). An odd number of forms is `malformed cond: a test with no expression`, at the last form. The paired `(cond (t e) ..)` of the first tranche is gone; a clause of several bodies is `t (do b1 b2)` |
+| `if-let`, `when-let`, `nil?`-free option tests | `match` (the pair `(p e)` may be written `[p e]`, as `dotimes`'s `(i n)` may be `[i n]`, stdlib E3): `(if-let (p e) a b)` ⟹ `(match e ((some p) a) (_ b))`, `(when-let (p e) body ..)` ⟹ `(match e ((some p) body) (_ ()))`. `p` may be any pattern (§3.6): a name, a vector pattern, a variant pattern, a literal; the else is taken on `nil` and on a mismatch of `p`, so a refutable `p` is exhaustive (an else of `(nil b)` made it `missing (some [])`). `(if-let (p e) a)` has `()` as its else (arity 2 to 3; stdlib design §2.4, §7 E13) |
 | `list` | `(list a b)` ⟹ `(fib.prelude/Cons a (fib.prelude/Cons b fib.prelude/Empty))`, `(list)` ⟹ `fib.prelude/Empty` (`Empty` is `List`'s field-less variant, used bare: §3.9; the variants are qualified so that the library's function `cons` and method `empty` cannot capture them) |
 | `plet` | §3.12 |
 | `while`, `dotimes`, `for-each` over a `range` | `loop`/`recur` (§3.18): `(while c body)` ⟹ `(loop () (if c (do body (recur)) ()))`; `(dotimes (i n) body)` ⟹ `(let ((m n)) (loop ((i 0)) (if (< i m) (do body (recur (+ i 1))) ())))` with `m` a gensym; `(for-each (range a b) (fn (i) body))`, with a literal `(range a b)` or `(range n)` (read as `(range 0 n)`) and a literal `fn` with no name, one unannotated parameter and no result annotation, ⟹ `(let ((s a) (m b)) (loop ((i s)) (if (< i m) (do body (recur (+ i 1))) ())))` with `s` and `m` gensyms, the body spliced in with no closure. A loop variable takes no annotation, so a `fn` whose parameter is annotated (`(fn (i: i64) ..)`) is left to the library function, which checks it (case 86). The bounds are evaluated once, left to right, before the loop variable exists, so a bound that mentions a variable named like `i` sees the outer one (**Decided**, owner, 2026-09-27; the earlier `(loop ((i 0) (m n)) ..)` bound `n` inside the loop's own `i`); any other `(for-each c f)` is `(fib.seq/run! f c)`, the library's walk with the function first (the prelude's `for-each` function and its `Traversable` protocol are gone, stdlib §8.3 C), and a call of any other number of arguments is the macro's own arity error |

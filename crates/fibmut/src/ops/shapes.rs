@@ -26,20 +26,26 @@ pub fn branch(src: &str, n: &Node, out: &mut Vec<Mutant>) {
     out.push(replace("branch", cond.start, cond.end, negated));
 }
 
-/// One clause of a `match` or a `cond` is deleted; a form with one clause
-/// is left alone (it would only stop compiling).
+/// One clause of a `match` or a `cond` is deleted (a clause of a `cond` is
+/// a test and its expression, two forms); a form with one clause is left
+/// alone (it would only stop compiling).
 pub fn clause(src: &str, n: &Node, out: &mut Vec<Mutant>) {
-    let first = match n.head(src) {
-        Some("match") => 2,
-        Some("cond") => 1,
+    let spans: Vec<(usize, usize)> = match n.head(src) {
+        Some("match") => (n.kids.iter().skip(2))
+            .filter(|c| c.kind == Kind::List)
+            .map(|c| (c.start, c.end))
+            .collect(),
+        Some("cond") => (n.kids[1..].chunks_exact(2))
+            .map(|pair| (pair[0].start, pair[1].end))
+            .collect(),
         _ => return,
     };
-    let clauses: Vec<&Node> = n.kids.iter().skip(first).collect();
-    if clauses.len() < 2 {
+    let clauses = n.kids.len() - if n.head(src) == Some("match") { 2 } else { 1 };
+    if clauses < 2 {
         return;
     }
-    for c in clauses.iter().filter(|c| c.kind == Kind::List) {
-        out.push(replace("clause", c.start, c.end, String::new()));
+    for (start, end) in spans {
+        out.push(replace("clause", start, end, String::new()));
     }
 }
 
@@ -116,7 +122,12 @@ fn tails<'a>(n: &'a Node, src: &str, found: &mut Vec<&'a Node>) {
         }
         Some("do" | "let" | "when" | "unless" | "fn") => last(n, found),
         Some("match") => n.kids.iter().skip(2).for_each(|c| last(c, found)),
-        Some("cond") => n.kids.iter().skip(1).for_each(|c| last(c, found)),
+        Some("cond") => n
+            .kids
+            .iter()
+            .skip(2)
+            .step_by(2)
+            .for_each(|e| tails(e, src, found)),
         _ => found.push(n),
     }
 }

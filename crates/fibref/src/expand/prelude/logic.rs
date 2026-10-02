@@ -3,6 +3,7 @@
 
 use crate::syntax::{Form, FormKind, Pos};
 
+use crate::expand::brackets::seq_items;
 use crate::expand::build::{boolean, call, check_arity, list, malformed, string, sym, unit};
 use crate::expand::collections::prelude_name;
 use crate::expand::error::ExpandError;
@@ -61,56 +62,46 @@ pub(super) fn and_or(items: Vec<Form>, pos: &Pos, is_and: bool) -> Form {
     call("if", vec![first, then, other], pos)
 }
 
-/// Whether a `cond` clause test is the catch-all `else` or `:else`.
-fn is_else(test: &Form) -> bool {
-    match &test.kind {
-        FormKind::Sym(s) => s == "else",
-        FormKind::Kw(k) => k == "else",
-        _ => false,
-    }
-}
-
-/// `(cond (test body+)*)`: nested `if`s, tried in order. A final clause
-/// whose test is `else` or `:else` is the default; without one, falling
-/// off the end is `(fib.prelude/trap "cond: no clause matched at POS")`,
-/// which has every type, so `(cond)` is that trap.
+/// `(cond t1 e1 t2 e2 ...)`, Clojure's flat form: nested `if`s, tried in
+/// order. A test that is a keyword (`:else`) is always true and must be the
+/// last one; without one, falling off the end is
+/// `(fib.prelude/trap "cond: no clause matched at POS")`, which has every
+/// type, so `(cond)` is that trap. An odd number of forms is a test with no
+/// expression.
 pub(super) fn cond(items: Vec<Form>, pos: &Pos) -> Result<Form, ExpandError> {
-    let clauses: Vec<Form> = items.into_iter().skip(1).collect();
-    if let Some(bad) = clauses
-        .iter()
-        .find(|c| c.as_list().is_none_or(|p| p.len() < 2))
-    {
-        return Err(malformed("cond", "a clause is (test body+)", &bad.pos));
+    let mut forms: Vec<Form> = items.into_iter().skip(1).collect();
+    if forms.len() % 2 == 1 {
+        let at = forms.last().map_or(pos, |f| &f.pos);
+        return Err(malformed("cond", "a test with no expression", at));
     }
     let message = format!("cond: no clause matched at {pos}");
     let mut acc = call(&prelude_name("trap"), vec![string(&message, pos)], pos);
-    for (i, clause) in clauses.into_iter().rev().enumerate() {
-        let cpos = clause.pos;
-        let mut parts = match clause.kind {
-            FormKind::List(parts) if parts.len() >= 2 => parts,
-            _ => return Err(malformed("cond", "a clause is (test body+)", &cpos)),
-        };
-        let body = body_form(parts.split_off(1), &cpos);
-        let test = parts.pop().unwrap_or_else(|| boolean(true, &cpos));
-        if is_else(&test) {
-            if i != 0 {
-                return Err(malformed("cond", "else must be the last clause", &cpos));
+    let mut last = true;
+    while let (Some(expr), Some(test)) = (forms.pop(), forms.pop()) {
+        if matches!(test.kind, FormKind::Kw(_)) {
+            if !last {
+                return Err(malformed(
+                    "cond",
+                    "a keyword test must be the last",
+                    &test.pos,
+                ));
             }
-            acc = body;
+            acc = expr;
         } else {
-            acc = call("if", vec![test, body, acc], pos);
+            acc = call("if", vec![test, expr, acc], pos);
         }
+        last = false;
     }
     Ok(acc)
 }
 
-/// The `(x e)` binding of `if-let`/`when-let`.
+/// The `(x e)` or `[x e]` binding of `if-let`/`when-let`.
 fn option_binding(name: &str, form: &Form) -> Result<(Form, Form), ExpandError> {
-    match form.as_list() {
+    match seq_items(form) {
         Some([x, e]) => Ok((x.clone(), e.clone())),
         _ => Err(malformed(
             name,
-            "the binding is (pattern expression)",
+            "the binding is [pattern expression]",
             &form.pos,
         )),
     }

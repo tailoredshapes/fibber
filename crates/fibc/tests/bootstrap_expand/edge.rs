@@ -87,7 +87,7 @@ fn errors() -> Vec<Input> {
         one("derive-generic", "(defstruct (Pair a b) (fst: a snd: b))\n(derive Eq Pair)(derive Show Pair)\n"),
         one("macro-odd-map", "(defmacro m () (Map [(Int 1 :i64) (Int 2 :i64) (Int 3 :i64)]))\n(defun f () -> i64 (g (m)))\n"),
         one("arity-prelude-macro", "(defun f () -> i64 (dbg 1 2))\n"),
-        one("cond-else-not-last", "(defun f (x) -> i64 (cond (else 1) (x 2)))\n"),
+        one("cond-else-not-last", "(defun f (x) -> i64 (cond :else 1 x 2))\n"),
         one("let-binding", "(defun f () -> i64 (let (a) 1))\n"),
         one("limit-deep-and", "(defun f (x) -> i64 (and x x x x x x x x x x x x x x x x))\n"),
     ]

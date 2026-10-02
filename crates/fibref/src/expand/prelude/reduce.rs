@@ -23,7 +23,7 @@
 //! that function and has no identity: it goes through `reduce-nonempty`.
 //!
 //! In the last form every tail position of the literal `fn`'s body is
-//! rewritten, through `if`, `let`, `do`, `match`, `cond`, `when`,
+//! rewritten, through `if`, `let`, `do`, `match`, flat `cond`, `when`,
 //! `unless`, `if-let`, `when-let` and `loop`: a tail `(reduced e)` becomes
 //! `(fib.core/Done e)`, any other tail `v` becomes `(fib.core/More v)`,
 //! and a tail `(recur ..)` is left alone (it is not a value). A call is
@@ -37,6 +37,7 @@
 use crate::syntax::{Form, FormKind, IntWidth, Pos};
 
 use super::Outcome;
+use crate::expand::brackets::seq_items;
 use crate::expand::build::{call, list, string, sym};
 use crate::expand::collections::prelude_name;
 use crate::expand::ctx::ExpandCtx;
@@ -103,8 +104,11 @@ enum Shape {
     From(usize),
     /// The last item (the body of `let`, `do`, `loop`, `when`..).
     Last,
-    /// The last item of every clause from this index on (`match`, `cond`).
+    /// The last item of every clause from this index on (`match`).
     Clauses(usize),
+    /// Every second item after this index: the expressions of the pairs of
+    /// a test and an expression that start at it (`cond`).
+    Flat(usize),
 }
 
 fn shape(form: &Form) -> Shape {
@@ -116,7 +120,7 @@ fn shape(form: &Form) -> Shape {
         ("if" | "if-let", 4) => Shape::From(2),
         ("do", 2..) | ("let" | "loop" | "when" | "unless" | "when-let", 3..) => Shape::Last,
         ("match", 3..) => Shape::Clauses(2),
-        ("cond", 2..) => Shape::Clauses(1),
+        ("cond", 2..) => Shape::Flat(1),
         _ => Shape::Leaf,
     }
 }
@@ -130,6 +134,7 @@ fn tail_slots(form: &mut Form, shape: Shape) -> Vec<&mut Form> {
         Shape::Leaf => Vec::new(),
         Shape::From(n) => items.iter_mut().skip(n).collect(),
         Shape::Last => items.last_mut().into_iter().collect(),
+        Shape::Flat(n) => items.iter_mut().skip(n + 1).step_by(2).collect(),
         Shape::Clauses(n) => items
             .iter_mut()
             .skip(n)
@@ -195,7 +200,7 @@ fn rewrite_tails(body: &mut Form, pos: &Pos) -> bool {
 /// no `->` or `:where` before the body.
 fn literal_fn(form: &Form) -> Option<&[Form]> {
     let items = form.as_list()?;
-    if items.len() < 3 || items[0].as_sym() != Some("fn") || items[1].as_list()?.len() != 2 {
+    if items.len() < 3 || items[0].as_sym() != Some("fn") || seq_items(&items[1])?.len() != 2 {
         return None;
     }
     let annotated = match &items[2].kind {

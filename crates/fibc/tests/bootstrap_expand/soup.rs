@@ -137,21 +137,18 @@ impl Soup<'_> {
 
     fn cond(&mut self, d: usize) -> String {
         let n = self.rng.between(0, 3);
-        let mut clauses: Vec<String> = (0..n)
-            .map(|_| match self.rng.below(8) {
-                0 => self.expr(d),
-                1 => format!("({})", self.expr(d)),
-                _ => format!("({} {})", self.expr(d), self.expr(d)),
-            })
-            .collect();
+        let mut forms: Vec<String> = (0..n).flat_map(|_| [self.expr(d), self.expr(d)]).collect();
         if self.rng.one_in(2) {
-            let tail = if self.rng.one_in(2) { "else" } else { ":else" };
-            clauses.push(format!("({tail} {})", self.expr(d)));
+            forms.push(":else".to_string());
+            forms.push(self.expr(d));
+        }
+        if self.rng.one_in(8) {
+            forms.pop();
         }
         if self.rng.one_in(6) {
-            clauses.reverse();
+            forms.reverse();
         }
-        format!("(cond {})", clauses.join(" "))
+        format!("(cond {})", forms.join(" "))
     }
 
     fn let_macro(&mut self, name: &str, d: usize) -> String {
@@ -302,7 +299,7 @@ impl Soup<'_> {
             1 => format!("(let ((y {e})) {t})"),
             2 => format!("(do {e} {t})"),
             3 => format!("(match {e} (1 {t}) (_ {u}))"),
-            4 => format!("(cond ({e} {t}) (else {u}))"),
+            4 => format!("(cond {e} {t} :else {u})"),
             5 => format!("(when {e} {t})"),
             6 => format!("(unless {e} {t})"),
             7 => format!("(if-let (p {e}) {t} {u})"),

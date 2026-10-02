@@ -190,13 +190,10 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// `(cond (test expr..) ..)`: every form of a clause is code.
+    /// `(cond test expr ..)`: every form is code.
     fn cond_form(&mut self, n: &Node) {
-        for clause in n.kids.iter().skip(1) {
-            match clause.kind {
-                Kind::List => clause.kids.iter().for_each(|k| self.code(k)),
-                _ => self.code(clause),
-            }
+        for k in n.kids.iter().skip(1) {
+            self.code(k);
         }
     }
 }

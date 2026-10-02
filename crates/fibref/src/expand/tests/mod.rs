@@ -1,5 +1,6 @@
 //! Unit tests for the expander, split by what they cover.
 
+mod brackets;
 mod derive;
 mod errors;
 mod fuse;

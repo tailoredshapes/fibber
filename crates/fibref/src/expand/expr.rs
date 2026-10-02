@@ -7,6 +7,7 @@
 
 use crate::syntax::{Form, FormKind, Pos};
 
+use super::brackets;
 use super::build::{head_name, malformed};
 use super::collections::{map_literal, vec_literal};
 use super::core::{expr_plan, Role};
@@ -141,6 +142,10 @@ pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, Exp
                 Outcome::Expanded(f) => form = f,
                 Outcome::Declined(f) => return Ok(f),
             }
+        } else if brackets::has_brackets(&form) {
+            // A syntactic respelling: no step, and no growth to admit.
+            form = brackets::rewrite(form)?;
+            continue;
         } else if params::fn_has_patterns(&form) {
             ex.ctx.step(&pos)?;
             form = params::desugar(ex.ctx, form, false)?;

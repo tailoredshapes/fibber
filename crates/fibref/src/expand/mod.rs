@@ -43,6 +43,7 @@
 //! described in `derive`.
 
 mod admit;
+mod brackets;
 mod build;
 mod collections;
 mod core;
