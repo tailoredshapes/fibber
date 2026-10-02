@@ -1,14 +1,245 @@
 ;; compiler/own/explain.fib: the printer of spec/types.md §9 (`fibref explain`), as
-;; crates/fibref/src/own/explain/mod.rs (380 lines of Rust). Package O8; every public function
-;; is a stub of its final signature.
+;; crates/fibref/src/own/explain/mod.rs (385 lines of Rust). Package O8.
+;;
+;; Per `defun`, `defun f.owned`, `impl` method and `def` of a module a block of lines: the title,
+;; `params:`, `bindings:`, one `closure`/`async` line for each literal directly in it, `calls:`
+;; (the first line labelled, the others aligned), `ops:` and a blank line; then the blocks of the
+;; literals, each under `fn @L:C` or `async @L:C`. The words of expressions, sites, operations,
+;; passes and tails are own.explain.names'.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust code writes into one `String` with `writeln!`; this builds a `(Vec str)` of lines
+;;   (the blank line is the empty string), and `explain` joins them with a newline after each.
+;; - `explain-lines p o m` is Rust's `explain_module` as lines (the section `explain` of
+;;   `fibref own` prints one module at a time); `explain` is `explain_module` of the main module.
+;; - the frame's expressions are one pre-order list; its literals are those of them that are `fn`
+;;   or `async` (Rust collects them in a second list, in the same order).
 (ns own.explain
-  (:use types.program own.program))
+  (:use fib.string types.ast types.decls types.table types.program types.display own.program own.syntactic
+        own.explain.names))
+
+;; What a block is written from: the program, the decisions for the body, the index of the body.
+(defstruct Section (p: TypedProgram b: BodyOwn ix: (Map i64 Expr)))
+
+;; Where a body is, and its block's title.
+(defstruct Header (title: str body: Expr module: i64))
 
 ;; Rust: explain/mod.rs:28 `explain`: the explanation of every body of the user module, in checking order.
 (defun explain (p: TypedProgram o: OwnedProgram) -> str
-  (trap "todo: explain"))
+  (str-join (mapv (fn (l: str) (str-concat l "\n")) (explain-lines p o @(. (. p globals) main)))))
 
 ;; The §9 text of the bodies of module m, as lines (new: the section `explain` of `fibref own`
-;; prints one module at a time; its Rust counterpart filters `explain`'s output by module).
+;; prints one module at a time; its Rust counterpart is `explain_module`).
 (defun explain-lines (p: TypedProgram o: OwnedProgram m: i64) -> (Vec str)
-  (trap "todo: explain-lines"))
+  (reduce (fn (acc: (Vec str) key: BodyKey)
+            (let ((h (header p key)))
+              (if (= (. h module) m)
+                  (if-some [b (get (. o bodies) key)]
+                    (frame acc (Section p b (names-index (. h body))) (. h title) (. b params) (. h body))
+                    acc)
+                  acc)))
+          [] (. o order)))
+
+;; Rust: explain/mod.rs:57 `header`: the title, body and module of the body `key` names.
+(defun header :private (p: TypedProgram key: BodyKey) -> Header
+  (let ((g (. p globals)))
+    (match key
+      ((BodyFun f) (fun-header p f ""))
+      ((BodyAllOwned f) (fun-header p f ".owned"))
+      ((BodyMethod i m) (method-header g i m ""))
+      ((BodyMethodOwned i m) (method-header g i m ".owned"))
+      ((BodyDef d)
+       (let ((def (g-def g d)))
+         (Header (str-concat "def " (. def name)) (. def init) (. def module)))))))
+
+(defun fun-header :private (p: TypedProgram f: i64 suffix: str) -> Header
+  (let ((def (g-fun (. p globals) f))
+        (ty (if-some [s (get (. p fun-schemes) f)] (program-show-scheme p s) "")))
+    (Header (str-join [(if (. def is-macro) "defmacro" "defun") " " (. def name) suffix " : " ty])
+            (. def body) (. def module))))
+
+(defun method-header :private (g: Globals i: i64 m: i64 suffix: str) -> Header
+  (let ((inst (table-get (. g instances) i))
+        (im (nth (. inst methods) m))
+        (proto (g-proto g (. inst proto)))
+        (ty (printer-ty (printer-with-names g (. inst var-names) []) (. inst head))))
+    (Header (str-join ["impl " (. proto name) "/" (. (nth (. proto methods) (. im index)) name) suffix
+                       " for " ty])
+            (. im body) (. inst module))))
+
+;; Whether e is a `fn` or an `async` literal: a frame of its own.
+(defun literal? :private (e: Expr) -> bool
+  (match (. e kind) ((EFn _) true) ((EAsync _ _) true) (_ false)))
+
+;; The expressions of one frame (not inside nested literals) in pre-order, the literals included.
+(defun frame-exprs :private (acc: (Vec Expr) e: Expr) -> (Vec Expr)
+  (if (literal? e)
+      (conj acc e)
+      (reduce (fn (a: (Vec Expr) c: Expr) (frame-exprs a c)) (conj acc e) (children-of e))))
+
+;; The block of one frame, then the blocks of its literals.
+(defun frame (acc: (Vec str) s: Section title: str params: (Vec ParamOwn) body: Expr) -> (Vec str)
+  (let ((exprs (frame-exprs [] body))
+        (lits (filterv literal? exprs))
+        (a1 (conj (conj acc title) (str-concat "  params:    " (params-text s params))))
+        (a2 (conj a1 (str-concat "  bindings:  " (items-text ";  " (binding-items s exprs)))))
+        (a3 (reduce (fn (a: (Vec str) l: Expr) (closure-line a s l)) a2 lits))
+        (a4 (into a3 (call-lines s exprs)))
+        (a5 (conj a4 (str-concat "  ops:       " (items-text "; " (ops-post [] s body)))))
+        (a6 (conj a5 "")))
+    (reduce (fn (a: (Vec str) l: Expr) (literal-frame a s l)) a6 lits)))
+
+;; The block of the `fn` or `async` literal l.
+(defun literal-frame :private (acc: (Vec str) s: Section l: Expr) -> (Vec str)
+  (match (. l kind)
+    ((EFn lit) (frame acc s (str-concat "fn " (names-at l)) (closure-params s l) (. lit body)))
+    ((EAsync inner _) (frame acc s (str-concat "async " (names-at l)) [] inner))
+    (_ acc)))
+
+(defun closure-params :private (s: Section l: Expr) -> (Vec ParamOwn)
+  (if-some [c (get (. (. s b) closures) (. l id))] (. c params) []))
+
+;; The items joined by sep, or `(none)`.
+(defun items-text :private (sep: str items: (Vec str)) -> str
+  (if (empty? items) "(none)" (join sep items)))
+
+(defun params-text :private (s: Section ps: (Vec ParamOwn)) -> str
+  (items-text ";  " (mapv (fn (x: ParamOwn) (param-text s x)) ps)))
+
+;; `NAME  KIND  escapes=no|yes|no (declared :borrow)`, or `NAME  scalar`, `NAME  &param`.
+(defun param-text :private (s: Section x: ParamOwn) -> str
+  (let ((name (. (g-binding (. (. s p) globals) (. x binding)) name))
+        (esc (cond (. x declared-borrow) "no (declared :borrow)"
+                   (. x escapes) "yes"
+                   :else "no")))
+    (match (. x kind)
+      ((PkScalar) (str-concat name "  scalar"))
+      ((PkAmp) (str-concat name "  &param"))
+      ((PkBorrowed) (str-join [name "  borrowed  escapes=" esc]))
+      ((PkOwned ws)
+       (str-join [name "  owned (" (join "; " (mapv owned-why ws)) ")  escapes=" esc])))))
+
+(defun owned-why :private (w: OwnedWhy) -> str
+  (match w
+    ((OwRule1 x) (str-concat "rule 1: " x))
+    ((OwRule2 x) (str-concat "rule 2: " x))
+    ((OwRule3 x) (str-concat "rule 3: " x))
+    ((OwLoop x) (str-concat "rule 1 " x))
+    ((OwDeclared) "not inferred")))
+
+;; The bindings a pattern introduces, in order, added to acc.
+(defun pattern-vars :private (acc: (Vec i64) p: Pattern) -> (Vec i64)
+  (match (. p kind)
+    ((PBind b) (conj acc b))
+    ((PAs q b) (pattern-vars (conj acc b) q))
+    ((PCtor _ _ subs) (reduce (fn (a: (Vec i64) q: Pattern) (pattern-vars a q)) acc subs))
+    ((PVec subs rest)
+     (let ((a (reduce (fn (a0: (Vec i64) q: Pattern) (pattern-vars a0 q)) acc subs)))
+       (match rest ((RestBind b) (conj a b)) (_ a))))
+    (_ acc)))
+
+;; The bindings an expression introduces.
+(defun bound-by :private (e: Expr) -> (Vec i64)
+  (match (. e kind)
+    ((ELet bs _) (reduce (fn (a: (Vec i64) x: LetBind) (pattern-vars a (. x pat))) [] bs))
+    ((EMatch _ cls) (reduce (fn (a: (Vec i64) c: Clause) (pattern-vars a (. c pat))) [] cls))
+    ((ELoop vs _) (mapv (fn (v: LoopBind) (. v binding)) vs))
+    (_ [])))
+
+;; `NAME  owns|alias-of S|derived-of S[ scope-local]` for a binding that has an object of its own.
+(defun binding-item :private (s: Section b: i64 x: BindingOwn) -> (Option str)
+  (let ((p (. s p))
+        (kind (match (. x kind)
+                ((BnOwns) (some "owns"))
+                ((BnAliasOf site) (some (str-concat "alias-of " (names-site p (. s ix) site))))
+                ((BnDerivedOf site) (some (str-concat "derived-of " (names-site p (. s ix) site))))
+                (_ nil))))
+    (if-some [k kind]
+      (some (str-join [(. (g-binding (. p globals) b) name) "  " k (if (. x scope-local) " scope-local" "")]))
+      nil)))
+
+;; The bindings of the frame, then its scope-local temporaries.
+(defun binding-items :private (s: Section exprs: (Vec Expr)) -> (Vec str)
+  (let ((bound (reduce (fn (acc: (Vec str) e: Expr)
+                         (reduce (fn (a: (Vec str) b: i64)
+                                   (if-some [x (get (. (. s b) bindings) b)]
+                                     (if-some [item (binding-item s b x)] (conj a item) a)
+                                     a))
+                                 acc (bound-by e)))
+                       [] exprs)))
+    (reduce (fn (a: (Vec str) e: Expr)
+              (if (contains? (. (. s b) stack-temps) (. e id))
+                  (conj a (str-concat (names-show (. s p) e) "  temporary scope-local"))
+                  a))
+            bound exprs)))
+
+(defun reason-text :private (r: (Option str)) -> str
+  (if-some [why r] (str-join ["yes (" why ")"]) "no"))
+
+;; How a capture is written: `owns`, `alias`, `&-cell`, or the pass's own word.
+(defun capture-word :private (x: Pass) -> str
+  (match x ((PsRetain) "owns") ((PsAlias) "alias") ((PsOwnCell) "&-cell") (_ (names-pass x))))
+
+;; The `closure` or `async` line of the literal l, if the pass decided it.
+(defun closure-line :private (acc: (Vec str) s: Section l: Expr) -> (Vec str)
+  (if-some [c (get (. (. s b) closures) (. l id))]
+    (let ((caps (mapv (fn (k: CaptureOwn)
+                        (str-join [(. (g-binding (. (. s p) globals) (. k binding)) name) " ("
+                                   (capture-word (. k pass)) ")"]))
+                      (filterv (fn (k: CaptureOwn) (not (= (. k pass) PsScalar))) (. c captures)))))
+      (conj acc (str-join ["  " (if (. c is-async) "async" "closure") " " (names-at l)
+                           "  escaping=" (reason-text (. c escaping)) "  heap=" (reason-text (. c heap))
+                           "  captures: " (items-text ", " caps)])))
+    acc))
+
+;; `&NAME: PASS` or `arg N EXPR: PASS`.
+(defun arg-text :private (s: Section args: (Vec Arg) i: i64 x: Pass) -> str
+  (match (nth args i)
+    ((ArgAmp b _)
+     (str-join ["&" (. (g-binding (. (. s p) globals) b) name) ": " (names-pass x)]))
+    ((ArgExpr e) (str-join ["arg " (show (+ i 1)) " " (names-show (. s p) e) ": " (names-pass x)]))))
+
+(defun ops-text :private (s: Section ops: (Vec Op)) -> (Vec str)
+  (mapv (fn (o: Op) (names-op (. s p) (. s ix) o)) ops))
+
+;; The words of a call: where, the tail decision, the head, the arguments, the releases before the jump.
+(defun call-text :private (s: Section e: Expr c: CallOwn args: (Vec Arg)) -> str
+  (let ((argv (vec (map-indexed (fn (i: i64 x: Pass) (arg-text s args i x)) (. c args)))))
+    (join "   "
+          (filterv (fn (x: str) (not (empty? x)))
+                   [(str-join [(names-at e) " " (names-show (. s p) e)])
+                    (names-tail (. s p) (. c tail) (. c callee))
+                    (if (= (. c head) PsScalar) "" (str-concat "head: " (names-pass (. c head))))
+                    (join "; " argv)
+                    (if (empty? (. c jump)) "" (str-concat "before the jump: " (join ", " (ops-text s (. c jump)))))]))))
+
+(defun recur-text :private (s: Section e: Expr r: RecurOwn) -> str
+  (str-join [(names-at e) " recur   "
+             (join "; " (vec (map-indexed (fn (i: i64 x: Pass) (str-join ["arg " (show (+ i 1)) ": " (names-pass x)]))
+                                          (. r args))))
+             "   before the jump: " (join ", " (ops-text s (. r jump)))]))
+
+;; The text of the call or `recur` e, if it is one.
+(defun call-item :private (s: Section e: Expr) -> (Option str)
+  (if-some [c (get (. (. s b) calls) (. e id))]
+    (match (. e kind)
+      ((ECall _ args) (some (call-text s e c args)))
+      (_ nil))
+    (if-some [r (get (. (. s b) recurs) (. e id))] (some (recur-text s e r)) nil)))
+
+;; The `calls:` lines: the first labelled, the others aligned under it.
+(defun call-lines :private (s: Section exprs: (Vec Expr)) -> (Vec str)
+  (let ((items (reduce (fn (a: (Vec str) e: Expr) (if-some [t (call-item s e)] (conj a t) a)) [] exprs)))
+    (vec (map-indexed (fn (i: i64 t: str) (str-join ["  " (if (= i 0) "calls:   " "         ") "  " t])) items))))
+
+;; The operations of the frame in the order they run: an expression's `after` list follows those
+;; of its sub-expressions; then the false edge of its guard.
+(defun ops-post :private (acc: (Vec str) s: Section e: Expr) -> (Vec str)
+  (let ((a1 (if (literal? e) acc (reduce (fn (a: (Vec str) c: Expr) (ops-post a s c)) acc (children-of e))))
+        (line (str-concat "L" (show (. (. e pos) line))))
+        (a2 (if-some [x (get (. (. s b) exprs) (. e id))]
+              (into a1 (mapv (fn (t: str) (str-join [line " " t])) (ops-text s (. x after))))
+              a1)))
+    (if-some [fs (get (. (. s b) guard-fail) (. e id))]
+      (into a2 (mapv (fn (t: str) (str-join [line " guard false: " t])) (ops-text s fs)))
+      a2)))

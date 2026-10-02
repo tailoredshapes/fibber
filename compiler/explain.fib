@@ -1,0 +1,59 @@
+;; compiler/explain.fib: the explanation tool, as `fibref explain FILE` (crates/fibref/src/main.rs
+;; `run_explain`, spec/types.md §9): checks the one module in FILE through the ownership pass and
+;; prints `explain` (own.explain), the §9 text of its bodies; or, if the front end rejects it, the
+;; line `rejected:` and the errors, one on each line, with status 1. It is the judge of package
+;; O8: `compiler/tests/types/compare.sh -c explain FIBREF TOOL FILE..` compares it with
+;; `fibref explain`, byte for byte.
+;;
+;; Exit status: 0 if it explained the file, 1 if the front end rejected it, 2 if the file could
+;; not be read or the words are not one file name (a usage line to stderr, nothing to stdout).
+;; The file is loaded, expanded and lowered as `own.dump` does (types.dump's file loop, the
+;; implicit library, the prelude); the explanation is `explain` of the main module.
+;; Not ported from `run_explain`: `-I DIR` (library roots), and the text of the operating
+;; system's error for an unreadable file (the reason is not printed). A file that does not load,
+;; read or expand prints `rejected:` and the error record of types.dump (not Rust's `read: ..`
+;; or `expand: ..` text). It links every module of compiler/own/ it needs, in dependency order,
+;; as compiler/own.fib.
+(ns main
+  (:require [types.dump :as td] [types.driver :as tdr] [types.dump.sections :as sec]
+            [types.args :as ta])
+  (:use fib.string syntax.form expand.types own.args own.error own.objects own.program own.syntactic own.captured own.taken
+        own.walk.state own.walk.callee own.walk.pattern own.walk.lit own.walk.expr own.walk.call
+        own.facts own.classify own.stack own.unit own.top own.driver own.explain.names own.explain))
+
+(def usage: str "usage: explain FILE")
+
+;; What the tool prints for a program that loaded: the explanation of its main module, printed
+;; at once, or `rejected:` and the errors of the step that failed.
+(defun explain-check (modules: (Vec Expanded) prelude: (Vec Stx) opts: ta/Options) -> td/Dumped
+  (let ((rejected (fn (e: CheckError) -> td/Dumped (td/Dumped ["rejected:" (check-error-text e)] 1))))
+    (match (tdr/lower-modules modules prelude)
+      ((Err errs) (rejected (CeType errs)))
+      ((Ok l)
+       (match (own-check-lowered l (not (. opts library)))
+         ((Err e) (rejected e))
+         ((Ok c) (do (print-raw (explain (. c typed) (. c owned))) (td/Dumped [] 0))))))))
+
+;; Prints the lines of a dump, each ended by a newline.
+(defun print-lines (lines: (Vec str))
+  (doseq [line lines] (println line)))
+
+;; Explains the file, and returns the exit status.
+(defun explain-file (file: str) -> i64
+  (let ((d (td/dump-file file (base-options (own-options-default))
+                         (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx)
+                              layout: (Vec sec/Shown) home: str opts: ta/Options)
+                           (explain-check modules prelude opts))))
+        (lines (. d lines)))
+    (cond (empty? lines) 0
+          (= (nth lines 0) (str-concat "== " file))
+          (if (and (> (count lines) 1) (= (nth lines 1) "unreadable"))
+              (do (eprintln (str-concat "fibref: cannot read " file)) 2)
+              (do (println "rejected:") (print-lines (vec (drop 1 lines))) (. d status)))
+          :else (do (print-lines lines) (. d status)))))
+
+(defun main () -> i64
+  (let ((words (args)))
+    (if (= (count words) 1)
+        (explain-file (nth words 0))
+        (do (eprintln usage) 2))))

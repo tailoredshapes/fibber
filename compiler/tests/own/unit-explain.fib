@@ -1,0 +1,214 @@
+;; compiler/tests/own/unit-explain.fib: the printer of spec/types.md §9 (own.explain.names,
+;; own.explain) over tables, expressions and an `OwnedProgram` built by hand. The expected texts are
+;; written from crates/fibref/src/own/explain/ and not from the output of this port: each word of
+;; a pass, operation, reason and tail; the short rendering of each kind of expression; a string
+;; literal as Rust's `{:?}` writes it; the title of each kind of body; one body with every line of
+;; a block (parameters, bindings, closure, calls, `recur`, operations in the order they run, the
+;; blocks of the literals after it); a module sees only its own bodies. Prints `ok NAME` or `FAIL NAME`.
+;; Build: fibc build compiler/tests/own/unit-explain.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [own.explain.names :as n] [own.explain :as x])
+  (:use syntax.pos syntax.form types.ty types.scheme types.table types.ast types.decls types.builtins
+        types.program types.infer.mod types.check own.program))
+
+(defun pos-at (line: i64 col: i64) -> Pos (Pos "t.fib" line col 0 0))
+
+(defun ex (id: i64 line: i64 col: i64 kind: ExprKind) -> Expr (Expr id (pos-at line col) kind))
+
+(defun local (id: i64 line: i64 col: i64 b: i64) -> Expr (ex id line col (ELocal b)))
+
+(defun gfun (id: i64 f: i64) -> Expr (ex id 1 1 (EGlobal (GFun f))))
+
+(defun lit-str (id: i64 s: str) -> Expr (ex id 1 1 (ELit (LitStr s))))
+
+;; Bindings B0 x, B1 y, B2 z, B3 w, B4 n, B5 r, B6 s; functions f (B0, B1; module 2), g (module 3),
+;; h (module 2); a def k; the instance of `Area` on `str` (area, perim); module 2 is `main`.
+(defun tables () -> Globals
+  (let ((g (globals-new)) (pos (pos-at 1 1)))
+    (do (g-add-module g "the builtins" (Links [] [] []) (map-empty))
+        (g-add-module g "fib.prelude" (Links [] [] []) (map-empty))
+        (g-add-module g "main" (Links [] [] []) (map-empty))
+        (g-add-module g "other" (Links [] [] []) (map-empty))
+        (set! (. g main) 2)
+        (doseq [name ["x" "y" "z" "w" "n" "r" "s"]]
+          (table-add (. g bindings) (BindingInfo name BkParam pos nil)))
+        (table-add (. g funs) (FunDef "f" 2 [] nil [] (f-body) false pos))
+        (table-add (. g funs) (FunDef "g" 3 [] nil [] (local 40 1 1 0) false pos))
+        (table-add (. g funs) (FunDef "h" 2 [] nil [] (local 41 1 1 0) false pos))
+        (table-add (. g defs) (DefDef "k" 2 nil (local 42 1 1 0) false pos))
+        (table-add (. g instances) (InstanceDef 0 KStr 2 [] (ty-str) [] []
+                                                [(ImplMethod 0 [] nil (local 43 1 1 0) pos)
+                                                 (ImplMethod 1 [] nil (local 44 1 1 0) pos)]
+                                                pos))
+        (table-add (. g protos) (ProtoDef "Area" 2 [] [(MethodDef "area" [] (scheme-mono (ty-i64)) false nil pos)
+                                                        (MethodDef "perim" [] (scheme-mono (ty-i64)) false nil pos)]
+                                          [] pos))
+        g)))
+
+;; The body of f:
+;;   2:1  E1 (let z = E2 (g x), n = E16 y; E3 ..)
+;;   3:1  E3 (do E6 (perim &y "a\tb") E7 (recur 7) E8 (fn (w) E13 (f w)) E9 (async E14 (x)))
+(defun f-body () -> Expr
+  (let ((e2 (ex 2 2 10 (ECall (gfun 4 1) [(ArgExpr (local 5 2 12 0))])))
+        (e6 (ex 6 3 3 (ECall (ex 10 3 4 (EGlobal (GMethod 0 1))) [(ArgAmp 1 (pos-at 3 8)) (ArgExpr (lit-str 11 "a\tb"))])))
+        (e7 (ex 7 4 3 (ERecur [(ex 12 4 9 (ELit (LitInt 7 I64)))])))
+        (e8 (ex 8 5 3 (EFn (FnLit nil [(FnParam 3 nil)] nil
+                                  (ex 13 5 20 (ECall (gfun 17 0) [(ArgExpr (local 18 5 22 3))])) []))))
+        (e9 (ex 9 6 3 (EAsync (ex 14 7 5 (ECall (local 15 7 6 0) [])) []))))
+    (ex 1 2 1 (ELet [(LetBind (Pattern (pos-at 2 6) (PBind 2)) e2)
+                     (LetBind (Pattern (pos-at 2 20) (PBind 4)) (local 16 2 24 1))]
+                    (ex 3 3 1 (EDo [e6 e7 e8 e9]))))))
+
+;; The decisions for f: every kind of parameter, binding, closure, call and operation.
+(defun f-own () -> BodyOwn
+  (BodyOwn [(ParamOwn 0 (PkOwned [(OwRule1 "stored") (OwRule2 "returned") (OwRule3 "scc") (OwLoop "through n") OwDeclared])
+                      true false)
+            (ParamOwn 1 PkBorrowed false true) (ParamOwn 5 PkAmp false false) (ParamOwn 6 PkScalar false false)]
+           (assoc (assoc (assoc (assoc (map-empty)
+                                       5 (ExprOwn MScalar [(Op OpRetain (SiteBind 0) WhyStore)]))
+                                6 (ExprOwn MScalar [(Op OpRelease (SiteValue 6) WhyStepEnd)]))
+                         8 (ExprOwn MScalar [(Op OpRetain (SiteBind 1) WhyReturn)]))
+                  1 (ExprOwn MScalar [(Op OpEndStack (SiteBind 2) WhyScopeExit)]))
+           (assoc (assoc (map-empty) 2 (BindingOwn (BnDerivedOf (SiteValue 2)) true)) 4 (BindingOwn BnOwns false))
+           (assoc (assoc (assoc (assoc (map-empty)
+                                       2 (CallOwn (CalFun 1) TlNotInTail PsScalar [PsBorrow] [] []))
+                                6 (CallOwn (CalMethod 0 1) (TlOrdinary BcAmpArgument) PsBorrow [PsBorrow PsMove] [] []))
+                         13 (CallOwn CalCtor TlNotInTail PsScalar [PsRetain] [] []))
+                  14 (CallOwn CalValue TlTailCall PsBorrow [] [] [(Op OpRetain (SiteBind 0) WhyJump)]))
+           (assoc (map-empty) 7 (RecurOwn [PsScalar] [(Op OpRelease (SiteBind 2) WhyRecurOld)]))
+           (assoc (assoc (map-empty)
+                         8 (ClosureOwn false (some "returned") (some "escapes")
+                                       [(CaptureOwn 0 PsRetain) (CaptureOwn 1 PsAlias) (CaptureOwn 2 PsOwnCell) (CaptureOwn 3 PsScalar)]
+                                       [(ParamOwn 3 PkBorrowed false false)]))
+                  9 (ClosureOwn true (some "spawned") nil [(CaptureOwn 0 PsScalar)] []))
+           (map-empty) (conj (conj (set-empty) 2) 5)
+           (assoc (map-empty) 7 [(Op OpRelease (SiteBind 2) WhyDiscard)])))
+
+(def f-expected: (Vec str)
+  ["defun f : i64"
+   "  params:    x  owned (rule 1: stored; rule 2: returned; rule 3: scc; rule 1 through n; not inferred)  escapes=yes;  y  borrowed  escapes=no (declared :borrow);  r  &param;  s  scalar"
+   "  bindings:  z  derived-of (g ..) scope-local;  n  owns;  (g ..)  temporary scope-local;  x  temporary scope-local"
+   "  closure @5:3  escaping=yes (returned)  heap=yes (escapes)  captures: x (owns), y (alias), z (&-cell)"
+   "  async @6:3  escaping=yes (spawned)  heap=no  captures: (none)"
+   "  calls:     @2:10 (g ..)   call   arg 1 x: borrow"
+   "             @3:3 (perim ..)   call (b: & argument)   head: borrow   &y: borrow; arg 2 \"a\\tb\": moved"
+   "             @4:3 recur   arg 1: scalar   before the jump: release [z] (old loop value)"
+   "  ops:       L2 retain [x] (store); L3 release [(perim ..)] (step end); L4 guard false: release [z] (discard); L5 retain [y] (return); L2 end-stack [z] (exit)"
+   ""
+   "fn @5:3"
+   "  params:    w  borrowed  escapes=no"
+   "  bindings:  (none)"
+   "  calls:     @5:20 (f ..)   construct   arg 1 w: retain"
+   "  ops:       (none)"
+   ""
+   "async @6:3"
+   "  params:    (none)"
+   "  bindings:  (none)"
+   "  calls:     @7:5 (x)   tail-call   head: borrow   before the jump: retain [x] (jump)"
+   "  ops:       (none)"
+   ""])
+
+(def tiny: (Vec str) ["  params:    (none)" "  bindings:  (none)" "  ops:       (none)" ""])
+
+(defun program-of (g: Globals) -> TypedProgram
+  (TypedProgram g (assoc (map-empty) 0 (scheme-mono (ty-i64))) (map-empty) (map-empty) (map-empty) (map-empty)
+                (map-empty) (map-empty) (builtin-table) []))
+
+(defun owned-of () -> OwnedProgram
+  (let ((keys [(BodyFun 0) (BodyAllOwned 2) (BodyMethod 0 1) (BodyMethodOwned 0 0) (BodyDef 0) (BodyFun 1) (BodyAllOwned 1)]))
+    (OwnedProgram (assoc (assoc (assoc (assoc (assoc (assoc (map-empty) (BodyFun 0) (f-own))
+                                                     (BodyAllOwned 2) (body-own-new))
+                                              (BodyMethod 0 1) (body-own-new))
+                                       (BodyMethodOwned 0 0) (body-own-new))
+                                (BodyDef 0) (body-own-new))
+                         (BodyFun 1) (body-own-new))
+                  keys (map-empty) (set-empty) (set-empty) [])))
+
+(defun show-checks (cs: Checks p: TypedProgram) -> unit
+  (let ((s (fn (e: Expr) (n/names-show p e)))
+        (call (fn (id: i64 h: Expr args: (Vec Arg)) (ex id 3 4 (ECall h args)))))
+    (do (check cs "at: @line:col" (= (n/names-at (local 1 12 34 0)) "@12:34"))
+        (check cs "a local, a function, a def, a method head are their names"
+               (= (mapv s [(local 1 1 1 2) (gfun 2 0) (ex 3 1 1 (EGlobal (GDef 0))) (ex 4 1 1 (EGlobal (GMethod 0 0)))])
+                  ["z" "f" "k" "area"]))
+        (check cs "literals: an integer, a bool, a string; any other is `<expr @L:C>`"
+               (= (mapv s [(ex 1 1 1 (ELit (LitInt -7 I64))) (ex 2 1 1 (ELit (LitBool true))) (lit-str 3 "hi")
+                           (ex 4 5 6 (ELit (LitFloat 1.5 F64))) (ex 5 5 6 (ELit (LitKeyword "k")))])
+                  ["-7" "true" "\"hi\"" "<expr @5:6>" "<expr @5:6>"]))
+        (check cs "a string as Rust's {:?}: \\ \" and the escapes, controls as \\u{hex}, the rest as it is"
+               (= (mapv (fn (t: str) (s (lit-str 1 t)))
+                        ["q\"\\'" "a\tb\r\n" (char->str (i32->char 0i32)) (char->str (i32->char 27i32))
+                         (char->str (i32->char 127i32)) (char->str (i32->char 133i32)) "é😀" ""])
+                  ["\"q\\\"\\\\'\"" "\"a\\tb\\r\\n\"" "\"\\0\"" "\"\\u{1b}\"" "\"\\u{7f}\"" "\"\\u{85}\"" "\"é😀\"" "\"\""]))
+        (check cs "a deref is `@` and the place, a field `(. x f)`"
+               (= (mapv s [(ex 1 1 1 (EDeref (PlAmp 5) "")) (ex 2 1 1 (EDeref (PlExpr (local 3 1 1 0)) ""))
+                           (ex 4 1 1 (EField (local 5 1 1 1) "len" "len"))])
+                  ["@r" "@x" "(. y len)"]))
+        (check cs "a call is its head, with `..` for arguments; a head that is not a name is shown"
+               (= (mapv s [(call 1 (gfun 2 0) []) (call 3 (local 4 1 1 0) [(ArgExpr (local 5 1 1 1))])
+                           (call 6 (call 7 (gfun 8 1) []) [(ArgAmp 1 (pos-at 1 1))])
+                           (call 9 (ex 10 8 9 (EFn (FnLit nil [] nil (local 11 1 1 0) []))) [])])
+                  ["(f)" "(x ..)" "((g) ..)" "(<closure @8:9>)"]))
+        (check cs "a closure, a task and any other expression"
+               (= (mapv s [(ex 1 7 8 (EFn (FnLit nil [] nil (local 2 1 1 0) []))) (ex 3 7 8 (EAsync (local 4 1 1 0) []))
+                           (ex 5 7 8 (EDo [])) (ex 6 7 8 (EUnsafe (local 7 1 1 0)))])
+                  ["<closure @7:8>" "<async @7:8>" "<expr @7:8>" "<expr @7:8>"])))))
+
+(defun site-checks (cs: Checks p: TypedProgram) -> unit
+  (let ((body (f-body))
+        (ix (n/names-index (f-body)))
+        (site (fn (s: Site) (n/names-site p (n/names-index (f-body)) s))))
+    (do (check cs "index: every expression of the body by id, the literals' bodies included"
+               (and (= (count ix) 18) (= (. (unwrap (get ix 13)) id) 13) (= (. (unwrap (get ix 1)) id) (. body id))
+                    (not (contains? ix 99))))
+        (check cs "sites: a binding, a capture, a def by name; a value by its expression"
+               (= (mapv site [(SiteBind 3) (SiteCapture 8 1) (SiteGlobal 0) (SiteValue 2) (SiteValue 15)])
+                  ["w" "y" "k" "(g ..)" "x"]))
+        (check cs "a value not in the body is `<value N>`, an environment is of its closure or just `env`"
+               (= (mapv site [(SiteValue 99) (SiteEnv 8) (SiteEnv 99)])
+                  ["<value 99>" "env of <closure @5:3>" "env"])))))
+
+(defun word-checks (cs: Checks p: TypedProgram) -> unit
+  (let ((ix (n/names-index (f-body))))
+    (do (check cs "an operation is kind, [site] and (reason), and every reason has its words"
+               (= (mapv (fn (w: Why) (n/names-op p ix (Op OpRetain (SiteBind 0) w)))
+                        [WhyReturn WhyStore WhyJoin WhyScopeExit WhyStepEnd WhyDerivedExit WhyDiscard WhyParamExit
+                         WhyLoopInit WhyJump WhyRecurOld])
+                  ["retain [x] (return)" "retain [x] (store)" "retain [x] (join)" "retain [x] (exit)"
+                   "retain [x] (step end)" "retain [x] (derived exit)" "retain [x] (discard)" "retain [x] (exit)"
+                   "retain [x] (loop init)" "retain [x] (jump)" "retain [x] (old loop value)"]))
+        (check cs "the three kinds of operation"
+               (= (mapv (fn (k: OpKind) (n/names-op p ix (Op k (SiteValue 2) WhyJoin))) [OpRetain OpRelease OpEndStack])
+                  ["retain [(g ..)] (join)" "release [(g ..)] (join)" "end-stack [(g ..)] (join)"]))
+        (check cs "passes"
+               (= (mapv n/names-pass [PsScalar PsBorrow PsMove PsRetain PsAcquire PsForward PsOwnCell PsAlias PsKeepEnv])
+                  ["scalar" "borrow" "moved" "retain" "acquire" "forward" "own cell" "alias" "env kept"]))
+        (check cs "tails: a tail call, a construction, a call, and the rule that made one ordinary"
+               (= (mapv (fn (t: Tail) (n/names-tail p t CalValue)) [TlTailCall TlNotInTail])
+                  ["tail-call" "call"]))
+        (check cs "a constructor that is not in tail position is a construction; in tail position it is what the tail says"
+               (= [(n/names-tail p TlNotInTail CalCtor) (n/names-tail p TlTailCall CalCtor)] ["construct" "tail-call"]))
+        (check cs "every reason a tail call is ordinary"
+               (= (mapv (fn (b: Because) (n/names-tail p (TlOrdinary b) (CalFun 0)))
+                        [BcAmpArgument (BcAmpCaptured 1) (BcFrameOwned 0) BcAsyncBody BcExtern BcStore])
+                  ["call (b: & argument)" "call (b: &y captured by an argument)"
+                   "call (e: frame-owned argument 1 at a borrowed position)" "call (f: async body)" "call (extern)"
+                   "call (a store, not a call)"])))))
+
+(defun block-checks (cs: Checks p: TypedProgram o: OwnedProgram) -> unit
+  (do (check cs "a body with every line of a block, then the blocks of its literals"
+             (= (x/explain-lines p o 2 ) (into (into (into (into f-expected ["defun h.owned : "]) tiny)
+                                                     (into ["impl Area/perim for str"] tiny))
+                                               (into (into ["impl Area/area.owned for str"] tiny)
+                                                     (into ["def k"] tiny)))))
+      (check cs "a module sees its own bodies only, and a key the pass did not decide prints nothing"
+             (and (= (x/explain-lines p o 3) (into ["defun g : "] tiny)) (= (x/explain-lines p o 1) [])))
+      (check cs "`explain` is the main module's lines, each ended by a newline"
+             (= (x/explain p o) (str-join (mapv (fn (l: str) (str-concat l "\n")) (x/explain-lines p o 2)))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (p (program-of (tables)))
+        (o (owned-of)))
+    (do (show-checks cs p) (site-checks cs p) (word-checks cs p) (block-checks cs p o)
+        (finish cs))))
