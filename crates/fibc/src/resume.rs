@@ -50,7 +50,13 @@ pub fn make_resumable(f: &mut FnBuilder, shape: &Shape<'_>) -> Result<Vec<Frame>
             .iter()
             .position(|b| &b.label == label)
             .ok_or_else(|| Unsupported(format!("no continuation block {label}")))?;
-        for n in &live.live_in[i] {
+        // A `HashSet`'s order differs from run to run and would reach
+        // the frame's slots and so the emitted text: sort each state's
+        // live values by the builder's creation order (`tN`, N rising),
+        // which is the order of their definitions.
+        let mut names: Vec<&String> = live.live_in[i].iter().collect();
+        names.sort_by_key(|n| name_order(n));
+        for n in names {
             if !demoted.contains(n) {
                 demoted.push(n.clone());
             }
@@ -251,8 +257,10 @@ fn demote(
     }
     f.blocks[0].items.splice(0..0, geps);
     // Loads for phi operands go at the end of the block the edge
-    // comes from: (block index, value) -> the loaded name.
-    let mut edge_loads: HashMap<(usize, String), String> = HashMap::new();
+    // comes from: (block index, value) -> the loaded name. A list in
+    // the order the phis are met, not a map: the loads are emitted by
+    // walking it, and a hash order would reach the text.
+    let mut edge_loads: Vec<((usize, String), String)> = Vec::new();
     let labels: Vec<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
     for bi in 1..f.blocks.len() {
         let phis = f.blocks[bi].phis.clone();
@@ -267,11 +275,11 @@ fn demote(
                     continue;
                 };
                 let key = (p, v.clone());
-                let loaded = match edge_loads.get(&key) {
-                    Some(l) => l.clone(),
+                let loaded = match edge_loads.iter().find(|(k, _)| *k == key) {
+                    Some((_, l)) => l.clone(),
                     None => {
                         let l = f.fresh();
-                        edge_loads.insert(key, l.clone());
+                        edge_loads.push((key, l.clone()));
                         l
                     }
                 };
@@ -368,6 +376,13 @@ fn switch_entry(f: &mut FnBuilder, shape: &Shape<'_>) {
 /// Whether an atom is an SSA name of the builder (`tN`).
 fn is_name(a: &str) -> bool {
     a.len() > 1 && a.starts_with('t') && a[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// The creation order of an SSA name of the builder: `t12` is 12 (the
+/// names are not sorted as text, where `t10` would precede `t9`).
+fn name_order(name: &str) -> (u64, &str) {
+    let digits = name.get(1..).and_then(|d| d.parse().ok());
+    (digits.unwrap_or(u64::MAX), name)
 }
 
 /// The SSA names an instruction's text mentions, each once.

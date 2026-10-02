@@ -51,6 +51,36 @@ fn every_emitted_module_rereads_and_rechecks() {
     );
 }
 
+/// The emitted text is a function of the program alone: an `async` body
+/// that keeps several values live across an `await` gets its frame slots
+/// in one order, run after run (stage 2 and stage 3 must emit identical
+/// lIR, spec/bootstrap.md). Each std `HashSet` and `HashMap` is seeded
+/// differently, so ten compilations in one process show any hash order
+/// that reaches the text.
+#[test]
+fn emission_is_deterministic_for_async_bodies_with_live_values() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cases/ownership");
+    for name in [
+        "174-awaits-in-a-loop-with-live-locals.fib",
+        "148-await-in-guard.fib",
+    ] {
+        let source = std::fs::read_to_string(dir.join(name)).expect("case readable");
+        let mut texts = std::collections::BTreeSet::new();
+        for _ in 0..10 {
+            let Front::Checked(checked) = check(&source, name) else {
+                panic!("{name}: the front end rejected the case");
+            };
+            texts.insert(compile(&checked).expect("the case lowers"));
+        }
+        assert_eq!(
+            texts.len(),
+            1,
+            "{name}: {} different texts in 10 runs",
+            texts.len()
+        );
+    }
+}
+
 /// `(alloc n)` is `n` zero bytes (syntax §3.15): the lowering is `calloc`
 /// of one block, not `malloc`, whose block is zero only when the system
 /// has just given it. Case 190 shows the difference at run time; this
