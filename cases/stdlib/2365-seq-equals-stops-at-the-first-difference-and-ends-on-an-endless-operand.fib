@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.4 row seq= ("equality across Reducibles"), §2.1 rule 3 (a consumer stops its source), tranche 2 plan Y3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: seq=
+;; `seq=` is a terminal that reads its operands one element at a time, so it ends at the first difference: with a
+;; lazy first operand whose function counts its calls, a difference at the second element means two calls, not five;
+;; an operand of one more element than the other ends it too; and an endless operand does not make it loop: Clojure's
+;; `(= (range) [0 1])` is false (recalled, not run), and `(seq= (iterate inc 0) [0 1])` is false whichever side the endless one is on.
+;; Two endless operands that agree would run for ever, as Clojure's do, so no case has them: a difference ends them.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun counted (calls: (Cell i64)) -> (fn (i64) i64)
+  (fn (x) (do (set! calls (+ @calls 1)) x)))
+
+(defun main () -> i64
+  (let ((c (checks)) (calls (cell 0)))
+    (do ;; a difference at the second element ends the walk of the lazy first operand there
+        (check c (not (seq= (map (counted calls) [1 2 3 4 5]) [1 9 3 4 5])))
+        (check c (= @calls 2))
+        (set! calls 0)
+        (check c (not (seq= [1 9 3 4 5] (map (counted calls) [1 2 3 4 5]))))
+        (check c (= @calls 2))
+        ;; equal elements are all read
+        (set! calls 0)
+        (check c (seq= (map (counted calls) [1 2 3]) [1 2 3]))
+        (check c (= @calls 3))
+        ;; one more element on either side
+        (check c (not (seq= [1 2 3] [1 2 3 4])))
+        (check c (not (seq= [1 2 3 4] [1 2 3])))
+        ;; an endless operand on either side, or both, ends at the finite one or at the difference
+        (check c (not (seq= (iterate inc 0) [0 1])))
+        (check c (not (seq= [0 1] (iterate inc 0))))
+        (check c (not (seq= (iterate inc 0) [1 2 3])))
+        (check c (not (seq= [0 1 2] (repeat 0))))
+        (check c (not (seq= (repeat 1) (repeat 2))))
+        (check c (not (seq= (cycle [1 2]) (cycle [1 2 3]))))
+        (check c (seq= (take 3 (iterate inc 0)) [0 1 2]))
+        (check c (seq= [1 2 1 2 1] (take 5 (cycle [1 2]))))
+        (checks-result c))))

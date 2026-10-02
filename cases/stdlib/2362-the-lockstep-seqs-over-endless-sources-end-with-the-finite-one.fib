@@ -1,0 +1,38 @@
+;; spec:   stdlib §2.1 rule 1 and 2 (an endless source is fine for a lazy seq), §4.4 rows zip zip-with interleave, tranche 2 plan Y3 (judge: laziness)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: zip zip-with interleave iterate repeat cycle
+;; The plan's laziness check, `(take 2 (zip (iterate inc 0) (iterate inc 10)))`, and its relatives. Every endless source
+;; (Iterate, Repeat, Cycle: Y1's) has its own lazy seq, so the lockstep functions read both operands one node at a time:
+;; two endless operands give an endless seq that `take` ends, one finite operand ends the result, and `(take 2 ..)` of two
+;; counting iterates calls each function once (the third node is never demanded). A fused walk over an endless first
+;; operand stops through the each-while, over a second one through the cursor: those are in cases 2367 and 2354.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun pr (a: i64 b: i64) -> (Pair i64 i64) (Pair a b))
+
+(defun main () -> i64
+  (let ((c (checks)) (fa (cell 0)) (fb (cell 0)))
+    (do (check c (= (to-vec (take 2 (zip (iterate inc 0) (iterate inc 10)))) [(pr 0 10) (pr 1 11)]))
+        (check c (= (to-vec (take 4 (zip (cycle [1 2]) (repeat 9)))) [(pr 1 9) (pr 2 9) (pr 1 9) (pr 2 9)]))
+        ;; the finite operand ends the result, on either side
+        (check c (= (to-vec (zip (iterate inc 0) [5 6 7])) [(pr 0 5) (pr 1 6) (pr 2 7)]))
+        (check c (= (to-vec (zip [5 6] (repeat 1))) [(pr 5 1) (pr 6 1)]))
+        (check c (= (count (zip (range 4) (iterate inc 0))) 4))
+        (check c (= (to-vec (take 3 (zip-with + (iterate inc 0) (iterate inc 10)))) [10 12 14]))
+        (check c (= (to-vec (zip-with * (range 1 5) (cycle [2 3]))) [2 6 6 12]))
+        (check c (= (to-vec (take 5 (interleave (iterate inc 0) (repeat 7)))) [0 7 1 7 2]))
+        (check c (= (to-vec (interleave [1 2] (repeat 0))) [1 0 2 0]))
+        (check c (= (to-vec (interleave (iterate inc 5) [9 9])) [5 9 6 9]))
+        ;; a search over an endless pair of seqs ends
+        (check c (= (first (filter (fn (p: (Pair i64 i64)) (> (+ (. p fst) (. p snd)) 10))
+                                   (zip (iterate inc 0) (iterate inc 3))))
+                    (some (pr 4 7))))
+        ;; the node after the one taken is not demanded: f and g are called once each for two nodes
+        (let ((z (zip (iterate (fn (x: i64) (do (set! fa (+ @fa 1)) (+ x 1))) 0)
+                      (iterate (fn (x: i64) (do (set! fb (+ @fb 1)) (+ x 1))) 0))))
+          (do (check c (= (count (take 2 z)) 2))
+              (check c (and (= @fa 1) (= @fb 1)))))
+        (checks-result c))))

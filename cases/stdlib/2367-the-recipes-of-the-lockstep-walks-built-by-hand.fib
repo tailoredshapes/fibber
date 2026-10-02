@@ -1,0 +1,64 @@
+;; spec:   stdlib §2.1 rule 2 (recipes) and rule 5 (the second operand of the fused walk is a cursor), A11 e16, tranche 2 plan Y3 and X12
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The recipes `Zipped`, `ZipWith` and `Interleaved` that the expander's rewrite (X12) will build, here written by hand as
+;; cases 260 and 261 do for the tranche-1 recipes: the sources first, then the function. Each walks its first operand with
+;; each-while and pulls its second by cursor, so the second may be a recipe (by buffering): the page's values of A11 e16 over
+;; recipes, in both operand orders, and a recipe in both positions at once. A hand-built recipe is not memoised (it is
+;; never a value of a program): two walks of one `ZipWith` call its function twice per element. The walk answers as the other
+;; recipes do: false when the consumer stopped it, true when it ended by its own rule, which includes the second operand
+;; running out; and `Interleaved` never gives an element of the first operand whose partner is missing.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun pr (a: i64 b: i64) -> (Pair i64 i64) (Pair a b))
+(defun inc1 (x: i64) -> i64 (+ x 1))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (xs [1 2 3 4 5])
+        (calls (cell 0)))
+    (do ;; A11 e16 over recipes
+        (check c (= (to-vec (Zipped xs (Mapped xs inc1))) [(pr 1 2) (pr 2 3) (pr 3 4) (pr 4 5) (pr 5 6)]))
+        (check c (= (to-vec (Zipped (Mapped xs inc1) xs)) [(pr 2 1) (pr 3 2) (pr 4 3) (pr 5 4) (pr 6 5)]))
+        (check c (= (to-vec (Zipped xs (Filtered xs odd?))) [(pr 1 1) (pr 2 3) (pr 3 5)]))
+        (check c (= (to-vec (Zipped (Filtered xs odd?) xs)) [(pr 1 1) (pr 3 2) (pr 5 3)]))
+        (check c (= (to-vec (ZipWith (Dropped xs 1) xs (fn (b: i64 a: i64) (- b a)))) [1 1 1 1]))
+        (check c (= (to-vec (ZipWith xs (Dropped xs 1) (fn (a: i64 b: i64) (- a b)))) [-1 -1 -1 -1]))
+        ;; a recipe in both positions, and a recipe of a recipe
+        (check c (= (to-vec (Zipped (Taken xs 3) (Mapped (Filtered xs odd?) inc1))) [(pr 1 2) (pr 2 4) (pr 3 6)]))
+        (check c (= (to-vec (Zipped (Zipped xs xs) (Mapped xs inc1)))
+                    [(Pair (pr 1 1) 2) (Pair (pr 2 2) 3) (Pair (pr 3 3) 4) (Pair (pr 4 4) 5) (Pair (pr 5 5) 6)]))
+        (check c (= (to-vec (Interleaved xs (Mapped xs inc1))) [1 2 2 3 3 4 4 5 5 6]))
+        (check c (= (to-vec (Interleaved (Mapped xs inc1) (Taken xs 2))) [2 1 3 2]))
+        (check c (= (to-vec (ZipWith (Zipped xs xs) (Interleaved xs xs) (fn (p: (Pair i64 i64) y: i64) (+ (. p fst) y))))
+                    [2 3 5 6 8]))
+        ;; the shorter ends it, on either side; the first operand's extra element is not given by Interleaved
+        (check c (= (to-vec (Zipped [1 2 3] [4 5])) [(pr 1 4) (pr 2 5)]))
+        (check c (= (to-vec (Zipped [1 2] [4 5 6])) [(pr 1 4) (pr 2 5)]))
+        (check c (= (to-vec (Interleaved [1 2 3] [4 5])) [1 4 2 5]))
+        (check c (= (to-vec (Interleaved [1 2] [4 5 6])) [1 4 2 5]))
+        ;; endless operands: the first by each-while, the second by a cursor of Iterate, Repeat or Cycle
+        (check c (= (to-vec (Zipped [7 8] (iterate inc 0))) [(pr 7 0) (pr 8 1)]))
+        (check c (= (to-vec (ZipWith [1 2 3] (repeat 10) (fn (a: i64 b: i64) (+ a b)))) [11 12 13]))
+        (check c (= (to-vec (Interleaved [1 2 3] (cycle [0 9]))) [1 0 2 9 3 0]))
+        (check c (= (to-vec (Taken (Zipped (iterate inc 0) (iterate inc 5)) 2)) [(pr 0 5) (pr 1 6)]))
+        ;; not memoised: two walks of one recipe call its function twice per element
+        (let ((w (ZipWith [1 2 3] [4 5 6] (fn (a: i64 b: i64) (do (set! calls (+ @calls 1)) (+ a b))))))
+          (do (check c (= (to-vec w) [5 7 9]))
+              (check c (= (to-vec w) [5 7 9]))
+              (check c (= @calls 6))))
+        ;; each-while: stopped by the consumer is false; ended by the recipe (either operand) is true
+        (check c (not (each-while (Zipped [1 2 3] [4 5 6]) (fn (p: (Pair i64 i64)) false))))
+        (check c (each-while (Zipped [1 2 3] [4 5 6]) (fn (p: (Pair i64 i64)) true)))
+        (check c (each-while (Zipped [1 2 3] [4 5]) (fn (p: (Pair i64 i64)) true)))
+        (check c (each-while (Zipped [1 2] [4 5 6]) (fn (p: (Pair i64 i64)) true)))
+        (check c (not (each-while (Interleaved [1 2 3] [4 5 6]) (fn (x: i64) (< x 4)))))
+        (check c (each-while (Interleaved [1 2 3] [4 5]) (fn (x: i64) true)))
+        (check c (not (each-while (ZipWith [1 2] [3 4] +) (fn (x: i64) false))))
+        ;; the walk stops the second operand's cursor at the end of the first: first, empty? and take work on a recipe
+        (check c (= (first (Zipped xs xs)) (some (pr 1 1))))
+        (check c (= (count (Zipped xs (Taken xs 2))) 2))
+        (check c (empty? (Zipped [1 2] (vec-empty))))
+        (checks-result c))))

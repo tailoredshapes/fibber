@@ -1,0 +1,21 @@
+;; spec:   stdlib §2.1 rule 5 ("one buffer per zip, none per element"), §8.1 item 5 (count cases), tranche 2 plan Y3
+;; expect: accept
+;; result: 2500
+;; audit:  clean
+;; allocs: <= 21
+;; roots:  ../../lib support
+;; A `ZipWith` over a Vec and a recipe (`Mapped` over the same Vec), 50 elements, folded by `reduce`: the second operand of a fused walk is
+;; walked by a cursor, and the cursor of a recipe is the buffering one of the page (spec §2.1 rule 5): a Vec built once by `to-vec`, one buffer
+;; for the whole walk and none per element. The count is not a constant, because the bulk builder of the buffer makes about two objects
+;; for every 32 elements (a leaf and its array, spec §2.5): 21 over 50 elements (case 2377) and 51 over 500 (case 2378), 30 more for 450 more
+;; elements, where a per-element cost, as the Pairs of case 2376, would be 450 more. Both bounds are tight. After X7 (§7 L16) the cursor of
+;; `Mapped` holds no buffer and the count is a constant, which is case 2382, open for it.
+(ns main (:use fib.core fib.seq))
+
+(def xs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+  20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+  40 41 42 43 44 45 46 47 48 49])
+
+(defun main () -> i64
+  (reduce + 0 (ZipWith xs (Mapped xs (fn (a: i64) (+ a 1))) (fn (a: i64 b: i64) (+ a b)))))

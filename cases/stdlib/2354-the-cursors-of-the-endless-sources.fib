@@ -1,0 +1,41 @@
+;; spec:   stdlib §2.1 rule 1 (Iterate Repeat Cycle are sources), rule 5, tranche 2 plan Y3 and Y1
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The endless sources have a cursor that never says false: Iterate gives x and then f of the last one, and calls f when the next
+;; element is asked for and not before (four advance! of `(iterate f 1)` call f three times, as `(take 4 (iterate f 1))`
+;; does); Repeat gives its element; Cycle goes round its source again and again, and the Cycle of an empty source is
+;; the end at once. A cursor that stops early is dropped with nothing left to free (the audit is clean).
+;; `iterate`, `repeat` and `cycle` are Y1's rows; this case calls them because the cursors are for their structs.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; the first n elements, asking advance! n times and no more
+(defun first-n (c: k n: i64) :where ((Cursor k e)) -> (Vec e)
+  (loop ((acc (vec-empty)) (i 0))
+    (if (and (< i n) (advance! c)) (recur (conj acc (current c)) (+ i 1)) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (none: (Vec i64) (vec-empty)))
+    (do (check c (= (first-n (cursor (iterate inc 5)) 4) [5 6 7 8]))
+        (check c (= (first-n (cursor (repeat 7)) 3) [7 7 7]))
+        (check c (= (first-n (cursor (repeat "x")) 2) ["x" "x"]))
+        (check c (= (first-n (cursor (cycle [1 2 3])) 8) [1 2 3 1 2 3 1 2]))
+        (check c (= (first-n (cursor (cycle none)) 5) none))
+        (check c (= (first-n (cursor (cycle (range 2))) 5) [0 1 0 1 0]))
+        ;; f is called when the next element is asked for
+        (let ((it (cursor (iterate (fn (x: i64) (do (set! calls (+ @calls 1)) (+ x 1))) 1))))
+          (do (check c (advance! it))
+              (check c (= @calls 0))
+              (check c (= (current it) 1))
+              (check c (advance! it))
+              (check c (= @calls 1))
+              (check c (advance! it))
+              (check c (advance! it))
+              (check c (= @calls 3))
+              (check c (= (current it) 4))
+              (check c (= (current it) 4))
+              (check c (= @calls 3))))
+        (checks-result c))))

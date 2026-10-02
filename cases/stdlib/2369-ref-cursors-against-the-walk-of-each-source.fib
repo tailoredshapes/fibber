@@ -1,0 +1,78 @@
+;; spec:   stdlib §2.1 rule 5, §2.3 (Cursor, Cursable), §8.1 item 2 (a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; 300 seeded inputs: a Vec of 0 to 11 elements, and from it an Array, a List, a lazy seq, the VSeq of its rest and a VSeq with
+;; a front element, each drained through its cursor and compared with the elements it holds (a reference built with loops over
+;; vec-nth); a Range of drawn bounds and step (never 0: a step of 0 does not end) against a loop that adds the step; and a
+;; string of 0 to 8 scalars of every width (tl.gen) through the cursor of the str and of its Chars against the walk of the
+;; str's own `to-vec`, which is fib.seq.chars's decoder, so the copy of the decoder in fib.seq.cursors is held equal to
+;; the original on every width and on the boundaries between them. The planted fault is in the reference of the Vec-like
+;; sources: it forgets the last element. Seed 2369.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng tl.gen))
+
+(defun drain (c: k) :where ((Cursor k e)) -> (Vec e)
+  (loop ((acc (vec-empty)))
+    (if (advance! c) (recur (fib.prelude/vec-conj acc (current c))) acc)))
+
+;; v from index lo, less its last element when the fault is planted
+(defun from (v: (Vec i64) lo: i64 fault: bool) -> (Vec i64)
+  (let ((n (- (vec-count v) (if (and fault (> (vec-count v) lo)) 1 0))))
+    (loop ((i lo) (acc (vec-empty)))
+      (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (vec-nth v i))) acc))))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+(defun same-chars (a: (Vec char) b: (Vec char)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+(defun to-array (v: (Vec i64)) -> (Array i64)
+  (let ((n (vec-count v)))
+    (loop ((i 0) (acc (array n 0)))
+      (if (< i n) (recur (+ i 1) (array-with acc i (vec-nth v i))) acc))))
+
+(defun to-cons (v: (Vec i64)) -> (List i64)
+  (loop ((i (- (vec-count v) 1)) (acc Empty))
+    (if (>= i 0) (recur (- i 1) (Cons (vec-nth v i) acc)) acc)))
+
+;; x before the elements of v: conj conses at the front of a VSeq
+(defun front (x: i64 v: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc [x])) (if (< i (vec-count v)) (recur (+ i 1) (fib.prelude/vec-conj acc (vec-nth v i))) acc)))
+
+;; the Range lo hi by, by a loop that adds the step (by is not 0)
+(defun range-by-loop (lo: i64 hi: i64 by: i64) -> (Vec i64)
+  (loop ((x lo) (acc (vec-empty)))
+    (if (if (> by 0) (< x hi) (> x hi)) (recur (+ x by) (fib.prelude/vec-conj acc x)) acc)))
+
+(defun trial (r: Rng c: Checks fault: bool) -> unit
+  (let ((v (rng-vec r (rng-below r 12) 100))
+        (lo (rng-below r 20)) (hi (rng-below r 20))
+        (by (- (rng-below r 7) 3))
+        (s (gen-str r (rng-below r 9))))
+    (let ((want (from v 0 fault)) (tail (from v 1 fault))
+          (step (if (= by 0) 1 by)))
+      (do (check c (same (drain (cursor v)) want))
+          (check c (same (drain (cursor (to-array v))) want))
+          (check c (same (drain (cursor (to-cons v))) want))
+          (check c (same (drain (cursor (to-lseq v))) want))
+          (check c (same (drain (cursor (rest v))) tail))
+          (check c (same (drain (cursor (conj (rest v) 77))) (front 77 (from v 1 false))))
+          (check c (same (drain (cursor (range-by lo hi step))) (range-by-loop lo hi step)))
+          (check c (same-chars (drain (cursor s)) (to-vec s)))
+          (check c (same-chars (drain (cursor (Chars s))) (to-vec s)))))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 2369)))
+    (dotimes (i 300) (trial r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 2700))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

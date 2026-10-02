@@ -1,0 +1,69 @@
+;; spec:   stdlib §4.4 row zipmap, §8.1 item 2 (a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: zipmap
+;; 300 seeded pairs of Vecs of 0 to 11 elements (keys drawn from 0 to 4, so a key comes twice often, values from 0 to 99), the
+;; values seen as a Vec, a List, a lazy seq or an Array, drawn; `(zipmap ks vs)` against a reference that builds no Map: for
+;; each possible key k, the value at the last index i below the shorter length with ks[i] = k, or none. The Map's
+;; count is the number of keys that have one, and each `get` agrees. The planted fault is a reference that takes the first
+;; such index, which zipmap must disagree with whenever a key repeats with different values. Seed 2371.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun to-cons (v: (Vec i64)) -> (List i64)
+  (loop ((i (- (vec-count v) 1)) (acc Empty))
+    (if (>= i 0) (recur (- i 1) (Cons (vec-nth v i) acc)) acc)))
+
+(defun to-array (v: (Vec i64)) -> (Array i64)
+  (let ((n (vec-count v)))
+    (loop ((i 0) (acc (array n 0)))
+      (if (< i n) (recur (+ i 1) (array-with acc i (vec-nth v i))) acc))))
+
+(defun lo (a: i64 b: i64) -> i64 (if (< a b) a b))
+
+;; the index below n of the last (or, with the fault, the first) key k, or -1
+(defun where-is (ks: (Vec i64) n: i64 k: i64 fault: bool) -> i64
+  (loop ((i 0) (at -1))
+    (if (< i n)
+        (recur (+ i 1) (if (= (vec-nth ks i) k) (if (and fault (>= at 0)) at i) at))
+        at)))
+
+;; whether the Map has the reference's value for k
+(defun agrees (m: (Map i64 i64) ks: (Vec i64) vs: (Vec i64) n: i64 k: i64 fault: bool) -> bool
+  (let ((i (where-is ks n k fault)))
+    (if (< i 0)
+        (= (get m k) nil)
+        (= (get m k) (some (vec-nth vs i))))))
+
+(defun distinct-keys (ks: (Vec i64) n: i64) -> i64
+  (loop ((k 0) (cnt 0))
+    (if (< k 5) (recur (+ k 1) (if (>= (where-is ks n k false) 0) (+ cnt 1) cnt)) cnt)))
+
+(defun lib-map (kind: i64 ks: (Vec i64) vs: (Vec i64)) -> (Map i64 i64)
+  (match kind
+    (0 (zipmap ks vs))
+    (1 (zipmap ks (to-cons vs)))
+    (2 (zipmap ks (to-lseq vs)))
+    (_ (zipmap ks (to-array vs)))))
+
+(defun trial (r: Rng c: Checks fault: bool) -> unit
+  (let ((ks (rng-vec r (rng-below r 12) 5))
+        (vs (rng-vec r (rng-below r 12) 100))
+        (kind (rng-below r 4)))
+    (let ((m (lib-map kind ks vs)) (n (lo (vec-count ks) (vec-count vs))))
+      (do (check c (= (count m) (distinct-keys ks n)))
+          (check c (loop ((k 0))
+                     (if (< k 5) (if (agrees m ks vs n k fault) (recur (+ k 1)) false) true)))))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 2371)))
+    (dotimes (i 300) (trial r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 600))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

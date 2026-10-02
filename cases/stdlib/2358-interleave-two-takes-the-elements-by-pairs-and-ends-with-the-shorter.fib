@@ -1,0 +1,40 @@
+;; spec:   stdlib §4.4 row interleave, §2.1 rule 5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: interleave
+;; (interleave a b) is an LSeq of the elements of a and b alternately, a's first: Clojure's two-operand form (the
+;; variadic one is L2, tranche 3). It gives the elements of a pair together or not at all: with three elements and two,
+;; the third of the first operand is not in the result, as `(interleave [1 2 3] [10 20])` is `(1 10 2 20)` in Clojure,
+;; because the node holds both sides before it gives either. The operands are any two Reducibles of one element type.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Vec i64) (vec-empty))
+        (tree (Node (Node Leaf 1 Leaf) 2 (Node Leaf 3 Leaf))))
+    (do (check c (= (to-vec (interleave [1 2 3] [10 20 30])) [1 10 2 20 3 30]))
+        (check c (= (to-vec (interleave [1 2 3] [10 20])) [1 10 2 20]))
+        (check c (= (to-vec (interleave [1 2] [10 20 30 40])) [1 10 2 20]))
+        (check c (= (to-vec (interleave none [1 2])) none))
+        (check c (= (to-vec (interleave [1 2] none)) none))
+        (check c (= (to-vec (interleave none none)) none))
+        (check c (= (to-vec (interleave [7] [8])) [7 8]))
+        ;; any two sources of one element type
+        (check c (= (to-vec (interleave (list 1 2 3) (range 10 13))) [1 10 2 11 3 12]))
+        (check c (= (to-vec (interleave (range 3) (to-lseq [5 6 7]))) [0 5 1 6 2 7]))
+        (check c (= (to-vec (interleave "ab" [\X \Y \Z])) [\a \X \b \Y]))
+        (check c (= (to-vec (interleave tree [10 20 30 40])) [1 10 2 20 3 30]))
+        (check c (= (to-vec (interleave (rest [1 2 3]) (map inc [10 20 30]))) [2 11 3 21]))
+        ;; the result is a Reducible too: three operands by nesting
+        (check c (= (to-vec (interleave (interleave [1 2] [3 4]) [5 6 7 8])) [1 5 3 6 2 7 4 8]))
+        (check c (= (count (interleave [1 2 3 4] [5 6 7])) 6))
+        (checks-result c))))

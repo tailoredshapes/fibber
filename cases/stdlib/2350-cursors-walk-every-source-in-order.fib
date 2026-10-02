@@ -1,0 +1,59 @@
+;; spec:   stdlib §2.1 rule 5, §2.3 (Cursor, Cursable), tranche 2 plan Y3 (P16: `no implementation of Cursable for (Vec i64)` is gone)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; Every source of the page's list has a cursor: Vec Array List LSeq VSeq Range str and Chars. A cursor starts before the
+;; first element, advance! says whether it reached one, and current reads it. Each source is drained and compared with the
+;; elements it holds: a Vec empty and not, an Array, a List, a lazy seq (to-lseq of a Vec and a lazy map), a VSeq with
+;; and without front elements (rest and conj of it), integer, descending and float ranges and an empty one, a string of
+;; every scalar width (the characters are those of `to-vec`, which is fib.seq.chars's decoder, and their codes are
+;; written out), a Chars, and sources of strings and of vectors, whose
+;; elements are objects.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun drain (c: k) :where ((Cursor k e)) -> (Vec e)
+  (loop ((acc (vec-empty)))
+    (if (advance! c) (recur (conj acc (current c))) acc)))
+
+(defun codes (v: (Vec char)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count v)) (recur (+ i 1) (conj acc (zext i64 (char->i32 (nth v i))))) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Vec i64) (vec-empty))
+        (nolist: (List i64) Empty)
+        (arr (array-with (array-with (array 3 0) 1 5) 2 9)))
+    (do (check c (= (drain (cursor [1 2 3])) [1 2 3]))
+        (check c (= (drain (cursor none)) none))
+        (check c (= (drain (cursor arr)) [0 5 9]))
+        (check c (= (drain (cursor (list 4 5 6))) [4 5 6]))
+        (check c (= (drain (cursor nolist)) none))
+        (check c (= (drain (cursor (to-lseq [7 8 9]))) [7 8 9]))
+        (check c (= (drain (cursor (map inc [1 2 3]))) [2 3 4]))
+        (check c (= (drain (cursor (to-lseq none))) none))
+        (check c (= (drain (cursor (rest [1 2 3 4]))) [2 3 4]))
+        (check c (= (drain (cursor (conj (rest [1 2 3 4]) 0))) [0 2 3 4]))
+        (check c (= (drain (cursor (conj (conj (rest [1 2 3]) 9) 0))) [0 9 2 3]))
+        (check c (= (drain (cursor (rest (vec-empty)))) none))
+        (check c (= (drain (cursor (range 5))) [0 1 2 3 4]))
+        (check c (= (drain (cursor (range-by 10 0 -3))) [10 7 4 1]))
+        (check c (= (drain (cursor (range 0))) none))
+        (check c (= (drain (cursor (range-by 0.0 1.0 0.25))) [0.0 0.25 0.5 0.75]))
+        (check c (= (drain (cursor (range-by 5i8 8i8 1i8))) [5i8 6i8 7i8]))
+        ;; a range that ends at the largest integer of its width never overflows (case 163 for the walk)
+        (check c (= (drain (cursor (range-by 9223372036854775805 9223372036854775807 1))) [9223372036854775805 9223372036854775806]))
+        (check c (= (drain (cursor (range-by -9223372036854775805 -9223372036854775808 -1)))
+                    [-9223372036854775805 -9223372036854775806 -9223372036854775807]))
+        (check c (= (drain (cursor (range-by 120i8 127i8 3i8))) [120i8 123i8 126i8]))
+        (check c (= (codes (drain (cursor "aé€😀z"))) [97 233 8364 128512 122]))
+        (check c (= (drain (cursor "aé€😀z")) (to-vec "aé€😀z")))
+        (check c (= (drain (cursor "")) (to-vec "")))
+        (check c (= (codes (drain (cursor (Chars "é€")))) [233 8364]))
+        ;; elements that are objects: `current` gives the element and the audit finds no count wrong
+        (check c (= (drain (cursor ["a" "bb" "ccc"])) ["a" "bb" "ccc"]))
+        (check c (= (drain (cursor (list "x" "yy"))) ["x" "yy"]))
+        (check c (= (drain (cursor (to-lseq [[1] [2 3]]))) [[1] [2 3]]))
+        (check c (= (drain (cursor (conj (rest ["p" "q"]) "o"))) ["o" "q"]))
+        (checks-result c))))

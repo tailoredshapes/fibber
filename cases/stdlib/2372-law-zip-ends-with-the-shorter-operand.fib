@@ -1,0 +1,75 @@
+;; spec:   stdlib §4.4 rows zip zip-with interleave seq=, tranche 2 plan Y3 (judge: law, the count of a zip is the shorter count)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: zip zip-with interleave seq=
+;; Properties over 300 seeded pairs of Vecs of 0 to 14 elements (each side seen as a Vec, a List or a lazy seq, drawn), with m the
+;; shorter length: (count (zip a b)) is m; the firsts of the pairs are the first m elements of a and the seconds those of b;
+;; (zip-with + a b) and (zip-with + b a) are `seq=`; (zip-with first-arg a b) is the first m of a; (count (interleave a b)) is
+;; 2m and its even positions are a's elements and its odd positions b's; and (zip a a) has equal pairs. The planted fault
+;; is the law with the count `m + 1`, which every pair breaks. Seed 2372.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun to-cons (v: (Vec i64)) -> (List i64)
+  (loop ((i (- (vec-count v) 1)) (acc Empty))
+    (if (>= i 0) (recur (- i 1) (Cons (vec-nth v i) acc)) acc)))
+
+(defun lo (a: i64 b: i64) -> i64 (if (< a b) a b))
+
+;; the first n elements of v
+(defun prefix (v: (Vec i64) n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (vec-nth v i))) acc)))
+
+;; the laws for a pair of sources of i64 of any types; la and lb are their lengths, a and b the Vecs they were made from
+(defun laws (c: Checks fault: bool a: ca b: cb va: (Vec i64) vb: (Vec i64)) :where ((Reducible ca i64) (Reducible cb i64)) -> unit
+  (let ((m (lo (vec-count va) (vec-count vb))) (z (zip a b)))
+    (do (check c (= (count z) (if fault (+ m 1) m)))
+        (check c (= (to-vec (map (fn (p: (Pair i64 i64)) (. p fst)) z)) (prefix va m)))
+        (check c (= (to-vec (map (fn (p: (Pair i64 i64)) (. p snd)) z)) (prefix vb m)))
+        (check c (seq= (zip-with + a b) (zip-with + b a)))
+        (check c (= (to-vec (zip-with (fn (x: i64 y: i64) x) a b)) (prefix va m)))
+        (check c (= (count (interleave a b)) (* 2 m)))
+        (check c (= (to-vec (take-nth-even (interleave a b))) (prefix va m)))
+        (check c (= (to-vec (take-nth-even (drop 1 (interleave a b)))) (prefix vb m)))
+        (check c (every? (fn (p: (Pair (Pair i64 i64) (Pair i64 i64))) (= (. p fst) (. p snd))) (zip (zip a b) (zip a b))))
+        ())))
+
+;; the elements at even positions of s: the first, third, ..
+(defun take-nth-even (s: (LSeq i64)) -> (LSeq i64)
+  (let ((n (cell 0)))
+    (filter (fn (x: i64) (let ((i @n)) (do (set! n (+ i 1)) (= (rem i 2) 0)))) s)))
+
+(defun views (c: Checks fault: bool ka: i64 kb: i64 va: (Vec i64) vb: (Vec i64)) -> unit
+  (match ka
+    (0 (match kb
+         (0 (laws c fault va vb va vb))
+         (1 (laws c fault va (to-cons vb) va vb))
+         (_ (laws c fault va (to-lseq vb) va vb))))
+    (1 (match kb
+         (0 (laws c fault (to-cons va) vb va vb))
+         (1 (laws c fault (to-cons va) (to-cons vb) va vb))
+         (_ (laws c fault (to-cons va) (to-lseq vb) va vb))))
+    (_ (match kb
+         (0 (laws c fault (to-lseq va) vb va vb))
+         (1 (laws c fault (to-lseq va) (to-cons vb) va vb))
+         (_ (laws c fault (to-lseq va) (to-lseq vb) va vb))))))
+
+(defun trial (r: Rng c: Checks fault: bool) -> unit
+  (let ((va (rng-vec r (rng-below r 15) 100))
+        (vb (rng-vec r (rng-below r 15) 100))
+        (ka (rng-below r 3)) (kb (rng-below r 3)))
+    (views c fault ka kb va vb)))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 2372)))
+    (dotimes (i 300) (trial r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 2700))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

@@ -1,0 +1,49 @@
+;; spec:   stdlib §2.1 rule 2 (nothing runs until a node is demanded), §4.4 rows zip zip-with interleave
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: zip zip-with interleave
+;; The lazy form of case 241 for the lockstep walks. The sources are lazy seqs of five nodes that bump a counter when a
+;; node is made, and `f` of zip-with bumps another. Right after the call of zip, zip-with or interleave, the counters
+;; of both sources and of f read 0: the call built a seq and ran nothing. Demanding the first node costs one node of
+;; each source (and one call of f); the second element of an interleave comes from the node that the first demand made
+;; (the pair is made together), so asking for it costs nothing more, and the third element costs the next node of each.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+;; the source nodes made so far: [first source, second source, calls of f]
+(defun read (a: (Cell i64) b: (Cell i64) f: (Cell i64)) -> (Vec i64) [@a @b @f])
+
+(defun main () -> i64
+  (let ((c (checks))
+        (na (cell 0)) (nb (cell 0)) (calls (cell 0)))
+    (let ((z (zip (countdown 5 na) (countdown 5 nb))))
+      (do (check c (= (read na nb calls) [0 0 0]))
+          (check c (match (lfirst z) ((some p) (and (= (. p fst) 5) (= (. p snd) 5))) (nil false)))
+          (check c (= (read na nb calls) [1 1 0]))
+          (set! na 0) (set! nb 0)
+          (let ((w (zip-with (fn (x: i64 y: i64) (do (set! calls (+ @calls 1)) (+ x y)))
+                             (countdown 5 na) (countdown 5 nb))))
+            (do (check c (= (read na nb calls) [0 0 0]))
+                (check c (= (lfirst w) (some 10)))
+                (check c (= (read na nb calls) [1 1 1]))
+                (check c (= (lfirst (lrest w)) (some 8)))
+                (check c (= (read na nb calls) [2 2 2]))
+                ;; the first node again: realised once, so f is not called again
+                (check c (= (lfirst w) (some 10)))
+                (check c (= (read na nb calls) [2 2 2]))))
+          (set! na 0) (set! nb 0)
+          (let ((il (interleave (countdown 5 na) (countdown 5 nb))))
+            (do (check c (= (read na nb calls) [0 0 2]))
+                (check c (= (lfirst il) (some 5)))
+                (check c (= (read na nb calls) [1 1 2]))
+                (check c (= (lfirst (lrest il)) (some 5)))
+                (check c (= (read na nb calls) [1 1 2]))
+                (check c (= (lfirst (lrest (lrest il))) (some 4)))
+                (check c (= (read na nb calls) [2 2 2]))))
+          (checks-result c)))))

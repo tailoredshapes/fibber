@@ -1,0 +1,61 @@
+;; spec:   stdlib §4.4 row seq=, §8.1 item 2 (a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: seq=
+;; 300 seeded pairs (a, b) of Vecs over the elements 0 and 1 (so that equal ones are common), b drawn as an independent Vec, a
+;; copy of a, a with one element more, or a with one element changed; each side is seen as a Vec, a List or a lazy seq, drawn
+;; independently, and `seq=` of the two views is compared with a loop over vec-nth that checks the lengths and the
+;; elements. The planted fault is a reference that forgets the lengths (it compares up to the shorter), which `seq=` must
+;; disagree with on every pair of which one is a proper prefix of the other. Seed 2370.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun to-cons (v: (Vec i64)) -> (List i64)
+  (loop ((i (- (vec-count v) 1)) (acc Empty))
+    (if (>= i 0) (recur (- i 1) (Cons (vec-nth v i) acc)) acc)))
+
+;; the reference; the fault ignores the lengths
+(defun ref-eq (a: (Vec i64) b: (Vec i64) fault: bool) -> bool
+  (let ((n (if (< (vec-count a) (vec-count b)) (vec-count a) (vec-count b))))
+    (and (or fault (= (vec-count a) (vec-count b)))
+         (loop ((i 0)) (if (< i n) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true)))))
+
+;; b changed at index i
+(defun changed (b: (Vec i64) i: i64) -> (Vec i64)
+  (loop ((j 0) (acc (vec-empty)))
+    (if (< j (vec-count b))
+        (recur (+ j 1) (fib.prelude/vec-conj acc (if (= j i) (- 1 (vec-nth b j)) (vec-nth b j))))
+        acc)))
+
+(defun view-eq (kb: i64 a: c b: (Vec i64)) :where ((Reducible c i64)) -> bool
+  (match kb (0 (seq= a b)) (1 (seq= a (to-cons b))) (_ (seq= a (to-lseq b)))))
+
+(defun lib-eq (ka: i64 kb: i64 a: (Vec i64) b: (Vec i64)) -> bool
+  (match ka
+    (0 (view-eq kb a b))
+    (1 (view-eq kb (to-cons a) b))
+    (_ (view-eq kb (to-lseq a) b))))
+
+(defun trial (r: Rng c: Checks fault: bool) -> unit
+  (let ((a (rng-vec r (rng-below r 4) 2))
+        (d (rng-below r 4))
+        (ka (rng-below r 3)) (kb (rng-below r 3)))
+    (let ((b (match d
+               (0 (rng-vec r (rng-below r 4) 2))
+               (1 a)
+               (2 (fib.prelude/vec-conj a (rng-below r 2)))
+               (_ (if (> (vec-count a) 0) (changed a (rng-below r (vec-count a))) a)))))
+      (check c (= (lib-eq ka kb a b) (ref-eq a b fault))))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 2370)))
+    (dotimes (i 300) (trial r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 300))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

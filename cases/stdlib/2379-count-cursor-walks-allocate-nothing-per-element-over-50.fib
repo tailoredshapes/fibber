@@ -1,0 +1,31 @@
+;; spec:   stdlib §2.1 rule 5 (a cursor never allocates per element), §8.1 item 5 (count cases), tranche 2 plan Y3
+;; expect: accept
+;; result: 1376955
+;; audit:  clean
+;; allocs: <= 11
+;; roots:  ../../lib support
+;; The cursors of a Vec, a Range, a List and a str, each drained over 50 elements (the Vec, the List and the string are `def`s, whose
+;; objects the trace leaves out; the string has every scalar width) and the elements summed. A cursor keeps its place in cells made with it, so
+;; each costs what it costs once, whatever it walks: 2 objects for the Vec's, 4 for the Range's, 3 for the List's and 2 for the str's, 11 in
+;; all (measured one at a time), and the same program over 500 elements has the same bound (case 2380). A
+;; cursor that allocated per element would fail one of the two.
+(ns main (:use fib.core fib.seq))
+
+(def xs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+  20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+  40 41 42 43 44 45 46 47 48 49])
+
+(def ls: (List i64) (list 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49))
+
+(def text: str "aé€😀zaé€😀zaé€😀zaé€😀zaé€😀zaé€😀zaé€😀zaé€😀zaé€😀zaé€😀z")
+
+(defun sum-of (c: k) :where ((Cursor k i64)) -> i64
+  (loop ((s 0)) (if (advance! c) (recur (+ s (current c))) s)))
+
+(defun sum-of-codes (c: k) :where ((Cursor k char)) -> i64
+  (loop ((s 0)) (if (advance! c) (recur (+ s (zext i64 (char->i32 (current c))))) s)))
+
+(defun main () -> i64
+  (+ (+ (sum-of (cursor xs)) (sum-of (cursor (range 50))))
+     (+ (sum-of (cursor ls)) (sum-of-codes (cursor text)))))

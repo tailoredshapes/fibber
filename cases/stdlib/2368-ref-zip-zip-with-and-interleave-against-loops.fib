@@ -1,0 +1,75 @@
+;; spec:   stdlib §4.4 rows zip zip-with interleave, §8.1 item 2 (a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: zip zip-with interleave
+;; 300 seeded pairs of Vecs of 0 to 11 elements of 0 to 99 (the lengths differ, so each side is the shorter about as often as
+;; the other), through the three lockstep functions and an eager reference written with loops over the prelude's vec-count,
+;; vec-nth and vec-conj, which do not use the library under test: zip as the flat Vec x y x y .. of its pairs, zip-with with
+;; f = 3x + y (not symmetric, so an argument swap shows), interleave. Three planted faults, each in one reference, each
+;; required to be noticed by its own comparison: zip's pair written (y, x), zip-with's f given (y, x), interleave starting with the
+;; second operand. Seed 2368.
+(ns main (:use fib.core fib.seq tl.check tl.rng))
+
+(defun lo (a: i64 b: i64) -> i64 (if (< a b) a b))
+(defun push (v: (Vec i64) x: i64) -> (Vec i64) (vec-conj v x))
+
+;; the reference: x y x y .. over the shorter length; fault writes (y x)
+(defun ref-zip (a: (Vec i64) b: (Vec i64) fault: bool) -> (Vec i64)
+  (let ((n (lo (vec-count a) (vec-count b))))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n)
+          (let ((x (vec-nth a i)) (y (vec-nth b i)))
+            (recur (+ i 1) (if fault (push (push acc y) x) (push (push acc x) y))))
+          acc))))
+
+(defun ref-zip-with (a: (Vec i64) b: (Vec i64) fault: bool) -> (Vec i64)
+  (let ((n (lo (vec-count a) (vec-count b))))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n)
+          (let ((x (vec-nth a i)) (y (vec-nth b i)))
+            (recur (+ i 1) (push acc (if fault (+ (* 3 y) x) (+ (* 3 x) y)))))
+          acc))))
+
+(defun ref-interleave (a: (Vec i64) b: (Vec i64) fault: bool) -> (Vec i64)
+  (let ((n (lo (vec-count a) (vec-count b))))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n)
+          (let ((x (vec-nth a i)) (y (vec-nth b i)))
+            (recur (+ i 1) (if fault (push (push acc y) x) (push (push acc x) y))))
+          acc))))
+
+(defun flat (z: (LSeq (Pair i64 i64))) -> (Vec i64)
+  (to-vec (mapcat (fn (p: (Pair i64 i64)) [(. p fst) (. p snd)]) z)))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; one drawn pair of Vecs through the three functions; the faults go to the three Checks the planted runs use
+(defun trial (r: Rng cz: Checks cw: Checks ci: Checks fz: bool fw: bool fi: bool) -> unit
+  (let ((a (rng-vec r (rng-below r 12) 100))
+        (b (rng-vec r (rng-below r 12) 100)))
+    (do (check cz (same (flat (zip a b)) (ref-zip a b fz)))
+        (check cw (same (to-vec (zip-with (fn (x: i64 y: i64) (+ (* 3 x) y)) a b)) (ref-zip-with a b fw)))
+        (check ci (same (to-vec (interleave a b)) (ref-interleave a b fi))))))
+
+(defun run-all (cz: Checks cw: Checks ci: Checks fz: bool fw: bool fi: bool) -> unit
+  (let ((r (rng 2368)))
+    (dotimes (i 300) (trial r cz cw ci fz fw fi))))
+
+(defun main () -> i64
+  (let ((c (checks)) (c2 (checks)) (c3 (checks))
+        (pz (checks)) (pw (checks)) (pi (checks)) (n1 (checks)) (n2 (checks)) (n3 (checks)))
+    (do (run-all c c2 c3 false false false)
+        (check c (= (checks-made c) 300))
+        (check c (= (checks-result c2) 0))
+        (check c (= (checks-result c3) 0))
+        (run-all pz n1 n2 true false false)
+        (run-all n3 pw n1 false true false)
+        (run-all n2 n3 pi false false true)
+        (check-detects c pz)
+        (check-detects c pw)
+        (check-detects c pi)
+        (checks-result c))))

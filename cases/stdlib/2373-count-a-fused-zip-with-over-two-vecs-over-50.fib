@@ -1,0 +1,21 @@
+;; spec:   stdlib §2.1 rule 2 and 5 (a fused walk allocates nothing per element), §8.1 item 5 (count cases), tranche 2 plan Y3
+;; expect: accept
+;; result: 2450
+;; audit:  clean
+;; allocs: <= 4
+;; roots:  ../../lib support
+;; The walk of a hand-built `ZipWith` over two Vecs of 50 elements, folded by `reduce`: what the expander's rewrite (X12) will make of
+;; `(reduce + 0 (zip-with f a b))`. The first operand is walked by each-while and the second by the cursor of its Vec, so the walk
+;; allocates what it needs once and nothing per element: 4 heap objects, the A lines of the free trace of both tools. The same program over 500 elements has the
+;; same bound (case 2374), so a walk that allocated per element would fail one of the two. There is no Pair: the function takes the
+;; two elements as they are, which is why the page has `zip-with` at +4 objects over 1000 elements and `zip` at +1003 (A10 alloc).
+;; The Vec is a `def`, whose objects the trace leaves out (compiler.md §4).
+(ns main (:use fib.core fib.seq))
+
+(def xs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+  20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+  40 41 42 43 44 45 46 47 48 49])
+
+(defun main () -> i64
+  (reduce + 0 (ZipWith xs xs (fn (a: i64 b: i64) (+ a b)))))

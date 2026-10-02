@@ -1,0 +1,53 @@
+;; spec:   stdlib §2.1 rule 5, §2.3 (Cursor), tranche 2 plan Y3 (the convention of the part)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; The convention of fib.seq.cursors: a fresh cursor stands before the first element, so the first advance! of an
+;; empty source says false; and once advance! has said false it keeps saying false, however often it is asked (a cursor
+;; that moved on after the end would read past it, or say true again once its index wrapped). Each of Vec, Array,
+;; List, LSeq, VSeq, Range, str and Chars is drained, then asked three more times, and an empty one is asked before
+;; anything else. A Range of step 0 never ends, so it is asked a hundred times
+;; and gives its start each time.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun drained (c: k) :where ((Cursor k e)) -> unit
+  (loop () (if (advance! c) (recur) ())))
+
+;; at the end: three more advance! and all three say false
+(defun stays (c: k) :where ((Cursor k e)) -> bool
+  (do (drained c)
+      (let ((a (advance! c)) (b (advance! c)) (d (advance! c)))
+        (and (not a) (and (not b) (not d))))))
+
+;; an empty source: the first advance! is already false
+(defun starts-at-the-end (c: k) :where ((Cursor k e)) -> bool (not (advance! c)))
+
+(defun hundred (c: k) :where ((Cursor k i64)) -> bool
+  (loop ((i 0))
+    (if (< i 100) (if (and (advance! c) (= (current c) 7)) (recur (+ i 1)) false) true)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Vec i64) (vec-empty))
+        (nolist: (List i64) Empty)
+        (arr (array-with (array 2 0) 1 5)))
+    (do (check c (stays (cursor [1 2 3])))
+        (check c (stays (cursor arr)))
+        (check c (stays (cursor (list 4 5))))
+        (check c (stays (cursor (map inc [1 2 3]))))
+        (check c (stays (cursor (conj (rest [1 2 3]) 0))))
+        (check c (stays (cursor (range 4))))
+        (check c (stays (cursor (range-by 0.0 1.0 0.25))))
+        (check c (stays (cursor "aé€")))
+        (check c (stays (cursor (Chars "é"))))
+        (check c (starts-at-the-end (cursor none)))
+        (check c (starts-at-the-end (cursor (array 0 0))))
+        (check c (starts-at-the-end (cursor nolist)))
+        (check c (starts-at-the-end (cursor (to-lseq none))))
+        (check c (starts-at-the-end (cursor (rest none))))
+        (check c (starts-at-the-end (cursor (range 0))))
+        (check c (starts-at-the-end (cursor (range-by 3 3 1))))
+        (check c (starts-at-the-end (cursor "")))
+        (check c (hundred (cursor (range-by 7 8 0))))
+        (checks-result c))))

@@ -1,0 +1,49 @@
+;; spec:   stdlib §4.4 row seq-of, §2.1 "The seq is one type" (1) joins, A10 join, tranche 2 plan Y3 (judge: the join case of A10)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: seq-of filter
+;; `(if flag (filter p v) v)` is an `(LSeq i64)` against a `(Vec i64)`, which no join unifies until L24; the explicit form is
+;; `(seq-of c)`, a `(dyn (Reducible e))` that erases the source's type at the cost of one heap object and an indirect call
+;; per visit, and the page's own program, `(if flag (seq-of (filter p v)) (seq-of v))`, runs (A10 join; probe P20 of the plan).
+;; The erased value is a source like any other: it is counted, folded, searched, mapped, zipped and compared, and the
+;; erasure of an erased value is the same seq. Every check is made on both arms of the join.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun pipeline (flag: bool v: (Vec i64)) -> (dyn (Reducible i64))
+  (if flag (seq-of (filter odd? v)) (seq-of v)))
+
+;; a field of a type that varies: the erased source in a struct
+(defstruct Holder (items: (dyn (Reducible i64))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [1 2 3 4 5]))
+    (do (check c (= (count (pipeline true v)) 3))
+        (check c (= (count (pipeline false v)) 5))
+        (check c (= (sum (pipeline true v)) 9))
+        (check c (= (sum (pipeline false v)) 15))
+        (check c (= (reduce + 0 (pipeline true v)) 9))
+        (check c (= (first (pipeline true v)) (some 1)))
+        (check c (= (last (pipeline false v)) (some 5)))
+        (check c (= (nth (pipeline true v) 2) 5))
+        (check c (= (to-vec (pipeline true v)) [1 3 5]))
+        (check c (= (to-vec (pipeline false v)) v))
+        (check c (= (to-vec (map inc (pipeline true v))) [2 4 6]))
+        (check c (= (to-vec (take 2 (pipeline false v))) [1 2]))
+        (check c (seq= (pipeline true v) [1 3 5]))
+        (check c (not (seq= (pipeline false v) [1 3 5])))
+        (check c (= (to-vec (zip (pipeline true v) (pipeline false v))) [(Pair 1 1) (Pair 3 2) (Pair 5 3)]))
+        (check c (= (to-vec (interleave (pipeline true v) [0 0 0])) [1 0 3 0 5 0]))
+        ;; the erasure of an erased source is the same elements
+        (check c (= (to-vec (seq-of (pipeline true v))) [1 3 5]))
+        ;; any source erases: a List, a Range, a lazy map, a str (of chars)
+        (check c (= (sum (seq-of (list 1 2 3))) 6))
+        (check c (= (sum (seq-of (range 4))) 6))
+        (check c (= (to-vec (seq-of "ab")) [\a \b]))
+        ;; a struct field of the erased type holds either arm
+        (let ((h (Holder (pipeline true v))) (g (Holder (pipeline false v))))
+          (do (check c (= (count (. h items)) 3))
+              (check c (= (count (. g items)) 5))))
+        (checks-result c))))

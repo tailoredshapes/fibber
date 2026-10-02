@@ -1,0 +1,56 @@
+;; spec:   stdlib §4.4 row zip, §2.1 rule 5 and rule 6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: zip
+;; (zip a b) is an LSeq of (Pair x y): the elements of a and of b together, one object per element until C5, ending
+;; with the shorter operand (either one, or an empty one). The operands are any Reducible, whatever their types:
+;; a Vec, a List, a Range, an Array, a lazy seq, a VSeq, a str, a Map, a Set, an Option, and a user type that
+;; gave `each-while` and nothing else (§2.1 rule 6): the tree is no Cursable, and `zip` takes it on either side all the
+;; same, because it reads the lazy seq of each operand and not a cursor. The pairs are read through fst and snd,
+;; flattened in order into one Vec.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+;; fst, snd, fst, snd ..
+(defun flat (z: (LSeq (Pair i64 i64))) -> (Vec i64)
+  (to-vec (mapcat (fn (p: (Pair i64 i64)) [(. p fst) (. p snd)]) z)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Vec i64) (vec-empty))
+        (arr (array-with (array-with (array 2 0) 0 8) 1 9))
+        (tree (Node (Node Leaf 1 Leaf) 2 (Node Leaf 3 Leaf))))
+    (do (check c (= (flat (zip [1 2 3] [4 5 6])) [1 4 2 5 3 6]))
+        ;; the shorter operand ends it, on either side
+        (check c (= (flat (zip [1 2] [4 5 6])) [1 4 2 5]))
+        (check c (= (flat (zip [1 2 3] [4])) [1 4]))
+        (check c (= (flat (zip none [4 5])) none))
+        (check c (= (flat (zip [1 2] none)) none))
+        (check c (= (flat (zip none none)) none))
+        ;; every source, as either operand
+        (check c (= (flat (zip (list 1 2) (range 5 9))) [1 5 2 6]))
+        (check c (= (flat (zip (range 3) (list 7 8 9))) [0 7 1 8 2 9]))
+        (check c (= (flat (zip arr [1 2 3])) [8 1 9 2]))
+        (check c (= (flat (zip [1 2 3] arr)) [1 8 2 9]))
+        (check c (= (flat (zip (to-lseq [1 2 3]) (map inc [10 20 30]))) [1 11 2 21 3 31]))
+        (check c (= (flat (zip (rest [1 2 3]) (conj (rest [7 8 9]) 0))) [2 0 3 8]))
+        (check c (= (flat (zip tree [10 20])) [1 10 2 20]))
+        (check c (= (flat (zip [10 20 30] tree)) [10 1 20 2 30 3]))
+        (check c (= (flat (zip tree tree)) [1 1 2 2 3 3]))
+        (check c (= (flat (zip (some 4) [8 9])) [4 8]))
+        (check c (= (flat (zip (set [5]) [8 9])) [5 8]))
+        ;; elements of other types
+        (check c (= (to-vec (map (fn (p: (Pair i64 char)) (. p snd)) (zip (range 3) "abc"))) [\a \b \c]))
+        (check c (= (to-vec (map (fn (p: (Pair char i64)) (. p fst)) (zip "xyz" [1 2]))) [\x \y]))
+        (check c (= (to-vec (zip {1 2} [9])) [(Pair (Pair 1 2) 9)]))
+        ;; a Pair of two Pairs: the result of zip is itself a Reducible
+        (check c (= (count (zip (zip [1 2 3] [4 5 6]) [7 8])) 2))
+        (checks-result c))))

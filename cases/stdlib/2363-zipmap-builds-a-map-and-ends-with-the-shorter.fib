@@ -1,0 +1,65 @@
+;; spec:   stdlib §4.4 row zipmap, §2.1 rule 5 (the values are walked by a cursor), tranche 2 plan Y3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: zipmap
+;; (zipmap ks vs) is a Map from the keys to the values at the same positions, ending with the shorter operand; a key
+;; that comes twice keeps its later value (assoc replaces), as Clojure's. The keys are any Reducible with Hash and Eq
+;; elements; the values are anything Cursable: a Vec, an Array, a List, a lazy seq, a VSeq, a Range, a str, the endless
+;; Iterate, Repeat and Cycle, and a recipe (through its buffer). The Map is compared by `get` and by `=`, never by the
+;; order its entries print in, which is the prelude's (P1 changes it). The values stop the walk: with four keys and a
+;; lazy seq of two values the seq's third node is the end and no node past it is made, and with four lazy keys and two values the
+;; keys are read to the third.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (none: (Vec i64) (vec-empty))
+        (arr (array-with (array-with (array 2 0) 0 8) 1 9))
+        (nb (cell 0))
+        (m (zipmap [1 2 3] [4 5 6])))
+    (do (check c (= (count m) 3))
+        (check c (= (get m 1) (some 4)))
+        (check c (= (get m 2) (some 5)))
+        (check c (= (get m 3) (some 6)))
+        (check c (= (get m 4) nil))
+        (check c (= m (assoc (assoc (assoc (map-empty) 3 6) 1 4) 2 5)))
+        ;; the shorter operand ends it, on either side
+        (check c (= (zipmap [1 2 3] [4 5]) (assoc (assoc (map-empty) 1 4) 2 5)))
+        (check c (= (zipmap [1 2] [4 5 6]) (assoc (assoc (map-empty) 1 4) 2 5)))
+        (check c (= (count (zipmap none [4 5])) 0))
+        (check c (= (count (zipmap [1 2] none)) 0))
+        ;; a key twice keeps its later value
+        (check c (= (get (zipmap [1 2 1] [10 20 30]) 1) (some 30)))
+        (check c (= (count (zipmap [1 2 1] [10 20 30])) 2))
+        (check c (= (get (zipmap ["a" "b"] [1 2]) "b") (some 2)))
+        ;; keys from any Reducible
+        (check c (= (get (zipmap (range 3) [7 8 9]) 2) (some 9)))
+        (check c (= (get (zipmap (list 5 6) [7 8]) 6) (some 8)))
+        (check c (= (get (zipmap "abc" (range 3)) \c) (some 2)))
+        (check c (= (count (zipmap (set [1 2 3]) [1 2 3 4 5])) 3))
+        ;; values from any Cursable
+        (check c (= (get (zipmap [1 2] arr) 2) (some 9)))
+        (check c (= (get (zipmap [1 2] (list 3 4)) 1) (some 3)))
+        (check c (= (get (zipmap [1 2] (map inc [10 20])) 2) (some 21)))
+        (check c (= (get (zipmap [1 2 3] (rest [5 6 7 8])) 3) (some 8)))
+        (check c (= (get (zipmap [1 2 3] (conj (rest [5 6 7]) 0)) 1) (some 0)))
+        (check c (= (get (zipmap [1 2 3] (range-by 10 0 -4)) 3) (some 2)))
+        (check c (= (get (zipmap [1 2 3] "xyz") 2) (some \y)))
+        (check c (= (get (zipmap [1 2 3] (iterate inc 100)) 3) (some 102)))
+        (check c (= (get (zipmap [1 2 3] (repeat 0)) 2) (some 0)))
+        (check c (= (get (zipmap [1 2 3 4] (cycle [1 2])) 4) (some 2)))
+        (check c (= (get (zipmap [1 2] (Mapped [10 20] (fn (x: i64) (* x 2)))) 2) (some 40)))
+        ;; the values end the walk: four keys, two values and the end node of the lazy seq
+        (check c (= (count (zipmap [1 2 3 4] (countdown 2 nb))) 2))
+        (check c (= @nb 3))
+        ;; and the other way: four lazy keys, two values: the keys are read to the third (it finds no value) and no further
+        (let ((na (cell 0)))
+          (do (check c (= (count (zipmap (countdown 4 na) [10 20])) 2))
+              (check c (= @na 3))))
+        (checks-result c))))

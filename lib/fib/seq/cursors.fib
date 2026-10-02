@@ -1,5 +1,315 @@
 ;; owner: Y3
-;; fib.seq.cursors: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the `Cursor` structs and their `Cursable` instances, and `interleave zip zip-with zipmap seq= seq-of`.
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
-(ns fib.seq.cursors (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq fib.seq.sources fib.seq.recipes fib.seq.recipes2 fib.seq.seqable fib.seq.streams))
+;; fib.seq.cursors: the pull side of stdlib §2.1 rule 5 and the lockstep walks (tranche 2 plan §5 Y3; spec §2.3, §4.4
+;; rows interleave zip zip-with zipmap seq= seq-of). Public: the cursor structs VecCur ArrayCur ListCur LSeqCur VSeqCur
+;; RangeCur StrCur IterateCur RepeatCur and the Cursable instances of the sources (Vec Array List LSeq VSeq Range str Chars
+;; Iterate Repeat Cycle) and of every recipe; the recipes of the lockstep walks Zipped ZipWith Interleaved; and the functions
+;; zip zip-with interleave zipmap seq= seq-of. It replaces nothing: P0 declared the protocols Cursor and Cursable
+;; (fib.seq.protocols) and gave them no instance, so `(cursor [1 2 3])` was `no implementation of Cursable for (Vec i64)`.
+;;
+;; A cursor is a struct that holds its source and the place it has reached in cells made with it, so a step allocates
+;; nothing. Decided here, where the page is silent (the convention is the prototype's, A11 e16):
+;;  - a fresh cursor stands before the first element: `advance!` moves to the next element and says whether there is one,
+;;    and after it says false it stays at the end and keeps saying false; `current` reads the element advance! reached,
+;;    and traps `current: the cursor has no element` before the first advance! and after the end.
+;;  - Vec, Array: an index; List, LSeq: the node it stands on, and whether it has moved yet (an LSeq node is realised once by
+;;    `lnode`, so a cursor and every other reader of one seq see the same elements); VSeq: the cursor of its front list, then
+;;    that of its Vec from the offset; Range: the element it stands on, advanced by the range's own `range-more?` so floats
+;;    accumulate as the range's walk does and a step of 0 repeats the start for ever; str and Chars: a byte offset, decoded
+;;    one scalar at a time (the decoder is fib.seq.chars's, copied: a private helper cannot be shared between two parts, and a
+;;    cursor made of `to-vec` would be a buffer; case 2369 holds the two decoders equal).
+;;  - the endless sources have a cursor that never says false: Iterate calls f when the next element is asked for, as its walk
+;;    does, and Repeat holds the element. A Cycle has the cursor of its lazy seq, one node per element, because a cursor that
+;;    walked its source again on every pass would have to name the cursor type of the source in the instance head, which no
+;;    impl may do until §7 L16 (X7) lands.
+;;  - every recipe is Cursable by buffering (stdlib §2.1 rule 5): its cursor is the VecCur of `(to-vec self)`, one Vec made
+;;    when the cursor is, none per element. They are the seven of tranche 1 (Mapped Filtered Taken Dropped TakenWhile Mapcat
+;;    Cat), the seven of Y2 (MapIndexed Kept DroppedWhile Interposed Distinct Reductions Consed) and the three below. Not
+;;    done here: after X7 the cursors of Mapped Dropped Taken Zipped lose the buffer (plan W2). Until then a recipe over an
+;;    endless source (a Mapped over a Repeat) that is the second operand of a fused walk never returns: the walk that fills the
+;;    buffer never ends, and ran out of memory (`trap: out of memory`) in the one probe made, under a 2 GB limit. No instance
+;;    for Option, Map and Set: the page lists none, and one line of buffering is a user's to write.
+;;
+;; The recipes of the lockstep walks are for the expander's rewrite (X12, plan §5): (Zipped a b), (ZipWith a b f) and
+;; (Interleaved a b), the sources first and then the function (decided here: `zip-with` takes `f` first and the recipe
+;; constructors take the sources first, §2.1 rule 2). Each walks `a` with each-while and pulls `b` by cursor, one `advance!`
+;; per element of `a`, so `b` must be Cursable and the walk of a recipe allocates nothing per element but what it hands on
+;; (a Pair for Zipped, until C5). A walk that ends because `b` ran out has run to the end by its own rule and answers true,
+;; as Taken does; one the consumer stopped answers false. Interleaved never emits an element of `a` whose partner is
+;; missing, as Clojure's. The impl heads carry the element and cursor types as phantom parameters, as the tranche-1
+;; recipes do, because no impl context may name a variable that a constraint determines (L16). A hazard for X12: the lazy
+;; functions below take any Reducible as the second operand and the recipes only a Cursable one, so a rewrite of a `zip`
+;; whose second operand has no Cursable instance (a user type with each-while alone, a Map, a Set, an Option) turns a valid
+;; call into the type error `no implementation of Cursable for ..`.
+;;
+;; The functions. Decided here, where the plan and the page say two things: the plan's Y3 says the lazy functions advance
+;; cursors; the rows of the page give `zip`, `zip-with` and `interleave` a `Reducible` second operand and say of
+;; `interleave` that it is lazy over the seqs of both, and §2.1 rule 6 says a type that implements Reducible alone gets every
+;; adaptor, so these three read the lazy seq of each operand (`to-lseq`), not a cursor, and take any two Reducibles. The
+;; cursor serves what the page says it serves: the second operand of the fused walk (the recipes above) and `zipmap`.
+;;  - `zip`, `zip-with`, `interleave` return an LSeq: nothing runs until a node is demanded, each node is realised once, so
+;;    a bound result traversed twice runs `f` once per element and shows the same elements. A node realises the next node of
+;;    both operands before it looks at either, as Clojure's `(and (seq c1) (seq c2))` does (recalled from Clojure's source,
+;;    which was not run: there is none on this machine): `(zip [] s)` realises the first node of `s`. They end with the
+;;    shorter operand. `interleave` gives the elements of a pair together or not at all: with `[1 2 3]` and `[10 20]` it is
+;;    `(1 10 2 20)`. It has two operands; the variadic form is L2 (T3).
+;;  - `zip-with` is the three-argument `map` until Y11 deletes it (spec §3 N4); `f` is stored in the nodes, so it is owned.
+;;  - `zipmap` walks the keys with each-while and the values by cursor and stops at the shorter; a key twice keeps the later
+;;    value (assoc replaces), and the Map is `map-empty` of the prelude, so its shape follows the prelude's (P1 makes it the
+;;    small insertion-ordered one). The values are Cursable, as the row says; a `Map`, a `Set` or an `Option` needs an impl.
+;;  - `seq=` walks the first operand with each-while and takes the elements of the second from its lazy seq one at a time, so
+;;    it stops at the first difference and a pair of one endless and one finite operand ends: `(seq= (iterate inc 0) [0 1])`
+;;    is false. Two empty operands are equal.
+;;  - `seq-of` is `(dyn (Reducible e) c)`: one heap object and an indirect call per visit (§2.1 "The seq is one type").
+(ns fib.seq.cursors (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.sources fib.seq.chars fib.seq.recipes
+                          fib.seq.recipes2 fib.seq.streams))
+
+;; the trap of `current` when advance! has not reached an element
+(defun no-element :private () -> a (trap "current: the cursor has no element"))
+
+;; ---- Vec and Array: an index that starts before the first element and stops at the count ----
+(defstruct (VecCur a) (v: (Vec a) i: (Cell i64)))
+(impl (Cursor a) (VecCur a)
+  (advance! (self)
+    (let ((i @(. self i)) (n (vec-count (. self v))))
+      (if (< i n)
+          (do (set! (. self i) (+ i 1)) (< (+ i 1) n))
+          false)))
+  (current (self)
+    (let ((i @(. self i)))
+      (if (and (>= i 0) (< i (vec-count (. self v)))) (vec-nth (. self v) i) (no-element)))))
+(impl (Cursable (VecCur a)) (Vec a) (cursor (self) (VecCur self (cell -1))))
+
+(defstruct (ArrayCur a) (a: (Array a) i: (Cell i64)))
+(impl (Cursor a) (ArrayCur a)
+  (advance! (self)
+    (let ((i @(. self i)) (n (array-len (. self a))))
+      (if (< i n)
+          (do (set! (. self i) (+ i 1)) (< (+ i 1) n))
+          false)))
+  (current (self)
+    (let ((i @(. self i)))
+      (if (and (>= i 0) (< i (array-len (. self a)))) (array-get (. self a) i) (no-element)))))
+(impl (Cursable (ArrayCur a)) (Array a) (cursor (self) (ArrayCur self (cell -1))))
+
+;; ---- List and LSeq: the node the cursor stands on, and whether it has moved yet ----
+(defstruct (ListCur a) (at: (Cell (List a)) fresh: (Cell bool)))
+(impl (Cursor a) (ListCur a)
+  (advance! (self)
+    (do (if @(. self fresh)
+            (set! (. self fresh) false)
+            (match @(. self at) ((Cons _ t) (set! (. self at) t)) ((Empty) ())))
+        (match @(. self at) ((Cons _ _) true) ((Empty) false))))
+  (current (self)
+    (if @(. self fresh) (no-element) (match @(. self at) ((Cons h _) h) ((Empty) (no-element))))))
+(impl (Cursable (ListCur a)) (List a) (cursor (self) (ListCur (cell self) (cell true))))
+
+(defstruct (LSeqCur a) (at: (Cell (LSeq a)) fresh: (Cell bool)))
+(impl (Cursor a) (LSeqCur a)
+  (advance! (self)
+    (do (if @(. self fresh)
+            (set! (. self fresh) false)
+            (match (lnode @(. self at)) ((LCons _ t) (set! (. self at) t)) ((LNil) ())))
+        (match (lnode @(. self at)) ((LCons _ _) true) ((LNil) false))))
+  (current (self)
+    (if @(. self fresh) (no-element) (match (lnode @(. self at)) ((LCons h _) h) ((LNil) (no-element))))))
+(impl (Cursable (LSeqCur a)) (LSeq a) (cursor (self) (LSeqCur (cell self) (cell true))))
+
+;; ---- VSeq: the cursor of the front list, then the cursor of the Vec from the offset ----
+(defstruct (VSeqCur a) (front: (ListCur a) back: (VecCur a) fronting: (Cell bool)))
+(impl (Cursor a) (VSeqCur a)
+  (advance! (self)
+    (if @(. self fronting)
+        (if (advance! (. self front))
+            true
+            (do (set! (. self fronting) false) (advance! (. self back))))
+        (advance! (. self back))))
+  (current (self) (if @(. self fronting) (current (. self front)) (current (. self back)))))
+(impl (Cursable (VSeqCur a)) (VSeq a)
+  (cursor (self) (VSeqCur (cursor (. self front)) (VecCur (. self v) (cell (- (. self lo) 1))) (cell true))))
+
+;; ---- Range: the element the cursor stands on, and whether it is before the first (0), on an element (1) or past the end (2) ----
+(defstruct (RangeCur t) (r: (Range t) at: (Cell t) st: (Cell i64)))
+(impl (Cursor t) (RangeCur t) :where ((Num t) (Ord t) (Unit t) (RangeLen t))
+  (advance! (self)
+    (let ((r (. self r)) (st @(. self st)))
+      (if (= st 0)
+          (if (each-while r (fn (x) false))
+              (do (set! (. self st) 2) false)
+              (do (set! (. self at) (. r lo)) (set! (. self st) 1) true))
+          (if (= st 1)
+              (let ((x @(. self at)) (by (. r by)))
+                (if (= by (zero by))
+                    true
+                    (if (range-more? x (. r hi) by)
+                        (do (set! (. self at) (+ x by)) true)
+                        (do (set! (. self st) 2) false))))
+              false))))
+  (current (self) (if (= @(. self st) 1) @(. self at) (no-element))))
+(impl (Cursable (RangeCur t)) (Range t) :where ((Num t) (Ord t) (Unit t) (RangeLen t))
+  (cursor (self) (RangeCur self (cell (. self lo)) (cell 0))))
+
+;; ---- str and Chars: the byte offset of the character the cursor stands on, -1 before the first ----
+(defun lead-width :private (b: i8) -> i64
+  (if (>= b 0i8) 1 (if (< b -32i8) 2 (if (< b -16i8) 3 4))))
+(defun low-bits :private (s: str j: i64) -> i32
+  (bit-and (zext i32 (str-byte-at s j)) 63i32))
+(defun scalar-at :private (s: str i: i64 b: i8 w: i64) -> char
+  (let ((lead (zext i32 b)))
+    (i32->char
+      (if (= w 1)
+          lead
+          (if (= w 2)
+              (bit-or (shl (bit-and lead 31i32) 6i32) (low-bits s (+ i 1)))
+              (if (= w 3)
+                  (bit-or (shl (bit-and lead 15i32) 12i32)
+                          (bit-or (shl (low-bits s (+ i 1)) 6i32) (low-bits s (+ i 2))))
+                  (bit-or (shl (bit-and lead 7i32) 18i32)
+                          (bit-or (shl (low-bits s (+ i 1)) 12i32)
+                                  (bit-or (shl (low-bits s (+ i 2)) 6i32) (low-bits s (+ i 3)))))))))))
+
+(defstruct StrCur (s: str at: (Cell i64)))
+(impl (Cursor char) StrCur
+  (advance! (self)
+    (let ((s (. self s)) (a @(. self at)))
+      (let ((n (str-len s)))
+        (if (>= a n)
+            false
+            (let ((next (if (< a 0) 0 (+ a (lead-width (str-byte-at s a))))))
+              (do (set! (. self at) next) (< next n)))))))
+  (current (self)
+    (let ((s (. self s)) (a @(. self at)))
+      (if (and (>= a 0) (< a (str-len s)))
+          (let ((b (str-byte-at s a))) (scalar-at s a b (lead-width b)))
+          (no-element)))))
+(impl (Cursable StrCur) str (cursor (self) (StrCur self (cell -1))))
+(impl (Cursable StrCur) Chars (cursor (self) (cursor (. self s))))
+
+;; ---- the endless sources ----
+(defstruct (IterateCur a) (f: (fn (a) a) at: (Cell a) fresh: (Cell bool)))
+(impl (Cursor a) (IterateCur a)
+  (advance! (self)
+    (do (if @(. self fresh) (set! (. self fresh) false) (set! (. self at) ((. self f) @(. self at))))
+        true))
+  (current (self) (if @(. self fresh) (no-element) @(. self at))))
+(impl (Cursable (IterateCur a)) (Iterate a)
+  (cursor (self) (IterateCur (. self f) (cell (. self x)) (cell true))))
+
+(defstruct (RepeatCur a) (x: a fresh: (Cell bool)))
+(impl (Cursor a) (RepeatCur a)
+  (advance! (self) (do (set! (. self fresh) false) true))
+  (current (self) (if @(. self fresh) (no-element) (. self x))))
+(impl (Cursable (RepeatCur a)) (Repeat a) (cursor (self) (RepeatCur (. self x) (cell true))))
+
+(impl (Cursable (LSeqCur e)) (Cycle c e) :where ((Reducible c e)) (cursor (self) (cursor (to-lseq self))))
+
+;; ---- the recipes of the lockstep walks: the first operand by each-while, the second by cursor ----
+;; (Zipped a b): the pairs of the elements of a and b, as long as both have one
+(defstruct (Zipped a b ea eb cb) (left: a right: b))
+(impl (Reducible (Pair ea eb)) (Zipped a b ea eb cb) :where ((Reducible a ea) (Cursable b cb) (Cursor cb eb))
+  (each-while (self k)
+    (let ((cur (cursor (. self right))) (ended (cell false)))
+      (let ((done (each-while (. self left)
+                    (fn (x) (if (advance! cur) (k (Pair x (current cur))) (do (set! ended true) false))))))
+        (if done true @ended)))))
+
+;; (ZipWith a b f): (f x y) for the elements of a and b, as long as both have one
+(defstruct (ZipWith a b ea eb cb r) (left: a right: b f: (fn (ea eb) r)))
+(impl (Reducible r) (ZipWith a b ea eb cb r) :where ((Reducible a ea) (Cursable b cb) (Cursor cb eb))
+  (each-while (self k)
+    (let ((cur (cursor (. self right))) (f (. self f)) (ended (cell false)))
+      (let ((done (each-while (. self left)
+                    (fn (x) (if (advance! cur) (k (f x (current cur))) (do (set! ended true) false))))))
+        (if done true @ended)))))
+
+;; (Interleaved a b): an element of a, then the element of b with it, as long as both have one
+(defstruct (Interleaved a b e cb) (left: a right: b))
+(impl (Reducible e) (Interleaved a b e cb) :where ((Reducible a e) (Cursable b cb) (Cursor cb e))
+  (each-while (self k)
+    (let ((cur (cursor (. self right))) (ended (cell false)))
+      (let ((done (each-while (. self left)
+                    (fn (x) (if (advance! cur)
+                                (if (k x) (k (current cur)) false)
+                                (do (set! ended true) false))))))
+        (if done true @ended)))))
+
+;; ---- every recipe is Cursable by buffering: one Vec per cursor, none per element ----
+(impl (Cursable (VecCur b)) (Mapped c e b) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (Filtered c e r) :where ((Reducible c e) (Truthy r)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (Taken c e) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (Dropped c e) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (TakenWhile c e r) :where ((Reducible c e) (Truthy r)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur b)) (Mapcat c e d b) :where ((Reducible c e) (Reducible d b)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (Cat a b e) :where ((Reducible a e) (Reducible b e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur b)) (MapIndexed c e b) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur b)) (Kept c e b) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (DroppedWhile c e r) :where ((Reducible c e) (Truthy r)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (Interposed c e) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (Distinct c e) :where ((Reducible c e) (Hash e) (Eq e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur a)) (Reductions c e a) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (Consed c e) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur (Pair ea eb))) (Zipped a b ea eb cb) :where ((Reducible a ea) (Cursable b cb) (Cursor cb eb))
+  (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur r)) (ZipWith a b ea eb cb r) :where ((Reducible a ea) (Cursable b cb) (Cursor cb eb))
+  (cursor (self) (cursor (to-vec self))))
+(impl (Cursable (VecCur e)) (Interleaved a b e cb) :where ((Reducible a e) (Cursable b cb) (Cursor cb e))
+  (cursor (self) (cursor (to-vec self))))
+
+;; ---- the lazy functions: nodes made on demand over the lazy seqs of both operands ----
+;; the next node of both operands is realised before either is looked at
+(defun lzip :private (a: (LSeq x) b: (LSeq y)) -> (LSeq (Pair x y))
+  (lazy-node (fn ()
+    (let ((na (lnode a)) (nb (lnode b)))
+      (match na
+        ((LNil) LNil)
+        ((LCons x ta) (match nb
+                        ((LNil) LNil)
+                        ((LCons y tb) (LCons (Pair x y) (lzip ta tb))))))))))
+
+(defun lzip-with :private (f: (fn (x y) r) a: (LSeq x) b: (LSeq y)) -> (LSeq r)
+  (lazy-node (fn ()
+    (let ((na (lnode a)) (nb (lnode b)))
+      (match na
+        ((LNil) LNil)
+        ((LCons x ta) (match nb
+                        ((LNil) LNil)
+                        ((LCons y tb) (LCons (f x y) (lzip-with f ta tb))))))))))
+
+;; the pair of nodes x, y is made together: the node of y is ready, and the rest is lazy
+(defun linterleave :private (a: (LSeq e) b: (LSeq e)) -> (LSeq e)
+  (lazy-node (fn ()
+    (let ((na (lnode a)) (nb (lnode b)))
+      (match na
+        ((LNil) LNil)
+        ((LCons x ta) (match nb
+                        ((LNil) LNil)
+                        ((LCons y tb) (LCons x (lcons y (linterleave ta tb)))))))))))
+
+(defun zip (a: c1 b: c2) :where ((Reducible c1 x) (Reducible c2 y)) -> (LSeq (Pair x y))
+  (lzip (to-lseq a) (to-lseq b)))
+
+;; the 3-arity of map until Y11 deletes it
+(defun zip-with (f: (fn (x y) r) a: c1 b: c2) :where ((Reducible c1 x) (Reducible c2 y)) -> (LSeq r)
+  (lzip-with f (to-lseq a) (to-lseq b)))
+
+(defun interleave (a: c1 b: c2) :where ((Reducible c1 e) (Reducible c2 e)) -> (LSeq e)
+  (linterleave (to-lseq a) (to-lseq b)))
+
+;; ---- zipmap, seq= and seq-of ----
+(defun zipmap (ks: c1 vs: c2) :where ((Reducible c1 k) (Cursable c2 cv) (Cursor cv v) (Hash k) (Eq k)) -> (Map k v)
+  (let ((cur (cursor vs)) (acc (cell (fib.prelude/map-empty))))
+    (do (each-while ks
+          (fn (key) (if (advance! cur)
+                        (do (set! acc (fib.prelude/map-assoc @acc key (current cur))) true)
+                        false)))
+        @acc)))
+
+;; whether the elements of a and of b are equal one by one and both end together
+(defun seq= (a: c1 b: c2) :where ((Reducible c1 e) (Reducible c2 e) (Eq e)) -> bool
+  (let ((more (cell (to-lseq b))) (same (cell true)))
+    (do (each-while a
+          (fn (x) (match (lnode @more)
+                    ((LNil) (do (set! same false) false))
+                    ((LCons y t) (if (= x y) (do (set! more t) true) (do (set! same false) false))))))
+        (if @same (match (lnode @more) ((LNil) true) ((LCons _ _) false)) false))))
+
+(defun seq-of (c: c) :where ((Reducible c e)) -> (dyn (Reducible e)) (dyn (Reducible e) c))

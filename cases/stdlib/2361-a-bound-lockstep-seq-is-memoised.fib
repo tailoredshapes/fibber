@@ -1,0 +1,70 @@
+;; spec:   stdlib §2.1 rule 2 (a value traversed twice runs its function once), tranche 2 plan Y3 (risks)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: zip zip-with interleave
+;; A bound zip, zip-with or interleave is Clojure's memoised seq: two traversals of it see the same elements, and the
+;; function of zip-with and the nodes of the sources are run once per element however many times the seq is read (the
+;; risk the plan names for a cursor that advances once per node: a seq built on a cursor that is stepped by every
+;; reader would give the second reader the elements after the first's; these are built on the lazy seqs of their
+;; operands, whose nodes are realised once). The case reads each result four ways (`to-vec` twice, then `count`, then
+;; the element at 2 through `nth`), and then reads a prefix and the whole through two readers taken turn about. A seq is also
+;; its own second operand (`(zip s (rest s))`), and two cursors over one bound seq advance the same nodes: each sees every
+;; element and the function behind the seq runs once per element, not once per cursor.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (na (cell 0)) (nb (cell 0)) (calls (cell 0)))
+    (let ((w (zip-with (fn (x: i64 y: i64) (do (set! calls (+ @calls 1)) (* x y)))
+                       (countdown 4 na) (countdown 6 nb))))
+      (do (check c (= (to-vec w) [24 15 8 3]))
+          (check c (= @calls 4))
+          (check c (= (to-vec w) [24 15 8 3]))
+          (check c (= (count w) 4))
+          (check c (= (nth w 2) 8))
+          (check c (= @calls 4))
+          ;; four elements of the first and one more node to see that it ends; the same for the second operand
+          (check c (= @na 5))
+          (check c (= @nb 5))
+          ;; the same through two readers: each takes a prefix, then the whole, and both see one sequence
+          (let ((z (zip (countdown 3 na) (to-lseq [7 8 9 10]))))
+            (let ((head (to-vec (take 2 z))) (whole (to-vec z)) (again (to-vec (take 2 z))))
+              (do (check c (= (count head) 2))
+                  (check c (= (count whole) 3))
+                  (check c (= (nth head 1) (nth whole 1)))
+                  (check c (= again head))
+                  (check c (= (nth whole 2) (Pair 1 9))))))
+          (let ((il (interleave (countdown 3 na) (to-lseq [7 8 9 10]))))
+            (do (check c (= (to-vec il) [3 7 2 8 1 9]))
+                (check c (= (to-vec il) [3 7 2 8 1 9]))
+                (check c (= (to-vec (drop 4 il)) [1 9]))))
+          ;; a lockstep seq is itself an operand: it is read once however many seqs are built on it
+          (let ((base (zip [1 2 3] [4 5 6])))
+            (let ((p (zip base [10 20 30])) (q (zip [0 0 0] base)))
+              (do (check c (= (count p) 3))
+                  (check c (= (count q) 3))
+                  (check c (= (to-vec base) [(Pair 1 4) (Pair 2 5) (Pair 3 6)])))))
+          ;; a seq that is its own second operand: the nodes are shared, and f runs once per node
+          (let ((k (cell 0)))
+            (let ((s (map (fn (x: i64) (do (set! k (+ @k 1)) (+ x 1))) [0 1 2 3])))
+              (do (check c (= (to-vec (zip s (rest s))) [(Pair 1 2) (Pair 2 3) (Pair 3 4)]))
+                  (check c (= @k 4)))))
+          ;; two cursors over one bound seq advance the same nodes: each sees every element, and f runs once per element
+          (let ((k (cell 0)))
+            (let ((s (map (fn (x: i64) (do (set! k (+ @k 1)) (* x 10))) [1 2 3])))
+              (let ((c1 (cursor s)) (c2 (cursor s)))
+                (do (check c (and (advance! c1) (advance! c1)))
+                    (check c (= (current c1) 20))
+                    (check c (and (advance! c2) (= (current c2) 10)))
+                    (check c (= @k 2))
+                    (check c (and (advance! c2) (advance! c2) (= (current c2) 30)))
+                    (check c (and (advance! c1) (= (current c1) 30)))
+                    (check c (not (or (advance! c1) (advance! c2))))
+                    (check c (= @k 3))))))
+          (checks-result c)))))
