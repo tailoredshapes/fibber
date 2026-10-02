@@ -62,6 +62,12 @@ commands:
                   extern, unit, error, ast, tables), --library (no main
                   needed), --prelude (each file is a library prelude),
                   --implicit, --implicit-lib A,B, --ast, --tables
+  own [OPTION..] <file>..
+                  print the ownership decisions of each file (the dump
+                  of spec/bootstrap.md section 7). Options, before the
+                  files: --sections A,B (body, facts, summary, taken,
+                  error, explain), --library, --prelude, --implicit,
+                  --implicit-lib A,B
   help           print this message";
 
 /// The directory `cases` runs when none is given.
@@ -85,6 +91,11 @@ enum Command {
     Types {
         files: Vec<String>,
         opts: fibref::types_dump::Options,
+    },
+    /// Print the ownership dump of each file (`fibref::own_dump`).
+    Own {
+        files: Vec<String>,
+        opts: fibref::own_dump::Options,
     },
     /// Print usage and exit successfully.
     Help,
@@ -138,6 +149,10 @@ fn parse(args: &[String]) -> Command {
         },
         [cmd, rest @ ..] if cmd == "types" => match fibref::types_dump::parse_args(rest) {
             Some((opts, files)) => Command::Types { files, opts },
+            None => Command::Invalid,
+        },
+        [cmd, rest @ ..] if cmd == "own" => match fibref::own_dump::parse_args(rest) {
+            Some((opts, files)) => Command::Own { files, opts },
             None => Command::Invalid,
         },
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
@@ -270,6 +285,13 @@ fn types_files(files: &[String], opts: &fibref::types_dump::Options) -> ExitCode
     finish(&text, ExitCode::from(status))
 }
 
+/// Prints the ownership dump of each file (`fibref::own_dump`): exit 1 if
+/// a program ends in an error record, 2 if a file cannot be read.
+fn own_files(files: &[String], opts: &fibref::own_dump::Options) -> ExitCode {
+    let (text, status) = fibref::own_dump::own_files(files, opts);
+    finish(&text, ExitCode::from(status))
+}
+
 /// Prints `text` to stdout and returns `code`, the verdict of the
 /// command, unless the report could not be written: then it says why on
 /// stderr and exits 2, so that a full device is not a pass. A reader that
@@ -319,6 +341,7 @@ fn main() -> ExitCode {
         Command::Read { files, print } => read_files(&files, print),
         Command::Expand { files, opts } => expand_files(&files, &opts),
         Command::Types { files, opts } => types_files(&files, &opts),
+        Command::Own { files, opts } => own_files(&files, &opts),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -331,174 +354,4 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn cases_takes_one_directory() {
-        assert_eq!(
-            parse(&args(&["cases", "cases/other"])),
-            Command::Cases {
-                dir: "cases/other".to_string(),
-                only: Vec::new()
-            }
-        );
-    }
-
-    #[test]
-    fn cases_only_takes_one_or_more_prefixes_after_the_directory() {
-        assert_eq!(
-            parse(&args(&["cases", "d", "--only", "240-", "241-"])),
-            Command::Cases {
-                dir: "d".to_string(),
-                only: vec!["240-".to_string(), "241-".to_string()]
-            }
-        );
-        assert_eq!(parse(&args(&["cases", "d", "--only"])), Command::Invalid);
-        assert_eq!(parse(&args(&["cases", "--only", "1"])), Command::Invalid);
-        assert_eq!(
-            parse(&args(&["cases", "d", "-only", "1"])),
-            Command::Invalid
-        );
-    }
-
-    #[test]
-    fn cases_without_a_directory_uses_the_default() {
-        assert_eq!(
-            parse(&args(&["cases"])),
-            Command::Cases {
-                dir: "cases/ownership".to_string(),
-                only: Vec::new()
-            }
-        );
-    }
-
-    #[test]
-    fn cases_with_extra_arguments_is_invalid() {
-        assert_eq!(parse(&args(&["cases", "a", "b"])), Command::Invalid);
-    }
-
-    #[test]
-    fn explain_takes_one_file() {
-        assert_eq!(
-            parse(&args(&["explain", "a.fib"])),
-            Command::Explain {
-                file: "a.fib".to_string()
-            }
-        );
-        assert_eq!(parse(&args(&["explain"])), Command::Invalid);
-    }
-
-    #[test]
-    fn run_takes_one_file() {
-        assert_eq!(
-            parse(&args(&["run", "a.fib"])),
-            Command::Run {
-                file: "a.fib".to_string(),
-                args: Vec::new()
-            }
-        );
-        assert_eq!(
-            parse(&args(&["run", "a.fib", "--", "x"])),
-            Command::Run {
-                file: "a.fib".to_string(),
-                args: vec!["x".to_string()]
-            }
-        );
-        assert_eq!(parse(&args(&["run"])), Command::Invalid);
-    }
-
-    #[test]
-    fn read_takes_one_or_more_files() {
-        assert_eq!(
-            parse(&args(&["read", "a.fib", "b.fib"])),
-            Command::Read {
-                files: vec!["a.fib".to_string(), "b.fib".to_string()],
-                print: false
-            }
-        );
-        assert_eq!(parse(&args(&["read"])), Command::Invalid);
-    }
-
-    #[test]
-    fn read_print_is_a_flag_before_the_files() {
-        assert_eq!(
-            parse(&args(&["read", "--print", "a.fib", "b.fib"])),
-            Command::Read {
-                files: vec!["a.fib".to_string(), "b.fib".to_string()],
-                print: true
-            }
-        );
-        // The flag alone names no file; after a file it is a file name.
-        assert_eq!(parse(&args(&["read", "--print"])), Command::Invalid);
-        assert_eq!(
-            parse(&args(&["read", "a.fib", "--print"])),
-            Command::Read {
-                files: vec!["a.fib".to_string(), "--print".to_string()],
-                print: false
-            }
-        );
-    }
-
-    #[test]
-    fn expand_takes_its_options_and_files_from_the_shared_parser() {
-        let opts = Options {
-            context: true,
-            ..Options::default()
-        };
-        assert_eq!(
-            parse(&args(&["expand", "--context", "a.fib", "b.fib"])),
-            Command::Expand {
-                files: vec!["a.fib".to_string(), "b.fib".to_string()],
-                opts
-            }
-        );
-        assert_eq!(parse(&args(&["expand"])), Command::Invalid);
-        assert_eq!(parse(&args(&["expand", "--context"])), Command::Invalid);
-    }
-
-    #[test]
-    fn types_takes_its_options_and_files_from_the_shared_parser() {
-        let opts = fibref::types_dump::Options {
-            stage: fibref::types_dump::Stage::Lower,
-            tables: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            parse(&args(&["types", "--stage", "lower", "--tables", "a.fib"])),
-            Command::Types {
-                files: vec!["a.fib".to_string()],
-                opts
-            }
-        );
-        assert_eq!(parse(&args(&["types"])), Command::Invalid);
-        assert_eq!(
-            parse(&args(&["types", "--stage", "x", "a.fib"])),
-            Command::Invalid
-        );
-    }
-
-    #[test]
-    fn no_arguments_is_invalid() {
-        assert_eq!(parse(&args(&[])), Command::Invalid);
-    }
-
-    #[test]
-    fn unknown_command_is_invalid() {
-        assert_eq!(
-            parse(&args(&["bogus", "cases/ownership"])),
-            Command::Invalid
-        );
-    }
-
-    #[test]
-    fn help_spellings_are_help() {
-        for spelling in ["help", "--help", "-h"] {
-            assert_eq!(parse(&args(&[spelling])), Command::Help, "{spelling}");
-        }
-    }
-}
+mod tests;

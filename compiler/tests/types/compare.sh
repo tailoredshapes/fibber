@@ -1,22 +1,26 @@
 #!/bin/bash
-# Compare the fibber type checker with `fibref types` on a list of programs, one process per file.
-# usage: compare.sh [-j N] [-o "OPTIONS"] FIBREF TOOL FILE..
-#   FIBREF  the Rust tool (target/debug/fibref), TOOL the built compiler/types.fib binary
-#   -o      options given to both tools, e.g. "--stage lower --sections type,error" (see spec/bootstrap.md section 6)
+# Compare a fibber tool with the `fibref` subcommand it replaces on a list of programs, one process per file:
+# the type checker (compiler/types.fib, `fibref types`, the default) or the ownership checker
+# (compiler/own.fib, `fibref own`, or `fibref explain`).
+# usage: compare.sh [-j N] [-c SUBCOMMAND] [-o "OPTIONS"] FIBREF TOOL FILE..
+#   FIBREF  the Rust tool (target/debug/fibref), TOOL the built fibber binary
+#   -c      the fibref subcommand to run (types, own, explain, ..); default types
+#   -o      options given to both tools, e.g. "--stage lower --sections type,error" (spec/bootstrap.md section 6)
+#           or "--sections body,facts" with -c own (section 7)
 # Output: a tally and the first ten differing files; the two outputs of each difference are kept in
-# $CMP_OUT (default $HOME/.cache/fibber-scratch/compare-types) as NAME.rust and NAME.fib.
+# $CMP_OUT (default $HOME/.cache/fibber-scratch/compare-SUBCOMMAND) as NAME.rust and NAME.fib.
 # Run from the repository root. Each process runs under ulimit -v 4000000 and a 120 s timeout.
-jobs=4; opts=""
-while getopts "j:o:" o; do case $o in j) jobs=$OPTARG;; o) opts=$OPTARG;; esac; done
+jobs=4; opts=""; cmd=types
+while getopts "j:o:c:" o; do case $o in j) jobs=$OPTARG;; o) opts=$OPTARG;; c) cmd=$OPTARG;; esac; done
 shift $((OPTIND-1)); rust=$1; tool=$2; shift 2
-out=${CMP_OUT:-$HOME/.cache/fibber-scratch/compare-types}; rm -rf "$out"; mkdir -p "$out"
+out=${CMP_OUT:-$HOME/.cache/fibber-scratch/compare-$cmd}; rm -rf "$out"; mkdir -p "$out"
 one() {
   f=$1; n=$(echo "$f" | tr '/' '_')
-  (ulimit -v 4000000; timeout 120 "$rust" types $opts "$f" > "$out/$n.rust" 2>&1; echo "status $?" >> "$out/$n.rust")
+  (ulimit -v 4000000; timeout 120 "$rust" $cmd $opts "$f" > "$out/$n.rust" 2>&1; echo "status $?" >> "$out/$n.rust")
   (ulimit -v 4000000; timeout 120 "$tool" $opts "$f" > "$out/$n.fib" 2>&1; echo "status $?" >> "$out/$n.fib")
   if cmp -s "$out/$n.rust" "$out/$n.fib"; then rm -f "$out/$n.rust" "$out/$n.fib"; echo "same $f"; else echo "DIFF $f"; fi
 }
-export -f one; export rust tool opts out
+export -f one; export rust tool opts out cmd
 printf '%s\n' "$@" | xargs -P "$jobs" -I{} bash -c 'one {}' > "$out/tally.txt"
 same=$(grep -c '^same' "$out/tally.txt"); diff=$(grep -c '^DIFF' "$out/tally.txt")
 echo "files $((same+diff)): same $same, different $diff"

@@ -43,6 +43,9 @@ pub use program::OwnedProgram;
 pub use taken::{methods_taken, value_taken};
 pub use top::analyse;
 
+pub(crate) use facts::Facts;
+pub(crate) use top::analyse_observed;
+
 use crate::expand::{ExpandCtx, NoRunner};
 use crate::modules::ModuleSpec;
 use crate::roots::Roots;

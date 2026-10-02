@@ -26,12 +26,17 @@ use names::{at, index, op, pass, show, site, tail};
 
 /// The explanation of every body of the user module, in checking order.
 pub fn explain(p: &TypedProgram, o: &OwnedProgram) -> String {
+    explain_module(p, o, p.globals.main)
+}
+
+/// The explanation of every body of module `module`, in checking order.
+pub fn explain_module(p: &TypedProgram, o: &OwnedProgram, module: ModuleId) -> String {
     let mut out = String::new();
     for key in &o.order {
-        let Some((title, body, module)) = header(p, *key) else {
+        let Some((title, body, home)) = header(p, *key) else {
             continue;
         };
-        if module != p.globals.main {
+        if home != module {
             continue;
         }
         if let Some(b) = o.bodies.get(key) {

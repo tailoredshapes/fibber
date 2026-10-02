@@ -884,3 +884,250 @@ error MacroArity 1:23 22..28: macro when takes at least 1 argument(s), got 0
 and option, 25 error kinds from short programs, the check that the text is
 the same on every run); the harness that runs the port against it,
 `crates/fibc/tests/bootstrap_types.rs`, is not written yet.
+
+## 7. The ownership checker (M6 step 4)
+
+The pass of `crates/fibref/src/own/` (the `&` checks, the tail sites, the
+fixpoint of the count kinds, the walk that decides every operation, the
+summaries) is ported to `compiler/own/`, judged as the type checker was: by
+a dump that the oracle and the port print and that must be the same text,
+byte for byte (method rule 3). `fibref explain` (types §9) stays as a second
+oracle for the text of the user module; the dump is the first one, because
+it shows what the emitter reads and `explain` does not (every library body,
+the modes of the expressions, the allocations, the facts of the fixpoint).
+This section is the format of the dump; the plan of the port is outside the
+spec.
+
+### 7.1 The ownership dump
+
+`fibref own [OPTION..] [--] FILE..` and `compiler/own.fib` with the same
+words print the same text. The words, the statuses and the header are those
+of §6.1: for each FILE the line `== FILE`, then one of
+
+- the line `unreadable`;
+- the **expander's error record** unchanged (§5.1), when the file does not
+  read, load or expand;
+- the `error` records (§6.4) of the type checker's first failing step, when
+  it does not type; or the `error` records (§7.4) of the ownership pass,
+  when it does not pass;
+- the **sections** of every module (§7.3), in dependency order and the main
+  module last, when the program is accepted.
+
+The exit status is 0 if every file was accepted, 1 if one ended in an error
+record (also when `--sections` leaves it out of the text), 2 if one was
+unreadable, the larger winning. The arguments are read by
+`fibref::own_dump::parse_args`: the words that start with `--` before the
+first file are options, a lone `--` ends them, and no file, a word that is
+not an option or a section that is not one, or an empty or repeated-comma
+list refuses with a usage line on standard error, nothing on standard
+output, and status 2.
+
+**What the tool runs**, which the port runs in the same order: what §6.1
+runs up to `types::lower_modules`; then `own::syntactic::check` (the `&`
+checks of types §6.5 and §6.9 that need no types: still step 3, so a
+program with one of them and a type error prints only the `&` error); then
+`types::infer_lowered` with `main` required unless `--library`; then
+`own::analyse` on the typed program, which walks the units in checking
+order. A panic is the line `internal error: the own dump panicked` and
+status 2.
+
+### 7.2 Options
+
+| Option | What it does |
+|---|---|
+| `--sections LIST` | print only the sections of LIST: section names separated by commas, from `body`, `facts`, `summary`, `taken`, `error`, `explain`; the order of the dump is not the order of LIST. Without it every section but `explain` prints |
+| `--library` | `main` is not required, as in §6.2 |
+| `--implicit` | print the sections of the implicit modules, of the modules read for them and of `fib.prelude` (first of all), as in §6.2 |
+| `--implicit-lib LIST` | the implicit modules of this dump, as in §6.2 (`--implicit-lib ""` is no library, which most tests run with) |
+| `--prelude` | each FILE is a library prelude, checked alone with no `main`, as in §6.2; one section `-- module fib.prelude FILE` |
+
+There is no `--stage`, `--ast` or `--tables`: the pass has one stage and
+reads the tables of §6 without printing them.
+
+### 7.3 The sections of a module
+
+Every module with a section starts with `-- module NS FILE`. The sections
+follow in the order `body`, `facts`, `summary`, `taken`, `explain`; every
+line is `WORD ..` with the indented lines of its record under it, and
+**every table that the pass keeps in a hash table is printed in order of its
+id** (`ExprId`, `BindingId`, `FunId`), the others in the order the pass built
+them. Ids are the numbers of the type checker's tables (§6.5 shows them),
+which its port reproduces; no name is written where an id is enough, and no
+type is written (ownership prints none, so §6.4's normalisation is not
+needed).
+
+**`body`**: one record per body of the module (`OwnedProgram::order`: the
+order the units were decided; a body belongs to the module that defines its
+function, its instance or its `def`), headed by `body KEY`. `KEY` is `fun
+NAME` (a `defun` or `defmacro`), `allowned NAME` (the all-owned body of a
+function whose value is taken), `method I NAME` and `methodowned I NAME` (the
+implementation of method `NAME` of instance `I`, as in the `unit impl` lines
+of §6.3, and its all-owned body) or `def NAME`. Under it, one table after the
+other, in this order and each in order of id:
+
+```
+  param B NAME KIND escapes=0|1 declared-borrow=0|1
+  expr E MODE[ after OP; OP..]
+  binding B NAME BKIND scope-local=0|1
+  call E CALLEE tail=TAIL head=PASS args=PASS,.. write-backs=I:B,.. jump=OP; OP..
+  recur E args=PASS,.. jump=OP; OP..
+  closure E async=0|1 captures=B:PASS,.. escaping=no|yes(REASON) heap=no|yes(REASON)
+    closure-param E B NAME KIND escapes=0|1 declared-borrow=0|1
+  alloc E heap|stack|nothing
+  stack-temp E
+  guard-fail E[ OP; OP..]
+```
+
+`B` and `E` after a word are the ids of a binding and an expression (`B428`,
+`E3087`), in the `param` lines in the order of the parameters. The words:
+
+| Text | Is |
+|---|---|
+| `KIND` | `scalar`, `amp`, `borrowed`, or `owned:WHY,WHY..` (`owned` alone if no reason is left), the reasons in the order of their derived `Ord` (variant, then text); `WHY` is `rule1(TEXT)`, `rule2(TEXT)`, `rule3(TEXT)`, `loop(TEXT)` or `declared`, `TEXT` the pass's own words (`returned`, `called at a tail site`) |
+| `MODE` | `scalar`, `owned`, `owned!` (immortal), `borrowed SITE`, `derived SITE` |
+| `SITE` | `b:B` (binding), `v:E` (value of expression), `cap:E:B` (capture `B` in closure `E`), `env:E`, `def:D` |
+| `OP` | `retain`, `release` or `end-stack`, then `SITE`, then the reason: `return`, `store`, `join`, `scope-exit`, `step-end`, `derived-exit`, `discard`, `param-exit`, `loop-init`, `jump`, `recur-old` |
+| `BKIND` | `scalar`, `owns`, `alias-of SITE`, `derived-of SITE`, `borrowed-param`, `owned-param`, `amp-param` |
+| `CALLEE` | `fun NAME`, `allowned NAME`, `method PROTOCOL.NAME`, `builtin NAME` (by name: the table of builtins may grow), `ctor`, `extern`, `value` |
+| `TAIL` | `none` (not in tail position), `tail`, `ordinary:BECAUSE` with `BECAUSE` one of `amp-argument`, `amp-captured:B`, `frame-owned:I` (argument `I`, from 0), `async-body`, `extern`, `store` |
+| `PASS` | `scalar`, `borrow`, `move`, `retain`, `acquire`, `forward`, `own-cell`, `alias`, `keep-env` |
+
+Lists are separated by a comma (passes, captures, write-backs) or by `; `
+(operations) and an empty list prints nothing after its `=`, so a `call` line
+ends in `jump=` with a space before it. A `closure` line is followed by one
+`closure-param` line for each parameter of the literal; an `expr` line has
+` after ` and its operations only if it has some; a `guard-fail` line has its
+operations after one space, or none.
+
+**`facts`**: one record per unit decided, in the order the units were decided
+(an SCC whose value is taken has its all-owned unit right after its own),
+under the module of its first body: `facts KEY, KEY..` (the keys of the
+unit's bodies as above), then the unit's settled facts, each in order of id:
+
+```
+  owned B WHY,WHY..        a parameter whose kind is owned, with every reason
+  escapes B TEXT           a parameter or loop variable that escapes, with the first reason
+  loop-rule1 B             a loop variable to which rule 1 applies
+  escaping E TEXT          an escaping closure literal, with the first use of kind (d)
+  heap E TEXT              a closure literal on the heap, with the reason
+```
+
+**`summary`**: `summary NAME (O,E) (O,E)..` for each `defun` of the module in
+order of function id: per parameter, owned and escapes as `0` or `1`; a
+function with no parameter is `summary NAME`.
+
+**`taken`**: `taken value NAME` for each function of the module whose value
+is taken, in order of function id, then `taken method I NAME` for each
+method implementation that a method value may run, in order of `(I, method)`.
+
+**`explain`**: the text `fibref explain` prints for the module (types §9: one
+block per body, with a blank line after each), line for line. It is not
+printed unless `--sections` lists it; for the main module it is exactly what
+`fibref explain FILE` prints.
+
+### 7.4 Errors, ordering and what is never printed
+
+- The five kinds of `own::OwnErrorKind` print as `error KIND LINE:COL
+  START..END[@FILE]: MESSAGE`, the position relative to the **main** file as in
+  §6.4, and a file with one prints no section: `AmpTwice` (one variable
+  passed to two `&` parameters of a call) and `AmpInAsync` (an `&` parameter
+  used inside `async`), both found before inference; `AmpCaptured` (an `&`
+  parameter captured by an escaping closure), `BorrowEscapes` (a parameter
+  declared `:borrow` escapes) and `ImplEscapes` (the same for a protocol
+  method's implementation, or the default it took), found in the order of the
+  units. The syntactic errors come first and alone: they stop the file before
+  type errors are looked for. Type errors print as in §6.4 and stop the file
+  before the pass runs.
+- **Nothing iterates a hash table unsorted.** The pass keeps its per-body
+  tables in `HashMap`s; the dump sorts each by id. A unit test runs a program
+  several times in one process (hash tables get a new seed each time) and
+  compares the text, and another checks that every table of the text is in
+  increasing order of id.
+- **Not printed**: the types, the edges and member lists inside the facts of
+  a unit (they are inputs of the fixpoint, not decisions), the positions of
+  expressions (the ids say which expression, and `fibref types --ast` says
+  where it is).
+- To print the facts, the pass reports each unit as it decides it
+  (`own::analyse_observed`, the `watch` function `analyse` leaves empty);
+  nothing in the pass reads what it reports.
+
+### 7.5 A worked example, accepted
+
+`t.fib`:
+
+```
+(defstruct Pt (x: i64 y: i64))
+(defun keep (s: Pt) -> Pt s)
+(defun mk (n: i64) (fn (x) (+ x n)))
+(defun main () -> i64 (. (keep (Pt 1 2)) x))
+```
+
+`fibref own --implicit-lib "" t.fib` prints, status 0 (the ids are those of
+this run: the prelude's bindings and expressions come first):
+
+```
+== t.fib
+-- module main t.fib
+body fun keep
+  param B428 s owned:rule1(returned) escapes=1 declared-borrow=0
+  expr E3087 borrowed b:428
+  binding B428 s owned-param scope-local=0
+body fun mk
+  param B429 n scalar escapes=0 declared-borrow=0
+  expr E3089 scalar
+  expr E3090 scalar
+  expr E3091 scalar
+  expr E3092 owned
+  binding B429 n scalar scope-local=0
+  binding B430 x scalar scope-local=0
+  call E3091 method Num.+ tail=tail head=scalar args=scalar,scalar write-backs= jump=release env:3092 jump
+  closure E3092 async=0 captures=429:scalar escaping=yes(returned) heap=yes(returned)
+    closure-param E3092 B430 x scalar escapes=0 declared-borrow=0
+  alloc E3092 heap
+body fun main
+  expr E3095 scalar
+  expr E3096 scalar
+  expr E3097 owned
+  expr E3098 owned
+  expr E3099 scalar after release v:3098 scope-exit
+  call E3097 ctor tail=none head=scalar args=scalar,scalar write-backs= jump=
+  call E3098 fun keep tail=none head=scalar args=move write-backs= jump=
+  alloc E3097 heap
+facts fun keep
+  owned B428 rule1(returned)
+  escapes B428 returned
+facts fun mk
+  escaping E3092 returned
+  heap E3092 returned
+facts fun main
+summary keep (1,1)
+summary mk (0,0)
+summary main
+```
+
+`keep` returns its parameter, so the parameter is owned by rule 1 and its
+summary is `(1,1)`; `mk` returns a closure, which therefore escapes and is
+on the heap, and the tail call `+` first releases the closure's own `env`;
+in `main` the result of `(keep ..)` is an owned temporary that is released
+when the projection `.` is done.
+
+### 7.6 A worked example, rejected
+
+`(defstruct Pt (x: i64 y: i64)) (defun keep (s: Pt :borrow) -> Pt s) (defun main () -> i64 (. (keep (Pt 1 2)) x))`
+on three lines in `t.fib`: `fibref own --implicit-lib "" t.fib` prints, status
+1, no section:
+
+```
+== t.fib
+error BorrowEscapes 2:1 31..67: parameter s of keep is declared :borrow but escapes
+```
+
+`fibref own` is tested by `crates/fibref/src/own_dump/` (every section and
+option, each error kind from a short program, the text the same on every
+run, the order of the ids); the harnesses that run the port against it are
+`compiler/tests/types/compare.sh -c own` (one verdict per file, the same
+script that runs the type checker; `-c explain` compares `fibref explain`)
+and `compiler/tests/own/compare-bodies.sh` (the same pairs of outputs cut at
+the top-level lines, with a tally per kind of record: how many bodies, facts,
+summaries are identical, which a port that cannot yet finish a file needs
+to see its progress).

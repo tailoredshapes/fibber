@@ -92,7 +92,7 @@ impl Facts {
 
     /// Adds what `events` imply about the unit whose `fn` literals are
     /// `literals`; returns whether anything changed.
-    pub fn absorb(
+    pub(super) fn absorb(
         &mut self,
         p: &TypedProgram,
         events: &[Event],

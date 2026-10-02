@@ -17,6 +17,7 @@ pub mod expand_dump;
 pub mod heap;
 pub mod modules;
 pub mod own;
+pub mod own_dump;
 pub mod roots;
 pub mod syntax;
 pub mod types;

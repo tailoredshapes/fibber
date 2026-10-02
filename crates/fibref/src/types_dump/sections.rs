@@ -273,7 +273,7 @@ fn unit_module(g: &Globals, u: &UnitRef) -> ModuleId {
 }
 
 /// The name of method `k` of instance `i`.
-fn impl_method_name(g: &Globals, i: usize, k: usize) -> &str {
+pub(crate) fn impl_method_name(g: &Globals, i: usize, k: usize) -> &str {
     let inst = &g.instances[i];
     &g.proto(inst.proto).methods[inst.methods[k].index].name
 }

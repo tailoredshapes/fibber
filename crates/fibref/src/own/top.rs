@@ -18,11 +18,24 @@ use super::facts::Facts;
 use super::objects::is_object;
 use super::program::{BodyKey, BodyOwn, OwnedProgram, Pass};
 use super::syntactic::visit;
-use super::unit::{decide, Unit};
+use super::unit::{decide, Decided, Unit};
 use super::walk::{BodySpec, FrameKind, ParamIn};
+
+/// What a dump may watch: after each unit is decided, the keys of its
+/// bodies (in the order they were stored) and its finished facts.
+pub(crate) type Observer<'o> = &'o mut dyn FnMut(&[BodyKey], &Facts);
 
 /// Runs the ownership pass over a typed program.
 pub fn analyse(p: &TypedProgram) -> Result<OwnedProgram, Vec<OwnError>> {
+    analyse_observed(p, &mut |_, _| {})
+}
+
+/// [`analyse`], telling `watch` about every unit as it is decided; the
+/// pass reads nothing back, so the result is the same.
+pub(crate) fn analyse_observed(
+    p: &TypedProgram,
+    watch: Observer<'_>,
+) -> Result<OwnedProgram, Vec<OwnError>> {
     let mut prog = OwnedProgram {
         value_taken: super::taken::value_taken(p),
         methods_taken: super::taken::methods_taken(p),
@@ -31,9 +44,11 @@ pub fn analyse(p: &TypedProgram) -> Result<OwnedProgram, Vec<OwnError>> {
     let mut errors = Vec::new();
     for u in &p.units {
         match u {
-            UnitRef::Scc(fs) => scc_unit(p, fs, &mut prog, &mut errors),
-            UnitRef::Macro(f) => scc_unit(p, &[*f], &mut prog, &mut errors),
-            UnitRef::ImplMethod(i, m) => method_unit(p, *i, *m, &mut prog, &mut errors),
+            UnitRef::Scc(fs) => scc_unit(p, fs, &mut prog, &mut errors, &mut *watch),
+            UnitRef::Macro(f) => scc_unit(p, &[*f], &mut prog, &mut errors, &mut *watch),
+            UnitRef::ImplMethod(i, m) => {
+                method_unit(p, (*i, *m), &mut prog, &mut errors, &mut *watch)
+            }
             UnitRef::Def(d) => {
                 let spec = BodySpec {
                     kind: FrameKind::Def,
@@ -47,6 +62,7 @@ pub fn analyse(p: &TypedProgram) -> Result<OwnedProgram, Vec<OwnError>> {
                     all_owned: false,
                 };
                 let done = decide(p, &prog.summaries, &unit, Facts::default());
+                seen(&mut *watch, &done);
                 store(&mut prog, done.bodies);
             }
         }
@@ -56,6 +72,11 @@ pub fn analyse(p: &TypedProgram) -> Result<OwnedProgram, Vec<OwnError>> {
     } else {
         Err(errors)
     }
+}
+
+fn seen(watch: Observer<'_>, done: &Decided) {
+    let keys: Vec<BodyKey> = done.bodies.iter().map(|(k, _)| *k).collect();
+    watch(&keys, &done.facts);
 }
 
 fn store(prog: &mut OwnedProgram, bodies: Vec<(BodyKey, BodyOwn)>) {
@@ -91,7 +112,13 @@ fn fun_spec<'p>(p: &'p TypedProgram, f: FunId, all_owned: bool) -> BodySpec<'p> 
     }
 }
 
-fn scc_unit(p: &TypedProgram, fs: &[FunId], prog: &mut OwnedProgram, errors: &mut Vec<OwnError>) {
+fn scc_unit(
+    p: &TypedProgram,
+    fs: &[FunId],
+    prog: &mut OwnedProgram,
+    errors: &mut Vec<OwnError>,
+    watch: Observer<'_>,
+) {
     let members: BTreeMap<FunId, Vec<_>> = fs
         .iter()
         .map(|f| {
@@ -108,6 +135,7 @@ fn scc_unit(p: &TypedProgram, fs: &[FunId], prog: &mut OwnedProgram, errors: &mu
         &scc_bodies(p, fs, false),
         Facts::new(members.clone(), inferred, &[]),
     );
+    seen(&mut *watch, &done);
     for f in fs {
         prog.summaries.insert(*f, done.facts.summary(p, *f));
         borrow_checks(p.globals.fun(*f), &done.facts, errors);
@@ -122,6 +150,7 @@ fn scc_unit(p: &TypedProgram, fs: &[FunId], prog: &mut OwnedProgram, errors: &mu
         let preset: Vec<_> = members.values().flatten().copied().collect();
         let facts = Facts::new(members, BTreeSet::new(), &preset);
         let done = decide(p, &prog.summaries, &scc_bodies(p, fs, true), facts);
+        seen(&mut *watch, &done);
         store(prog, done.bodies);
     }
 }
@@ -190,10 +219,10 @@ fn amp_captures(p: &TypedProgram, def: &FunDef, body: &BodyOwn, errors: &mut Vec
 
 fn method_unit(
     p: &TypedProgram,
-    i: usize,
-    m: usize,
+    (i, m): (usize, usize),
     prog: &mut OwnedProgram,
     errors: &mut Vec<OwnError>,
+    watch: Observer<'_>,
 ) {
     let im = &p.globals.instances[i].methods[m];
     let spec = method_spec(p, i, m);
@@ -211,6 +240,7 @@ fn method_unit(
     };
     let facts = Facts::new(BTreeMap::new(), BTreeSet::new(), &preset);
     let done = decide(p, &prog.summaries, &unit, facts);
+    seen(&mut *watch, &done);
     for (j, b) in im.params.iter().enumerate() {
         if declared[j] && done.facts.escapes.contains_key(b) {
             errors.push(impl_escapes(p, i, m, *b));
@@ -218,8 +248,9 @@ fn method_unit(
     }
     store(prog, done.bodies);
     if prog.methods_taken.contains(&(i, m)) {
-        let owned = method_owned(p, i, m, &prog.summaries);
-        store(prog, owned);
+        let done = method_owned(p, i, m, &prog.summaries);
+        seen(&mut *watch, &done);
+        store(prog, done.bodies);
     }
 }
 
@@ -232,7 +263,7 @@ fn method_owned(
     i: usize,
     m: usize,
     summaries: &std::collections::HashMap<FunId, super::program::Summary>,
-) -> Vec<(BodyKey, BodyOwn)> {
+) -> Decided {
     let mut spec = method_spec(p, i, m);
     for (_, pin) in &mut spec.params {
         if let ParamIn::Obj { owned } = pin {
@@ -251,7 +282,7 @@ fn method_owned(
         all_owned: false,
     };
     let facts = Facts::new(BTreeMap::new(), BTreeSet::new(), &preset);
-    decide(p, summaries, &unit, facts).bodies
+    decide(p, summaries, &unit, facts)
 }
 
 /// A method body with its declared kinds (syntax §3.10).

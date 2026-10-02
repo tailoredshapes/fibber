@@ -33,6 +33,7 @@ use std::thread;
 
 pub use args::{flags, parse_args};
 pub use normal::normalise;
+pub(crate) use sections::impl_method_name;
 
 use crate::dump::span_in;
 use crate::eval::{MacroEvaluator, STACK_BYTES};
@@ -145,20 +146,20 @@ impl Options {
 }
 
 /// One file's output, and whether it ends in an error record.
-struct Dump {
-    text: String,
-    failed: bool,
+pub(crate) struct Dump {
+    pub(crate) text: String,
+    pub(crate) failed: bool,
 }
 
 impl Dump {
-    fn ok(text: String) -> Dump {
+    pub(crate) fn ok(text: String) -> Dump {
         Dump {
             text,
             failed: false,
         }
     }
 
-    fn failure(text: String) -> Dump {
+    pub(crate) fn failure(text: String) -> Dump {
         Dump { text, failed: true }
     }
 }
@@ -198,34 +199,50 @@ pub(crate) fn push_raw(out: &mut String, text: &str) {
 /// `builtins` table comes once, before the first file. Runs on a thread
 /// with the stack both the evaluator and the checker need.
 pub fn types_files(files: &[String], opts: &Options) -> (String, u8) {
-    thread::scope(|scope| {
-        let worker = thread::Builder::new()
-            .name("fibref-types".into())
-            .stack_size(STACK_BYTES.max(CHECK_STACK))
-            .spawn_scoped(scope, || types_here(files, opts));
-        match worker.map(|h| h.join()) {
-            Ok(Ok(done)) => done,
-            Ok(Err(_)) => ("internal error: the types dump panicked\n".to_string(), 2),
-            Err(e) => (format!("cannot start the types dump: {e}\n"), 2),
+    let head = if opts.wants(Section::Tables) {
+        tables::builtins_text()
+    } else {
+        String::new()
+    };
+    files_dump("types", files, &head, |file, source| {
+        if opts.prelude {
+            dump_prelude(source, file, opts)
+        } else {
+            dump_program(source, file, opts)
         }
     })
 }
 
-fn types_here(files: &[String], opts: &Options) -> (String, u8) {
-    let mut text = String::new();
-    if opts.wants(Section::Tables) {
-        text.push_str(&tables::builtins_text());
-    }
+/// The loop of `fibref types` and `fibref own` (spec/bootstrap.md §6.1,
+/// §7.1): `head`, then each file under its `== FILE` header with what
+/// `one(file, source)` makes of it, on a thread of the stack the
+/// evaluator and the checker need. `what` names the command in the
+/// messages of a panic and of a thread that cannot start.
+pub(crate) fn files_dump<F>(what: &str, files: &[String], head: &str, one: F) -> (String, u8)
+where
+    F: Fn(&str, &str) -> Dump + Sync,
+{
+    thread::scope(|scope| {
+        let worker = thread::Builder::new()
+            .name(format!("fibref-{what}"))
+            .stack_size(STACK_BYTES.max(CHECK_STACK))
+            .spawn_scoped(scope, || files_here(files, head, &one));
+        match worker.map(|h| h.join()) {
+            Ok(Ok(done)) => done,
+            Ok(Err(_)) => (format!("internal error: the {what} dump panicked\n"), 2),
+            Err(e) => (format!("cannot start the {what} dump: {e}\n"), 2),
+        }
+    })
+}
+
+fn files_here(files: &[String], head: &str, one: &dyn Fn(&str, &str) -> Dump) -> (String, u8) {
+    let mut text = head.to_string();
     let mut status = 0u8;
     for file in files {
         text.push_str(&format!("== {file}\n"));
         match std::fs::read_to_string(file) {
             Ok(source) => {
-                let dump = if opts.prelude {
-                    dump_prelude(&source, file, opts)
-                } else {
-                    dump_program(&source, file, opts)
-                };
+                let dump = one(file, &source);
                 status = status.max(u8::from(dump.failed));
                 text.push_str(&dump.text);
             }
@@ -238,22 +255,31 @@ fn types_here(files: &[String], opts: &Options) -> (String, u8) {
     (text, status)
 }
 
-/// The dump of the program whose main module is `source` (the file
-/// `file`).
-fn dump_program(source: &str, file: &str, opts: &Options) -> Dump {
+/// A program read, loaded and expanded: its modules in dependency order
+/// with the forms each expanded to, the prelude's forms, and each
+/// module's file and whether it is implicit.
+pub(crate) struct Expanded {
+    pub modules: Vec<(ModuleSpec, Vec<Form>)>,
+    pub prelude: Vec<Form>,
+    pub shown: Vec<(String, bool)>,
+}
+
+/// The program whose main module is `source` (the file `file`) as
+/// `fibref expand` sees it, or the dump of the record that stops it.
+pub(crate) fn expand_modules(
+    source: &str,
+    file: &str,
+    implicit_lib: &Option<Vec<String>>,
+) -> Result<Expanded, Dump> {
     let mut ctx = ExpandCtx::new();
-    let prelude = match prelude_forms(&mut ctx) {
-        Ok(p) => p,
-        Err(m) => return Dump::failure(record("Prelude", None, file, &m)),
-    };
-    let implicit: Vec<&str> = match &opts.implicit_lib {
+    let prelude =
+        prelude_forms(&mut ctx).map_err(|m| Dump::failure(record("Prelude", None, file, &m)))?;
+    let implicit: Vec<&str> = match implicit_lib {
         Some(list) => list.iter().map(String::as_str).collect(),
         None => IMPLICIT_LIB.to_vec(),
     };
-    let loaded = match try_load_with(source, file, &Roots::default(), &implicit) {
-        Ok(l) => l,
-        Err(e) => return Dump::failure(load_record(&e, file)),
-    };
+    let loaded = try_load_with(source, file, &Roots::default(), &implicit)
+        .map_err(|e| Dump::failure(load_record(&e, file)))?;
     let all: Vec<Form> = loaded.iter().flat_map(|l| l.forms.clone()).collect();
     let mut runner = MacroEvaluator::new(&all, prelude.clone());
     let mut modules: Vec<(ModuleSpec, Vec<Form>)> = Vec::new();
@@ -267,34 +293,49 @@ fn dump_program(source: &str, file: &str, opts: &Options) -> Dump {
                 modules.push((l.spec, forms));
             }
             Err(e) => {
-                let head = format!("-- module {} {}\n", l.spec.ns, l.file);
-                return Dump::failure(head + &expand_record(&e, &l.file));
+                let head = format!(
+                    "-- module {} {}
+",
+                    l.spec.ns, l.file
+                );
+                return Err(Dump::failure(head + &expand_record(&e, &l.file)));
             }
         }
     }
-    let layout = layout_of(&modules, shown, opts);
-    check_and_dump(&modules, &prelude, (&layout, file), opts)
+    Ok(Expanded {
+        modules,
+        prelude,
+        shown,
+    })
+}
+
+/// The dump of the program whose main module is `source` (the file
+/// `file`).
+fn dump_program(source: &str, file: &str, opts: &Options) -> Dump {
+    match expand_modules(source, file, &opts.implicit_lib) {
+        Err(dump) => dump,
+        Ok(x) => {
+            let layout = layout_of(&x.modules, x.shown, opts.implicit);
+            check_and_dump(&x.modules, &x.prelude, (&layout, file), opts)
+        }
+    }
 }
 
 /// The modules that have a section, in order: the prelude first with
-/// `--implicit`, then each program module (module `i` is `ModuleId(i +
+/// `implicit`, then each program module (module `i` is `ModuleId(i +
 /// 2)`, after the builtins and the prelude), the implicit ones only with
-/// `--implicit`. `shown` is each module's file and whether it is implicit.
-fn layout_of(
+/// `implicit`. `shown` is each module's file and whether it is implicit.
+pub(crate) fn layout_of(
     modules: &[(ModuleSpec, Vec<Form>)],
     shown: Vec<(String, bool)>,
-    opts: &Options,
+    implicit: bool,
 ) -> Vec<Shown> {
     let mut layout = Vec::new();
-    if opts.implicit {
-        layout.push(Shown {
-            id: ModuleId::PRELUDE,
-            ns: PRELUDE_NS.to_string(),
-            file: "lib/prelude.fib".to_string(),
-        });
+    if implicit {
+        layout.push(prelude_shown("lib/prelude.fib"));
     }
-    for (i, ((file, implicit), (spec, _))) in shown.into_iter().zip(modules).enumerate() {
-        if opts.implicit || !implicit {
+    for (i, ((file, is_implicit), (spec, _))) in shown.into_iter().zip(modules).enumerate() {
+        if implicit || !is_implicit {
             let (id, ns) = (ModuleId(i as u32 + 2), spec.ns.clone());
             layout.push(Shown { id, ns, file });
         }
@@ -302,30 +343,44 @@ fn layout_of(
     layout
 }
 
-/// The dump of `source` (the file `file`) as a library prelude, which is
-/// what `prelude_forms` makes of `lib/prelude.fib`: the expander's own
-/// prelude, then the forms of the file, expanded with no runner in the
-/// module `fib.prelude`, which is then checked alone (no `main`).
-fn dump_prelude(source: &str, file: &str, opts: &Options) -> Dump {
-    let head = format!("-- module {PRELUDE_NS} {file}\n");
-    let lib = match read_all(source, file) {
-        Ok(forms) => forms,
-        Err(e) => return Dump::failure(read_record(&e, file)),
-    };
+/// The section of the module `fib.prelude`, read from `file`.
+pub(crate) fn prelude_shown(file: &str) -> Shown {
+    Shown {
+        id: ModuleId::PRELUDE,
+        ns: PRELUDE_NS.to_string(),
+        file: file.to_string(),
+    }
+}
+
+/// The forms `source` (the file `file`) makes as a library prelude,
+/// which is what `prelude_forms` makes of `lib/prelude.fib`: the
+/// expander's own prelude, then the forms of the file, expanded with no
+/// runner in the module `fib.prelude`; or the dump of the record that
+/// stops it.
+pub(crate) fn expand_library(source: &str, file: &str) -> Result<Vec<Form>, Dump> {
+    let lib = read_all(source, file).map_err(|e| Dump::failure(read_record(&e, file)))?;
     let mut ctx = ExpandCtx::new();
     let expanded = expand_prelude(&mut ctx).and_then(|mut forms| {
         forms.extend(expand_program(lib, &mut ctx, &mut NoRunner)?);
         Ok(forms)
     });
-    let forms = match expanded {
+    expanded.map_err(|e| {
+        let head = format!(
+            "-- module {PRELUDE_NS} {file}
+"
+        );
+        Dump::failure(head + &expand_record(&e, file))
+    })
+}
+
+/// The dump of `source` (the file `file`) as a library prelude, checked
+/// alone (no `main`).
+fn dump_prelude(source: &str, file: &str, opts: &Options) -> Dump {
+    let forms = match expand_library(source, file) {
         Ok(forms) => forms,
-        Err(e) => return Dump::failure(head + &expand_record(&e, file)),
+        Err(dump) => return dump,
     };
-    let layout = [Shown {
-        id: ModuleId::PRELUDE,
-        ns: PRELUDE_NS.to_string(),
-        file: file.to_string(),
-    }];
+    let layout = [prelude_shown(file)];
     let library = Options {
         library: true,
         ..opts.clone()
@@ -376,17 +431,24 @@ fn sections_text(view: &View, layout: &[Shown], opts: &Options) -> String {
 
 /// The `error` records of a failed step, in order.
 fn error_dump(errs: &[TypeError], home: &str, opts: &Options) -> Dump {
+    let text = if opts.wants(Section::Error) {
+        error_records(errs, home)
+    } else {
+        String::new()
+    };
+    Dump::failure(text)
+}
+
+/// The `error` records of the type errors `errs`, their positions
+/// relative to `home`.
+pub(crate) fn error_records(errs: &[TypeError], home: &str) -> String {
     let mut out = String::new();
-    if opts.wants(Section::Error) {
-        for e in errs {
-            let at = span_in(&e.pos, home);
-            push(
-                &mut out,
-                &format!("error {} {at}: {}", kind_name(e.kind), e.message),
-            );
-        }
+    for e in errs {
+        let at = span_in(&e.pos, home);
+        let line = format!("error {} {at}: {}", kind_name(e.kind), e.message);
+        push(&mut out, &line);
     }
-    Dump::failure(out)
+    out
 }
 
 /// The name of an error's variant; a new variant is a compile error here
