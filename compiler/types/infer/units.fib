@@ -8,12 +8,12 @@
   (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.annot types.lower.impl-head types.lower.supers
         types.infer.cx types.infer.unify types.infer.expr types.infer.call
-        types.infer.solve types.infer.general types.exhaust))
+        types.infer.solve types.infer.general types.infer.send types.exhaust))
 
 ;; ---- a def
 
 ;; Rust: infer/units.rs:14 infer_def. Types a `def` (§2.16): a closed
-;; monomorphic type.
+;; monomorphic type, that holds no `Cell` or `Weak` (L15).
 (defun cx-infer-def (cx: Cx d: i64) -> (Result Ty TypeError)
   (let ((def (g-def (. cx g) d)))
     (do (set! (. (. cx u) fun) (str-join ["def " (. def name)]))
@@ -38,21 +38,24 @@
          (Ok at))))
     (nil (Ok t))))
 
-;; The unit is closed: its matches are checked and its colours settled.
+;; The unit is closed: its matches are checked and its colours settled, and the type of the
+;; def is searched for a `Cell` or a `Weak`.
 (defun def-closed :private (cx: Cx def: DefDef ty: Ty) -> (Result Ty TypeError)
   (try-let ((closed (cx-close cx []))
             (_ (cx-check-matches cx (. def init))))
     (let ((map (genmap-new cx [] (. closed colours) []))
           (out (genmap-apply map (. cx st) ty)))
       (do (cx-finalize cx map closed)
-          (Ok out)))))
+          (if-some [w (def-holds-cell (. cx g) out)]
+            (Err (def-cell-error (. cx g) (. def name) w (. def pos)))
+            (Ok out))))))
 
 ;; ---- an impl method
 
 ;; The parameter types and the result of a method at its instance.
 (defstruct MethodSig (params: (Vec Ty) ret: Ty))
 
-;; Rust: infer/units.rs:47. Checks one method body of instance `index`
+;; Rust: infer/units.rs:50. Checks one method body of instance `index`
 ;; (§2.7, §3.5 step 6).
 (defun cx-infer-impl-method (cx: Cx index: i64 method: i64) -> (Result unit TypeError)
   (let ((inst (table-get (. (. cx g) instances) index))

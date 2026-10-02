@@ -170,12 +170,36 @@
       (expect cs "declare keeps every error and goes no further" (lower-text (world) "(defun f (a a) 1) (def 5 1) (defun g () 1) (defun g () 2) 7")
                ["1:13 parameter a is repeated" "1:19 expected (def name expr)" "1:44 g is already defined"
                  "1:59 expected a definition, found 7"])
-      (expect cs "define keeps every error: funs, then defs" (lower-text (world) "(defun f () nowhere) (def a (fn (x) x)) (defun g () nope) (def b 1)")
-               ["1:13 unbound name nowhere" "1:53 unbound name nope" "1:29 def a: initialiser is not a constant expression"])
+      (expect cs "define keeps every error: funs, then defs" (lower-text (world) "(defun f () nowhere) (def a nope2) (defun g () nope) (def b 1)")
+               ["1:13 unbound name nowhere" "1:48 unbound name nope" "1:29 unbound name nope2"])
+      (expect cs "a def takes any initialiser (L15): a function value, a call, an if" (lower-text (world) "(defun f () 1) (def a (fn (x) x)) (def b (f)) (def c (if true 1 2))")
+               ["funs=[0] defs=[0 1 2] impls=[] macros=[]"])
       (check cs "a body error leaves the placeholder, the next funs are still lowered"
              (let ((g (world)))
                (do (lower-text g "(defun f () nowhere) (defun h (a) a)")
                    (and (= (count (. (g-fun g 1) params)) 1) (empty? (. (g-fun g 0) params))))))))
+
+;; The `constant` field of each def of a module (the constant grammar of syntax §3.19): a literal, a
+;; function, a constructor over constants and an earlier constant def are; a call of a function, a
+;; function value, a later def and a def of a non-constant are not.
+(defun constants-of (src: str) -> (Vec bool)
+  (let ((g (world)))
+    (do (lower-text g src)
+        (mapv (fn (d: DefDef) (. d constant)) (table-rows (. g defs))))))
+
+(defun constant-checks (cs: Checks) -> unit
+  (do (expect cs "a literal, a function and a quoted form are constants" (constants-of "(defun f () 1) (def a 1) (def b f) (def c 'x)")
+               [true true true])
+      (expect cs "a call of a function is not" (constants-of "(defun f () 1) (def a (f))")
+               [false])
+      (expect cs "a function value is not" (constants-of "(def a (fn (x) x))")
+               [false])
+      (expect cs "a constructor over constants is, over a call it is not"
+               (constants-of "(defstruct P (x: i64)) (defun f () 1) (def a (P 1)) (def b (P (f)))")
+               [true false])
+      (expect cs "an earlier constant def is, an earlier non-constant def and a later def are not"
+               (constants-of "(defun f () 1) (def a 1) (def b a) (def c (f)) (def d c) (def e later) (def later 2)")
+               [true true false false false true])))
 
 (defun macro-checks (cs: Checks) -> unit
   (let ((g (world)))
@@ -208,6 +232,6 @@
 
 (defun main () -> i64
   (let ((cs (checks-new)))
-    (do (defun-parts-checks cs) (def-parts-checks cs) (extern-checks cs)
+    (do (defun-parts-checks cs) (def-parts-checks cs) (extern-checks cs) (constant-checks cs)
         (module-step-checks cs) (macro-checks cs) (enum-checks cs)
         (finish cs))))

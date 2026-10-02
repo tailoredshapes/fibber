@@ -4,7 +4,9 @@
 ;; steps, the needs of variables and colours, zonking, recursive types
 ;; (the greatest fixpoint, and that `seen` is a visited set that is never
 ;; popped), and the text of `send-error` (the texts of tests/cases.rs:132 and
-;; tests/dyn_send.rs:42).
+;; tests/dyn_send.rs:42); and the walk of a `def`'s type (`def-holds-cell`, `def-cell-error`:
+;; L15, the tests `def_initialiser_is_any_expression_but_its_type_holds_no_cell_or_weak` of
+;; types/tests/errors2.rs and `DefHoldsCell` of types_dump/tests/errors.rs).
 ;; Build: fibc build compiler/tests/types/unit-send.fib -I compiler -I lib -o OUT
 (ns main (:use syntax.pos types.ty types.error types.store types.table types.decls
                types.infer.cx types.infer.send types.check))
@@ -165,6 +167,62 @@
              (= (. (send-error g (Witness [] (ty-cell (TRigid 0))) pos ["T"]) message)
                 "cell cannot be shared between threads: the value has type (Cell T)")))))
 
+(defun holds-at? (r: (Option Witness) path: (Vec str) t: Ty) -> bool
+  (match r ((some w) (and (= (. w path) path) (= (. w offending) t))) (nil false)))
+
+(defun hold-tests (cs: Checks) -> unit
+  (let ((g (globals-for-send)) (c (ty-cell (ty-i64))))
+    (do
+      (check cs "a cell is held, at the value" (holds-at? (def-holds-cell g c) [] c))
+      (check cs "a weak is held, the weak itself the offender"
+             (holds-at? (def-holds-cell g (TCon KWeak [(ty-i64)])) [] (TCon KWeak [(ty-i64)])))
+      (check cs "scalars, str, a function and a variable hold none"
+             (and (nil? (def-holds-cell g (ty-i64))) (nil? (def-holds-cell g (ty-str)))
+                  (nil? (def-holds-cell g (fn0 CLocal))) (nil? (def-holds-cell g (TVar 0)))))
+      (check cs "an Atom of i64 is allowed" (nil? (def-holds-cell g (TCon KAtom [(ty-i64)]))))
+      (check cs "an Atom of a cell: the step is content of"
+             (holds-at? (def-holds-cell g (TCon KAtom [c])) ["content of (Atom (Cell i64))"] c))
+      (check cs "an array of cells: the step is element of"
+             (holds-at? (def-holds-cell g (TCon KArray [c])) ["element of (Array (Cell i64))"] c))
+      (check cs "a task of a cell: the step is result of"
+             (holds-at? (def-holds-cell g (TCon KTask [c])) ["result of (Task (Cell i64))"] c))
+      (check cs "an array of i64 holds none" (nil? (def-holds-cell g (TCon KArray [(ty-i64)]))))
+      (check cs "a struct with a cell: field f of S"
+             (holds-at? (def-holds-cell g (ty-nominal 1 [])) ["field c of Holder"] c))
+      (check cs "a struct of Send fields holds none" (nil? (def-holds-cell g (ty-nominal 0 []))))
+      (check cs "an enum variant with one field: payload of V"
+             (holds-at? (def-holds-cell g (ty-nominal 7 [])) ["payload of Wrap"] c))
+      (check cs "an enum variant with several fields: payload i of V"
+             (holds-at? (def-holds-cell g (ty-nominal 2 [])) ["payload 1 of Both"] c))
+      (check cs "a recursive type holds none (a type seen twice is assumed fine)"
+             (nil? (def-holds-cell g (ty-nominal 3 []))))
+      (check cs "the quantified field is instantiated: Box of a cell"
+             (holds-at? (def-holds-cell g (ty-nominal 4 [c])) ["field v of Box"] c))
+      (check cs "steps nest, outermost first"
+             (holds-at? (def-holds-cell g (ty-nominal 5 [c])) ["field l of Two" "field v of Box"] c))
+      (check cs "Box of i64 twice holds none" (nil? (def-holds-cell g (ty-nominal 5 [(ty-i64)]))))
+      (check cs "the same type at other arguments is examined"
+             (match (def-holds-cell g (TCon KArray [(ty-nominal 4 [(ty-i64)]) (ty-nominal 4 [c])]))
+               ((some w) (= (. w offending) c))
+               (nil false)))
+      (check cs "a (Thunk send) holds none, its closure is not walked"
+             (nil? (def-holds-cell g (ty-nominal 6 [(ty-colour-arg CSend)])))))))
+
+(defun def-error-tests (cs: Checks) -> unit
+  (let ((g (globals-for-send)) (c (ty-cell (ty-i64))) (pos (Pos "t.fib" 3 4 10 12)))
+    (do
+      (check cs "def-cell-error: DefHoldsCell, the name, the path and the type"
+             (let ((e (def-cell-error g "h" (Witness ["field c of Holder"] c) pos)))
+               (and (= (. e kind) DefHoldsCell)
+                    (= (. e message) "def h: a def may not hold a Cell or a Weak: field c of Holder has type (Cell i64); use an Atom")
+                    (= (. (. e pos) line) 3))))
+      (check cs "an empty path is the value"
+             (= (. (def-cell-error g "c" (Witness [] c) pos) message)
+                "def c: a def may not hold a Cell or a Weak: the value has type (Cell i64); use an Atom"))
+      (check cs "the steps of the path are joined by a comma"
+             (= (. (def-cell-error g "a" (Witness ["element of (Array (Cell i64))" "field c of Holder"] c) pos) message)
+                "def a: a def may not hold a Cell or a Weak: element of (Array (Cell i64)), field c of Holder has type (Cell i64); use an Atom")))))
+
 (defun main () -> i64
   (let ((cs (checks-new)))
     (do (leaf-tests cs)
@@ -172,4 +230,6 @@
         (container-tests cs)
         (nominal-tests cs)
         (error-tests cs)
+        (hold-tests cs)
+        (def-error-tests cs)
         (finish cs))))

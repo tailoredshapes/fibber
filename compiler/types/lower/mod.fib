@@ -12,8 +12,8 @@
 ;;   a `Result`, if it is one; the order of the errors is the order of the Rust.
 ;; - `Declared`'s fields are the Rust ones; a declared form is a `DeclItem` of `declare-one`,
 ;;   which `add-item` puts in its field.
-;; - `check_const`, called by `lower_def` and (for the arguments of a call) as a bool, is
-;;   `constant?`: the error is built by `lower-def`, at the initialiser's position.
+;; - `is_constant`, called by `lower_def` and (for the arguments of a call), is `constant?`; a
+;;   `def` takes any initialiser (L15), so it only fills the `constant` field of the `DefDef`.
 (ns types.lower.mod
   (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store
         types.table types.ast types.decls types.names types.display types.lower.typeform
@@ -55,7 +55,7 @@
   (try-let ((parts (def-parts form)))
     (let ((id (table-count (. g defs)))
           (init (placeholder g (. form pos))))
-      (do (table-add (. g defs) (DefDef (. parts fst) m nil init (. form pos)))
+      (do (table-add (. g defs) (DefDef (. parts fst) m nil init false (. form pos)))
           (try-let ((done (define-value g m (. parts fst) (GDef id) (. form pos))))
             (Ok id))))))
 
@@ -242,24 +242,23 @@
 
 ;; ---- def
 
-;; Rust: lower/mod.rs:316 lower_def: the annotation and initialiser of `def` `id`.
+;; Rust: lower/mod.rs:317 lower_def: the annotation and initialiser of `def` `id`, and whether
+;; the initialiser is a constant; no initialiser is refused (L15).
 (defun lower-def :private (g: Globals m: i64 id: i64 form: Stx) -> (Result unit TypeError)
   (try-let ((parts (def-parts form))
             (ann (opt-type-ann g m (. parts snd))))
     (let ((lw (lowerer-make g m (. parts fst))))
       (try-let ((init (lw-expr lw (. parts thd) false)))
-        (if (constant? g id init)
-            (let ((d (g-def g id)))
-              (Ok (table-set (. g defs) id (DefDef (. d name) (. d module) ann init (. d pos)))))
-            (Err (type-error DefNotConstant (. init pos)
-                             (str-join ["def " (. (g-def g id) name) ": initialiser is not a constant expression"]))))))))
+        (let ((d (g-def g id)))
+          (Ok (table-set (. g defs) id (DefDef (. d name) (. d module) ann init (constant? g id init) (. d pos)))))))))
 
-;; Rust: lower/mod.rs:329 check_const: the constant grammar of syntax §3.19.
+;; Rust: lower/mod.rs:335 is_constant: whether `e` is in the constant grammar of syntax §3.19: no
+;; effect, only immutable objects, named defs that are themselves constant.
 (defun constant? :private (g: Globals id: i64 e: Expr) -> bool
   (match (. e kind)
     ((ELit _) true)
     ((EQuote _) true)
-    ((EGlobal (GDef d)) (< d id))
+    ((EGlobal (GDef d)) (and (< d id) (. (g-def g d) constant)))
     ((EGlobal (GCtor _ _)) true)
     ((EGlobal (GFun _)) true)
     ((ECall head args)

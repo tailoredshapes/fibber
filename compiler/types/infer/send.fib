@@ -13,6 +13,11 @@
 ;; pushed: a visited set of `(type, args)`) and `needs` (only pushed) through
 ;; `&mut`. Here `path` is an owned Vec that each step extends (nothing to pop)
 ;; and `seen` and `needs` are Cells of a `SendWalk` the walk passes down.
+;;
+;; A `def` is reachable from every task, so its closed type may hold no `Cell` and no `Weak`
+;; (types §2.16, L15; an `Atom` is allowed): `def-holds-cell` walks the type as `Send` does and
+;; gives the same witness path, with `content of (Atom T)` for an `Atom`; `def-cell-error` is
+;; its error.
 (ns types.infer.send
   (:require [fib.string :as str])
   (:use syntax.pos types.ty types.error types.store types.display types.table types.decls types.infer.cx))
@@ -69,8 +74,11 @@
 
 ;; The arguments of an Array, Weak or Task, one step in.
 (defun send-through :private (w: SendWalk t: Ty what: str args: (Vec Ty) path: (Vec str)) -> (Result unit Witness)
-  (let ((inner (conj path (str-join [what " of " (printer-ty (printer-new (. w g)) t)]))))
-    (send-all w args inner)))
+  (send-all w args (step-into (. w g) t what path)))
+
+;; The path one step in: `what of T`.
+(defun step-into :private (g: Globals t: Ty what: str path: (Vec str)) -> (Vec str)
+  (conj path (str-join [what " of " (printer-ty (printer-new g) t)])))
 
 (defun send-all :private (w: SendWalk tys: (Vec Ty) path: (Vec str)) -> (Result unit Witness)
   (loop ((i 0))
@@ -109,10 +117,14 @@
                       (str-join ["payload " (show i) " of " (. v name)]))
                   (. (nth fs i) ty)))))))
 
-;; Rust: infer/send.rs:142. The error of §5.3 for a failed `Send`.
+;; The path of a witness as an error says it.
+(defun witness-path :private (w: Witness) -> str
+  (if (empty? (. w path)) "the value" (str/join ", " (. w path))))
+
+;; Rust: infer/send.rs:146. The error of §5.3 for a failed `Send`.
 (defun send-error (g: Globals w: Witness pos: Pos rigid: (Vec str)) -> TypeError
   (let ((p (printer-with-names g [] rigid))
-        (path (if (empty? (. w path)) "the value" (str/join ", " (. w path))))
+        (path (witness-path w))
         (t (printer-ty p (. w offending))))
     (match (. w offending)
       ((TCon (KCell) _)
@@ -120,3 +132,45 @@
          (str-join ["cell cannot be shared between threads: " path " has type " t])))
       (_ (type-error ValueNotSend pos
            (str-join ["value of type " t " cannot be shared between threads: " path]))))))
+
+;; ---- a def holds no Cell or Weak
+
+;; Rust: infer/send.rs:172. The first `Cell` or `Weak` in the closed type `ty` of a `def`, as the
+;; witness of the path to it; the nominal types are walked once per `(type, args)`.
+(defun def-holds-cell (g: Globals ty: Ty) -> (Option Witness)
+  (hold-walk g (cell []) ty []))
+
+(defun hold-walk :private (g: Globals seen: (Cell (Vec (Pair i64 (Vec Ty)))) t: Ty path: (Vec str)) -> (Option Witness)
+  (match t
+    ((TCon c args)
+     (match c
+       ((KCell) (some (Witness path t)))
+       ((KWeak) (some (Witness path t)))
+       ((KArray) (hold-through g seen t "element" args path))
+       ((KAtom) (hold-through g seen t "content" args path))
+       ((KTask) (hold-through g seen t "result" args path))
+       ((KNominal id) (hold-nominal g seen id args path))
+       (_ nil)))
+    (_ nil)))
+
+;; The arguments of an Array, Atom or Task, one step in.
+(defun hold-through :private (g: Globals seen: (Cell (Vec (Pair i64 (Vec Ty)))) t: Ty what: str args: (Vec Ty) path: (Vec str)) -> (Option Witness)
+  (let ((inner (step-into g t what path)))
+    (some (fn (a: Ty) (hold-walk g seen a inner)) args)))
+
+;; A struct or enum: every field, once per `(type, args)` seen.
+(defun hold-nominal :private (g: Globals seen: (Cell (Vec (Pair i64 (Vec Ty)))) id: i64 args: (Vec Ty) path: (Vec str)) -> (Option Witness)
+  (let ((key (Pair id args)))
+    (if (includes? key @seen)
+        nil
+        (do (set! seen (conj @seen key))
+            (let ((colours (colour-args args)))
+              (some (fn (f: (Pair str Ty))
+                      (hold-walk g seen (ty-subst-gen (. f snd) args colours) (conj path (. f fst))))
+                    (send-fields (g-ty g id))))))))
+
+;; Rust: infer/send.rs:216. The error of a `def` whose type holds a `Cell` or a `Weak`.
+(defun def-cell-error (g: Globals name: str w: Witness pos: Pos) -> TypeError
+  (type-error DefHoldsCell pos
+    (str-join ["def " name ": a def may not hold a Cell or a Weak: " (witness-path w)
+               " has type " (printer-ty (printer-new g) (. w offending)) "; use an Atom"])))
