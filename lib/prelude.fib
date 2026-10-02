@@ -139,6 +139,34 @@
                  (nil (trap "nth: index out of range"))
                  ((some r) (vnode-get r shift i)))))))))
 
+;; node, a branch at level, with element i replaced by x: one new array and one new node for each level of
+;; the path from the root to the leaf, the other kids shared.
+(defun vnode-assoc :private (node: (VNode a) level: i64 i: i64 x: a) -> (VNode a)
+  (match node
+    ((VLeaf items) (VLeaf (array-with items (bit-and i 31) x)))
+    ((VBranch kids)
+     (let ((sub (bit-and (shr i level) 31)))
+       (VBranch (array-with kids sub (vnode-assoc (array-get kids sub) (- level 5) i x)))))))
+
+;; (vec-assoc v i x) is v with element i replaced by x (stdlib §2.5): the path from the root to the leaf is
+;; copied, or only the tail when i is in the tail, so O(log32 n) objects, and v is unchanged. i = the count
+;; appends, as Clojure's assoc does; an index below zero or above the count traps `assoc: index out of range`.
+(defun vec-assoc (v: (Vec a) i: i64 x: a) -> (Vec a)
+  (let ((n (vec-count v)))
+    (if (= i n)
+        (vec-conj v x)
+        (if (or (< i 0) (> i n))
+            (trap "assoc: index out of range")
+            (match v
+              ((VecEmpty) (trap "assoc: index out of range"))
+              ((VecOf cnt shift root tail)
+               (let ((tailoff (- cnt (array-len tail))))
+                 (if (>= i tailoff)
+                     (VecOf cnt shift root (array-with tail (- i tailoff) x))
+                     (match root
+                       (nil (trap "assoc: index out of range"))
+                       ((some r) (VecOf cnt shift (some (vnode-assoc r shift i x)) tail)))))))))))
+
 ;; The bulk builder (stdlib design §2.5; tranche 1 plan L9). A Vec built by conj spends 2.09 heap
 ;; objects an element (the tail is copied, and one path of the trie every 32); built here, 2 objects
 ;; for every 32 elements (a leaf's array and its node, and the same one level up for every 32 nodes)

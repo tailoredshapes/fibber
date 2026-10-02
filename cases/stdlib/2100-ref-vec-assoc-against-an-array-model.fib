@@ -1,0 +1,75 @@
+;; spec:   stdlib §2.5, §4.4 row assoc, task P1 item 1 (the prelude's vec-assoc)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc
+;; vec-assoc against an (Array i64) model, at every count from 0 to 70 and at the counts around the trie's
+;; boundaries (32, 33, 64, 1024, 1025, 1056, 1057, 1088, 1089; 1057 is the first with a root two levels
+;; deep). The vector is built by the prelude's vec-conj; each draw makes six assocs (the first and the last
+;; index, then drawn ones, and the indices 31, 32 and 33 where the count allows) and, after each, compares every
+;; element of the vector with the model, and then appends at the count (assoc at i = count) and compares again.
+;; The last checks plant a fault in the model, one at a time (1: it writes one index to the right, 2: it
+;; ignores a write at an index of 32 or more, which only a bug in the trie's path would show), and require each
+;; to be noticed. Seed 2100.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun fill (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (+ (* i 3) 1))) acc)))
+
+(defun model-of (n: i64) -> (Array i64)
+  (let ((m (cell (array (if (> n 0) n 1) 0))))
+    (do (dotimes (i n) (array-set! &m i (+ (* i 3) 1))) @m)))
+
+;; the model with i replaced by x: an array copy, the fault planted in the write
+(defun model-put (m: (Array i64) i: i64 x: i64 fault: i64) -> (Array i64)
+  (let ((n (array-len m))
+        (j (if (= fault 1) (rem (+ i 1) n) i)))
+    (if (and (= fault 2) (>= i 32)) m (array-with m j x))))
+
+;; the model grown by one element
+(defun model-grow (m: (Array i64) x: i64) -> (Array i64)
+  (let ((n (array-len m)) (c (cell (array (+ n 1) x))))
+    (do (dotimes (i n) (array-set! &c i (array-get m i))) @c)))
+
+(defun agrees (v: (Vec i64) m: (Array i64) n: i64) -> bool
+  (and (= (vec-count v) n)
+       (loop ((i 0)) (if (< i n) (if (= (fib.prelude/vec-nth v i) (array-get m i)) (recur (+ i 1)) false) true))))
+
+;; the index of the k-th operation of a draw on n elements
+(defun pick (r: Rng n: i64 k: i64) -> i64
+  (if (= k 0) 0
+      (if (= k 1) (- n 1)
+          (if (and (= k 2) (> n 31)) 31
+              (if (and (= k 3) (> n 33)) 33
+                  (if (and (= k 4) (> n 32)) 32 (rng-below r n)))))))
+
+(defun draw (r: Rng c: Checks n: i64 fault: i64) -> unit
+  (if (= n 0)
+      (check c (agrees (vec-assoc (vec-empty) 0 5) (array 1 5) 1))
+      (loop ((k 0) (v (fill n)) (m (model-of n)))
+        (if (< k 6)
+            (let ((i (pick r n k)) (x (rng-below r 1000)))
+              (let ((v2 (vec-assoc v i x)) (m2 (model-put m i x fault)))
+                (do (check c (agrees v2 m2 n))
+                    (recur (+ k 1) v2 m2))))
+            (let ((v3 (vec-assoc v n 77)) (m3 (model-grow m 77)))
+              (do (check c (agrees v3 m3 (+ n 1)))
+                  (check c (agrees (vec-assoc v3 n 78) (model-put m3 n 78 fault) (+ n 1)))))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2100)))
+    (do (dotimes (n 71) (draw r c n fault))
+        (draw r c 1024 fault) (draw r c 1025 fault) (draw r c 1056 fault)
+        (draw r c 1057 fault) (draw r c 1088 fault) (draw r c 1089 fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)))
+    (do (run-all c 0)
+        (run-all p1 1)
+        (run-all p2 2)
+        (check c (= (checks-made c) 609))
+        (check-detects c p1)
+        (check-detects c p2)
+        (checks-result c))))

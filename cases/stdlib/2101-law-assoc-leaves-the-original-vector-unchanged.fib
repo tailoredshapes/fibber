@@ -1,0 +1,52 @@
+;; spec:   stdlib §2.5, §1.2 (a persistent vector), §4.4 row assoc, task P1 item 1
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc
+;; Persistence of vec-assoc: from a Vec of n elements (33, 1056 and 1089: one with a single leaf under its root, one
+;; with a full root of leaves and one with a root two levels deep), v2 = assoc at 0, v3 = assoc of v2 at the middle,
+;; v4 = assoc of v3 in the tail; then v has every element it began with, v2 has only the first changed, v3 only that and
+;; the middle, and v4 all three; and a second assoc made from the same v does not show in v2. The last checks run the
+;; same comparisons against a reference that is wrong in one way (it expects v2 to have kept the old first element)
+;; and require the noticing.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun fill (n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (fib.prelude/vec-conj acc (* i 10))) acc)))
+
+;; every element of v is its index times ten, except at i1, i2, i3 where it is x1, x2, x3 (an index of -1 is none)
+(defun holds (v: (Vec i64) n: i64 i1: i64 x1: i64 i2: i64 x2: i64 i3: i64 x3: i64) -> bool
+  (and (= (vec-count v) n)
+       (loop ((i 0))
+         (if (< i n)
+             (let ((want (if (= i i1) x1 (if (= i i2) x2 (if (= i i3) x3 (* i 10))))))
+               (if (= (fib.prelude/vec-nth v i) want) (recur (+ i 1)) false))
+             true))))
+
+(defun try (c: Checks n: i64 fault: i64) -> unit
+  (let ((v (fill n))
+        (mid (shr n 1))
+        (last (- n 1)))
+    (let ((v2 (vec-assoc v 0 -5))
+          (v2b (vec-assoc v 0 -6)))
+      (let ((v3 (vec-assoc v2 mid -7)))
+        (let ((v4 (vec-assoc v3 last -8)))
+          (do (check c (holds v n -1 0 -1 0 -1 0))
+              (check c (holds v2 n 0 (if (= fault 1) 0 -5) -1 0 -1 0))
+              (check c (holds v2b n 0 -6 -1 0 -1 0))
+              (check c (holds v3 n 0 -5 mid -7 -1 0))
+              (check c (holds v4 n 0 -5 mid -7 last -8))
+              (check c (holds v2 n 0 -5 -1 0 -1 0))))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (do (try c 33 fault) (try c 1056 fault) (try c 1089 fault)))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)))
+    (do (run-all c 0)
+        (run-all p1 1)
+        (check c (= (checks-made c) 18))
+        (check-detects c p1)
+        (checks-result c))))
