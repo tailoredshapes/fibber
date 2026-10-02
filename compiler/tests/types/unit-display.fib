@@ -1,0 +1,140 @@
+;; compiler/tests/types/unit-display.fib: the Printer of types.display. The one Rust
+;; inline test of display.rs (letters cycle with a suffix) and the rules its header
+;; states, one check each: variables named a, b, .. by first appearance within one
+;; printer, quantified and rigid variables by their names or tN / rN, the colour parts
+;; (:send :local ς0, rigid by name or κN, an unsolved colour variable written only as
+;; a colour argument), nominal types with colour parameters, dyn, predicates, and the
+;; qualified printer (a nominal type's and a protocol's name behind a module prefix;
+;; a predicate's head is not qualified, as in Rust).
+;; Build: fibc build compiler/tests/types/unit-display.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.table types.decls types.display types.check))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+;; types: 0 Box (a), 1 Unit0 (), 2 Hook (k colour), 3 Mixed (a k colour); module 2
+;; protocols: 0 Show (), 1 Conv (a) in module 3
+(defun globals () -> Globals
+  (let ((g (globals-new)))
+    (do (table-add (. g types) (TypeDef "Box" 2 ["a"] [] (TsStruct []) p0))
+        (table-add (. g types) (TypeDef "Unit0" 2 [] [] (TsStruct []) p0))
+        (table-add (. g types) (TypeDef "Hook" 2 ["k"] [true] (TsStruct []) p0))
+        (table-add (. g types) (TypeDef "Mixed" 2 ["a" "k"] [false true] (TsStruct []) p0))
+        (table-add (. g protos) (ProtoDef "Show" 2 [] [] [] p0))
+        (table-add (. g protos) (ProtoDef "Conv" 3 ["a"] [] [] p0))
+        g)))
+
+(defun expect (cs: Checks name: str got: str want: str) -> unit
+  (do (if (= got want) () (println (str-join ["  got:  " got "\n  want: " want])))
+      (check cs name (= got want))))
+
+(defun nom (id: i64 args: (Vec Ty)) -> Ty (TCon (KNominal id) args))
+(defun fn-ty (k: Colour ps: (Vec Ty) r: Ty) -> Ty (TFn k ps r))
+
+(defun letters (cs: Checks) -> unit
+  (do (expect cs "letter 0" (letter-name 0) "a")
+      (expect cs "letter 25" (letter-name 25) "z")
+      (expect cs "letter 26 cycles with a suffix" (letter-name 26) "a1")
+      (expect cs "letter 27" (letter-name 27) "b1")
+      (expect cs "letter 51" (letter-name 51) "z1")
+      (expect cs "letter 52" (letter-name 52) "a2")))
+
+(defun scalars (cs: Checks) -> unit
+  (let ((p (printer-new (globals))))
+    (do (expect cs "scalars" (str-join (mapv (fn (s: Scalar) (str-join [(printer-ty p (ty-scalar s)) ","])) (scalar-all)))
+                "bool,i8,i16,i32,i64,f32,f64,char,keyword,unit,ptr,")
+        (expect cs "str" (printer-ty p (ty-str)) "str")
+        (expect cs "builtin constructors"
+                (str-join [(printer-ty p (TCon KArray [(ty-i64)])) (printer-ty p (ty-cell (ty-i64)))
+                           (printer-ty p (TCon KAtom [(ty-bool)])) (printer-ty p (TCon KWeak [(ty-str)]))
+                           (printer-ty p (ty-task (ty-unit)))])
+                "(Array i64)(Cell i64)(Atom bool)(Weak str)(Task unit)"))))
+
+(defun variables (cs: Checks) -> unit
+  (let ((g (globals))
+        (p (printer-new g))
+        (f (fn-ty CLocal [(TVar 7) (TVar 3)] (TVar 7))))
+    (do (expect cs "unification variables by first appearance" (printer-ty p f) "(fn :local (a b) a)")
+        (expect cs "one printer keeps its names" (printer-ty p (TVar 3)) "b")
+        (expect cs "a new variable gets the next letter" (printer-ty p (TVar 99)) "c")
+        (expect cs "a fresh printer starts at a" (printer-ty (printer-new g) (TVar 99)) "a")
+        (expect cs "the parameters are named before the result"
+                (printer-ty (printer-new g) (fn-ty (CVar 0) [(TVar 5)] (TVar 4)))
+                "(fn (a) b)")
+        (expect cs "the 27th variable has a suffix"
+                (let ((q (printer-new g)))
+                  (do (run! (fn (i: i64) (printer-ty q (TVar i))) (range 26))
+                      (printer-ty q (TVar 100))))
+                "a1")
+        (let ((n (printer-with-names g ["x" "y"] ["R"])))
+          (do (expect cs "quantified variables by name" (printer-ty n (TGen 1)) "y")
+              (expect cs "a quantified variable without a name" (printer-ty n (TGen 5)) "t5")
+              (expect cs "rigid variables by name" (printer-ty n (TRigid 0)) "R")
+              (expect cs "a rigid variable without a name" (printer-ty n (TRigid 3)) "r3")
+              (expect cs "no names at all" (printer-ty p (TGen 0)) "t0"))))))
+
+
+(defun colours (cs: Checks) -> unit
+  (let ((g (globals))
+        (p (printer-with-names g [] ["R" "S"])))
+    (do (expect cs ":send" (printer-ty p (fn-ty CSend [] (ty-i64))) "(fn :send () i64)")
+        (expect cs ":local" (printer-ty p (fn-ty CLocal [(ty-i64)] (ty-unit))) "(fn :local (i64) unit)")
+        (expect cs "an unsolved colour prints nothing in a function type"
+                (printer-ty p (fn-ty (CVar 4) [(TGen 0)] (TGen 0))) "(fn (t0) t0)")
+        (expect cs "a quantified colour" (printer-ty p (fn-ty (CGen 0) [(TGen 0)] (TGen 0))) "(fn ς0 (t0) t0)")
+        (expect cs "a rigid colour by name" (printer-ty p (fn-ty (CRigid 1) [] (ty-unit))) "(fn S () unit)")
+        (expect cs "a rigid colour without a name" (printer-ty p (fn-ty (CRigid 5) [] (ty-unit))) "(fn κ5 () unit)")
+        (expect cs "printer-colour" (str-join [(printer-colour p CSend) "," (printer-colour p CLocal) ","
+                                               (printer-colour p (CGen 2)) "," (printer-colour p (CVar 9)) ","
+                                               (printer-colour p (CRigid 0)) "," (printer-colour p (CRigid 8))])
+                ":send,:local,ς2,_,R,κ8")
+        (expect cs "a function of functions"
+                (printer-ty (printer-new g) (fn-ty CLocal [(fn-ty CLocal [(TVar 1)] (TVar 2))] (TVar 3)))
+                "(fn :local ((fn :local (a) b)) c)"))))
+
+(defun nominals (cs: Checks) -> unit
+  (let ((p (printer-new (globals))))
+    (do (expect cs "a nominal type with an argument" (printer-ty p (nom 0 [(ty-i64)])) "(Box i64)")
+        (expect cs "a nominal type without arguments" (printer-ty p (nom 1 [])) "Unit0")
+        (expect cs "a function argument at a type parameter"
+                (printer-ty p (nom 0 [(fn-ty CLocal [] (ty-unit))])) "(Box (fn :local () unit))")
+        (expect cs "a colour argument :send" (printer-ty p (nom 2 [(ty-colour-arg CSend)])) "(Hook :send)")
+        (expect cs "a colour argument :local" (printer-ty p (nom 2 [(ty-colour-arg CLocal)])) "(Hook :local)")
+        (expect cs "a colour argument ς" (printer-ty p (nom 2 [(ty-colour-arg (CGen 0))])) "(Hook ς0)")
+        (expect cs "an unsolved colour argument is _" (printer-ty p (nom 2 [(ty-colour-arg (CVar 3))])) "(Hook _)")
+        (expect cs "a colour parameter given a variable prints as a variable"
+                (printer-ty p (nom 2 [(TVar 8)])) "(Hook a)")
+        (expect cs "a mixed head: type then colour"
+                (printer-ty p (nom 3 [(ty-i64) (ty-colour-arg CSend)])) "(Mixed i64 :send)")
+        (expect cs "colour parts only at colour parameters"
+                (printer-ty p (nom 3 [(ty-colour-arg CSend) (ty-colour-arg CSend)]))
+                "(Mixed (fn :send () unit) :send)"))))
+
+(defun dyns (cs: Checks) -> unit
+  (let ((p (printer-new (globals))))
+    (do (expect cs "dyn" (printer-ty p (TCon (KDyn 0 false) [])) "(dyn Show)")
+        (expect cs "dyn :send" (printer-ty p (TCon (KDyn 0 true) [])) "(dyn Show :send)")
+        (expect cs "dyn with arguments" (printer-ty p (TCon (KDyn 1 false) [(ty-i64)])) "(dyn (Conv i64))")
+        (expect cs "dyn with arguments :send" (printer-ty p (TCon (KDyn 1 true) [(ty-i64)])) "(dyn (Conv i64) :send)"))))
+
+(defun preds (cs: Checks) -> unit
+  (let ((p (printer-new (globals))))
+    (do (expect cs "a protocol predicate" (printer-pred p (PProto 1 [(TVar 4)])) "(Conv a)")
+        (expect cs "Send" (printer-pred p (PSend (ty-i64))) "(Send i64)")
+        (expect cs "Object" (printer-pred p (PObject (nom 0 [(TVar 4)]))) "(Object (Box a))")
+        (expect cs "Weakable" (printer-pred p (PWeakable (ty-str))) "(Weakable str)")
+        (expect cs "a protocol predicate without arguments has a space, as in Rust"
+                (printer-pred p (PProto 0 [])) "(Show )"))))
+
+(defun qualified (cs: Checks) -> unit
+  (let ((p (printer-qualified (globals) (fn (m: i64) (str-join ["m" (show m) "."])))))
+    (do (expect cs "a nominal type behind its module" (printer-ty p (nom 0 [(ty-i64)])) "(m2.Box i64)")
+        (expect cs "without arguments" (printer-ty p (nom 1 [])) "m2.Unit0")
+        (expect cs "a protocol of another module" (printer-ty p (TCon (KDyn 1 true) [(ty-i64)]))
+                "(dyn (m3.Conv i64) :send)")
+        (expect cs "scalars and builtins are not qualified" (printer-ty p (ty-cell (ty-i64))) "(Cell i64)")
+        (expect cs "a predicate's head is not qualified" (printer-pred p (PProto 1 [(ty-i64)])) "(Conv i64)"))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (letters cs) (scalars cs) (variables cs) (colours cs) (nominals cs) (dyns cs) (preds cs) (qualified cs)
+        (finish cs))))

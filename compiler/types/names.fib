@@ -1,40 +1,197 @@
 ;; compiler/types/names.fib: the lookup of names through a module's chain (package P2).
-;; Replaces crates/fibref/src/types/names.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
-;; Names, Space, is_private and make_private are in types.decls (decls.rs re-exports them).
+;; Replaces crates/fibref/src/types/names.rs (286 lines of Rust).
+;;
+;; How a name used in a module resolves (syntax §5): the chain builtins, prelude,
+;; implicit modules, `:use`s, program (a later one shadows an earlier), a qualified
+;; `fib.prelude/x` or `alias/x`, `:private` definitions (which no other module sees
+;; except through `(var m/x)`), the modules a module re-exports (`:export-from`), and
+;; the error when two `:use`d modules export different definitions of one name that is
+;; used bare. `Names`, `Space`, `names-is-private` and `names-make-private` are in
+;; types.decls (decls.rs re-exports them and `exports` needs them).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - Rust's `find<T>` takes `get`, a function that reads one module's binding of a base
+;;   name from the `Names` of the space, and is generic in T (GlobalRef or an id).
+;;   A function passed down a recursion is an owned parameter here (it cannot be
+;;   called in a loop and passed on as `:borrow`), so the three spaces are one
+;;   non-generic search over `Item`, the sum of what the three maps hold, and the
+;;   public functions unwrap it. The algorithm is the Rust one, step for step.
+;; - the tuples `(from, o)`, `(space, base, private_ok)` that Rust passes to keep its
+;;   argument lists short are the struct `Q` (the question): `g` `from` `space` `base`
+;;   `private-ok`.
+;; - Rust's `Found<T>` is `Found`: `FNowhere`, `FOne item`, `FTwice a b`.
 (ns types.names
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
 
-;; Rust: names.rs:75 Globals::chain
+;; The namespace a name can be qualified with from anywhere (expand's PRELUDE_NS).
+(def prelude-ns: str :private "fib.prelude")
+
+;; What one space of a module's names holds under a name.
+(defenum Item :private (IValue ref: GlobalRef) (IType type: i64) (IProto proto: i64))
+(derive Eq Item)
+
+;; What a name resolved to along a module's chain.
+(defenum Found :private
+  FNowhere
+  (FOne item: Item)
+  ;; two `:use`d modules export different definitions of it (an error when it is
+  ;; referenced unqualified)
+  (FTwice a: i64 b: i64))
+
+;; One search: in `g`, a name used in module `from`, as `base`, in `space`;
+;; `private-ok`: `(var m/x)` sees private definitions too.
+(defstruct Q :private (g: Globals from: i64 space: Space base: str private-ok: bool))
+
+;; The modules a name used in `m` is looked up in, in order.
 (defun g-chain (g: Globals m: i64) -> (Vec i64)
-  (trap "todo: g-chain"))
+  (. (g-module g m) chain))
 
-;; Rust: names.rs:205 Globals::value
+;; The module whose chain a name used in `m` is looked up in, with the name
+;; itself: `ns/x` is looked up in `ns`'s chain, where `ns` is an alias or the
+;; full name of a module `m` requires or uses, or the prelude's name from
+;; anywhere.
+(defun lookup :private (g: Globals m: i64 name: str) -> (Pair i64 str)
+  (let ((plain (Pair m name)))
+    (match (str-find name "/" 0)
+      (nil plain)
+      ((some i)
+       (let ((ns (str-slice name 0 i))
+             (base (str-slice name (+ i 1) (str-len name))))
+         (cond ((= (str-len base) 0) plain)
+               (else (match (get (. (g-module g m) aliases) ns)
+                       ((some t) (Pair t base))
+                       (nil (if (= ns prelude-ns) (Pair module-prelude base) plain))))))))))
+
+;; The binding of `base` in one space of the names `n`.
+(defun item-of :private (n: Names space: Space base: str) -> (Option Item)
+  (match space
+    ((SpValue) (if-some (r (get @(. n values) base)) (some (IValue r)) nil))
+    ((SpType) (if-some (t (get @(. n types) base)) (some (IType t)) nil))
+    ((SpProto) (if-some (p (get @(. n protos) base)) (some (IProto p)) nil))))
+
+;; Whether a definition of `owner` named `base` in `space` is visible from `from`:
+;; always in its own module, else unless private (syntax §5).
+(defun visible :private (q: Q owner: i64) -> bool
+  (or (= owner (. q from))
+      (not (names-is-private (g-names (. q g) owner) (. q space) (. q base)))))
+
+;; What module `o` itself binds under the base name, if the question sees it.
+(defun own-item :private (q: Q o: i64) -> (Option Item)
+  (if (or (. q private-ok) (visible q o))
+      (item-of (g-names (. q g) o) (. q space) (. q base))
+      nil))
+
+;; What module `o` exports under the base name to `from`: its own definition,
+;; else what the modules it re-exports (`:export-from`) export, which must not
+;; disagree (syntax §5) any more than two `:use`d modules may.
+(defun exported :private (q: Q o: i64) -> Found
+  (match (own-item q o)
+    ((some t) (FOne t))
+    (nil (layer q (. (g-module (. q g) o) reexports)))))
+
+;; What a layer of modules (a module's `:use`s, or its implicit modules)
+;; exports under the base name to `from`: the one definition they all agree on,
+;; or the two modules that differ.
+(defun layer :private (q: Q mods: (Vec i64)) -> Found
+  (loop ((i 0) (first nil))
+    (if (>= i (count mods))
+        (match first
+          ((some (Pair _ t)) (FOne t))
+          (nil FNowhere))
+        (let ((u (nth mods i)))
+          (match (exported q u)
+            ((FOne t)
+             (match first
+               ((some (Pair f other)) (if (= other t) (recur (+ i 1) first) (FTwice f u)))
+               (nil (recur (+ i 1) (some (Pair u t))))))
+            ((FTwice a b) (FTwice a b))
+            ((FNowhere) (recur (+ i 1) first)))))))
+
+;; The first module of the chain from index `from-index` that binds the name.
+(defun chain-rest :private (q: Q chain: (Vec i64) from-index: i64) -> Found
+  (loop ((i from-index))
+    (if (>= i (count chain))
+        FNowhere
+        (match (own-item q (nth chain i))
+          ((some t) (FOne t))
+          (nil (recur (+ i 1)))))))
+
+;; Resolves `name`, used in module `m`, in `space`. The module's own definition
+;; shadows every other; else what its `:use`d modules export, which must not
+;; disagree (syntax §5), shadows what its implicit modules export (which must not
+;; disagree either: a bare name two of them export differently is an error, and so
+;; is one that two parts of one implicit module do; the library's gate `lib_disjoint`
+;; keeps that from happening), which shadows the prelude and the builtins.
+(defun find-item :private (g: Globals m: i64 name: str space: Space private-ok: bool) -> Found
+  (let ((lk (lookup g m name))
+        (owner (. lk fst))
+        (info (g-module g owner))
+        (q (Q g m space (. lk snd) private-ok)))
+    (match (own-item q owner)
+      ((some t) (FOne t))
+      (nil
+       (match (layer q (. info uses))
+         ((FNowhere)
+          (match (layer q (. info implicit))
+            ((FNowhere)
+             (chain-rest q (. info chain) (+ 1 (+ (count (. info uses)) (count (. info implicit))))))
+            (found found)))
+         (found found))))))
+
+;; Resolves a value name used in module `m`; a private value of another module
+;; is not visible (syntax §5), and a name that two `:use`d modules export
+;; differently is not resolved (see `g-unknown`).
 (defun g-value (g: Globals m: i64 name: str) -> (Option GlobalRef)
-  (trap "todo: g-value"))
+  (match (find-item g m name SpValue false)
+    ((FOne (IValue r)) (some r))
+    (_ nil)))
 
-;; Rust: names.rs:214 value_any
+;; Resolves a value name as `(var name)` does (syntax §3.20): private values of
+;; other modules included.
 (defun g-value-any (g: Globals m: i64 name: str) -> (Option GlobalRef)
-  (trap "todo: g-value-any"))
+  (match (find-item g m name SpValue true)
+    ((FOne (IValue r)) (some r))
+    (_ nil)))
 
-;; Rust: names.rs:223 type_name
+;; Resolves a type name used in module `m` (private ones of other modules are
+;; not visible).
 (defun g-type-name (g: Globals m: i64 name: str) -> (Option i64)
-  (trap "todo: g-type-name"))
+  (match (find-item g m name SpType false)
+    ((FOne (IType t)) (some t))
+    (_ nil)))
 
-;; Rust: names.rs:232 proto_name
+;; Resolves a protocol name used in module `m` (private ones of other modules
+;; are not visible).
 (defun g-proto-name (g: Globals m: i64 name: str) -> (Option i64)
-  (trap "todo: g-proto-name"))
+  (match (find-item g m name SpProto false)
+    ((FOne (IProto p)) (some p))
+    (_ nil)))
 
-;; Rust: names.rs:242 ambiguity
+;; The two `:use`d modules that export different definitions of `name` in
+;; `space`, which make it an error to use it from `m` unqualified (syntax §5).
 (defun g-ambiguity (g: Globals m: i64 space: Space name: str) -> (Option (Pair i64 i64))
-  (trap "todo: g-ambiguity"))
+  (match (find-item g m name space false)
+    ((FTwice a b) (some (Pair a b)))
+    (_ nil)))
 
-;; Rust: names.rs:259 private_owner
+;; The module whose private definition `name` in `space` would have resolved a
+;; name used in `m` that did not resolve, for the message `x is private to M`.
 (defun g-private-owner (g: Globals m: i64 space: Space name: str) -> (Option i64)
-  (trap "todo: g-private-owner"))
+  (let ((lk (lookup g m name)))
+    (first (filterv (fn (o: i64)
+                      (and (not (= o m)) (names-is-private (g-names g o) space (. lk snd))))
+                    (g-chain g (. lk fst))))))
 
-;; Rust: names.rs:271 unknown
+;; `unbound name x`; `x is exported by both A and B; write A/x or B/x` when two
+;; `:use`d modules export it (syntax §5); or `x is private to M` when a private
+;; definition of another module has the name.
 (defun g-unknown (g: Globals m: i64 space: Space name: str what: str) -> str
-  (trap "todo: g-unknown"))
+  (match (g-ambiguity g m space name)
+    ((some (Pair a b))
+     (let ((an (g-module-name g a))
+           (bn (g-module-name g b)))
+       (str-join [name " is exported by both " an " and " bn "; write " an "/" name " or " bn "/" name])))
+    (nil
+     (match (g-private-owner g m space name)
+       ((some o) (str-join [name " is private to " (g-module-name g o) "; it is not exported"]))
+       (nil (str-join [what " " name]))))))

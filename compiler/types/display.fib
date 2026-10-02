@@ -1,43 +1,155 @@
 ;; compiler/types/display.fib: the printer of types and predicates (package P2).
-;; Replaces crates/fibref/src/types/display.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/display.rs (241 lines of Rust).
+;;
+;; Unification variables print as `a`, `b`, .. in order of first appearance
+;; within one Printer (so one message names its variables consistently);
+;; quantified variables by their scheme's names (or `t0`, `t1`, .. when none
+;; are given); rigid variables by their written names (`r0`, ..). A colour
+;; prints only when it is `:send`, `:local`, a quantified one (`ς0`) or a
+;; rigid one; an unsolved colour variable prints nothing in a function type
+;; and `_` as a colour argument.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - Rust's `write(&Ty, &mut String)` is a function that returns the text;
+;;   the pieces are joined with `str-join` in the order Rust writes them, so
+;;   the variables are named in the same order (the vector literal of
+;;   `str-join` is evaluated left to right).
+;; - the Printer holds the Globals it reads, the names of the quantified and
+;;   rigid variables, the unification variables met so far (a Cell, Rust's
+;;   RefCell: the printer is passed by value and the Cell is shared) and
+;;   an optional function from a module id to the prefix of a nominal type's
+;;   name (Rust's `&dyn Fn(ModuleId) -> String`).
+;; - `letter-name` takes an i64 (a usize in Rust; never negative).
 (ns types.display
+  (:require [fib.string :as str])
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
 
-;; Rust `Printer<'a>`: the names of the quantified and rigid variables, the
-;; unification variables met so far (a RefCell: a Cell) and an optional
-;; qualifier of the module a nominal type is printed with. P2 may change
-;; the fields.
 (defstruct Printer
   (g: Globals gen-names: (Vec str) rigid-names: (Vec str) vars: (Cell (Vec i64))
    qualifier: (Option (fn (i64) str))))
 
-;; Rust: display.rs:31 Printer::new
-(defun printer-new (g: Globals) -> Printer
-  (trap "todo: printer-new"))
-
-;; Rust: display.rs:37 with_names
+;; A printer that names `TGen i` by gen-names[i] and `TRigid i` by rigid-names[i].
 (defun printer-with-names (g: Globals gen-names: (Vec str) rigid-names: (Vec str)) -> Printer
-  (trap "todo: printer-with-names"))
+  (Printer g gen-names rigid-names (cell (vec-empty)) nil))
 
-;; Rust: display.rs:51 qualified
+;; A printer with no scheme or rigid names.
+(defun printer-new (g: Globals) -> Printer
+  (printer-with-names g [] []))
+
+;; A printer that writes every nominal type's and protocol's name behind
+;; `prefix` of the module that defines it, so that two modules' types of one
+;; name print differently (the compiler's symbols, compiler.md §2).
 (defun printer-qualified (g: Globals prefix: (fn (i64) str)) -> Printer
-  (trap "todo: printer-qualified"))
+  (Printer g [] [] (cell (vec-empty)) (some prefix)))
 
-;; Rust: display.rs:66 Printer::ty
+(defun qualify :private (p: Printer m: i64 name: str) -> str
+  (match (. p qualifier)
+    ((some prefix) (str-join [(prefix m) name]))
+    (nil name)))
+
+;; The type as text. It should be zonked first.
 (defun printer-ty (p: Printer t: Ty) -> str
-  (trap "todo: printer-ty"))
+  (write-ty p t))
 
-;; Rust: display.rs:74 Printer::pred
+;; A predicate as text: `(P T..)`, `(Send T)`, `(Object T)`, `(Weakable T)`
+;; (a protocol without arguments prints as `(P )`, as in Rust).
 (defun printer-pred (p: Printer pr: Pred) -> str
-  (trap "todo: printer-pred"))
+  (let ((head (match pr
+                ((PProto id _) (. (g-proto (. p g) id) name))
+                ((PSend _) "Send")
+                ((PObject _) "Object")
+                ((PWeakable _) "Weakable"))))
+    (str-join ["(" head " " (str/join " " (mapv (fn (t: Ty) (write-ty p t)) (pred-tys pr))) ")"])))
 
-;; Rust: display.rs:128 Printer::colour
+;; The position of v in vs.
+(defun var-position :private (vs: (Vec i64) v: i64) -> (Option i64)
+  (loop ((i 0))
+    (cond ((>= i (count vs)) nil)
+          ((= (nth vs i) v) (some i))
+          (else (recur (+ i 1))))))
+
+;; `a`, `b`, .. by order of first appearance.
+(defun var-name :private (p: Printer v: i64) -> str
+  (let ((vs @(. p vars)))
+    (letter-name
+      (match (var-position vs v)
+        ((some i) i)
+        (nil (do (set! (. p vars) (conj vs v)) (count vs)))))))
+
+;; The name of quantified or rigid variable i, or `PREFIXi` when it has none.
+(defun var-or :private (names: (Vec str) i: i64 fallback: str) -> str
+  (match (get names i)
+    ((some n) n)
+    (nil (str-join [fallback (show i)]))))
+
+(defun write-ty :private (p: Printer t: Ty) -> str
+  (match t
+    ((TVar v) (var-name p v))
+    ((TGen i) (var-or (. p gen-names) i "t"))
+    ((TRigid i) (var-or (. p rigid-names) i "r"))
+    ((TCon c args) (write-con p c args))
+    ((TFn k ps r)
+     (str-join ["(fn "
+                (match k
+                  ((CVar _) "")
+                  (_ (str-join [(printer-colour p k) " "])))
+                (write-list p ps) " " (write-ty p r) ")"]))))
+
+;; A colour as written: `:send`, `:local`, `ς0` for a quantified one, a rigid
+;; colour by its name (as `TRigid i` is), `_` unsolved.
 (defun printer-colour (p: Printer k: Colour) -> str
-  (trap "todo: printer-colour"))
+  (match k
+    ((CSend) ":send")
+    ((CLocal) ":local")
+    ((CGen i) (str-join ["ς" (show i)]))
+    ((CVar _) "_")
+    ((CRigid i) (var-or (. p rigid-names) i "κ"))))
 
-;; Rust: display.rs:223 letter_name
+(defun write-list :private (p: Printer ts: (Vec Ty)) -> str
+  (str-join ["(" (str/join " " (mapv (fn (t: Ty) (write-ty p t)) ts)) ")"]))
+
+(defun con-name :private (p: Printer c: Con) -> str
+  (match c
+    ((KScalar s) (scalar-name s))
+    ((KStr) "str")
+    ((KArray) "Array")
+    ((KCell) "Cell")
+    ((KAtom) "Atom")
+    ((KWeak) "Weak")
+    ((KTask) "Task")
+    ((KNominal id) (let ((def (g-ty (. p g) id))) (qualify p (. def module) (. def name))))
+    ((KDyn pr _) (let ((proto (g-proto (. p g) pr))) (qualify p (. proto module) (. proto name))))))
+
+(defun write-con :private (p: Printer c: Con args: (Vec Ty)) -> str
+  (let ((name (con-name p c)))
+    (match c
+      ((KDyn _ send)
+       (str-join ["(dyn " (if (empty? args) name (write-con-args p name args)) (if send " :send" "") ")"]))
+      ((KNominal id)
+       (if (empty? args) name (write-nominal-args p name (g-ty (. p g) id) args)))
+      (_ (if (empty? args) name (write-con-args p name args))))))
+
+;; `(NAME A..)`.
+(defun write-con-args :private (p: Printer name: str args: (Vec Ty)) -> str
+  (str-join ["(" name (str-join (mapv (fn (a: Ty) (str-join [" " (write-ty p a)])) args)) ")"]))
+
+;; A nominal type's arguments; one at a colour parameter (§1.3) prints as
+;; its colour: `:send`, `:local`, `ς0`, or `_` unsolved.
+(defun write-nominal-args :private (p: Printer name: str def: TypeDef args: (Vec Ty)) -> str
+  (str-join
+    ["(" name
+     (str-join
+       (mapv (fn (i: i64)
+               (let ((a (nth args i)))
+                 (str-join [" " (match a
+                                  ((TFn k _ _) (if (typedef-is-colour def i) (printer-colour p k) (write-ty p a)))
+                                  (_ (write-ty p a)))])))
+             (range (count args))))
+     ")"]))
+
+;; `a`, `b`, .., `z`, `a1`, `b1`, ..
 (defun letter-name (i: i64) -> str
-  (trap "todo: letter-name"))
+  (let ((j (rem i 26))
+        (n (quot i 26))
+        (letter (str-slice "abcdefghijklmnopqrstuvwxyz" j (+ j 1))))
+    (if (= n 0) letter (str-join [letter (show n)]))))
