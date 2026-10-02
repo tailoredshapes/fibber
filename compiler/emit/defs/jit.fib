@@ -1,0 +1,240 @@
+;; compiler/emit/defs/jit.fib: a `def`'s value through the JIT (types §8.10, spec/compiler.md §5, §9). Replaces crates/fibc/src/defs/jit.rs
+;; (310 lines of Rust): the initialiser is lowered as the body `d.NAME`, the module so far (runtime, tables, the constants of the earlier
+;; `def`s, every body) is JIT-compiled through lair (compiler/lair/jit.fib, the C interface), the initialiser is called, and its value is
+;; read out of the JIT's memory by the type table's layouts into constants (emit.defs.data). The self-hosted compiler has only this
+;; mechanism; there is no interpreter to fall back on.
+;;
+;; fibber cannot call a function pointer of another result type than an `i64` or a `double` (lair.call), so the entry of a `def`
+;; widens its result in lIR: a narrow integer by `sext` (`zext` for an `i1`), a `float` by `fpext`. The text of this module is
+;; never printed, only the constants it makes. Memory is read through raw pointers (`unsafe`), from addresses held as `i64`s.
+(ns emit.defs.jit
+  (:require [lair.jit :as jit] [lair.call :as call] [lair.ffi :as ffi])
+  (:use types.ty own.program emit.value emit.text emit.layout emit.objects emit.statics emit.program emit.assemble emit.defs.data))
+
+;; What a `def`'s entry returned, or a field held. Rust: defs/jit.rs:88 Raw (the `f32` is widened, as `float_text(f64::from(x))`)
+(defenum DefRaw DrUnit (DrInt n: i64) (DrFlt x: f64) (DrPtr a: i64))
+
+;; The constants already made for the objects at these JIT addresses (the earlier `def`s, the immortal closures, and each object read
+;; so far, so that a shared object is one constant). Rust: defs/jit.rs:157 Reader
+(defstruct Reader (names: (Cell (Map i64 str))))
+
+;; --- the JIT's memory ---
+
+(defun mem-i8 :private (a: i64) -> i64 (unsafe (sext i64 (load-i8 (ffi/addr->ptr a)))))
+(defun mem-u8 :private (a: i64) -> i64 (unsafe (zext i64 (load-i8 (ffi/addr->ptr a)))))
+(defun mem-i16 :private (a: i64) -> i64 (unsafe (sext i64 (load-i16 (ffi/addr->ptr a)))))
+(defun mem-i32 :private (a: i64) -> i64 (unsafe (sext i64 (load-i32 (ffi/addr->ptr a)))))
+(defun mem-u32 :private (a: i64) -> i64 (unsafe (zext i64 (load-i32 (ffi/addr->ptr a)))))
+(defun mem-i64 :private (a: i64) -> i64 (unsafe (load-i64 (ffi/addr->ptr a))))
+(defun mem-f32 :private (a: i64) -> f64 (unsafe (fpext f64 (bits->f32 (load-i32 (ffi/addr->ptr a))))))
+(defun mem-f64 :private (a: i64) -> f64 (unsafe (bits->f64 (load-i64 (ffi/addr->ptr a)))))
+
+;; A raw read of `l` at `a`: an address inside an object the JIT allocated, at a field of that type by the type table's layout.
+;; Rust: defs/jit.rs:167 read
+(defun read-raw :private (a: i64 l: LirTy) -> (Result DefRaw str)
+  (match l
+    ((LirI1) (Ok (DrInt (bit-and (mem-u8 a) 1))))
+    ((LirI8) (Ok (DrInt (mem-i8 a))))
+    ((LirI16) (Ok (DrInt (mem-i16 a))))
+    ((LirI32) (Ok (DrInt (mem-i32 a))))
+    ((LirI64) (Ok (DrInt (mem-i64 a))))
+    ((LirFloat) (Ok (DrFlt (mem-f32 a))))
+    ((LirDouble) (Ok (DrFlt (mem-f64 a))))
+    ((LirPtr) (Ok (DrPtr (mem-i64 a))))
+    ((LirDyn) (Err "a def holding a dyn"))
+    ((LirRaw) (Err "a def holding a raw ptr"))))
+
+;; --- the entry ---
+
+;; An entry of result type `ty` that returns `expr`.
+(defun entry-word :private (entry: str ty: str expr: str) -> str
+  (str-join ["(define (" entry " " ty ") () (block entry (ret " expr ")))\n"]))
+
+;; The entry `fib.defentry.K` of the body `body` of type `lt`: what `call-entry` can call. Rust: defs/jit.rs:36 (the `define` text)
+(defun entry-text :private (entry: str body: str lt: (Option LirTy)) -> str
+  (match lt
+    (nil (str-join ["(define (" entry " void) () (block entry (call @" body ") (ret)))\n"]))
+    ((some l)
+     (let ((c (str-join ["(call @" body ")"])))
+       (match l
+         ((LirI1) (entry-word entry "i64" (str-join ["(zext i64 " c ")"])))
+         ((LirI8) (entry-word entry "i64" (str-join ["(sext i64 " c ")"])))
+         ((LirI16) (entry-word entry "i64" (str-join ["(sext i64 " c ")"])))
+         ((LirI32) (entry-word entry "i64" (str-join ["(sext i64 " c ")"])))
+         ((LirFloat) (entry-word entry "double" (str-join ["(fpext double " c ")"])))
+         (_ (entry-word entry (lir-ty-text l) c)))))))
+
+;; Calls the entry with the signature its lIR result type gives. Rust: defs/jit.rs:112 call_entry
+(defun call-entry :private (j: jit/Jit entry: str lt: (Option LirTy)) -> (Result DefRaw str)
+  (match (jit/jit-c-entry j entry)
+    ((Err m) (Err (str-concat "def entry: " m)))
+    ((Ok addr)
+     (match lt
+       (nil (try-let ((_a (tag-err (call/call-i64 addr []) "def entry: "))) (Ok DrUnit)))
+       ((some (LirDyn)) (Err "a def holding a dyn"))
+       ((some (LirRaw)) (Err "a def holding a raw ptr"))
+       ((some (LirFloat)) (try-let ((x (tag-err (call/call-f64 addr []) "def entry: "))) (Ok (DrFlt x))))
+       ((some (LirDouble)) (try-let ((x (tag-err (call/call-f64 addr []) "def entry: "))) (Ok (DrFlt x))))
+       ((some (LirPtr)) (try-let ((w (tag-err (call/call-i64 addr []) "def entry: "))) (Ok (DrPtr w))))
+       (_ (try-let ((w (tag-err (call/call-i64 addr []) "def entry: "))) (Ok (DrInt w))))))))
+
+;; `Err` with a prefix on its message.
+(defun tag-err :private (r: (Result a str) prefix: str) -> (Result a str)
+  (match r
+    ((Ok v) (Ok v))
+    ((Err m) (Err (str-concat prefix m)))))
+
+;; --- the statics a value may point to ---
+
+;; The exported getter of each static's address (`fib.defaddr.K.I`): the statics are `internal`, so a value pointing at one is
+;; shared, not copied. Rust: defs/jit.rs:73 address_getters
+(defun address-getters :private (k: i64 known: (Vec str)) -> str
+  (str-join (mapv (fn (i: i64)
+                    (str-join ["(define (fib.defaddr." (str k) "." (str i) " ptr) () (block entry (ret " (nth known i) ")))\n"]))
+                  (range (count known)))))
+
+;; The JIT address of each of the statics `known`, as the name it has in the module. Rust: defs/jit.rs:140 known_addresses
+(defun known-addresses :private (j: jit/Jit k: i64 known: (Vec str)) -> (Result (Map i64 str) str)
+  (loop ((i 0) (names (map-empty)))
+    (if (< i (count known))
+        (try-let ((get (tag-err (jit/jit-c-entry j (str-join ["fib.defaddr." (str k) "." (str i)])) "def constants: "))
+                  (a (tag-err (call/call-i64 get []) "def constants: ")))
+          (recur (+ i 1) (assoc names a (nth known i))))
+        (Ok names))))
+
+;; --- the reader ---
+
+(defun lit-text :private (l: LirTy body: str) -> str
+  (str-join ["(" (lir-ty-text l) " " body ")"]))
+
+;; The elements of the array at `a` (its elements follow the header and the length, at the stride of `el`) as value texts.
+(defun read-elems :private (r: Reader d: Defs p: Program a: i64 el: LirTy elem: Ty) -> (Result (Vec str) str)
+  (let ((n (mem-i64 (+ a 16)))
+        (stride (. (size-align el) fst)))
+    (loop ((i 0) (out []))
+      (if (< i n)
+          (try-let ((raw (read-raw (+ a (+ 24 (* i stride))) el))
+                    (v (reader-value r d p raw elem)))
+            (recur (+ i 1) (conj out v)))
+          (Ok out)))))
+
+;; The fields of the struct, or of the variant `tag`, at `a`, one text per declared field (empty for a unit field).
+(defun read-fields :private (r: Reader d: Defs p: Program a: i64 info: ObjInfo tag: (Option i64) tys: (Vec Ty)) -> (Result (Vec str) str)
+  (let ((slots (obj-slots info tag))
+        (offsets (obj-offsets info tag)))
+    (loop ((i 0) (slot 0) (out []))
+      (if (< i (min (count tys) (count slots)))
+          (match (nth slots i)
+            (nil (recur (+ i 1) slot (conj out "")))
+            ((some l)
+             (try-let ((raw (read-raw (+ a (nth offsets slot)) l))
+                       (v (reader-value r d p raw (nth tys i))))
+               (recur (+ i 1) (+ slot 1) (conj out v)))))
+          (Ok out)))))
+
+;; The constant of the struct or enum object at `a`, of type `t`.
+(defun read-nominal :private (r: Reader d: Defs p: Program a: i64 t: Ty info: ObjInfo) -> (Result str str)
+  (let ((tag (match (. info kind) ((ObEnum _) (some (mem-i32 (+ a 16)))) (_ nil))))
+    (try-let ((tys (field-types p t tag))
+              (texts (read-fields r d p a info tag tys)))
+      (defs-emit-object d p t tag texts))))
+
+;; The constant of the array at `a`, of type `t`, its elements of lIR type `el`.
+(defun read-array :private (r: Reader d: Defs p: Program a: i64 t: Ty el: LirTy) -> (Result str str)
+  (match t
+    ((TCon (KArray) args)
+     (try-let ((elems (read-elems r d p a el (nth args 0))))
+       (defs-emit-array d p t el elems)))
+    (_ (Err "an array at a non-array type"))))
+
+;; The constant for the object at `a` that is not yet one, by the kind of the object the header says it is.
+(defun read-object :private (r: Reader d: Defs p: Program a: i64 t: Ty) -> (Result str str)
+  (let ((info (objects-get (. p objects) (mem-u32 (+ a 8)))))
+    (match (. info kind)
+      ((ObStr) (Ok (statics-string (. p statics) (ffi/text-at (+ a 24) (mem-i64 (+ a 16))) 0)))
+      ((ObArray el) (read-array r d p a t el))
+      ((ObStruct _) (read-nominal r d p a t info))
+      ((ObEnum _) (read-nominal r d p a t info))
+      ((ObClosure _) (Err "a def holding a closure"))
+      (_ (Err "a def holding a cell, an atom, a weak reference or a task")))))
+
+;; The constant for the object at `a`, of type `t`: null, one already made, or made now. Rust: defs/jit.rs:243 Reader::object
+(defun reader-object (r: Reader d: Defs p: Program a: i64 t: Ty) -> (Result str str)
+  (if (= a 0)
+      (Ok "(ptr null)")
+      (match (get @(. r names) a)
+        ((some n) (Ok n))
+        (nil (try-let ((name (read-object r d p a t)))
+               (do (set! (. r names) (assoc @(. r names) a name))
+                   (Ok name)))))))
+
+;; A pointer where `t` is an object, or an `Option` of one: a null `Option` is `nil`, a boxed one a nil object when null (a generic
+;; payload gave the plan no allocation, so the constant is the nil object either way, as the interpreter's).
+(defun reader-pointer :private (r: Reader d: Defs p: Program a: i64 t: Ty) -> (Result str str)
+  (match (option-payload (program-g p) t)
+    ((some payload)
+     (try-let ((rep (option-rep (program-g p) payload)))
+       (match rep
+         ((OptNull) (if (= a 0) (Ok "(ptr null)") (reader-object r d p a payload)))
+         ((OptBoxed) (if (= a 0) (defs-emit-object d p t (some 0) []) (reader-object r d p a t))))))
+    (nil (reader-object r d p a t))))
+
+;; The lIR text of a value of type `t`: a literal, or the address of its constant. Rust: defs/jit.rs:176 Reader::value
+(defun reader-value (r: Reader d: Defs p: Program raw: DefRaw t: Ty) -> (Result str str)
+  (try-let ((lt (program-lir p t)))
+    (match lt
+      (nil (Ok ""))
+      ((some l)
+       (match raw
+         ((DrUnit) (Ok ""))
+         ((DrInt n) (Ok (lit-text l (str n))))
+         ((DrFlt x) (Ok (lit-text l (float-lir-text x))))
+         ((DrPtr a)
+          (match l
+            ((LirPtr) (reader-pointer r d p a t))
+            (_ (Err (str-join ["a pointer where " (lir-ty-text l) " was expected"]))))))))))
+
+;; --- one def ---
+
+;; Inside the session: adds the module, runs the runtime's initialiser, reads the statics' addresses, calls the entry and reads
+;; its value. Not `fib.init`, which would also read FIB_TRACE: the objects a `def` allocates at compile time are not in the trace
+;; of the run (compiler.md §4), whatever the environment says. Rust: defs/jit.rs:55-66
+(defun read-in-session :private (j: jit/Jit p: Program d: Defs k: i64 text: str entry: str known: (Vec str) t: Ty lt: (Option LirTy))
+    -> (Result str str)
+  (try-let ((_a (tag-err (jit/jit-add-source j (str-join ["def." (str k)]) text) (str-join ["def " (str k) ": "])))
+            (init (tag-err (jit/jit-c-entry j (str-join ["fib.definit." (str k)])) (str-join ["def " (str k) ": "])))
+            (_b (tag-err (call/call-i64 init []) (str-join ["def " (str k) ": "])))
+            (names (known-addresses j k known))
+            (raw (call-entry j entry lt)))
+    (reader-value (Reader (cell names)) d p raw t)))
+
+(defun in-session :private (p: Program d: Defs k: i64 text: str entry: str known: (Vec str) t: Ty lt: (Option LirTy)) -> (Result str str)
+  (match (jit/jit-new 0)
+    ((Err m) (Err (str-join ["def " (str k) ": " m])))
+    ((Ok j)
+     (let ((r (read-in-session j p d k text entry known t lt)))
+       (do (jit/jit-free j) r)))))
+
+;; The text of the module the JIT is given for def k: the module so far, the entry, the runtime initialiser, the address getters.
+(defun session-text :private (p: Program d: Defs k: i64 body: str entry: str lt: (Option LirTy) known: (Vec str)) -> str
+  (str-join [(assemble-parts p @(. d text)) (entry-text entry body lt)
+             (str-join ["(define (fib.definit." (str k) " void) () (block entry (call @fib.rq-init) (ret)))\n"])
+             (address-getters k known)]))
+
+;; Evaluates the initialiser of def number k (`d`, a constant) and records its value for the ones after (syntax §3.19).
+;; Rust: defs/jit.rs:25-69, the body of the loop of `emit_defs`
+(defun emit-def (p: Program defs: Defs k: i64 d: i64) -> (Result unit str)
+  (match (get (. (. p typed) def-types) d)
+    (nil (Err "a def without a type"))
+    ((some t)
+     (let ((body (program-request p (BodyDef d) [])))
+       (try-let ((_a (emit-all p))
+                 (lt (program-lir p t)))
+         (let ((entry (str-join ["fib.defentry." (str k)]))
+               (known (into @(. defs constants) (statics-closure-names (. p statics)))))
+           (let ((text (session-text p defs k body entry lt known)))
+             (try-let ((v (in-session p defs k text entry known t lt)))
+               (let ((dv (DefValue v lt)))
+                 (do (set! (. p def-values) (assoc @(. p def-values) d dv))
+                     (set! (. defs values) (assoc @(. defs values) d dv))
+                     (Ok ())))))))))))

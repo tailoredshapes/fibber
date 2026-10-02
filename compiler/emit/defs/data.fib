@@ -1,0 +1,62 @@
+;; compiler/emit/defs/data.fib: the constants of the `def`s and the text they are written as (spec/compiler.md §5, types §8.10).
+;; Replaces crates/fibc/src/defs/mod.rs (147 lines of Rust: `Defs`, `all_def_ids` (emit.inits'), `def_ids`, `Defs::emit_array`,
+;; `emit_object`, `field_types`, `fresh`). It is below emit.defs.jit (the reader of the JIT's memory builds constants through
+;; these) and emit.defs.mod (`emit-defs`, which `:export-from`s this module so that `Defs` is still seen where it was).
+(ns emit.defs.data
+  (:require [fib.string :as s])
+  (:use types.ty types.decls emit.value emit.layout emit.program emit.inits))
+
+;; The text, values and constants of the defs. Rust: defs/mod.rs:28 Defs
+;; `text` holds the `(constant ..)` lines made so far, `values` each constant `def`'s value, `constants` the names made (`@def.N`).
+(defstruct Defs (text: (Cell str) values: (Cell (Map i64 DefValue)) constants: (Cell (Vec str)) counter: (Cell i64)))
+
+;; No constants yet (Rust: `Defs::default()`).
+(defun defs-new () -> Defs
+  (Defs (cell "") (cell (map-empty)) (cell []) (cell 0)))
+
+;; The `def`s made at compile time as static data: those whose initialiser is a constant expression (syntax §3.19); the others are
+;; made at run time by the init functions of emit.inits. Rust: defs/mod.rs:58 def_ids
+(defun def-ids (p: Program) -> (Vec i64)
+  (vec (filter (fn (d: i64) (. (g-def (program-g p) d) constant)) (all-def-ids p))))
+
+;; The number of the next constant, recorded as `@def.N` in `constants`. Rust: defs/mod.rs:140 fresh
+(defun defs-fresh :private (d: Defs) -> i64
+  (let ((n (+ @(. d counter) 1)))
+    (do (set! (. d counter) n)
+        (set! (. d constants) (conj @(. d constants) (str-join ["@def." (str n)])))
+        n)))
+
+(defun defs-append :private (d: Defs line: str) -> unit
+  (set! (. d text) (str-concat @(. d text) line)))
+
+;; An array constant of `t = (Array E)` with these element texts. Rust: defs/mod.rs:62 Defs::emit_array
+(defun defs-emit-array (d: Defs p: Program t: Ty el: LirTy elems: (Vec str)) -> (Result str str)
+  (try-let ((o (program-object p t)))
+    (let ((n (count elems))
+          (id (defs-fresh d))
+          (e (lir-ty-text el)))
+      (let ((arr (str-join ["[" (str n) " x " e "]"])))
+        (do (defs-append d (str-join ["(constant internal def." (str id) " { i64 i32 i32 i64 " arr " } { (i64 0) (i32 " (str (. o fst))
+                                      ") (i32 " (str flag-immortal) ") (i64 " (str n) ") (" arr " " (s/join " " elems) ") })\n"]))
+            (Ok (str-join ["@def." (str id)])))))))
+
+;; A struct or variant constant of nominal type `t` with these field texts (a unit field's is empty and is skipped).
+;; Rust: defs/mod.rs:85 Defs::emit_object
+(defun defs-emit-object (d: Defs p: Program t: Ty tag: (Option i64) fields: (Vec str)) -> (Result str str)
+  (try-let ((o (program-object p t)))
+    (let ((sname (match tag (nil (. o snd)) ((some i) (str-join [(. o snd) ".v" (str i)]))))
+          (head ["(i64 0)" (str-join ["(i32 " (str (. o fst)) ")"]) (str-join ["(i32 " (str flag-immortal) ")"])])
+          (tagged (match tag (nil []) ((some i) [(str-join ["(i32 " (str i) ")"])])))
+          (given (vec (filter (fn (f: str) (not (empty? f))) fields))))
+      (let ((id (defs-fresh d)))
+        (do (defs-append d (str-join ["(constant internal def." (str id) " %struct." sname " (%struct." sname " "
+                                      (s/join " " (into (into head tagged) given)) "))\n"]))
+            (Ok (str-join ["@def." (str id)])))))))
+
+;; The field types of the struct, or of variant `tag`, of nominal type `t`. Rust: defs/mod.rs:118 Defs::field_types
+(defun field-types (p: Program t: Ty tag: (Option i64)) -> (Result (Vec Ty) str)
+  (match t
+    ((TCon (KNominal id) args)
+     (try-let ((vs (variants (program-g p) id args)))
+       (Ok (. (nth vs (unwrap-or tag 0)) tys))))
+    (_ (Err "an object at a non-nominal type"))))
