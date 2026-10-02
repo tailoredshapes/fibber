@@ -1,0 +1,139 @@
+;; compiler/tests/own/unit-classify.fib: own.classify (§6.5: the escaping and the heap closure
+;; literals) and own.stack (§6.11: the scope-local sites) over hand-built `Event` lists (package O6;
+;; classify.rs and stack.rs have no unit tests of their own, the end-to-end tests of own/tests reach
+;; them only through the whole pass). Prints `ok NAME` or `FAIL NAME`.
+;; Build: fibc build compiler/tests/own/unit-classify.fib -I compiler -I lib -o OUT
+(ns main
+  (:use fib.coll.record types.check own.program own.walk.state own.classify own.stack))
+
+(defun arg-at () -> ArgAt (->ArgAt 0 0 ClBorrow false false nil false false false))
+(defun head-at () -> HeadAt (->HeadAt 0 false false false))
+(defun lit (l: i64 at: At) -> Event (Event (VLit l) at))
+(defun site (b: i64 at: At) -> Event (Event (VB (SiteBind b)) at))
+(defun env (l: i64 at: At) -> Event (Event (VB (SiteEnv l)) at))
+
+(defun esc (events: (Vec Event) literals: (Vec i64)) -> (Map i64 str) (. (classify events (set literals)) fst))
+(defun heap (events: (Vec Event) literals: (Vec i64)) -> (Map i64 str) (. (classify events (set literals)) snd))
+(defun one (l: i64 why: str) -> (Map i64 str) (assoc (map-empty) l why))
+
+;; The reason a literal 7 whose only event is `at` is escaping with, `nil` if it is not.
+(defun esc-of (at: At) -> (Option str) (get (esc [(lit 7 at)] [7]) 7))
+
+(defun check-escaping (cs: Checks) -> unit
+  (do (check cs "escaping: a direct call, an argument to a plain parameter and a let initialiser are no escape"
+             (and (= (esc-of (AtHead (head-at))) nil) (= (esc-of (AtArg (arg-at))) nil)
+                  (= (esc-of (AtLetInit 20)) nil)))
+      (check cs "escaping: an argument to an escaping parameter or to a closure value, the closure value first"
+             (and (= (esc-of (AtArg (with (arg-at) (escapes true)))) (some "arg-to-escapes"))
+                  (= (esc-of (AtArg (with (arg-at) (closure-value true)))) (some "arg-to-closure-value"))
+                  (= (esc-of (AtArg (with (arg-at) (escapes true) (closure-value true)))) (some "arg-to-closure-value"))))
+      (check cs "escaping: each other position says its text"
+             (and (= (esc-of AtReturn) (some "returned")) (= (esc-of AtStore) (some "stored"))
+                  (= (esc-of AtThread) (some "spawned")) (= (esc-of (AtCapture 3 false)) (some "captured by a closure"))
+                  (= (esc-of (AtCapture 3 true)) (some "captured by a closure"))
+                  (= (esc-of AtJoin) (some "a branch of a join"))
+                  (= (esc-of (AtLoopInit 3)) (some "initialises a loop variable"))
+                  (= (esc-of (AtRecur 3)) (some "arg-of-recur")) (= (esc-of AtMoveOut) (some "moved out of its scope"))
+                  (= (esc-of AtWeak) (some "used as a value")) (= (esc-of AtRawRetained) (some "used as a value"))
+                  (= (esc-of AtOther) (some "used as a value"))))
+      (check cs "escaping: the first reason is kept"
+             (= (esc [(lit 7 AtStore) (lit 7 AtReturn)] [7]) (one 7 "stored")))
+      (check cs "escaping: a literal that no event names escapes as a value"
+             (= (esc [(lit 7 (AtHead (head-at)))] [7 8]) (one 8 "used as a value")))
+      (check cs "escaping: an event of a literal that is not among the literals counts as well"
+             (= (esc [(lit 9 AtReturn)] [7]) (assoc (one 9 "returned") 7 "used as a value")))))
+
+(defun check-bound (cs: Checks) -> unit
+  (let ((let-init (lit 7 (AtLetInit 20))))
+    (do (check cs "bound: a binding the literal initialises is a use of it, a call or a plain argument is fine"
+               (= (esc [let-init (site 20 (AtHead (head-at))) (site 20 (AtArg (arg-at)))] [7]) (map-empty)))
+        (check cs "bound: its use as an escaping argument, a return or a store makes the literal escape"
+               (and (= (esc [let-init (site 20 (AtArg (with (arg-at) (escapes true))))] [7]) (one 7 "arg-to-escapes"))
+                    (= (esc [let-init (site 20 AtReturn)] [7]) (one 7 "returned"))
+                    (= (esc [let-init (site 20 AtStore)] [7]) (one 7 "stored"))))
+        (check cs "bound: bound again by let, or used as a value"
+               (and (= (esc [let-init (site 20 (AtLetInit 21))] [7]) (one 7 "bound again by let"))
+                    (= (esc [let-init (site 20 AtOther)] [7]) (one 7 "used as a value"))))
+        (check cs "bound: the binding of another literal, or of no literal, is not a use of this one"
+               (= (esc [let-init (site 21 AtReturn) (site 20 (AtHead (head-at)))] [7]) (map-empty)))
+        (check cs "bound: a binding is bound to the last literal that initialises it"
+               (= (esc [let-init (lit 8 (AtLetInit 20)) (site 20 AtReturn)] [7 8]) (one 8 "returned"))))))
+
+(defun check-env (cs: Checks) -> unit
+  (do (check cs "env: the closure object inside the literal's body is a use of it, escaping by its position"
+             (= (esc [(lit 7 (AtHead (head-at))) (env 7 AtStore)] [7]) (one 7 "stored")))
+      (check cs "env: a literal only named by its env says nothing of where its occurrence went, so it is a value"
+             (= (esc [(env 7 AtStore)] [7]) (one 7 "used as a value")))
+      (check cs "env: a call of the self-name inside the body is no escape"
+             (= (esc [(lit 7 (AtHead (head-at))) (env 7 (AtHead (head-at)))] [7]) (map-empty)))))
+
+(defun check-heap (cs: Checks) -> unit
+  (let ((tail-head (with (head-at) (tail-site true)))
+        (tail-arg (with (arg-at) (tail-site true))))
+    (do (check cs "heap: the head of a tail call, admitted or not, and the self-name of a self tail call"
+               (and (= (heap [(lit 7 (AtHead tail-head))] [7]) (one 7 "head-of-tail-site"))
+                    (= (heap [(lit 7 (AtHead (with tail-head (admitted true))))] [7]) (one 7 "head-of-tail-call"))
+                    (= (heap [(lit 7 (AtHead (with tail-head (self-tail true))))] [7]) (map-empty))
+                    (= (heap [(lit 7 (AtHead (head-at)))] [7]) (map-empty))))
+        (check cs "heap: an argument of a tail site, admitted or not, and of a call that is no tail site"
+               (and (= (heap [(lit 7 (AtArg tail-arg))] [7]) (one 7 "arg-of-tail-site"))
+                    (= (heap [(lit 7 (AtArg (with tail-arg (admitted true))))] [7]) (one 7 "arg-of-tail-call"))
+                    (= (heap [(lit 7 (AtArg (arg-at)))] [7]) (map-empty))))
+        (check cs "heap: a recur escapes and is on the heap"
+               (and (= (heap [(lit 7 (AtRecur 3))] [7]) (one 7 "arg-of-recur"))
+                    (= (esc [(lit 7 (AtRecur 3))] [7]) (one 7 "arg-of-recur"))))
+        (check cs "heap: an escaping literal is on the heap for its escaping reason, which replaces a tail reason"
+             (= (heap [(lit 7 (AtHead tail-head)) (lit 7 AtStore)] [7]) (one 7 "stored")))
+        (check cs "heap: a tail use through the literal's binding counts too, a literal that is only a value is on the heap"
+             (and (= (heap [(lit 7 (AtLetInit 20)) (site 20 (AtArg tail-arg))] [7]) (one 7 "arg-of-tail-site"))
+                  (= (heap [] [7]) (one 7 "used as a value"))))
+        (check cs "heap: only the literals with a tail use are on the heap"
+             (= (heap [(lit 7 (AtHead tail-head)) (lit 8 (AtHead (head-at)))] [7 8]) (one 7 "head-of-tail-site"))))))
+
+;; ---- stack
+
+;; Whether the site b, initialised by 100, stays scope-local when its only event is `at`.
+(defun local-after (at: At) -> bool
+  (contains? (scope-local [(site 1 at)] (assoc (map-empty) (SiteBind 1) 100) (set-empty) (map-empty)) (SiteBind 1)))
+
+(defun check-stack (cs: Checks) -> unit
+  (do (check cs "stack: a candidate with no event of its own is scope-local"
+             (= (scope-local [] (assoc (map-empty) (SiteBind 1) 100) (set-empty) (map-empty)) (hash-set (SiteBind 1))))
+      (check cs "stack: each of E1 to E4, the join, raw-retained, weak, a move out and a loop initialiser takes it off the stack"
+             (and (not (local-after AtReturn)) (not (local-after AtStore)) (not (local-after AtThread))
+                  (not (local-after AtJoin)) (not (local-after AtRawRetained)) (not (local-after AtWeak))
+                  (not (local-after AtMoveOut)) (not (local-after (AtLoopInit 3))) (not (local-after (AtRecur 3)))))
+      (check cs "stack: a capture by a heap closure does, one by a stack closure does not"
+             (and (not (local-after (AtCapture 9 true))) (local-after (AtCapture 9 false))))
+      (check cs "stack: an argument does if it is admitted, escapes or goes to a closure value"
+             (and (not (local-after (AtArg (with (arg-at) (admitted true))))) (not (local-after (AtArg (with (arg-at) (escapes true)))))
+                  (not (local-after (AtArg (with (arg-at) (closure-value true))))) (local-after (AtArg (arg-at)))
+                  (local-after (AtArg (with (arg-at) (tail-site true) (frame-owned true) (class ClOwned))))))
+      (check cs "stack: a head does if it is admitted"
+             (and (not (local-after (AtHead (with (head-at) (admitted true))))) (local-after (AtHead (head-at)))
+                  (local-after (AtHead (with (head-at) (tail-site true))))))
+      (check cs "stack: a let initialiser and any other position do not"
+             (and (local-after (AtLetInit 3)) (local-after AtOther)))
+      (check cs "stack: only the site that is at the position leaves, derived values and literals are not occurrences of it"
+             (let ((cands (assoc (assoc (assoc (map-empty) (SiteBind 1) 100) (SiteBind 2) 101) (SiteValue 5) 102)))
+               (and (= (scope-local [(site 2 AtReturn)] cands (set-empty) (map-empty)) (hash-set (SiteBind 1) (SiteValue 5)))
+                    (= (scope-local [(Event (VD (SiteBind 1)) AtReturn) (Event (VLit 100) AtReturn) (site 3 AtReturn)]
+                                    cands (set-empty) (map-empty))
+                       (hash-set (SiteBind 1) (SiteBind 2) (SiteValue 5)))
+                    (= (scope-local [(Event (VB (SiteValue 5)) AtStore)] cands (set-empty) (map-empty))
+                       (hash-set (SiteBind 1) (SiteBind 2))))))
+      (check cs "stack: a site that is not a candidate is not an answer"
+             (= (scope-local [] (map-empty) (set-empty) (map-empty)) (set-empty)))
+      (check cs "stack: a closure literal's site is decided by the heap of §6.5, not by its events"
+             (let ((cands (assoc (assoc (map-empty) (SiteBind 1) 100) (SiteBind 2) 101)))
+               (and (= (scope-local [(site 1 AtReturn) (site 2 AtReturn)] cands (hash-set 100 101) (assoc (map-empty) 101 "returned"))
+                       (hash-set (SiteBind 1)))
+                    (= (scope-local [] cands (hash-set 101) (assoc (map-empty) 101 "returned") ) (hash-set (SiteBind 1))))))
+      (check cs "stack: an allocation that is not a closure literal is not decided by the heap"
+             (= (scope-local [] (assoc (map-empty) (SiteBind 1) 100) (set-empty) (assoc (map-empty) 100 "returned"))
+                (hash-set (SiteBind 1))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (check-escaping cs) (check-bound cs) (check-env cs) (check-heap cs) (check-stack cs)
+        (finish cs))))

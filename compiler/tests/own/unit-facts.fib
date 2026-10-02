@@ -1,0 +1,198 @@
+;; compiler/tests/own/unit-facts.fib: own.facts over hand-built `Event` lists (package O6; Rust
+;; facts.rs has no unit tests of its own, the 46 end-to-end tests of own/tests reach it only through
+;; the whole pass): rule 1 at each position, rule 2, rule 3, the escapes, the edges to the loop
+;; variables and their propagation order, the summary, and the `*self != before` fixpoint.
+;; Prints `ok NAME` or `FAIL NAME`.
+;; Build: fibc build compiler/tests/own/unit-facts.fib -I compiler -I lib -o OUT
+;;
+;; The world has nine bindings, by id: 0 p and 1 q (parameters), 2 l1 and 3 l2 (loop variables),
+;; 4 x (a `let`), 5 a (an `&` parameter), 6 w (a loop variable), 7 r (a parameter), 8 s (a
+;; parameter of type i64); function 0 `f` has the parameters p q s a r.
+(ns main
+  (:use fib.coll.record syntax.pos types.ty types.table types.ast types.decls types.check
+        types.program own.program own.walk.state own.facts))
+
+(def pos-here: Pos (Pos "t.fib" 1 1 0 1))
+
+(defun world () -> TypedProgram
+  (let ((g (globals-new))
+        (kinds [BkParam BkParam BkLoop BkLoop BkLet BkAmpParam BkLoop BkParam BkParam])
+        (names ["p" "q" "l1" "l2" "x" "a" "w" "r" "s"]))
+    (do (doseq [i (range 9)] (table-add (. g bindings) (BindingInfo (nth names i) (nth kinds i) pos-here nil)))
+        (table-add (. g funs)
+                   (FunDef "f" module-main
+                           [(ParamDecl 0 "p" false nil false) (ParamDecl 1 "q" false nil false)
+                            (ParamDecl 8 "s" false nil false) (ParamDecl 5 "a" true nil false)
+                            (ParamDecl 7 "r" false nil true)]
+                           nil [] (Expr 0 pos-here (ELocal 0)) false pos-here))
+        (TypedProgram g (map-empty) (map-empty) (map-empty)
+                      (assoc (assoc (assoc (map-empty) 0 (TGen 0)) 8 (ty-i64)) 7 (TGen 0))
+                      (map-empty) (map-empty) (map-empty) [] []))))
+
+(defun arg-at () -> ArgAt (->ArgAt 0 0 ClBorrow false false nil false false false))
+(defun head-at () -> HeadAt (->HeadAt 0 false false false))
+(defun ev (b: i64 at: At) -> Event (Event (VB (SiteBind b)) at))
+
+;; facts of a unit whose function 0 has the parameters 0 and 1, inferring `inferred`
+(defun fresh (inferred: (Vec i64)) -> Facts
+  (facts-new (assoc (map-empty) 0 [0 1]) (set inferred) []))
+
+(defun absorb (p: TypedProgram f: Facts evs: (Vec Event)) -> Facts (facts-absorb f p evs (set-empty)))
+(defun whys (f: Facts b: i64) -> (Set OwnedWhy) (get-or (. f owned) b (set-empty)))
+(defun esc (f: Facts b: i64) -> (Option str) (get (. f escapes) b))
+
+(defun check-position (cs: Checks p: TypedProgram at: At what: str) -> unit
+  (let ((g (absorb p (fresh [0 1]) [(ev 0 at)])))
+    (check cs (str-join ["rule 1: " what " owns an inferred parameter, which escapes"])
+           (and (= (whys g 0) (hash-set (OwRule1 what))) (= (esc g 0) (some what)) (empty? (. g loop-rule1))))))
+
+(defun check-rule1 (cs: Checks p: TypedProgram) -> unit
+  (let ((one (absorb p (fresh [0]) [(ev 1 AtReturn)]))
+        (loopv (absorb p (fresh [0 1 2]) [(ev 2 AtReturn)])))
+    (do (check-position cs p AtReturn "returned")
+        (check-position cs p AtStore "stored")
+        (check-position cs p AtThread "spawned")
+        (check-position cs p AtJoin "join retain")
+        (check-position cs p AtRawRetained "raw-retained")
+        (check-position cs p (AtCapture 9 true) "captured by a heap closure")
+        (check cs "rule 1: a parameter whose kind is not inferred escapes and is not owned"
+               (and (= (esc one 1) (some "returned")) (empty? (. one owned))))
+        (check cs "rule 1: a loop variable escapes, gets loop-rule1 and is not owned"
+               (and (= (esc loopv 2) (some "returned")) (= (. loopv loop-rule1) (hash-set 2)) (empty? (. loopv owned))))
+        (check cs "rule 1: a capture by a stack closure is no position"
+               (= (absorb p (fresh [0]) [(ev 0 (AtCapture 9 false))]) (fresh [0])))
+        (check cs "rule 1: a let binding and an & parameter have no facts"
+               (= (absorb p (fresh [0 4 5]) [(ev 4 AtReturn) (ev 5 AtStore) (ev 4 AtWeak)]) (fresh [0 4 5])))
+        (check cs "rule 1: only the first reason is kept"
+               (let ((g (absorb p (fresh [0]) [(ev 0 AtStore) (ev 0 AtReturn)])))
+                 (and (= (esc g 0) (some "stored")) (= (whys g 0) (hash-set (OwRule1 "stored") (OwRule1 "returned")))))))))
+
+(defun check-escapes (cs: Checks p: TypedProgram) -> unit
+  (let ((tail (with (arg-at) (tail-site true) (class ClBorrow))))
+    (do (check cs "escape: the operand of weak escapes without owning"
+               (let ((g (absorb p (fresh [0]) [(ev 0 AtWeak)])))
+                 (and (= (esc g 0) (some "operand of weak")) (empty? (. g owned)))))
+        (check cs "escape: an argument at an escaping parameter or to a closure value escapes"
+               (and (= (esc (absorb p (fresh [0]) [(ev 0 (AtArg (with (arg-at) (escapes true))))]) 0)
+                       (some "passed to an escaping parameter"))
+                    (= (esc (absorb p (fresh [0]) [(ev 0 (AtArg (with (arg-at) (closure-value true))))]) 0)
+                       (some "passed to an escaping parameter"))
+                    (= (esc (absorb p (fresh [0]) [(ev 0 (AtArg (arg-at)))]) 0) nil)))
+        (check cs "escape: the loop's value escapes a loop variable, and a parameter moved out does not"
+               (let ((g (absorb p (fresh [0]) [(ev 2 AtMoveOut) (ev 0 AtMoveOut)])))
+                 (and (= (esc g 2) (some "the loop's value")) (= (. g loop-rule1) (hash-set 2)) (= (esc g 0) nil))))
+        (check cs "escape: a borrowed argument of a tail site is not rule 2"
+               (= (absorb p (fresh [0]) [(ev 0 (AtArg tail))]) (fresh [0]))))))
+
+(defun check-rule2 (cs: Checks p: TypedProgram) -> unit
+  (let ((tail (with (arg-at) (tail-site true) (index 2) (class ClOwned))))
+    (do (check cs "rule 2: an owned argument of a tail site owns the parameter, the position counted from 1"
+               (= (whys (absorb p (fresh [0]) [(ev 0 (AtArg tail))]) 0) (hash-set (OwRule2 "argument 3 of a tail site"))))
+        (check cs "rule 2: a stored argument of a tail site too, a non-tail argument no"
+               (and (= (whys (absorb p (fresh [0]) [(ev 0 (AtArg (with tail (class ClStore))))]) 0)
+                       (hash-set (OwRule2 "argument 3 of a tail site")))
+                    (empty? (. (absorb p (fresh [0]) [(ev 0 (AtArg (with tail (tail-site false))))]) owned))))
+        (check cs "rule 2: the head of a tail call owns the parameter, the self-name of a self tail call does not"
+               (and (= (whys (absorb p (fresh [0]) [(ev 0 (AtHead (with (head-at) (tail-site true))))]) 0)
+                       (hash-set (OwRule2 "called at a tail site")))
+                    (empty? (. (absorb p (fresh [0]) [(ev 0 (AtHead (with (head-at) (tail-site true) (self-tail true))))]) owned))
+                    (empty? (. (absorb p (fresh [0]) [(ev 0 (AtHead (head-at)))]) owned))))
+        (check cs "rule 2: a parameter whose kind is not inferred is not owned"
+               (empty? (. (absorb p (fresh [1]) [(ev 0 (AtArg tail))]) owned))))))
+
+(defun check-rule3 (cs: Checks p: TypedProgram) -> unit
+  (let ((scc (with (arg-at) (tail-site true) (frame-owned true) (scc-callee (some 0)) (index 1))))
+    (do (check cs "rule 3: a frame-owned argument of a tail call in the SCC owns that parameter of the member"
+               (let ((g (absorb p (fresh [0 1]) [(ev 4 (AtArg scc))])))
+                 (and (= (whys g 1) (hash-set (OwRule3 "a tail call in the SCC passes a frame-owned argument")))
+                      (empty? (whys g 0)))))
+        (check cs "rule 3: the event's value need not be a parameter"
+               (= (whys (absorb p (fresh [1]) [(Event (VD (SiteValue 3)) (AtArg scc))]) 1)
+                  (hash-set (OwRule3 "a tail call in the SCC passes a frame-owned argument"))))
+        (check cs "rule 3: not frame-owned, not a tail site, not in the SCC, past the parameters: nothing"
+               (and (= (absorb p (fresh [0 1]) [(ev 4 (AtArg (with scc (frame-owned false))))]) (fresh [0 1]))
+                    (= (absorb p (fresh [0 1]) [(ev 4 (AtArg (with scc (tail-site false))))]) (fresh [0 1]))
+                    (= (absorb p (fresh [0 1]) [(ev 4 (AtArg (with scc (scc-callee nil))))]) (fresh [0 1]))
+                    (= (absorb p (fresh [0 1]) [(ev 4 (AtArg (with scc (scc-callee (some 5)))))]) (fresh [0 1]))
+                    (= (absorb p (fresh [0 1]) [(ev 4 (AtArg (with scc (index 2))))]) (fresh [0 1]))))
+        (check cs "rule 3: a parameter whose kind is not inferred is not owned"
+               (empty? (. (absorb p (fresh [0]) [(ev 4 (AtArg scc))]) owned))))))
+
+(defun check-edges (cs: Checks p: TypedProgram) -> unit
+  (do (check cs "edges: a consumption into a loop variable is an edge from a parameter or a loop variable only"
+             (let ((g (absorb p (fresh [0]) [(ev 0 (AtLoopInit 2)) (ev 3 (AtRecur 2)) (ev 4 (AtLoopInit 2))
+                                             (ev 5 (AtRecur 2)) (ev 4 AtOther)])))
+               (= (. g edges) (hash-set (Pair 0 2) (Pair 3 2)))))
+      (check cs "edges: a position that is an escape is not an edge"
+             (empty? (. (absorb p (fresh [0]) [(ev 0 AtReturn) (ev 0 AtWeak)]) edges)))
+      (check cs "propagate: an escaping loop variable makes the value consumed into it escape and own"
+             (let ((g (absorb p (fresh [0]) [(ev 0 (AtLoopInit 2)) (ev 2 AtReturn)])))
+               (and (= (esc g 0) (some "through loop variable l1: returned"))
+                    (= (whys g 0) (hash-set (OwLoop "through loop variable l1")))
+                    (= (. g loop-rule1) (hash-set 2)))))
+      (check cs "propagate: a recur is an edge as well, and a parameter that is not inferred escapes only"
+             (let ((g (absorb p (fresh [1]) [(ev 0 (AtRecur 2)) (ev 2 AtStore)])))
+               (and (= (esc g 0) (some "through loop variable l1: stored")) (empty? (. g owned)))))
+      (check cs "propagate: loop-rule1 flows to the loop variables that feed a loop variable"
+             (let ((g (absorb p (fresh [0]) [(ev 3 (AtLoopInit 2)) (ev 2 AtReturn) (ev 0 (AtRecur 3))])))
+               (and (= (. g loop-rule1) (hash-set 2 3))
+                    (= (esc g 3) (some "through loop variable l1: returned"))
+                    (= (esc g 0) (some "through loop variable l2: through loop variable l1: returned"))
+                    (= (whys g 0) (hash-set (OwLoop "through loop variable l2"))))))
+      (check cs "propagate: the edges are walked in order, an escape found by one is seen by the next"
+             ;; edges (p,l1) (p,l2) (l1,w): the first pass takes p's reason from l2, as l1 only escapes by
+             ;; the third edge; a closure first would give l1's. The events list them in another order.
+             (let ((g (absorb p (fresh [0]) [(ev 2 (AtLoopInit 6)) (ev 0 (AtLoopInit 3)) (ev 0 (AtLoopInit 2))
+                                             (ev 6 AtReturn) (ev 3 AtStore)])))
+               (and (= (esc g 0) (some "through loop variable l2: stored"))
+                    (= (esc g 2) (some "through loop variable w: returned")))))
+      (check cs "propagate: of two escaping loop variables the smaller id gives the reason"
+             (let ((g (absorb p (fresh [0]) [(ev 0 (AtLoopInit 3)) (ev 0 (AtLoopInit 2)) (ev 3 AtStore) (ev 2 AtReturn)])))
+               (= (esc g 0) (some "through loop variable l1: returned"))))
+      (check cs "propagate: a cycle of loop variables ends"
+             (let ((g (absorb p (fresh [0]) [(ev 2 (AtRecur 3)) (ev 3 (AtRecur 2)) (ev 3 AtReturn)])))
+               (and (= (esc g 2) (some "through loop variable l2: returned"))
+                    (= (. g loop-rule1) (hash-set 2 3)))))))
+
+(defun check-fixpoint (cs: Checks p: TypedProgram) -> unit
+  (let ((evs [(ev 0 (AtLoopInit 2)) (ev 2 AtReturn) (ev 1 AtStore)])
+        (f1 (absorb p (fresh [0 1]) evs)))
+    (do (check cs "fixpoint: the first walk changes the facts, the same walk again does not"
+               (and (not (= f1 (fresh [0 1]))) (= (absorb p f1 evs) f1)))
+        (check cs "fixpoint: a walk that implies nothing leaves the facts equal"
+               (= (absorb p (fresh [0 1]) [(ev 0 AtOther) (ev 4 AtReturn)]) (fresh [0 1])))
+        (check cs "fixpoint: facts only grow, a later walk with fewer events keeps what was found"
+               (= (absorb p f1 []) f1)))))
+
+(defun check-closures (cs: Checks p: TypedProgram) -> unit
+  (let ((old (with (facts-empty) (escaping (assoc (map-empty) 7 "returned")) (heap (assoc (map-empty) 7 "old"))))
+        (g (facts-absorb old p [(Event (VLit 7) AtStore)] (hash-set 7 8))))
+    (do (check cs "closures: the first escaping reason stays, a literal that reaches no position is new"
+               (= (. g escaping) (assoc (assoc (map-empty) 7 "returned") 8 "used as a value")))
+        (check cs "closures: the heap reasons are replaced by the walk's"
+               (= (. g heap) (assoc (assoc (map-empty) 7 "stored") 8 "used as a value")))
+        (check cs "closures: facts of closures are a change, then a fixpoint"
+               (and (not (= g old)) (= (facts-absorb g p [(Event (VLit 7) AtStore)] (hash-set 7 8)) g))))))
+
+(defun check-new-and-summary (cs: Checks p: TypedProgram) -> unit
+  (let ((f0 (facts-new (assoc (map-empty) 0 [0 1]) (hash-set 0 1 7 8 5) [7]))
+        (g (absorb p f0 [(ev 0 AtReturn) (ev 1 AtWeak) (ev 7 AtStore) (ev 8 AtReturn) (ev 5 AtReturn)]))
+        (s (facts-summary g p 0)))
+    (do (check cs "new: a preset parameter is owned as declared, the rest is as given"
+               (and (= (. f0 owned) (assoc (map-empty) 7 (hash-set OwDeclared)))
+                    (= (. f0 members) (assoc (map-empty) 0 [0 1])) (= (. f0 inferred) (hash-set 0 1 7 8 5))
+                    (empty? (. f0 escapes)) (empty? (. f0 edges))))
+        (check cs "new: a declared parameter keeps OwDeclared beside the reasons found"
+               (= (whys g 7) (hash-set OwDeclared (OwRule1 "stored"))))
+        (check cs "summary: an owned and escaping parameter is (true, true)" (= (nth (. s params) 0) (Pair true true)))
+        (check cs "summary: an escaping parameter that is not owned is (false, true)" (= (nth (. s params) 1) (Pair false true)))
+        (check cs "summary: a parameter that is not an object is (false, false) whatever the facts" (= (nth (. s params) 2) (Pair false false)))
+        (check cs "summary: an & parameter is (false, false)" (= (nth (. s params) 3) (Pair false false)))
+        (check cs "summary: a declared :borrow takes the escape away and keeps the ownership" (= (nth (. s params) 4) (Pair true false)))
+        (check cs "summary: one entry for each parameter" (= (count (. s params)) 5)))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)) (p (world)))
+    (do (check-rule1 cs p) (check-escapes cs p) (check-rule2 cs p) (check-rule3 cs p) (check-edges cs p)
+        (check-fixpoint cs p) (check-closures cs p) (check-new-and-summary cs p)
+        (finish cs))))

@@ -1,9 +1,96 @@
 ;; compiler/own/classify.fib: the escaping and the heap closure literals (spec/types.md §6.5),
-;; as crates/fibref/src/own/classify.rs (109 lines of Rust). Package O6; the function is a stub.
+;; as crates/fibref/src/own/classify.rs (109 lines of Rust). Package O6.
+;;
+;; Every use of a literal (the literal itself, the `let` binding it directly initialises, a named
+;; `fn`'s self-name inside its body) is one of (a) a direct call, (b) an argument to a
+;; non-escaping parameter of a known callee, (c) the direct initialiser of a `let` binding all of
+;; whose uses are (a) or (b) and which no closure captures, or (d) anything else. A literal is
+;; escaping iff some use is (d); heap iff escaping or some use is the head or an argument of a tail
+;; site (the self-name as the head of its own self tail call excepted).
+;;
+;; Shapes: the Rust `HashMap`s are `Map`s; "the first reason" (`entry().or_insert`) is `put-first`;
+;; the one pass over the events is a `reduce` over a private record of what has been seen.
 (ns own.classify
-  (:use own.walk.state))
+  (:use fib.coll.record own.program own.walk.state))
+
+;; The literal a use is a use of: the literal itself, a binding a literal initialises, the
+;; closure object inside the literal's own body.
+(defun literal-of :private (v: Val bound: (Map i64 i64)) -> (Option i64)
+  (match v
+    ((VLit l) (some l))
+    ((VB (SiteBind f)) (get bound f))
+    ((VB (SiteEnv l)) (some l))
+    (_ nil)))
+
+;; A use of kind (d), described; `nil` for (a), (b) and (c).
+(defun escaping-use :private (ev: Event) -> (Option str)
+  (match (. ev at)
+    ((AtHead _) nil)
+    ((AtArg a) (if (. a closure-value)
+                   (some "arg-to-closure-value")
+                   (if (. a escapes) (some "arg-to-escapes") nil)))
+    ((AtLetInit _) (match (. ev val) ((VLit _) nil) (_ (some "bound again by let"))))
+    ((AtReturn) (some "returned"))
+    ((AtStore) (some "stored"))
+    ((AtThread) (some "spawned"))
+    ((AtCapture _ _) (some "captured by a closure"))
+    ((AtJoin) (some "a branch of a join"))
+    ((AtLoopInit _) (some "initialises a loop variable"))
+    ((AtRecur _) (some "arg-of-recur"))
+    ((AtMoveOut) (some "moved out of its scope"))
+    ((AtWeak) (some "used as a value"))
+    ((AtRawRetained) (some "used as a value"))
+    ((AtOther) (some "used as a value"))))
+
+;; Why a use at a tail site puts the literal on the heap, if it does.
+(defun tail-use :private (ev: Event) -> (Option str)
+  (match (. ev at)
+    ((AtHead h) :when (and (. h tail-site) (not (. h self-tail)))
+     (some (if (. h admitted) "head-of-tail-call" "head-of-tail-site")))
+    ((AtArg a) :when (. a tail-site)
+     (some (if (. a admitted) "arg-of-tail-call" "arg-of-tail-site")))
+    ((AtRecur _) (some "arg-of-recur"))
+    (_ nil)))
+
+;; What one pass has seen: the reasons found so far and the literals whose own occurrence reached
+;; a recorded position.
+(defstruct ClassifySeen (escaping: (Map i64 str) heap: (Map i64 str) used: (Set i64)))
+
+;; `m` with `why` for `k`, unless `k` already has one (Rust `entry(k).or_insert(why)`).
+(defun put-first :private (m: (Map i64 str) k: i64 why: (Option str)) -> (Map i64 str)
+  (if-some [w why] (if (contains? m k) m (assoc m k w)) m))
+
+(defun is-lit :private (v: Val) -> bool
+  (match v ((VLit _) true) (_ false)))
+
+;; The `let` bindings that a literal directly initialises: binding -> literal.
+(defun bound-literals :private (events: (Vec Event)) -> (Map i64 i64)
+  (reduce (fn (m: (Map i64 i64) ev: Event)
+            (match (. ev val)
+              ((VLit l) (match (. ev at) ((AtLetInit b) (assoc m b l)) (_ m)))
+              (_ m)))
+          (map-empty) events))
+
+(defun see :private (s: ClassifySeen ev: Event bound: (Map i64 i64)) -> ClassifySeen
+  (if-some [l (literal-of (. ev val) bound)]
+    (with s
+      (used (if (is-lit (. ev val)) (conj (. s used) l) (. s used)))
+      (escaping (put-first (. s escaping) l (escaping-use ev)))
+      (heap (put-first (. s heap) l (tail-use ev))))
+    s))
 
 ;; Rust: classify.rs:75 `classify`: the escaping literals and the heap literals among `literals`,
-;; each with its reason, as the pair (escaping, heap).
+;; each with its reason, as the pair (escaping, heap). A literal whose own occurrence reaches no
+;; recorded position is escaping: its value flows on through the enclosing form (the last step of
+;; a `do`, a branch of an `if` or `match`, the body of a `let`, a `dyn`), which is none of
+;; (a)-(c). Only an event of the literal itself counts here: its self-name's calls and its
+;; binding's uses are uses of the literal too, but they say nothing about where the occurrence went.
 (defun classify (events: (Vec Event) literals: (Set i64)) -> (Pair (Map i64 str) (Map i64 str))
-  (trap "todo: classify"))
+  (let ((bound (bound-literals events))
+        (seen (reduce (fn (s: ClassifySeen ev: Event) (see s ev bound))
+                      (ClassifySeen (map-empty) (map-empty) (set-empty)) events))
+        (escaping (reduce (fn (m: (Map i64 str) l: i64)
+                            (if (contains? (. seen used) l) m (assoc m l "used as a value")))
+                          (. seen escaping) (vec literals))))
+    (Pair escaping
+          (reduce-kv (fn (m: (Map i64 str) l: i64 why: str) (assoc m l why)) (. seen heap) escaping))))

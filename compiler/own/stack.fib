@@ -1,10 +1,47 @@
 ;; compiler/own/stack.fib: the scope-local bindings of spec/types.md §6.11, as
-;; crates/fibref/src/own/stack.rs (65 lines of Rust). Package O6; the function is a stub.
+;; crates/fibref/src/own/stack.rs (65 lines of Rust). Package O6.
+;;
+;; A binding, `match` temporary or implicit temporary whose initialiser allocates its object in
+;; this frame is on the stack iff no occurrence of `Borrowed(b)`, on any path of its scope, is at
+;; an escape position E1 to E6 (E6: an admitted tail call), passed to an escaping parameter or to a
+;; closure value, moved out or retained by a scope exit or a join, the initialiser of a loop
+;; variable, or the operand of `weak` or `raw-retained`. A closure literal is decided by §6.5
+;; instead: a stack closure's binding or temporary is scope-local.
 (ns own.stack
   (:use own.program own.walk.state))
+
+;; Whether an occurrence at `at` keeps its binding off the stack (every position is named, as in
+;; Rust, so that a new one has to be decided).
+(defun disqualifies :private (at: At) -> bool
+  (match at
+    ((AtReturn) true)
+    ((AtStore) true)
+    ((AtThread) true)
+    ((AtJoin) true)
+    ((AtRawRetained) true)
+    ((AtWeak) true)
+    ((AtMoveOut) true)
+    ((AtLoopInit _) true)
+    ((AtRecur _) true)
+    ((AtCapture _ heap) heap)
+    ((AtArg a) (or (. a admitted) (. a escapes) (. a closure-value)))
+    ((AtHead h) (. h admitted))
+    ((AtLetInit _) false)
+    ((AtOther) false)))
 
 ;; Rust: stack.rs:40 `scope_local`: the sites among candidates (by initialiser) whose object never
 ;; leaves its scope, given every event of the unit, the closure literals, and the heap literals.
 (defun scope-local (events: (Vec Event) candidates: (Map Site i64) literals: (Set i64)
                     heap: (Map i64 str)) -> (Set Site)
-  (trap "todo: scope-local"))
+  (let ((out-of-scope (reduce (fn (s: (Set Site) ev: Event)
+                                (match (. ev val)
+                                  ((VB site) :when (disqualifies (. ev at)) (conj s site))
+                                  (_ s)))
+                              (set-empty) events)))
+    (reduce-kv (fn (out: (Set Site) site: Site init: i64)
+                 (if (if (contains? literals init)
+                         (not (contains? heap init))
+                         (not (contains? out-of-scope site)))
+                     (conj out site)
+                     out))
+               (set-empty) candidates)))
