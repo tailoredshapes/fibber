@@ -812,7 +812,11 @@ Clojure's. A refutable pattern in a binding position is an explicit trap, as `nt
 * **Floats print as Clojure's** (**Decided**, owner, 2026-10-01; §9.1): `str`, `println` and `pr` give Java's `Double.toString`
   text, positional for `1e-3 <= |x| < 1e7` with at least one digit after the point, otherwise `d.dddE<exp>` with no plus sign, the
   shortest digits that read back to the value, and `NaN`, `Infinity`, `-Infinity`, `-0.0`: `1.0E21`, `1.0E-7`, `1.0E7`,
-  `1.23456789E7`, `0.001`, `1.0E-4`, `100.0`, `9999999.0`, `-0.0`, `Infinity`, `-Infinity`, `NaN`, `-1.23456789E9`, `1.5`, `0.1`
+  `1.23456789E7`, `0.001`, `1.0E-4`, `100.0`, `9999999.0`, `-0.0`, `Infinity`, `-Infinity`, `NaN`, `-1.23456789E9`, `1.5`, `0.1`;
+   **the three non-finite values are the exception** (found by differential testing against Clojure 1.12, 2026-10-02): only `(str x)` of a bare
+   float gives `Infinity`, `-Infinity`, `NaN`; `pr`, `print`, `println` and the text of a float inside a collection (`(str [x])` too) write the reader
+   forms `##Inf`, `##-Inf`, `##NaN`. Library `Debug` does this (case 2973); the builtin `Show`, used by `print` and `println`, still writes
+   `Infinity` (open case 2974, X3)
   ([R] A13 fltfmt: a library function over today's `show` prints exactly these fifteen texts under both tools, so the rule is
   specified by a program). It amends the owner's decision of 2026-09-30 (types §2.12: positional, never an exponent, `inf`,
   `-inf`) and is a runtime change in both tools, §7 C12 (tranche 0: the text of a float is observable by everything);
@@ -1440,7 +1444,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `Double/parseDouble` | adapt | `(Double/parseDouble s)` | `str -> f64` | 3 | module `Double`; traps on a malformed string, as Java throws; `parse-double` is the `(Option f64)` parser |
 | `inc` | keep | `(inc x)` | `t -> t \| Num t, Unit t` | 1 | any numeric type; traps on overflow |
 | `dec` | keep | `(dec x)` | `t -> t \| Num t, Unit t` | 1 |  |
-| `mod` | keep | `(mod a b)` | `t t -> t \| Num t, Ord t, Unit t` | 1 | the sign of the divisor; traps on zero; on floats too, over `rem` (A13 div) |
+| `mod` | keep | `(mod a b)` | `t t -> t \| Num t, Ord t, Unit t` | 1 | the sign of the divisor, built on `rem`; an integer zero divisor traps, a float one never does: it gives `NaN` where Clojure throws, as `rem` does (types §4, Decided 2026-09-28: float arithmetic never traps) (A13 div) |
 | `max` | adapt | `(max a b ..)` | `t t -> t \| Ord t` | 1 | any ordered type; a macro folds more; a NaN argument gives NaN, as Clojure's ([R] A10 nan) |
 | `min` | adapt | `(min a b ..)` | `t t -> t \| Ord t` | 1 | as `max` |
 | `abs` | adapt | `(abs x)` | `t -> t \| Num t, Ord t, Unit t` | 1 | traps on the minimum of an integer type |
@@ -1450,10 +1454,10 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `unchecked-negate` | adapt | `(unchecked-negate a)` | `t -> t \| Bits t` | 3 | wrapping |
 | `unchecked-inc` | adapt | `(unchecked-inc a)` | `t -> t \| Bits t` | 3 | wrapping |
 | `unchecked-dec` | adapt | `(unchecked-dec a)` | `t -> t \| Bits t` | 3 | wrapping |
-| `byte` | adapt | `(byte x)` | `t -> i8 \| ToByte t` | 2 | checked: traps when the value does not fit; `(trunc i8 x)` wraps |
-| `short` | adapt | `(short x)` | `t -> i16 \| ToShort t` | 2 | checked |
-| `int` | adapt | `(int x)` | `t -> i32 \| ToInt t` | 2 | checked; floats truncate toward zero and trap out of range; a `char` gives its code point ([R] A12 int2). |
-| `long` | adapt | `(long x)` | `t -> i64 \| ToLong t` | 2 | checked; `(sext i64 x)` widens without a check; a `char` gives its code point. |
+| `byte` | adapt | `(byte x)` | `t -> i8 \| ToByte t` | 2 | checked: traps when the value does not fit, and for a float that is out of range before it is cut (`127.9`) or a `NaN`; `(trunc i8 x)` wraps |
+| `short` | adapt | `(short x)` | `t -> i16 \| ToShort t` | 2 | checked; a float is range-checked before it is cut, a `NaN` traps (Clojure's `RT.shortCast`) |
+| `int` | adapt | `(int x)` | `t -> i32 \| ToInt t` | 2 | checked; a float is range-checked before it is cut toward zero (`2147483647.9` traps), a `NaN` is `0`, an infinity traps, as Clojure's `RT.intCast`; a `char` gives its code point ([R] A12 int2). |
+| `long` | adapt | `(long x)` | `t -> i64 \| ToLong t` | 2 | checked; a `NaN` is `0` and an infinity traps, as Clojure's `RT.longCast`; `(sext i64 x)` widens without a check; a `char` gives its code point. |
 | `float` | adapt | `(float x)` | `t -> f32 \| ToFloat t` | 2 |  |
 | `double` | adapt | `(double x)` | `t -> f64 \| ToDouble t` | 2 |  |
 | `bit-and-not` | keep | `(bit-and-not a b)` | `t t -> t \| Bits t` | 3 | library over `bit-and` and `bit-not` |
@@ -1713,7 +1717,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
 | `find` | adapt | `(find m k)` | `s k -> (Option (Pair k v)) \| Lookup s k v` | 2 | returns the entry, a `Pair` |
-| `select-keys` | keep | `(select-keys m ks)` | `s c -> s \| Lookup s k v, Assoc s k v, Emptyable s, Reducible c k` | 1 | absent keys are skipped |
+| `select-keys` | keep | `(select-keys m ks)` | `s c -> (Map k v) \| Lookup s k v, Hash k, Eq k, Reducible c k` | 1 | absent keys are skipped; the result is always a `Map`, whatever `s` is, as Clojure's (it builds from `{}`; found by differential testing, 2026-10-02) |
 | `conj` | adapt | `(conj c x ..)` | `s e -> r \| Collection s r e` | 1 | one rule per type: `List` front, `Vec` end, `Set` anywhere, `Map` takes a `Pair` (a two-element `Vec` after L23); a literal `nil` first argument is `(list)` (§2.4); macro for more than one `x` (**landed**, R6a: `(conj c)` is `c`; the literal-`nil` first argument rule is not implemented); `VSeq` front, `SubVec` end; a seq (`LSeq`, `Range`, `Iterate`, `Repeat`, `Cycle`) conses at the front and the result is an `LSeq`, Clojure's `(conj (range 3) 9)` being `(9 0 1 2)`: `Collection s r e` has the result type determined by the instance (§2.3; [R] A13 conjseq) |
 | `assoc` | adapt | `(assoc m k v ..)` | `s k v -> s \| Assoc s k v` | 1 | `Map` and `Vec` (index at most the count: `i = count` appends, as Clojure's, and beyond it traps, [R] A11 e6); a struct by a literal keyword is `with` (L21); a literal `nil` is `{}` (§2.4; not implemented); macro for more pairs (**landed**, R6a; a key without a value is `malformed assoc: a key without a value`) |
 | `dissoc` | keep | `(dissoc m k ..)` | `s k -> s \| Dissoc s k` | 1 | `Map` and `Set`; macro for more keys |

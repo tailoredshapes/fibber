@@ -8,10 +8,12 @@
 ;;  - a value that does not fit traps `NAME: value out of range`, NAME the function the program called (`char`,
 ;;    `byte`, `short`, `int`, `long`, `float`); an integer fits when it lies in the target's signed range, so
 ;;    `(byte 127)` and `(byte -128)` are bytes and `(byte 128)` and `(byte -129)` trap.
-;;  - a float is truncated toward zero first and the integer must then fit: `(int 2147483647.9)` is 2147483647
-;;    and `(int 2147483648.0)` traps. A NaN and the infinities trap for every integer target: a NaN has no
-;;    integer (the plan's judge names NaN; the page is silent). The test is made on the cut value in the
-;;    float's own type, against 2^(w-1), which an f64 holds exactly at every width, so no limit is rounded.
+;;  - a float converts to a byte, short or int when it lies, uncut, within the target's inclusive limits, and is then
+;;    cut toward zero: `(int 2147483647.0)` and `(byte -128.0)` convert, `(int 2147483647.9)` and `(byte 127.9)`
+;;    trap, as Clojure's RT.intCast, byteCast and shortCast do (found by differential testing against Clojure
+;;    1.12). A long takes any float whose cut value lies in [-2^63, 2^63); the infinities trap for every target.
+;;    A NaN is 0 for `int` and `long` and traps for `byte` and `short`, as Clojure's casts do (the plan's
+;;    "NaN traps" was the first draft's guess; the owner's rule is Clojure's behaviour unless memory safety).
 ;;  - `(float x)` of an f64 traps when x lies beyond the greatest f32, an infinity included; the test is on
 ;;    the f64, so a value between the greatest f32 and the next halfway point traps although rounding would
 ;;    have kept it. A NaN passes through as a NaN: it overflows nothing. An integer rounds to the nearest
@@ -42,18 +44,23 @@
 (defun i32-of :private (x: i64) -> i32
   (if (and (>= x -2147483648) (<= x 2147483647)) (trunc i32 x) (trap "int: value out of range")))
 
-;; whether x, truncated toward zero, lies in [-hi, hi): hi is 2^(w-1) of the target's width w, exact in an f64
-;; at every width, so no integer limit that an f64 cannot hold is compared. A NaN is in no range.
+;; whether x, truncated toward zero, lies in [-hi, hi): hi is 2^63, exact in an f64, so no integer limit that an f64
+;; cannot hold is compared. A NaN is in no range.
 (defun whole? :private (x: f64 hi: f64) -> bool
   (let ((cut (quot x 1.0))) (and (>= cut (neg hi)) (< cut hi))))
+;; whether x, uncut, lies in [lo, hi]: the three narrow targets compare the float before they cut it (Clojure's
+;; casts do). A NaN is in no range.
+(defun within? :private (x: f64 lo: f64 hi: f64) -> bool (and (>= x lo) (<= x hi)))
 (defun i8-of-f :private (x: f64) -> i8
-  (if (whole? x 128.0) (fptosi i8 x) (trap "byte: value out of range")))
+  (if (within? x -128.0 127.0) (fptosi i8 x) (trap "byte: value out of range")))
 (defun i16-of-f :private (x: f64) -> i16
-  (if (whole? x 32768.0) (fptosi i16 x) (trap "short: value out of range")))
+  (if (within? x -32768.0 32767.0) (fptosi i16 x) (trap "short: value out of range")))
 (defun i32-of-f :private (x: f64) -> i32
-  (if (whole? x 2147483648.0) (fptosi i32 x) (trap "int: value out of range")))
+  (if (not (= x x)) (fptosi i32 0.0)
+      (if (within? x -2147483648.0 2147483647.0) (fptosi i32 x) (trap "int: value out of range"))))
 (defun i64-of-f :private (x: f64) -> i64
-  (if (whole? x 9223372036854775808.0) (fptosi i64 x) (trap "long: value out of range")))
+  (if (not (= x x)) 0
+      (if (whole? x 9223372036854775808.0) (fptosi i64 x) (trap "long: value out of range"))))
 
 ;; 3.4028234663852886e38 is the greatest f32, as an f64
 (defun f32-of :private (x: f64) -> f32
