@@ -1,23 +1,111 @@
 ;; compiler/types/lower/bindings.fib: let bindings (package P7).
-;; Replaces crates/fibref/src/types/lower/bindings.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/bindings.rs (149 lines of Rust).
+;;
+;; The bindings of `let` and `loop` (syntax §3.3, §3.18): `(pat expr)`, or `(x: T expr)`,
+;; whose annotation types `x` as annotations do everywhere (§1.5, types §2.4).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `RawBinding<'f>` holds `Stx` copies; `Entry` is a struct here, as in Rust.
+;; - `let_chain` and its trap clause lower an expression (the trap call): they call the hub
+;;   through `lw-sub-expr`.
+;; - the `fallback` flag of Rust's `Clause` (the clause the checker adds to a refutable `let`)
+;;   is not a field of `types.ast`'s Clause: it is dropped, see `lw-trap-clause` (to report).
 (ns types.lower.bindings
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.lower.scope))
+  (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.lower.typeform types.lower.decl types.lower.scope))
 
-;; Rust `RawBinding<'f>` (lower/bindings.rs:15): a pattern, its annotation
-;; form and its initialiser form.
+;; What a refutable `let` pattern traps with.
+(def mismatch: str "let: pattern does not match")
+
+;; Rust `RawBinding<'f>` (lower/bindings.rs:15): a pattern, its annotation form and its
+;; initialiser form.
 (defstruct RawBinding (pat: Stx ann: (Option Stx) init: Stx))
 
-;; Rust: lower/bindings.rs:25
+;; One lowered binding of a `let`, or of a `loop` pattern: whether `pat` can fail to match
+;; (stdlib §7 L8).
+(defstruct Entry (pat: Pattern init: Expr refutable: bool))
+
+(defun malformed :private (p: Stx) -> TypeError
+  (type-error-resolve (. p pos) "a binding is (pattern expression) or (name: type expression)"))
+
+;; Rust: lower/bindings.rs:39 binding
+(defun raw-binding :private (p: Stx) -> (Result RawBinding TypeError)
+  (let ((parts (stx-items p)))
+    (match (stx-as-list p)
+      (nil (Err (malformed p)))
+      (_ (cond ((= (count parts) 3)
+                (match (annotation-name (nth parts 0))
+                  ((some n) (Ok (RawBinding (Stx (SSym n) (. (nth parts 0) pos)) (some (nth parts 1)) (nth parts 2))))
+                  (nil (Err (malformed p)))))
+               ((= (count parts) 2) (Ok (RawBinding (nth parts 0) nil (nth parts 1))))
+               (else (Err (malformed p))))))))
+
+;; Rust: lower/bindings.rs:28 bindings_of: the `((pat expr)..)` or `((x: T expr)..)` of a
+;; `let` or `loop`.
 (defun bindings-of (items: (Vec Stx) form: Stx) -> (Result (Vec RawBinding) TypeError)
-  (trap "todo: bindings-of"))
+  (let ((head (unwrap-or (stx-as-sym (nth items 0)) "let")))
+    (match (if (>= (count items) 2) (stx-as-list (nth items 1)) nil)
+      ((some pairs)
+       (if (>= (count items) 3)
+           (loop ((i 0) (out (vec-empty)))
+             (if (>= i (count pairs))
+                 (Ok out)
+                 (match (raw-binding (nth pairs i))
+                   ((Ok b) (recur (+ i 1) (conj out b)))
+                   ((Err e) (Err e)))))
+           (Err (type-error-resolve (. form pos) (str-join [head " needs bindings and a body"])))))
+      (nil (Err (type-error-resolve (. form pos) (str-join [head " needs bindings and a body"])))))))
 
-;; Rust: lower/bindings.rs:65 annotate
+;; Rust: lower/bindings.rs:78 let_chain: the `let` of `entries` around `body`. Irrefutable
+;; bindings stay one `Let`; a refutable one is a `match` of its initialiser whose clause holds
+;; what follows and whose last clause traps, so no pattern an irrefutable binding has is ever
+;; redundant. The entries are taken last to first, a run of irrefutable ones collected.
+(defun lw-let-chain (lw: Lowerer entries: (Vec Entry) body: Expr pos: Pos) -> (Result Expr TypeError)
+  (loop ((i (- (count entries) 1)) (acc body) (run (vec-empty)))
+    (if (< i 0)
+        (Ok (close-run lw run acc pos))
+        (let ((e (nth entries i)))
+          (if (. e refutable)
+              (let ((closed (close-run lw run acc pos)))
+                (match (lw-trap-clause lw (. (. e pat) pos))
+                  ((Err x) (Err x))
+                  ((Ok trap)
+                   ;; Rust's Clause also says `fallback: false` here
+                   (recur (- i 1)
+                          (lw-mk lw pos (EMatch (. e init) [(Clause (. e pat) nil closed) trap]))
+                          (vec-empty)))))
+              (recur (- i 1) acc (conj run (LetBind (. e pat) (. e init)))))))))
+
+;; `acc` under the bindings of `run` (collected last to first).
+(defun close-run :private (lw: Lowerer run: (Vec LetBind) acc: Expr pos: Pos) -> Expr
+  (if (empty? run)
+      acc
+      (lw-mk lw pos (ELet (vec (reverse run)) acc))))
+
+;; `(_ (trap "let: pattern does not match"))`, the clause that ends a refutable `let`
+;; (Rust sets `fallback: true`, which `types.ast`'s Clause has no field for).
+(defun lw-trap-clause (lw: Lowerer pos: Pos) -> (Result Clause TypeError)
+  (let ((text (Stx (SStr mismatch) pos))
+        (head (Stx (SSym "fib.prelude/trap") pos)))
+    (try-let ((body (lw-sub-expr lw (Stx (SList [head text]) pos) false)))
+      (Ok (Clause (Pattern pos PWild) nil body)))))
+
+;; Rust: lower/bindings.rs:128 annotate: records the annotation `ann` of the `let` binding
+;; `pat`, which is a variable when annotated (`_: T` is a pattern, not a name).
 (defun lw-annotate (lw: Lowerer pat: Pattern ann: (Option Stx)) -> (Result unit TypeError)
-  (trap "todo: lw-annotate"))
+  (match ann
+    (nil (Ok ()))
+    ((some _)
+     (match (. pat kind)
+       ((PBind b) (lw-annotate-binding lw b ann))
+       (_ (Err (type-error-resolve (. pat pos) "only a variable can be annotated in a binding")))))))
 
-;; Rust: lower/bindings.rs:79 annotate_binding
+;; Rust: lower/bindings.rs:142 annotate_binding: records the annotation `ann` of the binding `b`.
 (defun lw-annotate-binding (lw: Lowerer b: i64 ann: (Option Stx)) -> (Result unit TypeError)
-  (trap "todo: lw-annotate-binding"))
+  (match ann
+    (nil (Ok ()))
+    ((some t)
+     (try-let ((a (type-ann (. lw g) (. lw m) t false)))
+       (let ((info (g-binding (. lw g) b)))
+         (do (table-set (. (. lw g) bindings) b (BindingInfo (. info name) (. info kind) (. info pos) (some a)))
+             (Ok ())))))))

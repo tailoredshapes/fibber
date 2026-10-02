@@ -1,0 +1,136 @@
+;; compiler/tests/types/unit-protos.fib: protocols and instances (types.lower.protos, with
+;; types.lower.supers and types.lower.impl-head under it, and the `protocol` and `instance`
+;; sections of types.dump.protos). protos.rs has no inline test. Two kinds of check:
+;; - the cases of protos-cases/ (NAME.fib, and NAME.out, which is the tool's `--stage lower
+;;   --sections protocol,instance,error` output as protos-support.fib describes): the forms of
+;;   each are lowered as `lower::declare` and `lower::define` order their steps, and the sections,
+;;   or the errors, printed as the tool prints them;
+;; - what the tool cannot reach (a form the expander rejects first, a state a failing declaration
+;;   leaves in the tables) and the functions on their own (`pred-of`, `register-instance`): the
+;;   expectations are the messages and positions of protos.rs.
+;; Run from the repository root.
+;; Build: fibc build compiler/tests/types/unit-protos.fib -I compiler -I lib -o OUT
+(ns main (:use fib.string syntax.pos syntax.form types.ty types.scheme types.error types.ast
+               types.table types.decls types.names types.check types.lower.typeform
+               types.lower.protos types.lower.supers tests.types.lower-support
+               tests.types.protos-support))
+
+(def case-names: (Vec str)
+  ["proto-basic" "proto-dets" "proto-bad-head" "proto-bad-method" "proto-dup-method" "proto-dup"
+   "proto-method-clash" "proto-sig-errorder" "proto-sig-noarrow" "proto-sig-noself"
+   "proto-sig-nottype" "proto-sig-odd" "proto-sig-params" "proto-sig-pname" "proto-sig-ret"
+   "proto-sig-short" "proto-sig-unknown-tv" "proto-head-forms" "proto-and-impl-errors"
+   "impl-basic" "impl-where" "impl-dets" "impl-overlap" "impl-overlap-colour" "impl-overlap-vars"
+   "impl-errors-order" "impl-paterson-bigger" "impl-paterson-equal" "impl-paterson-fn"
+   "impl-paterson-second" "impl-paterson-size" "impl-paterson-vars" "impl-proto-dets"
+   "impl-proto-dets-none" "impl-proto-unknown" "impl-where-arity" "impl-where-bad-item"
+   "impl-where-not-list" "impl-where-nottype" "impl-where-send-arity" "impl-where-unknown-proto"
+   "impl-where-unknown-var"])
+
+;; ---- what the tool cannot reach
+
+(def mine: i64 2)
+(def plain: str "(defprotocol Plain (plain (self) -> i64))\n")
+
+(defun malformed (cs: Checks) -> unit
+  (do (expect-err cs "(defprotocol A)" "1:1 expected (defprotocol Name :requires (P..)? method+)")
+      (expect-err cs "(defprotocol)" "1:1 expected (defprotocol Name :requires (P..)? method+)")
+      (expect-err cs "(defprotocol A :requires (Show))" "1:1 expected (defprotocol Name :requires (P..)? method+)")
+      (expect-err cs "(defprotocol 5 (a (self) -> i64))" "1:14 expected Name or (Name self det*)")
+      (expect-err cs "(defprotocol () (a (self) -> i64))" "1:14 expected Name or (Name self det*)")
+      (expect-err cs "(defprotocol (A 5) (a (self) -> i64))" "1:14 expected Name or (Name self det*)")
+      (expect-err cs "(defprotocol (A b :x) (a (self) -> i64))" "1:14 expected Name or (Name self det*)")
+      (expect-err cs "(defprotocol A (a (self) -> i64) ())" "1:34 a method is (name (self ..) -> type)")
+      (expect-err cs "(defprotocol A (a (self) -> i64) [x])" "1:34 a method is (name (self ..) -> type)")
+      (expect-err cs "(impl Show)" "1:1 expected (impl P T method*)")
+      (expect-err cs (str-join [plain "(impl Plain)"]) "2:1 expected (impl P T method*)")
+      (expect-err cs (str-join [plain "(impl Plain i64 :where)"]) "2:1 :where without constraints")))
+
+;; the protocol's parameters, the placeholder rows, what an error leaves
+(defun tables (cs: Checks) -> unit
+  (let ((g (world))
+        (m (g-add-module g "main" (Links [] [] []) (map-empty)))
+        (f (nth (forms-of "(defprotocol (A s e) (a (self) -> e) (b (self) -> s))" "t") 0)))
+    (match (declare-proto g m f)
+      ((Err _) (check cs "declare-proto" false))
+      ((Ok id)
+       (let ((d (g-proto g id)))
+         (do (check cs "declare-proto: the next id, params and names" (and (= id mine) (= (. d params) ["s" "e"])
+                                                                   (= (mapv (fn (md: MethodDef) (. md name)) (. d methods)) ["a" "b"])))
+             (check cs "declare-proto: placeholders are unit, no default, no supers"
+                    (and (= (. (nth (. d methods) 0) scheme) (scheme-mono (ty-unit))) (empty? (. d supers))
+                         (not (some? (. (nth (. d methods) 0) default)))))
+             (check cs "declare-proto: the name is bound as a type-less protocol and the methods as values"
+                    (and (= (g-proto-name g m "A") (some mine))
+                         (= (g-value g m "a") (some (GMethod mine 0))) (= (g-value g m "b") (some (GMethod mine 1)))))
+             (check cs "declare-proto: a second declaration is rejected and adds nothing"
+                    (and (is-err? (declare-proto g m f)) (= (table-count (. g protos)) (+ mine 1))))))))))
+
+(defun is-err? :private (r: (Result i64 TypeError)) -> bool
+  (match r ((Err _) true) ((Ok _) false)))
+
+;; a duplicate method name: the first is bound, the protocol is not added
+(defun partial (cs: Checks) -> unit
+  (let ((l (lower-src "(defprotocol A (a (self) -> i64) (a (self) -> i64))"))
+        (g (. l g)))
+    (do (check cs "dup method: the error" (= (count (. l errors)) 1))
+        (check cs "dup method: no protocol, the first method name stays bound"
+              (and (= (table-count (. g protos)) mine) (some? (g-value g module-main "a"))
+                   (not (some? (g-proto-name g module-main "A"))))))))
+
+;; the methods of a resolved protocol: qualifiers, defaults, Self elsewhere, the scheme
+(defun methods (cs: Checks) -> unit
+  (let ((l (lower-src "(defprotocol (Q s e) (m1 (self :borrow :owned x: s :owned y: e :borrow) -> e) (m2 (self) -> i64 7) (m3 (self other: s) -> i64) (m4 (self) -> (Array s)) (m5 (self f: (fn (s) e)) -> e))"))
+        (g (. l g)))
+    (if (not (empty? (. l errors)))
+        (check cs "methods: lowered" false)
+        (let ((ms (. (g-proto g mine) methods))
+              (flag (fn (i: i64) (. (nth ms i) self-elsewhere))))
+          (do (check cs "m1 params and flags"
+                     (= (mapv (fn (p: MethodParam) (str-join [(. p name) (if (. p borrow) ":b" "") (if (. p owned) ":o" "")]))
+                              (. (nth ms 0) params))
+                        ["self:b:o" "x:o" "y:b"]))
+              (check cs "m1 scheme: vars s e, dispatch pred, no amps"
+                     (let ((sc (. (nth ms 0) scheme)))
+                       (and (= (. sc n-vars) 2) (= (. sc var-names) ["s" "e"]) (= (. sc n-colours) 0)
+                            (= (. sc preds) [(PProto mine [(TGen 0) (TGen 1)])])
+                            (= (. sc amps) [false false false]) (= (. sc params) ["self" "x" "y"])
+                            (= (. sc ty) (TFn CSend [(TGen 0) (TGen 0) (TGen 1)] (TGen 1))))))
+              (check cs "default only where a body follows"
+                     (and (not (some? (. (nth ms 0) default))) (some? (. (nth ms 1) default))))
+              (check cs "self-elsewhere: parameter, return, none"
+                     (= [(flag 0) (flag 1) (flag 2) (flag 3) (flag 4)] [true false true true true]))
+              (check cs "m5: the colour of an omitted fn colour is quantified"
+                     (= (. (. (nth ms 4) scheme) n-colours) 1)))))))
+
+(defun preds (cs: Checks) -> unit
+  (let ((g (world))
+        (p (Pos "t" 1 1 0 1)))
+    (do (check cs "pred-of Send" (match (pred-of g module-prelude "Send" [(ty-i64)] p) ((Ok (PSend t)) (= t (ty-i64))) (_ false)))
+        (check cs "pred-of Object" (match (pred-of g module-prelude "Object" [(ty-i64)] p) ((Ok (PObject _)) true) (_ false)))
+        (check cs "pred-of Weakable" (match (pred-of g module-prelude "Weakable" [(ty-i64)] p) ((Ok (PWeakable _)) true) (_ false)))
+        (check cs "pred-of Show at its arity" (match (pred-of g module-prelude "Show" [(ty-i64)] p) ((Ok (PProto 0 _)) true) (_ false)))
+        (check cs "pred-of Stack with two"
+              (match (pred-of g module-prelude "Stack" [(ty-i64) (ty-i64)] p) ((Ok (PProto 1 [_ _])) true) (_ false)))
+        (check cs "pred-of Show with two"
+              (match (pred-of g module-prelude "Show" [(ty-i64) (ty-i64)] p)
+                ((Err e) (and (= (. e message) "protocol Show takes 1 type(s)") (= (. e kind) Resolve)))
+                (_ false)))
+        (check cs "pred-of Send with two is looked up as a protocol"
+              (match (pred-of g module-prelude "Send" [(ty-i64) (ty-i64)] p)
+                ((Err e) (= (. e message) "unknown protocol Send"))
+                (_ false)))
+        (check cs "pred-of Nope"
+              (match (pred-of g module-prelude "Nope" [] p)
+                ((Err e) (= (. e message) "unknown protocol Nope"))
+                (_ false))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (run-cases cs case-names)
+        (malformed cs)
+        (tables cs)
+        (partial cs)
+        (methods cs)
+        (preds cs)
+        (finish cs))))

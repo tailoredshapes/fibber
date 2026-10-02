@@ -1,74 +1,142 @@
 ;; compiler/types/lower/scope.fib: the lowerer and its scope of local names (package P7).
-;; Replaces crates/fibref/src/types/lower/scope.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/scope.rs (139 lines of Rust).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `&mut self` is `self` over Cells: `scope`, `depth`, `frames`, `loops` and
+;;   `unsafe-depth` are Cells; the `&mut Globals` is the Globals of Cells and Tables.
+;; - the lowering is one cycle (`expr` calls `call`, `clause`, `bindings`, which call `expr`)
+;;   and fibber modules are acyclic: the Lowerer carries the hub function `expr` (a field of
+;;   function type, set by `lowerer-new`'s caller in types.lower.expr), and the modules below
+;;   the hub call it as `lw-sub-expr`. `lw-body`, which only loops over it, lives here too
+;;   (`clause` needs it).
+;; - `literal` (Rust lower/expr.rs:17) lives here, not in `expr`: `pattern` needs it and
+;;   `expr` needs `pattern`.
+;; - `str-in` is `names.iter().any(|n| n == name)`.
 (ns types.lower.scope
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
 
-;; Rust `Lowerer<'g>` (lower/scope.rs:19) and its private `Frame`: the
-;; scope is a vector of (name, binding) with a mark to reset to, `depth` the
-;; frame each binding was made in, `loops` the frame depth of each open
-;; loop. Every field with state is a Cell. P7 may change the fields.
 (defstruct ScopeEntry (name: str binding: i64))
 (defstruct LowerFrame (is-async: bool captures: (Vec i64)))
 (defstruct Lowerer
   (g: Globals m: i64 owner: str scope: (Cell (Vec ScopeEntry))
    depth: (Cell (Map i64 i64)) frames: (Cell (Vec LowerFrame))
-   loops: (Cell (Vec i64)) unsafe-depth: (Cell i64)))
+   loops: (Cell (Vec i64)) unsafe-depth: (Cell i64)
+   expr: (fn (Lowerer Stx bool) (Result Expr TypeError))))
 
-;; Rust: lower/scope.rs:36 Lowerer::new
-(defun lowerer-new (g: Globals m: i64 owner: str) -> Lowerer
-  (trap "todo: lowerer-new"))
+;; Rust: lower/scope.rs:36 Lowerer::new; `expr` is the hub function (`lw-expr`).
+(defun lowerer-new (g: Globals m: i64 owner: str expr: (fn (Lowerer Stx bool) (Result Expr TypeError))) -> Lowerer
+  (Lowerer g m owner (cell (vec-empty)) (cell (map-empty)) (cell (vec-empty)) (cell (vec-empty))
+           (cell 0) expr))
+
+;; `self.expr(form, tail)` from a module below the hub.
+(defun lw-sub-expr (lw: Lowerer form: Stx tail: bool) -> (Result Expr TypeError)
+  ((. lw expr) lw form tail))
+
+(defun str-in (xs: (Vec str) name: str) -> bool
+  (not (every? (fn (n: str) (not (= n name))) xs)))
 
 ;; Rust: lower/scope.rs:50 bind
 (defun lw-bind (lw: Lowerer name: str kind: BindingKind pos: Pos) -> i64
-  (trap "todo: lw-bind"))
+  (let ((id (table-add (. (. lw g) bindings) (BindingInfo name kind pos nil))))
+    (do (set! (. lw depth) (assoc @(. lw depth) id (count @(. lw frames))))
+        (set! (. lw scope) (conj @(. lw scope) (ScopeEntry name id)))
+        id)))
 
 ;; Rust: lower/scope.rs:64 mark
 (defun lw-mark (lw: Lowerer) -> i64
-  (trap "todo: lw-mark"))
+  (count @(. lw scope)))
 
 ;; Rust: lower/scope.rs:69 reset
 (defun lw-reset (lw: Lowerer mark: i64) -> unit
-  (trap "todo: lw-reset"))
+  (set! (. lw scope) (vec (take mark @(. lw scope)))))
 
-;; Rust: lower/scope.rs:75 lookup
+;; Records `id` as a capture of every closure frame from the one it was bound in outwards.
+(defun capture-in-frames :private (lw: Lowerer id: i64) -> unit
+  (let ((bound-at (unwrap-or (get @(. lw depth) id) 0)))
+    (set! (. lw frames)
+          (vec (map-indexed (fn (i: i64 f: LowerFrame)
+                              (if (or (< i bound-at) (str-has-id (. f captures) id))
+                                  f
+                                  (LowerFrame (. f is-async) (conj (. f captures) id))))
+                            @(. lw frames))))))
+
+(defun str-has-id :private (xs: (Vec i64) id: i64) -> bool
+  (not (every? (fn (n: i64) (not (= n id))) xs)))
+
+;; Rust: lower/scope.rs:75 lookup: the binding `name` refers to, recorded as a capture of
+;; every closure frame between its binding and here.
 (defun lw-lookup (lw: Lowerer name: str) -> (Option i64)
-  (trap "todo: lw-lookup"))
+  (let ((sc @(. lw scope)))
+    (loop ((i (- (count sc) 1)))
+      (cond ((< i 0) nil)
+            ((= (. (nth sc i) name) name)
+             (let ((id (. (nth sc i) binding)))
+               (do (capture-in-frames lw id) (some id))))
+            (else (recur (- i 1)))))))
 
 ;; Rust: lower/scope.rs:87 is_local
 (defun lw-is-local (lw: Lowerer name: str) -> bool
-  (trap "todo: lw-is-local"))
+  (not (every? (fn (e: ScopeEntry) (not (= (. e name) name))) @(. lw scope))))
 
 ;; Rust: lower/scope.rs:92 kind
 (defun lw-kind (lw: Lowerer id: i64) -> BindingKind
-  (trap "todo: lw-kind"))
+  (. (g-binding (. lw g) id) kind))
 
 ;; Rust: lower/scope.rs:98 enter_frame
 (defun lw-enter-frame (lw: Lowerer is-async: bool) -> unit
-  (trap "todo: lw-enter-frame"))
+  (set! (. lw frames) (conj @(. lw frames) (LowerFrame is-async (vec-empty)))))
 
-;; Rust: lower/scope.rs:106 leave_frame
+;; Rust: lower/scope.rs:106 leave_frame: the capture set of the literal left.
 (defun lw-leave-frame (lw: Lowerer) -> (Vec i64)
-  (trap "todo: lw-leave-frame"))
+  (let ((fs @(. lw frames)))
+    (if (empty? fs)
+        (vec-empty)
+        (do (set! (. lw frames) (vec (take (- (count fs) 1) fs)))
+            (. (nth fs (- (count fs) 1)) captures)))))
 
 ;; Rust: lower/scope.rs:111 in_async
 (defun lw-in-async (lw: Lowerer) -> bool
-  (trap "todo: lw-in-async"))
+  (let ((fs @(. lw frames)))
+    (and (not (empty? fs)) (. (nth fs (- (count fs) 1)) is-async))))
 
 ;; Rust: lower/scope.rs:116 enter_loop
 (defun lw-enter-loop (lw: Lowerer) -> unit
-  (trap "todo: lw-enter-loop"))
+  (set! (. lw loops) (conj @(. lw loops) (count @(. lw frames)))))
 
 ;; Rust: lower/scope.rs:121 leave_loop
 (defun lw-leave-loop (lw: Lowerer) -> unit
-  (trap "todo: lw-leave-loop"))
+  (let ((ls @(. lw loops)))
+    (if (empty? ls) () (set! (. lw loops) (vec (take (- (count ls) 1) ls))))))
 
 ;; Rust: lower/scope.rs:127 in_loop
 (defun lw-in-loop (lw: Lowerer) -> bool
-  (trap "todo: lw-in-loop"))
+  (let ((ls @(. lw loops)))
+    (and (not (empty? ls)) (= (nth ls (- (count ls) 1)) (count @(. lw frames))))))
 
 ;; Rust: lower/scope.rs:132 mk
 (defun lw-mk (lw: Lowerer pos: Pos kind: ExprKind) -> Expr
-  (trap "todo: lw-mk"))
+  (Expr (g-next-expr (. lw g)) pos kind))
+
+;; Rust lower/expr.rs:17: a literal form's value, if it is one.
+(defun literal (form: Stx) -> (Option Lit)
+  (match (. form kind)
+    ((SInt v w) (some (LitInt v w)))
+    ((SFlt v w) (some (LitFloat v w)))
+    ((SStr s) (some (LitStr s)))
+    ((SChr c) (some (LitChar c)))
+    ((syntax.form/SBool b) (some (LitBool b)))
+    ((SKw k) (some (LitKeyword k)))
+    ((SList items) (if (empty? items) (some LitUnit) nil))
+    (_ nil)))
+
+;; Rust: lower/expr.rs:53 body: one or more forms as one expression (a `do` when there are
+;; several); `tail` holds for the last only.
+(defun lw-body (lw: Lowerer forms: (Vec Stx) pos: Pos tail: bool) -> (Result Expr TypeError)
+  (if (= (count forms) 1)
+      (lw-sub-expr lw (nth forms 0) tail)
+      (loop ((i 0) (steps (vec-empty)))
+        (if (>= i (count forms))
+            (Ok (lw-mk lw pos (EDo steps)))
+            (match (lw-sub-expr lw (nth forms i) (and tail (= (+ i 1) (count forms))))
+              ((Ok e) (recur (+ i 1) (conj steps e)))
+              ((Err e) (Err e)))))))

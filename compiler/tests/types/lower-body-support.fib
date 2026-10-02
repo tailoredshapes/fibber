@@ -1,0 +1,85 @@
+;; compiler/tests/types/lower-body-support.fib: what the unit programs of the lowering of bodies
+;; (unit-lower-*.fib, package P7) share. A case is a program, lower-body-cases/NAME.fib, of core
+;; forms with a `defun f`; the harness declares its types as the declaration lowering does,
+;; registers every `defun` as a function (the real step is package P5's), binds the parameters of
+;; `f` as `lower_defun` does and lowers its body, and prints what the tool prints for it:
+;; the `ast fun f` section, or the `error` line. NAME.out is the Rust tool's output for the same
+;; file (`fibref types --stage lower --ast --sections ast,error`), the ids of the block made
+;; relative (the first expression id and the first binding id of `f` are 0, as here) by
+;; tests/types/lower-body-gen.py.
+(ns tests.types.lower-body-support
+  (:require [syntax.dump :as sdump])
+  (:use fib.string syntax.pos syntax.form types.ty types.error types.ast types.table types.decls
+        types.init types.builtins types.dump.ast tests.types.lower-support types.lower.typeform types.lower.decl
+        types.lower.scope types.lower.call types.lower.expr))
+
+(def body-dir: str "compiler/tests/types/lower-body-cases/")
+
+;; `new-globals` and the builtins of the table defined by name (their schemes are not needed
+;; to lower), and a prelude function `concat`, which the real prelude has and which hides the
+;; builtin of that name (so `special` finds none).
+(defun fresh-world () -> Globals
+  (match (new-globals)
+    ((Err e) (trap (type-error-text e)))
+    ((Ok g)
+     (do (run! (fn ([i sig]) (define-value g module-builtin (. sig name) (GBuiltin i) (builtin-pos)))
+               (vec (zip (range (count (builtin-table))) (builtin-table))))
+         (let ((id (table-add (. g funs) (FunDef "concat" module-prelude [] nil []
+                                                 (Expr 0 (builtin-pos) (ELit LitUnit)) false (builtin-pos)))))
+           (define-value g module-prelude "concat" (GFun id) (builtin-pos)))
+         (lower-module g module-prelude (forms-of "(defenum (Vec a) VecEmpty)" "prelude"))
+         g))))
+
+(defun defun-name (f: Stx) -> (Option str)
+  (let ((items (stx-items f)))
+    (if (and (> (count items) 1) (= (head-of f) "defun")) (stx-as-sym (nth items 1)) nil)))
+
+;; Every `defun` as a function with a placeholder body: the names the cases call.
+(defun register-funs (g: Globals m: i64 forms: (Vec Stx)) -> unit
+  (run! (fn (f: Stx)
+          (match (defun-name f)
+            ((some nm)
+             (let ((id (table-add (. g funs) (FunDef nm m [] nil [] (Expr 0 (. f pos) (ELit LitUnit)) false (. f pos)))))
+               (match (define-value g m nm (GFun id) (. f pos)) ((Ok _) ()) ((Err _) ()))))
+            (nil ())))
+        forms))
+
+;; The parameters of `f`, bound as `lower_defun` binds them (`(& x)` an `&` parameter).
+(defun bind-params (lw: Lowerer params: (Vec Stx)) -> (Result (Vec i64) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count params))
+        (Ok out)
+        (let ((p (nth params i)))
+          (match (amp-operand p)
+            ((some x) (recur (+ i 1) (conj out (lw-bind lw x BkAmpParam (. p pos)))))
+            (nil
+             (match (lw-plain-param lw params i)
+               ((Err e) (Err e))
+               ((Ok t) (recur (. t thd) (conj out (lw-bind lw (. t fst) BkParam (. p pos))))))))))))
+
+;; The lines of the case: the `ast fun f` section or the error.
+(defun lower-f (g: Globals m: i64 form: Stx file: str) -> (Vec str)
+  (let ((items (stx-items form))
+        (lw (lowerer-make g m "f")))
+    (match (try-let ((ps (bind-params lw (stx-items (nth items 2))))
+                     (ra (lw-ret-annotation lw items 3))
+                     (b (lw-body lw (vec (drop (. ra snd) items)) (. form pos) false)))
+             (Ok (body-lines [] g file "ast fun f" ps (. ra fst) b)))
+      ((Ok lines) lines)
+      ((Err e) [(error-line e file)]))))
+
+(defun text-lines (text: str file: str) -> (Vec str)
+  (forms-lines (forms-of text file) file))
+
+(defun forms-lines (forms: (Vec Stx) file: str) -> (Vec str)
+  (let ((g (fresh-world))
+        (m (g-add-module g "main" (Links [] [] []) (map-empty)))
+        (errs (lower-module g m forms)))
+    (do (register-funs g m forms)
+        (match (first (filterv (fn (f: Stx) (= (defun-name f) (some "f"))) forms))
+          ((some f) (lower-f g m f file))
+          (nil ["no defun f"])))))
+
+(defun case-lines (name: str) -> (Vec str)
+  (let ((file (str-join [body-dir name ".fib"])))
+    (text-lines (file-text file) file)))

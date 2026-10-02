@@ -1,0 +1,43 @@
+;; compiler/tests/types/unit-lower-nest.fib: the lowering of bodies at depth (package P7). The Rust
+;; checker runs on a 256 MB stack because its passes recurse over bodies up to 2000 deep
+;; (types/mod.rs:111-115, the expander admits 2000): a body nested 150, 900 and 1990 deep, in each
+;; shape that recurses (if, let, call, fn, match, loop), lowers without an error and prints exactly the
+;; lines its levels have. The forms are built, not read (the reader stops at 1000).
+;; Run from the repository root, under `ulimit -s 262144` for the deepest.
+;; Build: fibc build compiler/tests/types/unit-lower-nest.fib -I compiler -I lib -o OUT
+(ns main (:use fib.string syntax.pos syntax.form types.check tests.types.lower-support
+               tests.types.lower-body-support))
+
+(defun sym (s: str) -> Stx (Stx (SSym s) p0))
+(defun lst (xs: (Vec Stx)) -> Stx (Stx (SList xs) p0))
+
+;; `inner` under one level of the shape
+(defun wrap (shape: str inner: Stx) -> Stx
+  (cond ((= shape "if") (lst [(sym "if") (sym "x") inner (sym "x")]))
+        ((= shape "let") (lst [(sym "let") (lst [(lst [(sym "x") (sym "x")])]) inner]))
+        ((= shape "call") (lst [(sym "g") (sym "x") inner]))
+        ((= shape "fn") (lst [(sym "fn") (lst [(sym "x")]) inner]))
+        ((= shape "match") (lst [(sym "match") (sym "x") (lst [(sym "_") inner])]))
+        (else (lst [(sym "loop") (lst [(lst [(sym "x") (sym "x")])]) inner]))))
+
+(defun nested (shape: str n: i64) -> Stx
+  (loop ((i 0) (acc (sym "x")))
+    (if (>= i n) acc (recur (+ i 1) (wrap shape acc)))))
+
+;; each shape with the lines one level of it prints (the node and the leaves beside the inner)
+(def shapes: (Vec (Pair str i64))
+  [(Pair "if" 3) (Pair "let" 3) (Pair "call" 3) (Pair "fn" 2) (Pair "match" 4) (Pair "loop" 3)])
+
+(defun depth (cs: Checks sh: (Pair str i64) n: i64) -> unit
+  (let ((shape (. sh fst))
+        (forms [(lst [(sym "defun") (sym "g") (lst [(sym "a") (sym "b")]) (sym "a")])
+                (lst [(sym "defun") (sym "f") (lst [(sym "x")]) (nested shape n)])])
+        (lines (forms-lines forms "nest.fib")))
+    (do (check cs (str-join ["nest " shape " " (show n) " (" (show (count lines)) " lines)"])
+               (and (= (count lines) (+ (* n (. sh snd)) 3)) (= (nth lines 0) "ast fun f")))
+        (if (< (count lines) 3) (println (nth lines 0)) ()))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (run! (fn (n: i64) (run! (fn (sh: (Pair str i64)) (depth cs sh n)) shapes)) [150 900 1990])
+        (finish cs))))

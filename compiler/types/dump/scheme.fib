@@ -1,0 +1,52 @@
+;; compiler/types/dump/scheme.fib: a scheme as text over the global tables alone
+;; (package P4, for the `protocol`, `instance` and `fun` sections), as `show_scheme_in` of
+;; crates/fibref/src/types/program.rs: `∀a b. (P a) ⇒ (fn (a) b)`, or the bare type when
+;; nothing is quantified and there is no context. `(& T)` marks an `&` parameter; colour
+;; constraints print after the predicates as `κ ⊑ κ'` and `κ ⊒ Caps{T}`.
+;;
+;; It reads only `Globals`, so a scheme can be printed before inference (the lowered
+;; protocol methods); `program-show-scheme` of types.program is this over the program's
+;; globals. A colour prints `send`, `local`, `ς{i}`, `?ς{n}` or `κ{i}` here (program.rs
+;; `colour`), not as types.display's `printer-colour` (`:send`).
+(ns types.dump.scheme
+  (:use fib.string types.ty types.scheme types.decls types.display))
+
+;; A colour as `show_scheme_in` writes it.
+(defun scheme-colour (k: Colour) -> str
+  (match k
+    ((CSend) "send")
+    ((CLocal) "local")
+    ((CGen i) (str-join ["ς" (show i)]))
+    ((CVar v) (str-join ["?ς" (show v)]))
+    ((CRigid i) (str-join ["κ" (show i)]))))
+
+;; The scheme's type: a function with `&` parameters prints them `(& T)`.
+(defun scheme-type :private (p: Printer s: Scheme) -> str
+  (match (. s ty)
+    ((TFn _ ps r)
+     (if (scheme-has-amp s)
+         (str-join ["(fn (" (join " " (map-indexed (fn (i: i64 t: Ty)
+                                                     (if (nth (. s amps) i)
+                                                         (str-join ["(& " (printer-ty p t) ")"])
+                                                         (printer-ty p t)))
+                                                   ps))
+                    ") " (printer-ty p r) ")"])
+         (printer-ty p (. s ty))))
+    (t (printer-ty p t))))
+
+(defun bound-text :private (p: Printer b: ColourBound) -> str
+  (match b
+    ((BFlow a c) (str-join [(scheme-colour a) " ⊑ " (scheme-colour c)]))
+    ((BCaps k t) (str-join [(scheme-colour k) " ⊒ Caps{" (printer-ty p t) "}"]))))
+
+;; `∀VARS. CONTEXT ⇒ TYPE`, the first two parts left out when empty.
+(defun show-scheme-in (g: Globals s: Scheme) -> str
+  (let ((p (printer-with-names g (. s var-names) []))
+        (ty (scheme-type p s))
+        (ctx (into (mapv (fn (q: Pred) (printer-pred p q)) (. s preds))
+                   (mapv (fn (b: ColourBound) (bound-text p b)) (. s colour-bounds))))
+        (vars (into (. s var-names)
+                    (mapv (fn (i: i64) (str-join ["ς" (show i)])) (range (. s n-colours))))))
+    (str-join [(if (empty? vars) "" (str-join ["∀" (join " " vars) ". "]))
+               (if (empty? ctx) "" (str-join [(join " " ctx) " ⇒ "]))
+               ty])))

@@ -1,27 +1,299 @@
 ;; compiler/types/lower/protos.fib: protocols and instances (package P4).
-;; Replaces crates/fibref/src/types/lower/protos.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/protos.rs (399 lines of Rust).
+;;
+;; `defprotocol` and the heads of `impl`s (syntax §3.10; types §2.7, §4.1): method
+;; signatures as schemes, instances keyed by `(P, head)` with their declared contexts,
+;; coherence and the Paterson condition.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `g.protos.push`, `g.protos[id].methods[i] = method` and `g.instances.push` are
+;;   `table-add` and `table-set` of the rebuilt row; `resolve_proto` sets each method as
+;;   soon as it is read, so a later method's error leaves the earlier ones set, as in Rust.
+;; - `declare_impl`'s `(usize, &[Form])` is a `(Pair i64 (Vec Stx))`.
+;; - `method_params` returned `Option<TResult<..>>`: here `(Result (Option ..) TypeError)`,
+;;   `nil` being `None` (a malformed parameter list, which `method_sig` reports as `bad`).
+;; - `MethodParam` mutation by `quals` is the result `Quals` (the index after the qualifiers
+;;   and the two flags).
+;; - Rust's `size` returns the count of each variable in a Vec of pairs; here a
+;;   `(Map i64 i64)`: only lookups and the `any` over it are used.
+;; - `pos` of an earlier instance in a message is `pos-display` (`{pos}`).
 (ns types.lower.protos
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:require [expand.error :as ee])
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.display types.annot
+        types.lower.typeform types.lower.decl types.lower.impl-head types.lower.supers))
 
-;; Rust: lower/protos.rs:43
+;; `Name` (dispatch parameter `Self`) or `(Name self det*)`: the name and the parameters.
+(defun proto-name-params :private (head: Stx) -> (Result (Pair str (Vec str)) TypeError)
+  (match (stx-as-sym head)
+    ((some n) (Ok (Pair n ["Self"])))
+    (nil (let ((items (stx-items head))
+               (names (vec (keep (fn (f: Stx) (stx-as-sym f)) items))))
+           (if (and (not (empty? items)) (= (count names) (count items)))
+               (Ok (Pair (nth names 0) (if (= (count names) 1) ["Self"] (vec (drop 1 names)))))
+               (Err (type-error-resolve (. head pos) "expected Name or (Name self det*)")))))))
+
+(defun placeholder-method :private (name: str pos: Pos) -> MethodDef
+  (MethodDef name [] (scheme-mono (ty-unit)) false nil pos))
+
+;; The method forms of a `defprotocol` form.
+(defun method-forms :private (items: (Vec Stx)) -> (Vec Stx)
+  (vec (drop (methods-start items) items)))
+
+;; Declares a protocol's name, parameters and method names.
 (defun declare-proto (g: Globals m: i64 form: Stx) -> (Result i64 TypeError)
-  (trap "todo: declare-proto"))
+  (let ((items (stx-items form)))
+    (if (<= (count items) (methods-start items))
+        (Err (type-error-resolve (. form pos) "expected (defprotocol Name :requires (P..)? method+)"))
+        (try-let ((np (proto-name-params (nth items 1))))
+          (let ((name (. np fst)))
+            (if (contains? @(. (g-names g m) protos) name)
+                (Err (type-error-resolve (. form pos) (str-join ["protocol " name " is already defined"])))
+                (let ((id (table-count (. g protos))))
+                  (try-let ((methods (declare-methods g m id (method-forms items))))
+                    (do (table-add (. g protos) (ProtoDef name m (. np snd) methods [] (. form pos)))
+                        (set! (. (g-names g m) protos) (assoc @(. (g-names g m) protos) name id))
+                        (Ok id))))))))))
 
-;; Rust: lower/protos.rs:90
+;; Binds the method names of protocol `id` as values; a placeholder row for each.
+(defun declare-methods :private (g: Globals m: i64 id: i64 forms: (Vec Stx)) -> (Result (Vec MethodDef) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count forms))
+        (Ok out)
+        (let ((mf (nth forms i))
+              (items (stx-items mf))
+              (mname (if (empty? items) nil (stx-as-sym (nth items 0)))))
+          (match mname
+            (nil (Err (type-error-resolve (. mf pos) "a method is (name (self ..) -> type)")))
+            ((some n)
+             (match (define-value g m n (GMethod id i) (. mf pos))
+               ((Err e) (Err e))
+               ((Ok _) (recur (+ i 1) (conj out (placeholder-method n (. mf pos))))))))))))
+
+;; Resolves the method signatures of a declared protocol.
 (defun resolve-proto (g: Globals m: i64 id: i64 form: Stx) -> (Result unit TypeError)
-  (trap "todo: resolve-proto"))
+  (let ((forms (method-forms (stx-items form))))
+    (match (resolve-supers g m id form)
+      ((Err e) (Err e))
+      ((Ok _)
+       (loop ((i 0))
+        (if (>= i (count forms))
+            (Ok ())
+            (match (method-sig g m id (nth forms i))
+              ((Err e) (Err e))
+              ((Ok method)
+               (let ((def (g-proto g id)))
+                 (do (table-set (. g protos) id
+                                (ProtoDef (. def name) (. def module) (. def params)
+                                          (assoc (. def methods) i method) (. def supers) (. def pos)))
+                     (recur (+ i 1))))))))))))
 
-;; Rust: lower/protos.rs:225 (usize, &[Form]): the instance index and the method forms
+(defun bad-method :private (mf: Stx) -> (Result a TypeError)
+  (Err (type-error-resolve (. mf pos) "a method is (name (self qual* x: T qual*) -> type)")))
+
+(defun first-sym :private (xs: (Vec Stx)) -> str
+  (unwrap-or (if (empty? xs) nil (stx-as-sym (nth xs 0))) ""))
+
+;; `(mname (self qual* mparam*) -> type)`, `mparam ::= sym: type qual*`.
+(defun method-sig :private (g: Globals m: i64 id: i64 mf: Stx) -> (Result MethodDef TypeError)
+  (let ((items (stx-items mf)))
+    (if (< (count items) 4)
+        (bad-method mf)
+        (match (stx-as-list (nth items 1))
+          (nil (bad-method mf))
+          ((some ps)
+           (if (or (not (= (first-sym (vec (drop 2 items))) "->")) (not (= (first-sym ps) "self")))
+               (bad-method mf)
+               (method-sig-parts g m (g-proto g id) id mf ps)))))))
+
+(defun method-sig-parts :private (g: Globals m: i64 proto: ProtoDef id: i64 mf: Stx ps: (Vec Stx))
+    -> (Result MethodDef TypeError)
+  (let ((items (stx-items mf))
+        (ret-form (nth items 3))
+        (env (gen-env-with-self (. proto params))))
+    (try-let ((mp (method-params g m ps (nth (. proto params) 0) env)))
+      (match mp
+        (nil (bad-method mf))
+        ((some r)
+         (try-let ((ret-ann (type-ann g m ret-form true))
+                   (ret (ann-to-ty (rename-dispatch ret-ann (nth (. proto params) 0)) env (. ret-form pos))))
+           (Ok (MethodDef (unwrap-or (stx-as-sym (nth items 0)) "") (. r fst)
+                          (method-scheme id (. proto params) env (. r fst) (. r snd) ret)
+                          (self-elsewhere? (. r snd) ret)
+                          (if (> (count items) 4) (some mf) nil)
+                          (. mf pos)))))))))
+
+(defun method-scheme :private (id: i64 params: (Vec str) env: GenEnv mparams: (Vec MethodParam)
+                               tys: (Vec Ty) ret: Ty) -> Scheme
+  (Scheme (count @(. env names)) @(. env colours) @(. env names)
+          [(PProto id (mapv (fn (i: i64) (TGen i)) (range (count params))))]
+          [] (ty-fn-send tys ret) (mapv (fn (_: Ty) false) tys) (mapv (fn (p: MethodParam) (. p name)) mparams)))
+
+(defun ty-fn-send :private (tys: (Vec Ty) ret: Ty) -> Ty
+  (TFn CSend tys ret))
+
+;; Whether `Self` occurs anywhere but the receiver: in a parameter type after the first, or in
+;; the return type.
+(defun self-elsewhere? :private (tys: (Vec Ty) ret: Ty) -> bool
+  (or (any-index? (fn (i: i64) (mentions-gen0 (nth tys (+ i 1)))) (- (count tys) 1))
+      (mentions-gen0 ret)))
+
+;; Whether `TGen 0` occurs in the type.
+(defun mentions-gen0 :private (t: Ty) -> bool
+  (match t
+    ((TGen i) (= i 0))
+    ((TCon _ args) (any-index? (fn (i: i64) (mentions-gen0 (nth args i))) (count args)))
+    ((TFn _ ps r) (or (any-index? (fn (i: i64) (mentions-gen0 (nth ps i))) (count ps)) (mentions-gen0 r)))
+    (_ false)))
+
+;; Reads `:borrow`/`:owned` qualifiers from `i`: the index after them and the two flags.
+(defstruct Quals :private (next: i64 borrow: bool owned: bool))
+
+(defun quals :private (ps: (Vec Stx) i: i64) -> Quals
+  (loop ((j i) (borrow false) (owned false))
+    (match (if (< j (count ps)) (some (. (nth ps j) kind)) nil)
+      ((some (SKw k))
+       (cond ((= k "borrow") (recur (+ j 1) true owned))
+             ((= k "owned") (recur (+ j 1) borrow true))
+             (else (Quals j borrow owned))))
+      (_ (Quals j borrow owned)))))
+
+;; The parameters of a method signature, `self` first: their declared kinds and their
+;; types. `nil` when the list is malformed.
+(defun method-params :private (g: Globals m: i64 ps: (Vec Stx) dispatch: str env: GenEnv)
+    -> (Result (Option (Pair (Vec MethodParam) (Vec Ty))) TypeError)
+  (let ((q0 (quals ps 1)))
+    (loop ((i (. q0 next)) (mparams [(MethodParam "self" (. q0 borrow) (. q0 owned))]) (tys [(TGen 0)]))
+      (if (>= i (count ps))
+          (Ok (some (Pair mparams tys)))
+          (match (annotation-name (nth ps i))
+            (nil (Ok nil))
+            ((some pname)
+             (if (>= (+ i 1) (count ps))
+                 (Ok nil)
+                 (let ((t (nth ps (+ i 1))))
+                   (match (try-let ((ann (type-ann g m t true)))
+                            (ann-to-ty (rename-dispatch ann dispatch) env (. t pos)))
+                     ((Err e) (Err e))
+                     ((Ok ty)
+                      (let ((q (quals ps (+ i 2))))
+                        (recur (. q next) (conj mparams (MethodParam pname (. q borrow) (. q owned)))
+                               (conj tys ty)))))))))))))
+
+;; The dispatch parameter's own name (`s` in `(Seq s e)`) means `Self`.
+(defun rename-dispatch :private (ann: TypeAnn dispatch: str) -> TypeAnn
+  (let ((all (fn (as: (Vec TypeAnn)) (mapv (fn (a: TypeAnn) (rename-dispatch a dispatch)) as))))
+    (match ann
+      ((AVar n) (if (= n dispatch) ASelf ann))
+      ((ABuiltin c a) (ABuiltin c (rename-dispatch a dispatch)))
+      ((ANominal id args) (ANominal id (all args)))
+      ((ADyn p args send) (ADyn p (all args) send))
+      ((AFn k ps r) (AFn k (all ps) (rename-dispatch r dispatch)))
+      (_ ann))))
+
+;; Declares the instance of an `impl` form; returns its index and the method forms.
 (defun declare-impl (g: Globals m: i64 form: Stx) -> (Result (Pair i64 (Vec Stx)) TypeError)
-  (trap "todo: declare-impl"))
+  (let ((items (stx-items form)))
+    (if (< (count items) 3)
+        (Err (type-error-resolve (. form pos) "expected (impl P T method*)"))
+        (try-let ((pr (proto-ref g m (nth items 1) false))
+                  (h (impl-head g m (nth items 2))))
+          (declare-impl-rest g m form pr h)))))
 
-;; Rust: lower/protos.rs:277
+(defun declare-impl-rest :private (g: Globals m: i64 form: Stx pr: (Pair i64 (Vec TypeAnn)) h: ImplHead)
+    -> (Result (Pair i64 (Vec Stx)) TypeError)
+  (let ((items (stx-items form))
+        (env (HeadEnv (. h vars) (. h colours)))
+        (rest (vec (drop 3 items)))
+        (where? (and (not (empty? rest)) (stx-kw? (nth rest 0) "where"))))
+    (if (and where? (< (count rest) 2))
+        (Err (type-error-resolve (. form pos) ":where without constraints"))
+        (try-let ((context (if where? (where-preds g m (nth rest 1) env) (Ok (vec-empty))))
+                  (dets (try-collect (. pr snd) (fn (d: TypeAnn) (ann-to-ty d env (. (nth items 1) pos)))))
+                  (ok (paterson g context (. h head) (. form pos)))
+                  (index (register-instance g (InstanceDef (. pr fst) (. h con) m (. h vars) (. h head) dets
+                                                           context [] (. form pos)))))
+          (Ok (Pair index (if where? (vec (drop 2 rest)) rest)))))))
+
+;; Registers an instance, checking coherence (§4.1).
 (defun register-instance (g: Globals inst: InstanceDef) -> (Result i64 TypeError)
-  (trap "todo: register-instance"))
+  (let ((key (InstKey (. inst proto) (. inst con))))
+    (match (get @(. g instance-index) key)
+      ((some i)
+       (let ((other (table-get (. g instances) i))
+             (shown (printer-ty (printer-with-names g [] (. inst var-names))
+                                (strip-head (. inst head) (. inst var-names)))))
+         (Err (type-error-other (. inst pos)
+                (str-join ["overlapping instances: " (. (g-proto g (. inst proto)) name) " for " shown
+                           " is already implemented at " (ee/pos-display (. other pos))])))))
+      (nil (let ((id (table-add (. g instances) inst)))
+             (do (set! (. g instance-index) (assoc @(. g instance-index) key id))
+                 (Ok id)))))))
 
-;; Rust: lower/protos.rs:330
+;; The head with the instance's own variables rigid.
+(defun strip-head :private (head: Ty names: (Vec str)) -> Ty
+  (ty-map-leaves head
+    (fn (t: Ty) (match t ((TGen i) (if (< i (count names)) (some (TRigid i)) nil)) (_ nil)))))
+
+;; The constraints of a `:where` clause: `(P T..)` or `(Send T)`, over the head's
+;; variables only.
+(defun where-preds :private (g: Globals m: i64 cs: Stx env: HeadEnv) -> (Result (Vec Pred) TypeError)
+  (match (stx-as-list cs)
+    (nil (Err (type-error-resolve (. cs pos) ":where takes a list of constraints")))
+    ((some list) (try-collect list (fn (c: Stx) (where-pred g m c env))))))
+
+(defun where-pred :private (g: Globals m: i64 c: Stx env: HeadEnv) -> (Result Pred TypeError)
+  (let ((items (stx-items c)))
+    (match (if (empty? items) nil (stx-as-sym (nth items 0)))
+      (nil (Err (type-error-resolve (. c pos) "a constraint is (P T..) or (Send T)")))
+      ((some pname)
+       (try-let ((tys (try-collect (vec (drop 1 items))
+                        (fn (t: Stx) (try-let ((ann (type-ann g m t false))) (ann-to-ty ann env (. t pos)))))))
+         (pred-of g m pname tys (. c pos)))))))
+
+;; `(P T..)`, `(Send T)`, `(Object T)` or `(Weakable T)` from its parts.
 (defun pred-of (g: Globals m: i64 name: str tys: (Vec Ty) pos: Pos) -> (Result Pred TypeError)
-  (trap "todo: pred-of"))
+  (cond ((and (= name "Send") (= (count tys) 1)) (Ok (PSend (nth tys 0))))
+        ((and (= name "Object") (= (count tys) 1)) (Ok (PObject (nth tys 0))))
+        ((and (= name "Weakable") (= (count tys) 1)) (Ok (PWeakable (nth tys 0))))
+        (else
+         (match (g-proto-name g m name)
+           (nil (Err (type-error-resolve pos (g-unknown g m SpProto name "unknown protocol"))))
+           ((some p)
+            (let ((want (count (. (g-proto g p) params))))
+              (if (= want (count tys))
+                  (Ok (PProto p tys))
+                  (Err (type-error-resolve pos (str-join ["protocol " name " takes " (show want) " type(s)"]))))))))))
+
+;; The Paterson condition (§3.3): each context constraint has no variable more often than
+;; the head and is smaller than the head.
+(defun paterson :private (g: Globals context: (Vec Pred) head: Ty pos: Pos) -> (Result unit TypeError)
+  (let ((hs (size-all [head] 0 (map-empty)))
+        (printer (printer-new g)))
+    (loop ((i 0))
+      (if (>= i (count context))
+          (Ok ())
+          (let ((c (nth context i))
+                (cs (size-all (pred-tys c) 0 (map-empty))))
+            (if (or (too-many? (. cs snd) (. hs snd)) (>= (. cs fst) (. hs fst)))
+                (Err (type-error-other pos
+                       (str-join ["the context constraint " (printer-pred printer c)
+                                  " is not smaller than the instance head"])))
+                (recur (+ i 1))))))))
+
+;; Whether some variable of `vars` occurs more often than in `head-vars` (or is not there).
+(defun too-many? :private (vars: (Map i64 i64) head-vars: (Map i64 i64)) -> bool
+  (not (every? (fn (v: i64) (<= (get-or vars v 0) (get-or head-vars v 0))) (keys vars))))
+
+;; Constructors plus variables, and the count of each variable, of ts added to n and vars.
+(defun size-all :private (ts: (Vec Ty) n: i64 vars: (Map i64 i64)) -> (Pair i64 (Map i64 i64))
+  (reduce (fn (acc: (Pair i64 (Map i64 i64)) t: Ty) (size-walk t (. acc fst) (. acc snd)))
+          (Pair n vars) ts))
+
+(defun size-walk :private (t: Ty n: i64 vars: (Map i64 i64)) -> (Pair i64 (Map i64 i64))
+  (let ((n1 (+ n 1)))
+    (match t
+      ((TGen i) (Pair n1 (assoc vars i (+ 1 (get-or vars i 0)))))
+      ((TCon _ args) (size-all args n1 vars))
+      ((TFn _ ps r) (let ((a (size-all ps n1 vars))) (size-walk r (. a fst) (. a snd))))
+      (_ (Pair n1 vars)))))

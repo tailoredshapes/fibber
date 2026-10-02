@@ -1,0 +1,125 @@
+;; compiler/tests/types/protos-support.fib: what the unit programs of the protocol and
+;; instance lowering (unit-protos, unit-impl-head, unit-supers) share: the lowering of one
+;; module as `lower::declare` and `lower::define` order their steps, for the steps of
+;; package P4 (types, protocols and impls declared form by form with the errors kept; the
+;; shapes resolved; then every protocol resolved, every impl declared and every declared
+;; impl's supertraits checked; the bodies of impls and of `defun`s are package P5's and
+;; are not lowered), and the lines the Rust tool prints for the `protocol`, `instance` and
+;; `error` sections, so that a program's output can be compared with
+;; `fibref types --stage lower --sections protocol,instance,error NAME.fib` (protos-cases/NAME.out).
+;;
+;; A NAME.out is the tool's output without its `== NAME.fib` line, with the instance numbers
+;; counted from the first instance of main (the tool's table starts with the builtin and
+;; prelude instances, which this world has not) and without the `  method` lines under an
+;; instance (the tool's `lower_impl` of package P5 fills those).
+(ns tests.types.protos-support
+  (:require [syntax.dump :as sdump])
+  (:use fib.string syntax.pos syntax.form syntax.reader types.ty types.error types.ast types.table
+        types.decls types.check types.lower.typeform types.lower.decl types.lower.impl-head
+        types.lower.supers types.lower.protos types.dump.protos tests.types.lower-support))
+
+(def pdir: str "compiler/tests/types/protos-cases/")
+
+;; What one top-level form declares.
+(defenum Item (IRaw raw: RawType) (IProto id: i64 form: Stx) (IImpl form: Stx) INone)
+
+;; Declared forms: the raw types, protocols and impls in order, and the errors.
+(defstruct Declared2 (raws: (Vec RawType) protos: (Vec (Pair i64 Stx)) impls: (Vec Stx) errors: (Vec TypeError)))
+
+;; A `defun`'s name is bound as a value (its row is not needed here).
+(defun declare-defun (g: Globals m: i64 f: Stx) -> (Result Item TypeError)
+  (let ((items (stx-items f))
+        (name (unwrap-or (if (> (count items) 1) (stx-as-sym (nth items 1)) nil) "")))
+    (match (define-value g m name (GFun (table-count (. g funs))) (. f pos))
+      ((Err e) (Err e))
+      ((Ok _) (Ok INone)))))
+
+(defun declare-form (g: Globals m: i64 f: Stx) -> (Result Item TypeError)
+  (match (head-of f)
+    ("defstruct" (try-let ((r (declare-struct g m f))) (Ok (IRaw r))))
+    ("defenum" (try-let ((r (declare-enum g m f))) (Ok (IRaw r))))
+    ("defprotocol" (try-let ((id (declare-proto g m f))) (Ok (IProto id f))))
+    ("impl" (Ok (IImpl f)))
+    ("defun" (declare-defun g m f))
+    (_ (Ok INone))))
+
+(defun declare-all (g: Globals m: i64 forms: (Vec Stx)) -> Declared2
+  (reduce (fn (d: Declared2 f: Stx)
+            (match (declare-form g m f)
+              ((Err e) (Declared2 (. d raws) (. d protos) (. d impls) (conj (. d errors) e)))
+              ((Ok (IRaw r)) (Declared2 (conj (. d raws) r) (. d protos) (. d impls) (. d errors)))
+              ((Ok (IProto id pf)) (Declared2 (. d raws) (conj (. d protos) (Pair id pf)) (. d impls) (. d errors)))
+              ((Ok (IImpl pf)) (Declared2 (. d raws) (. d protos) (conj (. d impls) pf) (. d errors)))
+              ((Ok (INone)) d)))
+          (Declared2 [] [] [] []) forms))
+
+;; The errors of `define` for the steps of P4: protocols resolved, impls declared, the
+;; supertraits of each declared impl checked.
+(defun define-all (g: Globals m: i64 d: Declared2) -> (Vec TypeError)
+  (let ((e1 (reduce (fn (es: (Vec TypeError) p: (Pair i64 Stx))
+                      (match (resolve-proto g m (. p fst) (. p snd)) ((Ok _) es) ((Err e) (conj es e))))
+                    (vec-empty) (. d protos)))
+        (r2 (reduce (fn (acc: (Pair (Vec TypeError) (Vec i64)) f: Stx)
+                      (match (declare-impl g m f)
+                        ((Ok x) (Pair (. acc fst) (conj (. acc snd) (. x fst))))
+                        ((Err e) (Pair (conj (. acc fst) e) (. acc snd)))))
+                    (Pair e1 (vec-empty)) (. d impls))))
+    (reduce (fn (es: (Vec TypeError) i: i64)
+              (match (check-impl-supers g i) ((Ok _) es) ((Err e) (conj es e))))
+            (. r2 fst) (. r2 snd))))
+
+;; The errors of lowering the forms of module m, in the tool's order.
+(defun lower-forms (g: Globals m: i64 forms: (Vec Stx)) -> (Vec TypeError)
+  (let ((d (declare-all g m forms))
+        (errs (into (. d errors) (resolve-all g m (. d raws)))))
+    (if (empty? errs) (define-all g m d) errs)))
+
+;; The lines of a program of one module: the errors, or the protocol and instance sections.
+(defun src-lines (src: str file: str) -> (Vec str)
+  (let ((g (world))
+        (m (g-add-module g "main" (Links [] [] []) (map-empty)))
+        (errs (lower-forms g m (forms-of src file))))
+    (if (empty? errs)
+        (instance-section (protocol-section [(str-join ["-- module main " file])] g m file) g m file)
+        (mapv (fn (e: TypeError) (error-line e file)) errs))))
+
+(defun case-lines (name: str) -> (Vec str)
+  (let ((file (str-join [name ".fib"])))
+    (src-lines (file-text (str-join [pdir file])) file)))
+
+;; One case of protos-cases/: the lines equal the tool's.
+(defun run-case (cs: Checks name: str) -> unit
+  (let ((got (case-lines name))
+        (want (lines-of (file-text (str-join [pdir name ".out"])))))
+    (if (= got want)
+        (check cs (str-join ["case " name " (" (show (count want)) " lines)"]) true)
+        (do (check cs (str-join ["case " name]) false)
+            (println (str-join ["  want " (join "\n        " want)]))
+            (println (str-join ["  got  " (join "\n        " got)]))))))
+
+(defun run-cases (cs: Checks names: (Vec str)) -> unit
+  (run! (fn (n: str) (run-case cs n)) names))
+
+;; The lowered world of the source `src` in module `main`: its globals and the errors.
+(defstruct Lowered (g: Globals errors: (Vec TypeError)))
+
+(defun lower-src (src: str) -> Lowered
+  (let ((g (world))
+        (m (g-add-module g "main" (Links [] [] []) (map-empty))))
+    (Lowered g (lower-forms g m (forms-of src "t")))))
+
+;; The error lines of a source, `LINE:COL MESSAGE` each (`kind` is `Resolve` unless said).
+(defun err-texts (src: str) -> (Vec str)
+  (mapv (fn (e: TypeError)
+          (str-join [(show (. (. e pos) line)) ":" (show (. (. e pos) col)) " " (. e message)
+                     (if (= (. e kind) Resolve) "" (str-join [" [" (error-kind-name (. e kind)) "]"]))]))
+        (. (lower-src src) errors)))
+
+;; `src` has exactly the error `want`.
+(defun expect-err (cs: Checks src: str want: str) -> unit
+  (let ((got (err-texts src)))
+    (if (= got [want])
+        (check cs (str-join [src " => " want]) true)
+        (do (check cs src false)
+            (println (str-join ["  want " want]))
+            (println (str-join ["  got  " (join " | " got)]))))))

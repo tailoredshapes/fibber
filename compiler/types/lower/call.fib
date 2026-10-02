@@ -1,27 +1,205 @@
 ;; compiler/types/lower/call.fib: calls and primitive forms (package P7).
-;; Replaces crates/fibref/src/types/lower/call.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/call.rs (269 lines of Rust).
+;;
+;; Lowering calls (syntax §2, §3.13): `&x` arguments, the builtins whose operands are special
+;; (`deref` and `set!`, whose operand may be an `&` parameter name; the variadic `concat`), the
+;; primitive forms whose operand is a field name, a protocol or a type (§4.3), and the
+;; `unsafe`-only names (§3.15).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the variants of `Special` carry the prefix `Sf` (`Sp` is the Space of types.decls).
+;; - `(Some(r) == builtin("set!"))` is `is-builtin`.
+;; - `arity` is the function `arity-error`: the first `?` of each branch returns its error.
 (ns types.lower.call
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.lower.scope))
+  (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.builtins types.lower.typeform types.lower.scope))
 
-;; Rust: lower/call.rs:47
+;; What a call's head names, when it matters for lowering.
+(defenum Special SfDeref SfSet SfConcat SfSetField SfDyn (SfConvert op: ConvOp))
+
+;; Whether `(dyn P :send e)`: the keyword right after the protocol.
+(defun dyn-send :private (items: (Vec Stx)) -> bool
+  (and (> (count items) 2) (stx-kw? (nth items 2) "send")))
+
+(defun conv-op :private (name: str) -> (Option ConvOp)
+  (cond ((= name "trunc") (some (CvIntToInt Trunc)))
+        ((= name "zext") (some (CvIntToInt Zext)))
+        ((= name "sext") (some (CvIntToInt Sext)))
+        ((or (= name "fptrunc") (= name "fpext")) (some CvFloatToFloat))
+        ((= name "fptosi") (some (CvFloatToInt true)))
+        ((= name "fptoui") (some (CvFloatToInt false)))
+        ((= name "sitofp") (some (CvIntToFloat true)))
+        ((= name "uitofp") (some (CvIntToFloat false)))
+        (else nil)))
+
+;; Rust: lower/call.rs:47 is_primitive_form: whether `name` is a primitive form (§4.3) not
+;; shadowed locally.
 (defun lw-is-primitive-form (lw: Lowerer name: str) -> bool
-  (trap "todo: lw-is-primitive-form"))
+  (and (or (= name "set-field!") (= name "dyn") (str-in conversions name))
+       (not (lw-is-local lw name))))
 
-;; Rust: lower/call.rs:53
+;; Rust: lower/call.rs:53 primitive_value: the error for a primitive form used as a value.
 (defun lw-primitive-value (lw: Lowerer name: str form: Stx) -> TypeError
-  (trap "todo: lw-primitive-value"))
+  (if (= name "set-field!")
+      (type-error AmpFunctionValue (. form pos) "function with & parameters is not a value")
+      (type-error-resolve (. form pos) (str-join [name " is a primitive form, not a value"]))))
 
-;; Rust: lower/call.rs:65
+;; Rust: lower/call.rs:65 check_unsafe: rejects an `unsafe`-only name outside `unsafe` (§3.15).
 (defun lw-check-unsafe (lw: Lowerer r: GlobalRef name: str form: Stx) -> (Result unit TypeError)
-  (trap "todo: lw-check-unsafe"))
+  (let ((only (match r
+                ((GExtern _) true)
+                ((GBuiltin b) (and (< b (count (builtin-table))) (. (nth (builtin-table) b) unsafe-only)))
+                (_ false))))
+    (if (and only (= @(. lw unsafe-depth) 0))
+        (Err (type-error-other (. form pos) (str-join [name " may only be used inside unsafe"])))
+        (Ok ()))))
 
-;; Rust: lower/call.rs:106 call
+;; Whether `r` is the builtin `name`.
+(defun is-builtin :private (r: GlobalRef name: str) -> bool
+  (match (builtin-index name)
+    ((some i) (= r (GBuiltin i)))
+    (nil false)))
+
+;; Rust: lower/call.rs:78 special
+(defun special :private (lw: Lowerer name: str) -> (Option Special)
+  (cond ((lw-is-primitive-form lw name)
+         (cond ((= name "set-field!") (some SfSetField))
+               ((= name "dyn") (some SfDyn))
+               (else (match (conv-op name) ((some op) (some (SfConvert op))) (nil nil)))))
+        ((lw-is-local lw name) nil)
+        (else
+         (match (g-value (. lw g) (. lw m) name)
+           (nil nil)
+           ((some r)
+            (cond ((is-builtin r "set!") (some SfSet))
+                  ((is-builtin r "concat") (some SfConcat))
+                  (else (match r
+                          ((GMethod p i) (if (and (= i 0) (= (some p) @(. (. lw g) deref-proto))) (some SfDeref) nil))
+                          (_ nil)))))))))
+
+;; Rust: lower/call.rs:106 call: a list form that is not a core form.
 (defun lw-call (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
-  (trap "todo: lw-call"))
+  (match (match (stx-as-sym (nth items 0)) ((some name) (special lw name)) (nil nil))
+    ((some s) (special-call lw s items form))
+    (nil
+     (try-let ((head (lw-sub-expr lw (nth items 0) false))
+               (args (call-args lw items)))
+       (Ok (lw-mk lw (. form pos) (ECall head args)))))))
 
-;; Rust: lower/call.rs:261
+(defun call-args :private (lw: Lowerer items: (Vec Stx)) -> (Result (Vec Arg) TypeError)
+  (loop ((i 1) (args (vec-empty)))
+    (if (>= i (count items))
+        (Ok args)
+        (match (call-arg lw (nth items i))
+          ((Ok a) (recur (+ i 1) (conj args a)))
+          ((Err e) (Err e))))))
+
+;; One argument: `(& x)` or an expression.
+(defun call-arg :private (lw: Lowerer a: Stx) -> (Result Arg TypeError)
+  (match (amp-operand a)
+    ((some x) (try-let ((b (amp-variable lw x a))) (Ok (ArgAmp b (. a pos)))))
+    (nil (try-let ((e (lw-sub-expr lw a false))) (Ok (ArgExpr e))))))
+
+;; The variable of an `&x` argument: a local binding (§2.14).
+(defun amp-variable :private (lw: Lowerer x: str a: Stx) -> (Result i64 TypeError)
+  (match (lw-lookup lw x)
+    ((some b) (Ok b))
+    (nil
+     (match (g-value (. lw g) (. lw m) x)
+       ((some _) (Err (type-error AmpArgument (. a pos) "& argument must be a cell variable")))
+       (nil (Err (type-error-resolve (. a pos) (g-unknown (. lw g) (. lw m) SpValue x "unbound name"))))))))
+
+;; The target of `deref`/`set!`: an `&` parameter's name or an expression.
+(defun place :private (lw: Lowerer f: Stx) -> (Result Place TypeError)
+  (match (match (stx-as-sym f) ((some name) (lookup-amp lw name)) (nil nil))
+    ((some b) (Ok (PlAmp b)))
+    (nil (try-let ((e (lw-sub-expr lw f false))) (Ok (PlExpr e))))))
+
+(defun lookup-amp :private (lw: Lowerer name: str) -> (Option i64)
+  (if (lw-is-local lw name)
+      (match (lw-lookup lw name)
+        ((some b) (if (= (lw-kind lw b) BkAmpParam) (some b) nil))
+        (nil nil))
+      nil))
+
+;; `{name} takes {n} operand(s), got {k}` unless `items` has n operands.
+(defun arity :private (items: (Vec Stx) pos: Pos n: i64) -> (Result unit TypeError)
+  (if (= (count items) (+ n 1))
+      (Ok ())
+      (Err (type-error-other pos (str-join [(unwrap-or (stx-as-sym (nth items 0)) "") " takes " (show n)
+                                            " operand(s), got " (show (- (count items) 1))])))))
+
+;; Rust: lower/call.rs:164 special_call
+(defun special-call :private (lw: Lowerer s: Special items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (try-let ((k (special-kind lw s items (. form pos))))
+    (Ok (lw-mk lw (. form pos) k))))
+
+(defun special-kind :private (lw: Lowerer s: Special items: (Vec Stx) pos: Pos) -> (Result ExprKind TypeError)
+  (match s
+    ((SfDeref)
+     (try-let ((_ (arity items pos 1))
+               (p (place lw (nth items 1))))
+       (Ok (EDeref p (stx-show (nth items 1))))))
+    ((SfSet)
+     (try-let ((_ (arity items pos 2))
+               (target (place lw (nth items 1)))
+               (value (lw-sub-expr lw (nth items 2) false)))
+       (Ok (ESet target value))))
+    ((SfConcat)
+     (try-let ((es (concat-operands lw items)))
+       (Ok (EConcat es))))
+    ((SfSetField)
+     (try-let ((_ (arity items pos 3)))
+       (set-field lw items)))
+    ((SfDyn)
+     (let ((send (dyn-send items)))
+       (try-let ((_ (arity items pos (if send 3 2)))
+                 (pd (proto-ref (. lw g) (. lw m) (nth items 1) false))
+                 (e (lw-sub-expr lw (nth items (- (count items) 1)) false)))
+         (Ok (EDyn (. pd fst) (. pd snd) send e)))))
+    ((SfConvert op)
+     (try-let ((_ (arity items pos 2)))
+       (convert lw op items)))))
+
+(defun concat-operands :private (lw: Lowerer items: (Vec Stx)) -> (Result (Vec Expr) TypeError)
+  (loop ((i 1) (es (vec-empty)))
+    (if (>= i (count items))
+        (Ok es)
+        (match (lw-sub-expr lw (nth items i) false)
+          ((Ok e) (recur (+ i 1) (conj es e)))
+          ((Err e) (Err e))))))
+
+;; `(set-field! &x f e)` (§2.13).
+(defun set-field :private (lw: Lowerer items: (Vec Stx)) -> (Result ExprKind TypeError)
+  (match (amp-operand (nth items 1))
+    (nil (Err (type-error AmpArgument (. (nth items 1) pos) "& argument must be a cell variable")))
+    ((some x)
+     (try-let ((b (amp-variable lw x (nth items 1))))
+       (match (stx-as-sym (nth items 2))
+         (nil (Err (type-error-resolve (. (nth items 2) pos) "a field name is a symbol")))
+         ((some field)
+          (try-let ((value (lw-sub-expr lw (nth items 3) false)))
+            (Ok (ESetField b field value)))))))))
+
+;; A conversion `(op T e)` (§2.12).
+(defun convert :private (lw: Lowerer op: ConvOp items: (Vec Stx)) -> (Result ExprKind TypeError)
+  (try-let ((ann (type-ann (. lw g) (. lw m) (nth items 1) false)))
+    (match ann
+      ((AScalar target)
+       (let ((wants-int (match op ((CvIntToInt _) true) ((CvFloatToInt _) true) (_ false))))
+         (if (if wants-int (scalar-is-int target) (scalar-is-float target))
+             (try-let ((e (lw-sub-expr lw (nth items 2) false)))
+               (Ok (EConvert op target e)))
+             (Err (type-error-other (. (nth items 1) pos)
+                                    (str-join [(unwrap-or (stx-as-sym (nth items 0)) "") " cannot convert to "
+                                               (scalar-name target)]))))))
+      (_ (Err (type-error-other (. (nth items 1) pos) "a conversion's target is a scalar type"))))))
+
+;; Rust: lower/call.rs:261 amp_operand: `x` when `form` is `(& x)`.
 (defun amp-operand (form: Stx) -> (Option str)
-  (trap "todo: amp-operand"))
+  (match (. form kind)
+    ((SList items)
+     (if (and (= (count items) 2) (= (stx-as-sym (nth items 0)) (some "&")))
+         (stx-as-sym (nth items 1))
+         nil))
+    (_ nil)))

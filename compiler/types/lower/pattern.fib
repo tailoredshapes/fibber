@@ -1,15 +1,184 @@
 ;; compiler/types/lower/pattern.fib: patterns (package P7).
-;; Replaces crates/fibref/src/types/lower/pattern.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/pattern.rs (207 lines of Rust).
+;;
+;; `_`, a variable, a literal, `nil`, `(some p)`, `(Variant p..)`, `(Struct p..)`, `[p.. & r]`,
+;; `(p :as x)` (syntax §3.6). A variable may occur once per pattern; a `let` pattern may be
+;; refutable (§3.3).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `names: &mut Vec<String>` is a `(Cell (Vec str))`.
+;; - `let_pattern` returns the pattern and whether it is refutable as a `Pair`.
+;; - `collect::<TResult<Vec<_>>>` is a loop that stops at the first error.
 (ns types.lower.pattern
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.lower.scope))
+  (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.lower.typeform types.lower.scope))
 
-;; Rust: lower/pattern.rs:19 pattern
+(defun resolve-err :private (pos: Pos msg: str) -> (Result a TypeError)
+  (Err (type-error-resolve pos msg)))
+
+(defun nil-form? :private (f: Stx) -> bool
+  (match (. f kind) ((SNil) true) (_ false)))
+
+(defun no-pattern :private (form: Stx) -> (Result a TypeError)
+  (resolve-err (. form pos) (str-join [(stx-show form) " is not a pattern"])))
+
+;; Rust: lower/pattern.rs:19 pattern: lowers `form`, binding its variables with `kind`;
+;; `names` holds the names bound so far by the enclosing form.
 (defun lower-pattern (lw: Lowerer form: Stx kind: BindingKind names: (Cell (Vec str))) -> (Result Pattern TypeError)
-  (trap "todo: lower-pattern"))
+  (match (literal form)
+    ((some l) (Ok (Pattern (. form pos) (PLit l))))
+    (nil
+     (try-let ((k (pat-kind lw form kind names)))
+       (Ok (Pattern (. form pos) k))))))
 
-;; Rust: lower/pattern.rs:146 let_pattern
-(defun lower-let-pattern (lw: Lowerer form: Stx names: (Cell (Vec str))) -> (Result Pattern TypeError)
-  (trap "todo: lower-let-pattern"))
+(defun pat-kind :private (lw: Lowerer form: Stx kind: BindingKind names: (Cell (Vec str))) -> (Result PatKind TypeError)
+  (match (. form kind)
+    ((SSym s)
+     (if (= s "_")
+         (Ok PWild)
+         (try-let ((b (bind-once lw s kind form names))) (Ok (PBind b)))))
+    ((SNil) (Ok (PCtor @(. (. lw g) option) (some 0) [])))
+    ((SList items) (list-pattern lw items form kind names))
+    ((SVec items) (vec-pattern lw items kind names))
+    (_ (no-pattern form))))
+
+(defun bind-once :private (lw: Lowerer name: str kind: BindingKind form: Stx names: (Cell (Vec str))) -> (Result i64 TypeError)
+  (if (str-in @names name)
+      (resolve-err (. form pos) (str-join [name " is bound twice in one pattern"]))
+      (do (set! names (conj @names name))
+          (Ok (lw-bind lw name kind (. form pos))))))
+
+;; The patterns of items from index `from`, the first error ending the list.
+(defun sub-patterns :private (lw: Lowerer items: (Vec Stx) from: i64 kind: BindingKind names: (Cell (Vec str))) -> (Result (Vec Pattern) TypeError)
+  (loop ((i from) (subs (vec-empty)))
+    (if (>= i (count items))
+        (Ok subs)
+        (match (lower-pattern lw (nth items i) kind names)
+          ((Ok p) (recur (+ i 1) (conj subs p)))
+          ((Err e) (Err e))))))
+
+(defun list-pattern :private (lw: Lowerer items: (Vec Stx) form: Stx kind: BindingKind names: (Cell (Vec str))) -> (Result PatKind TypeError)
+  (cond ((and (= (count items) 3) (stx-kw? (nth items 1) "as"))
+         (match (stx-as-sym (nth items 2))
+           (nil (resolve-err (. (nth items 2) pos) ":as binds a symbol"))
+           ((some xn)
+            (try-let ((inner (lower-pattern lw (nth items 0) kind names))
+                      (b (bind-once lw xn kind (nth items 2) names)))
+              (Ok (PAs inner b))))))
+        ((and (= (count items) 1) (nil-form? (nth items 0)))
+         (Ok (PCtor @(. (. lw g) option) (some 0) [])))
+        (else
+         (match (stx-as-sym (nth items 0))
+           (nil (no-pattern form))
+           ((some head) (ctor-pattern lw items form head kind names))))))
+
+;; The number of fields of the constructor `id` `variant`.
+(defun ctor-arity :private (lw: Lowerer id: i64 variant: (Option i64)) -> i64
+  (match (. (g-ty (. lw g) id) shape)
+    ((TsStruct fs) (match variant (nil (count fs)) (_ 0)))
+    ((TsEnum vs) (match variant
+                   ((some i) (if (< i (count vs)) (count (. (nth vs i) fields)) 0))
+                   (nil 0)))))
+
+(defun ctor-pattern :private (lw: Lowerer items: (Vec Stx) form: Stx head: str kind: BindingKind names: (Cell (Vec str))) -> (Result PatKind TypeError)
+  (match (g-value (. lw g) (. lw m) head)
+    ((some (GCtor id variant))
+     (let ((arity (ctor-arity lw id variant)))
+       (if (= arity (- (count items) 1))
+           (try-let ((subs (sub-patterns lw items 1 kind names)))
+             (Ok (PCtor id variant subs)))
+           (resolve-err (. form pos)
+                        (str-join [head " has " (show arity) " field(s), the pattern has "
+                                   (show (- (count items) 1))])))))
+    (_ (resolve-err (. (nth items 0) pos) (not-a-ctor lw head)))))
+
+;; `[p.. & r]` (§3.6): the elements, then `&` and one symbol or `_`.
+(defun vec-pattern :private (lw: Lowerer items: (Vec Stx) kind: BindingKind names: (Cell (Vec str))) -> (Result PatKind TypeError)
+  (let ((amp (amp-index items))
+        (elems (vec (take amp items)))
+        (tail (vec (drop amp items))))
+    (try-let ((subs (vec-elems lw elems kind names))
+              (rest (vec-rest lw tail kind names)))
+      (Ok (PVec subs rest)))))
+
+;; The index of the first symbol `&` of items, or their count.
+(defun amp-index :private (items: (Vec Stx)) -> i64
+  (loop ((i 0))
+    (cond ((>= i (count items)) i)
+          ((= (stx-as-sym (nth items i)) (some "&")) i)
+          (else (recur (+ i 1))))))
+
+;; The elements before the `&`: `(& r)` reads as `&r`, an error reported before the element
+;; is lowered; the first error ends the list.
+(defun elem-check :private (p: Stx) -> (Result unit TypeError)
+  (let ((parts (stx-items p)))
+    (if (and (= (count parts) 2) (= (stx-as-sym (nth parts 0)) (some "&")))
+        (resolve-err (. p pos) "&r reads as (& r); write & r, with a space, in a vector pattern")
+        (Ok ()))))
+
+;; The elements of a vector pattern, each checked by `elem-check` and lowered in turn.
+(defun vec-elems :private (lw: Lowerer elems: (Vec Stx) kind: BindingKind names: (Cell (Vec str))) -> (Result (Vec Pattern) TypeError)
+  (loop ((i 0) (subs (vec-empty)))
+    (if (>= i (count elems))
+        (Ok subs)
+        (match (elem-check (nth elems i))
+          ((Err e) (Err e))
+          ((Ok _)
+           (match (lower-pattern lw (nth elems i) kind names)
+             ((Ok p) (recur (+ i 1) (conj subs p)))
+             ((Err e) (Err e))))))))
+
+(defun bad-rest :private (at: Stx) -> (Result a TypeError)
+  (resolve-err (. at pos) "& in a vector pattern is followed by one symbol or _"))
+
+(defun vec-rest :private (lw: Lowerer tail: (Vec Stx) kind: BindingKind names: (Cell (Vec str))) -> (Result Rest TypeError)
+  (cond ((empty? tail) (Ok RestExact))
+        ((= (count tail) 2)
+         (let ((r (nth tail 1)))
+           (match (stx-as-sym r)
+             ((some "_") (Ok RestIgnore))
+             ((some n) (if (= n "&") (bad-rest r) (try-let ((b (bind-once lw n kind r names))) (Ok (RestBind b)))))
+             (nil (bad-rest r)))))
+        (else (bad-rest (nth tail 0)))))
+
+;; Rust: lower/pattern.rs:149 let_pattern: the pattern of a `let` or `loop` binding (§3.3,
+;; stdlib §7 L8): a vector pattern in binding position takes a prefix, so `[a b]` is
+;; `[a b & _]` at every depth; and whether the result is refutable.
+(defun lower-let-pattern (lw: Lowerer form: Stx names: (Cell (Vec str))) -> (Result (Pair Pattern bool) TypeError)
+  (try-let ((p0 (lower-pattern lw form BkLet names)))
+    (let ((p (prefix-pat p0)))
+      (Ok (Pair p (not (irrefutable lw p)))))))
+
+;; `p` with every exact vector pattern in it open at the end.
+(defun prefix-pat :private (p: Pattern) -> Pattern
+  (Pattern (. p pos)
+           (match (. p kind)
+             ((PVec subs rest) (PVec (mapv (fn (s: Pattern) (prefix-pat s)) subs)
+                                     (if (= rest RestExact) RestIgnore rest)))
+             ((PCtor id v subs) (PCtor id v (mapv (fn (s: Pattern) (prefix-pat s)) subs)))
+             ((PAs inner b) (PAs (prefix-pat inner) b))
+             (other other))))
+
+(defun irrefutable :private (lw: Lowerer p: Pattern) -> bool
+  (match (. p kind)
+    ((PWild) true)
+    ((PBind _) true)
+    ((PLit l) (match l ((LitUnit) true) (_ false)))
+    ((PAs inner _) (irrefutable lw inner))
+    ((PVec subs rest) (and (empty? subs) (not (= rest RestExact))))
+    ((PCtor id variant subs)
+     (and (match (. (g-ty (. lw g) id) shape)
+            ((TsStruct _) (match variant (nil true) (_ false)))
+            ((TsEnum vs) (match variant ((some _) (= (count vs) 1)) (nil false))))
+          (every? (fn (s: Pattern) (irrefutable lw s)) subs)))))
+
+;; `V is not a variant or struct`, `V is private to m` when a private definition of
+;; another module has the name, or `V is exported by both a and b` when two `:use`d
+;; modules export it (syntax §5).
+(defun not-a-ctor :private (lw: Lowerer head: str) -> str
+  (let ((g (. lw g)) (m (. lw m)))
+    (match (g-private-owner g m SpValue head)
+      ((some _) (g-unknown g m SpValue head ""))
+      (nil (match (g-ambiguity g m SpValue head)
+             ((some _) (g-unknown g m SpValue head ""))
+             (nil (str-join [head " is not a variant or struct"])))))))

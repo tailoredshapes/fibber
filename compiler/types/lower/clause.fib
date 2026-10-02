@@ -1,11 +1,41 @@
 ;; compiler/types/lower/clause.fib: match clauses (package P7).
-;; Replaces crates/fibref/src/types/lower/clause.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/clause.rs (63 lines of Rust).
+;;
+;; Lowering `match` (syntax §3.6): the scrutinee, then each clause `(pat body+)` or
+;; `(pat :when guard body+)`. A clause's pattern variables are in scope in its guard and its
+;; body; the guard is never in tail position, the body is when the `match` is.
 (ns types.lower.clause
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.lower.scope))
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.lower.typeform types.lower.scope types.lower.pattern))
 
 ;; Rust: lower/clause.rs:18 match_form
 (defun lw-match-form (lw: Lowerer items: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
-  (trap "todo: lw-match-form"))
+  (if (< (count items) 3)
+      (Err (type-error-resolve (. form pos) "match needs a scrutinee and clauses"))
+      (try-let ((scrut (lw-sub-expr lw (nth items 1) false)))
+        (loop ((i 2) (clauses (vec-empty)))
+          (if (>= i (count items))
+              (Ok (lw-mk lw (. form pos) (EMatch scrut clauses)))
+              (let ((mark (lw-mark lw))
+                    (lowered (lw-clause lw (nth items i) tail)))
+                (do (lw-reset lw mark)
+                    (match lowered
+                      ((Ok c) (recur (+ i 1) (conj clauses c)))
+                      ((Err e) (Err e))))))))))
+
+;; Rust: lower/clause.rs:36 clause
+(defun lw-clause :private (lw: Lowerer clause: Stx tail: bool) -> (Result Clause TypeError)
+  (let ((parts (stx-items clause))
+        (resolve (fn (msg: str) (Err (type-error-resolve (. clause pos) msg)))))
+    (cond ((< (count parts) 2) (resolve "a clause is (pattern body+)"))
+          ((and (stx-kw? (nth parts 1) "when") (< (count parts) 4))
+           (resolve "a guarded clause is (pattern :when guard body+)"))
+          (else
+           (try-let ((pat (lower-pattern lw (nth parts 0) BkPattern (cell (vec-empty))))
+                     (guard (if (stx-kw? (nth parts 1) "when")
+                                (try-let ((g (lw-sub-expr lw (nth parts 2) false))) (Ok (some g)))
+                                (Ok nil)))
+                     (body (lw-body lw (vec (drop (if (stx-kw? (nth parts 1) "when") 3 1) parts))
+                                    (. clause pos) tail)))
+             ;; Rust's Clause also says `fallback: false` here
+             (Ok (Clause pat guard body)))))))

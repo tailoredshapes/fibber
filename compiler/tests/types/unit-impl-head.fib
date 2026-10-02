@@ -1,0 +1,105 @@
+;; compiler/tests/types/unit-impl-head.fib: instance heads (types.lower.impl-head). Three kinds
+;; of check:
+;; - the cases of protos-cases/ whose point is a head (a variable, repeated variables, a
+;;   constructor argument that is no variable, colour variables and written colours): the lines
+;;   or errors the tool prints (see protos-support.fib);
+;; - the inline test of impl_head.rs, `HeadEnv` reads a colour variable only at a colour
+;;   parameter, over the five methods of `AnnEnv`;
+;; - `colour-vars`, `body-args` and `fixed-colours` on the instances lowering makes, with the
+;;   values the code of impl_head.rs gives (the tool prints none of them).
+;; Run from the repository root.
+;; Build: fibc build compiler/tests/types/unit-impl-head.fib -I compiler -I lib -o OUT
+(ns main (:use fib.string syntax.pos syntax.form types.ty types.scheme types.error types.ast
+               types.table types.decls types.check types.annot types.lower.typeform
+               types.lower.impl-head tests.types.lower-support tests.types.protos-support))
+
+(def case-names: (Vec str)
+  ["impl-head-var" "impl-head-dup" "impl-head-nonvar" "impl-head-fn" "impl-head-dyn"
+   "impl-head-notype" "impl-head-unknown" "impl-head-colour-dup" "impl-head-colour-var-as-ty"
+   "impl-head-colour-in-where" "impl-head-ty-as-colour" "impl-head-colour-at-type"
+   "impl-colour" "impl-colour-var" "impl-basic"])
+
+;; the inline test of impl_head.rs
+(defun head-env (cs: Checks) -> unit
+  (let ((env (HeadEnv ["a" "k"] [false true])))
+    (do (check cs "var a is TGen 0" (match (ann-var env "a" p0) ((Ok t) (= t (TGen 0))) (_ false)))
+        (check cs "var k (a colour variable) is an error" (match (ann-var env "k" p0) ((Err _) true) (_ false)))
+        (check cs "colour-param-arg k is TGen 1"
+               (match (ann-colour-param-arg env "k" p0) ((some (Ok t)) (= t (TGen 1))) (_ false)))
+        (check cs "colour-param-arg a is an error"
+               (match (ann-colour-param-arg env "a" p0) ((some (Err _)) true) (_ false)))
+        (check cs "named-colour k is an error" (match (ann-named-colour env "k" p0) ((Err _) true) (_ false)))
+        ;; beyond the test: the messages, the unknown name, the colour of an omitted fn colour
+        (check cs "var k: message"
+               (match (ann-var env "k" p0)
+                 ((Err e) (and (= (. e message) "k is a colour parameter of the impl head, not a type") (= (. e kind) Resolve)))
+                 (_ false)))
+        (check cs "var z: message"
+               (match (ann-var env "z" p0)
+                 ((Err e) (= (. e message) "type variable z is not a parameter of the impl head"))
+                 (_ false)))
+        (check cs "colour-param-arg a: message"
+               (match (ann-colour-param-arg env "a" p0)
+                 ((some (Err e)) (= (. e message) "a is not a colour variable of the impl head"))
+                 (_ false)))
+        (check cs "colour-param-arg z: message"
+               (match (ann-colour-param-arg env "z" p0)
+                 ((some (Err e)) (= (. e message) "z is not a colour variable of the impl head"))
+                 (_ false)))
+        (check cs "named-colour: message"
+               (match (ann-named-colour env "k" p0)
+                 ((Err e) (= (. e message) "k may be used here only as the argument of a colour parameter"))
+                 (_ false)))
+        (check cs "an omitted colour is local" (= (ann-colour env) CLocal))
+        (check cs "no Self" (match (ann-self-ty env p0) ((Err _) true) (_ false))))))
+
+(def head-src: str "(defstruct (Cap k :colour a) (f: (fn k (a) a)))
+(defstruct (Hook k :colour) (f: (fn k (i64) i64) tag: i64))
+(defstruct (Two2 a b) (x: a y: b))
+(defprotocol Plain (plain (self) -> i64))
+")
+
+;; the instance `i` of the source's lowering
+(defun inst-of (src: str i: i64) -> InstanceDef
+  (table-get (. (. (lower-src (str-join [head-src src])) g) instances) i))
+
+(defun derived (cs: Checks) -> unit
+  (let ((l (lower-src (str-join [head-src "(impl Plain (Cap k a) (plain (self) 1))"])))
+        (g (. l g))
+        (i0 (table-get (. g instances) 0)))
+    (do (check cs "no errors" (empty? (. l errors)))
+        (check cs "colour-vars (Cap k a) = [k a]" (= (colour-vars g i0) [true false]))
+        (check cs "body-args (Cap k a): the rigid colour, the rigid variable"
+               (= (body-args g i0) [(ty-colour-arg (CRigid 0)) (TRigid 1)]))
+        (check cs "fixed-colours (Cap k a) = none, none" (= (fixed-colours g (. i0 head)) [nil nil]))
+        (check cs "head: TGen 0, TGen 1" (= (. i0 head) (TCon (KNominal 0) [(TGen 0) (TGen 1)])))
+        (check cs "variables" (= (. i0 var-names) ["k" "a"])))))
+
+(defun written (cs: Checks) -> unit
+  (let ((l (lower-src (str-join [head-src "(impl Plain (Cap :local a) (plain (self) 1))\n(impl Plain (Hook :send) (plain (self) 2))\n(impl Plain i64 (plain (self) 3))\n(impl Plain (Two2 a b) (plain (self) 4))"])))
+        (g (. l g)))
+    (if (not (empty? (. l errors)))
+        (check cs "written colours lower" false)
+        (let ((i (fn (n: i64) (table-get (. g instances) n))))
+          (do (check cs "(Cap :local a): the head holds the colour argument"
+                     (= (. (i 0) head) (TCon (KNominal 0) [(ty-colour-arg CLocal) (TGen 0)])))
+              (check cs "(Cap :local a): colour-vars = [a is no colour]" (= (colour-vars g (i 0)) [false]))
+              (check cs "(Cap :local a): body-args = [rigid a]" (= (body-args g (i 0)) [(TRigid 0)]))
+              (check cs "(Cap :local a): fixed-colours = [local, none]"
+                     (= (fixed-colours g (. (i 0) head)) [(some CLocal) nil]))
+              (check cs "(Hook :send): no variables, fixed send"
+                     (and (= (colour-vars g (i 1)) []) (= (body-args g (i 1)) [])
+                          (= (fixed-colours g (. (i 1) head)) [(some CSend)])))
+              (check cs "i64: nothing" (and (= (colour-vars g (i 2)) []) (= (fixed-colours g (. (i 2) head)) [])))
+              (check cs "(Two2 a b): two type variables"
+                     (and (= (colour-vars g (i 3)) [false false]) (= (body-args g (i 3)) [(TRigid 0) (TRigid 1)])
+                          (= (fixed-colours g (. (i 3) head)) [nil nil])))
+              (check cs "var-index" (and (= (var-index ["a" "b" "c"] "c") (some 2)) (not (some? (var-index ["a"] "z"))))))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (run-cases cs case-names)
+        (head-env cs)
+        (derived cs)
+        (written cs)
+        (finish cs))))

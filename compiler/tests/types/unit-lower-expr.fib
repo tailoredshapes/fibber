@@ -1,0 +1,33 @@
+;; compiler/tests/types/unit-lower-expr.fib: the lowering of bodies (types.lower.scope, .pattern,
+;; .bindings, .clause, .call, .expr; package P7). Every case of lower-body-cases/ is a program with
+;; a `defun f`: its body is lowered as `lower_defun` lowers it and the `ast fun f` section, or the
+;; error, printed as the Rust tool prints it (NAME.out: `fibref types --stage lower --ast
+;; --sections ast,error`, ids relative to the first of `f`, made by lower-body-gen.py), compared
+;; line by line. Run from the repository root.
+;; Build: fibc build compiler/tests/types/unit-lower-expr.fib -I compiler -I lib -o OUT
+(ns main (:use fib.string syntax.pos types.check tests.types.lower-support tests.types.lower-body-support))
+
+(def case-names: (Vec str)
+  ["amp" "async" "async-empty" "atoms" "body-many" "concat" "convert" "do-empty" "do-one" "dyn"
+   "field" "fn" "fn-captures" "if" "let" "let-nested" "loop" "loop-ann" "match" "match-as-lit"
+   "match-enum" "match-struct" "match-vec" "quote" "set-field" "unsafe" "var" "err-amp-expr"
+   "err-amp-value" "err-await" "err-await-arity" "err-bound-twice" "err-conv-arity"
+   "err-conv-form" "err-conv-target" "err-ctor" "err-ctor-arity" "err-deref-arity"
+   "err-fn-body" "err-fn-param-form" "err-fn-params" "err-fn-repeat" "err-if" "err-let-annot"
+   "err-let-body" "err-let-shape" "err-prim-value" "err-quote" "err-recur-outside"
+   "err-recur-tail" "err-set-field" "err-unbound" "err-underscore" "err-unsafe"
+   "err-vec-amp-pair" "err-vec-rest"])
+
+(defun case (cs: Checks name: str) -> unit
+  (let ((got (case-lines name))
+        (want (lines-of (file-text (str-join [body-dir name ".out"])))))
+    (if (= got want)
+        (check cs (str-join ["case " name " (" (show (count want)) " lines)"]) true)
+        (do (check cs (str-join ["case " name]) false)
+            (println (str-join ["  want: " (join "\n        " want)]))
+            (println (str-join ["  got:  " (join "\n        " got)]))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (run! (fn (n: str) (case cs n)) case-names)
+        (finish cs))))

@@ -1,27 +1,203 @@
 ;; compiler/types/lower/supers.fib: protocol superclasses and their entailment (package P4).
-;; Replaces crates/fibref/src/types/lower/supers.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/supers.rs (229 lines of Rust).
+;;
+;; Supertraits (types §4.1, owner's decision of 2026-09-28): the `:requires` list of a
+;; protocol, the constraints a given entails through it, and the check that an `impl` has
+;; its supertraits' impls with contexts its own context entails.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `collect::<TResult<Vec<_>>>()` is `try-collect` (public: protos uses it): the first
+;;   Err ends it. It takes the conversion as a function parameter; the loop does not
+;;   recurse through the closure, so `:borrow` is enough.
+;; - `owner` (the text `impl P for T`) is a Pair of the protocol's name and the head text,
+;;   so that the messages that replace `impl ` by `impl of ` (`replacen`) and that take the
+;;   part after ` for ` (`split`) need no string surgery.
+;; - `g.protos[id].supers = supers` is `table-set` of the rebuilt `ProtoDef`.
+;; - the `while let Some(Pred::Proto(..)) = work.pop()` of `super_closure` is a `loop` over
+;;   the work list `peek`ed at its end; a work item that is not a protocol predicate ends
+;;   it as in Rust.
 (ns types.lower.supers
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.display types.annot
+        types.lower.typeform types.lower.impl-head))
 
-;; Rust: lower/supers.rs:18
+;; The `Ok` values of f over xs in order, or the first `Err`.
+(defun try-collect (xs: (Vec a) f: (fn (a) (Result b TypeError)) :borrow) -> (Result (Vec b) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count xs))
+        (Ok out)
+        (match (f (nth xs i))
+          ((Ok v) (recur (+ i 1) (conj out v)))
+          ((Err e) (Err e))))))
+
+;; Where a `defprotocol`'s methods start: after `Name`, and after `:requires (..)`
+;; when present.
 (defun methods-start (items: (Vec Stx)) -> i64
-  (trap "todo: methods-start"))
+  (if (and (> (count items) 2) (stx-kw? (nth items 2) "requires")) 4 2))
 
-;; Rust: lower/supers.rs:81
+;; The protocol's own parameters as `TGen i`, `Self` as `TGen 0`; nothing else may occur
+;; in a supertrait.
+(defstruct SuperEnv :private (params: (Vec str)))
+
+(impl AnnEnv SuperEnv
+  (ann-var (self name pos)
+    (match (var-index (. self params) name)
+      ((some i) (Ok (TGen i)))
+      (nil (Err (type-error-resolve pos (str-join ["a supertrait may mention only the protocol's parameters, not " name]))))))
+  (ann-self-ty (self pos) (Ok (TGen 0)))
+  (ann-colour (self) CLocal))
+
+;; One entry of `:requires`: `Q` for `(Q Self)`, or `(Q s t..)`.
+(defun super-pred :private (g: Globals m: i64 params: (Vec str) f: Stx) -> (Result Pred TypeError)
+  (let ((items (stx-items f))
+        (sym (stx-as-sym f))
+        (name (unwrap-or (if (some? sym) sym (if (empty? items) nil (stx-as-sym (nth items 0)))) "")))
+    (if-some [q (g-proto-name g m name)]
+      (let ((want (count (. (g-proto g q) params))))
+        (try-let ((args (if (some? sym)
+                            (Ok [(TGen 0)])
+                            (let ((env (SuperEnv params)))
+                              (try-collect (vec (drop 1 items))
+                                (fn (t: Stx)
+                                  (try-let ((ann (type-ann g m t true)))
+                                    (ann-to-ty ann env (. t pos)))))))))
+          (if (and (= (count args) want) (= (nth args 0) (TGen 0)))
+              (Ok (PProto q args))
+              (Err (type-error-resolve (. f pos)
+                     (str-join ["a supertrait is " name " or (" name " s ..) with " (show want)
+                                " type(s), the first the protocol's own dispatch parameter"]))))))
+      (Err (type-error-resolve (. f pos) (g-unknown g m SpProto name "unknown protocol"))))))
+
+;; The protocol's own predicate `(P a b ..)` over its parameters.
+(defun own-pred :private (id: i64 n: i64) -> Pred
+  (PProto id (mapv (fn (i: i64) (TGen i)) (range n))))
+
+;; Reads `:requires` of protocol `id` and records its supertraits; one that reaches the
+;; protocol again is an error.
 (defun resolve-supers (g: Globals m: i64 id: i64 form: Stx) -> (Result unit TypeError)
-  (trap "todo: resolve-supers"))
+  (let ((items (stx-items form)))
+    (if (= (methods-start items) 2)
+        (Ok ())
+        (match (if (> (count items) 3) (stx-as-list (nth items 3)) nil)
+          (nil (Err (type-error-resolve (. form pos) ":requires takes a list of protocols")))
+          ((some list)
+           (let ((def (g-proto g id)))
+             (try-let ((supers (try-collect list (fn (f: Stx) (super-pred g m (. def params) f)))))
+               (do (table-set (. g protos) id
+                              (ProtoDef (. def name) (. def module) (. def params) (. def methods) supers (. def pos)))
+                   (if (any-proto? id (super-closure g (own-pred id (count (. def params)))))
+                       (Err (type-error-resolve (. form pos)
+                              (str-join ["protocol " (. def name) " requires itself"])))
+                       (Ok ()))))))))))
 
-;; Rust: lower/supers.rs:112
+(defun any-proto? :private (id: i64 ps: (Vec Pred)) -> bool
+  (any-index? (fn (i: i64) (match (nth ps i) ((PProto q _) (= q id)) (_ false))) (count ps)))
+
+;; Every supertrait constraint `p` entails, transitively (§4.1 rule 2); `p` itself only
+;; through a cycle, which `resolve-supers` reports. Stops at a repeat, so a cycle cannot
+;; loop.
 (defun super-closure (g: Globals p: Pred) -> (Vec Pred)
-  (trap "todo: super-closure"))
+  (loop ((out (vec-empty)) (work [p]))
+    (match (peek work)
+      ((some (PProto q args))
+       (let ((fresh (loop ((i 0) (seen out) (added (vec-empty)))
+                      (let ((supers (. (g-proto g q) supers)))
+                        (if (>= i (count supers))
+                            (Pair seen added)
+                            (let ((inst (pred-map-tys (nth supers i) (fn (t: Ty) (ty-subst-gen t args [])))))
+                              (if (includes? inst seen)
+                                  (recur (+ i 1) seen added)
+                                  (recur (+ i 1) (conj seen inst) (conj added inst)))))))))
+         (recur (. fresh fst) (into (pop work) (. fresh snd)))))
+      (_ out))))
 
-;; Rust: lower/supers.rs:128
+;; `preds` and everything they entail through supertraits.
 (defun entail-closure (g: Globals preds: (Vec Pred)) -> (Vec Pred)
-  (trap "todo: entail-closure"))
+  (reduce (fn (out: (Vec Pred) p: Pred)
+            (match p
+              ((PProto _ _)
+               (reduce (fn (o: (Vec Pred) q: Pred) (if (includes? q o) o (conj o q)))
+                       out (super-closure g p)))
+              (_ out)))
+          preds preds))
 
-;; Rust: lower/supers.rs:177
+;; Whether the constraint `c` (over the instance's `TGen`s) follows from `given` (closed
+;; under supertraits): it is one of them, or an instance for its head resolves it with a
+;; context that follows.
+(defun entailed :private (g: Globals given: (Vec Pred) c: Pred depth: i64) -> bool
+  (if (includes? c given)
+      true
+      (match c
+        ((PProto r args)
+         (match (if (empty? args) nil (some (nth args 0)))
+           ((some (TCon con targs))
+            (match (g-instance g r con)
+              ((some inst)
+               (and (< depth 8)
+                    (every? (fn (q: Pred)
+                              (entailed g given (pred-map-tys q (fn (t: Ty) (ty-subst-gen t targs []))) (+ depth 1)))
+                            (. inst context))))
+              (nil false)))
+           (_ false)))
+        (_ false))))
+
+;; `impl P for T`, for messages: the protocol's name and the head's text, `TGen`s printed
+;; as the rigid names of the instance.
+(defun owner :private (g: Globals inst: InstanceDef proto: i64) -> (Pair str str)
+  (let ((head (ty-map-leaves (. inst head) (fn (t: Ty) (match t ((TGen i) (some (TRigid i))) (_ nil))))))
+    (Pair (. (g-proto g proto) name) (printer-ty (printer-with-names g [] (. inst var-names)) head))))
+
+(defun owner-text :private (o: (Pair str str)) -> str
+  (str-join ["impl " (. o fst) " for " (. o snd)]))
+
+(defun owner-of-text :private (o: (Pair str str)) -> str
+  (str-join ["impl of " (. o fst) " for " (. o snd)]))
+
+;; What the checks of one instance share.
+(defstruct SuperCx :private (inst: InstanceDef given: (Vec Pred) me: str printer: Printer subst: (Vec Ty)))
+
+;; Rule 1 of §4.1 for instance `index`: every direct supertrait has an instance for the
+;; same head, with the determined arguments the supertrait names, and a context this
+;; instance's context entails.
 (defun check-impl-supers (g: Globals index: i64) -> (Result unit TypeError)
-  (trap "todo: check-impl-supers"))
+  (let ((inst (table-get (. g instances) index))
+        (cx (SuperCx inst (entail-closure g (. inst context)) (owner-text (owner g inst (. inst proto)))
+                     (printer-with-names g (. inst var-names) []) (into [(. inst head)] (. inst dets))))
+        (supers (. (g-proto g (. inst proto)) supers)))
+    (loop ((i 0))
+      (if (>= i (count supers))
+          (Ok ())
+          (match (nth supers i)
+            ((PProto q args)
+             (match (check-super g cx q args)
+               ((Err e) (Err e))
+               ((Ok _) (recur (+ i 1)))))
+            (_ (recur (+ i 1))))))))
+
+(defun check-super :private (g: Globals cx: SuperCx q: i64 args: (Vec Ty)) -> (Result unit TypeError)
+  (let ((inst (. cx inst))
+        (me (. cx me))
+        (want (mapv (fn (t: Ty) (ty-subst-gen t (. cx subst) [])) args))
+        (err (fn (msg: str) (Err (type-error-other (. inst pos) msg)))))
+    (match (g-instance g q (. inst con))
+      (nil (err (str-join [me " requires an " (owner-of-text (owner g inst q))])))
+      ((some qi)
+       (cond ((not (covers-colours g qi inst))
+              (let ((theirs (owner g qi q)))
+                (err (str-join [me " requires an " (owner-of-text (owner g inst q)) "; "
+                                (owner-text theirs) " covers only " (. theirs snd)]))))
+             ((not (= (. qi dets) (vec (drop 1 want))))
+              (err (str-join [me " requires " (printer-pred (. cx printer) (PProto q want))
+                              ", but " (owner-text (owner g qi q)) " determines "
+                              (printer-pred (. cx printer) (PProto q (into [(nth want 0)] (. qi dets))))])))
+             (else
+              (match (first (filterv (fn (c: Pred) (not (entailed g (. cx given) c 0))) (. qi context)))
+                ((some c) (err (str-join [me " does not entail the context of " (owner-text (owner g qi q)) ": "
+                                          (printer-pred (. cx printer) c)])))
+                (nil (Ok ())))))))))
+
+;; Whether instance `qi` covers every colour that `inst`'s head covers (§1.3, §4.1 rule
+;; 1): wherever `qi`'s head gives a colour, `inst`'s gives the same one.
+(defun covers-colours :private (g: Globals qi: InstanceDef inst: InstanceDef) -> bool
+  (every? (fn ([t m]) (or (not (some? t)) (= t m)))
+          (zip (fixed-colours g (. qi head)) (fixed-colours g (. inst head)))))

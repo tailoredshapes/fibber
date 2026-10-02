@@ -1,27 +1,307 @@
-;; compiler/types/lower/expr.fib: expressions (package P7).
-;; Replaces crates/fibref/src/types/lower/expr.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; compiler/types/lower/expr.fib: expressions, the hub of the lowering of bodies (package P7).
+;; Replaces crates/fibref/src/types/lower/expr.rs (400 lines of Rust).
+;;
+;; Atoms, names and the core forms (syntax §3); calls and the builtins with special operands
+;; are in `call`, `match` in `clause`, patterns in `pattern`, `let` chains in `bindings`.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - this module is the hub of a cycle: `lowerer-make` builds the Lowerer with `lw-expr` as its
+;;   `expr` field (types.lower.scope), and the modules below call it as `lw-sub-expr`. The
+;;   callers of the Rust `Lowerer::new` call `lowerer-make`.
+;; - `items[n..]` is `rest-items`; `Form::as_sym` and `as_list` are those of types.lower.typeform.
+;; - `unsafe_depth += 1` and `-= 1` are `set!` of its Cell.
+;; - `plain_param` returns a `Triple` (name, annotation, next index), `ret_annotation` a `Pair`
+;;   (annotation, body start).
 (ns types.lower.expr
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.lower.scope))
+  (:require [expand.heads :as heads])
+  (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.lower.typeform types.lower.decl types.lower.scope
+        types.lower.pattern types.lower.bindings types.lower.clause types.lower.call))
 
-;; Rust: lower/expr.rs:17
-(defun literal (form: Stx) -> (Option Lit)
-  (trap "todo: literal"))
+;; A lowerer for a definition named `owner` in module `m`: Rust `Lowerer::new`.
+(defun lowerer-make (g: Globals m: i64 owner: str) -> Lowerer
+  (lowerer-new g m owner (fn (lw: Lowerer f: Stx tail: bool) (lw-expr lw f tail))))
 
-;; Rust: lower/expr.rs:33 expr
+(defun resolve-err :private (pos: Pos msg: str) -> (Result a TypeError)
+  (Err (type-error-resolve pos msg)))
+
+(defun rest-items :private (items: (Vec Stx) n: i64) -> (Vec Stx)
+  (vec (drop n items)))
+
+;; Rust: lower/expr.rs:33 expr: lowers `form` in expression position; `tail` says whether it
+;; is in tail position of the innermost loop body (for `recur`).
 (defun lw-expr (lw: Lowerer form: Stx tail: bool) -> (Result Expr TypeError)
-  (trap "todo: lw-expr"))
+  (match (literal form)
+    ((some l) (Ok (lw-mk lw (. form pos) (ELit l))))
+    (nil
+     (match (. form kind)
+       ((SNil) (Ok (lw-mk lw (. form pos) (EGlobal (GCtor @(. (. lw g) option) (some 0))))))
+       ((SSym name) (name-form lw name form))
+       ((SList items) (list-form lw items form tail))
+       (_ (resolve-err (. form pos) (str-join [(stx-show form) " is not an expression after expansion"])))))))
 
-;; Rust: lower/expr.rs:53 body
-(defun lw-body (lw: Lowerer forms: (Vec Stx) pos: Pos tail: bool) -> (Result Expr TypeError)
-  (trap "todo: lw-body"))
+;; A name in expression position.
+(defun name-form :private (lw: Lowerer name: str form: Stx) -> (Result Expr TypeError)
+  (if (= name "_")
+      (resolve-err (. form pos) "_ is not an expression")
+      (match (lw-lookup lw name)
+        ((some b)
+         (if (= (lw-kind lw b) BkAmpParam)
+             (Err (type-error AmpParamValue (. form pos)
+                              (str-join ["& parameter " name " used as a value in " (. lw owner)])))
+             (Ok (lw-mk lw (. form pos) (ELocal b)))))
+        (nil
+         (if (lw-is-primitive-form lw name)
+             (Err (lw-primitive-value lw name form))
+             (match (g-value (. lw g) (. lw m) name)
+               ((some r) (global-form lw r name form))
+               (nil (resolve-err (. form pos) (g-unknown (. lw g) (. lw m) SpValue name "unbound name")))))))))
 
-;; Rust: lower/expr.rs:292 plain_param
+(defun global-form :private (lw: Lowerer r: GlobalRef name: str form: Stx) -> (Result Expr TypeError)
+  (try-let ((_ (lw-check-unsafe lw r name form)))
+    (Ok (lw-mk lw (. form pos) (EGlobal r)))))
+
+;; `(var name)` (syntax §3.20): the top-level definition `name` names, private or not,
+;; never a local binding.
+(defun var-form :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (match (if (= (count items) 2) (stx-as-sym (nth items 1)) nil)
+    (nil (resolve-err (. form pos) "expected (var name)"))
+    ((some name)
+     (match (g-value-any (. lw g) (. lw m) name)
+       ((some r) (global-form lw r name form))
+       (nil (resolve-err (. form pos) (str-join ["var: no definition named " name])))))))
+
+;; A list form: a core form or a call.
+(defun list-form :private (lw: Lowerer items: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
+  (let ((head (unwrap-or (stx-as-sym (nth items 0)) ""))
+        (pos (. form pos)))
+    (cond ((= head "if") (if-form lw items form tail))
+          ((= head "do") (body-or-unit lw (rest-items items 1) form tail))
+          ((= head "let") (let-form lw items form tail))
+          ((= head "loop") (loop-form lw items form))
+          ((= head "recur") (recur-form lw items form tail))
+          ((= head "match") (lw-match-form lw items form tail))
+          ((= head "fn") (fn-form lw items form))
+          ((= head "async") (async-form lw items form))
+          ((= head "await") (await-form lw items form))
+          ((= head "unsafe") (unsafe-form lw items form))
+          ((= head "quote")
+           (if (= (count items) 2)
+               (Ok (lw-mk lw pos (EQuote (nth items 1))))
+               (resolve-err pos "malformed quote")))
+          ((= head ".") (field-form lw items form))
+          ((= head "var") (var-form lw items form))
+          ((= head "&") (Err (type-error AmpArgument pos "& argument must be a cell variable")))
+          ((heads/is-core head) (resolve-err pos (str-join [head " is only allowed at top level"])))
+          (else (lw-call lw items form)))))
+
+(defun unsafe-form :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (do (set! (. lw unsafe-depth) (+ @(. lw unsafe-depth) 1))
+      (let ((body (body-or-unit lw (rest-items items 1) form false)))
+        (do (set! (. lw unsafe-depth) (- @(. lw unsafe-depth) 1))
+            (try-let ((b body)) (Ok (lw-mk lw (. form pos) (EUnsafe b))))))))
+
+(defun body-or-unit :private (lw: Lowerer forms: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
+  (if (empty? forms)
+      (Ok (lw-mk lw (. form pos) (ELit LitUnit)))
+      (try-let ((e (lw-body lw forms (. form pos) tail)))
+        ;; `(do e)` keeps its own node so the step structure is visible.
+        (if (= (count forms) 1)
+            (Ok (lw-mk lw (. form pos) (EDo [e])))
+            (Ok e)))))
+
+(defun if-form :private (lw: Lowerer items: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
+  (if (= (count items) 4)
+      (try-let ((c (lw-expr lw (nth items 1) false))
+                (t (lw-expr lw (nth items 2) tail))
+                (e (lw-expr lw (nth items 3) tail)))
+        (Ok (lw-mk lw (. form pos) (EIf c t e))))
+      (resolve-err (. form pos) "if takes a test and two branches")))
+
+;; ---- let
+
+;; The entries of the bindings of a `let`: the initialiser, then the pattern, then the
+;; annotation of each, in turn.
+(defun let-entries :private (lw: Lowerer pairs: (Vec RawBinding) names: (Cell (Vec str))) -> (Result (Vec Entry) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count pairs))
+        (Ok out)
+        (let ((b (nth pairs i)))
+          (match (let-entry lw b names)
+            ((Ok e) (recur (+ i 1) (conj out e)))
+            ((Err e) (Err e)))))))
+
+(defun let-entry :private (lw: Lowerer b: RawBinding names: (Cell (Vec str))) -> (Result Entry TypeError)
+  (try-let ((init (lw-expr lw (. b init) false))
+            (pr (lower-let-pattern lw (. b pat) names))
+            (_ (lw-annotate lw (. pr fst) (. b ann))))
+    (Ok (Entry (. pr fst) init (. pr snd)))))
+
+(defun let-form :private (lw: Lowerer items: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
+  (try-let ((pairs (bindings-of items form)))
+    (let ((mark (lw-mark lw)))
+      (try-let ((entries (let-entries lw pairs (cell (vec-empty)))))
+        (let ((body (lw-body lw (rest-items items 2) (. form pos) tail)))
+          (do (lw-reset lw mark)
+              (try-let ((b body)) (lw-let-chain lw entries b (. form pos)))))))))
+
+;; ---- loop and recur
+
+;; `(loop ((x e)..) body)` (§3.18). A binding `(pat e)` whose pattern is not a variable is a
+;; hidden loop variable bound to `e`, which `recur` rebinds whole, and `pat` is matched
+;; against it, as a `let` binding is (stdlib §7 L7), at the start of the body.
+(defun loop-form :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (try-let ((pairs (bindings-of items form)))
+    (let ((mark (lw-mark lw)))
+      (try-let ((vp (loop-vars lw pairs)))
+        (do (lw-enter-loop lw)
+            (let ((body (loop-body lw (. vp snd) (rest-items items 2) form)))
+              (do (lw-leave-loop lw)
+                  (lw-reset lw mark)
+                  (try-let ((b body)) (Ok (lw-mk lw (. form pos) (ELoop (. vp fst) b)))))))))))
+
+;; The loop variables of the bindings and the patterns of the hidden ones (with their variable).
+(defun loop-vars :private (lw: Lowerer pairs: (Vec RawBinding)) -> (Result (Pair (Vec LoopBind) (Vec (Pair Stx i64))) TypeError)
+  (loop ((i 0) (vars (vec-empty)) (patterns (vec-empty)))
+    (if (>= i (count pairs))
+        (Ok (Pair vars patterns))
+        (let ((p (nth pairs i)))
+          (match (lw-expr lw (. p init) false)
+            ((Err e) (Err e))
+            ((Ok init)
+             (let ((sym (stx-as-sym (. p pat)))
+                   (b (lw-bind lw (match (stx-as-sym (. p pat)) ((some n) n) (nil (str-join ["#loop." (show i)])))
+                               BkLoop (. (. p pat) pos))))
+               (match (lw-annotate-binding lw b (. p ann))
+                 ((Err e) (Err e))
+                 ((Ok _)
+                  (recur (+ i 1) (conj vars (LoopBind b init))
+                         (match sym (nil (conj patterns (Pair (. p pat) b))) (_ patterns))))))))))))
+
+;; The body of a loop under the patterns of its hidden variables.
+(defun loop-body :private (lw: Lowerer patterns: (Vec (Pair Stx i64)) body: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (let ((names (cell (vec-empty))))
+    (try-let ((entries (loop-entries lw patterns names))
+              (b (lw-body lw body (. form pos) true)))
+      (lw-let-chain lw entries b (. form pos)))))
+
+(defun loop-entries :private (lw: Lowerer patterns: (Vec (Pair Stx i64)) names: (Cell (Vec str))) -> (Result (Vec Entry) TypeError)
+  (loop ((i 0) (entries (vec-empty)))
+    (if (>= i (count patterns))
+        (Ok entries)
+        (let ((p (. (nth patterns i) fst))
+              (b (. (nth patterns i) snd)))
+          (match (lower-let-pattern lw p names)
+            ((Err e) (Err e))
+            ((Ok pr)
+             (recur (+ i 1) (conj entries (Entry (. pr fst) (lw-mk lw (. p pos) (ELocal b)) (. pr snd))))))))))
+
+(defun recur-form :private (lw: Lowerer items: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
+  (cond ((not (lw-in-loop lw))
+         (Err (type-error RecurOutsideLoop (. form pos) "recur outside loop")))
+        ((not tail)
+         (Err (type-error RecurNotTail (. form pos) "recur not in tail position")))
+        (else
+         (try-let ((args (lower-each lw (rest-items items 1))))
+           (Ok (lw-mk lw (. form pos) (ERecur args)))))))
+
+;; Each form as an expression not in tail position, the first error ending the list.
+(defun lower-each :private (lw: Lowerer forms: (Vec Stx)) -> (Result (Vec Expr) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count forms))
+        (Ok out)
+        (match (lw-expr lw (nth forms i) false)
+          ((Ok e) (recur (+ i 1) (conj out e)))
+          ((Err e) (Err e))))))
+
+;; ---- fn
+
+(defun fn-form :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (let ((named (if (> (count items) 1) (stx-as-sym (nth items 1)) nil))
+        (start (match (if (> (count items) 1) (stx-as-sym (nth items 1)) nil) ((some _) 2) (nil 1))))
+    (match (if (> (count items) start) (stx-as-list (nth items start)) nil)
+      (nil (resolve-err (. form pos) "fn needs a parameter list"))
+      ((some params)
+       (try-let ((ra (lw-ret-annotation lw items (+ start 1))))
+         (let ((mark (lw-mark lw)))
+           (do (lw-enter-frame lw false)
+               (let ((lit (fn-parts lw named params (. ra fst) (rest-items items (. ra snd)) form))
+                     (captures (lw-leave-frame lw)))
+                 (do (lw-reset lw mark)
+                     (try-let ((l lit))
+                       (Ok (lw-mk lw (. form pos)
+                                  (EFn (FnLit (. l name) (. l params) (. l ret) (. l body) captures)))))))))))))
+)
+(defun fn-parts :private (lw: Lowerer named: (Option str) params: (Vec Stx) ret: (Option TypeAnn) body: (Vec Stx) form: Stx) -> (Result FnLit TypeError)
+  (if (empty? body)
+      (resolve-err (. form pos) "fn needs a body")
+      (let ((name (match named ((some n) (some (lw-bind lw n BkFnSelf (. form pos)))) (nil nil))))
+        (try-let ((ps (fn-params lw params))
+                  (b (lw-body lw body (. form pos) false)))
+          (Ok (FnLit name ps ret b (vec-empty)))))))
+
+(defun fn-params :private (lw: Lowerer params: (Vec Stx)) -> (Result (Vec FnParam) TypeError)
+  (loop ((i 0) (ps (vec-empty)))
+    (if (>= i (count params))
+        (Ok ps)
+        (match (lw-plain-param lw params i)
+          ((Err e) (Err e))
+          ((Ok t)
+           (if (not (every? (fn (p: FnParam) (not (= (. (g-binding (. lw g) (. p binding)) name) (. t fst)))) ps))
+               (resolve-err (. (nth params i) pos) (str-join ["parameter " (. t fst) " is repeated"]))
+               (recur (. t thd)
+                      (conj ps (FnParam (lw-bind lw (. t fst) BkParam (. (nth params i) pos)) (. t snd))))))))))
+
+;; Rust: lower/expr.rs:322 plain_param: a `fn` parameter `sym` or `sym: type` at `i`; the name,
+;; the annotation and the index after it.
 (defun lw-plain-param (lw: Lowerer params: (Vec Stx) i: i64) -> (Result (Triple str (Option TypeAnn) i64) TypeError)
-  (trap "todo: lw-plain-param"))
+  (let ((p (nth params i)))
+    (match (annotation-name p)
+      ((some n)
+       (if (< (+ i 1) (count params))
+           (try-let ((ann (type-ann (. lw g) (. lw m) (nth params (+ i 1)) false)))
+             (Ok (Triple n (some ann) (+ i 2))))
+           (resolve-err (. p pos) "annotation without a type")))
+      (nil
+       (match (stx-as-sym p)
+         ((some n) (if (= n "_")
+                       (resolve-err (. p pos) "a fn parameter is sym or sym: type")
+                       (Ok (Triple n nil (+ i 1)))))
+         (nil (resolve-err (. p pos) "a fn parameter is sym or sym: type")))))))
 
-;; Rust: lower/expr.rs:315 ret_annotation
+;; Rust: lower/expr.rs:345 ret_annotation: an optional `-> T` at `i`; it and where the body
+;; starts.
 (defun lw-ret-annotation (lw: Lowerer items: (Vec Stx) i: i64) -> (Result (Pair (Option TypeAnn) i64) TypeError)
-  (trap "todo: lw-ret-annotation"))
+  (if (and (< i (count items)) (= (stx-as-sym (nth items i)) (some "->")))
+      (if (< (+ i 1) (count items))
+          (try-let ((a (type-ann (. lw g) (. lw m) (nth items (+ i 1)) false)))
+            (Ok (Pair (some a) (+ i 2))))
+          (resolve-err (. (nth items i) pos) "-> without a type"))
+      (Ok (Pair nil i))))
+
+;; ---- async, await, field
+
+(defun async-form :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (do (lw-enter-frame lw true)
+      (let ((body (body-or-unit lw (rest-items items 1) form false))
+            (captures (lw-leave-frame lw)))
+        (try-let ((b body))
+          (Ok (lw-mk lw (. form pos) (EAsync b captures)))))))
+
+(defun await-form :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (cond ((not (lw-in-async lw))
+         (Err (type-error AwaitOutsideAsync (. form pos) "await outside async")))
+        ((not (= (count items) 2))
+         (resolve-err (. form pos) "await takes one operand"))
+        (else
+         (try-let ((e (lw-expr lw (nth items 1) false)))
+           (Ok (lw-mk lw (. form pos) (EAwait e)))))))
+
+(defun field-form :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (if (not (= (count items) 3))
+      (resolve-err (. form pos) "(. e field) takes two operands")
+      (match (stx-as-sym (nth items 2))
+        (nil (resolve-err (. (nth items 2) pos) "a field name is a symbol"))
+        ((some field)
+         (try-let ((e (lw-expr lw (nth items 1) false)))
+           (Ok (lw-mk lw (. form pos) (EField e field (stx-show (nth items 1))))))))))

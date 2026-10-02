@@ -1,27 +1,133 @@
 ;; compiler/types/lower/impl-head.fib: instance heads (package P4).
-;; Replaces crates/fibref/src/types/lower/impl_head.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/impl_head.rs (194 lines of Rust).
+;;
+;; The head of an `impl` (syntax §3.10; types §1.3, §2.7): a type constructor applied to
+;; distinct variables, where a colour parameter of a struct or enum takes a colour variable
+;; or a written colour. A colour variable of the head is `TGen i` in the instance's head,
+;; determined arguments and context, like a type variable; the method bodies see it as the
+;; rigid colour `CRigid i` (`body-args`).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `HeadEnv<'a>` holds the head's variables and which are colours; here it is a struct of
+;;   the two vectors (an `AnnEnv` implementor, as the other environments of types.annot).
+;; - `var-index` is public: protos and supers look a name up in a list of names too.
+;; - the loop of `impl_head` that pushes to `out` and `continue`s on a written colour is a
+;;   `loop` over the arguments carrying the three vectors; the "bad" errors are `Other`.
 (ns types.lower.impl-head
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.annot types.lower.typeform))
 
 ;; Rust `ImplHead` (lower/impl_head.rs:20): the head constructor, its
-;; variables, which of them are colours, and the head type.
+;; variables, which of them are colours, and the head type: `TGen i` for a variable,
+;; `ty-colour-arg k` for a written colour.
 (defstruct ImplHead (con: Con vars: (Vec str) colours: (Vec bool) head: Ty))
 
-;; Rust: lower/impl_head.rs:35
+(def distinct-text: str
+  "an instance head is a type constructor applied to distinct variables (or, at a colour parameter, a colour)")
+
+(defun bad-head :private (form: Stx msg: str) -> (Result a TypeError)
+  (Err (type-error-other (. form pos) msg)))
+
+;; The position of name in names.
+(defun var-index (names: (Vec str) name: str) -> (Option i64)
+  (loop ((i 0))
+    (cond ((>= i (count names)) nil)
+          ((= (nth names i) name) (some i))
+          (else (recur (+ i 1))))))
+
+;; Resolves the head form of an `impl`.
 (defun impl-head (g: Globals m: i64 form: Stx) -> (Result ImplHead TypeError)
-  (trap "todo: impl-head"))
+  (try-let ((ann (type-ann g m form false)))
+    (match ann
+      ((AVar _) (bad-head form "an instance head must not be a type variable"))
+      ((AScalar s) (head-args form (KScalar s) []))
+      ((AStr) (head-args form KStr []))
+      ((ABuiltin c a) (head-args form c [a]))
+      ((ANominal id args) (head-args form (KNominal id) args))
+      (_ (bad-head form distinct-text)))))
 
-;; Rust: lower/impl_head.rs:124
+;; A variable argument: its name and whether it is a colour variable.
+(defun head-var :private (a: TypeAnn) -> (Option (Pair str bool))
+  (match a
+    ((AVar v) (some (Pair v false)))
+    ((AColourArg (CaNamed v)) (some (Pair v true)))
+    (_ nil)))
+
+(defun head-args :private (form: Stx con: Con args: (Vec TypeAnn)) -> (Result ImplHead TypeError)
+  (loop ((i 0) (vars (vec-empty)) (colours (vec-empty)) (hargs (vec-empty)))
+    (if (>= i (count args))
+        (Ok (ImplHead con vars colours (TCon con hargs)))
+        (match (nth args i)
+          ((AColourArg (CaFixed k))
+           (recur (+ i 1) vars colours (conj hargs (ty-colour-arg k))))
+          (a (match (head-var a)
+               ((some nc)
+                (if (includes? (. nc fst) vars)
+                    (bad-head form distinct-text)
+                    (recur (+ i 1) (conj vars (. nc fst)) (conj colours (. nc snd))
+                           (conj hargs (TGen (count vars))))))
+               (nil (bad-head form distinct-text))))))))
+
+;; The variables of an impl head in a determined argument or the `:where` context: a
+;; type variable is `TGen i`, and so is a colour variable at a colour parameter; a colour
+;; variable anywhere else is an error. vars: the head's variables; colours: which are
+;; colour variables.
+(defstruct HeadEnv (vars: (Vec str) colours: (Vec bool)))
+
+(impl AnnEnv HeadEnv
+  (ann-var (self name pos)
+    (match (var-index (. self vars) name)
+      ((some i)
+       (if (nth (. self colours) i)
+           (Err (type-error-resolve pos (str-join [name " is a colour parameter of the impl head, not a type"])))
+           (Ok (TGen i))))
+      (nil (Err (type-error-resolve pos (str-join ["type variable " name " is not a parameter of the impl head"]))))))
+  (ann-colour (self) CLocal)
+  (ann-named-colour (self name pos)
+    (Err (type-error-resolve pos (str-join [name " may be used here only as the argument of a colour parameter"]))))
+  (ann-colour-param-arg (self name pos)
+    (some (match (var-index (. self vars) name)
+            ((some i) (if (nth (. self colours) i)
+                          (Ok (TGen i))
+                          (Err (type-error-resolve pos (str-join [name " is not a colour variable of the impl head"])))))
+            (nil (Err (type-error-resolve pos (str-join [name " is not a colour variable of the impl head"]))))))))
+
+;; Per variable of `inst`, whether it is a colour variable: it stands at a colour
+;; parameter of the head's struct or enum (§1.3).
 (defun colour-vars (g: Globals inst: InstanceDef) -> (Vec bool)
-  (trap "todo: colour-vars"))
+  (let ((n (count (. inst var-names))))
+    (match (. inst head)
+      ((TCon (KNominal id) args)
+       (let ((def (g-ty g id))
+             (at-colour (fn (j: i64)
+                          (any-index? (fn (i: i64) (and (typedef-is-colour def i) (= (nth args i) (TGen j))))
+                                      (count args)))))
+         (mapv at-colour (range n))))
+      (_ (mapv (fn (_: i64) false) (range n))))))
 
-;; Rust: lower/impl_head.rs:141
+;; Whether `p` holds of some index below n.
+(defun any-index? (p: (fn (i64) bool) n: i64) -> bool
+  (loop ((i 0))
+    (cond ((>= i n) false)
+          ((p i) true)
+          (else (recur (+ i 1))))))
+
+;; What the variables of `inst` are in its method bodies: `TRigid i` for a type
+;; variable, the rigid colour `CRigid i` as a colour argument for a colour variable
+;; (§1.3).
 (defun body-args (g: Globals inst: InstanceDef) -> (Vec Ty)
-  (trap "todo: body-args"))
+  (vec (map-indexed (fn (i: i64 c: bool) (if c (ty-colour-arg (CRigid i)) (TRigid i)))
+                    (colour-vars g inst))))
 
-;; Rust: lower/impl_head.rs:154
+;; The colours a head gives its colour parameters, by argument position: `(some k)` for
+;; a written colour, `nil` for a variable.
 (defun fixed-colours (g: Globals head: Ty) -> (Vec (Option Colour))
-  (trap "todo: fixed-colours"))
+  (match head
+    ((TCon (KNominal id) args)
+     (let ((def (g-ty g id)))
+       (mapv (fn (i: i64)
+               (match (nth args i)
+                 ((TFn k _ _) (if (and (typedef-is-colour def i) (or (= k CSend) (= k CLocal))) (some k) nil))
+                 (_ nil)))
+             (range (count args)))))
+    (_ [])))

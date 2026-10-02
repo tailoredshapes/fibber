@@ -1,0 +1,57 @@
+;; compiler/types/dump/protos.fib: the `protocol` and `instance` sections of one module of
+;; the types dump (spec/bootstrap.md §6.3), as `protocols` and `instances` of
+;; crates/fibref/src/types_dump/sections.rs (package P4). Each takes the lines so far and
+;; appends its own, each normalised as Rust's `push` does; types.dump.sections calls them
+;; from `module-lines`, in the order of `Section`.
+;;
+;; `method-line` is also what the instance lines print under a head (the protocol's own
+;; declaration of the method an instance overrides): the `fun` section of P5 does not use it.
+(ns types.dump.protos
+  (:require [syntax.dump :as sdump])
+  (:use fib.string types.ty types.table types.decls types.display types.dump.normal types.dump.scheme))
+
+;; `  method M : SCHEME params P[:borrow|:owned]..` (the protocol's own declaration of the
+;; method).
+(defun method-line (g: Globals m: MethodDef) -> str
+  (str-join ["  method " (. m name) " : " (show-scheme-in g (. m scheme)) " params"
+             (str-join (mapv (fn (p: MethodParam)
+                               (str-join [" " (. p name) (if (. p borrow) ":borrow" "") (if (. p owned) ":owned" "")]))
+                             (. m params)))]))
+
+(defun emit :private (acc: (Vec str) text: str) -> (Vec str)
+  (conj acc (normalise text)))
+
+;; `protocol NAME (PARAMS) POS supers PRED..`, then a `method` line each, of every protocol
+;; module m defines, in declaration order; file is the main file the position is shown in.
+(defun protocol-section (acc: (Vec str) g: Globals m: i64 file: str) -> (Vec str)
+  (reduce (fn (a: (Vec str) d: ProtoDef) (protocol-lines a g d file))
+          acc
+          (filterv (fn (d: ProtoDef) (= (. d module) m)) (table-rows (. g protos)))))
+
+(defun protocol-lines :private (acc: (Vec str) g: Globals d: ProtoDef file: str) -> (Vec str)
+  (let ((p (printer-with-names g (. d params) []))
+        (supers (str-join (mapv (fn (q: Pred) (str-join [" " (printer-pred p q)])) (. d supers))))
+        (head (emit acc (str-join ["protocol " (. d name) " (" (join " " (. d params)) ") "
+                                   (sdump/span-in (. d pos) file) " supers" supers]))))
+    (reduce (fn (a: (Vec str) md: MethodDef) (emit a (method-line g md))) head (. d methods))))
+
+;; `instance N HEAD vars K where PRED.. POS`, then a `method` line each, of every instance
+;; module m defines, N the index in the instance table.
+(defun instance-section (acc: (Vec str) g: Globals m: i64 file: str) -> (Vec str)
+  (let ((rows (table-rows (. g instances))))
+    (loop ((n 0) (out acc))
+      (if (>= n (count rows))
+          out
+          (recur (+ n 1)
+                 (if (= (. (nth rows n) module) m) (instance-lines out g n (nth rows n) file) out))))))
+
+(defun instance-lines :private (acc: (Vec str) g: Globals n: i64 inst: InstanceDef file: str) -> (Vec str)
+  (let ((p (printer-with-names g (. inst var-names) []))
+        (head (printer-pred p (PProto (. inst proto) (into [(. inst head)] (. inst dets)))))
+        (context (mapv (fn (q: Pred) (printer-pred p q)) (. inst context)))
+        (ctx (if (empty? context) "" (str-join [" where " (join " " context)])))
+        (out (emit acc (str-join ["instance " (show n) " " head " vars " (show (count (. inst var-names)))
+                                  ctx " " (sdump/span-in (. inst pos) file)]))))
+    (reduce (fn (a: (Vec str) mi: ImplMethod)
+              (emit a (method-line g (nth (. (g-proto g (. inst proto)) methods) (. mi index)))))
+            out (. inst methods))))

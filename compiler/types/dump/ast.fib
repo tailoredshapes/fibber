@@ -1,0 +1,300 @@
+;; compiler/types/dump/ast.fib: the `ast` section of the types dump (package P7), as the
+;; `ast` parts of crates/fibref/src/types_dump/tables.rs (:1-210) and texts.rs (229 lines):
+;; the resolved AST of every body, one node per line, depth first, two spaces a level.
+;; Ids are allocation order, so a port that lowers in another order prints other ids.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - the Rust walk takes a visitor and prints in `ast_event`; here each kind of node prints
+;;   as the walk reaches it (the lines are appended to a `(Vec str)`, a line is one element,
+;;   not normalised: Rust's `push_raw`).
+;; - `ast-section` takes the module's id and file, not a `Shown` (types.dump.sections calls it
+;;   and would be a cycle).
+;; - the text of a float is `show` at its width, as the reader dump prints it (syntax.dump's
+;;   private `flt-text`, copied).
+(ns types.dump.ast
+  (:require [syntax.dump :as sdump])
+  (:use fib.string syntax.pos syntax.form util.text types.ty types.table types.ast types.decls
+        types.builtins))
+
+;; ---- the text of the nodes (texts.rs)
+
+(defun colour-text :private (k: Colour) -> str
+  (match k
+    ((CSend) "send")
+    ((CLocal) "local")
+    ((CGen i) (str-join ["ς" (show i)]))
+    ((CVar v) (str-join ["?ς" (show v)]))
+    ((CRigid i) (str-join ["κ" (show i)]))))
+
+(defun colour-ann-text :private (c: ColourAnn) -> str
+  (match c
+    ((CaFixed k) (match k ((CSend) ":send") ((CLocal) ":local") (_ (colour-text k))))
+    ((CaNamed n) n)))
+
+(defun con-name :private (c: Con) -> str
+  (match c
+    ((KScalar s) (scalar-name s))
+    ((KStr) "str")
+    ((KArray) "Array")
+    ((KCell) "Cell")
+    ((KAtom) "Atom")
+    ((KWeak) "Weak")
+    ((KTask) "Task")
+    ((KNominal _) "nominal")
+    ((KDyn _ _) "dyn")))
+
+(defun anns-text :private (g: Globals xs: (Vec TypeAnn)) -> str
+  (str-join (mapv (fn (x: TypeAnn) (str-join [" " (ann-text g x)])) xs)))
+
+;; A written type annotation as text: names as written, `Self`, the scalars, `str`,
+;; `(Array T)`, `(Name A..)`, `(fn [COLOUR] (A..) R)`, `(dyn P A.. [:send])`.
+(defun ann-text (g: Globals a: TypeAnn) -> str
+  (match a
+    ((AVar n) n)
+    ((ASelf) "Self")
+    ((AScalar s) (scalar-name s))
+    ((AStr) "str")
+    ((ABuiltin con inner) (str-join ["(" (con-name con) " " (ann-text g inner) ")"]))
+    ((ANominal id args)
+     (if (empty? args)
+         (. (g-ty g id) name)
+         (str-join ["(" (. (g-ty g id) name) (anns-text g args) ")"])))
+    ((AFn colour ps r)
+     (str-join ["(fn " (match colour ((some c) (str-join [(colour-ann-text c) " "])) (nil ""))
+                "(" (join " " (mapv (fn (p: TypeAnn) (ann-text g p)) ps)) ") " (ann-text g r) ")"]))
+    ((AColourArg c) (colour-ann-text c))
+    ((ADyn p args send)
+     (str-join ["(dyn " (. (g-proto g p) name) (anns-text g args) (if send " :send" "") ")"]))))
+
+(defun variant-name :private (g: Globals t: i64 v: (Option i64)) -> str
+  (match v
+    (nil "-")
+    ((some i)
+     (match (. (g-ty g t) shape)
+       ((TsEnum vs) (if (< i (count vs)) (. (nth vs i) name) (show i)))
+       ((TsStruct _) (show i))))))
+
+(defun global-text :private (g: Globals r: GlobalRef) -> str
+  (match r
+    ((GFun f) (str-join ["fun " (. (g-fun g f) name)]))
+    ((GCtor t v) (str-join ["ctor " (. (g-ty g t) name) " " (variant-name g t v)]))
+    ((GMethod p i) (str-join ["method " (. (g-proto g p) name) " " (. (nth (. (g-proto g p) methods) i) name)]))
+    ((GBuiltin b) (str-join ["builtin " (. (nth (builtin-table) b) name)]))
+    ((GDef d) (str-join ["def " (. (g-def g d) name)]))
+    ((GExtern x) (str-join ["extern " (. (g-ext g x) name)]))))
+
+(defun flt-text :private (v: f64 w: FltWidth) -> str
+  (match w
+    ((F32) (show (fptrunc f32 v)))
+    ((F64) (show v))))
+
+(defun lit-text :private (l: Lit) -> str
+  (match l
+    ((LitInt v w) (str-join ["int " (show v) " " (int-width-suffix w)]))
+    ((LitFloat v w) (str-join ["flt " (flt-text v w) " " (flt-width-suffix w)]))
+    ((LitStr s) (str-join ["str " (sdump/quote-text s)]))
+    ((LitChar c) (str-join ["chr U+" (hex-upper (zext i64 (char->i32 c)) 4)]))
+    ((LitBool b) (str-join ["bool " (show b)]))
+    ((LitKeyword k) (str-join ["kw " (sdump/quote-text k)]))
+    ((LitUnit) "unit")))
+
+(defun conv-text :private (op: ConvOp) -> str
+  (let ((sign (fn (signed: bool) (if signed "signed" "unsigned"))))
+    (match op
+      ((CvIntToInt c) (str-join ["int-to-int:" (match c ((Trunc) "trunc") ((Zext) "zext") ((Sext) "sext"))]))
+      ((CvFloatToFloat) "float-to-float")
+      ((CvFloatToInt s) (str-join ["float-to-int:" (sign s)]))
+      ((CvIntToFloat s) (str-join ["int-to-float:" (sign s)])))))
+
+(defun captures-text :private (bs: (Vec i64)) -> str
+  (str-join ["captures[" (join "," (mapv (fn (b: i64) (str-join ["B" (show b)])) bs)) "]"]))
+
+(defun binding-name :private (g: Globals b: i64) -> str
+  (. (g-binding g b) name))
+
+;; `KIND DETAIL` of an expression node.
+(defun expr-kind-text :private (g: Globals e: Expr) -> str
+  (match (. e kind)
+    ((ELit l) (str-join ["lit " (lit-text l)]))
+    ((ELocal b) (str-join ["local B" (show b) " " (binding-name g b)]))
+    ((EGlobal r) (str-join ["global " (global-text g r)]))
+    ((ECall _ args) (str-join ["call " (show (count args))]))
+    ((EFn lit) (str-join ["fn " (show (count (. lit params))) " " (captures-text (. lit captures))]))
+    ((ELet bs _) (str-join ["let " (show (count bs))]))
+    ((EIf _ _ _) "if")
+    ((EDo es) (str-join ["do " (show (count es))]))
+    ((EMatch _ cs) (str-join ["match " (show (count cs))]))
+    ((ELoop vs _) (str-join ["loop " (show (count vs))]))
+    ((ERecur es) (str-join ["recur " (show (count es))]))
+    ((EField _ f text) (str-join ["field " f " " (sdump/quote-text text)]))
+    ((EDeref _ text) (str-join ["deref " (sdump/quote-text text)]))
+    ((ESet _ _) "set")
+    ((ESetField b f _) (str-join ["set-field B" (show b) " " (binding-name g b) " " f]))
+    ((EAsync _ caps) (str-join ["async " (captures-text caps)]))
+    ((EAwait _) "await")
+    ((EUnsafe _) "unsafe")
+    ((EQuote _) "quote")
+    ((EDyn p args send _)
+     (str-join ["dyn " (. (g-proto g p) name) (if send " :send" "") (anns-text g args)]))
+    ((EConvert op to _) (str-join ["convert " (conv-text op) " " (scalar-name to)]))
+    ((EConcat es) (str-join ["concat " (show (count es))]))))
+
+(defun ann-suffix :private (g: Globals info: BindingInfo) -> str
+  (match (. info ann)
+    ((some a) (str-join [" : " (ann-text g a)]))
+    (nil "")))
+
+(defun binding-head :private (g: Globals b: i64) -> str
+  (let ((info (g-binding g b)))
+    (str-join ["B" (show b) " " (. info name) (ann-suffix g info)])))
+
+(defun binding-kind-text :private (k: BindingKind) -> str
+  (match k
+    ((BkParam) "param") ((BkAmpParam) "ampparam") ((BkLet) "let") ((BkPattern) "pattern")
+    ((BkLoop) "loop") ((BkFnSelf) "fnself")))
+
+(defun binding-line :private (g: Globals b: i64 home: str) -> str
+  (let ((info (g-binding g b)))
+    (str-join ["B" (show b) " " (binding-kind-text (. info kind)) " " (. info name) (ann-suffix g info)
+               " " (sdump/span-in (. info pos) home)])))
+
+(defun pat-line :private (g: Globals p: Pattern home: str) -> str
+  (let ((at (sdump/span-in (. p pos) home)))
+    (match (. p kind)
+      ((PWild) (str-join ["P wild " at]))
+      ((PBind b) (str-join ["P bind " (binding-head g b) " " at]))
+      ((PLit l) (str-join ["P lit " (lit-text l) " " at]))
+      ((PCtor t v subs)
+       (str-join ["P ctor " (. (g-ty g t) name) " " (variant-name g t v) " " (show (count subs)) " " at]))
+      ((PAs _ b) (str-join ["P as " (binding-head g b) " " at]))
+      ((PVec subs rest)
+       (str-join ["P vec " (show (count subs)) " "
+                  (match rest ((RestExact) "exact") ((RestIgnore) "ignore")
+                    ((RestBind b) (str-join ["B" (show b)])))
+                  " " at])))))
+
+;; ---- the walk (tables.rs): each node's line at its depth, then its children one deeper
+
+(defun pad-of :private (d: i64) -> str
+  (str-join (mapv (fn (_: i64) "  ") (range d))))
+
+(defun line :private (acc: (Vec str) d: i64 text: str) -> (Vec str)
+  (conj acc (str-join [(pad-of d) text])))
+
+(defun ret-line :private (acc: (Vec str) g: Globals d: i64 r: (Option TypeAnn)) -> (Vec str)
+  (match r
+    ((some a) (line acc d (str-join ["ret " (ann-text g a)])))
+    (nil acc)))
+
+(defun binding-lines :private (acc: (Vec str) g: Globals home: str d: i64 bs: (Vec i64)) -> (Vec str)
+  (reduce (fn (a: (Vec str) b: i64) (line a d (binding-line g b home))) acc bs))
+
+(defun walk-pat :private (acc: (Vec str) g: Globals home: str p: Pattern d: i64) -> (Vec str)
+  (let ((here (line acc d (pat-line g p home)))
+        (sub (fn (a: (Vec str) s: Pattern) (walk-pat a g home s (+ d 1)))))
+    (match (. p kind)
+      ((PCtor _ _ subs) (reduce sub here subs))
+      ((PVec subs _) (reduce sub here subs))
+      ((PAs inner _) (sub here inner))
+      (_ here))))
+
+(defun walk-place :private (acc: (Vec str) g: Globals home: str p: Place d: i64) -> (Vec str)
+  (match p
+    ((PlExpr e) (walk acc g home e d))
+    ((PlAmp b) (line acc d (str-join ["amp B" (show b) " " (binding-name g b)])))))
+
+(defun walk-clause :private (acc: (Vec str) g: Globals home: str c: Clause d: i64) -> (Vec str)
+  (let ((head (line acc d (match (. c guard) ((some _) "clause guard") (nil "clause"))))
+        (pat (walk-pat head g home (. c pat) (+ d 1)))
+        (guarded (match (. c guard) ((some x) (walk pat g home x (+ d 1))) (nil pat))))
+    (walk guarded g home (. c body) (+ d 1))))
+
+(defun walk-fn :private (acc: (Vec str) g: Globals home: str lit: FnLit d: i64) -> (Vec str)
+  (let ((named (binding-lines acc g home d (match (. lit name) ((some b) [b]) (nil []))))
+        (ps (binding-lines named g home d (mapv (fn (p: FnParam) (. p binding)) (. lit params)))))
+    (walk (ret-line ps g d (. lit ret)) g home (. lit body) d)))
+
+(defun walk-all :private (acc: (Vec str) g: Globals home: str es: (Vec Expr) d: i64) -> (Vec str)
+  (reduce (fn (a: (Vec str) x: Expr) (walk a g home x d)) acc es))
+
+;; The expression `e` at depth d: its line, then its children at d + 1.
+(defun walk (acc: (Vec str) g: Globals home: str e: Expr d: i64) -> (Vec str)
+  (let ((here (line acc d (str-join ["E" (show (. e id)) " " (expr-kind-text g e) " "
+                                     (sdump/span-in (. e pos) home)])))
+        (k (+ d 1)))
+    (match (. e kind)
+      ((ELit _) here)
+      ((ELocal _) here)
+      ((EGlobal _) here)
+      ((EQuote form) (sdump/dump-stx-in here form k home))
+      ((ECall head args)
+       (reduce (fn (a: (Vec str) x: Arg)
+                 (match x
+                   ((ArgExpr y) (walk a g home y k))
+                   ((ArgAmp b pos)
+                    (line a k (str-join ["amp B" (show b) " " (binding-name g b) " " (sdump/span-in pos home)])))))
+               (walk here g home head k) args))
+      ((EFn lit) (walk-fn here g home lit k))
+      ((ELet bs body)
+       (walk (reduce (fn (a: (Vec str) b: LetBind) (walk (walk-pat a g home (. b pat) k) g home (. b init) k))
+                     here bs)
+             g home body k))
+      ((EIf c t f) (walk-all here g home [c t f] k))
+      ((EDo es) (walk-all here g home es k))
+      ((ERecur es) (walk-all here g home es k))
+      ((EConcat es) (walk-all here g home es k))
+      ((EMatch s cs)
+       (reduce (fn (a: (Vec str) c: Clause) (walk-clause a g home c k)) (walk here g home s k) cs))
+      ((ELoop vs body)
+       (walk (reduce (fn (a: (Vec str) v: LoopBind)
+                       (walk (line a k (binding-line g (. v binding) home)) g home (. v init) k))
+                     here vs)
+             g home body k))
+      ((EDeref p _) (walk-place here g home p k))
+      ((ESet p v) (walk (walk-place here g home p k) g home v k))
+      ((EField x _ _) (walk here g home x k))
+      ((ESetField _ _ x) (walk here g home x k))
+      ((EAsync x _) (walk here g home x k))
+      ((EAwait x) (walk here g home x k))
+      ((EUnsafe x) (walk here g home x k))
+      ((EDyn _ _ _ x) (walk here g home x k))
+      ((EConvert _ _ x) (walk here g home x k)))))
+
+;; ---- the section
+
+;; A body's lines under `head`: its parameters' bindings, the written result type, the
+;; expression, at depth 1.
+(defun body-lines (acc: (Vec str) g: Globals home: str head: str params: (Vec i64) ret: (Option TypeAnn) body: Expr) -> (Vec str)
+  (walk (ret-line (binding-lines (conj acc head) g home 1 params) g 1 ret) g home body 1))
+
+(defun fun-item :private (acc: (Vec str) g: Globals home: str head: str f: FunDef) -> (Vec str)
+  (body-lines acc g home head (mapv (fn (p: ParamDecl) (. p binding)) (. f params)) (. f ret) (. f body)))
+
+(defun def-item :private (acc: (Vec str) g: Globals home: str d: DefDef) -> (Vec str)
+  (walk (ret-line (conj acc (str-join ["ast def " (. d name)])) g 1 (. d ann)) g home (. d init) 1))
+
+(defun impl-item :private (acc: (Vec str) g: Globals home: str i: i64 inst: InstanceDef) -> (Vec str)
+  (reduce (fn (a: (Vec str) m: ImplMethod)
+            (body-lines a g home
+                        (str-join ["ast impl " (show i) " " (. (nth (. (g-proto g (. inst proto)) methods) (. m index)) name)])
+                        (. m params) (. m ret) (. m body)))
+          acc (. inst methods)))
+
+;; The `ast` section of module `id` (file `file`): every body, in the order funs, defs, impl
+;; methods, macros, each under a line `ast fun NAME`, `ast def NAME`, `ast impl INDEX METHOD` or
+;; `ast macro NAME`.
+(defun funs-of :private (acc: (Vec str) g: Globals id: i64 file: str macro: bool) -> (Vec str)
+  (reduce (fn (b: (Vec str) f: FunDef)
+            (fun-item b g file (str-join [(if macro "ast macro " "ast fun ") (. f name)]) f))
+          acc
+          (filterv (fn (f: FunDef) (and (= (. f module) id) (= (. f is-macro) macro))) (table-rows (. g funs)))))
+
+(defun ast-section (acc: (Vec str) g: Globals id: i64 file: str) -> (Vec str)
+  (let ((a1 (funs-of acc g id file false))
+        (a2 (reduce (fn (a: (Vec str) d: DefDef) (def-item a g file d))
+                    a1 (filterv (fn (d: DefDef) (= (. d module) id)) (table-rows (. g defs)))))
+        (a3 (reduce (fn (a: (Vec str) i: i64)
+                      (let ((inst (table-get (. g instances) i)))
+                        (if (= (. inst module) id) (impl-item a g file i inst) a)))
+                    a2 (range (table-count (. g instances))))))
+    (funs-of a3 g id file true)))

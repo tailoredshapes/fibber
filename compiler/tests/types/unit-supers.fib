@@ -1,0 +1,90 @@
+;; compiler/tests/types/unit-supers.fib: supertraits (types.lower.supers). supers.rs has no
+;; inline test. Two kinds of check:
+;; - the cases of protos-cases/ about `:requires` (the forms of a requirement, a cycle, an
+;;   unknown protocol) and about the rules an impl must meet (a supertrait's impl for the same
+;;   head, its determined arguments, the context entailed, the colours covered): the lines or
+;;   errors the tool prints (see protos-support.fib);
+;; - the closures on their own, with the order the code of supers.rs gives (the tool prints none).
+;; Run from the repository root.
+;; Build: fibc build compiler/tests/types/unit-supers.fib -I compiler -I lib -o OUT
+(ns main (:use fib.string syntax.pos syntax.form types.ty types.scheme types.error types.ast
+               types.table types.decls types.check types.lower.typeform types.lower.supers
+               tests.types.lower-support tests.types.protos-support))
+
+(def case-names: (Vec str)
+  ["proto-requires" "proto-req-err-unknown" "proto-req-err-args" "proto-req-err-first"
+   "proto-req-err-var" "proto-req-err-list" "proto-req-cycle" "proto-req-cycle3" "proto-req-self"
+   "super-ok" "super-missing" "super-missing-second" "super-dets" "super-context"
+   "super-context-ok-by-given" "super-context-ok-by-instance" "super-context-instance-deep"
+   "super-colour" "super-colour-ok" "super-colour-same" "super-colour-two" "super-errors-order"
+   "super-vars-names" "super-entail-instance" "super-entail-instance-fail" "super-entail-no-instance"])
+
+(defun starts (cs: Checks) -> unit
+  (let ((n (fn (src: str) (methods-start (stx-items (nth (forms-of src "t") 0))))))
+    (do (check cs "methods-start: no requires" (= (n "(defprotocol A (a (self) -> i64))") 2))
+        (check cs "methods-start: requires" (= (n "(defprotocol A :requires (X) (a (self) -> i64))") 4))
+        (check cs "methods-start: a requires that is not third" (= (n "(defprotocol A (a (self) -> i64) :requires)") 2))
+        (check cs "methods-start: too short" (and (= (n "(defprotocol A)") 2) (= (n "(defprotocol)") 2)))
+        (check cs "methods-start: a symbol requires is no keyword" (= (n "(defprotocol A requires (X) m)") 2)))))
+
+;; the closures: A; B requires A; C requires A and B; (Sq s e); (Sq2 s e) requires (Sq s e)
+(def src: str "(defprotocol A (a (self) -> i64))
+(defprotocol B :requires (A) (b (self) -> i64))
+(defprotocol C :requires (A B) (c (self) -> i64))
+(defprotocol (Sq self e) (sq (self) -> e))
+(defprotocol (Sq2 self e) :requires ((Sq self e)) (sq2 (self) -> e))
+(defprotocol X :requires (Y) (x (self) -> i64))
+(defprotocol Y :requires (X) (y (self) -> i64))
+(defprotocol G (g (self) -> i64))
+(defprotocol H (h (self) -> i64))
+(defprotocol E :requires (G) (e (self) -> i64))
+(defprotocol F :requires (H) (f (self) -> i64))
+(defprotocol D :requires (E F) (d (self) -> i64))")
+
+(defun closures (cs: Checks) -> unit
+  (let ((l (lower-src src))
+        (g (. l g))
+        (t (ty-i64))
+        (a 2) (b 3) (c 4) (sq 5) (sq2 6) (x 7) (y 8) (pg 9) (ph 10) (pe 11) (pf 12) (pd 13))
+    (do (check cs "the cycle is the only error" (= (count (. l errors)) 1))
+        (check cs "protocol ids: after Show and Stack" (= (. (g-proto g a) name) "A"))
+        (check cs "super-closure of C: A then B, each once"
+               (= (super-closure g (PProto c [t])) [(PProto a [t]) (PProto b [t])]))
+        (check cs "super-closure of B: A" (= (super-closure g (PProto b [t])) [(PProto a [t])]))
+        (check cs "super-closure of A: none" (empty? (super-closure g (PProto a [t]))))
+        (check cs "super-closure of Sq2 s e substitutes the arguments"
+               (= (super-closure g (PProto sq2 [(ty-str) (ty-i64)])) [(PProto sq [(ty-str) (ty-i64)])]))
+        (check cs "super-closure of a cycle stops: Y, X (the first reached again once)"
+               (= (super-closure g (PProto x [t])) [(PProto y [t]) (PProto x [t])]))
+        (check cs "super-closure walks a stack: D requires E F, E requires G, F requires H gives E F H G"
+               (= (super-closure g (PProto pd [t])) [(PProto pe [t]) (PProto pf [t]) (PProto ph [t]) (PProto pg [t])]))
+        (check cs "super-closure of a predicate that is no protocol: none" (empty? (super-closure g (PSend t))))
+        (check cs "entail-closure: the predicates first, then what they entail, no repeats"
+               (= (entail-closure g [(PProto c [t]) (PSend t) (PProto a [t])])
+                  [(PProto c [t]) (PSend t) (PProto a [t]) (PProto b [t])]))
+        (check cs "entail-closure of nothing" (empty? (entail-closure g [])))
+        (check cs "entail-closure leaves a non-protocol predicate alone"
+               (= (entail-closure g [(PObject t)]) [(PObject t)]))
+        (check cs "the supers of B were recorded" (= (. (g-proto g b) supers) [(PProto a [(TGen 0)])]))
+        (check cs "the supers of Sq2 were recorded"
+               (= (. (g-proto g sq2) supers) [(PProto sq [(TGen 0) (TGen 1)])]))
+        (check cs "the supers of X and Y were both recorded before the cycle was found"
+               (and (= (. (g-proto g x) supers) [(PProto y [(TGen 0)])]) (= (. (g-proto g y) supers) [(PProto x [(TGen 0)])]))))))
+
+(defun collect (cs: Checks) -> unit
+  (let ((calls (cell 0))
+        (r (try-collect [1 2 3 4]
+             (fn (n: i64) (do (set! calls (+ @calls 1))
+                              (if (= n 3) (Err (type-error-resolve p0 "three")) (Ok (* n 10))))))))
+    (do (check cs "try-collect: the first Err ends it" (and (= @calls 3) (match r ((Err e) (= (. e message) "three")) (_ false))))
+        (check cs "try-collect: all Ok in order"
+               (= (match (try-collect [1 2 3] (fn (n: i64) (Ok (+ n 1)))) ((Ok v) v) (_ [])) [2 3 4]))
+        (check cs "try-collect: nothing" (= (match (try-collect (vec-empty) (fn (n: i64) (Ok n))) ((Ok v) (count v)) (_ 9)) 0)))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (run-cases cs case-names)
+        (starts cs)
+        (closures cs)
+        (collect cs)
+        (finish cs))))
