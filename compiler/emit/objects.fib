@@ -1,82 +1,150 @@
 ;; compiler/emit/objects.fib: the table of object types: the struct of every type the program allocates, its type id (`tid`), its
-;; layout and its type record (spec/types.md §8.2-§8.7). Replaces crates/fibc/src/objects.rs; the walkers of
-;; objects/walk.rs (private `fn`s: `child_fields`, `array_walker`, `releases`, ..; 221 lines) belong to `objects-render`
-;; and are E2's to write in emit/objects/walk.fib. The slots are the Rust constants as numbers.
+;; layout and its type record (spec/types.md §8.2-§8.7). Replaces crates/fibc/src/objects.rs (315 lines of Rust before its tests).
+;; The data (`FrameSlot`, `ObjKind`, `ObjInfo`) and the slot numbers are in emit.objects.kinds and exported from here again; the
+;; walkers of objects/walk.rs (`child_fields`, `array_walker`, `releases`, ..) are emit.objects.walk, which `objects-render` calls
+;; (a module cannot call its importer back, so the data had to be below both).
 ;; The index of Rust's `HashMap<String, u32>` is a `(Map str i64)`: only looked up, never iterated.
-;; STATUS: every public function below is a STUB of package E2, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/objects.rs, 407 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
 (ns emit.objects
-  (:use types.ty types.decls emit.value))
-
-;; The shape of a task frame slot. Rust: objects.rs:17 FrameSlot
-(defenum FrameSlot (FrVal ty: LirTy) (FrBytes bytes: i64))
-(derive Eq FrameSlot) (derive Hash FrameSlot)
-
-;; What an object type is. Rust: objects.rs:40 ObjKind
-(defenum ObjKind
-  ObStr (ObArray elem: LirTy) (ObStruct fields: (Vec (Option LirTy)))
-  (ObEnum variants: (Vec (Vec (Option LirTy)))) (ObCell ty: LirTy) (ObAtom ty: LirTy) ObWeak
-  (ObClosure caps: (Vec LirTy)) (ObTask caps: (Vec LirTy) frame: (Vec FrameSlot)))
-(derive Eq ObjKind) (derive Hash ObjKind)
-
-;; One object type. Rust: objects.rs:77 ObjInfo
-(defstruct ObjInfo (tid: i64 sname: str name: str kind: ObjKind))
+  (:require [fib.string :as s])
+  (:use types.ty types.decls emit.value emit.text emit.layout emit.objects.walk)
+  (:export-from emit.objects.kinds))
 
 ;; The table, in interning order. Rust: objects.rs:171 Objects
 (defstruct Objects (list: (Cell (Vec ObjInfo)) index: (Cell (Map str i64))))
 
 (defun objects-new () -> Objects (Objects (cell []) (cell (map-empty))))
 
-;; Slot numbers of the fields of every object kind (§8.2-§8.7). Rust: objects.rs:177-197
-(def slot-struct-field0: i64 3) (def slot-enum-tag: i64 3) (def slot-variant-field0: i64 4)
-(def slot-len: i64 3) (def slot-elems: i64 4) (def slot-cell-value: i64 3)
-(def slot-atom-lock: i64 3) (def slot-atom-value: i64 4)
-(def slot-task-state: i64 3) (def slot-task-result: i64 7) (def slot-task-waiters: i64 8)
-(def slot-task-closure: i64 9) (def slot-task-resume: i64 6) (def slot-task-capture0: i64 10)
-(def slot-closure-code: i64 3) (def slot-capture0: i64 4)
-
-;; Rust: objects.rs:66 ObjInfo::class
+;; The trace class letter (compiler.md §4) as its byte: `c`, `a` or `o`. Rust: objects.rs:66 ObjInfo::class
 (defun obj-class (o: ObjInfo) -> i64
-  (trap "todo: E2 obj-class"))
+  (match (. o kind)
+    ((ObCell _) 99)
+    ((ObAtom _) 97)
+    (_ 111)))
 
-;; Rust: objects.rs:89 ObjInfo::variant_sname
-(defun obj-variant-sname (o: ObjInfo v: i64) -> str
-  (trap "todo: E2 obj-variant-sname"))
+(defun frame-text :private (f: FrameSlot) -> str
+  (match f
+    ((FrVal t) (lir-ty-text t))
+    ((FrBytes n) (str-join ["[" (str n) " x i8]"]))))
 
+(defun frame-size-align :private (f: FrameSlot) -> (Pair i64 i64)
+  (match f
+    ((FrVal t) (size-align t))
+    ((FrBytes n) (Pair n 8))))
+
+(defun frame-vals :private (ts: (Vec LirTy)) -> (Vec FrameSlot)
+  (mapv (fn (t: LirTy) (FrVal t)) ts))
+
+;; The types of the declared fields that have a slot (a unit field has none).
+(defun slot-tys :private (fs: (Vec (Option LirTy))) -> (Vec LirTy)
+  (vec (keep (fn (f: (Option LirTy)) f) fs)))
+
+;; The fields of the object struct (an enum's are its tag prefix; its variants are separate structs). Rust: objects.rs:100 fields
+(defun obj-fields :private (o: ObjInfo) -> (Vec FrameSlot)
+  (into (frame-vals (layout-header))
+        (match (. o kind)
+          ((ObStr) (frame-vals [LirI64]))
+          ((ObArray _) (frame-vals [LirI64]))
+          ((ObStruct fs) (frame-vals (slot-tys fs)))
+          ((ObEnum _) (frame-vals [LirI32]))
+          ((ObCell t) (frame-vals [t]))
+          ((ObAtom t) (frame-vals [LirI32 t]))
+          ((ObWeak) (frame-vals [LirI32 LirPtr LirPtr]))
+          ((ObClosure caps) (frame-vals (into [LirPtr] caps)))
+          ((ObTask caps frame)
+           (into (frame-vals (into [LirI32 LirI32 LirI32 LirPtr LirPtr LirPtr LirPtr] caps)) frame)))))
+
+;; The lIR slot of each declared field of a struct, or of variant `tag` of an enum (`nil` for a unit field, which has no slot).
 ;; Rust: objects.rs:125 ObjInfo::slots
 (defun obj-slots (o: ObjInfo tag: (Option i64)) -> (Vec (Option LirTy))
-  (trap "todo: E2 obj-slots"))
+  (match (. o kind)
+    ((ObStruct fs) fs)
+    ((ObEnum vs) (match tag ((some i) (nth vs i)) (nil [])))
+    (_ [])))
 
+;; The fields of variant `tag` of an enum: the tag prefix, then the variant's slots.
+(defun variant-fields :private (o: ObjInfo tag: (Option i64)) -> (Vec FrameSlot)
+  (into (obj-fields o) (frame-vals (slot-tys (obj-slots o tag)))))
+
+;; The byte offset of each user slot of a struct, or of variant `tag` of an enum, after the header (and the tag).
+;; A struct's fields already hold its slots; an enum's hold the tag prefix, and the variant's slots follow.
 ;; Rust: objects.rs:135 ObjInfo::offsets
 (defun obj-offsets (o: ObjInfo tag: (Option i64)) -> (Vec i64)
-  (trap "todo: E2 obj-offsets"))
+  (let ((fixed (match (. o kind) ((ObStruct _) (count (layout-header))) (_ (count (obj-fields o)))))
+        (all (match (. o kind)
+               ((ObEnum _) (variant-fields o tag))
+               (_ (obj-fields o)))))
+    (vec (drop fixed (field-offsets (mapv frame-size-align all))))))
 
+;; The size of a fixed-size object; an enum's is its largest variant's. Strings and arrays add their elements at run time.
 ;; Rust: objects.rs:152 ObjInfo::size
 (defun obj-size (o: ObjInfo) -> i64
-  (trap "todo: E2 obj-size"))
+  (let ((of (fn (f: (Vec FrameSlot)) (struct-size-of (mapv frame-size-align f)))))
+    (match (. o kind)
+      ((ObEnum vs) (reduce (fn (m: i64 i: i64) (max m (of (variant-fields o (some i))))) 0 (range (count vs))))
+      (_ (of (obj-fields o))))))
 
-;; Rust: objects.rs:202 Objects::intern
+;; The type id of the object type named `sname` of kind `kind`, registering it on first use. Rust: objects.rs:202 Objects::intern
 (defun objects-intern (os: Objects sname: str name: str kind: ObjKind) -> i64
-  (trap "todo: E2 objects-intern"))
+  (if-some [t (get @(. os index) sname)]
+    t
+    (let ((tid (count @(. os list))))
+      (do (set! (. os list) (conj @(. os list) (ObjInfo tid sname name kind)))
+          (set! (. os index) (assoc @(. os index) sname tid))
+          tid))))
 
 ;; Rust: objects.rs:217 Objects::get
 (defun objects-get (os: Objects tid: i64) -> ObjInfo
-  (trap "todo: E2 objects-get"))
+  (nth @(. os list) tid))
 
-;; Rust: objects.rs:222 Objects::set_task_frame
+;; The frame of task type `tid`, known once its body is lowered. Rust: objects.rs:222 Objects::set_task_frame
 (defun objects-set-task-frame (os: Objects tid: i64 frame: (Vec FrameSlot)) -> unit
-  (trap "todo: E2 objects-set-task-frame"))
+  (let ((o (nth @(. os list) tid)))
+    (match (. o kind)
+      ((ObTask caps _)
+       (set! (. os list) (assoc @(. os list) tid (ObjInfo (. o tid) (. o sname) (. o name) (ObTask caps frame)))))
+      (_ ()))))
 
 ;; Rust: objects.rs:228 Objects::len
 (defun objects-len (os: Objects) -> i64
-  (trap "todo: E2 objects-len"))
+  (count @(. os list)))
 
 ;; Rust: objects.rs:232 Objects::is_empty
 (defun objects-is-empty (os: Objects) -> bool
-  (trap "todo: E2 objects-is-empty"))
+  (empty? @(. os list)))
 
-;; Rust: objects.rs:238 Objects::render
+(defun frame-words :private (fs: (Vec FrameSlot)) -> str
+  (s/join " " (mapv frame-text fs)))
+
+;; The `defstruct` of an object, and of each variant of an enum. Rust: objects.rs:285 render_structs
+(defun render-structs :private (o: ObjInfo) -> str
+  (let ((trailing (match (. o kind)
+                    ((ObStr) " [0 x i8]")
+                    ((ObArray t) (str-join [" [0 x " (lir-ty-text t) "]"]))
+                    (_ ""))))
+    (str-join
+      (into [(str-join ["(defstruct " (. o sname) " (" (frame-words (obj-fields o)) trailing "))\n"])]
+            (match (. o kind)
+              ((ObEnum vs)
+               (mapv (fn (i: i64)
+                       (str-join ["(defstruct " (obj-variant-sname o i) " (" (frame-words (variant-fields o (some i))) "))\n"]))
+                     (range (count vs))))
+              (_ []))))))
+
+;; The type table and the class table. Rust: objects.rs:317 render_tables
+(defun render-tables :private (list: (Vec ObjInfo)) -> str
+  (let ((n (str (count list)))
+        (rec (fn (o: ObjInfo)
+               (str-join ["(%struct.fib.typerec @drop." (str (. o tid)) " @trace." (str (. o tid))
+                          " (string " (lir-quote (. o name)) ") (i64 " (str (obj-size o)) ") @share." (str (. o tid)) ")"])))
+        (class (fn (o: ObjInfo) (str-join ["(i8 " (str (obj-class o)) ")"]))))
+    (str-join ["(constant internal fib.types [" n " x %struct.fib.typerec] ([" n " x %struct.fib.typerec] "
+               (s/join " " (mapv rec list)) "))\n"
+               "(constant internal fib.classes [" n " x i8] ([" n " x i8] " (s/join " " (mapv class list)) "))\n"])))
+
+;; Every `defstruct`, `drop`, `trace` and `share` function, and the type and class tables. Rust: objects.rs:238 Objects::render
 (defun objects-render (os: Objects) -> str
-  (trap "todo: E2 objects-render"))
+  (let ((list @(. os list)))
+    (str-join
+      (into (into (mapv render-structs list)
+                  (mapcat (fn (o: ObjInfo) [(walker o "drop") (walker o "trace") (walker o "share")]) list))
+            [(render-tables list)]))))

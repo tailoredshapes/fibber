@@ -2,12 +2,8 @@
 ;; Replaces crates/fibc/src/mono.rs. The Rust `Queue` holds a `VecDeque`, a map from instance to name and the
 ;; overflow message; here the pending instances are a Vec with a head index (conj and pop are O(1)) and the names
 ;; a Map keyed by `Inst` (derived Hash, plan D6). The porter may re-key by (BodyKey, mangled types).
-;; STATUS: every public function below is a STUB of package E2, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/mono.rs, 256 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
 (ns emit.mono
-  (:use types.ty types.scheme types.decls own.program emit.value))
+  (:use types.ty types.scheme types.table types.decls own.program emit.value emit.layout emit.names))
 
 ;; An instance of a body at concrete types. Rust: mono.rs:20 Inst
 (defstruct Inst (key: BodyKey tys: (Vec Ty)))
@@ -27,34 +23,118 @@
 
 (defun queue-new () -> Queue (Queue (cell []) (cell 0) (cell (map-empty)) (cell nil)))
 
-;; Rust: mono.rs:27 Inst::subst
+;; A type of the body at this specialisation. Rust: mono.rs:27 Inst::subst
 (defun inst-subst (inst: Inst t: Ty) -> Ty
-  (trap "todo: E2 inst-subst"))
+  (ty-subst-gen t (. inst tys) []))
 
-;; Rust: mono.rs:48
+;; The class of a concrete type. Rust: mono.rs:48 class_of
 (defun class-of (g: Globals t: Ty) -> (Result RepClass str)
-  (trap "todo: E2 class-of"))
+  (try-let ((l (lir-ty g t)))
+    (match l
+      (nil (Ok ClsUnit))
+      ((some (LirDyn)) (Ok ClsDyn))
+      ((some (LirPtr))
+       (match (option-payload g t)
+         (nil (Ok ClsPtr))
+         ((some p) (try-let ((r (option-rep g p)))
+                     (Ok (match r ((OptNull) ClsOpt) ((OptBoxed) ClsBoxed)))))))
+      ((some s) (Ok (ClsScalar s))))))
 
-;; Rust: mono.rs:65
+;; The representative type of a class: what an unconstrained variable becomes inside its specialisation (compiler.md §7).
+;; Rust: mono.rs:65 representative
 (defun representative (g: Globals c: RepClass) -> Ty
-  (trap "todo: E2 representative"))
+  (match c
+    ((ClsScalar t)
+     (match t
+       ((LirI1) (ty-bool)) ((LirI8) (ty-scalar SI8)) ((LirI16) (ty-scalar SI16)) ((LirI32) (ty-scalar SI32))
+       ((LirFloat) (ty-scalar SF32)) ((LirDouble) (ty-scalar SF64)) ((LirRaw) (ty-scalar SPtr))
+       (_ (ty-i64))))
+    ((ClsUnit) (ty-unit))
+    ((ClsPtr) (ty-str))
+    ((ClsOpt) (ty-nominal @(. g option) [(ty-str)]))
+    ((ClsBoxed) (ty-nominal @(. g option) [(ty-i64)]))
+    ((ClsDyn) (TCon (KDyn 0 false) []))))
 
-;; Rust: mono.rs:86
+;; Whether type t mentions quantified variable i (Rust: the `visit` of mono.rs:93 `mentions`; the colour leaves of a function
+;; type are never a `Gen`, so the walk is over the types).
+(defun mentions :private (t: Ty i: i64) -> bool
+  (match t
+    ((TGen j) (= j i))
+    ((TCon _ args) (not (not-any? (fn (a: Ty) (mentions a i)) args)))
+    ((TFn _ ps r) (or (mentions r i) (not (not-any? (fn (p: Ty) (mentions p i)) ps))))
+    (_ false)))
+
+;; Whether quantified variable `i` of a scheme carries a protocol bound (directly or inside a constraint), which keys it by its
+;; full type. Rust: mono.rs:86 bounded
 (defun bounded (s: Scheme i: i64) -> bool
-  (trap "todo: E2 bounded"))
+  (not (not-any? (fn (p: Pred)
+                   (match p
+                     ((PProto _ tys) (not (not-any? (fn (t: Ty) (mentions t i)) tys)))
+                     (_ false)))
+                 (. s preds))))
 
-;; Rust: mono.rs:105
+;; The key of a `defun`'s specialisation at the concrete `tys`: the full type where bounded, the class's representative elsewhere.
+;; Rust: mono.rs:105 fun_key
 (defun fun-key (g: Globals s: Scheme tys: (Vec Ty)) -> (Result (Vec Ty) str)
-  (trap "todo: E2 fun-key"))
+  (loop ((i 0) (out []))
+    (if (< i (count tys))
+        (if (bounded s i)
+            (recur (+ i 1) (conj out (nth tys i)))
+            (try-let ((c (class-of g (nth tys i))))
+              (recur (+ i 1) (conj out (representative g c)))))
+        (Ok out))))
 
-;; Rust: mono.rs:171 Queue::request
+;; The depth and the node count of a type. Rust: mono.rs:130 extent
+(defun extent :private (t: Ty) -> (Pair i64 i64)
+  (let ((kids (match t ((TCon _ args) args) ((TFn _ ps r) (conj ps r)) (_ [])))
+        (sum (fn (acc: (Pair i64 i64) k: Ty)
+               (let ((e (extent k))) (Pair (max (. acc fst) (. e fst)) (+ (. acc snd) (. e snd)))))))
+    (let ((r (reduce sum (Pair 0 1) kids)))
+      (Pair (+ (. r fst) 1) (. r snd)))))
+
+;; What a body is called in a message: a function's name, or `the method m of P`. Rust: mono.rs:146 describe
+(defun method-desc :private (g: Globals i: i64 m: i64) -> str
+  (let ((inst (table-get (. g instances) i))
+        (proto (g-proto g (. (table-get (. g instances) i) proto))))
+    (str-join ["the method " (. (nth (. proto methods) (. (nth (. inst methods) m) index)) name) " of " (. proto name)])))
+
+(defun describe :private (g: Globals key: BodyKey) -> str
+  (match key
+    ((BodyFun f) (. (g-fun g f) name))
+    ((BodyAllOwned f) (. (g-fun g f) name))
+    ((BodyDef d) (. (g-def g d) name))
+    ((BodyMethod i m) (method-desc g i m))
+    ((BodyMethodOwned i m) (method-desc g i m))))
+
+;; Whether a type is past the limits of the overflow rule.
+(defun too-big :private (t: Ty) -> bool
+  (let ((e (extent t)))
+    (or (> (. e fst) max-type-depth) (> (. e snd) max-type-size))))
+
+;; The name of the specialisation, queued for emission if new. A request at a type past the limits above is not queued, and what
+;; it was is kept for `queue-overflow`. Rust: mono.rs:171 Queue::request
 (defun queue-request (q: Queue g: Globals inst: Inst) -> str
-  (trap "todo: E2 queue-request"))
+  (cond (or (some? @(. q overflow)) (not (not-any? too-big (. inst tys))))
+          (do (when (nil? @(. q overflow))
+                (set! (. q overflow) (some (describe g (. inst key)))))
+              "@overflow")
+        :else
+          (if-some [n (get @(. q names) inst)]
+            n
+            (let ((name (body-name g (. inst key) (. inst tys))))
+              (do (set! (. q names) (assoc @(. q names) inst name))
+                  (set! (. q pending) (conj @(. q pending) inst))
+                  name)))))
 
-;; Rust: mono.rs:190 Queue::pop
+;; The next body to emit. Rust: mono.rs:190 Queue::pop
 (defun queue-pop (q: Queue) -> (Option Inst)
-  (trap "todo: E2 queue-pop"))
+  (let ((h @(. q head)))
+    (if (< h (count @(. q pending)))
+        (do (set! (. q head) (+ h 1))
+            (some (nth @(. q pending) h)))
+        nil)))
 
+;; The first body that was requested at a type past the limits, if any: the compilation cannot finish.
 ;; Rust: mono.rs:196 Queue::overflow
 (defun queue-overflow (q: Queue) -> (Option str)
-  (trap "todo: E2 queue-overflow"))
+  @(. q overflow))

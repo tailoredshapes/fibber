@@ -8,7 +8,8 @@
 ;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
 ;; the data it names is the porter's to extend.
 (ns emit.program
-  (:use types.ty types.ast types.decls types.program own.program emit.value emit.mono emit.objects emit.statics))
+  (:use types.ty types.ast types.decls types.display types.init types.program own.program emit.value emit.layout emit.names
+        emit.mono emit.objects emit.statics))
 
 ;; The work the queue hands out: a body, or a closure of an owner. Rust: program.rs:24 Work
 (defenum Work (WorkBody inst: Inst) (WorkClosure owner: Inst lit: i64 name: str))
@@ -23,13 +24,21 @@
    helpers: (Cell (Map str bool)) def-values: (Cell (Map i64 DefValue)) quotes: (Cell (Map i64 str))
    quote-text: (Cell str) quote-counter: (Cell i64) keyword-helpers: (Cell bool)))
 
+;; `str` is type id 0: the literals need it before any body runs; the runtime's own text names the byte array and the weak box.
+;; (E2 wrote this and the object functions below, which `--layout` needs; E3 owns the rest of this module.)
 ;; Rust: program.rs:60 Program::new
 (defun program-new (typed: TypedProgram owned: OwnedProgram) -> Program
-  (trap "todo: E3 program-new"))
+  (let ((p (Program typed owned (objects-new) (statics-new) (queue-new) (cell []) (cell 0) (cell []) (cell [])
+                    (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell "") (cell 0) (cell false))))
+    (do (objects-intern (. p objects) "fib.str" "str" ObStr)
+        (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
+        (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
+        (objects-intern (. p objects) "fib.task" "task" (ObTask [] []))
+        p)))
 
 ;; Rust: program.rs:93 Program::g
 (defun program-g (p: Program) -> Globals
-  (trap "todo: E3 program-g"))
+  (. (. p typed) globals))
 
 ;; Rust: program.rs:98 Program::ty_of
 (defun program-ty-of (p: Program inst: Inst e: i64) -> (Result Ty str)
@@ -37,7 +46,7 @@
 
 ;; Rust: program.rs:108 Program::lir
 (defun program-lir (p: Program t: Ty) -> (Result (Option LirTy) str)
-  (trap "todo: E3 program-lir"))
+  (lir-ty (program-g p) t))
 
 ;; Rust: program.rs:113 Program::request
 (defun program-request (p: Program key: BodyKey tys: (Vec Ty)) -> str
@@ -51,9 +60,52 @@
 (defun program-next-work (p: Program) -> (Option Work)
   (trap "todo: E3 program-next-work"))
 
+;; What an object type is called in the table and what it is.
+(defstruct ObjSpec :private (sname: str kind: ObjKind))
+
+;; The element layout of a container; a `unit` content takes an `i1` slot that nothing reads (an atom of `unit` is a task's
+;; result holder). Rust: program.rs:220 elem_lir
+(defun elem-lir :private (g: Globals args: (Vec Ty)) -> (Result LirTy str)
+  (match (first args)
+    (nil (Err "a constructor without its argument"))
+    ((some t) (try-let ((l (lir-ty g t))) (Ok (unwrap-or l LirI1))))))
+
+;; A container's object: `fib.NAME.ELEM` with its element's short name.
+(defun container-spec :private (g: Globals args: (Vec Ty) word: str mk: (fn (LirTy) ObjKind) :borrow) -> (Result ObjSpec str)
+  (try-let ((e (elem-lir g args)))
+    (Ok (ObjSpec (str-join ["fib." word "." (tyname e)]) (mk e)))))
+
+;; The struct name and kind of the nominal type `t` with arguments `args`. Rust: program.rs:145 Program::object, the last two arms
+(defun nominal-spec :private (g: Globals t: Ty id: i64 args: (Vec Ty)) -> (Result ObjSpec str)
+  (if (= id @(. g option))
+      (let ((payload (unwrap-or (option-payload g t) (ty-unit))))
+        (try-let ((rep (option-rep g payload)))
+          (if (= rep OptNull)
+              (Err "a null-represented Option has no object")
+              (try-let ((f (lir-ty g payload)))
+                (Ok (ObjSpec (str-join ["o." (mangle g t)]) (ObEnum [[] [f]])))))))
+      (try-let ((vs (variants g id args))
+                (lowered (try-map (fn (v: Variant) (try-map (fn (f: Ty) (lir-ty g f)) (. v tys))) vs)))
+        (Ok (ObjSpec (str-join ["o." (mangle g t)])
+                     (match (. (nth vs 0) name)
+                       (nil (ObStruct (nth lowered 0)))
+                       ((some _) (ObEnum lowered))))))))
+
+;; The type id and struct name of the object type `t` (a struct, an enum with fields, `str`, an array, a boxed `Option`).
 ;; Rust: program.rs:145 Program::object
 (defun program-object (p: Program t: Ty) -> (Result (Pair i64 str) str)
-  (trap "todo: E3 program-object"))
+  (let ((g (program-g p)))
+    (try-let ((spec (match t
+                      ((TCon (KStr) _) (Ok (ObjSpec "fib.str" ObStr)))
+                      ((TCon (KArray) args) (container-spec g args "array" (fn (e: LirTy) (ObArray e))))
+                      ((TCon (KCell) args) (container-spec g args "cell" (fn (e: LirTy) (ObCell e))))
+                      ((TCon (KAtom) args) (container-spec g args "atom" (fn (e: LirTy) (ObAtom e))))
+                      ((TCon (KWeak) _) (Ok (ObjSpec "fib.weakbox" ObWeak)))
+                      ((TCon (KTask) _) (Ok (ObjSpec "fib.task" (ObTask [] []))))
+                      ((TCon (KNominal id) args) (nominal-spec g t id args))
+                      (_ (Err (str-join ["no object layout for " (mangle g t)]))))))
+      (let ((tid (objects-intern (. p objects) (. spec sname) (printer-ty (printer-new g) t) (. spec kind))))
+        (Ok (Pair tid (. spec sname)))))))
 
 ;; Rust: program.rs:221 Program::declare_extern
 (defun program-declare-extern (p: Program d: ExternDef) -> (Result unit str)
@@ -81,12 +133,18 @@
 
 ;; Rust: program.rs:315 Program::task_object
 (defun program-task-object (p: Program code: str caps: (Vec LirTy)) -> (Pair i64 str)
-  (trap "todo: E3 program-task-object"))
+  (let ((sname (str-join ["task." code])))
+    (Pair (objects-intern (. p objects) sname (str-join ["task " code]) (ObTask caps [])) sname)))
 
 ;; Rust: program.rs:329 Program::closure_object
 (defun program-closure-object (p: Program code: str caps: (Vec LirTy)) -> (Pair i64 str)
-  (trap "todo: E3 program-closure-object"))
+  (let ((sname (str-join ["clo." code])))
+    (Pair (objects-intern (. p objects) sname (str-join ["closure " code]) (ObClosure caps)) sname)))
 
 ;; Rust: program.rs:339
 (defun tyname (t: LirTy) -> str
-  (trap "todo: E3 tyname"))
+  (match t
+    ((LirDyn) "dyn")
+    ;; Not `ptr`: `(Array ptr)` and `(Array str)` have one layout but not one drop, and a name is one object type.
+    ((LirRaw) "raw")
+    (_ (lir-ty-text t))))

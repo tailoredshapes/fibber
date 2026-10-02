@@ -1,0 +1,97 @@
+;; compiler/emit/layout-dump.fib: `--layout` of the emit dump (spec/bootstrap.md §8.5), as crates/fibc/src/emit_dump/layout.rs (136 lines of
+;; Rust): what the emitter decides about every ground type of the typed program before it emits a body: the mangled name, the lIR
+;; type, the class and its representative, and for an object its struct, type id, size and field offsets; then the structs and
+;; type table the objects make. No body is lowered and no ownership plan is read.
+;; The file loop and the read, load and expand records are types.dump's (`dump-file` with this module's check, as `types-file` is
+;; `dump-file` with the checker's); the Rust `Checked` of an empty ownership plan is `owned-program-new`.
+;; Known difference: there is no macro runner here (the macro-time module is package E11), so a program that calls a macro of its own
+;; ends in the expander's `MacroNeedsEvaluator` record where the Rust prints its layout.
+(ns emit.layout-dump
+  (:require [fib.string :as s] [types.driver :as driver] [types.dump :as dump])
+  (:use syntax.form expand.types types.ty types.args types.decls types.display types.program types.infer.cx types.dump types.dump.sections
+        own.program emit.value emit.names emit.layout emit.mono emit.objects emit.program))
+
+;; Whether every leaf of the type is a colour (no variable is left in it).
+(defun ground? :private (t: Ty) -> bool
+  (let ((ok (cell true)))
+    (do (ty-visit t (fn (l: Leaf) (match l ((LColour _) ()) (_ (set! ok false)))))
+        @ok)))
+
+;; The values of a table in the order of its ids.
+(defun by-id :private (m: (Map i64 v)) -> (Vec v)
+  (mapv (fn (p: (Pair i64 v)) (. p snd)) (sort-by (fn (p: (Pair i64 v)) (. p fst)) m)))
+
+;; The types of the expressions (in the order of their ids), of the bindings (in the order of theirs) and of the instantiations (in
+;; the order of the expressions that use them, each one's types in order), with colours erased as the mangled name erases them,
+;; without the types that still hold a variable, and without repeats. Rust: layout.rs:42 ground_types
+(defun ground-types :private (typed: TypedProgram) -> (Vec Ty)
+  (let ((all (into (into (by-id (. typed expr-types)) (by-id (. typed binding-types)))
+                   (vec (mapcat (fn (i: Instantiation) (. i tys)) (by-id (. typed instantiations)))))))
+    (. (reduce (fn (acc: (Pair (Set Ty) (Vec Ty)) t: Ty)
+                 (let ((erased (ty-map-colours t (fn (k: Colour) CLocal))))
+                   (if (and (ground? erased) (not (contains? (. acc fst) erased)))
+                       (Pair (conj (. acc fst) erased) (conj (. acc snd) erased))
+                       acc)))
+               (Pair (set-empty) []) all)
+       snd)))
+
+(defun class-word :private (c: RepClass) -> str
+  (match c
+    ((ClsScalar _) "scalar") ((ClsPtr) "ptr") ((ClsOpt) "opt") ((ClsBoxed) "boxed") ((ClsDyn) "dyn") ((ClsUnit) "unit")))
+
+;; The byte offsets of an object's user slots after its header, separated by commas (`-` for none); an enum's are listed by
+;; variant, `v0:- v1:16,24`. Rust: layout.rs:121 offsets_word
+(defun offsets-word :private (o: ObjInfo) -> str
+  (let ((offs (fn (v: (Vec i64)) (if (empty? v) "-" (s/join "," v)))))
+    (match (. o kind)
+      ((ObEnum vs) (s/join " " (mapv (fn (i: i64) (str-join ["v" (str i) ":" (offs (obj-offsets o (some i)))]))
+                                     (range (count vs)))))
+      (_ (offs (obj-offsets o nil))))))
+
+;; The columns of the object `t` is, registering it in the type table: only a pointer class that is not a closure (closures are
+;; objects per code, registered when their literal is lowered) has one. Rust: layout.rs:102 object_columns
+(defun object-columns :private (p: Program t: Ty c: RepClass) -> str
+  (if (or (not (match c ((ClsPtr) true) ((ClsBoxed) true) (_ false))) (match t ((TFn _ _ _) true) (_ false)))
+      "object -"
+      (match (program-object p t)
+        ((Err _) "object unsupported")
+        ((Ok r) (let ((o (objects-get (. p objects) (. r fst))))
+                  (str-join ["object " (. r snd) " tid " (str (. r fst)) " size " (str (obj-size o))
+                             " offsets " (offsets-word o)]))))))
+
+;; `TYPE mangle M lir L class C repr R object O`; a type the compiler cannot lay out ends `unsupported` after the columns that were
+;; found. Rust: layout.rs:69 line
+(defun type-line :private (p: Program t: Ty) -> str
+  (let ((g (program-g p)))
+    (let ((head (str-join [(printer-ty (printer-new g) t) " mangle " (mangle g t)])))
+      (match (lir-ty g t)
+        ((Err _) (str-join [head " unsupported"]))
+        ((Ok l)
+         (match (class-of g t)
+           ((Err _) (str-join [head " unsupported"]))
+           ((Ok c)
+            (str-join [head " lir " (match l (nil "void") ((some x) (tyname x)))
+                       " class " (class-word c) " repr " (mangle g (representative g c)) " " (object-columns p t c)]))))))))
+
+;; The layout table and the type table of a typed program's ground types: the line `;; == layout`, one line per type, then
+;; `;; == section types` and the text of the `types` section the objects make (without its last line break). Rust: layout.rs:25 text
+(defun layout-lines (lines: (Vec str) typed: TypedProgram) -> (Vec str)
+  (let ((p (emit.program/program-new typed (owned-program-new))))
+    (let ((rows (mapv (fn (t: Ty) (type-line p t)) (ground-types typed)))
+          (types (objects-render (. p objects))))
+      (into (conj (into (conj lines ";; == layout") rows) ";; == section types")
+            [(str-slice types 0 (- (str-len types) 1))]))))
+
+;; The check of an expanded program: the type checker's records when it does not check, else the layout.
+(defun layout-check :private (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
+    -> Dumped
+  (match (driver/lower-modules modules prelude)
+    ((Err errs) (dump/error-dump lines errs home true))
+    ((Ok l)
+     (match (driver/infer-lowered l true)
+       ((Err errs) (dump/error-dump lines errs home true))
+       ((Ok typed) (Dumped (layout-lines lines typed) 0))))))
+
+;; What `fibc emit-dump --layout` prints for one file, and the status it adds.
+(defun layout-file (file: str) -> Dumped
+  (dump/dump-file file (options-default) layout-check))

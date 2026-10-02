@@ -1,12 +1,9 @@
 ;; compiler/emit/statics.fib: static data (types §8.2): string literals, keyword ids, the immortal closures of named functions, and vtables,
 ;; each an lIR `constant` with count 0 and the `IMMORTAL` flag. Replaces crates/fibc/src/statics.rs. The bytes of a
 ;; string are the bytes of its `str`; the Rust `Vec<u8>` key of the string index is the `str` itself.
-;; STATUS: every public function below is a STUB of package E2, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/statics.rs, 191 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
 (ns emit.statics
-  (:use emit.value))
+  (:require [fib.string :as s])
+  (:use emit.value emit.layout))
 
 ;; A string constant: the text of its type id and its bytes. Rust: statics.rs:13 `strings`
 (defstruct StaticStr (tid: str text: str))
@@ -26,38 +23,88 @@
   (Statics (cell []) (cell (map-empty)) (cell []) (cell (map-empty)) (cell false)
            (cell []) (cell (map-empty)) (cell []) (cell (map-empty))))
 
-;; Rust: statics.rs:26 Statics::string
+;; The address of the immortal `str` object holding `text`. Rust: statics.rs:26 Statics::string
 (defun statics-string (st: Statics text: str tid-str: i64) -> str
-  (trap "todo: E2 statics-string"))
+  (if-some [n (get @(. st string-index) text)]
+    n
+    (let ((name (str-join ["@str." (str (count @(. st strings)))])))
+      (do (set! (. st strings) (conj @(. st strings) (StaticStr (str tid-str) text)))
+          (set! (. st string-index) (assoc @(. st string-index) text name))
+          name))))
 
-;; Rust: statics.rs:42 Statics::keyword
+;; The interned id of a keyword. Once the table is sealed, a keyword that is not in it is a broken invariant: a trap, as the
+;; Rust panic. Rust: statics.rs:42 Statics::keyword
 (defun statics-keyword (st: Statics k: str) -> i64
-  (trap "todo: E2 statics-keyword"))
+  (if-some [id (get @(. st keyword-index) k)]
+    id
+    (if @(. st keywords-sealed)
+        (trap (str-join ["the keyword :" k " was interned after the keyword table was sealed"]))
+        (let ((id (count @(. st keywords))))
+          (do (set! (. st keywords) (conj @(. st keywords) k))
+              (set! (. st keyword-index) (assoc @(. st keyword-index) k id))
+              id)))))
 
-;; Rust: statics.rs:62 Statics::seal_keywords
+;; Seals the table: the ids given out so far are the table a macro module exports (`fibm.kw.K`, compiler.md §6), so a keyword that
+;; is not already in it must not be interned from here on. Rust: statics.rs:62 Statics::seal_keywords
 (defun statics-seal-keywords (st: Statics) -> unit
-  (trap "todo: E2 statics-seal-keywords"))
+  (set! (. st keywords-sealed) true))
 
-;; Rust: statics.rs:67 Statics::keywords
+;; Every keyword interned so far, by id. Rust: statics.rs:67 Statics::keywords
 (defun statics-keywords (st: Statics) -> (Vec str)
-  (trap "todo: E2 statics-keywords"))
+  @(. st keywords))
 
-;; Rust: statics.rs:72 Statics::closure
+;; The address of the immortal closure whose code is `code` (§8.4). Rust: statics.rs:72 Statics::closure
 (defun statics-closure (st: Statics code: str tid: i64) -> str
-  (trap "todo: E2 statics-closure"))
+  (if-some [n (get @(. st closure-index) code)]
+    n
+    (let ((name (str-join ["@clo." (str (count @(. st closures)))])))
+      (do (set! (. st closures) (conj @(. st closures) (StaticClosure name code tid)))
+          (set! (. st closure-index) (assoc @(. st closure-index) code name))
+          name))))
 
-;; Rust: statics.rs:83 Statics::closure_names
+;; The immortal closures made so far, by address name (`@clo.N`). Rust: statics.rs:83 Statics::closure_names
 (defun statics-closure-names (st: Statics) -> (Vec str)
-  (trap "todo: E2 statics-closure-names"))
+  (mapv (fn (c: StaticClosure) (. c name)) @(. st closures)))
 
+;; The address of the vtable named `name` with these slots (§8.5), or of the one registered under that name before.
 ;; Rust: statics.rs:89 Statics::vtable
 (defun statics-vtable (st: Statics name: str slots: (Vec str)) -> str
-  (trap "todo: E2 statics-vtable"))
+  (if-some [n (get @(. st vtable-index) name)]
+    n
+    (let ((global (str-join ["@vt." (str (count @(. st vtables)))])))
+      (do (set! (. st vtables) (conj @(. st vtables) (StaticVtable global slots)))
+          (set! (. st vtable-index) (assoc @(. st vtable-index) name global))
+          global))))
 
-;; Rust: statics.rs:100 Statics::has_vtable
+;; Whether a vtable of this name exists already. Rust: statics.rs:100 Statics::has_vtable
 (defun statics-has-vtable (st: Statics name: str) -> bool
-  (trap "todo: E2 statics-has-vtable"))
+  (contains? @(. st vtable-index) name))
 
-;; Rust: statics.rs:105 Statics::render
+;; An address name without its `@`.
+(defun unat :private (name: str) -> str
+  (str-slice name 1 (str-len name)))
+
+;; The bytes of s as `(i8 B)` words, then the terminating zero.
+(defun byte-words :private (text: str) -> str
+  (s/join " " (conj (mapv (fn (i: i64) (str-join ["(i8 " (str (zext i64 (str-byte-at text i))) ")"]))
+                          (range (str-len text)))
+                    "(i8 0)")))
+
+(defun render-string :private (i: i64 st: StaticStr) -> str
+  (let ((n (str-len (. st text))) (arr (str-join ["[" (str (+ (str-len (. st text)) 1)) " x i8]"])))
+    (str-join ["(constant internal str." (str i) " { i64 i32 i32 i64 " arr " } { (i64 0) (i32 " (. st tid) ") (i32 "
+               (str flag-immortal) ") (i64 " (str n) ") (" arr " " (byte-words (. st text)) ") })\n"])))
+
+;; The constants: strings, immortal closures, vtables. Rust: statics.rs:105 Statics::render
 (defun statics-render (st: Statics) -> str
-  (trap "todo: E2 statics-render"))
+  (str-join
+    (into (into (vec (map-indexed render-string @(. st strings)))
+                (mapv (fn (c: StaticClosure)
+                        (str-join ["(constant internal " (unat (. c name)) " { i64 i32 i32 ptr } { (i64 0) (i32 " (str (. c tid))
+                                   ") (i32 " (str flag-immortal) ") @" (. c code) " })\n"]))
+                      @(. st closures)))
+          (mapv (fn (v: StaticVtable)
+                  (let ((k (str (count (. v slots)))))
+                    (str-join ["(constant internal " (unat (. v name)) " [" k " x ptr] ([" k " x ptr] "
+                               (s/join " " (. v slots)) "))\n"])))
+                @(. st vtables)))))

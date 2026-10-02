@@ -1,0 +1,33 @@
+;; compiler/emit/objects/kinds.fib: what an object type is: the data of emit.objects and the slot numbers, in a module of their own
+;; because the walkers (emit.objects.walk) read them and `objects-render`, which calls the walkers, is in emit.objects (fibber
+;; modules cannot call each other in a cycle; Rust's `walk` is a child module of `objects` and reads its parent).
+;; emit.objects exports all of this again (`:export-from`), so a module that `:use`s emit.objects sees it as before.
+;; Replaces crates/fibc/src/objects.rs lines 17-100 and 177-197 (the data, `variant_sname`, the slot constants).
+(ns emit.objects.kinds
+  (:use emit.value))
+
+;; The shape of a task frame slot. Rust: objects.rs:17 Frame
+(defenum FrameSlot (FrVal ty: LirTy) (FrBytes bytes: i64))
+(derive Eq FrameSlot) (derive Hash FrameSlot)
+
+;; What an object type is. Rust: objects.rs:40 ObjKind
+(defenum ObjKind
+  ObStr (ObArray elem: LirTy) (ObStruct fields: (Vec (Option LirTy)))
+  (ObEnum variants: (Vec (Vec (Option LirTy)))) (ObCell ty: LirTy) (ObAtom ty: LirTy) ObWeak
+  (ObClosure caps: (Vec LirTy)) (ObTask caps: (Vec LirTy) frame: (Vec FrameSlot)))
+(derive Eq ObjKind) (derive Hash ObjKind)
+
+;; One object type. Rust: objects.rs:77 ObjInfo
+(defstruct ObjInfo (tid: i64 sname: str name: str kind: ObjKind))
+
+;; Slot numbers of the fields of every object kind (§8.2-§8.7). Rust: objects.rs:177-197
+(def slot-struct-field0: i64 3) (def slot-enum-tag: i64 3) (def slot-variant-field0: i64 4)
+(def slot-len: i64 3) (def slot-elems: i64 4) (def slot-cell-value: i64 3)
+(def slot-atom-lock: i64 3) (def slot-atom-value: i64 4)
+(def slot-task-state: i64 3) (def slot-task-result: i64 7) (def slot-task-waiters: i64 8)
+(def slot-task-closure: i64 9) (def slot-task-resume: i64 6) (def slot-task-capture0: i64 10)
+(def slot-closure-code: i64 3) (def slot-capture0: i64 4)
+
+;; Rust: objects.rs:89 ObjInfo::variant_sname
+(defun obj-variant-sname (o: ObjInfo v: i64) -> str
+  (str-join [(. o sname) ".v" (str v)]))

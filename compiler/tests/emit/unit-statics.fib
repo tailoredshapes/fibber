@@ -1,0 +1,67 @@
+;; compiler/tests/emit/unit-statics.fib: compiler/emit/statics.fib. The two Rust tests of statics.rs
+;; (a_sealed_keyword_table_answers_its_keywords_and_refuses_a_new_one, strings_are_shared_and_render_as_constants), minus the
+;; re-read of the text by the lIR checker (the module is not linked to the lIR reader). Where Rust catches the panic of a
+;; keyword interned after the seal, this program traps: run it with the word `late` and it must end with status 134 and the
+;; message `trap: the keyword :late was interned after the keyword table was sealed` on standard error (the shell check
+;; is in E2's report). The lines marked ORACLE are lines `fibc emit-dump --sections statics` printed for programs of cases/ownership
+;; (106: a string, a vtable; the first 0N case with a closure of `even?`); the others are read from `Statics::render`.
+;; Build: fibc build compiler/tests/emit/unit-statics.fib -I compiler -I lib -o OUT
+(ns main (:use types.check emit.statics))
+
+(defun main () -> i64
+  (let ((cs (checks-new)) (st (statics-new)))
+    (do
+      (check cs "keywords are numbered in first-use order, again by their id"
+             (= [(statics-keyword st "i8") (statics-keyword st "f16") (statics-keyword st "i8")] [0 1 0]))
+      (statics-seal-keywords st)
+      (check cs "a sealed table still answers its keywords"
+             (= [(statics-keyword st "f16") (statics-keyword st "i8")] [1 0]))
+      (check cs "keywords lists them by id" (= (statics-keywords st) ["i8" "f16"]))
+      (when (= (args) ["late"])
+        (do (statics-keyword st "late") ()))
+      (let ((s (statics-new)))
+        (do (check cs "a string is named @str.N by first use and shared"
+                   (= [(statics-string s "hi" 0) (statics-string s "hi" 0) (statics-string s "" 0) (statics-string s "ab" 3)]
+                      ["@str.0" "@str.0" "@str.1" "@str.2"]))
+            (check cs "keywords of another table are numbered from 0" (= [(statics-keyword s "a") (statics-keyword s "b") (statics-keyword s "a")] [0 1 0]))
+            (check cs "closures are named @clo.N by their code, shared, in order"
+                   (= [(statics-closure s "f.g.owned" 3) (statics-closure s "f.h" 4) (statics-closure s "f.g.owned" 3)]
+                      ["@clo.0" "@clo.1" "@clo.0"]))
+            (check cs "closure-names" (= (statics-closure-names s) ["@clo.0" "@clo.1"]))
+            (check cs "vtables are named @vt.N by their name; has-vtable"
+                   (and (= (statics-vtable s "Show.str" ["@m.Show.show.str"]) "@vt.0")
+                        (= (statics-vtable s "Show.str" ["@other"]) "@vt.0")
+                        (= (statics-vtable s "Eq.str" ["@a" "@b"]) "@vt.1")
+                        (statics-has-vtable s "Eq.str") (not (statics-has-vtable s "Show.i64"))))
+            (check cs "the constants: strings, closures, vtables"
+                   (= (statics-render s)
+                      (str-join
+                        ["(constant internal str.0 { i64 i32 i32 i64 [3 x i8] } { (i64 0) (i32 0) (i32 8) (i64 2) ([3 x i8] (i8 104) (i8 105) (i8 0)) })\n"
+                         "(constant internal str.1 { i64 i32 i32 i64 [1 x i8] } { (i64 0) (i32 0) (i32 8) (i64 0) ([1 x i8] (i8 0)) })\n"
+                         "(constant internal str.2 { i64 i32 i32 i64 [3 x i8] } { (i64 0) (i32 3) (i32 8) (i64 2) ([3 x i8] (i8 97) (i8 98) (i8 0)) })\n"
+                         "(constant internal clo.0 { i64 i32 i32 ptr } { (i64 0) (i32 3) (i32 8) @f.g.owned })\n"
+                         "(constant internal clo.1 { i64 i32 i32 ptr } { (i64 0) (i32 4) (i32 8) @f.h })\n"
+                         "(constant internal vt.0 [1 x ptr] ([1 x ptr] @m.Show.show.str))\n"
+                         "(constant internal vt.1 [2 x ptr] ([2 x ptr] @a @b))\n"])))))
+      (let ((s (statics-new)))
+        (do (statics-string s "ab" 0)
+            (check cs "ORACLE: the string \"ab\" of case 106"
+                   (= (statics-render s)
+                      "(constant internal str.0 { i64 i32 i32 i64 [3 x i8] } { (i64 0) (i32 0) (i32 8) (i64 2) ([3 x i8] (i8 97) (i8 98) (i8 0)) })\n"))))
+      (let ((s (statics-new)))
+        (do (statics-closure s "f.fib.core.num.even?.owned.i64" 6)
+            (check cs "ORACLE: the immortal closure of a named function"
+                   (= (statics-render s)
+                      "(constant internal clo.0 { i64 i32 i32 ptr } { (i64 0) (i32 6) (i32 8) @f.fib.core.num.even?.owned.i64 })\n"))))
+      (let ((s (statics-new)))
+        (do (statics-vtable s "Show.Named" ["@m.fib.builtin.Show.show.Named"])
+            (check cs "ORACLE: a vtable of one slot"
+                   (= (statics-render s) "(constant internal vt.0 [1 x ptr] ([1 x ptr] @m.fib.builtin.Show.show.Named))\n"))))
+      (let ((s (statics-new)))
+        (do (statics-string s "a\"b\\c\né" 0)
+            (check cs "the bytes of a string: a quote, a backslash, a line break, a two-byte character"
+                   (= (statics-render s)
+                      (str-join ["(constant internal str.0 { i64 i32 i32 i64 [9 x i8] } { (i64 0) (i32 0) (i32 8) (i64 8) ([9 x i8] "
+                                 "(i8 97) (i8 34) (i8 98) (i8 92) (i8 99) (i8 10) (i8 195) (i8 169) (i8 0)) })\n"])))))
+      (check cs "nothing to render is empty" (= (statics-render (statics-new)) ""))
+      (finish cs))))
