@@ -1,0 +1,26 @@
+;; spec:   stdlib §4.15 (row future-call: `(spawn f)`), §8.1 item 5 (count cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 43
+;; roots:  ../../lib support
+;; covers: future-call
+;; (future-call f) is (spawn f): nothing sits between the call and the task, so ten calls allocate what
+;; ten spawns do, and no wrapper closure per call. The run allocates 43 heap objects: 3 for the Checks and
+;; the cell (a run of no tasks counts 3, one of five calls of each 23) and 2 for each of the 20 tasks
+;; (a named function is no heap object). The mutation review (MUT-L12) found that a future-call that
+;; spawned (fn () (f)) gave every answer the same and only this count tells it (53, a closure more
+;; per call); the bound is the count.
+(ns main (:use fib.core fib.async tl.check))
+
+(defun seven () -> i64 7)
+
+(defun main () -> i64
+  (let ((c (checks))
+        (total (cell 0)))
+    (do (dotimes (i 10) (set! total (+ @total (join (future-call seven)))))
+        (check c (= @total 70))
+        (set! total 0)
+        (dotimes (i 10) (set! total (+ @total (join (spawn seven)))))
+        (check c (= @total 70))
+        (checks-result c))))

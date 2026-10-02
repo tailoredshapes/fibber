@@ -1,0 +1,60 @@
+;; spec:   stdlib §2.1 rule 8 (rest of a seq is the seq of what follows), §4.4 (rows seq, rest, next, sort, VSeq)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: seq rest next sort
+;; A VSeq is front elements consed over a Vec and an offset. Its `rest` takes
+;; the front's head while there is one (the Vec and its offset stay as they
+;; are) and only then moves the offset; and the offset never goes past the
+;; end of the Vec, however often `rest` is asked of an empty seq (the
+;; comment of the instance says so, and `lo` is a field of the public type).
+;; Case 324 consed onto a sort but only asked `rest` of one that had nothing
+;; consed; here every element is read through `rest` and the seq's own `seq`,
+;; with zero, one and two elements consed on.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; the elements of a seq in order, read only through seq and rest
+(defun walk (s: (VSeq i64) out: (Vec i64)) -> (Vec i64)
+  (match (seq s) (nil out) ((some t) (walk (rest t) (fib.prelude/conj out (nth t 0))))))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (if (= (fib.prelude/count a) (fib.prelude/count b))
+      (loop ((i 0))
+        (if (< i (fib.prelude/count a))
+            (if (= (fib.prelude/nth a i) (fib.prelude/nth b i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+;; the offset after asking `rest` n times
+(defun offset-after (s: (VSeq i64) n: i64) -> i64
+  (if (= n 0) (. s lo) (offset-after (rest s) (- n 1))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s (sort [3 1 2]))
+        (s0 (conj (sort [3 1 2]) 0))
+        (s1 (conj (conj (sort [3 1 2]) 0) -1))
+        (one (conj (sort [7]) 6)))
+    (do (check c (same (walk s (vec-empty)) [1 2 3]))
+        (check c (same (walk s0 (vec-empty)) [0 1 2 3]))
+        (check c (same (walk s1 (vec-empty)) [-1 0 1 2 3]))
+        (check c (same (walk one (vec-empty)) [6 7]))
+        (check c (same (to-vec (rest s0)) [1 2 3]))
+        (check c (same (to-vec (rest s1)) [0 1 2 3]))
+        (check c (same (to-vec (rest (rest s1))) [1 2 3]))
+        (check c (same (to-vec (rest (rest (rest s1)))) [2 3]))
+        (check c (same (to-vec (rest one)) [7]))
+        (check c (= (count (rest (rest one))) 0))
+        (check c (match (next s0) (nil false) ((some t) (same (to-vec t) [1 2 3]))))
+        (check c (match (next one) (nil false) ((some t) (same (to-vec t) [7]))))
+        (check c (match (next (rest one)) (nil true) ((some _) false)))
+        (check c (= (offset-after s0 1) 0))
+        (check c (= (offset-after s0 2) 1))
+        (check c (= (offset-after s 3) 3))
+        (check c (= (offset-after s 4) 3))
+        (check c (= (offset-after s 9) 3))
+        (check c (= (offset-after s1 5) 3))
+        (check c (= (offset-after s1 8) 3))
+        (check c (= (offset-after (sort (vec-empty)) 4) 0))
+        (checks-result c))))

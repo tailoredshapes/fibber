@@ -1,0 +1,28 @@
+;; spec:   stdlib §4.4 rows filter mapcat, §2.1 rule 2 (the lazy forms), tranche 1 plan §6 L6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: filter mapcat
+;; A lazy seq whose first hundred thousand source elements give nothing (a filter that
+;; rejects them, a mapcat whose function gives an empty seq) finds
+;; its first element in a loop, not by one stack frame per skipped element: a version
+;; that recursed overflowed both tools, the interpreter at its 896 MiB of stack and the
+;; compiled program at its own limit, at this size and not at sixty thousand. Each seq
+;; is bound to a name and walked twice, so the lazy forms run (a chain that one consumer
+;; reads once is fused into recipes, which never recurse: case 248's two thousand), and
+;; the second walk finds the same count in the memoised nodes. remove is filter with the
+;; complement, so its loop is the filter's.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((s (filter (fn (x: i64) (= x 99999)) (range 100000))))
+          (do (check c (= (count s) 1))
+              (check c (= (count s) 1))))
+        (let ((s (mapcat (fn (x: i64) (if (= x 99999) [x x] [])) (range 100000))))
+          (do (check c (= (count s) 2))
+              (check c (= (count s) 2))))
+        (let ((s (filter (fn (x: i64) (> x 99999)) (range 100000))))
+          (check c (nil? (lfirst s))))
+        (checks-result c))))

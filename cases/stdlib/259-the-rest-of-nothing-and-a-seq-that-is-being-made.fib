@@ -1,0 +1,33 @@
+;; spec:   stdlib §2.1 rule 2 (the memoised lazy seq; Clojure's realized? and rest), §4.4 row lazy-seq
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: lazy-seq map
+;; Two reads of a lazy seq's state. The rest of the empty seq is the empty seq itself, not
+;; a new one: a realised empty seq's rest is realised too, where a fresh node would not be.
+;; And a seq is not realised while its own body runs, Clojure's (realized? s) inside the
+;; body of (lazy-seq ..) is false, and true once the body has returned; the body reads the
+;; seq through a cell set after the seq is made (the cell holds a seq that holds its own
+;; thunk until the body returns; the thunk is dropped once the node is realised, so no
+;; cycle outlasts the run, unlike case 252's).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (r: (Cell (Option (LSeq i64))) (cell nil))
+        (seen (cell -1)))
+    (let ((e (map (fn (x: i64) x) [])))
+      (do (check c (not (realized? e)))
+          (check c (nil? (lfirst e)))
+          (check c (realized? e))
+          (check c (realized? (lrest e)))
+          (check c (realized? (lrest (lrest e))))
+          (let ((s (lazy-seq (do (set! seen (match @r ((some t) (if (realized? t) 1 0)) (nil 2)))
+                                 [7]))))
+            (do (set! r (some s))
+                (check c (not (realized? s)))
+                (check c (= (count s) 1))
+                (check c (= @seen 0))
+                (check c (realized? s))
+                (checks-result c)))))))

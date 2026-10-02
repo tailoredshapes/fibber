@@ -1,0 +1,56 @@
+;; spec:   stdlib §2.7 (Set text, strings bare under Show and quoted under Debug)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: str
+;; Case 601 asks a Set for its ToStr and its Debug and case 605 for its ToStr;
+;; neither asks for its Show, the text `println` writes, which is a separate
+;; instance (Show (Set a)). It is #{..} with the elements a space apart, bare
+;; strings included, and #{} for the empty Set. The order of a Set is its
+;; walk's, so a Set of two elements is checked for either order, and a larger
+;; one for its length (the brackets, each element's text and one space between
+;; neighbours) and for each element appearing once. A Set inside a Vec is
+;; printed through the Set's own instance, at each of the three printers.
+(ns main (:use fib.core fib.seq fib.print tl.check))
+
+(defun fill (n: i64) -> (Set i64)
+  (loop ((i 0) (s (set-empty))) (if (< i n) (recur (+ i 1) (conj s i)) s)))
+
+;; how many times pat occurs in s
+(defun occurrences (s: str pat: str) -> i64
+  (loop ((from 0) (n 0))
+    (match (str-find s pat from)
+      (nil n)
+      ((some at) (recur (+ at (str-len pat)) (+ n 1))))))
+
+(defun every-digit-once (s: str) -> bool
+  (loop ((d 0))
+    (if (< d 10) (if (= (occurrences s (show d)) 1) (recur (+ d 1)) false) true)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (e: (Set i64) (set-empty))
+        (one (conj (set-empty) 7))
+        (word (conj (set-empty) "a"))
+        (two (conj (conj (set-empty) "a") "b"))
+        (ten (show (fill 10)))
+        (sets [(conj (set-empty) "a")]))
+    (do (check c (= (show e) "#{}"))
+        (check c (= (show one) "#{7}"))
+        (check c (= (show word) "#{a}"))
+        (check c (= (debug word) "#{\"a\"}"))
+        (check c (= (str word) "#{\"a\"}"))
+        (check c (let ((x (show two))) (or (= x "#{a b}") (= x "#{b a}"))))
+        (check c (let ((x (debug two))) (or (= x "#{\"a\" \"b\"}") (= x "#{\"b\" \"a\"}"))))
+        (check c (= (str-len ten) 22))
+        (check c (starts-with? ten "#{"))
+        (check c (= (str-slice ten 21 22) "}"))
+        (check c (= (occurrences ten " ") 9))
+        (check c (= (occurrences ten "}") 1))
+        (check c (every-digit-once ten))
+        (check c (= (show sets) "[#{a}]"))
+        (check c (= (debug sets) "[#{\"a\"}]"))
+        (check c (= (str sets) "[#{\"a\"}]"))
+        (check c (= (show (Pair 1 one)) "[1 #{7}]"))
+        (checks-result c))))

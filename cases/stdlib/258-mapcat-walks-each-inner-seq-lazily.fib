@@ -1,0 +1,45 @@
+;; spec:   stdlib §4.4 row mapcat, §2.1 rule 2 (the lazy forms), tranche 1 plan §6 L6 (mapcat appends (to-lseq (f x)))
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mapcat take map
+;; The seq mapcat gives makes the first element of the first non-empty inner seq without
+;; making the rest of that inner seq: an inner lazy seq of three counted elements has run
+;; its function once after the first element is asked for, and three elements taken from an
+;; inner seq of five nodes have made three nodes, not five (six elements: the five, the
+;; node that ends the first inner seq, and the first node of the second: seven). The
+;; result seq is bound to a name, so the lazy form runs; written as one nested call under a
+;; consumer it would be the Mapcat recipe, which walks its inner sources by each-while.
+(ns main (:use fib.core fib.seq tl.check))
+
+;; n, n-1 .. 1 and then the end, one node made (and counted) per demand
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (do (let ((s (mapcat (fn (x: i64) (map (fn (y: i64) (do (set! calls (+ @calls 1)) (+ x y))) [1 2 3])) [10 20])))
+          (do (check c (= (match (lfirst s) ((some x) x) (nil -1)) 11))
+              (check c (= @calls 1))
+              (check c (= (match (lfirst s) ((some x) x) (nil -1)) 11))
+              (check c (= @calls 1))
+              (check c (= (total s) 102))
+              (check c (= @calls 6))))
+        (let ((nodes (cell 0)))
+          (let ((s (mapcat (fn (x: i64) (countdown 5 nodes)) [1 2])))
+            (do (check c (= (digits (take 3 s)) 543))
+                (check c (= @nodes 3))
+                (check c (= (digits (take 6 s)) 543215))
+                (check c (= @nodes 7)))))
+        (checks-result c))))

@@ -1,0 +1,43 @@
+;; spec:   stdlib §2.1 rule 4 (count is a walk that calls f), tranche 1 plan §6 L6 (size is not overridden)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: count
+;; No recipe has a size of its own: counting one walks it, and a counting function under it
+;; runs once for each element the walk reaches, as (count (map f c)) does in case 254.
+;; Each of the seven constructors is counted over [1 2 3 4 5] with a counted Mapped as its
+;; source, so the number of calls tells how far the source was walked: all five under a
+;; Mapped, a Filtered, a Dropped and a Mapcat, the first three under a Taken of three (the
+;; walk stops at the third), the first three under a TakenWhile that fails at 3, and ten
+;; under a Cat of two of them.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun counted (v: (Vec i64) calls: (Cell i64)) -> (Mapped (Vec i64) i64 i64)
+  (Mapped v (fn (x: i64) (do (set! calls (+ @calls 1)) x))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [1 2 3 4 5])
+        (calls (cell 0)))
+    (do (check c (= (count (counted v calls)) 5))
+        (check c (= @calls 5))
+        (set! calls 0)
+        (check c (= (count (Filtered (counted v calls) (fn (x: i64) (> x 2)))) 3))
+        (check c (= @calls 5))
+        (set! calls 0)
+        (check c (= (count (Taken (counted v calls) 3)) 3))
+        (check c (= @calls 3))
+        (set! calls 0)
+        (check c (= (count (Dropped (counted v calls) 2)) 3))
+        (check c (= @calls 5))
+        (set! calls 0)
+        (check c (= (count (TakenWhile (counted v calls) (fn (x: i64) (< x 3)))) 2))
+        (check c (= @calls 3))
+        (set! calls 0)
+        (check c (= (count (Mapcat (counted v calls) (fn (x: i64) [x x]))) 10))
+        (check c (= @calls 5))
+        (set! calls 0)
+        (check c (= (count (Cat (counted v calls) (counted v calls))) 10))
+        (check c (= @calls 10))
+        (checks-result c))))

@@ -1,0 +1,76 @@
+;; spec:   stdlib §4.4 (row range-by), §2.8 (overflow traps at every width), tranche 1 plan §6 L5a and MUT-L5a
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: range-by
+;; The count and the nth of an integer range are closed forms with two branches: a range that does not straddle
+;; zero (start at or above it, or end at or below it) is the plain quotient of `end - 1 - start`, and one that
+;; does is worked from its two sides, because `end - 1 - start` itself overflows there (case 163 pins the ends
+;; 0 and the largest). A range that starts at the smallest i64 and ends at 1 is the nearest straddling range
+;; to the line: `end - 1 - start` is 2^63, one more than the largest i64, and the plain formula traps, as does
+;; the plain `start + i * step` at an index whose product is 2^63. So the count, the nth and the walk of these
+;; ranges are checked at the ends -1, 0, 1 and 2 on both sides of the line and, mirrored, with the step
+;; downwards from the largest i64 to the end -2 (the same ranges seen through the bitwise complement).
+;; A count above the largest i64 is the largest i64 (case 163).
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun same (v: (Vec i64) xs: (Vec i64)) -> bool
+  (and (= (fib.prelude/count v) (fib.prelude/count xs))
+       (loop ((i 0))
+         (if (< i (fib.prelude/count v))
+             (if (= (fib.prelude/nth v i) (fib.prelude/nth xs i)) (recur (+ i 1)) false)
+             true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (top 9223372036854775807)
+        (bottom -9223372036854775808)
+        (half 4611686018427387904))
+    (do ;; the start is the smallest i64 and the end is 1: 2^63 + 1 elements at a step of 1
+        (check c (= (range-len bottom 1 1) top))
+        (check c (= (count (range-by bottom 1 1)) top))
+        (check c (= (range-len bottom 1 2) 4611686018427387905))
+        (check c (= (count (range-by bottom 1 2)) 4611686018427387905))
+        (check c (= (range-len bottom 1 3) 3074457345618258603))
+        ;; three elements: the start, a quarter of the way up, and 0
+        (check c (= (count (range-by bottom 1 half)) 3))
+        (check c (same (to-vec (range-by bottom 1 half)) [-9223372036854775808 -4611686018427387904 0]))
+        (check c (= (nth (range-by bottom 1 half) 1) (- 0 half)))
+        (check c (= (nth (range-by bottom 1 half) 2) 0))
+        ;; the index whose product with the step is 2^63: the element is 0, the product is not representable
+        (check c (= (nth (range-by bottom 1 2) half) 0))
+        (check c (= (nth (range-by bottom 1 2) (- half 1)) -2))
+        (check c (= (nth (range-by bottom 1 2) (- half 2)) -4))
+        (check c (= (nth (range-by bottom 1 4294967296) 2147483648) 0))
+        ;; the ends -1, 0, 1, 2 with the start at the smallest + 1 (the span is 2^63 - 1 + end)
+        (check c (= (range-len -9223372036854775807 0 1) top))
+        (check c (= (range-len -9223372036854775807 1 1) top))
+        (check c (= (range-len -9223372036854775807 2 1) top))
+        (check c (= (count (range-by -9223372036854775807 1 half)) 2))
+        (check c (= (nth (range-by -9223372036854775807 1 half) 1) -4611686018427387903))
+        ;; small ranges that end at -1, 0, 1 and 2, or start at -1, 0 and 1
+        (check c (same (to-vec (range-by -5 -1 2)) [-5 -3]))
+        (check c (same (to-vec (range-by -5 0 2)) [-5 -3 -1]))
+        (check c (same (to-vec (range-by -5 1 2)) [-5 -3 -1]))
+        (check c (same (to-vec (range-by -5 2 2)) [-5 -3 -1 1]))
+        (check c (same (to-vec (range-by -2 1 1)) [-2 -1 0]))
+        (check c (same (to-vec (range-by -1 1 1)) [-1 0]))
+        (check c (same (to-vec (range-by -1 2 3)) [-1]))
+        (check c (same (to-vec (range-by 0 1 1)) [0]))
+        (check c (= (count (range-by -5 1 2)) 3))
+        (check c (= (nth (range-by -5 1 2) 2) -1))
+        (check c (= (nth (range-by -5 2 2) 3) 1))
+        (check c (= (nth (range-by -3 1 2) 1) -1))
+        ;; mirrored: from the largest i64 down to -2, the same ranges through the bitwise complement
+        (check c (= (range-len top -2 -1) top))
+        (check c (= (count (range-by top -2 -1)) top))
+        (check c (= (range-len top -2 -2) 4611686018427387905))
+        (check c (= (count (range-by top -2 (- 0 half))) 3))
+        (check c (same (to-vec (range-by top -2 (- 0 half))) [9223372036854775807 4611686018427387903 -1]))
+        (check c (= (nth (range-by top -2 (- 0 half)) 2) -1))
+        (check c (= (nth (range-by top -2 -2) half) -1))
+        (check c (same (to-vec (range-by 5 -2 -2)) [5 3 1 -1]))
+        (check c (same (to-vec (range-by 4 -2 -2)) [4 2 0]))
+        (check c (same (to-vec (range-by 4 -3 -2)) [4 2 0 -2]))
+        (checks-result c))))
