@@ -1,0 +1,67 @@
+;; compiler/emit/args.fib: the words `emit` (`fibc emit-dump`) takes before the files (spec/bootstrap.md §8.2), as
+;; crates/fibc/src/emit_dump/args.rs (229 lines of Rust, most of them tests): `--sections LIST` of
+;; runtime,externs,types,statics,keywords,defs,quotes,fns,main; `--fn PREFIX`; `--layout`; `--macro NAME`; a lone `--` ends them.
+;; `--layout` and `--macro` stand alone (neither with the other, nor with `--sections` or `--fn`); at least one file follows.
+;; Shapes decided: the Rust `Option<BTreeSet<Section>>` is a `(Option (Vec str))` of section names (only membership is asked).
+(ns emit.args
+  (:require [fib.string :as s]))
+
+;; The sections of a module in the order they are printed. Rust: emit_dump/mod.rs:31 Section::ALL
+(def section-names: (Vec str) ["runtime" "externs" "types" "statics" "keywords" "defs" "quotes" "fns" "main"])
+
+;; Rust: emit_dump/mod.rs:84 Options
+(defstruct EmitOptions (sections: (Option (Vec str)) fn-prefix: (Option str) layout: bool macro-name: (Option str)))
+
+;; The options and the files. Rust: `Option<(Options, Vec<String>)>` of args.rs:11 parse_args
+(defstruct EmitParsed (opts: EmitOptions files: (Vec str)))
+
+(defun emit-options-default () -> EmitOptions (EmitOptions nil nil false nil))
+
+;; Whether the section is printed: those listed, else (with `--fn`) the functions only, else all. Rust: mod.rs:95 Options::wants
+(defun emit-wants (o: EmitOptions sec: str) -> bool
+  (match (. o sections)
+    ((some names) (some? (first (filter (fn (n: str) (= n sec)) names))))
+    (nil (match (. o fn-prefix)
+           ((some _) (= sec "fns"))
+           (nil true)))))
+
+;; Whether `n` is the name of a section.
+(defun section-name? :private (n: str) -> bool
+  (not (not-any? (fn (m: str) (= m n)) section-names)))
+
+;; The sections of a comma-separated list, or nil if one is not a section.
+(defun section-list :private (list: str) -> (Option (Vec str))
+  (let ((names (s/split list ",")))
+    (if (and (not (empty? names)) (not-any? (fn (n: str) (not (section-name? n))) names))
+        (some names)
+        nil)))
+
+;; The options of the words before the files; `i` is the next word.
+(defun parse-from :private (words: (Vec str) i: i64 o: EmitOptions) -> (Option EmitParsed)
+  (let ((w (if (< i (count words)) (nth words i) ""))
+        (value (if (< (+ i 1) (count words)) (nth words (+ i 1)) ""))
+        (se (. o sections)) (fp (. o fn-prefix)) (la (. o layout)) (ma (. o macro-name)))
+    (cond (>= i (count words)) (parse-end o [])
+          (= w "--") (parse-end o (vec (drop (+ i 1) words)))
+          (= w "--layout") (parse-from words (+ i 1) (EmitOptions se fp true ma))
+          (and (or (= w "--sections") (= w "--fn") (= w "--macro")) (= value "")) nil
+          (= w "--sections")
+            (match (section-list value)
+              (nil nil)
+              ((some l) (parse-from words (+ i 2) (EmitOptions (some l) fp la ma))))
+          (= w "--fn") (parse-from words (+ i 2) (EmitOptions se (some value) la ma))
+          (= w "--macro") (parse-from words (+ i 2) (EmitOptions se fp la (some value)))
+          (starts-with? w "--") nil
+          :else (parse-end o (vec (drop i words))))))
+
+;; The options are checked against each other once the files are known.
+(defun parse-end :private (o: EmitOptions files: (Vec str)) -> (Option EmitParsed)
+  (let ((alone (+ (if (. o layout) 1 0) (if (some? (. o macro-name)) 1 0)))
+        (others (or (some? (. o sections)) (some? (. o fn-prefix)))))
+    (if (or (> alone 1) (and (= alone 1) others) (empty? files))
+        nil
+        (some (EmitParsed o files)))))
+
+;; Rust: args.rs:11 parse_args
+(defun emit-parse-args (words: (Vec str)) -> (Option EmitParsed)
+  (parse-from words 0 (emit-options-default)))

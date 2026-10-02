@@ -1,69 +1,216 @@
-;; compiler/emit/lower/mod.fib: lowering a body (spec/compiler.md §4): `emit_body`, `emit_closure`, the expression and value walkers and the small
-;; emitters of the context. Replaces crates/fibc/src/lower/mod.rs; its data is in emit.lower.cx. `float_text`
-;; (mod.rs:493) is `float-lir-text` of emit.text (real, tested).
-;; STATUS: every public function below is a STUB of package E4, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/mod.rs, 501 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/mod.fib: lowering a body (spec/compiler.md §4): `emit_body`, `emit_closure` and `emit_async` (the entry points),
+;; the dispatch over expression kinds and the hub that lets the modules below call it. Replaces crates/fibc/src/lower/mod.rs (501
+;; lines of Rust). What every module needs from below (`lcx-ty`, `lcx-local`, `lcx-value`, `lcx-gep`, `literals`, ..) is in
+;; emit.lower.cx (see its header: a module cannot call upward); here is what only the top needs. `float_text` (mod.rs:493) is
+;; `float-lir-text` of emit.text.
 (ns emit.lower.mod
-  (:use types.ty types.ast types.program own.program syntax.form emit.value emit.ir emit.mono emit.program emit.lower.cx))
+  (:use types.ty types.ast types.decls types.program types.table types.init own.program syntax.form emit.value emit.text emit.layout
+        emit.ir emit.mono emit.statics emit.objects emit.program emit.resume emit.lower.cx emit.lower.ops emit.lower.ctrl
+        emit.lower.values emit.lower.call emit.lower.arith emit.lower.objects emit.lower.cells emit.lower.dynamic
+        emit.lower.pattern emit.lower.quote emit.lower.threads))
 
-;; Rust: lower/mod.rs:84
-(defun emit-body (p: Program inst: Inst) -> (Result unit str)
-  (trap "todo: E4 emit-body"))
+;; The functions the modules below call upward, as the Rust methods they stand for (the hub of emit.lower.cx).
+(defun hub-default () -> Hub
+  (Hub expr-step lcx-method-value lcx-builtin-value))
 
-;; Rust: lower/mod.rs:132
-(defun emit-closure (p: Program owner: Inst lit: i64 name: str) -> (Result unit str)
-  (trap "todo: E4 emit-closure"))
-
-;; Rust: lower/mod.rs:239
-(defun literals (typed: TypedProgram owned: OwnedProgram key: BodyKey) -> (Map i64 Expr)
-  (trap "todo: E4 literals"))
-
-;; Rust: lower/mod.rs:258 LowerCx::new
+;; Rust: lower/mod.rs:258 Cx::new
 (defun lcx-new (p: Program inst: Inst own: BodyOwn name: str params: (Vec LirParam)) -> LowerCx
-  (trap "todo: E4 lcx-new"))
+  (lcx-build p inst own name params true (hub-default) (literals (. p typed) (. p owned) (. inst key))))
 
-;; Rust: lower/mod.rs:302 LowerCx::ty
-(defun lcx-ty (cx: LowerCx e: Expr) -> (Result Ty str)
-  (trap "todo: E4 lcx-ty"))
+;; ---- the entry points
 
-;; Rust: lower/mod.rs:307 LowerCx::binding_ty
-(defun lcx-binding-ty (cx: LowerCx b: i64) -> (Result Ty str)
-  (trap "todo: E4 lcx-binding-ty"))
+;; A parameter's value in the body and its place in the signature (none for a `unit` parameter).
+(defstruct ParamSlot (binding: i64 v: V sig: (Option LirParam)))
 
-;; Rust: lower/mod.rs:318 LowerCx::local
-(defun lcx-local (cx: LowerCx b: i64) -> (Result V str)
-  (trap "todo: E4 lcx-local"))
+(defun param-slot :private (p: Program inst: Inst i: i64 b: i64) -> (Result ParamSlot str)
+  (try-let ((t (binding-ty p inst b)) (l (program-lir p t)))
+    (Ok (match l
+          ((some x) (let ((pn (str-join ["p" (str i)]))) (ParamSlot b (VVal pn x) (some (LirParam x pn)))))
+          (nil (ParamSlot b VUnit nil))))))
 
-;; Rust: lower/mod.rs:333 LowerCx::expr
-(defun lcx-expr (cx: LowerCx e: Expr) -> (Result Flow str)
-  (trap "todo: E4 lcx-expr"))
+(defun param-slots :private (p: Program inst: Inst bs: (Vec i64)) -> (Result (Vec ParamSlot) str)
+  (try-map (fn (i: i64) (param-slot p inst i (nth bs i))) (vec (range (count bs)))))
 
-;; Rust: lower/mod.rs:347 LowerCx::value
-(defun lcx-value (cx: LowerCx e: Expr) -> (Result V str)
-  (trap "todo: E4 lcx-value"))
+(defun params-sig :private (ps: (Vec ParamSlot)) -> (Vec LirParam)
+  (vec (keep (fn (s: ParamSlot) (. s sig)) ps)))
 
-;; Rust: lower/mod.rs:418 LowerCx::obj_word
-(defun lcx-obj-word (cx: LowerCx v: V) -> (Option str)
-  (trap "todo: E4 lcx-obj-word"))
+(defun bind-params :private (cx: LowerCx ps: (Vec ParamSlot)) -> unit
+  (doseq [s ps] (set! (. cx locals) (assoc @(. cx locals) (. s binding) (LocalVal (. s v))))))
 
-;; Rust: lower/mod.rs:432 LowerCx::trap_c
-(defun lcx-trap-c (cx: LowerCx msg: str) -> unit
-  (trap "todo: E4 lcx-trap-c"))
+(defun ret-term :private (cx: LowerCx v: V) -> unit
+  (fb-term (. cx b) (match v ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"])))))
 
-;; Rust: lower/mod.rs:439 LowerCx::gep
-(defun lcx-gep (cx: LowerCx sname: str p: str i: i64) -> str
-  (trap "todo: E4 lcx-gep"))
+;; Lowers the body, returns its value, and records the function. Rust: lower/mod.rs:276 Cx::finish_with
+(defun finish-with :private (cx: LowerCx body: Expr) -> (Result unit str)
+  (try-let ((rt (lcx-ty cx body)) (l (program-lir (. cx p) rt)))
+    (do (set! (. (. cx b) ret) l)
+        (try-let ((flow (lcx-expr cx body)))
+          (do (match flow ((FlowVal v) (ret-term cx v)) ((FlowJump) ()))
+              (set! (. (. cx p) funcs) (conj @(. (. cx p) funcs) (fb-render (. cx b))))
+              (Ok ()))))))
 
-;; Rust: lower/mod.rs:449 LowerCx::load
-(defun lcx-load (cx: LowerCx t: LirTy ptr: str) -> V
-  (trap "todo: E4 lcx-load"))
+;; The parameter bindings of the body a key names.
+(defun key-params :private (g: Globals key: BodyKey) -> (Vec i64)
+  (let ((of-fun (fn (f: i64) (mapv (fn (q: ParamDecl) (. q binding)) (. (g-fun g f) params))))
+        (of-method (fn (i: i64 m: i64) (. (nth (. (table-get (. g instances) i) methods) m) params))))
+    (match key
+      ((BodyFun f) (of-fun f))
+      ((BodyAllOwned f) (of-fun f))
+      ((BodyMethod i m) (of-method i m))
+      ((BodyMethodOwned i m) (of-method i m))
+      ((BodyDef _) []))))
 
-;; Rust: lower/mod.rs:453 LowerCx::store
-(defun lcx-store (cx: LowerCx v: V ptr: str) -> unit
-  (trap "todo: E4 lcx-store"))
+;; Emits the function of `inst` into the program. Rust: lower/mod.rs:84 emit_body
+(defun emit-body (p: Program inst: Inst) -> (Result unit str)
+  (let ((g (program-g p)))
+    (match (get (. (. p owned) bodies) (. inst key))
+      (nil (Err "no plan for the body"))
+      ((some own)
+       (let ((name (queue-request (. p queue) g inst))
+             (env (match (. inst key) ((BodyAllOwned _) true) ((BodyMethodOwned _ _) true) (_ false))))
+         (try-let ((ps (param-slots p inst (key-params g (. inst key)))))
+           (let ((cx (lcx-new p inst own name (into (if env [(LirParam LirPtr "env")] []) (params-sig ps)))))
+             (do (bind-params cx ps)
+                 (when env (set! (. cx env) (some (VVal "env" LirPtr))))
+                 (finish-with cx (body-expr g (. inst key)))))))))))
 
-;; Rust: lower/mod.rs:481
+;; The captures of a closure body, loaded from `env` in capture order into their bindings. Rust: lower/mod.rs:462 load_captures
+(defun load-captures :private (cx: LowerCx e: Expr) -> (Result unit str)
+  (match (get (. (. cx own) closures) (. e id))
+    (nil (Err "no plan for a fn literal"))
+    ((some oc)
+     (try-let ((caps (lcx-capture-tys cx oc)))
+       (let ((sname (. (program-closure-object (. cx p) (. cx name) caps) snd)))
+         (do (doseq [i (range (min (count (. oc captures)) (count caps)))]
+               (let ((slot (lcx-gep cx sname "env" (+ slot-capture0 i))))
+                 (let ((v (lcx-load cx (nth caps i) slot)))
+                   (set! (. cx locals) (assoc @(. cx locals) (. (nth (. oc captures) i) binding) (LocalVal v))))))
+             (Ok ())))))))
+
+;; Emits the code of closure literal `lit` of `owner` (§8.4): `env` first, then the parameters; captures loaded from `env`.
+;; Rust: lower/mod.rs:132 emit_closure
+(defun emit-closure (p: Program owner: Inst lit: i64 name: str) -> (Result unit str)
+  (match (get (. (. p owned) bodies) (. owner key))
+    (nil (Err "no plan for the owner of a closure"))
+    ((some own)
+     (let ((lits (literals (. p typed) (. p owned) (. owner key))))
+       (match (get lits lit)
+         (nil (Err (str-join ["no literal " (str lit)])))
+         ((some e)
+          (match (. e kind)
+            ((EFn f) (emit-fn p owner own lits e f name))
+            ((EAsync body _) (emit-async p owner own lits e body name))
+            (_ (Err "a literal that is neither fn nor async")))))))))
+
+;; The code of a `fn` literal: its own name (a self-recursive closure) is the closure object, which is `env`.
+(defun emit-fn :private (p: Program owner: Inst own: BodyOwn lits: (Map i64 Expr) e: Expr f: FnLit name: str) -> (Result unit str)
+  (try-let ((ps (param-slots p owner (mapv (fn (q: FnParam) (. q binding)) (. f params)))))
+    (let ((cx (lcx-build p owner own name (into [(LirParam LirPtr "env")] (params-sig ps)) true (hub-default) lits))
+          (env (VVal "env" LirPtr)))
+      (do (set! (. cx env) (some env))
+          (when-some (n (. f name)) (set! (. cx locals) (assoc @(. cx locals) n (LocalVal env))))
+          (bind-params cx ps)
+          (try-let ((loaded (load-captures cx e)))
+            (finish-with cx (. f body)))))))
+
+;; Loads the captures of a task from its object into their bindings; the point of the frame is the field after them.
+(defun load-task-captures :private (cx: LowerCx oc: ClosureOwn caps: (Vec LirTy) sname: str) -> unit
+  (doseq [i (range (min (count (. oc captures)) (count caps)))]
+    (let ((slot (lcx-gep cx sname "env" (+ slot-task-capture0 i))))
+      (let ((v (lcx-load cx (nth caps i) slot)))
+        (set! (. cx locals) (assoc @(. cx locals) (. (nth (. oc captures) i) binding) (LocalVal v)))))))
+
+;; The result type of an `async` literal: the argument of its `Task` type.
+(defun task-result :private (t: Ty) -> (Result Ty str)
+  (match t
+    ((TCon (KTask) args) (Ok (nth args 0)))
+    (_ (Err "async without a Task type"))))
+
+;; The resume function of an `async` body (§8.8): `env` is the task object, whose captures follow its fixed fields; the body is
+;; lowered like any function, then made a state machine (emit.resume), and the task's frame takes the shape that gives it.
+;; Rust: lower/mod.rs:171 emit_async
+(defun emit-async :private (p: Program owner: Inst own: BodyOwn lits: (Map i64 Expr) e: Expr body: Expr name: str) -> (Result unit str)
+  (let ((cx (lcx-build p owner own name [(LirParam LirPtr "env")] false (hub-default) lits)))
+    (do (set! (. cx env) (some (VVal "env" LirPtr)))
+        (match (get (. own closures) (. e id))
+          (nil (Err "no plan for an async literal"))
+          ((some oc)
+           (try-let ((caps (lcx-capture-tys cx oc)))
+             (let ((task (program-task-object p (. cx name) caps)))
+               (do (load-task-captures cx oc caps (. task snd))
+                   (let ((point (+ slot-task-capture0 (count caps)))
+                         (prologue (count @(. (nth @(. (. cx b) blocks) 0) items))))
+                     (do (set! (. cx async-frame) (some (AsyncFrame (. task snd) point [])))
+                         (async-body cx e body name task point prologue)))))))))))
+
+;; The body of an `async` literal and the state machine made of it.
+(defun async-body :private (cx: LowerCx e: Expr body: Expr name: str task: (Pair i64 str) point: i64 prologue: i64) -> (Result unit str)
+  (try-let ((ety (lcx-ty cx e)) (result-ty (task-result ety)) (l (program-lir (. cx p) result-ty)))
+    (do (set! (. (. cx b) ret) l)
+        (try-let ((flow (lcx-expr cx body)))
+          (do (match flow ((FlowVal v) (ret-term cx v)) ((FlowJump) ()))
+              (try-let ((complete (lcx-complete-helper cx name result-ty)))
+                (let ((states (match @(. cx async-frame) ((some f) (. f states)) (nil []))))
+                  (do (set! (. cx async-frame) nil)
+                      (try-let ((frame (make-resumable (. cx b) (ResumeShape (. task snd) prologue states complete point))))
+                        (do (objects-set-task-frame (. (. cx p) objects) (. task fst) frame)
+                            (set! (. (. cx p) funcs) (conj @(. (. cx p) funcs) (fb-render (. cx b))))
+                            (Ok ())))))))))))
+
+;; The Vec runtime ids of `(Vec elem)` outside any body (for the macro surface, `compile_macro`). Any body key whose definition
+;; exists will do: the literal table of the context is read from it and not used. Rust: lower/mod.rs:481 vec_ids_of
 (defun vec-ids-of (p: Program t: Ty elem: Ty) -> (Result VecIds str)
-  (trap "todo: E4 vec-ids-of"))
+  (lcx-vec-tids (lcx-new p (Inst (BodyFun 0) []) (empty-plan) "fibm.ids" []) t elem))
+
+;; ---- the dispatch over expression kinds
+
+(defun val-flow :private (r: (Result V str)) -> (Result Flow str)
+  (match r ((Ok v) (Ok (FlowVal v))) ((Err e) (Err e))))
+
+;; A literal's value. Rust: lower/mod.rs:381 literal
+(defun literal-value :private (cx: LowerCx e: Expr l: Lit) -> (Result V str)
+  (match l
+    ((LitInt n _) (try-let ((t (lcx-ty cx e)) (lt (program-lir (. cx p) t))) (Ok (v-int (unwrap-or lt LirI64) n))))
+    ((LitFloat x w) (let ((t (match w ((F32) LirFloat) ((F64) LirDouble))))
+                      (Ok (VVal (str-join ["(" (lir-ty-text t) " " (float-lir-text x) ")"]) t))))
+    ((LitStr s) (Ok (VVal (statics-string (. (. cx p) statics) s 0) LirPtr)))
+    ((LitChar c) (Ok (v-int LirI32 (long c))))
+    ((LitBool b) (Ok (v-int LirI1 (if b 1 0))))
+    ((LitKeyword k) (Ok (v-int LirI64 (statics-keyword (. (. cx p) statics) k))))
+    ((LitUnit) (Ok VUnit))))
+
+;; What an expression yields, without the plan's operations after it. Rust: lower/mod.rs:361 form
+(defun form :private (cx: LowerCx e: Expr) -> (Result Flow str)
+  (match (. e kind)
+    ((ELit l) (val-flow (literal-value cx e l)))
+    ((ELocal b) (val-flow (lcx-local cx b)))
+    ((EGlobal g) (val-flow (lcx-global cx e g)))
+    ((ECall h args) (lcx-call cx e h args))
+    ((EFn _) (val-flow (lcx-make-fn cx e)))
+    ((ELet bs body) (lcx-let-form cx bs body))
+    ((EIf c t f) (lcx-if-form cx e c t f))
+    ((EDo es) (lcx-do-form cx es))
+    ((EMatch s cls) (lcx-match-form cx e s cls))
+    ((ELoop vs body) (lcx-loop-form cx e vs body))
+    ((ERecur args) (lcx-recur cx e args))
+    ((EField x name _) (val-flow (lcx-field-of cx x name)))
+    ((EDeref pl _) (val-flow (lcx-deref-place cx pl)))
+    ((ESet pl v) (val-flow (lcx-set-place cx pl v)))
+    ((ESetField b f v) (val-flow (lcx-set-field cx b f v)))
+    ((EUnsafe b) (lcx-expr cx b))
+    ((EDyn pr _ _ b) (val-flow (lcx-dyn-of cx pr b)))
+    ((EConvert op t x) (try-let ((v (lcx-value cx x))) (val-flow (lcx-convert cx op t v))))
+    ((EAsync _ _) (val-flow (lcx-make-async cx e)))
+    ((EAwait x) (val-flow (lcx-await-task cx x)))
+    ((EQuote f) (val-flow (lcx-quote cx e f)))
+    ((EConcat es) (val-flow (lcx-concat cx e es)))))
+
+;; Lowers an expression: its value, then the plan's operations (the hub's `expr`). Rust: lower/mod.rs:333 Cx::expr
+(defun expr-step (cx: LowerCx e: Expr) -> (Result Flow str)
+  (try-let ((flow (form cx e)))
+    (match flow
+      ((FlowVal v)
+       (do (when (contains? (. cx value-sites) (. e id))
+             (set! (. cx values) (assoc @(. cx values) (. e id) v)))
+           (try-let ((ran (lcx-after cx (. e id)))) (Ok flow))))
+      ((FlowJump) (Ok flow)))))

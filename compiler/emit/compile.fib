@@ -1,36 +1,76 @@
-;; compiler/emit/compile.fib: the driver of the emission: the runtime declarations, the assembly of the module text from its parts, `compile`
-;; and `compile_macro` (spec/compiler.md §2, §6). Replaces crates/fibc/src/compile.rs. `compile` takes the two parts
-;; of the Rust `Checked`; `Unsupported(String)` is the `str` of a `(Result a str)`.
-;; STATUS: every public function below is a STUB of package E3, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/compile.rs, 326 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/compile.fib: the driver of the emission: `compile` and `compile-module` (spec/compiler.md §2, types §8): the runtime, the
+;; type table, the static data, every specialised body reached from `main`, and lIR's `main`. Replaces crates/fibc/src/compile.rs. `compile`
+;; takes the two parts of the Rust `Checked`; `Unsupported(String)` is the `str` of a `(Result a str)`.
+;; Where the rest of compile.rs went: RUNTIME and `runtime_declaration` are emit.rt's (over the generated emit.runtime), `emit_all`, `Parts`,
+;; `Module`, `module_parts` and `assemble_parts` are emit.assemble's (emit.defs.mod needs them), the init functions of inits.rs are emit.inits.
+;; `compile-module` does not fail at a stub (an error message starting `todo: `, package E4 and later): the `Module` it returns has `pending`
+;; set and holds what needs no body, the runtime and `main`.
+;; STATUS: `compile-macro` is still a STUB of package E11, `(trap "todo: PACKAGE NAME")`.
 (ns emit.compile
-  (:use types.program own.program emit.value emit.program))
+  (:use types.decls types.program own.program emit.value emit.names emit.program emit.inits emit.assemble emit.defs.mod))
 
 ;; The text of a macro module. Rust: compile.rs:88 MacroModule
 (defstruct MacroModule (text: str))
 
-;; Rust: compile.rs:36
-(defun runtime-declaration (name: str) -> (Option str)
-  (trap "todo: E3 runtime-declaration"))
+;; The fixed end of a module: `main`, which §8.8 has join every thread still running before the result is printed (fibc run) or
+;; returned (an executable), calling the program's entry function. Rust: compile.rs:296 main_text
+(defun main-text :private (entry: str executable: bool init: str) -> str
+  (let ((end (if executable
+                 "(ret (trunc i32 r))"
+                 "(call @printf (string \"%lld\\n\") r)\n      (ret (i32 0))")))
+    (str-join ["(declare printf i32 (ptr ...))\n(define (main i32) ((i32 argc) (ptr argv))\n  (block entry\n    (call @fib.init)\n"
+               "    (call @fib.set-args argc argv)\n    " init "\n    (let ((r (call @" entry ")))\n      (call @fib.join-all)\n"
+               "      (call @fib.pool-quiesce)\n      " end ")))\n"])))
 
-;; Rust: compile.rs:47
+;; The constant `def`s are made by `emit-defs`, which runs each through the JIT; a program with none has no defs to make (the Rust
+;; `emit_defs` loops over none and returns the empty `Defs`), so it never reaches that package.
+(defun make-defs :private (p: Program) -> (Result Defs str)
+  (if (empty? (filter (fn (d: i64) (. (g-def (program-g p) d) constant)) (all-def-ids p)))
+      (Ok (Defs (cell "") (cell (map-empty)) (cell []) (cell 0)))
+      (emit-defs p)))
+
+;; The `main` section: the init functions, then `main` calling the entry. Nothing in it depends on a body being emitted.
+(defun main-part :private (p: Program entry: str executable: bool) -> str
+  ;; §3.19, L15: the init functions of the `def`s made at run time come before `main`, which calls them after the arguments are known.
+  (str-join [(inits-render p) (main-text entry executable (if (empty? @(. p inits)) "" "(call @fib.defs-init)"))]))
+
+;; A stub reached is an error whose message starts `todo: `: the module is then pending, with what needs no body.
+(defun pending-or-error :private (p: Program entry: str executable: bool m: str) -> (Result Module str)
+  (if (starts-with? m "todo: ")
+      (Ok (Module (parts-pending) (main-part p entry executable) (some m)))
+      (Err m)))
+
+;; The Module of a program that has a `main`, planned, with its defs made and its entry requested. Rust: compile.rs:60 compile_module
+;; The entry's name is the same whenever it is requested (names carry no counter): a module that stops at the defs knows it.
+(defun compile-module (typed: TypedProgram owned: OwnedProgram executable: bool) -> (Result Module str)
+  (match (program-fun typed "main")
+    (nil (Err "the program has no main"))
+    ((some main)
+     (let ((p (emit.program/program-new typed owned)))
+       (try-let ((_ (inits-plan p)))
+         (match (make-defs p)
+           ((Err m) (pending-or-error p (body-name (program-g p) (BodyFun main) []) executable m))
+           ((Ok defs)
+            (do (set! (. p def-values) (merge @(. p def-values) @(. defs values)))
+                (let ((entry (program-request p (BodyFun main) [])))
+                  (match (emit-all p)
+                    ((Ok _) (Ok (Module (module-parts p @(. defs text)) (main-part p entry executable) nil)))
+                    ((Err m) (pending-or-error p entry executable m))))))))))))
+
+;; The lIR text of a whole program for `fibc run`: runtime, static data, bodies, and a `main` that prints the result.
+;; Rust: compile.rs:47 compile
 (defun compile (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
-  (trap "todo: E3 compile"))
+  (match (compile-module typed owned false)
+    ((Err m) (Err m))
+    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (module-text m)))))))
 
-;; Rust: compile.rs:53
+;; The same for an executable, whose `main` returns the result as the process status and prints nothing (compiler.md §1).
+;; Rust: compile.rs:53 compile_executable
 (defun compile-executable (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
-  (trap "todo: E3 compile-executable"))
+  (match (compile-module typed owned true)
+    ((Err m) (Err m))
+    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (module-text m)))))))
 
-;; Rust: compile.rs:71
-(defun emit-all (p: Program) -> (Result unit str)
-  (trap "todo: E3 emit-all"))
-
-;; Rust: compile.rs:96
+;; The macro-time module of a program whose `defmacro` is `name`, taking `n` `Form` (or rest vector) arguments. Rust: compile.rs:96
 (defun compile-macro (typed: TypedProgram owned: OwnedProgram name: str n: i64 k: i64) -> (Result MacroModule str)
-  (trap "todo: E3 compile-macro"))
-
-;; Rust: compile.rs:175
-(defun assemble-parts (p: Program defs: str) -> str
-  (trap "todo: E3 assemble-parts"))
+  (Err "todo: E11 compile-macro"))

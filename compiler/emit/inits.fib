@@ -1,0 +1,97 @@
+;; compiler/emit/inits.fib: the `def`s made at run time (syntax §3.19, types §2.16, L15, X8). Replaces crates/fibc/src/inits.rs
+;; (159 lines of Rust; its header there is the description of the scheme). A `def` whose initialiser is a constant expression is
+;; evaluated while compiling and emitted as static data (emit.defs.mod); any other is evaluated before `main`, once, by an init
+;; function: `inits-plan` chooses those `def`s, gives each a slot (`def.slot.N`, a global of the module) and requests its body;
+;; `inits-slot-text` is the globals and `inits-render` the init functions and `fib.defs-init`, which calls them in order, a
+;; maximal run of `def`s of one module being one init function, `fib.init.mN.K`.
+;; `all-def-ids` is the Rust `defs::all_def_ids` (defs/mod.rs:50): emit.defs.mod's `def-ids` (the constants) is E10's.
+(ns emit.inits
+  (:require [fib.string :as s])
+  (:use types.ty types.decls types.init types.program types.infer.mod own.program emit.value emit.program))
+
+;; Every `def` of the program, in the order the checker typed them, which is the order they are evaluated in (syntax §3.19).
+;; Rust: defs/mod.rs:50 all_def_ids
+(defun all-def-ids (p: Program) -> (Vec i64)
+  (vec (mapcat (fn (u: UnitRef) (match u ((UDef d) [d]) (_ []))) (. (. p typed) units))))
+
+;; Plans one `def`: nothing for a constant, else its slot, its body requested and its place among the inits.
+(defun plan-one :private (p: Program d: i64) -> (Result unit str)
+  (let ((dd (g-def (program-g p) d)))
+    (if (. dd constant)
+        (Ok ())
+        (match (get (. (. p typed) def-types) d)
+          (nil (Err "a def without a type"))
+          ((some t)
+           (try-let ((lt (program-lir p t)))
+             (match lt
+               ((some (LirDyn)) (Err (str-join ["def " (. dd name) ": a def made at run time holds a dyn value"])))
+               (_ (let ((body (program-request p (BodyDef d) []))
+                        (object (match lt ((some (LirPtr)) true) (_ false))))
+                    (do (set! (. p def-slots) (assoc @(. p def-slots) d (DefValue (str-join ["def.slot." (str d)]) lt)))
+                        (set! (. p inits) (conj @(. p inits) (Init d (. dd module) body object)))
+                        (Ok ())))))))))))
+
+;; Chooses the `def`s made at run time, gives each its slot and requests its body. Runs before the constants are made, because a
+;; function a constant names may read one of these `def`s. Rust: inits.rs:57 plan
+(defun inits-plan (p: Program) -> (Result unit str)
+  (try-let ((_ (try-map (fn (d: i64) (plan-one p d)) (all-def-ids p))))
+    (Ok ())))
+
+;; The zero a global of the type starts as. Rust: inits.rs:104 zero
+(defun slot-zero :private (l: LirTy) -> str
+  (match l
+    ((LirPtr) "(ptr null)")
+    ((LirRaw) "(ptr null)")
+    ((LirFloat) (str-join ["(" (lir-ty-text l) " 0.0)"]))
+    ((LirDouble) (str-join ["(" (lir-ty-text l) " 0.0)"]))
+    (_ (str-join ["(" (lir-ty-text l) " 0)"]))))
+
+;; The globals of the slots: `(global internal def.slot.N T zero)`. Rust: inits.rs:92 slot_text
+(defun inits-slot-text (p: Program) -> str
+  (str-join (mapv (fn (i: Init)
+                    (match (get @(. p def-slots) (. i def-id))
+                      ((some dv)
+                       (match (. dv ty)
+                         ((some l) (str-join ["(global internal " (. dv text) " " (lir-ty-text l) " " (slot-zero l) ")\n"]))
+                         (nil "")))
+                      (nil "")))
+                  @(. p inits))))
+
+;; The init function of one run of `def`s of a module. Rust: inits.rs:146 init_function
+(defun init-function :private (p: Program name: str run: (Vec Init)) -> str
+  (let ((steps (mapv (fn (k: i64)
+                       (let ((i (nth run k)) (v (str-join ["v" (str k)]))
+                             (head (str-join ["(store (string \"def " (. (g-def (program-g p) (. i def-id)) name) ": \") @fib.initdef) "])))
+                         (match (get @(. p def-slots) (. i def-id))
+                           ((some dv)
+                            (match (. dv ty)
+                              (nil (Pair (str-join [head "(call @" (. i body) ") "]) ""))
+                              ((some _)
+                               (Pair (str-join [head "(let ((" v " (call @" (. i body) "))) "
+                                                (if (. i object) (str-join ["(call @fib.immortalise " v ") "]) "")
+                                                "(store " v " @" (. dv text) ") "])
+                                     ")"))))
+                           (nil (Pair head "")))))
+                     (range (count run)))))
+    (str-join ["(define internal (" name " void) ()\n  (block entry " (str-join (mapv (fn (q: (Pair str str)) (. q fst)) steps))
+               "(ret)" (str-join (mapv (fn (q: (Pair str str)) (. q snd)) steps)) "))\n"])))
+
+;; The inits cut into maximal runs of one module.
+(defun module-runs :private (inits: (Vec Init)) -> (Vec (Vec Init))
+  (reduce (fn (acc: (Vec (Vec Init)) i: Init)
+            (let ((at (- (count acc) 1)))
+              (if (and (>= at 0) (= (. (nth (nth acc at) 0) module) (. i module)))
+                  (assoc acc at (conj (nth acc at) i))
+                  (conj acc [i]))))
+          [] inits))
+
+;; The init functions and `fib.defs-init`, or nothing if every `def` is a constant. Rust: inits.rs:118 render
+(defun inits-render (p: Program) -> str
+  (let ((runs (module-runs @(. p inits))))
+    (if (empty? runs)
+        ""
+        (let ((names (mapv (fn (k: i64) (str-join ["fib.init.m" (str (. (nth (nth runs k) 0) module)) "." (str k)])) (range (count runs)))))
+          (str-join [(str-join (mapv (fn (k: i64) (init-function p (nth names k) (nth runs k))) (range (count runs))))
+                     "(define internal (fib.defs-init void) ()\n  (block entry "
+                     (str-join (mapv (fn (n: str) (str-join ["(call @" n ") "])) names))
+                     "(call @fib.init-done) (ret)))\n"])))))

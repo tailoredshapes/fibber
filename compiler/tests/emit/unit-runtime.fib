@@ -1,0 +1,35 @@
+;; compiler/tests/emit/unit-runtime.fib: compiler/emit/runtime.fib and compiler/emit/rt.fib. The drift test: each def of the generated
+;; file equals the text of its crates/fibc/rt/*.lir file (read at test time, so run it from the repository root), the runtime text is
+;; the files joined with a line break after each, and the runtime's declarations are found as `runtime_declaration` finds them.
+;; compiler/tests/emit/runtime.sh also regenerates the file and compares it byte for byte.
+;; Build: fibc build compiler/tests/emit/unit-runtime.fib -I compiler -I lib -o OUT
+(ns main (:use types.check emit.runtime emit.rt))
+
+(def stems: (Vec str) ["core" "str" "array" "vec" "vecbuild" "atom" "thread" "task" "weak" "io"])
+
+(defun file-text (stem: str) -> str
+  (match (read-file (str-join ["crates/fibc/rt/" stem ".lir"]))
+    (nil "")
+    ((some t) t)))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (parts (runtime-parts)))
+    (do
+      (check cs "ten parts" (= (count parts) 10))
+      (doseq [i (range 10)]
+        (check cs (str-join ["part " (nth stems i) " is its file"])
+               (and (> (str-len (nth parts i)) 0) (= (nth parts i) (file-text (nth stems i))))))
+      (check cs "the text is every file and a line break"
+             (= (runtime-text) (str-join (vec (mapcat (fn (st: str) [(file-text st) "\n"]) stems)))))
+      (check cs "malloc is declared by core"
+             (= (runtime-declaration "malloc") (some "(declare malloc ptr (i64))")))
+      (check cs "sched_yield is declared by atom (a part after the first)"
+             (= (runtime-declaration "sched_yield") (some "(declare sched_yield i32 ())")))
+      (check cs "fopen is declared by io, the last part"
+             (= (runtime-declaration "fopen") (some "(declare fopen ptr (ptr ptr))")))
+      (check cs "a name that is a prefix of another is not found"
+             (nil? (runtime-declaration "mallo")))
+      (check cs "an undeclared name is not found" (nil? (runtime-declaration "printf")))
+      (check cs "a definition is not a declaration" (nil? (runtime-declaration "fib.init")))
+      (finish cs))))

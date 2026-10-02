@@ -1,0 +1,37 @@
+;; compiler/emit/rt.fib: what the compiler does with the runtime's lIR text (spec/compiler.md §3): the text of the module's first
+;; section and the runtime's own `declare` of a C function. The text is the data of emit.runtime, generated from crates/fibc/rt/*.lir.
+;; Replaces compile.rs:20 RUNTIME and compile.rs:36 runtime_declaration.
+(ns emit.rt
+  (:use emit.runtime))
+
+;; The ten parts in the order compile.rs:20 `include_str!`s them: core str array vec vecbuild atom thread task weak io.
+(defun runtime-parts () -> (Vec str)
+  [RT-CORE RT-STR RT-ARRAY RT-VEC RT-VECBUILD RT-ATOM RT-THREAD RT-TASK RT-WEAK RT-IO])
+
+;; The first section of a module: every part followed by a line break. Rust: compile.rs:249 `runtime` of module_parts
+(defun runtime-text () -> str
+  (str-join (vec (mapcat (fn (part: str) [part "\n"]) (runtime-parts)))))
+
+;; The line of `part` that starts at byte `start`, without its line break (`str-find` counts bytes).
+(defun line-from :private (part: str start: i64) -> str
+  (match (str-find part "\n" start)
+    (nil (str-slice part start (str-len part)))
+    ((some e) (str-slice part start e))))
+
+;; The first line of `part` that starts with `head`.
+(defun declaration-in :private (part: str head: str) -> (Option str)
+  (if (starts-with? part head)
+      (some (line-from part 0))
+      (match (str-find part (str-join ["\n" head]) 0)
+        (nil nil)
+        ((some i) (some (line-from part (+ i 1)))))))
+
+;; The runtime's own `declare` of the C function `name`, if any: a program's `extern` of the same name must agree with it and is then
+;; not declared again. Rust: compile.rs:36 runtime_declaration
+(defun runtime-declaration (name: str) -> (Option str)
+  (let ((head (str-join ["(declare " name " "])))
+    (reduce (fn (found: (Option str) part: str)
+              (match found
+                ((some _) found)
+                (nil (declaration-in part head))))
+            nil (runtime-parts))))

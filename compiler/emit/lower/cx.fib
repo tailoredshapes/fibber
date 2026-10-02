@@ -1,18 +1,19 @@
 ;; compiler/emit/lower/cx.fib: the context of lowering one function and the small data every lowering module shares (spec/compiler.md §4).
 ;; The data of crates/fibc/src/lower/mod.rs (`Flow`, `Local`, `LoopCx`, `LowerCx`), lower/call.rs (`Target`),
 ;; lower/pattern.rs (`VecIds`) and lower/threads.rs (`AsyncFrame`) is here, in a module below all of them, because the
-;; Rust modules call each other in a cycle (`expr` -> `call` -> `expr`, ..) and fibber modules cannot. DECISION FOR
-;; E4/E5: cut the cycle as the checker did (types/infer/call.fib: `infer` is a borrowed function parameter that
-;; types.infer.expr passes), i.e. each `lcx-NAME` that calls back takes `lower: (fn (LowerCx Expr) (Result Flow str))`
-;; last, or keep the cycle's members in one module. A `Cx` method of Rust is `lcx-NAME` here; `LowerCx` is a struct
-;; of Cells passed borrowed (plan D2); `p` is the same `Program` handle (all its mutation is in Cells), so two
-;; handles are safe; `lits` holds counted `Expr` handles; the 15 fields are Rust's, in its order.
-;; STATUS: every public function below is a STUB of package E4, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/mod.rs, 501 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; Rust modules call each other in a cycle (`expr` -> `call` -> `expr`, ..) and fibber modules cannot. A `Cx` method of Rust is
+;; `lcx-NAME` here; `LowerCx` is a struct of Cells passed borrowed (plan D2); `p` is the same `Program` handle (all its mutation is
+;; in Cells), so two handles are safe; `lits` holds counted `Expr` handles; the 15 fields are Rust's, in its order, and the hub.
+;; STATUS (E4, 2026-10-02): the context, the hub and the small functions every lowering module calls (no module above this one can
+;; be called from below it, so they are here, not in emit.lower.mod): `lcx-ty`, `lcx-binding-ty`, `binding-ty`, `body-expr`, `lcx-local`, `lcx-obj-word`,
+;; `lcx-trap-c`, `lcx-gep`, `lcx-load`, `lcx-store`, `lcx-expr`, `lcx-value`, `literals`, `value-sites`, and the constructors
+;; `lcx-build`, `lcx-sub`. THE HUB breaks the cycle of the Rust (`expr` -> `call` -> `expr`, `global` -> `method_value` ->
+;; `builtin` -> `alloc_at` -> ..): a `Hub` is a struct of function values that emit.lower.mod fills with the real functions, kept in
+;; the context; a module that must call upward calls `((. (. cx hub) FIELD) cx ..)`. To add one, add the field to `Hub` and to
+;; `hub-default` in emit.lower.mod (the only constructor). A context for a generated body (a wrapper, a vtable function) is
+;; `lcx-sub` of the context it is made in: it keeps the hub.
 (ns emit.lower.cx
-  (:use types.ty types.ast own.program emit.value emit.ir emit.mono emit.program))
+  (:use types.ty types.decls types.table types.program types.ast types.init own.program emit.value emit.layout emit.ir emit.mono emit.program))
 
 ;; What an expression yielded: a value, or a jump (the block ended). Rust: lower/mod.rs:38 Flow
 (defenum Flow (FlowVal v: V) FlowJump)
@@ -39,10 +40,120 @@
   (TgDirect name: str env: bool) (TgValue v: V) (TgBuiltin name: str) (TgNative proto: str method: str)
   (TgCtor type: i64 variant: (Option i64)) (TgCode code: str this: str) (TgExtern name: str))
 
-;; The context of one function. Rust: lower/mod.rs:60 Cx (15 fields)
+;; The functions a lowering module calls upward, filled by emit.lower.mod (see the header). The Rust names are the methods
+;; `expr` (lower/mod.rs:333), `method_value` (values.rs:29) and `builtin_value` (values.rs:73).
+(defstruct Hub
+  (expr: (fn (LowerCx Expr) (Result Flow str))
+   method-value: (fn (LowerCx Expr i64 i64) (Result V str))
+   builtin-value: (fn (LowerCx Expr i64) (Result V str))))
+
+;; The context of one function. Rust: lower/mod.rs:60 Cx (15 fields, and the hub)
 (defstruct LowerCx
   (p: Program inst: Inst own: BodyOwn name: str b: FnBuilder
    locals: (Cell (Map i64 Local)) values: (Cell (Map i64 V)) value-sites: (Set i64)
    env: (Cell (Option V)) loops: (Cell (Vec LoopCx)) stack-slots: (Cell (Map i64 str))
    lits: (Map i64 Expr) rests: (Cell (Vec RestSlot)) closure-slots: (Cell (Set str))
-   async-frame: (Cell (Option AsyncFrame))))
+   async-frame: (Cell (Option AsyncFrame)) hub: Hub))
+
+;; The sites of `ops` that name an expression's value, added to `acc`.
+(defun add-sites :private (acc: (Set i64) ops: (Vec Op)) -> (Set i64)
+  (reduce (fn (s: (Set i64) op: Op) (match (. op site) ((SiteValue e) (conj s e)) (_ s))) acc ops))
+
+;; The expressions whose value some operation names. Rust: lower/ops.rs:14 value_sites
+(defun value-sites (own: BodyOwn) -> (Set i64)
+  (let ((a (reduce (fn (s: (Set i64) x: ExprOwn) (add-sites s (. x after))) (set-empty) (vals (. own exprs))))
+        (b (reduce (fn (s: (Set i64) c: CallOwn) (add-sites s (. c jump))) a (vals (. own calls))))
+        (c (reduce (fn (s: (Set i64) r: RecurOwn) (add-sites s (. r jump))) b (vals (. own recurs)))))
+    (reduce (fn (s: (Set i64) ops: (Vec Op)) (add-sites s ops)) c (vals (. own guard-fail)))))
+
+;; The body of the `defun`, method or `def` a key names (a `def`'s is its initialiser). Rust: lower/mod.rs:84 emit_body, :239 literals
+(defun body-expr (g: Globals key: BodyKey) -> Expr
+  (match key
+    ((BodyFun f) (. (g-fun g f) body))
+    ((BodyAllOwned f) (. (g-fun g f) body))
+    ((BodyMethod i m) (. (nth (. (table-get (. g instances) i) methods) m) body))
+    ((BodyMethodOwned i m) (. (nth (. (table-get (. g instances) i) methods) m) body))
+    ((BodyDef d) (. (g-def g d) init))))
+
+;; Every `fn` and `async` literal of a body, by expression id. Rust: lower/mod.rs:239 literals
+(defun literals (typed: TypedProgram owned: OwnedProgram key: BodyKey) -> (Map i64 Expr)
+  (loop ((stack [(body-expr (. typed globals) key)]) (out (map-empty)))
+    (match (peek stack)
+      (nil out)
+      ((some e)
+       (recur (into (pop stack) (expr-children e))
+              (match (. e kind) ((EFn _) (assoc out (. e id) e)) ((EAsync _ _) (assoc out (. e id) e)) (_ out)))))))
+
+;; A context with the entry block open: the constructor all others call. `tailcc` is false for the resume function of an `async`
+;; body. Rust: lower/mod.rs:258 Cx::new (and `b.tailcc = false`, which FnBuilder here takes at construction)
+(defun lcx-build (p: Program inst: Inst own: BodyOwn name: str params: (Vec LirParam) tailcc: bool hub: Hub lits: (Map i64 Expr))
+    -> LowerCx
+  (LowerCx p inst own name (fb-new name nil params tailcc) (cell (map-empty)) (cell (map-empty)) (value-sites own) (cell nil)
+           (cell []) (cell (map-empty)) lits (cell []) (cell (set-empty)) (cell nil) hub))
+
+;; The context of a generated body (a wrapper, a vtable function) of `parent`'s program, with the parent's hub. Rust: Cx::new of a
+;; method of the parent's
+(defun lcx-sub (parent: LowerCx inst: Inst own: BodyOwn name: str params: (Vec LirParam)) -> LowerCx
+  (lcx-build (. parent p) inst own name params true (. parent hub) (literals (. (. parent p) typed) (. (. parent p) owned) (. inst key))))
+
+;; The concrete type of an expression. Rust: lower/mod.rs:302 Cx::ty (program.rs:98 Program::ty_of)
+(defun lcx-ty (cx: LowerCx e: Expr) -> (Result Ty str)
+  (program-ty-of (. cx p) (. cx inst) (. e id)))
+
+;; The concrete type of a binding at the specialisation `inst`. Rust: lower/mod.rs:307 Cx::binding_ty
+(defun binding-ty (p: Program inst: Inst b: i64) -> (Result Ty str)
+  (match (get (. (. p typed) binding-types) b)
+    ((some t) (Ok (inst-subst inst t)))
+    (nil (Err (str-join ["binding " (str b) " has no type"])))))
+
+;; Rust: lower/mod.rs:307 Cx::binding_ty
+(defun lcx-binding-ty (cx: LowerCx b: i64) -> (Result Ty str)
+  (binding-ty (. cx p) (. cx inst) b))
+
+;; The value of a local; a loop variable is loaded from its slot. Rust: lower/mod.rs:318 Cx::local
+(defun lcx-local (cx: LowerCx b: i64) -> (Result V str)
+  (match (get @(. cx locals) b)
+    ((some (LocalVal v)) (Ok v))
+    ((some (LocalSlot slot (some t))) (Ok (fb-val (. cx b) (str-join ["(load " (lir-ty-text t) " " slot ")"]) t)))
+    ((some (LocalSlot _ nil)) (Ok VUnit))
+    (nil (Err (str-join ["unbound local " (. (g-binding (program-g (. cx p)) b) name)])))))
+
+;; Lowers an expression: its value, then the plan's operations (through the hub). Rust: lower/mod.rs:333 Cx::expr
+(defun lcx-expr (cx: LowerCx e: Expr) -> (Result Flow str)
+  ((. (. cx hub) expr) cx e))
+
+;; Lowers an expression that must produce a value. After a jump nothing runs: the value stands in for one never used, and what
+;; is emitted with it lands in dead blocks the builder discards. Rust: lower/mod.rs:347 Cx::value
+(defun lcx-value (cx: LowerCx e: Expr) -> (Result V str)
+  (try-let ((flow (lcx-expr cx e)))
+    (match flow
+      ((FlowVal v) (Ok v))
+      ((FlowJump)
+       (try-let ((t (lcx-ty cx e)) (l (program-lir (. cx p) t)))
+         (Ok (match l ((some x) (VVal (fb-fresh (. cx b)) x)) (nil VUnit))))))))
+
+;; The object word of a value: the pointer itself, or a `dyn`'s first word; `nil` for a scalar. Rust: lower/mod.rs:418 Cx::obj_word
+(defun lcx-obj-word (cx: LowerCx v: V) -> (Option str)
+  (match v
+    ((VVal s (LirPtr)) (some s))
+    ((VVal s (LirDyn)) (some (v-text (fb-val (. cx b) (str-join ["(extractvalue " s " 0)"]) LirPtr))))
+    (_ nil)))
+
+;; A trap with a C-string message: the block ends here. Rust: lower/mod.rs:432 Cx::trap_c
+(defun lcx-trap-c (cx: LowerCx msg: str) -> unit
+  (do (fb-stmt (. cx b) (str-join ["(call @fib.trap-c (string \"" msg "\"))"]))
+      (fb-term (. cx b) "(unreachable)")))
+
+;; `(getelementptr %struct.S p (i32 0) (i32 i))`. Rust: lower/mod.rs:439 Cx::gep
+(defun lcx-gep (cx: LowerCx sname: str p: str i: i64) -> str
+  (v-text (fb-val (. cx b) (str-join ["(getelementptr %struct." sname " " p " (i32 0) (i32 " (str i) "))"]) LirPtr)))
+
+;; Rust: lower/mod.rs:449 Cx::load
+(defun lcx-load (cx: LowerCx t: LirTy ptr: str) -> V
+  (fb-val (. cx b) (str-join ["(load " (lir-ty-text t) " " ptr ")"]) t))
+
+;; Rust: lower/mod.rs:453 Cx::store
+(defun lcx-store (cx: LowerCx v: V ptr: str) -> unit
+  (match v
+    ((VVal s _) (fb-stmt (. cx b) (str-join ["(store " s " " ptr ")"])))
+    (_ ())))

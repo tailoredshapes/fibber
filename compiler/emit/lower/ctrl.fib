@@ -1,35 +1,134 @@
-;; compiler/emit/lower/ctrl.fib: control forms: `let`, `do`, `if`, `match`, `loop`, `recur`. Replaces crates/fibc/src/lower/ctrl.rs.
-;; STATUS: every public function below is a STUB of package E4, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/ctrl.rs, 163 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/ctrl.fib: control forms: `let`, `do`, `if`, `match`, `loop`, `recur` (spec/compiler.md §4, types §8.3 for `match`,
+;; §8.9 for `recur`). Replaces crates/fibc/src/lower/ctrl.rs (163 lines of Rust). The order of the fresh names and of the calls
+;; that intern or emit is the Rust's: a label or a value asked for earlier shifts every later name of the function.
 (ns emit.lower.ctrl
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.ast types.init own.program emit.value emit.layout emit.ir emit.program emit.lower.cx emit.lower.ops
+        emit.lower.pattern))
 
-;; Rust: lower/ctrl.rs:13 LowerCx::let_form
+;; Rust: lower/ctrl.rs:13 Cx::let_form
 (defun lcx-let-form (cx: LowerCx bs: (Vec LetBind) body: Expr) -> (Result Flow str)
-  (trap "todo: E4 lcx-let-form"))
+  (try-let ((done (try-each (fn (lb: LetBind)
+                              (try-let ((v (lcx-value cx (. lb init))) (t (lcx-ty cx (. lb init))))
+                                (lcx-bind-irrefutable cx (. lb pat) v t)))
+                            bs)))
+    (lcx-expr cx body)))
 
-;; Rust: lower/ctrl.rs:22 LowerCx::do_form
+;; Rust: lower/ctrl.rs:22 Cx::do_form
 (defun lcx-do-form (cx: LowerCx es: (Vec Expr)) -> (Result Flow str)
-  (trap "todo: E4 lcx-do-form"))
+  (if (empty? es)
+      (Ok (FlowVal VUnit))
+      (loop ((i 0))
+        (if (< i (- (count es) 1))
+            (try-let ((flow (lcx-expr cx (nth es i))))
+              (match flow ((FlowJump) (Ok FlowJump)) (_ (recur (+ i 1)))))
+            (lcx-expr cx (nth es i))))))
 
-;; Rust: lower/ctrl.rs:34 LowerCx::if_form
+;; Opens `label`, lowers the branch and, when it falls through, the label of the block it ends in with its value, after the jump to
+;; the join block `lj`.
+(defun branch :private (cx: LowerCx label: str body: Expr lj: str) -> (Result (Option (Pair str V)) str)
+  (do (fb-open (. cx b) label)
+      (try-let ((flow (lcx-expr cx body)))
+        (match flow
+          ((FlowVal v) (let ((at (fb-current (. cx b))))
+                         (do (fb-term (. cx b) (str-join ["(br " lj ")"]))
+                             (Ok (some (Pair at v))))))
+          ((FlowJump) (Ok nil))))))
+
+;; Rust: lower/ctrl.rs:34 Cx::if_form
 (defun lcx-if-form (cx: LowerCx e: Expr c: Expr t: Expr f: Expr) -> (Result Flow str)
-  (trap "todo: E4 lcx-if-form"))
+  (try-let ((cv (lcx-value cx c)))
+    (let ((lt (fb-label (. cx b) "then")) (lf (fb-label (. cx b) "else")) (lj (fb-label (. cx b) "join")))
+      (do (fb-term (. cx b) (str-join ["(br " (v-text cv) " " lt " " lf ")"]))
+          (try-let ((rt (lcx-ty cx e)) (ty (program-lir (. cx p) rt))
+                    (from-then (branch cx lt t lj)) (from-else (branch cx lf f lj)))
+            (lcx-join-branches cx lj ty (vec (keep (fn (x: (Option (Pair str V))) x) [from-then from-else]))))))))
 
-;; Rust: lower/ctrl.rs:57 LowerCx::join_branches
+;; The join block of branches that fell through, with a `phi` of their values; a jump when none did.
+;; Rust: lower/ctrl.rs:57 Cx::join_branches
 (defun lcx-join-branches (cx: LowerCx label: str ty: (Option LirTy) incoming: (Vec (Pair str V))) -> (Result Flow str)
-  (trap "todo: E4 lcx-join-branches"))
+  (if (empty? incoming)
+      (Ok FlowJump)
+      (do (fb-open (. cx b) label)
+          (match ty
+            (nil (Ok (FlowVal VUnit)))
+            ((some t)
+             (Ok (FlowVal (fb-phi (. cx b) t (mapv (fn (p: (Pair str V)) (PhiEdge (. p fst) (v-text (. p snd)))) incoming)))))))))
 
-;; Rust: lower/ctrl.rs:77 LowerCx::match_form
+;; The false edge of a clause's guard: the plan's operations for it, then on to the next clause.
+(defun guard-edge :private (cx: LowerCx guard: (Option Expr) next: str) -> (Result unit str)
+  (match guard
+    (nil (Ok ()))
+    ((some g)
+     (try-let ((gv (lcx-value cx g)))
+       (let ((ok (fb-label (. cx b) "guard")) (fail (fb-label (. cx b) "gfail")))
+         (do (fb-term (. cx b) (str-join ["(br " (v-text gv) " " ok " " fail ")"]))
+             (fb-open (. cx b) fail)
+             (try-let ((ran (lcx-run-ops cx (unwrap-or (get (. (. cx own) guard-fail) (. g id)) []))))
+               (do (fb-term (. cx b) (str-join ["(br " next ")"]))
+                   (fb-open (. cx b) ok)
+                   (Ok ())))))))))
+
+;; Rust: lower/ctrl.rs:77 Cx::match_form
 (defun lcx-match-form (cx: LowerCx e: Expr s: Expr cls: (Vec Clause)) -> (Result Flow str)
-  (trap "todo: E4 lcx-match-form"))
+  (try-let ((v (lcx-value cx s)) (st (lcx-ty cx s)) (rt (lcx-ty cx e)) (ty (program-lir (. cx p) rt)))
+    (let ((lj (fb-label (. cx b) "mjoin")) (first-next (fb-label (. cx b) "clause")))
+      (do (fb-term (. cx b) (str-join ["(br " first-next ")"]))
+          (loop ((i 0) (next first-next) (incoming []))
+            (if (< i (count cls))
+                (let ((c (nth cls i)))
+                  (do (fb-open (. cx b) next)
+                      (let ((after (fb-label (. cx b) "clause")))
+                        (try-let ((matched (lcx-match-pattern cx (. c pat) v st after)) (rests (lcx-build-rests cx))
+                                  (guarded (guard-edge cx (. c guard) after)) (bf (lcx-expr cx (. c body))))
+                          (recur (+ i 1) after
+                                 (match bf
+                                   ((FlowVal bv) (let ((at (fb-current (. cx b))))
+                                                   (do (fb-term (. cx b) (str-join ["(br " lj ")"]))
+                                                       (conj incoming (Pair at bv)))))
+                                   ((FlowJump) incoming)))))))
+                (do (fb-open (. cx b) next)
+                    (lcx-trap-c cx "no match clause matched")
+                    (lcx-join-branches cx lj ty incoming))))))))
 
-;; Rust: lower/ctrl.rs:112 LowerCx::loop_form
+;; A loop variable: its initialiser stored in a slot of the entry block, the binding a slot local.
+(defun loop-var :private (cx: LowerCx lb: LoopBind) -> (Result LoopVar str)
+  (try-let ((v (lcx-value cx (. lb init))))
+    (let ((t (v-ty v)))
+      (let ((slot (fb-entry-alloca (. cx b) (match t ((some x) (lir-ty-text x)) (nil "i64"))
+                                   (match t ((some x) (. (size-align x) fst)) (nil 8)))))
+        (do (lcx-store cx v slot)
+            (set! (. cx locals) (assoc @(. cx locals) (. lb binding) (LocalSlot slot t)))
+            (Ok (LoopVar (. lb binding) slot t)))))))
+
+;; Rust: lower/ctrl.rs:112 Cx::loop_form
 (defun lcx-loop-form (cx: LowerCx e: Expr vs: (Vec LoopBind) body: Expr) -> (Result Flow str)
-  (trap "todo: E4 lcx-loop-form"))
+  (try-let ((vars (try-map (fn (lb: LoopBind) (loop-var cx lb)) vs)))
+    (let ((head (fb-label (. cx b) "loop")))
+      (do (fb-term (. cx b) (str-join ["(br " head ")"]))
+          (fb-open (. cx b) head)
+          (set! (. cx loops) (conj @(. cx loops) (LoopCx vars head)))
+          (let ((flow (lcx-expr cx body)))
+            (do (set! (. cx loops) (pop @(. cx loops)))
+                flow))))))
 
-;; Rust: lower/ctrl.rs:136 LowerCx::recur
+;; An argument of a `recur`: its value, retained when the plan says the loop variable takes a count.
+(defun recur-arg :private (cx: LowerCx ro: RecurOwn args: (Vec Expr) i: i64) -> (Result V str)
+  (try-let ((v (lcx-value cx (nth args i))))
+    (do (when (= (get (. ro args) i) (some PsRetain)) (lcx-retain cx v))
+        (Ok v))))
+
+;; `recur` (§6.10): the arguments consumed into the loop variables, the jump's releases, the new values stored, back to the head.
+;; Rust: lower/ctrl.rs:136 Cx::recur
 (defun lcx-recur (cx: LowerCx e: Expr args: (Vec Expr)) -> (Result Flow str)
-  (trap "todo: E4 lcx-recur"))
+  (match (get (. (. cx own) recurs) (. e id))
+    (nil (Err "no plan for a recur"))
+    ((some ro)
+     (try-let ((vals (try-map (fn (i: i64) (recur-arg cx ro args i)) (vec (range (count args)))))
+               (ran (lcx-run-ops cx (. ro jump))))
+       (match (peek @(. cx loops))
+         (nil (Err "recur outside a loop"))
+         ((some lp)
+          (do (doseq [i (range (min (count (. lp vars)) (count vals)))]
+                (lcx-store cx (nth vals i) (. (nth (. lp vars) i) name)))
+              (fb-term (. cx b) (str-join ["(br " (. lp head) ")"]))
+              (Ok FlowJump))))))))

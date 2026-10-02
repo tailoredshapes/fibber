@@ -1,0 +1,37 @@
+;; compiler/tests/emit/ctrl-tool.fib: the functions of a program's lIR module (`fibc emit-dump --sections fns`) as the lowering core
+;; (emit.lower.mod, ctrl, ops, values) makes them, for files whose bodies use only the forms of package E4: literals, `do`, `if`,
+;; `loop`/`recur` (and what the other lowering packages have ported by now). Not the tool: the tool is compiler/emit.fib; this one
+;; skips the runtime, the `def`s and the sections and runs `emit-all` alone, so it works while the rest of the module is pending.
+;; Prints `== FILE`, `;; == section fns` and the functions, as `fibc emit-dump --sections fns` does, or `== FILE` and `error: MSG`.
+;; Build: fibc build compiler/tests/emit/ctrl-tool.fib -I compiler -I lib -o OUT       Run: OUT FILE..
+(ns main
+  (:require [types.dump :as dump])
+  (:use syntax.form expand.types types.args types.program types.dump types.dump.sections own.program own.driver emit.value emit.mono
+        emit.program emit.assemble))
+
+;; The text of the functions the emitter makes for a checked program, or the reason it stopped.
+(defun fns-of (c: Checked) -> (Result (Vec str) str)
+  (match (program-fun (. c typed) "main")
+    (nil (Err "the program has no main"))
+    ((some main)
+     (let ((p (emit.program/program-new (. c typed) (. c owned))))
+       (do (program-request p (BodyFun main) [])
+           (try-let ((done (emit-all p))) (Ok @(. p funcs))))))))
+
+;; The lines of one file: the functions, or `error: MSG`.
+(defun emit-check (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options) -> Dumped
+  (match (own-check-modules modules prelude)
+    ((Err _) (Dumped (conj lines "error: the program is rejected") 1))
+    ((Ok c)
+     (match (fns-of c)
+       ((Err m) (Dumped (conj lines (str-join ["error: " m])) 1))
+       ((Ok fns)
+        (let ((text (str-join fns)))
+          (Dumped (into lines [";; == section fns" (str-slice text 0 (max 0 (- (str-len text) 1)))]) 0)))))))
+
+(defun main () -> i64
+  (reduce (fn (status: i64 file: str)
+            (let ((d (dump/dump-file file (options-default) emit-check)))
+              (do (doseq [line (. d lines)] (println line))
+                  (max status (. d status)))))
+          0 (vec (args))))

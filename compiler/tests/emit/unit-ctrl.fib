@@ -1,0 +1,97 @@
+;; compiler/tests/emit/unit-ctrl.fib: the small functions of the lowering core on hand-built contexts (the Rust lower/ has no unit tests;
+;; its judge is the text of whole functions, ctrl.sh): the join of branches, the object word, the sites and operations of the plan, a
+;; value after a jump, `value-sites`, and the hub (`lcx-expr` calls the function the context carries).
+;; Build: fibc build compiler/tests/emit/unit-ctrl.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [fib.string :as s])
+  (:use syntax.pos types.ty types.decls types.program types.check types.ast own.program emit.value emit.ir emit.mono emit.program
+        emit.lower.cx emit.lower.ops emit.lower.ctrl))
+
+(defun test-hub (flow: Flow) -> Hub
+  (Hub (fn (cx: LowerCx e: Expr) (Ok flow)) (fn (cx: LowerCx e: Expr p: i64 i: i64) (Err "no method values here"))
+       (fn (cx: LowerCx e: Expr b: i64) (Err "no builtin values here"))))
+
+(defun cx-of (own: BodyOwn types: (Map i64 Ty) flow: Flow) -> LowerCx
+  (let ((typed (TypedProgram (globals-new) (map-empty) (map-empty) types (map-empty) (map-empty) (map-empty) (map-empty) [] [])))
+    (lcx-build (emit.program/program-new typed (owned-program-new)) (Inst (BodyFun 0) []) own "f.t" [] true (test-hub flow) (map-empty))))
+
+(defun plain () -> LowerCx (cx-of (body-own-new) (map-empty) FlowJump))
+(defun text-of (cx: LowerCx) -> str (fb-render (. cx b)))
+(defun includes (cx: LowerCx word: str) -> bool (s/includes? (text-of cx) word))
+(defun jump? (r: (Result Flow str)) -> bool (match r ((Ok (FlowJump)) true) (_ false)))
+(defun err-starts (r: (Result unit str) word: str) -> bool (match r ((Err m) (s/starts-with? m word)) (_ false)))
+(defun lit (id: i64) -> Expr (Expr id (Pos "t" 0 0 0 0) (ELit LitUnit)))
+
+(defun join-checks (cs: Checks) -> unit
+  (let ((a (plain)) (b (plain)) (c (plain)) (v1 (VVal "t1" LirI64)) (v2 (VVal "t2" LirI64)))
+    (do (let ((before (text-of a)))
+          (check cs "no branch fell through: a jump, nothing opened"
+                 (and (jump? (lcx-join-branches a "j" (some LirI64) [])) (= before (text-of a)))))
+        (fb-term (. b b) "(br j)")
+        (check cs "a join with no type: a unit value, the join block current"
+               (match (lcx-join-branches b "j" nil [(Pair "entry" VUnit)])
+                 ((Ok (FlowVal (VUnit))) (= (fb-current (. b b)) "j"))
+                 (_ false)))
+        (fb-term (. c b) "(br j)")
+        (check cs "a join of two values: a phi of their edges"
+               (match (lcx-join-branches c "j" (some LirI64) [(Pair "entry" v1) (Pair "x" v2)])
+                 ((Ok (FlowVal (VVal n (LirI64)))) (and (includes c "(phi i64 (entry t1) (x t2))") (includes c n)))
+                 (_ false))))))
+
+(defun word-checks (cs: Checks) -> unit
+  (let ((cx (plain)))
+    (do (check cs "a pointer is its own word" (= (lcx-obj-word cx (VVal "p" LirPtr)) (some "p")))
+        (check cs "a raw pointer and a scalar have none" (and (nil? (lcx-obj-word cx (VVal "p" LirRaw))) (nil? (lcx-obj-word cx (v-int LirI64 1)))))
+        (check cs "a dyn's word is its first element" (and (match (lcx-obj-word cx (VVal "d" LirDyn)) ((some w) (includes cx (str-join ["(extractvalue d 0)"]))) (nil false))))
+        (check cs "gep, load and store text"
+               (let ((g (lcx-gep cx "o.S" "p" 3)) (l (lcx-load cx LirI32 g)))
+                 (do (lcx-store cx l "q") (lcx-store cx VUnit "r")
+                     (and (includes cx "(getelementptr %struct.o.S p (i32 0) (i32 3))") (includes cx (str-join ["(load i32 " g ")"]))
+                          (includes cx (str-join ["(store " (v-text l) " q)"])) (not (includes cx "(store  r)")))))))))
+
+(defun ops-own (e: i64 ops: (Vec Op)) -> BodyOwn
+  (BodyOwn [] (assoc (map-empty) e (ExprOwn MScalar ops)) (map-empty) (assoc (map-empty) 2 (CallOwn (CalFun 0) TlNotInTail PsScalar [] [] [(Op OpRelease (SiteValue 6) WhyJump)]))
+           (assoc (map-empty) 3 (RecurOwn [] [(Op OpRetain (SiteValue 7) WhyJump)])) (map-empty) (map-empty) (set-empty)
+           (assoc (map-empty) 4 [(Op OpRelease (SiteValue 8) WhyScopeExit) (Op OpRelease (SiteBind 9) WhyScopeExit)])))
+
+(defun ops-checks (cs: Checks) -> unit
+  (let ((own (ops-own 1 [(Op OpRetain (SiteValue 5) WhyStore) (Op OpEndStack (SiteValue 5) WhyScopeExit)])) (cx (cx-of (ops-own 1 []) (map-empty) FlowJump)))
+    (do (check cs "value-sites: the values the operations of every table name, not bindings"
+               (= (value-sites own) (set [5 6 7 8])))
+        (check cs "a site that names a value with none is an error"
+               (match (lcx-site cx (SiteValue 5)) ((Err m) (s/starts-with? m "the plan names value 5")) (_ false)))
+        (check cs "a def has no value, the env is the context's"
+               (and (match (lcx-site cx (SiteGlobal 1)) ((Ok (nil)) true) (_ false)) (match (lcx-site cx (SiteEnv 1)) ((Ok (nil)) true) (_ false))))
+        (set! (. cx values) (assoc @(. cx values) 5 (VVal "t5" LirPtr)))
+        (check cs "retain and the end of a stack object run in order, one `fib.stack-end` and one `fib.drop-fields`"
+               (and (not (err-starts (lcx-run-ops cx (. (nth (vec (vals (. own exprs))) 0) after)) "")) (includes cx "(call @fib.retain t5)")
+                    (includes cx "(call @fib.stack-end t5)") (includes cx "(call @fib.drop-fields t5)")))
+        (set! (. cx closure-slots) (conj @(. cx closure-slots) "t5"))
+        (check cs "a stack closure's end runs no drop"
+               (let ((n (count (s/split (text-of cx) "fib.drop-fields"))))
+                 (do (lcx-run-ops cx [(Op OpEndStack (SiteValue 5) WhyScopeExit)])
+                     (= (count (s/split (text-of cx) "fib.drop-fields")) n))))
+        (set! (. cx values) (assoc @(. cx values) 6 (v-int LirI64 1)))
+        (check cs "an operation on a scalar emits nothing, and ending one as a stack object is an error"
+               (and (match (lcx-run-ops cx [(Op OpRelease (SiteValue 6) WhyJump)]) ((Ok _) (not (includes cx "(call @fib.release")))  (_ false))
+                    (err-starts (lcx-run-ops cx [(Op OpEndStack (SiteValue 6) WhyScopeExit)]) "the plan ends a scalar"))))))
+
+(defun flow-checks (cs: Checks) -> unit
+  (let ((types (assoc (assoc (map-empty) 7 (ty-scalar SI64)) 8 (ty-unit))))
+    (do (check cs "a value after a jump is a fresh name of the expression's type"
+               (match (lcx-value (cx-of (body-own-new) types FlowJump) (lit 7)) ((Ok (VVal n (LirI64))) (s/starts-with? n "t")) (_ false)))
+        (check cs "and for a unit expression, unit"
+               (match (lcx-value (cx-of (body-own-new) types FlowJump) (lit 8)) ((Ok (VUnit)) true) (_ false)))
+        (check cs "lcx-expr is the context's function, lcx-value the value it yields"
+               (let ((cx (cx-of (body-own-new) types (FlowVal (VVal "hub" LirI64)))))
+                 (and (match (lcx-expr cx (lit 7)) ((Ok (FlowVal (VVal "hub" _))) true) (_ false))
+                      (match (lcx-value cx (lit 7)) ((Ok (VVal "hub" _)) true) (_ false)))))
+        (check cs "a local: a value as it is, a slot loaded, a unit slot unit"
+               (let ((cx (plain)))
+                 (do (set! (. cx locals) (assoc (assoc (assoc @(. cx locals) 1 (LocalVal (VVal "v" LirI64))) 2 (LocalSlot "s" (some LirI32))) 3 (LocalSlot "u" nil)))
+                     (and (= (lcx-local cx 1) (Ok (VVal "v" LirI64))) (match (lcx-local cx 2) ((Ok (VVal _ (LirI32))) (includes cx "(load i32 s)")) (_ false))
+                          (= (lcx-local cx 3) (Ok VUnit)))))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (join-checks cs) (word-checks cs) (ops-checks cs) (flow-checks cs) (finish cs))))

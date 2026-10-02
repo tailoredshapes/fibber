@@ -3,13 +3,13 @@
 ;; `Program` is a struct of Cells passed borrowed (plan D1); the Rust `c: &Checked` is its two parts, `typed`
 ;; and `owned` (own.driver's `Checked` is not needed here). The `closures` VecDeque is a Vec with a head index;
 ;; `helpers` (a HashSet) is a `(Map str bool)`; Rust's `(String, Option<LirTy>)` of a def is a `DefValue`.
-;; STATUS: every public function below is a STUB of package E3, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/program.rs, 347 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; E3 ported it all (E2 wrote the object functions, `--layout` needs them). X8 added two fields to the Rust `Program`
+;; (`def_slots`, `inits`, with `Init` which inits.rs defines): they are `def-slots` and `inits` here, and `Init` is below.
+;; The runtime's own `declare` (`runtime-declaration`) is emit.rt's.
 (ns emit.program
+  (:require [fib.string :as s])
   (:use types.ty types.ast types.decls types.display types.init types.program own.program emit.value emit.layout emit.names
-        emit.mono emit.objects emit.statics))
+        emit.mono emit.objects emit.statics emit.rt))
 
 ;; The work the queue hands out: a body, or a closure of an owner. Rust: program.rs:24 Work
 (defenum Work (WorkBody inst: Inst) (WorkClosure owner: Inst lit: i64 name: str))
@@ -17,19 +17,26 @@
 ;; The address and lIR type of a def's value. Rust: program.rs:48 `(String, Option<LirTy>)`
 (defstruct DefValue (text: str ty: (Option LirTy)))
 
-;; Rust: program.rs:37 Program (13 fields; `c` is two)
+;; One `def` made at run time (X8, L15): the `def`, the module that defines it, the code name of its initialiser's body, and whether
+;; its value is an object to make immortal. Rust: inits.rs:42 Init
+(defstruct Init (def-id: i64 module: i64 body: str object: bool))
+
+;; Rust: program.rs:37 Program (13 fields; `c` is two) and, since X8, `def_slots` (the slot, a global of the module, and the type of
+;; every `def` made at run time, as a `DefValue`) and `inits` (those `def`s in the order their init functions make them)
 (defstruct Program
   (typed: TypedProgram owned: OwnedProgram objects: Objects statics: Statics queue: Queue
    closures: (Cell (Vec Work)) closures-head: (Cell i64) funcs: (Cell (Vec str)) externs: (Cell (Vec str))
    helpers: (Cell (Map str bool)) def-values: (Cell (Map i64 DefValue)) quotes: (Cell (Map i64 str))
-   quote-text: (Cell str) quote-counter: (Cell i64) keyword-helpers: (Cell bool)))
+   quote-text: (Cell str) quote-counter: (Cell i64) keyword-helpers: (Cell bool)
+   def-slots: (Cell (Map i64 DefValue)) inits: (Cell (Vec Init))))
 
 ;; `str` is type id 0: the literals need it before any body runs; the runtime's own text names the byte array and the weak box.
 ;; (E2 wrote this and the object functions below, which `--layout` needs; E3 owns the rest of this module.)
 ;; Rust: program.rs:60 Program::new
 (defun program-new (typed: TypedProgram owned: OwnedProgram) -> Program
   (let ((p (Program typed owned (objects-new) (statics-new) (queue-new) (cell []) (cell 0) (cell []) (cell [])
-                    (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell "") (cell 0) (cell false))))
+                    (cell (map-empty)) (cell (map-empty)) (cell (map-empty)) (cell "") (cell 0) (cell false)
+                    (cell (map-empty)) (cell []))))
     (do (objects-intern (. p objects) "fib.str" "str" ObStr)
         (objects-intern (. p objects) "fib.array.i8" "(Array i8)" (ObArray LirI8))
         (objects-intern (. p objects) "fib.weakbox" "weak box" ObWeak)
@@ -42,7 +49,9 @@
 
 ;; Rust: program.rs:98 Program::ty_of
 (defun program-ty-of (p: Program inst: Inst e: i64) -> (Result Ty str)
-  (trap "todo: E3 program-ty-of"))
+  (match (get (. (. p typed) expr-types) e)
+    (nil (Err (str-join ["expression ExprId(" (str e) ") has no type"])))
+    ((some t) (Ok (inst-subst inst t)))))
 
 ;; Rust: program.rs:108 Program::lir
 (defun program-lir (p: Program t: Ty) -> (Result (Option LirTy) str)
@@ -50,15 +59,25 @@
 
 ;; Rust: program.rs:113 Program::request
 (defun program-request (p: Program key: BodyKey tys: (Vec Ty)) -> str
-  (trap "todo: E3 program-request"))
+  ;; Colours have no representation (§8.4): one specialisation serves every colour instantiation.
+  (queue-request (. p queue) (program-g p)
+                 (Inst key (mapv (fn (t: Ty) (ty-map-colours t (fn (k: Colour) CLocal))) tys))))
 
 ;; Rust: program.rs:125 Program::request_closure
 (defun program-request-closure (p: Program owner: Inst owner-name: str lit: i64) -> str
-  (trap "todo: E3 program-request-closure"))
+  (let ((name (closure-name owner-name lit)))
+    (do (set! (. p closures) (conj @(. p closures) (WorkClosure owner lit name)))
+        name)))
 
 ;; Rust: program.rs:136 Program::next_work
 (defun program-next-work (p: Program) -> (Option Work)
-  (trap "todo: E3 program-next-work"))
+  (let ((h @(. p closures-head)))
+    (if (< h (count @(. p closures)))
+        (do (set! (. p closures-head) (+ h 1))
+            (some (nth @(. p closures) h)))
+        (match (queue-pop (. p queue))
+          (nil nil)
+          ((some inst) (some (WorkBody inst)))))))
 
 ;; What an object type is called in the table and what it is.
 (defstruct ObjSpec :private (sname: str kind: ObjKind))
@@ -109,27 +128,67 @@
 
 ;; Rust: program.rs:221 Program::declare_extern
 (defun program-declare-extern (p: Program d: ExternDef) -> (Result unit str)
-  (trap "todo: E3 program-declare-extern"))
+  (match (. d ty)
+    ((TFn _ params ret)
+     (let ((g (program-g p)))
+       (try-let ((ps (try-map (fn (t: Ty)
+                                (try-let ((l (lir-ty g t)))
+                                  (match l
+                                    (nil (Err "a unit extern parameter"))
+                                    ((some x) (Ok (lir-ty-text x))))))
+                              params))
+                 (r (lir-ty g ret)))
+         (let ((decl (str-join ["(declare " (. d name) " " (match r (nil "void") ((some x) (lir-ty-text x))) " ("
+                                (s/join " " (if (. d varargs) (conj ps "...") ps)) "))\n"])))
+           (match (runtime-declaration (. d name))
+             ((some own)
+              (if (= (s/trim own) (s/trim decl))
+                  (Ok ())
+                  (Err (str-join ["extern " (. d name) " conflicts with the runtime's " own]))))
+             (nil (do (when (not-any? (fn (x: str) (= x decl)) @(. p externs))
+                        (set! (. p externs) (conj @(. p externs) decl)))
+                      (Ok ()))))))))
+    (_ (Err "an extern without a function type"))))
 
 ;; Rust: program.rs:258 Program::fresh_quote
 (defun program-fresh-quote (p: Program) -> str
-  (trap "todo: E3 program-fresh-quote"))
+  (let ((n (+ @(. p quote-counter) 1)))
+    (do (set! (. p quote-counter) n)
+        (str-join ["@q." (str n)]))))
 
 ;; Rust: program.rs:264 Program::has_helper
 (defun program-has-helper (p: Program name: str) -> bool
-  (trap "todo: E3 program-has-helper"))
+  (contains? @(. p helpers) name))
 
 ;; Rust: program.rs:269 Program::add_helper
 (defun program-add-helper (p: Program name: str text: str) -> unit
-  (trap "todo: E3 program-add-helper"))
+  (do (set! (. p helpers) (assoc @(. p helpers) name true))
+      (set! (. p funcs) (conj @(. p funcs) text))))
 
 ;; Rust: program.rs:275 Program::render_externs
 (defun program-render-externs (p: Program) -> str
-  (trap "todo: E3 program-render-externs"))
+  (str-join @(. p externs)))
 
 ;; Rust: program.rs:285 Program::render_keyword_helpers
 (defun program-render-keyword-helpers (p: Program) -> str
-  (trap "todo: E3 program-render-keyword-helpers"))
+  (if (not @(. p keyword-helpers))
+      ""
+      (let ((st (. p statics)) (names (statics-keywords (. p statics))) (n (count (statics-keywords (. p statics)))))
+        ;; per keyword, in order, the `:k` text is interned and then the name: that numbers the `@str.N` of both
+        (let ((pairs (mapv (fn (i: i64)
+                             (let ((colon (statics-string st (str-join [":" (nth names i)]) 0))
+                                   (name (statics-string st (nth names i) 0)))
+                               (Pair (str-join ["  (block k" (str i) " (ret (call @fib.str-copy " colon ")))\n"])
+                                     (str-join ["  (block k" (str i) " (ret (call @fib.str-hash " name ")))\n"]))))
+                           (range n)))
+              (cases (s/join " " (mapv (fn (i: i64) (str-join ["((i64 " (str i) ") k" (str i) ")"])) (range n))))
+              (order (sort-by (fn (i: i64) (nth names i)) (range n))))
+          (let ((switch (str-join ["  (block entry (switch k bad " cases "))\n"]))
+                (bad "  (block bad (unreachable)))\n")
+                (ranks (mapv (fn (r: i64) (str-join ["  (block k" (str (nth order r)) " (ret (i64 " (str r) ")))\n"])) (range n))))
+            (str-join ["(define internal (kw.show ptr) ((i64 k))\n" switch (str-join (mapv (fn (q: (Pair str str)) (. q fst)) pairs)) bad
+                       "(define internal (kw.hash i64) ((i64 k))\n" switch (str-join (mapv (fn (q: (Pair str str)) (. q snd)) pairs)) bad
+                       "(define internal (kw.rank i64) ((i64 k))\n" switch (str-join ranks) bad]))))))
 
 ;; Rust: program.rs:315 Program::task_object
 (defun program-task-object (p: Program code: str caps: (Vec LirTy)) -> (Pair i64 str)

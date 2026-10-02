@@ -1,0 +1,63 @@
+;; compiler/emit/assemble.fib: the module's text in its parts, and the loop that emits every body and closure queued
+;; (spec/compiler.md §2). Replaces compile.rs:71 `emit_all`, :175 `module_parts`, `assemble_parts` and the types `Parts` and `Module`
+;; (compile.rs:211-262), which are not in emit.compile because emit.defs.mod needs `emit-all` and `assemble-parts` (it assembles
+;; the module so far for every `def` it runs) and emit.compile needs `emit-defs`: a module cannot call its caller.
+;; A stub reached makes `emit-body` and `emit-closure` return an error whose message starts with `todo: ` (pending, never a pass):
+;; `emit-all` passes it on, and emit.compile makes it the `pending` of the `Module`.
+(ns emit.assemble
+  (:use types.ty own.program emit.value emit.mono emit.objects emit.statics emit.program emit.inits emit.rt emit.lower.mod))
+
+;; The text of a module before its `main`, in the pieces `assemble-parts` puts together, in this order (`fibc emit-dump --sections`):
+;; the runtime, the `extern` declarations, the object structs and the type table, the static data, the keyword helpers, the values
+;; of the `def`s, the quoted constants, then every function in the order its body was finished. Rust: compile.rs:211 Parts
+(defstruct Parts (runtime: str externs: str types: str statics: str keywords: str defs: str quotes: str fns: (Vec str)))
+
+;; A program's lIR module: Parts, then lIR's `main`; `pending` is the first stub reached, when emitting stopped at one (the parts
+;; after the runtime are then empty). Rust: compile.rs:243 Module
+(defstruct Module (parts: Parts main: str pending: (Option str)))
+
+;; The parts of a module that stopped at a stub: only the runtime is known.
+(defun parts-pending () -> Parts
+  (Parts (runtime-text) "" "" "" "" "" "" []))
+
+;; The pieces one after the other. Rust: compile.rs:226 Parts::text
+(defun parts-text (parts: Parts) -> str
+  (str-join (into [(. parts runtime) (. parts externs) (. parts types) (. parts statics) (. parts keywords) (. parts defs)
+                   (. parts quotes)]
+                  (. parts fns))))
+
+;; The text `fibc emit` prints. Rust: compile.rs:253 Module::text
+(defun module-text (m: Module) -> str
+  (str-join [(parts-text (. m parts)) (. m main)]))
+
+;; The runtime, the tables, the static data and every function: what a program and a macro module share, and what `emit_defs`
+;; assembles again for every `def` it runs, so the program's functions and quoted constants are copied and left in place.
+;; Rust: compile.rs:269 module_parts
+(defun module-parts (p: Program defs: str) -> Parts
+  ;; The names of the keyword helpers intern strings: they come before the statics are rendered.
+  (let ((keywords (program-render-keyword-helpers p))
+        (externs (program-render-externs p))
+        (types (objects-render (. p objects))))
+    (let ((statics (statics-render (. p statics))))
+      ;; §3.19, L15: the slot globals of the `def`s made at run time come with the values of the constant `def`s.
+      (let ((slots (inits-slot-text p)))
+        (Parts (runtime-text) externs types statics keywords (str-join [slots defs]) @(. p quote-text) @(. p funcs))))))
+
+;; Rust: compile.rs:285 assemble_parts
+(defun assemble-parts (p: Program defs: str) -> str
+  (parts-text (module-parts p defs)))
+
+;; Emits every body and closure queued so far. Rust: compile.rs:71 emit_all
+(defun emit-all (p: Program) -> (Result unit str)
+  (loop ()
+    (match (program-next-work p)
+      (nil (Ok ()))
+      ((some w)
+       (try-let ((_ (match w
+                      ((WorkBody inst) (emit-body p inst))
+                      ((WorkClosure owner lit name) (emit-closure p owner lit name)))))
+         (match (queue-overflow (. p queue))
+           ((some body)
+            (Err (str-join [body " is wanted at ever larger types, a polymorphic recursion that never ends (types §3.6): "
+                            "the compilation would never finish"])))
+           (nil (recur))))))))

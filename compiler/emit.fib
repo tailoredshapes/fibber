@@ -1,29 +1,31 @@
-;; compiler/emit.fib: the lIR emitter's tool, as `fibc emit-dump` will be (plan E0, E3; the plan is scratchpad
-;; m6/emit-plan.md section 1.2). THIS IS THE SKELETON of package E1, not the tool: it links every module of
-;; compiler/emit/ (so `fibc build compiler/emit.fib` proves they all compile, the stubs of E2..E12 included)
-;; and, run on any words, says it is pending and exits 70, which a harness counts as pending, never as a
-;; pass (CLAUDE.md). E3 replaces `main` with the options of emit-dump (`--sections`, `--layout`, `--fn`,
-;; `--macro`) and a stub reached prints `todo: PACKAGE NAME` and exits 70 the same way.
-;; The modules are in dependency order.
+;; compiler/emit.fib: the lIR emitter's tool, as `fibc emit-dump` (plan E0, E3; the plan is scratchpad m6/emit-plan.md section 1.2;
+;; spec/bootstrap.md §8): prints, for each file named, `== FILE` and then the sections of the lIR module of the program
+;; (`--sections LIST` of runtime,externs,types,statics,keywords,defs,quotes,fns,main; `--fn PREFIX` the functions whose name starts with it),
+;; or the layout table and type table of its ground types (`--layout`), or a macro's module (`--macro NAME`, package E11: pending).
+;; With no file, or a word that is not an option, it prints a usage line to stderr, nothing to stdout, and exits 2.
+;; Exit status: 0 if every file was emitted, 1 if one ended in an error record (it did not read, load, expand or check), 2 if one
+;; could not be read at all or the words were refused, 3 if one is `unsupported`, 70 if a stub of a package not ported yet was reached
+;; (pending: never a pass); the larger wins. It links every module of compiler/emit/, so that `fibc build compiler/emit.fib` proves each
+;; compiles; the modules are in dependency order.
 (ns main
-  (:use emit.value emit.text emit.ir emit.names emit.layout emit.mono emit.objects emit.statics
-        emit.program emit.compile emit.lower.cx emit.lower.mod emit.lower.ops emit.lower.ctrl
+  (:use emit.value emit.text emit.ir emit.names emit.layout emit.mono emit.objects emit.statics emit.runtime emit.rt
+        emit.program emit.inits emit.lower.cx emit.lower.mod emit.lower.ops emit.lower.ctrl
         emit.lower.values emit.lower.call emit.lower.arith emit.lower.objects emit.lower.cells
         emit.lower.dynamic emit.lower.pattern emit.lower.show emit.lower.strfind emit.lower.quote
-        emit.lower.builtins emit.lower.threads emit.resume emit.defs.mod emit.macros.abi emit.layout-dump
-        types.dump))
+        emit.lower.builtins emit.lower.threads emit.resume emit.macros.abi emit.layout-dump emit.assemble emit.defs.mod
+        emit.compile emit.args emit.dump types.dump))
 
-;; The words of this stage of the tool: `--layout FILE..` prints the layout dump (package E2), everything else is pending.
-(defun layout-files (files: (Vec str)) -> i64
+(def usage: str "usage: emit [--sections LIST | --fn PREFIX | --layout | --macro NAME] [--] FILE..")
+
+;; Prints the output of each of files in order, and returns the largest status.
+(defun emit-files (files: (Vec str) o: EmitOptions) -> i64
   (reduce (fn (status: i64 file: str)
-            (let ((d (layout-file file)))
+            (let ((d (emit-file file o)))
               (do (doseq [line (. d lines)] (println line))
                   (max status (. d status)))))
           0 files))
 
 (defun main () -> i64
-  (let ((words (args)))
-    (if (and (> (count words) 1) (= (nth words 0) "--layout"))
-        (layout-files (vec (drop (if (= (nth words 1) "--") 2 1) words)))
-        (do (eprintln "emit: pending: only `--layout FILE..` is ported (package E2); the rest is E3")
-            70))))
+  (match (emit-parse-args (vec (args)))
+    (nil (do (eprintln usage) 2))
+    ((some parsed) (emit-files (. parsed files) (. parsed opts)))))

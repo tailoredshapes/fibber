@@ -1,19 +1,120 @@
-;; compiler/emit/lower/values.fib: method and builtin values (a method or builtin used as a function value). Replaces crates/fibc/src/lower/values.rs.
-;; STATUS: every public function below is a STUB of package E4, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/values.rs, 155 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/values.fib: method and builtin values (a method or builtin used as a function value): an immortal closure whose
+;; code is the method's all-owned body, or a generated wrapper that runs the native operation under the closure convention and
+;; releases the arguments it does not own (types §8.4). Replaces crates/fibc/src/lower/values.rs (155 lines of Rust).
+;; The Rust `wrapper` takes the wrapper's body as a closure (`FnOnce(&mut Cx, ..)`); here it is two functions around the body,
+;; `wrapper-open` and `wrapper-close`, so no closure captures the borrowed context.
 (ns emit.lower.values
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.ast types.decls types.program types.builtins types.infer.cx types.table types.init own.program emit.value
+        emit.names emit.mono emit.ir emit.statics emit.program emit.lower.cx emit.lower.ops emit.lower.arith emit.lower.builtins))
 
-;; Rust: lower/values.rs:21
+;; The plan of a generated wrapper: it has no expressions of its own. Rust: lower/values.rs:21 empty_plan
 (defun empty-plan () -> BodyOwn
-  (trap "todo: E4 empty-plan"))
+  (body-own-new))
 
-;; Rust: lower/values.rs:29 LowerCx::method_value
+;; A wrapper under construction: its context, the values of its parameters, their types and its result type.
+(defstruct Wrapper (cx: LowerCx vals: (Vec V) tys: (Vec Ty) ret: Ty))
+
+;; The context of the closure-convention function `name` whose parameters and result are those of the function type of `e`; `nil`
+;; when it was emitted already. Rust: lower/values.rs:107 Cx::wrapper, up to the call of the body
+(defun wrapper-open :private (cx: LowerCx e: Expr name: str) -> (Result (Option Wrapper) str)
+  (if (program-has-helper (. cx p) name)
+      (Ok nil)
+      (try-let ((fty (lcx-ty cx e)))
+        (match fty
+          ((TFn _ params ret)
+           (try-let ((lirs (try-map (fn (t: Ty) (program-lir (. cx p) t)) params)))
+             (let ((vals (mapv (fn (i: i64) (match (nth lirs i) ((some l) (VVal (str-join ["p" (str i)]) l)) (nil VUnit)))
+                               (range (count params))))
+                   (sig (into [(LirParam LirPtr "env")]
+                              (vec (keep (fn (i: i64) (match (nth lirs i) ((some l) (some (LirParam l (str-join ["p" (str i)])))) (nil nil)))
+                                         (range (count params)))))))
+               (let ((w (lcx-sub cx (. cx inst) (empty-plan) name sig)))
+                 (try-let ((rl (program-lir (. cx p) ret)))
+                   (do (set! (. (. w b) ret) rl)
+                       (set! (. w env) (some (VVal "env" LirPtr)))
+                       (set! (. w locals) (assoc @(. w locals) 4294967295 (LocalVal VUnit)))
+                       (Ok (some (Wrapper w vals params ret)))))))))
+          (_ (Err "a function value without a function type"))))))
+
+;; Returns `v` and records the finished function as a helper. Rust: lower/values.rs:107 Cx::wrapper, after the body
+(defun wrapper-close :private (w: Wrapper name: str v: V) -> unit
+  (do (fb-term (. (. w cx) b) (match v ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"]))))
+      (program-add-helper (. (. w cx) p) name (fb-render (. (. w cx) b)))))
+
+;; The closure object of `code` without captures: the address of its immortal static.
+(defun closure-value :private (cx: LowerCx code: str) -> V
+  (let ((r (program-closure-object (. cx p) code [])))
+    (VVal (statics-closure (. (. cx p) statics) code (. r fst)) LirPtr)))
+
+;; The index in `ms` of the implementation of method `i` of the protocol.
+(defun method-position :private (ms: (Vec ImplMethod) i: i64) -> (Option i64)
+  (loop ((m 0))
+    (if (>= m (count ms))
+        nil
+        (if (= (. (nth ms m) index) i) (some m) (recur (+ m 1))))))
+
+;; The wrapper of a protocol method with no implementation of its own (a native one), as a code name: it runs the native
+;; operation, then releases the arguments the method does not own.
+(defun native-wrapper :private (cx: LowerCx e: Expr proto: ProtoDef i: i64) -> (Result str str)
+  (let ((m (nth (. proto methods) i)) (g (program-g (. cx p))))
+    (try-let ((t (lcx-ty cx e)))
+      (let ((name (str-join ["l.native." (. proto name) "." (. m name) "." (mangle g t)])))
+        (try-let ((opened (wrapper-open cx e name)))
+          (match opened
+            (nil (Ok name))
+            ((some w)
+             (try-let ((r (lcx-native-method (. w cx) (. proto name) (. m name) (. w vals) (. w tys) (. w ret))))
+               (match r
+                 (nil (Err "a native wrapper that does not return"))
+                 ((some v)
+                  (do (doseq [j (range (count (. w vals)))]
+                        (when (not (match (get (. m params) j) ((some q) (. q owned)) (nil false)))
+                          (lcx-release (. w cx) (nth (. w vals) j))))
+                      (wrapper-close w name v)
+                      (Ok name))))))))))))
+
+;; A protocol method as a value: its implementation at the resolved instance, all-owned. Rust: lower/values.rs:29 Cx::method_value
 (defun lcx-method-value (cx: LowerCx e: Expr p: i64 i: i64) -> (Result V str)
-  (trap "todo: E4 lcx-method-value"))
+  (match (get (. (. (. cx p) typed) resolutions) (. e id))
+    ((some (ResInstance index args))
+     (let ((g (program-g (. cx p))))
+       (let ((inst (table-get (. g instances) index)) (targs (mapv (fn (t: Ty) (inst-subst (. cx inst) t)) args)))
+         (let ((proto (g-proto g (. inst proto))))
+           (try-let ((code (if (empty? (. inst methods))
+                               (native-wrapper cx e proto i)
+                               (match (method-position (. inst methods) i)
+                                 (nil (Err "an instance without the method"))
+                                 ((some m) (Ok (program-request (. cx p) (BodyMethodOwned index m) targs)))))))
+             (Ok (closure-value cx code)))))))
+    (_ (Err "a method value without a resolved instance"))))
 
-;; Rust: lower/values.rs:73 LowerCx::builtin_value
+;; Builtins that cannot be a value.
+(defun builtin-not-a-value :private (name: str) -> bool
+  (contains? (set ["cell" "atom" "array" "array-with" "array-copy" "str-bytes" "weak" "spawn" "join" "trap" "concat"]) name))
+
+;; Runs the builtin `sig` in the wrapper, then releases the arguments it only borrows (eval/native.rs `release_borrowed`).
+(defun builtin-body :private (w: Wrapper e: Expr sig: BuiltinSig name: str) -> (Result unit str)
+  (try-let ((r (lcx-builtin (. w cx) (. sig name) e (. w vals) (. w tys))))
+    (match r
+      (nil (Err "a builtin wrapper that does not return"))
+      ((some v)
+       (do (doseq [j (range (min (count (. sig escapes)) (count (. w vals))))]
+             (match (nth (. sig escapes) j)
+               ((EscBorrow) (lcx-release (. w cx) (nth (. w vals) j)))
+               ((EscWeak) (lcx-release (. w cx) (nth (. w vals) j)))
+               ((EscRaw) (lcx-release (. w cx) (nth (. w vals) j)))
+               (_ ())))
+           (wrapper-close w name v)
+           (Ok ()))))))
+
+;; A builtin as a value: a wrapper running it, then releasing its borrowed arguments. Rust: lower/values.rs:73 Cx::builtin_value
 (defun lcx-builtin-value (cx: LowerCx e: Expr b: i64) -> (Result V str)
-  (trap "todo: E4 lcx-builtin-value"))
+  (let ((sig (nth (. (. (. cx p) typed) builtins) b)))
+    (if (builtin-not-a-value (. sig name))
+        (Err (str-join [(. sig name) " as a value"]))
+        (try-let ((t (lcx-ty cx e)))
+          (let ((name (str-join ["l.builtin." (. sig name) "." (mangle (program-g (. cx p)) t)])))
+            (try-let ((opened (wrapper-open cx e name)))
+              (match opened
+                (nil (Ok (closure-value cx name)))
+                ((some w) (try-let ((done (builtin-body w e sig name))) (Ok (closure-value cx name)))))))))))

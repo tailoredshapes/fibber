@@ -1,32 +1,56 @@
 ;; compiler/emit/lower/ops.fib: ownership operations: `retain`, `release`, the sites of the plan (spec/compiler.md §4.2).
-;; Replaces crates/fibc/src/lower/ops.rs.
-;; STATUS: every public function below is a STUB of package E4, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/ops.rs, 94 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; Replaces crates/fibc/src/lower/ops.rs (94 lines of Rust). `value-sites` (ops.rs:14) is in emit.lower.cx, where the context is
+;; built: a constructor cannot call a module above it.
 (ns emit.lower.ops
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.ast types.init own.program emit.value emit.ir emit.program emit.lower.cx))
 
-;; Rust: lower/ops.rs:14
-(defun value-sites (own: BodyOwn) -> (Set i64)
-  (trap "todo: E4 value-sites"))
-
-;; Rust: lower/ops.rs:33 LowerCx::site
+;; The value a site names; `nil` for a `def` (immortal: every operation on it is a no-op). Rust: lower/ops.rs:33 Cx::site
 (defun lcx-site (cx: LowerCx s: Site) -> (Result (Option V) str)
-  (trap "todo: E4 lcx-site"))
+  (match s
+    ((SiteBind b) (try-let ((v (lcx-local cx b))) (Ok (some v))))
+    ((SiteCapture _ b) (try-let ((v (lcx-local cx b))) (Ok (some v))))
+    ((SiteValue e)
+     (match (get @(. cx values) e)
+       ((some v) (Ok (some v)))
+       (nil (Err (str-join ["the plan names value " (str e) ", which has no value here"])))))
+    ((SiteEnv _) (Ok @(. cx env)))
+    ((SiteGlobal _) (Ok nil))))
 
-;; Rust: lower/ops.rs:47 LowerCx::after
+;; The operations after expression `e`. Rust: lower/ops.rs:47 Cx::after
 (defun lcx-after (cx: LowerCx e: i64) -> (Result unit str)
-  (trap "todo: E4 lcx-after"))
+  (match (get (. (. cx own) exprs) e)
+    ((some x) (if (empty? (. x after)) (Ok ()) (lcx-run-ops cx (. x after))))
+    (nil (Ok ()))))
 
-;; Rust: lower/ops.rs:55 LowerCx::run_ops
+;; Rust: lower/ops.rs:55 Cx::run_ops
 (defun lcx-run-ops (cx: LowerCx ops: (Vec Op)) -> (Result unit str)
-  (trap "todo: E4 lcx-run-ops"))
+  (try-each (fn (op: Op)
+              (try-let ((site (lcx-site cx (. op site))))
+                (match site
+                  (nil (Ok ()))
+                  ((some v) (match (. op kind)
+                              ((OpRetain) (Ok (lcx-retain cx v)))
+                              ((OpRelease) (Ok (lcx-release cx v)))
+                              ((OpEndStack) (end-stack cx v)))))))
+            ops))
 
-;; Rust: lower/ops.rs:69 LowerCx::retain
+;; Rust: lower/ops.rs:69 Cx::retain
 (defun lcx-retain (cx: LowerCx v: V) -> unit
-  (trap "todo: E4 lcx-retain"))
+  (when-some (w (lcx-obj-word cx v))
+    (fb-stmt (. cx b) (str-join ["(call @fib.retain " w ")"]))))
 
-;; Rust: lower/ops.rs:75 LowerCx::release
+;; Rust: lower/ops.rs:75 Cx::release
 (defun lcx-release (cx: LowerCx v: V) -> unit
-  (trap "todo: E4 lcx-release"))
+  (when-some (w (lcx-obj-word cx v))
+    (fb-stmt (. cx b) (str-join ["(call @fib.release " w ")"]))))
+
+;; The end of a stack object's scope (§6.11): its inline drop; a stack closure holds only aliases, so there is nothing to release.
+;; Rust: lower/ops.rs:84 Cx::end_stack
+(defun end-stack :private (cx: LowerCx v: V) -> (Result unit str)
+  (match (lcx-obj-word cx v)
+    (nil (Err "the plan ends a scalar as a stack object"))
+    ((some w)
+     (do (fb-stmt (. cx b) (str-join ["(call @fib.stack-end " w ")"]))
+         (when (not (contains? @(. cx closure-slots) w))
+           (fb-stmt (. cx b) (str-join ["(call @fib.drop-fields " w ")"])))
+         (Ok ())))))

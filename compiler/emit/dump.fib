@@ -1,0 +1,110 @@
+;; compiler/emit/dump.fib: what `fibc emit-dump` prints for one file (spec/bootstrap.md §8), as crates/fibc/src/emit_dump/{mod,sections,front}.rs:
+;; the header `== FILE`, then the front end's record if the file does not read, load, expand or check, else the sections of the module
+;; (each under `;; == section NAME`, in the order of emit.args `section-names`), or `unsupported WORD` (status 3), or `unreadable`.
+;; The file loop and the read, load and expand records are types.dump's (`dump-file`, as layout-dump and own.dump use it); the front end
+;; is the one of `check_modules`: lowering, the `&` checks, inference, ownership (own.driver `own-check-lowered`).
+;; PENDING: a stub reached (an error `todo: ..`, emit.assemble) is printed on stderr and makes the status 70, which wins over the others
+;; (the harness counts it as pending, never as a pass). The sections that need no body, `runtime` and `main`, are printed all the same.
+;; Not ported: `--macro NAME` (package E11): it checks the file and is pending.
+(ns emit.dump
+  (:require [fib.string :as s] [types.driver :as driver] [types.dump :as dump] [syntax.dump :as sdump])
+  (:use syntax.form expand.types types.args types.dump.sections own.error own.program own.driver
+        emit.args emit.assemble emit.compile emit.layout-dump))
+
+(def pending-status: i64 70)
+
+;; The first word of a message: all a harness compares of an `unsupported` program (§8.4), the messages being for people.
+(defun first-word :private (m: str) -> str
+  (let ((start (loop ((i 0)) (if (and (< i (str-len m)) (<= (str-byte-at m i) 32i8)) (recur (+ i 1)) i))))
+    (str-slice m start (loop ((i start)) (if (and (< i (str-len m)) (> (str-byte-at m i) 32i8)) (recur (+ i 1)) i)))))
+
+;; The name of a function's text: the head after its modifiers, `(define internal tailcc (f.sq i64) ..` is `f.sq`. Rust: sections.rs:46 fn_name
+(defun fn-name :private (text: str) -> (Option str)
+  (if (not (starts-with? text "(define "))
+      nil
+      (match (str-find text "(" 8)
+        (nil nil)
+        ((some open)
+         (let ((end (loop ((i (+ open 1))) (if (and (< i (str-len text)) (> (str-byte-at text i) 32i8) (not (= (str-byte-at text i) 41i8))) (recur (+ i 1)) i))))
+           (if (= end (+ open 1)) nil (some (str-slice text (+ open 1) end))))))))
+
+;; The functions whose name starts with the prefix, or all. Rust: sections.rs:40 push_fns
+(defun fns-text :private (fns: (Vec str) prefix: (Option str)) -> str
+  (str-join (vec (filter (fn (f: str)
+                      (match prefix
+                        (nil true)
+                        ((some pre) (match (fn-name f) (nil false) ((some n) (starts-with? n pre))))))
+                    fns))))
+
+;; The text of one section of the module. Rust: sections.rs:13 text
+(defun section-body :private (m: Module sec: str prefix: (Option str)) -> str
+  (let ((p (. m parts)))
+    (cond (= sec "runtime") (. p runtime)
+          (= sec "externs") (. p externs)
+          (= sec "types") (. p types)
+          (= sec "statics") (. p statics)
+          (= sec "keywords") (. p keywords)
+          (= sec "defs") (. p defs)
+          (= sec "quotes") (. p quotes)
+          (= sec "fns") (fns-text (. p fns) prefix)
+          :else (. m main))))
+
+;; A text as the lines to print: each section is one element, its last line break left to `println`.
+(defun text-line :private (text: str) -> (Vec str)
+  (cond (= text "") []
+        (s/ends-with? text "\n") [(str-slice text 0 (- (str-len text) 1))]
+        :else [text]))
+
+;; The sections asked for, under their headers. A section of a module that stopped at a stub holds nothing but `runtime` and `main`.
+(defun sections-lines :private (lines: (Vec str) m: Module o: EmitOptions) -> (Vec str)
+  (reduce (fn (acc: (Vec str) sec: str)
+            (if (emit-wants o sec)
+                (let ((known (or (= sec "runtime") (= sec "main") (nil? (. m pending)))))
+                  (into (conj acc (str-join [";; == section " sec]))
+                        (if known (text-line (section-body m sec (. o fn-prefix))) [])))
+                acc))
+          lines section-names))
+
+;; The status of a module: pending if a section asked for needed what was not made.
+(defun module-status :private (m: Module o: EmitOptions) -> i64
+  (match (. m pending)
+    (nil 0)
+    ((some msg)
+     (if (not-any? (fn (sec: str) (and (emit-wants o sec) (not (= sec "runtime")) (not (= sec "main")))) section-names)
+         0
+         (do (eprintln msg) pending-status)))))
+
+;; The records of ownership errors, in order, their positions relative to the main file home. Rust: own_dump::own_error_records
+(defun own-records :private (lines: (Vec str) errs: (Vec OwnError) home: str) -> (Vec str)
+  (reduce (fn (acc: (Vec str) e: OwnError)
+            (conj acc (str-join ["error " (own-error-kind-name (. e kind)) " " (sdump/span-in (. e pos) home) ": " (. e message)])))
+          lines errs))
+
+;; The module of a checked program, printed, or what stopped it.
+(defun emit-checked :private (lines: (Vec str) c: Checked o: EmitOptions) -> dump/Dumped
+  (match (compile-module (. c typed) (. c owned) false)
+    ((Err m) (dump/Dumped (conj lines (str-join ["unsupported" (if (= (first-word m) "") "" (str-join [" " (first-word m)]))])) 3))
+    ((Ok m) (dump/Dumped (sections-lines lines m o) (module-status m o)))))
+
+;; The check of an expanded program: the front end's records when it does not check, else the module (or the macro's, pending).
+(defun emit-check :private (o: EmitOptions lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
+    -> dump/Dumped
+  (match (driver/lower-modules modules prelude)
+    ((Err errs) (dump/error-dump lines errs home true))
+    ((Ok l)
+     (match (own-check-lowered l true)
+       ((Err (CeType errs)) (dump/error-dump lines errs home true))
+       ((Err (CeOwn errs)) (dump/Dumped (own-records lines errs home) 1))
+       ((Err e) (dump/Dumped (conj lines (check-error-text e)) 1))
+       ((Ok c)
+        (if (some? (. o macro-name))
+            (do (eprintln "todo: E11 --macro") (dump/Dumped lines pending-status))
+            (emit-checked lines c o)))))))
+
+;; What `fibc emit-dump` prints for one file, and the status it adds. Rust: emit_dump/mod.rs:192 dump_file
+(defun emit-file (file: str o: EmitOptions) -> dump/Dumped
+  (if (. o layout)
+      (layout-file file)
+      (dump/dump-file file (options-default)
+                      (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
+                        (emit-check o lines modules prelude shown home opts)))))
