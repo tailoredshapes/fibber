@@ -1,0 +1,45 @@
+;; spec:   stdlib §2.1 rule 2 (an infinite source is fine: the fused loop has no seq and no chunk), tranche 1 plan R9; case 821
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: iterate map filter take drop take-while vec reduce-while
+;; Case 821 with the real source: the chains of that case, over (iterate g 0) where g counts its calls
+;; (`steps`: the elements asked for after the first) and f counts its own. The expander fuses a chain
+;; whose terminal is `vec` or `reduce-while` into one loop; the source is an ordinary expression to it, so an
+;; Iterate needs no table row. `(vec (take 2 (map f (iterate g 0))))` is [0 2] with 2 calls of f and 1 of g:
+;; the source is stopped at the second element, not asked for a third. The bound form of the same chain, the
+;; lazy one, makes the same calls. A walk that took one element too many would show as an extra step.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (steps (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2))))
+          (g (fn (x: i64) (do (set! steps (+ @steps 1)) (+ x 1))))
+          (even (fn (x: i64) (= (rem x 2) 0))))
+      (do (check c (= (vec (take 2 (map f (iterate g 0)))) [0 2]))
+          (check c (= @calls 2))
+          (check c (= @steps 1))
+          (set! calls 0)
+          (set! steps 0)
+          (let ((s (take 2 (map f (iterate g 0)))))
+            (do (check c (= (vec s) [0 2]))
+                (check c (= @calls 2))
+                (check c (= @steps 1))))
+          (set! calls 0)
+          (set! steps 0)
+          (check c (= (vec (take 3 (filter even (map f (iterate g 1))))) [2 4 6]))
+          (check c (= @calls 3))
+          (check c (= @steps 2))
+          (set! steps 0)
+          (check c (= (vec (take-while (fn (x: i64) (< x 5)) (iterate g 2))) [2 3 4]))
+          (check c (= @steps 3))
+          (set! steps 0)
+          (check c (= (vec (take 2 (drop 3 (iterate g 0)))) [3 4]))
+          (check c (= @steps 4))
+          (set! steps 0)
+          (check c (= (reduce-while (fn (a x) (if (> x 3) (reduced a) (More (+ a x)))) 0 (iterate g 0)) 6))
+          (check c (= @steps 4))
+          (checks-result c)))))

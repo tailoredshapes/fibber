@@ -1,0 +1,38 @@
+;; spec:   stdlib §2.1 rule 8 (Cycle is its own seq type)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: cycle seq rest next first nth take vec map
+;; `seq` of a Cycle is the Cycle (nil only when the source is empty); `rest` is the Cycle one element
+;; on, made without a walk: its second field, skip, counts the elements already passed, and the walk that
+;; reads it takes it modulo the length of the source, so three rests of a cycle of three are the cycle
+;; again and a skip of seven over a source of three starts at the second element. The constructor is
+;; public: (Cycle src 0) is (cycle src). The lazy form (a bound map over a skipped cycle), the fused
+;; form and `nth` read the same position. Every rest is a (Cycle c e), so `third` below, written once over any seq,
+;; takes any of them.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun third (xs: c) :where ((Seqable c s) (Seqable s s) (Reducible s e)) -> (Option e)
+  (first (rest (rest xs))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (cy (cycle [1 2 3])))
+    (do (check c (= (vec (take 5 (rest cy))) [2 3 1 2 3]))
+        (check c (= (vec (take 4 (rest (rest cy)))) [3 1 2 3]))
+        (check c (= (vec (take 4 (rest (rest (rest cy))))) [1 2 3 1]))
+        (check c (= (first (rest (rest (rest (rest cy))))) (some 2)))
+        (check c (= (nth (rest cy) 4) 3))
+        (check c (= (match (seq cy) (nil nil) ((some s) (first s))) (some 1)))
+        (check c (= (match (next cy) (nil nil) ((some s) (first s))) (some 2)))
+        (check c (= (third cy) (some 3)))
+        (check c (= (third (rest cy)) (some 1)))
+        (check c (= (vec (take 4 (Cycle [1 2 3] 7))) [2 3 1 2]))
+        (check c (= (vec (take 3 (Cycle [1 2 3] 3))) [1 2 3]))
+        (check c (= (vec (take 3 (Cycle [1 2 3] 0))) (vec (take 3 cy))))
+        (let ((m (map inc (Cycle [1 2 3] 4))))
+          (check c (= (vec (take 4 m)) [3 4 2 3])))
+        (check c (= (vec (take 4 (map inc (Cycle [1 2 3] 4)))) [3 4 2 3]))
+        (check c (= (nth (Cycle [1 2 3] 4) 5) 1))
+        (checks-result c))))

@@ -1,5 +1,133 @@
 ;; owner: Y1
-;; fib.seq.streams: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the endless sources `Iterate Repeat Cycle` and `iterate repeat repeatedly cycle`, with the `Reducible` and `Seqable` instances of the three.
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
-(ns fib.seq.streams (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.lazy fib.seq.sources fib.seq.seqable))
+;; fib.seq.streams: the endless sources of stdlib §4.4 (tranche 2 plan Y1; spec §2.1 rules 1, 3 and 8). Public: Iterate, Repeat,
+;; Cycle, iterate, repeat, cycle, repeatedly, and the Reducible and Seqable instances of the three structs. It replaces nothing:
+;; before it the only endless source was a Range of step 0 (range-by a b 0), which repeats its start for ever.
+;;
+;; The three structs are sources that only an early-exiting consumer ends, each its own seq type (rule 8):
+;; (Iterate f x) is x, (f x), (f (f x)) ..; (Repeat x) is x for ever; (Cycle c skip) is the elements of c from the
+;; skip-th on, then all of c again and again. Each walks with one loop and allocates nothing per element (a Cycle one
+;; cell and one closure per pass), and the function of an Iterate is called when the next element is asked for and never
+;; before: (take n (iterate f x)) calls f n - 1 times. Where Clojure's behaviour is named below it is as I recall it: there
+;; is no Clojure on this machine, so none of it was run.
+;; Decided here, where the page or the plan is silent or says two things:
+;;  - to-lseq is lazy, one node per demand, and builds no cyclic seq: a forced node of (Repeat x) makes the next node, so
+;;    a seq that repeats does not close a loop through a cell (a leak cycle, spec §2.1 rule 2).
+;;  - Plan §4.2 rule 5 says an endless source "never overrides size or last" and, in the same sentence, that count, last
+;;    and to-vec of it trap. Read as: no override ever answers (no closed form, no capped count), and the three overrides
+;;    here exist only to trap, with `count: never ends`, `last: never ends` and `to-vec: never ends` (the default walks would
+;;    hang; Range of step 0 traps the same way). A Cycle of an empty source is empty and answers 0, nil and [] instead.
+;;  - nth of an index below zero traps `nth: index out of range` at once (the default walk would never find it); every
+;;    other index is a walk of that many elements, O(1) for a Repeat.
+;;  - the walk of a Cycle stops when a whole pass yields nothing, so a source with no elements ends it (true: it ran to
+;;    the end). A Cycle walks its source again on every pass: over a bound LSeq the passes read the same memoised nodes, so
+;;    the function behind it runs once per element (Clojure's cycle keeps the first pass); over a recipe built by hand the
+;;    function runs again on every pass. The expander's fusion (X12) must therefore not make the argument of cycle a stage.
+;;  - the closed seq type of each source is itself (rule 8): seq is (some self), and nil only for the Cycle of an empty
+;;    source; rest of an Iterate calls f once (as Clojure's does), rest of a Repeat is itself, and rest of a Cycle is the
+;;    Cycle one element on, made without a walk: its field `skip` counts the elements already passed, and the walk that
+;;    reads it takes it modulo the length of the source (so it grows by one per rest and traps, as + does, at the largest
+;;    i64). (Cycle c 0) is (cycle c); the second argument is the one place where the constructor is not (Name source),
+;;    which X12's table must know if it ever builds a Cycle.
+;;  - repeatedly is (lazy-seq (cons (f) (repeatedly f))) as an LSeq, so f runs when a node is first forced and once per
+;;    element across every traversal. Its function is stored in the nodes, so it is owned, not :borrow.
+;;  - Proposed (plan recommendation, owner not yet confirmed; spec §8.2.1 item 14, D7): the three structs have no `Show`
+;;    instance, so printing one is a compile error that names the type, where a print of an endless seq never returns; and
+;;    Iterate is a pure struct that holds no cell, so a bound Iterate calls f again on every traversal where Clojure's caches
+;;    next. A lazy seq made from it (map, filter, a bound take) memoises as every LSeq does. A pure Iterate still does not
+;;    cross a task: its field f has a function type of the default colour, which is :local, so only a colour parameter
+;;    would let it (case 2229; Repeat and Cycle hold no function and do, case 2228).
+;;  - L1: (repeat n x) and (repeatedly n f) are Y11's clauses; no stand-in name is made for them here (case 2237 waits for them).
+(ns fib.seq.streams (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.consumers fib.seq.recipes))
+
+;; ---- iterate ----
+(defstruct (Iterate a) (f: (fn (a) a) x: a))
+
+(defun iterate (f: (fn (a) a) x: a) -> (Iterate a) (Iterate f x))
+
+;; the node after the one that holds x: f is applied when the node is first demanded
+(defun iterate-after :private (f: (fn (a) a) x: a) -> (LSeq a)
+  (lazy-node (fn () (let ((y (f x))) (LCons y (iterate-after f y))))))
+
+(impl (Reducible a) (Iterate a)
+  (each-while (self k)
+    (let ((f (. self f)))
+      (loop ((x (. self x))) (if (k x) (recur (f x)) false))))
+  (size (self) (trap "count: never ends"))
+  (last (self) (trap "last: never ends"))
+  (to-vec (self) (trap "to-vec: never ends"))
+  (nth (self i)
+    (if (< i 0)
+        (trap "nth: index out of range")
+        (let ((f (. self f)))
+          (loop ((j 0) (x (. self x))) (if (< j i) (recur (+ j 1) (f x)) x)))))
+  (to-lseq (self) (lcons (. self x) (iterate-after (. self f) (. self x)))))
+
+(impl (Seqable (Iterate a)) (Iterate a)
+  (seq (self) (some self))
+  (rest (self) (Iterate (. self f) ((. self f) (. self x)))))
+
+;; ---- repeat ----
+(defstruct (Repeat a) (x: a))
+
+(defun repeat (x: a) -> (Repeat a) (Repeat x))
+
+(defun repeat-lseq :private (x: a) -> (LSeq a)
+  (lazy-node (fn () (LCons x (repeat-lseq x)))))
+
+(impl (Reducible a) (Repeat a)
+  (each-while (self k)
+    (let ((x (. self x)))
+      (loop () (if (k x) (recur) false))))
+  (size (self) (trap "count: never ends"))
+  (last (self) (trap "last: never ends"))
+  (to-vec (self) (trap "to-vec: never ends"))
+  (nth (self i) (if (< i 0) (trap "nth: index out of range") (. self x)))
+  (to-lseq (self) (repeat-lseq (. self x))))
+
+(impl (Seqable (Repeat a)) (Repeat a)
+  (seq (self) (some self))
+  (rest (self) self))
+
+;; ---- cycle ----
+;; (Cycle c skip) is c from its skip-th element on and then c again for ever; (cycle c) is skip 0, and e is the element
+;; type that c determines (the phantom variable of the recipes, which the impl heads below need until L16)
+(defstruct (Cycle c e) (src: c skip: i64))
+
+(defun cycle (c: c) :where ((Reducible c e)) -> (Cycle c e) (Cycle c 0))
+
+(defun cycle-empty? :private (self: (Cycle c e)) :where ((Reducible c e)) -> bool
+  (each-while (. self src) (fn (x) false)))
+
+;; the seq from s on, n elements of this pass still to skip, m elements of it passed; a pass that passed none is the end
+(defun cycle-lseq :private (all: (LSeq e) s: (LSeq e) n: i64 m: i64) -> (LSeq e)
+  (lazy-node (fn ()
+    (loop ((s s) (n n) (m m))
+      (match (lnode s)
+        ((LCons h t) (if (> n 0) (recur t (- n 1) (+ m 1)) (LCons h (cycle-lseq all t 0 (+ m 1)))))
+        ((LNil) (if (= m 0) LNil (recur all (rem n m) 0))))))))
+
+(impl (Reducible e) (Cycle c e) :where ((Reducible c e))
+  (each-while (self k)
+    (let ((src (. self src)))
+      (loop ((skip (. self skip)))
+        (let ((n (cell 0)))
+          (if (each-while src (fn (x) (do (set! n (+ @n 1)) (if (> @n skip) (k x) true))))
+              (if (> @n skip) (recur 0) (if (= @n 0) true (recur (rem skip @n))))
+              false)))))
+  (size (self) (if (cycle-empty? self) 0 (trap "count: never ends")))
+  (last (self) (if (cycle-empty? self) nil (trap "last: never ends")))
+  (to-vec (self) (if (cycle-empty? self) (vec-empty) (trap "to-vec: never ends")))
+  (nth (self i)
+    (if (< i 0)
+        (trap "nth: index out of range")
+        (match (first (Dropped self i)) ((some x) x) (nil (trap "nth: index out of range")))))
+  (to-lseq (self) (let ((all (to-lseq (. self src)))) (cycle-lseq all all (. self skip) 0))))
+
+(impl (Seqable (Cycle c e)) (Cycle c e) :where ((Reducible c e))
+  (seq (self) (if (cycle-empty? self) nil (some self)))
+  (rest (self) (if (cycle-empty? self) self (Cycle (. self src) (+ (. self skip) 1)))))
+
+;; ---- repeatedly ----
+;; Clojure's (lazy-seq (cons (f) (repeatedly f))): f runs once per element, when the node is first demanded
+(defun repeatedly (f: (fn () a)) -> (LSeq a)
+  (lazy-node (fn () (LCons (f) (repeatedly f)))))

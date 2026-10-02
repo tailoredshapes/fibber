@@ -1,0 +1,31 @@
+;; spec:   stdlib §4.4 (row repeatedly), §2.1 rule 2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: repeatedly take vec map
+;; A function with state, a seeded generator, shows memoisation without a counter. The numbers the generator gives
+;; for seed 2227 are drawn once by a loop that does not use the library (`reference`, from a second generator of the
+;; same seed): the first eight elements of (repeatedly ..) are those eight numbers, which a library that called the
+;; function twice per element or ahead of the demand would not give. The second traversal of the same seq is the first
+;; again, which one that ran the generator on every read would not give; a lazy seq made from it by `map` agrees; and a
+;; second (repeatedly ..) made from the same generator is a seq of its own that reads the numbers after the first eight.
+;; A function that returns a heap value (a string) is the same: the elements are the values it made.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun draw-all (r: Rng n: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (vec-conj acc (rng-below r 1000))) acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (r (rng 2227))
+        (reference (draw-all (rng 2227) 16)))
+    (let ((s (repeatedly (fn () (rng-below r 1000)))))
+      (let ((first8 (vec (take 8 s))))
+        (do (check c (= first8 (vec (take 8 reference))))
+            (check c (= (vec (take 8 s)) first8))
+            (check c (= (vec (take 8 (map (fn (x: i64) (+ x 1)) s))) (vec (map (fn (x: i64) (+ x 1)) first8))))
+            (check c (= (vec (take 8 (repeatedly (fn () (rng-below r 1000))))) (vec (take 8 (drop 8 reference)))))
+            (check c (= (vec (take 2 (repeatedly (fn () "ab")))) ["ab" "ab"]))
+            (checks-result c))))))

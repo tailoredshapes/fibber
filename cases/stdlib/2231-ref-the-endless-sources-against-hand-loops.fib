@@ -1,0 +1,108 @@
+;; spec:   stdlib §4.4 rows iterate repeat cycle, §8.1 item 2 (a naive reference)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: iterate repeat cycle take vec reduce nth
+;; 300 seeded draws, each of a source kind: an iterate of a drawn step (add, double and add, subtract)
+;; from a drawn start, a repeat of a drawn element, a cycle from a drawn position of a drawn Vec of 0 to 5
+;; elements (the empty one included). Each is read four ways, as a fused chain over the bound source,
+;; as a bound lazy seq of a take, by a fold, and by nth, and compared with an eager reference written
+;; with loops over the prelude's vec-conj and vec-nth, which do not use the library under test. The
+;; last check plants a fault in the reference (every element is read one step on) and requires the
+;; comparison to notice: the case can fail. The draws are one check each, so the 300 checks share
+;; bits 0 to 61 and a failure of a later one sets bit 62. Seed 2231.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+;; the step of an iterate, as a closure and, written out again, as the reference's own
+(defun step-of (op: i64 d: i64) -> (fn (i64) i64)
+  (match op
+    (0 (fn (x) (+ x d)))
+    (1 (fn (x) (+ (* x 2) d)))
+    (_ (fn (x) (- x d)))))
+
+(defun ref-step (op: i64 d: i64 x: i64) -> i64
+  (match op (0 (+ x d)) (1 (+ (* x 2) d)) (_ (- x d))))
+
+(defun ref-sum (v: (Vec i64)) -> i64
+  (loop ((i 0) (acc 0)) (if (< i (vec-count v)) (recur (+ i 1) (+ acc (vec-nth v i))) acc)))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; ---- the references: n elements by loops, and element j
+(defun ref-iterate (op: i64 d: i64 x0: i64 n: i64 fault: bool) -> (Vec i64)
+  (loop ((i 0) (x (if fault (ref-step op d x0) x0)) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (ref-step op d x) (vec-conj acc x)) acc)))
+
+(defun ref-iterate-nth (op: i64 d: i64 x0: i64 j: i64 fault: bool) -> i64
+  (loop ((i 0) (x (if fault (ref-step op d x0) x0))) (if (< i j) (recur (+ i 1) (ref-step op d x)) x)))
+
+(defun ref-cycle (src: (Vec i64) s: i64 n: i64 fault: bool) -> (Vec i64)
+  (let ((len (vec-count src)))
+    (if (= len 0)
+        (vec-empty)
+        (loop ((i 0) (acc (vec-empty)))
+          (if (< i n) (recur (+ i 1) (vec-conj acc (vec-nth src (rem (+ (+ s i) (if fault 1 0)) len)))) acc)))))
+
+(defun ref-repeat (x: i64 n: i64 fault: bool) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (vec-conj acc (if fault (+ x i) x))) acc)))
+
+;; ---- one draw of each kind: the library side against the reference
+(defun iterate-ok (r: Rng fault: bool) -> bool
+  (let ((op (rng-below r 3)) (d (rng-below r 9)) (x0 (rng-below r 50)) (n (rng-below r 14)))
+    (let ((j (rng-below r 14)) (ref (ref-iterate op d x0 n fault)))
+      (let ((it (iterate (step-of op d) x0))
+            (lazy (take n (iterate (step-of op d) x0))))
+        (and (same (vec (take n it)) ref)
+             (and (same (vec lazy) ref)
+                  (and (= (reduce (fn (a x) (+ a x)) 0 (take n it)) (ref-sum ref))
+                       (= (nth it j) (ref-iterate-nth op d x0 j fault)))))))))
+
+(defun repeat-ok (r: Rng fault: bool) -> bool
+  (let ((x (rng-below r 100)) (n (rng-below r 10)) (j (rng-below r 1000)))
+    (let ((ref (ref-repeat x n fault))
+          (lazy (take n (repeat x))))
+      (and (same (vec (take n (repeat x))) ref)
+           (and (same (vec lazy) ref)
+                (and (= (reduce (fn (a e) (+ a e)) 0 (take n (repeat x))) (ref-sum ref))
+                     (= (nth (repeat x) j) x)))))))
+
+(defun cycle-ok (r: Rng fault: bool) -> bool
+  (let ((src (rng-vec r (rng-below r 6) 50)) (s (rng-below r 10)) (n (rng-below r 16)) (j (rng-below r 20)))
+    (let ((ref (ref-cycle src s n fault))
+          (lazy (take n (Cycle src s))))
+      (and (same (vec (take n (Cycle src s))) ref)
+           (and (same (vec (take n (cycle src))) (ref-cycle src 0 n fault))
+                (and (same (vec lazy) ref)
+                     (and (= (reduce (fn (a e) (+ a e)) 0 (take n (Cycle src s))) (ref-sum ref))
+                          (if (= (vec-count src) 0)
+                              true
+                              (= (nth (Cycle src s) j) (vec-nth src (rem (+ s j) (vec-count src))))))))))))
+
+(defun draw-ok (k: i64 r: Rng fault: bool) -> bool
+  (match k
+    (0 (iterate-ok r fault))
+    (1 (repeat-ok r fault))
+    (_ (cycle-ok r fault))))
+
+;; the draws of one run; kinds[k] counts the draws of kind k, so the case knows each kind was exercised
+(defun run-all (c: Checks fault: bool kinds: (Vec (Cell i64))) -> unit
+  (let ((r (rng 2231)))
+    (dotimes (i 300)
+      (let ((k (rng-below r 3)))
+        (let ((n (vec-nth kinds k)))
+          (do (set! n (+ @n 1))
+              (check c (draw-ok k r fault))))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks))
+        (kinds [(cell 0) (cell 0) (cell 0)])
+        (kinds2 [(cell 0) (cell 0) (cell 0)]))
+    (do (run-all c false kinds)
+        (check c (= (checks-made c) 300))
+        (check c (and (> @(vec-nth kinds 0) 50) (and (> @(vec-nth kinds 1) 50) (> @(vec-nth kinds 2) 50))))
+        (run-all planted true kinds2)
+        (check-detects c planted)
+        (checks-result c))))

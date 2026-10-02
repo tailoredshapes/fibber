@@ -1,0 +1,17 @@
+;; spec:   stdlib §2.1 rule 2 and P2 (a fused chain allocates nothing per element), §8.1 item 5 (count cases); case 826
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 5
+;; roots:  ../../lib support
+;; covers: iterate map take reduce
+;; The fold of 500 elements of a mapped iterate: (reduce .. (take 500 (map f (iterate g 0)))). The expander fuses the chain
+;; into a Mapped recipe over the Iterate and a Taken over that, walked by one loop, so what is allocated is the
+;; structs and closures of the stages and not one object per element: the count is the same over 50
+;; elements (case 2234) and over 500 (case 2235), and a stage that allocated per element would fail one of the two.
+;; Nothing is cached: the iterate calls g once per step and no node is made.
+(ns main (:use fib.core fib.seq))
+
+(defun main () -> i64
+  (let ((total (reduce (fn (a x) (+ a x)) 0 (take 500 (map (fn (x: i64) (* x 2)) (iterate (fn (x: i64) (+ x 1)) 0))))))
+    (if (= total 249500) 0 1)))

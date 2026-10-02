@@ -1,0 +1,30 @@
+;; spec:   stdlib §2.1 rules 2 and 8 (Repeat is its own seq type; a bound lazy chain over a source is an LSeq), §4.4 row repeat
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: repeat seq rest first map take vec
+;; `seq` of a Repeat is the Repeat, and so is its `rest`: the seq has no end, so
+;; what is left after one element is the same seq, and the Repeat is not consumed by being walked. A bound `map` over a repeat is the lazy form: the source is
+;; converted by its to-lseq, one node per demand, so a map with a counting function over
+;; a repeated 5 makes three calls for the three elements asked for and no more. A repeat of
+;; a string reads the same lazily. No seq made here closes a cycle through a cell: the
+;; audit is clean, not a leak cycle.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (r (repeat 5)))
+    (let ((m (map (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2))) r)))
+      (do (check c (= (first (rest r)) (some 5)))
+          (check c (= (first (rest (rest (rest r)))) (some 5)))
+          (check c (= (match (seq r) (nil -1) ((some s) (nth s 7))) 5))
+          (check c (= @calls 0))
+          (check c (= (vec (take 3 m)) [10 10 10]))
+          (check c (= @calls 3))
+          (check c (= (vec (take 3 m)) [10 10 10]))
+          (check c (= @calls 3))
+          (let ((w (map (fn (s: str) (str-concat s "!")) (repeat "hi"))))
+            (check c (= (vec (take 2 w)) ["hi!" "hi!"])))
+          (checks-result c)))))

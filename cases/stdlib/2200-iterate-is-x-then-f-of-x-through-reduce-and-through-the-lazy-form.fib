@@ -1,0 +1,31 @@
+;; spec:   stdlib §4.4 (row iterate), §2.1 rules 1 and 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: iterate take reduce vec first nth
+;; (iterate f x) is x, (f x), (f (f x)) and so on, a source with no end that a
+;; consumer which stops ends. Five elements of (iterate inc 0) are read the two
+;; ways a program can: folded by `reduce` straight off the chain, which the
+;; expander fuses into one loop over a Taken recipe, and through a bound seq,
+;; which is the lazy form, an LSeq whose nodes are made as they are demanded.
+;; Both give 0 1 2 3 4. `first` and `nth` read the source without a seq, and a
+;; second function that is not `inc` gives the doublings.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (s (take 5 (iterate inc 0)))
+        (twos (iterate (fn (x: i64) (* x 2)) 1)))
+    (do (check c (= (reduce (fn (a x) (+ a x)) 0 (take 5 (iterate inc 0))) 10))
+        (check c (= (reduce (fn (a x) (+ (* a 10) x)) 0 (take 5 (iterate inc 0))) 1234))
+        (check c (= (vec s) [0 1 2 3 4]))
+        (check c (= (vec s) [0 1 2 3 4]))
+        (check c (= (vec (take 5 (iterate inc 0))) [0 1 2 3 4]))
+        (check c (= (first (iterate inc 7)) (some 7)))
+        (check c (= (nth (iterate inc 7) 0) 7))
+        (check c (= (nth (iterate inc 7) 5) 12))
+        (check c (= (vec (take 6 twos)) [1 2 4 8 16 32]))
+        (check c (= (nth twos 10) 1024))
+        (check c (= (vec (take 0 (iterate inc 0))) []))
+        (checks-result c))))

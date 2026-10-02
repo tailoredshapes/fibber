@@ -1,0 +1,28 @@
+;; spec:   stdlib §4.4 (rows repeat and repeatedly: (repeat n x) and (repeatedly n f) return an (LSeq a)), §7 L1 (arity overloading)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: repeat repeatedly
+;; open:   Y11
+;; The count clauses of the two rows, which tranche 2's plan leaves to Y11 (they are clauses of the same name, so they
+;; wait for arity overloading, L1): (repeat n x) is n copies of x as a lazy seq, empty for n of 0 and below, and
+;; (repeatedly n f) is the first n elements of (repeatedly f), memoised, so f runs once per element across
+;; traversals: three calls for a seq read twice, and none until it is read. Every expected value was run
+;; once through two stand-ins written over the one-argument forms ((take n (repeat x)) and (take n (repeatedly f))),
+;; which answer 0. Y11 lands the clauses and removes `open:` and the open- of the name.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((s (repeatedly 3 (fn () (do (set! calls (+ @calls 1)) @calls)))))
+      (do (check c (= (vec (repeat 3 "ab")) ["ab" "ab" "ab"]))
+          (check c (= (vec (repeat 0 "ab")) []))
+          (check c (= (vec (repeat -2 "ab")) []))
+          (check c (= @calls 0))
+          (check c (= (vec s) [1 2 3]))
+          (check c (= (vec s) [1 2 3]))
+          (check c (= @calls 3))
+          (check c (= (vec (repeatedly 0 (fn () 1))) []))
+          (checks-result c)))))

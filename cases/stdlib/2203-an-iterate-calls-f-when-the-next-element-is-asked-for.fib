@@ -1,0 +1,39 @@
+;; spec:   stdlib §4.4 (row iterate: infinite source; a consumer that stops ends it), §2.1 rule 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: iterate first nth take vec rest
+;; The function of an iterate runs when the element after the one in hand is demanded and
+;; never ahead of it. `first` asks for none, so f is not called: 0. `nth` of 4 walks four steps: 4.
+;; `(take 5 ..)` stops the source at the fifth element, which is not followed by a sixth:
+;; 4 calls through the fused loop and 4 through the lazy form (a bound seq). `rest` of an Iterate calls f once, when it is asked, and the
+;; Iterate it gives starts at f of the old start: one call and a first element of 1.
+;; Each count is read from a fresh cell, and each line asks one question.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((g (fn (x: i64) (do (set! calls (+ @calls 1)) (+ x 1)))))
+      (do (check c (= (first (iterate g 0)) (some 0)))
+          (check c (= @calls 0))
+          (check c (= (nth (iterate g 0) 4) 4))
+          (check c (= @calls 4))
+          (set! calls 0)
+          (check c (= (vec (take 5 (iterate g 0))) [0 1 2 3 4]))
+          (check c (= @calls 4))
+          (set! calls 0)
+          (let ((s (take 5 (iterate g 0))))
+            (do (check c (= @calls 0))
+                (check c (= (vec s) [0 1 2 3 4]))
+                (check c (= @calls 4))))
+          (set! calls 0)
+          (let ((r (rest (iterate g 0))))
+            (do (check c (= @calls 1))
+                (check c (= (first r) (some 1)))
+                (check c (= @calls 1))))
+          (set! calls 0)
+          (check c (= (first (rest (rest (iterate g 10)))) (some 12)))
+          (check c (= @calls 2))
+          (checks-result c)))))

@@ -1,0 +1,64 @@
+;; spec:   stdlib §4.4 rows iterate repeat cycle, §2.1 rules 2, 3 and 8, §8.1 item 4 (laws over generated values)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: iterate repeat cycle take drop rest nth vec count range map first
+;; Four laws, each over 300 drawn inputs, one check per draw. (1) The three routes through an iterate agree: the
+;; fused loop over a bound Iterate, a bound lazy seq of a take, and n separate nths (`nth` of j walks j steps).
+;; (2) The first element after k rests of an iterate is the element at index k. (3) After k rests a cycle
+;; of a non-empty Vec reads as that cycle with its first k elements dropped, and as (Cycle src k); k = the length
+;; of the Vec brings it back to the start. (4) n elements of a repeat have n elements, all the one. The last check
+;; plants a fault in the first law (the nth route reads one index on) and requires the comparison to notice.
+;; Seed 2232.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; (1) fused loop = lazy seq = nth by nth
+(defun law-routes (r: Rng fault: bool) -> bool
+  (let ((k (+ 1 (rng-below r 5))) (x0 (rng-below r 30)) (n (rng-below r 12)))
+    (let ((it (iterate (fn (x: i64) (+ (* x 2) k)) x0))
+          (lazy (take n (iterate (fn (x: i64) (+ (* x 2) k)) x0))))
+      (let ((by-nth (vec (map (fn (j: i64) (nth it (if fault (+ j 1) j))) (range n)))))
+        (and (same (vec (take n it)) (vec lazy))
+             (same (vec lazy) by-nth))))))
+
+;; (2) the first element of the k-th rest is the element at k
+(defun law-rest (r: Rng) -> bool
+  (let ((k (rng-below r 10)) (x0 (rng-below r 30)))
+    (let ((it (iterate (fn (x: i64) (+ x 3)) x0)))
+      (= (first (loop ((s it) (i 0)) (if (< i k) (recur (rest s) (+ i 1)) s))) (some (nth it k))))))
+
+;; (3) k rests of a cycle: the cycle without its first k, and (Cycle src k)
+(defun rest-times (cy: (Cycle (Vec i64) i64) k: i64) -> (Cycle (Vec i64) i64)
+  (loop ((s cy) (i 0)) (if (< i k) (recur (rest s) (+ i 1)) s)))
+
+(defun law-cycle (r: Rng) -> bool
+  (let ((src (rng-vec r (+ 1 (rng-below r 5)) 40)) (k (rng-below r 12)) (m (rng-below r 15)))
+    (let ((cy (cycle src)))
+      (and (same (vec (take m (rest-times cy k))) (vec (take m (drop k cy))))
+           (and (same (vec (take m (rest-times cy k))) (vec (take m (Cycle src k))))
+                (same (vec (take m (rest-times cy (vec-count src)))) (vec (take m cy))))))))
+
+;; (4) n copies
+(defun law-repeat (r: Rng) -> bool
+  (let ((x (rng-below r 100)) (n (rng-below r 10)))
+    (let ((v (vec (take n (repeat x)))))
+      (and (= (count v) n)
+           (every? (fn (e: i64) (= e x)) v)))))
+
+(defun run-all (c: Checks fault: bool) -> unit
+  (let ((r (rng 2232)))
+    (dotimes (i 300)
+      (check c (and (law-routes r fault) (and (law-rest r) (and (law-cycle r) (law-repeat r))))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (planted (checks)))
+    (do (run-all c false)
+        (check c (= (checks-made c) 300))
+        (run-all planted true)
+        (check-detects c planted)
+        (checks-result c))))

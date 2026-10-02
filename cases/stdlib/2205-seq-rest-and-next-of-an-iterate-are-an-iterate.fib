@@ -1,0 +1,28 @@
+;; spec:   stdlib §2.1 rule 8 (Iterate is its own seq type, so recursion on rest is not polymorphic recursion)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: iterate seq rest next first nth take vec
+;; `seq` of an Iterate is the Iterate (it has an element, always), `rest` is the Iterate
+;; one step on, `next` is a seq of that rest. All three stay an (Iterate a), so a function
+;; that recurses on `rest` over a generic seq type, as the page's `len` does, is one
+;; instance and not a growing chain: `third` below is written once over any seq and
+;; used on an Iterate and on a Vec's VSeq.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun third (xs: c) :where ((Seqable c s) (Seqable s s) (Reducible s e)) -> (Option e)
+  (first (rest (rest xs))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (it (iterate (fn (x: i64) (+ x 3)) 1)))
+    (do (check c (= (first (rest it)) (some 4)))
+        (check c (= (first (rest (rest it))) (some 7)))
+        (check c (= (nth (rest it) 3) 13))
+        (check c (= (vec (take 3 (rest (rest (rest it))))) [10 13 16]))
+        (check c (= (match (seq it) (nil -1) ((some s) (nth s 2))) 7))
+        (check c (= (match (next it) (nil nil) ((some s) (first s))) (some 4)))
+        (check c (= (third it) (some 7)))
+        (check c (= (third [5 6 7 8]) (some 7)))
+        (checks-result c))))

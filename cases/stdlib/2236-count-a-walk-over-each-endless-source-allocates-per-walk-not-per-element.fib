@@ -1,0 +1,25 @@
+;; spec:   stdlib §2.1 rule 1 and P2 (a source allocates nothing per element), §8.1 item 5 (count cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 7
+;; roots:  ../../lib support
+;; covers: iterate repeat cycle
+;; Five hundred elements of each source, read by one loop over a Taken recipe built by hand (the
+;; constructor the fusion emits): the Iterate, the Repeat and the Cycle each walk with a loop and a
+;; closure made once, so what the run allocates is the three sources, their stages and the closures of the
+;; walks, never one object for an element (7 in all). The sums are worked out by hand: 0 + 1 + .. + 499 is
+;; 124750, 500 ones are 500, and 500 elements of 1 2 3 1 2 3 .. are 166 passes of 6 and the elements 1 and 2: 999.
+(ns main (:use fib.core fib.seq))
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+(def threes: (Vec i64) [1 2 3])
+
+(defun main () -> i64
+  (let ((a (total (Taken (iterate (fn (x: i64) (+ x 1)) 0) 500)))
+        (b (total (Taken (repeat 1) 500)))
+        (c (total (Taken (cycle threes) 500))))
+    (if (and (= a 124750) (and (= b 500) (= c 999))) 0 1)))

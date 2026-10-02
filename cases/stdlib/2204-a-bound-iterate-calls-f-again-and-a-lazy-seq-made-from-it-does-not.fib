@@ -1,0 +1,30 @@
+;; spec:   stdlib §4.4 (row iterate), §2.1 rule 2 (a bound lazy seq runs its function once per element); plan D7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: iterate take reduce
+;; Proposed (plan recommendation, owner not yet confirmed; stdlib §8.2.1 item 14, D7): an Iterate is a
+;; pure struct, so it holds no cell and remembers nothing. Where Clojure's iterate caches the element after
+;; each one, a bound Iterate calls f again on every traversal: two folds of the first four
+;; elements make three calls each, six. A lazy seq made from it, the bound result of a take, is memoised
+;; like every LSeq: the same two folds make three calls in all.
+;; If the owner chooses the other alternative (an Iterate that holds a cell), the first count
+;; becomes 3 and this case is edited with the reason.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((g (fn (x: i64) (do (set! calls (+ @calls 1)) (+ x 1)))))
+      (let ((it (iterate g 0)))
+        (do (check c (= (reduce (fn (a x) (+ a x)) 0 (take 4 it)) 6))
+            (check c (= @calls 3))
+            (check c (= (reduce (fn (a x) (+ a x)) 0 (take 4 it)) 6))
+            (check c (= @calls 6))
+            (set! calls 0)
+            (let ((s (take 4 it)))
+              (do (check c (= (reduce (fn (a x) (+ a x)) 0 s) 6))
+                  (check c (= (reduce (fn (a x) (+ a x)) 0 s) 6))
+                  (check c (= @calls 3))))
+            (checks-result c))))))

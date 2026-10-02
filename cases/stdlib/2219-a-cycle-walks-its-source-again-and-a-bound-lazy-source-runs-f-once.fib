@@ -1,0 +1,32 @@
+;; spec:   stdlib §4.4 (row cycle), §2.1 rule 2 (a bound lazy seq runs its function once per element); tranche 2 plan Y1
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: cycle map take vec
+;; A Cycle goes back to its source for every pass, so what the source costs it pays again. Over
+;; a bound lazy seq the nodes are memoised, and nine elements of a cycle of three make three calls
+;; of the function. Over a recipe built by hand, which is
+;; not memoised (it is never a value of a program, spec §2.1 rule 2), the function runs again on
+;; every pass: nine calls. That is the difference, written down as decided in the header of the part
+;; streams (lib/fib/seq/streams.fib): a fusion of cycle (X12) must not put the argument of cycle through a recipe, or it
+;; changes the count of the first line.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 10)))))
+      (do (let ((s (map f [1 2 3])))
+            (do (check c (= (vec (take 9 (cycle s))) [10 20 30 10 20 30 10 20 30]))
+                (check c (= @calls 3))))
+          (set! calls 0)
+          (check c (= (vec (take 9 (cycle (Mapped [1 2 3] f)))) [10 20 30 10 20 30 10 20 30]))
+          (check c (= @calls 9))
+          (set! calls 0)
+          (let ((s (map f [1 2 3])))
+            (let ((z (take 9 (cycle s))))
+              (do (check c (= (vec z) [10 20 30 10 20 30 10 20 30]))
+                  (check c (= (vec z) [10 20 30 10 20 30 10 20 30]))
+                  (check c (= @calls 3)))))
+          (checks-result c)))))
