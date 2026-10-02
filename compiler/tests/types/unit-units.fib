@@ -1,0 +1,104 @@
+;; compiler/tests/types/unit-units.fib: the parts of crates/fibref/src/types/
+;; infer/units.rs that run without the later packages (units.rs has no inline
+;; tests): the annotation of a `def` (the omitted colour is `send`, the
+;; initialiser flows into it, a named variable is rigid, the unify error is at
+;; the initialiser) and the rigid variables of an impl method. The two
+;; functions that need `infer`, `solve_all`, `close`, `body_args` and the rest
+;; (`cx-infer-def`, `cx-infer-impl-method`) are judged by the `unit` section
+;; and the `fun` schemes once P11 and P12 run.
+;; Build: fibc build compiler/tests/types/unit-units.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.infer.units types.check))
+
+(def p-def: Pos (Pos "d.fib" 1 1 0 30))
+(def p-init: Pos (Pos "d.fib" 2 5 12 20))
+
+(defun the-def (ann: (Option TypeAnn)) -> DefDef
+  (DefDef "d" 2 ann (Expr 0 p-init (ELit (LitInt 1 I64))) p-def))
+
+(defun cx-new () -> Cx
+  (Cx (globals-new) (env-new) (store-new) (tables-new) (unit-new)))
+
+(defun fn0 (k: Colour) -> Ty (TFn k [] (ty-i64)))
+(defun ann-fn0 () -> TypeAnn (AFn nil [] (AScalar SI64)))
+(defun n-colours (cx: Cx) -> i64 (count @(. (. cx u) colours)))
+
+(defun annotated-ok (r: (Result Ty TypeError) t: Ty) -> bool
+  (match r ((Ok x) (= x t)) (_ false)))
+
+(defun def-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (cx-new)))
+      (check cs "no annotation: the initialiser's type, nothing else"
+             (and (annotated-ok (def-annotated cx (the-def nil) (ty-i64)) (ty-i64))
+                  (= (n-colours cx) 0) (empty? @(. (. cx u) rigid-names)))))
+    (let ((cx (cx-new)))
+      (check cs "an omitted colour in the annotation is send"
+             (and (annotated-ok (def-annotated cx (the-def (some (ann-fn0))) (fn0 CSend)) (fn0 CSend))
+                  (= (n-colours cx) 0))))
+    (let ((cx (cx-new))
+          (r (def-annotated (cx-new) (the-def (some (ann-fn0))) (fn0 CLocal))))
+      (check cs "a local initialiser flows into the send annotation"
+             (annotated-ok r (fn0 CSend))))
+    (let ((cx (cx-new)))
+      (do (def-annotated cx (the-def (some (ann-fn0))) (fn0 CLocal))
+          (check cs "the flow pushes one constraint, local below send, at the initialiser"
+                 (let ((cons @(. (. cx u) colours)))
+                   (and (= (count cons) 1)
+                        (= (. (nth cons 0) from) CLocal) (= (. (nth cons 0) to) CSend)
+                        (= (. (. (nth cons 0) pos) line) 2) (= (. (. (nth cons 0) pos) col) 5)
+                        (not (nil? (. (nth cons 0) origin))))))))
+    (let ((cx (cx-new)) (v (cx-fresh cx)))
+      (do (check cs "a named variable in the annotation is rigid, and the initialiser unifies with it"
+                 (annotated-ok (def-annotated cx (the-def (some (AVar "a"))) v) (TRigid 0)))
+          (check cs "the unit's rigid names and map are set"
+                 (and (= @(. (. cx u) rigid-names) ["a"])
+                      (= (get @(. (. cx u) rigid-map) "a") (some 0))))
+          (check cs "and the variable is bound to the rigid one" (= (cx-zonk cx v) (TRigid 0)))))
+    (let ((cx (cx-new)))
+      (check cs "a named colour in the annotation is send too, and remembered"
+             (and (annotated-ok (def-annotated cx (the-def (some (AColourArg (CaNamed "k")))) (ty-colour-arg CSend))
+                                (ty-colour-arg CSend))
+                  (= (get @(. (. cx u) rigid-colours) "k") (some CSend)))))
+    (let ((cx (cx-new)))
+      (check cs "a mismatch with the annotation is the Unify error, at the initialiser"
+             (match (def-annotated cx (the-def (some AStr)) (ty-i64))
+               ((Err e) (and (= (. e kind) Unify) (= (. e message) "cannot unify i64 with str")
+                             (= (. (. e pos) line) 2)))
+               (_ false))))
+    (let ((cx (cx-new)))
+      (check cs "an annotation that does not resolve is the annotation's error"
+             (match (def-annotated cx (the-def (some ASelf)) (ty-i64))
+               ((Err e) (= (. e message) "Self is only allowed in a protocol"))
+               (_ false))))))
+
+(defun scheme-with (names: (Vec str)) -> Scheme
+  (Scheme (count names) 0 names [] [] (ty-unit) [] []))
+
+(defun method-def (names: (Vec str)) -> MethodDef
+  (MethodDef "m" [] (scheme-with names) false nil p-def))
+
+(defun rigid-tests (cs: Checks) -> unit
+  (do
+    (let ((u (unit-new)))
+      (do (set! (. u rigid-names) ["T"])
+          (check cs "the method's own variables after the head's are rigid and named"
+                 (and (= (method-rigid-tys u (method-def ["T" "U" "V"]) [(TRigid 0)])
+                         [(TRigid 0) (TRigid 1) (TRigid 2)])
+                      (= @(. u rigid-names) ["T" "U" "V"])))))
+    (let ((u (unit-new)))
+      (do (set! (. u rigid-names) ["T" "D"])
+          (check cs "the determined arguments count: only the rest are new"
+                 (and (= (method-rigid-tys u (method-def ["T" "D" "X"]) [(TRigid 0) (ty-i64)])
+                         [(TRigid 0) (ty-i64) (TRigid 2)])
+                      (= @(. u rigid-names) ["T" "D" "X"])))))
+    (let ((u (unit-new)))
+      (check cs "a method with no variables of its own adds none"
+             (and (= (method-rigid-tys u (method-def ["T"]) [(TRigid 0)]) [(TRigid 0)])
+                  (empty? @(. u rigid-names)))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (def-tests cs)
+        (rigid-tests cs)
+        (finish cs))))

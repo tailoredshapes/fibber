@@ -1,0 +1,175 @@
+;; compiler/tests/types/unit-send.fib: crates/fibref/src/types/infer/send.rs has
+;; no inline tests, so these are written from its doc comment and its code
+;; (spec/types.md §5.1, §5.3): what is and is not Send, the witness path
+;; steps, the needs of variables and colours, zonking, recursive types
+;; (the greatest fixpoint, and that `seen` is a visited set that is never
+;; popped), and the text of `send-error` (the texts of tests/cases.rs:132 and
+;; tests/dyn_send.rs:42).
+;; Build: fibc build compiler/tests/types/unit-send.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.error types.store types.table types.decls
+               types.infer.cx types.infer.send types.check))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+(defun fd (name: str ty: Ty) -> FieldDef (FieldDef name ty))
+(defun vr (name: str tys: (Vec Ty)) -> VariantDef
+  (VariantDef name (mapv (fn (t: Ty) (FieldDef "_" t)) tys)))
+(defun add-type (g: Globals name: str params: (Vec str) colours: (Vec bool) shape: TypeShape) -> i64
+  (table-add (. g types) (TypeDef name 2 params colours shape p0)))
+
+;; 0 Plain, 1 Holder, 2 Shape, 3 List, 4 Box a, 5 Two a, 6 Thunk k, 7 Wrap,
+;; 8 Odd (a field that is a unification variable, as a hand-made type may have).
+(defun globals-for-send () -> Globals
+  (let ((g (globals-new)))
+    (do (add-type g "Plain" [] [] (TsStruct [(fd "a" (ty-i64)) (fd "s" (ty-str))]))
+        (add-type g "Holder" [] [] (TsStruct [(fd "a" (ty-i64)) (fd "c" (ty-cell (ty-i64)))]))
+        (add-type g "Shape" [] []
+          (TsEnum [(vr "Dot" [(ty-i64)]) (vr "Both" [(ty-i64) (ty-cell (ty-i64))]) (vr "Empty" [])]))
+        (add-type g "List" [] []
+          (TsEnum [(vr "Nil" []) (vr "Cons" [(ty-i64) (ty-nominal 3 [])])]))
+        (add-type g "Box" ["a"] [false] (TsStruct [(fd "v" (TGen 0))]))
+        (add-type g "Two" ["a"] [false]
+          (TsStruct [(fd "l" (ty-nominal 4 [(TGen 0)])) (fd "r" (ty-nominal 4 [(TGen 0)]))]))
+        (add-type g "Thunk" ["k"] [true] (TsStruct [(fd "f" (TFn (CGen 0) [] (ty-unit)))]))
+        (add-type g "Wrap" [] [] (TsEnum [(vr "Wrap" [(ty-cell (ty-i64))])]))
+        (add-type g "Odd" [] [] (TsStruct [(fd "f" (TVar 0))]))
+        g)))
+
+(defun eval (g: Globals st: Store t: Ty) -> (Result Needs Witness)
+  (send-eval g st t []))
+
+(defun passes? (r: (Result Needs Witness)) -> bool (match r ((Ok _) true) (_ false)))
+(defun needs-of (r: (Result Needs Witness)) -> Needs (match r ((Ok n) n) (_ (Needs [] []))))
+(defun var-needs (r: (Result Needs Witness)) -> (Vec (Pair Ty (Vec str))) (. (needs-of r) vars))
+(defun colour-needs (r: (Result Needs Witness)) -> (Vec (Pair Colour (Vec str))) (. (needs-of r) colours))
+(defun fails-at? (r: (Result Needs Witness) path: (Vec str) t: Ty) -> bool
+  (match r ((Err w) (and (= (. w path) path) (= (. w offending) t))) (_ false)))
+(defun nothing-needed? (r: (Result Needs Witness)) -> bool
+  (and (passes? r) (empty? (var-needs r)) (empty? (colour-needs r))))
+
+(defun ptr () -> Ty (ty-scalar SPtr))
+(defun fn0 (k: Colour) -> Ty (TFn k [] (ty-i64)))
+
+(defun leaf-tests (cs: Checks) -> unit
+  (let ((g (globals-for-send)) (st (store-new)))
+    (do
+      (check cs "scalars, str and atom are Send, with no needs"
+             (and (nothing-needed? (eval g st (ty-i64))) (nothing-needed? (eval g st (ty-bool)))
+                  (nothing-needed? (eval g st (ty-str))) (nothing-needed? (eval g st (TCon KAtom [])))))
+      (check cs "ptr is not Send" (fails-at? (eval g st (ptr)) [] (ptr)))
+      (check cs "a cell is not Send" (fails-at? (eval g st (ty-cell (ty-i64))) [] (ty-cell (ty-i64))))
+      (check cs "a dyn is not Send" (fails-at? (eval g st (TCon (KDyn 0 false) [])) [] (TCon (KDyn 0 false) [])))
+      (check cs "a send dyn is Send" (nothing-needed? (eval g st (TCon (KDyn 0 true) []))))
+      (check cs "a send function is Send" (nothing-needed? (eval g st (fn0 CSend))))
+      (check cs "a local function is not Send" (fails-at? (eval g st (fn0 CLocal)) [] (fn0 CLocal)))
+      (check cs "a function's parameters are not looked at"
+             (nothing-needed? (eval g st (TFn CSend [(ty-cell (ty-i64))] (ty-cell (ty-i64))))))
+      (check cs "a path given is the path of the witness"
+             (fails-at? (send-eval g st (ty-cell (ty-i64)) ["closure capture n"])
+                        ["closure capture n"] (ty-cell (ty-i64)))))))
+
+(defun variable-tests (cs: Checks) -> unit
+  (let ((g (globals-for-send)) (st (store-new)) (v (store-fresh st)) (w (store-fresh st)))
+    (do
+      (check cs "a variable is a need, with its path"
+             (= (var-needs (send-eval g st v ["closure capture x"])) [(Pair v ["closure capture x"])]))
+      (check cs "a function's result is not looked at"
+             (nothing-needed? (eval g st (TFn CSend [] (TRigid 0)))))
+      (check cs "a rigid variable is a need"
+             (= (var-needs (eval g st (TRigid 0))) [(Pair (TRigid 0) [])]))
+      (check cs "a gen variable is a need"
+             (= (var-needs (eval g st (TGen 1))) [(Pair (TGen 1) [])]))
+      (check cs "a colour variable is a colour need, a rigid and a gen one too"
+             (and (= (colour-needs (eval g st (fn0 (CVar 3)))) [(Pair (CVar 3) [])])
+                  (= (colour-needs (eval g st (fn0 (CRigid 0)))) [(Pair (CRigid 0) [])])
+                  (= (colour-needs (eval g st (fn0 (CGen 1)))) [(Pair (CGen 1) [])])))
+      (check cs "a variable bound to a cell is zonked and fails"
+             (do (store-bind st (match v ((TVar i) i) (_ 0)) (ty-cell (ty-i64)))
+                 (fails-at? (eval g st v) [] (ty-cell (ty-i64)))))
+      (check cs "a variable bound to i64 is zonked and passes, with no needs"
+             (do (store-bind st (match w ((TVar i) i) (_ 0)) (ty-i64))
+                 (nothing-needed? (eval g st w)))))))
+
+(defun container-tests (cs: Checks) -> unit
+  (let ((g (globals-for-send)) (st (store-new)) (v (store-fresh st))
+        (arr (TCon KArray [(ty-cell (ty-i64))])))
+    (do
+      (check cs "an array of i64 is Send" (nothing-needed? (eval g st (TCon KArray [(ty-i64)]))))
+      (check cs "an array of cells: the step is element of the array type"
+             (fails-at? (eval g st arr) ["element of (Array (Cell i64))"] (ty-cell (ty-i64))))
+      (check cs "weak: the step is target of"
+             (fails-at? (eval g st (TCon KWeak [(ty-cell (ty-i64))])) ["target of (Weak (Cell i64))"] (ty-cell (ty-i64))))
+      (check cs "task: the step is result of"
+             (fails-at? (eval g st (TCon KTask [(ty-cell (ty-i64))])) ["result of (Task (Cell i64))"] (ty-cell (ty-i64))))
+      (check cs "steps nest, outermost first"
+             (fails-at? (eval g st (TCon KArray [arr]))
+                        ["element of (Array (Array (Cell i64)))" "element of (Array (Cell i64))"]
+                        (ty-cell (ty-i64))))
+      (check cs "a variable in an array has the step in its path"
+             (let ((ns (var-needs (eval g st (TCon KArray [v])))))
+               (and (= (count ns) 1) (= (. (nth ns 0) fst) v) (= (count (. (nth ns 0) snd)) 1)))))))
+
+(defun nominal-tests (cs: Checks) -> unit
+  (let ((g (globals-for-send)) (st (store-new)) (v (store-fresh st)))
+    (do
+      (check cs "a struct of Send fields is Send" (nothing-needed? (eval g st (ty-nominal 0 []))))
+      (check cs "a struct with a cell: field f of S"
+             (fails-at? (eval g st (ty-nominal 1 [])) ["field c of Holder"] (ty-cell (ty-i64))))
+      (check cs "an enum variant with one field: payload of V"
+             (fails-at? (eval g st (ty-nominal 7 [])) ["payload of Wrap"] (ty-cell (ty-i64))))
+      (check cs "an enum variant with several fields: payload i of V"
+             (fails-at? (eval g st (ty-nominal 2 [])) ["payload 1 of Both"] (ty-cell (ty-i64))))
+      (check cs "a recursive type is Send (the greatest fixpoint)"
+             (nothing-needed? (eval g st (ty-nominal 3 []))))
+      (check cs "a field of the quantified type is instantiated: Box of a cell"
+             (fails-at? (eval g st (ty-nominal 4 [(ty-cell (ty-i64))])) ["field v of Box"] (ty-cell (ty-i64))))
+      (check cs "Box of a variable needs the variable, with the field step"
+             (= (var-needs (eval g st (ty-nominal 4 [v]))) [(Pair v ["field v of Box"])]))
+      (check cs "a (type, args) already examined is skipped, not examined again"
+             (= (var-needs (eval g st (ty-nominal 5 [v])))
+                [(Pair v ["field l of Two" "field v of Box"])]))
+      (check cs "the same type at other arguments is examined"
+             (= (count (var-needs (eval g st (TCon KArray [(ty-nominal 4 [v]) (ty-nominal 4 [(TRigid 0)])])))) 2))
+      (check cs "the types of the fields are zonked too"
+             (let ((st2 (store-new)) (x (store-fresh st2)))
+               (do (store-bind st2 0 (ty-cell (ty-i64)))
+                   (fails-at? (eval g st2 (ty-nominal 8 [])) ["field f of Odd"] (ty-cell (ty-i64))))))
+      (check cs "a colour argument is passed to the field: (Thunk send) is Send"
+             (nothing-needed? (eval g st (ty-nominal 6 [(ty-colour-arg CSend)]))))
+      (check cs "(Thunk local) fails at the field"
+             (fails-at? (eval g st (ty-nominal 6 [(ty-colour-arg CLocal)]))
+                        ["field f of Thunk"] (TFn CLocal [] (ty-unit))))
+      (check cs "(Thunk k) needs the colour k, with the field step"
+             (= (colour-needs (eval g st (ty-nominal 6 [(ty-colour-arg (CVar 5))])))
+                [(Pair (CVar 5) ["field f of Thunk"])])))))
+
+(defun error-tests (cs: Checks) -> unit
+  (let ((g (globals-for-send)) (cell-i64 (ty-cell (ty-i64))) (pos (Pos "t.fib" 3 4 10 12)))
+    (do
+      (check cs "send-error of a cell: CellNotSend, the path and the type"
+             (let ((e (send-error g (Witness ["closure capture n"] cell-i64) pos [])))
+               (and (= (. e kind) CellNotSend)
+                    (= (. e message) "cell cannot be shared between threads: closure capture n has type (Cell i64)")
+                    (= (. (. e pos) line) 3))))
+      (check cs "send-error of another type: ValueNotSend"
+             (let ((e (send-error g (Witness ["field p of Holder"] (ptr)) pos [])))
+               (and (= (. e kind) ValueNotSend)
+                    (= (. e message) "value of type ptr cannot be shared between threads: field p of Holder"))))
+      (check cs "an empty path is the value"
+             (= (. (send-error g (Witness [] cell-i64) pos []) message)
+                "cell cannot be shared between threads: the value has type (Cell i64)"))
+      (check cs "the steps of the path are joined by a comma"
+             (= (. (send-error g (Witness ["closure capture self" "field f of Hook"] (fn0 CLocal)) pos []) message)
+                "value of type (fn :local () i64) cannot be shared between threads: closure capture self, field f of Hook"))
+      (check cs "rigid names are the printer's"
+             (= (. (send-error g (Witness [] (ty-cell (TRigid 0))) pos ["T"]) message)
+                "cell cannot be shared between threads: the value has type (Cell T)")))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (leaf-tests cs)
+        (variable-tests cs)
+        (container-tests cs)
+        (nominal-tests cs)
+        (error-tests cs)
+        (finish cs))))

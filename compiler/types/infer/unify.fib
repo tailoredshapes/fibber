@@ -1,15 +1,152 @@
 ;; compiler/types/infer/unify.fib: unification and colour flow (package P8).
 ;; Replaces crates/fibref/src/types/infer/unify.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; Unification (spec/types.md §3.2): Robinson with the occurs check over the
+;; store's union-find variables; nominal and built-in constructors unify only
+;; with themselves, rigid variables only with themselves or an unbound
+;; variable; function colours are never unified but constrained, `from ⊑ to`
+;; at a flow site and both ways elsewhere. At a flow site a variable meeting a
+;; function type is bound to a copy of it with a fresh colour below or above
+;; the original (§5.4).
+;;
+;; Shapes: Rust's `Unifier` is a struct holding the colour constraints it
+;; pushes as a Cell (the unit's `colours`): they stay pushed when the
+;; unification fails half way, as in Rust (`infer/expr.rs:274` ignores a
+;; failed `unify` and the constraints made before the failure remain). The
+;; module's functions are the Unifier's methods; `UErr` is the failure.
 (ns types.infer.unify
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:use syntax.pos types.ty types.error types.store types.table types.decls types.infer.cx))
 
-;; Rust: infer/unify.rs:158 unify
+;; Why unification failed.
+(defenum UErr UMismatch UOccurs)
+(derive Eq UErr)
+
+(defstruct Unifier (g: Globals st: Store cons: (Cell (Vec ColourCon)) pos: Pos))
+
+(defun unifier-new (g: Globals st: Store cons: (Cell (Vec ColourCon)) pos: Pos) -> Unifier
+  (Unifier g st cons pos))
+
+;; Unifies a and b, `flow` saying whether this is a flow site.
+(defun unifier-unify (u: Unifier a: Ty b: Ty flow: bool) -> (Result unit UErr)
+  (let ((ra (store-resolve (. u st) a))
+        (rb (store-resolve (. u st) b)))
+    (match ra
+      ((TVar x)
+       (match rb
+         ((TVar y) (if (= x y) (Ok ()) (do (store-bind (. u st) x rb) (Ok ()))))
+         (_ (bind-var u x rb flow true))))
+      (_ (match rb
+           ((TVar y) (bind-var u y ra flow false))
+           (_ (unify-shapes u ra rb flow)))))))
+
+;; Neither side is a variable.
+(defun unify-shapes :private (u: Unifier a: Ty b: Ty flow: bool) -> (Result unit UErr)
+  (match a
+    ((TRigid i) (match b ((TRigid j) (same-index i j)) (_ (Err UMismatch))))
+    ((TGen i) (match b ((TGen j) (same-index i j)) (_ (Err UMismatch))))
+    ((TCon c1 a1)
+     (match b
+       ((TCon c2 a2)
+        (if (and (= c1 c2) (= (count a1) (count a2)))
+            (unify-con-args u c1 a1 a2)
+            (Err UMismatch)))
+       (_ (Err UMismatch))))
+    ((TFn k1 p1 r1)
+     (match b
+       ((TFn k2 p2 r2)
+        (if (= (count p1) (count p2))
+            (do (colour-flow u k1 k2 flow a b)
+                (try-let ((_ (unify-params u p1 p2)))
+                  (unifier-unify u r1 r2 false)))
+            (Err UMismatch)))
+       (_ (Err UMismatch))))
+    (_ (Err UMismatch))))
+
+(defun same-index :private (i: i64 j: i64) -> (Result unit UErr)
+  (if (= i j) (Ok ()) (Err UMismatch)))
+
+;; The arguments of two applications of constructor c, one by one.
+(defun unify-con-args :private (u: Unifier c: Con a1: (Vec Ty) a2: (Vec Ty)) -> (Result unit UErr)
+  (loop ((i 0))
+    (if (< i (count a1))
+        (try-let ((_ (fixed-colours-differ u c i (nth a1 i) (nth a2 i)))
+                  (_ (unifier-unify u (nth a1 i) (nth a2 i) false)))
+          (recur (+ i 1)))
+        (Ok ()))))
+
+;; The parameters of two function types, one by one (never at a flow site).
+(defun unify-params :private (u: Unifier ps: (Vec Ty) qs: (Vec Ty)) -> (Result unit UErr)
+  (loop ((i 0))
+    (if (< i (count ps))
+        (try-let ((_ (unifier-unify u (nth ps i) (nth qs i) false)))
+          (recur (+ i 1)))
+        (Ok ()))))
+
+;; Two different constant colours at a colour parameter of a nominal type
+;; (§1.3): the arguments are invariant, so `(N :send)` and `(N :local)` do
+;; not unify, and neither does an `impl` head's rigid `(N k)` with either
+;; (§3.2); that is a mismatch, rather than a colour flow.
+(defun fixed-colours-differ :private (u: Unifier c: Con i: i64 x: Ty y: Ty) -> (Result unit UErr)
+  (match c
+    ((KNominal id)
+     (if (typedef-is-colour (g-ty (. u g) id) i)
+         (let ((fx (fixed-colour (store-resolve (. u st) x)))
+               (fy (fixed-colour (store-resolve (. u st) y))))
+           (if (and (not (nil? fx)) (not (nil? fy)) (not (= fx fy)))
+               (Err UMismatch)
+               (Ok ())))
+         (Ok ())))
+    (_ (Ok ()))))
+
+;; The colour of a function type when it is a constant or rigid one.
+(defun fixed-colour :private (t: Ty) -> (Option Colour)
+  (match t
+    ((TFn k _ _) (match k ((CSend) (some k)) ((CLocal) (some k)) ((CRigid _) (some k)) (_ nil)))
+    (_ nil)))
+
+;; Binds v to t; `v-is-from` says which side of a flow v is.
+(defun bind-var :private (u: Unifier v: i64 t: Ty flow: bool v-is-from: bool) -> (Result unit UErr)
+  (if (store-occurs (. u st) v t)
+      (Err UOccurs)
+      (match t
+        ((TFn k ps r)
+         (if flow
+             (let ((k2 (store-fresh-colour (. u st)))
+                   (copy (TFn k2 ps r)))
+               (do (store-bind (. u st) v copy)
+                   (if v-is-from
+                       (colour-flow u k2 k true copy t)
+                       (colour-flow u k k2 true t copy))
+                   (Ok ())))
+             (do (store-bind (. u st) v t) (Ok ()))))
+        (_ (do (store-bind (. u st) v t) (Ok ()))))))
+
+;; `from ⊑ to`, and `to ⊑ from` unless at a flow site.
+(defun colour-flow :private (u: Unifier from: Colour to: Colour flow: bool from-ty: Ty to-ty: Ty) -> unit
+  (when-not (= from to)
+    (push-con u from to from-ty)
+    (when-not flow (push-con u to from to-ty))))
+
+;; Pushes `from ⊑ to`; a `local` source carries the zonked type it came from
+;; as the origin of the witness (§5.3).
+(defun push-con :private (u: Unifier from: Colour to: Colour from-ty: Ty) -> unit
+  (let ((origin (if (= from CLocal) (some (Witness [] (store-zonk (. u st) from-ty))) nil)))
+    (set! (. u cons) (conj @(. u cons) (ColourCon from to nil origin (. u pos))))))
+
+;; ---- the methods of `impl Cx`
+
+(defun cx-unify-mode :private (cx: Cx a: Ty b: Ty flow: bool pos: Pos) -> (Result unit TypeError)
+  (match (unifier-unify (Unifier (. cx g) (. cx st) (. (. cx u) colours) pos) a b flow)
+    ((Ok _) (Ok ()))
+    ((Err (UMismatch)) (Err (cx-mismatch cx a b pos)))
+    ((Err (UOccurs))
+     (Err (type-error Infinite pos
+            (str-join ["cannot construct the infinite type: " (cx-show cx a) " = " (cx-show cx b)]))))))
+
+;; Unifies a and b (not a flow site: colours made equal).
 (defun cx-unify (cx: Cx a: Ty b: Ty pos: Pos) -> (Result unit TypeError)
-  (trap "todo: cx-unify"))
+  (cx-unify-mode cx a b false pos))
 
-;; Rust: infer/unify.rs:163 flow
+;; `from` flows into a position of type `to` (§3.2 flow sites).
 (defun cx-flow (cx: Cx from: Ty to: Ty pos: Pos) -> (Result unit TypeError)
-  (trap "todo: cx-flow"))
+  (cx-unify-mode cx from to true pos))

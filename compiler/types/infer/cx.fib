@@ -1,8 +1,7 @@
 ;; compiler/types/infer/cx.fib: the inference context, the tables and the per-unit worklists (package P8).
 ;; Replaces crates/fibref/src/types/infer/cx.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; The data is P1's (P8 added nothing); the Rust `impl Cx` methods are the
+;; `cx-NAME` functions below, `cx` borrowed, the Cells reached through it.
 (ns types.infer.cx
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.display))
 
@@ -88,34 +87,48 @@
         (cell []) (cell (map-empty)) (cell []) (cell nil) (cell []) (cell [])
         (cell []) (cell []) (cell [])))
 
-;; Rust: infer/cx.rs:220 fresh
+;; ---- the methods of `impl Cx` (infer/cx.rs:218-281)
+
+;; A fresh unification variable.
 (defun cx-fresh (cx: Cx) -> Ty
-  (trap "todo: cx-fresh"))
+  (store-fresh (. cx st)))
 
-;; Rust: infer/cx.rs:225 record
+;; Records the type of an expression.
 (defun cx-record (cx: Cx id: i64 ty: Ty) -> unit
-  (trap "todo: cx-record"))
+  (do (set! (. (. cx t) expr-types) (assoc @(. (. cx t) expr-types) id ty))
+      (set! (. (. cx u) exprs) (conj @(. (. cx u) exprs) id))))
 
-;; Rust: infer/cx.rs:231 bind
+;; Records the type of a binding.
 (defun cx-bind (cx: Cx b: i64 ty: Ty) -> unit
-  (trap "todo: cx-bind"))
+  (do (set! (. (. cx t) binding-types) (assoc @(. (. cx t) binding-types) b ty))
+      (set! (. (. cx u) bindings) (conj @(. (. cx u) bindings) b))))
 
-;; Rust: infer/cx.rs:237 binding
+;; The type of a binding (bound earlier in this unit).
 (defun cx-binding (cx: Cx b: i64 pos: Pos) -> (Result Ty TypeError)
-  (trap "todo: cx-binding"))
+  (match (get @(. (. cx t) binding-types) b)
+    ((some t) (Ok t))
+    (nil (Err (type-error-other pos
+                (str-join ["internal: " (. (g-binding (. cx g) b) name) " has no type"]))))))
 
-;; Rust: infer/cx.rs:248 defer
+;; Adds a deferred constraint, tagged with the unit's current function.
 (defun cx-defer (cx: Cx kind: DKind pos: Pos site: (Option i64)) -> unit
-  (trap "todo: cx-defer"))
+  (set! (. (. cx u) deferred)
+        (conj @(. (. cx u) deferred) (Deferred kind pos site @(. (. cx u) fun)))))
 
-;; Rust: infer/cx.rs:259 zonk
+;; A zonked type.
 (defun cx-zonk (cx: Cx t: Ty) -> Ty
-  (trap "todo: cx-zonk"))
+  (store-zonk (. cx st) t))
 
-;; Rust: infer/cx.rs:264 show
+;; The type as text (zonked first, a printer of its own).
 (defun cx-show (cx: Cx t: Ty) -> str
-  (trap "todo: cx-show"))
+  (let ((z (store-zonk (. cx st) t)))
+    (printer-ty (printer-with-names (. cx g) [] @(. (. cx u) rigid-names)) z)))
 
-;; Rust: infer/cx.rs:270 mismatch
+;; `cannot unify a with b`: the two types zonked, printed by one printer
+;; (so an unbound variable has the same name in both).
 (defun cx-mismatch (cx: Cx a: Ty b: Ty pos: Pos) -> TypeError
-  (trap "todo: cx-mismatch"))
+  (let ((za (store-zonk (. cx st) a))
+        (zb (store-zonk (. cx st) b))
+        (p (printer-with-names (. cx g) [] @(. (. cx u) rigid-names))))
+    (type-error Unify pos
+      (str-join ["cannot unify " (printer-ty p za) " with " (printer-ty p zb)]))))

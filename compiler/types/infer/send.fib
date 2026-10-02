@@ -1,20 +1,122 @@
 ;; compiler/types/infer/send.fib: the Send judgement (package P8).
 ;; Replaces crates/fibref/src/types/infer/send.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; The `Send` predicate (spec/types.md §5.1) evaluated structurally, with the
+;; witness path of §5.3 when it fails. Path steps, outermost first, are
+;; spelled: `closure capture x`, `async capture x`, `field f of S` (a struct),
+;; `payload of V` / `payload i of V` (an enum variant with one field / several),
+;; `element of (Array T)`, `target of (Weak T)`, `result of (Task T)`. For
+;; recursive nominal types `Send` is the greatest fixpoint: a type already
+;; being examined is assumed sendable.
+;;
+;; Shapes: the Rust walk threads `path` (pushed and popped), `seen` (only
+;; pushed: a visited set of `(type, args)`) and `needs` (only pushed) through
+;; `&mut`. Here `path` is an owned Vec that each step extends (nothing to pop)
+;; and `seen` and `needs` are Cells of a `SendWalk` the walk passes down.
 (ns types.infer.send
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:require [fib.string :as str])
+  (:use syntax.pos types.ty types.error types.store types.display types.table types.decls types.infer.cx))
 
 ;; Rust `Needs` (infer/send.rs:25): the variables and colours a type being
 ;; `Send` still depends on, each with the path to it.
 (defstruct Needs
   (vars: (Vec (Pair Ty (Vec str))) colours: (Vec (Pair Colour (Vec str)))))
 
-;; Rust: infer/send.rs:34
-(defun send-eval (g: Globals st: Store ty: Ty path: (Vec str)) -> (Result Needs Witness)
-  (trap "todo: send-eval"))
+(defstruct SendWalk
+  (g: Globals st: Store seen: (Cell (Vec (Pair i64 (Vec Ty))))
+   vars: (Cell (Vec (Pair Ty (Vec str)))) colours: (Cell (Vec (Pair Colour (Vec str))))))
 
-;; Rust: infer/send.rs:142
+;; Rust: infer/send.rs:34. Evaluates `Send ty` (zonking as it goes), `path`
+;; being the steps that led here.
+(defun send-eval (g: Globals st: Store ty: Ty path: (Vec str)) -> (Result Needs Witness)
+  (let ((w (SendWalk g st (cell []) (cell []) (cell []))))
+    (try-let ((_ (send-walk w (store-zonk st ty) path)))
+      (Ok (Needs @(. w vars) @(. w colours))))))
+
+(defun send-fail :private (path: (Vec str) t: Ty) -> (Result unit Witness)
+  (Err (Witness path t)))
+
+(defun send-walk :private (w: SendWalk t: Ty path: (Vec str)) -> (Result unit Witness)
+  (match t
+    ((TVar _) (send-need w t path))
+    ((TRigid _) (send-need w t path))
+    ((TGen _) (send-need w t path))
+    ((TCon c args) (send-con w t c args path))
+    ((TFn k _ _)
+     (match k
+       ((CSend) (Ok ()))
+       ((CLocal) (send-fail path t))
+       (_ (do (set! (. w colours) (conj @(. w colours) (Pair k path)))
+              (Ok ())))))))
+
+;; A variable: `Send` waits for it.
+(defun send-need :private (w: SendWalk t: Ty path: (Vec str)) -> (Result unit Witness)
+  (do (set! (. w vars) (conj @(. w vars) (Pair t path)))
+      (Ok ())))
+
+(defun send-con :private (w: SendWalk t: Ty c: Con args: (Vec Ty) path: (Vec str)) -> (Result unit Witness)
+  (match c
+    ((KScalar s) (match s ((SPtr) (send-fail path t)) (_ (Ok ()))))
+    ((KCell) (send-fail path t))
+    ;; `(dyn P :send)` was made of a `Send` value (§2.15, §5.1).
+    ((KDyn _ send) (if send (Ok ()) (send-fail path t)))
+    ((KStr) (Ok ()))
+    ((KAtom) (Ok ()))
+    ((KArray) (send-through w t "element" args path))
+    ((KWeak) (send-through w t "target" args path))
+    ((KTask) (send-through w t "result" args path))
+    ((KNominal id) (send-nominal w id args path))))
+
+;; The arguments of an Array, Weak or Task, one step in.
+(defun send-through :private (w: SendWalk t: Ty what: str args: (Vec Ty) path: (Vec str)) -> (Result unit Witness)
+  (let ((inner (conj path (str-join [what " of " (printer-ty (printer-new (. w g)) t)]))))
+    (send-all w args inner)))
+
+(defun send-all :private (w: SendWalk tys: (Vec Ty) path: (Vec str)) -> (Result unit Witness)
+  (loop ((i 0))
+    (if (< i (count tys))
+        (try-let ((_ (send-walk w (nth tys i) path))) (recur (+ i 1)))
+        (Ok ()))))
+
+;; A struct or enum: every field, once per `(type, args)` being examined.
+(defun send-nominal :private (w: SendWalk id: i64 args: (Vec Ty) path: (Vec str)) -> (Result unit Witness)
+  (let ((key (Pair id args)))
+    (if (includes? key @(. w seen))
+        (Ok ())
+        (do (set! (. w seen) (conj @(. w seen) key))
+            (let ((fields (send-fields (g-ty (. w g) id)))
+                  (colours (colour-args args)))
+              (loop ((i 0))
+                (if (< i (count fields))
+                    (let ((f (nth fields i))
+                          (ft (store-zonk (. w st) (ty-subst-gen (. f snd) args colours))))
+                      (try-let ((_ (send-walk w ft (conj path (. f fst)))))
+                        (recur (+ i 1))))
+                    (Ok ()))))))))
+
+;; The label and type of each field of a struct, or of each payload of each
+;; variant of an enum, in order.
+(defun send-fields :private (d: TypeDef) -> (Vec (Pair str Ty))
+  (match (. d shape)
+    ((TsStruct fs)
+     (mapv (fn (f: FieldDef) (Pair (str-join ["field " (. f name) " of " (. d name)]) (. f ty))) fs))
+    ((TsEnum vs)
+     (vec (for [v vs
+                :let [fs (. v fields) one (= (count fs) 1)]
+                i (range (count fs))]
+            (Pair (if one
+                      (str-join ["payload of " (. v name)])
+                      (str-join ["payload " (show i) " of " (. v name)]))
+                  (. (nth fs i) ty)))))))
+
+;; Rust: infer/send.rs:142. The error of §5.3 for a failed `Send`.
 (defun send-error (g: Globals w: Witness pos: Pos rigid: (Vec str)) -> TypeError
-  (trap "todo: send-error"))
+  (let ((p (printer-with-names g [] rigid))
+        (path (if (empty? (. w path)) "the value" (str/join ", " (. w path))))
+        (t (printer-ty p (. w offending))))
+    (match (. w offending)
+      ((TCon (KCell) _)
+       (type-error CellNotSend pos
+         (str-join ["cell cannot be shared between threads: " path " has type " t])))
+      (_ (type-error ValueNotSend pos
+           (str-join ["value of type " t " cannot be shared between threads: " path]))))))

@@ -1,15 +1,119 @@
 ;; compiler/types/infer/units.fib: inference of a def and of an impl method (package P8).
 ;; Replaces crates/fibref/src/types/infer/units.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; The units that are not generalised (spec/types.md §3.5 steps 5-6): a `def`
+;; (closed and monomorphic, §2.16) and an `impl` method body (checked against
+;; its signature under the declared context, §2.7).
+;;
+;; TODO(P12): `check-matches` below is a stub. The Rust `check_matches` is a
+;; method of `Cx` (infer/exhaust/mod.rs:46), but P1's stub in types.exhaust is
+;; `checker-check-matches` over a `Checker`, which makes types.exhaust use
+;; types.infer.mod, which uses this module (types.infer.scc calls it too): a
+;; cycle. P12 should give types.exhaust `(cx-check-matches (cx: Cx e: Expr))`
+;; and no import of types.infer.mod; then delete the stub, `:use` types.exhaust
+;; and call `cx-check-matches`.
 (ns types.infer.units
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast types.decls
+        types.annot types.lower.impl-head types.lower.supers
+        types.infer.cx types.infer.unify types.infer.expr types.infer.call
+        types.infer.solve types.infer.general))
 
-;; Rust: infer/units.rs:14 infer_def
+;; Rust: infer/exhaust/mod.rs:46 check_matches. STUB, see the TODO above.
+(defun check-matches :private (cx: Cx e: Expr) -> (Result unit TypeError)
+  (trap "todo: cx-check-matches"))
+
+;; ---- a def
+
+;; Rust: infer/units.rs:14 infer_def. Types a `def` (§2.16): a closed
+;; monomorphic type.
 (defun cx-infer-def (cx: Cx d: i64) -> (Result Ty TypeError)
-  (trap "todo: cx-infer-def"))
+  (let ((def (g-def (. cx g) d)))
+    (do (set! (. (. cx u) fun) (str-join ["def " (. def name)]))
+        (try-let ((t (cx-infer cx (. def init)))
+                  (ty (def-annotated cx def t))
+                  (_ (cx-solve-all cx)))
+          (if (empty? (general-keys (. cx st) ty))
+              (def-closed cx def ty)
+              (Err (type-error DefUnresolved (. def pos)
+                     (str-join ["def " (. def name) " has an unresolved type; annotate it"]))))))))
 
-;; Rust: infer/units.rs:47
+;; The type of the def: its annotation, with the initialiser flowing into it
+;; (an omitted colour in the annotation is `send`), or the initialiser's.
+;; Public for tests/types/unit-units.fib.
+(defun def-annotated (cx: Cx def: DefDef t: Ty) -> (Result Ty TypeError)
+  (match (. def ann)
+    ((some a)
+     (let ((u (. cx u))
+           (env (RigidEnv (. u rigid-map) (. u rigid-names) (fn () CSend) (. u rigid-colours))))
+       (try-let ((at (ann-to-ty a env (. def pos)))
+                 (_ (cx-flow cx t at (. (. def init) pos))))
+         (Ok at))))
+    (nil (Ok t))))
+
+;; The unit is closed: its matches are checked and its colours settled.
+(defun def-closed :private (cx: Cx def: DefDef ty: Ty) -> (Result Ty TypeError)
+  (try-let ((closed (cx-close cx []))
+            (_ (check-matches cx (. def init))))
+    (let ((map (genmap-new cx [] (. closed colours) []))
+          (out (genmap-apply map (. cx st) ty)))
+      (do (cx-finalize cx map closed)
+          (Ok out)))))
+
+;; ---- an impl method
+
+;; The parameter types and the result of a method at its instance.
+(defstruct MethodSig (params: (Vec Ty) ret: Ty))
+
+;; Rust: infer/units.rs:47. Checks one method body of instance `index`
+;; (§2.7, §3.5 step 6).
 (defun cx-infer-impl-method (cx: Cx index: i64 method: i64) -> (Result unit TypeError)
-  (trap "todo: cx-infer-impl-method"))
+  (let ((inst (table-get (. (. cx g) instances) index))
+        (m (nth (. inst methods) method)))
+    (try-let ((sig (impl-method-sig cx inst m)))
+      (do (doseq [[b t] (zip (. m params) (. sig params))] (cx-bind cx b t))
+          (try-let ((_ (impl-method-ret cx m (. sig ret)))
+                    (body (cx-infer cx (. m body)))
+                    (_ (cx-flow cx body (. sig ret) (. (. m body) pos)))
+                    (closed (cx-close cx []))
+                    (_ (check-matches cx (. m body))))
+            (let ((order (mapv (fn (i: i64) (KeyRigid i)) (range (count @(. (. cx u) rigid-names)))))
+                  (map (genmap-new cx order (. closed colours) [])))
+              (do (cx-finalize cx map closed)
+                  (Ok ()))))))))
+
+;; The written result type of the method, when there is one, is the one
+;; of the signature.
+(defun impl-method-ret :private (cx: Cx m: ImplMethod ret: Ty) -> (Result unit TypeError)
+  (match (. m ret)
+    ((some a) (try-let ((at (cx-ann cx a (. m pos)))) (cx-unify cx at ret (. m pos))))
+    (nil (Ok ()))))
+
+;; Sets the unit up for the method: a type variable of the head is rigid, and
+;; so is a colour variable, as a rigid colour (§1.3, §2.7); the given context
+;; is the declared one and what it entails through supertraits (§4.1 rule 2).
+;; The signature of the method at the instance.
+(defun impl-method-sig :private (cx: Cx inst: InstanceDef m: ImplMethod) -> (Result MethodSig TypeError)
+  (let ((g (. cx g))
+        (u (. cx u))
+        (md (nth (. (g-proto g (. inst proto)) methods) (. m index)))
+        (rig (body-args g inst))
+        (subst (fn (t: Ty) (ty-subst-gen t rig []))))
+    (do (set! (. u rigid-names) (. inst var-names))
+        (let ((tys (method-rigid-tys u md (into [(subst (. inst head))] (mapv subst (. inst dets)))))
+              (context (mapv (fn (p: Pred) (pred-map-tys p subst)) (. inst context))))
+          (do (set! (. u givens) (some (entail-closure g context)))
+              (set! (. u fun) (str-join [(. md name) " for " (cx-show cx (nth tys 0))]))
+              (let ((colours (mapv (fn (i: i64) (store-fresh-colour (. cx st)))
+                                   (range (. (. md scheme) n-colours)))))
+                (match (. (scheme-instantiate-with (. md scheme) tys colours) ty)
+                  ((TFn _ params ret) (Ok (MethodSig params ret)))
+                  (_ (Err (type-error-other (. m pos) "internal: method type is not a function"))))))))))
+
+;; The type variables of the method itself, after the head's and the
+;; determined ones, are rigid too. Public for tests/types/unit-units.fib.
+(defun method-rigid-tys (u: Unit md: MethodDef tys: (Vec Ty)) -> (Vec Ty)
+  (reduce (fn (acc: (Vec Ty) name: str)
+            (let ((i (count @(. u rigid-names))))
+              (do (set! (. u rigid-names) (conj @(. u rigid-names) name))
+                  (conj acc (TRigid i)))))
+          tys (drop (count tys) (. (. md scheme) var-names))))
