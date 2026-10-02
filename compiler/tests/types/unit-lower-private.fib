@@ -1,0 +1,115 @@
+;; compiler/tests/types/unit-lower-private.fib: `:private` (types.lower.private). The two inline
+;; Rust tests of private.rs (the marker follows the name, or a `def`'s annotation; stripping takes
+;; it off and lists the private forms), the rest of `mark_private`'s rules (a struct's constructor,
+;; an enum's variants, a protocol's methods, `def g: T`, no name for a macro, forms that name
+;; nothing), and the effect across modules: lower-cases/priv/ (util.fib, main-err.fib, main-ok.fib
+;; and the .out files the Rust tool made for them): a private type of util is not found from main,
+;; and the error says whose it is.
+;; Run from the repository root.
+;; Build: fibc build compiler/tests/types/unit-lower-private.fib -I compiler -I lib -o OUT
+(ns main (:require [expand.private :as ep])
+         (:use fib.string syntax.pos syntax.form syntax.print types.ty types.scheme types.error
+               types.ast types.table types.decls types.names types.check tests.types.lower-support
+               types.lower.typeform types.lower.private))
+
+(defun shown (fs: (Vec Stx)) -> (Vec str) (mapv stx-show fs))
+
+(defun markers (cs: Checks) -> unit
+  (let ((fs (forms-of "(defun f :private (x) x) (def g: i64 :private 1) (def h :private 2)
+                       (defstruct P :private (x: i64)) (defun k (x) :private)" "t")))
+    (do (check cs "the marker follows the name or a def's annotation"
+               (= (mapv ep/marker-index fs) [(some 2) (some 3) (some 2) (some 2) nil]))
+        (check cs "a marker elsewhere is none"
+               (= (mapv ep/marker-index (forms-of "(defun f (x) :private) (foo :private) 5 :private (def)" "t"))
+                  [nil nil nil nil nil])))))
+
+(defun stripping (cs: Checks) -> unit
+  (let ((r (strip-private (forms-of "(defun f :private (x) x) (defun g (x) x)" "t")))
+        (r2 (strip-private (forms-of "(def a: i64 :private 1) 7 (defenum E :private A B) (defun f () 1) (extern x :private (fn () unit))" "t"))))
+    (do (check cs "the marker comes off and the private forms are listed"
+               (and (= (shown (. r fst)) ["(defun f (x) x)" "(defun g (x) x)"])
+                    (= (shown (. r snd)) ["(defun f (x) x)"])))
+        (check cs "a def's annotation, a form that is no list, and the order of both lists"
+               (and (= (shown (. r2 fst)) ["(def a: i64 1)" "7" "(defenum E A B)" "(defun f () 1)" "(extern x (fn () unit))"])
+                    (= (shown (. r2 snd)) ["(def a: i64 1)" "(defenum E A B)" "(extern x (fn () unit))"])))
+        (check cs "a stripped form keeps its position"
+               (= (. (. (nth (. r fst) 0) pos) col) 1))
+        (check cs "no forms, none private"
+               (and (empty? (. (strip-private []) fst)) (empty? (. (strip-private []) snd)))))))
+
+;; the world with module main, the struct P, the enum E and the protocol Pr (methods m1 m2) declared
+(defun marked-world (private: str) -> Globals
+  (let ((g (world-main))
+        (n (g-names g module-main))
+        (pr (table-add (. g protos)
+                       (ProtoDef "Pr" module-main ["a"]
+                                 [(MethodDef "m1" [] (scheme-mono (ty-unit)) false nil p0)
+                                  (MethodDef "m2" [] (scheme-mono (ty-unit)) false nil p0)]
+                                 [] p0))))
+    (do (set! (. n protos) (assoc @(. n protos) "Pr" pr))
+        (lower-module g module-main (forms-of "(defstruct P (x: i64)) (defstruct (Q a) (x: a)) (defenum E A B) (defstruct R (x: i64))" "t"))
+        (mark-private g module-main (forms-of private "t"))
+        g)))
+
+(defun private-in (g: Globals space: Space name: str) -> bool
+  (names-is-private (g-names g module-main) space name))
+
+(defun marking (cs: Checks) -> unit
+  (let ((g (marked-world "(defun f (x) x) (def g: i64 1) (def h 2) (defstruct P (x: i64)) (defstruct (Q a) (x: a))
+                          (defenum E A B) (defprotocol Pr (m1 (self))) (defmacro mac (x) x) (extern ext (fn () unit))
+                          (defstruct Gone (x: i64)) 5 (defun) () (defun 5)")))
+    (do (check cs "a function, a def with an annotation and one without, an extern: their names"
+               (and (private-in g SpValue "f") (private-in g SpValue "g") (private-in g SpValue "h")
+                    (private-in g SpValue "ext")))
+        (check cs "a struct: its type and its constructor, a head with parameters by its name"
+               (and (private-in g SpType "P") (private-in g SpValue "P")
+                    (private-in g SpType "Q") (private-in g SpValue "Q")))
+        (check cs "an enum: its type and every variant, not the type as a value"
+               (and (private-in g SpType "E") (private-in g SpValue "A") (private-in g SpValue "B")
+                    (not (private-in g SpValue "E"))))
+        (check cs "a protocol: its name and the methods the table has for it (not the form's)"
+               (and (private-in g SpProto "Pr") (private-in g SpValue "m1") (private-in g SpValue "m2")
+                    (not (private-in g SpType "Pr")) (not (private-in g SpValue "Pr"))))
+        (check cs "a macro names nothing"
+               (and (not (private-in g SpValue "mac")) (not (private-in g SpType "mac")) (not (private-in g SpProto "mac"))))
+        (check cs "a struct that was not declared: the type name only"
+               (and (private-in g SpType "Gone") (not (private-in g SpValue "Gone"))))
+        (check cs "what is not listed stays public; the other spaces too"
+               (and (not (private-in g SpType "R")) (not (private-in g SpValue "R"))
+                    (not (private-in g SpValue "P2")) (not (private-in g SpType "f"))
+                    (not (private-in g SpProto "P")) (not (private-in g SpType "g"))))
+        (check cs "the other modules are not touched"
+               (not (names-is-private (g-names g module-prelude) SpValue "f"))))))
+
+(defun case (cs: Checks name: str srcs: (Vec Src)) -> unit
+  (let ((got (program-lines srcs))
+        (want (lines-of (file-text (str-join [dir "priv/" name ".out"])))))
+    (if (= got want)
+        (check cs (str-join ["case priv/" name " (" (show (count want)) " lines)"]) true)
+        (do (check cs (str-join ["case priv/" name]) false)
+            (println (str-join ["  want " (join "\n        " want)]))
+            (println (str-join ["  got  " (join "\n        " got)]))))))
+
+(defun src (ns: str file: str uses: (Vec i64)) -> Src
+  (Src ns file (file-text (str-join [dir "priv/" file])) uses))
+
+(defun across-modules (cs: Checks) -> unit
+  (do (case cs "main-err" [(src "util" "util.fib" []) (src "main" "main-err.fib" [2])])
+      (case cs "main-ok" [(src "util" "util.fib" []) (src "main" "main-ok.fib" [2])])
+      (check cs "a private type is found in its own module and by `(var ..)`-style lookups"
+             (let ((g (world))
+                   (u (g-add-module g "util" (Links [] [] []) (map-empty)))
+                   (m (g-add-module g "main" (Links [u] [] []) (map-empty))))
+               (do (lower-module g u (forms-of "(defstruct P :private (x: i64)) (defstruct S (z: P))" "u.fib"))
+                   (and (= (g-type-name g u "P") (some 0))
+                        (= (g-type-name g m "P") nil)
+                        (= (g-value g m "P") nil)
+                        (= (g-value-any g m "P") (some (GCtor 0 nil)))
+                        (match (type-ann g m (nth (forms-of "P" "t") 0) false)
+                          ((Err e) (= (. e message) "P is private to util; it is not exported"))
+                          (_ false))))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (markers cs) (stripping cs) (marking cs) (across-modules cs)
+        (finish cs))))

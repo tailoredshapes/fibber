@@ -1,0 +1,59 @@
+;; compiler/tests/types/unit-lower-defaults.fib: the default method of a protocol as an impl's
+;; method form (types.lower.defaults). The inline Rust test of defaults.rs (a default with a
+;; borrowed parameter becomes `(!= (self y) (not (= self y)))`) and the rest of the rule in its
+;; header: the parameters are the method's by name, the body is the default's from its fifth item
+;; on (the result annotation is dropped), the head is the method's name, the new forms take the
+;; default's position and the body keeps its own.
+;; Build: fibc build compiler/tests/types/unit-lower-defaults.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.decls types.check
+               tests.types.lower-support types.lower.typeform types.lower.defaults))
+
+(defun mp (name: str) -> MethodParam (MethodParam name false false))
+
+(defun md (name: str params: (Vec str) default: Stx) -> MethodDef
+  (MethodDef name (mapv mp params) (scheme-mono (ty-unit)) true (some default) (. default pos)))
+
+(defun pos= (a: Pos b: Pos) -> bool
+  (and (= (. a line) (. b line)) (= (. a col) (. b col)) (= (. a start) (. b start)) (= (. a end) (. b end))))
+
+(defun form (src: str) -> Stx (nth (forms-of src "t") 0))
+
+(defun made (name: str params: (Vec str) src: str) -> str
+  (let ((f (form src)))
+    (stx-show (method-form (md name params f) f))))
+
+(defun forms (cs: Checks) -> unit
+  (do (check cs "the Rust test: a default with a borrowed parameter"
+             (= (made "!=" ["self" "y"] "(!= (self y: Self :borrow) -> bool (not (= self y)))")
+                "(!= (self y) (not (= self y)))"))
+      (check cs "the parameters are the method's by name, not the default's"
+             (= (made "m" ["self" "a" "b"] "(m (self q.. x: i64) -> unit (f x))") "(m (self a b) (f x))"))
+      (check cs "every body form is kept, in order"
+             (= (made "m" ["self"] "(m (self) -> unit (f 1) (g 2) h)") "(m (self) (f 1) (g 2) h)"))
+      (check cs "no body, no parameters"
+             (and (= (made "m" ["self"] "(m (self) -> unit)") "(m (self))")
+                  (= (made "m" [] "(m () -> unit)") "(m ())")))
+      (check cs "the head is the method's name, whatever the default's head is"
+             (= (made "name" ["self"] "(other (self) -> unit 1)") "(name (self) 1)"))
+      (check cs "four items are dropped (the head, the parameters, the arrow and the result), whatever they are"
+             (= (made "m" ["self"] "(m (self) a b c d)") "(m (self) c d)"))
+      (check cs "a default that is not a list has no body"
+             (and (= (made "m" ["self"] "x") "(m (self))") (= (made "m" ["self"] "5") "(m (self))")
+                  (= (made "m" ["self"] "[m (self) -> unit 1]") "(m (self))")))
+      (check cs "a short default"
+             (= (made "m" ["self" "x"] "(m)") "(m (self x))"))))
+
+(defun positions (cs: Checks) -> unit
+  (let ((f (nth (forms-of "  (m (self) -> unit (f 1))" "t") 0))
+        (r (method-form (md "m" ["self"] f) f))
+        (items (stx-items r)))
+    (do (check cs "the form, its head and its parameter list take the default's position"
+               (and (pos= (. r pos) (. f pos)) (pos= (. (nth items 0) pos) (. f pos)) (pos= (. (nth items 1) pos) (. f pos))
+                    (pos= (. (nth (stx-items (nth items 1)) 0) pos) (. f pos))))
+        (check cs "the body keeps the position it was written at"
+               (and (pos= (. (nth items 2) pos) (. (nth (stx-items f) 4) pos)) (not (pos= (. (nth items 2) pos) (. f pos))))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (forms cs) (positions cs)
+        (finish cs))))

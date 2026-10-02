@@ -1,0 +1,133 @@
+;; compiler/tests/types/lower-support.fib: what the unit programs of the declaration lowering
+;; (unit-lower-*.fib) share: a world of modules, the reading of forms, `lower::declare` for type
+;; forms with `strip-private` and `mark-private` as the driver calls them, and the lines the Rust
+;; tool prints for the `type` and `error` sections, so that a program's output can be compared with
+;; `fibref types --stage lower --sections type,error` (lower-cases/NAME.out).
+(ns tests.types.lower-support
+  (:require [syntax.dump :as sdump])
+  (:use fib.string syntax.pos syntax.form syntax.reader types.ty types.error types.ast
+        types.table types.decls types.display
+        types.lower.typeform types.lower.decl types.lower.private))
+
+(def p0: Pos (Pos "t" 1 1 0 1))
+(def dir: str "compiler/tests/types/lower-cases/")
+
+(defun add-proto (g: Globals name: str params: (Vec str)) -> unit
+  (let ((n (g-names g module-prelude))
+        (id (table-add (. g protos) (ProtoDef name module-prelude params [] [] p0))))
+    (set! (. n protos) (assoc @(. n protos) name id))))
+
+;; builtins 0, prelude 1 (the protocols Show and Stack, as the tool's prelude has them)
+(defun world () -> Globals
+  (let ((g (globals-new)))
+    (do (g-add-module g "<builtin>" (Links [] [] []) (map-empty))
+        (g-add-module g "fib.prelude" (Links [] [] []) (map-empty))
+        (add-proto g "Show" ["a"])
+        (add-proto g "Stack" ["s" "e"])
+        g)))
+
+;; the world and the module `main` (id 2, `module-main`) the direct tests declare in
+(defun world-main () -> Globals
+  (let ((g (world)))
+    (do (g-add-module g "main" (Links [] [] []) (map-empty)) g)))
+
+(defun forms-of (src: str file: str) -> (Vec Stx)
+  (match (read-all src file)
+    ((Ok fs) fs)
+    ((Err _) (trap (str-join ["unreadable " file])))))
+
+(defun head-of (f: Stx) -> str
+  (let ((items (stx-items f)))
+    (unwrap-or (if (empty? items) nil (stx-as-sym (nth items 0))) "")))
+
+(defun file-text (path: str) -> str
+  (match (read-file path) ((some s) s) (nil (trap (str-join ["no file " path])))))
+
+(defun lines-of (text: str) -> (Vec str)
+  (let ((ls (split text "\n")))
+    (if (and (not (empty? ls)) (= (last ls) (some ""))) (vec (take (- (count ls) 1) ls)) ls)))
+
+;; ---- lower::declare on the type forms
+
+(defstruct Declared (raws: (Vec RawType) errors: (Vec TypeError)))
+
+;; every `defstruct` and `defenum` declared, an error kept and the next form tried
+(defun declare-forms (g: Globals m: i64 forms: (Vec Stx)) -> Declared
+  (loop ((i 0) (raws (vec-empty)) (errs (vec-empty)))
+    (if (>= i (count forms))
+        (Declared raws errs)
+        (let ((f (nth forms i)))
+          (match (match (head-of f)
+                   ("defstruct" (some (declare-struct g m f)))
+                   ("defenum" (some (declare-enum g m f)))
+                   (_ nil))
+            (nil (recur (+ i 1) raws errs))
+            ((some (Ok raw)) (recur (+ i 1) (conj raws raw) errs))
+            ((some (Err e)) (recur (+ i 1) raws (conj errs e))))))))
+
+(defun resolve-all (g: Globals m: i64 raws: (Vec RawType)) -> (Vec TypeError)
+  (reduce (fn (errs: (Vec TypeError) r: RawType)
+            (match (resolve-shape g m r) ((Ok _) errs) ((Err e) (conj errs e))))
+          (vec-empty) raws))
+
+;; one module as the driver lowers it: markers stripped, names declared, shapes resolved, and,
+;; when all went well, the private definitions marked; the errors in the tool's order
+(defun lower-module (g: Globals m: i64 forms: (Vec Stx)) -> (Vec TypeError)
+  (let ((sp (strip-private forms))
+        (d (declare-forms g m (. sp fst)))
+        (errs (into (. d errors) (resolve-all g m (. d raws)))))
+    (do (if (empty? errs) (mark-private g m (. sp snd)) ())
+        errs)))
+
+;; ---- the tool's lines
+
+(defun error-line (e: TypeError file: str) -> str
+  (str-join ["error " (error-kind-name (. e kind)) " " (sdump/span-in (. e pos) file) ": " (. e message)]))
+
+(defun params-text (d: TypeDef) -> str
+  (join " " (map-indexed (fn (i: i64 p: str) (if (typedef-is-colour d i) (str-join [p ":colour"]) p))
+                         (. d params))))
+
+(defun type-lines (g: Globals d: TypeDef file: str) -> (Vec str)
+  (let ((p (printer-with-names g (. d params) []))
+        (head (str-join ["type " (. d name) " (" (params-text d) ") "
+                         (match (. d shape) ((TsStruct _) "struct") ((TsEnum _) "enum")) " "
+                         (sdump/span-in (. d pos) file)])))
+    (match (. d shape)
+      ((TsStruct fields)
+       (into [head] (mapv (fn (f: FieldDef) (str-join ["  field " (. f name) " : " (printer-ty p (. f ty))])) fields)))
+      ((TsEnum variants)
+       (into [head]
+             (mapv (fn (v: VariantDef)
+                     (str-join ["  variant " (. v name) " ("
+                                (join " " (mapv (fn (f: FieldDef) (printer-ty p (. f ty))) (. v fields))) ")"]))
+                   variants))))))
+
+;; `-- module NS FILE` and the types the module defines
+(defun module-lines (g: Globals m: i64 file: str) -> (Vec str)
+  (reduce (fn (acc: (Vec str) t: TypeDef) (into acc (type-lines g t file)))
+          [(str-join ["-- module " (g-module-name g m) " " file])]
+          (filterv (fn (t: TypeDef) (= (. t module) m)) (table-rows (. g types)))))
+
+;; a module of a program: its namespace, file, text, and the modules (by index in the program,
+;; the first being module 2) it `:use`s
+(defstruct Src (ns: str file: str text: str uses: (Vec i64)))
+
+;; the lines of a program of modules in dependency order: the errors of the first module that has
+;; any, or the `type` section of each
+(defun program-lines (srcs: (Vec Src)) -> (Vec str)
+  (let ((g (world)))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (>= i (count srcs))
+          acc
+          (let ((s (nth srcs i))
+                (m (g-add-module g (. s ns) (Links (. s uses) [] []) (map-empty)))
+                (errs (lower-module g m (forms-of (. s text) (. s file)))))
+            (if (empty? errs)
+                (recur (+ i 1) (into acc (module-lines g m (. s file))))
+                (mapv (fn (e: TypeError) (error-line e (. s file))) errs)))))))
+
+;; the program of one module, the only one of the case NAME: lower-cases/NAME.fib and NAME.out
+(defun single-lines (name: str) -> (Vec str)
+  (let ((file (str-join [name ".fib"])))
+    (program-lines [(Src "main" file (file-text (str-join [dir file])) [])])))

@@ -1,15 +1,238 @@
 ;; compiler/types/lower/typeform.fib: type forms to annotations (package P3).
-;; Replaces crates/fibref/src/types/lower/typeform.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/typeform.rs (249 lines of Rust).
+;;
+;; Type forms (spec/types.md §1) to `TypeAnn`: names resolved against the module's types
+;; and protocols; a lowercase symbol that names no type is a type variable.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - a `Form` is a `Stx`; its `Display` (`{form}` in messages) is `stx-show`.
+;; - `collect::<TResult<Vec<_>>>()` is `try-map-i`: it stops at the first Err, so the
+;;   conversions after it are not run (they have no effect on `Globals`, but the order of
+;;   errors is the Rust one). It takes the conversion as a function, as `anns` of
+;;   types.annot does, and a function that captures a parameter is an owned one.
+;; - `Form::as_sym` and `as_list` (and `as_list().unwrap_or(&[])`) are `stx-as-sym`,
+;;   `stx-as-list` and `stx-items`: public, for the packages that lower more forms.
+;; - `builtin_con` and `is_var_name` are `builtin-con` and `var-name?`.
 (ns types.lower.typeform
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store
+        types.table types.ast types.decls types.names))
 
-;; Rust: lower/typeform.rs:32
+;; ---- the forms as Rust's Form methods see them
+
+;; The name of a symbol form.
+(defun stx-as-sym (f: Stx) -> (Option str)
+  (match (. f kind)
+    ((SSym s) (some s))
+    (_ nil)))
+
+;; The items of a list form (`(...)`, not `[...]`).
+(defun stx-as-list (f: Stx) -> (Option (Vec Stx))
+  (match (. f kind)
+    ((SList items) (some items))
+    (_ nil)))
+
+;; The items of a list form, none for any other form (`as_list().unwrap_or(&[])`).
+(defun stx-items (f: Stx) -> (Vec Stx)
+  (unwrap-or (stx-as-list f) (vec-empty)))
+
+;; Whether the form is the keyword `:name`.
+(defun stx-kw? (f: Stx name: str) -> bool
+  (match (. f kind)
+    ((SKw k) (= k name))
+    (_ false)))
+
+;; ---- helpers
+
+;; The built-in unary constructors.
+(defun builtin-con :private (name: str) -> (Option Con)
+  (match name
+    ("Array" (some KArray))
+    ("Cell" (some KCell))
+    ("Atom" (some KAtom))
+    ("Weak" (some KWeak))
+    ("Task" (some KTask))
+    (_ nil)))
+
+;; Whether `name` can be a type variable: it starts with a lowercase ASCII letter (the
+;; first byte is read as a byte: a multi-byte character starts with a byte above 127,
+;; which is negative as an i8).
+(defun var-name? :private (name: str) -> bool
+  (let ((bs (str-bytes name)))
+    (and (> (array-len bs) 0)
+         (>= (array-get bs 0) 97i8)
+         (<= (array-get bs 0) 122i8))))
+
+;; A name that can be a colour variable: a variable name that is not a scalar's.
+(defun colour-var-name? :private (name: str) -> bool
+  (and (var-name? name) (not (some? (scalar-from-name name)))))
+
+(defun resolve-err :private (pos: Pos msg: str) -> (Result a TypeError)
+  (Err (type-error-resolve pos msg)))
+
+(defun not-a-type :private (form: Stx) -> (Result a TypeError)
+  (resolve-err (. form pos) (str-join [(stx-show form) " is not a type"])))
+
+;; `(f 0 x0) (f 1 x1) ..` in order, the first Err ending it.
+(defun try-map-i :private (xs: (Vec a) f: (fn (i64 a) (Result b TypeError)) :borrow)
+    -> (Result (Vec b) TypeError)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (>= i (count xs))
+        (Ok acc)
+        (match (f i (nth xs i))
+          ((Ok v) (recur (+ i 1) (conj acc v)))
+          ((Err e) (Err e))))))
+
+;; ---- type forms
+
+;; Resolves the type form `form` in module `m`. `Self` is allowed when `allow-self`.
 (defun type-ann (g: Globals m: i64 form: Stx allow-self: bool) -> (Result TypeAnn TypeError)
-  (trap "todo: type-ann"))
+  (match (. form kind)
+    ((SSym name) (sym-type g m name form allow-self))
+    ((SList items) (if (> (count items) 0)
+                       (list-type g m items form allow-self)
+                       (not-a-type form)))
+    (_ (not-a-type form))))
 
-;; Rust: lower/typeform.rs:219
-(defun proto-ref (g: Globals m: i64 form: Stx allow-self: bool) -> (Result (Pair i64 (Vec TypeAnn)) TypeError)
-  (trap "todo: proto-ref"))
+(defun sym-type :private (g: Globals m: i64 name: str form: Stx allow-self: bool)
+    -> (Result TypeAnn TypeError)
+  (if-some [s (scalar-from-name name)]
+    (Ok (AScalar s))
+    (cond ((= name "str") (Ok AStr))
+          ((and (= name "Self") allow-self) (Ok ASelf))
+          (else (named-type g m name (. form pos))))))
+
+;; A symbol that is no scalar, `str` or `Self`: a nominal type of no parameters, or a
+;; type variable.
+(defun named-type :private (g: Globals m: i64 name: str pos: Pos) -> (Result TypeAnn TypeError)
+  (if-some [id (g-type-name g m name)]
+    (let ((arity (count (. (g-ty g id) params))))
+      (if (= arity 0)
+          (Ok (ANominal id (vec-empty)))
+          (resolve-err pos (str-join ["type " name " takes " (show arity) " argument(s)"]))))
+    (cond ((some? (builtin-con name))
+           (resolve-err pos (str-join ["type " name " takes 1 argument"])))
+          ((var-name? name) (Ok (AVar name)))
+          (else (resolve-err pos (g-unknown g m SpType name "unknown type"))))))
+
+(defun list-type :private (g: Globals m: i64 items: (Vec Stx) form: Stx allow-self: bool)
+    -> (Result TypeAnn TypeError)
+  (match (stx-as-sym (nth items 0))
+    (nil (not-a-type form))
+    ((some head)
+     (let ((args (vec (drop 1 items))))
+       (match head
+         ("fn" (fn-type g m args form allow-self))
+         ("dyn" (dyn-type g m args form allow-self))
+         (_ (try-let ((anns (arg-anns g m head args allow-self)))
+              (applied-type g m head anns (. form pos)))))))))
+
+;; `(K A..)` once the arguments are resolved: a built-in constructor or a nominal type.
+(defun applied-type :private (g: Globals m: i64 head: str anns: (Vec TypeAnn) pos: Pos)
+    -> (Result TypeAnn TypeError)
+  (if-some [c (builtin-con head)]
+    (if (= (count anns) 1)
+        (Ok (ABuiltin c (nth anns 0)))
+        (resolve-err pos (str-join ["type " head " takes 1 argument"])))
+    (if-some [id (g-type-name g m head)]
+      (let ((arity (count (. (g-ty g id) params))))
+        (if (= arity (count anns))
+            (Ok (ANominal id anns))
+            (resolve-err pos (str-join ["type " head " takes " (show arity)
+                                        " argument(s), not " (show (count anns))]))))
+      (resolve-err pos (g-unknown g m SpType head "unknown type")))))
+
+;; The arguments of the type constructor `head`: types, or colours at its colour
+;; parameters (§1.3).
+(defun arg-anns :private (g: Globals m: i64 head: str args: (Vec Stx) allow-self: bool)
+    -> (Result (Vec TypeAnn) TypeError)
+  (let ((id (g-type-name g m head))
+        (colour-at (fn (i: i64) (if-some [t id] (typedef-is-colour (g-ty g t) i) false))))
+    (try-map-i args
+      (fn (i: i64 a: Stx)
+        (if (colour-at i)
+            (colour-param-arg a head)
+            (type-ann g m a allow-self))))))
+
+;; `(fn κ? (A..) R)`: the colour is a keyword, or a variable name when the form has
+;; three items (the colour, the parameters and the result).
+(defun fn-colour :private (args: (Vec Stx)) -> (Pair (Option ColourAnn) (Vec Stx))
+  (match (if (empty? args) nil (colour-form (nth args 0) (= (count args) 3)))
+    ((some c) (Pair (some c) (vec (drop 1 args))))
+    (nil (Pair nil args))))
+
+(defun colour-form :private (f: Stx named-ok: bool) -> (Option ColourAnn)
+  (match (if named-ok (stx-as-sym f) nil)
+    ((some k) (if (colour-var-name? k) (some (CaNamed k)) nil))
+    (nil (colour-arg f))))
+
+(defun fn-type :private (g: Globals m: i64 args: (Vec Stx) form: Stx allow-self: bool)
+    -> (Result TypeAnn TypeError)
+  (let ((split (fn-colour args))
+        (rest (. split snd)))
+    (match (if (= (count rest) 2) (stx-as-list (nth rest 0)) nil)
+      (nil (resolve-err (. form pos) (str-join ["malformed function type " (stx-show form)])))
+      ((some ps)
+       (try-let ((params (try-map-i ps (fn (_: i64 p: Stx) (type-ann g m p allow-self))))
+                 (ret (type-ann g m (nth rest 1) allow-self)))
+         (Ok (AFn (. split fst) params ret)))))))
+
+;; `:send` or `:local`.
+(defun colour-arg :private (f: Stx) -> (Option ColourAnn)
+  (cond ((stx-kw? f "send") (some (CaFixed CSend)))
+        ((stx-kw? f "local") (some (CaFixed CLocal)))
+        (else nil)))
+
+;; An argument at a colour parameter (§1.3): `:send`, `:local` or a colour variable.
+(defun colour-param-arg :private (f: Stx head: str) -> (Result TypeAnn TypeError)
+  (match (colour-arg f)
+    ((some c) (Ok (AColourArg c)))
+    (nil
+     (match (stx-as-sym f)
+       ((some k) (if (and (colour-var-name? k) (not (= k "str")))
+                     (Ok (AColourArg (CaNamed k)))
+                     (not-a-colour f head)))
+       (nil (not-a-colour f head))))))
+
+(defun not-a-colour :private (f: Stx head: str) -> (Result a TypeError)
+  (resolve-err (. f pos)
+               (str-join [(stx-show f) " is not a colour: " head
+                          " takes :send, :local or a colour variable there"])))
+
+;; `(dyn P)` / `(dyn (P D..))`, each optionally followed by `:send`.
+(defun dyn-type :private (g: Globals m: i64 args: (Vec Stx) form: Stx allow-self: bool)
+    -> (Result TypeAnn TypeError)
+  (let ((n (count args)))
+    (cond ((= n 1) (dyn-of g m (nth args 0) false allow-self))
+          ((and (= n 2) (stx-kw? (nth args 1) "send")) (dyn-of g m (nth args 0) true allow-self))
+          (else (resolve-err (. form pos) (str-join ["malformed " (stx-show form)]))))))
+
+(defun dyn-of :private (g: Globals m: i64 p: Stx send: bool allow-self: bool)
+    -> (Result TypeAnn TypeError)
+  (try-let ((r (proto-ref g m p allow-self)))
+    (Ok (ADyn (. r fst) (. r snd) send))))
+
+;; The name and the determined-type forms of a protocol reference `P` or `(P D..)`.
+(defun proto-head :private (form: Stx) -> (Result (Pair str (Vec Stx)) TypeError)
+  (match (. form kind)
+    ((SSym n) (Ok (Pair n (vec-empty))))
+    ((SList items)
+     (match (if (> (count items) 0) (stx-as-sym (nth items 0)) nil)
+       ((some n) (Ok (Pair n (vec (drop 1 items)))))
+       (nil (resolve-err (. form pos) "expected a protocol"))))
+    (_ (resolve-err (. form pos) "expected a protocol"))))
+
+;; A protocol reference `P` or `(P D..)`, with the determined types.
+(defun proto-ref (g: Globals m: i64 form: Stx allow-self: bool)
+    -> (Result (Pair i64 (Vec TypeAnn)) TypeError)
+  (try-let ((h (proto-head form)))
+    (let ((name (. h fst))
+          (dets (. h snd)))
+      (if-some [p (g-proto-name g m name)]
+        (let ((want (- (count (. (g-proto g p) params)) 1)))
+          (if (= want (count dets))
+              (try-let ((ds (try-map-i dets (fn (_: i64 d: Stx) (type-ann g m d allow-self)))))
+                (Ok (Pair p ds)))
+              (resolve-err (. form pos)
+                           (str-join ["protocol " name " has " (show want)
+                                      " determined parameter(s)"]))))
+        (resolve-err (. form pos) (g-unknown g m SpProto name "unknown protocol"))))))

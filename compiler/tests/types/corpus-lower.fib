@@ -1,0 +1,112 @@
+;; compiler/tests/types/corpus-lower.fib: the declarations of types.lower.{typeform,decl,private} over
+;; a real program, until the spine (types.driver, with protocols and signatures) runs end to end.
+;; It does what `types.dump` does for `--stage lower --sections type,error` (read, load, expand through
+;; the existing ports), then declares only the types of every module (prelude first, implicit modules
+;; next, each program module, as the driver orders them) with the world of types.init and a protocol
+;; STAND-IN for each `defprotocol` (name and parameter count only), and prints the `type` section of
+;; the modules the tool shows, or the errors of the first module that has any, as the tool does.
+;; Forms that are not struct, enum or protocol forms are not looked at, so a program that the Rust
+;; tool rejects for something else (a function, an impl, ...) prints no error here: compare only where
+;; the Rust tool printed the `type` section (compare-lower.py).
+;; usage: corpus-lower [--implicit] FILE   (run from the repository root; one program per process;
+;; --implicit also prints the sections of the prelude and the implicit library modules, as the tool does)
+;; Build: fibc build compiler/tests/types/corpus-lower.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [expand.modules :as mods] [expand.program :as prog] [types.driver :as driver])
+  (:use syntax.pos syntax.form expand.types expand.ctx expand.roots types.error types.table types.decls
+        tests.types.lower-support types.lower.typeform))
+
+(defun expand-all (ctx: ExpandCtx loaded: (Vec Loaded)) -> (Result (Vec Expanded) str)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count loaded))
+        (Ok out)
+        (let ((l (nth loaded i)))
+          (do (mods/begin-spec ctx (. l spec))
+              (match (prog/expand-program (. l forms) ctx (no-runner))
+                ((Err _) (Err "expander error"))
+                ((Ok forms) (do (ctx-end-module ctx)
+                                (recur (+ i 1) (conj out (Expanded (. l spec) forms)))))))))))
+
+;; a stand-in for `(defprotocol Name ..)` / `(defprotocol (Name p ..) ..)`: its name and parameters
+(defun stand-in (g: Globals m: i64 f: Stx) -> unit
+  (let ((items (stx-items f))
+        (head (if (> (count items) 1) (nth items 1) f))
+        (ps (match (. head kind)
+              ((SSym n) (some (Pair n ["self"])))
+              ((SList hs) (if (empty? hs) nil
+                            (match (stx-as-sym (nth hs 0))
+                              ((some n) (some (Pair n (mapv (fn (h: Stx) (unwrap-or (stx-as-sym h) "?")) (vec (drop 1 hs))))))
+                              (nil nil))))
+              (_ nil))))
+    (when-some [p ps]
+      (let ((n (g-names g m))
+            (id (table-add (. g protos) (ProtoDef (. p fst) m (. p snd) [] [] (. f pos)))))
+        (set! (. n protos) (assoc @(. n protos) (. p fst) id))))))
+
+(defun stand-ins (g: Globals m: i64 forms: (Vec Stx)) -> unit
+  (doseq [f forms] (when (= (head-of f) "defprotocol") (stand-in g m f))))
+
+;; the lowering errors of one module's type forms, its stand-in protocols being in
+(defun lower-types (g: Globals m: i64 forms: (Vec Stx)) -> (Vec TypeError)
+  (do (stand-ins g m forms) (lower-module g m forms)))
+
+;; the world of lower-support, with the builtin types `Option a` and `Form` that types.init declares
+;; (their shapes are not needed to resolve a type form) and the protocols of init without a table
+(defun corpus-world () -> Globals
+  (let ((g (world))
+        (n (g-names g module-builtin)))
+    (do (doseq [t [(Pair "Option" ["a"]) (Pair "Form" [])]]
+          (let ((id (table-add (. g types) (TypeDef (. t fst) module-builtin (. t snd) [] (TsStruct []) p0))))
+            (set! (. n types) (assoc @(. n types) (. t fst) id))))
+        g)))
+
+(defun add-all (g: Globals modules: (Vec Expanded)) -> (Result (Vec i64) (Vec TypeError))
+  (loop ((i 0) (ids (map-empty)) (out (vec-empty)))
+    (if (>= i (count modules))
+        (Ok out)
+        (let ((e (nth modules i)))
+          (match (driver/add-linked g (. e spec) ids (. e forms))
+            ((Err errs) (Err errs))
+            ((Ok m) (let ((errs (lower-types g m (. e forms))))
+                      (if (empty? errs)
+                          (recur (+ i 1) (assoc ids (. (. e spec) ns) m) (conj out m))
+                          (Err errs)))))))))
+
+(defun print-lines (lines: (Vec str)) -> unit (doseq [l lines] (println l)))
+
+(defun lower-all (g: Globals file: str loaded: (Vec Loaded) modules: (Vec Expanded) prelude: (Vec Stx)
+                  implicit: bool) -> i64
+  (let ((perrs (lower-types g module-prelude prelude)))
+    (if (not (empty? perrs))
+        (do (print-lines (mapv (fn (e: TypeError) (error-line e file)) perrs)) 1)
+        (match (add-all g modules)
+          ((Err errs) (do (print-lines (mapv (fn (e: TypeError) (error-line e file)) errs)) 1))
+          ((Ok _)
+           (do (when implicit (print-lines (module-lines g module-prelude "lib/prelude.fib")))
+               (doseq [i (range (count loaded))]
+                 (let ((l (nth loaded i)))
+                   (when (or implicit (not (. l implicit))) (print-lines (module-lines g (+ i 2) (. l file))))))
+               0))))))
+
+(defun run-file (file: str implicit: bool) -> i64
+  (do (println (str-concat "== " file))
+      (match (read-file file)
+        (nil (do (println "unreadable") 2))
+        ((some source)
+         (let ((ctx (ctx-new)))
+           (match (driver/prelude-forms ctx)
+             ((Err m) (do (println (str-concat "prelude: " m)) 1))
+             ((Ok prelude)
+              (match (mods/try-load-with source file (roots-default) (mods/implicit-lib))
+                ((Err _) (do (println "load error") 1))
+                ((Ok loaded)
+                 (match (expand-all ctx loaded)
+                   ((Err m) (do (println m) 1))
+                   ((Ok modules)
+                    (lower-all (corpus-world) file loaded modules prelude implicit))))))))))))
+
+(defun main () -> i64
+  (let ((a (args)))
+    (cond ((= (count a) 1) (run-file (nth a 0) false))
+          ((and (= (count a) 2) (= (nth a 0) "--implicit")) (run-file (nth a 1) true))
+          (else (do (println "usage: corpus-lower [--implicit] FILE") 2)))))

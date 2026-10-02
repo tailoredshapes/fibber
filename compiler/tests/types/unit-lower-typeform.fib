@@ -1,0 +1,221 @@
+;; compiler/tests/types/unit-lower-typeform.fib: type forms to annotations (types.lower.typeform).
+;; typeform.rs has no inline test; this is one check per rule of its header and of spec/types.md
+;; §1, the same inputs the Rust tool runs through struct fields (cases lower-cases/ty-*.fib and
+;; err-*.fib, whose messages and columns the expectations below repeat), plus what no struct
+;; field reaches: `Self` allowed, and `proto-ref` itself.
+;; A case is a form and what it makes: a rendering of the TypeAnn (below), or `!COL MESSAGE`, the
+;; resolve error at that column of line 1.
+;; Build: fibc build compiler/tests/types/unit-lower-typeform.fib -I compiler -I lib -o OUT
+(ns main (:use fib.string syntax.pos syntax.form syntax.reader syntax.print types.ty types.error types.ast
+               types.table types.decls types.check types.lower.typeform))
+
+;; ---- the world: builtins 0, prelude 1 (Show, Stack), main 2 (Pa a, Cap k:colour a, Unit0)
+
+(def p0: Pos (Pos "t" 1 1 0 1))
+
+(defun add-type (g: Globals name: str params: (Vec str) colours: (Vec bool)) -> unit
+  (let ((n (g-names g module-main))
+        (id (table-add (. g types) (TypeDef name module-main params colours (TsStruct []) p0))))
+    (set! (. n types) (assoc @(. n types) name id))))
+
+(defun add-proto (g: Globals name: str params: (Vec str)) -> unit
+  (let ((n (g-names g module-prelude))
+        (id (table-add (. g protos) (ProtoDef name module-prelude params [] [] p0))))
+    (set! (. n protos) (assoc @(. n protos) name id))))
+
+(defun world () -> Globals
+  (let ((g (globals-new)))
+    (do (g-add-module g "<builtin>" (Links [] [] []) (map-empty))
+        (g-add-module g "fib.prelude" (Links [] [] []) (map-empty))
+        (g-add-module g "main" (Links [] [] []) (map-empty))
+        (add-proto g "Show" ["a"])
+        (add-proto g "Stack" ["s" "e"])
+        (add-type g "Pa" ["a"] [])
+        (add-type g "Cap" ["k" "a"] [true false])
+        (add-type g "Unit0" [] [])
+        g)))
+
+(defun form-of (src: str) -> Stx
+  (match (read-all src "t")
+    ((Ok fs) (nth fs 0))
+    ((Err _) (trap (str-join ["unreadable " src])))))
+
+;; ---- renderings
+
+(defun colour-text (c: ColourAnn) -> str
+  (match c
+    ((CaFixed k) (match k ((CSend) ":send") ((CLocal) ":local") (_ "?")))
+    ((CaNamed n) (str-join ["~" n]))))
+
+(defun list-text (g: Globals xs: (Vec TypeAnn)) -> str
+  (str-join (mapv (fn (a: TypeAnn) (str-join [" " (ann-text g a)])) xs)))
+
+(defun ann-text (g: Globals a: TypeAnn) -> str
+  (match a
+    ((AVar n) (str-join ["'" n]))
+    ((ASelf) "Self")
+    ((AScalar s) (scalar-name s))
+    ((AStr) "str")
+    ((ABuiltin c x) (str-join ["(" (builtin-name c) " " (ann-text g x) ")"]))
+    ((ANominal id args) (str-join ["(" (. (g-ty g id) name) (list-text g args) ")"]))
+    ((AFn k ps r)
+     (str-join ["(fn" (match k ((some c) (str-join [" " (colour-text c)])) (nil ""))
+                " (" (join " " (mapv (fn (p: TypeAnn) (ann-text g p)) ps)) ") "
+                (ann-text g r) ")"]))
+    ((AColourArg c) (colour-text c))
+    ((ADyn p args send)
+     (str-join ["(dyn " (. (g-proto g p) name) (list-text g args) (if send " :send" "") ")"]))))
+
+(defun builtin-name (c: Con) -> str
+  (match c ((KArray) "Array") ((KCell) "Cell") ((KAtom) "Atom") ((KWeak) "Weak") ((KTask) "Task") (_ "?")))
+
+(defun got-text (g: Globals r: (Result TypeAnn TypeError)) -> str
+  (match r
+    ((Ok a) (ann-text g a))
+    ((Err e) (str-join ["!" (show (. (. e pos) col)) " " (. e message)
+                        (if (= (. e kind) Resolve) "" " [WRONG KIND]")]))))
+
+;; one case: the form, read at line 1 column 1, converted with Self allowed or not
+(defun tc (cs: Checks g: Globals src: str self: bool want: str) -> unit
+  (let ((got (got-text g (type-ann g module-main (form-of src) self))))
+    (if (= got want)
+        (check cs (str-join [src " => " want]) true)
+        (do (check cs src false) (println (str-join ["  want " want]))
+            (println (str-join ["  got  " got]))))))
+
+;; ---- cases
+
+(defun names (cs: Checks g: Globals) -> unit
+  (do (tc cs g "i64" false "i64")
+      (tc cs g "bool" false "bool")
+      (tc cs g "keyword" false "keyword")
+      (tc cs g "ptr" false "ptr")
+      (tc cs g "str" false "str")
+      (tc cs g "Unit0" false "(Unit0)")
+      (tc cs g "Self" true "Self")
+      (tc cs g "Self" false "!1 unknown type Self")
+      (tc cs g "a" false "'a")
+      (tc cs g "q1" false "'q1")
+      (tc cs g "Foo" false "!1 unknown type Foo")
+      (tc cs g "_x" false "!1 unknown type _x")
+      (tc cs g "Pa" false "!1 type Pa takes 1 argument(s)")
+      (tc cs g "Cap" false "!1 type Cap takes 2 argument(s)")
+      (tc cs g "Cell" false "!1 type Cell takes 1 argument")
+      (tc cs g "Weak" false "!1 type Weak takes 1 argument")
+      (tc cs g "5" false "!1 5 is not a type")
+      (tc cs g "()" false "!1 () is not a type")
+      (tc cs g "(1 2)" false "!1 (1 2) is not a type")
+      (tc cs g ":k" false "!1 :k is not a type")
+      (tc cs g "[i64]" false "!1 [i64] is not a type")))
+
+(defun applied (cs: Checks g: Globals) -> unit
+  (do (tc cs g "(Cell i64)" false "(Cell i64)")
+      (tc cs g "(Array (Cell (Atom i64)))" false "(Array (Cell (Atom i64)))")
+      (tc cs g "(Weak a)" false "(Weak 'a)")
+      (tc cs g "(Task Self)" true "(Task Self)")
+      (tc cs g "(Pa i64)" false "(Pa i64)")
+      (tc cs g "(Pa (Pa a))" false "(Pa (Pa 'a))")
+      (tc cs g "(Cell)" false "!1 type Cell takes 1 argument")
+      (tc cs g "(Cell i64 i64)" false "!1 type Cell takes 1 argument")
+      (tc cs g "(Pa i64 i64)" false "!1 type Pa takes 1 argument(s), not 2")
+      (tc cs g "(Pa)" false "!1 type Pa takes 1 argument(s), not 0")
+      (tc cs g "(Unit0 i64)" false "!1 type Unit0 takes 0 argument(s), not 1")
+      (tc cs g "(Foo i64)" false "!1 unknown type Foo")
+      (tc cs g "(5 i64)" false "!1 (5 i64) is not a type")
+      (tc cs g "(Foo Bar)" false "!6 unknown type Bar")
+      (tc cs g "(Pa Foo Bar)" false "!5 unknown type Foo")
+      (tc cs g "(Cell Foo)" false "!7 unknown type Foo")
+      (tc cs g "(Cell (Cell i64) i64)" false "!1 type Cell takes 1 argument")
+      (tc cs g "(Pa Self)" false "!5 unknown type Self")
+      (tc cs g "(Pa Self)" true "(Pa Self)")))
+
+(defun fns (cs: Checks g: Globals) -> unit
+  (do (tc cs g "(fn (a) b)" false "(fn ('a) 'b)")
+      (tc cs g "(fn () unit)" false "(fn () unit)")
+      (tc cs g "(fn (a b) b)" false "(fn ('a 'b) 'b)")
+      (tc cs g "(fn :send (a) b)" false "(fn :send ('a) 'b)")
+      (tc cs g "(fn :local () b)" false "(fn :local () 'b)")
+      (tc cs g "(fn k (a) b)" false "(fn ~k ('a) 'b)")
+      (tc cs g "(fn str (a) b)" false "(fn ~str ('a) 'b)")
+      (tc cs g "(fn ((fn (a) a)) b)" false "(fn ((fn ('a) 'a)) 'b)")
+      (tc cs g "(fn :send ((fn k () a)) b)" false "(fn :send ((fn ~k () 'a)) 'b)")
+      (tc cs g "(fn i64 (a) b)" false "!1 malformed function type (fn i64 (a) b)")
+      (tc cs g "(fn bool (a) b)" false "!1 malformed function type (fn bool (a) b)")
+      (tc cs g "(fn K (a) b)" false "!1 malformed function type (fn K (a) b)")
+      (tc cs g "(fn :other (a) b)" false "!1 malformed function type (fn :other (a) b)")
+      (tc cs g "(fn (i64))" false "!1 malformed function type (fn (i64))")
+      (tc cs g "(fn i64 i64)" false "!1 malformed function type (fn i64 i64)")
+      (tc cs g "(fn (i64) i64 i64)" false "!1 malformed function type (fn (i64) i64 i64)")
+      (tc cs g "(fn :send i64 i64)" false "!1 malformed function type (fn :send i64 i64)")
+      (tc cs g "(fn)" false "!1 malformed function type (fn)")
+      (tc cs g "(fn [i64] i64)" false "!1 malformed function type (fn [i64] i64)")
+      (tc cs g "(fn k [i64] i64)" false "!1 malformed function type (fn k [i64] i64)")
+      (tc cs g "(fn (a Foo) Bar)" false "!8 unknown type Foo")
+      (tc cs g "(fn (a) Bar)" false "!9 unknown type Bar")
+      (tc cs g "(fn (()) a)" false "!6 () is not a type")))
+
+(defun colours (cs: Checks g: Globals) -> unit
+  (do (tc cs g "(Cap :send i64)" false "(Cap :send i64)")
+      (tc cs g "(Cap :local i64)" false "(Cap :local i64)")
+      (tc cs g "(Cap k i64)" false "(Cap ~k i64)")
+      (tc cs g "(Cap k (Cap j a))" false "(Cap ~k (Cap ~j 'a))")
+      (tc cs g "(Cap Foo i64)" false "!6 Foo is not a colour: Cap takes :send, :local or a colour variable there")
+      (tc cs g "(Cap str i64)" false "!6 str is not a colour: Cap takes :send, :local or a colour variable there")
+      (tc cs g "(Cap i64 i64)" false "!6 i64 is not a colour: Cap takes :send, :local or a colour variable there")
+      (tc cs g "(Cap 5 i64)" false "!6 5 is not a colour: Cap takes :send, :local or a colour variable there")
+      (tc cs g "(Cap :other i64)" false "!6 :other is not a colour: Cap takes :send, :local or a colour variable there")
+      (tc cs g "(Cap (k) i64)" false "!6 (k) is not a colour: Cap takes :send, :local or a colour variable there")
+      (tc cs g "(Cap k)" false "!1 type Cap takes 2 argument(s), not 1")
+      (tc cs g "(Cap :send :send)" false "!12 :send is not a type")
+      (tc cs g "(Cell :send)" false "!7 :send is not a type")
+      (tc cs g "(Pa :local)" false "!5 :local is not a type")
+      (tc cs g "(Cap Foo Bar)" false "!6 Foo is not a colour: Cap takes :send, :local or a colour variable there")))
+
+(defun dyns (cs: Checks g: Globals) -> unit
+  (do (tc cs g "(dyn Show)" false "(dyn Show)")
+      (tc cs g "(dyn Show :send)" false "(dyn Show :send)")
+      (tc cs g "(dyn (Stack i64))" false "(dyn Stack i64)")
+      (tc cs g "(dyn (Stack (Array i64)) :send)" false "(dyn Stack (Array i64) :send)")
+      (tc cs g "(dyn)" false "!1 malformed (dyn)")
+      (tc cs g "(dyn Show :local)" false "!1 malformed (dyn Show :local)")
+      (tc cs g "(dyn Show :send :send)" false "!1 malformed (dyn Show :send :send)")
+      (tc cs g "(dyn Foo)" false "!6 unknown protocol Foo")
+      (tc cs g "(dyn Pa)" false "!6 unknown protocol Pa")
+      (tc cs g "(dyn 5)" false "!6 expected a protocol")
+      (tc cs g "(dyn (Show i64))" false "!6 protocol Show has 0 determined parameter(s)")
+      (tc cs g "(dyn (Stack))" false "!6 protocol Stack has 1 determined parameter(s)")
+      (tc cs g "(dyn ((Show)))" false "!6 expected a protocol")
+      (tc cs g "(dyn ())" false "!6 expected a protocol")
+      (tc cs g "(dyn (Stack Foo))" false "!13 unknown type Foo")
+      (tc cs g "(dyn (Stack Self))" false "!13 unknown type Self")
+      (tc cs g "(dyn (Stack Self))" true "(dyn Stack Self)")
+      (tc cs g "(Cell (dyn Show :send))" false "(Cell (dyn Show :send))")))
+
+;; `proto-ref` on its own (a protocol's super, an impl's head): `P` or `(P D..)`
+(defun pr (cs: Checks g: Globals src: str self: bool want: str) -> unit
+  (let ((got (match (proto-ref g module-main (form-of src) self)
+               ((Ok p) (ann-text g (ADyn (. p fst) (. p snd) false)))
+               ((Err e) (str-join ["!" (show (. (. e pos) col)) " " (. e message)])))))
+    (check cs (str-join ["proto-ref " src " => " want]) (= got want))))
+
+(defun proto-refs (cs: Checks g: Globals) -> unit
+  (do (pr cs g "Show" false "(dyn Show)")
+      (pr cs g "(Show)" false "(dyn Show)")
+      (pr cs g "(Stack i64)" false "(dyn Stack i64)")
+      (pr cs g "(Stack Self)" true "(dyn Stack Self)")
+      (pr cs g "(Stack Self)" false "!8 unknown type Self")
+      (pr cs g "Foo" false "!1 unknown protocol Foo")
+      (pr cs g "(Foo i64)" false "!1 unknown protocol Foo")
+      (pr cs g "5" false "!1 expected a protocol")
+      (pr cs g "()" false "!1 expected a protocol")
+      (pr cs g "(5)" false "!1 expected a protocol")
+      (pr cs g "(Show i64)" false "!1 protocol Show has 0 determined parameter(s)")
+      (pr cs g "(Stack)" false "!1 protocol Stack has 1 determined parameter(s)")
+      (pr cs g "(Stack i64 i64)" false "!1 protocol Stack has 1 determined parameter(s)")
+      (pr cs g "(Stack Foo)" false "!8 unknown type Foo")))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (g (world)))
+    (do (names cs g) (applied cs g) (fns cs g) (colours cs g) (dyns cs g) (proto-refs cs g)
+        (finish cs))))

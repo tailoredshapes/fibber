@@ -1,10 +1,20 @@
 ;; compiler/types/lower/decl.fib: struct and enum declarations (package P3).
-;; Replaces crates/fibref/src/types/lower/decl.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/decl.rs (311 lines of Rust).
+;;
+;; `defstruct` and `defenum` (syntax §3.7, §3.9): declaring the names, then resolving the
+;; field types once every type name of the module is known (types §3.5 step 3).
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `RawField<'f>` and `RawType<'f>` hold `Stx` copies, not references (the P1 stubs).
+;; - Rust's `Head` and the `&mut Head` that `struct_fields` extends are a `Head` and a
+;;   `Pair` of the fields and the extended head.
+;; - `g.types.push` and `g.types[id].shape = shape` are `table-add` and `table-set` of the
+;;   rebuilt `TypeDef`; `names_mut(m).values.insert` is `set!` of the `Names` cell.
+;; - an error ends the declaration where it is: what an earlier step added to `Globals`
+;;   (the type, an earlier variant's constructor) stays, as in Rust.
 (ns types.lower.decl
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.annot types.lower.typeform))
 
 ;; Rust `RawField` and `RawType` (lower/decl.rs:17, :23): a declared field
 ;; or variant, its type form still unresolved.
@@ -12,22 +22,208 @@
 (defstruct RawType
   (id: i64 variants: (Option (Vec (Pair str (Vec RawField)))) fields: (Vec RawField)))
 
-;; Rust: lower/decl.rs:32
+(defun resolve-err :private (pos: Pos msg: str) -> (Result a TypeError)
+  (Err (type-error-resolve pos msg)))
+
+;; Binds `name` to `r` in module `m`, unless `m` already binds it.
 (defun define-value (g: Globals m: i64 name: str r: GlobalRef pos: Pos) -> (Result unit TypeError)
-  (trap "todo: define-value"))
+  (let ((n (g-names g m)))
+    (if (contains? @(. n values) name)
+        (resolve-err pos (str-join [name " is already defined"]))
+        (do (set! (. n values) (assoc @(. n values) name r))
+            (Ok ())))))
 
-;; Rust: lower/decl.rs:51
+;; `x:` as `(some "x")`: a symbol of one or more characters and a last `:`.
 (defun annotation-name (form: Stx) -> (Option str)
-  (trap "todo: annotation-name"))
+  (if-some [s (stx-as-sym form)]
+    (let ((bs (str-bytes s))
+          (n (array-len bs)))
+      (if (and (> n 1) (= (array-get bs (- n 1)) 58i8))
+          (some (str-slice s 0 (- n 1)))
+          nil))
+    nil))
 
-;; Rust: lower/decl.rs:130
+;; ---- the head
+
+;; A definition head: its name, parameters, and which parameters are colour parameters
+;; (§1.3).
+(defstruct Head :private (name: str params: (Vec str) colours: (Vec bool)))
+
+(defun bad-head :private (form: Stx) -> (Result a TypeError)
+  (resolve-err (. form pos) "expected Name or (Name tvar+)"))
+
+;; `Name` or `(Name param+)`, `param ::= tvar | tvar :colour` (§1.3).
+(defun parse-head :private (form: Stx) -> (Result Head TypeError)
+  (match (stx-as-sym form)
+    ((some name) (Ok (Head name (vec-empty) (vec-empty))))
+    (nil
+     (let ((items (stx-items form)))
+       (match (if (empty? items) nil (stx-as-sym (nth items 0)))
+         (nil (bad-head form))
+         ((some name) (head-params form name items)))))))
+
+(defun head-params :private (form: Stx name: str items: (Vec Stx)) -> (Result Head TypeError)
+  (loop ((i 1) (params (vec-empty)) (colours (vec-empty)))
+    (if (>= i (count items))
+        (cond ((empty? params) (bad-head form))
+              ((includes? true colours) (Ok (Head name params colours)))
+              (else (Ok (Head name params (vec-empty)))))
+        (let ((f (nth items i)))
+          (cond ((and (stx-kw? f "colour") (= (peek colours) (some false)))
+                 (recur (+ i 1) params (conj (pop colours) true)))
+                ((some? (stx-as-sym f))
+                 (recur (+ i 1) (conj params (unwrap (stx-as-sym f))) (conj colours false)))
+                (else (bad-head form)))))))
+
+;; Declares the type `head` of module `m` (empty shape for now); its id.
+(defun new-type :private (g: Globals m: i64 head: Head pos: Pos) -> (Result i64 TypeError)
+  (let ((name (. head name))
+        (n (g-names g m)))
+    (if (contains? @(. n types) name)
+        (resolve-err pos (str-join ["type " name " is already defined"]))
+        (let ((id (table-add (. g types)
+                             (TypeDef name m (. head params) (. head colours)
+                                      (TsStruct (vec-empty)) pos))))
+          (do (set! (. n types) (assoc @(. n types) name id))
+              (Ok id))))))
+
+;; ---- struct
+
+;; Declares `(defstruct Name (field+))`: the type and its constructor.
 (defun declare-struct (g: Globals m: i64 form: Stx) -> (Result RawType TypeError)
-  (trap "todo: declare-struct"))
+  (let ((items (stx-items form)))
+    (if (= (count items) 3)
+        (try-let ((head (parse-head (nth items 1)))
+                  (decl (struct-decl (nth items 2)))
+                  (sf (struct-fields decl head))
+                  (id (new-type g m (. sf snd) (. form pos)))
+                  (_ (define-value g m (. (. sf snd) name) (GCtor id nil) (. form pos))))
+          (Ok (RawType id nil (. sf fst))))
+        (resolve-err (. form pos) "expected (defstruct Name (field+))"))))
 
-;; Rust: lower/decl.rs:198
+;; The items of the field list, which must be a non-empty list.
+(defun struct-decl :private (decl: Stx) -> (Result (Vec Stx) TypeError)
+  (let ((items (stx-items decl)))
+    (if (empty? items)
+        (resolve-err (. decl pos) "expected a non-empty field list")
+        (Ok items))))
+
+;; `field ::= sym: type | sym`; an unannotated field adds a parameter named after it to
+;; the head's (§3.7). The fields, and the head with them added.
+(defun struct-fields :private (decl: (Vec Stx) head: Head) -> (Result (Pair (Vec RawField) Head) TypeError)
+  (loop ((i 0) (fields (vec-empty)) (params (. head params)) (colours (. head colours)))
+    (if (>= i (count decl))
+        (Ok (Pair fields (Head (. head name) params colours)))
+        (let ((f (nth decl i)))
+          (match (annotation-name f)
+            ((some fname)
+             (if (< (+ i 1) (count decl))
+                 (recur (+ i 2) (conj fields (RawField fname (some (nth decl (+ i 1))))) params colours)
+                 (resolve-err (. f pos) "annotation without a type")))
+            (nil
+             (match (stx-as-sym f)
+               ((some fname)
+                (recur (+ i 1) (conj fields (RawField fname nil)) (conj params fname)
+                       (if (empty? colours) colours (conj colours false))))
+               (nil (resolve-err (. f pos) "a field is sym: type or sym")))))))))
+
+;; ---- enum
+
+;; Declares `(defenum Name variant+)`: the type and its variants.
 (defun declare-enum (g: Globals m: i64 form: Stx) -> (Result RawType TypeError)
-  (trap "todo: declare-enum"))
+  (let ((items (stx-items form)))
+    (if (< (count items) 3)
+        (resolve-err (. form pos) "expected (defenum Name variant+)")
+        (try-let ((head (parse-head (nth items 1)))
+                  (variants (parse-variants (vec (drop 2 items))))
+                  (id (new-type g m head (. form pos)))
+                  (_ (define-variants g m id variants (. form pos))))
+          (Ok (RawType id (some variants) (vec-empty)))))))
 
-;; Rust: lower/decl.rs:262
+(defun parse-variants :private (forms: (Vec Stx)) -> (Result (Vec (Pair str (Vec RawField))) TypeError)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (>= i (count forms))
+        (Ok acc)
+        (match (parse-variant (nth forms i))
+          ((Ok v) (recur (+ i 1) (conj acc v)))
+          ((Err e) (Err e))))))
+
+;; Binds the constructor of each variant, in order, the first clash ending it.
+(defun define-variants :private (g: Globals m: i64 id: i64 variants: (Vec (Pair str (Vec RawField))) pos: Pos)
+    -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (>= i (count variants))
+        (Ok ())
+        (match (define-value g m (. (nth variants i) fst) (GCtor id (some i)) pos)
+          ((Ok _) (recur (+ i 1)))
+          ((Err e) (Err e))))))
+
+;; `variant ::= (Variant) | (Variant field+) | Variant`; a field is `sym: type` or a type,
+;; named by its position.
+(defun parse-variant :private (form: Stx) -> (Result (Pair str (Vec RawField)) TypeError)
+  (match (stx-as-sym form)
+    ((some name) (Ok (Pair name (vec-empty))))
+    (nil
+     (let ((items (stx-items form)))
+       (match (if (empty? items) nil (stx-as-sym (nth items 0)))
+         (nil (resolve-err (. form pos) "a variant is (Variant field*) or Variant"))
+         ((some name) (try-let ((fields (variant-fields items))) (Ok (Pair name fields)))))))))
+
+(defun variant-fields :private (items: (Vec Stx)) -> (Result (Vec RawField) TypeError)
+  (loop ((i 1) (fields (vec-empty)))
+    (if (>= i (count items))
+        (Ok fields)
+        (let ((f (nth items i)))
+          (match (annotation-name f)
+            ((some fname)
+             (if (< (+ i 1) (count items))
+                 (recur (+ i 2) (conj fields (RawField fname (some (nth items (+ i 1))))))
+                 (resolve-err (. f pos) "annotation without a type")))
+            (nil (recur (+ i 1) (conj fields (RawField (show (count fields)) (some f))))))))))
+
+;; ---- shapes
+
+;; Resolves the field types of a declared struct or enum.
 (defun resolve-shape (g: Globals m: i64 raw: RawType) -> (Result unit TypeError)
-  (trap "todo: resolve-shape"))
+  (let ((id (. raw id)))
+    (try-let ((shape (match (. raw variants)
+                       (nil (try-let ((fs (resolve-fields g m id (. raw fields)))) (Ok (TsStruct fs))))
+                       ((some vs) (try-let ((vds (resolve-variants g m id vs))) (Ok (TsEnum vds)))))))
+      (let ((d (g-ty g id)))
+        (do (table-set (. g types) id
+                       (TypeDef (. d name) (. d module) (. d params) (. d colours) shape (. d pos)))
+            (Ok ()))))))
+
+(defun resolve-variants :private (g: Globals m: i64 id: i64 vs: (Vec (Pair str (Vec RawField))))
+    -> (Result (Vec VariantDef) TypeError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count vs))
+        (Ok out)
+        (match (resolve-fields g m id (. (nth vs i) snd))
+          ((Ok fields) (recur (+ i 1) (conj out (VariantDef (. (nth vs i) fst) fields))))
+          ((Err e) (Err e))))))
+
+;; The fields of type `id`: each form resolved and converted with the type's parameters;
+;; an unannotated field has the parameter named after it.
+(defun resolve-fields :private (g: Globals m: i64 id: i64 raw: (Vec RawField))
+    -> (Result (Vec FieldDef) TypeError)
+  (let ((def (g-ty g id))
+        (env (ParamEnv (. def params) (. def colours) (. def name))))
+    (loop ((i 0) (out (vec-empty)))
+      (if (>= i (count raw))
+          (Ok out)
+          (let ((f (nth raw i)))
+            (match (field-ty g m def env f)
+              ((Ok ty) (recur (+ i 1) (conj out (FieldDef (. f name) ty))))
+              ((Err e) (Err e))))))))
+
+(defun field-ty :private (g: Globals m: i64 def: TypeDef env: ParamEnv f: RawField) -> (Result Ty TypeError)
+  (match (. f ty)
+    ((some form)
+     (try-let ((ann (type-ann g m form false)))
+       (ann-to-ty ann env (. form pos))))
+    (nil (Ok (TGen (unwrap-or (find-index (. def params) (. f name)) 0))))))
+
+;; The index of `x` in `xs`.
+(defun find-index :private (xs: (Vec str) x: str) -> (Option i64)
+  (first (filterv (fn (i: i64) (= (nth xs i) x)) (range (count xs)))))

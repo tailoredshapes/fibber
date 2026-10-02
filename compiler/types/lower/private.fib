@@ -1,15 +1,79 @@
 ;; compiler/types/lower/private.fib: :private definitions (package P3).
-;; Replaces crates/fibref/src/types/lower/private.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; Replaces crates/fibref/src/types/lower/private.rs (112 lines of Rust).
+;;
+;; `:private` (syntax §5): the marker after a definition's name, taken off before the
+;; definition is lowered and recorded in the module's names, so that name resolution in
+;; every other module skips it.
+;;
+;; Shapes decided where Rust and fibber differ:
+;; - `marker_index` and the removal of the marker are the expander's (expand.private,
+;;   which Rust's `pub use crate::expand::marker_index` also shares): `marker-index`
+;;   and `take-marker`.
+;; - `names_mut(m).make_private` is `names-make-private` over the module's `Names`.
 (ns types.lower.private
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
+  (:require [expand.private :as ep])
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.names types.lower.typeform types.lower.decl))
 
-;; Rust: lower/private.rs:15
+;; The form with its marker taken off.
+(defun without-marker :private (f: Stx) -> Stx
+  (match (ep/marker-index f)
+    ((some at) (. (ep/take-marker f at) form))
+    (nil f)))
+
+;; The forms with their markers taken off, and the private ones among them (without their
+;; markers).
 (defun strip-private (forms: (Vec Stx)) -> (Pair (Vec Stx) (Vec Stx))
-  (trap "todo: strip-private"))
+  (Pair (mapv without-marker forms)
+        (mapv without-marker (filterv (fn (f: Stx) (some? (ep/marker-index f))) forms))))
 
-;; Rust: lower/private.rs:42
+;; The name a definition head gives: `Name` or `(Name a..)`.
+(defun head-name :private (f: Stx) -> (Option str)
+  (match (stx-as-sym f)
+    ((some s) (some s))
+    (nil (if-some [items (stx-as-list f)]
+           (if (empty? items) nil (stx-as-sym (nth items 0)))
+           nil))))
+
+;; The constructor names of the struct or enum `name` of module `m`.
+(defun ctor-names :private (g: Globals m: i64 name: str) -> (Vec str)
+  (match (get @(. (g-names g m) types) name)
+    (nil (vec-empty))
+    ((some id)
+     (match (. (g-ty g id) shape)
+       ((TsStruct _) [name])
+       ((TsEnum vs) (mapv (fn (v: VariantDef) (. v name)) vs))))))
+
+;; The value names a definition of kind `kind` and name `name` makes private besides its
+;; type or protocol name: a struct's constructor, an enum's variants, a protocol's methods.
+(defun private-values :private (g: Globals m: i64 kind: str name: str) -> (Vec str)
+  (match kind
+    ("defstruct" (ctor-names g m name))
+    ("defenum" (ctor-names g m name))
+    ("defprotocol"
+     (match (get @(. (g-names g m) protos) name)
+       ((some p) (mapv (fn (md: MethodDef) (. md name)) (. (g-proto g p) methods)))
+       (nil (vec-empty))))
+    ("defmacro" (vec-empty))
+    (_ [name])))
+
+;; Records the definitions of `private` (declared in `m`) as private: their names, a
+;; struct's constructor, an enum's variants and a protocol's methods (syntax §5).
 (defun mark-private (g: Globals m: i64 private: (Vec Stx)) -> unit
-  (trap "todo: mark-private"))
+  (doseq [f private]
+    (let ((items (stx-items f))
+          (kind (unwrap-or (if (empty? items) nil (stx-as-sym (nth items 0))) ""))
+          (named (if (> (count items) 1)
+                   (let ((n (nth items 1)))
+                     (match (annotation-name n)
+                       ((some a) (some a))
+                       (nil (head-name n))))
+                   nil)))
+      (when-some [name named]
+        (let ((n (g-names g m)))
+          (do (cond ((or (= kind "defstruct") (= kind "defenum"))
+                     (names-make-private n SpType name))
+                    ((= kind "defprotocol") (names-make-private n SpProto name))
+                    (else ()))
+              (doseq [v (private-values g m kind name)]
+                (names-make-private n SpValue v))))))))
