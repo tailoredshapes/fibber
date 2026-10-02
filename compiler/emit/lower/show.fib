@@ -1,15 +1,90 @@
-;; compiler/emit/lower/show.fib: the native `show` and `hash`. Replaces crates/fibc/src/lower/show.rs.
-;; STATUS: every public function below is a STUB of package E7, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/show.rs, 104 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/show.fib: the native `Show` and `Hash` instances (types §2.12) on scalars, field-less enums and `str`,
+;; computing what the interpreter computes (eval/arith.rs `show`, `hash`); every `show` allocates one fresh `str`.
+;; Replaces crates/fibc/src/lower/show.rs. No or-pattern in the language: the Rust's `I8 | I16 | I32` arm is the last arm of the
+;; scalar matches (it follows every other scalar), commented as such.
 (ns emit.lower.show
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:require [fib.string :as s])
+  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.names emit.ir emit.statics emit.program
+        emit.lower.cx))
+
+;; The call a scalar's `show` is. `x` is the value; an integer narrower than 64 bits is widened first. Rust: show.rs:17
+(defun scalar-show :private (cx: LowerCx sc: Scalar x: V) -> str
+  (let ((xt (v-text x)) (p (. cx p)))
+    (match sc
+      ((SBool) (str-join ["(call @fib.show-bool " xt ")"]))
+      ((SChar) (str-join ["(call @fib.show-char " xt ")"]))
+      ((SI64) (str-join ["(call @fib.show-int " xt ")"]))
+      ((SPtr) (str-join ["(call @fib.show-ptr " xt ")"]))
+      ((SUnit) (str-join ["(call @fib.str-copy " (statics-string (. p statics) "()" 0) ")"]))
+      ((SKeyword) (do (set! (. p keyword-helpers) true)
+                      (str-join ["(call @kw.show " xt ")"])))
+      ((SF32) (str-join ["(call @fib.show-float " xt ")"]))
+      ((SF64) (str-join ["(call @fib.show-double " xt ")"]))
+      ;; SI8, SI16, SI32
+      (_ (let ((w (fb-val (. cx b) (str-join ["(sext i64 " xt ")"]) LirI64)))
+           (str-join ["(call @fib.show-int " (v-text w) ")"]))))))
+
+;; `show` on a field-less enum: a fresh copy of the variant's name. The helper function is made once per enum.
+;; Rust: show.rs:84 enum_show_helper
+(defun enum-show-helper :private (cx: LowerCx id: i64) -> (Result str str)
+  (let ((name (str-join ["show.enum." (str id)])) (p (. cx p)))
+    (if (program-has-helper p name)
+        (Ok name)
+        (match (. (g-ty (program-g p) id) shape)
+          ((TsStruct _) (Err "show of a struct"))
+          ((TsEnum vs)
+           (let ((strs (mapv (fn (v: VariantDef) (statics-string (. p statics) (. v name) 0)) vs))
+                 (idx (vec (range (count vs)))))
+             (do (program-add-helper
+                   p name
+                   (str-join ["(define internal (" name " ptr) ((i32 i))\n  (block entry (switch i bad "
+                              (s/join " " (mapv (fn (i: i64) (str-join ["((i32 " (str i) ") v" (str i) ")"])) idx)) "))\n"
+                              (str-join (mapv (fn (i: i64)
+                                                (str-join ["  (block v" (str i) " (ret (call @fib.str-copy " (nth strs i) ")))\n"]))
+                                              idx))
+                              "  (block bad (unreachable)))\n"]))
+                 (Ok name))))))))
+
+(defun fieldless-enum? :private (g: Globals t: Ty) -> bool
+  (match t
+    ((TCon (KNominal id) _) (typedef-is-fieldless-enum (g-ty g id)))
+    (_ false)))
 
 ;; Rust: lower/show.rs:15 LowerCx::native_show
 (defun lcx-native-show (cx: LowerCx x: V t: Ty) -> (Result V str)
-  (Err "todo: E7 lcx-native-show"))
+  (let ((g (program-g (. cx p))))
+    (try-let ((call (match t
+                      ((TCon (KScalar sc) _) (Ok (scalar-show cx sc x)))
+                      ((TCon (KStr) _) (Ok (str-join ["(call @fib.str-copy " (v-text x) ")"])))
+                      (_ (if (fieldless-enum? g t)
+                             (try-let ((f (match t ((TCon (KNominal id) _) (enum-show-helper cx id)) (_ (Err "show of a non-enum")))))
+                               (Ok (str-join ["(call @" f " " (v-text x) ")"])))
+                             (Err (str-join ["show of " (mangle g t)])))))))
+      (Ok (fb-val (. cx b) call LirPtr)))))
+
+;; The hash of a scalar, as the 64-bit value `conv` makes of `instr`.
+(defun hash-val :private (cx: LowerCx instr: str) -> V
+  (fb-val (. cx b) instr LirI64))
 
 ;; Rust: lower/show.rs:48 LowerCx::native_hash
 (defun lcx-native-hash (cx: LowerCx x: V t: Ty) -> (Result V str)
-  (Err "todo: E7 lcx-native-hash"))
+  (let ((g (program-g (. cx p))) (xt (v-text x)))
+    (match t
+      ((TCon (KScalar sc) _)
+       (match sc
+         ((SI64) (Ok x))
+         ((SBool) (Ok (hash-val cx (str-join ["(zext i64 " xt ")"]))))
+         ((SChar) (Ok (hash-val cx (str-join ["(zext i64 " xt ")"]))))
+         ((SF64) (Ok (hash-val cx (str-join ["(call @fib.double-hash " xt ")"]))))
+         ((SF32) (let ((d (fb-val (. cx b) (str-join ["(fpext double " xt ")"]) LirDouble)))
+                   (Ok (hash-val cx (str-join ["(call @fib.double-hash " (v-text d) ")"])))))
+         ((SPtr) (Ok (hash-val cx (str-join ["(ptrtoint i64 " xt ")"]))))
+         ((SUnit) (Ok (v-int LirI64 0)))
+         ((SKeyword) (do (set! (. (. cx p) keyword-helpers) true)
+                         (Ok (hash-val cx (str-join ["(call @kw.hash " xt ")"])))))
+         ;; SI8, SI16, SI32
+         (_ (Ok (hash-val cx (str-join ["(sext i64 " xt ")"]))))))
+      ((TCon (KStr) _) (Ok (hash-val cx (str-join ["(call @fib.str-hash " xt ")"]))))
+      (_ (if (fieldless-enum? g t)
+             (Ok (hash-val cx (str-join ["(sext i64 " xt ")"])))
+             (Err (str-join ["hash of " (mangle g t)])))))))

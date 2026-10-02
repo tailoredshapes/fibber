@@ -1,19 +1,145 @@
-;; compiler/emit/lower/dynamic.fib: `dyn` values and their dispatch. Replaces crates/fibc/src/lower/dynamic.rs.
-;; STATUS: every public function below is a STUB of package E6, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/dynamic.rs, 191 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/dynamic.fib: `dyn` values and their dispatch (types §4.4, §8.5). Replaces crates/fibc/src/lower/dynamic.rs (191 lines
+;; of Rust). `(dyn P e)` builds the two-word value `{ obj, vtable }`; a method call through it loads the slot and calls indirectly with
+;; `obj` as `self`; a supertrait's method goes through the supertrait's vtable slot. `instance_of_pred` is call.rs's, which is above
+;; this module (call dispatches through `dyn_target`): it is the hub's `instance-of-pred`.
 (ns emit.lower.dynamic
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.scheme types.ast types.decls types.table types.init own.program emit.value emit.names emit.mono emit.ir emit.statics
+        emit.program emit.lower.cx emit.lower.arith))
 
+;; Every supertrait constraint `p` entails, transitively, depth first, each protocol once (§4.1 rule 2).
+;; Rust: lower/dynamic.rs:178 super_closure
+(defun super-closure (g: Globals p: Pred) -> (Vec Pred)
+  (loop ((work [p]) (out []))
+    (match (peek work)
+      ((some (PProto q args))
+       (let ((r (reduce (fn (acc: (Pair (Vec Pred) (Vec Pred)) s: Pred)
+                          (let ((inst (pred-map-tys s (fn (t: Ty) (ty-subst-gen t args [])))))
+                            (if (nil? (find-first (fn (x: Pred) (= x inst)) (. acc fst)))
+                                (Pair (conj (. acc fst) inst) (conj (. acc snd) inst))
+                                acc)))
+                        (Pair out (pop work)) (. (g-proto g q) supers))))
+         (recur (. r snd) (. r fst))))
+      (_ out))))
+
+;; The index in `ms` of the implementation of method `i` of the protocol.
+(defun method-position :private (ms: (Vec ImplMethod) i: i64) -> (Option i64)
+  (loop ((m 0))
+    (if (>= m (count ms))
+        nil
+        (if (= (. (nth ms m) index) i) (some m) (recur (+ m 1))))))
+
+;; The vtable slot of method `i` of `p` at a native instance (types §2.12: `str` under `Hash`, `Show`, `Eq`, `Ord`): a `tailcc` function
+;; of the method's parameters running the native method (`arith`), emitted once. Rust: lower/dynamic.rs:88 native_slot
+(defun native-slot :private (cx: LowerCx p: i64 i: i64 head: Ty) -> (Result str str)
+  (let ((g (program-g (. cx p))))
+    (let ((proto (g-proto g p)))
+      (let ((md (nth (. proto methods) i)))
+        (let ((name (str-join ["m." (proto-qualified g p) "." (. md name) "." (mangle g head)])))
+          (cond
+            (program-has-helper (. cx p) name) (Ok name)
+            (not (= (. (. md scheme) n-vars) 1)) (Err "a native instance of a protocol with determined parameters")
+            true (match (ty-subst-gen (. (. md scheme) ty) [head] [])
+                   ((TFn _ params ret) (native-body cx name proto md params ret))
+                   (_ (Err "a method without a function type")))))))))
+
+;; The signature and the parameter values of a native slot: one lIR parameter `pN` for each parameter that is not `unit`.
+(defun native-params :private (cx: LowerCx params: (Vec Ty)) -> (Result (Pair (Vec LirParam) (Vec V)) str)
+  (try-let ((lirs (try-map (fn (t: Ty) (program-lir (. cx p) t)) params)))
+    (Ok (Pair (vec (keep (fn (j: i64) (match (nth lirs j) ((some l) (some (LirParam l (str-join ["p" (str j)])))) (nil nil)))
+                         (range (count params))))
+              (mapv (fn (j: i64) (match (nth lirs j) ((some l) (VVal (str-join ["p" (str j)]) l)) (nil VUnit)))
+                    (range (count params)))))))
+
+;; The body of a native slot, recorded as a helper: the native method run on the parameters, then returned.
+(defun native-body :private (cx: LowerCx name: str proto: ProtoDef md: MethodDef params: (Vec Ty) ret: Ty) -> (Result str str)
+  (try-let ((sv (native-params cx params)))
+    (let ((w (lcx-sub cx (. cx inst) (body-own-new) name (. sv fst))))
+      (try-let ((rl (program-lir (. cx p) ret))
+                (r (do (set! (. (. w b) ret) rl) (lcx-native-method w (. proto name) (. md name) (. sv snd) params ret))))
+        (match r
+          (nil (Err "a native method that does not return"))
+          ((some v)
+           (do (fb-term (. w b) (match v ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"]))))
+               (program-add-helper (. cx p) name (fb-render (. w b)))
+               (Ok name))))))))
+
+;; The slots of a vtable for `p` at the instance `index`: one for each method of `p`.
+(defun method-slots :private (cx: LowerCx p: i64 index: i64 args: (Vec Ty) head: Ty) -> (Result (Vec str) str)
+  (let ((g (program-g (. cx p))))
+    (let ((inst (table-get (. g instances) index)) (n (count (. (g-proto g p) methods))))
+      (loop ((i 0) (slots []))
+        (if (< i n)
+            (try-let ((f (if (empty? (. inst methods))
+                             (native-slot cx p i head)
+                             (match (method-position (. inst methods) i)
+                               (nil (Err "an instance missing a method"))
+                               ((some m) (Ok (program-request (. cx p) (BodyMethod index m) args)))))))
+              (recur (+ i 1) (conj slots (str-join ["@" f]))))
+            (Ok slots))))))
+
+;; The vtables of the supertraits in `sups`, as slots, in order; a predicate that is not a protocol has none.
+(defun super-slots :private (cx: LowerCx sups: (Vec Pred) head: Ty) -> (Result (Vec str) str)
+  (loop ((i 0) (slots []))
+    (if (< i (count sups))
+        (match (nth sups i)
+          ((PProto q _) (try-let ((s (vtable-for cx q head))) (recur (+ i 1) (conj slots s))))
+          (_ (recur (+ i 1) slots)))
+        (Ok slots))))
+
+;; The vtable global of `(p, head)`: one slot per method of `p`, then one per supertrait in the order of the transitive closure.
+;; Rust: lower/dynamic.rs:44 vtable_for
+(defun vtable-for :private (cx: LowerCx p: i64 head: Ty) -> (Result str str)
+  (let ((g (program-g (. cx p))) (st (. (. cx p) statics)))
+    (let ((name (str-join [(proto-qualified g p) ".vt." (mangle g head)])))
+      (if (statics-has-vtable st name)
+          (Ok (statics-vtable st name []))
+          (let ((pred (PProto p [head])))
+            (try-let ((r ((. (. cx hub) instance-of-pred) cx pred)))
+              (try-let ((slots (method-slots cx p (. r fst) (. r snd) head))
+                        (sups (super-slots cx (super-closure g pred) head)))
+                (Ok (statics-vtable st name (into slots sups))))))))))
+
+;; Supertrait `q`'s vtable, loaded from a `(dyn p)` value. Rust: lower/dynamic.rs:120 super_vtable
+(defun super-vtable :private (cx: LowerCx v: V p: i64 q: i64) -> (Result V str)
+  (let ((g (program-g (. cx p))))
+    (let ((n (count (. (g-proto g p) methods)))
+          (sups (super-closure g (PProto p [(ty-unit)]))))
+      (let ((pos (loop ((k 0))
+                   (if (< k (count sups))
+                       (match (nth sups k)
+                         ((PProto r _) (if (= r q) (some k) (recur (+ k 1))))
+                         (_ (recur (+ k 1))))
+                       nil))))
+        (match pos
+          (nil (Err (str-join [(. (g-proto g q) name) " is not a supertrait of " (. (g-proto g p) name)])))
+          ((some k)
+           (let ((vt (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " 1)"]) LirPtr)))
+             (let ((slot (fb-val (. cx b) (str-join ["(getelementptr ptr " (v-text vt) " (i64 " (str (+ n k)) "))"]) LirPtr)))
+               (Ok (lcx-load cx LirPtr (v-text slot)))))))))))
+
+;; `(dyn P e)`: the value with the vtable of `(P, head type of e)`, or an upcast of a `dyn` value through its supertrait slot.
 ;; Rust: lower/dynamic.rs:19 LowerCx::dyn_of
 (defun lcx-dyn-of (cx: LowerCx p: i64 b: Expr) -> (Result V str)
-  (Err "todo: E6 lcx-dyn-of"))
+  (try-let ((v (lcx-value cx b)) (t (lcx-ty cx b)))
+    (match t
+      ((TCon (KDyn q _) _)
+       (if (= q p)
+           (Ok v)
+           (let ((obj (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " 0)"]) LirPtr)))
+             (try-let ((vt (super-vtable cx v q p)))
+               (Ok (fb-val (. cx b) (str-join ["{ " (v-text obj) " " (v-text vt) " }"]) LirDyn))))))
+      (_ (try-let ((vt (vtable-for cx p t)))
+           (Ok (fb-val (. cx b) (str-join ["{ " (v-text v) " " vt " }"]) LirDyn)))))))
 
-;; Rust: lower/dynamic.rs:150 LowerCx::dyn_target
+;; The target of method `i` of protocol `q` called on the `dyn` receiver `recv` of type `t`. Rust: lower/dynamic.rs:150 LowerCx::dyn_target
 (defun lcx-dyn-target (cx: LowerCx recv: V t: Ty q: i64 i: i64) -> (Result Target str)
-  (Err "todo: E6 lcx-dyn-target"))
-
-;; Rust: lower/dynamic.rs:178
-(defun super-closure (g: Globals p: Pred) -> (Vec Pred)
-  (trap "todo: E6 super-closure"))
+  (match t
+    ((TCon (KDyn p _) _)
+     (let ((obj (fb-val (. cx b) (str-join ["(extractvalue " (v-text recv) " 0)"]) LirPtr)))
+       (try-let ((vt (if (= p q)
+                         (Ok (fb-val (. cx b) (str-join ["(extractvalue " (v-text recv) " 1)"]) LirPtr))
+                         (super-vtable cx recv p q))))
+         (let ((slot (fb-val (. cx b) (str-join ["(getelementptr ptr " (v-text vt) " (i64 " (str i) "))"]) LirPtr)))
+           (let ((code (lcx-load cx LirPtr (v-text slot))))
+             (Ok (TgCode (v-text code) (v-text obj))))))))
+    (_ (Err "a dyn call on a non-dyn receiver"))))

@@ -1,39 +1,237 @@
-;; compiler/emit/lower/cells.fib: cells and atoms: deref, reset, swap, set, unique write. Replaces crates/fibc/src/lower/cells.rs.
-;; STATUS: every public function below is a STUB of package E6, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/cells.rs, 376 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/cells.fib: cells and atoms: deref, reset, swap, set, unique write (types §8.6). Replaces
+;; crates/fibc/src/lower/cells.rs (376 lines of Rust). What it needs from above (`cell_load`, `emit_call`, `join_value`) it calls through
+;; the hub (emit.lower.cx): `arith` calls `deref_val` and `call` calls `cell_load`, so this module is below both. The statement order
+;; is Rust's: a `gep` before the access it feeds, an operand's retain before the call it is passed to.
 (ns emit.lower.cells
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.objects emit.program
+        emit.lower.cx emit.lower.ops emit.lower.objects))
 
-;; Rust: lower/cells.rs:25 LowerCx::deref_place
+;; The content of a cell, atom, weak reference or task type; `nil` for any other type.
+(defun content-of :private (t: Ty) -> (Option Ty)
+  (match t
+    ((TCon (KCell) args) (first args))
+    ((TCon (KAtom) args) (first args))
+    ((TCon (KWeak) args) (first args))
+    ((TCon (KTask) args) (first args))
+    (_ nil)))
+
+;; The cell (or atom) a place names and its type. Rust: lower/cells.rs:14 place
+(defun place :private (cx: LowerCx pl: Place) -> (Result (Pair V Ty) str)
+  (match pl
+    ((PlAmp b) (try-let ((v (lcx-local cx b)) (t (lcx-binding-ty cx b))) (Ok (Pair v t))))
+    ((PlExpr e) (try-let ((v (lcx-value cx e)) (t (lcx-ty cx e))) (Ok (Pair v t))))))
+
+;; The content of a cell, `(call @fib.lock ..)` and `unlock` around the load of an atom's, retained (§8.6, never elided).
+(defun cell-load :private (cx: LowerCx sname: str cell: str ty: Ty) -> (Result V str)
+  ((. (. cx hub) cell-load) cx sname cell ty))
+
+;; `@p`: the content, retained (§8.6, never elided). Rust: lower/cells.rs:25 LowerCx::deref_place
 (defun lcx-deref-place (cx: LowerCx pl: Place) -> (Result V str)
-  (Err "todo: E6 lcx-deref-place"))
+  (try-let ((r (place cx pl)))
+    (lcx-deref-val cx (. r fst) (. r snd))))
+
+;; An atom's content under the lock: lock, load, retain, unlock: one atomic step (§8.6).
+(defun atom-deref :private (cx: LowerCx c: V sname: str content: Ty) -> (Result V str)
+  (let ((lockp (lcx-gep cx sname (v-text c) slot-atom-lock)))
+    (do (fb-stmt (. cx b) (str-join ["(call @fib.lock " lockp ")"]))
+        (let ((vp (lcx-gep cx sname (v-text c) slot-atom-value)))
+          (try-let ((l (program-lir (. cx p) content)))
+            (let ((v (match l ((some lt) (lcx-load cx lt vp)) (nil VUnit))))
+              (do (lcx-retain cx v)
+                  (fb-stmt (. cx b) (str-join ["(call @fib.unlock " lockp ")"]))
+                  (Ok v))))))))
 
 ;; Rust: lower/cells.rs:30 LowerCx::deref_val
 (defun lcx-deref-val (cx: LowerCx c: V t: Ty) -> (Result V str)
-  (Err "todo: E6 lcx-deref-val"))
+  (match (content-of t)
+    (nil (Err "deref of a non-cell"))
+    ((some content)
+     (match t
+       ((TCon (KTask) _) ((. (. cx hub) join-value) cx c content))
+       ((TCon (KWeak) _) (upgrade cx c content))
+       (_ (try-let ((o (lcx-object-of cx t)))
+            (match t
+              ((TCon (KAtom) _) (atom-deref cx c (. o sname) content))
+              (_ (try-let ((v (cell-load cx (. o sname) (v-text c) content)))
+                   (do (lcx-retain cx v)
+                       (Ok v)))))))))))
 
+;; A heap enum `Option` object with `tag` and, for `some`, its consumed payload. Rust: lower/cells.rs:98 option_object
+(defun option-object :private (cx: LowerCx tid: i64 sname: str size: i64 tag: i64 payload: (Option V)) -> str
+  (let ((p (lcx-heap-alloc cx tid size)) (vs (str-join [sname ".v" (str tag)])))
+    (do (fb-stmt (. cx b) (str-join ["(store (i32 " (str tag) ") " (lcx-gep cx vs p slot-enum-tag) ")"]))
+        (when-some [v payload] (lcx-store cx v (lcx-gep cx vs p slot-variant-field0)))
+        p)))
+
+;; `@w` on a weak box of a `dyn` target: the value is `{ box, vt }` and the result a heap enum, `(some { t, vt })` or the tag `nil`
+;; (§8.1), allocated as the interpreter allocates it.
+(defun upgrade-dyn :private (cx: LowerCx w: V target: Ty) -> (Result V str)
+  (if (not (= (v-ty w) (some LirDyn)))
+      (Err "a weak reference to an Option")
+      (let ((b (. cx b)) (g (program-g (. cx p))))
+        (try-let ((o (lcx-object-of cx (ty-nominal @(. g option) [target]))))
+          (let ((bx (fb-val b (str-join ["(extractvalue " (v-text w) " 0)"]) LirPtr))
+                (vt (fb-val b (str-join ["(extractvalue " (v-text w) " 1)"]) LirPtr)))
+            (let ((t (fb-val b (str-join ["(call @fib.upgrade " (v-text bx) ")"]) LirPtr)))
+              (let ((gone (fb-val b (str-join ["(icmp eq " (v-text t) " (ptr null))"]) LirI1))
+                    (lnil (fb-label b "wnil")) (lsome (fb-label b "wsome")) (ljoin (fb-label b "wup")))
+                (do (fb-term b (str-join ["(br " (v-text gone) " " lnil " " lsome ")"]))
+                    (fb-open b lnil)
+                    (let ((pn (option-object cx (. o tid) (. o sname) (. o size) 0 nil)))
+                      (do (fb-term b (str-join ["(br " ljoin ")"]))
+                          (fb-open b lsome)
+                          (let ((d (fb-val b (str-join ["{ " (v-text t) " " (v-text vt) " }"]) LirDyn)))
+                            (let ((ps (option-object cx (. o tid) (. o sname) (. o size) 1 (some d))))
+                              (do (fb-term b (str-join ["(br " ljoin ")"]))
+                                  (fb-open b ljoin)
+                                  (Ok (fb-phi b LirPtr [(PhiEdge lnil pn) (PhiEdge lsome ps)])))))))))))))))
+
+;; `@w` on a weak box: the target retained if alive, else `nil` (§8.7). Rust: lower/cells.rs:62 upgrade
+(defun upgrade :private (cx: LowerCx w: V target: Ty) -> (Result V str)
+  (try-let ((rep (option-rep (program-g (. cx p)) target)))
+    (match rep
+      ((OptNull) (Ok (fb-val (. cx b) (str-join ["(call @fib.upgrade " (v-text w) ")"]) LirPtr)))
+      ((OptBoxed) (upgrade-dyn cx w target)))))
+
+;; `(reset! a v)`: the consumed value share-marked if the atom is, stored under the lock, the old value released (§8.6).
 ;; Rust: lower/cells.rs:133 LowerCx::reset
 (defun lcx-reset (cx: LowerCx a: V t: Ty v: V) -> (Result V str)
-  (Err "todo: E6 lcx-reset"))
+  (match t
+    ((TCon (KAtom) args)
+     (try-let ((o (lcx-object-of cx t)))
+       (do (when-some [w (lcx-obj-word cx v)]
+             (fb-stmt (. cx b) (str-join ["(call @fib.share-into " (v-text a) " " w ")"])))
+           (let ((lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)))
+             (do (fb-stmt (. cx b) (str-join ["(call @fib.lock " lockp ")"]))
+                 (let ((vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value)))
+                   (try-let ((l (program-lir (. cx p) (nth args 0))))
+                     (let ((old (match l ((some lt) (lcx-load cx lt vp)) (nil VUnit))))
+                       (do (lcx-store cx v vp)
+                           (fb-stmt (. cx b) (str-join ["(call @fib.unlock " lockp ")"]))
+                           (lcx-release cx old)
+                           (Ok VUnit))))))))))
+    (_ (Err "reset! on a non-atom"))))
 
-;; Rust: lower/cells.rs:159 LowerCx::swap
+;; Whether two values of one type are the same word (an object's address, a scalar's bits). Rust: lower/cells.rs:213 same_bits
+(defun same-bits :private (cx: LowerCx x: V y: V) -> V
+  (let ((b (. cx b)) (a (v-text x)) (c (v-text y)))
+    (let ((cast (fn (ty: str)
+                  (let ((ia (fb-val b (str-join ["(bitcast " ty " " a ")"]) (if (= ty "i32") LirI32 LirI64)))
+                        (ib (fb-val b (str-join ["(bitcast " ty " " c ")"]) (if (= ty "i32") LirI32 LirI64))))
+                    (fb-val b (str-join ["(icmp eq " (v-text ia) " " (v-text ib) ")"]) LirI1)))))
+      (match (v-ty x)
+        ((some (LirFloat)) (cast "i32"))
+        ((some (LirDouble)) (cast "i64"))
+        ((some (LirDyn))
+         (let ((oa (fb-val b (str-join ["(extractvalue " a " 0)"]) LirPtr)) (ob (fb-val b (str-join ["(extractvalue " c " 0)"]) LirPtr)))
+           (fb-val b (str-join ["(icmp eq " (v-text oa) " " (v-text ob) ")"]) LirI1)))
+        (_ (fb-val b (str-join ["(icmp eq " a " " c ")"]) LirI1))))))
+
+;; The stores of a swap that found the atom unchanged: the new value share-marked and stored under the lock, the snapshot released twice.
+(defun swap-store :private (cx: LowerCx a: V lockp: str vp: str old: V new: V) -> unit
+  (do (when-some [w (lcx-obj-word cx new)]
+        (fb-stmt (. cx b) (str-join ["(call @fib.share-into " (v-text a) " " w ")"])))
+      (lcx-store cx new vp)
+      (lcx-retain cx new)
+      (fb-stmt (. cx b) (str-join ["(call @fib.unlock " lockp ")"]))
+      (lcx-release cx old)
+      (lcx-release cx old)))
+
+;; `(swap! a f)` (§8.6, as the interpreter runs it): snapshot the value, call `f` on it with the counts a call through a value takes,
+;; store the result if the atom is unchanged, else retry. Rust: lower/cells.rs:159 LowerCx::swap
 (defun lcx-swap (cx: LowerCx a: V t: Ty f: V) -> (Result V str)
-  (Err "todo: E6 lcx-swap"))
+  (match t
+    ((TCon (KAtom) args)
+     (let ((content (nth args 0)) (b (. cx b)))
+       (try-let ((o (lcx-object-of cx t)) (lt (program-lir (. cx p) content)))
+         (match lt
+           (nil (Err "swap! on an atom of unit"))
+           ((some l)
+            (let ((lockp (lcx-gep cx (. o sname) (v-text a) slot-atom-lock)) (vp (lcx-gep cx (. o sname) (v-text a) slot-atom-value))
+                  (head (fb-label b "swap")) (done (fb-label b "swapped")))
+              (do (fb-term b (str-join ["(br " head ")"]))
+                  (fb-open b head)
+                  (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
+                  (let ((old (lcx-load cx l vp)))
+                    (do (lcx-retain cx old)
+                        (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+                        (lcx-retain cx old)
+                        (lcx-retain cx f)
+                        (try-let ((new ((. (. cx hub) emit-call) cx (TgValue f) [old] content false)))
+                          (do (fb-stmt b (str-join ["(call @fib.lock " lockp ")"]))
+                              (let ((cur (lcx-load cx l vp)))
+                                (let ((same (same-bits cx cur old)) (lyes (fb-label b "unchanged")) (lno (fb-label b "changed")))
+                                  (do (fb-term b (str-join ["(br " (v-text same) " " lyes " " lno ")"]))
+                                      (fb-open b lyes)
+                                      (swap-store cx a lockp vp old new)
+                                      (fb-term b (str-join ["(br " done ")"]))
+                                      (fb-open b lno)
+                                      (fb-stmt b (str-join ["(call @fib.unlock " lockp ")"]))
+                                      (lcx-release cx old)
+                                      (lcx-release cx new)
+                                      (fb-term b (str-join ["(br " head ")"]))
+                                      (fb-open b done)
+                                      (Ok new)))))))))))))))
+    (_ (Err "swap! on a non-atom"))))
 
-;; Rust: lower/cells.rs:236 LowerCx::set_place
+;; `(set! p v)`: the value consumed (its retain is in the plan), stored, the old content released. Rust: lower/cells.rs:236 LowerCx::set_place
 (defun lcx-set-place (cx: LowerCx pl: Place v: Expr) -> (Result V str)
-  (Err "todo: E6 lcx-set-place"))
+  (try-let ((r (place cx pl)) (new (lcx-value cx v)))
+    (match (. r snd)
+      ((TCon (KCell) args)
+       (try-let ((o (lcx-object-of cx (. r snd))) (old (cell-load cx (. o sname) (v-text (. r fst)) (nth args 0))))
+         (do (lcx-store cx new (lcx-gep cx (. o sname) (v-text (. r fst)) slot-cell-value))
+             (lcx-release cx old)
+             (Ok VUnit))))
+      ((TCon (KAtom) _) (Err "atoms"))
+      (_ (Err "set! of a non-cell")))))
 
-;; Rust: lower/cells.rs:254 LowerCx::new_slot
+;; `(cell e)` or `(atom e)`: the slot object holding the consumed value. Rust: lower/cells.rs:254 LowerCx::new_slot
 (defun lcx-new-slot (cx: LowerCx e: Expr v: V atom: bool) -> (Result V str)
-  (Err "todo: E6 lcx-new-slot"))
+  (try-let ((t (lcx-ty cx e)) (o (lcx-object-of cx t)) (p (lcx-alloc-at cx (. e id) (. o tid) (. o sname) (. o size))))
+    (let ((field (if atom
+                     (do (fb-stmt (. cx b) (str-join ["(store (i32 0) " (lcx-gep cx (. o sname) p slot-cell-value) ")"]))
+                         (lcx-gep cx (. o sname) p slot-atom-value))
+                     (lcx-gep cx (. o sname) p slot-cell-value))))
+      (do (lcx-store cx v field)
+          (Ok (VVal p LirPtr))))))
 
+;; `(set-field! &s f v)`: a unique write when `fib.unique?` holds, else a changed copy stored into the cell (§8.3, §6.6).
 ;; Rust: lower/cells.rs:272 LowerCx::set_field
 (defun lcx-set-field (cx: LowerCx b: i64 f: str v: Expr) -> (Result V str)
-  (Err "todo: E6 lcx-set-field"))
+  (try-let ((cell (lcx-local cx b)) (cell-ty (lcx-binding-ty cx b)) (x (lcx-value cx v)))
+    (match cell-ty
+      ((TCon (KCell) cargs)
+       (let ((st (nth cargs 0)))
+         (try-let ((at (field-at cx st "set-field!" f)) (co (lcx-object-of cx cell-ty)) (so (lcx-object-of cx st)))
+           (try-let ((content (cell-load cx (. co sname) (v-text cell) st)))
+             (lcx-unique-write cx (. co sname) (v-text cell) content (. so sname) (. so tid) (. so size) (. at slot) x
+                               (nth (. at tys) (. at index)))))))
+      (_ (Err "set-field! on a non-cell")))))
 
-;; Rust: lower/cells.rs:320 LowerCx::unique_write
+;; The unique-write protocol shared by `set-field!` and `array-set!` on a fixed-layout object: in place when unique, else copy, write,
+;; store the copy, release the old. Rust: lower/cells.rs:320 LowerCx::unique_write
 (defun lcx-unique-write (cx: LowerCx cell-s: str cell: str content: V sname: str tid: i64 size: i64 slot: i64 x: V elem-ty: Ty) -> (Result V str)
-  (Err "todo: E6 lcx-unique-write"))
+  (let ((b (. cx b)))
+    (let ((unique (fb-val b (str-join ["(call @fib.unique? " (v-text content) ")"]) LirI1))
+          (li (fb-label b "inplace")) (lc (fb-label b "copy")) (lj (fb-label b "written")))
+      (do (fb-term b (str-join ["(br " (v-text unique) " " li " " lc ")"]))
+          (fb-open b li)
+          (try-let ((elt (program-lir (. cx p) elem-ty)))
+            (let ((field (lcx-gep cx sname (v-text content) slot)))
+              (do (when-some [t elt]
+                    (let ((old (lcx-load cx t field)))
+                      (do (lcx-store cx x field) (lcx-release cx old))))
+                  (fb-term b (str-join ["(br " lj ")"]))
+                  (fb-open b lc)
+                  (let ((copy (fb-val b (str-join ["(call @fib.copy-object " (v-text content) " (i64 " (str size) ") (i32 " (str tid) "))"]) LirPtr)))
+                    (do (fb-stmt b (str-join ["(call @trace." (str tid) " " (v-text copy) " @fib.retain)"]))
+                        (let ((cfield (lcx-gep cx sname (v-text copy) slot)))
+                          (do (when-some [t elt]
+                                (let ((old (lcx-load cx t cfield)))
+                                  (do (lcx-store cx x cfield) (lcx-release cx old))))
+                              (lcx-store cx copy (lcx-gep cx cell-s cell slot-cell-value))
+                              (lcx-release cx content)
+                              (fb-term b (str-join ["(br " lj ")"]))
+                              (fb-open b lj)
+                              (Ok VUnit))))))))))))

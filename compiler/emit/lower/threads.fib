@@ -1,31 +1,226 @@
-;; compiler/emit/lower/threads.fib: async and threads: spawn, `async` bodies, await, join. Replaces crates/fibc/src/lower/threads.rs; `AsyncFrame` is in emit.lower.cx.
-;; STATUS: every public function below is a STUB of package E9, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/threads.rs, 368 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/threads.fib: async and threads: spawn, `async` bodies, await, join. Replaces crates/fibc/src/lower/threads.rs (368 lines
+;; of Rust); `AsyncFrame` is in emit.lower.cx. `await_task` replaces the frame's record in its Cell (`states` is a plain Vec); the
+;; frame's state machine is built by emit.resume, called from emit.lower.mod's `emit-async`, which also calls `lcx-complete-helper`.
+;; The text of every instruction is the Rust's, byte for byte (the completion functions are written out as the Rust writes them).
 (ns emit.lower.threads
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.ast types.init own.program emit.value emit.names emit.ir emit.objects emit.program emit.lower.cx emit.lower.ops
+        emit.lower.objects))
 
-;; Rust: lower/threads.rs:33 LowerCx::spawn
+;; The result type `a` of a `(Task a)`, or the error `what`.
+(defun task-arg :private (t: Ty what: str) -> (Result Ty str)
+  (match t
+    ((TCon (KTask) args) (Ok (nth args 0)))
+    (_ (Err what))))
+
+;; The zero of a result slot: a null pointer, a zeroed `dyn`, `0.0` or `0`.
+(defun zero-text :private (l: LirTy) -> str
+  (match l
+    ((LirPtr) "(ptr null)")
+    ((LirRaw) "(ptr null)")
+    ((LirDyn) "(zeroinitializer { ptr ptr })")
+    ((LirFloat) "(float 0.0)")
+    ((LirDouble) "(double 0.0)")
+    (_ (str-join ["(" (lir-ty-text l) " 0)"]))))
+
+;; `(store v field-i-of-p)`: the field's address first (it takes a name), then the store.
+(defun store-at :private (cx: LowerCx sname: str p: str i: i64 v: str) -> unit
+  (let ((q (lcx-gep cx sname p i)))
+    (fb-stmt (. cx b) (str-join ["(store " v " " q ")"]))))
+
+;; `(call @fib.alloc size (i32 tid))`
+(defun alloc-text :private (size: str tid: i64) -> str
+  (str-join ["(call @fib.alloc " size " (i32 " (str tid) "))"]))
+
+;; The `(i64 size)` text of an object type's fixed size.
+(defun size-text :private (cx: LowerCx tid: i64) -> str
+  (str-join ["(i64 " (str (obj-size (objects-get (. (. cx p) objects) tid))) ")"]))
+
+;; A fresh result atom of `result-ty`, its lock and slot zeroed. Rust: lower/threads.rs:97 LowerCx::result_atom
+(defun result-atom :private (cx: LowerCx result-ty: Ty) -> (Result V str)
+  (try-let ((obj (program-object (. cx p) (TCon KAtom [result-ty]))))
+    (let ((atid (. obj fst))
+          (asname (. obj snd))
+          (atom (fb-val (. cx b) (alloc-text (size-text cx atid) atid) LirPtr)))
+      (do (store-at cx asname (v-text atom) slot-atom-lock "(i32 0)")
+          (let ((vp (lcx-gep cx asname (v-text atom) slot-atom-value)))
+            (try-let ((l (program-lir (. cx p) result-ty)))
+              (do (when-some (t l) (fb-stmt (. cx b) (str-join ["(store " (zero-text t) " " vp ")"])))
+                  (Ok atom))))))))
+
+;; The fields of a task that `spawn` fills: running, its driver held by the thread, no resume function, no waiters, the result
+;; atom and the closure.
+(defun init-spawned :private (cx: LowerCx tsname: str task: V atom: V f: V) -> unit
+  (let ((t (v-text task)))
+    (do (doseq [k (range 3)]
+          (store-at cx tsname t (+ slot-task-state k) (nth ["(i32 1)" "(i32 1)" "(i32 0)"] k)))
+        (doseq [i [(+ slot-task-state 3) (+ slot-task-result 1)]]
+          (store-at cx tsname t i "(ptr null)"))
+        (lcx-store cx atom (lcx-gep cx tsname t slot-task-result))
+        (lcx-store cx f (lcx-gep cx tsname t slot-task-closure)))))
+
+;; `(spawn f)`: the task handle. Share-marks the closure, makes the result atom and the task (count 2: the handle and the thread),
+;; and hands both to a new OS thread whose entry calls the closure, publishes the result and releases the task. Rust: lower/threads.rs:33
 (defun lcx-spawn (cx: LowerCx e: Expr f: V) -> (Result V str)
-  (Err "todo: E9 lcx-spawn"))
+  (try-let ((task-ty (lcx-ty cx e)) (result-ty (task-arg task-ty "spawn without a Task type")))
+    (do (fb-stmt (. cx b) (str-join ["(call @fib.share " (v-text f) ")"]))
+        (try-let ((atom (result-atom cx result-ty)) (obj (program-object (. cx p) task-ty)))
+          (let ((ttid (. obj fst))
+                (tsname (. obj snd))
+                (task (fb-val (. cx b) (alloc-text (size-text cx ttid) ttid) LirPtr)))
+            (do (fb-stmt (. cx b) (str-join ["(call @fib.retain " (v-text task) ")"]))
+                (init-spawned cx tsname task atom f)
+                ;; The task and its result atom cross to the new thread: SHARED before the handoff (§8.8).
+                (fb-stmt (. cx b) (str-join ["(call @fib.share " (v-text task) ")"]))
+                (try-let ((entry (thread-entry cx result-ty tsname)))
+                  (do (fb-stmt (. cx b) (str-join ["(call @fib.spawn " (v-text task) " @" entry ")"]))
+                      (Ok task)))))))))
 
-;; Rust: lower/threads.rs:124 LowerCx::make_async
+;; The captures of an `async` literal as values, each retained when the plan says so.
+(defun capture-values :private (cx: LowerCx own: ClosureOwn) -> (Result (Vec V) str)
+  (try-map (fn (c: CaptureOwn)
+             (try-let ((v (lcx-local cx (. c binding))))
+               (do (when (= (. c pass) PsRetain) (lcx-retain cx v))
+                   (Ok v))))
+           (. own captures)))
+
+;; `(async body)`: a pending task holding the body's captures (retained), its resume point 0 and its resume function, the body's
+;; state machine (emit.resume); run when joined or awaited (syntax §3.12, types §8.8). Rust: lower/threads.rs:124
 (defun lcx-make-async (cx: LowerCx e: Expr) -> (Result V str)
-  (Err "todo: E9 lcx-make-async"))
+  (match (get (. (. cx own) closures) (. e id))
+    (nil (Err "no plan for an async literal"))
+    ((some own)
+     (try-let ((task-ty (lcx-ty cx e)) (result-ty (task-arg task-ty "async without a Task type"))
+               (caps (lcx-capture-tys cx own)))
+       (let ((code (program-request-closure (. cx p) (. cx inst) (. cx name) (. e id)))
+             (obj (program-task-object (. cx p) code caps))
+             (ttid (. obj fst))
+             (tsname (. obj snd)))
+         (try-let ((vals (capture-values cx own)) (atom (result-atom cx result-ty)))
+           ;; The frame's size is the type table's: the body's slots are known only once it is lowered.
+           (let ((task (fb-val (. cx b) (alloc-text (str-join ["(call @fib.size-of (i32 " (str ttid) "))"]) ttid) LirPtr))
+                 (t (v-text task)))
+             (do (doseq [k (range 3)] (store-at cx tsname t (+ slot-task-state k) "(i32 0)"))
+                 (doseq [i [(+ slot-task-result 1) slot-task-closure]] (store-at cx tsname t i "(ptr null)"))
+                 (lcx-store cx atom (lcx-gep cx tsname t slot-task-result))
+                 (store-at cx tsname t slot-task-resume (str-join ["@" code]))
+                 (lcx-store-fields cx tsname t slot-task-capture0 vals)
+                 (store-at cx tsname t (+ slot-task-capture0 (count caps)) "(i32 0)")
+                 (Ok task)))))))))
 
-;; Rust: lower/threads.rs:184 LowerCx::await_task
+;; `(await e)` in an `async` body (§8.8): the next state's point is stored, then `fib.await-or-park` either finds `e` done or
+;; registers this task as its waiter, in which case the resume returns here and continues, in a later resume, at the state's block,
+;; where `e`'s result is read. Rust: lower/threads.rs:184
 (defun lcx-await-task (cx: LowerCx x: Expr) -> (Result V str)
-  (Err "todo: E9 lcx-await-task"))
+  (try-let ((t (lcx-value cx x)) (tt (lcx-ty cx x)) (result-ty (task-arg tt "await of a non-task")))
+    (match @(. cx async-frame)
+      (nil (Err "await outside an async body"))
+      ((some frame)
+       (let ((b (. cx b))
+             (pp (lcx-gep cx (. frame tsname) "env" (. frame point))))
+         (do (fb-stmt b (str-join ["(store (i32 " (str (+ (count (. frame states)) 1)) ") " pp ")"]))
+             (let ((parked (fb-val b (str-join ["(call @fib.await-or-park env " (v-text t) ")"]) LirI1))
+                   (lpark (fb-label b "park"))
+                   (lcont (fb-label b "resume")))
+               (do (fb-term b (str-join ["(br " (v-text parked) " " lpark " " lcont ")"]))
+                   (fb-open b lpark)
+                   (fb-term b "(ret)")
+                   (fb-open b lcont)
+                   (set! (. cx async-frame) (some (AsyncFrame (. frame tsname) (. frame point) (conj (. frame states) lcont))))
+                   (task-value cx t result-ty)))))))))
 
-;; Rust: lower/threads.rs:214 LowerCx::join
+;; `(join t)`: drives the executor until the task is done (§8.8), then its result, retained. Rust: lower/threads.rs:214
 (defun lcx-join (cx: LowerCx e: Expr t: V) -> (Result V str)
-  (Err "todo: E9 lcx-join"))
+  (try-let ((result-ty (lcx-ty cx e)))
+    (lcx-join-value cx t result-ty)))
 
-;; Rust: lower/threads.rs:221 LowerCx::join_value
+;; `(join t)` of a task whose result has type `result-ty`; also `@t` (types §2.9, the `Deref` instance of `(Task a)`).
+;; Rust: lower/threads.rs:221
 (defun lcx-join-value (cx: LowerCx t: V result-ty: Ty) -> (Result V str)
-  (Err "todo: E9 lcx-join-value"))
+  (do (fb-stmt (. cx b) (str-join ["(call @fib.drive " (v-text t) ")"]))
+      (task-value cx t result-ty)))
 
-;; Rust: lower/threads.rs:266 LowerCx::complete_helper
+;; The result of a task that is done, retained (under its atom's lock, as any atom read). Rust: lower/threads.rs:228
+(defun task-value :private (cx: LowerCx t: V result-ty: Ty) -> (Result V str)
+  (try-let ((aobj (program-object (. cx p) (TCon KAtom [result-ty])))
+            (tobj (program-object (. cx p) (TCon KTask [result-ty]))))
+    (let ((rp (lcx-gep cx (. tobj snd) (v-text t) slot-task-result))
+          (atom (lcx-load cx LirPtr rp))
+          (vp (lcx-gep cx (. aobj snd) (v-text atom) slot-atom-value)))
+      (try-let ((l (program-lir (. cx p) result-ty)))
+        (let ((v (match l ((some lt) (lcx-load cx lt vp)) (nil VUnit))))
+          (do (lcx-retain cx v)
+              (Ok v)))))))
+
+;; ---- the helper functions: the thread entry and the completion of a task
+
+;; The thread entry for tasks of this result type, emitted once: calls the spawned closure, completes the task, releases it.
+;; Rust: lower/threads.rs:247 thread_entry
+(defun thread-entry :private (cx: LowerCx result-ty: Ty tsname: str) -> (Result str str)
+  (let ((name (str-join ["fib.thread." (mangle (program-g (. cx p)) result-ty)])))
+    (if (program-has-helper (. cx p) name)
+        (Ok name)
+        (let ((head (str-join ["(define internal (" name " ptr) ((ptr task))\n  (block entry\n    (let ((f (load ptr (getelementptr %struct."
+                               tsname " task (i32 0) (i32 " (str slot-task-closure) "))))\n          (code (load ptr (getelementptr "
+                               "%struct.fib.closure f (i32 0) (i32 3))))"]))
+              (call (fn (r: str) (str-join ["(indirect-call code (fn tailcc " r " (ptr)) f)"])))
+              (tail "      (call @fib.release task)\n      (ret (ptr null)))))\n"))
+          (try-let ((s (completion cx head call true tail result-ty)))
+            (do (program-add-helper (. cx p) name s)
+                (Ok name)))))))
+
+;; The completion function of an `async` body's task: called by the state machine with the body's value in place of its `ret`
+;; (emit.resume). Returns its name. Rust: lower/threads.rs:266 complete_helper
 (defun lcx-complete-helper (cx: LowerCx code: str result-ty: Ty) -> (Result str str)
-  (Err "todo: E9 lcx-complete-helper"))
+  (let ((name (str-join ["fib.complete." code])))
+    (if (program-has-helper (. cx p) name)
+        (Ok name)
+        (try-let ((l (program-lir (. cx p) result-ty)))
+          (let ((param (match l ((some t) (str-join [" (" (lir-ty-text t) " v0)"])) (nil "")))
+                (head (str-join ["(define internal (" name " void) ((ptr task)" param ")\n  (block entry\n    (let ("])))
+            (try-let ((s (completion cx head (fn (r: str) "v0") false "      (ret))))\n" result-ty)))
+              (do (program-add-helper (. cx p) name s)
+                  (Ok name))))))))
+
+;; The `let` bindings every completion starts with: the task's result atom, its lock and its value slot.
+(defun completion-bindings :private (tsname: str asname: str) -> str
+  (str-join ["\n          (atom (load ptr (getelementptr %struct." tsname " task (i32 0) (i32 " (str slot-task-result) "))))\n"
+             "          (lockp (getelementptr %struct." asname " atom (i32 0) (i32 " (str slot-atom-lock) ")))\n"
+             "          (vp (getelementptr %struct." asname " atom (i32 0) (i32 " (str slot-atom-value) "))))\n"]))
+
+;; The word that is share-marked, retained and released of a result: the pointer itself or a `dyn`'s first word; none for a scalar
+;; and a raw pointer.
+(defun completion-word :private (t: LirTy v: str) -> (Option str)
+  (match t
+    ((LirPtr) (some v))
+    ((LirDyn) (some (str-join ["(extractvalue " v " 0)"])))
+    (_ nil)))
+
+;; The lock, the store of `v` and the release of the old content, for a result of type `t`; `close` closes the `let`s opened.
+(defun completion-store :private (t: LirTy v: str close: str) -> str
+  (let ((w (completion-word t v))
+        (opening (str-join ["        (call @fib.lock lockp)\n        (let ((old (load " (lir-ty-text t) " vp)))\n          (store " v " vp)\n"])))
+    (match w
+      ((some word)
+       (let ((ow (match t ((LirDyn) "(extractvalue old 0)") (_ "old"))))
+         (str-join ["        (call @fib.share " word ")\n" opening
+                    "          (call @fib.retain " word ")\n          (call @fib.unlock lockp)\n          (call @fib.release " ow ")\n"
+                    "          (call @fib.release " word ")" close "\n"])))
+      (nil (str-join [opening "          (call @fib.unlock lockp)" close "\n"])))))
+
+;; The completion of a task (§8.8, as the interpreter's `complete`): the body's value share-marked, stored into the result atom
+;; under its lock (retained; the old content released), released as the step's temporary, and the state set to done, which wakes the
+;; waiters. `call` gives, for the lIR text of the result type, the instruction producing the value when `bind` holds, else the name
+;; it is already bound to. Rust: lower/threads.rs:298 completion
+(defun completion :private (cx: LowerCx head: str call: (fn (str) str) bind: bool tail: str result-ty: Ty) -> (Result str str)
+  (try-let ((l (program-lir (. cx p) result-ty))
+            (aobj (program-object (. cx p) (TCon KAtom [result-ty])))
+            (tobj (program-object (. cx p) (TCon KTask [result-ty]))))
+    (let ((close (if bind "))" ")"))
+          (body (match l
+                  (nil (str-join [(if bind (str-join ["      " (call "void") "\n"]) "")
+                                  "      (call @fib.lock lockp)\n      (call @fib.unlock lockp)\n"]))
+                  ((some t)
+                   (if bind
+                       (str-join ["      (let ((v " (call (lir-ty-text t)) "))\n" (completion-store t "v" close)])
+                       (completion-store t (call (lir-ty-text t)) close))))))
+      (Ok (str-join [head (completion-bindings (. tobj snd) (. aobj snd)) body "      (call @fib.task-complete task)\n" tail])))))

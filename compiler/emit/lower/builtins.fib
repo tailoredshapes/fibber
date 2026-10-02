@@ -1,15 +1,298 @@
-;; compiler/emit/lower/builtins.fib: the builtins: the string-keyed arms, array operations, calls into the runtime. Replaces crates/fibc/src/lower/builtins.rs.
-;; STATUS: every public function below is a STUB of package E8, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/builtins.rs, 478 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/builtins.fib: the builtins of syntax §4.3 (types §2.9 to §2.13, §8.3): cells, arrays, strings, traps and the unsafe
+;; primitives, lowered by name. Replaces crates/fibc/src/lower/builtins.rs (478 lines of Rust); `lcx-rt-call` of that file is in
+;; emit.lower.cx (emit.lower.strfind calls it and this module calls strfind), and the cell load is the hub's `cell-load` (call.rs
+;; is above this module). The Rust `match name` is a chain of `match`es, each ending in the next (`builtin-core`, `builtin-text`,
+;; `builtin-mem`), because a fibber `match` takes no or-pattern; an argument is fetched where the Rust arm fetches it, so a missing
+;; one is the Rust's error. NOT PORTED: the `trap` arm of a macro module (`fib.trap-at`, Rust `p.macro_module`): Program has no such
+;; flag until the macro module (E11) lands.
 (ns emit.lower.builtins
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.program emit.objects.kinds
+        emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads))
 
-;; Rust: lower/builtins.rs:14 LowerCx::builtin
+;; Argument `i` of the builtin `name`. Rust: the closure `arg` of lower/builtins.rs:16
+(defun arg :private (name: str a: (Vec V) i: i64) -> (Result V str)
+  (match (get a i)
+    ((some v) (Ok v))
+    (nil (Err (str-join [name " without argument " (str i)])))))
+
+(defun one-of? :private (x: str xs: (Vec str)) -> bool
+  (reduce (fn (acc: bool y: str) (or acc (= x y))) false xs))
+
+;; A builtin call; `nil` when it does not return (`trap`). Rust: lower/builtins.rs:15 LowerCx::builtin
 (defun lcx-builtin (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result (Option V) str)
-  (Err "todo: E8 lcx-builtin"))
+  (if (= name "trap")
+      (try-let ((m (arg name a 0)))
+        (do (fb-stmt (. cx b) (str-join ["(call @fib.trap " (v-text m) ")"]))
+            (fb-term (. cx b) "(unreachable)")
+            (Ok nil)))
+      (try-let ((v (builtin-core cx name e a tys))) (Ok (some v)))))
 
-;; Rust: lower/builtins.rs:225 LowerCx::rt_call
-(defun lcx-rt-call (cx: LowerCx f: str a: (Vec V) ret: (Option LirTy)) -> V
-  (trap "todo: E8 lcx-rt-call"))
+;; ---- cells, weak references, the macro hooks, threads, `not`
+
+;; Rust: lower/builtins.rs:256 set_cell: `(set! c v)` as the builtin: store the consumed value, release the old.
+(defun set-cell :private (cx: LowerCx c: V t: Ty v: V) -> (Result V str)
+  (match t
+    ((TCon (KCell) args)
+     (try-let ((o (program-object (. cx p) t))
+               (old ((. (. cx hub) cell-load) cx (. o snd) (v-text c) (nth args 0))))
+       (let ((field (lcx-gep cx (. o snd) (v-text c) slot-cell-value)))
+         (do (lcx-store cx v field) (lcx-release cx old) (Ok VUnit)))))
+    (_ (Err "set! on a non-cell"))))
+
+;; `(weak x)`: the box of an object, or (§8.7) of the object behind a `dyn`, with its vtable.
+(defun builtin-weak :private (cx: LowerCx e: Expr x: V) -> (Result V str)
+  (try-let ((t (lcx-ty cx e)) (o (program-object (. cx p) t)))
+    (let ((b (. cx b)) (tid (str (. o fst))))
+      (match (v-ty x)
+        ((some (LirPtr)) (Ok (fb-val b (str-join ["(call @fib.weak " (v-text x) " (i32 " tid "))"]) LirPtr)))
+        ((some (LirDyn))
+         (let ((obj (fb-val b (str-join ["(extractvalue " (v-text x) " 0)"]) LirPtr))
+               (vt (fb-val b (str-join ["(extractvalue " (v-text x) " 1)"]) LirPtr))
+               (bx (fb-val b (str-join ["(call @fib.weak " (v-text obj) " (i32 " tid "))"]) LirPtr)))
+           (Ok (fb-val b (str-join ["{ " (v-text bx) " " (v-text vt) " }"]) LirDyn))))
+        (_ (Err "weak of a scalar"))))))
+
+;; `(gensym s)`: the expander's hook, called through the pointers the macro runner stores.
+(defun builtin-gensym :private (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
+  (let ((hook (lcx-load cx LirPtr "@fibm.gensym-hook")) (hcx (lcx-load cx LirPtr "@fibm.hook-cx")))
+    (try-let ((x (arg name a 0)))
+      (Ok (fb-val (. cx b) (str-join ["(indirect-call " (v-text hook) " (fn ptr (ptr ptr)) " (v-text hcx) " " (v-text x) ")"]) LirPtr)))))
+
+(defun reflect-name? :private (name: str) -> bool
+  (one-of? name ["struct?" "struct-fields" "struct-params" "struct-field-types" "enum?" "enum-params" "enum-variants"]))
+
+;; The prelude's `Form` type. Rust: lower/builtins.rs:228 form_ty
+(defun form-ty :private (cx: LowerCx) -> (Result Ty str)
+  (match @(. (program-g (. cx p)) form)
+    ((some id) (Ok (ty-nominal id [])))
+    (nil (Err "the prelude defines no Form"))))
+
+;; A reflection builtin: the hook answers with a `Form`; a Bool is read out of its variant 6, a Vec out of its variant 9.
+(defun builtin-reflect :private (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
+  (let ((hook (lcx-load cx LirPtr "@fibm.reflect-hook")) (hcx (lcx-load cx LirPtr "@fibm.hook-cx")))
+    (try-let ((x (arg name a 0)))
+      (let ((r (fb-val (. cx b) (str-join ["(indirect-call " (v-text hook) " (fn ptr (ptr ptr ptr)) " (v-text hcx)
+                                           " (string \"" name "\") " (v-text x) ")"]) LirPtr)))
+        (try-let ((ft (form-ty cx)) (o (program-object (. cx p) ft)))
+          (if (one-of? name ["struct?" "enum?"])
+              (Ok (lcx-load cx LirI1 (lcx-gep cx (str-join [(. o snd) ".v6"]) (v-text r) slot-variant-field0)))
+              (Ok (lcx-load cx LirPtr (lcx-gep cx (str-join [(. o snd) ".v9"]) (v-text r) slot-variant-field0)))))))))
+
+(defun builtin-core :private (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result V str)
+  (match name
+    ("cell" (try-let ((x (arg name a 0))) (lcx-new-slot cx e x false)))
+    ("atom" (try-let ((x (arg name a 0))) (lcx-new-slot cx e x true)))
+    ("set!" (try-let ((c (arg name a 0)) (v (arg name a 1))) (set-cell cx c (nth tys 0) v)))
+    ("reset!" (try-let ((c (arg name a 0)) (v (arg name a 1))) (lcx-reset cx c (nth tys 0) v)))
+    ("swap!" (try-let ((c (arg name a 0)) (f (arg name a 1))) (lcx-swap cx c (nth tys 0) f)))
+    ("weak" (try-let ((x (arg name a 0))) (builtin-weak cx e x)))
+    ("gensym" (builtin-gensym cx name a))
+    ("spawn" (try-let ((f (arg name a 0))) (lcx-spawn cx e f)))
+    ("join" (try-let ((t (arg name a 0))) (lcx-join cx e t)))
+    ("not" (try-let ((x (arg name a 0))) (Ok (fb-val (. cx b) (str-join ["(xor " (v-text x) " (i1 1))"]) LirI1))))
+    (_ (if (reflect-name? name)
+           (builtin-reflect cx name a)
+           (builtin-text cx name e a tys)))))
+
+;; ---- arrays
+
+;; What every array arm needs of the array type. Rust: the locals of lower/builtins.rs:269 array_builtin
+(defstruct Arr (tid: i64 sname: str elem: Ty unit: bool el: LirTy esize: i64 counted: bool))
+
+(defun array-name? :private (name: str) -> bool
+  (one-of? name ["array" "array-len" "array-get" "array-with" "array-copy" "array-set!"]))
+
+;; The array type the builtin works on: the result's for the makers, the cell's content for `array-set!`, else the argument's.
+(defun array-ty-of :private (cx: LowerCx name: str e: Expr tys: (Vec Ty)) -> (Result Ty str)
+  (cond (one-of? name ["array" "array-copy" "array-with"]) (lcx-ty cx e)
+        (= name "array-set!")
+        (match (nth tys 0)
+          ((TCon (KCell) args) (Ok (nth args 0)))
+          (_ (Err "array-set! on a non-cell")))
+        :else (Ok (nth tys 0))))
+
+;; An element of `unit` has no value, but takes the `i1` slot a cell of `unit` takes (program.rs `elem_lir`), so that the array has
+;; its length and a place for every element, and `array-get` reads a unit.
+(defun arr-info :private (cx: LowerCx name: str e: Expr tys: (Vec Ty)) -> (Result Arr str)
+  (try-let ((arr-ty (array-ty-of cx name e tys)))
+    (match arr-ty
+      ((TCon (KArray) args)
+       (let ((elem (nth args 0)))
+         (try-let ((o (program-object (. cx p) arr-ty)) (l (program-lir (. cx p) elem)))
+           (let ((el (match l ((some t) t) (nil LirI1))))
+             (Ok (Arr (. o fst) (. o snd) elem (match l (nil true) (_ false)) el (. (size-align el) fst)
+                      (match el ((LirPtr) true) ((LirDyn) true) (_ false))))))))
+      (_ (Err (str-join [name " on a non-array"]))))))
+
+(defun elem-ptr :private (r: Arr arr: str i: str) -> str
+  (str-join ["(getelementptr %struct." (. r sname) " " arr " (i32 0) (i32 " (str slot-elems) ") " i ")"]))
+
+;; Stores `x` into every element of a fresh array of `n`, taking `n - 1` further counts on it (the consume brought the first).
+;; Rust: lower/builtins.rs:349 array_fill
+(defun array-fill :private (cx: LowerCx r: Arr p: V n: V x: V) -> unit
+  (let ((b (. cx b)) (lh (fb-label b "fill")) (lb (fb-label b "fillb")) (ld (fb-label b "filled")) (entry (fb-current b)))
+    (do (fb-term b (str-join ["(br " lh ")"]))
+        (fb-open b lh)
+        (let ((i (fb-phi b LirI64 [(PhiEdge entry "(i64 0)")]))
+              (c (fb-val b (str-join ["(icmp slt " (v-text i) " " (v-text n) ")"]) LirI1)))
+          (do (fb-term b (str-join ["(br " (v-text c) " " lb " " ld ")"]))
+              (fb-open b lb)
+              (let ((ep (fb-val b (elem-ptr r (v-text p) (v-text i)) LirPtr)))
+                (do (lcx-store cx x (v-text ep))
+                    (when (. r counted) (retain-after-first cx x i))
+                    (let ((i2 (fb-val b (str-join ["(add " (v-text i) " (i64 1))"]) LirI64)) (back (fb-current b)))
+                      (do (fb-term b (str-join ["(br " lh ")"]))
+                          (fb-patch-phi b lh (v-text i) back (v-text i2))
+                          (fb-open b ld))))))))))
+
+;; A count on `x` for every element but the first.
+(defun retain-after-first :private (cx: LowerCx x: V i: V) -> unit
+  (let ((b (. cx b)) (nf (fb-val b (str-join ["(icmp ne " (v-text i) " (i64 0))"]) LirI1)) (lr (fb-label b "fillr")) (ln (fb-label b "filln")))
+    (do (fb-term b (str-join ["(br " (v-text nf) " " lr " " ln ")"]))
+        (fb-open b lr)
+        (lcx-retain cx x)
+        (fb-term b (str-join ["(br " ln ")"]))
+        (fb-open b ln))))
+
+;; The address of element `i`, after the bounds check (a trap with the interpreter's message, `eval/arrays.rs`).
+;; Rust: lower/builtins.rs:396 array_index
+(defun array-index :private (cx: LowerCx r: Arr arr: str i: V) -> str
+  (let ((b (. cx b)) (n (lcx-load cx LirI64 (lcx-gep cx (. r sname) arr slot-len)))
+        (ok (fb-val b (str-join ["(icmp ult " (v-text i) " " (v-text n) ")"]) LirI1))
+        (lo (fb-label b "inb")) (lt (fb-label b "oob")))
+    (do (fb-term b (str-join ["(br " (v-text ok) " " lo " " lt ")"]))
+        (fb-open b lt)
+        (fb-stmt b (str-join ["(call @fib.trap-index " (v-text i) " " (v-text n) ")"]))
+        (fb-term b "(unreachable)")
+        (fb-open b lo)
+        (v-text (fb-val b (elem-ptr r arr (v-text i)) LirPtr)))))
+
+;; A copy of an array with every element retained. Rust: lower/builtins.rs:423 array_dup
+(defun array-dup :private (cx: LowerCx r: Arr arr: str) -> V
+  (let ((b (. cx b)) (n (lcx-load cx LirI64 (lcx-gep cx (. r sname) arr slot-len))))
+    (let ((p (fb-val b (str-join ["(call @fib.array-slice " arr " (i64 0) " (v-text n) " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr)))
+      (do (fb-stmt b (str-join ["(call @trace." (str (. r tid)) " " (v-text p) " @fib.retain)"]))
+          p))))
+
+;; `(array-set! &a i x)`: in place when unique, else a changed copy stored into the cell (§8.3). Rust: lower/builtins.rs:441 array_set
+(defun array-set :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
+  (try-let ((co (program-object (. cx p) cell-ty)))
+    (let ((cell-s (. co snd)) (cell (v-text (nth a 0))))
+      (try-let ((content ((. (. cx hub) cell-load) cx cell-s cell (TCon KArray [(. r elem)]))))
+        (let ((b (. cx b)) (el (. r el)) (x (nth a 2)) (ep (array-index cx r (v-text content) (nth a 1)))
+              (unique (fb-val b (str-join ["(call @fib.unique? " (v-text content) ")"]) LirI1))
+              (li (fb-label b "inplace")) (lc (fb-label b "copy")) (lj (fb-label b "written")))
+          (do (fb-term b (str-join ["(br " (v-text unique) " " li " " lc ")"]))
+              (fb-open b li)
+              (let ((old (lcx-load cx el ep)))
+                (do (lcx-store cx x ep) (lcx-release cx old) (fb-term b (str-join ["(br " lj ")"]))))
+              (fb-open b lc)
+              (array-set-copy cx r cell-s cell content (v-text (nth a 1)) x)
+              (fb-term b (str-join ["(br " lj ")"]))
+              (fb-open b lj)
+              (Ok VUnit)))))))
+
+;; The copying branch of `array-set`: the changed copy is stored into the cell and the old array released.
+(defun array-set-copy :private (cx: LowerCx r: Arr cell-s: str cell: str content: V i: str x: V) -> unit
+  (let ((copy (array-dup cx r (v-text content))) (cep (fb-val (. cx b) (elem-ptr r (v-text copy) i) LirPtr)))
+    (let ((old (lcx-load cx (. r el) (v-text cep))))
+      (do (lcx-store cx x (v-text cep))
+          (lcx-release cx old)
+          (lcx-store cx copy (lcx-gep cx cell-s cell slot-cell-value))
+          (lcx-release cx content)))))
+
+(defun builtin-array :private (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result V str)
+  (try-let ((r (arr-info cx name e tys)))
+    (match name
+      ("array" (let ((n (nth a 0))
+                     (p (fb-val (. cx b) (str-join ["(call @fib.array-alloc " (v-text n) " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr)))
+                 (do (array-fill cx r p n (nth a 1)) (Ok p))))
+      ("array-len" (Ok (lcx-load cx LirI64 (lcx-gep cx (. r sname) (v-text (nth a 0)) slot-len))))
+      ("array-get" (let ((ep (array-index cx r (v-text (nth a 0)) (nth a 1))))
+                     (if (. r unit)
+                         (Ok VUnit)
+                         (let ((v (lcx-load cx (. r el) ep))) (do (lcx-retain cx v) (Ok v))))))
+      ("array-with" (let ((copy (array-dup cx r (v-text (nth a 0)))))
+                      (let ((ep (array-index cx r (v-text copy) (nth a 1))))
+                        (let ((old (lcx-load cx (. r el) ep)))
+                          (do (lcx-store cx (nth a 2) ep) (lcx-release cx old) (Ok copy))))))
+      ("array-copy" (let ((p (fb-val (. cx b) (str-join ["(call @fib.array-slice " (v-text (nth a 0)) " " (v-text (nth a 1)) " " (v-text (nth a 2))
+                                                         " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr)))
+                      (do (fb-stmt (. cx b) (str-join ["(call @trace." (str (. r tid)) " " (v-text p) " @fib.retain)"]))
+                          (Ok p))))
+      (_ (array-set cx r (nth tys 0) a)))))
+
+;; ---- strings, the command line, floats
+
+;; The builtins that are one call of the runtime: its name and what it returns. Rust: the `rt_call` arms of lower/builtins.rs:133-153, :180, :187
+(defun rt-arm :private (name: str) -> (Option (Pair str (Option LirTy)))
+  (match name
+    ("str-len" (some (Pair "fib.str-len" (some LirI64))))
+    ("str-eq" (some (Pair "fib.str-eq" (some LirI1))))
+    ("starts-with?" (some (Pair "fib.str-starts-with" (some LirI1))))
+    ("str-concat" (some (Pair "fib.str-concat" (some LirPtr))))
+    ("str-slice" (some (Pair "fib.str-slice" (some LirPtr))))
+    ("str-byte-at" (some (Pair "fib.str-byte-at" (some LirI8))))
+    ("str-from-bytes" (some (Pair "fib.str-from-array" (some LirPtr))))
+    ("read-file" (some (Pair "fib.read-file" (some LirPtr))))
+    ("write-file" (some (Pair "fib.write-file" (some LirI1))))
+    ("i32->char" (some (Pair "fib.i32-to-char" (some LirI32))))
+    ("free" (some (Pair "free" nil)))
+    ("release-raw" (some (Pair "fib.release" nil)))
+    (_ nil)))
+
+;; `(args)`: a fresh `Vec str` of the command line's arguments, built through the runtime's Vec builder as `concat` builds one
+;; (each str made with count 1, retained into the vector, then released as the builder's temporary). Rust: lower/builtins.rs:196 args_vec
+(defun args-vec :private (cx: LowerCx e: Expr) -> (Result V str)
+  (try-let ((t (lcx-ty cx e)) (ids (lcx-vec-tids cx t (ty-str))))
+    (let ((b (. cx b)) (n (fb-val (. cx b) "(call @fib.args-count)" LirI64)))
+      (let ((buf (fb-val b (str-join ["(call @malloc (mul " (v-text n) " (i64 8)))"]) LirPtr)))
+        (do (fb-stmt b (str-join ["(call @fib.args-fill " (v-text buf) ")"]))
+            (let ((v (fb-val b (str-join ["(call @fib.vec-build " (v-text buf) " " (v-text n) " (i64 8) (i8 1) (i32 " (str (. ids tvec))
+                                          ") (i32 " (str (. ids tnode)) ") (i32 " (str (. ids tarr)) ") (i32 " (str (. ids tnarr)) "))"]) LirPtr)))
+              (do (fb-stmt b (str-join ["(call @fib.args-release " (v-text buf) " " (v-text n) ")"]))
+                  (fb-stmt b (str-join ["(call @free " (v-text buf) ")"]))
+                  (Ok v))))))))
+
+(defun builtin-text :private (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result V str)
+  (match name
+    ("str-find" (lcx-str-find cx e a))
+    ("str-bytes" (try-let ((o (program-object (. cx p) (TCon KArray [(ty-scalar SI8)]))) (x (arg name a 0)))
+                   (Ok (lcx-rt-call cx "fib.str-bytes" [x (v-int LirI32 (. o fst))] (some LirPtr)))))
+    ("args" (args-vec cx e))
+    ("char->i32" (arg name a 0))
+    (_ (cond (array-name? name) (builtin-array cx name e a tys)
+             (one-of? name ["f64->bits" "bits->f64" "f32->bits" "bits->f32"])
+             (try-let ((x (arg name a 0))) (lcx-float-bits cx name x))
+             :else (if-some [r (rt-arm name)]
+                     (Ok (lcx-rt-call cx (. r fst) a (. r snd)))
+                     (builtin-mem cx name a))))))
+
+;; ---- the unsafe primitives
+
+(defun load-ty :private (name: str) -> (Option LirTy)
+  (match name
+    ("load-i8" (some LirI8)) ("load-i16" (some LirI16)) ("load-i32" (some LirI32)) ("load-i64" (some LirI64)) ("load-ptr" (some LirRaw))
+    (_ nil)))
+
+;; syntax §3.15: the block is zeroed, as the interpreter's is, and one that cannot be had is the trap `out of memory`, as the
+;; interpreter's is (`fib.alloc-check`).
+(defun builtin-mem :private (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
+  (cond (= name "ptr+")
+        (try-let ((p (arg name a 0)) (n (arg name a 1)))
+          (Ok (fb-val (. cx b) (str-join ["(getelementptr i8 " (v-text p) " " (v-text n) ")"]) LirRaw)))
+        (= name "alloc")
+        (try-let ((n (arg name a 0)))
+          (let ((block (lcx-rt-call cx "calloc" [(v-int LirI64 1) n] (some LirRaw))))
+            (Ok (lcx-rt-call cx "fib.alloc-check" [block n] (some LirRaw)))))
+        (one-of? name ["raw" "raw-retained"])
+        (try-let ((v (arg name a 0)))
+          (match (lcx-obj-word cx v)
+            ((some w) (Ok (VVal w LirRaw)))
+            (nil (Err "raw of a scalar"))))
+        (one-of? name ["store-i8" "store-i16" "store-i32" "store-i64" "store-ptr"])
+        (try-let ((p (arg name a 0)) (v (arg name a 1)))
+          (do (lcx-store cx v (v-text p)) (Ok VUnit)))
+        :else (if-some [t (load-ty name)]
+                (try-let ((p (arg name a 0))) (Ok (lcx-load cx t (v-text p))))
+                (Err (str-join ["builtin " name])))))

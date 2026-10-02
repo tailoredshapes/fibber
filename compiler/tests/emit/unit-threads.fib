@@ -1,0 +1,169 @@
+;; compiler/tests/emit/unit-threads.fib: emit.lower.threads on hand-built contexts. The Rust lower/threads.rs has no unit tests; its judge is
+;; the text of whole functions (`fibc emit-dump --sections fns` against the tool, compare.sh). The helper functions (`fib.thread.*`,
+;; `fib.complete.*`) carry no type ids, so their text is checked against the Rust's, copied from `fibc emit` of programs that spawn and
+;; `async` an i64, a str and a unit (2026-10-02); `spawn`, `join` and `await` are checked against the Rust's instruction sequence with
+;; the ids the program gave the objects. `make-async` needs the captures of package E6 and is judged by the whole-file comparison.
+;; Build: fibc build compiler/tests/emit/unit-threads.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [fib.string :as s])
+  (:use syntax.pos types.ty types.decls types.program types.check types.ast own.program emit.value emit.ir emit.mono emit.program
+        emit.objects emit.lower.cx emit.lower.mod emit.lower.threads))
+
+(defun no-hub () -> Hub (hub-default))
+
+;; A hub whose `expr` yields the value `v`.
+(defun hub-of (v: V) -> Hub
+  (with (no-hub) (expr (fn (cx: LowerCx e: Expr) (Ok (FlowVal v))))))
+
+(defun cx-of (types: (Map i64 Ty) hub: Hub) -> LowerCx
+  (let ((typed (TypedProgram (globals-new) (map-empty) (map-empty) types (map-empty) (map-empty) (map-empty) (map-empty) [] [])))
+    (lcx-build (emit.program/program-new typed (owned-program-new)) (Inst (BodyFun 0) []) (body-own-new) "f.t" [] true hub (map-empty))))
+
+(defun lit (id: i64) -> Expr (Expr id (Pos "t" 0 0 0 0) (ELit LitUnit)))
+(defun lines (ls: (Vec str)) -> str (str-join (mapv (fn (l: str) (str-join [l "\n"])) ls)))
+(defun text-of (cx: LowerCx) -> str (fb-render (. cx b)))
+(defun funcs-of (cx: LowerCx) -> (Vec str) @(. (. cx p) funcs))
+(defun ok-v (r: (Result V str)) -> V (match r ((Ok v) v) ((Err m) (VVal m LirPtr))))
+(defun idx-of (text: str w: str) -> i64 (match (s/index-of text w) ((some i) i) (nil -1)))
+(defun i64-t () -> Ty (ty-scalar SI64))
+(defun err-is (r: (Result V str) m: str) -> bool (= r (Err m)))
+
+;; The lines the Rust's `completion` prints around a result's code, for a result whose slots are of atom `a`.
+(defun entry-let (name: str a: str) -> (Vec str)
+  [(str-join ["(define internal (" name " ptr) ((ptr task))"]) "  (block entry"
+   "    (let ((f (load ptr (getelementptr %struct.fib.task task (i32 0) (i32 9))))"
+   "          (code (load ptr (getelementptr %struct.fib.closure f (i32 0) (i32 3))))"
+   "          (atom (load ptr (getelementptr %struct.fib.task task (i32 0) (i32 7))))"
+   (str-join ["          (lockp (getelementptr %struct.fib.atom." a " atom (i32 0) (i32 3)))"])
+   (str-join ["          (vp (getelementptr %struct.fib.atom." a " atom (i32 0) (i32 4))))"])])
+
+(defun thread-tail () -> (Vec str)
+  ["      (call @fib.task-complete task)" "      (call @fib.release task)" "      (ret (ptr null)))))"])
+
+(defun thread-i64 () -> str
+  (lines (into (into (entry-let "fib.thread.i64" "i64")
+                     ["      (let ((v (indirect-call code (fn tailcc i64 (ptr)) f)))" "        (call @fib.lock lockp)"
+                      "        (let ((old (load i64 vp)))" "          (store v vp)" "          (call @fib.unlock lockp)))"])
+               (thread-tail))))
+
+(defun thread-str () -> str
+  (lines (into (into (entry-let "fib.thread.str" "ptr")
+                     ["      (let ((v (indirect-call code (fn tailcc ptr (ptr)) f)))" "        (call @fib.share v)" "        (call @fib.lock lockp)"
+                      "        (let ((old (load ptr vp)))" "          (store v vp)" "          (call @fib.retain v)" "          (call @fib.unlock lockp)"
+                      "          (call @fib.release old)" "          (call @fib.release v)))"])
+               (thread-tail))))
+
+(defun thread-unit () -> str
+  (lines (into (into (entry-let "fib.thread.unit" "i1")
+                     ["      (indirect-call code (fn tailcc void (ptr)) f)" "      (call @fib.lock lockp)" "      (call @fib.unlock lockp)"])
+               (thread-tail))))
+
+(defun complete-top (name: str param: str a: str) -> (Vec str)
+  [(str-join ["(define internal (" name " void) ((ptr task)" param ")"]) "  (block entry" "    (let ("
+   "          (atom (load ptr (getelementptr %struct.fib.task task (i32 0) (i32 7))))"
+   (str-join ["          (lockp (getelementptr %struct.fib.atom." a " atom (i32 0) (i32 3)))"])
+   (str-join ["          (vp (getelementptr %struct.fib.atom." a " atom (i32 0) (i32 4))))"])])
+
+(defun complete-tail () -> (Vec str) ["      (call @fib.task-complete task)" "      (ret))))"])
+
+(defun complete-i64 (name: str) -> str
+  (lines (into (into (complete-top name " (i64 v0)" "i64")
+                     ["        (call @fib.lock lockp)" "        (let ((old (load i64 vp)))" "          (store v0 vp)" "          (call @fib.unlock lockp))"])
+               (complete-tail))))
+
+(defun complete-str (name: str) -> str
+  (lines (into (into (complete-top name " (ptr v0)" "ptr")
+                     ["        (call @fib.share v0)" "        (call @fib.lock lockp)" "        (let ((old (load ptr vp)))" "          (store v0 vp)"
+                      "          (call @fib.retain v0)" "          (call @fib.unlock lockp)" "          (call @fib.release old)" "          (call @fib.release v0))"])
+               (complete-tail))))
+
+(defun complete-unit (name: str) -> str
+  (lines (into (into (complete-top name "" "i1") ["      (call @fib.lock lockp)" "      (call @fib.unlock lockp)"]) (complete-tail))))
+
+(defun helper-checks (cs: Checks) -> unit
+  (let ((cx (cx-of (map-empty) (no-hub))))
+    (do (check cs "complete helper of an i64 result: the Rust's text, the name returned, the helper registered once"
+               (and (= (lcx-complete-helper cx "l.f.main.1" (i64-t)) (Ok "fib.complete.l.f.main.1"))
+                    (= (funcs-of cx) [(complete-i64 "fib.complete.l.f.main.1")])
+                    (= (lcx-complete-helper cx "l.f.main.1" (i64-t)) (Ok "fib.complete.l.f.main.1"))
+                    (= (count (funcs-of cx)) 1)))
+        (check cs "complete helper of a str result: the value is share-marked, stored, retained, the old content released"
+               (and (= (lcx-complete-helper cx "l.f.main.2" (ty-str)) (Ok "fib.complete.l.f.main.2"))
+                    (= (nth (funcs-of cx) 1) (complete-str "fib.complete.l.f.main.2"))))
+        (check cs "complete helper of a unit result: no parameter, lock and unlock only"
+               (and (= (lcx-complete-helper cx "l.f.main.3" (ty-unit)) (Ok "fib.complete.l.f.main.3"))
+                    (= (nth (funcs-of cx) 2) (complete-unit "fib.complete.l.f.main.3")))))))
+
+;; ---- spawn, join, await
+
+(defun spawn-of (result: Ty) -> (Pair LowerCx (Result V str))
+  (let ((cx (cx-of (assoc (map-empty) 7 (ty-task result)) (no-hub))))
+    (Pair cx (lcx-spawn cx (lit 7) (VVal "f0" LirPtr)))))
+
+;; The function `spawn` of an i64 task builds: the Rust's instructions (`fibc emit` of `(spawn (fn () 1))`, 2026-10-02), the names renumbered
+;; from t1 and the atom's type id (4 here, 5 in that program).
+(defun spawn-i64-text () -> str
+  (lines ["(define internal tailcc (f.t void) ()" "  (block entry" "    (call @fib.share f0)"
+          "    (let ((t1 (call @fib.alloc (i64 32) (i32 4)))" "          (t2 (getelementptr %struct.fib.atom.i64 t1 (i32 0) (i32 3))))" "      (store (i32 0) t2))"
+          "    (let ((t3 (getelementptr %struct.fib.atom.i64 t1 (i32 0) (i32 4))))" "      (store (i64 0) t3))"
+          "    (let ((t4 (call @fib.alloc (i64 64) (i32 3))))" "      (call @fib.retain t4))"
+          "    (let ((t5 (getelementptr %struct.fib.task t4 (i32 0) (i32 3))))" "      (store (i32 1) t5))"
+          "    (let ((t6 (getelementptr %struct.fib.task t4 (i32 0) (i32 4))))" "      (store (i32 1) t6))"
+          "    (let ((t7 (getelementptr %struct.fib.task t4 (i32 0) (i32 5))))" "      (store (i32 0) t7))"
+          "    (let ((t8 (getelementptr %struct.fib.task t4 (i32 0) (i32 6))))" "      (store (ptr null) t8))"
+          "    (let ((t9 (getelementptr %struct.fib.task t4 (i32 0) (i32 8))))" "      (store (ptr null) t9))"
+          "    (let ((t10 (getelementptr %struct.fib.task t4 (i32 0) (i32 7))))" "      (store t1 t10))"
+          "    (let ((t11 (getelementptr %struct.fib.task t4 (i32 0) (i32 9))))" "      (store f0 t11))"
+          "    (call @fib.share t4)" "    (call @fib.spawn t4 @fib.thread.i64)" "  ))"]))
+
+(defun spawn-checks (cs: Checks) -> unit
+  (let ((a (spawn-of (i64-t))) (b (spawn-of (ty-str))) (c (spawn-of (ty-unit))))
+    (do (check cs "spawn of an i64 task: the handle is the task, the thread entry fib.thread.i64 is the Rust's text"
+               (and (match (. a snd) ((Ok (VVal _ (LirPtr))) true) (_ false))
+                    (= (funcs-of (. a fst)) [(thread-i64)])
+                    (= (funcs-of (. b fst)) [(thread-str)])
+                    (= (funcs-of (. c fst)) [(thread-unit)])))
+        (check cs "spawn: the Rust's instruction sequence, with the ids the program gave the objects (the atom is 4, fib.task is 3)"
+               (= (text-of (. a fst)) (spawn-i64-text)))
+        (check cs "spawn of a non-task is an error"
+               (let ((cx (cx-of (assoc (map-empty) 7 (i64-t)) (no-hub))))
+                 (err-is (lcx-spawn cx (lit 7) (VVal "f0" LirPtr)) "spawn without a Task type"))))))
+
+(defun join-checks (cs: Checks) -> unit
+  (let ((cx (cx-of (assoc (map-empty) 7 (i64-t)) (no-hub))))
+    (do (check cs "join of an i64 task: drive, then the result loaded from the atom"
+               (let ((r (lcx-join cx (lit 7) (VVal "t0" LirPtr))) (text (text-of cx)))
+                 (and (match r ((Ok (VVal _ (LirI64))) true) (_ false))
+                      (s/includes? text "(call @fib.drive t0)")
+                      (s/includes? text "(getelementptr %struct.fib.task t0 (i32 0) (i32 7))")
+                      (s/includes? text "(load ptr t1)")
+                      (s/includes? text "(getelementptr %struct.fib.atom.i64 t2 (i32 0) (i32 4))"))))
+        (check cs "join of a unit task has no value and retains nothing"
+               (let ((cx2 (cx-of (map-empty) (no-hub))))
+                 (and (= (lcx-join-value cx2 (VVal "t0" LirPtr) (ty-unit)) (Ok VUnit))
+                      (not (s/includes? (text-of cx2) "(call @fib.retain"))
+                      (s/includes? (text-of cx2) "(call @fib.drive t0)")))))))
+
+(defun await-checks (cs: Checks) -> unit
+  (let ((cx (cx-of (assoc (map-empty) 7 (ty-task (i64-t))) (hub-of (VVal "t9" LirPtr)))))
+    (do (check cs "await outside an async body is an error"
+               (err-is (lcx-await-task cx (lit 7)) "await outside an async body"))
+        (set! (. cx async-frame) (some (AsyncFrame "task.l.f.a" 10 [])))
+        (let ((r (lcx-await-task cx (lit 7))) (text (text-of cx)))
+          (do (check cs "await: the next state's point stored, park or resume, the result read in the resume block"
+                     (and (match r ((Ok (VVal _ (LirI64))) true) (_ false))
+                          (s/includes? text "(store (i32 1) t1)")
+                          (s/includes? text "(call @fib.await-or-park env t9)")
+                          (s/includes? text "(br t2 park3 resume4)")
+                          (s/includes? text "(block park3")
+                          (s/includes? text "(block resume4")))
+              (check cs "await records the continuation block as the next state of the frame"
+                     (match @(. cx async-frame) ((some f) (= (. f states) ["resume4"])) (nil false)))
+              (check cs "a second await stores point 2"
+                     (do (lcx-await-task cx (lit 7))
+                         (and (s/includes? (text-of cx) "(store (i32 2) ")
+                              (match @(. cx async-frame) ((some f) (= (count (. f states)) 2)) (nil false))))))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (helper-checks cs) (spawn-checks cs) (join-checks cs) (await-checks cs) (finish cs))))

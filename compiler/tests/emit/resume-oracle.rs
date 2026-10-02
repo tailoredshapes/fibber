@@ -184,8 +184,8 @@ fn edges() {
     f.open("b");
     f.term("(br join)");
     f.open("join");
-    let p1 = f.phi(LirTy::I64, &[("a".to_string(), made[7].clone()), ("b".to_string(), "(i64 1)".to_string())]);
-    let p2 = f.phi(LirTy::I64, &[("a".to_string(), made[8].clone()), ("b".to_string(), "(i64 2)".to_string())]);
+    let p1 = f.phi(LirTy::I64, &[("a".to_string(), made[8].clone()), ("b".to_string(), "(i64 1)".to_string())]);
+    let p2 = f.phi(LirTy::I64, &[("a".to_string(), made[7].clone()), ("b".to_string(), "(i64 2)".to_string())]);
     f.stmt(STORE_POINT);
     let parked = f.val(PARK, LirTy::I1);
     f.term(&format!("(br {} park resume)", parked.text()));

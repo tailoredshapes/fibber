@@ -1,0 +1,230 @@
+;; compiler/tests/emit/unit-call.fib: calls and arithmetic (package E5) on hand-built contexts: the text of each native method of the
+;; scalars (the Rust arith.rs has no unit tests; its judge is the text of whole functions, call.sh), the checks and traps of the integer
+;; operations, the conversions, `emit-call` for every target, `cell-load`, `instance-of-pred` over a hand-built instance table, and the
+;; errors of the call site that no accepted program reaches.
+;; Build: fibc build compiler/tests/emit/unit-call.fib -I compiler -I lib -o OUT       Run: OUT (exit 0 when every check holds)
+(ns main
+  (:require [fib.string :as s])
+  (:use syntax.pos types.ty types.decls types.table types.program types.check types.ast own.program emit.value emit.ir emit.mono emit.program
+        emit.lower.cx emit.lower.mod emit.lower.arith emit.lower.call))
+
+(defun cx-over (g: Globals own: BodyOwn) -> LowerCx
+  (let ((typed (TypedProgram g (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) [] [])))
+    (lcx-build (emit.program/program-new typed (owned-program-new)) (Inst (BodyFun 0) []) own "f.t" [] true (hub-default) (map-empty))))
+
+(defun plain () -> LowerCx (cx-over (globals-new) (body-own-new)))
+(defun text-of (cx: LowerCx) -> str (fb-render (. cx b)))
+(defun has (cx: LowerCx word: str) -> bool (s/includes? (text-of cx) word))
+(defun lit (id: i64) -> Expr (Expr id (Pos "t" 0 0 0 0) (ELit LitUnit)))
+(defun starts-err (r: (Result a str) word: str) -> bool (match r ((Err m) (s/starts-with? m word)) (_ false)))
+
+(def t64: Ty (ty-scalar SI64))
+(def a64: V (VVal "a" LirI64))
+(def b64: V (VVal "b" LirI64))
+
+;; One method of a native instance on a fresh context: the context, the result.
+(defstruct Ran (cx: LowerCx r: (Result (Option V) str)))
+(defun ran (method: str x: V y: V t: Ty) -> Ran
+  (let ((cx (plain))) (Ran cx (lcx-native-method cx "Num" method [x y] [t t] t))))
+(defun ty-of (r: Ran) -> (Option LirTy)
+  (match (. r r) ((Ok (some v)) (v-ty v)) (_ nil)))
+
+;; Each row: the method, the text it must emit, the type of its result.
+(defun table-checks (cs: Checks what: str x: V y: V t: Ty rows: (Vec (Pair str (Pair str LirTy)))) -> unit
+  (doseq [row rows]
+    (let ((r (ran (. row fst) x y t)))
+      (check cs (str-join [what " " (. row fst)])
+             (and (has (. r cx) (. (. row snd) fst)) (= (ty-of r) (some (. (. row snd) snd))))))))
+
+(defun int-checks (cs: Checks) -> unit
+  (do (table-checks cs "i64" a64 b64 t64
+                    [(Pair "bit-and" (Pair "(and a b)" LirI64)) (Pair "bit-or" (Pair "(or a b)" LirI64)) (Pair "bit-xor" (Pair "(xor a b)" LirI64))
+                     (Pair "=" (Pair "(icmp eq a b)" LirI1)) (Pair "!=" (Pair "(icmp ne a b)" LirI1)) (Pair "<" (Pair "(icmp slt a b)" LirI1))
+                     (Pair "<=" (Pair "(icmp sle a b)" LirI1)) (Pair ">" (Pair "(icmp sgt a b)" LirI1)) (Pair ">=" (Pair "(icmp sge a b)" LirI1))
+                     (Pair "+" (Pair "(sadd-overflow a b)" LirI64)) (Pair "-" (Pair "(ssub-overflow a b)" LirI64))
+                     (Pair "*" (Pair "(smul-overflow a b)" LirI64)) (Pair "rem" (Pair "(srem a b)" LirI64))
+                     (Pair "quot" (Pair "(sdiv a b)" LirI64)) (Pair "shl" (Pair "(shl a " LirI64)) (Pair "shr" (Pair "(lshr a " LirI64))
+                     (Pair "sar" (Pair "(ashr a " LirI64))])
+      (table-checks cs "i1" (VVal "p" LirI1) (VVal "q" LirI1) (ty-scalar SBool)
+                    [(Pair "<" (Pair "(icmp ult p q)" LirI1)) (Pair ">=" (Pair "(icmp uge p q)" LirI1)) (Pair "=" (Pair "(icmp eq p q)" LirI1))])
+      (check cs "an overflow check traps on the flag with the width in the message"
+             (let ((r (ran "+" a64 b64 t64)))
+               (and (has (. r cx) "(extractvalue ") (has (. r cx) "(string \"integer overflow in + at i64\")") (has (. r cx) "(unreachable)"))))
+      (check cs "a shift masks its count to the width: i32 by 31"
+             (let ((cx (plain)) (r (lcx-native-method cx "Bits" "shl" [(VVal "a" LirI32) (VVal "b" LirI32)] [(ty-scalar SI32) (ty-scalar SI32)] (ty-scalar SI32))))
+               (and (has cx "(and b (i32 31))") (has cx "(shl a "))))
+      (check cs "a native method without a receiver is an error naming the method" (starts-err (lcx-native-method (plain) "Num" "+" [] [] t64) "+ without"))
+      (check cs "an unknown comparison method is an error" (starts-err (. (ran "nope" a64 b64 t64) r) "native method nope"))))
+
+(defun division-checks (cs: Checks) -> unit
+  (do (check cs "quot is the division `/`: the zero check, the minimum check, sdiv, the messages name `/`"
+             (let ((r (ran "quot" a64 b64 t64)))
+               (and (has (. r cx) "(icmp eq b (i64 0))") (has (. r cx) "(icmp eq a (i64 -9223372036854775808))") (has (. r cx) "(icmp eq b (i64 -1))")
+                    (has (. r cx) "integer / by zero") (has (. r cx) "integer overflow in / at i64") (has (. r cx) "(sdiv a b)"))))
+      (check cs "rem names rem and uses srem"
+             (let ((r (ran "rem" a64 b64 t64))) (and (has (. r cx) "integer rem by zero") (has (. r cx) "(srem a b)"))))
+      (check cs "at i8 the minimum is -128"
+             (let ((r (ran "quot" (VVal "a" LirI8) (VVal "b" LirI8) (ty-scalar SI8)))) (and (has (. r cx) "(icmp eq a (i8 -128))") (has (. r cx) "at i8"))))
+      (check cs "a literal zero divisor is the trap alone: no value, no division"
+             (let ((r (ran "quot" a64 (v-int LirI64 0) t64)))
+               (and (= (. r r) (Ok nil)) (has (. r cx) "(string \"integer / by zero\")") (not (has (. r cx) "sdiv")) (not (has (. r cx) "icmp eq")))))
+      (check cs "and for rem" (let ((r (ran "rem" a64 (v-int LirI64 0) t64))) (and (= (. r r) (Ok nil)) (has (. r cx) "integer rem by zero"))))))
+
+(defun unary-checks (cs: Checks) -> unit
+  (let ((one (fn (method: str x: V t: Ty) (let ((cx (plain))) (Pair cx (lcx-native-method cx "Num" method [x] [t] t))))))
+    (do (check cs "neg traps on the minimum and subtracts from zero"
+               (let ((r (one "neg" a64 t64)))
+                 (and (has (. r fst) "(icmp eq a (i64 -9223372036854775808))") (has (. r fst) "integer overflow in neg at i64") (has (. r fst) "(sub (i64 0) a)"))))
+        (check cs "bit-not xors with -1, popcount is ctpop"
+               (and (has (. (one "bit-not" a64 t64) fst) "(xor a (i64 -1))") (has (. (one "popcount" a64 t64) fst) "(ctpop a)")))
+        (check cs "an unknown unary method is an error" (starts-err (. (one "nope" a64 t64) snd) "unary nope"))
+        (check cs "a float negates with fneg, at its own width"
+               (let ((r (one "neg" (VVal "x" LirFloat) (ty-scalar SF32))))
+                 (and (has (. r fst) "(fneg x)") (match (. r snd) ((Ok (some (VVal _ (LirFloat)))) true) (_ false))))))))
+
+(defun float-checks (cs: Checks) -> unit
+  (let ((x (VVal "x" LirDouble)) (y (VVal "y" LirDouble)) (t (ty-scalar SF64)))
+    (do (table-checks cs "f64" x y t
+                      [(Pair "+" (Pair "(fadd x y)" LirDouble)) (Pair "-" (Pair "(fsub x y)" LirDouble)) (Pair "*" (Pair "(fmul x y)" LirDouble))
+                       (Pair "fdiv" (Pair "(fdiv x y)" LirDouble)) (Pair "rem" (Pair "(frem x y)" LirDouble))
+                       (Pair "quot" (Pair "(call @trunc " LirDouble)) (Pair "=" (Pair "(fcmp oeq x y)" LirI1)) (Pair "!=" (Pair "(fcmp une x y)" LirI1))
+                       (Pair "<" (Pair "(fcmp olt x y)" LirI1)) (Pair "<=" (Pair "(fcmp ole x y)" LirI1)) (Pair ">" (Pair "(fcmp ogt x y)" LirI1))
+                       (Pair ">=" (Pair "(fcmp oge x y)" LirI1))])
+        (check cs "f32 quot truncates with truncf, after the division"
+               (let ((r (ran "quot" (VVal "x" LirFloat) (VVal "y" LirFloat) (ty-scalar SF32))))
+                 (and (has (. r cx) "(fdiv x y)") (has (. r cx) "(call @truncf ") (not (has (. r cx) "(call @trunc ")) (= (ty-of r) (some LirFloat))))))))
+
+(defun other-checks (cs: Checks) -> unit
+  (do (check cs "strings compare by fib.str-cmp against zero"
+             (let ((cx (plain)) (r (lcx-native-method cx "Ord" "<" [(VVal "a" LirPtr) (VVal "b" LirPtr)] [(TCon KStr []) (TCon KStr [])] (ty-scalar SBool))))
+               (and (has cx "(call @fib.str-cmp a b)") (has cx "(icmp slt ") (has cx "(i32 0))") (= (ty-of (Ran cx r)) (some LirI1)))))
+      (check cs "a string comparison needs its second operand"
+             (starts-err (lcx-native-method (plain) "Ord" "<" [(VVal "a" LirPtr)] [(TCon KStr [])] (ty-scalar SBool)) "a string comparison"))
+      (check cs "keywords order by name through kw.rank, and the module then has the keyword helpers"
+             (let ((cx (plain)) (kw (ty-scalar SKeyword)))
+               (do (lcx-native-method cx "Ord" "<" [a64 b64] [kw kw] (ty-scalar SBool))
+                   (and (has cx "(call @kw.rank a)") (has cx "(call @kw.rank b)") @(. (. cx p) keyword-helpers)))))
+      (check cs "and equality of keywords is the integer one, with no helpers"
+             (let ((cx (plain)) (kw (ty-scalar SKeyword)))
+               (do (lcx-native-method cx "Eq" "=" [a64 b64] [kw kw] (ty-scalar SBool))
+                   (and (has cx "(icmp eq a b)") (not @(. (. cx p) keyword-helpers))))))
+      (check cs "unit equals itself and is neither below nor above"
+             (let ((u (fn (m: str) (lcx-native-method (plain) "Ord" m [VUnit VUnit] [(ty-unit) (ty-unit)] (ty-scalar SBool)))))
+               (and (= (u "=") (Ok (some (v-int LirI1 1)))) (= (u ">=") (Ok (some (v-int LirI1 1)))) (= (u "<") (Ok (some (v-int LirI1 0))))
+                    (= (u "!=") (Ok (some (v-int LirI1 0)))) (starts-err (u "+") "+ on unit"))))))
+
+(defun convert-checks (cs: Checks) -> unit
+  (let ((conv (fn (op: ConvOp to: Scalar v: V) (let ((cx (plain))) (Pair cx (lcx-convert cx op to v)))))
+        (x (VVal "x" LirDouble)) (n (VVal "n" LirI64)))
+    (do (check cs "trunc, zext, sext" (and (has (. (conv (CvIntToInt Trunc) SI8 n) fst) "(trunc i8 n)") (has (. (conv (CvIntToInt Zext) SI64 (VVal "n" LirI32)) fst) "(zext i64 n)")
+                                           (has (. (conv (CvIntToInt Sext) SI64 (VVal "n" LirI8)) fst) "(sext i64 n)")))
+        (check cs "an integer conversion to the same width is no instruction"
+               (let ((r (conv (CvIntToInt Sext) SI64 n))) (and (= (. r snd) (Ok n)) (not (has (. r fst) "sext")))))
+        (check cs "fptrunc and fpext, and a float to its own type is no instruction"
+               (and (has (. (conv CvFloatToFloat SF32 x) fst) "(fptrunc float x)") (has (. (conv CvFloatToFloat SF64 (VVal "x" LirFloat)) fst) "(fpext double x)")
+                    (= (. (conv CvFloatToFloat SF64 x) snd) (Ok x))))
+        (check cs "float to integer saturates, signed or not"
+               (and (has (. (conv (CvFloatToInt true) SI8 x) fst) "(fptosi-sat i8 x)") (has (. (conv (CvFloatToInt false) SI32 x) fst) "(fptoui-sat i32 x)")))
+        (check cs "integer to float, signed or not"
+               (and (has (. (conv (CvIntToFloat true) SF64 n) fst) "(sitofp double n)") (has (. (conv (CvIntToFloat false) SF32 n) fst) "(uitofp float n)")))
+        (check cs "a conversion to unit or of unit is an error"
+               (and (starts-err (. (conv (CvIntToInt Zext) SUnit n) snd) "conversion to unit") (starts-err (. (conv (CvIntToInt Zext) SI64 VUnit) snd) "conversion of unit"))))))
+
+(defun bits-checks (cs: Checks) -> unit
+  (let ((one (fn (name: str v: V) (let ((cx (plain))) (Pair cx (lcx-float-bits cx name v))))))
+    (do (check cs "the four bit casts are bitcasts to the width's other type"
+               (and (has (. (one "f64->bits" (VVal "x" LirDouble)) fst) "(bitcast i64 x)") (has (. (one "bits->f64" a64) fst) "(bitcast double a)")
+                    (has (. (one "f32->bits" (VVal "x" LirFloat)) fst) "(bitcast i32 x)") (has (. (one "bits->f32" (VVal "n" LirI32)) fst) "(bitcast float n)")))
+        (check cs "another name is an error" (starts-err (. (one "f16->bits" a64) snd) "builtin f16->bits")))))
+
+(defun trap-checks (cs: Checks) -> unit
+  (let ((cx (plain)))
+    (do (lcx-trap-if cx (VVal "c" LirI1) "boom")
+        (check cs "trap-if branches on the flag to a trap block and continues in a fresh ok block"
+               (and (has cx "(br c ") (has cx "(string \"boom\")") (has cx "(unreachable)") (s/starts-with? (fb-current (. cx b)) "ok"))))))
+
+;; ---- calls
+
+(defun emitted (target: Target vals: (Vec V) rt: Ty tail: bool) -> Ran
+  (let ((cx (plain))) (Ran cx (match (lcx-emit-call cx target vals rt tail) ((Ok v) (Ok (some v))) ((Err e) (Err e))))))
+
+(defun emit-call-checks (cs: Checks) -> unit
+  (do (check cs "a direct call: the unit argument is not passed, the result is a value of the return type"
+               (let ((r (emitted (TgDirect "f.g" false) [a64 VUnit b64] t64 false))) (and (has (. r cx) "(call @f.g a b)") (= (ty-of r) (some LirI64)))))
+        (check cs "an all-owned callee takes a null environment first"
+               (has (. (emitted (TgDirect "f.g" true) [a64] t64 false) cx) "(call @f.g (ptr null) a)"))
+        (check cs "a tail call ends the block and yields unit"
+               (let ((r (emitted (TgDirect "f.g" false) [a64] t64 true))) (and (= (. r r) (Ok (some VUnit))) (fb-closed (. (. r cx) b)) (has (. r cx) "(tailcall @f.g a)"))))
+        (check cs "a unit result is a statement"
+               (let ((r (emitted (TgDirect "f.g" false) [a64] (ty-unit) false))) (and (= (. r r) (Ok (some VUnit))) (has (. r cx) "(call @f.g a)"))))
+        (check cs "an extern is called by its own name"
+               (has (. (emitted (TgExtern "abs") [a64] t64 false) cx) "(call @abs a)"))
+        (check cs "a vtable's code is called indirectly with this first and the types of the rest"
+               (let ((r (emitted (TgCode "c1" "this") [(VVal "this" LirPtr) a64 b64] t64 false)))
+                 (has (. r cx) "(indirect-call c1 (fn tailcc i64 (ptr i64 i64)) this a b)")))
+        (check cs "a closure's code is loaded from the closure object and called with it first, in tail position too"
+               (let ((r (emitted (TgValue (VVal "clo" LirPtr)) [a64] t64 true)))
+                 (and (has (. r cx) "(getelementptr %struct.fib.closure clo (i32 0) (i32 3))") (has (. r cx) "(load ptr ")
+                      (has (. r cx) "(indirect-tailcall ") (has (. r cx) "(fn tailcc i64 (ptr i64)) clo a)"))))
+        (check cs "a unit-returning closure call has void in its type"
+               (has (. (emitted (TgValue (VVal "clo" LirPtr)) [] (ty-unit) false) cx) "(fn tailcc void (ptr)) clo )"))
+        (check cs "a builtin is not a callable target" (starts-err (. (emitted (TgBuiltin "x") [] t64 false) r) "not a callable target"))))
+
+(defun cell-checks (cs: Checks) -> unit
+  (let ((cx (plain)) (cy (plain)))
+    (do (check cs "a cell's content: the field's address, then the load"
+               (and (match (lcx-cell-load cx "o.cell" "c" t64) ((Ok (VVal _ (LirI64))) true) (_ false))
+                    (has cx "(getelementptr %struct.o.cell c (i32 0) (i32 3))") (has cx "(load i64 ")))
+        (check cs "a unit content has no load, but the address is taken as in the Rust"
+               (and (= (lcx-cell-load cy "o.cell" "c" (ty-unit)) (Ok VUnit)) (has cy "(getelementptr") (not (has cy "(load")))))))
+
+;; ---- instance-of-pred
+
+(defun inst (proto: i64 con: Con vars: (Vec str) head: Ty) -> InstanceDef
+  (InstanceDef proto con 2 vars head [] [] [] (Pos "t" 0 0 0 0)))
+
+(defun with-instances () -> LowerCx
+  (let ((g (globals-new)))
+    (do (table-add (. g protos) (ProtoDef "Top" 2 [] [] [] (Pos "t" 0 0 0 0)))
+        (doseq [i [(inst 0 (KNominal 5) ["a" "b"] (TCon (KNominal 5) [(TGen 1) (TGen 0)]))
+                   (inst 0 (KNominal 7) ["a" "b"] (TCon (KNominal 7) [(TGen 0)]))
+                   (inst 0 (KNominal 8) ["a" "b"] (TCon (KNominal 8) [(TFn CLocal [(TGen 0)] (TGen 1))]))]]
+          (let ((id (table-add (. g instances) i)))
+            (set! (. g instance-index) (assoc @(. g instance-index) (InstKey 0 (. i con)) id))))
+        (cx-over g (body-own-new)))))
+
+(defun pred-checks (cs: Checks) -> unit
+  (let ((cx (with-instances)) (bool (ty-scalar SBool)))
+    (do (check cs "the head's variables take the actual's arguments, by their own index"
+               (= (lcx-instance-of-pred cx (PProto 0 [(TCon (KNominal 5) [t64 bool])])) (Ok (Pair 0 [bool t64]))))
+        (check cs "a function type in the head is matched too"
+               (= (lcx-instance-of-pred cx (PProto 0 [(TCon (KNominal 8) [(TFn CLocal [t64] bool)])])) (Ok (Pair 2 [t64 bool]))))
+        (check cs "a variable the head does not fix is an error"
+               (starts-err (lcx-instance-of-pred cx (PProto 0 [(TCon (KNominal 7) [t64])])) "an instance variable the head does not fix"))
+        (check cs "no instance for the constructor"
+               (starts-err (lcx-instance-of-pred cx (PProto 0 [(TCon (KNominal 6) [])])) "no instance of Top"))
+        (check cs "a function type, a variable, a predicate that is no protocol and a protocol without arguments are errors"
+               (and (starts-err (lcx-instance-of-pred cx (PProto 0 [(TFn CLocal [] t64)])) "a protocol instance on a function type")
+                    (starts-err (lcx-instance-of-pred cx (PProto 0 [(TVar 3)])) "a type variable at a method call")
+                    (starts-err (lcx-instance-of-pred cx (PSend t64)) "a non-protocol bound at a method call")
+                    (starts-err (lcx-instance-of-pred cx (PProto 0 [])) "a protocol without a head"))))))
+
+;; ---- the site
+
+(defun call-own (callee: Callee) -> BodyOwn
+  (BodyOwn [] (map-empty) (map-empty) (assoc (map-empty) 1 (CallOwn callee TlNotInTail PsScalar [] [] [])) (map-empty) (map-empty) (map-empty) (set-empty) (map-empty)))
+
+(defun site-checks (cs: Checks) -> unit
+  (let ((at (fn (callee: Callee) (lcx-call (cx-over (globals-new) (call-own callee)) (lit 1) (lit 2) []))))
+    (do (check cs "no plan for the call is an error" (starts-err (lcx-call (plain) (lit 1) (lit 2) []) "no plan for a call"))
+        (check cs "a plan with fewer passes than arguments stops at the first argument without one"
+               (starts-err (lcx-call (cx-over (globals-new) (call-own (CalFun 0))) (lit 1) (lit 2) [(ArgExpr (lit 3))]) "no pass for an argument"))
+        (check cs "a method call with no resolution, a function with no scheme, a constructor or extern callee on another head"
+               (and (starts-err (at (CalMethod 0 0)) "a method call without a resolution") (starts-err (at (CalFun 0)) "a function without a scheme")
+                    (starts-err (at (CalAllOwned 0)) "a function without a scheme") (starts-err (at CalCtor) "callee Ctor")
+                    (starts-err (at CalExtern) "callee Extern"))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (int-checks cs) (division-checks cs) (unary-checks cs) (float-checks cs) (other-checks cs) (convert-checks cs) (bits-checks cs)
+        (trap-checks cs) (emit-call-checks cs) (cell-checks cs) (pred-checks cs) (site-checks cs) (finish cs))))

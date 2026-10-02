@@ -1,48 +1,221 @@
-;; compiler/emit/lower/objects.fib: objects: allocation, construction, field access, closures, globals.
-;; Replaces crates/fibc/src/lower/objects.rs.
-;; STATUS: every public function below is a STUB of package E6, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/objects.rs, 273 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/objects.fib: objects: allocation, construction, field access, closures, globals (types §8.3, §8.4).
+;; Replaces crates/fibc/src/lower/objects.rs (273 lines of Rust). The statement order is Rust's: a `gep` before its `store`, the
+;; type of an object before its allocation, a closure's captures retained before its object is allocated.
+;; Below the call protocol: what it needs from above (`method_value`, `builtin_value`) it calls through the hub.
 (ns emit.lower.objects
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.scheme types.ast types.decls types.init own.program emit.value emit.layout emit.mono emit.ir emit.objects emit.statics
+        emit.program emit.lower.cx emit.lower.ops))
 
-;; Rust: lower/objects.rs:20 LowerCx::alloc_at
+;; The object of allocation site `e`: on the heap through `fib.alloc`, or a `STACK` object in the site's entry-block slot (§8.2), as the
+;; plan decided. Rust: lower/objects.rs:20 LowerCx::alloc_at
 (defun lcx-alloc-at (cx: LowerCx e: i64 tid: i64 sname: str size: i64) -> (Result str str)
-  (Err "todo: E6 lcx-alloc-at"))
+  (match (get (. (. cx own) allocs) e)
+    ((some (AlStack))
+     (let ((slot (match (get @(. cx stack-slots) e)
+                   ((some s) s)
+                   (nil (let ((s (fb-entry-alloca (. cx b) (str-join ["%struct." sname]) size)))
+                          (do (set! (. cx stack-slots) (assoc @(. cx stack-slots) e s))
+                              s))))))
+       (do (fb-stmt (. cx b) (str-join ["(call @fib.stack-init " slot " (i32 " (str tid) "))"]))
+           (Ok slot))))
+    ((some (AlNothing)) (Err "an allocation the plan says allocates nothing"))
+    (_ (Ok (lcx-heap-alloc cx tid size)))))
 
-;; Rust: lower/objects.rs:43 LowerCx::heap_alloc
+;; A counted heap object of `size` bytes, count 1. Rust: lower/objects.rs:43 LowerCx::heap_alloc
 (defun lcx-heap-alloc (cx: LowerCx tid: i64 size: i64) -> str
-  (trap "todo: E6 lcx-heap-alloc"))
+  (v-text (fb-val (. cx b) (str-join ["(call @fib.alloc (i64 " (str size) ") (i32 " (str tid) "))"]) LirPtr)))
 
-;; Rust: lower/objects.rs:54 LowerCx::construct
+;; An object type's id, struct name and size.
+(defstruct ObjAt (tid: i64 sname: str size: i64))
+
+;; The object of type `t` and its size: the table's entry, interned on first use.
+(defun lcx-object-of (cx: LowerCx t: Ty) -> (Result ObjAt str)
+  (try-let ((obj (program-object (. cx p) t)))
+    (Ok (ObjAt (. obj fst) (. obj snd) (obj-size (objects-get (. (. cx p) objects) (. obj fst)))))))
+
+;; The object allocated, its tag stored when it is a variant's, its fields stored from slot `base`.
+(defun build-object :private (cx: LowerCx e: Expr o: ObjAt sname: str base: i64 tag: (Option i64) vals: (Vec V))
+    -> (Result V str)
+  (try-let ((p (lcx-alloc-at cx (. e id) (. o tid) sname (. o size))))
+    (do (when-some [i tag]
+          (fb-stmt (. cx b) (str-join ["(store (i32 " (str i) ") " (lcx-gep cx sname p slot-enum-tag) ")"])))
+        (lcx-store-fields cx sname p base vals)
+        (Ok (VVal p LirPtr)))))
+
+;; A constructor call: the object with its fields stored. Rust: lower/objects.rs:54 LowerCx::construct
 (defun lcx-construct (cx: LowerCx e: Expr id: i64 variant: (Option i64) vals: (Vec V)) -> (Result V str)
-  (Err "todo: E6 lcx-construct"))
+  (try-let ((t (lcx-ty cx e)))
+    (let ((g (program-g (. cx p))))
+      (if (= id @(. g option))
+          (construct-option cx e variant vals t)
+          (let ((def (g-ty g id)))
+            (if (typedef-is-fieldless-enum def)
+                (Ok (v-int LirI32 (unwrap-or variant 0)))
+                (try-let ((o (lcx-object-of cx t)))
+                  (match (. def shape)
+                    ((TsStruct _) (build-object cx e o (. o sname) slot-struct-field0 nil vals))
+                    ((TsEnum _)
+                     (match variant
+                       (nil (Err "an enum constructor without a variant"))
+                       ((some i) (build-object cx e o (str-join [(. o sname) ".v" (str i)]) slot-variant-field0 variant vals))))))))))))
 
-;; Rust: lower/objects.rs:84 LowerCx::store_fields
+;; Stores values into consecutive fields from `base`, skipping `unit` values. Rust: lower/objects.rs:84 LowerCx::store_fields
 (defun lcx-store-fields (cx: LowerCx sname: str p: str base: i64 vals: (Vec V)) -> unit
-  (trap "todo: E6 lcx-store-fields"))
+  (do (reduce (fn (slot: i64 v: V)
+                (match v
+                  ((VUnit) slot)
+                  (_ (do (lcx-store cx v (lcx-gep cx sname p slot)) (+ slot 1)))))
+              base vals)
+      ()))
 
-;; Rust: lower/objects.rs:127 LowerCx::field_of
+;; `(some x)` and `nil` of an `Option`: null or the payload when `Option` is a nullable pointer, else a heap enum with a tag.
+;; Rust: lower/objects.rs:93 LowerCx::construct_option
+(defun construct-option :private (cx: LowerCx e: Expr variant: (Option i64) vals: (Vec V) t: Ty) -> (Result V str)
+  (let ((g (program-g (. cx p))))
+    (match (option-payload g t)
+      (nil (Err "an Option constructor at a non-Option type"))
+      ((some payload)
+       (try-let ((rep (option-rep g payload)))
+         (match rep
+           ((OptNull)
+            (match variant
+              ((some 0) (Ok (v-null)))
+              (_ (match (first vals) ((some v) (Ok v)) (nil (Err "some without a payload"))))))
+           ((OptBoxed)
+            ;; A `nil` whose site the plan gave no allocation (a generic payload) is the null pointer, as the interpreter makes it.
+            (if (and (= variant (some 0)) (nil? (get (. (. cx own) allocs) (. e id))))
+                (Ok (v-null))
+                (try-let ((o (lcx-object-of cx t)))
+                  (build-object cx e o (str-join [(. o sname) ".v" (str (unwrap-or variant 0))]) slot-variant-field0
+                                (some (unwrap-or variant 0)) vals))))))))))
+
+;; A field of a struct type: its index, the types of all the fields and its slot in the object (the slot of the field
+;; before it, plus one for each earlier field that is not `unit`). Rust: the shared part of objects.rs:127 field_of and cells.rs:272 set_field
+(defstruct FieldAt (index: i64 tys: (Vec Ty) slot: i64))
+
+;; Where field `name` of the struct `t` is; `what` names the form in the messages.
+(defun field-at (cx: LowerCx t: Ty what: str name: str) -> (Result FieldAt str)
+  (match t
+    ((TCon (KNominal id) args)
+     (match (. (g-ty (program-g (. cx p)) id) shape)
+       ((TsEnum _) (Err (str-join [what " on an enum"])))
+       ((TsStruct fs)
+        (let ((index (loop ((i 0)) (if (< i (count fs)) (if (= (. (nth fs i) name) name) (some i) (recur (+ i 1))) nil))))
+          (match index
+            (nil (Err (str-join ["no field " name])))
+            ((some k)
+             (try-let ((vs (variants (program-g (. cx p)) id args)))
+               (let ((tys (. (nth vs 0) tys)))
+                 (loop ((i 0) (slot slot-struct-field0))
+                   (if (< i k)
+                       (try-let ((l (program-lir (. cx p) (nth tys i))))
+                         (recur (+ i 1) (if (nil? l) slot (+ slot 1))))
+                       (Ok (FieldAt k tys slot))))))))))))
+    (_ (Err (str-join [what " on a non-struct"])))))
+
+;; `(. x f)`: a field load, no count operation (§6.2). Rust: lower/objects.rs:127 LowerCx::field_of
 (defun lcx-field-of (cx: LowerCx x: Expr name: str) -> (Result V str)
-  (Err "todo: E6 lcx-field-of"))
+  (try-let ((v (lcx-value cx x)) (t (lcx-ty cx x)) (at (field-at cx t "field access" name)) (obj (program-object (. cx p) t))
+            (l (program-lir (. cx p) (nth (. at tys) (. at index)))))
+    (Ok (match l
+          ((some lt) (lcx-load cx lt (lcx-gep cx (. obj snd) (v-text v) (. at slot))))
+          (nil VUnit)))))
 
-;; Rust: lower/objects.rs:160 LowerCx::capture_tys
+;; The lIR types of a closure's capture slots. Rust: lower/objects.rs:160 LowerCx::capture_tys
 (defun lcx-capture-tys (cx: LowerCx own: ClosureOwn) -> (Result (Vec LirTy) str)
-  (Err "todo: E6 lcx-capture-tys"))
+  (try-map (fn (c: CaptureOwn)
+             (try-let ((t (lcx-binding-ty cx (. c binding))) (l (program-lir (. cx p) t)))
+               (match l ((some x) (Ok x)) (nil (Err "a unit capture")))))
+           (. own captures)))
 
+;; The values of a closure's captures, those the plan says retain retained as they are taken.
+(defun capture-values :private (cx: LowerCx own: ClosureOwn) -> (Result (Vec V) str)
+  (try-map (fn (c: CaptureOwn)
+             (try-let ((v (lcx-local cx (. c binding))))
+               (do (match (. c pass) ((PsRetain) (lcx-retain cx v)) (_ ()))
+                   (Ok v))))
+           (. own captures)))
+
+;; A `fn` literal: its closure object (§8.4), heap or stack as the plan says, captures taken as their passes say.
 ;; Rust: lower/objects.rs:174 LowerCx::make_fn
 (defun lcx-make-fn (cx: LowerCx e: Expr) -> (Result V str)
-  (Err "todo: E6 lcx-make-fn"))
+  (match (get (. (. cx own) closures) (. e id))
+    (nil (Err "no plan for a fn literal"))
+    ((some own)
+     (if (. own is-async)
+         (Err "async")
+         (try-let ((caps (lcx-capture-tys cx own)))
+           (let ((code (program-request-closure (. cx p) (. cx inst) (. cx name) (. e id))))
+             (let ((r (program-closure-object (. cx p) code caps)))
+               (let ((tid (. r fst)) (sname (. r snd)))
+                 (let ((size (obj-size (objects-get (. (. cx p) objects) tid))))
+                   (try-let ((vals (capture-values cx own)) (p (lcx-alloc-at cx (. e id) tid sname size)))
+                     (do (match (get (. (. cx own) allocs) (. e id))
+                           ((some (AlStack)) (set! (. cx closure-slots) (conj @(. cx closure-slots) p)))
+                           (_ ()))
+                         (let ((codep (lcx-gep cx sname p slot-closure-code)))
+                           (do (fb-stmt (. cx b) (str-join ["(store @" code " " codep ")"]))
+                               (lcx-store-fields cx sname p slot-capture0 vals)
+                               (Ok (VVal p LirPtr)))))))))))))))
 
+;; The constructor `v` of type `t` as a value: a field-less variant's index, or an object with no fields. Rust: lower/objects.rs:250 ctor_value
+(defun ctor-value :private (cx: LowerCx e: Expr t: i64 v: (Option i64)) -> (Result V str)
+  (let ((g (program-g (. cx p))))
+    (let ((def (g-ty g t)))
+      (let ((fieldless (match (. def shape)
+                         ((TsEnum vs) (match v ((some i) (match (get vs i) ((some x) (empty? (. x fields))) (nil false))) (nil false)))
+                         (_ false))))
+        (if (and (= t @(. g option)) (= v (some 0)))
+            (lcx-construct cx e t v [])
+            (match v
+              ((some i)
+               (if (and fieldless (typedef-is-fieldless-enum def))
+                   (Ok (v-int LirI32 i))
+                   (if fieldless (lcx-construct cx e t v []) (Err "a constructor as a value"))))
+              (nil (Err "a constructor as a value"))))))))
+
+;; A `def`'s value: its constant, or a load of the slot the init functions fill before `main`. Rust: lower/objects.rs:233 (the `Def` arm)
+(defun def-value :private (cx: LowerCx d: i64) -> (Result V str)
+  (match (get @(. (. cx p) def-values) d)
+    ((some (DefValue text (some l))) (Ok (VVal text l)))
+    ((some (DefValue _ nil)) (Ok VUnit))
+    (nil
+     (match (get @(. (. cx p) def-slots) d)
+       ((some (DefValue slot (some l))) (Ok (lcx-load cx l (str-join ["@" slot]))))
+       ((some (DefValue _ nil)) (Ok VUnit))
+       (nil (Err (str-join ["def " (. (g-def (program-g (. cx p)) d) name)
+                            " is read where it has no value: it is not a constant and no init function makes it here"])))))))
+
+;; A named function as a value: its immortal closure with no captures, at the instantiation recorded for the expression.
+(defun fun-value :private (cx: LowerCx e: Expr f: i64) -> (Result V str)
+  (match (get (. (. (. cx p) typed) fun-schemes) f)
+    (nil (Err "a function without a scheme"))
+    ((some scheme)
+     (let ((tys (match (get (. (. (. cx p) typed) instantiations) (. e id))
+                  ((some i) (mapv (fn (t: Ty) (inst-subst (. cx inst) t)) (. i tys)))
+                  (nil []))))
+       (try-let ((key (fun-key (program-g (. cx p)) scheme tys)))
+         (let ((code (program-request (. cx p) (BodyAllOwned f) key)))
+           (let ((r (program-closure-object (. cx p) code [])))
+             (Ok (VVal (statics-closure (. (. cx p) statics) code (. r fst)) LirPtr)))))))))
+
+;; A global name as a value: a named function's immortal closure (§8.4), a field-less variant's index, a `def`.
 ;; Rust: lower/objects.rs:210 LowerCx::global
 (defun lcx-global (cx: LowerCx e: Expr g: GlobalRef) -> (Result V str)
-  (Err "todo: E6 lcx-global"))
+  (match g
+    ((GFun f) (fun-value cx e f))
+    ((GCtor t v) (ctor-value cx e t v))
+    ((GMethod p i) ((. (. cx hub) method-value) cx e p i))
+    ((GBuiltin b) ((. (. cx hub) builtin-value) cx e b))
+    ((GDef d) (def-value cx d))
+    ((GExtern _) (Err "an extern as a value"))))
 
-;; Rust: lower/objects.rs:262 LowerCx::literal_expr
+;; The expression a literal id names, for closure bodies. Rust: lower/objects.rs:262 LowerCx::literal_expr
 (defun lcx-literal-expr (cx: LowerCx lit: i64) -> (Result Expr str)
-  (Err "todo: E6 lcx-literal-expr"))
+  (match (get (. cx lits) lit)
+    ((some e) (Ok e))
+    (nil (Err (str-join ["no literal ExprId(" (str lit) ")"])))))
 
-;; Rust: lower/objects.rs:270
+;; Whether an expression is a `fn` literal. Rust: lower/objects.rs:270
 (defun is-fn (e: Expr) -> bool
-  (trap "todo: E6 is-fn"))
+  (match (. e kind) ((EFn _) true) (_ false)))

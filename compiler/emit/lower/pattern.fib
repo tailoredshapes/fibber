@@ -1,23 +1,233 @@
-;; compiler/emit/lower/pattern.fib: patterns: irrefutable binding and refutable matching. Replaces crates/fibc/src/lower/pattern.rs; `VecIds` is in emit.lower.cx.
-;; STATUS: every public function below is a STUB of package E7, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/pattern.rs, 363 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/pattern.fib: patterns: irrefutable binding and refutable matching (types §2.6, §8.3): tests that branch to a
+;; failure label, binding variables on the way; `Option` by its representation, an enum by its tag through the variant struct.
+;; Replaces crates/fibc/src/lower/pattern.rs; `VecIds` is in emit.lower.cx. The order of the fresh names and of the calls that
+;; intern or emit is the Rust's (the dead `gep` and `load` of a field matched by `_` too): a name asked for earlier shifts every later
+;; one. `Lit` tests, the `Pair`/`Triple` tuple test and the vector rest are here too; no `case` or or-pattern in the language, so the
+;; Rust's multi-name arms are single ones.
 (ns emit.lower.pattern
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.scheme types.ast types.decls types.names types.init own.program emit.value emit.layout emit.ir emit.objects.kinds
+        emit.statics emit.text emit.program emit.lower.cx))
 
-;; Rust: lower/pattern.rs:28 LowerCx::bind_irrefutable
+;; Continues in a fresh block when `c` holds, else goes to `fail`. Rust: pattern.rs:178 branch
+(defun branch :private (cx: LowerCx c: V fail: str) -> unit
+  (let ((ok (fb-label (. cx b) "ok")))
+    (do (fb-term (. cx b) (str-join ["(br " (v-text c) " " ok " " fail ")"]))
+        (fb-open (. cx b) ok))))
+
+;; A comparison value: `(icmp eq x (T n))` and the like.
+(defun test-val :private (cx: LowerCx text: str) -> V
+  (fb-val (. cx b) text LirI1))
+
+(defun bind-local :private (cx: LowerCx b: i64 v: V) -> unit
+  (set! (. cx locals) (assoc @(. cx locals) b (LocalVal v))))
+
+(defun wild? :private (p: Pattern) -> bool
+  (match (. p kind) ((PWild) true) (_ false)))
+
+;; Whether `id` is the prelude's `Pair` or `Triple`, which a vector pattern `[a b]` matches field by field (stdlib §7 L3b).
+;; Rust: decls.rs:447 Globals::is_tuple
+(defun is-tuple :private (g: Globals id: i64) -> bool
+  (let ((def (g-ty g id)))
+    (and (= (. def module) module-prelude)
+         (or (= (. def name) "Pair") (= (. def name) "Triple"))
+         (match (. def shape) ((TsStruct _) true) (_ false)))))
+
+;; The test of a literal pattern against the value. Rust: pattern.rs:188 lit_test
+(defun lit-test :private (cx: LowerCx l: Lit v: V) -> (Result V str)
+  (let ((x (v-text v)) (st (. (. cx p) statics)))
+    (match l
+      ((LitInt n _)
+       (match (v-ty v)
+         ((some t) (Ok (test-val cx (str-join ["(icmp eq " x " (" (lir-ty-text t) " " (str n) "))"]))))
+         (nil (Err "literal pattern on unit"))))
+      ((LitFloat f _)
+       (match (v-ty v)
+         ((some t) (Ok (test-val cx (str-join ["(fcmp oeq " x " (" (lir-ty-text t) " " (float-lir-text f) "))"]))))
+         (nil (Err "literal pattern on unit"))))
+      ((LitChar c) (Ok (test-val cx (str-join ["(icmp eq " x " (i32 " (str (long c)) "))"]))))
+      ((LitBool b) (Ok (test-val cx (str-join ["(icmp eq " x " (i1 " (if b "1" "0") "))"]))))
+      ((LitKeyword k) (let ((id (statics-keyword st k)))
+                        (Ok (test-val cx (str-join ["(icmp eq " x " (i64 " (str id) "))"])))))
+      ((LitStr s) (let ((lit (statics-string st s 0)))
+                    (Ok (test-val cx (str-join ["(call @fib.str-eq " x " " lit ")"])))))
+      ((LitUnit) (Ok (v-int LirI1 1))))))
+
+;; The sub-patterns of a struct or variant, each against the field loaded from the object (a field of type `unit` has no slot).
+;; Rust: pattern.rs:243 sub_patterns
+(defun sub-patterns :private (cx: LowerCx sname: str base: i64 fields: (Vec Ty) subs: (Vec Pattern) v: V fail: str)
+    -> (Result unit str)
+  (loop ((i 0) (slot base))
+    (if (< i (min (count subs) (count fields)))
+        (let ((ft (nth fields i)) (p (nth subs i)))
+          (try-let ((lt (program-lir (. cx p) ft)))
+            (let ((fv (match lt
+                        ((some l) (lcx-load cx l (lcx-gep cx sname (v-text v) slot)))
+                        (nil VUnit))))
+              (try-let ((done (if (wild? p) (Ok ()) (lcx-match-pattern cx p fv ft fail))))
+                (recur (+ i 1) (if (some? lt) (+ slot 1) slot))))))
+        (Ok ()))))
+
+;; The test that the tag of the enum object `v` is `want`, branching to `fail` otherwise. Rust: pattern.rs:218
+(defun check-tag :private (cx: LowerCx sname: str v: V want: i64 fail: str) -> unit
+  (let ((tag (lcx-load cx LirI32 (lcx-gep cx sname (v-text v) slot-enum-tag))))
+    (branch cx (test-val cx (str-join ["(icmp eq " (v-text tag) " (i32 " (str want) "))"])) fail)))
+
+;; A struct or enum pattern on an object of type `t` (arguments `args`). Rust: pattern.rs:205 ctor_pattern (after the tests of
+;; `Option` and of field-less enums)
+(defun object-pattern :private (cx: LowerCx def: TypeDef id: i64 args: (Vec Ty) variant: (Option i64) subs: (Vec Pattern) v: V t: Ty
+                                fail: str) -> (Result unit str)
+  (try-let ((o (program-object (. cx p) t)) (vs (variants (program-g (. cx p)) id args)))
+    (let ((sname (. o snd)))
+      (match (. def shape)
+        ((TsStruct _) (sub-patterns cx sname slot-struct-field0 (. (nth vs 0) tys) subs v fail))
+        ((TsEnum _)
+         (match variant
+           (nil (Err "an enum pattern without a variant"))
+           ((some i) (do (check-tag cx sname v i fail)
+                         (sub-patterns cx (str-join [sname ".v" (str i)]) slot-variant-field0 (. (nth vs i) tys) subs v fail)))))))))
+
+;; Rust: pattern.rs:205 ctor_pattern
+(defun ctor-pattern :private (cx: LowerCx id: i64 variant: (Option i64) subs: (Vec Pattern) v: V t: Ty fail: str) -> (Result unit str)
+  (let ((g (program-g (. cx p))))
+    (if (= id @(. g option))
+        (option-pattern cx variant subs v t fail)
+        (let ((def (g-ty g id)))
+          (if (typedef-is-fieldless-enum def)
+              (do (branch cx (test-val cx (str-join ["(icmp eq " (v-text v) " (i32 " (str (unwrap-or variant 0)) "))"])) fail)
+                  (Ok ()))
+              (match t
+                ((TCon (KNominal _) args) (object-pattern cx def id args variant subs v t fail))
+                (_ (Err "a constructor pattern on a non-nominal type"))))))))
+
+;; `(Option payload)` by its representation: a null pointer for `nil` when the payload is a pointer, else a boxed enum whose `nil`
+;; may be null, so the tag is read only from a non-null value. Rust: pattern.rs:300 option_pattern
+(defun boxed-option :private (cx: LowerCx is-some: bool payload: Ty subs: (Vec Pattern) v: V t: Ty fail: str) -> (Result unit str)
+  (try-let ((o (program-object (. cx p) t)))
+    (let ((sname (. o snd))
+          (null (test-val cx (str-join ["(icmp eq " (v-text v) " (ptr null))"])))
+          (lnull (fb-label (. cx b) "onull")) (ltag (fb-label (. cx b) "otag")) (lok (fb-label (. cx b) "ok")))
+      (do (fb-term (. cx b) (str-join ["(br " (v-text null) " " lnull " " ltag ")"]))
+          (fb-open (. cx b) lnull)
+          (fb-term (. cx b) (str-join ["(br " (if is-some fail lok) ")"]))
+          (fb-open (. cx b) ltag)
+          (let ((tag (lcx-load cx LirI32 (lcx-gep cx sname (v-text v) slot-enum-tag)))
+                (c (test-val cx (str-join ["(icmp eq " (v-text tag) " (i32 " (if is-some "1" "0") "))"]))))
+            (do (fb-term (. cx b) (str-join ["(br " (v-text c) " " lok " " fail ")"]))
+                (fb-open (. cx b) lok)
+                (if is-some
+                    (sub-patterns cx (str-join [sname ".v1"]) slot-variant-field0 [payload] subs v fail)
+                    (Ok ()))))))))
+
+(defun option-pattern :private (cx: LowerCx variant: (Option i64) subs: (Vec Pattern) v: V t: Ty fail: str) -> (Result unit str)
+  (let ((g (program-g (. cx p))) (is-some (= variant (some 1))))
+    (match (option-payload g t)
+      (nil (Err "an Option pattern on a non-Option"))
+      ((some payload)
+       (try-let ((rep (option-rep g payload)))
+         (match rep
+           ((OptNull)
+            (do (branch cx (test-val cx (str-join ["(icmp " (if is-some "ne" "eq") " " (v-text v) " (ptr null))"])) fail)
+                (if (and is-some (= (count subs) 1))
+                    (lcx-match-pattern cx (nth subs 0) v payload fail)
+                    (Ok ()))))
+           ((OptBoxed) (boxed-option cx is-some payload subs v t fail))))))))
+
+;; The element `i` of the vector `v`, read as `vec-nth` reads it with no count operation. Rust: pattern.rs:90
+(defun vec-elem :private (cx: LowerCx v: V i: i64 el: (Option LirTy) esize: i64) -> V
+  (match el
+    ((some l) (lcx-load cx l (v-text (fb-val (. cx b)
+                                             (str-join ["(call @fib.vec-elem-ptr " (v-text v) " (i64 " (str i) ") (i64 " (str esize) "))"])
+                                             LirPtr))))
+    (nil VUnit)))
+
+;; A vector pattern of `elem`s (§8.3): the length test, then each element; a rest is noted for `lcx-build-rests`.
+;; Rust: pattern.rs:63 vec_pattern, after the tuple and element type tests
+(defun vec-elements :private (cx: LowerCx subs: (Vec Pattern) rest: Rest v: V t: Ty elem: Ty fail: str) -> (Result unit str)
+  (let ((n (fb-val (. cx b) (str-join ["(call @fib.vec-len " (v-text v) ")"]) LirI64))
+        (k (count subs)))
+    (let ((c (test-val cx (str-join ["(icmp " (match rest ((RestExact) "eq") (_ "sge")) " " (v-text n) " (i64 " (str k) "))"]))))
+      (do (branch cx c fail)
+          (try-let ((el (program-lir (. cx p) elem)))
+            (let ((esize (match el ((some l) (. (size-align l) fst)) (nil 0))))
+              (try-let ((done (try-each (fn (i: i64)
+                                          (let ((p (nth subs i)))
+                                            (if (wild? p)
+                                                (Ok ())
+                                                (lcx-match-pattern cx p (vec-elem cx v i el esize) elem fail))))
+                                        (vec (range k)))))
+                (do (match rest
+                      ((RestBind b) (set! (. cx rests) (conj @(. cx rests) (RestSlot b v k t))))
+                      (_ ()))
+                    (Ok ())))))))))
+
+;; Rust: pattern.rs:63 vec_pattern
+(defun vec-pattern :private (cx: LowerCx subs: (Vec Pattern) rest: Rest v: V t: Ty fail: str) -> (Result unit str)
+  (match t
+    ((TCon (KNominal id) args)
+     (if (is-tuple (program-g (. cx p)) id)
+         (ctor-pattern cx id nil subs v t fail)
+         (match (first args)
+           (nil (Err "a Vec without its element type"))
+           ((some elem) (vec-elements cx subs rest v t elem fail)))))
+    (_ (Err "a vector pattern on a non-Vec"))))
+
+;; Binds an irrefutable pattern (a `let`'s); a failure traps. Rust: lower/pattern.rs:28 LowerCx::bind_irrefutable
 (defun lcx-bind-irrefutable (cx: LowerCx pat: Pattern v: V t: Ty) -> (Result unit str)
-  (Err "todo: E7 lcx-bind-irrefutable"))
+  (let ((fail (fb-label (. cx b) "nomatch")) (ok (fb-label (. cx b) "bound")))
+    (try-let ((matched (lcx-match-pattern cx pat v t fail)) (rests (lcx-build-rests cx)))
+      (do (fb-term (. cx b) (str-join ["(br " ok ")"]))
+          (fb-open (. cx b) fail)
+          (lcx-trap-c cx "no match clause matched")
+          (fb-open (. cx b) ok)
+          (Ok ())))))
 
-;; Rust: lower/pattern.rs:43 LowerCx::match_pattern
+;; Tests `v : t` against `pat`, branching to `fail` on a mismatch and binding the pattern's variables; the current block on return
+;; is the success path. Rust: lower/pattern.rs:43 LowerCx::match_pattern
 (defun lcx-match-pattern (cx: LowerCx pat: Pattern v: V t: Ty fail: str) -> (Result unit str)
-  (Err "todo: E7 lcx-match-pattern"))
+  (match (. pat kind)
+    ((PWild) (Ok ()))
+    ((PBind b) (do (bind-local cx b v) (Ok ())))
+    ((PAs p b) (do (bind-local cx b v) (lcx-match-pattern cx p v t fail)))
+    ((PLit l) (try-let ((c (lit-test cx l v))) (do (branch cx c fail) (Ok ()))))
+    ((PCtor id variant subs) (ctor-pattern cx id variant subs v t fail))
+    ((PVec subs rest) (vec-pattern cx subs rest v t fail))))
 
+;; `(fib.vec-drop v k)`: the vector of `v`'s elements from `k` on. Rust: pattern.rs:152 vec_drop
+(defun vec-drop :private (cx: LowerCx v: V k: i64 t: Ty) -> (Result V str)
+  (match t
+    ((TCon (KNominal _) args)
+     (try-let ((ids (lcx-vec-tids cx t (nth args 0))))
+       (Ok (fb-val (. cx b)
+                   (str-join ["(call @fib.vec-drop " (v-text v) " (i64 " (str k) ") (i64 " (str (. ids esize)) ") (i8 "
+                              (str (. ids counted)) ") (i32 " (str (. ids tvec)) ") (i32 " (str (. ids tnode)) ") (i32 "
+                              (str (. ids tarr)) ") (i32 " (str (. ids tnarr)) "))"])
+                   LirPtr))))
+    (_ (Err "a rest of a non-Vec"))))
+
+;; Binds every rest variable noted by the pattern just matched to a new vector (`fib.vec-drop`), left to right (§6.3).
 ;; Rust: lower/pattern.rs:119 LowerCx::build_rests
 (defun lcx-build-rests (cx: LowerCx) -> (Result unit str)
-  (Err "todo: E7 lcx-build-rests"))
+  (let ((rests @(. cx rests)))
+    (do (set! (. cx rests) [])
+        (try-each (fn (r: RestSlot)
+                    (try-let ((d (vec-drop cx (. r v) (. r start) (. r ty))))
+                      (Ok (bind-local cx (. r binding) d))))
+                  rests))))
 
+;; The type ids and element layout the Vec runtime functions take for a `(Vec elem)` (rt/vec.lir, rt/vecbuild.lir).
 ;; Rust: lower/pattern.rs:130 LowerCx::vec_tids
 (defun lcx-vec-tids (cx: LowerCx t: Ty elem: Ty) -> (Result VecIds str)
-  (Err "todo: E7 lcx-vec-tids"))
+  (let ((p (. cx p)) (g (program-g (. cx p))))
+    (if (not (match t ((TCon (KNominal id) _) (= (some id) @(. g vec))) (_ false)))
+        (Err "a vector operation on a non-Vec")
+        (match (g-type-name g module-prelude "VNode")
+          (nil (Err "the prelude defines no VNode"))
+          ((some node-id)
+           (let ((node-ty (ty-nominal node-id [elem])))
+             (try-let ((tv (program-object p t)) (tn (program-object p node-ty))
+                       (ta (program-object p (TCon KArray [elem]))) (tna (program-object p (TCon KArray [node-ty])))
+                       (el (program-lir p elem)))
+               ;; The nodes of a Vec of `unit` are arrays of the `i1` slot an element of `unit` takes (builtins.rs `array_builtin`).
+               (let ((l (unwrap-or el LirI1)))
+                 (Ok (VecIds (. (size-align l) fst) (match l ((LirPtr) 1) ((LirDyn) 2) (_ 0))
+                             (. tv fst) (. tn fst) (. ta fst) (. tna fst)))))))))))

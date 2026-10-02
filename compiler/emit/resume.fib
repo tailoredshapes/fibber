@@ -19,11 +19,11 @@
 ;;   async body with several live values (S2 fixes it in resume.rs). This port implements the intended
 ;;   behaviour through TWO functions, the only places that choose an order, so that they are easy to
 ;;   change when S2's choice is read from resume.rs:
-;;   `order-live-names` (the names a point adds, per point in `points` order; now sorted by name, as
-;;   `BTreeSet<String>` would: "t12" before "t2") and `order-edge-loads` (the loads that go before one
-;;   block's terminator; now sorted by the value they load, as `BTreeMap<(usize, String), _>` would).
-;;   Fresh names are still handed out in the Rust's order (blocks in order, phis in order, edges in
-;;   order), which is deterministic.
+;;   `order-live-names` (the names a point adds, per point in `points` order) and `order-edge-loads` (the
+;;   loads that go before one block's terminator). S2's resume.rs (4e509b8) chose: the live names sorted by
+;;   the builder's creation order (the number of `tN`, rising: t9 before t10; ties by name), the edge loads
+;;   in the order the phis are met, which is the order they are made here. Fresh names are handed out in
+;;   the Rust's order (blocks in order, phis in order, edges in order), which is deterministic.
 ;; - the `Unsupported(String)` errors are `Err` strings with the Rust's text (`no continuation block L`,
 ;;   `live value N of unknown type`).
 ;; - a label is looked up as the FIRST block of that name (Rust: `position`); liveness used `collect` into
@@ -123,18 +123,18 @@
 
 ;; ---- the two places that choose an order (see the header)
 
-;; The names a point adds to the demoted values, each point's in this order. Rust: the iteration of a
-;; `HashSet<String>` (resume.rs:53); intended: sorted.
+;; The names a point adds to the demoted values, each point's in this order: by creation order (`tN`, N
+;; rising: not as text, where t10 would precede t9), ties by name. Rust: resume.rs:53 and name_order.
 (defun order-live-names :private (names: (Vec str)) -> (Vec str)
-  (vec (sort names)))
+  (vec (sort-by (fn (n: str) (unwrap-or (parse-long (subs-from n 1)) 9223372036854775807)) (sort names))))
 
 ;; A value loaded before a block's terminator for the phi operand of an edge out of that block.
 (defstruct EdgeLoad :private (value: str name: str text: str ty: LirTy))
 
-;; The loads that go before one block's terminator, in the order they are printed. Rust: the iteration of
-;; a `HashMap<(usize, String), String>` (resume.rs:295); intended: sorted by the loaded value.
+;; The loads that go before one block's terminator, in the order they are printed: the order the phis met
+;; them, which is the order `edge-load!` made them in (Rust: the `edge_loads` list, resume.rs:261).
 (defun order-edge-loads :private (loads: (Vec EdgeLoad)) -> (Vec EdgeLoad)
-  (vec (sort-by (fn (e: EdgeLoad) (. e value)) loads)))
+  loads)
 
 ;; ---- the rewriting, in the order of make_resumable
 

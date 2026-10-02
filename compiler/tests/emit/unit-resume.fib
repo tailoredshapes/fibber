@@ -117,8 +117,8 @@
                     (fb-term f (str-join ["(ret " (v-text t4) ")"]))
                     (Case "loop" f 1 ["resume"] true))))))))
 
-;; Two phis of one join take demoted values (t9, t10) from the same block: their loads go before its
-;; terminator, in the order of `order-edge-loads` (by value: t10 before t9) and not of their making.
+;; Two phis of one join take demoted values (t10, then t9) from the same block: their loads go before its
+;; terminator in the order the phis met them (t10 before t9), not by value.
 (defun edges () -> Case
   (let ((f (fb-new "l.f.6" (some LirI64) (env-params) false))
         (cap (fb-val f (cap-text) LirI64))
@@ -130,8 +130,8 @@
         (fb-open f "a") (fb-term f "(br join)")
         (fb-open f "b") (fb-term f "(br join)")
         (fb-open f "join")
-        (let ((p1 (fb-phi f LirI64 [(PhiEdge "a" (nth made 8)) (PhiEdge "b" "(i64 1)")]))
-              (p2 (fb-phi f LirI64 [(PhiEdge "a" (nth made 9)) (PhiEdge "b" "(i64 2)")])))
+        (let ((p1 (fb-phi f LirI64 [(PhiEdge "a" (nth made 9)) (PhiEdge "b" "(i64 1)")]))
+              (p2 (fb-phi f LirI64 [(PhiEdge "a" (nth made 8)) (PhiEdge "b" "(i64 2)")])))
           (do (fb-stmt f (store-point))
               (let ((parked (fb-val f (park-text) LirI1)))
                 (do (fb-term f (str-join ["(br " (v-text parked) " park resume)"]))
@@ -225,14 +225,14 @@
                      (= (frame-of (nth rs 1)) ["val:i32" "bytes:24" "bytes:1" "val:i64"]))
               (check cs "join frame: t2 then t4" (= (frame-of (nth rs 2)) ["val:i32" "val:i64" "val:i64"]))
               (check cs "order frame: three values" (= (frame-of (nth rs 3)) ["val:i32" "val:i64" "val:i64" "val:i64"]))
-              (check cs "order: the names a point adds go in name order (t10 t11 t9: slots s12 s13 s14)"
-                     (and (s/includes? (. (nth rs 3) text) "(store t10 s12)")
-                          (s/includes? (. (nth rs 3) text) "(store t11 s13)")
-                          (s/includes? (. (nth rs 3) text) "(store t9 s14)")))
+              (check cs "order: the names a point adds go in creation order (t9 t10 t11: slots s12 s13 s14, not the text order)"
+                     (and (s/includes? (. (nth rs 3) text) "(store t9 s12)")
+                          (s/includes? (. (nth rs 3) text) "(store t10 s13)")
+                          (s/includes? (. (nth rs 3) text) "(store t11 s14)")))
               (check cs "edges frame: four values" (= (frame-of (nth rs 7)) ["val:i32" "val:i64" "val:i64" "val:i64" "val:i64"]))
-              (check cs "edges: the loads before the terminator of a go in value order (t10 first)"
+              (check cs "edges: the loads before the terminator of a go in the order the phis met them (t10 = s13 first, then t9 = s12)"
                      (let ((a-block (nth (s/split-limit (nth (s/split-limit (. (nth rs 7) text) "  (block a\n" -1) 1) "  (block b\n" -1) 0)))
-                       (< (unwrap (s/index-of a-block "(load i64 s12)")) (unwrap (s/index-of a-block "(load i64 s15)")))))
+                       (< (unwrap (s/index-of a-block "(load i64 s13)")) (unwrap (s/index-of a-block "(load i64 s12)")))))
               (check cs "a missing continuation block" (= (error-of (nth rs 5)) "no continuation block nope"))
               (check cs "a live value that nothing binds" (= (error-of (nth rs 6)) "live value t99 of unknown type"))
               (doseq [r rs] (check-case cs r))

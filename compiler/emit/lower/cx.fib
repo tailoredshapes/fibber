@@ -45,7 +45,11 @@
 (defstruct Hub
   (expr: (fn (LowerCx Expr) (Result Flow str))
    method-value: (fn (LowerCx Expr i64 i64) (Result V str))
-   builtin-value: (fn (LowerCx Expr i64) (Result V str))))
+   builtin-value: (fn (LowerCx Expr i64) (Result V str))
+   cell-load: (fn (LowerCx str str Ty) (Result V str))
+   emit-call: (fn (LowerCx Target (Vec V) Ty bool) (Result V str))
+   join-value: (fn (LowerCx V Ty) (Result V str))
+   instance-of-pred: (fn (LowerCx Pred) (Result (Pair i64 (Vec Ty)) str))))
 
 ;; The context of one function. Rust: lower/mod.rs:60 Cx (15 fields, and the hub)
 (defstruct LowerCx
@@ -157,3 +161,13 @@
   (match v
     ((VVal s _) (fb-stmt (. cx b) (str-join ["(store " s " " ptr ")"])))
     (_ ())))
+
+;; A call of a runtime function with these arguments (a `unit` argument is no text); a value of `ret`, or unit when there is none.
+;; Here, not in emit.lower.builtins as the stub had it, because emit.lower.strfind calls it and builtins calls strfind (E8).
+;; Rust: lower/builtins.rs:238 Cx::rt_call
+(defun lcx-rt-call (cx: LowerCx f: str a: (Vec V) ret: (Option LirTy)) -> V
+  (let ((texts (mapv v-text (filterv (fn (v: V) (match v ((VUnit) false) (_ true))) a)))
+        (instr (str-join ["(call @" f " " (str-join (vec (interpose " " texts))) ")"])))
+    (match ret
+      ((some t) (fb-val (. cx b) instr t))
+      (nil (do (fb-stmt (. cx b) instr) VUnit)))))

@@ -1,11 +1,33 @@
-;; compiler/emit/lower/strfind.fib: string search. Replaces crates/fibc/src/lower/strfind.rs.
-;; STATUS: every public function below is a STUB of package E7, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/strfind.rs, 50 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/lower/strfind.fib: `(str-find s pat from)` (stdlib §7 L18): the runtime finds the byte offset (`fib.str-find`, -1 for
+;; none) and this code makes the `(Option i64)` from it. That `Option` is a heap enum, `nil` too (types §8.1), so a call costs the one
+;; object the interpreter's call costs, as `construct_option` would make it for `(some n)` or `nil`; the string itself is never
+;; copied. Replaces crates/fibc/src/lower/strfind.rs.
 (ns emit.lower.strfind
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.objects emit.objects.kinds
+        emit.program emit.lower.cx emit.lower.ctrl emit.lower.objects))
 
-;; Rust: lower/strfind.rs:17 LowerCx::str_find
+;; One arm: opens `label`, allocates the `Option` object with `tag` (the payload `at` for `some`) and jumps to the join block `lj`.
+;; Its edge is the block it ends in and the object. Rust: strfind.rs:32 (the loop body)
+(defun found-arm :private (cx: LowerCx label: str tag: i64 tid: i64 size: i64 sname: str at: V lj: str) -> (Pair str V)
+  (do (fb-open (. cx b) label)
+      (let ((variant (str-join [sname ".v" (str tag)])) (p (lcx-heap-alloc cx tid size)))
+        (do (fb-stmt (. cx b) (str-join ["(store (i32 " (str tag) ") " (lcx-gep cx variant p slot-enum-tag) ")"]))
+            (when (= tag 1) (lcx-store-fields cx variant p slot-variant-field0 [at]))
+            (let ((edge (Pair (fb-current (. cx b)) (VVal p LirPtr))))
+              (do (fb-term (. cx b) (str-join ["(br " lj ")"]))
+                  edge))))))
+
+;; The `(Option i64)` of `(str-find ..)` with arguments `a`. Rust: lower/strfind.rs:17 LowerCx::str_find
 (defun lcx-str-find (cx: LowerCx e: Expr a: (Vec V)) -> (Result V str)
-  (Err "todo: E7 lcx-str-find"))
+  (let ((at (lcx-rt-call cx "fib.str-find" a (some LirI64))))
+    (try-let ((t (lcx-ty cx e)) (o (program-object (. cx p) t)))
+      (let ((tid (. o fst)) (sname (. o snd)))
+        (let ((size (obj-size (objects-get (. (. cx p) objects) tid)))
+              (found (fb-val (. cx b) (str-join ["(icmp sge " (v-text at) " (i64 0))"]) LirI1))
+              (lsome (fb-label (. cx b) "found")) (lnone (fb-label (. cx b) "missing")) (lj (fb-label (. cx b) "fjoin")))
+          (do (fb-term (. cx b) (str-join ["(br " (v-text found) " " lsome " " lnone ")"]))
+              (let ((incoming [(found-arm cx lsome 1 tid size sname at lj) (found-arm cx lnone 0 tid size sname at lj)]))
+                (try-let ((flow (lcx-join-branches cx lj (some LirPtr) incoming)))
+                  (match flow
+                    ((FlowVal v) (Ok v))
+                    ((FlowJump) (Err "str-find without a result")))))))))))

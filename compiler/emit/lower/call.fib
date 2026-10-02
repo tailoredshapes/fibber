@@ -1,24 +1,295 @@
 ;; compiler/emit/lower/call.fib: calls: the site protocol (arguments, copy-in, target, the call, write-back, tail calls) and targets.
-;; Replaces crates/fibc/src/lower/call.rs; `Target` is in emit.lower.cx.
-;; STATUS: every public function below is a STUB of package E5, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/lower/call.rs, 431 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; Replaces crates/fibc/src/lower/call.rs (431 lines of Rust); `Target` is in emit.lower.cx. The order of the evaluation is the Rust's
+;; (types §8.9): the head value, the arguments in order, the copy-in of every `&` argument, then the target (it requests the callee, so
+;; it interns and queues), then the call; a port that asks for a type earlier interns an object earlier and shifts every later `tid`.
+;; The modules this one calls (arith, builtins, dynamic, objects) reach `cell-load`, `emit-call` and `instance-of-pred` through the hub,
+;; so none of them may `:use` this module (a cycle).
 (ns emit.lower.call
-  (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:require [fib.string :as s])
+  (:use types.ty types.scheme types.ast types.decls types.table types.init types.infer.cx own.program emit.value emit.layout emit.ir
+        emit.mono emit.objects emit.program emit.lower.cx emit.lower.ops emit.lower.arith emit.lower.builtins
+        emit.lower.dynamic emit.lower.objects))
 
-;; Rust: lower/call.rs:37 LowerCx::call
-(defun lcx-call (cx: LowerCx e: Expr head: Expr args: (Vec Arg)) -> (Result Flow str)
-  (Err "todo: E5 lcx-call"))
+;; ---- arguments
 
-;; Rust: lower/call.rs:173 LowerCx::cell_load
+;; The head of a call on a closure value: lowered (and retained when the plan says) before the arguments; none for any other callee.
+(defun call-head-value :private (cx: LowerCx head: Expr own: CallOwn) -> (Result (Option V) str)
+  (match (. own callee)
+    ((CalValue)
+     (try-let ((v (lcx-value cx head)))
+       (do (when (= (. own head) PsRetain) (lcx-retain cx v))
+           (Ok (some v)))))
+    (_ (Ok nil))))
+
+;; One argument as the plan hands it over, with its type: an expression's value (retained when the plan says), or the cell of an `&`
+;; argument (a copy-in is made later for `Acquire`: no value yet).
+(defun call-argument :private (cx: LowerCx a: Arg pass: Pass) -> (Result (Pair V Ty) str)
+  (match a
+    ((ArgExpr x)
+     (try-let ((v (lcx-value cx x)))
+       (do (when (= pass PsRetain) (lcx-retain cx v))
+           (try-let ((t (lcx-ty cx x))) (Ok (Pair v t))))))
+    ((ArgAmp b _)
+     (try-let ((t (lcx-binding-ty cx b)))
+       (match pass
+         ((PsAcquire) (Ok (Pair VUnit t)))
+         ((PsForward) (try-let ((v (lcx-local cx b))) (Ok (Pair v t))))
+         ((PsOwnCell) (try-let ((v (lcx-local cx b))) (Ok (Pair v t))))
+         (_ (Err "an & argument passed as a pass that is not acquire, forward or own-cell")))))))
+
+;; Every argument in order: their values and their types.
+(defun call-arguments :private (cx: LowerCx args: (Vec Arg) passes: (Vec Pass)) -> (Result (Pair (Vec V) (Vec Ty)) str)
+  (loop ((i 0) (vals []) (tys []))
+    (if (>= i (count args))
+        (Ok (Pair vals tys))
+        (match (get passes i)
+          (nil (Err "no pass for an argument"))
+          ((some pass)
+           (try-let ((r (call-argument cx (nth args i) pass)))
+             (recur (+ i 1) (conj vals (. r fst)) (conj tys (. r snd)))))))))
+
+;; The content type of a cell type, or `why`.
+(defun cell-content :private (t: Ty why: str) -> (Result Ty str)
+  (match t
+    ((TCon (KCell) cargs) (Ok (nth cargs 0)))
+    (_ (Err why))))
+
+;; The private `STACK` cell of one `&` argument at call entry (§8.6): the variable's content, retained, in a stack object of this site.
+(defun call-private-cell :private (cx: LowerCx b: i64) -> (Result V str)
+  (try-let ((cell-ty (lcx-binding-ty cx b)) (content-ty (cell-content cell-ty "an & parameter that is not a cell"))
+            (obj (program-object (. cx p) cell-ty)))
+    (let ((tid (. obj fst)) (sname (. obj snd)))
+      (let ((slot (fb-entry-alloca (. cx b) (str-join ["%struct." sname]) (obj-size (objects-get (. (. cx p) objects) tid)))))
+        (do (fb-stmt (. cx b) (str-join ["(call @fib.stack-init " slot " (i32 " (str tid) "))"]))
+            (try-let ((var (lcx-local cx b)) (content (lcx-cell-load cx sname (v-text var) content-ty)))
+              (do (lcx-retain cx content)
+                  (lcx-store cx content (lcx-gep cx sname slot slot-cell-value))
+                  (Ok (VVal slot LirPtr)))))))))
+
+;; The copy-in of every `&` argument the plan acquires: its value becomes the private cell. Rust: lower/call.rs:132 copy_in
+(defun call-copy-in :private (cx: LowerCx args: (Vec Arg) passes: (Vec Pass) vals: (Vec V)) -> (Result (Vec V) str)
+  (loop ((i 0) (acc vals))
+    (if (>= i (min (count args) (count passes)))
+        (Ok acc)
+        (match (nth args i)
+          ((ArgAmp b _)
+           (if (= (nth passes i) PsAcquire)
+               (try-let ((slot (call-private-cell cx b))) (recur (+ i 1) (assoc acc i slot)))
+               (recur (+ i 1) acc)))
+          (_ (recur (+ i 1) acc))))))
+
+;; The write-back after an ordinary call (§8.6): the private cell's content into the variable, the variable's old content released.
+;; Rust: lower/call.rs:158 write_back
+(defun call-write-back :private (cx: LowerCx var: i64 private: V cell-ty: Ty) -> (Result unit str)
+  (try-let ((content-ty (cell-content cell-ty "a write-back to a non-cell")) (obj (program-object (. cx p) cell-ty)))
+    (let ((sname (. obj snd)))
+      (try-let ((content (lcx-cell-load cx sname (v-text private) content-ty)) (target (lcx-local cx var))
+                (old (lcx-cell-load cx sname (v-text target) content-ty)))
+        (do (lcx-store cx content (lcx-gep cx sname (v-text target) slot-cell-value))
+            (lcx-release cx old)
+            (fb-stmt (. cx b) (str-join ["(call @fib.stack-end " (v-text private) ")"]))
+            (Ok ()))))))
+
+;; The content of a cell object. Rust: lower/call.rs:173 LowerCx::cell_load
 (defun lcx-cell-load (cx: LowerCx sname: str cell: str content-ty: Ty) -> (Result V str)
-  (Err "todo: E5 lcx-cell-load"))
+  (let ((field (lcx-gep cx sname cell slot-cell-value)))
+    (try-let ((l (program-lir (. cx p) content-ty)))
+      (Ok (match l ((some t) (lcx-load cx t field)) (nil VUnit))))))
 
-;; Rust: lower/call.rs:312 LowerCx::instance_of_pred
+;; ---- targets
+
+;; The specialisation key of a call to the `defun` `f` at `head`. A call inside the callee's own SCC has no instantiation: the members
+;; share their quantified variables (§3.6), so the callee's are the caller's, by index.
+(defun call-fun-instance :private (cx: LowerCx head: Expr f: i64) -> (Result (Vec Ty) str)
+  (let ((typed (. (. cx p) typed)) (g (program-g (. cx p))))
+    (match (get (. typed fun-schemes) f)
+      (nil (Err "a function without a scheme"))
+      ((some scheme)
+       (let ((tys (match (get (. typed instantiations) (. head id))
+                    ((some i) (mapv (fn (t: Ty) (inst-subst (. cx inst) t)) (. i tys)))
+                    (nil (mapv (fn (i: i64) (inst-subst (. cx inst) (TGen i))) (range (. scheme n-vars)))))))
+         (if (not (= (count tys) (. scheme n-vars)))
+             (Err (str-join ["call of " (. (g-fun g f) name) " instantiates " (str (count tys)) " of " (str (. scheme n-vars)) " variables"]))
+             (fun-key g scheme tys)))))))
+
+;; The instance variables a head type fixes: `head` is over `TGen`s, `actual` is concrete; the last write to a variable wins.
+(defun match-head :private (head: Ty actual: Ty vars: (Vec (Option Ty))) -> (Vec (Option Ty))
+  (match head
+    ((TGen i) (if (< i (count vars)) (assoc vars i (some actual)) vars))
+    ((TCon _ hs) (match actual
+                   ((TCon _ ts) (reduce (fn (acc: (Vec (Option Ty)) pr: (Pair Ty Ty)) (match-head (. pr fst) (. pr snd) acc)) vars (zip hs ts)))
+                   (_ vars)))
+    ((TFn _ hp hr) (match actual
+                     ((TFn _ tp tr)
+                      (match-head hr tr (reduce (fn (acc: (Vec (Option Ty)) pr: (Pair Ty Ty)) (match-head (. pr fst) (. pr snd) acc)) vars (zip hp tp))))
+                     (_ vars)))
+    (_ vars)))
+
+;; The instance that discharges a concrete protocol constraint, with its variables' values. Rust: lower/call.rs:312 instance_of_pred
 (defun lcx-instance-of-pred (cx: LowerCx pred: Pred) -> (Result (Pair i64 (Vec Ty)) str)
-  (Err "todo: E5 lcx-instance-of-pred"))
+  (let ((g (program-g (. cx p))))
+    (match pred
+      ((PProto p tys)
+       (match (first tys)
+         (nil (Err "a protocol without a head"))
+         ((some head-ty)
+          (match head-ty
+            ((TFn _ _ _) (Err "a protocol instance on a function type"))
+            ((TCon c _)
+             (match (get @(. g instance-index) (InstKey p c))
+               (nil (Err (str-join ["no instance of " (. (g-proto g p) name) " for the constructor"])))
+               ((some index)
+                (let ((inst (table-get (. g instances) index)))
+                  (try-let ((args (try-map (fn (v: (Option Ty)) (match v ((some t) (Ok t)) (nil (Err "an instance variable the head does not fix"))))
+                                           (match-head (. inst head) head-ty (mapv (fn (i: i64) nil) (range (count (. inst var-names))))))))
+                    (Ok (Pair index args)))))))
+            (_ (Err "a type variable at a method call"))))))
+      (_ (Err "a non-protocol bound at a method call")))))
 
-;; Rust: lower/call.rs:342 LowerCx::emit_call
+;; A method call through the receiver's own vtable (§3.3): the receiver is the first argument.
+(defun call-dyn-target :private (cx: LowerCx vals: (Vec V) tys: (Vec Ty) p: i64 i: i64) -> (Result Target str)
+  (if-some (recv (first vals))
+    (if-some (t (first tys))
+      (lcx-dyn-target cx recv t p i)
+      (Err "a dyn call without a receiver"))
+    (Err "a dyn call without a receiver")))
+
+;; The index in `ms` of the implementation of method `i`.
+(defun call-method-index :private (ms: (Vec ImplMethod) i: i64) -> (Option i64)
+  (loop ((m 0))
+    (if (>= m (count ms))
+        nil
+        (if (= (. (nth ms m) index) i) (some m) (recur (+ m 1))))))
+
+;; The target of method `i` of protocol `p` at instance `index` instantiated at `args`: a native one, or its body.
+(defun call-instance-target :private (cx: LowerCx p: i64 i: i64 index: i64 args: (Vec Ty)) -> (Result Target str)
+  (let ((g (program-g (. cx p))))
+    (let ((inst (table-get (. g instances) index)))
+      (if (empty? (. inst methods))
+          (let ((proto (g-proto g (. inst proto))))
+            (Ok (TgNative (. proto name) (. (nth (. proto methods) i) name))))
+          (match (call-method-index (. inst methods) i)
+            (nil (Err "an instance without the method"))
+            ((some m) (Ok (TgDirect (program-request (. cx p) (BodyMethod index m) args) false))))))))
+
+;; A bound the specialisation discharges with a `dyn` is met by the receiver's own vtable (§3.3), any other by its instance.
+(defun call-bound-target :private (cx: LowerCx pred: Pred vals: (Vec V) tys: (Vec Ty) p: i64 i: i64) -> (Result Target str)
+  (let ((pred (pred-map-tys pred (fn (t: Ty) (inst-subst (. cx inst) t)))))
+    (if (match pred
+          ((PProto _ ptys) (match (first ptys) ((some (TCon (KDyn _ _) _)) true) (_ false)))
+          (_ false))
+        (call-dyn-target cx vals tys p i)
+        (try-let ((r (lcx-instance-of-pred cx pred)))
+          (call-instance-target cx p i (. r fst) (. r snd))))))
+
+;; The instance a method call reaches, as a target. Rust: lower/call.rs:262 method_target
+(defun call-method-target :private (cx: LowerCx head: Expr p: i64 i: i64 vals: (Vec V) tys: (Vec Ty)) -> (Result Target str)
+  (match (get (. (. (. cx p) typed) resolutions) (. head id))
+    ((some (ResInstance index args))
+     (call-instance-target cx p i index (mapv (fn (t: Ty) (inst-subst (. cx inst) t)) args)))
+    ((some (ResBound pred)) (call-bound-target cx pred vals tys p i))
+    ((some (ResDyn)) (call-dyn-target cx vals tys p i))
+    (nil (Err "a method call without a resolution"))))
+
+;; What the call reaches. Rust: lower/call.rs:208 target
+(defun call-target :private (cx: LowerCx head: Expr c: Callee hv: (Option V) vals: (Vec V) tys: (Vec Ty)) -> (Result Target str)
+  (let ((p (. cx p)))
+    (match c
+      ((CalFun f) (try-let ((ts (call-fun-instance cx head f))) (Ok (TgDirect (program-request p (BodyFun f) ts) false))))
+      ((CalAllOwned f) (try-let ((ts (call-fun-instance cx head f))) (Ok (TgDirect (program-request p (BodyAllOwned f) ts) true))))
+      ((CalMethod pr i) (call-method-target cx head pr i vals tys))
+      ((CalBuiltin b) (Ok (TgBuiltin (. (nth (. (. p typed) builtins) b) name))))
+      ((CalCtor) (match (. head kind)
+                   ((EGlobal (GCtor t v)) (Ok (TgCtor t v)))
+                   (_ (Err "callee Ctor with this head"))))
+      ((CalExtern) (match (. head kind)
+                     ((EGlobal (GExtern x))
+                      (let ((d (g-ext (program-g p) x)))
+                        (try-let ((declared (program-declare-extern p d))) (Ok (TgExtern (. d name))))))
+                     (_ (Err "callee Extern with this head"))))
+      ((CalValue) (match hv (nil (Err "no head value")) ((some v) (Ok (TgValue v))))))))
+
+;; ---- the call itself
+
+;; The texts of the values that are not `unit`.
+(defun call-arg-texts :private (vals: (Vec V)) -> (Vec str)
+  (vec (keep (fn (v: V) (match v ((VVal s _) (some s)) ((VUnit) nil))) vals)))
+
+(defun call-ret-text :private (ret: (Option LirTy)) -> str
+  (match ret ((some t) (lir-ty-text t)) (nil "void")))
+
+;; The types of the parameters after `this`: the texts of the types of the values that have one.
+(defun call-param-tys :private (vals: (Vec V)) -> str
+  (s/join " " (into ["ptr"] (vec (keep (fn (v: V) (match v ((VVal _ t) (some (lir-ty-text t))) ((VUnit) nil))) vals)))))
+
+;; The text of the call or tail call of `target` (§8.4): direct, an extern, a vtable's code or a closure's code pointer.
+(defun call-instr :private (cx: LowerCx target: Target vals: (Vec V) ret: (Option LirTy) tail: bool) -> (Result str str)
+  (let ((args (call-arg-texts vals)) (indirect (if tail "indirect-tailcall" "indirect-call")))
+    (match target
+      ((TgDirect name env)
+       (Ok (str-join ["(" (if tail "tailcall" "call") " @" name (if env " (ptr null)" "") " " (s/join " " args) ")"])))
+      ((TgExtern name) (Ok (str-join ["(call @" name " " (s/join " " args) ")"])))
+      ((TgCode code this)
+       (Ok (str-join ["(" indirect " " code " (fn tailcc " (call-ret-text ret) " (" (call-param-tys (vec (drop 1 vals))) ")) " this " "
+                      (s/join " " (vec (drop 1 args))) ")"])))
+      ((TgValue clo)
+       (let ((codep (lcx-gep cx "fib.closure" (v-text clo) slot-closure-code)))
+         (let ((code (lcx-load cx LirPtr codep)))
+           (Ok (str-join ["(" indirect " " (v-text code) " (fn tailcc " (call-ret-text ret) " (" (call-param-tys vals) ")) " (v-text clo) " "
+                          (s/join " " args) ")"])))))
+      (_ (Err "not a callable target")))))
+
+;; The call itself: `call` or `tailcall`, direct or through a closure's code pointer. Rust: lower/call.rs:342 LowerCx::emit_call
 (defun lcx-emit-call (cx: LowerCx target: Target vals: (Vec V) rt: Ty tail: bool) -> (Result V str)
-  (Err "todo: E5 lcx-emit-call"))
+  (try-let ((ret (program-lir (. cx p) rt)) (instr (call-instr cx target vals ret tail)))
+    (if tail
+        (do (fb-term (. cx b) instr) (Ok VUnit))
+        (match ret
+          ((some t) (Ok (fb-val (. cx b) instr t)))
+          (nil (do (fb-stmt (. cx b) instr) (Ok VUnit)))))))
+
+;; ---- the site
+
+(defun call-some :private (r: (Result V str)) -> (Result (Option V) str)
+  (match r ((Ok v) (Ok (some v))) ((Err e) (Err e))))
+
+;; A target a tail call jumps to.
+(defun call-jumpable :private (target: Target) -> bool
+  (match target ((TgDirect _ _) true) ((TgValue _) true) ((TgCode _ _) true) (_ false)))
+
+;; The result of an ordinary call; `nil` when the callee does not return (a builtin or native operation that ended the block).
+(defun call-result :private (cx: LowerCx e: Expr target: Target vals: (Vec V) tys: (Vec Ty) rt: Ty) -> (Result (Option V) str)
+  (match target
+    ((TgBuiltin name) (lcx-builtin cx name e vals tys))
+    ((TgNative proto method) (lcx-native-method cx proto method vals tys rt))
+    ((TgCtor t variant) (call-some (lcx-construct cx e t variant vals)))
+    (_ (call-some (lcx-emit-call cx target vals rt false)))))
+
+;; The write-backs the plan asks for after an ordinary call.
+(defun call-write-backs :private (cx: LowerCx own: CallOwn vals: (Vec V) tys: (Vec Ty)) -> (Result unit str)
+  (try-each (fn (wb: (Pair i64 i64)) (call-write-back cx (. wb snd) (nth vals (. wb fst)) (nth tys (. wb fst)))) (. own write-backs)))
+
+;; Everything after the target: the releases and the jump of a tail call, the call, the write-backs, the return of a tail call.
+(defun call-site :private (cx: LowerCx e: Expr own: CallOwn target: Target vals: (Vec V) tys: (Vec Ty)) -> (Result Flow str)
+  (let ((tail (= (. own tail) TlTailCall)))
+    (try-let ((rt (lcx-ty cx e)) (ran (if tail (lcx-run-ops cx (. own jump)) (Ok ()))))
+      (if (and tail (call-jumpable target))
+          (try-let ((c (lcx-emit-call cx target vals rt true))) (Ok FlowJump))
+          (try-let ((r (call-result cx e target vals tys rt)))
+            (match r
+              (nil (Ok FlowJump))
+              ((some result)
+               (try-let ((wb (call-write-backs cx own vals tys)))
+                 (if tail
+                     (do (fb-term (. cx b) (match result ((VUnit) "(ret)") ((VVal s _) (str-join ["(ret " s ")"]))))
+                         (Ok FlowJump))
+                     (Ok (FlowVal result)))))))))))
+
+;; A call (types §8.9). Rust: lower/call.rs:37 LowerCx::call
+(defun lcx-call (cx: LowerCx e: Expr head: Expr args: (Vec Arg)) -> (Result Flow str)
+  (match (get (. (. cx own) calls) (. e id))
+    (nil (Err "no plan for a call"))
+    ((some own)
+     (try-let ((hv (call-head-value cx head own)) (r (call-arguments cx args (. own args)))
+               (vals (call-copy-in cx args (. own args) (. r fst))) (target (call-target cx head (. own callee) hv vals (. r snd))))
+       (call-site cx e own target vals (. r snd))))))
