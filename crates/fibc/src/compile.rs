@@ -2,14 +2,11 @@
 //! types §8): the runtime, the type table, the static data, every
 //! specialised body reached from `main`, and lIR's `main`.
 
-use std::fmt::Write;
-
 use fibref::own::program::BodyKey;
 use fibref::own::Checked;
 
 use crate::lower::{emit_body, emit_closure};
 use crate::program::{Program, Work};
-use crate::value::LirTy;
 
 /// Why a program cannot be compiled yet (reported as Pending by the
 /// harness, never as a pass).
@@ -55,6 +52,13 @@ pub fn compile_executable(checked: &Checked) -> Result<String, Unsupported> {
 }
 
 fn compile_kind(checked: &Checked, executable: bool) -> Result<String, Unsupported> {
+    Ok(compile_module(checked, executable)?.text())
+}
+
+/// [`compile`] or [`compile_executable`] with the module kept in its
+/// parts, for `fibc emit-dump` (spec/bootstrap.md §8): the text of the
+/// module is [`Module::text`].
+pub fn compile_module(checked: &Checked, executable: bool) -> Result<Module, Unsupported> {
     let main = checked
         .typed
         .fun("main")
@@ -65,7 +69,16 @@ fn compile_kind(checked: &Checked, executable: bool) -> Result<String, Unsupport
     p.def_values.extend(defs.values);
     let entry = p.request(BodyKey::Fun(main), Vec::new());
     emit_all(&mut p)?;
-    Ok(assemble(&mut p, &defs.text, &entry, executable))
+    let parts = module_parts(&mut p, &defs.text);
+    // §3.19, L15: the init functions of the `def`s made at run time come
+    // before `main`, which calls them after the arguments are known.
+    let init = if p.inits.is_empty() {
+        ""
+    } else {
+        "(call @fib.defs-init)"
+    };
+    let main = crate::inits::render(&p) + &main_text(&entry, executable, init);
+    Ok(Module { parts, main })
 }
 
 /// Emits every body and closure queued so far.
@@ -171,48 +184,101 @@ pub fn compile_macro(
     Ok(MacroModule { text })
 }
 
-/// The runtime, the tables, the static data and every function: what
-/// a program and a macro module share.
-pub(crate) fn assemble_parts(p: &mut Program<'_>, defs: &str) -> String {
-    let mut out = String::new();
-    for part in RUNTIME {
-        out.push_str(part);
-        out.push('\n');
-    }
-    let keyword_helpers = p.render_keyword_helpers();
-    out.push_str(&p.render_externs());
-    out.push_str(&p.objects.render());
-    out.push_str(&p.statics.render());
-    out.push_str(&keyword_helpers);
-    out.push_str(&crate::inits::slot_text(p));
-    out.push_str(defs);
-    out.push_str(&p.quote_text);
-    for f in &p.funcs {
-        out.push_str(f);
-    }
-    out
+/// The text of a module before its `main`, in the pieces `assemble_parts`
+/// puts together, in this order (`fibc emit-dump --sections`): the runtime,
+/// the `extern` declarations, the object structs and the type table, the
+/// static data, the keyword helpers, the values of the `def`s, the quoted
+/// constants, then every function in the order its body was finished.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parts {
+    pub runtime: String,
+    pub externs: String,
+    pub types: String,
+    pub statics: String,
+    pub keywords: String,
+    pub defs: String,
+    pub quotes: String,
+    pub fns: Vec<String>,
 }
 
-fn assemble(p: &mut Program<'_>, defs: &str, entry: &str, executable: bool) -> String {
-    let mut out = assemble_parts(p, defs);
-    out.push_str(&crate::inits::render(p));
-    // §3.19, L15: the `def`s made at run time, after the arguments are
-    // known and before `main`.
-    let init = if p.inits.is_empty() {
-        ""
-    } else {
-        "(call @fib.defs-init)"
-    };
-    let _ = LirTy::I64;
-    // §8.8: main's return joins every thread still running before
-    // the result is printed (fibc run) or returned (an executable).
+impl Parts {
+    /// The pieces one after the other.
+    pub fn text(&self) -> String {
+        let mut out = String::new();
+        for part in [
+            &self.runtime,
+            &self.externs,
+            &self.types,
+            &self.statics,
+            &self.keywords,
+            &self.defs,
+            &self.quotes,
+        ] {
+            out.push_str(part);
+        }
+        for f in &self.fns {
+            out.push_str(f);
+        }
+        out
+    }
+}
+
+/// A program's lIR module: [`Parts`], then lIR's `main`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Module {
+    pub parts: Parts,
+    pub main: String,
+}
+
+impl Module {
+    /// The text `fibc emit` prints.
+    pub fn text(&self) -> String {
+        self.parts.text() + &self.main
+    }
+}
+
+/// The runtime, the tables, the static data and every function: what
+/// a program and a macro module share, and what `emit_defs` assembles
+/// again for every `def` it runs, so the program's functions and quoted
+/// constants are copied and left in place.
+pub(crate) fn module_parts(p: &mut Program<'_>, defs: &str) -> Parts {
+    let runtime: String = RUNTIME.iter().flat_map(|part| [*part, "\n"]).collect();
+    // The names of the keyword helpers intern strings: they come before
+    // the statics are rendered.
+    let keywords = p.render_keyword_helpers();
+    let externs = p.render_externs();
+    let types = p.objects.render();
+    let statics = p.statics.render();
+    // §3.19, L15: the slot globals of the `def`s made at run time come
+    // with the values of the constant `def`s.
+    let slots = crate::inits::slot_text(p);
+    Parts {
+        runtime,
+        externs,
+        types,
+        statics,
+        keywords,
+        defs: slots + defs,
+        quotes: p.quote_text.clone(),
+        fns: p.funcs.clone(),
+    }
+}
+
+/// [`module_parts`] as one text.
+pub(crate) fn assemble_parts(p: &mut Program<'_>, defs: &str) -> String {
+    module_parts(p, defs).text()
+}
+
+/// The fixed end of a module: `main`, which §8.8 has join every thread
+/// still running before the result is printed (fibc run) or returned (an
+/// executable), calling the program's entry function.
+fn main_text(entry: &str, executable: bool, init: &str) -> String {
     let end = if executable {
         "(ret (trunc i32 r))"
     } else {
         "(call @printf (string \"%lld\\n\") r)\n      (ret (i32 0))"
     };
-    let _ = write!(
-        out,
+    format!(
         "(declare printf i32 (ptr ...))
 (define (main i32) ((i32 argc) (ptr argv))
   (block entry
@@ -224,8 +290,7 @@ fn assemble(p: &mut Program<'_>, defs: &str, entry: &str, executable: bool) -> S
       (call @fib.pool-quiesce)
       {end})))
 "
-    );
-    out
+    )
 }
 
 #[cfg(test)]
@@ -235,6 +300,82 @@ mod tests {
     fn lir_of(src: &str) -> String {
         let c = fibref::own::check_source(src, "t").expect("checks");
         compile(&c).expect("compiles")
+    }
+
+    /// The module as `assemble` made it before the pieces had names: the
+    /// reference that `fibc emit`'s text must not move from
+    /// (`fibc emit-dump` cuts the same text into [`Parts`]).
+    fn assembled_before_parts(checked: &Checked, executable: bool) -> String {
+        use std::fmt::Write;
+        let main = checked.typed.fun("main").expect("a main");
+        let mut p = Program::new(checked);
+        crate::inits::plan(&mut p).expect("plan");
+        let defs = crate::defs::emit_defs(&mut p).expect("defs");
+        p.def_values.extend(defs.values);
+        let entry = p.request(BodyKey::Fun(main), Vec::new());
+        emit_all(&mut p).expect("emits");
+        let mut out = String::new();
+        for part in RUNTIME {
+            out.push_str(part);
+            out.push('\n');
+        }
+        let keyword_helpers = p.render_keyword_helpers();
+        out.push_str(&p.render_externs());
+        out.push_str(&p.objects.render());
+        out.push_str(&p.statics.render());
+        out.push_str(&keyword_helpers);
+        out.push_str(&crate::inits::slot_text(&p));
+        out.push_str(&defs.text);
+        out.push_str(&p.quote_text);
+        for f in &p.funcs {
+            out.push_str(f);
+        }
+        out.push_str(&crate::inits::render(&p));
+        let init = if p.inits.is_empty() {
+            ""
+        } else {
+            "(call @fib.defs-init)"
+        };
+        let end = if executable {
+            "(ret (trunc i32 r))"
+        } else {
+            "(call @printf (string \"%lld\\n\") r)\n      (ret (i32 0))"
+        };
+        let _ = write!(
+            out,
+            "(declare printf i32 (ptr ...))
+(define (main i32) ((i32 argc) (ptr argv))
+  (block entry
+    (call @fib.init)
+    (call @fib.set-args argc argv)
+    {init}
+    (let ((r (call @{entry})))
+      (call @fib.join-all)
+      (call @fib.pool-quiesce)
+      {end})))
+"
+        );
+        out
+    }
+
+    #[test]
+    fn the_module_text_is_what_the_assembly_made_before_it_had_parts() {
+        let programs = [
+            "(defun main () -> i64 (+ 1 2))",
+            "(extern abs (i32) -> i32)\n(def g \"hi\")\n(defstruct P (x: i64 s: str))\n\
+             (defun k (k: keyword) -> str (show k))\n\
+             (defun main () -> i64 (let ((p (P 4 g)) (f (fn (n) (+ n 1)))) \
+               (do (k :a) (+ (f (. p x)) (unsafe (sext i64 (abs -3i32)))))))",
+            // L15 (X8): a `def` made at run time has slots and an init function.
+            "(defun two () -> i64 2)\n(def c: i64 (two))\n(defun main () -> i64 (+ c 1))",
+        ];
+        for src in programs {
+            let c = fibref::own::check_source(src, "t").expect("checks");
+            for executable in [false, true] {
+                let text = compile_kind(&c, executable).expect("compiles");
+                assert!(text == assembled_before_parts(&c, executable), "{src}");
+            }
+        }
     }
 
     /// A method of an `impl` that is wanted at ever larger types: the

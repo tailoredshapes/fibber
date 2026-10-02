@@ -441,7 +441,7 @@ fn error_dump(errs: &[TypeError], home: &str, opts: &Options) -> Dump {
 
 /// The `error` records of the type errors `errs`, their positions
 /// relative to `home`.
-pub(crate) fn error_records(errs: &[TypeError], home: &str) -> String {
+pub fn error_records(errs: &[TypeError], home: &str) -> String {
     let mut out = String::new();
     for e in errs {
         let at = span_in(&e.pos, home);

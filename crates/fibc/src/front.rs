@@ -72,7 +72,7 @@ pub fn check_in(source: &str, file: &str, roots: &Roots) -> Front {
 /// The macro runner of this build: the JIT (compiler.md §6), or the
 /// interpreter's evaluator when LLVM is not linked.
 #[cfg(feature = "llvm")]
-fn macro_runner(
+pub(crate) fn macro_runner(
     _forms: &[fibref::syntax::Form],
     prelude: Vec<fibref::syntax::Form>,
 ) -> Result<Box<dyn MacroRunner>, String> {
@@ -82,7 +82,7 @@ fn macro_runner(
 }
 
 #[cfg(not(feature = "llvm"))]
-fn macro_runner(
+pub(crate) fn macro_runner(
     forms: &[fibref::syntax::Form],
     prelude: Vec<fibref::syntax::Form>,
 ) -> Result<Box<dyn MacroRunner>, String> {

@@ -216,15 +216,22 @@ fn type_errors(errs: &[TypeError], home: &str, opts: &Options) -> Dump {
 
 /// The `error` records of the ownership errors of the failed step.
 fn own_errors(errs: &[OwnError], home: &str, opts: &Options) -> Dump {
+    let text = match opts.wants(Section::Error) {
+        true => own_error_records(errs, home),
+        false => String::new(),
+    };
+    Dump::failure(text)
+}
+
+/// The `error` records of the ownership errors `errs`, their positions
+/// relative to `home`: what `fibref own` prints, for a tool that runs the
+/// pass itself (`fibc emit-dump`, spec/bootstrap.md §8).
+pub fn own_error_records(errs: &[OwnError], home: &str) -> String {
     let mut out = String::new();
-    if opts.wants(Section::Error) {
-        for e in errs {
-            let at = span_in(&e.pos, home);
-            push(
-                &mut out,
-                &format!("error {} {at}: {}", kind_name(e.kind), e.message),
-            );
-        }
+    for e in errs {
+        let at = span_in(&e.pos, home);
+        let line = format!("error {} {at}: {}", kind_name(e.kind), e.message);
+        push(&mut out, &line);
     }
-    Dump::failure(out)
+    out
 }

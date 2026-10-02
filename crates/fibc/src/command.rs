@@ -4,11 +4,12 @@
 
 use std::path::PathBuf;
 
+use fibc::emit_dump::Options as EmitDumpOptions;
 use fibc::harness::gen::GenConfig;
 
 pub const USAGE: &str = "usage: fibc <command>
 
-Every command that reads a program (run, build, emit, explain, itrace) takes
+Every command that reads a program (run, build, emit, emit-dump, explain, itrace) takes
 -I dir (or -Idir), any number of times, anywhere before --: a module is found
 beside the file, then under each -I dir in order, then under each directory of
 $FIB_LIB, then in the library the executable carries (spec/syntax.md §5).
@@ -29,6 +30,11 @@ commands:
 build defaults to 2, run to 0 (a run compiles the program afresh every time,
 and -O 2 costs about two and a half times as long to compile as -O 0).
   emit <file>            print the lIR module of file
+  emit-dump [--sections LIST | --fn PREFIX | --layout | --macro NAME] [--] <file>..
+                         print the lIR module of each file in its sections, or
+                         the layout of its types, or one macro module: the
+                         oracle of the self-hosted emitter (spec/bootstrap.md
+                         section 8); exit 0, 1 a record, 2 unreadable, 3 unsupported
   explain <file>         print the ownership checker's decisions (types §9)
   itrace <file>          run file in the reference interpreter and print its
                          canonical trace (compiler.md §4) on standard output;
@@ -83,6 +89,10 @@ pub enum Command {
     },
     Emit {
         file: String,
+    },
+    EmitDump {
+        opts: EmitDumpOptions,
+        files: Vec<String>,
     },
     Explain {
         file: String,
@@ -239,6 +249,12 @@ pub fn parse(args: &[String]) -> Command {
         ["emit", file] => Command::Emit {
             file: file.to_string(),
         },
+        ["emit-dump", rest @ ..] => match fibc::emit_dump::parse_args(
+            &rest.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        ) {
+            Some((opts, files)) => Command::EmitDump { opts, files },
+            None => Command::Invalid,
+        },
         ["explain", file] => Command::Explain {
             file: file.to_string(),
         },
@@ -294,6 +310,19 @@ mod tests {
             args: words.iter().map(|s| s.to_string()).collect(),
             opt,
         }
+    }
+
+    #[test]
+    fn emit_dump_takes_its_options_then_its_files() {
+        let Command::EmitDump { opts, files } = parse(&args(&["emit-dump", "--layout", "a", "b"]))
+        else {
+            panic!("not an emit-dump");
+        };
+        assert!(opts.layout && files == ["a", "b"]);
+        assert_eq!(
+            parse(&args(&["emit-dump", "--bogus", "a"])),
+            Command::Invalid
+        );
     }
 
     #[test]

@@ -1131,3 +1131,247 @@ and `compiler/tests/own/compare-bodies.sh` (the same pairs of outputs cut at
 the top-level lines, with a tally per kind of record: how many bodies, facts,
 summaries are identical, which a port that cannot yet finish a file needs
 to see its progress).
+
+## 8. The lIR emitter (M6 step 5)
+
+The lowering of `crates/fibc/src/` (monomorphisation, names, layout and the
+type table, static data, the bodies, the `def` values through the JIT, the
+macro-time module) is ported to `compiler/emit/`, judged as the earlier passes
+were: by a dump that the oracle and the port print and that must be the same
+text, byte for byte (method rule 3). `fibc emit FILE`, the module text of the
+whole program, stays the final judge and is not changed by the dump; the dump
+cuts that text into its parts and adds two views that need no body, so that
+names, layout, monomorphisation and the objects of the type table can each be
+judged before the bodies exist. This section is the format of the dump; the
+plan of the port is outside the spec.
+
+### 8.1 The emit dump
+
+`fibc emit-dump [OPTION..] [--] FILE..` and `compiler/emit.fib` with the same
+words print the same text. For each FILE the line `== FILE`, then one of
+
+- the line `unreadable`;
+- the **expander's error record** unchanged (§5.1: a read error, a load
+  error, or an expansion error under the `-- module NS FILE` line of the
+  module that did not expand), when the file does not read, load or expand;
+- the `error` records of the type checker's first failing step (§6.4) or of
+  the ownership pass (§7.4), when the program is not accepted; with `--layout`
+  the ownership pass is not run, so only the type checker's records;
+- the line `unsupported WORD`, when the compiler cannot lower the program yet:
+  WORD is the first word of the message and nothing else (a message may print
+  Rust's `Debug` of an enum, and is for people; the status and the first word
+  are what is compared);
+- the line `internal error: MESSAGE`, when the tool itself fails (the macro
+  runner cannot start, the checker panicked);
+- the **sections** of the module (§8.3), or the layout (§8.5), or the macro
+  module (§8.5), when it is lowered.
+
+The exit status is 0 if every file printed its sections, 1 if one ended in an
+error record, 2 if one was unreadable or ended in an internal error (or the
+arguments were refused), 3 if one was `unsupported`, the larger winning. The
+arguments are read by `fibc::emit_dump::parse_args`, which the binary and the
+tests share: the words that start with `--` before the first file are options,
+a lone `--` ends them, and no file, a word that is not an option, a section
+that is not one, an empty list, an empty `--fn` or `--macro` value, or `--layout`
+or `--macro` together with another mode refuses with the usage line on standard
+error, nothing on standard output, and status 2. `-I DIR` is the command
+line's own (the roots of `fibc emit`), not an option of the dump.
+
+**What the tool runs** is what `fibc emit` runs (`front::check_in`, then
+`compile`), in the same order: the expander's prelude and `lib/prelude.fib`; the
+program loaded with the roots; every module expanded in one context with the
+macros run through the same runner as `fibc emit` (the JIT in a build with
+LLVM, §6 of compiler.md, and not the interpreter's evaluator that §6.1 runs, so
+the text is the one `emit` prints); then the whole front end (`check_modules`,
+types and ownership), then the lowering from `main`. A panic is the line
+`internal error: the emit dump panicked` and status 2.
+
+**A stage-2 stub is pending.** `compiler/emit.fib` is built package by package
+(E1 to E12) and a function that has no port yet is a stub that prints `todo:
+PACKAGE NAME` on standard error and exits 70. A run that ends so is **pending in
+every tally, never a pass** (CLAUDE.md: pending is not pass), and not a
+difference to repair: a harness counts the stubs reached and says which package
+blocks most files.
+
+### 8.2 Options
+
+| Option | What it does |
+|---|---|
+| `--sections LIST` | print only the sections of LIST: section names separated by commas, from `runtime`, `externs`, `types`, `statics`, `keywords`, `defs`, `quotes`, `fns`, `main`; the order of the dump is not the order of LIST. Without it every section prints (but see `--fn`) |
+| `--fn PREFIX` | of the functions of the `fns` section, only those whose mangled name starts with PREFIX (`f.main`, `f.sq`, `m.Show.show.i64`, `l.f.main.`, `d.limit`); everything is still emitted, so the numbering of ids and names is that of the whole module. Without `--sections` it alone prints the `fns` section and nothing else |
+| `--layout` | the layout table and the type table of every ground type (§8.5), no sections; not with another mode |
+| `--macro NAME` | the macro-time module of the macro NAME (§8.5), no sections; not with another mode |
+
+### 8.3 The sections of a module
+
+The text of a module (`fibc emit`) is the concatenation of nine parts, cut
+where `compile::module_parts` pushes them. Each part that is asked for is
+printed after the line `;; == section NAME`; the sections follow in this order,
+and with all nine on and the header lines taken out the text is exactly what
+`fibc emit FILE` prints (a test shows it, and a second test that `emit` is what
+it printed before the parts had names).
+
+| Section | The part | Source |
+|---|---|---|
+| `runtime` | the ten files `crates/fibc/rt/*.lir`, each followed by a line break, in the order core str array vec vecbuild atom thread task weak io | `compile.rs` `RUNTIME` |
+| `externs` | one `(declare ..)` per `extern` the bodies reached, in first-use order, but those the runtime declares itself | `Program::render_externs` |
+| `types` | every object struct, the `drop`, `trace` and `share` walkers of every type id, and the type and class tables | `Objects::render` |
+| `statics` | the strings `@str.N` in first-use order, the immortal closures of named functions and the vtables | `Statics::render` |
+| `keywords` | `kw.show`, `kw.hash` and `kw.rank`, only when a body used `show` or `hash` on a keyword | `Program::render_keyword_helpers` |
+| `defs` | the constants `@def.N` of the values of the `def`s, evaluated through the JIT | `defs::emit_defs` |
+| `quotes` | the constants `@q.N` of the quoted forms | `Program::quote_text` |
+| `fns` | every function, in the order its body was **finished**, not requested | `Program::funcs` |
+| `main` | the fixed end: `(declare printf ..)` and lIR's `main` | `compile::main_text` |
+
+A section may be empty: its header line is there and nothing follows. `keywords`
+is computed before `statics` is rendered because it interns strings, so a port
+that renders the statics first prints other numbers.
+
+### 8.4 Ordering and what is never compared
+
+- **Emission order is data.** Closures come before bodies in the queue, both
+  first in first out; `emit_defs` runs before `main` is requested and emits the
+  bodies of a `def`'s initialiser before it runs it; `p.funcs` is pushed when a
+  body is finished; `str` is type id 0 and `fib.array.i8`, `fib.weakbox` and
+  `fib.task` are 1 to 3, interned first; strings and keywords are numbered by
+  first use; fresh names are per function. A port that computes a type earlier
+  interns an object earlier and shifts every later `tid` and `@str.N`.
+- No position and no address is printed. Nothing iterates a hash table in the
+  text: every `HashMap` of the emitter is an index looked up one key at a time.
+  A unit test runs a program twice in one process (a hash table gets a new seed
+  each time) and compares the text.
+- **Known gap.** For a program with an `async` body whose frame keeps more than
+  one value live across an `await`, the text of `fibc emit` is not the same on
+  every run: `resume.rs` takes the live names from a `HashSet` and assigns frame
+  slots in its order (the `defstruct task..` line and the `s15`/`s16` names
+  differ between runs of `cases/ownership/174-awaits-in-a-loop-with-live-locals.fib`).
+  Until the Rust sorts them, a byte comparison over such files (`async` is in
+  16 of `cases/ownership`) is not a verdict on the port.
+
+### 8.5 `--layout` and `--macro`
+
+`--layout` prints, instead of sections, the line `;; == layout`, one line per
+ground type of the typed program, then `;; == section types` and the text the
+`types` section has for the objects those lines registered. It runs the type
+checker and **not the ownership pass**, and lowers no body: a program that the
+ownership pass rejects still has a layout, and the layout judges `names`,
+`layout`, `mono` and `objects` before an ownership port or a lowering exists.
+
+The types are those of the expressions in the order of their ids, then of the
+bindings in the order of theirs, then of the instantiations in the order of the
+expressions that use them (each one's types in order), colours erased as the
+mangled name erases them, without any type that still holds a variable, and each
+only at its first place. A line is
+
+```
+TYPE mangle M lir L class C repr R object O
+```
+
+`TYPE` is the type as `Printer::with_names(g, [], [])` prints it, so every
+function type is `(fn :local (A..) R)`. `M` is `names::mangle`. `L` is the lIR
+type: `i1 i8 i16 i32 i64 float double`, `ptr` for a counted object pointer,
+`raw` for a program's raw `ptr`, `dyn`, and `void` for `unit`. `C` is the class
+of `mono::class_of`: `scalar`, `ptr`, `opt` (a nullable pointer), `boxed` (an
+`Option` held as a heap enum), `dyn` or `unit`; `R` is the mangled name of the
+class's representative type (`mono::representative`). `O` is `-` for a type that
+is no object (a scalar, a `dyn`, `unit`, a null-represented `Option`, a
+function), else `SNAME tid N size S offsets OFFSETS`: the struct name, the type
+id in the order the lines registered it, the size in bytes of the object and the
+byte offset of each user slot after its header (and tag): `16,24`, `-` for none,
+and for an enum one list per variant, `v0:- v1:24,32`. A type the compiler cannot
+lay out ends the columns that were found with `unsupported` (`TYPE mangle M
+unsupported`, `object unsupported`).
+
+`--macro NAME` prints the line `;; == macro KEY` and the text of
+`compile_macro(checked, NAME, n, 0)`: the macro-time module of the `defmacro`
+whose key `ns/name` or bare name is NAME (the first in key order), compiled as a
+program of its own (the macro and a `main`, as `JitRunner` builds it), with the
+keyword table the module interned and sealed, as the first macro module of a run
+(`k` is 0 in the names `fibm.init.0`). The rest of the program is expanded but
+not checked, so a macro of a program that does not type still has a module. A
+file with no such macro prints `error NoMacro 0:0 0..0: no macro NAME` and status
+1.
+
+### 8.6 A worked example
+
+`t.fib`:
+
+```
+(defstruct P (x: i64 s: str))
+(defun main () -> i64
+  (let ((p (P 4 "ab")))
+    (+ (. p x) (str-len (. p s)))))
+```
+
+`fibc emit-dump --sections statics,fns,main --fn f.main t.fib` prints, status 0:
+
+```
+== t.fib
+;; == section statics
+(constant internal str.0 { i64 i32 i32 i64 [3 x i8] } { (i64 0) (i32 0) (i32 8) (i64 2) ([3 x i8] (i8 97) (i8 98) (i8 0)) })
+;; == section fns
+(define internal tailcc (f.main i64) ()
+  (block entry
+    (let ((t1 (alloca %struct.o.P)))
+      (call @fib.stack-init t1 (i32 4)))
+    (let ((t2 (getelementptr %struct.o.P t1 (i32 0) (i32 3))))
+      (store (i64 4) t2))
+    (let ((t3 (getelementptr %struct.o.P t1 (i32 0) (i32 4))))
+      (store @str.0 t3))
+    (br bound5)
+  )
+  (block bound5
+    (let ((t6 (getelementptr %struct.o.P t1 (i32 0) (i32 3)))
+          (t7 (load i64 t6))
+          (t8 (getelementptr %struct.o.P t1 (i32 0) (i32 4)))
+          (t9 (load ptr t8))
+          (t10 (call @fib.str-len t9)))
+      (call @fib.stack-end t1))
+    (call @fib.drop-fields t1)
+    (let ((t11 (sadd-overflow t7 t10))
+          (t12 (extractvalue t11 1)))
+      (br t12 trap13 ok14))
+  )
+  (block trap13
+    (call @fib.trap-c (string "integer overflow in + at i64"))
+    (unreachable)
+  )
+  (block ok14
+    (let ((t15 (extractvalue t11 0)))
+      (ret t15))
+  ))
+;; == section main
+(declare printf i32 (ptr ...))
+(define (main i32) ((i32 argc) (ptr argv))
+  (block entry
+    (call @fib.init)
+    (call @fib.set-args argc argv)
+    (let ((r (call @f.main)))
+      (call @fib.join-all)
+      (call @fib.pool-quiesce)
+      (call @printf (string "%lld\n") r)
+      (ret (i32 0)))))
+```
+
+`fibc emit-dump --layout t.fib` prints about three hundred lines (every type
+the checker knew, the library's included) and the type table; the lines of
+`i64`, `str` and `P` are
+
+```
+i64 mangle i64 lir i64 class scalar repr i64 object -
+str mangle str lir ptr class ptr repr str object fib.str tid 0 size 24 offsets -
+P mangle P lir ptr class ptr repr str object o.P tid 21 size 32 offsets 16,24
+```
+
+(`P`: a header of 16 bytes, `x` at 16, `s` at 24, 32 in all; its tid is the
+place its line registered it in, and depends on the library.) A program that
+does not check prints the records of §6.6 under its `== FILE` line; one whose
+type table needs a polymorphic recursion that never ends prints `unsupported
+the` and status 3.
+
+`fibc emit-dump` is tested by `crates/fibc/src/emit_dump/` (every section and
+option, the records of every way a file stops, that the sections are the text
+of `emit`, that the text is the same on every run) and by `compile::tests`
+(that `emit` is what it was); the harness that runs the port against it is not
+written yet: `compiler/tests/types/compare.sh -c emit-dump FIBC TOOL FILE..`
+compares the two tools, one process per file.

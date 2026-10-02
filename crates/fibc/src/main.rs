@@ -232,6 +232,16 @@ fn emit(file: &str, roots: &Roots) -> ExitCode {
     }
 }
 
+/// `emit-dump` (spec/bootstrap.md §8): the sections, the layout or the macro
+/// module of each file, and the status the dump says.
+fn emit_dump(files: &[String], roots: &Roots, opts: &fibc::emit_dump::Options) -> ExitCode {
+    let (text, status) = fibc::emit_dump::emit_files(files, roots, opts);
+    match write_stdout(&text) {
+        ExitCode::SUCCESS => ExitCode::from(status),
+        other => other,
+    }
+}
+
 fn explain(file: &str, roots: &Roots) -> ExitCode {
     let source = match read(file) {
         Ok(s) => s,
@@ -342,6 +352,7 @@ fn main() -> ExitCode {
         Command::Run { .. }
             | Command::Build { .. }
             | Command::Emit { .. }
+            | Command::EmitDump { .. }
             | Command::Explain { .. }
             | Command::Itrace { .. }
     );
@@ -364,6 +375,7 @@ fn main() -> ExitCode {
             opt,
         } => build(&file, &roots, &out, &link, opt),
         Command::Emit { file } => emit(&file, &roots),
+        Command::EmitDump { opts, files } => emit_dump(&files, &roots, &opts),
         Command::Explain { file } => explain(&file, &roots),
         Command::Itrace { file } => itrace(&file, &roots),
         Command::Cases { dir, only } => cases(&dir, &only),

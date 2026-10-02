@@ -8,6 +8,7 @@
 
 pub mod compile;
 pub mod defs;
+pub mod emit_dump;
 pub mod front;
 pub mod harness;
 pub mod inits;
