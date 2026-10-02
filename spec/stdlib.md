@@ -2623,7 +2623,11 @@ method.md applies: nothing is done until a test that can fail says so. A tranche
    pass, and fails the day one passes (method.md: pending is not pass). The gate of tranche 3 is therefore `conj` at most n + c, not c: the
    first version required a bound that its own §2.5 said the design could not meet.
 6. **A mutation review** of each tranche's source, as the reader had (spec/bootstrap.md §3): mutants of
-   the fibber source run against the tranche's tests, and each survivor becomes a case. The review ran nine
+   the fibber source run against the tranche's tests, and each survivor becomes a case. **It is not a gate**
+   (owner, 2026-10-02: "like UAT: it doesn't stop development"): a tranche is done when the conventional
+   suite and items 1 to 5 pass; the reviews run in the background at low priority (at most one at a time
+   per kind, never taking a cargo slot a development package needs), and what they find lands later as
+   new cases or tests in small commits, and as defects to fix. The review ran nine
    mutants of the prototype against `t1.fib`: six were caught, **three survived** (`sort` made unstable,
    `update` ignoring the old value, `cycle` of an empty source, which loops forever). With three checks
    added (stability, `update` on a present key, `cycle` of an empty source) and three more mutants

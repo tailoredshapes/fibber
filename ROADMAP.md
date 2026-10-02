@@ -360,9 +360,11 @@ tree: `fibref cases` and `fibc cases` both give `cases/ownership` 240 pass of
 `bootstrap` 58, `bootstrap_expand` 80, `capi` 19); `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean;
 `every_row_of_the_tranche_is_covered`, run with `--ignored`, passes. Not done:
-removing that `#[ignore]` (the last step of the gate), the by-hand mutation
-reviews of the Rust packages, the generator's forms for `@t` and float
-`quot`, and the commit. The compiler's sources are ported faithfully, not
+removing that `#[ignore]` (the last step of the gate), the generator's forms
+for `@t` and float `quot`, and the commit. The by-hand mutation reviews of
+the Rust packages run in the background and do not gate (owner,
+2026-10-02: mutation reviews are like UAT: they run continuously, find
+interesting bugs, and do not stop development). The compiler's sources are ported faithfully, not
 idiomatically: M6 resumes with the library in view.
 
 Order: spec/stdlib.md (the table of names and deviations); sequences,
