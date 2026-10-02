@@ -1,0 +1,118 @@
+;; compiler/tests/emit/unit-macros.fib: compiler/emit/macros/abi.fib and `compile-macro` of compiler/emit/compile.fib: the keyword table
+;; (the two tests of crates/fibc/src/macros/abi.rs, with the exact text), the entry and the surface of the ABI for a module numbered K
+;; (every exported function is `fibm.NAME.K`, the tags and the `Vec` ids are put where the Rust puts them), `macro-forms` and the
+;; refusals of `compile-macro` in the order of the Rust. The whole-module judge is compiler/tests/emit/macros.sh (`fibc emit-dump --macro`).
+;; Build: fibc build compiler/tests/emit/unit-macros.fib -I compiler -I lib -L target/debug -l lair -o OUT   (emit.compile reaches the JIT of the defs)
+(ns main
+  (:require [syntax.reader :as reader] [syntax.print :as printer])
+  (:use syntax.pos syntax.form expand.types types.ty types.ast types.table types.decls types.program types.check own.program
+        emit.value emit.statics emit.lower.cx emit.macros.abi emit.compile))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+(defun empty-typed () -> TypedProgram
+  (TypedProgram (globals-new) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) (map-empty) [] []))
+
+;; How many times `sub` occurs in `text`.
+(defun occurrences (text: str sub: str) -> i64
+  (loop ((from 0) (n 0))
+    (match (str-find text sub from)
+      (nil n)
+      ((some at) (recur (+ at 1) (+ n 1))))))
+
+(defun has? (text: str sub: str) -> bool (> (occurrences text sub) 0))
+
+;; A layout with distinguishable numbers: tags 10..20, size 40, tid 9, the Vec ids 21..24.
+(defun layout (strs: (Vec str)) -> FormLayout
+  (FormLayout "o.Form" 9 [10 11 12 13 14 15 16 17 18 19 20] 40 (VecIds 8 0 21 22 23 24) strs))
+
+(def exported: (Vec str)
+  ["kw-count" "kw" "entry" "str" "form" "vec" "tag" "f0-ptr" "f0-i64" "f0-f64" "f0-i32" "f0-i1" "f1-i64" "str-len" "str-ptr" "vec-len"
+   "vec-elem" "set-hooks" "set-trap-hook" "init"])
+
+;; The error of compile-macro, or "ok".
+(defun refused (typed: TypedProgram name: str) -> str
+  (match (compile-macro typed (owned-program-new) name 0 0)
+    ((Err m) m)
+    ((Ok _) "ok")))
+
+(defun macro-fun (name: str) -> FunDef (FunDef name 2 [] nil [] (Expr 0 p0 (ELit LitUnit)) true p0))
+
+(defun variants (names: (Vec str)) -> (Vec VariantDef)
+  (mapv (fn (n: str) (VariantDef n [(FieldDef "v" (ty-i64))])) names))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (st (statics-new)))
+    (do
+      ;; ---- the keyword table (abi.rs tests)
+      (let ((strs (mapv (fn (k: str) (statics-string st k 0)) ["i8" "f16"])))
+        (check cs "the keyword table is a count and a switch over static names"
+               (= (abi-render-keywords strs 3)
+                  (str-join ["(define (fibm.kw-count.3 i64) () (block entry (ret (i64 2))))\n"
+                             "(define (fibm.kw.3 ptr) ((i64 id))\n"
+                             "  (block entry (switch id none ((i64 0) kw0) ((i64 1) kw1)))\n"
+                             "  (block kw0 (ret @str.0))\n"
+                             "  (block kw1 (ret @str.1))\n"
+                             "  (block none (ret (ptr null))))\n"]))))
+      (check cs "a table of no keywords is a zero count and a null for every id"
+             (= (abi-render-keywords [] 0)
+                (str-join ["(define (fibm.kw-count.0 i64) () (block entry (ret (i64 0))))\n"
+                           "(define (fibm.kw.0 ptr) ((i64 id))\n"
+                           "  (block entry (switch id none))\n"
+                           "  (block none (ret (ptr null))))\n"])))
+      (check cs "the widths and the variants" (and (= (abi-widths) ["i8" "i16" "i32" "i64" "f32" "f64"]) (= (count (abi-variants)) 11)))
+      ;; ---- the entry and the surface, for a module numbered 3
+      (let ((t3 (abi-render (layout ["@str.0"]) "f.m" 2 3)))
+        (do (check cs "the entry takes the arguments"
+                    (has? t3 "(define (fibm.entry.3 ptr) ((ptr a0) (ptr a1))\n  (block entry (ret (call @f.m a0 a1))))\n"))
+            (check cs "every function of the surface is fibm.NAME.3, once, and nothing is numbered otherwise"
+                   (and (= (occurrences t3 "(define (fibm.") 20)
+                        (reduce (fn (ok: bool n: str) (and ok (= (occurrences t3 (str-join ["(define (fibm." n ".3 "])) 1))) true exported)
+                        (not (has? t3 ".0 ")) (not (has? t3 "fibm.entry.0"))))
+            (check cs "the tag switch: the tags of the variants, in the Rust order, the Nil and the Vec of the list among them"
+                   (has? t3 (str-join ["(switch tag done ((i32 10) ptrf) ((i32 11) ptrf) ((i32 12) intf) ((i32 13) fltf) ((i32 14) ptrf) "
+                                       "((i32 15) chrf) ((i32 16) boolf) ((i32 18) ptrf) ((i32 19) ptrf) ((i32 20) ptrf))"])))
+            (check cs "the allocation: size and type id, immortal, count zero"
+                   (and (has? t3 "(call @fib.alloc (i64 40) (i32 9))")
+                        (has? t3 "(store (i32 8) (getelementptr %struct.fib.hdr o (i32 0) (i32 2)))")
+                        (has? t3 "(store (i64 0) (getelementptr %struct.fib.hdr o (i32 0) (i32 0)))")))
+            (check cs "the variant fields are read through the struct name"
+                   (and (has? t3 "(getelementptr %struct.o.Form.v0 o (i32 0) (i32 4))")
+                        (has? t3 "(getelementptr %struct.o.Form.v6 o (i32 0) (i32 4))")
+                        (has? t3 "(load i32 (getelementptr %struct.o.Form o (i32 0) (i32 3)))")))
+            (check cs "the vector builder gets the Vec ids"
+                   (has? t3 "(call @fib.vec-build buf n (i64 8) (i8 1) (i32 21) (i32 22) (i32 23) (i32 24))"))
+            (check cs "the keyword table comes first"
+                   (starts-with? t3 "(define (fibm.kw-count.3 i64) () (block entry (ret (i64 1))))\n"))))
+      (check cs "no arguments: an empty parameter list and a call with a space"
+             (has? (abi-render (layout []) "f.n" 0 0) "(define (fibm.entry.0 ptr) ()\n  (block entry (ret (call @f.n ))))\n"))
+      ;; ---- macro-forms
+      (let ((m (MacroDef "m" "main" "main/m" false ["a" "b"] (some "r") [(Stx (SSym "x") p0)] p0))
+            (n (MacroDef "n" "main" "main/n" false [] nil [(Stx (SSym "x") p0) (Stx (SInt 1 I64) p0)] p0)))
+        (match (reader/read-all "(defmacro m (a b ... r) x) (defun main () -> i64 0)" "t.fib")
+          ((Ok em)
+           (match (reader/read-all "(defmacro n () x 1) (defun main () -> i64 0)" "t.fib")
+             ((Ok en)
+              (check cs "the forms of a macro module: the defmacro, with the rest after the dots, and a main"
+                     (and (= (count (macro-forms m)) 2) (= (count (macro-forms n)) 2)
+                          (= (printer/stx-show (nth (macro-forms m) 0)) (printer/stx-show (nth em 0))) (= (printer/stx-show (nth (macro-forms m) 1)) (printer/stx-show (nth em 1)))
+                          (= (printer/stx-show (nth (macro-forms n) 0)) (printer/stx-show (nth en 0))) (= (printer/stx-show (nth (macro-forms n) 1)) (printer/stx-show (nth en 1))))))
+             (_ (check cs "the forms are read" false))))
+          (_ (check cs "the forms are read" false))))
+      ;; ---- the refusals of compile-macro, in the order of the Rust
+      (let ((typed (empty-typed)))
+        (let ((g (. typed globals)))
+          (do (check cs "no macro of that name" (= (refused typed "zz") "no macro zz"))
+              (table-add (. g funs) (macro-fun "mm"))
+              (check cs "a function that is not a macro is not one" (= (refused typed "main") "no macro main"))
+              (check cs "no Form in the prelude" (= (refused typed "mm") "the prelude defines no Form"))
+              (set! (. g form) (some (table-add (. g types) (TypeDef "Form" 2 [] [] (TsStruct []) p0))))
+              (check cs "Form is not an enum" (= (refused typed "mm") "Form is not an enum"))
+              (table-set (. g types) 0 (TypeDef "Form" 2 [] [] (TsEnum (variants ["Sym" "Kw" "Int" "Flt" "Str" "Chr" "Bool" "Nil" "List" "Vec"])) p0))
+              (check cs "Form lacks a variant" (= (refused typed "mm") "Form has no variant Map"))
+              (table-set (. g types) 0 (TypeDef "Form" 2 [] [] (TsEnum (variants ["Kw" "Sym" "Int" "Flt" "Str" "Chr" "Bool" "Nil" "List" "Vec" "Map"])) p0))
+              (check cs "Form's variants are in another order" (= (refused typed "mm") "Form's variants are not in the expected order"))
+              (table-set (. g types) 0 (TypeDef "Form" 2 [] [] (TsEnum (variants (abi-variants))) p0))
+              (check cs "no Vec in the prelude" (= (refused typed "mm") "the prelude defines no Vec")))))
+      (finish cs))))

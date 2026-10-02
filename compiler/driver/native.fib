@@ -1,0 +1,87 @@
+;; compiler/driver/native.fib: what the driver does with the lIR text through lair's C interface (spec/compiler.md §9) and the C
+;; library, as crates/fibc/src/main.rs `run` and `build`: the JIT session that runs `main` (`run-lir`), the executable
+;; (`build-lir`), the environment (`getenv-opt`, `setenv-set`), the check that a `-L` directory can be read and the reason a file cannot (`fault-of`).
+;; Shapes decided: the C interface has no library directory for the link (`lair_build_executable`, lair.h: "no rpath is written"),
+;; so each `-L` directory is given to `cc` through LIBRARY_PATH (found at link time) and the executable carries no rpath: it finds
+;; its libraries only if the loader does. The Rust gives the directory twice: `-L` and an rpath (aot/link.rs:53 `args`).
+;; `run` calls `main` on the stack of the driver's thread through `call-i64`, as the Rust calls it on its own.
+(ns driver.native
+  (:require [lair.jit :as jit] [lair.call :as call] [lair.ffi :as ffi]))
+
+(extern getenv :private (ptr) -> ptr)
+(extern setenv :private (ptr ptr i32) -> i32)
+(extern opendir :private (ptr) -> ptr)
+(extern closedir :private (ptr) -> i32)
+(extern open :private (ptr i32) -> i32)
+(extern read :private (i32 ptr i64) -> i64)
+(extern close :private (i32) -> i32)
+(extern __errno_location :private () -> ptr)
+(extern strerror :private (i32) -> ptr)
+
+;; Why a file cannot be read: the operating system's code (0 if it opens and reads, so the text is not UTF-8) and the words Rust's
+;; `io::Error` prints for it, `No such file or directory (os error 2)`.
+(defstruct Fault (code: i64 text: str))
+
+(defun errno-fault :private (code: i64) -> Fault
+  (Fault code (str-join [(ffi/c-string-at (ffi/ptr->addr (unsafe (strerror (trunc i32 code))))) " (os error " (show code) ")"])))
+
+(defun fault-of (path: str) -> Fault
+  (let ((p (ffi/bytes-new path))
+        (buf (ffi/slot-new))
+        (f (unsafe
+             (let ((fd (sext i64 (open p 0i32))))
+               (if (< fd 0)
+                   (errno-fault (sext i64 (load-i32 (__errno_location))))
+                   (let ((n (read (trunc i32 fd) buf 1))
+                         (code (sext i64 (load-i32 (__errno_location)))))
+                     (do (close (trunc i32 fd))
+                         (if (< n 0) (errno-fault code) (Fault 0 "stream did not contain valid UTF-8")))))))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (ffi/free-addr (ffi/ptr->addr buf))
+        f)))
+
+;; The value of the environment variable `name`, or nil if it is not set.
+(defun getenv-opt (name: str) -> (Option str)
+  (let ((key (ffi/bytes-new name))
+        (at (unsafe (ffi/ptr->addr (getenv key)))))
+    (do (ffi/free-addr (ffi/ptr->addr key))
+        (if (= at 0) nil (some (ffi/c-string-at at))))))
+
+;; Sets the environment variable `name` to `value` (replacing its value).
+(defun setenv-set (name: str value: str) -> unit
+  (let ((k (ffi/bytes-new name))
+        (v (ffi/bytes-new value)))
+    (do (unsafe (setenv k v 1i32))
+        (ffi/free-addr (ffi/ptr->addr k))
+        (ffi/free-addr (ffi/ptr->addr v)))))
+
+;; Whether `dir` is a directory that can be read. Rust: aot/link.rs:30 `library_dir` (which also takes its canonical path, and refuses a
+;; path holding `:` or `$`, which an rpath cannot hold: no rpath is written here).
+(defun readable-dir? (dir: str) -> bool
+  (let ((p (ffi/bytes-new dir))
+        (d (unsafe (ffi/ptr->addr (opendir p)))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (= d 0) false (do (unsafe (closedir (ffi/addr->ptr d))) true)))))
+
+;; The argument vector `main` receives: `(i32 argc) (ptr argv)`, for the words, each a NUL-terminated copy.
+(defun call-main :private (addr: i64 words: (Vec str)) -> (Result i64 str)
+  (let ((copies (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) words))
+        (argv (ffi/ptr->addr (ffi/words-new copies))))
+    (let ((r (call/call-i64 addr [(count words) argv])))
+      (do (ffi/free-addr argv)
+          (doseq [c copies] (ffi/free-addr c))
+          r))))
+
+;; The JIT session of `lir` (named `file` in messages) at optimisation level `opt`, and `main` called with `file` and `args` as its
+;; command line; the result of `main` as an `i32`. The session is not freed: the process ends with the program. Rust: main.rs:154 `run`
+(defun run-lir (file: str lir: str opt: i64 args: (Vec str)) -> (Result i64 str)
+  (try-let ((j (jit/jit-new opt))
+            (_ (jit/jit-add-source j file lir))
+            (addr (jit/jit-c-entry j "main"))
+            (r (call-main addr (into [file] args))))
+    (Ok (bit-and r 255))))
+
+;; The executable `out` of the module `lir`, linked against the libraries `libs`, searched in `dirs`. Rust: main.rs:200 `build`
+(defun build-lir (lir: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> (Result unit str)
+  (do (when-not (empty? dirs) (setenv-set "LIBRARY_PATH" (str-join (vec (interpose ":" dirs)))))
+      (jit/build-executable lir out opt libs)))

@@ -1,19 +1,106 @@
-;; compiler/emit/macros/abi.fib: the ABI of a macro module: the layout of `Form` and the text of the entry the expander calls (spec/compiler.md §6).
-;; Replaces crates/fibc/src/macros/abi.rs (`compile_macro` and `macro_forms` are E11's too, in emit.compile and here).
-;; STATUS: every public function below is a STUB of package E11, `(trap "todo: PACKAGE NAME")`,
-;; with the Rust it replaces in the comment above it (crates/fibc/src/macros/abi.rs, 174 lines of Rust).
-;; A stub reached makes a tool exit 70 (pending, never a pass); its signature is final for the callers,
-;; the data it names is the porter's to extend.
+;; compiler/emit/macros/abi.fib: the ABI of a macro module: the layout of `Form`, the table of the keywords the module interned and the text of
+;; the entry the expander calls (spec/compiler.md §6): the C-callable surface of a macro-time module, its entry that runs the macro, the
+;; constructors and readers of `Form` objects for the expander's forms, the hooks the module calls back for `gensym` and reflection, all
+;; `ccc` and exported. Replaces crates/fibc/src/macros/abi.rs (the text is the Rust's, byte for byte) and `macro_forms` of
+;; macros/mod.rs; `compile-macro` is emit.compile's.
 (ns emit.macros.abi
-  (:use emit.value emit.lower.cx))
+  (:require [fib.string :as s])
+  (:use syntax.pos syntax.form expand.types emit.value emit.layout emit.lower.cx))
 
-;; The layout of the built-in `Form`. Rust: macros/abi.rs:14 FormLayout (`tags: [u32; 11]`)
+;; The layout of the built-in `Form`. Rust: macros/abi.rs:14 FormLayout (`tags: [u32; 11]`): `sname` is the `Form` object's struct name
+;; (its variants are `.vN`), `tags` the variant index of each name in the order of `abi-variants`, `size` the size of a `Form` object,
+;; and `keyword-strs` the static `str` constant (`@str.N`) holding each interned keyword's name, by keyword id.
 (defstruct FormLayout (sname: str tid: i64 tags: (Vec i64) size: i64 vec: VecIds keyword-strs: (Vec str)))
 
-;; The integer and float widths and the variants of `Form`, in tag order. Rust: macros/abi.rs:31, :34
+;; The width suffixes `compile-macro` interns before anything else, so that a form of any width can be given an id by name, and the
+;; variants of `Form` in tag order. Rust: macros/abi.rs:31 WIDTHS, :34 VARIANTS
 (defun abi-widths () -> (Vec str) ["i8" "i16" "i32" "i64" "f32" "f64"])
 (defun abi-variants () -> (Vec str) ["Sym" "Kw" "Int" "Flt" "Str" "Chr" "Bool" "Nil" "List" "Vec" "Map"])
 
-;; Rust: macros/abi.rs:40 render
+;; `fibm.kw-count.K`, the number of keywords the module interned, and `fibm.kw.K`, the name of the keyword with a given id as an immortal
+;; `str` object, or null for an id that is none (below 0 or from the count up). The ids are 0 to count - 1, in the order interned.
+;; Rust: macros/abi.rs:152 render_keywords
+(defun abi-render-keywords (strs: (Vec str) k: i64) -> str
+  (let ((cases (str-join (mapv (fn (i: i64) (str-join [" ((i64 " (str i) ") kw" (str i) ")"])) (range (count strs)))))
+        (blocks (str-join (mapv (fn (i: i64) (str-join ["\n  (block kw" (str i) " (ret " (nth strs i) "))"])) (range (count strs))))))
+    (str-join ["(define (fibm.kw-count." (str k) " i64) () (block entry (ret (i64 " (str (count strs)) "))))\n"
+               "(define (fibm.kw." (str k) " ptr) ((i64 id))\n"
+               "  (block entry (switch id none" cases "))" blocks "\n"
+               "  (block none (ret (ptr null))))\n"])))
+
+;; The entry that runs the macro body `body` on `n` `Form` (or rest vector) arguments. Rust: macros/abi.rs:41 (the first writeln)
+(defun abi-entry :private (body: str n: i64 k: str) -> str
+  (let ((ids (range n)))
+    (str-join ["(define (fibm.entry." k " ptr) (" (s/join " " (mapv (fn (i: i64) (str-join ["(ptr a" (str i) ")"])) ids)) ")\n"
+               "  (block entry (ret (call @" body " " (s/join " " (mapv (fn (i: i64) (str-join ["a" (str i)])) ids)) "))))\n"])))
+
+;; The constructors of strings, forms and vectors. Rust: macros/abi.rs:58 (the second writeln, up to `fibm.form`)
+(defun abi-constructors :private (f: FormLayout k: str) -> str
+  (let ((sn (. f sname)) (tags (. f tags)) (v (. f vec)))
+    (str-join [
+      "(define (fibm.str." k " ptr) ((ptr bytes) (i64 n))\n"
+      "  (block entry\n"
+      "    (let ((r (call @fib.str-new n)))\n"
+      "      (call @memcpy (call @fib.str-bytes-ptr r) bytes n)\n"
+      "      (ret r))))\n"
+      "(define (fibm.form." k " ptr) ((i32 tag) (i64 a) (i64 b) (ptr p))\n"
+      "  (block entry\n"
+      "    (let ((o (call @fib.alloc (i64 " (str (. f size)) ") (i32 " (str (. f tid)) ")))\n"
+      "          (f0 (getelementptr %struct." sn ".v0 o (i32 0) (i32 4)))\n"
+      "          (f1 (getelementptr %struct." sn ".v2 o (i32 0) (i32 5))))\n"
+      "      (store (i32 " (str flag-immortal) ") (getelementptr %struct.fib.hdr o (i32 0) (i32 2)))\n"
+      "      (store (i64 0) (getelementptr %struct.fib.hdr o (i32 0) (i32 0)))\n"
+      "      (store tag (getelementptr %struct." sn " o (i32 0) (i32 3)))\n"
+      "      (switch tag done ((i32 " (str (nth tags 0)) ") ptrf) ((i32 " (str (nth tags 1)) ") ptrf) ((i32 " (str (nth tags 2)) ") intf) ((i32 " (str (nth tags 3)) ") fltf) ((i32 " (str (nth tags 4)) ") ptrf) ((i32 " (str (nth tags 5)) ") chrf) ((i32 " (str (nth tags 6)) ") boolf) ((i32 " (str (nth tags 8)) ") ptrf) ((i32 " (str (nth tags 9)) ") ptrf) ((i32 " (str (nth tags 10)) ") ptrf))))\n"
+      "  (block ptrf (store p f0) (br done))\n"
+      "  (block intf (store a f0) (store b f1) (br done))\n"
+      "  (block fltf (store (bitcast double a) f0) (store b f1) (br done))\n"
+      "  (block chrf (store (trunc i32 a) (getelementptr %struct." sn ".v5 o (i32 0) (i32 4))) (br done))\n"
+      "  (block boolf (store (trunc i1 a) (getelementptr %struct." sn ".v6 o (i32 0) (i32 4))) (br done))\n"
+      "  (block done (ret o)))\n"])))
+
+;; The readers of forms and vectors and the hooks. Rust: macros/abi.rs:58 (the rest of the second writeln)
+(defun abi-readers :private (f: FormLayout k: str) -> str
+  (let ((sn (. f sname)) (tags (. f tags)) (v (. f vec)))
+    (str-join [
+      "(define (fibm.vec." k " ptr) ((ptr buf) (i64 n))\n"
+      "  (block entry (ret (call @fib.vec-build buf n (i64 8) (i8 1) (i32 " (str (. v tvec)) ") (i32 " (str (. v tnode)) ") (i32 " (str (. v tarr)) ") (i32 " (str (. v tnarr)) ")))))\n"
+      "(define (fibm.tag." k " i32) ((ptr o))\n"
+      "  (block entry (ret (load i32 (getelementptr %struct." sn " o (i32 0) (i32 3))))))\n"
+      "(define (fibm.f0-ptr." k " ptr) ((ptr o))\n"
+      "  (block entry (ret (load ptr (getelementptr %struct." sn ".v0 o (i32 0) (i32 4))))))\n"
+      "(define (fibm.f0-i64." k " i64) ((ptr o))\n"
+      "  (block entry (ret (load i64 (getelementptr %struct." sn ".v2 o (i32 0) (i32 4))))))\n"
+      "(define (fibm.f0-f64." k " double) ((ptr o))\n"
+      "  (block entry (ret (load double (getelementptr %struct." sn ".v3 o (i32 0) (i32 4))))))\n"
+      "(define (fibm.f0-i32." k " i32) ((ptr o))\n"
+      "  (block entry (ret (load i32 (getelementptr %struct." sn ".v5 o (i32 0) (i32 4))))))\n"
+      "(define (fibm.f0-i1." k " i32) ((ptr o))\n"
+      "  (block entry (ret (zext i32 (load i1 (getelementptr %struct." sn ".v6 o (i32 0) (i32 4)))))))\n"
+      "(define (fibm.f1-i64." k " i64) ((ptr o))\n"
+      "  (block entry (ret (load i64 (getelementptr %struct." sn ".v2 o (i32 0) (i32 5))))))\n"
+      "(define (fibm.str-len." k " i64) ((ptr s)) (block entry (ret (call @fib.str-len s))))\n"
+      "(define (fibm.str-ptr." k " ptr) ((ptr s)) (block entry (ret (call @fib.str-bytes-ptr s))))\n"
+      "(define (fibm.vec-len." k " i64) ((ptr v)) (block entry (ret (call @fib.vec-len v))))\n"
+      "(define (fibm.vec-elem." k " ptr) ((ptr v) (i64 i))\n"
+      "  (block entry (ret (load ptr (call @fib.vec-elem-ptr v i (i64 8))))))\n"
+      "(define (fibm.set-hooks." k " void) ((ptr gensym) (ptr reflect) (ptr cx))\n"
+      "  (block entry (store gensym @fibm.gensym-hook) (store reflect @fibm.reflect-hook) (store cx @fibm.hook-cx) (ret)))\n"
+      "(define (fibm.set-trap-hook." k " void) ((ptr trap))\n"
+      "  (block entry (store trap @fibm.trap-hook) (ret)))\n"
+      "(define (fibm.init." k " void) () (block entry (call @fib.init) (ret)))\n"])))
+
+;; The lIR of the module's surface; `entry` runs the macro body `body` on `n` `Form` (or rest vector) arguments. Rust: macros/abi.rs:40 render
 (defun abi-render (f: FormLayout body: str n: i64 k: i64) -> str
-  (trap "todo: E11 abi-render"))
+  (str-join [(abi-render-keywords (. f keyword-strs) k) (abi-entry body n (str k)) (abi-constructors f (str k)) (abi-readers f (str k))]))
+
+;; ---- the forms of a macro-time module
+
+;; The macro-time module's forms: the `defmacro` and a `main`, as the interpreter's runner builds them. Rust: macros/mod.rs:219 macro_forms
+(defun macro-forms (m: MacroDef) -> (Vec Stx)
+  (let ((p (. m pos)))
+    (let ((sym (fn (s: str) (Stx (SSym s) p)))
+          (params (into (mapv (fn (s: str) (Stx (SSym s) p)) (. m params))
+                        (match (. m rest) (nil []) ((some r) [(Stx (SSym "...") p) (Stx (SSym r) p)])))))
+      [(Stx (SList (into [(sym "defmacro") (sym (. m name)) (Stx (SList params) p)] (. m body))) p)
+       (Stx (SList [(sym "defun") (sym "main") (Stx (SList []) p) (sym "->") (sym "i64") (Stx (SInt 0 I64) p)]) p)])))

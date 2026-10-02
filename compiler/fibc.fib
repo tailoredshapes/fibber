@@ -1,0 +1,35 @@
+;; compiler/fibc.fib: the compiler in fibber, `fibc` (spec/compiler.md §1, spec/bootstrap.md; package D1 of M6 step 5): the port of
+;; crates/fibc/src/main.rs, command.rs and front.rs over the passes already in fibber (the reader, expander, type checker, ownership
+;; checker and lIR emitter of compiler/) and lair through its C interface (compiler/lair): `emit FILE` prints the lIR module, `build FILE
+;; -o OUT [-O N] [-L dir].. [-l lib]..` makes the executable, `run [--trace] [-O N] FILE [-- arg..]` runs `main` through the JIT, `explain
+;; FILE` prints the ownership checker's decisions, `emit-dump` is the emitter's oracle tool (compiler/emit.fib), `help`. `-I DIR` and
+;; the directories of FIB_LIB are the roots a module is looked for in (spec/syntax.md §5).
+;; Exit status as the Rust: 0, `main`'s result for `run`, 2 for usage or a file that does not read, 3 the front end rejected the
+;; program, 4 the compiler cannot lower it yet (`unsupported`), 5 lair refused the module or the link failed. Added here: 1 for a
+;; program that needs a macro (the stage-2 expander has no runner yet: the lead wires it); for `emit-dump` the statuses of
+;; compiler/emit.fib (0, 1, 2, 3, 70 pending).
+;; Not ported (the Rust test harness stays Rust): `itrace`, `cases`, `gen`: each is refused with status 2.
+;; Build: `fibc build compiler/fibc.fib -I compiler -I lib -L target/debug -l lair -o OUT`, run from the repository root.
+(ns main
+  (:require [driver.args :as a] [driver.commands :as c] [driver.native :as native] [expand.roots :as roots]))
+
+(defun refuse (word: str) -> i64
+  (do (eprintln (str-join ["fibc: `" word "` is a command of the Rust compiler (the test harness)"])) 2))
+
+(defun dispatch (cmd: a/Command rts: roots/Roots) -> i64
+  (match cmd
+    ((a/CmdRun file trace args opt) (c/cmd-run file trace args opt rts))
+    ((a/CmdBuild file out dirs libs opt) (c/cmd-build file out dirs libs opt rts))
+    ((a/CmdEmit file) (c/cmd-emit file rts))
+    ((a/CmdEmitDump opts files) (c/cmd-emit-dump files opts rts))
+    ((a/CmdExplain file) (c/cmd-explain file rts))
+    ((a/CmdHarness word) (refuse word))
+    ((a/CmdHelp) (do (println a/usage) 0))
+    ((a/CmdInvalid) (do (eprintln a/usage) 2))))
+
+(defun main () -> i64
+  (let ((split (a/split-roots (vec (args))))
+        (cmd (a/parse (. split rest))))
+    (if (and (not (empty? (. split dirs))) (not (a/takes-roots? cmd)))
+        (do (eprintln (str-join ["fibc: -I belongs to a command that reads a program\n" a/usage])) 2)
+        (dispatch cmd (roots/roots-from-env (. split dirs) (native/getenv-opt "FIB_LIB"))))))

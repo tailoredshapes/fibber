@@ -205,12 +205,16 @@
     ((EQuote f) (val-flow (lcx-quote cx e f)))
     ((EConcat es) (val-flow (lcx-concat cx e es)))))
 
-;; Lowers an expression: its value, then the plan's operations (the hub's `expr`). Rust: lower/mod.rs:333 Cx::expr
+;; Lowers an expression: its value, then the plan's operations (the hub's `expr`); `at` is the expression being lowered (E11: a trap
+;; of a macro module carries its position, lcx-trap-c). Rust: lower/mod.rs:333 Cx::expr
 (defun expr-step (cx: LowerCx e: Expr) -> (Result Flow str)
-  (try-let ((flow (form cx e)))
-    (match flow
-      ((FlowVal v)
-       (do (when (contains? (. cx value-sites) (. e id))
-             (set! (. cx values) (assoc @(. cx values) (. e id) v)))
-           (try-let ((ran (lcx-after cx (. e id)))) (Ok flow))))
-      ((FlowJump) (Ok flow)))))
+  (let ((outer @(. cx at)))
+    (do (set! (. cx at) (some e))
+        (try-let ((flow (form cx e)))
+          (do (set! (. cx at) outer)
+              (match flow
+                ((FlowVal v)
+                 (do (when (contains? (. cx value-sites) (. e id))
+                       (set! (. cx values) (assoc @(. cx values) (. e id) v)))
+                     (try-let ((ran (lcx-after cx (. e id)))) (Ok flow))))
+                ((FlowJump) (Ok flow))))))))

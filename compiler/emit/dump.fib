@@ -5,11 +5,11 @@
 ;; is the one of `check_modules`: lowering, the `&` checks, inference, ownership (own.driver `own-check-lowered`).
 ;; PENDING: a stub reached (an error `todo: ..`, emit.assemble) is printed on stderr and makes the status 70, which wins over the others
 ;; (the harness counts it as pending, never as a pass). The sections that need no body, `runtime` and `main`, are printed all the same.
-;; Not ported: `--macro NAME` (package E11): it checks the file and is pending.
+;; `--macro NAME` (package E11): the macro-time module of the macro, `compile-macro` (emit.macros.front finds the macro, emit-macro prints it).
 (ns emit.dump
   (:require [fib.string :as s] [types.driver :as driver] [types.dump :as dump] [syntax.dump :as sdump])
-  (:use syntax.form expand.types types.args types.dump.sections own.error own.program own.driver
-        emit.args emit.assemble emit.compile emit.layout-dump))
+  (:use syntax.form expand.types expand.roots types.args types.dump.sections own.error own.program own.driver
+        emit.args emit.assemble emit.compile emit.layout-dump emit.macros.abi emit.macros.front))
 
 (def pending-status: i64 70)
 
@@ -80,13 +80,17 @@
             (conj acc (str-join ["error " (own-error-kind-name (. e kind)) " " (sdump/span-in (. e pos) home) ": " (. e message)])))
           lines errs))
 
+;; What a program the compiler cannot lower is told by: the first word of its message and nothing else, status 3. Rust: From<Stop>
+(defun unsupported-dump :private (lines: (Vec str) m: str) -> dump/Dumped
+  (dump/Dumped (conj lines (str-join ["unsupported" (if (= (first-word m) "") "" (str-join [" " (first-word m)]))])) 3))
+
 ;; The module of a checked program, printed, or what stopped it.
 (defun emit-checked :private (lines: (Vec str) c: Checked o: EmitOptions) -> dump/Dumped
   (match (compile-module (. c typed) (. c owned) false)
-    ((Err m) (dump/Dumped (conj lines (str-join ["unsupported" (if (= (first-word m) "") "" (str-join [" " (first-word m)]))])) 3))
+    ((Err m) (unsupported-dump lines m))
     ((Ok m) (dump/Dumped (sections-lines lines m o) (module-status m o)))))
 
-;; The check of an expanded program: the front end's records when it does not check, else the module (or the macro's, pending).
+;; The check of an expanded program: the front end's records when it does not check, else the module.
 (defun emit-check :private (o: EmitOptions lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
     -> dump/Dumped
   (match (driver/lower-modules modules prelude)
@@ -96,15 +100,39 @@
        ((Err (CeType errs)) (dump/error-dump lines errs home true))
        ((Err (CeOwn errs)) (dump/Dumped (own-records lines errs home) 1))
        ((Err e) (dump/Dumped (conj lines (check-error-text e)) 1))
-       ((Ok c)
-        (if (some? (. o macro-name))
-            (do (eprintln "todo: E11 --macro") (dump/Dumped lines pending-status))
-            (emit-checked lines c o)))))))
+       ((Ok c) (emit-checked lines c o))))))
+
+;; The macro-time module of a macro, printed under `;; == macro KEY`: the module of `compile-macro` for the first macro module of a
+;; run (`k` is 0), or what stopped it; a stub reached is pending. Rust: emit_dump/front.rs:113 `macro_text`
+(defun emit-macro-module :private (lines: (Vec str) m: MacroDef c: Checked) -> dump/Dumped
+  (match (compile-macro (. c typed) (. c owned) (. m name) (+ (count (. m params)) (if (some? (. m rest)) 1 0)) 0)
+    ((Err msg) (if (starts-with? msg "todo: ")
+                   (do (eprintln msg) (dump/Dumped lines pending-status))
+                   (unsupported-dump lines msg)))
+    ((Ok mm) (dump/Dumped (into (conj lines (str-join [";; == macro " (. m key)])) (text-line (. mm text))) 0))))
+
+;; The check of the macro's forms, as a program of their own, and the module. Rust: `check_forms` and `macro_text`
+(defun emit-macro :private (file: str name: str) -> dump/Dumped
+  (match (macro-front file name)
+    ((Err d) d)
+    ((Ok mi)
+     (match (own-check-forms (macro-forms (. mi def)) (. mi prelude))
+       ((Err (CeType errs)) (dump/error-dump (. mi lines) errs file true))
+       ((Err (CeOwn errs)) (dump/Dumped (own-records (. mi lines) errs file) 1))
+       ((Err e) (dump/Dumped (conj (. mi lines) (check-error-text e)) 1))
+       ((Ok c) (emit-macro-module (. mi lines) (. mi def) c))))))
 
 ;; What `fibc emit-dump` prints for one file, and the status it adds. Rust: emit_dump/mod.rs:192 dump_file
-(defun emit-file (file: str o: EmitOptions) -> dump/Dumped
+;; The modules the file requires are looked for in `roots` (the driver's `-I` and FIB_LIB; D1), except by `--macro` (emit.macros.front).
+(defun emit-file-in (file: str o: EmitOptions roots: Roots) -> dump/Dumped
   (if (. o layout)
-      (layout-file file)
-      (dump/dump-file file (options-default)
+      (layout-file-in file roots)
+      (if-some [name (. o macro-name)]
+        (emit-macro file name)
+        (dump/dump-file-in file (options-default) roots
                       (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
-                        (emit-check o lines modules prelude shown home opts)))))
+                        (emit-check o lines modules prelude shown home opts))))))
+
+;; `emit-file-in` with the built-in library only.
+(defun emit-file (file: str o: EmitOptions) -> dump/Dumped
+  (emit-file-in file o (roots-default)))

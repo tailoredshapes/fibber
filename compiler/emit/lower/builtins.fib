@@ -3,8 +3,7 @@
 ;; emit.lower.cx (emit.lower.strfind calls it and this module calls strfind), and the cell load is the hub's `cell-load` (call.rs
 ;; is above this module). The Rust `match name` is a chain of `match`es, each ending in the next (`builtin-core`, `builtin-text`,
 ;; `builtin-mem`), because a fibber `match` takes no or-pattern; an argument is fetched where the Rust arm fetches it, so a missing
-;; one is the Rust's error. NOT PORTED: the `trap` arm of a macro module (`fib.trap-at`, Rust `p.macro_module`): Program has no such
-;; flag until the macro module (E11) lands.
+;; one is the Rust's error. The `trap` arm of a macro module (`fib.trap-at`, Rust `p.macro_module`) is E11's.
 (ns emit.lower.builtins
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.program emit.objects.kinds
         emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads))
@@ -22,7 +21,10 @@
 (defun lcx-builtin (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result (Option V) str)
   (if (= name "trap")
       (try-let ((m (arg name a 0)))
-        (do (fb-stmt (. cx b) (str-join ["(call @fib.trap " (v-text m) ")"]))
+        ;; In a macro module the trap fails the expansion with the interpreter's text, `POS: trap: MSG`, and does not return.
+        (do (fb-stmt (. cx b) (if @(. (. cx p) macro-module)
+                                  (str-join ["(call @fib.trap-at (string \"" (lir-text (pos-text (. e pos))) "\") " (v-text m) ")"])
+                                  (str-join ["(call @fib.trap " (v-text m) ")"])))
             (fb-term (. cx b) "(unreachable)")
             (Ok nil)))
       (try-let ((v (builtin-core cx name e a tys))) (Ok (some v)))))

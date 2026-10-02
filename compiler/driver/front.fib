@@ -1,0 +1,99 @@
+;; compiler/driver/front.fib: the front end of the driver, as crates/fibc/src/front.rs `check_in` (spec/compiler.md §1) and the
+;; lowering of crates/fibc/src/main.rs (`lower`, `lower_kind`, :19 the exit codes): read, load (the modules of the program found in
+;; `roots`), expand, type, check ownership, then the lIR text of the module; or what to say and the exit status when a step stops.
+;; Shapes decided: the macro runner of stage 2a is `no-runner`, so a program that calls a macro is `FrontPending` (the expander's
+;; `MacroNeedsEvaluator` record on stderr, exit 1: the lead wires the runner of stage 2b in `front-check`, the one place that
+;; expands). The reason a file or a module cannot be read is the operating system's, asked for as Rust prints it (driver.native `fault-of`).
+(ns driver.front
+  (:require [syntax.dump :as sdump] [expand.modules :as mods] [types.driver :as td] [emit.compile :as ec] [driver.native :as native]
+            [fib.string :as s])
+  (:use syntax.form expand.error expand.types expand.ctx expand.roots own.error own.program own.driver))
+
+;; The exit statuses of a program the compiler stops at. Rust: harness/child.rs EXIT_REJECTED, EXIT_UNSUPPORTED, EXIT_COMPILE_FAILED
+(def exit-usage: i64 2)
+(def exit-rejected: i64 3)
+(def exit-unsupported: i64 4)
+(def exit-compile-failed: i64 5)
+(def exit-pending: i64 1)
+
+;; What the front end said about a program. Rust: front.rs:15 Front (and `FrontPending`: a macro that needs a runner)
+(defenum Front
+  (FrontChecked c: Checked)
+  (FrontRejected message: str)
+  (FrontFailed message: str)
+  (FrontPending record: str))
+
+;; The expander stopped: a macro that needs a runner (stage 2a has none) is pending, any other error a rejection.
+(defun expand-stop :private (e: ExpandError file: str) -> Front
+  (match (. e kind)
+    ((MacroNeedsEvaluator _)
+     (FrontPending (str-join ["error MacroNeedsEvaluator " (sdump/span-in (. e pos) file) ": " (expand-err-message (. e kind))])))
+    (_ (FrontRejected (expand-error-text e)))))
+
+;; The text of a module that is not at its file: the Rust asks the operating system why for each place it looked (beside the main file,
+;; then each root), and says so for the first, naming the others with `nor at`; a place that is not missing but cannot be read ends it.
+;; Rust: roots.rs:103 `find`, modules/load.rs:121 (the words are those of `impl Display for LoadError`)
+(defun missing-text :private (ns: str file: str roots: Roots) -> str
+  (let ((rel (str-concat (str-join (vec (interpose "/" (s/split ns ".")))) ".fib"))
+        (places (into [file] (mapv (fn (d: str) (path-join d rel)) (. roots dirs)))))
+    (loop ((i 0) (missing []))
+      (if (>= i (count places))
+          (let ((first-fault (nth missing 0))
+                (also (mapv (fn (m: (Pair str native/Fault)) (. m fst)) (vec (drop 1 missing)))))
+            (str-join ["module " ns " is not at " (. first-fault fst) ": " (. (. first-fault snd) text)
+                       (if (empty? also) "" (str-concat "; nor at " (str-join (vec (interpose ", " also)))))]))
+          (let ((f (native/fault-of (nth places i))))
+            (if (or (= (. f code) 2) (= (. f code) 20))
+                (recur (+ i 1) (conj missing (Pair (nth places i) f)))
+                (str-join ["module " ns " is not at " (nth places i) ": " (. f text)])))))))
+
+;; The text of a load failure; a module that is not at its file says why. Rust: modules.rs:71 `impl Display for LoadError`
+(defun load-failure :private (e: LoadErr roots: Roots) -> str
+  (match e
+    ((LoadMissing ns file) (missing-text ns file roots))
+    (_ (mods/load-err-message e))))
+
+;; The checker's verdict. Rust: front.rs:83
+(defun check-stop :private (e: CheckError) -> Front
+  (match e
+    ((CePrelude m) (FrontFailed m))
+    ((CeInternal m) (FrontFailed m))
+    (_ (FrontRejected (check-error-text e)))))
+
+;; Reads, expands, types and checks `source` (named `file` in positions), its modules looked for in `roots`, exactly as the Rust
+;; front end does before it lowers. Rust: front.rs:45 `check_in`
+(defun front-check (source: str file: str roots: Roots) -> Front
+  (let ((ctx (ctx-new)))
+    (match (td/prelude-forms ctx)
+      ((Err m) (FrontFailed (str-concat "the prelude does not expand: " m)))
+      ((Ok prelude)
+       (match (mods/try-load-in source file roots)
+         ((Err e) (FrontRejected (load-failure e roots)))
+         ((Ok loaded)
+          (match (mods/expand-all loaded ctx (no-runner))
+            ((Err e) (expand-stop e file))
+            ((Ok modules)
+             (match (own-check-modules modules prelude)
+               ((Err e) (check-stop e))
+               ((Ok c) (FrontChecked c)))))))))))
+
+;; The checked program of `file`, or the exit status after the message of what stopped it. Rust: main.rs:47 `lower_kind` (first half)
+(defun check-file (file: str roots: Roots) -> (Result Checked i64)
+  (match (read-file file)
+    (nil (do (eprintln (str-join ["fibc: cannot read " file ": " (. (native/fault-of file) text)])) (Err exit-usage)))
+    ((some source)
+     (match (front-check source file roots)
+       ((FrontChecked c) (Ok c))
+       ((FrontRejected m) (do (eprintln (str-concat "rejected:\n" m)) (Err exit-rejected)))
+       ((FrontFailed m) (do (eprintln (str-concat "failed: " m)) (Err exit-compile-failed)))
+       ((FrontPending r) (do (eprintln r) (Err exit-pending)))))))
+
+;; The front end and the lowering: the lIR text of `file` (of an executable when `executable`), or the exit status that says why
+;; not, its message already printed. Rust: main.rs:47 `lower_kind`
+(defun lower-kind (file: str roots: Roots executable: bool) -> (Result str i64)
+  (match (check-file file roots)
+    ((Err code) (Err code))
+    ((Ok c)
+     (match (if executable (ec/compile-executable (. c typed) (. c owned)) (ec/compile (. c typed) (. c owned)))
+       ((Err m) (do (eprintln (str-concat "unsupported: " m)) (Err exit-unsupported)))
+       ((Ok text) (Ok text))))))

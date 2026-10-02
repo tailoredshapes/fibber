@@ -13,7 +13,7 @@
 ;; `hub-default` in emit.lower.mod (the only constructor). A context for a generated body (a wrapper, a vtable function) is
 ;; `lcx-sub` of the context it is made in: it keeps the hub.
 (ns emit.lower.cx
-  (:use types.ty types.decls types.table types.program types.ast types.init own.program emit.value emit.layout emit.ir emit.mono emit.program))
+  (:use syntax.pos types.ty types.decls types.table types.program types.ast types.init own.program emit.value emit.layout emit.ir emit.mono emit.program))
 
 ;; What an expression yielded: a value, or a jump (the block ended). Rust: lower/mod.rs:38 Flow
 (defenum Flow (FlowVal v: V) FlowJump)
@@ -57,7 +57,8 @@
    locals: (Cell (Map i64 Local)) values: (Cell (Map i64 V)) value-sites: (Set i64)
    env: (Cell (Option V)) loops: (Cell (Vec LoopCx)) stack-slots: (Cell (Map i64 str))
    lits: (Map i64 Expr) rests: (Cell (Vec RestSlot)) closure-slots: (Cell (Set str))
-   async-frame: (Cell (Option AsyncFrame)) hub: Hub))
+   async-frame: (Cell (Option AsyncFrame)) hub: Hub
+   at: (Cell (Option Expr))))
 
 ;; The sites of `ops` that name an expression's value, added to `acc`.
 (defun add-sites :private (acc: (Set i64) ops: (Vec Op)) -> (Set i64)
@@ -93,7 +94,7 @@
 (defun lcx-build (p: Program inst: Inst own: BodyOwn name: str params: (Vec LirParam) tailcc: bool hub: Hub lits: (Map i64 Expr))
     -> LowerCx
   (LowerCx p inst own name (fb-new name nil params tailcc) (cell (map-empty)) (cell (map-empty)) (value-sites own) (cell nil)
-           (cell []) (cell (map-empty)) lits (cell []) (cell (set-empty)) (cell nil) hub))
+           (cell []) (cell (map-empty)) lits (cell []) (cell (set-empty)) (cell nil) hub (cell nil)))
 
 ;; The context of a generated body (a wrapper, a vtable function) of `parent`'s program, with the parent's hub. Rust: Cx::new of a
 ;; method of the parent's
@@ -143,10 +144,25 @@
     ((VVal s (LirDyn)) (some (v-text (fb-val (. cx b) (str-join ["(extractvalue " s " 0)"]) LirPtr))))
     (_ nil)))
 
-;; A trap with a C-string message: the block ends here. Rust: lower/mod.rs:432 Cx::trap_c
+;; `text` as the body of an lIR string literal. Rust: lower/fault.rs:11 lir_text
+(defun lir-text (text: str) -> str
+  (str-join (mapv (fn (c: char) (cond (= c \\) "\\\\" (= c \") "\\\"" (= c \newline) "\\n" :else (char->str c))) (str-chars text))))
+
+;; `FILE:LINE:COL`, the text of a position. Rust: syntax/pos.rs:51 Display for Pos
+(defun pos-text (p: Pos) -> str
+  (str-join [(. p file) ":" (str (. p line)) ":" (str (. p col))]))
+
+;; A trap with a C-string message: the block ends here. In a macro module (`macro-module`) a trap fails the expansion through the
+;; module's hook and carries the position of the expression being lowered (`at`). Rust: lower/fault.rs:18 Cx::trap_c
 (defun lcx-trap-c (cx: LowerCx msg: str) -> unit
-  (do (fb-stmt (. cx b) (str-join ["(call @fib.trap-c (string \"" msg "\"))"]))
-      (fb-term (. cx b) "(unreachable)")))
+  (let ((plain (str-join ["(call @fib.trap-c (string \"" msg "\"))"])))
+    (do (fb-stmt (. cx b)
+                 (match @(. cx at)
+                   ((some e) (if @(. (. cx p) macro-module)
+                                 (str-join ["(call @fib.trap-at-c (string \"" (lir-text (pos-text (. e pos))) "\") (string \"" msg "\"))"])
+                                 plain))
+                   (nil plain)))
+        (fb-term (. cx b) "(unreachable)"))))
 
 ;; `(getelementptr %struct.S p (i32 0) (i32 i))`. Rust: lower/mod.rs:439 Cx::gep
 (defun lcx-gep (cx: LowerCx sname: str p: str i: i64) -> str

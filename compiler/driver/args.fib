@@ -1,0 +1,167 @@
+;; compiler/driver/args.fib: the command line of the compiler in fibber, as crates/fibc/src/command.rs (501 lines, most of them
+;; tests) and `fibref::cmdline::split_roots` (spec/compiler.md §1): the usage text, `-I DIR` (or `-IDIR`) taken out of the words
+;; before the first `--`, and the parse of what is left into a `Command`.
+;; Shapes decided: the Rust `Command` is an enum of the same variants with `opt` an `i64`; the three commands that stay Rust
+;; (`itrace`, `cases`, `gen`: the test harness, spec/compiler.md §5) are one variant, `CmdHarness`, whose word the driver names in
+;; its refusal; `emit-dump`'s words are emit.args' (`emit-parse-args`). Not ported: the check that an argument before `--` is UTF-8
+;; (`(args)` of a fibber program turns an invalid sequence into U+FFFD).
+(ns driver.args
+  (:use emit.args))
+
+(def usage: str
+  "usage: fibc <command>
+
+Every command that reads a program (run, build, emit, emit-dump, explain) takes
+-I dir (or -Idir), any number of times, anywhere before --: a module is found
+beside the file, then under each -I dir in order, then under each directory of
+$FIB_LIB, then in the library directory `lib` (spec/syntax.md §5).
+
+commands:
+  run [--trace] [-O N] <file> [-- arg..]
+                         compile file through the JIT and run its main; the
+                         args after -- are (args)
+  build <file> -o <out> [-O N] [-L dir].. [-l lib]..
+                         compile file to an executable; each -l lib links
+                         -llib, each -L dir is searched for libraries (-Ldir and
+                         -llib are also taken)
+
+-O N (N from 0 to 3, or -ON) is the LLVM optimisation level of run and build:
+build defaults to 2, run to 0.
+  emit <file>            print the lIR module of file
+  emit-dump [--sections LIST | --fn PREFIX | --layout | --macro NAME] [--] <file>..
+                         print the lIR module of each file in its sections, or
+                         the layout of its types, or one macro module (spec/bootstrap.md
+                         section 8); exit 0, 1 a record, 2 unreadable, 3 unsupported
+  explain <file>         print the ownership checker's decisions (types §9)
+  help                   print this message
+
+itrace, cases and gen are commands of the Rust compiler (the test harness).")
+
+;; The LLVM optimisation level of `run` without `-O`, and of `build`. Rust: command.rs RUN_OPT_LEVEL, BUILD_OPT_LEVEL
+(def run-opt-level: i64 0)
+(def build-opt-level: i64 2)
+
+;; What the command line asks for. Rust: command.rs:81 Command
+(defenum Command
+  (CmdRun file: str trace: bool args: (Vec str) opt: i64)
+  (CmdBuild file: str out: str dirs: (Vec str) libs: (Vec str) opt: i64)
+  (CmdEmit file: str)
+  (CmdEmitDump opts: EmitOptions files: (Vec str))
+  (CmdExplain file: str)
+  (CmdHarness word: str)
+  (CmdHelp)
+  (CmdInvalid))
+
+;; Whether a command takes `-I`. Rust: main.rs:355 `takes_roots` (`itrace` does too, but is not here)
+(defun takes-roots? (c: Command) -> bool
+  (match c
+    ((CmdRun _ _ _ _) true)
+    ((CmdBuild _ _ _ _ _) true)
+    ((CmdEmit _) true)
+    ((CmdEmitDump _ _) true)
+    ((CmdExplain _) true)
+    ((CmdHarness w) (= w "itrace"))
+    (_ false)))
+
+;; The `-I` directories and the other words. Rust: cmdline.rs:37 `split_roots`
+(defstruct Split (dirs: (Vec str) rest: (Vec str)))
+
+;; Whether the word is one of the words.
+(defun in? :private (word: str words: (Vec str)) -> bool
+  (some? (first (filter (fn (w: str) (= w word)) words))))
+
+;; The word after the one at i, if there is one.
+(defun word-at :private (words: (Vec str) i: i64) -> (Option str)
+  (if (< i (count words)) (some (nth words i)) nil))
+
+;; A `-I` is left in the words when no directory follows, or the next word is empty or `--`. The flag stands anywhere before the first `--`.
+(defun split-roots (words: (Vec str)) -> Split
+  (loop ((i 0) (dirs (vec-empty)) (rest (vec-empty)) (after false))
+    (if (>= i (count words))
+        (Split dirs rest)
+        (let ((w (nth words i))
+              (past (or after (= w "--")))
+              (next (word-at words (+ i 1))))
+          (cond past (recur (+ i 1) dirs (conj rest w) true)
+                (not (starts-with? w "-I")) (recur (+ i 1) dirs (conj rest w) false)
+                (not (= w "-I")) (recur (+ i 1) (conj dirs (str-slice w 2 (str-len w))) rest false)
+                (and (some? next) (not (= (unwrap-or next "") "")) (not (= (unwrap-or next "") "--")))
+                  (recur (+ i 2) (conj dirs (unwrap-or next "")) rest false)
+                :else (recur (+ i 1) dirs (conj rest w) false))))))
+
+;; An optimisation level: one digit, 0 to 3. Rust: command.rs:203 `opt_level`
+(defun opt-level :private (text: str) -> (Option i64)
+  (cond (= text "0") (some 0) (= text "1") (some 1) (= text "2") (some 2) (= text "3") (some 3) :else nil))
+
+;; A flag with its value, as `cc` takes them: `-L DIR` or `-LDIR`, `-l LIB` or `-lLIB`, `-O N` or `-ON`, `-o OUT`; `used` is how
+;; many words it took. Rust: command.rs:182 `flag_value`
+(defstruct FlagVal (name: str value: str used: i64))
+
+(defun flag-value :private (words: (Vec str) i: i64) -> (Option FlagVal)
+  (let ((flag (nth words i))
+        (glued (first (filter (fn (n: str) (starts-with? flag n)) ["-L" "-l" "-O"]))))
+    (if (and (some? glued) (> (str-len flag) 2))
+        (some (FlagVal (unwrap-or glued "") (str-slice flag 2 (str-len flag)) 1))
+        (match (word-at words (+ i 1))
+          (nil nil)
+          ((some v) (if (= v "") nil (some (FlagVal flag v 2))))))))
+
+;; `build FILE -o OUT` and any number of `-L DIR` and `-l LIB`, and at most one `-O N`, in any order after the file; `-o` exactly once.
+;; Rust: command.rs:218 `parse_build`
+(defun parse-build :private (file: str rest: (Vec str)) -> Command
+  (loop ((i 0) (out nil) (dirs (vec-empty)) (libs (vec-empty)) (opt nil))
+    (if (>= i (count rest))
+        (match out
+          (nil CmdInvalid)
+          ((some o) (CmdBuild file o dirs libs (unwrap-or opt build-opt-level))))
+        (match (flag-value rest i)
+          (nil CmdInvalid)
+          ((some fv)
+           (let ((name (. fv name)) (value (. fv value)) (next (+ i (. fv used))))
+             (cond (and (= name "-o") (nil? out)) (recur next (some value) dirs libs opt)
+                   (= name "-L") (recur next out (conj dirs value) libs opt)
+                   (= name "-l") (recur next out dirs (conj libs value) opt)
+                   (and (= name "-O") (nil? opt))
+                     (match (opt-level value)
+                       (nil CmdInvalid)
+                       ((some n) (recur next out dirs libs (some n))))
+                   :else CmdInvalid)))))))
+
+;; The tail of `run`'s words from the file on. Rust: command.rs:266
+(defun run-from :private (rest: (Vec str) at: i64 trace: bool opt: (Option i64)) -> Command
+  (let ((tail (vec (drop at rest)))
+        (level (unwrap-or opt run-opt-level)))
+    (cond (= (count tail) 1) (CmdRun (nth tail 0) trace [] level)
+          (and (>= (count tail) 2) (= (nth tail 1) "--")) (CmdRun (nth tail 0) trace (vec (drop 2 tail)) level)
+          :else CmdInvalid)))
+
+;; `run [--trace] [-O N] FILE [-- ARG..]`: the flags in either order before the file. A flag has to be followed by a word that is
+;; not `--`, the file, so `run --trace` is the file `--trace` as it always was. Rust: command.rs:245 `parse_run`
+(defun parse-run :private (rest: (Vec str)) -> Command
+  (loop ((at 0) (trace false) (opt nil))
+    (let ((next (word-at rest (+ at 1)))
+          (word (if (< at (count rest)) (nth rest at) "")))
+      (cond (or (nil? next) (= (unwrap-or next "") "--")) (run-from rest at trace opt)
+            (and (= word "--trace") (not trace)) (recur (+ at 1) true opt)
+            (and (starts-with? word "-O") (nil? opt))
+              (let ((glued (str-slice word 2 (str-len word))))
+                (match (opt-level (if (= glued "") (unwrap-or next "") glued))
+                  (nil CmdInvalid)
+                  ((some n) (recur (+ at (if (= glued "") 2 1)) trace (some n)))))
+            :else (run-from rest at trace opt)))))
+
+;; The command a list of words (after `-I` is taken out) is. Rust: command.rs:296 `parse`
+(defun parse (words: (Vec str)) -> Command
+  (let ((n (count words))
+        (head (if (> (count words) 0) (nth words 0) "")))
+    (cond (= head "run") (parse-run (vec (drop 1 words)))
+          (and (= head "build") (>= n 2)) (parse-build (nth words 1) (vec (drop 2 words)))
+          (and (= head "emit") (= n 2)) (CmdEmit (nth words 1))
+          (= head "emit-dump") (match (emit-parse-args (vec (drop 1 words)))
+                                 (nil CmdInvalid)
+                                 ((some p) (CmdEmitDump (. p opts) (. p files))))
+          (and (= head "explain") (= n 2)) (CmdExplain (nth words 1))
+          (and (= head "itrace") (= n 2)) (CmdHarness head)
+          (in? head ["cases" "gen"]) (CmdHarness head)
+          (and (= n 1) (in? head ["help" "--help" "-h"])) CmdHelp
+          :else CmdInvalid)))

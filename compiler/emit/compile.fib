@@ -5,9 +5,10 @@
 ;; `Module`, `module_parts` and `assemble_parts` are emit.assemble's (emit.defs.mod needs them), the init functions of inits.rs are emit.inits.
 ;; `compile-module` does not fail at a stub (an error message starting `todo: `, package E4 and later): the `Module` it returns has `pending`
 ;; set and holds what needs no body, the runtime and `main`.
-;; STATUS: `compile-macro` is still a STUB of package E11, `(trap "todo: PACKAGE NAME")`.
+;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
-  (:use types.decls types.program own.program emit.value emit.names emit.program emit.inits emit.assemble emit.defs.mod))
+  (:use types.ty types.table types.decls types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
+        emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi))
 
 ;; The text of a macro module. Rust: compile.rs:88 MacroModule
 (defstruct MacroModule (text: str))
@@ -71,6 +72,68 @@
     ((Err m) (Err m))
     ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (module-text m)))))))
 
-;; The macro-time module of a program whose `defmacro` is `name`, taking `n` `Form` (or rest vector) arguments. Rust: compile.rs:96
+;; The first `defmacro` of the program called `name`: its function id.
+(defun macro-index :private (g: Globals name: str) -> (Option i64)
+  (loop ((i 0))
+    (cond (>= i (table-count (. g funs))) nil
+          (and (. (g-fun g i) is-macro) (= (. (g-fun g i) name) name)) (some i)
+          :else (recur (+ i 1)))))
+
+;; The index of the first variant called `v`.
+(defun variant-index :private (vs: (Vec VariantDef) v: str) -> (Option i64)
+  (loop ((i 0))
+    (cond (>= i (count vs)) nil
+          (= (. (nth vs i) name) v) (some i)
+          :else (recur (+ i 1)))))
+
+;; The variant index of each name of `abi-variants` in the enum `Form`: they must be in the order the ABI assumes.
+(defun form-tags :private (g: Globals form-id: i64) -> (Result (Vec i64) str)
+  (match (. (g-ty g form-id) shape)
+    ((TsEnum vs)
+     (loop ((i 0) (tags []))
+       (if (>= i (count (abi-variants)))
+           (Ok tags)
+           (let ((v (nth (abi-variants) i)))
+             (match (variant-index vs v)
+               (nil (Err (str-join ["Form has no variant " v])))
+               ((some tag) (if (= tag i)
+                               (recur (+ i 1) (conj tags tag))
+                               (Err "Form's variants are not in the expected order"))))))))
+    (_ (Err "Form is not an enum"))))
+
+;; The layout of `Form`, once its object, the `Vec` ids and the body of macro `f` are made. The keyword table is complete when the
+;; bodies are emitted: it is sealed, so that a keyword interned later (assembling the text) traps and does not leave an id the table
+;; lacks. Rust: compile.rs:149-159
+(defun macro-layout :private (p: Program sname: str tid: i64 tags: (Vec i64) vec: VecIds) -> FormLayout
+  (let ((keyword-strs (mapv (fn (k: str) (statics-string (. p statics) k 0)) (statics-keywords (. p statics)))))
+    (do (statics-seal-keywords (. p statics))
+        (FormLayout sname tid tags (obj-size (objects-get (. p objects) tid)) vec keyword-strs))))
+
+;; The module of macro `f`: the program's runtime, tables and functions, then the surface of `abi-render`.
+(defun macro-text :private (p: Program f: i64 form-ty: Ty vec-id: i64 tags: (Vec i64) obj: (Pair i64 str) n: i64 k: i64)
+    -> (Result MacroModule str)
+  (try-let ((vec (vec-ids-of p (ty-nominal vec-id [form-ty]) form-ty)) (defs (make-defs p)))
+    (do (set! (. p def-values) @(. defs values))
+        (let ((body (program-request p (BodyFun f) [])))
+          (try-let ((_ (emit-all p)))
+            (let ((layout (macro-layout p (. obj snd) (. obj fst) tags vec)))
+              (Ok (MacroModule (str-join [(assemble-parts p @(. defs text)) (abi-render layout body n k)])))))))))
+
+;; The macro-time module of a program whose `defmacro` is `name`, taking `n` `Form` (or rest vector) arguments, as the first macro
+;; module of a run is numbered `k`. Rust: compile.rs:96 compile_macro
 (defun compile-macro (typed: TypedProgram owned: OwnedProgram name: str n: i64 k: i64) -> (Result MacroModule str)
-  (Err "todo: E11 compile-macro"))
+  (let ((g (. typed globals)))
+    (match (macro-index g name)
+      (nil (Err (str-join ["no macro " name])))
+      ((some f)
+       (let ((p (emit.program/program-new typed owned)))
+         (do (set! (. p macro-module) true)
+             (doseq [w (abi-widths)] (statics-keyword (. p statics) w))
+             (match @(. g form)
+               (nil (Err "the prelude defines no Form"))
+               ((some form-id)
+                (let ((form-ty (ty-nominal form-id [])))
+                  (try-let ((obj (program-object p form-ty)) (tags (form-tags g form-id)))
+                    (match @(. g vec)
+                      (nil (Err "the prelude defines no Vec"))
+                      ((some vec-id) (macro-text p f form-ty vec-id tags obj n k)))))))))))))
