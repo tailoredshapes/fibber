@@ -68,6 +68,12 @@ fn a_test_of_any_other_type_is_the_plain_mismatch() {
         "(defun main () -> i64 (if [1] 2 3))",
         "cannot unify (Vec i64) with bool",
     );
+    // a raw pointer is a primitive that is not a bool too, but the
+    // Clojure habit is not to test one: the plain mismatch.
+    unify(
+        "(defun main () -> i64 (unsafe (if (alloc 8) 2 3)))",
+        "cannot unify ptr with bool",
+    );
 }
 
 #[test]
@@ -121,4 +127,17 @@ fn a_programs_own_function_of_that_name_has_no_hint() {
         "get takes 2 argument(s), got 3",
     );
     assert_eq!(e.message, "get takes 2 argument(s), got 3");
+}
+
+#[test]
+fn a_programs_own_constructor_named_like_a_stand_in_has_no_hint() {
+    // A constructor is not the library's, whatever its name: the hint is
+    // for the functions of the library only.
+    for src in [
+        "(defstruct nth (a: i64)) (defun main () -> i64 (do (nth 1 2 3) 0))",
+        "(defenum E (nth a: i64)) (defun main () -> i64 (do (nth 1 2 3) 0))",
+    ] {
+        let e = fails(src, K::Other, "nth takes 1 argument(s), got 3");
+        assert_eq!(e.message, "nth takes 1 argument(s), got 3", "{src}");
+    }
 }

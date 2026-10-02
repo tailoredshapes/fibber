@@ -77,3 +77,12 @@ every machine. A subdirectory of a case that holds roots has no
   symbols do (8191). `fibc` named them by the bare type name: `getelementptr:
   field index 4 out of range for %struct.o.Pt` and `duplicate definition
   of @m.Sz.size.Pt`.
+- 029: a module defines its own list type `(Stack a)` with variants spelt
+  `Empty` and `Cons`, and the main module uses it: `(list ..)` still
+  builds the prelude's `List` (`fib.prelude/Cons`, `fib.prelude/Empty`).
+  Case 020's lowercase `cons` and `empty` cannot capture the expansion
+  any more; this one can (223).
+- 030: a module defines functions named `vec-empty`, `vec-conj`,
+  `map-empty` and `map-assoc` that build the wrong collections, and the
+  main module uses it: `[..]` and `{..}` are still the prelude's (23).
+  Case 021's `conj` and `assoc` are no longer what a literal is built with.

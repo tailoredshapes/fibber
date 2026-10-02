@@ -208,6 +208,17 @@ fn def_initialiser_is_not_a_constant_expression() {
 }
 
 #[test]
+fn def_initialiser_accepts_every_head_of_the_literal_rewrite() {
+    // `[..]`, `{..}` and `(list ..)` rewrite to prelude calls and
+    // constructors (R2: `vec-conj`, `map-assoc`, `Cons`, `Empty`); the
+    // check of a constant knows each, so none of them is refused.
+    ok("(def m {1 2 3 4}) (defun main () -> i64 (map-count m))");
+    ok("(def e: (Map i64 i64) {}) (defun main () -> i64 (map-count e))");
+    ok("(def l (list 1 2)) (defun main () -> i64 (match l ((Cons h _) h) ((Empty) 0)))");
+    ok("(def l: (List i64) (list)) (defun main () -> i64 (match l ((Cons h _) h) ((Empty) 0)))");
+}
+
+#[test]
 fn def_and_defun_depend_on_each_other() {
     fails(
         "(def t [f]) (defun f () (vec-count t)) (defun main () -> i64 (f))",

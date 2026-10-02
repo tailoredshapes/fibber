@@ -1,0 +1,29 @@
+;; spec:   stdlib §2.7 (ToStr of a record is its Debug text), §7 L17; R8: ToStr's :where asks Debug of a parameter
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; (derive ToStr W) is built from the fields' Debug (case 812), so the instance
+;; for a generic type asks `(fib.core/Debug t)` of its parameter and not
+;; `(fib.core/ToStr t)`: a W of a type that derives only Debug has a `to-str`.
+;; Pt below has a Debug and no ToStr; were the instance to ask for ToStr of its
+;; parameter, `(to-str (W (Pt 1)))` would be refused with no implementation of
+;; ToStr for Pt. The same holds for a generic enum.
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check))
+
+(defstruct Pt (x: i64))
+(derive Debug Pt)
+
+(defstruct (W t) (v: t))
+(derive ToStr W)
+
+(defenum (Slot t) Free (Held v: t))
+(derive ToStr Slot)
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (to-str (W (Pt 1))) "#main.W{:v #main.Pt{:x 1}}"))
+        (check c (= (to-str (W 7)) "#main.W{:v 7}"))
+        (check c (= (to-str (Held (Pt 2))) "#main.Held{:v #main.Pt{:x 2}}"))
+        (check c (let ((f: (Slot Pt) Free)) (= (to-str f) "Free")))
+        (checks-result c))))

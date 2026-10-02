@@ -140,6 +140,32 @@ fn the_implicit_library_does_not_hide_the_macros() {
 }
 
 #[test]
+fn a_macro_of_an_implicit_module_beats_a_macro_of_the_prelude_and_a_used_one_beats_both() {
+    // syntax §5: a name is the module's own, then what its `:use`s export, then the
+    // implicit library, then the prelude. A context starts in the prelude's namespace.
+    let mut ctx = ExpandCtx::new();
+    let define = |ctx: &mut ExpandCtx, ns: &str, body: &str| {
+        ctx.begin_module(ns, (&[], &[]), HashMap::new());
+        let src = format!("(defmacro dup (e) {body})");
+        expand_program(read(&src), ctx, &mut NoRunner).expect("defines");
+        ctx.end_module();
+    };
+    ctx.begin_module("fib.prelude", (&[], &[]), HashMap::new());
+    expand_program(read("(defmacro dup (e) e)"), &mut ctx, &mut NoRunner).expect("defines");
+    ctx.end_module();
+    define(&mut ctx, "fib.x", "e");
+    define(&mut ctx, "mine", "e");
+    let owner = |ctx: &ExpandCtx| ctx.macro_def("dup").map(|d| d.ns.clone());
+    ctx.begin_module("a", (&[], &[]), HashMap::new());
+    assert_eq!(owner(&ctx).as_deref(), Some("fib.prelude"));
+    let (uses, implicit) = (["mine".to_string()], ["fib.x".to_string()]);
+    ctx.begin_module("b", (&[], &implicit), HashMap::new());
+    assert_eq!(owner(&ctx).as_deref(), Some("fib.x"));
+    ctx.begin_module("c", (&uses, &implicit), HashMap::new());
+    assert_eq!(owner(&ctx).as_deref(), Some("mine"));
+}
+
+#[test]
 fn a_qualified_prelude_head_is_the_prelude_macro_whatever_the_module_defines() {
     let defs = "(defun when (a b) a) (defun and (a b) a) (defun str (a) a)";
     assert_eq!(body(defs, "(fib.prelude/when x y)"), "(if x y ())");

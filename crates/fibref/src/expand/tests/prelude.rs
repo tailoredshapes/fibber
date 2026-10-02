@@ -266,3 +266,104 @@ fn expansions_are_expanded_again() {
         format!("(if (if a b false) {} ())", v(&["x"]))
     );
 }
+
+/// `src` expanded and printed with the position of every node,
+/// `node@line:col`, a list as `(items..)@line:col`.
+fn ex_at(src: &str) -> String {
+    use crate::expand::{expand_expr, ExpandCtx, NoRunner};
+    fn shown(f: &crate::syntax::Form) -> String {
+        let at = format!("@{}:{}", f.pos.line, f.pos.col);
+        match f.as_list() {
+            Some(items) => {
+                let inner: Vec<String> = items.iter().map(shown).collect();
+                format!("({}){at}", inner.join(" "))
+            }
+            None => format!("{f}{at}"),
+        }
+    }
+    let form = expand_expr(super::one(src), &mut ExpandCtx::new(), &mut NoRunner)
+        .unwrap_or_else(|e| panic!("{src:?}: {e}"));
+    shown(&form)
+}
+
+#[test]
+fn if_let_builds_every_part_at_the_call_and_keeps_the_input_forms_where_they_were() {
+    // §1.3: the `match`, the `some` pattern, the wildcard clause and the
+    // unit else take the call's position (2:3); `e`, `x`, `a` and `b` keep
+    // their own.
+    assert_eq!(
+        ex_at("(g\n  (if-let (x e) a b))"),
+        "(g@1:2 (match@2:3 e@2:14 ((fib.prelude/some@2:3 x@2:12)@2:3 a@2:17)@2:3 (_@2:3 b@2:19)@2:3)@2:3)@1:1"
+    );
+    assert_eq!(
+        ex_at("(g\n  (if-let (x e) a))"),
+        "(g@1:2 (match@2:3 e@2:14 ((fib.prelude/some@2:3 x@2:12)@2:3 a@2:17)@2:3 (_@2:3 ()@2:3)@2:3)@2:3)@1:1"
+    );
+}
+
+#[test]
+fn when_let_builds_every_part_at_the_call_and_keeps_the_input_forms_where_they_were() {
+    assert_eq!(
+        ex_at("(g\n  (when-let (x e) a b))"),
+        "(g@1:2 (match@2:3 e@2:16 ((fib.prelude/some@2:3 x@2:14)@2:3 (do@2:3 a@2:19 b@2:21)@2:3)@2:3 (_@2:3 ()@2:3)@2:3)@2:3)@1:1"
+    );
+}
+
+#[test]
+fn the_binding_of_if_let_and_when_let_is_exactly_a_pattern_and_an_expression() {
+    for (src, head) in [
+        ("(if-let (x e extra) a b)", "if-let"),
+        ("(if-let (x) a b)", "if-let"),
+        ("(if-let () a b)", "if-let"),
+        ("(when-let (x e extra) a)", "when-let"),
+        ("(when-let (x) a)", "when-let"),
+        ("(when-let x a)", "when-let"),
+    ] {
+        let e = ex_err(src);
+        assert!(
+            matches!(e.kind, K::Malformed { head: ref h, .. } if h == head),
+            "{src}: {:?}",
+            e.kind
+        );
+    }
+}
+
+#[test]
+fn when_let_needs_a_binding_and_no_body_and_if_let_needs_a_then() {
+    assert_eq!(
+        ex("(when-let (x e))"),
+        "(match e ((fib.prelude/some x) (do)) (_ ()))"
+    );
+    assert_eq!(
+        ex_err("(when-let)").kind,
+        K::MacroArity {
+            name: "when-let".into(),
+            expected: "at least 1".into(),
+            found: 0
+        }
+    );
+    assert_eq!(
+        ex_err("(if-let (x e))").kind,
+        K::MacroArity {
+            name: "if-let".into(),
+            expected: "2 to 3".into(),
+            found: 1
+        }
+    );
+}
+
+#[test]
+fn range_serves_one_and_two_arguments_declines_three_and_refuses_four() {
+    // Three arguments are Clojure's `(range a b step)`: the macro leaves
+    // the call to the checker, whose arity error says `use range-by`.
+    assert_eq!(ex("(range a b c)"), "(range a b c)");
+    assert_eq!(ex("(range a b)"), "(fib.seq/range-by a b 1)");
+    assert_eq!(
+        ex_err("(range a b c d)").kind,
+        K::MacroArity {
+            name: "range".into(),
+            expected: "1 to 2".into(),
+            found: 4
+        }
+    );
+}

@@ -3,7 +3,9 @@
 //! the rewrite of `reduced` in a literal `fn`, each as printed, and every
 //! call it leaves to the library function.
 
-use super::{ex, program};
+use super::{ex, ex_err, ex_pos, program};
+use crate::expand::error::ExpandErrorKind as K;
+use crate::expand::{expand_expr, ExpandCtx, Limits, NoRunner};
 
 /// Expands `call` as the last form of a module whose first form is `defs`
 /// (a program: the module's own definitions are what the macros yield to).
@@ -178,6 +180,8 @@ fn what_is_not_the_shape_is_declined() {
         "(reduce (fn (a x) :where ((Eq a)) (reduced a)) 0 c)",
         "(reduce (fn (a x y) (reduced a)) 0 c)",
         "(reduce (fn (a) (reduced a)) 0 c)",
+        // a literal that is not a `fn`
+        "(reduce (g (a x) (reduced a)) 0 c)",
         "(reduce)",
         "(reduce f)",
         "(reduce f 0 c d)",
@@ -215,4 +219,102 @@ fn the_wrappers_take_the_call_position_and_the_operands_their_own() {
         (3, 13),
         "its operand"
     );
+}
+
+#[test]
+fn a_do_of_one_form_is_a_tail_and_an_empty_do_is_a_value() {
+    assert_eq!(
+        ex("(reduce (fn (a x) (do (reduced a))) 0 c)"),
+        "(fib.seq/reduce-while (fn (a x) (do (fib.core/Done a))) 0 c)"
+    );
+    assert_eq!(
+        ex("(reduce (fn (a x) (if p (reduced a) (do))) 0 c)"),
+        "(fib.seq/reduce-while (fn (a x) (if p (fib.core/Done a) (fib.core/More (do)))) 0 c)"
+    );
+}
+
+#[test]
+fn a_one_armed_if_let_has_no_value_for_a_step_so_its_reduced_is_no_tail() {
+    // `(if-let (p e) a)` has `()` as its else, which is not a Step: the
+    // macro only reads the four-item form as a branching tail
+    assert_eq!(
+        ex("(reduce (fn (a x) (if-let (v (f x)) (reduced v))) 0 c)"),
+        "(reduce (fn (a x) (match (f x) ((fib.prelude/some v) (reduced v)) (_ ()))) 0 c)"
+    );
+}
+
+#[test]
+fn a_form_without_its_parts_is_one_value_and_the_core_form_reports_it() {
+    // `fn` needs a body, `if` both arms, `let` a body: the rewrite leaves
+    // each malformed form whole, so the walk after it names the form
+    let malformed = |head: &str, reason: &'static str| K::Malformed {
+        head: head.to_string(),
+        reason,
+    };
+    assert_eq!(
+        ex_err("(reduce (fn (a x)) 0 c)").kind,
+        malformed("fn", "missing body")
+    );
+    assert_eq!(
+        ex_err("(reduce (fn (a x) (if p (reduced a))) 0 c)").kind,
+        malformed("if", "wrong number of operands")
+    );
+    assert_eq!(
+        ex_err("(reduce (fn (a x) (if p (reduced a) (let ((y 1)))))  0 c)").kind,
+        malformed("let", "expected bindings and a body")
+    );
+    assert_eq!(
+        ex_err("(reduce (fn (a x) (if p (reduced a) (loop ((i 0))))) 0 c)").kind,
+        malformed("loop", "expected bindings and a body")
+    );
+}
+
+#[test]
+fn every_wrapper_takes_the_call_position_and_every_operand_its_own() {
+    // `reduced` and a plain value: Done and More both at the call
+    assert_eq!(
+        ex_pos("(h\n  (reduce (fn (a x)\n   (if p (reduced a) b)) 0 c))"),
+        "(h@1:2 (fib.seq/reduce-while@2:3 (fn@2:12 (a@2:16 x@2:18)@2:15 \
+         (if@3:5 p@3:8 (fib.core/Done@2:3 a@3:19)@2:3 (fib.core/More@2:3 b@3:22)@2:3)@3:4)@2:11 \
+         0@3:26 c@3:28)@2:3)@1:1"
+    );
+}
+
+#[test]
+fn the_built_str_and_concat_folds_are_all_at_the_call_position() {
+    let at = |src: &str| ex_pos(&format!("(h\n  {src})"));
+    assert_eq!(
+        at("(reduce str c)"),
+        "(h@1:2 (fib.seq/reduce@2:3 (fn@2:3 (#r.1@2:3 #r.2@2:3)@2:3 \
+         (fib.prelude/str-concat@2:3 (fib.core/to-str@2:3 #r.1@2:3)@2:3 \
+         (fib.core/to-str@2:3 #r.2@2:3)@2:3)@2:3)@2:3 \"\"@2:3 c@2:15)@2:3)@1:1"
+    );
+    assert_eq!(
+        at("(reduce concat c)"),
+        "(h@1:2 (fib.seq/reduce@2:3 concat@2:11 (fib.seq/lazy-node@2:3 \
+         (fn@2:3 ()@2:3 fib.seq/LNil@2:3)@2:3)@2:3 c@2:18)@2:3)@1:1"
+    );
+}
+
+#[test]
+fn a_declined_call_keeps_its_own_position() {
+    assert_eq!(
+        ex_pos("(h\n  (reduce f 0 c))"),
+        "(h@1:2 (reduce@2:4 f@2:11 0@2:13 c@2:15)@2:3)@1:1"
+    );
+}
+
+#[test]
+fn an_expansion_is_admitted_like_any_macro_result() {
+    // `(fib.seq/reduce-nonempty f c)` is four forms: the limit counts them
+    let at = |max_forms: usize| {
+        let mut ctx = ExpandCtx::new();
+        ctx.limits = Limits {
+            max_forms,
+            ..Limits::default()
+        };
+        expand_expr(super::one("(reduce f c)"), &mut ctx, &mut NoRunner).map_err(|e| e.kind)
+    };
+    assert_eq!(at(3), Err(K::TooLarge { limit: 3 }));
+    assert!(at(4).is_ok(), "{:?}", at(4));
 }

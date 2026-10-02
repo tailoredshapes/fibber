@@ -2,7 +2,9 @@
 //! §2.4, tranche 1 R6b; Appendix A11 t24): each expansion as printed, and
 //! each call the macro declines.
 
-use super::ex;
+use super::{ex, ex_pos, one};
+use crate::expand::error::ExpandErrorKind as K;
+use crate::expand::{expand_expr, ExpandCtx, Limits, NoRunner};
 
 #[test]
 fn extra_arguments_go_into_a_closure_over_the_value() {
@@ -82,4 +84,46 @@ fn no_argument_count_is_an_error_of_the_macro() {
     for src in ["(update)", "(update a)", "(update a b)"] {
         assert_eq!(ex(src), src);
     }
+}
+
+#[test]
+fn the_built_forms_take_the_call_position_and_the_operands_their_own() {
+    assert_eq!(
+        ex_pos("(h\n  (update m k f x))"),
+        "(h@1:2 (fib.coll/update@2:3 m@2:11 k@2:13 (fn@2:3 (#v.1@2:3)@2:3 \
+         (f@2:15 #v.1@2:3 x@2:17)@2:3)@2:3)@2:3)@1:1"
+    );
+    assert_eq!(
+        ex_pos("(h\n  (update m k (fnil g d)))"),
+        "(h@1:2 (fib.coll/update-or@2:3 m@2:11 k@2:13 g@2:21 d@2:23)@2:3)@1:1"
+    );
+    assert_eq!(
+        ex_pos("(h\n  (update m k (fnil g d) x))"),
+        "(h@1:2 (fib.coll/update-or@2:3 m@2:11 k@2:13 (fn@2:3 (#v.1@2:3)@2:3 \
+         (g@2:21 #v.1@2:3 x@2:26)@2:3)@2:3 d@2:23)@2:3)@1:1"
+    );
+}
+
+#[test]
+fn a_declined_call_keeps_its_own_position() {
+    assert_eq!(
+        ex_pos("(h\n  (update m k f))"),
+        "(h@1:2 (update@2:4 m@2:11 k@2:13 f@2:15)@2:3)@1:1"
+    );
+}
+
+#[test]
+fn an_expansion_is_admitted_like_any_macro_result() {
+    // twelve forms: the call and its head, `m` and `k`, the closure with its
+    // parameter list, its body, `f`, the value and `x`
+    let at = |max_forms: usize| {
+        let mut ctx = ExpandCtx::new();
+        ctx.limits = Limits {
+            max_forms,
+            ..Limits::default()
+        };
+        expand_expr(one("(update m k f x)"), &mut ctx, &mut NoRunner).map_err(|e| e.kind)
+    };
+    assert_eq!(at(11), Err(K::TooLarge { limit: 11 }));
+    assert!(at(12).is_ok(), "{:?}", at(12));
 }

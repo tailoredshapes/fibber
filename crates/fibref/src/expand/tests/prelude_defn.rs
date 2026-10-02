@@ -95,6 +95,15 @@ fn the_defun_takes_the_call_position_and_the_parameters_the_vectors() {
 }
 
 #[test]
+fn the_private_keyword_takes_the_call_position() {
+    let forms = program("\n  (defn- f [x]\n   x)").unwrap_or_else(|e| panic!("{e}"));
+    let items = forms[0].as_list().unwrap_or(&[]);
+    assert_eq!(items[2].to_string(), ":private");
+    let at = (items[2].pos.line, items[2].pos.col);
+    assert_eq!(at, (2, 3), "the generated keyword is the call's");
+}
+
+#[test]
 fn error_positions_are_the_offending_form() {
     let at = |src: &str| match program(src) {
         Ok(f) => panic!("{src:?} expanded to {f:?}"),
@@ -104,4 +113,14 @@ fn error_positions_are_the_offending_form() {
     assert_eq!(at("(defn f\n ([x] 1))"), (2, 2), "the clause list");
     assert_eq!(at("(defn 1 [x] x)"), (1, 7), "the name");
     assert_eq!(at("(defn f)"), (1, 1), "the call");
+    assert_eq!(
+        at("(defn f \"doc\")"),
+        (1, 1),
+        "the call, nothing after the docstring"
+    );
+    assert_eq!(
+        at("(defn f\n  (x) 1)"),
+        (2, 3),
+        "the list that is not a vector"
+    );
 }

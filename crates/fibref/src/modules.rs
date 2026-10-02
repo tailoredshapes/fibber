@@ -132,6 +132,23 @@ mod tests {
     use crate::syntax::read_all;
 
     #[test]
+    fn the_four_facades_are_read_in_the_order_core_seq_coll_print_and_marked_implicit() {
+        // stdlib design §6.2; the order of the expansion dump with `--implicit`
+        assert_eq!(
+            IMPLICIT_LIB,
+            ["fib.core", "fib.seq", "fib.coll", "fib.print"]
+        );
+        let loaded = try_load("(defun main () -> i64 1)", "/nonexistent/t.fib").expect("loads");
+        let at = |ns: &str| loaded.iter().position(|l| l.spec.ns == ns).expect(ns);
+        let facades: Vec<usize> = IMPLICIT_LIB.iter().map(|ns| at(ns)).collect();
+        assert!(facades.windows(2).all(|w| w[0] < w[1]), "{facades:?}");
+        assert!(loaded[..loaded.len() - 1].iter().all(|l| l.implicit));
+        let main = loaded.last().expect("the main module");
+        assert!(!main.implicit);
+        assert_eq!(main.spec.implicit, IMPLICIT_LIB);
+    }
+
+    #[test]
     fn begin_spec_gives_the_context_the_uses_and_aliases_of_the_module() {
         let forms = read_all("(ns a (:require [b.c :as bc]) (:use d))", "t").expect("reads");
         let mut spec = spec_of(&forms, "main").expect("a spec");

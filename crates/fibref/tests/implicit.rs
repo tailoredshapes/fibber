@@ -256,3 +256,112 @@ fn the_context_names_the_implicit_modules_a_module_sees_only_with_the_flag() {
     assert!(!with(false).contains("implicit \"fib.x\""));
     assert!(with(true).contains("  implicit \"fib.x\""));
 }
+
+#[test]
+fn a_module_an_implicit_module_uses_is_read_before_it_and_sees_no_implicit_module() {
+    // `helper` is read for `fib.x`, so it cannot see `fib.x` as an implicit module
+    // (it is loaded before it); the program sees `fib.x`'s names, not `helper`'s
+    let x = "(ns fib.x (:use helper))\n(defun twice-base () -> i64 (+ (base) (base)))\n";
+    let helper = "(ns helper)\n(defun base () -> i64 21)\n";
+    let main = "(defun main () -> i64 (twice-base))";
+    let files = [("main.fib", main), ("fib/x.fib", x), ("helper.fib", helper)];
+    assert_eq!(run("dependency", &files, &["fib.x"]), Ok(42));
+    let bare = "(defun main () -> i64 (base))";
+    let files = [("main.fib", bare), ("fib/x.fib", x), ("helper.fib", helper)];
+    is_err_with(
+        run("dependency-hidden", &files, &["fib.x"]),
+        "unbound name base",
+    );
+}
+
+#[test]
+fn the_private_name_a_message_names_is_a_used_modules_before_an_implicit_ones() {
+    // both `mine` and `fib.x` have a private `secret`, so neither is visible to `main`;
+    // the message names the first of the chain: itself, its `:use`s, the implicit modules
+    let mine = "(ns mine)\n(defun secret :private () -> i64 1)\n";
+    let main = "(ns main (:use mine))\n(defun main () -> i64 (secret 1))";
+    let files = [("main.fib", main), ("mine.fib", mine), ("fib/x.fib", FIB_X)];
+    is_err_with(
+        run("private-order", &files, &["fib.x"]),
+        "secret is private to mine; it is not exported",
+    );
+}
+
+#[test]
+fn the_full_name_of_a_used_module_shadows_an_alias_of_the_same_spelling() {
+    // `types/decls.rs` (`add_module`): a used module's full name beats an alias, for names
+    // of functions. (A *macro* `mine/m` goes to the alias: `ExpandCtx::macro_def` looks at
+    // aliases first and knows no used module's full name; an edge the reviewer reported.)
+    let (mine, other) = (
+        "(ns mine)\n(defun f () -> i64 1)\n",
+        "(ns other)\n(defun f () -> i64 2)\n",
+    );
+    let main = "(ns main (:use mine) (:require [other :as mine]))\n(defun main () -> i64 (mine/f))";
+    let files = [("main.fib", main), ("mine.fib", mine), ("other.fib", other)];
+    assert_eq!(run("alias-vs-use", &files, &[]), Ok(1));
+}
+
+#[test]
+fn two_parts_of_one_implicit_facade_that_export_one_name_are_an_error_too() {
+    let facade = "(ns fib.f (:export-from fib.f.a fib.f.b))";
+    let a = "(ns fib.f.a)\n(defun pick () -> i64 1)\n";
+    let b = "(ns fib.f.b)\n(defun pick () -> i64 2)\n";
+    let main = "(defun main () -> i64 (pick))";
+    let files = [
+        ("main.fib", main),
+        ("fib/f.fib", facade),
+        ("fib/f/a.fib", a),
+        ("fib/f/b.fib", b),
+    ];
+    is_err_with(
+        run("parts", &files, &["fib.f"]),
+        "pick is exported by both fib.f.a and fib.f.b",
+    );
+}
+
+#[test]
+fn an_error_in_an_implicit_module_is_the_last_record_under_its_own_module_line() {
+    let bad = "(ns fib.bad)\n(defmacro if (a) a)\n";
+    let main = "(defun main () -> i64 1)";
+    let tree = Tree::new("bad-implicit", &[("main.fib", main), ("fib/bad.fib", bad)]);
+    let file = tree.main();
+    let opts = Options {
+        implicit_lib: Some(vec!["fib.bad".to_string()]),
+        ..Options::default()
+    };
+    let (text, status) = expand_files(std::slice::from_ref(&file), &opts);
+    assert_eq!(status, 1, "{text}");
+    let head = text
+        .find("-- module fib.bad ")
+        .unwrap_or_else(|| panic!("no section: {text}"));
+    assert!(text[head..].contains("\nerror "), "{text}");
+    assert!(!text.contains("-- module main "), "{text}");
+}
+
+#[test]
+fn the_context_of_an_implicit_module_is_printed_only_with_the_flag_too() {
+    let main = "(defun main () -> i64 (double-it 4))";
+    let tree = Tree::new(
+        "context-sections",
+        &[("main.fib", main), ("fib/x.fib", FIB_X)],
+    );
+    let file = tree.main();
+    let with = |implicit: bool| {
+        let opts = Options {
+            context: true,
+            implicit,
+            implicit_lib: Some(vec!["fib.x".to_string()]),
+            ..Options::default()
+        };
+        expand_files(std::slice::from_ref(&file), &opts).0
+    };
+    let hidden = with(false);
+    assert!(hidden.contains("-- context main"), "{hidden}");
+    assert!(!hidden.contains("-- context fib.x"), "{hidden}");
+    let shown = with(true);
+    assert!(shown.contains("-- context fib.x"), "{shown}");
+    assert!(
+        shown.find("-- context fib.x") < shown.find("-- context main"),
+        "{shown}"
+    );
+}

@@ -6,10 +6,10 @@
 
 use std::path::PathBuf;
 
-use fibref::expand::ExpandCtx;
+use fibref::expand::{expand_program, ExpandCtx, NoRunner};
 use fibref::modules::{expand_all, try_load_with};
 use fibref::roots::Roots;
-use fibref::syntax::Form;
+use fibref::syntax::{read_all, Form};
 use fibref::types::{check_modules, prelude_forms};
 
 /// A scratch directory holding `files` (path, text), removed on drop.
@@ -53,6 +53,12 @@ const MINE: &str = "(ns mine)
 
 /// The first type error of `main.fib` of `files`, in words.
 fn first_error(label: &str, files: &[(&str, &str)]) -> String {
+    first_error_in(label, files, "")
+}
+
+/// [`first_error`] with the forms of `extra` appended to the prelude: a
+/// function defined there is the prelude's.
+fn first_error_in(label: &str, files: &[(&str, &str)], extra: &str) -> String {
     let tree = Tree::new(label, files);
     let file = tree.main();
     let source = std::fs::read_to_string(&file).expect("main.fib");
@@ -61,7 +67,9 @@ fn first_error(label: &str, files: &[(&str, &str)]) -> String {
             .stack_size(fibref::eval::STACK_BYTES)
             .spawn_scoped(scope, || {
                 let mut ctx = ExpandCtx::new();
-                let prelude = prelude_forms(&mut ctx).expect("the prelude expands");
+                let mut prelude = prelude_forms(&mut ctx).expect("the prelude expands");
+                let more = read_all(extra, "extra.fib").expect("the extra forms read");
+                prelude.extend(expand_program(more, &mut ctx, &mut NoRunner).expect("expand"));
                 let loaded = try_load_with(&source, &file, &Roots::default(), &[])
                     .map_err(|e| e.to_string())
                     .expect("the program loads");
@@ -119,5 +127,37 @@ fn other_counts_and_a_programs_own_module_have_no_hint() {
     assert_eq!(
         first_error("own-reduce", &files),
         "reduce takes 3 argument(s), got 2"
+    );
+}
+
+#[test]
+fn a_module_whose_name_only_begins_with_fib_is_not_the_library() {
+    // The library's modules are `fib.core`, `fib.seq` ..; `fibs` is a name
+    // a program may choose, and its `sort` and `reduce` get no hint.
+    let fibs = MINE.replace("(ns mine)", "(ns fibs)");
+    let own = "(ns main (:use fibs))\n(defun main () -> i64 (do (sort > [1 2]) 0))";
+    let files = [("main.fib", own), ("fibs.fib", fibs.as_str())];
+    assert_eq!(
+        first_error("fibs-sort", &files),
+        "sort takes 1 argument(s), got 2"
+    );
+    let own = "(ns main (:use fibs))\n(defun main () -> i64 (fibs/reduce + [1 2]))";
+    let files = [("main.fib", own), ("fibs.fib", fibs.as_str())];
+    assert_eq!(
+        first_error("fibs-reduce", &files),
+        "reduce takes 3 argument(s), got 2"
+    );
+}
+
+#[test]
+fn a_function_of_the_prelude_gets_the_hint_too() {
+    // D1: "a function of the prelude or of a module whose `ns` starts
+    // `fib.`". No function of the shipped prelude has one of the five
+    // names, so the prelude is given a `sort` of one argument.
+    let main = "(ns main)\n(defun main () -> i64 (do (sort > [1 2]) 0))";
+    let sort = "(defun sort (xs: (Vec i64)) -> (Vec i64) xs)";
+    assert_eq!(
+        first_error_in("prelude-sort", &[("main.fib", main)], sort),
+        "sort takes 1 argument(s), got 2; use sort-with"
     );
 }

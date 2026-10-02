@@ -52,6 +52,27 @@ fn ex(src: &str) -> String {
     form.to_string()
 }
 
+/// Prints `f` with the position of every node, `node@line:col`, a list as
+/// `(items..)@line:col`: what the position tests compare.
+fn with_pos(f: &Form) -> String {
+    let at = format!("@{}:{}", f.pos.line, f.pos.col);
+    match f.as_list() {
+        Some(items) => {
+            let inner: Vec<String> = items.iter().map(with_pos).collect();
+            format!("({}){at}", inner.join(" "))
+        }
+        None => format!("{f}{at}"),
+    }
+}
+
+/// Expands the single expression `src`, which must succeed, and prints
+/// the result with every position.
+fn ex_pos(src: &str) -> String {
+    let form = expand_expr(one(src), &mut ExpandCtx::new(), &mut NoRunner)
+        .unwrap_or_else(|e| panic!("{src:?}: {e}"));
+    with_pos(&form)
+}
+
 /// Expands the single expression `src`, which must fail.
 fn ex_err(src: &str) -> ExpandError {
     match expand_expr(one(src), &mut ExpandCtx::new(), &mut NoRunner) {

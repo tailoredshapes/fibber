@@ -301,6 +301,18 @@ mod tests {
         for ns in ["fib.string", "fib.x.part", "Long", "Math", "y"] {
             assert!(!sees_implicit(ns, &implicit), "{ns}");
         }
+        // look-alikes: only the `fib.` prefix and the exact names count
+        for ns in [
+            "fib",
+            "fibonacci",
+            "fibx.y",
+            "Longer",
+            "Mathx",
+            "x.fib",
+            "Y",
+        ] {
+            assert!(sees_implicit(ns, &implicit), "{ns}");
+        }
     }
 
     const MAIN: &str = "(ns main (:use util))\n(defun main () -> i64 1)";
@@ -342,6 +354,63 @@ mod tests {
         for lib in ["fib.x.part", "fib.x", "fib.z"] {
             assert!(implicit(lib).is_empty(), "{lib}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn independent_implicit_modules_are_read_in_the_order_listed() {
+        let (dir, file) = program(
+            "implicit-order",
+            &[
+                ("main.fib", MAIN),
+                ("util.fib", "(ns util)"),
+                ("fib/a.fib", "(ns fib.a)"),
+                ("fib/b.fib", "(ns fib.b)"),
+            ],
+        );
+        let order = |list: &[&str]| -> Vec<String> {
+            let loaded = try_load_with(MAIN, &file, &Roots::default(), list).expect("loads");
+            loaded.iter().map(|l| l.spec.ns.clone()).collect()
+        };
+        assert_eq!(
+            order(&["fib.a", "fib.b"]),
+            ["fib.a", "fib.b", "util", "main"]
+        );
+        assert_eq!(
+            order(&["fib.b", "fib.a"]),
+            ["fib.b", "fib.a", "util", "main"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_an_implicit_module_depends_on_is_read_for_it_and_sees_no_implicit_module() {
+        // `helper` is no library module (its name does not start `fib.`) and not in the
+        // list, but it is read for `fib.x` before the list is done: it must not be given
+        // `fib.x` as an implicit module (it is loaded before it), and the dump leaves it out.
+        let (dir, file) = program(
+            "implicit-dep",
+            &[
+                ("main.fib", MAIN),
+                ("util.fib", "(ns util)"),
+                ("fib/x.fib", "(ns fib.x (:use helper))"),
+                ("helper.fib", "(ns helper)"),
+            ],
+        );
+        let loaded = try_load_with(MAIN, &file, &Roots::default(), &["fib.x"]).expect("loads");
+        let seen: Vec<(&str, bool, usize)> = loaded
+            .iter()
+            .map(|l| (l.spec.ns.as_str(), l.implicit, l.spec.implicit.len()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("helper", true, 0),
+                ("fib.x", true, 0),
+                ("util", false, 1),
+                ("main", false, 1)
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

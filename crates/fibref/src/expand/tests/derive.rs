@@ -381,3 +381,36 @@ fn prelude_expands() {
     let all: String = out.iter().map(|f| f.to_string()).collect();
     assert!(!all.contains("(cons ") && !all.contains("(empty)"), "{all}");
 }
+
+#[test]
+fn the_protocol_error_text_is_exactly_the_pages() {
+    // not a prefix of it: `ToString` would also contain `ToStr`
+    assert_eq!(
+        prog_err("(defstruct P (a)) (derive Foo P)").to_string(),
+        "cannot derive Foo: only Eq, Ord, Hash, Show, Debug and ToStr"
+    );
+}
+
+#[test]
+fn derive_errors_sit_at_the_offending_argument_not_at_the_call() {
+    let at = |src: &str| {
+        let err = program(src)
+            .err()
+            .unwrap_or_else(|| panic!("{src}: expanded"));
+        (err.pos.line, err.pos.col)
+    };
+    assert_eq!(at("(defstruct P (a))\n(derive Foo P)"), (2, 9));
+    assert_eq!(at("(defstruct P (a))\n(derive Debug Nope)"), (2, 15));
+}
+
+#[test]
+fn derive_takes_exactly_a_protocol_and_a_type() {
+    let src = "(defstruct P (a)) (derive Debug P P)";
+    assert!(matches!(prog_err(src), K::MacroArity { .. }), "{src}");
+}
+
+#[test]
+fn an_enum_names_the_whole_dotted_module_in_its_text() {
+    let got = derived("(defenum T (B x: i64))", "(derive Debug T)", "a.b");
+    assert!(got.contains("\"#a.b.B{:x \""), "{got}");
+}

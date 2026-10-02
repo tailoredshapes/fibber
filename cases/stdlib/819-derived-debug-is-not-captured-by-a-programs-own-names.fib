@@ -1,0 +1,38 @@
+;; spec:   stdlib §2.7, §7 L17; design C-4 (every name a macro writes is qualified)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; A program that defines its own protocol `Debug` with its method `debug`, its
+;; own `to-str` and its own `str-concat` still gets the library's text from
+;; `derive Debug` and `derive ToStr`: the derived instances name the protocols
+;; and methods by the facade (`fib.core/Debug`, `fib.core/debug`) and the
+;; concatenation by `fib.prelude/str-concat`, so a binding of the same names in
+;; the program is not what they call. The program's own `debug` and `to-str` and
+;; `str-concat` answer "mine" to show they are there and are not used.
+(ns main (:use fib.core fib.seq fib.coll fib.print tl.check))
+
+(defprotocol Debug (debug (self) -> str))
+(impl Debug i64 (debug (self) "mine"))
+(defun to-str (x: i64) -> str "mine")
+(defun str-concat (a: str b: str) -> str "mine")
+
+(defstruct P (x: i64 y: str))
+(derive Debug P)
+(derive ToStr P)
+
+(defenum E (Nada) (Leaf v: i64))
+(derive Debug E)
+(derive ToStr E)
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (fib.core/debug (P 1 "x")) "#main.P{:x 1, :y \"x\"}"))
+        (check c (= (fib.core/to-str (P 1 "x")) "#main.P{:x 1, :y \"x\"}"))
+        (check c (= (fib.core/debug (Leaf 3)) "#main.Leaf{:v 3}"))
+        (check c (= (fib.core/to-str (Leaf 3)) "#main.Leaf{:v 3}"))
+        (check c (= (fib.core/debug Nada) "Nada"))
+        (check c (= (debug 5) "mine"))
+        (check c (= (to-str 5) "mine"))
+        (check c (= (str-concat "a" "b") "mine"))
+        (checks-result c))))
