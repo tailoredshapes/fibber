@@ -1,0 +1,375 @@
+;; compiler/tests/types/unit-general.fib: crates/fibref/src/types/infer/general.rs,
+;; which has no inline test, written from the code: the keys of a type, the
+;; numbering and naming of the quantified variables (letters that skip the
+;; unit's rigid names, rigid variables under their own names), the colour
+;; solution under the map, `apply` (zonks, an unquantified variable is i64),
+;; the colour bounds (flows followed through unquantified variables, symbolic
+;; captures, sorted by the Debug text of the bound: Gen(10) before Gen(2)),
+;; the pieces of `close` that need no solver (unresolved constraints,
+;; ambiguity, determined variables in the order the constraints add them,
+;; stuck `Send` reduced), `finalize` (tables, uses, sites, fn colours, the
+;; worklists emptied) and `scheme` (the constraints whose variables the root
+;; holds, once each). The pieces of `close` that call the solver are in
+;; unit-general-close.fib.
+;; Build: fibc build compiler/tests/types/unit-general.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.infer.colour types.infer.general
+               types.check))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+(defun pos-at (line: i64) -> Pos (Pos "t.fib" line 1 0 1))
+
+(defun cx-new () -> Cx
+  (Cx (globals-new) (env-new) (store-new) (tables-new) (unit-new)))
+
+(defun colours-of (raised: (Map i64 Colour) must-send: (Set i64) symbolic: (Vec (Pair Colour Ty))
+                   flows: (Vec (Pair Colour Colour))) -> Colours
+  (Colours raised must-send symbolic flows))
+(defun no-colours () -> Colours (colours-of (map-empty) (set-empty) [] []))
+
+(defun fn-of (k: Colour params: (Vec Ty)) -> Ty (TFn k params (ty-i64)))
+(defun v (i: i64) -> Ty (TVar i))
+(defun cell-of (t: Ty) -> Ty (ty-cell t))
+
+(defun keys-tests (cs: Checks) -> unit
+  (let ((cx (cx-new)))
+    (do
+      (check cs "keys: each variable once, in order of first occurrence, rigid ones too"
+             (= (general-keys (. cx st) (TFn CSend [(v 1) (TRigid 0)] (cell-of (TCon KArray [(v 1) (v 2)]))))
+                [(KeyVar 1) (KeyRigid 0) (KeyVar 2)]))
+      (check cs "keys: a quantified variable and a colour are not keys"
+             (empty? (general-keys (. cx st) (TFn (CVar 3) [(TGen 0)] (ty-i64)))))
+      (store-bind (. cx st) 1 (ty-i64))
+      (check cs "keys: the type is zonked first"
+             (= (general-keys (. cx st) (TCon KArray [(v 1) (v 4)])) [(KeyVar 4)])))))
+
+(defun naming-tests (cs: Checks) -> unit
+  (let ((cx (cx-new)))
+    (do
+      (set! (. (. cx u) rigid-names) ["b" "T"])
+      (check cs "names: letters skip the unit's rigid names, a rigid variable keeps its own"
+             (= (. (genmap-new cx [(KeyVar 5) (KeyRigid 0) (KeyVar 6) (KeyRigid 1)] (no-colours) []) names)
+                ["a" "b" "c" "T"]))
+      (check cs "names: a rigid variable the unit does not name is called nothing"
+             (= (. (genmap-new cx [(KeyRigid 7)] (no-colours) []) names) [""]))
+      (let ((m (genmap-new cx [(KeyVar 5) (KeyRigid 0) (KeyVar 6)] (no-colours) [])))
+        (check cs "vars: each key by its position in the order"
+               (and (= (get (. m vars) (KeyVar 5)) (some 0)) (= (get (. m vars) (KeyRigid 0)) (some 1))
+                    (= (get (. m vars) (KeyVar 6)) (some 2)) (nil? (get (. m vars) (KeyVar 7))))))
+      (set! (. (. cx u) rigid-names) [])
+      (let ((order (mapv (fn (i: i64) (KeyVar i)) (range 28)))
+            (names (. (genmap-new cx (mapv (fn (i: i64) (KeyVar i)) (range 28)) (no-colours) []) names)))
+        (check cs "names: past z the letters take a number (a1, b1)"
+               (and (= (nth names 0) "a") (= (nth names 25) "z") (= (nth names 26) "a1") (= (nth names 27) "b1")))))))
+
+(defun colour-tests (cs: Checks) -> unit
+  (let ((cx (cx-new))
+        (cols (colours-of (assoc (map-empty) 9 CLocal) (conj (set-empty) 11) [] []))
+        (roots [(fn-of (CVar 7) []) (fn-of (CVar 3) [(fn-of (CVar 7) []) (fn-of (CVar 9) []) (fn-of (CVar 11) []) (fn-of CLocal [])])]))
+    (let ((m (genmap-new cx [] cols roots)))
+      (do
+        (check cs "colours: the free colour variables of the roots are numbered in order of first occurrence"
+               (and (= (genmap-n-colours m) 2) (= (get (. m colour-gen) 7) (some 0)) (= (get (. m colour-gen) 3) (some 1))))
+        (check cs "colours: a variable the solution raised or fixed is not quantified"
+               (and (nil? (get (. m colour-gen) 9)) (nil? (get (. m colour-gen) 11))))
+        (check cs "colour: a quantified variable is its Gen"
+               (and (= (genmap-colour m (CVar 7)) (CGen 0)) (= (genmap-colour m (CVar 3)) (CGen 1))))
+        (check cs "colour: a raised variable is its value, a send one is send"
+               (and (= (genmap-colour m (CVar 9)) CLocal) (= (genmap-colour m (CVar 11)) CSend)))
+        (check cs "colour: a free variable that is not quantified is send (least)"
+               (= (genmap-colour m (CVar 99)) CSend))
+        (check cs "colour: constants and Gens stay"
+               (and (= (genmap-colour m CSend) CSend) (= (genmap-colour m CLocal) CLocal)
+                    (= (genmap-colour m (CRigid 2)) (CRigid 2)) (= (genmap-colour m (CGen 5)) (CGen 5))))))))
+
+(defun apply-tests (cs: Checks) -> unit
+  (let ((cx (cx-new)))
+    (do
+      (set! (. (. cx u) rigid-names) ["T"])
+      (let ((m (genmap-new cx [(KeyVar 1) (KeyRigid 0)] (colours-of (map-empty) (set-empty) [] []) [(fn-of (CVar 7) [])]))
+            (st (. cx st)))
+        (do
+          (check cs "apply: variables and rigid ones become Gens, the colours too, an unquantified variable is i64"
+                 (= (genmap-apply m st (TFn (CVar 7) [(v 1) (TRigid 0) (v 99)] (v 1)))
+                    (TFn (CGen 0) [(TGen 0) (TGen 1) (ty-i64)] (TGen 0))))
+          (check cs "apply: a rigid variable the map lacks stays rigid"
+                 (= (genmap-apply m st (TRigid 3)) (TRigid 3)))
+          (store-bind st 1 (cell-of (v 99)))
+          (check cs "apply: the type is zonked first (a bound variable is its type)"
+                 (= (genmap-apply m st (v 1)) (cell-of (ty-i64))))
+          (check cs "pred: the types of a predicate under the map"
+                 (and (= (genmap-pred m st (PProto 3 [(TRigid 0) (ty-str)])) (PProto 3 [(TGen 1) (ty-str)]))
+                      (= (genmap-pred m st (PSend (TRigid 0))) (PSend (TGen 1)))
+                      (= (genmap-pred m st (PObject (v 50))) (PObject (ty-i64)))
+                      (= (genmap-pred m st (PWeakable (TRigid 0))) (PWeakable (TGen 1))))))))))
+
+;; A map quantifying n colour variables 100.. as the colours of the parameters of one root.
+(defun colour-root (n: i64) -> Ty
+  (TFn (CVar 100) (mapv (fn (i: i64) (fn-of (CVar (+ 101 i)) [])) (range n)) (ty-i64)))
+
+(defun bounds-tests (cs: Checks) -> unit
+  (let ((cx (cx-new)) (st (store-new)))
+    (do
+      (let ((m (genmap-new cx [] (colours-of (map-empty) (set-empty) [] [(Pair (CVar 100) (CVar 101))]) [(colour-root 1)])))
+        (check cs "bounds: a flow between quantified colours"
+               (= (genmap-colour-bounds m st) [(BFlow (CGen 0) (CGen 1))])))
+      (let ((m (genmap-new cx [] (colours-of (map-empty) (set-empty) [] [(Pair (CVar 101) (CVar 100))]) [(colour-root 1)])))
+        (check cs "bounds: the flow runs the other way"
+               (= (genmap-colour-bounds m st) [(BFlow (CGen 1) (CGen 0))])))
+      (let ((m (genmap-new cx [] (colours-of (map-empty) (set-empty) [] [(Pair (CVar 100) (CVar 900)) (Pair (CVar 900) (CVar 101))])
+                           [(colour-root 1)])))
+        (check cs "bounds: a flow through an unquantified variable is followed"
+               (= (genmap-colour-bounds m st) [(BFlow (CGen 0) (CGen 1))])))
+      (let ((m (genmap-new cx [] (colours-of (map-empty) (set-empty) [] [(Pair (CVar 100) (CVar 101)) (Pair (CVar 100) (CVar 101))])
+                           [(colour-root 1)])))
+        (check cs "bounds: a repeated flow is one bound"
+               (= (count (genmap-colour-bounds m st)) 1)))
+      (let ((m (genmap-new cx [] (colours-of (map-empty) (set-empty) [] [(Pair (CVar 100) (CVar 100))]) [(colour-root 1)])))
+        (check cs "bounds: a colour does not bound itself"
+               (empty? (genmap-colour-bounds m st))))
+      (let ((m (genmap-new cx [(KeyVar 1)] (colours-of (map-empty) (set-empty) [(Pair (CVar 101) (v 1))] [(Pair (CVar 100) (CVar 101))])
+                           [(colour-root 1)])))
+        (check cs "bounds: a symbolic capture bounds every quantified colour that reaches it, Caps before Flow"
+               (= (genmap-colour-bounds m st)
+                  [(BCaps (CGen 1) (TGen 0)) (BFlow (CGen 0) (CGen 1))])))
+      (let ((m (genmap-new cx [(KeyVar 1)] (colours-of (map-empty) (set-empty) [(Pair (CVar 100) (v 1))] [(Pair (CVar 100) (CVar 101))])
+                           [(colour-root 1)])))
+        (check cs "bounds: a symbolic capture also bounds the colours that follow it along flows"
+               (= (genmap-colour-bounds m st)
+                  [(BCaps (CGen 0) (TGen 0)) (BCaps (CGen 1) (TGen 0)) (BFlow (CGen 0) (CGen 1))])))
+      (let ((m (genmap-new cx [] (colours-of (map-empty) (set-empty) []
+                                             (mapv (fn (i: i64) (Pair (CVar 100) (CVar (+ 101 i)))) (range 11)))
+                           [(colour-root 11)])))
+        (check cs "bounds: sorted by Debug text, so Gen(1) Gen(10) Gen(11) Gen(2) .. Gen(9)"
+               (= (mapv (fn (b: ColourBound) (match b ((BFlow _ (CGen i)) i) (_ -1))) (genmap-colour-bounds m st))
+                  [1 10 11 2 3 4 5 6 7 8 9]))))))
+
+(defun debug-tests (cs: Checks) -> unit
+  (do
+    (check cs "debug: a Caps bound as derive(Debug) writes it (checked against rustc)"
+           (= (debug-bound (BCaps (CGen 2) (TFn (CRigid 1) [(TCon (KScalar SI64) []) (TVar 3)
+                                                              (TCon (KNominal 4) [(TGen 0) (TCon (KDyn 5 true) [])])]
+                                             (TCon KStr []))))
+              "Caps(Gen(2), Fn(Rigid(1), [Con(Scalar(I64), []), Var(TvId(3)), Con(Nominal(TypeId(4)), [Gen(0), Con(Dyn(ProtoId(5), true), [])])], Con(Str, [])))"))
+    (check cs "debug: a Flow bound"
+           (= (debug-bound (BFlow CSend (CVar 7))) "Flow(Send, Var(CvId(7)))"))
+    (check cs "debug: the other constants"
+           (and (= (debug-colour CLocal) "Local")
+                (= (debug-ty (TCon KArray [])) "Con(Array, [])")
+                (= (debug-ty (TCon KCell [])) "Con(Cell, [])")
+                (= (debug-ty (TCon KAtom [])) "Con(Atom, [])")
+                (= (debug-ty (TCon KWeak [])) "Con(Weak, [])")
+                (= (debug-ty (TCon KTask [])) "Con(Task, [])")
+                (= (debug-ty (TCon (KDyn 1 false) [])) "Con(Dyn(ProtoId(1), false), [])")))
+    (check cs "debug: the scalars"
+           (= (mapv (fn (s: Scalar) (debug-ty (TCon (KScalar s) []))) (scalar-all))
+              (mapv (fn (n: str) (str-join ["Con(Scalar(" n "), [])"]))
+                    ["Bool" "I8" "I16" "I32" "I64" "F32" "F64" "Char" "Keyword" "Unit" "Ptr"])))))
+
+;; ---- pieces of close
+
+(defun proto-cx () -> Cx
+  (let ((cx (cx-new)))
+    (do (table-add (. (. cx g) protos) (ProtoDef "Show" 2 [] [] [] p0))
+        cx)))
+
+(defun deferred (kind: DKind line: i64) -> Deferred (Deferred kind (pos-at line) nil "f"))
+(defun set-deferred (cx: Cx ds: (Vec Deferred)) -> unit (set! (. (. cx u) deferred) ds))
+(defun err-text (r: (Result unit TypeError)) -> str (match r ((Err e) (. e message)) (_ "")))
+(defun err-kind (r: (Result unit TypeError)) -> ErrorKind (match r ((Err e) (. e kind)) (_ Resolve)))
+(defun err-line (r: (Result unit TypeError)) -> i64 (match r ((Err e) (. (. e pos) line)) (_ 0)))
+(defun ok? (r: (Result unit TypeError)) -> bool (match r ((Ok _) true) (_ false)))
+
+(defun unresolved-tests (cs: Checks) -> unit
+  (let ((cx (cx-new)))
+    (do
+      (set-deferred cx [])
+      (check cs "unresolved: nothing deferred, nothing wrong" (ok? (check-unresolved cx)))
+      (set-deferred cx [(deferred (DkSend (v 1) []) 2) (deferred (DkWeakable (v 1)) 3)])
+      (check cs "unresolved: stuck Send and Weakable are not reported here" (ok? (check-unresolved cx)))
+      (set-deferred cx [(deferred (DkSend (v 1) []) 2)
+                        (deferred (DkField (v 1) "x" (v 2) "p") 3)
+                        (deferred (DkDeref (v 3) (v 4) "q") 4)])
+      (let ((r (check-unresolved cx)))
+        (check cs "unresolved: a field of an unknown struct, the first one, at its position"
+               (and (= (err-kind r) FieldUnresolved) (= (err-line r) 3)
+                    (= (err-text r) "cannot infer the struct type of p for field x; annotate it"))))
+      (set-deferred cx [(deferred (DkDeref (v 3) (v 4) "(deref p)") 4) (deferred (DkField (v 1) "x" (v 2) "p") 5)])
+      (let ((r (check-unresolved cx)))
+        (check cs "unresolved: a deref of an unknown type"
+               (and (= (err-kind r) DerefUnresolved) (= (err-line r) 4)
+                    (= (err-text r) "cannot infer whether (deref p) is a cell, an atom, a weak reference or a task"))))
+      (set-deferred cx [(deferred (DkFloat (v 8)) 6)])
+      (let ((r (check-unresolved cx)))
+        (check cs "unresolved: a float whose type is unknown (shown with the unit's names)"
+               (and (= (err-kind r) Ambiguous) (= (err-line r) 6)
+                    (= (err-text r) "cannot infer which float type a is; annotate it")))))))
+
+(defun ambiguous-tests (cs: Checks) -> unit
+  (let ((cx (proto-cx)))
+    (do
+      (set-deferred cx [(deferred (DkProto 0 [(v 3)] nil) 7)])
+      (let ((r (check-ambiguous cx [(KeyVar 1)])))
+        (check cs "ambiguous: a protocol constraint on a variable no root holds"
+               (and (= (err-kind r) Ambiguous) (= (err-line r) 7)
+                    (= (err-text r) "ambiguous constraint Show a in f; add an annotation"))))
+      (check cs "ambiguous: the variable is in the union"
+             (ok? (check-ambiguous cx [(KeyVar 3)])))
+      (set-deferred cx [(deferred (DkProto 0 [(v 3) (v 9)] nil) 7)])
+      (check cs "ambiguous: only the dispatch argument is looked at"
+             (ok? (check-ambiguous cx [(KeyVar 3)])))
+      (set-deferred cx [(deferred (DkSend (v 3) []) 7) (deferred (DkProto 0 [(TCon KArray [(v 3) (v 4)])] nil) 8)
+                        (deferred (DkProto 0 [(v 5)] nil) 9)])
+      (let ((r (check-ambiguous cx [(KeyVar 3)])))
+        (check cs "ambiguous: the first offending constraint, any variable of the dispatch type, shown with its own letters"
+               (and (= (err-line r) 8) (= (err-text r) "ambiguous constraint Show (Array a b) in f; add an annotation")))))))
+
+(defun determined-tests (cs: Checks) -> unit
+  (let ((cx (cx-new)))
+    (do
+      (set-deferred cx [])
+      (check cs "determined: no constraints, the set stays"
+             (= (determined cx [(KeyVar 1)]) [(KeyVar 1)]))
+      (set-deferred cx [(deferred (DkProto 0 [(v 1) (v 7)] nil) 1) (deferred (DkProto 0 [(v 6) (v 8)] nil) 2)])
+      (check cs "determined: a constraint whose dispatch is in the set adds its variables, in order; one whose dispatch is not does not"
+             (= (determined cx [(KeyVar 1)]) [(KeyVar 1) (KeyVar 7)]))
+      (set-deferred cx [(deferred (DkProto 0 [(v 6) (v 8)] nil) 2) (deferred (DkProto 0 [(v 7) (v 6)] nil) 1)
+                        (deferred (DkProto 0 [(v 1) (v 7)] nil) 3)])
+      (check cs "determined: a later pass picks up what an earlier constraint reaches"
+             (= (determined cx [(KeyVar 1)]) [(KeyVar 1) (KeyVar 7) (KeyVar 6) (KeyVar 8)]))
+      (set-deferred cx [(deferred (DkProto 0 [(v 1) (v 6)] nil) 1) (deferred (DkProto 0 [(v 1) (v 7)] nil) 2)])
+      (check cs "determined: the additions follow the order of the constraints"
+             (= (determined cx [(KeyVar 1)]) [(KeyVar 1) (KeyVar 6) (KeyVar 7)]))
+      (set-deferred cx [(deferred (DkProto 0 [(v 7) (v 1)] nil) 1) (deferred (DkProto 0 [(v 1) (v 7)] nil) 2)])
+      (check cs "determined: it ends when nothing is added"
+             (= (determined cx [(KeyVar 1)]) [(KeyVar 1) (KeyVar 7)]))
+      (set-deferred cx [(deferred (DkSend (v 1) []) 1) (deferred (DkProto 0 [(TCon KArray [(v 1) (v 7)])] nil) 2)])
+      (check cs "determined: a dispatch type holding any variable of the set determines the rest"
+             (= (determined cx [(KeyVar 1)]) [(KeyVar 1) (KeyVar 7)])))))
+
+(defun sends-tests (cs: Checks) -> unit
+  (let ((cx (cx-new))
+        (d-array (Deferred (DkSend (TCon KArray [(v 2)]) []) (pos-at 5) (some 4) "g")))
+    (do
+      (set-deferred cx [(deferred (DkWeakable (v 9)) 1)
+                        (deferred (DkSend (fn-of (CVar 5) []) ["x"]) 2)
+                        d-array
+                        (deferred (DkSend (cell-of (ty-i64)) ["c"]) 6)])
+      (reduce-sends cx)
+      (let ((ds @(. (. cx u) deferred))
+            (cons @(. (. cx u) colours)))
+        (do
+          (check cs "reduce-sends: what is not a Send, a Send that fails and a Send on a variable stay, a closure's Send goes"
+                 (and (= (count ds) 3)
+                      (match (. (nth ds 0) kind) ((DkWeakable _) true) (_ false))
+                      (match (. (nth ds 1) kind) ((DkSend (TVar 2) _) true) (_ false))
+                      (match (. (nth ds 2) kind) ((DkSend (TCon (KCell) _) _) true) (_ false))))
+          (check cs "reduce-sends: the variable's Send keeps the position, site and function of the constraint"
+                 (and (= (. (. (nth ds 1) pos) line) 5) (= (. (nth ds 1) site) (some 4)) (= (. (nth ds 1) fun) "g")))
+          (check cs "reduce-sends: a closure's colour is bounded by send, with the path as the label"
+                 (and (= (count cons) 1) (= (. (nth cons 0) from) (CVar 5)) (= (. (nth cons 0) to) CSend)
+                      (= (. (nth cons 0) label) (some "x")) (nil? (. (nth cons 0) origin))
+                      (= (. (. (nth cons 0) pos) line) 2))))))))
+
+;; ---- finalize
+
+(defun bound-is? (r: (Option Resolution) p: Pred) -> bool
+  (match r ((some (ResBound q)) (= p q)) (_ false)))
+
+(defun finalize-tests (cs: Checks) -> unit
+  (let ((cx (cx-new))
+        (cols (colours-of (map-empty) (set-empty) [] []))
+        (u (. cx u))
+        (tb (. cx t)))
+    (do
+      (set! (. u rigid-names) ["T"])
+      (set! (. tb expr-types) (assoc (assoc (map-empty) 1 (v 1)) 2 (TRigid 0)))
+      (set! (. u exprs) [1 2 77 1])
+      (set! (. tb binding-types) (assoc (map-empty) 5 (fn-of (CVar 7) [(v 1)])))
+      (set! (. u bindings) [5])
+      (set! (. tb instantiations) (assoc (map-empty) 3 (Instantiation [(v 1) (v 40)] [(CVar 7) CLocal (CVar 8)])))
+      (set! (. u insts) [3 78])
+      (set! (. tb resolutions)
+            (assoc (assoc (assoc (map-empty) 10 (ResInstance 4 [(v 1)])) 11 (ResBound (PProto 0 [(v 1)]))) 12 ResDyn))
+      (set! (. u sites) [10 11 12 13])
+      (set! (. u fn-lits) [(Pair 30 (CVar 7)) (Pair 31 (CVar 8))])
+      (let ((m (genmap-new cx [(KeyVar 1) (KeyRigid 0)] cols [(fn-of (CVar 7) [])]))
+            (closed (Closed [] cols [(Pair (PProto 0 [(v 1)]) (some 20)) (Pair (PSend (v 1)) nil)])))
+        (do
+          (cx-finalize cx m closed)
+          (check cs "finalize: a remaining constraint with a method site is resolved by its bound, one without is not"
+                 (and (bound-is? (get @(. tb resolutions) 20) (PProto 0 [(TGen 0)]))
+                      (= (count @(. tb resolutions)) 4)))
+          (check cs "finalize: the types of the expressions are under the map, once, and the list is emptied"
+                 (and (= (get @(. tb expr-types) 1) (some (TGen 0))) (= (get @(. tb expr-types) 2) (some (TGen 1)))
+                      (= (count @(. tb expr-types)) 2) (empty? @(. u exprs))))
+          (check cs "finalize: so are the types of the bindings"
+                 (and (= (get @(. tb binding-types) 5) (some (TFn (CGen 0) [(TGen 0)] (ty-i64))))
+                      (empty? @(. u bindings))))
+          (check cs "finalize: an instantiation's types and colours are under the map"
+                 (and (match (get @(. tb instantiations) 3)
+                        ((some i) (and (= (. i tys) [(TGen 0) (ty-i64)]) (= (. i colours) [(CGen 0) CLocal CSend])))
+                        (_ false))
+                      (empty? @(. u insts)) (nil? (get @(. tb instantiations) 78))))
+          (check cs "finalize: an instance resolution's arguments and a bound's predicate are under the map; a dyn stays"
+                 (and (match (get @(. tb resolutions) 10)
+                        ((some (ResInstance i args)) (and (= i 4) (= args [(TGen 0)])))
+                        (_ false))
+                      (bound-is? (get @(. tb resolutions) 11) (PProto 0 [(TGen 0)]))
+                      (match (get @(. tb resolutions) 12) ((some (ResDyn)) true) (_ false))
+                      (nil? (get @(. tb resolutions) 13)) (empty? @(. u sites))))
+          (check cs "finalize: a function literal's colour is under the map"
+                 (and (= (get @(. tb fn-colours) 30) (some (CGen 0))) (= (get @(. tb fn-colours) 31) (some CSend))
+                      (empty? @(. u fn-lits)))))))))
+
+;; ---- scheme
+
+(defun scheme-tests (cs: Checks) -> unit
+  (let ((cx (cx-new))
+        (cols (colours-of (map-empty) (set-empty) [] []))
+        (root (fn-of CSend [(v 1) (v 2)])))
+    (let ((m (genmap-new cx [(KeyVar 1) (KeyVar 2)] cols []))
+          (closed (Closed [[(KeyVar 1)] [(KeyVar 2)]] cols
+                          [(Pair (PProto 0 [(v 1)]) nil) (Pair (PProto 0 [(v 2)]) nil) (Pair (PProto 0 [(v 1)]) (some 3))
+                           (Pair (PProto 1 [(v 1) (v 2)]) nil) (Pair (PSend (v 1)) nil) (Pair (PSend (v 1)) nil)])))
+      (do
+        (let ((s (cx-scheme cx m closed 0 root [false true] ["x" "y"])))
+          (do
+            (check cs "scheme: the constraints whose variables the root holds, each once, in order"
+                   (= (. s preds) [(PProto 0 [(TGen 0)]) (PSend (TGen 0))]))
+            (check cs "scheme: the variables, names, type, amps and parameters"
+                   (and (= (. s n-vars) 2) (= (. s n-colours) 0) (= (. s var-names) ["a" "b"])
+                        (= (. s ty) (TFn CSend [(TGen 0) (TGen 1)] (ty-i64)))
+                        (= (. s amps) [false true]) (= (. s params) ["x" "y"])
+                        (empty? (. s colour-bounds))))))
+        (let ((s (cx-scheme cx m closed 1 root [] [])))
+          (check cs "scheme: the other root holds the other variable"
+                 (= (. s preds) [(PProto 0 [(TGen 1)])])))))))
+
+(defun scheme-colour-tests (cs: Checks) -> unit
+  (let ((cx (cx-new))
+        (cols (colours-of (map-empty) (set-empty) [] [(Pair (CVar 100) (CVar 101))]))
+        (root (colour-root 1)))
+    (let ((m (genmap-new cx [] cols [root]))
+          (closed (Closed [[]] cols [])))
+      (let ((s (cx-scheme cx m closed 0 root [] [])))
+        (check cs "scheme: colours are counted and their bounds kept"
+               (and (= (. s n-colours) 2) (= (. s colour-bounds) [(BFlow (CGen 0) (CGen 1))])
+                    (= (. s ty) (TFn (CGen 0) [(TFn (CGen 1) [] (ty-i64))] (ty-i64)))))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (keys-tests cs)
+        (naming-tests cs)
+        (colour-tests cs)
+        (apply-tests cs)
+        (bounds-tests cs)
+        (debug-tests cs)
+        (unresolved-tests cs)
+        (ambiguous-tests cs)
+        (determined-tests cs)
+        (sends-tests cs)
+        (finalize-tests cs)
+        (scheme-tests cs)
+        (scheme-colour-tests cs)
+        (finish cs))))

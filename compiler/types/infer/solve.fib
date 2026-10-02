@@ -1,19 +1,436 @@
 ;; compiler/types/infer/solve.fib: the constraint solver (package P9).
 ;; Replaces crates/fibref/src/types/infer/solve.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; The worklist of deferred constraints (spec/types.md §3.3), run to a
+;; fixpoint: each constraint is retried until it is solved (possibly replaced
+;; by an instance's context), fails, or nothing changes. Stuck protocol
+;; constraints with equal dispatch types are improved through the functional
+;; dependency `s → d̄` (§3, Jones-style improvement).
+;;
+;; Shapes: Rust's `Step` is `Attempt` (`Step` is the prelude's). The Rust
+;; functions of `impl Cx` are `cx-NAME`; the ones that are private there are
+;; `solve-NAME` and private here.
+;;
+;; Two functions of infer/pattern.rs that the solver needs live here, so that
+;; solve does not depend on the pattern module (P11 uses them from here):
+;; `cx-settle-vec-pattern` and `cx-tuple-arity` (and `solve-is-tuple`, Rust
+;; `Globals::is_tuple`). The arm of `cx-try-solve` for the Rust
+;; `DKind::VecPat` is `solve-vec-pat`; it waits for the variant `DkVecPat s:
+;; Ty parts: (Vec Ty)` in types.infer.cx (see the TODO at `cx-try-solve`).
 (ns types.infer.solve
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:require [fib.string :as str])
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.infer.cx types.infer.unify types.infer.send
+        types.lower.supers types.lower.impl-head))
 
-;; Rust: infer/solve.rs:26 solve_all
+;; What one attempt did: solved (these constraints replace it) or not
+;; decidable yet.
+(defenum Attempt (AtSolved new: (Vec Deferred)) AtStuck)
+
+;; Rust: infer/solve.rs:26 solve_all. Runs the worklist to a fixpoint; stops
+;; at the first failure.
 (defun cx-solve-all (cx: Cx) -> (Result unit TypeError)
-  (trap "todo: cx-solve-all"))
+  (let ((work @(. (. cx u) deferred)))
+    (do (set! (. (. cx u) deferred) [])
+        (try-let ((r (solve-pass cx work)))
+          (do (set! (. (. cx u) deferred) (into (. r fst) @(. (. cx u) deferred)))
+              (try-let ((changed (cx-improve cx)))
+                (if (or (. r snd) changed) (cx-solve-all cx) (Ok ()))))))))
 
-;; Rust: infer/solve.rs:125 no_instance
+;; One pass over the worklist: what is kept (stuck ones, and what the solved
+;; ones are replaced by) and whether anything was solved.
+(defun solve-pass :private (cx: Cx work: (Vec Deferred)) -> (Result (Pair (Vec Deferred) bool) TypeError)
+  (loop ((i 0) (keep []) (progress false))
+    (if (< i (count work))
+        (let ((d (nth work i)))
+          (try-let ((step (cx-try-solve cx d)))
+            (match step
+              ((AtSolved new) (recur (+ i 1) (into keep new) true))
+              ((AtStuck) (recur (+ i 1) (conj keep d) progress)))))
+        (Ok (Pair keep progress)))))
+
+;; TODO(lead): add `(DkVecPat s: Ty parts: (Vec Ty))` to DKind in
+;; types.infer.cx (Rust cx.rs:107, added by X4) and this arm to the match:
+;;   ((DkVecPat s parts) (solve-vec-pat cx d s parts))
+(defun cx-try-solve :private (cx: Cx d: Deferred) -> (Result Attempt TypeError)
+  (match (. d kind)
+    ((DkProto p args method) (solve-proto cx d p args method))
+    ((DkSend t path) (solve-send cx d t path))
+    ((DkObject t who) (solve-object cx d t who))
+    ((DkWeakable t) (solve-weakable cx d t))
+    ((DkField t f r _) (solve-field cx d t f r))
+    ((DkDeref t r _) (solve-deref cx d t r))
+    ((DkFloat t) (solve-float cx d t))))
+
+;; The deferred `[p..]` once `s` is known.
+(defun solve-vec-pat (cx: Cx d: Deferred s: Ty parts: (Vec Ty)) -> (Result Attempt TypeError)
+  (match (store-resolve (. cx st) s)
+    ((TVar _) (Ok AtStuck))
+    (_ (try-let ((_ (cx-settle-vec-pattern cx s parts (. d pos))))
+         (Ok (AtSolved []))))))
+
+(defun solve-float :private (cx: Cx d: Deferred t: Ty) -> (Result Attempt TypeError)
+  (let ((rt (store-resolve (. cx st) t)))
+    (match rt
+      ((TVar _) (Ok AtStuck))
+      ((TCon (KScalar s) _) (if (scalar-is-float s) (Ok (AtSolved [])) (solve-not-float cx d rt)))
+      (_ (solve-not-float cx d rt)))))
+
+(defun solve-not-float :private (cx: Cx d: Deferred t: Ty) -> (Result Attempt TypeError)
+  (Err (type-error Unify (. d pos)
+         (str-join ["cannot unify " (cx-show cx t) " with a float type"]))))
+
+;; ---- protocol constraints
+
+(defun solve-proto :private (cx: Cx d: Deferred p: i64 args: (Vec Ty) method: (Option i64)) -> (Result Attempt TypeError)
+  (let ((t1 (store-resolve (. cx st) (nth args 0))))
+    (match t1
+      ((TVar _) (Ok AtStuck))
+      ((TGen _) (Ok AtStuck))
+      ((TRigid r) (solve-rigid-proto cx d p r args))
+      ((TCon (KDyn q _) dargs) (solve-dyn-proto cx d p args method t1 q dargs))
+      ((TCon c _) (solve-apply-instance cx d p c t1 args))
+      ((TFn _ _ _) (Err (cx-no-instance cx p t1 (. d pos)))))))
+
+;; `P` itself, or a supertrait of it with the determined arguments read off
+;; the dyn's (§4.1 rule 3).
+(defun solve-dyn-proto :private (cx: Cx d: Deferred p: i64 args: (Vec Ty) method: (Option i64) t1: Ty q: i64 dargs: (Vec Ty)) -> (Result Attempt TypeError)
+  (if-some [dargs2 (solve-dyn-args (. cx g) q dargs p t1)]
+    (try-let ((_ (solve-dyn-method cx d p method))
+              (_ (solve-unify-all cx dargs2 (vec (drop 1 args)) (. d pos))))
+      (do (solve-resolved cx d ResDyn)
+          (Ok (AtSolved []))))
+    (Err (cx-no-instance cx p t1 (. d pos)))))
+
+;; The determined arguments of `(p t1 ..)` for `t1 = (dyn q dargs)`: `dargs`
+;; when `p` is `q`, else those of the supertrait `p` of `q` (§4.1 rule 3);
+;; `nil` when `p` is neither.
+(defun solve-dyn-args :private (g: Globals q: i64 dargs: (Vec Ty) p: i64 t1: Ty) -> (Option (Vec Ty))
+  (if (= q p)
+      (some dargs)
+      (find-map (fn (s: Pred) (match s
+                                ((PProto r a) (if (= r p) (some (vec (drop 1 a))) nil))
+                                (_ nil)))
+                (super-closure g (PProto q (into [t1] dargs))))))
+
+;; A method whose `Self` occurs elsewhere than the receiver is not callable
+;; through `dyn` (§4.4).
+(defun solve-dyn-method :private (cx: Cx d: Deferred p: i64 method: (Option i64)) -> (Result unit TypeError)
+  (if-some [m method]
+    (let ((pd (g-proto (. cx g) p))
+          (md (nth (. pd methods) m)))
+      (if (. md self-elsewhere)
+          (Err (type-error-other (. d pos)
+                 (str-join ["method " (. md name) " of " (. pd name) " is not callable through dyn"])))
+          (Ok ())))
+    (Ok ())))
+
+;; Rust: infer/solve.rs:125 no_instance. `no implementation of P for T`.
 (defun cx-no-instance (cx: Cx p: i64 t: Ty pos: Pos) -> TypeError
-  (trap "todo: cx-no-instance"))
+  (type-error NoInstance pos
+    (str-join ["no implementation of " (. (g-proto (. cx g) p) name) " for " (cx-show cx t)])))
 
-;; Rust: infer/solve.rs:373 improve
+;; `(P (K ..) ..)`: the instance at `K`, its head matched against the type,
+;; its determined arguments unified, its context deferred.
+(defun solve-apply-instance :private (cx: Cx d: Deferred p: i64 c: Con t1: Ty args: (Vec Ty)) -> (Result Attempt TypeError)
+  (let ((g (. cx g)))
+    (if-some [index (get @(. g instance-index) (InstKey p c))]
+      (let ((inst (table-get (. g instances) index)))
+        (if (solve-covers cx (. inst head) t1)
+            (solve-instantiate cx d index inst t1 args)
+            (Err (cx-no-instance cx p t1 (. d pos)))))
+      (Err (cx-no-instance cx p t1 (. d pos))))))
+
+;; The instance at fresh variables: head unified with the type, determined
+;; arguments with the constraint's, the context becomes the new constraints.
+(defun solve-instantiate :private (cx: Cx d: Deferred index: i64 inst: InstanceDef t1: Ty args: (Vec Ty)) -> (Result Attempt TypeError)
+  (let ((tys (mapv (fn (v: str) (cx-fresh cx)) (. inst var-names)))
+        (head (ty-subst-gen (. inst head) tys []))
+        (dets (mapv (fn (t: Ty) (ty-subst-gen t tys [])) (. inst dets)))
+        (context (mapv (fn (q: Pred) (pred-map-tys q (fn (t: Ty) (ty-subst-gen t tys []))))
+                       (. inst context))))
+    (try-let ((_ (cx-unify cx head t1 (. d pos)))
+              (_ (solve-unify-all cx dets (vec (drop 1 args)) (. d pos))))
+      (do (solve-resolved cx d (ResInstance index tys))
+          (Ok (AtSolved (mapv (fn (q: Pred) (solve-pred-deferred q d)) context)))))))
+
+;; Whether an instance head covers `t`'s colour arguments (§1.3): a colour
+;; the head gives is covered only by itself, where `t` has a constant colour
+;; (`:send`, `:local`, a rigid one) there; a colour variable of the unit is
+;; left to unification.
+(defun solve-covers :private (cx: Cx head: Ty t: Ty) -> bool
+  (match t
+    ((TCon _ args)
+     (every? (fn ([k a]) (solve-covered cx k a)) (zip (fixed-colours (. cx g) head) args)))
+    (_ true)))
+
+(defun solve-covered :private (cx: Cx k: (Option Colour) a: Ty) -> bool
+  (let ((k2 (match (store-resolve (. cx st) a)
+              ((TFn c _ _) (match c ((CSend) (some c)) ((CLocal) (some c)) ((CRigid _) (some c)) (_ nil)))
+              (_ nil))))
+    (or (nil? k) (nil? k2) (= k k2))))
+
+;; A predicate as a deferred constraint arising from `d`.
+(defun solve-pred-deferred :private (q: Pred d: Deferred) -> Deferred
+  (let ((kind (match q
+                ((PProto p args) (DkProto p args nil))
+                ((PSend t) (DkSend t []))
+                ((PObject t) (DkObject t "an instance context"))
+                ((PWeakable t) (DkWeakable t)))))
+    (Deferred kind (. d pos) nil (. d fun))))
+
+;; Records what the method use `d` resolved to.
+(defun solve-resolved :private (cx: Cx d: Deferred r: Resolution) -> unit
+  (when-some [site (. d site)]
+    (set! (. (. cx t) resolutions) (assoc @(. (. cx t) resolutions) site r))
+    (set! (. (. cx u) sites) (conj @(. (. cx u) sites) site))))
+
+;; Unifies the two lists pairwise, to the shorter.
+(defun solve-unify-all :private (cx: Cx xs: (Vec Ty) ys: (Vec Ty) pos: Pos) -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (< i (min (count xs) (count ys)))
+        (try-let ((_ (cx-unify cx (nth xs i) (nth ys i) pos)))
+          (recur (+ i 1)))
+        (Ok ()))))
+
+;; ---- rigid variables, Send, Object, Weakable
+
+;; `(P a ..)` for a rigid `a`: entailed by a given in an `impl` body (§2.7);
+;; a bound of the scheme in a `defun`.
+(defun solve-rigid-proto :private (cx: Cx d: Deferred p: i64 r: i64 args: (Vec Ty)) -> (Result Attempt TypeError)
+  (if-some [givens @(. (. cx u) givens)]
+    (if-some [gv (find-first (fn (gv: Pred) (solve-given-for gv p r)) givens)]
+      (match gv
+        ((PProto _ gargs)
+         (try-let ((_ (solve-unify-all cx (vec (drop 1 gargs)) (vec (drop 1 args)) (. d pos))))
+           (do (solve-resolved cx d (ResBound gv))
+               (Ok (AtSolved [])))))
+        (_ (Ok AtStuck)))
+      (let ((name (. (g-proto (. cx g) p) name))
+            (a (cx-show cx (TRigid r))))
+        (Err (type-error ImplContext (. d pos)
+               (str-join ["no implementation of " name " for " a "; add (" name " " a
+                          ") to the :where of the impl"])))))
+    (Ok AtStuck)))
+
+(defun solve-given-for :private (gv: Pred p: i64 r: i64) -> bool
+  (match gv
+    ((PProto q gargs) (and (= q p) (= (nth gargs 0) (TRigid r))))
+    (_ false)))
+
+(defun solve-send :private (cx: Cx d: Deferred t: Ty path: (Vec str)) -> (Result Attempt TypeError)
+  (match (send-eval (. cx g) (. cx st) t path)
+    ((Err w) (Err (send-error (. cx g) w (. d pos) @(. (. cx u) rigid-names))))
+    ((Ok needs)
+     (try-let ((open (solve-send-vars cx d (. needs vars))))
+       (if open
+           (Ok AtStuck)
+           (do (doseq [p (. needs colours)]
+                 (set! (. (. cx u) colours)
+                       (conj @(. (. cx u) colours)
+                             (ColourCon (. p fst) CSend
+                                        (if (empty? (. p snd)) nil (some (str/join ", " (. p snd))))
+                                        nil (. d pos)))))
+               (Ok (AtSolved []))))))))
+
+;; Whether `Send` still waits for a variable: a rigid one is decided by the
+;; givens when there are some (§2.7), any other is open.
+(defun solve-send-vars :private (cx: Cx d: Deferred vars: (Vec (Pair Ty (Vec str)))) -> (Result bool TypeError)
+  (loop ((i 0) (open false))
+    (if (< i (count vars))
+        (match (. (nth vars i) fst)
+          ((TRigid r)
+           (if (some? @(. (. cx u) givens))
+               (try-let ((_ (solve-given-send cx d r))) (recur (+ i 1) open))
+               (recur (+ i 1) true)))
+          (_ (recur (+ i 1) true)))
+        (Ok open))))
+
+(defun solve-given-send :private (cx: Cx d: Deferred r: i64) -> (Result unit TypeError)
+  (if (includes? (PSend (TRigid r)) (unwrap-or @(. (. cx u) givens) []))
+      (Ok ())
+      (let ((a (cx-show cx (TRigid r))))
+        (Err (type-error ImplContext (. d pos)
+               (str-join ["no implementation of Send for " a "; add (Send " a ") to the :where of the impl"]))))))
+
+;; `(Object T)`: `T` is not a scalar (§2.11, §2.15). `who` names what
+;; requires it, for the message.
+(defun solve-object :private (cx: Cx d: Deferred t: Ty who: str) -> (Result Attempt TypeError)
+  (if-some [scalar (solve-is-scalar cx t)]
+    (if scalar
+        (Err (type-error NotObject (. d pos)
+               (str-join [who " requires an object type, not " (cx-show cx t)])))
+        (Ok (AtSolved [])))
+    (Ok AtStuck)))
+
+;; `(Weakable T)`: `T` is an object type and not an `Option` (§2.11). A
+;; scalar keeps the catalogue's `weak requires an object type`.
+(defun solve-weakable :private (cx: Cx d: Deferred t: Ty) -> (Result Attempt TypeError)
+  (if-some [scalar (solve-is-scalar cx t)]
+    (cond (scalar (Err (type-error WeakScalar (. d pos) "weak requires an object type")))
+          ((solve-is-option cx t)
+           (Err (type-error WeakOption (. d pos)
+                  (str-join ["weak of an Option is not allowed: " (cx-show cx t)
+                             " has no object of its own to observe; take the weak reference of the object inside it"]))))
+          (else (Ok (AtSolved []))))
+    (Ok AtStuck)))
+
+(defun solve-is-option :private (cx: Cx t: Ty) -> bool
+  (match (store-resolve (. cx st) t)
+    ((TCon (KNominal id) _) (= id @(. (. cx g) option)))
+    (_ false)))
+
+;; Whether `t` is a scalar, or `nil` while that is undecided. A rigid
+;; variable is an object iff a given says so: `(Object a)`, or `(Weakable
+;; a)`, which implies it.
+(defun solve-is-scalar :private (cx: Cx t: Ty) -> (Option bool)
+  (match (store-resolve (. cx st) t)
+    ((TVar _) nil)
+    ((TGen _) nil)
+    ((TRigid r)
+     (if-some [gs @(. (. cx u) givens)]
+       (some (not (or (includes? (PObject (TRigid r)) gs) (includes? (PWeakable (TRigid r)) gs))))
+       nil))
+    ((TCon (KScalar _) _) (some true))
+    ((TCon (KNominal id) _) (some (typedef-is-fieldless-enum (g-ty (. cx g) id))))
+    (_ (some false))))
+
+;; ---- fields and dereference
+
+(defun solve-field :private (cx: Cx d: Deferred t: Ty f: str r: Ty) -> (Result Attempt TypeError)
+  (let ((rt (store-resolve (. cx st) t)))
+    (match rt
+      ((TVar _) (Ok AtStuck))
+      (_ (if-some [fty (solve-field-type cx rt f)]
+           (try-let ((_ (cx-unify cx r fty (. d pos))))
+             (Ok (AtSolved [])))
+           (Err (type-error NoField (. d pos) (str-join [(cx-show cx rt) " has no field " f]))))))))
+
+;; The type of field `f` of the struct type `rt`, with its arguments zonked.
+(defun solve-field-type :private (cx: Cx rt: Ty f: str) -> (Option Ty)
+  (match rt
+    ((TCon (KNominal id) args)
+     (match (. (g-ty (. cx g) id) shape)
+       ((TsStruct fields)
+        (if-some [fd (find-first (fn (fd: FieldDef) (= (. fd name) f)) fields)]
+          (let ((zs (mapv (fn (a: Ty) (cx-zonk cx a)) args)))
+            (some (ty-subst-gen (. fd ty) zs (colour-args zs))))
+          nil))
+       (_ nil)))
+    (_ nil)))
+
+(defun solve-deref :private (cx: Cx d: Deferred t: Ty r: Ty) -> (Result Attempt TypeError)
+  (let ((rt (store-resolve (. cx st) t)))
+    (match rt
+      ((TVar _) (Ok AtStuck))
+      ((TCon (KCell) a) (solve-deref-to cx d r (nth a 0)))
+      ((TCon (KAtom) a) (solve-deref-to cx d r (nth a 0)))
+      ((TCon (KTask) a) (solve-deref-to cx d r (nth a 0)))
+      ((TCon (KWeak) a) (solve-deref-to cx d r (ty-nominal @(. (. cx g) option) [(nth a 0)])))
+      (_ (if-some [p @(. (. cx g) deref-proto)]
+           (Err (cx-no-instance cx p rt (. d pos)))
+           (Err (type-error-other (. d pos) "no Deref protocol")))))))
+
+(defun solve-deref-to :private (cx: Cx d: Deferred r: Ty content: Ty) -> (Result Attempt TypeError)
+  (try-let ((_ (cx-unify cx r content (. d pos))))
+    (Ok (AtSolved []))))
+
+;; ---- vector patterns (infer/pattern.rs, here: see the header)
+
+;; Rust `Globals::is_tuple` (decls.rs:442): the prelude's `Pair` or `Triple`.
+(defun solve-is-tuple (g: Globals id: i64) -> bool
+  (let ((def (g-ty g id)))
+    (and (= (. def module) module-prelude)
+         (or (= (. def name) "Pair") (= (. def name) "Triple"))
+         (match (. def shape) ((TsStruct _) true) (_ false)))))
+
+;; Rust: infer/pattern.rs:156 tuple_arity.
+(defun cx-tuple-arity (cx: Cx id: i64 k: i64 pos: Pos) -> TypeError
+  (let ((def (g-ty (. cx g) id))
+        (n (match (. def shape) ((TsStruct fs) (count fs)) (_ 0))))
+    (type-error-other pos
+      (str-join ["a vector pattern of a " (. def name) " takes exactly its " (show n)
+                 " field(s) and no rest, the pattern has " (show k) " element(s)"]))))
+
+;; Rust: infer/pattern.rs:172 settle_vec_pattern. The deferred `[p..]` once
+;; `s` is known, or defaulted: against a `Pair` or `Triple` each element has
+;; its field's type, otherwise `s` is a `(Vec a)` and each element is `a`.
+(defun cx-settle-vec-pattern (cx: Cx s: Ty parts: (Vec Ty) pos: Pos) -> (Result unit TypeError)
+  (match (cx-zonk cx s)
+    ((TCon (KNominal id) args)
+     (if (solve-is-tuple (. cx g) id)
+         (solve-tuple-pattern cx id args parts pos)
+         (solve-vec-pattern cx s parts pos)))
+    (_ (solve-vec-pattern cx s parts pos))))
+
+(defun solve-tuple-pattern :private (cx: Cx id: i64 args: (Vec Ty) parts: (Vec Ty) pos: Pos) -> (Result unit TypeError)
+  (match (. (g-ty (. cx g) id) shape)
+    ((TsStruct fields)
+     (if (= (count fields) (count parts))
+         (solve-unify-all cx parts
+                          (mapv (fn (f: FieldDef) (ty-subst-gen (. f ty) args (colour-args args))) fields)
+                          pos)
+         (Err (cx-tuple-arity cx id (count parts) pos))))
+    (_ (Ok ()))))
+
+;; `s` is a `(Vec a)` and every element is `a`.
+(defun solve-vec-pattern :private (cx: Cx s: Ty parts: (Vec Ty) pos: Pos) -> (Result unit TypeError)
+  (if-some [vec-id @(. (. cx g) vec)]
+    (let ((a (cx-fresh cx)))
+      (try-let ((_ (cx-unify cx s (ty-nominal vec-id [a]) pos))
+                (_ (solve-unify-all cx parts (mapv (fn (p: Ty) a) parts) pos)))
+        (Ok ())))
+    (Err (type-error-other pos "vector patterns need the prelude's Vec"))))
+
+;; ---- improvement
+
+;; A protocol constraint with more than the dispatch type, as `improve`
+;; groups them.
+(defstruct Improvable (proto: i64 args: (Vec Ty) pos: Pos))
+
+;; Rust: infer/solve.rs:373 improve. Improvement: stuck `(P s d̄)` and
+;; `(P s d̄')` (or a given) with the same `s` must have `d̄ = d̄'`. Returns
+;; whether anything changed. Constraints are grouped by protocol and zonked
+;; dispatch type, so a pass is linear in the worklist.
 (defun cx-improve (cx: Cx) -> (Result bool TypeError)
-  (trap "todo: cx-improve"))
+  (let ((own (vec (keep solve-improvable @(. (. cx u) deferred)))))
+    (if (empty? own)
+        (Ok false)
+        (let ((pos (. (nth own 0) pos))
+              (given (vec (keep (fn (q: Pred) (match q
+                                                ((PProto p args) (some (Improvable p args pos)))
+                                                (_ nil)))
+                                (unwrap-or @(. (. cx u) givens) [])))))
+          (solve-improve-loop cx (into own given))))))
+
+(defun solve-improvable :private (d: Deferred) -> (Option Improvable)
+  (match (. d kind)
+    ((DkProto p args _) (if (> (count args) 1) (some (Improvable p args (. d pos))) nil))
+    (_ nil)))
+
+;; The first constraint of each `(protocol, zonked dispatch type)` is the
+;; representative; each later one has its determined arguments unified with
+;; it.
+(defun solve-improve-loop :private (cx: Cx preds: (Vec Improvable)) -> (Result bool TypeError)
+  (loop ((i 0) (seen (map-empty)) (changed false))
+    (if (< i (count preds))
+        (let ((pr (nth preds i))
+              (key (Pair (. pr proto) (cx-zonk cx (nth (. pr args) 0)))))
+          (if-some [j (get seen key)]
+            (try-let ((ch (solve-improve-pair cx (nth preds j) pr)))
+              (recur (+ i 1) seen (or changed ch)))
+            (recur (+ i 1) (assoc seen key i) changed)))
+        (Ok changed))))
+
+;; The determined arguments of `a` and `b` that differ are unified, at `b`'s
+;; position.
+(defun solve-improve-pair :private (cx: Cx a: Improvable b: Improvable) -> (Result bool TypeError)
+  (loop ((k 1) (changed false))
+    (if (< k (min (count (. a args)) (count (. b args))))
+        (let ((x (nth (. a args) k))
+              (y (nth (. b args) k)))
+          (if (= (cx-zonk cx x) (cx-zonk cx y))
+              (recur (+ k 1) changed)
+              (try-let ((_ (cx-unify cx x y (. b pos))))
+                (recur (+ k 1) true))))
+        (Ok changed))))

@@ -1,0 +1,148 @@
+;; compiler/tests/types/unit-polyrec.fib: crates/fibref/src/types/infer/polyrec.rs
+;; (it has no inline test; its behaviour is spec/types.md §3.6 and the comment
+;; at the head of the Rust file): a call at a type that grows its own variable
+;; around a cycle of occurrences is refused, with the message of the Rust code
+;; (naming the caller, "through" the callee when they differ, the type
+;; printed with the unit's rigid names); a plain permutation of the variables,
+;; a strict edge on no cycle, a call at a closed type and an occurrence whose
+;; instantiation or callee variables are not recorded are accepted; the first
+;; offending edge in the order of the unit's calls is the one reported; the
+;; type is zonked first; `reaches` and `poly-vars`.
+;; Build: fibc build compiler/tests/types/unit-polyrec.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.infer.unify types.infer.polyrec types.check))
+
+(defun pos-at (line: i64) -> Pos (Pos "t.fib" line 1 0 1))
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+(defun fun-def (name: str) -> FunDef
+  (FunDef name 2 [] nil [] (Expr 0 p0 (ELit LitUnit)) false p0))
+
+(defun cx-new () -> Cx
+  (Cx (globals-new) (env-new) (store-new) (tables-new) (unit-new)))
+
+(defun a () -> Ty (TRigid 0))
+(defun b () -> Ty (TRigid 1))
+(defun cell-of (t: Ty) -> Ty (ty-cell t))
+
+;; A call of `callee` from `caller` at `site`, line `line`.
+(defun call (caller: i64 callee: i64 site: i64 line: i64) -> PolyCall
+  (PolyCall caller callee site (pos-at line)))
+
+;; A unit holding the calls, the rigid variable of each callee variable
+;; (callee id, the rigid indexes of its variables) and the types each call
+;; instantiated its callee's variables with (site, the types).
+(defun unit-with (calls: (Vec PolyCall) vars: (Vec (Pair i64 (Vec i64))) insts: (Vec (Pair i64 (Vec Ty)))) -> Cx
+  (let ((cx (cx-new)))
+    (do (set! (. (. cx u) rigid-names) ["a" "b"])
+        (set! (. (. cx u) poly-calls) calls)
+        (set! (. (. cx u) poly-vars)
+              (reduce (fn (m: (Map i64 (Vec i64)) [k v]) (assoc m k v)) (map-empty) vars))
+        (set! (. (. cx t) instantiations)
+              (reduce (fn (m: (Map i64 Instantiation) [site tys]) (assoc m site (Instantiation tys [])))
+                      (map-empty) insts))
+        cx)))
+
+(defun members () -> (Vec FunDef) [(fun-def "f") (fun-def "g")])
+
+(defun run (cx: Cx) -> (Result unit TypeError)
+  (cx-check-polymorphic-recursion cx (members) [0 1]))
+(defun ok? (r: (Result unit TypeError)) -> bool (match r ((Ok _) true) (_ false)))
+(defun msg (r: (Result unit TypeError)) -> str (match r ((Err e) (. e message)) (_ "")))
+(defun err-line (r: (Result unit TypeError)) -> i64 (match r ((Err e) (. (. e pos) line)) (_ 0)))
+(defun err-kind (r: (Result unit TypeError)) -> ErrorKind (match r ((Err e) (. e kind)) (_ Resolve)))
+
+(defun tail () -> str ": polymorphic recursion is not supported; use loop or a List")
+
+(defun refused-tests (cs: Checks) -> unit
+  (do
+    (let ((r (run (unit-with [(call 0 0 10 3)] [(Pair 0 [0])] [(Pair 10 [(cell-of (a))])]))))
+      (do (check cs "f at (Cell a) from f is refused, with no `through`"
+                 (= (msg r) (str-join ["f recurses at (Cell a)" (tail)])))
+          (check cs "the error is of kind Other, at the call"
+                 (and (= (err-kind r) Other) (= (err-line r) 3)))))
+    (check cs "the callee's variable may be another one: a call of f at (Cell a) feeding b is a strict edge a -> b, no cycle, so accepted"
+           (ok? (run (unit-with [(call 0 0 10 3)] [(Pair 0 [1])] [(Pair 10 [(cell-of (a))])]))))
+    (check cs "a strict edge back to a variable that leads on to it: a -> b strict, b -> a plain, refused"
+           (= (msg (run (unit-with [(call 0 0 10 3) (call 0 0 11 4)] [(Pair 0 [1 0])]
+                                   [(Pair 10 [(cell-of (a)) (b)]) (Pair 11 [(a) (b)])])))
+              (str-join ["f recurses at (Cell a)" (tail)])))
+    (check cs "the type is zonked before it is compared"
+           (let ((cx (unit-with [(call 0 0 10 3)] [(Pair 0 [0])] [])))
+             (let ((v (cx-fresh cx)))
+               (do (cx-unify cx v (cell-of (a)) p0)
+                   (set! (. (. cx t) instantiations) (assoc @(. (. cx t) instantiations) 10 (Instantiation [v] [])))
+                   (= (msg (run cx)) (str-join ["f recurses at (Cell a)" (tail)]))))))
+    (check cs "the type is printed with the unit's rigid names"
+           (let ((cx (unit-with [(call 0 0 10 3)] [(Pair 0 [0])] [(Pair 10 [(cell-of (a))])])))
+             (do (set! (. (. cx u) rigid-names) ["elem"])
+                 (= (msg (run cx)) (str-join ["f recurses at (Cell elem)" (tail)])))))
+    (check cs "two members: f calls g at a growing type, g calls f at a plain one: refused through g"
+           (= (msg (run (unit-with [(call 0 1 10 3) (call 1 0 11 4)] [(Pair 1 [1]) (Pair 0 [0])]
+                                   [(Pair 10 [(cell-of (a))]) (Pair 11 [(b)])])))
+              (str-join ["f recurses through g at (Cell a)" (tail)])))
+    (check cs "the caller is the one whose body holds the occurrence: g's call is named g"
+           (= (msg (run (unit-with [(call 1 0 11 4) (call 0 1 10 3)] [(Pair 1 [1]) (Pair 0 [0])]
+                                   [(Pair 10 [(a)]) (Pair 11 [(cell-of (b))])])))
+              (str-join ["g recurses through f at (Cell b)" (tail)])))
+    (check cs "the first offending edge in the order of the calls is reported"
+           (let ((r (run (unit-with [(call 0 0 10 7) (call 0 0 11 9)] [(Pair 0 [0])]
+                                    [(Pair 10 [(cell-of (a))]) (Pair 11 [(cell-of (cell-of (a)))])]))))
+             (and (= (err-line r) 7) (= (msg r) (str-join ["f recurses at (Cell a)" (tail)])))))
+    (check cs "a later call is reported when the earlier ones are fine"
+           (let ((r (run (unit-with [(call 0 0 10 7) (call 0 0 11 9)] [(Pair 0 [0])]
+                                    [(Pair 10 [(a)]) (Pair 11 [(cell-of (cell-of (a)))])]))))
+             (and (= (err-line r) 9) (= (msg r) (str-join ["f recurses at (Cell (Cell a))" (tail)])))))
+    (check cs "a member that is not in ids is named `the function`"
+           (let ((r (cx-check-polymorphic-recursion
+                      (unit-with [(call 5 5 10 3)] [(Pair 5 [0])] [(Pair 10 [(cell-of (a))])]) (members) [0 1])))
+             (= (msg r) (str-join ["the function recurses at (Cell a)" (tail)]))))
+    (check cs "ids and members are matched by position"
+           (let ((r (cx-check-polymorphic-recursion
+                      (unit-with [(call 7 7 10 3)] [(Pair 7 [0])] [(Pair 10 [(cell-of (a))])]) (members) [4 7])))
+             (= (msg r) (str-join ["g recurses at (Cell a)" (tail)]))))))
+
+(defun accepted-tests (cs: Checks) -> unit
+  (do
+    (check cs "no calls: accepted" (ok? (run (cx-new))))
+    (check cs "a plain self edge (f at a): finitely many instances"
+           (ok? (run (unit-with [(call 0 0 10 3)] [(Pair 0 [0])] [(Pair 10 [(a)])]))))
+    (check cs "a call at a closed type draws no edge"
+           (ok? (run (unit-with [(call 0 0 10 3)] [(Pair 0 [0])] [(Pair 10 [(cell-of (ty-i64))])]))))
+    (check cs "a permutation of the variables is only plain edges"
+           (ok? (run (unit-with [(call 0 0 10 3)] [(Pair 0 [0 1])] [(Pair 10 [(b) (a)])]))))
+    (check cs "a strict edge on no cycle is finitely deep"
+           (ok? (run (unit-with [(call 0 1 10 3)] [(Pair 1 [1])] [(Pair 10 [(cell-of (a))])]))))
+    (check cs "an occurrence with no recorded instantiation draws no edge"
+           (ok? (run (unit-with [(call 0 0 10 3)] [(Pair 0 [0])] []))))
+    (check cs "an occurrence whose callee has no recorded variables draws no edge"
+           (ok? (run (unit-with [(call 0 0 10 3)] [] [(Pair 10 [(cell-of (a))])]))))
+    (check cs "variables beyond the instantiation's types are not paired (zip stops)"
+           (ok? (run (unit-with [(call 0 0 10 3)] [(Pair 0 [0 1])] [(Pair 10 [(a)])]))))))
+
+(defun edge (from: i64 to: i64) -> Edge (Edge from to false 0 (ty-i64)))
+
+(defun reaches-tests (cs: Checks) -> unit
+  (do
+    (check cs "reaches: a variable reaches itself" (reaches [] 3 3))
+    (check cs "reaches: no edges, no other variable" (not (reaches [] 3 4)))
+    (check cs "reaches: one edge" (reaches [(edge 1 2)] 1 2))
+    (check cs "reaches: edges are directed" (not (reaches [(edge 1 2)] 2 1)))
+    (check cs "reaches: a chain" (reaches [(edge 1 2) (edge 2 3) (edge 3 4)] 1 4))
+    (check cs "reaches: a cycle that does not hold the target ends" (not (reaches [(edge 1 2) (edge 2 1)] 1 5)))
+    (check cs "reaches: through a cycle to a branch" (reaches [(edge 1 2) (edge 2 1) (edge 2 6)] 1 6))))
+
+(defun vars-tests (cs: Checks) -> unit
+  (let ((m (reduce (fn (m: (Map str i64) [k v]) (assoc m k v)) (map-empty) [(Pair "a" 3) (Pair "b" 0)])))
+    (do
+      (check cs "poly-vars: the rigid index of each name, u32::MAX for one that is missing"
+             (= (poly-vars ["a" "z" "b"] m) [3 4294967295 0]))
+      (check cs "poly-vars: no names, no variables" (empty? (poly-vars [] m))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (refused-tests cs)
+        (accepted-tests cs)
+        (reaches-tests cs)
+        (vars-tests cs)
+        (finish cs))))

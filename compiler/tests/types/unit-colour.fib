@@ -1,0 +1,239 @@
+;; compiler/tests/types/unit-colour.fib: the two inline tests of crates/fibref/
+;; src/types/infer/colour.rs (rigid_colours_lie_between_send_and_local,
+;; the_fixpoint_raises_a_variable_to_the_join_of_its_sources), and what the
+;; Rust ones leave to the types: `Colours::value`, the index kept with each
+;; raised variable, `must_send`, `bounded_above`, the witness walk (a chain,
+;; an origin, a cycle), the text of the three colour errors, and
+;; `solve_colours` end to end (a capture that is not send, a rigid colour into
+;; send, a symbolic capture that becomes a `Send` bound or stays symbolic, a
+;; captured closure's colour).
+;; Build: fibc build compiler/tests/types/unit-colour.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.infer.send types.infer.colour types.check))
+
+(def p0: Pos (Pos "t" 1 1 0 0))
+(def rk: Colour (CRigid 0))
+(def rj: Colour (CRigid 1))
+
+(defun cv (i: i64) -> Colour (CVar i))
+(defun con (from: Colour to: Colour) -> ColourCon (ColourCon from to nil nil p0))
+(defun con-l (from: Colour to: Colour label: str) -> ColourCon (ColourCon from to (some label) nil p0))
+(defun cx-new () -> Cx (Cx (globals-new) (env-new) (store-new) (tables-new) (unit-new)))
+(defun fn0 (k: Colour) -> Ty (TFn k [] (ty-unit)))
+
+(defun the-error (r: (Result Colours TypeError)) -> (Option TypeError)
+  (match r ((Err e) (some e)) (_ nil)))
+
+(defun error-is (e: (Option TypeError) kind: ErrorKind msg: str) -> bool
+  (match e ((some x) (and (= (. x kind) kind) (= (. x message) msg))) (nil false)))
+
+(defun set-cons (cx: Cx cons: (Vec ColourCon)) -> unit
+  (set! (. (. cx u) colours) cons))
+
+(defun set-caps (cx: Cx caps: (Vec CapsCon)) -> unit
+  (set! (. (. cx u) caps) caps))
+
+(defun rust-tests (cs: Checks) -> unit
+  (let ((cons [(con CSend (cv 0)) (con rk (cv 1)) (con (cv 1) (cv 2)) (con rj (cv 2))])
+        (r (colour-raise cons)))
+    (do
+      (check cs "rigid colours lie between send and local"
+             (and (= (colour-join CSend rk) rk) (= (colour-join rk rk) rk)
+                  (= (colour-join rk rj) CLocal) (= (colour-join rk CLocal) CLocal)
+                  (colour-fits CSend rk) (colour-fits rk rk) (colour-fits rk CLocal)
+                  (not (colour-fits CLocal rk)) (not (colour-fits rj rk))
+                  (not (colour-fits rk CSend))))
+      (check cs "the fixpoint raises a variable to the join of its sources"
+             (and (= (colour-value-of (cv 0) r) CSend)
+                  (= (colour-value-of (cv 1) r) rk)
+                  (= (colour-value-of (cv 2) r) CLocal)
+                  (contains? (colour-bounded-above [(con (cv 3) rk)]) 3))))))
+
+(defun lattice-tests (cs: Checks) -> unit
+  (let ((cons [(con CSend (cv 0)) (con rk (cv 1)) (con (cv 1) (cv 2)) (con rj (cv 2))])
+        (r (colour-raise cons)))
+    (do
+      (check cs "join and fits at the other constants"
+             (and (= (colour-join CSend CSend) CSend) (= (colour-join CLocal CSend) CLocal)
+                  (= (colour-join CLocal CLocal) CLocal)
+                  (colour-fits CLocal CLocal) (colour-fits CLocal (cv 4)) (colour-fits rj (CGen 0))
+                  (colour-fits CSend CSend) (not (colour-fits CLocal CSend))))
+      (check cs "a raised variable keeps the constraint that raised it last"
+             (and (= (get r 1) (some (Pair rk 1)))
+                  (= (get r 2) (some (Pair CLocal 3)))
+                  (nil? (get r 0))))
+      (check cs "an unraised variable and a quantified colour are send"
+             (and (= (colour-value-of (cv 9) r) CSend) (= (colour-value-of (CGen 3) r) CSend)
+                  (= (colour-value-of CLocal r) CLocal) (= (colour-value-of rj r) rj)))
+      (check cs "the fixpoint reaches through a chain written backwards"
+             (let ((r2 (colour-raise [(con (cv 1) (cv 2)) (con (cv 0) (cv 1)) (con CLocal (cv 0))])))
+               (and (= (colour-value-of (cv 2) r2) CLocal) (= (get r2 2) (some (Pair CLocal 0))))))
+      (check cs "must-send: what reaches send along flows, not what reaches a rigid colour"
+             (let ((m (colour-must-send [(con (cv 0) (cv 1)) (con (cv 1) CSend) (con (cv 2) rk)
+                                         (con CLocal (cv 3)) (con (cv 4) (cv 0))])))
+               (and (contains? m 0) (contains? m 1) (contains? m 4)
+                    (not (contains? m 2)) (not (contains? m 3)) (= (set-count m) 3))))
+      (check cs "bounded-above: what reaches send or a rigid colour"
+             (let ((b (colour-bounded-above [(con (cv 0) (cv 1)) (con (cv 1) CSend) (con (cv 2) rk)
+                                             (con CLocal (cv 3))])))
+               (and (contains? b 0) (contains? b 1) (contains? b 2) (not (contains? b 3))
+                    (= (set-count b) 3)))))))
+
+(defun colours-of (raised: (Map i64 Colour) must: (Set i64)) -> Colours
+  (Colours raised must [] []))
+
+(defun value-tests (cs: Checks) -> unit
+  (let ((c (colours-of (assoc (map-empty) 0 CLocal) (conj (set-empty) 1))))
+    (check cs "Colours.value: raised, must-send, free, constants"
+           (and (= (colours-value c (cv 0)) CLocal) (= (colours-value c (cv 1)) CSend)
+                (= (colours-value c (cv 2)) (cv 2)) (= (colours-value c rk) rk)
+                (= (colours-value c CSend) CSend)))))
+
+(defun witness-tests (cs: Checks) -> unit
+  (let ((w0 (Witness ["capture x"] (ty-cell (ty-i64))))
+        (cons [(ColourCon CLocal (cv 0) (some "a") (some w0) p0)
+               (con-l (cv 0) (cv 1) "b")
+               (con (cv 1) CSend)])
+        (raised (colour-raise cons)))
+    (do
+      (check cs "witness: the chain back to the forcing capture, labels first, then the origin"
+             (let ((w (colour-witness cons raised (nth cons 2))))
+               (and (= (. w path) ["b" "a" "capture x"]) (= (. w offending) (ty-cell (ty-i64))))))
+      (check cs "witness without an origin: a unit closure of the source colour"
+             (let ((w (colour-witness [(con rk CSend)] (map-empty) (con rk CSend))))
+               (and (empty? (. w path)) (= (. w offending) (fn0 rk)))))
+      (check cs "witness through a cycle stops after count+1 steps"
+             (let ((cyc [(con-l (cv 0) (cv 1) "a") (con-l (cv 1) (cv 0) "b")])
+                   (rs (assoc (assoc (map-empty) 0 (Pair CLocal 1)) 1 (Pair CLocal 0)))
+                   (w (colour-witness cyc rs (nth cyc 0))))
+               (and (= (. w path) ["a" "b" "a"]) (= (. w offending) (fn0 (cv 1)))))))))
+
+(defun error-tests (cs: Checks) -> unit
+  (let ((g (globals-new))
+        (w (Witness ["field f of S"] (fn0 CLocal)))
+        (w0 (Witness [] (fn0 rk))))
+    (do
+      (check cs "a local closure where a rigid colour is required"
+             (let ((e (colour-error g w CLocal rk p0 ["k"])))
+               (and (= (. e kind) RigidColour)
+                    (= (. e message) "local closure where colour k is required: field f of S has type (fn :local () unit)"))))
+      (check cs "a rigid colour where send is required"
+             (= (. (colour-error g w0 rk CSend p0 ["k"]) message)
+                "closure of colour k cannot be shared between threads: the value"))
+      (check cs "one rigid colour where another is required"
+             (= (. (colour-error g w0 rj rk p0 ["k" "j"]) message)
+                "closure of colour j where colour k is required: the value"))
+      (check cs "an unnamed rigid colour prints as kappa"
+             (= (. (colour-error g w0 rj rk p0 []) message)
+                "closure of colour κ1 where colour κ0 is required: the value")))))
+
+(defun solve-tests (cs: Checks) -> unit
+  (do
+    ;; a Cell captured into a closure that must be send
+    (let ((cx (cx-new)) (s (cx-fresh cx)) (k (store-fresh-colour (. cx st))))
+      (do (set-caps cx [(CapsCon k (ty-cell (ty-i64)) "capture x" p0)])
+          (set-cons cx [(con k CSend)])
+          (check cs "a captured cell makes the colour local, and local into send is the cell error"
+                 (error-is (the-error (cx-solve-colours cx)) CellNotSend
+                           "cell cannot be shared between threads: capture x has type (Cell i64)"))
+          (check cs "the caps are consumed, the rewritten constraint comes first"
+                 (and (empty? @(. (. cx u) caps)) (= (count @(. (. cx u) colours)) 2)
+                      (= (. (nth @(. (. cx u) colours) 1) from) CLocal)
+                      (= (. (nth @(. (. cx u) colours) 1) to) k)))))
+    ;; a capture of an i64: nothing to constrain
+    (let ((cx (cx-new)) (k (store-fresh-colour (. cx st))))
+      (do (set-caps cx [(CapsCon k (ty-i64) "x" p0)])
+          (set-cons cx [(con k CSend)])
+          (check cs "a captured i64 adds no constraint and the unit solves"
+                 (match (cx-solve-colours cx)
+                   ((Ok c) (and (= (count @(. (. cx u) colours)) 1) (empty? (. c symbolic))
+                                (= (colours-value c k) CSend)
+                                (= (. c flows) [(Pair k CSend)])))
+                   (_ false)))))
+    ;; a rigid colour flowing into send
+    (let ((cx (cx-new)))
+      (do (set! (. (. cx u) rigid-names) ["k"])
+          (set-cons cx [(con rk CSend)])
+          (check cs "a rigid colour into send is a RigidColour error"
+                 (error-is (the-error (cx-solve-colours cx)) RigidColour
+                           "closure of colour k cannot be shared between threads: the value"))))
+    ;; a local closure into a rigid colour
+    (let ((cx (cx-new)) (k (store-fresh-colour (. cx st))))
+      (do (set! (. (. cx u) rigid-names) ["k"])
+          (set-cons cx [(ColourCon CLocal k nil (some (Witness ["capture f"] (fn0 CLocal))) p0)
+                        (con k rk)])
+          (check cs "a local closure where a rigid colour is required"
+                 (error-is (the-error (cx-solve-colours cx)) RigidColour
+                           "local closure where colour k is required: capture f has type (fn :local () unit)"))))
+    ;; the first failing constraint is the error, in order
+    (let ((cx (cx-new)))
+      (do (set! (. (. cx u) rigid-names) ["k" "j"])
+          (set-cons cx [(con rj CSend) (con rk CSend)])
+          (check cs "the first failing constraint is reported"
+                 (error-is (the-error (cx-solve-colours cx)) RigidColour
+                           "closure of colour j cannot be shared between threads: the value"))))
+    ;; a symbolic capture below send becomes a Send bound; below nothing it stays
+    (let ((cx (cx-new)) (a (cx-fresh cx)) (k (store-fresh-colour (. cx st)))
+          (k2 (store-fresh-colour (. cx st))))
+      (do (set-caps cx [(CapsCon k a "capture a" (Pos "t" 4 5 0 0)) (CapsCon k2 a "capture b" p0)])
+          (set-cons cx [(con k CSend)])
+          (check cs "a symbolic capture of a send colour is a Send bound, a free one stays symbolic"
+                 (match (cx-solve-colours cx)
+                   ((Ok c) (let ((d @(. (. cx u) deferred)))
+                             (and (= (count d) 1)
+                                  (match (. (nth d 0) kind)
+                                    ((DkSend t path) (and (= t a) (= path ["capture a"])))
+                                    (_ false))
+                                  (= (. (. (nth d 0) pos) line) 4)
+                                  (= (. c symbolic) [(Pair k2 a)])
+                                  (= (colours-value c k) CSend))))
+                   (_ false)))))
+    ;; a captured closure's colour variable flows into the closure's colour
+    (let ((cx (cx-new)) (k (store-fresh-colour (. cx st))) (k2 (store-fresh-colour (. cx st))))
+      (do (set-caps cx [(CapsCon k (TFn k2 [] (ty-i64)) "capture g" p0)])
+          (set-cons cx [(con CLocal k2)])
+          (check cs "a captured closure's colour variable flows into the capturing colour"
+                 (match (cx-solve-colours cx)
+                   ((Ok c) (let ((cons @(. (. cx u) colours)))
+                             (and (= (count cons) 2)
+                                  (= (. (nth cons 1) from) k2) (= (. (nth cons 1) to) k)
+                                  (= (. (nth cons 1) label) (some "capture g"))
+                                  (= (colours-value c k) CLocal)
+                                  (= (colours-value c k2) CLocal)
+                                  (= (. c flows) [(Pair CLocal k2) (Pair k2 k)]))))
+                   (_ false)))))
+    ;; a symbolic capture below a rigid colour is a Send bound too, one below local is dropped
+    (let ((cx (cx-new)) (a (cx-fresh cx)) (k (store-fresh-colour (. cx st))))
+      (do (set! (. (. cx u) rigid-names) ["k"])
+          (set-caps cx [(CapsCon k a "capture a" p0)])
+          (set-cons cx [(con k rk)])
+          (check cs "a symbolic capture below a rigid colour is a Send bound"
+                 (match (cx-solve-colours cx)
+                   ((Ok c) (and (= (count @(. (. cx u) deferred)) 1) (empty? (. c symbolic))
+                                (= (colours-value c k) k)))
+                   (_ false)))))
+    (let ((cx (cx-new)) (a (cx-fresh cx)) (k (store-fresh-colour (. cx st))))
+      (do (set-caps cx [(CapsCon k a "capture a" p0)])
+          (set-cons cx [(con CLocal k)])
+          (check cs "a symbolic capture of a local colour is dropped"
+                 (match (cx-solve-colours cx)
+                   ((Ok c) (and (= (count @(. (. cx u) deferred)) 0) (empty? (. c symbolic))
+                                (= (colours-value c k) CLocal)))
+                   (_ false)))))
+    ;; a local captured closure into a send colour
+    (let ((cx (cx-new)) (k (store-fresh-colour (. cx st))))
+      (do (set-caps cx [(CapsCon k (fn0 CLocal) "capture h" p0)])
+          (set-cons cx [(con k CSend)])
+          (check cs "a captured local closure into send is the value error"
+                 (error-is (the-error (cx-solve-colours cx)) ValueNotSend
+                           "value of type (fn :local () unit) cannot be shared between threads: capture h"))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (rust-tests cs)
+        (lattice-tests cs)
+        (value-tests cs)
+        (witness-tests cs)
+        (error-tests cs)
+        (solve-tests cs)
+        (finish cs))))

@@ -1,8 +1,8 @@
 ;; compiler/types/infer/deps.fib: the dependency graph and its strongly connected components (package P10).
 ;; Replaces crates/fibref/src/types/infer/deps.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;; The signatures are the Rust ones (Form is Stx, `&mut Vec` the Cell of a Vec,
+;; an id an i64); the order of the SCCs and of their members is the Rust one:
+;; dependencies first, a component's members and its ties in source order.
 (ns types.infer.deps
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls))
 
@@ -11,10 +11,71 @@
 (defenum Node (NFun fun: i64) (NDef def: i64))
 (derive Eq Node) (derive Hash Node)
 
-;; Rust: infer/deps.rs:19 refs
+;; Rust: infer/deps.rs:19 refs. The functions and defs `e` names, each once, in
+;; the order they are first met.
 (defun deps-refs (e: Expr out: (Cell (Vec Node))) -> unit
-  (trap "todo: deps-refs"))
+  (do (match (. e kind)
+        ((EGlobal (GFun f)) (deps-push out (NFun f)))
+        ((EGlobal (GDef d)) (deps-push out (NDef d)))
+        (_ ()))
+      (doseq (c (expr-children e)) (deps-refs c out))))
 
-;; Rust: infer/deps.rs:36 sccs
+(defun deps-push :private (out: (Cell (Vec Node)) n: Node) -> unit
+  (when-not (includes? n @out)
+    (set! out (conj @out n))))
+
+;; ---- Tarjan
+
+;; The state of the walk: the visit number and the low link of every node
+;; reached, the stack and its members, the visit counter and the components
+;; found (Rust `Tarjan`; the edges are a parameter, not a field).
+(defstruct Tarjan
+  (index: (Cell (Map Node i64)) low: (Cell (Map Node i64)) stack: (Cell (Vec Node))
+   on: (Cell (Set Node)) clock: (Cell i64) out: (Cell (Vec (Vec Node)))))
+
+(defun tarjan-new () -> Tarjan
+  (Tarjan (cell (map-empty)) (cell (map-empty)) (cell []) (cell (set-empty)) (cell 0) (cell [])))
+
+;; Rust: infer/deps.rs:36 sccs. The SCCs of `nodes` (in source order), whose
+;; edges are given by `edges`, dependencies first; the members of a component
+;; in the order of `nodes` (a node not in `nodes` first).
 (defun deps-sccs (nodes: (Vec Node) edges: (Map Node (Vec Node))) -> (Vec (Vec Node))
-  (trap "todo: deps-sccs"))
+  (let ((t (tarjan-new))
+        (pos (reduce (fn (m: (Map Node i64) [i n]) (assoc m n i))
+                     (map-empty) (zip (range (count nodes)) nodes))))
+    (do (doseq (n nodes)
+          (when-not (contains? @(. t index) n) (tarjan-visit t edges n)))
+        (mapv (fn (scc: (Vec Node)) (vec (sort-by (fn (n: Node) (get-or pos n -1)) scc)))
+              @(. t out)))))
+
+(defun tarjan-visit :private (t: Tarjan edges: (Map Node (Vec Node)) v: Node) -> unit
+  (let ((n @(. t clock)))
+    (do (set! (. t index) (assoc @(. t index) v n))
+        (set! (. t low) (assoc @(. t low) v n))
+        (set! (. t clock) (+ n 1))
+        (set! (. t stack) (conj @(. t stack) v))
+        (set! (. t on) (conj @(. t on) v))
+        (doseq (w (get-or edges v []))
+          (if (contains? @(. t index) w)
+              (when (contains? @(. t on) w)
+                (tarjan-lower t v (tarjan-number @(. t index) w)))
+              (do (tarjan-visit t edges w)
+                  (tarjan-lower t v (tarjan-number @(. t low) w)))))
+        (when (= (tarjan-number @(. t low) v) (tarjan-number @(. t index) v))
+          (tarjan-emit t v)))))
+
+(defun tarjan-number :private (m: (Map Node i64) n: Node) -> i64
+  (unwrap (get m n)))
+
+(defun tarjan-lower :private (t: Tarjan v: Node x: i64) -> unit
+  (set! (. t low) (update @(. t low) v (fn (l: i64) (min l x)))))
+
+;; Pops the stack down to v: they are a component, last pushed first.
+(defun tarjan-emit :private (t: Tarjan v: Node) -> unit
+  (loop ((scc []))
+    (let ((w (unwrap (peek @(. t stack)))))
+      (do (set! (. t stack) (pop @(. t stack)))
+          (set! (. t on) (disj @(. t on) w))
+          (if (= w v)
+              (set! (. t out) (conj @(. t out) (conj scc w)))
+              (recur (conj scc w)))))))

@@ -1,0 +1,107 @@
+;; compiler/tests/types/unit-general-close.fib: `cx-close` of
+;; crates/fibref/src/types/infer/general.rs (steps c-e of §3.5), the part of
+;; general.rs that calls the solver (types.infer.solve, types.infer.colour):
+;; the variables each root holds (and those a protocol constraint determines),
+;; what stays as a constraint with its method site, an ambiguous constraint,
+;; an unresolved field, a `Send`/`Object`/`Weakable` on a variable no root holds
+;; becoming `i64` (and its constraint solved), a stuck `Send` on a structure
+;; reduced to its variable, and the colour solution handed on.
+;; Build: fibc build compiler/tests/types/unit-general-close.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.infer.colour types.infer.general types.check))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+(defun pos-at (line: i64) -> Pos (Pos "t.fib" line 1 0 1))
+
+(defun proto-cx () -> Cx
+  (let ((cx (Cx (globals-new) (env-new) (store-new) (tables-new) (unit-new))))
+    (do (table-add (. (. cx g) protos) (ProtoDef "Show" 2 [] [] [] p0))
+        cx)))
+
+(defun v (i: i64) -> Ty (TVar i))
+(defun deferred (kind: DKind line: i64 site: (Option i64)) -> Deferred (Deferred kind (pos-at line) site "f"))
+(defun set-deferred (cx: Cx ds: (Vec Deferred)) -> unit (set! (. (. cx u) deferred) ds))
+(defun root (params: (Vec Ty)) -> Ty (TFn CSend params (ty-unit)))
+
+(defun closed-of (r: (Result Closed TypeError)) -> Closed
+  (match r ((Ok c) c) (_ (Closed [] (Colours (map-empty) (set-empty) [] []) []))))
+(defun err-of (r: (Result Closed TypeError)) -> (Option TypeError)
+  (match r ((Err e) (some e)) (_ nil)))
+
+(defun hold-tests (cs: Checks) -> unit
+  (let ((cx (proto-cx)))
+    (do
+      (let ((c (closed-of (cx-close cx [(root [(v 1)]) (root [(TCon KArray [(v 2) (v 1)])])]))))
+        (check cs "close: each root holds its own variables, in order"
+               (= (. c sets) [[(KeyVar 1)] [(KeyVar 2) (KeyVar 1)]])))
+      (check cs "close: no roots, no sets"
+             (empty? (. (closed-of (cx-close (proto-cx) [])) sets)))
+      (let ((cx (proto-cx)))
+        (do (set-deferred cx [(deferred (DkProto 0 [(v 1) (v 7)] nil) 3 (some 5))])
+            (let ((c (closed-of (cx-close cx [(root [(v 1)])]))))
+              (do (check cs "close: a protocol constraint determines the variables of its other arguments for the root"
+                         (= (. c sets) [[(KeyVar 1) (KeyVar 7)]]))
+                  (check cs "close: a stuck protocol constraint stays, as a predicate with its method site"
+                         (and (= (count (. c preds)) 1)
+                              (= (. (nth (. c preds) 0) fst) (PProto 0 [(v 1) (v 7)]))
+                              (= (. (nth (. c preds) 0) snd) (some 5))))))))
+      (let ((cx (proto-cx)))
+        (do (set-deferred cx [(deferred (DkSend (v 1) []) 3 nil)])
+            (let ((c (closed-of (cx-close cx [(root [(v 1)])]))))
+              (check cs "close: a Send on a variable of a root stays, with no site"
+                     (and (= (count (. c preds)) 1) (= (. (nth (. c preds) 0) fst) (PSend (v 1)))
+                          (nil? (. (nth (. c preds) 0) snd))))))))))
+
+(defun error-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (proto-cx)))
+      (do (set-deferred cx [(deferred (DkProto 0 [(v 3)] nil) 7 nil)])
+          (let ((e (err-of (cx-close cx [(root [(v 1)])]))))
+            (check cs "close: a protocol constraint on a variable no root holds is ambiguous, at its position"
+                   (and (some? e)
+                        (= (. (unwrap e) kind) Ambiguous) (= (. (. (unwrap e) pos) line) 7)
+                        (= (. (unwrap e) message) "ambiguous constraint Show a in f; add an annotation"))))))
+    (let ((cx (proto-cx)))
+      (do (set-deferred cx [(deferred (DkField (v 1) "x" (v 2) "p") 4 nil)])
+          (let ((e (err-of (cx-close cx [(root [(v 1)])]))))
+            (check cs "close: a field of a struct that is still unknown is reported"
+                   (and (some? e) (= (. (unwrap e) kind) FieldUnresolved)
+                        (= (. (unwrap e) message) "cannot infer the struct type of p for field x; annotate it"))))))
+    (let ((cx (proto-cx)))
+      (do (set-deferred cx [(deferred (DkFloat (v 1)) 4 nil)])
+          (let ((e (err-of (cx-close cx [(root [(v 1)])]))))
+            (check cs "close: a float of unknown type is reported with the variable's letter"
+                   (and (some? e) (= (. (unwrap e) message) "cannot infer which float type a is; annotate it"))))))))
+
+(defun default-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (proto-cx)))
+      (do (set-deferred cx [(deferred (DkSend (v 4) []) 3 nil) (deferred (DkWeakable (v 5)) 4 nil)])
+          (let ((c (closed-of (cx-close cx [(root [(v 1)])]))))
+            (do (check cs "close: a Send or Weakable on a variable no root holds makes it i64"
+                       (and (= (store-zonk (. cx st) (v 4)) (ty-i64))
+                            (= (store-zonk (. cx st) (v 5)) (ty-i64))))
+                (check cs "close: and the constraints on it are solved, none is left"
+                       (empty? (. c preds)))))))
+    (let ((cx (proto-cx)))
+      (do (set-deferred cx [(deferred (DkSend (TCon KArray [(v 2)]) []) 3 (some 9))])
+          (let ((c (closed-of (cx-close cx [(root [(v 2)])]))))
+            (check cs "close: a stuck Send on a structure is reduced to its variables (the site is kept)"
+                   (and (= (count (. c preds)) 1) (= (. (nth (. c preds) 0) fst) (PSend (v 2)))
+                        (= (. (nth (. c preds) 0) snd) (some 9)))))))))
+
+(defun colour-tests (cs: Checks) -> unit
+  (let ((cx (proto-cx)))
+    (do (set! (. (. cx u) colours)
+              [(ColourCon (CVar 1) (CVar 2) nil nil p0)])
+        (let ((c (closed-of (cx-close cx [(TFn (CVar 1) [] (ty-unit))]))))
+          (check cs "close: the colour solution is handed on (the flows are the constraints)"
+                 (= (. (. c colours) flows) [(Pair (CVar 1) (CVar 2))]))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (hold-tests cs)
+        (error-tests cs)
+        (default-tests cs)
+        (colour-tests cs)
+        (finish cs))))

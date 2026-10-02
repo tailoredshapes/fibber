@@ -1,10 +1,31 @@
 ;; compiler/types/infer/colour.fib: colour inference (package P9).
 ;; Replaces crates/fibref/src/types/infer/colour.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; Solving closure colours (spec/types.md §5.4), after the unit's type
+;; constraints:
+;; 1. each `ς ⊒ Caps{T}` is rewritten: `Send T` false gives `local ⊑ ς`
+;;    remembering the capture; a captured closure's colour `κ` gives `κ ⊑ ς`;
+;;    a type variable keeps the symbolic `ς ⊒ send-of(a)`;
+;; 2. least fixpoint: every colour variable starts `send` and is raised to the
+;;    join of what flows into it, in the lattice `send ⊑ k ⊑ local` where `k`
+;;    is a rigid colour of an `impl` head (two distinct rigid colours join to
+;;    `local`);
+;; 3. every constraint whose right side is a constant is checked: `κ ⊑ send`
+;;    needs `κ` send (the error of §5.3), `κ ⊑ k` needs `κ` send or `k`; the
+;;    witness is found by walking the `⊑` chain back to the forcing capture;
+;; 4. a variable bounded above by a constant (it reaches `send` or a rigid
+;;    colour along `⊑`) and not forced `local` turns its symbolic constraints
+;;    into `Send a` bounds; the others stay for generalisation.
+;;
+;; Shapes: the Rust functions private to colour.rs are public here (`colour-`
+;; prefixed) so that compiler/tests/types/unit-colour.fib can reach them, as
+;; the inline tests of colour.rs do. `Raised` (a `HashMap<CvId, (Colour,
+;; usize)>`) is `(Map i64 (Pair Colour i64))`; the fixpoints are one `loop`
+;; that restarts its pass while it changed something.
 (ns types.infer.colour
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:require [fib.string :as str])
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.display types.infer.cx types.infer.send))
 
 ;; Rust `Colours` (infer/colour.rs:33): the colours raised, the colour
 ;; variables that must be send, and the constraints kept symbolic.
@@ -12,10 +33,189 @@
   (raised: (Map i64 Colour) must-send: (Set i64)
    symbolic: (Vec (Pair Colour Ty)) flows: (Vec (Pair Colour Colour))))
 
-;; Rust: infer/colour.rs:48 Colours::value
+;; Rust: infer/colour.rs:48 Colours::value. The value of a colour under the
+;; solution: `local`, a rigid colour, `send`, or the variable itself when it
+;; is still free.
 (defun colours-value (c: Colours k: Colour) -> Colour
-  (trap "todo: colours-value"))
+  (match k
+    ((CVar v)
+     (if-some [r (get (. c raised) v)]
+       r
+       (if (contains? (. c must-send) v) CSend k)))
+    (_ k)))
 
-;; Rust: infer/colour.rs:64 solve_colours
+;; ---- the lattice
+
+;; The join in `send ⊑ k ⊑ local`, `k` any rigid colour.
+(defun colour-join (a: Colour b: Colour) -> Colour
+  (cond ((= a CSend) b) ((= b CSend) a) ((= a b) a) (else CLocal)))
+
+;; Whether a colour of value `from` may flow into `to`.
+(defun colour-fits (from: Colour to: Colour) -> bool
+  (match to
+    ((CSend) (= from CSend))
+    ((CRigid _) (or (= from CSend) (= from to)))
+    (_ true)))
+
+;; The value of `k` under the fixpoint: a constant, a raised variable's
+;; value, `send` for any other variable.
+(defun colour-value-of (k: Colour raised: (Map i64 (Pair Colour i64))) -> Colour
+  (match k
+    ((CVar v) (if-some [p (get raised v)] (. p fst) CSend))
+    ((CGen _) CSend)
+    (_ k)))
+
+;; ---- the fixpoints
+
+;; Step 2, the least fixpoint: each raised variable's value and the index of
+;; the constraint that raised it last.
+(defun colour-raise (cons: (Vec ColourCon)) -> (Map i64 (Pair Colour i64))
+  (loop ((raised (map-empty)) (i 0) (changed false))
+    (if (< i (count cons))
+        (let ((c (nth cons i)))
+          (match (. c to)
+            ((CVar t)
+             (let ((old (colour-value-of (. c to) raised))
+                   (new (colour-join old (colour-value-of (. c from) raised))))
+               (if (= new old)
+                   (recur raised (+ i 1) changed)
+                   (recur (assoc raised t (Pair new i)) (+ i 1) true))))
+            (_ (recur raised (+ i 1) changed))))
+        (if changed (recur raised 0 false) raised))))
+
+;; The variables from which `send` (and, with `rigid`, a rigid colour too) is
+;; reachable along `⊑`.
+(defun colour-reach :private (cons: (Vec ColourCon) rigid: bool) -> (Set i64)
+  (loop ((found (set-empty)) (i 0) (changed false))
+    (if (< i (count cons))
+        (let ((c (nth cons i))
+              (hit (match (. c to)
+                     ((CSend) true)
+                     ((CRigid _) rigid)
+                     ((CVar v) (contains? found v))
+                     (_ false))))
+          (match (. c from)
+            ((CVar f) (if (and hit (not (contains? found f)))
+                          (recur (conj found f) (+ i 1) true)
+                          (recur found (+ i 1) changed)))
+            (_ (recur found (+ i 1) changed))))
+        (if changed (recur found 0 false) found))))
+
+;; Variables from which `send` is reachable along `⊑`.
+(defun colour-must-send (cons: (Vec ColourCon)) -> (Set i64)
+  (colour-reach cons false))
+
+;; Variables from which a constant `send` or rigid colour is reachable along
+;; `⊑`: bounded above, so not free to become `local`.
+(defun colour-bounded-above (cons: (Vec ColourCon)) -> (Set i64)
+  (colour-reach cons true))
+
+;; ---- errors and witnesses
+
+;; The error of a flow into a rigid colour, or of a rigid colour into `send`
+;; (§1.3, §5.4).
+(defun colour-error (g: Globals w: Witness from: Colour to: Colour pos: Pos names: (Vec str)) -> TypeError
+  (let ((p (printer-with-names g [] names))
+        (path (if (empty? (. w path)) "the value" (str/join ", " (. w path)))))
+    (type-error RigidColour pos
+      (cond ((= from CLocal)
+             (str-join ["local closure where colour " (printer-colour p to) " is required: "
+                        path " has type " (printer-ty p (. w offending))]))
+            ((= to CSend)
+             (str-join ["closure of colour " (printer-colour p from)
+                        " cannot be shared between threads: " path]))
+            (else
+             (str-join ["closure of colour " (printer-colour p from) " where colour "
+                        (printer-colour p to) " is required: " path]))))))
+
+;; Walks the `⊑` chain back from `c` to the constraint that raised its
+;; source, collecting path steps (at most `count cons + 1` of them, so a
+;; cycle cannot loop).
+(defun colour-witness (cons: (Vec ColourCon) raised: (Map i64 (Pair Colour i64)) c: ColourCon) -> Witness
+  (loop ((cur c) (path []) (n 0))
+    (if (> n (count cons))
+        (witness-end cur path)
+        (let ((path2 (if-some [l (. cur label)] (conj path l) path)))
+          (match (. cur from)
+            ((CVar v) (if-some [p (get raised v)]
+                        (recur (nth cons (. p snd)) path2 (+ n 1))
+                        (witness-end cur path2)))
+            (_ (witness-end cur path2)))))))
+
+;; The witness once the walk has stopped at `cur`.
+(defun witness-end :private (cur: ColourCon path: (Vec str)) -> Witness
+  (match (. cur origin)
+    ((some w) (Witness (into path (. w path)) (. w offending)))
+    (nil (Witness path (TFn (. cur from) [] (ty-unit))))))
+
+;; ---- the solver
+
+;; A `ς ⊒ Caps{T}` that stays symbolic in `T`: a variable `v` of `T` with the
+;; path to it (Rust's tuple `(Colour, Ty, Vec<String>, Pos)`).
+(defstruct SymCap (colour: Colour ty: Ty path: (Vec str) pos: Pos))
+
+(defun push-colour-con :private (cx: Cx c: ColourCon) -> unit
+  (set! (. (. cx u) colours) (conj @(. (. cx u) colours) c)))
+
+;; Step 1: each `ς ⊒ Caps{T}` becomes `local ⊑ ς` (with its witness) when
+;; `Send T` fails, `κ ⊑ ς` for each colour variable in `T`; what depends on a
+;; type variable is returned as symbolic. Empties the unit's `caps`.
+(defun rewrite-caps :private (cx: Cx) -> (Vec SymCap)
+  (let ((caps @(. (. cx u) caps)))
+    (do (set! (. (. cx u) caps) [])
+        (reduce (fn (sym c: CapsCon) (rewrite-cap cx sym c)) [] caps))))
+
+(defun rewrite-cap :private (cx: Cx sym: (Vec SymCap) c: CapsCon) -> (Vec SymCap)
+  (match (send-eval (. cx g) (. cx st) (. c ty) [(. c label)])
+    ((Err w)
+     (do (push-colour-con cx (ColourCon CLocal (. c colour) nil (some w) (. c pos)))
+         sym))
+    ((Ok needs)
+     (do (doseq [p (. needs colours)]
+           (push-colour-con cx (ColourCon (. p fst) (. c colour) (some (str/join ", " (. p snd)))
+                                          nil (. c pos))))
+         (into sym (for [p (. needs vars)] (SymCap (. c colour) (. p fst) (. p snd) (. c pos))))))))
+
+;; Step 3: every constraint into a constant holds; the first that does not is
+;; the error.
+(defun colour-check-bounds :private (cx: Cx cons: (Vec ColourCon) raised: (Map i64 (Pair Colour i64))) -> (Result unit TypeError)
+  (match (find-map (fn (c: ColourCon) (bound-error cx cons raised c)) cons)
+    ((some e) (Err e))
+    (nil (Ok ()))))
+
+(defun bound-error :private (cx: Cx cons: (Vec ColourCon) raised: (Map i64 (Pair Colour i64)) c: ColourCon) -> (Option TypeError)
+  (let ((from (colour-value-of (. c from) raised)))
+    (if (colour-fits from (. c to))
+        nil
+        (let ((w (colour-witness cons raised c))
+              (names @(. (. cx u) rigid-names)))
+          (some (if (and (= from CLocal) (= (. c to) CSend))
+                    (send-error (. cx g) w (. c pos) names)
+                    (colour-error (. cx g) w from (. c to) (. c pos) names)))))))
+
+;; Step 4 for one symbolic capture: a `Send v` bound when its colour is send
+;; or bounded above, nothing when it is local, else it stays symbolic.
+(defun settle-cap :private (cx: Cx base: Colours bounded: (Set i64) keep: (Vec (Pair Colour Ty)) s: SymCap) -> (Vec (Pair Colour Ty))
+  (let ((k (. s colour))
+        (bound? (match k ((CVar c) (contains? bounded c)) (_ false))))
+    (match (colours-value base k)
+      ((CLocal) keep)
+      ((CSend) (do (cx-defer cx (DkSend (. s ty) (. s path)) (. s pos) nil) keep))
+      (_ (if bound?
+             (do (cx-defer cx (DkSend (. s ty) (. s path)) (. s pos) nil) keep)
+             (conj keep (Pair k (. s ty))))))))
+
+;; Rust: infer/colour.rs:64 solve_colours. Solves the unit's colour
+;; constraints; adds `Send a` constraints for the symbolic captures of
+;; closures that must be `send` (or stay below a rigid colour).
 (defun cx-solve-colours (cx: Cx) -> (Result Colours TypeError)
-  (trap "todo: cx-solve-colours"))
+  (let ((symbolic (rewrite-caps cx))
+        (cons @(. (. cx u) colours))
+        (raised (colour-raise cons)))
+    (try-let ((_ (colour-check-bounds cx cons raised)))
+      (let ((bounded (colour-bounded-above cons))
+            (flows (mapv (fn (c: ColourCon) (Pair (. c from) (. c to))) cons))
+            (base (Colours (reduce-kv (fn (m v p) (assoc m v (. p fst))) (map-empty) raised)
+                           (colour-must-send cons) [] flows))
+            (kept (reduce (fn (keep s) (settle-cap cx base bounded keep s)) [] symbolic)))
+        (Ok (Colours (. base raised) (. base must-send) kept flows))))))

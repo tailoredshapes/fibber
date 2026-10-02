@@ -1,0 +1,462 @@
+;; compiler/tests/types/unit-solve.fib: crates/fibref/src/types/infer/solve.rs
+;; has no inline tests, so these programs are written from its doc comments:
+;; the worklist run to a fixpoint (stuck stays, solved goes, the first error
+;; stops, `progress |= improve`), a protocol constraint at a variable, a rigid
+;; variable (given or not), a trait object of the protocol itself, `Send` (the
+;; open variables, the givens, the colour constraints it leaves), `Object`,
+;; `Weakable`, a field, a dereference, a float, improvement, and the vector
+;; pattern the solver settles. What needs an instance or a supertrait (the
+;; bodies of `fixed-colours` and `super-closure`, package P4) is in
+;; unit-solve-inst.fib.
+;; Build: fibc build compiler/tests/types/unit-solve.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.infer.cx types.infer.unify types.infer.send types.infer.solve types.check))
+
+(def p0: Pos (Pos "t" 1 1 0 0))
+
+(defun tdef (name: str module: i64 params: (Vec str) shape: TypeShape) -> TypeDef
+  (TypeDef name module params [] shape p0))
+
+(defun fld (name: str t: Ty) -> FieldDef (FieldDef name t))
+
+;; The prelude types of the checker's own tests: 0 Option, 1 Vec, 2 Pair, 3
+;; Triple; 4 `S a` (a struct, in main), 5 `E` (a field-less enum), 6 a `Pair` of
+;; main's own; protocols
+;; 0 `Show`, 1 `Conv d` (method 1 mentions Self elsewhere than the receiver).
+(defun world-without-vec () -> Globals
+  (let ((g (globals-new))
+        (sch (Scheme 0 0 [] [] [] (ty-unit) [] [])))
+    (do (table-add (. g types)
+          (tdef "Option" 1 ["a"] (TsEnum [(VariantDef "None" []) (VariantDef "Some" [(fld "0" (TGen 0))])])))
+        (table-add (. g types) (tdef "Vec" 1 ["a"] (TsStruct [])))
+        (table-add (. g types) (tdef "Pair" 1 ["a" "b"] (TsStruct [(fld "fst" (TGen 0)) (fld "snd" (TGen 1))])))
+        (table-add (. g types)
+          (tdef "Triple" 1 ["a" "b" "c"]
+                (TsStruct [(fld "fst" (TGen 0)) (fld "snd" (TGen 1)) (fld "thd" (TGen 2))])))
+        (table-add (. g types) (tdef "S" 2 ["a"] (TsStruct [(fld "f" (ty-i64)) (fld "g" (TGen 0))])))
+        (table-add (. g types) (tdef "E" 2 [] (TsEnum [(VariantDef "A" []) (VariantDef "B" [])])))
+        (table-add (. g types) (tdef "Pair" 2 ["a" "b"] (TsStruct [])))
+        (table-add (. g protos) (ProtoDef "Show" 1 [] [] [] p0))
+        (table-add (. g protos)
+          (ProtoDef "Conv" 2 ["d"] [(MethodDef "conv" [] sch false nil p0) (MethodDef "bad" [] sch true nil p0)] [] p0))
+        (set! (. g option) 0)
+        g)))
+
+(defun world () -> Globals
+  (let ((g (world-without-vec))) (do (set! (. g vec) (some 1)) g)))
+
+(defun cx-of (g: Globals) -> Cx (Cx g (env-new) (store-new) (tables-new) (unit-new)))
+(defun fresh-cx () -> Cx (cx-of (world)))
+
+(defun defer (cx: Cx kind: DKind) -> unit (cx-defer cx kind p0 nil))
+(defun defer-at (cx: Cx kind: DKind site: i64) -> unit (cx-defer cx kind p0 (some site)))
+(defun left (cx: Cx) -> i64 (count @(. (. cx u) deferred)))
+(defun givens! (cx: Cx gs: (Vec Pred)) -> unit (set! (. (. cx u) givens) (some gs)))
+(defun names! (cx: Cx names: (Vec str)) -> unit (set! (. (. cx u) rigid-names) names))
+(defun cons-of (cx: Cx) -> (Vec ColourCon) @(. (. cx u) colours))
+
+(defun ok? (r: (Result unit TypeError)) -> bool (match r ((Ok _) true) (_ false)))
+(defun failed (r: (Result unit TypeError) kind: ErrorKind msg: str) -> bool
+  (match r ((Err e) (and (= (. e kind) kind) (= (. e message) msg))) (_ false)))
+
+(defun s-of (a: Ty) -> Ty (ty-nominal 4 [a]))
+(defun pair-of (a: Ty b: Ty) -> Ty (ty-nominal 2 [a b]))
+(defun same? (cx: Cx a: Ty b: Ty) -> bool (= (cx-zonk cx a) (cx-zonk cx b)))
+
+(defun stuck? (r: (Result Attempt TypeError)) -> bool (match r ((Ok (AtStuck)) true) (_ false)))
+(defun done? (r: (Result Attempt TypeError)) -> bool (match r ((Ok (AtSolved n)) (empty? n)) (_ false)))
+
+(defun res-dyn? (cx: Cx site: i64) -> bool
+  (match (get @(. (. cx t) resolutions) site) ((some (ResDyn)) true) (_ false)))
+(defun res-bound? (cx: Cx site: i64 p: Pred) -> bool
+  (match (get @(. (. cx t) resolutions) site) ((some (ResBound q)) (= p q)) (_ false)))
+
+;; ---- the worklist
+
+(defun worklist-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+      (do (defer cx (DkProto 0 [v] nil))
+          (check cs "a protocol constraint on a variable stays on the worklist"
+                 (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkProto 0 [(TGen 0)] nil))
+          (check cs "a protocol constraint on a quantified variable is stuck too"
+                 (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkProto 0 [(TFn CSend [] (ty-i64))] nil))
+          (check cs "a function type has no instance"
+                 (failed (cx-solve-all cx) NoInstance "no implementation of Show for (fn :send () i64)"))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkProto 0 [(ty-i64)] nil))
+          (check cs "a type with no instance of the protocol is a NoInstance error"
+                 (failed (cx-solve-all cx) NoInstance "no implementation of Show for i64"))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkProto 0 [(ty-i64)] nil))
+          (defer cx (DkFloat (ty-scalar SF64)))
+          (check cs "the first failure stops the run and the worklist is gone"
+                 (and (failed (cx-solve-all cx) NoInstance "no implementation of Show for i64")
+                      (= (left cx) 0)))))
+    (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+      (do (defer cx (DkFloat v))
+          (defer cx (DkField (s-of (ty-scalar SF64)) "g" v ""))
+          (check cs "a constraint unblocked by a later one is solved in the next round"
+                 (and (ok? (cx-solve-all cx)) (= (left cx) 0) (same? cx v (ty-scalar SF64))))))
+    (check cs "no_instance: the kind and the text"
+           (let ((cx (fresh-cx)) (e (cx-no-instance cx 1 (ty-str) p0)))
+             (and (= (. e kind) NoInstance) (= (. e message) "no implementation of Conv for str"))))))
+
+;; ---- rigid variables and the givens
+
+(defun rigid-tests (cs: Checks) -> unit
+  (let ((show-t (PProto 0 [(TRigid 0)])))
+    (do
+      (let ((cx (fresh-cx)))
+        (do (defer cx (DkProto 0 [(TRigid 0)] nil))
+            (check cs "a rigid variable outside an impl is stuck"
+                   (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+      (let ((cx (fresh-cx)))
+        (do (givens! cx [show-t])
+            (defer-at cx (DkProto 0 [(TRigid 0)] nil) 5)
+            (check cs "a given entails it, and the use resolves to the bound"
+                   (and (ok? (cx-solve-all cx)) (= (left cx) 0) (res-bound? cx 5 show-t)
+                        (= @(. (. cx u) sites) [5])))))
+      (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+        (do (givens! cx [(PProto 1 [(TRigid 0) (ty-str)])])
+            (defer cx (DkProto 1 [(TRigid 0) v] nil))
+            (check cs "a given's determined arguments are unified with the constraint's"
+                   (and (ok? (cx-solve-all cx)) (same? cx v (ty-str))))))
+      (let ((cx (fresh-cx)))
+        (do (givens! cx []) (names! cx ["T"])
+            (defer cx (DkProto 0 [(TRigid 0)] nil))
+            (check cs "no given: ImplContext, with the fix"
+                   (failed (cx-solve-all cx) ImplContext
+                           "no implementation of Show for T; add (Show T) to the :where of the impl"))))
+      (let ((cx (fresh-cx)))
+        (do (givens! cx [(PProto 0 [(TRigid 1)])]) (names! cx ["T" "U"])
+            (defer cx (DkProto 0 [(TRigid 0)] nil))
+            (check cs "a given for another rigid variable does not entail it"
+                   (failed (cx-solve-all cx) ImplContext
+                           "no implementation of Show for T; add (Show T) to the :where of the impl")))))))
+
+;; ---- a trait object of the protocol itself
+
+(defun dyn-tests (cs: Checks) -> unit
+  (let ((dyn-conv (TCon (KDyn 1 false) [(ty-i64)])))
+    (do
+      (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+        (do (defer-at cx (DkProto 1 [dyn-conv v] nil) 3)
+            (check cs "a dyn of the protocol: determined arguments from the dyn, resolved Dyn"
+                   (and (ok? (cx-solve-all cx)) (same? cx v (ty-i64)) (res-dyn? cx 3) (= (left cx) 0)))))
+      (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+        (do (defer cx (DkProto 1 [dyn-conv v] (some 0)))
+            (check cs "a method that does not mention Self elsewhere is callable through dyn"
+                   (ok? (cx-solve-all cx)))))
+      (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+        (do (defer cx (DkProto 1 [dyn-conv v] (some 1)))
+            (check cs "a method with Self elsewhere is not"
+                   (failed (cx-solve-all cx) Other "method bad of Conv is not callable through dyn"))))
+      (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+        (do (defer cx (DkProto 1 [dyn-conv v] nil))
+            (defer cx (DkProto 1 [dyn-conv (ty-str)] nil))
+            (check cs "the dyn's arguments against another constraint's are a mismatch"
+                   (failed (cx-solve-all cx) Unify "cannot unify i64 with str")))))))
+
+;; ---- Send
+
+(defun send-tests (cs: Checks) -> unit
+  (let ((k (TFn (CVar 0) [] (ty-i64))))
+    (do
+      (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+        (do (defer cx (DkSend v []))
+            (check cs "Send of a variable waits" (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+      (let ((cx (fresh-cx)))
+        (do (defer cx (DkSend (ty-i64) []))
+            (check cs "Send of i64 is solved and leaves no constraint"
+                   (and (ok? (cx-solve-all cx)) (= (left cx) 0) (= (count (cons-of cx)) 0)))))
+      (let ((cx (fresh-cx)))
+        (do (defer cx (DkSend k ["x"]))
+            (check cs "Send of a closure with a colour variable is colour ⊑ send, labelled by the path"
+                   (and (ok? (cx-solve-all cx)) (= (left cx) 0)
+                        (let ((c (cons-of cx)))
+                          (and (= (count c) 1) (= (. (nth c 0) from) (CVar 0)) (= (. (nth c 0) to) CSend)
+                               (= (. (nth c 0) label) (some "x")) (nil? (. (nth c 0) origin))))))))
+      (let ((cx (fresh-cx)))
+        (do (defer cx (DkSend k []))
+            (defer cx (DkSend (TFn (CVar 1) [] (ty-i64)) ["a" "b"]))
+            (check cs "an empty path has no label, a longer one is joined by commas, in order"
+                   (and (ok? (cx-solve-all cx))
+                        (let ((c (cons-of cx)))
+                          (and (= (count c) 2) (nil? (. (nth c 0) label))
+                               (= (. (nth c 1) label) (some "a, b"))))))))
+      (let ((cx (fresh-cx)))
+        (do (defer cx (DkSend (ty-cell (ty-i64)) []))
+            (check cs "Send of a cell is the cell error"
+                   (failed (cx-solve-all cx) CellNotSend
+                           "cell cannot be shared between threads: the value has type (Cell i64)"))))
+      (let ((cx (fresh-cx)))
+        (do (defer cx (DkSend (TFn CLocal [] (ty-i64)) ["capture f"]))
+            (check cs "Send of a local closure is the value error, with the path"
+                   (failed (cx-solve-all cx) ValueNotSend
+                           "value of type (fn :local () i64) cannot be shared between threads: capture f"))))
+      (let ((cx (fresh-cx)))
+        (do (defer cx (DkSend (TRigid 0) []))
+            (check cs "Send of a rigid variable outside an impl waits"
+                   (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+      (let ((cx (fresh-cx)))
+        (do (givens! cx [(PSend (TRigid 0))])
+            (defer cx (DkSend (TRigid 0) []))
+            (check cs "a given Send entails it"
+                   (and (ok? (cx-solve-all cx)) (= (left cx) 0)))))
+      (let ((cx (fresh-cx)))
+        (do (givens! cx []) (names! cx ["T"])
+            (defer cx (DkSend (TRigid 0) []))
+            (check cs "no given Send: ImplContext, with the fix"
+                   (failed (cx-solve-all cx) ImplContext
+                           "no implementation of Send for T; add (Send T) to the :where of the impl"))))
+      (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+        (do (givens! cx [(PSend (TRigid 0))])
+            (defer cx (DkSend (pair-of (TRigid 0) v) []))
+            (check cs "a rigid variable with a given and an open variable still waits"
+                   (and (ok? (cx-solve-all cx)) (= (left cx) 1))))))))
+
+;; ---- Object and Weakable
+
+(defun object-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+      (do (defer cx (DkObject v "dyn"))
+          (check cs "Object of a variable waits" (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkObject (ty-i64) "dyn"))
+          (check cs "Object of a scalar is NotObject, naming what requires it"
+                 (failed (cx-solve-all cx) NotObject "dyn requires an object type, not i64"))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkObject (s-of (ty-i64)) "dyn"))
+          (defer cx (DkObject (ty-str) "raw"))
+          (defer cx (DkObject (TFn CSend [] (ty-i64)) "raw"))
+          (check cs "a struct, a str and a function are objects"
+                 (and (ok? (cx-solve-all cx)) (= (left cx) 0)))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkObject (ty-nominal 5 []) "an instance context"))
+          (check cs "a field-less enum is a scalar"
+                 (failed (cx-solve-all cx) NotObject "an instance context requires an object type, not E"))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkObject (TRigid 0) "dyn"))
+          (check cs "a rigid variable outside an impl waits" (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+    (let ((cx (fresh-cx)))
+      (do (givens! cx [(PObject (TRigid 0))])
+          (defer cx (DkObject (TRigid 0) "dyn"))
+          (defer cx (DkWeakable (TRigid 0)))
+          (check cs "a given Object makes a rigid variable an object, so Weakable passes too"
+                 (and (ok? (cx-solve-all cx)) (= (left cx) 0)))))
+    (let ((cx (fresh-cx)))
+      (do (givens! cx [(PWeakable (TRigid 0))])
+          (defer cx (DkObject (TRigid 0) "dyn"))
+          (defer cx (DkWeakable (TRigid 0)))
+          (check cs "a given Weakable implies Object and is itself enough"
+                 (and (ok? (cx-solve-all cx)) (= (left cx) 0)))))
+    (let ((cx (fresh-cx)))
+      (do (givens! cx []) (names! cx ["T"])
+          (defer cx (DkObject (TRigid 0) "dyn"))
+          (check cs "a rigid variable with no given is a scalar"
+                 (failed (cx-solve-all cx) NotObject "dyn requires an object type, not T"))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkWeakable (ty-i64)))
+          (check cs "weak of a scalar"
+                 (failed (cx-solve-all cx) WeakScalar "weak requires an object type"))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkWeakable (ty-nominal 0 [(ty-i64)])))
+          (check cs "weak of an Option"
+                 (failed (cx-solve-all cx) WeakOption
+                         "weak of an Option is not allowed: (Option i64) has no object of its own to observe; take the weak reference of the object inside it"))))
+    (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+      (do (defer cx (DkWeakable v))
+          (check cs "weak of a variable waits, then of a struct is fine"
+                 (and (ok? (cx-solve-all cx)) (= (left cx) 1)
+                      (do (cx-unify cx v (s-of (ty-i64)) p0)
+                          (and (ok? (cx-solve-all cx)) (= (left cx) 0)))))))))
+
+;; ---- fields and dereference
+
+(defun field-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkField (s-of (ty-scalar SF64)) "f" r ""))
+          (check cs "a field's type without a parameter"
+                 (and (ok? (cx-solve-all cx)) (same? cx r (ty-i64))))))
+    (let ((cx (fresh-cx)) (a (cx-fresh cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkField (s-of a) "g" r ""))
+          (cx-unify cx a (ty-str) p0)
+          (check cs "a field's type with the struct's arguments zonked in"
+                 (and (ok? (cx-solve-all cx)) (same? cx r (ty-str))))))
+    (let ((cx (fresh-cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkField (s-of (ty-i64)) "zz" r ""))
+          (check cs "no such field"
+                 (failed (cx-solve-all cx) NoField "(S i64) has no field zz"))))
+    (let ((cx (fresh-cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkField (ty-nominal 0 [(ty-i64)]) "f" r ""))
+          (check cs "an enum has no fields"
+                 (failed (cx-solve-all cx) NoField "(Option i64) has no field f"))))
+    (let ((cx (fresh-cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkField (ty-i64) "f" r ""))
+          (check cs "a scalar has no fields"
+                 (failed (cx-solve-all cx) NoField "i64 has no field f"))))
+    (let ((cx (fresh-cx)) (v (cx-fresh cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkField v "f" r ""))
+          (check cs "a field of a variable waits" (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkField (s-of (ty-i64)) "f" (ty-str) ""))
+          (check cs "the field's type against the expected one is a Unify error"
+                 (failed (cx-solve-all cx) Unify "cannot unify str with i64"))))))
+
+(defun deref-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)) (r (cx-fresh cx)) (r2 (cx-fresh cx)) (r3 (cx-fresh cx)))
+      (do (defer cx (DkDeref (ty-cell (ty-i64)) r ""))
+          (defer cx (DkDeref (TCon KAtom [(ty-str)]) r2 ""))
+          (defer cx (DkDeref (ty-task (ty-bool)) r3 ""))
+          (check cs "a cell, an atom and a task dereference to their content"
+                 (and (ok? (cx-solve-all cx)) (same? cx r (ty-i64)) (same? cx r2 (ty-str))
+                      (same? cx r3 (ty-bool))))))
+    (let ((cx (fresh-cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkDeref (TCon KWeak [(s-of (ty-i64))]) r ""))
+          (check cs "a weak reference dereferences to an Option of its target"
+                 (and (ok? (cx-solve-all cx)) (same? cx r (ty-nominal 0 [(s-of (ty-i64))]))))))
+    (let ((cx (fresh-cx)) (v (cx-fresh cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkDeref v r ""))
+          (check cs "a dereference of a variable waits" (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+    (let ((cx (fresh-cx)) (r (cx-fresh cx)))
+      (do (defer cx (DkDeref (ty-i64) r ""))
+          (check cs "no Deref protocol in the globals"
+                 (failed (cx-solve-all cx) Other "no Deref protocol"))))
+    (let ((cx (fresh-cx)) (r (cx-fresh cx)))
+      (do (set! (. (. cx g) deref-proto) (some 0))
+          (defer cx (DkDeref (ty-i64) r ""))
+          (check cs "anything else has no instance of the Deref protocol"
+                 (failed (cx-solve-all cx) NoInstance "no implementation of Show for i64"))))
+    (let ((cx (fresh-cx)) (v (cx-fresh cx)))
+      (do (defer cx (DkFloat v))
+          (check cs "a float constraint on a variable waits" (and (ok? (cx-solve-all cx)) (= (left cx) 1)))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkFloat (ty-scalar SF64)))
+          (defer cx (DkFloat (ty-scalar SF32)))
+          (check cs "f32 and f64 are floats" (and (ok? (cx-solve-all cx)) (= (left cx) 0)))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkFloat (ty-i64)))
+          (check cs "i64 is not a float"
+                 (failed (cx-solve-all cx) Unify "cannot unify i64 with a float type"))))
+    (let ((cx (fresh-cx)))
+      (do (defer cx (DkFloat (ty-str)))
+          (check cs "nor is a str"
+                 (failed (cx-solve-all cx) Unify "cannot unify str with a float type"))))))
+
+;; ---- improvement
+
+(defun improve-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (check cs "improve: nothing deferred, nothing changed"
+             (match (cx-improve cx) ((Ok c) (not c)) (_ false))))
+    (let ((cx (fresh-cx)) (a (cx-fresh cx)))
+      (do (defer cx (DkProto 0 [a] nil))
+          (defer cx (DkProto 0 [a] nil))
+          (check cs "improve: one-argument constraints are not improved"
+                 (match (cx-improve cx) ((Ok c) (not c)) (_ false)))))
+    (let ((cx (fresh-cx)) (a (cx-fresh cx)) (v1 (cx-fresh cx)) (v2 (cx-fresh cx)))
+      (do (defer cx (DkProto 1 [a v1] nil))
+          (defer cx (DkProto 1 [a v2] nil))
+          (check cs "improve: equal dispatch types make the determined arguments equal"
+                 (and (match (cx-improve cx) ((Ok c) c) (_ false)) (same? cx v1 v2)))))
+    (let ((cx (fresh-cx)) (a (cx-fresh cx)) (v1 (cx-fresh cx)))
+      (do (defer cx (DkProto 1 [a v1] nil))
+          (defer cx (DkProto 1 [a v1] nil))
+          (check cs "improve: equal determined arguments already, nothing changed"
+                 (match (cx-improve cx) ((Ok c) (not c)) (_ false)))))
+    (let ((cx (fresh-cx)) (a (cx-fresh cx)) (b (cx-fresh cx)) (v1 (cx-fresh cx)) (v2 (cx-fresh cx)))
+      (do (defer cx (DkProto 1 [a v1] nil))
+          (defer cx (DkProto 1 [b v2] nil))
+          (defer cx (DkProto 0 [a v2] nil))
+          (check cs "improve: other dispatch types and other protocols are left alone"
+                 (and (match (cx-improve cx) ((Ok c) (not c)) (_ false)) (not (same? cx v1 v2))))))
+    (let ((cx (fresh-cx)) (a (cx-fresh cx)) (v (cx-fresh cx)))
+      (do (cx-unify cx a (TRigid 0) p0)
+          (givens! cx [(PProto 1 [(TRigid 0) (ty-str)])])
+          (defer cx (DkProto 1 [a v] nil))
+          (check cs "improve: a given with the same dispatch type improves a stuck constraint"
+                 (and (match (cx-improve cx) ((Ok c) c) (_ false)) (same? cx v (ty-str))))))
+    (let ((cx (fresh-cx)) (a (cx-fresh cx)))
+      (do (cx-unify cx a (TRigid 0) p0)
+          (givens! cx [(PProto 1 [(TRigid 0) (ty-str)])])
+          (defer cx (DkProto 1 [a (ty-i64)] nil))
+          (check cs "improve: a given that disagrees is a Unify error"
+                 (match (cx-improve cx)
+                   ((Err e) (and (= (. e kind) Unify) (= (. e message) "cannot unify i64 with str")))
+                   (_ false)))))
+    (let ((cx (fresh-cx)) (a (cx-fresh cx)) (v1 (cx-fresh cx)) (v2 (cx-fresh cx)))
+      (do (defer cx (DkProto 1 [a v1] nil))
+          (defer cx (DkProto 1 [a v2] nil))
+          (defer cx (DkFloat v1))
+          (defer cx (DkField (s-of (ty-scalar SF64)) "g" v2 ""))
+          (check cs "solve_all: improvement is progress, the round after it solves what it unblocked"
+                 (and (ok? (cx-solve-all cx)) (= (left cx) 2) (same? cx v1 (ty-scalar SF64))))))))
+
+;; ---- the vector pattern the solver settles
+
+(defun settle-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)) (p1 (cx-fresh cx)) (p2 (cx-fresh cx)))
+      (check cs "a Pair: each element has its field's type"
+             (and (ok? (cx-settle-vec-pattern cx (pair-of (ty-i64) (ty-str)) [p1 p2] p0))
+                  (same? cx p1 (ty-i64)) (same? cx p2 (ty-str)))))
+    (let ((cx (fresh-cx)) (p1 (cx-fresh cx)))
+      (check cs "a Triple with too few elements"
+             (failed (cx-settle-vec-pattern cx (ty-nominal 3 [(ty-i64) (ty-i64) (ty-i64)]) [p1 p1] p0) Other
+                     "a vector pattern of a Triple takes exactly its 3 field(s) and no rest, the pattern has 2 element(s)")))
+    (let ((cx (fresh-cx)) (x (cx-fresh cx)) (y (cx-fresh cx)))
+      (check cs "a Vec: each element is the element type"
+             (and (ok? (cx-settle-vec-pattern cx (ty-nominal 1 [(ty-i64)]) [x y] p0))
+                  (same? cx x (ty-i64)) (same? cx y (ty-i64)))))
+    (let ((cx (fresh-cx)) (s (cx-fresh cx)) (x (cx-fresh cx)) (y (cx-fresh cx)))
+      (check cs "an unknown scrutinee becomes a Vec of one element variable"
+             (and (ok? (cx-settle-vec-pattern cx s [x y] p0))
+                  (same? cx s (ty-nominal 1 [x])) (same? cx x y)
+                  (= (cx-fresh cx) (TVar 4)))))
+    (let ((cx (cx-of (world-without-vec))) (x (cx-fresh cx)))
+      (check cs "no Vec in the prelude"
+             (failed (cx-settle-vec-pattern cx (ty-i64) [x] p0) Other "vector patterns need the prelude's Vec")))
+    (let ((cx (fresh-cx)) (x (cx-fresh cx)))
+      (check cs "a struct that is not a tuple is not a Vec"
+             (failed (cx-settle-vec-pattern cx (s-of (ty-i64)) [x] p0) Unify
+                     "cannot unify (S i64) with (Vec a)")))
+    (let ((cx (fresh-cx)) (x (cx-fresh cx)))
+      (check cs "the solver's arm waits for the scrutinee"
+             (stuck? (solve-vec-pat cx (Deferred (DkWeakable x) p0 nil "f") x [x]))))
+    (let ((cx (fresh-cx)) (x (cx-fresh cx)))
+      (check cs "the solver's arm settles once it is known"
+             (and (done? (solve-vec-pat cx (Deferred (DkWeakable x) p0 nil "f") (pair-of (ty-i64) (ty-i64)) [x x]))
+                  (same? cx x (ty-i64)))))
+    (let ((g (world)))
+      (check cs "is_tuple: the prelude's Pair and Triple only, not a Pair of main's"
+             (and (solve-is-tuple g 2) (solve-is-tuple g 3) (not (solve-is-tuple g 4))
+                  (not (solve-is-tuple g 0)) (not (solve-is-tuple g 1)) (not (solve-is-tuple g 5))
+                  (not (solve-is-tuple g 6)))))
+    (let ((cx (fresh-cx)))
+      (check cs "tuple_arity names the type, its fields and the pattern's elements"
+             (and (= (. (cx-tuple-arity cx 2 3 p0) message)
+                     "a vector pattern of a Pair takes exactly its 2 field(s) and no rest, the pattern has 3 element(s)")
+                  (= (. (cx-tuple-arity cx 0 1 p0) message)
+                     "a vector pattern of a Option takes exactly its 0 field(s) and no rest, the pattern has 1 element(s)"))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (worklist-tests cs)
+        (rigid-tests cs)
+        (dyn-tests cs)
+        (send-tests cs)
+        (object-tests cs)
+        (field-tests cs)
+        (deref-tests cs)
+        (improve-tests cs)
+        (settle-tests cs)
+        (finish cs))))

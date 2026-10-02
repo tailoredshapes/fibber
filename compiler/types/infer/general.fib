@@ -1,15 +1,28 @@
 ;; compiler/types/infer/general.fib: generalisation (package P10).
 ;; Replaces crates/fibref/src/types/infer/general.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; The end of a unit (spec/types.md §3.5 steps c-e, §3.6): run the worklist,
+;; report unresolved field and `deref` constraints, check ambiguity, solve
+;; colours, and generalise every variable left in the members' types (Rémy:
+;; all of them were created at the unit's level, and Γ holds only closed
+;; schemes). A quantified variable with no constraints that does not occur in
+;; the type is instantiated to `i64` (§3.6).
+;;
+;; Shapes: the Rust methods of `Cx` are `cx-NAME` (the ones the other modules
+;; call) or plain functions over a `Cx` (the private ones, public here for
+;; tests/types/unit-general.fib). A `HashMap<CvId, u32>` is a `(Map i64 i64)`;
+;; the Rust `colour_bounds` sorts by the `Debug` text of the bound, so
+;; `debug-bound` writes the text derive(Debug) writes.
 (ns types.infer.general
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx types.infer.colour))
+  (:require [fib.string :as str])
+  (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.display types.infer.cx types.infer.colour types.infer.send
+        types.infer.solve types.infer.unify))
 
 ;; Rust `Key`, `Closed`, `GenMap` (infer/general.rs:24, :49, :60): a
 ;; variable to quantify (a unification variable or a rigid one), the
 ;; closed variable sets and predicates, and the numbering of the quantified
-;; variables. P10 may change the fields of `GenMap`.
+;; variables.
 (defenum Key (KeyVar tv: i64) (KeyRigid index: i64))
 (derive Eq Key) (derive Hash Key)
 (defstruct Closed
@@ -17,42 +30,385 @@
 (defstruct GenMap
   (vars: (Map Key i64) names: (Vec str) colours: Colours colour-gen: (Map i64 i64)))
 
-;; Rust: infer/general.rs:32 keys
+;; Rust: infer/general.rs:32 keys. The keys of a type (zonked), each once, in
+;; order.
 (defun general-keys (st: Store t: Ty) -> (Vec Key)
-  (trap "todo: general-keys"))
+  (let ((out (cell (vec-empty))))
+    (do (ty-visit (store-zonk st t)
+          (fn (l: Leaf)
+            (when-some (k (match l ((LVar v) (some (KeyVar v))) ((LRigid r) (some (KeyRigid r))) (_ nil)))
+              (when-not (includes? k @out) (set! out (conj @out k))))))
+        @out)))
 
-;; Rust: infer/general.rs:71 GenMap::new
+;; ---- GenMap
+
+;; Rust: infer/general.rs:71 GenMap::new. A map quantifying `order`, and the
+;; free colour variables of `colour-roots`.
 (defun genmap-new (cx: Cx order: (Vec Key) colours: Colours colour-roots: (Vec Ty)) -> GenMap
-  (trap "todo: genmap-new"))
+  (GenMap (reduce (fn (m: (Map Key i64) [i k]) (assoc m k i)) (map-empty)
+                  (zip (range (count order)) order))
+          (key-names @(. (. cx u) rigid-names) order)
+          colours
+          (colour-numbers cx colours colour-roots)))
 
-;; Rust: infer/general.rs:118 n_colours
+;; A display name per key: a rigid variable's own, else the next letter name
+;; the unit's rigid names do not hold.
+(defun key-names :private (taken: (Vec str) order: (Vec Key)) -> (Vec str)
+  (loop ((i 0) (next 0) (names []))
+    (if (< i (count order))
+        (match (nth order i)
+          ((KeyRigid r) (recur (+ i 1) next (conj names (nth-or taken r ""))))
+          ((KeyVar _) (let ((p (fresh-letter taken next)))
+                        (recur (+ i 1) (. p snd) (conj names (. p fst))))))
+        names)))
+
+;; The first letter name from `next` on that `taken` lacks, and the index after it.
+(defun fresh-letter :private (taken: (Vec str) next: i64) -> (Pair str i64)
+  (let ((n (letter-name next)))
+    (if (includes? n taken)
+        (fresh-letter taken (+ next 1))
+        (Pair n (+ next 1)))))
+
+;; The free colour variables of the roots, numbered in order of first occurrence.
+(defun colour-numbers :private (cx: Cx colours: Colours roots: (Vec Ty)) -> (Map i64 i64)
+  (let ((out (cell (map-empty))))
+    (do (doseq (t roots)
+          (ty-visit (store-zonk (. cx st) t)
+            (fn (l: Leaf)
+              (match l
+                ((LColour (CVar v))
+                 (when (and (= (colours-value colours (CVar v)) (CVar v)) (not (contains? @out v)))
+                   (set! out (assoc @out v (count @out)))))
+                (_ ())))))
+        @out)))
+
+;; Rust: infer/general.rs:118 n_colours. The number of quantified colour variables.
 (defun genmap-n-colours (m: GenMap) -> i64
-  (trap "todo: genmap-n-colours"))
+  (count (. m colour-gen)))
 
-;; Rust: infer/general.rs:123 colour
+;; Rust: infer/general.rs:123 colour. A colour under the map: solved,
+;; quantified, or `send` (least).
 (defun genmap-colour (m: GenMap k: Colour) -> Colour
-  (trap "todo: genmap-colour"))
+  (let ((v (colours-value (. m colours) k)))
+    (match v
+      ((CVar x) (if-some (i (get (. m colour-gen) x)) (CGen i) CSend))
+      (_ v))))
 
-;; Rust: infer/general.rs:141 apply
+(defun genmap-quantified :private (m: GenMap k: Colour) -> (Option i64)
+  (match k
+    ((CVar v) (get (. m colour-gen) v))
+    (_ nil)))
+
+;; Rust: infer/general.rs:141 apply. A type under the map; a variable it does
+;; not quantify is `i64`.
 (defun genmap-apply (m: GenMap st: Store t: Ty) -> Ty
-  (trap "todo: genmap-apply"))
+  (ty-map-colours
+    (ty-map-leaves (store-zonk st t)
+      (fn (l: Ty)
+        (match l
+          ((TVar v) (some (if-some (i (get (. m vars) (KeyVar v))) (TGen i) (ty-i64))))
+          ((TRigid r) (if-some (i (get (. m vars) (KeyRigid r))) (some (TGen i)) nil))
+          (_ nil))))
+    (fn (k: Colour) (genmap-colour m k))))
 
-;; Rust: infer/general.rs:156 pred
+;; Rust: infer/general.rs:156 pred. A predicate under the map.
 (defun genmap-pred (m: GenMap st: Store p: Pred) -> Pred
-  (trap "todo: genmap-pred"))
+  (pred-map-tys p (fn (t: Ty) (genmap-apply m st t))))
 
-;; Rust: infer/general.rs:162 colour_bounds
+;; Rust: infer/general.rs:162 colour_bounds. The colour bounds that remain
+;; between quantified colours (§5.4 step 4), following flows through
+;; unquantified variables, sorted by their `Debug` text.
 (defun genmap-colour-bounds (m: GenMap st: Store) -> (Vec ColourBound)
-  (trap "todo: genmap-colour-bounds"))
+  (let ((flows (reduce (fn (out: (Vec ColourBound) v: i64) (flow-bounds m out v))
+                       [] (keys (. m colour-gen))))
+        (all (reduce (fn (out: (Vec ColourBound) [k t]) (caps-bounds m st out k t))
+                     flows (. (. m colours) symbolic))))
+    (vec (sort-by (fn (b: ColourBound) (debug-bound b)) all))))
 
-;; Rust: infer/general.rs:206 close
+;; The bounds `colour(v) ⊑ w` for each other quantified colour w reached from v.
+(defun flow-bounds :private (m: GenMap out: (Vec ColourBound) v: i64) -> (Vec ColourBound)
+  (let ((own (unwrap (get (. m colour-gen) v)))
+        (from (genmap-colour m (CVar v))))
+    (reduce (fn (acc: (Vec ColourBound) w: i64)
+              (let ((b (BFlow from (CGen w))))
+                (if (and (not (= w own)) (not (includes? b acc))) (conj acc b) acc)))
+            out (genmap-reach m (CVar v)))))
+
+;; The bounds `w ⊒ Caps{t}` for each quantified colour w reached from k.
+(defun caps-bounds :private (m: GenMap st: Store out: (Vec ColourBound) k: Colour t: Ty) -> (Vec ColourBound)
+  (reduce (fn (acc: (Vec ColourBound) w: i64)
+            (let ((b (BCaps (CGen w) (genmap-apply m st t))))
+              (if (includes? b acc) acc (conj acc b))))
+          out (genmap-reach m k)))
+
+;; Quantified colours reachable from `k` along flows, `k` included, in order.
+(defun genmap-reach :private (m: GenMap k: Colour) -> (Vec i64)
+  (let ((seen (loop ((seen [k]) (i 0))
+                (if (< i (count seen))
+                    (let ((cur (nth seen i)))
+                      (recur (reduce (fn (s: (Vec Colour) [a b])
+                                       (if (and (= a cur) (not (includes? b s))) (conj s b) s))
+                                     seen (. (. m colours) flows))
+                             (+ i 1)))
+                    seen))))
+    (reduce (fn (out: (Vec i64) c: Colour)
+              (if-some (q (genmap-quantified m c)) (conj out q) out))
+            [] seen)))
+
+;; ---- the text derive(Debug) gives a bound, the sort key of `colour_bounds`
+
+(defun debug-bound (b: ColourBound) -> str
+  (match b
+    ((BFlow a c) (str-join ["Flow(" (debug-colour a) ", " (debug-colour c) ")"]))
+    ((BCaps k t) (str-join ["Caps(" (debug-colour k) ", " (debug-ty t) ")"]))))
+
+(defun debug-colour (k: Colour) -> str
+  (match k
+    ((CSend) "Send")
+    ((CLocal) "Local")
+    ((CVar v) (str-join ["Var(CvId(" (show v) "))"]))
+    ((CGen i) (str-join ["Gen(" (show i) ")"]))
+    ((CRigid i) (str-join ["Rigid(" (show i) ")"]))))
+
+(defun debug-ty (t: Ty) -> str
+  (match t
+    ((TVar v) (str-join ["Var(TvId(" (show v) "))"]))
+    ((TGen i) (str-join ["Gen(" (show i) ")"]))
+    ((TRigid i) (str-join ["Rigid(" (show i) ")"]))
+    ((TCon c args) (str-join ["Con(" (debug-con c) ", " (debug-tys args) ")"]))
+    ((TFn k ps r) (str-join ["Fn(" (debug-colour k) ", " (debug-tys ps) ", " (debug-ty r) ")"]))))
+
+(defun debug-tys :private (ts: (Vec Ty)) -> str
+  (str-join ["[" (str/join ", " (mapv (fn (t: Ty) (debug-ty t)) ts)) "]"]))
+
+(defun debug-con :private (c: Con) -> str
+  (match c
+    ((KScalar s) (str-join ["Scalar(" (debug-scalar s) ")"]))
+    ((KStr) "Str")
+    ((KArray) "Array")
+    ((KCell) "Cell")
+    ((KAtom) "Atom")
+    ((KWeak) "Weak")
+    ((KTask) "Task")
+    ((KNominal t) (str-join ["Nominal(TypeId(" (show t) "))"]))
+    ((KDyn p s) (str-join ["Dyn(ProtoId(" (show p) "), " (show s) ")"]))))
+
+(defun debug-scalar :private (s: Scalar) -> str
+  (match s
+    ((SBool) "Bool") ((SI8) "I8") ((SI16) "I16") ((SI32) "I32") ((SI64) "I64") ((SF32) "F32")
+    ((SF64) "F64") ((SChar) "Char") ((SKeyword) "Keyword") ((SUnit) "Unit") ((SPtr) "Ptr")))
+
+;; ---- closing a unit
+
+;; Rust: infer/general.rs:206 close. Steps c-e for a unit whose roots are
+;; `roots` (the members' types; none for an `impl` body or a `def`).
 (defun cx-close (cx: Cx roots: (Vec Ty)) -> (Result Closed TypeError)
-  (trap "todo: cx-close"))
+  (try-let ((_ (cx-solve-all cx))
+            (_ (default-vec-patterns cx))
+            (_ (check-unresolved cx)))
+    (do (reduce-sends cx)
+        (let ((sets (mapv (fn (t: Ty) (determined cx (general-keys (. cx st) t))) roots))
+              (union (reduce (fn (acc: (Vec Key) s: (Vec Key)) (into acc s)) [] sets)))
+          (try-let ((_ (check-ambiguous cx union))
+                    (_ (default-outside cx union))
+                    (colours (cx-solve-colours cx))
+                    (_ (cx-solve-all cx))
+                    (_ (default-outside cx union)))
+            (Ok (Closed sets colours
+                        (reduce (fn (out: (Vec (Pair Pred (Option i64))) d: Deferred)
+                                  (if-some (p (pred-of d)) (conj out p) out))
+                                [] @(. (. cx u) deferred)))))))))
 
-;; Rust: infer/general.rs:351 finalize
+;; The stuck constraint as a predicate with its method site.
+(defun pred-of :private (d: Deferred) -> (Option (Pair Pred (Option i64)))
+  (match (. d kind)
+    ((DkProto p args _) (some (Pair (PProto p args) (. d site))))
+    ((DkSend t _) (some (Pair (PSend t) (. d site))))
+    ((DkObject t _) (some (Pair (PObject t) (. d site))))
+    ((DkWeakable t) (some (Pair (PWeakable t) (. d site))))
+    (_ nil)))
+
+;; TODO(lead): Rust `default_vec_patterns` (general.rs:230, X4 L3b) settles each
+;; deferred `DKind::VecPat` that is still unknown at the close of the unit as a
+;; `Vec`'s pattern (`settle_vec_pattern`, infer/pattern.rs:172) and solves again.
+;; It needs `(DkVecPat ty: Ty parts: (Vec Ty))` in types.infer.cx's DKind and
+;; `cx-settle-vec-pattern` in types.infer.pattern, neither of which exists in the
+;; skeleton, so until they do this settles nothing.
+(defun default-vec-patterns :private (cx: Cx) -> (Result unit TypeError)
+  (Ok ()))
+
+;; The first stuck field, `deref` or float constraint is an error.
+(defun check-unresolved (cx: Cx) -> (Result unit TypeError)
+  (match (find-map (fn (d: Deferred) (unresolved-error cx d)) @(. (. cx u) deferred))
+    ((some e) (Err e))
+    (nil (Ok ()))))
+
+(defun unresolved-error :private (cx: Cx d: Deferred) -> (Option TypeError)
+  (match (. d kind)
+    ((DkField _ f _ text)
+     (some (type-error FieldUnresolved (. d pos)
+             (str-join ["cannot infer the struct type of " text " for field " f "; annotate it"]))))
+    ((DkDeref _ _ text)
+     (some (type-error DerefUnresolved (. d pos)
+             (str-join ["cannot infer whether " text " is a cell, an atom, a weak reference or a task"]))))
+    ((DkFloat t)
+     (some (type-error Ambiguous (. d pos)
+             (str-join ["cannot infer which float type " (cx-show cx t) " is; annotate it"]))))
+    (_ nil)))
+
+;; Replaces each stuck `Send T` by `Send a` for its variables, and emits
+;; `κ ⊑ send` for its colour variables.
+(defun reduce-sends (cx: Cx) -> unit
+  (let ((ds @(. (. cx u) deferred)))
+    (do (set! (. (. cx u) deferred) [])
+        (set! (. (. cx u) deferred)
+              (reduce (fn (out: (Vec Deferred) d: Deferred) (reduce-send cx out d)) [] ds)))))
+
+(defun reduce-send :private (cx: Cx out: (Vec Deferred) d: Deferred) -> (Vec Deferred)
+  (match (. d kind)
+    ((DkSend t path)
+     (match (send-eval (. cx g) (. cx st) t path)
+       ((Err _) (conj out d))
+       ((Ok needs)
+        (do (doseq [[k p] (. needs colours)]
+              (set! (. (. cx u) colours)
+                    (conj @(. (. cx u) colours)
+                          (ColourCon k CSend (if (empty? p) nil (some (str/join ", " p))) nil (. d pos)))))
+            (reduce (fn (acc: (Vec Deferred) [v p])
+                      (conj acc (Deferred (DkSend v p) (. d pos) (. d site) (. d fun))))
+                    out (. needs vars))))))
+    (_ (conj out d))))
+
+;; Adds to `set` the variables determined by its protocol constraints, until
+;; no constraint adds one.
+(defun determined (cx: Cx set: (Vec Key)) -> (Vec Key)
+  (let ((next (reduce (fn (s: (Vec Key) d: Deferred) (determine-by cx s d))
+                      set @(. (. cx u) deferred))))
+    (if (= (count next) (count set)) set (determined cx next))))
+
+(defun determine-by :private (cx: Cx set: (Vec Key) d: Deferred) -> (Vec Key)
+  (match (. d kind)
+    ((DkProto _ args _)
+     (if (some? (find-first (fn (k: Key) (includes? k set)) (general-keys (. cx st) (nth args 0))))
+         (reduce (fn (s: (Vec Key) a: Ty)
+                   (reduce (fn (s2: (Vec Key) k: Key) (if (includes? k s2) s2 (conj s2 k)))
+                           s (general-keys (. cx st) a)))
+                 set args)
+         set))
+    (_ set)))
+
+;; A protocol constraint on a variable that no root holds is ambiguous.
+(defun check-ambiguous (cx: Cx union: (Vec Key)) -> (Result unit TypeError)
+  (match (find-map (fn (d: Deferred) (ambiguous-error cx union d)) @(. (. cx u) deferred))
+    ((some e) (Err e))
+    (nil (Ok ()))))
+
+(defun ambiguous-error :private (cx: Cx union: (Vec Key) d: Deferred) -> (Option TypeError)
+  (match (. d kind)
+    ((DkProto p args _)
+     (if (some? (find-first (fn (k: Key) (not (includes? k union))) (general-keys (. cx st) (nth args 0))))
+         (some (type-error Ambiguous (. d pos)
+                 (str-join ["ambiguous constraint " (. (g-proto (. cx g) p) name) " "
+                            (cx-show cx (nth args 0)) " in " (. d fun) "; add an annotation"])))
+         nil))
+    (_ nil)))
+
+;; `Send`/`Object`/`Weakable` on a variable outside every root: `i64` (§3.6).
+(defun default-outside (cx: Cx union: (Vec Key)) -> (Result unit TypeError)
+  (let ((ds @(. (. cx u) deferred)))
+    (try-let ((changed (loop ((i 0) (changed false))
+                         (if (< i (count ds))
+                             (try-let ((c (default-deferred cx union (nth ds i))))
+                               (recur (+ i 1) (or changed c)))
+                             (Ok changed)))))
+      (if changed (cx-solve-all cx) (Ok ())))))
+
+;; Whether d's type held a variable outside the roots, which is now `i64`.
+(defun default-deferred :private (cx: Cx union: (Vec Key) d: Deferred) -> (Result bool TypeError)
+  (let ((ty (match (. d kind)
+              ((DkSend t _) (some t))
+              ((DkObject t _) (some t))
+              ((DkWeakable t) (some t))
+              (_ nil))))
+    (if-some (t ty)
+      (let ((ks (general-keys (. cx st) t)))
+        (loop ((i 0) (changed false))
+          (if (< i (count ks))
+              (match (nth ks i)
+                ((KeyVar v)
+                 (if (includes? (nth ks i) union)
+                     (recur (+ i 1) changed)
+                     (try-let ((_ (cx-unify cx (TVar v) (ty-i64) (. d pos))))
+                       (recur (+ i 1) true))))
+                (_ (recur (+ i 1) changed)))
+              (Ok changed))))
+      (Ok false))))
+
+;; ---- finalising
+
+;; The list, emptied (Rust `std::mem::take`).
+(defun take-all :private (c: (Cell (Vec a))) -> (Vec a)
+  (let ((v @c))
+    (do (set! c []) v)))
+
+;; Rust: infer/general.rs:351 finalize. Records every remaining method site as
+;; resolved by a bound, and every type of the unit under `map`.
 (defun cx-finalize (cx: Cx map: GenMap closed: Closed) -> unit
-  (trap "todo: cx-finalize"))
+  (do (doseq [[p site] (. closed preds)]
+        (when-some (s site)
+          (set! (. (. cx t) resolutions)
+                (assoc @(. (. cx t) resolutions) s (ResBound (genmap-pred map (. cx st) p))))))
+      (remap-types cx map (. (. cx t) expr-types) (. (. cx u) exprs))
+      (remap-types cx map (. (. cx t) binding-types) (. (. cx u) bindings))
+      (finalize-uses cx map)))
 
-;; Rust: infer/general.rs:396 scheme
+;; The types the unit recorded under `ids`, under the map.
+(defun remap-types :private (cx: Cx map: GenMap table: (Cell (Map i64 Ty)) ids: (Cell (Vec i64))) -> unit
+  (set! table
+        (reduce (fn (acc: (Map i64 Ty) id: i64)
+                  (if-some (t (get acc id)) (assoc acc id (genmap-apply map (. cx st) t)) acc))
+                @table (take-all ids))))
+
+(defun finalize-uses :private (cx: Cx map: GenMap) -> unit
+  (let ((u (. cx u))
+        (tb (. cx t))
+        (st (. cx st)))
+    (do (doseq (id (take-all (. u insts)))
+          (when-some (i (get @(. tb instantiations) id))
+            (set! (. tb instantiations)
+                  (assoc @(. tb instantiations) id
+                         (Instantiation (mapv (fn (x: Ty) (genmap-apply map st x)) (. i tys))
+                                        (mapv (fn (k: Colour) (genmap-colour map k)) (. i colours)))))))
+        (doseq (id (take-all (. u sites)))
+          (when-some (r (get @(. tb resolutions) id))
+            (match r
+              ((ResInstance index args)
+               (set! (. tb resolutions)
+                     (assoc @(. tb resolutions) id
+                            (ResInstance index (mapv (fn (x: Ty) (genmap-apply map st x)) args)))))
+              ((ResBound p)
+               (set! (. tb resolutions)
+                     (assoc @(. tb resolutions) id (ResBound (genmap-pred map st p)))))
+              (_ ()))))
+        (doseq [[id k] (take-all (. u fn-lits))]
+          (set! (. tb fn-colours) (assoc @(. tb fn-colours) id (genmap-colour map k)))))))
+
+;; Rust: infer/general.rs:396 scheme. The scheme of root `i` of a closed unit:
+;; the constraints whose variables the root holds, the colour bounds that remain,
+;; the type under the map.
 (defun cx-scheme (cx: Cx map: GenMap closed: Closed i: i64 root: Ty amps: (Vec bool) params: (Vec str)) -> Scheme
-  (trap "todo: cx-scheme"))
+  (let ((held (nth (. closed sets) i))
+        (st (. cx st))
+        (preds (reduce (fn (acc: (Vec Pred) [p _])
+                         (let ((q (genmap-pred map st p)))
+                           (if (and (every? (fn (k: Key) (includes? k held)) (pred-keys st p))
+                                    (not (includes? q acc)))
+                               (conj acc q)
+                               acc)))
+                       [] (. closed preds))))
+    (Scheme (count (. map names)) (genmap-n-colours map) (. map names) preds
+            (genmap-colour-bounds map st) (genmap-apply map st root) amps params)))
+
+;; The keys of the types of a predicate, in order.
+(defun pred-keys :private (st: Store p: Pred) -> (Vec Key)
+  (reduce (fn (acc: (Vec Key) t: Ty) (into acc (general-keys st t))) [] (pred-tys p)))

@@ -1,15 +1,98 @@
 ;; compiler/types/infer/polyrec.fib: polymorphic recursion (package P10).
 ;; Replaces crates/fibref/src/types/infer/polyrec.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; A fully annotated `defun` may call itself, or another member of its SCC, at
+;; other types than its own: the annotation is the scheme of those occurrences.
+;; A function that calls itself at a type built from its own variable is wanted
+;; at one type, then at a bigger one, without end, so it is refused here
+;; (spec/types.md §3.6). The rule: draw an edge from each variable `r` of a
+;; caller to the variable `v` of the callee that a recursive occurrence
+;; instantiates with a type mentioning `r`, strict when that type is more than
+;; `r` itself. A cycle of edges holding a strict one is an error; a cycle of
+;; plain edges only permutes the variables, and a strict edge on no cycle is
+;; finitely deep. A call at a type with no variable of the caller's draws no
+;; edge. `PolyCall` is in types.infer.cx, so that `Unit` need not depend on
+;; this module.
 (ns types.infer.polyrec
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.display types.infer.cx))
 
-;; Rust: infer/polyrec.rs:117
+;; An edge of the instantiation graph: the caller's variable (a rigid index),
+;; the callee's variable, whether the type given to `to` is more than just
+;; `from`, the occurrence (an index into the unit's calls) and that type.
+(defstruct Edge (from: i64 to: i64 strict: bool call: i64 ty: Ty))
+
+;; The rigid variables of t, each once, in order of first occurrence.
+(defun ty-rigids (t: Ty) -> (Vec i64)
+  (let ((out (cell (vec-empty))))
+    (do (ty-visit t
+          (fn (l: Leaf)
+            (match l
+              ((LRigid r) (when-not (includes? r @out) (set! out (conj @out r))))
+              (_ ()))))
+        @out)))
+
+;; Whether `to` leads back to `from`, through `edges` (a breadth-first walk
+;; from `to`, the edges in order).
+(defun reaches (edges: (Vec Edge) to: i64 from: i64) -> bool
+  (loop ((seen [to]) (at 0))
+    (if (< at (count seen))
+        (let ((v (nth seen at)))
+          (if (= v from)
+              true
+              (recur (reduce (fn (s: (Vec i64) e: Edge)
+                               (if (and (= (. e from) v) (not (includes? (. e to) s)))
+                                   (conj s (. e to))
+                                   s))
+                             seen edges)
+                     (+ at 1))))
+        false)))
+
+;; The edges of the occurrences recorded in this unit, once their types are
+;; solved. An occurrence whose instantiation or callee variables are not
+;; recorded draws none.
+(defun instantiation-edges (cx: Cx) -> (Vec Edge)
+  (let ((calls @(. (. cx u) poly-calls)))
+    (reduce (fn (edges: (Vec Edge) [call c]) (into edges (call-edges cx call c)))
+            [] (zip (range (count calls)) calls))))
+
+(defun call-edges :private (cx: Cx call: i64 c: PolyCall) -> (Vec Edge)
+  (if-some (inst (get @(. (. cx t) instantiations) (. c site)))
+    (if-some (vars (get @(. (. cx u) poly-vars) (. c callee)))
+      (reduce (fn (acc: (Vec Edge) [to t])
+                (let ((ty (store-zonk (. cx st) t)))
+                  (into acc (mapv (fn (from: i64) (Edge from to (not (= ty (TRigid from))) call ty))
+                                  (ty-rigids ty)))))
+              [] (zip vars (. inst tys)))
+      [])
+    []))
+
+;; Rust: infer/polyrec.rs:117. Rejects a member that is called at a growing
+;; type around a cycle of the SCC's occurrences.
 (defun cx-check-polymorphic-recursion (cx: Cx members: (Vec FunDef) ids: (Vec i64)) -> (Result unit TypeError)
-  (trap "todo: cx-check-polymorphic-recursion"))
+  (let ((edges (instantiation-edges cx)))
+    (match (find-first (fn (e: Edge) (and (. e strict) (reaches edges (. e to) (. e from)))) edges)
+      ((some e) (Err (polyrec-error cx members ids e)))
+      (nil (Ok ())))))
 
-;; Rust: infer/polyrec.rs:151
+(defun polyrec-error :private (cx: Cx members: (Vec FunDef) ids: (Vec i64) e: Edge) -> TypeError
+  (let ((c (nth @(. (. cx u) poly-calls) (. e call)))
+        (ty (printer-ty (printer-with-names (. cx g) [] @(. (. cx u) rigid-names)) (. e ty)))
+        (through (if (= (. c caller) (. c callee))
+                     ""
+                     (str-join [" through " (member-name members ids (. c callee))]))))
+    (type-error-other (. c pos)
+      (str-join [(member-name members ids (. c caller)) " recurses" through " at " ty
+                 ": polymorphic recursion is not supported; use loop or a List"]))))
+
+;; The name of the member with id f ("the function" for one that is not a member).
+(defun member-name :private (members: (Vec FunDef) ids: (Vec i64) f: i64) -> str
+  (if-some (i (find-first (fn (i: i64) (= (nth ids i) f)) (range (count ids))))
+    (. (nth members i) name)
+    "the function"))
+
+;; Rust: infer/polyrec.rs:151. The rigid variable of each quantified variable
+;; of an annotation scheme (u32::MAX, which no variable is, for one the
+;; member's names do not hold), by the names the scheme gives them.
 (defun poly-vars (var-names: (Vec str) rigid-map: (Map str i64)) -> (Vec i64)
-  (trap "todo: poly-vars"))
+  (mapv (fn (n: str) (get-or rigid-map n 4294967295)) var-names))

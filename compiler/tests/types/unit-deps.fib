@@ -1,0 +1,117 @@
+;; compiler/tests/types/unit-deps.fib: the inline test of crates/fibref/src/types/
+;; infer/deps.rs (dependencies_come_first_and_cycles_group), and what it leaves
+;; to the code: dependencies before dependents, ties in source order, the
+;; members of a component in source order whatever order the walk found them
+;; in, self loops, a Fun and a Def of one id being two nodes, an edge to a
+;; node outside `nodes`, a long chain; and `deps-refs` (each global once, the
+;; order met, constructors and methods ignored, children walked in `children`
+;; order, a borrowed argument skipped).
+;; Build: fibc build compiler/tests/types/unit-deps.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos types.ty types.ast types.infer.deps types.check))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+(defun f (i: i64) -> Node (NFun i))
+(defun d (i: i64) -> Node (NDef i))
+(defun e (k: Node vs: (Vec Node)) -> (Pair Node (Vec Node)) (Pair k vs))
+(defun sccs (nodes: (Vec Node) es: (Vec (Pair Node (Vec Node)))) -> (Vec (Vec Node))
+  (deps-sccs nodes (reduce (fn (m: (Map Node (Vec Node)) [k v]) (assoc m k v)) (map-empty) es)))
+
+(defun tarjan-tests (cs: Checks) -> unit
+  (do
+    (check cs "the Rust test: a -> b, b -> c, a: c first, then the cycle a b"
+           (= (sccs [(f 0) (f 1) (f 2)] [(e (f 0) [(f 1)]) (e (f 1) [(f 2) (f 0)])])
+              [[(f 2)] [(f 0) (f 1)]]))
+    (check cs "no edges: one component each, in source order"
+           (= (sccs [(f 3) (f 1) (f 2) (d 0)] [])
+              [[(f 3)] [(f 1)] [(f 2)] [(d 0)]]))
+    (check cs "no nodes: no components" (empty? (sccs [] [])))
+    (check cs "a dependency comes before its dependent, the rest keeps source order"
+           (= (sccs [(f 0) (f 1) (f 2)] [(e (f 0) [(f 2)])])
+              [[(f 2)] [(f 0)] [(f 1)]]))
+    (check cs "members of a cycle are in source order whatever order the walk found them"
+           (= (sccs [(f 0) (f 1) (f 2)] [(e (f 2) [(f 0)]) (e (f 0) [(f 1)]) (e (f 1) [(f 2)])])
+              [[(f 0) (f 1) (f 2)]]))
+    (check cs "a cycle entered from the middle"
+           (= (sccs [(f 0) (f 1) (f 2) (f 3)] [(e (f 0) [(f 2)]) (e (f 2) [(f 1)]) (e (f 1) [(f 2)]) (e (f 3) [(f 0)])])
+              [[(f 1) (f 2)] [(f 0)] [(f 3)]]))
+    (check cs "two cycles joined by an edge: the depended-on one first"
+           (= (sccs [(f 0) (f 1) (f 2) (f 3)]
+                    [(e (f 0) [(f 1)]) (e (f 1) [(f 0) (f 2)]) (e (f 2) [(f 3)]) (e (f 3) [(f 2)])])
+              [[(f 2) (f 3)] [(f 0) (f 1)]]))
+    (check cs "a self loop is a component of one"
+           (= (sccs [(f 0) (f 1)] [(e (f 0) [(f 0)]) (e (f 1) [(f 0)])])
+              [[(f 0)] [(f 1)]]))
+    (check cs "Fun 0 and Def 0 are two nodes"
+           (= (sccs [(f 0) (d 0)] [(e (f 0) [(d 0)]) (e (d 0) [(f 0)])])
+              [[(f 0) (d 0)]]))
+    (check cs "Fun 0 and Def 0 do not form a cycle through one id"
+           (= (sccs [(f 0) (d 0)] [(e (f 0) [(d 0)])])
+              [[(d 0)] [(f 0)]]))
+    (check cs "an edge to a node outside the list is visited all the same, first"
+           (= (sccs [(f 0)] [(e (f 0) [(f 9)])])
+              [[(f 9)] [(f 0)]]))
+    (check cs "a node outside the list sorts before the members of its component"
+           (= (sccs [(f 0)] [(e (f 0) [(f 9)]) (e (f 9) [(f 0)])])
+              [[(f 9) (f 0)]]))
+    (check cs "a repeated edge changes nothing"
+           (= (sccs [(f 0) (f 1)] [(e (f 0) [(f 1) (f 1)]) (e (f 1) [(f 0) (f 0)])])
+              [[(f 0) (f 1)]]))))
+
+;; A chain 0 -> 1 -> .. -> n-1 and the same closed into one ring.
+(defun chain-edges (n: i64 ring: bool) -> (Vec (Pair Node (Vec Node)))
+  (mapv (fn (i: i64) (e (f i) (if (< (+ i 1) n) [(f (+ i 1))] (if ring [(f 0)] [])))) (range n)))
+
+(defun long-tests (cs: Checks) -> unit
+  (let ((n 300)
+        (nodes (mapv (fn (i: i64) (f i)) (range n))))
+    (do
+      (let ((out (sccs nodes (chain-edges n false))))
+        (check cs "a chain of 300: 300 components, the last node first, the first node last"
+               (and (= (count out) n) (= (nth out 0) [(f (- n 1))]) (= (nth out (- n 1)) [(f 0)]))))
+      (let ((out (sccs nodes (chain-edges n true))))
+        (check cs "a ring of 300: one component in source order"
+               (and (= (count out) 1) (= (nth out 0) nodes)))))))
+
+;; Expressions of the structure `refs` walks.
+(defun g (r: GlobalRef) -> Expr (Expr 0 p0 (EGlobal r)))
+(defun call (h: Expr args: (Vec Expr)) -> Expr
+  (Expr 0 p0 (ECall h (mapv (fn (a: Expr) (ArgExpr a)) args))))
+
+(defun refs-of (e: Expr) -> (Vec Node)
+  (let ((out (cell [])))
+    (do (deps-refs e out) @out)))
+
+(defun refs-tests (cs: Checks) -> unit
+  (do
+    (check cs "a literal names nothing"
+           (empty? (refs-of (Expr 0 p0 (ELit LitUnit)))))
+    (check cs "a global function and a def"
+           (= (refs-of (call (g (GFun 4)) [(g (GDef 2))])) [(NFun 4) (NDef 2)]))
+    (check cs "each global once, in the order first met"
+           (= (refs-of (call (g (GFun 4)) [(g (GDef 2)) (g (GFun 4)) (g (GFun 1)) (g (GDef 2))]))
+              [(NFun 4) (NDef 2) (NFun 1)]))
+    (check cs "constructors, methods, built-ins and externs are not nodes"
+           (empty? (refs-of (call (g (GCtor 0 nil)) [(g (GMethod 0 1)) (g (GBuiltin 3)) (g (GExtern 2))]))))
+    (check cs "Fun 1 and Def 1 are two nodes"
+           (= (refs-of (call (g (GFun 1)) [(g (GDef 1))])) [(NFun 1) (NDef 1)]))
+    (check cs "an if names its condition, then its branches"
+           (= (refs-of (Expr 0 p0 (EIf (g (GFun 3)) (g (GFun 1)) (g (GFun 2)))))
+              [(NFun 3) (NFun 1) (NFun 2)]))
+    (check cs "a nested call is walked: the head, then the arguments, each deeply"
+           (= (refs-of (call (g (GFun 0)) [(call (g (GFun 1)) [(g (GFun 2))]) (g (GFun 3))]))
+              [(NFun 0) (NFun 1) (NFun 2) (NFun 3)]))
+    (check cs "a borrowed argument names nothing"
+           (= (refs-of (Expr 0 p0 (ECall (g (GFun 0)) [(ArgAmp 5 p0) (ArgExpr (g (GFun 1)))])))
+              [(NFun 0) (NFun 1)]))
+    (check cs "refs adds to what out already holds, once"
+           (let ((out (cell [(NFun 4)])))
+             (do (deps-refs (call (g (GFun 4)) [(g (GFun 5))]) out)
+                 (= @out [(NFun 4) (NFun 5)]))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (tarjan-tests cs)
+        (long-tests cs)
+        (refs-tests cs)
+        (finish cs))))

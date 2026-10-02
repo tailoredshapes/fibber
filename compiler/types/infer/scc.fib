@@ -1,11 +1,208 @@
 ;; compiler/types/infer/scc.fib: inference of a strongly connected component of functions (package P10).
 ;; Replaces crates/fibref/src/types/infer/scc.rs.
-;; STUB of M6 step 3 package P1 (the signatures are the Rust ones: Form is Stx,
-;; Result is the prelude's, `&mut Foo` is the Foo of Cells, an id an i64); the
-;; package that owns this module writes the bodies and the data marked below.
+;;
+;; An SCC of `defun`s (spec/types.md §3.5 step 5, §3.6): each member bound to a
+;; fresh monomorphic type (or, when fully annotated and used polymorphically
+;; inside the SCC, to its annotation), the bodies inferred, the unit closed, one
+;; scheme per member.
+;;
+;; Shapes: the Rust methods of `Cx` that are private to scc.rs are public here
+;; (for tests/types/unit-scc.fib); `member_sig`'s tuple is a `Pair`; the
+;; `HashMap<String, u32>` of a member's rigid variables is a `(Map str i64)`;
+;; `try-times` is the Rust loop that collects a `TResult` per index, stopping
+;; at the first error.
 (ns types.infer.scc
-  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls types.infer.cx))
+  (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast
+        types.decls types.display types.lower.supers types.exhaust
+        types.infer.cx types.infer.unify types.infer.expr types.infer.call
+        types.infer.general types.infer.polyrec))
 
-;; Rust: infer/scc.rs:203 infer_scc
+;; `step` at 0 .. n-1, in order, the results collected; the first error stops.
+(defun try-times (n: i64 step: (fn (i64) (Result b TypeError)) :borrow) -> (Result (Vec b) TypeError)
+  (loop ((i 0) (acc []))
+    (if (< i n)
+        (try-let ((x (step i)))
+          (recur (+ i 1) (conj acc x)))
+        (Ok acc))))
+
+;; The annotation's type, or a fresh variable for a missing one.
+(defun ann-or-fresh :private (cx: Cx a: (Option TypeAnn) pos: Pos) -> (Result Ty TypeError)
+  (match a
+    ((some x) (cx-ann cx x pos))
+    (nil (Ok (cx-fresh cx)))))
+
+;; Rust: infer/scc.rs:19 member_sig. The monomorphic signature of an SCC
+;; member, binding its parameters (an `&` one as a cell of its type); its
+;; annotation scheme when fully annotated (§3.6).
+(defun member-sig (cx: Cx f: FunDef) -> (Result (Pair MonoSig (Option Scheme)) TypeError)
+  (try-let ((params (try-times (count (. f params))
+                      (fn (i: i64)
+                        (let ((p (nth (. f params) i)))
+                          (try-let ((t (ann-or-fresh cx (. p ann) (. f pos))))
+                            (do (cx-bind cx (. p binding) (if (. p amp) (ty-cell t) t))
+                                (Ok t)))))))
+            (ret (ann-or-fresh cx (. f ret) (. f pos))))
+    (let ((sig (MonoSig params (mapv (fn (p: ParamDecl) (. p amp)) (. f params))
+                        (mapv (fn (p: ParamDecl) (. p name)) (. f params)) ret))
+          (full (and (some? (. f ret)) (every? (fn (p: ParamDecl) (some? (. p ann))) (. f params)))))
+      (if full
+          (try-let ((s (annotation-scheme cx f sig)))
+            (Ok (Pair sig (some s))))
+          (Ok (Pair sig nil))))))
+
+;; Rust: infer/scc.rs:56 annotation_scheme. A fully annotated `defun`'s
+;; annotation as a scheme for its recursive occurrences: its rigid variables
+;; quantified, its `:where` bounds as the context. Its colour variables are not
+;; quantified: the recursive occurrences share them with the body, so what the
+;; body requires of a colour holds at every occurrence.
+(defun annotation-scheme (cx: Cx f: FunDef sig: MonoSig) -> (Result Scheme TypeError)
+  (try-let ((bounds (fn-bounds cx f)))
+    (let ((ty (TFn CSend (. sig params) (. sig ret)))
+          (rigid (reduce (fn (acc: (Vec i64) t: Ty)
+                           (reduce (fn (a: (Vec i64) r: i64) (if (includes? r a) a (conj a r)))
+                                   acc (ty-rigids t)))
+                         [] (reduce (fn (acc: (Vec Ty) b: Pred) (into acc (pred-tys b))) [ty] bounds)))
+          (names @(. (. cx u) rigid-names)))
+      (let ((gen (fn (t: Ty) (rigid-to-gen t rigid))))
+        (Ok (Scheme (count rigid) 0 (mapv (fn (r: i64) (nth names r)) rigid)
+                    (mapv (fn (b: Pred) (pred-map-tys b gen)) bounds) []
+                    (gen ty) (. sig amps) (. sig names)))))))
+
+;; t with each rigid variable that `rigid` holds replaced by its position there.
+(defun rigid-to-gen :private (t: Ty rigid: (Vec i64)) -> Ty
+  (ty-map-leaves t
+    (fn (l: Ty)
+      (match l
+        ((TRigid r) (if-some (i (find-first (fn (j: i64) (= (nth rigid j) r)) (range (count rigid))))
+                      (some (TGen i))
+                      nil))
+        (_ nil)))))
+
+;; Rust: infer/scc.rs:113 bounds. The `:where` bounds of `f` as predicates.
+(defun fn-bounds (cx: Cx f: FunDef) -> (Result (Vec Pred) TypeError)
+  (try-times (count (. f bounds))
+    (fn (i: i64)
+      (match (nth (. f bounds) i)
+        ((PaProto p anns)
+         (try-let ((tys (try-times (count anns) (fn (j: i64) (cx-ann cx (nth anns j) (. f pos))))))
+           (Ok (PProto p tys))))
+        ((PaSend a)
+         (try-let ((t (cx-ann cx a (. f pos))))
+           (Ok (PSend t))))))))
+
+;; Rust: infer/scc.rs:135 scc_signatures. Step a: every member's signature;
+;; each member's rigid variable map.
+(defun scc-signatures (cx: Cx members: (Vec FunDef) ids: (Vec i64)) -> (Result (Vec (Map str i64)) TypeError)
+  (try-times (count ids)
+    (fn (i: i64)
+      (let ((id (nth ids i)))
+        (do (set! (. (. cx u) rigid-map) (map-empty))
+            (try-let ((r (member-sig cx (nth members i))))
+              (let ((u (. cx u)))
+                (do (set! (. u mono) (assoc @(. u mono) id (. r fst)))
+                    (when-some (p (. r snd))
+                      (do (set! (. u poly-vars) (assoc @(. u poly-vars) id (poly-vars (. p var-names) @(. u rigid-map))))
+                          (set! (. u poly) (assoc @(. u poly) id p))))
+                    (let ((m @(. u rigid-map)))
+                      (do (set! (. u rigid-map) (map-empty))
+                          (Ok m)))))))))))
+
+;; A bound as the constraint it defers (`who` names what requires an `Object`).
+(defun pred-kind (p: Pred who: str) -> DKind
+  (match p
+    ((PProto q args) (DkProto q args nil))
+    ((PSend t) (DkSend t []))
+    ((PObject t) (DkObject t who))
+    ((PWeakable t) (DkWeakable t))))
+
+;; Rust: infer/scc.rs:165 scc_bodies. Step b: every member's body; each
+;; member's declared bounds.
+(defun scc-bodies (cx: Cx members: (Vec FunDef) ids: (Vec i64) maps: (Vec (Map str i64))) -> (Result (Vec (Vec Pred)) TypeError)
+  (try-times (count ids)
+    (fn (i: i64)
+      (let ((f (nth members i))
+            (id (nth ids i))
+            (u (. cx u)))
+        (do (set! (. u rigid-map) (nth maps i))
+            (set! (. u fun) (. f name))
+            (set! (. u cur) (some id))
+            (try-let ((bounds (fn-bounds cx f)))
+              (do (doseq (b bounds) (cx-defer cx (pred-kind b (. f name)) (. f pos) nil))
+                  (try-let ((body (cx-infer cx (. f body)))
+                            (_ (cx-flow cx body (. (mono-of cx id) ret) (. (. f body) pos))))
+                    (Ok bounds)))))))))
+
+(defun mono-of :private (cx: Cx id: i64) -> MonoSig
+  (unwrap (get @(. (. cx u) mono) id)))
+
+;; Rust: infer/scc.rs:197 check_poly_bounds. A member whose annotation served as
+;; its scheme at a recursive occurrence (§3.6) must declare every bound its body
+;; needs on its own variables, or those occurrences went unchecked.
+(defun check-poly-bounds (cx: Cx members: (Vec FunDef) ids: (Vec i64) maps: (Vec (Map str i64))
+                          declared: (Vec (Vec Pred)) closed: Closed) -> (Result unit TypeError)
+  (match (find-map (fn (i: i64)
+                     (if (contains? @(. (. cx u) poly-used) (nth ids i))
+                         (poly-bound-error cx (nth members i) (nth maps i) (nth declared i) closed)
+                         nil))
+                   (range (count ids)))
+    ((some e) (Err e))
+    (nil (Ok ()))))
+
+;; The error of a member whose own variables hold a constraint its `:where`
+;; does not list, if there is one.
+(defun poly-bound-error :private (cx: Cx f: FunDef rigid: (Map str i64) declared: (Vec Pred) closed: Closed) -> (Option TypeError)
+  (let ((st (. cx st))
+        (own (mapv (fn (r: i64) (KeyRigid r)) (vals rigid)))
+        (decl (entail-closure (. cx g) (mapv (fn (p: Pred) (pred-map-tys p (fn (t: Ty) (store-zonk st t)))) declared))))
+    (find-map (fn (pr: (Pair Pred (Option i64)))
+                (let ((p (. pr fst))
+                      (ks (reduce (fn (acc: (Vec Key) t: Ty) (into acc (general-keys st t))) [] (pred-tys p)))
+                      (z (pred-map-tys (. pr fst) (fn (t: Ty) (store-zonk st t)))))
+                  (if (and (not (empty? ks)) (every? (fn (k: Key) (includes? k own)) ks) (not (includes? z decl)))
+                      (some (type-error-other (. f pos)
+                              (str-join [(. f name) " is used polymorphically in its own definition, so its :where must list "
+                                         (printer-pred (printer-with-names (. cx g) [] @(. (. cx u) rigid-names)) z)])))
+                      nil)))
+              (. closed preds))))
+
+;; The quantified variables of the SCC: every key of every root once, in order,
+;; minus the unification variables of an enclosing level (Rémy: only variables
+;; created at this unit's level, not lowered by unification with an enclosing
+;; level's, are generalised).
+(defun scc-order (cx: Cx closed: Closed) -> (Vec Key)
+  (let ((outer (max 0 (- (store-level (. cx st)) 1))))
+    (filterv (fn (k: Key)
+               (match k
+                 ((KeyVar v) (match (store-level-of (. cx st) v) ((some l) (> l outer)) (nil false)))
+                 (_ true)))
+             (reduce (fn (order: (Vec Key) s: (Vec Key))
+                       (reduce (fn (o: (Vec Key) k: Key) (if (includes? k o) o (conj o k))) order s))
+                     [] (. closed sets)))))
+
+;; The first member body whose matches are not exhaustive, or redundant.
+(defun check-bodies-matches :private (cx: Cx members: (Vec FunDef)) -> (Result unit TypeError)
+  (match (find-map (fn (f: FunDef)
+                     (match (cx-check-matches cx (. f body))
+                       ((Err e) (some e))
+                       ((Ok _) nil)))
+                   members)
+    ((some e) (Err e))
+    (nil (Ok ()))))
+
+;; Rust: infer/scc.rs:203 infer_scc. Infers an SCC of `defun`s and
+;; generalises it (§3.5 a-e).
 (defun cx-infer-scc (cx: Cx members: (Vec FunDef) ids: (Vec i64)) -> (Result (Vec Scheme) TypeError)
-  (trap "todo: cx-infer-scc"))
+  (try-let ((maps (scc-signatures cx members ids))
+            (declared (scc-bodies cx members ids maps)))
+    (let ((roots (mapv (fn (id: i64) (TFn CSend (. (mono-of cx id) params) (. (mono-of cx id) ret))) ids)))
+      (try-let ((closed (cx-close cx roots))
+                (_ (check-poly-bounds cx members ids maps declared closed))
+                (_ (cx-check-polymorphic-recursion cx members ids))
+                (_ (check-bodies-matches cx members)))
+        (let ((map (genmap-new cx (scc-order cx closed) (. closed colours) roots))
+              (schemes (mapv (fn (i: i64)
+                               (let ((m (mono-of cx (nth ids i))))
+                                 (cx-scheme cx map closed i (nth roots i) (. m amps) (. m names))))
+                             (range (count ids)))))
+          (do (cx-finalize cx map closed)
+              (Ok schemes)))))))
