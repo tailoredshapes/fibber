@@ -35,12 +35,13 @@
 ;;   its own call again chains up to max-steps expansions, 100,000 by
 ;;   default, which no native stack holds); what one pass of it decides is
 ;;   the enum `Rewriting` (not `Head`: the compiler's lowering takes the
-;;   private `Head` of expand.types for it), `Settled` (return the form)
-;;   or `Rewrote` (admit the result, go again).
+;;   private `Head` of expand.types for it), `Settled` (return the form),
+;;   `Rewrote` (admit the result, go again) or `Respelled` (go again at once).
 ;; - `plan` is private and gives the `Planned` of the form it was given
 ;;   (Rust's `(Role, Finish)` and the form beside them).
 (ns expand.expr
-  (:require [expand.prelude :as prelude] [expand.quasi :as quasi] [expand.params :as params])
+  (:require [expand.prelude :as prelude] [expand.quasi :as quasi] [expand.params :as params]
+            [expand.brackets :as brackets])
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.core
         expand.build expand.heads expand.collections expand.fuse))
 
@@ -123,7 +124,10 @@
   ;; the form is not a macro call (or a declined one): the answer
   (Settled form: Stx)
   ;; the call's expansion, still to be admitted and looked at again
-  (Rewrote form: Stx))
+  (Rewrote form: Stx)
+  ;; a bracket `let`, `loop` or `fn` in its parenthesised spelling: looked at again, but it is
+  ;; neither a step nor admitted (X2)
+  (Respelled form: Stx))
 
 ;; A prelude macro call: counted as a step and rewritten, or declined. A
 ;; call written `fib.prelude/NAME` counts a step only when it expands: the
@@ -154,6 +158,15 @@
        ((Err e) (Err e))
        ((Ok f) (Ok (Rewrote f)))))))
 
+;; A `let`, `loop` or `fn` written with a bracket operand is respelled with parentheses (X2,
+;; expand.brackets); any other form goes on to `params-step`. (the `has_brackets` arm of
+;; `expand_head`)
+(defun bracket-step :private (ex: Expander form: Stx) -> (Result Rewriting ExpandError)
+  (if (brackets/has-brackets form)
+      (try-let ((f (brackets/rewrite form)))
+        (Ok (Respelled f)))
+      (params-step ex form)))
+
 ;; A `fn` literal with a pattern parameter is one more rewriting step, to a
 ;; plain parameter and a `let` (X4, expand.params); any other form is
 ;; settled. (the last arm of `expand_head`)
@@ -171,7 +184,7 @@
     ((some _) (user-step ex form name))
     (nil (if (some? (prelude/macro-of (. ex ctx) name))
              (prelude-step ex form name)
-             (params-step ex form)))))
+             (bracket-step ex form)))))
 
 ;; One pass over a form whose head is the symbol name.
 (defun head-step :private (ex: Expander form: Stx name: str) -> (Result Rewriting ExpandError)
@@ -202,6 +215,7 @@
        (match (head-step ex form name)
          ((Err e) (Err e))
          ((Ok (Settled f)) (Ok f))
+         ((Ok (Respelled f)) (recur f))
          ((Ok (Rewrote f))
           (match (ctx-admit (. ex ctx) f (. form pos))
             ((Err e) (Err e))

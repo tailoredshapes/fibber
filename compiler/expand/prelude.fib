@@ -31,8 +31,6 @@
 ;;   error where it is used unqualified (syntax §5).
 ;; - A Rust `Option<(Form, Form)>` or a tuple of forms is a `(Vec Stx)` of
 ;;   the parts in order; `Vec<Form>` iterated with `skip(n)` is `tail-from`.
-;; - the Rust's second check of a `cond` clause cannot fire after its first
-;;   and is not ported (`bad-clause` is the one check).
 ;; - a call whose head names no row (`()`, which `is-macro` never lets
 ;;   through) is declined, as the Rust does.
 ;; - `list`, `plet`, `->`, `->>`, `doto`, `assert` and `dbg` (the Rust
@@ -209,17 +207,14 @@
                     (recur (- j 2) expr))
                 (recur (- j 2) (call "if" [test expr acc] pos))))))))
 
-;; The `x e` of the `(x e)` binding of `if-let`/`when-let`.
+;; The `x e` of the `[x e]` or `(x e)` binding of `if-let`/`when-let`. (`option_binding`)
 (defun option-binding :private (name: str form: Stx) -> (Result (Vec Stx) ExpandError)
-  (match (items-of form)
-    ((some parts)
-     (if (= (count parts) 2)
-         (Ok parts)
-         (Err (malformed name "the binding is (pattern expression)" (. form pos)))))
-    (nil (Err (malformed name "the binding is (pattern expression)" (. form pos))))))
+  (match (seq-items form)
+    ((some [x e]) (Ok [x e]))
+    (_ (Err (malformed name "the binding is [pattern expression]" (. form pos))))))
 
-;; `(if-let (p e) a b)` ==> `(match e ((fib.prelude/some p) a) (_ b))`;
-;; `(if-let (p e) a)` has `()` as its else (§4.4, stdlib §2.4).
+;; `(if-let [p e] a b)` ==> `(match e ((fib.prelude/some p) a) (_ b))`;
+;; `(if-let [p e] a)` has `()` as its else (§4.4, stdlib §2.4).
 (defun if-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "if-let" items 2 (some 3) pos)
     ((Err e) (Err e))
@@ -230,7 +225,7 @@
         (Ok (option-match (nth b 0) (nth b 1) (nth items 2)
                           (if (> (count items) 3) (nth items 3) (unit pos)) pos)))))))
 
-;; `(when-let (p e) body...)` ==> `(match e ((fib.prelude/some p) body)
+;; `(when-let [p e] body...)` ==> `(match e ((fib.prelude/some p) body)
 ;; (_ ()))`.
 (defun when-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "when-let" items 1 nil pos)
@@ -266,25 +261,25 @@
         (lp (call "loop" [vars branch] pos)))
     (call "let" [(list-form (. c bounds) pos) lp] pos)))
 
-;; `(dotimes (i n) body...)`.
+;; `(dotimes [i n] body...)`.
 (defun dotimes-macro :private (ctx: ExpandCtx items: (Vec Stx) pos: Pos)
     -> (Result Stx ExpandError)
   (match (check-arity "dotimes" items 1 nil pos)
     ((Err e) (Err e))
     ((Ok _)
      (match (counter-spec (nth items 1))
-       (nil (Err (malformed "dotimes" "expected (dotimes (sym count) body)" (. (nth items 1) pos))))
+       (nil (Err (malformed "dotimes" "expected (dotimes [sym count] body)" (. (nth items 1) pos))))
        ((some spec)
         (let ((m (ctx-gensym ctx "m" pos)))
           (Ok (counting-loop (Counting (nth spec 0) [(list-form [m (nth spec 1)] pos)] (int 0 pos) m)
                              (tail-from items 2)
                              pos))))))))
 
-;; The `i n` of a `(i n)` with `i` a symbol.
+;; The `i n` of a `[i n]` or `(i n)` with `i` a symbol.
 (defun counter-spec :private (form: Stx) -> (Option (Vec Stx))
-  (match (items-of form)
-    (nil nil)
-    ((some xs) (if (and (= (count xs) 2) (some? (sym-of (nth xs 0)))) (some xs) nil))))
+  (match (seq-items form)
+    ((some [i n]) (if (some? (sym-of i)) (some [i n]) nil))
+    (_ nil)))
 
 ;; The `a b` of a literal `(range a b)`, or `0 n` of `(range n)`
 ;; (Decided, owner, 2026-09-27: `(range n)` is `(range 0 n)`).
@@ -313,34 +308,28 @@
              (Ok (Rewritten (call "fib.seq/range-by" [(nth items 1) (nth items 2) (int 1 pos)] pos)))
              (Ok (Declined (list-form items pos))))))))
 
-;; The `i` and body of a literal `(fn (i) body+)`, as `i` then the body:
-;; no name, one unannotated parameter, no result annotation.
+;; The `i` and body of a literal `(fn [i] body+)` (or `(fn (i) body+)`), as `i` then the body:
+;; no name, one unannotated parameter, no result annotation. (`literal_fn`)
 (defun literal-fn :private (form: Stx) -> (Option (Vec Stx))
   (match (items-of form)
-    (nil nil)
-    ((some xs)
-     (if (and (>= (count xs) 3) (is-sym (nth xs 0) "fn"))
-         (fn-parameter xs)
-         nil))))
+    ((some xs) (if (and (>= (count xs) 3) (is-sym (nth xs 0) "fn")) (fn-parameter xs) nil))
+    (nil nil)))
 
-;; The parameter of `(fn (p) body+)` and its body, when `p` is a plain name.
+;; The parameter of `(fn [p] body+)` and its body, when `p` is a plain name.
 (defun fn-parameter :private (xs: (Vec Stx)) -> (Option (Vec Stx))
-  (match (items-of (nth xs 1))
-    (nil nil)
-    ((some ps)
-     (if (= (count ps) 1)
-         (match (sym-of (nth ps 0))
-           (nil nil)
-           ((some name)
-            (if (or (ends-with-colon name) (= name "nil") (is-sym (nth xs 2) "->"))
-                nil
-                (some (concat-forms [(nth ps 0)] (tail-from xs 2))))))
-         nil))))
+  (match (seq-items (nth xs 1))
+    ((some [p])
+     (if-some [name (sym-of p)]
+       (if (or (ends-with-colon name) (= name "nil") (is-sym (nth xs 2) "->"))
+           nil
+           (some (concat-forms [p] (tail-from xs 2))))
+       nil))
+    (_ nil)))
 
 (defun ends-with-colon :private (s: str) -> bool
   (and (> (str-len s) 0) (= (str-slice s (- (str-len s) 1) (str-len s)) ":")))
 
-;; `(for-each (range a b) (fn (i) body...))` becomes the loop; any other
+;; `(for-each (range a b) (fn [i] body...))` becomes the loop; any other
 ;; `(for-each c f)` is `(fib.seq/run! f c)`, the library's walk with the
 ;; function first; any other number of arguments is the macro's arity
 ;; error.

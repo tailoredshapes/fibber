@@ -79,12 +79,15 @@
 ;; Where the tail sub-forms of a form are: none (the form is a leaf tail),
 ;; every item from an index on (the branches of an `if`), the last item (the
 ;; body of `let`, `do`, `loop`, `when`..), or the last item of every clause
-;; from an index on (`match`, `cond`).
+;; from an index on (`match`), or the expression of every pair of a test and an
+;; expression from an index on (the flat `cond`: every second item after the test
+;; at the index; X2, `Shape::Flat`).
 (defenum TailShape :private
   TailLeaf
   (TailFrom n: i64)
   TailLast
-  (TailClauses n: i64))
+  (TailClauses n: i64)
+  (TailFlat n: i64))
 
 (defun tail-shape :private (form: Stx) -> TailShape
   (match (items-of form)
@@ -99,7 +102,7 @@
                    (>= n 3))
               TailLast
              (and (= head "match") (>= n 3)) (TailClauses 2)
-             (and (= head "cond") (>= n 2)) (TailClauses 1)
+             (and (= head "cond") (>= n 2)) (TailFlat 1)
              true TailLeaf)))))
 
 ;; A form with its tails rewritten, and whether one was a `reduced`.
@@ -125,45 +128,47 @@
 (defun list-items :private (form: Stx) -> (Vec Stx)
   (unwrap-or (items-of form) (vec-empty)))
 
+;; What the item at index `i` of `n` items is for a shape: not a tail, a tail itself, or
+;; a clause whose last form is the tail.
+(defenum Slot :private Untouched Tail InClause)
+
+(defun slot-of :private (shape: TailShape i: i64 n: i64) -> Slot
+  (match shape
+    ((TailFrom k) (if (>= i k) Tail Untouched))
+    ((TailLast) (if (= i (- n 1)) Tail Untouched))
+    ((TailClauses k) (if (>= i k) InClause Untouched))
+    ((TailFlat k) (if (and (> i k) (even? (- i k 1))) Tail Untouched))
+    ((TailLeaf) Untouched)))
+
 ;; `form` with its tails rewritten.
 (defun tails-of-form :private (form: Stx pos: Pos) -> TailForm
   (match (tail-shape form)
     ((TailLeaf) (leaf-tail form pos))
-    ((TailFrom n) (rebuilt form (items-from (list-items form) n pos)))
-    ((TailLast) (rebuilt form (items-from (list-items form) (- (count (list-items form)) 1) pos)))
-    ((TailClauses n) (rebuilt form (items-clauses (list-items form) n pos)))))
+    (shape (let [r (rewrite-items (list-items form) shape pos)]
+             (TailForm (Stx (SList (. r items)) (. form pos)) (. r found))))))
 
-(defun rebuilt :private (form: Stx r: TailItems) -> TailForm
-  (TailForm (Stx (SList (. r items)) (. form pos)) (. r found)))
+;; Items with the tails the shape picks rewritten, and whether one was a `reduced`.
+(defun rewrite-items :private (items: (Vec Stx) shape: TailShape pos: Pos) -> TailItems
+  (loop [i 0 acc (vec-empty) found false]
+    (if (>= i (count items))
+        (TailItems acc found)
+        (let [x (nth items i)
+              r (match (slot-of shape i (count items))
+                  ((Tail) (tails-of-form x pos))
+                  ((InClause) (clause-tail x pos))
+                  ((Untouched) (TailForm x false)))]
+          (recur (+ i 1) (conj acc (. r form)) (or found (. r found)))))))
 
-;; Every item from index `from` on, rewritten as a tail.
-(defun items-from :private (items: (Vec Stx) from: i64 pos: Pos) -> TailItems
-  (loop ((i 0) (acc (vec-empty)) (found false))
-    (if (< i (count items))
-        (if (>= i from)
-            (let ((r (tails-of-form (nth items i) pos)))
-              (recur (+ i 1) (conj acc (. r form)) (or found (. r found))))
-            (recur (+ i 1) (conj acc (nth items i)) found))
-        (TailItems acc found))))
-
-;; The last part of every clause `(head body+)` from index `from` on; a
-;; clause that is not a list of two or more forms is left as it is.
-(defun items-clauses :private (items: (Vec Stx) from: i64 pos: Pos) -> TailItems
-  (loop ((i 0) (acc (vec-empty)) (found false))
-    (if (< i (count items))
-        (if (>= i from)
-            (let ((r (clause-tail (nth items i) pos)))
-              (recur (+ i 1) (conj acc (. r form)) (or found (. r found))))
-            (recur (+ i 1) (conj acc (nth items i)) found))
-        (TailItems acc found))))
-
+;; The last part of a clause `(head body+)`; a clause that is not a list of two or more forms
+;; is left as it is.
 (defun clause-tail :private (clause: Stx pos: Pos) -> TailForm
   (match (items-of clause)
-    (nil (TailForm clause false))
     ((some parts)
      (if (>= (count parts) 2)
-         (rebuilt clause (items-from parts (- (count parts) 1) pos))
-         (TailForm clause false)))))
+         (let [r (rewrite-items parts TailLast pos)]
+           (TailForm (Stx (SList (. r items)) (. clause pos)) (. r found)))
+         (TailForm clause false)))
+    (nil (TailForm clause false))))
 
 ;; Whether the form is `->` or `:where`, which a literal fn may carry
 ;; after its parameters.
@@ -173,7 +178,7 @@
     ((SKw k) (= k "where"))
     (_ false)))
 
-;; Whether the form is a literal `(fn (acc x) body+)`: no name, two
+;; Whether the form is a literal `(fn [acc x] body+)` (or `(fn (acc x) body+)`): no name, two
 ;; parameters, no `->` or `:where` before the body.
 (defun literal-fn :private (form: Stx) -> bool
   (match (items-of form)
@@ -181,17 +186,17 @@
     ((some items)
      (and (>= (count items) 3)
           (is-sym (nth items 0) "fn")
-          (match (items-of (nth items 1))
-            (nil false)
-            ((some ps) (= (count ps) 2)))
-          (if (is-annotation (nth items 2)) false true)))))
+          (match (seq-items (nth items 1))
+            ((some [_ _]) true)
+            (_ false))
+          (not (is-annotation (nth items 2)))))))
 
 ;; `f` with its tails rewritten, when it is a literal `fn` that has a
 ;; `reduced` in a tail position.
 (defun with-reduced-tails :private (f: Stx pos: Pos) -> (Option Stx)
   (if (literal-fn f)
-      (let ((items (list-items f))
-            (r (items-from items (- (count items) 1) pos)))
+      (let [items (list-items f)
+            r (rewrite-items items TailLast pos)]
         (if (. r found) (some (Stx (SList (. r items)) (. f pos))) nil))
       nil))
 
