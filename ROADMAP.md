@@ -271,6 +271,14 @@ are from runs on 2026-10-01):
 - [ ] types (10,800 Rust lines), ownership (4,400), the lIR emitter
       (8,000), macros through lair (750), the driver (830)
 
+**Resumed** (owner, 2026-10-02: "proceed with M6 now; I don't want to
+get stuck behind verification"). While the Rust packages of M7's tranche 2
+land, their expander and prelude changes are not mirrored into
+`compiler/expand/` in the same commit: `bootstrap_expand` is behind the
+`mirror` feature of `crates/fibc` and each package lists what to re-sync in
+`compiler/mirror-pending/` (README there). Mutation reviews and other
+verification run in the background and gate nothing.
+
 **Paused** (owner, 2026-10-01) after step 2a until M7's library is
 viable. The faithful ports so far are 0.8 times the Rust's code lines
 and 1.25 times its bytes, because the prelude lacks what makes Clojure
