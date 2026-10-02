@@ -176,50 +176,38 @@
 (defun item-or-boolean :private (args: (Vec Stx) b: bool pos: Pos) -> Stx
   (if (= (count args) 1) (nth args 0) (boolean b pos)))
 
-;; Whether a `cond` clause test is the catch-all `else` or `:else`.
-(defun is-else :private (test: Stx) -> bool
+;; `(cond t1 e1 t2 e2 ..)`, Clojure's flat form: nested `if`s, tried in order. A
+;; test that is a keyword (`:else`) is always true and must be the last one;
+;; without one, falling off the end is `(trap "cond: no clause matched at POS")`,
+;; which has every type, so `(cond)` is that trap. An odd number of forms is a
+;; test with no expression.
+(defun cond-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
+  (let ((forms (tail-from items 1)))
+    (if (!= (* 2 (quot (count forms) 2)) (count forms))
+        (Err (malformed "cond" "a test with no expression" (. (nth forms (- (count forms) 1)) pos)))
+        (let ((message (str-join ["cond: no clause matched at " (pos-display pos)])))
+          (cond-fold forms (call (prelude-name "trap") [(string message pos)] pos) pos)))))
+
+;; Whether a `cond` test is a keyword, which is always true.
+(defun is-kw-test :private (test: Stx) -> bool
   (match (. test kind)
-    ((SSym s) (= s "else"))
-    ((SKw k) (= k "else"))
+    ((SKw _) true)
     (_ false)))
 
-;; The first clause of `cond` that is not a list of two or more forms.
-(defun bad-clause :private (clauses: (Vec Stx)) -> (Option Stx)
-  (loop ((i 0))
-    (if (< i (count clauses))
-        (match (items-of (nth clauses i))
-          ((some parts) (if (< (count parts) 2) (some (nth clauses i)) (recur (+ i 1))))
-          (nil (some (nth clauses i))))
-        nil)))
-
-;; `(cond (test body+)*)`: nested `if`s, tried in order. A final clause
-;; whose test is `else` or `:else` is the default; without one, falling
-;; off the end is `(trap "cond: no clause matched at POS")`, which has
-;; every type, so `(cond)` is that trap.
-(defun cond-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
-  (let ((clauses (tail-from items 1)))
-    (match (bad-clause clauses)
-      ((some bad) (Err (malformed "cond" "a clause is (test body+)" (. bad pos))))
-      (nil
-       (let ((message (str-join ["cond: no clause matched at " (pos-display pos)])))
-         (cond-fold clauses (call (prelude-name "trap") [(string message pos)] pos) pos))))))
-
-;; The clauses, last first, folded onto the trap: clause j is the default
+;; The pairs, last first, folded onto the trap: a keyword test is the default
 ;; only when it is the last one.
-(defun cond-fold :private (clauses: (Vec Stx) trap: Stx pos: Pos) -> (Result Stx ExpandError)
-  (let ((last (- (count clauses) 1)))
+(defun cond-fold :private (forms: (Vec Stx) trap: Stx pos: Pos) -> (Result Stx ExpandError)
+  (let ((last (- (count forms) 2)))
     (loop ((j last) (acc trap))
       (if (< j 0)
           (Ok acc)
-          (let ((cpos (. (nth clauses j) pos))
-                (parts (unwrap-or (items-of (nth clauses j)) (vec-empty)))
-                (test (nth parts 0))
-                (body (body-form (tail-from parts 1) cpos)))
-            (if (is-else test)
+          (let ((test (nth forms j))
+                (expr (nth forms (+ j 1))))
+            (if (is-kw-test test)
                 (if (!= j last)
-                    (Err (malformed "cond" "else must be the last clause" cpos))
-                    (recur (- j 1) body))
-                (recur (- j 1) (call "if" [test body acc] pos))))))))
+                    (Err (malformed "cond" "a keyword test must be the last" (. test pos)))
+                    (recur (- j 2) expr))
+                (recur (- j 2) (call "if" [test expr acc] pos))))))))
 
 ;; The `x e` of the `(x e)` binding of `if-let`/`when-let`.
 (defun option-binding :private (name: str form: Stx) -> (Result (Vec Stx) ExpandError)
