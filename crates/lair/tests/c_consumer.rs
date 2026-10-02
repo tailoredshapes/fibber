@@ -211,6 +211,7 @@ fn expected_checks() -> Vec<String> {
             )
         ),
         "exe bad level: opt_level is 9, not 0 to 3".into(),
+        "exe with a missing library directory: error: -L /no/such/lair/library/directory: No such file or directory (os error 2)".into(),
         "bad opt level: opt_level is 7, not 0 to 3".into(),
         "null jit: jit is null".into(),
         "null src: src is null but its length is 3".into(),

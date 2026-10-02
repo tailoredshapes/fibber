@@ -152,7 +152,7 @@ fn the_header_declares_exactly_what_the_crate_exports() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let rust = all_exports(&root.join("src/capi")).unwrap();
     let header = std::fs::read_to_string(root.join("include/lair.h")).unwrap();
-    assert!(rust.len() >= 21, "found only {:?}", rust.keys());
+    assert!(rust.len() >= 22, "found only {:?}", rust.keys());
     compare(&rust, &declared(&header).unwrap()).unwrap();
 }
 

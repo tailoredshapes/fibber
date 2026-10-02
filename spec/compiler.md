@@ -503,8 +503,8 @@ handles may be used from any one thread at a time, different handles
 from different threads at once (`crates/lair/tests/capi.rs`,
 `capi_mailbox.rs` run sessions and mailboxes in several threads).
 `lair.h` has the exact C types (every length is a `size_t`; an address is
-a `size_t`). The interface is 21 functions, the two tables below: `nm -D
---defined-only target/debug/liblair.so | grep -c ' T lair_'` prints 21,
+a `size_t`). The interface is 22 functions, the two tables below: `nm -D
+--defined-only target/debug/liblair.so | grep -c ' T lair_'` prints 22,
 and a unit test (`crates/lair/src/capi/header.rs`) keeps `lair.h` equal
 to the `#[no_mangle]` functions of the source, parameter counts included.
 
@@ -517,6 +517,7 @@ to the `#[no_mangle]` functions of the source, parameter counts included.
 | `lair_error *lair_jit_c_entry(lair_jit *, name, len, size_t *out)` | its `ccc` entry, a trampoline when it is not `ccc` (`Jit::c_entry`) |
 | `lair_error *lair_check_source(src, len)` | parse and check, no code |
 | `lair_error *lair_build_executable(src, len, path, len, int opt_level, const char *const *libs, const size_t *lib_lens, size_t n)` | compile a module that satisfies the `main` rule and link it; each of the `n` names is linked as `-lNAME`, after libm and libpthread, which are always linked, and is found where the process's `cc` finds it: **the library search is the system's, and no `-L` directory or rpath can be given through this function** (`aot::build_executable` with `Options::lib_dirs` empty) |
+| `lair_error *lair_build_executable_with(src, len, path, len, int opt_level, libs, lib_lens, size_t n_libs, const char *const *dirs, const size_t *dir_lens, size_t n_dirs)` | as `lair_build_executable`, and each of the `n_dirs` directories is a library directory of the link: `-L` and an absolute canonical **rpath** (`aot::build_executable` with `Options::lib_dirs`, `aot::library_dir`'s rules: a directory that is missing, is no directory, or has `:` or `$` in its canonical name is an error before anything is compiled), so the executable finds its libraries with no `LD_LIBRARY_PATH`, as `fibc build -L` does (§1). `lair_build_executable` stays, and is this function with no directories. Tested by `crates/lair/tests/link.rs` (an executable built through it runs from `/` without `LD_LIBRARY_PATH`) and `crates/lair/tests/c/consumer.c`; the fibber binding is `build-executable` of `compiler/lair/jit.fib`, which `fibc2 build -L` calls |
 | `const char *lair_error_text(const lair_error *, size_t *len)`, `void lair_error_free(lair_error *)` | the message |
 | `int64_t lair_call_i64(size_t addr, const int64_t *args, size_t n)`, `double lair_call_f64(...)` | call a C-ABI function at `addr` with `n <= 8` integer or pointer arguments (a float or double *parameter* cannot be passed; a double *result* is `lair_call_f64`); fibber cannot call a function pointer itself. These two have no error channel, so a call that cannot be made (`addr` 0, `n > 8`, null `args` with `n > 0`) is not made and returns 0. A result narrower than 64 bits has unspecified high bits |
 

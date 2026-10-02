@@ -110,12 +110,28 @@ lair_error *lair_check_source(const char *src, size_t src_len);
  * linked); libs and lib_lens may be NULL when n_libs is 0. The library
  * search is the system's, the way `cc` does it: there is no argument
  * for a library directory, so a library outside the system's
- * directories cannot be named here and no rpath is written. (The Rust
- * API's aot::Options::lib_dirs has both; the C interface does not
- * give it yet.) The executable's exit status is main's result. */
+ * directories cannot be named here and no rpath is written (see
+ * lair_build_executable_with for that). The executable's exit status is
+ * main's result. */
 lair_error *lair_build_executable(const char *src, size_t src_len, const char *path,
                                   size_t path_len, int opt_level, const char *const *libs,
                                   const size_t *lib_lens, size_t n_libs);
+
+/* As lair_build_executable, and each of the n_dirs directories dirs[i]
+ * (of length dir_lens[i]; dirs and dir_lens may be NULL when n_dirs is
+ * 0) is a library directory of the link: given to `cc` as -L and
+ * written into the executable as an rpath, the directory's absolute
+ * canonical path, as the Rust API's aot::Options::lib_dirs and `fibc
+ * build -L` do. The executable then finds its libraries when it runs,
+ * from any directory and without LD_LIBRARY_PATH. A directory that is
+ * missing, is not a directory, or whose canonical path holds ':' or '$'
+ * (an rpath cannot hold either) is an error, before anything is
+ * compiled. */
+lair_error *lair_build_executable_with(const char *src, size_t src_len, const char *path,
+                                       size_t path_len, int opt_level, const char *const *libs,
+                                       const size_t *lib_lens, size_t n_libs,
+                                       const char *const *dirs, const size_t *dir_lens,
+                                       size_t n_dirs);
 
 /* ------------------------------------------------------------------ */
 /* Calling an address                                                 */

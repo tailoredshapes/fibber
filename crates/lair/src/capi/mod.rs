@@ -42,7 +42,7 @@ mod header;
 mod jit;
 mod mailbox;
 
-pub use aot::lair_build_executable;
+pub use aot::{lair_build_executable, lair_build_executable_with};
 pub use call::{lair_call_f64, lair_call_i64};
 pub use check::lair_check_source;
 pub use error::{lair_error_free, lair_error_text, LairError};

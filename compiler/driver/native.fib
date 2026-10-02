@@ -1,9 +1,9 @@
 ;; compiler/driver/native.fib: what the driver does with the lIR text through lair's C interface (spec/compiler.md §9) and the C
 ;; library, as crates/fibc/src/main.rs `run` and `build`: the JIT session that runs `main` (`run-lir`), the executable
 ;; (`build-lir`), the environment (`getenv-opt`, `setenv-set`), the check that a `-L` directory can be read and the reason a file cannot (`fault-of`).
-;; Shapes decided: the C interface has no library directory for the link (`lair_build_executable`, lair.h: "no rpath is written"),
-;; so each `-L` directory is given to `cc` through LIBRARY_PATH (found at link time) and the executable carries no rpath: it finds
-;; its libraries only if the loader does. The Rust gives the directory twice: `-L` and an rpath (aot/link.rs:53 `args`).
+;; Shape decided: each `-L` directory goes to lair's link through `lair_build_executable_with` (lair.h, spec/compiler.md §9), which gives
+;; it to `cc` twice as the Rust does, `-L` and an absolute rpath (aot/link.rs `args`), so the executable finds its libraries without
+;; LD_LIBRARY_PATH.
 ;; `run` calls `main` on the stack of the driver's thread through `call-i64`, as the Rust calls it on its own.
 (ns driver.native
   (:require [lair.jit :as jit] [lair.call :as call] [lair.ffi :as ffi]))
@@ -55,8 +55,9 @@
         (ffi/free-addr (ffi/ptr->addr k))
         (ffi/free-addr (ffi/ptr->addr v)))))
 
-;; Whether `dir` is a directory that can be read. Rust: aot/link.rs:30 `library_dir` (which also takes its canonical path, and refuses a
-;; path holding `:` or `$`, which an rpath cannot hold: no rpath is written here).
+;; Whether `dir` is a directory that can be read, so that a bad `-L` is exit 2 before the front end runs. Rust: aot/link.rs `library_dir`
+;; (which also takes the canonical path and refuses a path holding `:` or `$`, which an rpath cannot hold: here that refusal is the
+;; link's, `lair_build_executable_with`, and comes as a compile failure).
 (defun readable-dir? (dir: str) -> bool
   (let ((p (ffi/bytes-new dir))
         (d (unsafe (ffi/ptr->addr (opendir p)))))
@@ -83,5 +84,4 @@
 
 ;; The executable `out` of the module `lir`, linked against the libraries `libs`, searched in `dirs`. Rust: main.rs:200 `build`
 (defun build-lir (lir: str out: str opt: i64 dirs: (Vec str) libs: (Vec str)) -> (Result unit str)
-  (do (when-not (empty? dirs) (setenv-set "LIBRARY_PATH" (str-join (vec (interpose ":" dirs)))))
-      (jit/build-executable lir out opt libs)))
+  (jit/build-executable lir out opt libs dirs))

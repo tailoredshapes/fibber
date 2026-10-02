@@ -6,18 +6,22 @@
 //!
 //! The libraries are tiny C files compiled with `cc -shared`:
 //! `liblairtest.so` (`lairtest_triple`) and `liblairtwo.so`
-//! (`lairtwo_add`).
+//! (`lairtwo_add`). The last tests do the same through the C interface's
+//! `lair_build_executable_with`.
 
 #![cfg(unix)]
 
 mod common;
 
+use std::ffi::c_char;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::ptr;
 
 use common::bounded;
-use common::Scratch;
+use common::{s, take, Scratch};
 use lair::aot::{build_executable, Options};
+use lair::capi::lair_build_executable_with;
 use lair::Error;
 
 const TRIPLE_C: &str = "int lairtest_triple(int n) { return 3 * n; }\n";
@@ -266,4 +270,94 @@ fn the_command_line_names_a_directory_that_is_missing() {
         text(&out.stderr)
     );
     assert!(!scratch.path().join("one").exists());
+}
+
+// ---- the C interface: lair_build_executable_with (spec/compiler.md §9) ----
+
+/// `lair_build_executable_with` as a C caller writes it: the error text,
+/// or `None` for success.
+fn build_through_c(program: &str, exe: &Path, libs: &[&str], dirs: &[&Path]) -> Option<String> {
+    let strs = |v: &[&str]| -> (Vec<*const c_char>, Vec<usize>) {
+        (
+            v.iter().map(|x| x.as_ptr().cast()).collect(),
+            v.iter().map(|x| x.len()).collect(),
+        )
+    };
+    let dirs: Vec<&str> = dirs.iter().map(|d| d.to_str().expect("utf-8")).collect();
+    let ((lp, ll), (dp, dl)) = (strs(libs), strs(&dirs));
+    let (c, cl) = s(program);
+    let (p, pl) = s(exe.to_str().expect("utf-8"));
+    // SAFETY: every pointer is to bytes of the length beside it, alive
+    // for the call.
+    unsafe {
+        take(lair_build_executable_with(
+            c,
+            cl,
+            p,
+            pl,
+            0,
+            lp.as_ptr(),
+            ll.as_ptr(),
+            libs.len(),
+            dp.as_ptr(),
+            dl.as_ptr(),
+            dirs.len(),
+        ))
+    }
+}
+
+/// The directories of the C interface are written as the Rust options'
+/// are: -L and an absolute rpath, so the executable runs from another
+/// directory with no `LD_LIBRARY_PATH`; and the function without them
+/// still cannot find a library outside the system's.
+#[test]
+fn the_c_interface_writes_an_rpath_for_each_directory_it_is_given() {
+    let scratch = Scratch::new("link-capi");
+    let one = library(scratch.path(), "lairtest", TRIPLE_C);
+    let two = library(scratch.path(), "lairtwo", ADD_C);
+    let exe = scratch.path().join("two");
+    let got = build_through_c(TWO_LIBRARIES, &exe, &["lairtest", "lairtwo"], &[&one, &two]);
+    assert_eq!(got, None);
+    let out = run(&exe, Path::new("/"));
+    assert_eq!(out.status.code(), Some(56), "{}", text(&out.stderr));
+
+    std::fs::remove_file(&exe).expect("the executable goes");
+    let without = build_through_c(ONE_LIBRARY, &exe, &["lairtest"], &[]).expect("no -L: refused");
+    assert!(without.starts_with("error: linker failed:"), "{without}");
+    assert!(!exe.exists());
+}
+
+#[test]
+fn the_c_interface_refuses_a_directory_that_cannot_be_used_and_a_null_list() {
+    let scratch = Scratch::new("link-capi-bad");
+    let exe = scratch.path().join("one");
+    let nowhere = scratch.path().join("no-such-dir");
+    let got = build_through_c(ONE_LIBRARY, &exe, &["lairtest"], &[&nowhere]).expect("refused");
+    assert!(
+        got.starts_with(&format!("error: -L {}: ", nowhere.display())) && got.contains("No such"),
+        "{got}"
+    );
+    assert!(!exe.exists());
+    // SAFETY: the null pointers are the case; `src` and `path` are valid.
+    let null_dirs = unsafe {
+        let (c, cl) = s(ONE_LIBRARY);
+        let (p, pl) = s(exe.to_str().expect("utf-8"));
+        take(lair_build_executable_with(
+            c,
+            cl,
+            p,
+            pl,
+            0,
+            ptr::null(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            2,
+        ))
+    };
+    assert_eq!(
+        null_dirs.as_deref(),
+        Some("dirs and dir_lens must not be null for n_dirs 2")
+    );
 }

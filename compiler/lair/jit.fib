@@ -25,7 +25,7 @@
 (extern lair_jit_address :private (i64 ptr i64 ptr) -> i64)
 (extern lair_jit_c_entry :private (i64 ptr i64 ptr) -> i64)
 (extern lair_check_source :private (ptr i64) -> i64)
-(extern lair_build_executable :private (ptr i64 ptr i64 i32 ptr ptr i64) -> i64)
+(extern lair_build_executable_with :private (ptr i64 ptr i64 i32 ptr ptr i64 ptr ptr i64) -> i64)
 
 ;; A session at optimisation level opt (0 to 3, as `-O`).
 (defun jit-new (opt: i64) -> (Result Jit str)
@@ -77,46 +77,53 @@
           (e (lair_check_source sp (str-len src))))
       (do (free sp) (ffi/status e)))))
 
-;; The names of libs as the arguments of `lair_build_executable`: an
+;; The words of a list (the libraries, the directories) as the arguments of `lair_build_executable_with`: an
 ;; array of n pointers to NUL-terminated copies (each a `bytes-new`) and an
 ;; array of n lengths. The blocks are held as addresses (`i64`), the
 ;; convention of these modules (see the head of lair.ffi: a raw `ptr` in
 ;; a struct was once released as if it were an object, which is fixed,
-;; so this is a choice and not a workaround). `libs-free` releases the
+;; so this is a choice and not a workaround). `names-free` releases the
 ;; arrays and the copies.
-(defstruct Libs :private (names: i64 lens: i64 copies: (Vec i64)))
+(defstruct Names :private (names: i64 lens: i64 copies: (Vec i64)))
 
-(defun copies-of :private (libs: (Vec str)) -> (Vec i64)
+(defun copies-of :private (words: (Vec str)) -> (Vec i64)
   (loop ((i 0) (acc (vec-empty)))
-    (if (< i (count libs))
-        (recur (+ i 1) (conj acc (ffi/ptr->addr (ffi/bytes-new (nth libs i)))))
+    (if (< i (count words))
+        (recur (+ i 1) (conj acc (ffi/ptr->addr (ffi/bytes-new (nth words i)))))
         acc)))
 
-(defun lens-of :private (libs: (Vec str)) -> (Vec i64)
+(defun lens-of :private (words: (Vec str)) -> (Vec i64)
   (loop ((i 0) (acc (vec-empty)))
-    (if (< i (count libs)) (recur (+ i 1) (conj acc (str-len (nth libs i)))) acc)))
+    (if (< i (count words)) (recur (+ i 1) (conj acc (str-len (nth words i)))) acc)))
 
-(defun libs-new :private (libs: (Vec str)) -> Libs
-  (let ((copies (copies-of libs)))
-    (Libs (ffi/ptr->addr (ffi/words-new copies))
-          (ffi/ptr->addr (ffi/words-new (lens-of libs)))
-          copies)))
+(defun names-new :private (words: (Vec str)) -> Names
+  (let ((copies (copies-of words)))
+    (Names (ffi/ptr->addr (ffi/words-new copies))
+           (ffi/ptr->addr (ffi/words-new (lens-of words)))
+           copies)))
 
-(defun libs-free :private (l: Libs) -> unit
+(defun names-free :private (l: Names) -> unit
   (do (dotimes (i (count (. l copies))) (ffi/free-addr (nth (. l copies) i)))
       (ffi/free-addr (. l names))
       (ffi/free-addr (. l lens))))
 
 ;; Compiles the module `src`, which must satisfy lIR's `main` rule
 ;; (lir.md §7.2), at optimisation level opt and links it into the
-;; executable `path`, with `-lNAME` for each of libs. The executable's
-;; exit status is main's result.
-(defun build-executable (src: str path: str opt: i64 libs: (Vec str)) -> (Result unit str)
-  (let ((l (libs-new libs)))
+;; executable `path`, with `-lNAME` for each of libs. Each of dirs is a
+;; library directory of the link: `-L` and an absolute rpath, so the
+;; executable finds its libraries without LD_LIBRARY_PATH (a directory
+;; that is missing, is no directory or cannot be an rpath is an `Err`,
+;; before anything is compiled). The executable's exit status is main's
+;; result.
+(defun build-executable (src: str path: str opt: i64 libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
+  (let ((l (names-new libs))
+        (d (names-new dirs)))
     (unsafe
       (let ((sp (ffi/bytes-new src))
             (pp (ffi/bytes-new path))
-            (e (lair_build_executable sp (str-len src) pp (str-len path) (trunc i32 opt)
-                                      (ffi/addr->ptr (. l names)) (ffi/addr->ptr (. l lens))
-                                      (count (. l copies)))))
-        (do (free sp) (free pp) (libs-free l) (ffi/status e))))))
+            (e (lair_build_executable_with sp (str-len src) pp (str-len path) (trunc i32 opt)
+                                           (ffi/addr->ptr (. l names)) (ffi/addr->ptr (. l lens))
+                                           (count (. l copies))
+                                           (ffi/addr->ptr (. d names)) (ffi/addr->ptr (. d lens))
+                                           (count (. d copies)))))
+        (do (free sp) (free pp) (names-free l) (names-free d) (ffi/status e))))))

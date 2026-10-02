@@ -4,7 +4,7 @@
 # usage: cli.sh STAGE2 [STAGE1]    STAGE1 (the Rust fibc) is only to compare `explain` and `emit` with, when given.
 # Run from the repository root with LD_LIBRARY_PATH holding liblair.so (target/debug) in the environment.
 # Prints `ok NAME` or `FAIL NAME` for each check; exit status 0 only if none failed. Scratch files go under $HOME/.cache/fibber-scratch/.
-s2=$1; s1=$2; fail=0
+s2=$1; s1=$2; fail=0; root=$PWD
 unset FIB_LIB   # the roots of a check are its own; the library is `lib` of the working directory (the repository root)
 t=$(mktemp -d "$HOME/.cache/fibber-scratch/cli.XXXXXX"); trap 'rm -rf "$t"' EXIT
 ck() { if [ "$2" = "$3" ]; then echo "ok $1"; else echo "FAIL $1: got [$2] want [$3]"; fail=1; fi; }
@@ -44,7 +44,17 @@ ck "build refuses a rejected program, writes nothing" "$($s2 build "$t/bad.fib" 
 ck "build: -o is required" "$($s2 build "$t/three.fib" > /dev/null 2>&1; echo $?)" 2
 ck "build: a -L that is not a directory: exit 2, nothing built" "$($s2 build "$t/three.fib" -o "$t/x" -L "$t/nonexist" 2>&1; echo $?; test -e "$t/x" && echo built)" "$(printf 'fibc: -L %s/nonexist: not a directory that can be read\n2' "$t")"
 ck "build without -l lair cannot link a program that calls lair" "$($s2 build "$t/lair.fib" -o "$t/lair" > /dev/null 2>&1; echo $?)" 5
-ck "build -L DIR -l lair links it" "$($s2 build "$t/lair.fib" -o "$t/lair" -L target/debug -l lair > /dev/null 2>&1; echo $?; "$t/lair"; echo $?)" "$(printf '0\n0')"
+lib=target/debug   # where liblair.so is: the first directory of LD_LIBRARY_PATH that has it, else target/debug
+for d in ${LD_LIBRARY_PATH//:/ }; do if [ -e "$d/liblair.so" ]; then lib=$d; break; fi; done
+ck "build -L DIR -l lair links it" "$($s2 build "$t/lair.fib" -o "$t/lair" -L "$lib" -l lair > /dev/null 2>&1; echo $?; "$t/lair"; echo $?)" "$(printf '0\n0')"
+# The rpath: each -L is also an absolute rpath (as the Rust compiler's is), so the executable runs from another directory with no LD_LIBRARY_PATH,
+# and only because of it: with the library moved away it does not start.
+mkdir -p "$t/rp"; cp "$lib/liblair.so" "$t/rp/"
+$s2 build "$t/lair.fib" -o "$t/lair-rpath" -L "$t/rp" -l lair > /dev/null 2>&1
+ck "build -L DIR writes an rpath: the executable runs from /, with no LD_LIBRARY_PATH" "$(cd /; env -u LD_LIBRARY_PATH "$t/lair-rpath" 2>&1; echo $?)" 0
+mv "$t/rp" "$t/rp-moved"
+ck "build -L DIR: the rpath is what finds the library (moved away, it does not start)" "$(cd /; env -u LD_LIBRARY_PATH "$t/lair-rpath" 2>&1 | grep -c 'liblair.so: cannot open')" 1
+ck "build -L DIR: a relative directory is an absolute rpath" "$($s2 build "$t/lair.fib" -o "$t/lair-rel" -L "$(realpath --relative-to="$root" "$t/rp-moved")" -l lair > /dev/null 2>&1; cd /; env -u LD_LIBRARY_PATH "$t/lair-rel" 2>&1; echo $?)" 0
 if [ -n "$s1" ]; then
   for c in emit explain; do
     cmp -s <($s1 $c "$t/prog/main.fib" -I "$t/a" -I "$t/b" 2>&1) <($s2 $c "$t/prog/main.fib" -I "$t/a" -I "$t/b" 2>&1); ck "$c equals the Rust compiler's, with roots" $? 0

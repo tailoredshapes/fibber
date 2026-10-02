@@ -224,6 +224,12 @@ static void checks_and_executables(const char *dir, const char *tmp) {
               STR("(define (square i64) ((i64 x)) (block entry (ret (mul x x))))"),
               STR(exe), 0, NULL, NULL, 0));
     fails("exe bad level", lair_build_executable(STR(prog), STR(exe), 9, NULL, NULL, 0));
+    const char *dirs[1] = {"/no/such/lair/library/directory"};
+    size_t dir_lens[1] = {strlen(dirs[0])};
+    fails("exe with a missing library directory",
+          lair_build_executable_with(STR(prog), STR(exe), 0, NULL, NULL, 0, dirs, dir_lens, 1));
+    OK(lair_build_executable_with(STR(prog), STR(exe), 0, NULL, NULL, 0, NULL, NULL, 0));
+    remove(exe);
 
     lair_jit *j = NULL;
     lair_error *e = lair_jit_new(7, &j);
