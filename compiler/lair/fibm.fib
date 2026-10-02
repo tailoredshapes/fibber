@@ -227,13 +227,21 @@
          ((Err e) (Err e))))
       (nil (Err (str-concat "trap: a Flt form of width :" (width-name m id)))))))
 
+;; The forms a macro was given, by the address of the `Form` object made for each node of them (`to-object-in`): what a macro
+;; returns of them keeps their own positions (syntax §1.3; the Rust `Inputs`). The objects of a macro module are never freed
+;; (`fibm.form` makes them immortal), so an address is one node for good.
+(defstruct Inputs (by-address: (Cell (Map i64 Stx))))
+
+(defun inputs-new () -> Inputs
+  (Inputs (cell (map-empty))))
+
 ;; The List, Vec or Map (tag 8, 9 or 10) form o.
-(defun seq-kind :private (m: Fibm o: i64 tag: i64 pos: Pos) -> (Result StxKind str)
-  (match (stx-items m (vec-items m (word (. m f0-ptr) [o])) pos)
+(defun seq-kind :private (m: Fibm o: i64 tag: i64 pos: Pos ins: (Map i64 Stx)) -> (Result StxKind str)
+  (match (stx-items m (vec-items m (word (. m f0-ptr) [o])) pos ins)
     ((Err e) (Err e))
     ((Ok xs) (Ok (match tag (8 (SList xs)) (9 (SVec xs)) (_ (SMap xs)))))))
 
-(defun to-kind :private (m: Fibm o: i64 pos: Pos) -> (Result StxKind str)
+(defun to-kind :private (m: Fibm o: i64 pos: Pos ins: (Map i64 Stx)) -> (Result StxKind str)
   (let ((tag (form-tag m o)))
     (match tag
       (0 (Ok (SSym (form-text m o))))
@@ -243,22 +251,29 @@
       (4 (Ok (SStr (form-text m o))))
       (5 (Ok (SChr (code-char (low32 (word (. m f0-i32) [o]))))))
       (6 (Ok (SBool (not (= (low32 (word (. m f0-i1) [o])) 0)))))
-      (8 (seq-kind m o tag pos))
-      (9 (seq-kind m o tag pos))
-      (10 (seq-kind m o tag pos))
+      (8 (seq-kind m o tag pos ins))
+      (9 (seq-kind m o tag pos ins))
+      (10 (seq-kind m o tag pos ins))
       (_ (Ok SNil)))))
 
-;; The tree of the `Form` object o, every node at pos (a macro's result
-;; has no positions of its own: the call's, syntax §1.3).
-(defun to-stx (m: Fibm o: i64 pos: Pos) -> (Result Stx str)
-  (match (to-kind m o pos)
-    ((Err e) (Err e))
-    ((Ok k) (Ok (Stx k pos)))))
+;; The tree of the `Form` object o: the input form it was made for, if `ins` has it, with its own positions, else a new node at
+;; pos (a macro's new forms have no positions of their own: the call's, syntax §1.3), its children read the same way.
+(defun to-stx-in (m: Fibm o: i64 pos: Pos ins: (Map i64 Stx)) -> (Result Stx str)
+  (match (get ins o)
+    ((some s) (Ok s))
+    (nil
+     (match (to-kind m o pos ins)
+       ((Err e) (Err e))
+       ((Ok k) (Ok (Stx k pos)))))))
 
-(defun stx-items :private (m: Fibm objs: (Vec i64) pos: Pos) -> (Result (Vec Stx) str)
+;; The tree of the `Form` object o, every node at pos.
+(defun to-stx (m: Fibm o: i64 pos: Pos) -> (Result Stx str)
+  (to-stx-in m o pos (map-empty)))
+
+(defun stx-items :private (m: Fibm objs: (Vec i64) pos: Pos ins: (Map i64 Stx)) -> (Result (Vec Stx) str)
   (loop ((i 0) (acc (vec-empty)))
     (if (< i (count objs))
-        (match (to-stx m (nth objs i) pos)
+        (match (to-stx-in m (nth objs i) pos ins)
           ((Ok s) (recur (+ i 1) (conj acc s)))
           ((Err e) (Err e)))
         (Ok acc))))
@@ -289,3 +304,22 @@
     ((SList xs) (seq-object m 8 xs))
     ((SVec xs) (seq-object m 9 xs))
     ((SMap xs) (seq-object m 10 xs))))
+
+;; As `to-objects` and `to-object`, recording every node made in `ins` (an argument of a macro: `to-stx-in` gives it back as it was).
+(defun to-objects-in (m: Fibm xs: (Vec Stx) ins: Inputs) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count xs))
+        (recur (+ i 1) (conj acc (to-object-in m (nth xs i) ins)))
+        acc)))
+
+(defun seq-object-in :private (m: Fibm tag: i64 xs: (Vec Stx) ins: Inputs) -> i64
+  (form-object m tag 0 0 (vec-object m (to-objects-in m xs ins))))
+
+(defun to-object-in (m: Fibm s: Stx ins: Inputs) -> i64
+  (let ((o (match (. s kind)
+             ((SList xs) (seq-object-in m 8 xs ins))
+             ((SVec xs) (seq-object-in m 9 xs ins))
+             ((SMap xs) (seq-object-in m 10 xs ins))
+             (_ (to-object m s)))))
+    (do (set! (. ins by-address) (assoc @(. ins by-address) o s))
+        o)))

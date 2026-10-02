@@ -6,6 +6,9 @@
 ;; `--ast`, `--tables`; a lone `--` ends them). With no file, or an option that is not
 ;; one, it prints a usage line to stderr, nothing to stdout, and exits 2.
 ;;
+;; The macros of a program are run (macros.runner: the tool needs `-L target/debug -l lair`) as `fibref types` runs them with the interpreter's
+;; evaluator; the word `--no-runner` among the options (not part of the Rust tool) leaves a call of a user macro `MacroNeedsEvaluator`.
+;;
 ;; Exit status: 0 if every file was typed, 1 if one ended in an error record (it did not
 ;; read, load, expand or check), 2 if one could not be read at all (its dump is the line
 ;; `unreadable`) or the words were refused; the larger wins.
@@ -16,7 +19,7 @@
 ;; `fibc build compiler/types.fib` proves every module of the port compiles; the
 ;; modules are in dependency order.
 (ns main
-  (:require [types.args :as cli] [types.dump :as dump])
+  (:require [types.args :as cli] [types.dump :as dump] [expand.maker :as mk] [macros.runner :as mr])
   (:use types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.names types.display types.annot types.builtins types.init
         types.lower.typeform types.lower.decl types.lower.private types.lower.defaults
@@ -37,15 +40,16 @@
   (doseq [line lines] (println line)))
 
 ;; Prints the output of each of files in order, and returns the largest status.
-(defun types-files (files: (Vec str) opts: cli/Options) -> i64
+(defun types-files (files: (Vec str) opts: cli/Options rm: mk/RunnerMaker) -> i64
   (do (print-lines (dump/header-lines opts))
       (reduce (fn (status: i64 file: str)
-                (let ((d (dump/types-file file opts)))
+                (let ((d (dump/types-file-with file opts rm)))
                   (do (print-lines (. d lines))
                       (max status (. d status)))))
               0 files)))
 
 (defun main () -> i64
-  (match (cli/parse-args (args))
-    (nil (do (eprintln usage) 2))
-    ((some parsed) (types-files (. parsed files) (. parsed opts)))))
+  (let ((nr (mk/take-no-runner (vec (args)))))
+    (match (cli/parse-args (. nr words))
+      (nil (do (eprintln usage) 2))
+      ((some parsed) (types-files (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))))))

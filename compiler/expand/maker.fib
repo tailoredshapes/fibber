@@ -1,0 +1,38 @@
+;; compiler/expand/maker.fib: how a tool is handed its macro runner (spec/bootstrap.md §5.4, §5.5). A user macro is run by a module
+;; that sits above the expander and the front end (macros.runner: it type checks, checks and emits the macro's module, and JITs it),
+;; so the passes below it cannot name it; they take a `RunnerMaker`, a function value that makes the `Runner` of a program from the
+;; forms of its prelude, as the expander takes its `Runner` as data. The default of every tool is the runner (as the Rust `fibc`
+;; and `fibref types` run macros); `--no-runner` keeps the stage-2a behaviour, a call of a user macro being `MacroNeedsEvaluator`,
+;; which the earlier passes' oracle comparisons use (spec/bootstrap.md §5.1).
+(ns expand.maker
+  (:use syntax.form expand.types expand.ctx))
+
+;; Makes the runner of one program, given the forms of the prelude its macros are checked with and the top-level forms of the program's
+;; modules as they were read (the names they define tell a macro that calls a function of the program, `MacroPhase`; the Rust
+;; `MacroEvaluator::new(&all, prelude)`).
+(defstruct RunnerMaker (make: (fn ((Vec Stx) (Vec Stx)) Runner)))
+
+;; The maker of stage 2a: no macro runs.
+(defun no-runner-maker () -> RunnerMaker
+  (RunnerMaker (fn (prelude: (Vec Stx) program: (Vec Stx)) (no-runner))))
+
+;; The top-level forms of every module of `loaded`, in order.
+(defun loaded-forms :private (loaded: (Vec Loaded)) -> (Vec Stx)
+  (reduce (fn (acc: (Vec Stx) l: Loaded) (into acc (. l forms))) (vec-empty) loaded))
+
+;; The runner of a program whose prelude is `prelude` and whose modules are `loaded`.
+(defun maker-runner (m: RunnerMaker prelude: (Vec Stx) loaded: (Vec Loaded)) -> Runner
+  ((. m make) prelude (loaded-forms loaded)))
+
+;; The words of a command line without the `--no-runner` that stands among its options (before a lone `--`), and whether there was one.
+(defstruct RunnerWords (words: (Vec str) no-runner: bool))
+
+(defun take-no-runner (words: (Vec str)) -> RunnerWords
+  (loop ((i 0) (out (vec-empty)) (found false) (past false))
+    (if (>= i (count words))
+        (RunnerWords out found)
+        (let ((w (nth words i)))
+          (cond past (recur (+ i 1) (conj out w) found true)
+                (= w "--") (recur (+ i 1) (conj out w) found true)
+                (= w "--no-runner") (recur (+ i 1) out true false)
+                :else (recur (+ i 1) (conj out w) found false))))))

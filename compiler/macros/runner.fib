@@ -1,0 +1,258 @@
+;; compiler/macros/runner.fib: the macro runner of stage 2 (package M2b; spec/bootstrap.md §5.4, §5.5, spec/compiler.md §6, §9): what runs
+;; a user macro at expansion time. It is the Rust `JitRunner` (crates/fibc/src/macros/{mod,module,bridge}.rs) in fibber, over lair's C
+;; interface (compiler/lair): for the macro `m`, its module is the macro's forms (`macro-forms`) checked with the prelude,
+;; emitted (`compile-macro`, E11) and added to a JIT session, once for each macro key; a call converts the argument trees to `Form`
+;; objects, runs the entry on a mailbox's worker, answers the hooks the macro calls, and reads the result back as a tree.
+;;
+;; The module sits above the expander and the front end, which it needs (the macro's module goes through the whole pipeline while the
+;; program's own expansion is suspended): the passes below take a `RunnerMaker` (expand.maker), a function value, and a tool builds
+;; it here (`runner-maker`).
+;;
+;; Where this differs from the Rust, and why:
+;; - The JIT session is made at the first macro run, not with the runner (a program with no user macro starts no JIT).
+;; - The hooks of the Rust runner are Rust functions given to the module as pointers; fibber cannot give C a function, so lair supplies
+;;   two hooks (gensym, reflection) and the compiler answers them in `serve` (lair.expand does so for a table of answers; here the
+;;   answers are the context's: `ctx-gensym`, `ctx-reflect`). The trap hook has four arguments and lair has none of that arity, so
+;;   it is a function of the macro module itself (`trap-shim`, appended to the module's text, not part of `compile-macro`'s): it
+;;   hands the position and the message to the reflection hook, which `serve` tells from a reflection call by its operation word
+;;   (a reflection call names one of the seven operations of expand.reflect, a trap's first word is its position or null) and never
+;;   answers, so the worker stays parked for good, as the Rust trap hook parks its thread.
+;; - A Rust `ExpandError` raised in a hook (a reflection error) is the first one kept and ends the expansion after the macro has run to
+;;   its end, as in the Rust runner.
+;; - A macro whose module does not check because it calls a function of the program is `MacroPhase`, as the interpreter's evaluator
+;;   (the oracle of `fibref expand`) says it, not `MacroFailed` of the checker's text as the Rust JitRunner does (`check-failure`).
+;; - A reflection error is at the macro call's position, as the JitRunner's: the hook is not told where in the macro's body the call is,
+;;   so the evaluator's position (that of the `(struct-fields x)` in the body) cannot be given. compiler/tests/expand/porter2-073 to 080
+;;   differ from `fibref expand` in that position alone.
+;; Rust: macros/mod.rs `JitRunner::{module, build, run}`, bridge.rs, module.rs `Fns::{input_object, input_items, to_form}`.
+(ns macros.runner
+  (:require [lair.jit :as jit] [lair.call :as call] [lair.fibm :as fibm] [lair.ffi :as ffi] [fib.string :as s] [emit.compile :as ec]
+            [emit.macros.abi :as abi] [own.driver :as od] [own.error :as oerr])
+  (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.maker))
+
+;; The state of one runner: the forms of the prelude the macros are checked with, the JIT session (made at the first macro), the
+;; modules made so far by macro key (a failed build is kept: the Rust keeps it too), and how many were added to the session.
+(defstruct Session
+  (prelude: (Vec Stx) names: (Map str bool) jit: (Cell (Option jit/Jit)) mods: (Cell (Map str (Result fibm/Fibm ExpandErrKind)))
+   built: (Cell i64)))
+
+;; The names the program's modules define at top level: `defun` and `def`, also inside a `do`, a trailing `:` of a `def` taken off.
+;; Rust: eval/macros.rs collect_names
+(defun collect-names :private (f: Stx names: (Map str bool)) -> (Map str bool)
+  (match (. f kind)
+    ((SList items)
+     (match (if (empty? items) SNil (. (nth items 0) kind))
+       ((SSym h)
+        (cond (or (= h "defun") (= h "def"))
+              (match (if (> (count items) 1) (. (nth items 1) kind) SNil)
+                ((SSym n) (assoc names (if (s/ends-with? n ":") (str-slice n 0 (- (str-len n) 1)) n) true))
+                (_ names))
+              (= h "do") (reduce (fn (acc: (Map str bool) x: Stx) (collect-names x acc)) names (vec (drop 1 items)))
+              :else names))
+       (_ names)))
+    (_ names)))
+
+(defun session-new (prelude: (Vec Stx) program: (Vec Stx)) -> Session
+  (Session prelude (reduce (fn (acc: (Map str bool) f: Stx) (collect-names f acc)) (map-empty) program) (cell nil) (cell (map-empty)) (cell 0)))
+
+;; ---------------------------------------------------------------- the module of a macro
+
+(defun failed :private (def: MacroDef message: str) -> ExpandErrKind
+  (MacroFailed (. def name) message))
+
+;; Why the macro's forms did not check: a call of a function the program defines, which is not there at expansion time, is `MacroPhase`
+;; (as the interpreter's evaluator says it; the Rust JitRunner says `MacroFailed` of the checker's text); else the checker's text.
+;; Rust: eval/macros.rs check_error
+(defun check-failure :private (s: Session def: MacroDef e: oerr/CheckError) -> ExpandErrKind
+  (let ((phase (first (filter (fn (f: str) (some? (get (. s names) f)))
+                              (mapv (fn (msg: str) (str-slice msg 13 (str-len msg)))
+                                    (filter (fn (msg: str) (s/starts-with? msg "unbound name ")) (oerr/check-error-messages e)))))))
+    (match phase
+      ((some f) (MacroPhase (. def name) f))
+      (nil (failed def (oerr/check-error-text e))))))
+
+;; The session's JIT, made on first use.
+(defun session-jit :private (s: Session) -> (Result jit/Jit str)
+  (match @(. s jit)
+    ((some j) (Ok j))
+    (nil
+     (match (jit/jit-new 0)
+       ((Err m) (Err (str-concat "cannot start the JIT: " m)))
+       ((Ok j) (do (set! (. s jit) (some j)) (Ok j)))))))
+
+;; The trap hook of the module made for the k-th macro (see the header): `(fn void (ptr ptr ptr i64))` over the context, the position
+;; (a C string or null), the message's bytes and their count; the message goes to the reflection hook as a `str` object.
+(defun trap-shim :private (k: str) -> str
+  (str-join ["(define (fibm.trap-shim." k " void) ((ptr cx) (ptr pos) (ptr bytes) (i64 n))\n"
+             "  (block entry\n"
+             "    (let ((s (call @fib.str-new n)))\n"
+             "      (call @memcpy (call @fib.str-bytes-ptr s) bytes n)\n"
+             "      (indirect-call (load ptr @fibm.reflect-hook) (fn ptr (ptr ptr ptr)) cx pos s)\n"
+             "      (unreachable))))\n"]))
+
+;; Installs the trap shim of the module k in the module.
+(defun install-trap-hook :private (j: jit/Jit k: i64) -> (Result unit str)
+  (match (jit/jit-c-entry j (str-concat "fibm.set-trap-hook." (show k)))
+    ((Err m) (Err m))
+    ((Ok set)
+     (match (jit/jit-c-entry j (str-concat "fibm.trap-shim." (show k)))
+       ((Err m) (Err m))
+       ((Ok shim)
+        (match (call/call-i64 set [shim])
+          ((Err m) (Err m))
+          ((Ok _) (Ok ()))))))))
+
+;; Adds the module text to the session as the k-th, looks its surface up, starts its runtime and hooks its traps.
+(defun load-module :private (s: Session def: MacroDef k: i64 text: str) -> (Result fibm/Fibm ExpandErrKind)
+  (match (session-jit s)
+    ((Err m) (Err (failed def m)))
+    ((Ok j)
+     (match (jit/jit-add-source j (str-join ["macro." (. def name) "." (show k)]) (str-concat text (trap-shim (show k))))
+       ((Err m) (Err (failed def m)))
+       ((Ok _)
+        (do (set! (. s built) (+ k 1))
+            (match (fibm/fibm-lookup j k)
+              ((Err m) (Err (failed def m)))
+              ((Ok fm)
+               (do (fibm/fibm-init fm)
+                   (match (install-trap-hook j k)
+                     ((Err m) (Err (failed def m)))
+                     ((Ok _) (Ok fm))))))))))))
+
+;; The module of macro `def`: its forms checked with the prelude, emitted and loaded. Rust: JitRunner::build
+(defun build-module :private (s: Session def: MacroDef) -> (Result fibm/Fibm ExpandErrKind)
+  (match (od/own-check-forms (abi/macro-forms def) (. s prelude))
+    ((Err e) (Err (check-failure s def e)))
+    ((Ok c)
+     (let ((k @(. s built))
+           (n (+ (count (. def params)) (if (some? (. def rest)) 1 0))))
+       (match (ec/compile-macro (. c typed) (. c owned) (. def name) n k)
+         ((Err m) (Err (failed def m)))
+         ((Ok mm) (load-module s def k (. mm text))))))))
+
+;; The module of the macro, built on its first use. Rust: JitRunner::module
+(defun session-module :private (s: Session def: MacroDef) -> (Result fibm/Fibm ExpandErrKind)
+  (match (get @(. s mods) (. def key))
+    ((some r) r)
+    (nil
+     (let ((r (build-module s def)))
+       (do (set! (. s mods) (assoc @(. s mods) (. def key) r))
+           r)))))
+
+;; ---------------------------------------------------------------- one call
+
+;; How a macro's call ended: it returned (with the first error a hook found, if any), or it trapped with this text.
+(defenum Served (Returned error: (Option ExpandError)) (Trapped message: str))
+
+;; What the hooks see of one call: the module, the mailbox, the macro, the context, the call's position and the forms the macro was given.
+(defstruct Call (m: fibm/Fibm mb: call/Mailbox def: MacroDef ctx: ExpandCtx pos: Pos inputs: (Map i64 Stx)))
+
+(def reflect-names: (Vec str) :private ["struct?" "struct-fields" "struct-params" "struct-field-types" "enum?" "enum-params" "enum-variants"])
+
+(defun reflect-name? :private (op: str) -> bool
+  (some? (first (filter (fn (n: str) (= n op)) reflect-names))))
+
+;; The text of a trap: `POS: trap: MSG`, or `trap: MSG` where the runtime does not know the position. Rust: bridge.rs trap_hook
+(defun trap-text :private (c: Call op-addr: i64 msg-obj: i64) -> str
+  (let ((msg (fibm/str-text (. c m) msg-obj)))
+    (if (= op-addr 0)
+        (str-concat "trap: " msg)
+        (str-join [(ffi/c-string-at op-addr) ": trap: " msg]))))
+
+;; A reflection call `(op form)`: the context's answer as a `Form` object, and the first error. Rust: bridge.rs reflect_hook
+(defun reflect-reply :private (c: Call op: str arg: i64 err: (Option ExpandError)) -> (Pair i64 (Option ExpandError))
+  (let ((m (. c m)) (pos (. c pos))
+        (f (match (fibm/to-stx-in m arg pos (. c inputs)) ((Ok f) f) ((Err _) (Stx SNil pos)))))
+    (match (ctx-reflect (. c ctx) op f pos)
+      ((Ok out) (Pair (fibm/to-object m out) err))
+      ((Err e) (Pair (fibm/to-object m (Stx SNil pos)) (if (some? err) err (some e)))))))
+
+;; Answers the hook the worker is parked at: a gensym, a reflection call, or the trap, which ends the call. Rust: bridge.rs
+(defun answer :private (c: Call arity: i64 err: (Option ExpandError)) -> (Result (Option ExpandError) Served)
+  (let ((m (. c m)) (mb (. c mb)))
+    (if (= arity 1)
+        (let ((sym (ctx-gensym (. c ctx) (fibm/str-text m (call/call-hook-arg mb 0)) (. c pos))))
+          (do (call/call-hook-reply mb (fibm/to-object m sym)) (Ok err)))
+        (let ((at (call/call-hook-arg mb 0)))
+          (if (or (= at 0) (not (reflect-name? (ffi/c-string-at at))))
+              (Err (Trapped (trap-text c at (call/call-hook-arg mb 1))))
+              (let ((r (reflect-reply c (ffi/c-string-at at) (call/call-hook-arg mb 1) err)))
+                (do (call/call-hook-reply mb (. r fst)) (Ok (. r snd)))))))))
+
+;; Serves the hooks until the call returns, or traps, or the mailbox faults (a message, as a `trap` of the Rust runner's thread).
+(defun serve :private (c: Call) -> (Result Served str)
+  (loop ((err nil))
+    (match (call/call-wait (. c mb))
+      ((Err e) (Err e))
+      ((Ok (call/Done)) (Ok (Returned err)))
+      ((Ok (call/Hook k))
+       (match (answer c k err)
+         ((Err t) (Ok t))
+         ((Ok e) (recur e)))))))
+
+;; The objects a macro entry takes: one for each fixed argument and, when the macro has a rest parameter, a `(Vec Form)` of the others.
+;; Rust: JitRunner::run (`input_object`, `input_items`)
+(defun entry-objects :private (m: fibm/Fibm def: MacroDef args: (Vec Stx) ins: fibm/Inputs) -> (Vec i64)
+  (let ((fixed (min (count (. def params)) (count args)))
+        (objs (fibm/to-objects-in m (vec (take fixed args)) ins)))
+    (if (some? (. def rest))
+        (conj objs (fibm/vec-object m (fibm/to-objects-in m (vec (drop fixed args)) ins)))
+        objs)))
+
+(defun macro-error :private (def: MacroDef pos: Pos message: str) -> ExpandError
+  (ExpandError (failed def message) pos))
+
+;; The result as a tree, once the call returned: the first hook error is the expansion's, else the object read back with the inputs'
+;; own positions. Rust: JitRunner::run (the end), module.rs to_form
+(defun finish :private (c: Call err: (Option ExpandError)) -> (Result Stx ExpandError)
+  (match err
+    ((some e) (Err e))
+    (nil
+     (match (fibm/to-stx-in (. c m) (call/call-result (. c mb)) (. c pos) (. c inputs))
+       ((Ok f) (Ok f))
+       ((Err message) (Err (macro-error (. c def) (. c pos) message)))))))
+
+;; Hooks installed, entry started, hooks served, result read.
+(defun run-call :private (c: Call objs: (Vec i64)) -> (Result Stx ExpandError)
+  (let ((h (call/hook-addresses)) (fail (fn (msg: str) (macro-error (. c def) (. c pos) msg))))
+    (match (call/call-i64 (. (. c m) set-hooks) [(. h one) (. h two) (. (. c mb) handle)])
+      ((Err e) (Err (fail e)))
+      ((Ok _)
+       (match (call/call-start (. c mb) (. (. c m) entry) objs)
+         ((Err e) (Err (fail e)))
+         ((Ok _)
+          (match (serve c)
+            ((Err e) (Err (fail e)))
+            ((Ok (Trapped t)) (Err (fail t)))
+            ((Ok (Returned err)) (finish c err)))))))))
+
+;; Runs the macro in module `m` on the arguments of its call. Rust: JitRunner::run
+(defun call-macro :private (m: fibm/Fibm def: MacroDef args: (Vec Stx) ctx: ExpandCtx) -> (Result Stx ExpandError)
+  (let ((pos @(. ctx call-pos)) (ins (fibm/inputs-new)))
+    (match (call/call-new)
+      ((Err e) (Err (macro-error def pos (str-concat "cannot start a thread for the macro: " e))))
+      ((Ok mb)
+       (let ((objs (entry-objects m def args ins))
+             (r (run-call (Call m mb def ctx pos @(. ins by-address)) objs)))
+         (do (call/call-free mb) r))))))
+
+;; ---------------------------------------------------------------- the runner
+
+;; Runs `def` on its arguments in the context; its module is made once (`session-module`).
+(defun run-macro :private (s: Session def: MacroDef args: (Vec Stx) ctx: ExpandCtx) -> (Result Stx ExpandError)
+  (match (session-module s def)
+    ((Err k) (Err (ExpandError k @(. ctx call-pos))))
+    ((Ok m) (call-macro m def args ctx))))
+
+;; The runner of a program whose prelude is `prelude`.
+(defun runner-new (prelude: (Vec Stx) program: (Vec Stx)) -> Runner
+  (let ((s (session-new prelude program)))
+    (Runner (fn (def: MacroDef args: (Vec Stx) ctx: ExpandCtx) (run-macro s def args ctx)))))
+
+;; What a tool hands the passes: the runner of this module.
+(defun runner-maker () -> RunnerMaker
+  (RunnerMaker (fn (prelude: (Vec Stx) program: (Vec Stx)) (runner-new prelude program))))
+
+;; The maker a tool uses: the runner, or none (`--no-runner`).
+(defun maker-for (no-runner: bool) -> RunnerMaker
+  (if no-runner (no-runner-maker) (runner-maker)))

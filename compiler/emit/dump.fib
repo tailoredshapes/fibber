@@ -8,7 +8,7 @@
 ;; `--macro NAME` (package E11): the macro-time module of the macro, `compile-macro` (emit.macros.front finds the macro, emit-macro prints it).
 (ns emit.dump
   (:require [fib.string :as s] [types.driver :as driver] [types.dump :as dump] [syntax.dump :as sdump])
-  (:use syntax.form expand.types expand.roots types.args types.dump.sections own.error own.program own.driver
+  (:use syntax.form expand.types expand.roots expand.maker types.args types.dump.sections own.error own.program own.driver
         emit.args emit.assemble emit.compile emit.layout-dump emit.macros.abi emit.macros.front))
 
 (def pending-status: i64 70)
@@ -112,8 +112,8 @@
     ((Ok mm) (dump/Dumped (into (conj lines (str-join [";; == macro " (. m key)])) (text-line (. mm text))) 0))))
 
 ;; The check of the macro's forms, as a program of their own, and the module. Rust: `check_forms` and `macro_text`
-(defun emit-macro :private (file: str name: str) -> dump/Dumped
-  (match (macro-front file name)
+(defun emit-macro :private (file: str name: str rm: RunnerMaker) -> dump/Dumped
+  (match (macro-front file name rm)
     ((Err d) d)
     ((Ok mi)
      (match (own-check-forms (macro-forms (. mi def)) (. mi prelude))
@@ -124,14 +124,18 @@
 
 ;; What `fibc emit-dump` prints for one file, and the status it adds. Rust: emit_dump/mod.rs:192 dump_file
 ;; The modules the file requires are looked for in `roots` (the driver's `-I` and FIB_LIB; D1), except by `--macro` (emit.macros.front).
-(defun emit-file-in (file: str o: EmitOptions roots: Roots) -> dump/Dumped
+(defun emit-file-with (file: str o: EmitOptions roots: Roots rm: RunnerMaker) -> dump/Dumped
   (if (. o layout)
-      (layout-file-in file roots)
+      (layout-file-with file roots rm)
       (if-some [name (. o macro-name)]
-        (emit-macro file name)
-        (dump/dump-file-in file (options-default) roots
+        (emit-macro file name rm)
+        (dump/dump-file-with file (options-default) roots rm
                       (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx) shown: (Vec Shown) home: str opts: Options)
                         (emit-check o lines modules prelude shown home opts))))))
+
+;; `emit-file-with` and no macro runner (stage 2a).
+(defun emit-file-in (file: str o: EmitOptions roots: Roots) -> dump/Dumped
+  (emit-file-with file o roots (no-runner-maker)))
 
 ;; `emit-file-in` with the built-in library only.
 (defun emit-file (file: str o: EmitOptions) -> dump/Dumped

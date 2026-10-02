@@ -39,7 +39,7 @@
   (:require [syntax.reader :as reader] [syntax.dump :as sdump] [expand.modules :as mods]
             [expand.program :as prog] [expand.dumpctx :as dctx])
   (:use syntax.pos syntax.form syntax.error expand.error expand.types expand.ctx
-        expand.args expand.roots))
+        expand.args expand.roots expand.maker))
 
 ;; One file's output: its lines and the status it adds (0 expanded, 1
 ;; ended in an error record, 2 unreadable). A line has no newline.
@@ -78,10 +78,11 @@
                                 (unwrap-or (. o depth) (. l max-depth))
                                 (unwrap-or (. o forms) (. l max-forms))))))
 
-;; What runs the macros of a program. Stage 2a has no evaluator.
-(defun runner-of :private (kind: RunnerKind) -> Runner
+;; What runs the macros of a program: the tool's runner (macros.runner, given by the tool as a `RunnerMaker`, expand.maker) unless
+;; `--no-runner`; stage 2a's tool gives `no-runner-maker`.
+(defun runner-of :private (kind: RunnerKind rm: RunnerMaker prelude: (Vec Stx) loaded: (Vec Loaded)) -> Runner
   (match kind
-    ((Evaluator) (no-runner))
+    ((Evaluator) (maker-runner rm prelude loaded))
     ((NoRunner) (no-runner))))
 
 (defun failed :private (lines: (Vec str) record: str) -> Dumped
@@ -119,17 +120,17 @@
 ;; The dump of the program whose main module is source (the file `file`):
 ;; the prelude is expanded in a fresh context, then the program's modules
 ;; in dependency order, the main one last. (dump_program)
-(defun dump-program :private (lines: (Vec str) source: str file: str opts: Options) -> Dumped
+(defun dump-program :private (lines: (Vec str) source: str file: str opts: Options rm: RunnerMaker) -> Dumped
   (let ((ctx (ctx-new)))
     (match (prog/prelude-forms ctx)
       ((Err m) (failed lines (record "Prelude" no-position m)))
-      ((Ok _)
+      ((Ok prelude)
        (do (apply-limits ctx (. opts limits))
            (let ((baseline (dctx/baseline-of ctx)))
              (match (mods/try-load-with source file (roots-default) (implicit-of opts))
                ((Err e) (failed lines (load-record e file)))
                ((Ok loaded)
-                (dump-modules lines ctx loaded (runner-of (. opts runner)) baseline opts)))))))))
+                (dump-modules lines ctx loaded (runner-of (. opts runner) rm prelude loaded) baseline opts)))))))))
 
 ;; The implicit modules of the dump: those of `--implicit-lib`, else the
 ;; library's (`IMPLICIT_LIB`).
@@ -167,11 +168,15 @@
 ;; dump or the line `unreadable`: the program's modules in dependency
 ;; order with their forms, or the one error record that ended it; as a
 ;; library prelude with `--prelude`. (the body of `expand_here`'s loop)
-(defun expand-file (file: str opts: Options) -> Dumped
+(defun expand-file-with (file: str opts: Options rm: RunnerMaker) -> Dumped
   (let ((header [(str-concat "== " file)]))
     (match (read-file file)
       (nil (Dumped (conj header "unreadable") 2))
       ((some source)
        (if (. opts prelude)
            (dump-prelude header source file opts)
-           (dump-program header source file opts))))))
+           (dump-program header source file opts rm))))))
+
+;; `expand-file-with` and no runner at all (stage 2a).
+(defun expand-file (file: str opts: Options) -> Dumped
+  (expand-file-with file opts (no-runner-maker)))

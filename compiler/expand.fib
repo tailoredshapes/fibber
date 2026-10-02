@@ -15,10 +15,13 @@
 ;; larger wins. Stage 2's expander is correct when this prints what
 ;; `fibref expand` prints, byte for byte (crates/fibc/tests/bootstrap_expand.rs).
 ;;
+;; Without `--no-runner` a user macro is run by macros.runner (the stage-2b runner: the macro's module is JITted through lair, so the tool
+;; is built with `-L target/debug -l lair`), as `fibref expand` runs it with the interpreter's evaluator.
+;;
 ;; The Rust tool builds the whole text and prints it at the end; this one
 ;; prints each file's section as soon as it is made, which gives the same
 ;; bytes and holds one file's lines in memory at a time.
-(ns main (:require [expand.args :as cli] [expand.dump :as dump]))
+(ns main (:require [expand.args :as cli] [expand.dump :as dump] [macros.runner :as mr]))
 
 (def usage: str
   "usage: expand [--prelude] [--context] [--implicit] [--implicit-lib LIST] [--no-runner] [--max-steps N] [--max-depth N] [--max-forms N] [--] FILE..")
@@ -38,7 +41,7 @@
 (defun expand-files (files: (Vec str) opts: cli/Options) -> i64
   (loop ((i 0) (status 0))
     (if (< i (count files))
-        (let ((d (dump/expand-file (nth files i) opts)))
+        (let ((d (dump/expand-file-with (nth files i) opts (mr/runner-maker))))
           (do (print-lines (. d lines))
               (recur (+ i 1) (max-status status (. d status)))))
         status)))

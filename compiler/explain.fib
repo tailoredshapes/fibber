@@ -5,6 +5,9 @@
 ;; O8: `compiler/tests/types/compare.sh -c explain FIBREF TOOL FILE..` compares it with
 ;; `fibref explain`, byte for byte.
 ;;
+;; The macros of a program are run (macros.runner: the tool needs `-L target/debug -l lair`); the word `--no-runner` before the file (not part of
+;; the Rust tool) leaves a call of a user macro `MacroNeedsEvaluator`.
+;;
 ;; Exit status: 0 if it explained the file, 1 if the front end rejected it, 2 if the file could
 ;; not be read or the words are not one file name (a usage line to stderr, nothing to stdout).
 ;; The file is loaded, expanded and lowered as `own.dump` does (types.dump's file loop, the
@@ -16,7 +19,7 @@
 ;; as compiler/own.fib.
 (ns main
   (:require [types.dump :as td] [types.driver :as tdr] [types.dump.sections :as sec]
-            [types.args :as ta])
+            [types.args :as ta] [expand.maker :as mk] [expand.roots :as er] [macros.runner :as mr])
   (:use fib.string syntax.form expand.types own.args own.error own.objects own.program own.syntactic own.captured own.taken
         own.walk.state own.walk.callee own.walk.pattern own.walk.lit own.walk.expr own.walk.call
         own.facts own.classify own.stack own.unit own.top own.driver own.explain.names own.explain))
@@ -39,8 +42,8 @@
   (doseq [line lines] (println line)))
 
 ;; Explains the file, and returns the exit status.
-(defun explain-file (file: str) -> i64
-  (let ((d (td/dump-file file (base-options (own-options-default))
+(defun explain-file (file: str rm: mk/RunnerMaker) -> i64
+  (let ((d (td/dump-file-with file (base-options (own-options-default)) (er/roots-default) rm
                          (fn (lines: (Vec str) modules: (Vec Expanded) prelude: (Vec Stx)
                               layout: (Vec sec/Shown) home: str opts: ta/Options)
                            (explain-check modules prelude opts))))
@@ -53,7 +56,7 @@
           :else (do (print-lines lines) (. d status)))))
 
 (defun main () -> i64
-  (let ((words (args)))
-    (if (= (count words) 1)
-        (explain-file (nth words 0))
+  (let ((nr (mk/take-no-runner (vec (args)))))
+    (if (= (count (. nr words)) 1)
+        (explain-file (nth (. nr words) 0) (mr/maker-for (. nr no-runner)))
         (do (eprintln usage) 2))))

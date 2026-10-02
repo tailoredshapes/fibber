@@ -18,7 +18,7 @@
 ;; program the front end accepts the body, facts, summary, taken and error sections equal
 ;; `fibref own` (cases/ownership 230 of 241; the others need the macro evaluator of stage 2b).
 (ns main
-  (:require [own.args :as cli] [own.dump :as dump])
+  (:require [own.args :as cli] [own.dump :as dump] [expand.maker :as mk] [macros.runner :as mr])
   (:use own.error own.objects own.program own.syntactic own.captured own.taken own.walk.state
         own.walk.callee own.walk.pattern own.walk.lit own.walk.expr own.walk.call own.facts
         own.classify own.stack own.unit own.top own.driver own.explain.names own.explain
@@ -32,14 +32,15 @@
   (doseq [line lines] (println line)))
 
 ;; Prints the output of each of files in order, and returns the largest status.
-(defun own-files (files: (Vec str) opts: cli/OwnOptions) -> i64
+(defun own-files (files: (Vec str) opts: cli/OwnOptions rm: mk/RunnerMaker) -> i64
   (reduce (fn (status: i64 file: str)
-            (let ((d (dump/own-file file opts)))
+            (let ((d (dump/own-file-with file opts rm)))
               (do (print-lines (. d lines))
                   (max status (. d status)))))
           0 files))
 
 (defun main () -> i64
-  (match (cli/own-parse-args (args))
-    (nil (do (eprintln usage) 2))
-    ((some parsed) (own-files (. parsed files) (. parsed opts)))))
+  (let ((nr (mk/take-no-runner (vec (args)))))
+    (match (cli/own-parse-args (. nr words))
+      (nil (do (eprintln usage) 2))
+      ((some parsed) (own-files (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))))))

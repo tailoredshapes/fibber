@@ -2,12 +2,13 @@
 ;; `fibc emit-dump` expands it, with the expander's context kept, because the macros a module defined are in the context and not in
 ;; the expanded forms. Rust: emit_dump/front.rs:57 `expand` and the first half of :113 `macro_text`; the check of the macro's forms, the
 ;; module and the printing are emit.dump's. types.dump's `dump-file` hands a check only the expanded modules, so the loop is written
-;; again here (its records are private there). There is no macro runner in stage 2 (`no-runner`): a file whose own macro uses another
-;; macro ends in the expander's `MacroNeedsEvaluator` record where the Rust prints the module (pending until stage 2b).
+;; again here (its records are private there). The macros the file uses are run by the runner the tool was given (`RunnerMaker`, as the Rust
+;; `expand` runs them with the JIT runner); with `no-runner-maker` a file whose own macro uses another macro ends in the expander's
+;; `MacroNeedsEvaluator` record where the Rust prints the module.
 (ns emit.macros.front
   (:require [syntax.dump :as sdump] [expand.modules :as mods] [expand.program :as prog] [types.driver :as driver]
             [types.dump :as dump] [lair.ffi :as ffi])
-  (:use syntax.form syntax.error expand.error expand.types expand.ctx expand.roots))
+  (:use syntax.form syntax.error expand.error expand.types expand.ctx expand.roots expand.maker))
 
 (def no-position: str "0:0 0..0")
 
@@ -49,14 +50,15 @@
 
 ;; Expands the modules of `loaded` in order in `ctx`, each begun and ended. The first expansion error ends the expansion; it is `Err`, a
 ;; record under its `-- module NS FILE` line, except that a call of a user macro (`MacroNeedsEvaluator`: stage 2 has no runner yet) is
-;; `Ok` of that record: the macros defined before it are in the context and their modules do not depend on what follows.
-(defun expand-loaded :private (lines: (Vec str) ctx: ExpandCtx loaded: (Vec Loaded)) -> (Result (Option dump/Dumped) dump/Dumped)
+;; `Ok` of that record: the macros defined before it are in the context and their modules do not depend on what follows (with a runner
+;; the record is never `MacroNeedsEvaluator`).
+(defun expand-loaded :private (lines: (Vec str) ctx: ExpandCtx loaded: (Vec Loaded) runner: Runner) -> (Result (Option dump/Dumped) dump/Dumped)
   (loop ((i 0))
     (if (>= i (count loaded))
         (Ok nil)
         (let ((l (nth loaded i)))
           (do (mods/begin-spec ctx (. l spec))
-              (match (prog/expand-program (. l forms) ctx (no-runner))
+              (match (prog/expand-program (. l forms) ctx runner)
                 ((Err e)
                  (let ((d (failed (conj lines (str-join ["-- module " (. (. l spec) ns) " " (. l file)])) (expand-record e (. l file)))))
                    (if (= (expand-err-name (. e kind)) "MacroNeedsEvaluator") (Ok (some d)) (Err d))))
@@ -72,7 +74,7 @@
 
 ;; The macro `name` of the source of `file`, expanded, or what ends the file's output: a record of the front end, `NoMacro` when the
 ;; file has no such macro.
-(defun macro-of :private (lines: (Vec str) source: str file: str name: str) -> (Result MacroInput dump/Dumped)
+(defun macro-of :private (lines: (Vec str) source: str file: str name: str rm: RunnerMaker) -> (Result MacroInput dump/Dumped)
   (let ((ctx (ctx-new)))
     (match (driver/prelude-forms ctx)
       ((Err m) (Err (failed lines (record "Prelude" no-position m))))
@@ -80,14 +82,14 @@
        (match (mods/try-load-with source file (roots-from-env [] (getenv-opt "FIB_LIB")) (mods/implicit-lib))
          ((Err e) (Err (failed lines (load-record e file))))
          ((Ok loaded)
-          (try-let ((cut (expand-loaded lines ctx loaded)))
+          (try-let ((cut (expand-loaded lines ctx loaded (maker-runner rm prelude loaded))))
             (match (find-macro ctx name)
               ((some m) (Ok (MacroInput lines m prelude)))
               (nil (Err (unwrap-or cut (failed lines (record "NoMacro" no-position (str-join ["no macro " name]))))))))))))))
 
 ;; The file's header and its macro: `unreadable` for a file that is not there. Rust: files_here and the start of `macro_text`
-(defun macro-front (file: str name: str) -> (Result MacroInput dump/Dumped)
+(defun macro-front (file: str name: str rm: RunnerMaker) -> (Result MacroInput dump/Dumped)
   (let ((header [(str-concat "== " file)]))
     (match (read-file file)
       (nil (Err (dump/Dumped (conj header "unreadable") 2)))
-      ((some source) (macro-of header source file name)))))
+      ((some source) (macro-of header source file name rm)))))

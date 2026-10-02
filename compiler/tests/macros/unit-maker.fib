@@ -1,0 +1,38 @@
+;; compiler/tests/macros/unit-maker.fib: compiler/expand/maker.fib: how a tool is handed its macro runner. The words of the command line
+;; lose a `--no-runner` among the options (not after a lone `--`, where it is a file name); the maker of stage 2a makes a runner that
+;; stops every user macro call with the pending error. The runner of macros.runner is judged by compare.sh of compiler/tests/expand
+;; (`fibref expand` without --no-runner) and of compiler/tests/driver (`fibc emit`, `fibc run`).
+;; Build: fibc build compiler/tests/macros/unit-maker.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [expand.maker :as mk])
+  (:use syntax.pos syntax.form types.check expand.error expand.types expand.ctx))
+
+(defun split (words: (Vec str)) -> (Pair (Vec str) bool)
+  (let ((r (mk/take-no-runner words))) (Pair (. r words) (. r no-runner))))
+
+;; What the stage-2a runner says of a call of the macro `m` at line 3.
+(defun pending-text () -> str
+  (let ((ctx (ctx-new))
+        (def (MacroDef "m" "main" "main/m" false [] nil [] (builtin-pos))))
+    (do (ctx-set-call-pos ctx (Pos "f.fib" 3 4 10 12))
+        (match (runner-run (mk/maker-runner (mk/no-runner-maker) [] []) def [] ctx)
+          ((Err e) (str-join [(expand-err-name (. e kind)) " " (expand-err-message (. e kind)) " " (show (. (. e pos) line))]))
+          ((Ok _) "ran")))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (check cs "no --no-runner: the words as they were"
+             (and (= (split ["a" "b"]) (Pair ["a" "b"] false)) (= (split []) (Pair [] false))))
+      (check cs "--no-runner among the options is taken out, anywhere before the files"
+             (and (= (split ["--no-runner" "f"]) (Pair ["f"] true))
+                  (= (split ["--sections" "fns" "--no-runner" "f" "g"]) (Pair ["--sections" "fns" "f" "g"] true))
+                  (= (split ["a" "--no-runner" "--no-runner"]) (Pair ["a"] true))))
+      (check cs "after a lone -- it is a file name"
+             (and (= (split ["--" "--no-runner"]) (Pair ["--" "--no-runner"] false))
+                  (= (split ["--no-runner" "--" "--no-runner"]) (Pair ["--" "--no-runner"] true))))
+      (check cs "a word that only starts like it stays"
+             (= (split ["--no-runner=1" "--no-runners"]) (Pair ["--no-runner=1" "--no-runners"] false)))
+      (check cs "the maker of stage 2a makes the runner that stops every macro call"
+             (= (pending-text) "MacroNeedsEvaluator macro m needs the evaluator to expand (pending) 3"))
+      (finish cs))))

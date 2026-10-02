@@ -3,11 +3,14 @@
 ;; (`--sections LIST` of runtime,externs,types,statics,keywords,defs,quotes,fns,main; `--fn PREFIX` the functions whose name starts with it),
 ;; or the layout table and type table of its ground types (`--layout`), or a macro's module (`--macro NAME`, package E11: pending).
 ;; With no file, or a word that is not an option, it prints a usage line to stderr, nothing to stdout, and exits 2.
+;; The macros of a program are run (macros.runner: the tool needs `-L target/debug -l lair`) as `fibc emit-dump` runs them with the JIT runner; the
+;; word `--no-runner` among the options (not part of the Rust tool) leaves a call of a user macro `MacroNeedsEvaluator`.
 ;; Exit status: 0 if every file was emitted, 1 if one ended in an error record (it did not read, load, expand or check), 2 if one
 ;; could not be read at all or the words were refused, 3 if one is `unsupported`, 70 if a stub of a package not ported yet was reached
 ;; (pending: never a pass); the larger wins. It links every module of compiler/emit/, so that `fibc build compiler/emit.fib` proves each
 ;; compiles; the modules are in dependency order.
 (ns main
+  (:require [expand.maker :as mk] [expand.roots :as er] [macros.runner :as mr])
   (:use emit.value emit.text emit.ir emit.names emit.layout emit.mono emit.objects emit.statics emit.runtime emit.rt
         emit.program emit.inits emit.lower.cx emit.lower.mod emit.lower.ops emit.lower.ctrl
         emit.lower.values emit.lower.call emit.lower.arith emit.lower.objects emit.lower.cells
@@ -18,14 +21,15 @@
 (def usage: str "usage: emit [--sections LIST | --fn PREFIX | --layout | --macro NAME] [--] FILE..")
 
 ;; Prints the output of each of files in order, and returns the largest status.
-(defun emit-files (files: (Vec str) o: EmitOptions) -> i64
+(defun emit-files (files: (Vec str) o: EmitOptions rm: mk/RunnerMaker) -> i64
   (reduce (fn (status: i64 file: str)
-            (let ((d (emit-file file o)))
+            (let ((d (emit-file-with file o (er/roots-default) rm)))
               (do (doseq [line (. d lines)] (println line))
                   (max status (. d status)))))
           0 files))
 
 (defun main () -> i64
-  (match (emit-parse-args (vec (args)))
-    (nil (do (eprintln usage) 2))
-    ((some parsed) (emit-files (. parsed files) (. parsed opts)))))
+  (let ((nr (mk/take-no-runner (vec (args)))))
+    (match (emit-parse-args (. nr words))
+      (nil (do (eprintln usage) 2))
+      ((some parsed) (emit-files (. parsed files) (. parsed opts) (mr/maker-for (. nr no-runner)))))))

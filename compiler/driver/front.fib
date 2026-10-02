@@ -1,11 +1,11 @@
 ;; compiler/driver/front.fib: the front end of the driver, as crates/fibc/src/front.rs `check_in` (spec/compiler.md §1) and the
 ;; lowering of crates/fibc/src/main.rs (`lower`, `lower_kind`, :19 the exit codes): read, load (the modules of the program found in
 ;; `roots`), expand, type, check ownership, then the lIR text of the module; or what to say and the exit status when a step stops.
-;; Shapes decided: the macro runner of stage 2a is `no-runner`, so a program that calls a macro is `FrontPending` (the expander's
-;; `MacroNeedsEvaluator` record on stderr, exit 1: the lead wires the runner of stage 2b in `front-check`, the one place that
-;; expands). The reason a file or a module cannot be read is the operating system's, asked for as Rust prints it (driver.native `fault-of`).
+;; Shapes decided: the macros of the program are run by the runner the tool gives (`RunnerMaker`, expand.maker; stage 2b's is macros.runner,
+;; the default of `fibc`); with `--no-runner` (`no-runner-maker`) a program that calls a macro is `FrontPending` (the expander's
+;; `MacroNeedsEvaluator` record on stderr, exit 1), `front-check` being the one place that expands. The reason a file or a module cannot be read is the operating system's, asked for as Rust prints it (driver.native `fault-of`).
 (ns driver.front
-  (:require [syntax.dump :as sdump] [expand.modules :as mods] [types.driver :as td] [emit.compile :as ec] [driver.native :as native]
+  (:require [syntax.dump :as sdump] [expand.modules :as mods] [expand.maker :as mk] [types.driver :as td] [emit.compile :as ec] [driver.native :as native]
             [fib.string :as s])
   (:use syntax.form expand.error expand.types expand.ctx expand.roots own.error own.program own.driver))
 
@@ -62,7 +62,7 @@
 
 ;; Reads, expands, types and checks `source` (named `file` in positions), its modules looked for in `roots`, exactly as the Rust
 ;; front end does before it lowers. Rust: front.rs:45 `check_in`
-(defun front-check (source: str file: str roots: Roots) -> Front
+(defun front-check (source: str file: str roots: Roots rm: mk/RunnerMaker) -> Front
   (let ((ctx (ctx-new)))
     (match (td/prelude-forms ctx)
       ((Err m) (FrontFailed (str-concat "the prelude does not expand: " m)))
@@ -70,7 +70,7 @@
        (match (mods/try-load-in source file roots)
          ((Err e) (FrontRejected (load-failure e roots)))
          ((Ok loaded)
-          (match (mods/expand-all loaded ctx (no-runner))
+          (match (mods/expand-all loaded ctx (mk/maker-runner rm prelude loaded))
             ((Err e) (expand-stop e file))
             ((Ok modules)
              (match (own-check-modules modules prelude)
@@ -78,11 +78,11 @@
                ((Ok c) (FrontChecked c)))))))))))
 
 ;; The checked program of `file`, or the exit status after the message of what stopped it. Rust: main.rs:47 `lower_kind` (first half)
-(defun check-file (file: str roots: Roots) -> (Result Checked i64)
+(defun check-file (file: str roots: Roots rm: mk/RunnerMaker) -> (Result Checked i64)
   (match (read-file file)
     (nil (do (eprintln (str-join ["fibc: cannot read " file ": " (. (native/fault-of file) text)])) (Err exit-usage)))
     ((some source)
-     (match (front-check source file roots)
+     (match (front-check source file roots rm)
        ((FrontChecked c) (Ok c))
        ((FrontRejected m) (do (eprintln (str-concat "rejected:\n" m)) (Err exit-rejected)))
        ((FrontFailed m) (do (eprintln (str-concat "failed: " m)) (Err exit-compile-failed)))
@@ -90,8 +90,8 @@
 
 ;; The front end and the lowering: the lIR text of `file` (of an executable when `executable`), or the exit status that says why
 ;; not, its message already printed. Rust: main.rs:47 `lower_kind`
-(defun lower-kind (file: str roots: Roots executable: bool) -> (Result str i64)
-  (match (check-file file roots)
+(defun lower-kind (file: str roots: Roots rm: mk/RunnerMaker executable: bool) -> (Result str i64)
+  (match (check-file file roots rm)
     ((Err code) (Err code))
     ((Ok c)
      (match (if executable (ec/compile-executable (. c typed) (. c owned)) (ec/compile (. c typed) (. c owned)))

@@ -28,7 +28,7 @@
 (ns types.dump
   (:require [syntax.reader :as reader] [syntax.dump :as sdump] [expand.modules :as mods]
             [expand.program :as prog] [types.driver :as driver])
-  (:use syntax.pos syntax.form syntax.error expand.error expand.types expand.ctx expand.roots
+  (:use syntax.pos syntax.form syntax.error expand.error expand.types expand.ctx expand.roots expand.maker
         types.args types.error types.decls types.dump.normal types.dump.tables types.dump.sections))
 
 ;; One file's output: its lines and the status it adds. A line has no newline.
@@ -107,14 +107,14 @@
 
 ;; The modules of loaded expanded in order in ctx, each begun, expanded and ended;
 ;; the first expansion error ends the dump under its `-- module NS FILE` line.
-(defun expand-modules :private (lines: (Vec str) ctx: ExpandCtx loaded: (Vec Loaded))
+(defun expand-modules :private (lines: (Vec str) ctx: ExpandCtx loaded: (Vec Loaded) runner: Runner)
     -> (Result (Vec Expanded) Dumped)
   (loop ((i 0) (out (vec-empty)))
     (if (>= i (count loaded))
         (Ok out)
         (let ((l (nth loaded i)))
           (do (mods/begin-spec ctx (. l spec))
-              (match (prog/expand-program (. l forms) ctx (no-runner))
+              (match (prog/expand-program (. l forms) ctx runner)
                 ((Err e) (Err (failed (conj lines (str-join ["-- module " (. (. l spec) ns) " " (. l file)]))
                                       (expand-record e (. l file)))))
                 ((Ok forms) (do (ctx-end-module ctx)
@@ -126,7 +126,7 @@
 
 ;; The dump of the program whose main module is source (the file `file`)
 ;; (`dump_program`).
-(defun dump-program :private (lines: (Vec str) source: str file: str opts: Options roots: Roots
+(defun dump-program :private (lines: (Vec str) source: str file: str opts: Options roots: Roots rm: RunnerMaker
                               check: (fn ((Vec str) (Vec Expanded) (Vec Stx) (Vec Shown) str Options) Dumped) :borrow)
     -> Dumped
   (let ((ctx (ctx-new)))
@@ -136,7 +136,7 @@
        (match (mods/try-load-with source file roots (implicit-of opts))
          ((Err e) (failed lines (load-record e file)))
          ((Ok loaded)
-          (match (expand-modules lines ctx loaded)
+          (match (expand-modules lines ctx loaded (maker-runner rm prelude loaded))
             ((Err d) d)
             ((Ok modules)
              (check lines modules prelude (layout-of loaded opts) file opts)))))))))
@@ -171,8 +171,8 @@
 ;; options in, what the file prints out. The modules the program requires are looked for in
 ;; `roots` (spec/syntax.md §5: beside the file, under each `-I` directory, under each directory of
 ;; `FIB_LIB`, then the built-in library); a program that is a library prelude needs none.
-(defun dump-file-in (file: str opts: Options roots: Roots
-                     check: (fn ((Vec str) (Vec Expanded) (Vec Stx) (Vec Shown) str Options) Dumped) :borrow)
+(defun dump-file-with (file: str opts: Options roots: Roots rm: RunnerMaker
+                       check: (fn ((Vec str) (Vec Expanded) (Vec Stx) (Vec Shown) str Options) Dumped) :borrow)
     -> Dumped
   (let ((header [(str-concat "== " file)]))
     (match (read-file file)
@@ -180,7 +180,13 @@
       ((some source)
        (if (. opts prelude)
            (dump-prelude header source file opts check)
-           (dump-program header source file opts roots check))))))
+           (dump-program header source file opts roots rm check))))))
+
+;; `dump-file-with` and no runner at all (stage 2a: a call of a user macro is `MacroNeedsEvaluator`).
+(defun dump-file-in (file: str opts: Options roots: Roots
+                     check: (fn ((Vec str) (Vec Expanded) (Vec Stx) (Vec Shown) str Options) Dumped) :borrow)
+    -> Dumped
+  (dump-file-with file opts roots (no-runner-maker) check))
 
 ;; `dump-file-in` with no directory but the built-in library's (`Roots::default`).
 (defun dump-file (file: str opts: Options
@@ -191,6 +197,10 @@
 ;; What `fibref types` prints for one file: `dump-file` with the type checker's check.
 (defun types-file (file: str opts: Options) -> Dumped
   (dump-file file opts check-and-dump))
+
+;; `types-file` with the macro runner `rm` makes (`fibref types` runs the macros of a program).
+(defun types-file-with (file: str opts: Options rm: RunnerMaker) -> Dumped
+  (dump-file-with file opts (roots-default) rm check-and-dump))
 
 ;; What the tool prints before its first file: the `builtins` table when the `tables` section is
 ;; asked for (`types_here`).
