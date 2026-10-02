@@ -1,0 +1,65 @@
+;; spec:   stdlib §2.1 rule 1 and 3 (each-while's result says whether the walk ran to the end), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; Case 262 for the recipes of tranche 2. each-while answers false exactly when the visitor stopped the
+;; walk, and true when the recipe ran to its end: so a visitor that says false at its n-th element
+;; makes every recipe answer false, at an element of the source, at a separator of an Interposed, at
+;; the init of a Reductions and at the element of a Consed, and none of them asks its source for
+;; another element after that (a source that counts the elements it gave says so). A walk
+;; the visitor never stops answers true, including over an empty source.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; a source that counts the elements it gives
+(defstruct Counted (v: (Vec i64) seen: (Cell i64)))
+(impl (Reducible i64) Counted
+  (each-while (self k)
+    (let ((n (vec-count (. self v))))
+      (loop ((i 0))
+        (if (< i n)
+            (do (set! (. self seen) (+ @(. self seen) 1))
+                (if (k (vec-nth (. self v) i)) (recur (+ i 1)) false))
+            true)))))
+
+;; visits until it has seen `limit` elements, saying false at the limit-th;
+;; the result is [what each-while answered, how many elements it saw, how many the source gave]
+(defun walk (mk: (fn (Counted) c) limit: i64) :where ((Reducible c i64)) -> (Vec i64)
+  (let ((src (Counted [1 2 3 4 5] (cell 0))) (seen (cell 0)))
+    (let ((r (mk src)))
+      (let ((done (each-while r (fn (x) (do (set! seen (+ @seen 1)) (< @seen limit))))))
+        [(if done 1 0) @seen @(. src seen)]))))
+
+(defun none () -> (Vec i64) [])
+(defun add (a: i64 x: i64) -> i64 (+ a x))
+(defun id (i: i64 x: i64) -> i64 x)
+(defun some-all (x: i64) -> (Option i64) (some x))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do ;; run to the end: true, every element seen
+        (check c (= (walk (fn (s) (MapIndexed s id)) 99) [1 5 5]))
+        (check c (= (walk (fn (s) (Kept s some-all)) 99) [1 5 5]))
+        (check c (= (walk (fn (s) (DroppedWhile s (fn (x: i64) (< x 3)))) 99) [1 3 5]))
+        (check c (= (walk (fn (s) (Interposed s 0)) 99) [1 9 5]))
+        (check c (= (walk (fn (s) (Distinct s)) 99) [1 5 5]))
+        (check c (= (walk (fn (s) (Reductions s add 0)) 99) [1 6 5]))
+        (check c (= (walk (fn (s) (Consed 0 s)) 99) [1 6 5]))
+        ;; the visitor stops at its third value: false, three seen, and the source not asked for more
+        (check c (= (walk (fn (s) (MapIndexed s id)) 3) [0 3 3]))
+        (check c (= (walk (fn (s) (Kept s some-all)) 3) [0 3 3]))
+        (check c (= (walk (fn (s) (DroppedWhile s (fn (x: i64) (< x 2)))) 3) [0 3 4]))
+        (check c (= (walk (fn (s) (Interposed s 0)) 3) [0 3 2]))
+        (check c (= (walk (fn (s) (Interposed s 0)) 2) [0 2 2]))
+        (check c (= (walk (fn (s) (Distinct s)) 3) [0 3 3]))
+        (check c (= (walk (fn (s) (Reductions s add 0)) 3) [0 3 2]))
+        (check c (= (walk (fn (s) (Consed 0 s)) 3) [0 3 2]))
+        ;; the first value stops: Reductions and Consed never touch the source
+        (check c (= (walk (fn (s) (Reductions s add 0)) 1) [0 1 0]))
+        (check c (= (walk (fn (s) (Consed 0 s)) 1) [0 1 0]))
+        ;; over nothing: true, and a Reductions still gives its init and a Consed its element
+        (check c (= (walk (fn (s) (MapIndexed (none) id)) 99) [1 0 0]))
+        (check c (= (walk (fn (s) (Reductions (none) add 7)) 99) [1 1 0]))
+        (check c (= (walk (fn (s) (Consed 7 (none))) 99) [1 1 0]))
+        (check c (= (walk (fn (s) (Interposed (none) 0)) 99) [1 0 0]))
+        (checks-result c))))

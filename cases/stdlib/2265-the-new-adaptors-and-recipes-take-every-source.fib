@@ -1,0 +1,71 @@
+;; spec:   stdlib §2.1 rule 1 (every source feeds the adaptors), §4.4 rows map-indexed keep drop-while interpose distinct reductions cons mapv filterv partition-by, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed keep drop-while interpose distinct reductions cons mapv filterv partition-by
+;; Every function of tranche 2 and the recipe of each takes any Reducible: a Vec, a List, a VSeq
+;; (a seq of a Vec with a consed front), an LSeq, an Option, a Range, a Set, an Array, a str (its
+;; characters) and a user type, which joins with one impl (here a tree walked in order). For each source
+;; the answer through the generic path is the answer through the Vec of the same elements (the Vec
+;; path is what the ref- cases check against loops), and the order of a Set's elements is its own,
+;; the same in both.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defenum (Tree a) Leaf (Node l: (Tree a) v: a r: (Tree a)))
+(defun tree-each (t: (Tree a) k: (fn (a) bool) :borrow) -> bool
+  (match t
+    ((Leaf) true)
+    ((Node l v r) (if (tree-each l k) (if (k v) (tree-each r k) false) false))))
+(impl (Reducible a) (Tree a) (each-while (self k) (tree-each self k)))
+
+(defun mix (i: i64 x: i64) -> i64 (+ (* i 7) x))
+(defun some-odd (x: i64) -> (Option i64) (if (odd? x) (some (* x 10)) nil))
+(defun small (x: i64) -> bool (< x 2))
+(defun add (a: i64 x: i64) -> i64 (+ a x))
+(defun halves (x: i64) -> i64 (quot x 2))
+(defun parts (s: (LSeq (VSeq i64))) -> (Vec (Vec i64)) (vec (map (fn (g: (VSeq i64)) (to-vec g)) s)))
+
+;; the eight lazy functions, the two eager twins and the seven recipes over c, against the same over the Vec of its elements
+(defun agrees (c: c) :where ((Reducible c i64)) -> bool
+  (let ((v (to-vec c)))
+    (and (= (vec (map-indexed mix c)) (vec (map-indexed mix v)))
+         (= (vec (keep some-odd c)) (vec (keep some-odd v)))
+         (= (vec (drop-while small c)) (vec (drop-while small v)))
+         (= (vec (interpose 0 c)) (vec (interpose 0 v)))
+         (= (vec (distinct c)) (vec (distinct v)))
+         (= (vec (reductions add 5 c)) (vec (reductions add 5 v)))
+         (= (vec (cons 9 c)) (vec (cons 9 v)))
+         (= (parts (partition-by halves c)) (parts (partition-by halves v)))
+         (= (mapv halves c) (mapv halves v))
+         (= (filterv small c) (filterv small v))
+         (= (to-vec (MapIndexed c mix)) (to-vec (MapIndexed v mix)))
+         (= (to-vec (Kept c some-odd)) (to-vec (Kept v some-odd)))
+         (= (to-vec (DroppedWhile c small)) (to-vec (DroppedWhile v small)))
+         (= (to-vec (Interposed c 0)) (to-vec (Interposed v 0)))
+         (= (to-vec (Distinct c)) (to-vec (Distinct v)))
+         (= (to-vec (Reductions c add 5)) (to-vec (Reductions v add 5)))
+         (= (to-vec (Consed 9 c)) (to-vec (Consed 9 v))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (tree (Node (Node Leaf 1 Leaf) 2 (Node (Node Leaf 2 Leaf) 3 Leaf))))
+    (do (check c (agrees [1 2 2 3 4 4 5]))
+        (check c (agrees (list 1 2 2 3 4)))
+        (check c (agrees (VSeq (list 1 2) [2 3 3] 1)))
+        (check c (agrees (vseq-of [3 1 3])))
+        (check c (agrees (lcons 1 (lcons 2 (lcons 2 (lcons 3 (lazy-node (fn () LNil))))))))
+        (check c (agrees (map (fn (x: i64) (rem x 3)) (range 9))))
+        (check c (agrees (some 3)))
+        (check c (agrees (some 1)))
+        (check c (agrees (range 8)))
+        (check c (agrees (range-by 10 0 -3)))
+        (check c (agrees (Set (map-assoc (map-assoc (map-assoc (map-empty) 4 true) 1 true) 7 true))))
+        (check c (agrees (array 4 7)))
+        (check c (agrees tree))
+        (check c (agrees (Mapped [1 2 3] (fn (x: i64) (* x x)))))
+        (check c (agrees (Cat [1 2] (some 2))))
+        ;; the characters of a string
+        (check c (= (str-join (vec (map (fn (ch: char) (char->str ch)) (distinct "abracadabra")))) "abrcd"))
+        (check c (= (vec (map-indexed (fn (i: i64 ch: char) (char->i32 ch)) "ab")) [97i32 98i32]))
+        (checks-result c))))

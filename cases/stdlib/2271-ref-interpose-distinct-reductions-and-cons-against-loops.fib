@@ -1,0 +1,78 @@
+;; spec:   stdlib §4.4 rows interpose distinct reductions cons, §8.1 item 2, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: interpose distinct reductions cons
+;; The four lazy functions against eager loops over the prelude's vec-conj and vec-nth (no library
+;; code on the reference side; the reference of distinct scans the Vec of what it has kept, where the
+;; library hashes), over 300 seeded draws of a Vec of 0 to 40 integers below 8 (so that there are
+;; repeats) and drawn parameters. reductions uses a combiner that is not commutative, so a swapped
+;; argument shows. The last checks plant a fault in the reference, one at a time (1: a separator
+;; after the last element, 2: distinct drops only a repeat of the previous element, 3: reductions
+;; leaves out its init, 4: cons puts its element last), and require each to be noticed. Seed 2271.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+;; ---- the reference
+(defun push (v: (Vec i64) x: i64) -> (Vec i64) (vec-conj v x))
+(defun r-interpose (v: (Vec i64) sep: i64 fault: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (recur (+ i 1) (push (if (> i 0) (push acc sep) acc) (vec-nth v i)))
+        (if (and (= fault 1) (> i 0)) (push acc sep) acc))))
+(defun has (v: (Vec i64) x: i64) -> bool
+  (loop ((i 0)) (if (< i (vec-count v)) (if (= (vec-nth v i) x) true (recur (+ i 1))) false)))
+(defun r-distinct (v: (Vec i64) fault: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (let ((x (vec-nth v i)))
+          (recur (+ i 1)
+                 (if (if (= fault 2)
+                         (and (> (vec-count acc) 0) (= (vec-nth acc (- (vec-count acc) 1)) x))
+                         (has acc x))
+                     acc
+                     (push acc x))))
+        acc)))
+(defun step (a: i64 x: i64 k: i64) -> i64 (rem (+ (* a k) x) 1000003))
+(defun r-reductions (v: (Vec i64) init: i64 k: i64 fault: i64) -> (Vec i64)
+  (loop ((i 0) (a init) (acc (if (= fault 3) (vec-empty) (push (vec-empty) init))))
+    (if (< i (vec-count v))
+        (let ((b (step a (vec-nth v i) k))) (recur (+ i 1) b (push acc b)))
+        acc)))
+(defun r-cons (x: i64 v: (Vec i64) fault: i64) -> (Vec i64)
+  (loop ((i 0) (acc (if (= fault 4) (vec-empty) (push (vec-empty) x))))
+    (if (< i (vec-count v))
+        (recur (+ i 1) (push acc (vec-nth v i)))
+        (if (= fault 4) (push acc x) acc))))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; one draw: every function against its reference
+(defun draw (r: Rng c: Checks fault: i64) -> unit
+  (let ((v (rng-vec r (rng-below r 41) 8))
+        (x (rng-below r 8))
+        (k (+ 1 (rng-below r 3))))
+    (do (check c (same (vec (interpose x v)) (r-interpose v x fault)))
+        (check c (same (vec (distinct v)) (r-distinct v fault)))
+        (check c (same (vec (reductions (fn (a: i64 e: i64) (step a e k)) x v)) (r-reductions v x k fault)))
+        (check c (same (vec (cons x v)) (r-cons x v fault))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2271)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)) (p4 (checks)))
+    (do (run-all c 0)
+        (check c (= (checks-made c) 1200))
+        (run-all p1 1)
+        (run-all p2 2)
+        (run-all p3 3)
+        (run-all p4 4)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (check-detects c p4)
+        (checks-result c))))

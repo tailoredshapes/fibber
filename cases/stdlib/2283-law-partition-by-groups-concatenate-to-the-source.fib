@@ -1,0 +1,54 @@
+;; spec:   stdlib §4.4 row partition-by, §8.1 item 4 (laws), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: partition-by
+;; (partition-by f xs) over 300 seeded draws of a Vec of 0 to 40 integers below 40 and the key (quot x 7):
+;; the groups, one after the other, are the source again; no group is empty; every element of a group
+;; has the group's key; the keys of two neighbouring groups differ; and there are at most as many
+;; groups as elements. The last checks plant a fault in each expectation, one at a time (1: the groups
+;; make the source reversed, 2: neighbouring groups have equal keys, 3: there is a group for every
+;; element), and require each to be noticed. Seed 2283.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun key (x: i64) -> i64 (quot x 7))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; every element of the group has the key of its first
+(defun one-key (g: (Vec i64)) -> bool
+  (loop ((i 0)) (if (< i (vec-count g)) (if (= (key (vec-nth g i)) (key (vec-nth g 0))) (recur (+ i 1)) false) true)))
+
+(defun draw (r: Rng c: Checks fault: i64) -> unit
+  (let ((xs (rng-vec r (rng-below r 41) 40)))
+    (let ((gs (vec (map (fn (g: (VSeq i64)) (to-vec g)) (partition-by key xs)))))
+      (let ((flat (vec (mapcat (fn (g: (Vec i64)) g) gs))))
+        (do (check c (same flat (if (= fault 1) (vec (reverse xs)) xs)))
+            (check c (every? (fn (g: (Vec i64)) (> (count g) 0)) gs))
+            (check c (every? one-key gs))
+            (check c (loop ((i 1))
+                       (if (< i (count gs))
+                           (if (= (!= (key (nth (nth gs (- i 1)) 0)) (key (nth (nth gs i) 0))) (!= fault 2))
+                               (recur (+ i 1))
+                               false)
+                           true)))
+            (check c (if (= fault 3) (= (count gs) (count xs)) (<= (count gs) (count xs)))))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2283)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (run-all c 0)
+        (check c (= (checks-made c) 1500))
+        (run-all p1 1)
+        (run-all p2 2)
+        (run-all p3 3)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

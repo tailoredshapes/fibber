@@ -1,0 +1,50 @@
+;; spec:   stdlib §4.4 row reductions, §8.1 item 4 (laws), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reductions
+;; (reductions f init xs) over 300 seeded draws of a Vec of 0 to 40 integers, an init and a combiner
+;; that is not commutative: it has n + 1 values; the first is init; each value is f of the one before it
+;; and the next element; and the last is what reduce gives. The last checks plant a fault in each
+;; expectation, one at a time (1: the count is n, 2: the last is the reduce from init + 1, 3: each
+;; value is f of the element and the value before it), and require each to be noticed. Seed 2282.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun step (a: i64 x: i64) -> i64 (rem (+ (* a 3) x) 1000003))
+
+;; every value is f of the one before it and the next element
+(defun chained (out: (Vec i64) xs: (Vec i64) fault: i64) -> bool
+  (loop ((i 0))
+    (if (< i (vec-count xs))
+        (if (= (vec-nth out (+ i 1))
+               (if (= fault 3) (step (vec-nth xs i) (vec-nth out i)) (step (vec-nth out i) (vec-nth xs i))))
+            (recur (+ i 1))
+            false)
+        true)))
+
+(defun draw (r: Rng c: Checks fault: i64) -> unit
+  (let ((xs (rng-vec r (rng-below r 41) 100))
+        (init (rng-below r 10)))
+    (let ((out (vec (reductions step init xs)))
+          (n (vec-count xs)))
+      (do (check c (= (vec-count out) (if (= fault 1) n (+ n 1))))
+          (check c (= (first out) (some init)))
+          (check c (and (>= (vec-count out) (+ n 1)) (chained out xs fault)))
+          (check c (= (last out) (some (reduce step (if (= fault 2) (+ init 1) init) xs))))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2282)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (run-all c 0)
+        (check c (= (checks-made c) 1200))
+        (run-all p1 1)
+        (run-all p2 2)
+        (run-all p3 3)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

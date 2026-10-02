@@ -1,0 +1,39 @@
+;; spec:   stdlib §4.4 row distinct, §2.1 rule 2 (the lazy form), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: distinct
+;; (distinct c) keeps the first occurrence of each element, in the order they come, by Eq and
+;; Hash: strings, pairs and vectors are the same as integers. The set of what it has seen is
+;; threaded through the nodes, so a bound seq walked twice, and two seqs made from one source, each
+;; give the whole answer; the source's own seq is not changed.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun none () -> (Vec i64) [])
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (vec (distinct [1 2 1 3 2 4 1])) [1 2 3 4]))
+        (check c (= (vec (distinct [5 5 5])) [5]))
+        (check c (= (vec (distinct [1 2 3])) [1 2 3]))
+        (check c (empty? (distinct (none))))
+        (check c (= (vec (distinct [3 1 3 1 2])) [3 1 2]))
+        ;; the elements are compared by Eq and Hash, not by position or identity
+        (check c (= (vec (distinct ["b" "a" "b" "c" "a"])) ["b" "a" "c"]))
+        (check c (= (vec (distinct [(Pair 1 2) (Pair 2 1) (Pair 1 2)])) [(Pair 1 2) (Pair 2 1)]))
+        (check c (= (vec (distinct [[1 2] [1] [1 2] []])) [[1 2] [1] []]))
+        (check c (= (vec (distinct [true false true])) [true false]))
+        ;; every kind of source
+        (check c (= (vec (distinct (list 2 1 2))) [2 1]))
+        (check c (= (vec (distinct (some 4))) [4]))
+        (check c (= (vec (distinct (map (fn (x: i64) (rem x 3)) (range 9)))) [0 1 2]))
+        (check c (= (count (distinct (concat (range 5) (range 3)))) 5))
+        ;; a bound seq walked twice, and two seqs of one source
+        (let ((src (map (fn (x: i64) (rem x 2)) [1 2 3 4])))
+          (let ((a (distinct src)) (b (distinct src)))
+            (do (check c (= (vec a) [1 0]))
+                (check c (= (vec a) [1 0]))
+                (check c (= (vec b) [1 0]))
+                (check c (= (vec src) [1 0 1 0])))))
+        (checks-result c))))

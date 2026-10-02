@@ -1,0 +1,32 @@
+;; spec:   stdlib §2.1 rule 2 and P2 (a fused chain allocates nothing per element), §8.1 item 5 (count cases), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 89970
+;; audit:  clean
+;; allocs: <= 8
+;; roots:  ../../lib support
+;; Case 280 for the recipes of tranche 2: a chain of five of them, Reductions over Consed over Interposed over
+;; DroppedWhile over MapIndexed, built by hand with the constructors the rewrite (X12) will emit
+;; and walked once by each-while, over a Vec of 50 elements allocates at most 8 heap objects,
+;; however many elements there are: the five structs and the three closures that three of them store (the
+;; function of MapIndexed, the predicate of DroppedWhile, the combiner of Reductions), none per element
+;; (counted with `fibc itrace`, which prints the A lines of the free trace; MapIndexed alone is 2, the chain without Reductions 6). The bound is the count, and the
+;; same chain over 500 elements has the same bound (case 2297), so a stage that allocated per element would fail one of
+;; the two. Kept and Distinct are not in the chain: until C5 an Option that f returns is a heap
+;; object, and a set of the elements seen grows with them. The Vec is a `def`, whose objects the trace
+;; leaves out (compiler.md §4).
+(ns main (:use fib.core fib.seq))
+
+(def xs: (Vec i64)
+  [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+    20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
+    40 41 42 43 44 45 46 47 48 49])
+
+(defun total (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ @acc x)) true))) @acc)))
+
+;; the index added to the element, the leading small ones dropped, a 1 between the rest, a 100 in front, running sums
+(defun main () -> i64
+  (total (Reductions (Consed 100 (Interposed (DroppedWhile (MapIndexed xs (fn (i: i64 x: i64) (+ i x))) (fn (x: i64) (< x 10))) 1))
+                     (fn (a: i64 x: i64) (+ a x))
+                     0)))

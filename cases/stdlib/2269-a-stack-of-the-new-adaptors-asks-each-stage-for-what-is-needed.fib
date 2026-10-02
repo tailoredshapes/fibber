@@ -1,0 +1,49 @@
+;; spec:   stdlib §2.1 rule 2 (two lazy adaptors stay lazy end to end), tranche 1 plan PC-13, §4.4 rows map-indexed keep drop-while interpose, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed keep drop-while interpose
+;; Three of the new adaptors one over the other, (map-indexed g (keep f (drop-while p source))),
+;; with a counter in each function and one in the source. Each stage converts its source with to-lseq,
+;; which is the seq itself for an LSeq, so the stack is lazy end to end: the demand for the first
+;; element calls p until it fails, f until it gives a payload and g once, and reads the source only that
+;; far; the second element continues from there; nothing is called twice, and a second walk calls
+;; nothing. Then interpose on top, whose separator node asks the stage below for one element more.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun bump (calls: (Cell i64)) -> unit (set! calls (+ @calls 1)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (p-calls (cell 0)) (f-calls (cell 0)) (g-calls (cell 0)) (nodes (cell 0)))
+    (let ((s (map-indexed (fn (i: i64 x: i64) (do (bump g-calls) (+ (* i 10) x)))
+               (keep (fn (x: i64) (do (bump f-calls) (if (odd? x) (some x) nil)))
+                 (drop-while (fn (x: i64) (do (bump p-calls) (> x 4)))
+                   (countdown 6 nodes))))))
+      (do ;; nothing yet
+          (check c (and (= @p-calls 0) (= @f-calls 0) (= @g-calls 0) (= @nodes 0)))
+          ;; the first element: 6 5 4 asked of p, 4 3 of f, one g, four nodes
+          (check c (= (first s) (some 3)))
+          (check c (and (= @p-calls 3) (= @f-calls 2) (= @g-calls 1) (= @nodes 4)))
+          ;; the whole seq: 2 and 1 more for f, one more g, the end node
+          (check c (= (vec s) [3 11]))
+          (check c (and (= @p-calls 3) (= @f-calls 4) (= @g-calls 2) (= @nodes 7)))
+          ;; walked again: nothing is called
+          (check c (= (vec s) [3 11]))
+          (check c (and (= @p-calls 3) (= @f-calls 4) (= @g-calls 2) (= @nodes 7)))))
+    ;; interpose over the stack: its first element costs what the stack's first costs, and the node
+    ;; of the separator asks the stack for its second
+    (let ((f-calls (cell 0)) (nodes (cell 0)))
+      (let ((s (interpose 0 (keep (fn (x: i64) (do (bump f-calls) (if (odd? x) (some x) nil))) (countdown 6 nodes)))))
+        (do (check c (= (first s) (some 5)))
+            (check c (and (= @f-calls 2) (= @nodes 2)))
+            (check c (= (first (rest s)) (some 0)))
+            (check c (and (= @f-calls 4) (= @nodes 4)))
+            (check c (= (vec s) [5 0 3 0 1])))))
+    (checks-result c)))

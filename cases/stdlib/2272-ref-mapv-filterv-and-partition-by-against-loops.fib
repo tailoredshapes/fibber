@@ -1,0 +1,72 @@
+;; spec:   stdlib §4.4 rows mapv filterv partition-by, §8.1 item 2, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mapv filterv partition-by
+;; mapv, filterv and partition-by against eager loops over the prelude's vec-conj and vec-nth (no
+;; library code on the reference side), over 300 seeded draws of a Vec of 0 to 40 integers below 30
+;; and drawn parameters. partition-by is read as a Vec of the Vecs of its groups, and the reference
+;; closes a group when its key differs from the key of the group's first element. The last checks
+;; plant a fault in the reference, one at a time (1: mapv is off by one, 2: filterv keeps what it
+;; should drop, 3: partition-by cuts only where the key goes up), and require each to be noticed.
+;; Seed 2272.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+;; ---- the reference
+(defun push (v: (Vec i64) x: i64) -> (Vec i64) (vec-conj v x))
+(defun r-mapv (v: (Vec i64) k: i64 fault: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (recur (+ i 1) (push acc (+ (+ (* (vec-nth v i) k) 1) (if (= fault 1) 1 0))))
+        acc)))
+(defun r-filterv (v: (Vec i64) k: i64 fault: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (let ((x (vec-nth v i)))
+          (recur (+ i 1) (if (= (= (rem (+ x k) 2) 0) (!= fault 2)) (push acc x) acc)))
+        acc)))
+(defun r-partition-by (v: (Vec i64) m: i64 fault: i64) -> (Vec (Vec i64))
+  (loop ((i 0) (out (vec-empty)) (run (vec-empty)))
+    (if (< i (vec-count v))
+        (let ((x (vec-nth v i)))
+          (if (and (> (vec-count run) 0)
+                   (if (= fault 3)
+                       (> (quot x m) (quot (vec-nth run 0) m))
+                       (!= (quot x m) (quot (vec-nth run 0) m))))
+              (recur (+ i 1) (vec-conj out run) (push (vec-empty) x))
+              (recur (+ i 1) out (push run x))))
+        (if (> (vec-count run) 0) (vec-conj out run) out))))
+
+;; ---- the functions given to the library, the same ones the reference spells out
+(defun ftimes (k: i64) -> (fn (i64) i64) (fn (x) (+ (* x k) 1)))
+(defun feven (k: i64) -> (fn (i64) bool) (fn (x) (= (rem (+ x k) 2) 0)))
+(defun fkey (m: i64) -> (fn (i64) i64) (fn (x) (quot x m)))
+
+(defun groups (s: (LSeq (VSeq i64))) -> (Vec (Vec i64))
+  (vec (map (fn (g: (VSeq i64)) (to-vec g)) s)))
+
+;; one draw: every function against its reference
+(defun draw (r: Rng c: Checks fault: i64) -> unit
+  (let ((v (rng-vec r (rng-below r 41) 30))
+        (k (rng-below r 5))
+        (m (+ 2 (rng-below r 6))))
+    (do (check c (= (mapv (ftimes k) v) (r-mapv v k fault)))
+        (check c (= (filterv (feven k) v) (r-filterv v k fault)))
+        (check c (= (groups (partition-by (fkey m) v)) (r-partition-by v m fault))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2272)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (run-all c 0)
+        (check c (= (checks-made c) 900))
+        (run-all p1 1)
+        (run-all p2 2)
+        (run-all p3 3)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

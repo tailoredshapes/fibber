@@ -1,0 +1,41 @@
+;; spec:   stdlib §4.4 rows map-indexed keep drop-while interpose distinct reductions cons mapv filterv partition-by, §2.5 (ownership), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed keep drop-while interpose distinct reductions cons mapv filterv partition-by
+;; Every function of tranche 2 over elements that are heap objects, strings and vectors, which a
+;; function has to retain when it uses one twice (an interpose that repeats its separator, a distinct
+;; that keeps an element in its set and hands it on, a reductions whose running value is both emitted
+;; and given to the next step) and release when it drops one (a drop-while, a keep that gives nothing).
+;; The answers are compared as values, and the audit that ends the run, clean, says nothing was freed
+;; twice, read after being freed or left live. A recipe walked twice is in the case too.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun groups (s: (LSeq (VSeq a))) -> (Vec (Vec a))
+  (vec (map (fn (g: (VSeq a)) (to-vec g)) s)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (words ["to" "be" "or" "not" "to" "be"])
+        (vs [[1 2] [3] [1 2] []]))
+    (do (check c (= (vec (distinct words)) ["to" "be" "or" "not"]))
+        (check c (= (vec (distinct vs)) [[1 2] [3] []]))
+        (check c (= (vec (interpose ", " ["a" "b" "c"])) ["a" ", " "b" ", " "c"]))
+        (check c (= (vec (interpose [0] vs)) [[1 2] [0] [3] [0] [1 2] [0] []]))
+        (check c (= (vec (map-indexed (fn (i: i64 w: str) (str-concat (show i) w)) words)) ["0to" "1be" "2or" "3not" "4to" "5be"]))
+        (check c (= (vec (keep (fn (w: str) (if (> (str-len w) 2) (some (str-concat w "!")) nil)) words)) ["not!"]))
+        (check c (= (vec (drop-while (fn (w: str) (!= w "or")) words)) ["or" "not" "to" "be"]))
+        (check c (= (vec (cons "so" words)) ["so" "to" "be" "or" "not" "to" "be"]))
+        (check c (= (vec (cons [9] vs)) [[9] [1 2] [3] [1 2] []]))
+        (check c (= (vec (reductions (fn (acc: (Vec str) w: str) (conj acc w)) [] ["a" "b"])) [[] ["a"] ["a" "b"]]))
+        (check c (= (vec (reductions (fn (acc: str w: str) (str-concat acc w)) "" ["to" "be" "or"])) ["" "to" "tobe" "tobeor"]))
+        (check c (= (mapv (fn (w: str) (str-concat w w)) ["a" "b"]) ["aa" "bb"]))
+        (check c (= (filterv (fn (v: (Vec i64)) (> (count v) 1)) vs) [[1 2] [1 2]]))
+        (check c (= (groups (partition-by (fn (w: str) (str-len w)) words)) [["to" "be" "or"] ["not"] ["to" "be"]]))
+        (check c (= (groups (partition-by (fn (v: (Vec i64)) v) vs)) [[[1 2]] [[3]] [[1 2]] [[]]]))
+        ;; a recipe walked twice over strings: the elements are kept and handed on each time
+        (let ((r (Interposed (Distinct words) "|")))
+          (do (check c (= (to-vec r) ["to" "|" "be" "|" "or" "|" "not"]))
+              (check c (= (to-vec r) ["to" "|" "be" "|" "or" "|" "not"]))))
+        (checks-result c))))

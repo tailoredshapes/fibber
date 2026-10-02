@@ -1,0 +1,51 @@
+;; spec:   stdlib §4.4 row distinct, §8.1 item 4 (laws), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: distinct
+;; Four properties of distinct over 300 seeded draws of a Vec of 0 to 40 integers below 12: it is
+;; idempotent, its count is the count of the Set of the same elements, its elements are pairwise
+;; different, and a source followed by itself has the same distinct elements as the source. The last
+;; checks plant a fault in each property's expectation, one at a time (1: the count is one more than
+;; the set's, 2: the idempotent answer is read backwards, 3: the doubled source gets an extra element),
+;; and require each to be noticed. Seed 2280.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; no element equals a later one
+(defun pairwise-different (v: (Vec i64)) -> bool
+  (loop ((i 0))
+    (if (< i (vec-count v))
+        (if (loop ((j (+ i 1))) (if (< j (vec-count v)) (if (= (vec-nth v i) (vec-nth v j)) false (recur (+ j 1))) true))
+            (recur (+ i 1))
+            false)
+        true)))
+
+(defun draw (r: Rng c: Checks fault: i64) -> unit
+  (let ((xs (rng-vec r (rng-below r 41) 12)))
+    (let ((d (vec (distinct xs))))
+      (do (check c (same (vec (distinct d)) (if (= fault 2) (vec (reverse d)) d)))
+          (check c (= (count d) (+ (count (set xs)) (if (= fault 1) 1 0))))
+          (check c (pairwise-different d))
+          (check c (same (vec (distinct (concat xs (if (= fault 3) [99] xs)))) d))
+          (check c (<= (count d) (count xs)))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2280)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (run-all c 0)
+        (check c (= (checks-made c) 1500))
+        (run-all p1 1)
+        (run-all p2 2)
+        (run-all p3 3)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

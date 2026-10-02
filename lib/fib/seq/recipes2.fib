@@ -1,5 +1,96 @@
-;; owner: Y2
-;; fib.seq.recipes2: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the recipes `MapIndexed Kept DroppedWhile Interposed Distinct Reductions Consed` and their `Reducible` instances (Y3 adds the cursor instances to `fib.seq.cursors`, not here).
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
-(ns fib.seq.recipes2 (:use fib.core fib.seq.types fib.seq.protocols fib.seq.recipes))
+;; fib.seq.recipes2: the recipe structs of the fused path for the adaptors of tranche 2 (stdlib §2.1 rule 2; tranche 2
+;; plan §5 Y2, owner Y2). Exports MapIndexed Kept DroppedWhile Interposed Distinct Reductions Consed and their
+;; Reducible instances; it adds to fib.seq.recipes (tranche 1) what `map-indexed keep drop-while interpose distinct
+;; reductions cons` need, and replaces nothing. The Cursable instances of these structs are Y3's, in fib.seq.cursors.
+;;
+;; A recipe holds its source and its parameters and walks the source with one each-while, as the tranche-1 recipes do:
+;; built in O(1), nothing allocated per element, never a value of a program, so a hand-built one that is walked twice
+;; runs its function twice. The expander (X12, E16) rewrites a chain of adaptor calls that a consumer reads once into these
+;; constructors, so the argument order below is the rewrite's contract. Decided here (tranche 2 plan §5 Y2, where the
+;; page is silent):
+;;  - the constructors take the source first, then the parameters, as the tranche-1 ones do: (MapIndexed c f),
+;;    (Kept c f), (DroppedWhile c p), (Interposed c sep), (Distinct c), (Reductions c f init). The one exception is
+;;    (Consed x c): `cons` has no source before its element, and the plan lists the constructor in that order.
+;;  - the function of MapIndexed is (fn (i64 e) b): the index counts the elements of the source from 0, in a cell made
+;;    per walk, so two walks of one recipe both start at 0. The function of Kept is (fn (e) (Option b)): a nil is
+;;    dropped and a (some y) is y, as the row says (`keep` is not `filter`: a false inside a some is kept).
+;;  - the predicate of DroppedWhile returns any Truthy, as filter's and take-while's do; once it fails, every later
+;;    element passes, and it is never called again.
+;;  - Interposed puts the separator between two elements, never before the first or after the last: a source of one
+;;    element is that element, a source of none is none.
+;;  - Distinct keeps the first occurrence of each element, in order. The set of the elements seen is made per walk, in a
+;;    cell inside each-while: the prelude's Set (set-empty, a Map of bool over the element's Hash and Eq), since a part
+;;    of fib.seq cannot use fib.coll. Two walks of one recipe each start from the empty set.
+;;  - Reductions emits init first, then the running value after each element: a source of n elements gives n + 1
+;;    values, a source of none gives just init. The walk stops as soon as the consumer says false, so init alone
+;;    never touches the source when the consumer stops at it.
+;;  - Consed puts its element before the elements of its source.
+;;  - like Taken and Dropped, the structs whose element type is not in their fields carry it as a phantom parameter, so
+;;    that the impl head names the variable its context determines (types §3.3, until L16 lands).
+;;  - no recipe overrides `size` or `to-lseq`: (count (keep f c)) walks it and calls f once per element, as Clojure's does.
+(ns fib.seq.recipes2 (:use fib.core fib.seq.protocols))
+
+;; (MapIndexed c f): (f i x) for the i-th element x of c, counting from 0
+(defstruct (MapIndexed c e b) (src: c f: (fn (i64 e) b)))
+(impl (Reducible b) (MapIndexed c e b) :where ((Reducible c e))
+  (each-while (self k)
+    (let ((f (. self f)) (i (cell 0)))
+      (each-while (. self src)
+        (fn (x) (let ((j @i)) (do (set! i (+ j 1)) (k (f j x)))))))))
+
+;; (Kept c f): the payloads of the (some y) results of f; the nils are dropped
+(defstruct (Kept c e b) (src: c f: (fn (e) (Option b))))
+(impl (Reducible b) (Kept c e b) :where ((Reducible c e))
+  (each-while (self k)
+    (let ((f (. self f)))
+      (each-while (. self src)
+        (fn (x) (match (f x) (nil true) ((some y) (k y))))))))
+
+;; (DroppedWhile c p): the elements from the first one for which p is not truthy
+(defstruct (DroppedWhile c e r) (src: c p: (fn (e) r)))
+(impl (Reducible e) (DroppedWhile c e r) :where ((Reducible c e) (Truthy r))
+  (each-while (self k)
+    (let ((p (. self p)) (dropping (cell true)))
+      (each-while (. self src)
+        (fn (x) (if @dropping
+                    (if (truthy? (p x)) true (do (set! dropping false) (k x)))
+                    (k x)))))))
+
+;; (Interposed c sep): sep between the elements of c
+(defstruct (Interposed c e) (src: c sep: e))
+(impl (Reducible e) (Interposed c e) :where ((Reducible c e))
+  (each-while (self k)
+    (let ((started (cell false)) (sep (. self sep)))
+      (each-while (. self src)
+        (fn (x) (if @started
+                    (if (k sep) (k x) false)
+                    (do (set! started true) (k x))))))))
+
+;; the set s with x added: the prelude's Set is a Map of bool, and a part of fib.seq cannot use fib.coll
+(defun seen-add :private (s: (Set e) x: e) :where ((Hash e) (Eq e)) -> (Set e)
+  (Set (fib.prelude/map-assoc (. s m) x true)))
+
+;; (Distinct c): the first occurrence of each element of c, in order
+(defstruct (Distinct c e) (src: c))
+(impl (Reducible e) (Distinct c e) :where ((Reducible c e) (Hash e) (Eq e))
+  (each-while (self k)
+    (let ((seen (cell (fib.prelude/set-empty))))
+      (each-while (. self src)
+        (fn (x) (if (fib.prelude/set-contains? @seen x)
+                    true
+                    (do (set! seen (seen-add @seen x)) (k x))))))))
+
+;; (Reductions c f init): init, then f applied to the running value and each element in turn
+(defstruct (Reductions c e a) (src: c f: (fn (a e) a) init: a))
+(impl (Reducible a) (Reductions c e a) :where ((Reducible c e))
+  (each-while (self k)
+    (let ((f (. self f)) (acc (cell (. self init))))
+      (if (k @acc)
+          (each-while (. self src) (fn (x) (do (set! acc (f @acc x)) (k @acc))))
+          false))))
+
+;; (Consed x c): x, then the elements of c
+(defstruct (Consed c e) (x: e src: c))
+(impl (Reducible e) (Consed c e) :where ((Reducible c e))
+  (each-while (self k)
+    (if (k (. self x)) (each-while (. self src) k) false)))

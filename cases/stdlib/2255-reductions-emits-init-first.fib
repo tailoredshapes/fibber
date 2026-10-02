@@ -1,0 +1,49 @@
+;; spec:   stdlib §4.4 row reductions, §2.1 rule 2 (the lazy form), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: reductions
+;; (reductions f init c) is init, then (f init x0), then (f (f init x0) x1) ..: n + 1 values for n
+;; elements, and just (init) for an empty source. The accumulator may have another type than the
+;; elements. The first value is there with no call of f and no node of the source made; each later
+;; one costs one call and one node. (The two-argument form, seeded with the first element, is
+;; Y11's and has no case here.)
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun none () -> (Vec i64) [])
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (add (fn (a: i64 x: i64) (+ a x))))
+    (do (check c (= (vec (reductions add 0 [1 2 3])) [0 1 3 6]))
+        (check c (= (vec (reductions add 10 [1])) [10 11]))
+        (check c (= (vec (reductions add 7 (none))) [7]))
+        (check c (= (count (reductions add 0 (range 10))) 11))
+        ;; the last value is the reduce
+        (check c (= (last (reductions add 0 [4 5 6])) (some (reduce add 0 [4 5 6]))))
+        ;; the accumulator is not the element type
+        (check c (= (vec (reductions (fn (acc: str x: str) (str-concat acc x)) "" ["a" "b" "c"])) ["" "a" "ab" "abc"]))
+        (check c (= (vec (reductions (fn (acc: (Vec i64) x: i64) (conj acc x)) [] [1 2])) [[] [1] [1 2]]))
+        ;; every kind of source
+        (check c (= (vec (reductions add 0 (list 1 2))) [0 1 3]))
+        (check c (= (vec (reductions add 0 (some 5))) [0 5]))
+        (check c (= (vec (reductions add 0 (map (fn (x: i64) (* x x)) [1 2 3]))) [0 1 5 14]))
+        ;; the first value costs nothing; each later one costs one call and one node
+        (let ((calls (cell 0)) (nodes (cell 0)))
+          (let ((s (reductions (fn (a: i64 x: i64) (do (set! calls (+ @calls 1)) (+ a x))) 100 (countdown 3 nodes))))
+            (do (check c (and (= @calls 0) (= @nodes 0)))
+                (check c (= (lfirst s) (some 100)))
+                (check c (and (= @calls 0) (= @nodes 0)))
+                (check c (= (lfirst (lrest s)) (some 103)))
+                (check c (and (= @calls 1) (= @nodes 1)))
+                (check c (= (vec s) [100 103 105 106]))
+                (check c (and (= @calls 3) (= @nodes 4)))
+                (check c (= (vec s) [100 103 105 106]))
+                (check c (and (= @calls 3) (= @nodes 4))))))
+        (checks-result c))))

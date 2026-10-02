@@ -1,0 +1,69 @@
+;; spec:   stdlib §2.1 rule 2 (nothing runs until a node is demanded), §4.4 rows map-indexed keep drop-while interpose distinct reductions cons partition-by
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed keep drop-while interpose distinct reductions cons partition-by
+;; The laziness of case 241, for the eight lazy functions of tranche 2: calling one builds a seq and
+;; runs neither its function nor its source (a counter in the function and one in the source's thunks
+;; both read 0 right after the call), and the demand for the first node moves them by what that node
+;; needs: one call and one node for map-indexed and keep; drop-while reads the nodes it skips; interpose
+;; and distinct read one node; partition-by reads its whole run and the element after it. The two
+;; that already hold a value, reductions and cons, give their first node with nothing run and cost
+;; a call (reductions) and a node of the source on the demand for the second. The source is an LSeq
+;; of five nodes that bump a counter each time one is made.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+;; [calls, nodes] right after the call, then after asking for the first node, then for the second
+(defun probe (mk: (fn ((LSeq i64) (Cell i64)) (LSeq b))) -> (Vec i64)
+  (let ((calls (cell 0)) (nodes (cell 0)))
+    (let ((s (mk (countdown 5 nodes) calls)))
+      (let ((c0 @calls) (n0 @nodes))
+        (let ((first-node (lfirst s)))
+          (let ((c1 @calls) (n1 @nodes))
+            (let ((second-node (lfirst (lrest s))))
+              [c0 n0 c1 n1 @calls @nodes])))))))
+
+(defun bump (calls: (Cell i64)) -> unit (set! calls (+ @calls 1)))
+
+(defun idle (v: (Vec i64)) -> bool (and (= (nth v 0) 0) (= (nth v 1) 0)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (let ((mi (probe (fn (s calls) (map-indexed (fn (i: i64 x: i64) (do (bump calls) x)) s))))
+          (kp (probe (fn (s calls) (keep (fn (x: i64) (do (bump calls) (some x))) s))))
+          (dw (probe (fn (s calls) (drop-while (fn (x: i64) (do (bump calls) (> x 3))) s))))
+          (ip (probe (fn (s calls) (interpose 0 s))))
+          (ds (probe (fn (s calls) (distinct s))))
+          (rd (probe (fn (s calls) (reductions (fn (a: i64 x: i64) (do (bump calls) (+ a x))) 0 s))))
+          (cs (probe (fn (s calls) (cons 0 s))))
+          (pb (probe (fn (s calls) (partition-by (fn (x: i64) (do (bump calls) (> x 3))) s)))))
+      (do ;; nothing ran when each was called
+          (check c (idle mi))
+          (check c (idle kp))
+          (check c (idle dw))
+          (check c (idle ip))
+          (check c (idle ds))
+          (check c (idle rd))
+          (check c (idle cs))
+          (check c (idle pb))
+          ;; the first node: [calls, nodes]
+          (check c (and (= (nth mi 2) 1) (= (nth mi 3) 1)))
+          (check c (and (= (nth kp 2) 1) (= (nth kp 3) 1)))
+          (check c (and (= (nth dw 2) 3) (= (nth dw 3) 3)))
+          (check c (and (= (nth ip 2) 0) (= (nth ip 3) 1)))
+          (check c (and (= (nth ds 2) 0) (= (nth ds 3) 1)))
+          (check c (and (= (nth rd 2) 0) (= (nth rd 3) 0)))
+          (check c (and (= (nth cs 2) 0) (= (nth cs 3) 0)))
+          (check c (and (= (nth pb 2) 3) (= (nth pb 3) 3)))
+          ;; the second node, after the first
+          (check c (and (= (nth mi 4) 2) (= (nth mi 5) 2)))
+          (check c (and (= (nth kp 4) 2) (= (nth kp 5) 2)))
+          (check c (and (= (nth rd 4) 1) (= (nth rd 5) 1)))
+          (check c (and (= (nth cs 4) 0) (= (nth cs 5) 1)))
+          (checks-result c)))))

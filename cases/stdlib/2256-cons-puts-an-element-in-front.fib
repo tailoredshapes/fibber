@@ -1,0 +1,51 @@
+;; spec:   stdlib §4.4 row cons, §2.1 rule 2 (the lazy form), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: cons realized?
+;; (cons x c) is the lazy seq of x followed by the elements of c, for any Reducible c (the plan's
+;; decision: the page's row says Seqable, and every Seqable here is Reducible). Its first node is
+;; ready at once and holds x; c is not asked for a node until the rest is. A consed LSeq is shared,
+;; not copied: the rest of (cons x s) is s itself, which the realised flag of s shows.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun none () -> (Vec i64) [])
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (vec (cons 0 [1 2 3])) [0 1 2 3]))
+        (check c (= (vec (cons 7 (none))) [7]))
+        (check c (= (vec (cons "a" ["b"])) ["a" "b"]))
+        (check c (= (vec (cons 1 (cons 2 (cons 3 (none))))) [1 2 3]))
+        ;; every kind of source, and a recipe
+        (check c (= (vec (cons 9 (range 3))) [9 0 1 2]))
+        (check c (= (vec (cons 9 (list 1 2))) [9 1 2]))
+        (check c (= (vec (cons 9 (some 1))) [9 1]))
+        (check c (= (vec (cons 9 (Mapped [1 2] (fn (x: i64) (* x 10))))) [9 10 20]))
+        (check c (= (vec (cons 0 (map (fn (x: i64) (+ x 1)) [1 2]))) [0 2 3]))
+        ;; the first node is the element and the source has not been asked
+        (let ((nodes (cell 0)))
+          (let ((s (cons 5 (countdown 2 nodes))))
+            (do (check c (= (lfirst s) (some 5)))
+                (check c (= @nodes 0))
+                (check c (= (lfirst (lrest s)) (some 2)))
+                (check c (= @nodes 1))
+                (check c (= (vec s) [5 2 1]))
+                (check c (= (vec s) [5 2 1]))
+                (check c (= @nodes 3)))))
+        ;; realized?: a node is realised once demanded, and the rest of a cons is the seq itself
+        (let ((src (lazy-node (fn () (LCons 1 (lazy-node (fn () LNil)))))))
+          (let ((s (cons 0 src)))
+            (do (check c (not (realized? src)))
+                (check c (realized? s))
+                (check c (not (realized? (lrest s))))
+                (check c (= (lfirst (lrest s)) (some 1)))
+                (check c (realized? src))
+                (check c (realized? (lrest s))))))
+        (checks-result c))))

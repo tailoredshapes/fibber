@@ -1,0 +1,27 @@
+;; spec:   stdlib §2.1 rule 2 (the lazy forms), §4.4 rows keep drop-while, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: keep drop-while
+;; Case 257 for keep and drop-while: keep over a hundred thousand nils and drop-while over a hundred
+;; thousand leading elements each find the next node in a loop, not by one stack frame per skipped
+;; element (a version that recursed overflowed both tools at this size). Each seq is bound to a name
+;; and walked twice, so the lazy forms run, and the second walk reads the memoised nodes. Case 2268
+;; has distinct and partition-by; each of the two takes about 1.2 GB of the interpreter at this size,
+;; which is why they are two cases.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((s (keep (fn (x: i64) (if (= x 99999) (some x) nil)) (range 100000))))
+          (do (check c (= (count s) 1))
+              (check c (= (count s) 1))))
+        (let ((s (keep (fn (x: i64) (if (> x 99999) (some x) nil)) (range 100000))))
+          (check c (nil? (lfirst s))))
+        (let ((s (drop-while (fn (x: i64) (< x 99999)) (range 100000))))
+          (do (check c (= (count s) 1))
+              (check c (= (count s) 1))))
+        (let ((s (drop-while (fn (x: i64) true) (range 100000))))
+          (check c (nil? (lfirst s))))
+        (checks-result c))))

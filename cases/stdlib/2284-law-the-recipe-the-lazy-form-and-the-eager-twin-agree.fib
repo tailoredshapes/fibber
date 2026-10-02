@@ -1,0 +1,60 @@
+;; spec:   stdlib §2.1 rule 2 (the fused path changes no observable behaviour), §4.4 rows mapv filterv keep drop-while map-indexed, §8.1 item 4, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mapv filterv keep drop-while map-indexed interpose distinct reductions cons
+;; The identities that let the fusion rewrite (X12) pick a form: over 120 seeded draws (a run of 300 holds
+;; 2.5 GB of the interpreter) of a Vec of 0 to 40 integers below 10, the recipe of each of the seven adaptors and the lazy form give one answer;
+;; mapv and filterv are the vec of map and filter; keep of a test that gives (some x) is filter;
+;; drop-while is drop of the length of the take-while; map-indexed of the element is the source and
+;; of the index is the range. The last checks plant a fault in each of three, one at a time
+;; (1: mapv against a map of another function, 2: keep against remove, 3: drop-while against a
+;; drop one element short), and require each to be noticed. Seed 2284.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+(defun f (x: i64) -> i64 (+ (* x 3) 1))
+(defun g (x: i64) -> i64 (+ (* x 3) 2))
+(defun small (x: i64) -> bool (< x 4))
+(defun big (x: i64) -> bool (>= x 4))
+(defun some-big (x: i64) -> (Option i64) (if (big x) (some x) nil))
+(defun mix (i: i64 x: i64) -> i64 (+ (* i 11) x))
+(defun add (a: i64 x: i64) -> i64 (rem (+ (* a 3) x) 1000003))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+(defun draw (r: Rng c: Checks fault: i64) -> unit
+  (let ((xs (rng-vec r (rng-below r 41) 10)))
+    (do ;; eager twins and their lazy originals
+        (check c (same (mapv f xs) (vec (map (if (= fault 1) g f) xs))))
+        (check c (same (filterv small xs) (vec (filter small xs))))
+        (check c (same (vec (keep some-big xs)) (vec (if (= fault 2) (remove big xs) (filter big xs)))))
+        (check c (same (vec (drop-while small xs)) (vec (drop (- (count (take-while small xs)) (if (= fault 3) 1 0)) xs))))
+        (check c (same (vec (map-indexed (fn (i: i64 x: i64) x) xs)) xs))
+        (check c (same (vec (map-indexed (fn (i: i64 x: i64) i) xs)) (vec (range (count xs)))))
+        ;; each recipe against its lazy form
+        (check c (same (to-vec (MapIndexed xs mix)) (vec (map-indexed mix xs))))
+        (check c (same (to-vec (Kept xs some-big)) (vec (keep some-big xs))))
+        (check c (same (to-vec (DroppedWhile xs small)) (vec (drop-while small xs))))
+        (check c (same (to-vec (Interposed xs 7)) (vec (interpose 7 xs))))
+        (check c (same (to-vec (Distinct xs)) (vec (distinct xs))))
+        (check c (same (to-vec (Reductions xs add 1)) (vec (reductions add 1 xs))))
+        (check c (same (to-vec (Consed 5 xs)) (vec (cons 5 xs)))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2284)))
+    (dotimes (i 120) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (run-all c 0)
+        (check c (= (checks-made c) 1560))
+        (run-all p1 1)
+        (run-all p2 2)
+        (run-all p3 3)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

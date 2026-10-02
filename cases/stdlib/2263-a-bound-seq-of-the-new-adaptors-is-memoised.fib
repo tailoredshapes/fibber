@@ -1,0 +1,53 @@
+;; spec:   stdlib §2.1 rule 2 (a value traversed twice runs its function once per element; a node is realised once), §4.4 rows map-indexed keep drop-while interpose distinct reductions cons partition-by
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed keep drop-while interpose distinct reductions cons partition-by
+;; The page's [12 12 3] for the eight lazy functions of tranche 2: a seq bound to a name and walked
+;; three times (vec, count, vec) calls its function once per element in all, and the source made its
+;; nodes once (the five elements and the end: six). The recipe built by hand is the contrast: it is
+;; not memoised and calls its function again on every walk.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; n nodes counting down from n; every node realised bumps the counter
+(defun countdown (n: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1))
+                        (if (> n 0) (LCons n (countdown (- n 1) nodes)) LNil)))))
+
+;; walks the seq three times and says [calls, nodes]
+(defun walked (mk: (fn ((LSeq i64) (Cell i64)) (LSeq b))) -> (Vec i64)
+  (let ((calls (cell 0)) (nodes (cell 0)))
+    (let ((s (mk (countdown 5 nodes) calls)))
+      (let ((a (vec s)) (n (count s)) (b (vec s)))
+        [@calls @nodes (count a) n (count b)]))))
+
+(defun bump (calls: (Cell i64)) -> unit (set! calls (+ @calls 1)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (let ((mi (walked (fn (s calls) (map-indexed (fn (i: i64 x: i64) (do (bump calls) x)) s))))
+          (kp (walked (fn (s calls) (keep (fn (x: i64) (do (bump calls) (some x))) s))))
+          (dw (walked (fn (s calls) (drop-while (fn (x: i64) (do (bump calls) (> x 3))) s))))
+          (ip (walked (fn (s calls) (interpose 0 s))))
+          (ds (walked (fn (s calls) (distinct s))))
+          (rd (walked (fn (s calls) (reductions (fn (a: i64 x: i64) (do (bump calls) (+ a x))) 0 s))))
+          (cs (walked (fn (s calls) (cons 0 s))))
+          (pb (walked (fn (s calls) (partition-by (fn (x: i64) (do (bump calls) (> x 3))) s)))))
+      (do ;; [calls, nodes, the three counts]
+          (check c (= mi [5 6 5 5 5]))
+          (check c (= kp [5 6 5 5 5]))
+          (check c (= dw [3 6 3 3 3]))
+          (check c (= ip [0 6 9 9 9]))
+          (check c (= ds [0 6 5 5 5]))
+          (check c (= rd [5 6 6 6 6]))
+          (check c (= cs [0 6 6 6 6]))
+          (check c (= pb [5 6 2 2 2]))
+          ;; a hand-built recipe walked three times runs its function every time
+          (let ((calls (cell 0)))
+            (let ((r (Kept [1 2 3] (fn (x: i64) (do (bump calls) (some x))))))
+              (do (check c (= (count r) 3))
+                  (check c (= (count r) 3))
+                  (check c (= (count r) 3))
+                  (check c (= @calls 9)))))
+          (checks-result c)))))

@@ -1,0 +1,51 @@
+;; spec:   stdlib §4.4 row realized?, §2.1 rule 2 (a node is realised once, on demand), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: realized? map-indexed keep drop-while interpose distinct partition-by
+;; (realized? s) of an LSeq says whether its first node has been computed. A lazy adaptor's seq is
+;; not realised when it is made, is realised by the demand for its first node, and stays so; the
+;; node after it is a seq of its own, not realised until it is demanded in turn. The two that start
+;; with a value they already have, reductions and cons, are the exception: their first node is
+;; ready when they return (and the node after it is not).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; whether the seq is unrealised now, and realised after its first node is asked for
+(defun lazy-then-forced (s: (LSeq a)) -> bool
+  (let ((before (realized? s)))
+    (do (lfirst s)
+        (and (not before) (realized? s)))))
+
+;; whether the node after the first is unrealised, then realised once it is asked for
+(defun second-node-on-demand (s: (LSeq a)) -> bool
+  (let ((t (lrest s)))
+    (let ((before (realized? t)))
+      (do (lfirst t)
+          (and (not before) (realized? t))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [1 2 3 4 5]))
+    (do (check c (lazy-then-forced (map-indexed (fn (i: i64 x: i64) i) v)))
+        (check c (lazy-then-forced (keep (fn (x: i64) (some x)) v)))
+        (check c (lazy-then-forced (drop-while (fn (x: i64) (< x 2)) v)))
+        (check c (lazy-then-forced (interpose 0 v)))
+        (check c (lazy-then-forced (distinct v)))
+        (check c (lazy-then-forced (partition-by (fn (x: i64) (quot x 3)) v)))
+        ;; the node after the first is on demand too
+        (check c (second-node-on-demand (map-indexed (fn (i: i64 x: i64) i) v)))
+        (check c (second-node-on-demand (keep (fn (x: i64) (some x)) v)))
+        (check c (second-node-on-demand (distinct v)))
+        (check c (second-node-on-demand (interpose 0 v)))
+        (check c (second-node-on-demand (reductions (fn (a: i64 x: i64) (+ a x)) 0 v)))
+        (check c (second-node-on-demand (cons 0 (map (fn (x: i64) x) v))))
+        ;; reductions and cons have their first node at once
+        (check c (realized? (reductions (fn (a: i64 x: i64) (+ a x)) 0 v)))
+        (check c (realized? (cons 0 v)))
+        ;; a realised seq stays realised, whatever is asked of it afterwards
+        (let ((s (keep (fn (x: i64) (some x)) v)))
+          (do (check c (= (count s) 5))
+              (check c (realized? s))
+              (check c (realized? (lrest s)))))
+        (checks-result c))))

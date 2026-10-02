@@ -1,0 +1,54 @@
+;; spec:   stdlib §2.1 rule 1 and 3 (an infinite source is fine), §4.4 rows iterate repeat cycle map-indexed keep drop-while interpose distinct reductions cons partition-by, tranche 2 plan §5 Y2 (judged by an endless source after Y1)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed keep drop-while interpose distinct reductions cons take
+;; Cases 2261 and 2262 have an endless LSeq and a Range of step 0; this one has the endless sources of
+;; Y1, which override to-lseq so that a lazy adaptor over them is lazy one node at a time:
+;; (take 3 (keep f (iterate inc 0))), and each function of tranche 2 over iterate, repeat and cycle,
+;; ended by take, and the recipes of three of them under a Taken. The last checks count the calls of the
+;; step of an iterate: a seq made over it and read for three elements calls the step twice (the first
+;; element is the seed), and reading the same seq again calls it no more, since the seq is memoised.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun inc1 (x: i64) -> i64 (+ x 1))
+(defun add (a: i64 x: i64) -> i64 (+ a x))
+
+(defun groups (s: (LSeq (VSeq a))) -> (Vec (Vec a))
+  (vec (map (fn (g: (VSeq a)) (to-vec g)) s)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do ;; over iterate
+        (check c (= (vec (take 3 (keep (fn (x: i64) (if (even? x) (some (* x 10)) nil)) (iterate inc1 0)))) [0 20 40]))
+        (check c (= (vec (take 3 (map-indexed (fn (i: i64 x: i64) (* i x)) (iterate inc1 5)))) [0 6 14]))
+        (check c (= (vec (take 3 (drop-while (fn (x: i64) (< x 4)) (iterate inc1 0)))) [4 5 6]))
+        (check c (= (vec (take 5 (interpose 0 (iterate inc1 1)))) [1 0 2 0 3]))
+        (check c (= (vec (take 4 (reductions add 0 (iterate inc1 1)))) [0 1 3 6]))
+        (check c (= (vec (take 3 (cons -1 (iterate inc1 0)))) [-1 0 1]))
+        (check c (= (vec (take 3 (distinct (map (fn (x: i64) (rem x 3)) (iterate inc1 0))))) [0 1 2]))
+        (check c (= (groups (take 2 (partition-by (fn (x: i64) (quot x 2)) (iterate inc1 0)))) [[0 1] [2 3]]))
+        ;; over repeat
+        (check c (= (vec (take 3 (map-indexed (fn (i: i64 x: i64) (+ i x)) (repeat 7)))) [7 8 9]))
+        (check c (= (vec (take 5 (interpose 0 (repeat 7)))) [7 0 7 0 7]))
+        (check c (= (vec (take 1 (distinct (repeat 7)))) [7]))
+        (check c (= (vec (take 3 (reductions add 0 (repeat 2)))) [0 2 4]))
+        (check c (= (vec (take 2 (keep (fn (x: i64) (some (* x 2))) (repeat 4)))) [8 8]))
+        ;; over cycle
+        (check c (= (vec (take 5 (cycle [1 2]))) [1 2 1 2 1]))
+        (check c (= (vec (take 3 (distinct (cycle [1 2 3])))) [1 2 3]))
+        (check c (= (vec (take 5 (interpose 0 (cycle [1 2])))) [1 0 2 0 1]))
+        (check c (= (vec (take 3 (map-indexed (fn (i: i64 x: i64) (+ (* i 10) x)) (cycle [1 2])))) [1 12 21]))
+        ;; the recipes, stopped by a Taken
+        (check c (= (to-vec (Taken (Kept (iterate inc1 0) (fn (x: i64) (if (odd? x) (some x) nil))) 3)) [1 3 5]))
+        (check c (= (to-vec (Taken (Reductions (iterate inc1 1) add 0) 4)) [0 1 3 6]))
+        (check c (= (to-vec (Taken (MapIndexed (cycle [5 6]) (fn (i: i64 x: i64) (+ i x))) 3)) [5 7 7]))
+        ;; the step runs once per element demanded: take 3 of an iterate calls it twice
+        (let ((calls (cell 0)))
+          (let ((s (map-indexed (fn (i: i64 x: i64) x) (iterate (fn (x: i64) (do (set! calls (+ @calls 1)) (+ x 1))) 0))))
+            (do (check c (= (vec (take 3 s)) [0 1 2]))
+                (check c (= @calls 2))
+                (check c (= (vec (take 3 s)) [0 1 2]))
+                (check c (= @calls 2)))))
+        (checks-result c))))

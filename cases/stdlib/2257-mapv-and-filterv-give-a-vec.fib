@@ -1,0 +1,40 @@
+;; spec:   stdlib §4.4 rows mapv filterv, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: mapv filterv
+;; (mapv f c) and (filterv p c) are (vec (map f c)) and (vec (filter p c)) with their results: a Vec
+;; of the same elements, f and p called once per element in the source's order, and no seq. The
+;; result is a plain Vec, so nth and conj work on it at once (a seq's would be a seq, not a
+;; vector), and an empty source is the empty Vec. p is truthy as a bool or an Option, as filter's.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun none () -> (Vec i64) [])
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m {2 20 4 40}))
+    (do (check c (= (mapv (fn (x: i64) (* x x)) [1 2 3]) [1 4 9]))
+        (check c (= (mapv (fn (x: i64) (show x)) [1 2]) ["1" "2"]))
+        (check c (= (mapv (fn (x: i64) x) (none)) (none)))
+        (check c (= (filterv (fn (x: i64) (> x 1)) [1 2 3]) [2 3]))
+        (check c (= (filterv (fn (x: i64) (> x 9)) [1 2 3]) (none)))
+        (check c (= (filterv (fn (k: i64) (get m k)) [1 2 3 4]) [2 4]))
+        ;; the result is a Vec: indexed and grown as one
+        (check c (= (nth (mapv (fn (x: i64) (+ x 1)) [5 6 7]) 2) 8))
+        (check c (= (conj (filterv (fn (x: i64) (odd? x)) [1 2 3]) 9) [1 3 9]))
+        ;; every kind of source, and a lazy chain below
+        (check c (= (mapv (fn (x: i64) (* x 2)) (range 4)) [0 2 4 6]))
+        (check c (= (mapv (fn (x: i64) (* x 2)) (list 1 2)) [2 4]))
+        (check c (= (filterv (fn (x: i64) (> x 0)) (some 1)) [1]))
+        (check c (= (mapv (fn (x: i64) (+ x 1)) (filter (fn (x: i64) (even? x)) (range 7))) [1 3 5 7]))
+        ;; one call per element, in order, and a second mapv of the result calls again
+        (let ((order (cell (none))))
+          (let ((v (mapv (fn (x: i64) (do (set! order (conj @order x)) (* x 10))) [3 1 2])))
+            (do (check c (= v [30 10 20]))
+                (check c (= @order [3 1 2])))))
+        (let ((calls (cell 0)))
+          (do (check c (= (count (filterv (fn (x: i64) (do (set! calls (+ @calls 1)) (> x 1))) [1 2 3 4])) 3))
+              (check c (= @calls 4))))
+        (checks-result c))))

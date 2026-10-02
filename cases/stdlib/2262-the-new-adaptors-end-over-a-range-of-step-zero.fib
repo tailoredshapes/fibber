@@ -1,0 +1,35 @@
+;; spec:   stdlib §2.1 rule 1 (every source feeds the adaptors, an infinite one too), §4.4 rows map-indexed keep drop-while interpose distinct reductions cons partition-by, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed keep drop-while interpose distinct reductions cons partition-by take
+;; A Range of step 0 repeats its start for ever (Clojure's (range 7 8 0)), and its to-lseq is lazy,
+;; one node per demand, so it is an endless source that is not an LSeq: the path the lazy forms
+;; take through `to-lseq` for every source but a Vec and an LSeq (case 2261 is the LSeq's). Each
+;; function of tranche 2 over it, ended by take. (partition-by and distinct need elements that
+;; change, so those two number the elements first with map-indexed.)
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun groups (s: (LSeq (VSeq a))) -> (Vec (Vec a))
+  (vec (map (fn (g: (VSeq a)) (to-vec g)) s)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (sevens (range-by 7 8 0))
+        (add (fn (a: i64 x: i64) (+ a x))))
+    (do (check c (= (vec (take 3 sevens)) [7 7 7]))
+        (check c (= (vec (take 3 (keep (fn (x: i64) (some (* x 2))) sevens))) [14 14 14]))
+        (check c (= (vec (take 3 (map-indexed (fn (i: i64 x: i64) (+ i x)) sevens))) [7 8 9]))
+        (check c (= (vec (take 2 (drop-while (fn (x: i64) (< x 3)) sevens))) [7 7]))
+        (check c (= (vec (take 5 (interpose 0 sevens))) [7 0 7 0 7]))
+        (check c (= (vec (take 3 (reductions add 0 sevens))) [0 7 14]))
+        (check c (= (vec (take 3 (cons 1 sevens))) [1 7 7]))
+        (check c (= (vec (take 1 (distinct sevens))) [7]))
+        (check c (= (vec (take 3 (distinct (map-indexed (fn (i: i64 x: i64) (+ x (rem i 3))) sevens)))) [7 8 9]))
+        (check c (= (groups (take 2 (partition-by (fn (x: i64) x) (map-indexed (fn (i: i64 x: i64) (quot i 2)) sevens)))) [[0 0] [1 1]]))
+        ;; a stack of them
+        (check c (= (vec (take 3 (map-indexed (fn (i: i64 x: i64) (+ i x))
+                                   (keep (fn (x: i64) (some (+ x 1))) (drop-while (fn (x: i64) (> x 99)) sevens)))))
+                    [8 9 10]))
+        (checks-result c))))

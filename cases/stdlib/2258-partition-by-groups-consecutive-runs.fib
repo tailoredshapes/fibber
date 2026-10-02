@@ -1,0 +1,59 @@
+;; spec:   stdlib §4.4 row partition-by, §2.1 rule 2 (the lazy form), §2.1 rule 8 (VSeq), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: partition-by
+;; (partition-by f c) cuts c where (f x) changes: each group is a run of consecutive elements with
+;; an equal key, and equal keys that are not neighbours are two groups. Each group is a VSeq, as the
+;; row says: conj conses at its front, where a Vec's would append. The key needs Eq only. f is
+;; called once per element (Clojure calls it twice on the first element of every group but the
+;; first; the plan's seq is memoised and the extra call is not observable for a pure f).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun none () -> (Vec i64) [])
+
+;; the groups as vectors, in order
+(defun groups (s: (LSeq (VSeq a))) -> (Vec (Vec a))
+  (vec (map (fn (g: (VSeq a)) (to-vec g)) s)))
+
+(defun parity (x: i64) -> i64 (rem x 2))
+
+;; n nodes counting up from i; every node realised bumps the counter
+(defun count-up (i: i64 nodes: (Cell i64)) -> (LSeq i64)
+  (lazy-node (fn () (do (set! nodes (+ @nodes 1)) (LCons i (count-up (+ i 1) nodes))))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m {1 1 2 1 4 4}))
+    (do (check c (= (groups (partition-by parity [1 3 2 4 5])) [[1 3] [2 4] [5]]))
+        (check c (= (groups (partition-by parity [1 3 2 4 5 7])) [[1 3] [2 4] [5 7]]))
+        (check c (= (groups (partition-by (fn (x: i64) x) [1 1 2 2 1])) [[1 1] [2 2] [1]]))
+        (check c (= (groups (partition-by parity [1 2 3 4])) [[1] [2] [3] [4]]))
+        (check c (= (groups (partition-by parity [2 4 6])) [[2 4 6]]))
+        (check c (= (groups (partition-by parity [8])) [[8]]))
+        (check c (empty? (partition-by parity (none))))
+        ;; the key is anything with Eq: strings, options
+        (check c (= (groups (partition-by (fn (s: str) (str-len s)) ["a" "b" "cc" "dd" "e"])) [["a" "b"] ["cc" "dd"] ["e"]]))
+        (check c (= (groups (partition-by (fn (k: i64) (get m k)) [1 2 3 4 5])) [[1 2] [3] [4] [5]]))
+        ;; a group is a VSeq: conj conses at its front (a Vec's conj would append)
+        (let ((gs (partition-by parity [1 3 2])))
+          (match (lfirst gs)
+            (nil (check c false))
+            ((some g) (do (check c (= (to-vec (conj g 0)) [0 1 3]))
+                          (check c (= (count g) 2))))))
+        ;; every kind of source
+        (check c (= (groups (partition-by (fn (x: i64) (quot x 3)) (range 7))) [[0 1 2] [3 4 5] [6]]))
+        (check c (= (groups (partition-by parity (list 1 3 2))) [[1 3] [2]]))
+        (check c (= (groups (partition-by parity (some 4))) [[4]]))
+        (check c (= (groups (partition-by parity (map (fn (x: i64) (* x 3)) [1 2 3 5]))) [[3] [6] [9 15]]))
+        ;; f once per element, in order
+        (let ((calls (cell 0)))
+          (do (check c (= (count (partition-by (fn (x: i64) (do (set! calls (+ @calls 1)) (parity x))) [1 3 2 4 5])) 3))
+              (check c (= @calls 5))))
+        ;; an endless source: two groups, no more of the source than they and the next element need
+        (let ((nodes (cell 0)))
+          (let ((s (partition-by (fn (x: i64) (quot x 3)) (count-up 0 nodes))))
+            (do (check c (= (groups (take 2 s)) [[0 1 2] [3 4 5]]))
+                (check c (= @nodes 7)))))
+        (checks-result c))))

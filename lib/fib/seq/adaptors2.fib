@@ -1,5 +1,147 @@
-;; owner: Y2
-;; fib.seq.adaptors2: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold the lazy adaptors `map-indexed keep drop-while interpose distinct reductions cons mapv filterv partition-by`.
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
-(ns fib.seq.adaptors2 (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.lazy fib.seq.vseq fib.seq.adaptors fib.seq.recipes fib.seq.recipes2))
+;; fib.seq.adaptors2: the lazy sequence functions of tranche 2's first batch (stdlib §2.1 rule 2, §4.4; tranche 2
+;; plan §5 Y2, owner Y2). Exports map-indexed keep drop-while interpose distinct reductions cons mapv filterv
+;; partition-by. It adds to fib.seq.adaptors (tranche 1) and replaces nothing. The recipe of each is in
+;; fib.seq.recipes2 (the fused form the expander picks when a consumer reads a chain once), and `realized?` is
+;; fib.seq.lazy's.
+;;
+;; Each lazy function is written as fib.seq.adaptors writes its own: it converts its source with to-lseq and hands it
+;; to a private lazy form, one lazy-node per result node, whose thunk demands as few nodes of the source as the
+;; result node needs. So nothing runs when it is called, a node is realised once, and a stack of lazy adaptors over a
+;; lazy source stays lazy end to end (PC-13): (take 3 (keep f (iterate inc 0))) calls f three times and ends.
+;; Decided here, where the page is silent (the tranche 2 plan's "decided here" for Y2 is taken as written):
+;;  - the state of `distinct` lives in the node chain: each node holds the persistent set of the elements before it,
+;;    and the next node is made with that set and the element added. A seq traversed twice therefore sees the same
+;;    elements, and there is no cell shared by two traversals (the recipe, which is never a value, keeps its set in a
+;;    cell per walk). The set is the prelude's Set, since fib.seq cannot use fib.coll.
+;;  - `reductions` emits init as its first node without demanding its source or calling f: (first (reductions f 0 s))
+;;    is 0 with f never called, and f runs when the second node is demanded. A source of none gives (init). `f`
+;;    does not read Clojure's `reduced` (its type is (fn (a e) a)). L1: (reductions f c), seeded with the first
+;;    element, is Y11's.
+;;  - `cons` is (lcons x (to-lseq c)) over any Reducible, where the page's row says Seqable c s: every Seqable the
+;;    library has is Reducible, and a recipe or a user's tree, which are Reducible only, can then be consed onto.
+;;    The node of x is ready at once; c is not demanded until the rest is.
+;;  - `interpose` puts the separator between elements: the first node holds the first element, and each later
+;;    element is preceded by a node holding the separator. The separator node demands the next element of the source
+;;    (to know there is one), as Clojure's (drop 1 (interleave (repeat sep) c)) does.
+;;  - `keep` takes an (Option b) from f, nil dropped and (some y) giving y: elements for which f gives nothing are skipped
+;;    in a loop, not by recursion, so a long run of nils does not deepen the stack.
+;;  - `drop-while` skips on its first demand, not when called, and shares the rest of the source's nodes
+;;    (its result from the first element that fails the predicate is the source's own seq from there).
+;;  - `partition-by` yields (VSeq e) groups of consecutive elements with equal keys, a group being the Vec of its run;
+;;    realising a node reads the whole run and the one element after it, as Clojure's does. f is called once per
+;;    element, where Clojure calls it twice on the first element of every group but the first: the lazy seq here is
+;;    memoised and the extra call is not observable by a pure f (decided here, reported).
+;;  - `mapv` and `filterv` are the page's `(vec (map f c))` and `(vec (filter p c))` and have their results: a Vec,
+;;    the same elements, f and p called once per element in order. They walk the recipe (Mapped, Filtered) with
+;;    to-vec, so no seq and no node per element is built where (vec (map ..)) would build one.
+;;  - the function arguments are never :borrow: a node's thunk keeps them (plan §4.3 rule 7).
+(ns fib.seq.adaptors2 (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq fib.seq.recipes))
+
+;; the elements of s numbered from i
+(defun lmap-indexed :private (f: (fn (i64 a) b) i: i64 s: (LSeq a)) -> (LSeq b)
+  (lazy-node (fn ()
+    (match (lnode s)
+      ((LNil) LNil)
+      ((LCons h t) (LCons (f i h) (lmap-indexed f (+ i 1) t)))))))
+
+(defun lkeep :private (f: (fn (a) (Option b)) s: (LSeq a)) -> (LSeq b)
+  (lazy-node (fn ()
+    (loop ((s s))
+      (match (lnode s)
+        ((LNil) LNil)
+        ((LCons h t)
+         (match (f h)
+           (nil (recur t))
+           ((some y) (LCons y (lkeep f t))))))))))
+
+;; the seq from the first element that fails p, or the empty seq reached on the way
+(defun lskip-while :private (p: (fn (a) r) s: (LSeq a)) :where ((Truthy r)) -> (LSeq a)
+  (loop ((s s))
+    (match (lnode s)
+      ((LNil) s)
+      ((LCons h t) (if (truthy? (p h)) (recur t) s)))))
+
+(defun ldrop-while :private (p: (fn (a) r) s: (LSeq a)) :where ((Truthy r)) -> (LSeq a)
+  (lazy-node (fn () (lnode (lskip-while p s)))))
+
+;; the elements of s, each after a node of the separator
+(defun linterpose :private (sep: a s: (LSeq a)) -> (LSeq a)
+  (lazy-node (fn ()
+    (match (lnode s)
+      ((LNil) LNil)
+      ((LCons h t) (LCons sep (lcons h (linterpose sep t))))))))
+
+;; the first occurrence of each element of s: seen holds the elements before s, and the next node gets seen with this one added
+(defun ldistinct :private (seen: (Set e) s: (LSeq e)) :where ((Hash e) (Eq e)) -> (LSeq e)
+  (lazy-node (fn ()
+    (loop ((s s))
+      (match (lnode s)
+        ((LNil) LNil)
+        ((LCons h t) (if (fib.prelude/set-contains? seen h)
+                         (recur t)
+                         (LCons h (ldistinct (Set (fib.prelude/map-assoc (. seen m) h true)) t)))))))))
+
+;; the seq of what follows the running value acc: one node per element of s, each (f acc x)
+(defun lreductions :private (f: (fn (a e) a) acc: a s: (LSeq e)) -> (LSeq a)
+  (lazy-node (fn ()
+    (match (lnode s)
+      ((LNil) LNil)
+      ((LCons h t) (let ((v (f acc h))) (LCons v (lreductions f v t))))))))
+
+;; the groups of s: the run of elements whose key is the key of the first one, then the groups of what follows it.
+;; known is the key of the first element of s when the run before it has already computed it, so f is called once per element
+(defun lpartition-by :private (f: (fn (a) k) known: (Option k) s: (LSeq a)) :where ((Eq k)) -> (LSeq (VSeq a))
+  (lazy-node (fn ()
+    (match (lnode s)
+      ((LNil) LNil)
+      ((LCons h t)
+       (let ((key (match known (nil (f h)) ((some kh) kh))))
+         (loop ((after t) (run (vec-conj (vec-empty) h)))
+           (match (lnode after)
+             ((LNil) (LCons (vseq-of run) (lpartition-by f nil after)))
+             ((LCons x xs)
+              (let ((kx (f x)))
+                (if (= kx key)
+                    (recur xs (vec-conj run x))
+                    (LCons (vseq-of run) (lpartition-by f (some kx) after)))))))))))))
+
+;; (map-indexed f c): (f 0 x0), (f 1 x1) ..
+(defun map-indexed (f: (fn (i64 e) b) c: c) :where ((Reducible c e)) -> (LSeq b)
+  (lmap-indexed f 0 (to-lseq c)))
+
+;; (keep f c): the payloads of the (some y) results of f
+(defun keep (f: (fn (e) (Option b)) c: c) :where ((Reducible c e)) -> (LSeq b)
+  (lkeep f (to-lseq c)))
+
+(defun drop-while (p: (fn (e) r) c: c) :where ((Reducible c e) (Truthy r)) -> (LSeq e)
+  (ldrop-while p (to-lseq c)))
+
+(defun interpose (sep: e c: c) :where ((Reducible c e)) -> (LSeq e)
+  (let ((s (to-lseq c)))
+    (lazy-node (fn ()
+      (match (lnode s)
+        ((LNil) LNil)
+        ((LCons h t) (LCons h (linterpose sep t))))))))
+
+;; the first occurrence of each element, in order
+(defun distinct (c: c) :where ((Reducible c e) (Hash e) (Eq e)) -> (LSeq e)
+  (ldistinct (fib.prelude/set-empty) (to-lseq c)))
+
+;; init, then (f init x0), (f (f init x0) x1) ..
+;; L1: (reductions f c) is Y11's
+(defun reductions (f: (fn (a e) a) init: a c: c) :where ((Reducible c e)) -> (LSeq a)
+  (lcons init (lreductions f init (to-lseq c))))
+
+;; x, then the elements of c
+(defun cons (x: e c: c) :where ((Reducible c e)) -> (LSeq e)
+  (lcons x (to-lseq c)))
+
+(defun mapv (f: (fn (e) b) c: c) :where ((Reducible c e)) -> (Vec b)
+  (to-vec (Mapped c f)))
+
+(defun filterv (p: (fn (e) r) c: c) :where ((Reducible c e) (Truthy r)) -> (Vec e)
+  (to-vec (Filtered c p)))
+
+;; the runs of consecutive elements with equal (f x), each a VSeq
+(defun partition-by (f: (fn (e) k) c: c) :where ((Reducible c e) (Eq k)) -> (LSeq (VSeq e))
+  (lpartition-by f nil (to-lseq c)))

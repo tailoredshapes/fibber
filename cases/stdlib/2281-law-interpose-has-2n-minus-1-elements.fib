@@ -1,0 +1,50 @@
+;; spec:   stdlib §4.4 row interpose, §8.1 item 4 (laws), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: interpose
+;; (interpose s xs) over 300 seeded draws of a Vec of 0 to 40 integers and a separator: it has 2n - 1
+;; elements for n >= 1 and none for n = 0; the elements at the even positions are the source's, in
+;; order, and those at the odd positions are the separator; its first and last elements are the
+;; source's first and last. The last checks plant a fault in each expectation, one at a time
+;; (1: the count is 2n, 2: the separators are at the even positions, 3: the first element is the
+;; separator), and require each to be noticed. Seed 2281.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+;; the elements at the even positions are the source's, those at the odd positions are sep
+(defun laid-out (out: (Vec i64) xs: (Vec i64) sep: i64 fault: i64) -> bool
+  (loop ((i 0))
+    (if (< i (vec-count out))
+        (if (if (= (rem i 2) (if (= fault 2) 1 0))
+                (= (vec-nth out i) (vec-nth xs (quot i 2)))
+                (= (vec-nth out i) sep))
+            (recur (+ i 1))
+            false)
+        true)))
+
+(defun draw (r: Rng c: Checks fault: i64) -> unit
+  (let ((xs (rng-vec r (rng-below r 41) 100))
+        (sep -1))
+    (let ((out (vec (interpose sep xs)))
+          (n (vec-count xs)))
+      (do (check c (= (vec-count out) (if (= n 0) 0 (- (* 2 n) (if (= fault 1) 0 1)))))
+          (check c (laid-out out xs sep fault))
+          (check c (= (first out) (if (= fault 3) (some sep) (first xs))))
+          (check c (= (last out) (last xs)))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2281)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (run-all c 0)
+        (check c (= (checks-made c) 1200))
+        (run-all p1 1)
+        (run-all p2 2)
+        (run-all p3 3)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

@@ -1,0 +1,65 @@
+;; spec:   stdlib §2.1 rule 2 (the fused path: recipes), tranche 2 plan §5 Y2 and X12 (the constructors the rewrite emits)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed
+;; The recipe of each adaptor of tranche 2, built by hand with the constructors the fusion rewrite
+;; (X12) will emit, source first: (MapIndexed c f) (Kept c f) (DroppedWhile c p) (Interposed c sep)
+;; (Distinct c) (Reductions c f init), and (Consed x c), whose element comes first as `cons` does.
+;; Alone and nested. A recipe is not memoised: a second walk calls its function again, where a bound
+;; seq does not; and a Distinct keeps its set per walk, so two walks both see every element once.
+;; DroppedWhile stops calling its predicate at the first element that fails it.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun digits (c: c) :where ((Reducible c i64)) -> i64
+  (let ((acc (cell 0)))
+    (do (each-while c (fn (x) (do (set! acc (+ (* @acc 10) x)) true))) @acc)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((f (fn (i: i64 x: i64) (do (set! calls (+ @calls 1)) (+ i x))))
+          (odd-ten (fn (x: i64) (if (odd? x) (some (* x 10)) nil)))
+          (add (fn (a: i64 x: i64) (+ a x))))
+      (do ;; each recipe alone
+          (check c (= (digits (MapIndexed [5 6 7] f)) 579))
+          (check c (= (digits (Kept [1 2 3 4] (fn (x: i64) (if (> x 2) (some x) nil)))) 34))
+          (check c (= (digits (DroppedWhile [1 2 3 1] (fn (x: i64) (< x 3)))) 31))
+          (check c (= (digits (DroppedWhile [1 2 3 1] (fn (x: i64) (if (< x 3) (some x) nil)))) 31))
+          (check c (= (digits (Interposed [1 2 3] 0)) 10203))
+          (check c (= (digits (Distinct [1 2 1 3 2 4])) 1234))
+          (check c (= (digits (Reductions [1 2 3] add 0)) 136))
+          (check c (= (digits (Consed 9 [1 2])) 912))
+          ;; the edges: nothing, one element, everything passing or failing
+          (check c (= (digits (Interposed [7] 0)) 7))
+          (check c (= (digits (Interposed (some 7) 0)) 7))
+          (check c (= (digits (Reductions (some 4) add 1)) 15))
+          (check c (= (digits (Reductions (Dropped [1 2] 2) add 3)) 3))
+          (check c (= (digits (DroppedWhile [1 2] (fn (x: i64) true))) 0))
+          (check c (= (digits (Consed 9 (Taken [1 2] 0))) 9))
+          ;; nested, as a rewritten chain would be
+          (check c (= (digits (Kept (MapIndexed [1 2 3 4] (fn (i: i64 x: i64) (+ i x))) odd-ten)) 13570))
+          (check c (= (digits (Interposed (Distinct (Mapped [1 2 1 2 3] (fn (x: i64) (+ x 1)))) 0)) 20304))
+          (check c (= (digits (Reductions (DroppedWhile [1 1 2 3] (fn (x: i64) (< x 2))) add 0)) 25))
+          (check c (= (digits (Consed 1 (Interposed (Taken [2 3 4] 2) 0))) 1203))
+          ;; a recipe is not memoised, a bound seq is
+          (set! calls 0)
+          (let ((r (MapIndexed [1 1 1] f)) (s (map-indexed f [1 1 1])))
+            (do (check c (= (+ (digits r) (digits r)) 246))
+                (check c (= @calls 6))
+                (set! calls 0)
+                (check c (= (+ (digits s) (digits s)) 246))
+                (check c (= @calls 3))))
+          ;; a Distinct recipe walked twice gives all its elements twice
+          (let ((r (Distinct [3 3 4])))
+            (check c (= (+ (digits r) (digits r)) 68)))
+          ;; the predicate of a DroppedWhile is called up to the first failure only
+          (set! calls 0)
+          (check c (= (digits (DroppedWhile [1 2 3 1 2] (fn (x: i64) (do (set! calls (+ @calls 1)) (< x 3))))) 312))
+          (check c (= @calls 3))
+          ;; the function of a Kept is called once per element, and a walk of the recipe is a count
+          (set! calls 0)
+          (check c (= (count (Kept [1 2 3] (fn (x: i64) (do (set! calls (+ @calls 1)) (some x))))) 3))
+          (check c (= @calls 3))
+          (checks-result c)))))

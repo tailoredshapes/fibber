@@ -1,0 +1,66 @@
+;; spec:   stdlib §4.4 rows map-indexed keep drop-while, §8.1 item 2, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map-indexed keep drop-while
+;; The three lazy functions against eager loops over the prelude's vec-conj and vec-nth (no library
+;; code on the reference side), over 300 seeded draws of a Vec of 0 to 40 integers (past the 32 of a
+;; trie leaf) and drawn parameters. The lazy side reads the seq with `vec`. The last checks plant a
+;; fault in the reference, one at a time (1: map-indexed numbers from 1, 2: keep tests the wrong
+;; remainder, 3: drop-while drops one element too many), and require each to be noticed. Seed 2270.
+(ns main (:use fib.core fib.seq fib.coll tl.check tl.rng))
+
+;; ---- the reference
+(defun push (v: (Vec i64) x: i64) -> (Vec i64) (vec-conj v x))
+(defun r-map-indexed (v: (Vec i64) k: i64 fault: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (recur (+ i 1) (push acc (+ (* (if (= fault 1) (+ i 1) i) k) (vec-nth v i))))
+        acc)))
+(defun r-keep (v: (Vec i64) k: i64 fault: i64) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (vec-count v))
+        (let ((x (vec-nth v i)))
+          (recur (+ i 1) (if (= (rem (+ x k) 3) (if (= fault 2) 1 0)) (push acc (* x k)) acc)))
+        acc)))
+(defun tail-from (v: (Vec i64) from: i64) -> (Vec i64)
+  (loop ((j from) (acc (vec-empty))) (if (< j (vec-count v)) (recur (+ j 1) (push acc (vec-nth v j))) acc)))
+(defun r-drop-while (v: (Vec i64) k: i64 fault: i64) -> (Vec i64)
+  (loop ((i 0))
+    (if (and (< i (vec-count v)) (< (vec-nth v i) k))
+        (recur (+ i 1))
+        (tail-from v (if (= fault 3) (+ i 1) i)))))
+
+;; ---- the functions given to the library, the same ones the reference spells out
+(defun fmi (k: i64) -> (fn (i64 i64) i64) (fn (i x) (+ (* i k) x)))
+(defun fkeep (k: i64) -> (fn (i64) (Option i64)) (fn (x) (if (= (rem (+ x k) 3) 0) (some (* x k)) nil)))
+(defun fbelow (k: i64) -> (fn (i64) bool) (fn (x) (< x k)))
+
+(defun same (a: (Vec i64) b: (Vec i64)) -> bool
+  (and (= (vec-count a) (vec-count b))
+       (loop ((i 0)) (if (< i (vec-count a)) (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false) true))))
+
+;; one draw: every function against its reference
+(defun draw (r: Rng c: Checks fault: i64) -> unit
+  (let ((v (rng-vec r (rng-below r 41) 20))
+        (k (rng-below r 9)))
+    (do (check c (same (vec (map-indexed (fmi k) v)) (r-map-indexed v k fault)))
+        (check c (same (vec (keep (fkeep k) v)) (r-keep v k fault)))
+        (check c (same (vec (drop-while (fbelow k) v)) (r-drop-while v k fault))))))
+
+(defun run-all (c: Checks fault: i64) -> unit
+  (let ((r (rng 2270)))
+    (dotimes (i 300) (draw r c fault))))
+
+(defun main () -> i64
+  (let ((c (checks)) (p1 (checks)) (p2 (checks)) (p3 (checks)))
+    (do (run-all c 0)
+        (check c (= (checks-made c) 900))
+        (run-all p1 1)
+        (run-all p2 2)
+        (run-all p3 3)
+        (check-detects c p1)
+        (check-detects c p2)
+        (check-detects c p3)
+        (checks-result c))))

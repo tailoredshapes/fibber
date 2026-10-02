@@ -1,0 +1,37 @@
+;; spec:   stdlib §4.4 row keep, §2.1 rule 2 (the lazy form), tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: keep
+;; (keep f c): f returns an (Option b); a nil is dropped and a (some y) is y, in order. It is not
+;; filter: a (some false) is kept as the element false, and the elements are what f made. A map's
+;; lookup is the usual f (the keys that are there), and the result type is the payload's, not
+;; the source's.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (m {1 10 3 30 4 40}))
+    (do (check c (= (vec (keep (fn (x: i64) (if (> x 2) (some (* x x)) nil)) [1 2 3 4])) [9 16]))
+        (check c (empty? (keep (fn (x: i64) (if (> x 9) (some x) nil)) [1 2 3])))
+        (check c (empty? (keep (fn (x: i64) (some x)) [])))
+        (check c (= (vec (keep (fn (x: i64) (some x)) [1 2 3])) [1 2 3]))
+        ;; the payload may be a false: it is not dropped
+        (check c (= (vec (keep (fn (x: i64) (some (> x 1))) [1 2 3])) [false true true]))
+        ;; the payload has another type than the element
+        (check c (= (vec (keep (fn (x: i64) (if (even? x) (some (show x)) nil)) [1 2 3 4])) ["2" "4"]))
+        ;; the lookup of keys that are in a map
+        (check c (= (vec (keep (fn (k: i64) (get m k)) [1 2 3 4 5])) [10 30 40]))
+        ;; every kind of source
+        (check c (= (vec (keep (fn (x: i64) (if (odd? x) (some x) nil)) (range 6))) [1 3 5]))
+        (check c (= (vec (keep (fn (x: i64) (if (odd? x) (some x) nil)) (list 1 2 3))) [1 3]))
+        (check c (= (vec (keep (fn (x: i64) (some (* x 2))) (some 4))) [8]))
+        ;; after another lazy adaptor, and under one
+        (check c (= (vec (keep (fn (x: i64) (if (> x 4) (some x) nil)) (map (fn (x: i64) (* x 2)) [1 2 3 4]))) [6 8]))
+        (check c (= (vec (map (fn (x: i64) (+ x 1)) (keep (fn (x: i64) (if (> x 1) (some x) nil)) [1 2 3]))) [3 4]))
+        ;; a bound seq walked twice
+        (let ((s (keep (fn (x: i64) (if (> x 1) (some x) nil)) [1 2 3])))
+          (do (check c (= (vec s) [2 3]))
+              (check c (= (vec s) [2 3]))))
+        (checks-result c))))

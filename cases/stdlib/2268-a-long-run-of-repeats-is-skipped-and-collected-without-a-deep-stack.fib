@@ -1,0 +1,22 @@
+;; spec:   stdlib §2.1 rule 2 (the lazy forms), §4.4 rows distinct partition-by, tranche 2 plan §5 Y2
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: distinct partition-by
+;; Case 2264 for the two functions that read a run before they answer: distinct over a hundred
+;; thousand repeats, whose node skips every repeat in a loop, and partition-by over one run of a hundred
+;; thousand elements, which collects the run in a loop (a version that recursed overflowed both tools
+;; at this size). The seq of distinct is bound to a name and walked twice, so the lazy form runs and
+;; the second walk reads the memoised nodes; the one group of partition-by has all the elements.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((s (distinct (map (fn (x: i64) (rem x 1)) (range 100000)))))
+          (do (check c (= (count s) 1))
+              (check c (= (count s) 1))))
+        (let ((s (partition-by (fn (x: i64) 0) (range 100000))))
+          (do (check c (= (count s) 1))
+              (check c (= (count (to-vec (unwrap (lfirst s)))) 100000))))
+        (checks-result c))))
