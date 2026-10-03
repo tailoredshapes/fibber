@@ -1,0 +1,30 @@
+;; spec:   stdlib "sys primitives" (S5)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: fd-read fd-write fd-write-range
+;; A read of 3 from a longer file is 3 bytes (short), a range write takes only its range, and a range outside
+;; the array or a negative read count is EINVAL (22), never a trap.
+(ns main (:use tl.check tl.sysx fib.unix))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (path "/tmp/fib-s5-3603")
+        (w (creat path))
+        (b (str-bytes "abcdefghij")))
+    (do (check c (= (num (fd-write-range w b 2 3)) 3))
+        (check c (= (num (fd-write-range w b 8 3)) -22))
+        (check c (= (num (fd-write-range w b -1 1)) -22))
+        (check c (= (num (fd-write-range w b 0 -1)) -22))
+        (check c (= (num (fd-write-range w b 10 0)) 0))
+        (check c (= (num (fd-write w b)) 10))
+        (fd-close w)
+        (let ((r (open-ro path)))
+          (do (check c (= (text r 3) "cde"))
+              (check c (= (text r 4) "abcd"))
+              (check c (= (text r 100) "efghij"))
+              (check c (= (nread (fd-read r -1)) -22))
+              (fd-close r)))
+        (fd-unlink path)
+        (checks-result c))))

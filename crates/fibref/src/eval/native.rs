@@ -116,6 +116,7 @@ impl<'p> Interp<'p> {
                 super::float_bits::float_bits(BUILTINS[b].name, arg(0)?)
             }
             name @ ("args" | "read-file" | "write-file") => self.io_builtin(name, a),
+            name if name.starts_with("sys-") => self.sys_builtin(name, a),
             "gensym" | "struct?" | "struct-fields" | "struct-params" | "struct-field-types"
             | "enum?" | "enum-params" | "enum-variants" => {
                 self.expansion_builtin(BUILTINS[b].name, arg(0)?, pos)

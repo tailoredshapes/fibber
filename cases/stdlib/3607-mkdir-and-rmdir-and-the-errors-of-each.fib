@@ -1,0 +1,32 @@
+;; spec:   stdlib "sys primitives" (S5)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: fd-mkdir fd-rmdir fd-unlink
+;; A directory is made and removed; making it twice is EEXIST (17), making one under a missing parent is ENOENT
+;; (2), removing a missing one is ENOENT, unlinking a directory is EISDIR (21), a file in it is made and
+;; removed, and reading a directory is EISDIR.
+(ns main (:use tl.check tl.sysx fib.unix))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (dir "/tmp/fib-s5-3607")
+        (file "/tmp/fib-s5-3607/f"))
+    (do (check c (= (num (fd-mkdir dir 493)) 0))
+        (check c (= (num (fd-mkdir dir 493)) -17))
+        (check c (= (num (fd-mkdir "/tmp/fib-s5-3607-none/sub" 493)) -2))
+        (let ((w (creat file)))
+          (do (check c (> w 2))
+              (check c (= (put w "x") 1))
+              (fd-close w)))
+        (check c (= (num (fd-rmdir dir)) -39))
+        (check c (= (num (fd-unlink dir)) -21))
+        (let ((d (open-ro dir)))
+          (do (check c (> d 2))
+              (check c (= (nread (fd-read d 10)) -21))
+              (fd-close d)))
+        (check c (= (num (fd-unlink file)) 0))
+        (check c (= (num (fd-rmdir dir)) 0))
+        (check c (= (num (fd-rmdir dir)) -2))
+        (checks-result c))))

@@ -156,6 +156,7 @@ impl<'a> Cx<'_, 'a> {
             "read-file" => self.rt_call("fib.read-file", a, Some(LirTy::Ptr)),
             "write-file" => self.rt_call("fib.write-file", a, Some(LirTy::I1)),
             "args" => self.args_vec(e)?,
+            n if n.starts_with("sys-") => self.sys_builtin(n, a)?,
             "char->i32" => arg(0)?.clone(),
             "i32->char" => self.rt_call("fib.i32-to-char", a, Some(LirTy::I32)),
             "f64->bits" | "bits->f64" | "f32->bits" | "bits->f32" => {

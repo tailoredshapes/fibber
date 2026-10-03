@@ -1,0 +1,27 @@
+;; spec:   stdlib "sys primitives" (S5)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: fd-open fd-close fd-read fd-write fd-seek fd-dup fd-unlink fd-mkdir fd-rmdir fd-pipe
+;; A descriptor that is not open (EBADF, 9) and a path with a NUL in it (EINVAL, 22) are Errs from every
+;; primitive that takes them; none traps. The Err carries the errno, and its text is non-empty.
+(ns main (:use tl.check tl.sysx fib.unix))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (bad 9999)
+        (b (str-bytes "x")))
+    (do (check c (= (num (fd-close bad)) -9))
+        (check c (= (nread (fd-read bad 4)) -9))
+        (check c (= (num (fd-write bad b)) -9))
+        (check c (= (num (fd-seek bad 0 SEEK_SET)) -9))
+        (check c (= (num (fd-dup bad)) -9))
+        (check c (= (num (fd-close -1)) -9))
+        (check c (= (num (fd-open "a\0b" O_RDONLY 0)) -22))
+        (check c (= (num (fd-unlink "a\0b")) -22))
+        (check c (= (num (fd-mkdir "a\0b" 493)) -22))
+        (check c (= (num (fd-rmdir "a\0b")) -22))
+        (check c (> (str-len (errno-text 9)) 0))
+        (check c (> (str-len (errno-text 99999)) 0))
+        (checks-result c))))

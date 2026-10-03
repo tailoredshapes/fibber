@@ -2026,3 +2026,172 @@
       (ret (and (icmp eq w n) (icmp eq c (i32 0)))))))
 ")
 
+;; sys.lir
+(def RT-SYS: str
+";; fib.rt, the unix primitives (stdlib \"sys primitives\"): descriptors as
+;; i64, every failure the negated errno in the result and never a trap.
+;; The interpreter's eval/sys.rs gives the same results; the two are
+;; compared by cases/stdlib 3600 to 3649.
+;; openat(AT_FDCWD, ..) is open(..): a program of ours already declares `open` with another type (compiler/driver/native.fib), and the
+;; runtime and an extern of one name must agree.
+(declare openat i32 (i32 ptr i32 ...))
+(declare close i32 (i32))
+(declare read i64 (i32 ptr i64))
+(declare lseek i64 (i32 i64 i32))
+(declare pipe i32 (ptr))
+(declare dup i32 (i32))
+(declare isatty i32 (i32))
+(declare unlink i32 (ptr))
+(declare mkdir i32 (ptr i32))
+(declare rmdir i32 (ptr))
+(declare strerror ptr (i32))
+(declare clock_gettime i32 (i32 ptr))
+(declare nanosleep i32 (ptr ptr))
+(declare __errno_location ptr ())
+
+;; r when the call succeeded (not negative), else the negated errno.
+(define internal (fib.sys-ret i64) ((i64 r))
+  (block entry (br (icmp slt r (i64 0)) bad ok))
+  (block bad
+    (let ((e (load i32 (call @__errno_location))))
+      (ret (sub (i64 0) (sext i64 e)))))
+  (block ok (ret r)))
+
+;; The same for a call that answers an i32.
+(define internal (fib.sys-ret32 i64) ((i32 r))
+  (block entry (ret (call @fib.sys-ret (sext i64 r)))))
+
+;; (sys-open path flags mode): a path with a NUL in it is EINVAL (22).
+(define internal (fib.sys-open i64) ((ptr path) (i64 flags) (i64 mode))
+  (block entry (br (call @fib.path-ok path) go bad))
+  (block bad (ret (i64 -22)))
+  (block go
+    (let ((r (call @openat (i32 -100) (call @fib.str-bytes-ptr path) (trunc i32 flags) (trunc i32 mode))))
+      (ret (call @fib.sys-ret32 r)))))
+
+(define internal (fib.sys-close i64) ((i64 fd))
+  (block entry (ret (call @fib.sys-ret32 (call @close (trunc i32 fd))))))
+
+;; A fresh array of the 8 bytes of status and then the len at buf.
+(define internal (fib.sys-pack ptr) ((i64 status) (ptr buf) (i64 len) (i32 tid))
+  (block entry
+    (let ((a (call @fib.array-alloc (add len (i64 8)) tid (i64 1)))
+          (data (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0))))
+      (store status data)
+      (br (icmp sgt len (i64 0)) copy done)))
+  (block copy
+    (call @memcpy (getelementptr i8 data (i64 8)) buf len)
+    (br done))
+  (block done (ret a)))
+
+;; (sys-read fd n): the status and the bytes read, in one array. n is
+;; clamped to 2^30, as the interpreter's is; a negative n is EINVAL.
+(define internal (fib.sys-read ptr) ((i64 fd) (i64 n) (i32 tid))
+  (block entry
+    (let ((m (select (icmp sgt n (i64 1073741824)) (i64 1073741824) n)))
+      (br (icmp slt n (i64 0)) bad alloc)))
+  (block bad (ret (call @fib.sys-pack (i64 -22) (ptr null) (i64 0) tid)))
+  (block alloc
+    (let ((buf (call @malloc (add m (i64 1)))))
+      (br (icmp eq buf (ptr null)) nomem go)))
+  (block nomem (ret (call @fib.sys-pack (i64 -12) (ptr null) (i64 0) tid)))
+  (block go
+    (let ((st (call @fib.sys-ret (call @read (trunc i32 fd) buf m)))
+          (got (select (icmp slt st (i64 0)) (i64 0) st))
+          (a (call @fib.sys-pack st buf got tid)))
+      (call @free buf)
+      (ret a))))
+
+;; (sys-write fd bytes off n): the range off, off+n must lie inside the
+;; array, else EINVAL.
+(define internal (fib.sys-write i64) ((i64 fd) (ptr arr) (i64 off) (i64 n))
+  (block entry
+    (let ((len (call @fib.array-len arr))
+          (bad (or (or (icmp slt off (i64 0)) (icmp slt n (i64 0)))
+                   (or (icmp sgt off len) (icmp sgt n (sub len off))))))
+      (br bad no go)))
+  (block no (ret (i64 -22)))
+  (block go
+    (let ((p (getelementptr i8 (getelementptr %struct.fib.array.i8 arr (i32 0) (i32 4) (i64 0)) off)))
+      (ret (call @fib.sys-ret (call @write (trunc i32 fd) p n))))))
+
+(define internal (fib.sys-seek i64) ((i64 fd) (i64 off) (i64 whence))
+  (block entry (ret (call @fib.sys-ret (call @lseek (trunc i32 fd) off (trunc i32 whence))))))
+
+;; The read end shifted left 32 bits, or'd with the write end.
+(define internal (fib.sys-pipe i64) ()
+  (block entry
+    (let ((fds (alloca (align 8) i8 (i32 8)))
+          (r (call @pipe fds)))
+      (br (icmp slt r (i32 0)) bad ok)))
+  (block bad (ret (call @fib.sys-ret (i64 -1))))
+  (block ok
+    (let ((rd (sext i64 (load i32 fds)))
+          (wr (sext i64 (load i32 (getelementptr i8 fds (i64 4))))))
+      (ret (or (shl rd (i64 32)) wr)))))
+
+(define internal (fib.sys-dup i64) ((i64 fd))
+  (block entry (ret (call @fib.sys-ret32 (call @dup (trunc i32 fd))))))
+
+(define internal (fib.sys-isatty i1) ((i64 fd))
+  (block entry (ret (icmp eq (call @isatty (trunc i32 fd)) (i32 1)))))
+
+(define internal (fib.sys-unlink i64) ((ptr path))
+  (block entry (br (call @fib.path-ok path) go bad))
+  (block bad (ret (i64 -22)))
+  (block go (ret (call @fib.sys-ret32 (call @unlink (call @fib.str-bytes-ptr path))))))
+
+(define internal (fib.sys-mkdir i64) ((ptr path) (i64 mode))
+  (block entry (br (call @fib.path-ok path) go bad))
+  (block bad (ret (i64 -22)))
+  (block go
+    (ret (call @fib.sys-ret32 (call @mkdir (call @fib.str-bytes-ptr path) (trunc i32 mode))))))
+
+(define internal (fib.sys-rmdir i64) ((ptr path))
+  (block entry (br (call @fib.path-ok path) go bad))
+  (block bad (ret (i64 -22)))
+  (block go (ret (call @fib.sys-ret32 (call @rmdir (call @fib.str-bytes-ptr path))))))
+
+;; strerror's text, made UTF-8 as the interpreter does.
+(define internal (fib.sys-errno-text ptr) ((i64 e))
+  (block entry
+    (let ((p (call @strerror (trunc i32 e))))
+      (ret (call @fib.str-from-lossy p (call @strlen p))))))
+
+;; The variable's value as a str, or null when unset (or the name has a
+;; NUL in it).
+(define internal (fib.sys-getenv ptr) ((ptr name))
+  (block entry (br (call @fib.path-ok name) go none))
+  (block none (ret (ptr null)))
+  (block go
+    (let ((p (call @getenv (call @fib.str-bytes-ptr name))))
+      (br (icmp eq p (ptr null)) none some)))
+  (block some (ret (call @fib.str-from-lossy p (call @strlen p)))))
+
+(define internal (fib.sys-clock i64) ((i32 id))
+  (block entry
+    (let ((t (alloca (align 8) i8 (i32 16))))
+      (call @clock_gettime id t)
+      (ret (add (mul (load i64 t) (i64 1000000000)) (load i64 (getelementptr i8 t (i64 8))))))))
+
+(define internal (fib.sys-clock-now i64) ()
+  (block entry (ret (call @fib.sys-clock (i32 1)))))
+
+(define internal (fib.sys-wall-now i64) ()
+  (block entry (ret (call @fib.sys-clock (i32 0)))))
+
+;; Sleeps at least ns nanoseconds, resuming after a signal; returns 0.
+(define internal (fib.sys-sleep i64) ((i64 ns))
+  (block entry
+    (let ((t (alloca (align 8) i8 (i32 16))))
+      (br (icmp sle ns (i64 0)) done go)))
+  (block go
+    (store (sdiv ns (i64 1000000000)) t)
+    (store (srem ns (i64 1000000000)) (getelementptr i8 t (i64 8)))
+    (br again))
+  (block again
+    (let ((r (call @nanosleep t t)))
+      (br (icmp eq r (i32 0)) done again)))
+  (block done (ret (i64 0))))
+")
+

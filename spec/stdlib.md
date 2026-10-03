@@ -2096,6 +2096,48 @@ The predicates that Clojure asks of a run-time tag (`string?`, `vector?`, `seq?`
 | `satisfies?` | adapt | `(satisfies? P x)` | `P a -> bool` | 3 | a constant: `true` iff the type of the argument has an instance of the protocol `P`, which the compiler knows (types §4); `(satisfies? P x)` is the question Clojure asks at run time |
 | `extends?` | adapt | `(extends? P T)` | `P T -> bool` | 3 | a constant: `true` iff the type `T` has an instance of the protocol `P` |
 
+### 4.19 `fib.unix`: the sys primitives (package S5)
+
+The groundwork of an io library written in fibber: unix file descriptors, small enough that the interpreter
+(`crates/fibref/src/eval/sys.rs`, through the `libc` crate) and the compiled runtime (`crates/fibc/rt/sys.lir`,
+through the C library) give the same answers, so a library built on them is judged by both tools (method rule 6;
+`extern` is refused by the interpreter and cannot be). The module is `lib/fib/unix.fib`, not `fib.sys`, which §4.16
+keeps for the Java names of tranche 4. The case block is 3600 to 3649.
+
+**Names (decided).** A builtin lives in one flat table, so the builtins carry the prefix `sys-`; the library names
+(`fd-open`, `getenv`, ..) are functions of `fib.unix`, which a program `:use`s (it is not implicit).
+
+**The builtins** answer an `i64` (or, where noted, another type) and never trap: a result below zero is the negated
+errno. A descriptor is an `i64`. Bytes are an `(Array i8)`, as `str-bytes` and `str-from-bytes` use them, because
+bytes read from a descriptor need not be UTF-8 and a `str` must be.
+
+| Builtin | Signature | Note |
+|---|---|---|
+| `sys-open` | `str i64 i64 -> i64` | open(2): the path, the flags, the mode; the descriptor. A path with a NUL is 22 (EINVAL) |
+| `sys-close` | `i64 -> i64` | 0 |
+| `sys-read` | `i64 i64 -> (Array i8)` | the first 8 bytes are the status as a little-endian `i64` (bytes read, or the negated errno), then the bytes read; at most `n`, `n` above 2^30 read as 2^30, `n` below 0 is 22; a status of 0 is end of file. `fib.unix/fd-read` unpacks it (no builtin can return a `Result` without the checker knowing its layout, and an array can be built without mutation) |
+| `sys-write` | `i64 (Array i8) i64 i64 -> i64` | write(2) of bytes `off` to `off+n` of the array: the number written, which may be short; a range outside the array is 22 |
+| `sys-seek` | `i64 i64 i64 -> i64` | lseek(2): the new offset |
+| `sys-pipe` | `-> i64` | pipe(2): the read end shifted left 32 bits, or'd with the write end |
+| `sys-dup` `sys-unlink` `sys-mkdir` `sys-rmdir` | `i64 -> i64`, `str -> i64`, `str i64 -> i64`, `str -> i64` | 0 or the descriptor |
+| `sys-isatty` | `i64 -> bool` | isatty(3); false for a descriptor that is not open |
+| `sys-errno-text` | `i64 -> str` | strerror(3) (`2` is `No such file or directory`); bytes that are not UTF-8 become U+FFFD |
+| `sys-getenv` | `str -> (Option str)` | nil for an unset variable and for a name with a NUL; the value's bytes made UTF-8 as `from_utf8_lossy` does |
+| `sys-clock-now` `sys-wall-now` | `-> i64` | CLOCK_MONOTONIC and CLOCK_REALTIME in nanoseconds |
+| `sys-sleep` | `i64 -> i64` | at least that many nanoseconds, resumed after a signal; 0; nothing for a time that is not positive |
+
+An error of the C library is returned as it is: `EINTR` is not retried by `sys-read` and `sys-write` (the library
+above loops if it wants to). Both tools take the flags as an `i32` and the mode as an `unsigned`.
+
+**The library** `fib.unix` has the Linux numbers `O_RDONLY 0 O_WRONLY 1 O_RDWR 2 O_CREAT 64 O_EXCL 128 O_TRUNC 512
+O_APPEND 1024`, `SEEK_SET 0 SEEK_CUR 1 SEEK_END 2`, `stdin 0 stdout 1 stderr 2`, and, each answering `(Result t i64)`
+whose error is the errno itself: `(fd-open path flags mode)`, `fd-close`, `(fd-read fd n) -> (Result (Array i8) i64)`
+(an empty array is end of file), `(fd-write fd bytes)` and `(fd-write-range fd bytes off n)` (bytes written; the
+library above loops on a short write), `(fd-seek fd off whence)`, `(fd-pipe) -> (Result (Pair i64 i64) i64)`
+(read end, write end), `fd-dup`, `(fd-isatty fd) -> bool`, `(fd-unlink path)`, `(fd-mkdir path mode)`,
+`(fd-rmdir path)`, `(errno-text e) -> str`, `(getenv name) -> (Option str)`, `(clock-now)`, `(wall-now)` and
+`(sleep-ns ns)`. Sockets are the next package (S6).
+
 ## 5. Deviations from Clojure
 
 The first version of this page had 82 deviation rows. Under the rule (§1.1) a deviation needs a memory-safety failing

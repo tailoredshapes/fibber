@@ -25,6 +25,7 @@ const RUNTIME: &[&str] = &[
     include_str!("../rt/task.lir"),
     include_str!("../rt/weak.lir"),
     include_str!("../rt/io.lir"),
+    include_str!("../rt/sys.lir"),
 ];
 
 /// The runtime's own `declare` of the C function `name`, if any:

@@ -18,6 +18,7 @@ pub mod pattern;
 mod quote;
 mod show;
 mod strfind;
+mod sys;
 mod threads;
 mod values;
 

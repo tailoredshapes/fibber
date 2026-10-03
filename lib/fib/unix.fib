@@ -1,0 +1,85 @@
+;; fib.unix: unix file descriptors, the groundwork of an io library (stdlib "sys primitives", package S5).
+;; The builtins `sys-open sys-close sys-read sys-write sys-seek sys-pipe sys-dup sys-isatty sys-unlink
+;; sys-mkdir sys-errno-text sys-getenv sys-clock-now sys-wall-now sys-sleep` (the same in the interpreter and
+;; the compiled runtime) answer plain `i64`s: the value, or the negated errno when it is negative. This
+;; module wraps them as `(Result t i64)` whose error is the errno itself, so no failure traps.
+;; Decided here, where the spec was silent:
+;;  - a descriptor is an `i64`; bytes are an `(Array i8)`, as `str-bytes` and `str-from-bytes` use them (a
+;;    `str` is UTF-8 and bytes read from a descriptor need not be).
+;;  - fd-read answers an empty array at end of file; it may answer fewer than n bytes. fd-write may take
+;;    fewer than all of them: the library above loops.
+;;  - flags are the Linux numbers (x86-64 and aarch64 differ in none of these seven).
+(ns fib.unix)
+
+(def O_RDONLY: i64 0)
+(def O_WRONLY: i64 1)
+(def O_RDWR: i64 2)
+(def O_CREAT: i64 64)
+(def O_EXCL: i64 128)
+(def O_TRUNC: i64 512)
+(def O_APPEND: i64 1024)
+
+(def SEEK_SET: i64 0)
+(def SEEK_CUR: i64 1)
+(def SEEK_END: i64 2)
+
+(def stdin: i64 0)
+(def stdout: i64 1)
+(def stderr: i64 2)
+
+(defun checked :private (r: i64) -> (Result i64 i64)
+  (if (< r 0) (Err (- 0 r)) (Ok r)))
+
+(defun fd-open (path: str flags: i64 mode: i64) -> (Result i64 i64)
+  (checked (sys-open path flags mode)))
+
+(defun fd-close (fd: i64) -> (Result i64 i64) (checked (sys-close fd)))
+
+(defun le64 :private (a: (Array i8) i: i64 acc: i64) -> i64
+  (if (< i 0)
+      acc
+      (le64 a (- i 1) (bit-or (shl acc 8) (zext i64 (array-get a i))))))
+
+;; At most n bytes (n below 0 is EINVAL, n above 2^30 is read as 2^30).
+(defun fd-read (fd: i64 n: i64) -> (Result (Array i8) i64)
+  (let ((a (sys-read fd n))
+        (status (le64 a 7 0)))
+    (if (< status 0)
+        (Err (- 0 status))
+        (Ok (array-copy a 8 (array-len a))))))
+
+;; Bytes off to off+n of the array (EINVAL when they are not inside it): the number written.
+(defun fd-write-range (fd: i64 bytes: (Array i8) off: i64 n: i64) -> (Result i64 i64)
+  (checked (sys-write fd bytes off n)))
+
+(defun fd-write (fd: i64 bytes: (Array i8)) -> (Result i64 i64)
+  (checked (sys-write fd bytes 0 (array-len bytes))))
+
+(defun fd-seek (fd: i64 off: i64 whence: i64) -> (Result i64 i64)
+  (checked (sys-seek fd off whence)))
+
+(defun fd-pipe () -> (Result (Pair i64 i64) i64)
+  (let ((r (sys-pipe)))
+    (if (< r 0)
+        (Err (- 0 r))
+        (Ok (Pair (shr r 32) (bit-and r 4294967295))))))
+
+(defun fd-dup (fd: i64) -> (Result i64 i64) (checked (sys-dup fd)))
+
+(defun fd-isatty (fd: i64) -> bool (sys-isatty fd))
+
+(defun fd-unlink (path: str) -> (Result i64 i64) (checked (sys-unlink path)))
+
+(defun fd-mkdir (path: str mode: i64) -> (Result i64 i64) (checked (sys-mkdir path mode)))
+
+(defun fd-rmdir (path: str) -> (Result i64 i64) (checked (sys-rmdir path)))
+
+(defun errno-text(e: i64) -> str (sys-errno-text e))
+
+(defun getenv (name: str) -> (Option str) (sys-getenv name))
+
+;; Nanoseconds on the monotonic clock, and since the Unix epoch.
+(defun clock-now () -> i64 (sys-clock-now))
+(defun wall-now () -> i64 (sys-wall-now))
+
+(defun sleep-ns (ns: i64) -> i64 (sys-sleep ns))

@@ -1,0 +1,34 @@
+;; spec:   stdlib "sys primitives" (S5)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: fd-pipe fd-dup fd-isatty
+;; Bytes written to a pipe's write end come out of its read end; a dup of the write end writes into the same
+;; pipe; once every write end is closed the read end gives end of file; a pipe is not a terminal.
+(ns main (:use tl.check tl.sysx fib.unix))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (match (fd-pipe)
+      ((Err e) (do (check c false) (checks-result c)))
+      ((Ok p)
+       (let ((r (. p fst))
+             (w (. p snd))
+             (d (num (fd-dup (. p snd)))))
+         (do (check c (> r 2))
+             (check c (> w r))
+             (check c (> d w))
+             (check c (= (put w "ping") 4))
+             (check c (= (text r 16) "ping"))
+             (check c (= (put d "pong") 4))
+             (check c (= (text r 2) "po"))
+             (check c (= (text r 16) "ng"))
+             (check c (not (fd-isatty r)))
+             (check c (not (fd-isatty 9999)))
+             (check c (= (num (fd-close w)) 0))
+             (check c (= (num (fd-close d)) 0))
+             (check c (= (text r 16) ""))
+             (check c (= (num (fd-close r)) 0))
+             (check c (= (num (fd-close r)) -9))
+             (checks-result c)))))))

@@ -61,7 +61,7 @@ impl<'p> Interp<'p> {
     }
 
     /// The elements of an array value.
-    fn items(&self, v: &Val) -> R<&Vec<Val>> {
+    pub(super) fn items(&self, v: &Val) -> R<&Vec<Val>> {
         match self.objs.get(&self.heap, v.expect_obj("an array")?)? {
             Obj::Array(items) => Ok(items),
             o => Err(RunError::internal(format!("not an array: {o:?}"))),
