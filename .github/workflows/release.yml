@@ -100,3 +100,38 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS --verify-tag --title "$TAG" --generate-notes
+
+  # The VS Code extension (editors/vscode) as a .vsix on the same release: install with `code --install-extension FILE.vsix`.
+  vsix:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-node@v4
+        timeout-minutes: 5
+        with:
+          node-version: 22
+
+      - name: Package the extension
+        timeout-minutes: 5
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npx --yes @vscode/vsce package --out "fibber-vscode.vsix"
+
+      - name: Attach it to the release
+        timeout-minutes: 5
+        working-directory: editors/vscode
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v=$(node -p "require('./package.json').version")
+          mv fibber-vscode.vsix "fibber-vscode-$v.vsix"
+          gh release upload "$TAG" "fibber-vscode-$v.vsix" --clobber

@@ -73,6 +73,10 @@ REAL_CC=$(command -v cc) PATH="$work/shim:$PATH" build "$work/F3" "$tree/bin/fib
 emit "$tree/bin/fibc" > "$work/emit.ship"
 cmp "$work/emit.seed" "$work/emit.ship" || { echo "package: the shipped fibc emits something else" >&2; exit 1; }
 cp "$work/liblair.so" "$tree/lib/liblair.so"
+# The seed's fibref (the frozen reference interpreter, which also serves `fibref lsp` to the editor extension) rides along when
+# the seed has one beside its fibc: the bootstrapped tarball has no interpreter of its own.
+seed_fibref=$(dirname "$FIBC")/fibref
+if [ -x "$seed_fibref" ]; then cp "$seed_fibref" "$tree/bin/fibref"; fi
 cp -r lib "$tree/share/fibber/lib"
 cp LICENSE "$tree/LICENSE"
 sed "s/@VERSION@/$version/g" > "$tree/README.txt" <<'README'
@@ -80,6 +84,7 @@ fibc @VERSION@: the fibber compiler, written in fibber (stage 2).
 
 Layout
   bin/fibc                 the compiler
+  bin/fibref               the frozen reference interpreter and `fibref lsp` for editors (when the seed had one)
   lib/liblair.so           the code generator (lair), found by the rpath $ORIGIN/../lib
   share/fibber/lib/        the standard library source, found beside bin/ by fibc itself
 
