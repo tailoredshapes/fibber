@@ -1,0 +1,100 @@
+name: release
+
+# A pushed tag v* builds the release for that tag and attaches the tarball and SHA256SUMS to a GitHub release of the same name.
+#   v0.0.*  the Rust tools (scripts/package-rust.sh): the seed of the bootstrap.
+#   v0.1.*  and later: fibc written in fibber (scripts/package.sh), built by the seed that SEED names (scripts/fetch-seed.sh); the tag
+#           has to equal v + the file VERSION.
+# workflow_dispatch does the same for an existing tag given as input.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'An existing tag to build and release, such as v0.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install stable toolchain
+        timeout-minutes: 10
+        run: |
+          rustup update stable
+          rustup default stable
+
+      # As ci.yml's lair job: LLVM 21 from apt.llvm.org, its development package, Polly's archives and the system libraries llvm-sys
+      # links statically.
+      - name: Install LLVM 21
+        timeout-minutes: 15
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
+          /usr/lib/llvm-21/bin/llvm-config --version
+
+      - uses: Swatinem/rust-cache@v2
+        timeout-minutes: 10
+        with:
+          prefix-key: release
+
+      - name: Package the Rust tools (v0.0.*)
+        if: startsWith(env.TAG, 'v0.0.')
+        timeout-minutes: 60
+        run: scripts/package-rust.sh "${TAG#v}" dist
+
+      - name: Fetch the seed (v0.1 and later)
+        id: seed
+        if: ${{ !startsWith(env.TAG, 'v0.0.') }}
+        timeout-minutes: 5
+        run: echo "fibc=$(scripts/fetch-seed.sh seed)" >> "$GITHUB_OUTPUT"
+
+      - name: Package fibc (v0.1 and later)
+        if: ${{ !startsWith(env.TAG, 'v0.0.') }}
+        timeout-minutes: 90
+        env:
+          FIBC: ${{ steps.seed.outputs.fibc }}
+        run: |
+          test "v$(cat VERSION)" = "$TAG" || { echo "tag $TAG is not v$(cat VERSION), the file VERSION" >&2; exit 1; }
+          scripts/package.sh dist
+
+      - name: Check the unpacked tarball runs with an empty environment
+        timeout-minutes: 10
+        run: |
+          mkdir unpacked
+          tar -xzf dist/fibc-*-linux-x86_64.tar.gz -C unpacked
+          echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > hello.fib
+          env -i unpacked/fibc-*/bin/fibc run hello.fib
+
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: dist
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      # gh is on the runner; GITHUB_TOKEN is the default one, with contents: write from the permissions above.
+      - name: Create the release
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS --verify-tag --title "$TAG" --generate-notes
