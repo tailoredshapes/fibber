@@ -142,7 +142,7 @@ fn a_file_that_cannot_be_read_is_unreadable_and_the_largest_status_wins() {
     assert_eq!(expand_files(&[dir.file("absent.fib")], &plain()).1, 2);
 }
 
-const WITH_MACRO: &str = "(defmacro twice (x) `(+ ,x ,x))\n(defun main () -> i64 (twice 21))\n";
+const WITH_MACRO: &str = "(defmacro twice (x) `(+ ~x ~x))\n(defun main () -> i64 (twice 21))\n";
 
 #[test]
 fn a_user_macro_runs_in_the_evaluator_and_is_pending_without_a_runner() {
@@ -341,7 +341,7 @@ fn a_program_lists_what_differs_from_the_prelude_and_the_prelude_lists_everythin
 
 #[test]
 fn the_context_of_a_module_program_adds_up_and_shows_the_scope_of_each_module() {
-    let util = "(ns util)\n(defmacro twice (x) `(do ,x ,x))\n(defstruct S (a: i64))\n";
+    let util = "(ns util)\n(defmacro twice (x) `(do ~x ~x))\n(defstruct S (a: i64))\n";
     let main = "(ns main (:require [util :as u]) (:use util))\n(defstruct T (b: i64))\n";
     let dir = Dir::new("ctx-modules", &[("main.fib", main), ("util.fib", util)]);
     let opts = Options {

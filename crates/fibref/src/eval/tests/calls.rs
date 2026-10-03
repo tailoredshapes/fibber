@@ -149,7 +149,7 @@ fn closures_capture_and_share_a_cell() {
 #[test]
 fn a_user_macro_with_a_rest_parameter_expands() {
     clean(
-        "(defmacro sum (... xs) `(+ 0 (+ ,@xs)))
+        "(defmacro sum (... xs) `(+ 0 (+ ~@xs)))
          (defun main () -> i64 (sum 1 2))",
         3,
     );

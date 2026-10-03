@@ -79,7 +79,7 @@ fn pipeline(source: &str, file: &str, implicit: &[&str]) -> Result<i64, String> 
 const FIB_X: &str = "(ns fib.x)
 (defun twice (n: i64) -> i64 (+ n n))
 (defun secret :private (n: i64) -> i64 n)
-(defmacro double-it (e) `(fib.x/twice ,e))
+(defmacro double-it (e) `(fib.x/twice ~e))
 ";
 
 fn is_err_with(r: Result<i64, String>, text: &str) {
@@ -114,7 +114,7 @@ fn a_template_naming_an_implicit_module_expands_in_a_module_that_never_named_it(
     // `lib.m` is no implicit module; its macro's template names fib.x/twice and is
     // expanded in `main`, which has not used fib.x (probes m2 and m3 of the plan)
     let main = "(ns main (:use lib.m))\n(defun main () -> i64 (twice-it 4))";
-    let lib = "(ns lib.m)\n(defmacro twice-it (e) `(fib.x/twice ,e))\n";
+    let lib = "(ns lib.m)\n(defmacro twice-it (e) `(fib.x/twice ~e))\n";
     let files = [("main.fib", main), ("lib/m.fib", lib), ("fib/x.fib", FIB_X)];
     assert_eq!(run("template", &files, &["fib.x"]), Ok(8));
     is_err_with(run("template-off", &files, &[]), "twice");
@@ -184,7 +184,7 @@ fn two_implicit_modules_exporting_one_name_are_an_error_that_names_both() {
 #[test]
 fn a_facade_is_implicit_with_its_parts_and_the_library_itself_sees_no_implicit_module() {
     let facade = "(ns fib.f (:export-from fib.f.a fib.f.b))";
-    let a = "(ns fib.f.a)\n(defun from-a () -> i64 1)\n(defmacro mac-a (e) `(+ ,e 100))\n";
+    let a = "(ns fib.f.a)\n(defun from-a () -> i64 1)\n(defmacro mac-a (e) `(+ ~e 100))\n";
     let b = "(ns fib.f.b)\n(defun from-b () -> i64 20)\n";
     let main = "(defun main () -> i64 (+ (mac-a (from-a)) (from-b)))";
     let lib = [

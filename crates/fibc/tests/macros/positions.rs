@@ -71,10 +71,10 @@ const TEMPLATES: [Template; 35] = [
     t("(x)", "(List [x x x])", Args::Fixed(1)),
     // An argument wrapped in a new list, by hand and by quasiquote.
     t("(x)", "(List [(Sym \"do\") x])", Args::Fixed(1)),
-    t("(x)", "`(do ,x)", Args::Fixed(1)),
-    t("(x)", "`(do ,x ,x)", Args::Fixed(1)),
-    t("(x)", "`(do [,x 1] {,x ,x})", Args::Fixed(1)),
-    t("(x)", "`(a (b (c ,x) ,x) [,x {,x ,x}])", Args::Fixed(1)),
+    t("(x)", "`(do ~x)", Args::Fixed(1)),
+    t("(x)", "`(do ~x ~x)", Args::Fixed(1)),
+    t("(x)", "`(do [~x 1] {~x ~x})", Args::Fixed(1)),
+    t("(x)", "`(a (b (c ~x) ~x) [~x {~x ~x}])", Args::Fixed(1)),
     // A child of the argument, a list rebuilt from the old children.
     t("(x)", "(match x ((List [_ y & _]) y) (_ x))", Args::Fixed(1)),
     t(
@@ -107,12 +107,12 @@ const TEMPLATES: [Template; 35] = [
         Args::Fixed(1),
     ),
     // Two arguments, old and new forms in one list.
-    t("(a b)", "`(do ,b ,a)", Args::Fixed(2)),
+    t("(a b)", "`(do ~b ~a)", Args::Fixed(2)),
     t("(a b)", "(List [(Sym \"do\") a (Int 1 :i64) b (Str \"s\") a])", Args::Fixed(2)),
     t("(a b)", "(Vec [a (Vec [b]) (Map [b a]) (List [])])", Args::Fixed(2)),
     t("(a b)", "(match a ((List items) (List (vec-conj items b))) (_ (List [a b])))", Args::Fixed(2)),
     t("(a b)", "(match b ((List items) (List (concat [a] items))) (_ b))", Args::Fixed(2)),
-    t("(a b c)", "`(do ,c (,b) ,a [,c ,a])", Args::Fixed(3)),
+    t("(a b c)", "`(do ~c (~b) ~a [~c ~a])", Args::Fixed(3)),
     // Forms the macro made itself: quoted, gensym'd, nil, `(do)`.
     t("(x)", "'(do 1 [2] {3 4})", Args::Fixed(1)),
     t("(x)", "'q", Args::Fixed(1)),
@@ -124,21 +124,21 @@ const TEMPLATES: [Template; 35] = [
     t("(x)", "Nil", Args::Fixed(1)),
     t("()", "`(do)", Args::Fixed(0)),
     // Rest arguments.
-    t("(... xs)", "`(do ,@xs)", Args::Rest(0)),
+    t("(... xs)", "`(do ~@xs)", Args::Rest(0)),
     t("(... xs)", "(List xs)", Args::Rest(0)),
     t("(... xs)", "(List [])", Args::Rest(0)),
-    t("(a ... xs)", "`(do ,a ,@xs ,a)", Args::Rest(1)),
+    t("(a ... xs)", "`(do ~a ~@xs ~a)", Args::Rest(1)),
     t("(a ... xs)", "(match xs ([y & _] y) (_ a))", Args::Rest(1)),
     // Macros that expand to calls of macros, and to calls of themselves.
-    t("(x)", "`(twice ,x)", Args::Fixed(1)),
-    t("(... xs)", "`(twice (do ,@xs))", Args::Rest(0)),
-    t("(x)", "(match x ((List [_ & r]) `(m ,(List r))) (_ x))", Args::Fixed(1)),
+    t("(x)", "`(twice ~x)", Args::Fixed(1)),
+    t("(... xs)", "`(twice (do ~@xs))", Args::Rest(0)),
+    t("(x)", "(match x ((List [_ & r]) `(m ~(List r))) (_ x))", Args::Fixed(1)),
 ];
 
 /// Multi-byte text and a helper macro before the macro under test, so
 /// that no position is the same by luck.
 const HEADER: &str =
-    ";; é日 header\n(defstruct P (a: i64 b: i64))\n(defmacro twice (x) `(do ,x ,x))\n";
+    ";; é日 header\n(defstruct P (a: i64 b: i64))\n(defmacro twice (x) `(do ~x ~x))\n";
 
 /// How many top-level forms of a program are definitions (the header's
 /// two and the macro under test), expanded as one program; every later
@@ -254,8 +254,8 @@ const SPECIAL: [&str; 6] = [
     "(defmacro m (x) (Bool (struct? x)))\n(defun f () -> i64 (m P))\n(defun g () -> i64 (m Q))\n",
     "(defmacro m (x) (List [(Sym \"do\") x (List (struct-fields x))]))\n(defun f () -> i64 (m P))\n",
     "(defmacro m (x) (Int (vec-count (enum-variants x)) :i64))\n(defun f () -> i64 (m Option))\n",
-    "(defmacro defpair (a b) `(do (def ,a 1) (def ,b 2)))\n(defpair x\n  y)\n(defpair é 日)\n",
-    "(defmacro m (... xs) `(do ,@xs))\n(m)\n(m (def a 1) (def b 2))\n(m (m (def c 1)))\n",
+    "(defmacro defpair (a b) `(do (def ~a 1) (def ~b 2)))\n(defpair x\n  y)\n(defpair é 日)\n",
+    "(defmacro m (... xs) `(do ~@xs))\n(m)\n(m (def a 1) (def b 2))\n(m (m (def c 1)))\n",
 ];
 
 /// The errors of a reflection call, one program each. (A macro that traps

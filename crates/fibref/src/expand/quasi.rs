@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! `atom                ⟹ (quote atom)
-//! `(a ,b ,@cs d)       ⟹ (List (concat ['a] [b] cs ['d]))
+//! `(a ~b ~@cs d)       ⟹ (List (concat ['a] [b] cs ['d]))
 //! `[ ... ]  `{ ... }   ⟹ the same with Vec / Map
 //! ```
 //!
@@ -15,7 +15,7 @@
 //! Nesting follows the usual levels: an inner `quasiquote` raises the
 //! level, an `unquote` or `unquote-splicing` lowers it, and only one at
 //! level 1 is evaluated; deeper ones are rebuilt as data with their
-//! operand rewritten one level down. A `,@` at level 1 that is not an
+//! operand rewritten one level down. A `~@` at level 1 that is not an
 //! item of a list, vector or map is [`ExpandErrorKind::SpliceOutsideList`].
 //!
 //! The rewrite produces vector literals (`['a]`), which the expander

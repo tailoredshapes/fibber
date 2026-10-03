@@ -23,7 +23,7 @@ fn atom_is_quoted() {
 #[test]
 fn the_spec_example() {
     assert_eq!(
-        qq("`(a ,b ,@cs d)"),
+        qq("`(a ~b ~@cs d)"),
         "(fib.prelude/List (fib.prelude/concat [(quote a)] [b] cs [(quote d)]))"
     );
 }
@@ -31,71 +31,71 @@ fn the_spec_example() {
 #[test]
 fn vectors_and_maps_use_their_constructors() {
     assert_eq!(
-        qq("`[a ,b]"),
+        qq("`[a ~b]"),
         "(fib.prelude/Vec (fib.prelude/concat [(quote a)] [b]))"
     );
     assert_eq!(
-        qq("`{k ,v}"),
+        qq("`{k ~v}"),
         "(fib.prelude/Map (fib.prelude/concat [(quote k)] [v]))"
     );
-    assert_eq!(qq("`[,@xs]"), "(fib.prelude/Vec (fib.prelude/concat xs))");
+    assert_eq!(qq("`[~@xs]"), "(fib.prelude/Vec (fib.prelude/concat xs))");
     assert_eq!(qq("`()"), "(fib.prelude/List (fib.prelude/concat))");
 }
 
 #[test]
 fn unquote_at_top_is_the_operand() {
-    assert_eq!(qq("`,x"), "x");
-    assert_eq!(qq("`,(f x)"), "(f x)");
+    assert_eq!(qq("`~x"), "x");
+    assert_eq!(qq("`~(f x)"), "(f x)");
 }
 
 #[test]
 fn nested_lists_are_rebuilt() {
     assert_eq!(
-        qq("`(a (b ,c))"),
+        qq("`(a (b ~c))"),
         "(fib.prelude/List (fib.prelude/concat [(quote a)] [(fib.prelude/List (fib.prelude/concat [(quote b)] [c]))]))"
     );
 }
 
 #[test]
 fn nested_quasiquote_evaluates_only_level_one() {
-    // `(a `(b ,(c ,d))): the inner , belongs to the inner quasiquote and
-    // is kept as data, but its ,d is at level one and is evaluated.
+    // `(a `(b ~(c ~d))): the inner , belongs to the inner quasiquote and
+    // is kept as data, but its ~d is at level one and is evaluated.
     let inner_c = "(fib.prelude/List (fib.prelude/concat [(quote c)] [d]))";
     let unq = format!("(fib.prelude/List (fib.prelude/concat [(quote unquote)] [{inner_c}]))");
     let b = format!("(fib.prelude/List (fib.prelude/concat [(quote b)] [{unq}]))");
     let qq_b = format!("(fib.prelude/List (fib.prelude/concat [(quote quasiquote)] [{b}]))");
     let expected = format!("(fib.prelude/List (fib.prelude/concat [(quote a)] [{qq_b}]))");
-    assert_eq!(qq("`(a `(b ,(c ,d)))"), expected);
+    assert_eq!(qq("`(a `(b ~(c ~d)))"), expected);
 }
 
 #[test]
 fn nested_quasiquote_keeps_deep_unquotes_as_data() {
-    // `(a `(b ,c)): c is at level two, so the result holds (unquote c).
+    // `(a `(b ~c)): c is at level two, so the result holds (unquote c).
     let unq = "(fib.prelude/List (fib.prelude/concat [(quote unquote)] [(quote c)]))";
     let b = format!("(fib.prelude/List (fib.prelude/concat [(quote b)] [{unq}]))");
     let qq_b = format!("(fib.prelude/List (fib.prelude/concat [(quote quasiquote)] [{b}]))");
     assert_eq!(
-        qq("`(a `(b ,c))"),
+        qq("`(a `(b ~c))"),
         format!("(fib.prelude/List (fib.prelude/concat [(quote a)] [{qq_b}]))")
     );
 }
 
 #[test]
 fn nested_splice_at_level_one() {
-    // `(x `(y ,@(z ,@w))): w is spliced now, into the list (z ...).
+    // `(x `(y ~@(z ~@w))): w is spliced now, into the list (z ...).
     let z = "(fib.prelude/List (fib.prelude/concat [(quote z)] w))";
     let uqs = format!("(fib.prelude/List (fib.prelude/concat [(quote unquote-splicing)] [{z}]))");
     let y = format!("(fib.prelude/List (fib.prelude/concat [(quote y)] [{uqs}]))");
     let qq_y = format!("(fib.prelude/List (fib.prelude/concat [(quote quasiquote)] [{y}]))");
     assert_eq!(
-        qq("`(x `(y ,@(z ,@w)))"),
+        qq("`(x `(y ~@(z ~@w)))"),
         format!("(fib.prelude/List (fib.prelude/concat [(quote x)] [{qq_y}]))")
     );
 }
 
 #[test]
 fn splice_as_the_whole_template_is_an_error() {
-    let e = ex_err("`,@xs");
+    let e = ex_err("`~@xs");
     assert_eq!(e.kind, K::SpliceOutsideList);
     assert_eq!((e.pos.line, e.pos.col), (1, 2));
 }
@@ -113,7 +113,7 @@ fn after_expansion_vectors_are_library_calls() {
     let a = v(&["(quote a)"]);
     let b = v(&["b"]);
     assert_eq!(
-        ex("`(a ,b)"),
+        ex("`(a ~b)"),
         format!("(fib.prelude/List (fib.prelude/concat {a} {b}))")
     );
 }
@@ -122,22 +122,22 @@ fn after_expansion_vectors_are_library_calls() {
 fn unquote_operands_are_expanded() {
     let x = v(&["(if p q false)"]);
     assert_eq!(
-        ex("`(,(and p q))"),
+        ex("`(~(and p q))"),
         format!("(fib.prelude/List (fib.prelude/concat {x}))")
     );
 }
 
 #[test]
 fn quote_keeps_brackets_and_unquotes_as_data() {
-    assert_eq!(ex("'(a ,b [c] {d e})"), "(quote (a (unquote b) [c] {d e}))");
+    assert_eq!(ex("'(a ~b [c] {d e})"), "(quote (a (unquote b) [c] {d e}))");
 }
 
 #[test]
 fn unquote_outside_quasiquote_is_an_error() {
-    let e = ex_err("(f ,x)");
+    let e = ex_err("(f ~x)");
     assert_eq!(e.kind, K::UnquoteOutsideQuasiquote { head: "unquote" });
     assert_eq!((e.pos.line, e.pos.col), (1, 4));
-    let e = ex_err("(f ,@x)");
+    let e = ex_err("(f ~@x)");
     assert_eq!(
         e.kind,
         K::UnquoteOutsideQuasiquote {

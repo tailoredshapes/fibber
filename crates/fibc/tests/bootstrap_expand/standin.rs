@@ -137,7 +137,7 @@ mod tests {
             write("a.fib", "(defun f (x: i64) -> i64 (when x 1 2))\n"),
             write(
                 "b.fib",
-                "(defmacro m (x) `(do ,x))\n(defun main () -> i64 (m 1))\n",
+                "(defmacro m (x) `(do ~x))\n(defun main () -> i64 (m 1))\n",
             ),
             write("c.fib", "(defun f () -> i64 1)\n(f)\n"),
             write("d.fib", "(a\n"),

@@ -37,7 +37,7 @@ pub struct Limits {
     /// all, each expansion's result counted in full. The step limit
     /// alone does not make expansion terminate in practice: a macro
     /// whose result grows at each step (`(defmacro g (... xs) `(g 1
-    /// ,@xs))`, or one that doubles its argument) does quadratic or
+    /// ~@xs))`, or one that doubles its argument) does quadratic or
     /// exponential work long before its steps run out. It fails with
     /// [`ExpandErrorKind::TooLarge`] instead.
     pub max_forms: usize,

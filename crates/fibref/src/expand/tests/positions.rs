@@ -93,12 +93,12 @@ fn list_rewrite_takes_the_call_position_and_the_elements_keep_theirs() {
 
 #[test]
 fn quasi_rewrite_builds_at_the_template_forms_and_operands_keep_theirs() {
-    // `(a ,b): the built `List` and `concat` are at the template list
+    // `(a ~b): the built `List` and `concat` are at the template list
     // (2:3), the one-element vector that wraps `a` and its `quote` at `a`
-    // (2:4), the one that wraps `,b` at the unquote form (3:2); the
+    // (2:4), the one that wraps `~b` at the unquote form (3:2); the
     // operand `b` keeps its own position (3:3).
     assert_eq!(
-        ex_pos("(f\n `(a\n ,b))"),
+        ex_pos("(f\n `(a\n ~b))"),
         "(f@1:2 (fib.prelude/List@2:3 (fib.prelude/concat@2:3 \
          (fib.prelude/vec-conj@2:4 (fib.prelude/vec-empty@2:4)@2:4 (quote@2:4 a@2:4)@2:4)@2:4 \
          (fib.prelude/vec-conj@3:2 (fib.prelude/vec-empty@3:2)@3:2 b@3:3)@3:2)@2:3)@2:3)@1:1"

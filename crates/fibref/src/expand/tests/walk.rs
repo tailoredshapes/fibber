@@ -123,7 +123,7 @@ fn top_level_do_splices_in_order() {
 
 #[test]
 fn defmacro_stays_with_its_body_expanded() {
-    let out = prog("(defmacro m (a ... r) `(f ,a ,@r))");
+    let out = prog("(defmacro m (a ... r) `(f ~a ~@r))");
     let body = format!(
         "(fib.prelude/List (fib.prelude/concat {} {} r))",
         v(&["(quote f)"]),

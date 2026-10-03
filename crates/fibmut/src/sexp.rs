@@ -23,7 +23,7 @@ pub enum Kind {
     Str,
     /// A `\c` literal, `\newline` and the like.
     Char,
-    /// A reader prefix (`'` `` ` `` `,` `,@` `@`) and the one form it applies to.
+    /// A reader prefix (`'` `` ` `` `~` `~@` `@`) and the one form it applies to.
     Prefix,
 }
 
@@ -123,25 +123,13 @@ fn is_delimiter(b: u8) -> bool {
         || is_closer(b)
         || matches!(
             b,
-            b'(' | b'[' | b'{' | b'"' | b';' | b'\'' | b'`' | b',' | b'@' | b'\\'
+            b'(' | b'[' | b'{' | b'"' | b';' | b'\'' | b'`' | b',' | b'@' | b'~' | b'\\'
         )
 }
 
 impl Parser<'_> {
     fn peek(&self, at: usize) -> Option<u8> {
         self.b.get(at).copied()
-    }
-
-    /// A comma is white space unless a form follows it (`spec/syntax.md` 1.2).
-    fn comma_is_space(&self) -> bool {
-        let mut at = self.pos;
-        while self.peek(at) == Some(b',') {
-            at += 1;
-        }
-        match self.peek(at) {
-            None => true,
-            Some(c) => is_space(c) || is_closer(c) || c == b';',
-        }
     }
 
     /// Skips white space, comments, white-space commas and `#_ form`.
@@ -154,7 +142,7 @@ impl Parser<'_> {
                         self.pos += 1;
                     }
                 }
-                Some(b',') if self.comma_is_space() => self.pos += 1,
+                Some(b',') => self.pos += 1,
                 Some(b'#') if self.peek(self.pos + 1) == Some(b'_') => {
                     self.pos += 2;
                     self.skip(depth + 1)?;
@@ -179,7 +167,7 @@ impl Parser<'_> {
             c if is_closer(c) => fail(self.pos, "a closer with no opener"),
             b'"' => self.string(),
             b'\\' => self.character(),
-            b'\'' | b'`' | b'@' | b',' => self.prefix(depth),
+            b'\'' | b'`' | b'@' | b'~' => self.prefix(depth),
             _ => self.atom(),
         }
     }
@@ -209,7 +197,7 @@ impl Parser<'_> {
 
     fn prefix(&mut self, depth: usize) -> Result<Node, ParseError> {
         let start = self.pos;
-        let spliced = self.peek(start) == Some(b',') && self.peek(start + 1) == Some(b'@');
+        let spliced = self.peek(start) == Some(b'~') && self.peek(start + 1) == Some(b'@');
         self.pos += if spliced { 2 } else { 1 };
         self.skip(depth + 1)?;
         let kid = self.form(depth + 1)?;

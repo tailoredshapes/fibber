@@ -157,7 +157,7 @@ mod tests {
     fn sources() -> Vec<String> {
         vec![
             "(defstruct P (a: i64))\n(defun f (x: i64) -> i64 (when x 1))\n".to_string(),
-            "(defmacro m (x) `(do ,x))\n(defun main () -> i64 (m 1))\n".to_string(),
+            "(defmacro m (x) `(do ~x))\n(defun main () -> i64 (m 1))\n".to_string(),
         ]
     }
 

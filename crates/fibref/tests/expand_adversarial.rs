@@ -47,7 +47,7 @@ fn last(src: &str) -> String {
 // ---- hygiene: what gensym must survive -------------------------------
 
 const SWAP_ADD: &str =
-    "(defmacro add-first (a b) (let ((t (gensym \"t\"))) `(let ((,t ,a)) (+ ,t ,b))))\n";
+    "(defmacro add-first (a b) (let ((t (gensym \"t\"))) `(let ((~t ~a)) (+ ~t ~b))))\n";
 
 #[test]
 fn gensym_binding_does_not_capture_a_user_variable_of_the_same_name() {
@@ -98,7 +98,7 @@ fn prelude_gensyms_do_not_capture_user_names() {
 fn an_unhygienic_macro_does_capture_as_the_spec_decides() {
     // §3.16: "There is no automatic hygiene"; a macro that binds a plain
     // name captures the caller's use of it.
-    let src = "(defmacro bad (e) `(let ((t 1)) (+ t ,e)))\n(defun f (t) (bad t))";
+    let src = "(defmacro bad (e) `(let ((t 1)) (+ t ~e)))\n(defun f (t) (bad t))";
     assert_eq!(last(src), "(defun f (t) (let ((t 1)) (+ t t)))");
 }
 
@@ -106,7 +106,7 @@ fn an_unhygienic_macro_does_capture_as_the_spec_decides() {
 
 #[test]
 fn a_macro_defining_macro_with_nested_quasiquote_and_splicing() {
-    let src = "(defmacro defalias (new old) `(defmacro ,new (... args) `(,',old ,@args)))\n\
+    let src = "(defmacro defalias (new old) `(defmacro ~new (... args) `(~'~old ~@args)))\n\
                (defalias plus g)\n\
                (defun f () (plus 1 2 3))";
     let out = ok(src);
@@ -125,7 +125,7 @@ fn a_macro_defining_macro_with_nested_quasiquote_and_splicing() {
 #[test]
 fn splicing_at_several_levels() {
     let src =
-        "(defmacro wrap (... xs) `(f [,@xs] (g ,@xs ,@xs) '(h ,@xs)))\n(defun k () (wrap a b))";
+        "(defmacro wrap (... xs) `(f [~@xs] (g ~@xs ~@xs) '(h ~@xs)))\n(defun k () (wrap a b))";
     let out = last(src);
     let v = "(fib.prelude/vec-conj (fib.prelude/vec-conj (fib.prelude/vec-empty) a) b)";
     assert_eq!(
@@ -136,7 +136,7 @@ fn splicing_at_several_levels() {
 
 #[test]
 fn splice_outside_a_list_is_an_error_at_definition() {
-    let e = err("(defmacro m (xs) `,@xs)");
+    let e = err("(defmacro m (xs) `~@xs)");
     assert_eq!(e.kind, K::SpliceOutsideList);
     assert_eq!((e.pos.line, e.pos.col), (1, 19));
 }
@@ -155,7 +155,7 @@ fn a_macro_producing_a_top_level_do_of_several_defs() {
     // §3.16's defrecord (proposed case 41): the spliced defstruct is
     // registered before the spliced derive is expanded.
     let src =
-        "(defmacro defrecord (name fields) `(do (defstruct ,name ,fields) (derive Eq ,name)))\n\
+        "(defmacro defrecord (name fields) `(do (defstruct ~name ~fields) (derive Eq ~name)))\n\
                (defrecord Pt (x y))\n\
                (defun main () (= (Pt 1 2) (Pt 1 2)))";
     let out = ok(src);
@@ -170,13 +170,13 @@ fn a_macro_producing_a_top_level_do_of_several_defs() {
 
 #[test]
 fn a_macro_producing_nested_dos_of_defuns() {
-    let src = "(defmacro two (a b) `(do (defun ,a () 1) (do (do) (defun ,b () 2))))\n(two f g)";
+    let src = "(defmacro two (a b) `(do (defun ~a () 1) (do (do) (defun ~b () 2))))\n(two f g)";
     assert_eq!(ok(src)[1..], ["(defun f () 1)", "(defun g () 2)"]);
 }
 
 #[test]
 fn a_macro_producing_definitions_in_an_expression_is_an_error() {
-    let src = "(defmacro two (a) `(do (defun ,a () 1)))\n(defun h () (two f))";
+    let src = "(defmacro two (a) `(do (defun ~a () 1)))\n(defun h () (two f))";
     assert_eq!(
         err(src).kind,
         K::DefinitionInExpression {
@@ -188,7 +188,7 @@ fn a_macro_producing_definitions_in_an_expression_is_an_error() {
 #[test]
 fn reflection_from_a_macro() {
     let src = "(defstruct (P a) (x: a y: i64))\n\
-               (defmacro fields (n) `(list ,@(struct-fields n)))\n\
+               (defmacro fields (n) `(list ~@(struct-fields n)))\n\
                (defmacro no (n) (struct-fields n))\n\
                (defun f (p) (fields P))";
     assert_eq!(
@@ -264,7 +264,7 @@ fn a_macro_that_expands_to_itself_hits_the_step_limit() {
 
 #[test]
 fn a_macro_that_grows_hits_the_depth_limit() {
-    let e = err("(defmacro grow (x) `(f (grow ,x)))\n(defun f () (grow 1))");
+    let e = err("(defmacro grow (x) `(f (grow ~x)))\n(defun f () (grow 1))");
     assert_eq!(
         e.kind,
         K::TooDeep {
@@ -322,7 +322,7 @@ fn loop_bodies_with_recur_looking_user_symbols() {
 
 #[test]
 fn positions_through_a_user_macro() {
-    let src = "(defmacro call-g (x) `(g ,x))\n(defun f ()\n  (call-g\n    arg))";
+    let src = "(defmacro call-g (x) `(g ~x))\n(defun f ()\n  (call-g\n    arg))";
     let out = expand_program(read(src), &mut ExpandCtx::new(), &mut Mini)
         .unwrap_or_else(|e| panic!("{e}"));
     let body = &out[1].as_list().unwrap_or(&[])[3];
@@ -337,7 +337,7 @@ fn positions_through_a_user_macro() {
 
 #[test]
 fn user_macro_shadows_a_prelude_macro() {
-    let src = "(defmacro when (c x) `(if ,c ,x 0))\n(defun f (c) (when c 1))";
+    let src = "(defmacro when (c x) `(if ~c ~x 0))\n(defun f (c) (when c 1))";
     assert_eq!(last(src), "(defun f (c) (if c 1 0))");
 }
 
@@ -354,7 +354,7 @@ fn no_runner_reports_pending_with_the_call_position() {
 
 #[test]
 fn proposed_case_41_expands_with_an_evaluator() {
-    let src = "(defmacro defrecord (name fields)\n  `(do (defstruct ,name ,fields)\n       (derive Eq ,name)))\n\
+    let src = "(defmacro defrecord (name fields)\n  `(do (defstruct ~name ~fields)\n       (derive Eq ~name)))\n\
                (defrecord Point (x: i64 y: i64))\n\
                (defun main () -> i64 (if (= (Point 1 2) (Point 1 2)) 1 0))";
     let out = ok(src);
@@ -372,7 +372,7 @@ fn proposed_case_41_expands_with_an_evaluator() {
 
 #[test]
 fn proposed_case_51_and_its_companions() {
-    let src = "(defmacro or-zero (e)\n  `(match ,e ((some x) x) (nil 0)))\n\
+    let src = "(defmacro or-zero (e)\n  `(match ~e ((some x) x) (nil 0)))\n\
                (defun main () -> i64 (+ (or-zero (pick true)) (or-zero (pick false))))";
     assert_eq!(
         last(src),

@@ -86,19 +86,19 @@ fn a_discarded_form_is_not_in_the_tree() {
 #[test]
 fn prefixes_take_the_next_form() {
     assert_eq!(
-        shape("'(a b) @x `(c ,d ,@e)"),
+        shape("'(a b) @x `(c ~d ~@e)"),
         "P<(a b)> P<x> P<(c P<d> P<e>)>"
     );
     assert_eq!(shape("' x"), "P<x>");
 }
 
 #[test]
-fn a_comma_is_space_unless_a_form_follows_it() {
+fn a_comma_is_space() {
     assert_eq!(shape("[1, 2 , 3]"), "[1 2 3]");
-    // `,3` touches its form: an unquote, as the reader says
-    assert_eq!(shape("[1 ,3]"), "[1 P<3>]");
-    assert_eq!(shape("(a ,b)"), "(a P<b>)");
-    assert_eq!(shape("(a ,,b)"), "(a P<P<b>>)");
+    // a comma is space even when it touches a form (E14)
+    assert_eq!(shape("[1 ,3]"), "[1 3]");
+    assert_eq!(shape("(a ~b)"), "(a P<b>)");
+    assert_eq!(shape("(a ,~b)"), "(a P<b>)");
     assert_eq!(shape("(a b,)"), "(a b)");
 }
 

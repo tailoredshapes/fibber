@@ -12,8 +12,8 @@ use crate::rng::Rng;
 /// The text of each module's definitions that may be present; each is a
 /// top-level form.
 const UTIL_ITEMS: [&str; 8] = [
-    "(defmacro twice (x) `(do ,x ,x))",
-    "(defmacro hid :private (x) `(do ,x))",
+    "(defmacro twice (x) `(do ~x ~x))",
+    "(defmacro hid :private (x) `(do ~x))",
     "(defmacro nf (n) (Int (count (struct-fields n)) :i64))",
     "(defstruct S (a: i64 b: str))",
     "(defstruct PS :private (a: i64))",
@@ -23,8 +23,8 @@ const UTIL_ITEMS: [&str; 8] = [
 ];
 
 const MORE_ITEMS: [&str; 5] = [
-    "(defmacro twice (x) `(do ,x ,x ,x))",
-    "(defmacro thrice (x) `(do ,x ,x ,x))",
+    "(defmacro twice (x) `(do ~x ~x ~x))",
+    "(defmacro thrice (x) `(do ~x ~x ~x))",
     "(defstruct S2 (z: i64))",
     "(defstruct PS2 :private (z: i64))",
     "(derive Eq S2)",

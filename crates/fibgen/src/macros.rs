@@ -58,13 +58,13 @@ impl Mac {
     /// The `defmacro`.
     pub fn definition(self) -> &'static str {
         match self {
-            Mac::Twice => "(defmacro twice (e) `(+ ,e ,e))",
-            Mac::Once2 => "(defmacro once2 (e) (let ((t (gensym \"t\"))) `(let ((,t ,e)) (+ ,t ,t))))",
-            Mac::SwapSub => "(defmacro swap-sub (form)\n  (match form ((List [(Sym \"-\") a b]) `(- ,b ,a)) (_ form)))",
-            Mac::FlipIf => "(defmacro flip-if (form)\n  (match form ((List [(Sym \"if\") c t e]) `(if (not ,c) ,e ,t)) (_ form)))",
-            Mac::SumAll => "(defmacro sum-all (... xs)\n  (match xs ([] '0) ([x & more] `(+ ,x (sum-all ,@more)))))",
+            Mac::Twice => "(defmacro twice (e) `(+ ~e ~e))",
+            Mac::Once2 => "(defmacro once2 (e) (let ((t (gensym \"t\"))) `(let ((~t ~e)) (+ ~t ~t))))",
+            Mac::SwapSub => "(defmacro swap-sub (form)\n  (match form ((List [(Sym \"-\") a b]) `(- ~b ~a)) (_ form)))",
+            Mac::FlipIf => "(defmacro flip-if (form)\n  (match form ((List [(Sym \"if\") c t e]) `(if (not ~c) ~e ~t)) (_ form)))",
+            Mac::SumAll => "(defmacro sum-all (... xs)\n  (match xs ([] '0) ([x & more] `(+ ~x (sum-all ~@more)))))",
             Mac::Nargs => "(defmacro nargs (... xs) (Int (vec-count xs) :i64))",
-            Mac::Seq => "(defmacro seq (... steps) `(do ,@steps))",
+            Mac::Seq => "(defmacro seq (... steps) `(do ~@steps))",
         }
     }
 

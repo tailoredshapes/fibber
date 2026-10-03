@@ -215,7 +215,7 @@ fn facade_tree(d: &Path) {
                  (impl Sized Pt (size (self) (+ (. self x) (. self y))))\n\
                  (defun fa (n: i64) -> i64 (+ n 100))\n\
                  (defun hidden :private () -> i64 5)\n\
-                 (defmacro twice (x) `(+ ,x ,x))\n",
+                 (defmacro twice (x) `(+ ~x ~x))\n",
             ),
             (
                 "lib/parts/b.fib",

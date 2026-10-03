@@ -92,13 +92,13 @@ impl Soup<'_> {
     /// A quasiquote with unquotes and splices at random levels.
     fn quasi(&mut self, d: usize) -> String {
         let parts = [
-            format!(",{}", self.expr(d)),
-            format!(",@{}", self.expr(d)),
+            format!("~{}", self.expr(d)),
+            format!("~@{}", self.expr(d)),
             self.atom(),
-            format!("(a ,{} ,@{})", self.expr(d), self.expr(d)),
-            "`(b ,,x)".to_string(),
-            "[,@xs]".to_string(),
-            "{,x ,@ys}".to_string(),
+            format!("(a ~{} ~@{})", self.expr(d), self.expr(d)),
+            "`(b ,~x)".to_string(),
+            "[~@xs]".to_string(),
+            "{~x ~@ys}".to_string(),
         ];
         let n = self.rng.between(1, 3);
         let picked: Vec<String> = (0..n)

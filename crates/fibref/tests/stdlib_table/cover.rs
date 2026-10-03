@@ -227,7 +227,7 @@ mod tests {
         assert!(calls("(count @acc)", &at));
         assert!(!calls("(count acc)", &at));
         assert!(!calls(&code_of("(f \"@acc\")"), &at));
-        assert!(calls("`(do ,x)", &row("`x", "`x", 1)));
+        assert!(calls("`(do ~x)", &row("`x", "`x", 1)));
     }
 
     #[test]

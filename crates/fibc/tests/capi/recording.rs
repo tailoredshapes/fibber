@@ -56,7 +56,7 @@ fn type_names(source: &str) -> Vec<String> {
         for rest in source.split(head).skip(1) {
             let rest = rest.trim_start().trim_start_matches('(');
             if let Some(end) = rest.find(|c: char| c.is_whitespace() || c == ')') {
-                // A macro's template (`(defstruct ,name ..)`) is no type.
+                // A macro's template (`(defstruct ~name ..)`) is no type.
                 if rest.starts_with(char::is_uppercase) {
                     names.push(rest[..end].to_string());
                 }

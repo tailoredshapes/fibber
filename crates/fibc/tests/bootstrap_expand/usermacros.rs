@@ -19,19 +19,19 @@ struct Def {
 
 const DEFS: [Def; 16] = [
     Def {
-        source: "(defmacro twice (x) `(do ,x ,x))",
+        source: "(defmacro twice (x) `(do ~x ~x))",
         needs: &[],
         call: "(twice {})",
         top_level: false,
     },
     Def {
-        source: "(defmacro sum (... xs) `(+ ,@xs))",
+        source: "(defmacro sum (... xs) `(+ ~@xs))",
         needs: &[],
         call: "(sum {} {} 3)",
         top_level: false,
     },
     Def {
-        source: "(defmacro keep (x) (let ((g (gensym \"k\"))) `(let ((,g ,x)) ,g)))",
+        source: "(defmacro keep (x) (let ((g (gensym \"k\"))) `(let ((~g ~x)) ~g)))",
         needs: &[],
         call: "(keep {})",
         top_level: false,
@@ -49,19 +49,19 @@ const DEFS: [Def; 16] = [
         top_level: false,
     },
     Def {
-        source: "(defmacro defrecord (name fields) `(do (defstruct ,name ,fields) (derive Eq ,name)))",
+        source: "(defmacro defrecord (name fields) `(do (defstruct ~name ~fields) (derive Eq ~name)))",
         needs: &[],
         call: "(defrecord Rec (x: i64 y: str))",
         top_level: true,
     },
     Def {
-        source: "(defmacro mkdef (name v) `(defun ,name () -> i64 ,v))",
+        source: "(defmacro mkdef (name v) `(defun ~name () -> i64 ~v))",
         needs: &[],
         call: "(mkdef made {})",
         top_level: true,
     },
     Def {
-        source: "(defmacro nest (x) `(twice (twice ,x)))",
+        source: "(defmacro nest (x) `(twice (twice ~x)))",
         needs: &["twice"],
         call: "(nest {})",
         top_level: false,
@@ -73,7 +73,7 @@ const DEFS: [Def; 16] = [
         top_level: false,
     },
     Def {
-        source: "(defmacro or-zero (e) `(match ,e ((some x) x) (nil 0)))",
+        source: "(defmacro or-zero (e) `(match ~e ((some x) x) (nil 0)))",
         needs: &[],
         call: "(or-zero {})",
         top_level: false,
@@ -97,7 +97,7 @@ const DEFS: [Def; 16] = [
         top_level: false,
     },
     Def {
-        source: "(defmacro when (c ... b) `(if ,c (do ,@b) 0))",
+        source: "(defmacro when (c ... b) `(if ~c (do ~@b) 0))",
         needs: &[],
         call: "(when {} {})",
         top_level: false,
@@ -119,17 +119,17 @@ const DEFS: [Def; 16] = [
 /// Macros that only a small limit stops, and what limits them.
 const LIMIT_DEFS: [(&str, &str, &str); 3] = [
     (
-        "(defmacro loopy (x) `(loopy ,x))",
+        "(defmacro loopy (x) `(loopy ~x))",
         "(loopy 1)",
         "--max-steps",
     ),
     (
-        "(defmacro grow (... xs) `(grow 1 ,@xs))",
+        "(defmacro grow (... xs) `(grow 1 ~@xs))",
         "(grow 1)",
         "--max-forms",
     ),
     (
-        "(defmacro deep (x) `(do (deep ,x)))",
+        "(defmacro deep (x) `(do (deep ~x)))",
         "(deep 1)",
         "--max-depth",
     ),

@@ -145,7 +145,7 @@ fn too_many_forms() {
 
 #[test]
 fn a_result_that_grows_at_each_step_is_stopped() {
-    // A runner standing in for (defmacro g (x) `(g (do ,x ,x))): each
+    // A runner standing in for (defmacro g (x) `(g (do ~x ~x))): each
     // step doubles the form, so the steps would take forever.
     struct Doubling;
     impl crate::expand::MacroRunner for Doubling {

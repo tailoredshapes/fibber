@@ -8,7 +8,7 @@ use super::{binding_type, fails, ok};
 
 #[test]
 fn macros_are_typed_as_functions_over_form() {
-    let p = ok("(defmacro m (x ... rest) `(do ,@rest (+ ,x 1))) (defun main () -> i64 0)");
+    let p = ok("(defmacro m (x ... rest) `(do ~@rest (+ ~x 1))) (defun main () -> i64 0)");
     let m = p
         .globals
         .funs

@@ -28,7 +28,7 @@ const GENSYM: Scenario = Scenario {
     name: "gensym",
     source: "(defmacro with-temp (e body)
   (let ((g (gensym \"tmp\")))
-    `(let ((,g ,e)) ,body)))
+    `(let ((~g ~e)) ~body)))
 (defun main () -> i64 (do (with-temp 5 (+ 1 2)) (with-temp \"s\" (with-temp 1 2))))",
     wanted: "with-temp",
     calls: 3,
@@ -45,8 +45,8 @@ const REFLECTION: Scenario = Scenario {
 (defmacro describe (name)
   (let ((g (gensym \"d\")))
     (if (struct? name)
-        `(let ((,g ,(Int (vec-count (struct-fields name)) :i64))) (do ,@(struct-fields name) ,g))
-        `(quote ,name))))
+        `(let ((~g ~(Int (vec-count (struct-fields name)) :i64))) (do ~@(struct-fields name) ~g))
+        `(quote ~name))))
 (defun main () -> i64 (do (describe P) (describe Q) 0))",
     wanted: "describe",
     calls: 2,
@@ -64,7 +64,7 @@ fn a_reflection_error_ends_the_expansion_with_the_message_rust_gives() {
         ("not-a-symbol", "(fields-of 5)"),
     ] {
         let source = format!(
-            "(defmacro fields-of (name) `(quote ,(Vec (struct-fields name))))
+            "(defmacro fields-of (name) `(quote ~(Vec (struct-fields name))))
 (defun main () -> i64 (do {call} 0))"
         );
         let source: &'static str = Box::leak(source.into_boxed_str());
@@ -81,7 +81,7 @@ const REST: Scenario = Scenario {
     name: "rest",
     source: "(defmacro wrap-all (tag ... bodies)
   (let ((g (gensym \"w\")))
-    `(let ((,g ,tag)) (do ,@bodies ,g))))
+    `(let ((~g ~tag)) (do ~@bodies ~g))))
 (defun f () -> i64 1)
 (defun main () -> i64 (do (wrap-all 7 (f) (f) (f)) (wrap-all 8)))",
     wanted: "wrap-all",

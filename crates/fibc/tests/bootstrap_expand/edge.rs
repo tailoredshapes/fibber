@@ -47,7 +47,7 @@ fn deep() -> Vec<Input> {
         one("deep-do-900", &nest("(do ", ")", 900, "x")),
         one("deep-let-400", &nest("(let ((a x)) ", ")", 400, "a")),
         one("deep-match-300", &nest("(match x (_ ", "))", 300, "1")),
-        one("deep-quasiquote-150", &nest("`(a ", ")", 150, ",x")),
+        one("deep-quasiquote-150", &nest("`(a ", ")", 150, "~x")),
         one(
             "deep-and-700",
             &format!("(defun f (x) -> i64 (and {}))\n", operands(700)),
@@ -76,9 +76,9 @@ fn errors() -> Vec<Input> {
         one("in-out-outside-argument", "(defun f () -> i64 (& x))\n"),
         one("in-out-as-argument", "(defun f (x: i64) -> i64 (g (& x) (& nil)))\n"),
         one("unquote-outside", "(defun f () -> i64 (unquote x))\n"),
-        one("splice-outside", "(defun f () -> i64 `,@x)\n"),
-        one("splice-inside-list", "(defun f (xs) -> i64 `(a ,@xs b))\n"),
-        one("quasi-levels", "(defun f (x) -> i64 `(a `(b ,(c ,x) ,@(d ,@x))))\n"),
+        one("splice-outside", "(defun f () -> i64 `~@x)\n"),
+        one("splice-inside-list", "(defun f (xs) -> i64 `(a ~@xs b))\n"),
+        one("quasi-levels", "(defun f (x) -> i64 `(a `(b ~(c ~x) ~@(d ~@x))))\n"),
         one("thread-step", "(defun f (x) -> i64 (-> x 1))\n"),
         one("thread-first-last", "(defun f (x) -> i64 (+ (-> x (g 1) h) (->> x (g 1) h)))\n"),
         one("derive-protocol", "(defstruct P (a: i64))\n(derive Foo P)\n"),
@@ -108,9 +108,9 @@ fn macro_errors() -> Vec<Input> {
         one("macro-not-a-struct", "(defmacro nf (n) (Int (count (struct-fields n)) :i64))\n(defun main () -> i64 (nf Nope))\n"),
         one("macro-not-an-enum", "(defmacro nv (n) (Int (count (enum-variants n)) :i64))\n(defun main () -> i64 (nv Nope))\n"),
         one("macro-bad-reflection", "(defmacro nf (n) (Int (count (struct-fields (Int 1 :i64))) :i64))\n(defun main () -> i64 (nf P))\n"),
-        one("macro-splices-definitions", "(defmacro defrecord (name fields)\n  `(do (defstruct ,name ,fields) (derive Eq ,name)))\n(defrecord Point (x: i64 y: i64))\n(defun main () -> i64 (if (= (Point 1 2) (Point 1 2)) 1 0))\n"),
-        one("macro-shadows-prelude", "(defmacro when (c ... b) `(if ,c (do ,@b) 0))\n(defun main () -> i64 (when true 1 2))\n"),
-        one("macro-gensyms", "(defmacro keep (x) (let ((g (gensym \"k\"))) `(let ((,g ,x)) ,g)))\n(defun main () -> i64 (+ (keep 1) (keep 2)))\n"),
+        one("macro-splices-definitions", "(defmacro defrecord (name fields)\n  `(do (defstruct ~name ~fields) (derive Eq ~name)))\n(defrecord Point (x: i64 y: i64))\n(defun main () -> i64 (if (= (Point 1 2) (Point 1 2)) 1 0))\n"),
+        one("macro-shadows-prelude", "(defmacro when (c ... b) `(if ~c (do ~@b) 0))\n(defun main () -> i64 (when true 1 2))\n"),
+        one("macro-gensyms", "(defmacro keep (x) (let ((g (gensym \"k\"))) `(let ((~g ~x)) ~g)))\n(defun main () -> i64 (+ (keep 1) (keep 2)))\n"),
         one("macro-private-marker", "(defmacro hid :private (x) x)\n(defstruct S :private (a: i64))\n(defun main () -> i64 (hid 1))\n"),
     ]
 }
@@ -139,8 +139,8 @@ fn rewrites() -> Vec<Input> {
 /// Programs of several modules: the errors of loading and of macro
 /// lookup, the driver's order.
 fn modules() -> Vec<Input> {
-    let util = "(ns util)\n(defmacro twice (x) `(do ,x ,x))\n(defmacro hid :private (x) x)\n(defstruct PS :private (a: i64))\n(defstruct S (a: i64))\n";
-    let more = "(ns more)\n(defmacro twice (x) `(do ,x ,x ,x))\n";
+    let util = "(ns util)\n(defmacro twice (x) `(do ~x ~x))\n(defmacro hid :private (x) x)\n(defstruct PS :private (a: i64))\n(defstruct S (a: i64))\n";
+    let more = "(ns more)\n(defmacro twice (x) `(do ~x ~x ~x))\n";
     vec![
         program("ambiguous-macro", &[
             ("main.fib", "(ns main (:use util more))\n(defun main () -> i64 (twice 1))\n"),
@@ -178,7 +178,7 @@ fn modules() -> Vec<Input> {
             ("main.fib", "(ns main (:use left right))\n(defun main () -> i64 (twice 1))\n"),
             ("left.fib", "(ns left (:use shared))\n"),
             ("right.fib", "(ns right (:use shared))\n"),
-            ("shared.fib", "(ns shared)\n(defmacro twice (x) `(do ,x ,x))\n"),
+            ("shared.fib", "(ns shared)\n(defmacro twice (x) `(do ~x ~x))\n"),
         ]),
     ]
 }

@@ -81,7 +81,7 @@ pub enum ExpandErrorKind {
         /// `unquote` or `unquote-splicing`.
         head: &'static str,
     },
-    /// `,@e` whose value would have to stand for the whole template
+    /// `~@e` whose value would have to stand for the whole template
     /// rather than for items of a list, vector or map (§3.16).
     SpliceOutsideList,
     /// A core form, prelude macro or definition whose shape its grammar
