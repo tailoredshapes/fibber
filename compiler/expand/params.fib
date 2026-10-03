@@ -82,14 +82,24 @@
     ((SList items) (as-param items))
     (_ nil)))
 
-;; Splits a parameter list into plain items and pattern parameters. (`split`)
+;; Whether the item at `i` is the qualifier keyword `:borrow`.
+(defun borrow-at? :private (params: (Vec Stx) i: i64) -> bool
+  (and (< i (count params))
+       (match (. (nth params i) kind)
+         ((SKw k) (= k "borrow"))
+         (_ false))))
+
+;; Splits a parameter list into plain items and pattern parameters. A
+;; `:borrow` after a typed parameter's type is part of that parameter.
+;; (`split`)
 (defun split :private (params: (Vec Stx)) -> (Vec Param)
   (loop ((i 0) (out (vec-empty)))
     (if (>= i (count params))
         out
         (let ((p (nth params i)))
           (if (and (typed-name? p) (< (+ i 1) (count params)))
-              (recur (+ i 2) (conj out (PlainParam [p (nth params (+ i 1))])))
+              (let ((end (if (borrow-at? params (+ i 2)) (+ i 3) (+ i 2))))
+                (recur end (conj out (PlainParam (slice params i end)))))
               (recur (+ i 1) (conj out (match (pattern-param p)
                                          ((some pp) pp)
                                          (nil (PlainParam [p]))))))))))

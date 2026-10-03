@@ -35,17 +35,24 @@
     ((FacSeq) (. (. env module) seq))
     ((FacColl) (. (. env module) coll))))
 
-;; The bare name of `head` when it is the library's name of `facade`:
-;; written `fib.seq/base` it always is; bare, it is when the module sees
-;; the facade and the name is not bound by the form, defined by the module
-;; or exported by a non-library module it uses. (Env::library)
-(defun fuse-library :private (env: FuseEnv head: str facade: Facade) -> (Option str)
-  (let ((sp (fuse-split-head head)))
+;; The bare name of `head`, a call of `argc` arguments, when it is the
+;; library's name of `facade`: written `fib.seq/base` it always is; bare, it
+;; is when the module sees the facade and the name is not bound by the form,
+;; defined by the module or exported by a non-library module it uses. A
+;; clause-picked head (`map$2`) is the base name for the tables, but is also
+;; shadowed as written. (Env::library)
+(defun fuse-library (env: FuseEnv head: str argc: i64 facade: Facade) -> (Option str)
+  (let ((sp (fuse-base-head head argc)))
     (match (. sp facade)
       ((some q) (if (facade-same? q facade) (some (. sp base)) nil))
-      (nil (let ((free (and (not (fuse-has-name? (. env bound) (. sp base)))
-                            (not (fuse-has-name? (. (. env module) shadow) (. sp base))))))
-             (if (and free (fuse-sees env facade)) (some (. sp base)) nil))))))
+      (nil (if (and (fuse-sees env facade) (not (fuse-taken? env (. sp base))) (not (fuse-taken? env head)))
+               (some (. sp base))
+               nil)))))
+
+;; Whether `name` is bound by the form or is the module's own.
+(defun fuse-taken? :private (env: FuseEnv name: str) -> bool
+  (or (fuse-has-name? (. env bound) name)
+      (fuse-has-name? (. (. env module) shadow) name)))
 
 ;; The row of **T** this call is, if its head is the library's.
 ;; (Env::terminal_call)
@@ -53,12 +60,13 @@
   (match (fuse-item-sym items 0)
     (nil nil)
     ((some head)
-     (match (fuse-terminal (. (fuse-split-head head) base) (- (count items) 1))
-       (nil nil)
-       ((some row)
-        (match (fuse-library env head (. row facade))
-          (nil nil)
-          ((some _) (some row))))))))
+     (let ((argc (- (count items) 1)))
+       (match (fuse-terminal (. (fuse-base-head head argc) base) argc)
+         (nil nil)
+         ((some row)
+          (match (fuse-library env head argc (. row facade))
+            (nil nil)
+            ((some _) (some row)))))))))
 
 ;; Whether the evaluation of `form` has no effect and can move: a symbol,
 ;; a literal, or a `fn` form. (stage::atomic)
@@ -87,11 +95,11 @@
 
 ;; The row of **A** this call is, if its head is the library's, it has two
 ;; arguments and they are ones the rewrite can take. (Env::stage_call)
-(defun fuse-stage-call :private (env: FuseEnv items: (Vec Stx)) -> (Option FuseStage)
+(defun fuse-stage-call (env: FuseEnv items: (Vec Stx)) -> (Option FuseStage)
   (match (fuse-item-sym items 0)
     (nil nil)
     ((some head)
-     (match (fuse-library env head FacSeq)
+     (match (fuse-library env head (- (count items) 1) FacSeq)
        (nil nil)
        ((some base)
         (match (fuse-stage-named base)

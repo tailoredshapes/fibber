@@ -1,0 +1,79 @@
+;; compiler/tests/expand/unit-x9b.fib: the unit tests of the X9b port, each the Rust test of the same rule.
+;; SOURCE: params.rs `expand::tests::params::a_borrow_qualifier_after_the_type_is_part_of_its_parameter`;
+;; tables.rs `a_clause_picked_head_is_its_base_name`; tests::fuse `a_clause_picked_library_head_still_fuses`,
+;; `the_other_clause_of_a_library_head_is_not_a_stage`, `a_clause_head_of_the_modules_own_is_not_the_librarys`;
+;; scan.rs `a_terminal_call_is_seen_by_name_and_arity`.
+;; Build: fibc build compiler/tests/expand/unit-x9b.fib -I compiler -I lib -o OUT
+(ns main
+  (:use types.check syntax.pos syntax.form expand.build expand.params expand.fusetab expand.fusescan expand.fuse))
+
+(defun p0 () -> Pos (Pos "t" 1 1 0 0))
+(defun s (name: str) -> Stx (sym name (p0)))
+(defun kw (name: str) -> Stx (Stx (SKw name) (p0)))
+(defun lst (items: (Vec Stx)) -> Stx (list-form items (p0)))
+(defun names (xs: (Vec str)) -> (Map str bool)
+  (loop ((i 0) (m (map-empty)))
+    (if (< i (count xs)) (recur (+ i 1) (assoc m (nth xs i) true)) m)))
+
+;; A module that sees `fib.seq` and `fib.coll`, with `own` in its shadow set.
+(defun env-of (own: (Vec str)) -> FuseEnv
+  (FuseEnv (ModuleEnv (names own) true true true) (map-empty)))
+
+(defun head-is? (h: str argc: i64 facade: (Option Facade) base: str) -> bool
+  (let ((sp (fuse-base-head h argc)))
+    (and (= (. sp base) base)
+         (match (. sp facade)
+           ((some f) (match facade ((some g) (facade-same? f g)) (nil false)))
+           (nil (nil? facade))))))
+
+(defun call-of (head: str args: (Vec str)) -> (Vec Stx)
+  (loop ((i 0) (items [(s head)]))
+    (if (< i (count args)) (recur (+ i 1) (conj items (s (nth args i)))) items)))
+
+(defun terminal? (env: FuseEnv head: str args: (Vec str)) -> bool
+  (some? (fuse-terminal-call env (call-of head args))))
+
+(defun stage? (env: FuseEnv head: str) -> bool
+  (some? (fuse-stage-call env (call-of head ["f" "c"]))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (check cs "a :borrow after a typed parameter's type is part of it"
+             (and (= (arity [(s "f:") (lst [(s "fn") (lst [(s "a")]) (s "b")]) (kw "borrow") (s "x:") (s "a")]) 2)
+                  (= (arity [(s "x:") (s "a") (kw "borrow")]) 1)
+                  (= (arity [(s "x:") (s "a") (kw "borrow") (s "y:") (s "b")]) 2)))
+      (check cs "only :borrow is taken, and only after a type"
+             (and (= (arity [(s "x:") (s "a") (kw "other")]) 2)
+                  (= (arity [(s "x") (kw "borrow")]) 2)))
+      (check cs "a clause suffix of the call's count is taken off the head"
+             (and (head-is? "map$2" 2 nil "map")
+                  (head-is? "fib.seq/map$2" 2 (some FacSeq) "map")
+                  (head-is? "sort$1" 1 nil "sort")))
+      (check cs "another count's suffix, or none, leaves the head as it is"
+             (and (head-is? "map$3" 2 nil "map$3")
+                  (head-is? "map" 2 nil "map")
+                  (head-is? "$" 0 nil "$")))
+      (check cs "a head of multibyte characters is cut byte-wise, never inside one"
+             (and (head-is? "é$2" 2 nil "é")
+                  (head-is? "é" 1 nil "é")
+                  (head-is? "日本" 2 nil "日本")))
+      (check cs "a clause-picked library head still fuses"
+             (and (terminal? (env-of []) "sort$1" ["v"])
+                  (stage? (env-of []) "map$2")
+                  (stage? (env-of []) "fib.seq/map$2")))
+      (check cs "the other clause of a library head is not a stage or a terminal"
+             (and (not (stage? (env-of []) "map$3"))
+                  (not (terminal? (env-of []) "sort$2" ["a" "b"]))
+                  (terminal? (env-of []) "sort-by$2" ["a" "b"])))
+      (check cs "a clause head of the module's own is not the library's"
+             (and (not (stage? (env-of ["map$2"]) "map$2"))
+                  (not (terminal? (env-of ["sort$1"]) "sort$1" ["v"]))
+                  (not (stage? (env-of ["map"]) "map$2"))
+                  (stage? (env-of ["map$3"]) "map$2")))
+      (check cs "a terminal call is seen by name and arity"
+             (and (fuse-calls-a-terminal? (lst [(s "do") (lst [(s "sort$1") (s "v")])]))
+                  (fuse-calls-a-terminal? (lst [(s "count") (s "v")]))
+                  (not (fuse-calls-a-terminal? (lst [(s "sort$2") (s "a") (s "b")])))
+                  (not (fuse-calls-a-terminal? (lst [])))))
+      (finish cs))))

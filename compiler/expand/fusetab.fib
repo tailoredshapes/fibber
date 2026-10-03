@@ -75,6 +75,26 @@
         (starts-with? head "fib.coll/") (SplitHead (some FacColl) (str-slice head 9 (str-len head)))
         :else (SplitHead nil head)))
 
+;; `head` with a clause suffix of the call's own argument count taken off
+;; (the expander picked a clause: `map$2` for `(map f c)`), then split:
+;; `map$2` with 2 arguments is `(None, "map")`, `map$3` is left as it is.
+;; (tables::base_head)
+(defun fuse-base-head (head: str argc: i64) -> SplitHead
+  (let ((suffix (str-concat "$" (show argc))))
+    (fuse-split-head (if (ends-with-bytes? head suffix)
+                         (str-slice head 0 (- (str-len head) (str-len suffix)))
+                         head))))
+
+;; Whether the last bytes of `s` are the bytes of `suffix` (byte-wise: `s`
+;; may hold multibyte characters, and `suffix` is ASCII).
+(defun ends-with-bytes? :private (s: str suffix: str) -> bool
+  (let ((from (- (str-len s) (str-len suffix))))
+    (and (>= from 0)
+         (loop ((k 0))
+           (cond (>= k (str-len suffix)) true
+                 (= (str-byte-at s (+ from k)) (str-byte-at suffix k)) (recur (+ k 1))
+                 :else false)))))
+
 ;; The row of **T** for a call of `args` arguments by this bare name.
 ;; (tables::terminal)
 (defun fuse-terminal (name: str args: i64) -> (Option Terminal)
