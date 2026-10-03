@@ -22,6 +22,7 @@ for pair in "ownership:${LIMIT_OWNERSHIP:-400}" "modules:${LIMIT_MODULES:-120}" 
   code=$?
   echo "exit $code after $(( $(date +%s) - start ))s"
   tail -n 6 "$out/$name.txt"
+  awk '$1 ~ /\.fib$/ && NF >= 2 && $2 != "pass" && $2 != "OPEN"' "$out/$name.txt" | cut -c1-1500
   if [ "$code" -eq 124 ]; then echo "ci-stage2: $dir timed out"; bad=1; continue; fi
   total=$(sed -n 's/^\([0-9][0-9]*\) cases: .*/\1/p' "$out/$name.txt" | tail -n 1)
   if [ -z "$total" ] || [ "$total" -eq 0 ]; then echo "ci-stage2: $dir printed no case count (exit $code)"; tail -n 20 "$out/$name.err"; bad=1; continue; fi
