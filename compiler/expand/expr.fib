@@ -41,14 +41,17 @@
 ;;   (Rust's `(Role, Finish)` and the form beside them).
 (ns expand.expr
   (:require [expand.prelude :as prelude] [expand.quasi :as quasi] [expand.params :as params]
-            [expand.brackets :as brackets] [expand.overload :as overload])
+            [expand.brackets :as brackets] [expand.overload :as overload]
+            [expand.scope :as scope])
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx expand.core
         expand.build expand.heads expand.collections expand.fuse))
 
 ;; The state of one expansion: the context, the runner for user macros
 ;; and the current nesting depth; in the fusion walk, what it knows of the
-;; form it rewrites (`fuse`: nil in the first walk).
-(defstruct Expander (ctx: ExpandCtx runner: Runner depth: (Cell i64) fuse: (Option FuseEnv)))
+;; form it rewrites (`fuse`: nil in the first walk); the local names in scope at
+;; the form being walked (expand.scope; X9c).
+(defstruct Expander (ctx: ExpandCtx runner: Runner depth: (Cell i64) fuse: (Option FuseEnv)
+                     scope: (Cell (Vec str))))
 
 ;; What to do with a form after its items are walked (Rust `Finish`):
 ;; nothing; `nil` is `(Nil)`; `[..]` is a chain of `conj`; `{..}` is a
@@ -61,13 +64,13 @@
 
 ;; An expander at depth 0. (Expander::new)
 (defun expander-new (ctx: ExpandCtx runner: Runner) -> Expander
-  (Expander ctx runner (cell 0) nil))
+  (Expander ctx runner (cell 0) nil (cell (vec-empty))))
 
 ;; An expander for the fusion walk of one top-level form: the forms it
 ;; walks are expanded already, and it rewrites the chains in them.
 ;; (Expander::fusing)
 (defun expander-fusing (ctx: ExpandCtx runner: Runner env: FuseEnv) -> Expander
-  (Expander ctx runner (cell 0) (some env)))
+  (Expander ctx runner (cell 0) (some env) (cell (vec-empty))))
 
 ;; Enters one level of nesting, failing past the depth limit: TooDeep at
 ;; pos with the limit. (Expander::enter)
@@ -83,6 +86,18 @@
 (defun expander-leave (ex: Expander) -> unit
   (let ((depth @(. ex depth)))
     (set! (. ex depth) (if (> depth 0) (- depth 1) 0))))
+
+;; The number of local names in scope.
+(defun expander-scope-len (ex: Expander) -> i64
+  (count @(. ex scope)))
+
+;; Brings `names` into scope.
+(defun expander-scope-add (ex: Expander names: (Vec str)) -> unit
+  (set! (. ex scope) (scope/scope-push @(. ex scope) names)))
+
+;; Cuts the scope back to its first `n` names.
+(defun expander-scope-cut (ex: Expander n: i64) -> unit
+  (set! (. ex scope) (scope/scope-cut @(. ex scope) n)))
 
 ;; Whether the macro accepts n arguments. (MacroDef::accepts)
 (defun accepts? :private (def: MacroDef n: i64) -> bool
@@ -214,7 +229,7 @@
       ((some name)
        (match (head-step ex form name)
          ((Err e) (Err e))
-         ((Ok (Settled f)) (overload/overload-pick (. ex ctx) f))
+         ((Ok (Settled f)) (overload/overload-pick (. ex ctx) @(. ex scope) f))
          ((Ok (Respelled f)) (recur f))
          ((Ok (Rewrote f))
           (match (ctx-admit (. ex ctx) f (. form pos))
@@ -225,9 +240,9 @@
 ;; position except the operand at skip, which is left alone. (call_role)
 (defun call-role :private (skip: (Option i64)) -> Role
   (match skip
-    (nil (role-items [Expr] Arg))
+    (nil (role-items [CallHead] Arg))
     ((some at)
-     (role-items (loop ((first [Expr]))
+     (role-items (loop ((first [CallHead]))
                    (if (< (count first) at)
                        (recur (conj first Arg))
                        (conj first Keep)))
@@ -327,7 +342,19 @@
     ((some env) (plan-fuse env (. ex ctx) form role))
     (nil (match (expand-head ex form)
            ((Err e) (Err e))
-           ((Ok expanded) (plan expanded (arg-position-only? role)))))))
+           ((Ok expanded) (plan (value-form ex expanded role) (arg-position-only? role)))))))
+
+;; A bare name that is an overloaded function, in a position that is not a call's
+;; head, is its clause of the fewest parameters (X9c); any other form as it is.
+(defun value-form :private (ex: Expander form: Stx role: Role) -> Stx
+  (match (. form kind)
+    ((SSym s)
+     (match role
+       ((CallHead) form)
+       (_ (match (overload/overload-value (. ex ctx) @(. ex scope) s)
+            ((some head) (sym head (. form pos)))
+            (nil form)))))
+    (_ form)))
 
 ;; Whether the role is `Arg` itself (Rust: `*role == Role::Arg`).
 (defun arg-position-only? :private (role: Role) -> bool

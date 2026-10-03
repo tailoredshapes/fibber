@@ -43,7 +43,22 @@
   ;; normalise it as a pattern
   Pattern
   ;; walk its items: item i by the ith role, the rest by `rest`
-  (Items roles: (Vec Role) rest: Role))
+  (Items roles: (Vec Role) rest: Role)
+  ;; the head of a call: an expression, but a bare overloaded name there is
+  ;; the call's and not a value (X9c, expand.overload `overload-value`)
+  CallHead
+  ;; walk the items by `inner`, with the names of the parameter list at item
+  ;; `at` (and the symbols before it) in scope for all of them
+  (ScopeParams inner: Role at: i64)
+  ;; walk the items by `inner`; the names its bindings bring into scope go
+  ;; with it (a `let` or `loop`)
+  (ScopeRegion inner: Role)
+  ;; walk the items by `inner` (a binding `(pat expr)`); once all are walked
+  ;; the names of its first item are in scope for what follows in the parent
+  (ScopeBind inner: Role)
+  ;; walk the items by `inner` (a clause `(pat body)`); once the first is
+  ;; walked its names are in scope for the rest
+  (ScopeClause inner: Role))
 
 ;; `n` kept items, then every other item with `rest`. (Role::after)
 (defun role-after (n: i64 rest: Role) -> Role
@@ -84,7 +99,7 @@
   (let ((i (if (and (> (count items) 1) (some? (sym-name (nth items 1)))) 2 1)))
     (match (body-start name items i pos)
       ((Err e) (Err e))
-      ((Ok start) (Ok (role-after start Expr))))))
+      ((Ok start) (Ok (ScopeParams (role-after start Expr) i))))))
 
 ;; The name of a symbol form. (Form::as_sym)
 (defun sym-name :private (form: Stx) -> (Option str)
@@ -137,7 +152,7 @@
          (match (binding-roles head pairs)
            ((Err e) (Err e))
            ((Ok roles)
-            (Ok (role-items [Keep (role-items roles Keep)] Expr))))))))
+            (Ok (ScopeRegion (role-items [Keep (role-items roles Keep)] Expr)))))))))
 
 ;; The role of each binding, or the first malformed one.
 (defun binding-roles :private (head: str pairs: (Vec Stx)) -> (Result (Vec Role) ExpandError)
@@ -154,9 +169,9 @@
   (let ((parts (unwrap-or (list-items pair) (vec-empty))))
     (cond
       (and (some? (list-items pair)) (= (count parts) 2))
-       (Ok (role-items [Pattern Expr] Keep))
+       (Ok (ScopeBind (role-items [Pattern Expr] Keep)))
       (and (= (count parts) 3) (annotated-name (nth parts 0)))
-       (Ok (role-items [Keep Keep Expr] Keep))
+       (Ok (ScopeBind (role-items [Keep Keep Expr] Keep)))
       true (Err (malformed-error head
                    "a binding is (pattern expression) or (name: type expression)"
                    (. pair pos))))))
@@ -176,7 +191,7 @@
       (Err (malformed-error "match" "expected a scrutinee and clauses" pos))
       (match (bad-clause items 2)
         ((some clause) (Err (malformed-error "match" "a clause is (pattern body+)" (. clause pos))))
-        (nil (Ok (role-items [Keep Expr] (role-items [Pattern] Expr)))))))
+        (nil (Ok (role-items [Keep Expr] (ScopeClause (role-items [Pattern] Expr))))))))
 
 ;; The first clause from `i` that is not a list of two items or more.
 (defun bad-clause :private (items: (Vec Stx) i: i64) -> (Option Stx)

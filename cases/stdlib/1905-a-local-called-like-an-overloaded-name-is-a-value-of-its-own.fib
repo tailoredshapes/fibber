@@ -1,0 +1,21 @@
+;; spec:   stdlib §7 L1 (a name a form binds is not the clause set), expander scope
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; covers: defn
+;; A local named `pick` that is passed on as a value stays the local (its type is its own, not
+;; `pick$1`'s), and a `match` clause's variable does not outlive its clause: the second clause
+;; of the `match` below calls the overloaded function (it is not reached, and must still be picked).
+(defn pick
+  ([a: i64] -> i64 (* a 10))
+  ([a: i64 b: i64] -> i64 (+ a b)))
+
+(defun twice (f: (fn (i64 i64) i64) x: i64) -> i64 (f x x))
+
+(defun main () -> i64
+  (let ((v (let ((pick (fn (a: i64 b: i64) -> i64 (* a b)))) (twice pick 6)))
+        (w (match (some 3)
+             ((some pick) (+ pick 1))
+             (nil (pick 2 3)))))
+    (if (= v 36) (if (= w 4) 0 2) 1)))

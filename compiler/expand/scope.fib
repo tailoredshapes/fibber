@@ -1,0 +1,101 @@
+;; compiler/expand/scope.fib: the local names a form in the walk can see (X9c).
+;; The arity pick of expand.overload leaves a call alone, and a bare name is no
+;; value of a clause set, when the name is bound by an enclosing `fn`, `let`,
+;; `loop`, `match` clause or definition: `(let ((get (nth c 1))) (get))` calls
+;; the local. The walk (expand.walk) keeps the names in a `(Cell (Vec str))`:
+;; a frame that binds records the length when it opens, pushes what it binds
+;; at the point the binding takes effect, and cuts back to the length when it
+;; closes. This module is the pure part: which names a parameter list, a
+;; pattern or a binding introduces, and the vector's push and cut.
+;;
+;; Over-approximation is the rule: a name that is not a binder but is taken for
+;; one (a type, a constructor in a deeper position) only stops an overloaded
+;; library name of that spelling from being picked, and the types and
+;; constructors are not library function names.
+(ns expand.scope (:use syntax.pos syntax.form))
+
+;; Whether the symbol ends in a colon: `x:`, the name of a typed binding.
+(defun colon-name? :private (s: str) -> bool
+  (and (> (str-len s) 1)
+       (= (str-slice s (- (str-len s) 1) (str-len s)) ":")))
+
+(defun without-colon :private (s: str) -> str
+  (str-slice s 0 (- (str-len s) 1)))
+
+(defun items-in :private (form: Stx) -> (Vec Stx)
+  (match (. form kind)
+    ((SList items) items)
+    ((SVec items) items)
+    (_ (vec-empty))))
+
+;; The names of a parameter list `(a b: T c: T :borrow & r)`: a symbol is a
+;; name unless it follows a typed name (it is the type), is `&` or ends in `:`
+;; (then the name without the colon is it).
+(defun param-names :private (items: (Vec Stx)) -> (Vec str)
+  (loop ((i 0) (typed false) (out (vec-empty)))
+    (if (< i (count items))
+        (match (. (nth items i) kind)
+          ((SSym s)
+           (cond typed (recur (+ i 1) false out)
+                 (colon-name? s) (recur (+ i 1) true (conj out (without-colon s)))
+                 (= s "&") (recur (+ i 1) false out)
+                 :else (recur (+ i 1) false (conj out s))))
+          (_ (recur (+ i 1) false out)))
+        out)))
+
+;; The names of `(head ... (params) ...)` with the parameter list at `at`:
+;; the symbols between the head and the list (a `fn`'s own name) and the
+;; parameters. Nothing when the item at `at` is not a list.
+(defun scope-param-names (form: Stx at: i64) -> (Vec str)
+  (let ((items (items-in form)))
+    (if (and (< at (count items)) (> at 0))
+        (loop ((i 1) (out (vec-empty)))
+          (if (< i at)
+              (match (. (nth items i) kind)
+                ((SSym s) (recur (+ i 1) (conj out s)))
+                (_ (recur (+ i 1) out)))
+              (concat-names out (param-names (items-in (nth items at))))))
+        (vec-empty))))
+
+(defun concat-names :private (a: (Vec str) b: (Vec str)) -> (Vec str)
+  (loop ((i 0) (acc a))
+    (if (< i (count b)) (recur (+ i 1) (conj acc (nth b i))) acc)))
+
+;; Every symbol of a pattern that can bind: the head of a list is a
+;; constructor and not one.
+(defun scope-pattern-names (form: Stx) -> (Vec str)
+  (match (. form kind)
+    ((SSym s) (if (= s "_") (vec-empty) [s]))
+    ((SList items) (items-names items 1 (vec-empty)))
+    ((SVec items) (items-names items 0 (vec-empty)))
+    (_ (vec-empty))))
+
+(defun items-names :private (items: (Vec Stx) from: i64 out: (Vec str)) -> (Vec str)
+  (loop ((i from) (acc out))
+    (if (< i (count items))
+        (recur (+ i 1) (concat-names acc (scope-pattern-names (nth items i))))
+        acc)))
+
+;; The names a binding `(pat expr)` or `(x: T expr)` has, from its first item.
+(defun scope-binding-names (first: Stx) -> (Vec str)
+  (match (. first kind)
+    ((SSym s) (if (colon-name? s) [(without-colon s)] (scope-pattern-names first)))
+    (_ (scope-pattern-names first))))
+
+;; The names with `more` after them.
+(defun scope-push (names: (Vec str) more: (Vec str)) -> (Vec str)
+  (concat-names names more))
+
+;; The first `n` of the names.
+(defun scope-cut (names: (Vec str) n: i64) -> (Vec str)
+  (if (<= (count names) n)
+      names
+      (loop ((i 0) (acc (vec-empty)))
+        (if (< i n) (recur (+ i 1) (conj acc (nth names i))) acc))))
+
+;; Whether `name` is one of the names.
+(defun scope-has? (names: (Vec str) name: str) -> bool
+  (loop ((i 0))
+    (cond (>= i (count names)) false
+          (= (nth names i) name) true
+          :else (recur (+ i 1)))))

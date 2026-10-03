@@ -17,7 +17,7 @@
 ;; repeat; the methods of the context are functions taking it
 ;; (`overload-in`, `overload-of`, `pick-clause`, `note-clause`).
 (ns expand.overload
-  (:require [expand.params :as params])
+  (:require [expand.params :as params] [expand.scope :as scope])
   (:use syntax.pos syntax.form expand.error expand.types expand.build expand.ctx
         expand.prelude.parts))
 
@@ -379,19 +379,44 @@
                                      pos)))))))
 
 ;; `form`, a call, with its head replaced by the clause its argument count
-;; picks; `(gensym)` is `(gensym "G__")`. (`pick`)
-(defun overload-pick (ctx: ExpandCtx form: Stx) -> (Result Stx ExpandError)
+;; picks; `(gensym)` is `(gensym "G__")`. `scope` holds the local names in
+;; scope (expand.scope): a bare head that is one is the local's call and is
+;; left alone, as is any call of a name that is no overloaded function. (`pick`)
+(defun overload-pick (ctx: ExpandCtx scope: (Vec str) form: Stx) -> (Result Stx ExpandError)
   (match (head-name form)
     (nil (Ok form))
     ((some name)
-     (let ((items (unwrap-or (items-of form) (vec-empty)))
-           (pos (. form pos))
-           (argc (- (count (unwrap-or (items-of form) (vec-empty))) 1)))
-       (if (and (= name "gensym") (= argc 0) (not (some? (map-get @(. ctx own) "gensym"))))
-           (Ok (Stx (SList (conj items (string "G__" pos))) pos))
-           (match (pick-clause ctx name argc pos)
-             ((Err e) (Err e))
-             ((Ok nil) (Ok form))
-             ((Ok (some head))
-              (Ok (Stx (SList (concat-forms [(sym head (. (nth items 0) pos))] (tail-from items 1)))
-                       pos)))))))))
+     (if (and (= (slash-at name) -1) (scope/scope-has? scope name))
+         (Ok form)
+         (pick-call ctx name form)))))
+
+(defun pick-call :private (ctx: ExpandCtx name: str form: Stx) -> (Result Stx ExpandError)
+  (let ((items (unwrap-or (items-of form) (vec-empty)))
+        (pos (. form pos))
+        (argc (- (count (unwrap-or (items-of form) (vec-empty))) 1)))
+    (if (and (= name "gensym") (= argc 0) (not (some? (map-get @(. ctx own) "gensym"))))
+        (Ok (Stx (SList (conj items (string "G__" pos))) pos))
+        (match (pick-clause ctx name argc pos)
+          ((Err e) (Err e))
+          ((Ok nil) (Ok form))
+          ((Ok (some head))
+           (Ok (Stx (SList (concat-forms [(sym head (. (nth items 0) pos))] (tail-from items 1)))
+                    pos)))))))
+
+;; The name a bare overloaded function stands for as a value, `(let ((r range)) (r 2))`
+;; (X9c): the clause with the fewest parameters, `range$1`, or nil when the name is a
+;; local in scope, is no overloaded function, or its smallest arity is a protocol
+;; method's (then the name is the method). The type of such a value is the clause's.
+(defun overload-value (ctx: ExpandCtx scope: (Vec str) name: str) -> (Option str)
+  (if (and (= (slash-at name) -1) (scope/scope-has? scope name))
+      nil
+      (match (overload-of ctx name)
+        (nil nil)
+        ((some r) (value-clause r)))))
+
+(defun value-clause :private (r: Reach) -> (Option str)
+  (let ((clauses (. (. r overload) clauses))
+        (methods (. (. r overload) methods)))
+    (cond (= (count clauses) 0) nil
+          (and (> (count methods) 0) (< (nth methods 0) (nth clauses 0))) nil
+          :else (some (str-join [(. r qualifier) (clause-name (. r base) (nth clauses 0))])))))

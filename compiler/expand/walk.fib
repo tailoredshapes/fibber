@@ -24,19 +24,26 @@
 ;; - `Result<Form, ExpandError>` is `(Result Stx ExpandError)`; the
 ;;   Rust `&mut Expander` is the one `Expander` of expand.expr.
 (ns expand.walk
+  (:require [expand.scope :as scope])
   (:use syntax.pos syntax.form expand.error expand.core expand.expr))
 
 ;; Which kind of form a frame rebuilds from its walked items (Rust's
 ;; `Rebuild`, a function pointer to `FormKind::List`, `Vec` or `Map`).
 (defenum Shape ShList ShVec ShMap)
 
+;; When a frame brings names into scope for its parent or itself (X9c): never,
+;; after its first item is walked (a match clause), or when it closes (a binding).
+(defenum After AfterNone AfterItem AfterClose)
+
 ;; One form whose items are being walked: where it was, how it is
 ;; rebuilt, its items and the index of the next to look at, the items
 ;; walked so far, the role of its items, how to finish it and whether
-;; it was entered (counted against max-depth, so left when done).
+;; it was entered (counted against max-depth, so left when done); the
+;; number of local names in scope when it opened, which it cuts back to
+;; when it closes, and when it adds names.
 (defstruct WalkFrame
   (pos: Pos shape: Shape items: (Vec Stx) next: i64 done: (Vec Stx)
-   role: Role finish: Finish entered: bool))
+   role: Role finish: Finish entered: bool mark: i64 after: After))
 
 ;; The frames that wait for the form being walked, the innermost first
 ;; (Rust's `Vec<Frame>`: a Vec has no pop here, so a chain of frames).
@@ -67,18 +74,36 @@
     ((Items roles rest) (if (< i (count roles)) (nth roles i) rest))
     (_ role)))
 
-;; The frame with value walked: its next item's turn.
-(defun resume :private (frame: WalkFrame value: Stx) -> WalkFrame
-  (WalkFrame (. frame pos) (. frame shape) (. frame items) (. frame next)
-         (conj (. frame done) value) (. frame role) (. frame finish) (. frame entered)))
+;; The frame with value walked: its next item's turn. A match clause's
+;; pattern has its names in scope for the rest of the clause.
+(defun resume :private (ex: Expander frame: WalkFrame value: Stx) -> WalkFrame
+  (do (match (. frame after)
+        ((AfterItem) (if (= (count (. frame done)) 0)
+                         (expander-scope-add ex (scope/scope-pattern-names value))
+                         ()))
+        (_ ()))
+      (WalkFrame (. frame pos) (. frame shape) (. frame items) (. frame next)
+                 (conj (. frame done) value) (. frame role) (. frame finish) (. frame entered)
+                 (. frame mark) (. frame after))))
 
 ;; Leaves the level a form entered, if it did. (the `if entered` of Rust)
 (defun leave-if :private (ex: Expander entered: bool) -> unit
   (if entered (expander-leave ex) ()))
 
+;; Cuts the scope back to where the frame opened; a binding then brings its names
+;; into scope for the frames after it in its parent.
+(defun leave-scope :private (ex: Expander frame: WalkFrame) -> unit
+  (do (if (>= (. frame mark) 0) (expander-scope-cut ex (. frame mark)) ())
+      (match (. frame after)
+        ((AfterClose) (if (> (count (. frame done)) 0)
+                          (expander-scope-add ex (scope/scope-binding-names (nth (. frame done) 0)))
+                          ()))
+        (_ ()))))
+
 ;; The frame done at its last item: rebuilt, finished, handed down.
 (defun close :private (ex: Expander frame: WalkFrame stack: Stack) -> Move
   (do (leave-if ex (. frame entered))
+      (leave-scope ex frame)
       (Move (Done (finish-form (Stx (rebuild (. frame shape) (. frame done)) (. frame pos))
                                (. frame finish)))
             stack)))
@@ -97,10 +122,12 @@
               ((Keep) (recur (+ i 1) (conj done item)))
               (_ (Move (Todo item role)
                        (Open (WalkFrame (. frame pos) (. frame shape) items (+ i 1) done
-                                    (. frame role) (. frame finish) (. frame entered))
+                                    (. frame role) (. frame finish) (. frame entered)
+                                    (. frame mark) (. frame after))
                              stack)))))
           (close ex (WalkFrame (. frame pos) (. frame shape) items n done
-                           (. frame role) (. frame finish) (. frame entered))
+                           (. frame role) (. frame finish) (. frame entered)
+                           (. frame mark) (. frame after))
                  stack)))))
 
 ;; A form with no items to walk: left if it was entered, finished.
@@ -109,21 +136,45 @@
       (Move (Done (finish-form form finish)) stack)))
 
 ;; Opens a frame to walk the items of form by role, or finishes a form
-;; that has no items to walk. (open)
+;; that has no items to walk. A role that brings names into scope (X9c) is
+;; looked through: its frame notes where the scope was and when it adds names.
+;; (open)
 (defun open :private (ex: Expander form: Stx role: Role finish: Finish entered: bool
                       stack: Stack) -> Move
+  (match role
+    ((ScopeParams inner at)
+     (open-items ex form inner finish entered stack AfterNone (scope/scope-param-names form at)
+                 (expander-scope-len ex)))
+    ((ScopeRegion inner)
+     (open-items ex form inner finish entered stack AfterNone (vec-empty) (expander-scope-len ex)))
+    ((ScopeBind inner)
+     (open-items ex form inner finish entered stack AfterClose (vec-empty) (expander-scope-len ex)))
+    ((ScopeClause inner)
+     (open-items ex form inner finish entered stack AfterItem (vec-empty) (expander-scope-len ex)))
+    (_ (open-items ex form role finish entered stack AfterNone (vec-empty) -1))))
+
+(defun open-items :private (ex: Expander form: Stx role: Role finish: Finish entered: bool
+                            stack: Stack after: After names: (Vec str) mark: i64) -> Move
   (let ((pos (. form pos)))
     (match role
       ((Items _ _)
        (match (. form kind)
          ((SList items)
-          (advance ex (WalkFrame pos ShList items 0 (vec-empty) role finish entered) stack))
+          (open-frame ex (WalkFrame pos ShList items 0 (vec-empty) role finish entered mark after)
+                      names stack))
          ((SVec items)
-          (advance ex (WalkFrame pos ShVec items 0 (vec-empty) role finish entered) stack))
+          (open-frame ex (WalkFrame pos ShVec items 0 (vec-empty) role finish entered mark after)
+                      names stack))
          ((SMap items)
-          (advance ex (WalkFrame pos ShMap items 0 (vec-empty) role finish entered) stack))
+          (open-frame ex (WalkFrame pos ShMap items 0 (vec-empty) role finish entered mark after)
+                      names stack))
          (_ (settle ex form finish entered stack))))
       (_ (settle ex form finish entered stack)))))
+
+;; Brings the names of a form's frame into scope and starts it.
+(defun open-frame :private (ex: Expander frame: WalkFrame names: (Vec str) stack: Stack) -> Move
+  (do (expander-scope-add ex names)
+      (advance ex frame stack)))
 
 ;; A pattern: the symbol `nil` becomes `(Nil)`; braces are an error; the
 ;; items of a list or of a vector pattern (§1.4, §3.6) are patterns.
@@ -155,11 +206,16 @@
     ((Expr) (start-expr ex form role stack))
     ((Arg) (start-expr ex form role stack))
     ((Fuse) (start-expr ex form role stack))
+    ((CallHead) (start-expr ex form role stack))
     ((Pattern)
      (match (expander-enter ex (. form pos))
        ((Err e) (Err e))
        ((Ok _) (pattern ex form stack))))
-    ((Items _ _) (Ok (open ex form role FinSame false stack)))))
+    ((Items _ _) (Ok (open ex form role FinSame false stack)))
+    ((ScopeParams _ _) (Ok (open ex form role FinSame false stack)))
+    ((ScopeRegion _) (Ok (open ex form role FinSame false stack)))
+    ((ScopeBind _) (Ok (open ex form role FinSame false stack)))
+    ((ScopeClause _) (Ok (open ex form role FinSame false stack)))))
 
 ;; Walks form by role: returns the form with every operand the role names
 ;; expanded, or the first error. The stack of open frames is explicit, so
@@ -176,7 +232,7 @@
        (match stack
          ((Bottom) (Ok value))
          ((Open frame below)
-          (let ((m (advance ex (resume frame value) below)))
+          (let ((m (advance ex (resume ex frame value) below)))
             (recur (. m step) (. m stack)))))))))
 
 ;; Expands a form in expression position: `walk` with the role Expr.
