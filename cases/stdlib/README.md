@@ -251,7 +251,7 @@ A test that cannot fail is worse than none.
 
 ## The cases of Z0 (tranche 2)
 
-* 1000 (`open-`, L14) `(:k x)`: a keyword in call position reads a field of a struct and the value of a
+* 1000 (L14, flipped by X6; its accept and reject cases are 1601-1612) `(:k x)`: a keyword in call position reads a field of a struct and the value of a
   `(Map keyword v)`, and `(map :age ps)` takes the keyword where a function is expected. This is the
   keyword half of S2; case 901 keeps the collections (`(m k)`, `(v i)`).
 

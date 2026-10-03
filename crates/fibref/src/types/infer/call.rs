@@ -258,6 +258,9 @@ impl Cx<'_> {
                 return self.apply(e, sig, args);
             }
         }
+        if let Some(t) = self.keyword_call(head, args)? {
+            return Ok(t);
+        }
         let ht = self.infer(head)?;
         let params: Vec<Ty> = args.iter().map(|_| self.st.fresh()).collect();
         let ret = self.fresh();
@@ -309,6 +312,9 @@ impl Cx<'_> {
                             self.record(x.id, &v);
                             lits.push(v.clone());
                             v
+                        }
+                        ExprKind::Lit(Lit::Keyword(k)) if self.expects_fn(&sig.params[i]) => {
+                            self.keyword_fn(x, k)
                         }
                         _ => self.infer(x)?,
                     };

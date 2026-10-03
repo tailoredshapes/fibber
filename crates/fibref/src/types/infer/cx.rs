@@ -66,6 +66,18 @@ pub struct Tables {
     /// The colour of every `fn` literal (`Send`, `Local`, or a
     /// quantified `Gen` of the enclosing scheme).
     pub fn_colours: HashMap<ExprId, Colour>,
+    /// Every keyword that is a function (stdlib §7 L14): what it reads,
+    /// for `elab`, which makes it the field read or the `map-get`.
+    pub kw_sites: HashMap<ExprId, KwSite>,
+}
+
+/// What a keyword in function position reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KwSite {
+    /// A field of a struct: `(. x k)`.
+    Field,
+    /// A key of a `(Map keyword v)`: `(map-get x :k)`.
+    Map,
 }
 
 /// A deferred constraint (§3.3) with where it came from.
@@ -100,6 +112,10 @@ pub enum DKind {
     Deref(Ty, Ty, String),
     /// `T` is a float type (the operand of `fptrunc` and the like).
     Float(Ty),
+    /// A keyword `k` used as a function (stdlib §7 L14) at `site`: of
+    /// the argument `S` (a struct with the field, or a `(Map keyword v)`),
+    /// with the result `R`; the default's type, for `(:k x d)`.
+    Keyword(ExprId, Ty, String, Ty, Option<Ty>),
     /// `[p..]` against a scrutinee `T` whose type is not known yet, the
     /// element patterns having the given types: a `Pair` or `Triple`
     /// gives each its field, anything else is a `(Vec a)` of them all

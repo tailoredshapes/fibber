@@ -14,7 +14,7 @@ use super::cx::{ColourCon, Cx, DKind, Deferred, Resolution};
 use super::send::{send_error, send_eval};
 
 /// What one attempt did.
-enum Step {
+pub(super) enum Step {
     /// Solved; these constraints replace it.
     Done(Vec<Deferred>),
     /// Not decidable yet.
@@ -54,6 +54,7 @@ impl Cx<'_> {
             DKind::Weakable(t) => self.solve_weakable(d, t),
             DKind::Field(t, f, r, _) => self.solve_field(d, t, f, r),
             DKind::Deref(t, r, _) => self.solve_deref(d, t, r),
+            DKind::Keyword(site, s, k, r, dflt) => self.solve_keyword(d, *site, s, k, r, dflt),
             DKind::VecPat(s, parts) => match self.st.resolve(s) {
                 Ty::Var(_) => Ok(Step::Stuck),
                 _ => self

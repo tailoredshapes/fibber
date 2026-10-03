@@ -10,6 +10,7 @@ mod deps;
 mod exhaust;
 mod expr;
 mod general;
+mod keyword;
 mod pattern;
 mod polyrec;
 mod scc;
@@ -30,7 +31,7 @@ use crate::types::store::Store;
 use crate::types::ty::{Colour, Ty};
 
 use cx::{Cx, Unit};
-pub use cx::{Env, Instantiation, Resolution, Tables};
+pub use cx::{Env, Instantiation, KwSite, Resolution, Tables};
 use deps::{refs, sccs, Node};
 
 /// One unit as it was checked, in order.

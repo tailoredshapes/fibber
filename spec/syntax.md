@@ -627,6 +627,16 @@ value: a borrow derived from `expr` for objects, a copy for scalars. A
 argument of `set!`. There is no field place: `&` takes a variable, never
 a `(. x field)` form (§3.13; **Decided**, D1).
 
+**A keyword as a function** (stdlib §7 L14). `(:k x)` is `(. x k)` when `x`
+is a struct with the field `k`, and `(map-get x :k)`, an `Option`, when `x`
+is a `(Map keyword v)`; `(:k x d)` is that `Option`'s payload or `d`, and
+only a map has one. A keyword where a `(fn (S) R)` is expected, as in
+`(map :age ps)`, is `(fn (x) (:k x))`. Which one is decided by the checker
+once `S` is known (types: `Tables::kw_sites`) and the elaboration after
+inference writes the plain form, so no later pass sees a keyword call. A
+keyword that names no field, or over a type that is neither a struct nor a
+`(Map keyword v)`, is a type error quoting the type and the keyword.
+
 ### 3.9 `defenum`
 
 ```

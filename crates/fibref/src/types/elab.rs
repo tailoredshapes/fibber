@@ -11,11 +11,13 @@
 
 use crate::syntax::Pos;
 
+mod kw;
+
 use super::ast::{
     Arg, BindingId, BindingInfo, BindingKind, Clause, Expr, ExprId, ExprKind, GlobalRef, Lit,
     PatKind, Pattern, Place,
 };
-use super::decls::Globals;
+use super::decls::{Globals, ModuleId};
 use super::infer::{Instantiation, Tables};
 use super::ty::{Colour, Con, Scalar, Ty};
 
@@ -98,12 +100,19 @@ impl Elab<'_> {
     }
 
     fn expr(&mut self, e: &mut Expr) {
+        if self.keyword_call(e) {
+            return;
+        }
         children_mut(e, &mut |c| self.expr(c));
         let kind = std::mem::replace(&mut e.kind, ExprKind::Lit(Lit::Unit));
         e.kind = match kind {
             ExprKind::If(c, t, f) => {
                 let c = self.test(*c);
                 ExprKind::If(Box::new(c), t, f)
+            }
+            ExprKind::Lit(Lit::Keyword(k)) if self.t.kw_sites.contains_key(&e.id) => {
+                let site = self.t.kw_sites[&e.id];
+                self.keyword_fn(e, &k, site)
             }
             ExprKind::Guarded(cs) => self.guarded(e, cs),
             ExprKind::And(ops) => self.and(e, ops),

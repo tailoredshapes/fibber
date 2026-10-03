@@ -263,6 +263,10 @@ impl Cx<'_> {
                     ErrorKind::DerefUnresolved,
                     format!("cannot infer whether {text} is a cell, an atom, a weak reference or a task"),
                 ),
+                DKind::Keyword(_, _, k, _, _) => (
+                    ErrorKind::FieldUnresolved,
+                    format!("cannot infer the type of the argument of :{k}; annotate it"),
+                ),
                 DKind::Float(t) => (
                     ErrorKind::Ambiguous,
                     format!(
