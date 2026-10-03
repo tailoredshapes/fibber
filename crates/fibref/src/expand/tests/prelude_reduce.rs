@@ -128,12 +128,12 @@ fn every_tail_is_found_through_the_forms_a_body_nests() {
     assert_eq!(
         ex("(reduce (fn (a x) (when-let (v (f x)) (if-let (w v) (reduced w) a))) 0 c)"),
         "(fib.seq/reduce-while (fn (a x) (match (f x) ((fib.prelude/some v) \
-         (match v ((fib.prelude/some w) (fib.core/Done w)) (_ (fib.core/More a)))) \
-         (_ ()))) 0 c)"
+         (if true (match v ((fib.prelude/some w) (fib.core/Done w)) (_ (fib.core/More a))))) \
+         (_ (fib.prelude/elide)))) 0 c)"
     );
     assert_eq!(
         ex("(reduce (fn (a x) (g) (unless p (reduced a))) 0 c)"),
-        "(fib.seq/reduce-while (fn (a x) (g) (if p () (fib.core/Done a))) 0 c)"
+        "(fib.seq/reduce-while (fn (a x) (g) (if (fib.prelude/not p) (fib.core/Done a))) 0 c)"
     );
 }
 
@@ -194,7 +194,7 @@ fn what_is_not_the_shape_is_declined() {
 fn a_declined_call_still_has_its_arguments_expanded() {
     assert_eq!(
         ex("(reduce f (when a b) (and c d))"),
-        "(reduce f (if a b ()) (if c d false))"
+        "(reduce f (if a b) (and c d))"
     );
 }
 
@@ -256,7 +256,7 @@ fn a_form_without_its_parts_is_one_value_and_the_core_form_reports_it() {
         malformed("fn", "missing body")
     );
     assert_eq!(
-        ex_err("(reduce (fn (a x) (if p (reduced a))) 0 c)").kind,
+        ex_err("(reduce (fn (a x) (if p (reduced a) 1 2)) 0 c)").kind,
         malformed("if", "wrong number of operands")
     );
     assert_eq!(

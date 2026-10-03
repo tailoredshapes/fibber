@@ -126,7 +126,7 @@ fn merge_skips_a_literal_nil_operand() {
 fn the_operands_are_expanded() {
     assert_eq!(
         ex("(conj (when a b) (and c d) e)"),
-        "(fib.coll/conj (fib.coll/conj (if a b ()) (if c d false)) e)"
+        "(fib.coll/conj (fib.coll/conj (if a b) (and c d)) e)"
     );
 }
 
@@ -165,6 +165,6 @@ fn swap_of_two_arguments_or_fewer_is_declined() {
 fn the_extra_arguments_are_expanded_inside_the_closure() {
     assert_eq!(
         ex("(swap! a f (when p q))"),
-        "(fib.prelude/swap! a (fn (#v.1) (f #v.1 (if p q ()))))"
+        "(fib.prelude/swap! a (fn (#v.1) (f #v.1 (if p q))))"
     );
 }

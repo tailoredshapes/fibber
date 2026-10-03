@@ -228,7 +228,7 @@ fn eq_all(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
     match tests.len() {
         0 => boolean(true, pos),
         1 => tests.pop().unwrap_or_else(|| boolean(true, pos)),
-        _ => call(&prelude_name("and"), tests, pos),
+        _ => call("and", tests, pos),
     }
 }
 
@@ -242,8 +242,8 @@ fn lex_less(pairs: Vec<(Form, Form)>, pos: &Pos) -> Form {
             None => less,
             Some(rest) => {
                 let equal = call(&prelude_name("="), vec![a, b], pos);
-                let same = call(&prelude_name("and"), vec![equal, rest], pos);
-                call(&prelude_name("or"), vec![less, same], pos)
+                let same = call("and", vec![equal, rest], pos);
+                call("or", vec![less, same], pos)
             }
         });
     }

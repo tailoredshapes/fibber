@@ -1,7 +1,7 @@
 //! What the head of a list form means to the expander (§4.2, §4.3).
 
-/// The twenty-three core forms of §4.2.
-pub const CORE_FORMS: [&str; 23] = [
+/// The twenty-five core forms of §4.2 (`and` and `or` since stdlib §7 L20).
+pub const CORE_FORMS: [&str; 25] = [
     "defun",
     "def",
     "fn",
@@ -25,6 +25,8 @@ pub const CORE_FORMS: [&str; 23] = [
     "defmacro",
     "ns",
     "var",
+    "and",
+    "or",
 ];
 
 /// The core forms that §2 admits only at top level.

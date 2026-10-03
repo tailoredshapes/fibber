@@ -54,7 +54,7 @@ fn a_prefix_that_matches_no_case_is_exit_2_and_names_the_prefix() {
 
 #[test]
 fn an_open_case_is_listed_with_its_item_and_is_not_a_failure() {
-    let out = fibref(&["cases", "cases/stdlib", "--only", "900-"]);
+    let out = fibref(&["cases", "cases/stdlib", "--only", "1501-"]);
     let stdout = text(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{stdout}");
     assert!(stdout.contains("OPEN"), "{stdout}");

@@ -117,7 +117,7 @@ fn shape(form: &Form) -> Shape {
     };
     let head = items.first().and_then(Form::as_sym).unwrap_or("");
     match (head, items.len()) {
-        ("if" | "if-let", 4) => Shape::From(2),
+        ("if", 3 | 4) | ("if-let", 4) => Shape::From(2),
         ("do", 2..) | ("let" | "loop" | "when" | "unless" | "when-let", 3..) => Shape::Last,
         ("match", 3..) => Shape::Clauses(2),
         ("cond", 2..) => Shape::Flat(1),

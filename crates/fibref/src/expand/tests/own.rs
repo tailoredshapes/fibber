@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use super::read;
-use crate::expand::{expand_program, ExpandCtx, ExpandError, ExpandErrorKind as K, NoRunner};
+use crate::expand::{expand_program, ExpandCtx, ExpandError, NoRunner};
 use crate::syntax::Form;
 
 /// Expands the program `src` as the module `main` (a user module: not the
@@ -63,7 +63,7 @@ fn a_defun_of_the_same_name_makes_the_call_an_ordinary_call() {
 
 #[test]
 fn without_the_definition_the_macro_still_expands() {
-    assert_eq!(body("(defun other (a) a)", "(when x y)"), "(if x y ())");
+    assert_eq!(body("(defun other (a) a)", "(when x y)"), "(if x y)");
     assert_eq!(
         body("", "(update m k f x)"),
         "(fib.coll/update m k (fn (#v.1) (f #v.1 x)))"
@@ -100,9 +100,9 @@ fn a_definition_below_the_use_hides_the_macro_there_too() {
 fn only_a_definition_of_the_module_counts_not_a_binding() {
     assert_eq!(
         body("", "(let ((when 1)) (when x y))"),
-        "(let ((when 1)) (if x y ()))"
+        "(let ((when 1)) (if x y))"
     );
-    assert_eq!(body("(defun f (when) when)", "(when x y)"), "(if x y ())");
+    assert_eq!(body("(defun f (when) when)", "(when x y)"), "(if x y)");
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn the_names_a_program_module_exports_hide_the_macro_in_the_module_that_uses_it(
     let main = read("(defun m () (str x y)) (defun n () (when x y))");
     let out = expand_program(main, &mut ctx, &mut NoRunner).expect("main expands");
     assert_eq!(out[0].to_string(), "(defun m () (str x y))");
-    assert_eq!(out[1].to_string(), "(defun n () (if x y ()))");
+    assert_eq!(out[1].to_string(), "(defun n () (if x y))");
     ctx.end_module();
     // a module that does not use util has the macro, and so has the next one
     ctx.begin_module("other", (&[], &[]), HashMap::new());
@@ -167,13 +167,8 @@ fn a_macro_of_an_implicit_module_beats_a_macro_of_the_prelude_and_a_used_one_bea
 
 #[test]
 fn a_qualified_prelude_head_is_the_prelude_macro_whatever_the_module_defines() {
-    let defs = "(defun when (a b) a) (defun and (a b) a) (defun str (a) a)";
-    assert_eq!(body(defs, "(fib.prelude/when x y)"), "(if x y ())");
-    assert_eq!(
-        body(defs, "(fib.prelude/and x y z)"),
-        "(if x (if y z false) false)"
-    );
-    assert_eq!(body(defs, "(fib.prelude/or x y)"), "(if x true y)");
+    let defs = "(defun when (a b) a) (defun str (a) a)";
+    assert_eq!(body(defs, "(fib.prelude/when x y)"), "(if x y)");
     assert_eq!(body(defs, "(fib.prelude/str x)"), "(fib.core/to-str x)");
     assert_eq!(body(defs, "(str x)"), "(str x)");
 }
@@ -229,19 +224,16 @@ fn a_qualified_call_that_is_declined_is_not_a_step() {
 }
 
 #[test]
-fn a_user_macro_named_like_a_prelude_one_does_not_capture_the_preludes_own_heads() {
-    let defs = "(defmacro and (a b) a) (defmacro or (a b) b)";
-    // the folds, `and` and `or` of the prelude and `derive` write fib.prelude/and
+fn the_folds_write_the_core_and_which_a_user_macro_cannot_be_named() {
+    // `and` and `or` are core forms (stdlib §7 L20): the folds and `derive` write them bare,
+    // and a module cannot define a macro of the name, so there is nothing to capture.
     assert_eq!(
-        body(defs, "(< a b c)"),
-        "(if (fib.prelude/< a b) (fib.prelude/< b c) false)"
+        body("", "(< a b c)"),
+        "(and (fib.prelude/< a b) (fib.prelude/< b c))"
     );
-    assert_eq!(
-        body(defs, "(fib.prelude/and x y z)"),
-        "(if x (if y z false) false)"
+    let err = program("(defmacro and (a b) a)").expect_err("a core form");
+    assert!(
+        err.to_string().contains("cannot redefine core form and"),
+        "{err:?}"
     );
-    // the user's own `and` is still the user's macro in the user's module
-    let src = format!("{defs} (defun m () (and x y))");
-    let err = program(&src).expect_err("the user's macro needs the evaluator");
-    assert!(matches!(err.kind, K::MacroNeedsEvaluator { .. }), "{err:?}");
 }

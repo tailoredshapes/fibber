@@ -31,6 +31,7 @@ pub mod ast;
 pub mod builtins;
 pub mod decls;
 pub mod display;
+mod elab;
 pub mod error;
 pub mod infer;
 pub mod init;
@@ -241,7 +242,7 @@ fn add_linked(
 /// Steps 4–7 of §3.5 on a lowered program; with `main`, requires `main
 /// : (fn () i64)`. Same stack requirement as [`lower_program`].
 pub fn infer_lowered(l: Lowered, main: bool) -> Result<TypedProgram, Vec<TypeError>> {
-    let g = l.globals;
+    let mut g = l.globals;
     let (env, tables, units) = {
         let mut ck = Checker::new(&g);
         ck.module(&l.prelude);
@@ -256,6 +257,8 @@ pub fn infer_lowered(l: Lowered, main: bool) -> Result<TypedProgram, Vec<TypeErr
         }
         (ck.env, ck.t, ck.order)
     };
+    let mut tables = tables;
+    elab::elaborate(&mut g, &mut tables);
     Ok(TypedProgram::new(g, env, tables, units))
 }
 

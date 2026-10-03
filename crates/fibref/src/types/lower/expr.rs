@@ -116,6 +116,8 @@ impl Lowerer<'_> {
         let pos = &form.pos;
         match head {
             "if" => self.if_form(items, form, tail),
+            "and" | "or" => self.and_or(items, form, head == "and"),
+            "fib.prelude/elide" if items.len() == 1 => Ok(self.mk(pos, ExprKind::Elided)),
             "do" => self.body_or_unit(&items[1..], form, tail),
             "let" => self.let_form(items, form, tail),
             "loop" => self.loop_form(items, form, tail),
@@ -163,10 +165,13 @@ impl Lowerer<'_> {
     }
 
     fn if_form(&mut self, items: &[Form], form: &Form, tail: bool) -> TResult<Expr> {
+        if items.len() == 3 || (items.len() == 4 && ends_one_armed(&items[3])) {
+            return self.guarded(items, form, tail);
+        }
         let [_, c, t, e] = items else {
             return Err(TypeError::resolve(
                 &form.pos,
-                "if takes a test and two branches",
+                "if takes a test and one or two branches",
             ));
         };
         let c = self.expr(c, false)?;
@@ -176,6 +181,40 @@ impl Lowerer<'_> {
             &form.pos,
             ExprKind::If(Box::new(c), Box::new(t), Box::new(e)),
         ))
+    }
+
+    /// A one-armed `if`, or a chain of `if`s whose last is one-armed (the
+    /// expansion of a `cond` without a default): `(test body)` pairs
+    /// (stdlib §7 L20).
+    fn guarded(&mut self, items: &[Form], form: &Form, tail: bool) -> TResult<Expr> {
+        let mut clauses = Vec::new();
+        let mut cur = items;
+        loop {
+            let test = self.expr(&cur[1], false)?;
+            let body = self.expr(&cur[2], tail)?;
+            clauses.push((test, body));
+            match cur.get(3).and_then(Form::as_list) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        Ok(self.mk(&form.pos, ExprKind::Guarded(clauses)))
+    }
+
+    /// `(and a ..)` and `(or a ..)` (stdlib §7 L20): no operand is the
+    /// identity, one is itself.
+    fn and_or(&mut self, items: &[Form], form: &Form, is_and: bool) -> TResult<Expr> {
+        let mut ops = Vec::new();
+        for f in &items[1..] {
+            ops.push(self.expr(f, false)?);
+        }
+        let kind = match ops.len() {
+            0 => ExprKind::Lit(Lit::Bool(is_and)),
+            1 => return Ok(ops.remove(0)),
+            _ if is_and => ExprKind::And(ops),
+            _ => ExprKind::Or(ops),
+        };
+        Ok(self.mk(&form.pos, kind))
     }
 
     fn let_form(&mut self, items: &[Form], form: &Form, tail: bool) -> TResult<Expr> {
@@ -396,5 +435,21 @@ impl Lowerer<'_> {
             &form.pos,
             ExprKind::Field(Box::new(e), field.to_string(), text),
         ))
+    }
+}
+
+/// Whether `f` is an `if` whose last else is a one-armed `if`: a link of
+/// the chain `cond` without a default expands to (stdlib §7 L20).
+fn ends_one_armed(f: &Form) -> bool {
+    let Some(items) = f.as_list() else {
+        return false;
+    };
+    if items.first().and_then(Form::as_sym) != Some("if") {
+        return false;
+    }
+    match items.len() {
+        3 => true,
+        4 => ends_one_armed(&items[3]),
+        _ => false,
     }
 }

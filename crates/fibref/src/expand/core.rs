@@ -56,6 +56,7 @@ pub(crate) fn expr_plan(name: &str, items: &[Form], pos: &Pos) -> Result<Role, E
     };
     match name {
         "quote" | "var" => exact(2).map(|_| Keep),
+        "if" if items.len() == 3 => Ok(Role::after(1, Expr)),
         "if" => exact(4).map(|_| Role::after(1, Expr)),
         "await" => exact(2).map(|_| Role::after(1, Expr)),
         "." => exact(3).map(|_| Role::items(vec![Keep, Expr], Keep)),

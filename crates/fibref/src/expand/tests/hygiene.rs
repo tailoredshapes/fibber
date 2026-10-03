@@ -23,8 +23,6 @@ const SAMPLES: &[(&str, &str)] = &[
     ("when", "(defun m () (when a b c))"),
     ("unless", "(defun m () (unless a b c))"),
     ("cond", "(defun m () (cond a b c d))"),
-    ("and", "(defun m () (and a b c))"),
-    ("or", "(defun m () (or a b c))"),
     ("if-let", "(defun m () (if-let (x a) b c))"),
     ("when-let", "(defun m () (when-let (x a) b c))"),
     ("list", "(defun m () (list a b))"),

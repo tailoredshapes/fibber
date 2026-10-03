@@ -60,10 +60,7 @@ fn a_test_of_any_other_type_is_the_plain_mismatch() {
         "(defun main () -> i64 (if (do) 2 3))",
         "cannot unify unit with bool",
     );
-    unify(
-        "(defun main () -> i64 (if (some 1) 2 3))",
-        "cannot unify (Option i64) with bool",
-    );
+    // (an Option is a test since L20: case 900)
     unify(
         "(defun main () -> i64 (if [1] 2 3))",
         "cannot unify (Vec i64) with bool",

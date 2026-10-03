@@ -15,6 +15,7 @@ mod polyrec;
 mod scc;
 mod send;
 mod solve;
+mod truthy;
 mod unify;
 mod units;
 

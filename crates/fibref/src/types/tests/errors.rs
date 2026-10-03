@@ -197,9 +197,9 @@ fn cannot_unify() {
     // A test that is not a bool: a primitive says why (D1, `conditions.rs`),
     // anything else is the plain mismatch.
     fails(
-        "(defun main () -> i64 (if (some 1) 2 3))",
+        "(defun main () -> i64 (if [1] 2 3))",
         K::Unify,
-        "cannot unify (Option i64) with bool",
+        "cannot unify (Vec i64) with bool",
     );
     // §2.10: set! on an atom.
     fails(

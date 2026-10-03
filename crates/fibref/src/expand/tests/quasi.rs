@@ -120,7 +120,7 @@ fn after_expansion_vectors_are_library_calls() {
 
 #[test]
 fn unquote_operands_are_expanded() {
-    let x = v(&["(if p q false)"]);
+    let x = v(&["(and p q)"]);
     assert_eq!(
         ex("`(~(and p q))"),
         format!("(fib.prelude/List (fib.prelude/concat {x}))")

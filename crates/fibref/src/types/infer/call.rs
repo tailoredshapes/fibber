@@ -1,10 +1,10 @@
 //! Globals and calls (spec/types.md §2.1, §2.2): instantiating schemes,
 //! `&` positions, constants that are not functions, annotations.
 
-use crate::syntax::Pos;
+use crate::syntax::{IntWidth, Pos};
 
 use crate::types::annot::{ann_to_ty, RigidEnv};
-use crate::types::ast::{Arg, Expr, ExprId, ExprKind, GlobalRef, TypeAnn};
+use crate::types::ast::{Arg, Expr, ExprId, ExprKind, GlobalRef, Lit, TypeAnn};
 use crate::types::decls::{ModuleId, Shape};
 use crate::types::error::{ErrorKind, TResult, TypeError};
 use crate::types::scheme::{ColourBound, Scheme};
@@ -291,6 +291,7 @@ impl Cx<'_> {
             );
             return Err(TypeError::other(&e.pos, msg));
         }
+        let mut lits: Vec<Ty> = Vec::new();
         for (i, a) in args.iter().enumerate() {
             let pname = sig
                 .names
@@ -299,7 +300,18 @@ impl Cx<'_> {
                 .unwrap_or_else(|| (i + 1).to_string());
             match (a, sig.amps[i]) {
                 (Arg::Expr(x), false) => {
-                    let t = self.infer(x)?;
+                    let t = match &x.kind {
+                        // An integer literal in an argument position
+                        // adopts a float type it unifies with (L19);
+                        // else it is `i64`, below.
+                        ExprKind::Lit(Lit::Int(n, IntWidth::I64)) => {
+                            let v = self.st.fresh_lit(*n);
+                            self.record(x.id, &v);
+                            lits.push(v.clone());
+                            v
+                        }
+                        _ => self.infer(x)?,
+                    };
                     self.flow(&t, &sig.params[i], &x.pos)?;
                 }
                 (Arg::Amp(b, pos), true) => {
@@ -319,6 +331,15 @@ impl Cx<'_> {
                     let msg = format!("parameter {pname} of {} is not &; pass x", sig.name);
                     return Err(TypeError::new(ErrorKind::AmpPosition, pos, msg));
                 }
+            }
+        }
+        if !lits.is_empty() && !self.u.deferred.is_empty() {
+            // What the arguments determine (`Reducible c e`) comes first.
+            self.solve_all()?;
+        }
+        for v in lits {
+            if matches!(self.st.resolve(&v), Ty::Var(_)) {
+                self.unify(&v, &Ty::i64(), &e.pos)?;
             }
         }
         Ok(sig.ret)

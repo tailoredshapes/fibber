@@ -65,6 +65,9 @@ impl Walker<'_> {
                 Mode::Scalar
             }
             ExprKind::Concat(es) => self.concat(e, es),
+            ExprKind::Guarded(_) | ExprKind::And(_) | ExprKind::Or(_) | ExprKind::Elided => {
+                Mode::Scalar
+            }
         }
     }
 

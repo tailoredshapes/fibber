@@ -233,6 +233,20 @@ pub enum ExprKind {
     /// `(concat v..)`, the variadic `(Vec a)` concatenation the
     /// quasiquote rewrite emits (syntax §3.16).
     Concat(Vec<Expr>),
+    /// The one-armed `if` and the chain of one-armed `if`s that
+    /// `(cond ..)` without a default expands to, `(test body)` pairs
+    /// tried in order: unit when the bodies are, else `(Option T)` with
+    /// `some` around the value (stdlib §7 L20). Elaborated away after
+    /// inference (`elab`): no later pass sees it.
+    Guarded(Vec<(Expr, Expr)>),
+    /// `(and a b ..)`, two or more operands: typed by the last, tests
+    /// `bool` or `(Option T)` (L20). Elaborated away.
+    And(Vec<Expr>),
+    /// `(or a b ..)`, two or more operands (L20). Elaborated away.
+    Or(Vec<Expr>),
+    /// `(fib.prelude/elide)`: the absent arm of the `when-let` match,
+    /// `()` or `nil` as the other arm's type says. Elaborated away.
+    Elided,
 }
 
 /// A `match` clause: `(pat body+)` or `(pat :when guard body+)`
@@ -328,7 +342,18 @@ impl Expr {
     /// Calls `f` on every direct sub-expression.
     pub fn children(&self, f: &mut dyn FnMut(&Expr)) {
         match &self.kind {
-            ExprKind::Lit(_) | ExprKind::Local(_) | ExprKind::Global(_) | ExprKind::Quote(_) => {}
+            ExprKind::Lit(_)
+            | ExprKind::Local(_)
+            | ExprKind::Global(_)
+            | ExprKind::Quote(_)
+            | ExprKind::Elided => {}
+            ExprKind::Guarded(cs) => {
+                for (t, b) in cs {
+                    f(t);
+                    f(b);
+                }
+            }
+            ExprKind::And(es) | ExprKind::Or(es) => es.iter().for_each(f),
             ExprKind::Call(h, args) => {
                 f(h);
                 for a in args {

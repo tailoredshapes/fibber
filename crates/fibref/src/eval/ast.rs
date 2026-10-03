@@ -9,6 +9,7 @@ pub fn children(e: &Expr) -> Vec<&Expr> {
         ExprKind::Lit(_) | ExprKind::Local(_) | ExprKind::Global(_) | ExprKind::Quote(_) => {
             Vec::new()
         }
+        ExprKind::Guarded(_) | ExprKind::And(_) | ExprKind::Or(_) | ExprKind::Elided => Vec::new(),
         ExprKind::Call(h, args) => std::iter::once(h.as_ref())
             .chain(args.iter().filter_map(|a| match a {
                 Arg::Expr(x) => Some(x),

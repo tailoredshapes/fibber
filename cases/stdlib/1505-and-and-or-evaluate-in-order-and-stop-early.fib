@@ -1,0 +1,33 @@
+;; spec:   stdlib §4.2 (rows and, or), §7 L20
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  support
+;; covers: and or
+;; `and` stops at the first falsy operand and `or` at the first truthy one, over bool and
+;; Option operands alike, and the operands run left to right: each one adds its digit
+;; to a trace cell, so the trace says which ran.
+(ns main (:use tl.check))
+
+(defun step (trace: (Cell i64) digit: i64 v: bool) -> bool
+  (do (set! trace (+ (* @trace 10) digit))
+      v))
+
+(defun step-opt (trace: (Cell i64) digit: i64 v: (Option i64)) -> (Option i64)
+  (do (set! trace (+ (* @trace 10) digit))
+      v))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (t1 (cell 0)) (t2 (cell 0)) (t3 (cell 0)) (t4 (cell 0)))
+    (do (check c (not (and (step t1 1 true) (step t1 2 false) (step t1 3 true))))
+        (check c (= @t1 12))
+        (check c (or (step t2 1 false) (step t2 2 true) (step t2 3 true)))
+        (check c (= @t2 12))
+        (check c (= (or (step-opt t3 1 nil) (step-opt t3 2 (some 5)) (step-opt t3 3 (some 9)))
+                    (some 5)))
+        (check c (= @t3 12))
+        (check c (= (and (step t4 1 true) (step-opt t4 2 (some 7))) (some 7)))
+        (check c (= (or (step-opt t4 3 nil) (some 4)) (some 4)))
+        (check c (= @t4 123))
+        (checks-result c))))

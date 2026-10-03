@@ -167,6 +167,9 @@ pub(super) fn expr_kind(g: &Globals, e: &Expr) -> String {
         }
         ExprKind::Convert(op, to, _) => format!("convert {} {}", conv_text(*op), to.name()),
         ExprKind::Concat(es) => format!("concat {}", es.len()),
+        ExprKind::Guarded(_) | ExprKind::And(_) | ExprKind::Or(_) | ExprKind::Elided => {
+            "unelaborated".into()
+        }
     }
 }
 

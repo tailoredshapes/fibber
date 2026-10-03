@@ -51,6 +51,7 @@ pub(super) fn children_of(e: &Expr) -> Vec<&Expr> {
     let mut out: Vec<&Expr> = Vec::new();
     match &e.kind {
         ExprKind::Lit(_) | ExprKind::Local(_) | ExprKind::Global(_) | ExprKind::Quote(_) => {}
+        ExprKind::Guarded(_) | ExprKind::And(_) | ExprKind::Or(_) | ExprKind::Elided => {}
         ExprKind::Call(h, args) => {
             out.push(h);
             out.extend(args.iter().filter_map(|a| match a {

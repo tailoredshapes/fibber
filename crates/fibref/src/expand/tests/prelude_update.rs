@@ -45,7 +45,7 @@ fn a_call_the_library_function_serves_is_declined() {
 fn a_declined_call_still_has_its_arguments_expanded() {
     assert_eq!(
         ex("(update (when a b) k (and c d))"),
-        "(update (if a b ()) k (if c d false))"
+        "(update (if a b) k (and c d))"
     );
 }
 
@@ -66,7 +66,7 @@ fn only_a_fnil_with_one_function_and_one_default_is_routed() {
 fn the_arguments_are_expanded_inside_the_closure() {
     assert_eq!(
         ex("(update m k f (when a b))"),
-        "(fib.coll/update m k (fn (#v.1) (f #v.1 (if a b ()))))"
+        "(fib.coll/update m k (fn (#v.1) (f #v.1 (if a b))))"
     );
 }
 

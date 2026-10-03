@@ -100,9 +100,10 @@ fn float_bit_casts_are_functions_of_fixed_widths() {
     assert_eq!(binding_type(&p, "b"), "f64");
     assert_eq!(binding_type(&p, "c"), "i32");
     assert_eq!(binding_type(&p, "d"), "f32");
-    // Numbers never widen: each cast takes exactly its own width.
+    // Numbers never widen: each cast takes exactly its own width (a literal argument
+    // adopts a float type, stdlib §7 L19; a variable never does).
     fails(
-        "(defun main () -> i64 (do (f64->bits 1) 0))",
+        "(defun main () -> i64 (let ((n 1)) (do (f64->bits n) 0)))",
         K::Unify,
         "cannot unify i64 with f64",
     );

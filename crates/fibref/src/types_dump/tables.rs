@@ -109,6 +109,7 @@ fn walk_clause(c: &crate::types::ast::Clause, d: usize, f: Visit<'_>) {
 fn walk_children(e: &Expr, d: usize, f: Visit<'_>) {
     match &e.kind {
         ExprKind::Lit(_) | ExprKind::Local(_) | ExprKind::Global(_) | ExprKind::Quote(_) => {}
+        ExprKind::Guarded(_) | ExprKind::And(_) | ExprKind::Or(_) | ExprKind::Elided => {}
         ExprKind::Call(head, args) => {
             walk(head, d, f);
             for a in args {

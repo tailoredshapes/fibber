@@ -95,16 +95,16 @@ fn a_comparison_of_nothing_is_declined() {
 fn a_chain_of_simple_operands_is_an_and_of_the_pairs() {
     assert_eq!(
         ex("(< a b c)"),
-        "(if (fib.prelude/< a b) (fib.prelude/< b c) false)"
+        "(and (fib.prelude/< a b) (fib.prelude/< b c))"
     );
     assert_eq!(
         ex("(<= 1 x 10 y)"),
-        "(if (fib.prelude/<= 1 x) (if (fib.prelude/<= x 10) (fib.prelude/<= 10 y) false) false)"
+        "(and (fib.prelude/<= 1 x) (fib.prelude/<= x 10) (fib.prelude/<= 10 y))"
     );
     for op in [">", ">=", "="] {
         assert_eq!(
             ex(&format!("({op} a b c)")),
-            format!("(if (fib.prelude/{op} a b) (fib.prelude/{op} b c) false)")
+            format!("(and (fib.prelude/{op} a b) (fib.prelude/{op} b c))")
         );
     }
 }
@@ -113,12 +113,12 @@ fn a_chain_of_simple_operands_is_an_and_of_the_pairs() {
 fn a_field_path_is_simple_and_a_call_is_bound_once_in_order() {
     assert_eq!(
         ex("(= (. p n) (. q n) r)"),
-        "(if (fib.prelude/= (. p n) (. q n)) (fib.prelude/= (. q n) r) false)"
+        "(and (fib.prelude/= (. p n) (. q n)) (fib.prelude/= (. q n) r))"
     );
     assert_eq!(
         ex("(< a (f x) c (g y))"),
-        "(let ((#cmp.1 (f x)) (#cmp.2 (g y))) (if (fib.prelude/< a #cmp.1) \
-         (if (fib.prelude/< #cmp.1 c) (fib.prelude/< c #cmp.2) false) false))"
+        "(let ((#cmp.1 (f x)) (#cmp.2 (g y))) (and (fib.prelude/< a #cmp.1) \
+         (fib.prelude/< #cmp.1 c) (fib.prelude/< c #cmp.2)))"
     );
 }
 
@@ -127,11 +127,11 @@ fn a_literal_collection_and_a_call_inside_a_path_are_not_simple() {
     assert_eq!(
         ex("(= [1] a b)"),
         "(let ((#cmp.1 (fib.prelude/vec-conj (fib.prelude/vec-empty) 1))) \
-         (if (fib.prelude/= #cmp.1 a) (fib.prelude/= a b) false))"
+         (and (fib.prelude/= #cmp.1 a) (fib.prelude/= a b)))"
     );
     assert_eq!(
         ex("(< (. (f x) n) a b)"),
-        "(let ((#cmp.1 (. (f x) n))) (if (fib.prelude/< #cmp.1 a) (fib.prelude/< a b) false))"
+        "(let ((#cmp.1 (. (f x) n))) (and (fib.prelude/< #cmp.1 a) (fib.prelude/< a b)))"
     );
 }
 
@@ -139,12 +139,12 @@ fn a_literal_collection_and_a_call_inside_a_path_are_not_simple() {
 fn the_operands_of_every_form_are_expanded() {
     assert_eq!(
         ex("(+ (+ a b c) (when p q) 1)"),
-        "(fib.prelude/+ (fib.prelude/+ (fib.prelude/+ (fib.prelude/+ a b) c) (if p q ())) 1)"
+        "(fib.prelude/+ (fib.prelude/+ (fib.prelude/+ (fib.prelude/+ a b) c) (if p q)) 1)"
     );
     assert_eq!(
         ex("(< (+ a b c) x y)"),
         "(let ((#cmp.1 (fib.prelude/+ (fib.prelude/+ a b) c))) \
-         (if (fib.prelude/< #cmp.1 x) (fib.prelude/< x y) false))"
+         (and (fib.prelude/< #cmp.1 x) (fib.prelude/< x y)))"
     );
 }
 

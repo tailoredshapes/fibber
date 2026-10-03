@@ -6,20 +6,18 @@ use crate::expand::error::ExpandErrorKind as K;
 
 #[test]
 fn when_and_unless() {
-    assert_eq!(ex("(when c x)"), "(if c x ())");
-    assert_eq!(ex("(when c x y)"), "(if c (do x y) ())");
-    assert_eq!(ex("(when c)"), "(if c (do) ())");
-    assert_eq!(ex("(unless c x y)"), "(if c () (do x y))");
+    assert_eq!(ex("(when c x)"), "(if c x)");
+    assert_eq!(ex("(when c x y)"), "(if c (do x y))");
+    assert_eq!(ex("(when c)"), "(if c (do))");
+    assert_eq!(ex("(unless c x y)"), "(if (fib.prelude/not c) (do x y))");
 }
 
 #[test]
 fn and_or() {
-    assert_eq!(ex("(and)"), "true");
-    assert_eq!(ex("(and a)"), "a");
-    assert_eq!(ex("(and a b c)"), "(if a (if b c false) false)");
-    assert_eq!(ex("(or)"), "false");
-    assert_eq!(ex("(or a)"), "a");
-    assert_eq!(ex("(or a b c)"), "(if a true (if b true c))");
+    // Core forms (stdlib §7 L20): the expander passes them through.
+    assert_eq!(ex("(and)"), "(and)");
+    assert_eq!(ex("(and a b c)"), "(and a b c)");
+    assert_eq!(ex("(or a (and b c))"), "(or a (and b c))");
 }
 
 #[test]
@@ -30,23 +28,17 @@ fn cond_is_flat_nests_ifs_and_traps_when_nothing_matches() {
     );
     // Any keyword is a test that is always true.
     assert_eq!(ex("(cond a 1 :default 4)"), "(if a 1 4)");
-    assert_eq!(
-        ex("(cond a 1)"),
-        "(if a 1 (fib.prelude/trap \"cond: no clause matched at t.fib:1:1\"))"
-    );
-    assert_eq!(
-        ex("(cond)"),
-        "(fib.prelude/trap \"cond: no clause matched at t.fib:1:1\")"
-    );
+    // Without a default the last `if` is one-armed (stdlib §7 L20); a `true` test is a default.
+    assert_eq!(ex("(cond a 1)"), "(if a 1)");
+    assert_eq!(ex("(cond a 1 b 2)"), "(if a 1 (if b 2))");
+    assert_eq!(ex("(cond a 1 true 2)"), "(if a 1 2)");
+    assert_eq!(ex("(cond)"), "()");
 }
 
 #[test]
 fn cond_has_no_special_symbol_else() {
     // `else` is a variable like any other: a test, not the default.
-    assert_eq!(
-        ex("(cond a 1 else 4)"),
-        "(if a 1 (if else 4 (fib.prelude/trap \"cond: no clause matched at t.fib:1:1\")))"
-    );
+    assert_eq!(ex("(cond a 1 else 4)"), "(if a 1 (if else 4))");
 }
 
 #[test]
@@ -76,7 +68,7 @@ fn if_let_and_when_let_are_match() {
     );
     assert_eq!(
         ex("(when-let (x e) a b)"),
-        "(match e ((fib.prelude/some x) (do a b)) (_ ()))"
+        "(match e ((fib.prelude/some x) (if true (do a b))) (_ (fib.prelude/elide)))"
     );
     let e = ex_err("(if-let x a b)");
     assert!(matches!(e.kind, K::Malformed { ref head, .. } if head == "if-let"));
@@ -96,7 +88,7 @@ fn if_let_takes_any_pattern_and_has_an_optional_else() {
     );
     assert_eq!(
         ex("(when-let ([a & r] o) a)"),
-        "(match o ((fib.prelude/some [a & r]) a) (_ ()))"
+        "(match o ((fib.prelude/some [a & r]) (if true a)) (_ (fib.prelude/elide)))"
     );
     // The else may be left out: it is `()`.
     assert_eq!(
@@ -280,7 +272,7 @@ fn dbg_evaluates_once_prints_with_show_and_returns_the_value() {
 fn expansions_are_expanded_again() {
     assert_eq!(
         ex("(when (and a b) [x])"),
-        format!("(if (if a b false) {} ())", v(&["x"]))
+        format!("(if (and a b) {})", v(&["x"]))
     );
 }
 
@@ -322,7 +314,7 @@ fn if_let_builds_every_part_at_the_call_and_keeps_the_input_forms_where_they_wer
 fn when_let_builds_every_part_at_the_call_and_keeps_the_input_forms_where_they_were() {
     assert_eq!(
         ex_at("(g\n  (when-let (x e) a b))"),
-        "(g@1:2 (match@2:3 e@2:16 ((fib.prelude/some@2:3 x@2:14)@2:3 (do@2:3 a@2:19 b@2:21)@2:3)@2:3 (_@2:3 ()@2:3)@2:3)@2:3)@1:1"
+        "(g@1:2 (match@2:3 e@2:16 ((fib.prelude/some@2:3 x@2:14)@2:3 (if@2:3 true@2:3 (do@2:3 a@2:19 b@2:21)@2:3)@2:3)@2:3 (_@2:3 (fib.prelude/elide@2:3)@2:3)@2:3)@2:3)@1:1"
     );
 }
 
@@ -349,7 +341,7 @@ fn the_binding_of_if_let_and_when_let_is_exactly_a_pattern_and_an_expression() {
 fn when_let_needs_a_binding_and_no_body_and_if_let_needs_a_then() {
     assert_eq!(
         ex("(when-let (x e))"),
-        "(match e ((fib.prelude/some x) (do)) (_ ()))"
+        "(match e ((fib.prelude/some x) (if true (do))) (_ (fib.prelude/elide)))"
     );
     assert_eq!(
         ex_err("(when-let)").kind,

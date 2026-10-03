@@ -57,8 +57,13 @@ D3; consistent with lIR's no-promotion rule, liar ADR 017 is out).
 
 An integer literal has the width of its suffix, `i64` without one; a
 float literal `f64` unless suffixed `f32`. There is no literal
-polymorphism (**Decided**, D3: no defaulting search): `(+ x 1)` pins
-`x : i64`; `(+ x 1i32)` pins `i32`.
+polymorphism over the integer widths (**Decided**, D3: no defaulting search): `(+ x 1)` pins
+`x : i64`; `(+ x 1i32)` pins `i32`. One exception (stdlib §7 L19, **Decided**): an integer
+literal that is an argument of a call is a literal variable until the call is checked, and
+may unify with `f32` or `f64` when the float holds its value exactly (at most 2^24 and 2^53);
+else it is `i64`. A variable bound to an integer never adopts: `(let ((n 2)) (* n 1.5))` is
+`cannot unify f64 with i64`. The interpreter and the compiler read the literal as a float
+of the type the checker recorded for it.
 
 ### 1.2 Objects
 
@@ -363,10 +368,30 @@ generalised.
 (let ((pat₁ e₁) ..) b)   eᵢ : Tᵢ;  patᵢ checked against Tᵢ binding Γᵢ (§2.6, irrefutable);  Γ,Γ̄ ⊢ b : T  ⇒ T
 (let (.. (x: A e) ..) b) e : T;  T ~ A, a flow site (§3.2);  x : A  (syntax §1.5; likewise a loop variable, a plet binding)
 (do e₁ .. eₙ)            each eᵢ typed; ⇒ Tₙ;  (do) ⇒ unit
-(if c t e)               c : bool, t : T, e : T  ⇒ T
+(if c t e)               c : bool or (Option U), t : T, e : T  ⇒ T      (truthiness, below)
+(if c t)                 c as above; t : unit ⇒ unit, t : T ⇒ (Option T) with `some` around t
+(and a .. z)             each a testable; ⇒ the type of z (bool or an Option)
+(or a .. z)              z : L; a : (Option L) when L is no Option nor bool, (Option U) = L when it is, bool or (Option U) when L is bool  ⇒ L
 (loop ((x₁ e₁) .. (xₙ eₙ)) b)   eᵢ : Tᵢ;  Γ, xᵢ:Tᵢ ⊢ b : T with recur enabled at (T₁ .. Tₙ)  ⇒ T
 (recur a₁ .. aₙ)         aᵢ : Tᵢ of the innermost enclosing loop  ⇒ fresh (it never yields a value)
 ```
+
+**Truthiness** (stdlib §7 L20, implemented by X5). A test of `if`, a clause of a one-armed `if`
+or `cond`, an operand of `and` and a non-last operand of `or` is a `bool` or an `(Option T)`,
+truthy when `true` or `(some _)`; an `(Option bool)` is truthy when it is `(some true)`. A test
+whose type is not known yet is `bool`; a primitive that is not `bool` (or a `str`) is `a value
+of type T is always true; write the test`; any other type is the plain mismatch. The one-armed
+`if`, which `when` and a `cond` with no default are, is `unit` when its bodies are unit (a body
+of a type not yet known, a `recur`, counts as unit) and `(Option T)` otherwise, each body in
+`some`, falling off the end `nil`. `or` is typed by its last operand `L`; an earlier operand
+that is an `(Option T)` is its payload when `L` is `T`, itself when `L` is that `Option`, and
+`true` when `L` is `bool`. The checker types `and`, `or` and the one-armed form directly and,
+once the types are final, rewrites them and every `(Option T)` test into `if`, `match`, `some`
+and `nil` (`types/elab.rs`), so the ownership pass, the interpreter and the compiler read only
+the core forms. The payload is read from the type as the definition has it: a type variable
+payload is a plain `some` test, even if it is instantiated at `bool`. `(not x)` is `(if x false
+true)` (the builtin `not` stays a `bool` function as a value). `when-let` over a `bool` binding
+is not done (case 1501).
 
 Loop variables are monomorphic, like `let` bindings. A `recur` that is
 not in tail position of its loop body, that is outside any `loop`, or
@@ -667,7 +692,7 @@ which the library's `Div` instances for the float types wrap. Until
 name) `Num` has both, `/` and `quot`, with one meaning on integers.
 
 `Self` in a signature stands for the dispatch type, so `(+ a b)` unifies
-both operands: `(+ (i32 1) 2)` is a type error, never a promotion.
+both operands: `(+ (i32 1) 2)` is still a type error, never a promotion, but an integer literal in an argument position takes the float type it unifies with when the float holds its value exactly (`(* 2 1.5)`, `(/ x 2)` on an `f64`; stdlib §7 L19), never an integer width and never through a variable.
 `(defun add (a b) (+ a b))` is `∀a. (Num a) ⇒ (fn :send (a a) a)`.
 
 The built-in `Eq` and `Ord` instances (for every scalar type and for

@@ -62,7 +62,7 @@ is not one of the four integer widths, is an error where the macro's
 expansion is turned back into code (**Decided**, owner, 2026-09-28;
 case 105, as case 93 is for a value out of its width). A `Form` value
 built at run time is data and is not checked until it is compiled. Numbers carry their width in the reader; there
-is no literal polymorphism (types §1.1; **Decided**, D3).
+is no literal polymorphism, except that an integer literal in an argument position adopts a float type it unifies with (types §1.1; stdlib §7 L19).
 
 **Symbols.** A symbol is a maximal run of characters that are not
 whitespace, `( ) [ ] { } " ; ' `` ` `` `,` `@` `~` `\`, not starting with a
@@ -466,10 +466,16 @@ any owning binding; so is a loop variable (§3.18).
 
 ```
 (if expr expr expr)
+(if expr expr)
+(and expr ..) (or expr ..)
 ```
 
-The test has type `bool`; both branches are required and have one type.
-`when`, `unless`, `cond`, `and`, `or` are prelude macros over `if`.
+The test has type `bool` or `(Option T)` (types §2.4, truthiness; stdlib §7 L20); with both
+branches they have one type; the one-armed `if` is `unit` for a unit body and `(Option T)`
+otherwise. `and` and `or` are core forms the checker elaborates (any number of operands:
+`(and)` is `true`, `(or)` is `false`, one operand is itself). `when`, `unless` and `cond` are
+prelude macros over the one-armed `if`; a `cond` whose last test is a keyword or `true` has a
+default.
 
 Ownership (**Decided** by §3.1 and case 04): if one branch's value is a
 borrow and the other's is owned, the borrowed branch retains, so the

@@ -6,6 +6,8 @@
 //! with path compression; [`Store::zonk`] substitutes every bound
 //! variable of a type.
 
+use std::collections::HashMap;
+
 use super::ty::{Colour, CvId, TvId, Ty};
 
 /// One unification variable.
@@ -23,9 +25,50 @@ pub struct Store {
     nodes: Vec<Node>,
     colours: u32,
     level: u32,
+    /// The unbound variables that are the type of an integer literal in an
+    /// argument position (stdlib §7 L19), with the largest magnitude of
+    /// the literals that share them: such a variable may be bound to a
+    /// float type that holds the value exactly, else only to `i64`.
+    lits: HashMap<u32, u64>,
 }
 
 impl Store {
+    /// A fresh variable for the integer literal `n`.
+    pub fn fresh_lit(&mut self, n: i64) -> Ty {
+        let t = self.fresh();
+        if let Ty::Var(v) = &t {
+            self.lits.insert(v.0, n.unsigned_abs());
+        }
+        t
+    }
+
+    /// The magnitude bound of the literal variable `v`, `None` for any
+    /// other variable.
+    pub fn lit_of(&self, v: TvId) -> Option<u64> {
+        self.lits.get(&v.0).copied()
+    }
+
+    /// Records that `v` also stands for a literal of magnitude `m`.
+    pub fn widen_lit(&mut self, v: TvId, m: u64) {
+        let e = self.lits.entry(v.0).or_insert(0);
+        *e = (*e).max(m);
+    }
+
+    /// `t` zonked, with every literal variable still unbound as `i64`,
+    /// for messages.
+    pub fn zonk_default(&mut self, t: &Ty) -> Ty {
+        match self.resolve(t) {
+            Ty::Var(v) if self.lits.contains_key(&v.0) => Ty::i64(),
+            Ty::Con(c, args) => Ty::Con(c, args.iter().map(|a| self.zonk_default(a)).collect()),
+            Ty::Fn(k, ps, r) => Ty::Fn(
+                k,
+                ps.iter().map(|p| self.zonk_default(p)).collect(),
+                Box::new(self.zonk_default(&r)),
+            ),
+            other => other,
+        }
+    }
+
     /// An empty store at level 0 (the top level, where only closed
     /// schemes live).
     pub fn new() -> Self {

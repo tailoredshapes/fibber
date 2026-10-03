@@ -390,6 +390,9 @@ impl<'p, 'a> Cx<'p, 'a> {
             ExprKind::Await(x) => self.await_task(x)?,
             ExprKind::Quote(f) => self.quote(e, f)?,
             ExprKind::Concat(es) => self.concat(e, es)?,
+            ExprKind::Guarded(_) | ExprKind::And(_) | ExprKind::Or(_) | ExprKind::Elided => {
+                return Err(Unsupported("an unelaborated form".into()))
+            }
         };
         Ok(Flow::Val(v))
     }
@@ -399,7 +402,12 @@ impl<'p, 'a> Cx<'p, 'a> {
             Lit::Int(n, _) => {
                 let t = self.ty(e)?;
                 let l = self.p.lir(&t)?.unwrap_or(LirTy::I64);
-                V::int(l, *n)
+                if matches!(l, LirTy::Float | LirTy::Double) {
+                    // An integer literal that took a float type (stdlib §7 L19).
+                    V::Val(format!("({} {})", l.text(), float_text(*n as f64)), l)
+                } else {
+                    V::int(l, *n)
+                }
             }
             Lit::Float(x, w) => {
                 let t = match w {

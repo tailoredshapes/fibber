@@ -23,8 +23,8 @@ fn if_not_negates_the_test_and_the_one_armed_form_has_the_unit_else() {
 
 #[test]
 fn when_not_is_unless_under_clojures_name() {
-    assert_eq!(ex("(when-not c x)"), "(if c () x)");
-    assert_eq!(ex("(when-not c x y)"), "(if c () (do x y))");
+    assert_eq!(ex("(when-not c x)"), "(if (fib.prelude/not c) x)");
+    assert_eq!(ex("(when-not c x y)"), "(if (fib.prelude/not c) (do x y))");
     assert_eq!(
         ex_err("(when-not)").to_string(),
         "t.fib:1:1: macro when-not takes at least 1 argument(s), got 0"

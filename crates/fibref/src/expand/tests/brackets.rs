@@ -11,7 +11,7 @@ fn let_takes_flat_pairs() {
     assert_eq!(ex("(let [a 1 b 2] (+ a b))"), "(let ((a 1) (b 2)) (+ a b))");
     assert_eq!(ex("(let [] x)"), "(let () x)");
     // The initialiser of a binding is expanded like any expression.
-    assert_eq!(ex("(let [a (when c 1)] a)"), "(let ((a (if c 1 ()))) a)");
+    assert_eq!(ex("(let [a (when c 1)] a)"), "(let ((a (if c 1))) a)");
 }
 
 #[test]

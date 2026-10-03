@@ -14,7 +14,7 @@ use crate::syntax::Pos;
 use crate::types::decls::Globals;
 use crate::types::error::{ErrorKind, TResult, TypeError};
 use crate::types::store::Store;
-use crate::types::ty::{Colour, Con, TvId, Ty};
+use crate::types::ty::{Colour, Con, Scalar, TvId, Ty};
 
 use super::cx::{ColourCon, Cx, Witness};
 
@@ -38,8 +38,17 @@ impl Unifier<'_> {
         let b = self.st.resolve(b);
         match (&a, &b) {
             (Ty::Var(x), Ty::Var(y)) if x == y => Ok(()),
-            (Ty::Var(x), Ty::Var(_)) => {
-                self.st.bind(*x, b.clone());
+            (Ty::Var(x), Ty::Var(y)) => {
+                // A literal variable stays the representative, so that
+                // the other variable adopts what it adopts (L19).
+                match (self.st.lit_of(*x), self.st.lit_of(*y)) {
+                    (Some(_), None) => self.st.bind(*y, a.clone()),
+                    (Some(m), Some(_)) => {
+                        self.st.widen_lit(*y, m);
+                        self.st.bind(*x, b.clone());
+                    }
+                    _ => self.st.bind(*x, b.clone()),
+                }
                 Ok(())
             }
             (Ty::Var(x), t) => self.bind_var(*x, t, flow, true),
@@ -90,6 +99,11 @@ impl Unifier<'_> {
         if self.st.occurs(v, t) {
             return Err(UErr::Occurs);
         }
+        if let Some(magnitude) = self.st.lit_of(v) {
+            if !lit_fits(magnitude, t) {
+                return Err(UErr::Mismatch);
+            }
+        }
         match t {
             Ty::Fn(k, ps, r) if flow => {
                 let k2 = self.st.fresh_colour();
@@ -129,6 +143,18 @@ impl Unifier<'_> {
             origin,
             pos: self.pos.clone(),
         });
+    }
+}
+
+/// Whether the type of an integer literal of this magnitude may be `t`
+/// (stdlib §7 L19): `i64`, or a float type that holds the value exactly.
+/// The integer widths are not (L26 is not in this rule).
+fn lit_fits(magnitude: u64, t: &Ty) -> bool {
+    match t {
+        Ty::Con(Con::Scalar(Scalar::I64), _) => true,
+        Ty::Con(Con::Scalar(Scalar::F64), _) => magnitude <= 1 << 53,
+        Ty::Con(Con::Scalar(Scalar::F32), _) => magnitude <= 1 << 24,
+        _ => false,
     }
 }
 

@@ -85,8 +85,6 @@ const MACROS: &[(&str, MacroFn)] = &[
         expanded(logic::when(i, &p, true, "unless"))
     }),
     ("cond", |_, i, p| expanded(logic::cond(i, &p))),
-    ("and", |_, i, p| expanded(Ok(logic::and_or(i, &p, true)))),
-    ("or", |_, i, p| expanded(Ok(logic::and_or(i, &p, false)))),
     ("if-let", |_, i, p| expanded(logic::if_let(i, &p))),
     ("when-let", |_, i, p| expanded(logic::when_let(i, &p))),
     ("list", |_, i, p| expanded(Ok(forms::list_macro(i, &p)))),

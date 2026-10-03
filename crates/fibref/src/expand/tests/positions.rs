@@ -38,18 +38,16 @@ fn macro_built_forms_take_the_call_position() {
     assert_eq!(lc(&items[0]), (2, 3), "the built `if`");
     assert_eq!(lc(&items[1]), (2, 9), "the test keeps its own");
     assert_eq!(lc(&items[2]), (3, 5), "the body keeps its own");
-    assert_eq!(lc(&items[3]), (2, 3), "the built ()");
 }
 
 #[test]
 fn nested_expansions_keep_the_inner_call_position() {
-    // (and a b c) -> (if a (and b c) false): the inner `and` is built at
-    // the outer call, and its own expansion takes that position.
-    let f = expand("(and a\n b c)");
+    // (cond a b c d) -> (if a b (if c d)): the inner `if` is built at the call.
+    let f = expand("(cond a b\n c d)");
     let items = f.as_list().unwrap_or(&[]);
-    assert_eq!(lc(&items[1]), (1, 6));
-    assert_eq!(lc(&items[2]), (1, 1));
-    let inner = items[2].as_list().unwrap_or(&[]);
+    assert_eq!(lc(&items[1]), (1, 7));
+    assert_eq!(lc(&items[3]), (1, 1));
+    let inner = items[3].as_list().unwrap_or(&[]);
     assert_eq!(lc(&inner[1]), (2, 2));
 }
 

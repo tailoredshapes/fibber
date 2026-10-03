@@ -34,14 +34,14 @@ fn let_fn_match_loop_positions() {
     assert_eq!(
         ex("(let ((x (when a b)) (y [1])) (fn f (p) -> i64 (and p x)))"),
         format!(
-            "(let ((x (if a b ())) (y {})) (fn f (p) -> i64 (if p x false)))",
+            "(let ((x (if a b)) (y {})) (fn f (p) -> i64 (and p x)))",
             v(&["1"])
         )
     );
     assert_eq!(
         ex("(match (or a b) ((some (list x)) (list x)) (nil []))"),
         format!(
-            "(match (if a true b) ((some (list x)) (fib.prelude/Cons x fib.prelude/Empty)) (nil {}))",
+            "(match (or a b) ((some (list x)) (fib.prelude/Cons x fib.prelude/Empty)) (nil {}))",
             v(&[])
         )
     );
@@ -105,13 +105,13 @@ fn definitions_expand_their_bodies() {
     assert_eq!(
         out[7],
         format!(
-            "(defun f (x (& y:) i64) :where ((Eq a)) -> i64 (if x {} ()) fib.prelude/Empty)",
+            "(defun f (x (& y:) i64) :where ((Eq a)) -> i64 (if x {}) fib.prelude/Empty)",
             v(&["1"])
         )
     );
     assert_eq!(
         out[8],
-        "(impl Q P (q (self) -> i64 fib.prelude/Empty) (r (self) (if a b false)))"
+        "(impl Q P (q (self) -> i64 fib.prelude/Empty) (r (self) (and a b)))"
     );
 }
 

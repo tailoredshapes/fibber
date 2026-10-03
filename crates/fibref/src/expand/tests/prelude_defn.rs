@@ -42,10 +42,7 @@ fn defn_dash_puts_private_after_the_name() {
 
 #[test]
 fn the_body_is_expanded_as_a_defun_body() {
-    assert_eq!(
-        prog("(defn f [x] (when x 1))"),
-        ["(defun f (x) (if x 1 ()))"]
-    );
+    assert_eq!(prog("(defn f [x] (when x 1))"), ["(defun f (x) (if x 1))"]);
 }
 
 #[test]

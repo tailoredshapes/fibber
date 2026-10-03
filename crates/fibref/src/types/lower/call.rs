@@ -6,7 +6,7 @@
 
 use crate::syntax::{Form, FormKind};
 
-use crate::types::ast::{Arg, BindingKind, ConvOp, Expr, ExprKind, GlobalRef, IntConv, Place};
+use crate::types::ast::{Arg, BindingKind, ConvOp, Expr, ExprKind, GlobalRef, IntConv, Lit, Place};
 use crate::types::builtins::{builtin_index, BUILTINS, CONVERSIONS};
 use crate::types::error::{ErrorKind, TResult, TypeError};
 
@@ -18,6 +18,7 @@ enum Special {
     Deref,
     Set,
     Concat,
+    Not,
     SetField,
     Dyn,
     Convert(ConvOp),
@@ -92,6 +93,9 @@ impl Lowerer<'_> {
         };
         if Some(r) == builtin("set!") {
             return Some(Special::Set);
+        }
+        if Some(r) == builtin("not") {
+            return Some(Special::Not);
         }
         if Some(r) == builtin("concat") {
             return Some(Special::Concat);
@@ -184,6 +188,13 @@ impl Lowerer<'_> {
                 arity(2)?;
                 let target = self.place(&items[1])?;
                 ExprKind::Set(target, Box::new(self.expr(&items[2], false)?))
+            }
+            Special::Not => {
+                arity(1)?;
+                let test = self.expr(&items[1], false)?;
+                let no = self.mk(pos, ExprKind::Lit(Lit::Bool(false)));
+                let yes = self.mk(pos, ExprKind::Lit(Lit::Bool(true)));
+                ExprKind::If(Box::new(test), Box::new(no), Box::new(yes))
             }
             Special::Concat => ExprKind::Concat(
                 items[1..]

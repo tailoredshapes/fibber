@@ -6,7 +6,7 @@
 
 use crate::syntax::{FltWidth, IntWidth};
 use crate::types::ast::{Clause, Expr, ExprKind, GlobalRef, Lit, Pattern};
-use crate::types::ty::Scalar;
+use crate::types::ty::{Con, Scalar, Ty};
 
 use super::call::Jump;
 use super::error::{RunError, R};
@@ -76,13 +76,22 @@ impl<'p> Interp<'p> {
                 super::arith::convert(*op, *t, &v)?
             }
             ExprKind::Concat(es) => self.concat(es)?,
+            ExprKind::Guarded(_) | ExprKind::And(_) | ExprKind::Or(_) | ExprKind::Elided => {
+                return Err(RunError::internal("an unelaborated form".to_string()))
+            }
         };
         Ok(Flow::Val(v))
     }
 
     fn literal(&mut self, e: &Expr, l: &Lit) -> R<Val> {
         Ok(match l {
-            Lit::Int(n, w) => Val::Int(*n, int_scalar(*w)),
+            Lit::Int(n, w) => match self.p.expr_types.get(&e.id) {
+                // An integer literal that took a float type (stdlib §7 L19).
+                Some(Ty::Con(Con::Scalar(s @ (Scalar::F32 | Scalar::F64)), _)) => {
+                    Val::Float(*n as f64, *s)
+                }
+                _ => Val::Int(*n, int_scalar(*w)),
+            },
             Lit::Float(x, FltWidth::F32) => Val::Float(*x, Scalar::F32),
             Lit::Float(x, FltWidth::F64) => Val::Float(*x, Scalar::F64),
             Lit::Str(s) => self.string_literal(e.id, s)?,

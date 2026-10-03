@@ -214,11 +214,10 @@ fn expr(src: &str) -> Result<String, ExpandError> {
 }
 
 #[test]
-fn cond_with_no_clauses_is_a_trap() {
-    assert_eq!(
-        expr("(cond)").ok(),
-        Some("(fib.prelude/trap \"cond: no clause matched at adv.fib:1:1\")".into())
-    );
+fn cond_with_no_clauses_is_unit() {
+    // stdlib §7 L20: without a default a cond falls to nil, or `()` for unit bodies; no trap.
+    assert_eq!(expr("(cond)").ok(), Some("()".into()));
+    assert_eq!(expr("(cond a 1)").ok(), Some("(if a 1)".into()));
 }
 
 #[test]
@@ -235,7 +234,7 @@ fn threading_with_non_list_steps() {
         assert_eq!(expr(src).map_err(|e| e.kind), Err(K::ThreadStep), "{src}");
     }
     // A step that is itself a macro call is expanded after threading.
-    assert_eq!(expr("(-> a (and b))").ok(), Some("(if a b false)".into()));
+    assert_eq!(expr("(-> a (when b))").ok(), Some("(if a b)".into()));
 }
 
 #[test]
@@ -250,7 +249,7 @@ fn derive_on_a_generic_enum_with_a_recursive_field() {
         let head = format!("(impl {p} (Tree a) :where {ctx} ");
         assert!(form.starts_with(&head), "{form}");
     }
-    assert!(out[1].contains("((node #v.1 #l.2 #r.3) (match y ((node #v2.4 #l2.5 #r2.6) (if (fib.prelude/= #v.1 #v2.4) (if (fib.prelude/= #l.2 #l2.5) (fib.prelude/= #r.3 #r2.6) false) false)) (_ false)))"), "{}", out[1]);
+    assert!(out[1].contains("((node #v.1 #l.2 #r.3) (match y ((node #v2.4 #l2.5 #r2.6) (and (fib.prelude/= #v.1 #v2.4) (fib.prelude/= #l.2 #l2.5) (fib.prelude/= #r.3 #r2.6))) (_ false)))"), "{}", out[1]);
 }
 
 #[test]
@@ -361,7 +360,7 @@ fn proposed_case_41_expands_with_an_evaluator() {
     assert_eq!(out[1], "(defstruct Point (x: i64 y: i64))");
     assert_eq!(
         out[2],
-        "(impl Eq Point (= (self y) (if (fib.prelude/= (. self x) (. y x)) (fib.prelude/= (. self y) (. y y)) false)) \
+        "(impl Eq Point (= (self y) (and (fib.prelude/= (. self x) (. y x)) (fib.prelude/= (. self y) (. y y)))) \
          (!= (self y) (fib.prelude/not (fib.prelude/= self y))))"
     );
     assert_eq!(

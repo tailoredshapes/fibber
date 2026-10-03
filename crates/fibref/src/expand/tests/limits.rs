@@ -13,7 +13,7 @@ fn too_many_steps() {
         max_steps: 2,
         ..Limits::default()
     };
-    let r = expand_expr(one("(and a b c d)"), &mut ctx, &mut NoRunner);
+    let r = expand_expr(one("(when a (when b (when c d)))"), &mut ctx, &mut NoRunner);
     assert_eq!(r.map_err(|e| e.kind), Err(K::TooManySteps { limit: 2 }));
 }
 
@@ -24,7 +24,7 @@ fn steps_reset_per_top_level_form() {
         max_steps: 3,
         ..Limits::default()
     };
-    let src = "(defun f () (and a b c)) (defun g () (and a b c))";
+    let src = "(defun f () (when a (when b c))) (defun g () (when a (when b c)))";
     let r = expand_program(read(src), &mut ctx, &mut NoRunner);
     assert!(r.is_ok(), "{r:?}");
 }
@@ -48,14 +48,14 @@ fn a_long_and_expands_to_the_depth_limit_and_no_further() {
     let n = MAX_EXPAND_DEPTH - 10;
     let args = "a ".repeat(n);
     let r = expand_expr(
-        one(&format!("(and {args})")),
+        one(&format!("(cond {args})")),
         &mut ExpandCtx::new(),
         &mut NoRunner,
     );
     assert!(r.is_ok(), "{:?}", r.err());
-    let args = "a ".repeat(MAX_EXPAND_DEPTH + 10);
+    let args = "a b ".repeat(MAX_EXPAND_DEPTH + 10);
     let r = expand_expr(
-        one(&format!("(and {args})")),
+        one(&format!("(cond {args})")),
         &mut ExpandCtx::new(),
         &mut NoRunner,
     );
@@ -137,9 +137,9 @@ fn too_many_forms() {
         max_forms: 10,
         ..Limits::default()
     };
-    let r = expand_expr(one("(and a b c d)"), &mut ctx, &mut NoRunner);
+    let r = expand_expr(one("(when a (when b (when c d)))"), &mut ctx, &mut NoRunner);
     assert_eq!(r.map_err(|e| e.kind), Err(K::TooLarge { limit: 10 }));
-    let r = expand_expr(one("(and a b)"), &mut ctx, &mut NoRunner);
+    let r = expand_expr(one("(when a b)"), &mut ctx, &mut NoRunner);
     assert!(r.is_ok(), "{r:?}");
 }
 

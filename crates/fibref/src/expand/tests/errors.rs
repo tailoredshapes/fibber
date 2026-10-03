@@ -53,7 +53,7 @@ fn prelude_macro_arity() {
 #[test]
 fn malformed_core_forms() {
     for src in [
-        "(defun f () (if a b))",
+        "(defun f () (if a))",
         "(defun f () (let (x 1) x))",
         "(defun f () (let ((x)) x))",
         "(defun f () (let ((x 1))))",
@@ -82,7 +82,7 @@ fn malformed_core_forms() {
     ] {
         assert!(matches!(prog_err(src), K::Malformed { .. }), "{src}");
     }
-    assert_eq!(at("(defun f ()\n  (if a b))"), (2, 3));
+    assert_eq!(at("(defun f ()\n  (if a))"), (2, 3));
 }
 
 #[test]

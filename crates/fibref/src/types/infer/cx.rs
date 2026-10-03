@@ -267,13 +267,13 @@ impl Cx<'_> {
 
     /// The type as text (zonked first).
     pub fn show(&mut self, t: &Ty) -> String {
-        let z = self.st.zonk(t);
+        let z = self.st.zonk_default(t);
         crate::types::display::Printer::with_names(self.g, &[], &self.u.rigid_names).ty(&z)
     }
 
     /// `cannot unify a with b`.
     pub fn mismatch(&mut self, a: &Ty, b: &Ty, pos: &Pos) -> TypeError {
-        let (za, zb) = (self.st.zonk(a), self.st.zonk(b));
+        let (za, zb) = (self.st.zonk_default(a), self.st.zonk_default(b));
         let p = crate::types::display::Printer::with_names(self.g, &[], &self.u.rigid_names);
         let msg = format!("cannot unify {} with {}", p.ty(&za), p.ty(&zb));
         TypeError::new(ErrorKind::Unify, pos, msg)
