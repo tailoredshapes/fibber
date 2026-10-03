@@ -6,12 +6,17 @@
 ;;   (defn- name doc? [x: T ..] -> R body ..) ==> (defun name :private (x: T ..) -> R body ..)
 ;;
 ;; The docstring is dropped; everything after the parameter vector is passed
-;; on as written. A `&` in the vector (rest parameters, L2) and a list of
-;; clauses `([x] ..) ([x y] ..)` (several arities, L1) are errors that name
-;; the stdlib item that adds them. The built `defun` takes the call's
-;; position; the parameter list takes the vector's. Called by expand.prelude
-;; (the registry rows `defn` and `defn-`).
+;; on as written. A `&` in the vector (rest parameters, L2) is an error that
+;; names the stdlib item that adds it. Several arities, `([x] ..) ([x y] ..)`
+;; (L1, X9), are one `defun` per clause named `NAME$N` for the clause's
+;; parameter count `N`, in a `do` (expand.overload resolves the calls); each
+;; clause has its own `:private` (right after its vector), `:where` and
+;; `-> R`, and `defn-` makes every clause private; one clause is the plain
+;; `defn`. The built `defun` takes the call's position; the parameter list
+;; takes the vector's. Called by expand.prelude (the registry rows `defn`
+;; and `defn-`).
 (ns expand.prelude.defn
+  (:require [expand.overload :as overload])
   (:use syntax.pos syntax.form expand.error expand.build expand.prelude.parts))
 
 ;; `(defn name doc? [params] rest..)` and, with `private`, `(defn- ..)`.
@@ -23,7 +28,10 @@
       ((Ok _)
        (match (sym-of (nth items 1))
          (nil (Err (malformed name "the name must be a symbol" (. (nth items 1) pos))))
-         ((some _) (defn-parameters name items pos private)))))))
+         ((some _)
+          (match (overload/clauses-of items)
+            ((some clauses) (clauses-defn name items clauses pos private))
+            (nil (defn-parameters name items pos private)))))))))
 
 ;; The index of the form after the docstring, when there is one: a string
 ;; is a docstring only in this place.
@@ -37,9 +45,9 @@
     ((SVec _) true)
     (_ false)))
 
-;; The parameter vector (Rust `parameters`): a vector is the parameters, a
-;; list of clauses that starts with one is several arities, anything else,
-;; or nothing, is not a parameter vector.
+;; The parameter vector (Rust `parameters`): a vector is the parameters,
+;; anything else, or nothing, is not a parameter vector (clauses are
+;; `clauses-defn`'s).
 (defun defn-parameters :private (name: str items: (Vec Stx) pos: Pos private: bool)
     -> (Result Stx ExpandError)
   (let ((at (doc-skip items)))
@@ -48,10 +56,6 @@
         (let ((form (nth items at)))
           (match (. form kind)
             ((SVec params) (defn-rest-check name items pos private form params (+ at 1)))
-            ((SList clauses)
-             (if (and (> (count clauses) 0) (is-vector (nth clauses 0)))
-                 (Err (malformed name "several arities need L1" (. form pos)))
-                 (Err (malformed name "expected a parameter vector" (. form pos)))))
             (_ (Err (malformed name "expected a parameter vector" (. form pos)))))))))
 
 (defun has-rest-marker :private (params: (Vec Stx)) -> bool
@@ -73,3 +77,65 @@
         (Ok (list-form (concat-forms (conj head (Stx (SList params) (. form pos)))
                                      (tail-from items rest-at))
                        pos)))))
+
+;; A clause `([params] ..)`: its items, nil for anything else.
+(defun clause-items :private (clause: Stx) -> (Option (Vec Stx))
+  (match (items-of clause)
+    (nil nil)
+    ((some c) (if (and (> (count c) 0) (is-vector (nth c 0))) (some c) nil))))
+
+;; The first clause that is not `([params] ..)`.
+(defun bad-clause :private (clauses: (Vec Stx)) -> (Option Stx)
+  (loop ((i 0))
+    (cond (>= i (count clauses)) nil
+          (some? (clause-items (nth clauses i))) (recur (+ i 1))
+          :else (some (nth clauses i)))))
+
+;; `(defn name doc? ([x] ..) ..)`: one clause is the plain `defn`, several
+;; are a `do` of the `defun`s `name$N`. (defn.rs `clauses_defn`)
+(defun clauses-defn :private (name: str items: (Vec Stx) clauses: (Vec Stx) pos: Pos private: bool)
+    -> (Result Stx ExpandError)
+  (match (bad-clause clauses)
+    ((some bad) (Err (malformed name "every clause is ([params] ..)" (. bad pos))))
+    (nil
+     (if (= (count clauses) 1)
+         (defn-macro (concat-forms [(nth items 0) (nth items 1)]
+                                   (unwrap-or (items-of (nth clauses 0)) (vec-empty)))
+                     pos private)
+         (clause-defuns name items clauses pos private)))))
+
+(defun clause-defuns :private (name: str items: (Vec Stx) clauses: (Vec Stx) pos: Pos private: bool)
+    -> (Result Stx ExpandError)
+  (loop ((i 0) (out [(sym "do" pos)]))
+    (if (< i (count clauses))
+        (match (clause-defun name items (nth clauses i) pos private)
+          ((Err e) (Err e))
+          ((Ok d) (recur (+ i 1) (conj out d))))
+        (Ok (list-form out pos)))))
+
+;; The `defun name$N` of one clause.
+(defun clause-defun :private (name: str items: (Vec Stx) clause: Stx pos: Pos private: bool)
+    -> (Result Stx ExpandError)
+  (let ((c (unwrap-or (clause-items clause) (vec-empty)))
+        (vec (nth (unwrap-or (clause-items clause) (vec-empty)) 0)))
+    (if (has-rest-marker (vec-items vec))
+        (Err (malformed name "rest parameters need L2" (. vec pos)))
+        (let ((marked (and (> (count c) 1)
+                           (match (. (nth c 1) kind)
+                             ((SKw k) (= k "private"))
+                             (_ false))))
+              (head [(sym "defun" pos)
+                     (sym (overload/clause-name (unwrap-or (sym-of (nth items 1)) "")
+                                                (unwrap-or (overload/clause-arity clause) 0))
+                          pos)]))
+          (Ok (list-form
+               (concat-forms
+                (concat-forms (if (or private marked) (conj head (keyword "private" pos)) head)
+                              [(Stx (SList (vec-items vec)) (. vec pos))])
+                (tail-from c (if marked 2 1)))
+               (. clause pos)))))))
+
+(defun vec-items :private (form: Stx) -> (Vec Stx)
+  (match (. form kind)
+    ((SVec ps) ps)
+    (_ (vec-empty))))

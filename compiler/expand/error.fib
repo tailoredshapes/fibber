@@ -46,6 +46,9 @@
   (TooManySteps limit: i64)
   (TooDeep limit: i64)
   (TooLarge limit: i64)
+  (DuplicateClause name: str arity: i64)
+  (ClauseOfMethod name: str arity: i64)
+  (NoClause name: str counts: (Vec i64) found: i64)
   (BadLiteral error: ErrKind))
 
 ;; An expansion error: what went wrong and where (a macro call's position
@@ -80,6 +83,9 @@
     ((TooManySteps _) "TooManySteps")
     ((TooDeep _) "TooDeep")
     ((TooLarge _) "TooLarge")
+    ((DuplicateClause _ _) "DuplicateClause")
+    ((ClauseOfMethod _ _) "ClauseOfMethod")
+    ((NoClause _ _ _) "NoClause")
     ((BadLiteral _) "BadLiteral")))
 
 ;; The kind's Display text: the message after the position, word for
@@ -118,7 +124,33 @@
     ((TooLarge limit)
      (str-join ["macro expansions of one top-level form produced more than " (show limit)
                 " forms"]))
+    ((DuplicateClause name arity)
+     (str-join ["two clauses of " name " take " (show arity) " argument(s)"]))
+    ((ClauseOfMethod name arity)
+     (str-join ["a clause of " name " takes " (show arity) " argument(s), as the protocol method "
+                name " does"]))
+    ((NoClause name counts found)
+     (str-join [name " takes " (counts-text counts) " argument(s), got " (show found)]))
     ((BadLiteral e) (str-join ["a macro built an invalid literal: " (err-message e)]))))
+
+;; The counts of a NoClause, `1`, `1 or 2`, `1, 2 or 3`: the last one after
+;; ` or `, the others joined by `, `.
+(defun counts-text :private (counts: (Vec i64)) -> str
+  (let ((n (count counts))
+        (last (show (nth counts (- n 1)))))
+    (if (= n 1)
+        last
+        (str-join [(str-join-with ", " (init-texts counts (- n 1))) " or " last]))))
+
+(defun init-texts :private (counts: (Vec i64) n: i64) -> (Vec str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i n) (recur (+ i 1) (conj acc (show (nth counts i)))) acc)))
+
+(defun str-join-with :private (sep: str parts: (Vec str)) -> str
+  (loop ((i 0) (acc ""))
+    (if (< i (count parts))
+        (recur (+ i 1) (if (= i 0) (nth parts 0) (str-join [acc sep (nth parts i)])))
+        acc)))
 
 ;; A position as Rust's `Pos` Display writes it: FILE:LINE:COL (not the
 ;; dump's `LINE:COL START..END`, which is `syntax.dump`'s `span`).

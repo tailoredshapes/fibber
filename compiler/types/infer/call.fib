@@ -12,11 +12,9 @@
         types.ast types.decls types.annot types.builtins types.infer.cx types.infer.unify
         types.infer.solve types.infer.inst types.infer.keyword))
 
-;; A function's signature at a call: parameter types, `&` flags, names, and
-;; whether the function is the library's (§7 D1 says what its arity errors
-;; may add).
+;; A function's signature at a call: parameter types, `&` flags, names.
 (defstruct Sig
-  (params: (Vec Ty) amps: (Vec bool) names: (Vec str) ret: Ty name: str library: bool))
+  (params: (Vec Ty) amps: (Vec bool) names: (Vec str) ret: Ty name: str))
 
 ;; Where a global's type comes from: its scheme (with its name and, for a
 ;; method, its index), a monomorphic SCC member's signature, or nowhere (a
@@ -25,19 +23,6 @@
   (SrScheme scheme: Scheme name: str method: (Option i64))
   (SrMono sig: Sig)
   SrValue)
-
-;; The words `; use X` a library function's arity error ends with when the
-;; call has the arguments of its stand-in, else nothing: the stand-in a library
-;; function has for the arity a call wrote, until arity overloading lands
-;; (stdlib §7 L1, diagnostic D1). `(get m k 0)` is `get takes 2 argument(s),
-;; got 3; use get-or`.
-(defun stand-in-hint :private (name: str found: i64) -> str
-  (cond (and (= name "get") (= found 3)) "; use get-or"
-        (and (= name "nth") (= found 3)) "; use nth-or"
-        (and (= name "reduce") (= found 2)) "; use reduce1"
-        (and (= name "sort") (= found 2)) "; use sort-with"
-        (and (= name "range") (= found 3)) "; use range-by"
-        :else ""))
 
 ;; Rust: infer/call.rs:54 ann. Converts an annotation in the current
 ;; definition: named variables are its rigid variables, omitted colours fresh
@@ -69,7 +54,7 @@
 
 ;; A signature of a monomorphic SCC member, with the library flag of its use.
 (defun mono-sig :private (m: MonoSig name: str) -> Sig
-  (Sig (. m params) (. m amps) (. m names) (. m ret) name false))
+  (Sig (. m params) (. m amps) (. m names) (. m ret) name))
 
 ;; Where a global's type comes from: its scheme (with its name and, for a
 ;; method, its index), or a monomorphic SCC member's signature.
@@ -99,19 +84,6 @@
            (Ok SrValue)))
       (_ (Ok SrValue)))))
 
-;; Whether the function or method `r` is the library's: defined in the prelude
-;; or in a module named `fib.*` (the loader's rule for the modules that are the
-;; library's own, `sees_implicit`). A program's own `get` is not, whatever its
-;; arity.
-(defun is-library :private (cx: Cx r: GlobalRef) -> bool
-  (let ((module (match r
-                  ((GFun f) (some (. (g-fun (. cx g) f) module)))
-                  ((GMethod p _) (some (. (g-proto (. cx g) p) module)))
-                  (_ nil))))
-    (match module
-      ((some m) (or (= m module-prelude) (starts-with? (g-module-name (. cx g) m) "fib.")))
-      (nil false))))
-
 ;; A call of a function polymorphically recursive in the unit: recorded for
 ;; the fixpoint of infer/polyrec.rs.
 (defun note-poly-call :private (cx: Cx id: i64 r: GlobalRef pos: Pos) -> unit
@@ -131,8 +103,7 @@
   (try-let ((src (cx-source cx r pos)))
     (match src
       ((SrMono sig)
-       (Ok (some (Sig (. sig params) (. sig amps) (. sig names) (. sig ret) (. sig name)
-                      (is-library cx r)))))
+       (Ok (some (Sig (. sig params) (. sig amps) (. sig names) (. sig ret) (. sig name)))))
       ((SrValue) (Ok nil))
       ((SrScheme scheme name method)
        (let ((ty (cx-instantiate cx scheme id name pos method)))
@@ -141,7 +112,7 @@
                ((TFn _ params ret)
                 (Ok (some (Sig params
                                (if (empty? (. scheme amps)) (mapv (fn (p: Ty) false) params) (. scheme amps))
-                               (. scheme params) ret name (is-library cx r)))))
+                               (. scheme params) ret name))))
                (_ (Err (type-error-other pos (str-join ["internal: " name " is not a function"])))))))))))
 
 ;; A constant is not called: `N is a constant, not a function; write N`.
@@ -179,7 +150,7 @@
       (try-let ((_ (cx-unify cx ht (TFn k params ret) (. head pos))))
         (apply-sig cx e
           (Sig params (mapv (fn (a: Arg) false) args)
-               (mapv (fn (i: i64) (show (+ i 1))) (range (count args))) ret "the function" false)
+               (mapv (fn (i: i64) (show (+ i 1))) (range (count args))) ret "the function")
           args infer)))))
 
 ;; The arguments against the signature: by count, then one by one.
@@ -187,8 +158,7 @@
   (if (not (= (count (. sig params)) (count args)))
       (Err (type-error-other (. e pos)
              (str-join [(. sig name) " takes " (show (count (. sig params))) " argument(s), got "
-                        (show (count args))
-                        (if (. sig library) (stand-in-hint (. sig name) (count args)) "")])))
+                        (show (count args))])))
       (let ((lits (cell (vec-empty))))
         (loop ((i 0))
           (if (< i (count args))

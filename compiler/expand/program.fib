@@ -32,7 +32,7 @@
 ;;   says so with an `expect`: the unit test `prelude_expands` reads it),
 ;;   so a read error is a `trap` here, not an error value.
 (ns expand.program
-  (:require [syntax.reader :as reader] [expand.own :as own])
+  (:require [syntax.reader :as reader] [expand.own :as own] [expand.overload :as overload])
   (:use syntax.pos syntax.form syntax.error expand.error expand.types
         expand.ctx expand.expr expand.walk expand.top expand.fuserun))
 
@@ -52,13 +52,16 @@
   (let ((ex (expander-new ctx runner))
         (n (count forms)))
     (do (own/ctx-hide-macros ctx (own/own-defined-by forms))
-        (loop ((i 0) (out (vec-empty)))
-          (if (< i n)
-              (do (ctx-reset-counters ctx)
-                  (match (top-form ex (nth forms i) out)
-                    ((Err e) (Err e))
-                    ((Ok next) (recur (+ i 1) next))))
-              (Ok (fuse-run out ctx)))))))
+        (match (overload/overload-scan ctx forms)
+          ((Err e) (Err e))
+          ((Ok _)
+           (loop ((i 0) (out (vec-empty)))
+             (if (< i n)
+                 (do (ctx-reset-counters ctx)
+                     (match (top-form ex (nth forms i) out)
+                       ((Err e) (Err e))
+                       ((Ok next) (recur (+ i 1) next))))
+                 (Ok (fuse-run out ctx)))))))))
 
 ;; Expands one form in expression position (for a test); the counters
 ;; start at 0. (expand_expr)

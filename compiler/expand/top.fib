@@ -23,7 +23,8 @@
 ;; - `skip` of an `Option`-returning `get(1)` is a helper per use: the
 ;;   tests are `is_none_or(|n| n.as_sym().is_none())` and the like.
 (ns expand.top
-  (:require [expand.own :as own] [expand.fusescan :as scan] [expand.params :as params])
+  (:require [expand.own :as own] [expand.fusescan :as scan] [expand.params :as params]
+            [expand.overload :as overload])
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx
         expand.build expand.heads expand.private expand.core expand.expr expand.walk))
 
@@ -310,12 +311,22 @@
 (defun desugared :private (ctx: ExpandCtx form: Stx name: str) -> (Result Stx ExpandError)
   (if (= name "defun") (params/desugar ctx form true) (Ok form)))
 
+;; A `defun base$N` that a macro produced is a clause of base (overload).
+(defun note-defun :private (ctx: ExpandCtx form: Stx name: str) -> (Result unit ExpandError)
+  (do (if (= name "defun")
+          (match (sym-at (items-of form) 1)
+            ((some n) (overload/note-clause ctx n))
+            (nil ()))
+          ())
+      (Ok ())))
+
 ;; One definition with its `:private` marker already off. (definition_of)
 (defun definition-of :private (ex: Expander form: Stx first: bool) -> (Result Stx ExpandError)
   (let ((name (head-or-empty form)))
     (if (= name "defmacro")
         (macro-definition ex form)
-        (try-let ((f (desugared (. ex ctx) form name))
+        (try-let ((_ (note-defun (. ex ctx) form name))
+                  (f (desugared (. ex ctx) form name))
                   (role (definition-role ex f name first)))
           (walk ex f role)))))
 

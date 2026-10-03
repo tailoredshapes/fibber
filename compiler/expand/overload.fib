@@ -1,0 +1,397 @@
+;; compiler/expand/overload.fib: arity overloading (stdlib spec §7 L1), as
+;; crates/fibref/src/expand/overload.rs (337 lines of Rust, X9):
+;; `(defn name ([a: T] -> R body) ([a: T b: T] -> R body))` defines one
+;; function `name$N` per clause, N being the clause's parameter count, and a
+;; call `(name a b)` is rewritten to the clause of its argument count
+;; (`(name$2 a b)`), so the checker never sees an overloaded name.
+;;
+;; The table of a module is read off its unexpanded forms before the first
+;; one is expanded (`overload-scan`); a module that `:use`s or `:require`s
+;; another resolves its calls against that module's table, through its
+;; re-exports. A protocol method of the same name is a *method* of its
+;; arity: a call of that count is left alone.
+;;
+;; Shapes decided where Rust and fibber differ: the Rust table of a module
+;; (`HashMap<ns, HashMap<name, Overload>>`) is one `(Map str Overload)` of
+;; the context keyed `ns/name`; the `BTreeSet`s are sorted vectors with no
+;; repeat; the methods of the context are functions taking it
+;; (`overload-in`, `overload-of`, `pick-clause`, `note-clause`).
+(ns expand.overload
+  (:require [expand.params :as params])
+  (:use syntax.pos syntax.form expand.error expand.types expand.build expand.ctx
+        expand.prelude.parts))
+
+;; The name of the clause of `name` that takes `arity` arguments.
+(defun clause-name (name: str arity: i64) -> str
+  (str-join [name "$" (show arity)]))
+
+;; The index of the first `/` of name, or -1 (`split_once('/')`).
+(defun slash-at :private (name: str) -> i64
+  (let ((bs (str-bytes name))
+        (n (array-len bs)))
+    (loop ((i 0))
+      (if (< i n)
+          (if (= (array-get bs i) 47i8) i (recur (+ i 1)))
+          -1))))
+
+;; `(base, arity)` for a name written `base$N`: the last `$`, a base that is
+;; not empty and digits after it (`split_clause`).
+(defstruct Clause :private (base: str arity: i64))
+
+(defun digits? :private (s: str) -> bool
+  (let ((bs (str-bytes s))
+        (n (array-len bs)))
+    (and (> n 0)
+         (loop ((i 0))
+           (if (< i n)
+               (if (and (>= (array-get bs i) 48i8) (<= (array-get bs i) 57i8))
+                   (recur (+ i 1))
+                   false)
+               true)))))
+
+(defun last-dollar :private (name: str) -> i64
+  (let ((bs (str-bytes name)))
+    (loop ((i (- (array-len bs) 1)))
+      (cond (< i 0) -1
+            (= (array-get bs i) 36i8) i
+            :else (recur (- i 1))))))
+
+(defun split-clause :private (name: str) -> (Option Clause)
+  (let ((at (last-dollar name)))
+    (if (> at 0)
+        (let ((tail (str-slice name (+ at 1) (str-len name))))
+          (if (and (digits? tail) (< (str-len tail) 19))
+              (some (Clause (str-slice name 0 at) (parse-count tail)))
+              nil))
+        nil)))
+
+(defun parse-count :private (s: str) -> i64
+  (let ((bs (str-bytes s)))
+    (loop ((i 0) (acc 0))
+      (if (< i (array-len bs))
+          (recur (+ i 1) (+ (* acc 10) (- (sext i64 (array-get bs i)) 48)))
+          acc))))
+
+;; ------------------------------------------------- sorted sets of counts
+
+(defun set-has? :private (xs: (Vec i64) x: i64) -> bool
+  (loop ((i 0))
+    (cond (>= i (count xs)) false
+          (= (nth xs i) x) true
+          :else (recur (+ i 1)))))
+
+(defun set-add :private (xs: (Vec i64) x: i64) -> (Vec i64)
+  (if (set-has? xs x)
+      xs
+      (loop ((i 0) (acc (vec-empty)) (done false))
+        (if (< i (count xs))
+            (let ((y (nth xs i)))
+              (if (and (not done) (< x y))
+                  (recur (+ i 1) (conj (conj acc x) y) true)
+                  (recur (+ i 1) (conj acc y) done)))
+            (if done acc (conj acc x))))))
+
+(defun set-union :private (a: (Vec i64) b: (Vec i64)) -> (Vec i64)
+  (loop ((i 0) (acc a))
+    (if (< i (count b)) (recur (+ i 1) (set-add acc (nth b i))) acc)))
+
+;; ------------------------------------------------------ reading the forms
+
+(defun is-str? :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SStr _) true)
+    (_ false)))
+
+(defun is-vec? :private (form: Stx) -> bool
+  (match (. form kind)
+    ((SVec _) true)
+    (_ false)))
+
+;; The clauses of a `defn` call (`items` is the whole call) when its
+;; parameters are written as clauses, `([x] ..) ([x y] ..)`. (`clauses_of`)
+(defun clauses-of (items: (Vec Stx)) -> (Option (Vec Stx))
+  (let ((at (if (and (> (count items) 2) (is-str? (nth items 2))) 3 2)))
+    (if (< at (count items))
+        (match (items-of (nth items at))
+          (nil nil)
+          ((some c) (if (and (> (count c) 0) (is-vec? (nth c 0)))
+                        (some (tail-from items at))
+                        nil)))
+        nil)))
+
+;; The parameter count of a clause `([params] ..)`. (`clause_arity`)
+(defun clause-arity (clause: Stx) -> (Option i64)
+  (match (items-of clause)
+    (nil nil)
+    ((some c)
+     (if (> (count c) 0)
+         (match (. (nth c 0) kind)
+           ((SVec ps) (some (params/arity ps)))
+           (_ nil))
+         nil))))
+
+;; The top-level forms, a top-level `do` looked through, in order.
+(defun top-forms :private (forms: (Vec Stx) out: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 0) (acc out))
+    (if (< i (count forms))
+        (let ((form (nth forms i)))
+          (if (= (unwrap-or (head-name form) "") "do")
+              (recur (+ i 1) (top-forms (tail-from (unwrap-or (items-of form) (vec-empty)) 1) acc))
+              (recur (+ i 1) (conj acc form))))
+        acc)))
+
+;; A method of a protocol: its name and parameter count.
+(defstruct Method :private (name: str arity: i64))
+
+(defun method-of :private (m: Stx) -> (Option Method)
+  (match (items-of m)
+    (nil nil)
+    ((some parts)
+     (if (< (count parts) 2)
+         nil
+         (match (sym-of (nth parts 0))
+           (nil nil)
+           ((some name)
+            (match (items-of (nth parts 1))
+              (nil nil)
+              ((some ps) (some (Method name (params/arity ps)))))))))))
+
+;; The methods of a `defprotocol` form.
+(defun methods-of :private (form: Stx) -> (Vec Method)
+  (let ((items (unwrap-or (items-of form) (vec-empty)))
+        (requires (and (> (count items) 2)
+                       (match (. (nth items 2) kind)
+                         ((SKw k) (= k "requires"))
+                         (_ false)))))
+    (loop ((i (if requires 4 2)) (out (vec-empty)))
+      (if (< i (count items))
+          (recur (+ i 1) (match (method-of (nth items i))
+                           ((some m) (conj out m))
+                           (nil out)))
+          out))))
+
+;; ------------------------------------------------------------ the tables
+
+(defun table-key :private (ns: str name: str) -> str
+  (str-join [ns "/" name]))
+
+(defun table-get :private (ctx: ExpandCtx ns: str name: str) -> (Option Overload)
+  (map-get @(. ctx overloads) (table-key ns name)))
+
+;; The entry of `name` in the table of the module being expanded.
+(defun table-entry :private (ctx: ExpandCtx name: str) -> Overload
+  (unwrap-or (table-get ctx (. (ctx-scope ctx) ns) name) (Overload (vec-empty) (vec-empty))))
+
+(defun table-put :private (ctx: ExpandCtx name: str o: Overload) -> unit
+  (set! (. ctx overloads)
+        (assoc @(. ctx overloads) (table-key (. (ctx-scope ctx) ns) name) o)))
+
+;; The arities of the protocol methods called `name` that the module being
+;; expanded sees. (`visible_methods`)
+(defun visible-methods :private (ctx: ExpandCtx name: str) -> (Vec i64)
+  (let ((scope (ctx-scope ctx))
+        (nss (concat-strs (concat-strs [(. scope ns)] (. scope uses)) (. scope implicit))))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i (count nss))
+          (recur (+ i 1)
+                 (match (table-get ctx (nth nss i) name)
+                   ((some o) (set-union out (. o methods)))
+                   (nil out)))
+          out))))
+
+(defun concat-strs :private (a: (Vec str) b: (Vec str)) -> (Vec str)
+  (loop ((i 0) (acc a))
+    (if (< i (count b)) (recur (+ i 1) (conj acc (nth b i))) acc)))
+
+;; Records a clause of `name` taking `arity` arguments in the module being
+;; expanded: an error if it has one already, or a protocol method of that
+;; name and count is visible. (`add_clause`)
+(defun add-clause :private (ctx: ExpandCtx name: str arity: i64 pos: Pos) -> (Result unit ExpandError)
+  (let ((clash (set-has? (visible-methods ctx name) arity))
+        (entry (table-entry ctx name)))
+    (cond (set-has? (. entry clauses) arity)
+           (Err (ExpandError (DuplicateClause name arity) pos))
+          clash (Err (ExpandError (ClauseOfMethod name arity) pos))
+          :else (do (table-put ctx name (Overload (set-add (. entry clauses) arity) (. entry methods)))
+                    (Ok ())))))
+
+;; Records a clause function `base$N` that a macro produced, as it is
+;; defined; one the scan saw is there already. (`note_clause`)
+(defun note-clause (ctx: ExpandCtx defined: str) -> unit
+  (match (split-clause defined)
+    (nil ())
+    ((some c)
+     (let ((entry (table-entry ctx (. c base))))
+       (table-put ctx (. c base)
+                  (Overload (set-add (. entry clauses) (. c arity)) (. entry methods)))))))
+
+;; The `defn` forms of the top-level forms that have two clauses or more.
+(defun scan-protocols :private (ctx: ExpandCtx forms: (Vec Stx)) -> unit
+  (loop ((i 0))
+    (if (< i (count forms))
+        (do (if (= (unwrap-or (head-name (nth forms i)) "") "defprotocol")
+                (add-methods ctx (methods-of (nth forms i)))
+                ())
+            (recur (+ i 1)))
+        ())))
+
+(defun add-methods :private (ctx: ExpandCtx ms: (Vec Method)) -> unit
+  (loop ((j 0))
+    (if (< j (count ms))
+        (let ((m (nth ms j))
+              (entry (table-entry ctx (. (nth ms j) name))))
+          (do (table-put ctx (. m name)
+                         (Overload (. entry clauses) (set-add (. entry methods) (. m arity))))
+              (recur (+ j 1))))
+        ())))
+
+(defun scan-clauses :private (ctx: ExpandCtx name: str clauses: (Vec Stx)) -> (Result unit ExpandError)
+  (loop ((k 0))
+    (if (< k (count clauses))
+        (match (clause-arity (nth clauses k))
+          (nil (recur (+ k 1)))
+          ((some arity)
+           (match (add-clause ctx name arity (. (nth clauses k) pos))
+             ((Err e) (Err e))
+             ((Ok _) (recur (+ k 1))))))
+        (Ok ()))))
+
+(defun scan-defn :private (ctx: ExpandCtx form: Stx) -> (Result unit ExpandError)
+  (let ((items (unwrap-or (items-of form) (vec-empty))))
+    (if (< (count items) 2)
+        (Ok ())
+        (match (sym-of (nth items 1))
+          (nil (Ok ()))
+          ((some name)
+           (match (clauses-of items)
+             (nil (Ok ()))
+             ((some clauses)
+              (if (< (count clauses) 2) (Ok ()) (scan-clauses ctx name clauses)))))))))
+
+;; Reads the arity table of the module being expanded off its unexpanded
+;; forms; an error for two clauses of one count, or a clause of the arity
+;; of a protocol method of its name. (`scan`)
+(defun overload-scan (ctx: ExpandCtx forms: (Vec Stx)) -> (Result unit ExpandError)
+  (let ((all (top-forms forms (vec-empty))))
+    (do (scan-protocols ctx all)
+        (loop ((i 0))
+          (if (< i (count all))
+              (let ((h (unwrap-or (head-name (nth all i)) "")))
+                (if (or (= h "defn") (= h "defn-"))
+                    (match (scan-defn ctx (nth all i))
+                      ((Err e) (Err e))
+                      ((Ok _) (recur (+ i 1))))
+                    (recur (+ i 1))))
+              (Ok ()))))))
+
+;; ----------------------------------------------------------- resolution
+
+;; The overload of `name` that module `ns` exports, through the modules it
+;; re-exports. (`overload_in`)
+(defun overload-in :private (ctx: ExpandCtx ns: str name: str) -> (Option Overload)
+  (match (table-get ctx ns name)
+    ((some o) (if (> (count (. o clauses)) 0) (some o) (reexported-overload ctx ns name)))
+    (nil (reexported-overload ctx ns name))))
+
+(defun reexported-overload :private (ctx: ExpandCtx ns: str name: str) -> (Option Overload)
+  (match (map-get @(. ctx exports) ns)
+    (nil nil)
+    ((some rs)
+     (loop ((i 0))
+       (if (< i (count rs))
+           (match (overload-in ctx (nth rs i) name)
+             ((some o) (some o))
+             (nil (recur (+ i 1))))
+           nil)))))
+
+;; An overload a call head reaches: the head's qualifier (`alias/` or
+;; empty), the base name and the overload.
+(defstruct Reach :private (qualifier: str base: str overload: Overload))
+
+(defun has-name? :private (names: (Vec str) q: str) -> bool
+  (loop ((i 0))
+    (cond (>= i (count names)) false
+          (= (nth names i) q) true
+          :else (recur (+ i 1)))))
+
+(defun qualified-overload :private (ctx: ExpandCtx scope: ModuleScope name: str slash: i64)
+    -> (Option Reach)
+  (let ((q (str-slice name 0 slash))
+        (base (str-slice name (+ slash 1) (str-len name))))
+    (match (module-of-qualifier scope q)
+      (nil nil)
+      ((some ns)
+       (match (overload-in ctx ns base)
+         (nil nil)
+         ((some o) (some (Reach (str-slice name 0 (+ slash 1)) base o))))))))
+
+;; The module a qualifier names: an alias, else the module itself, an
+;; implicit module or a used one; the prelude's name reaches no overload.
+(defun module-of-qualifier :private (scope: ModuleScope q: str) -> (Option str)
+  (match (map-get (. scope aliases) q)
+    ((some ns) (some ns))
+    (nil (cond (= q prelude-ns) nil
+               (= q (. scope ns)) (some q)
+               (or (has-name? (. scope implicit) q) (has-name? (. scope uses) q)) (some q)
+               :else nil))))
+
+;; A bare name: the module's own table first (a plain own definition
+;; hides), then what its `:use`s and implicit modules export.
+(defun bare-overload :private (ctx: ExpandCtx scope: ModuleScope name: str) -> (Option Reach)
+  (match (overload-in ctx (. scope ns) name)
+    ((some o) (some (Reach "" name o)))
+    (nil (if (some? (map-get @(. ctx own) name))
+             nil
+             (used-overload ctx (concat-strs (. scope uses) (. scope implicit)) name)))))
+
+(defun used-overload :private (ctx: ExpandCtx nss: (Vec str) name: str) -> (Option Reach)
+  (loop ((i 0))
+    (if (< i (count nss))
+        (match (overload-in ctx (nth nss i) name)
+          ((some o) (some (Reach "" name o)))
+          (nil (if (some? (map-get (ctx-add-exported ctx (map-empty) (nth nss i)) name))
+                   nil
+                   (recur (+ i 1)))))
+        nil)))
+
+;; The overload a call head `name` reaches from the module being expanded.
+;; (`overload_of`)
+(defun overload-of :private (ctx: ExpandCtx name: str) -> (Option Reach)
+  (let ((scope (ctx-scope ctx))
+        (slash (slash-at name)))
+    (if (>= slash 0)
+        (qualified-overload ctx scope name slash)
+        (bare-overload ctx scope name))))
+
+;; The head a call of `name` with `argc` arguments has once its clause is
+;; picked; nil if `name` is not an overloaded function, or the call is of a
+;; protocol method's arity. (`pick_clause`)
+(defun pick-clause :private (ctx: ExpandCtx name: str argc: i64 pos: Pos)
+    -> (Result (Option str) ExpandError)
+  (match (overload-of ctx name)
+    (nil (Ok nil))
+    ((some r)
+     (let ((o (. r overload)))
+       (cond (set-has? (. o clauses) argc)
+              (Ok (some (str-join [(. r qualifier) (clause-name (. r base) argc)])))
+             (set-has? (. o methods) argc) (Ok nil)
+             :else (Err (ExpandError (NoClause name (set-union (. o clauses) (. o methods)) argc)
+                                     pos)))))))
+
+;; `form`, a call, with its head replaced by the clause its argument count
+;; picks; `(gensym)` is `(gensym "G__")`. (`pick`)
+(defun overload-pick (ctx: ExpandCtx form: Stx) -> (Result Stx ExpandError)
+  (match (head-name form)
+    (nil (Ok form))
+    ((some name)
+     (let ((items (unwrap-or (items-of form) (vec-empty)))
+           (pos (. form pos))
+           (argc (- (count (unwrap-or (items-of form) (vec-empty))) 1)))
+       (if (and (= name "gensym") (= argc 0) (not (some? (map-get @(. ctx own) "gensym"))))
+           (Ok (Stx (SList (conj items (string "G__" pos))) pos))
+           (match (pick-clause ctx name argc pos)
+             ((Err e) (Err e))
+             ((Ok nil) (Ok form))
+             ((Ok (some head))
+              (Ok (Stx (SList (concat-forms [(sym head (. (nth items 0) pos))] (tail-from items 1)))
+                       pos)))))))))
