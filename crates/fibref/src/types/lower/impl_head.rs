@@ -12,7 +12,7 @@ use crate::types::annot::AnnEnv;
 use crate::types::ast::{ColourAnn, TypeAnn};
 use crate::types::decls::{Globals, InstanceDef, ModuleId};
 use crate::types::error::{TResult, TypeError};
-use crate::types::ty::{Colour, Con, Ty};
+use crate::types::ty::{Colour, Con, Pred, Ty};
 
 use super::typeform::type_ann;
 
@@ -73,12 +73,73 @@ pub fn impl_head(g: &Globals, m: ModuleId, form: &Form) -> TResult<ImplHead> {
 /// The variables of an impl head in a determined argument or the
 /// `:where` context: a type variable is `Gen(i)`, and so is a colour
 /// variable at a colour parameter; a colour variable anywhere else is
-/// an error.
+/// an error. A name that is not a head variable is, in `lenient`
+/// mode, a candidate *determined* variable (types §3.3, L16): it gets
+/// the next `Gen` index and its first position is kept in `extras`,
+/// for [`check_determined`] to accept or reject once the whole
+/// context is lowered.
 pub struct HeadEnv<'a> {
-    /// The head's variables.
-    pub vars: &'a [String],
+    /// The head's variables, then the candidate determined ones.
+    pub vars: &'a mut Vec<String>,
     /// Which are colour variables.
-    pub colours: &'a [bool],
+    pub colours: &'a mut Vec<bool>,
+    /// Whether an unknown name becomes a candidate determined variable.
+    pub lenient: bool,
+    /// Per candidate: its index in `vars` and where it was first named.
+    pub extras: &'a mut Vec<(usize, Pos)>,
+}
+
+const NOT_PARAM: &str = "is not a parameter of the impl head";
+
+/// The liberal coverage condition (types §3.3, L16): the variables the
+/// head does not name (`extras`) must each be *determined*. A variable
+/// is determined when it stands in a determined position of a context
+/// constraint `(P s d ..)` whose dispatch argument `s` mentions only
+/// head variables and variables already determined. One that no
+/// constraint determines is the error it always was.
+pub fn check_determined(
+    vars: &[String],
+    head_len: usize,
+    extras: &[(usize, Pos)],
+    context: &[Pred],
+) -> TResult<()> {
+    let mut known: Vec<bool> = (0..vars.len()).map(|i| i < head_len).collect();
+    loop {
+        let mut grew = false;
+        for c in context {
+            let Pred::Proto(_, tys) = c else { continue };
+            let Some((s, outs)) = tys.split_first() else {
+                continue;
+            };
+            if gens(s).iter().all(|i| known[*i]) {
+                for i in outs.iter().flat_map(gens) {
+                    grew |= !std::mem::replace(&mut known[i], true);
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    match extras.iter().find(|(i, _)| !known[*i]) {
+        Some((i, pos)) => Err(TypeError::resolve(
+            pos,
+            format!("type variable {} {NOT_PARAM}", vars[*i]),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The `Gen` indices a type mentions.
+pub fn gens(t: &Ty) -> Vec<usize> {
+    let mut out = Vec::new();
+    t.map_leaves(&mut |l| {
+        if let Ty::Gen(i) = l {
+            out.push(*i as usize);
+        }
+        None
+    });
+    out
 }
 
 impl AnnEnv for HeadEnv<'_> {
@@ -89,9 +150,15 @@ impl AnnEnv for HeadEnv<'_> {
                 format!("{name} is a colour parameter of the impl head, not a type"),
             )),
             Some(i) => Ok(Ty::Gen(i as u32)),
+            None if self.lenient => {
+                self.extras.push((self.vars.len(), pos.clone()));
+                self.vars.push(name.to_string());
+                self.colours.push(false);
+                Ok(Ty::Gen(self.vars.len() as u32 - 1))
+            }
             None => Err(TypeError::resolve(
                 pos,
-                format!("type variable {name} is not a parameter of the impl head"),
+                format!("type variable {name} {NOT_PARAM}"),
             )),
         }
     }
@@ -177,10 +244,14 @@ mod tests {
             start: 0,
             end: 0,
         };
-        let vars = vec!["a".to_string(), "k".to_string()];
+        let mut vars = vec!["a".to_string(), "k".to_string()];
+        let mut colours = vec![false, true];
+        let mut extras = Vec::new();
         let mut env = HeadEnv {
-            vars: &vars,
-            colours: &[false, true],
+            vars: &mut vars,
+            colours: &mut colours,
+            lenient: false,
+            extras: &mut extras,
         };
         assert_eq!(env.var("a", &pos).ok(), Some(Ty::Gen(0)));
         assert!(env.var("k", &pos).is_err());
@@ -190,5 +261,37 @@ mod tests {
         ));
         assert!(matches!(env.colour_param_arg("a", &pos), Some(Err(_))));
         assert!(env.named_colour("k", &pos).is_err());
+    }
+
+    fn pos() -> Pos {
+        Pos {
+            file: std::sync::Arc::from("t"),
+            line: 1,
+            col: 1,
+            start: 0,
+            end: 0,
+        }
+    }
+
+    fn cur(s: u32, d: u32) -> Pred {
+        Pred::Proto(crate::types::ty::ProtoId(0), vec![Ty::Gen(s), Ty::Gen(d)])
+    }
+
+    #[test]
+    fn a_variable_is_determined_from_the_head_and_not_from_itself() {
+        let vars: Vec<String> = ["c", "k", "j"].iter().map(|s| s.to_string()).collect();
+        let k = vec![(1, pos())];
+        // (Cur c k): k is determined by the head variable c
+        assert!(check_determined(&vars, 1, &k, &[cur(0, 1)]).is_ok());
+        // no constraint at all
+        let e = check_determined(&vars, 1, &k, &[])
+            .err()
+            .map(|e| e.to_string());
+        assert!(e.is_some_and(|m| m.contains("type variable k is not a parameter")));
+        // (Cur k j) (Cur j k): neither starts at the head
+        let kj = vec![(1, pos()), (2, pos())];
+        assert!(check_determined(&vars, 1, &kj, &[cur(1, 2), cur(2, 1)]).is_err());
+        // (Cur c k) (Cur k j): j is determined through k
+        assert!(check_determined(&vars, 1, &kj, &[cur(1, 2), cur(0, 1)]).is_ok());
     }
 }

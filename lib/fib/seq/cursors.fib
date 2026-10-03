@@ -21,13 +21,17 @@
 ;;    does, and Repeat holds the element. A Cycle has the cursor of its lazy seq, one node per element, because a cursor that
 ;;    walked its source again on every pass would have to name the cursor type of the source in the instance head, which no
 ;;    impl may do until §7 L16 (X7) lands.
-;;  - every recipe is Cursable by buffering (stdlib §2.1 rule 5): its cursor is the VecCur of `(to-vec self)`, one Vec made
-;;    when the cursor is, none per element. They are the seven of tranche 1 (Mapped Filtered Taken Dropped TakenWhile Mapcat
-;;    Cat), the seven of Y2 (MapIndexed Kept DroppedWhile Interposed Distinct Reductions Consed) and the three below. Not
-;;    done here: after X7 the cursors of Mapped Dropped Taken Zipped lose the buffer (plan W2). Until then a recipe over an
-;;    endless source (a Mapped over a Repeat) that is the second operand of a fused walk never returns: the walk that fills the
-;;    buffer never ends, and ran out of memory (`trap: out of memory`) in the one probe made, under a 2 GB limit. No instance
-;;    for Option, Map and Set: the page lists none, and one line of buffering is a user's to write.
+;;  - Mapped, Taken, Dropped and Zipped are Cursable without a buffer (L16, X7): their cursor is a struct over the cursor of
+;;    their source (the cursor type is a variable of the impl that `(Cursable c cc)` determines), so one `advance!` pulls one
+;;    element, a recipe over an endless source (a Mapped over a Repeat) is a valid second operand, and a Mapped calls its
+;;    function in `current`, so only for the elements read (a second `current` calls it again). The price: the source of
+;;    each must itself be Cursable, which a type with each-while alone (a Map, a Set, an Option) is not; and the left
+;;    operand of a Zipped that is walked by cursor must be Cursable too (its walk by each-while is unchanged).
+;;  - every other recipe is Cursable by buffering (stdlib §2.1 rule 5): its cursor is the VecCur of `(to-vec self)`, one Vec made
+;;    when the cursor is, none per element. They are Filtered TakenWhile Mapcat Cat of tranche 1, the seven of Y2
+;;    (MapIndexed Kept DroppedWhile Interposed Distinct Reductions Consed) and the two below (ZipWith Interleaved). A recipe
+;;    of these over an endless source that is the second operand of a fused walk never returns: the walk that fills the buffer
+;;    never ends. No instance for Option, Map and Set: the page lists none, and one line of buffering is a user's to write.
 ;;
 ;; The recipes of the lockstep walks are for the expander's rewrite (X12, plan §5): (Zipped a b), (ZipWith a b f) and
 ;; (Interleaved a b), the sources first and then the function (decided here: `zip-with` takes `f` first and the recipe
@@ -36,7 +40,7 @@
 ;; (a Pair for Zipped, until C5). A walk that ends because `b` ran out has run to the end by its own rule and answers true,
 ;; as Taken does; one the consumer stopped answers false. Interleaved never emits an element of `a` whose partner is
 ;; missing, as Clojure's. The impl heads carry the element and cursor types as phantom parameters, as the tranche-1
-;; recipes do, because no impl context may name a variable that a constraint determines (L16). A hazard for X12: the lazy
+;; recipes do, because the recipes' element and cursor types are not fields; the cursors above name the determined cursor type of their source (L16). A hazard for X12: the lazy
 ;; functions below take any Reducible as the second operand and the recipes only a Cursable one, so a rewrite of a `zip`
 ;; whose second operand has no Cursable instance (a user type with each-while alone, a Map, a Set, an Option) turns a valid
 ;; call into the type error `no implementation of Cursable for ..`.
@@ -232,11 +236,54 @@
                                 (do (set! ended true) false))))))
         (if done true @ended)))))
 
+;; ---- the bufferless cursors (L16): Mapped, Taken, Dropped and Zipped pull from the cursor of their source ----
+;; The cursor type of the source is a variable the impl does not name in its head but `(Cursable c cc)` determines (types §3.3).
+;; Mapped calls its function in `current`, so only for the elements read: a program that reads one element calls it once.
+(defstruct (MappedCur cc e b) (src: cc f: (fn (e) b)))
+(impl (Cursor b) (MappedCur cc e b) :where ((Cursor cc e))
+  (advance! (self) (advance! (. self src)))
+  (current (self) ((. self f) (current (. self src)))))
+(impl (Cursable (MappedCur cc e b)) (Mapped c e b) :where ((Cursable c cc))
+  (cursor (self) (MappedCur (cursor (. self src)) (. self f))))
+
+;; Taken: `left` elements may still be asked of the source; `on` says the cursor stands on one of them
+(defstruct (TakenCur cc e) (src: cc left: (Cell i64) on: (Cell bool)))
+(impl (Cursor e) (TakenCur cc e) :where ((Cursor cc e))
+  (advance! (self)
+    (if (> @(. self left) 0)
+        (do (set! (. self left) (- @(. self left) 1))
+            (let ((ok (advance! (. self src))))
+              (do (set! (. self on) ok)
+                  (if ok true (do (set! (. self left) 0) false)))))
+        (do (set! (. self on) false) false)))
+  (current (self) (if @(. self on) (current (. self src)) (no-element))))
+(impl (Cursable (TakenCur cc e)) (Taken c e) :where ((Cursable c cc))
+  (cursor (self) (TakenCur (cursor (. self src)) (cell (. self n)) (cell false))))
+
+;; Dropped: the first advance! skips `skip` elements of the source, then moves to the next one
+(defstruct (DroppedCur cc e) (src: cc skip: (Cell i64)))
+(impl (Cursor e) (DroppedCur cc e) :where ((Cursor cc e))
+  (advance! (self)
+    (do (loop ()
+          (if (> @(. self skip) 0)
+              (do (set! (. self skip) (- @(. self skip) 1))
+                  (if (advance! (. self src)) (recur) (set! (. self skip) 0)))
+              ()))
+        (advance! (. self src))))
+  (current (self) (current (. self src))))
+(impl (Cursable (DroppedCur cc e)) (Dropped c e) :where ((Cursable c cc))
+  (cursor (self) (DroppedCur (cursor (. self src)) (cell (. self n)))))
+
+;; Zipped: the left cursor is advanced first, and the right one only when the left has an element
+(defstruct (ZippedCur ca cb ea eb) (l: ca r: cb))
+(impl (Cursor (Pair ea eb)) (ZippedCur ca cb ea eb) :where ((Cursor ca ea) (Cursor cb eb))
+  (advance! (self) (if (advance! (. self l)) (advance! (. self r)) false))
+  (current (self) (Pair (current (. self l)) (current (. self r)))))
+(impl (Cursable (ZippedCur ca cb ea eb)) (Zipped a b ea eb cb) :where ((Cursable a ca) (Cursable b cb))
+  (cursor (self) (ZippedCur (cursor (. self left)) (cursor (. self right)))))
+
 ;; ---- every recipe is Cursable by buffering: one Vec per cursor, none per element ----
-(impl (Cursable (VecCur b)) (Mapped c e b) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
 (impl (Cursable (VecCur e)) (Filtered c e r) :where ((Reducible c e) (Truthy r)) (cursor (self) (cursor (to-vec self))))
-(impl (Cursable (VecCur e)) (Taken c e) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
-(impl (Cursable (VecCur e)) (Dropped c e) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
 (impl (Cursable (VecCur e)) (TakenWhile c e r) :where ((Reducible c e) (Truthy r)) (cursor (self) (cursor (to-vec self))))
 (impl (Cursable (VecCur b)) (Mapcat c e d b) :where ((Reducible c e) (Reducible d b)) (cursor (self) (cursor (to-vec self))))
 (impl (Cursable (VecCur e)) (Cat a b e) :where ((Reducible a e) (Reducible b e)) (cursor (self) (cursor (to-vec self))))
@@ -247,8 +294,6 @@
 (impl (Cursable (VecCur e)) (Distinct c e) :where ((Reducible c e) (Hash e) (Eq e)) (cursor (self) (cursor (to-vec self))))
 (impl (Cursable (VecCur a)) (Reductions c e a) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
 (impl (Cursable (VecCur e)) (Consed c e) :where ((Reducible c e)) (cursor (self) (cursor (to-vec self))))
-(impl (Cursable (VecCur (Pair ea eb))) (Zipped a b ea eb cb) :where ((Reducible a ea) (Cursable b cb) (Cursor cb eb))
-  (cursor (self) (cursor (to-vec self))))
 (impl (Cursable (VecCur r)) (ZipWith a b ea eb cb r) :where ((Reducible a ea) (Cursable b cb) (Cursor cb eb))
   (cursor (self) (cursor (to-vec self))))
 (impl (Cursable (VecCur e)) (Interleaved a b e cb) :where ((Reducible a e) (Cursable b cb) (Cursor cb e))

@@ -12,7 +12,7 @@ use crate::types::scheme::Scheme;
 use crate::types::ty::{Colour, Leaf, Pred, ProtoId, Ty};
 
 use super::decl::{annotation_name, define_value};
-use super::impl_head::{impl_head, HeadEnv, ImplHead};
+use super::impl_head::{check_determined, impl_head, HeadEnv, ImplHead};
 use super::supers::{methods_start, resolve_supers};
 use super::typeform::{proto_ref, type_ann};
 
@@ -234,13 +234,17 @@ pub fn declare_impl<'f>(
     let (proto, det_anns) = proto_ref(g, m, &items[1], false)?;
     let ImplHead {
         con,
-        vars,
-        colours,
+        mut vars,
+        mut colours,
         head,
     } = impl_head(g, m, &items[2])?;
-    let env = || HeadEnv {
-        vars: &vars,
-        colours: &colours,
+    let head_len = vars.len();
+    let mut extras = Vec::new();
+    let mut env = HeadEnv {
+        vars: &mut vars,
+        colours: &mut colours,
+        lenient: true,
+        extras: &mut extras,
     };
     let mut rest = &items[3..];
     let mut context = Vec::new();
@@ -249,15 +253,16 @@ pub fn declare_impl<'f>(
             let Some(cs) = rest.get(1) else {
                 return Err(TypeError::resolve(&form.pos, ":where without constraints"));
             };
-            context = where_preds(g, m, cs, &mut env())?;
+            context = where_preds(g, m, cs, &mut env)?;
             rest = &rest[2..];
         }
     }
     let dets = det_anns
         .iter()
-        .map(|d| ann_to_ty(d, &mut env(), &items[1].pos))
+        .map(|d| ann_to_ty(d, &mut env, &items[1].pos))
         .collect::<TResult<Vec<_>>>()?;
-    paterson(g, &context, &head, &form.pos)?;
+    check_determined(&vars, head_len, &extras, &context)?;
+    paterson(g, &context, &head, head_len, &form.pos)?;
     let inst = InstanceDef {
         proto,
         con,
@@ -352,22 +357,41 @@ pub fn pred_of(g: &Globals, m: ModuleId, name: &str, mut tys: Vec<Ty>, pos: &Pos
     Ok(Pred::Proto(p, tys))
 }
 
-/// The Paterson condition (§3.3): each context constraint has no
-/// variable more often than the head and is smaller than the head.
-fn paterson(g: &Globals, context: &[Pred], head: &Ty, pos: &Pos) -> TResult<()> {
+/// The Paterson condition (§3.3), with the termination bound of the
+/// determined variables (L16): the *dispatch* argument of each
+/// protocol constraint (the other arguments are outputs the instance
+/// that discharges it fixes) has no variable more often than the head
+/// and is smaller than the head, and mentions only variables the head
+/// names (the first `head_len`): a determined variable is never
+/// looked up again, so every constraint a step adds is on a proper
+/// subterm of the head it came from and the worklist empties. The
+/// other constraints (`Send` and the like) are measured whole.
+fn paterson(g: &Globals, context: &[Pred], head: &Ty, head_len: usize, pos: &Pos) -> TResult<()> {
     let (head_size, head_vars) = size(&[head]);
     for c in context {
-        let (s, vars) = size(&c.tys());
+        let measured: Vec<&Ty> = match c {
+            Pred::Proto(_, tys) => tys.iter().take(1).collect(),
+            _ => c.tys(),
+        };
+        let (s, vars) = size(&measured);
         let too_many = vars.iter().any(|(v, n)| {
             head_vars
                 .iter()
                 .find(|(w, _)| w == v)
                 .is_none_or(|(_, m)| n > m)
         });
+        let printer = crate::types::display::Printer::new(g);
+        if matches!(c, Pred::Proto(..)) && vars.iter().any(|(v, _)| *v as usize >= head_len) {
+            let msg = format!(
+                "the context constraint {} looks up a determined variable; a dispatch argument may name only head variables (the termination bound of determined variables)",
+                printer.pred(c)
+            );
+            return Err(TypeError::other(pos, msg));
+        }
         if too_many || s >= head_size {
             let msg = format!(
                 "the context constraint {} is not smaller than the instance head",
-                crate::types::display::Printer::new(g).pred(c)
+                printer.pred(c)
             );
             return Err(TypeError::other(pos, msg));
         }

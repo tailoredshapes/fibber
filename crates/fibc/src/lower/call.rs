@@ -4,6 +4,7 @@
 
 use fibref::own::program::{Callee, Pass, Tail};
 use fibref::types::ast::{Arg, BindingId, Expr, ExprKind, GlobalRef};
+use fibref::types::decls::InstanceDef;
 use fibref::types::infer::Resolution;
 use fibref::types::ty::{Con, Pred, ProtoId, Ty};
 
@@ -310,24 +311,34 @@ impl<'a> Cx<'_, 'a> {
     /// The instance that discharges a concrete protocol constraint,
     /// with its variables' values.
     pub fn instance_of_pred(&self, pred: &Pred) -> R<(usize, Vec<Ty>)> {
-        let g = self.p.g();
         let Pred::Proto(p, tys) = pred else {
             return Err(Unsupported("a non-protocol bound at a method call".into()));
         };
         let head_ty = tys
             .first()
             .ok_or_else(|| Unsupported("a protocol without a head".into()))?;
+        self.instance_for(*p, head_ty, &tys[1..])
+    }
+
+    /// The instance of `p` for `head_ty`, given the determined arguments
+    /// `dets` when they are known (else none).
+    fn instance_for(&self, p: ProtoId, head_ty: &Ty, dets: &[Ty]) -> R<(usize, Vec<Ty>)> {
+        let g = self.p.g();
         let con = match head_ty {
             Ty::Con(c, _) => *c,
             Ty::Fn(..) => return Err(Unsupported("a protocol instance on a function type".into())),
             _ => return Err(Unsupported("a type variable at a method call".into())),
         };
-        let index = g.instance_index.get(&(*p, con)).copied().ok_or_else(|| {
-            Unsupported(format!("no instance of {} for {con:?}", g.proto(*p).name))
+        let index = g.instance_index.get(&(p, con)).copied().ok_or_else(|| {
+            Unsupported(format!("no instance of {} for {con:?}", g.proto(p).name))
         })?;
         let inst = &g.instances[index];
         let mut vars: Vec<Option<Ty>> = vec![None; inst.var_names.len()];
         match_head(&inst.head, head_ty, &mut vars);
+        for (d, t) in inst.dets.iter().zip(dets) {
+            match_head(d, t, &mut vars);
+        }
+        self.determine_from_context(inst, &mut vars)?;
         let args = vars
             .into_iter()
             .map(|v| {
@@ -335,6 +346,38 @@ impl<'a> Cx<'_, 'a> {
             })
             .collect::<R<Vec<_>>>()?;
         Ok((index, args))
+    }
+
+    /// The variables of `inst` that its head and determined arguments do
+    /// not fix, which its context determines (types §3.3, L16): for each
+    /// constraint `(Q s d ..)` whose dispatch argument is known, the
+    /// instance of `Q` for it gives the outputs, and they are matched
+    /// against the constraint's own.
+    fn determine_from_context(&self, inst: &InstanceDef, vars: &mut [Option<Ty>]) -> R<()> {
+        let g = self.p.g();
+        loop {
+            let mut grew = false;
+            for c in &inst.context {
+                let Pred::Proto(q, tys) = c else { continue };
+                let Some(s) = tys.first().and_then(|t| subst_known(t, vars)) else {
+                    continue;
+                };
+                let outs: Vec<&Ty> = tys[1..].iter().collect();
+                if outs.iter().all(|t| subst_known(t, vars).is_some()) {
+                    continue;
+                }
+                let (qi, qargs) = self.instance_for(*q, &s, &[])?;
+                let q_inst = &g.instances[qi];
+                for (t, d) in outs.iter().zip(&q_inst.dets) {
+                    let before = vars.iter().filter(|v| v.is_some()).count();
+                    match_head(t, &d.subst_gen(&qargs, &[]), vars);
+                    grew |= vars.iter().filter(|v| v.is_some()).count() > before;
+                }
+            }
+            if !grew {
+                return Ok(());
+            }
+        }
     }
 
     /// The call itself: `call` or `tailcall`, direct or through a
@@ -408,6 +451,22 @@ impl<'a> Cx<'_, 'a> {
 
 /// Matches an instance head (over `Gen` variables) against a concrete
 /// type, recording each variable's value.
+/// `t` with its variables read from `vars`, when all of them are known.
+fn subst_known(t: &Ty, vars: &[Option<Ty>]) -> Option<Ty> {
+    let mut ok = true;
+    let out = t.map_leaves(&mut |l| match l {
+        Ty::Gen(i) => match vars.get(*i as usize).and_then(Option::as_ref) {
+            Some(v) => Some(v.clone()),
+            None => {
+                ok = false;
+                None
+            }
+        },
+        _ => None,
+    });
+    ok.then_some(out)
+}
+
 fn match_head(head: &Ty, actual: &Ty, vars: &mut [Option<Ty>]) {
     match (head, actual) {
         (Ty::Gen(i), t) => {

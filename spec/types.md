@@ -990,9 +990,20 @@ bound, and again at the end of the SCC:
 | colour constraints | §5.4, after all type constraints of the SCC | `cell cannot be shared between threads: closure capture n has type (Cell T)` |
 
 Termination: each step binds a variable, removes a constraint, or
-replaces a constraint by an instance context whose types are proper
-subterms of the instance head (the Paterson condition, checked on every
-`impl`), so the worklist empties.
+replaces a constraint by an instance context whose *dispatch*
+arguments are proper subterms of the instance head (the Paterson
+condition, checked on every `impl`: the first argument of each protocol
+constraint is smaller than the head, no variable occurs more often in it
+than in the head, and it names head variables only; the other arguments
+are outputs, §4.1), so the worklist empties. An instance context may
+name variables the head does not (L16, §4.1 "Determined variables");
+the bound on dispatch arguments is what keeps that terminating: a
+determined variable is bound by an instance's output, which can be any
+size, and a constraint that dispatched on it could restart the
+resolution on a larger type (`(impl (Cur j) (Src c) :where ((Cur c k)
+(Cur k j)) ..)` with `(Cur Bar)` giving `(Src Bar)` would not end). It
+is `the context constraint (Cur k j) looks up a determined variable;
+a dispatch argument may name only head variables`.
 
 ### 3.4 Field access and `deref` without annotations
 
@@ -1186,6 +1197,27 @@ instance for `(Handler k)` or `(Handler :send)`, and the instance
 covers only that colour (§1.3; **Decided**, owner, 2026-09-28). Protocol
 parameters are output positions: `(Deref (Cell i64) t)` yields `t = i64`
 without annotation.
+
+**Determined variables** (**Decided**, owner, 2026-10-01, L16; the
+liberal coverage condition). The context of an `impl`, and the
+determined arguments of its protocol, may name type variables the head
+does not, if each is *determined*: it stands in an output (non-dispatch)
+position of a context constraint `(Q s d ..)` whose dispatch argument
+`s` names only head variables, as `k` does in `(impl (Cursable (Wrap
+k)) (Src c) :where ((Cursable c k)) ..)`. A determined variable is an
+instance variable like the others: `Gen(i)` after the head's in the
+instance, a fresh variable when the instance is applied (§3.3: it is
+bound by the improvement of the context constraint, which is retried
+when `c` is known), and rigid in the method bodies. A variable no
+constraint determines, or that only determines itself through others
+(`((Cur k j) (Cur j k))`), is still `type variable k is not a parameter
+of the impl head`; a head with two determined impls is still
+`overlapping instances` (one per `(P, K)`); the termination bound is
+§3.3's. This gives `(impl (Lookup k v) (Option s) :where ((Lookup s k
+v)) ..)` (so `(get (get m :a) :b)` types) and the cursors of `Mapped`,
+`Taken`, `Dropped` and `Zipped` over the cursor of their source. Not
+yet: a determined variable used as a dispatch argument (a chain), and
+a bound on a method's own variable (the push visitor of stdlib §2.2).
 
 **Supertraits** (**Decided**, owner, 2026-09-28; replaces "no
 supertraits in v1", §10 item 15). `(defprotocol Ord :requires (Eq) ..)`

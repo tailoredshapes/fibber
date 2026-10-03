@@ -1,0 +1,15 @@
+;; spec:   types §3.3 (the termination bound of determined variables), stdlib §7 L16
+;; expect: reject
+;; error:  looks up a determined variable
+;; With `(impl (Cur (Src Bar)) Bar ..)` and the impl for `Src` below, solving `(Cur (Src Bar) j)` makes `k = (Src Bar)` and then `(Cur k j)` runs the impl
+;; again on `Bar`'s output, and so for ever. The bound: the dispatch argument of a context constraint names head variables only, so the worklist cannot grow.
+(ns main (:use fib.core))
+
+(defprotocol (Cur s c) (cur (self) -> c))
+(defstruct Bar (n: i64))
+(defstruct (Src c) (inner: c))
+(impl (Cur (Src Bar)) Bar (cur (self) (Src (Bar 0))))
+(impl (Cur j) (Src c) :where ((Cur c k) (Cur k j))
+  (cur (self) (cur (cur (. self inner)))))
+
+(defun main () -> i64 (do (cur (Src (Bar 0))) 0))
