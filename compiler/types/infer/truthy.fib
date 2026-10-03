@@ -1,0 +1,132 @@
+;; compiler/types/infer/truthy.fib: truthiness (stdlib §7 L20), as
+;; crates/fibref/src/types/infer/truthy.rs (118 lines of Rust).
+;;
+;; The test of an `if` or of the operands of `and` and `or` is a `bool` or an `(Option T)`,
+;; truthy when `true` or `(some _)`; the one-armed `if` and the default-less `cond` are unit
+;; for unit bodies and `(Option T)` otherwise; `and` has the type of its last operand and `or`
+;; is typed by it. The rules type the forms; types.elab rewrites them into `if` and `match`
+;; once the types are known.
+;;
+;; Shapes: `condition` moved here from types.infer.expr (Rust moved it too); `infer` is the
+;; function parameter `cx-call` has, as expr and these modules are one cycle.
+(ns types.infer.truthy
+  (:use syntax.pos types.ty types.error types.store types.ast types.infer.cx types.infer.unify))
+
+;; Rust: truthy.rs:17 option_payload. The payload of `t` when it is an `Option` (resolved so far).
+(defun option-payload :private (cx: Cx t: Ty) -> (Option Ty)
+  (match (store-resolve (. cx st) t)
+    ((TCon (KNominal id) args) (if (= id @(. (. cx g) option)) (first args) nil))
+    (_ nil)))
+
+(defun always-true? :private (t: Ty) -> bool
+  (match t
+    ((TCon (KScalar s) _) (not (or (= s types.ty/SBool) (= s SUnit) (= s SPtr))))
+    ((TCon (KStr) _) true)
+    (_ false)))
+
+;; Rust: truthy.rs:37 condition. The test of an `if`, a clause of a one-armed `if`, an operand
+;; of `and` or a non-last operand of `or`: `bool` or `(Option T)`. A test of a primitive type
+;; that is not `bool` can never be false, which is the mistake a Clojure habit makes (`(if n
+;; ..)`, `(when s ..)`), so the error says that instead of `cannot unify i64 with bool` (stdlib
+;; §7 D1). A type not known yet is `bool`; any other type is the usual mismatch.
+(defun cx-condition (cx: Cx t: Ty pos: Pos) -> (Result unit TypeError)
+  (cond (some? (option-payload cx t)) (Ok ())
+        (always-true? (store-resolve (. cx st) t))
+         (Err (type-error Unify pos
+                (str-join ["a value of type " (cx-show cx t) " is always true; write the test"])))
+        :else (cx-unify cx t (ty-bool) pos)))
+
+(defun unit-ty? :private (t: Ty) -> bool
+  (match t
+    ((TCon (KScalar s) _) (= s SUnit))
+    (_ false)))
+
+;; The type of the first body that is not a variable (a `recur`), resolved.
+(defun first-known :private (cx: Cx bodies: (Vec Ty)) -> (Option Ty)
+  (find-first (fn (r: Ty) (match r ((TVar _) false) (_ true)))
+              (mapv (fn (b: Ty) (store-resolve (. cx st) b)) bodies)))
+
+;; Rust: truthy.rs:57 guarded. `(if t b)` and the chain of them: the bodies are all unit, or
+;; all of one type `T` and the form is `(Option T)`. A body whose type is not known (a
+;; `recur`) is unit unless another body says otherwise.
+(defun cx-guarded (cx: Cx clauses: (Vec Guard) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow)
+    -> (Result Ty TypeError)
+  (try-let ((bodies (guard-bodies cx clauses infer)))
+    (let ((value (match (first-known cx bodies)
+                   ((some t) (if (unit-ty? t) nil (some t)))
+                   (nil nil)))
+          )
+      (let ((target (unwrap-or value (ty-unit))))
+        (try-let ((_ (guard-flows cx clauses bodies target)))
+          (Ok (match value
+                ((some t) (ty-nominal @(. (. cx g) option) [t]))
+                (nil (ty-unit)))))))))
+
+;; Infers each test (a condition) and each body, in order; the types of the bodies.
+(defun guard-bodies :private (cx: Cx clauses: (Vec Guard) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow)
+    -> (Result (Vec Ty) TypeError)
+  (loop ((i 0) (bodies (vec-empty)))
+    (if (>= i (count clauses))
+        (Ok bodies)
+        (let ((c (nth clauses i)))
+          (try-let ((ct (infer cx (. c test)))
+                    (_ (cx-condition cx ct (. (. c test) pos)))
+                    (bt (infer cx (. c body))))
+            (recur (+ i 1) (conj bodies bt)))))))
+
+(defun guard-flows :private (cx: Cx clauses: (Vec Guard) bodies: (Vec Ty) target: Ty) -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (>= i (count clauses))
+        (Ok ())
+        (try-let ((_ (cx-flow cx (nth bodies i) target (. (. (nth clauses i) body) pos))))
+          (recur (+ i 1))))))
+
+;; Rust: truthy.rs:87 and_expr. `(and a b ..)`: each operand is a test; the type is the last's.
+(defun cx-and (cx: Cx ops: (Vec Expr) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow)
+    -> (Result Ty TypeError)
+  (loop ((i 0) (last (ty-bool)))
+    (if (>= i (count ops))
+        (Ok last)
+        (let ((o (nth ops i)))
+          (try-let ((t (infer cx o))
+                    (_ (cx-condition cx t (. o pos))))
+            (recur (+ i 1) t))))))
+
+;; The types of the operands, inferred in order.
+(defun infer-all :private (cx: Cx ops: (Vec Expr) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow)
+    -> (Result (Vec Ty) TypeError)
+  (loop ((i 0) (tys (vec-empty)))
+    (if (>= i (count ops))
+        (Ok tys)
+        (try-let ((t (infer cx (nth ops i))))
+          (recur (+ i 1) (conj tys t))))))
+
+;; Rust: truthy.rs:104 or_expr. `(or a b ..)`: typed by the last operand `L`. An earlier
+;; operand is a `bool` (and `L` is), an `(Option T)` when `L` is `bool`, an `(Option T)` equal
+;; to `L` when `L` is an `Option`, else an `(Option L)`: `(or (get m k) 7)` is the value or the
+;; default.
+(defun cx-or (cx: Cx ops: (Vec Expr) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow)
+    -> (Result Ty TypeError)
+  (try-let ((tys (infer-all cx ops infer)))
+    (if (empty? tys)
+        (Ok (ty-bool))
+        (let ((last (nth tys (- (count tys) 1))))
+          (loop ((i 0))
+            (if (>= i (- (count ops) 1))
+                (Ok last)
+                (try-let ((_ (or-operand cx (nth ops i) (nth tys i) last)))
+                  (recur (+ i 1)))))))))
+
+(defun bool-ty? :private (t: Ty) -> bool
+  (match t
+    ((TCon (KScalar s) _) (= s types.ty/SBool))
+    (_ false)))
+
+(defun or-operand :private (cx: Cx o: Expr t: Ty last: Ty) -> (Result unit TypeError)
+  (cond (nil? (option-payload cx t))
+         (try-let ((_ (cx-condition cx t (. o pos))))
+           (cx-unify cx last (ty-bool) (. o pos)))
+        (some? (option-payload cx last)) (cx-unify cx t last (. o pos))
+        (not (bool-ty? (store-resolve (. cx st) last)))
+         (cx-unify cx t (ty-nominal @(. (. cx g) option) [last]) (. o pos))
+        :else (Ok ())))

@@ -26,12 +26,15 @@
 
 ;; Unification variables, colour variables (the count of those made) and
 ;; the current level. Treat the fields as private: use the functions.
-(defstruct Store (nodes: (Cell (Map i64 VarNode)) colours: (Cell i64) level: (Cell i64)))
+;; `lits` are the unbound variables that are the type of an integer literal in an argument
+;; position (stdlib §7 L19), with the largest magnitude of the literals that share them.
+(defstruct Store (nodes: (Cell (Map i64 VarNode)) colours: (Cell i64) level: (Cell i64)
+                  lits: (Cell (Map i64 i64))))
 
 ;; An empty store at level 0 (the top level, where only closed schemes
 ;; live).
 (defun store-new () -> Store
-  (Store (cell (map-empty)) (cell 0) (cell 0)))
+  (Store (cell (map-empty)) (cell 0) (cell 0) (cell (map-empty))))
 
 (defun store-level (s: Store) -> i64 @(. s level))
 
@@ -49,6 +52,36 @@
   (let ((id (map-count @(. s nodes))))
     (do (set! (. s nodes) (assoc @(. s nodes) id (Unbound @(. s level))))
         (TVar id))))
+
+;; A fresh variable for the integer literal n (Rust `fresh_lit`).
+(defun store-fresh-lit (s: Store n: i64) -> Ty
+  (let ((t (store-fresh s)))
+    (match t
+      ((TVar v) (do (set! (. s lits) (assoc @(. s lits) v (lit-magnitude n))) t))
+      (_ t))))
+
+;; The magnitude of n (`unsigned_abs`; the one that does not fit saturates).
+(defun lit-magnitude :private (n: i64) -> i64
+  (cond (>= n 0) n
+        (= n (- (- 0 9223372036854775807) 1)) 9223372036854775807
+        :else (- 0 n)))
+
+;; The magnitude bound of the literal variable v, nil for any other variable.
+(defun store-lit-of (s: Store v: i64) -> (Option i64)
+  (get @(. s lits) v))
+
+;; Records that v also stands for a literal of magnitude m.
+(defun store-widen-lit (s: Store v: i64 m: i64) -> unit
+  (set! (. s lits) (assoc @(. s lits) v (max (unwrap-or (get @(. s lits) v) 0) m))))
+
+;; t zonked, with every literal variable still unbound as `i64`, for messages.
+(defun store-zonk-default (s: Store t: Ty) -> Ty
+  (match (store-resolve s t)
+    ((TVar v) (if (contains? @(. s lits) v) (ty-i64) (TVar v)))
+    ((TCon c args) (TCon c (mapv (fn (a: Ty) (store-zonk-default s a)) args)))
+    ((TFn k ps r)
+     (TFn k (mapv (fn (p: Ty) (store-zonk-default s p)) ps) (store-zonk-default s r)))
+    (other other)))
 
 ;; A fresh colour variable.
 (defun store-fresh-colour (s: Store) -> Colour

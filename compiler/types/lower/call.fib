@@ -15,7 +15,7 @@
         types.ast types.decls types.names types.builtins types.lower.typeform types.lower.scope))
 
 ;; What a call's head names, when it matters for lowering.
-(defenum Special SfDeref SfSet SfConcat SfSetField SfDyn (SfConvert op: ConvOp))
+(defenum Special SfDeref SfSet SfNot SfConcat SfSetField SfDyn (SfConvert op: ConvOp))
 
 ;; Whether `(dyn P :send e)`: the keyword right after the protocol.
 (defun dyn-send :private (items: (Vec Stx)) -> bool
@@ -72,6 +72,7 @@
            (nil nil)
            ((some r)
             (cond (is-builtin r "set!") (some SfSet)
+                  (is-builtin r "not") (some SfNot)
                   (is-builtin r "concat") (some SfConcat)
                   :else (match r
                           ((GMethod p i) (if (and (= i 0) (= (some p) @(. (. lw g) deref-proto))) (some SfDeref) nil))
@@ -145,6 +146,12 @@
                (target (place lw (nth items 1)))
                (value (lw-sub-expr lw (nth items 2) false)))
        (Ok (ESet target value))))
+    ((SfNot)
+     (try-let ((_ (arity items pos 1))
+               (test (lw-sub-expr lw (nth items 1) false)))
+       (let ((no (lw-mk lw pos (ELit (LitBool false))))
+             (yes (lw-mk lw pos (ELit (LitBool true)))))
+         (Ok (EIf test no yes)))))
     ((SfConcat)
      (try-let ((es (concat-operands lw items)))
        (Ok (EConcat es))))

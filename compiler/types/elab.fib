@@ -1,0 +1,260 @@
+;; compiler/types/elab.fib: elaboration after inference (stdlib §7 L20), as
+;; crates/fibref/src/types/elab.rs (390 lines of Rust).
+;;
+;; The forms the checker typed by truthiness (`EGuarded`, `EAnd`, `EOr`, `EElided`) and the
+;; tests that are an `(Option T)` become plain `if`, `match`, `some` and `nil`, with the types
+;; the checker found, so that the ownership pass, the interpreter and the compiler read only
+;; the core forms.
+;;
+;; An `(Option T)` is truthy when it is `(some _)`; `(Option bool)` when it is `(some true)`, as
+;; Clojure's `false` is falsy. The payload is read from the type as the definition has it: a
+;; type variable is never `bool`, whatever it is instantiated at.
+;;
+;; Shapes: the Rust rewrites each body in place (`&mut Expr`); here `el-expr` returns the
+;; rewritten expression and the tables of the program are set with the rebuilt rows. The new
+;; nodes take ids from `g-next-expr` in the Rust's order (children first, in `children_mut`
+;; order, then the node itself, each helper allocating as the Rust one does), so the dumps and
+;; the lIR of stage 2 agree. `finish` returns the kind of the node built for a form; the id
+;; and type of that node are dropped (the form keeps its own).
+(ns types.elab
+  (:use syntax.pos types.ty types.ast types.decls types.table types.infer.cx))
+
+(defstruct Elab (g: Globals t: Tables))
+
+;; How a test of this type is read: a `bool`, an `(Option T)` (truthy when `(some _)`), an
+;; `(Option bool)` (truthy when `(some true)`).
+(defenum Truth ElPlain ElSome ElSomeTrue)
+
+;; Rust: elab.rs:25 elaborate. Elaborates every body of the program.
+(defun elaborate (g: Globals t: Tables) -> unit
+  (let ((el (Elab g t)))
+    (do (doseq [i (range (table-count (. g funs)))]
+          (let ((f (table-get (. g funs) i)))
+            (table-set (. g funs) i
+                       (FunDef (. f name) (. f module) (. f params) (. f ret) (. f bounds)
+                               (el-expr el (. f body)) (. f is-macro) (. f pos)))))
+        (doseq [i (range (table-count (. g defs)))]
+          (let ((d (table-get (. g defs) i)))
+            (table-set (. g defs) i
+                       (DefDef (. d name) (. d module) (. d ann) (el-expr el (. d init))
+                               (. d constant) (. d pos)))))
+        (doseq [i (range (table-count (. g instances)))]
+          (let ((inst (table-get (. g instances) i)))
+            (table-set (. g instances) i
+                       (InstanceDef (. inst proto) (. inst con) (. inst module) (. inst var-names)
+                                    (. inst head) (. inst dets) (. inst context)
+                                    (mapv (fn (m: ImplMethod) (el-method el m)) (. inst methods))
+                                    (. inst pos))))))))
+
+(defun el-method :private (el: Elab m: ImplMethod) -> ImplMethod
+  (ImplMethod (. m index) (. m params) (. m ret) (el-expr el (. m body)) (. m pos)))
+
+;; ---- the tables and the types
+
+(defun el-ty :private (el: Elab e: Expr) -> Ty
+  (unwrap-or (get @(. (. el t) expr-types) (. e id)) (ty-unit)))
+
+(defun el-option :private (el: Elab) -> i64 @(. (. el g) option))
+
+(defun el-payload :private (el: Elab t: Ty) -> (Option Ty)
+  (match t
+    ((TCon (KNominal id) args) (if (= id (el-option el)) (first args) nil))
+    (_ nil)))
+
+(defun el-truth :private (el: Elab t: Ty) -> Truth
+  (match (el-payload el t)
+    ((some (TCon (KScalar s) _)) (if (= s types.ty/SBool) ElSomeTrue ElSome))
+    ((some _) ElSome)
+    (nil ElPlain)))
+
+(defun scalar-is? :private (t: Ty s: Scalar) -> bool
+  (match t
+    ((TCon (KScalar x) _) (= x s))
+    (_ false)))
+
+;; A new node of type ty.
+(defun el-node :private (el: Elab pos: Pos kind: ExprKind ty: Ty) -> Expr
+  (let ((id (g-next-expr (. el g))))
+    (do (set! (. (. el t) expr-types) (assoc @(. (. el t) expr-types) id ty))
+        (Expr id pos kind))))
+
+(defun lit-bool :private (el: Elab b: bool pos: Pos) -> Expr
+  (el-node el pos (ELit (LitBool b)) (ty-bool)))
+
+(defun el-instantiate :private (el: Elab site: i64 option: Ty) -> unit
+  (let ((tys (if-some [p (el-payload el option)] [p] [])))
+    (set! (. (. el t) instantiations)
+          (assoc @(. (. el t) instantiations) site (Instantiation tys [])))))
+
+;; `nil` of the type ty, an `(Option T)`.
+(defun el-nil :private (el: Elab ty: Ty pos: Pos) -> Expr
+  (let ((e (el-node el pos (EGlobal (GCtor (el-option el) (some 0))) ty)))
+    (do (el-instantiate el (. e id) ty) e)))
+
+;; `(some x)` of the type ty, an `(Option T)`.
+(defun el-some :private (el: Elab x: Expr ty: Ty) -> Expr
+  (let ((pos (. x pos))
+        (payload (unwrap-or (el-payload el ty) (el-ty el x))))
+    (let ((fty (TFn CSend [payload] ty))
+          (head (el-node el pos (EGlobal (GCtor (el-option el) (some 1))) (TFn CSend [payload] ty))))
+      (do (el-instantiate el (. head id) ty)
+          (el-node el pos (ECall head [(ArgExpr x)]) ty)))))
+
+;; The pattern `(some p)`, `p` being `true` for an `(Option bool)`.
+(defun some-pattern :private (el: Elab truth: Truth pos: Pos inner: (Option Pattern)) -> Pattern
+  (let ((p (unwrap-or inner (Pattern pos (if (= truth ElSomeTrue) (PLit (LitBool true)) PWild)))))
+    (Pattern pos (PCtor (el-option el) (some 1) [p]))))
+
+(defun wild :private (pos: Pos) -> Pattern (Pattern pos PWild))
+
+(defun clause :private (pat: Pattern body: Expr) -> Clause
+  (Clause pat nil body false))
+
+;; A test as a `bool` expression.
+(defun el-test :private (el: Elab c: Expr) -> Expr
+  (let ((truth (el-truth el (el-ty el c))))
+    (if (= truth ElPlain)
+        c
+        (let ((pos (. c pos))
+              (yes (lit-bool el true (. c pos)))
+              (no (lit-bool el false (. c pos))))
+          (el-node el pos
+                   (EMatch c [(clause (some-pattern el truth pos nil) yes) (clause (wild pos) no)])
+                   (ty-bool))))))
+
+;; The kind of the node `top` built for a form, whose own id and type are not wanted.
+(defun finish :private (el: Elab top: Expr) -> ExprKind
+  (do (set! (. (. el t) expr-types) (dissoc @(. (. el t) expr-types) (. top id)))
+      (set! (. (. el t) instantiations) (dissoc @(. (. el t) instantiations) (. top id)))
+      (. top kind)))
+
+;; ---- the rewrite
+
+;; Rust: elab.rs:106 expr. Children first, then the form itself.
+(defun el-expr (el: Elab e: Expr) -> Expr
+  (let ((kind (el-children el (. e kind))))
+    (Expr (. e id) (. e pos) (el-form el e kind))))
+
+(defun el-form :private (el: Elab e: Expr kind: ExprKind) -> ExprKind
+  (match kind
+    ((EIf c t f) (EIf (el-test el c) t f))
+    ((EGuarded cs) (el-guarded el e cs))
+    ((EAnd ops) (el-and el e ops))
+    ((EOr ops) (el-or el e ops))
+    ((EElided)
+     (let ((t (el-ty el e)))
+       (if (some? (el-payload el t))
+           (do (el-instantiate el (. e id) t)
+               (EGlobal (GCtor (el-option el) (some 0))))
+           (ELit LitUnit))))
+    (other other)))
+
+;; The clauses `(test body)` as nested `if`s: unit, or `some` around each body and `nil` at the
+;; end, as the type of the whole says.
+(defun el-guarded :private (el: Elab e: Expr cs: (Vec Guard)) -> ExprKind
+  (let ((ty (el-ty el e))
+        (is-unit (scalar-is? (el-ty el e) SUnit)))
+    (let ((init (if is-unit (el-node el (. e pos) (ELit LitUnit) ty) (el-nil el ty (. e pos)))))
+      (finish el (reduce (fn (rest: Expr c: Guard)
+                           (let ((test (el-test el (. c test)))
+                                 (body (if is-unit (. c body) (el-some el (. c body) ty))))
+                             (el-node el (. e pos) (EIf test body rest) ty)))
+                         init (reverse cs))))))
+
+;; `(and a b)` is `(if a b <false>)`, the false being `false` or `nil`.
+(defun el-and :private (el: Elab e: Expr ops: (Vec Expr)) -> ExprKind
+  (let ((ty (el-ty el e))
+        (rops (reverse ops)))
+    (finish el (reduce (fn (rest: Expr op: Expr)
+                         (let ((falsy (el-falsy el ty (. e pos)))
+                               (test (el-test el op)))
+                           (el-node el (. e pos) (EIf test rest falsy) ty)))
+                       (nth rops 0) (rest rops)))))
+
+(defun el-falsy :private (el: Elab ty: Ty pos: Pos) -> Expr
+  (if (some? (el-payload el ty)) (el-nil el ty pos) (lit-bool el false pos)))
+
+;; `(or a b)` is the value of `a` when it is truthy, else `b`.
+(defun el-or :private (el: Elab e: Expr ops: (Vec Expr)) -> ExprKind
+  (let ((ty (el-ty el e))
+        (rops (reverse ops)))
+    (finish el (reduce (fn (rest: Expr op: Expr)
+                         (let ((kind (or-step el op rest ty (. e pos))))
+                           (el-node el (. e pos) kind ty)))
+                       (nth rops 0) (rest rops)))))
+
+(defun or-step :private (el: Elab op: Expr rest: Expr ty: Ty pos: Pos) -> ExprKind
+  (let ((op-ty (el-ty el op))
+        (truth (el-truth el (el-ty el op))))
+    (if (or (= truth ElPlain) (scalar-is? ty SBool))
+        (let ((yes (lit-bool el true pos))
+              (test (el-test el op)))
+          (EIf test yes rest))
+        (or-match el op rest ty pos op-ty truth))))
+
+;; The value of an `(Option T)` operand: itself when the result is an `Option` (`s@(some _)`),
+;; its payload when it is a `T`.
+(defun or-match :private (el: Elab op: Expr rest: Expr ty: Ty pos: Pos op-ty: Ty truth: Truth) -> ExprKind
+  (let ((payload (unwrap-or (el-payload el op-ty) (ty-unit)))
+        (keep-whole (some? (el-payload el ty))))
+    (let ((local-ty (if keep-whole op-ty payload))
+          (b (el-binding el (if keep-whole op-ty payload) pos)))
+      (let ((base (some-pattern el truth pos (if keep-whole nil (some (Pattern pos (PBind b)))))))
+        (let ((pat (if keep-whole (Pattern pos (PAs base b)) base))
+              (local (el-node el pos (ELocal b) local-ty)))
+          (EMatch op [(clause pat local) (clause (wild pos) rest)]))))))
+
+(defun el-binding :private (el: Elab ty: Ty pos: Pos) -> i64
+  (let ((id (table-add (. (. el g) bindings) (BindingInfo "or-value" BkPattern pos nil))))
+    (do (set! (. (. el t) binding-types) (assoc @(. (. el t) binding-types) id ty))
+        id)))
+
+;; ---- the children, in the order of `children_mut`
+
+(defun el-args :private (el: Elab args: (Vec Arg)) -> (Vec Arg)
+  (mapv (fn (a: Arg) (match a ((ArgExpr x) (ArgExpr (el-expr el x))) (_ a))) args))
+
+(defun el-place :private (el: Elab p: Place) -> Place
+  (match p
+    ((PlExpr x) (PlExpr (el-expr el x)))
+    (_ p)))
+
+(defun el-exprs :private (el: Elab es: (Vec Expr)) -> (Vec Expr)
+  (mapv (fn (x: Expr) (el-expr el x)) es))
+
+(defun el-clause :private (el: Elab c: Clause) -> Clause
+  (let ((g (match (. c guard) ((some x) (some (el-expr el x))) (nil nil)))
+        (body (el-expr el (. c body))))
+    (Clause (. c pat) g body (. c fallback))))
+
+(defun el-children :private (el: Elab kind: ExprKind) -> ExprKind
+  (match kind
+    ((ECall h args) (let ((h2 (el-expr el h)) (a2 (el-args el args))) (ECall h2 a2)))
+    ((EFn lit)
+     (EFn (FnLit (. lit name) (. lit params) (. lit ret) (el-expr el (. lit body)) (. lit captures))))
+    ((ELet bs body)
+     (let ((bs2 (mapv (fn (b: LetBind) (LetBind (. b pat) (el-expr el (. b init)))) bs)))
+       (ELet bs2 (el-expr el body))))
+    ((EIf c t f) (let ((c2 (el-expr el c)) (t2 (el-expr el t)) (f2 (el-expr el f))) (EIf c2 t2 f2)))
+    ((EDo es) (EDo (el-exprs el es)))
+    ((ERecur es) (ERecur (el-exprs el es)))
+    ((EConcat es) (EConcat (el-exprs el es)))
+    ((EAnd es) (EAnd (el-exprs el es)))
+    ((EOr es) (EOr (el-exprs el es)))
+    ((EGuarded cs)
+     (EGuarded (mapv (fn (c: Guard) (let ((t (el-expr el (. c test)))) (Guard t (el-expr el (. c body))))) cs)))
+    ((EMatch s cls)
+     (let ((s2 (el-expr el s))) (EMatch s2 (mapv (fn (c: Clause) (el-clause el c)) cls))))
+    ((ELoop bs body)
+     (let ((bs2 (mapv (fn (b: LoopBind) (LoopBind (. b binding) (el-expr el (. b init)))) bs)))
+       (ELoop bs2 (el-expr el body))))
+    ((EDeref p text) (EDeref (el-place el p) text))
+    ((ESet p v) (let ((p2 (el-place el p))) (ESet p2 (el-expr el v))))
+    ((EField x f text) (EField (el-expr el x) f text))
+    ((ESetField b f x) (ESetField b f (el-expr el x)))
+    ((EAsync x caps) (EAsync (el-expr el x) caps))
+    ((EAwait x) (EAwait (el-expr el x)))
+    ((EUnsafe x) (EUnsafe (el-expr el x)))
+    ((EDyn p args send x) (EDyn p args send (el-expr el x)))
+    ((EConvert op to x) (EConvert op to (el-expr el x)))
+    (other other)))

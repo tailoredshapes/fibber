@@ -76,6 +76,8 @@
   (let ((head (unwrap-or (stx-as-sym (nth items 0)) ""))
         (pos (. form pos)))
     (cond (= head "if") (if-form lw items form tail)
+          (or (= head "and") (= head "or")) (and-or lw items form (= head "and"))
+          (and (= head "fib.prelude/elide") (= (count items) 1)) (Ok (lw-mk lw pos EElided))
           (= head "do") (body-or-unit lw (rest-items items 1) form tail)
           (= head "let") (let-form lw items form tail)
           (= head "loop") (loop-form lw items form)
@@ -110,13 +112,55 @@
             (Ok (lw-mk lw (. form pos) (EDo [e])))
             (Ok e)))))
 
+;; Rust: lower/expr.rs:167 if_form. A one-armed `if`, or a chain ending in one, is `guarded`.
 (defun if-form :private (lw: Lowerer items: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
-  (if (= (count items) 4)
-      (try-let ((c (lw-expr lw (nth items 1) false))
-                (t (lw-expr lw (nth items 2) tail))
-                (e (lw-expr lw (nth items 3) tail)))
-        (Ok (lw-mk lw (. form pos) (EIf c t e))))
-      (resolve-err (. form pos) "if takes a test and two branches")))
+  (cond (or (= (count items) 3) (and (= (count items) 4) (ends-one-armed? (nth items 3))))
+         (guarded lw items form tail)
+        (= (count items) 4)
+         (try-let ((c (lw-expr lw (nth items 1) false))
+                   (t (lw-expr lw (nth items 2) tail))
+                   (e (lw-expr lw (nth items 3) tail)))
+           (Ok (lw-mk lw (. form pos) (EIf c t e))))
+        :else (resolve-err (. form pos) "if takes a test and one or two branches")))
+
+;; Rust: lower/expr.rs:186 guarded. The `(test body)` pairs of a chain of `if`s whose last is
+;; one-armed.
+(defun guarded :private (lw: Lowerer items: (Vec Stx) form: Stx tail: bool) -> (Result Expr TypeError)
+  (loop ((cur items) (clauses (vec-empty)))
+    (try-let ((test (lw-expr lw (nth cur 1) false))
+              (body (lw-expr lw (nth cur 2) tail)))
+      (let ((cs (conj clauses (Guard test body))))
+        (match (if (> (count cur) 3) (stx-as-list (nth cur 3)) nil)
+          ((some next) (recur next cs))
+          (nil (Ok (lw-mk lw (. form pos) (EGuarded cs)))))))))
+
+;; Rust: lower/expr.rs:204 and_or. No operand is the identity, one is itself.
+(defun and-or :private (lw: Lowerer items: (Vec Stx) form: Stx is-and: bool) -> (Result Expr TypeError)
+  (try-let ((ops (lower-operands lw items)))
+    (cond (= (count ops) 0) (Ok (lw-mk lw (. form pos) (ELit (LitBool is-and))))
+          (= (count ops) 1) (Ok (nth ops 0))
+          is-and (Ok (lw-mk lw (. form pos) (EAnd ops)))
+          :else (Ok (lw-mk lw (. form pos) (EOr ops))))))
+
+;; The operands of `and` and `or`, in order.
+(defun lower-operands :private (lw: Lowerer items: (Vec Stx)) -> (Result (Vec Expr) TypeError)
+  (loop ((i 1) (ops (vec-empty)))
+    (if (>= i (count items))
+        (Ok ops)
+        (try-let ((e (lw-expr lw (nth items i) false)))
+          (recur (+ i 1) (conj ops e))))))
+
+;; Rust: lower/expr.rs:441 ends_one_armed. Whether `f` is an `if` whose last else is a
+;; one-armed `if`.
+(defun ends-one-armed? :private (f: Stx) -> bool
+  (match (stx-as-list f)
+    (nil false)
+    ((some items)
+     (if (and (not (empty? items)) (= (stx-as-sym (nth items 0)) (some "if")))
+         (cond (= (count items) 3) true
+               (= (count items) 4) (ends-one-armed? (nth items 3))
+               :else false)
+         false))))
 
 ;; ---- let
 

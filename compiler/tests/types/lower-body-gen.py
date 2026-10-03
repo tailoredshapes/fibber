@@ -66,7 +66,15 @@ CASES = {
  "err-conv-form": "(defun f (x) (trunc (Vec i64) x))",
  "err-conv-arity": "(defun f (x) (trunc i32))",
  "err-set-field": "(defun f (x) (set-field! x px 1))",
- "err-if": "(defun f () (if 1 2))",
+ "err-if": "(defun f () (if 1 2 3 4))",
+ "if-one-armed": "(defun f (x: bool) (if x 1))",
+ "if-chain": "(defun f (x: bool y: bool) (if x 1 (if y 2)))",
+ "if-chain-else": "(defun f (x: bool y: bool) (if x 1 (if y 2 3)))",
+ "and": "(defun f (x: bool y: bool) (and x y x))",
+ "or": "(defun f (x: bool y: bool) (or x y))",
+ "and-or-edge": "(defun f (x: bool) (do (and) (or) (and x) (or x)))",
+ "not": "(defun f (x: bool) (not x))",
+ "elided": "(defun f () (fib.prelude/elide))",
  "err-prim-value": "(defun f () (g trunc 1))",
  "err-deref-arity": "(defun f ((& c)) (deref c c))",
 }
@@ -79,21 +87,26 @@ LOWER_ONLY = {
  "err-await-arity": ("Resolve", "await takes one operand"),
  "err-fn-body": ("Resolve", "fn needs a body"),
  "err-fn-params": ("Resolve", "fn needs a parameter list"),
- "err-if": ("Resolve", "if takes a test and two branches"),
+ "err-if": ("Resolve", "if takes a test and one or two branches"),
  "err-let-body": ("Resolve", "let needs bindings and a body"),
  "err-let-shape": ("Resolve", "a binding is (pattern expression) or (name: type expression)"),
  "err-quote": ("Resolve", "malformed quote"),
 }
 
-def rebase(block):
+# Expressions of a case that the dump does not show (the operands of an unelaborated form): the
+# first id of `f` is that many below the smallest shown, as the harness counts it.
+HIDDEN = {"if-one-armed": 2, "if-chain": 4, "and": 3, "or": 2}
+
+def rebase(block, hidden=0):
     ids = {}
     for kind in "EB":
         nums = [int(n) for l in block for n in re.findall(r"\b" + kind + r"(\d+)\b", l)]
         ids[kind] = min(nums) if nums else 0
+    ids["E"] -= hidden
     sub = lambda m: m.group(1) + str(int(m.group(2)) - ids[m.group(1)])
     return [re.sub(r"\b([EB])(\d+)\b", sub, l) for l in block]
 
-def out_of(fibref, path):
+def out_of(fibref, path, hidden=0):
     r = subprocess.run([fibref, "types", "--stage", "lower", "--ast", "--sections", "ast,error", path],
                        capture_output=True, text=True)
     lines = r.stdout.split("\n")
@@ -107,7 +120,7 @@ def out_of(fibref, path):
             block.append(l)
     block = [l for l in block if l != ""]
     if block:
-        return rebase(block)
+        return rebase(block, hidden)
     return [l for l in lines[1:] if l != ""]
 
 def lowered_only(n, lines):
@@ -121,7 +134,7 @@ def main():
     for n in names:
         path = D + n + ".fib"
         open(path, "w").write(HEAD + CASES[n] + "\n(defun main () -> i64 0)\n")
-        out = out_of(fibref, path)
+        out = out_of(fibref, path, HIDDEN.get(n, 0))
         if n in LOWER_ONLY:
             out = lowered_only(n, out)
         open(D + n + ".out", "w").write("\n".join(out) + "\n")

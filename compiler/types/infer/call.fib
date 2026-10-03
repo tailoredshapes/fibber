@@ -9,7 +9,8 @@
 ;; infer/expr.rs's, here so that call need not depend on expr.
 (ns types.infer.call
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
-        types.ast types.decls types.annot types.builtins types.infer.cx types.infer.unify))
+        types.ast types.decls types.annot types.builtins types.infer.cx types.infer.unify
+        types.infer.solve))
 
 ;; A function's signature at a call: parameter types, `&` flags, names, and
 ;; whether the function is the library's (§7 D1 says what its arity errors
@@ -230,15 +231,31 @@
              (str-join [(. sig name) " takes " (show (count (. sig params))) " argument(s), got "
                         (show (count args))
                         (if (. sig library) (stand-in-hint (. sig name) (count args)) "")])))
-      (loop ((i 0))
-        (if (< i (count args))
-            (try-let ((_ (apply-arg cx sig i (nth args i) infer)))
-              (recur (+ i 1)))
-            (Ok (. sig ret))))))
+      (let ((lits (cell (vec-empty))))
+        (loop ((i 0))
+          (if (< i (count args))
+              (try-let ((_ (apply-arg cx sig i (nth args i) infer lits)))
+                (recur (+ i 1)))
+              (try-let ((_ (unify-lits cx e lits)))
+                (Ok (. sig ret))))))))
+
+;; After the arguments: what they determine (`Reducible c e`) comes first, then each literal
+;; variable still unbound is `i64` (L19).
+(defun unify-lits :private (cx: Cx e: Expr lits: (Cell (Vec Ty))) -> (Result unit TypeError)
+  (try-let ((_ (if (and (not (empty? @lits)) (not (empty? @(. (. cx u) deferred))))
+                   (cx-solve-all cx)
+                   (Ok ()))))
+    (loop ((i 0))
+      (if (>= i (count @lits))
+          (Ok ())
+          (let ((v (nth @lits i)))
+            (match (store-resolve (. cx st) v)
+              ((TVar _) (try-let ((_ (cx-unify cx v (ty-i64) (. e pos)))) (recur (+ i 1))))
+              (_ (recur (+ i 1)))))))))
 
 ;; One argument: an expression flows into its parameter; an `&x` is a cell of
 ;; the parameter's type; the two are not exchangeable.
-(defun apply-arg :private (cx: Cx sig: Sig i: i64 a: Arg infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow) -> (Result unit TypeError)
+(defun apply-arg :private (cx: Cx sig: Sig i: i64 a: Arg infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow lits: (Cell (Vec Ty))) -> (Result unit TypeError)
   (let ((pname (if (< i (count (. sig names))) (nth (. sig names) i) (show (+ i 1))))
         (amp (nth (. sig amps) i))
         (param (nth (. sig params) i)))
@@ -247,7 +264,7 @@
        (if amp
            (Err (type-error AmpPosition (. x pos)
                   (str-join ["parameter " pname " of " (. sig name) " is &; pass &x"])))
-           (try-let ((t (infer cx x)))
+           (try-let ((t (arg-type cx x infer lits)))
              (cx-flow cx t param (. x pos)))))
       ((ArgAmp b pos)
        (if amp
@@ -257,6 +274,18 @@
                ((Err _) (Err (amp-not-cell pos)))))
            (Err (type-error AmpPosition pos
                   (str-join ["parameter " pname " of " (. sig name) " is not &; pass x"]))))))))
+
+;; The type of an argument expression: an integer literal adopts a float type it unifies with
+;; (L19), else it is `i64` (`unify-lits`); the reader makes no difference between `5` and `5i64`.
+(defun arg-type :private (cx: Cx x: Expr infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow lits: (Cell (Vec Ty)))
+    -> (Result Ty TypeError)
+  (match (. x kind)
+    ((ELit (LitInt n (I64)))
+     (let ((v (store-fresh-lit (. cx st) n)))
+       (do (cx-record cx (. x id) v)
+           (set! lits (conj @lits v))
+           (Ok v))))
+    (_ (infer cx x))))
 
 ;; `& argument must be a cell variable` (§2.14). Rust: infer/expr.rs:369.
 (defun amp-not-cell (pos: Pos) -> TypeError

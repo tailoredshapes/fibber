@@ -1,0 +1,156 @@
+;; compiler/tests/types/unit-truthy.fib: the literal variables of L19 (types.store,
+;; unify's `lit-fits?`) and the truthiness of L20 (types.infer.truthy), over hand-built
+;; ASTs: crates/fibref/src/types/infer/truthy.rs has no inline tests, so these are written
+;; from its doc comments and from spec/types.md section 2.4; and the elaboration
+;; (types.elab) of a guarded form, an `and` and an `or` with its new ids.
+;; Build: fibc build compiler/tests/types/unit-truthy.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.init types.infer.cx types.infer.unify types.infer.expr
+               types.elab types.check))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+(defun world () -> Globals
+  (match (new-globals)
+    ((Ok g) (do (table-add (. g bindings) (BindingInfo "a" BkLet p0 nil)) g))
+    ((Err e) (trap (type-error-text e)))))
+
+(defun cx-of (g: Globals) -> Cx (Cx g (env-new) (store-new) (tables-new) (unit-new)))
+(defun fresh-cx () -> Cx (cx-of (world)))
+(defun opt (cx: Cx t: Ty) -> Ty (ty-nominal @(. (. cx g) option) [t]))
+
+(defun ex (id: i64 k: ExprKind) -> Expr (Expr id p0 k))
+(defun int (id: i64) -> Expr (ex id (ELit (LitInt 1 I64))))
+(defun bool-lit (id: i64) -> Expr (ex id (ELit (LitBool true))))
+(defun unit-lit (id: i64) -> Expr (ex id (ELit LitUnit)))
+(defun local (id: i64) -> Expr (ex id (ELocal 0)))
+(defun infer (cx: Cx e: Expr) -> (Result Ty TypeError) (cx-infer cx e))
+(defun guard (t: Expr b: Expr) -> Guard (Guard t b))
+
+(defun ty-is? (cx: Cx r: (Result Ty TypeError) t: Ty) -> bool
+  (match r ((Ok x) (= (cx-zonk cx x) (cx-zonk cx t))) (_ false)))
+(defun fails? (r: (Result Ty TypeError) msg: str) -> bool
+  (match r ((Err e) (and (= (. e kind) Unify) (= (. e message) msg))) (_ false)))
+(defun unifies? (cx: Cx a: Ty b: Ty) -> bool
+  (match (cx-unify cx a b p0) ((Ok _) true) (_ false)))
+
+(defun lit-tests (cs: Checks) -> unit
+  (do
+    (let ((st (store-new)) (v (store-fresh-lit st 5)) (w (store-fresh st)))
+      (check cs "a literal variable has its magnitude, a plain one none"
+             (and (= (store-lit-of st 0) (some 5)) (nil? (store-lit-of st 1)))))
+    (let ((st (store-new)) (v (store-fresh-lit st -7)))
+      (do (check cs "the magnitude of a negative literal" (= (store-lit-of st 0) (some 7)))
+          (store-widen-lit st 0 3)
+          (check cs "widening keeps the larger" (= (store-lit-of st 0) (some 7)))
+          (store-widen-lit st 0 9)
+          (check cs "widening takes the larger" (= (store-lit-of st 0) (some 9)))
+          (check cs "an unbound literal variable is i64 in messages"
+                 (= (store-zonk-default st (ty-cell v)) (ty-cell (ty-i64))))))
+    (let ((cx (fresh-cx)))
+      (let ((v (store-fresh-lit (. cx st) 5)))
+        (check cs "a literal takes f64" (unifies? cx v (ty-scalar SF64)))))
+    (let ((cx (fresh-cx)))
+      (let ((v (store-fresh-lit (. cx st) 16777216)))
+        (check cs "2^24 fits an f32" (unifies? cx v (ty-scalar SF32)))))
+    (let ((cx (fresh-cx)))
+      (let ((v (store-fresh-lit (. cx st) 16777217)))
+        (check cs "2^24 + 1 does not fit an f32" (not (unifies? cx v (ty-scalar SF32))))))
+    (let ((cx (fresh-cx)))
+      (let ((v (store-fresh-lit (. cx st) 9007199254740993)))
+        (check cs "2^53 + 1 does not fit an f64" (not (unifies? cx v (ty-scalar SF64))))))
+    (let ((cx (fresh-cx)))
+      (let ((v (store-fresh-lit (. cx st) 5)))
+        (check cs "a literal is not an i32" (not (unifies? cx v (ty-scalar SI32))))))
+    (let ((cx (fresh-cx)))
+      (let ((v (store-fresh-lit (. cx st) 5)))
+        (check cs "a literal is not an object" (not (unifies? cx v (ty-str))))))
+    (let ((cx (fresh-cx)))
+      (let ((v (store-fresh-lit (. cx st) 5)) (w (cx-fresh cx)))
+        (do (unifies? cx w v)
+            (check cs "a plain variable adopts what the literal variable adopts"
+                   (and (unifies? cx w (ty-scalar SF64))
+                        (= (cx-zonk cx v) (ty-scalar SF64)))))))
+    (let ((cx (fresh-cx)))
+      (let ((v (store-fresh-lit (. cx st) 5)) (w (cx-fresh cx)))
+        (do (unifies? cx v w)
+            (check cs "the literal variable stays the representative"
+                   (not (unifies? cx w (ty-scalar SI32)))))))))
+
+(defun truthy-tests (cs: Checks) -> unit
+  (let ((cx (fresh-cx)))
+    (do
+      (cx-bind cx 0 (opt cx (ty-i64)))
+      (check cs "a bool and an option: the type of the last"
+             (ty-is? cx (infer cx (ex 1 (EAnd [(bool-lit 2) (local 3)]))) (opt cx (ty-i64))))
+      (check cs "an option is a test"
+             (ty-is? cx (infer cx (ex 4 (EAnd [(local 5) (bool-lit 6)]))) (ty-bool)))
+      (check cs "an integer is never a test"
+             (fails? (infer cx (ex 7 (EAnd [(int 8) (bool-lit 9)])))
+                     "a value of type i64 is always true; write the test"))
+      (check cs "or: an option with a default is the value"
+             (ty-is? cx (infer cx (ex 10 (EOr [(local 11) (int 12)]))) (ty-i64)))
+      (check cs "or of options is an option"
+             (ty-is? cx (infer cx (ex 13 (EOr [(local 14) (local 15)]))) (opt cx (ty-i64))))
+      (check cs "or of bools is a bool"
+             (ty-is? cx (infer cx (ex 16 (EOr [(bool-lit 17) (bool-lit 18)]))) (ty-bool)))
+      (check cs "a guarded form with value bodies is an option"
+             (ty-is? cx (infer cx (ex 19 (EGuarded [(guard (bool-lit 20) (int 21))]))) (opt cx (ty-i64))))
+      (check cs "a guarded form with unit bodies is unit"
+             (ty-is? cx (infer cx (ex 22 (EGuarded [(guard (local 23) (unit-lit 24))]))) (ty-unit)))
+      (check cs "a guarded form tests with an option"
+             (match (infer cx (ex 25 (EGuarded [(guard (local 26) (int 27)) (guard (bool-lit 28) (int 29))])))
+               ((Ok _) true) (_ false)))
+      (check cs "a guarded body of another type is a mismatch"
+             (fails? (infer cx (ex 30 (EGuarded [(guard (bool-lit 31) (int 32)) (guard (bool-lit 33) (bool-lit 34))])))
+                     "cannot unify bool with i64"))
+      (check cs "an elided arm is a fresh variable"
+             (match (infer cx (ex 35 EElided)) ((Ok (TVar _)) true) (_ false))))))
+
+;; ---- elaboration
+
+(defun body-of (g: Globals) -> Expr (. (table-get (. g funs) 0) body))
+
+(defun elab-program (cx: Cx body: Expr) -> Expr
+  (let ((g (. cx g)))
+    (do (table-add (. g funs) (FunDef "f" 0 [] nil [] body false p0))
+        (elaborate g (. cx t))
+        (body-of g))))
+
+(defun is-if? (e: Expr) -> bool (match (. e kind) ((EIf _ _ _) true) (_ false)))
+
+(defun elab-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (let ((n (g-next-expr (. cx g))))
+        (do (cx-bind cx 0 (opt cx (ty-i64)))
+            (let ((e (ex 100 (EGuarded [(guard (bool-lit 101) (int 102))])))
+                  (t (opt cx (ty-i64))))
+              (do (infer cx e)
+                  (let ((out (elab-program cx e)))
+                    (check cs "a guarded form is an if, keeping its id"
+                           (and (is-if? out) (= (. out id) 100)))))))))
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (opt cx (ty-i64)))
+          (let ((e (ex 200 (EAnd [(local 201) (bool-lit 202)]))))
+            (do (infer cx e)
+                (let ((out (elab-program cx e)))
+                  (check cs "an and over an option test is an if over a match"
+                         (match (. out kind)
+                           ((EIf c _ _) (match (. c kind) ((EMatch _ cls) (= (count cls) 2)) (_ false)))
+                           (_ false))))))))
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (opt cx (ty-i64)))
+          (let ((e (ex 300 (EOr [(local 301) (int 302)]))))
+            (do (infer cx e)
+                (let ((out (elab-program cx e)))
+                  (check cs "an or with a default is a match on some with a binding"
+                         (and (match (. out kind) ((EMatch _ cls) (= (count cls) 2)) (_ false))
+                              (= (. (g-binding (. cx g) 1) name) "or-value"))))))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (lit-tests cs)
+        (truthy-tests cs)
+        (elab-tests cs)
+        (finish cs))))

@@ -107,7 +107,18 @@
   ;; `(dyn P e)` / `(dyn (P D..) e)`, `:send` the bool
   (EDyn proto: i64 args: (Vec TypeAnn) send: bool e: Expr)
   (EConvert op: ConvOp to: Scalar e: Expr)
-  (EConcat exprs: (Vec Expr)))
+  (EConcat exprs: (Vec Expr))
+  ;; the one-armed `if` and the chain of them a `cond` without a default
+  ;; expands to: `(test body)` pairs; elaborated away after inference
+  (EGuarded clauses: (Vec Guard))
+  ;; `(and a b ..)`, `(or a b ..)`, two or more operands; elaborated away
+  (EAnd exprs: (Vec Expr))
+  (EOr exprs: (Vec Expr))
+  ;; `(fib.prelude/elide)`; elaborated away
+  EElided)
+
+;; One `(test body)` pair of an `EGuarded`.
+(defstruct Guard (test: Expr body: Expr))
 
 (defstruct Clause (pat: Pattern guard: (Option Expr) body: Expr fallback: bool))
 
@@ -172,6 +183,9 @@
     ((EDo es) es)
     ((ERecur es) es)
     ((EConcat es) es)
+    ((EAnd es) es)
+    ((EOr es) es)
+    ((EGuarded cs) (reduce (fn (acc: (Vec Expr) c: Guard) (conj (conj acc (. c test)) (. c body))) [] cs))
     ((EMatch s cls)
      (reduce (fn (acc: (Vec Expr) c: Clause)
                (conj (match (. c guard) ((some g) (conj acc g)) (nil acc)) (. c body)))

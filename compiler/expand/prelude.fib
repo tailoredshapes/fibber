@@ -25,7 +25,7 @@
 ;;   `cond`, `list`, `assert`, `dbg`, `doto`, `range`, `if-let`,
 ;;   `when-let`, `plet`, `while`, `dotimes`, `for-each`: a call of one in
 ;;   fibber source would be expanded as the macro) end in `-macro`;
-;;   `and_or` is `and-or`, `thread` is `thread`.
+;;   `thread` is `thread`.
 ;; - `Outcome::Expanded` is `Rewritten`: `Expanded` is a struct of
 ;;   expand.types, and two modules exporting one name make that name an
 ;;   error where it is used unqualified (syntax §5).
@@ -75,7 +75,7 @@
 ;; The prelude macros, by name, in the order of the Rust table (the soup
 ;; of crates/fibc/tests/bootstrap_expand picks them from it).
 (def prelude-macros: (Vec str)
-  ["when" "unless" "cond" "and" "or" "if-let" "when-let" "list" "plet" "while"
+  ["when" "unless" "cond" "if-let" "when-let" "list" "plet" "while"
    "dotimes" "for-each" "range" "->" "->>" "doto" "assert" "dbg" "derive"
    "defn" "defn-" "update" "reduce" "str" "println" "print" "prn" "pr"
    "+" "-" "*" "<" ">" "<=" ">=" "=" "max" "min" "bit-and" "bit-or" "bit-xor"
@@ -146,57 +146,42 @@
     ((Err e) (Err e))
     ((Ok f) (Ok (Rewritten f)))))
 
-;; logic.rs: when unless cond and or if-let when-let
-;; `(when c body...)` ==> `(if c body ())`; `(unless c body...)` and
-;; `(when-not c body...)` ==> `(if c () body)`; `name` is the one the arity
-;; error names.
+;; logic.rs: when unless cond if-let when-let (`and` and `or` are core forms, stdlib §7 L20)
+;; `(when c body...)` ==> `(if c body)`, the one-armed `if` (unit for a unit
+;; body, `(Option T)` otherwise); `(unless c body...)` and `(when-not c body...)`
+;; ==> `(if (fib.prelude/not c) body)`; `name` is the one the arity error names.
 (defun when-macro :private (items: (Vec Stx) pos: Pos negate: bool name: str) -> (Result Stx ExpandError)
   (match (check-arity name items 1 nil pos)
     ((Err e) (Err e))
     ((Ok _)
-     (let ((test (nth items 1))
+     (let ((test (if negate (call (prelude-name "not") [(nth items 1)] pos) (nth items 1)))
            (body (body-form (tail-from items 2) pos)))
-       (Ok (call "if" (if negate [test (unit pos) body] [test body (unit pos)]) pos))))))
-
-;; `(and)` ==> `true`, `(and a)` ==> `a`, `(and a b ...)` ==> `(if a (and b
-;; ...) false)`; `or` dually with `(if a true (or b ...))`.
-(defun and-or :private (items: (Vec Stx) pos: Pos is-and: bool) -> Stx
-  (let ((args (tail-from items 1)))
-    (if (<= (count args) 1)
-        (item-or-boolean args is-and pos)
-        (let ((rest (call (prelude-name (if is-and "and" "or")) (tail-from args 1) pos)))
-          (call "if" (if is-and
-                         [(nth args 0) rest (boolean false pos)]
-                         [(nth args 0) (boolean true pos) rest])
-                pos)))))
-
-;; The only argument, or the boolean the empty `and`/`or` is.
-(defun item-or-boolean :private (args: (Vec Stx) b: bool pos: Pos) -> Stx
-  (if (= (count args) 1) (nth args 0) (boolean b pos)))
+       (Ok (call "if" [test body] pos))))))
 
 ;; `(cond t1 e1 t2 e2 ..)`, Clojure's flat form: nested `if`s, tried in order. A
-;; test that is a keyword (`:else`) is always true and must be the last one;
-;; without one, falling off the end is `(trap "cond: no clause matched at POS")`,
-;; which has every type, so `(cond)` is that trap. An odd number of forms is a
-;; test with no expression.
+;; test that is a keyword (`:else`) is always true and must be the last one, as
+;; is a test that is the literal `true`. Without one, the last test is a
+;; one-armed `if`: falling off the end is `nil` or `()` (stdlib §7 L20), and
+;; `(cond)` is `()`. An odd number of forms is a test with no expression.
 (defun cond-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (let ((forms (tail-from items 1)))
     (if (!= (* 2 (quot (count forms) 2)) (count forms))
         (Err (malformed "cond" "a test with no expression" (. (nth forms (- (count forms) 1)) pos)))
-        (let ((message (str-join ["cond: no clause matched at " (pos-display pos)])))
-          (cond-fold forms (call (prelude-name "trap") [(string message pos)] pos) pos)))))
+        (cond-fold forms pos))))
 
-;; Whether a `cond` test is a keyword, which is always true.
+;; Whether a `cond` test is a keyword or the literal `true`, which is always true.
 (defun is-kw-test :private (test: Stx) -> bool
   (match (. test kind)
     ((SKw _) true)
+    ((SBool b) b)
     (_ false)))
 
-;; The pairs, last first, folded onto the trap: a keyword test is the default
-;; only when it is the last one.
-(defun cond-fold :private (forms: (Vec Stx) trap: Stx pos: Pos) -> (Result Stx ExpandError)
+;; The pairs, last first, folded onto `acc` (`has-acc` false until a default or
+;; a test has been folded): a keyword or `true` test is the default only when it
+;; is the last one.
+(defun cond-fold :private (forms: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (let ((last (- (count forms) 2)))
-    (loop ((j last) (acc trap))
+    (loop ((j last) (has-acc false) (acc (unit pos)))
       (if (< j 0)
           (Ok acc)
           (let ((test (nth forms j))
@@ -204,8 +189,9 @@
             (if (is-kw-test test)
                 (if (!= j last)
                     (Err (malformed "cond" "a keyword test must be the last" (. test pos)))
-                    (recur (- j 2) expr))
-                (recur (- j 2) (call "if" [test expr acc] pos))))))))
+                    (recur (- j 2) true expr))
+                (recur (- j 2) true
+                       (call "if" (if has-acc [test expr acc] [test expr]) pos))))))))
 
 ;; The `x e` of the `[x e]` or `(x e)` binding of `if-let`/`when-let`. (`option_binding`)
 (defun option-binding :private (name: str form: Stx) -> (Result (Vec Stx) ExpandError)
@@ -225,8 +211,8 @@
         (Ok (option-match (nth b 0) (nth b 1) (nth items 2)
                           (if (> (count items) 3) (nth items 3) (unit pos)) pos)))))))
 
-;; `(when-let [p e] body...)` ==> `(match e ((fib.prelude/some p) body)
-;; (_ ()))`.
+;; `(when-let [p e] body...)` ==> `(match e ((fib.prelude/some p) (if true
+;; body)) (_ (fib.prelude/elide)))` (stdlib §7 L20).
 (defun when-let-macro :private (items: (Vec Stx) pos: Pos) -> (Result Stx ExpandError)
   (match (check-arity "when-let" items 1 nil pos)
     ((Err e) (Err e))
@@ -234,8 +220,9 @@
      (match (option-binding "when-let" (nth items 1))
        ((Err e) (Err e))
        ((Ok b)
-        (Ok (option-match (nth b 0) (nth b 1) (body-form (tail-from items 2) pos)
-                          (unit pos) pos)))))))
+        (Ok (option-match (nth b 0) (nth b 1)
+                          (call "if" [(boolean true pos) (body-form (tail-from items 2) pos)] pos)
+                          (call (prelude-name "elide") (vec-empty) pos) pos)))))))
 
 ;; loops.rs: while dotimes for-each range
 ;; `(while c body...)`.
@@ -377,8 +364,6 @@
     ("when" (rewritten (when-macro items pos false "when")))
     ("unless" (rewritten (when-macro items pos true "unless")))
     ("cond" (rewritten (cond-macro items pos)))
-    ("and" (Ok (Rewritten (and-or items pos true))))
-    ("or" (Ok (Rewritten (and-or items pos false))))
     ("if-let" (rewritten (if-let-macro items pos)))
     ("when-let" (rewritten (when-let-macro items pos)))
     ("list" (Ok (Rewritten (list-macro items pos))))

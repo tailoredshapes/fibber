@@ -170,7 +170,12 @@
 ;; A literal's value. Rust: lower/mod.rs:381 literal
 (defun literal-value :private (cx: LowerCx e: Expr l: Lit) -> (Result V str)
   (match l
-    ((LitInt n _) (try-let ((t (lcx-ty cx e)) (lt (program-lir (. cx p) t))) (Ok (v-int (unwrap-or lt LirI64) n))))
+    ((LitInt n _) (try-let ((t (lcx-ty cx e)) (lt (program-lir (. cx p) t)))
+                    (let ((l (unwrap-or lt LirI64)))
+                      ;; An integer literal that took a float type (stdlib §7 L19).
+                      (if (or (= l LirFloat) (= l LirDouble))
+                          (Ok (VVal (str-join ["(" (lir-ty-text l) " " (float-lir-text (sitofp f64 n)) ")"]) l))
+                          (Ok (v-int l n))))))
     ((LitFloat x w) (let ((t (match w ((F32) LirFloat) ((F64) LirDouble))))
                       (Ok (VVal (str-join ["(" (lir-ty-text t) " " (float-lir-text x) ")"]) t))))
     ((LitStr s) (Ok (VVal (statics-string (. (. cx p) statics) s 0) LirPtr)))
@@ -200,6 +205,11 @@
     ((EUnsafe b) (lcx-expr cx b))
     ((EDyn pr _ _ b) (val-flow (lcx-dyn-of cx pr b)))
     ((EConvert op t x) (try-let ((v (lcx-value cx x))) (val-flow (lcx-convert cx op t v))))
+    ;; X5: the checker elaborates these away before the emitter sees the program (Rust: lower/mod.rs)
+    ((EGuarded _) (Err "unsupported: an unelaborated form"))
+    ((EAnd _) (Err "unsupported: an unelaborated form"))
+    ((EOr _) (Err "unsupported: an unelaborated form"))
+    ((EElided) (Err "unsupported: an unelaborated form"))
     ((EAsync _ _) (val-flow (lcx-make-async cx e)))
     ((EAwait x) (val-flow (lcx-await-task cx x)))
     ((EQuote f) (val-flow (lcx-quote cx e f)))

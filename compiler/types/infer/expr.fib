@@ -12,7 +12,7 @@
 (ns types.infer.expr
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
         types.decls types.names types.infer.cx types.infer.unify types.infer.solve
-        types.infer.pattern types.infer.call))
+        types.infer.pattern types.infer.call types.infer.truthy))
 
 ;; Rust: infer/expr.rs:39 infer. Infers the type of `e`, recording it.
 ;;
@@ -59,30 +59,17 @@
       ((EQuote _) (infer-form-type cx pos))
       ((EDyn p dets send x) (infer-dyn cx p dets send x pos))
       ((EConvert op target x) (infer-convert cx op target x))
-      ((EConcat parts) (infer-concat cx parts pos)))))
+      ((EConcat parts) (infer-concat cx parts pos))
+      ((EGuarded clauses) (cx-guarded cx clauses (fn (c: Cx x: Expr) (cx-infer c x))))
+      ((EAnd ops) (cx-and cx ops (fn (c: Cx x: Expr) (cx-infer c x))))
+      ((EOr ops) (cx-or cx ops (fn (c: Cx x: Expr) (cx-infer c x))))
+      ((EElided) (Ok (cx-fresh cx))))))
 
 ;; ---- conditions and branches
 
-;; Rust: infer/expr.rs:93 condition. The test of an `if` (so of `when`, `while`, `cond`,
-;; `and`, `or`, which expand to it) has type `bool`. A test of a primitive type that is not
-;; `bool` can never be false, which is the mistake a Clojure habit makes (`(if n ..)`,
-;; `(when s ..)`), so the error says that instead of `cannot unify i64 with bool` (stdlib §7
-;; D1). Any other type, `(Option T)` included, is the usual mismatch.
-(defun infer-condition :private (cx: Cx t: Ty pos: Pos) -> (Result unit TypeError)
-  (if (infer-always-true? (store-resolve (. cx st) t))
-      (Err (type-error Unify pos
-             (str-join ["a value of type " (cx-show cx t) " is always true; write the test"])))
-      (cx-unify cx t (ty-bool) pos)))
-
-(defun infer-always-true? :private (t: Ty) -> bool
-  (match t
-    ((TCon (KScalar s) _) (not (or (= s types.ty/SBool) (= s SUnit) (= s SPtr))))
-    ((TCon (KStr) _) true)
-    (_ false)))
-
 (defun infer-if :private (cx: Cx c: Expr t: Expr f: Expr) -> (Result Ty TypeError)
   (try-let ((ct (cx-infer cx c))
-            (_ (infer-condition cx ct (. c pos))))
+            (_ (cx-condition cx ct (. c pos))))
     (let ((r (cx-fresh cx)))
       (try-let ((_ (infer-branch cx r t))
                 (_ (infer-branch cx r f)))

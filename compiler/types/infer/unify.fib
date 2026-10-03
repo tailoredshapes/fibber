@@ -33,11 +33,21 @@
     (match ra
       ((TVar x)
        (match rb
-         ((TVar y) (if (= x y) (Ok ()) (do (store-bind (. u st) x rb) (Ok ()))))
+         ((TVar y) (if (= x y) (Ok ()) (do (bind-vars u x y ra rb) (Ok ()))))
          (_ (bind-var u x rb flow true))))
       (_ (match rb
            ((TVar y) (bind-var u y ra flow false))
            (_ (unify-shapes u ra rb flow)))))))
+
+;; Two distinct unbound variables: a literal variable stays the representative, so that the
+;; other variable adopts what it adopts (L19).
+(defun bind-vars :private (u: Unifier x: i64 y: i64 a: Ty b: Ty) -> unit
+  (match (store-lit-of (. u st) x)
+    ((some m)
+     (if (some? (store-lit-of (. u st) y))
+         (do (store-widen-lit (. u st) y m) (store-bind (. u st) x b))
+         (store-bind (. u st) y a)))
+    (nil (store-bind (. u st) x b))))
 
 ;; Neither side is a variable.
 (defun unify-shapes :private (u: Unifier a: Ty b: Ty flow: bool) -> (Result unit UErr)
@@ -106,8 +116,9 @@
 
 ;; Binds v to t; `v-is-from` says which side of a flow v is.
 (defun bind-var :private (u: Unifier v: i64 t: Ty flow: bool v-is-from: bool) -> (Result unit UErr)
-  (if (store-occurs (. u st) v t)
-      (Err UOccurs)
+  (cond (store-occurs (. u st) v t) (Err UOccurs)
+        (lit-mismatch? u v t) (Err UMismatch)
+        :else
       (match t
         ((TFn k ps r)
          (if flow
@@ -120,6 +131,22 @@
                    (Ok ())))
              (do (store-bind (. u st) v t) (Ok ()))))
         (_ (do (store-bind (. u st) v t) (Ok ()))))))
+
+;; Whether v is a literal variable that t cannot be: `i64`, or a float type that holds the
+;; value exactly, nothing else (L19; the integer widths are L26).
+(defun lit-mismatch? :private (u: Unifier v: i64 t: Ty) -> bool
+  (match (store-lit-of (. u st) v)
+    ((some m) (not (lit-fits? m t)))
+    (nil false)))
+
+(defun lit-fits? :private (m: i64 t: Ty) -> bool
+  (match t
+    ((TCon (KScalar s) _)
+     (cond (= s SI64) true
+           (= s SF64) (<= m 9007199254740992)
+           (= s SF32) (<= m 16777216)
+           :else false))
+    (_ false)))
 
 ;; `from ⊑ to`, and `to ⊑ from` unless at a flow site.
 (defun colour-flow :private (u: Unifier from: Colour to: Colour flow: bool from-ty: Ty to-ty: Ty) -> unit
