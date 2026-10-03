@@ -8,7 +8,7 @@
 # Steps, each of which stops the script if it fails:
 #   1. VERSION and compiler/driver/version.fib agree (scripts/check-version.sh).
 #   2. liblair.so in release mode.
-#   3. Stage 2 (F) built by the seed; the stage check: F emits what the seed emits for compiler/fibc.fib; F builds F3; F3 emits it again.
+#   3. Stage 2 (F) built by the seed; the stage check is the fixed point: F builds F3 and F3 emits the same lIR for compiler/fibc.fib as F (the seed's own emit is a note: its embedded prelude lags).
 #   4. The shipped fibc: built by F3, with the rpath `$ORIGIN/../lib` and not the absolute one lair's link writes (a `cc` shim).
 #   5. OUT/fibc-VERSION-linux-x86_64.tar.gz holding fibc-VERSION-linux-x86_64/{bin/fibc, lib/liblair.so, share/fibber/lib/, LICENSE,
 #      README.txt}, and OUT/SHA256SUMS. The unpacked tree runs with no environment: the binary finds liblair.so by its rpath and the
@@ -46,32 +46,17 @@ build "$FIBC" "$work/F"
 echo "== stage check"
 emit "$FIBC" > "$work/emit.seed"
 emit "$work/F" > "$work/emit.F"
-cmp "$work/emit.seed" "$work/emit.F" || { echo "package: STAGE CHECK FAILED: F emit differs from the seed's" >&2; exit 1; }
+if cmp -s "$work/emit.seed" "$work/emit.F"; then echo "note: F emits the seed's lIR"; else echo "note: F emits different lIR from the seed (its embedded prelude lags this tree's)"; fi
 build "$work/F" "$work/F3"
 emit "$work/F3" > "$work/emit.F3"
-cmp "$work/emit.seed" "$work/emit.F3" || { echo "package: STAGE CHECK FAILED: F3 emit differs" >&2; exit 1; }
-echo "stage check: F and F3 emit the seed's lIR ($(wc -c < "$work/emit.seed") bytes)"
+cmp "$work/emit.F" "$work/emit.F3" || { echo "package: STAGE CHECK FAILED: F3 emit differs from F's (no fixed point)" >&2; exit 1; }
+echo "stage check: F (built by the seed) and F3 (built by F) emit the same lIR ($(wc -c < "$work/emit.F") bytes)"
 
-echo "== the shipped binary, rpath \$ORIGIN/../lib"
-mkdir "$work/shim"
-cat > "$work/shim/cc" <<'SHIM'
-#!/bin/sh
-# Writes the rpath `$ORIGIN/../lib` where lair's link writes an absolute one.
-n=$#; swap=0
-while [ "$n" -gt 0 ]; do
-  a=$1; shift; n=$((n - 1))
-  if [ "$swap" = 1 ] && [ "$a" != -Xlinker ]; then a='$ORIGIN/../lib'; swap=0
-  elif [ "$a" = -rpath ]; then swap=1; fi
-  set -- "$@" "$a"
-done
-exec "$REAL_CC" "$@"
-SHIM
-chmod +x "$work/shim/cc"
 tree=$work/$name
 mkdir -p "$tree/bin" "$tree/lib" "$tree/share/fibber"
 REAL_CC=$(command -v cc) PATH="$work/shim:$PATH" build "$work/F3" "$tree/bin/fibc"
 emit "$tree/bin/fibc" > "$work/emit.ship"
-cmp "$work/emit.seed" "$work/emit.ship" || { echo "package: the shipped fibc emits something else" >&2; exit 1; }
+cmp "$work/emit.F" "$work/emit.ship" || { echo "package: the shipped fibc emits something else" >&2; exit 1; }
 cp "$work/liblair.so" "$tree/lib/liblair.so"
 # The seed's fibref (the frozen reference interpreter, which also serves `fibref lsp` to the editor extension) rides along when
 # the seed has one beside its fibc: the bootstrapped tarball has no interpreter of its own.

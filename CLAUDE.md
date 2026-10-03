@@ -61,9 +61,11 @@ test says so; claims in docs, commit messages and chat carry no weight.
   rule is retired; `compiler/mirror-pending/` is backlog of what the Rust
   has and stage 2 lacks.
 - Build stage 2 with the seed: `fibc build compiler/fibc.fib -I compiler -I
-  lib -L target/debug -l lair -o F`; check it with `F emit compiler/fibc.fib`
-  equal to `fibc emit compiler/fibc.fib`, then F builds F3 and F3 emits the
-  same again, while the seed still reads the program.
+  lib -L target/debug -l lair -o F`. The stage check is the fixed point: F
+  builds F3, and `F emit compiler/fibc.fib` equals `F3 emit compiler/fibc.fib`.
+  F's emit equals the seed's only while `lib/prelude.fib` is the one the
+  seed embedded (a seed built before a prelude change emits the old one), so
+  that comparison is a note, not a gate.
 - Each pass has a Rust dump as its oracle for the language the seed knows
   (`fibref read|expand|types|own`, `fibc emit-dump`) and a compare script
   under `compiler/tests/`. Rebuild the binaries after any edit of
