@@ -435,6 +435,20 @@ strings and formatting; then the long tail; then measurement. It
 interleaves with M6: library items the compiler needs land first.
 
 
+## Releases
+
+Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,
+`.github/workflows/release.yml`). The Rust tools are the 0.0.x line (tag
+`seed-1` is to be released as v0.0.1); the bootstrapped compiler starts at
+0.1.0 and stays 0.x.
+
+- [x] `fibc --version`; the relocatable tarball runs `hello.fib` with an
+      empty environment (`scripts/package.sh`)
+- [ ] v0.0.1 released and its sha256 recorded in `SEED`; the workflow run on
+      GitHub (not run there yet)
+- [ ] v0.1.0 released
+- [ ] 1.0.0 readiness: the owner's call, not decided by any test
+
 ## Decisions
 
 - **Macros at compile time: JIT, with phase separation** (owner,

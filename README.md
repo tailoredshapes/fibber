@@ -18,6 +18,29 @@ lifetimes nor retain/release.
 that compiles itself. See [ROADMAP.md](ROADMAP.md) for the milestones on
 the way; a small working language is one of them, not the destination.
 
+## Install
+
+Releases are on the [GitHub releases page](https://github.com/tailoredshapes/fibber/releases):
+`fibc-VERSION-linux-x86_64.tar.gz` and `SHA256SUMS`. The 0.0.x releases are
+the Rust tools; from 0.1.0 `fibc` is the compiler written in fibber, built by
+itself, and stays 0.x until the owner says 1.0.0. Download both files, then:
+
+```
+sha256sum -c --ignore-missing SHA256SUMS     # fibc-0.1.0-linux-x86_64.tar.gz: OK
+tar xzf fibc-0.1.0-linux-x86_64.tar.gz
+echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > hello.fib
+fibc-0.1.0-linux-x86_64/bin/fibc --version   # fibc 0.1.0
+fibc-0.1.0-linux-x86_64/bin/fibc run hello.fib
+fibc-0.1.0-linux-x86_64/bin/fibc build hello.fib -o hello && ./hello
+```
+
+No environment variable is needed: `bin/fibc` finds `lib/liblair.so` by its
+rpath and the library in `share/fibber/lib` by its own location, so move the
+unpacked directory as a whole. LLVM is not needed (it is inside
+`liblair.so`); the machine needs libc, libm, libstdc++, libgcc_s, libz and
+libzstd, and a C compiler (`cc`) for `fibc build`. To make a release
+yourself, see `scripts/package.sh`.
+
 ## Status
 
 **The compiler is bootstrapped** (M6, 2026-10-02). `compiler/fibc.fib` is a
