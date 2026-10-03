@@ -20,8 +20,29 @@
    "impl-colour" "impl-colour-var" "impl-basic"])
 
 ;; the inline test of impl_head.rs
+;; the lenient environment: an unknown name takes the next index and is remembered; check-determined
+(defun lenient-env (cs: Checks) -> unit
+  (let ((env (head-env-new ["c"] [false]))
+        (mk (fn (s: i64 d: i64) (PProto 0 [(TGen s) (TGen d)])))
+        (vars ["c" "k" "j"])
+        (k [(Pair 1 p0)])
+        (kj [(Pair 1 p0) (Pair 2 p0)]))
+    (do (check cs "lenient: k is the next index" (match (ann-var env "k" p0) ((Ok t) (= t (TGen 1))) (_ false)))
+        (check cs "lenient: k is kept as an extra" (= (count @(. env extras)) 1))
+        (check cs "lenient: the second use is the same index" (match (ann-var env "k" p0) ((Ok t) (= t (TGen 1))) (_ false)))
+        (check cs "lenient: the extra is not repeated" (= (count @(. env extras)) 1))
+        (check cs "determined by a head variable" (match (check-determined vars 1 k [(mk 0 1)]) ((Ok _) true) (_ false)))
+        (check cs "no constraint: the old error"
+               (match (check-determined vars 1 k [])
+                 ((Err e) (= (. e message) "type variable k is not a parameter of the impl head"))
+                 (_ false)))
+        (check cs "k and j determine each other only: error"
+               (match (check-determined vars 1 kj [(mk 1 2) (mk 2 1)]) ((Err _) true) (_ false)))
+        (check cs "j determined through k"
+               (match (check-determined vars 1 kj [(mk 1 2) (mk 0 1)]) ((Ok _) true) (_ false))))))
+
 (defun head-env (cs: Checks) -> unit
-  (let ((env (HeadEnv ["a" "k"] [false true])))
+  (let ((env (HeadEnv (cell ["a" "k"]) (cell [false true]) false (cell []))))
     (do (check cs "var a is TGen 0" (match (ann-var env "a" p0) ((Ok t) (= t (TGen 0))) (_ false)))
         (check cs "var k (a colour variable) is an error" (match (ann-var env "k" p0) ((Err _) true) (_ false)))
         (check cs "colour-param-arg k is TGen 1"
@@ -100,6 +121,7 @@
   (let ((cs (checks-new)))
     (do (run-cases cs case-names)
         (head-env cs)
+        (lenient-env cs)
         (derived cs)
         (written cs)
         (finish cs))))

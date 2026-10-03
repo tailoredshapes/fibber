@@ -203,15 +203,17 @@
 (defun declare-impl-rest :private (g: Globals m: i64 form: Stx pr: (Pair i64 (Vec TypeAnn)) h: ImplHead)
     -> (Result (Pair i64 (Vec Stx)) TypeError)
   (let ((items (stx-items form))
-        (env (HeadEnv (. h vars) (. h colours)))
+        (env (head-env-new (. h vars) (. h colours)))
+        (head-len (count (. h vars)))
         (rest (vec (drop 3 items)))
         (where? (and (not (empty? rest)) (stx-kw? (nth rest 0) "where"))))
     (if (and where? (< (count rest) 2))
         (Err (type-error-resolve (. form pos) ":where without constraints"))
         (try-let ((context (if where? (where-preds g m (nth rest 1) env) (Ok (vec-empty))))
                   (dets (try-collect (. pr snd) (fn (d: TypeAnn) (ann-to-ty d env (. (nth items 1) pos)))))
-                  (ok (paterson g context (. h head) (. form pos)))
-                  (index (register-instance g (InstanceDef (. pr fst) (. h con) m (. h vars) (. h head) dets
+                  (cov (check-determined @(. env vars) head-len @(. env extras) context))
+                  (ok (paterson g context (. h head) head-len (. form pos)))
+                  (index (register-instance g (InstanceDef (. pr fst) (. h con) m @(. env vars) (. h head) dets
                                                            context [] (. form pos)))))
           (Ok (Pair index (if where? (vec (drop 2 rest)) rest)))))))
 
@@ -265,21 +267,30 @@
                   (Ok (PProto p tys))
                   (Err (type-error-resolve pos (str-join ["protocol " name " takes " (show want) " type(s)"])))))))))
 
-;; The Paterson condition (§3.3): each context constraint has no variable more often than
-;; the head and is smaller than the head.
-(defun paterson :private (g: Globals context: (Vec Pred) head: Ty pos: Pos) -> (Result unit TypeError)
+;; The Paterson condition (§3.3) with the termination bound of determined variables (L16):
+;; the dispatch (first) argument of each protocol constraint has no variable more often
+;; than the head, is smaller than the head, and names head variables only (the first
+;; `head-len`); the other constraints are measured whole.
+(defun paterson :private (g: Globals context: (Vec Pred) head: Ty head-len: i64 pos: Pos) -> (Result unit TypeError)
   (let ((hs (size-all [head] 0 (map-empty)))
         (printer (printer-new g)))
     (loop ((i 0))
       (if (>= i (count context))
           (Ok ())
           (let ((c (nth context i))
-                (cs (size-all (pred-tys c) 0 (map-empty))))
-            (if (or (too-many? (. cs snd) (. hs snd)) (>= (. cs fst) (. hs fst)))
-                (Err (type-error-other pos
-                       (str-join ["the context constraint " (printer-pred printer c)
-                                  " is not smaller than the instance head"])))
-                (recur (+ i 1))))))))
+                (cs (size-all (match c ((PProto _ tys) (vec (take 1 tys))) (_ (pred-tys c))) 0 (map-empty))))
+            (cond (and (proto-pred? c) (not (every? (fn (v: i64) (< v head-len)) (keys (. cs snd)))))
+                  (Err (type-error-other pos
+                         (str-join ["the context constraint " (printer-pred printer c)
+                                    " looks up a determined variable; a dispatch argument may name only head variables (the termination bound of determined variables)"])))
+                  (or (too-many? (. cs snd) (. hs snd)) (>= (. cs fst) (. hs fst)))
+                  (Err (type-error-other pos
+                         (str-join ["the context constraint " (printer-pred printer c)
+                                    " is not smaller than the instance head"])))
+                  :else (recur (+ i 1))))))))
+
+(defun proto-pred? :private (c: Pred) -> bool
+  (match c ((PProto _ _) true) (_ false)))
 
 ;; Whether some variable of `vars` occurs more often than in `head-vars` (or is not there).
 (defun too-many? :private (vars: (Map i64 i64) head-vars: (Map i64 i64)) -> bool

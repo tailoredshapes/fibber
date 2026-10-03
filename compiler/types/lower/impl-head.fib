@@ -70,27 +70,76 @@
 
 ;; The variables of an impl head in a determined argument or the `:where` context: a
 ;; type variable is `TGen i`, and so is a colour variable at a colour parameter; a colour
-;; variable anywhere else is an error. vars: the head's variables; colours: which are
-;; colour variables.
-(defstruct HeadEnv (vars: (Vec str) colours: (Vec bool)))
+;; variable anywhere else is an error. A name that is not a head variable is, when
+;; `lenient`, a candidate determined variable (types §3.3, L16): it gets the next `TGen`
+;; index and its first position is kept in `extras`, for `check-determined` to accept or
+;; reject once the whole context is lowered.
+;; vars: the head's variables, then the candidates; colours: which are colour variables;
+;; extras: per candidate, its index in vars and where it was first named.
+(defstruct HeadEnv
+  (vars: (Cell (Vec str)) colours: (Cell (Vec bool)) lenient: bool
+   extras: (Cell (Vec (Pair i64 Pos)))))
+
+(defun head-env-new (vars: (Vec str) colours: (Vec bool)) -> HeadEnv
+  (HeadEnv (cell vars) (cell colours) true (cell (vec-empty))))
+
+(def not-param-text: str "is not a parameter of the impl head")
 
 (impl AnnEnv HeadEnv
   (ann-var (self name pos)
-    (match (var-index (. self vars) name)
+    (match (var-index @(. self vars) name)
       ((some i)
-       (if (nth (. self colours) i)
+       (if (nth @(. self colours) i)
            (Err (type-error-resolve pos (str-join [name " is a colour parameter of the impl head, not a type"])))
            (Ok (TGen i))))
-      (nil (Err (type-error-resolve pos (str-join ["type variable " name " is not a parameter of the impl head"]))))))
+      (nil
+       (if (. self lenient)
+           (let ((n (count @(. self vars))))
+             (do (set! (. self extras) (conj @(. self extras) (Pair n pos)))
+                 (set! (. self vars) (conj @(. self vars) name))
+                 (set! (. self colours) (conj @(. self colours) false))
+                 (Ok (TGen n))))
+           (Err (type-error-resolve pos (str-join ["type variable " name " " not-param-text])))))))
   (ann-colour (self) CLocal)
   (ann-named-colour (self name pos)
     (Err (type-error-resolve pos (str-join [name " may be used here only as the argument of a colour parameter"]))))
   (ann-colour-param-arg (self name pos)
-    (some (match (var-index (. self vars) name)
-            ((some i) (if (nth (. self colours) i)
+    (some (match (var-index @(. self vars) name)
+            ((some i) (if (nth @(. self colours) i)
                           (Ok (TGen i))
                           (Err (type-error-resolve pos (str-join [name " is not a colour variable of the impl head"])))))
             (nil (Err (type-error-resolve pos (str-join [name " is not a colour variable of the impl head"]))))))))
+
+;; The `TGen` indices a type mentions.
+(defun ty-gens (t: Ty) -> (Vec i64)
+  (let ((acc (cell (vec-empty))))
+    (do (ty-map-leaves t (fn (l: Ty) (match l ((TGen i) (do (set! acc (conj @acc i)) nil)) (_ nil))))
+        @acc)))
+
+;; The liberal coverage condition (types §3.3, L16): the variables the head does not name
+;; (`extras`) must each be determined: in a determined position of a context constraint
+;; `(P s d ..)` whose dispatch argument `s` mentions only head variables and variables
+;; already determined. One that no constraint determines is the error it always was.
+(defun check-determined (vars: (Vec str) head-len: i64 extras: (Vec (Pair i64 Pos)) context: (Vec Pred))
+    -> (Result unit TypeError)
+  (let ((known (determine-fixpoint (mapv (fn (i: i64) (< i head-len)) (range (count vars))) context)))
+    (match (find-first (fn (e: (Pair i64 Pos)) (not (nth known (. e fst)))) extras)
+      ((some e) (Err (type-error-resolve (. e snd) (str-join ["type variable " (nth vars (. e fst)) " " not-param-text]))))
+      (nil (Ok ())))))
+
+;; One round over the context, repeated until nothing more is known.
+(defun determine-fixpoint :private (known: (Vec bool) context: (Vec Pred)) -> (Vec bool)
+  (let ((next (reduce determine-step known context)))
+    (if (= next known) known (determine-fixpoint next context))))
+
+(defun determine-step :private (known: (Vec bool) c: Pred) -> (Vec bool)
+  (match c
+    ((PProto _ tys)
+     (if (and (not (empty? tys)) (every? (fn (i: i64) (nth known i)) (ty-gens (nth tys 0))))
+         (reduce (fn (k: (Vec bool) i: i64) (assoc k i true))
+                 known (mapcat ty-gens (vec (drop 1 tys))))
+         known))
+    (_ known)))
 
 ;; Per variable of `inst`, whether it is a colour variable: it stands at a colour
 ;; parameter of the head's struct or enum (§1.3).

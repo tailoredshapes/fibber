@@ -125,26 +125,76 @@
                      (_ vars)))
     (_ vars)))
 
-;; The instance that discharges a concrete protocol constraint, with its variables' values. Rust: lower/call.rs:312 instance_of_pred
+;; The instance that discharges a concrete protocol constraint, with its variables' values. Rust: lower/call.rs:313 instance_of_pred
 (defun lcx-instance-of-pred (cx: LowerCx pred: Pred) -> (Result (Pair i64 (Vec Ty)) str)
+  (match pred
+    ((PProto p tys)
+     (match (first tys)
+       (nil (Err "a protocol without a head"))
+       ((some head-ty) (instance-for cx p head-ty (vec (drop 1 tys))))))
+    (_ (Err "a non-protocol bound at a method call"))))
+
+;; The instance of `p` for `head-ty`, given the determined arguments `dets` when they are known (else none). Rust: instance_for
+(defun instance-for :private (cx: LowerCx p: i64 head-ty: Ty dets: (Vec Ty)) -> (Result (Pair i64 (Vec Ty)) str)
   (let ((g (program-g (. cx p))))
-    (match pred
-      ((PProto p tys)
-       (match (first tys)
-         (nil (Err "a protocol without a head"))
-         ((some head-ty)
-          (match head-ty
-            ((TFn _ _ _) (Err "a protocol instance on a function type"))
-            ((TCon c _)
-             (match (get @(. g instance-index) (InstKey p c))
-               (nil (Err (str-join ["no instance of " (. (g-proto g p) name) " for the constructor"])))
-               ((some index)
-                (let ((inst (table-get (. g instances) index)))
-                  (try-let ((args (try-map (fn (v: (Option Ty)) (match v ((some t) (Ok t)) (nil (Err "an instance variable the head does not fix"))))
-                                           (match-head (. inst head) head-ty (mapv (fn (i: i64) nil) (range (count (. inst var-names))))))))
-                    (Ok (Pair index args)))))))
-            (_ (Err "a type variable at a method call"))))))
-      (_ (Err "a non-protocol bound at a method call")))))
+    (match head-ty
+      ((TFn _ _ _) (Err "a protocol instance on a function type"))
+      ((TCon c _)
+       (match (get @(. g instance-index) (InstKey p c))
+         (nil (Err (str-join ["no instance of " (. (g-proto g p) name) " for the constructor"])))
+         ((some index)
+          (let ((inst (table-get (. g instances) index))
+                (v0 (match-head (. inst head) head-ty (mapv (fn (i: i64) nil) (range (count (. inst var-names)))))))
+            (try-let ((vars (determine-from-context cx inst (match-dets (. inst dets) dets v0)))
+                      (args (try-map (fn (v: (Option Ty)) (match v ((some t) (Ok t)) (nil (Err "an instance variable the head does not fix")))) vars)))
+              (Ok (Pair index args)))))))
+      (_ (Err "a type variable at a method call")))))
+
+;; The variables after matching each determined argument of an instance against the constraint's.
+(defun match-dets :private (ds: (Vec Ty) ts: (Vec Ty) vars: (Vec (Option Ty))) -> (Vec (Option Ty))
+  (reduce (fn (acc: (Vec (Option Ty)) pr: (Pair Ty Ty)) (match-head (. pr fst) (. pr snd) acc)) vars (zip ds ts)))
+
+;; `t` with the known variables substituted, or nil when it names an unknown one.
+(defun subst-known :private (t: Ty vars: (Vec (Option Ty))) -> (Option Ty)
+  (let ((ok (cell true))
+        (out (ty-map-leaves t (fn (l: Ty)
+                                (match l
+                                  ((TGen i) (match (if (< i (count vars)) (nth vars i) nil)
+                                              ((some v) (some v))
+                                              (nil (do (set! ok false) nil))))
+                                  (_ nil))))))
+    (if @ok (some out) nil)))
+
+(defun count-known :private (vars: (Vec (Option Ty))) -> i64
+  (count (filter (fn (v: (Option Ty)) (some? v)) vars)))
+
+;; The variables of `inst` that its head and determined arguments do not fix, which its context determines (types §3.3, L16): for
+;; each constraint `(Q s d ..)` whose dispatch argument is known, the instance of `Q` for it gives the outputs, matched against the
+;; constraint's own. Rust: determine_from_context
+(defun determine-from-context :private (cx: LowerCx inst: InstanceDef vars: (Vec (Option Ty))) -> (Result (Vec (Option Ty)) str)
+  (try-let ((next (determine-round cx (. inst context) 0 vars)))
+    (if (> (count-known next) (count-known vars))
+        (determine-from-context cx inst next)
+        (Ok next))))
+
+(defun determine-round :private (cx: LowerCx context: (Vec Pred) i: i64 vars: (Vec (Option Ty))) -> (Result (Vec (Option Ty)) str)
+  (if (>= i (count context))
+      (Ok vars)
+      (try-let ((vs (determine-one cx (nth context i) vars)))
+        (determine-round cx context (+ i 1) vs))))
+
+(defun determine-one :private (cx: LowerCx c: Pred vars: (Vec (Option Ty))) -> (Result (Vec (Option Ty)) str)
+  (match c
+    ((PProto q tys)
+     (let ((s (match (first tys) ((some t) (subst-known t vars)) (nil nil)))
+           (outs (vec (drop 1 tys))))
+       (if (or (nil? s) (every? (fn (t: Ty) (some? (subst-known t vars))) outs))
+           (Ok vars)
+           (try-let ((r (instance-for cx q (unwrap s) [])))
+             (let ((g (program-g (. cx p)))
+                   (q-inst (table-get (. g instances) (. r fst))))
+               (Ok (match-dets outs (mapv (fn (d: Ty) (ty-subst-gen d (. r snd) [])) (. q-inst dets)) vars)))))))
+    (_ (Ok vars))))
 
 ;; A method call through the receiver's own vtable (§3.3): the receiver is the first argument.
 (defun call-dyn-target :private (cx: LowerCx vals: (Vec V) tys: (Vec Ty) p: i64 i: i64) -> (Result Target str)
