@@ -14,7 +14,7 @@
     ((CmdEmitDump o files) (str-join ["emit-dump " (show (. o layout)) " " (show files)]))
     ((CmdExplain f) (str-concat "explain " (show f)))
     ((CmdHarness w) (str-concat "harness " w))
-    ((CmdCases d o) (str-join ["cases " (show d) " " (show o)]))
+    ((CmdCases d o j) (str-join ["cases " (show d) " " (show o) " " (show j)]))
     ((CmdHelp) "help")
     ((CmdVersion) "version")
     ((CmdInvalid) "invalid")))
@@ -52,12 +52,19 @@
                     (_ false))
                   (invalid? ["emit-dump" "--bogus" "a"])))
       (check cs "the harness commands are not the driver's"
-             (and (is? ["cases"] (CmdCases "cases/ownership" [])) (is? ["cases" "d"] (CmdCases "d" []))
-                  (is? ["cases" "d" "--only" "1" "2"] (CmdCases "d" ["1" "2"]))
+             (and (is? ["cases"] (CmdCases "cases/ownership" [] 1)) (is? ["cases" "d"] (CmdCases "d" [] 1))
+                  (is? ["cases" "d" "--only" "1" "2"] (CmdCases "d" ["1" "2"] 1))
                   (is? ["cases" "d" "--only"] CmdInvalid) (is? ["cases" "--only" "1"] CmdInvalid)
-                  (not (takes-roots? (CmdCases "d" [])))
+                  (not (takes-roots? (CmdCases "d" [] 1)))
                   (is? ["gen" "--seed" "1"] (CmdHarness "gen")) (is? ["itrace" "a"] (CmdHarness "itrace"))
                   (not (takes-roots? (CmdHarness "cases"))) (takes-roots? (CmdHarness "itrace"))))
+      (check cs "cases takes -j N, or -jN, anywhere; a count below 1 or not a number is invalid"
+             (and (is? ["cases" "d" "-j" "12"] (CmdCases "d" [] 12)) (is? ["cases" "d" "-j4"] (CmdCases "d" [] 4))
+                  (is? ["cases" "-j" "3"] (CmdCases "cases/ownership" [] 3))
+                  (is? ["cases" "d" "--only" "1" "2" "-j" "5"] (CmdCases "d" ["1" "2"] 5))
+                  (is? ["cases" "-j" "2" "d" "--only" "1"] (CmdCases "d" ["1"] 2))
+                  (invalid? ["cases" "d" "-j" "0"]) (invalid? ["cases" "d" "-j" "x"]) (invalid? ["cases" "d" "-j"])
+                  (invalid? ["cases" "d" "-j" "-1"]) (invalid? ["cases" "d" "-j"  "2" "--only"])))
       (check cs "build takes any number of dirs and libs in order"
              (is? ["build" "a.fib" "-o" "a" "-L" "d1" "-l" "lair" "-L" "d2" "-l" "m"] (build-at "a.fib" "a" ["d1" "d2"] ["lair" "m"] 2)))
       (check cs "build takes the flags before the output and glued to their value"

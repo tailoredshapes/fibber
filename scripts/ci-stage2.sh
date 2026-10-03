@@ -6,8 +6,11 @@
 # today (a known gap kept honest in the case itself: if it starts to pass the harness reports FAIL), so it is not listed; lines starting with # and blank lines are ignored.
 # usage: scripts/ci-stage2.sh F      F is a stage 2 fibc; FIB_LIB must name lib/ and LD_LIBRARY_PATH liblair.so's directory
 # Limits (seconds), each the time a directory may take: LIMIT_OWNERSHIP, LIMIT_MODULES, LIMIT_STDLIB.
+# Also (scripts/gate.sh sets them; CI does not): CI_STAGE2_JOBS=N runs N cases at a time (`cases -j N`); CI_STAGE2_ONLY=FILE holds the
+# names (one per line, as `cases --only` takes them) of the stdlib cases to run, and the expected set is then the lines of the expected
+# file for the cases that were run.
 set -u
-root=$(cd "$(dirname "$0")/.." && pwd)
+root=${GATE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 f=${1:?usage: ci-stage2.sh F}
 out=${CI_STAGE2_OUT:-$(mktemp -d)}
 mkdir -p "$out"
@@ -18,7 +21,10 @@ for pair in "ownership:${LIMIT_OWNERSHIP:-400}" "modules:${LIMIT_MODULES:-120}" 
   name=${pair%%:*}; limit=${pair##*:}; dir=cases/$name
   echo "== $f cases $dir (limit ${limit}s)"
   start=$(date +%s)
-  timeout "$limit" "$f" cases "$dir" > "$out/$name.txt" 2> "$out/$name.err"
+  only=(); jflag=()
+  [ -n "${CI_STAGE2_JOBS:-}" ] && jflag=(-j "$CI_STAGE2_JOBS")
+  if [ "$name" = stdlib ] && [ -n "${CI_STAGE2_ONLY:-}" ]; then only=(--only $(cat "$CI_STAGE2_ONLY")); fi
+  timeout "$limit" "$f" cases "$dir" "${only[@]}" "${jflag[@]}" > "$out/$name.txt" 2> "$out/$name.err"
   code=$?
   echo "exit $code after $(( $(date +%s) - start ))s"
   tail -n 6 "$out/$name.txt"
@@ -30,6 +36,11 @@ for pair in "ownership:${LIMIT_OWNERSHIP:-400}" "modules:${LIMIT_MODULES:-120}" 
 done
 sort -o "$out/actual" "$out/actual"
 grep -v -e '^#' -e '^[[:space:]]*$' scripts/ci-stage2.expected | sort > "$out/expected"
+if [ -n "${CI_STAGE2_ONLY:-}" ]; then   # a sample: only the expected lines of the stdlib cases that ran, all of the other directories'
+  awk '$1 ~ /\.fib$/ { print "cases/stdlib/" $1 }' "$out/stdlib.txt" | sort > "$out/ran"
+  awk 'NR==FNR { ran[$1]=1; next } $1 !~ /^cases\/stdlib\// || ($1 in ran)' "$out/ran" "$out/expected" > "$out/expected.sel"
+  mv "$out/expected.sel" "$out/expected"
+fi
 if ! diff -u "$out/expected" "$out/actual"; then
   echo "ci-stage2: the cases that do not pass differ from scripts/ci-stage2.expected (- expected only, + actual only)"
   bad=1

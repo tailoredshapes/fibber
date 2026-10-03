@@ -112,13 +112,25 @@
 (defun child-argv :private (path: str roots: (Vec str)) -> (Vec str)
   (conj (reduce (fn (acc: (Vec str) r: str) (conj (conj acc "-I") r)) ["fibc" "run" "--trace"] roots) path))
 
+;; A compiled run started and not yet judged: its process and the two files its streams go to.
+(defstruct Started (pid: i64 out: str err: str))
+
+;; Starts the compiled run of the case at `path` with library roots `roots`, its streams going to the files `TAG-out` and `TAG-err` in the
+;; directory `tmp` (a tag no other run in `tmp` uses, so runs started together do not collide).
+(defun start-in (path: str roots: (Vec str) tmp: str tag: str) -> Started
+  (let ((out (str-join [tmp "/" tag "-out"]))
+        (err (str-join [tmp "/" tag "-err"])))
+    (Started (p/spawn-start (child-argv path roots) out err limit-secs) out err)))
+
+;; What a run `start-in` began came to, given the exit `status` of its process (the caller waited for it); its files are removed.
+(defun finish-in (r: Started status: i64) -> CsOutcome
+  (let ((stdout (unwrap-or (read-file (. r out)) ""))
+        (stderr (unwrap-or (read-file (. r err)) "")))
+    (do (p/remove-file (. r out))
+        (p/remove-file (. r err))
+        (if (< status 0) (OutFailed "cannot run this executable") (interpret status stdout stderr)))))
+
 ;; The compiled outcome of the case at `path` with library roots `roots`, the child's streams going to files in the directory `tmp`.
 (defun run-in (path: str roots: (Vec str) tmp: str) -> CsOutcome
-  (let ((out (str-concat tmp "/out"))
-        (err (str-concat tmp "/err"))
-        (status (p/spawn-wait (child-argv path roots) out err limit-secs))
-        (stdout (unwrap-or (read-file out) ""))
-        (stderr (unwrap-or (read-file err) "")))
-    (do (p/remove-file out)
-        (p/remove-file err)
-        (if (< status 0) (OutFailed "cannot run this executable") (interpret status stdout stderr)))))
+  (let ((r (start-in path roots tmp "0")))
+    (finish-in r (if (< (. r pid) 0) -1 (p/wait-pid (. r pid))))))

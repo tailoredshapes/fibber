@@ -73,3 +73,18 @@ test says so; claims in docs, commit messages and chat carry no weight.
 - Fibber source follows the same limits as Rust where it can (files under
   500 lines, functions under 50) and uses the library's own tools: flat
   `cond`, `try-let`, `if-some`, destructuring, `defrecord`.
+
+## Performance cycle
+
+Make many changes, then build and test once. Rust is frozen; the tools are shell scripts over stage 2 (`F` below).
+
+- `F cases DIR [--only PREFIX..] -j N` runs N cases at a time (default 1); the rows and counts are the same, in the same order.
+- `scripts/gate.sh [--quick|--full]`: builds stage 2 (cached while compiler/ and lib/ are unchanged), the fixed point (full), the case
+  directories with `-j`, compares the non-passing set with `scripts/ci-stage2.expected`; one timing line per stage and PASS or FAIL.
+  `--quick` is ownership, modules and about 100 stdlib cases.
+- `scripts/bench/quick.sh [--record]`: 10 benchmarks of 1-2 s, median of 3, against `scripts/bench/baseline.tsv`; flags a delta over 10%
+  and a changed checksum (a wrong answer is a failure, not a speedup).
+- `scripts/batch.sh BRANCH..`: the lead's integrator (scratch branch from main, cherry-picks, one gate, one bench, halving on failure).
+- An agent working a lever uses one worktree and its own files, runs targeted cases and the quick bench, commits, and does NOT run
+  the full gate; the lead batches branches through `scripts/batch.sh`. Gate, batch and bench hold `/tmp/fibsuite.lock`, so a benchmark
+  never overlaps a run; no more than about 12 heavy jobs at once.

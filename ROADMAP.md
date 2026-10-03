@@ -530,6 +530,18 @@ Order of work, cheapest first: (1) the dissoc count (a library edit, one case), 
 bindings, (5) library check once, (4) allocator. Each is a proposal; each needs a before/after from
 `scripts/bench/run.sh` and its case before it counts.
 
+### The performance cycle
+
+Builds and case runs are the cost of every lever (stage 2 build 40 s, `emit` 30 s, stdlib cases 11 min one at a time), so the
+cycle is shaped to pay each of them once for many changes (scripts/gate.sh, scripts/bench/quick.sh, scripts/batch.sh):
+
+1. Each agent takes one lever, in its own worktree, on files no other lever touches. It runs only the targeted cases
+   (`F cases DIR --only PREFIX -j 12`) and the quick bench, commits, and does not run the full gate.
+2. The lead runs `scripts/batch.sh BRANCH..` on a batch of branches: the commits are cherry-picked in order onto a scratch branch of
+   main, one gate and one bench compare run, and a failing gate is bisected by halving the batch to name the offending branch.
+3. Conflicts between levers show at the cherry-pick; the lead resolves them at integration, not the agents in advance.
+4. Benchmarks run alone: gate, batch and bench share /tmp/fibsuite.lock.
+
 ## Releases
 
 Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,

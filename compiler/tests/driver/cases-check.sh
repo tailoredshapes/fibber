@@ -49,4 +49,23 @@ printf ';; spec: x\n;; expect: accept\n;; result: 1\n;; audit: clean\n;; open: L
 ck "an open case that passes is a FAIL" "$(row)" "a.fib FAIL the item landed: remove \`open\`"
 ck "a prefix no case starts with is exit 2" "$($s2 cases $t --only zz 2>&1; echo $?)" "$(printf 'fibc: no case matches zz in %s\n2' "$t")"
 mkdir -p $t/empty; $s2 cases $t/empty >/dev/null 2>&1; ck "a directory with no case is not a pass" "$?" 1
+# -j N: the same table and counts as one at a time, in the same order, and a planted fault is still reported (exit 1).
+rm -rf "$t"/*; mkdir "$t/par"
+for c in $ok $rej $trp $leak; do cp "$c" "$t/par/$(basename "$c")"; done
+sed -E 's/^;; result: *1$/;; result: 2/' $ok > "$t/par/00-planted-wrong-result.fib"
+printf ';; spec: x\n;; bogus: 1\n' > "$t/par/99-bad-header.fib"
+$s2 cases "$t/par" > "$t/seq.txt" 2>&1; sst=$?; $s2 cases "$t/par" -j 8 > "$t/par8.txt" 2>&1; pst=$?
+$s2 cases "$t/par" -j3 > "$t/par3.txt" 2>&1
+ck "-j 8 prints the rows and counts of one at a time, byte for byte" "$(cmp "$t/seq.txt" "$t/par8.txt" && echo same)" same
+ck "-j3 (glued) too" "$(cmp "$t/seq.txt" "$t/par3.txt" && echo same)" same
+ck "the planted wrong result is a FAIL row under -j 8" "$(grep -c '^00-planted-wrong-result.fib *FAIL' "$t/par8.txt")" 1
+ck "the bad header is a HEADER row under -j 8" "$(grep -c '^99-bad-header.fib *HEADER' "$t/par8.txt")" 1
+ck "and the counts line says 4 pass, 1 fail, 1 header error" "$(grep -c '^6 cases: 4 pass, 1 fail, 0 pending, 1 header error' "$t/par8.txt")" 1
+ck "the status is 1 under -j 8 as at -j 1" "$pst/$sst" "1/1"
+ck "the rows are in file-name order" "$(awk '$1 ~ /\.fib$/ {print $1}' "$t/par8.txt" | sort -c && echo sorted)" sorted
+mkdir "$t/tmpd"; TMPDIR="$t/tmpd" $s2 cases "$t/par" -j 8 > /dev/null 2>&1
+ck "-j 8 leaves no scratch directory or file behind" "$(ls -A "$t/tmpd" | wc -l)" 0
+$s2 cases "$t/par" -j 0 > /dev/null 2>&1; ck "-j 0 is a usage error: exit 2" $? 2
+$s2 cases "$t/par" -j > /dev/null 2>&1; ck "-j with no number is a usage error: exit 2" $? 2
+$s2 cases "$t/par" -j x > /dev/null 2>&1; ck "-j x is a usage error: exit 2" $? 2
 exit $fail

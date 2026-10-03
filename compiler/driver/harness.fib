@@ -2,7 +2,7 @@
 ;; (`list_cases`, `select_cases`, `run_case`), table.rs (`render`) and crates/fibc/src/main.rs `cases`: every `*.fib` directly inside DIR
 ;; (and the `main.fib` of each subdirectory that has one, a program of several modules) in file-name order, each judged by its header
 ;; against its compiled run (driver.child, driver.verdict), then the table and the counts, exit 1 if a case failed or a header did not
-;; parse, 2 for a directory that cannot be read or a prefix no case starts with. Shapes decided: the rows and the counts line are the
+;; parse, 2 for a directory that cannot be read or a prefix no case starts with. `-j N` (not in the Rust) runs N cases' children at once. Shapes decided: the rows and the counts line are the
 ;; Rust's, byte for byte; each case is run once (compiled, in a child process), where the Rust harness runs the interpreter too.
 (ns driver.harness
   (:require [fib.string :as s] [driver.proc :as p] [driver.child :as c] [driver.native :as native])
@@ -47,14 +47,22 @@
         ((some p) (Err p))
         (nil (Ok (vec (filter (fn (c: Case) (some? (first (filter (fn (p: str) (starts-with? (. c key) p)) prefixes)))) cases)))))))
 
-;; The status of the case at `path`: its header, its compiled run, the verdict. Rust: harness/mod.rs `run_case`
-(defun run-case (path: str tmp: str) -> CsStatus
+;; A case being judged: its status already (a header that did not parse, a run that could not start), or its header and its compiled run,
+;; started, and the index of the case.
+(defenum Job
+  (JobDone st: CsStatus)
+  (JobRun h: CsHeader run: c/Started))
+
+;; Starts the case at `path`: its header, and the compiled run in the child `tag` names (one tag for each case of a run, so the files
+;; of cases running together are apart). Rust: harness/mod.rs `run_case`
+(defun start-case :private (path: str tmp: str tag: str) -> Job
   (match (read-file path)
-    (nil (StHeader 0 (str-concat "cannot read case: " (. (native/fault-of path) text))))
+    (nil (JobDone (StHeader 0 (str-concat "cannot read case: " (. (native/fault-of path) text)))))
     ((some source)
      (match (parse-header path source)
-       ((Err e) (StHeader (. e line) (. e msg)))
-       ((Ok h) (judge h (c/run-in path (. h roots) tmp)))))))
+       ((Err e) (JobDone (StHeader (. e line) (. e msg))))
+       ((Ok h) (let ((r (c/start-in path (. h roots) tmp tag)))
+                 (if (< (. r pid) 0) (JobDone (judge h (c/finish-in r -1))) (JobRun h r))))))))
 
 (defstruct Row (name: str label: str detail: str status: CsStatus))
 
@@ -116,21 +124,41 @@
   (let ((n (reduce (fn (k: Counts r: Row) (count-status k (. r status))) (Counts 0 0 0 0 0) rows)))
     (and (> (total n) 0) (= (. n fail) 0) (= (. n header) 0))))
 
-(defun run-all :private (cases: (Vec Case) tmp: str) -> (Vec Row)
-  (mapv (fn (cs: Case) (row-of cs (run-case (. cs path) tmp))) cases))
+;; A started case waiting for its process: which case it is, its header and its run.
+(defstruct Slot (index: i64 h: CsHeader run: c/Started))
+
+;; The rows of `cases`, in order, with up to `jobs` of the compiled runs going at a time. A run is started whenever fewer than `jobs`
+;; are going; when `jobs` are, whichever process ends first is waited for and its case judged at once (so a slow case holds up
+;; nothing but itself); the rows are put in order at the end. With one job a case is started and then waited for, as it always was.
+(defun run-all :private (cases: (Vec Case) tmp: str jobs: i64) -> (Vec Row)
+  (let ((rows (loop ((next 0) (running {}) (done {}))
+                (cond (and (< next (count cases)) (< (count running) jobs))
+                        (let ((cs (nth cases next)))
+                          (match (start-case (. cs path) tmp (show next))
+                            ((JobDone st) (recur (+ next 1) running (assoc done next (row-of cs st))))
+                            ((JobRun h r) (recur (+ next 1) (assoc running (. r pid) (Slot next h r)) done))))
+                      (empty? running) done
+                      :else (let ((e (p/wait-any)))
+                              (match (get running (. e pid))
+                                (nil (recur next (if (< (. e pid) 0) {} running) done))
+                                ((some slot)
+                                 (let ((cs (nth cases (. slot index)))
+                                       (st (judge (. slot h) (c/finish-in (. slot run) (. e status)))))
+                                   (recur next (dissoc running (. e pid)) (assoc done (. slot index) (row-of cs st)))))))))))
+    (mapv (fn (i: i64) (unwrap-or (get rows i) (row-of (nth cases i) (StFail "no result: its process was lost")))) (range (count cases)))))
 
 (defun tmp-base :private () -> str
   (unwrap-or (native/getenv-opt "TMPDIR") "/tmp"))
 
-(defun report :private (cases: (Vec Case) dir: str tmp: str) -> i64
-  (let ((rows (run-all cases tmp)))
+(defun report :private (cases: (Vec Case) dir: str tmp: str jobs: i64) -> i64
+  (let ((rows (run-all cases tmp jobs)))
     (do (p/remove-dir tmp)
         (when (empty? rows) (eprintln (str-join ["fibc: no case files in " dir "; a run with nothing to run is not a pass"])))
         (let ((w (native/write-stdout (render rows))))
           (if (= w 0) (if (ok? rows) 0 1) w)))))
 
-;; `cases DIR [--only PREFIX..]`. Rust: main.rs:292 `cases`
-(defun cmd-cases (dir: str only: (Vec str)) -> i64
+;; `cases DIR [--only PREFIX..] [-j N]`. Rust: main.rs:292 `cases`
+(defun cmd-cases (dir: str only: (Vec str) jobs: i64) -> i64
   (match (list-cases dir)
     (nil (do (eprintln (str-join ["fibc: cannot read cases in " dir ": " (. (native/fault-of dir) text)])) 2))
     ((some all)
@@ -139,4 +167,4 @@
        ((Ok cases)
         (match (p/make-temp-dir (tmp-base))
           (nil (do (eprintln "fibc: cannot make a scratch directory") 2))
-          ((some tmp) (report cases dir tmp))))))))
+          ((some tmp) (report cases dir tmp jobs))))))))

@@ -36,9 +36,10 @@ build defaults to 2, run to 0.
   help                   print this message
   --version, -V          print the version
 
-  cases [dir [--only prefix..]]
+  cases [dir [--only prefix..]] [-j N]
                          run each case of dir (default cases/ownership) against the verdict
-                         in its header, compiled, and print the table; exit 1 if one failed
+                         in its header, compiled, and print the table; exit 1 if one failed;
+                         -j N runs N cases at a time (default 1), the table the same
 
 itrace and gen are commands of the Rust compiler (the test harness).")
 
@@ -57,7 +58,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
   (CmdEmitDump opts: EmitOptions files: (Vec str))
   (CmdExplain file: str)
   (CmdHarness word: str)
-  (CmdCases dir: str only: (Vec str))
+  (CmdCases dir: str only: (Vec str) jobs: i64)
   (CmdHelp)
   (CmdVersion)
   (CmdInvalid))
@@ -160,6 +161,33 @@ itrace and gen are commands of the Rust compiler (the test harness).")
                   ((some n) (recur (+ at (if (= glued "") 2 1)) trace (some n)))))
             :else (run-from rest at trace opt)))))
 
+;; The words of `cases` without its `-j N` (or `-jN`, anywhere after the directory): the number of cases to run at a time, 1 without
+;; the flag, 0 for a `-j` whose value is not a whole number of at least 1.
+(defstruct JobsFlag (n: i64 rest: (Vec str)))
+
+(defun jobs-of :private (text: str) -> i64
+  (match (parse-long text)
+    (nil 0)
+    ((some k) (if (> k 0) k 0))))
+
+(defun take-jobs :private (words: (Vec str)) -> JobsFlag
+  (loop ((i 0) (rest []) (jobs 1))
+    (let ((w (if (< i (count words)) (nth words i) "")))
+      (cond (>= i (count words)) (JobsFlag jobs rest)
+            (and (= w "-j") (< (+ i 1) (count words))) (recur (+ i 2) rest (jobs-of (nth words (+ i 1))))
+            (= w "-j") (JobsFlag 0 rest)
+            (and (starts-with? w "-j") (> (str-len w) 2)) (recur (+ i 1) rest (jobs-of (str-slice w 2 (str-len w))))
+            :else (recur (+ i 1) (conj rest w) jobs)))))
+
+;; `cases [DIR [--only PREFIX..]] [-j N]`. Rust: command.rs `parse`, to which `-j` is added
+(defun parse-cases :private (words: (Vec str) jobs: i64) -> Command
+  (let ((n (count words)))
+    (cond (< jobs 1) CmdInvalid
+          (= n 1) (CmdCases default-cases-dir [] jobs)
+          (= n 2) (CmdCases (nth words 1) [] jobs)
+          (and (> n 3) (= (nth words 2) "--only")) (CmdCases (nth words 1) (vec (drop 3 words)) jobs)
+          :else CmdInvalid)))
+
 ;; The command a list of words (after `-I` is taken out) is. Rust: command.rs:296 `parse`
 (defun parse (words: (Vec str)) -> Command
   (let ((n (count words))
@@ -172,9 +200,7 @@ itrace and gen are commands of the Rust compiler (the test harness).")
                                  ((some p) (CmdEmitDump (. p opts) (. p files))))
           (and (= head "explain") (= n 2)) (CmdExplain (nth words 1))
           (and (= head "itrace") (= n 2)) (CmdHarness head)
-          (and (= head "cases") (= n 1)) (CmdCases default-cases-dir [])
-          (and (= head "cases") (= n 2)) (CmdCases (nth words 1) [])
-          (and (= head "cases") (> n 3) (= (nth words 2) "--only")) (CmdCases (nth words 1) (vec (drop 3 words)))
+          (= head "cases") (let ((j (take-jobs words))) (parse-cases (. j rest) (. j n)))
           (= head "gen") (CmdHarness head)
           (and (= n 1) (in? head ["help" "--help" "-h"])) CmdHelp
           (and (= n 1) (in? head ["--version" "-V"])) CmdVersion
