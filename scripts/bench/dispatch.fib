@@ -1,0 +1,27 @@
+;; bench: enum match + protocol dispatch over a Vec of shapes (1000 shapes, 50000 passes), and closures (compose, captured counters)
+(ns main)
+(defstruct Sq (s: i64))
+(defstruct Rc (w: i64 h: i64))
+(defenum Shape (Circle r: i64) (Rect w: i64 h: i64) (Tri b: i64 h: i64))
+(defprotocol Area (area (self) -> i64))
+(impl Area Shape
+  (area (self) (match self ((Circle r) (* 3 (* r r))) ((Rect w h) (* w h)) ((Tri b h) (quot (* b h) 2)))))
+(impl Area Sq (area (self) (* (. self s) (. self s))))
+(impl Area Rc (area (self) (* (. self w) (. self h))))
+(defun mk (i: i64) -> Shape
+  (cond (= (rem i 3) 0) (Circle (+ 1 (rem i 7)))
+        (= (rem i 3) 1) (Rect (+ 1 (rem i 5)) (+ 2 (rem i 3)))
+        :else (Tri (+ 2 (rem i 9)) (+ 1 (rem i 4)))))
+(defun adder (k: i64) -> (fn (i64) i64) (fn (x) (+ x k)))
+(defun twice (f: (fn (i64) i64)) -> (fn (i64) i64) (fn (x) (f (f x))))
+(defun main () -> i64
+  (let [shapes (vec (map mk (range 1000)))
+        a (loop [p 0 acc 0]
+            (if (>= p 50000) acc
+              (recur (+ p 1) (+ acc (reduce (fn (s x) (+ s (area x))) 0 shapes)))))
+        b (loop [i 0 acc 0]
+            (if (>= i 50000000) acc
+              (recur (+ i 1) (+ acc (+ (area (Sq (rem i 100))) (area (Rc (rem i 7) 3)))))))
+        f (twice (twice (adder 3)))
+        c (loop [i 0 acc 0] (if (>= i 100000000) acc (recur (+ i 1) (rem (f acc) 1000003))))]
+    (do (println a b c) 0)))

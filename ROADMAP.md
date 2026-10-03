@@ -435,6 +435,101 @@ strings and formatting; then the long tail; then measurement. It
 interleaves with M6: library items the compiler needs land first.
 
 
+## Performance
+
+PERF0 (2026-10-03): measurement only; nothing below is changed yet. The suite is `scripts/bench/` (one fibber
+program per benchmark, each printing a checksum; Rust twins in `scripts/bench/rust/`, outside the cargo
+workspace; `FIBC=bin/fibc scripts/bench/run.sh [-n RUNS] [name..]` builds, times, compares checksums and prints
+the table). Measured with the released fibc 0.1.0 (stage 2, `bin/fibc` layout) against `rustc -O` twins, median
+of 3, on the shared 28-core host, one program at a time. Every benchmark printed the same line under fibc and
+under its Rust twin (column `check`). Rust is built plain `-O` (integer overflow wraps there, traps in fibber; no
+benchmark overflows). No Clojure column: no Clojure 1.12 jar was on disk (the lead's scratchpad copy is gone).
+
+| benchmark | fibber run s | max RSS MB | Rust run s | ratio | what it does |
+|---|---|---|---|---|---|
+| num-i64 | 2.97 | 1.5 | 2.87 | 1.0 | loop/recur, 1e9 steps |
+| num-f64 | 1.50 | 1.5 | 1.51 | 0.9 | f64 series, 2e9 steps |
+| recursion | 2.32 | 1.5 | 1.36 | 1.7 | fib 44 + arity-overloaded tail call |
+| binary-trees | 2.81 | 97 | 2.55 | 1.1 | depth 18, enum tree |
+| dispatch | 2.66 | 1.5 | 0.39 | 6.8 | protocol, enum match, closures |
+| vec-index | 0.83 | 2.8 | 0.08 | 10.3 | 1e8 `nth` |
+| num-nbody | 1.38 | 1.5 | 0.10 | 13.7 | 5 structs in a Vec, `assoc` per body per step |
+| strings | 1.08 | 217 | 0.09 | 11.9 | str, split, join, index-of |
+| lazy-fused | 1.05 | 1.5 | 0.09 | 11.6 | fused range/map/filter/reduce, iterate/drop/take |
+| map-assoc-get | 1.68 | 151 | 0.14 | 11.9 | `(Map i64 i64)`, 1e6 assoc, 2e6 get |
+| vec-sort | 0.92 | 73 | 0.07 | 13.1 | sort 2e6, sort-by 1e6, comparator sort 1e6 |
+| set-conj | 0.84 | 79 | 0.05 | 16.7 | 1e6 conj, 1e6 contains? |
+| vec-conj-pop | 1.64 | 208 | 0.06 | 27.2 | 2e7 conj, 2e7 pop |
+| lazy-bound | 1.48 | 1146 | 0.03 | 49.1 | the same chain, each stage bound by `let`, 5e6 |
+| vec-assoc | 3.36 | 3.4 | 0.01 | 333 | 1e7 `assoc` on a unique 1e5 Vec |
+| set-disj | 3.38 | 5.0 | under 0.01 | not meaningful (about 1000+) | 2e4 conj then 1e4 disj; quadratic |
+
+Where a Rust time is 0.01 s or less the ratio is bounded by timer resolution: read the absolute fibber time.
+Compile (stage 2): `fibc build hello.fib` 0.42 s against 0.115 s for the Rust seed (3.7x); each benchmark compiles
+in 0.4 to 0.7 s; `fibc emit compiler/fibc.fib` 37.5 s against 15.9 s for the Rust seed (2.4x).
+
+Scalar code is at Rust's speed (num-i64, num-f64, recursion, binary-trees: 0.9 to 1.7): LLVM does its work and
+the checked arithmetic costs nothing visible. Everything that touches a collection is 7x to 330x slower, and
+the profiles say why (sampled with `scripts/bench/tools/prof.sh`, an LD_PRELOAD SIGPROF sampler, because
+`perf_event_paranoid` is 4 here and perf, valgrind and hyperfine are absent; self time is exact, the
+inclusive and phase columns come from a heuristic stack scan and undercount):
+
+1. **`dissoc`/`disj` walks the whole trie twice per call** (library, `lib/prelude.fib` `dissoc`, lines 497-501:
+   `(= (mnode-count r) (mnode-count root))` to learn whether the key was present). set-disj at n = 20000, 40000,
+   80000 took 3.3 s, 15.0 s, 74.4 s (4.5x per doubling: quadratic); the profile of the 20000 run: 91.4% self in
+   `f.fib.prelude.mnode-count.i64.bool`, 8.3% in `fib.release`. This is the known ~20 s finding (n = 220000 did
+   not finish in 6 minutes here). It also costs the compiler itself: profiling `fibc emit compiler/fibc.fib`,
+   `mnode-count.i64.str` is 19.3% self time (about 7 s of 37.5 s), `dissoc` 18.2% inclusive, called from
+   `types.elab.finish`. Fix: `mnode-dissoc` reports whether it removed anything (or compare `cnt`). Expected: set-disj
+   3.4 s to well under 0.1 s; `fibc emit` 37.5 s to about 30 s; also helps every program that removes from a map.
+2. **Nothing is updated in place, so every `conj`/`assoc` copies and frees** (stdlib.md §2.5 says "today it never
+   is"; the checker/runtime layer: `compiler/own` to prove uniqueness or a run-time refcount-1 test in
+   `rt/*.lir`, then the library's `array-with`/`array-push`/`vnode-assoc`/`mnode-assoc` take the in-place path).
+   Evidence: vec-assoc profile: `vnode-assoc` 27.5% self, `fib.release` 27.1%, `drop.11` 17.3%, `__libc_free` 6.1%,
+   `malloc` 5.1% (about 80% of the time is path copying and its release); vec-conj-pop: `fib.array-alloc`
+   59.7% and `fib.array-slice` 34.3% inclusive (the 32-slot tail is copied on every `conj`), `fib.release` 44.2%
+   inclusive; set-conj: `mnode-assoc` 33.3% self, `fib.release` 81.7% inclusive (every superseded trie path is
+   freed); num-nbody: `fib.array-slice` 50.7% and `fib.release` 47.4% inclusive for five-element `assoc`s. Affects
+   vec-assoc (333x), vec-conj-pop (27x), set-conj (17x), nbody (14x), map-assoc-get (12x), vec-sort (13x,
+   whose `rnd` builds by `conj`) and the compiler's own build. Expected: 5x to 30x on these, to within about 2x
+   of Rust (the Rust Vec is the same algorithm without the copy). The largest payoff available after item 1.
+3. **A seq bound to a name costs a cell per element** (library `lib/fib/seq` + the expander's fuse rule,
+   `compiler/expand`). lazy-bound is 49x Rust and 1146 MB at 5e6 elements (230 bytes per element across three
+   stages); profile: `fib.alloc` 93.7% inclusive, `lmap` 64.7%, `lfilter` 48.3%, `range-lseq` 32.1%, `malloc` +
+   `free` 24.5% self, `fib.release` 53.3%. The same chain consumed in place (lazy-fused) runs 1.05 s for 100e6 + 2e7
+   elements with 1.5 MB: fusion works, 11.6x of the Rust iterator chain, which is the cost of the closure calls
+   and checked ops, not of allocation. Fix options: fuse a `let`-bound seq whose only use is a consumer (an
+   expander change, no semantic change when the binding is used once), chunk the lazy node (32 elements per
+   cell), or free consumed cells as `reduce` walks (the head is not held when the binding is dead after the call).
+   Expected: lazy-bound 49x down to about 12x (the fused figure) or better.
+4. **Allocator and refcount traffic is a flat 25% to 50% tax on everything** (emitter/runtime: `rt/*.lir`;
+   LLVM-level: lair). Self time of `malloc` + `__libc_free` + `fib.release` + `fib.drop-one` + `fib.alloc`
+   across profiles: vec-conj-pop 50%, vec-assoc 43%, nbody 43%, lazy-bound 42%, `fibc build hello.fib` 33%,
+   set-conj 26% (plus `drop.9` 10.9%). A size-class free list or bump arena in `fib.alloc`, an inlined
+   non-atomic (when single-threaded) fast path in `fib.release`, and `drop.N` specialised per node type would
+   cut it; binary-trees already runs at 1.1x of Rust's `Box`, so the gain is bounded by Rust's own malloc cost
+   there, but the collection benchmarks pay it several times per operation. Expected: 1.3x to 1.8x on
+   allocation-heavy programs; do after items 2 and 3, which remove most of the traffic instead.
+5. **Compile time: 2.4x to 3.7x slower than the Rust seed.** `fibc build hello.fib` (380 samples = 0.38 s CPU):
+   types 24.5%, own 20.3%, expand 13.7% (phase, innermost pass-module frame), liblair only 7.4% self: the front
+   end re-checks the implicit library for every program, and its own allocation traffic (`fib.release` 12.4%,
+   `malloc`+free 16%, `vec-conj`/`vec-collect` 16% and 8% inclusive) is the next biggest cost. `fibc emit
+   compiler/fibc.fib` (38,055 samples): `liblair.so` 33.0% self (called from `emit.defs.jit.emit-def` and the macro
+   JIT `macros.runner.build-module`: LLVM compiling each macro module), `mnode-count` 19.3% (item 1), libc 16.9%.
+   Fix: item 1 first (a one-line-class change); then check the library once per process or cache its checked form
+   (compiler/driver + types/own, the owner's "library checked once" line above); then JIT macro modules at -O0 or
+   cache them (compiler/macros + lair). Expected: item 1 alone 37.5 s to about 30 s; library caching hello 0.42 s
+   to about 0.15 s.
+6. **Smaller items** (not in the top five): dispatch 6.8x (protocol calls and closures: the `f.twice` closure
+   chain and the `Box`ed closure environments, check inlining of `m.` method symbols and closure calls in lair;
+   not profiled), vec-index 10.3x (a trie walk per `nth` with a bounds check and `Option` tail test; the Rust Vec is
+   flat; a flat-array Vec up to 32 slots, or unrolled shift-5 levels, would help), strings 11.9x (unprofiled; str
+   concat in a loop copies: in place when unique, as item 2), `sqrt` is not landed (nbody had to avoid it).
+
+Order of work, cheapest first: (1) the dissoc count (a library edit, one case), (2) in-place update, (3) seq
+bindings, (5) library check once, (4) allocator. Each is a proposal; each needs a before/after from
+`scripts/bench/run.sh` and its case before it counts.
+
 ## Releases
 
 Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,

@@ -1,0 +1,27 @@
+;; bench: nbody-like: 5 bodies as a Vec of structs, pairwise force loop (no sqrt: it is not landed), 4000000 steps
+(ns main)
+(defstruct Body (x: f64 y: f64 vx: f64 vy: f64 m: f64))
+(defun accel (bs: (Vec Body) i: i64) -> (Pair f64 f64)
+  (let [b (nth bs i)]
+    (loop [j 0 ax 0.0 ay 0.0]
+      (if (>= j 5) (Pair ax ay)
+        (if (= j i) (recur (+ j 1) ax ay)
+          (let [o (nth bs j)
+                dx (- (. o x) (. b x))
+                dy (- (. o y) (. b y))
+                d2 (+ (+ (* dx dx) (* dy dy)) 0.01)
+                f (/ (. o m) (* d2 (+ d2 1.0)))]
+            (recur (+ j 1) (+ ax (* f dx)) (+ ay (* f dy)))))))))
+(defun step (bs: (Vec Body)) -> (Vec Body)
+  (loop [i 0 out bs]
+    (if (>= i 5) out
+      (let [a (accel bs i)
+            b (nth bs i)
+            vx (+ (. b vx) (* 0.001 (. a fst)))
+            vy (+ (. b vy) (* 0.001 (. a snd)))]
+        (recur (+ i 1) (assoc out i (Body (+ (. b x) (* 0.001 vx)) (+ (. b y) (* 0.001 vy)) vx vy (. b m))))))))
+(defun main () -> i64
+  (let [b0 [(Body 0.0 0.0 0.0 0.0 10.0) (Body 1.0 0.0 0.0 1.0 1.0) (Body 0.0 2.0 -1.0 0.0 1.0)
+            (Body -3.0 0.0 0.0 -0.5 0.5) (Body 0.0 -4.0 0.5 0.0 0.2)]
+        r (loop [k 0 bs b0] (if (>= k 4000000) bs (recur (+ k 1) (step bs))))]
+    (do (println (long (* 1000.0 (+ (. (nth r 1) x) (. (nth r 2) y))))) 0)))
