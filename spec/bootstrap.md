@@ -22,7 +22,7 @@ Rust module they replace, so a reviewer can put the two side by side:
 | `syntax.error` | `syntax/error.rs` | `ErrKind`, `ReadError`, the messages |
 | `syntax.chars`, `syntax.cursor` | `chars.rs`, `cursor.rs` | character classes; a cursor over the UTF-8 bytes |
 | `syntax.number`, `syntax.literal` | `number.rs`, `literal.rs` | numbers; strings and characters |
-| `syntax.lexer` | `lexer.rs` | tokens: delimiters, the prefix reader macros, `#_`, and atoms (through `syntax.number` and `syntax.literal`); skips whitespace, comments and separator commas |
+| `syntax.lexer` | `lexer.rs` | tokens: delimiters, the prefix reader macros (`'` `` ` `` `~` `~@` `@` `&`), `#_`, `#(`, `#{`, and atoms (through `syntax.number` and `syntax.literal`; `7/2` is one atom, a list of three forms); skips whitespace, commas and comments |
 | `syntax.reader` | `reader.rs` | the tokens of `syntax.lexer` to `Stx`, the explicit stack of open frames written as recursion bounded by the nesting cap of 1000 |
 | `syntax.print` | `print.rs` | `Stx` to text that reads back |
 | `syntax.dump` | `crates/fibref/src/dump.rs` | the reader dump (§2) |
@@ -73,6 +73,26 @@ not in columns):
 | boolean, nil | `bool true`, `nil` |
 | list, vector, map | `list 3`, `vec 3`, `map 4`: the count of items, which follow one level deeper |
 
+The dump has no line of its own for a form the reader synthesises: `#(f %)`
+is the list `(fn (%1) (f %1))`, `#{a b}` the list `(hash-set a b)`, `7/2` the
+list `(/ 7 2)`, `'x` the list `(quote x)`, and each prints as the nodes of
+that list. What the reader decides, and what the dump therefore shows, is
+the position of every synthesised node (E8, E14a; **Decided**, owner,
+2026-10-03):
+
+| Synthesised node | Position |
+|---|---|
+| the `quote` `quasiquote` `unquote` `unquote-splicing` `deref` `&` symbol of a prefix form | the prefix characters alone (`'`, `~@`); the list spans the prefix through the form |
+| the symbol `fn` of `#(`, and its parameter list | the two characters `#(`; the whole `fn` list spans `#(` through `)` |
+| the body list of `#(`, the forms between | `#(` through `)`, the same span as the whole |
+| a parameter `%i` | the position of its first use in the body, whether written `%` or `%i`; a parameter never used (`%1` in `#(f %2)`), the two characters `#(` |
+| the symbol `%` in the body | its own text, and named `%1` |
+| the symbol `hash-set` of `#{` | the two characters `#{`; the list spans `#{` through `}` |
+| the symbol `/` and the two integers of `7/2` | each its own text; the list spans the whole token |
+
+Positions of this kind do not nest in a way that needs a rule: a synthesised
+node inside another is positioned by its own row.
+
 Quoted text escapes `"` as `\"`, `\` as `\\`, LF, TAB and CR as `\n`,
 `\t`, `\r`, every other character below U+0020 and U+007F as `\xNN`
 (uppercase), and writes every other character as it is. An error is one
@@ -108,13 +128,14 @@ and compares its output and exit status, byte for byte, with
 
 1. every `.fib` file under `cases/`, `lib/` and `compiler/`, and the
    prelude of the expander;
-2. the files of `compiler/tests/reader/` (983 `.fib` files when this
+2. the files of `compiler/tests/reader/` (1187 `.fib` files when this
    was written), written to hit each rule of syntax §1 and each
    read error, and the inputs that killed the mutants of the reader that
    the test alone had let survive (`rmut-*`, `rmut2-*`). Every variant of
    `ReadErrorKind` occurs among them: `fibref read
    compiler/tests/reader/*.fib | grep -a '^error ' | awk '{print $2}' |
-   sort -u | wc -l` prints 19, and the enum has 19 variants; no test
+   sort -u | wc -l` prints 22, and the enum has 22 variants (`NestedFn`,
+   `UnsupportedRest` and `BadFnParam` came with E8 and E14a); no test
    derives that count from the enum, so a variant added later is not
    noticed. Nothing checks that the inputs of the Rust reader's own unit
    tests (`crates/fibref/src/syntax/tests/`) are among these files;
@@ -125,7 +146,8 @@ and compares its output and exit status, byte for byte, with
    never thousands: the machine has been taken down by sweeps before).
    A unit test (`crates/fibc/tests/bootstrap/fuzz.rs`) checks that the
    standard run reaches each of 19 named read errors at least twice and
-   each node kind at least ten times; the 19 names are a list in the
+   each node kind at least ten times (the three errors of `#(` are reached
+   by the inputs of item 2 only); the 19 names are a list in the
    test, not derived from `ReadErrorKind`;
 5. paths that cannot be read, and the tool with no file.
 

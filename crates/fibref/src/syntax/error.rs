@@ -70,10 +70,23 @@ pub enum ReadErrorKind {
     InvalidSymbol(String),
     /// A keyword with an empty or malformed name (`:`, `::a`, `:a/`).
     InvalidKeyword(String),
-    /// `#` followed by anything but `_` (the only dispatch §1.1 defines).
+    /// `#` followed by anything but `_`, `(` or `{` (the dispatches §1.2
+    /// defines).
     UnknownDispatch(Option<char>),
+    /// `#(` inside the body of another `#(` (§1.2).
+    NestedFn,
+    /// `%&` in a `#(` body: rest parameters are not read yet (§1.2).
+    UnsupportedRest,
+    /// A `%N` in a `#(` body that is not a parameter: `%0` or an index
+    /// with a leading zero, or one above 255 (§1.2).
+    BadFnParam {
+        /// The symbol as written.
+        text: String,
+        /// Why it is not accepted.
+        reason: &'static str,
+    },
     /// A prefix reader macro (§1.2) with no form after it; for `@`, `&`,
-    /// `,` and `,@`, also one not immediately followed by a form.
+    /// `~` and `~@`, also one not immediately followed by a form.
     PrefixWithoutForm(&'static str),
     /// `#_` with no form after it before a closing delimiter or the end.
     DiscardWithoutForm,
@@ -140,8 +153,11 @@ impl fmt::Display for ReadErrorKind {
                 write!(f, "invalid symbol {s}: `/` may appear once, between a namespace and a name, or alone")
             }
             K::InvalidKeyword(s) => write!(f, "invalid keyword {s}"),
-            K::UnknownDispatch(Some(c)) => write!(f, "unknown reader syntax #{c}: only #_ is defined"),
+            K::UnknownDispatch(Some(c)) => write!(f, "unknown reader syntax #{c}: only #_, #(, #{{ are defined"),
             K::UnknownDispatch(None) => write!(f, "unknown reader syntax # at end of input"),
+            K::NestedFn => write!(f, "#( may not be nested inside #("),
+            K::UnsupportedRest => write!(f, "%& (a rest parameter) is not supported in #("),
+            K::BadFnParam { text, reason } => write!(f, "bad parameter {text} in #(: {reason}"),
             K::PrefixWithoutForm(p) => write!(f, "{p} must be followed immediately by a form"),
             K::DiscardWithoutForm => write!(f, "#_ must be followed by a form"),
             K::InOutNotSymbol => write!(f, "& must be followed by a symbol"),

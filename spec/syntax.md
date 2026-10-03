@@ -35,7 +35,7 @@ special forms.
 
 | Class | Syntax | Form produced |
 |---|---|---|
-| whitespace | space, tab, newline; a comma not immediately followed by a non-separator character (§1.2) | none |
+| whitespace | space, tab, newline, and the comma (`[1,2]` is `[1 2]`) | none |
 | line comment | `;` to end of line | none |
 | form comment | `#_` followed by one form | the form is read and discarded |
 | integer | `42`, `-7`, `0x1F`, `0b1010`, `1_000_000`, with optional width suffix `i8` `i16` `i32` `i64` (`1i32`, `0xFFu8` is not valid: no unsigned types) | `(Int v width)`; width is `i64` when no suffix |
@@ -47,9 +47,12 @@ special forms.
 | unit | `()` | `(List [])`; as an expression it is the unit value |
 | keyword | `:name`, `:ns/name` | `(Kw s)` |
 | symbol | see below | `(Sym s)` |
+| ratio | `7/2`, `-7/2`: decimal digits, `/`, decimal digits, the sign only on the first and no suffix, no `_`, no radix (`7/-2`, `7/2i32`, `0x7/2` are read errors, as every number-like token that is not a number) | `(List [(Sym "/") (Int 7 i64) (Int 2 i64)])`, which is the call `(/ 7 2)` |
 | list | `( f1 f2 ... )` | `(List [f1 f2 ...])` |
 | vector | `[ f1 f2 ... ]` | `(Vec [f1 f2 ...])` |
 | map | `{ k1 v1 k2 v2 ... }` (odd count is a read error) | `(Map [k1 v1 k2 v2 ...])` |
+| set | `#{ f1 f2 ... }` | `(List [(Sym "hash-set") f1 f2 ...])`, which is the call `(hash-set f1 f2 ...)`; any count, no pairing |
+| function | `#( f1 f2 ... )` (§1.2) | `(fn (%1 ... %n) (f1 f2 ...))` |
 
 A literal that does not fit its width (`300i8`, `9223372036854775808`) is a
 read error, never a wrap. A suffix that names no width (`2.5f16`, `1i128`) is a
@@ -62,7 +65,7 @@ built at run time is data and is not checked until it is compiled. Numbers carry
 is no literal polymorphism (types §1.1; **Decided**, D3).
 
 **Symbols.** A symbol is a maximal run of characters that are not
-whitespace, `( ) [ ] { } " ; ' `` ` `` `,` `@` `\`, not starting with a
+whitespace, `( ) [ ] { } " ; ' `` ` `` `,` `@` `~` `\`, not starting with a
 digit (or `-` followed by a digit), `:` or `#`. Symbols are
 case-sensitive. A symbol may contain `/` once, separating a namespace
 alias from a name (`seq/first`); `/` alone is a name. A symbol ending in
@@ -84,14 +87,15 @@ Each rewrites to a list form. There are exactly six.
 |---|---|---|
 | `'x` | `(quote x)` | the form `x` as a `Form` value (§3.16) |
 | `` `x `` | `(quasiquote x)` | template (§3.16) |
-| `,x` | `(unquote x)` | inside a quasiquote: splice one form |
-| `,@x` | `(unquote-splicing x)` | inside a quasiquote: splice a `(Vec Form)` |
+| `~x` | `(unquote x)` | inside a quasiquote: splice one form |
+| `~@x` | `(unquote-splicing x)` | inside a quasiquote: splice a `(Vec Form)` |
 | `@x` | `(deref x)` | read a cell, atom, weak reference or task (§3.11) |
 | `&x` | `(& x)` | in-out argument or parameter (§3.13); `x` must be a symbol |
 
-A comma immediately followed by a character that can start a form is
-`unquote`; any other comma is whitespace, so `[1, 2]` and `` `(a ,b) ``
-both read as expected. `@` and `&` bind tightly to the following form:
+The comma is whitespace everywhere, as in Clojure: `[1,2]` and `{:a 1, :b 2}`
+read as `[1 2]` and `{:a 1 :b 2}`, and `,x` is the symbol `x` (before E14 a
+comma touching a form was `unquote`; the unquote is now `~`). `~` is not a
+symbol constituent. `@` and `&` bind tightly to the following form:
 `@(. p children)` is `(deref (. p children))`. `&` is only meaningful in
 a parameter list or in argument position; anywhere else `(& x)` is an
 error at expansion.
@@ -153,10 +157,28 @@ which the rules above leave open:
   tab, line feed and carriage return, is an error outside a string and a
   comment (it would otherwise be an invisible symbol constituent).
 - `'` and `` ` `` may be separated from their form by whitespace and
-  comments; `@`, `&`, `,` and `,@` must touch theirs. `&` not followed
+  comments; `@`, `&`, `~` and `~@` must touch theirs. `&` not followed
   by a form is the symbol `&`; `&` applied to anything but a symbol is
-  a read error. A run of commas followed by a form is that many nested
-  unquotes.
+  a read error. A run of tildes is that many nested unquotes (`~~x`).
+- `#(` .. `)` (E8, E14) reads the forms up to the `)` as the body of an
+  anonymous function: `#(f % 2)` is `(fn (%1) (f %1 2))`. Every symbol
+  `%N` met between the `#(` and its `)`, at any depth and also in a
+  discarded form, is a parameter; a bare `%` is `%1` and is read as the
+  symbol `%1`; the parameter list is `%1` to `%n`, `n` the largest index
+  used, and an index never used is still a parameter, so `#(f %3)` takes
+  three. The body is one list of the forms, so `#(f 1)` is `(fn () (f 1))`
+  and `#()` is `(fn () ())`. `N` is written without a leading zero and is
+  at most 255: `%0`, `%01` and `%256` are the read error `BadFnParam`.
+  `#(` inside a `#(` is the read error `NestedFn` (at the inner `#(`), and
+  `%&`, which Clojure binds to the rest, is the read error
+  `UnsupportedRest` until a later item gives it a meaning. Outside a `#(`
+  `%`, `%1` and `%&` are ordinary symbols.
+- `#{` .. `}` (E8) reads as `(hash-set ..)`, so `#{1 2}` is `(hash-set 1 2)`;
+  an unclosed one is the error `Unclosed` for `{`.
+- `UnknownDispatch`'s message is `unknown reader syntax #X: only #_, #(, #{ are defined`;
+  `#` at the end of the input says so.
+- `7/2` reads as `(/ 7 2)`: the three forms are the symbol `/` and the
+  `Int`s of the digits, each with the position of its own text (§1.3).
 - Hexadecimal and binary literals are values, so `0xFFi8` is out of
   range; `_` may only stand between two digits; `1f32` is invalid (a
   float needs a `.` or an exponent); a float that overflows its width
@@ -1072,7 +1094,7 @@ time through a preloaded library (`crates/fibref/tests/run_io.rs`,
 
 ```
 (quote form)          ; 'form : Form
-(quasiquote form)     ; `form, with (unquote e) ,e and (unquote-splicing e) ,@e inside
+(quasiquote form)     ; `form, with (unquote e) ~e and (unquote-splicing e) ~@e inside
 (defmacro name private? (param*) body)
 param ::= sym | ... sym            ; "... rest" binds the remaining forms as (Vec Form)
 ```
@@ -1120,7 +1142,7 @@ Quasiquote is rewritten by the expander, not evaluated:
 
 ```
 `atom                ⟹ (quote atom)
-`(a ,b ,@cs d)       ⟹ (List (concat ['a] [b] cs ['d]))      ; b : Form, cs : (Vec Form)
+`(a ~b ~@cs d)       ⟹ (List (concat ['a] [b] cs ['d]))      ; b : Form, cs : (Vec Form)
 `[ ... ]  `{ ... }   ⟹ the same with Vec / Map
 ```
 
@@ -1148,7 +1170,7 @@ struct. `(do)` splices nothing. So
 
 ```lisp
 (defmacro defrecord (name fields)
-  `(do (defstruct ,name ,fields) (derive Eq ,name)))
+  `(do (defstruct ~name ~fields) (derive Eq ~name)))
 ```
 
 defines the struct and its `Eq` instance (proposed case 41).
@@ -1166,7 +1188,7 @@ its expansions, each counted in full as the number of forms in its
 tree, add up to more than 4 000 000 forms (`macro expansions of one
 top-level form produced more than 4000000 forms`). The last limit is
 what stops a macro whose expansion grows at each step, such as
-`` (defmacro g (x) `(g (do ,x ,x))) ``, which would otherwise do
+`` (defmacro g (x) `(g (do ~x ~x))) ``, which would otherwise do
 exponential (or, growing by one form a step, quadratic) work long
 before it reached the first limit.
 

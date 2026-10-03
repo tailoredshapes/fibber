@@ -16,9 +16,9 @@
 //! 0 only; control characters and Unicode whitespace other than space,
 //! tab, LF, CR are errors outside strings and comments; `'` and `` ` ``
 //! may be separated from their form by whitespace or comments, while
-//! `@`, `&`, `,` and `,@` must touch it; `&` not followed by a form is
+//! `@`, `&`, `~` and `~@` must touch it; `&` not followed by a form is
 //! the reserved symbol `&`, and `&` applied to a non-symbol is a read
-//! error; a run of commas followed by a form is nested unquotes; hex and
+//! error; a run of tildes is nested unquotes, the comma is whitespace; hex and
 //! binary literals are values, so `0xFFi8` is out of range; `_` may only
 //! stand between two digits; `1f32` is invalid (no `.` or exponent); a
 //! float that overflows its width is an error, one that underflows

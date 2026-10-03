@@ -17,7 +17,10 @@
 ;;   form is that frame's error (PrefixWithoutForm, DiscardWithoutForm at
 ;;   its position), whichever delimiter it is;
 ;; - the end of the input is the error of the innermost open frame;
-;; - `TooDeep` is reported at the token that would be the 1001st frame.
+;; - `TooDeep` is reported at the token that would be the 1001st frame;
+;; - `#(` inside a `#(` is `NestedFn`, found before the depth is checked;
+;; - `%`, `%N` and `%&` are looked at when the symbol is read (so also in
+;;   a discarded form), `%&` and a bad index being errors at that symbol.
 ;;
 ;; The end of the input is the token `TEof` here where Rust has `None`;
 ;; that is the only difference of shape. Where the Rust is silent, this
@@ -34,15 +37,23 @@
   (IClose found: Delim pos: Pos)
   (IEnd))
 
+;; What a sequence frame becomes when it closes.
+(defenum SeqKind :private SPlain SSet SFn)
+
+;; The state of reading: the lexer, whether a `#(` is open (there is at
+;; most one), the position of the first use of each parameter index met
+;; in it, and the largest index met.
+(defstruct Rd (lx: Lexer in-fn: (Cell bool) uses: (Cell (Map i64 Pos)) top: (Cell i64)))
+
 (defun too-deep :private (pos: Pos) -> ReadError
   (ReadError (TooDeep max-depth) pos))
 
 ;; Reads every top-level form of source, attributing positions to file.
 ;; Stops at the first error.
 (defun read-all (source: str file: str) -> (Result (Vec Stx) ReadError)
-  (let ((lx (lexer-new source file)))
+  (let ((rd (Rd (lexer-new source file) (cell false) (cell (map-empty)) (cell 0))))
     (loop ((out (vec-empty)))
-      (match (read-item lx 0)
+      (match (read-item rd 0)
         ((Err e) (Err e))
         ((Ok (IForm s)) (recur (conj out s)))
         ((Ok (IDiscarded)) (recur out))
@@ -52,29 +63,90 @@
 ;; Reads from the next token: a finished form, a discarded one, a closing
 ;; delimiter (left to the frame that owns it) or the end. depth is the
 ;; number of frames open around the token.
-(defun read-item :private (lx: Lexer depth: i64) -> (Result Item ReadError)
-  (match (next-token lx)
+(defun read-item :private (rd: Rd depth: i64) -> (Result Item ReadError)
+  (match (next-token (. rd lx))
     ((Err e) (Err e))
     ((Ok tok)
      (let ((pos (. tok pos)))
        (match (. tok kind)
          ((TEof) (Ok IEnd))
          ((TClose d) (Ok (IClose d pos)))
-         ((TAtom k) (Ok (IForm (Stx k pos))))
-         (opener (if (>= depth max-depth)
-                     (Err (too-deep pos))
-                     (read-opened lx (+ depth 1) opener pos))))))))
+         ((TAtom k) (read-atom rd k pos))
+         ((TOpenFn)
+          (if @(. rd in-fn)
+              (Err (ReadError NestedFn pos))
+              (read-checked rd depth TOpenFn pos)))
+         (opener (read-checked rd depth opener pos)))))))
+
+(defun read-checked :private (rd: Rd depth: i64 opener: TokenKind pos: Pos) -> (Result Item ReadError)
+  (if (>= depth max-depth)
+      (Err (too-deep pos))
+      (read-opened rd (+ depth 1) opener pos)))
+
+;; An atom; inside `#(` a symbol may be a parameter.
+(defun read-atom :private (rd: Rd k: StxKind pos: Pos) -> (Result Item ReadError)
+  (match k
+    ((SSym name)
+     (if @(. rd in-fn)
+         (match (fn-param rd name pos)
+           ((Err e) (Err e))
+           ((Ok n) (Ok (IForm (Stx (SSym n) pos)))))
+         (Ok (IForm (Stx k pos)))))
+    (_ (Ok (IForm (Stx k pos))))))
+
+(defun digits? :private (s: str) -> bool
+  (let ((bs (str-bytes s)))
+    (loop ((i 0))
+      (cond (>= i (array-len bs)) true
+            (and (>= (array-get bs i) 48i8) (<= (array-get bs i) 57i8)) (recur (+ i 1))
+            :else false))))
+
+;; The value of a run of at most three digits.
+(defun digits-value :private (s: str) -> i64
+  (let ((bs (str-bytes s)))
+    (loop ((i 0) (n 0))
+      (if (>= i (array-len bs))
+          n
+          (recur (+ i 1) (+ (* n 10) (- (zext i64 (array-get bs i)) 48)))))))
+
+;; A symbol read inside `#(`: `%` and `%N` are parameters, noted with the
+;; position of their first use; `%` is named `%1`.
+(defun fn-param :private (rd: Rd name: str pos: Pos) -> (Result str ReadError)
+  (if (not (starts-with? name "%"))
+      (Ok name)
+      (let ((digits (str-slice name 1 (str-len name))))
+        (cond (= digits "") (Ok (note-param rd 1 pos))
+              (= digits "&") (Err (ReadError UnsupportedRest pos))
+              (not (digits? digits)) (Ok name)
+              (starts-with? digits "0")
+                (Err (ReadError (BadFnParam name "parameters are numbered from %1, without a leading zero") pos))
+              (or (> (str-len digits) 3) (> (digits-value digits) 255))
+                (Err (ReadError (BadFnParam name "a #( has at most 255 parameters") pos))
+              :else (Ok (note-param rd (digits-value digits) pos))))))
+
+(defun note-param :private (rd: Rd n: i64 pos: Pos) -> str
+  (do (match (get @(. rd uses) n)
+        (nil (set! (. rd uses) (assoc @(. rd uses) n pos)))
+        ((some _) ()))
+      (if (> n @(. rd top)) (set! (. rd top) n) ())
+      (str-join ["%" (show n)])))
 
 ;; The form or discard an opening token starts; depth counts its frame.
-(defun read-opened :private (lx: Lexer depth: i64 tok: TokenKind pos: Pos) -> (Result Item ReadError)
+(defun read-opened :private (rd: Rd depth: i64 tok: TokenKind pos: Pos) -> (Result Item ReadError)
   (match tok
-    ((TOpen d) (item-of (read-seq lx depth d pos)))
+    ((TOpen d) (item-of (read-seq rd depth d SPlain pos)))
+    ((TOpenSet) (item-of (read-seq rd depth DBrace SSet pos)))
+    ((TOpenFn)
+     (do (set! (. rd in-fn) true)
+         (set! (. rd uses) (map-empty))
+         (set! (. rd top) 0)
+         (item-of (read-seq rd depth DParen SFn pos))))
     ((TPrefix p)
-     (match (read-operand lx depth (ReadError (PrefixWithoutForm (prefix-text p)) pos))
+     (match (read-operand rd depth (ReadError (PrefixWithoutForm (prefix-text p)) pos))
        ((Err e) (Err e))
        ((Ok form) (item-of (apply-prefix p pos form)))))
     (_
-     (match (read-operand lx depth (ReadError DiscardWithoutForm pos))
+     (match (read-operand rd depth (ReadError DiscardWithoutForm pos))
        ((Err e) (Err e))
        ((Ok _) (Ok IDiscarded))))))
 
@@ -85,36 +157,62 @@
 
 ;; The one form a prefix or `#_` is waiting for, skipping discarded forms;
 ;; a closing delimiter or the end there is unfinished, the frame's error.
-(defun read-operand :private (lx: Lexer depth: i64 unfinished: ReadError) -> (Result Stx ReadError)
-  (match (read-item lx depth)
+(defun read-operand :private (rd: Rd depth: i64 unfinished: ReadError) -> (Result Stx ReadError)
+  (match (read-item rd depth)
     ((Err e) (Err e))
     ((Ok (IForm s)) (Ok s))
-    ((Ok (IDiscarded)) (read-operand lx depth unfinished))
+    ((Ok (IDiscarded)) (read-operand rd depth unfinished))
     ((Ok _) (Err unfinished))))
 
-;; The forms of a list, vector or map up to its closing delimiter, which
-;; must be d. open is the position of the opening delimiter.
-(defun read-seq :private (lx: Lexer depth: i64 d: Delim open: Pos) -> (Result Stx ReadError)
+;; The forms of a list, vector, map, `#{` or `#(` up to its closing
+;; delimiter, which must be d. open is the position of the opening
+;; delimiter.
+(defun read-seq :private (rd: Rd depth: i64 d: Delim kind: SeqKind open: Pos) -> (Result Stx ReadError)
   (loop ((items (vec-empty)))
-    (match (read-item lx depth)
+    (match (read-item rd depth)
       ((Err e) (Err e))
       ((Ok (IForm s)) (recur (conj items s)))
       ((Ok (IDiscarded)) (recur items))
       ((Ok (IEnd)) (Err (ReadError (Unclosed (delim-open d)) open)))
       ((Ok (IClose found close))
        (if (same-delim found d)
-           (build-seq d (pos-through open close) items)
+           (build-seq rd d kind (pos-through open close) items)
            (Err (ReadError (MismatchedClose (delim-open d) (. open line) (. open col) (delim-close found))
                            close)))))))
 
-(defun build-seq :private (d: Delim pos: Pos items: (Vec Stx)) -> (Result Stx ReadError)
-  (match d
-    ((DParen) (Ok (Stx (SList items) pos)))
-    ((DBracket) (Ok (Stx (SVec items) pos)))
-    ((DBrace)
-     (if (= (bit-and (count items) 1) 0)
-         (Ok (Stx (SMap items) pos))
-         (Err (ReadError (OddMapEntries (count items)) pos))))))
+(defun build-seq :private (rd: Rd d: Delim kind: SeqKind pos: Pos items: (Vec Stx)) -> (Result Stx ReadError)
+  (match kind
+    ((SSet)
+     (Ok (Stx (SList (vec (concat [(Stx (SSym "hash-set") (open-token pos))] items))) pos)))
+    ((SFn) (Ok (build-fn rd pos items)))
+    (_
+     (match d
+       ((DParen) (Ok (Stx (SList items) pos)))
+       ((DBracket) (Ok (Stx (SVec items) pos)))
+       ((DBrace)
+        (if (= (bit-and (count items) 1) 0)
+            (Ok (Stx (SMap items) pos))
+            (Err (ReadError (OddMapEntries (count items)) pos))))))))
+
+;; The `#(` or `#{` token: the first two characters of the form.
+(defun open-token :private (pos: Pos) -> Pos
+  (Pos (. pos file) (. pos line) (. pos col) (. pos start) (+ (. pos start) 2)))
+
+;; `#(..)` as `(fn (%1 .. %n) (..))`: the `fn` and the parameter list take
+;; the position of the `#(`, a parameter that of its first use (the `#(`
+;; when never used), the body that of the whole.
+(defun build-fn :private (rd: Rd pos: Pos items: (Vec Stx)) -> Stx
+  (let ((open (open-token pos))
+        (uses @(. rd uses))
+        (top @(. rd top))
+        (params (loop ((i 1) (out (vec-empty)))
+                  (if (> i top)
+                      out
+                      (recur (+ i 1)
+                             (conj out (Stx (SSym (str-join ["%" (show i)]))
+                                            (unwrap-or (get uses i) open))))))))
+    (do (set! (. rd in-fn) false)
+        (Stx (SList [(Stx (SSym "fn") open) (Stx (SList params) open) (Stx (SList items) pos)]) pos))))
 
 ;; §1.2: `'x` is `(quote x)`, and so on; `&` requires a symbol. The list
 ;; spans from the prefix through the form, its head symbol is the prefix

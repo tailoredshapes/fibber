@@ -130,11 +130,11 @@ fn name_errors() {
         "invalid keyword ::k",
     );
     check(
-        "#{1}",
-        ReadErrorKind::UnknownDispatch(Some('{')),
+        "#[1]",
+        ReadErrorKind::UnknownDispatch(Some('[')),
         (1, 1),
-        "#{",
-        "only #_ is defined",
+        "#[",
+        "unknown reader syntax #[: only #_, #(, #{ are defined",
     );
     check(
         "x #",
@@ -153,8 +153,10 @@ fn prefix_errors() {
         ("`", "`", (1, 1)),
         ("(@)", "@", (1, 2)),
         ("@ x", "@", (1, 1)),
-        ("[,@]", ",@", (1, 2)),
-        (",@ x", ",@", (1, 1)),
+        ("[~@]", "~@", (1, 2)),
+        ("~@ x", "~@", (1, 1)),
+        ("~ x", "~", (1, 1)),
+        ("~", "~", (1, 1)),
         ("(x ';c\n)", "'", (1, 4)),
     ] {
         let e = error(src);

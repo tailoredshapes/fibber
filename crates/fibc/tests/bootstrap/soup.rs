@@ -21,7 +21,7 @@ const WHITESPACE: [&str; 8] = [" ", "  ", "\n", "\r\n", "\t", ", ", ",\n", "\n\n
 const SEPARATORS: [&str; 7] = ["", " ", "\n", "\r\n", "\t", ", ", ","];
 const SEPARATOR_WEIGHTS: [usize; 7] = [30, 30, 15, 10, 5, 5, 5];
 
-const PREFIXES: [&str; 6] = ["'", "`", ",", ",@", "@", "&"];
+const PREFIXES: [&str; 6] = ["'", "`", "~", "~@", "@", "&"];
 
 /// Symbols that can follow `&` (which must apply to a symbol).
 const SAFE_SYMBOLS: [&str; 6] = ["x", "foo", "a/b", "->", ".", "é"];

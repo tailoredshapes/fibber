@@ -118,7 +118,7 @@ fn invalid_numbers_say_why() {
     assert!(invalid_reason("1__0").contains("between two digits"));
     assert!(invalid_reason("0x_1").contains("expected a digit"));
     for bad in [
-        "1abc", "1.", "1.e5", "1e", "1e+", "0x", "0b102", "1.5.6", "1/2", "1i128", "0X1F", "-0x",
+        "1abc", "1.", "1.e5", "1e", "1e+", "0x", "0b102", "1.5.6", "1/2.5", "1i128", "0X1F", "-0x",
         "1-2", "0x1.5",
     ] {
         invalid_reason(bad);

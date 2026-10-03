@@ -52,7 +52,7 @@ fn deep_frame(rng: &mut Rng, out: &mut String, closers: &mut Vec<char>, discard_
             false
         }
         3 => {
-            out.push_str(rng.pick(&["'", "`", ",", ",@", "@"]));
+            out.push_str(rng.pick(&["'", "`", "~", "~@", "@"]));
             false
         }
         4 if discard_ok => {

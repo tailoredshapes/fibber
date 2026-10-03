@@ -47,16 +47,6 @@ impl<'a> Cursor<'a> {
         self.src[self.off..].chars().next()
     }
 
-    /// The byte offset of the next character.
-    pub(crate) fn offset(&self) -> usize {
-        self.off
-    }
-
-    /// The source from byte offset `off` (empty past the end).
-    pub(crate) fn src_from(&self, off: usize) -> &'a str {
-        self.src.get(off..).unwrap_or("")
-    }
-
     /// The character `n` places ahead (0 is [`Cursor::peek`]).
     pub(crate) fn peek_nth(&self, n: usize) -> Option<char> {
         self.src[self.off..].chars().nth(n)

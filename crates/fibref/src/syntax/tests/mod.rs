@@ -6,6 +6,7 @@ mod gen;
 mod numbers;
 mod positions;
 mod roundtrip;
+mod shorthand;
 mod structure;
 mod text;
 

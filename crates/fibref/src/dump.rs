@@ -188,6 +188,9 @@ pub fn kind_name(k: &ReadErrorKind) -> &'static str {
         K::MismatchedClose { .. } => "MismatchedClose",
         K::OddMapEntries { .. } => "OddMapEntries",
         K::TooDeep { .. } => "TooDeep",
+        K::NestedFn => "NestedFn",
+        K::UnsupportedRest => "UnsupportedRest",
+        K::BadFnParam { .. } => "BadFnParam",
     }
 }
 

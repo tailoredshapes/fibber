@@ -37,13 +37,13 @@ fn a_hundred_thousand_levels_of_each_nesting_construct() {
     assert!(read_all(&",".repeat(HUGE), "adv")
         .expect("reads")
         .is_empty());
-    for open in ["(", "[", "{", "'", "`", "@", "#_", ",@", "' ", "#_ "] {
+    for open in ["(", "[", "{", "'", "`", "@", "#_", "~@", "#{", "' ", "#_ "] {
         let src = open.repeat(HUGE);
         assert_eq!(kind_of_error(&src), too_deep(), "{open:?} x {HUGE}");
         let closed = format!("{}x{}", open.repeat(HUGE), ")".repeat(HUGE));
         assert_eq!(kind_of_error(&closed), too_deep(), "{open:?}x) x {HUGE}");
     }
-    let unquotes = format!("{}x", ",".repeat(HUGE));
+    let unquotes = format!("{}x", "~".repeat(HUGE));
     assert_eq!(kind_of_error(&unquotes), too_deep());
     let balanced = format!("{}{}", "(".repeat(HUGE), ")".repeat(HUGE));
     assert_eq!(kind_of_error(&balanced), too_deep());
@@ -266,19 +266,19 @@ fn form_comment_before_a_closing_delimiter() {
 fn quasiquote_nesting() {
     assert_eq!(show("```x"), "(quasiquote (quasiquote (quasiquote x)))");
     assert_eq!(
-        show("`(a `(b ,(c ,d)))"),
+        show("`(a `(b ~(c ~d)))"),
         "(quasiquote (a (quasiquote (b (unquote (c (unquote d)))))))"
     );
-    assert_eq!(show(",@,@x"), "(unquote-splicing (unquote-splicing x))");
-    assert_eq!(show("`,'x"), "(quasiquote (unquote (quote x)))");
+    assert_eq!(show("~@~@x"), "(unquote-splicing (unquote-splicing x))");
+    assert_eq!(show("`~'x"), "(quasiquote (unquote (quote x)))");
     assert_eq!(
-        show("`(,@[1 2] ,@{})"),
+        show("`(~@[1 2] ~@{})"),
         "(quasiquote ((unquote-splicing [1 2]) (unquote-splicing {})))"
     );
     // The reader does not check that unquote is inside a quasiquote:
     // that is the expander's job (§3.16).
-    assert_eq!(show(",x ,@y"), "(unquote x) (unquote-splicing y)");
-    let nested = format!("{}x", "`,".repeat(MAX_DEPTH / 2));
+    assert_eq!(show("~x ~@y"), "(unquote x) (unquote-splicing y)");
+    let nested = format!("{}x", "`~".repeat(MAX_DEPTH / 2));
     assert_eq!(read_all(&nested, "adv").expect("reads").len(), 1);
 }
 

@@ -16,9 +16,31 @@ use super::pos::Pos;
 /// The deepest nesting the reader accepts.
 pub const MAX_DEPTH: usize = 1000;
 
+/// What a sequence frame becomes when it closes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeqKind {
+    /// A list, vector or map, by its delimiter.
+    Plain,
+    /// `#{..}`, the list `(hash-set ..)`.
+    Set,
+    /// `#(..)`, the list `(fn (%1 .. %n) (..))`.
+    Fn,
+}
+
+/// The most parameters a `#(` has.
+const MAX_FN_PARAMS: usize = 255;
+
+/// The parameters met so far in the `#(` being read: for each index, the
+/// position of its first use.
+#[derive(Default)]
+struct FnParams {
+    uses: Vec<Option<Pos>>,
+}
+
 enum Frame {
     Seq {
         delim: Delim,
+        kind: SeqKind,
         open: Pos,
         items: Vec<Form>,
     },
@@ -33,6 +55,8 @@ enum Frame {
 
 struct Reader {
     stack: Vec<Frame>,
+    /// Set while a `#(` is open; there is at most one.
+    params: Option<FnParams>,
     out: Vec<Form>,
 }
 
@@ -45,6 +69,7 @@ pub(crate) fn read_all(source: &str, file: &str) -> Result<Vec<Form>, ReadError>
     let mut lexer = Lexer::new(source, file);
     let mut reader = Reader {
         stack: Vec::new(),
+        params: None,
         out: Vec::new(),
     };
     while let Some(token) = lexer.next_token()? {
@@ -57,16 +82,70 @@ impl Reader {
     fn feed(&mut self, token: Token) -> Result<(), ReadError> {
         let pos = token.pos;
         match token.kind {
-            TokenKind::Open(delim) => self.push(Frame::Seq {
-                delim,
-                open: pos,
-                items: Vec::new(),
-            }),
+            TokenKind::Open(delim) => self.open(delim, SeqKind::Plain, pos),
+            TokenKind::OpenSet => self.open(Delim::Brace, SeqKind::Set, pos),
+            TokenKind::OpenFn if self.params.is_some() => Err(error(ReadErrorKind::NestedFn, pos)),
+            TokenKind::OpenFn => {
+                self.open(Delim::Paren, SeqKind::Fn, pos)?;
+                self.params = Some(FnParams::default());
+                Ok(())
+            }
             TokenKind::Close(delim) => self.close(delim, pos),
             TokenKind::Prefix(prefix) => self.push(Frame::Prefix { prefix, pos }),
             TokenKind::Discard => self.push(Frame::Discard { pos }),
+            TokenKind::Atom(FormKind::Sym(name)) if self.params.is_some() => {
+                let name = self.param(name, &pos)?;
+                self.complete(Form::new(FormKind::Sym(name), pos))
+            }
             TokenKind::Atom(kind) => self.complete(Form::new(kind, pos)),
         }
+    }
+
+    fn open(&mut self, delim: Delim, kind: SeqKind, open: Pos) -> Result<(), ReadError> {
+        self.push(Frame::Seq {
+            delim,
+            kind,
+            open,
+            items: Vec::new(),
+        })
+    }
+
+    /// A symbol read inside `#(`: `%` and `%N` are parameters, noted
+    /// with the position of their first use; `%` is named `%1`.
+    fn param(&mut self, name: String, pos: &Pos) -> Result<String, ReadError> {
+        let Some(digits) = name.strip_prefix('%') else {
+            return Ok(name);
+        };
+        let bad = |reason| {
+            let kind = ReadErrorKind::BadFnParam {
+                text: name.clone(),
+                reason,
+            };
+            error(kind, pos.clone())
+        };
+        let index = if digits.is_empty() {
+            1
+        } else if digits == "&" {
+            return Err(error(ReadErrorKind::UnsupportedRest, pos.clone()));
+        } else if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Ok(name);
+        } else if digits.starts_with('0') {
+            return Err(bad(
+                "parameters are numbered from %1, without a leading zero",
+            ));
+        } else {
+            match digits.parse::<usize>() {
+                Ok(n) if n <= MAX_FN_PARAMS => n,
+                _ => return Err(bad("a #( has at most 255 parameters")),
+            }
+        };
+        if let Some(p) = self.params.as_mut() {
+            if p.uses.len() < index {
+                p.uses.resize(index, None);
+            }
+            p.uses[index - 1].get_or_insert_with(|| pos.clone());
+        }
+        Ok(format!("%{index}"))
     }
 
     fn push(&mut self, frame: Frame) -> Result<(), ReadError> {
@@ -90,8 +169,18 @@ impl Reader {
                 },
                 pos,
             )),
-            Some(Frame::Seq { delim, open, items }) if delim == found => {
-                let form = build_seq(delim, open.through(&pos), items)?;
+            Some(Frame::Seq {
+                delim,
+                kind,
+                open,
+                items,
+            }) if delim == found => {
+                let params = if kind == SeqKind::Fn {
+                    self.params.take()
+                } else {
+                    None
+                };
+                let form = build_seq(delim, kind, params, open.through(&pos), items)?;
                 self.complete(form)
             }
             Some(Frame::Seq { delim, open, .. }) => {
@@ -152,15 +241,42 @@ fn unfinished(frame: Frame) -> ReadError {
     }
 }
 
-fn build_seq(delim: Delim, pos: Pos, items: Vec<Form>) -> Result<Form, ReadError> {
-    let kind = match delim {
-        Delim::Paren => FormKind::List(items),
-        Delim::Bracket => FormKind::Vec(items),
-        Delim::Brace if !items.len().is_multiple_of(2) => {
+fn build_seq(
+    delim: Delim,
+    kind: SeqKind,
+    params: Option<FnParams>,
+    pos: Pos,
+    items: Vec<Form>,
+) -> Result<Form, ReadError> {
+    // The `#(` or `#{` token: the first two characters.
+    let open = Pos {
+        end: pos.start + 2,
+        ..pos.clone()
+    };
+    let sym = |name: &str, at: &Pos| Form::new(FormKind::Sym(name.to_string()), at.clone());
+    let kind = match (kind, delim) {
+        (SeqKind::Set, _) => {
+            let mut all = vec![sym("hash-set", &open)];
+            all.extend(items);
+            FormKind::List(all)
+        }
+        (SeqKind::Fn, _) => {
+            let uses = params.map(|p| p.uses).unwrap_or_default();
+            let names = uses
+                .iter()
+                .enumerate()
+                .map(|(i, first)| sym(&format!("%{}", i + 1), first.as_ref().unwrap_or(&open)));
+            let params = Form::new(FormKind::List(names.collect()), open.clone());
+            let body = Form::new(FormKind::List(items), pos.clone());
+            FormKind::List(vec![sym("fn", &open), params, body])
+        }
+        (_, Delim::Paren) => FormKind::List(items),
+        (_, Delim::Bracket) => FormKind::Vec(items),
+        (_, Delim::Brace) if !items.len().is_multiple_of(2) => {
             let count = items.len();
             return Err(error(ReadErrorKind::OddMapEntries { count }, pos));
         }
-        Delim::Brace => FormKind::Map(items),
+        (_, Delim::Brace) => FormKind::Map(items),
     };
     Ok(Form::new(kind, pos))
 }

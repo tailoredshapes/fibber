@@ -1,22 +1,18 @@
 ;; compiler/syntax/lexer.fib: tokens (syntax §1.1, §1.2), as
 ;; crates/fibref/src/syntax/lexer.rs: delimiters, the prefix reader
 ;; macros, the form comment `#_`, and atoms, which are complete forms
-;; already. Whitespace, `;` comments and separator commas are skipped
-;; here. `syntax.reader` builds forms from these tokens.
+;; already. Whitespace, commas and `;` comments are skipped here. `syntax.reader` builds forms from these tokens.
 ;;
 ;; Every decision, and the order the decisions are taken in, is the Rust
 ;; lexer's: a token's error is found before the reader sees the token, a
-;; comma is an unquote exactly when what follows the run of commas
-;; starts a form (`unquote-until` remembers the end of a run known to be
-;; followed by a form, so a long run costs one scan, not one per comma),
-;; a tight prefix (`,` `,@` `@` `&`) must touch its form while `'` and
-;; `` ` `` need not, a lone `&` is the symbol `&`.
+;; comma is whitespace, a tight prefix (`~` `~@` `@` `&`) must touch its
+;; form while `'` and `` ` `` need not, a lone `&` is the symbol `&`,
+;; `#(` and `#{` are tokens of their own, and `7/2` is one atom, the list
+;; `(/ 7 2)` with a position for each of its three forms.
 ;;
 ;; Where this port differs in shape only: the end of the input is a
 ;; token (`TEof`) rather than `None`, so next-token has one result type
-;; less to wrap; the cursor works on bytes, so a run of commas is found
-;; by scanning bytes (a comma is one byte and never part of another
-;; character) and the character after it is decoded where the run ends.
+;; less to wrap.
 (ns syntax.lexer
   (:require [syntax.number :as number] [syntax.literal :as literal])
   (:use syntax.pos syntax.form syntax.error syntax.cursor syntax.chars))
@@ -57,8 +53,8 @@
   (match p
     ((PQuote) "'")
     ((PQuasiquote) "`")
-    ((PUnquote) ",")
-    ((PUnquoteSplicing) ",@")
+    ((PUnquote) "~")
+    ((PUnquoteSplicing) "~@")
     ((PDeref) "@")
     ((PInOut) "&")))
 
@@ -72,6 +68,8 @@
   (TClose d: Delim)
   (TPrefix p: Prefix)
   (TDiscard)
+  (TOpenFn)
+  (TOpenSet)
   (TAtom k: StxKind)
   (TEof))
 
@@ -79,13 +77,11 @@
 ;; span there).
 (defstruct Token (kind: TokenKind pos: Pos))
 
-;; The cursor, and the memo of starts-form: commas before this byte
-;; offset are known to be unquotes (they belong to a run of commas
-;; followed by a form).
-(defstruct Lexer (cur: Cursor unquote-until: (Cell i64)))
+;; The cursor.
+(defstruct Lexer (cur: Cursor))
 
 (defun lexer-new (src: str file: str) -> Lexer
-  (Lexer (cursor-new src file) (cell 0)))
+  (Lexer (cursor-new src file)))
 
 ;; The next token; TEof at the end of the input.
 (defun next-token (lx: Lexer) -> (Result Token ReadError)
@@ -99,44 +95,22 @@
              ((Err e) (Err e))
              ((Ok kind) (Ok (Token kind (cursor-pos-from cur mark))))))))))
 
-(defun is-comma :private (c: char) -> bool (= (char->i32 c) 44i32))
-
 (defun not-newline :private (c: char) -> bool (not (= (char->i32 c) 10i32)))
 
-;; Skips whitespace, `;` comments and commas that do not unquote.
+;; Skips whitespace, commas and `;` comments.
 (defun skip-trivia :private (lx: Lexer) -> unit
   (let ((cur (. lx cur)))
     (loop ()
       (match (cursor-peek cur)
         (nil ())
         ((some c)
-         (cond (is-space c) (do (cursor-bump cur) (recur))
+         (cond (is-separator c) (do (cursor-bump cur) (recur))
                (= (char->i32 c) 59i32) (do (cursor-bump-while cur not-newline) (recur))
-               (and (is-comma c) (not (starts-form lx 1)))
-                ;; Every comma of this run is followed by commas and then
-                ;; no form, so the whole run is whitespace.
-                (do (cursor-bump-while cur is-comma) (recur))
                :else ()))))))
 
-;; The offset of the first byte at or after i that is not a comma.
-(defun past-commas :private (cur: Cursor i: i64) -> i64
-  (let ((len (cursor-len cur)))
-    (loop ((j i))
-      (if (and (< j len) (= (cursor-byte cur j) 44)) (recur (+ j 1)) j))))
-
-;; Whether the text skip bytes ahead of the cursor starts a form (§1.2),
-;; looking through a run of commas: `,,x` is `(unquote (unquote x))`, and
-;; a run of commas not followed by a form is whitespace.
-(defun starts-form :private (lx: Lexer skip: i64) -> bool
-  (let ((cur (. lx cur))
-        (off (+ (cursor-offset cur) skip))
-        (len (cursor-len cur)))
-    (if (and (< off len) (= (cursor-byte cur off) 44) (< off @(. lx unquote-until)))
-        true
-        (let ((end (past-commas cur off))
-              (starts (starts-form-char (if (< end len) (some (decode-at (. cur bytes) end)) nil))))
-          (do (if starts (set! (. lx unquote-until) end) ())
-              starts)))))
+;; Whether the next character starts a form (§1.2).
+(defun starts-form :private (lx: Lexer) -> bool
+  (starts-form-char (cursor-peek (. lx cur))))
 
 ;; The error of kind from mark to the cursor.
 (defun err-at :private (cur: Cursor mark: Mark kind: ErrKind) -> ReadError
@@ -164,31 +138,31 @@
       (\` (single cur (TPrefix PQuasiquote)))
       (\" (atom-kind (literal/lex-string cur)))
       (\\ (atom-kind (literal/lex-char cur)))
-      (\, (lex-tight-prefix lx c mark))
+      (\~ (lex-tight-prefix lx c mark))
       (\@ (lex-tight-prefix lx c mark))
       (\& (lex-tight-prefix lx c mark))
       (\# (lex-dispatch cur mark))
       (\: (lex-keyword cur mark))
       (_ (lex-word cur c mark)))))
 
-;; `,` `,@` `@` `&`: each must be followed immediately by a form. A `&`
+;; `~` `~@` `@` `&`: each must be followed immediately by a form. A `&`
 ;; that is not is the reserved symbol `&` itself (§1.1), which is what
 ;; `(& x)` needs to read back.
 (defun lex-tight-prefix :private (lx: Lexer c: char mark: Mark) -> (Result TokenKind ReadError)
   (let ((cur (. lx cur)))
     (do (cursor-bump cur)
         (match c
-          (\, (if (= (cursor-peek cur) (some \@))
+          (\~ (if (= (cursor-peek cur) (some \@))
                   (do (cursor-bump cur) (tight-prefix lx mark PUnquoteSplicing))
                   (tight-prefix lx mark PUnquote)))
           (\@ (tight-prefix lx mark PDeref))
-          (_ (if (starts-form lx 0)
+          (_ (if (starts-form lx)
                  (Ok (TPrefix PInOut))
                  (Ok (TAtom (SSym "&")))))))))
 
 ;; The prefix just consumed, which must be followed immediately by a form.
 (defun tight-prefix :private (lx: Lexer mark: Mark p: Prefix) -> (Result TokenKind ReadError)
-  (if (starts-form lx 0)
+  (if (starts-form lx)
       (Ok (TPrefix p))
       (Err (err-at (. lx cur) mark (PrefixWithoutForm (prefix-text p))))))
 
@@ -196,6 +170,8 @@
   (do (cursor-bump cur)
       (match (cursor-peek cur)
         ((some \_) (do (cursor-bump cur) (Ok TDiscard)))
+        ((some \() (do (cursor-bump cur) (Ok TOpenFn)))
+        ((some \{) (do (cursor-bump cur) (Ok TOpenSet)))
         (other (do (cursor-bump cur) (Err (err-at cur mark (UnknownDispatch other))))))))
 
 (defun lex-keyword :private (cur: Cursor mark: Mark) -> (Result TokenKind ReadError)
@@ -226,11 +202,58 @@
         (is-forbidden c) (do (cursor-bump cur) (Err (err-at cur mark (InvalidCharacter c))))
         :else (lex-symbol cur mark)))
 
+;; The byte offset of the `/` of text when it is `-?D/D` with D a
+;; non-empty run of decimal digits (a ratio, §1.1), else -1.
+(defun ratio-slash :private (text: str) -> i64
+  (let ((bs (str-bytes text))
+        (n (array-len bs))
+        (from (if (and (> n 0) (= (array-get bs 0) 45i8)) 1 0)))
+    (loop ((i from))
+      (cond (>= i n) -1
+            (digit-byte? (array-get bs i)) (recur (+ i 1))
+            (and (= (array-get bs i) 47i8) (> i from) (< (+ i 1) n)
+                 (all-digits? bs (+ i 1) n)) i
+            :else -1))))
+
+(defun digit-byte? :private (b: i8) -> bool
+  (and (>= b 48i8) (<= b 57i8)))
+
+(defun all-digits? :private (bs: (Array i8) from: i64 to: i64) -> bool
+  (loop ((i from))
+    (cond (>= i to) true
+          (digit-byte? (array-get bs i)) (recur (+ i 1))
+          :else false)))
+
+;; The position of the bytes from..to of the token at pos (all ASCII, so
+;; bytes are columns).
+(defun part-pos :private (pos: Pos from: i64 to: i64) -> Pos
+  (Pos (. pos file) (. pos line) (+ (. pos col) from) (+ (. pos start) from) (+ (. pos start) to)))
+
+(defun ratio-part :private (text: str pos: Pos from: i64 to: i64) -> (Result Stx ErrKind)
+  (match (number/parse-number (str-slice text from to))
+    ((Err kind) (Err kind))
+    ((Ok k) (Ok (Stx k (part-pos pos from to))))))
+
+;; `7/2` as `(/ 7 2)`; slash is the offset of the `/`.
+(defun lex-ratio :private (cur: Cursor mark: Mark text: str slash: i64) -> (Result TokenKind ReadError)
+  (let ((pos (cursor-pos-from cur mark)))
+    (match (ratio-part text pos 0 slash)
+      ((Err kind) (Err (err-at cur mark kind)))
+      ((Ok num)
+       (match (ratio-part text pos (+ slash 1) (str-len text))
+         ((Err kind) (Err (err-at cur mark kind)))
+         ((Ok den)
+          (Ok (TAtom (SList [(Stx (SSym "/") (part-pos pos slash (+ slash 1))) num den])))))))))
+
 (defun lex-number :private (cur: Cursor mark: Mark) -> (Result TokenKind ReadError)
   (do (cursor-bump-while cur is-constituent)
-      (match (number/parse-number (cursor-text-from cur mark))
-        ((Ok k) (Ok (TAtom k)))
-        ((Err kind) (Err (err-at cur mark kind))))))
+      (let ((text (cursor-text-from cur mark))
+            (slash (ratio-slash text)))
+        (if (>= slash 0)
+            (lex-ratio cur mark text slash)
+            (match (number/parse-number text)
+              ((Ok k) (Ok (TAtom k)))
+              ((Err kind) (Err (err-at cur mark kind))))))))
 
 (defun lex-symbol :private (cur: Cursor mark: Mark) -> (Result TokenKind ReadError)
   (do (cursor-bump-while cur is-constituent)

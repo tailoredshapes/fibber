@@ -48,9 +48,9 @@ fn prefix_forms_span_prefix_and_operand() {
     assert_eq!(span(src, &items[0]), "@");
     assert_eq!(items[0].as_sym(), Some("deref"));
     assert_eq!(span(src, &items[1]), "(. p c)");
-    let src = ",@xs";
+    let src = "~@xs";
     let f = &read_all(src, "t").expect("reads")[0];
-    assert_eq!(span(src, &f.as_list().expect("list")[0]), ",@");
+    assert_eq!(span(src, &f.as_list().expect("list")[0]), "~@");
     let src = "' \n x";
     let f = &read_all(src, "t").expect("reads")[0];
     assert_eq!(span(src, f), src);

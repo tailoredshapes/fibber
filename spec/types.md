@@ -324,7 +324,7 @@ variables and emits its constraints.
 | `f` a global defun, constructor, variant constant or protocol method | `inst(σ_f)`; error if `f` has `&` parameters (`function with & parameters is not a value`) |
 | `g` a `def` name (syntax §3.19) | `Γ(g)`, its closed monomorphic type (§2.16); a global like `f`, never a capture |
 | `[e₁ .. eₙ]`, `{k v ..}` | rewritten to prelude calls before typing (syntax §1.4) |
-| `'form`, `` `form `` | `Form`; inside a quasiquote `,e` needs `e : Form` and `,@e` needs `e : (Vec Form)` |
+| `'form`, `` `form `` | `Form`; inside a quasiquote `~e` needs `e : Form` and `~@e` needs `e : (Vec Form)` |
 
 ### 2.2 Calls
 

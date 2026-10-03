@@ -30,7 +30,7 @@ fn the_six_prefix_macros() {
     assert_eq!(show("'x"), "(quote x)");
     assert_eq!(show("`x"), "(quasiquote x)");
     assert_eq!(
-        show("`(a ,b ,@cs d)"),
+        show("`(a ~b ~@cs d)"),
         "(quasiquote (a (unquote b) (unquote-splicing cs) d))"
     );
     assert_eq!(show("@x"), "(deref x)");
@@ -40,7 +40,7 @@ fn the_six_prefix_macros() {
     assert_eq!(show("'[a]"), "(quote [a])");
     assert_eq!(show("&v:"), "(& v:)");
     assert_eq!(show("@@x"), "(deref (deref x))");
-    assert_eq!(show(",@@x"), "(unquote-splicing (deref x))");
+    assert_eq!(show("~@@x"), "(unquote-splicing (deref x))");
     assert_eq!(show("''x"), "(quote (quote x))");
 }
 
@@ -63,11 +63,13 @@ fn prefix_lists_are_ordinary_lists() {
 #[test]
 fn commas() {
     assert_eq!(show("[1, 2]"), "[1 2]");
-    assert_eq!(show("[1 ,2]"), "[1 (unquote 2)]");
-    assert_eq!(show("[1,2]"), "[1 (unquote 2)]");
+    assert_eq!(show("[1 ,2]"), "[1 2]");
+    assert_eq!(show("[1,2]"), "[1 2]");
+    assert_eq!(show("[1 ~2]"), "[1 (unquote 2)]");
     assert_eq!(show("(a ,)"), "(a)");
     assert_eq!(show("a,"), "a");
-    assert_eq!(show(",,x"), "(unquote (unquote x))");
+    assert_eq!(show(",,x"), "x");
+    assert_eq!(show("~~x"), "(unquote (unquote x))");
     assert_eq!(show("(a ,, )"), "(a)");
     assert_eq!(show(", x"), "x");
     assert_eq!(show("{:a 1, :b 2}"), "{:a 1 :b 2}");
@@ -98,16 +100,16 @@ fn form_comments() {
 #[test]
 fn quasiquote_nesting_reads_structurally() {
     assert_eq!(
-        show("``(a ,,b ,@,c)"),
+        show("``(a ~~b ~@~c)"),
         "(quasiquote (quasiquote (a (unquote (unquote b)) (unquote-splicing (unquote c)))))"
     );
-    assert_eq!(show(",x"), "(unquote x)");
+    assert_eq!(show("~x"), "(unquote x)");
     assert_eq!(
-        show("`(do (defstruct ,name ,fields) (derive Eq ,name))"),
+        show("`(do (defstruct ~name ~fields) (derive Eq ~name))"),
         "(quasiquote (do (defstruct (unquote name) (unquote fields)) (derive Eq (unquote name))))"
     );
     assert_eq!(
-        show("`[,a {,k ,@v}]"),
+        show("`[~a {~k ~@v}]"),
         "(quasiquote [(unquote a) {(unquote k) (unquote-splicing v)}])"
     );
 }
