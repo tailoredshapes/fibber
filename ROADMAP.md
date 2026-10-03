@@ -542,6 +542,18 @@ cycle is shaped to pay each of them once for many changes (scripts/gate.sh, scri
 3. Conflicts between levers show at the cherry-pick; the lead resolves them at integration, not the agents in advance.
 4. Benchmarks run alone: gate, batch and bench share /tmp/fibsuite.lock.
 
+Where the time goes (measured 2026-10-03, 28 cores, `compiler/fibc.fib` = 17.7 MB of lIR): `fibc build` by the Rust seed (a debug
+build) 42.5 s = Rust emit 15.8 s + lair 26.7 s; `build` by stage 2 56.5 s = stage 2 emit 30.7 s + lair 25.8 s. lair's share is
+LLVM's: -O2 26 s, -O1 22 s, -O0 about 2 s (`F build -O 0` 32.7 s, but the F it makes emits in 44.5 s, not 30.7 s). A program's
+front end re-checks the whole library each time: `F emit hello.fib` 0.4 s, and 0.4 s is most of an average case's 0.67 s (642 s
+for 963 cases); the library is checked once per case, 963 times per stdlib run. Cheapest cuts, in order, proposals only:
+(1) cache the checked library (types, ownership, lowered lIR) keyed by the stamp of lib/, so a program's front end handles its own
+module: hello 0.4 s to about 0.15 s (the "library check once" item above; the estimate is that item's, not measured here); (2) `-O 0` for
+builds whose product the cycle only runs once (a lever's check build; `--full` keeps -O 2): the build 56 to 33 s; (3) emit
+per module in parallel, the library's modules first (28 cores idle during a 30 s single-threaded emit); (4) one process, many
+cases: the harness compiles each case in its own process; a process that keeps the library's checked form and the JIT warm saves
+the start and the library, which (1) already gets.
+
 ## Releases
 
 Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,
