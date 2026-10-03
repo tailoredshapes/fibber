@@ -321,6 +321,9 @@ pub fn expand_kind_name(k: &ExpandErrorKind) -> &'static str {
         K::TooManySteps { .. } => "TooManySteps",
         K::TooDeep { .. } => "TooDeep",
         K::TooLarge { .. } => "TooLarge",
+        K::DuplicateClause { .. } => "DuplicateClause",
+        K::ClauseOfMethod { .. } => "ClauseOfMethod",
+        K::NoClause { .. } => "NoClause",
         K::BadLiteral { .. } => "BadLiteral",
     }
 }

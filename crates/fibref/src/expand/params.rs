@@ -77,6 +77,12 @@ fn split(params: &[Form]) -> Vec<Param> {
     out
 }
 
+/// The number of parameters in a parameter list or vector (an annotated
+/// parameter `x: T` and a pattern parameter count as one).
+pub(crate) fn arity(params: &[Form]) -> usize {
+    split(params).len()
+}
+
 /// `[pat]` or `(pat :as p)` or `(pat :as p: T)`.
 fn pattern_param(p: &Form) -> Option<Param> {
     match &p.kind {

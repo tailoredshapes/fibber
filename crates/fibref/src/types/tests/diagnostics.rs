@@ -81,42 +81,29 @@ fn a_bool_test_and_a_test_that_becomes_a_bool_are_accepted() {
 }
 
 #[test]
-fn a_library_functions_arity_error_names_the_stand_in_for_the_arity_written() {
-    // `get` and `nth` are methods of the library's protocols, `range` its function.
-    let get = "(defun main () -> i64 (get (map-empty) 1 0))";
-    let e = fails_lib(get, K::Other, "get takes 2 argument(s), got 3; use get-or");
-    assert_eq!(e.message, "get takes 2 argument(s), got 3; use get-or");
-    fails_lib(
-        "(defun main () -> i64 (nth [1 2] 1 0))",
-        K::Other,
-        "nth takes 2 argument(s), got 3; use nth-or",
-    );
-    fails_lib(
-        "(defun main () -> i64 (range 0 10 2))",
-        K::Other,
-        "range takes 1 argument(s), got 3; use range-by",
-    );
+fn a_library_functions_arity_error_has_no_hint() {
+    // D1's hints went with the stand-ins (L1).
+    for (src, text) in [
+        (
+            "(defun main () -> i64 (get (map-empty) 1 0))",
+            "get takes 2 argument(s), got 3",
+        ),
+        (
+            "(defun main () -> i64 (nth [1 2] 1 0))",
+            "nth takes 2 argument(s), got 3",
+        ),
+        (
+            "(defun main () -> i64 (range 0 10 2))",
+            "range takes 1 argument(s), got 3",
+        ),
+    ] {
+        let e = fails_lib(src, K::Other, text);
+        assert_eq!(e.message, text, "{src}");
+    }
 }
 
 #[test]
-fn the_hint_is_for_the_arity_of_the_stand_in_and_no_other() {
-    // Too few, and one too many of another count: the plain error.
-    let e = fails_lib(
-        "(defun main () -> i64 (get (map-empty)))",
-        K::Other,
-        "get takes 2 argument(s), got 1",
-    );
-    assert_eq!(e.message, "get takes 2 argument(s), got 1");
-    let e = fails_lib(
-        "(defun main () -> i64 (nth [1 2] 1 0 0))",
-        K::Other,
-        "nth takes 2 argument(s), got 4",
-    );
-    assert_eq!(e.message, "nth takes 2 argument(s), got 4");
-}
-
-#[test]
-fn a_programs_own_function_of_that_name_has_no_hint() {
+fn a_programs_own_function_gets_the_plain_arity_error() {
     let e = fails(
         "(defun get (a: i64 b: i64) -> i64 (+ a b))
          (defun main () -> i64 (get 1 2 3))",
@@ -127,9 +114,7 @@ fn a_programs_own_function_of_that_name_has_no_hint() {
 }
 
 #[test]
-fn a_programs_own_constructor_named_like_a_stand_in_has_no_hint() {
-    // A constructor is not the library's, whatever its name: the hint is
-    // for the functions of the library only.
+fn a_programs_own_constructor_gets_the_plain_arity_error() {
     for src in [
         "(defstruct nth (a: i64)) (defun main () -> i64 (do (nth 1 2 3) 0))",
         "(defenum E (nth a: i64)) (defun main () -> i64 (do (nth 1 2 3) 0))",

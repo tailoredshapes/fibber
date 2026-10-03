@@ -15,6 +15,7 @@ use super::ctx::ExpandCtx;
 use super::error::{ExpandError, ExpandErrorKind as K};
 use super::fuse::{self, Env};
 use super::heads::{is_core, is_definition, primitive_operand};
+use super::overload;
 use super::params;
 use super::prelude::{self, Outcome};
 use super::quasi;
@@ -140,7 +141,7 @@ pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, Exp
         } else if prelude::macro_of(ex.ctx, &name).is_some() {
             match prelude_step(ex, &name, form)? {
                 Outcome::Expanded(f) => form = f,
-                Outcome::Declined(f) => return Ok(f),
+                Outcome::Declined(f) => return overload::pick(ex.ctx, f),
             }
         } else if brackets::has_brackets(&form) {
             // A syntactic respelling: no step, and no growth to admit.
@@ -150,7 +151,7 @@ pub(crate) fn expand_head(ex: &mut Expander, mut form: Form) -> Result<Form, Exp
             ex.ctx.step(&pos)?;
             form = params::desugar(ex.ctx, form, false)?;
         } else {
-            return Ok(form);
+            return overload::pick(ex.ctx, form);
         }
         ex.ctx.admit(&mut form, &pos)?;
     }

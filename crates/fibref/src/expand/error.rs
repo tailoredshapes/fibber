@@ -174,6 +174,32 @@ pub enum ExpandErrorKind {
         /// The limit.
         limit: usize,
     },
+    /// Two clauses of one `defn` name take the same number of arguments
+    /// (stdlib §7 L1).
+    DuplicateClause {
+        /// The function.
+        name: String,
+        /// The parameter count.
+        arity: usize,
+    },
+    /// A clause of a `defn` takes as many arguments as a protocol method
+    /// of its name (stdlib §7 L1).
+    ClauseOfMethod {
+        /// The function.
+        name: String,
+        /// The parameter count.
+        arity: usize,
+    },
+    /// A call of an overloaded function with a count of arguments that no
+    /// clause takes (stdlib §7 L1).
+    NoClause {
+        /// The function, as written.
+        name: String,
+        /// The counts it takes.
+        counts: Vec<usize>,
+        /// The count the call has.
+        found: usize,
+    },
     /// An expansion produced a literal that the reader would reject
     /// (§1.1, §3.16): an `Int` that does not fit its width, a `Flt` that
     /// is not a finite number of its width.
@@ -246,6 +272,23 @@ impl fmt::Display for ExpandErrorKind {
                 f,
                 "macro expansions of one top-level form produced more than {limit} forms"
             ),
+            K::DuplicateClause { name, arity } => {
+                write!(f, "two clauses of {name} take {arity} argument(s)")
+            }
+            K::ClauseOfMethod { name, arity } => write!(
+                f,
+                "a clause of {name} takes {arity} argument(s), as the protocol method {name} does"
+            ),
+            K::NoClause { name, counts, found } => {
+                let (last, first) = counts.split_last().map_or((0, &[][..]), |(l, f)| (*l, f));
+                let mut list: Vec<String> = first.iter().map(usize::to_string).collect();
+                let text = match list.len() {
+                    0 => last.to_string(),
+                    1 => format!("{} or {last}", list.remove(0)),
+                    _ => format!("{} or {last}", list.join(", ")),
+                };
+                write!(f, "{name} takes {text} argument(s), got {found}")
+            }
             K::BadLiteral { error } => write!(f, "a macro built an invalid literal: {error}"),
         }
     }

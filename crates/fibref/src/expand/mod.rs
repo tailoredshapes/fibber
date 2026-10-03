@@ -54,6 +54,7 @@ mod expr;
 mod fuse;
 mod heads;
 mod inspect;
+mod overload;
 mod own;
 mod params;
 mod prelude;
@@ -90,6 +91,7 @@ pub fn expand_program(
     runner: &mut dyn MacroRunner,
 ) -> Result<Vec<Form>, ExpandError> {
     ctx.hide_macros(own::defined_by(&forms));
+    overload::scan(ctx, &forms)?;
     let mut ex = Expander::new(ctx, runner);
     let mut out = Vec::new();
     for form in forms {

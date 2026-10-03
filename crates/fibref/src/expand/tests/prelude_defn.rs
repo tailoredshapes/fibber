@@ -46,13 +46,25 @@ fn the_body_is_expanded_as_a_defun_body() {
 }
 
 #[test]
-fn rest_parameters_and_several_arities_are_errors_naming_the_item() {
+fn rest_parameters_are_an_error_naming_the_item() {
     let rest = "rest parameters need L2";
     assert_eq!(prog_err("(defn f [x & r] x)"), malformed("defn", rest));
     assert_eq!(prog_err("(defn- f [& r] x)"), malformed("defn-", rest));
-    let arities = "several arities need L1";
-    let src = "(defn f ([x] 1) ([x y] 2))";
-    assert_eq!(prog_err(src), malformed("defn", arities));
+}
+
+#[test]
+fn several_arities_are_a_defun_per_clause_named_for_its_count() {
+    assert_eq!(
+        prog("(defn f \"doc\" ([x] 1) ([x y] :private -> i64 2))"),
+        ["(defun f$1 (x) 1)", "(defun f$2 :private (x y) -> i64 2)"]
+    );
+    assert_eq!(
+        prog("(defn- f ([x] 1) ([x y] 2))"),
+        ["(defun f$1 :private (x) 1)", "(defun f$2 :private (x y) 2)"]
+    );
+    assert_eq!(prog("(defn f ([x] 1))"), ["(defun f (x) 1)"]);
+    let bad = "every clause is ([params] ..)";
+    assert_eq!(prog_err("(defn f ([x] 1) 2)"), malformed("defn", bad));
 }
 
 #[test]
@@ -107,7 +119,7 @@ fn error_positions_are_the_offending_form() {
         Err(e) => (e.pos.line, e.pos.col),
     };
     assert_eq!(at("(defn f [x & r] x)"), (1, 9), "the vector");
-    assert_eq!(at("(defn f\n ([x] 1))"), (2, 2), "the clause list");
+    assert_eq!(at("(defn f ([x] 1)\n  2)"), (2, 3), "the bad clause");
     assert_eq!(at("(defn 1 [x] x)"), (1, 7), "the name");
     assert_eq!(at("(defn f)"), (1, 1), "the call");
     assert_eq!(

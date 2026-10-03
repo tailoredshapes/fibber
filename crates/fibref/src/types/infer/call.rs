@@ -5,7 +5,7 @@ use crate::syntax::{IntWidth, Pos};
 
 use crate::types::annot::{ann_to_ty, RigidEnv};
 use crate::types::ast::{Arg, Expr, ExprId, ExprKind, GlobalRef, Lit, TypeAnn};
-use crate::types::decls::{ModuleId, Shape};
+use crate::types::decls::Shape;
 use crate::types::error::{ErrorKind, TResult, TypeError};
 use crate::types::scheme::{ColourBound, Scheme};
 use crate::types::ty::{Colour, Pred, Ty};
@@ -21,31 +21,6 @@ struct Sig {
     names: Vec<String>,
     ret: Ty,
     name: String,
-    /// Whether the function is the library's (§7 D1 says what its arity
-    /// errors may add).
-    library: bool,
-}
-
-/// The stand-in a library function has for the arity a call wrote, until
-/// arity overloading lands (stdlib §7 L1, diagnostic D1): the function's
-/// name, the number of arguments the call has, and the function that takes
-/// them. `(get m k 0)` is `get takes 2 argument(s), got 3; use get-or`.
-const STAND_INS: &[(&str, usize, &str)] = &[
-    ("get", 3, "get-or"),
-    ("nth", 3, "nth-or"),
-    ("reduce", 2, "reduce1"),
-    ("sort", 2, "sort-with"),
-    ("range", 3, "range-by"),
-];
-
-/// The words `; use X` a library function's arity error ends with when
-/// the call has the arguments of its stand-in, else nothing.
-fn stand_in_hint(name: &str, found: usize) -> String {
-    STAND_INS
-        .iter()
-        .find(|(n, k, _)| *n == name && *k == found)
-        .map(|(_, _, stand_in)| format!("; use {stand_in}"))
-        .unwrap_or_default()
 }
 
 impl Cx<'_> {
@@ -185,28 +160,12 @@ impl Cx<'_> {
         })
     }
 
-    /// Whether the function or method `r` is the library's: defined in
-    /// the prelude or in a module named `fib.*` (the loader's rule for the
-    /// modules that are the library's own, `sees_implicit`). A program's
-    /// own `get` is not, whatever its arity.
-    fn is_library(&self, r: GlobalRef) -> bool {
-        let module = match r {
-            GlobalRef::Fun(f) => self.g.fun(f).module,
-            GlobalRef::Method(p, _) => self.g.proto(p).module,
-            _ => return false,
-        };
-        module == ModuleId::PRELUDE || self.g.modules[module.0 as usize].ns.starts_with("fib.")
-    }
-
     /// The signature of a global function, instantiated; `None` for a
     /// `def` or a constructor that is a value.
     fn signature(&mut self, id: ExprId, r: GlobalRef, pos: &Pos) -> TResult<Option<Sig>> {
         let (scheme, name, method) = match self.source(r, pos)? {
             Source::Scheme(s, name, method) => (s, name, method),
-            Source::Mono(sig) => {
-                let library = self.is_library(r);
-                return Ok(Some(Sig { library, ..sig }));
-            }
+            Source::Mono(sig) => return Ok(Some(sig)),
             Source::Value => return Ok(None),
         };
         let ty = self.instantiate(&scheme, id, &name, pos, method);
@@ -238,7 +197,6 @@ impl Cx<'_> {
             names: scheme.params.clone(),
             ret: *ret,
             name,
-            library: self.is_library(r),
         }))
     }
 
@@ -274,20 +232,14 @@ impl Cx<'_> {
             names,
             ret,
             name: "the function".into(),
-            library: false,
         };
         self.apply(e, sig, args)
     }
 
     fn apply(&mut self, e: &Expr, sig: Sig, args: &[Arg]) -> TResult<Ty> {
         if sig.params.len() != args.len() {
-            let hint = if sig.library {
-                stand_in_hint(&sig.name, args.len())
-            } else {
-                String::new()
-            };
             let msg = format!(
-                "{} takes {} argument(s), got {}{hint}",
+                "{} takes {} argument(s), got {}",
                 sig.name,
                 sig.params.len(),
                 args.len()
@@ -366,7 +318,6 @@ fn mono_sig(m: MonoSig, name: String) -> Sig {
         names: m.names,
         ret: m.ret,
         name,
-        library: false,
     }
 }
 

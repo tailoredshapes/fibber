@@ -79,7 +79,7 @@ pub struct ExpandCtx {
     /// Every user macro, by `ns/name`.
     pub(crate) macros: HashMap<String, MacroDef>,
     /// The modules each module re-exports (`(:export-from ..)`), by `ns`.
-    exports: HashMap<String, Vec<String>>,
+    pub(crate) exports: HashMap<String, Vec<String>>,
     /// The public names each module defined at top level, by `ns`, as the
     /// modules expanded so far left them (the fusion rewrite asks whether a
     /// module it `:use`s exports a name).
@@ -91,6 +91,11 @@ pub struct ExpandCtx {
     /// that it `:use`s export. A prelude macro of one of these names
     /// declines in the module.
     hides: HashSet<String>,
+    /// The names the module being expanded defines itself (`own`).
+    pub(crate) own: HashSet<String>,
+    /// The arity tables of the modules expanded so far, by `ns`
+    /// (`overload`).
+    pub(crate) overloads: HashMap<String, super::overload::Table>,
     pub(crate) types: TypeTable,
     pub(crate) call_pos: Pos,
     pub(crate) steps: usize,
@@ -139,6 +144,8 @@ impl ExpandCtx {
             defined: HashMap::new(),
             scope: ModuleScope::of(super::PRELUDE_NS),
             hides: HashSet::new(),
+            own: HashSet::new(),
+            overloads: HashMap::new(),
             types: TypeTable::with_builtins(),
             call_pos: Pos {
                 file: Arc::from("<none>"),
@@ -350,6 +357,7 @@ impl ExpandCtx {
     pub fn end_module(&mut self) {
         self.types.end_module();
         self.hides.clear();
+        self.own.clear();
         // Until `begin_module` says otherwise, what follows is a
         // program with no `ns` clauses.
         self.scope = ModuleScope::of("main");
@@ -364,6 +372,7 @@ impl ExpandCtx {
             .filter(|u| !is_library(u))
             .flat_map(|u| self.exported_names(u))
             .collect();
+        self.own = own.clone();
         self.hides = own;
         self.hides.extend(used);
     }

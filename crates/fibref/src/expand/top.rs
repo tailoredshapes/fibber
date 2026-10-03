@@ -85,6 +85,10 @@ fn definition_of(ex: &mut Expander, mut form: Form, first: bool) -> Result<Form,
         "defprotocol" => protocol_plan(&form)?,
         "defmacro" => return defmacro(ex, form),
         "defun" => {
+            if let Some(name) = form.as_list().and_then(|i| i.get(1)).and_then(Form::as_sym) {
+                let name = name.to_string();
+                ex.ctx.note_clause(&name);
+            }
             form = params::desugar(ex.ctx, form, true)?;
             defun_plan(&form)?
         }
