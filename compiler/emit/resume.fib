@@ -108,7 +108,7 @@
     (_ [])))
 
 (defun replace-all :private (text: str old: str new: str) -> str
-  (str-join (vec (interpose new (str/split-limit text old -1)))))
+  (str-join (vec (interpose new (str/split text old -1)))))
 
 ;; The phi text with the operand of edge `from` changed from `v` to `to`. Rust: resume.rs:467
 (defun subst-phi-operand :private (text: str from: str v: str to: str) -> str
@@ -126,7 +126,7 @@
 ;; The names a point adds to the demoted values, each point's in this order: by creation order (`tN`, N
 ;; rising: not as text, where t10 would precede t9), ties by name. Rust: resume.rs:53 and name_order.
 (defun order-live-names :private (names: (Vec str)) -> (Vec str)
-  (vec (sort-by (fn (n: str) (unwrap-or (parse-long (subs-from n 1)) 9223372036854775807)) (sort names))))
+  (vec (sort-by (fn (n: str) (unwrap-or (parse-long (subs n 1)) 9223372036854775807)) (sort names))))
 
 ;; A value loaded before a block's terminator for the phi operand of an edge out of that block.
 (defstruct EdgeLoad :private (value: str name: str text: str ty: LirTy))
@@ -233,7 +233,7 @@
                 e (phi-edges (. p text))]
           (when-some [pred (get index (. e label))]
             (when (ssa-name? (. e value))
-              (set! acc (assoc @acc (Pair pred i) (conj (get-or @acc (Pair pred i) (set-empty)) (. e value)))))))
+              (set! acc (assoc @acc (Pair pred i) (conj (get @acc (Pair pred i) (set-empty)) (. e value)))))))
         @acc)))
 
 ;; The live-in set of block i given the sets of the blocks after it: what it uses, and what its
@@ -306,10 +306,10 @@
 
 ;; The load of the slot of `v` that goes before the terminator of block p, made once per (p, v).
 (defun edge-load! :private (f: FnBuilder loads: (Cell (Map i64 (Vec EdgeLoad))) p: i64 s: Slot) -> str
-  (match (find-first (fn (e: EdgeLoad) (= (. e value) (. s value))) (get-or @loads p []))
+  (match (find-first (fn (e: EdgeLoad) (= (. e value) (. s value))) (get @loads p []))
     ((some e) (. e name))
     (nil (let ((n (fb-fresh f)))
-           (do (set! loads (assoc @loads p (conj (get-or @loads p []) (EdgeLoad (. s value) n (load-text s) (. s ty)))))
+           (do (set! loads (assoc @loads p (conj (get @loads p []) (EdgeLoad (. s value) n (load-text s) (. s ty)))))
                n)))))
 
 ;; The operands of a phi that are demoted values come from the end of the block they come from, loaded.
@@ -352,7 +352,7 @@
                                   @(. b phis))))))
     (do (doseq [k (range (count items))]
           (do (when (and (= k last) @(. b closed))
-                (doseq [e (order-edge-loads (get-or @loads bi []))]
+                (doseq [e (order-edge-loads (get @loads bi []))]
                   (set! out (conj @out (ItBind (. e name) (. e text) (. e ty))))))
               (demote-item f table out (nth items k))))
         (set! (. b items) @out))))

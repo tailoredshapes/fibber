@@ -1,5 +1,72 @@
-;; owner: Y11
-;; fib.seq.partition: a stub made by tranche 2's Z0 (spec/stdlib.md §8.2.1), it will hold `partition` and `partition-all`, in every arity (written after L1, in wave 2).
-;; The owner writes the part and replaces this comment with its header: what the part replaces and every rule it decided where the
-;; page is silent. The `:use` lines are the ones the layout rules allow (the facades above, the parts before it); the owner edits them freely.
+;; fib.seq.partition: `partition` and `partition-all` in every arity (stdlib §4.4 rows partition, partition-all; L1:
+;; the clauses partition$2 $3 $4 and partition-all$2 $3). Each answers a lazy seq of `VSeq` groups; nothing runs until a
+;; node is demanded, and each node is made once (the LSeq memoises). Decided here, where the page is silent:
+;;  - the groups are Clojure's: `(partition n step c)` starts a group every `step` elements; a group that cannot be
+;;    filled is dropped by `partition`, kept by `partition-all` (which goes on, as Clojure's does, until the source is
+;;    empty: (partition-all 3 1 [1 2 3 4]) is ((1 2 3) (2 3 4) (3 4) (4)));
+;;  - `(partition n step pad c)` fills the last incomplete group from `pad` and stops, so the last group may still
+;;    be short when `pad` is; only as many elements of `pad` as are needed are demanded;
+;;  - a count n of 0 or less gives the empty seq (Clojure's would not end); a step of 0 repeats the first group for
+;;    ever, as Clojure's does.
 (ns fib.seq.partition (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.vseq fib.seq.adaptors))
+
+;; s without its first i elements
+(defun lskip :private (i: i64 s: (LSeq e)) -> (LSeq e)
+  (loop ((j i) (cur s))
+    (if (> j 0)
+        (match (lnode cur)
+          ((LNil) cur)
+          ((LCons _ t) (recur (- j 1) t)))
+        cur)))
+
+;; up to n elements of s
+(defun take-run :private (n: i64 s: (LSeq e)) -> (Vec e)
+  (loop ((i 0) (cur s) (run (vec-empty)))
+    (if (< i n)
+        (match (lnode cur)
+          ((LNil) run)
+          ((LCons x t) (recur (+ i 1) t (vec-conj run x))))
+        run)))
+
+;; run, then up to m elements of pad
+(defun pad-run :private (run: (Vec e) m: i64 pad: (LSeq e)) -> (Vec e)
+  (loop ((i 0) (out run) (extra (take-run m pad)))
+    (if (< i (vec-count extra))
+        (recur (+ i 1) (vec-conj out (vec-nth extra i)) extra)
+        out)))
+
+;; the groups of n from s after skipping `skip` elements; mode 0 drops an incomplete group, 1 keeps it, 2 pads it from pad
+(defun lpart :private (n: i64 step: i64 mode: i64 pad: (LSeq e) skip: i64 s: (LSeq e)) -> (LSeq (VSeq e))
+  (lazy-node (fn ()
+    (let ((cur (lskip skip s)))
+      (let ((run (take-run n cur)))
+        (let ((k (vec-count run)))
+          (if (= k 0)
+              LNil
+              (if (= k n)
+                  (LCons (vseq-of run) (lpart n step mode pad step cur))
+                  (if (= mode 1)
+                      (LCons (vseq-of run) (lpart n step mode pad step cur))
+                      (if (= mode 2)
+                          (LCons (vseq-of (pad-run run (- n k) pad)) (lazy-node (fn () LNil)))
+                          LNil))))))))))
+
+;; (partition n c): groups of n, an incomplete last group dropped
+(defun partition$2 (n: i64 c: c) :where ((Reducible c e)) -> (LSeq (VSeq e))
+  (lpart n n 0 (to-lseq (vec-empty)) 0 (to-lseq c)))
+
+;; (partition n step c): a group starts every step elements
+(defun partition$3 (n: i64 step: i64 c: c) :where ((Reducible c e)) -> (LSeq (VSeq e))
+  (lpart n step 0 (to-lseq (vec-empty)) 0 (to-lseq c)))
+
+;; (partition n step pad c): the last incomplete group is filled from pad
+(defun partition$4 (n: i64 step: i64 pad: d c: c) :where ((Reducible c e) (Reducible d e)) -> (LSeq (VSeq e))
+  (lpart n step 2 (to-lseq pad) 0 (to-lseq c)))
+
+;; (partition-all n c): groups of n, an incomplete last group kept
+(defun partition-all$2 (n: i64 c: c) :where ((Reducible c e)) -> (LSeq (VSeq e))
+  (lpart n n 1 (to-lseq (vec-empty)) 0 (to-lseq c)))
+
+;; (partition-all n step c): a group starts every step elements, short ones at the end kept
+(defun partition-all$3 (n: i64 step: i64 c: c) :where ((Reducible c e)) -> (LSeq (VSeq e))
+  (lpart n step 1 (to-lseq (vec-empty)) 0 (to-lseq c)))

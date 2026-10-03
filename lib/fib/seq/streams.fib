@@ -36,7 +36,7 @@
 ;;    next. A lazy seq made from it (map, filter, a bound take) memoises as every LSeq does. A pure Iterate still does not
 ;;    cross a task: its field f has a function type of the default colour, which is :local, so only a colour parameter
 ;;    would let it (case 2229; Repeat and Cycle hold no function and do, case 2228).
-;;  - L1: (repeat n x) and (repeatedly n f) are Y11's clauses; no stand-in name is made for them here (case 2237 waits for them).
+;;  - (repeat n x) and (repeatedly n f) are the clauses repeat$2 and repeatedly$2 (L1): n copies, lazily, empty for n <= 0.
 (ns fib.seq.streams (:use fib.core fib.seq.types fib.seq.protocols fib.seq.lseq fib.seq.consumers fib.seq.recipes))
 
 ;; ---- iterate ----
@@ -69,7 +69,11 @@
 ;; ---- repeat ----
 (defstruct (Repeat a) (x: a))
 
-(defun repeat (x: a) -> (Repeat a) (Repeat x))
+(defn repeat
+  ([x: a] -> (Repeat a) (Repeat x))
+;; (repeat n x): n copies of x, lazily; empty for n of 0 and below
+  ([n: i64 x: a] -> (LSeq a)
+  (lazy-node (fn () (if (> n 0) (LCons x (repeat$2 (- n 1) x)) LNil)))))
 
 (defun repeat-lseq :private (x: a) -> (LSeq a)
   (lazy-node (fn () (LCons x (repeat-lseq x)))))
@@ -127,7 +131,12 @@
   (seq (self) (if (cycle-empty? self) nil (some self)))
   (rest (self) (if (cycle-empty? self) self (Cycle (. self src) (+ (. self skip) 1)))))
 
+(defn repeatedly
 ;; ---- repeatedly ----
 ;; Clojure's (lazy-seq (cons (f) (repeatedly f))): f runs once per element, when the node is first demanded
-(defun repeatedly (f: (fn () a)) -> (LSeq a)
+  ([f: (fn () a)] -> (LSeq a)
   (lazy-node (fn () (LCons (f) (repeatedly f)))))
+;; (repeatedly n f): the first n elements of (repeatedly f), memoised as its nodes are; f runs once per element, on demand
+  ([n: i64 f: (fn () a)] -> (LSeq a)
+  (lazy-node (fn () (if (> n 0) (LCons (f) (repeatedly$2 (- n 1) f)) LNil)))))
+

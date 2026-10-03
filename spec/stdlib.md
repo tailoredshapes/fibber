@@ -643,9 +643,8 @@ truthy), which is what makes `(filter (fn (k) (get m k)) ks)` and `(some #(get m
 
 Protocol methods carry Clojure's names. A name whose Clojure arities differ by a default value
 (`get`, `nth`, `reduce`, `sort`, `update`, `sort-by`, `range`, `map`) has its shortest arity as the method or function and
-the others as clauses of the same name once arity overloading exists (§7 L1); until then they are `get-or`, `nth-or`,
-`reduce1`, `sort-with`, `sort-by-with`, `range-by`, `zip-with`, `subs-from`, `str/split-limit` and `str/index-of-from` (§4), and `update` is the macro of §2.4 (its extra
-arguments are Clojure's, so it takes no stand-in). **The stand-ins are deleted in the commit that lands L1**, and the cases that
+the others as clauses of the same name once arity overloading exists (§7 L1); landed (Y11) as `get$3`, `nth$3`, `subs$2`, `str/index-of$3`, `str/split$3`, `reductions$2`, `repeat$2`, `repeatedly$2`, `range$3`, `partition$2 $3 $4` and `partition-all$2 $3`; still stand-ins: `reduce1`, `range-by` (the target of the Rust macro `range`), and `sort-with`, `sort-by-with`, `zip-with`, because `sort`, `sort-by` and `map` are in the Rust fusion tables (expand/fuse/tables.rs), which do not know the names the expander's pick gives their clauses. `update` is the macro of §2.4 (its extra
+arguments are Clojure's, so it takes no stand-in). **The stand-ins that landed were deleted by Y11**, and the cases that
 used them are ported in the same commit; the typed forms `update-or`, `update-opt` and `reduce1` (which keep the
 `Option` where Clojure's `(f)` or `nil` have no type) stay as the typed twins. **[R]** A protocol method may not
 share a name with a `defun` clause today (`f is already defined`), so L1 must say that a method and clauses of
@@ -674,7 +673,7 @@ type can carry it, and replaced by a typed twin where it cannot:
 | Clojure idiom | Here | Rule |
 |---|---|---|
 | `(get m k)`, `(first c)`, `(peek s)`, `(find m k)`, `(last c)` | `(Option v)` | a miss is `nil`, never a trap; absent and `nil`-valued cannot be confused (§5 T1); `(unwrap o)` and `(nth c 0)` are the sure cases |
-| `(get m k d)`, `(nth c i d)` | clause of `get`, `nth` (§7 L1); `get-or`, `nth-or` until it lands | the clause has its own result type `v` |
+| `(get m k d)`, `(nth c i d)` | clause of `get`, `nth` (§7 L1, landed) | the clause has its own result type `v` |
 | `(if (seq xs) ..)`, `(when (get m k) ..)`, `(while (peek s) ..)`, `(filter :active ps)`, `(remove nil? xs)` | **a condition of type `bool` or `(Option T)` is accepted**: truthy when `true` or `(some _)`; `(Option bool)` truthy when `(some true)` (Clojure's `false` is falsy) | memory-safe, typed and free at run time: the elaboration is a direct call to an identity (`fibc emit` of A11 e1z shows `(call @m.Truthy.truthy?.bool t1)` to a body `(ret p0)`); [sketch] checker rule §7 L20; the library runs today as the `Truthy` protocol (§2.3, A11 t04: `if`, `or` with a default, `or` of two options, `and` and `when` over `bool` and `Option`, 127 under both tools). Today `(if (get m 1) 1 2)` is `cannot unify (Option i64) with bool` (A11 t01), `(or (get m 2) 7)` the same (t02), `(if 5 1 2)` `cannot unify i64 with bool` (t03). Any other type as a condition stays a compile error: it cannot be false (`(if* 5 1 2)` is `no implementation of Truthy for i64`, A11 n15) |
 | `(or (get m k) d)`, `(or (get m k) (get m j))`, `(and (get m k) (> x 0))` | Clojure's text: `or` and `and` are checker forms typed by their **last** operand: `(or (Option T) T)` is `T`, `(or (Option T) (Option T))` and `(or bool bool)` keep their type; `and` has the type of its last operand; a first operand of another type is the compile error above | one `or` for two result types needs the operand types, not just the first (an instance per head overlaps: `OrHit for (Option a)`, A11 t70, e2): a checker rule, or L23. The macros `or-d` and `or-e` of A11 t04 run today as two names; `(unwrap-or o d)` is the spelling that needs nothing |
 | `(some pred c)` | `(Option payload)`: `(some even? c)` is `(some true)` or `nil`, `(some #(get m %) ks)` the first non-nil value | over the predicate's `Truthy` result ([R] A11 `some`: `(some true)`, `(some 20)`, `nil`); `some` is also `Option`'s constructor, so the two arities are one name by L1 extended to a constructor (A11 n13: a `defun some` of two parameters makes `(some 5)` `some takes 2 argument(s), got 1`) or a Rust macro that picks by argument count; `find-first` and `find-map` are extras |
@@ -1430,7 +1429,6 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 |---|---|---|---|---|---|
 | `str` | adapt | `(str a ..)` | macro `a ... -> str \| ToStr a` | 1 | concatenates the `to-str` of the arguments: a string as itself, a collection as its `pr` text, `nil` as the empty text (§2.7); `(str)` is `""`; a Rust prelude macro (§6.3) with a function twin (**landed**, R5, `605a26e`): a right fold of `fib.prelude/str-concat` over the pieces, a string literal as it is, a literal `nil` as `""`, any other piece `(fib.core/to-str x)`, so it needs `fib.core` in scope (syntax §4.4) |
 | `subs` | adapt | `(subs s a b) (subs s a)` | `str i64 i64 -> str; str i64 -> str` | 1 | **CHARACTER offsets** (Unicode scalars, §5 T10), pairing with `count` and `str/index-of` as Clojure's do; never splits a character; O(n) until the ASCII flag (C10); the byte layer is `str-slice` (§2.9); the 2-arity is `subs-from` until L1 |
-| `subs-from` (new) | new | `(subs-from s a)` | `str i64 -> str` | 1 | the 2-arity of `subs` until L1, then deleted ([R] A11 e3b) |
 | `name` | adapt | `(name k)` | `keyword -> str` | 4 | keywords are flat; `(name :a/b)` is `b` |
 | `keyword` | adapt | `(keyword s) (keyword ns s)` | `str -> keyword; str str -> keyword` | 4 | interns at run time |
 | `gensym` | keep | `(gensym) (gensym prefix)` | `-> Form; str -> Form` | 1 | builtin whose result is a `Sym` form, `(fn (str) Form)` in the checker (case 713); macro time only (syntax §3.16); the zero-argument form is not there today: `gensym takes 1 argument(s), got 0` ([R] A11 gensym), so it is a clause by L1 (tranche 2; `(gensym "G__")` until then) |
@@ -1694,7 +1692,6 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `product` (new) | new | `(product c)` | `c -> e \| Reducible c e, Num e, Unit e` | 2 |  |
 | `reduce-while` (new) | new | `(reduce-while f init c)` | `(fn (a e) (Step a)) a c -> a \| Reducible c e` | 1 | Clojure's `reduced`; boxed `Step` allocates per step until §7 C5 |
 | `frange` (new) | new | `(frange a b s)` | `f64 f64 f64 -> (FRange)` | 3 | the non-accumulating `a + i*s` for `i < ceil((b-a)/s)`; an extra: `range` over floats is Clojure's accumulating form; step 0 traps |
-| `nth-or` (new) | new | `(nth-or c i d)` | `c i64 e -> e \| Reducible c e` | 1 | the 3-arity of `nth` until L1, then deleted |
 | `reduce1` (new) | new | `(reduce1 f c)` | `(fn (e e) e) c -> (Option e) \| Reducible c e` | 1 | the 2-arity of `reduce` until L1, then deleted; `(unwrap (reduce1 max xs))` is Clojure's `(apply max xs)` |
 | `sort-with` (new) | new | `(sort-with cmp c)` | `(fn (e e) r) c -> (VSeq e) \| Reducible c e, Cmp r` | 1 | the comparator form of `sort` (until L1, then deleted); stable; a `Cmp` result, so a predicate works |
 | `range-by` (new) | new | `(range-by a b s)` | `i64 i64 i64 -> Range` | 1 | the 3-arity of `range` until L1, then deleted; `(range a b)` is today's macro |
@@ -1746,7 +1743,6 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `SubVec` (new) | new | `(SubVec e)` | struct `(v: (Vec e) lo: i64 hi: i64)` | 3 | the O(1) vector view `subvec` returns: `Reducible` (an O(1) `nth`), `Lookup`, `Assoc`, `Collection` (end), `Stack`, `Keyed`; it becomes `Vec` itself when `Vec` is the struct with an offset field (§9 Q18) |
 | `VSeq` (new) | new | `(VSeq e)` | struct `(front: (List e) v: (Vec e) lo: i64)` | 1 | the seq of a `Vec` (`rest`, `seq`, `next`) and the result of `sort`, `sort-by` and `take-last`, and the groups of `partition`: `Reducible`, `Seqable`, `Collection` (`conj` conses at the front), printing in parentheses ([R] A12 vseq) |
 | `LSeq` (new) | new | `(LSeq e)` | struct `(box: (Cell (LState e)))` | 1 | Clojure's lazy seq: a node realised once by a thunk held in one cell (§2.1 rule 2; [R] A13 lz1); the result of every sequence function that is not fused, of `lazy-seq`, `repeatedly`, `line-seq`, `iteration`, `file-seq`, and the seq of the keyed collections; `Reducible`, `Seqable`, `Cursable`, `Collection` (a cons at the front), `Show` in parentheses; it holds a `Cell`, so it is not a `def` (§5 M1) and does not cross a task (§5 S10) |
-| `get-or` (new) | new | `(get-or c k d)` | `s k v -> v \| Lookup s k v` | 1 | the 3-arity of `get` until L1 (§7), then deleted; `(get m k 0)` is `get takes 2 argument(s), got 3` until then (the error says `use get-or`, §7 D1) |
 
 ### 4.6 `fib.sorted`
 
@@ -1789,8 +1785,6 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `str-len` (new) | new | `(str-len s)` | `str -> i64` | 1 | builtin: bytes, O(1) |
 | `str-byte-at` (new) | new | `(str-byte-at s i)` | `str i64 -> i8` | 1 | builtin (§7 L18, landed): the byte at `i`, negative above 127, no allocation, traps `str-byte-at: index {i} out of range 0..{n}`; `str-bytes` allocates an array per call |
 | `str-find` (new) | new | `(str-find s pat from)` | `str str i64 -> (Option i64)` | 1 | builtin (§7 L18, landed): the byte offset of the first match at or after `from`, an empty `pat` found at `from`; copies nothing and allocates only its result, **one `(Option i64)` object per call until C5** (hit or miss; the string is never copied); traps `str-find: from {from} out of range 0..{n}` and `str-find: from {from} splits a character`; `str/index-of` is built on it |
-| `str/split-limit` (new) | new | `(str/split-limit s re n)` | `str p i64 -> (Vec str) \| Pattern p` | 1 | the 3-arity of `str/split` until L1, then deleted |
-| `str/index-of-from` (new) | new | `(str/index-of-from s sub from)` | `str str i64 -> (Option i64)` | 1 | the 3-arity of `str/index-of` until L1, then deleted ([R] A11 e3b) |
 | `replace-with` (new) | new | `(str/replace-with s re f)` | `str Regex (fn (Match) str) -> str` | 4 | the function replacement, `(fn (Match) str)`, until L23 lets `str/replace` dispatch on the replacement's type |
 | `clojure.string/re-quote-replacement` | adapt | `(str/re-quote-replacement s)` | `str -> str` | 4 | escapes `$` and `\` for a regex replacement template |
 
