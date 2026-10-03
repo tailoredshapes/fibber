@@ -26,7 +26,7 @@ use super::super::build::{call, list};
 use super::super::collections::prelude_name;
 use super::super::core::Role;
 use super::super::ctx::ExpandCtx;
-use super::tables::{split_head, stage_named, terminal, Facade, Shape, Stage, Terminal};
+use super::tables::{base_head, stage_named, terminal, Facade, Shape, Stage, Terminal};
 
 /// What a module is, for the fusion rewrite: the names that are not the
 /// library's (its own definitions, what the non-library modules it uses
@@ -53,16 +53,19 @@ impl Env<'_> {
         }
     }
 
-    /// The bare name of `head` when it is the library's name of `facade`:
-    /// written `fib.seq/base` it always is; bare, it is when the module
-    /// sees the facade and the name is not bound by the form, defined by
-    /// the module or exported by a non-library module it uses.
-    fn library<'h>(&self, head: &'h str, facade: Facade) -> Option<&'h str> {
-        let (qualified, base) = split_head(head);
+    /// The bare name of `head`, a call of `argc` arguments, when it is the
+    /// library's name of `facade`: written `fib.seq/base` it always is;
+    /// bare, it is when the module sees the facade and the name is not
+    /// bound by the form, defined by the module or exported by a
+    /// non-library module it uses. A clause-picked head (`map$2`) is the
+    /// base name for the tables, but is also shadowed as written.
+    fn library<'h>(&self, head: &'h str, argc: usize, facade: Facade) -> Option<&'h str> {
+        let (qualified, base) = base_head(head, argc);
         match qualified {
             Some(q) => (q == facade).then_some(base),
             None => {
-                let free = !self.bound.contains(base) && !self.module.shadow.contains(base);
+                let taken = |n: &str| self.bound.contains(n) || self.module.shadow.contains(n);
+                let free = !taken(base) && !taken(head);
                 (free && self.sees(facade)).then_some(base)
             }
         }
@@ -71,15 +74,19 @@ impl Env<'_> {
     /// The row of **T** this call is, if its head is the library's.
     pub(super) fn terminal_call(&self, items: &[Form]) -> Option<&'static Terminal> {
         let head = items.first()?.as_sym()?;
-        let row = terminal(split_head(head).1, items.len() - 1)?;
-        self.library(head, row.facade).map(|_| row)
+        let argc = items.len() - 1;
+        let row = terminal(base_head(head, argc).1, argc)?;
+        self.library(head, argc, row.facade).map(|_| row)
     }
 
     /// The row of **A** this call is, if its head is the library's, it has
     /// two arguments and they are ones the rewrite can take.
     fn stage_call(&self, items: &[Form]) -> Option<&'static Stage> {
         let head = items.first()?.as_sym()?;
-        let row = self.library(head, Facade::Seq).and_then(stage_named)?;
+        let argc = items.len() - 1;
+        let row = self
+            .library(head, argc, Facade::Seq)
+            .and_then(stage_named)?;
         let ok = items.len() == 3
             && match row.shape {
                 Shape::Two => true,

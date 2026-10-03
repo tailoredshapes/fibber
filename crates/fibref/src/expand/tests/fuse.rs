@@ -378,3 +378,41 @@ fn the_expression_a_binding_calls_does_not_bind_the_names_it_uses() {
         "(loop ((acc (take 2 v))) (count (fib.seq/Filtered acc p)))"
     );
 }
+
+/// A context where `fib.seq` has `map` and `sort` with a second clause.
+fn clause_ctx() -> ExpandCtx {
+    let mut ctx = ExpandCtx::new();
+    let src = "(defn map ([f c] c) ([f a b] a)) (defn sort ([c] c) ([f c] c))";
+    module_in(&mut ctx, "fib.seq", &[], src);
+    ctx
+}
+
+#[test]
+fn a_clause_picked_library_head_still_fuses() {
+    let mut ctx = clause_ctx();
+    let uses = ["fib.core", "fib.seq", "fib.coll"];
+    let src = "(defun m (v f g) (sort (map f (map g v))))";
+    let out = module_in(&mut ctx, "main", &uses, src);
+    assert_eq!(
+        out,
+        ["(defun m (v f g) (sort$1 (fib.seq/Mapped (fib.seq/Mapped v g) f)))"]
+    );
+}
+
+#[test]
+fn the_other_clause_of_a_library_head_is_not_a_stage() {
+    let mut ctx = clause_ctx();
+    let uses = ["fib.core", "fib.seq", "fib.coll"];
+    let src = "(defun m (v w f) (count (map f v w)))";
+    let out = module_in(&mut ctx, "main", &uses, src);
+    assert_eq!(out, ["(defun m (v w f) (count (map$3 f v w)))"]);
+}
+
+#[test]
+fn a_clause_head_of_the_modules_own_is_not_the_librarys() {
+    let mut ctx = clause_ctx();
+    let uses = ["fib.core", "fib.seq"];
+    let src = "(defn map ([f c] c) ([f a b] a)) (defun m (v f) (count (map f v)))";
+    let out = module_in(&mut ctx, "main", &uses, src);
+    assert!(out[2].contains("(count (map$2 f v))"), "{out:?}");
+}

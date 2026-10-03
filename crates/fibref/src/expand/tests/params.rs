@@ -70,3 +70,12 @@ fn a_defun_pattern_parameter_without_a_type_is_refused() {
     }
     assert!(program("(defun f (([a b] :as v: (Vec i64))) -> i64 1)").is_ok());
 }
+
+#[test]
+fn a_borrow_qualifier_after_the_type_is_part_of_its_parameter() {
+    use super::read;
+    use crate::expand::params::arity;
+    let ps = |s: &str| read(s).remove(0).as_list().expect("list").to_vec();
+    assert_eq!(arity(&ps("(f: (fn (a) b) :borrow x: a)")), 2);
+    assert_eq!(arity(&ps("(f: (fn (a) b) :borrow x: a y: a)")), 3);
+}

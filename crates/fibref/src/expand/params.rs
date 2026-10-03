@@ -64,8 +64,13 @@ fn split(params: &[Form]) -> Vec<Param> {
     while i < params.len() {
         let p = &params[i];
         if p.as_sym().is_some_and(|s| s.ends_with(':')) && i + 1 < params.len() {
-            out.push(Param::Plain(params[i..i + 2].to_vec()));
-            i += 2;
+            // A qualifier (`:borrow`) after the type belongs to the parameter.
+            let end = match params.get(i + 2).map(|f| &f.kind) {
+                Some(FormKind::Kw(k)) if k == "borrow" => i + 3,
+                _ => i + 2,
+            };
+            out.push(Param::Plain(params[i..end].to_vec()));
+            i = end;
             continue;
         }
         out.push(match pattern_param(p) {

@@ -12,7 +12,7 @@ use crate::syntax::{Form, FormKind};
 
 use super::super::build::head_name;
 use super::super::private::{marker_index, type_name};
-use super::tables::{split_head, terminal};
+use super::tables::{base_head, terminal};
 
 /// Adds every symbol inside `form` to `out`; a name written `x:` is added
 /// as `x:` and as `x`.
@@ -109,8 +109,9 @@ pub(super) fn calls_a_terminal(form: &Form) -> bool {
     while let Some(f) = stack.pop() {
         match &f.kind {
             FormKind::List(items) => {
-                let name = head_name(f).map(|h| split_head(h).1);
-                if name.is_some_and(|n| terminal(n, items.len() - 1).is_some()) {
+                let argc = items.len().saturating_sub(1);
+                let name = head_name(f).map(|h| base_head(h, argc).1);
+                if name.is_some_and(|n| terminal(n, argc).is_some()) {
                     return true;
                 }
                 stack.extend(items.iter());
@@ -237,6 +238,7 @@ mod tests {
         assert!(call("(defun f () (g (count v)))"));
         assert!(call("(defun f () (fib.seq/reduce a b c))"));
         assert!(!call("(defun f () (reduce a c))"));
+        assert!(call("(defun f () (g (sort$1 v)))"));
         assert!(!call("(defun f () (first v))"));
     }
 

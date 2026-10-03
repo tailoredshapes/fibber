@@ -136,6 +136,17 @@ pub(super) fn split_head(head: &str) -> (Option<Facade>, &str) {
     (None, head)
 }
 
+/// `head` as the library's name, with a clause suffix of the call's own
+/// argument count taken off: the expander picked the clause of an
+/// overloaded library function (`map` with a 3-argument clause makes
+/// `(map f c)` the call `(map$2 f c)`), and the tables key on the base
+/// name and the arity of the call. The suffix is split off the name and
+/// not the qualifier, so `fib.seq/map$2` is `(Some(Seq), "map")` too.
+pub(super) fn base_head(head: &str, argc: usize) -> (Option<Facade>, &str) {
+    let suffix = format!("${argc}");
+    split_head(head.strip_suffix(suffix.as_str()).unwrap_or(head))
+}
+
 /// The row of **T** for a call of `args` arguments by this bare name.
 pub(super) fn terminal(name: &str, args: usize) -> Option<&'static Terminal> {
     TERMINALS.iter().find(|t| t.name == name && t.args == args)
@@ -156,6 +167,15 @@ mod tests {
         assert_eq!(split_head("fib.coll/vec"), (Some(Facade::Coll), "vec"));
         assert_eq!(split_head("map"), (None, "map"));
         assert_eq!(split_head("fib.core/map"), (None, "fib.core/map"));
+    }
+
+    #[test]
+    fn a_clause_picked_head_is_its_base_name() {
+        assert_eq!(base_head("map$2", 2), (None, "map"));
+        assert_eq!(base_head("fib.seq/map$2", 2), (Some(Facade::Seq), "map"));
+        assert_eq!(base_head("sort$1", 1), (None, "sort"));
+        assert_eq!(base_head("map$3", 2), (None, "map$3"));
+        assert_eq!(base_head("map", 2), (None, "map"));
     }
 
     #[test]
