@@ -79,6 +79,29 @@ pub fn root() -> PathBuf {
     repo_root()
 }
 
+/// The directory of this test's profile (`target/debug`), holding
+/// `liblair.so`; it is built with `cargo build -p lair` when missing, as the
+/// tests of the C interface do.
+fn lair_dir(root: &Path) -> PathBuf {
+    let exe = std::env::current_exe().expect("the test's own path");
+    let dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("the profile directory")
+        .to_path_buf();
+    if !dir.join("liblair.so").exists() {
+        let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        cargo.args(["build", "-p", "lair", "-j2"]).current_dir(root);
+        if dir.file_name().and_then(|p| p.to_str()) == Some("release") {
+            cargo.arg("--release");
+        }
+        let out = cargo.output().expect("cargo runs");
+        assert!(out.status.success(), "cargo build -p lair failed");
+    }
+    assert!(dir.join("liblair.so").exists(), "liblair.so was not built");
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,27 +297,4 @@ mod tests {
         );
         assert!(m.contains("nothing was compared"), "{m}");
     }
-}
-
-/// The directory of this test's profile (`target/debug`), holding
-/// `liblair.so`; it is built with `cargo build -p lair` when missing, as the
-/// tests of the C interface do.
-fn lair_dir(root: &Path) -> PathBuf {
-    let exe = std::env::current_exe().expect("the test's own path");
-    let dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("the profile directory")
-        .to_path_buf();
-    if !dir.join("liblair.so").exists() {
-        let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-        cargo.args(["build", "-p", "lair", "-j2"]).current_dir(root);
-        if dir.file_name().and_then(|p| p.to_str()) == Some("release") {
-            cargo.arg("--release");
-        }
-        let out = cargo.output().expect("cargo runs");
-        assert!(out.status.success(), "cargo build -p lair failed");
-    }
-    assert!(dir.join("liblair.so").exists(), "liblair.so was not built");
-    dir
 }
