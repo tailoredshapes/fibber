@@ -19,6 +19,9 @@ echo '(extern lair_hook1_address () -> i64)
 (defun main () -> i64 (if (= (unsafe (lair_hook1_address)) 0) 1 0))' > "$t/lair.fib"
 
 ck "help prints the usage and exits 0" "$($s2 help | head -1; echo $?)" "$(printf 'usage: fibc <command>\n0')"
+ck "--version prints the version and exits 0" "$($s2 --version; echo $?)" "$(printf 'fibc %s\n0' "$(cat VERSION)")"
+ck "-V is --version" "$($s2 -V)" "fibc $(cat VERSION)"
+$s2 --version x > /dev/null 2>&1; ck "--version with a word after it: exit 2" $? 2
 $s2 > /dev/null 2>&1; ck "no command: exit 2" $? 2
 $s2 bogus > /dev/null 2>&1; ck "an unknown command: exit 2" $? 2
 ck "cases of a missing directory: exit 2" "$($s2 cases "$t/nodir" 2>&1; echo $?)" "$(printf 'fibc: cannot read cases in %s/nodir: No such file or directory (os error 2)\n2' "$t")"
