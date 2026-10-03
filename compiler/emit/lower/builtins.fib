@@ -69,12 +69,17 @@
     ((some id) (Ok (ty-nominal id [])))
     (nil (Err "the prelude defines no Form"))))
 
+;; The name a reflection call gives its hook: `OP FILE:LINE:COL:START:END`, the position of the call. Rust: lower/builtins.rs, fault.rs pos_text
+(defun reflect-call-text :private (cx: LowerCx name: str e: Expr) -> str
+  (let ((p (. e pos)))
+    (str-join [name " " (lir-text (str-join [(. p file) ":" (show (. p line)) ":" (show (. p col)) ":" (show (. p start)) ":" (show (. p end))]))])))
+
 ;; A reflection builtin: the hook answers with a `Form`; a Bool is read out of its variant 6, a Vec out of its variant 9.
-(defun builtin-reflect :private (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
+(defun builtin-reflect :private (cx: LowerCx name: str e: Expr a: (Vec V)) -> (Result V str)
   (let ((hook (lcx-load cx LirPtr "@fibm.reflect-hook")) (hcx (lcx-load cx LirPtr "@fibm.hook-cx")))
     (try-let ((x (arg name a 0)))
       (let ((r (fb-val (. cx b) (str-join ["(indirect-call " (v-text hook) " (fn ptr (ptr ptr ptr)) " (v-text hcx)
-                                           " (string \"" name "\") " (v-text x) ")"]) LirPtr)))
+                                           " (string \"" (reflect-call-text cx name e) "\") " (v-text x) ")"]) LirPtr)))
         (try-let ((ft (form-ty cx)) (o (program-object (. cx p) ft)))
           (if (one-of? name ["struct?" "enum?"])
               (Ok (lcx-load cx LirI1 (lcx-gep cx (str-join [(. o snd) ".v6"]) (v-text r) slot-variant-field0)))
@@ -93,7 +98,7 @@
     ("join" (try-let ((t (arg name a 0))) (lcx-join cx e t)))
     ("not" (try-let ((x (arg name a 0))) (Ok (fb-val (. cx b) (str-join ["(xor " (v-text x) " (i1 1))"]) LirI1))))
     (_ (if (reflect-name? name)
-           (builtin-reflect cx name a)
+           (builtin-reflect cx name e a)
            (builtin-text cx name e a tys)))))
 
 ;; ---- arrays

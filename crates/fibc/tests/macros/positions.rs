@@ -310,12 +310,10 @@ fn jit_and_interpreter_give_a_reflection_error_the_same_message() {
     }
 }
 
-/// **Known to fail**, a second divergence in positions, reported and not
-/// fixed: the interpreter reports a reflection error at the reflection
-/// call in the macro's body (`4:23`, `(struct-fields x)`), the JIT at the
-/// call of the macro (`6:22`), the only position `reflect_hook` has.
+/// A reflection error is reported at the reflection call in the
+/// macro's body (`4:23`, `(struct-fields x)`) by both: the hook is told
+/// the position (`bridge.rs` `split_call`).
 #[test]
-#[ignore = "a divergence in the position of a reflection error, reported, not fixed"]
 fn jit_and_interpreter_report_a_reflection_error_at_the_same_position() {
     for (i, body) in REFLECTION_ERRORS.iter().enumerate() {
         let (a, b) = both(&format!("{HEADER}{body}"), &format!("error-{i}.fib"));

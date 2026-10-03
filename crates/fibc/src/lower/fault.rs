@@ -13,6 +13,12 @@ pub fn lir_text(text: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// A position in full, `FILE:LINE:COL:START:END`: what a reflection
+/// call tells its hook (macros/bridge.rs `split_call`).
+pub fn pos_text(p: &fibref::syntax::Pos) -> String {
+    format!("{}:{}:{}:{}:{}", p.file, p.line, p.col, p.start, p.end)
+}
+
 impl Cx<'_, '_> {
     /// A trap with a C-string message: the block ends here.
     pub fn trap_c(&mut self, msg: &str) {

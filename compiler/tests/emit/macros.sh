@@ -29,7 +29,7 @@ mark() {
     macro-div/*) echo '(call @fib.trap-at-c (string "'; echo 'by zero"))'; echo '(string "integer overflow in - at i64"))';;
     macro-keywords/*) echo '(block kw6 ';; macro-rest/nothing) echo '(define (fibm.entry.0 ptr) ()';;
     macro-rest/wrap) echo '(ptr a1)';; macro-rest/many) echo '(ptr a3)';; macro-literals/*) echo '(double 1e21)';;
-    macro-reflect/*) echo '@fibm.gensym-hook';; *) echo '';;
+    macro-reflect/*fields-of) echo '(string "struct-fields '; echo 'macro-reflect.fib:6:54:459:479")';; macro-reflect/*) echo '@fibm.gensym-hook';; *) echo '';;
   esac
 }
 

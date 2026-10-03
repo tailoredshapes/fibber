@@ -21,9 +21,8 @@
 ;;   its end, as in the Rust runner.
 ;; - A macro whose module does not check because it calls a function of the program is `MacroPhase`, as the interpreter's evaluator
 ;;   (the oracle of `fibref expand`) says it, not `MacroFailed` of the checker's text as the Rust JitRunner does (`check-failure`).
-;; - A reflection error is at the macro call's position, as the JitRunner's: the hook is not told where in the macro's body the call is,
-;;   so the evaluator's position (that of the `(struct-fields x)` in the body) cannot be given. compiler/tests/expand/porter2-073 to 080
-;;   differ from `fibref expand` in that position alone.
+;; - A reflection call names its own position in the operation string (`OP FILE:LINE:COL:START:END`), so a reflection error is at the
+;;   builtin call in the macro's body, as the evaluator's (the Rust hook ABI is the same: bridge.rs `split_call`).
 ;; Rust: macros/mod.rs `JitRunner::{module, build, run}`, bridge.rs, module.rs `Fns::{input_object, input_items, to_form}`.
 (ns macros.runner
   (:require [lair.jit :as jit] [lair.call :as call] [lair.fibm :as fibm] [lair.ffi :as ffi] [fib.string :as s] [emit.compile :as ec]
@@ -152,6 +151,24 @@
 (defun reflect-name? :private (op: str) -> bool
   (some? (first (filter (fn (n: str) (= n op)) reflect-names))))
 
+;; The operation and the position of a reflection call: the name the module passes is `OP FILE:LINE:COL:START:END`, or `OP` alone.
+;; Rust: bridge.rs split_call
+(defun num-or-neg :private (text: str) -> i64
+  (match (parse-long text) ((some n) n) (nil -1)))
+
+(defun split-call :private (text: str) -> (Pair str (Option Pos))
+  (let ((halves (s/split-limit text " " 2)))
+    (if (< (count halves) 2)
+        (Pair text nil)
+        (let ((parts (s/split (nth halves 1) ":")) (n (count parts)) (op (nth halves 0)))
+          (if (< n 5)
+              (Pair op nil)
+              (let ((line (num-or-neg (nth parts (- n 4)))) (col (num-or-neg (nth parts (- n 3))))
+                    (start (num-or-neg (nth parts (- n 2)))) (end (num-or-neg (nth parts (- n 1)))))
+                (if (or (< line 0) (< col 0) (< start 0) (< end 0))
+                    (Pair op nil)
+                    (Pair op (some (Pos (s/join ":" (vec (take (- n 4) parts))) line col start end))))))))))
+
 ;; The text of a trap: `POS: trap: MSG`, or `trap: MSG` where the runtime does not know the position. Rust: bridge.rs trap_hook
 (defun trap-text :private (c: Call op-addr: i64 msg-obj: i64) -> str
   (let ((msg (fibm/str-text (. c m) msg-obj)))
@@ -160,10 +177,11 @@
         (str-join [(ffi/c-string-at op-addr) ": trap: " msg]))))
 
 ;; A reflection call `(op form)`: the context's answer as a `Form` object, and the first error. Rust: bridge.rs reflect_hook
-(defun reflect-reply :private (c: Call op: str arg: i64 err: (Option ExpandError)) -> (Pair i64 (Option ExpandError))
-  (let ((m (. c m)) (pos (. c pos))
+(defun reflect-reply :private (c: Call call: str arg: i64 err: (Option ExpandError)) -> (Pair i64 (Option ExpandError))
+  (let ((m (. c m)) (pos (. c pos)) (sp (split-call call))
+        (at (match (. sp snd) ((some p) p) (nil pos)))
         (f (match (fibm/to-stx-in m arg pos (. c inputs)) ((Ok f) f) ((Err _) (Stx SNil pos)))))
-    (match (ctx-reflect (. c ctx) op f pos)
+    (match (ctx-reflect (. c ctx) (. sp fst) f at)
       ((Ok out) (Pair (fibm/to-object m out) err))
       ((Err e) (Pair (fibm/to-object m (Stx SNil pos)) (if (some? err) err (some e)))))))
 
@@ -174,7 +192,7 @@
         (let ((sym (ctx-gensym (. c ctx) (fibm/str-text m (call/call-hook-arg mb 0)) (. c pos))))
           (do (call/call-hook-reply mb (fibm/to-object m sym)) (Ok err)))
         (let ((at (call/call-hook-arg mb 0)))
-          (if (or (= at 0) (not (reflect-name? (ffi/c-string-at at))))
+          (if (or (= at 0) (not (reflect-name? (. (split-call (ffi/c-string-at at)) fst))))
               (Err (Trapped (trap-text c at (call/call-hook-arg mb 1))))
               (let ((r (reflect-reply c (ffi/c-string-at at) (call/call-hook-arg mb 1) err)))
                 (do (call/call-hook-reply mb (. r fst)) (Ok (. r snd)))))))))

@@ -89,6 +89,30 @@ pub unsafe extern "C" fn gensym_hook(cur: *mut Current<'_>, prefix: *const u8) -
     cur.fns.to_object(&sym)
 }
 
+/// The operation and the position of a reflection call: the name the
+/// module passes is `OP FILE:LINE:COL:START:END`, or `OP` alone.
+pub fn split_call(text: &str) -> (&str, Option<Pos>) {
+    let Some((op, at)) = text.split_once(' ') else {
+        return (text, None);
+    };
+    let mut it = at.rsplitn(5, ':');
+    let (end, start, col, line, file) = (it.next(), it.next(), it.next(), it.next(), it.next());
+    let num = |s: Option<&str>| s.and_then(|s| s.parse::<usize>().ok());
+    match (num(end), num(start), num(col), num(line), file) {
+        (Some(end), Some(start), Some(col), Some(line), Some(file)) => (
+            op,
+            Some(Pos {
+                file: file.into(),
+                line,
+                col,
+                start,
+                end,
+            }),
+        ),
+        _ => (op, None),
+    }
+}
+
 /// `(struct? f)` and the other reflection builtins: the expander's
 /// answer, a `Bool` or a `Vec` form. The argument is read back as a
 /// result is: an input form keeps its own position (the interpreter's
@@ -103,14 +127,16 @@ pub unsafe extern "C" fn reflect_hook(
     form: *const u8,
 ) -> *const u8 {
     let cur = &mut *cur;
-    let name = std::ffi::CStr::from_ptr(name)
+    let call = std::ffi::CStr::from_ptr(name)
         .to_string_lossy()
         .into_owned();
+    let (name, at) = split_call(&call);
+    let at = at.unwrap_or_else(|| cur.pos.clone());
     let f = match cur.fns.to_form(form, &cur.pos, cur.inputs) {
         Ok(f) => f,
         Err(_) => Form::new(FormKind::Nil, cur.pos.clone()),
     };
-    match cur.ctx.reflect(&name, &f, &cur.pos) {
+    match cur.ctx.reflect(name, &f, &at) {
         Ok(out) => cur.fns.to_object(&out),
         Err(e) => {
             if cur.error.is_none() {

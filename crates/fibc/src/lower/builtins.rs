@@ -4,7 +4,7 @@
 use fibref::types::ast::Expr;
 use fibref::types::ty::{Con, Ty};
 
-use super::fault::lir_text;
+use super::fault::{lir_text, pos_text};
 use super::{Cx, R};
 use crate::compile::Unsupported;
 use crate::ir::{LirTy, V};
@@ -76,11 +76,18 @@ impl<'a> Cx<'_, 'a> {
             | "enum-params" | "enum-variants" => {
                 let hook = self.load(LirTy::Ptr, "@fibm.reflect-hook");
                 let cx = self.load(LirTy::Ptr, "@fibm.hook-cx");
+                // The name carries the position of this call, `OP
+                // FILE:LINE:COL:START:END` (macros/bridge.rs `split_call`).
+                let call = match self.at {
+                    Some(e) => format!("{name} {}", pos_text(&e.pos)),
+                    None => name.to_string(),
+                };
                 let r = self.b.val(
                     &format!(
-                        "(indirect-call {} (fn ptr (ptr ptr ptr)) {} (string \"{name}\") {})",
+                        "(indirect-call {} (fn ptr (ptr ptr ptr)) {} (string \"{}\") {})",
                         hook.text(),
                         cx.text(),
+                        lir_text(&call),
                         arg(0)?.text()
                     ),
                     LirTy::Ptr,
