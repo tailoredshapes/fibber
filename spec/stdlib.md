@@ -2126,6 +2126,28 @@ bytes read from a descriptor need not be UTF-8 and a `str` must be.
 | `sys-clock-now` `sys-wall-now` | `-> i64` | CLOCK_MONOTONIC and CLOCK_REALTIME in nanoseconds |
 | `sys-sleep` | `i64 -> i64` | at least that many nanoseconds, resumed after a signal; 0; nothing for a time that is not positive |
 
+The functions of `fib.unix`, as table rows (the `covers:` lines of cases 3600 to 3609 name them):
+
+| Name | Verdict | Spelling | Signature | T | Note |
+|---|---|---|---|---|---|
+| `fd-open` (new) | new | `(fd-open path flags mode)` | `str i64 i64 -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-close` (new) | new | `(fd-close fd)` | `i64 -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-read` (new) | new | `(fd-read fd n)` | `i64 i64 -> (Result (Array i8) i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-write` (new) | new | `(fd-write fd bytes)` | `i64 (Array i8) -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-write-range` (new) | new | `(fd-write-range fd bytes off n)` | `i64 (Array i8) i64 i64 -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-seek` (new) | new | `(fd-seek fd off whence)` | `i64 i64 i64 -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-pipe` (new) | new | `(fd-pipe)` | `-> (Result (Pair i64 i64) i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-dup` (new) | new | `(fd-dup fd)` | `i64 -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-isatty` (new) | new | `(fd-isatty fd)` | `i64 -> bool` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-unlink` (new) | new | `(fd-unlink path)` | `str -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-mkdir` (new) | new | `(fd-mkdir path mode)` | `str i64 -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `fd-rmdir` (new) | new | `(fd-rmdir path)` | `str -> (Result i64 i64)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `errno-text` (new) | new | `(errno-text e)` | `i64 -> str` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `getenv` (new) | new | `(getenv name)` | `str -> (Option str)` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `clock-now` (new) | new | `(clock-now)` | `-> i64` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `wall-now` (new) | new | `(wall-now)` | `-> i64` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+| `sleep-ns` (new) | new | `(sleep-ns ns)` | `i64 -> i64` | 1 | `fib.unix`, over the `sys-` builtin of the same call |
+
 An error of the C library is returned as it is: `EINTR` is not retried by `sys-read` and `sys-write` (the library
 above loops if it wants to). Both tools take the flags as an `i32` and the mode as an `unsigned`.
 

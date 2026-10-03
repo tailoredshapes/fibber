@@ -250,6 +250,6 @@ intro | not a row
         let rows = parse_table(&text).unwrap();
         let of = |t: u8| rows.iter().filter(|r| r.tranche == t).count();
         let counts: Vec<usize> = (1..=5).map(of).collect();
-        assert_eq!((rows.len(), counts), (703, vec![190, 89, 226, 116, 82]));
+        assert_eq!((rows.len(), counts), (720, vec![207, 89, 226, 116, 82]));
     }
 }
