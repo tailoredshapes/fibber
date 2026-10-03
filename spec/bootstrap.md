@@ -1,10 +1,13 @@
 # Bootstrap: the compiler in fibber (M6)
 
-Status: **Proposed**, step by step. The owner agreed to the shape of M6
-on 2026-09-30 (stage 2 is written in `compiler/`, one pass at a time,
-each compared against the Rust pass it replaces before the next begins:
-reader, expander, types, ownership, emitter). Nothing here is **Decided**
-until the owner signs it; method.md applies throughout: a pass is done
+Status: **Proposed**, step by step; the whole of M6 has been done to its
+definition (2026-10-02, see ROADMAP M6): reader, expander with a macro
+runner, type checker, ownership checker and lIR emitter in `compiler/`, each
+compared with the Rust pass it replaces, and stage 2 and stage 3 emit
+identical lIR. The owner agreed to the shape of M6 on 2026-09-30 (stage 2 is
+written in `compiler/`, one pass at a time, each compared against the Rust
+pass it replaces before the next begins: reader, expander, types, ownership,
+emitter). Nothing here is **Decided** until the owner signs it; method.md applies throughout: a pass is done
 when a test that can fail says it matches the Rust one, not before.
 
 ## 1. Layout

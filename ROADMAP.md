@@ -268,28 +268,56 @@ are from runs on 2026-10-01):
       runner now keeps the positions of the forms a macro was given, as
       the interpreter does. Stage 2b, user macros through lair, needs
       the later passes.
-- [ ] types (10,800 Rust lines), ownership (4,400), the lIR emitter
-      (8,000), macros through lair (750), the driver (830)
+- [x] types (`compiler/types/`, tool `compiler/types.fib`, 8,200 fibber
+      lines for 11,000 Rust): `--stage infer --tables` equals `fibref types`
+      (spec/bootstrap.md §6) on every corpus program that needs no macro run,
+      the library included; the Rust side of the oracle is `fibref types`.
+- [x] ownership (`compiler/own/`, tools `compiler/own.fib` and
+      `compiler/explain.fib`): the body, facts, summary, taken, error and
+      explain sections equal `fibref own` and `fibref explain` (spec §7) on
+      the corpus. Not done: the port of the 46 Rust whole-pass tests and
+      the mutation reviews (O9).
+- [x] the lIR emitter (`compiler/emit/`, tool `compiler/emit.fib`): every
+      section of `fibc emit-dump` (spec §8) equals the Rust: runtime,
+      externs, types, statics, keywords, defs (constant `def`s through the
+      JIT), quotes, function bodies, main, the macro modules.
+- [x] stage 2b, macros through lair (`compiler/macros/runner.fib`, the
+      `RunnerMaker` of `compiler/expand/maker.fib`): the runner is the
+      default of every tool; `--no-runner` keeps the old behaviour.
+- [x] the driver (`compiler/fibc.fib`, `compiler/driver/`): `emit`, `build`,
+      `run`, `explain`, `emit-dump`, `-I` and `FIB_LIB`; `build -L` writes
+      the rpath; a closed pipe is no failure. `cases`, `gen` and `itrace`
+      stay in Rust (the harness).
+- [x] **stage 2 and stage 3** (2026-10-02, re-checked 2026-10-03): `fibc
+      build compiler/fibc.fib` makes stage 2; stage 2 builds stage 3; `fibc`,
+      stage 2 and stage 3 emit the same 16,550,159 bytes of lIR for
+      `compiler/fibc.fib` (equal md5); stage 3 emits the same lIR as `fibc`
+      on the 1,116 programs of cases/ownership, cases/modules and
+      cases/stdlib (with the support modules beside them), and stage 3's
+      `run`, `explain` and built executables equal stage 1's on the 243
+      ownership programs.
+- [ ] the last clause of the definition by the Rust harness: `fibc cases`
+      has no hook to use another compiler; today it is shown by output
+      equality.
+- [ ] 8 reflection-error inputs (`compiler/tests/expand/porter2-073..080`)
+      differ between the JIT runner and the interpreter in the position of
+      the error (spec/compiler.md §6 says they must be equal): package S4;
+      then `compiler/expand/stage` moves from 2a to 2b.
 
-**Resumed** (owner, 2026-10-02: "proceed with M6 now; I don't want to
-get stuck behind verification"). While the Rust packages of M7's tranche 2
-land, their expander and prelude changes are not mirrored into
-`compiler/expand/` in the same commit: `bootstrap_expand` is behind the
-`mirror` feature of `crates/fibc` and each package lists what to re-sync in
-`compiler/mirror-pending/` (README there). Mutation reviews and other
-verification run in the background and gate nothing. Baseline before the
-gate, on 2026-10-02 with tranche 2's library parts Y1 to Y5, Y9 and Y10 in
-tree: `cargo test -p fibc --test bootstrap_expand` 80 passed, 0 failed, 1
-ignored, in 1144 s (the self-hosted expander handles the whole library).
-
-**Paused** (owner, 2026-10-01) after step 2a until M7's library is
-viable. The faithful ports so far are 0.8 times the Rust's code lines
-and 1.25 times its bytes, because the prelude lacks what makes Clojure
-terse (`try-let`, `reduce`, `pop`, destructuring, sort); porting the
-remaining 25,000 lines in that style would mean rewriting them. Until
-then step 2a stays in step with the Rust expander: a library package
-that changes the Rust expander or the prelude mirrors the change in
-`compiler/expand/` and keeps `bootstrap_expand` at 0 failing.
+**Method since 2026-10-02.** M6 resumed with M7's tools (`try-let`,
+destructuring, flat `cond`, `defrecord`, `reduce`, `sort`): the ports are
+idiomatic, about 0.7 times the Rust's lines. Each pass has a dump command
+in Rust as its oracle (`fibref types|own`, `fibc emit-dump`), a harness that
+compares it with the fibber tool, `--sections` so a package is judged alone,
+and a differential test over the corpus. A change to the Rust front end
+must be mirrored into the fibber ports or stage 2 stops reading the
+library: each Rust package writes `compiler/mirror-pending/NAME.md` (the
+Rust function, the behaviour, the case that shows it, the fibber function
+that changes) and a re-sync package follows (X2, X8 and X7 are mirrored; X5
+is next). `bootstrap_expand` is behind the `mirror` feature of `crates/fibc`.
+Speed: stage 2 takes about 25 s to emit its own source against 13.8 s for
+the Rust (about 5 times slower on small programs: the library is checked
+again for every program). Nothing has been profiled.
 
 `lair` (lIR to native, via LLVM) stays in Rust, as LLVM stays in C++.
 The C interface to `lair` (spec/compiler.md §9) is a stopgap, not a
@@ -302,8 +330,9 @@ that interface go.
 **Aim** (owner, 2026-10-01): "steal Clojure's, or as close to it";
 improve inconsistencies and un-idiomatic corners where there is a reason;
 the language is to be as ergonomic as Clojure with a run-time
-performance that rivals Rust. Status: **Proposed**, not started; the
-rules below are mine, for the owner to amend.
+performance that rivals Rust. Status: **Proposed**; tranches 0 and 1 done,
+tranche 2 under way (see below); the rules below are mine, for the owner
+to amend.
 
 Rules:
 
@@ -358,25 +387,42 @@ Rules:
    (`sort`, `Map` iteration order, formatting for diagnostics) comes
    first.
 
-**Tranche 0 and 1 state** (2026-10-02, measured on the working tree, uncommitted):
-tranche 0 is done but for five of the thirty-two macros of E1; tranche 1 is
-implemented and **not complete**. The implicit library (`fib.core`,
-`fib.seq`, `fib.coll`, `fib.print`) is on, the prelude's old protocols are
-gone, `/` is `Div`'s, and `compiler/` is ported (`compiler/util/result.fib`
-is deleted; the prelude's `Result` is used). Evidence, each run on this
-tree: `fibref cases` and `fibc cases` both give `cases/ownership` 240 pass of
-240, `cases/modules` 25 of 25, `cases/stdlib` 556 cases, 529 pass, 0 fail,
-0 pending, 0 header error, 27 `open-` (items of later tranches);
-`cargo test --workspace` 1993 passed, 0 failed, 4 ignored (the passes include
-`bootstrap` 58, `bootstrap_expand` 80, `capi` 19); `cargo fmt --check` and
-`cargo clippy --workspace --all-targets -- -D warnings` clean;
-`every_row_of_the_tranche_is_covered`, run with `--ignored`, passes. Not done:
-removing that `#[ignore]` (the last step of the gate), the generator's forms
-for `@t` and float `quot`, and the commit. The by-hand mutation reviews of
-the Rust packages run in the background and do not gate (owner,
-2026-10-02: mutation reviews are like UAT: they run continuously, find
-interesting bugs, and do not stop development). The compiler's sources are ported faithfully, not
-idiomatically: M6 resumes with the library in view.
+**State** (2026-10-03). Tranches 0 and 1 are done and the flip is made: the
+implicit library (`fib.core`, `fib.seq`, `fib.coll`, `fib.print`) is on and the
+prelude's old protocols are gone. Tranche 2 (the Clojure surface), under way:
+- landed in the library: the lazy adaptors and their recipes (Y2), endless
+  sources (Y1), cursors and `zip` (Y3), `second` `ffirst` `product` and the
+  other consumers (Y4), `Stack` `find` `merge-with` `reduce-kv` (Y5), the
+  numeric conversions (Y9), the string-returning printers (Y10), `partial`
+  `complement` `volatile!` `as->` `defonce` `lazy-cat` (Y6), `defrecord`
+  and `with` (Y8), `vec-assoc` and `vec-pop` in O(log n) (PRE);
+- landed in the language: the Rust macros `try-let` `if-some` `when-some`
+  `when-first` `doseq` `for` `some` and the rest (X3), patterns in `fn`,
+  `defun` and `let` (X4), flat `cond` and bracket binding forms (X2), `def`
+  initialisers (X8), determined variables in impl heads (X7), the Clojure
+  reader additions `~x` `#(..)` `#{..}` `7/2` (X1), the stage-1 fixes S1 to
+  S3;
+- checked against real Clojure 1.12 (twelve independent verifiers, 2026-10-02:
+  eight defects confirmed and fixed: NaN and out-of-range conversions, `pr`
+  of non-finite floats, `select-keys`; Rust-side findings queued);
+- open: X5 (truthiness over `Option`, integer literals adopting floats; in
+  progress), X6 (keyword calls), X9 (arity overloading) and its library
+  rows (Y11), X10 (macro hygiene, `x#`), X11 (struct values), chunked lazy
+  seqs (Y12), the fusion tables (X12) and the generator (X13), L17's
+  default derive; then the performance tranche below.
+Counts: `cases/stdlib` 912 cases, 881 pass, 31 `open-`; `cargo test`
+workspace 1,913 passed; `cases/ownership` 243 and `cases/modules` 27 under
+both tools. Mutation reviews run in the background and gate nothing (owner,
+2026-10-02).
+
+**Performance tranche** (owner, 2026-10-03: "spending a little time on
+compilation is worth it"; specialising once the runtime use is known is
+fine, and the LLVM backend is trusted). After the library is viable:
+profile the compiler's own build first; then in-place update when a value
+is uniquely held (refcount 1, checked at run time) for `assoc` `conj`
+`pop`; fusion of lazy chains that are only reduced; the library checked
+once per process instead of per program; a benchmark suite against Rust
+(rule 5). Nothing here starts before it is measured.
 
 Order: spec/stdlib.md (the table of names and deviations); sequences,
 transducers and `Iter` fusion; maps, sets and sorted collections;

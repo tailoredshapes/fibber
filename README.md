@@ -20,20 +20,27 @@ the way; a small working language is one of them, not the destination.
 
 ## Status
 
-The reference interpreter runs: every case passes with a clean memory
-audit. lIR, the assembler the compiler will emit, is specified,
-implemented and checked on both its paths. The compiler `fibc` in Rust
-(M4) and the library (M5) are done; the bootstrap (M6) has begun, with
-the reader of the self-hosted compiler written in fibber. Nothing counts
-as implemented until an executable test says so.
+**The compiler is bootstrapped** (M6, 2026-10-02). `compiler/fibc.fib` is a
+fibber compiler written in fibber: reader, expander with a macro runner,
+type checker, ownership checker and lIR emitter, about 32,000 lines. The
+Rust `fibc` (stage 1) builds it into stage 2; stage 2 builds itself into
+stage 3; all three emit byte-identical lIR for the compiler's own source,
+and stage 3 emits the same lIR as stage 1 on every program of the case
+suite. Native code still comes from `lair` and LLVM through a C interface
+(`liblair.so`), the runtime `fib.rt` is lIR text, and the test harnesses are
+Rust. The standard library (M7) is a Clojure-shaped library in `lib/`,
+implicit in every program; its second tranche is under way. Nothing counts
+as implemented until an executable test says so ([spec/method.md](spec/method.md)).
 
 ```
 cargo test --workspace                          # the full suite (lair needs LLVM 21)
-cargo run -p fibref -- cases cases/ownership    # 191 cases
+cargo run -p fibref -- cases cases/ownership    # 243 cases
 cargo run -p fibref -- cases cases/modules      # programs of several modules, a directory each
 cargo run -p fibref -- run   <file.fib>         # result and memory audit
 cargo run -p fibref -- explain <file.fib>       # the ownership decisions
+cargo run -p fibref -- cases cases/stdlib       # the standard library's cases (header keys: cases/stdlib/README.md)
 cargo run -p fibref -- read [--print] <file>..  # the reader's dump or printed forms (spec/bootstrap.md §2)
+cargo run -p fibref -- expand|types|own <file>..  # the dumps of the expander, type checker and ownership checker (spec/bootstrap.md §5 to §7)
 cargo run -p lair -- cases cases/lir            # 323 lIR cases, JIT and AOT
 cargo run -p lair -- run   <file.lir>           # JIT-compile and run main
 cargo run -p lair -- build <file.lir> -o out    # native executable
@@ -43,6 +50,16 @@ cargo run -p fibc -- cases cases/ownership      # every case interpreted and com
 cargo run -p fibc -- run   <file.fib> [-- a b]  # compile through the JIT and run main; a b are (args)
 cargo run -p fibc -- build <file.fib> -o out [-L dir].. [-l lib]..  # native executable, linked with the libraries named
 cargo run -p fibc -- gen --seed S --count N     # N generated programs through the same harness (method rule 5)
+cargo run -p fibc -- emit <file.fib>            # the lIR module; emit-dump prints it by section (spec/bootstrap.md §8)
+```
+
+The compiler in fibber is a program like any other. Build it with stage 1
+and use it as `fibc`:
+
+```
+fibc build compiler/fibc.fib -I compiler -I lib -L target/debug -l lair -o fibc2
+./fibc2 build compiler/fibc.fib -I compiler -I lib -L target/debug -l lair -o fibc3   # it compiles itself
+./fibc3 emit compiler/fibc.fib | cmp - <(fibc emit compiler/fibc.fib)               # byte-identical lIR
 ```
 
 `lair` links LLVM 21 statically through llvm-sys: set
@@ -55,14 +72,15 @@ cargo run -p fibc -- gen --seed S --count N     # N generated programs through t
 | Ownership model | [spec/ownership.md](spec/ownership.md) | decided |
 | Syntax | [spec/syntax.md](spec/syntax.md) | decided |
 | Type system and ownership checker | [spec/types.md](spec/types.md) | decided |
-| Cases | [cases/ownership/](cases/ownership/) | 191, all passing (128–149: vector patterns and guards; 150–153: copy-in at call entry; 154: IEEE float comparisons; 155–161: colour parameters in impl heads; 162–165: no forwarding of a captured `&` parameter; 166–168: spin-waits and `swap!` contention on the fair executor; 169: the native `Show` and `Hash` instances on scalars; 170–173: findings of `fibc gen`; 174–176: the state machine of `async` and its executor; 177: a `dyn` over a native instance; 178: the texts of `show` on floats and `str`; 179–182: the prelude's `Map` and `Set`; 183–184: `str-from-bytes`, `str-join`, `str-chars`, `char->str`; 185–186: `read-file`, `write-file`, `args`, `println`; 187: the text of `show` on float ties and shorter digits; 188: every way `read-file` fails; 189: the `strtod` and `strtof` externs; 190: `alloc` is zeroed; 192: `println` writes every byte; 193: a raw `ptr` field is not counted; 194: the float bit casts; numbers 30, 35 and 191 are unused) |
-| Module cases | [cases/modules/](cases/modules/) | 6 programs of several modules (syntax §5), each a directory with its `main.fib`, all passing both ways |
+| Cases | [cases/ownership/](cases/ownership/) | 243, all passing under both tools (the language, ownership, closures, threads, macros, the prelude's data structures; the numbering and the findings behind each block are in the case headers) |
+| Module cases | [cases/modules/](cases/modules/) | 27 programs of several modules (syntax §5), each a directory with its `main.fib`, all passing both ways |
 | Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
 | Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
-| Library | [lib/prelude.fib](lib/prelude.fib) | done (M5, 2026-09-30): `Vec` (a 32-way trie), `Map` and `Set` (an HAMT), `List`, iterators, string building and characters, tasks, `println`, `eprintln`, files and `args` |
+| Library | [lib/](lib), design [spec/stdlib.md](spec/stdlib.md) | M7, **Proposed**, tranches 0 and 1 done and tranche 2 under way (2026-10-03): the prelude (`Vec`, `Map` and `Set`, `Result`, tasks, files) plus four implicit facades `fib.core fib.seq fib.coll fib.print` of about forty parts: protocols (`Reducible`, `Seqable`, `Lookup`, ...), fused adaptors and memoised lazy seqs, sorting, strings and formatting, `defrecord`, numeric conversions, endless sources, cursors; verified against real Clojure 1.12 where behaviour is Clojure's |
+| Standard library cases | [cases/stdlib/](cases/stdlib/) | 912 cases, 881 passing under both tools, 31 `open-` (items of later tranches): reference, law, count (allocation bounds), trap and reject cases per function |
 | lIR: the assembler for LLVM IR that `fibc` emits | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28; the second M3 pass's additions decided the same day, §14 items 8 to 11) |
 | lIR cases | [cases/lir/](cases/lir/) | 323, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial, the fuzzer's findings among them; verify: one reject case per rule) |
 | lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |
 | Compiler `fibc`: `fibref`'s front end lowered to lIR, the runtime `fib.rt`, the rule-6 harness, macros and `def`s through the JIT, `async` as state machines | [spec/compiler.md](spec/compiler.md), [crates/fibc](crates/fibc) | done (M4, decided 2026-09-30): all 191 cases pass interpreted and compiled with matching free traces (`fibc cases cases/ownership`, 2026-10-01), and generated programs run through the same harness (`fibc gen`) |
-| The C interface to `lair` (`liblair.so`), for the compiler written in fibber | [spec/compiler.md §9](spec/compiler.md), [crates/lair/include/lair.h](crates/lair/include/lair.h), [crates/lair/src/capi](crates/lair/src/capi), bindings in [compiler/lair/](compiler/lair) | M6; 21 `lair_*` functions, the list **Proposed**; a test keeps the header equal to the exports; `fibc build FILE -o OUT -L DIR -l lair` links a fibber program against it |
-| Bootstrap: the compiler written in fibber | [spec/bootstrap.md](spec/bootstrap.md), [compiler/](compiler) | M6, **Proposed**, step 1 of 5: the reader. `compiler/read.fib` prints what `fibref read` prints, byte for byte, in both modes; the expander, types, ownership and the lIR emitter are not started ([ROADMAP.md](ROADMAP.md)) |
+| The C interface to `lair` (`liblair.so`), used by the compiler written in fibber | [spec/compiler.md §9](spec/compiler.md), [crates/lair/include/lair.h](crates/lair/include/lair.h), [crates/lair/src/capi](crates/lair/src/capi), bindings in [compiler/lair/](compiler/lair) | M6; 22 `lair_*` functions, the list **Proposed**; a test keeps the header equal to the exports; `fibc build FILE -o OUT -L DIR -l lair` links a fibber program against it and writes the rpath. A stopgap: `lair` is to be rewritten in fibber later |
+| Bootstrap: the compiler written in fibber | [spec/bootstrap.md](spec/bootstrap.md), [compiler/](compiler) | M6 done as far as the definition goes (2026-10-02, **Proposed**): `compiler/fibc.fib` (commands `emit`, `build`, `run`, `explain`, `emit-dump`) over `compiler/{syntax,expand,macros,types,own,emit,lair,driver}`. Each pass equals its Rust oracle byte for byte on the whole corpus (the reader, expander, `fibref types`, `fibref own` and `explain`, `fibc emit-dump`); stage 1, 2 and 3 emit identical lIR for the compiler itself; open: the Rust test harness cannot yet use stage 3 as the compiler, and 8 reflection-error inputs differ in position between the JIT and the interpreter ([ROADMAP.md](ROADMAP.md)) |
