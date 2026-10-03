@@ -71,6 +71,17 @@ commands:
                   (expand, types and own find a module as run does: beside
                   the file, under each -I dir, under each $FIB_LIB dir,
                   then in the library the executable carries)
+  complete [-I dir].. FILE|- LINE COL [--path NAME]
+                  print {\"items\":[{label,kind,detail,doc}..]}: the names
+                  visible at LINE (from 1) and COL (from 0, UTF-16 units) of
+                  FILE, or of standard input for `-` (an unsaved buffer;
+                  --path names it for module lookup). Exit 0 even if the
+                  buffer does not read or check (spec/bootstrap.md §9)
+  diagnostics [-I dir].. FILE|- [--path NAME]
+                  print {\"diagnostics\":[{line,col,endLine,endCol,message,
+                  severity}..]}, the front end's errors; exit 0
+  lsp [-I dir]..  a language server on standard input and output
+                  (JSON-RPC, Content-Length framing; spec/bootstrap.md §9)
   help          print this message";
 
 /// The directory `cases` runs when none is given.
@@ -100,6 +111,9 @@ enum Command {
         files: Vec<String>,
         opts: fibref::own_dump::Options,
     },
+    /// `complete`, `diagnostics` or `lsp` (`fibref::editor::cli`), with
+    /// their words after the command.
+    Editor { name: String, args: Vec<String> },
     /// Print usage and exit successfully.
     Help,
     /// Print usage and exit with an error: the arguments made no sense.
@@ -158,6 +172,12 @@ fn parse(args: &[String]) -> Command {
             Some((opts, files)) => Command::Own { files, opts },
             None => Command::Invalid,
         },
+        [cmd, rest @ ..] if matches!(cmd.as_str(), "complete" | "diagnostics" | "lsp") => {
+            Command::Editor {
+                name: cmd.clone(),
+                args: rest.to_vec(),
+            }
+        }
         [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Command::Help,
         _ => Command::Invalid,
     }
@@ -295,6 +315,25 @@ fn own_files(files: &[String], opts: &fibref::own_dump::Options) -> ExitCode {
     finish(&text, ExitCode::from(status))
 }
 
+/// Runs `complete`, `diagnostics` or `lsp`: the document on stdout and
+/// exit 0, or the reason on stderr and exit 2 (bad usage, an unreadable
+/// file); `lsp` exits 0 after `shutdown`, 1 without it.
+fn editor(name: &str, args: &[String], roots: Roots) -> ExitCode {
+    use fibref::editor::cli;
+    let outcome = match name {
+        "complete" => cli::complete_cmd(args, &roots),
+        "diagnostics" => cli::diagnostics_cmd(args, &roots),
+        _ => return ExitCode::from(cli::lsp_cmd(roots) as u8),
+    };
+    match outcome {
+        Ok(text) => finish(&text, ExitCode::SUCCESS),
+        Err(why) => {
+            eprintln!("{why}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// Prints `text` to stdout and returns `code`, the verdict of the
 /// command, unless the report could not be written: then it says why on
 /// stderr and exits 2, so that a full device is not a pass. A reader that
@@ -339,9 +378,12 @@ fn main() -> ExitCode {
             | Command::Expand { .. }
             | Command::Types { .. }
             | Command::Own { .. }
+            | Command::Editor { .. }
     );
     if !dirs.is_empty() && !takes_roots {
-        eprintln!("fibref: -I belongs to `run`, `explain`, `expand`, `types` and `own`\n{USAGE}");
+        eprintln!(
+            "fibref: -I belongs to `run`, `explain`, `expand`, `types`, `own`, `complete`, `diagnostics` and `lsp`\n{USAGE}"
+        );
         return ExitCode::from(2);
     }
     let roots = Roots::from_env(&dirs, std::env::var_os("FIB_LIB").as_deref());
@@ -362,6 +404,7 @@ fn main() -> ExitCode {
             opts.roots = roots.dirs().to_vec();
             own_files(&files, &opts)
         }
+        Command::Editor { name, args } => editor(&name, &args, roots),
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS

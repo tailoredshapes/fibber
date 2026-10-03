@@ -91,11 +91,21 @@ pub fn check_modules(
     modules: &[(ModuleSpec, Vec<Form>)],
     prelude: &[Form],
 ) -> Result<Checked, CheckError> {
+    check_modules_with(modules, prelude, true)
+}
+
+/// [`check_modules`] where `main` says whether the program must define
+/// `main` (an editor's buffer is often a library: `fibref complete`).
+pub fn check_modules_with(
+    modules: &[(ModuleSpec, Vec<Form>)],
+    prelude: &[Form],
+    main: bool,
+) -> Result<Checked, CheckError> {
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new()
             .name("fibref-own".into())
             .stack_size(CHECK_STACK)
-            .spawn_scoped(scope, || check_here(modules, prelude));
+            .spawn_scoped(scope, || check_here(modules, prelude, main));
         match worker.map(|h| h.join()) {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(CheckError::Internal("the checker panicked".into())),
@@ -109,13 +119,14 @@ pub fn check_modules(
 fn check_here(
     modules: &[(ModuleSpec, Vec<Form>)],
     prelude: &[Form],
+    main: bool,
 ) -> Result<Checked, CheckError> {
     let lowered = lower_modules(modules, prelude).map_err(CheckError::Type)?;
     let amp = syntactic::check(&lowered.globals);
     if !amp.is_empty() {
         return Err(CheckError::Own(amp));
     }
-    let typed = infer_lowered(lowered, true).map_err(CheckError::Type)?;
+    let typed = infer_lowered(lowered, main).map_err(CheckError::Type)?;
     let owned = analyse(&typed).map_err(CheckError::Own)?;
     Ok(Checked { typed, owned })
 }

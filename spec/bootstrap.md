@@ -1404,3 +1404,68 @@ of `emit`, that the text is the same on every run) and by `compile::tests`
 (that `emit` is what it was); the harness that runs the port against it is not
 written yet: `compiler/tests/types/compare.sh -c emit-dump FIBC TOOL FILE..`
 compares the two tools, one process per file.
+
+## 9. Editor support (`fibref complete`, `fibref diagnostics`, `fibref lsp`)
+
+Editor support is not a language rule, so no port in `compiler/` mirrors it
+and no `mirror-pending` note is owed: it reads the Rust front end (reader,
+expander, checker) and changes none of it. Code is `crates/fibref/src/editor/`;
+a buffer is the text the editor holds, saved or not.
+
+**Positions.** Lines count from 1 and columns from 0, in UTF-16 code units
+(a character for any text of the Basic Multilingual Plane), in the two
+commands; the language server uses LSP's own, lines from 0. A position past
+the end of its line is the end of the line.
+
+**`fibref complete [-I dir].. FILE|- LINE COL [--path NAME]`** prints one line,
+`{"items":[{"label","kind","detail","doc"}]}`, and exits 0 whatever the
+buffer is (2 for bad usage or an unreadable FILE). `-` reads the buffer from
+standard input, and `--path NAME` is the file it stands for: a module is
+found beside NAME, then as `run` finds it, so an unsaved buffer completes
+like a saved one. `kind` is one of `function variable struct enum variant
+protocol method macro keyword module field type`; `detail` is the checker's
+scheme for a library function (`∀Self. (Num Self) ⇒ (fn :send (Self Self)
+Self)`), the signature as written for one the buffer defines, the type for a
+local; `doc` names where it comes from. Prefix filtering is the client's. The
+class of candidate comes from the text before the cursor: after `(. x ` the
+fields of x's struct (its type from the checker when the buffer checks, else
+its annotation `x: T`); after `x:` or `->` the types; after `alias/` what that
+module exports; after `:` the keywords written in the file; else the locals
+and parameters in scope (the reader reads the text before the cursor closed
+by the delimiters still open, so this survives a buffer that does not read),
+the buffer's own definitions, every name the module sees (the library with
+its schemes, the `:use`d modules), `alias/` for each alias, the core forms
+(`kind` `macro`, detail `special form`) and the prelude's macros.
+
+**Degrading.** The buffer is checked as the main module; a program with no
+`main` is accepted (`main` is required only when the text has `(defun
+main`). When that fails the candidates come from the program of the library,
+the buffer's `ns` form and the buffer's top-level forms other than the one the
+cursor is in, then of its type definitions, then of the `ns` form alone, then
+of the library alone; the diagnostics are those of the first failure.
+
+**`fibref diagnostics [-I dir].. FILE|- [--path NAME]`** prints
+`{"diagnostics":[{"line","col","endLine","endCol","message","severity"}]}`
+(`severity` always `"error"`; every error the first failing pass reports: the
+reader, the expander, or the checker and the ownership pass), positions as above, from the error's position
+(syntax §1.3); an empty range is widened to one character. An error in
+another file (a module the buffer requires) is shown at the top of the buffer
+with its own `file:line:col`. Exit 0.
+
+**`fibref lsp [-I dir]..`** is a language server on standard input and output:
+JSON-RPC 2.0, `Content-Length` framing, hand-written (the workspace has no
+dependencies; `json.rs` reads and writes the JSON). It answers `initialize`
+(full-text synchronisation, hover, completion with the trigger characters
+`( / . : ` and space), `shutdown`, `exit` (status 0 after `shutdown`, else
+1), `textDocument/didOpen didChange didSave didClose` (each publishes
+`publishDiagnostics` for the buffer, empty on close), `textDocument/completion`
+(the items of `complete`, `kind` mapped to LSP's numbers) and
+`textDocument/hover` (`name : scheme` for a global, `name : type` for a local
+of a buffer that checks; null elsewhere). An unknown request is error -32601,
+a request with bad parameters -32602, any request after `shutdown` -32600,
+unparseable JSON -32700 with a null id, and a handler that panics answers
+its request with -32603 and the server goes on. Tests: `crates/fibref/src/editor/*/tests.rs`
+(the server driven through framed in-memory messages),
+`crates/fibref/tests/editor_cli.rs` with the fixtures of
+`crates/fibref/tests/complete/`, and `editors/vscode/test/lsp.js` (the real
+`fibref lsp` over a pipe).
