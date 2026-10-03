@@ -1,0 +1,109 @@
+;; compiler/tests/types/unit-keyword.fib: a keyword as a function (stdlib §7 L14, X6): the
+;; deferred constraint of types.infer.keyword (stuck at a variable, a struct's field, no field,
+;; a default over a struct, neither a struct nor a map, left over at the close of the unit) and
+;; its elaboration (types.elab) as a field read and as the `fn` of one. The `(Map keyword v)`
+;; path needs the prelude's `map-get`; `compare.sh` over cases 1601, 1602, 1000 shows it.
+;; Build: fibc build compiler/tests/types/unit-keyword.fib -I compiler -I lib -o OUT
+(ns main (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
+               types.decls types.init types.infer.cx types.infer.unify types.infer.general
+               types.infer.keyword types.infer.solve types.infer.expr types.elab types.check))
+
+(def p0: Pos (Pos "t.fib" 1 1 0 1))
+
+;; The checker's globals with a struct `Person` (type id after the prelude's) and a binding 0.
+(defun world () -> Globals
+  (match (new-globals)
+    ((Ok g) (do (table-add (. g bindings) (BindingInfo "a" BkLet p0 nil))
+                (table-add (. g types) (TypeDef "Person" module-main [] [] (TsStruct [(FieldDef "age" (ty-i64))]) p0))
+                g))
+    ((Err e) (trap (type-error-text e)))))
+
+(defun person (cx: Cx) -> Ty (ty-nominal (- (table-count (. (. cx g) types)) 1) []))
+(defun cx-of (g: Globals) -> Cx (Cx g (env-new) (store-new) (tables-new) (unit-new)))
+(defun fresh-cx () -> Cx (cx-of (world)))
+(defun ex (id: i64 k: ExprKind) -> Expr (Expr id p0 k))
+(defun kw (id: i64 k: str) -> Expr (ex id (ELit (LitKeyword k))))
+(defun local (id: i64) -> Expr (ex id (ELocal 0)))
+(defun infer (cx: Cx e: Expr) -> (Result Ty TypeError) (cx-infer cx e))
+(defun call (id: i64 k: str args: (Vec Arg)) -> Expr (ex id (ECall (kw (+ id 1) k) args)))
+
+(defun error-is? (r: (Result Ty TypeError) kind: ErrorKind msg: str) -> bool
+  (match r ((Err e) (and (= (. e kind) kind) (= (. e message) msg))) (_ false)))
+
+(defun elab-program (cx: Cx body: Expr) -> Expr
+  (let ((g (. cx g)))
+    (do (table-add (. g funs) (FunDef "f" 0 [] nil [] body false p0))
+        (elaborate g (. cx t))
+        (. (table-get (. g funs) 0) body))))
+
+(defun solver-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (cx-fresh cx))
+          (let ((r (infer cx (call 10 "age" [(ArgExpr (local 12))]))))
+            (check cs "a keyword over an unknown type is stuck, not an error"
+                   (and (match r ((Ok _) true) (_ false)) (= (count @(. (. cx u) deferred)) 1))))))
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (person cx))
+          (let ((r (infer cx (call 10 "age" [(ArgExpr (local 12))]))))
+            (check cs "a struct's field is the result, the site is a Field"
+                   (and (match r ((Ok t) (= (cx-zonk cx t) (ty-i64))) (_ false))
+                        (= (get @(. (. cx t) kw-sites) 11) (some KwField))
+                        (empty? @(. (. cx u) deferred)))))))
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (person cx))
+          (check cs "a struct without the field"
+                 (error-is? (infer cx (call 10 "salary" [(ArgExpr (local 12))])) NoField
+                            "Person has no field :salary"))))
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (person cx))
+          (check cs "a default over a struct"
+                 (error-is? (infer cx (call 10 "age" [(ArgExpr (local 12)) (ArgExpr (kw 13 "z"))])) Other
+                            "(:age x d): Person is a struct, a default needs a map"))))
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (ty-i64))
+          (check cs "neither a struct nor a map"
+                 (error-is? (infer cx (call 10 "a" [(ArgExpr (local 12))])) Other
+                            "cannot apply :a to i64: it is neither a struct nor a (Map keyword v)"))))
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (cx-fresh cx))
+          (infer cx (call 10 "age" [(ArgExpr (local 12))]))
+          (check cs "a keyword left over at the close of the unit"
+                 (match (check-unresolved cx)
+                   ((Err e) (and (= (. e kind) FieldUnresolved)
+                                 (= (. e message) "cannot infer the type of the argument of :age; annotate it")))
+                   (_ false)))))))
+
+(defun elab-tests (cs: Checks) -> unit
+  (do
+    (let ((cx (fresh-cx)))
+      (do (cx-bind cx 0 (person cx))
+          (infer cx (call 10 "age" [(ArgExpr (local 12))]))
+          (let ((n (g-next-expr (. cx g))))
+            (let ((out (elab-program cx (call 10 "age" [(ArgExpr (local 12))]))))
+              (check cs "a struct read is a field read and allocates no node"
+                     (and (match (. out kind) ((EField x f _) (and (= f "age") (= (. x id) 12))) (_ false))
+                          (= (g-next-expr (. cx g)) (+ n 1))))))))
+    (let ((cx (fresh-cx)))
+      (let ((k (kw 50 "age")))
+        (let ((t (cx-keyword-fn cx k "age")))
+          (match t
+            ((TFn _ ps r)
+             (do (cx-unify cx (nth ps 0) (person cx) p0)
+                 (cx-solve-all cx)
+                 (let ((out (elab-program cx k)))
+                   (check cs "a keyword argument is the fn of the field read"
+                          (and (match (. out kind)
+                                 ((EFn lit) (and (= (count (. lit params)) 1)
+                                                 (match (. (. lit body) kind) ((EField _ f _) (= f "age")) (_ false))))
+                                 (_ false))
+                               (= (. (g-binding (. cx g) 1) name) "keyword-arg")
+                               (= (get @(. (. cx t) kw-sites) 50) (some KwField))
+                               (= (count @(. (. cx u) fn-lits)) 1))))))
+            (_ (check cs "a keyword argument is typed as a function" false))))))))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do (solver-tests cs)
+        (elab-tests cs)
+        (finish cs))))

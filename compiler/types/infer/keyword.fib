@@ -1,0 +1,120 @@
+;; compiler/types/infer/keyword.fib: a keyword as a function (stdlib §7 L14, X6), as
+;; crates/fibref/src/types/infer/keyword.rs.
+;;
+;; Typed by a deferred constraint (`DkKeyword`), settled when the argument's type is known;
+;; `types.elab` writes the field read or the `map-get` it chose (`Tables.kw-sites`).
+(ns types.infer.keyword
+  (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast types.decls
+        types.names types.infer.cx types.infer.unify types.infer.inst))
+
+;; Whether a parameter type is a function type (a keyword passed there is the function of L14).
+(defun cx-expects-fn (cx: Cx t: Ty) -> bool
+  (match (store-resolve (. cx st) t)
+    ((TFn _ _ _) true)
+    (_ false)))
+
+;; A keyword where a function is expected: `(fn (S) R)`, `S` and `R` settled by the argument's
+;; type (L14).
+(defun cx-keyword-fn (cx: Cx x: Expr k: str) -> Ty
+  (let ((s (cx-fresh cx))
+        (r (cx-fresh cx))
+        (colour (store-fresh-colour (. cx st))))
+    (let ((t (TFn colour [s] r)))
+      (do (cx-record cx (. x id) t)
+          (set! (. (. cx u) fn-lits) (conj @(. (. cx u) fn-lits) (Pair (. x id) colour)))
+          (cx-defer cx (DkKeyword (. x id) s k r nil) (. x pos) nil)
+          t))))
+
+;; `(:k x)` and `(:k x d)` (L14): the field read or the lookup, settled when the type of `x` is.
+;; `nil` when the call is not one (the old `cannot unify keyword with (fn ..)` follows).
+(defun cx-keyword-call (cx: Cx head: Expr args: (Vec Arg) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow)
+    -> (Result (Option Ty) TypeError)
+  (match (. head kind)
+    ((ELit (LitKeyword k))
+     (if (keyword-args? args)
+         (match (nth args 0)
+           ((ArgExpr x)
+            (try-let ((s (infer cx x))
+                      (dflt (if (= (count args) 2)
+                                (match (nth args 1)
+                                  ((ArgExpr d) (try-let ((t (infer cx d))) (Ok (some t))))
+                                  (_ (Ok nil)))
+                                (Ok nil))))
+              (let ((r (cx-fresh cx)))
+                (do (cx-defer cx (DkKeyword (. head id) s k r dflt) (. head pos) nil)
+                    (Ok (some r))))))
+           (_ (Ok nil)))
+         (Ok nil)))
+    (_ (Ok nil))))
+
+(defun keyword-args? :private (args: (Vec Arg)) -> bool
+  (and (or (= (count args) 1) (= (count args) 2))
+       (every? (fn (a: Arg) (match a ((ArgExpr _) true) (_ false))) args)))
+
+;; The scheme of the prelude's `map-get`, which `(:k m)` is.
+(defun keyword-map-get-scheme :private (cx: Cx pos: Pos) -> (Result Scheme TypeError)
+  (let ((found (match (g-value (. cx g) module-prelude "map-get")
+                 ((some (GFun f)) (get @(. (. cx env) funs) f))
+                 (_ nil))))
+    (match found
+      ((some s) (Ok s))
+      (nil (Err (type-error-other pos "internal: map-get has no scheme"))))))
+
+;; A keyword as a function (L14): the field read when `S` is a struct with the field, `map-get`
+;; when it is a `(Map keyword v)`.
+(defun solve-keyword (cx: Cx d: Deferred site: i64 s: Ty k: str r: Ty dflt: (Option Ty))
+    -> (Result Attempt TypeError)
+  (let ((rt (store-resolve (. cx st) s)))
+    (match rt
+      ((TVar _) (Ok AtStuck))
+      ((TCon (KNominal id) args)
+       (match (. (g-ty (. cx g) id) shape)
+         ((TsStruct fields) (solve-keyword-field cx d site rt fields args k r dflt))
+         (_ (if (= (g-type-name (. cx g) module-prelude "Map") (some id))
+                (try-let ((_ (solve-keyword-map cx d site s k r dflt)))
+                  (Ok (AtSolved [])))
+                (keyword-neither cx d rt k)))))
+      (_ (keyword-neither cx d rt k)))))
+
+(defun keyword-neither :private (cx: Cx d: Deferred rt: Ty k: str) -> (Result Attempt TypeError)
+  (Err (type-error-other (. d pos)
+         (str-join ["cannot apply :" k " to " (cx-show cx rt)
+                    ": it is neither a struct nor a (Map keyword v)"]))))
+
+(defun solve-keyword-field :private (cx: Cx d: Deferred site: i64 rt: Ty fields: (Vec FieldDef) args: (Vec Ty)
+                                     k: str r: Ty dflt: (Option Ty)) -> (Result Attempt TypeError)
+  (if-some [fd (find-first (fn (fd: FieldDef) (= (. fd name) k)) fields)]
+    (if (some? dflt)
+        (Err (type-error-other (. d pos)
+               (str-join ["(:" k " x d): " (cx-show cx rt) " is a struct, a default needs a map"])))
+        (let ((zs (mapv (fn (a: Ty) (cx-zonk cx a)) args)))
+          (try-let ((_ (cx-unify cx r (ty-subst-gen (. fd ty) zs (colour-args zs)) (. d pos))))
+            (do (set! (. (. cx t) kw-sites) (assoc @(. (. cx t) kw-sites) site KwField))
+                (Ok (AtSolved []))))))
+    (Err (type-error NoField (. d pos) (str-join [(cx-show cx rt) " has no field :" k])))))
+
+(defun solve-keyword-map :private (cx: Cx d: Deferred site: i64 s: Ty k: str r: Ty dflt: (Option Ty))
+    -> (Result unit TypeError)
+  (try-let ((scheme (keyword-map-get-scheme cx (. d pos))))
+    (match (cx-instantiate cx scheme site "map-get" (. d pos) nil)
+      ((TFn _ ps ret)
+       (try-let ((_ (cx-unify cx (nth ps 0) s (. d pos)))
+                 (_ (match (cx-unify cx (nth ps 1) (ty-scalar SKeyword) (. d pos))
+                      ((Ok _) (Ok ()))
+                      ((Err _) (Err (type-error-other (. d pos)
+                                      (str-join ["cannot apply :" k ": the map's keys are not keywords"])))))))
+         (try-let ((_ (match dflt
+                        (nil (cx-unify cx r ret (. d pos)))
+                        ((some dt)
+                         (let ((v (keyword-payload cx ret)))
+                           (try-let ((_ (cx-unify cx dt v (. d pos))))
+                             (cx-unify cx r v (. d pos))))))))
+           (do (set! (. (. cx t) kw-sites) (assoc @(. (. cx t) kw-sites) site KwMap))
+               (Ok ())))))
+      (_ (Err (type-error-other (. d pos) "internal: map-get is not a function"))))))
+
+(defun keyword-payload :private (cx: Cx t: Ty) -> Ty
+  (let ((rt (store-resolve (. cx st) t)))
+    (match rt
+      ((TCon _ args) (if (= (count args) 1) (nth args 0) rt))
+      (_ rt))))

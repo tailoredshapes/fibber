@@ -17,7 +17,7 @@
 ;; the lIR of stage 2 agree. `finish` returns the kind of the node built for a form; the id
 ;; and type of that node are dropped (the form keeps its own).
 (ns types.elab
-  (:use syntax.pos types.ty types.ast types.decls types.table types.infer.cx))
+  (:use syntax.pos types.ty types.ast types.decls types.table types.names types.infer.cx))
 
 (defstruct Elab (g: Globals t: Tables))
 
@@ -132,8 +132,10 @@
 
 ;; Rust: elab.rs:106 expr. Children first, then the form itself.
 (defun el-expr (el: Elab e: Expr) -> Expr
-  (let ((kind (el-children el (. e kind))))
-    (Expr (. e id) (. e pos) (el-form el e kind))))
+  (if-some [r (el-keyword-call el e)]
+    r
+    (let ((kind (el-children el (. e kind))))
+      (Expr (. e id) (. e pos) (el-form el e kind)))))
 
 (defun el-form :private (el: Elab e: Expr kind: ExprKind) -> ExprKind
   (match kind
@@ -141,6 +143,10 @@
     ((EGuarded cs) (el-guarded el e cs))
     ((EAnd ops) (el-and el e ops))
     ((EOr ops) (el-or el e ops))
+    ((ELit (LitKeyword k))
+     (match (get @(. (. el t) kw-sites) (. e id))
+       ((some site) (el-keyword-fn el e k site))
+       (nil kind)))
     ((EElided)
      (let ((t (el-ty el e)))
        (if (some? (el-payload el t))
@@ -258,3 +264,71 @@
     ((EDyn p args send x) (EDyn p args send (el-expr el x)))
     ((EConvert op to x) (EConvert op to (el-expr el x)))
     (other other)))
+
+;; ---- keywords as functions (stdlib §7 L14, X6; crates/fibref/src/types/elab/kw.rs)
+;;
+;; `(:k x)` is the field read `(. x k)` when `x` is a struct and `(map-get x :k)` when it is a
+;; `(Map keyword v)`; `(:k x d)` is a `match` on that, `d` for `nil`; a keyword where a
+;; function was expected is the `fn` of the read. The checker decided which (`kw-sites`).
+
+;; A call whose head is a keyword the checker took as a function: elaborated whole, its head
+;; never a node of its own. `nil` when `e` is not one.
+(defun el-keyword-call :private (el: Elab e: Expr) -> (Option Expr)
+  (match (. e kind)
+    ((ECall head args)
+     (match (. head kind)
+       ((ELit (LitKeyword k))
+        (if-some [kind (get @(. (. el t) kw-sites) (. head id))]
+          (some (el-keyword-args el e k kind (. head id) args))
+          nil))
+       (_ nil)))
+    (_ nil)))
+
+(defun el-keyword-args :private (el: Elab e: Expr k: str kind: KwSite site: i64 args: (Vec Arg)) -> Expr
+  (let ((es (reduce (fn (acc: (Vec Expr) a: Arg)
+                      (match a ((ArgExpr x) (conj acc (el-expr el x))) (_ acc)))
+                    [] args)))
+    (let ((dflt (if (= (count es) 2) (some (nth es 1)) nil))
+          (ty (el-ty el e)))
+      (Expr (. e id) (. e pos) (el-read el kind (nth es 0) k dflt (. e pos) site ty)))))
+
+;; A keyword literal that is a function: `(fn (x) <the read of x>)`.
+(defun el-keyword-fn :private (el: Elab e: Expr k: str kind: KwSite) -> ExprKind
+  (let ((ty (el-ty el e)))
+    (let ((arg (match ty ((TFn _ ps _) (if (= (count ps) 1) (nth ps 0) (ty-unit))) (_ (ty-unit))))
+          (ret (match ty ((TFn _ ps r) (if (= (count ps) 1) r (ty-unit))) (_ (ty-unit))))
+          (b (table-add (. (. el g) bindings) (BindingInfo "keyword-arg" BkParam (. e pos) nil))))
+      (do (set! (. (. el t) binding-types) (assoc @(. (. el t) binding-types) b arg))
+          (let ((x (el-node el (. e pos) (ELocal b) arg)))
+            (let ((rk (el-read el kind x k nil (. e pos) (. e id) ret)))
+              (let ((body (el-node el (. e pos) rk ret)))
+                (EFn (FnLit nil [(FnParam b nil)] nil body [])))))))))
+
+;; The read itself, of the type `ty`; `site` is the keyword's node, whose instantiation of
+;; `map-get` moves to the head made here.
+(defun el-read :private (el: Elab kind: KwSite x: Expr k: str dflt: (Option Expr) pos: Pos site: i64 ty: Ty) -> ExprKind
+  (if (= kind KwField)
+      (EField x k "the argument")
+      (let ((opt (if (some? dflt) (ty-nominal (el-option el) [ty]) ty))
+            (kw-ty (ty-scalar SKeyword)))
+        (let ((fty (TFn CSend [(el-ty el x) kw-ty] opt))
+              (hk (match (g-value (. el g) module-prelude "map-get")
+                    ((some r) (EGlobal r))
+                    (nil (ELit LitUnit)))))
+          (let ((head (el-node el pos hk fty)))
+            (do (when-some [i (get @(. (. el t) instantiations) site)]
+                  (set! (. (. el t) instantiations)
+                        (assoc (dissoc @(. (. el t) instantiations) site) (. head id) i)))
+                (let ((kw (el-node el pos (ELit (LitKeyword k)) kw-ty)))
+                  (let ((call (ECall head [(ArgExpr x) (ArgExpr kw)])))
+                    (match dflt
+                      (nil call)
+                      ((some d) (el-default el call d pos opt ty)))))))))))
+
+;; `(match <call> ((some v) v) (_ d))`
+(defun el-default :private (el: Elab call: ExprKind d: Expr pos: Pos opt: Ty ty: Ty) -> ExprKind
+  (let ((c (el-node el pos call opt)))
+    (let ((b (el-binding el ty pos)))
+      (let ((some-pat (Pattern pos (PCtor (el-option el) (some 1) [(Pattern pos (PBind b))]))))
+        (let ((local (el-node el pos (ELocal b) ty)))
+          (EMatch c [(clause some-pat local) (clause (wild pos) d)]))))))

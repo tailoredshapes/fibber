@@ -1,0 +1,50 @@
+;; compiler/types/infer/inst.fib: instantiating a scheme at a use (Rust infer/call.rs:68 instantiate).
+;; Split out of call.fib so that the solver's keyword constraint (types.infer.keyword) can
+;; instantiate `map-get` without a cycle through call.
+(ns types.infer.inst
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
+        types.ast types.decls types.infer.cx))
+
+;; `type argument a of f`.
+(defun send-root :private (s: Scheme t: Ty who: str) -> str
+  (match t
+    ((TGen i)
+     (str-join ["type argument "
+                (if (< i (count (. s var-names))) (nth (. s var-names) i) (str-join ["t" (show i)]))
+                " of " who]))
+    (_ (str-join ["a type argument of " who]))))
+
+;; The deferred constraint for the predicate `i` of the scheme at this use:
+;; the dispatch constraint of a method call is the first.
+(defun inst-pred-kind :private (s: Scheme p: Pred i: i64 who: str dispatch: (Option i64)) -> DKind
+  (match p
+    ((PProto q args) (DkProto q args dispatch))
+    ((PSend t) (DkSend t [(send-root s (match (nth (. s preds) i) ((PSend t0) t0) (_ (ty-unit))) who)]))
+    ((PObject t) (DkObject t who))
+    ((PWeakable t) (DkWeakable t))))
+
+;; The colour constraint of a scheme's bound at this use.
+(defun inst-colour-bound :private (cx: Cx b: ColourBound who: str pos: Pos) -> unit
+  (match b
+    ((BFlow a c)
+     (set! (. (. cx u) colours) (conj @(. (. cx u) colours) (ColourCon a c nil nil pos))))
+    ((BCaps k t)
+     (set! (. (. cx u) caps)
+           (conj @(. (. cx u) caps)
+                 (CapsCon k t (str-join ["a capture of a closure made by " who]) pos))))))
+
+;; Rust: infer/call.rs:68 instantiate. Instantiates `s` for the use `site` of
+;; `who`, emitting its context and colour constraints.
+(defun cx-instantiate (cx: Cx s: Scheme site: i64 who: str pos: Pos method: (Option i64)) -> Ty
+  (let ((tys (mapv (fn (i: i64) (cx-fresh cx)) (range (. s n-vars))))
+        (colours (mapv (fn (i: i64) (store-fresh-colour (. cx st))) (range (. s n-colours))))
+        (inst (scheme-instantiate-with s tys colours)))
+    (do (doseq [i (range (count (. inst preds)))]
+          (let ((dispatch (if (= i 0) method nil)))
+            (cx-defer cx (inst-pred-kind s (nth (. inst preds) i) i who dispatch) pos
+                      (if (nil? dispatch) nil (some site)))))
+        (doseq [b (. inst colour-bounds)] (inst-colour-bound cx b who pos))
+        (set! (. (. cx t) instantiations)
+              (assoc @(. (. cx t) instantiations) site (Instantiation tys colours)))
+        (set! (. (. cx u) insts) (conj @(. (. cx u) insts) site))
+        (. inst ty))))

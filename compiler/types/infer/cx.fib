@@ -26,7 +26,13 @@
 (defstruct Tables
   (expr-types: (Cell (Map i64 Ty)) binding-types: (Cell (Map i64 Ty))
    instantiations: (Cell (Map i64 Instantiation))
-   resolutions: (Cell (Map i64 Resolution)) fn-colours: (Cell (Map i64 Colour))))
+   resolutions: (Cell (Map i64 Resolution)) fn-colours: (Cell (Map i64 Colour))
+   kw-sites: (Cell (Map i64 KwSite))))
+
+;; What a keyword in function position reads (cx.rs KwSite, X6): a field of a struct, or a key
+;; of a `(Map keyword v)`. Read by the elaboration only.
+(defenum KwSite KwField KwMap)
+(derive Eq KwSite)
 
 ;; A constraint waiting for its types to be known (cx.rs:73, :86).
 (defenum DKind
@@ -37,9 +43,16 @@
   (DkField obj: Ty field: str result: Ty text: str)
   (DkDeref cell: Ty result: Ty text: str)
   (DkFloat ty: Ty)
+  ;; a keyword used as a function (X6, L14) at `site`: the argument `S`, the keyword, the result
+  ;; `R`, the default's type for `(:k x d)`
+  (DkKeyword site: i64 arg: Ty key: str result: Ty dflt: (Option Ty))
   ;; `[p..]` against a scrutinee not known yet: one type per element (cx.rs:107, X4)
   (DkVecPat s: Ty parts: (Vec Ty)))
 (defstruct Deferred (kind: DKind pos: Pos site: (Option i64) fun: str))
+
+;; What one attempt at solving a constraint did: solved (these constraints replace it) or not
+;; decidable yet (here, from solve.fib, for types.infer.keyword).
+(defenum Attempt (AtSolved new: (Vec Deferred)) AtStuck)
 
 ;; Why a type is not `Send`: the path to the offending type (cx.rs:107).
 (defstruct Witness (path: (Vec str) offending: Ty))
@@ -81,7 +94,7 @@
 
 (defun tables-new () -> Tables
   (Tables (cell (map-empty)) (cell (map-empty)) (cell (map-empty))
-          (cell (map-empty)) (cell (map-empty))))
+          (cell (map-empty)) (cell (map-empty)) (cell (map-empty))))
 
 (defun unit-new () -> Unit
   (Unit (cell []) (cell []) (cell []) (cell []) (cell (map-empty)) (cell (map-empty))
