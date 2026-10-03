@@ -31,7 +31,7 @@ mark() {
     raw-retained|release-raw) echo '@fib.release';; ptr-plus) echo '(getelementptr i8';;
     load-i8) echo '(load i8';; load-i16) echo '(load i16';; load-i32) echo '(load i32';; load-i64) echo '(load i64';;
     load-ptr) echo '(load ptr';; store-*) echo '(store ';;
-    read-file) echo '@fib.read-file';; write-file) echo '@fib.write-file';; starts-with) echo '@fib.str-starts-with';;
+    sys-*) echo "@fib.$1";; read-file) echo '@fib.read-file';; write-file) echo '@fib.write-file';; starts-with) echo '@fib.str-starts-with';;
     str-from-bytes) echo '@fib.str-from-array';; str-*) echo "@fib.$1";;
     *) echo '';;
   esac
