@@ -18,7 +18,20 @@ esac
 if [ "${#want}" -ne 64 ]; then echo "fetch-seed: sha256 in $seed is not 64 hex digits" >&2; exit 2; fi
 mkdir -p "$dir"
 tarball=$dir/seed.tar.gz
-curl -fsSL --retry 3 -o "$tarball" "$url" >&2
+# A private repository's release assets need credentials: with gh, ask GitHub for the asset of a github.com release URL
+# (OWNER/REPO/releases/download/TAG/FILE); otherwise (a public URL, any other host) curl does it.
+case $url in
+  https://github.com/*/releases/download/*) gh_ok=1 ;;
+  *) gh_ok= ;;
+esac
+if [ -n "$gh_ok" ] && command -v gh >/dev/null 2>&1; then
+  rest=${url#https://github.com/}
+  repo=${rest%%/releases/*}; rest=${rest#*/releases/download/}; tag=${rest%%/*}; file=${rest#*/}
+  rm -f "$tarball"
+  gh release download "$tag" -R "$repo" -p "$file" -O "$tarball" >&2
+else
+  curl -fsSL --retry 3 -o "$tarball" "$url" >&2
+fi
 got=$(sha256sum "$tarball" | cut -d' ' -f1)
 if [ "$got" != "$want" ]; then
   echo "fetch-seed: sha256 mismatch for $url: got $got, SEED says $want" >&2
