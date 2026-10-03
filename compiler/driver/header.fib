@@ -1,0 +1,173 @@
+;; compiler/driver/header.fib: the header of a case, as crates/fibref/src/cases/header.rs and header/labels.rs (spec/method.md rule 3,
+;; cases/stdlib/README.md): the run of `;; key: value` lines at the top of the file, validated against its verdict (`accept` has `result`
+;; and `audit`, `reject` an `error`, `trap` a `trap`), with the optional `allocs`, `roots`, `covers` and `open`. A header that does not
+;; parse is a `CsHdrError` (the line and the words of the Rust's Display), never a verdict.
+;; Shapes decided: `allocs` is -1 when the header gives none; the verdict's audit is the word (`clean` or `leak-cycle`) as a bool
+;; `clean`; `roots` are already joined to the case's directory (`case_roots`).
+(ns driver.header
+  (:require [fib.string :as s])
+  (:use expand.roots))
+
+;; Why a header is refused: the 1-based line (0 when the file could not be read) and the words.
+(defstruct CsHdrError (line: i64 msg: str))
+
+;; One `;; key: value` line.
+(defstruct CsField (key: str value: str line: i64))
+
+;; The verdict a header fixes. Rust: header.rs Verdict
+(defenum CsVerdict
+  (CsAccept result: i64 clean: bool allocs: i64)
+  (CsReject error: str)
+  (CsTrap trap: str))
+
+;; A parsed header. `open` are the §7 items that excuse a failing `accept` case.
+(defstruct CsHeader (spec: str verdict: CsVerdict roots: (Vec str) open: (Vec str)))
+
+(def known-keys: (Vec str) ["spec" "expect" "result" "audit" "allocs" "roots" "error" "trap" "covers" "open"])
+
+(defun key-char? :private (b: i32) -> bool
+  (or (and (>= b 48i32) (<= b 57i32)) (and (>= b 65i32) (<= b 90i32)) (and (>= b 97i32) (<= b 122i32)) (= b 45i32) (= b 95i32)))
+
+;; Whether every byte of s is one of `ok`'s, and there is one.
+(defun all-bytes? :private (t: str ok: (fn (i32) bool) :borrow) -> bool
+  (and (> (str-len t) 0)
+       (loop ((i 0))
+         (cond (>= i (str-len t)) true
+               (not (ok (zext i32 (str-byte-at t i)))) false
+               :else (recur (+ i 1))))))
+
+;; A `;; key: value` line as its key and trimmed value; any other line ends the header. Rust: header.rs `header_line`
+(defun header-line :private (line: str) -> (Option (Pair str str))
+  (if (starts-with? line ";;")
+      (let ((rest (s/triml (str-slice line 2 (str-len line)))))
+        (match (s/index-of rest ":")
+          (nil nil)
+          ((some i)
+           (let ((k (str-slice rest 0 i)))
+             (if (all-bytes? k key-char?)
+                 (some (Pair k (s/trim (str-slice rest (+ i 1) (str-len rest)))))
+                 nil)))))
+      nil))
+
+(defun find-field :private (fields: (Vec CsField) key: str) -> (Option CsField)
+  (first (filter (fn (f: CsField) (= (. f key) key)) fields)))
+
+(defun hdr-err :private (line: i64 msg: str) -> CsHdrError (CsHdrError line msg))
+
+;; The header lines at the top of `source`, an unknown or repeated key refused as it is met. Rust: header.rs `collect`
+(defun collect :private (source: str) -> (Result (Vec CsField) CsHdrError)
+  (let ((lines (s/split-lines source)))
+    (loop ((i 0) (fields []))
+      (match (if (< i (count lines)) (header-line (nth lines i)) nil)
+        (nil (if (empty? fields)
+                 (Err (hdr-err 1 "empty header: line 1 is not `;; key: value`"))
+                 (Ok fields)))
+        ((some kv)
+         (let ((k (. kv fst)))
+           (cond (empty? (filter (fn (n: str) (= n k)) known-keys))
+                   (Err (hdr-err (+ i 1) (str-join ["unknown header key `" k "`"])))
+                 (some? (find-field fields k))
+                   (Err (hdr-err (+ i 1) (str-join ["duplicate header key `" k "`"])))
+                 :else (recur (+ i 1) (conj fields (CsField k (. kv snd) (+ i 1)))))))))))
+
+(defun end-line :private (fields: (Vec CsField)) -> i64
+  (. (nth fields (- (count fields) 1)) line))
+
+(defun bad-value :private (f: CsField) -> CsHdrError
+  (hdr-err (. f line) (str-join ["bad value `" (. f value) "` for header key `" (. f key) "`"])))
+
+;; The field of a required key whose value `ok` accepts. Rust: header.rs `Fields::parsed`
+(defun checked :private (fields: (Vec CsField) key: str ok: (fn (str) bool) :borrow) -> (Result CsField CsHdrError)
+  (match (find-field fields key)
+    (nil (Err (hdr-err (end-line fields) (str-join ["missing required header key `" key "`"]))))
+    ((some f) (if (ok (. f value)) (Ok f) (Err (bad-value f))))))
+
+(defun forbid :private (fields: (Vec CsField) key: str) -> (Result unit CsHdrError)
+  (match (find-field fields key)
+    (nil (Ok ()))
+    ((some f) (Err (hdr-err (. f line) (str-join ["header key `" key "` is not allowed for this verdict"]))))))
+
+(defun forbid-all :private (fields: (Vec CsField) keys: (Vec str)) -> (Result unit CsHdrError)
+  (loop ((i 0))
+    (if (>= i (count keys))
+        (Ok ())
+        (match (forbid fields (nth keys i))
+          ((Err e) (Err e))
+          ((Ok _) (recur (+ i 1)))))))
+
+(defun digit? :private (b: i32) -> bool (and (>= b 48i32) (<= b 57i32)))
+
+;; The maximum of an `allocs` value `<= N` (decimal digits only), or -1. Rust: header.rs `allocs_maximum`
+(defun allocs-max :private (v: str) -> i64
+  (if (starts-with? v "<=")
+      (let ((digits (s/triml (str-slice v 2 (str-len v)))))
+        (if (all-bytes? digits digit?) (unwrap-or (parse-long digits) -1) -1))
+      -1))
+
+(defun nonempty? :private (v: str) -> bool (not (= v "")))
+
+(defun allocs-of :private (fields: (Vec CsField)) -> (Result i64 CsHdrError)
+  (if (some? (find-field fields "allocs"))
+      (try-let ((f (checked fields "allocs" (fn (v: str) (>= (allocs-max v) 0)))))
+        (Ok (allocs-max (. f value))))
+      (Ok -1)))
+
+(defun accept :private (fields: (Vec CsField)) -> (Result CsVerdict CsHdrError)
+  (try-let ((r (checked fields "result" (fn (v: str) (some? (parse-long v)))))
+            (a (checked fields "audit" (fn (v: str) (or (= v "clean") (= v "leak-cycle")))))
+            (n (allocs-of fields))
+            (_ (forbid-all fields ["error" "trap"])))
+    (Ok (CsAccept (unwrap-or (parse-long (. r value)) 0) (= (. a value) "clean") n))))
+
+(defun reject :private (fields: (Vec CsField)) -> (Result CsVerdict CsHdrError)
+  (try-let ((e (checked fields "error" nonempty?))
+            (_ (forbid-all fields ["result" "audit" "allocs" "trap" "open"])))
+    (Ok (CsReject (. e value)))))
+
+(defun trap :private (fields: (Vec CsField)) -> (Result CsVerdict CsHdrError)
+  (try-let ((t (checked fields "trap" nonempty?))
+            (_ (forbid-all fields ["result" "audit" "allocs" "error" "open"])))
+    (Ok (CsTrap (. t value)))))
+
+;; The names a list key holds, each once; `open` may not be empty. Rust: header/labels.rs `names`
+(defun names :private (fields: (Vec CsField) key: str may-be-empty: bool) -> (Result (Vec str) CsHdrError)
+  (match (find-field fields key)
+    (nil (Ok []))
+    ((some f)
+     (let ((words (vec (filter nonempty? (s/split (. f value) " ")))))
+       (if (or (not (= (count words) (count (set words)))) (and (empty? words) (not may-be-empty)))
+           (Err (bad-value f))
+           (Ok words))))))
+
+;; The directory of a path ("" for a bare name).
+(defun dirname :private (path: str) -> str
+  (loop ((i (- (str-len path) 1)))
+    (cond (< i 0) ""
+          (= (str-byte-at path i) 47i8) (str-slice path 0 i)
+          :else (recur (- i 1)))))
+
+;; The library roots a header names, joined to the case's directory. Rust: header.rs `case_roots`
+(defun case-roots :private (fields: (Vec CsField) path: str) -> (Result (Vec str) CsHdrError)
+  (match (find-field fields "roots")
+    (nil (Ok []))
+    ((some f)
+     (let ((dirs (vec (filter nonempty? (s/split (. f value) " ")))))
+       (if (empty? dirs)
+           (Err (bad-value f))
+           (Ok (mapv (fn (d: str) (path-join (dirname path) d)) dirs)))))))
+
+(defun verdict-of :private (fields: (Vec CsField) expect: str) -> (Result CsVerdict CsHdrError)
+  (cond (= expect "accept") (accept fields)
+        (= expect "reject") (reject fields)
+        :else (trap fields)))
+
+;; The header at the top of `source`, read from `path`. Rust: header.rs `parse_header`, `case_roots`, labels `parse_labels`
+(defun parse-header (path: str source: str) -> (Result CsHeader CsHdrError)
+  (try-let ((fields (collect source))
+            (sp (checked fields "spec" nonempty?))
+            (ex (checked fields "expect" (fn (v: str) (or (= v "accept") (= v "reject") (= v "trap")))))
+            (verdict (verdict-of fields (. ex value)))
+            (_ (names fields "covers" true))
+            (open (names fields "open" false))
+            (roots (case-roots fields path)))
+    (Ok (CsHeader (. sp value) verdict roots open))))

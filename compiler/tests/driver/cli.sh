@@ -21,7 +21,8 @@ echo '(extern lair_hook1_address () -> i64)
 ck "help prints the usage and exits 0" "$($s2 help | head -1; echo $?)" "$(printf 'usage: fibc <command>\n0')"
 $s2 > /dev/null 2>&1; ck "no command: exit 2" $? 2
 $s2 bogus > /dev/null 2>&1; ck "an unknown command: exit 2" $? 2
-ck "cases is the Rust compiler's" "$($s2 cases 2>&1; echo $?)" "$(printf 'fibc: `cases` is a command of the Rust compiler (the test harness)\n2')"
+ck "cases of a missing directory: exit 2" "$($s2 cases "$t/nodir" 2>&1; echo $?)" "$(printf 'fibc: cannot read cases in %s/nodir: No such file or directory (os error 2)\n2' "$t")"
+ck "gen is the Rust compiler's" "$($s2 gen 2>&1; echo $?)" "$(printf 'fibc: `gen` is a command of the Rust compiler (the test harness)\n2')"
 $s2 -I x help > /dev/null 2>&1; ck "-I with a command that reads no program: exit 2" $? 2
 ck "an unreadable file: the operating system's words, exit 2" "$($s2 emit "$t/nonexist.fib" 2>&1; echo $?)" "$(printf 'fibc: cannot read %s/nonexist.fib: No such file or directory (os error 2)\n2' "$t")"
 ck "a directory is not a program" "$($s2 emit "$t" 2>&1; echo $?)" "$(printf 'fibc: cannot read %s: Is a directory (os error 21)\n2' "$t")"

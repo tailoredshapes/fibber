@@ -1,0 +1,124 @@
+;; compiler/driver/child.fib: the compiled run of a case, as crates/fibc/src/harness/child.rs (spec/compiler.md §5 step 3): this very
+;; executable run as `fibc run --trace -I ROOT.. FILE` in a child process with its standard output and error in files, and what its exit
+;; status and streams say: 0 and the last line of standard output the result, 3 `rejected:` and the message, 4 `unsupported: REASON`,
+;; 134 `trap: MESSAGE`, anything else a failure. Added: the audit (driver.verdict's note) is read from the free trace on standard error.
+;; The child keeps FIB_LIB (the Rust one removes it, its library being embedded); a run is limited to 300 seconds by an alarm.
+(ns driver.child
+  (:require [fib.string :as s] [driver.proc :as p])
+  (:use driver.verdict))
+
+(def limit-secs: i64 300)
+
+;; The trace of a run read byte by byte (a run can print a million lines, and a line split and parsed as text costs far more than
+;; this scan) in one loop, so the set of live objects is updated in place: the objects allocated and not freed, the `A` lines, the frees
+;; that were wrong, and the number `k` of the last `I k` marker (what the initialisers of a program made, which the trace numbers
+;; from). A line that is not exactly `A n k`, `F n` or `I k` is not read. Rust: trace.rs `parse_line`, `after_init`
+(defstruct Tally (leaks: i64 allocs: i64 errors: (Vec str)))
+
+(defun byte-at :private (t: str i: i64) -> i8 (str-byte-at t i))
+
+;; The end of the line that starts at `from`: the index of its newline, or the length.
+(defun line-end :private (t: str from: i64) -> i64
+  (loop ((i from))
+    (if (or (>= i (str-len t)) (= (byte-at t i) 10i8)) i (recur (+ i 1)))))
+
+;; The end of the run of decimal digits from `from` to `limit`.
+(defun digits-end :private (t: str from: i64 limit: i64) -> i64
+  (loop ((i from))
+    (if (and (< i limit) (>= (byte-at t i) 48i8) (<= (byte-at t i) 57i8)) (recur (+ i 1)) i)))
+
+(defun digits-value :private (t: str from: i64 to: i64) -> i64
+  (loop ((i from) (n 0))
+    (if (< i to) (recur (+ i 1) (+ (* n 10) (- (sext i64 (byte-at t i)) 48))) n)))
+
+;; The number of the line at `pos` (its first byte `c`, its end `nl`) when it is `c n` followed by `tail` (what an `A` has after
+;; its number: ` o`, ` c` or ` a`) or nothing; -1 otherwise.
+(defun number-of :private (t: str pos: i64 nl: i64 a-line: bool) -> i64
+  (let ((from (+ pos 2))
+        (e (digits-end t (+ pos 2) nl)))
+    (cond (or (= e from) (> (- e from) 17) (not (= (byte-at t (+ pos 1)) 32i8))) -1
+          (not a-line) (if (= e nl) (digits-value t from e) -1)
+          (and (= (+ e 2) nl) (= (byte-at t e) 32i8)
+               (or (= (byte-at t (+ e 1)) 111i8) (= (byte-at t (+ e 1)) 99i8) (= (byte-at t (+ e 1)) 97i8)))
+            (digits-value t from e)
+          :else -1)))
+
+(defun grown :private (marks: (Vec i64) size: i64) -> (Vec i64)
+  (loop ((m marks))
+    (if (< (count m) size) (recur (conj m 0)) m)))
+
+;; `marks` holds 1 at the id of each live object (a Set of a million ids is far slower than an indexed vector), `live` their number.
+(defun tally-of :private (stderr: str) -> Tally
+  (let ((len (str-len stderr)))
+    (loop ((pos 0) (marks (vec-empty)) (live 0) (allocs 0) (errors []) (k 0))
+      (if (>= pos len)
+          (Tally live allocs errors)
+          (let ((nl (line-end stderr pos))
+                (c (byte-at stderr pos))
+                (n (if (and (< (+ pos 1) nl) (or (= c 65i8) (= c 70i8) (= c 73i8))) (number-of stderr pos nl (= c 65i8)) -1))
+                (id (max 0 (- n k))))
+            (cond (< n 0) (recur (+ nl 1) marks live allocs errors k)
+                  (= c 73i8) (recur (+ nl 1) (vec-empty) 0 0 [] n)
+                  (= c 65i8) (let ((m (assoc (grown marks (+ id 1)) id 1)))
+                               (recur (+ nl 1) m (+ live 1) (+ allocs 1) errors k))
+                  (<= n k) (recur (+ nl 1) marks live allocs errors k)
+                  (and (< id (count marks)) (= (nth marks id) 1)) (recur (+ nl 1) (assoc marks id 0) (- live 1) allocs errors k)
+                  :else (recur (+ nl 1) marks live allocs (conj errors (str-concat "free of an object not live: F " (show n))) k)))))))
+
+;; Whether a line is a trace line: `A n k`, `S n k`, `F n`, `D n` or `T`. Rust: trace.rs `parse_line`
+(defun trace-line? :private (line: str) -> bool
+  (let ((w (s/split line " "))
+        (head (if (empty? w) "" (nth w 0)))
+        (num (and (>= (count w) 2) (some? (parse-long (nth w 1))))))
+    (cond (empty? w) false
+          (or (= head "A") (= head "S")) (and (= (count w) 3) num (or (= (nth w 2) "o") (= (nth w 2) "c") (= (nth w 2) "a")))
+          (or (= head "F") (= head "D")) (and (= (count w) 2) num)
+          :else (and (= head "T") (= (count w) 1)))))
+
+;; The standard error without its trace lines. Rust: child.rs `untraced`
+(defun untraced :private (stderr: str) -> str
+  (str-join (mapv (fn (l: str) (str-concat l "\n")) (filter (fn (l: str) (not (trace-line? l))) (s/split-lines stderr)))))
+
+;; The text after the first line that starts with `prefix`.
+(defun after-line :private (text: str prefix: str) -> (Option str)
+  (match (first (filter (fn (l: str) (starts-with? l prefix)) (s/split-lines text)))
+    (nil nil)
+    ((some l) (some (str-slice l (str-len prefix) (str-len l))))))
+
+;; The text after the first `prefix` anywhere, trimmed.
+(defun tail-after :private (text: str prefix: str) -> (Option str)
+  (match (s/index-of text prefix)
+    (nil nil)
+    ((some i) (some (s/trim (str-slice text (+ i (str-len prefix)) (str-len text)))))))
+
+(defun finished :private (stdout: str stderr: str) -> CsOutcome
+  (let ((lines (s/split-lines (s/trim stdout)))
+        (n (if (empty? lines) nil (parse-long (s/trim (nth lines (- (count lines) 1)))))))
+    (match n
+      (nil (OutFailed (str-concat "exit 0 but no result on standard output: " (pr-str stdout))))
+      ((some r) (let ((t (tally-of stderr))) (OutCompiled r (CsAudit (. t leaks) (. t errors)) (. t allocs)))))))
+
+;; What the child's status and streams say. Rust: child.rs `interpret`
+(defun interpret :private (status: i64 stdout: str stderr: str) -> CsOutcome
+  (cond (= status 0) (finished stdout stderr)
+        (= status 3) (OutRejected (unwrap-or (tail-after stderr "rejected:") ""))
+        (= status 4) (OutUnsupported (unwrap-or (after-line stderr "unsupported: ") ""))
+        (= status 134) (match (after-line stderr "trap: ")
+                         ((some m) (OutTrapped m))
+                         (nil (OutFailed (str-concat "aborted without a trap message: " stderr))))
+        (= status 142) (OutFailed (str-join ["timed out after " (show limit-secs) "s"]))
+        :else (OutFailed (str-join ["exit status " (show status) ": " (s/trim (untraced stderr))]))))
+
+(defun child-argv :private (path: str roots: (Vec str)) -> (Vec str)
+  (conj (reduce (fn (acc: (Vec str) r: str) (conj (conj acc "-I") r)) ["fibc" "run" "--trace"] roots) path))
+
+;; The compiled outcome of the case at `path` with library roots `roots`, the child's streams going to files in the directory `tmp`.
+(defun run-in (path: str roots: (Vec str) tmp: str) -> CsOutcome
+  (let ((out (str-concat tmp "/out"))
+        (err (str-concat tmp "/err"))
+        (status (p/spawn-wait (child-argv path roots) out err limit-secs))
+        (stdout (unwrap-or (read-file out) ""))
+        (stderr (unwrap-or (read-file err) "")))
+    (do (p/remove-file out)
+        (p/remove-file err)
+        (if (< status 0) (OutFailed "cannot run this executable") (interpret status stdout stderr)))))

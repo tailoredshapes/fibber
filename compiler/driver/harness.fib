@@ -1,0 +1,142 @@
+;; compiler/driver/harness.fib: `cases DIR [--only PREFIX..]`, the case harness in fibber, as crates/fibref/src/cases/runner.rs
+;; (`list_cases`, `select_cases`, `run_case`), table.rs (`render`) and crates/fibc/src/main.rs `cases`: every `*.fib` directly inside DIR
+;; (and the `main.fib` of each subdirectory that has one, a program of several modules) in file-name order, each judged by its header
+;; against its compiled run (driver.child, driver.verdict), then the table and the counts, exit 1 if a case failed or a header did not
+;; parse, 2 for a directory that cannot be read or a prefix no case starts with. Shapes decided: the rows and the counts line are the
+;; Rust's, byte for byte; each case is run once (compiled, in a child process), where the Rust harness runs the interpreter too.
+(ns driver.harness
+  (:require [fib.string :as s] [driver.proc :as p] [driver.child :as c] [driver.native :as native])
+  (:use expand.roots driver.header driver.verdict))
+
+(def default-dir: str "cases/ownership")
+
+;; A case: the path to run, the key a prefix is matched and the list sorted by (the file name, or the directory's for a `main.fib`),
+;; and the name shown. Rust: runner.rs `case_key`, `CaseResult::name`
+(defstruct Case (path: str key: str name: str))
+
+(defun file-case :private (dir: str name: str) -> Case
+  (Case (path-join dir name) name name))
+
+(defun main-case :private (dir: str name: str) -> Case
+  (Case (path-join (path-join dir name) "main.fib") name (str-concat name "/main.fib")))
+
+;; The case an entry of the directory is, if it is one: a `*.fib` that is not a directory, or a directory with a `main.fib`.
+;; Rust: runner.rs `list_cases`, `is_case`
+(defun entry-main :private (dir: str e: p/Entry) -> (Option Case)
+  (if (and (. e dir) (some? (read-file (path-join (path-join dir (. e name)) "main.fib"))))
+      (some (main-case dir (. e name)))
+      nil))
+
+(defun entry-any :private (dir: str e: p/Entry) -> (Option Case)
+  (cond (and (. e dir) (not (s/ends-with? (. e name) ".fib"))) (entry-main dir e)
+        (s/ends-with? (. e name) ".fib")
+          (if (some? (read-file (path-join dir (. e name)))) (some (file-case dir (. e name))) (entry-main dir e))
+        :else nil))
+
+;; The cases of `dir`, sorted by key; nil if it cannot be read.
+(defun list-cases (dir: str) -> (Option (Vec Case))
+  (match (p/list-dir dir)
+    (nil nil)
+    ((some es) (some (vec (sort-by (fn (c: Case) (. c key)) (keep (fn (e: p/Entry) (entry-any dir e)) es)))))))
+
+;; The cases whose key starts with one of `prefixes`; or the first prefix that no case starts with. Rust: runner.rs `select_cases`
+(defun select-cases (cases: (Vec Case) prefixes: (Vec str)) -> (Result (Vec Case) str)
+  (if (empty? prefixes)
+      (Ok cases)
+      (match (first (filter (fn (p: str) (not (some? (first (filter (fn (c: Case) (starts-with? (. c key) p)) cases))))) prefixes))
+        ((some p) (Err p))
+        (nil (Ok (vec (filter (fn (c: Case) (some? (first (filter (fn (p: str) (starts-with? (. c key) p)) prefixes)))) cases)))))))
+
+;; The status of the case at `path`: its header, its compiled run, the verdict. Rust: harness/mod.rs `run_case`
+(defun run-case (path: str tmp: str) -> CsStatus
+  (match (read-file path)
+    (nil (StHeader 0 (str-concat "cannot read case: " (. (native/fault-of path) text))))
+    ((some source)
+     (match (parse-header path source)
+       ((Err e) (StHeader (. e line) (. e msg)))
+       ((Ok h) (judge h (c/run-in path (. h roots) tmp)))))))
+
+(defstruct Row (name: str label: str detail: str status: CsStatus))
+
+;; A detail on one line: its lines trimmed and joined with ` | `, blank ones dropped. Rust: table.rs `one_line`
+(defun one-line :private (detail: str) -> str
+  (str-join (vec (interpose " | " (filter (fn (l: str) (not (= l ""))) (mapv s/trim (s/split-lines detail)))))))
+
+(defun pad :private (text: str width: i64) -> str
+  (loop ((out text))
+    (if (< (str-len out) width) (recur (str-concat out " ")) out)))
+
+(defun widest :private (rows: (Vec Row) f: (fn (Row) i64) :borrow floor: i64) -> i64
+  (reduce (fn (m: i64 r: Row) (max m (f r))) floor rows))
+
+;; The counts of each status, in order: pass, fail, pending, header error, open.
+(defstruct Counts (pass: i64 fail: i64 pending: i64 header: i64 open: i64))
+
+(defun count-status :private (n: Counts st: CsStatus) -> Counts
+  (match st
+    ((StPass) (Counts (+ (. n pass) 1) (. n fail) (. n pending) (. n header) (. n open)))
+    ((StFail _) (Counts (. n pass) (+ (. n fail) 1) (. n pending) (. n header) (. n open)))
+    ((StOpenPassed) (Counts (. n pass) (+ (. n fail) 1) (. n pending) (. n header) (. n open)))
+    ((StPending _) (Counts (. n pass) (. n fail) (+ (. n pending) 1) (. n header) (. n open)))
+    ((StHeader _ _) (Counts (. n pass) (. n fail) (. n pending) (+ (. n header) 1) (. n open)))
+    ((StOpen _) (Counts (. n pass) (. n fail) (. n pending) (. n header) (+ (. n open) 1)))))
+
+(defun total :private (n: Counts) -> i64 (+ (+ (+ (. n pass) (. n fail)) (+ (. n pending) (. n header))) (. n open)))
+
+;; The lines under the table. Rust: table.rs `render_counts`
+(defun render-counts :private (n: Counts) -> str
+  (let ((all (total n)))
+    (str-join
+      [(str-join ["\n" (show all) " cases: " (show (. n pass)) " pass, " (show (. n fail)) " fail, " (show (. n pending)) " pending, "
+                  (show (. n header)) " header error" (if (> (. n open) 0) (str-concat ", " (str-concat (show (. n open)) " open")) "") "\n"])
+       (if (> (. n open) 0)
+           (str-join ["OPEN: " (show (. n open)) " of " (show all) " cases fail as their `open` label says; an open case is not a pass.\n"])
+           "")
+       (if (> (. n pending) 0)
+           (str-join ["PENDING: " (show (. n pending)) " of " (show all) " cases did not run; pending is not a pass.\n"])
+           "")])))
+
+(defun render-row :private (r: Row nw: i64 lw: i64) -> str
+  (str-concat (s/trimr (str-join [(pad (. r name) nw) "  " (pad (. r label) lw) "  " (. r detail)])) "\n"))
+
+;; The table and the counts. Rust: table.rs `render`
+(defun render (rows: (Vec Row)) -> str
+  (let ((nw (widest rows (fn (r: Row) (str-len (. r name))) 4))
+        (lw (widest rows (fn (r: Row) (str-len (. r label))) 6))
+        (n (reduce (fn (k: Counts r: Row) (count-status k (. r status))) (Counts 0 0 0 0 0) rows)))
+    (str-join [(str-concat (pad "case" nw) (str-concat "  " (str-concat (pad "status" lw) "  detail\n")))
+               (str-join (mapv (fn (r: Row) (render-row r nw lw)) rows))
+               (render-counts n)])))
+
+(defun row-of :private (cs: Case st: CsStatus) -> Row
+  (Row (one-line (. cs name)) (status-label st) (one-line (status-detail st)) st))
+
+;; Whether the run is a pass: a case at least, none failed, no header refused.
+(defun ok? :private (rows: (Vec Row)) -> bool
+  (let ((n (reduce (fn (k: Counts r: Row) (count-status k (. r status))) (Counts 0 0 0 0 0) rows)))
+    (and (> (total n) 0) (= (. n fail) 0) (= (. n header) 0))))
+
+(defun run-all :private (cases: (Vec Case) tmp: str) -> (Vec Row)
+  (mapv (fn (cs: Case) (row-of cs (run-case (. cs path) tmp))) cases))
+
+(defun tmp-base :private () -> str
+  (unwrap-or (native/getenv-opt "TMPDIR") "/tmp"))
+
+(defun report :private (cases: (Vec Case) dir: str tmp: str) -> i64
+  (let ((rows (run-all cases tmp)))
+    (do (p/remove-dir tmp)
+        (when (empty? rows) (eprintln (str-join ["fibc: no case files in " dir "; a run with nothing to run is not a pass"])))
+        (let ((w (native/write-stdout (render rows))))
+          (if (= w 0) (if (ok? rows) 0 1) w)))))
+
+;; `cases DIR [--only PREFIX..]`. Rust: main.rs:292 `cases`
+(defun cmd-cases (dir: str only: (Vec str)) -> i64
+  (match (list-cases dir)
+    (nil (do (eprintln (str-join ["fibc: cannot read cases in " dir ": " (. (native/fault-of dir) text)])) 2))
+    ((some all)
+     (match (select-cases all only)
+       ((Err prefix) (do (eprintln (str-join ["fibc: no case matches " prefix " in " dir])) 2))
+       ((Ok cases)
+        (match (p/make-temp-dir (tmp-base))
+          (nil (do (eprintln "fibc: cannot make a scratch directory") 2))
+          ((some tmp) (report cases dir tmp))))))))

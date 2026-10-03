@@ -1,0 +1,95 @@
+;; compiler/driver/proc.fib: what the case harness (driver.harness) asks of the operating system through the C library, as the standard
+;; library of Rust gave crates/fibc/src/harness/child.rs and fibref's cases runner: the entries of a directory, a scratch directory,
+;; and a child process (this very executable, `/proc/self/exe`) run with its standard output and error in files, with a time limit.
+;; S5's `sys-*` builtins are not in stage 2, so these are `extern`s as driver.native's are. Linux and glibc: `/proc/self/exe`, the layout
+;; of `struct dirent` (d_type at 18, d_name at 19).
+(ns driver.proc
+  (:require [lair.ffi :as ffi]))
+
+(extern fork :private () -> i32)
+(extern execv :private (ptr ptr) -> i32)
+(extern dup2 :private (i32 i32) -> i32)
+(extern creat :private (ptr i32) -> i32)
+(extern close :private (i32) -> i32)
+(extern waitpid :private (i32 ptr i32) -> i32)
+(extern _exit :private (i32) -> unit)
+(extern alarm :private (i32) -> i32)
+(extern mkdtemp :private (ptr) -> ptr)
+(extern unlink :private (ptr) -> i32)
+(extern rmdir :private (ptr) -> i32)
+(extern opendir :private (ptr) -> ptr)
+(extern closedir :private (ptr) -> i32)
+(extern readdir :private (ptr) -> ptr)
+
+;; The offsets in a glibc `struct dirent` of its type byte and its name, and the type of a directory.
+(def dirent-type: i64 18)
+(def dirent-name: i64 19)
+(def dt-dir: i8 4i8)
+
+;; An entry of a directory: its name and whether it is a directory (or of unknown type, which the caller looks into).
+(defstruct Entry (name: str dir: bool))
+
+(defun entry-at :private (a: i64) -> Entry
+  (let ((t (unsafe (load-i8 (ptr+ (ffi/addr->ptr a) dirent-type)))))
+    (Entry (ffi/c-string-at (+ a dirent-name)) (or (= t dt-dir) (= t 0i8)))))
+
+;; The entries of `dir` but `.` and `..`, in no order; nil if it cannot be opened.
+(defun list-dir (dir: str) -> (Option (Vec Entry))
+  (let ((p (ffi/bytes-new dir))
+        (d (unsafe (ffi/ptr->addr (opendir p)))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (= d 0)
+            nil
+            (let ((dp (ffi/addr->ptr d))
+                  (found (loop ((acc []))
+                           (let ((e (unsafe (ffi/ptr->addr (readdir dp)))))
+                             (if (= e 0)
+                                 acc
+                                 (let ((en (entry-at e)))
+                                   (recur (if (or (= (. en name) ".") (= (. en name) "..")) acc (conj acc en)))))))))
+              (do (unsafe (closedir dp)) (some found)))))))
+
+;; The exit status as `waitpid`'s word says it: the code of a process that exited, 128 and the signal of one that was killed.
+(defun decode-status :private (w: i64) -> i64
+  (if (= (bit-and w 127) 0) (bit-and (quot w 256) 255) (+ 128 (bit-and w 127))))
+
+;; A new directory under `base`, its name made by mkdtemp.
+(defun make-temp-dir (base: str) -> (Option str)
+  (let ((t (ffi/bytes-new (str-concat base "/fibcases-XXXXXX")))
+        (r (unsafe (ffi/ptr->addr (mkdtemp t))))
+        (name (if (= r 0) nil (some (ffi/c-string-at r)))))
+    (do (ffi/free-addr (ffi/ptr->addr t)) name)))
+
+(defun remove-file (path: str) -> unit
+  (let ((p (ffi/bytes-new path)))
+    (do (unsafe (unlink p)) (ffi/free-addr (ffi/ptr->addr p)))))
+
+(defun remove-dir (path: str) -> unit
+  (let ((p (ffi/bytes-new path)))
+    (do (unsafe (rmdir p)) (ffi/free-addr (ffi/ptr->addr p)))))
+
+;; In the child: standard output and error to the files, the alarm set, this executable run with `argv`.
+(defun become :private (pp: ptr av: ptr fo: i32 fe: i32 secs: i64) -> i64
+  (unsafe
+    (do (dup2 fo 1i32) (dup2 fe 2i32) (alarm (trunc i32 secs)) (execv pp av) (_exit 127i32) 0)))
+
+;; This executable run with the words `argv` (the first is its name), standard output to the file `out` and standard error to `err`,
+;; killed by SIGALRM after `secs` seconds (status 142); its exit status, or -1 if there was no process.
+(defun spawn-wait (argv: (Vec str) out: str err: str secs: i64) -> i64
+  (let ((po (ffi/bytes-new out))
+        (pe (ffi/bytes-new err))
+        (pp (ffi/bytes-new "/proc/self/exe"))
+        (cs (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) argv))
+        (av (ffi/words-new cs))
+        (st (ffi/slot-new))
+        (status (unsafe
+                  (let ((fo (creat po 384i32))
+                        (fe (creat pe 384i32))
+                        (pid (fork)))
+                    (cond (< pid 0i32) -1
+                          (= pid 0i32) (become pp av fo fe secs)
+                          :else (do (close fo) (close fe) (waitpid pid st 0i32)
+                                    (decode-status (sext i64 (load-i32 st)))))))))
+    (do (doseq [c cs] (ffi/free-addr c))
+        (doseq [p [(ffi/ptr->addr po) (ffi/ptr->addr pe) (ffi/ptr->addr pp) (ffi/ptr->addr av) (ffi/ptr->addr st)]] (ffi/free-addr p))
+        status)))

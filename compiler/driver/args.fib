@@ -35,11 +35,18 @@ build defaults to 2, run to 0.
   explain <file>         print the ownership checker's decisions (types §9)
   help                   print this message
 
-itrace, cases and gen are commands of the Rust compiler (the test harness).")
+  cases [dir [--only prefix..]]
+                         run each case of dir (default cases/ownership) against the verdict
+                         in its header, compiled, and print the table; exit 1 if one failed
+
+itrace and gen are commands of the Rust compiler (the test harness).")
 
 ;; The LLVM optimisation level of `run` without `-O`, and of `build`. Rust: command.rs RUN_OPT_LEVEL, BUILD_OPT_LEVEL
 (def run-opt-level: i64 0)
 (def build-opt-level: i64 2)
+
+;; The directory `cases` runs without one. Rust: command.rs DEFAULT_CASES_DIR
+(def default-cases-dir: str "cases/ownership")
 
 ;; What the command line asks for. Rust: command.rs:81 Command
 (defenum Command
@@ -49,6 +56,7 @@ itrace, cases and gen are commands of the Rust compiler (the test harness).")
   (CmdEmitDump opts: EmitOptions files: (Vec str))
   (CmdExplain file: str)
   (CmdHarness word: str)
+  (CmdCases dir: str only: (Vec str))
   (CmdHelp)
   (CmdInvalid))
 
@@ -162,6 +170,9 @@ itrace, cases and gen are commands of the Rust compiler (the test harness).")
                                  ((some p) (CmdEmitDump (. p opts) (. p files))))
           (and (= head "explain") (= n 2)) (CmdExplain (nth words 1))
           (and (= head "itrace") (= n 2)) (CmdHarness head)
-          (in? head ["cases" "gen"]) (CmdHarness head)
+          (and (= head "cases") (= n 1)) (CmdCases default-cases-dir [])
+          (and (= head "cases") (= n 2)) (CmdCases (nth words 1) [])
+          (and (= head "cases") (> n 3) (= (nth words 2) "--only")) (CmdCases (nth words 1) (vec (drop 3 words)))
+          (= head "gen") (CmdHarness head)
           (and (= n 1) (in? head ["help" "--help" "-h"])) CmdHelp
           :else CmdInvalid)))

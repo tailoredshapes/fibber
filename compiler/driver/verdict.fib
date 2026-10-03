@@ -1,0 +1,134 @@
+;; compiler/driver/verdict.fib: what a case's header expects against what its compiled run did, as crates/fibref/src/cases/verdict.rs
+;; (the table at its head, spec/method.md rule 3) and the compiled side of crates/fibc/src/harness/mod.rs `combine`.
+;; Shapes decided: stage 2 has no interpreter, so there is no second side to disagree with: the outcome is the compiled run's alone, its
+;; audit read from the free trace (every `A n` freed once by an `F n`, none freed that was not allocated, `I k` restarting the count
+;; as Rust's `Trace::parse` does). The trace cannot tell a leaked cycle from another leak, so `audit: leak-cycle` holds when something
+;; leaked and nothing erred, and an `open` case whose audit leaks without error counts as the program's own failure.
+(ns driver.verdict
+  (:require [fib.string :as s])
+  (:use driver.header))
+
+;; The memory audit of a run: objects never freed, and what went wrong with a free.
+(defstruct CsAudit (leaks: i64 errors: (Vec str)))
+
+;; What running a case came to. Rust: evaluator.rs Outcome
+(defenum CsOutcome
+  (OutCompiled result: i64 audit: CsAudit allocs: i64)
+  (OutRejected message: str)
+  (OutTrapped message: str)
+  (OutFailed message: str)
+  (OutUnsupported reason: str))
+
+;; How a case fared. Rust: verdict.rs Status
+(defenum CsStatus
+  (StPass)
+  (StFail why: str)
+  (StPending why: str)
+  (StOpen why: str)
+  (StOpenPassed)
+  (StHeader line: i64 msg: str))
+
+(defun status-label (st: CsStatus) -> str
+  (match st
+    ((StPass) "pass")
+    ((StFail _) "FAIL")
+    ((StPending _) "PENDING")
+    ((StOpen _) "OPEN")
+    ((StOpenPassed) "FAIL")
+    ((StHeader _ _) "HEADER")))
+
+(defun status-detail (st: CsStatus) -> str
+  (match st
+    ((StPass) "")
+    ((StFail why) why)
+    ((StPending why) why)
+    ((StOpen why) why)
+    ((StOpenPassed) "the item landed: remove `open`")
+    ((StHeader line msg) (str-join ["line " (show line) ": " msg]))))
+
+(defun audit-text :private (a: CsAudit) -> str
+  (str-join (into ["clean=" (show (and (= (. a leaks) 0) (empty? (. a errors)))) " leak-cycles=n/a leaks=" (show (. a leaks))
+                   " errors=" (show (count (. a errors)))]
+                  (mapv (fn (e: str) (str-join [" [" e "]"])) (. a errors)))))
+
+(defun audit-clean? :private (a: CsAudit) -> bool (and (= (. a leaks) 0) (empty? (. a errors))))
+
+(defun audit-mismatch :private (clean: bool a: CsAudit) -> (Vec str)
+  (let ((holds (if clean (audit-clean? a) (and (> (. a leaks) 0) (empty? (. a errors))))))
+    (if holds [] [(str-join ["audit: expected " (if clean "clean" "leak-cycle") ", got " (audit-text a)])])))
+
+(defun allocs-mismatch :private (maximum: i64 counted: i64) -> (Vec str)
+  (if (or (< maximum 0) (<= counted maximum))
+      []
+      [(str-join ["allocs: expected at most " (show maximum) " heap objects, the run allocated " (show counted)])]))
+
+(defun judge-accept :private (expected: i64 clean: bool maximum: i64 o: CsOutcome) -> CsStatus
+  (match o
+    ((OutCompiled result audit counted)
+     (let ((ms (into (into (if (= expected result) [] [(str-join ["result: expected " (show expected) ", got " (show result)])])
+                           (audit-mismatch clean audit))
+                     (allocs-mismatch maximum counted))))
+       (if (empty? ms) StPass (StFail (str-join (vec (interpose "; " ms)))))))
+    ((OutRejected m) (StFail (str-concat "expected accept, but rejected: " m)))
+    ((OutTrapped m) (StFail (str-concat "the run trapped: " m)))
+    ((OutFailed m) (StFail (str-concat "the run failed: " m)))
+    ((OutUnsupported r) (StPending r))))
+
+(def blank-error: str "expected error text is empty or only whitespace: nearly every message contains it, so this case could never fail")
+
+(defun judge-reject :private (expected: str o: CsOutcome) -> CsStatus
+  (match o
+    ((OutRejected m)
+     (cond (= (s/trim expected) "") (StFail blank-error)
+           (s/includes? m expected) StPass
+           :else (StFail (str-join ["rejected, but the error does not contain the expected text: expected \"" expected "\", got \"" m "\""]))))
+    ((OutCompiled result audit _)
+     (if (= (s/trim expected) "")
+         (StFail blank-error)
+         (StFail (str-join ["expected reject with \"" expected "\", but compiled: result " (show result) ", audit " (audit-text audit)]))))
+    ((OutTrapped m) (StFail (str-join ["expected reject with \"" expected "\", but compiled and the run failed: " m])))
+    ((OutFailed m) (StFail (str-join ["expected reject with \"" expected "\", but compiled and the run failed: " m])))
+    ((OutUnsupported r) (StPending r))))
+
+(def blank-trap: str "expected trap text is empty or only whitespace: nearly every message contains it, so this case could never fail")
+
+(defun judge-trap :private (expected: str o: CsOutcome) -> CsStatus
+  (let ((want (str-join ["expected a trap with \"" expected "\", but "])))
+    (match o
+      ((OutTrapped m)
+       (cond (= (s/trim expected) "") (StFail blank-trap)
+             (s/includes? m expected) StPass
+             :else (StFail (str-join ["trapped, but the trap does not contain the expected text: expected \"" expected "\", got \"" m "\""]))))
+      ((OutCompiled result audit _)
+       (StFail (if (= (s/trim expected) "") blank-trap
+                   (str-join [want "the run finished: result " (show result) ", audit " (audit-text audit)]))))
+      ((OutRejected m) (StFail (str-join [want "rejected: " m])))
+      ((OutFailed m) (StFail (str-join [want "the run failed: " m])))
+      ((OutUnsupported r) (StPending r)))))
+
+(defun judge-counted :private (v: CsVerdict o: CsOutcome) -> CsStatus
+  (match o
+    ((OutUnsupported r) (StPending r))
+    (_ (match v
+         ((CsAccept result clean maximum) (judge-accept result clean maximum o))
+         ((CsReject e) (judge-reject e o))
+         ((CsTrap t) (judge-trap t o))))))
+
+;; True when the outcome says the program is wrong and nothing else is. Rust: verdict.rs `programs_own_failure`
+(defun programs-own-failure? :private (o: CsOutcome) -> bool
+  (match o
+    ((OutRejected _) true)
+    ((OutTrapped _) true)
+    ((OutCompiled _ audit _) (empty? (. audit errors)))
+    (_ false)))
+
+;; The status of a case with the `open` items `open`: a pass is `OpenPassed`, the program's own failure is `Open`.
+;; Rust: verdict.rs `judge_labelled`
+(defun judge (h: CsHeader o: CsOutcome) -> CsStatus
+  (let ((st (judge-counted (. h verdict) o))
+        (open (. h open)))
+    (cond (empty? open) st
+          :else (match st
+                  ((StPass) StOpenPassed)
+                  ((StFail why) (if (programs-own-failure? o) (StOpen (str-join [(str-join (vec (interpose " " open))) ": " why])) st))
+                  (_ st)))))
