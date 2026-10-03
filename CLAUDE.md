@@ -52,19 +52,21 @@ test says so; claims in docs, commit messages and chat carry no weight.
 - One logical change per commit; the message says what and why.
 - Never commit build output. Never rewrite pushed history.
 
-## The ports in `compiler/`
+## `compiler/` is where the work is
 
-- A change to the Rust front end (reader, expander, checker, emitter) breaks
-  stage 2 until the matching fibber port changes: write
-  `compiler/mirror-pending/NAME.md` (the Rust function, the behaviour, the
-  case that shows it, the fibber function that changes) and schedule the
-  re-sync. The stage check is: `fibc build compiler/fibc.fib -I compiler -I
-  lib -L target/debug -l lair -o F`, then `F emit compiler/fibc.fib` equals
-  `fibc emit compiler/fibc.fib`, then F builds F3 and F3 emits the same again.
-- Each pass has a Rust dump as its oracle (`fibref read|expand|types|own`,
-  `fibc emit-dump`) and a compare script under `compiler/tests/`. The Rust
-  dump tools take `-I` and `FIB_LIB` as `run` does; rebuild the binaries
-  after any edit of `lib/prelude.fib` (it is embedded).
+- The Rust `fibc` and the front end shared with `fibref` are frozen as the
+  seed (tag `seed-1`); do not add language features there. New language and
+  library work starts in `compiler/` and the library in `lib/`. The mirror
+  rule is retired; `compiler/mirror-pending/` is backlog of what the Rust
+  has and stage 2 lacks.
+- Build stage 2 with the seed: `fibc build compiler/fibc.fib -I compiler -I
+  lib -L target/debug -l lair -o F`; check it with `F emit compiler/fibc.fib`
+  equal to `fibc emit compiler/fibc.fib`, then F builds F3 and F3 emits the
+  same again, while the seed still reads the program.
+- Each pass has a Rust dump as its oracle for the language the seed knows
+  (`fibref read|expand|types|own`, `fibc emit-dump`) and a compare script
+  under `compiler/tests/`. Rebuild the binaries after any edit of
+  `lib/prelude.fib` (it is embedded).
 - Fibber source follows the same limits as Rust where it can (files under
   500 lines, functions under 50) and uses the library's own tools: flat
   `cond`, `try-let`, `if-some`, destructuring, `defrecord`.

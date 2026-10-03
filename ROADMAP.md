@@ -309,12 +309,17 @@ destructuring, flat `cond`, `defrecord`, `reduce`, `sort`): the ports are
 idiomatic, about 0.7 times the Rust's lines. Each pass has a dump command
 in Rust as its oracle (`fibref types|own`, `fibc emit-dump`), a harness that
 compares it with the fibber tool, `--sections` so a package is judged alone,
-and a differential test over the corpus. A change to the Rust front end
-must be mirrored into the fibber ports or stage 2 stops reading the
-library: each Rust package writes `compiler/mirror-pending/NAME.md` (the
-Rust function, the behaviour, the case that shows it, the fibber function
-that changes) and a re-sync package follows (X2, X8 and X7 are mirrored; X5
-is next). `bootstrap_expand` is behind the `mirror` feature of `crates/fibc`.
+and a differential test over the corpus. **Rust is frozen (owner, 2026-10-03).** The Rust `fibc` and the front end it
+shares with `fibref` are the seed: tag `seed-1` is the last Rust-first
+commit. New language and library work starts in `compiler/` (fibber); the
+mirror rule is retired, because mirroring every Rust change cost more than
+the work it copied. What the Rust has and stage 2 lacks (S5's `sys-*`
+builtins, X9b's clause fixes, E1's editor commands, X9c once designed) is
+ordinary backlog in `compiler/mirror-pending/`, ported when something needs
+it. Consequence: a feature that exists only in stage 2 is judged by its
+cases and the spec, not by two independent tools (method rule 6) until a
+second implementation is written. `bootstrap_expand` (`mirror` feature of
+`crates/fibc`) is the old expander oracle and no longer gates.
 Speed: stage 2 takes about 25 s to emit its own source against 13.8 s for
 the Rust (about 5 times slower on small programs: the library is checked
 again for every program). Nothing has been profiled.
