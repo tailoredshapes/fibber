@@ -19,3 +19,12 @@ with `F` built from `compiler/fibc.fib` and `FIB_LIB=$PWD/lib`, and must print `
 Under the seed with the Y11 library (clauses for `get nth range ...`): ownership 05 is
 `get takes 2 or 3 argument(s), got 0`. Case 874 passes under both, but its expansion differs: the seed
 leaves the value `range` as the symbol, stage 2 writes `range$1`.
+
+## Differences the expand compare now shows (by design)
+
+`compiler/tests/expand/compare.sh` against the seed's `fibref expand`, with the Y11 library: cases/ownership
+and cases/modules differ only in 05 (above); cases/stdlib in 1900, 1901, 1902, 1904 and 874 (the value
+`range` is `range$1`); compiler/tests/expand in `x9-015` (`f` as a value is `f$1`) and `porter4c-210`
+(`range` as a value is `range$1`). Each is the value rule, the seed leaving the symbol. The other
+differences of those runs (656 658 659 669 674 679, porter1-034, porter3-082) are the library's path
+printed absolute under `FIB_LIB`, not these rules.
