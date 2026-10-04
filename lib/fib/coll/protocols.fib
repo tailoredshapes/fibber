@@ -6,15 +6,17 @@
 ;; Vec is nil out of range, as Clojure's. The List variants are `Empty` and `Cons` (R2).
 (ns fib.coll.protocols (:use fib.core fib.seq))
 (defprotocol (Lookup s k v)   (get (self key: k) -> (Option v)))
-(defprotocol (Assoc s k v)    (assoc (self key: k val: v) -> Self))
-(defprotocol (Dissoc s k)     (dissoc (self key: k) -> Self))
+(defprotocol (Assoc s k v)    (assoc (self :owned key: k val: v) -> Self))
+(defprotocol (Dissoc s k)     (dissoc (self :owned key: k) -> Self))
 (defprotocol (Keyed s k)      (contains? (self key: k) -> bool))
 (defprotocol Emptyable        (empty (self) -> Self))
-(defprotocol (Stack s e)      (peek (self) -> (Option e)) (pop (self) -> Self))
+(defprotocol (Stack s e)      (peek (self) -> (Option e)) (pop (self :owned) -> Self))
 (defprotocol (Reversible s e) (each-while-rev (self k: (fn (e) bool) :borrow) -> bool))
 (defprotocol (KeyReducible m k v) (each-kv-while (self k: (fn (k v) bool) :borrow) -> bool))
-;; conj's result type is the instance's: the collection itself, or an LSeq for a seq
-(defprotocol (Collection s r e) (conj (self x: e) -> r))
+;; conj's result type is the instance's: the collection itself, or an LSeq for a seq. The update methods (conj, assoc, dissoc, pop)
+;; take `self` :owned: a caller that does not use the collection again hands its count over, so the instance can update in place
+;; (docs/design/in-place-update.md); a caller that does use it again retains first and the instance copies.
+(defprotocol (Collection s r e) (conj (self :owned x: e) -> r))
 ;; (get c k d): the value at k, or d: the 3-arity of Clojure's get (the 2-arity is Lookup's method)
 (defun get$3 (c: s k: k d: v) :where ((Lookup s k v)) -> v
   (match (get c k)

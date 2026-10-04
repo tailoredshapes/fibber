@@ -164,16 +164,14 @@
         (vec-conj v x)
         (if (or (< i 0) (> i n))
             (trap "assoc: index out of range")
+            ;; the trie clause names the root's payload in the pattern, so that it is a field of v's own slot: it can be stolen
             (match v
-              ((VecEmpty) (trap "assoc: index out of range"))
-              ((VecOf cnt shift root tail)
-               (let ((tailoff (- cnt (array-len tail))))
-                 (if (>= i tailoff)
-                     (let ((c (cell tail)))
-                       (do (array-set! &c (- i tailoff) x) (VecOf cnt shift root @c)))
-                     (match root
-                       (nil (trap "assoc: index out of range"))
-                       ((some r) (VecOf cnt shift (some (vnode-assoc r shift i x)) tail)))))))))))
+              ((VecOf cnt shift root tail) :when (>= i (- cnt (array-len tail)))
+               (let ((k (- i (- cnt (array-len tail))))
+                     (c (cell tail)))
+                 (do (array-set! &c k x) (VecOf cnt shift root @c))))
+              ((VecOf cnt shift (some r) tail) (VecOf cnt shift (some (vnode-assoc r shift i x)) tail))
+              (_ (trap "assoc: index out of range")))))))
 
 ;; The leaf of the trie that holds index i, as its array of 32.
 (defun vnode-leaf :private (node: (VNode a) level: i64 i: i64) -> (Array a)

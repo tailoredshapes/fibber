@@ -97,7 +97,7 @@
   (cx: Ctx frames: (Cell (Vec Frame)) site-frame: (Cell (Map Site i64)) out: (Cell BodyOwn)
    events: (Cell (Vec Event)) tails: (Cell (Map i64 Tail)) candidates: (Cell (Map Site i64))
    expr: (fn (Walker Expr bool) Mode)
-   moved: (Cell (Set Site)) diverged: (Cell bool) stealable: (Cell (Map i64 Site))))
+   moved: (Cell (Set Site)) diverged: (Cell bool) stealable: (Cell (Map i64 Site)) wants: (Cell (Set i64))))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; The methods of Rust's `Walker` (walk/mod.rs:207-458) are functions `w-NAME` of the walker, which
@@ -111,7 +111,7 @@
 ;; expression (the cycle's function field).
 (defun walker-new (cx: Ctx expr: (fn (Walker Expr bool) Mode)) -> Walker
   (Walker cx (cell []) (cell (map-empty)) (cell (body-own-new)) (cell []) (cell (map-empty))
-          (cell (map-empty)) expr (cell (set-empty)) (cell false) (cell (map-empty))))
+          (cell (map-empty)) expr (cell (set-empty)) (cell false) (cell (map-empty)) (cell (set-empty))))
 
 ;; Rust: walk/mod.rs:452 `kind_of_param`: an owned parameter is `BnOwnedParam`, else `BnBorrowedParam`.
 (defun kind-of-param (owned: bool) -> BindKind
@@ -345,6 +345,24 @@
                            (not (w-env-moved? w s))))
             (_ false)))
          (_ false))))
+
+;; Whether `x` is the last use of a field variable (and nothing reads the shell afterwards) of the match on a *borrowed parameter* of
+;; a `defun`: the steal would fire if the parameter were owned. The parameter is then recorded in `wants` (own.unit `decide` makes it
+;; owned and walks again), and `x` is retained as before in this walk.
+(defun w-want-own (w: Walker x: Expr) -> bool
+  (match (. x kind)
+    ((ELocal b)
+     (if (contains? (. (. w cx) steal) (. x id))
+       (match (get @(. w stealable) b)
+         ((some (SiteBind p))
+          (let [bound (get (. @(. w out) bindings) p)]
+            (if (and (= (. (w-frame w) kind) FkDefun)
+                     (match bound ((some k) (= (. k kind) BnBorrowedParam)) (_ false)))
+              (do (set! (. w wants) (conj @(. w wants) p)) true)
+              false)))
+         (_ false))
+       false))
+    (_ false)))
 
 ;; The state to branch from, and what a branch ended in.
 (defstruct Branch (moved: (Set Site) jumped: bool))

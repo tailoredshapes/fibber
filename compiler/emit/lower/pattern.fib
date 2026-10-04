@@ -52,6 +52,15 @@
                     (Ok (test-val cx (str-join ["(call @fib.str-eq " x " " lit ")"])))))
       ((LitUnit) (Ok (v-int LirI1 1))))))
 
+;; Whether the field type `ft` is an `Option` of a pointer that is no `Option`, which is the pointer itself (`OptNull`): the payload of a
+;; `(some x)` sub-pattern then is the value of the field's own slot.
+(defun option-slot? :private (cx: LowerCx t2: i64 ft: Ty) -> bool
+  (let ((g (program-g (. cx p))))
+    (and (= t2 @(. g option))
+         (match (option-payload g ft)
+           ((some payload) (match (option-rep g payload) ((Ok (OptNull)) true) (_ false)))
+           (_ false)))))
+
 ;; The sub-patterns of a struct or variant, each against the field loaded from the object (a field of type `unit` has no slot).
 ;; Rust: pattern.rs:243 sub_patterns
 (defun sub-patterns :private (cx: LowerCx sname: str base: i64 fields: (Vec Ty) subs: (Vec Pattern) v: V fail: str)
@@ -66,6 +75,10 @@
               (do (match (. p kind)
                     ((PBind b) (when (some? lt)
                                  (set! (. cx origins) (assoc @(. cx origins) b (Origin v sname slot)))))
+                    ((PCtor t2 _ inner) (when (and (some? lt) (option-slot? cx t2 ft))
+                                          (match (sole-bind inner)
+                                            ((some b) (set! (. cx origins) (assoc @(. cx origins) b (Origin v sname slot))))
+                                            (_ ()))))
                     (_ ()))
               (try-let ((done (if (wild? p) (Ok ()) (lcx-match-pattern cx p fv ft fail))))
                 (recur (+ i 1) (if (some? lt) (+ slot 1) slot)))))))

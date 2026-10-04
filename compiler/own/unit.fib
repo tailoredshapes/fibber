@@ -26,7 +26,7 @@
 ;; tail decisions, the allocation candidates and the `fn` literals that are not `async`.
 (defstruct Walked
   (outs: (Vec BodyOwn) events: (Vec Event) tails: (Map i64 Tail) candidates: (Map Site i64)
-   literals: (Set i64)))
+   literals: (Set i64) wants: (Set i64)))
 
 ;; What every walk of a unit shares.
 (defstruct Run (p: TypedProgram summaries: (Map i64 Summary) unit: Unit))
@@ -41,6 +41,7 @@
             (events (into (. w events) @(. walker events)))
             (tails (merge (. w tails) @(. walker tails)))
             (candidates (merge (. w candidates) @(. walker candidates)))
+            (wants (into (. w wants) (vec @(. walker wants))))
             (literals (reduce-kv (fn (s: (Set i64) lit: i64 c: ClosureOwn)
                                    (if (. c is-async) s (conj s lit)))
                                  (. w literals) (. out closures))))))))
@@ -54,7 +55,7 @@
               (walk-one w (Ctx (. r p) (. r summaries) facts (. unit scc) (. unit all-owned)
                                sites admit local dead steal amp)
                         (. pair snd)))
-            (Walked [] [] (map-empty) (map-empty) (set-empty))
+            (Walked [] [] (map-empty) (map-empty) (set-empty) (set-empty))
             (. unit bodies))))
 
 ;; The facts of the fixpoint: walks until a walk's events add nothing.
@@ -95,6 +96,22 @@
                       declared)))
         (range (count (. spec params)))))
 
+;; The parameters among `wants` (borrowed parameters whose field would be stolen, own.walk.state `w-want-own`) that rule 4 may make
+;; owned: parameters of a `defun` body of the unit, inferred, not declared `:borrow`, not owned yet.
+(defun wanted-params :private (unit: Unit wants: (Set i64) facts: Facts) -> (Vec i64)
+  (vec (sort (vec (reduce (fn (acc: (Set i64) pair: (Pair BodyKey BodySpec))
+                            (let [spec (. pair snd)]
+                              (if (= (. spec kind) FkDefun)
+                                (reduce (fn (a: (Set i64) i: i64)
+                                          (let [b (. (nth (. spec params) i) fst)]
+                                            (if (and (contains? wants b) (contains? (. facts inferred) b)
+                                                     (not (contains? (. facts owned) b))
+                                                     (not (get (. spec declared-borrow) i false)))
+                                              (conj a b) a)))
+                                        acc (range (count (. spec params))))
+                                acc)))
+                          (set-empty) (. unit bodies))))))
+
 ;; Rust: unit.rs:101 `decide`: decides a unit, starting from `facts`.
 (defun decide (p: TypedProgram summaries: (Map i64 Summary) unit: Unit facts: Facts) -> Decided
   (let [r (Run p summaries unit)
@@ -110,11 +127,14 @@
         dead (reduce (fn (acc: (Set i64) l: LastUses) (into acc (vec (. l dead)))) (set-empty) lasts)
         steal (reduce (fn (acc: (Set i64) l: LastUses) (into acc (vec (. l steal)))) (set-empty) lasts)
         amp (reduce (fn (acc: (Set i64) l: LastUses) (into acc (vec (. l amp)))) (set-empty) lasts)
-        emitted (run-walk r done (some sites) true local dead steal amp)]
-    (Decided (mapv (fn (pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
+        emitted (run-walk r done (some sites) true local dead steal amp)
+        wanted (wanted-params unit (. emitted wants) done)]
+    (if (not (empty? wanted))
+      (decide p summaries unit (reduce (fn (g: Facts b: i64) (facts-want-owned g b)) done wanted))
+      (Decided (mapv (fn (pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
                      (let [key (. (. pair fst) fst)
                            spec (. (. pair fst) snd)
                            out (finish-allocs (. pair snd) (. emitted candidates) (. emitted literals) local)]
                        (Pair key (with out (params (body-params done spec))))))
                    (zip (. unit bodies) (. emitted outs)))
-             done)))
+             done))))

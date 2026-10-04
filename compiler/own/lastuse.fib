@@ -88,13 +88,21 @@
     (_ acc)))
 
 ;; The field variables of a pattern matched against a shell (a scrutinee that is a binding's value or owned):
-;; the variables that are the direct sub-patterns of a top-level constructor pattern, except an `Option`'s.
+;; the variables that are the direct sub-patterns of a top-level constructor pattern, except an `Option`'s, and the payload
+;; variable of a direct `(some x)` sub-pattern (an `Option` of a pointer is the pointer: the same slot).
 (defun field-vars :private (p: Pattern opt: i64 acc: (Vec i64)) -> (Vec i64)
   (match (. p kind)
     ((PCtor t _ subs)
      (if (= t opt)
        acc
-       (reduce (fn (a: (Vec i64) s: Pattern) (match (. s kind) ((PBind x) (conj a x)) (_ a))) acc subs)))
+       (reduce (fn (a: (Vec i64) s: Pattern)
+                 (match (. s kind)
+                   ((PBind x) (conj a x))
+                   ((PCtor t2 _ inner) (if (= t2 opt)
+                                         (match (sole-bind inner) ((some x) (conj a x)) (_ a))
+                                         a))
+                   (_ a)))
+               acc subs)))
     (_ acc)))
 
 ;; Whether the expression is a shell in the above sense: it reads a binding's site as itself, or is owned.

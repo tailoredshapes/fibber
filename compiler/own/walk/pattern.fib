@@ -3,7 +3,7 @@
 ;; Rust). Package O3. `walk-scrutinee` is here and not in own.walk.expr (own-notes.md): `match-form` needs it, and
 ;; own.walk.expr requires this module.
 (ns own.walk.pattern
-  (:use types.ast own.program own.walk.state own.walk.callee own.walk.lit own.walk.step))
+  (:use types.ast types.ty own.program own.walk.state own.walk.callee own.walk.lit own.walk.step))
 
 ;; Rust: walk/pattern.rs:15 `pattern_modes`: the modes of a whole-scrutinee variable and of a variable
 ;; inside a constructor pattern, for a scrutinee of mode m whose implicit owning binding (when m is
@@ -33,6 +33,14 @@
   (do (w-own-site w (SiteBind r) false)
       (w-bind w r (w-owning r) BnOwns)))
 
+;; Whether `x`, the payload variable of a `(some x)` sub-pattern, is an object that is not itself an `Option`: then the `Option` is
+;; the pointer (`OptNull`) and `x` is the field's own slot (emit/lower/pattern.fib `sub-patterns`).
+(defun stealable-payload? :private (w: Walker x: i64) -> bool
+  (and (w-binding-is-object w x)
+       (match (get (. (w-p w) binding-types) x)
+         ((some (TCon (KNominal id) _)) (not (= id @(. (. (w-p w) globals) option))))
+         (_ false))))
+
 ;; The variables that are direct sub-patterns of a top-level constructor pattern (but an `Option`'s), matched
 ;; against a scrutinee that is a site's value (`whole` is `Borrowed`: a binding's or an owned temporary's), name fields
 ;; of that shell: the plan may steal them (`PsSteal`) at their last use.
@@ -45,6 +53,11 @@
           (doseq [p subs]
             (match (. p kind)
               ((PBind x) (when (w-binding-is-object w x) (set! (. w stealable) (assoc @(. w stealable) x s))))
+              ((PCtor t2 _ inner)
+               (when (= t2 @(. (. (w-p w) globals) option))
+                 (match (sole-bind inner)
+                   ((some x) (when (stealable-payload? w x) (set! (. w stealable) (assoc @(. w stealable) x s))))
+                   (_ (do)))))
               (_ (do))))))
        (_ (do))))
     (_ (do))))
