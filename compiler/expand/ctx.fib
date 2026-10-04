@@ -78,7 +78,10 @@
    ;; macro expansions and produced forms counted for the current
    ;; top-level form
    steps: (Cell i64)
-   forms: (Cell i64)))
+   forms: (Cell i64)
+   ;; the bare names of the user macros defined so far: a macro lookup of a name
+   ;; that is not here is none, with no key built and no map probed (compile time)
+   macro-names: (Cell (Map str bool))))
 
 ;; The namespace the §1.4 rewrite qualifies its heads with, and where a
 ;; context starts (expand/collections.rs, ctx.rs).
@@ -107,7 +110,8 @@
              (cell (map-empty))
              (cell (none-pos))
              (cell 0)
-             (cell 0)))
+             (cell 0)
+             (cell (map-empty))))
 
 ;; A fresh symbol `#PREFIX.N` at pos, N one more than the count so far.
 ;; (ctx.rs `gensym`)
@@ -148,6 +152,16 @@
                      (union-names out (unwrap-or (map-get @(. ctx defined) m) (map-empty))))))
         out)))
 
+;; Whether module ns exports `name`: ctx-add-exported's set holds it, found without building the set.
+(defun ctx-exports-name? (ctx: ExpandCtx ns: str name: str) -> bool
+  (loop ((pending [ns]) (i 0) (seen (map-empty)))
+    (if (< i (count pending))
+        (let ((m (nth pending i)))
+          (cond (some? (map-get seen m)) (recur pending (+ i 1) seen)
+                (some? (map-get (unwrap-or (map-get @(. ctx defined) m) (map-empty)) name)) true
+                :else (recur (append-names pending (reexported-by ctx m)) (+ i 1) (assoc seen m true))))
+        false)))
+
 ;; The modules ns re-exports, none when it re-exports none.
 (defun reexported-by :private (ctx: ExpandCtx ns: str) -> (Vec str)
   (unwrap-or (map-get @(. ctx exports) ns) (vec-empty)))
@@ -171,10 +185,11 @@
 (defun ctx-define-macro (ctx: ExpandCtx def: MacroDef) -> unit
   (let ((ns (. @(. ctx scope) ns))
         (key (str-join [(. @(. ctx scope) ns) "/" (. def name)])))
-    (set! (. ctx macros)
-          (assoc @(. ctx macros) key
-                 (MacroDef (. def name) ns key (. def private) (. def params) (. def rest)
-                           (. def body) (. def pos))))))
+    (do (set! (. ctx macro-names) (assoc @(. ctx macro-names) (. def name) true))
+        (set! (. ctx macros)
+              (assoc @(. ctx macros) key
+                     (MacroDef (. def name) ns key (. def private) (. def params) (. def rest)
+                               (. def body) (. def pos)))))))
 
 ;; Makes the macro name of the module being expanded :private.
 ;; (ctx.rs `make_macro_private`)
@@ -426,6 +441,11 @@
 ;; expanded: its own (a :private one only to itself), else one that a
 ;; module it re-exports exports. (ctx.rs `exported_macro`)
 (defun exported-macro :private (ctx: ExpandCtx ns: str name: str) -> (Option MacroDef)
+  (if (some? (map-get @(. ctx macro-names) name))
+      (exported-macro-defined ctx ns name)
+      nil))
+
+(defun exported-macro-defined :private (ctx: ExpandCtx ns: str name: str) -> (Option MacroDef)
   (let ((own (match (map-get @(. ctx macros) (str-join [ns "/" name]))
                (nil nil)
                ((some d)
