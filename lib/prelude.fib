@@ -385,7 +385,6 @@
 (defenum (Map k v)
   (MapEmpty)
   (MapOf cnt: i64 root: (MNode k v)))
-(defstruct (MRes k v) :private (node: (MNode k v) added: bool))
 
 (defun map-empty () MapEmpty)
 
@@ -441,33 +440,34 @@
            nil
            (mnode-get (array-get kids (popcount (bit-and bitmap (- bit 1)))) (+ shift 5) h key))))))
 
-(defun mnode-assoc :private (node: (MNode k v) shift: i64 h: i64 key: k val: v) :where ((Eq k)) -> (MRes k v)
+(defun mnode-assoc :private (node: (MNode k v) shift: i64 h: i64 key: k val: v &added: bool) :where ((Eq k)) -> (MNode k v)
   (match node
     ((MLeaf h0 k0 v0)
      (if (= h0 h)
          (if (= k0 key)
-             (MRes (MLeaf h key val) false)
-             (MRes (MColl h (array-push (array 1 (Pair k0 v0)) (Pair key val))) true))
-         (MRes (mnode-two shift h0 node h (MLeaf h key val)) true)))
+             (MLeaf h key val)
+             (do (set! added true) (MColl h (array-push (array 1 (Pair k0 v0)) (Pair key val)))))
+         (do (set! added true) (mnode-two shift h0 node h (MLeaf h key val)))))
     ((MColl h0 items)
      (if (= h0 h)
          (let ((i (mcoll-find items key)))
            (if (< i 0)
-               (MRes (MColl h (array-push items (Pair key val))) true)
+               (do (set! added true) (MColl h (array-push items (Pair key val))))
                (let ((c (cell items)))
                  (array-set! &c i (Pair key val))
-                 (MRes (MColl h @c) false))))
-         (MRes (mnode-two shift h0 node h (MLeaf h key val)) true)))
+                 (MColl h @c))))
+         (do (set! added true) (mnode-two shift h0 node h (MLeaf h key val)))))
     ((MBits bitmap kids)
      (let ((bit (shl 1 (mchunk h shift)))
            (idx (popcount (bit-and bitmap (- bit 1)))))
        (if (= (bit-and bitmap bit) 0)
-           (MRes (MBits (bit-or bitmap bit) (array-insert kids idx (MLeaf h key val))) true)
-           ;; descent over the cell idiom: array-take! moves the child out when kids is unique
-           (let ((c (cell kids))
-                 (r (mnode-assoc (array-take! &c idx) (+ shift 5) h key val)))
-             (array-set! &c idx (. r node))
-             (MRes (MBits bitmap @c) (. r added))))))))
+           (do (set! added true) (MBits (bit-or bitmap bit) (array-insert kids idx (MLeaf h key val))))
+           ;; descent over the cell idiom: array-take! moves the child out when kids is unique; the flag
+           ;; travels by the in-out parameter, so a level builds no result record
+           (let ((c (cell kids)))
+             (let ((kid (array-take! &c idx)))
+               (do (array-set! &c idx (mnode-assoc kid (+ shift 5) h key val &added))
+                   (MBits bitmap @c)))))))))
 
 ;; The node without key, or nil when that empties it.
 (defun mnode-dissoc :private (node: (MNode k v) shift: i64 h: i64 key: k) :where ((Eq k)) -> (Option (MNode k v))
@@ -498,8 +498,9 @@
     (match m
       ((MapEmpty) (MapOf 1 (MLeaf h key val)))
       ((MapOf cnt root)
-       (let ((r (mnode-assoc root 0 h key val)))
-         (MapOf (if (. r added) (+ cnt 1) cnt) (. r node)))))))
+       (let ((added (cell false)))
+         (let ((r (mnode-assoc root 0 h key val &added)))
+           (MapOf (if @added (+ cnt 1) cnt) r)))))))
 
 (defun map-get (m: (Map k v) key: k) -> (Option v)
   (match m
