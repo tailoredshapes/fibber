@@ -488,6 +488,18 @@ as described.
 
 ## 9. The C interface to lair (M6)
 
+**Retired by `native.*`** (lair in fibber, stage 7, 2026-10-04). What follows is what the interface was: the 23 `lair_*` functions of
+`liblair.so` that stage 2 called through `extern`. The compiler no longer calls any of them. Its users (`emit.defs.jit`, `macros.runner`,
+`driver.native`) require `native.api` (the names of `lair.jit`: `jit-new`, `jit-add-source`, `jit-c-entry`, `check-source`,
+`build-executable`, ...) and `native.call` (the names of `lair.call`: `call-i64`, the mailbox and its hooks), which are lair written in
+fibber (`compiler/lir/`, `compiler/native/`) over LLVM's C interface (`compiler/llvm/`); `native.fibm` and `native.expand` are `lair.fibm` and
+`lair.expand` moved onto them. A stage 2 links LLVM 21 itself (`fibc build compiler/fibc.fib -L DIR -l LLVM-21` for development, the static
+archives through the ld script of `scripts/llvm-static.sh` for a release) and has no `liblair.so`: `ldd` of a release `bin/fibc` shows libc,
+libm, libstdc++, libgcc_s, libz and libzstd. Fibber cannot export a C function, so `lair.h` cannot be offered again: nothing of it is kept
+for third parties (owner decision D2 of docs/design/lair-in-fibber.md). `crates/lair` with its `liblair.so`, `compiler/lair/` (`lair.jit`,
+`lair.call`, `lair.ffi`, `lair.err` and the originals of `lair.fibm` and `lair.expand`, for `compiler/jit-demo.fib` and the tests of
+`crates/fibc/tests/capi/`) stay as a legacy oracle until the Rust `fibc` goes (stage 10), then everything under this heading goes with them.
+
 **Decided** (owner, 2026-10-01): the self-hosted compiler reaches `lair`
 through a C interface, as LLVM stays in C++ and `lair` in Rust
 (ROADMAP M6). Stage 2 is a fibber program: it calls the functions below
@@ -518,8 +530,8 @@ handles may be used from any one thread at a time, different handles
 from different threads at once (`crates/lair/tests/capi.rs`,
 `capi_mailbox.rs` run sessions and mailboxes in several threads).
 `lair.h` has the exact C types (every length is a `size_t`; an address is
-a `size_t`). The interface is 22 functions, the two tables below: `nm -D
---defined-only target/debug/liblair.so | grep -c ' T lair_'` prints 22,
+a `size_t`). The interface is 23 functions, the two tables below: `nm -D
+--defined-only target/debug/liblair.so | grep -c ' T lair_'` prints 23,
 and a unit test (`crates/lair/src/capi/header.rs`) keeps `lair.h` equal
 to the `#[no_mangle]` functions of the source, parameter counts included.
 

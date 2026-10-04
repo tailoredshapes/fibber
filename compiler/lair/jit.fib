@@ -15,7 +15,7 @@
 ;; (lair.h): `jit-free` takes the session by value to say so, but the
 ;; compiler cannot stop a copy of the struct being used afterwards. Every
 ;; raw buffer made here is freed before the function returns.
-(ns lair.jit (:require [lair.ffi :as ffi]))
+(ns lair.jit (:require [lair.ffi :as ffi] [lair.err :as err]))
 
 (defstruct Jit (handle: i64))
 
@@ -33,7 +33,7 @@
   (unsafe
     (let ((out (ffi/slot-new))
           (e (lair_jit_new (trunc i32 opt) out)))
-      (match (ffi/word-result e out)
+      (match (err/word-result e out)
         ((Ok h) (Ok (Jit h)))
         ((Err m) (Err m))))))
 
@@ -43,7 +43,7 @@
   (unsafe
     (let ((out (ffi/slot-new))
           (e (lair_jit_new_fast_codegen (trunc i32 opt) out)))
-      (match (ffi/word-result e out)
+      (match (err/word-result e out)
         ((Ok h) (Ok (Jit h)))
         ((Err m) (Err m))))))
 
@@ -59,7 +59,7 @@
     (let ((nm (ffi/bytes-new name))
           (sp (ffi/bytes-new src))
           (e (lair_jit_add_source (. j handle) nm (str-len name) sp (str-len src))))
-      (do (free nm) (free sp) (ffi/status e)))))
+      (do (free nm) (free sp) (err/status e)))))
 
 ;; The address of the exported function `name`, compiled if need be. A
 ;; function that is not `ccc` is at an address of its own convention:
@@ -69,7 +69,7 @@
     (let ((nm (ffi/bytes-new name))
           (out (ffi/slot-new))
           (e (lair_jit_address (. j handle) nm (str-len name) out)))
-      (do (free nm) (ffi/word-result e out)))))
+      (do (free nm) (err/word-result e out)))))
 
 ;; A `ccc` entry to `name`: the function itself when it is `ccc`, else a
 ;; trampoline the session makes once. Valid until `jit-free`.
@@ -78,7 +78,7 @@
     (let ((nm (ffi/bytes-new name))
           (out (ffi/slot-new))
           (e (lair_jit_c_entry (. j handle) nm (str-len name) out)))
-      (do (free nm) (ffi/word-result e out)))))
+      (do (free nm) (err/word-result e out)))))
 
 ;; Parses and checks `src` as a whole module and makes no code: `Ok ()`
 ;; or the diagnostics `lair check` prints, without a file name.
@@ -86,7 +86,7 @@
   (unsafe
     (let ((sp (ffi/bytes-new src))
           (e (lair_check_source sp (str-len src))))
-      (do (free sp) (ffi/status e)))))
+      (do (free sp) (err/status e)))))
 
 ;; The words of a list (the libraries, the directories) as the arguments of `lair_build_executable_with`: an
 ;; array of n pointers to NUL-terminated copies (each a `bytes-new`) and an
@@ -137,4 +137,4 @@
                                            (count (. l copies))
                                            (ffi/addr->ptr (. d names)) (ffi/addr->ptr (. d lens))
                                            (count (. d copies)))))
-        (do (free sp) (free pp) (names-free l) (names-free d) (ffi/status e))))))
+        (do (free sp) (free pp) (names-free l) (names-free d) (err/status e))))))

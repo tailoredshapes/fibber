@@ -4,7 +4,11 @@
 #   root          the repository (a worktree) this is run for
 #   GATE_OUT      scratch for F, F3, stamps, case output; default ~/.cache/fibber-scratch/gate-<name of root>
 #   FIBC | SEED   a fibc to build with (the Rust seed, or any stage 2); SEED may also name a directory holding bin/fibc or fibc
-#   LAIR_DIR      the directory with liblair.so; default: the builder's directory if it has one, else target/debug of the main checkout
+#   LLVM_LINK     how stage 2 links LLVM: `shared` (default: `-L /usr/lib/llvm-21/lib -l LLVM-21`, LLVM_LIBDIR names another directory) or `static`
+#                 (the archives, through the ld script scripts/llvm-static.sh writes under $GATE_OUT)
+#   LAIR_DIR      only for a builder that is the Rust fibc or a release before the flip (it loads liblair.so itself): the directory with liblair.so;
+#                 default: the builder's directory if it has one, else target/debug of the main checkout; a builder with none is fine (a stage 2 needs
+#                 no liblair: it links LLVM)
 #   GATE_FRESH=1  never build from the previous F
 # Without FIBC or SEED: the previous F ($GATE_OUT/F) if it was built from the same lib/prelude.fib (the prelude is embedded in a
 # compiler, so a changed one needs the seed), else the Rust fibc of target/debug, else bin/fibc, else `fibc` on PATH.
@@ -38,16 +42,27 @@ pick_builder() {
   else BUILDER=$(command -v fibc || true); BUILDER_NOTE="from fibc on PATH"; fi
   [ -x "${BUILDER:-}" ] || { echo "stage2.sh: no fibc to build with: set FIBC or SEED" >&2; return 2; }
   if [ -z "${LAIR_DIR:-}" ]; then
-    for d in "$(dirname "$BUILDER")" "${LD_LIBRARY_PATH:-/nonexistent}" "$main_target" "$root/target/debug"; do
+    for d in "$(dirname "$BUILDER")" "$(dirname "$BUILDER")/../lib" "${LD_LIBRARY_PATH:-/nonexistent}" "$main_target" "$root/target/debug"; do
       if [ -e "$d/liblair.so" ]; then LAIR_DIR=$d; break; fi
     done
   fi
-  [ -e "${LAIR_DIR:-/nonexistent}/liblair.so" ] || { echo "stage2.sh: no liblair.so: set LAIR_DIR" >&2; return 2; }
-  export LD_LIBRARY_PATH=$LAIR_DIR
+  # The builder may be a seed that compiles with its own liblair.so (found above, or next to it in a release's lib/); a stage 2 has none.
+  if [ -e "${LAIR_DIR:-/nonexistent}/liblair.so" ]; then export LD_LIBRARY_PATH=$LAIR_DIR; else unset LD_LIBRARY_PATH; fi
+  llvm_link_args
+}
+
+# Sets LLVM_ARGS: the `-L`/`-l` words that link LLVM into a stage 2, by LLVM_LINK (shared or static).
+llvm_link_args() {
+  local libdir=${LLVM_LIBDIR:-/usr/lib/llvm-21/lib}
+  case ${LLVM_LINK:-shared} in
+    shared) LLVM_ARGS=(-L "$libdir" -l LLVM-21) ;;
+    static) read -r -a LLVM_ARGS < <("$root/scripts/llvm-static.sh" "$GATE_OUT/llvm-static") || return 2 ;;
+    *) echo "stage2.sh: LLVM_LINK is shared or static, not ${LLVM_LINK}" >&2; return 2 ;;
+  esac
 }
 
 build_with() { # build_with FIBC OUT: stage 2 from the tree with FIBC
-  (cd "$root" && "$1" build compiler/fibc.fib -I compiler -I lib -L "$LAIR_DIR" -l lair -o "$2")
+  (cd "$root" && "$1" build compiler/fibc.fib -I compiler -I lib "${LLVM_ARGS[@]}" -o "$2")
 }
 
 # stage2_ensure: F built from this tree at $GATE_OUT/F (cached by stamp). Prints what it did.

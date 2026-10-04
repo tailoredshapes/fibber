@@ -238,9 +238,11 @@ are from runs on 2026-10-01):
       lists are not in the repo, only the killing inputs are:
       `compiler/tests/reader/rmut-001..021` and `rmut2-001..006`
       (`rmut2-004..006` are the 250 KB timing inputs).
-- [x] the C interface to `lair` (spec/compiler.md §9): 21 `lair_*`
+- [x] the C interface to `lair` (spec/compiler.md §9): 23 `lair_*`
       functions in `liblair.so` (`nm -D --defined-only
-      target/debug/liblair.so | grep -c ' T lair_'` prints 21),
+      target/debug/liblair.so | grep -c ' T lair_'` prints 23; retired
+      by `native.*` at the flip of the lair-in-fibber line below, kept
+      as a legacy oracle until stage 10),
       declared in `crates/lair/include/lair.h`, which a unit test keeps
       equal to the exports; the fibber bindings `compiler/lair/*.fib`
       and `compiler/jit-demo.fib`, which runs the macro modules of
@@ -324,11 +326,18 @@ Speed: stage 2 takes about 25 s to emit its own source against 13.8 s for
 the Rust (about 5 times slower on small programs: the library is checked
 again for every program). Nothing has been profiled.
 
-`lair` (lIR to native, via LLVM) stays in Rust, as LLVM stays in C++.
-The C interface to `lair` (spec/compiler.md §9) is a stopgap, not a
-design to polish: once there is a compiler, `lair` itself is to be
-rewritten in fibber (owner, 2026-10-01), at which point this line and
-that interface go.
+`lair` (lIR to native, via LLVM) was Rust, as LLVM stays in C++. The C
+interface to `lair` (spec/compiler.md §9) was a stopgap, not a design
+to polish: once there is a compiler, `lair` itself is to be rewritten in
+fibber (owner, 2026-10-01). Lair in fibber (docs/design/lair-in-fibber.md,
+`compiler/lir`, `compiler/native`, `compiler/llvm`, the tool
+`compiler/lairf.fib`): stage 7, the flip, is done when its gate says so
+(scripts/gate.sh --full, the compare scripts against the Rust): the
+compiler's users of lair call `native.api` and `native.call`, a stage 2
+links LLVM itself (shared for development, static for the release) and
+has no `liblair.so`; the Rust `crates/lair`, `crates/lir`, `liblair.so`
+and the Rust `fibc` remain as oracles until stage 10, when this line and
+the interface go.
 
 ## M7. A standard library as ergonomic as Clojure's, as fast as Rust's
 

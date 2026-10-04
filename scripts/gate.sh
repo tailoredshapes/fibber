@@ -8,7 +8,8 @@
 #   -j N               cases run at a time (default 12; the machine has 28 cores and 61 GB, and no more than about 12 heavy jobs at once)
 # Environment (scripts/lib/stage2.sh has the whole list): FIBC or SEED = the fibc that builds stage 2 (CI gives the seed); without
 # them a previous F of the same prelude builds it (the line `build:` says which); GATE_OUT = scratch (F and case output are kept there,
-# and a build is skipped when compiler/ and lib/ are what the cached F was built from); LAIR_DIR = where liblair.so is.
+# and a build is skipped when compiler/ and lib/ are what the cached F was built from); LLVM_LINK = shared (default) or static: how F links
+# LLVM; LAIR_DIR = where the liblair.so of a pre-flip builder is (a builder that is a stage 2 needs none).
 # Takes /tmp/fibsuite.lock for its whole run, so a benchmark (scripts/bench/quick.sh) never overlaps it.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)

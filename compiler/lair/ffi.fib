@@ -1,7 +1,8 @@
 ;; compiler/lair/ffi.fib: what every binding of lair's C interface
 ;; (spec/compiler.md §9, crates/lair/include/lair.h) shares: moving bytes
-;; and words between fibber values and the raw memory C reads, and turning
-;; a `lair_error *` into a `(Result .. str)`.
+;; and words between fibber values and the raw memory C reads. (Turning a
+;; `lair_error *` into a `(Result .. str)` is lair.err's, the legacy
+;; bindings' alone: the compiler no longer links liblair.)
 ;;
 ;; Conventions of the bindings (lair.jit, lair.call, lair.fibm):
 ;;
@@ -31,9 +32,6 @@
 ;;   the call and read with `load-i64` only after a call that reported
 ;;   success: lair leaves an out-parameter untouched on failure.
 (ns lair.ffi)
-
-(extern lair_error_text :private (i64 ptr) -> i64)
-(extern lair_error_free :private (i64) -> unit)
 
 ;; The pointer whose address is a: eight bytes holding a, read back as a
 ;; pointer (fibber has no cast; the idiom of case 189).
@@ -104,25 +102,3 @@
 ;; The NUL-terminated string at address a, copied.
 (defun c-string-at (a: i64) -> str
   (text-at a (c-string-len a)))
-
-;; The message of the `lair_error` e (not null), copied out; e is freed.
-(defun error-text (e: i64) -> str
-  (unsafe
-    (let ((len (slot-new))
-          (at (lair_error_text e len))
-          (text (text-at at (load-i64 len))))
-      (do (free len)
-          (lair_error_free e)
-          text))))
-
-;; What a call that returns a `lair_error *` came to: `Ok ()` for NULL,
-;; else `Err` of the message, the error freed.
-(defun status (e: i64) -> (Result unit str)
-  (if (= e 0) (Ok ()) (Err (error-text e))))
-
-;; The same for a call that also gave a word through the slot `out`: the
-;; word when e is NULL, else the message. `out` is freed either way.
-(defun word-result (e: i64 out: ptr) -> (Result i64 str)
-  (unsafe
-    (let ((r (if (= e 0) (Ok (load-i64 out)) (Err (error-text e)))))
-      (do (free out) r))))

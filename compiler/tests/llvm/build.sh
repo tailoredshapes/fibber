@@ -23,10 +23,7 @@ case $mode in
   shared)
     "$fibc" build -I "$root/compiler" "$root/compiler/tests/llvm/spike.fib" -L "$libdir" -l LLVM-21 -o "$out" ;;
   static)
-    d=$out.static; mkdir -p "$d"
-    archives=$("$lc" --link-static --libfiles core orcjit native passes analysis irreader bitwriter | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ')
-    libs=$("$lc" --link-static --system-libs | sed 's/-l\([a-z0-9_+-]*\)/-l\1/g')
-    printf 'GROUP ( %s AS_NEEDED ( -lstdc++ %s ) )\n' "$archives" "$libs" > "$d/libllvm-static.so"
+    d=$out.static; LLVM_CONFIG=$lc "$root/scripts/llvm-static.sh" "$d" > /dev/null
     "$fibc" build -I "$root/compiler" "$root/compiler/tests/llvm/spike.fib" -L "$d" -l llvm-static -o "$out" ;;
   *) echo "mode is shared or static" >&2; exit 2 ;;
 esac
