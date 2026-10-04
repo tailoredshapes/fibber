@@ -1,0 +1,52 @@
+;; spec:   stdlib §2.8 (BigInt), §4.20
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: big-shift-left big-shift-right gcd expt isqrt big-mul-small big-bit-length
+;; Laws over 250 seeded triples from tl.bigdiff's operand generator, with no oracle but the arithmetic itself
+;; (so they hold in a tree where Java is not at hand): (a+b)-b = a; a*b = b*a; (a+b)*c = a*c + b*c; for b != 0
+;; a = (quot a b) b + (rem a b) with |rem| < |b| and the dividend's sign; shifting left then right by k is the
+;; identity; the gcd divides both and the quotients are coprime; expt multiplies; isqrt r has r^2 <= a <
+;; (r+1)^2; mul-small is a multiplication. The planted fault claims a - b = b - a.
+(ns main (:use tl.check tl.rng tl.bigdiff fib.bigint))
+
+(defun laws-hold? (r: Rng p: bool) -> bool
+  (let [a (gen-big r)
+        b (nonzero (gen-big r))
+        c (gen-big r)
+        k (rng-below r 100)
+        q (quot a b)
+        rm (rem a b)
+        g (gcd a b)
+        sq (isqrt (abs a))
+        m (rng-below r 2147483648)
+        e (rng-below r 4)]
+    (and (if p (= (- a b) (- b a)) (= (- (+ a b) b) a))
+         (= (* a b) (* b a))
+         (= (* (+ a b) c) (+ (* a c) (* b c)))
+         (= a (+ (* q b) rm))
+         (< (abs rm) (abs b))
+         (or (zero? rm) (= (pos? rm) (pos? a)))
+         (= (big-shift-right (big-shift-left a k) k) a)
+         (= (big-shift-left a k) (* a (expt (bigint 2) k)))
+         (or (zero? g) (and (zero? (rem a g)) (zero? (rem b g))))
+         (or (zero? g) (= (gcd (quot a g) (quot b g)) (bigint 1)))
+         (= (expt a (+ e 1)) (* (expt a e) a))
+         (<= (* sq sq) (abs a))
+         (> (* (inc sq) (inc sq)) (abs a))
+         (= (big-mul-small a m) (* a (bigint m)))
+         (= (big-bit-length (big-shift-left (bigint 1) k)) (+ k 1)))))
+
+(defun failures (seed: i64 p: bool) -> i64
+  (let [r (rng seed)]
+    (loop [i 0 bad 0]
+      (if (< i 250) (recur (+ i 1) (if (laws-hold? r p) bad (+ bad 1))) bad))))
+
+(defun main () -> i64
+  (let [c (checks)
+        p (checks)]
+    (do (check c (= (failures 77 false) 0))
+        (check p (= (failures 77 true) 0))
+        (check-detects c p)
+        (checks-result c))))

@@ -1,0 +1,134 @@
+;; tl.bigdiff: the seeded operations of the BigInt differential cases (cases/stdlib/6000-6099), the twin of
+;; scripts/bigint/BigDiff.java: both draw the same operands from tl.rng's xorshift64, compute each kind of
+;; operation with fibber's BigInt and Java's BigInteger, and reduce the decimal text of every result to a
+;; digest (an xorshift step per byte). A case embeds the digest the Java program printed for a kind and
+;; checks that fibber's is the same; `bigdiff-trace` prints the texts, to find the first one that differs.
+;; The thirteen kinds are listed in BigDiff.java's `one`; an operand is drawn by `gen-big`: zero, a digit,
+;; a power of two and its neighbours, random limbs (short, medium and 40 to 160 limbs, the Karatsuba range),
+;; all ones, the edges of an i64, a power of ten and its neighbours, a product of small numbers.
+(ns tl.bigdiff (:use fib.bigint tl.rng))
+
+(defun kinds () -> i64 14)
+(defun kind-iters (k: i64) -> i64
+  (vec-nth [600 600 500 500 400 400 400 300 400 400 400 300 300 60] k))
+
+(defun two (k: i64) -> BigInt (big-shift-left (bigint 1) k))
+(defun big1 () -> BigInt (bigint 1))
+
+(defun rand-bits (r: Rng limbs: i64) -> BigInt
+  (loop [i 0 v (bigint 0)]
+    (if (< i limbs)
+        (recur (+ i 1) (+ (big-shift-left v 31) (bigint (rng-below r 2147483648))))
+        v)))
+
+(defun edge-limb (i: i64) -> i64
+  (vec-nth [0 1 2 1073741823 1073741824 1073741825 2147483646 2147483647] i))
+
+;; limbs drawn from the edge values, where the rare branches of Algorithm D (the add-back) are common
+(defun edge-bits (r: Rng limbs: i64) -> BigInt
+  (loop [i 0 v (bigint 0)]
+    (if (< i limbs)
+        (recur (+ i 1) (+ (big-shift-left v 31) (bigint (edge-limb (rng-below r 8)))))
+        v)))
+
+(defun signed (r: Rng v: BigInt) -> BigInt
+  (if (= (rng-below r 2) 1) (neg v) v))
+
+(defun edge (i: i64) -> BigInt
+  (cond (= i 0) (bigint "-9223372036854775808")
+        (= i 1) (bigint "9223372036854775807")
+        (= i 2) (bigint "-9223372036854775807")
+        (= i 3) (bigint "9223372036854775806")
+        (= i 4) (two 63)
+        (= i 5) (- (neg (two 63)) (big1))
+        (= i 6) (two 62)
+        (= i 7) (two 32)
+        (= i 8) (two 31)
+        :else (- (two 31) (big1))))
+
+(defun gen-big (r: Rng) -> BigInt
+  (let [kind (rng-below r 11)]
+    (cond (= kind 0) (bigint 0)
+          (= kind 1) (bigint (- (rng-below r 19) 9))
+          (= kind 2) (let [k (rng-below r 260)
+                           d (- (rng-below r 3) 1)]
+                       (signed r (+ (two k) (bigint d))))
+          (= kind 3) (signed r (rand-bits r (+ 1 (rng-below r 6))))
+          (= kind 4) (signed r (rand-bits r (+ 1 (rng-below r 40))))
+          (= kind 5) (let [n (+ 1 (rng-below r 8))
+                           w (if (= (rng-below r 2) 0) 31 32)]
+                       (signed r (- (two (* w n)) (big1))))
+          (= kind 6) (signed r (rand-bits r (+ 40 (rng-below r 120))))
+          (= kind 7) (edge (rng-below r 10))
+          (= kind 8) (let [k (rng-below r 80)
+                           p (expt (bigint 10) k)]
+                       (signed r (+ p (bigint (- (rng-below r 3) 1)))))
+          (= kind 10) (signed r (edge-bits r (+ 1 (rng-below r 8))))
+          :else (let [x (rng-below r 2147483648)
+                      y (rng-below r 2147483648)
+                      z (- (rng-below r 3) 1)]
+                  (* (* (bigint x) (bigint y)) (bigint z))))))
+
+(defun nonzero (b: BigInt) -> BigInt (if (zero? b) (big1) b))
+
+;; the digest of a text, one xorshift step per byte, as BigDiff.out
+(defun mix (h: i64 s: str) -> i64
+  (let [bs (str-bytes s)
+        n (array-len bs)
+        step (fn (x) (let [a (bit-xor x (shl x 13))
+                           b (bit-xor a (shr a 7))]
+                       (bit-xor b (shl b 17))))
+        h1 (loop [i 0 h h]
+             (if (< i n)
+                 (recur (+ i 1) (step (bit-xor h (bit-and (sext i64 (array-get bs i)) 255))))
+                 h))]
+    (step (bit-xor h1 256))))
+
+(defun sink (h: (Cell i64) trace: bool s: str) -> unit
+  (do (if trace (println s) ())
+      (set! h (mix @h s))))
+
+(defun mod-of (a: BigInt b: BigInt) -> BigInt (mod a b))
+
+(defun ratio-text (a: BigInt b: BigInt) -> str (str (/ a b)))
+
+(defun one-op (r: Rng h: (Cell i64) trace: bool kind: i64) -> unit
+  (let [a (gen-big r)
+        b (nonzero (gen-big r))
+        out (fn (s) (sink h trace s))]
+    (cond (= kind 0) (out (str (+ a b)))
+          (= kind 1) (out (str (- a b)))
+          (= kind 2) (out (str (* a b)))
+          (= kind 3) (do (out (str (quot a b))) (out (str (rem a b))))
+          (= kind 4) (do (out (str (compare a b))) (out (str (= a b))) (out (str (< a b))))
+          (= kind 5) (let [k (rng-below r 200)]
+                       (do (out (str (big-shift-left a k))) (out (str (big-shift-right a k)))))
+          (= kind 6) (out (str (gcd a b)))
+          (= kind 7) (out (str (expt a (rng-below r 6))))
+          (= kind 8) (let [s (str a)]
+                       (do (out s)
+                           (out (str (neg a)))
+                           (out (str (abs a)))
+                           (if (= (bigint s) a) () (out "PARSE MISMATCH"))))
+          (= kind 9) (do (out (if (big-fits-i64? a) (str (long a)) "nofit"))
+                         (out (if (<= (big-bit-length a) 1000) (str (double a)) "big"))
+                         (out (str (big-bit-length a))))
+          (= kind 10) (let [m (rng-below r 2147483648)]
+                        (do (out (str (big-mul-small a m))) (out (str (mod-of a b)))))
+          (= kind 11) (out (str (isqrt (abs a))))
+          (= kind 12) (out (ratio-text a b))
+          :else (let [x (if (= (rng-below r 2) 1) (edge-bits r (+ 40 (rng-below r 100))) (rand-bits r (+ 40 (rng-below r 160))))
+                      y0 (if (= (rng-below r 2) 1) (edge-bits r (+ 1 (rng-below r 100))) (rand-bits r (+ 1 (rng-below r 200))))
+                      y1 (if (= (rng-below r 2) 1) (rand-bits r (+ 40 (rng-below r 60))) y0)
+                      y (nonzero y1)]
+                  (do (out (str (* x y)))
+                      (out (str (quot x y)))
+                      (out (str (rem x y)))
+                      (out (str (* x x))))))))
+
+;; the digest of kind k's iterations, or their texts when trace
+(defun bigdiff-run (k: i64 trace: bool) -> i64
+  (let [r (rng (+ 1000 k))
+        h (cell 1)]
+    (do (dotimes (i (kind-iters k)) (one-op r h trace k))
+        @h)))

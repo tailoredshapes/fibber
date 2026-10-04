@@ -1,0 +1,76 @@
+;; fib.bigint.magmul: the product of two magnitudes (fib.bigint.mag): schoolbook below KARATSUBA-LIMBS limbs
+;; of the shorter operand, Karatsuba above, and an unbalanced product (one operand twice the other or more)
+;; is cut into pieces as long as the shorter one. KARATSUBA-LIMBS is measured (scripts/bench or the
+;; README of the library): the crossover is where the recursion's extra additions and copies cost what the
+;; saved limb products do.
+(ns fib.bigint.magmul (:use fib.bigint.mag))
+
+(def KARATSUBA-LIMBS: i64 40)
+
+;; r += x at limb offset off; r must be long enough that the carry stops inside it
+(defun mag-add-at! (&r: (Array i64) off: i64 x: (Array i64)) -> unit
+  (let [n (array-len x)]
+    (loop [i 0 carry 0]
+      (if (or (< i n) (> carry 0))
+          (let [t (+ (+ (array-get @r (+ off i)) (if (< i n) (array-get x i) 0)) carry)]
+            (do (array-set! &r (+ off i) (bit-and t MAG-MASK))
+                (recur (+ i 1) (shr t 31))))
+          ()))))
+
+(defun mag-mul-school (a: (Array i64) b: (Array i64)) -> (Array i64)
+  (let [la (array-len a) lb (array-len b)
+        c (cell (array (+ la lb) 0))]
+    (do (loop [i 0]
+          (if (< i la)
+              (let [ai (array-get a i)
+                    carry (loop [j 0 carry 0]
+                            (if (< j lb)
+                                (let [t (+ (+ (* ai (array-get b j)) (array-get @c (+ i j))) carry)]
+                                  (do (array-set! &c (+ i j) (bit-and t MAG-MASK))
+                                      (recur (+ j 1) (shr t 31))))
+                                carry))]
+                (do (array-set! &c (+ i lb) carry) (recur (+ i 1))))
+              ()))
+        (mag-norm @c))))
+
+;; the low h limbs of a, normalised, and the rest
+(defun mag-low (a: (Array i64) h: i64) -> (Array i64)
+  (if (>= h (array-len a)) a (mag-norm (array-copy a 0 h))))
+(defun mag-high (a: (Array i64) h: i64) -> (Array i64)
+  (if (>= h (array-len a)) (mag-empty) (array-copy a h (array-len a))))
+
+;; a >= b in length, a < 2 b: one level of Karatsuba
+(defun mag-mul-kara (a: (Array i64) b: (Array i64)) -> (Array i64)
+  (let [la (array-len a) lb (array-len b)
+        h (quot la 2)
+        a0 (mag-low a h) a1 (mag-high a h)
+        b0 (mag-low b h) b1 (mag-high b h)
+        z0 (mag-mul a0 b0)
+        z2 (mag-mul a1 b1)
+        z1 (mag-sub (mag-sub (mag-mul (mag-add a0 a1) (mag-add b0 b1)) z0) z2)
+        c (cell (array (+ la lb) 0))]
+    (do (mag-add-at! &c 0 z0)
+        (mag-add-at! &c h z1)
+        (mag-add-at! &c (* 2 h) z2)
+        (mag-norm @c))))
+
+;; a much longer than b: a in pieces of len b
+(defun mag-mul-pieces (a: (Array i64) b: (Array i64)) -> (Array i64)
+  (let [la (array-len a) lb (array-len b)
+        c (cell (array (+ la lb) 0))]
+    (do (loop [off 0]
+          (if (< off la)
+              (let [hi (if (< (+ off lb) la) (+ off lb) la)
+                    piece (mag-norm (array-copy a off hi))]
+                (do (mag-add-at! &c off (mag-mul piece b)) (recur hi)))
+              ()))
+        (mag-norm @c))))
+
+(defun mag-mul (a: (Array i64) b: (Array i64)) -> (Array i64)
+  (let [la (array-len a) lb (array-len b)]
+    (cond (or (= la 0) (= lb 0)) (mag-empty)
+          (< la lb) (mag-mul b a)
+          (= lb 1) (mag-mul-small a (array-get b 0))
+          (< lb KARATSUBA-LIMBS) (mag-mul-school a b)
+          (>= la (* 2 lb)) (mag-mul-pieces a b)
+          :else (mag-mul-kara a b))))
