@@ -14,7 +14,8 @@ use std::ptr;
 
 use llvm_sys::analysis::{LLVMVerifierFailureAction, LLVMVerifyModule};
 use llvm_sys::core::{
-    LLVMAddFunction, LLVMAddGlobal, LLVMSetFunctionCallConv, LLVMSetGlobalConstant,
+    LLVMAddAttributeAtIndex, LLVMAddFunction, LLVMAddGlobal, LLVMCreateEnumAttribute,
+    LLVMGetEnumAttributeKindForName, LLVMSetFunctionCallConv, LLVMSetGlobalConstant,
     LLVMSetInitializer, LLVMSetLinkage, LLVMSetVisibility, LLVMStructCreateNamed,
     LLVMStructSetBody,
 };
@@ -169,8 +170,21 @@ impl Lx {
         unsafe {
             LLVMSetFunctionCallConv(f, cc_number(ty.cc));
             set_modifiers(f, mods);
+            if is_slow_path(name) {
+                self.add_noinline(f);
+            }
         }
         self.funcs.insert(name.to_string(), (f, ty.clone()));
+    }
+
+    /// The function attribute `noinline` on `f`.
+    ///
+    /// # Safety
+    /// `f` is a function of the live context.
+    unsafe fn add_noinline(&self, f: LLVMValueRef) {
+        let kind = LLVMGetEnumAttributeKindForName(b"noinline".as_ptr().cast(), 8);
+        let attr = LLVMCreateEnumAttribute(self.ctx, kind, 0);
+        LLVMAddAttributeAtIndex(f, FUNCTION_INDEX, attr);
     }
 
     /// A global; a definition gets its initialiser later, a
@@ -185,6 +199,17 @@ impl Lx {
     }
 }
 
+/// LLVM's index of the attributes of a function itself (`LLVMAttributeFunctionIndex`).
+const FUNCTION_INDEX: u32 = u32::MAX;
+
+/// A function whose name ends in `-slow` is the out-of-line path of an inlinable fast path (the
+/// runtime's `fib.release` and `fib.release-slow`): it is never inlined. Without this LLVM inlines
+/// an internal function that has one call site, whatever its size, so the slow path swells the
+/// fast path until that is no longer inlined into its own callers.
+fn is_slow_path(name: &str) -> bool {
+    name.ends_with("-slow")
+}
+
 fn hidden(hidden: bool) -> Modifiers {
     Modifiers {
         linkage: Linkage::External,
@@ -196,6 +221,30 @@ fn hidden(hidden: bool) -> Modifiers {
 mod tests {
     use super::*;
     use crate::llvm::target::Machine;
+
+    /// A `-slow` function is `noinline`; any other is not (the runtime's fast paths stay inlinable).
+    #[test]
+    fn a_slow_path_function_is_noinline_and_others_are_not() {
+        use llvm_sys::core::{LLVMGetEnumAttributeAtIndex, LLVMGetNamedFunction};
+        let src = "(define internal (f-slow void) () (block entry (ret)))\n\
+                   (define internal (f void) () (block entry (call @f-slow) (ret)))\n\
+                   (define (main i32) () (block entry (call @f) (ret (i32 0))))";
+        let m = lir::parse(src).unwrap();
+        lir::check(&m).unwrap();
+        let host = Machine::host(0).unwrap();
+        let owned = lower(&m, "t", &host.triple, &host.data_layout).unwrap();
+        // SAFETY: the module is alive; the names are NUL-terminated.
+        unsafe {
+            let kind = LLVMGetEnumAttributeKindForName(b"noinline".as_ptr().cast(), 8);
+            let has = |n: &[u8]| {
+                let f = LLVMGetNamedFunction(owned.module(), n.as_ptr().cast());
+                !LLVMGetEnumAttributeAtIndex(f, FUNCTION_INDEX, kind).is_null()
+            };
+            assert!(has(b"f-slow\0"));
+            assert!(!has(b"f\0"));
+            assert!(!has(b"main\0"));
+        }
+    }
 
     /// The LLVM verifier is the backstop behind lIR's checker: a module
     /// that skipped the checker and is invalid is an internal error,
