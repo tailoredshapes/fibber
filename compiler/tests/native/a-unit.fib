@@ -1,0 +1,24 @@
+;; compiler/tests/native/a-unit.fib: unit tests of native.link (package A), the cases of crates/lair/src/aot/link.rs `tests`. Prints `ok` or one line per failure; exit 1 on a failure.
+;; Build with the LLVM link line (native.aot is not required here, native.link needs only libc): fibc build compiler/tests/native/a-unit.fib -I compiler -I lib -o OUT
+(ns main
+  (:require [native.link :as link] [native.error :as err]))
+
+(defun check (name: str ok: bool) -> i64
+  (if ok 0 (do (println "FAIL" name) 1)))
+
+(defun err-text (r: (Result str str)) -> str
+  (match r ((Err m) m) ((Ok p) (str "ok " p))))
+
+(defun main () -> i64
+  (let ((n (reduce (fn (a: i64 b: i64) (+ a b)) 0
+             [(check "no dirs, no libs: the base libraries" (= (link/link-args [] []) ["-lm" "-lpthread"]))
+              (check "each directory is searched and an rpath, each library comes last"
+                     (= (link/link-args ["/a" "/b c"] ["x" "y"])
+                        ["-lm" "-lpthread" "-L/a" "-Xlinker" "-rpath" "-Xlinker" "/a" "-L/b c" "-Xlinker" "-rpath" "-Xlinker" "/b c" "-lx" "-ly"]))
+              (check "object path beside the output" (= (link/object-path "/tmp/x/prog") "/tmp/x/prog.lair.o"))
+              (check "object path of a bare name" (= (link/object-path "prog") "prog.lair.o"))
+              (check "a missing directory is refused with the OS text"
+                     (= (err-text (link/library-dir "/no/such/lair-dir")) "-L /no/such/lair-dir: No such file or directory (os error 2)"))
+              (check "a file is not a directory" (= (err-text (link/library-dir "/etc/passwd")) "-L /etc/passwd: not a directory"))
+              (check "the current directory is made absolute" (starts-with? (err-text (link/library-dir ".")) "ok /"))])))
+    (do (if (= n 0) (println "ok") (println "failed")) n)))
