@@ -1,0 +1,22 @@
+;; spec:   types §4.2, §6.4; lever C of batch 4
+;; expect: accept
+;; result: 55
+;; audit:  clean
+;; `depth` calls the method `weigh`, and `weigh` calls `depth` again with a part of its receiver: a cycle through a method. The method
+;; names a `defun` that is not decided yet when `depth` first calls it, so it is decided at its own place, after `depth`, and the call in
+;; `depth` uses the protocol's default (the receiver escapes: a heap object); the call in `weigh` finds the summary of `depth`. The sum is
+;; 10 + 9 + .. + 1 over the chain of ten nodes, checking both sides keep their counts.
+(defstruct Node (n: i64 next: (Option Node)))
+(defprotocol Weigh (weigh (self) -> i64))
+
+(defun depth (x: (Option Node)) -> i64
+  (match x
+    ((some nd) (weigh nd))
+    (nil 0)))
+
+(defun chain (k: i64) -> (Option Node)
+  (if (= k 0) nil (some (Node k (chain (- k 1))))))
+
+(impl Weigh Node (weigh (self) (+ (. self n) (depth (. self next)))))
+
+(defun main () -> i64 (depth (chain 10)))

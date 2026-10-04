@@ -11,10 +11,10 @@
 ;;   the keys of each unit's bodies and its finished facts, in `OwnedProgram.unit-facts`.
 (ns own.top
   (:use syntax.pos types.ast types.decls types.table types.program types.display types.infer.mod own.error
-        own.objects own.program own.facts own.walk.state own.walk.lit own.unit own.taken))
+        own.objects own.program own.facts own.walk.state own.walk.lit own.unit own.taken own.refs))
 
 ;; What the pass has so far: the program being made and the errors found.
-(defstruct TopState (prog: OwnedProgram errors: (Vec OwnError)))
+(defstruct TopState (prog: OwnedProgram errors: (Vec OwnError) hoisted: (Set (Pair i64 i64))))
 
 ;; Rust: top.rs:76 `seen`: tells the program the keys of a decided unit's bodies, in the order
 ;; stored, and its finished facts.
@@ -107,7 +107,7 @@
         bindings (vec (mapcat (fn (f: i64) (param-bindings (g-fun g f))) fs))
         members (reduce (fn (m: (Map i64 (Vec i64)) f: i64) (assoc m f (param-bindings (g-fun g f))))
                         (map-empty) fs)
-        done (decide p (. (. t prog) summaries) (scc-bodies p fs false)
+        done (decide p (. (. t prog) summaries) (. (. t prog) bodies) (scc-bodies p fs false)
                      (facts-new members (into (set-empty) bindings) []))
         o1 (reduce (fn (o: OwnedProgram f: i64)
                      (with o (summaries (assoc (. o summaries) f (facts-summary (. done facts) p f)))))
@@ -121,10 +121,10 @@
                    e1 (. done bodies))
         o2 (store o1 (. done bodies))]
     (if (some? (find-first (fn (f: i64) (contains? (. o2 value-taken) f)) fs))
-      (let [owned (decide p (. o2 summaries) (scc-bodies p fs true)
+      (let [owned (decide p (. o2 summaries) (. o2 bodies) (scc-bodies p fs true)
                           (facts-new members (set-empty) bindings))]
-        (TopState (store (observe o2 owned) (. owned bodies)) e2))
-      (TopState o2 e2))))
+        (TopState (store (observe o2 owned) (. owned bodies)) e2 (. t hoisted)))
+      (TopState o2 e2 (. t hoisted)))))
 
 ;; Rust: top.rs:306 `method_spec`: a method body with its declared kinds (syntax §3.10).
 (defun method-spec (p: TypedProgram i: i64 m: i64) -> BodySpec
@@ -146,7 +146,7 @@
 ;; (§8.4): the body decided afresh with every object parameter owned (declared, like an
 ;; all-owned body's). The declared kinds were checked on the method's own body; this one reports
 ;; nothing.
-(defun method-owned :private (p: TypedProgram i: i64 m: i64 summaries: (Map i64 Summary)) -> Decided
+(defun method-owned :private (p: TypedProgram i: i64 m: i64 summaries: (Map i64 Summary) bodies: (Map BodyKey BodyOwn)) -> Decided
   (let [spec (method-spec p i m)
         owned (with spec
                 (params (mapv (fn (pr: (Pair i64 ParamIn))
@@ -156,7 +156,7 @@
                               (. spec params))))
         preset (vec (keep (fn (pr: (Pair i64 ParamIn)) (match (. pr snd) ((PiObj _) (some (. pr fst))) (_ nil)))
                           (. owned params)))]
-    (decide p summaries (Unit [(Pair (BodyMethodOwned i m) owned)] [] false)
+    (decide p summaries bodies (Unit [(Pair (BodyMethodOwned i m) owned)] [] false)
             (facts-new (map-empty) (set-empty) preset))))
 
 ;; Rust: top.rs:318 `impl_escapes`: `implementation of P/m for T makes parameter p escape; the
@@ -179,7 +179,7 @@
         spec (method-spec p i m)
         preset (vec (keep (fn (pr: (Pair i64 ParamIn)) (if (= (. pr snd) (PiObj true)) (some (. pr fst)) nil))
                           (. spec params)))
-        done (decide p (. (. t prog) summaries) (Unit [(Pair (BodyMethod i m) spec)] [] false)
+        done (decide p (. (. t prog) summaries) (. (. t prog) bodies) (Unit [(Pair (BodyMethod i m) spec)] [] false)
                      (facts-new (map-empty) (set-empty) preset))
         o1 (observe (. t prog) done)
         errs (reduce (fn (es: (Vec OwnError) j: i64)
@@ -190,9 +190,9 @@
                      (. t errors) (range (count (. im params))))
         o2 (store o1 (. done bodies))]
     (if (contains? (. o2 methods-taken) (Pair i m))
-      (let [owned (method-owned p i m (. o2 summaries))]
-        (TopState (store (observe o2 owned) (. owned bodies)) errs))
-      (TopState o2 errs))))
+      (let [owned (method-owned p i m (. o2 summaries) (. o2 bodies))]
+        (TopState (store (observe o2 owned) (. owned bodies)) errs (. t hoisted)))
+      (TopState o2 errs (. t hoisted)))))
 
 ;; One unit of the program, in checking order.
 (defun top-unit :private (p: TypedProgram t: TopState u: UnitRef) -> TopState
@@ -202,16 +202,50 @@
     ((UImplMethod i m) (method-unit p t i m))
     ((UDef d)
      (let [spec (BodySpec FkDef [] [] (. (g-def (. p globals) d) init))
-           done (decide p (. (. t prog) summaries) (Unit [(Pair (BodyDef d) spec)] [] false) (facts-empty))]
-       (TopState (store (observe (. t prog) done) (. done bodies)) (. t errors))))))
+           done (decide p (. (. t prog) summaries) (. (. t prog) bodies) (Unit [(Pair (BodyDef d) spec)] [] false) (facts-empty))]
+       (TopState (store (observe (. t prog) done) (. done bodies)) (. t errors) (. t hoisted))))))
+
+;; Not in the Rust. The `impl` methods come after the `defun`s of their module in checking order, so a caller would never find the
+;; facts of the method it calls (§6.4: the escape facts of the impl, for a call that resolves to it). `hoist-method` decides the unit
+;; of method `(i, m)` ahead of the first unit that names it, when every `defun` the method names has its summary already (a missing
+;; one would be read as borrowed, not as the callee's inferred kind) and, first, the methods it names in turn. A method that is not
+;; ready is decided at its place and its callers use the protocol's kinds, as they did.
+(defun hoist-method :private (p: TypedProgram known: (Set (Pair i64 i64)) t: TopState key: (Pair i64 i64)
+                              visiting: (Set (Pair i64 i64))) -> TopState
+  (if (or (not (contains? known key)) (contains? (. t hoisted) key) (contains? visiting key))
+    t
+    (let [r (unit-refs p (UImplMethod (. key fst) (. key snd)))]
+      (if (every? (fn (f: i64) (contains? (. (. t prog) summaries) f)) (vec (. r funs)))
+        (let [t1 (hoist-methods p known t (. r methods) (conj visiting key))
+              t2 (method-unit p t1 (. key fst) (. key snd))]
+          (with t2 (hoisted (conj (. t2 hoisted) key))))
+        t))))
+
+(defun hoist-methods :private (p: TypedProgram known: (Set (Pair i64 i64)) t: TopState ms: (Set (Pair i64 i64))
+                               visiting: (Set (Pair i64 i64))) -> TopState
+  (reduce (fn (a: TopState key: (Pair i64 i64)) (hoist-method p known a key visiting))
+          t (sort (vec ms))))
+
+;; One unit in the order of the pass: the method units it names first, and a method unit already decided ahead of its place not again.
+(defun order-unit :private (p: TypedProgram known: (Set (Pair i64 i64)) t: TopState u: UnitRef) -> TopState
+  (match u
+    ((UImplMethod i m) (if (contains? (. t hoisted) (Pair i m)) t (top-unit p t u)))
+    (_ (top-unit p (hoist-methods p known t (. (unit-refs p u) methods) (set-empty)) u))))
+
+;; The method units of the program.
+(defun method-units :private (p: TypedProgram) -> (Set (Pair i64 i64))
+  (reduce (fn (acc: (Set (Pair i64 i64)) u: UnitRef)
+            (match u ((UImplMethod i m) (conj acc (Pair i m))) (_ acc)))
+          (set-empty) (. p units)))
 
 ;; Rust: top.rs:25 `analyse`: runs the ownership pass over a typed program: the `OwnedProgram`
 ;; (with the facts of each unit in `unit-facts`), or the ownership errors.
 (defun analyse (p: TypedProgram) -> (Result OwnedProgram (Vec OwnError))
-  (let [t (reduce (fn (t: TopState u: UnitRef) (top-unit p t u))
+  (let [known (method-units p)
+        t (reduce (fn (t: TopState u: UnitRef) (order-unit p known t u))
                   (TopState (with (owned-program-new)
                               (value-taken (value-taken p))
                               (methods-taken (methods-taken p)))
-                            [])
+                            [] (set-empty))
                   (. p units))]
     (if (empty? (. t errors)) (Ok (. t prog)) (Err (. t errors)))))

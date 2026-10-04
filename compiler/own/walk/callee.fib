@@ -2,7 +2,7 @@
 ;; (spec/types.md §6.3), as crates/fibref/src/own/walk/callee.rs (155 lines of Rust). Package O3;
 ;; `Walker`'s methods are functions of the walker (own.walk.state).
 (ns own.walk.callee
-  (:use fib.coll.record types.ast types.decls types.builtins types.program own.program own.facts own.walk.state))
+  (:use fib.coll.record types.ast types.decls types.table types.builtins types.program types.infer.cx own.program own.facts own.refs own.walk.state))
 
 ;; One parameter position of a callee: its class, whether it escapes, whether it is an `&`
 ;; position, the operand of `weak` (no count, but an escape), the operand of `raw-retained`.
@@ -73,6 +73,26 @@
                  owned (match mp ((some m) (. m owned)) (_ false))
                  borrow (match mp ((some m) (. m borrow)) (_ false))]
              (param (if owned ClOwned ClBorrow) (not borrow)))))))
+
+;; Not in the Rust (spec/types.md §6.4): for a call whose method resolves to an instance, the escape of each position is the one
+;; the implementation's own body decided, when its unit has been decided; the count kind stays the protocol's (the body is compiled
+;; with the declared kinds). Every other call keeps the protocol's defaults: a bound of the enclosing scheme, `dyn`, a built-in
+;; instance, an implementation not decided yet.
+(defun impl-params (w: Walker head: Expr c: Callee ps: (Vec Param)) -> (Vec Param)
+  (match c
+    ((CalMethod _ i)
+     (match (get (. (w-p w) resolutions) (. head id))
+       ((some (ResInstance k _))
+        (match (impl-method-of (. (w-p w) globals) k i)
+          ((some m)
+           (match (get (. (. w cx) bodies) (BodyMethod k m))
+             ((some b) :when (= (count (. b params)) (count ps))
+              (mapv (fn (j: i64) (with (nth ps j) (escapes (and (. (nth ps j) escapes) (. (nth (. b params) j) escapes)))))
+                    (range (count ps))))
+             (_ ps)))
+          (_ ps)))
+       (_ ps)))
+    (_ ps)))
 
 ;; Rust: walk/callee.rs:140 `builtin_param`: the position of a builtin's argument by how it escapes.
 (defun builtin-param :private (b: i64 e: Escape) -> Param

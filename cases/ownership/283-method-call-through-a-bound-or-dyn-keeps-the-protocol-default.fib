@@ -1,0 +1,39 @@
+;; spec:   types §4.2, §4.3, §6.4; lever C of batch 4
+;; expect: accept
+;; result: 333833500
+;; audit:  clean
+;; Only a call that the checker resolved to an instance reads the implementation's escape facts. A call on a receiver whose type is a
+;; bounded variable of the enclosing function (`via-bound`) or a `(dyn P)` keeps the protocol's default, every position escaping: the
+;; receiver of `kept-via-bound` may be any instance, here `Big`, whose `keep` stores `self` (the first instance, `Tiny`, does not): the
+;; receiver must survive the call as a heap object.
+;; `make-kept` returns the stored receiver out of its frame and `clobber` (the sum of 1 .. 40 is 820) writes over the stack where that
+;; frame was, so a receiver left on the stack reads the pad. The result is the sum of the squares below 1000 through `Area`
+;; (332833500), plus the stored receiver's `s` (1000000), plus 0 for the clobber and for the `dyn` call (49 less 49).
+(defstruct Sq (s: i64))
+(defstruct Big (s: i64))
+(defprotocol Area (area (self) -> i64))
+(defstruct Tiny (s: i64))
+(defprotocol Keep (keep (self) -> (Vec Big)))
+(impl Area Sq (area (self) (* (. self s) (. self s))))
+(impl Keep Tiny (keep (self) (vec-empty)))
+(impl Keep Big (keep (self) (vec-conj (vec-empty) self)))
+
+(defun via-bound (x: a) -> i64 :where ((Area a)) (area x))
+(defun kept-via-bound (x: a) -> (Vec Big) :where ((Keep a)) (keep x))
+(defun make-kept (n: i64) -> (Vec Big) (let ((v (kept-via-bound (Big n)))) v))
+
+(defstruct Pad (a: i64 b: i64 c: i64 d: i64))
+(defun clobber (n: i64) -> i64
+  (if (= n 0)
+      0
+      (let ((p (Pad n n n n))) (+ (. p a) (clobber (- n 1))))))
+
+(defun main () -> i64
+  (let ((squares (loop ((i 0) (acc 0))
+                   (if (< i 1000)
+                       (recur (+ i 1) (+ acc (via-bound (Sq i))))
+                       acc)))
+        (v (make-kept 1000000))
+        (junk (clobber 40))
+        (d (dyn Area (Sq 7))))
+    (+ (+ squares (. (nth v 0) s)) (+ (- junk 820) (- (area d) 49)))))

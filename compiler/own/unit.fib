@@ -29,7 +29,7 @@
    literals: (Set i64) wants: (Set i64)))
 
 ;; What every walk of a unit shares.
-(defstruct Run (p: TypedProgram summaries: (Map i64 Summary) unit: Unit))
+(defstruct Run (p: TypedProgram summaries: (Map i64 Summary) bodies: (Map BodyKey BodyOwn) unit: Unit))
 
 ;; Walks one body with a new walker and adds what it found to `w`.
 (defun walk-one :private (w: Walked cx: Ctx spec: BodySpec) -> Walked
@@ -53,7 +53,7 @@
   (let [unit (. r unit)]
     (reduce (fn (w: Walked pair: (Pair BodyKey BodySpec))
               (walk-one w (Ctx (. r p) (. r summaries) facts (. unit scc) (. unit all-owned)
-                               sites admit local dead steal amp reuse)
+                               sites admit local dead steal amp reuse (. r bodies))
                         (. pair snd)))
             (Walked [] [] (map-empty) (map-empty) (set-empty) (set-empty))
             (. unit bodies))))
@@ -113,8 +113,8 @@
                           (set-empty) (. unit bodies))))))
 
 ;; Rust: unit.rs:101 `decide`: decides a unit, starting from `facts`.
-(defun decide (p: TypedProgram summaries: (Map i64 Summary) unit: Unit facts: Facts) -> Decided
-  (let [r (Run p summaries unit)
+(defun decide (p: TypedProgram summaries: (Map i64 Summary) bodies: (Map BodyKey BodyOwn) unit: Unit facts: Facts) -> Decided
+  (let [r (Run p summaries bodies unit)
         sites (. (run-walk r facts nil false (set-empty) (set-empty) (set-empty) (set-empty) (map-empty)) tails)
         settled (settle r sites facts)
         admitted (run-walk r settled (some sites) true (set-empty) (set-empty) (set-empty) (set-empty) (map-empty))
@@ -131,7 +131,7 @@
         emitted (run-walk r done (some sites) true local dead steal amp reuse)
         wanted (wanted-params unit (. emitted wants) done)]
     (if (not (empty? wanted))
-      (decide p summaries unit (reduce (fn (g: Facts b: i64) (facts-want-owned g b)) done wanted))
+      (decide p summaries bodies unit (reduce (fn (g: Facts b: i64) (facts-want-owned g b)) done wanted))
       (Decided (mapv (fn (pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
                      (let [key (. (. pair fst) fst)
                            spec (. (. pair fst) snd)

@@ -1,0 +1,21 @@
+;; spec:   types §4.2, §6.4; lever C of batch 4
+;; expect: accept
+;; result: 1000
+;; audit:  clean
+;; The ownership pass decides an `impl` method ahead of its first caller so that the caller can use its escape facts, and only when
+;; every `defun` the method names has been decided: `total` comes first in checking order (it names nothing of `grow`), the method
+;; names `grow`, which returns its parameter, so takes it owned. Reading `grow` as the borrowed, escaping parameter of a function with no
+;; summary yet would leave the method's argument counted twice (one count for the callee that returns it, one released by the caller),
+;; a double free the audit reports.
+(defstruct Sq (s: i64))
+(defprotocol Area (area (self) -> i64))
+
+(defun total (n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n) (recur (+ i 1) (+ acc (area (Sq 1)))) acc)))
+
+(defun grow (v: (Vec i64)) -> (Vec i64) v)
+
+(impl Area Sq (area (self) (vec-count (grow (vec-conj (vec-empty) (. self s))))))
+
+(defun main () -> i64 (total 1000))

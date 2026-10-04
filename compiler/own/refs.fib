@@ -1,0 +1,37 @@
+;; compiler/own/refs.fib: what the body of a unit names that the ownership pass needs decided first (not in the Rust): the `defun`s it
+;; calls or names, and the `impl` methods its method calls statically resolve to. own.top reads it to run an `impl` method's unit
+;; before the first unit that calls the method, so that the caller can use the method's own escape facts (spec/types.md §6.4).
+(ns own.refs
+  (:use types.ast types.decls types.table types.program types.infer.cx types.infer.mod))
+
+;; The `defun`s a body names and the method implementations `(instance, method)` a method call of it resolves to an instance of.
+(defstruct Refs (funs: (Set i64) methods: (Set (Pair i64 i64))))
+
+;; The position in the instance `k` of the implementation of method `i` of its protocol: the `m` of `UImplMethod k m`.
+(defun impl-method-of (g: Globals k: i64 i: i64) -> (Option i64)
+  (let [ms (. (table-get (. g instances) k) methods)]
+    (find-first (fn (m: i64) (= (. (nth ms m) index) i)) (range (count ms)))))
+
+;; Adds what `e` and its sub-expressions name to `acc`.
+(defun refs-in :private (p: TypedProgram e: Expr acc: Refs) -> Refs
+  (let [here (match (. e kind)
+               ((EGlobal (GFun f)) (with acc (funs (conj (. acc funs) f))))
+               ((EGlobal (GMethod _ i))
+                (match (get (. p resolutions) (. e id))
+                  ((some (ResInstance k _))
+                   (match (impl-method-of (. p globals) k i)
+                     ((some m) (with acc (methods (conj (. acc methods) (Pair k m)))))
+                     (_ acc)))
+                  (_ acc)))
+               (_ acc))]
+    (reduce (fn (a: Refs c: Expr) (refs-in p c a)) here (expr-children e))))
+
+;; The names in the bodies of a unit.
+(defun unit-refs (p: TypedProgram u: UnitRef) -> Refs
+  (let [g (. p globals)
+        none (Refs (set-empty) (set-empty))]
+    (match u
+      ((UScc fs) (reduce (fn (a: Refs f: i64) (refs-in p (. (g-fun g f) body) a)) none fs))
+      ((UMacro f) (refs-in p (. (g-fun g f) body) none))
+      ((UImplMethod i m) (refs-in p (. (nth (. (table-get (. g instances) i) methods) m) body) none))
+      ((UDef d) (refs-in p (. (g-def g d) init) none)))))

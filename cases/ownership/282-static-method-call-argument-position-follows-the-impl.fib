@@ -1,0 +1,31 @@
+;; spec:   types §4.2, §6.4; lever C of batch 4
+;; expect: accept
+;; result: 3005
+;; audit:  clean
+;; The second parameter of `Put` is read by `Tally`'s implementation and stored by `Bag`'s: one protocol position is a non-escaping
+;; position for one statically resolved call and an escaping one for the other. `(put (Tally 0) (Sq 3))` builds receiver and argument in
+;; the caller's frame; `(put bag (Sq 5))` in `fill` must heap-allocate its argument, which the bag it returns keeps. `clobber` writes over
+;; the stack where the frame of `fill` was, so a bag whose element lived there reads the pad (820 is the sum of 1 .. 40), not 5.
+;; The result is 1000 times 3, plus the 5 read back from the bag.
+(defstruct Sq (s: i64))
+(defstruct Pad (a: i64 b: i64 c: i64 d: i64))
+(defstruct Tally (n: i64))
+(defstruct Bag (items: (Vec Sq)))
+(defprotocol Put (put (self x: Sq) -> i64))
+(defprotocol Fill (fill (self x: Sq) -> Bag))
+(impl Put Tally (put (self x) (+ (. self n) (. x s))))
+(impl Fill Bag (fill (self x) (Bag (vec-conj (. self items) x))))
+
+(defun fill-with-five (b: Bag) -> Bag (fill b (Sq 5)))
+
+(defun clobber (n: i64) -> i64
+  (if (= n 0)
+      0
+      (let ((p (Pad n n n n))) (+ (. p a) (clobber (- n 1))))))
+
+(defun main () -> i64
+  (let ((bag (fill-with-five (Bag (vec-empty))))
+        (sum (loop ((i 0) (acc 0))
+               (if (< i 1000) (recur (+ i 1) (+ acc (put (Tally 0) (Sq 3)))) acc))))
+    (let ((junk (clobber 40)))
+      (+ (+ sum (. (nth (. bag items) 0) s)) (- junk 820)))))

@@ -754,10 +754,12 @@ plain function (§3.1). `:owned` declares that the caller hands the
 parameter over with one count and every implementation releases it or
 hands it on (types §6.4, D5): the convention an implementation needs to
 pass the parameter on in a tail call without a frame. A `defun`'s kinds
-are inferred (§3.1); a method's are declared, because callers are
-compiled against the protocol, not the implementation, and an
-implementation is compiled with the declared kind whatever its body
-would have inferred. Only a `:borrow` parameter may receive a
+are inferred (§3.1); a method's are declared, because a call through a
+bound or `dyn` is compiled against the protocol, not the
+implementation, and an implementation is compiled with the declared
+kind whatever its body would have inferred. (A call that statically
+resolves to an implementation takes that body's escape fact in place
+of the default; the count kind stays the declared one: types §6.4.) Only a `:borrow` parameter may receive a
 non-escaping closure or a closure that captures an `&` parameter
 (cases 08, 18). A method signature that mentions a closure type without
 a colour (`(fn (a) unit)`) accepts closures of any colour; `(fn :send

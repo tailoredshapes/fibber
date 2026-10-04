@@ -1380,9 +1380,10 @@ because bounded variables are keyed by their full type argument
 (§4.3), so this covers every method call outside `(dyn P)`.
 Consequences: no dispatch cost, scalars unboxed in generic code, and
 retain/release in generic code emitted knowing which values are
-objects. The escape kinds a caller relies on
-are the ones declared on the protocol (§6.4), so the caller never needs
-to see the implementation.
+objects. The count kinds a caller relies on are the ones declared on
+the protocol (§6.4). The escape kinds are the protocol's too, except
+for a call the checker resolved to an instance, where they are the
+implementation's own (§6.4, "Static calls").
 
 ### 4.3 Monomorphisation
 
@@ -1957,9 +1958,41 @@ declaration: `implementation of P/m for T makes parameter p escape;
 the protocol declares it :borrow`. A body is compiled with the declared
 count kind whatever it would have inferred, which can cost it a retain,
 or a tail call by rule (e), but never a verdict, so `:owned` needs no
-check. Callers use the declared kinds whichever implementation runs,
-which keeps summaries modular under dynamic dispatch and separate
-compilation (**Decided**). A default method body (§4.1) is checked and
+check. Callers use the declared **count** kinds whichever implementation
+runs (the body is compiled with them), which keeps the calling
+convention modular under dynamic dispatch and separate compilation
+(**Decided**).
+
+**Static calls** (lever C of batch 4; the owner's brief, no earlier decision): the
+**escape** kind of each parameter position of a method call is the
+declared one (escaping unless `:borrow`), except at a call whose head
+the checker resolved to an instance (`ResInstance`, §4.2): there it is
+the escape fact the ownership pass found for that implementation's own
+body, where a position is non-escaping if the declaration says
+`:borrow` or the body does not make the parameter escape; the call
+may then build a non-escaping argument or receiver in the caller's
+frame (§6.11) or pass a stack closure, as a call of a `defun` does by
+its summary (the count kind and everything else about the call stay the
+protocol's). The implementation's facts are the contract only for the
+calls that resolve to it: a call through a bound of the enclosing
+scheme (`ResBound`), through `(dyn P)` (`ResDyn`) or to a built-in
+instance with no body keeps the declared kinds, and so does a call to
+an implementation whose body has not been decided when the caller is.
+That last case is an order of the pass, not of the program: an `impl`
+method is decided at its place after the `defun`s of its module, but
+ahead of the first unit that calls it when every `defun` its body names
+already has a summary (a missing one would be read as borrowed, not as
+the callee's kind) and, first, the methods it names in the same way; a
+method that is not ready, as one in a cycle with its caller, is decided
+at its place and its callers use the declared kinds. Soundness: the
+body of an implementation is the same whichever way it is called (same
+count kind, same code), so the escape fact the pass found for it holds
+for every call of it, and a caller that builds an argument in its frame
+hands it only to a body shown not to store, return or hand it to a
+thread. The facts of a body are final when its unit is decided, and
+they depend only on what was decided before it, with the declared kinds
+for the rest, so deciding it earlier can only make the facts it reads
+less precise, never wrong. A default method body (§4.1) is checked and
 compiled the same way, once per instance that takes it, as that
 instance's implementation: the error above then names the `impl` that
 took the default. Externs take scalars only: `(raw e)` is not

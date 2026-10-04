@@ -1,0 +1,20 @@
+;; spec:   types §4.2, §6.4 (static dispatch uses the implementation's own escape facts); lever C of batch 4
+;; expect: accept
+;; result: 332833500
+;; audit:  clean
+;; allocs: <= 0
+;; `area` reads its receiver and lets it go: the implementation's escape summary says `self` does not escape, and the call
+;; `(area (Sq i))` resolves to that implementation (the receiver has a known type), so the receiver is built in the frame of the
+;; caller, as a plain `defun` taking a borrowed struct would have it. Under the protocol's default (every position escapes unless
+;; `:borrow`) each of the 1000 receivers is a heap object: the bound `<= 0` fails with 1000. 332833500 is the sum of i*i for i
+;; below 1000. The impl is written after its caller `total`: the order of the declarations does not matter.
+(defstruct Sq (s: i64))
+(defprotocol Area (area (self) -> i64))
+
+(defun total (n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n) (recur (+ i 1) (+ acc (area (Sq i)))) acc)))
+
+(impl Area Sq (area (self) (* (. self s) (. self s))))
+
+(defun main () -> i64 (total 1000))

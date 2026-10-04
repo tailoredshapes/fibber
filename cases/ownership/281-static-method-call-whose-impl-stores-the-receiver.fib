@@ -1,0 +1,24 @@
+;; spec:   types §4.2, §6.4; lever C of batch 4
+;; expect: accept
+;; result: 7
+;; audit:  clean
+;; The implementation of `keep` stores `self` in a vector it returns, so its summary says `self` escapes, and the statically resolved
+;; call `(keep (Sq 7))` in `make` must build the receiver on the heap: a receiver in the frame of `make` dies with it while the returned
+;; vector still holds it. `clobber` then writes over the stack below `main`, where the frame of `make` was, so a vector that points
+;; into it reads the pad (the sum of 1 .. 40 is 820) and not 7, and its release would free a stack address.
+(defstruct Sq (s: i64))
+(defstruct Pad (a: i64 b: i64 c: i64 d: i64))
+(defprotocol Keep (keep (self) -> (Vec Sq)))
+(impl Keep Sq (keep (self) (vec-conj (vec-empty) self)))
+
+(defun make (i: i64) -> (Vec Sq) (let ((v (keep (Sq i)))) v))
+
+(defun clobber (n: i64) -> i64
+  (if (= n 0)
+      0
+      (let ((p (Pad n n n n))) (+ (. p a) (clobber (- n 1))))))
+
+(defun main () -> i64
+  (let ((v (make 7)))
+    (let ((junk (clobber 40)))
+      (+ (. (nth v 0) s) (- junk 820)))))
