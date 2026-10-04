@@ -1,0 +1,34 @@
+;; spec:   stdlib §4.9 (a `Regex` is immutable and `Send`), syntax §3.19 (a def is shared by every task), types §5.5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: re-count re-find re-seq pmap
+;; A `Regex` is captured by closures that run on several tasks: a `#"..."` literal (static data, immortal), and a pattern made at
+;; run time by `re-pattern` (a value the tasks share by count). Before the split of the representation a `Regex` held the caches of
+;; its lazy DFAs in cells, so it was not `Send` and the closures below were refused. A pattern too big for a table keeps its lazy
+;; DFA in a matcher made per search, so tasks searching with it share nothing mutable either.
+(ns main (:use fib.core fib.seq fib.coll fib.regex tl.check))
+
+(def lit: Regex #"[a-c]+\d")
+
+(defun texts () -> (Vec str)
+  [(str-join (vec (repeat 400 "ab1 xx "))) "cab22 q" "no digits here" (str-join (vec (repeat 600 "a[ab]c9 ")))])
+
+(defun main () -> i64
+  (let [c (checks)
+        ts (texts)
+        dyn (re-pattern "[a-c]+\\d")
+        big (re-pattern "a[ab]{14}c")
+        want (mapv (fn (s: str) (re-count lit s)) ts)]
+    (do (check c (= want [400 1 0 600]))
+        ;; a literal named by a def, and one written in the closure, on one task per text
+        (check c (= (pmap (fn (s: str) (re-count lit s)) ts) want))
+        (check c (= (pmap (fn (s: str) (re-count #"[a-c]+\d" s)) ts) want))
+        ;; a Regex made at run time, shared by the tasks
+        (check c (= (pmap (fn (s: str) (re-count dyn s)) ts) want))
+        (check c (= (pmap (fn (s: str) (count (re-seq dyn s))) ts) want))
+        ;; a pattern whose DFA does not fit a table (its matcher is made in each task)
+        (check c (= (pmap (fn (s: str) (re-count big (str s "a" "ababababababab" "c"))) ts) [1 1 1 1]))
+        (checks-result c))))

@@ -173,6 +173,11 @@ which the rules above leave open:
   `%&`, which Clojure binds to the rest, is the read error
   `UnsupportedRest` until a later item gives it a meaning. Outside a `#(`
   `%`, `%1` and `%&` are ordinary symbols.
+- `#"` .. `"` (E14, stage 2 only) is a regex literal: it reads as `(fib.prelude/re "..")`, the text between the quotes taken as it is
+  with Clojure's escape rule: a backslash and the character after it are both kept, so `#"\d+"` is the string `\d+` (not the string
+  escape `\d`, which is an error) and `#"a\"b"` is `a\"b`, the quote after the backslash not ending the literal. No other escape is
+  interpreted. An unterminated literal is `UnterminatedString`. The expander gives the form its meaning (stdlib §4.9): a reference to a
+  `def` of `(fib.regex.api/re-pattern "..")` that the compiler makes at compile time (§3.19), the pattern checked there.
 - `#{` .. `}` (E8) reads as `(hash-set ..)`, so `#{1 2}` is `(hash-set 1 2)`;
   an unclosed one is the error `Unclosed` for `{`.
 - `UnknownDispatch`'s message is `unknown reader syntax #X: only #_, #(, #{ are defined`;
@@ -1441,6 +1446,7 @@ immortal mechanism the runtime has for literals covers it exactly):
 
 ```
 const ::= literal | 'form | nil | Variant             ; a field-less variant, bare (§3.9)
+        | (re-pattern "literal")                      ; of fib.regex.api, when the library accepts the pattern (stage 2; stdlib §4.9)
         | (Ctor const*) | (some const)                ; a struct or variant constructor
         | [const*] | {const const ...}                ; literal collections (§1.4)
         | name                                        ; an earlier def, or a named function (of this module or a required one) as a value
