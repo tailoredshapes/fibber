@@ -1,21 +1,98 @@
-;; compiler/native/lower/consts.fib: constants: literals, strings, addresses and struct constants (crates/lair/src/lower/consts.rs). OWNER: package L1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/lower/consts.fib: constants: literals, strings, addresses and struct constants (crates/lair/src/lower/consts.rs). OWNER: package L1.
 
 (ns native.lower.consts
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.types)
+  (:require [llvm.core :as core] [llvm.ffi :as ffi]))
 
 
 ;; The low `bits` of `v` as LLVM's constant constructor wants them: the same function as `lir.lit/lit-low`. (consts.rs `low_bits`)
 (defun low-bits (v: LLit bits: i64) -> i64
-  (trap "todo: native.lower.consts low-bits"))
+  (lit-low v bits))
+
+;; The constants of `es`, in order, or the first error.
+(defun lx-constants (lx: Lx es: (Vec LExpr)) -> (Result (Vec i64) LairError)
+  (loop ((i 0) (acc []))
+    (if (>= i (count es))
+        (Ok acc)
+        (match (lx-constant lx (nth es i))
+          ((Err x) (Err x))
+          ((Ok v) (recur (+ i 1) (conj acc v)))))))
 
 ;; A constant expression (spec/lir.md 6.11, 9). (consts.rs `Lx::constant`)
 (defun lx-constant (lx: Lx e: LExpr) -> (Result i64 LairError)
-  (trap "todo: native.lower.consts lx-constant"))
+  (match (. e kind)
+    ((KInt t v) (match t
+                  ((TInt b) (Ok (unsafe (core/LLVMConstInt (lx-ty lx t) (low-bits v b) 0i32))))
+                  (_ (not-constant e))))
+    ((KFloat t v) (Ok (unsafe (core/LLVMConstReal (lx-ty lx t) v))))
+    ((KNull) (Ok (unsafe (core/LLVMConstNull (lx-ty lx ty-ptr)))))
+    ((KZero t) (Ok (unsafe (core/LLVMConstNull (lx-ty lx t)))))
+    ((KArray t es) (match t
+                     ((TArray _ elem) (const-array lx elem es))
+                     (_ (not-constant e))))
+    ((KVector _ es) (const-vector lx es))
+    ((KStr bytes) (Ok (lx-string lx bytes)))
+    ((KGlobal g) (lx-address lx g))
+    ((KStruct name fs) (const-struct lx name fs))
+    (_ (not-constant e))))
+
+(defun not-constant :private (e: LExpr) -> (Result i64 LairError)
+  (Err (ErrInternal (str "not a constant at " (pos-debug (. e pos))))))
+
+(defun const-array :private (lx: Lx elem: LType es: (Vec LExpr)) -> (Result i64 LairError)
+  (match (lx-constants lx es)
+    ((Err x) (Err x))
+    ((Ok vs) (let ((ws (ffi/words-new vs)))
+               (unsafe
+                 (let ((r (core/LLVMConstArray2 (lx-ty lx elem) ws (count vs))))
+                   (do (free ws) (Ok r))))))))
+
+(defun const-vector :private (lx: Lx es: (Vec LExpr)) -> (Result i64 LairError)
+  (match (lx-constants lx es)
+    ((Err x) (Err x))
+    ((Ok vs) (let ((ws (ffi/words-new vs)))
+               (unsafe
+                 (let ((r (core/LLVMConstVector ws (trunc i32 (count vs)))))
+                   (do (free ws) (Ok r))))))))
+
+(defun const-struct :private (lx: Lx name: (Option str) fs: (Vec LExpr)) -> (Result i64 LairError)
+  (match (lx-constants lx fs)
+    ((Err x) (Err x))
+    ((Ok vs) (let ((ws (ffi/words-new vs))
+                   (n (trunc i32 (count vs))))
+               (unsafe
+                 (let ((r (match name
+                            ((some s) (core/LLVMConstNamedStruct (unwrap-struct lx s) ws n))
+                            (nil (core/LLVMConstStructInContext (. lx ctx) ws n 0i32)))))
+                   (do (free ws) (Ok r))))))))
+
+(defun unwrap-struct :private (lx: Lx s: str) -> i64
+  (match (get @(. lx structs) s)
+    ((some v) v)
+    (nil (trap (str "unknown struct " s)))))
 
 ;; The address of a function or global. (consts.rs `address`)
 (defun lx-address (lx: Lx g: str) -> (Result i64 LairError)
-  (trap "todo: native.lower.consts lx-address"))
+  (match (get @(. lx funcs) g)
+    ((some f) (Ok (. f value)))
+    (nil (match (get @(. lx globals) g)
+           ((some v) (Ok v))
+           (nil (Err (ErrInternal (str "unknown global @" g))))))))
 
 ;; A private constant holding `bytes` and a NUL; its address. (consts.rs `string`)
 (defun lx-string (lx: Lx bytes: (Array i8)) -> i64
-  (trap "todo: native.lower.consts lx-string"))
+  (let ((n (array-len bytes))
+        (name (ffi/bytes-new ".str")))
+    (unsafe
+      (let ((buf (alloc (+ n 1))))
+        (do (dotimes (i n) (store-i8 (ptr+ buf i) (array-get bytes i)))
+            (let ((init (core/LLVMConstStringInContext2 (. lx ctx) buf n 0i32))
+                  (ty (core/LLVMArrayType2 (core/LLVMInt8TypeInContext (. lx ctx)) (+ n 1)))
+                  (g (core/LLVMAddGlobal (. lx module) ty name)))
+              (do (core/LLVMSetInitializer g init)
+                  (core/LLVMSetGlobalConstant g 1i32)
+                  (core/LLVMSetLinkage g 9i32)
+                  (core/LLVMSetUnnamedAddress g 2i32)
+                  (free buf)
+                  (free name)
+                  g)))))))
