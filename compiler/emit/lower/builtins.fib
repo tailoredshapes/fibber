@@ -119,6 +119,13 @@
           (_ (Err (str-join [name " on a non-cell"]))))
         :else (Ok (nth tys 0))))
 
+;; Whether the plan makes this `array-get` a part of its array (spec/types.md §6.3, "Element reads"): then the read takes no count; the
+;; consumer retains it where it must (`consume`). Any other mode is `Owned`, and the read retains.
+(defun elem-derived? :private (cx: LowerCx e: Expr) -> bool
+  (match (get (. (. cx own) exprs) (. e id))
+    ((some x) (match (. x mode) ((MDerived _) true) (_ false)))
+    (_ false)))
+
 ;; An element of `unit` has no value, but takes the `i1` slot a cell of `unit` takes (program.rs `elem_lir`), so that the array has
 ;; its length and a place for every element, and `array-get` reads a unit.
 (defun arr-info :private (cx: LowerCx name: str e: Expr tys: (Vec Ty)) -> (Result Arr str)
@@ -283,7 +290,8 @@
       ("array-get" (let ((ep (array-index cx r (v-text (nth a 0)) (nth a 1))))
                      (if (. r unit)
                          (Ok VUnit)
-                         (let ((v (lcx-load cx (. r el) ep))) (do (lcx-retain cx v) (Ok v))))))
+                         (let ((v (lcx-load cx (. r el) ep)))
+                           (do (when-not (elem-derived? cx e) (lcx-retain cx v)) (Ok v))))))
       ("array-with" (let ((copy (array-dup cx r (v-text (nth a 0)))))
                       (let ((ep (array-index cx r (v-text copy) (nth a 1))))
                         (let ((old (lcx-load cx (. r el) ep)))

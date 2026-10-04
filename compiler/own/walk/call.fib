@@ -12,7 +12,7 @@
 ;; - `Walker::temp` of walk/expr.rs is `walk-temp` of own.walk.step (a module cycle otherwise,
 ;;   own-notes.md); this module never requires own.walk.expr.
 (ns own.walk.call
-  (:use fib.coll.record types.ast own.program own.captured own.syntactic own.walk.state
+  (:use fib.coll.record types.ast types.builtins own.program own.captured own.syntactic own.walk.state
         own.walk.callee own.walk.lit own.walk.step))
 
 ;; What the argument rules need to know about the call: its id, its callee, whether it is a tail
@@ -35,10 +35,21 @@
             moved (cell (set-empty))
             hp (head-pass w cs head head-m moved)
             r (arg-passes w cs args ms params moved)]
-        (finish-call w e cs (CallOwn callee d hp (. r fst) (. r snd) []) @moved)
-        (record-alloc w e head)
-        (note-reuse w e)
-        (MOwned false)))))
+        (let [rm (finish-call w e cs (CallOwn callee d hp (. r fst) (. r snd) []) @moved (elem-mode callee ms))]
+          (do (record-alloc w e head)
+              (note-reuse w e)
+              rm))))))
+
+;; The mode an `array-get` call would give its result (§6.2, "Element reads"): a part of its array when that is borrowed or
+;; derived; every other call, and an owned array operand, `Owned`.
+(defun elem-mode :private (callee: Callee ms: (Vec (Option Mode))) -> Mode
+  (match callee
+    ((CalBuiltin b) :when (= (. (nth (builtin-table) b) name) "array-get")
+     (match (get ms 0)
+       ((some (some (MBorrowed s))) (MDerived s))
+       ((some (some (MDerived s))) (MDerived s))
+       (_ (MOwned false))))
+    (_ (MOwned false))))
 
 ;; A constructor call that may build its object in the memory of a shell (own.lastuse `reuse`): the result takes over the shell's
 ;; count, so the shell is handed over like a binding at its last use, and the plan records the call.
@@ -74,19 +85,26 @@
                  (_ wbs)))))))
 
 ;; The end of a call: the jump of a tail call (§6.10 step 3), or the release of the step's
-;; temporaries after an ordinary one; records the call.
-(defun finish-call :private (w: Walker e: Expr cs: CallSite own: CallOwn moved: (Set Site)) -> unit
-  (let [own2 (if (. cs admitted)
+;; temporaries after an ordinary one; records the call. Returns the mode of the call: `rm`, the part of a site that outlives the
+;; step, or `Owned` (a part of one of the step's own temporaries is `Owned`, as `(. e f)` of an owned `e` is retained at exit).
+(defun finish-call :private (w: Walker e: Expr cs: CallSite own: CallOwn moved: (Set Site) rm: Mode) -> Mode
+  (let [res (cell (MOwned false))
+        own2 (if (. cs admitted)
                (let [keep-env (= (. own head) PsKeepEnv)
                      ops (into (w-release-scopes w 0 moved WhyJump)
                                (w-release-params w moved keep-env WhyJump))]
                  (w-pop-scope w)
                  (set! (. w diverged) true)
                  (with own (jump ops)))
-               (let [scope (w-pop-scope w)]
-                 (w-exit-scope w scope (. e id) (MOwned false))
-                 own))]
-    (w-out! w (fn (o: BodyOwn) -> BodyOwn (with o (calls (assoc (. o calls) (. e id) own2)))))))
+               (let [scope (w-pop-scope w)
+                     own-temp (match rm
+                                ((MDerived s) (some? (find-first (fn (x: (Pair Site bool)) (= (. x fst) s)) @(. scope sites))))
+                                (_ false))]
+                 (do (set! res (if own-temp (MOwned false) rm))
+                     (w-exit-scope w scope (. e id) @res)
+                     own)))]
+    (do (w-out! w (fn (o: BodyOwn) -> BodyOwn (with o (calls (assoc (. o calls) (. e id) own2)))))
+        @res)))
 
 ;; Records an allocation site as a heap one; the driver turns those that §6.11 finds scope-local
 ;; into stack ones.
