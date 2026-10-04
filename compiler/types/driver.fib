@@ -19,7 +19,7 @@
   (:use syntax.pos syntax.form syntax.error expand.ctx expand.types expand.error
         types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.init types.lower.private types.lower.mod types.infer.cx types.infer.mod
-        types.program types.elab types.infer.demand))
+        types.program types.elab types.infer.demand types.target))
 
 ;; Rust `Lowered` (mod.rs:147): the globals and the items of the prelude and
 ;; of each module.
@@ -101,10 +101,16 @@
 ;; before it, sees its `:use`s unqualified, its implicit modules after them and
 ;; its `:require`s by alias, and the last defines `main` (mod.rs:168).
 (defun lower-modules (modules: (Vec Expanded) prelude: (Vec Stx)) -> (Result Lowered (Vec TypeError))
-  (try-let ((g (errs-of (new-globals)))
-            (prelude-items (lower-prelude g prelude))
-            (items (lower-each g modules)))
-    (Ok (Lowered g prelude-items items))))
+  (lower-modules-for modules prelude nil))
+
+;; `lower-modules` for the code generation target `target` (nil: the checker's default): `:native` and `f32xn` are resolved against it,
+;; and the emitter reads it from the globals (SIMD P3), so that both agree.
+(defun lower-modules-for (modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target)) -> (Result Lowered (Vec TypeError))
+  (try-let ((g (errs-of (new-globals))))
+    (do (set! (. g target) target)
+        (try-let ((prelude-items (lower-prelude g prelude))
+                  (items (lower-each g modules)))
+          (Ok (Lowered g prelude-items items))))))
 
 ;; Adds the module `spec` describes (whose forms are `forms`) to g, linked to the
 ;; modules `ids` of the program that came before it (mod.rs:197): a module it

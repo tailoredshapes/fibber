@@ -9,7 +9,7 @@
 (ns emit.compile
   (:require [emit.defs.astmod :as am])
   (:use types.ty types.table types.decls types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
-        emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi))
+        emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi types.target))
 
 ;; The text of a macro module. Rust: compile.rs:88 MacroModule
 (defstruct MacroModule (text: str))
@@ -67,19 +67,26 @@
                     ((Ok _) (verified p defs (Module (module-parts p @(. defs text)) (main-part p entry executable) nil)))
                     ((Err m) (pending-or-error p entry executable m))))))))))))
 
+;; The module's `(target (cpu ..) (features ..))` form (spec/lir.md 4.5) for the target the front end was told: the CPU the checker chose its lane
+;; counts for, so that `lair` builds for the CPU the program was checked against. Nothing when the checker was told none (its unit tests).
+(defun target-form :private (typed: TypedProgram) -> str
+  (match @(. (. typed globals) target)
+    (nil "")
+    ((some t) (str-join ["(target (cpu \"" (. t cpu) "\")" (if (= (. t features) "") "" (str-join [" (features \"" (. t features) "\")"])) ")\n"]))))
+
 ;; The lIR text of a whole program for `fibc run`: runtime, static data, bodies, and a `main` that prints the result.
 ;; Rust: compile.rs:47 compile
 (defun compile (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
   (match (compile-module typed owned false)
     ((Err m) (Err m))
-    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (module-text m)))))))
+    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (str-concat (target-form typed) (module-text m))))))))
 
 ;; The same for an executable, whose `main` returns the result as the process status and prints nothing (compiler.md §1).
 ;; Rust: compile.rs:53 compile_executable
 (defun compile-executable (typed: TypedProgram owned: OwnedProgram) -> (Result str str)
   (match (compile-module typed owned true)
     ((Err m) (Err m))
-    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (module-text m)))))))
+    ((Ok m) (match (. m pending) ((some msg) (Err msg)) (nil (Ok (str-concat (target-form typed) (module-text m))))))))
 
 ;; The first `defmacro` of the program called `name`: its function id.
 (defun macro-index :private (g: Globals name: str) -> (Option i64)

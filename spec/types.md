@@ -330,8 +330,13 @@ f64x4  i32x8  f32xn                       ; sugar: ELEMENT x COUNT, ELEMENT in i
 count is a type argument `(KNat n)` of the constructor `KSimd`, so unification equates lane counts as it equates types). The
 element may be a variable too (`(Simd t 4)` with a bound `(Num t)`); a variable element is not checked to be a scalar by the
 annotation, only by the instance it is used at. `f64x4` is the sugar only where no type of that name is in scope. `:native` and
-`f32xn` are the target's lane count for the element: **today a constant of 256 bits** (`native-vector-bits` in
-`compiler/types/ty.fib`; `f32xn` is `f32x8`, `f64xn` is `f64x4`) until the target record of the design (P3) exists. Errors (all
+`f32xn` are the target's lane count for the element: the target's preferred vector width over the element's width (at least 1). The target is
+the `Target` record of `compiler/types/target.fib`, given to the checker once (`Globals.target`, set by `lower-modules-for`) and made by
+`native.target/target-info`: the CPU `FIB_TARGET_CPU` names (128 bits for `x86-64` and `x86-64-v2`, 256 for `x86-64-v3` and the CPUs of its
+table, which have AVX2 and FMA; a name not in the table is taken as a baseline), else the host's CPU and features (256 with `+avx2`, else 128;
+`+avx512f` hosts also prefer 256). `f32xn` is therefore `f32x4` on `x86-64` and `f32x8` on `x86-64-v3`; a checker told no target (its unit tests)
+assumes `x86-64-v3`. The emitted module's first line is `(target (cpu ..) (features ..))` for the same target (spec/lir.md 4.5), so the lane
+counts the checker chose and the code `lair` generates are for one CPU (`compiler/tests/driver/target.sh`). Errors (all
 `Resolve`, at the type): `a vector has 1 to 64 lanes, not N`, `a vector is at most 512 bits wide`, `a vector element is an
 integer width, f32, f64 or bool`.
 
@@ -4553,5 +4558,4 @@ expression is a type error that names `(splat V x)`, a mismatched element type i
 promotion (liar ADR 017 stays dropped); there is no deferred constraint and no inference-order rule beyond "the vector type is
 known at the application"; (4) integer vector arithmetic is checked like the scalar's, with `wrapping` (ADR 015) as the opt-out,
 which is a lowering matter and not in the checker; (5) the Rust interpreter is not the judge of new features, so §1.9 has none:
-its cases carry the expected type or error text. Open: the lowering (§1.9 "What is not there yet"); `native-vector-bits` is a
-constant until the target record exists; `/` on vectors needs the library `impl` of `Div`.
+its cases carry the expected type or error text. Open: the lowering (§1.9 "What is not there yet"); `/` on vectors needs the library `impl` of `Div`.

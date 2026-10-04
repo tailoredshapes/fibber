@@ -15,7 +15,7 @@
 (ns own.driver
   (:require [syntax.reader :as reader] [expand.program :as prog] [expand.error :as ee])
   (:use syntax.pos syntax.form syntax.error expand.ctx expand.types expand.error
-        types.error types.program types.driver own.error own.program own.syntactic own.top))
+        types.error types.program types.driver types.target own.error own.program own.syntactic own.top))
 
 ;; A program that passed the whole front end: its types (§3) and its ownership decisions (§6).
 (defstruct Checked (typed: TypedProgram owned: OwnedProgram))
@@ -40,7 +40,11 @@
 ;; Checks a program of several modules, expanded, in dependency order with the main module last: lowering, the `&` checks, inference, the
 ;; ownership pass (`check_modules`).
 (defun own-check-modules (modules: (Vec Expanded) prelude: (Vec Stx)) -> (Result Checked CheckError)
-  (match (lower-modules modules prelude)
+  (own-check-modules-for modules prelude nil))
+
+;; The same for the code generation target `target` (nil: the checker's default).
+(defun own-check-modules-for (modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target)) -> (Result Checked CheckError)
+  (match (lower-modules-for modules prelude target)
     ((Err errs) (Err (CeType errs)))
     ((Ok l) (own-check-lowered l true))))
 
@@ -53,7 +57,12 @@
 ;; `own-check-modules` where the units of the library that the program cannot reach are not checked (types.infer.demand): the checked
 ;; program holds only what the emitter can ask for, the result of `emit` and `run` is the same.
 (defun own-check-modules-on-demand (modules: (Vec Expanded) prelude: (Vec Stx)) -> (Result Checked CheckError)
-  (match (lower-modules modules prelude)
+  (own-check-modules-on-demand-for modules prelude nil))
+
+;; The same for the code generation target `target` (types.driver `lower-modules-for`): the front end of `emit`, `run` and `build`.
+(defun own-check-modules-on-demand-for (modules: (Vec Expanded) prelude: (Vec Stx) target: (Option Target))
+    -> (Result Checked CheckError)
+  (match (lower-modules-for modules prelude target)
     ((Err errs) (Err (CeType errs)))
     ((Ok l) (own-check-lowered-with l true (some (library-flags modules))))))
 

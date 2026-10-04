@@ -15,7 +15,7 @@
 ;; - `builtin_con` and `is_var_name` are `builtin-con` and `var-name?`.
 (ns types.lower.typeform
   (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store
-        types.table types.ast types.decls types.names))
+        types.table types.ast types.decls types.names types.target))
 
 ;; ---- the forms as Rust's Form methods see them
 
@@ -100,7 +100,7 @@
     (cond (= name "str") (Ok AStr)
           (and (= name "Self") allow-self) (Ok ASelf)
           (and (nil? (g-type-name g m name)) (some? (simd-sugar name)))
-            (simd-sugar-type name (. form pos))
+            (simd-sugar-type g name (. form pos))
           :else (named-type g m name (. form pos)))))
 
 ;; ---- lane vectors (spec/types.md 1.9)
@@ -137,17 +137,16 @@
                         ((some k) (some (Pair s (some k))))
                         (nil nil)))))))))
 
-(defun simd-sugar-type :private (name: str pos: Pos) -> (Result TypeAnn TypeError)
+(defun simd-sugar-type :private (g: Globals name: str pos: Pos) -> (Result TypeAnn TypeError)
   (match (simd-sugar name)
     ((some sl)
      (let ((s (. sl fst)))
-       (simd-ann pos (AScalar s) (match (. sl snd) ((some k) (ANat k)) (nil (native-lanes-ann s))))))
+       (simd-ann pos (AScalar s) (match (. sl snd) ((some k) (ANat k)) (nil (native-lanes-ann g s))))))
     (nil (resolve-err pos "internal: not a vector type name"))))
 
-;; The lane count of `:native` for an element: the vector width of the target over the element's
-;; width. The target's width is a constant here until the target record exists (SIMD P3).
-(defun native-lanes-ann :private (s: Scalar) -> TypeAnn
-  (ANat (max 1 (quot native-vector-bits (scalar-bits s)))))
+;; The lane count of `:native` for an element: the vector width of the target the checker was given over the element's width.
+(defun native-lanes-ann :private (g: Globals s: Scalar) -> TypeAnn
+  (ANat (native-lanes (g-target g) (scalar-bits s))))
 
 ;; `(Simd elem lanes)` once both are resolved: the element is an integer width, f32, f64 or bool,
 ;; the lane count is 1 to 64 and (but for a mask) the value at most 512 bits.
@@ -183,7 +182,7 @@
     ((SKw k)
      (if (= k "native")
          (match elem
-           ((AScalar s) (Ok (native-lanes-ann s)))
+           ((AScalar s) (Ok (native-lanes-ann g s)))
            (_ (resolve-err (. f pos) ":native needs a known element type")))
          (resolve-err (. f pos) (str-join [(stx-show f) " is not a lane count"]))))
     ((SSym n)

@@ -12,6 +12,7 @@
 # Run from the repository root, with FIB_LIB=lib and LD_LIBRARY_PATH holding liblair.so (target/debug) in the environment. Each process runs
 # under ulimit -v 6000000 (no core files). A `run` that does not end is cut by the timeout in both (status 124 in both is the same).
 jobs=4; opts=""; cmd=emit; secs=300
+export FIB_TARGET_CPU=${FIB_TARGET_CPU:-x86-64}   # the golden output does not depend on the machine
 while getopts "j:o:c:t:" o; do case $o in j) jobs=$OPTARG;; o) opts=$OPTARG;; c) cmd=$OPTARG;; t) secs=$OPTARG;; esac; done
 shift $((OPTIND-1)); s1=$1; s2=$2; shift 2
 out=${CMP_OUT:-$HOME/.cache/fibber-scratch/driver-$cmd}; rm -rf "$out"; mkdir -p "$out"
@@ -22,6 +23,8 @@ one() {
   f=$1; n=$(echo "$f" | tr '/' '_'); r=$(roots_of "$f")
   (ulimit -c 0 -v 6000000; timeout "$secs" "$s1" $cmd $r $opts "$f" < /dev/null > "$out/$n.out1" 2> "$out/$n.err1"; echo "status $?" > "$out/$n.st1")
   (ulimit -c 0 -v 6000000; timeout "$secs" "$s2" $cmd $r $opts "$f" < /dev/null > "$out/$n.out2" 2> "$out/$n.err2"; echo "status $?" > "$out/$n.st2")
+  # stage 2's emit starts with the module's (target ..) form (SIMD P3, FIB_TARGET_CPU pinned above), which the Rust compiler does not know
+  if [ "$cmd" = emit ]; then sed -i '1{/^(target /d}' "$out/$n.out2"; fi
   if cmp -s "$out/$n.out1" "$out/$n.out2" && cmp -s "$out/$n.err1" "$out/$n.err2" && cmp -s "$out/$n.st1" "$out/$n.st2"; then
     rm -f "$out/$n".*; echo "same $f"
   else
