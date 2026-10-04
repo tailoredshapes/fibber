@@ -30,6 +30,7 @@ type   ::= scalar | object | tvar
 scalar ::= bool | i8 | i16 | i32 | i64 | f32 | f64 | char | keyword | unit
          | ptr                                   ; only inside unsafe
          | Enum                                  ; a defenum whose variants have no fields
+         | (Simd elem lanes) | simd-name         ; a lane vector, scalar-class (§1.9)
 object ::= str | Form
          | (Array type)                          ; primitive fixed immutable array
          | Name | (Name arg+)                    ; nominal struct or enum, incl. the library's Vec, Map, Set, List, Option
@@ -306,6 +307,89 @@ C ::= (P T₁ .. Tₙ)          ; protocol constraint; T₁ is the dispatch posi
 ```
 
 ---
+
+### 1.9 Lane vectors
+
+*New in stage 2 (SIMD wave 2, package P1): the Rust tools are frozen and do not have this section, so there is no
+interpreter oracle for it; `compiler/tests/types/simd-check.sh` is its judge. Everything below the line "Typing" is checked
+by the cases in `compiler/tests/types/simd/`; the lowering of vectors to lIR is NOT written yet (§1.9.5).*
+
+**Type.** `(Simd T n)` is a vector of `n` lanes of `T`. `T` is `i8 i16 i32 i64 f32 f64` or `bool` (a mask, written
+`(Mask n)`, which is `(Simd bool n)`); `n` is a number from 1 to 64 (any number, not only a power of two) and the value is at
+most 512 bits wide (a mask is not counted). A vector is a **scalar-class value**: copied, no identity, no count, no mode; it
+is `Send`; the ownership checker gives a vector parameter the mode `scalar` and a vector captured by a closure, held by a
+struct field, a `Vec` element, an `Atom` or a task result takes no count operation (`o01-*.expect`: no `retain`/`release` of
+a vector). Written forms:
+
+```
+(Simd f64 4)   (Simd i8 16)   (Mask 4)   (Simd f64 n)   (Simd f64 :native)
+f64x4  i32x8  f32xn                       ; sugar: ELEMENT x COUNT, ELEMENT in i8 i16 i32 i64 f32 f64, COUNT a number or n
+```
+
+`n` may be a variable of the definition (`(defun twice (v: (Simd f64 n)) -> (Simd f64 n) (+ v v))` is `∀n.`; internally the lane
+count is a type argument `(KNat n)` of the constructor `KSimd`, so unification equates lane counts as it equates types). The
+element may be a variable too (`(Simd t 4)` with a bound `(Num t)`); a variable element is not checked to be a scalar by the
+annotation, only by the instance it is used at. `f64x4` is the sugar only where no type of that name is in scope. `:native` and
+`f32xn` are the target's lane count for the element: **today a constant of 256 bits** (`native-vector-bits` in
+`compiler/types/ty.fib`; `f32xn` is `f32x8`, `f64xn` is `f64x4`) until the target record of the design (P3) exists. Errors (all
+`Resolve`, at the type): `a vector has 1 to 64 lanes, not N`, `a vector is at most 512 bits wide`, `a vector element is an
+integer width, f32, f64 or bool`.
+
+**The literal** `(simd e1 .. en)` and `(simd T e1 .. en)` (`T` a scalar name written first) is the form the reader's
+`<<e1 .. en>>` is to read as (P2). Its lanes are expressions; the type is `(Simd E n)`. The elements that are not literals fix
+`E` (all must be equal); an integer literal and a float literal that carry no width of their own (the reader does not tell `5`
+from `5i64`) adopt `E`; with nothing to adopt from, `E` is `f64` if any literal is a float, else `i64` (L19). An element type
+that is not an integer width, `f32`, `f64` or `bool` is `a vector element is an integer width, f32, f64 or bool, not str`; one
+the checker cannot determine is `cannot infer the element type of a vector (a); annotate it`; 9 lanes of `f64` are `a vector is at
+most 512 bits wide: 9 lanes of f64 are 576 bits`; no element is `a vector literal needs at least one element`.
+
+**`(splat V x)`** (a primitive form like `(sitofp T e)`): every lane of the vector type `V` is `x`; `V` must be a vector type with
+a known lane count (`splat's first operand is a vector type with a known lane count, as f64x4`). `x` is a literal (adopting the
+element as below) or an expression of the element type.
+
+**Instances** (§2.12): `Num` (`+ - * quot rem neg`) for a vector whose element has `Num`, `Float` (`fdiv`) for one whose element has
+`Float`, `Bits` for one whose element has `Bits`, `Eq` and `Show` for every vector. No `Ord` and no `Hash` (`(< v w)` is
+`no implementation of Ord for (Simd f64 4)`; a lanewise comparison is `simd/lt` below). The instances are built in and have the
+context `(P t)`, so a failing element names itself: `(+ m m)` on masks is `no implementation of Num for bool`. `/` is the
+method of the library's `Div`, whose instance for a vector is a library `impl` (`(impl (Div (Simd a n)) (Simd a n) :where
+((Float a)) (/ (self y) (fdiv self y)))`, written by the module that provides the vector library, the P4 package; the library
+modules of the Rust tools cannot read `Simd`, so it is not in `lib/fib/core/num.fib`).
+
+**Builtins** (rows of `types.builtins`, after the Rust table): `simd/lt simd/le simd/gt simd/ge simd/eq simd/ne :
+(fn ((Simd t n) (Simd t n)) (Simd bool n))` with `(Num t)`; `lane : (fn ((Simd t n) i64) t)`; `with-lane : (fn ((Simd t n) i64 t)
+(Simd t n))`; `hsum hmin hmax : (fn ((Simd t n)) t)` with `(Num t)`. A **literal** index of `lane` or `with-lane` is checked
+against the lane count when it is known at the application: `lane index 4 out of range: (Simd f64 4) has lanes 0 to 3` (a
+negative literal too); a dynamic index is the run-time check of the design (it is not a checker rule).
+
+**Typing: the broadcast rule (owner decision 2026-10-04, revised the same day).** Implicit numeric promotion does not exist
+(§1.1, liar ADR 017 stays dropped) and neither does broadcast of a scalar *variable*. The one rule is the literal rule of
+stdlib §7 L19 extended to a vector operand. At a call of an arithmetic, bit-wise or comparison operator (a method of `Num`,
+`Float`, `Bits`, `Div` or `Eq`, or one of `simd/lt simd/le simd/gt simd/ge simd/eq simd/ne`) whose parameter is, at that point
+of the inference, a vector with a known element type, an integer or float literal operand that has no width of its own
+**is a lane of that vector's element type, for every lane**: the literal is recorded at the element type, the operand's type
+for the unification is the vector type. The literal must fit: an integer literal in an integer element by range
+(`the literal 300 does not fit i8, the lanes of (Simd i8 4)`), in a float element exactly, at most 2^24 for `f32` and 2^53 for
+`f64` (`the literal 9007199254740993 is not exact in f64, the lanes of (Simd f64 4)`; an integer literal against a float
+vector is allowed by this rule: `(* v 2)` is `(* v 2.0)`); a float literal is a float lane (rounded for `f32`) and is an error in an
+integer vector (`a float literal is not a lane of (Simd i32 4): the lanes are i32`) and in a mask. A literal first operand is
+applied after its partner when the partner is a vector: `(+ 1 v)` is `(+ v 1)`. The rule needs the vector type to be known when
+the call is checked (an annotated parameter, a result of an earlier call); a function whose parameter is unannotated gets the
+literal's own type by the ordinary rules (`(defun f (v) (+ v 1))` is `i64 -> i64`, as for floats) and there is no deferred
+constraint and no later repair. Every other scalar operand does **not** broadcast: a variable, a call, an arithmetic
+expression. The error is the unification error with the remedy appended (positions in the `.expect` files):
+
+```
+cannot unify (Simd f64 4) with f64: only a numeric literal broadcasts to a vector; write (splat (Simd f64 4) x) for a scalar variable or expression
+```
+
+(the two types are in the order of the flow: the operand's type with the parameter's). A vector of another lane count or element
+type is the plain `cannot unify (Simd f64 8) with (Simd f64 4)`. A literal as an argument of an ordinary function is not
+broadcast: `(f 1)` for `(defun f (v: f64x4))` is a mismatch; only the operators above adopt.
+
+**What is not there yet.** Emission: `(simd ..)`, `(splat ..)` and any use of a vector type reach the emitter, which stops with `todo: lane vectors are not lowered
+yet (SIMD wave 2, P0 and P1)`; the lowering waits for the lIR vector instructions (P0). The reader's `<<..>>` (P2) and `fib.simd`
+(P4) are not in this package. An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26 limit (so `(with-lane v 0 5)` on
+`i32x4` needs `5i32`).
 
 ## 2. Typing rules for the core forms and builtins
 
@@ -619,6 +703,8 @@ declaration order and shows as its variant name) and for `str`:
 (defprotocol Show (show (self) -> str))
 not : (fn :send (bool) bool)
 ```
+
+Vectors (§1.9) have built-in instances of `Num`, `Float`, `Bits`, `Eq` and `Show` at `KSimd` with the context `(P t)` of the element.
 
 **The order and equality of the scalars the paragraph above leaves open**
 (**Proposed**: the reference interpreter's, which the compiler followed from
@@ -3154,6 +3240,7 @@ it. Runtime support functions are ordinary lIR `define`s in a
 | `unit` | no value: `void` result, no argument; `()` in a value position is dropped | none |
 | field-less `defenum` | `i32` variant index | i32 |
 | `ptr` (unsafe) | `ptr`, uncounted | i64-like scalar |
+| `(Simd T n)` (§1.9) | `<n x T>` (`<n x i1>` for a mask); **not lowered yet**: the emitter stops with `todo:` | a scalar class, `vec` |
 | every object type (`str`, `Form`, `Array`, struct, enum with fields, `Cell`, `Atom`, `Weak` of a non-`dyn`, `Task`, closure) | `ptr` to a block starting with the header (§8.2) | ptr |
 | `(Option T)`, `T` an object type that is not itself an `Option` | `ptr`, null = `nil`; no allocation for `some` | opt |
 | `(Option T)`, `T` a scalar that has a value (`bool`, an integer, `char`, `keyword`, a float, a field-less `defenum`, `ptr`) — stage 2 | `{ i1 t }` by value, `t` the lIR type of `T`: the tag (1 for `some`), then the payload, zero for `nil`; no allocation, no count (§8.3; docs/design/unboxed-option.md) | `{ i1 t }`, a scalar class |
@@ -4456,3 +4543,15 @@ The variadic-promotion rule (lir.md §14 item 1) binds the compiler at
 `:varargs` externs (syntax §3.15): a `bool`, `i8`, `i16` or `f32`
 argument past the fixed parameters is widened to `i32` or `double`
 before the call, as C does.
+
+### Decided on lane vectors (SIMD wave 2, 2026-10-04)
+
+The owner decided, for the type checker (§1.9): (1) `(Simd T n)` with the lane count 1 to 64 and at most 512 bits, the sugar
+`f64x4`, and the native lane count; (2) scalar broadcast is **literals and `splat` only** (revised the same day from "a variable
+broadcasts when the vector is known"): a literal operand adopts the element type by the rule of L19 extended, a scalar variable or
+expression is a type error that names `(splat V x)`, a mismatched element type is an error, and there is no implicit numeric
+promotion (liar ADR 017 stays dropped); there is no deferred constraint and no inference-order rule beyond "the vector type is
+known at the application"; (4) integer vector arithmetic is checked like the scalar's, with `wrapping` (ADR 015) as the opt-out,
+which is a lowering matter and not in the checker; (5) the Rust interpreter is not the judge of new features, so §1.9 has none:
+its cases carry the expected type or error text. Open: the lowering (§1.9 "What is not there yet"); `native-vector-bits` is a
+constant until the target record exists; `/` on vectors needs the library `impl` of `Div`.
