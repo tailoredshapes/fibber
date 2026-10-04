@@ -42,12 +42,18 @@
     (if (>= i (count lines)) out (recur (+ i 1) (conj (conj out (nth lines i)) "\n")))))
 
 (defun emit :private (o: Out line: str) -> unit
-  (do (set! (. o buf) (conj @(. o buf) line))
-      (if (>= (count @(. o buf)) chunk-lines) (flush o) ())))
+  (let ((buf (. o buf)))
+    (do (update! buf (fn (v) (conj v line)))
+        (if (>= (count @buf) chunk-lines) (flush o) ()))))
 
+(def spaces: str "                                                                                                                                ")
+
+;; Two spaces for each level of depth: a slice of a constant down to 64 levels.
 (defun indent :private (d: i64) -> str
-  (loop ((i 0) (s ""))
-    (if (>= i d) s (recur (+ i 1) (str-concat s "  ")))))
+  (if (<= (* 2 d) (str-len spaces))
+      (str-slice spaces 0 (* 2 d))
+      (loop ((i 0) (s ""))
+        (if (>= i d) s (recur (+ i 1) (str-concat s "  "))))))
 
 ;; INDENT TAG [SP POS] [SP ATTRS].
 (defun line :private (o: Out d: i64 tag: str at: i64 attrs: str) -> unit

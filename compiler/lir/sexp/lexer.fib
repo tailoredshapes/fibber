@@ -35,10 +35,10 @@
 (defun byte-at :private (lx: Lexer i: i64) -> i64
   (if (< i (. lx n)) (zext i64 (str-byte-at (. lx src) i)) -1))
 
-(defun lex-pos :private (lx: Lexer) -> i64 (pos-new @(. lx line) @(. lx col)))
+(defun lex-pos (lx: Lexer) -> i64 (pos-new @(. lx line) @(. lx col)))
 
 ;; Consumes one byte; the column advances unless it is a continuation byte.
-(defun bump :private (lx: Lexer) -> unit
+(defun bump (lx: Lexer) -> unit
   (let ((b (byte-at lx @(. lx i))))
     (do (set! (. lx i) (+ @(. lx i) 1))
         (cond (= b 10) (do (set! (. lx line) (+ @(. lx line) 1)) (set! (. lx col) 1))
@@ -63,21 +63,42 @@
           (= b 227) (if (and (= b1 128) (= b2 128)) 3 0)
           :else 0)))
 
-;; A byte that ends an atom (lexer.rs `is_delim`).
-(defun delim-at? :private (lx: Lexer i: i64) -> bool
-  (let ((b (byte-at lx i)))
-    (or (= b 40) (= b 41) (= b 123) (= b 125) (= b 91) (= b 93) (= b 34) (= b 59) (= b 44) (> (ws-len lx i) 0))))
+;; The offset of the newline (or the end) that ends the comment starting at j.
+(defun comment-end :private (src: str n: i64 j: i64) -> i64
+  (loop ((k j))
+    (if (and (< k n) (not (= (zext i64 (str-byte-at src k)) 10))) (recur (+ k 1)) k)))
 
-(defun skip-space :private (lx: Lexer) -> unit
-  (loop ()
-    (let ((i @(. lx i)) (b (byte-at lx i)))
-      (cond (= b 59) (do (loop () (if (and (>= (byte-at lx @(. lx i)) 0) (not (= (byte-at lx @(. lx i)) 10)))
-                                      (do (bump lx) (recur))
-                                      ()))
-                         (recur))
-            (= b 44) (do (bump lx) (recur))
-            (> (ws-len lx i) 0) (do (bump-char lx) (recur))
-            :else ()))))
+;; The characters in bytes [from, to): the bytes that are not UTF-8 continuation bytes.
+(defun columns :private (src: str from: i64 to: i64) -> i64
+  (loop ((k from) (c 0))
+    (if (< k to)
+        (recur (+ k 1) (if (= (bit-and (zext i64 (str-byte-at src k)) 192) 128) c (+ c 1)))
+        c)))
+
+;; The cursor after the whitespace, commas and comments at the front. One pass over bytes held in locals, written back once: the cells are
+;; read and written at the end, not at every byte (the profile of `lairf check` on the 19 MB file: 30 ns a byte before this).
+(defun skip-space (lx: Lexer) -> unit
+  (let ((src (. lx src)) (n (. lx n)))
+    (loop ((j @(. lx i)) (line @(. lx line)) (col @(. lx col)))
+      (let ((b (if (< j n) (zext i64 (str-byte-at src j)) -1)))
+        (cond (= b 32) (recur (+ j 1) line (+ col 1))
+              (= b 10) (recur (+ j 1) (+ line 1) 1)
+              (= b 44) (recur (+ j 1) line (+ col 1))
+              (= b 59) (let ((k (comment-end src n j)))
+                         (recur k line (+ col (columns src j k))))
+              (and (>= b 9) (<= b 13)) (recur (+ j 1) line (+ col 1))
+              (>= b 128) (let ((w (ws-len lx j)))
+                           (if (> w 0)
+                               (recur (+ j w) line (+ col 1))
+                               (do (set! (. lx i) j) (set! (. lx line) line) (set! (. lx col) col))))
+              :else (do (set! (. lx i) j) (set! (. lx line) line) (set! (. lx col) col)))))))
+
+;; The byte at the cursor, -1 at the end.
+(defun lex-byte (lx: Lexer) -> i64 (byte-at lx @(. lx i)))
+
+;; The byte at the cursor after the whitespace and comments in front of it, -1 at the end of the text: what the next token starts with.
+(defun lex-peek (lx: Lexer) -> i64
+  (do (skip-space lx) (byte-at lx @(. lx i))))
 
 ;; The next token, nil at the end of the text (lexer.rs `Lexer::next`).
 (defun lex-next (lx: Lexer) -> (Result (Option Token) Diagnostic)
@@ -97,10 +118,29 @@
 (defun single :private (lx: Lexer t: Tok start: i64) -> (Result (Option Token) Diagnostic)
   (do (bump lx) (Ok (some (Token t start)))))
 
+;; The offset where the atom starting at j ends, and nothing else: an atom has no newline in it (a newline is whitespace), so its width
+;; in columns is the count of non-continuation bytes, which `columns` gives. ASCII bytes are classified here; a byte from 128 up asks `ws-len`.
+(defun atom-end :private (lx: Lexer j: i64) -> i64
+  (let ((src (. lx src)) (n (. lx n)))
+    (loop ((k j))
+      (if (< k n)
+          (let ((b (zext i64 (str-byte-at src k))))
+            (if (< b 128)
+                (if (or (= b 32) (and (>= b 9) (<= b 13)) (= b 40) (= b 41) (= b 123) (= b 125) (= b 91) (= b 93) (= b 34) (= b 59) (= b 44))
+                    k
+                    (recur (+ k 1)))
+                (if (> (ws-len lx k) 0) k (recur (+ k 1)))))
+          k))))
+
 (defun lex-atom :private (lx: Lexer start: i64) -> (Result (Option Token) Diagnostic)
-  (let ((from @(. lx i)))
-    (do (loop () (if (and (>= (byte-at lx @(. lx i)) 0) (not (delim-at? lx @(. lx i)))) (do (bump lx) (recur)) ()))
-        (Ok (some (Token (TokAtom (str-slice (. lx src) from @(. lx i))) start))))))
+  (Ok (some (Token (TokAtom (lex-atom-text lx)) start))))
+
+;; The atom at the cursor as text, the cursor after it.
+(defun lex-atom-text (lx: Lexer) -> str
+  (let ((from @(. lx i)) (to (atom-end lx @(. lx i))))
+    (do (set! (. lx col) (+ @(. lx col) (columns (. lx src) from to)))
+        (set! (. lx i) to)
+        (str-slice (. lx src) from to))))
 
 (defun hex-digit :private (c: i64) -> i64
   (cond (and (>= c 48) (<= c 57)) (- c 48)

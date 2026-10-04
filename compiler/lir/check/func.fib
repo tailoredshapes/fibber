@@ -24,12 +24,12 @@
           :else (recur (+ i 1)))))
 
 ;; Each block ends in exactly one terminator (spec/lir.md 5.1). (func.rs `structure`)
-(defun func-structure (f: LFunction) -> (Result unit Diagnostic)
+(defun func-structure (f: LFunction all: (Vec (Vec LExpr))) -> (Result unit Diagnostic)
   (loop ((i 0))
     (if (>= i (count (. f blocks)))
         (Ok ())
         (let ((b (nth (. f blocks) i))
-              (stmts (statements (. (nth (. f blocks) i) body))))
+              (stmts (nth all i)))
           (cond (or (= (count stmts) 0) (not (kind-terminator? (. (nth stmts (- (count stmts) 1)) kind))))
                 (err (. b pos) (str "block " (. b label) " does not end in a terminator"))
                 :else
@@ -61,13 +61,23 @@
                      (includes? idx succ) (recur (+ i 1) succ)
                      :else (recur (+ i 1) (conj succ idx))))))))))
 
-;; Successors from each block's terminator; undefined labels and branches to the entry are errors. (func.rs `successors`)
+;; The statements of every block, once for the structure and the successors (spec/lir.md 5.1).
+(defun func-statements (f: LFunction) -> (Vec (Vec LExpr))
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count (. f blocks)))
+        out
+        (recur (+ i 1) (conj out (statements (. (nth (. f blocks) i) body)))))))
+
 (defun func-successors (f: LFunction labels: (Map str i64)) -> (Result (Vec (Vec i64)) Diagnostic)
+  (func-successors-of f (func-statements f) labels))
+
+;; Successors from each block's terminator; undefined labels and branches to the entry are errors. (func.rs `successors`)
+(defun func-successors-of (f: LFunction all: (Vec (Vec LExpr)) labels: (Map str i64)) -> (Result (Vec (Vec i64)) Diagnostic)
   (let ((entry (. (nth (. f blocks) 0) label)))
     (loop ((i 0) (out (vec-empty)))
       (if (>= i (count (. f blocks)))
           (Ok out)
-          (let ((stmts (statements (. (nth (. f blocks) i) body))))
+          (let ((stmts (nth all i)))
             (match (func-block-succs (nth stmts (- (count stmts) 1)) entry labels)
               ((Err d) (Err d))
               ((Ok ss) (recur (+ i 1) (conj out ss)))))))))
@@ -88,11 +98,12 @@
           ((Err d) (Err d))))))
 
 (defun func-check-rest (env: LEnv f: LFunction labels: (Map str i64)) -> (Result unit Diagnostic)
-  (try-let ((_ (func-structure f)) (succs (func-successors f labels)) (b (bindings f)))
-    (let ((cfg (cfg-new succs))
-          (fcx (fcx-new env f cfg labels b check-ty check-terminator)))
-      (try-let ((_ (func-blocks fcx (func-order cfg (count (. f blocks))))))
-        (finish-phis fcx)))))
+  (let ((all (func-statements f)))
+    (try-let ((_ (func-structure f all)) (succs (func-successors-of f all labels)) (b (bindings f)))
+      (let ((cfg (cfg-new succs))
+            (fcx (fcx-new env f cfg labels b check-ty check-terminator)))
+        (try-let ((_ (func-blocks fcx (func-order cfg (count (. f blocks))))))
+          (finish-phis fcx))))))
 
 ;; Checks `f` completely; the first error. (func.rs `check_function`)
 (defun check-function (env: LEnv f: LFunction) -> (Result unit Diagnostic)
