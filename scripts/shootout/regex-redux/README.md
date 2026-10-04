@@ -26,3 +26,21 @@ opened with `dlopen` because the container has `libpcre2-8.so.0` and no header),
 ## Gaps hit
 
 See `docs/shootout/gaps.md`, section RE.
+
+## Results (RE agent, 2026-10-04; flock'd, /usr/bin/time, median of 3 at full and 5 at small, fibber under `ulimit -v 16000000`)
+
+elapsed seconds / user seconds / peak RSS in MB. Clojure: whole process, and in parentheses the in-program time of the work.
+
+| size (fasta N) | fibber | Java | Clojure | C (PCRE2 JIT) | fib/Java | fib/Clojure |
+|---|---|---|---|---|---|---|
+| small, 50000 | 0.03 / 0.02 / 8.4 | 0.15 / 0.35 / 53 | 0.47 (0.111) / 1.54 / 120 | 0.01 / 0.01 / 3.7 | 0.20 | 0.06 wall, 0.27 in-program |
+| full, 5000000 | 3.00 / 2.59 / 423 | 7.66 / 7.58 / 1237 | 9.91 (9.43) / 10.72 / 1280 | 1.71 / 1.62 / 101 | 0.39 | 0.30 wall, 0.32 in-program |
+| 25000000 (once) | 14.68 / 12.63 / 2107 | 36.97 / 35.64 / 5503 | 46.89 (46.02) / 46.44 / 5925 | 9.09 / 8.68 / 496 | 0.40 | 0.31 wall, 0.32 in-program |
+
+Start-up (hello world, median of 5): fibber 0.00 s, Java 0.01 s, Clojure `clojure.main -e nil` 0.22 s (user 0.63), C 0.00 s.
+
+Where fibber loses to C (1.75x at full): the profile (`scripts/bench/tools/prof.sh`) of the full run is 36% the DFA scan loop
+(`lib/fib/regex/dfa.fib`, one byte, one class lookup and one table lookup per character, plus a runtime call for the byte, RE-2 in
+the gaps), 15% memcpy/memset of the result strings, 9% the byte copy loops, 8% span vector reads, 7% the backward scan for the
+start of each match, 2% the 50 MB read. PCRE2's JIT scans the literal prefixes with vector instructions.
+Phases at full (ms): read 116, strip 324, the nine counts 78 each (700), the five substitutions 196 + 202 + 490 + 576 + 331.
