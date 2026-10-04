@@ -109,10 +109,12 @@
           (doseq [c copies] (ffi/free-addr c))
           r))))
 
+;; At `-O 0` the session uses the fast code generator (FastISel, as the macro runner's sessions do: dev-loop.md DV1); `-O 1` and up use
+;; the full selector. `build-lir` is unchanged.
 ;; The JIT session of `lir` (named `file` in messages) at optimisation level `opt`, and `main` called with `file` and `args` as its
 ;; command line; the result of `main` as an `i32`. The session is not freed: the process ends with the program. Rust: main.rs:154 `run`
 (defun run-lir (file: str lir: str opt: i64 args: (Vec str)) -> (Result i64 str)
-  (try-let ((j (jit/jit-new opt))
+  (try-let ((j (if (= opt 0) (jit/jit-new-fast-codegen opt) (jit/jit-new opt)))
             (_ (jit/jit-add-source j file lir))
             (addr (jit/jit-c-entry j "main"))
             (r (call-main addr (into [file] args))))
