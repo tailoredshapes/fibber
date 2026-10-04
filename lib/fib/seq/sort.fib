@@ -27,43 +27,87 @@
 
 (defun imin :private (a: i64 b: i64) -> i64 (if (< a b) a b))
 
-;; the pass that merges the sorted runs of `width` elements of `cur` into runs of 2*width in `tmp`:
-;; the left run's head wins a tie, which is what makes the sort stable
+;; The merges are written branch-free on purpose: a step takes the head by a select and moves the two cursors by (if take 1 0) and
+;; (if take 0 1), which are unconditional additions, so the machine code has no branch on the comparison, which a random input
+;; mispredicts about every second step (with a branch per step the merge took 1.7 times as long). The left head wins a tie, which is
+;; what makes the sort stable. When one run is used up the tail of the other is copied.
+
+;; the tails of cur[i,mid) and cur[j,hi) into tmp from k
+(defun merge-tails :private (cur: (Array e) tmp: (Cell (Array e)) i: i64 mid: i64 j: i64 hi: i64 k: i64) -> unit
+  (loop ((x i) (y k))
+    (if (< x mid)
+        (do (array-set! &tmp y (array-get cur x)) (recur (+ x 1) (+ y 1)))
+        (loop ((x2 j) (y2 y))
+          (if (< x2 hi) (do (array-set! &tmp y2 (array-get cur x2)) (recur (+ x2 1) (+ y2 1))) ())))))
+
+;; the pass that merges the sorted runs of `width` elements of `cur` into runs of 2*width in `tmp`, for a comparator function
 (defun merge-runs :private (cmp: (fn (e e) i64) :borrow cur: (Array e) tmp: (Cell (Array e)) n: i64 width: i64) -> unit
   (loop ((lo 0))
     (if (< lo n)
         (let ((mid (imin (+ lo width) n)) (hi (imin (+ lo (* 2 width)) n)))
           (do (loop ((i lo) (j mid) (k lo))
-                (if (< k hi)
-                    (if (if (< i mid) (if (< j hi) (<= (cmp (array-get cur i) (array-get cur j)) 0) true) false)
-                        (do (array-set! &tmp k (array-get cur i)) (recur (+ i 1) j (+ k 1)))
-                        (do (array-set! &tmp k (array-get cur j)) (recur i (+ j 1) (+ k 1))))
-                    ()))
+                (if (if (< i mid) (< j hi) false)
+                    (let ((a (array-get cur i)) (b (array-get cur j)) (take (<= (cmp a b) 0)))
+                      (do (array-set! &tmp k (if take a b))
+                          (recur (+ i (if take 1 0)) (+ j (if take 0 1)) (+ k 1))))
+                    (merge-tails cur tmp i mid j hi k)))
               (recur hi)))
         ())))
 
-;; the elements of v in the order of the three-way comparator cmp, stable; fewer than two come back as v
+;; the same pass for the natural order: `compare` is a call the compiler can see, where cmp is a closure
+(defun merge-runs-ord :private (cur: (Array e) tmp: (Cell (Array e)) n: i64 width: i64) :where ((Ord e)) -> unit
+  (loop ((lo 0))
+    (if (< lo n)
+        (let ((mid (imin (+ lo width) n)) (hi (imin (+ lo (* 2 width)) n)))
+          (do (loop ((i lo) (j mid) (k lo))
+                (if (if (< i mid) (< j hi) false)
+                    (let ((a (array-get cur i)) (b (array-get cur j)) (take (<= (compare a b) 0)))
+                      (do (array-set! &tmp k (if take a b))
+                          (recur (+ i (if take 1 0)) (+ j (if take 0 1)) (+ k 1))))
+                    (merge-tails cur tmp i mid j hi k)))
+              (recur hi)))
+        ())))
+
+;; the elements of v as an array of n, and a second array of n to merge into
+(defun sort-buffers :private (v: (Vec e) n: i64) -> (Cell (Array e))
+  (let ((cur (cell (array n (vec-nth v 0)))))
+    (do (dotimes (i n) (array-set! &cur i (vec-nth v i))) cur)))
+
+;; the elements of v in the order of the three-way comparator cmp, stable; fewer than two come back as v. The sorted array becomes
+;; the vector in one pass (vec-from-array: 2 objects for every 32 elements, where a conj loop spends 2 for each).
 (defun sort-vec :private (cmp: (fn (e e) i64) :borrow v: (Vec e)) -> (Vec e)
   (let ((n (vec-count v)))
     (if (< n 2)
         v
-        (let ((cur (cell (array n (vec-nth v 0)))) (tmp (cell (array n (vec-nth v 0)))))
-          (do (dotimes (i n) (array-set! &cur i (vec-nth v i)))
-              (loop ((width 1))
+        (let ((cur (sort-buffers v n)) (tmp (cell (array n (vec-nth v 0)))))
+          (do (loop ((width 1))
                 (if (< width n)
                     (do (merge-runs cmp @cur tmp n width)
                         (let ((t @cur)) (do (set! cur @tmp) (set! tmp t)))
                         (recur (* width 2)))
                     ()))
-              (loop ((i 0) (out (vec-empty)))
-                (if (< i n) (recur (+ i 1) (vec-conj out (array-get @cur i))) out)))))))
+              (fib.prelude/vec-from-array @cur))))))
+
+;; sort-vec for the natural order
+(defun sort-vec-ord :private (v: (Vec e)) :where ((Ord e)) -> (Vec e)
+  (let ((n (vec-count v)))
+    (if (< n 2)
+        v
+        (let ((cur (sort-buffers v n)) (tmp (cell (array n (vec-nth v 0)))))
+          (do (loop ((width 1))
+                (if (< width n)
+                    (do (merge-runs-ord @cur tmp n width)
+                        (let ((t @cur)) (do (set! cur @tmp) (set! tmp t)))
+                        (recur (* width 2)))
+                    ()))
+              (fib.prelude/vec-from-array @cur))))))
 
 ;; (sort-with cmp c): the 2-arity of Clojure's sort, kept as a function of its own because `sort` is a terminal of the Rust fusion tables, which do not know `sort$1` (Y11); the comparator's result is a Cmp
 (defun sort-with (cmp: (fn (e e) r) :borrow c: c) :where ((Reducible c e) (Cmp r)) -> (VSeq e)
   (vseq-of (sort-vec (fn (a b) (resolve (cmp a b) (fn () (cmp b a)))) (to-vec c))))
 
 (defun sort (c: c) :where ((Reducible c e) (Ord e)) -> (VSeq e)
-  (vseq-of (sort-vec (fn (a b) (compare a b)) (to-vec c))))
+  (vseq-of (sort-vec-ord (to-vec c))))
 
 ;; (sort-by-with key cmp c): the 3-arity of Clojure's sort-by until L1; cmp compares two keys
 (defun sort-by-with (key: (fn (e) k) cmp: (fn (k k) r) :borrow c: c) :where ((Reducible c e) (Cmp r)) -> (VSeq e)
