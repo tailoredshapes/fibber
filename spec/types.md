@@ -1707,7 +1707,7 @@ Everything else emits no count operation:
 | **join** of `if`/`match` branches | all branches `Borrowed(b)` for one `b`: `Borrowed(b)`. All branches `Derived(b)` for one `b`: `Derived(b)`. Otherwise, including `Borrowed(b)` mixed with `Derived(b)`, `Owned`, and every branch that is not `Owned` gets a retain at its tail (**Decided** by case 04 and for the mixed case: read as `Derived(b)` it hid a `Borrowed(b)` occurrence from the escape summary of §6.4, and read as `Borrowed(b)` the scope-exit rule would move `b` out when the other branch had returned a sub-object of `b`, leaking `b`) |
 | non-final `do` step | `Owned`: release at the step's end |
 | `defun`, `fn` or `async` body (E1) | `consume` the body's value (every `let` and `match` inside it has already exited by the scope-exit rule, since they are expressions); an owned parameter whose value is the result is moved out, with no retain and no release; then release the temporaries of the final step, then the owned parameters not moved out (§6.4). A tail call in a `defun` or `fn` body replaces all of this by the rule of §6.10. An `async` body has no parameters and no tail calls (§6.10 rule (f)): its consumed value is the task's result, which the completion of §8.8 stores after the body's last step has returned |
-| `@c` read | always an acquire (+1) with a matching release at the end of the value's scope or step; **never elided** in v1 (**Decided**). No elision of a cell read is sound on syntax alone: a callee can reach the same cell through any argument, field or capture and write it; a sibling sub-expression of the same step can write it (`(array-get (. @s arr) (do (set! s ..) 0))` freed the array under the call when the read was elided); and `count`, `nth` and `+` are protocol methods with user implementations, so "writes no cell" is not a property the checker can decide by name |
+| `@c` read | an acquire (+1) with a matching release at the end of the value's scope or step, except a **peek** (§6.3, "Cell peeks": a read of a private cell consumed at once by a borrowed position or a scalar field read, with no count). Elsewhere it is **never elided** (**Decided**). No elision of a cell read is sound on its position alone, which is why a peek has three conditions: a callee can reach the same cell through any argument, field or capture and write it; a sibling sub-expression of the same step can write it (`(array-get (. @s arr) (do (set! s ..) 0))` freed the array under the call when the read was elided); and `count`, `nth` and `+` are protocol methods with user implementations, so "writes no cell" is not a property the checker can decide by name |
 | `&` copy-in and write-back | §6.6 |
 | `(weak e)` | no count operation; forces `e`'s binding onto the heap (§6.11) |
 | `(raw e)` | no count operation; `e`'s binding must outlive every use of the pointer (**Decided**, §9; the programmer's obligation inside `unsafe`) |
@@ -1800,19 +1800,73 @@ fails without it:
   `Borrowed(b)` or `Derived(b)` value names is held by a count of `b`'s owner (the binding that owns it, or the
   caller of a borrowed parameter), so while the borrow is live that array has count 1 only if no cell holds it, and
   then no write reaches it; if a cell holds it as well the count is at least 2 and the write copies (§6.6), leaving
-  the borrowed array and its elements as they were. Cases 273 and 277 write to a sibling holder of a shared array and of a shared struct while an element is borrowed. A cell's content is never borrowed in place: `@c` always acquires
+  the borrowed array and its elements as they were. Cases 273 and 277 write to a sibling holder of a shared array and of a shared struct while an element is borrowed. A cell's content is borrowed in place only by a peek ("Cell peeks" below); every other `@c` acquires
   (the row `@c` read above), so a value read out of a cell is `Owned` and its temporary holds a count, and an `&c`
   argument takes the content without a count (`PsMoveIn`) only when no other operand of the call mentions `c`
-  (own.lastuse `amp`), so no sibling operand holds a derived read of it. An array that is the `Owned` result of
-  `@c` is the case the rule leaves `Owned` (above): `(let ((e (array-get @c 0))) (array-set! &c 0 x) e)` retains
-  the element at the read, the write finds the array shared by the temporary and copies, and `e` is the old element
-  (case 272).
+  (own.lastuse `amp`), so no sibling operand holds a derived read of it. An array that comes out of `@c` is never `Derived`
+  (above): `(let ((e (array-get @c 0))) (array-set! &c 0 x) e)` retains the element at the read, whether `@c` is acquired
+  (the write then finds the array shared by the temporary and copies) or a peek (the write finds it unique and writes in
+  place, releasing the old element, which `e` still holds), and `e` is the old element (case 272).
 
 Not done: a `Derived` read from an `Owned` array operand or from a part of a temporary of the call's own step (case 278),
-and a borrowed read through a cell (case 272). Both stay as they were: `Owned`, one retain at the read and one release
+and a `Derived` read through a cell (case 272: the element read is `Owned` even when the array is peeked, below). Both stay as they were: `Owned`, one retain at the element read and one release
 of the element's consumer. The audit does not see a read of a freed object that takes no count (the use after free of a
 borrowed element); the cases 271 and 276 therefore allocate an object of the same size after the point where a wrong plan would
 free the element, so that the allocator reuses its memory and the read gives another answer.
+
+**Cell peeks** (performance batch 6, P6; cases 286 to 29x). Every `@c` acquires the content (§6.7), and a borrowed
+position then releases it again after the call: a retain and a release around each `(array-get @a i)` and each
+`(energy @a)`. A **peek** is a `@c` that takes no count: the content is *borrowed from the cell* for the one expression that
+consumes it. The plan records the deref in `BodyOwn.peeks`; its mode is `Scalar` (it has no count and no binding, so every
+rule that reads a mode ignores it); the emitter loads the content and does not retain it. A `@c` is a peek when all
+three hold (source: `compiler/own/peek.fib` for P1, `compiler/own/walk/call.fib` and `expr.fib` for P2 and P3):
+
+- **P1, the cell is private to the body and never a value.** `c` is an `&` parameter of the body, or a `let` binding
+  whose initialiser is directly `(cell e)`; and every occurrence of `c` in the body is the place of a `@` or a `set!`,
+  an `&c` argument or the target of `set-field!`; no `fn` or `async` literal captures it (§6.5). A parameter of cell
+  type is not private (the caller, or another argument, may hold the same cell), an atom, a weak reference or a task
+  is never a peek (below), a cell read from a field or returned by a call is not a binding initialised by `(cell e)`.
+- **P2, the position is consumed at once.** The `@c` is (a) an argument of a call of a `defun`, a protocol method or a
+  builtin, at a position that is *borrowed* (§6.4) and no more than borrowed: not an `&` position, not `weak`, not `raw`,
+  not a store or a thread position, not an owned position, and not a call through a closure value or an `extern`; and
+  the call is **not in tail position**; or (b) the operand of a field read `(. @c f)` whose value is a scalar.
+- **P3, no sibling operand names the cell.** No other operand of the call (the head and the other arguments), at any
+  depth, closure literals included, mentions `c`: no `@c`, `&c`, `set!`, `set-field!` of it (own.syntactic
+  `mentions-amp`). A field read has no other operand.
+
+*Why it is sound.* Let `X` be the content. Its only count is the cell's (a peek adds none), so `X` is freed or
+overwritten in place only if the content of `c` changes: `set!` or a unique write (`array-set!`, `array-push!`,
+`set-field!`, ..., §6.6) through `&c`, or the write-back of an `&c` argument. Code can do that only if it can name
+`c`. P1 says that the body's mentions of `c` are all syntactic (`@c`, `set!`, `&c`, `set-field!`: there is no value of
+`c` to pass, store or capture, so no callee, closure, other task or other object can ever hold it), so a callee or a
+closure that runs during the call cannot write `c`; P3 says that no operand of this call is a mention, so
+no operand evaluated before the call can write it; and the expression is consumed before the next
+step of the body runs. The borrow therefore ends with the call, while `c` still holds `X`. The callee treats `X` as every
+borrowed parameter: a store of it retains (E2), a use as an owned argument retains (`consume`), its result is `Owned`
+(a part of it is retained at the callee's return, E1) and none of these depends on `X` having count 2. The reasons
+for each part, with the case that fails without it:
+
+- *A sibling that writes the cell* (`(f @a (do (set! a ..) 0))`, `(array-get @a (g &a))`): the content would be freed
+  under the call, which is the failure that made the read "never elided" in v1 (§6.7). P3. Cases 286, 287.
+- *A closure or a value that reaches the cell*: a call that receives the cell (as a closure that captured it, or as
+  an element of another argument) could write it. P1: such a cell is never peeked. Cases 288, 289.
+- *A tail call* (§6.10 step 3): the jump releases the frame's cell, an owned `let` cell included, before the callee
+  runs, so a borrowed content would dangle. P2 excludes a call in tail position. Case 290.
+- *A parameter of cell type*: the caller may hold the cell twice (`(f c (array c))`), and the second route writes it.
+  P1. Case 291.
+- *Atoms*: another thread can replace the content at any time, and the lock is held only inside the deref. A cell is
+  never shared between threads (P1: a spawned or `async` body captures its cells by E3, so a captured cell is not a
+  peek), so a peek cannot race. Weak references and tasks are not cells. Case 292.
+- *A loop*: a peek lives for one evaluation of one expression, so a loop that replaces the cell between iterations
+  reads the new content each round (the old content is released at the `set!`, no peek is outstanding). Case 293.
+
+The element read of §6.3: `(array-get @c i)` with a peeked array is `Owned` (an element that is an object is retained at the read:
+the array that held it can be replaced afterwards), as case 272 shows with `@c` acquired. Not done, and each stays an
+acquire: a peek in tail position (a scalar read there would be sound; the call machinery is not separate from the jump,
+and widening needs a case); `(. @c f)` of an object field; `match @c`; `(let ((x @c)) ..)` (the binding outlives the
+step); `@c` at an owned or stored position; `@(. s f)` and every other place that is not a binding named in P1; an
+atom. The interpreter keeps plain counting at a borrowed position (§6.12): it retains and releases around the call; the
+compiler elides the pair, and the two free the same objects at the same points (the retain and release cancel).
 
 ### 6.4 Borrowed and owned parameters, owned results, summaries (§4)
 
@@ -2292,7 +2346,7 @@ result 4; clean.
 - `(cell e)`: E2 for `e`; the cell owns one count of its content.
 - `@c`: an acquire, `Owned` (+1) — the same rule as for atoms
   (**Decided** for atoms, §7, and for cells), so that `(let ((x @c))
-  (set! c y) x)` can never read freed memory. Never elided in v1 (§6.3).
+  (set! c y) x)` can never read freed memory. Elided only by a peek (§6.3), and never otherwise.
 - `(set! c e)`: E2 for `e`, then release the old content. Order matters
   for `(set! c (f @c))`: the acquired temporary keeps the old value alive
   through `f`.
@@ -3367,7 +3421,7 @@ vtable: `(i64 i32 i32 ptr ptr)`, and a `(Weak (dyn P))` content the same
 way, box then vtable (lir.md §2).
 
 - `@c` on a cell: `load`, then `fib.retain` if the content is an object
-  (never elided, §6.3).
+  (elided only for a peek, §6.3 "Cell peeks", which is `load` alone).
 - `(set! c v)`: `old = load`; `store v` (after `consume`); `fib.release
   old`. If the cell is `SHARED` (only an atom can be), the value is
   share-marked before the store.
@@ -3878,7 +3932,7 @@ old numbering is kept here because the drafts and
 | 1 | HM with generalisation at `defun` SCCs only; `let`/`fn` never generalise (D3) | §3, §2.4 |
 | 2 | two-point colour lattice with `⊑` at flow sites (D4) | §5.4 |
 | 3 | copy-in moves when exclusive — **decided the other way (D1): always acquire** | §6.6 |
-| 4 | cell reads owned and never elided | §6.3, §6.7 |
+| 4 | cell reads owned and never elided; **amended in batch 6: a peek of a private cell elides the pair** | §6.3, §6.7 |
 | 5 | escape kinds declared on methods; closure types carry none | §6.4 |
 | 6 | only self tail calls become loops — **replaced by D5: every admissible call in tail position is a tail call; kinds inferred** | §6.10, §6.4 |
 | 7 | monomorphisation by layout class / full type; whole program | §4.3 |
