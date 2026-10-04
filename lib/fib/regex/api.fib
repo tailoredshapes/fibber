@@ -20,7 +20,7 @@
         fib.regex.ast fib.regex.parse fib.regex.prog fib.regex.pike fib.regex.dfa))
 
 (defstruct Regex
-  (pattern: str groups: i64 fwd: Prog rev: Prog fdfa: Dfa rdfa: Dfa use-dfa: bool))
+  (pattern: str groups: i64 fwd: Prog rev: Prog fdfa: Dfa rdfa: Dfa use-dfa: bool fixed: i64))
 
 (defstruct Match (start: i64 end: i64 whole: str groups: (Vec (Option str)) spans: (Vec i64)))
 
@@ -30,7 +30,7 @@
           r (compile-reverse a)]
       (if (or (. f too-big) (. r too-big))
           (Err "pattern is too large")
-          (Ok (Regex s (. a groups) f r (new-dfa f true false) (new-dfa r false true) (not (. f asserts))))))))
+          (Ok (Regex s (. a groups) f r (new-dfa f true false) (new-dfa r false true) (not (. f asserts)) (fixed-len (. a node))))))))
 
 (defun re-pattern (s: str) -> Regex
   (match (try-re-pattern s)
@@ -75,10 +75,14 @@
   (if (. rx use-dfa)
       (let [e (dfa-forward (. rx fdfa) s from)]
         (cond (= e -1) -1
-              (>= e 0) (let [st (dfa-backward (. rx rdfa) s e from)]
+              (>= e 0) (let [st (if (>= (. rx fixed) 0) (back-chars s e (. rx fixed)) (dfa-backward (. rx rdfa) s e from))]
                          (if (>= st 0) (pack-span st e) (caps-packed (pike-run (. rx fwd) s from false false))))
               :else (caps-packed (pike-run (. rx fwd) s from false false))))
       (caps-packed (pike-run (. rx fwd) s from false false))))
+
+;; k characters before byte offset i
+(defun back-chars :private (s: str i: i64 k: i64) -> i64
+  (if (> k 0) (back-chars s (start-before s i) (- k 1)) i))
 
 (defun caps-packed :private (caps: (Array i64)) -> i64
   (if (= (array-len caps) 0) -1 (pack-span (array-get caps 0) (array-get caps 1))))
