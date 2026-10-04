@@ -88,7 +88,7 @@ Tranche 2 (four digits; the package ids are those of the tranche 2 plan, spec/st
 | 3060-3119 | Y12 | 3200-3249 | Z2 |
 | 3500-3599 | integration and the flips | 4000-4049 | in-place update (PERFB2 L7): persistence cases 4000-4007 (`scripts/mutant-unique.sh` must kill each), 4008-4009 audit, 4010-4016 counts |
 | 5000-5999 | mutation additions, fifty a package | | |
-| 6000-6049 | `fib.regex` (the shootout's RE package): 6000 is the differential test against `java.util.regex` (`scripts/regex-diff/`), 6001 hand-picked pairs and the API | | |
+| 6100-6149 | `fib.regex` (the shootout's RE package): 6100 is the differential test against `java.util.regex` (`scripts/regex-diff/`), 6101 hand-picked pairs and the API | | |
 
 A package writes only in its block. A case that waits for another package's work stays in the block of
 the package that wrote it and names the item or package it waits for in `open:`; when that lands the case

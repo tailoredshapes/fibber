@@ -1903,7 +1903,7 @@ end, longest-first, it gives the START (the smallest start of a match that ends 
 `min(10000, 2000000 / classes)` states, and a search that needs more is done by the Pike VM instead. `re-find` with groups takes the span from the DFA and runs the Pike VM anchored at its start. A `Regex` holds the caches, so it is
 thread-confined (not `Send`), as a `Matcher` is.
 
-**What the differential test found of Java** (`cases/stdlib/6000-ref-regex-vs-java-util-regex.fib`, `scripts/regex-diff/RegexDiff.java`): the answers are Java's on every pair, with two exceptions that are Java's, not the library's: for a group inside two nested repeats
+**What the differential test found of Java** (`cases/stdlib/6100-ref-regex-vs-java-util-regex.fib`, `scripts/regex-diff/RegexDiff.java`): the answers are Java's on every pair, with two exceptions that are Java's, not the library's: for a group inside two nested repeats
 Java keeps the capture of an earlier iteration of the outer one (`((a)*b)*` on `abaab` gives group 2 as the first iteration's), where the library keeps the last, as Perl does; and Java steps into the middle of a supplementary character after an empty match,
 finding an empty match there that no text position holds. The test compares only the extent of the match for the first kind and keeps supplementary characters out of its random texts (they are in `6001`).
 
