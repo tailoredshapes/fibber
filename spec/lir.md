@@ -153,8 +153,10 @@ block  ::= (block LABEL instr+)
 ```
 
 Anything else at the top level is an error `expected a top-level form
-(define, declare, declare-global, defstruct, global, constant, target), found …`
-(liar silently ignored top-level expressions, `lir-audit/fuzz2.txt`).
+(define, declare, declare-global, defstruct, global, constant), found …`
+(liar silently ignored top-level expressions, `lir-audit/fuzz2.txt`). The
+message names the forms of the first M3 pass; `(target ..)` (§4.5) is a top-level form too, and
+is left out of the text so that the Rust `lair`, the oracle of the compare scripts, says the same.
 Items may appear in any order and refer to each other in any order.
 
 ### 4.1 Module-level rules
@@ -252,12 +254,13 @@ written where both can read it.
   instead). `lair build` and `emit` may name any CPU and features: the
   executable is for whoever runs it.
 - At most one `target` form (`a module has at most one target form`).
-- Syntax rules checked by §10 (before LLVM): `target needs (cpu "NAME")`;
-  `target: unknown field NAME` (anything but `cpu` and `features`);
-  `target: cpu must be a non-empty string of letters, digits, `.`, `_`
-  and `-``; `target: each feature must be +name or -name, found "avx2"`
-  (the name has letters, digits, `.`, `_` and `-`); `target: duplicate
-  cpu` and `target: duplicate features`.
+- Rules, checked by the parser and §10 before LLVM is called: `target needs (cpu "NAME")`; `target: unknown
+  field NAME` (anything but `cpu` and `features`); `target: expected (cpu "NAME") or (features "LIST"), found
+  X` (a field that is not a list); `target: cpu expects one string` and `target: features expects one string`;
+  `target: cpu must be a non-empty string of letters, digits, ., _ and -`; `target: features must be a
+  string`; `target: each feature must be +name or -name, found "avx2"` (the name has letters, digits, `.`,
+  `_` and `-`; an empty item or one with a space is found too); `target: duplicate cpu` and `target:
+  duplicate features`; `a module has at most one target form`.
 - LLVM itself ignores, with a warning on standard error, a CPU or
   feature name it does not know; lIR does not carry LLVM's tables, so it
   cannot reject them. A spelling mistake therefore costs speed, never
@@ -441,7 +444,8 @@ an infinity where the flag says there is none *is* poison) and `fast`
 value that violates it is poison`. Flags may appear in any order; repeating
 one is `duplicate fast-math flag reassoc`; a word that is none of these is
 `unknown fast-math flag foo`; a flag on a form that does not take them is
-the form's usual operand-count error. The measured effect is the point: a
+the form's usual operand-count error; a flag position that holds a form, not a word, is `expected a
+fast-math flag, found X`. The measured effect is the point: a
 sum of 4096 doubles in a loop takes 83 ms strict and 14 ms with
 `reassoc` on its `fadd` (docs/design/vectorisation.md), because only then
 may LLVM keep several partial sums in a vector register.

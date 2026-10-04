@@ -71,6 +71,33 @@
 (defun ordering-rank (o: LOrdering) -> i64
   (match o ((OUnordered) 0) ((OMonotonic) 1) ((OAcquire) 2) ((ORelease) 3) ((OAcqRel) 4) ((OSeqCst) 5)))
 
+;; ---------------------------------------------------------------- fast-math flags (spec/lir.md 6.1)
+
+;; The bits of `LLVMFastMathFlags` (llvm-c/Core.h): the flags lIR has. `nnan`, `ninf` and `fast` are not in lIR.
+(def fm-reassoc: i64 1)
+(def fm-nsz: i64 8)
+(def fm-arcp: i64 16)
+(def fm-contract: i64 32)
+(def fm-afn: i64 64)
+
+;; The flag a word names, nil for a word that is none.
+(defun fm-flag (w: str) -> (Option i64)
+  (cond (= w "reassoc") (some fm-reassoc)
+        (= w "contract") (some fm-contract)
+        (= w "arcp") (some fm-arcp)
+        (= w "afn") (some fm-afn)
+        (= w "nsz") (some fm-nsz)
+        :else nil))
+
+;; The words of the bits set, in the order the printer writes them.
+(defun fm-words (flags: i64) -> (Vec str)
+  (let ((all: (Vec str) ["reassoc" "contract" "arcp" "afn" "nsz"])
+        (bits: (Vec i64) [fm-reassoc fm-contract fm-arcp fm-afn fm-nsz]))
+    (loop ((i 0) (out: (Vec str) []))
+      (cond (>= i (count all)) out
+            (= (bit-and flags (nth bits i)) 0) (recur (+ i 1) out)
+            :else (recur (+ i 1) (conj out (nth all i)))))))
+
 ;; ---------------------------------------------------------------- expressions
 
 ;; The callee of a call (ast.rs `Callee`).
@@ -121,6 +148,10 @@
   (KCmpXchg weak: bool scope: LScope success: LOrdering failure: LOrdering ptr: LExpr expected: LExpr new: LExpr)
   (KFence scope: LScope ord: LOrdering)
   (KTrap)                                                       ;; `(trap)`: llvm.trap, void and not a terminator
+  ;; The intrinsic forms of spec/lir.md 6.1, 6.4 and 6.5 (SIMD wave 2, package P0): `name` is the word (`fma`, `reduce-add`, `gather`), `flags`
+  ;; the fast-math bits (`fm-*` below, 0 for none; a `fadd` that carries flags is this form with name "fadd", an unflagged one is `KBin`),
+  ;; `ty` the leading type operand of `masked-load` and `gather`, `args` the value operands, `align` the trailing `(align N)`.
+  (KIntrin name: str flags: i64 ty: (Option LType) args: (Vec LExpr) align: (Option i64))
   (KCall callee: LCallee args: (Vec LExpr) tail: bool)
   (KRet value: (Option LExpr))
   (KBr label: str)
@@ -172,16 +203,30 @@
 
 (defstruct LFunction (name: str ty: LFnType params: (Vec LParam) blocks: (Vec LBlock) mods: LModifiers pos: i64))
 
+;; `(target (cpu "..") (features ".."))` (spec/lir.md 4.5).
+(defstruct LTarget (cpu: str features: str pos: i64))
+
 ;; ast.rs `Item`.
 (defenum LItem
   (ItStruct def: LStructDef)
   (ItGlobal def: LGlobalDef)
   (ItDeclareGlobal decl: LGlobalDecl)
   (ItDeclare decl: LDeclare)
-  (ItDefine func: LFunction))
+  (ItDefine func: LFunction)
+  (ItTarget decl: LTarget))
 
 ;; A whole module, items in source order (ast.rs `Module`).
 (defstruct LModule (items: (Vec LItem)))
+
+;; The module's `target` form, nil when it has none (the checker allows one).
+(defun module-target (m: LModule) -> (Option LTarget)
+  (let ((items (. m items)))
+    (loop ((i 0))
+      (if (>= i (count items))
+          nil
+          (match (nth items i)
+            ((ItTarget t) (some t))
+            (_ (recur (+ i 1))))))))
 
 ;; Whether the name is visible outside its module (ast.rs `Linkage::exported`).
 (defun linkage-exported? (l: LLinkage) -> bool (= l LkExternal))

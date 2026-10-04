@@ -1,0 +1,111 @@
+;; compiler/lir/check/intrin.fib: the type rules of the intrinsic forms (spec/lir.md 6.1, 6.4, 6.5; lir.intrin has the table). The Rust checker has
+;; none of these. OWNER: package P0 (SIMD wave 2).
+
+;; Operands are typed with `fcx-val`, left to right, as in lir.check.arith, so that the first error is the one the spec's order gives.
+
+(ns lir.check.intrin
+  (:use lir.diag lir.types lir.ast lir.intrin lir.check.fcx))
+
+
+;; The type of the form (nil for void).
+(defun check-intrin (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
+  (match (. e kind)
+    ((KIntrin name _ ty args _)
+     (let ((c (intrin-class name)) (p (. e pos)))
+       (cond (or (= c "f1") (= c "f2") (= c "f3") (= c "fbin")) (some-t (check-float-fn fcx name args p))
+             (or (= c "i1") (= c "i2")) (some-t (check-int-fn fcx name args p))
+             (or (= c "red-i") (= c "red-m") (= c "red-f")) (some-t (check-reduce fcx name c args p))
+             :else (check-masked fcx name c ty args p))))
+    (_ (err (. e pos) "internal error: not an intrinsic form"))))
+
+(defun some-t :private (r: (Result LType Diagnostic)) -> (Result (Option LType) Diagnostic)
+  (match r ((Ok t) (Ok (some t))) ((Err d) (Err d))))
+
+;; The operands after the first, each of the type of the first: `NAME: operand K has type X, expected Y`.
+(defun same-rest :private (fcx: Fcx name: str args: (Vec LExpr) ta: LType pos: i64) -> (Result unit Diagnostic)
+  (loop ((k 1))
+    (if (>= k (count args))
+        (Ok ())
+        (match (fcx-val fcx (nth args k))
+          ((Err d) (Err d))
+          ((Ok tk) (match (fcx-same fcx name (+ k 1) tk ta pos)
+                     ((Err d) (Err d))
+                     ((Ok _) (recur (+ k 1)))))))))
+
+(defun check-float-fn :private (fcx: Fcx name: str args: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
+  (try-let ((ta (fcx-val fcx (nth args 0))))
+    (if (not (type-float-like? ta))
+        (err pos (str name " needs float operands, found " (type-str ta)))
+        (try-let ((_ (same-rest fcx name args ta pos))) (Ok ta)))))
+
+(defun check-int-fn :private (fcx: Fcx name: str args: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
+  (try-let ((ta (fcx-val fcx (nth args 0))))
+    (if (not (type-int-like? ta))
+        (err pos (str name " needs integer operands, found " (type-str ta)))
+        (try-let ((_ (same-rest fcx name args ta pos))) (Ok ta)))))
+
+;; The element type of a vector whose elements satisfy `ok`, else the error naming `what`.
+(defun vector-elem :private (name: str what: str ok: (fn (LType) bool) t: LType pos: i64) -> (Result LType Diagnostic)
+  (match t
+    ((TVector _ el) (if (ok el) (Ok el) (err pos (str name " needs " what " vector operand, found " (type-str t)))))
+    (_ (err pos (str name " needs " what " vector operand, found " (type-str t))))))
+
+(defun check-reduce :private (fcx: Fcx name: str c: str args: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
+  (cond (= c "red-i") (try-let ((tv (fcx-val fcx (nth args 0)))) (vector-elem name "an integer" type-int? tv pos))
+        (= c "red-m") (try-let ((tv (fcx-val fcx (nth args 0)))) (vector-elem name "a float" type-float? tv pos))
+        :else (try-let ((ta (fcx-val fcx (nth args 0)))
+                        (tv (fcx-val fcx (nth args 1)))
+                        (el (vector-elem name "a float" type-float? tv pos))
+                        (_ (fcx-same fcx name 1 ta el pos)))
+                (Ok el))))
+
+;; `<N x i1>` for the lanes of the vector type `t`.
+(defun mask-of :private (t: LType) -> LType
+  (match t ((TVector n _) (TVector n ty-i1)) (_ ty-i1)))
+
+(defun ptrs-of :private (t: LType) -> LType
+  (match t ((TVector n _) (TVector n ty-ptr)) (_ ty-ptr)))
+
+;; A vector of integers or floats: the operand or type of a masked access.
+(defun mem-vector :private (name: str t: LType what: str pos: i64) -> (Result unit Diagnostic)
+  (match t
+    ((TVector _ el) (if (or (type-int? el) (type-float? el))
+                        (Ok ())
+                        (err pos (str name " needs a vector of integers or floats, found " (type-str t)))))
+    (_ (err pos (str name " needs " what ", found " (type-str t))))))
+
+(defun ptr-operand :private (fcx: Fcx name: str e: LExpr pos: i64) -> (Result unit Diagnostic)
+  (try-let ((tp (fcx-val fcx e)))
+    (if (= tp ty-ptr) (Ok ()) (err pos (str name " needs a ptr operand, found " (type-str tp))))))
+
+(defun operand-is :private (fcx: Fcx name: str k: i64 e: LExpr want: LType pos: i64) -> (Result unit Diagnostic)
+  (try-let ((t (fcx-val fcx e)))
+    (fcx-same fcx name k t want pos)))
+
+(defun check-masked :private (fcx: Fcx name: str c: str ty: (Option LType) args: (Vec LExpr) pos: i64) -> (Result (Option LType) Diagnostic)
+  (cond (= c "mload")
+        (let ((t (unwrap-or ty ty-i32)))
+          (try-let ((u1 (fcx-valid fcx t pos)) (u2 (mem-vector name t "a vector type" pos))
+                    (u3 (ptr-operand fcx name (nth args 0) pos))
+                    (u4 (operand-is fcx name 2 (nth args 1) (mask-of t) pos))
+                    (u5 (operand-is fcx name 3 (nth args 2) t pos)))
+            (Ok (some t))))
+        (= c "gather")
+        (let ((t (unwrap-or ty ty-i32)))
+          (try-let ((u6 (fcx-valid fcx t pos)) (u7 (mem-vector name t "a vector type" pos))
+                    (u8 (operand-is fcx name 1 (nth args 0) (ptrs-of t) pos))
+                    (u9 (operand-is fcx name 2 (nth args 1) (mask-of t) pos))
+                    (u10 (operand-is fcx name 3 (nth args 2) t pos)))
+            (Ok (some t))))
+        (= c "mstore")
+        (try-let ((tv (fcx-val fcx (nth args 0)))
+                  (u11 (mem-vector name tv "a vector operand" pos))
+                  (u12 (ptr-operand fcx name (nth args 1) pos))
+                  (u13 (operand-is fcx name 3 (nth args 2) (mask-of tv) pos)))
+          (Ok nil))
+        :else
+        (try-let ((tv (fcx-val fcx (nth args 0)))
+                  (u14 (mem-vector name tv "a vector operand" pos))
+                  (u15 (operand-is fcx name 2 (nth args 1) (ptrs-of tv) pos))
+                  (u16 (operand-is fcx name 3 (nth args 2) (mask-of tv) pos)))
+          (Ok nil))))

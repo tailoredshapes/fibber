@@ -1,0 +1,33 @@
+;; expect: accept
+;; stage: 2
+;; out: load 7 8 -1 -1
+;; out: gather 7 -5 8 -5
+;; out: store done
+;; out: scatter done
+;; A masked-off lane is not accessed: the 4-lane vector at the end of a readable page has lanes 2 and 3 in the next page, which is PROT_NONE.
+;; With those lanes masked off the load, store, gather and scatter do not fault; masked-guard-fault.lir is the control that the page does fault
+;; when the lanes are on.
+(declare printf i32 (ptr ...))
+(declare mmap ptr (ptr i64 i32 i32 i32 i64))
+(declare mprotect i32 (ptr i64 i32))
+(define (opq <4 x i1>) ((<4 x i1> m))
+  (block entry (let ((s (alloca <4 x i1>))) (store volatile m s) (ret (load volatile <4 x i1> s)))))
+(define (main i32) ()
+  (block entry
+    (let ((base (call @mmap (ptr null) (i64 8192) (i32 3) (i32 34) (i32 -1) (i64 0)))
+          (guard (getelementptr i8 base (i64 4096)))
+          (v (getelementptr i8 base (i64 4080))))
+      (let ((r (call @mprotect guard (i64 4096) (i32 0))))
+        (store (align 8) (double 7.0) v)
+        (store (align 8) (double 8.0) (getelementptr double v (i64 1)))
+        (let ((l (masked-load <4 x double> v (call @opq (<4 x i1> 1 1 0 0)) (<4 x double> -1.0 -1.0 -1.0 -1.0) (align 8))))
+          (call @printf (string "load %.17g %.17g %.17g %.17g\n")
+            (extractelement l (i32 0)) (extractelement l (i32 1)) (extractelement l (i32 2)) (extractelement l (i32 3))))
+        (let ((g (gather <4 x double> (getelementptr double v (<4 x i64> 0 2 1 3)) (call @opq (<4 x i1> 1 0 1 0)) (<4 x double> -5.0 -5.0 -5.0 -5.0) (align 8))))
+          (call @printf (string "gather %.17g %.17g %.17g %.17g\n")
+            (extractelement g (i32 0)) (extractelement g (i32 1)) (extractelement g (i32 2)) (extractelement g (i32 3))))
+        (masked-store (<4 x double> 1.0 2.0 3.0 4.0) v (call @opq (<4 x i1> 1 1 0 0)) (align 8))
+        (call @printf (string "store done\n"))
+        (scatter (<4 x double> 1.0 2.0 3.0 4.0) (getelementptr double v (<4 x i64> 0 1 2 3)) (call @opq (<4 x i1> 1 1 0 0)) (align 8))
+        (call @printf (string "scatter done\n"))
+        (ret (i32 0))))))

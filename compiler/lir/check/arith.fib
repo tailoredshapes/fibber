@@ -141,20 +141,26 @@
 (defun bits-or-0 :private (t: LType) -> i64
   (match (type-bits t) ((some b) b) (nil 0)))
 
-;; trunc zext sext fptrunc fpext: both types of one class, then a width order. `narrowing` is trunc or fptrunc.
-(defun resize-rule :private (n: str class: str is-class: (fn (LType) bool) narrowing: bool t: LType v: LType pos: i64) -> (Result unit Diagnostic)
-  (cond (not (and (is-class t) (is-class v)))
-        (err pos (str n " needs " class " types, found " (type-str (if (not (is-class t)) t v))))
-        narrowing
-        (if (< (bits-or-0 t) (bits-or-0 v)) (Ok ()) (err pos (str n ": " (type-str t) " is not narrower than " (type-str v))))
-        :else
-        (if (> (bits-or-0 t) (bits-or-0 v)) (Ok ()) (err pos (str n ": " (type-str t) " is not wider than " (type-str v))))))
+;; The shape rule of a conversion: both scalars, or both vectors of the same number of lanes (spec/lir.md 6.3).
+(defun shape-rule :private (n: str v: LType t: LType pos: i64) -> (Result unit Diagnostic)
+  (if (= (type-lanes v) (type-lanes t))
+      (Ok ())
+      (err pos (str n ": " (type-str v) " and " (type-str t) " must both be scalars or both be vectors of the same length"))))
 
-(defun fp-to-int-rule :private (n: str sat: bool t: LType v: LType pos: i64) -> (Result unit Diagnostic)
-  (cond (not (type-int? t))
-        (err pos (str n " needs an integer" (if sat " scalar" "") " result type, found " (type-str t)))
-        (not (type-float? v)) (err pos (str n " needs a float operand, found " (type-str v)))
-        :else (Ok ())))
+;; trunc zext sext fptrunc fpext: both types of one class, then a width order of their elements. `narrowing` is trunc or fptrunc.
+(defun resize-rule :private (n: str class: str is-class: (fn (LType) bool) narrowing: bool t: LType v: LType pos: i64) -> (Result unit Diagnostic)
+  (cond (not (and (is-class (type-scalar t)) (is-class (type-scalar v))))
+        (err pos (str n " needs " class " types, found " (type-str (if (not (is-class (type-scalar t))) t v))))
+        (not (= (type-lanes v) (type-lanes t))) (shape-rule n v t pos)
+        narrowing
+        (if (< (bits-or-0 (type-scalar t)) (bits-or-0 (type-scalar v))) (Ok ()) (err pos (str n ": " (type-str t) " is not narrower than " (type-str v))))
+        :else
+        (if (> (bits-or-0 (type-scalar t)) (bits-or-0 (type-scalar v))) (Ok ()) (err pos (str n ": " (type-str t) " is not wider than " (type-str v))))))
+
+(defun fp-to-int-rule :private (n: str t: LType v: LType pos: i64) -> (Result unit Diagnostic)
+  (cond (not (type-int-like? t)) (err pos (str n " needs an integer result type, found " (type-str t)))
+        (not (type-float-like? v)) (err pos (str n " needs a float operand, found " (type-str v)))
+        :else (shape-rule n v t pos)))
 
 ;; The type rule of a cast, on the two types; pure. (arith.rs `cast_rule`)
 (defun cast-rule (op: LCastOp t: LType v: LType pos: i64) -> (Result unit Diagnostic)
@@ -165,26 +171,26 @@
       ((CSExt) (resize-rule n "integer" type-int? false t v pos))
       ((CFpTrunc) (resize-rule n "float" type-float? true t v pos))
       ((CFpExt) (resize-rule n "float" type-float? false t v pos))
-      ((CFpToSi) (fp-to-int-rule n false t v pos))
-      ((CFpToUi) (fp-to-int-rule n false t v pos))
-      ((CFpToSiSat) (fp-to-int-rule n true t v pos))
-      ((CFpToUiSat) (fp-to-int-rule n true t v pos))
+      ((CFpToSi) (fp-to-int-rule n t v pos))
+      ((CFpToUi) (fp-to-int-rule n t v pos))
+      ((CFpToSiSat) (fp-to-int-rule n t v pos))
+      ((CFpToUiSat) (fp-to-int-rule n t v pos))
       ((CSiToFp) (int-to-fp-rule n t v pos))
       ((CUiToFp) (int-to-fp-rule n t v pos))
       ((CPtrToInt)
-       (cond (not (type-int? t)) (err pos (str n " needs an integer result type, found " (type-str t)))
-             (not (= v ty-ptr)) (err pos (str n " needs a ptr operand, found " (type-str v)))
-             :else (Ok ())))
+       (cond (not (type-int-like? t)) (err pos (str n " needs an integer result type, found " (type-str t)))
+             (not (= (type-scalar v) ty-ptr)) (err pos (str n " needs a ptr operand, found " (type-str v)))
+             :else (shape-rule n v t pos)))
       ((CIntToPtr)
-       (cond (not (= t ty-ptr)) (err pos (str n " needs a ptr result type, found " (type-str t)))
-             (not (type-int? v)) (err pos (str n " needs an integer operand, found " (type-str v)))
-             :else (Ok ())))
+       (cond (not (= (type-scalar t) ty-ptr)) (err pos (str n " needs a ptr result type, found " (type-str t)))
+             (not (type-int-like? v)) (err pos (str n " needs an integer operand, found " (type-str v)))
+             :else (shape-rule n v t pos)))
       ((CBitcast) (bitcast-rule t v pos)))))
 
 (defun int-to-fp-rule :private (n: str t: LType v: LType pos: i64) -> (Result unit Diagnostic)
-  (cond (not (type-float? t)) (err pos (str n " needs a float result type, found " (type-str t)))
-        (not (type-int? v)) (err pos (str n " needs an integer operand, found " (type-str v)))
-        :else (Ok ())))
+  (cond (not (type-float-like? t)) (err pos (str n " needs a float result type, found " (type-str t)))
+        (not (type-int-like? v)) (err pos (str n " needs an integer operand, found " (type-str v)))
+        :else (shape-rule n v t pos)))
 
 ;; One side of a bitcast: not a pointer, not an aggregate.
 (defun bitcast-side :private (x: LType pos: i64) -> (Result unit Diagnostic)

@@ -1,0 +1,52 @@
+;; expect: accept
+;; stage: 2
+;; ir: = fadd reassoc double
+;; ir: = fsub nsz double
+;; ir: = fmul arcp <2 x double>
+;; ir: = fdiv afn double
+;; ir: = fadd contract double
+;; ir: = frem reassoc double
+;; ir: = fadd reassoc nsz arcp contract afn double
+;; ir: call reassoc <4 x double> @llvm.fma.v4f64
+;; ir: call reassoc contract double @llvm.vector.reduce.fmul.v4f64
+;; ir-not: = fadd nnan
+;; ir-not: = fadd ninf
+;; ir-not: = fadd fast
+;; ir-not: nnan
+;; out: add 3.5
+;; out: sub 1.25
+;; out: mul 6 -2
+;; out: div 0.25
+;; out: contract 8.5
+;; out: rem 0.5
+;; out: all 7
+;; out: fma 7 4
+;; out: redmul 24
+;; Each fast-math flag is set on the instruction it is written on (the IR text shows it) and none of them adds a flag that makes poison. The
+;; values are exact in every order, so the results do not depend on what a flag licenses.
+(declare printf i32 (ptr ...))
+(define (opq double) ((double x))
+  (block entry (let ((s (alloca double))) (store volatile x s) (ret (load volatile double s)))))
+(define (opv <4 x double>) ((<4 x double> x))
+  (block entry (let ((s (alloca <4 x double>))) (store volatile x s) (ret (load volatile <4 x double> s)))))
+(define (opw <2 x double>) ((<2 x double> x))
+  (block entry (let ((s (alloca <2 x double>))) (store volatile x s) (ret (load volatile <2 x double> s)))))
+(define (main i32) ()
+  (block entry
+    (let ((a (call @opq (double 2.5)))
+          (b (call @opq (double 1.0)))
+          (c (call @opq (double 3.0)))
+          (w (call @opw (<2 x double> 2.0 -1.0))))
+      (call @printf (string "add %.17g\n") (fadd reassoc a b))
+      (call @printf (string "sub %.17g\n") (fsub nsz a (double 1.25)))
+      (let ((m (fmul arcp w (<2 x double> 3.0 2.0))))
+        (call @printf (string "mul %.17g %.17g\n") (extractelement m (i32 0)) (extractelement m (i32 1))))
+      (call @printf (string "div %.17g\n") (fdiv afn b (double 4.0)))
+      (call @printf (string "contract %.17g\n") (fadd contract (fmul contract a c) b))
+      (call @printf (string "rem %.17g\n") (frem reassoc a b))
+      (call @printf (string "all %.17g\n") (fadd nsz arcp contract afn reassoc a (double 4.5)))
+      (let ((v (call @opv (<4 x double> 1.0 2.0 3.0 4.0)))
+            (f (fma reassoc (call @opv (<4 x double> 1.0 2.0 3.0 4.0)) (call @opv (<4 x double> 1.0 1.0 1.0 1.0)) (call @opv (<4 x double> 6.0 1.0 0.0 0.0)))))
+        (call @printf (string "fma %.17g %.17g\n") (extractelement f (i32 0)) (extractelement f (i32 3)))
+        (call @printf (string "redmul %.17g\n") (reduce-fmul reassoc contract (double 1.0) v))
+        (ret (i32 0))))))

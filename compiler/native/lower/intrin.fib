@@ -1,0 +1,72 @@
+;; compiler/native/lower/intrin.fib: the intrinsic forms of lIR (spec/lir.md 6.1, 6.4, 6.5; lir.intrin has the table) as LLVM intrinsic calls, and
+;; the fast-math flags. Not in crates/lair. OWNER: package P0 (SIMD wave 2).
+;;
+;; Each form is one call of the intrinsic `llvm.NAME` overloaded on the types the table says; a flagged `fadd` and its kin are the instruction
+;; itself with the flags set. The alignment argument of the masked memory intrinsics is LLVM 21's explicit `i32` operand (the attribute form
+;; came later).
+
+(ns native.lower.intrin
+  (:use lir.diag lir.types lir.lit lir.ast lir.intrin native.error native.lower.lx native.lower.types native.lower.calls native.lower.build)
+  (:require [llvm.core :as core] [llvm.target :as target]))
+
+
+(defun type-of :private (v: i64) -> i64 (unsafe (core/LLVMTypeOf v)))
+
+(defun ptr-ty :private (fx: Fx) -> i64 (lx-ty (. fx lx) ty-ptr))
+
+(defun const-i32 :private (fx: Fx n: i64) -> i64
+  (core/const-int (lx-ty (. fx lx) ty-i32) n false))
+
+;; The fast-math flags on an instruction that takes them; none when `flags` is 0.
+(defun set-flags :private (v: i64 flags: i64) -> i64
+  (do (if (= flags 0) () (unsafe (core/LLVMSetFastMathFlags v (trunc i32 flags))))
+      v))
+
+(defun fbin-opcode :private (name: str) -> i32
+  (cond (= name "fadd") (opcode-fadd) (= name "fsub") (opcode-fsub) (= name "fmul") (opcode-fmul)
+        (= name "fdiv") (opcode-fdiv) :else (opcode-frem)))
+
+;; The alignment operand: the one written, else the ABI alignment of `ty`.
+(defun align-of :private (fx: Fx align: (Option i64) ty: i64) -> i64
+  (const-i32 fx (match align
+                  ((some a) a)
+                  (nil (zext i64 (unsafe (target/LLVMABIAlignmentOfType (. (. fx lx) td) ty)))))))
+
+(defun call-intrinsic :private (fx: Fx name: str overloads: (Vec i64) args: (Vec i64)) -> i64
+  (b-intrinsic (. fx b) (. (. fx lx) ctx) (. (. fx lx) module) name overloads args))
+
+;; `class` of the form decides the operands the intrinsic takes beyond the lowered ones.
+(defun lower-intrin (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
+  (match (. e kind)
+    ((KIntrin name flags ty args align)
+     (match (fx-vals fx args)
+       ((Err x) (Err x))
+       ((Ok vs) (Ok (intrin-value fx name flags ty vs align)))))
+    (_ (Err (ErrInternal (str "unexpected form at " (pos-str (. e pos))))))))
+
+(defun intrin-value :private (fx: Fx name: str flags: i64 ty: (Option LType) vs: (Vec i64) align: (Option i64)) -> (Option i64)
+  (let ((c (intrin-class name)) (llvm (intrin-llvm name)))
+    (cond (= c "fbin") (some (set-flags (b-binop (. fx b) (fbin-opcode name) (nth vs 0) (nth vs 1)) flags))
+          (= c "i1") (some (call-intrinsic fx llvm [(type-of (nth vs 0))] [(nth vs 0) (core/const-int (lx-ty (. fx lx) ty-i1) 0 false)]))
+          (or (= c "f1") (= c "f2") (= c "f3") (= c "i2"))
+          (some (set-flags (call-intrinsic fx llvm [(type-of (nth vs 0))] vs) flags))
+          (or (= c "red-i") (= c "red-m")) (some (call-intrinsic fx llvm [(type-of (nth vs 0))] vs))
+          (= c "red-f") (some (set-flags (call-intrinsic fx llvm [(type-of (nth vs 1))] vs) flags))
+          :else (memory-value fx name c ty vs align))))
+
+(defun memory-value :private (fx: Fx name: str c: str ty: (Option LType) vs: (Vec i64) align: (Option i64)) -> (Option i64)
+  (let ((llvm (intrin-llvm name)))
+    (cond (= c "mload")
+          (let ((vt (type-of (nth vs 2))))
+            (some (call-intrinsic fx llvm [vt (ptr-ty fx)] [(nth vs 0) (align-of fx align vt) (nth vs 1) (nth vs 2)])))
+          (= c "mstore")
+          (let ((vt (type-of (nth vs 0))))
+            (do (call-intrinsic fx llvm [vt (ptr-ty fx)] [(nth vs 0) (nth vs 1) (align-of fx align vt) (nth vs 2)]) nil))
+          (= c "gather")
+          (let ((vt (type-of (nth vs 2))))
+            (some (call-intrinsic fx llvm [vt (type-of (nth vs 0))] [(nth vs 0) (align-of fx align (elem-type vt)) (nth vs 1) (nth vs 2)])))
+          :else
+          (let ((vt (type-of (nth vs 0))))
+            (do (call-intrinsic fx llvm [vt (type-of (nth vs 1))] [(nth vs 0) (nth vs 1) (align-of fx align (elem-type vt)) (nth vs 2)]) nil)))))
+
+(defun elem-type :private (vt: i64) -> i64 (unsafe (core/LLVMGetElementType vt)))
