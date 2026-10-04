@@ -1,0 +1,137 @@
+;; k-nucleotide (the Computer Language Benchmarks Game): read FASTA on stdin as bytes, take the sequence after the header
+;; `>THREE`, count every k-mer of length 1, 2, 3, 4, 6, 12 and 18 in a hash table (the library's Map), print the frequencies of
+;; the 1- and 2-mers (descending count, then ascending text) and the counts of five given k-mers.
+;; A k-mer is the key of the Map as a 2-bit-per-base integer (A 0, C 1, G 2, T 3), as the Java and C twins do.
+(ns main (:use fib.unix))
+
+(defun b8 (x: i64) -> i8 (trunc i8 x))
+
+;; The 2-bit code of a residue (either case); anything else is -1.
+(defun code-table () -> (Array i8)
+  (let [t (cell (array 256 (b8 -1)))
+        ls (str-bytes "ACGT")
+        us (str-bytes "acgt")]
+    (do (dotimes (i 4)
+          (do (array-set! &t (zext i64 (array-get ls i)) (b8 i))
+              (array-set! &t (zext i64 (array-get us i)) (b8 i))))
+        @t)))
+
+;; One block of the input. mode: 0 outside the sequence wanted, 1 inside a header line, 2 inside the THREE sequence, 3 finished
+;; (the next header ended it). hp counts the bytes of the header line so far; ok says they spell the start of `>THREE`.
+;; The codes of the residues of the block join `chunks` as an array of their own.
+(defun scan (b: (Array i8) tbl: (Array i8) want: (Array i8)
+             &mode: i64 &hp: i64 &ok: bool &chunks: (Vec (Array i8))) -> unit
+  (let [n (array-len b)
+        tmp (cell (array n (b8 0)))
+        j (cell 0)]
+    (do (loop [i 0]
+          (if (and (< i n) (< @mode 3))
+            (let [c (zext i64 (array-get b i))]
+              (do (cond
+                    (= @mode 1) (if (= c 10)
+                                  (do (set! mode (if (and @ok (>= @hp 6)) 2 0)) (set! hp 0))
+                                  (do (if (and (< @hp 6) (!= c (zext i64 (array-get want @hp)))) (set! ok false) ())
+                                      (set! hp (+ @hp 1))))
+                    (= c 62) (if (= @mode 2)
+                               (set! mode 3)
+                               (do (set! mode 1) (set! hp 1) (set! ok true)))
+                    (and (= @mode 2) (>= (sext i64 (array-get tbl c)) 0))
+                      (do (array-set! &tmp @j (array-get tbl c))
+                          (set! j (+ @j 1)))
+                    :else ())
+                  (recur (+ i 1))))
+            ()))
+        (if (> @j 0) (push! &chunks (array-copy @tmp 0 @j)) ()))))
+
+;; The blocks laid end to end in one array.
+(defun concat-codes (chunks: (Vec (Array i8))) -> (Array i8)
+  (let [total (loop [k 0 s 0] (if (< k (count chunks)) (recur (+ k 1) (+ s (array-len (nth chunks k)))) s))
+        out (cell (array total (b8 0)))]
+    (do (loop [k 0 off 0]
+          (if (< k (count chunks))
+            (let [c (nth chunks k)
+                  m (array-len c)]
+              (do (loop [i 0]
+                    (if (< i m)
+                      (do (array-set! &out (+ off i) (array-get c i)) (recur (+ i 1)))
+                      ()))
+                  (recur (+ k 1) (+ off m))))
+            ()))
+        @out)))
+
+;; The Map from k-mer to its count, over every position of the sequence.
+(defun count-kmers (seq: (Array i8) k: i64) -> (Map i64 i64)
+  (let [n (array-len seq)
+        mask (- (shl 1 (* 2 k)) 1)
+        m0: (Map i64 i64) {}]
+    (loop [i 0 key 0 m m0]
+      (if (>= i n)
+        m
+        (let [key2 (bit-and (bit-or (shl key 2) (zext i64 (array-get seq i))) mask)]
+          (if (>= i (- k 1))
+            ;; the count is read first: (assoc m k (+ 1 (get m k 0))) in one expression is 3.4 times slower (m is not unique)
+            (let [c (get m key2 0)]
+              (recur (+ i 1) key2 (assoc m key2 (+ c 1))))
+            (recur (+ i 1) key2 m)))))))
+
+(defun decode (key: i64 k: i64) -> str
+  (let [letters (str-bytes "ACGT")
+        out (cell (array k (b8 0)))]
+    (do (dotimes (i k)
+          (array-set! &out (- (- k 1) i) (array-get letters (bit-and (shr key (* 2 i)) 3))))
+        (str-from-bytes @out))))
+
+(defun encode (s: str) -> i64
+  (let [bs (str-bytes s)]
+    (loop [i 0 key 0]
+      (if (< i (array-len bs))
+        (recur (+ i 1) (+ (* key 4) (match (zext i64 (array-get bs i))
+                                      (65 0) (67 1) (71 2) (_ 3))))
+        key))))
+
+;; 100 * count / total with three decimals, rounded half up, in exact integer arithmetic (the library has no `format` yet, and
+;; the %.3f of Java and of C disagree on exact ties: docs/shootout/gaps.md IO-2).
+(defun percent3 (count: i64 total: i64) -> str
+  (let [v (quot (+ (* count 200000) total) (* 2 total))
+        fp (rem v 1000)]
+    (str (quot v 1000) "." (cond (< fp 10) "00" (< fp 100) "0" :else "") fp)))
+
+;; The frequency table of the k-mers, most frequent first, equal counts in text order.
+(defun frequencies-of (seq: (Array i8) k: i64) -> unit
+  (let [m (count-kmers seq k)
+        total (- (+ (array-len seq) 1) k)
+        keys (filter (fn (key) (contains? m key)) (range (shl 1 (* 2 k))))
+        sorted (sort-by (fn (key) (- 0 (get m key 0))) keys)]
+    (do (doseq (key sorted)
+          (println (str (decode key k) " " (percent3 (get m key 0) total))))
+        (println ""))))
+
+(defun count-of (seq: (Array i8) pat: str) -> unit
+  (let [m (count-kmers seq (count pat))]
+    (println (str (get m (encode pat) 0) "\t" pat))))
+
+(defun main () -> i64
+  (let [tbl (code-table)
+        want (str-bytes ">THREE")
+        mode (cell 0)
+        hp (cell 0)
+        ok (cell true)
+        chunks (cell [])]
+    (do (loop [go true]
+          (if (and go (< @mode 3))
+            (match (fd-read stdin 65536)
+              ((Ok b) (if (= (array-len b) 0)
+                        (recur false)
+                        (do (scan b tbl want &mode &hp &ok &chunks) (recur true))))
+              ((Err e) (trap "read failed")))
+            ()))
+        (let [seq (concat-codes @chunks)]
+          (do (set! chunks [])
+              (frequencies-of seq 1)
+              (frequencies-of seq 2)
+              (count-of seq "GGT")
+              (count-of seq "GGTA")
+              (count-of seq "GGTATT")
+              (count-of seq "GGTATTTTAATT")
+              (count-of seq "GGTATTTTAATTTATAGT")))
+        0)))
