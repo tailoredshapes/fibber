@@ -1,0 +1,120 @@
+;; reverse-complement (the Computer Language Benchmarks Game): read FASTA on stdin as bytes (64 KB blocks), write every
+;; sequence reverse-complemented (IUPAC codes, lower case folded to upper) in 60-column lines. The residues of a sequence are
+;; kept as a list of the complemented blocks; at the next header (or the end of the input) they are written back to front.
+(ns main (:use fib.unix))
+
+(defun b8 (x: i64) -> i8 (trunc i8 x))
+
+;; The complement table: 256 bytes, indexed by the byte; both cases of an IUPAC letter map to the upper case complement.
+(defun make-table () -> (Array i8)
+  (let [t (cell (array 256 (b8 0)))
+        from "ACGTUMRWSYKVHDBN"
+        to   "TGCAAKYWSRMBDHVN"
+        fb (str-bytes from)
+        tb (str-bytes to)]
+    (do (dotimes (i 16)
+          (let [f (zext i64 (array-get fb i))
+                v (array-get tb i)]
+            (do (array-set! &t f v)
+                (array-set! &t (+ f 32) v))))
+        @t)))
+
+(defun write-all (buf: (Array i8) n: i64) -> unit
+  (loop [off 0]
+    (if (< off n)
+      (match (fd-write-range stdout buf off (- n off))
+        ((Ok k) (recur (+ off k)))
+        ((Err e) (trap "write failed")))
+      ())))
+
+;; One sequence, back to front, 60 residues to a line, through a 64 KB output buffer that is local to this function (an array
+;; written through an & parameter of a helper is copied by every call, so the write stays in the loop that owns the cell).
+(defun emit-rc (chunks: (Vec (Array i8))) -> unit
+  (let [buf (cell (array 65536 (b8 0)))
+        pos (cell 0)
+        col (cell 0)]
+    (do (loop [k (- (count chunks) 1)]
+          (if (< k 0)
+            ()
+            (let [c (nth chunks k)]
+              (do (loop [i (- (array-len c) 1)]
+                    (if (< i 0)
+                      ()
+                      (do (array-set! &buf @pos (array-get c i))
+                          (set! pos (+ @pos 1))
+                          (set! col (+ @col 1))
+                          (if (= @col 60)
+                            (do (array-set! &buf @pos (b8 10))
+                                (set! pos (+ @pos 1))
+                                (set! col 0))
+                            ())
+                          (if (>= @pos 65000)
+                            (do (write-all @buf @pos) (set! pos 0))
+                            ())
+                          (recur (- i 1)))))
+                  (recur (- k 1))))))
+        (if (> @col 0)
+          (do (array-set! &buf @pos (b8 10)) (set! pos (+ @pos 1)))
+          ())
+        (write-all @buf @pos))))
+
+;; The sequence read so far: the pending part of the block is added to the list, the list is written, then emptied.
+(defun finish (tmp: (Array i8) j: i64 &chunks: (Vec (Array i8))) -> unit
+  (do (if (> j 0) (push! &chunks (array-copy tmp 0 j)) ())
+      (emit-rc @chunks)
+      (set! chunks [])))
+
+;; One block. mode 1 is "inside a header line": its bytes are written straight from the block (headers are few), mode 0 is
+;; "inside a sequence": the residues are complemented into a block of their own that joins the list.
+(defun scan (b: (Array i8) tbl: (Array i8) &mode: i64 &chunks: (Vec (Array i8))) -> unit
+  (let [n (array-len b)
+        tmp (cell (array n (b8 0)))
+        j (cell 0)]
+    (do (loop [i 0]
+          (if (< i n)
+            (let [c (zext i64 (array-get b i))]
+              (cond
+                (= @mode 1) (let [e (header-end b i n)]
+                              (do (write-range b i e)
+                                  (if (= (array-get b (- e 1)) (b8 10)) (set! mode 0) ())
+                                  (recur e)))
+                (= c 10) (recur (+ i 1))
+                (= c 62) (do (finish @tmp @j &chunks)
+                             (set! j 0)
+                             (set! mode 1)
+                             (recur i))
+                :else (do (array-set! &tmp @j (array-get tbl c))
+                          (set! j (+ @j 1))
+                          (recur (+ i 1)))))
+            ()))
+        (if (> @j 0) (push! &chunks (array-copy @tmp 0 @j)) ()))))
+
+;; The index after the newline that ends the line that starts at i (n when the block ends first).
+(defun header-end (b: (Array i8) i: i64 n: i64) -> i64
+  (loop [k i]
+    (cond (>= k n) n
+          (= (array-get b k) (b8 10)) (+ k 1)
+          :else (recur (+ k 1)))))
+
+(defun write-range (b: (Array i8) from: i64 to: i64) -> unit
+  (loop [off from]
+    (if (< off to)
+      (match (fd-write-range stdout b off (- to off))
+        ((Ok k) (recur (+ off k)))
+        ((Err e) (trap "write failed")))
+      ())))
+
+(defun main () -> i64
+  (let [tbl (make-table)
+        mode (cell 0)
+        chunks (cell [])]
+    (do (loop [go true]
+          (if go
+            (match (fd-read stdin 65536)
+              ((Ok b) (if (= (array-len b) 0)
+                        (recur false)
+                        (do (scan b tbl &mode &chunks) (recur true))))
+              ((Err e) (trap "read failed")))
+            ()))
+        (emit-rc @chunks)
+        0)))
