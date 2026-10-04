@@ -1,0 +1,25 @@
+;; spec:   types §1.9, docs/design/simd-and-tensors.md 1.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A function over `(Simd f64 n)` is specialised per lane count: 2, 4 and 8 lanes in one program give each its own body (the key keeps the count, not the class of a lane count); elements generic too.
+(ns main (:use fib.core tl.check))
+
+(defun twice (v: (Simd f64 n)) -> (Simd f64 n) (+ v v))
+(defun total (v: (Simd t n)) :where ((Num t)) -> t (hsum v))
+(defun same (x: t) -> t x)
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (total (twice <<1.0 2.0>>f64)) 6.0))
+        (check c (= (total (twice <<1.0 2.0 3.0 4.0>>f64)) 20.0))
+        (check c (= (total (twice <<1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0>>f64)) 72.0))
+        (check c (= (total <<1 2 3>>i32) 6i32))
+        (check c (= (total <<1 2 3 4 5>>i16) 15i16))
+        (check c (= (hsum (same <<1.5 2.5>>f32)) 4.0f32))
+        (check c (= (lane (same <<1 2 3>>i8) 2) 3i8))
+        (let ((p (checks)))
+          (do (check p (= (total (twice <<1.0 2.0>>f64)) 20.0)) (check-detects c p)))
+        (checks-result c))))

@@ -1,0 +1,48 @@
+;; compiler/types/target.fib: the code generation target as the front end sees it (docs/design/simd-and-tensors.md 2.9, spec/lir.md 4.5).
+;;
+;; A `Target` is the CPU (and CPU features) the module's code is generated for, and what the front end must know of it: the vector width
+;; that `:native` and `f32xn` stand for and whether `fma` is fast. It is a plain value, an explicit parameter of the checker (it lives in
+;; `Globals`, set once before lowering) and read by the emitter from there, so the lane counts the checker chose and the CPU the
+;; emitted module names (the `(target ..)` form) cannot disagree. `native.target/target-info` makes one from the environment and the
+;; host; this module is pure, so that the checker needs no LLVM.
+;;
+;; The width is the vector width the compiler *prefers* (a 512-bit machine prefers 256, as LLVM does on the client cores); a wrong
+;; choice costs speed, never results, because every vector operation legalises on every target (design 0.4).
+(ns types.target)
+
+;; `cpu` and `features` are the strings of the module's `(target (cpu ..) (features ..))`: `features` is empty for a named CPU (LLVM
+;; knows what the name stands for) and the host's whole list for the host. `vector-bits` is 128, 256 or 512.
+(defstruct Target (cpu: str features: str vector-bits: i64 has-fma: bool))
+(derive Eq Target)
+
+;; The CPUs that have AVX2 and FMA (256-bit vectors), by name. A name not here is taken to be a baseline x86-64 (128 bits, no fma): a
+;; wrong guess costs speed only.
+(defun cpu-avx2? :private (cpu: str) -> bool
+  (or (= cpu "x86-64-v3") (= cpu "x86-64-v4") (= cpu "haswell") (= cpu "broadwell") (= cpu "skylake") (= cpu "skylake-avx512")
+      (= cpu "skx") (= cpu "cascadelake") (= cpu "cooperlake") (= cpu "cannonlake") (= cpu "icelake-client") (= cpu "icelake-server")
+      (= cpu "tigerlake") (= cpu "rocketlake") (= cpu "sapphirerapids") (= cpu "alderlake") (= cpu "raptorlake")
+      (= cpu "meteorlake") (= cpu "graniterapids") (= cpu "znver1") (= cpu "znver2") (= cpu "znver3") (= cpu "znver4")
+      (= cpu "znver5") (= cpu "bdver4") (= cpu "core-avx2") (= cpu "x86-64-v3")))
+
+;; The target of the CPU named `cpu` (FIB_TARGET_CPU), with no features of its own.
+(defun target-of-cpu (cpu: str) -> Target
+  (if (cpu-avx2? cpu)
+      (Target cpu "" 256 true)
+      (Target cpu "" 128 false)))
+
+;; The target of a CPU named `cpu` whose feature list is `features` (LLVM's `+avx2,+fma,..`): 256 bits when it has AVX2, else 128.
+(defun target-of-features (cpu: str features: str) -> Target
+  (let ((wrapped (str-join ["," features ","])))
+    (let ((has (fn (f: str) (match (str-find wrapped (str-join ["," f ","]) 0) ((some _) true) (nil false)))))
+      (Target cpu features (if (has "+avx2") 256 128) (has "+fma")))))
+
+;; The baseline every x86-64 has: SSE2, 128-bit vectors, no fma.
+(defun target-baseline () -> Target (target-of-cpu "x86-64"))
+
+;; What the checker assumes when it is told nothing (its unit tests, the tools that only dump): an AVX2 machine, the width the
+;; constant `native-vector-bits` of the first SIMD wave had.
+(defun target-default () -> Target (target-of-cpu "x86-64-v3"))
+
+;; The number of lanes of the vector `native-lanes` of an element `bits` wide: the target's width over the element's, at least 1.
+(defun native-lanes (t: Target bits: i64) -> i64
+  (max 1 (quot (. t vector-bits) bits)))

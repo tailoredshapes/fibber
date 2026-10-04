@@ -1,0 +1,19 @@
+;; spec:   types §1.9, docs/design/simd-and-tensors.md 1.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; spawn and join: a vector is the result of a task, stored in the task`s atom and read back, for several widths; and a vector captured by the task body.
+(ns main (:use fib.core tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((a: f64x4 <<1.0 2.0 3.0 4.0>>f64))
+          (let ((t (spawn (fn () (* a a))))
+                (u (spawn (fn () (splat i16x5 3i16))))
+                (w (spawn (fn () (simd/lt a <<2.0 2.0 2.0 2.0>>f64)))))
+            (do (check c (= (hsum (join t)) 30.0)) (check c (= (hsum (join u)) 15i16)) (check c (= (lane (join w) 0) true)))))
+        (let ((p (checks)))
+          (do (check p (= (hsum (join (spawn (fn () <<1.0 2.0>>f64)))) 4.0)) (check-detects c p)))
+        (checks-result c))))

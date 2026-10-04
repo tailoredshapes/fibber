@@ -1,0 +1,18 @@
+;; spec:   types §1.9, docs/design/simd-and-tensors.md 1.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; f32xn f64xn and (Simd i8 :native) are vectors whose lane count is the target`s; the program is correct for any count: it fills the vector, sums it and compares with the count read back from the lane loop, whatever FIB_TARGET_CPU names.
+(ns main (:use fib.core tl.check))
+
+(defun lanes-of (v: f32xn) -> i64 (fptosi i64 (hsum (splat f32xn 1.0f32))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((n (lanes-of (splat f32xn 0.0f32))))
+          (do (check c (or (= n 4) (= n 8) (= n 16)))
+              (check c (= (hsum (splat f64xn 1.0)) (sitofp f64 (quot n 2))))
+              (check c (= (hsum (splat (Simd i8 :native) 1i8)) (trunc i8 (* n 4))))))
+        (checks-result c))))

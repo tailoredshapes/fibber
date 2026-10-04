@@ -1,0 +1,23 @@
+;; spec:   types §1.9, docs/design/simd-and-tensors.md 1.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A vector passed to, returned from and carried through a loop (a phi), through functions that may not be inlined, at lane counts that are not a power of two (3, 5, 7, 24 lanes) and at 512 bits.
+(ns main (:use fib.core tl.check))
+
+(defun step (v: f32x5 k: f32) -> f32x5 (+ (* v 2.0) (splat f32x5 k)))
+(defun three (v: i8x3 w: i8x3) -> i8x3 (+ v w))
+(defun wide (v: i64x8) -> i64x8 (* v v))
+(defun mix (a: f64x7 b: i32x16 c: f32x16) -> f64 (+ (hsum a) (+ (sitofp f64 (hsum b)) (fpext f64 (hsum c)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (lane (loop ((i 0) (v: f32x5 (splat f32x5 1.0f32))) (if (< i 4) (recur (+ i 1) (step v 1.0f32)) v)) 4) 31.0f32))
+        (check c (= (lane (three <<1 2 3>>i8 <<10 20 30>>i8) 2) 33i8))
+        (check c (= (hsum (wide <<1 2 3 4 5 6 7 8>>)) 204))
+        (check c (= (mix (splat f64x7 1.0) (splat i32x16 2i32) (splat f32x16 0.5f32)) 47.0))
+        (let ((p (checks)))
+          (do (check p (= (lane (three <<1 2 3>>i8 <<10 20 30>>i8) 2) 34i8)) (check-detects c p)))
+        (checks-result c))))

@@ -7,7 +7,7 @@
   (:use types.ty types.ast types.decls types.program types.table types.init own.program syntax.form emit.value emit.text emit.layout
         emit.ir emit.mono emit.statics emit.objects emit.program emit.resume emit.lower.cx emit.lower.ops emit.lower.ctrl
         emit.lower.values emit.lower.call emit.lower.arith emit.lower.objects emit.lower.cells emit.lower.dynamic
-        emit.lower.pattern emit.lower.quote emit.lower.threads))
+        emit.lower.pattern emit.lower.quote emit.lower.threads emit.lower.simd))
 
 ;; The functions the modules below call upward, as the Rust methods they stand for (the hub of emit.lower.cx).
 (defun hub-default () -> Hub
@@ -176,8 +176,13 @@
                       (if (or (= l LirFloat) (= l LirDouble))
                           (Ok (VVal (str-join ["(" (lir-ty-text l) " " (float-lir-text (sitofp f64 n)) ")"]) l))
                           (Ok (v-int l n))))))
-    ((LitFloat x w) (let ((t (match w ((F32) LirFloat) ((F64) LirDouble))))
-                      (Ok (VVal (str-join ["(" (lir-ty-text t) " " (float-lir-text x) ")"]) t))))
+    ;; A float literal that took the element type of a vector it is an operand of (types 1.9) has that type, not its own width.
+    ((LitFloat x w) (try-let ((ty (lcx-ty cx e)) (lt (program-lir (. cx p) ty)))
+                      (let ((t (match lt
+                                 ((some (LirFloat)) LirFloat)
+                                 ((some (LirDouble)) LirDouble)
+                                 (_ (match w ((F32) LirFloat) ((F64) LirDouble))))))
+                        (Ok (VVal (str-join ["(" (lir-ty-text t) " " (float-lir-text x) ")"]) t)))))
     ((LitStr s) (Ok (VVal (statics-string (. (. cx p) statics) s 0) LirPtr)))
     ((LitChar c) (Ok (v-int LirI32 (long c))))
     ((LitBool b) (Ok (v-int LirI1 (if b 1 0))))
@@ -214,9 +219,9 @@
     ((EAwait x) (val-flow (lcx-await-task cx x)))
     ((EQuote f) (val-flow (lcx-quote cx e f)))
     ((EConcat es) (val-flow (lcx-concat cx e es)))
-    ;; SIMD P1: the checker types lane vectors; their lowering waits for the lIR vector instructions (P0)
-    ((ESimd _ _) (Err "todo: lane vectors are not lowered yet (SIMD wave 2, P0 and P1)"))
-    ((ESplat _ _) (Err "todo: lane vectors are not lowered yet (SIMD wave 2, P0 and P1)"))))
+    ;; lane vectors (types 1.9; emit.lower.simd)
+    ((ESimd _ es) (val-flow (lcx-simd cx e es)))
+    ((ESplat _ x) (val-flow (lcx-splat cx e x)))))
 
 ;; Lowers an expression: its value, then the plan's operations (the hub's `expr`); `at` is the expression being lowered (E11: a trap
 ;; of a macro module carries its position, lcx-trap-c). Rust: lower/mod.rs:333 Cx::expr

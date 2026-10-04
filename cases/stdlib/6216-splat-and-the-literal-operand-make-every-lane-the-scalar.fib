@@ -1,0 +1,25 @@
+;; spec:   types §1.9, docs/design/simd-and-tensors.md 1.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; splat fills every lane; a scalar literal operand of a vector operator is read at the element type for every lane, on either side, for the arithmetic, bit and comparison operators; `<<..>>` with a suffix has the element type of the suffix.
+(ns main (:use fib.core tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((v (splat f32x5 1.5f32)))
+          (do (check c (= (lane v 0) 1.5f32)) (check c (= (lane v 4) 1.5f32)) (check c (= (hsum v) 7.5f32))))
+        (let ((v: i8x3 <<1 2 3>>i8))
+          (do (check c (= (lane (* v 3) 2) 9i8)) (check c (= (lane (+ 100 v) 1) 102i8)) (check c (= (lane (- 10 v) 0) 9i8))
+              (check c (= (lane (bit-and v 1) 1) 0i8)) (check c (= (lane (shl v 2) 2) 12i8)) (check c (= (lane (simd/gt v 1) 0) false))
+              (check c (= (lane (simd/gt 1 v) 0) false)) (check c (= (lane (simd/ge 3 v) 2) true))))
+        (let ((v: f64x2 <<1.0 4.0>>f64))
+          (do (check c (= (lane (* 2 v) 1) 8.0)) (check c (= (lane (- 0.5 v) 0) -0.5)) (check c (= (lane (+ v 0.25) 1) 4.25))
+              (check c (= (lane (neg (splat f64x2 0.0)) 0) -0.0))))
+        (let ((x 7i32))
+          (check c (= (hsum (splat i32x4 x)) 28i32)))
+        (let ((p (checks)))
+          (do (check p (= (lane (splat i32x4 2i32) 3) 3i32)) (check-detects c p)))
+        (checks-result c))))

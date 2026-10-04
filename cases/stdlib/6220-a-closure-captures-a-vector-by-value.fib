@@ -1,0 +1,20 @@
+;; spec:   types §1.9, docs/design/simd-and-tensors.md 1.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A closure that captures vectors of several widths reads them back: the captured value is stored in the closure object with 8-byte alignment and loaded with the same.
+(ns main (:use fib.core tl.check))
+
+(defun adder (a: f64x4 b: i32x3) -> (fn () f64) (fn () (+ (hsum a) (sitofp f64 (hsum b)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((f (adder <<1.0 2.0 3.0 4.0>>f64 <<1 2 3>>i32)))
+          (do (check c (= (f) 16.0)) (check c (= (f) 16.0))))
+        (let ((v: f32x16 (splat f32x16 0.5f32)) (k (fn (x: f32) (* (hsum v) x))))
+          (check c (= (k 2.0f32) 16.0f32)))
+        (let ((p (checks)))
+          (do (check p (= ((adder <<1.0 2.0 3.0 4.0>>f64 <<1 2 3>>i32)) 17.0)) (check-detects c p)))
+        (checks-result c))))

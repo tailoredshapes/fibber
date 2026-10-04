@@ -312,7 +312,7 @@ C ::= (P T₁ .. Tₙ)          ; protocol constraint; T₁ is the dispatch posi
 
 *New in stage 2 (SIMD wave 2, package P1): the Rust tools are frozen and do not have this section, so there is no
 interpreter oracle for it; `compiler/tests/types/simd-check.sh` is its judge. Everything below the line "Typing" is checked
-by the cases in `compiler/tests/types/simd/`; the lowering of vectors to lIR is NOT written yet (§1.9.5).*
+by the cases in `compiler/tests/types/simd/`; the lowering of vectors to lIR is written (SIMD wave 3, P3): `compiler/emit/lower/simd.fib`, judged by the cases 6200 to 6237 and 6290 of `cases/stdlib/` and `scripts/mutant-simd-lower.sh`.*
 
 **Type.** `(Simd T n)` is a vector of `n` lanes of `T`. `T` is `i8 i16 i32 i64 f32 f64` or `bool` (a mask, written
 `(Mask n)`, which is `(Simd bool n)`); `n` is a number from 1 to 64 (any number, not only a power of two) and the value is at
@@ -330,8 +330,13 @@ f64x4  i32x8  f32xn                       ; sugar: ELEMENT x COUNT, ELEMENT in i
 count is a type argument `(KNat n)` of the constructor `KSimd`, so unification equates lane counts as it equates types). The
 element may be a variable too (`(Simd t 4)` with a bound `(Num t)`); a variable element is not checked to be a scalar by the
 annotation, only by the instance it is used at. `f64x4` is the sugar only where no type of that name is in scope. `:native` and
-`f32xn` are the target's lane count for the element: **today a constant of 256 bits** (`native-vector-bits` in
-`compiler/types/ty.fib`; `f32xn` is `f32x8`, `f64xn` is `f64x4`) until the target record of the design (P3) exists. Errors (all
+`f32xn` are the target's lane count for the element: the target's preferred vector width over the element's width (at least 1). The target is
+the `Target` record of `compiler/types/target.fib`, given to the checker once (`Globals.target`, set by `lower-modules-for`) and made by
+`native.target/target-info`: the CPU `FIB_TARGET_CPU` names (128 bits for `x86-64` and `x86-64-v2`, 256 for `x86-64-v3` and the CPUs of its
+table, which have AVX2 and FMA; a name not in the table is taken as a baseline), else the host's CPU and features (256 with `+avx2`, else 128;
+`+avx512f` hosts also prefer 256). `f32xn` is therefore `f32x4` on `x86-64` and `f32x8` on `x86-64-v3`; a checker told no target (its unit tests)
+assumes `x86-64-v3`. The emitted module's first line is `(target (cpu ..) (features ..))` for the same target (spec/lir.md 4.5), so the lane
+counts the checker chose and the code `lair` generates are for one CPU (`compiler/tests/driver/target.sh`). Errors (all
 `Resolve`, at the type): `a vector has 1 to 64 lanes, not N`, `a vector is at most 512 bits wide`, `a vector element is an
 integer width, f32, f64 or bool`.
 
@@ -386,10 +391,34 @@ cannot unify (Simd f64 4) with f64: only a numeric literal broadcasts to a vecto
 type is the plain `cannot unify (Simd f64 8) with (Simd f64 4)`. A literal as an argument of an ordinary function is not
 broadcast: `(f 1)` for `(defun f (v: f64x4))` is a mismatch; only the operators above adopt.
 
-**What is not there yet.** Emission: `(simd ..)`, `(splat ..)` and any use of a vector type reach the emitter, which stops with `todo: lane vectors are not lowered
-yet (SIMD wave 2, P0 and P1)`; the lowering waits for the lIR vector instructions (P0). The reader's `<<..>>` (P2) and `fib.simd`
-(P4) are not in this package. An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26 limit (so `(with-lane v 0 5)` on
-`i32x4` needs `5i32`).
+**Lowering** (`compiler/emit/lower/simd.fib`; checked by the cases 6200 to 6237 and 6290 to 6291). `(Simd T n)` is the lIR vector `<n x T>`, a mask `<n x i1>`;
+it is a scalar-class value (in registers, passed and returned by value, never counted). In an object (a struct field, an enum payload, a closure
+capture, a task result, an array or `Vec` element) it is a `[k x i64]` field of 8 bytes of alignment, `k` the bytes of the vector over 8 rounded up,
+and loaded and stored as the vector with `(align 8)`: the heap gives an object 8 (malloc 16) bytes, and a field `<8 x float>` would be laid out at 32.
+An `(Option vector)` is a heap enum (the unboxed pair is for scalars). A lane count is a type argument and part of the specialisation key (generic
+`n` works: `(Simd f64 n)` at 2, 4 and 8 lanes is three bodies); the representative of a vector in a key is a vector. Operations, each one lIR
+instruction on the whole vector except the checks: `+ - *` on floats `fadd fsub fmul`, `fdiv` (the `Float` method) `fdiv`, `neg` `fneg`; on integers
+`+ - *` are **checked**: `sadd-overflow` (`ssub-`, `smul-`) on the vector, the overflow flags of all lanes or-ed (`reduce-or`), one trap
+`integer overflow in + at i32x4` (the name is the sugar of the type, a mask is `mask4`); `neg` traps when a lane is the minimum
+(`integer overflow in neg at i32x4`); `bit-and bit-or bit-xor bit-not popcount` are `and or xor xor-with-ones ctpop`; `shl shr sar` mask the count to the
+width (`and` with width-1) as the scalar's do; `=` is every lane equal (`reduce-and` of `icmp eq` or `fcmp oeq`: a NaN lane makes it false) and `!=` some lane
+unequal (`reduce-or` of `icmp ne` or `fcmp une`). `quot` and `rem` on vectors and integer `/` are not provided. A scalar literal operand (recorded at the
+element type by the checker) is splatted (`insertelement` then `shufflevector` with the zero mask), on either side; the same for the library `Div`
+method, whose vector instance is in `lib/fib/simd.fib` (`(:use fib.simd)`), and the float literal takes the element type's width (an `f32` lane
+literal is an `f32` constant). `simd/lt le gt ge eq ne` are `icmp slt..`/`fcmp olt ole ogt oge oeq` and `une` for `ne`, giving the mask. `lane` and
+`with-lane` are `extractelement` and `insertelement` after a check of the index against the lane count (`lane index out of range`: lIR makes
+an out-of-range index poison, so none is emitted unchecked; a literal index was checked by the checker). `hsum`, `hmin`, `hmax` are horizontal:
+`hsum` of integers adds the lanes left to right with the checked add (a partial sum that overflows traps `integer overflow in hsum at i8x4`), `hsum` of floats is
+the halving tree (lane `i` plus lane `i + n/2`, a count that is not a power of two padded with `-0.0`), `hmin` and `hmax` are `reduce-smin`/`reduce-smax` and the
+NaN-propagating `reduce-fmin`/`reduce-fmax`. The literal `(simd e ..)` is the zero vector with each lane `insertelement`ed; `(splat V x)` the splat.
+**Further builtins of the lowering** (rows of `types.builtins`): the masks have no `Bits` instance, so `simd/and simd/or simd/xor simd/not` (lanewise),
+`simd/any simd/all` (bool: `reduce-or`, `reduce-and`) and `simd/blend m a b` (`select`: lane from `a` where the mask is true) are the mask operations; and
+the wrapping family of stdlib §7 L10 for integers and integer vectors, `unchecked-add unchecked-subtract unchecked-multiply unchecked-negate`
+(`add sub mul`, which wrap at the lane width), the opt-out of the checked operators. **Not there yet:** the `wrapping` scope macro of the design (2.8), `Show` of a
+vector, vector loads and stores, shuffles, conversions, `fma`/`sqrt` and kin (the lIR has the instructions; no builtin row), a vector in a `def`, and a
+vector argument of an `extern` is not rejected. A local variable named `simd` captures the reader's `<<..>>` (a top-level `defun simd` does not: the core form wins), which
+is a gap of the reader's form, reported by the package that found it. An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26
+limit (so `(with-lane v 0 5)` on `i32x4` needs `5i32`).
 
 ## 2. Typing rules for the core forms and builtins
 
@@ -3240,7 +3269,7 @@ it. Runtime support functions are ordinary lIR `define`s in a
 | `unit` | no value: `void` result, no argument; `()` in a value position is dropped | none |
 | field-less `defenum` | `i32` variant index | i32 |
 | `ptr` (unsafe) | `ptr`, uncounted | i64-like scalar |
-| `(Simd T n)` (§1.9) | `<n x T>` (`<n x i1>` for a mask); **not lowered yet**: the emitter stops with `todo:` | a scalar class, `vec` |
+| `(Simd T n)` (§1.9) | `<n x T>` (`<n x i1>` for a mask); in an object `[k x i64]`, 8-aligned (§1.9) | a scalar class, `vec` |
 | every object type (`str`, `Form`, `Array`, struct, enum with fields, `Cell`, `Atom`, `Weak` of a non-`dyn`, `Task`, closure) | `ptr` to a block starting with the header (§8.2) | ptr |
 | `(Option T)`, `T` an object type that is not itself an `Option` | `ptr`, null = `nil`; no allocation for `some` | opt |
 | `(Option T)`, `T` a scalar that has a value (`bool`, an integer, `char`, `keyword`, a float, a field-less `defenum`, `ptr`) — stage 2 | `{ i1 t }` by value, `t` the lIR type of `T`: the tag (1 for `some`), then the payload, zero for `nil`; no allocation, no count (§8.3; docs/design/unboxed-option.md) | `{ i1 t }`, a scalar class |
@@ -4553,5 +4582,4 @@ expression is a type error that names `(splat V x)`, a mismatched element type i
 promotion (liar ADR 017 stays dropped); there is no deferred constraint and no inference-order rule beyond "the vector type is
 known at the application"; (4) integer vector arithmetic is checked like the scalar's, with `wrapping` (ADR 015) as the opt-out,
 which is a lowering matter and not in the checker; (5) the Rust interpreter is not the judge of new features, so §1.9 has none:
-its cases carry the expected type or error text. Open: the lowering (§1.9 "What is not there yet"); `native-vector-bits` is a
-constant until the target record exists; `/` on vectors needs the library `impl` of `Div`.
+its cases carry the expected type or error text. The lowering is written (§1.9 "Lowering"); `/` on vectors is the library `impl` of `Div` in `lib/fib/simd.fib`.

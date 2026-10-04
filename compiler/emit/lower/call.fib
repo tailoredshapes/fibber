@@ -8,7 +8,7 @@
   (:require [fib.string :as s])
   (:use types.ty types.scheme types.ast types.decls types.table types.init types.infer.cx own.program emit.value emit.layout emit.ir
         emit.mono emit.objects emit.program emit.lower.cx emit.lower.ops emit.lower.arith emit.lower.builtins
-        emit.lower.dynamic emit.lower.objects))
+        emit.lower.dynamic emit.lower.objects emit.lower.simd))
 
 ;; ---- arguments
 
@@ -339,11 +339,18 @@
                          (Ok FlowJump))
                      (Ok (FlowVal result)))))))))))
 
+;; Whether the callee is a method of the protocol `Div` (whose vector instance is the library's, fib.simd).
+(defun div-method? :private (cx: LowerCx c: Callee) -> bool
+  (match c
+    ((CalMethod pr _) (= (. (g-proto (program-g (. cx p)) pr) name) "Div"))
+    (_ false)))
+
 ;; A call (types §8.9). Rust: lower/call.rs:37 LowerCx::call
 (defun lcx-call (cx: LowerCx e: Expr head: Expr args: (Vec Arg)) -> (Result Flow str)
   (match (get (. (. cx own) calls) (. e id))
     (nil (Err "no plan for a call"))
     ((some own)
      (try-let ((hv (call-head-value cx head own)) (r (call-arguments cx args (. own args)))
-               (vals (call-copy-in cx args (. own args) (. r fst))) (target (call-target cx head (. own callee) hv vals (. r snd))))
+               (vals0 (call-copy-in cx args (. own args) (. r fst))) (vals (Ok (if (div-method? cx (. own callee)) (lcx-splat-pair cx vals0) vals0)))
+               (target (call-target cx head (. own callee) hv vals (. r snd))))
        (call-site cx e own target vals (. r snd))))))

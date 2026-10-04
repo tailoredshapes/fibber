@@ -17,8 +17,10 @@
 ;; variant, because the compiler decides from this type whether a slot is
 ;; counted; `LirDyn` is a `(dyn P)` value, `{ ptr ptr }` by value; `(LirOpt t)` is an
 ;; `(Option T)` whose payload is of the scalar lIR type `t`, `{ i1 t }` by value: the tag
-;; (1 for `some`), then the payload, zero for `nil` (types §8.1, docs/design/unboxed-option.md).
-(defenum LirTy LirI1 LirI8 LirI16 LirI32 LirI64 LirFloat LirDouble LirPtr LirRaw LirDyn (LirOpt of: LirTy))
+;; (1 for `some`), then the payload, zero for `nil` (types §8.1, docs/design/unboxed-option.md). `(LirVec e n)` is a lane vector `<n x e>`
+;; (types §1.9; `e` an integer type, `float`, `double`, or `i1` for a mask): a scalar-class value, in a register or an lIR value, and in
+;; an object it is `lir-mem-text` (see there).
+(defenum LirTy LirI1 LirI8 LirI16 LirI32 LirI64 LirFloat LirDouble LirPtr LirRaw LirDyn (LirOpt of: LirTy) (LirVec of: LirTy lanes: i64))
 (derive Eq LirTy) (derive Hash LirTy)
 
 ;; Rust: value.rs:29 text
@@ -27,7 +29,24 @@
     ((LirI1) "i1") ((LirI8) "i8") ((LirI16) "i16") ((LirI32) "i32") ((LirI64) "i64")
     ((LirFloat) "float") ((LirDouble) "double") ((LirPtr) "ptr") ((LirRaw) "ptr")
     ((LirDyn) "{ ptr ptr }")
-    ((LirOpt t) (str-join ["{ i1 " (lir-ty-text t) " }"]))))
+    ((LirOpt t) (str-join ["{ i1 " (lir-ty-text t) " }"]))
+    ((LirVec e n) (str-join ["<" (str n) " x " (lir-ty-text e) ">"]))))
+
+;; The bytes a lane vector takes in memory: its bits rounded up to bytes, then to the 8 of a word (a mask `<n x i1>` takes n bits).
+(defun vec-mem-bytes (t: LirTy) -> i64
+  (* 8 (quot (+ (quot (+ (lir-ty-bits t) 7) 8) 7) 8)))
+
+;; The type an object's field or an array's element of the lIR type `t` is declared as. A vector is `[k x i64]` there: the heap
+;; gives an object 8 bytes of alignment (16 from malloc), and a field of `<8 x float>` would be laid out at 32, which neither the
+;; allocation nor `size-align` knows. The access itself is a `load`/`store` of the vector with `lir-align-text`.
+(defun lir-mem-text (t: LirTy) -> str
+  (match t
+    ((LirVec _ _) (str-join ["[" (str (quot (vec-mem-bytes t) 8)) " x i64]"]))
+    (_ (lir-ty-text t))))
+
+;; The alignment words of a load or store of `t` through a pointer into an object: a vector may be 8-aligned only.
+(defun lir-align-text (t: LirTy) -> str
+  (match t ((LirVec _ _) "(align 8) ") (_ "")))
 
 ;; Rust: value.rs:43 is_int
 (defun lir-ty-is-int (t: LirTy) -> bool
@@ -40,7 +59,8 @@
   (match t
     ((LirI1) 1) ((LirI8) 8) ((LirI16) 16) ((LirI32) 32) ((LirI64) 64)
     ((LirDouble) 64) ((LirPtr) 64) ((LirRaw) 64) ((LirFloat) 32) ((LirDyn) 128)
-    ((LirOpt t) (+ 64 (lir-ty-bits t)))))
+    ((LirOpt t) (+ 64 (lir-ty-bits t)))
+    ((LirVec e n) (* n (lir-ty-bits e)))))
 
 ;; The zero of an lIR type as a value: the payload of a `nil` of `(LirOpt t)`, and the initial value of a slot.
 (defun lir-zero (t: LirTy) -> str
@@ -51,6 +71,7 @@
     ((LirDouble) "(double 0.0)")
     ((LirDyn) "(zeroinitializer { ptr ptr })")
     ((LirOpt _) (str-join ["(zeroinitializer " (lir-ty-text t) ")"]))
+    ((LirVec _ _) (str-join ["(zeroinitializer " (lir-ty-text t) ")"]))
     (_ (str-join ["(" (lir-ty-text t) " 0)"]))))
 
 ;; A value: an SSA name, a global address or a literal, with its type; `VUnit`
