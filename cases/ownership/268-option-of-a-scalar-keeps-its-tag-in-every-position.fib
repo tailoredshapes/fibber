@@ -1,0 +1,67 @@
+;; spec:   types §8.1 (an Option of a scalar is a pair held by value), §8.3, §1.5; docs/design/unboxed-option.md; method.md rule 6
+;; expect: accept
+;; result: 1048575
+;; audit:  clean
+;; An (Option scalar) is the pair (tag, payload) wherever it goes: returned, matched, stored in a struct, a Vec, a cell, an
+;; atom, a closure's capture and result, a task's result, a protocol method's result through a `dyn`, a `def`, a generic
+;; function's argument and result. Each check is its own bit of the result: 2^20 - 1 = 1048575. Every check tells `nil` from
+;; `(some 0)` or `(some false)` (a representation that decided by the payload would fail one), `(some unit)` and the nested
+;; Options stay heap enums and must still tell their three states apart.
+(defstruct Slot (o: (Option i64) f: (Option f64) tag: i64))
+(defstruct Counter (n: i64))
+(defprotocol Look (look (self) -> (Option i64)))
+(impl Look Counter (look (self) (if (> (. self n) 0) (some (. self n)) nil)))
+(defenum Colour Red Green)
+(defun wrap (x: a) -> (Option a) (some x))
+(defun unwrap-or-zero (o: (Option i64)) -> i64 (match o (nil -1) ((some x) x)))
+(defun deep (o: (Option (Option i64))) -> i64
+  (match o (nil 1) ((some nil) 2) ((some (some x)) (+ 10 x))))
+(defun unit-state (o: (Option unit)) -> i64 (match o (nil 0) ((some _) 1)))
+(defun pick (c: bool) -> (Option unit) (if c (some ()) nil))
+(defun bit (c: bool n: i64) -> i64 (if c n 0))
+(defun thrice (f: (fn (i64) (Option i64)) i: i64) -> i64
+  (+ (unwrap-or-zero (f i)) (+ (unwrap-or-zero (f (+ i 1))) (unwrap-or-zero (f (+ i 2))))))
+
+(def limit: (Option i64) (some 0))
+(def none: (Option i64) nil)
+(def slot: Slot (Slot (some 0) nil 7))
+
+(defun main () -> i64
+  (let ((zeros: (Vec i64) [0 5])
+        (bools: (Vec bool) [false true])
+        (floats: (Vec f64) [0.0 2.5])
+        (cols: (Vec Colour) [Red Green])
+        (chars: (Vec char) [\a])
+        (opts: (Vec (Option i64)) [(some 0) nil (some 7)])
+        (s: Slot (Slot (some 0) nil 1))
+        (c (cell (get zeros 0)))
+        (a (atom (get zeros 5)))
+        (held (get zeros 0))
+        (look-fn (fn (i: i64) -> (Option i64) (get zeros i)))
+        (captured (fn () -> (Option i64) held))
+        (d (dyn Look (Counter 4)))
+        (dz (dyn Look (Counter 0)))
+        (task (async (get zeros 0)))
+        (task-none (async (get zeros 9))))
+    (do (reset! a (get zeros 1))
+        (+ (bit (and (some? (get zeros 0)) (not (nil? (get zeros 0))) (nil? (get zeros 2))) 1)
+        (+ (bit (and (= (get zeros 0) (some 0)) (not (= (get zeros 0) nil)) (= (get zeros 7) nil)) 2)
+        (+ (bit (= (match (get bools 0) ((some b) (if b 1 2)) (nil 3)) 2) 4)
+        (+ (bit (and (= (get floats 0) (some 0.0)) (= (match (get floats 1) ((some x) x) (nil -1.0)) 2.5)) 8)
+        (+ (bit (and (= (get cols 0) (some Red)) (= (match (get cols 1) ((some Green) 1) (_ 0)) 1) (= (match (get chars 0) ((some \a) 1) (_ 0)) 1)) 16)
+        (+ (bit (and (= (nth opts 0) (some 0)) (nil? (nth opts 1)) (= (nth opts 2) (some 7)) (= (count opts) 3)) 32)
+        (+ (bit (let ((o2 (assoc (conj opts nil) 1 (some 9)))) (and (= (nth o2 1) (some 9)) (nil? (nth o2 3)) (= (nth (pop o2) 2) (some 7)))) 64)
+        (+ (bit (and (= (. s o) (some 0)) (nil? (. s f)) (= (. (with s (o nil) (f (some 1.5))) f) (some 1.5)) (nil? (. (with s (o nil)) o))) 128)
+        (+ (bit (and (= @c (some 0)) (do (set! c nil) (nil? @c)) (do (set! c (some 3)) (= @c (some 3)))) 256)
+        (+ (bit (and (= @a (some 5)) (do (swap! a (fn (o: (Option i64)) -> (Option i64) (if-some [x o] (some (+ x 1)) nil))) (= @a (some 6)))) 512)
+        (+ (bit (and (= (thrice look-fn 0) 4) (= (thrice look-fn 1) 3) (= (unwrap-or-zero (captured)) 0)) 1024)
+        (+ (bit (and (= (look d) (some 4)) (nil? (look dz)) (= (look (Counter 2)) (some 2))) 2048)
+        (+ (bit (and (= (join task) (some 0)) (nil? (join task-none))) 4096)
+        (+ (bit (and (= limit (some 0)) (nil? none) (= (. slot o) (some 0)) (nil? (. slot f)) (= (. slot tag) 7)) 8192)
+        (+ (bit (and (= (unwrap-or-zero (wrap 0)) 0) (= (wrap false) (some false)) (= (wrap 1.5) (some 1.5)) (not (nil? (wrap 0)))) 16384)
+        (+ (bit (and (= (deep (wrap (get zeros 0))) 10) (= (deep (wrap (get zeros 9))) 2) (= (deep nil) 1) (= (deep (some (some 5))) 15)) 32768)
+        (+ (bit (and (= (unit-state (pick true)) 1) (= (unit-state (pick false)) 0)) 65536)
+        (+ (bit (loop ((o (get zeros 0)) (n 0))
+                  (if (< n 5) (recur (if-some [x o] (get zeros (+ x 1)) (get zeros 9)) (+ n 1)) (nil? o))) 131072)
+        (+ (bit (= (reduce (fn (acc: i64 o: (Option i64)) -> i64 (+ acc (unwrap-or-zero o))) 0 opts) 6) 262144)
+           (bit (= (reduce (fn (acc: i64 x: i64) -> i64 (+ acc x)) 0 (keep (fn (i: i64) -> (Option i64) (get zeros i)) [0 1 2 3])) 5) 524288)))))))))))))))))))))))

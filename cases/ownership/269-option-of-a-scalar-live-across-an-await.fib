@@ -1,0 +1,22 @@
+;; spec:   types §8.1, §8.8; docs/design/unboxed-option.md; method.md rule 6
+;; expect: accept
+;; result: 1115
+;; audit:  clean
+;; An (Option i64) held as a pair is live across `await`: a present one, `(some 0)`, and an absent one are locals of the async
+;; body, and a loop variable of Option type is carried across an await. Compiled, the body is a state machine whose frame has a
+;; slot of the pair's type for each, written before the await and read after the resume (types §8.8). The sum tells `(some 0)`
+;; from `nil` after the resume: 10 (the awaited task) + 100 (the present one) + 1 (the absent one) + 1004 (the loop starts
+;; with `nil`, takes `(some 4)` at its first turn and keeps it through the await of its second) = 1115.
+(defun step (i: i64) -> (Task i64) (async (* i 10)))
+
+(defun main () -> i64
+  (let ((v: (Vec i64) [0 4])
+        (t (async
+             (let ((o (get v 0)) (n (get v 9)))
+               (let ((x (await (step 1)))
+                     (carried (loop ((i 0) (cur (get v 9)))
+                                (if (= i 2)
+                                    (match cur ((some k) (+ 1000 k)) (nil 0))
+                                    (recur (+ i 1) (if (= i 0) (get v 1) (let ((y (await (step 0)))) (if (= y 0) cur nil))))))))
+                 (+ x (+ (match o ((some a) (+ a 100)) (nil 0)) (+ (match n ((some _) 7) (nil 1)) carried))))))))
+    (block-on t)))

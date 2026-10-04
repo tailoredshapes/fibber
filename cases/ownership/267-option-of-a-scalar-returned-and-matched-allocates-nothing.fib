@@ -1,0 +1,31 @@
+;; spec:   types §8.1 (an Option of a scalar is a pair held by value), §8.3; docs/design/unboxed-option.md; method.md rule 6
+;; expect: accept
+;; result: 6000
+;; audit:  clean
+;; stage:  2
+;; allocs: <= 4
+;; An (Option i64) returned from a call and consumed by `unwrap`, `if-some` or `match` in the caller allocates nothing: the
+;; interpreter (and the stage 2 of the v0.1.4 seed) allocate one heap enum per `(some ..)`, so the first two loops of 1000 steps
+;; make 2004 objects there and 4 here (building the vector). A heap enum per step would put the count far above 4. The third
+;; loop reads 1000 absent indexes, so a `nil` that allocated would show too.
+(defun peek-sum (v: (Vec i64) n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n) (recur (+ i 1) (+ acc (unwrap (peek v)))) acc)))
+
+(defun get-sum (v: (Vec i64) n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (recur (+ i 1) (+ acc (if-some [x (get v (rem i 3))] x 0)))
+        acc)))
+
+(defun absent-count (v: (Vec i64) n: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (recur (+ i 1) (+ acc (match (get v (+ 10 i)) ((some _) 100) (nil 1))))
+        acc)))
+
+(defun main () -> i64
+  (let ((v: (Vec i64) [1 2 3]))
+    (+ (peek-sum v 1000)
+       (+ (- (get-sum v 1000) 1999)
+          (+ (- (absent-count v 1000) 1000) 3000)))))

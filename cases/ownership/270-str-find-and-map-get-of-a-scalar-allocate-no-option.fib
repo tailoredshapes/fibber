@@ -1,0 +1,33 @@
+;; spec:   types §8.1 (an Option of a scalar is a pair held by value); syntax §4.3 (str-find); docs/design/unboxed-option.md
+;; expect: accept
+;; result: 9500
+;; audit:  clean
+;; stage:  2
+;; allocs: <= 8
+;; `str-find` and `get` on a `(Map i64 i64)` return an `(Option i64)`: a hit, a miss and a hit at offset 0 (or at value 0) are
+;; told apart, and none allocates its result. The stage 2 of the v0.1.4 seed allocates one object for each of the 1500
+;; `str-find` calls and 1000 `get` hits (2508 in all, measured); here the 8 objects are the string and the map's, a count
+;; that does not grow with the number of calls. The checksum: 500 hits of "needle" at offset 3 in "abcneedlexyz" (1500), 500 misses of
+;; "zzz" (500 * 1), 500 hits of "abc" at offset 0 (0), 500 lookups of key 7 (14 * 500 = 7000), 500 of key 8, whose value is 0
+;; and is no miss (0), and 500 of key 9, a miss (500 * 1): 1500 + 500 + 0 + 7000 + 0 + 500 = 9500.
+(defun find-sum (s: str pat: str n: i64 miss: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (recur (+ i 1) (+ acc (match (str-find s pat 0) ((some at) at) (nil miss))))
+        acc)))
+
+(defun get-sum (m: (Map i64 i64) k: i64 n: i64 miss: i64) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i n)
+        (recur (+ i 1) (+ acc (if-some [v (get m k)] v miss)))
+        acc)))
+
+(defun main () -> i64
+  (let ((s (str-concat "abc" "needlexyz"))
+        (m (assoc (assoc (map-empty) 7 14) 8 0)))
+    (+ (find-sum s "needle" 500 1)
+    (+ (find-sum s "zzz" 500 1)
+    (+ (find-sum s "abc" 500 1)
+    (+ (get-sum m 7 500 1)
+    (+ (get-sum m 8 500 1)
+       (get-sum m 9 500 1))))))))
