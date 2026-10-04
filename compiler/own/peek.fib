@@ -1,0 +1,54 @@
+;; compiler/own/peek.fib: the cells whose `@` may be a peek (spec/types.md §6.3, "Cell peeks", condition P1; performance batch 6, P6).
+;;
+;; A cell is *private to the body and never a value* when it is an `&` parameter or a `let` binding initialised directly by
+;; `(cell e)`, and every occurrence of it in the body is the place of a `@` or a `set!`, an `&c` argument or the target of
+;; `set-field!`, and no `fn` or `async` literal captures it. Then the only code that can write its content is a form of this body
+;; that names it, so a read that no sibling operand names cannot see the content change under it (P3, own.walk.call). This
+;; module decides P1 only; the position (P2) and the siblings (P3) are decided where the call is walked.
+(ns own.peek
+  (:use types.ast types.builtins))
+
+;; What one scan of a body found: the `let` bindings initialised by `(cell e)`, and the bindings that are a value somewhere
+;; or are captured by a literal.
+(defstruct PeekScan (cells: (Set i64) bad: (Set i64)))
+
+;; Whether e is `(cell x)`.
+(defun cell-call? :private (e: Expr) -> bool
+  (match (. e kind)
+    ((ECall h _) (match (. h kind)
+                   ((EGlobal (GBuiltin b)) (= (. (nth (builtin-table) b) name) "cell"))
+                   (_ false)))
+    (_ false)))
+
+;; The binding a `let` initialises directly with `(cell x)`, if it is one.
+(defun cell-bind :private (b: LetBind) -> (Option i64)
+  (match (. (. b pat) kind)
+    ((PBind v) (if (cell-call? (. b init)) (some v) nil))
+    (_ nil)))
+
+;; Whether the place of a `@` or `set!` is a plain local variable: it is the one occurrence that is not a value.
+(defun place-local? :private (x: Expr) -> bool
+  (match (. x kind) ((ELocal _) true) (_ false)))
+
+;; The scan of e into s: a variable outside a `@` or `set!` place is a value; a literal's captures are escapes of the cell.
+(defun scan :private (e: Expr s: PeekScan) -> PeekScan
+  (match (. e kind)
+    ((EDeref (PlExpr x) _) (if (place-local? x) s (scan x s)))
+    ((ESet (PlExpr x) v) (scan v (if (place-local? x) s (scan x s))))
+    ((ELocal b) (with s (bad (conj (. s bad) b))))
+    ((EFn lit) (scan-children e (with s (bad (into (. s bad) (. lit captures))))))
+    ((EAsync _ caps) (scan-children e (with s (bad (into (. s bad) caps)))))
+    ((ELet bs _)
+     (scan-children e (with s (cells (reduce (fn (acc: (Set i64) b: LetBind)
+                                               (match (cell-bind b) ((some v) (conj acc v)) (_ acc)))
+                                             (. s cells) bs)))))
+    (_ (scan-children e s))))
+
+(defun scan-children :private (e: Expr s: PeekScan) -> PeekScan
+  (reduce (fn (acc: PeekScan c: Expr) (scan c acc)) s (expr-children e)))
+
+;; The bindings of the body whose `@` may be a peek: its `&` parameters and its `(cell e)` bindings that are never a value.
+(defun peekable-cells (body: Expr amps: (Vec i64)) -> (Set i64)
+  (let [s (scan body (PeekScan (set-empty) (set-empty)))
+        all (reduce (fn (acc: (Set i64) b: i64) (conj acc b)) (. s cells) amps)]
+    (reduce (fn (acc: (Set i64) b: i64) (if (contains? (. s bad) b) acc (conj acc b))) (set-empty) (vec all))))

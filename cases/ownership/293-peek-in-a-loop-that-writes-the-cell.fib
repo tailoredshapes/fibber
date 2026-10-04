@@ -1,0 +1,19 @@
+;; spec:   spec/types.md §6.3 (Cell peeks, P3, in loops)
+;; expect: accept
+;; result: 25
+;; audit:  clean
+;; A loop writes the cell in place with `array-set! &c` while it reads it with `@c` (the fannkuch pattern), and a second loop
+;; replaces the cell between the reads. `old` holds the first array, so the first write copies once and `old` keeps its zeros;
+;; every later write is in place. The reads see the content of the round: 22 = 0 (old) + 11 + 11, and 3 = 0 + 1 + 2.
+(defun second (a: (Array i64)) -> i64 (array-get a 1))
+
+(defun main () -> i64
+  (let [c (cell (array 3 0))
+        old @c]
+    (do (loop [i 0] (if (< i 3) (do (array-set! &c i (+ (array-get @c i) 1)) (recur (+ i 1))) 0))
+        (loop [i 0] (if (< i 3) (do (array-set! &c i (+ (array-get @c i) 10)) (recur (+ i 1))) 0))
+        (+ (+ (array-get old 0) (+ (array-get @c 0) (array-get @c 2)))
+           (loop [i 0 s 0]
+             (if (< i 3)
+               (do (set! c (array 2 i)) (recur (+ i 1) (+ s (second @c))))
+               s))))))

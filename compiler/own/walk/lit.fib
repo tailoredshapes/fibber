@@ -8,7 +8,7 @@
 ;; walker's `expr` field, and own.walk.step, own.walk.pattern, own.walk.call and own.walk.expr
 ;; use it.
 (ns own.walk.lit
-  (:use types.ast own.program own.captured own.syntactic own.walk.state))
+  (:use types.ast own.program own.captured own.syntactic own.peek own.walk.state))
 
 ;; What a parameter is when a body is walked: a scalar, an `&` parameter, an object parameter
 ;; (owned or borrowed).
@@ -74,7 +74,10 @@
 
 ;; Rust: walk/lit.rs:73 `Walker::walk_body`: walks a `defun`, method or `def` body.
 (defun walk-body (w: Walker spec: BodySpec) -> unit
-  (do (w-open-frame w (. spec kind))
+  (do (set! (. w peekable)
+            (peekable-cells (. spec body) (mapv (fn (p: (Pair i64 ParamIn)) (. p fst))
+                                                (filterv (fn (p: (Pair i64 ParamIn)) (= (. p snd) PiAmp)) (. spec params)))))
+      (w-open-frame w (. spec kind))
       (doseq [p (. spec params)] (walk-param w (. p fst) (. p snd)))
       (let [f (w-frame w)]
         (doseq [v @(. f amp-params)]
