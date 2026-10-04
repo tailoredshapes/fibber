@@ -33,7 +33,7 @@ full N 25000000 fedcba9876543210fedcba9876543210
 A line `stdin fasta` marks a benchmark that reads the fasta output on stdin (`k-nucleotide`, `reverse-complement`
 and `regex-redux` are always treated so). Its N is then the fasta size: `run.sh` generates the input with the
 Java fasta twin (`scripts/shootout/fasta/fasta.java`, `java fasta N`) once, caches it as
-`$SHOOT_SCRATCH/input/fasta-N.txt` with its md5 beside it (`.md5`), compares that md5 with the one in the fasta
+`$SHOOT_SCRATCH/input/fasta-N-<hash of fasta.java>.txt` with its md5 beside it (`.md5`), compares that md5 with the one in the fasta
 directory's own `sizes.txt` when that has the same N, and feeds it to every language on stdin. The benchmark is
 still given N as `args[0]`; it may ignore it.
 
