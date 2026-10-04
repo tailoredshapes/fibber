@@ -193,13 +193,17 @@
   (block done (ret)))
 
 ;; The fast path is the one that is small enough to be inlined at every
-;; call: not null, not SHARED, STACK or IMMORTAL (bits 1, 4, 8: HAS-WEAK
-;; does not matter here), a plain increment. The rest is retain-slow.
+;; call: not null; a STACK or IMMORTAL object (bits 4, 8) has no count and
+;; returns at once (a stack closure is retained and released at every call
+;; of it); not SHARED (bit 1: HAS-WEAK does not matter here), a plain
+;; increment. The SHARED rest is retain-slow.
 (define internal (fib.retain void) ((ptr p))
   (block entry (br (icmp eq p (ptr null)) done check))
   (block check
     (let ((f (call @fib.flags p)))
-      (br (icmp eq (and f (i32 13)) (i32 0)) local slow)))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done unshared)))
+  (block unshared
+    (br (icmp eq (and f (i32 1)) (i32 0)) local slow))
   (block local
     (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
       (store (add (load i64 cp) (i64 1)) cp)
@@ -226,20 +230,26 @@
   (block drop (call @fib.drop p) (br done))
   (block done (ret)))
 
-;; Small enough to be inlined at every call: a plain object (not SHARED,
-;; STACK or IMMORTAL) whose count is above 1 is decremented in place;
-;; everything else is release-slow.
+;; Small enough to be inlined at every call: a STACK or IMMORTAL object
+;; returns at once; a plain object (not SHARED) whose count is above 1 is
+;; decremented in place; everything else is release-slow.
 (define internal (fib.release void) ((ptr p))
   (block entry (br (icmp eq p (ptr null)) done check))
   (block check
     (let ((f (call @fib.flags p)))
-      (br (icmp eq (and f (i32 13)) (i32 0)) local slow)))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done unshared)))
+  (block unshared
+    (br (icmp eq (and f (i32 1)) (i32 0)) local shared))
   (block local
     (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
           (c (load i64 cp)))
-      (br (icmp ugt c (i64 1)) dec slow)))
+      (br (icmp ugt c (i64 1)) dec last)))
   (block dec (store (sub c (i64 1)) cp) (br done))
-  (block slow (call @fib.release-slow p f) (br done))
+  ;; two call sites with different arguments (an unshared object has flags that
+  ;; release-slow needs only as 0), so that LLVM does not fold the whole drop into
+  ;; every release as it does for a function called once
+  (block shared (call @fib.release-slow p f) (br done))
+  (block last (call @fib.release-slow p (i32 0)) (br done))
   (block done (ret)))
 
 ;; §8.2: the drop of an object whose count reached zero: weak-clear if
