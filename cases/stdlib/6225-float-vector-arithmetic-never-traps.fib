@@ -1,0 +1,20 @@
+;; spec:   types §1.9, docs/design/simd-and-tensors.md 2.4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; Float lanes overflow to infinity, divide by zero to infinity or NaN and keep the sign of zero, as the scalars: no trap, the same results lane by lane.
+(ns main (:use fib.core tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((big: f32x4 (splat f32x4 3.0e38f32)) (z: f64x2 <<0.0 -0.0>>f64))
+          (do (check c (= (lane (+ big big) 2) (+ 3.0e38f32 3.0e38f32))) (check c (> (lane (* big big) 0) 3.0e38f32))
+              (check c (= (lane (fdiv <<1.0 -1.0>>f64 z) 0) (fdiv 1.0 0.0))) (check c (= (lane (fdiv <<1.0 -1.0>>f64 z) 1) (fdiv -1.0 -0.0)))
+              (check c (!= (lane (fdiv z z) 0) (lane (fdiv z z) 0)))
+              (check c (= (f64->bits (lane (neg z) 0)) (f64->bits (neg 0.0)))) (check c (= (f64->bits (lane (neg z) 1)) (f64->bits (neg -0.0))))
+              (check c (= (f64->bits (lane (* z <<-1.0 -1.0>>f64) 0)) (f64->bits (* 0.0 -1.0))))))
+        (let ((p (checks)))
+          (do (check p (= (lane (neg <<0.0>>f64) 0) 1.0)) (check-detects c p)))
+        (checks-result c))))

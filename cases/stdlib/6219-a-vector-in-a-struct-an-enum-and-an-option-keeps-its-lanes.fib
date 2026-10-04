@@ -1,0 +1,30 @@
+;; spec:   types §1.9, docs/design/simd-and-tensors.md 1.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; A vector is a scalar-class value: held in a struct field beside counted fields (the layout leaves 8-byte alignment to the heap), in an enum variant and in an Option, it reads back unchanged and never takes a count.
+(ns main (:use fib.core tl.check))
+
+(defstruct Body (name: str pos: f32x8 tag: i8 vel: f64x3 id: i32))
+(defenum Shape (Dot v: i64x2) (Box lo: f64x4 hi: f64x4) Nothing)
+
+(defun area (s: Shape) -> f64
+  (match s ((Dot _) 0.0) ((Box lo hi) (hsum (- hi lo))) ((Nothing) -1.0)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((b (Body "earth" <<1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0>>f32 5i8 <<0.5 1.5 2.5>>f64 99i32)))
+          (do (check c (= (hsum (. b pos)) 36.0f32)) (check c (= (. b tag) 5i8)) (check c (= (lane (. b vel) 2) 2.5)) (check c (= (. b id) 99i32))
+              (check c (= (. b name) "earth"))
+              (let ((m (+ (. b pos) (. b pos)))) (check c (= (lane m 7) 16.0f32)))))
+        (check c (= (area (Box <<1.0 1.0 1.0 1.0>>f64 <<2.0 3.0 4.0 5.0>>f64)) 10.0))
+        (check c (= (area (Dot <<1 2>>)) 0.0)) (check c (= (area Nothing) -1.0))
+        (let ((o (some <<1 2 3 4>>i32)))
+          (match o ((some v) (check c (= (hsum v) 10i32))) (nil (check c false))))
+        (let ((o: (Option f64x2) nil))
+          (check c (nil? o)))
+        (let ((p (checks)))
+          (do (check p (= (area (Dot <<1 2>>)) 1.0)) (check-detects c p)))
+        (checks-result c))))
