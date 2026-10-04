@@ -1,0 +1,22 @@
+;; spec:   stdlib §2.5 (update! on a Cell: in place when the cell holds the only reference), §8.1 item 5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 1
+;; open:   L1
+;; roots:  ../../lib support
+;; covers: update!
+;; 1000 (update! c (fn (v) (conj v i))) on a cell holding a Vec. Open: the bound 1 is the goal (the vector is
+;; moved out of the cell and conj on a count-1 vector writes in place), not a measurement. Measured with F1.2
+;; (cell-update! in place, lib Vec and L1's last-use not yet in this tree): the run allocated 2097 heap objects, the
+;; 2094 a (set! c (conj @c i)) loop costs (stdlib §2.5): conj still copies, because the library's conj takes its vector
+;; borrowed and does not write in place (L3, Vec) and the call's argument is retained (L1). Flips when those land;
+;; the bound is then set to the measured count and the label and open- are dropped.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (acc (cell (vec-empty))))
+    (do (dotimes (i 1000) (update! acc (fn (v) (conj v i))))
+        (check c (= (count @acc) 1000))
+        (check c (= (nth @acc 999) 999))
+        (checks-result c))))
