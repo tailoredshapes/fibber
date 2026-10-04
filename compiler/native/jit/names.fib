@@ -1,4 +1,4 @@
-;; compiler/native/jit/names.fib: the cross-module namespace of a JIT session (spec/lir.md section 11; crates/lair/src/jit/names.rs). OWNER: package J. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/jit/names.fib: the cross-module namespace of a JIT session (spec/lir.md section 11; crates/lair/src/jit/names.rs). OWNER: package J.
 
 ;; The Rust `Names` is mutated by `record`; here the value is persistent: `names-record` returns the new one and the session keeps it in a Cell.
 
@@ -9,6 +9,7 @@
 (defenum Defined
   (DefFunc ty: LFnType)
   (DefVar ty: LType))
+(derive Eq Defined)
 
 ;; An exported definition and the module that made it.
 (defstruct Exported (def: Defined module: str))
@@ -18,16 +19,74 @@
 
 ;; No names yet. (names.rs `Names::default`)
 (defun names-new () -> JitNames
-  (trap "todo: native.jit.names names-new"))
+  (JitNames {} {}))
 
 ;; An exported function's type, or the error for `name`: `@N is a global, not a function`, `@N is private to module M`, `no function @N is defined in this JIT`. (names.rs `function`)
 (defun names-function (names: JitNames name: str) -> (Result LFnType LairError)
-  (trap "todo: native.jit.names names-function"))
+  (match (get (. names exported) name)
+    ((some e) (match (. e def)
+                ((DefFunc t) (Ok t))
+                ((DefVar _) (Err (ErrJit (str "@" name " is a global, not a function"))))))
+    (nil (match (get (. names hidden) name)
+           ((some m) (Err (ErrJit (str "@" name " is private to module " m))))
+           (nil (Err (ErrJit (str "no function @" name " is defined in this JIT"))))))))
+
+;; What a declaration asks for: a function type or a variable type.
+(defenum Want (WantFn ty: LFnType) (WantVar ty: LType))
+
+;; Whether the earlier definition is what the declaration says. (names.rs `matches`)
+(defun def-matches? :private (def: Defined want: Want) -> bool
+  (match def
+    ((DefFunc a) (match want ((WantFn b) (= a b)) (_ false)))
+    ((DefVar a) (match want ((WantVar b) (= a b)) (_ false)))))
 
 ;; The rules of spec/lir.md section 11 for a module about to be added: no second exported definition; a declaration matches the earlier definition or names a symbol of the host process. (names.rs `check`)
 (defun names-check (names: JitNames m: LModule in-process: (fn (str) bool)) -> (Result unit LairError)
-  (trap "todo: native.jit.names names-check"))
+  (let ((items (. m items)))
+    (loop ((i 0))
+      (if (>= i (count items))
+          (Ok ())
+          (match (check-item names (nth items i) in-process)
+            ((some d) (Err (lair-error-diag d)))
+            (nil (recur (+ i 1))))))))
+
+;; The diagnostic one item earns, nil for none.
+(defun check-item :private (names: JitNames item: LItem in-process: (fn (str) bool)) -> (Option Diagnostic)
+  (match item
+    ((ItDefine f) (if (linkage-exported? (. (. f mods) linkage)) (check-one names (. f name) (. f pos) nil in-process) nil))
+    ((ItGlobal g) (if (linkage-exported? (. (. g mods) linkage)) (check-one names (. g name) (. g pos) nil in-process) nil))
+    ((ItDeclare d) (check-one names (. d name) (. d pos) (some (WantFn (. d ty))) in-process))
+    ((ItDeclareGlobal g) (check-one names (. g name) (. g pos) (some (WantVar (. g ty))) in-process))
+    ((ItStruct _) nil)))
+
+(defun check-one :private (names: JitNames name: str pos: i64 want: (Option Want) in-process: (fn (str) bool)) -> (Option Diagnostic)
+  (match (get (. names exported) name)
+    ((some first)
+     (match want
+       (nil (some (Diagnostic pos (str "duplicate definition of @" name " (first in module " (. first module) ")"))))
+       ((some w) (if (def-matches? (. first def) w)
+                     nil
+                     (some (Diagnostic pos (str "declaration of @" name " does not match its definition in module " (. first module))))))))
+    (nil
+     (match want
+       (nil nil)
+       ((some _) (if (in-process name)
+                     nil
+                     (some (Diagnostic pos (str "undefined symbol @" name ": defined by no module of this JIT and not in the process")))))))))
 
 ;; The names after the module is added. (names.rs `record`)
 (defun names-record (names: JitNames module: str m: LModule) -> JitNames
-  (trap "todo: native.jit.names names-record"))
+  (let ((items (. m items)))
+    (loop ((i 0) (acc names))
+      (if (>= i (count items))
+          acc
+          (recur (+ i 1)
+                 (match (nth items i)
+                   ((ItDefine f) (record-one acc (. f name) (linkage-exported? (. (. f mods) linkage)) (DefFunc (. f ty)) module))
+                   ((ItGlobal g) (record-one acc (. g name) (linkage-exported? (. (. g mods) linkage)) (DefVar (. g ty)) module))
+                   (_ acc)))))))
+
+(defun record-one :private (names: JitNames name: str exported: bool def: Defined module: str) -> JitNames
+  (if exported
+      (JitNames (assoc (. names exported) name (Exported def module)) (. names hidden))
+      (JitNames (. names exported) (assoc (. names hidden) name module))))
