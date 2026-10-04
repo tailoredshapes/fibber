@@ -24,7 +24,7 @@
 ;;   tests are `is_none_or(|n| n.as_sym().is_none())` and the like.
 (ns expand.top
   (:require [expand.own :as own] [expand.fusescan :as scan] [expand.params :as params]
-            [expand.overload :as overload])
+            [expand.overload :as overload] [expand.regex :as regex])
   (:use syntax.pos syntax.form expand.error expand.types expand.ctx
         expand.build expand.heads expand.private expand.core expand.expr expand.walk))
 
@@ -393,8 +393,20 @@
               (recur (splice (items-of g) rest) out)
               (match (definition ex g (= (count out) 0))
                 ((Err e) (Err e))
-                ((Ok d) (do (own/ctx-add-own (. ex ctx) (scan/fuse-names-of d))
-                            (recur rest (conj out d))))))))))))
+                ((Ok d) (match (with-literals ex d out)
+                          ((Err e) (Err e))
+                          ((Ok out2) (recur rest out2))))))))))))
+
+;; out with the form d after the defs that its regex literals need (expand.regex), each registered as a definition is.
+(defun with-literals :private (ex: Expander d: Stx out: (Vec Stx)) -> (Result (Vec Stx) ExpandError)
+  (try-let ((h (regex/hoist-literals (. ex ctx) d)))
+    (loop ((i 0) (acc out))
+      (if (< i (count (. h defs)))
+          (try-let ((x (definition ex (nth (. h defs) i) false)))
+            (do (own/ctx-add-own (. ex ctx) (scan/fuse-names-of x))
+                (recur (+ i 1) (conj acc x))))
+          (do (own/ctx-add-own (. ex ctx) (scan/fuse-names-of (. h form)))
+              (Ok (conj acc (. h form))))))))
 
 ;; The items of a `do` after its head, pushed so that the first is next.
 (defun splice :private (items: (Vec Stx) rest: Pending) -> Pending

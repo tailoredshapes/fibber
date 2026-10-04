@@ -46,7 +46,7 @@
 ;; the `Runner`; `expand-all` returns the `Expanded`s in the dependency
 ;; order of `try-load`, or the first `ExpandError`, which ends it.
 (ns expand.modules
-  (:require [syntax.reader :as reader] [expand.program :as prog])
+  (:require [syntax.reader :as reader] [expand.program :as prog] [expand.regex :as regex])
   (:use syntax.pos syntax.form syntax.error expand.error expand.types expand.ctx
         expand.roots))
 
@@ -276,8 +276,9 @@
     ((Ok forms)
      (match (spec-in forms "main")
        ((Err e) (Err e))
-       ((Ok spec)
-        (let ((ld (Loader (path-parent file) roots implicit (cell false) (cell [(. spec ns)])
+       ((Ok spec0)
+        (let ((spec (with-regex spec0 forms))
+              (ld (Loader (path-parent file) roots implicit (cell false) (cell [(. spec ns)])
                           (cell (map-empty)) (cell (vec-empty)))))
           (match (load-implicit ld spec)
             ((Err e) (Err e))
@@ -326,10 +327,18 @@
     ((Ok forms)
      (match (spec-in forms ns)
        ((Err e) (Err e))
-       ((Ok spec)
+       ((Ok spec0)
+        (let ((spec (with-regex spec0 forms)))
         (if (= (. spec ns) ns)
             (visit-spec ld (give-implicit ld spec) file forms)
-            (Err (LoadMismatch file (. spec ns) ns))))))))
+            (Err (LoadMismatch file (. spec ns) ns)))))))))
+
+;; A module with a regex literal `#"..."` requires fib.regex.api, as the `def`s that expand.regex makes for the literals name its
+;; `re-pattern` by the full module name (the module's own `:require`s are kept).
+(defun with-regex :private (spec: ModuleSpec forms: (Vec Stx)) -> ModuleSpec
+  (if (and (not (starts-with? (. spec ns) "fib.regex")) (regex/has-literal? (Stx (SList forms) (Pos "" 0 0 0 0))))
+      (ModuleSpec (. spec ns) (conj (. spec requires) (Require regex/regex-module regex/regex-module)) (. spec uses) (. spec exports) (. spec implicit))
+      spec))
 
 ;; The spec with the implicit modules, all of which are read before it
 ;; (those loading them have none) (`give_implicit`).

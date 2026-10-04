@@ -157,6 +157,30 @@
   (let ((start (cursor-mark cur)))
     (do (cursor-bump cur) (string-body cur start))))
 
+;; The text of a regex literal after its opening quote, to the closing one: Clojure's rule, a backslash and the character after it
+;; stay as they are (`#"\d+"` is the pattern `\d+`, `#"a\"b"` is `a\"b`), so the closing quote is the first one no backslash holds.
+(defun regex-body :private (cur: Cursor start: Mark) -> (Result str ReadError)
+  (let ((from (cursor-offset cur)))
+    (loop ()
+      (match (cursor-peek cur)
+        (nil (Err (err-at cur start UnterminatedString)))
+        ((some \\) (do (cursor-bump cur)
+                        (match (cursor-bump cur)
+                          (nil (Err (err-at cur start UnterminatedString)))
+                          ((some _) (recur)))))
+        ((some \") (let ((text (cursor-slice cur from (cursor-offset cur))))
+                     (do (cursor-bump cur) (Ok text))))
+        ((some _) (do (cursor-bump cur) (recur)))))))
+
+;; Reads `#"..."` as the form `(fib.prelude/re "...")` (syntax §1.1, stdlib §4.9); the cursor is on the opening `"`, `mark` is at the `#`.
+;; The expander turns the form into a reference to a `def` made at compile time (expand.regex).
+(defun lex-regex (cur: Cursor mark: Mark) -> (Result StxKind ReadError)
+  (do (cursor-bump cur)
+      (match (regex-body cur mark)
+        ((Err e) (Err e))
+        ((Ok text) (let ((pos (cursor-pos-from cur mark)))
+                     (Ok (SList [(Stx (SSym "fib.prelude/re") pos) (Stx (SStr text) pos)])))))))
+
 ;; The constituent run after `\c` (c already consumed, a constituent):
 ;; one of the four names, or c alone.
 (defun char-name :private (cur: Cursor mark: Mark c: char) -> (Result StxKind ReadError)

@@ -15,6 +15,7 @@
 ;; - `is_constant`, called by `lower_def` and (for the arguments of a call), is `constant?`; a
 ;;   `def` takes any initialiser (L15), so it only fills the `constant` field of the `DefDef`.
 (ns types.lower.mod
+  (:require [fib.regex.api :as rx])
   (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store
         types.table types.ast types.decls types.names types.display types.lower.typeform
         types.lower.decl types.lower.defaults types.lower.protos types.lower.supers
@@ -262,8 +263,24 @@
     ((EGlobal (GCtor _ _)) true)
     ((EGlobal (GFun _)) true)
     ((ECall head args)
-     (and (const-head? g head)
-          (every? (fn (a: Arg) (match a ((ArgExpr x) (constant? g id x)) ((ArgAmp _ _) false))) args)))
+     (or (regex-literal-call? g head args)
+         (and (const-head? g head)
+          (every? (fn (a: Arg) (match a ((ArgExpr x) (constant? g id x)) ((ArgAmp _ _) false))) args))))
+    (_ false)))
+
+;; `(re-pattern "text")` of fib.regex.api with a literal the library accepts: the compiler makes the `Regex` at compile time, as
+;; static data (stdlib §4.9). The `Regex` holds no cell, so it is a legal def value; a pattern the library refuses is not constant
+;; and traps when the def is made at run time, as `re-pattern` does.
+(defun regex-literal-call? :private (g: Globals head: Expr args: (Vec Arg)) -> bool
+  (match (. head kind)
+    ((EGlobal (GFun f))
+     (let ((fd (g-fun g f)))
+       (and (= (. fd name) "re-pattern") (= (g-module-name g (. fd module)) "fib.regex.api") (= (count args) 1)
+            (match (nth args 0)
+              ((ArgExpr x) (match (. x kind)
+                             ((ELit (LitStr text)) (match (rx/try-re-pattern text) ((Ok _) true) ((Err _) false)))
+                             (_ false)))
+              (_ false)))))
     (_ false)))
 
 ;; A constructor, or one of the prelude calls of the literal rewrite.
