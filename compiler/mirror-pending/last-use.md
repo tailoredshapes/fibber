@@ -27,3 +27,20 @@ oracle for them), and `cases/ownership/248..260`. The 15 programs of `compiler/t
 so their dumps are unchanged by the pass.
 
 Not ported, and not to be: the Rust is the seed, and the seed's plan is the conservative one that this pass improves on.
+
+## L8 additions (performance batch 2): rule 4, steal through `(some x)`, shell reuse
+
+Three more divergences from the Rust plan, all in `compiler/own` and `compiler/emit/lower`, none ported:
+
+- **Rule 4** (`facts-want-owned`, `own/unit.fib` `decide`, `own/walk/state.fib` `w-want-own`): a borrowed parameter of a `defun`, not declared
+  `:borrow`, a field of whose shell would be stolen at its last use, is inferred owned (`explain`: `owned (rule 4: ..)`). `decide` walks the unit
+  again with the parameter owned. The Rust summaries (`fibref own --sections summary`) say borrowed for such a parameter.
+- **Steal through `(some x)`**: the payload variable of a direct `(some x)` sub-pattern of a constructor pattern is a field variable
+  (`lastuse.fib` `field-vars`, `walk/pattern.fib` `note-fields`) whose origin is the field's own slot (`emit/lower/pattern.fib` `option-slot?`),
+  when the payload is an object that is not an `Option` (an `Option` of a pointer is the pointer).
+- **Shell reuse** (`lastuse.fib` `record-reuse`, `walk/call.fib` `note-reuse`, `BodyOwn.reuse`, `emit/lower/objects.fib` `build-object`): a
+  constructor call of the variant of an enclosing clause's pattern, after which nothing reads the shell, hands the shell over and builds in it when
+  `fib.unique?` says so. The dumps (`fibref own`, `fibc explain`) do not print `reuse`; the emitted lIR has a `reuse`/`fresh`/`built` diamond at such a
+  site that the Rust emitter never produces.
+
+Cases: `cases/ownership/264..266`; the counts `cases/stdlib/4010..4015`, `4054`.

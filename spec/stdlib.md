@@ -767,7 +767,20 @@ spec/types.md §2.13.1 has the primitives.
 4. **A variable's last use hands over its count.** The ownership pass of the compiler in fibber (`compiler/own/lastuse.fib`)
    moves a binding's reference into the call at its last use, and takes a field out of a dead owned shell at its last use
    (`compiler/mirror-pending/last-use.md`). This removes the extra count that made the loop of §2.5 above copy. A variable
-   that is used again after the call is retained first, has count 2, and the call copies, correctly.
+   that is used again after the call is retained first, has count 2, and the call copies, correctly. Two more rules make
+   the library's own functions fire (`compiler/own/unit.fib` `decide`, `compiler/own/walk/state.fib` `w-want-own`): a
+   `defun` parameter that is a borrowed shell is **inferred owned** when a field of it would be taken out at its last use
+   (so `vec-conj`, `vec-assoc`, `vec-pop`, `map-assoc` take their vector or map owned, and a caller that uses its value again
+   retains it first), and the payload of a direct `(some x)` sub-pattern is a field slot of its shell and is taken out too.
+   The methods `conj`, `assoc`, `dissoc` and `pop` declare `self :owned` (`lib/fib/coll/protocols.fib`) for the same reason.
+4a. **A constructor that is the last use of its shell is built in the shell** (shell reuse; `compiler/own/lastuse.fib`
+   `record-reuse`, `compiler/emit/lower/objects.fib` `build-object`). When a function destructures a value with a
+   constructor pattern and builds a value of the same variant, and nothing reads the shell afterwards, the emitted code
+   tests `fib.unique?` of the shell: unique, the fields of the shell are overwritten (the old values released, a field that
+   was taken out is null) and the shell is the result; else the object is allocated as usual and the shell released. This
+   removes the `VecOf`, `VBranch` and `VLeaf` shells of an update: 1000 `assoc` on a unique 100000-element vector allocate
+   nothing (case 4010), 1000 `conj` allocate only the tail arrays and leaves, one in 32 (case 4011), and 1000 `assoc` of
+   present keys on a `Map` allocate nothing (case 4015). It never applies to a stack object or to a shell of another type.
 5. **Atoms are never unique.** A value stored in an `Atom` is marked `SHARED` before the store (types §6.3, `fib.share`,
    `rt/atom.lir`), and `fib.unique?` refuses a `SHARED` object, so `swap!` works on a copy. `(update! an-atom f)` is a type
    error (case 4052). The same holds for anything a task captured: `spawn` shares its captures, so neither side updates
@@ -779,14 +792,14 @@ spec/types.md §2.13.1 has the primitives.
    in-place update of the caller's vector. Code that wants the in-place path keeps the accumulator in a `loop` variable
    or in a cell updated with `update!`.
 8. **How to tell.** `fibc run --trace` prints one `A` line per heap object allocated; a count case (`allocs: <= N`, spec/method.md
-   rule 3) bounds it. The cases that are written for this are `cases/stdlib/4000` to `4016` (persistence, and counts, several
-   of them `open`) and `4050` to `4054` (`update!`); an `open` case prints as failing until its bound is met.
+   rule 3) bounds it. The cases that are written for this are `cases/stdlib/4000` to `4016` (persistence, and counts: none is
+   `open` now) and `4050` to `4054` (`update!`), and `cases/ownership` 248 to 266 (the rules above, each with the case that
+   fails when the rule is wrong); `scripts/mutant-unique.sh` checks that the persistence cases fail when `fib.unique?` lies.
 
 **What is tested.** The zero-cost claims are tests with counts (§8): a three-stage pipeline over n and
 over 10n elements allocates the same number of objects (passes today: +4 for 1000, A1), a bulk `vec` of
-n allocates at most n/32 + c, a `conj` loop of n allocates at most n + c once C2 to C4 and C7 land (the
-header, one object per `conj`) and at most c once `Vec` is a struct (**both fail today**, 2094; they are in
-the `open` list of the harness, which prints them as failing, never as pending). The harness had no object
+n allocates at most n/32 + c, and a `conj` loop of n allocates about n/32 + c on a unique accumulator (case 4011:
+190 for 1000, 2094 before the in-place update; a struct `Vec` is not needed). The harness had no object
 count at `36ed472`: a case header was `spec expect result audit error trap`; §7 H1 (landed, §7.5) added `allocs` (a maximum), `covers` and `open`, and the
 count lines it reads are the `A` lines of `fibc run --trace`, which the review ran (A10 t1r: 2099 for the
 chain of A1 through `fibc run --trace`).
