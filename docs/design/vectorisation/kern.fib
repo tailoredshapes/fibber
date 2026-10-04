@@ -1,0 +1,61 @@
+(ns main (:use fib.unix))
+;; sum over (Array f64)
+(defun sum-f64 (a: (Array f64)) -> f64
+  (loop [i 0 s 0.0] (if (< i (array-len a)) (recur (+ i 1) (+ s (array-get a i))) s)))
+(defun sum-i64 (a: (Array i64)) -> i64
+  (loop [i 0 s 0] (if (< i (array-len a)) (recur (+ i 1) (+ s (array-get a i))) s)))
+(defun dot-f64 (a: (Array f64) b: (Array f64)) -> f64
+  (loop [i 0 s 0.0] (if (< i (array-len a)) (recur (+ i 1) (+ s (* (array-get a i) (array-get b i)))) s)))
+(defun dot-i64 (a: (Array i64) b: (Array i64)) -> i64
+  (loop [i 0 s 0] (if (< i (array-len a)) (recur (+ i 1) (+ s (* (array-get a i) (array-get b i)))) s)))
+;; y = y + k*x in place
+(defun axpy-f64 (k: f64 x: (Array f64) &y: (Array f64)) -> i64
+  (do (loop [i 0] (if (< i (array-len x))
+        (do (array-set! &y i (+ (array-get @y i) (* k (array-get x i)))) (recur (+ i 1)))))
+      0))
+(defun axpy-i64 (k: i64 x: (Array i64) &y: (Array i64)) -> i64
+  (do (loop [i 0] (if (< i (array-len x))
+        (do (array-set! &y i (+ (array-get @y i) (* k (array-get x i)))) (recur (+ i 1)))))
+      0))
+;; out[i] = f(a[i]) via a function argument
+(defun map-into (f: (fn (f64) f64) a: (Array f64) &o: (Array f64)) -> i64
+  (do (loop [i 0] (if (< i (array-len a))
+        (do (array-set! &o i (f (array-get a i))) (recur (+ i 1)))))
+      0))
+(defun map-sq (a: (Array f64) &o: (Array f64)) -> i64
+  (do (loop [i 0] (if (< i (array-len a))
+        (let [x (array-get a i)] (do (array-set! &o i (* x x)) (recur (+ i 1))))))
+      0))
+(defun fill-f64 (n: i64) -> (Array f64)
+  (let [c (cell (array n 0.0))]
+    (do (loop [i 0] (if (< i n) (do (array-set! &c i (/ (double (+ (rem (* i 7919) 1000) 1)) 1000.0)) (recur (+ i 1)))))
+        @c)))
+(defun fill-i64 (n: i64) -> (Array i64)
+  (let [c (cell (array n 0))]
+    (do (loop [i 0] (if (< i n) (do (array-set! &c i (rem (* i 7919) 1000)) (recur (+ i 1)))))
+        @c)))
+(defun main () -> i64
+  (let [mode (nth (args) 0)
+        n (unwrap (parse-long (nth (args) 1)))
+        reps (unwrap (parse-long (nth (args) 2)))
+        a (fill-f64 n) b (fill-f64 n) ai (fill-i64 n) bi (fill-i64 n)
+        yf (cell (fill-f64 n)) yi (cell (fill-i64 n)) of (cell (array n 0.0))
+        t0 (clock-now)
+        r (loop [k 0 acc 0.0]
+            (if (< k reps)
+              (recur (+ k 1)
+                (+ acc
+                  (cond
+                    (= mode "sumf") (sum-f64 a)
+                    (= mode "sumi") (double (sum-i64 ai))
+                    (= mode "dotf") (dot-f64 a b)
+                    (= mode "doti") (double (dot-i64 ai bi))
+                    (= mode "axpyf") (do (axpy-f64 0.5 a &yf) 0.0)
+                    (= mode "axpyi") (do (axpy-i64 3 ai &yi) 0.0)
+                    (= mode "mapf") (do (map-into (fn (x: f64) -> f64 (* x 2.0)) a &of) 0.0)
+                    (= mode "sq") (do (map-sq a &of) 0.0)
+                    :else 0.0)))
+              acc))
+        t1 (clock-now)]
+    (do (println (str mode " n=" n " reps=" reps " result=" r " ms=" (quot (- t1 t0) 1000000)))
+        0)))

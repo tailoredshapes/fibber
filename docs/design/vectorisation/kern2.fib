@@ -1,0 +1,23 @@
+(ns main (:use fib.unix))
+;; sum with four independent accumulators (a different, but deterministic, order from the sequential fold)
+(defun sum4-f64 (a: (Array f64)) -> f64
+  (let [n (array-len a) m (- n (rem n 4))]
+    (loop [i 0 s0 0.0 s1 0.0 s2 0.0 s3 0.0]
+      (if (< i m)
+        (recur (+ i 4)
+               (+ s0 (array-get a i)) (+ s1 (array-get a (+ i 1)))
+               (+ s2 (array-get a (+ i 2))) (+ s3 (array-get a (+ i 3))))
+        (loop [j m t (+ (+ s0 s1) (+ s2 s3))]
+          (if (< j n) (recur (+ j 1) (+ t (array-get a j))) t))))))
+(defun fill-f64 (n: i64) -> (Array f64)
+  (let [c (cell (array n 0.0))]
+    (do (loop [i 0] (if (< i n) (do (array-set! &c i (/ (double (+ (rem (* i 7919) 1000) 1)) 1000.0)) (recur (+ i 1)))))
+        @c)))
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0)))
+        reps (unwrap (parse-long (nth (args) 1)))
+        a (fill-f64 n)
+        t0 (clock-now)
+        r (loop [k 0 acc 0.0] (if (< k reps) (recur (+ k 1) (+ acc (sum4-f64 a))) acc))
+        t1 (clock-now)]
+    (do (println (str "sum4 n=" n " reps=" reps " result=" r " ms=" (quot (- t1 t0) 1000000))) 0)))
