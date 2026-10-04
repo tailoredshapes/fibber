@@ -218,6 +218,14 @@ Rules:
      `fib.seq/map` or `fib.coll/vec` is the library's whatever the module defines (case 833). Modules whose `ns` starts with `fib.` and modules that do not
      see `fib.seq` are not rewritten. A `:require` alias (`s/map`) is not recognised. With the implicit list filled (`IMPLICIT_LIB`, §6.2, the flip) rule (3) runs end to end: a program that `:use`s a module that exports `first` or `map`
      calls its own (case 872), and a program's own `map` is not an error (case 871).
+   * **The let rule (stage 2; performance batch 3, P2; cases 4200 to 4203).** A seq bound by a `let` and read once is the chain it is. Before the fusing walk, a binding `(n e)` whose
+     pattern is a plain symbol is folded into its reader when the symbol occurs once in all that follows it, that one occurrence is the collection of a terminal consumer
+     or of a chain of stages (the tables above) that is the init of the next binding or the one body form of the `let`, and every other argument of the terminal and of the
+     stages is a symbol, a literal or a `fn`. Then `e` is evaluated once, at the same place in the program's order (the arguments it moves past have no effect), and the
+     chain is in a collection position, so it is fused: `(let ((r (range n)) (m (map f r)) (a (reduce + 0 m))) ..)` is `(let ((a (reduce + 0 (map f (range n))))) ..)`. A seq
+     that is read twice, or from a closure, or by anything that is not the library's consumer, is not touched and stays the memoised seq of case 822 and 827. The Rust
+     `expand/fuse.rs` has no such rule (frozen); the case headers say `stage: 2` (compiler/mirror-pending/P2-fuse-let.md). Measured: `scripts/bench/lazy-bound.fib` over 5e6
+     elements, 1.39 s and 1.5 GB before, 0.05 s and 1.5 MB after.
    * **The dump** of a program that sees `fib.seq` shows the recipes and the gensyms `#fuse.N`; its format is unchanged (bootstrap §2, §5.3).
 
    **Not adopted.** The second revision's affine recipes (a value consumed once, a compile error on the second use) and the first

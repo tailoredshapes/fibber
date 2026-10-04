@@ -1,0 +1,35 @@
+;; spec:   stdlib §2.1 rule 2 (the let rule), P2 of performance batch 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: map take vec
+;; Case 821 with every stage bound to a name. The source counts the elements it hands out and ends at
+;; a hundred thousand, which the lazy form's default to-lseq would walk in full before the first map; the
+;; folded and fused chain stops the source at the second element: 2 pulls, 2 calls of f, `[0 2]`. A
+;; fold that did not happen, or that moved the work out of order, shows as 100000 pulls.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct Naturals (from: i64 pulled: (Cell i64)))
+(impl (Reducible i64) Naturals
+  (each-while (self k)
+    (loop ((i (. self from)))
+      (if (< i 100000)
+          (do (set! (. self pulled) (+ @(. self pulled) 1))
+              (if (k i) (recur (+ i 1)) false))
+          true))))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (pulled (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2))))
+          (s (Naturals 0 pulled))
+          (m (map f s))
+          (t (take 2 m))
+          (v (vec t)))
+      (do (check c (= v [0 2]))
+          (check c (= @calls 2))
+          (check c (= @pulled 2))
+          (checks-result c)))))

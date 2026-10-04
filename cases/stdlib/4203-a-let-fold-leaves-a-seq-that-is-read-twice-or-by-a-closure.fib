@@ -1,0 +1,34 @@
+;; spec:   stdlib §2.1 rule 2 (a bound seq is memoised; the let rule folds only a seq read once), P2 of performance batch 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: map sum count
+;; A seq that the program reads twice, or reads from a closure that may run twice, must stay a memoised
+;; seq: f runs once per element however often it is read. Folding it into one reader would run f again
+;; at every read (6 calls, or 9, where the programs below make 3). Each form here has the name of the
+;; seq once in the text of the reader that follows it, so only the count of reads and the place of the
+;; read (a `fn`) keep it bound.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0)))
+    (let ((f (fn (x: i64) (do (set! calls (+ @calls 1)) (* x 2)))))
+      (do (let ((s (map f [1 2 3]))
+                (a (sum s)))
+            (check c (= (+ a (count s)) 15)))
+          (check c (= @calls 3))
+          (set! calls 0)
+          (let ((s (map f [1 2 3]))
+                (g (fn () (sum s))))
+            (check c (= (+ (g) (g)) 24)))
+          (check c (= @calls 3))
+          (set! calls 0)
+          ;; read once, in place: folded, f runs once per element
+          (let ((s (map f [1 2 3]))
+                (a (sum s)))
+            (check c (= a 12)))
+          (check c (= @calls 3))
+          (checks-result c)))))

@@ -1,0 +1,202 @@
+;; compiler/expand/fuselet.fib: a seq bound by a `let` and read once is a chain
+;; (stdlib design §2.1 rule 2, the let rule; stage 2 only, no Rust twin:
+;; compiler/mirror-pending/P2-fuse-let.md). Run on a top-level form that calls
+;; a terminal consumer, before the fusing walk:
+;;
+;;   (let ((r (range 9)) (m (map f r)) (a (reduce + 0 m))) ..)
+;;     ==>  (let ((a (reduce + 0 (map f (range 9))))) ..)
+;;
+;; The binding `(n e)` is folded into the form that reads `n` when
+;;  - the pattern is a plain symbol `n` and the symbol (or `n:`) occurs once in
+;;    all that follows the binding, and that one occurrence is a collection
+;;    position;
+;;  - the reader is the init of the next binding, or the one body form of the
+;;    `let` when the binding is the last, and `n` is the collection of a
+;;    terminal consumer or of a chain of stages (expand.fusetab) the library's
+;;    consumer reads: `(t a.. (stage p (stage p n)))`;
+;;  - every other argument of the terminal and of the stages is atomic (a
+;;    symbol, a literal or a `fn`: expand.fuse `fuse-atomic?`), so folding `e`
+;;    into the position moves its evaluation past nothing that has an effect.
+;; Then `e` runs exactly once, at the same point of the program's order, as an
+;; argument of the call that read `n`: the same program, and the chain is in a
+;; collection position, so the fusing walk makes it recipes, nothing per
+;; element (a bound chain costs a memoised cell per element, §2.1). A seq read
+;; twice, or by anything else (a closure, a loop, a function call that is not
+;; the library's), is not touched and stays the memoised seq of case 822/827.
+(ns expand.fuselet
+  (:use syntax.pos syntax.form expand.build expand.fusetab expand.fusescan expand.fuse))
+
+;; Occurrences of the symbol `n`, or `n:`, in `form`, anywhere.
+(defun sym-uses :private (form: Stx n: str) -> i64
+  (match (. form kind)
+    ((SSym s) (if (or (= s n) (= s (str-concat n ":"))) 1 0))
+    ((SList items) (items-uses items 0 n))
+    ((SVec items) (items-uses items 0 n))
+    ((SMap items) (items-uses items 0 n))
+    (_ 0)))
+
+;; Occurrences in the items from `from` on.
+(defun items-uses :private (items: (Vec Stx) from: i64 n: str) -> i64
+  (loop ((i from) (acc 0))
+    (if (< i (count items)) (recur (+ i 1) (+ acc (sym-uses (nth items i) n))) acc)))
+
+;; Whether every item but `at`, after the head, is atomic.
+(defun others-atomic? :private (items: (Vec Stx) at: i64) -> bool
+  (loop ((i 1))
+    (cond (>= i (count items)) true
+          (= i at) (recur (+ i 1))
+          (fuse-atomic? (nth items i)) (recur (+ i 1))
+          :else false)))
+
+;; The index of the collection of a terminal consumer call, when the others
+;; are atomic.
+(defun terminal-slot :private (env: FuseEnv items: (Vec Stx)) -> (Option i64)
+  (match (fuse-terminal-call env items)
+    (nil nil)
+    ((some row)
+     (let ((at (if (. row coll-first) 1 (- (count items) 1))))
+       (if (others-atomic? items at) (some at) nil)))))
+
+;; The index of the collection of a stage call (`concat`, two collections,
+;; is not one).
+(defun stage-slot :private (env: FuseEnv items: (Vec Stx)) -> (Option i64)
+  (match (fuse-stage-call env items)
+    (nil nil)
+    ((some row) (match (. row shape) ((FsTwo) nil) (_ (some 2))))))
+
+;; The slot of a call that reads a collection: a consumer or a stage at the
+;; top of a chain, a stage inside it.
+(defun reader-slot :private (env: FuseEnv items: (Vec Stx) top: bool) -> (Option i64)
+  (if top
+      (match (terminal-slot env items)
+        ((some at) (some at))
+        (nil (stage-slot env items)))
+      (stage-slot env items)))
+
+;; `form` with item `at` replaced.
+(defun with-item :private (form: Stx items: (Vec Stx) at: i64 x: Stx) -> Stx
+  (Stx (SList (loop ((i 0) (out (vec-empty)))
+                (if (< i (count items))
+                    (recur (+ i 1) (conj out (if (= i at) x (nth items i))))
+                    out)))
+       (. form pos)))
+
+;; `form` with the symbol `n`, found in the collection position of the chain
+;; it is the head of, replaced by `init`; none when it is not there.
+(defun subst-chain :private (env: FuseEnv form: Stx n: str init: Stx top: bool) -> (Option Stx)
+  (let ((items (fuse-list-items form)))
+    (match (reader-slot env items top)
+      (nil nil)
+      ((some at)
+       (let ((c (nth items at)))
+         (if (= (fuse-sym-of c) (some n))
+             (some (with-item form items at init))
+             (match (subst-chain env c n init false)
+               (nil nil)
+               ((some c2) (some (with-item form items at c2))))))))))
+
+;; The name a binding `(n e)` binds, when it is a plain symbol.
+(defun binding-name :private (pair: Stx) -> (Option str)
+  (let ((parts (fuse-list-items pair)))
+    (if (= (count parts) 2)
+        (match (fuse-sym-of (nth parts 0))
+          ((some s) (if (some? (strip-name-colon s)) nil (some s)))
+          (nil nil))
+        nil)))
+
+;; Whether `s` ends with a colon.
+(defun strip-name-colon :private (s: str) -> (Option str)
+  (let ((k (- (str-len s) 1)))
+    (if (and (>= k 0) (= (str-byte-at s k) 58i8)) (some (str-slice s 0 k)) nil)))
+
+;; The `let` items with binding `i` folded away, or none. `items` is
+;; `(let pairs body..)`, `pairs` its bindings.
+(defun fold-at :private (env: FuseEnv form: Stx items: (Vec Stx) pairs: (Vec Stx) i: i64) -> (Option Stx)
+  (match (binding-name (nth pairs i))
+    (nil nil)
+    ((some n)
+     (let ((init (nth (fuse-list-items (nth pairs i)) 1))
+           (uses (+ (items-uses pairs (+ i 1) n) (items-uses items 2 n))))
+       (if (not (= uses 1))
+           nil
+           (if (< (+ i 1) (count pairs))
+               (fold-into-pair env form items pairs i n init)
+               (fold-into-body env form items pairs i n init)))))))
+
+;; The reader is the init of the binding after `i`.
+(defun fold-into-pair :private (env: FuseEnv form: Stx items: (Vec Stx) pairs: (Vec Stx) i: i64 n: str init: Stx)
+    -> (Option Stx)
+  (let ((next (nth pairs (+ i 1))))
+    (let ((parts (fuse-list-items next)))
+      (if (not (= (count parts) 2))
+          nil
+          (match (subst-chain env (nth parts 1) n init true)
+            (nil nil)
+            ((some e)
+             (some (rebuild form items (without-at (replace-at pairs (+ i 1) (with-item next parts 1 e)) i)
+                            (. form pos)))))))))
+
+;; The reader is the one body form.
+(defun fold-into-body :private (env: FuseEnv form: Stx items: (Vec Stx) pairs: (Vec Stx) i: i64 n: str init: Stx)
+    -> (Option Stx)
+  (if (not (= (count items) 3))
+      nil
+      (match (subst-chain env (nth items 2) n init true)
+        (nil nil)
+        ((some e)
+         (if (= (count pairs) 1)
+             (some e)
+             (some (rebuild form items (without-at pairs i) (. form pos)))
+             )))))
+
+;; `(let pairs body..)` with `pairs` for the bindings.
+(defun rebuild :private (form: Stx items: (Vec Stx) pairs: (Vec Stx) pos: Pos) -> Stx
+  (Stx (SList (loop ((i 2) (out [(nth items 0) (list-form pairs (. (nth items 1) pos))]))
+                (if (< i (count items)) (recur (+ i 1) (conj out (nth items i))) out)))
+       pos))
+
+(defun replace-at :private (v: (Vec Stx) at: i64 x: Stx) -> (Vec Stx)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count v)) (recur (+ i 1) (conj out (if (= i at) x (nth v i)))) out)))
+
+(defun without-at :private (v: (Vec Stx) at: i64) -> (Vec Stx)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count v)) (recur (+ i 1) (if (= i at) out (conj out (nth v i)))) out)))
+
+;; A `let` with every binding that can be folded folded, first to last.
+(defun fold-let :private (env: FuseEnv form: Stx) -> Stx
+  (let ((items (fuse-list-items form)))
+    (if (< (count items) 3)
+        form
+        (let ((pairs (fuse-list-items (nth items 1))))
+          (match (first-fold env form items pairs 0)
+            (nil form)
+            ((some folded) (fold-let-again env folded)))))))
+
+;; The result of folding, folded again; a `let` that folded to its body is not one.
+(defun fold-let-again :private (env: FuseEnv form: Stx) -> Stx
+  (if (= (head-name form) (some "let")) (fold-let env form) form))
+
+(defun first-fold :private (env: FuseEnv form: Stx items: (Vec Stx) pairs: (Vec Stx) i: i64) -> (Option Stx)
+  (if (>= i (count pairs))
+      nil
+      (match (fold-at env form items pairs i)
+        ((some f) (some f))
+        (nil (first-fold env form items pairs (+ i 1))))))
+
+;; `items` with each folded.
+(defun fold-items :private (env: FuseEnv items: (Vec Stx)) -> (Vec Stx)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count items)) (recur (+ i 1) (conj out (fuse-lets env (nth items i)))) out)))
+
+;; `form` with every `let` in it folded (the operand of a `quote` is data).
+(defun fuse-lets (env: FuseEnv form: Stx) -> Stx
+  (match (. form kind)
+    ((SList items)
+     (if (= (head-name form) (some "quote"))
+         form
+         (let ((inner (Stx (SList (fold-items env items)) (. form pos))))
+           (if (= (head-name inner) (some "let")) (fold-let env inner) inner))))
+    ((SVec items) (Stx (SVec (fold-items env items)) (. form pos)))
+    ((SMap items) (Stx (SMap (fold-items env items)) (. form pos)))
+    (_ form)))

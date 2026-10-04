@@ -1,0 +1,41 @@
+;; spec:   stdlib §2.1 rule 2 (the let rule moves no effect), P2 of performance batch 3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: map filter sum vec
+;; The let rule folds a binding into the call that reads it only when every other argument of that call is
+;; a symbol, a literal or a `fn`: the binding's own evaluation then moves past nothing that has an effect.
+;; A binding whose reader has an argument with an effect (here the `fm` and `fp` calls, which log when
+;; they are evaluated) is left bound, so the log is the order of the program as written: the binding's
+;; expression first, then the reader's arguments. Each source and function logs once.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun note (log: (Cell (Vec i64)) n: i64) -> unit (set! log (conj @log n)))
+
+(defun fm (log: (Cell (Vec i64)) n: i64) -> (fn (i64) i64) (do (note log n) (fn (x) (* x 2))))
+(defun fp (log: (Cell (Vec i64)) n: i64) -> (fn (i64) bool) (do (note log n) (fn (x) (> x 2))))
+(defun src (log: (Cell (Vec i64)) n: i64) -> (Vec i64) (do (note log n) [1 2 3 4]))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (log (cell (vec-empty))))
+    (do (let ((s (src log 1))
+              (m (map (fm log 2) s)))
+          (check c (= (sum m) 20)))
+        (check c (= @log [1 2]))
+        (set! log (vec-empty))
+        (let ((s (src log 1))
+              (m (map (fm log 2) s))
+              (f (filter (fp log 3) m)))
+          (check c (= (vec f) [4 6 8])))
+        (check c (= @log [1 2 3]))
+        (set! log (vec-empty))
+        ;; the argument of the reader is atomic: the binding is folded, and runs once, as before
+        (let ((p (fn (x: i64) (> x 2)))
+              (s (src log 1))
+              (f (filter p s)))
+          (check c (= (vec f) [3 4])))
+        (check c (= @log [1]))
+        (checks-result c))))
