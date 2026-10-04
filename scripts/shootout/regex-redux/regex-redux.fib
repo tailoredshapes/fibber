@@ -1,7 +1,7 @@
 ;; regex-redux, the Computer Language Benchmarks Game: read a FASTA file from stdin, strip the header lines and
 ;; the newlines with a regex, count the matches of nine IUPAC variants of the pattern agggtaaa|tttaccct,
 ;; apply five substitutions one after the other, print the counts and the three lengths.
-;; The text is read as bytes (fib.unix fd-read, 64 KB blocks) and made one `str`; the regex is fib.regex.
+;; The text is read as bytes (fib.unix fd-read, 64 KB blocks) and made one `str`; the regex is fib.regex, the patterns are `#".."` literals (made at compile time).
 (ns main (:use fib.regex) (:require [fib.unix :as unix]))
 
 (defun read-chunks (fd: i64 chunks: (Vec (Array i8)) total: i64) -> (Pair (Vec (Array i8)) i64)
@@ -26,33 +26,36 @@
   (let [r (read-chunks unix/stdin (vec-empty) 0)]
     (str-from-bytes (join-chunks (. r fst) (. r snd)))))
 
-(defun variant-patterns () -> (Vec str)
-  ["agggtaaa|tttaccct"
-   "[cgt]gggtaaa|tttaccc[acg]"
-   "a[act]ggtaaa|tttacc[agt]t"
-   "ag[act]gtaaa|tttac[agt]ct"
-   "agg[act]taaa|ttta[agt]cct"
-   "aggg[acg]aaa|ttt[cgt]ccct"
-   "agggt[cgt]aa|tt[acg]accct"
-   "agggta[cgt]a|t[acg]taccct"
-   "agggtaa[cgt]|[acg]ttaccct"])
+(def strip: Regex #">.*\n|\n")
 
-(defun substitutions () -> (Vec (Pair str str))
-  [(Pair "tHa[Nt]" "<4>")
-   (Pair "aND|caN|Ha[DS]|WaS" "<3>")
-   (Pair "a[NSt]|BY" "<2>")
-   (Pair "<[^>]*>" "|")
-   (Pair "\\|[^|][^|]*\\|" "-")])
+;; the nine IUPAC variants of agggtaaa|tttaccct: regex literals, made by the compiler as static data
+(def variants: (Vec Regex)
+  [#"agggtaaa|tttaccct"
+   #"[cgt]gggtaaa|tttaccc[acg]"
+   #"a[act]ggtaaa|tttacc[agt]t"
+   #"ag[act]gtaaa|tttac[agt]ct"
+   #"agg[act]taaa|ttta[agt]cct"
+   #"aggg[acg]aaa|ttt[cgt]ccct"
+   #"agggt[cgt]aa|tt[acg]accct"
+   #"agggta[cgt]a|t[acg]taccct"
+   #"agggtaa[cgt]|[acg]ttaccct"])
+
+(def substitutions: (Vec (Pair Regex str))
+  [(Pair #"tHa[Nt]" "<4>")
+   (Pair #"aND|caN|Ha[DS]|WaS" "<3>")
+   (Pair #"a[NSt]|BY" "<2>")
+   (Pair #"<[^>]*>" "|")
+   (Pair #"\|[^|][^|]*\|" "-")])
 
 (defun main () -> i64
   (let [input (read-stdin)
         ilen (str-len input)
-        seq (replace-all (re-pattern ">.*\n|\n") input "")
+        seq (replace-all strip input "")
         clen (str-len seq)]
-    (do (doseq [p (variant-patterns)]
-          (println p (re-count (re-pattern p) seq)))
-        (let [final (reduce (fn (s: str sub: (Pair str str)) (replace-all (re-pattern (. sub fst)) s (. sub snd)))
-                            seq (substitutions))]
+    (do (doseq [r variants]
+          (println (pattern-of r) (re-count r seq)))
+        (let [final (reduce (fn (s: str sub: (Pair Regex str)) (replace-all (. sub fst) s (. sub snd)))
+                            seq substitutions)]
           (do (println)
               (println ilen)
               (println clen)

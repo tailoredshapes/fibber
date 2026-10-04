@@ -1,0 +1,101 @@
+;; compiler/expand/regex.fib: the regex literal `#"..."` (stdlib §4.9, syntax §1.1). The reader reads it as `(fib.prelude/re "...")`;
+;; after a top-level form is expanded, each such form in it is replaced by the name of a `:private` `def` placed before the form,
+;; `(def re$N :private (fib.regex.api/re-pattern "..."))`, whose initialiser the compiler evaluates at compile time as static data
+;; (types §3.5 `constant?`, syntax §3.19, X8): the pattern is parsed and compiled once, by the compiler, and the program holds the
+;; finished `Regex` as an immortal constant, so a literal costs nothing at run time and is shared by every task.
+;;
+;; The pattern is checked here, with the library's own parser (`fib.regex.api/try-re-pattern`, linked into the compiler): a bad
+;; one is `malformed regex literal: MESSAGE` at the literal. A literal inside `quote` or a `defmacro` is data or macro-time code and
+;; is left alone.
+(ns expand.regex
+  (:require [fib.regex.api :as rx])
+  (:use syntax.pos syntax.form expand.error expand.ctx))
+
+;; What a form became: the form and the `def`s it needs, each to be placed before it.
+(defstruct Hoisted (form: Stx defs: (Vec Stx)))
+
+(def re-head: str "fib.prelude/re")
+
+;; the module whose `re-pattern` the defs call: a module with a literal requires it under its full name
+(def regex-module: str "fib.regex.api")
+
+;; The defs made so far for the literals of one form.
+(defstruct Acc (defs: (Cell (Vec Stx))))
+
+;; Whether `items` is a regex literal `(fib.prelude/re "text")`; the text.
+(defun literal-text :private (items: (Vec Stx)) -> (Option str)
+  (if (= (count items) 2)
+      (match (. (nth items 0) kind)
+        ((SSym h) (if (= h re-head)
+                      (match (. (nth items 1) kind) ((SStr s) (some s)) (_ nil))
+                      nil))
+        (_ nil))
+      nil))
+
+(defun skipped? :private (items: (Vec Stx)) -> bool
+  (if (> (count items) 0)
+      (match (. (nth items 0) kind)
+        ((SSym h) (or (= h "quote") (= h "defmacro")))
+        (_ false))
+      false))
+
+(defun any-literal? :private (items: (Vec Stx)) -> bool
+  (loop ((i 0))
+    (cond (>= i (count items)) false
+          (has-literal? (nth items i)) true
+          :else (recur (+ i 1)))))
+
+;; Whether a regex literal is in the form (outside `quote` and `defmacro`).
+(defun has-literal? (f: Stx) -> bool
+  (match (. f kind)
+    ((SList items) (cond (some? (literal-text items)) true
+                         (skipped? items) false
+                         :else (any-literal? items)))
+    ((SVec items) (any-literal? items))
+    ((SMap items) (any-literal? items))
+    (_ false)))
+
+(defun sym :private (name: str pos: Pos) -> Stx (Stx (SSym name) pos))
+
+;; The name of the next def: `re$N` for the context's next gensym number.
+(defun fresh-name :private (ctx: ExpandCtx pos: Pos) -> str
+  (do (ctx-gensym ctx "re" pos)
+      (str-join ["re$" (show (ctx-gensym-count ctx))])))
+
+;; The reference to the def of the literal `text` at pos; the def is added to `acc`. A pattern the library refuses is the error.
+(defun hoist-literal :private (ctx: ExpandCtx acc: Acc text: str pos: Pos) -> (Result Stx ExpandError)
+  (match (rx/try-re-pattern text)
+    ((Err msg) (Err (malformed-error "regex literal" (str-join [msg " in #\"" text "\""]) pos)))
+    ((Ok _)
+     (let ((name (fresh-name ctx pos)))
+       (do (set! (. acc defs) (conj @(. acc defs) (Stx (SList [(sym "def" pos) (sym name pos) (Stx (SKw "private") pos)
+                                              (Stx (SList [(sym "fib.regex.api/re-pattern" pos) (Stx (SStr text) pos)]) pos)])
+                                       pos)))
+           (Ok (sym name pos)))))))
+
+(defun hoist-items :private (ctx: ExpandCtx acc: Acc items: (Vec Stx)) -> (Result (Vec Stx) ExpandError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count items))
+        (try-let ((x (hoist-form ctx acc (nth items i))))
+          (recur (+ i 1) (conj out x)))
+        (Ok out))))
+
+(defun hoist-form :private (ctx: ExpandCtx acc: Acc f: Stx) -> (Result Stx ExpandError)
+  (if (not (has-literal? f))
+      (Ok f)
+      (match (. f kind)
+        ((SList items)
+         (match (literal-text items)
+           ((some text) (hoist-literal ctx acc text (. f pos)))
+           (nil (try-let ((xs (hoist-items ctx acc items))) (Ok (Stx (SList xs) (. f pos)))))))
+        ((SVec items) (try-let ((xs (hoist-items ctx acc items))) (Ok (Stx (SVec xs) (. f pos)))))
+        ((SMap items) (try-let ((xs (hoist-items ctx acc items))) (Ok (Stx (SMap xs) (. f pos)))))
+        (_ (Ok f)))))
+
+;; The form with each regex literal replaced by the name of a def, and those defs.
+(defun hoist-literals (ctx: ExpandCtx f: Stx) -> (Result Hoisted ExpandError)
+  (if (has-literal? f)
+      (let ((acc (Acc (cell (vec-empty)))))
+        (try-let ((g (hoist-form ctx acc f)))
+          (Ok (Hoisted g @(. acc defs)))))
+      (Ok (Hoisted f (vec-empty)))))

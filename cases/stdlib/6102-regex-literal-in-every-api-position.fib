@@ -1,0 +1,62 @@
+;; spec:   stdlib §4.9 (the row `#"regex"`), syntax §1.1 (the regex literal), §3.19 (a def made at compile time)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: re-find re-matches re-seq re-groups replace-all replace-first re-count str/split
+;; A `#"..."` literal in every position of the API, and agreeing with `re-pattern` of the same text. The reader gives `#"\d+"` the
+;; pattern `\d+` (Clojure's rule: a backslash in a regex literal stays a backslash), `#"a\"b"` the pattern `a\"b`.
+;; The module does not require fib.regex.api itself: a literal makes the module require it.
+(ns main (:use fib.core fib.seq fib.coll fib.regex tl.check) (:require [fib.string :as str]))
+
+(defun spans (ms: (Vec Match)) -> (Vec (Pair i64 i64))
+  (mapv (fn (m: Match) (Pair (. m start) (. m end))) ms))
+
+;; the same answer from the literal and from the pattern made at run time, on a text
+(defun agree (lit: Regex s: str) -> bool
+  (let [dyn (re-pattern (pattern-of lit))]
+    (and (= (spans (re-seq lit s)) (spans (re-seq dyn s)))
+         (= (re-count lit s) (re-count dyn s))
+         (= (replace-all lit s "<$0>") (replace-all dyn s "<$0>")))))
+
+(defun whole-of (o: (Option Match)) -> str (match o (nil "") ((some m) (. m whole))))
+
+(defun main () -> i64
+  (let [c (checks)
+        long (str (str/join "" (repeat 40 "xy1 ab-12 ")) "a" "ababababababab" "c")]
+    (do ;; the pattern text of a literal: the backslash stays
+        (check c (= (pattern-of #"\d+") "\\d+"))
+        (check c (= (pattern-of #"a\"b") "a\\\"b"))
+        (check c (= (pattern-of #"") ""))
+        (check c (some? (re-find #"a\"b" "xa\"by")))
+        ;; re-find, with groups and without
+        (check c (= (whole-of (re-find #"\d+" "ab 12-345")) "12"))
+        (check c (= (match (re-find #"(\d+)-(\d+)" "ab 12-345 x") (nil []) ((some m) (re-groups m))) [(some "12-345") (some "12") (some "345")]))
+        (check c (not (some? (re-find #"[A-Z]" "abc"))))
+        ;; re-matches
+        (check c (some? (re-matches #"\d+-\d+" "12-345")))
+        (check c (not (some? (re-matches #"\d+" "12-345"))))
+        ;; re-seq
+        (check c (= (spans (re-seq #"\w+" "ab cd  e")) [(Pair 0 2) (Pair 3 5) (Pair 7 8)]))
+        ;; re-groups and re-group
+        (check c (= (match (re-find #"(a)|(b)" "b") (nil []) ((some m) (re-groups m))) [(some "b") nil (some "b")]))
+        (check c (= (match (re-find #"(\w)(\d)?" "a") (nil nil) ((some m) (re-group m 2))) nil))
+        ;; replace-all, replace-first, re-count
+        (check c (= (replace-all #"(\w)(\d)" "a1 b2" "$2$1") "1a 2b"))
+        (check c (= (replace-first #"\d" "a1 b2" "#") "a# b2"))
+        (check c (= (re-count #"a" "banana") 3))
+        ;; split, and replace, through Pattern
+        (check c (= (str/split "a1b22c" #"\d+") ["a" "b" "c"]))
+        ;; the literal and re-pattern agree on short texts, and on long ones (a lazy DFA, or the Pike VM)
+        (check c (agree #"\d+" "ab 12-345 x"))
+        (check c (agree #"(\w+)@(\w+)" "x@y z@w"))
+        (check c (agree #"a|ab" "abab"))
+        (check c (agree #"\bfoo\b" "a foo b foo_ foo"))
+        (check c (agree #"x*" "é"))
+        (check c (agree #"\d+" long))
+        (check c (agree #"[a-b]+-?\d*" long))
+        (check c (agree #"a[ab]{14}c" long))
+        (check c (agree #"(?:ab)+?c" long))
+        (check c (= (re-count #"a[ab]{14}c" long) 1))
+        (checks-result c))))

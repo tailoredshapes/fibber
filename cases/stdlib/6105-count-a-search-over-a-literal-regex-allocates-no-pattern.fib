@@ -1,0 +1,28 @@
+;; spec:   stdlib §4.9 (the row `#"regex"`: a literal costs nothing at run time), §8.1 item 5 (count cases)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; allocs: <= 12
+;; roots:  ../../lib support
+;; covers: re-count re-find
+;; A search over a `#"..."` literal allocates no pattern: the compiler made the `Regex` as static data, and its DFAs are tables,
+;; so there is no matcher state either. 3000 counts and 3000 finds that matched nothing allocate a handful of objects in all (the
+;; check state), where `re-pattern` at run time allocates dozens per call. The bound is the count: a pattern, a matcher or a Match
+;; per iteration would put it in the thousands.
+(ns main (:use fib.core fib.seq fib.coll fib.regex tl.check))
+
+(defun count-loop (s: str n: i64) -> i64
+  (loop [i 0 acc 0]
+    (if (< i n) (recur (+ i 1) (+ acc (re-count #"[a-c]+\d" s))) acc)))
+
+(defun find-loop (s: str n: i64) -> i64
+  (loop [i 0 acc 0]
+    (if (< i n) (recur (+ i 1) (+ acc (if (some? (re-find #"zz\d" s)) 1 0))) acc)))
+
+(defun main () -> i64
+  (let [c (checks)
+        s "xx ab1 yy cab22 q"]
+    (do (check c (= (count-loop s 3000) 6000))
+        (check c (= (find-loop s 3000) 0))
+        (checks-result c))))
