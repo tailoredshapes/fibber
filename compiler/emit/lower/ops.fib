@@ -2,7 +2,7 @@
 ;; Replaces crates/fibc/src/lower/ops.rs (94 lines of Rust). `value-sites` (ops.rs:14) is in emit.lower.cx, where the context is
 ;; built: a constructor cannot call a module above it.
 (ns emit.lower.ops
-  (:use types.ty types.ast types.init own.program emit.value emit.ir emit.program emit.lower.cx))
+  (:use types.ty types.ast types.init own.program emit.value emit.ir emit.program emit.objects emit.lower.cx))
 
 ;; The value a site names; `nil` for a `def` (immortal: every operation on it is a no-op). Rust: lower/ops.rs:33 Cx::site
 (defun lcx-site (cx: LowerCx s: Site) -> (Result (Option V) str)
@@ -31,7 +31,7 @@
                   ((some v) (match (. op kind)
                               ((OpRetain) (Ok (lcx-retain cx v)))
                               ((OpRelease) (Ok (lcx-release cx v)))
-                              ((OpEndStack) (end-stack cx v)))))))
+                              ((OpEndStack) (end-stack cx v (site-ty cx (. op site)))))))))
             ops))
 
 ;; Rust: lower/ops.rs:69 Cx::retain
@@ -72,13 +72,37 @@
   (when-some (w (lcx-obj-word cx v))
     (fb-stmt (. cx b) (str-join ["(call @fib.release " w ")"]))))
 
+;; The type of the value a site names, when the plan says (a binding or an expression); `nil` for the others.
+(defun site-ty :private (cx: LowerCx s: Site) -> (Option Ty)
+  (match s
+    ((SiteBind b) (match (lcx-binding-ty cx b) ((Ok t) (some t)) ((Err _) nil)))
+    ((SiteValue e) (match (program-ty-of (. cx p) (. cx inst) e) ((Ok t) (some t)) ((Err _) nil)))
+    (_ nil)))
+
+;; The inline drop of a stack cell `w` of type `t`: the release of its one counted slot, which is what `drop.N` queues, without the
+;; worklist and the indirect call of `fib.drop-fields` (the cell idiom of the library makes one per update). A cell of a scalar or of
+;; unit holds nothing to release. Gives false when `t` is not a cell: the caller drops through the type record.
+(defun end-cell :private (cx: LowerCx w: str t: Ty) -> (Result bool str)
+  (match t
+    ((TCon (KCell) args)
+     (try-let ((o (program-object (. cx p) t)) (l (program-lir (. cx p) (nth args 0))))
+       (match l
+         ((some lt)
+          (do (when (or (= lt LirPtr) (= lt LirDyn))
+                (lcx-release cx (lcx-load cx lt (lcx-gep cx (. o snd) w slot-cell-value))))
+              (Ok true)))
+         (nil (Ok true)))))
+    (_ (Ok false))))
+
 ;; The end of a stack object's scope (§6.11): its inline drop; a stack closure holds only aliases, so there is nothing to release.
 ;; Rust: lower/ops.rs:84 Cx::end_stack
-(defun end-stack :private (cx: LowerCx v: V) -> (Result unit str)
+(defun end-stack :private (cx: LowerCx v: V ty: (Option Ty)) -> (Result unit str)
   (match (lcx-obj-word cx v)
     (nil (Err "the plan ends a scalar as a stack object"))
     ((some w)
      (do (fb-stmt (. cx b) (str-join ["(call @fib.stack-end " w ")"]))
-         (when (not (contains? @(. cx closure-slots) w))
-           (fb-stmt (. cx b) (str-join ["(call @fib.drop-fields " w ")"])))
-         (Ok ())))))
+         (if (contains? @(. cx closure-slots) w)
+             (Ok ())
+             (try-let ((done (match ty (nil (Ok false)) ((some t) (end-cell cx w t)))))
+               (do (when (not done) (fb-stmt (. cx b) (str-join ["(call @fib.drop-fields " w ")"])))
+                   (Ok ()))))))))
