@@ -60,3 +60,39 @@ fn the_worker_marks_how_far_a_module_got() {
         "{err}"
     );
 }
+
+#[test]
+fn keep_writes_every_mutant_as_a_file() {
+    let dir = std::env::temp_dir().join(format!("lair-fuzz-keep-{}", std::process::id()));
+    let out_dir = dir.join("findings");
+    let keep = dir.join("kept");
+    let (ok, out, _) = lair(&[
+        "fuzz",
+        "--count",
+        "12",
+        "--seed",
+        "7",
+        "-o",
+        &out_dir.to_string_lossy(),
+        "--keep",
+        &keep.to_string_lossy(),
+        "cases/lir",
+    ]);
+    let mut names: Vec<String> = std::fs::read_dir(&keep)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let first = std::fs::read_to_string(keep.join("seed7-m0.lir")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(ok, "{out}");
+    assert_eq!(names.len(), 12, "{names:?}");
+    assert!(names.contains(&"seed7-m11.lir".to_string()), "{names:?}");
+    assert!(
+        first.contains("(define") || first.contains("(declare"),
+        "{first}"
+    );
+}

@@ -11,8 +11,9 @@ const USAGE: &str = "usage:
   lair run [-O n] FILE.lir [ARGS..]
   lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
   lair emit-llvm FILE.lir
+  lair dump-ast FILE.lir
   lair cases DIR..
-  lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [-v] [--print N] DIR..
+  lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
   lair fuzz-one [-O n] FILE.lir";
 
 pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
@@ -22,6 +23,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         "run" => run(rest),
         "build" => build(rest),
         "emit-llvm" => emit_llvm(rest),
+        "dump-ast" => dump_ast(rest),
         "cases" => cases(rest),
         "fuzz" => fuzz(rest),
         "fuzz-one" => fuzz_one(rest),
@@ -49,6 +51,17 @@ fn emit_llvm(rest: &[String]) -> Result<ExitCode, String> {
         "{}",
         lair::emit_llvm(&read(file)?, file).map_err(|e| e.render(file))?
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The canonical text of the parsed module (docs/design/lair-ast-dump.md);
+/// it parses but does not check, so it also dumps modules the checker rejects.
+fn dump_ast(rest: &[String]) -> Result<ExitCode, String> {
+    let [file] = rest else {
+        return Err(USAGE.into());
+    };
+    let m = lir::parse(&read(file)?).map_err(|e| e.in_file(file))?;
+    print!("{}", lair::dump::dump(&m));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -187,6 +200,7 @@ fn fuzz(rest: &[String]) -> Result<ExitCode, String> {
         count: 2000,
         timeout: std::time::Duration::from_secs(5),
         out_dir: PathBuf::from("target/lair-fuzz"),
+        keep: None,
         verbose: false,
         opt_level: 0,
     };
@@ -207,6 +221,7 @@ fn fuzz(rest: &[String]) -> Result<ExitCode, String> {
                     std::time::Duration::from_secs(val()?.parse().map_err(|_| "bad --timeout")?)
             }
             "-o" => cfg.out_dir = PathBuf::from(val()?),
+            "--keep" => cfg.keep = Some(PathBuf::from(val()?)),
             "-v" => cfg.verbose = true,
             "-O" => cfg.opt_level = opt_level(&val()?)?,
             "--print" => show = Some(val()?.parse().map_err(|_| "bad --print")?),

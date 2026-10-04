@@ -35,6 +35,9 @@ pub struct Config {
     pub timeout: Duration,
     /// Where a finding's mutant is kept.
     pub out_dir: PathBuf,
+    /// When set, every mutant is also written here as `seedN-mI.lir`
+    /// (the corpus for differential runs), findings or not.
+    pub keep: Option<PathBuf>,
     /// One line per mutant on standard output.
     pub verbose: bool,
     /// LLVM's optimisation level for the worker (0 to 3).
@@ -103,6 +106,9 @@ pub fn run(lair: &Path, corpus: &[Case], cfg: &Config) -> Result<Summary, String
     let scratch = std::env::temp_dir().join(format!("lair-fuzz-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&cfg.out_dir).map_err(|e| e.to_string())?;
+    if let Some(k) = &cfg.keep {
+        std::fs::create_dir_all(k).map_err(|e| format!("{}: {e}", k.display()))?;
+    }
     let next = AtomicUsize::new(0);
     let summary = Mutex::new(Summary::default());
     let workers = std::thread::available_parallelism()
@@ -147,6 +153,12 @@ fn one(
     };
     if let Err(e) = std::fs::write(&file, &src) {
         return Err(finding(format!("cannot write mutant: {e}"), file));
+    }
+    if let Some(k) = &cfg.keep {
+        let kept = k.join(format!("seed{}-m{i}.lir", cfg.seed));
+        if let Err(e) = std::fs::write(&kept, &src) {
+            return Err(finding(format!("cannot keep mutant: {e}"), kept));
+        }
     }
     let file_s = file.to_string_lossy().into_owned();
     let lair_s = lair.to_string_lossy().into_owned();
@@ -211,6 +223,7 @@ mod tests {
             count: 10,
             timeout: Duration::from_secs(1),
             out_dir: PathBuf::new(),
+            keep: None,
             verbose: false,
             opt_level: 0,
         };

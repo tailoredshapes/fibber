@@ -9,6 +9,7 @@
 pub mod aot;
 pub mod capi;
 pub mod cases;
+pub mod dump;
 mod error;
 pub mod fuzz;
 mod jit;
