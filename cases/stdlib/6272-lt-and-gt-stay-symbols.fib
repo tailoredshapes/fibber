@@ -1,0 +1,40 @@
+;; spec:   syntax §1.1 (the vector literal `<<..>>`), docs/design/simd-and-tensors.md 2.3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: <<..>>
+;; Only `<<` followed by a character that starts a form opens a vector literal; `<`, `>`, `<<` and `>>` alone, `<<=` `<<<` `<<>`,
+;; `->>` and a `>>` outside a literal read as the symbols they always were.
+(ns main (:use fib.core tl.check))
+
+;; `shape` shows how the reader read its argument: the head and the elements of a list form, each as the text of its kind and, for a
+;; number, its width. The typing of `(simd ..)` is not under test (the macro's argument is a form, never typed), only the reader.
+(defmacro shape (f)
+  (match f
+    ((List items)
+     (Str (loop ((i 0) (acc ""))
+            (if (< i (vec-count items))
+                (recur (+ i 1)
+                       (str-join [acc " "
+                                  (match (vec-nth items i)
+                                    ((Sym s) s)
+                                    ((Int v w) (str-join [(show v) (cond (= w :i8) "i8" (= w :i16) "i16" (= w :i32) "i32" :else "i64")]))
+                                    ((Flt v w) (str-join [(show v) (if (= w :f32) "f32" "f64")]))
+                                    ((Bool b) (if b "true" "false"))
+                                    ((List xs) (str-join ["(" (show (vec-count xs)) ")"]))
+                                    (_ "?"))]))
+                acc))))
+    (_ (Str "not a list"))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do
+      (check c (= (shape (a < > << >> <<= <<< <<> ->> >>> <=)) " a < > << >> <<= <<< <<> ->> >>> <="))
+      (check c (= (shape (<< 1 2 >>)) " << 1i64 2i64 >>"))
+      (check c (= (shape (<< )) " <<"))
+      (check c (= (shape (>> 1)) " >> 1i64"))
+      (check c (= (shape (x>>y <<1 2>>)) " x>>y (3)"))
+      (check c (= (shape (<<1 2>>f32 >>)) " (3) >>")))
+    (checks-result c)))

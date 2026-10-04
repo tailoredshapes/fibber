@@ -178,6 +178,18 @@ which the rules above leave open:
   escape `\d`, which is an error) and `#"a\"b"` is `a\"b`, the quote after the backslash not ending the literal. No other escape is
   interpreted. An unterminated literal is `UnterminatedString`. The expander gives the form its meaning (stdlib §4.9): a reference to a
   `def` of `(fib.regex.api/re-pattern "..")` that the compiler makes at compile time (§3.19), the pattern checked there.
+- `<<` .. `>>` (SIMD, stage 2 only) is a vector literal: it reads as `(simd e1 .. en)`, the elements being forms (docs/design/simd-and-tensors.md
+  2.3; the typing of `(simd ..)` is not the reader's). A token that starts with `<<` followed by a character that starts a form opens
+  it, except `<` and `=` (so `<<<` and `<<=` stay symbols); `<<` before whitespace, a closing delimiter or the end, a lone `>>`, `<`, `>`
+  and `->>` are the symbols they were. Directly inside the literal a `>>` ends a number, symbol or keyword and closes the literal; inside
+  a list, vector or map nested in it, `>>` is an ordinary symbol constituent. Right after the closer, with nothing between, a suffix
+  `i8 i16 i32 i64 f32 f64` fixes the element type: each element must then be a number literal, read at that width as if written with
+  the suffix (`<<0.1 0.2>>f32` is `(simd 0.1f32 0.2f32)`; an integer for a float width must be exact, a float for an integer width is an
+  error, a literal with another suffix of its own is an error). Read errors, each at the offending element or the whole literal: `EmptySimd`,
+  `TooManySimdLanes` (more than 64 elements), `BadSimdElement` (number literals of different types without a suffix, a string,
+  character, keyword or `nil` element, a bool mixed with numbers, a non-literal under a suffix), `BadSimdSuffix` (a letter after the
+  `>>` that is not one of the six), `UnclosedSimd`, `MismatchedCloseSimd`; an out-of-range element is the usual `IntegerOutOfRange` or
+  `FloatOutOfRange`. The Rust reader (`fibref read`) is frozen and does not read the literal.
 - `#{` .. `}` (E8) reads as `(hash-set ..)`, so `#{1 2}` is `(hash-set 1 2)`;
   an unclosed one is the error `Unclosed` for `{`.
 - `UnknownDispatch`'s message is `unknown reader syntax #X: only #_, #(, #{ are defined`;
