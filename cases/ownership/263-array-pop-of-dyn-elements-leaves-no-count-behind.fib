@@ -1,0 +1,17 @@
+;; spec:   design/in-place-update.md §2 (array-pop!), §6 T8
+;; expect: accept
+;; result: 8
+;; audit:  clean
+;; An array of `dyn` values: `array-pop!` moves the last element out of the array. The slot lies beyond the new length and is never
+;; released again, so a pop that also retains the element (as `array-take!` must, for the slot stays inside the length) leaves one count
+;; behind per pop, and the audit reports a leak. Both the unique array and the shared one (the pop acts on a copy) are popped.
+(defstruct Named (s: str))
+(impl Show Named (show (self) (. self s)))
+
+(defun main () -> i64
+  (let ((a (cell (array 2 (dyn Show (Named "abcd"))))))
+    (do (array-set! &a 1 (dyn Show (Named "wxyz")))
+        (let ((keep @a)
+              (p (array-pop! &a))
+              (q (array-pop! &a)))
+          (+ (str-len (show p)) (str-len (show q)))))))

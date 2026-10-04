@@ -244,7 +244,8 @@
               (fb-stmt b (str-join ["(store " (v-text (fb-val b (str-join ["(add " (v-text n) " (i64 1))"]) LirI64)) " " lp ")"]))
               (Ok VUnit)))))))
 
-;; `(array-pop! &a)`: the last element, moved out of a unique array, else out of a copy; traps on an empty one.
+;; `(array-pop! &a)`: the last element, moved out of a unique array, else out of a copy; traps on an empty one. The slot lies beyond
+;; the new length and is never released, so the element keeps its count (a dyn too: retaining it would leak one count per pop).
 (defun array-pop :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
   (try-let ((arr (array-own cx r cell-ty a false)))
     (let ((b (. cx b)) (lp (array-len-ptr cx r arr)) (lo (fb-label b "popok")) (lt (fb-label b "popempty")))
@@ -258,7 +259,6 @@
               (let ((ep (fb-val b (elem-ptr r (v-text arr) (v-text n1)) LirPtr)))
                 (let ((v (if (. r unit) VUnit (lcx-load cx (. r el) (v-text ep)))))
                   (do (fb-stmt b (str-join ["(store " (v-text n1) " " lp ")"]))
-                      (match (. r el) ((LirDyn) (lcx-retain cx v)) (_ ()))
                       (Ok v))))))))))
 
 ;; `(array-take! &a i)`: element `i` moved out (a null left in its slot), from a unique array or else from a copy.
