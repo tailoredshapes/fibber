@@ -15,7 +15,7 @@
         types.ast types.decls types.names types.builtins types.lower.typeform types.lower.scope))
 
 ;; What a call's head names, when it matters for lowering.
-(defenum Special SfDeref SfSet SfNot SfConcat SfSetField SfDyn (SfConvert op: ConvOp))
+(defenum Special SfDeref SfSet SfNot SfConcat SfSetField SfDyn SfSimd SfSplat (SfConvert op: ConvOp))
 
 ;; Whether `(dyn P :send e)`: the keyword right after the protocol.
 (defun dyn-send :private (items: (Vec Stx)) -> bool
@@ -35,7 +35,7 @@
 ;; Rust: lower/call.rs:47 is_primitive_form: whether `name` is a primitive form (§4.3) not
 ;; shadowed locally.
 (defun lw-is-primitive-form (lw: Lowerer name: str) -> bool
-  (and (or (= name "set-field!") (= name "dyn") (str-in conversions name))
+  (and (or (= name "set-field!") (= name "dyn") (= name "simd") (= name "splat") (str-in conversions name))
        (not (lw-is-local lw name))))
 
 ;; Rust: lower/call.rs:53 primitive_value: the error for a primitive form used as a value.
@@ -65,6 +65,8 @@
   (cond (lw-is-primitive-form lw name)
          (cond (= name "set-field!") (some SfSetField)
                (= name "dyn") (some SfDyn)
+               (= name "simd") (some SfSimd)
+               (= name "splat") (some SfSplat)
                :else (match (conv-op name) ((some op) (some (SfConvert op))) (nil nil)))
         (lw-is-local lw name) nil
         :else
@@ -164,9 +166,46 @@
                  (pd (proto-ref (. lw g) (. lw m) (nth items 1) false))
                  (e (lw-sub-expr lw (nth items (- (count items) 1)) false)))
          (Ok (EDyn (. pd fst) (. pd snd) send e)))))
+    ((SfSimd) (simd-form lw items pos))
+    ((SfSplat)
+     (try-let ((_ (arity items pos 2))
+               (ann (type-ann (. lw g) (. lw m) (nth items 1) false))
+               (e (lw-sub-expr lw (nth items 2) false)))
+       (match ann
+         ((ASimd _ (ANat _)) (Ok (ESplat ann e)))
+         (_ (Err (type-error-other (. (nth items 1) pos)
+                   "splat's first operand is a vector type with a known lane count, as f64x4"))))))
     ((SfConvert op)
      (try-let ((_ (arity items pos 2)))
        (convert lw op items)))))
+
+;; `(simd e..)` and `(simd T e..)`, the lanes of a vector (spec/types.md 1.9): `T` is an element type
+;; written first (a symbol that names a scalar and is not a local).
+(defun simd-form :private (lw: Lowerer items: (Vec Stx) pos: Pos) -> (Result ExprKind TypeError)
+  (let ((elem (if (> (count items) 1)
+                  (match (stx-as-sym (nth items 1))
+                    ((some n) (if (lw-is-local lw n) nil (scalar-from-name n)))
+                    (nil nil))
+                  nil)))
+    (let ((first (if (nil? elem) 1 2)))
+      (cond (>= first (count items))
+              (Err (type-error-other pos "a vector literal needs at least one element"))
+            (> (- (count items) first) simd-max-lanes)
+              (Err (type-error-other pos (str-join ["a vector has 1 to " (show simd-max-lanes) " lanes, not "
+                                                    (show (- (count items) first))])))
+            (and (some? elem) (not (simd-elem-scalar? (unwrap-or elem types.ty/SUnit))))
+              (Err (type-error-other (. (nth items 1) pos) "a vector element is an integer width, f32, f64 or bool"))
+            :else
+              (try-let ((es (simd-operands lw items first)))
+                (Ok (ESimd elem es)))))))
+
+(defun simd-operands :private (lw: Lowerer items: (Vec Stx) first: i64) -> (Result (Vec Expr) TypeError)
+  (loop ((i first) (es (vec-empty)))
+    (if (>= i (count items))
+        (Ok es)
+        (match (lw-sub-expr lw (nth items i) false)
+          ((Ok e) (recur (+ i 1) (conj es e)))
+          ((Err e) (Err e))))))
 
 (defun concat-operands :private (lw: Lowerer items: (Vec Stx)) -> (Result (Vec Expr) TypeError)
   (loop ((i 1) (es (vec-empty)))

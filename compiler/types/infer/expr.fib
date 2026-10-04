@@ -12,7 +12,7 @@
 (ns types.infer.expr
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast
         types.decls types.names types.infer.cx types.infer.unify types.infer.solve
-        types.infer.pattern types.infer.call types.infer.truthy))
+        types.infer.pattern types.infer.call types.infer.truthy types.infer.simd))
 
 ;; Rust: infer/expr.rs:39 infer. Infers the type of `e`, recording it.
 ;;
@@ -60,6 +60,8 @@
       ((EDyn p dets send x) (infer-dyn cx p dets send x pos))
       ((EConvert op target x) (infer-convert cx op target x))
       ((EConcat parts) (infer-concat cx parts pos))
+      ((ESimd el es) (infer-simd cx el es pos (fn (c: Cx x: Expr) (cx-infer c x))))
+      ((ESplat ann x) (infer-splat cx ann x pos))
       ((EGuarded clauses) (cx-guarded cx clauses (fn (c: Cx x: Expr) (cx-infer c x))))
       ((EAnd ops) (cx-and cx ops (fn (c: Cx x: Expr) (cx-infer c x))))
       ((EOr ops) (cx-or cx ops (fn (c: Cx x: Expr) (cx-infer c x))))
@@ -318,3 +320,24 @@
                          (_ (cx-unify cx t vt (. p pos))))
                  (recur (+ i 1))))
              (Ok vt)))))))
+
+;; `(splat V x)`: the vector type V, and x one lane of it. A literal adopts the element type
+;; (types.infer.simd); anything else must have it.
+(defun infer-splat :private (cx: Cx ann: TypeAnn x: Expr pos: Pos) -> (Result Ty TypeError)
+  (try-let ((vec (cx-ann cx ann pos)))
+    (match (known-vector cx vec)
+      (nil (Err (type-error-other pos "splat needs a vector type")))
+      ((some ev)
+       (match (adopt-literal cx x vec)
+         ((some r) (try-let ((_ r)) (Ok vec)))
+         (nil (try-let ((tx (cx-infer cx x))
+                        (_ (cx-flow cx tx (. ev fst) (. x pos))))
+                (do (cx-defer cx (DkSimdElem (. ev fst) (lane-count cx (. ev snd))) pos nil)
+                    (Ok vec)))))))))
+
+;; The lane count of a vector type that is written with a number (the check of 512 bits needs it);
+;; 1 when it is a variable of the definition.
+(defun lane-count :private (cx: Cx l: Ty) -> i64
+  (match (store-resolve (. cx st) l)
+    ((TCon (KNat n) _) n)
+    (_ 1)))

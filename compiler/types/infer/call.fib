@@ -10,7 +10,7 @@
 (ns types.infer.call
   (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table
         types.ast types.decls types.annot types.builtins types.infer.cx types.infer.unify
-        types.infer.solve types.infer.inst types.infer.keyword))
+        types.infer.solve types.infer.inst types.infer.keyword types.infer.simd))
 
 ;; A function's signature at a call: parameter types, `&` flags, names.
 (defstruct Sig
@@ -136,7 +136,10 @@
                (sig (cx-signature cx (. head id) r (. head pos))))
        (if-some [sg sig]
          (do (cx-record cx (. head id) (TFn CSend (. sg params) (. sg ret)))
-             (apply-sig cx e sg args infer))
+             (try-let ((ret (apply-sig-for cx e sg args infer (broadcast-op? cx r))))
+               (match (lane-index-error cx r args (. e pos))
+                 ((some err) (Err err))
+                 (nil (Ok ret)))))
          (call-value cx e head args infer))))
     (_ (try-let ((kt (cx-keyword-call cx head args infer)))
          (if-some [t kt] (Ok t) (call-value cx e head args infer))))))
@@ -151,10 +154,51 @@
         (apply-sig cx e
           (Sig params (mapv (fn (a: Arg) false) args)
                (mapv (fn (i: i64) (show (+ i 1))) (range (count args))) ret "the function")
-          args infer)))))
+          args infer false)))))
+
+;; A global's signature at a call. For an operator that broadcasts (`bc`, types.infer.simd), a first
+;; operand that is a literal is applied after its partner when the partner is a vector, so that the
+;; literal sees the vector type: `(+ 1 v)` is `(+ v 1)`.
+(defun apply-sig-for :private (cx: Cx e: Expr sig: Sig args: (Vec Arg) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow bc: bool)
+    -> (Result Ty TypeError)
+  (match (if (and bc (= (count args) 2) (= (count (. sig params)) 2) (literal-arg? (nth args 0)))
+             (match (nth args 1)
+               ((ArgExpr x) (if (literal-lane? x) nil (some x)))
+               (_ nil))
+             nil)
+    (nil (apply-sig cx e sig args infer bc))
+    ((some x)
+     (try-let ((t (infer cx x)))
+       (if (some? (known-vector cx t))
+           (apply-literal-first cx e sig (nth args 0) x t)
+           (apply-sig-inferred cx e sig args x t infer))))))
+
+;; `(op literal v)` with `v : t` a vector: the vector flows first, then the literal adopts its lanes.
+(defun apply-literal-first :private (cx: Cx e: Expr sig: Sig lit: Arg x: Expr t: Ty) -> (Result Ty TypeError)
+  (let ((lits (cell (vec-empty))))
+    (try-let ((_ (cx-flow cx t (nth (. sig params) 1) (. x pos)))
+              (_ (match lit
+                   ((ArgExpr l) (apply-literal cx sig l (nth (. sig params) 0)))
+                   (_ (Ok ())))))
+      (Ok (. sig ret)))))
+
+;; A literal operand against a vector parameter already bound.
+(defun apply-literal :private (cx: Cx sig: Sig l: Expr param: Ty) -> (Result unit TypeError)
+  (match (adopt-literal cx l param)
+    ((some r) (try-let ((_ r)) (Ok ())))
+    (nil (Err (type-error Unify (. l pos) "internal: the literal does not adopt")))))
+
+;; The second operand was inferred to learn whether it is a vector (it is not): the operands go in
+;; their order, the second at the type it has.
+(defun apply-sig-inferred :private (cx: Cx e: Expr sig: Sig args: (Vec Arg) x: Expr t: Ty infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow) -> (Result Ty TypeError)
+  (let ((lits (cell (vec-empty))))
+    (try-let ((_ (apply-arg cx sig 0 (nth args 0) infer lits true))
+              (_ (cx-flow cx t (nth (. sig params) 1) (. x pos)))
+              (_ (unify-lits cx e lits)))
+      (Ok (. sig ret)))))
 
 ;; The arguments against the signature: by count, then one by one.
-(defun apply-sig :private (cx: Cx e: Expr sig: Sig args: (Vec Arg) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow) -> (Result Ty TypeError)
+(defun apply-sig :private (cx: Cx e: Expr sig: Sig args: (Vec Arg) infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow bc: bool) -> (Result Ty TypeError)
   (if (not (= (count (. sig params)) (count args)))
       (Err (type-error-other (. e pos)
              (str-join [(. sig name) " takes " (show (count (. sig params))) " argument(s), got "
@@ -162,7 +206,7 @@
       (let ((lits (cell (vec-empty))))
         (loop ((i 0))
           (if (< i (count args))
-              (try-let ((_ (apply-arg cx sig i (nth args i) infer lits)))
+              (try-let ((_ (apply-arg cx sig i (nth args i) infer lits bc)))
                 (recur (+ i 1)))
               (try-let ((_ (unify-lits cx e lits)))
                 (Ok (. sig ret))))))))
@@ -183,7 +227,7 @@
 
 ;; One argument: an expression flows into its parameter; an `&x` is a cell of
 ;; the parameter's type; the two are not exchangeable.
-(defun apply-arg :private (cx: Cx sig: Sig i: i64 a: Arg infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow lits: (Cell (Vec Ty))) -> (Result unit TypeError)
+(defun apply-arg :private (cx: Cx sig: Sig i: i64 a: Arg infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow lits: (Cell (Vec Ty)) bc: bool) -> (Result unit TypeError)
   (let ((pname (if (< i (count (. sig names))) (nth (. sig names) i) (show (+ i 1))))
         (amp (nth (. sig amps) i))
         (param (nth (. sig params) i)))
@@ -192,8 +236,10 @@
        (if amp
            (Err (type-error AmpPosition (. x pos)
                   (str-join ["parameter " pname " of " (. sig name) " is &; pass &x"])))
-           (try-let ((t (arg-type cx x param infer lits)))
-             (cx-flow cx t param (. x pos)))))
+           (try-let ((t (arg-type cx x param infer lits bc)))
+             (match (cx-flow cx t param (. x pos))
+               ((Ok _) (Ok ()))
+               ((Err err) (Err (if bc (splat-hint cx t param err) err)))))))
       ((ArgAmp b pos)
        (if amp
            (try-let ((t (cx-binding cx b pos)))
@@ -205,7 +251,13 @@
 
 ;; The type of an argument expression: an integer literal adopts a float type it unifies with
 ;; (L19), else it is `i64` (`unify-lits`); the reader makes no difference between `5` and `5i64`.
-(defun arg-type :private (cx: Cx x: Expr param: Ty infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow lits: (Cell (Vec Ty)))
+(defun arg-type :private (cx: Cx x: Expr param: Ty infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow lits: (Cell (Vec Ty)) bc: bool)
+    -> (Result Ty TypeError)
+  (match (if bc (adopt-literal cx x param) nil)
+    ((some r) r)
+    (nil (arg-type-plain cx x param infer lits))))
+
+(defun arg-type-plain :private (cx: Cx x: Expr param: Ty infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow lits: (Cell (Vec Ty)))
     -> (Result Ty TypeError)
   (match (. x kind)
     ((ELit (LitInt n (I64)))

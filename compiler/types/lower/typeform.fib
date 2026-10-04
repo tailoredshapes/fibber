@@ -99,7 +99,113 @@
     (Ok (AScalar s))
     (cond (= name "str") (Ok AStr)
           (and (= name "Self") allow-self) (Ok ASelf)
+          (and (nil? (g-type-name g m name)) (some? (simd-sugar name)))
+            (simd-sugar-type name (. form pos))
           :else (named-type g m name (. form pos)))))
+
+;; ---- lane vectors (spec/types.md 1.9)
+
+;; The number a string of ASCII digits is; nil when it is empty, has another character or is
+;; too long to be a lane count.
+(defun digits-value :private (s: str) -> (Option i64)
+  (let ((bs (str-bytes s)) (n (array-len (str-bytes s))))
+    (if (or (= n 0) (> n 6))
+        nil
+        (loop ((i 0) (v 0))
+          (if (>= i n)
+              (some v)
+              (let ((c (array-get bs i)))
+                (if (and (>= c 48i8) (<= c 57i8))
+                    (recur (+ i 1) (+ (* v 10) (- (sext i64 c) 48)))
+                    nil)))))))
+
+;; `f64x4` and kin: the element scalar and the lane count (nil for the `n` of `f32xn`, the
+;; native count), when `name` is `ELEMENTxCOUNT` with an element type that a vector may have.
+(defun simd-sugar :private (name: str) -> (Option (Pair Scalar (Option i64)))
+  (match (str-find name "x" 0)
+    (nil nil)
+    ((some i)
+     (let ((elem (scalar-from-name (str-slice name 0 i)))
+           (rest (str-slice name (+ i 1) (str-len name))))
+       (match elem
+         (nil nil)
+         ((some s)
+          (cond (not (simd-elem-scalar? s)) nil
+                (= s types.ty/SBool) nil
+                (= rest "n") (some (Pair s nil))
+                :else (match (digits-value rest)
+                        ((some k) (some (Pair s (some k))))
+                        (nil nil)))))))))
+
+(defun simd-sugar-type :private (name: str pos: Pos) -> (Result TypeAnn TypeError)
+  (match (simd-sugar name)
+    ((some sl)
+     (let ((s (. sl fst)))
+       (simd-ann pos (AScalar s) (match (. sl snd) ((some k) (ANat k)) (nil (native-lanes-ann s))))))
+    (nil (resolve-err pos "internal: not a vector type name"))))
+
+;; The lane count of `:native` for an element: the vector width of the target over the element's
+;; width. The target's width is a constant here until the target record exists (SIMD P3).
+(defun native-lanes-ann :private (s: Scalar) -> TypeAnn
+  (ANat (max 1 (quot native-vector-bits (scalar-bits s)))))
+
+;; `(Simd elem lanes)` once both are resolved: the element is an integer width, f32, f64 or bool,
+;; the lane count is 1 to 64 and (but for a mask) the value at most 512 bits.
+(defun simd-ann :private (pos: Pos elem: TypeAnn lanes: TypeAnn) -> (Result TypeAnn TypeError)
+  (let ((bad-elem (match elem
+                    ((AScalar s) (not (simd-elem-scalar? s)))
+                    ((AVar _) false)
+                    (_ true))))
+    (cond bad-elem
+            (resolve-err pos "a vector element is an integer width, f32, f64 or bool")
+          (match lanes
+            ((ANat n) (or (< n 1) (> n simd-max-lanes)))
+            (_ false))
+            (resolve-err pos (str-join ["a vector has 1 to " (show simd-max-lanes) " lanes, not "
+                                        (match lanes ((ANat n) (show n)) (_ "?"))]))
+          (too-wide? elem lanes)
+            (resolve-err pos (str-join ["a vector is at most " (show simd-max-bits) " bits wide"]))
+          :else (Ok (ASimd elem lanes)))))
+
+;; Whether a vector of known element and lane count is wider than 512 bits (a mask is not counted).
+(defun too-wide? :private (elem: TypeAnn lanes: TypeAnn) -> bool
+  (match elem
+    ((AScalar s) (match lanes
+                   ((ANat n) (and (not (= s types.ty/SBool)) (> (* n (scalar-bits s)) simd-max-bits)))
+                   (_ false)))
+    (_ false)))
+
+;; The lane count argument of `(Simd T n)` / `(Mask n)`: a number, `:native` (given the element), or
+;; a variable.
+(defun lanes-arg :private (g: Globals m: i64 f: Stx elem: TypeAnn) -> (Result TypeAnn TypeError)
+  (match (. f kind)
+    ((SInt n _) (Ok (ANat n)))
+    ((SKw k)
+     (if (= k "native")
+         (match elem
+           ((AScalar s) (Ok (native-lanes-ann s)))
+           (_ (resolve-err (. f pos) ":native needs a known element type")))
+         (resolve-err (. f pos) (str-join [(stx-show f) " is not a lane count"]))))
+    ((SSym n)
+     (if (var-name? n)
+         (Ok (AVar n))
+         (resolve-err (. f pos) (str-join [(stx-show f) " is not a lane count"]))))
+    (_ (resolve-err (. f pos) (str-join [(stx-show f) " is not a lane count"])))))
+
+;; `(Simd T n)` and `(Mask n)`.
+(defun simd-type :private (g: Globals m: i64 head: str args: (Vec Stx) form: Stx allow-self: bool)
+    -> (Result TypeAnn TypeError)
+  (let ((pos (. form pos)))
+    (if (= head "Mask")
+        (if (= (count args) 1)
+            (try-let ((l (lanes-arg g m (nth args 0) (AScalar types.ty/SBool))))
+              (simd-ann pos (AScalar types.ty/SBool) l))
+            (resolve-err pos "type Mask takes 1 argument"))
+        (if (= (count args) 2)
+            (try-let ((e (type-ann g m (nth args 0) allow-self))
+                      (l (lanes-arg g m (nth args 1) e)))
+              (simd-ann pos e l))
+            (resolve-err pos "type Simd takes 2 arguments")))))
 
 ;; A symbol that is no scalar, `str` or `Self`: a nominal type of no parameters, or a
 ;; type variable.
@@ -123,6 +229,8 @@
        (match head
          ("fn" (fn-type g m args form allow-self))
          ("dyn" (dyn-type g m args form allow-self))
+         ("Simd" (simd-type g m head args form allow-self))
+         ("Mask" (simd-type g m head args form allow-self))
          (_ (try-let ((anns (arg-anns g m head args allow-self)))
               (applied-type g m head anns (. form pos)))))))))
 

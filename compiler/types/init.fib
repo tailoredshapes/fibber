@@ -101,6 +101,22 @@
        ((Ok _) (Ok ()))
        ((Err e) (Err e))))))
 
+;; The instances of a lane vector `(Simd t n)` (spec/types.md 2.12): `Num` and `Float` for floats, `Num`
+;; and `Bits` for integers, `Eq` and `Show` for every element, each when the element has it. One
+;; instance per protocol at `KSimd`; the context `(P t)` is what keeps a vector of bool from `Num`.
+(defun add-simd-instance :private (g: Globals proto: str) -> (Result unit TypeError)
+  (match (g-proto-name g module-builtin proto)
+    (nil (Err (other-error (str-join ["no builtin protocol " proto]))))
+    ((some p)
+     (match (register-instance g (InstanceDef p KSimd module-builtin ["a" "b"]
+                                              (TCon KSimd [(TGen 0) (TGen 1)]) []
+                                              [(PProto p [(TGen 0)])] [] (builtin-pos)))
+       ((Ok _) (Ok ()))
+       ((Err e) (Err e))))))
+
+(defun simd-instances :private (g: Globals) -> (Result unit TypeError)
+  (try-each (fn (p: str) (add-simd-instance g p)) ["Eq" "Show" "Num" "Float" "Bits"]))
+
 ;; The plain instances of a scalar, in order: `Eq`, `Ord`, `Hash`, `Show`
 ;; for every one, `Num` for the integers and floats, `Float` for the
 ;; floats, `Bits` for the integers (§2.12).
@@ -123,7 +139,8 @@
               (b (add-instance g "Deref" KCell 1 [(TGen 0)]))
               (c (add-instance g "Deref" KAtom 1 [(TGen 0)]))
               (d (add-instance g "Deref" KTask 1 [(TGen 0)])))
-      (add-instance g "Deref" KWeak 1 [opt]))))
+      (try-let ((e (add-instance g "Deref" KWeak 1 [opt])))
+        (simd-instances g)))))
 
 ;; ---- the globals at start
 

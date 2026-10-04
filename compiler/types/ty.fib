@@ -33,6 +33,10 @@
 (defenum Con
   (KScalar scalar: Scalar)
   KStr KArray KCell KAtom KWeak KTask
+  ;; `(Simd T n)`: a lane vector, scalar-class (spec/types.md 1.9). The arguments are the element
+  ;; type and the lane count, which is `(KNat n)` (a type-level natural, so a variable of a
+  ;; definition ranges over lane counts as over types and unification needs no new case).
+  KSimd (KNat n: i64)
   (KNominal type: i64)
   (KDyn proto: i64 send: bool))
 (derive Eq Con) (derive Ord Con) (derive Hash Con)
@@ -104,6 +108,32 @@
 (defun ty-cell (t: Ty) -> Ty (TCon KCell [t]))
 (defun ty-task (t: Ty) -> Ty (TCon KTask [t]))
 (defun ty-nominal (id: i64 args: (Vec Ty)) -> Ty (TCon (KNominal id) args))
+
+;; `(Simd elem lanes)` with `lanes` a type: a `(KNat n)` or a variable.
+(defun ty-simd (elem: Ty lanes: Ty) -> Ty (TCon KSimd [elem lanes]))
+(defun ty-nat (n: i64) -> Ty (TCon (KNat n) []))
+
+;; The element type and the lane count (a type) of a lane vector, when t is one.
+(defun ty-simd-parts (t: Ty) -> (Option (Pair Ty Ty))
+  (match t
+    ((TCon (KSimd) args) (some (Pair (nth args 0) (nth args 1))))
+    (_ nil)))
+
+;; The element types a lane vector may have: the integer widths, f32, f64 and bool (a mask).
+(defun simd-elem-scalar? (s: Scalar) -> bool
+  (or (scalar-is-int s) (scalar-is-float s) (= s SBool)))
+
+;; The most lanes of a vector and the most bits of its value (spec/types.md 1.9).
+(def simd-max-lanes: i64 64)
+
+;; The vector width `:native` and `f32xn` stand for. Until the target record exists (SIMD P3) this is
+;; the width of AVX2, the host this was designed on; a wrong choice costs speed, never results.
+(def native-vector-bits: i64 256)
+(def simd-max-bits: i64 512)
+
+;; The width of a scalar in bits (the element types of a lane vector only; 1 for bool).
+(defun scalar-bits (s: Scalar) -> i64
+  (match s ((SI8) 8) ((SI16) 16) ((SI32) 32) ((SI64) 64) ((SF32) 32) ((SF64) 64) (_ 1)))
 
 ;; A colour in a type-argument position: a function type with no
 ;; parameters and the colour.
