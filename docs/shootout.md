@@ -1,0 +1,41 @@
+# The language shootout
+
+The ten programs of the Computer Language Benchmarks Game (binary-trees, fannkuch-redux, fasta, k-nucleotide,
+mandelbrot, n-body, pidigits, regex-redux, reverse-complement, spectral-norm) in fibber, Java, Clojure and C.
+The owner's hope: comparable to Java. Whilst all benchmarks are stupid, this one at least gives some idea of
+performance. Programs and runner: [scripts/shootout/](../scripts/shootout/README.md). Gaps that benchmark
+authors hit in fibber: [docs/shootout/gaps.md](shootout/gaps.md).
+
+## Rules
+
+1. The same algorithm as the published description of the benchmark in every language (binary-trees allocates its
+   trees, no pooling; n-body uses the standard energy output; mandelbrot writes the P4 bitmap).
+2. Idiomatic, reasonably optimised code in each language: Java as a good Java programmer writes it (primitives,
+   arrays, no frameworks); Clojure as a strong Clojure programmer writes it (type hints, zero reflection warnings,
+   primitive math, `loop`/`recur`, primitive arrays, deftype with mutable primitive fields, transients;
+   single-threaded; `java.util` classes where Java uses them); fibber as a good fibber programmer writes it: the
+   library's own tools, and no `unsafe` or raw pointers, since memory safety is the point.
+3. Output is byte-identical in all four languages at the same N; the md5 for each size is in the benchmark's
+   `sizes.txt`, and any mismatch is a FAIL row with no number. Where the published reference output is known
+   (n-body 50000000: `-0.169075164`, `-0.169059907`; spectral-norm 5500: `1.274224153`; fannkuch-redux 12: `3968050`
+   and `Pfannkuchen(12) = 65`) the programs must agree with it.
+4. Single-threaded algorithm versions first.
+5. No stdin or stdout shortcuts: read and write through what the language offers.
+6. What fibber lacks is recorded in the gaps file, not worked around in a way that distorts the comparison.
+
+## Measuring
+
+Every timed run holds `flock /tmp/fibsuite.lock`; fibber runs under `ulimit -v 16000000`; elapsed wall seconds,
+user CPU seconds and peak RSS from `/usr/bin/time`; the median of 5 runs at the small size and 3 at the full size.
+Java and Clojure use default JVM flags. The Clojure column shows two numbers: the wall time of the whole process
+(JVM start-up and loading `clojure.core` included, as the Benchmarks Game reports it; this is the headline ratio)
+and the in-program time of the computation proper (the honest language-speed ratio). The hello-world baselines
+below the table give the start-up of each runtime. Details: [scripts/shootout/README.md](../scripts/shootout/README.md).
+
+Regenerate this section with `scripts/shootout/report.sh` (add `--size small,full` for both sizes).
+
+## Results
+
+<!-- shootout:results:begin -->
+No results yet: run `scripts/shootout/report.sh`.
+<!-- shootout:results:end -->
