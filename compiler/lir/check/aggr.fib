@@ -1,29 +1,173 @@
-;; compiler/lir/check/aggr.fib: struct literals, vector operations and aggregates (spec/lir.md 3, 6.4; crates/lir/src/check/aggr.rs). OWNER: package K2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/aggr.fib: struct literals, vector operations and aggregates (spec/lir.md 3, 6.4; crates/lir/src/check/aggr.rs). OWNER: package K2.
 
 (ns lir.check.aggr
-  (:use lir.diag lir.types lir.lit lir.ast lir.check.fcx))
+  (:use lir.diag lir.types lir.lit lir.ast lir.check.env lir.check.fcx))
 
+
+;; The unsigned decimal text of a word (a lane read as unsigned, as Rust prints a u128).
+(defun u64-str (n: i64) -> str
+  (if (< n 0) (lit-str (LLit 0 n)) (str n)))
+
+;; The first field whose type differs from the wanted one, as an error in the Rust's words; fields are typed in order.
+(defun literal-fields :private (fcx: Fcx ty: LType what: str fields: (Vec LExpr) want: (Vec LType) pos: i64) -> (Result unit Diagnostic)
+  (loop ((i 0))
+    (if (>= i (count fields))
+        (Ok ())
+        (match (fcx-val fcx (nth fields i))
+          ((Err d) (Err d))
+          ((Ok got)
+           (if (= got (nth want i))
+               (recur (+ i 1))
+               (err (. (nth fields i) pos)
+                    (str (type-str ty) " literal: " what " " (+ i 1) " has type " (type-str got) ", expected " (type-str (nth want i))))))))))
+
+;; The types of every expression, typed left to right, or the first error.
+(defun val-types :private (fcx: Fcx es: (Vec LExpr)) -> (Result (Vec LType) Diagnostic)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count es))
+        (Ok out)
+        (match (fcx-val fcx (nth es i))
+          ((Err d) (Err d))
+          ((Ok t) (recur (+ i 1) (conj out t)))))))
+
+;; The fields of a named struct the environment holds (the name was validated).
+(defun struct-fields :private (fcx: Fcx n: str) -> (Vec LType)
+  (match (get (. (. fcx env) structs) n) ((some fs) fs) (nil [])))
 
 ;; (aggr.rs `struct_literal`)
 (defun check-struct-literal (fcx: Fcx name: (Option str) fields: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.aggr check-struct-literal"))
+  (match name
+    (nil (try-let ((tys (val-types fcx fields))) (Ok (TAnon tys))))
+    ((some n)
+     (let ((ty (TNamed n)))
+       (try-let ((valid (fcx-valid fcx ty pos)))
+         (let ((want (struct-fields fcx n)))
+           (if (!= (count want) (count fields))
+               (err pos (str (type-str ty) " literal: " (count want) " fields expected, found " (count fields)))
+               (try-let ((ok (literal-fields fcx ty "field" fields want pos)))
+                 (Ok ty)))))))))
 
 ;; (aggr.rs `array_literal`)
 (defun check-array-literal (fcx: Fcx ty: LType elems: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.aggr check-array-literal"))
+  (try-let ((valid (fcx-valid fcx ty pos)))
+    (match ty
+      ((TArray _ elem)
+       (try-let ((ok (literal-fields fcx ty "element" elems (vec (repeat (count elems) elem)) pos)))
+         (Ok ty)))
+      (_ (err pos "not an array type")))))
+
+;; Whether the literal is a valid index below `n`: not negative, and less than n.
+(defun index-below? :private (i: LLit n: i64) -> bool
+  (and (not (lit-negative? i)) (lit-lt? i (lit-of n))))
 
 ;; One constant index step into an aggregate; also used by getelementptr. (aggr.rs `step`)
 (defun check-step (fcx: Fcx op: str cur: LType i: LLit pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.aggr check-step"))
+  (match cur
+    ((TArray n elem)
+     (if (index-below? i n)
+         (Ok elem)
+         (err pos (str op ": index " (lit-str i) " out of range for " (type-str cur)))))
+    (_
+     (match (env-fields (. fcx env) cur)
+       (nil (err pos (str op ": cannot index into " (type-str cur))))
+       ((some fields)
+        (if (index-below? i (count fields))
+            (Ok (nth fields (match (lit->i64 i) ((some k) k) (nil 0))))
+            (err pos (str op ": field index " (lit-str i) " out of range for " (type-str cur)))))))))
+
+;; The vector type of an operand, or `OP needs a vector`.
+(defun vector-of :private (fcx: Fcx op: str v: LExpr pos: i64) -> (Result LType Diagnostic)
+  (try-let ((t (fcx-val fcx v)))
+    (match t
+      ((TVector _ _) (Ok t))
+      (_ (err pos (str op " needs a vector, found " (type-str t)))))))
+
+(defun lane-count :private (vt: LType) -> i64
+  (match vt ((TVector n _) n) (_ 0)))
+
+;; The index operand of a lane operation: an integer, and when a literal, below the lane count.
+(defun lane-index :private (fcx: Fcx op: str i: LExpr vt: LType pos: i64) -> (Result unit Diagnostic)
+  (try-let ((ti (fcx-val fcx i)))
+    (if (not (type-int? ti))
+        (err pos (str op " index must be an integer, found " (type-str ti)))
+        (match (. i kind)
+          ((KInt t v)
+           (match t
+             ((TInt b)
+              (let ((u (lit-low v b)))
+                (if (u64-lt u (lane-count vt))
+                    (Ok ())
+                    (err pos (str "vector index " (u64-str u) " out of range for " (type-str vt))))))
+             (_ (Ok ()))))
+          (_ (Ok ()))))))
 
 ;; `extractelement insertelement shufflevector`. (aggr.rs `vector_op`)
 (defun check-vector-op (fcx: Fcx e: LExpr) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.aggr check-vector-op"))
+  (let ((pos (. e pos)))
+    (match (. e kind)
+      ((KExtractElement v i)
+       (try-let ((vt (vector-of fcx "extractelement" v pos))
+                 (ok (lane-index fcx "extractelement" i vt pos)))
+         (Ok (type-scalar vt))))
+      ((KInsertElement v x i)
+       (try-let ((vt (vector-of fcx "insertelement" v pos))
+                 (tx (fcx-val fcx x))
+                 (same (fcx-same fcx "insertelement" 2 tx (type-scalar vt) pos))
+                 (ok (lane-index fcx "insertelement" i vt pos)))
+         (Ok vt)))
+      ((KShuffle a b m) (check-shuffle fcx a b m pos))
+      (_ (err pos "not a vector operation")))))
+
+;; The lanes of a shuffle mask: a literal `<M x i32>`; or nil.
+(defun mask-lanes :private (m: LExpr) -> (Option (Vec LExpr))
+  (match (. m kind)
+    ((KVector t lanes) (match t ((TVector _ el) (if (= el ty-i32) (some lanes) nil)) (_ nil)))
+    (_ nil)))
+
+;; Every mask lane is a literal in [0, 2n).
+(defun mask-in-range :private (lanes: (Vec LExpr) n: i64 pos: i64) -> (Result unit Diagnostic)
+  (loop ((i 0))
+    (if (>= i (count lanes))
+        (Ok ())
+        (match (expr-int-literal (nth lanes i))
+          ((some v)
+           (if (index-below? v (* 2 n))
+               (recur (+ i 1))
+               (err pos (str "shufflevector mask element " (lit-str v) " out of range"))))
+          (nil (err pos "shufflevector mask must be a literal <M x i32>"))))))
+
+(defun check-shuffle :private (fcx: Fcx a: LExpr b: LExpr m: LExpr pos: i64) -> (Result LType Diagnostic)
+  (try-let ((vt (vector-of fcx "shufflevector" a pos))
+            (tb (fcx-val fcx b))
+            (same (fcx-same fcx "shufflevector" 2 tb vt pos)))
+    (match (mask-lanes m)
+      (nil (err pos "shufflevector mask must be a literal <M x i32>"))
+      ((some lanes)
+       (try-let ((ok (mask-in-range lanes (lane-count vt) pos)))
+         (Ok (TVector (count lanes) (type-scalar vt))))))))
+
+;; The type reached by `idx` from aggregate type `t`.
+(defun field-path :private (fcx: Fcx op: str t: LType idx: (Vec LLit) pos: i64) -> (Result LType Diagnostic)
+  (loop ((k 0) (cur t))
+    (if (>= k (count idx))
+        (Ok cur)
+        (match (check-step fcx op cur (nth idx k) pos)
+          ((Err d) (Err d))
+          ((Ok next) (recur (+ k 1) next))))))
 
 ;; (aggr.rs `extract_value`)
 (defun check-extract-value (fcx: Fcx a: LExpr idx: (Vec LLit) pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.aggr check-extract-value"))
+  (try-let ((ta (fcx-val fcx a)))
+    (if (not (type-aggregate? ta))
+        (err pos (str "extractvalue needs a struct or array, found " (type-str ta)))
+        (field-path fcx "extractvalue" ta idx pos))))
 
 ;; (aggr.rs `insert_value`)
 (defun check-insert-value (fcx: Fcx a: LExpr v: LExpr idx: (Vec LLit) pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.aggr check-insert-value"))
+  (try-let ((ta (fcx-val fcx a)))
+    (if (not (type-aggregate? ta))
+        (err pos (str "insertvalue needs a struct or array, found " (type-str ta)))
+        (try-let ((want (field-path fcx "insertvalue" ta idx pos))
+                  (tv (fcx-val fcx v))
+                  (same (fcx-same fcx "insertvalue" 2 tv want pos)))
+          (Ok ta)))))

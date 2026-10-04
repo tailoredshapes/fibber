@@ -1,13 +1,180 @@
-;; compiler/lir/check/calls.fib: calls, tail calls and the other terminators (spec/lir.md 6.7, 7; crates/lir/src/check/calls.rs). OWNER: package K2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/calls.fib: calls, tail calls and the other terminators (spec/lir.md 6.7, 7; crates/lir/src/check/calls.rs). OWNER: package K2.
 
 (ns lir.check.calls
-  (:use lir.diag lir.types lir.lit lir.ast lir.check.fcx))
+  (:use lir.diag lir.types lir.lit lir.ast lir.check.env lir.check.fcx))
 
+
+;; The callee's type, a name for messages, and the name of the callee for the variadic message (calls.rs `callee` and the `var` of `call`).
+(defstruct CalleeInfo (ty: LFnType what: str var: str))
+
+(defun plural :private (n: i64) -> str (if (= n 1) "" "s"))
+
+;; The C promotion a variadic argument of type `t` needs, if any.
+(defun promoted :private (t: LType) -> (Option str)
+  (match t
+    ((TInt b) (if (or (= b 1) (= b 8) (= b 16)) (some "i32") nil))
+    ((TFloat) (some "double"))
+    (_ nil)))
+
+;; (calls.rs `callee`)
+(defun callee-info :private (fcx: Fcx callee: LCallee tail: bool pos: i64) -> (Result CalleeInfo Diagnostic)
+  (match callee
+    ((CalDirect f)
+     (try-let ((ty (env-function (. fcx env) f pos)))
+       (Ok (CalleeInfo ty (str (if tail "tailcall to" "call to") " @" f) (str "@" f)))))
+    ((CalIndirect ptr ty)
+     (let ((op (if tail "indirect-tailcall" "indirect-call")))
+       (try-let ((tp (fcx-val fcx ptr)))
+         (if (!= tp ty-ptr)
+             (err pos (str op " needs a ptr callee, found " (type-str tp)))
+             (try-let ((valid (env-valid-fn (. fcx env) ty pos)))
+               (Ok (CalleeInfo ty op op)))))))))
+
+;; The count of arguments against the parameters.
+(defun arg-count :private (ty: LFnType what: str args: (Vec LExpr) pos: i64) -> (Result unit Diagnostic)
+  (let ((n (count (. ty params)))
+        (bad (if (. ty varargs) (< (count args) n) (!= (count args) n))))
+    (if bad
+        (err pos (str what ": expected " (if (. ty varargs) "at least " "") n " argument" (plural n) ", found " (count args)))
+        (Ok ()))))
+
+;; One argument: typed, then compared with its parameter, or checked for promotion when it is a variadic extra.
+(defun check-arg :private (fcx: Fcx ty: LFnType what: str var: str i: i64 a: LExpr) -> (Result unit Diagnostic)
+  (try-let ((t (fcx-val fcx a)))
+    (if (< i (count (. ty params)))
+        (let ((want (nth (. ty params) i)))
+          (if (!= want t)
+              (err (. a pos) (str what ": argument " (+ i 1) " has type " (type-str t) ", expected " (type-str want)))
+              (Ok ())))
+        (match (promoted t)
+          ((some to)
+           (err (. a pos) (str "variadic argument " (+ i 1) " of " var " has type " (type-str t) ", which C promotes; pass " to)))
+          (nil (Ok ()))))))
+
+(defun check-args :private (fcx: Fcx ci: CalleeInfo args: (Vec LExpr) pos: i64) -> (Result unit Diagnostic)
+  (try-let ((n (arg-count (. ci ty) (. ci what) args pos)))
+    (loop ((i 0))
+      (if (>= i (count args))
+          (Ok ())
+          (match (check-arg fcx (. ci ty) (. ci what) (. ci var) i (nth args i))
+            ((Err d) (Err d))
+            ((Ok _) (recur (+ i 1))))))))
 
 ;; A call that is not a tail call. (calls.rs `call`)
 (defun check-call (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
-  (trap "todo: lir.check.calls check-call"))
+  (match (. e kind)
+    ((KCall callee args tail)
+     (try-let ((ci (callee-info fcx callee tail (. e pos)))
+               (ok (check-args fcx ci args (. e pos))))
+       (Ok (. (. ci ty) ret))))
+    (_ (err (. e pos) "unexpected form"))))
 
 ;; A terminator in statement position: `ret br condbr switch unreachable` and a tail call with the musttail rules of spec/lir.md 7.3. The value of the `term` field of the context. (calls.rs `terminator`)
 (defun check-terminator (fcx: Fcx e: LExpr) -> (Result unit Diagnostic)
-  (trap "todo: lir.check.calls check-terminator"))
+  (let ((pos (. e pos)))
+    (match (. e kind)
+      ((KRet v) (check-ret fcx v pos))
+      ((KBr _) (Ok ()))
+      ((KUnreachable) (Ok ()))
+      ((KCondBr c _ _)
+       (try-let ((t (fcx-val fcx c)))
+         (if (= t ty-i1) (Ok ()) (err pos (str "br condition must be i1, found " (type-str t))))))
+      ((KSwitch v _ cases) (check-switch fcx v cases pos))
+      ((KCall callee _ _)
+       (try-let ((t (check-call fcx e)))
+         (tail-rules fcx callee pos)))
+      (_ (err pos "not a terminator")))))
+
+(defun check-ret :private (fcx: Fcx v: (Option LExpr) pos: i64) -> (Result unit Diagnostic)
+  (let ((f (. fcx f))
+        (want (. (. f ty) ret)))
+    (match v
+      (nil (match want
+             (nil (Ok ()))
+             ((some r) (err pos (str "ret without a value in @" (. f name) ", which returns " (type-str r))))))
+      ((some x)
+       (try-let ((t (fcx-val fcx x)))
+         (if (= (some t) want)
+             (Ok ())
+             (err pos (str "ret type " (type-str t) " does not match @" (. f name) "'s result " (ret-str want)))))))))
+
+;; One case of a switch: an integer literal of the switch's type, new to `seen`; the new set.
+(defun switch-case :private (t: LType bits: i64 seen: (Set i64) c: LCase) -> (Result (Set i64) Diagnostic)
+  (let ((ce (. c value)))
+    (match (. ce kind)
+      ((KInt ct val)
+       (cond (!= ct t) (err (. ce pos) (str "switch: case has type " (type-str ct) ", expected " (type-str t)))
+             (contains? seen (lit-low val bits)) (err (. ce pos) (str "switch: duplicate case " (lit-str val)))
+             :else (Ok (conj seen (lit-low val bits)))))
+      (_ (err (. ce pos) "switch case must be an integer literal")))))
+
+(defun check-switch :private (fcx: Fcx v: LExpr cases: (Vec LCase) pos: i64) -> (Result unit Diagnostic)
+  (try-let ((t (fcx-val fcx v)))
+    (match t
+      ((TInt bits)
+       (loop ((i 0) (seen: (Set i64) #{}))
+         (if (>= i (count cases))
+             (Ok ())
+             (match (switch-case t bits seen (nth cases i))
+               ((Err d) (Err d))
+               ((Ok s) (recur (+ i 1) s))))))
+      (_ (err pos (str "switch needs an integer scalar, found " (type-str t)))))))
+
+;; The musttail rules of spec/lir.md 7.3. (calls.rs `tail_rules`)
+(defun tail-rules :private (fcx: Fcx callee: LCallee pos: i64) -> (Result unit Diagnostic)
+  (let ((me (. (. fcx f) ty))
+        (fname (str "@" (. (. fcx f) name))))
+    (match callee
+      ((CalDirect g)
+       (try-let ((ty (env-function (. fcx env) g pos)))
+         (tail-compare fcx me fname ty "tailcall" (str "@" g) pos)))
+      ((CalIndirect _ t) (tail-compare fcx me fname t "indirect-tailcall" "the callee" pos)))))
+
+(defun tail-compare :private (fcx: Fcx me: LFnType fname: str ty: LFnType op: str them: str pos: i64) -> (Result unit Diagnostic)
+  (cond (!= (. me cc) (. ty cc))
+        (err pos (str op ": " fname " is " (cc-str (. me cc)) " and " them " is " (cc-str (. ty cc))))
+        (!= (. me ret) (. ty ret))
+        (err pos (str op ": " them " returns " (ret-str (. ty ret)) ", " fname " returns " (ret-str (. me ret))))
+        (. ty varargs) (err pos (str op " to a variadic function"))
+        (and (= (. me cc) CcC) (!= (. me params) (. ty params)))
+        (err pos (str op " under ccc needs identical parameter types (" fname " has " (fn-params-str me) ", "
+                      (if (= them "the callee") "the callee has" (str them " has")) " " (fn-params-str ty) "); use tailcc"))
+        :else (result-in-registers fcx (. ty ret) op pos)))
+
+;; Rule 5 of spec/lir.md 7.3: a result the target may return in memory cannot be tail-called: at most two leaves, each a scalar or a vector
+;; of at most 512 bits. (calls.rs `result_in_registers`)
+(defun result-in-registers (fcx: Fcx ret: (Option LType) op: str pos: i64) -> (Result unit Diagnostic)
+  (match ret
+    (nil (Ok ()))
+    ((some r)
+     (let ((lw (leaves fcx r)))
+       (if (or (> (nth lw 0) 2) (> (nth lw 1) 512))
+           (err pos (str op ": a result of type " (type-str r) " may be returned in memory, which no tail call can: at most 2 scalar or vector leaves of at most 512 bits (found "
+                         (nth lw 0) " leaves, the widest " (nth lw 1) " bits)"))
+           (Ok ()))))))
+
+(def sat-max: i64 9223372036854775807)
+
+(defun sat-add :private (a: i64 b: i64) -> i64 (if (> a (- sat-max b)) sat-max (+ a b)))
+
+(defun sat-mul :private (a: i64 b: i64) -> i64
+  (if (and (> a 0) (> b (quot sat-max a))) sat-max (* a b)))
+
+;; How many scalars and vectors `t` holds, structs and arrays flattened, and the widest of them in bits (a pointer counts 64): [count widest].
+;; (calls.rs `leaves`; the counts saturate at i64 max, not u64 max)
+(defun leaves (fcx: Fcx t: LType) -> (Vec i64)
+  (match t
+    ((TArray n e)
+     (let ((lw (leaves fcx e)))
+       [(sat-mul (nth lw 0) n) (nth lw 1)]))
+    ((TNamed _) (struct-leaves fcx t))
+    ((TAnon _) (struct-leaves fcx t))
+    (_ [1 (match (type-bits t) ((some b) b) (nil 64))])))
+
+(defun struct-leaves :private (fcx: Fcx t: LType) -> (Vec i64)
+  (let ((fields (match (env-fields (. fcx env) t) ((some fs) fs) (nil []))))
+    (loop ((i 0) (c 0) (w 0))
+      (if (>= i (count fields))
+          [c w]
+          (let ((lw (leaves fcx (nth fields i))))
+            (recur (+ i 1) (sat-add c (nth lw 0)) (max w (nth lw 1))))))))
