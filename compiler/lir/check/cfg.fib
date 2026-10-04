@@ -1,4 +1,4 @@
-;; compiler/lir/check/cfg.fib: a function's control-flow graph: successors, predecessors, reachability and dominators (spec/lir.md section 5; crates/lir/src/check/cfg.rs). OWNER: package K1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/cfg.fib: a function's control-flow graph: successors, predecessors, reachability and dominators (spec/lir.md section 5; crates/lir/src/check/cfg.rs). OWNER: package K1.
 
 ;; Blocks are indices in source order; block 0 is the entry. An absent immediate dominator (Rust `None`, an unreachable block) is -1.
 
@@ -13,18 +13,112 @@
    ;; the immediate dominator of each reachable block (the entry's is itself); -1 for an unreachable block
    idom: (Vec i64)))
 
+(defun fill-i64 (n: i64 x: i64) -> (Vec i64) (vec (repeat n x)))
+
+;; The predecessors: for each block in order, each of its successors learns of it (once).
+(defun cfg-preds (succs: (Vec (Vec i64))) -> (Vec (Vec i64))
+  (let ((e: (Vec i64) (vec-empty)))
+    (loop ((b 0) (preds (vec (repeat (count succs) e))))
+      (if (>= b (count succs))
+          preds
+          (recur (+ b 1)
+                 (loop ((k 0) (preds preds))
+                   (let ((ss (nth succs b)))
+                     (if (>= k (count ss))
+                         preds
+                         (let ((s (nth ss k)))
+                           (recur (+ k 1)
+                                  (if (last-is? (nth preds s) b)
+                                      preds
+                                      (assoc preds s (conj (nth preds s) b)))))))))))))
+
+;; Iterative depth-first search from block 0: the blocks in postorder. (cfg.rs `reverse_postorder`, before the reversal)
+(defun cfg-postorder (succs: (Vec (Vec i64))) -> (Vec i64)
+  (let ((n (count succs))
+        (e: (Vec i64) (vec-empty)))
+    (if (= n 0)
+        e
+        (loop ((sb [0]) (si [0]) (seen (assoc (vec (repeat n false)) 0 true)) (post e))
+          (if (= (count sb) 0)
+              post
+              (let ((b (peek-or sb)) (i (peek-or si)) (ss (nth succs (peek-or sb))))
+                (if (< i (count ss))
+                    (let ((s (nth ss i))
+                          (si2 (conj (pop si) (+ i 1))))
+                      (if (nth seen s)
+                          (recur sb si2 seen post)
+                          (recur (conj sb s) (conj si2 0) (assoc seen s true) post)))
+                    (recur (pop sb) (pop si) seen (conj post b)))))))))
+
+(defun peek-or (v: (Vec i64)) -> i64 (nth v (- (count v) 1)))
+
+(defun reverse-vec (v: (Vec i64)) -> (Vec i64)
+  (loop ((i (- (count v) 1)) (acc (vec-empty)))
+    (if (< i 0) acc (recur (- i 1) (conj acc (nth v i))))))
+
+;; The nearest common dominator of `a` and `b` by walking up the reverse postorder numbers. (cfg.rs `intersect`)
+(defun cfg-intersect (idom: (Vec i64) order: (Vec i64) a: i64 b: i64) -> i64
+  (loop ((x a) (y b))
+    (if (= x y)
+        x
+        (cond (> (nth order x) (nth order y)) (recur (let ((d (nth idom x))) (if (< d 0) x d)) y)
+              (> (nth order y) (nth order x)) (recur x (let ((d (nth idom y))) (if (< d 0) y d)))
+              :else x))))
+
+;; The new immediate dominator of `b` from its processed predecessors, or -1.
+(defun cfg-new-idom (idom: (Vec i64) order: (Vec i64) ps: (Vec i64)) -> i64
+  (loop ((k 0) (new -1))
+    (if (>= k (count ps))
+        new
+        (let ((p (nth ps k)))
+          (cond (< (nth idom p) 0) (recur (+ k 1) new)
+                (< new 0) (recur (+ k 1) p)
+                :else (recur (+ k 1) (cfg-intersect idom order p new)))))))
+
+;; One pass over the reverse postorder after the entry; the new idom vector and whether anything changed.
+(defun cfg-pass (preds: (Vec (Vec i64)) rpo: (Vec i64) order: (Vec i64) idom: (Vec i64)) -> (Vec i64)
+  (loop ((i 1) (idom idom))
+    (if (>= i (count rpo))
+        idom
+        (let ((b (nth rpo i))
+              (new (cfg-new-idom idom order (nth preds (nth rpo i)))))
+          (recur (+ i 1) (if (and (>= new 0) (not (= (nth idom b) new))) (assoc idom b new) idom))))))
+
+;; Cooper, Harvey and Kennedy's iterative algorithm. (cfg.rs `dominators`)
+(defun cfg-dominators (preds: (Vec (Vec i64)) rpo: (Vec i64) n: i64) -> (Vec i64)
+  (if (= (count rpo) 0)
+      (fill-i64 n -1)
+      (let ((order (loop ((i 0) (o (fill-i64 n 9223372036854775807)))
+                     (if (>= i (count rpo)) o (recur (+ i 1) (assoc o (nth rpo i) i)))))
+            (start (assoc (fill-i64 n -1) (nth rpo 0) (nth rpo 0))))
+        (loop ((idom start))
+          (let ((next (cfg-pass preds rpo order idom)))
+            (if (= next idom) idom (recur next)))))))
+
 ;; Builds the graph from each block's (deduplicated) successor list. (cfg.rs `Cfg::new`)
 (defun cfg-new (succs: (Vec (Vec i64))) -> Cfg
-  (trap "todo: lir.check.cfg cfg-new"))
+  (let ((preds (cfg-preds succs))
+        (rpo (reverse-vec (cfg-postorder succs))))
+    (Cfg succs preds rpo (cfg-dominators preds rpo (count succs)))))
 
 ;; (cfg.rs `reachable`)
 (defun cfg-reachable? (cfg: Cfg b: i64) -> bool
-  (trap "todo: lir.check.cfg cfg-reachable?"))
+  (>= (nth (. cfg idom) b) 0))
 
 ;; Whether `a` dominates `b` (both reachable; a block dominates itself). (cfg.rs `dominates`)
 (defun cfg-dominates? (cfg: Cfg a: i64 b: i64) -> bool
-  (trap "todo: lir.check.cfg cfg-dominates?"))
+  (loop ((cur b))
+    (if (= cur a)
+        true
+        (let ((d (nth (. cfg idom) cur)))
+          (if (and (>= d 0) (not (= d cur))) (recur d) false)))))
 
 ;; Whether a value bound in `bound` may be used in `user` (spec/lir.md 5.3). (cfg.rs `available`)
 (defun cfg-available? (cfg: Cfg bound: i64 user: i64) -> bool
-  (trap "todo: lir.check.cfg cfg-available?"))
+  (if (cfg-reachable? cfg user)
+      (and (cfg-reachable? cfg bound) (cfg-dominates? cfg bound user))
+      (cfg-reachable? cfg bound)))
+
+;; Whether the last element of `v` is `x` (blocks are visited in increasing order, so a repeated predecessor is the last one).
+(defun last-is? (v: (Vec i64) x: i64) -> bool
+  (and (> (count v) 0) (= (nth v (- (count v) 1)) x)))
