@@ -1,11 +1,117 @@
-;; compiler/lir/parse/instr.fib: arithmetic, comparison, cast, vector and aggregate forms (crates/lir/src/parse/instr.rs). OWNER: package R. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/parse/instr.fib: arithmetic, comparison, cast, vector and aggregate forms (crates/lir/src/parse/instr.rs). OWNER: package R.
 
-;; `parse-instr` answers nil for a head this module does not own, so that the dispatcher tries the next module.
+;; `parse-instr` answers nil for a head this module does not own, so that the dispatcher tries the next module. The memory forms of
+;; Rust's `instr::parse` are `lir.parse.memory`'s here.
 
 (ns lir.parse.instr
-  (:use lir.diag lir.types lir.lit lir.ast lir.sexp lir.parse.names))
+  (:use lir.diag lir.types lir.lit lir.ast lir.sexp lir.parse.names lir.parse.literal lir.parse.ty))
 
+(def binops: (Map str LBinOp)
+  {"add" BAdd "sub" BSub "mul" BMul "sdiv" BSDiv "udiv" BUDiv "srem" BSRem "urem" BURem "fadd" BFAdd "fsub" BFSub "fmul" BFMul
+   "fdiv" BFDiv "frem" BFRem "and" BAnd "or" BOr "xor" BXor "shl" BShl "lshr" BLShr "ashr" BAShr})
+
+(def castops: (Map str LCastOp)
+  {"trunc" CTrunc "zext" CZExt "sext" CSExt "fptrunc" CFpTrunc "fpext" CFpExt "fptosi" CFpToSi "fptoui" CFpToUi "sitofp" CSiToFp
+   "uitofp" CUiToFp "ptrtoint" CPtrToInt "inttoptr" CIntToPtr "bitcast" CBitcast "fptosi-sat" CFpToSiSat "fptoui-sat" CFpToUiSat})
+
+(def ipreds: (Map str LIPred)
+  {"eq" IEq "ne" INe "slt" ISlt "sle" ISle "sgt" ISgt "sge" ISge "ult" IUlt "ule" IUle "ugt" IUgt "uge" IUge})
+
+(def fpreds: (Map str LFPred)
+  {"oeq" FOeq "one" FOne "olt" FOlt "ole" FOle "ogt" FOgt "oge" FOge "ord" FOrd "ueq" FUeq "une" FUne "ult" FUlt "ule" FUle
+   "ugt" FUgt "uge" FUge "uno" FUno})
+
+(def ovfops: (Map str LOvfOp)
+  {"sadd-overflow" OvSAdd "ssub-overflow" OvSSub "smul-overflow" OvSMul})
 
 ;; The form `(NAME args..)` if NAME is one of: `add sub mul .. ashr`, `sadd-overflow ..`, `fneg ctpop`, `icmp fcmp`, the casts, `select extractelement insertelement shufflevector extractvalue insertvalue`; nil otherwise. (instr.rs `parse`)
 (defun parse-instr (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Option (Result LExpr Diagnostic))
-  (trap "todo: lir.parse.instr parse-instr"))
+  (match (get binops name)
+    ((some op) (some (bin sub name op args pos)))
+    (nil
+     (match (get castops name)
+       ((some op) (some (cast sub name op args pos)))
+       (nil (other-instr sub name args pos))))))
+
+(defun other-instr :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64) -> (Option (Result LExpr Diagnostic))
+  (match (get ovfops name)
+    ((some op) (some (overflow sub name op args pos)))
+    (nil
+     (cond (= name "fneg") (some (un sub name UFNeg args pos))
+           (= name "ctpop") (some (un sub name UCtpop args pos))
+           (= name "icmp") (some (icmp sub args pos))
+           (= name "fcmp") (some (fcmp sub args pos))
+           (or (= name "select") (= name "insertelement") (= name "shufflevector") (= name "extractelement"))
+           (some (vector-op sub name args pos))
+           (or (= name "extractvalue") (= name "insertvalue")) (some (aggregate sub name args pos))
+           :else nil))))
+
+(defun bin :private (sub: ExprParser name: str op: LBinOp args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity name args 2 pos))
+            (a (operand sub (nth args 0)))
+            (b (operand sub (nth args 1))))
+    (Ok (expr-new (KBin op a b) pos))))
+
+(defun overflow :private (sub: ExprParser name: str op: LOvfOp args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity name args 2 pos))
+            (a (operand sub (nth args 0)))
+            (b (operand sub (nth args 1))))
+    (Ok (expr-new (KOverflow op a b) pos))))
+
+(defun un :private (sub: ExprParser name: str op: LUnOp args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity name args 1 pos))
+            (a (operand sub (nth args 0))))
+    (Ok (expr-new (KUn op a) pos))))
+
+(defun cast :private (sub: ExprParser name: str op: LCastOp args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity name args 2 pos))
+            (ty (parse-type (nth args 0)))
+            (v (operand sub (nth args 1))))
+    (Ok (expr-new (KCast op ty v) pos))))
+
+(defun icmp :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity "icmp" args 3 pos))
+            (p (atom-text (nth args 0) "a predicate")))
+    (match (get ipreds p)
+      (nil (err (sexp-pos (nth args 0)) (str "unknown icmp predicate " p)))
+      ((some pred)
+       (try-let ((a (operand sub (nth args 1))) (b (operand sub (nth args 2))))
+         (Ok (expr-new (KICmp pred a b) pos)))))))
+
+(defun fcmp :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity "fcmp" args 3 pos))
+            (p (atom-text (nth args 0) "a predicate")))
+    (match (get fpreds p)
+      (nil (err (sexp-pos (nth args 0)) (str "unknown fcmp predicate " p)))
+      ((some pred)
+       (try-let ((a (operand sub (nth args 1))) (b (operand sub (nth args 2))))
+         (Ok (expr-new (KFCmp pred a b) pos)))))))
+
+(defun vector-op :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (arity name args (if (= name "extractelement") 2 3) pos))
+            (ops (operands sub args)))
+    (Ok (expr-new (cond (= name "select") (KSelect (nth ops 0) (nth ops 1) (nth ops 2))
+                        (= name "insertelement") (KInsertElement (nth ops 0) (nth ops 1) (nth ops 2))
+                        (= name "shufflevector") (KShuffle (nth ops 0) (nth ops 1) (nth ops 2))
+                        :else (KExtractElement (nth ops 0) (nth ops 1)))
+                  pos))))
+
+;; The index list of an extractvalue or insertvalue, from `args[from..]`: each an integer token (instr.rs `indices`).
+(defun indices :private (args: (Vec Sexp) from: i64) -> (Result (Vec LLit) Diagnostic)
+  (loop ((i from) (out []))
+    (if (>= i (count args))
+        (Ok out)
+        (let ((a (nth args i)))
+          (match (match a ((SxAtom t _) (int-token t)) (_ nil))
+            ((some v) (recur (+ i 1) (conj out v)))
+            (nil (err (sexp-pos a) "field index must be a number")))))))
+
+(defun aggregate :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (let ((extract (= name "extractvalue")))
+    (if (<= (count args) (if extract 1 2))
+        (err pos (str name " needs at least one field index"))
+        (try-let ((agg (operand sub (nth args 0))))
+          (if extract
+              (try-let ((ix (indices args 1))) (Ok (expr-new (KExtractValue agg ix) pos)))
+              (try-let ((v (operand sub (nth args 1))) (ix (indices args 2)))
+                (Ok (expr-new (KInsertValue agg v ix) pos))))))))

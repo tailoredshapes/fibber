@@ -1,9 +1,198 @@
-;; compiler/lir/check/memory.fib: memory and atomic instructions (spec/lir.md 6.5, 6.6; crates/lir/src/check/memory.rs). OWNER: package K2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/memory.fib: memory and atomic instructions (spec/lir.md 6.5, 6.6; crates/lir/src/check/memory.rs). OWNER: package K2.
 
 (ns lir.check.memory
   (:use lir.diag lir.types lir.lit lir.ast lir.check.env lir.check.fcx lir.check.aggr))
 
 
+(defun ord-name :private (o: LOrdering) -> str
+  (match o
+    ((OUnordered) "unordered") ((OMonotonic) "monotonic") ((OAcquire) "acquire")
+    ((ORelease) "release") ((OAcqRel) "acq_rel") ((OSeqCst) "seq_cst")))
+
+(defun rmw-name :private (op: LRmwOp) -> str
+  (match op
+    ((RXchg) "xchg") ((RAdd) "add") ((RSub) "sub") ((RAnd) "and") ((RNand) "nand") ((ROr) "or") ((RXor) "xor")
+    ((RMax) "max") ((RMin) "min") ((RUMax) "umax") ((RUMin) "umin")
+    ((RFAdd) "fadd") ((RFSub) "fsub") ((RFMax) "fmax") ((RFMin) "fmin")))
+
+(defun rmw-float? :private (op: LRmwOp) -> bool
+  (match op ((RFAdd) true) ((RFSub) true) ((RFMax) true) ((RFMin) true) (_ false)))
+
+(defun atomic-type (t: LType pos: i64) -> (Result unit Diagnostic)
+  (match t
+    ((TInt b) (if (or (= b 8) (= b 16) (= b 32) (= b 64)) (Ok ()) (err pos (str "atomic operation on " (type-str t)))))
+    ((TPtr) (Ok ()))
+    ((TFloat) (Ok ()))
+    ((TDouble) (Ok ()))
+    (_ (err pos (str "atomic operation on " (type-str t))))))
+
+;; `op cannot have ordering X` when `o` is one of `bad`.
+(defun forbid (op: str o: LOrdering bad: (Vec LOrdering) pos: i64) -> (Result unit Diagnostic)
+  (if (some? (find-first (fn (b: LOrdering) (= b o)) bad))
+      (err pos (str op " cannot have ordering " (ord-name o)))
+      (Ok ())))
+
+(defun find-first :private (p: (fn (LOrdering) bool) xs: (Vec LOrdering)) -> (Option LOrdering)
+  (loop ((i 0))
+    (cond (>= i (count xs)) nil
+          (p (nth xs i)) (some (nth xs i))
+          :else (recur (+ i 1)))))
+
+;; The operand must be a ptr.
+(defun pointer :private (fcx: Fcx op: str e: LExpr pos: i64) -> (Result unit Diagnostic)
+  (try-let ((t (fcx-val fcx e)))
+    (if (= t ty-ptr) (Ok ()) (err pos (str op " needs a ptr operand, found " (type-str t))))))
+
+;; The typed direct-access rule (spec/lir.md 6.5), on the environment and the uncounted allocas only. (memory.rs `direct`)
+(defun direct (fcx: Fcx op: str ty: LType ptr: LExpr pos: i64) -> (Result unit Diagnostic)
+  (match (. ptr kind)
+    ((KGlobal g)
+     (match (get (. (. fcx env) symbols) g)
+       ((some s)
+        (match s
+          ((SymVar gt _)
+           (if (!= gt ty)
+               (err pos (str op " of " (type-str ty) " through @" g ", a global of type " (type-str gt)))
+               (Ok ())))
+          (_ (Ok ()))))
+       (nil (Ok ()))))
+    ((KLocal n)
+     (match (get (. fcx allocas) n)
+       ((some at)
+        (if (!= at ty)
+            (err pos (str op " of " (type-str ty) " through " n ", which is (alloca " (type-str at) ")"))
+            (Ok ())))
+       (nil (Ok ()))))
+    (_ (Ok ()))))
+
 ;; `alloca load store getelementptr` and the atomics; nil is void. (memory.rs `memory`)
 (defun check-memory (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
-  (trap "todo: lir.check.memory check-memory"))
+  (let ((pos (. e pos)))
+    (match (. e kind)
+      ((KAlloca ty count _) (check-alloca fcx ty count pos))
+      ((KLoad ty ptr _ _)
+       (try-let ((valid (fcx-valid fcx ty pos))
+                 (p (pointer fcx "load" ptr pos))
+                 (d (direct fcx "load" ty ptr pos)))
+         (Ok (some ty))))
+      ((KStore value ptr _ _) (try-let ((u (check-store fcx value ptr pos))) (Ok nil)))
+      ((KGep _ ty ptr indices) (try-let ((t (check-gep fcx ty ptr indices pos))) (Ok (some t))))
+      (_ (check-atomic fcx e)))))
+
+(defun check-alloca :private (fcx: Fcx ty: LType count: (Option LExpr) pos: i64) -> (Result (Option LType) Diagnostic)
+  (try-let ((valid (fcx-valid fcx ty pos)))
+    (match count
+      (nil (Ok (some ty-ptr)))
+      ((some c)
+       (try-let ((tc (fcx-val fcx c)))
+         (if (type-int? tc)
+             (Ok (some ty-ptr))
+             (err pos (str "alloca count must be an integer, found " (type-str tc)))))))))
+
+;; A store to a global that is a constant is refused.
+(defun constant-global? :private (fcx: Fcx ptr: LExpr) -> (Option str)
+  (match (. ptr kind)
+    ((KGlobal g)
+     (match (get (. (. fcx env) symbols) g)
+       ((some s) (match s ((SymVar _ c) (if c (some g) nil)) (_ nil)))
+       (nil nil)))
+    (_ nil)))
+
+(defun check-store :private (fcx: Fcx v: LExpr ptr: LExpr pos: i64) -> (Result unit Diagnostic)
+  (try-let ((tv (fcx-val fcx v))
+            (p (pointer fcx "store" ptr pos)))
+    (match (constant-global? fcx ptr)
+      ((some g) (err pos (str "store to constant @" g)))
+      (nil (direct fcx "store" tv ptr pos)))))
+
+(defun check-gep :private (fcx: Fcx ty: LType ptr: LExpr idx: (Vec LExpr) pos: i64) -> (Result LType Diagnostic)
+  (try-let ((valid (fcx-valid fcx ty pos))
+            (p (pointer fcx "getelementptr" ptr pos)))
+    (loop ((k 0) (cur ty))
+      (if (>= k (count idx))
+          (Ok ty-ptr)
+          (match (fcx-val fcx (nth idx k))
+            ((Err d) (Err d))
+            ((Ok ti)
+             (cond (not (type-int? ti)) (err pos (str "getelementptr index must be an integer, found " (type-str ti)))
+                   (= k 0) (recur (+ k 1) cur)
+                   :else (match (gep-step fcx cur (nth idx k) ti pos)
+                           ((Err d) (Err d))
+                           ((Ok next) (recur (+ k 1) next))))))))))
+
+;; One index after the first: into an array by any integer (a constant one in range), into a struct by a constant `i32`. (memory.rs `gep_step`)
+(defun gep-step :private (fcx: Fcx cur: LType i: LExpr ti: LType pos: i64) -> (Result LType Diagnostic)
+  (match cur
+    ((TArray n elem)
+     ;; A [0 x T] is a trailing member of unknown length.
+     (match (expr-int-literal i)
+       ((some v) (if (> n 0) (check-step fcx "getelementptr" cur v pos) (Ok elem)))
+       (nil (Ok elem))))
+    (_
+     (cond (not (type-aggregate? cur)) (err pos (str "getelementptr cannot index into " (type-str cur)))
+           (and (match (. i kind) ((KInt _ _) true) (_ false)) (= ti ty-i32))
+           (let ((f (match (expr-int-literal i) ((some v) v) (nil (lit-of -1)))))
+             (check-step fcx "getelementptr" cur (LLit 0 (lit-low f 32)) pos))
+           :else (err pos "getelementptr: struct field index must be a constant i32")))))
+
+(defun check-atomic :private (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
+  (let ((pos (. e pos)))
+    (match (. e kind)
+      ((KAtomicLoad _ o t ptr)
+       (try-let ((f (forbid "atomic-load" o [ORelease OAcqRel] pos))
+                 (valid (fcx-valid fcx t pos))
+                 (a (atomic-type t pos))
+                 (p (pointer fcx "atomic-load" ptr pos))
+                 (d (direct fcx "atomic-load" t ptr pos)))
+         (Ok (some t))))
+      ((KAtomicStore _ o v ptr)
+       (try-let ((f (forbid "atomic-store" o [OAcquire OAcqRel] pos))
+                 (tv (fcx-val fcx v))
+                 (a (atomic-type tv pos))
+                 (p (pointer fcx "atomic-store" ptr pos))
+                 (d (direct fcx "atomic-store" tv ptr pos)))
+         (Ok nil)))
+      ((KAtomicRmw op _ o ptr v) (try-let ((t (check-rmw fcx op o ptr v pos))) (Ok (some t))))
+      ((KCmpXchg _ _ success failure ptr expected new)
+       (try-let ((t (check-cmpxchg fcx success failure ptr expected new pos))) (Ok (some t))))
+      ((KFence _ o)
+       (match o
+         ((OUnordered) (fence-error o pos))
+         ((OMonotonic) (fence-error o pos))
+         (_ (Ok nil))))
+      (_ (err pos "unexpected form")))))
+
+(defun fence-error :private (o: LOrdering pos: i64) -> (Result (Option LType) Diagnostic)
+  (err pos (str "fence ordering must be acquire, release, acq_rel or seq_cst, found " (ord-name o))))
+
+;; The operand rule of an atomicrmw operation on the value's type.
+(defun rmw-operand :private (op: LRmwOp tv: LType pos: i64) -> (Result unit Diagnostic)
+  (cond (= op RXchg) (atomic-type tv pos)
+        (rmw-float? op)
+        (if (type-float? tv) (Ok ()) (err pos (str "atomicrmw " (rmw-name op) " needs a float operand, found " (type-str tv))))
+        (not (type-int? tv)) (err pos (str "atomicrmw " (rmw-name op) " needs an integer operand, found " (type-str tv)))
+        :else (atomic-type tv pos)))
+
+(defun check-rmw :private (fcx: Fcx op: LRmwOp o: LOrdering ptr: LExpr v: LExpr pos: i64) -> (Result LType Diagnostic)
+  (try-let ((f (forbid "atomicrmw" o [OUnordered] pos))
+            (p (pointer fcx "atomicrmw" ptr pos))
+            (tv (fcx-val fcx v))
+            (r (rmw-operand op tv pos))
+            (d (direct fcx "atomicrmw" tv ptr pos)))
+    (Ok tv)))
+
+(defun check-cmpxchg :private (fcx: Fcx success: LOrdering failure: LOrdering ptr: LExpr expected: LExpr new: LExpr pos: i64) -> (Result LType Diagnostic)
+  (try-let ((f1 (forbid "cmpxchg" success [OUnordered] pos))
+            (f2 (forbid "cmpxchg" failure [OUnordered] pos))
+            (f3 (if (or (= failure ORelease) (= failure OAcqRel))
+                    (err pos (str "cmpxchg failure ordering cannot be " (ord-name failure)))
+                    (Ok ())))
+            (p (pointer fcx "cmpxchg" ptr pos))
+            (t (fcx-val fcx expected)))
+    (if (not (or (type-int? t) (= t ty-ptr)))
+        (err pos (str "cmpxchg needs an integer or ptr operand, found " (type-str t)))
+        (try-let ((a (atomic-type t pos))
+                  (tn (fcx-val fcx new))
+                  (s (fcx-same fcx "cmpxchg" 3 tn t pos))
+                  (d (direct fcx "cmpxchg" t ptr pos)))
+          (Ok (TAnon [t ty-i1]))))))

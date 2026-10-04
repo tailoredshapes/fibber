@@ -1,17 +1,97 @@
-;; compiler/lir/parse/atomics.fib: atomic instructions and fences (crates/lir/src/parse/atomics.rs). OWNER: package R. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/parse/atomics.fib: atomic instructions and fences (crates/lir/src/parse/atomics.rs). OWNER: package R.
 
 (ns lir.parse.atomics
-  (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names))
+  (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names lir.parse.ty))
 
+(def orderings: (Map str LOrdering)
+  {"unordered" OUnordered "monotonic" OMonotonic "acquire" OAcquire "release" ORelease "acq_rel" OAcqRel "seq_cst" OSeqCst})
+
+(def rmw-ops: (Map str LRmwOp)
+  {"xchg" RXchg "add" RAdd "sub" RSub "and" RAnd "nand" RNand "or" ROr "xor" RXor "max" RMax "min" RMin "umax" RUMax "umin" RUMin
+   "fadd" RFAdd "fsub" RFSub "fmax" RFMax "fmin" RFMin})
+
+;; The operands after an optional leading flag word, and whether it was there.
+(defstruct Flagged (on: bool rest: (Vec Sexp)))
+
+;; The scope word and the rest.
+(defstruct Scoped (scope: LScope rest: (Vec Sexp)))
 
 ;; The form for `atomic-load atomic-store atomicrmw cmpxchg fence`, nil for another head. (atomics.rs `parse`)
 (defun parse-atomic (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Option (Result LExpr Diagnostic))
-  (trap "todo: lir.parse.atomics parse-atomic"))
+  (cond (or (= name "atomic-load") (= name "atomic-store") (= name "fence")) (some (load-store-fence sub name args pos))
+        (= name "atomicrmw") (some (rmw sub args pos))
+        (= name "cmpxchg") (some (cmpxchg sub args pos))
+        :else nil))
 
 ;; `unordered monotonic acquire release acq_rel seq_cst`. (atomics.rs `ordering_word`)
 (defun ordering-word (s: str) -> (Option LOrdering)
-  (trap "todo: lir.parse.atomics ordering-word"))
+  (get orderings s))
+
+(defun ordering :private (s: Sexp) -> (Result LOrdering Diagnostic)
+  (try-let ((a (atom-text s "an ordering")))
+    (match (ordering-word a)
+      ((some o) (Ok o))
+      (nil (err (sexp-pos s) (str "unknown ordering " a))))))
+
+(defun flag :private (args: (Vec Sexp) word: str) -> Flagged
+  (if (and (> (count args) 0) (atom-is? (nth args 0) word))
+      (Flagged true (vec-from args 1))
+      (Flagged false args)))
+
+(defun scope :private (args: (Vec Sexp)) -> Scoped
+  (let ((f (flag args "singlethread")))
+    (Scoped (if (. f on) sc-single-thread sc-system) (. f rest))))
+
+(defun load-store-fence :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (let ((sc (scope args)) (rest (. (scope args) rest)))
+    (try-let ((_ (arity name rest (if (= name "fence") 1 3) pos))
+              (ord (ordering (nth rest 0))))
+      (cond (= name "fence") (Ok (expr-new (KFence (. sc scope) ord) pos))
+            (= name "atomic-load")
+            (try-let ((ty (parse-type (nth rest 1))) (p (operand sub (nth rest 2))))
+              (Ok (expr-new (KAtomicLoad (. sc scope) ord ty p) pos)))
+            :else
+            (try-let ((v (operand sub (nth rest 1))) (p (operand sub (nth rest 2))))
+              (Ok (expr-new (KAtomicStore (. sc scope) ord v p) pos)))))))
+
+(defun rmw-op :private (s: Sexp) -> (Result LRmwOp Diagnostic)
+  (try-let ((a (atom-text s "an atomicrmw operation")))
+    (match (get rmw-ops a)
+      ((some o) (Ok o))
+      (nil (err (sexp-pos s) (str "unknown atomicrmw operation " a))))))
+
+(defun rmw :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (if (= (count args) 0)
+      (err pos "atomicrmw expects an operation, an ordering and 2 operands")
+      (try-let ((op (rmw-op (nth args 0))))
+        (let ((sc (scope (vec-from args 1))) (rest (. (scope (vec-from args 1)) rest)))
+          (try-let ((_ (arity "atomicrmw" rest 3 pos))
+                    (ord (ordering (nth rest 0)))
+                    (p (operand sub (nth rest 1)))
+                    (v (operand sub (nth rest 2))))
+            (Ok (expr-new (KAtomicRmw op (. sc scope) ord p v) pos)))))))
 
 ;; The failure ordering a cmpxchg takes when none is written. (atomics.rs `default_failure`)
 (defun default-failure (success: LOrdering) -> LOrdering
-  (trap "todo: lir.parse.atomics default-failure"))
+  (match success
+    ((OAcqRel) OAcquire)
+    ((ORelease) OMonotonic)
+    (o o)))
+
+(defun cmpxchg :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (let ((weak (flag args "weak")))
+    (let ((sc (scope (. weak rest))))
+      (if (= (count (. sc rest)) 0)
+          (err pos "cmpxchg expects an ordering and 3 operands")
+          (try-let ((success (ordering (nth (. sc rest) 0))))
+            (cmpxchg-rest sub (. weak on) (. sc scope) success (vec-from (. sc rest) 1) pos))))))
+
+(defun cmpxchg-rest :private (sub: ExprParser weak: bool sc: LScope success: LOrdering rest: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (let ((given (if (> (count rest) 0) (match (nth rest 0) ((SxAtom a _) (ordering-word a)) (_ nil)) nil)))
+    (let ((failure (match given ((some f) f) (nil (default-failure success))))
+          (ops (match given ((some _) (vec-from rest 1)) (nil rest))))
+      (try-let ((_ (arity "cmpxchg" ops 3 pos))
+                (p (operand sub (nth ops 0)))
+                (e (operand sub (nth ops 1)))
+                (n (operand sub (nth ops 2))))
+        (Ok (expr-new (KCmpXchg weak sc success failure p e n) pos))))))

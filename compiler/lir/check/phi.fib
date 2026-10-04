@@ -1,13 +1,86 @@
-;; compiler/lir/check/phi.fib: phi: placement now, predecessors and incoming values once every block is typed (spec/lir.md 5.4; crates/lir/src/check/phi.rs). OWNER: package K2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/phi.fib: phi: placement now, predecessors and incoming values once every block is typed (spec/lir.md 5.4; crates/lir/src/check/phi.rs). OWNER: package K1 (the wave prompt gives phi.fib to K1; lair-interfaces.md says K2).
 
 (ns lir.check.phi
-  (:use lir.diag lir.types lir.ast lir.check.walk lir.check.fcx))
+  (:use lir.diag lir.types lir.ast lir.check.env lir.check.walk lir.check.fcx))
 
 
 ;; Registers the phi of the current block; `phi after the first instruction of block B`. (phi.rs `Fcx::phi`)
 (defun check-phi (fcx: Fcx t: LType inc: (Vec LBinding) pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.phi check-phi"))
+  (let ((emitted (. fcx emitted)) (phis (. fcx phis)) (cur (fcx-cur fcx)))
+    (if @emitted
+        (err pos (str "phi after the first instruction of block " (fcx-label fcx cur)))
+        (try-let ((_ (fcx-valid fcx t pos)))
+          (do (update! phis (fn (v) (conj v (PendingPhi cur t inc pos))))
+              (Ok t))))))
 
 ;; Checks every pending phi after the last block. (phi.rs `finish_phis`)
 (defun finish-phis (fcx: Fcx) -> (Result unit Diagnostic)
-  (trap "todo: lir.check.phi finish-phis"))
+  (let ((phis (. fcx phis)))
+    (let ((all @phis))
+      (do (set! phis (let ((e: (Vec PendingPhi) (vec-empty))) e))
+          (loop ((i 0))
+            (if (>= i (count all))
+                (Ok ())
+                (match (finish-phi fcx (nth all i))
+                  ((Ok _) (recur (+ i 1)))
+                  ((Err d) (Err d)))))))))
+
+;; Checks the entries of one phi in order, then that every predecessor has one. (phi.rs `finish_phi`)
+(defun finish-phi (fcx: Fcx ph: PendingPhi) -> (Result unit Diagnostic)
+  (let ((here (fcx-label fcx (. ph block)))
+        (preds (nth (. (. fcx cfg) preds) (. ph block))))
+    (loop ((i 0) (seen: (Vec i64) (vec-empty)))
+      (if (< i (count (. ph incoming)))
+          (let ((b (nth (. ph incoming) i)))
+            (match (get (. fcx labels) (. b name))
+              (nil (err (. b pos) (str "undefined block " (. b name))))
+              ((some m)
+               (cond (not (includes? m preds))
+                     (err (. b pos) (str "phi in " here " names " (. b name) ", which is not a predecessor"))
+                     (includes? m seen)
+                     (err (. b pos) (str "phi in " here " has two entries for " (. b name)))
+                     :else
+                     (match (phi-incoming fcx (. b value) m)
+                       ((Err d) (Err d))
+                       ((Ok t)
+                        (if (= t (. ph ty))
+                            (recur (+ i 1) (conj seen m))
+                            (err (. b pos) (str "phi: incoming value from " (. b name) " has type " (type-str t) ", expected " (type-str (. ph ty)))))))))))
+          (match (phi-missing preds seen)
+            ((some m) (err (. ph pos) (str "phi in " here " has no entry for predecessor " (fcx-label fcx m))))
+            (nil (Ok ())))))))
+
+;; The first predecessor without an entry.
+(defun phi-missing (preds: (Vec i64) seen: (Vec i64)) -> (Option i64)
+  (loop ((i 0))
+    (cond (>= i (count preds)) nil
+          (not (includes? (nth preds i) seen)) (some (nth preds i))
+          :else (recur (+ i 1)))))
+
+(defun phi-void-call? (fcx: Fcx callee: LCallee pos: i64) -> bool
+  (match callee
+    ((CalDirect f) (match (env-function (. fcx env) f pos) ((Ok t) (= (. t ret) nil)) ((Err _) false)))
+    (_ false)))
+
+;; The type of an incoming value, used at the end of block `m`. (phi.rs `incoming`)
+(defun phi-incoming (fcx: Fcx v: LExpr m: i64) -> (Result LType Diagnostic)
+  (let ((void (err (. v pos) "void value used as an operand")))
+    (if (kind-terminator? (. v kind))
+        (err (. v pos) "terminator used as a value")
+        (match (. v kind)
+          ((KLocal n) (fcx-lookup-at-end fcx n m (. v pos)))
+          ((KStore _ _ _ _) void)
+          ((KAtomicStore _ _ _ _) void)
+          ((KFence _ _) void)
+          ((KTrap) void)
+          ((KCall callee _ _) (if (phi-void-call? fcx callee (. v pos)) void (phi-constant fcx v m)))
+          (_ (phi-constant fcx v m))))))
+
+(defun phi-constant (fcx: Fcx v: LExpr m: i64) -> (Result LType Diagnostic)
+  (if (constant? v)
+      (let ((cur (. fcx cur)) (emitted (. fcx emitted)))
+        (let ((saved-cur @cur) (saved-emitted @emitted))
+          (do (set! cur m)
+              (let ((t (fcx-val fcx v)))
+                (do (set! cur saved-cur) (set! emitted saved-emitted) t)))))
+      (err (. v pos) "phi incoming value must be a name, a global or a constant")))

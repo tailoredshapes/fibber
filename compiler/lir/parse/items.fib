@@ -1,9 +1,192 @@
-;; compiler/lir/parse/items.fib: the top-level forms (crates/lir/src/parse/items.rs). OWNER: package R. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/parse/items.fib: the top-level forms (crates/lir/src/parse/items.rs). OWNER: package R.
 
 (ns lir.parse.items
-  (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names))
+  (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names lir.parse.ty lir.parse.expr))
 
+(def top-text: str "expected a top-level form (define, declare, declare-global, defstruct, global, constant)")
 
 ;; Every top-level form, in source order: `defstruct global constant declare-global declare define`. (items.rs `module`)
 (defun parse-module (forms: (Vec Sexp)) -> (Result LModule Diagnostic)
-  (trap "todo: lir.parse.items parse-module"))
+  (loop ((i 0) (out []))
+    (if (>= i (count forms))
+        (Ok (LModule out))
+        (match (item (nth forms i))
+          ((Err d) (Err d))
+          ((Ok it) (recur (+ i 1) (conj out it)))))))
+
+(defun item :private (form: Sexp) -> (Result LItem Diagnostic)
+  (match form
+    ((SxList items pos)
+     (let ((head (if (> (count items) 0) (atom-or-empty (nth items 0)) ""))
+           (rest (if (> (count items) 0) (vec-from items 1) items)))
+       (cond (= head "defstruct") (defstruct-form rest pos)
+             (= head "global") (global rest pos false)
+             (= head "constant") (global rest pos true)
+             (= head "declare-global") (declare-global rest pos)
+             (= head "declare") (declare rest pos)
+             (= head "define") (define rest pos)
+             :else (err pos (str top-text ", found " (sexp-describe form))))))
+    (_ (err (sexp-pos form) (str top-text ", found " (sexp-describe form))))))
+
+(defun global-name :private (s: Sexp) -> (Result str Diagnostic)
+  (try-let ((a (atom-text s "a name"))) (valid-name a (sexp-pos s))))
+
+(defun defstruct-form :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
+  (try-let ((_ (arity "defstruct" rest 2 pos))
+            (name (global-name (nth rest 0))))
+    (match (nth rest 1)
+      ((SxList fields _)
+       (try-let ((fs (parse-types fields))) (Ok (ItStruct (LStructDef name fs pos)))))
+      (other (err (sexp-pos other) "expected a field type list")))))
+
+(defun parse-types :private (items: (Vec Sexp)) -> (Result (Vec LType) Diagnostic)
+  (loop ((i 0) (out []))
+    (if (>= i (count items))
+        (Ok out)
+        (match (parse-type (nth items i))
+          ((Err d) (Err d))
+          ((Ok t) (recur (+ i 1) (conj out t)))))))
+
+;; The modifiers at the front of a form and how many words they took.
+(defstruct Mods (linkage: LLinkage hidden: bool used: i64))
+
+;; The linkage word a modifier names, nil for `hidden` or a non-modifier; the second answer is whether it is a modifier at all.
+(defun modifier-code :private (word: str) -> i64
+  (cond (= word "private") 0 (= word "internal") 1 (= word "external") 2 (= word "hidden") 3 :else -1))
+
+(defun linkage-of :private (code: i64) -> LLinkage
+  (cond (= code 0) lk-private (= code 1) lk-internal :else lk-external))
+
+(defun linkage-word :private (l: LLinkage) -> str
+  (match l ((LkExternal) "external") ((LkInternal) "internal") ((LkPrivate) "private")))
+
+;; The linkage and visibility words at the front of `items`, and how many they took (spec/lir.md 4.3). (items.rs `modifiers`)
+(defun modifiers :private (items: (Vec Sexp)) -> (Result Mods Diagnostic)
+  (loop ((i 0) (linkage lk-external) (seen false) (hidden false))
+    (let ((word (if (< i (count items)) (atom-or-empty (nth items i)) ""))
+          (code (modifier-code (if (< i (count items)) (atom-or-empty (nth items i)) ""))))
+      (if (< code 0)
+          (Ok (Mods linkage hidden i))
+          (let ((is-linkage (< code 3))
+                (dup (if (< code 3) seen hidden)))
+            (cond (and dup is-linkage (not (= (linkage-of code) linkage)))
+                  (err (sexp-pos (nth items i)) (str (linkage-word linkage) " and " word " exclude each other"))
+                  dup (err (sexp-pos (nth items i)) (str "duplicate modifier " word))
+                  is-linkage (recur (+ i 1) (linkage-of code) true hidden)
+                  :else (recur (+ i 1) linkage seen true)))))))
+
+;; Whether any of the first n items is the atom `external`.
+(defun has-external? :private (items: (Vec Sexp) n: i64) -> bool
+  (loop ((i 0))
+    (cond (>= i n) false
+          (atom-is? (nth items i) "external") true
+          :else (recur (+ i 1)))))
+
+;; A `declare` or `declare-global` takes `hidden` only. (items.rs `declared_hidden`)
+(defun declared-hidden :private (op: str items: (Vec Sexp)) -> (Result Mods Diagnostic)
+  (try-let ((m (modifiers items)))
+    (if (or (not (= (. m linkage) lk-external)) (has-external? items (. m used)))
+        (err (sexp-pos (nth items 0)) (str op " cannot be " (linkage-word (. m linkage))))
+        (Ok m))))
+
+(defun global :private (rest: (Vec Sexp) pos: i64 constant: bool) -> (Result LItem Diagnostic)
+  (let ((op (if constant "constant" "global")))
+    (try-let ((m (modifiers rest)))
+      (let ((body (vec-from rest (. m used))))
+        (try-let ((_ (arity op body 3 pos))
+                  (name (global-name (nth body 0)))
+                  (ty (parse-type (nth body 1)))
+                  (init (parse-expr (nth body 2))))
+          (Ok (ItGlobal (LGlobalDef name ty init constant (LModifiers (. m linkage) (. m hidden)) pos))))))))
+
+(defun declare-global :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
+  (try-let ((m (declared-hidden "declare-global" rest)))
+    (let ((body (vec-from rest (. m used))))
+      (try-let ((_ (arity "declare-global" body 2 pos))
+                (name (global-name (nth body 0)))
+                (ty (parse-type (nth body 1))))
+        (Ok (ItDeclareGlobal (LGlobalDecl name ty (. m hidden) pos)))))))
+
+(defun declare :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
+  (try-let ((m (declared-hidden "declare" rest)))
+    (let ((after (vec-from rest (. m used)))
+          (split (parse-cc (vec-from rest (. m used)))))
+      (let ((body (vec-from after (. split used))))
+        (try-let ((_ (arity "declare" body 3 pos))
+                  (name (global-name (nth body 0)))
+                  (ret (parse-ret (nth body 1)))
+                  (ps (parse-params (nth body 2))))
+          (Ok (ItDeclare (LDeclare name (LFnType (. split cc) ret (. ps types) (. ps varargs)) (. m hidden) pos))))))))
+
+(defun define :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
+  (try-let ((m (modifiers rest)))
+    (let ((after (vec-from rest (. m used)))
+          (split (parse-cc (vec-from rest (. m used)))))
+      (let ((body (vec-from after (. split used))))
+        (if (< (count body) 2)
+            (err pos "define expects (NAME R), parameters and blocks")
+            (match (nth body 0)
+              ((SxList h _)
+               (if (= (count h) 2)
+                   (define-rest m split body (nth h 0) (nth h 1) pos)
+                   (err (sexp-pos (nth body 0)) "expected (NAME R) after define")))
+              (other (err (sexp-pos other) "expected (NAME R) after define"))))))))
+
+(defun define-rest :private (m: Mods split: CcSplit body: (Vec Sexp) name-form: Sexp ret-form: Sexp pos: i64) -> (Result LItem Diagnostic)
+  (try-let ((name (global-name name-form))
+            (ret (parse-ret ret-form))
+            (ps (params (nth body 1)))
+            (blocks (parse-blocks body)))
+    (Ok (ItDefine (LFunction name (LFnType (. split cc) ret (. ps types) false) (. ps names) blocks
+                             (LModifiers (. m linkage) (. m hidden)) pos)))))
+
+(defstruct Params (types: (Vec LType) names: (Vec LParam)))
+
+(defun params :private (s: Sexp) -> (Result Params Diagnostic)
+  (match s
+    ((SxList items _)
+     (loop ((i 0) (tys []) (names []))
+       (if (>= i (count items))
+           (Ok (Params tys names))
+           (match (nth items i)
+             ((SxList tn pp)
+              (if (= (count tn) 2)
+                  (match (parse-type (nth tn 0))
+                    ((Err d) (Err d))
+                    ((Ok ty) (match (try-let ((a (atom-text (nth tn 1) "a parameter name"))) (valid-name a pp))
+                               ((Err d) (Err d))
+                               ((Ok n) (recur (+ i 1) (conj tys ty) (conj names (LParam n pp)))))))
+                  (err (sexp-pos (nth items i)) "a parameter must be (T name)")))
+             (other (err (sexp-pos other) "a parameter must be (T name)"))))))
+    (_ (err (sexp-pos s) "expected a parameter list ((T name)..)"))))
+
+(defun parse-blocks :private (body: (Vec Sexp)) -> (Result (Vec LBlock) Diagnostic)
+  (loop ((i 2) (out []))
+    (if (>= i (count body))
+        (Ok out)
+        (match (block (nth body i))
+          ((Err d) (Err d))
+          ((Ok b) (recur (+ i 1) (conj out b)))))))
+
+(defun block :private (s: Sexp) -> (Result LBlock Diagnostic)
+  (match s
+    ((SxList items pos)
+     (if (and (> (count items) 0) (atom-is? (nth items 0) "block"))
+         (if (< (count items) 2)
+             (err pos "block needs a label")
+             (try-let ((l (label (nth items 1)))
+                       (body (block-body items)))
+               (Ok (LBlock l body pos))))
+         (block-found s)))
+    (_ (block-found s))))
+
+(defun block-body :private (items: (Vec Sexp)) -> (Result (Vec LExpr) Diagnostic)
+  (loop ((i 2) (out []))
+    (if (>= i (count items))
+        (Ok out)
+        (match (parse-expr (nth items i))
+          ((Err d) (Err d))
+          ((Ok e) (recur (+ i 1) (conj out e)))))))
+
+(defun block-found :private (s: Sexp) -> (Result LBlock Diagnostic)
+  (err (sexp-pos s) (str "expected (block LABEL instr..), found " (sexp-describe s))))

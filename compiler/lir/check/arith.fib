@@ -1,35 +1,200 @@
-;; compiler/lir/check/arith.fib: arithmetic, comparisons, conversions and select (spec/lir.md 6.1 to 6.3; crates/lir/src/check/arith.rs). OWNER: package K2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/arith.fib: arithmetic, comparisons, conversions and select (spec/lir.md 6.1 to 6.3; crates/lir/src/check/arith.rs). OWNER: package K2.
 
 ;; Each rule takes the context and types its operands with `fcx-val`, left to right, as the Rust does.
 
 (ns lir.check.arith
-  (:use lir.diag lir.types lir.lit lir.ast lir.check.fcx))
+  (:use lir.diag lir.types lir.lit lir.ast lir.check.fcx lir.check.aggr))
 
+
+(defun bin-name :private (op: LBinOp) -> str
+  (match op
+    ((BAdd) "add") ((BSub) "sub") ((BMul) "mul") ((BSDiv) "sdiv") ((BUDiv) "udiv") ((BSRem) "srem") ((BURem) "urem")
+    ((BFAdd) "fadd") ((BFSub) "fsub") ((BFMul) "fmul") ((BFDiv) "fdiv") ((BFRem) "frem")
+    ((BAnd) "and") ((BOr) "or") ((BXor) "xor") ((BShl) "shl") ((BLShr) "lshr") ((BAShr) "ashr")))
+
+(defun bin-float? :private (op: LBinOp) -> bool
+  (match op ((BFAdd) true) ((BFSub) true) ((BFMul) true) ((BFDiv) true) ((BFRem) true) (_ false)))
+
+(defun bin-division? :private (op: LBinOp) -> bool
+  (match op ((BSDiv) true) ((BUDiv) true) ((BSRem) true) ((BURem) true) (_ false)))
+
+(defun bin-shift? :private (op: LBinOp) -> bool
+  (match op ((BShl) true) ((BLShr) true) ((BAShr) true) (_ false)))
+
+;; The literal lane of an expression as an unsigned value of its width (arith.rs `literal_lanes`, one lane).
+(defun lane-of :private (x: LExpr) -> (Option i64)
+  (match (. x kind)
+    ((KInt t v) (match t ((TInt b) (some (lit-low v b))) (_ nil)))
+    (_ nil)))
+
+;; Every literal lane of `e` (arith.rs `literal_lanes`).
+(defun literal-lanes (e: LExpr) -> (Vec i64)
+  (match (. e kind)
+    ((KVector _ es) (vec (keep lane-of es)))
+    (_ (if-some (l (lane-of e)) [l] []))))
+
+(defun any-zero? :private (lanes: (Vec i64)) -> bool
+  (loop ((i 0))
+    (cond (>= i (count lanes)) false
+          (= (nth lanes i) 0) true
+          :else (recur (+ i 1)))))
+
+;; The first lane that is not below `width` (as unsigned words), or nil.
+(defun first-wide :private (lanes: (Vec i64) width: i64) -> (Option i64)
+  (loop ((i 0))
+    (cond (>= i (count lanes)) nil
+          (not (u64-lt (nth lanes i) width)) (some (nth lanes i))
+          :else (recur (+ i 1)))))
+
+;; The literal rules of a binary operation once both operand types agree: division by zero and shift width.
+(defun bin-literals :private (op: LBinOp ta: LType b: LExpr pos: i64) -> (Result LType Diagnostic)
+  (let ((lanes (if (or (bin-division? op) (bin-shift? op)) (literal-lanes b) []))
+        (width (match (type-bits (type-scalar ta)) ((some w) w) (nil 0))))
+    (cond (and (bin-division? op) (any-zero? lanes)) (err pos "division by constant zero")
+          (bin-shift? op)
+          (match (first-wide lanes width)
+            ((some n) (err pos (str "shift amount " (u64-str n) " is not less than the width " width)))
+            (nil (Ok ta)))
+          :else (Ok ta))))
 
 ;; (arith.rs `bin`)
 (defun check-bin (fcx: Fcx op: LBinOp a: LExpr b: LExpr pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.arith check-bin"))
+  (let ((name (bin-name op))
+        (float (bin-float? op)))
+    (try-let ((ta (fcx-val fcx a)))
+      (cond (and float (not (type-float-like? ta)))
+            (err pos (str name " needs float operands, found " (type-str ta)))
+            (and (not float) (not (type-int-like? ta)))
+            (err pos (str name " needs integer operands, found " (type-str ta)))
+            :else
+            (try-let ((tb (fcx-val fcx b))
+                      (same (fcx-same fcx name 2 tb ta pos)))
+              (bin-literals op ta b pos))))))
+
+(defun ovf-name :private (op: LOvfOp) -> str
+  (match op ((OvSAdd) "sadd-overflow") ((OvSSub) "ssub-overflow") ((OvSMul) "smul-overflow")))
 
 ;; `{ T, i1 }` of the same shape. (arith.rs `overflow`)
 (defun check-overflow (fcx: Fcx op: LOvfOp a: LExpr b: LExpr pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.arith check-overflow"))
+  (let ((name (ovf-name op)))
+    (try-let ((ta (fcx-val fcx a)))
+      (if (not (type-int-like? ta))
+          (err pos (str name " needs integer operands, found " (type-str ta)))
+          (try-let ((tb (fcx-val fcx b))
+                    (same (fcx-same fcx name 2 tb ta pos)))
+            (Ok (TAnon [ta (type-bool-shape ta)])))))))
 
 ;; (arith.rs `un`)
 (defun check-un (fcx: Fcx op: LUnOp a: LExpr pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.arith check-un"))
+  (try-let ((t (fcx-val fcx a)))
+    (match op
+      ((UFNeg) (if (type-float-like? t) (Ok t) (err pos (str "fneg needs float operands, found " (type-str t)))))
+      ((UCtpop) (if (type-int-like? t) (Ok t) (err pos (str "ctpop needs integer operands, found " (type-str t))))))))
 
 ;; `name` is `icmp` or `fcmp`. (arith.rs `cmp`)
 (defun check-cmp (fcx: Fcx name: str a: LExpr b: LExpr pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.arith check-cmp"))
+  (try-let ((ta (fcx-val fcx a)))
+    (let ((icmp (= name "icmp"))
+          (ok (if (= name "icmp")
+                  (or (type-int-like? ta) (= (type-scalar ta) ty-ptr))
+                  (type-float-like? ta))))
+      (if (not ok)
+          (err pos (str name " needs " (if icmp "integer or ptr" "float") " operands, found " (type-str ta)))
+          (try-let ((tb (fcx-val fcx b))
+                    (same (fcx-same fcx name 2 tb ta pos)))
+            (Ok (type-bool-shape ta)))))))
+
+;; The rule on the condition of a select against the type of its arms.
+(defun select-cond :private (tc: LType ta: LType pos: i64) -> (Result unit Diagnostic)
+  (cond (= tc ty-i1) (Ok ())
+        :else
+        (match tc
+          ((TVector n e)
+           (cond (and (= e ty-i1) (= (type-lanes ta) (some n))) (Ok ())
+                 (= e ty-i1) (err pos (str "select condition " (type-str tc) " does not match " (type-str ta)))
+                 :else (err pos (str "select condition must be i1, found " (type-str tc)))))
+          (_ (err pos (str "select condition must be i1, found " (type-str tc)))))))
 
 ;; (arith.rs `select`)
 (defun check-select (fcx: Fcx c: LExpr a: LExpr b: LExpr pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.arith check-select"))
+  (try-let ((tc (fcx-val fcx c))
+            (ta (fcx-val fcx a))
+            (tb (fcx-val fcx b))
+            (cond-ok (select-cond tc ta pos))
+            (same (fcx-same fcx "select" 3 tb ta pos)))
+    (Ok ta)))
 
 ;; (arith.rs `cast`)
 (defun check-cast (fcx: Fcx op: LCastOp t: LType v: LExpr pos: i64) -> (Result LType Diagnostic)
-  (trap "todo: lir.check.arith check-cast"))
+  (try-let ((valid (fcx-valid fcx t pos))
+            (tv (fcx-val fcx v))
+            (rule (cast-rule op t tv pos)))
+    (Ok t)))
+
+(defun cast-name :private (op: LCastOp) -> str
+  (match op
+    ((CTrunc) "trunc") ((CZExt) "zext") ((CSExt) "sext") ((CFpTrunc) "fptrunc") ((CFpExt) "fpext")
+    ((CFpToSi) "fptosi") ((CFpToUi) "fptoui") ((CSiToFp) "sitofp") ((CUiToFp) "uitofp")
+    ((CPtrToInt) "ptrtoint") ((CIntToPtr) "inttoptr") ((CBitcast) "bitcast")
+    ((CFpToSiSat) "fptosi-sat") ((CFpToUiSat) "fptoui-sat")))
+
+(defun bits-or-0 :private (t: LType) -> i64
+  (match (type-bits t) ((some b) b) (nil 0)))
+
+;; trunc zext sext fptrunc fpext: both types of one class, then a width order. `narrowing` is trunc or fptrunc.
+(defun resize-rule :private (n: str class: str is-class: (fn (LType) bool) narrowing: bool t: LType v: LType pos: i64) -> (Result unit Diagnostic)
+  (cond (not (and (is-class t) (is-class v)))
+        (err pos (str n " needs " class " types, found " (type-str (if (not (is-class t)) t v))))
+        narrowing
+        (if (< (bits-or-0 t) (bits-or-0 v)) (Ok ()) (err pos (str n ": " (type-str t) " is not narrower than " (type-str v))))
+        :else
+        (if (> (bits-or-0 t) (bits-or-0 v)) (Ok ()) (err pos (str n ": " (type-str t) " is not wider than " (type-str v))))))
+
+(defun fp-to-int-rule :private (n: str sat: bool t: LType v: LType pos: i64) -> (Result unit Diagnostic)
+  (cond (not (type-int? t))
+        (err pos (str n " needs an integer" (if sat " scalar" "") " result type, found " (type-str t)))
+        (not (type-float? v)) (err pos (str n " needs a float operand, found " (type-str v)))
+        :else (Ok ())))
 
 ;; The type rule of a cast, on the two types; pure. (arith.rs `cast_rule`)
 (defun cast-rule (op: LCastOp t: LType v: LType pos: i64) -> (Result unit Diagnostic)
-  (trap "todo: lir.check.arith cast-rule"))
+  (let ((n (cast-name op)))
+    (match op
+      ((CTrunc) (resize-rule n "integer" type-int? true t v pos))
+      ((CZExt) (resize-rule n "integer" type-int? false t v pos))
+      ((CSExt) (resize-rule n "integer" type-int? false t v pos))
+      ((CFpTrunc) (resize-rule n "float" type-float? true t v pos))
+      ((CFpExt) (resize-rule n "float" type-float? false t v pos))
+      ((CFpToSi) (fp-to-int-rule n false t v pos))
+      ((CFpToUi) (fp-to-int-rule n false t v pos))
+      ((CFpToSiSat) (fp-to-int-rule n true t v pos))
+      ((CFpToUiSat) (fp-to-int-rule n true t v pos))
+      ((CSiToFp) (int-to-fp-rule n t v pos))
+      ((CUiToFp) (int-to-fp-rule n t v pos))
+      ((CPtrToInt)
+       (cond (not (type-int? t)) (err pos (str n " needs an integer result type, found " (type-str t)))
+             (not (= v ty-ptr)) (err pos (str n " needs a ptr operand, found " (type-str v)))
+             :else (Ok ())))
+      ((CIntToPtr)
+       (cond (not (= t ty-ptr)) (err pos (str n " needs a ptr result type, found " (type-str t)))
+             (not (type-int? v)) (err pos (str n " needs an integer operand, found " (type-str v)))
+             :else (Ok ())))
+      ((CBitcast) (bitcast-rule t v pos)))))
+
+(defun int-to-fp-rule :private (n: str t: LType v: LType pos: i64) -> (Result unit Diagnostic)
+  (cond (not (type-float? t)) (err pos (str n " needs a float result type, found " (type-str t)))
+        (not (type-int? v)) (err pos (str n " needs an integer operand, found " (type-str v)))
+        :else (Ok ())))
+
+;; One side of a bitcast: not a pointer, not an aggregate.
+(defun bitcast-side :private (x: LType pos: i64) -> (Result unit Diagnostic)
+  (cond (= (type-scalar x) ty-ptr) (err pos "bitcast cannot convert ptr")
+        (type-aggregate? x) (err pos (str "bitcast cannot convert " (type-str x)))
+        :else (Ok ())))
+
+(defun bitcast-rule :private (t: LType v: LType pos: i64) -> (Result unit Diagnostic)
+  (try-let ((a (bitcast-side t pos))
+            (b (bitcast-side v pos)))
+    (if (= (type-bits t) (type-bits v))
+        (Ok ())
+        (err pos (str "bitcast: " (type-str v) " and " (type-str t) " differ in size")))))

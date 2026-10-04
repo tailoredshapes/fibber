@@ -1,0 +1,19 @@
+;; compiler/tests/native/drivers/r-dump-ast.fib: `dump-ast FILE` of package R, the fibber side of compare-ast.sh: parses FILE with lir.parse and writes
+;; the AST dump (docs/design/lair-ast-dump.md) to standard output; a file that does not parse writes `FILE:LINE:COL: error: MESSAGE` to standard
+;; error and exits 1, as `lair dump-ast` does.
+;; Build: fibc build compiler/tests/native/drivers/r-dump-ast.fib -I compiler -I lib -o OUT        usage: OUT dump-ast FILE
+(ns main (:use lir.diag lir.parse lir.dump))
+
+(defun dump-file (file: str) -> i64
+  (match (read-file file)
+    (nil (do (eprintln (str file ": cannot read: unreadable")) 1))
+    ((some src)
+     (match (parse-source src)
+       ((Err d) (do (eprintln (diag-in-file d file)) 1))
+       ((Ok m) (do (dump-with m (fn (chunk: str) (print-raw chunk))) 0))))))
+
+(defun main () -> i64
+  (let ((a (vec (args))))
+    (if (and (= (count a) 2) (= (nth a 0) "dump-ast"))
+        (dump-file (nth a 1))
+        (do (eprintln "usage: dump-ast FILE") 2))))

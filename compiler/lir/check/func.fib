@@ -1,4 +1,4 @@
-;; compiler/lir/check/func.fib: one function: structure, control flow, names, then types (spec/lir.md 5; crates/lir/src/check/func.rs). OWNER: package K1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/func.fib: one function: structure, control flow, names, then types (spec/lir.md 5; crates/lir/src/check/func.rs). OWNER: package K1.
 
 ;; `check-function` builds the context with the two dispatchers: `check-ty` of lir.check.expr and `check-terminator` of lir.check.calls.
 
@@ -6,10 +6,102 @@
   (:use lir.diag lir.types lir.ast lir.check.env lir.check.cfg lir.check.walk lir.check.fcx lir.check.phi lir.check.calls lir.check.expr))
 
 
+;; Block labels to indices. (func.rs `labels`)
+(defun func-labels (f: LFunction) -> (Result (Map str i64) Diagnostic)
+  (loop ((i 0) (m {}))
+    (if (>= i (count (. f blocks)))
+        (Ok m)
+        (let ((b (nth (. f blocks) i)))
+          (if (contains? m (. b label))
+              (err (. b pos) (str "duplicate block label " (. b label)))
+              (recur (+ i 1) (assoc m (. b label) i)))))))
+
+;; The first terminator among the statements before the last.
+(defun func-early-terminator (stmts: (Vec LExpr)) -> (Option LExpr)
+  (loop ((i 0))
+    (cond (>= i (- (count stmts) 1)) nil
+          (kind-terminator? (. (nth stmts i) kind)) (some (nth stmts i))
+          :else (recur (+ i 1)))))
+
+;; Each block ends in exactly one terminator (spec/lir.md 5.1). (func.rs `structure`)
+(defun func-structure (f: LFunction) -> (Result unit Diagnostic)
+  (loop ((i 0))
+    (if (>= i (count (. f blocks)))
+        (Ok ())
+        (let ((b (nth (. f blocks) i))
+              (stmts (statements (. (nth (. f blocks) i) body))))
+          (cond (or (= (count stmts) 0) (not (kind-terminator? (. (nth stmts (- (count stmts) 1)) kind))))
+                (err (. b pos) (str "block " (. b label) " does not end in a terminator"))
+                :else
+                (match (func-early-terminator stmts)
+                  ((some t) (err (. t pos) (str "terminator in the middle of block " (. b label))))
+                  (nil (recur (+ i 1)))))))))
+
+;; The labels a terminator names, in order.
+(defun func-targets (k: LKind) -> (Vec str)
+  (match k
+    ((KBr l) [l])
+    ((KCondBr _ t e) [t e])
+    ((KSwitch _ d cases)
+     (loop ((i 0) (acc [d]))
+       (if (>= i (count cases)) acc (recur (+ i 1) (conj acc (. (nth cases i) label))))))
+    (_ (vec-empty))))
+
+;; The successor indices of one block's terminator. (func.rs `successors`, one block)
+(defun func-block-succs (term: LExpr entry: str labels: (Map str i64)) -> (Result (Vec i64) Diagnostic)
+  (let ((targets (func-targets (. term kind))))
+    (loop ((i 0) (succ (vec-empty)))
+      (if (>= i (count targets))
+          (Ok succ)
+          (let ((l (nth targets i)))
+            (match (get labels l)
+              (nil (err (. term pos) (str "undefined block " l)))
+              ((some idx)
+               (cond (= l entry) (err (. term pos) (str "branch to the entry block " l))
+                     (includes? idx succ) (recur (+ i 1) succ)
+                     :else (recur (+ i 1) (conj succ idx))))))))))
+
+;; Successors from each block's terminator; undefined labels and branches to the entry are errors. (func.rs `successors`)
+(defun func-successors (f: LFunction labels: (Map str i64)) -> (Result (Vec (Vec i64)) Diagnostic)
+  (let ((entry (. (nth (. f blocks) 0) label)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (>= i (count (. f blocks)))
+          (Ok out)
+          (let ((stmts (statements (. (nth (. f blocks) i) body))))
+            (match (func-block-succs (nth stmts (- (count stmts) 1)) entry labels)
+              ((Err d) (Err d))
+              ((Ok ss) (recur (+ i 1) (conj out ss)))))))))
+
+;; Reachable blocks in reverse postorder, then the unreachable in source order.
+(defun func-order (cfg: Cfg n: i64) -> (Vec i64)
+  (loop ((b 0) (acc (. cfg rpo)))
+    (cond (>= b n) acc
+          (cfg-reachable? cfg b) (recur (+ b 1) acc)
+          :else (recur (+ b 1) (conj acc b)))))
+
+(defun func-blocks (fcx: Fcx order: (Vec i64)) -> (Result unit Diagnostic)
+  (loop ((i 0))
+    (if (>= i (count order))
+        (Ok ())
+        (match (fcx-block fcx (nth order i))
+          ((Ok _) (recur (+ i 1)))
+          ((Err d) (Err d))))))
+
+(defun func-check-rest (env: LEnv f: LFunction labels: (Map str i64)) -> (Result unit Diagnostic)
+  (try-let ((_ (func-structure f)) (succs (func-successors f labels)) (b (bindings f)))
+    (let ((cfg (cfg-new succs))
+          (fcx (fcx-new env f cfg labels b check-ty check-terminator)))
+      (try-let ((_ (func-blocks fcx (func-order cfg (count (. f blocks))))))
+        (finish-phis fcx)))))
+
 ;; Checks `f` completely; the first error. (func.rs `check_function`)
 (defun check-function (env: LEnv f: LFunction) -> (Result unit Diagnostic)
-  (trap "todo: lir.check.func check-function"))
+  (if (= (count (. f blocks)) 0)
+      (err (. f pos) (str "function @" (. f name) " has no blocks"))
+      (try-let ((labels (func-labels f)))
+        (func-check-rest env f labels))))
 
 ;; The order in which blocks are checked and lowered: reachable blocks in reverse postorder, then the unreachable in source order. For a checked function. (func.rs `block_order`)
 (defun block-order (f: LFunction) -> (Result (Vec i64) Diagnostic)
-  (trap "todo: lir.check.func block-order"))
+  (try-let ((labels (func-labels f)) (succs (func-successors f labels)))
+    (Ok (func-order (cfg-new succs) (count (. f blocks))))))

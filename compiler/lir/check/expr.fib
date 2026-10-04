@@ -1,11 +1,71 @@
-;; compiler/lir/check/expr.fib: typing expressions: the dispatch over the instruction groups (crates/lir/src/check/expr.rs). OWNER: package K2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/expr.fib: typing expressions: the dispatch over the instruction groups (crates/lir/src/check/expr.rs). OWNER: package K2.
 
 ;; The value of the `ty` field of the context.
 
 (ns lir.check.expr
-  (:use lir.diag lir.types lir.ast lir.check.fcx lir.check.walk lir.check.phi lir.check.arith lir.check.aggr lir.check.calls lir.check.memory))
+  (:use lir.diag lir.types lir.ast lir.check.env lir.check.fcx lir.check.walk lir.check.phi lir.check.arith lir.check.aggr lir.check.calls lir.check.memory))
 
+
+;; A typed result as the type of a form that has one.
+(defun some-ty :private (r: (Result LType Diagnostic)) -> (Result (Option LType) Diagnostic)
+  (match r
+    ((Ok t) (Ok (some t)))
+    ((Err d) (Err d))))
+
+(defun global-ref :private (fcx: Fcx g: str pos: i64) -> (Result (Option LType) Diagnostic)
+  (match (get (. (. fcx env) symbols) g)
+    ((some _) (Ok (some ty-ptr)))
+    (nil (err pos (str "undefined global @" g)))))
 
 ;; The type of `e` (nil for void); marks the current block `emitted` when the form emits an instruction. (expr.rs `ty`)
 (defun check-ty (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
-  (trap "todo: lir.check.expr check-ty"))
+  (match (ty-inner fcx e)
+    ((Err d) (Err d))
+    ((Ok t)
+     (do (mark-emitted fcx e)
+         (Ok t)))))
+
+(defun mark-emitted :private (fcx: Fcx e: LExpr) -> unit
+  (let ((emitted (. fcx emitted)))
+    (if (emits? e) (set! emitted true) ())))
+
+(defun ty-inner :private (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
+  (let ((p (. e pos)))
+    (match (. e kind)
+      ((KLocal n) (some-ty (fcx-lookup fcx n p)))
+      ((KGlobal g) (global-ref fcx g p))
+      ((KInt t _) (Ok (some t)))
+      ((KFloat t _) (Ok (some t)))
+      ((KNull) (Ok (some ty-ptr)))
+      ((KStr _) (Ok (some ty-ptr)))
+      ((KVector t _) (Ok (some t)))
+      ((KStruct name fields) (some-ty (check-struct-literal fcx name fields p)))
+      ((KArray t elems) (some-ty (check-array-literal fcx t elems p)))
+      ((KZero t) (try-let ((v (fcx-valid fcx t p))) (Ok (some t))))
+      ((KTrap) (Ok nil))
+      ((KLet binds body) (fcx-let-form fcx binds body true))
+      ((KCall _ _ tail) (if tail (err p "terminator used as a value") (check-call fcx e)))
+      (_ (ty-op fcx e p)))))
+
+;; The operations: arithmetic, aggregates, phi; then the terminators (an error here) and memory.
+(defun ty-op :private (fcx: Fcx e: LExpr p: i64) -> (Result (Option LType) Diagnostic)
+  (match (. e kind)
+    ((KBin op a b) (some-ty (check-bin fcx op a b p)))
+    ((KOverflow op a b) (some-ty (check-overflow fcx op a b p)))
+    ((KUn op a) (some-ty (check-un fcx op a p)))
+    ((KICmp _ a b) (some-ty (check-cmp fcx "icmp" a b p)))
+    ((KFCmp _ a b) (some-ty (check-cmp fcx "fcmp" a b p)))
+    ((KCast op t v) (some-ty (check-cast fcx op t v p)))
+    ((KSelect c a b) (some-ty (check-select fcx c a b p)))
+    ((KExtractElement _ _) (some-ty (check-vector-op fcx e)))
+    ((KInsertElement _ _ _) (some-ty (check-vector-op fcx e)))
+    ((KShuffle _ _ _) (some-ty (check-vector-op fcx e)))
+    ((KExtractValue a idx) (some-ty (check-extract-value fcx a idx p)))
+    ((KInsertValue a v idx) (some-ty (check-insert-value fcx a v idx p)))
+    ((KPhi t inc) (some-ty (check-phi fcx t inc p)))
+    ((KRet _) (err p "terminator used as a value"))
+    ((KBr _) (err p "terminator used as a value"))
+    ((KCondBr _ _ _) (err p "terminator used as a value"))
+    ((KSwitch _ _ _) (err p "terminator used as a value"))
+    ((KUnreachable) (err p "terminator used as a value"))
+    (_ (check-memory fcx e))))
