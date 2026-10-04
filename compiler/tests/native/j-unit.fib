@@ -1,0 +1,159 @@
+;; compiler/tests/native/j-unit.fib: package J's unit tests of native.jit.names, native.jit.prune, native.jit.trampoline and of the session that uses them
+;; (the tests of crates/lair/src/jit/{prune,trampoline}.rs and the messages of names.rs, jit/mod.rs). One line per check, `ok NAME` or `FAIL NAME: ...`;
+;; the exit status is 0 when every check is ok. j-faults.sh plants a fault in each of the three modules and shows this program failing.
+(ns main
+  (:require [lir :as front] [lir.diag :as diag] [lir.ast :as ast] [lir.types :as types] [native.error :as err] [native.jit :as jit]
+            [native.jit.names :as names] [native.jit.prune :as prune] [native.jit.trampoline :as tramp] [native.call :as call])
+  (:use lir.ast))
+
+(defstruct Tally (failed: (Cell i64)))
+
+(defun say :private (t: Tally ok: bool name: str detail: str) -> unit
+  (if ok
+      (println (str "ok " name))
+      (do (set! (. t failed) (+ @(. t failed) 1)) (println (str "FAIL " name ": " detail)))))
+
+(defun expect-str :private (t: Tally name: str got: str want: str) -> unit
+  (say t (= got want) name (str "got [" got "] want [" want "]")))
+
+(defun module-of :private (src: str) -> ast/LModule
+  (match (front/parse-and-check src)
+    ((Ok m) m)
+    ((Err ds) (trap (str "j-unit: bad test module: " (types/str-join-with "; " (vec (map diag/diag-str ds))))))))
+
+(defun result-text :private (r: (Result unit err/LairError)) -> str
+  (match r
+    ((Ok _) "ok")
+    ((Err e) (err/lair-error-str e))))
+
+;; --------------------------------------------------------------------------------------------------------- names
+
+(def first-src: str "(define (f i64) () (block entry (ret (i64 1))))
+(define internal (g i64) () (block entry (ret (i64 2))))
+(global v i64 (i64 3))")
+
+(defun names-after :private () -> names/JitNames
+  (names/names-record (names/names-new) "m1" (module-of first-src)))
+
+(defun in-libc :private (n: str) -> bool (= n "puts"))
+
+(defun function-text :private (ns: names/JitNames name: str) -> str
+  (match (names/names-function ns name)
+    ((Ok ty) (types/fn-type-str ty))
+    ((Err e) (err/lair-error-str e))))
+
+(defun names-tests (t: Tally) -> unit
+  (let ((ns (names-after)))
+    (do (expect-str t "names: nothing defined" (function-text (names/names-new) "f") "error: jit: no function @f is defined in this JIT")
+        (expect-str t "names: an exported function" (function-text ns "f") "(fn i64 ())")
+        (expect-str t "names: an internal function is private" (function-text ns "g") "error: jit: @g is private to module m1")
+        (expect-str t "names: a global is no function" (function-text ns "v") "error: jit: @v is a global, not a function")
+        (expect-str t "names: a second definition" (result-text (names/names-check ns (module-of "(define (f i64) () (block entry (ret (i64 9))))") in-libc))
+                    "1:1: error: duplicate definition of @f (first in module m1)")
+        (expect-str t "names: a second global" (result-text (names/names-check ns (module-of "(global v i64 (i64 4))") in-libc))
+                    "1:1: error: duplicate definition of @v (first in module m1)")
+        (expect-str t "names: an internal of the same name is no clash" (result-text (names/names-check ns (module-of "(define internal (f i64) () (block entry (ret (i64 9))))") in-libc)) "ok")
+        (expect-str t "names: a matching declaration" (result-text (names/names-check ns (module-of "(declare f i64 ())") in-libc)) "ok")
+        (expect-str t "names: a declaration of another type" (result-text (names/names-check ns (module-of "(declare f i32 ())") in-libc))
+                    "1:1: error: declaration of @f does not match its definition in module m1")
+        (expect-str t "names: a variable declared as a function" (result-text (names/names-check ns (module-of "(declare v i64 ())") in-libc))
+                    "1:1: error: declaration of @v does not match its definition in module m1")
+        (expect-str t "names: a declaration of a symbol of the process" (result-text (names/names-check ns (module-of "(declare puts i32 (ptr))") in-libc)) "ok")
+        (expect-str t "names: a declaration nothing defines" (result-text (names/names-check ns (module-of "(declare nowhere i32 ())") in-libc))
+                    "1:1: error: undefined symbol @nowhere: defined by no module of this JIT and not in the process"))))
+
+;; --------------------------------------------------------------------------------------------------------- prune
+
+(def prune-src: str "
+      (global internal g.used i64 (i64 1))
+      (global internal g.dead i64 (i64 2))
+      (global internal g.via-init ptr @g.used)
+      (define internal (leaf i64) () (block entry (ret (load i64 (load ptr @g.via-init)))))
+      (define internal (mid i64) () (block entry (ret (call @leaf))))
+      (define private (dead i64) () (block entry (ret (call @mid))))
+      (define internal (by-pointer i64) () (block entry (ret (i64 3))))
+      (define (entry i64) () (block entry (ret (call @mid))))
+      (define (table ptr) () (block entry (ret @by-pointer)))
+      (define (also-exported i64) () (block entry (ret (i64 0))))")
+
+(defun kept :private (src: str) -> (Vec str)
+  (let ((items (. (prune/dead-internals (module-of src)) items)))
+    (vec (mapcat (fn (it: ast/LItem) -> (Vec str)
+                   (match it
+                     ((ItDefine f) [(. f name)])
+                     ((ItGlobal g) [(. g name)])
+                     (_ [])))
+                 items))))
+
+(defun has? :private (v: (Vec str) n: str) -> bool
+  (some? (first (filter (fn (x: str) -> bool (= x n)) v))))
+
+(defun prune-tests (t: Tally) -> unit
+  (let ((k (kept prune-src)))
+    (do (dotimes (i 7)
+          (let ((n (nth ["entry" "table" "also-exported" "mid" "leaf" "by-pointer" "g.via-init"] i)))
+            (say t (has? k n) (str "prune: " n " stays") (str-join [n " went: " (show k)]))))
+        (dotimes (i 2)
+          (let ((n (nth ["dead" "g.dead"] i)))
+            (say t (not (has? k n)) (str "prune: " n " goes") (str-join [n " stayed: " (show k)]))))
+        (say t (has? k "g.used") "prune: a chain of globals stays" (show k))
+        (expect-str t "prune: the order is the module's" (types/str-join-with " " k) "g.used g.via-init leaf mid by-pointer entry table also-exported")
+        (say t (empty? (kept "(define internal (f i64) () (block entry (ret (i64 1))))")) "prune: no exports keep no definitions" ""))))
+
+;; --------------------------------------------------------------------------------------------------------- trampoline
+
+(defun tramp-tests (t: Tally) -> unit
+  (let ((ty (ast/LFnType types/cc-tail (some types/ty-i64) [types/ty-i64 types/ty-ptr] false))
+        (void (ast/LFnType types/cc-tail nil [] false)))
+    (do (expect-str t "trampoline: the name" (tramp/tramp-name "loop") "loop.tramp")
+        (expect-str t "trampoline: the source" (tramp/tramp-source "loop" ty)
+                    "(declare tailcc loop i64 (i64 ptr))\n(define (loop.tramp i64) ((i64 a0) (ptr a1)) (block entry (ret (call @loop a0 a1))))\n")
+        (say t (s-includes (tramp/tramp-source "f" void) "(block entry (call @f ) (ret))") "trampoline: a void function" (tramp/tramp-source "f" void))
+        (say t (is-ok (front/parse-and-check (tramp/tramp-source "f" void))) "trampoline: the void source checks" ""))))
+
+(defun s-includes :private (s: str sub: str) -> bool
+  (some? (str-find s sub 0)))
+
+(defun is-ok :private (r: (Result a b)) -> bool
+  (match r ((Ok _) true) ((Err _) false)))
+
+;; --------------------------------------------------------------------------------------------------------- the session
+
+(def sess-src: str "(define (plain i64) ((i64 x)) (block entry (ret (add x (i64 1)))))
+(define tailcc (tail i64) ((i64 x)) (block entry (ret (mul x (i64 2)))))
+(define internal (hid i64) () (block entry (ret (i64 5))))")
+
+(defun call-text :private (r: (Result i64 err/LairError)) -> (Result i64 str)
+  (match r
+    ((Err e) (Err (err/lair-error-str e)))
+    ((Ok a) (call/call-i64 a [20]))))
+
+(defun res-text :private (r: (Result i64 str)) -> str
+  (match r
+    ((Ok n) (str "(Ok " n ")"))
+    ((Err m) (str "(Err \"" m "\")"))))
+
+(defun session-tests (t: Tally s: jit/JitSession) -> unit
+  (do (expect-str t "session: add a module" (result-text (jit/session-add-source s "m1" sess-src)) "ok")
+      (expect-str t "session: a ccc function" (res-text (call-text (jit/session-c-entry s "plain"))) "(Ok 21)")
+      (expect-str t "session: a tailcc function through its trampoline" (res-text (call-text (jit/session-c-entry s "tail"))) "(Ok 40)")
+      (expect-str t "session: the trampoline is made once" (res-text (call-text (jit/session-c-entry s "tail"))) "(Ok 40)")
+      (expect-str t "session: the trampoline is a function of the session" (match (jit/session-signature s "tail.tramp") ((Ok ty) (types/fn-type-str ty)) ((Err e) (err/lair-error-str e)))
+                  "(fn i64 (i64))")
+      (expect-str t "session: an internal function has no address" (res-text (call-text (jit/session-address s "hid"))) "(Err \"error: jit: @hid is private to module m1\")")
+      (expect-str t "session: a missing function" (res-text (call-text (jit/session-address s "nope"))) "(Err \"error: jit: no function @nope is defined in this JIT\")")
+      (expect-str t "session: a second definition" (result-text (jit/session-add-source s "m2" "(define (plain i64) () (block entry (ret (i64 0))))"))
+                  "1:1: error: duplicate definition of @plain (first in module m1)")
+      (expect-str t "session: usable after the refusal" (res-text (call-text (jit/session-address s "plain"))) "(Ok 21)")
+      (expect-str t "session: a later module sees the first" (result-text (jit/session-add-source s "m3" "(declare plain i64 (i64))\n(define (twice i64) ((i64 x)) (block entry (ret (call @plain (call @plain x)))))")) "ok")
+      (expect-str t "session: and calls it" (res-text (call-text (jit/session-address s "twice"))) "(Ok 22)")))
+
+(defun main () -> i64
+  (let ((t (Tally (cell 0))))
+    (do (names-tests t)
+        (prune-tests t)
+        (tramp-tests t)
+        (match (jit/session-new 0)
+          ((Err e) (say t false "session: new" (err/lair-error-str e)))
+          ((Ok s) (do (session-tests t s) (jit/session-free s))))
+        (if (= @(. t failed) 0) (do (println "all ok") 0) (do (println (str @(. t failed) " failed")) 1)))))
