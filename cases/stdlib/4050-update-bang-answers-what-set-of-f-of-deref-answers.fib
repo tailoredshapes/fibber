@@ -1,0 +1,35 @@
+;; spec:   stdlib §2.5 (update! on a Cell), §4.3 (row update!)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: update!
+;; (update! c f) leaves c holding f of what it held, whatever the type: a Vec grown in a loop, a string, an i64, an
+;; Option (whose nil is the null word), and a call that nests another update! on a second cell inside f's argument
+;; evaluation. The answer is unit: the new value is read with @c. The same program written with
+;; (set! c (f @c)) gives the same answers, which the last check compares element by element.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v (cell (vec-empty)))
+        (w (cell (vec-empty)))
+        (s (cell "ab"))
+        (n (cell 40))
+        (o (cell (some 1)))
+        (z (cell nil)))
+    (do (dotimes (i 100) (update! v (fn (x) (conj x i))))
+        (dotimes (i 100) (set! w (conj @w i)))
+        (update! s (fn (x) (str x "cd")))
+        (update! n (fn (x) (+ x 2)))
+        (update! o (fn (x) (match x ((some k) (some (+ k 1))) (nil nil))))
+        (update! z (fn (x) (match x ((some k) (some k)) (nil (some 7)))))
+        (check c (= (count @v) 100))
+        (check c (= (nth @v 0) 0))
+        (check c (= (nth @v 99) 99))
+        (check c (= @v @w))
+        (check c (= @s "abcd"))
+        (check c (= @n 42))
+        (check c (= @o (some 2)))
+        (check c (= @z (some 7)))
+        (checks-result c))))

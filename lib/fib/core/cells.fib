@@ -1,0 +1,24 @@
+;; fib.core.cells: update!, the in-place update of a value held in a Cell (stdlib §2.5, §4.3 row update!; performance
+;; batch 2, lever L6). Exports update!.
+;;
+;; `(set! c (conj @c x))` copies the value every time: `@c` acquires, so the value has count 2 while conj runs, and conj
+;; sees it shared. `(update! c f)` takes the value OUT of the cell (the cell holds nothing while f runs), applies f to it
+;; and stores the result, so a value only the cell held reaches f with count 1 and f's own updates are in place.
+;;
+;; Decided here:
+;;  - Cell only. An Atom is visible to other tasks and its value is never unique, so `swap!` copies and stays the form
+;;    for atoms; `(update! an-atom f)` is a type error (the argument is not a Cell).
+;;  - f is `(fn :send (a) a)`. A Send closure cannot capture a Cell, so f cannot read or write `c` while the cell is
+;;    empty: the type is what makes the take safe, not a syntactic test. A closure that captures a Cell is refused
+;;    (`cell cannot be shared between threads`); read what you need from other cells before the call.
+;;  - the answer is unit, not the new value: returning it would acquire it and make the next update shared. Read `@c`.
+;;  - f runs once (swap! on an atom may run it again). If f traps the task is over, and the cell with it.
+;;  - a value that another holder also holds (a vector `v` that was `(cell v)`-ed and is still used) has count 2: f's
+;;    updates copy, and the other holder is never changed.
+;;  - until the builtin `cell-update!` lands (PERFB2/L6-request.md) the body is `(set! c (f @c))`: the same answer, no
+;;    in-place update.
+(ns fib.core.cells (:use fib.core.base))
+
+;; (update! c f): c holds f of what it held
+(defun update! (c: (Cell a) f: (fn :send (a) a) :borrow) -> unit
+  (set! c (f @c)))

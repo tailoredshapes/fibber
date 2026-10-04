@@ -704,6 +704,8 @@ so `vec` and `into` live in the same module as `Vec`: about n/32 allocations ins
 element that a `conj` loop costs today (**[H]**: the design record's bulk builder filled a flat array with
 14 objects for 1000 elements; assembling the trie from it was not written).
 
+**`(update! c f)` is the in-place form for a value in a `Cell`** (row `update!`): `(set! c (conj @c x))` copies because `@c` acquires, and `(update! c (fn (v) (conj v x)))` moves the value out of the cell for the call of `f`. Cells only; an `Atom` copies (it is shared) and keeps `swap!`.
+
 **A loop of `conj` or `assoc` is in place iff the accumulator is unique.** Today it never is
 ([R] A4):
 
@@ -1288,6 +1290,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `set!` | adapt | `(set! c v)` | `(Cell a) a -> unit` | 1 | builtin on a `Cell`; also `(set! (. obj field) v)`, and on a dynamic var inside `binding` (§2.11) |
 | `volatile!` | alias | `(volatile! x)` | `a -> (Atom a) \| Send a` | 2 | an `Atom` (§2.11): visible across tasks and `vswap!` not atomic, as Clojure's volatile ([R] A12 p12); `Cell` is the thread-confined form |
 | `vswap!` | adapt | `(vswap! v f arg ..)` | `(Atom a) (fn (a) a) .. -> a` | 2 | a macro for `(reset! v (f @v arg ..))`: not atomic, as Clojure's; returns the new value |
+| `update!` | add | `(update! c f)` | `(Cell a) (fn :send (a) a) -> unit` | L6 | takes the value out of the cell, applies `f`, stores the result: a value that only the cell held reaches `f` with count 1 and `f`'s `conj`/`assoc` write in place (§2.5); a value another holder also has has count 2 and is copied, so no other holder changes. **Cells only**: an `Atom` is shared and never unique, `swap!` is its form and `(update! an-atom f)` is a type error; `f` is `:send`, so it cannot capture a cell and read the empty one; unit, not the new value (returning it would acquire it); `f` runs once; extra arguments are written in the closure. Library function over the builtin `cell-update!` |
 | `vreset!` | alias | `(vreset! v x)` | `(Atom a) a -> a` | 2 | `reset!` that returns `x` |
 | `long-array` | adapt | `(long-array n) (long-array c)` | `i64 -> (MArray i64); c -> (MArray i64) \| Reducible c i64` | 3 | a shared `MArray` of zeros, or a copy of the elements of a source (§2.11) |
 | `double-array` | adapt | `(double-array n) (double-array c)` | `i64 -> (MArray f64); c -> (MArray f64) \| Reducible c f64` | 3 | a shared `MArray` of `0.0`, or a copy of the elements of a source |

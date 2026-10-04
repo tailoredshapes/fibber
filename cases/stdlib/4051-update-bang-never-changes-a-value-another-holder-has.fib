@@ -1,0 +1,43 @@
+;; spec:   stdlib §2.5 (update! on a Cell: a shared value is copied), §1.1 (persistence)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: update!
+;; The case that must be able to fail: update! takes the value out of the cell and lets f write it in place when
+;; the cell was its only holder. When another holder has it, in place would change that holder too. Here the
+;; vector v is held by a cell and by a variable, a second cell, a struct field, a vector of vectors, and a
+;; snapshot read with @c before the update; after update! on the first cell every other holder still has the
+;; three elements and the cell has four. A mutant that makes update! write in place whatever the count
+;; (fib.unique? true) fails the first check. The last block updates the same cell twice, the first with a
+;; snapshot kept, the second not: the snapshot is the old value only.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defstruct Holder (items: (Vec i64)))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (v [1 2 3])
+        (cv (cell [1 2 3])))
+    (let ((other (cell v))
+          (h (Holder v))
+          (nest [v v])
+          (cc (cell v)))
+      (let ((snap @cc))
+        (do (update! cc (fn (x) (conj x 4)))
+            (check c (= v [1 2 3]))
+            (check c (= @other [1 2 3]))
+            (check c (= (. h items) [1 2 3]))
+            (check c (= nest [[1 2 3] [1 2 3]]))
+            (check c (= snap [1 2 3]))
+            (check c (= @cc [1 2 3 4]))
+            (update! other (fn (x) (assoc x 0 99)))
+            (check c (= v [1 2 3]))
+            (check c (= @other [99 2 3]))
+            (check c (= @cc [1 2 3 4]))
+            (update! cv (fn (x) (conj x 4)))
+            (let ((before @cv))
+              (do (update! cv (fn (x) (conj x 5)))
+                  (check c (= before [1 2 3 4]))
+                  (check c (= @cv [1 2 3 4 5]))))
+            (checks-result c))))))
