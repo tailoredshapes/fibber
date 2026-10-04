@@ -14,5 +14,5 @@ out=${1:-${TMPDIR:-/tmp}/c-call-$$}
 export FIB_LIB=${FIB_LIB:-$root/lib}
 export LD_LIBRARY_PATH=$lairdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 cd "$root" || exit 2
-"$fibc" build compiler/tests/native/c-call.fib -I compiler -I lib -L "$lairdir" -l lair -o "$out" || { echo "c-call: FAILED to build" >&2; exit 1; }
+"$fibc" build compiler/tests/native/c-call.fib -I compiler -I compiler/tests/native -I lib -L "$lairdir" -l lair -o "$out" || { echo "c-call: FAILED to build" >&2; exit 1; }
 "$out" all "$out"

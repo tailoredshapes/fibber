@@ -15,9 +15,10 @@
 ;; their first call at once may each make a session (the second is kept, the first leaks): the compiler makes its first call
 ;; on its one thread before any other.
 ;;
-;; INTERIM: the session is `lair.jit`'s (the Rust lair through liblair.so). When native.api lands, `host-session` and `session-address`
-;; are the two functions that change.
-(ns native.call (:require [lair.jit :as jit] [llvm.ffi :as ffi] [native.support :as support]))
+;; The session is `native.api`'s (`jit-new`, `jit-add-source`, `jit-address`: the names of `lair.jit`). Until package J's `native.api` is real, a
+;; program that wants a working host installs its own with `host-install` (compiler/tests/native/c-lair-host.fib over lair.jit,
+;; c-call-orc.fib over ORC).
+(ns native.call (:require [native.api :as api] [llvm.ffi :as ffi] [native.support :as support]))
 
 
 (def max-args: i64 8)
@@ -43,30 +44,33 @@
 
 (def the-host: (Atom (Option Host)) (atom nil))
 
-;; The session that holds the shim and the mailbox (see INTERIM above), and the address of a function of it.
-(defun host-session :private () -> (Result jit/Jit str)
-  (jit/jit-new 0))
-
-(defun session-address :private (j: jit/Jit name: str) -> (Result i64 str)
-  (jit/jit-address j name))
+(defun host-from :private (lookup: (fn (str) (Result i64 str))) -> (Result Host str)
+  (try-let ((cmp (lookup "lair_shim_cmp"))
+            (thread (lookup "lair_shim_thread"))
+            (mb-new (lookup "lair_mb_new"))
+            (start (lookup "lair_mb_start"))
+            (wait (lookup "lair_mb_wait"))
+            (arg (lookup "lair_mb_hook_arg"))
+            (reply (lookup "lair_mb_hook_reply"))
+            (result (lookup "lair_mb_result"))
+            (fault (lookup "lair_mb_fault"))
+            (free (lookup "lair_mb_free"))
+            (hook1 (lookup "lair_mb_hook1"))
+            (hook2 (lookup "lair_mb_hook2")))
+    (Ok (Host cmp thread mb-new start wait arg reply result fault free hook1 hook2))))
 
 (defun host-new :private () -> (Result Host str)
-  (try-let ((j (host-session))
-            (s1 (jit/jit-add-source j "lair.shim" (support/shim-source)))
-            (s2 (jit/jit-add-source j "lair.mailbox" (support/mailbox-source)))
-            (cmp (session-address j "lair_shim_cmp"))
-            (thread (session-address j "lair_shim_thread"))
-            (mb-new (session-address j "lair_mb_new"))
-            (start (session-address j "lair_mb_start"))
-            (wait (session-address j "lair_mb_wait"))
-            (arg (session-address j "lair_mb_hook_arg"))
-            (reply (session-address j "lair_mb_hook_reply"))
-            (result (session-address j "lair_mb_result"))
-            (fault (session-address j "lair_mb_fault"))
-            (free (session-address j "lair_mb_free"))
-            (hook1 (session-address j "lair_mb_hook1"))
-            (hook2 (session-address j "lair_mb_hook2")))
-    (Ok (Host cmp thread mb-new start wait arg reply result fault free hook1 hook2))))
+  (try-let ((j (api/jit-new 0))
+            (s1 (api/jit-add-source j "lair.shim" (support/shim-source)))
+            (s2 (api/jit-add-source j "lair.mailbox" (support/mailbox-source))))
+    (host-from (fn (name: str) -> (Result i64 str) (api/jit-address j name)))))
+
+;; Makes the host from a session of the caller's, in which the modules of `native.support` (`shim-source`, then `mailbox-source`) have been
+;; compiled and which lives as long as the process: `lookup` gives the address of an exported function of it. For a program that has its own
+;; session and no `lair.jit` (compiler/tests/native/c-call-orc.fib adds them to an ORC session); replaces any host made before.
+(defun host-install (lookup: (fn (str) (Result i64 str))) -> (Result unit str)
+  (try-let ((h (host-from lookup)))
+    (do (reset! the-host (some h)) (Ok ()))))
 
 ;; The host, made on first use.
 (defun host () -> (Result Host str)

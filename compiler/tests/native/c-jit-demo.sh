@@ -18,10 +18,18 @@ mkdir -p "$work/a" "$work/b"
 export FIB_LIB=${FIB_LIB:-$root/lib}
 export LD_LIBRARY_PATH=$lairdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 cd "$root" || exit 2
-sed 's/\[lair\.call :as call\]/[native.call :as call]/' compiler/jit-demo.fib > "$work/jit-demo-native.fib"
-grep -q 'native.call :as call' "$work/jit-demo-native.fib" || { echo "c-jit-demo: the require to swap is not in jit-demo.fib" >&2; exit 1; }
-"$fibc" build compiler/jit-demo.fib -I compiler -I lib -L "$lairdir" -l lair -o "$work/demo-lair" || exit 1
-"$fibc" build "$work/jit-demo-native.fib" -I compiler -I lib -L "$lairdir" -l lair -o "$work/demo-native" || exit 1
+# the demo's own main becomes `demo-main`; the new main installs the host (c-lair-host.fib) and runs it
+sed -e 's/\[lair\.call :as call\]/[native.call :as call] [c-lair-host :as lair-host]/' -e 's/^(defun main () -> i64$/(defun demo-main () -> i64/' compiler/jit-demo.fib > "$work/jit-demo-native.fib"
+cat >> "$work/jit-demo-native.fib" <<'EOM'
+
+(defun main () -> i64
+  (match (lair-host/install)
+    ((Err e) (do (eprintln e) 2))
+    ((Ok _) (demo-main))))
+EOM
+grep -q 'native.call :as call' "$work/jit-demo-native.fib" && grep -q "defun demo-main" "$work/jit-demo-native.fib" || { echo "c-jit-demo: the require to swap is not in jit-demo.fib" >&2; exit 1; }
+"$fibc" build compiler/jit-demo.fib -I compiler -I compiler/tests/native -I lib -L "$lairdir" -l lair -o "$work/demo-lair" || exit 1
+"$fibc" build "$work/jit-demo-native.fib" -I compiler -I compiler/tests/native -I lib -L "$lairdir" -l lair -o "$work/demo-native" || exit 1
 "$work/demo-lair" basic "$work/a" | sed "s|$work/a|DIR|g" > "$work/lair.out"
 "$work/demo-native" basic "$work/b" | sed "s|$work/b|DIR|g" > "$work/native.out"
 fail=0
