@@ -62,7 +62,7 @@
 
 ;; Reads, expands, types and checks `source` (named `file` in positions), its modules looked for in `roots`, exactly as the Rust
 ;; front end does before it lowers. Rust: front.rs:45 `check_in`
-(defun front-check (source: str file: str roots: Roots rm: mk/RunnerMaker) -> Front
+(defun front-check (source: str file: str roots: Roots rm: mk/RunnerMaker demand: bool) -> Front
   (let ((ctx (ctx-new)))
     (match (td/prelude-forms ctx)
       ((Err m) (FrontFailed (str-concat "the prelude does not expand: " m)))
@@ -73,16 +73,16 @@
           (match (mods/expand-all loaded ctx (mk/maker-runner rm prelude loaded))
             ((Err e) (expand-stop e file))
             ((Ok modules)
-             (match (own-check-modules modules prelude)
+             (match (if demand (own-check-modules-on-demand modules prelude) (own-check-modules modules prelude))
                ((Err e) (check-stop e))
                ((Ok c) (FrontChecked c)))))))))))
 
 ;; The checked program of `file`, or the exit status after the message of what stopped it. Rust: main.rs:47 `lower_kind` (first half)
-(defun check-file (file: str roots: Roots rm: mk/RunnerMaker) -> (Result Checked i64)
+(defun check-file (file: str roots: Roots rm: mk/RunnerMaker demand: bool) -> (Result Checked i64)
   (match (read-file file)
     (nil (do (eprintln (str-join ["fibc: cannot read " file ": " (. (native/fault-of file) text)])) (Err exit-usage)))
     ((some source)
-     (match (front-check source file roots rm)
+     (match (front-check source file roots rm demand)
        ((FrontChecked c) (Ok c))
        ((FrontRejected m) (do (eprintln (str-concat "rejected:\n" m)) (Err exit-rejected)))
        ((FrontFailed m) (do (eprintln (str-concat "failed: " m)) (Err exit-compile-failed)))
@@ -91,7 +91,7 @@
 ;; The front end and the lowering: the lIR text of `file` (of an executable when `executable`), or the exit status that says why
 ;; not, its message already printed. Rust: main.rs:47 `lower_kind`
 (defun lower-kind (file: str roots: Roots rm: mk/RunnerMaker executable: bool) -> (Result str i64)
-  (match (check-file file roots rm)
+  (match (check-file file roots rm true)
     ((Err code) (Err code))
     ((Ok c)
      (match (if executable (ec/compile-executable (. c typed) (. c owned)) (ec/compile (. c typed) (. c owned)))

@@ -1,0 +1,127 @@
+;; compiler/types/infer/demand.fib: the units of the library a program can reach, so that inference and the ownership pass check only those
+;; (PERFB lever B: a program's front end re-checked the whole library each time, which was most of `fibc emit hello.fib`'s 0.4 s).
+;;
+;; The emitter reaches a body only through an expression of a body it already reached: a `defun` or `def` named by `EGlobal`, a protocol method
+;; by `(GMethod proto i)` (which may run any instance's method `i`, resolved at specialisation), a `dyn` by its protocol (a vtable holds every
+;; method). So the units to check are those the roots reach through those three, where the roots are everything outside the library (all its
+;; defuns, defs, impl methods, macros), every `def` and every macro of the library (the emitter makes all the defs, whichever the program
+;; names), and what the roots name, transitively. A library impl method is reached when its protocol's method index is.
+;; The order of the units that are checked is that of the full run (the SCCs are still computed over all of a module, see
+;; types.infer.mod `checker-module-of`); the units not reached are not checked, so they are not in `units` and the ownership pass skips them.
+;; Not done here: `explain`, `emit-dump` and the dump tools check everything (they print every unit).
+(ns types.infer.demand
+  (:use syntax.pos types.ty types.ast types.decls types.table types.lower.mod types.infer.deps))
+
+;; The defuns and defs to check, the impl methods, `(instance, index in its methods)`, and the macros (those of the program's own modules: the
+;; library's are run by the macro runner, which checks them itself, and the emitter never asks for one).
+(defstruct Demand (nodes: (Set Node) impls: (Set (Pair i64 i64)) macros: (Set i64)))
+
+;; The walk: the globals, what is reached so far, the bodies still to read, and the library's impl methods by `(proto, method index)`.
+(defstruct Walk
+  (g: Globals nodes: (Cell (Set Node)) impls: (Cell (Set (Pair i64 i64))) methods: (Cell (Set (Pair i64 i64)))
+   dyns: (Cell (Set i64)) stack: (Cell (Vec Expr)) by-method: (Map (Pair i64 i64) (Vec (Pair i64 i64)))
+   ctors: (Cell (Set i64)) parked: (Cell (Map i64 (Vec (Pair i64 i64))))))
+
+(defun push-body :private (w: Walk e: Expr) -> unit
+  (set! (. w stack) (conj @(. w stack) e)))
+
+(defun want-node :private (w: Walk n: Node) -> unit
+  (when-not (contains? @(. w nodes) n)
+    (do (set! (. w nodes) (conj @(. w nodes) n))
+        (push-body w (match n
+                       ((NFun f) (. (g-fun (. w g) f) body))
+                       ((NDef d) (. (g-def (. w g) d) init)))))))
+
+(defun want-impl :private (w: Walk k: (Pair i64 i64)) -> unit
+  (when-not (contains? @(. w impls) k)
+    (do (set! (. w impls) (conj @(. w impls) k))
+        (push-body w (. (nth (. (table-get (. (. w g) instances) (. k fst)) methods) (. k snd)) body)))))
+
+;; The type a library instance is for, when it is a type of a library module other than the prelude: no value of such a type exists until a
+;; constructor of it is evaluated (the natives know the types of the prelude and the builtin module only), so its implementations wait for one.
+(defun waiting-type :private (w: Walk k: (Pair i64 i64)) -> (Option i64)
+  (match (. (table-get (. (. w g) instances) (. k fst)) head)
+    ((TCon (KNominal t) _) (if (> (. (table-get (. (. w g) types) t) module) module-prelude) (some t) nil))
+    (_ nil)))
+
+;; An implementation a call may run: wanted now, or parked until the type it is for can have a value.
+(defun offer-impl :private (w: Walk k: (Pair i64 i64)) -> unit
+  (match (waiting-type w k)
+    (nil (want-impl w k))
+    ((some t) (if (contains? @(. w ctors) t)
+                  (want-impl w k)
+                  (set! (. w parked) (assoc @(. w parked) t (conj (get @(. w parked) t []) k)))))))
+
+;; A constructor of type t is evaluated: the implementations parked for it are wanted.
+(defun want-ctor :private (w: Walk t: i64) -> unit
+  (when-not (contains? @(. w ctors) t)
+    (do (set! (. w ctors) (conj @(. w ctors) t))
+        (doseq (k (get @(. w parked) t []))
+          (want-impl w k)))))
+
+(defun want-method :private (w: Walk p: i64 i: i64) -> unit
+  (let ((key (Pair p i)))
+    (when-not (contains? @(. w methods) key)
+      (do (set! (. w methods) (conj @(. w methods) key))
+          (doseq (k (get (. w by-method) key []))
+            (offer-impl w k))))))
+
+(defun want-dyn :private (w: Walk p: i64) -> unit
+  (when-not (contains? @(. w dyns) p)
+    (do (set! (. w dyns) (conj @(. w dyns) p))
+        (doseq (i (range (count (. (g-proto (. w g) p) methods))))
+          (want-method w p i)))))
+
+;; What the expression names: the globals it reaches, the children read in turn.
+(defun visit :private (w: Walk e: Expr) -> unit
+  (do (match (. e kind)
+        ((EGlobal (GFun f)) (want-node w (NFun f)))
+        ((EGlobal (GDef d)) (want-node w (NDef d)))
+        ((EGlobal (GMethod p i)) (want-method w p i))
+        ((EGlobal (GCtor t _)) (want-ctor w t))
+        ((EDyn p _ _ _) (want-dyn w p))
+        (_ ()))
+      (doseq (c (expr-children e)) (visit w c))))
+
+(defun drain :private (w: Walk) -> unit
+  (loop ()
+    (match (peek @(. w stack))
+      (nil ())
+      ((some e) (do (set! (. w stack) (pop @(. w stack)))
+                    (visit w e)
+                    (recur))))))
+
+;; The library's impl methods by `(proto, method index)`: the `(instance, position)` of each.
+(defun methods-by-key :private (g: Globals libs: (Vec ModuleItems)) -> (Map (Pair i64 i64) (Vec (Pair i64 i64)))
+  (reduce (fn (acc: (Map (Pair i64 i64) (Vec (Pair i64 i64))) items: ModuleItems)
+            (reduce (fn (a: (Map (Pair i64 i64) (Vec (Pair i64 i64))) inst: i64)
+                      (let ((d (table-get (. g instances) inst)))
+                        (reduce (fn (b: (Map (Pair i64 i64) (Vec (Pair i64 i64))) m: i64)
+                                  (let ((key (Pair (. d proto) (. (nth (. d methods) m) index))))
+                                    (assoc b key (conj (get b key []) (Pair inst m)))))
+                                a (range (count (. d methods))))))
+                    acc (. items impls)))
+          (map-empty) libs))
+
+;; The roots of one module: every def and macro; and, when the module is not the library's, everything.
+(defun want-roots :private (w: Walk items: ModuleItems library: bool) -> unit
+  (do (doseq (d (. items defs)) (want-node w (NDef d)))
+      (when-not library
+        (doseq (f (. items macros)) (push-body w (. (g-fun (. w g) f) body))))
+      (when-not library
+        (do (doseq (f (. items funs)) (want-node w (NFun f)))
+            (doseq (inst (. items impls))
+              (doseq (m (range (count (. (table-get (. (. w g) instances) inst) methods))))
+                (want-impl w (Pair inst m))))))))
+
+;; What a program needs of the library: `prelude` is library; `modules` are in order, `library` says which of them are.
+(defun demand-of (g: Globals prelude: ModuleItems modules: (Vec ModuleItems) library: (Vec bool)) -> Demand
+  (let ((libs (into [prelude] (vec (keep (fn (i: i64) (if (nth library i) (some (nth modules i)) nil)) (range (count modules))))))
+        (w (Walk g (cell (set-empty)) (cell (set-empty)) (cell (set-empty)) (cell (set-empty)) (cell [])
+                 (methods-by-key g libs) (cell (set-empty)) (cell (map-empty)))))
+    (do (want-roots w prelude true)
+        (doseq (i (range (count modules)))
+          (want-roots w (nth modules i) (nth library i)))
+        (drain w)
+        (Demand @(. w nodes) @(. w impls)
+                (into (set-empty) (mapcat (fn (i: i64) (if (nth library i) [] (. (nth modules i) macros))) (range (count modules))))))))

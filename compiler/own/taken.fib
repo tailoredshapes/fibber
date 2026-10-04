@@ -12,7 +12,7 @@
 ;;   body names as values, collected in pre-order; both functions read that list.
 ;; - the instances are read once from the table (`table-rows` copies it) and not for each value.
 (ns own.taken
-  (:use types.ast types.decls types.table types.program types.infer.cx))
+  (:use types.ast types.decls types.table types.program types.infer.cx types.infer.mod))
 
 ;; A global named as a value: the expression and the global.
 (defstruct TakenValue (expr: i64 ref: GlobalRef))
@@ -28,18 +28,18 @@
              (match (. h kind) ((EGlobal _) (vec (rest (expr-children e)))) (_ (expr-children e)))))
     (_ (reduce (fn (a: (Vec TakenValue) c: Expr) (values-in c a)) acc (expr-children e)))))
 
-;; Rust: taken.rs:66 `for_each_value`: the globals named as a value in every body of the program,
-;; `defun`s, `impl` methods, then `def`s.
+;; Rust: taken.rs:66 `for_each_value`: the globals named as a value in every body of the program that was checked (the units, in
+;; the order they were checked; a program checked on demand, types.infer.demand, has no unit for what it cannot reach, and a body that
+;; was not typed has no resolutions to read): `defun`s, `impl` methods, `def`s.
 (defun taken-values :private (p: TypedProgram) -> (Vec TakenValue)
-  (let ((g (. p globals))
-        (a (reduce (fn (acc: (Vec TakenValue) d: FunDef) (values-in (. d body) acc))
-                   [] (table-rows (. g funs))))
-        (b (reduce (fn (acc: (Vec TakenValue) i: InstanceDef)
-                     (reduce (fn (x: (Vec TakenValue) m: ImplMethod) (values-in (. m body) x))
-                             acc (. i methods)))
-                   a (table-rows (. g instances)))))
-    (reduce (fn (acc: (Vec TakenValue) d: DefDef) (values-in (. d init) acc))
-            b (table-rows (. g defs)))))
+  (let ((g (. p globals)))
+    (reduce (fn (acc: (Vec TakenValue) u: UnitRef)
+              (match u
+                ((UScc fs) (reduce (fn (a: (Vec TakenValue) f: i64) (values-in (. (g-fun g f) body) a)) acc fs))
+                ((UMacro f) (values-in (. (g-fun g f) body) acc))
+                ((UImplMethod i m) (values-in (. (nth (. (table-get (. g instances) i) methods) m) body) acc))
+                ((UDef d) (values-in (. (g-def g d) init) acc))))
+            [] (. p units))))
 
 ;; Rust: taken.rs:22 `value_taken`: the `defun`s used as values anywhere: a function name in any
 ;; position but the head of a call (§8.4); they have an all-owned body.

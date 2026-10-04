@@ -20,25 +20,42 @@
 ;; A program that passed the whole front end: its types (§3) and its ownership decisions (§6).
 (defstruct Checked (typed: TypedProgram owned: OwnedProgram))
 
-;; Rust `check_here`'s second half: the `&` checks of the lowered program, inference (with `main`
-;; required if main is true), then the ownership pass.
-(defun own-check-lowered (l: Lowered main: bool) -> (Result Checked CheckError)
+;; Rust `check_here`'s second half: the `&` checks of the lowered program, inference (with `main` required if main is true), then the
+;; ownership pass. `library` (one flag for each module, or none) says which modules are the library's, whose units not reached from the
+;; rest of the program are neither inferred nor analysed (types.infer.demand); with none every unit is.
+(defun own-check-lowered-with (l: Lowered main: bool library: (Option (Vec bool))) -> (Result Checked CheckError)
   (let ((amp (syntactic-check (. l globals))))
     (if (not (empty? amp))
         (Err (CeOwn amp))
-        (match (infer-lowered l main)
+        (match (infer-lowered-with l main library)
           ((Err errs) (Err (CeType errs)))
           ((Ok typed)
            (match (analyse typed)
              ((Err errs) (Err (CeOwn errs)))
              ((Ok owned) (Ok (Checked typed owned)))))))))
 
-;; Checks a program of several modules, expanded, in dependency order with the main module last:
-;; lowering, the `&` checks, inference, the ownership pass (`check_modules`).
+(defun own-check-lowered (l: Lowered main: bool) -> (Result Checked CheckError)
+  (own-check-lowered-with l main nil))
+
+;; Checks a program of several modules, expanded, in dependency order with the main module last: lowering, the `&` checks, inference, the
+;; ownership pass (`check_modules`).
 (defun own-check-modules (modules: (Vec Expanded) prelude: (Vec Stx)) -> (Result Checked CheckError)
   (match (lower-modules modules prelude)
     ((Err errs) (Err (CeType errs)))
     ((Ok l) (own-check-lowered l true))))
+
+;; The library's modules among `modules`: those that do not see the implicit modules (`sees-implicit`: the implicit ones, `fib.*`,
+;; `Long`, `Math`), but never the last, the program's main module, whose every unit is checked.
+(defun library-flags :private (modules: (Vec Expanded)) -> (Vec bool)
+  (mapv (fn (i: i64) (and (< i (- (count modules) 1)) (empty? (. (. (nth modules i) spec) implicit))))
+        (range (count modules))))
+
+;; `own-check-modules` where the units of the library that the program cannot reach are not checked (types.infer.demand): the checked
+;; program holds only what the emitter can ask for, the result of `emit` and `run` is the same.
+(defun own-check-modules-on-demand (modules: (Vec Expanded) prelude: (Vec Stx)) -> (Result Checked CheckError)
+  (match (lower-modules modules prelude)
+    ((Err errs) (Err (CeType errs)))
+    ((Ok l) (own-check-lowered-with l true (some (library-flags modules))))))
 
 ;; Checks a module's forms after expansion against the prelude's (`check_forms`).
 (defun own-check-forms (forms: (Vec Stx) prelude: (Vec Stx)) -> (Result Checked CheckError)

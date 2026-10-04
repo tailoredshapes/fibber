@@ -19,7 +19,7 @@
   (:use syntax.pos syntax.form syntax.error expand.ctx expand.types expand.error
         types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.init types.lower.private types.lower.mod types.infer.cx types.infer.mod
-        types.program types.elab))
+        types.program types.elab types.infer.demand))
 
 ;; Rust `Lowered` (mod.rs:147): the globals and the items of the prelude and
 ;; of each module.
@@ -126,10 +126,18 @@
 ;; Steps 4 to 7 of §3.5 on a lowered program; with `main`, requires `main :
 ;; (fn () i64)` (mod.rs:243).
 (defun infer-lowered (l: Lowered main: bool) -> (Result TypedProgram (Vec TypeError))
+  (infer-lowered-with l main nil))
+
+;; `infer-lowered` where `library` (one flag for each of the modules) says which modules are the library's: only the units of those that
+;; the rest of the program can reach are checked (types.infer.demand). Nothing else about the result changes.
+(defun infer-lowered-with (l: Lowered main: bool library: (Option (Vec bool))) -> (Result TypedProgram (Vec TypeError))
   (let ((g (. l globals))
-        (ck (checker-new (. l globals))))
-    (do (checker-module ck (. l prelude))
-        (doseq [items (. l modules)] (checker-module ck items))
+        (ck (checker-new (. l globals)))
+        (want (match library
+                (nil nil)
+                ((some flags) (some (demand-of g (. l prelude) (. l modules) flags))))))
+    (do (checker-module-of ck (. l prelude) want)
+        (doseq [items (. l modules)] (checker-module-of ck items want))
         (when main (checker-check-main ck))
         (if (empty? @(. ck errors))
             (do (elaborate g (. ck t))

@@ -14,7 +14,7 @@
 (ns types.infer.mod
   (:use syntax.pos types.ty types.scheme types.error types.store types.table types.ast types.decls
         types.display types.init types.lower.mod
-        types.infer.cx types.infer.deps types.infer.scc types.infer.units))
+        types.infer.cx types.infer.deps types.infer.scc types.infer.units types.infer.demand))
 
 ;; Rust `UnitRef` (infer/mod.rs:37): a unit in the order it was checked.
 (defenum UnitRef
@@ -74,17 +74,39 @@
 ;; Rust: infer/mod.rs:100 module. Steps 4 to 6 for one module: the functions and
 ;; defs by SCC, then the impl methods, then the macros.
 (defun checker-module (ck: Checker items: ModuleItems) -> unit
+  (checker-module-of ck items nil))
+
+;; Whether the SCC is wanted: always without a demand, else when one of its members is reached (the members of an SCC reach one another).
+(defun scc-wanted? :private (want: (Option Demand) scc: (Vec Node)) -> bool
+  (match want
+    (nil true)
+    ((some d) (some? (find-first (fn (n: Node) (contains? (. d nodes) n)) scc)))))
+
+(defun macro-wanted? :private (want: (Option Demand) f: i64) -> bool
+  (match want
+    (nil true)
+    ((some d) (contains? (. d macros) f))))
+
+(defun impl-wanted? :private (want: (Option Demand) inst: i64 m: i64) -> bool
+  (match want
+    (nil true)
+    ((some d) (contains? (. d impls) (Pair inst m)))))
+
+;; `checker-module` with the units of the library it leaves out (types.infer.demand): the SCCs are those of the whole module, so the order
+;; of the units that are checked is the same as when all of them are.
+(defun checker-module-of (ck: Checker items: ModuleItems want: (Option Demand)) -> unit
   (let ((g (. ck g))
         (nodes (into (mapv (fn (f: i64) (NFun f)) (. items funs))
                      (mapv (fn (d: i64) (NDef d)) (. items defs))))
         (edges (reduce (fn (m: (Map Node (Vec Node)) n: Node)
                          (assoc m n (filterv (fn (x: Node) (includes? x nodes)) (refs-of (node-expr g n)))))
                        (map-empty) nodes)))
-    (do (doseq (scc (deps-sccs nodes edges)) (scc-unit ck scc edges))
+    (do (doseq (scc (deps-sccs nodes edges))
+          (when (scc-wanted? want scc) (scc-unit ck scc edges)))
         (doseq (inst (. items impls))
           (doseq (m (range (count (. (table-get (. g instances) inst) methods))))
-            (impl-unit ck inst m)))
-        (doseq (f (. items macros)) (macro-unit ck f)))))
+            (when (impl-wanted? want inst m) (impl-unit ck inst m))))
+        (doseq (f (. items macros)) (when (macro-wanted? want f) (macro-unit ck f))))))
 
 ;; Rust: infer/mod.rs:133 scc_unit. One SCC: skipped when it uses a unit that
 ;; failed, a def cycle is an error, a lone def is typed alone, the rest is a
