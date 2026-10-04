@@ -3,7 +3,7 @@
 ;; strings, with every check types §8.12 requires, and the conversion primitives. The order of the instructions is the Rust's: a fresh
 ;; name asked for earlier shifts every later one of the function. Where the Rust has `"a" | "b" =>` arms this is `case`.
 (ns emit.lower.arith
-  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.cells emit.lower.show))
+  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.cells emit.lower.show emit.lower.simd))
 
 (defun arith-some :private (r: (Result V str)) -> (Result (Option V) str)
   (match r ((Ok v) (Ok (some v))) ((Err e) (Err e))))
@@ -34,14 +34,6 @@
   (cond (in? method ["=" "<=" ">="]) (Ok (v-int LirI1 1))
         (in? method ["!=" "<" ">"]) (Ok (v-int LirI1 0))
         :else (Err (str-join [method " on unit"]))))
-
-;; Traps with `msg` when `c` holds; continues in a fresh block. Rust: arith.rs:200 LowerCx::trap_if
-(defun lcx-trap-if (cx: LowerCx c: V msg: str) -> unit
-  (let ((lt (fb-label (. cx b) "trap")) (lk (fb-label (. cx b) "ok")))
-    (do (fb-term (. cx b) (str-join ["(br " (v-text c) " " lt " " lk ")"]))
-        (fb-open (. cx b) lt)
-        (lcx-trap-c cx msg)
-        (fb-open (. cx b) lk))))
 
 ;; `<` and its fellows on strings: the comparison of `fib.str-cmp` with zero.
 (defun str-compare :private (cx: LowerCx method: str x: V y: (Option V)) -> (Result V str)
@@ -166,6 +158,14 @@
              (Ok (some (arith-val cx (str-join ["(fneg " (v-text x) ")"]) t)))
              (arith-some (int-unary cx method x))))))
 
+;; The vector type of an operand pair of a native method, when either operand is a lane vector.
+(defun vec-method-type :private (x: V y: (Option V)) -> (Option LirTy)
+  (match (v-ty x)
+    ((some (LirVec e n)) (some (LirVec e n)))
+    (_ (match y
+         ((some y2) (match (v-ty y2) ((some (LirVec e n)) (some (LirVec e n))) (_ nil)))
+         (nil nil)))))
+
 ;; A method of a native instance. Rust: arith.rs:14 LowerCx::native_method
 (defun lcx-native-method (cx: LowerCx proto: str method: str a: (Vec V) tys: (Vec Ty) rt: Ty) -> (Result (Option V) str)
   (match (first a)
@@ -175,6 +175,7 @@
        (cond (= proto "Deref") (arith-some (lcx-deref-val cx x t0))
              (= proto "Show") (arith-some (lcx-native-show cx x t0))
              (= proto "Hash") (arith-some (lcx-native-hash cx x t0))
+             (some? (vec-method-type x y)) (arith-some (lcx-vec-method cx method x y))
              (str-ty? t0) (arith-some (str-compare cx method x y))
              :else (match (v-ty x)
                      (nil (arith-some (unit-compare method)))

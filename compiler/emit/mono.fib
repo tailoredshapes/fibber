@@ -53,6 +53,8 @@
        ((LirI1) (ty-bool)) ((LirI8) (ty-scalar SI8)) ((LirI16) (ty-scalar SI16)) ((LirI32) (ty-scalar SI32))
        ((LirFloat) (ty-scalar SF32)) ((LirDouble) (ty-scalar SF64)) ((LirRaw) (ty-scalar SPtr))
        ((LirOpt s) (ty-nominal @(. g option) [(representative g (ClsScalar s))]))
+       ;; a lane vector is its own representative up to the element's (`(Simd i32 4)` for any 4 lanes of i32 or char)
+       ((LirVec e n) (ty-simd (representative g (ClsScalar e)) (ty-nat n)))
        (_ (ty-i64))))
     ((ClsUnit) (ty-unit))
     ((ClsPtr) (ty-str))
@@ -79,12 +81,16 @@
                      (_ false)))
                  (. s preds))))
 
+;; Whether a type argument is a lane count: it is part of the key as it is, a class would make `(Simd f64 4)` and `(Simd f64 8)` one.
+(defun nat-arg? :private (t: Ty) -> bool
+  (match t ((TCon (KNat _) _) true) (_ false)))
+
 ;; The key of a `defun`'s specialisation at the concrete `tys`: the full type where bounded, the class's representative elsewhere.
 ;; Rust: mono.rs:105 fun_key
 (defun fun-key (g: Globals s: Scheme tys: (Vec Ty)) -> (Result (Vec Ty) str)
   (loop ((i 0) (out []))
     (if (< i (count tys))
-        (if (bounded s i)
+        (if (or (bounded s i) (nat-arg? (nth tys i)))
             (recur (+ i 1) (conj out (nth tys i)))
             (try-let ((c (class-of g (nth tys i))))
               (recur (+ i 1) (conj out (representative g c)))))

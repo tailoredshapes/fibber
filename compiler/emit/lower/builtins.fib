@@ -6,7 +6,7 @@
 ;; one is the Rust's error. The `trap` arm of a macro module (`fib.trap-at`, Rust `p.macro_module`) is E11's.
 (ns emit.lower.builtins
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.ir emit.program emit.objects.kinds
-        emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads))
+        emit.lower.cx emit.lower.ops emit.lower.cells emit.lower.arith emit.lower.pattern emit.lower.strfind emit.lower.threads emit.lower.simd))
 
 ;; Argument `i` of the builtin `name`. Rust: the closure `arg` of lower/builtins.rs:16
 (defun arg :private (name: str a: (Vec V) i: i64) -> (Result V str)
@@ -98,6 +98,17 @@
     ("spawn" (try-let ((f (arg name a 0))) (lcx-spawn cx e f)))
     ("join" (try-let ((t (arg name a 0))) (lcx-join cx e t)))
     ("not" (try-let ((x (arg name a 0))) (Ok (fb-val (. cx b) (str-join ["(xor " (v-text x) " (i1 1))"]) LirI1))))
+    ("lane" (try-let ((v (arg name a 0)) (i (arg name a 1))) (Ok (lcx-lane cx v i))))
+    ("with-lane" (try-let ((v (arg name a 0)) (i (arg name a 1)) (x (arg name a 2))) (Ok (lcx-with-lane cx v i x))))
+    ("hsum" (try-let ((v (arg name a 0))) (Ok (lcx-reduce cx name v))))
+    ("hmin" (try-let ((v (arg name a 0))) (Ok (lcx-reduce cx name v))))
+    ("hmax" (try-let ((v (arg name a 0))) (Ok (lcx-reduce cx name v))))
+    ("simd/lt" (try-let ((x (arg name a 0)) (y (arg name a 1))) (lcx-vec-compare cx name x y)))
+    ("simd/le" (try-let ((x (arg name a 0)) (y (arg name a 1))) (lcx-vec-compare cx name x y)))
+    ("simd/gt" (try-let ((x (arg name a 0)) (y (arg name a 1))) (lcx-vec-compare cx name x y)))
+    ("simd/ge" (try-let ((x (arg name a 0)) (y (arg name a 1))) (lcx-vec-compare cx name x y)))
+    ("simd/eq" (try-let ((x (arg name a 0)) (y (arg name a 1))) (lcx-vec-compare cx name x y)))
+    ("simd/ne" (try-let ((x (arg name a 0)) (y (arg name a 1))) (lcx-vec-compare cx name x y)))
     (_ (if (reflect-name? name)
            (builtin-reflect cx name e a)
            (builtin-text cx name e a tys)))))

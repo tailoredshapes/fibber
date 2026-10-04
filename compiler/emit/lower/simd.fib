@@ -1,0 +1,222 @@
+;; compiler/emit/lower/simd.fib: lane vectors (spec/types.md 1.9, docs/design/simd-and-tensors.md 2.4 to 2.8): the literal, `splat`, the
+;; operators of the native instances of `Num`, `Float`, `Bits` and `Eq` on a vector, the comparisons that give a mask, `lane`,
+;; `with-lane` and the horizontal `hsum`, `hmin`, `hmax`. A vector is `(LirVec e n)`, `<n x e>`, a scalar-class value: lowering
+;; never counts it. Every operation is one lIR instruction on the whole vector (LLVM legalises whatever width and lane count the target
+;; has), except the checks:
+;;   - integer `+ - *` and `neg` are CHECKED, as the scalar's (types 8.12): the overflow flags of every lane are or-ed (`reduce-or`)
+;;     and one branch traps (`integer overflow in + at i32x4`); a mask or a float has none; `wrapping` is the opt-out (`unchecked-*`);
+;;   - a dynamic `lane` index is compared with the lane count and traps (lIR makes an out-of-range index poison, so none is emitted);
+;;   - `hsum` of integers adds the lanes left to right with the checked add; of floats it is the halving tree of the design (lane i
+;;     plus lane i + n/2, a vector that is not a power of two padded with `-0.0`), which is the same on every target.
+;; A scalar operand where a vector is wanted is a numeric literal recorded at the element type (the broadcast rule, types 1.9):
+;; it is splatted here.
+(ns emit.lower.simd
+  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx))
+
+;; ---- types and text
+
+(defun elem-of :private (t: LirTy) -> LirTy
+  (match t ((LirVec e _) e) (_ t)))
+
+(defun lanes-of :private (t: LirTy) -> i64
+  (match t ((LirVec _ n) n) (_ 1)))
+
+(defun vec? :private (t: LirTy) -> bool
+  (match t ((LirVec _ _) true) (_ false)))
+
+(defun float-elem? :private (t: LirTy) -> bool
+  (let ((e (elem-of t))) (or (= e LirFloat) (= e LirDouble))))
+
+;; `i32x4`, `f64x2`, `mask8`: the vector's name in a message.
+(defun vec-name :private (t: LirTy) -> str
+  (let ((e (elem-of t)) (n (str (lanes-of t))))
+    (cond (= e LirI1) (str-join ["mask" n])
+          (= e LirFloat) (str-join ["f32x" n])
+          (= e LirDouble) (str-join ["f64x" n])
+          :else (str-join [(lir-ty-text e) "x" n]))))
+
+;; `(<n x e> a a ..)`: the constant vector with every lane `text`.
+(defun vconst :private (t: LirTy text: str) -> str
+  (str-join (into ["(" (lir-ty-text t)] (into (mapv (fn (i: i64) (str-concat " " text)) (range (lanes-of t))) [")"]))))
+
+;; `(<m x i32> i ..)`: a literal shuffle mask.
+(defun mask-text :private (idx: (Vec i64)) -> str
+  (str-join (into ["(<" (str (count idx)) " x i32>"] (into (mapv (fn (i: i64) (str-concat " " (str i))) idx) [")"]))))
+
+(defun val :private (cx: LowerCx instr: str t: LirTy) -> V
+  (fb-val (. cx b) instr t))
+
+;; Every lane of vector type `t` is the scalar `x`.
+(defun splat :private (cx: LowerCx t: LirTy x: V) -> V
+  (let ((z (str-join ["(zeroinitializer " (lir-ty-text t) ")"])))
+    (val cx (str-join ["(shufflevector (insertelement " z " " (v-text x) " (i32 0)) " z " "
+                       (mask-text (mapv (fn (i: i64) 0) (range (lanes-of t)))) ")"]) t)))
+
+;; `x` as a vector of type `t`: itself, or the splat of a scalar literal.
+(defun as-vec :private (cx: LowerCx t: LirTy x: V) -> V
+  (match (v-ty x)
+    ((some (LirVec _ _)) x)
+    (_ (splat cx t x))))
+
+;; The first vector type among the operands (a literal operand may come first: `(+ 1 v)`).
+(defun vec-type :private (x: V y: (Option V)) -> (Option LirTy)
+  (match (v-ty x)
+    ((some (LirVec e n)) (some (LirVec e n)))
+    (_ (match y
+         ((some y2) (match (v-ty y2) ((some (LirVec e n)) (some (LirVec e n))) (_ nil)))
+         (nil nil)))))
+
+;; ---- arithmetic
+
+;; Integer `+ - *`: the overflow flag of every lane or-ed, one trap.
+(defun int-checked :private (cx: LowerCx method: str t: LirTy a: str b: str) -> V
+  (let ((op (cond (= method "+") "sadd-overflow" (= method "-") "ssub-overflow" :else "smul-overflow")))
+    (let ((r (val cx (str-join ["(" op " " a " " b ")"]) t)))
+      (let ((flags (val cx (str-join ["(extractvalue " (v-text r) " 1)"]) (LirVec LirI1 (lanes-of t)))))
+        (let ((any (val cx (str-join ["(reduce-or " (v-text flags) ")"]) LirI1)))
+          (do (lcx-trap-if cx any (str-join ["integer overflow in " method " at " (vec-name t)]))
+              (val cx (str-join ["(extractvalue " (v-text r) " 0)"]) t)))))))
+
+;; `neg`: floats `fneg`; integers trap when a lane is the minimum, as the scalar.
+(defun vec-neg :private (cx: LowerCx t: LirTy a: str) -> V
+  (if (float-elem? t)
+      (val cx (str-join ["(fneg " a ")"]) t)
+      (let ((w (lir-ty-bits (elem-of t))))
+        (let ((amin (val cx (str-join ["(icmp eq " a " " (vconst t (str (shl -1 (- w 1)))) ")"]) (LirVec LirI1 (lanes-of t)))))
+          (let ((any (val cx (str-join ["(reduce-or " (v-text amin) ")"]) LirI1)))
+            (do (lcx-trap-if cx any (str-join ["integer overflow in neg at " (vec-name t)]))
+                (val cx (str-join ["(sub " (vconst t "0") " " a ")"]) t)))))))
+
+;; The shifts: the count masked to the width, so no lane is shifted by the width or more.
+(defun vec-shift :private (cx: LowerCx method: str t: LirTy a: str b: str) -> V
+  (let ((m (val cx (str-join ["(and " b " " (vconst t (str (- (lir-ty-bits (elem-of t)) 1))) ")"]) t))
+        (op (cond (= method "shl") "shl" (= method "shr") "lshr" :else "ashr")))
+    (val cx (str-join ["(" op " " a " " (v-text m) ")"]) t)))
+
+;; `(= a b)`: every lane equal (a NaN lane makes it false); `(!= a b)`: some lane unequal.
+(defun vec-equal :private (cx: LowerCx method: str t: LirTy a: str b: str) -> V
+  (let ((mt (LirVec LirI1 (lanes-of t))))
+    (if (= method "=")
+        (let ((c (val cx (str-join [(if (float-elem? t) "(fcmp oeq " "(icmp eq ") a " " b ")"]) mt)))
+          (val cx (str-join ["(reduce-and " (v-text c) ")"]) LirI1))
+        (let ((c (val cx (str-join [(if (float-elem? t) "(fcmp une " "(icmp ne ") a " " b ")"]) mt)))
+          (val cx (str-join ["(reduce-or " (v-text c) ")"]) LirI1)))))
+
+(defun float-op :private (cx: LowerCx method: str t: LirTy a: str b: str) -> (Result V str)
+  (let ((op (fn (name: str) (Ok (val cx (str-join ["(" name " " a " " b ")"]) t)))))
+    (cond (= method "+") (op "fadd")
+          (= method "-") (op "fsub")
+          (= method "*") (op "fmul")
+          (= method "fdiv") (op "fdiv")
+          :else (Err (str-join ["unsupported: " method " on a float vector"])))))
+
+(defun int-op :private (cx: LowerCx method: str t: LirTy a: str b: str) -> (Result V str)
+  (cond (or (= method "+") (= method "-") (= method "*")) (Ok (int-checked cx method t a b))
+        (= method "bit-and") (Ok (val cx (str-join ["(and " a " " b ")"]) t))
+        (= method "bit-or") (Ok (val cx (str-join ["(or " a " " b ")"]) t))
+        (= method "bit-xor") (Ok (val cx (str-join ["(xor " a " " b ")"]) t))
+        (or (= method "shl") (= method "shr") (= method "sar")) (Ok (vec-shift cx method t a b))
+        :else (Err (str-join ["unsupported: " method " on an integer vector"]))))
+
+;; A method of a native instance whose receiver or second operand is a vector. `nil` when the operation is not one.
+(defun lcx-vec-method (cx: LowerCx method: str x: V y: (Option V)) -> (Result V str)
+  (match (vec-type x y)
+    (nil (Err (str-join ["a vector method " method " on scalars"])))
+    ((some t)
+     (let ((a (v-text (as-vec cx t x))))
+       (match y
+         (nil (cond (= method "neg") (Ok (vec-neg cx t a))
+                    (= method "bit-not") (Ok (val cx (str-join ["(xor " a " " (vconst t (if (= (elem-of t) LirI1) "1" "-1")) ")"]) t))
+                    (= method "popcount") (Ok (val cx (str-join ["(ctpop " a ")"]) t))
+                    :else (Err (str-join ["unary " method " on a vector"]))))
+         ((some y2)
+          (let ((b (v-text (as-vec cx t y2))))
+            (cond (or (= method "=") (= method "!=")) (Ok (vec-equal cx method t a b))
+                  (float-elem? t) (float-op cx method t a b)
+                  :else (int-op cx method t a b)))))))))
+
+;; ---- comparisons, lanes, reductions
+
+;; `simd/lt` and its fellows: the mask of the lanewise comparison (ordered for floats, as the scalar `<`; `ne` true on a NaN).
+(defun lcx-vec-compare (cx: LowerCx name: str x: V y: V) -> (Result V str)
+  (match (vec-type x (some y))
+    (nil (Err (str-join [name " without a vector operand"])))
+    ((some t)
+     (let ((a (v-text (as-vec cx t x))) (b (v-text (as-vec cx t y))) (k (str-slice name 5 (str-len name))) (fl (float-elem? t)))
+       (let ((pred (cond (= k "lt") (if fl "olt" "slt") (= k "le") (if fl "ole" "sle") (= k "gt") (if fl "ogt" "sgt")
+                         (= k "ge") (if fl "oge" "sge") (= k "eq") (if fl "oeq" "eq") :else (if fl "une" "ne"))))
+         (Ok (val cx (str-join ["(" (if fl "fcmp " "icmp ") pred " " a " " b ")"]) (LirVec LirI1 (lanes-of t)))))))))
+
+;; Traps when the dynamic lane index `i` is not below the lane count `n`.
+(defun check-lane :private (cx: LowerCx i: V n: i64) -> unit
+  (let ((bad (val cx (str-join ["(icmp uge " (v-text i) " (i64 " (str n) "))"]) LirI1)))
+    (lcx-trap-if cx bad "lane index out of range")))
+
+(defun lcx-lane (cx: LowerCx v: V i: V) -> V
+  (let ((t (unwrap-or (v-ty v) LirI64)))
+    (do (check-lane cx i (lanes-of t))
+        (val cx (str-join ["(extractelement " (v-text v) " " (v-text i) ")"]) (elem-of t)))))
+
+(defun lcx-with-lane (cx: LowerCx v: V i: V x: V) -> V
+  (let ((t (unwrap-or (v-ty v) LirI64)))
+    (do (check-lane cx i (lanes-of t))
+        (val cx (str-join ["(insertelement " (v-text v) " " (v-text x) " " (v-text i) ")"]) t))))
+
+(defun pow2-ceil :private (n: i64) -> i64
+  (loop ((p 1)) (if (>= p n) p (recur (* p 2)))))
+
+;; The halving tree of a float vector: pad to a power of two with `-0.0` (the identity of the sum), then add the upper half to the lower.
+(defun hsum-tree :private (cx: LowerCx v: V) -> V
+  (let ((t (unwrap-or (v-ty v) LirDouble)))
+    (let ((n (lanes-of t)) (e (elem-of t)) (p (pow2-ceil (lanes-of t))))
+      (let ((cur (if (= p n)
+                     v
+                     (val cx (str-join ["(shufflevector " (v-text v) " " (vconst t "-0.0") " " (mask-text (vec (range p))) ")"])
+                          (LirVec e p)))))
+        (loop ((x cur) (k p))
+          (if (= k 1)
+              (val cx (str-join ["(extractelement " (v-text x) " (i32 0))"]) e)
+              (let ((h (quot k 2)) (vt (LirVec e (quot k 2))))
+                (let ((lo (val cx (str-join ["(shufflevector " (v-text x) " " (v-text x) " " (mask-text (vec (range h))) ")"]) vt))
+                      (hi (val cx (str-join ["(shufflevector " (v-text x) " " (v-text x) " " (mask-text (vec (range h k))) ")"]) vt)))
+                  (recur (val cx (str-join ["(fadd " (v-text lo) " " (v-text hi) ")"]) vt) h)))))))))
+
+;; The checked sum of integer lanes, left to right: a partial sum that overflows traps, as the scalar loop of `+` would.
+(defun hsum-int :private (cx: LowerCx v: V) -> V
+  (let ((t (unwrap-or (v-ty v) LirI64)))
+    (let ((e (elem-of t)) (pick (fn (i: i64) (val cx (str-join ["(extractelement " (v-text v) " (i32 " (str i) "))"]) (elem-of t)))))
+      (loop ((i 1) (acc (pick 0)))
+        (if (>= i (lanes-of t))
+            acc
+            (let ((r (val cx (str-join ["(sadd-overflow " (v-text acc) " " (v-text (pick i)) ")"]) e)))
+              (let ((ovf (val cx (str-join ["(extractvalue " (v-text r) " 1)"]) LirI1)))
+                (do (lcx-trap-if cx ovf (str-join ["integer overflow in hsum at " (vec-name t)]))
+                    (recur (+ i 1) (val cx (str-join ["(extractvalue " (v-text r) " 0)"]) e))))))))))
+
+;; `hsum`, `hmin`, `hmax`: the horizontal reductions (NaN-propagating minimum and maximum for floats, as the stdlib's `min` and `max`).
+(defun lcx-reduce (cx: LowerCx name: str v: V) -> V
+  (let ((t (unwrap-or (v-ty v) LirI64)) (e (elem-of (unwrap-or (v-ty v) LirI64))))
+    (cond (= name "hsum") (if (float-elem? t) (hsum-tree cx v) (hsum-int cx v))
+          (= name "hmin") (val cx (str-join ["(" (if (float-elem? t) "reduce-fmin " "reduce-smin ") (v-text v) ")"]) e)
+          :else (val cx (str-join ["(" (if (float-elem? t) "reduce-fmax " "reduce-smax ") (v-text v) ")"]) e))))
+
+;; ---- the literal and splat
+
+;; `(simd e ..)`: the lanes, in order, put into the zero vector of the expression's type.
+(defun lcx-simd (cx: LowerCx e: Expr es: (Vec Expr)) -> (Result V str)
+  (try-let ((ty (lcx-ty cx e)) (l (program-lir (. cx p) ty)))
+    (match l
+      ((some t)
+       (loop ((i 0) (acc (VVal (str-join ["(zeroinitializer " (lir-ty-text t) ")"]) t)))
+         (if (>= i (count es))
+             (Ok acc)
+             (try-let ((x (lcx-value cx (nth es i))))
+               (recur (+ i 1) (val cx (str-join ["(insertelement " (v-text acc) " " (v-text x) " (i32 " (str i) "))"]) t))))))
+      (nil (Err "a vector of unit")))))
+
+;; `(splat V x)`: every lane `x`.
+(defun lcx-splat (cx: LowerCx e: Expr x: Expr) -> (Result V str)
+  (try-let ((ty (lcx-ty cx e)) (l (program-lir (. cx p) ty)) (v (lcx-value cx x)))
+    (match l
+      ((some t) (Ok (splat cx t v)))
+      (nil (Err "a vector of unit")))))

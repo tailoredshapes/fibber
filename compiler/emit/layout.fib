@@ -26,8 +26,15 @@
                  ((some (TCon (KDyn _ _) _)) LirDyn)
                  (_ LirPtr)))))
     ((TCon (KDyn _ _) _) (Ok (some LirDyn)))
-    ;; SIMD P1: the vector type has no lIR type here until the lowering lands (SIMD wave 2, P0 and P1)
-    ((TCon (KSimd) _) (Err "todo: lane vectors are not lowered yet (SIMD wave 2, P0 and P1)"))
+    ;; `(Simd T n)` is `<n x T>`, a mask `<n x i1>` (types §1.9)
+    ((TCon (KSimd) args)
+     (match (nth args 1)
+       ((TCon (KNat n) _)
+        (try-let ((el (lir-ty g (nth args 0))))
+          (match el
+            ((some e) (Ok (some (LirVec e n))))
+            (nil (Err "a lane vector of unit")))))
+       (_ (Err (str-join ["a type variable reached the lowering: the lane count of a vector: " (printer-ty (printer-new g) t)])))))
     ((TCon (KNominal id) args)
      (if (= id @(. g option))
          (match (first args)
@@ -44,7 +51,7 @@
 ;; no `Option` of a scalar and no `unit`.
 (defun scalar-payload :private (l: (Option LirTy)) -> (Option LirTy)
   (match l
-    ((some (LirPtr)) nil) ((some (LirDyn)) nil) ((some (LirOpt _)) nil)
+    ((some (LirPtr)) nil) ((some (LirDyn)) nil) ((some (LirOpt _)) nil) ((some (LirVec _ _)) nil)
     (_ l)))
 
 ;; Whether a type is an object type: its values are counted pointers (or a
@@ -103,6 +110,7 @@
     ((LirI32) (Pair 4 4)) ((LirFloat) (Pair 4 4))
     ((LirI64) (Pair 8 8)) ((LirDouble) (Pair 8 8)) ((LirPtr) (Pair 8 8)) ((LirRaw) (Pair 8 8))
     ((LirDyn) (Pair 16 8))
+    ((LirVec _ _) (Pair (vec-mem-bytes t) 8))
     ((LirOpt t) (let ((s (size-align t)))
                   (Pair (round-up (+ (round-up 1 (. s snd)) (. s fst)) (. s snd)) (. s snd))))))
 

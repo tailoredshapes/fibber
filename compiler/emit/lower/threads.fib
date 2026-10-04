@@ -21,6 +21,7 @@
     ((LirFloat) "(float 0.0)")
     ((LirDouble) "(double 0.0)")
     ((LirOpt _) (lir-zero l))
+    ((LirVec _ _) (lir-zero l))
     (_ (str-join ["(" (lir-ty-text l) " 0)"]))))
 
 ;; `(store v field-i-of-p)`: the field's address first (it takes a name), then the store.
@@ -45,7 +46,7 @@
       (do (store-at cx asname (v-text atom) slot-atom-lock "(i32 0)")
           (let ((vp (lcx-gep cx asname (v-text atom) slot-atom-value)))
             (try-let ((l (program-lir (. cx p) result-ty)))
-              (do (when-some (t l) (fb-stmt (. cx b) (str-join ["(store " (zero-text t) " " vp ")"])))
+              (do (when-some (t l) (fb-stmt (. cx b) (str-join ["(store " (lir-align-text t) (zero-text t) " " vp ")"])))
                   (Ok atom))))))))
 
 ;; The fields of a task that `spawn` fills: running, its driver held by the thread, no resume function, no waiters, the result
@@ -199,7 +200,7 @@
 ;; The lock, the store of `v` and the release of the old content, for a result of type `t`; `close` closes the `let`s opened.
 (defun completion-store :private (t: LirTy v: str close: str) -> str
   (let ((w (completion-word t v))
-        (opening (str-join ["        (call @fib.lock lockp)\n        (let ((old (load " (lir-ty-text t) " vp)))\n          (store " v " vp)\n"])))
+        (opening (str-join ["        (call @fib.lock lockp)\n        (let ((old (load " (lir-align-text t) (lir-ty-text t) " vp)))\n          (store " (lir-align-text t) v " vp)\n"])))
     (match w
       ((some word)
        (let ((ow (match t ((LirDyn) "(extractvalue old 0)") (_ "old"))))

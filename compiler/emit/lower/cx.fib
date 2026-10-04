@@ -173,12 +173,12 @@
 
 ;; Rust: lower/mod.rs:449 Cx::load
 (defun lcx-load (cx: LowerCx t: LirTy ptr: str) -> V
-  (fb-val (. cx b) (str-join ["(load " (lir-ty-text t) " " ptr ")"]) t))
+  (fb-val (. cx b) (str-join ["(load " (lir-align-text t) (lir-ty-text t) " " ptr ")"]) t))
 
 ;; Rust: lower/mod.rs:453 Cx::store
 (defun lcx-store (cx: LowerCx v: V ptr: str) -> unit
   (match v
-    ((VVal s _) (fb-stmt (. cx b) (str-join ["(store " s " " ptr ")"])))
+    ((VVal s t) (fb-stmt (. cx b) (str-join ["(store " (lir-align-text t) s " " ptr ")"])))
     (_ ())))
 
 ;; A call of a runtime function with these arguments (a `unit` argument is no text); a value of `ret`, or unit when there is none.
@@ -190,3 +190,11 @@
     (match ret
       ((some t) (fb-val (. cx b) instr t))
       (nil (do (fb-stmt (. cx b) instr) VUnit)))))
+
+;; Traps with `msg` when `c` holds; continues in a fresh block. Rust: arith.rs:200 LowerCx::trap_if
+(defun lcx-trap-if (cx: LowerCx c: V msg: str) -> unit
+  (let ((lt (fb-label (. cx b) "trap")) (lk (fb-label (. cx b) "ok")))
+    (do (fb-term (. cx b) (str-join ["(br " (v-text c) " " lt " " lk ")"]))
+        (fb-open (. cx b) lt)
+        (lcx-trap-c cx msg)
+        (fb-open (. cx b) lk))))
