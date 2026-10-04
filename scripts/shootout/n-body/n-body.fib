@@ -1,0 +1,100 @@
+;; n-body, the Benchmarks Game: the five-body solar system, symplectic advance by 0.01, N steps.
+;; The state is one flat (Array f64): body i holds x y z vx vy vz m at 7i .. 7i+6. It is held in a cell and
+;; written in place through & parameters.
+(ns main (:require [fib.math :as math] [fib.fmt :as fmt]))
+
+(def solar-mass: f64 39.47841760435743)   ; 4 * pi * pi, as Java computes it
+(def days-per-year: f64 365.24)
+
+(defstruct Six (a: f64 b: f64 c: f64 d: f64 e: f64 f: f64))
+
+(defun body (&a: (Array f64) i: i64 x: f64 y: f64 z: f64 vx: f64 vy: f64 vz: f64 m: f64) -> i64
+  (let [o (* 7 i)]
+    (do (array-set! &a o x) (array-set! &a (+ o 1) y) (array-set! &a (+ o 2) z)
+        (array-set! &a (+ o 3) (* vx days-per-year)) (array-set! &a (+ o 4) (* vy days-per-year))
+        (array-set! &a (+ o 5) (* vz days-per-year)) (array-set! &a (+ o 6) (* m solar-mass))
+        0)))
+
+(defun momentum (a: (Array f64) k: i64) -> f64
+  (loop [i 0 s 0.0] (if (>= i 5) s (recur (+ i 1) (+ s (* (array-get a (+ (* 7 i) k)) (array-get a (+ (* 7 i) 6))))))))
+
+(defun offset-momentum (&a: (Array f64)) -> i64
+  (let [px (momentum @a 3) py (momentum @a 4) pz (momentum @a 5)]
+    (do (array-set! &a 3 (/ (- 0.0 px) solar-mass))
+        (array-set! &a 4 (/ (- 0.0 py) solar-mass))
+        (array-set! &a 5 (/ (- 0.0 pz) solar-mass))
+        0)))
+
+;; the new velocities of bodies i and j after one step of dt between them: read through a borrow, so the
+;; writes that follow find the array with one holder and happen in place
+(defun pair-velocities (a: (Array f64) i: i64 j: i64 dt: f64) -> Six
+  (let [oi (* 7 i) oj (* 7 j)
+        dx (- (array-get a oi) (array-get a oj))
+        dy (- (array-get a (+ oi 1)) (array-get a (+ oj 1)))
+        dz (- (array-get a (+ oi 2)) (array-get a (+ oj 2)))
+        d2 (+ (+ (* dx dx) (* dy dy)) (* dz dz))
+        mag (/ dt (* d2 (math/sqrt d2)))
+        mi (array-get a (+ oi 6)) mj (array-get a (+ oj 6))]
+    (Six (- (array-get a (+ oi 3)) (* (* dx mj) mag))
+         (- (array-get a (+ oi 4)) (* (* dy mj) mag))
+         (- (array-get a (+ oi 5)) (* (* dz mj) mag))
+         (+ (array-get a (+ oj 3)) (* (* dx mi) mag))
+         (+ (array-get a (+ oj 4)) (* (* dy mi) mag))
+         (+ (array-get a (+ oj 5)) (* (* dz mi) mag)))))
+
+(defun pair (&a: (Array f64) i: i64 j: i64 dt: f64) -> i64
+  (let [v (pair-velocities @a i j dt) oi (* 7 i) oj (* 7 j)]
+    (do (array-set! &a (+ oi 3) (. v a)) (array-set! &a (+ oi 4) (. v b)) (array-set! &a (+ oi 5) (. v c))
+        (array-set! &a (+ oj 3) (. v d)) (array-set! &a (+ oj 4) (. v e)) (array-set! &a (+ oj 5) (. v f))
+        0)))
+
+(defun moved (a: (Array f64) i: i64 dt: f64) -> Six
+  (let [o (* 7 i)]
+    (Six (+ (array-get a o) (* dt (array-get a (+ o 3))))
+         (+ (array-get a (+ o 1)) (* dt (array-get a (+ o 4))))
+         (+ (array-get a (+ o 2)) (* dt (array-get a (+ o 5))))
+         0.0 0.0 0.0)))
+
+(defun advance (&a: (Array f64) dt: f64) -> i64
+  (do (loop [i 0] (if (>= i 5) 0
+        (do (loop [j (+ i 1)] (if (>= j 5) 0 (do (pair &a i j dt) (recur (+ j 1)))))
+            (recur (+ i 1)))))
+      (loop [i 0] (if (>= i 5) 0
+        (let [m (moved @a i dt) o (* 7 i)]
+          (do (array-set! &a o (. m a)) (array-set! &a (+ o 1) (. m b)) (array-set! &a (+ o 2) (. m c))
+              (recur (+ i 1))))))))
+
+(defun energy-with (a: (Array f64) i: i64 e: f64) -> f64
+  (loop [j (+ i 1) e e]
+    (if (>= j 5) e
+      (let [oi (* 7 i) oj (* 7 j)
+            dx (- (array-get a oi) (array-get a oj))
+            dy (- (array-get a (+ oi 1)) (array-get a (+ oj 1)))
+            dz (- (array-get a (+ oi 2)) (array-get a (+ oj 2)))]
+        (recur (+ j 1) (- e (/ (* (array-get a (+ oi 6)) (array-get a (+ oj 6)))
+                               (math/sqrt (+ (+ (* dx dx) (* dy dy)) (* dz dz))))))))))
+
+(defun energy (a: (Array f64)) -> f64
+  (loop [i 0 e 0.0]
+    (if (>= i 5) e
+      (let [oi (* 7 i)
+            vx (array-get a (+ oi 3)) vy (array-get a (+ oi 4)) vz (array-get a (+ oi 5)) mi (array-get a (+ oi 6))]
+        (recur (+ i 1) (energy-with a i (+ e (* (* 0.5 mi) (+ (+ (* vx vx) (* vy vy)) (* vz vz))))))))))
+
+(defun main () -> i64
+  (let [n (or (parse-long (nth (args) 0)) 0)
+        a (cell (array 35 0.0))]
+    (do (body &a 0 0.0 0.0 0.0 0.0 0.0 0.0 1.0)
+        (body &a 1 4.84143144246472090e+00 -1.16032004402742839e+00 -1.03622044471123109e-01
+              1.66007664274403694e-03 7.69901118419740425e-03 -6.90460016972063023e-05 9.54791938424326609e-04)
+        (body &a 2 8.34336671824457987e+00 4.12479856412430479e+00 -4.03523417114321381e-01
+              -2.76742510726862411e-03 4.99852801234917238e-03 2.30417297573763929e-05 2.85885980666130812e-04)
+        (body &a 3 1.28943695621391310e+01 -1.51111514016986312e+01 -2.23307578892655734e-01
+              2.96460137564761618e-03 2.37847173959480950e-03 -2.96589568540237556e-05 4.36624404335156298e-05)
+        (body &a 4 1.53796971148509165e+01 -2.59193146099879641e+01 1.79258772950371181e-01
+              2.68067772490389322e-03 1.62824170038242295e-03 -9.51592254519715870e-05 5.15138902046611451e-05)
+        (offset-momentum &a)
+        (println (fmt/format-f64 (energy @a) 9))
+        (loop [k 0] (if (>= k n) 0 (do (advance &a 0.01) (recur (+ k 1)))))
+        (println (fmt/format-f64 (energy @a) 9))
+        0)))
