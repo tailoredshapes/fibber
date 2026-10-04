@@ -1,0 +1,28 @@
+;; compiler/tests/native/h-exec.fib: package H's tests of native.cases.exec: output of both streams, exit codes, death by a signal, the time limit.
+(ns main (:use native.cases.exec))
+
+(defun report (name: str ok: bool) -> i64
+  (if ok (do (println (str "ok " name)) 0) (do (println (str "FAIL " name)) 1)))
+
+(defun sh (script: str limit: i64) -> Outcome
+  (match (run-within "/bin/sh" ["-c" script] limit) ((Ok o) o) ((Err e) (Outcome -5 nil false e ""))))
+
+(defun main () -> i64
+  (let ((a (sh "echo out; echo err >&2; exit 3" 20))
+        (b (sh "kill -SEGV $$" 20))
+        (c (sh "echo partial; sleep 30" 1))
+        (d (sh "cat" 20))
+        (e (run-within "/nonexistent/prog" [] 5))
+        (f (run-program "/bin/sh" ["-c" "exit 0"])))
+    (+ (report "exit status" (= (. a status) 3))
+       (report "stdout" (= (. a stdout) "out\n"))
+       (report "stderr" (= (. a stderr) "err\n"))
+       (report "no signal" (nil? (. a signal)))
+       (report "signal" (= (. b signal) (some 11)))
+       (report "signal status" (= (. b status) 139))
+       (report "timeout flag" (. c timed-out))
+       (report "timeout status" (= (. c status) 124))
+       (report "timeout keeps output" (= (. c stdout) "partial\n"))
+       (report "stdin is null" (and (= (. d status) 0) (= (. d stdout) "")))
+       (report "missing program is 127" (match e ((Ok o) (= (. o status) 127)) ((Err _) false)))
+       (report "run-program ok" (match f ((Ok o) (= (. o status) 0)) ((Err _) false))))))
