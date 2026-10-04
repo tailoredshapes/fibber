@@ -1,0 +1,45 @@
+;; mandelbrot: the Benchmarks Game's, N x N pixels, 50 iterations, P4 bitmap on standard output.
+(ns main (:use fib.unix))
+
+(def MAXIT: i64 50)
+
+;; The escape test of one pixel: true when |z|^2 stays at or below 4 through MAXIT iterations of z = z^2 + c.
+(defun inside? (cr: f64 ci: f64) -> bool
+  (loop [i 0 zr 0.0 zi 0.0 tr 0.0 ti 0.0]
+    (if (or (>= i MAXIT) (> (+ tr ti) 4.0))
+      (<= (+ tr ti) 4.0)
+      (let [zi2 (+ (* (* 2.0 zr) zi) ci)
+            zr2 (+ (- tr ti) cr)]
+        (recur (+ i 1) zr2 zi2 (* zr2 zr2) (* zi2 zi2))))))
+
+;; One byte: eight pixels, the first the high bit; pixels past the row's end are zeros.
+(defun pack (n: i64 bx: i64 ci: f64) -> i64
+  (loop [k 0 acc 0]
+    (if (< k 8)
+      (let [x (+ (* bx 8) k)
+            bit (if (and (< x n)
+                         (inside? (- (/ (* 2.0 (double x)) (double n)) 1.5) ci))
+                  1 0)]
+        (recur (+ k 1) (bit-or (shl acc 1) bit)))
+      acc)))
+
+;; One row of bytes into buf.
+(defun row (n: i64 y: i64 buf: (Cell (Array i8))) -> unit
+  (let [ci (- (/ (* 2.0 (double y)) (double n)) 1.0)
+        w (quot (+ n 7) 8)]
+    (loop [bx 0]
+      (if (< bx w)
+        (do (array-set! &buf bx (trunc i8 (pack n bx ci)))
+            (recur (+ bx 1)))
+        ()))))
+
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0)))
+        w (quot (+ n 7) 8)
+        buf (cell (array w (trunc i8 0)))]
+    (do
+      (fd-write stdout (str-bytes (str "P4\n" n " " n "\n")))
+      (loop [y 0]
+        (if (< y n)
+          (do (row n y buf) (fd-write stdout @buf) (recur (+ y 1)))
+          0)))))
