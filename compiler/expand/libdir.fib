@@ -1,7 +1,7 @@
 ;; compiler/expand/libdir.fib: where the library source is, for a tool that is installed and moved (scripts/package.sh). The release
 ;; layout is `bin/fibc`, `lib/liblair.so`, `share/fibber/lib/` (the library, `prelude.fib` and `fib/`): when the file `share/fibber/lib/prelude.fib`
 ;; is there beside the directory of the running executable (/proc/self/exe), that directory is the library; else it is `lib` of the working
-;; directory, as it always was (the repository root). No Rust counterpart: the Rust tools embed the library.
+;; directory, as it always was (the repository root). A FIB_LIB that names a directory with a `prelude.fib` wins over both. No Rust counterpart: the Rust tools embed the library.
 (ns expand.libdir
   (:require [lair.ffi :as ffi]))
 
@@ -25,10 +25,28 @@
             (= (array-get bs i) 47i8) (str-slice path 0 i)
             :else (recur (- i 1))))))
 
-;; The directory of the library: the installed one if there is one, else `lib`.
+;; The first directory of the environment variable FIB_LIB (a `:`-separated list) that holds a `prelude.fib`, if there is one.
+(defun env-library :private () -> (Option str)
+  (match (sys-getenv "FIB_LIB")
+    (nil nil)
+    ((some list)
+     (loop ((from 0))
+       (if (> from (str-len list))
+         nil
+         (let ((at (match (str-find list ":" from) (nil (str-len list)) ((some i) i)))
+               (dir (str-slice list from at)))
+           (if (and (> (str-len dir) 0) (some? (read-file (str-concat dir "/prelude.fib"))))
+             (some dir)
+             (recur (+ at 1)))))))))
+
+;; The directory of the library: the one FIB_LIB names (a compiler that builds a tree must read that tree's library, however it was
+;; installed), else the installed one beside the executable if there is one, else `lib` of the working directory.
 (defun library-dir () -> str
-  (match (exe-path)
-    (nil "lib")
-    ((some exe)
-     (let ((dir (str-concat (parent (parent exe)) "/share/fibber/lib")))
-       (if (some? (read-file (str-concat dir "/prelude.fib"))) dir "lib")))))
+  (match (env-library)
+    ((some dir) dir)
+    (nil
+     (match (exe-path)
+       (nil "lib")
+       ((some exe)
+        (let ((dir (str-concat (parent (parent exe)) "/share/fibber/lib")))
+          (if (some? (read-file (str-concat dir "/prelude.fib"))) dir "lib")))))))

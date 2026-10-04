@@ -151,6 +151,8 @@ jobs:
   stage2:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 5
@@ -164,12 +166,37 @@ jobs:
           echo "SEED_FIBC=$fibc" >> "$GITHUB_ENV"
           echo "SEED_LIB=$(cd "$(dirname "$fibc")/../lib" && pwd)" >> "$GITHUB_ENV"
 
+      # The tree's own lair: stage 2 links the code generator of the tree it is built from (it may call entries the seed's
+      # liblair.so lacks), so the Rust toolchain and LLVM come back for this one crate.
+      - name: Install the pinned toolchain
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install $RUST_TOOLCHAIN --profile minimal
+          rustup default $RUST_TOOLCHAIN
+
+      - name: Install LLVM 21
+        timeout-minutes: 15
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
+
+      - uses: Swatinem/rust-cache@v2
+        timeout-minutes: 10
+        with:
+          prefix-key: stage2-lair
+
+      - name: Build lair (release)
+        timeout-minutes: 30
+        run: cargo build --release -p lair
+
       - name: Build stage 2 and check it
         timeout-minutes: 30
         run: |
           set -eu
-          export FIB_LIB=$PWD/lib LD_LIBRARY_PATH=$SEED_LIB
-          build() { "$1" build compiler/fibc.fib -I compiler -I lib -L "$SEED_LIB" -l lair -o "$2"; }
+          export FIB_LIB=$PWD/lib LAIR=$PWD/target/release LD_LIBRARY_PATH=$PWD/target/release
+          build() { "$1" build compiler/fibc.fib -I compiler -I lib -L "$LAIR" -l lair -o "$2"; }
           emit() { "$1" emit -I compiler -I lib compiler/fibc.fib; }
           build "$SEED_FIBC" "$RUNNER_TEMP/F"
           emit "$SEED_FIBC" > "$RUNNER_TEMP/emit.seed"
@@ -191,5 +218,5 @@ jobs:
           LIMIT_MODULES: 120
           LIMIT_STDLIB: 2400
         run: |
-          export FIB_LIB=$PWD/lib LD_LIBRARY_PATH=$SEED_LIB
+          export FIB_LIB=$PWD/lib LD_LIBRARY_PATH=$PWD/target/release
           scripts/ci-stage2.sh "$RUNNER_TEMP/F"

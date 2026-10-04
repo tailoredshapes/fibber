@@ -41,4 +41,8 @@ fi
 tar -xzf "$tarball" -C "$dir"
 fibc=$(find "$dir" -path '*/bin/fibc' -type f | head -n 1)
 if [ -z "$fibc" ]; then echo "fetch-seed: no bin/fibc in the tarball" >&2; exit 1; fi
+# A seed compiler must read the library it is going to compile, not the one it was released with (a newer tree may use a prelude
+# function the seed's library lacks, and an installed compiler prefers its bundled library): the tree's lib/ replaces the bundled one.
+bundled=$(cd "$(dirname "$fibc")/.." && pwd)/share/fibber/lib
+if [ -d "$bundled" ] && [ -d "$root/lib" ]; then rm -rf "$bundled" && cp -r "$root/lib" "$bundled"; fi
 cd "$(dirname "$fibc")" && echo "$PWD/fibc"
