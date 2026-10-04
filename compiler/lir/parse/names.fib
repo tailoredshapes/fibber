@@ -58,8 +58,13 @@
 
 ;; The items of v from index k on, as a fresh vector (Rust's `&items[k..]`).
 (defun vec-from (v: (Vec Sexp) k: i64) -> (Vec Sexp)
-  (loop ((i k) (out []))
-    (if (>= i (count v)) out (recur (+ i 1) (conj out (nth v i))))))
+  (let ((n (- (count v) k)))
+    (if (<= n 0)
+        (vec-empty)
+        (let ((out (cell (array n (nth v k)))))
+          (do (loop ((i 1))
+                (if (< i n) (do (array-set! &out i (nth v (+ k i))) (recur (+ i 1))) ()))
+              (vec-from-array @out))))))
 
 ;; Whether the form is an atom with exactly this text.
 (defun atom-is? (s: Sexp w: str) -> bool
@@ -79,9 +84,16 @@
 
 ;; Every form of `args` as an expression (expr.rs `exprs`).
 (defun operands (sub: ExprParser args: (Vec Sexp)) -> (Result (Vec LExpr) Diagnostic)
-  (loop ((i 0) (out []))
-    (if (>= i (count args))
-        (Ok out)
-        (match ((. sub parse) (nth args i))
+  (let ((n (count args)))
+    (if (= n 0)
+        (Ok (vec-empty))
+        (match ((. sub parse) (nth args 0))
           ((Err d) (Err d))
-          ((Ok e) (recur (+ i 1) (conj out e)))))))
+          ((Ok e0)
+           (let ((out (cell (array n e0))))
+             (loop ((i 1))
+               (if (>= i n)
+                   (Ok (vec-from-array @out))
+                   (match ((. sub parse) (nth args i))
+                     ((Err d) (Err d))
+                     ((Ok e) (do (array-set! &out i e) (recur (+ i 1)))))))))))))
