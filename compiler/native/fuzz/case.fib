@@ -1,0 +1,34 @@
+;; compiler/native/fuzz/case.fib: one accept case, and the random type (crates/lair/src/fuzz/mutate.rs `Case`, `random_type`). OWNER: package F.
+;; Apart from mutate.rs so that grammar, mutate and deep do not form a cycle.
+(ns native.fuzz.case
+  (:require [native.fuzz.rng :as rng] [native.fuzz.tree :as tree] [native.fuzz.words :as w])
+  (:use lir.sexp))
+
+;; The name, the forms read once, and every atom of the case: the pool names and labels are drawn from.
+(defstruct FzCase (name: str forms: (Vec Sexp) atoms: (Vec str)))
+
+(defun case-new (name: str forms: (Vec Sexp)) -> FzCase
+  (FzCase name forms (tree/atoms-of forms)))
+
+(defun atom-of (text: str) -> Sexp (SxAtom text 0))
+
+(defun one-of (r: rng/FzRng xs: (Vec str)) -> str
+  (nth xs (rng/rng-below r (count xs))))
+
+(defun struct-atoms :private (c: FzCase) -> (Vec str)
+  (vec (filter (fn (a: str) (starts-with? a "%struct.")) (. c atoms))))
+
+;; A random type: a scalar keyword, a struct of the case, a vector or an array (mutate.rs `random_type`).
+(defun random-type (r: rng/FzRng c: FzCase) -> Sexp
+  (let ((k (rng/rng-below r 6)))
+    (cond (= k 0) (let ((structs (struct-atoms c)))
+                    (match (rng/rng-pick-index r (count structs))
+                      ((some i) (atom-of (nth structs i)))
+                      (nil (atom-of "ptr"))))
+          (= k 1) (let ((n (one-of r ["4" "2" "0" "1025" "8"]))
+                        (e (one-of r ["i32" "i64" "double" "i1" "ptr"])))
+                    (SxVecType n e 0))
+          (= k 2) (let ((n (one-of r ["4" "0" "1" "4294967296" "-1"]))
+                        (t (one-of r w/types)))
+                    (SxBracket [(atom-of n) (atom-of "x") (atom-of t)] 0))
+          :else (atom-of (one-of r w/types)))))

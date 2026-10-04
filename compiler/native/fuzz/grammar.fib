@@ -1,0 +1,61 @@
+;; compiler/native/fuzz/grammar.fib: random instructions of lIR's grammar, with operands drawn from the case under mutation
+;; (crates/lair/src/fuzz/grammar.rs). OWNER: package F. The draws are made in the Rust's order: every argument is bound in a `let`.
+(ns native.fuzz.grammar
+  (:require [native.fuzz.rng :as rng] [native.fuzz.words :as w])
+  (:use lir.sexp native.fuzz.case))
+
+(defun list-of :private (items: (Vec Sexp)) -> Sexp (SxList items 0))
+
+(defun num :private (r: rng/FzRng) -> Sexp (atom-of (one-of r w/interesting-numbers)))
+
+;; A name, label or literal of the case: what an operand slot gets (grammar.rs `leaf`).
+(defun leaf (r: rng/FzRng c: FzCase) -> Sexp
+  (let ((k (rng/rng-below r 4)))
+    (cond (= k 0) (let ((t (one-of r w/types)) (v (one-of r w/interesting-numbers)))
+                    (list-of [(atom-of t) (atom-of v)]))
+          (= k 1) (atom-of (one-of r ["null" "@printf" "@main" "entry" "x"]))
+          :else (match (rng/rng-pick-index r (count (. c atoms)))
+                  ((some i) (atom-of (nth (. c atoms) i)))
+                  (nil (atom-of "x"))))))
+
+(defun label (r: rng/FzRng c: FzCase) -> Sexp
+  (match (rng/rng-pick-index r (count (. c atoms)))
+    ((some i) (atom-of (nth (. c atoms) i)))
+    (nil (atom-of "entry"))))
+
+;; One instruction of the grammar with random operands (grammar.rs `random_instruction`).
+(defun random-instruction (r: rng/FzRng c: FzCase) -> Sexp
+  (let ((ty (random-type r c))
+        (k (rng/rng-below r 24)))
+    (cond (<= k 3) (let ((w (nth w/keywords (rng/rng-below r 18))) (a (leaf r c)) (b (leaf r c)))
+                     (list-of [(atom-of w) a b]))
+          (= k 4) (let ((p (one-of r w/ipreds)) (a (leaf r c)) (b (leaf r c)))
+                    (list-of [(atom-of "icmp") (atom-of p) a b]))
+          (= k 5) (let ((p (one-of r w/fpreds)) (a (leaf r c)) (b (leaf r c)))
+                    (list-of [(atom-of "fcmp") (atom-of p) a b]))
+          (= k 6) (let ((w (nth w/keywords (+ 26 (rng/rng-below r 14)))) (a (leaf r c)))
+                    (list-of [(atom-of w) ty a]))
+          (= k 7) (let ((a (leaf r c))) (list-of [(atom-of "load") ty a]))
+          (= k 8) (let ((a (leaf r c)) (b (leaf r c))) (list-of [(atom-of "store") a b]))
+          (= k 9) (list-of [(atom-of "alloca") ty])
+          (= k 10) (let ((a (leaf r c)) (n (num r)))
+                     (list-of [(atom-of "getelementptr") ty a (list-of [(atom-of "i32") (atom-of "0")]) (list-of [(atom-of "i32") n])]))
+          (= k 11) (let ((a (leaf r c)) (n (num r)))
+                     (list-of [(atom-of "extractvalue") a n]))
+          (= k 12) (let ((a (leaf r c)) (b (leaf r c)) (d (leaf r c))) (list-of [(atom-of "select") a b d]))
+          (= k 13) (let ((a (leaf r c))) (list-of [(atom-of "ret") a]))
+          (= k 14) (let ((l (label r c))) (list-of [(atom-of "br") l]))
+          (= k 15) (let ((a (leaf r c)) (l1 (label r c)) (l2 (label r c))) (list-of [(atom-of "br") a l1 l2]))
+          (= k 16) (let ((a (leaf r c)) (b (leaf r c))) (list-of [(atom-of "call") a b]))
+          (= k 17) (let ((l (label r c)) (a (leaf r c))) (list-of [(atom-of "phi") ty (list-of [l a])]))
+          (= k 18) (list-of [(atom-of (one-of r ["unreachable" "trap"]))])
+          (= k 19) (let ((op (one-of r ["add" "xchg" "max" "nand"])) (o (one-of r w/orderings)) (a (leaf r c)) (b (leaf r c)))
+                     (list-of [(atom-of "atomicrmw") (atom-of op) (atom-of o) a b]))
+          (= k 20) (let ((o (one-of r w/orderings)) (a (leaf r c)) (b (leaf r c)) (d (leaf r c)))
+                     (list-of [(atom-of "cmpxchg") (atom-of o) a b d]))
+          (= k 21) (let ((a (leaf r c)) (l (label r c)) (v (leaf r c)) (l2 (label r c)))
+                     (list-of [(atom-of "switch") a l (list-of [(list-of [v l2])])]))
+          (= k 22) (let ((a (leaf r c)) (b (leaf r c)))
+                     (list-of [(atom-of "let") (list-of [(list-of [(atom-of "x") a])]) b]))
+          :else (let ((a (leaf r c)) (b (leaf r c)))
+                  (list-of [(atom-of "indirect-call") a (list-of [(atom-of "fn") ty]) b])))))

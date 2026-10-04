@@ -1,0 +1,230 @@
+;; compiler/native/fuzz.fib: the mutation fuzzer of the checker (crates/lair/src/fuzz/mod.rs, spec/lir.md section 10, method.md rule 7): every accept
+;; case of a suite, deformed at random, must be rejected with a message or run, never crash the checker, the lowering or LLVM. Each mutant runs in
+;; a process of its own, through `lairf fuzz-one`, which marks on stderr how far it got. OWNER: package F; `fuzz-cmd` is called by native.cli.
+;; Differences from the Rust: the workers are `native.cases/cases-workers` (4, or FIB_LAIR_WORKERS) where the Rust runs min(cores, 8); a mutant that
+;; traps (`trap:` on stderr) is a finding as one that panics is.
+(ns native.fuzz
+  (:require [native.fuzz.rng :as rng] [native.fuzz.tree :as tree] [native.fuzz.mutate :as mutate] [native.fuzz.verdict :as vd]
+            [native.fuzz.case :as fcase] [native.cases :as cases] [native.cases.walk :as walk] [native.cases.header :as hdr]
+            [native.cases.exec :as exec] [llvm.ffi :as ffi] [fib.string :as s] [native.cases.text :as text] [lir.sexp :as sexp] [lir.diag :as diag])
+  (:use native.fuzz.verdict))
+
+(extern getpid :private () -> i32)
+(extern readlink :private (ptr ptr i64) -> i64)
+
+;; The path of this program (`std::env::current_exe`): the target of /proc/self/exe, which a shell would take for itself.
+(defun self-path :private () -> str
+  (let ((p (ffi/bytes-new "/proc/self/exe"))
+        (buf (ffi/bytes-new (str-join (mapv (fn (k: i64) " ") (range 4096)))))
+        (n (unsafe (readlink p buf 4095))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (let ((r (if (> n 0) (ffi/text-at (ffi/ptr->addr buf) n) "/proc/self/exe")))
+          (do (ffi/free-addr (ffi/ptr->addr buf)) r)))))
+
+;; The usage text of the whole tool (cli.rs `USAGE`; native.cli has it too, and cannot be required from here: it requires this module).
+(def usage: str "usage:
+  lair check FILE.lir
+  lair run [-O n] FILE.lir [ARGS..]
+  lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
+  lair emit-llvm FILE.lir
+  lair dump-ast FILE.lir
+  lair cases DIR..
+  lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
+  lair fuzz-one [-O n] FILE.lir")
+
+(defstruct FzConfig (seed: i64 total: i64 timeout: i64 out-dir: str keep: (Option str) verbose: bool opt: i64))
+
+;; One mutant the checker or the backend mishandled.
+(defstruct FzReport (index: i64 cname: str ops: (Vec str) what: str path: str))
+
+(defenum FzDone (FzJudged v: FzVerdict) (FzBad f: FzReport))
+
+;; ---------------------------------------------------------------------------------------------------- the corpus
+
+;; The accept cases under `paths` (mod.rs `corpus`).
+(defun corpus-of (paths: (Vec str)) -> (Result (Vec fcase/FzCase) str)
+  (let ((files (walk/collect-files paths)))
+    (try-let [cs (loop ((i 0) (out []))
+                   (if (>= i (count files))
+                       (Ok out)
+                       (let ((p (nth files i)))
+                         (match (read-file p)
+                           (nil (Err (str p ": cannot read: No such file or directory (os error 2)")))
+                           ((some src)
+                            (match (hdr/parse-header src)
+                              ((Err e) (Err (str p ": " e)))
+                              ((Ok h) (if (accept? h)
+                                          (match (sexp/read src)
+                                            ((Err d) (Err (str p ": " (diag/diag-str d))))
+                                            ((Ok forms) (recur (+ i 1) (conj out (fcase/case-new p forms)))))
+                                          (recur (+ i 1) out)))))))))]
+      (if (empty? cs) (Err "no accept cases found") (Ok cs)))))
+
+(defun accept? :private (h: hdr/CaseHeader) -> bool
+  (match (. h expect) ((hdr/ExpAccept _ _ _) true) (_ false)))
+
+;; ---------------------------------------------------------------------------------------------------- mutants
+
+;; The mutant `i` of the run: its source, its case and the names of the mutations; fixed by the seed and `i` alone (mod.rs `mutant`).
+(defstruct FzMutant (src: str cname: str ops: (Vec str)))
+
+(defun mutant (cfg: FzConfig corpus: (Vec fcase/FzCase) i: i64) -> FzMutant
+  (let ((r (rng/rng-new (bit-xor (. cfg seed) (rng/wmul i -7046029254386353131))))
+        (c (nth corpus (rng/rng-below r (count corpus))))
+        (m (mutate/mutate r corpus c)))
+    (FzMutant (tree/print-forms (. m fst)) (. c name) (. m snd))))
+
+;; The source of mutant `i`, to reproduce it by hand (mod.rs `show`).
+(defun show-mutant (corpus: (Vec fcase/FzCase) cfg: FzConfig i: i64) -> str
+  (let ((m (mutant cfg corpus i)))
+    (str ";; mutant " i " of " (. m cname) " by " (s/join ", " (. m ops)) "\n" (. m src))))
+
+;; ---------------------------------------------------------------------------------------------------- running
+
+;; mkdir -p.
+(defun make-dirs (path: str) -> bool
+  (let ((parts (filter (fn (c: str) (not (= c ""))) (s/split path "/"))))
+    (loop ((i 0) (cur (if (starts-with? path "/") "/" "")))
+      (if (>= i (count parts))
+          true
+          (let ((next (if (or (= cur "") (= cur "/")) (str cur (nth parts i)) (str cur "/" (nth parts i)))))
+            (do (sys-mkdir next 511)
+                (recur (+ i 1) next)))))))
+
+(defun debug-verdict :private (v: FzVerdict) -> str
+  (match v
+    ((FzRejected) "Rejected") ((FzRan) "Ran") ((FzRuntimeCrash) "RuntimeCrash") ((FzRuntimeTimeout) "RuntimeTimeout")
+    ((FzFinding w) (str "Finding(" (debug-w w) ")"))))
+
+(defun debug-w :private (w: str) -> str (text/debug-str w))
+
+;; The worker's command: a shell caps the address space and drops the program's output, which a mutant may produce without end.
+(def worker-script: str "ulimit -v 4194304; exec \"$0\" fuzz-one -O \"$1\" \"$2\" >/dev/null")
+
+(defun bad :private (m: FzMutant i: i64 what: str path: str) -> FzDone
+  (FzBad (FzReport i (. m cname) (. m ops) what path)))
+
+;; Mutant `i`: written, run, judged; a finding's file is kept. (mod.rs `one`)
+(defun one (lair: str corpus: (Vec fcase/FzCase) cfg: FzConfig scratch: str i: i64) -> FzDone
+  (let ((m (mutant cfg corpus i))
+        (file (str scratch "/m" i ".lir")))
+    (cond (not (write-file file (. m src))) (bad m i (str "cannot write mutant: " file) file)
+          :else
+          (let ((kept (match (. cfg keep)
+                        (nil "")
+                        ((some k) (let ((p (str k "/seed" (. cfg seed) "-m" i ".lir"))) (if (write-file p (. m src)) "" p))))))
+            (if (not (= kept ""))
+                (bad m i (str "cannot keep mutant: " kept) kept)
+                (let ((out (exec/run-within "sh" ["-c" worker-script lair (str (. cfg opt)) file] (. cfg timeout)))
+                      (v (classify out)))
+                  (do (sys-unlink file)
+                      (if (. cfg verbose)
+                          (println (str "mutant " i " of " (. m cname) " by " (s/join ", " (. m ops)) ": " (debug-verdict v)))
+                          ())
+                      (match v
+                        ((FzFinding what) (finding m cfg i what))
+                        (_ (FzJudged v))))))))))
+
+(defun finding :private (m: FzMutant cfg: FzConfig i: i64 what: str) -> FzDone
+  (let ((path (str (. cfg out-dir) "/seed" (. cfg seed) "-m" i ".lir"))
+        (header (str ";; lair fuzz finding: seed " (. cfg seed) " mutant " i " of " (. m cname) "\n;; mutations: " (s/join ", " (. m ops)) "\n;; " what "\n")))
+    (do (write-file path (str header (. m src)))
+        (bad m i what path))))
+
+;; One worker: takes the index of the next mutant until there is none.
+(defun work :private (next: (Atom i64) lair: str corpus: (Vec fcase/FzCase) cfg: FzConfig scratch: str) -> (Vec (Pair i64 FzDone))
+  (loop ((acc []))
+    (let ((i (- (swap! next (fn (n: i64) (+ n 1))) 1)))
+      (if (>= i (. cfg total))
+          acc
+          (recur (conj acc (Pair i (one lair corpus cfg scratch i))))))))
+
+(defstruct FzSummary (mutants: i64 rejected: i64 ran: i64 crashes: i64 timeouts: i64 findings: (Vec FzReport)))
+
+(defun record :private (sm: FzSummary d: FzDone) -> FzSummary
+  (let ((sm1 (with sm (mutants (+ (. sm mutants) 1)))))
+    (match d
+      ((FzBad f) (with sm1 (findings (conj (. sm1 findings) f))))
+      ((FzJudged v) (match v
+                      ((FzRejected) (with sm1 (rejected (+ (. sm1 rejected) 1))))
+                      ((FzRan) (with sm1 (ran (+ (. sm1 ran) 1))))
+                      ((FzRuntimeCrash) (with sm1 (crashes (+ (. sm1 crashes) 1))))
+                      ((FzRuntimeTimeout) (with sm1 (timeouts (+ (. sm1 timeouts) 1))))
+                      (_ sm1))))))
+
+;; Runs `cfg.count` mutants of `corpus` through `lair`, in parallel (mod.rs `run`).
+(defun run-fuzz (lair: str corpus: (Vec fcase/FzCase) cfg: FzConfig) -> (Result FzSummary str)
+  (let ((env (unwrap-or (sys-getenv "TMPDIR") ""))
+        (scratch (str (if (= env "") "/tmp" env) "/lair-fuzz-" (sext i64 (unsafe (getpid))))))
+    (if (not (and (make-dirs scratch) (make-dirs (. cfg out-dir)) (match (. cfg keep) (nil true) ((some k) (make-dirs k)))))
+        (Err "cannot make the output directories")
+        (let ((next (atom 0))
+              (tasks (mapv (fn (k: i64) (spawn (fn () (work next lair corpus cfg scratch)))) (range (cases/cases-workers))))
+              (all (reduce (fn (a: (Vec (Pair i64 FzDone)) t) (into a (join t))) [] tasks))
+              (sorted (vec (sort (fn (x: (Pair i64 FzDone) y: (Pair i64 FzDone)) (compare (. x fst) (. y fst))) all)))
+              (sm (reduce (fn (s: FzSummary p: (Pair i64 FzDone)) (record s (. p snd))) (FzSummary 0 0 0 0 0 []) sorted)))
+          (do (remove-scratch scratch) (Ok sm))))))
+
+(defun remove-scratch :private (d: str) -> unit
+  (do (match (walk/list-dir d) (nil ()) ((some names) (doseq [n names] (sys-unlink (walk/join-path d n)))))
+      (sys-rmdir d)
+      ()))
+
+;; ---------------------------------------------------------------------------------------------------- the command
+
+(defun opt-level :private (t: str) -> (Result i64 str)
+  (match (hdr/parse-i32 t)
+    ((some n) (if (and (>= n 0) (<= n 3)) (Ok n) (Err (str "bad -O level " t))))
+    (nil (Err (str "bad -O level " t)))))
+
+(defun nonneg :private (t: str what: str) -> (Result i64 str)
+  (match (parse-long t)
+    ((some n) (if (>= n 0) (Ok n) (Err what)))
+    (nil (Err what))))
+
+;; What `fuzz` was asked for so far: the options, the directories, the mutant to print.
+(defstruct FzArgs (cfg: FzConfig dirs: (Vec str) print-at: (Option i64)))
+
+(defun value-flag? :private (a: str) -> bool
+  (or (= a "--seed") (= a "--count") (= a "--timeout") (= a "-o") (= a "--keep") (= a "-O") (= a "--print")))
+
+(defun apply-flag :private (a: FzArgs flag: str v: str) -> (Result FzArgs str)
+  (let ((c (. a cfg)))
+    (cond (= flag "--seed") (try-let [n (nonneg v "bad --seed")] (Ok (with a (cfg (with c (seed n))))))
+          (= flag "--count") (try-let [n (nonneg v "bad --count")] (Ok (with a (cfg (with c (total n))))))
+          (= flag "--timeout") (try-let [n (nonneg v "bad --timeout")] (Ok (with a (cfg (with c (timeout n))))))
+          (= flag "-o") (Ok (with a (cfg (with c (out-dir v)))))
+          (= flag "--keep") (Ok (with a (cfg (with c (keep (some v))))))
+          (= flag "-O") (try-let [n (opt-level v)] (Ok (with a (cfg (with c (opt n))))))
+          :else (try-let [n (nonneg v "bad --print")] (Ok (with a (print-at (some n))))))))
+
+(defun parse-args :private (words: (Vec str)) -> (Result FzArgs str)
+  (loop ((i 0) (a (FzArgs (FzConfig 1 2000 5 "target/lair-fuzz" nil false 0) [] nil)))
+    (if (>= i (count words))
+        (Ok a)
+        (let ((w (nth words i)))
+          (cond (value-flag? w) (if (>= (+ i 1) (count words))
+                                    (Err (str w " needs a value"))
+                                    (try-let [a2 (apply-flag a w (nth words (+ i 1)))] (recur (+ i 2) a2)))
+                (= w "-v") (recur (+ i 1) (with a (cfg (with (. a cfg) (verbose true)))))
+                (starts-with? w "-") (Err (str "unknown option " w "\n" usage))
+                :else (recur (+ i 1) (with a (dirs (conj (. a dirs) w)))))))))
+
+(defun finding-text :private (f: FzReport) -> str
+  (str "FINDING mutant " (. f index) " of " (. f cname) " (" (s/join ", " (. f ops)) "): " (. f what) "\n  kept as " (. f path)))
+
+;; `lair fuzz ..`: the exit status (cli.rs `fuzz`).
+(defun fuzz-cmd (rest: (Vec str)) -> (Result i64 str)
+  (try-let [a (parse-args rest)]
+    (if (empty? (. a dirs))
+        (Err usage)
+        (try-let [corpus (corpus-of (. a dirs))]
+          (let ((cfg (. a cfg)))
+            (match (. a print-at)
+              ((some i) (do (print (show-mutant corpus cfg i)) (Ok 0)))
+              (nil (try-let [sm (run-fuzz (self-path) corpus cfg)]
+                     (do (doseq [f (. sm findings)] (println (finding-text f)))
+                         (println (str "fuzz: seed " (. cfg seed) ", " (count corpus) " cases, " (. sm mutants) " mutants: " (. sm rejected)
+                                       " rejected, " (. sm ran) " ran, " (. sm crashes) " crashed at run time, " (. sm timeouts)
+                                       " timed out at run time, " (count (. sm findings)) " findings"))
+                         (Ok (if (empty? (. sm findings)) 0 1)))))))))))

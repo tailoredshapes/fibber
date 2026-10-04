@@ -1,0 +1,115 @@
+;; compiler/tests/native/f-unit.fib: package F's unit tests of native.fuzz.* against the Rust's fuzz tests (crates/lair/src/fuzz/*.rs `mod tests`) and
+;; against values computed by an independent Python transcription of SplitMix64. Prints `ok NAME` / `FAIL NAME` per check; exit 0 when all pass.
+(ns main
+  (:require [native.fuzz.rng :as rng] [native.fuzz.tree :as tree] [native.fuzz.mutate :as mutate] [native.fuzz.deep :as deep]
+            [native.fuzz :as fuzz] [native.fuzz.grammar :as grammar] [native.fuzz.case :as fcase] [native.fuzz.words :as w] [native.cases.exec :as exec])
+  (:use lir.sexp native.fuzz.verdict))
+
+(defun report (name: str ok: bool) -> i64
+  (if ok (do (println (str "ok " name)) 0) (do (println (str "FAIL " name)) 1)))
+
+(defun forms-of (src: str) -> (Vec Sexp)
+  (match (read src) ((Ok f) f) ((Err d) (trap "f-unit: bad source"))))
+
+(defun draws (seed: i64 n: i64) -> (Vec i64)
+  (let ((r (rng/rng-new seed))) (mapv (fn (k: i64) (rng/rng-next r)) (range n))))
+
+(def small-case: str "(declare printf i32 (ptr ...))\n(define (main i32) ((i32 argc) (ptr argv)) (block entry (let ((p (alloca %struct.s)) (x (add argc (i32 -7)))) (store x p) (br (icmp slt x (i32 4)) a b))) (block a (ret (load i32 p))) (block b (fence seq_cst) (ret (i32 0))))")
+
+(defun one-case () -> fcase/FzCase (fcase/case-new "t" (forms-of small-case)))
+
+;; The names the mutations of seeds 0..399 applied.
+(defun seen-ops () -> (Vec str)
+  (let ((c (one-case))
+        (corpus [c]))
+    (vec (distinct (reduce (fn (acc: (Vec str) seed: i64)
+                             (into acc (. (mutate/mutate (rng/rng-new seed) corpus c) snd)))
+                           [] (range 400))))))
+
+(defun deterministic? () -> bool
+  (let ((c (one-case))
+        (corpus [c]))
+    (every? (fn (seed: i64)
+              (let ((a (mutate/mutate (rng/rng-new seed) corpus c))
+                    (b (mutate/mutate (rng/rng-new seed) corpus c))
+                    (src (tree/print-forms (. a fst))))
+                (and (= src (tree/print-forms (. b fst)))
+                     (= (. a snd) (. b snd))
+                     (match (read src) ((Ok _) true) ((Err _) false)))))
+            (range 400))))
+
+(defun random-instructions-read-back? () -> bool
+  (let ((c (fcase/case-new "t" (forms-of "(define (main i32) () (block entry (ret (i32 0))))")))
+        (r (rng/rng-new 9)))
+    (every? (fn (k: i64) (match (read (tree/print-forms [(grammar/random-instruction r c)])) ((Ok _) true) ((Err _) false)))
+            (range 200))))
+
+(defun outcome (status: i64 signal: (Option i64) timed-out: bool stderr: str) -> (Result exec/Outcome str)
+  (Ok (exec/Outcome status signal timed-out "" stderr)))
+
+(defun finding-text (v: FzVerdict) -> str (match v ((FzFinding w) w) (_ "<not a finding>")))
+
+;; Mutants 0..59 of seed 3 over the fixture corpus are the text `lair fuzz --seed 3 --print I` wrote (f-corpus/golden.txt, made by the Rust).
+(defun golden-ok? () -> bool
+  (match (fuzz/corpus-of ["compiler/tests/native/f-corpus"])
+    ((Err e) false)
+    ((Ok cs) (let ((cfg (fuzz/FzConfig 3 60 5 "x" nil false 0))
+                   (mine (str-join (mapv (fn (i: i64) (str "=== " i "\n" (fuzz/show-mutant cs cfg i))) (range 60)))))
+               (= (unwrap-or (read-file "compiler/tests/native/f-corpus/golden.txt") "<missing>") mine)))))
+
+(defun both () -> str (str checked-mark "\n" compiled-mark "\n"))
+
+(defun main () -> i64
+  (let ((src "(define (main i32) () (block entry (ret (i32 0))))\n(a \"x\\n\\\"\\x01\" <4 x i32> [2 x i8] {i32, ptr})\n")
+        (printed "(define (main i32) () (block entry (ret (i32 0))))\n(a \"x\\n\\\"\\x01\" <4 x i32> [2 x i8] {i32 ptr})\n")
+        (t (forms-of "(a (b c) d) e"))
+        (ops (seen-ops)))
+    (+ 0
+       ;; rng.rs, from Python
+       (report "rng stream, seed 7" (= (draws 7 3) [7191089600892374487 309689372594955804 -1830642326893942270]))
+       (report "rng stream, seed 0 and the all-ones seed" (and (= (draws 0 1) [-2152535657050944081]) (= (draws -1 1) [-1956407806741107680])))
+       (report "rng below is the unsigned remainder" (let ((r (rng/rng-new 7))) (= (mapv (fn (k: i64) (rng/rng-below r 1000)) (range 3)) [487 804 346])))
+       (report "rng below 0 draws nothing" (let ((r (rng/rng-new 7))) (and (= (rng/rng-below r 0) 0) (= (rng/rng-next r) 7191089600892374487))))
+       (report "wrapping product" (and (= (rng/wmul -1 -1) 1) (= (rng/wmul 123456789012345 987654321987) 3407596976647650219)
+                                       (= (rng/wmul 0 -5) 0) (= (rng/wmul -9223372036854775808 2) 0)))
+       (report "wrapping sum" (and (= (rng/wadd 9223372036854775807 9223372036854775807) -2) (= (rng/wadd -1 2) 1)))
+       (report "unsigned remainder of a negative" (and (= (rng/urem -1 10) 5) (= (rng/urem -9223372036854775808 7) 1)))
+       ;; tree.rs
+       (report "prints what it read" (= (tree/print-forms (forms-of src)) printed))
+       (report "print then read then print is stable" (= (tree/print-forms (forms-of printed)) printed))
+       (report "counts nodes in pre-order" (= (tree/count-nodes t) 7))
+       (report "nth node" (and (= (mapv sexp-describe [(unwrap-or (tree/nth-node t 2) (nth t 0)) (unwrap-or (tree/nth-node t 4) (nth t 0))
+                                                         (unwrap-or (tree/nth-node t 5) (nth t 0)) (unwrap-or (tree/nth-node t 6) (nth t 0))])
+                                   ["b" "c" "d" "e"])
+                               (nil? (tree/nth-node t 7))))
+       (report "update nth and atoms"
+               (match (tree/update-nth t 3 (fn (s: Sexp) (SxAtom "z" 0)))
+                 ((some f) (and (= (tree/print-forms f) "(a (z c) d)\ne\n") (= (tree/atoms-of f) ["a" "z" "c" "d" "e"])))
+                 (nil false)))
+       (report "update past the end is nil" (nil? (tree/update-nth t 7 (fn (s: Sexp) s))))
+       ;; the tables
+       (report "table sizes and slices" (and (= (count w/keywords) 87) (= (count w/types) 9) (= (count w/interesting-numbers) 22)
+                                             (= (nth w/keywords 17) "ashr") (= (nth w/keywords 26) "trunc") (= (nth w/keywords 39) "fptoui-sat")))
+       ;; mutate.rs, grammar.rs, deep.rs
+       (report "every op applies and mutants are fixed by their seed" (deterministic?))
+       (report "all sixteen ops were seen"
+               (every? (fn (o: str) (some? (first (filter (fn (x: str) (= x o)) ops))))
+                       ["swap-type" "drop-operand" "dup-operand" "rename-atom" "change-number" "insert-instruction" "splice" "swap-siblings"
+                        "replace-head" "unwrap" "drop-form" "swap-type-everywhere" "change-predicate" "change-ordering" "add-modifier" "duplicate-block"]))
+       (report "mutants 0..59 of seed 3 are the Rust's, byte for byte" (golden-ok?))
+       (report "random instructions read back" (random-instructions-read-back?))
+       ;; verdict.rs
+       (report "ran" (and (= (classify (outcome 0 nil false (both))) FzRan) (= (classify (outcome 7 nil false (both))) FzRan)))
+       (report "runtime crash and timeout" (and (= (classify (outcome 139 (some 11) false (both))) FzRuntimeCrash)
+                                                (= (classify (outcome 124 nil true (both))) FzRuntimeTimeout)))
+       (report "rejected" (= (classify (outcome 1 nil false "m.lir:1:2: error: add expects 2 operands, found 1\n")) FzRejected))
+       (report "panic and internal error" (and (starts-with? (finding-text (classify (outcome 101 nil false "thread 'main' panicked at x\n"))) "panic")
+                                               (starts-with? (finding-text (classify (outcome 1 nil false (str checked-mark "\ninternal error: LLVM verifier rejected\n")))) "internal error")))
+       (report "a trap is a panic" (starts-with? (finding-text (classify (outcome 134 (some 6) false "trap: unreachable\n"))) "panic"))
+       (report "killed in the backend" (= (finding-text (classify (outcome 134 (some 6) false (str checked-mark "\n"))))
+                                          "killed by SIGABRT (6) in the backend: "))
+       (report "timeouts" (and (= (finding-text (classify (outcome 124 nil true ""))) "the checker timed out")
+                               (= (finding-text (classify (outcome 124 nil true checked-mark))) "the backend timed out")))
+       (report "a failing exit with no error text is a finding" (starts-with? (finding-text (classify (outcome 3 nil false "boom\n"))) "exit 3 before compiling"))
+       (report "no message is a finding" (starts-with? (finding-text (classify (outcome 0 nil false ""))) "exit 0 before compiling"))
+       (report "the harness failing is a finding" (starts-with? (finding-text (classify (Err "timed out"))) "harness:")))))

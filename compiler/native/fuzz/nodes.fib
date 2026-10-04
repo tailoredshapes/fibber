@@ -1,0 +1,64 @@
+;; compiler/native/fuzz/nodes.fib: finding nodes and editing child lists, shared by the mutations (crates/lair/src/fuzz/mutate.rs and deep.rs).
+;; OWNER: package F. A mutation is `(Option (Pair str (Vec Sexp)))`: its name and the changed forms, or nil when it gave up.
+(ns native.fuzz.nodes
+  (:require [native.fuzz.rng :as rng] [native.fuzz.tree :as tree])
+  (:use lir.sexp native.fuzz.case))
+
+(defun result-of (name: str forms: (Option (Vec Sexp))) -> (Option (Pair str (Vec Sexp)))
+  (match forms ((some f) (some (Pair name f))) (nil nil)))
+
+;; A random node index (mutate.rs `any_node`).
+(defun any-node (r: rng/FzRng forms: (Vec Sexp)) -> i64
+  (rng/rng-below r (tree/count-nodes forms)))
+
+;; A random node satisfying `want`, found within `tries` draws (mutate.rs `some_node`: 24; deep.rs `form_with_head`: 40).
+(defun find-node (r: rng/FzRng forms: (Vec Sexp) tries: i64 want: (fn (Sexp) bool)) -> (Option i64)
+  (let ((total (tree/count-nodes forms)))
+    (loop ((i 0))
+      (if (>= i tries)
+          nil
+          (let ((n (rng/rng-below r total)))
+            (if (match (tree/nth-node forms n) ((some s) (want s)) (nil false))
+                (some n)
+                (recur (+ i 1))))))))
+
+(defun some-node (r: rng/FzRng forms: (Vec Sexp) want: (fn (Sexp) bool)) -> (Option i64)
+  (find-node r forms 24 want))
+
+(defun many-items? (s: Sexp) -> bool
+  (match (tree/items-of s) ((some v) (>= (count v) 2)) (nil false)))
+
+(defun has-items? (s: Sexp) -> bool
+  (match (tree/items-of s) ((some v) (>= (count v) 1)) (nil false)))
+
+;; The atom at the head of a list (only a list).
+(defun list-head (s: Sexp) -> (Option str)
+  (match s
+    ((SxList v _) (if (empty? v) nil (sexp-atom (nth v 0))))
+    (_ nil)))
+
+;; The first child of a list, brace or bracket when it is an atom.
+(defun first-atom (s: Sexp) -> (Option str)
+  (match (tree/items-of s)
+    ((some v) (if (empty? v) nil (sexp-atom (nth v 0))))
+    (nil nil)))
+
+;; The list with the element at `i` removed.
+(defun vec-remove (v: (Vec Sexp) i: i64) -> (Vec Sexp)
+  (into (vec (take i v)) (drop (+ i 1) v)))
+
+;; The list with `x` inserted at `i` (the elements from `i` move up).
+(defun vec-insert (v: (Vec Sexp) i: i64 x: Sexp) -> (Vec Sexp)
+  (into (conj (vec (take i v)) x) (drop i v)))
+
+;; The children of a brace, bracket or list changed by `f`; other forms unchanged.
+(defun edit-items (s: Sexp f: (fn ((Vec Sexp)) (Vec Sexp))) -> Sexp
+  (match s
+    ((SxList v p) (SxList (f v) p))
+    ((SxBrace v p) (SxBrace (f v) p))
+    ((SxBracket v p) (SxBracket (f v) p))
+    (_ s)))
+
+;; The same for a list only (the Rust's `if let Sexp::List(v, _) = s`).
+(defun edit-list (s: Sexp f: (fn ((Vec Sexp)) (Vec Sexp))) -> Sexp
+  (match s ((SxList v p) (SxList (f v) p)) (_ s)))

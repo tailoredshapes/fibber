@@ -1,0 +1,143 @@
+;; compiler/native/fuzz/mutate.fib: random mutations of a case's forms: the ways a compiler bug or a hostile emitter might deform valid lIR
+;; (crates/lair/src/fuzz/mutate.rs). OWNER: package F. The draws are made in the Rust's order.
+(ns native.fuzz.mutate
+  (:require [native.fuzz.rng :as rng] [native.fuzz.tree :as tree] [native.fuzz.words :as w] [native.fuzz.deep :as deep])
+  (:use lir.sexp native.fuzz.case native.fuzz.nodes native.fuzz.grammar))
+
+(defun type-atom? :private (s: Sexp) -> bool
+  (match s
+    ((SxAtom a _) (or (some? (first (filter (fn (t: str) (= t a)) w/types))) (starts-with? a "%struct.")))
+    ((SxVecType _ _ _) true)
+    ((SxBracket _ _) true)
+    (_ false)))
+
+(defun digit? :private (s: str) -> bool
+  (and (> (str-len s) 0) (let ((c (str-byte-at s 0))) (and (>= c 48i8) (<= c 57i8)))))
+
+(defun number? :private (s: Sexp) -> bool
+  (match (sexp-atom s)
+    ((some a) (digit? (if (starts-with? a "-") (str-slice a 1 (str-len a)) a)))
+    (nil false)))
+
+(defun atom? :private (s: Sexp) -> bool (some? (sexp-atom s)))
+
+(defun replace-at :private (forms: (Vec Sexp) n: i64 x: Sexp) -> (Option (Vec Sexp))
+  (tree/update-nth forms n (fn (s: Sexp) x)))
+
+(defun swap-type :private (r: rng/FzRng c: FzCase forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms type-atom?)
+    (nil nil)
+    ((some n) (let ((ty (random-type r c))) (result-of "swap-type" (replace-at forms n ty))))))
+
+(defun drop-operand :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms many-items?)
+    (nil nil)
+    ((some n) (let ((x (rng/rng-next r)))
+                (result-of "drop-operand"
+                           (tree/update-nth forms n
+                             (fn (s: Sexp) (edit-items s (fn (v: (Vec Sexp)) (vec-remove v (+ 1 (rng/urem x (- (count v) 1)))))))))))))
+
+(defun dup-operand :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms has-items?)
+    (nil nil)
+    ((some n) (let ((x (rng/rng-next r)))
+                (result-of "dup-operand"
+                           (tree/update-nth forms n
+                             (fn (s: Sexp) (edit-items s (fn (v: (Vec Sexp)) (let ((i (rng/urem x (count v)))) (vec-insert v i (nth v i))))))))))))
+
+(defun rename-atom :private (r: rng/FzRng c: FzCase forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms atom?)
+    (nil nil)
+    ((some n) (match (rng/rng-pick-index r (count (. c atoms)))
+                (nil nil)
+                ((some i) (result-of "rename-atom" (replace-at forms n (atom-of (nth (. c atoms) i)))))))))
+
+(defun change-number :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms number?)
+    (nil nil)
+    ((some n) (let ((v (one-of r w/interesting-numbers)))
+                (result-of "change-number" (replace-at forms n (atom-of v)))))))
+
+(defun list-nonempty? :private (s: Sexp) -> bool
+  (match s ((SxList v _) (not (empty? v))) (_ false)))
+
+(defun insert-instruction :private (r: rng/FzRng c: FzCase forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms list-nonempty?)
+    (nil nil)
+    ((some n) (let ((instr (random-instruction r c))
+                    (x (rng/rng-next r)))
+                (result-of "insert-instruction"
+                           (tree/update-nth forms n
+                             (fn (s: Sexp) (edit-list s (fn (v: (Vec Sexp)) (vec-insert v (+ 1 (rng/urem x (count v))) instr))))))))))
+
+;; A subtree of another case in place of a node of this one.
+(defun splice :private (r: rng/FzRng corpus: (Vec FzCase) forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (rng/rng-pick-index r (count corpus))
+    (nil nil)
+    ((some oi) (let ((other (nth corpus oi)))
+                 (match (tree/nth-node (. other forms) (any-node r (. other forms)))
+                   (nil nil)
+                   ((some donor) (let ((n (any-node r forms))) (result-of "splice" (replace-at forms n donor)))))))))
+
+(defun swap-siblings :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms many-items?)
+    (nil nil)
+    ((some n) (let ((a (rng/rng-next r))
+                    (b (rng/rng-next r)))
+                (result-of "swap-siblings"
+                           (tree/update-nth forms n
+                             (fn (s: Sexp)
+                               (edit-items s (fn (v: (Vec Sexp))
+                                               (let ((i (rng/urem a (count v))) (j (rng/urem b (count v))))
+                                                 (assoc (assoc v i (nth v j)) j (nth v i))))))))))))
+
+(defun list-with-atom-head? :private (s: Sexp) -> bool (some? (list-head s)))
+
+(defun replace-head :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms list-with-atom-head?)
+    (nil nil)
+    ((some n) (let ((word (nth w/keywords (rng/rng-below r (count w/keywords)))))
+                (result-of "replace-head"
+                           (tree/update-nth forms n (fn (s: Sexp) (edit-list s (fn (v: (Vec Sexp)) (assoc v 0 (atom-of word)))))))))))
+
+;; A list replaced by one of its children.
+(defun unwrap :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (some-node r forms many-items?)
+    (nil nil)
+    ((some n) (let ((x (rng/rng-next r)))
+                (result-of "unwrap"
+                           (tree/update-nth forms n
+                             (fn (s: Sexp) (match (tree/items-of s) ((some v) (nth v (rng/urem x (count v)))) (nil s)))))))))
+
+(defun drop-form :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (if (< (count forms) 2)
+      nil
+      (some (Pair "drop-form" (vec-remove forms (rng/rng-below r (count forms)))))))
+
+(def n-ops: i64 11)
+
+;; Op `k` of the table (mutate.rs `OPS`, then deep.rs `OPS`).
+(defun apply-op :private (k: i64 r: rng/FzRng corpus: (Vec FzCase) c: FzCase forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (cond (= k 0) (swap-type r c forms)
+        (= k 1) (drop-operand r forms)
+        (= k 2) (dup-operand r forms)
+        (= k 3) (rename-atom r c forms)
+        (= k 4) (change-number r forms)
+        (= k 5) (insert-instruction r c forms)
+        (= k 6) (splice r corpus forms)
+        (= k 7) (swap-siblings r forms)
+        (= k 8) (replace-head r forms)
+        (= k 9) (unwrap r forms)
+        (= k 10) (drop-form r forms)
+        :else (deep/apply-deep (- k n-ops) r c forms)))
+
+;; The forms after one to three mutations of `c`, and their names (mutate.rs `mutate`).
+(defun mutate (r: rng/FzRng corpus: (Vec FzCase) c: FzCase) -> (Pair (Vec Sexp) (Vec str))
+  (let ((wanted (+ 1 (rng/rng-below r 3))))
+    (loop ((tries 0) (forms (. c forms)) (applied []))
+      (if (or (>= (count applied) wanted) (>= tries 20))
+          (Pair forms applied)
+          (let ((k (rng/rng-below r (+ n-ops deep/n-deep))))
+            (match (apply-op k r corpus c forms)
+              (nil (recur (+ tries 1) forms applied))
+              ((some p) (recur (+ tries 1) (. p snd) (conj applied (. p fst))))))))))
