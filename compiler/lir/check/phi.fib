@@ -1,95 +1,13 @@
-;; compiler/lir/check/phi.fib: phi: placement now, predecessors and incoming values once every block is typed (spec/lir.md 5.4; crates/lir/src/check/phi.rs). OWNER: package K2.
+;; compiler/lir/check/phi.fib: phi: placement now, predecessors and incoming values once every block is typed (spec/lir.md 5.4; crates/lir/src/check/phi.rs). OWNER: package K2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
 
 (ns lir.check.phi
-  (:use lir.diag lir.types lir.ast lir.check.env lir.check.cfg lir.check.walk lir.check.fcx))
+  (:use lir.diag lir.types lir.ast lir.check.walk lir.check.fcx))
 
 
 ;; Registers the phi of the current block; `phi after the first instruction of block B`. (phi.rs `Fcx::phi`)
 (defun check-phi (fcx: Fcx t: LType inc: (Vec LBinding) pos: i64) -> (Result LType Diagnostic)
-  (if @(. fcx emitted)
-      (err pos (str "phi after the first instruction of block " (fcx-label fcx @(. fcx cur))))
-      (try-let ((valid (fcx-valid fcx t pos)))
-        (do (set! (. fcx phis) (conj @(. fcx phis) (PendingPhi @(. fcx cur) t inc pos)))
-            (Ok t)))))
+  (trap "todo: lir.check.phi check-phi"))
 
 ;; Checks every pending phi after the last block. (phi.rs `finish_phis`)
 (defun finish-phis (fcx: Fcx) -> (Result unit Diagnostic)
-  (let ((phis @(. fcx phis)))
-    (do (set! (. fcx phis) [])
-        (loop ((i 0))
-          (if (>= i (count phis))
-              (Ok ())
-              (match (finish-phi fcx (nth phis i))
-                ((Err d) (Err d))
-                ((Ok _) (recur (+ i 1)))))))))
-
-(defun preds-set :private (preds: (Vec i64)) -> (Set i64)
-  (loop ((i 0) (s: (Set i64) #{}))
-    (if (>= i (count preds)) s (recur (+ i 1) (conj s (nth preds i))))))
-
-;; One incoming entry: the block exists, is a predecessor, is new, and its value has the phi's type; the set of blocks seen with it.
-(defun finish-entry :private (fcx: Fcx ph: PendingPhi here: str preds: (Set i64) seen: (Set i64) b: LBinding) -> (Result (Set i64) Diagnostic)
-  (match (get (. fcx labels) (. b name))
-     (nil (err (. b pos) (str "undefined block " (. b name))))
-     ((some m)
-      (cond (not (contains? preds m))
-            (err (. b pos) (str "phi in " here " names " (. b name) ", which is not a predecessor"))
-            (contains? seen m)
-            (err (. b pos) (str "phi in " here " has two entries for " (. b name)))
-            :else
-            (try-let ((t (incoming fcx (. b value) m)))
-              (if (!= t (. ph ty))
-                  (err (. b pos) (str "phi: incoming value from " (. b name) " has type " (type-str t) ", expected " (type-str (. ph ty))))
-                  (Ok (conj seen m))))))))
-
-(defun finish-phi :private (fcx: Fcx ph: PendingPhi) -> (Result unit Diagnostic)
-  (let ((here (fcx-label fcx (. ph block)))
-        (pv (nth (. (. fcx cfg) preds) (. ph block)))
-        (preds (preds-set pv)))
-    (loop ((i 0) (seen: (Set i64) #{}))
-      (if (< i (count (. ph incoming)))
-          (match (finish-entry fcx ph here preds seen (nth (. ph incoming) i))
-            ((Err d) (Err d))
-            ((Ok s) (recur (+ i 1) s)))
-          (match (first-missing pv seen)
-            ((some m) (err (. ph pos) (str "phi in " here " has no entry for predecessor " (fcx-label fcx m))))
-            (nil (Ok ())))))))
-
-;; The first predecessor, in order, without an entry.
-(defun first-missing :private (preds: (Vec i64) seen: (Set i64)) -> (Option i64)
-  (loop ((i 0))
-    (cond (>= i (count preds)) nil
-          (not (contains? seen (nth preds i))) (some (nth preds i))
-          :else (recur (+ i 1)))))
-
-;; Whether the value is void by its form: a store, a fence, a trap, a call of a void function.
-(defun void-form? :private (fcx: Fcx v: LExpr) -> bool
-  (match (. v kind)
-    ((KStore _ _ _ _) true)
-    ((KAtomicStore _ _ _ _) true)
-    ((KFence _ _) true)
-    ((KTrap) true)
-    ((KCall callee _ _)
-     (match callee
-       ((CalDirect f)
-        (match (env-function (. fcx env) f (. v pos))
-          ((Ok t) (= (. t ret) nil))
-          ((Err _) false)))
-       (_ false)))
-    (_ false)))
-
-;; The type of an incoming value, used at the end of block `m`. (phi.rs `incoming`)
-(defun incoming :private (fcx: Fcx v: LExpr m: i64) -> (Result LType Diagnostic)
-  (cond (kind-terminator? (. v kind)) (err (. v pos) "terminator used as a value")
-        (match (. v kind) ((KLocal _) true) (_ false))
-        (match (. v kind) ((KLocal n) (fcx-lookup-at-end fcx n m (. v pos))) (_ (err (. v pos) "unexpected form")))
-        (void-form? fcx v) (err (. v pos) "void value used as an operand")
-        (constant? v)
-        (let ((saved-cur @(. fcx cur))
-              (saved-emitted @(. fcx emitted)))
-          (do (set! (. fcx cur) m)
-              (let ((r (fcx-val fcx v)))
-                (do (set! (. fcx cur) saved-cur)
-                    (set! (. fcx emitted) saved-emitted)
-                    r))))
-        :else (err (. v pos) "phi incoming value must be a name, a global or a constant")))
+  (trap "todo: lir.check.phi finish-phis"))
