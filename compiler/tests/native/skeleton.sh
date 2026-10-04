@@ -21,7 +21,9 @@ for f in compiler/lir.fib $(find compiler/lir compiler/native -name '*.fib' | LC
 done
 [ "$missing" = 0 ] || exit 1
 
-if ! "$fibc" build compiler/tests/native/skeleton.fib -I compiler -I lib -o "$out" 2> "$out.err"; then
+# The lowering modules call LLVM-C: link LLVM as compiler/tests/llvm/build.sh does (the shared library; LLVM_LIBDIR names its directory).
+llvmdir=${LLVM_LIBDIR:-$(llvm-config-21 --libdir 2>/dev/null || echo /usr/lib/llvm-21/lib)}
+if ! "$fibc" build compiler/tests/native/skeleton.fib -I compiler -I lib -L "$llvmdir" -l LLVM-21 -o "$out" 2> "$out.err"; then
   cat "$out.err" >&2; rm -f "$out" "$out.err"; echo "skeleton: FAILED to build" >&2; exit 1
 fi
 rm -f "$out.err"
