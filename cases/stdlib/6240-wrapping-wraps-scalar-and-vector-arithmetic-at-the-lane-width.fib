@@ -1,0 +1,57 @@
+;; spec:   stdlib §7 L10, types §1.9, docs/design/simd-and-tensors.md 2.8
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; (wrapping e) makes + - * and neg wrap: each result is compared with the scalar reference written here, the exact arithmetic in i64 cut to the width with trunc, for i8, i16 and i32 scalars and for every lane of i8x4, i16x4 and i32x4; the i64 results are the known wrapped values.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((xs [127i8 -128i8 100i8 -1i8 5i8]) (ys [1i8 -1i8 100i8 -128i8 -7i8]))
+          (doseq [i (range 5)]
+            (let ((a (nth xs i)) (b (nth ys i)) (wa (sext i64 (nth xs i))) (wb (sext i64 (nth ys i))))
+              (do (check c (= (wrapping (+ a b)) (trunc i8 (+ wa wb))))
+                  (check c (= (wrapping (- a b)) (trunc i8 (- wa wb))))
+                  (check c (= (wrapping (* a b)) (trunc i8 (* wa wb))))
+                  (check c (= (wrapping (neg a)) (trunc i8 (- 0 wa))))))))
+        (let ((xs [32767i16 -32768i16 300i16]) (ys [1i16 -1i16 300i16]))
+          (doseq [i (range 3)]
+            (let ((a (nth xs i)) (b (nth ys i)) (wa (sext i64 (nth xs i))) (wb (sext i64 (nth ys i))))
+              (do (check c (= (wrapping (+ a b)) (trunc i16 (+ wa wb))))
+                  (check c (= (wrapping (* a b)) (trunc i16 (* wa wb))))))))
+        (let ((xs [2147483647i32 -2147483648i32 65536i32]) (ys [1i32 -1i32 65536i32]))
+          (doseq [i (range 3)]
+            (let ((a (nth xs i)) (b (nth ys i)) (wa (sext i64 (nth xs i))) (wb (sext i64 (nth ys i))))
+              (do (check c (= (wrapping (+ a b)) (trunc i32 (+ wa wb))))
+                  (check c (= (wrapping (- a b)) (trunc i32 (- wa wb))))
+                  (check c (= (wrapping (* a b)) (trunc i32 (* wa wb))))))))
+        (check c (= (wrapping (+ 9223372036854775807 1)) -9223372036854775808))
+        (check c (= (wrapping (- -9223372036854775808 1)) 9223372036854775807))
+        (check c (= (wrapping (* 9223372036854775807 2)) -2))
+        (check c (= (wrapping (neg -9223372036854775808)) -9223372036854775808))
+        (let ((a: i8x4 <<127 -128 100 5>>i8) (b: i8x4 <<1 -1 100 -7>>i8))
+          (let ((s (wrapping (+ a b))) (d (wrapping (- a b))) (m (wrapping (* a b))) (n (wrapping (neg a))))
+            (doseq [i (range 4)]
+              (let ((x (sext i64 (lane a i))) (y (sext i64 (lane b i))))
+                (do (check c (= (lane s i) (trunc i8 (+ x y))))
+                    (check c (= (lane d i) (trunc i8 (- x y))))
+                    (check c (= (lane m i) (trunc i8 (* x y))))
+                    (check c (= (lane n i) (trunc i8 (- 0 x)))))))))
+        (let ((a: i16x4 <<32767 -32768 300 5>>i16) (b: i16x4 <<1 -1 300 -7>>i16))
+          (let ((s (wrapping (+ a b))) (m (wrapping (* a b))))
+            (doseq [i (range 4)]
+              (let ((x (sext i64 (lane a i))) (y (sext i64 (lane b i))))
+                (do (check c (= (lane s i) (trunc i16 (+ x y))))
+                    (check c (= (lane m i) (trunc i16 (* x y)))))))))
+        (let ((a: i32x4 <<2147483647 -2147483648 65536 5>>i32) (b: i32x4 <<1 -1 65536 -7>>i32))
+          (let ((s (wrapping (+ a b))) (d (wrapping (- a b))) (m (wrapping (* a b))))
+            (doseq [i (range 4)]
+              (let ((x (sext i64 (lane a i))) (y (sext i64 (lane b i))))
+                (do (check c (= (lane s i) (trunc i32 (+ x y))))
+                    (check c (= (lane d i) (trunc i32 (- x y))))
+                    (check c (= (lane m i) (trunc i32 (* x y)))))))))
+        (let ((p (checks)))
+          (do (check p (= (wrapping (+ 127i8 1i8)) 127i8)) (check-detects c p)))
+        (checks-result c))))
