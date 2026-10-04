@@ -1,9 +1,117 @@
-;; compiler/native/jit/prune.fib: pruning what no exported definition reaches (crates/lair/src/jit/prune.rs). OWNER: package J. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/jit/prune.fib: pruning what no exported definition reaches (crates/lair/src/jit/prune.rs). OWNER: package J.
+
+;; A definition that is neither exported nor reachable from an exported one (through calls, global references and initialisers) can never run, so
+;; it is not lowered. Structs, declarations and every exported definition are kept as they are.
 
 (ns native.jit.prune
   (:use lir.ast))
 
 
+;; The search: the definitions by name, the names found live, and the definitions still to scan.
+(defstruct Reach (defined: (Map str LItem) live: (Cell (Map str bool)) work: (Cell (Vec LItem))))
+
+(defun item-exported? :private (item: LItem) -> bool
+  (match item
+    ((ItDefine f) (linkage-exported? (. (. f mods) linkage)))
+    ((ItGlobal g) (linkage-exported? (. (. g mods) linkage)))
+    (_ false)))
+
+(defun item-name :private (item: LItem) -> (Option str)
+  (match item
+    ((ItDefine f) (some (. f name)))
+    ((ItGlobal g) (some (. g name)))
+    (_ nil)))
+
 ;; The module without the internal and private definitions that no exported one reaches, in the Rust's order. (prune.rs `dead_internals`)
 (defun dead-internals (m: LModule) -> LModule
-  (trap "todo: native.jit.prune dead-internals"))
+  (let ((items (. m items))
+        (r (Reach (defined-of (. m items)) (cell {}) (cell []))))
+    (do (dotimes (i (count items))
+          (if (item-exported? (nth items i)) (set! (. r work) (conj @(. r work) (nth items i))) ()))
+        (scan-all r)
+        (LModule (vec (filter (fn (it: LItem) -> bool (keep? r it)) items))))))
+
+(defun defined-of :private (items: (Vec LItem)) -> (Map str LItem)
+  (loop ((i 0) (acc {}))
+    (if (>= i (count items))
+        acc
+        (recur (+ i 1)
+               (match (item-name (nth items i))
+                 ((some n) (assoc acc n (nth items i)))
+                 (nil acc))))))
+
+(defun keep? :private (r: Reach it: LItem) -> bool
+  (match (item-name it)
+    ((some n) (or (item-exported? it) (contains? @(. r live) n)))
+    (nil true)))
+
+;; Takes definitions off the work list until it is empty.
+(defun scan-all :private (r: Reach) -> unit
+  (loop ()
+    (let ((w @(. r work)))
+      (if (= (count w) 0)
+          ()
+          (let ((it (nth w (- (count w) 1))))
+            (do (set! (. r work) (vec-pop w))
+                (scan-item r it)
+                (recur)))))))
+
+(defun scan-item :private (r: Reach it: LItem) -> unit
+  (match it
+    ((ItDefine f) (dotimes (b (count (. f blocks)))
+                    (let ((body (. (nth (. f blocks) b) body)))
+                      (dotimes (e (count body)) (visit r (nth body e))))))
+    ((ItGlobal g) (visit r (. g init)))
+    (_ ())))
+
+;; Notes `name` live and queues its definition, when it has one here and is not live yet.
+(defun reach :private (r: Reach name: str) -> unit
+  (match (get (. r defined) name)
+    ((some it) (if (contains? @(. r live) name)
+                   ()
+                   (do (set! (. r live) (assoc @(. r live) name true))
+                       (set! (. r work) (conj @(. r work) it)))))
+    (nil ())))
+
+(defun visit-all :private (r: Reach es: (Vec LExpr)) -> unit
+  (dotimes (i (count es)) (visit r (nth es i))))
+
+;; Reaches every global name `e` mentions: a direct callee or a `@name` operand.
+(defun visit :private (r: Reach e: LExpr) -> unit
+  (match (. e kind)
+    ((KGlobal n) (reach r n))
+    ((KVector _ es) (visit-all r es))
+    ((KStruct _ es) (visit-all r es))
+    ((KArray _ es) (visit-all r es))
+    ((KUn _ a) (visit r a))
+    ((KCast _ _ a) (visit r a))
+    ((KExtractValue a _) (visit r a))
+    ((KAtomicLoad _ _ _ a) (visit r a))
+    ((KLoad _ a _ _) (visit r a))
+    ((KRet v) (if-some [a v] (visit r a) ()))
+    ((KCondBr a _ _) (visit r a))
+    ((KAlloca _ c _) (if-some [x c] (visit r x) ()))
+    ((KBin _ a b) (do (visit r a) (visit r b)))
+    ((KOverflow _ a b) (do (visit r a) (visit r b)))
+    ((KICmp _ a b) (do (visit r a) (visit r b)))
+    ((KFCmp _ a b) (do (visit r a) (visit r b)))
+    ((KExtractElement a b) (do (visit r a) (visit r b)))
+    ((KInsertValue a b _) (do (visit r a) (visit r b)))
+    ((KAtomicStore _ _ a b) (do (visit r a) (visit r b)))
+    ((KAtomicRmw _ _ _ a b) (do (visit r a) (visit r b)))
+    ((KStore a b _ _) (do (visit r a) (visit r b)))
+    ((KSelect a b c) (do (visit r a) (visit r b) (visit r c)))
+    ((KInsertElement a b c) (do (visit r a) (visit r b) (visit r c)))
+    ((KShuffle a b c) (do (visit r a) (visit r b) (visit r c)))
+    ((KGep _ _ p ix) (do (visit r p) (visit-all r ix)))
+    ((KCmpXchg _ _ _ _ p x n) (do (visit r p) (visit r x) (visit r n)))
+    ((KCall callee args _) (do (match callee
+                                 ((CalDirect n) (reach r n))
+                                 ((CalIndirect p _) (visit r p)))
+                               (visit-all r args)))
+    ((KSwitch v _ cases) (do (visit r v)
+                             (dotimes (i (count cases)) (visit r (. (nth cases i) value)))))
+    ((KPhi _ inc) (dotimes (i (count inc)) (visit r (. (nth inc i) value))))
+    ((KLet binds body) (do (dotimes (i (count binds)) (visit r (. (nth binds i) value)))
+                           (visit-all r body)))
+    (_ ())))

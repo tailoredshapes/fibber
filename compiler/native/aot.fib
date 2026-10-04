@@ -1,7 +1,9 @@
-;; compiler/native/aot.fib: ahead-of-time compilation: an object, assembly or LLVM IR, and executables (crates/lair/src/aot.rs). OWNER: package A. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/aot.fib: ahead-of-time compilation: an object, assembly or LLVM IR, and executables (crates/lair/src/aot.rs). OWNER: package A.
 
 (ns native.aot
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.link))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.link)
+  (:require [lir.check :as check] [native.lower :as nl] [native.owned :as owned] [native.target :as target] [native.passes :as passes]
+            [llvm.target :as lt] [llvm.core :as core] [llvm.ffi :as ffi]))
 
 
 ;; What `aot-emit` produces (aot.rs `Output`).
@@ -11,10 +13,68 @@
 ;; them (`-L`, each also an absolute rpath).
 (defstruct AotOptions (opt-level: i64 libs: (Vec str) lib-dirs: (Vec str)))
 
+;; The bytes of a string as an array.
+(defun text-bytes :private (s: str) -> (Array i8)
+  (str-bytes s))
+
+;; The bytes of a memory buffer, copied into an array.
+(defun buffer-bytes :private (buf: i64) -> (Array i8)
+  (unsafe
+    (let ((n (core/LLVMGetBufferSize buf))
+          (p (ffi/addr->ptr (core/LLVMGetBufferStart buf)))
+          (c (cell (array n 0i8))))
+      (do (dotimes (i n) (array-set! &c i (load-i8 (ptr+ p i)))) @c))))
+
+;; LLVMObjectFile is 1, LLVMAssemblyFile 0.
+(defun file-kind :private (out: AotOutput) -> i32
+  (match out ((OutAssembly) 0i32) (_ 1i32)))
+
+;; The code generator's output for the module, copied; the buffer is disposed. (aot.rs `LLVMTargetMachineEmitToMemoryBuffer`)
+(defun generate :private (tm: i64 module: i64 out: AotOutput) -> (Result (Array i8) LairError)
+  (let ((msg (ffi/slot-new))
+        (buf (ffi/slot-new)))
+    (unsafe
+      (let ((failed (lt/LLVMTargetMachineEmitToMemoryBuffer tm module (file-kind out) msg buf))
+            (r (if (= failed 0i32)
+                   (let ((b (load-i64 buf)))
+                     (let ((bytes (buffer-bytes b)))
+                       (do (core/LLVMDisposeMemoryBuffer b) (Ok bytes))))
+                   (Err (ErrBackend (str "code generation failed: " (core/take-message (load-i64 msg))))))))
+        (do (free msg) (free buf) r)))))
+
+;; Optimises the lowered module at the machine's level and produces `out`.
+(defun finish :private (o: owned/Owned host: target/Machine out: AotOutput level: i64) -> (Result (Array i8) LairError)
+  (match (passes/optimize (. o module) (. host tm) level)
+    ((Err e) (Err e))
+    ((Ok _) (match out
+              ((OutLlvmIr) (Ok (text-bytes (owned/owned-ir o))))
+              (_ (generate (. host tm) (. o module) out))))))
+
 ;; Compiles a checked module for the host: lower, optimise, emit. (aot.rs `emit`)
 (defun aot-emit (m: LModule name: str out: AotOutput opts: AotOptions) -> (Result (Array i8) LairError)
-  (trap "todo: native.aot aot-emit"))
+  (match (target/machine-host (. opts opt-level))
+    ((Err e) (Err e))
+    ((Ok host) (let ((r (match (nl/lower m name (. host triple) (. host data-layout))
+                          ((Err e) (Err e))
+                          ((Ok o) (let ((b (finish o host out (. opts opt-level))))
+                                    (do (owned/owned-dispose o) b))))))
+                 (do (target/machine-dispose host) r)))))
+
+;; The canonical directories of `dirs`, or the first refusal as a backend error.
+(defun library-dirs :private (dirs: (Vec str)) -> (Result (Vec str) LairError)
+  (loop ((i 0) (acc []))
+    (if (>= i (count dirs))
+        (Ok acc)
+        (match (library-dir (nth dirs i))
+          ((Err m) (Err (ErrBackend m)))
+          ((Ok d) (recur (+ i 1) (conj acc d)))))))
 
 ;; Compiles a module that satisfies the `main` rule and links it into an executable at `path`. (aot.rs `build_executable`)
 (defun aot-build-executable (m: LModule name: str path: str opts: AotOptions) -> (Result unit LairError)
-  (trap "todo: native.aot aot-build-executable"))
+  (match (check/check-main m)
+    ((Err d) (Err (lair-error-diag d)))
+    ((Ok _) (match (library-dirs (. opts lib-dirs))
+              ((Err e) (Err e))
+              ((Ok dirs) (match (aot-emit m name OutObject opts)
+                           ((Err e) (Err e))
+                           ((Ok obj) (link obj path dirs (. opts libs)))))))))

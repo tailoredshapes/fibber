@@ -1,10 +1,14 @@
-;; compiler/native/jit.fib: a JIT session over ORC's LLJIT (crates/lair/src/jit/mod.rs `Jit`). OWNER: package J. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/jit.fib: a JIT session over ORC's LLJIT (crates/lair/src/jit/mod.rs `Jit`). OWNER: package J.
 
 ;; Named `JitSession` and `session-*` so that it does not meet `lair.jit`'s `Jit` (the legacy bindings) in one program; `native.api` wraps it with the
 ;; names of `lair.jit`. End a session with `session-free`: its addresses die with it.
 
+;; The sessions are of ORC's LLJIT through compiler/llvm (orc.fib); the names rules, the prune and the trampoline are the modules beside this one.
+
 (ns native.jit
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.jit.names))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.jit.names native.jit.prune native.jit.trampoline)
+  (:require [lir.check :as check] [native.pipeline :as pipe] [native.lower :as nl] [native.owned :as owned] [native.passes :as passes]
+            [native.target :as target] [llvm.orc :as orc] [llvm.support :as support]))
 
 
 (defstruct JitSession
@@ -17,32 +21,75 @@
 
 ;; A session at optimisation level `opt` (0 runs no IR optimisation, 1 to 3 `default<On>`), a target machine at the same level. (mod.rs `Jit::new`)
 (defun session-new (opt: i64) -> (Result JitSession LairError)
-  (trap "todo: native.jit session-new"))
+  (session-make opt false))
 
 ;; As `session-new` with the code generator at level None whatever `opt` is (FastISel): for the compiler's own sessions. (mod.rs `Jit::new_fast_codegen`)
 (defun session-new-fast-codegen (opt: i64) -> (Result JitSession LairError)
-  (trap "todo: native.jit session-new-fast-codegen"))
+  (session-make opt true))
+
+;; (mod.rs `Jit::with_codegen`): the target machine of the fast session is consumed by the LLJIT builder, so it is not disposed here.
+(defun session-make :private (opt: i64 fast: bool) -> (Result JitSession LairError)
+  (do (target/target-init)
+      (match (if fast (machine-handle) (Ok 0))
+        ((Err e) (Err e))
+        ((Ok tm) (match (orc/jit-new tm)
+                   ((Err m) (Err (ErrJit m)))
+                   ((Ok j) (Ok (JitSession j (orc/triple j) (orc/data-layout j) opt (cell (names-new))))))))))
+
+(defun machine-handle :private () -> (Result i64 LairError)
+  (match (target/machine-host 0)
+    ((Err e) (Err e))
+    ((Ok m) (Ok (. m tm)))))
 
 ;; Disposes the LLJIT; the addresses it gave out are dead. (mod.rs `Drop`)
 (defun session-free (s: JitSession) -> unit
-  (trap "todo: native.jit session-free"))
+  (do (orc/jit-free (. s lljit)) ()))
 
 ;; Parses, checks, lowers, verifies and adds a module. On `Err` nothing was added and the session stays usable. (mod.rs `add_source`)
 (defun session-add-source (s: JitSession name: str src: str) -> (Result unit LairError)
-  (trap "todo: native.jit session-add-source"))
+  (match (pipe/check-source src)
+    ((Err e) (Err e))
+    ((Ok m) (session-add-module s name m))))
 
 ;; Adds a module: `check`, the names rules, prune, lower, optimise, hand to ORC. (mod.rs `add_module`)
 (defun session-add-module (s: JitSession name: str m: LModule) -> (Result unit LairError)
-  (trap "todo: native.jit session-add-module"))
+  (match (check/check m)
+    ((Err ds) (Err (ErrInvalid ds)))
+    ((Ok _) (match (names-check @(. s names) m support/process-defines?)
+              ((Err e) (Err e))
+              ((Ok _) (match (nl/lower (dead-internals m) name (. s triple) (. s data-layout))
+                        ((Err e) (Err e))
+                        ((Ok o) (hand-over s name m o))))))))
+
+;; Optimises the lowered module and gives it to ORC, which then owns the context and the module; the names are recorded when it took it.
+(defun hand-over :private (s: JitSession name: str m: LModule o: owned/Owned) -> (Result unit LairError)
+  (match (passes/optimize (. o module) 0 (. s opt-level))
+    ((Err e) (do (owned/owned-dispose o) (Err e)))
+    ((Ok _) (match (orc/add-module (. s lljit) (. o ctx) (. o module))
+              ((Err msg) (Err (ErrJit msg)))
+              ((Ok _) (do (set! (. s names) (names-record @(. s names) name m)) (Ok ())))))))
 
 ;; The lIR type of an exported function defined in this session. (mod.rs `signature`)
 (defun session-signature (s: JitSession name: str) -> (Result LFnType LairError)
-  (trap "todo: native.jit session-signature"))
+  (names-function @(. s names) name))
 
 ;; The address of a `ccc` entry to `name`: the function itself when it is `ccc`, else a trampoline made once. (mod.rs `c_entry`)
 (defun session-c-entry (s: JitSession name: str) -> (Result i64 LairError)
-  (trap "todo: native.jit session-c-entry"))
+  (match (session-signature s name)
+    ((Err e) (Err e))
+    ((Ok ty) (match (. ty cc)
+               ((CcC) (session-address s name))
+               ((CcTail) (let ((tramp (tramp-name name)))
+                           (match (session-signature s tramp)
+                             ((Ok _) (session-address s tramp))
+                             ((Err _) (match (session-add-source s tramp (tramp-source name ty))
+                                        ((Err e) (Err e))
+                                        ((Ok _) (session-address s tramp)))))))))))
 
 ;; The address of a defined function, compiled if need be. (mod.rs `address`)
 (defun session-address (s: JitSession name: str) -> (Result i64 LairError)
-  (trap "todo: native.jit session-address"))
+  (match (session-signature s name)
+    ((Err e) (Err e))
+    ((Ok _) (match (orc/lookup (. s lljit) name)
+              ((Err m) (Err (ErrJit m)))
+              ((Ok a) (Ok a))))))
