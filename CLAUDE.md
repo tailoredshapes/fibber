@@ -26,11 +26,11 @@ test says so; claims in docs, commit messages and chat carry no weight.
 | `cases/` | test programs with verdicts fixed in their headers: `ownership/` (`fibref cases`, and `fibc cases` interpreted and compiled), `modules/` (programs of several modules), `stdlib/` (the library's cases), `lir/` (`lair cases`) |
 | `crates/fibref` | the reference interpreter and memory audit |
 | `crates/fibgen` | the random program generator (method rule 5) |
-| `crates/lir` | lIR's reader, AST and whole-module checker; no LLVM |
-| `crates/lair` | lIR to native through LLVM 21: JIT, AOT, the lIR case harness; also a `cdylib`, `liblair.so`, with the C interface in `include/lair.h` (spec/compiler.md §9). Needs `LLVM_SYS_211_PREFIX` |
+| `crates/lir` | LEGACY oracle (until the Rust `fibc` goes): lIR's reader, AST and whole-module checker in Rust, no LLVM; its fibber port is `compiler/lir/` |
+| `crates/lair` | LEGACY oracle (until the Rust `fibc` goes): lIR to native through LLVM 21: JIT, AOT, the lIR case harness; also a `cdylib`, `liblair.so`, with the 23-function C interface in `include/lair.h` (spec/compiler.md §9, retired by `compiler/native`). Needs `LLVM_SYS_211_PREFIX`. The compiler in fibber does not link it |
 | `crates/fibc` | the compiler in Rust (stage 1): `fibref`'s front end lowered to lIR through `lair`, the runtime `fib.rt` in `rt/*.lir`, the rule-6 harness (`fibc cases`, `fibc gen`); `tests/bootstrap` compares stage 2's reader with the Rust one |
 | `lib/` | `prelude.fib` and the implicit library `fib/` (facades `fib.core fib.seq fib.coll fib.print` and their parts): M7, design in `spec/stdlib.md` |
-| `compiler/` | the compiler in fibber (M6, spec/bootstrap.md), bootstrapped: `syntax/` reader, `expand/` expander, `macros/` macro runner, `types/` type checker, `own/` ownership checker, `emit/` lIR emitter, `driver/` commands, `lair/` bindings of lair's C interface, tools `fibc.fib read.fib expand.fib types.fib own.fib explain.fib emit.fib`, `tests/` edge inputs, golden programs and compare scripts, `mirror-pending/` what the ports still owe the Rust |
+| `compiler/` | the compiler in fibber (M6, spec/bootstrap.md), bootstrapped: `syntax/` reader, `expand/` expander, `macros/` macro runner, `types/` type checker, `own/` ownership checker, `emit/` lIR emitter, `driver/` commands, `lir/` lIR reader, AST and whole-module checker, `llvm/` bindings of LLVM-C, `native/` lair (lowering, passes, JIT, AOT, the `native.api` and `native.call` that `emit.defs.jit`, `macros.runner` and `driver.native` use, the case harness `cases`, `cli`), `lairf.fib` the tool (`lairf check|run|build|emit-llvm|dump-ast|cases`; renamed `lair` when the Rust one goes), `lair/` legacy bindings of `liblair.so` (`lair.ffi` is still the byte and word helpers; `lair.jit`, `lair.call`, `lair.err` and the old `lair.fibm`/`lair.expand` serve `jit-demo.fib` only), tools `fibc.fib read.fib expand.fib types.fib own.fib explain.fib emit.fib`, `tests/` edge inputs, golden programs and compare scripts, `mirror-pending/` what the ports still owe the Rust |
 | `editors/vscode/` | the VS Code language pack for `.fib`: a TextMate grammar, language configuration and snippets; no build step |
 | `scripts/` | release engineering: `package.sh` (the relocatable tarball of stage 2), `package-rust.sh`, `fetch-seed.sh` (the seed named by `SEED`), `check-version.sh` (`VERSION` against `compiler/driver/version.fib`); `.github/workflows/release.yml` runs them on a `v*` tag; `SEED` at the root names the release (url, sha256) that builds stage 2 in CI and for releases (v0.1.3 now). `FIB_TARGET_CPU` (read by lair) picks the CPU code is generated for: `package.sh` sets `x86-64-v2` so a release runs on any CPU; unset, code is for the host. See README.md, Install and ROADMAP.md, Releases |
 | `lir-audit/` | findings from auditing liar's lIR, each re-established as a case in `cases/lir/audit` |
@@ -61,7 +61,9 @@ test says so; claims in docs, commit messages and chat carry no weight.
   rule is retired; `compiler/mirror-pending/` is backlog of what the Rust
   has and stage 2 lacks.
 - Build stage 2 with the seed: `fibc build compiler/fibc.fib -I compiler -I
-  lib -L target/debug -l lair -o F`. The stage check is the fixed point: F
+  lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o F` (F links LLVM, no liblair; a seed
+  made before the flip needs its own `liblair.so` on `LD_LIBRARY_PATH` to compile;
+  `LLVM_LINK=static` in the scripts uses `scripts/llvm-static.sh`). The stage check is the fixed point: F
   builds F3, and `F emit compiler/fibc.fib` equals `F3 emit compiler/fibc.fib`.
   F's emit equals the seed's only while `lib/prelude.fib` is the one the
   seed embedded (a seed built before a prelude change emits the old one), so

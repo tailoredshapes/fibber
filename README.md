@@ -41,15 +41,16 @@ The tarball holds one directory, `fibc-VERSION-linux-x86_64/`:
 |------|------|
 | `bin/fibc` | the compiler |
 | `bin/fibref` | the frozen reference interpreter, which also serves `fibref lsp` to the editor pack; present when the seed that built the release had one beside its `fibc` |
-| `lib/liblair.so` | the code generator (lair, with LLVM inside), found by the rpath `$ORIGIN/../lib` |
 | `share/fibber/lib/` | the standard library source, found beside `bin/` by `fibc` itself |
 | `LICENSE`, `README.txt` | the licence (BSD 3-Clause) and a short layout note |
 
-No environment variable is needed: `bin/fibc` finds `lib/liblair.so` by its
-rpath and the library in `share/fibber/lib` by its own location, so move the
-unpacked directory as a whole. LLVM is not needed (it is inside
-`liblair.so`); the machine needs libc, libm, libstdc++, libgcc_s, libz and
-libzstd, and a C compiler (`cc`) for `fibc build`. To make a release
+No environment variable is needed: `bin/fibc` finds the library in
+`share/fibber/lib` by its own location, so move the unpacked directory as
+a whole (`bin/` and `share/` side by side). The code generator, lair, is
+written in fibber and links LLVM 21 statically into `bin/fibc`: there is no
+`lib/liblair.so`, and LLVM is not needed on your machine; it needs libc,
+libm, libstdc++, libgcc_s, libz and libzstd (`ldd bin/fibc` shows those
+and nothing else), and a C compiler (`cc`) for `fibc build`. To make a release
 yourself, see `scripts/package.sh`.
 
 **Which CPU the code is for.** A release is built with `FIB_TARGET_CPU=x86-64-v2`
@@ -121,8 +122,9 @@ type checker, ownership checker and lIR emitter, about 32,000 lines. The
 Rust `fibc` (stage 1) builds it into stage 2; stage 2 builds itself into
 stage 3; all three emit byte-identical lIR for the compiler's own source,
 and stage 3 emits the same lIR as stage 1 on every program of the case
-suite. Native code still comes from `lair` and LLVM through a C interface
-(`liblair.so`), the runtime `fib.rt` is lIR text, and the test harnesses are
+suite. Native code comes from `lair`, also written in fibber (`compiler/native`),
+over LLVM-C (`compiler/llvm`); the Rust `lair` and its C interface
+(`liblair.so`) are kept as an oracle until the Rust tools go. The runtime `fib.rt` is lIR text, and the test harnesses are
 Rust. The standard library (M7) is a Clojure-shaped library in `lib/`,
 implicit in every program; its second tranche is under way. Nothing counts
 as implemented until an executable test says so ([spec/method.md](spec/method.md)).
@@ -177,5 +179,5 @@ fibc build compiler/fibc.fib -I compiler -I lib -L target/debug -l lair -o fibc2
 | lIR cases | [cases/lir/](cases/lir/) | 323, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial, the fuzzer's findings among them; verify: one reject case per rule) |
 | lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |
 | Compiler `fibc`: `fibref`'s front end lowered to lIR, the runtime `fib.rt`, the rule-6 harness, macros and `def`s through the JIT, `async` as state machines | [spec/compiler.md](spec/compiler.md), [crates/fibc](crates/fibc) | done (M4, decided 2026-09-30): all 191 cases pass interpreted and compiled with matching free traces (`fibc cases cases/ownership`, 2026-10-01), and generated programs run through the same harness (`fibc gen`) |
-| The C interface to `lair` (`liblair.so`), used by the compiler written in fibber | [spec/compiler.md §9](spec/compiler.md), [crates/lair/include/lair.h](crates/lair/include/lair.h), [crates/lair/src/capi](crates/lair/src/capi), bindings in [compiler/lair/](compiler/lair) | M6; 22 `lair_*` functions, the list **Proposed**; a test keeps the header equal to the exports; `fibc build FILE -o OUT -L DIR -l lair` links a fibber program against it and writes the rpath. A stopgap: `lair` is to be rewritten in fibber later |
+| The C interface to `lair` (`liblair.so`), used by the compiler written in fibber | [spec/compiler.md §9](spec/compiler.md), [crates/lair/include/lair.h](crates/lair/include/lair.h), [crates/lair/src/capi](crates/lair/src/capi), bindings in [compiler/lair/](compiler/lair) | M6; 23 `lair_*` functions; a test keeps the header equal to the exports; `fibc build FILE -o OUT -L DIR -l lair` links a fibber program against it and writes the rpath. Retired by `native.*` (lair in fibber, `compiler/native`): the compiler no longer uses it; kept as a legacy oracle until the Rust tools go |
 | Bootstrap: the compiler written in fibber | [spec/bootstrap.md](spec/bootstrap.md), [compiler/](compiler) | M6 done as far as the definition goes (2026-10-02, **Proposed**): `compiler/fibc.fib` (commands `emit`, `build`, `run`, `explain`, `emit-dump`) over `compiler/{syntax,expand,macros,types,own,emit,lair,driver}`. Each pass equals its Rust oracle byte for byte on the whole corpus (the reader, expander, `fibref types`, `fibref own` and `explain`, `fibc emit-dump`); stage 1, 2 and 3 emit identical lIR for the compiler itself; open: the Rust test harness cannot yet use stage 3 as the compiler, and 8 reflection-error inputs differ in position between the JIT and the interpreter ([ROADMAP.md](ROADMAP.md)) |
