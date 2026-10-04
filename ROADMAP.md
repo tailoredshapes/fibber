@@ -554,6 +554,15 @@ per module in parallel, the library's modules first (28 cores idle during a 30 s
 cases: the harness compiles each case in its own process; a process that keeps the library's checked form and the JIT warm saves
 the start and the library, which (1) already gets.
 
+PERFB-B (2026-10-04), lever B done as a cheaper cut than (1): `emit`, `run` and `build` infer and analyse only the library units the program can
+reach (`types.infer.demand`: roots are the program's own modules and every library `def`; `defun`s by reference, impl methods by protocol
+method index and, for a type of a library module other than the prelude, only once a constructor of it is reachable; library macros are not
+checked, the macro runner checks its own). `explain` and `emit-dump` still check everything. Measured on the same host: `F emit hello.fib`
+0.356 s to 0.185 s; units checked for hello 815 to 100; a stdlib case (10 cases, one at a time) 0.56 s to 0.37 s; `F emit` of 1233 programs
+(ownership, modules, every stdlib case) byte-identical to before, and `explain` of the same 1233; `emit` of compiler/fibc.fib identical and
+the fixed point holds. What is left of a case's front end (hello, 0.185 s) is mostly reading, expanding and lowering the library; the next
+cut is there (a cached expanded and lowered library, or lowering bodies lazily), not in checking.
+
 ## Releases
 
 Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,
