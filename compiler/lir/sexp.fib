@@ -54,6 +54,37 @@
       (nil (Ok (take-items rd 0)))
       ((some d) (settle rd d)))))
 
+;; Reads every form and hands each, as soon as it is read, to `f`, which answers the error of the form or nil. The first error of `f` is held
+;; and the rest of the text is still read and not handed over: a lexical or structural error anywhere in the text wins over it, because the
+;; Rust reads all forms before it parses any (`read`). The forms are not kept, so a parser that frees each form as it goes never holds the
+;; whole tree of a 19 MB text. Answers nil, or the error that wins.
+(defun read-each (src: str f: (fn (Sexp) (Option Diagnostic)) :borrow) -> (Option Diagnostic)
+  (let ((rd (Reader (lexer-new src) (cell false) (cell (array 64 filler)) (cell 0)))
+        (held (cell nil)))
+    (match (read-forms-each rd f held)
+      (nil @held)
+      ((some d) (match (settle rd d) ((Err e) (some e)) ((Ok _) nil))))))
+
+(defun read-forms-each :private (rd: Reader f: (fn (Sexp) (Option Diagnostic)) :borrow held: (Cell (Option Diagnostic))) -> (Option Diagnostic)
+  (loop ()
+    (let ((lx (. rd lx)) (b (lex-peek lx)))
+      (cond (< b 0) nil
+            (= b 41) (some (Diagnostic (lex-pos lx) "unexpected )"))
+            (= b 125) (some (Diagnostic (lex-pos lx) "unexpected }"))
+            (= b 93) (some (Diagnostic (lex-pos lx) "unexpected ]"))
+            :else (match (read-form rd 0)
+                    (nil (do (hand-over rd f held) (recur)))
+                    ((some d) (some d)))))))
+
+;; The form just read, taken off the stack and given to `f` unless an earlier one failed.
+(defun hand-over :private (rd: Reader f: (fn (Sexp) (Option Diagnostic)) :borrow held: (Cell (Option Diagnostic))) -> unit
+  (let ((stk (. rd stack)))
+    (do (set! (. rd top) 0)
+        (let ((form (array-take! &stk 0)))
+          (match @held
+            (nil (match (f form) (nil ()) ((some d) (set! held (some d)))))
+            (_ ()))))))
+
 ;; The forms to the end of the text, on the stack; the error that stops them, nil if none.
 (defun read-forms :private (rd: Reader) -> (Option Diagnostic)
   (loop ()

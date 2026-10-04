@@ -3,8 +3,13 @@
 (ns lir.parse
   (:use lir.diag lir.ast lir.sexp lir.parse.items))
 
-;; Reads `src` into forms (`lir.sexp/read`) and parses them (`lir.parse.items/parse-module`): a lexical error anywhere is reported before any parse error. (lib.rs `parse`)
+;; Reads `src` into forms and parses them: a lexical error anywhere is reported before any parse error. (lib.rs `parse`) Each form is parsed
+;; as soon as it is read and then freed, so the 19 MB text never has its whole tree of forms in memory (`lir.sexp/read-each` holds the first
+;; parse error until the rest of the text has been read, which is what reading every form first comes to).
 (defun parse-source (src: str) -> (Result LModule Diagnostic)
-  (match (read src)
-    ((Err d) (Err d))
-    ((Ok forms) (parse-module forms))))
+  (let ((items (cell (vec-empty))))
+    (match (read-each src (fn (form: Sexp) (match (parse-item form)
+                                              ((Err d) (some d))
+                                              ((Ok it) (do (update! items (fn (v) (conj v it))) nil)))))
+      ((some d) (Err d))
+      (nil (Ok (LModule @items))))))
