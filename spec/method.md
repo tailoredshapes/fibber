@@ -28,7 +28,9 @@ rests on anyone's word, including the author's.
      interpreter's trace and `fibc cases` in the `FIB_TRACE=1` trace of
      the compiled run; the two traces are the same lines, so the counts
      are the same, except in a threaded run, where the compiled program
-     may allocate more. More than `N` is a failure, never pending, and
+     may allocate more, and in a program that makes an `Option` of a
+     scalar, where stage 2 holds it as a value and the compiled count is
+     lower (compiler.md §8 item 13; the case then carries `;; stage: 2`). More than `N` is a failure, never pending, and
      so is an evaluator that gives no count: a bound nobody checked
      would pass whatever the program did. A `<=` fails only when the
      count goes up, so a bound is worth having when `N` is the count,
