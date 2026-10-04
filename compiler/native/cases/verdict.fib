@@ -1,9 +1,88 @@
-;; compiler/native/cases/verdict.fib: judging one case against its header (crates/lair/src/cases/verdict.rs). OWNER: package H. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/cases/verdict.fib: judging one case against its header (crates/lair/src/cases/verdict.rs). OWNER: package H.
+;; The messages are the Rust's, character for character; `{:?}` is `debug-str` / `debug-strs` (native.cases.text).
 
 (ns native.cases.verdict
-  (:use native.cases.header native.cases.exec))
+  (:require [fib.string :as s] [native.pipeline :as pipe] [native.error :as err])
+  (:use native.cases.header native.cases.exec native.cases.text))
 
+
+(defun contains? :private (hay: str needle: str) -> bool (some? (str-find hay needle 0)))
+
+(defun signal-list :private (signals: (Vec CaseSignal)) -> (Vec i64)
+  (mapv (fn (g: CaseSignal) (. g number)) signals))
+
+;; Did the process end as the header says: by that exit status, or killed by one of those signals? (verdict.rs `ending`)
+(defun ending :private (path: str exit: i64 signals: (Vec CaseSignal) o: Outcome) -> (Result unit str)
+  (let ((nums (signal-list signals))
+        (expected (if (empty? nums)
+                      (str "expected exit " exit)
+                      (str "expected " (s/join " or " (mapv signal-name nums)))))
+        (stderr (s/trim (. o stderr))))
+    (match (. o signal)
+      ((some got) (if (some? (first (filter (fn (n: i64) (= n got)) nums)))
+                      (Ok ())
+                      (Err (str-join [path ": trapped by " (signal-name got) " (" expected "); stderr: " stderr]))))
+      (nil (if (and (empty? nums) (= (. o status) exit))
+               (Ok ())
+               (Err (str-join [path ": exit " (show (. o status)) " (" expected "); stderr: " stderr])))))))
+
+(defun judge-reject :private (path: str text: str o: Outcome) -> (Result unit str)
+  (let ((stderr (. o stderr))
+        (status (. o status)))
+    (cond (= status 0) (Err (str-join [path ": accepted, expected an error containing " (debug-str text)]))
+          (or (not (= status 1)) (contains? stderr "internal error") (contains? stderr "panicked"))
+            (Err (str-join [path ": failed badly (status " (show status) "): " (s/trim stderr)]))
+          (not (contains? stderr text))
+            (Err (str-join [path ": error " (debug-str (s/trim stderr)) " does not contain " (debug-str text)]))
+          :else (Ok ()))))
+
+;; (verdict.rs `judge`)
+(defun judge :private (path: str h: CaseHeader o: Outcome) -> (Result unit str)
+  (match (. h expect)
+    ((ExpAccept exit signals out)
+     (try-let [_ (ending path exit signals o)]
+       (let ((got (rust-lines (. o stdout))))
+         (if (= got out)
+             (Ok ())
+             (Err (str-join [path ": output " (debug-strs got) ", expected " (debug-strs out)]))))))
+    ((ExpReject text) (judge-reject path text o))))
+
+(defun reject? :private (h: CaseHeader) -> bool
+  (match (. h expect) ((ExpReject _) true) ((ExpAccept _ _ _) false)))
+
+;; Builds the case to `exe` and judges the build (a reject case) or the run of the executable. (verdict.rs `run_case`, the AOT half)
+(defun aot-path :private (lair: str h: CaseHeader file: str exe: str) -> (Result unit str)
+  (try-let [build (run-program lair ["build" file "-o" exe "-O" "2"])]
+    (cond (reject? h) (judge "aot" h build)
+          (not (= (. build status) 0)) (Err (str-concat "aot: build failed: " (s/trim (. build stderr))))
+          :else (try-let [ran (run-program exe [])]
+                  (do (sys-unlink exe) (judge "aot" h ran))))))
+
+(defun jit-path :private (lair: str h: CaseHeader file: str) -> (Result unit str)
+  (try-let [jit (run-program lair ["run" file])]
+    (judge "jit" h jit)))
+
+;; The `ir` and `ir-not` lines of the header against the module's LLVM text. (verdict.rs `ir_checks`)
+(defun ir-checks :private (h: CaseHeader src: str file: str) -> (Result unit str)
+  (if (and (empty? (. h ir)) (empty? (. h ir-not)))
+      (Ok ())
+      (match (pipe/emit-llvm src file)
+        ((Err e) (Err (str-concat "ir: " (err/lair-error-render e file))))
+        ((Ok ir) (match (first (filter (fn (t: str) (not (contains? ir t))) (. h ir)))
+                   ((some t) (Err (str-concat "ir: does not contain " (debug-str t))))
+                   (nil (match (first (filter (fn (t: str) (contains? ir t)) (. h ir-not)))
+                          ((some t) (Err (str-concat "ir: contains " (debug-str t))))
+                          (nil (Ok ())))))))))
+
+(defun run-paths :private (lair: str h: CaseHeader file: str exe: str) -> (Result unit str)
+  (try-let [_ (match (. h paths) ((PathsAot) (Ok ())) (_ (jit-path lair h file)))]
+    (match (. h paths) ((PathsJit) (Ok ())) (_ (aot-path lair h file exe)))))
 
 ;; Runs the case on each path its header names and judges the outcome; the failure text, or ok. (verdict.rs `run_case`)
 (defun run-case (lair: str path: str scratch: str n: i64) -> (Result unit str)
-  (trap "todo: native.cases.verdict run-case"))
+  (match (read-file path)
+    (nil (Err "cannot read: the file is missing or is not UTF-8"))
+    ((some src)
+     (try-let [h (parse-header src)
+               _ (run-paths lair h path (str-join [scratch "/case" (show n)]))]
+       (ir-checks h src path)))))

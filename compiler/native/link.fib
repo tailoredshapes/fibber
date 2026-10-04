@@ -1,17 +1,172 @@
-;; compiler/native/link.fib: the link step of `build-executable` (spec/lir.md section 11; crates/lair/src/aot/link.rs). OWNER: package A. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/link.fib: the link step of `build-executable` (spec/lir.md section 11; crates/lair/src/aot/link.rs). OWNER: package A.
+;;
+;; The command is the Rust's, argument for argument, so that the `cc` shim of scripts/package.sh (which rewrites the argument after `-rpath`) keeps working:
+;;   cc OBJ -o OUT -lm -lpthread [-LDIR -Xlinker -rpath -Xlinker DIR].. [-lNAME]..
+;; `cc` is found on PATH (`execvp`), runs with standard output discarded and standard error in a file that is read back for the error text; the object
+;; is written beside OUT as `OUT.lair.o` and removed after the link. The externs are this module's own (driver.proc's are private to the driver, which
+;; requires native.* at the cutover and so cannot be required back).
 
 (ns native.link
-  (:use native.error))
+  (:use native.error)
+  (:require [llvm.ffi :as ffi]))
 
+(extern realpath :private (ptr ptr) -> ptr)
+(extern opendir :private (ptr) -> ptr)
+(extern closedir :private (ptr) -> i32)
+(extern strerror :private (i32) -> ptr)
+(extern __errno_location :private () -> ptr)
+(extern fopen :private (ptr ptr) -> ptr)
+(extern fwrite :private (ptr i64 i64 ptr) -> i64)
+(extern fclose :private (ptr) -> i32)
+(extern unlink :private (ptr) -> i32)
+(extern pipe2 :private (ptr i32) -> i32)
+(extern fork :private () -> i32)
+(extern execvp :private (ptr ptr) -> i32)
+(extern dup2 :private (i32 i32) -> i32)
+(extern creat :private (ptr i32) -> i32)
+(extern close :private (i32) -> i32)
+(extern read :private (i32 ptr i64) -> i64)
+(extern write :private (i32 ptr i64) -> i64)
+(extern waitpid :private (i32 ptr i32) -> i32)
+(extern _exit :private (i32) -> unit)
+
+(def enotdir: i64 20)
+(def o-cloexec: i32 524288i32)
+
+;; The text of an operating-system error as Rust's `io::Error` displays it: `No such file or directory (os error 2)`.
+(defun os-error :private (e: i64) -> str
+  (str (ffi/c-string-at (unsafe (ffi/ptr->addr (strerror (trunc i32 e))))) " (os error " (show e) ")"))
+
+;; errno, read at once after the call that set it.
+(defun errno :private () -> i64
+  (unsafe (sext i64 (load-i32 (__errno_location)))))
+
+;; The canonical path of `dir`, or the errno that refused it.
+(defun canonical :private (dir: str) -> (Result str i64)
+  (let ((p (ffi/bytes-new dir))
+        (r (unsafe (ffi/ptr->addr (realpath p (ffi/addr->ptr 0)))))
+        (e (errno)))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (= r 0)
+            (Err e)
+            (let ((s (ffi/c-string-at r)))
+              (do (ffi/free-addr r) (Ok s)))))))
+
+;; Whether `path` is not a directory: opendir says ENOTDIR (any other refusal, such as no read permission, leaves it a directory, as `is_dir` has it).
+(defun not-a-directory? :private (path: str) -> bool
+  (let ((p (ffi/bytes-new path))
+        (d (unsafe (ffi/ptr->addr (opendir p))))
+        (e (errno)))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (= d 0)
+            (= e enotdir)
+            (do (unsafe (closedir (ffi/addr->ptr d))) false)))))
+
+(defun rpath-unsafe? :private (path: str) -> bool
+  (loop ((i 0))
+    (cond (>= i (str-len path)) false
+          (or (= (str-byte-at path i) 58i8) (= (str-byte-at path i) 36i8)) true
+          :else (recur (+ i 1)))))
 
 ;; The absolute directory a `-L` names, or why it cannot be an rpath (missing, no directory, a character an rpath cannot hold). (link.rs `library_dir`)
 (defun library-dir (dir: str) -> (Result str str)
-  (trap "todo: native.link library-dir"))
+  (match (canonical dir)
+    ((Err e) (Err (str "-L " dir ": " (os-error e))))
+    ((Ok path) (cond (not-a-directory? path) (Err (str "-L " dir ": not a directory"))
+                     (rpath-unsafe? path) (Err (str "-L " dir ": " path " has a ':' or a '$', which an rpath cannot hold"))
+                     :else (Ok path)))))
 
 ;; The `cc` arguments after the object and `-o`: `-lm -lpthread`, then `-L DIR -Xlinker -rpath -Xlinker DIR` per directory, then `-lNAME` per library. (link.rs `args`)
 (defun link-args (dirs: (Vec str) libs: (Vec str)) -> (Vec str)
-  (trap "todo: native.link link-args"))
+  (let ((base ["-lm" "-lpthread"])
+        (with-dirs (reduce (fn (acc: (Vec str) d: str) (into acc [(str "-L" d) "-Xlinker" "-rpath" "-Xlinker" d])) base dirs)))
+    (reduce (fn (acc: (Vec str) l: str) (conj acc (str "-l" l))) with-dirs libs)))
+
+;; `bytes` written to the file `path`; the error is `cannot write PATH: REASON` as link.rs words it.
+(defun write-bytes (path: str bytes: (Array i8)) -> (Result unit str)
+  (let ((p (ffi/bytes-new path))
+        (mode (ffi/bytes-new "wb"))
+        (n (array-len bytes))
+        (f (unsafe (ffi/ptr->addr (fopen p mode))))
+        (e (errno)))
+    (do (ffi/free-addr (ffi/ptr->addr mode))
+        (ffi/free-addr (ffi/ptr->addr p))
+        (if (= f 0)
+            (Err (str "cannot write " path ": " (os-error e)))
+            (let ((buf (unsafe (alloc (+ n 1)))))
+              (do (unsafe (dotimes (i n) (store-i8 (ptr+ buf i) (array-get bytes i))))
+                  (let ((w (unsafe (fwrite buf 1 n (ffi/addr->ptr f))))
+                        (e2 (errno))
+                        (c (unsafe (fclose (ffi/addr->ptr f)))))
+                    (do (unsafe (free buf))
+                        (if (and (= w n) (= c 0i32)) (Ok ()) (Err (str "cannot write " path ": " (os-error e2))))))))))))
+
+(defun remove-path :private (path: str) -> unit
+  (let ((p (ffi/bytes-new path)))
+    (do (unsafe (unlink p)) (ffi/free-addr (ffi/ptr->addr p)))))
+
+;; The directory part of `out`, with its last `/`, or "" (`Path::with_file_name` replaces what follows it).
+(defun dir-part :private (out: str) -> str
+  (loop ((i (- (str-len out) 1)))
+    (cond (< i 0) ""
+          (= (str-byte-at out i) 47i8) (str-slice out 0 (+ i 1))
+          :else (recur (- i 1)))))
+
+;; The path the object is written to: `OUT.lair.o` beside OUT. (link.rs: `out.with_file_name(format!("{name}.lair.o"))`)
+(defun object-path (out: str) -> str
+  (let ((d (dir-part out)))
+    (str d (str-slice out (str-len d) (str-len out)) ".lair.o")))
+
+;; In the child: standard output to the null device, standard error to the file, `cc` run by PATH search; an exec that fails writes its errno to the
+;; status pipe (closed on exec, so the parent reads nothing when it worked) and the child ends.
+(defun become :private (file: ptr av: ptr fo: i32 fe: i32 status-fd: i32 ebuf: ptr) -> i64
+  (unsafe
+    (do (dup2 fo 1i32) (dup2 fe 2i32) (execvp file av)
+        (store-i32 ebuf (load-i32 (__errno_location)))
+        (write status-fd ebuf 4)
+        (_exit 127i32)
+        0)))
+
+;; Runs `argv` (the first word is the program, found on PATH) with standard error in the file `errfile`: `ok` when it exits 0, else the failure
+;; text: `cannot run cc: REASON` when it cannot start, `linker failed: STDERR` otherwise. (link.rs `Command::output`)
+(defun run-cc :private (argv: (Vec str) errfile: str) -> (Result unit str)
+  (let ((file (ffi/bytes-new (nth argv 0)))
+        (pe (ffi/bytes-new errfile))
+        (pn (ffi/bytes-new "/dev/null"))
+        (cs (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) argv))
+        (av (ffi/words-new cs))
+        (fds (ffi/slot-new))
+        (ebuf (ffi/slot-new))
+        (st (ffi/slot-new))
+        (made (unsafe (pipe2 fds o-cloexec)))
+        (fo (unsafe (creat pn 384i32)))
+        (fe (unsafe (creat pe 384i32)))
+        (rfd (unsafe (load-i32 fds)))
+        (wfd (unsafe (load-i32 (ptr+ fds 4))))
+        (pid (unsafe (fork))))
+    (let ((child (if (= pid 0i32) (become file av fo fe wfd ebuf) 0))
+          (_c (unsafe (do (close fo) (close fe) (close wfd))))
+          (got (unsafe (read rfd ebuf 4)))
+          (e (unsafe (sext i64 (load-i32 ebuf))))
+          (_r (unsafe (close rfd)))
+          (w (if (< pid 0i32) -1i32 (unsafe (waitpid pid st 0i32))))
+          (word (unsafe (load-i32 st))))
+      (do (doseq [c cs] (ffi/free-addr c))
+          (doseq [p [file pe pn av fds ebuf st]] (ffi/free-addr (ffi/ptr->addr p)))
+          (cond (or (< pid 0i32) (< made 0i32)) (Err "cannot run cc: fork failed")
+                (= got 4) (Err (str "cannot run cc: " (os-error e)))
+                (and (>= w 0i32) (= word 0i32)) (Ok ())
+                :else (Err (str "linker failed: " (unwrap-or (read-file errfile) ""))))))))
 
 ;; Writes the object to a temporary file and runs `cc`. (link.rs `link`)
 (defun link (object: (Array i8) out: str dirs: (Vec str) libs: (Vec str)) -> (Result unit LairError)
-  (trap "todo: native.link link"))
+  (let ((obj (object-path out))
+        (errfile (str out ".lair.err")))
+    (match (write-bytes obj object)
+      ((Err m) (Err (ErrBackend m)))
+      ((Ok _) (let ((r (run-cc (into ["cc" obj "-o" out] (link-args dirs libs)) errfile)))
+                (do (remove-path obj)
+                    (remove-path errfile)
+                    (match r
+                      ((Err m) (Err (ErrBackend m)))
+                      ((Ok _) (Ok ())))))))))

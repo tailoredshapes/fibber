@@ -1,0 +1,64 @@
+;; compiler/native/cases/walk.fib: the files under a directory (crates/lair/src/cases/mod.rs `walk`). OWNER: package H.
+;; A path that opens as a directory is walked; one that is not a directory and ends in `.lir` and exists is a case. The sort is the Rust's
+;; `Path` order: component by component, not byte by byte (so `a/b` sorts before `a-b/c`).
+
+(ns native.cases.walk
+  (:require [llvm.ffi :as ffi] [fib.string :as s]))
+
+(extern opendir :private (ptr) -> ptr)
+(extern closedir :private (ptr) -> i32)
+(extern readdir :private (ptr) -> ptr)
+(extern access :private (ptr i32) -> i32)
+
+;; In a glibc `struct dirent` the name starts at byte 19.
+(def dirent-name: i64 19)
+
+;; The names in `dir` but `.` and `..`, in no order; nil when `dir` does not open as a directory.
+(defun list-dir (dir: str) -> (Option (Vec str))
+  (let ((p (ffi/bytes-new dir))
+        (d (unsafe (ffi/ptr->addr (opendir p)))))
+    (do (ffi/free-addr (ffi/ptr->addr p))
+        (if (= d 0)
+            nil
+            (let ((dp (ffi/addr->ptr d))
+                  (names (loop ((acc []))
+                           (let ((e (unsafe (ffi/ptr->addr (readdir dp)))))
+                             (if (= e 0)
+                                 acc
+                                 (let ((n (ffi/c-string-at (+ e dirent-name))))
+                                   (recur (if (or (= n ".") (= n "..")) acc (conj acc n)))))))))
+              (do (unsafe (closedir dp)) (some names)))))))
+
+(defun exists? :private (path: str) -> bool
+  (let ((p (ffi/bytes-new path))
+        (r (unsafe (access p 0i32))))
+    (do (ffi/free-addr (ffi/ptr->addr p)) (= r 0i32))))
+
+;; `dir.join(name)`.
+(defun join-path (dir: str name: str) -> str
+  (if (s/ends-with? dir "/") (str-concat dir name) (str-join [dir "/" name])))
+
+(defun walk :private (p: str acc: (Vec str)) -> (Vec str)
+  (match (list-dir p)
+    (nil (if (and (s/ends-with? p ".lir") (exists? p)) (conj acc p) acc))
+    ((some names) (reduce (fn (a: (Vec str) n: str) (walk (join-path p n) a)) acc names))))
+
+;; The components of a path as `std::path::Path` sees them: "." and empty ones (doubled or trailing slashes) dropped; a leading "/" is a component.
+(defun components (p: str) -> (Vec str)
+  (let ((parts (filter (fn (c: str) (not (or (= c "") (= c ".")))) (s/split p "/"))))
+    (if (starts-with? p "/") (into ["/"] parts) (vec parts))))
+
+;; Lexicographic order of component lists, each component by bytes: -1, 0, 1.
+(defun compare-components (a: (Vec str) b: (Vec str)) -> i64
+  (loop ((i 0))
+    (cond (and (>= i (count a)) (>= i (count b))) 0
+          (>= i (count a)) -1
+          (>= i (count b)) 1
+          (= (nth a i) (nth b i)) (recur (+ i 1))
+          (< (compare (nth a i) (nth b i)) 0) -1
+          :else 1)))
+
+;; Every `.lir` file under `dirs`, sorted in `Path` order.
+(defun collect-files (dirs: (Vec str)) -> (Vec str)
+  (let ((found (reduce (fn (a: (Vec str) d: str) (walk d a)) [] dirs)))
+    (vec (sort (fn (x: str y: str) (compare-components (components x) (components y))) found))))

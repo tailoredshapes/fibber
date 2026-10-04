@@ -1,42 +1,76 @@
-;; compiler/native/api.fib: the facade that replaces `lair.jit` (compiler/lair/jit.fib): the same names, parameters and results, over `native.*` and with no C types. OWNER: package J. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/api.fib: the facade that replaces `lair.jit` (compiler/lair/jit.fib): the same names, parameters and results, over `native.*` and with no C types. OWNER: package J.
 
 ;; The cutover is a changed `:require`. `Jit` is opaque to its users (none reads `handle`). Errors are `str`, the text lair prints: the diagnostics one
-;; per line without a file name, or `lair-error-str` of the failure.
+;; per line without a file name, or `lair-error-str` of the failure. The checks of lair's C interface (capi/jit.rs, capi/aot.rs: `level_arg`, the
+;; empty path) are here.
 
 (ns native.api
-  (:use native.error native.jit))
+  (:use native.error native.jit native.aot)
+  (:require [native.pipeline :as pipe]))
 
 
 (defstruct Jit (session: JitSession))
 
+;; `opt_level is N, not 0 to 3` for a level outside 0 to 3. (capi/error.rs `level_arg`)
+(defun level-check :private (opt: i64) -> (Result i64 str)
+  (if (and (>= opt 0) (<= opt 3))
+      (Ok opt)
+      (Err (str "opt_level is " opt ", not 0 to 3"))))
+
+(defun wrap :private (r: (Result JitSession LairError)) -> (Result Jit str)
+  (match r
+    ((Err e) (Err (lair-error-str e)))
+    ((Ok s) (Ok (Jit s)))))
+
+(defun unit-result :private (r: (Result unit LairError)) -> (Result unit str)
+  (match r
+    ((Err e) (Err (lair-error-str e)))
+    ((Ok _) (Ok ()))))
+
+(defun word-result :private (r: (Result i64 LairError)) -> (Result i64 str)
+  (match r
+    ((Err e) (Err (lair-error-str e)))
+    ((Ok a) (Ok a))))
+
 ;; A session at optimisation level `opt`. (jit.fib `jit-new`)
 (defun jit-new (opt: i64) -> (Result Jit str)
-  (trap "todo: native.api jit-new"))
+  (match (level-check opt)
+    ((Err m) (Err m))
+    ((Ok l) (wrap (session-new l)))))
 
 ;; (jit.fib `jit-new-fast-codegen`)
 (defun jit-new-fast-codegen (opt: i64) -> (Result Jit str)
-  (trap "todo: native.api jit-new-fast-codegen"))
+  (match (level-check opt)
+    ((Err m) (Err m))
+    ((Ok l) (wrap (session-new-fast-codegen l)))))
 
 ;; (jit.fib `jit-free`)
 (defun jit-free (j: Jit) -> unit
-  (trap "todo: native.api jit-free"))
+  (session-free (. j session)))
 
 ;; (jit.fib `jit-add-source`)
 (defun jit-add-source (j: Jit name: str src: str) -> (Result unit str)
-  (trap "todo: native.api jit-add-source"))
+  (unit-result (session-add-source (. j session) name src)))
 
 ;; (jit.fib `jit-address`)
 (defun jit-address (j: Jit name: str) -> (Result i64 str)
-  (trap "todo: native.api jit-address"))
+  (word-result (session-address (. j session) name)))
 
 ;; (jit.fib `jit-c-entry`)
 (defun jit-c-entry (j: Jit name: str) -> (Result i64 str)
-  (trap "todo: native.api jit-c-entry"))
+  (word-result (session-c-entry (. j session) name)))
 
 ;; Parses and checks `src` as a whole module and makes no code. (jit.fib `check-source`)
 (defun check-source (src: str) -> (Result unit str)
-  (trap "todo: native.api check-source"))
+  (match (pipe/check-source src)
+    ((Err e) (Err (lair-error-str e)))
+    ((Ok _) (Ok ()))))
 
 ;; Compiles the module `src`, which must satisfy the `main` rule, and links it into the executable `path`. (jit.fib `build-executable`)
 (defun build-executable (src: str path: str opt: i64 libs: (Vec str) dirs: (Vec str)) -> (Result unit str)
-  (trap "todo: native.api build-executable"))
+  (cond (= path "") (Err "path is empty")
+        :else (match (level-check opt)
+                ((Err m) (Err m))
+                ((Ok l) (match (pipe/for-executable src)
+                          ((Err e) (Err (lair-error-str e)))
+                          ((Ok m) (unit-result (aot-build-executable m path path (AotOptions l libs dirs)))))))))

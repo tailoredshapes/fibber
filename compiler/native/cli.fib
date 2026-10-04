@@ -1,8 +1,234 @@
-;; compiler/native/cli.fib: the command line of lair (crates/lair/src/cli.rs): `check run build emit-llvm cases fuzz fuzz-one dump-ast`; the entry point `compiler/lairf.fib` calls it. OWNER: package H. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/cli.fib: the command line of lair (crates/lair/src/cli.rs): `check run build emit-llvm cases fuzz fuzz-one dump-ast`; the entry point `compiler/lairf.fib` calls it. OWNER: package H.
+;; Errors are the Rust's strings (the caller prints them on standard error and exits 1). `fuzz` is package F's: here it answers with an error naming that.
 
-(ns native.cli)
+(ns native.cli
+  (:require [fib.string :as s] [llvm.ffi :as ffi] [lir.parse :as parse] [lir.dump :as dump] [lir.diag :as diag] [native.pipeline :as pipe]
+            [native.error :as err] [native.aot :as aot] [native.jit :as jit] [native.link :as link] [native.cases :as cases]
+            [native.cases.walk :as walk] [native.cases.header :as hdr] [native.call :as call])
+  (:use lir.ast lir.types))
 
+(extern exit :private (i32) -> unit)
+(extern getpid :private () -> i32)
+
+(def usage: str "usage:
+  lair check FILE.lir
+  lair run [-O n] FILE.lir [ARGS..]
+  lair build FILE.lir -o OUT [-O n] [--emit obj|asm|llvm] [-L DIR].. [-l LIB]..
+  lair emit-llvm FILE.lir
+  lair dump-ast FILE.lir
+  lair cases DIR..
+  lair fuzz [--seed N] [--count N] [--timeout SECS] [-O n] [-o DIR] [--keep DIR] [-v] [--print N] DIR..
+  lair fuzz-one [-O n] FILE.lir")
+
+(def fuzz-checked: str "fuzz-one: checked")
+(def fuzz-compiled: str "fuzz-one: compiled")
+
+(defun read-src :private (file: str) -> (Result str str)
+  (match (read-file file)
+    (nil (Err (str file ": cannot read: No such file or directory (os error 2)")))
+    ((some src) (Ok src))))
+
+(defun rendered :private (r: (Result a err/LairError) file: str) -> (Result a str)
+  (match r
+    ((Ok v) (Ok v))
+    ((Err e) (Err (err/lair-error-render e file)))))
+
+;; -------------------------------------------------------------------------------------------------- check, emit-llvm, dump-ast
+
+(defun check-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (if (not (= (count rest) 1))
+      (Err usage)
+      (try-let [src (read-src (nth rest 0))
+                _ (rendered (pipe/check-source src) (nth rest 0))]
+        (Ok 0))))
+
+(defun emit-llvm-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (if (not (= (count rest) 1))
+      (Err usage)
+      (try-let [src (read-src (nth rest 0))
+                text (rendered (pipe/emit-llvm src (nth rest 0)) (nth rest 0))]
+        (do (print text) (Ok 0)))))
+
+;; The canonical text of the parsed module (docs/design/lair-ast-dump.md); it parses but does not check.
+(defun dump-ast-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (if (not (= (count rest) 1))
+      (Err usage)
+      (try-let [src (read-src (nth rest 0))]
+        (match (parse/parse-source src)
+          ((Err d) (Err (diag/diag-in-file d (nth rest 0))))
+          ((Ok m) (do (dump/dump-with m (fn (chunk: str) (print-raw chunk))) (Ok 0)))))))
+
+;; -------------------------------------------------------------------------------------------------- the options
+
+(defun opt-level :private (t: str) -> (Result i64 str)
+  (match (hdr/parse-i32 t)
+    ((some n) (if (and (>= n 0) (<= n 3)) (Ok n) (Err (str "bad -O level " t))))
+    (nil (Err (str "bad -O level " t)))))
+
+;; The `-O n` that may start the arguments of run and fuzz-one: the level and what follows.
+(defun leading-opt :private (rest: (Vec str)) -> (Result (Pair i64 (Vec str)) str)
+  (if (and (>= (count rest) 2) (= (nth rest 0) "-O"))
+      (try-let [n (opt-level (nth rest 1))] (Ok (Pair n (vec (drop 2 rest)))))
+      (Ok (Pair 0 rest))))
+
+;; -------------------------------------------------------------------------------------------------- run
+
+(defun c-strings :private (words: (Vec str)) -> ptr
+  (ffi/words-new (conj (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) words) 0)))
+
+;; Calls `main` at `entry`, with (argc, argv) when its type has parameters; the status, as the C `int` it returned.
+(defun call-main :private (entry: i64 takes-args: bool argv: (Vec str)) -> (Result i64 str)
+  (try-let [r (call/call-i64 entry (if takes-args [(count argv) (ffi/ptr->addr (c-strings argv))] []))]
+    (Ok (sext i64 (trunc i32 r)))))
+
+(defun trace :private (on: bool mark: str) -> unit
+  (if on (eprintln mark) ()))
+
+;; JIT-compiles the module and runs `main`; exits with its status (`exit` flushes the C library's buffers, as returning from a C main would).
+(defun execute :private (file: str opt: i64 prog-args: (Vec str) tracing: bool) -> (Result i64 str)
+  (try-let [src (read-src file)
+            m (rendered (pipe/for-executable src) file)
+            session (rendered (jit/session-new opt) file)
+            _ (rendered (jit/session-add-module session file m) file)
+            ty (rendered (jit/session-signature session "main") file)
+            entry (rendered (jit/session-address session "main") file)
+            code (do (trace tracing fuzz-checked) (trace tracing fuzz-compiled)
+                     (call-main entry (not (empty? (. ty params))) (into [file] prog-args)))]
+    (do (unsafe (exit (trunc i32 code))) (Ok code))))
+
+(defun run-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (try-let [lo (leading-opt rest)]
+    (let ((tail (. lo snd)))
+      (if (empty? tail)
+          (Err usage)
+          (execute (nth tail 0) (. lo fst) (vec (drop 1 tail)) false)))))
+
+(defun fuzz-one-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (try-let [lo (leading-opt rest)]
+    (if (= (count (. lo snd)) 1)
+        (execute (nth (. lo snd) 0) (. lo fst) [] true)
+        (Err usage))))
+
+;; -------------------------------------------------------------------------------------------------- build
+
+;; What `build` was asked for so far (cli.rs `build`'s locals).
+(defstruct BuildArgs (out: (Option str) opt: i64 emit: (Option aot/AotOutput) libs: (Vec str) dirs: (Vec str)))
+
+(defun emit-kind :private (v: str) -> (Result aot/AotOutput str)
+  (cond (= v "obj") (Ok aot/OutObject)
+        (= v "asm") (Ok aot/OutAssembly)
+        (= v "llvm") (Ok aot/OutLlvmIr)
+        :else (Err (str "unknown --emit " v))))
+
+;; One option and its value applied to the arguments so far.
+(defun build-option :private (b: BuildArgs flag: str v: str) -> (Result BuildArgs str)
+  (cond (= flag "-o") (Ok (with b (out (some v))))
+        (= flag "-O") (try-let [n (opt-level v)] (Ok (with b (opt n))))
+        (= flag "-L") (Ok (with b (dirs (conj (. b dirs) v))))
+        (= flag "-l") (Ok (with b (libs (conj (. b libs) v))))
+        :else (try-let [k (emit-kind v)] (Ok (with b (emit (some k)))))))
+
+(defun build-flag? :private (a: str) -> bool
+  (or (= a "-o") (= a "-O") (= a "-L") (= a "-l") (= a "--emit")))
+
+(defun parse-build :private (words: (Vec str)) -> (Result BuildArgs str)
+  (loop ((i 0) (b (BuildArgs nil 0 nil [] [])))
+    (cond (>= i (count words)) (Ok b)
+          (not (build-flag? (nth words i))) (Err (str "unknown option " (nth words i) "\n" usage))
+          (>= (+ i 1) (count words)) (Err (str (nth words i) " needs a value"))
+          :else (try-let [b2 (build-option b (nth words i) (nth words (+ i 1)))]
+                  (recur (+ i 2) b2)))))
+
+(defun build-output :private (b: BuildArgs file: str src: str out: str) -> (Result unit str)
+  (let ((opts (aot/AotOptions (. b opt) (. b libs) (. b dirs))))
+    (match (. b emit)
+      (nil (try-let [m (rendered (pipe/for-executable src) file)]
+             (rendered (aot/aot-build-executable m file out opts) file)))
+      ((some kind) (try-let [m (rendered (pipe/check-source src) file)
+                             bytes (rendered (aot/aot-emit m file kind opts) file)]
+                     (match (link/write-bytes out bytes)
+                       ((Err e) (Err (str out ": " e)))
+                       ((Ok _) (Ok ()))))))))
+
+(defun build-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (if (empty? rest)
+      (Err usage)
+      (let ((file (nth rest 0)))
+        (try-let [b (parse-build (vec (drop 1 rest)))]
+          (match (. b out)
+            (nil (Err "build needs -o OUT"))
+            ((some out) (try-let [src (read-src file)
+                                  _ (build-output b file src out)]
+                          (Ok 0))))))))
+
+;; -------------------------------------------------------------------------------------------------- cases
+
+(defun category :private (p: str) -> str
+  (let ((cs (walk/components p)))
+    (if (or (< (count cs) 2) (= (nth cs (- (count cs) 2)) "/")) "" (nth cs (- (count cs) 2)))))
+
+;; The scratch directory of a run: TMPDIR (or /tmp)/lair-cases-PID.
+(defun scratch-dir :private () -> (Result str str)
+  (let ((env (unwrap-or (sys-getenv "TMPDIR") ""))
+        (d (str-join [(if (= env "") "/tmp" env) "/lair-cases-" (show (sext i64 (unsafe (getpid))))])))
+    (if (>= (sys-mkdir d 511) 0)
+        (Ok d)
+        (if (some? (walk/list-dir d)) (Ok d) (Err (str d ": cannot create the scratch directory"))))))
+
+(defun remove-scratch :private (d: str) -> unit
+  (do (match (walk/list-dir d) (nil ()) ((some names) (doseq [n names] (sys-unlink (walk/join-path d n)))))
+      (sys-rmdir d)
+      ()))
+
+;; The cases and passes of each run of one category.
+(defstruct Tally (cat: str n: i64 ok: i64))
+
+(defun tally :private (reports: (Vec cases/CaseReport)) -> (Vec Tally)
+  (reduce (fn (ts: (Vec Tally) r: cases/CaseReport)
+            (let ((c (category (. r path)))
+                  (pass (if (nil? (. r failure)) 1 0))
+                  (last (if (empty? ts) nil (some (nth ts (- (count ts) 1))))))
+              (match last
+                ((some l) (if (= (. l cat) c)
+                              (assoc ts (- (count ts) 1) (Tally c (+ (. l n) 1) (+ (. l ok) pass)))
+                              (conj ts (Tally c 1 pass))))
+                (nil (conj ts (Tally c 1 pass))))))
+          [] reports))
+
+;; The table of rows, the counts per category and the total; the status.
+(defun summarise :private (reports: (Vec cases/CaseReport)) -> i64
+  (let ((failed (count (filter (fn (r: cases/CaseReport) (some? (. r failure))) reports))))
+    (do (doseq [r reports]
+          (match (. r failure)
+            (nil (println (str "ok    " (. r path))))
+            ((some f) (println (str "FAIL  " (. r path) ": " f)))))
+        (doseq [t (tally reports)]
+          (println (str-join [(. t cat) ": " (show (. t n)) " cases, " (show (. t ok)) " pass, " (show (- (. t n) (. t ok))) " fail"])))
+        (println (str-join ["total: " (show (count reports)) " cases, " (show (- (count reports) failed)) " pass, " (show failed) " fail"]))
+        (if (= failed 0) 0 1))))
+
+(defun cases-cmd :private (rest: (Vec str)) -> (Result i64 str)
+  (let ((found (cases/cases-collect rest)))
+    (if (empty? found)
+        (Err "no cases found")
+        (try-let [scratch (scratch-dir)]
+          (let ((reports (cases/cases-run-all "/proc/self/exe" found scratch)))
+            (do (remove-scratch scratch) (Ok (summarise reports))))))))
+
+;; -------------------------------------------------------------------------------------------------- dispatch
 
 ;; Runs the command; the exit status, or the usage error. (cli.rs `dispatch`)
 (defun dispatch (args: (Vec str)) -> (Result i64 str)
-  (trap "todo: native.cli dispatch"))
+  (if (empty? args)
+      (Err usage)
+      (let ((cmd (nth args 0))
+            (rest (vec (drop 1 args))))
+        (cond (= cmd "check") (check-cmd rest)
+              (= cmd "run") (run-cmd rest)
+              (= cmd "build") (build-cmd rest)
+              (= cmd "emit-llvm") (emit-llvm-cmd rest)
+              (= cmd "dump-ast") (dump-ast-cmd rest)
+              (= cmd "cases") (cases-cmd rest)
+              (= cmd "fuzz-one") (fuzz-one-cmd rest)
+              (= cmd "fuzz") (Err "fuzz: not implemented in lairf yet (package F)")
+              :else (Err usage)))))

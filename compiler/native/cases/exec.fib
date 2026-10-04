@@ -1,15 +1,105 @@
-;; compiler/native/cases/exec.fib: running a program with a time limit (crates/lair/src/cases/exec.rs). OWNER: package H. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/cases/exec.fib: running a program with a time limit (crates/lair/src/cases/exec.rs). OWNER: package H.
+;; Standard output and error go to two files in a private directory (no pipe to drain, so no thread), read back when the process has ended;
+;; the wait polls `waitpid` every 2 ms as the Rust polls `try_wait`, and kills the process with SIGKILL at the limit. The status is the code,
+;; or 128 + the signal; `signal` is the signal that killed it. Not ported: the Rust's `cannot run PROGRAM: REASON` for a program that cannot
+;; be started (here the child exits 127), the `-1` of an unknowable status.
 
-(ns native.cases.exec)
+(ns native.cases.exec
+  (:require [llvm.ffi :as ffi]))
+
+(extern fork :private () -> i32)
+(extern execvp :private (ptr ptr) -> i32)
+(extern dup2 :private (i32 i32) -> i32)
+(extern open :private (ptr i32) -> i32)
+(extern creat :private (ptr i32) -> i32)
+(extern close :private (i32) -> i32)
+(extern waitpid :private (i32 ptr i32) -> i32)
+(extern kill :private (i32 i32) -> i32)
+(extern _exit :private (i32) -> unit)
+(extern mkdtemp :private (ptr) -> ptr)
+(extern unlink :private (ptr) -> i32)
+(extern rmdir :private (ptr) -> i32)
 
 
 ;; How a run ended (exec.rs `Outcome`).
 (defstruct Outcome (status: i64 signal: (Option i64) timed-out: bool stdout: str stderr: str))
 
-;; Runs with the default limit of 120 s. (exec.rs `run`)
-(defun run-program (program: str args: (Vec str)) -> (Result Outcome str)
-  (trap "todo: native.cases.exec run-program"))
+(def default-limit-secs: i64 120)
 
-;; (exec.rs `run_within`)
+(defun remove-path :private (path: str rm: i64) -> unit
+  (let ((p (ffi/bytes-new path)))
+    (do (unsafe (if (= rm 0) (unlink p) (rmdir p)))
+        (ffi/free-addr (ffi/ptr->addr p)))))
+
+;; A new directory under TMPDIR (or /tmp), its name made by mkdtemp; nil when it cannot be made.
+(defun temp-dir :private () -> (Option str)
+  (let ((env (unwrap-or (sys-getenv "TMPDIR") ""))
+        (t (ffi/bytes-new (str-concat (if (= env "") "/tmp" env) "/lairf-run-XXXXXX")))
+        (r (unsafe (ffi/ptr->addr (mkdtemp t))))
+        (name (if (= r 0) nil (some (ffi/c-string-at r)))))
+    (do (ffi/free-addr (ffi/ptr->addr t)) name)))
+
+;; In the child: standard input from /dev/null, output and error to the files, the program run; 127 when it cannot be.
+(defun become :private (argv0: ptr av: ptr fo: i32 fe: i32 nul: i32) -> i64
+  (unsafe (do (dup2 nul 0i32) (dup2 fo 1i32) (dup2 fe 2i32) (execvp argv0 av) (_exit 127i32) 0)))
+
+;; The process id of `program args..` with its streams in the files `out` and `err`; -1 when there is no process.
+(defun spawn :private (program: str args: (Vec str) out: str err: str) -> i64
+  (let ((po (ffi/bytes-new out))
+        (pe (ffi/bytes-new err))
+        (pn (ffi/bytes-new "/dev/null"))
+        (cs (mapv (fn (w: str) (ffi/ptr->addr (ffi/bytes-new w))) (into [program] args)))
+        (av (ffi/words-new (conj cs 0)))
+        (pid (unsafe
+               (let ((fo (creat po 420i32))
+                     (fe (creat pe 420i32))
+                     (nul (open pn 0i32))
+                     (pid (fork)))
+                 (cond (< pid 0i32) -1
+                       (= pid 0i32) (become (ffi/addr->ptr (nth cs 0)) av fo fe nul)
+                       :else (do (close fo) (close fe) (close nul) (sext i64 pid)))))))
+    (do (doseq [c cs] (ffi/free-addr c))
+        (doseq [p [(ffi/ptr->addr po) (ffi/ptr->addr pe) (ffi/ptr->addr pn) (ffi/ptr->addr av)]] (ffi/free-addr p))
+        pid)))
+
+;; waitpid's status word of `pid` when it has ended (or `limit-ns` after `start` has passed and it was killed): the word and whether it was killed.
+(defstruct Waited (word: i64 killed: bool))
+
+(defun poll :private (pid: i64 start: i64 limit-ns: i64) -> Waited
+  (let ((st (ffi/slot-new)))
+    (loop ((killed false))
+      (let ((r (unsafe (waitpid (trunc i32 pid) st (if killed 0i32 1i32)))))
+        (cond (< r 0i32) (do (ffi/free-addr (ffi/ptr->addr st)) (Waited 0 killed))
+              (> r 0i32) (let ((w (sext i64 (unsafe (load-i32 st))))) (do (ffi/free-addr (ffi/ptr->addr st)) (Waited w killed)))
+              (> (- (sys-clock-now) start) limit-ns) (do (unsafe (kill (trunc i32 pid) 9i32)) (recur true))
+              :else (do (sys-sleep 2000000) (recur false)))))))
+
+(defun outcome-of :private (w: Waited out: str err: str) -> Outcome
+  (let ((word (. w word))
+        (sig (bit-and word 127))
+        (stdout (unwrap-or (read-file out) ""))
+        (stderr (unwrap-or (read-file err) "")))
+    (cond (. w killed) (Outcome 124 nil true stdout stderr)
+          (= sig 0) (Outcome (bit-and (quot word 256) 255) nil false stdout stderr)
+          :else (Outcome (+ 128 sig) (some sig) false stdout stderr))))
+
+;; Runs `program args..`, killing it after `limit-secs`; a kill is reported in the outcome, with what it wrote until then. (exec.rs `run_within`)
 (defun run-within (program: str args: (Vec str) limit-secs: i64) -> (Result Outcome str)
-  (trap "todo: native.cases.exec run-within"))
+  (match (temp-dir)
+    (nil (Err "cannot make a scratch directory"))
+    ((some d)
+     (let ((out (str-concat d "/out"))
+           (err (str-concat d "/err"))
+           (start (sys-clock-now))
+           (pid (spawn program args (str-concat d "/out") (str-concat d "/err")))
+           (r (if (< pid 0)
+                  (Err (str "cannot run " program ": fork failed"))
+                  (Ok (outcome-of (poll pid start (* limit-secs 1000000000)) out err)))))
+       (do (remove-path out 0) (remove-path err 0) (remove-path d 1) r)))))
+
+;; Runs with the default limit of 120 s; going over it is an error. (exec.rs `run`)
+(defun run-program (program: str args: (Vec str)) -> (Result Outcome str)
+  (try-let [o (run-within program args default-limit-secs)]
+    (if (. o timed-out)
+        (Err (str "timed out after " default-limit-secs "s"))
+        (Ok o))))

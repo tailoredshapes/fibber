@@ -1,6 +1,9 @@
-;; compiler/native/cases.fib: the case harness (crates/lair/src/cases/mod.rs). OWNER: package H. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/cases.fib: the case harness (crates/lair/src/cases/mod.rs): every case through the JIT and through AOT, each in its own process. OWNER: package H.
+;; Workers: `cases-workers` tasks take the next case from a shared counter (the Rust runs min(cores, 8) threads; the machine this is built on is
+;; shared, so the default is 4, and FIB_LAIR_WORKERS overrides it).
 
 (ns native.cases
+  (:require [native.cases.walk :as walk])
   (:use native.cases.header native.cases.verdict))
 
 
@@ -8,8 +11,31 @@
 
 ;; Every case file under the directories, sorted. (mod.rs `collect`)
 (defun cases-collect (dirs: (Vec str)) -> (Vec str)
-  (trap "todo: native.cases cases-collect"))
+  (walk/collect-files dirs))
 
-;; Runs every case. (mod.rs `run_all`)
+(def default-workers: i64 4)
+
+(defun cases-workers () -> i64
+  (match (sys-getenv "FIB_LAIR_WORKERS")
+    (nil default-workers)
+    ((some s) (match (parse-long s) ((some n) (if (> n 0) n default-workers)) (nil default-workers)))))
+
+(defun report-of :private (lair: str path: str scratch: str n: i64) -> CaseReport
+  (match (run-case lair path scratch n)
+    ((Ok _) (CaseReport path nil))
+    ((Err f) (CaseReport path (some f)))))
+
+;; One worker: takes the index of the next case until there is none; its reports in index order of taking.
+(defun work :private (next: (Atom i64) lair: str cases: (Vec str) scratch: str) -> (Vec (Pair i64 CaseReport))
+  (loop ((acc []))
+    (let ((i (- (swap! next (fn (n: i64) (+ n 1))) 1)))
+      (if (>= i (count cases))
+          acc
+          (recur (conj acc (Pair i (report-of lair (nth cases i) scratch i))))))))
+
+;; Runs every case with `lair` as the tool, in parallel; the reports in the order of `cases`. (mod.rs `run_all`)
 (defun cases-run-all (lair: str cases: (Vec str) scratch: str) -> (Vec CaseReport)
-  (trap "todo: native.cases cases-run-all"))
+  (let ((next (atom 0))
+        (tasks (mapv (fn (k: i64) (spawn (fn () (work next lair cases scratch)))) (range (cases-workers))))
+        (all (reduce (fn (a: (Vec (Pair i64 CaseReport)) t) (into a (join t))) [] tasks)))
+    (mapv (fn (p: (Pair i64 CaseReport)) (. p snd)) (vec (sort (fn (x: (Pair i64 CaseReport) y: (Pair i64 CaseReport)) (compare (. x fst) (. y fst))) all)))))
