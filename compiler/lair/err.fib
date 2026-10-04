@@ -1,0 +1,29 @@
+;; compiler/lair/err.fib: LEGACY. What the bindings of liblair.so (lair.jit, lair.call, compiler/jit-demo.fib) share and the compiler does not: turning
+;; a `lair_error *` into a `(Result .. str)`. It left lair.ffi when the compiler moved to native.* and stopped linking liblair (lair-in-fibber, stage 7):
+;; lair.ffi has no `lair_*` extern now. Deleted with compiler/lair/ at stage 10.
+(ns lair.err (:require [lair.ffi :as ffi]))
+
+(extern lair_error_text :private (i64 ptr) -> i64)
+(extern lair_error_free :private (i64) -> unit)
+
+;; The message of the `lair_error` e (not null), copied out; e is freed.
+(defun error-text (e: i64) -> str
+  (unsafe
+    (let ((len (ffi/slot-new))
+          (at (lair_error_text e len))
+          (text (ffi/text-at at (load-i64 len))))
+      (do (free len)
+          (lair_error_free e)
+          text))))
+
+;; What a call that returns a `lair_error *` came to: `Ok ()` for NULL,
+;; else `Err` of the message, the error freed.
+(defun status (e: i64) -> (Result unit str)
+  (if (= e 0) (Ok ()) (Err (error-text e))))
+
+;; The same for a call that also gave a word through the slot `out`: the
+;; word when e is NULL, else the message. `out` is freed either way.
+(defun word-result (e: i64 out: ptr) -> (Result i64 str)
+  (unsafe
+    (let ((r (if (= e 0) (Ok (load-i64 out)) (Err (error-text e)))))
+      (do (free out) r))))

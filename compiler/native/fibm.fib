@@ -1,0 +1,325 @@
+;; compiler/native/fibm.fib: (lair.fibm of compiler/lair/fibm.fib, moved to native.* over native.api and native.call at the flip, lair-in-fibber stage 7; the lair.* original stays for compiler/jit-demo.fib until stage 10) a macro-time module as the compiler sees it
+;; (spec/compiler.md §6, crates/fibc/src/macros/abi.rs and module.rs): the
+;; C-callable surface `fibm.NAME.K` of the module made for the K-th macro,
+;; reached through lair.jit and lair.call, and the conversions between the
+;; compiler's tree (`Stx`) and the module's `Form` objects. This is what
+;; the Rust `Fns` does for the Rust expander, and what the stage-2
+;; expander does at the macro boundary (bootstrap.md §1).
+;;
+;; A `Form` object is plain heap data of the module, an `i64` here (an
+;; address): it is made by `form-object`, `str-object` and `vec-object`
+;; and read by the accessors, every one a call of a function of the
+;; module through `call-i64`. Objects made at expansion time are never
+;; freed, as in §6: the process is the compiler's.
+;;
+;; Where the Rust `Fns` is silent or fibber cannot follow, and what this
+;; module does:
+;;
+;; - The `Form` variant tags are positions in `abi.rs`'s VARIANTS: Sym
+;;   Kw Int Flt Str Chr Bool Nil List Vec Map are 0 to 10
+;;   (`compile_macro` refuses any other order). A tag that is none of them
+;;   reads as Nil, as in Rust.
+;; - The width of an Int or Flt form is a keyword id, and the module
+;;   exports the table of the keywords it interned, `fibm.kw-count.K` and
+;;   `fibm.kw.K` (abi.rs). `fibm-lookup` reads the whole table once, so
+;;   an id is named from the table, as the Rust `Fns` names it (an id
+;;   that is in no table is `#ID`), and the id of a width suffix (i8 i16
+;;   i32 i64 f32 f64) is found by name, never assumed. A module whose
+;;   table lacks one of those six cannot be given a form of that width,
+;;   so `fibm-lookup` refuses it with an error and `to-object` has none
+;;   to report; `compile_macro` interns all six, so each module it makes
+;;   is accepted.
+;; - `lair_call_i64` passes no double, but `fibm.form` takes the bits of a
+;;   Flt form's double as an integer: `(f64->bits v)` (syntax §4.3), every
+;;   bit of it, a NaN's payload and a zero's sign included. A Flt form of
+;;   width :f32 holds the f32 widened to f64, as the Rust `Form` does, so
+;;   the bits are those of the f64. Reading a Flt form needs no cast: the
+;;   module hands the double back through `call-f64`.
+(ns native.fibm
+  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi])
+  (:use syntax.pos syntax.form))
+
+;; The addresses of the module's functions, from `jit-c-entry`, then its
+;; keyword table: the name of each keyword by id, and the ids of the six
+;; width suffixes in the order of `width-names`.
+(defstruct Fibm
+  (entry: i64 str-new: i64 form: i64 vec: i64 tag: i64 f0-ptr: i64 f0-i64: i64 f0-f64: i64
+   f0-i32: i64 f0-i1: i64 f1-i64: i64 str-len: i64 str-ptr: i64 vec-len: i64 vec-elem: i64
+   set-hooks: i64 init: i64 kw: i64 kw-count: i64
+   keywords: (Vec str) widths: (Vec i64)))
+
+;; The names of those functions, in the order of the fields of `Fibm`.
+(def names: (Vec str) :private ["entry" "str" "form" "vec" "tag" "f0-ptr" "f0-i64" "f0-f64"
+                          "f0-i32" "f0-i1" "f1-i64" "str-len" "str-ptr" "vec-len" "vec-elem"
+                          "set-hooks" "init" "kw" "kw-count"])
+
+;; The width suffixes whose ids a form of that width needs.
+(def width-names: (Vec str) :private ["i8" "i16" "i32" "i64" "f32" "f64"])
+
+;; The addresses of `fibm.NAME.K` for each NAME, in order, or the first
+;; failure.
+(defun addresses :private (j: jit/Jit k: i64) -> (Result (Vec i64) str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count names))
+        (match (jit/jit-c-entry j (str-join ["fibm." (nth names i) "." (show k)]))
+          ((Ok a) (recur (+ i 1) (conj acc a)))
+          ((Err m) (Err m)))
+        (Ok acc))))
+
+;; The keyword table of the module whose function addresses are a: the
+;; name of each keyword, by id 0 to `fibm.kw-count` - 1, or the first id
+;; the module gives no name.
+(defun read-table :private (a: (Vec i64)) -> (Result (Vec str) str)
+  (let ((count (word (nth a 18) [])))
+    (loop ((id 0) (acc (vec-empty)))
+      (if (< id count)
+          (let ((s (word (nth a 17) [id])))
+            (if (= s 0)
+                (Err (str-join ["the keyword table has no name for keyword " (show id)
+                                " of " (show count)]))
+                (recur (+ id 1) (conj acc (text-of (nth a 12) (nth a 11) s)))))
+          (Ok acc)))))
+
+;; The position of s in xs.
+(defun index-of :private (xs: (Vec str) s: str) -> (Option i64)
+  (loop ((i 0))
+    (if (< i (count xs))
+        (if (= (nth xs i) s) (some i) (recur (+ i 1)))
+        nil)))
+
+;; The ids of the width suffixes in the table, in the order of
+;; `width-names`, or the first suffix the table lacks.
+(defun width-ids :private (table: (Vec str)) -> (Result (Vec i64) str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count width-names))
+        (match (index-of table (nth width-names i))
+          ((some id) (recur (+ i 1) (conj acc id)))
+          (nil (Err (str-concat "the keyword table has no :" (nth width-names i)))))
+        (Ok acc))))
+
+(defun fibm-of :private (a: (Vec i64) table: (Vec str) widths: (Vec i64)) -> Fibm
+  (Fibm (nth a 0) (nth a 1) (nth a 2) (nth a 3) (nth a 4) (nth a 5) (nth a 6) (nth a 7)
+        (nth a 8) (nth a 9) (nth a 10) (nth a 11) (nth a 12) (nth a 13) (nth a 14)
+        (nth a 15) (nth a 16) (nth a 17) (nth a 18) table widths))
+
+;; The surface of the module made for the K-th macro, added to j, with
+;; its keyword table read once.
+(defun fibm-lookup (j: jit/Jit k: i64) -> (Result Fibm str)
+  (match (addresses j k)
+    ((Err m) (Err m))
+    ((Ok a)
+     (match (read-table a)
+       ((Err m) (Err m))
+       ((Ok table)
+        (match (width-ids table)
+          ((Err m) (Err m))
+          ((Ok widths) (Ok (fibm-of a table widths)))))))))
+
+;; Initialises the module's runtime (`fibm.init`): once, after the module
+;; is added and before its first macro runs, as the Rust runner does.
+(defun fibm-init (m: Fibm) -> unit
+  (do (word (. m init) []) ()))
+
+;; The result of the function at addr applied to args. The address is a
+;; function of the module and the arguments are at most 8 by construction
+;; here, so the call is always made.
+(defun word :private (addr: i64 args: (Vec i64)) -> i64
+  (match (call/call-i64 addr args)
+    ((Ok v) v)
+    ((Err m) (trap m))))
+
+;; A 32-bit result (`i32` of a C function has unspecified high bits).
+(defun low32 :private (v: i64) -> i64 (bit-and v 4294967295))
+
+;; ---------------------------------------------------------------- objects
+
+;; A `str` object of the module with the bytes of s.
+(defun str-object (m: Fibm s: str) -> i64
+  (let ((p (ffi/bytes-new s))
+        (a (ffi/ptr->addr p))
+        (o (word (. m str-new) [a (str-len s)])))
+    (do (unsafe (free p)) o)))
+
+;; A `(Vec Form)` object holding the objects, which are `Form` objects.
+(defun vec-object (m: Fibm items: (Vec i64)) -> i64
+  (let ((buf (ffi/words-new items))
+        (o (word (. m vec) [(ffi/ptr->addr buf) (count items)])))
+    (do (unsafe (free buf)) o)))
+
+;; A `Form` object of variant tag (0 to 10) with the payload the variant
+;; has: a and b are the words of an Int (value, width id), a Chr or a Bool
+;; (a), p the pointer of the other variants (a `str` object, or a `(Vec
+;; Form)` object for List, Vec and Map).
+(defun form-object (m: Fibm tag: i64 a: i64 b: i64 p: i64) -> i64
+  (word (. m form) [tag a b p]))
+
+;; A Sym, Kw or Str form (tag 0, 1 or 4) with the text s.
+(defun text-form (m: Fibm tag: i64 s: str) -> i64
+  (form-object m tag 0 0 (str-object m s)))
+
+;; The tag of a `Form` object.
+(defun form-tag (m: Fibm o: i64) -> i64
+  (low32 (word (. m tag) [o])))
+
+;; The text of the `str` object s, read with the module's `str-ptr` and
+;; `str-len` functions at these addresses.
+(defun text-of :private (ptr-fn: i64 len-fn: i64 s: i64) -> str
+  (ffi/text-at (word ptr-fn [s]) (word len-fn [s])))
+
+;; The text of a `str` object.
+(defun str-text (m: Fibm s: i64) -> str
+  (text-of (. m str-ptr) (. m str-len) s))
+
+;; The text of the Sym, Kw or Str form o.
+(defun form-text (m: Fibm o: i64) -> str
+  (str-text m (word (. m f0-ptr) [o])))
+
+;; The elements of a `(Vec Form)` object.
+(defun vec-items (m: Fibm v: i64) -> (Vec i64)
+  (let ((n (word (. m vec-len) [v])))
+    (loop ((i 0) (acc (vec-empty)))
+      (if (< i n) (recur (+ i 1) (conj acc (word (. m vec-elem) [v i]))) acc))))
+
+;; -------------------------------------------------------------- widths
+
+(defun width-name :private (m: Fibm id: i64) -> str
+  (if (and (>= id 0) (< id (count (. m keywords))))
+      (nth (. m keywords) id)
+      (str-concat "#" (show id))))
+
+(defun int-width-of :private (m: Fibm id: i64) -> (Option IntWidth)
+  (match (width-name m id)
+    ("i8" (some I8)) ("i16" (some I16)) ("i32" (some I32)) ("i64" (some I64))
+    (_ nil)))
+
+(defun flt-width-of :private (m: Fibm id: i64) -> (Option FltWidth)
+  (match (width-name m id)
+    ("f32" (some F32)) ("f64" (some F64))
+    (_ nil)))
+
+(defun int-width-id :private (m: Fibm w: IntWidth) -> i64
+  (nth (. m widths) (match w ((I8) 0) ((I16) 1) ((I32) 2) ((I64) 3))))
+
+(defun flt-width-id :private (m: Fibm w: FltWidth) -> i64
+  (nth (. m widths) (match w ((F32) 4) ((F64) 5))))
+
+;; ----------------------------------------------------- object to Stx
+
+;; The character of a code point as Rust's `char::from_u32(c)
+;; .unwrap_or('\0')` reads it.
+(defun code-char :private (n: i64) -> char
+  (if (or (< n 55296) (and (> n 57343) (< n 1114112)))
+      (i32->char (trunc i32 n))
+      (i32->char 0i32)))
+
+(defun int-kind :private (m: Fibm o: i64) -> (Result StxKind str)
+  (let ((id (word (. m f1-i64) [o])))
+    (match (int-width-of m id)
+      ((some w) (Ok (SInt (word (. m f0-i64) [o]) w)))
+      (nil (Err (str-concat "trap: an Int form of width :" (width-name m id)))))))
+
+(defun flt-kind :private (m: Fibm o: i64) -> (Result StxKind str)
+  (let ((id (word (. m f1-i64) [o])))
+    (match (flt-width-of m id)
+      ((some w)
+       (match (call/call-f64 (. m f0-f64) [o])
+         ((Ok v) (Ok (SFlt v w)))
+         ((Err e) (Err e))))
+      (nil (Err (str-concat "trap: a Flt form of width :" (width-name m id)))))))
+
+;; The forms a macro was given, by the address of the `Form` object made for each node of them (`to-object-in`): what a macro
+;; returns of them keeps their own positions (syntax §1.3; the Rust `Inputs`). The objects of a macro module are never freed
+;; (`fibm.form` makes them immortal), so an address is one node for good.
+(defstruct Inputs (by-address: (Cell (Map i64 Stx))))
+
+(defun inputs-new () -> Inputs
+  (Inputs (cell (map-empty))))
+
+;; The List, Vec or Map (tag 8, 9 or 10) form o.
+(defun seq-kind :private (m: Fibm o: i64 tag: i64 pos: Pos ins: (Map i64 Stx)) -> (Result StxKind str)
+  (match (stx-items m (vec-items m (word (. m f0-ptr) [o])) pos ins)
+    ((Err e) (Err e))
+    ((Ok xs) (Ok (match tag (8 (SList xs)) (9 (SVec xs)) (_ (SMap xs)))))))
+
+(defun to-kind :private (m: Fibm o: i64 pos: Pos ins: (Map i64 Stx)) -> (Result StxKind str)
+  (let ((tag (form-tag m o)))
+    (match tag
+      (0 (Ok (SSym (form-text m o))))
+      (1 (Ok (SKw (form-text m o))))
+      (2 (int-kind m o))
+      (3 (flt-kind m o))
+      (4 (Ok (SStr (form-text m o))))
+      (5 (Ok (SChr (code-char (low32 (word (. m f0-i32) [o]))))))
+      (6 (Ok (SBool (not (= (low32 (word (. m f0-i1) [o])) 0)))))
+      (8 (seq-kind m o tag pos ins))
+      (9 (seq-kind m o tag pos ins))
+      (10 (seq-kind m o tag pos ins))
+      (_ (Ok SNil)))))
+
+;; The tree of the `Form` object o: the input form it was made for, if `ins` has it, with its own positions, else a new node at
+;; pos (a macro's new forms have no positions of their own: the call's, syntax §1.3), its children read the same way.
+(defun to-stx-in (m: Fibm o: i64 pos: Pos ins: (Map i64 Stx)) -> (Result Stx str)
+  (match (get ins o)
+    ((some s) (Ok s))
+    (nil
+     (match (to-kind m o pos ins)
+       ((Err e) (Err e))
+       ((Ok k) (Ok (Stx k pos)))))))
+
+;; The tree of the `Form` object o, every node at pos.
+(defun to-stx (m: Fibm o: i64 pos: Pos) -> (Result Stx str)
+  (to-stx-in m o pos (map-empty)))
+
+(defun stx-items :private (m: Fibm objs: (Vec i64) pos: Pos ins: (Map i64 Stx)) -> (Result (Vec Stx) str)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count objs))
+        (match (to-stx-in m (nth objs i) pos ins)
+          ((Ok s) (recur (+ i 1) (conj acc s)))
+          ((Err e) (Err e)))
+        (Ok acc))))
+
+;; ----------------------------------------------------- Stx to object
+
+;; The `Form` objects of the trees, in order.
+(defun to-objects (m: Fibm xs: (Vec Stx)) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count xs))
+        (recur (+ i 1) (conj acc (to-object m (nth xs i))))
+        acc)))
+
+(defun seq-object :private (m: Fibm tag: i64 xs: (Vec Stx)) -> i64
+  (form-object m tag 0 0 (vec-object m (to-objects m xs))))
+
+;; The `Form` object of the tree s (what the macro is given).
+(defun to-object (m: Fibm s: Stx) -> i64
+  (match (. s kind)
+    ((SSym n) (text-form m 0 n))
+    ((SKw n) (text-form m 1 n))
+    ((SStr n) (text-form m 4 n))
+    ((SInt v w) (form-object m 2 v (int-width-id m w) 0))
+    ((SFlt v w) (form-object m 3 (f64->bits v) (flt-width-id m w) 0))
+    ((SChr c) (form-object m 5 (zext i64 (char->i32 c)) 0 0))
+    ((SBool b) (form-object m 6 (if b 1 0) 0 0))
+    ((SNil) (form-object m 7 0 0 0))
+    ((SList xs) (seq-object m 8 xs))
+    ((SVec xs) (seq-object m 9 xs))
+    ((SMap xs) (seq-object m 10 xs))))
+
+;; As `to-objects` and `to-object`, recording every node made in `ins` (an argument of a macro: `to-stx-in` gives it back as it was).
+(defun to-objects-in (m: Fibm xs: (Vec Stx) ins: Inputs) -> (Vec i64)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (< i (count xs))
+        (recur (+ i 1) (conj acc (to-object-in m (nth xs i) ins)))
+        acc)))
+
+(defun seq-object-in :private (m: Fibm tag: i64 xs: (Vec Stx) ins: Inputs) -> i64
+  (form-object m tag 0 0 (vec-object m (to-objects-in m xs ins))))
+
+(defun to-object-in (m: Fibm s: Stx ins: Inputs) -> i64
+  (let ((o (match (. s kind)
+             ((SList xs) (seq-object-in m 8 xs ins))
+             ((SVec xs) (seq-object-in m 9 xs ins))
+             ((SMap xs) (seq-object-in m 10 xs ins))
+             (_ (to-object m s)))))
+    (do (set! (. ins by-address) (assoc @(. ins by-address) o s))
+        o)))

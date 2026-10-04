@@ -1,0 +1,141 @@
+;; compiler/native/expand.fib: (lair.expand of compiler/lair/expand.fib, moved to native.* over native.api and native.call at the flip, lair-in-fibber stage 7; the lair.* original stays for compiler/jit-demo.fib until stage 10) running one macro of a macro-time module the
+;; way the expander does (spec/compiler.md §6, §9), from fibber: the
+;; arguments become `Form` objects, the entry runs on a mailbox's worker,
+;; and every hook call the macro makes is answered here, until it
+;; returns; the result object becomes a `Stx` again. This is what
+;; `JitRunner::run` and `bridge.rs` do for the Rust expander, and the
+;; step the stage-2 expander is built on.
+;;
+;; The two hooks, as `bridge.rs` answers them:
+;;
+;; - arity 1, `(gensym prefix)`: the fresh Sym `#PREFIX.N`, N the next
+;;   number of a counter the compiler keeps (`ExpandCtx::gensym`);
+;; - arity 2, a reflection call `(NAME form)` (`struct?`, `struct-fields`,
+;;   `enum-variants`, ..): the answer is whatever the compiler's own table
+;;   says for NAME and the Sym it was asked about, a form built into an
+;;   object with `to-object`, or the message of the error that ends the
+;;   expansion. Those are the expander's `ExpandCtx::reflect`; this module
+;;   holds its answers as data (the `Ctx`), and a call the table has no
+;;   answer for, like one on a form that is not a Sym, is an error as
+;;   Rust's is. An error ends the expansion after the macro has been
+;;   answered with Nil and run to its end (the Rust runner does the same:
+;;   it records the first error and the call returns).
+;;
+;; The compiler's state that the hooks read and change is the `Ctx`; it
+;; is passed in and handed back, never global.
+(ns native.expand
+  (:require [native.call :as call] [native.fibm :as fibm] [lair.ffi :as ffi] [fib.string :as s])
+  (:use syntax.pos syntax.form))
+
+;; The answers of the reflection calls, by `"OP NAME"` (`answer-key`): a
+;; form, or the message of the error; the gensyms made so far; and the
+;; first error a hook found.
+(defstruct Ctx (answers: (Map str (Result Stx str)) gensyms: i64 error: (Option str)))
+
+;; The key of the answer to the reflection call op on the name.
+(defun answer-key (op: str name: str) -> str (str-join [op " " name]))
+
+;; The tree a macro returned, and the context after it.
+(defstruct Expansion (form: Stx ctx: Ctx))
+
+;; The answer to one hook call: a `Form` object, and the context after.
+(defstruct Reply :private (obj: i64 ctx: Ctx))
+
+(defun ctx-new (answers: (Map str (Result Stx str)) gensyms: i64) -> Ctx
+  (Ctx answers gensyms nil))
+
+;; ctx with its error set to why unless it already has one.
+(defun with-error :private (ctx: Ctx why: str) -> Ctx
+  (match (. ctx error)
+    ((some _) ctx)
+    (nil (Ctx (. ctx answers) (. ctx gensyms) (some why)))))
+
+;; ---------------------------------------------------------------- hooks
+
+(defun gensym-reply :private (m: fibm/Fibm mb: call/Mailbox ctx: Ctx) -> Reply
+  (let ((prefix (fibm/str-text m (call/call-hook-arg mb 0)))
+        (n (+ (. ctx gensyms) 1)))
+    (Reply (fibm/text-form m 0 (str-join ["#" prefix "." (show n)]))
+           (Ctx (. ctx answers) n (. ctx error)))))
+
+;; The answer object of the reflection call op on the name, or the
+;; message that ends the expansion.
+(defun reflect-answer :private (m: fibm/Fibm op: str name: str ctx: Ctx) -> (Result i64 str)
+  (match (get (. ctx answers) (answer-key op name))
+    ((some (Ok form)) (Ok (fibm/to-object m form)))
+    ((some (Err why)) (Err why))
+    (nil (Err (str-join ["reflection call " op " on " name " is not in the compiler's table"])))))
+
+;; The operation of a reflection call, `OP` or `OP POSITION` (the position is the compiler's to read; the table has none).
+(defun op-of :private (call: str) -> str
+  (match (s/index-of call " ") ((some i) (str-slice call 0 i)) (nil call)))
+
+(defun reflect-reply :private (m: fibm/Fibm mb: call/Mailbox ctx: Ctx) -> Reply
+  (let ((op (op-of (ffi/c-string-at (call/call-hook-arg mb 0))))
+        (arg (call/call-hook-arg mb 1))
+        (nothing (fibm/form-object m 7 0 0 0)))
+    (if (= (fibm/form-tag m arg) 0)
+        (match (reflect-answer m op (fibm/form-text m arg) ctx)
+          ((Ok o) (Reply o ctx))
+          ((Err why) (Reply nothing (with-error ctx why))))
+        (Reply nothing (with-error ctx (str-join ["bad reflection call " op ": expects one symbol"]))))))
+
+;; Answers the hook calls the worker makes until its call returns; the
+;; context at the end, or the first fault of the mailbox.
+(defun serve :private (m: fibm/Fibm mb: call/Mailbox ctx: Ctx) -> (Result Ctx str)
+  (loop ((ctx ctx))
+    (match (call/call-wait mb)
+      ((Err e) (Err e))
+      ((Ok (call/Done)) (Ok ctx))
+      ((Ok (call/Hook k))
+       (let ((r (if (= k 1) (gensym-reply m mb ctx) (reflect-reply m mb ctx))))
+         (do (call/call-hook-reply mb (. r obj))
+             (recur (. r ctx))))))))
+
+;; --------------------------------------------------------------- a call
+
+;; The objects a macro entry takes: one for each fixed argument and, when
+;; the macro has a rest parameter, a `(Vec Form)` object of the others.
+(defun entry-args :private (m: fibm/Fibm fixed: (Vec Stx) rest: (Option (Vec Stx))) -> (Vec i64)
+  (let ((objs (fibm/to-objects m fixed)))
+    (match rest
+      (nil objs)
+      ((some xs) (conj objs (fibm/vec-object m (fibm/to-objects m xs)))))))
+
+;; Installs the hooks with the mailbox as their context (`fibm.set-hooks`)
+;; and starts the entry on the worker.
+(defun start :private (m: fibm/Fibm mb: call/Mailbox objs: (Vec i64)) -> (Result unit str)
+  (let ((h (call/hook-addresses)))
+    (match (call/call-i64 (. m set-hooks) [(. h one) (. h two) (. mb handle)])
+      ((Err e) (Err e))
+      ((Ok _) (call/call-start mb (. m entry) objs)))))
+
+;; The macro's result as a tree at pos, once the call is served to its end;
+;; an error a hook found is the error of the expansion.
+(defun finish :private (m: fibm/Fibm mb: call/Mailbox ctx: Ctx pos: Pos) -> (Result Expansion str)
+  (match (. ctx error)
+    ((some why) (Err why))
+    (nil
+     (match (fibm/to-stx m (call/call-result mb) pos)
+       ((Err e) (Err e))
+       ((Ok s) (Ok (Expansion s ctx)))))))
+
+(defun run-macro :private (m: fibm/Fibm mb: call/Mailbox objs: (Vec i64) pos: Pos ctx: Ctx) -> (Result Expansion str)
+  (match (start m mb objs)
+    ((Err e) (Err e))
+    ((Ok _)
+     (match (serve m mb ctx)
+       ((Err e) (Err e))
+       ((Ok after) (finish m mb after pos))))))
+
+;; Runs the macro of the module `m` (looked up and initialised by the
+;; caller, once for the module: `fibm-lookup`, `fibm-init`) on the
+;; arguments of its call at pos: `fixed` for its parameters and, when it
+;; has a rest parameter, `rest` for the others. The mailbox lives for
+;; this call only.
+(defun expand-call (m: fibm/Fibm fixed: (Vec Stx) rest: (Option (Vec Stx)) pos: Pos ctx: Ctx) -> (Result Expansion str)
+  (match (call/call-new)
+    ((Err e) (Err e))
+    ((Ok mb)
+     (let ((r (run-macro m mb (entry-args m fixed rest) pos ctx)))
+       (do (call/call-free mb) r)))))
