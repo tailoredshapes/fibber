@@ -94,6 +94,50 @@
 (defun control-module () -> LModule
   (LModule [(sum-fn) (sw-fn) (both-fn) (count-fn) (step-fn) (nothing-fn)]))
 
+;; casts, floats, vectors, aggregates, intrinsics and a call with a string: the cases that are not memory or control.
+(defun cst (op: LCastOp ty: LType v: LExpr) -> LExpr (ex (KCast op ty v)))
+(defun idx (n: i64) -> (Vec LLit) [(lit-of n)])
+
+(defun misc-binds () -> (Vec LBinding)
+  (let ((v4 (TVector 4 ty-i32))
+        (pair (TAnon [ty-i64 ty-i8])))
+    [(bd "n" (ex (KUn UFNeg (lc "d"))))
+     (bd "c" (ex (KFCmp FOlt (lc "d") (lc "n"))))
+     (bd "p" (ex (KUn UCtpop (lc "w"))))
+     (bd "o" (ex (KOverflow OvSAdd (lc "w") (lc "w"))))
+     (bd "s" (cst CFpToSiSat ty-i64 (lc "d")))
+     (bd "u" (cst CFpToUiSat ty-i8 (lc "d")))
+     (bd "e" (ex (KExtractElement (lc "v") (i32n 0))))
+     (bd "iv" (ex (KInsertElement (lc "v") (lc "e") (i32n 1))))
+     (bd "sh" (ex (KShuffle (lc "v") (lc "iv") (ex (KVector v4 [(i32n 3) (i32n 7) (i32n 0) (i32n 4)])))))
+     (bd "z" (cst CZExt ty-i64 (lc "e")))
+     (bd "st" (ex (KStruct nil [(lc "w") (ex (KInt ty-i8 (lit-of 1)))])))
+     (bd "ar" (ex (KArray (TArray 2 ty-i64) [(lc "w") (lc "z")])))
+     (bd "iv2" (ex (KInsertValue (lc "st") (ex (KInt ty-i8 (lit-of 5))) (idx 1))))
+     (bd "ar2" (ex (KInsertValue (lc "ar") (lc "w") (idx 1))))
+     (bd "k" (ex (KSelect (lc "c") (ex (KExtractValue (lc "o") (idx 0))) (ex (KExtractValue (lc "ar2") (idx 1))))))
+     (bd "zz" (ex (KZero pair)))
+     (bd "t" (ex (KCall (CalDirect "puts") [(ex (KStr (str-bytes "hi")))] false)))
+     (bd "b" (cst CBitcast ty-i64 (lc "d")))
+     (bd "tr" (cst CTrunc ty-i8 (lc "w")))
+     (bd "f" (cst CSiToFp ty-double (lc "w")))
+     (bd "pp" (cst CIntToPtr ty-ptr (lc "w")))
+     (bd "q" (cst CPtrToInt ty-i64 (lc "pp")))]))
+
+(defun misc-sum () -> LExpr
+  (bin BAdd (lc "k")
+    (bin BAdd (ex (KExtractValue (lc "iv2") (idx 0)))
+      (bin BAdd (ex (KExtractValue (lc "zz") (idx 0)))
+        (bin BAdd (lc "z")
+          (bin BAdd (lc "b")
+            (bin BAdd (cst CZExt ty-i64 (lc "u")) (lc "q"))))))))
+
+(defun misc-module () -> LModule
+  (LModule
+    [(ItDeclare (LDeclare "puts" (LFnType cc-c (some ty-i32) [ty-ptr] false) false 0))
+     (fdef "m" cc-c (some ty-i64) ["d" "v" "w"] [ty-double (TVector 4 ty-i32) ty-i64]
+       [(blk "entry" [(lets (misc-binds) [(ret (misc-sum))])])])]))
+
 ;; The text between `prefix` and the next quote: `target triple = "X"` gives X.
 (defun quoted-after (text: str prefix: str) -> str
   (match (str-find text prefix 0)
@@ -127,6 +171,6 @@
                 (if (= got want) (do (println (str name ": same")) 0) (do (println (str name ": DIFF " (first-diff want got))) 1))))))))))
 
 (defun main () -> i64
-  (let ((bad (+ (check-module "arith" (arith-module)) (check-module "memory" (memory-module)) (check-module "control" (control-module)))))
+  (let ((bad (+ (check-module "arith" (arith-module)) (check-module "memory" (memory-module)) (check-module "control" (control-module)) (check-module "misc" (misc-module)))))
     (do (println (if (= bad 0) "l2-lower: ok" (str "l2-lower: " bad " failed")))
         bad)))
