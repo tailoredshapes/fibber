@@ -1,15 +1,171 @@
-;; compiler/native/lower/arith.fib: arithmetic, comparisons, casts, vectors, aggregates and trap (crates/lair/src/lower/arith.rs). OWNER: package L2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/lower/arith.fib: arithmetic, comparisons, casts, vectors, aggregates and trap (crates/lair/src/lower/arith.rs). OWNER: package L2.
 
 ;; Operands are lowered with `fx-val`, left to right, then the instruction is made, so the LLVM text has the Rust's order.
 
 (ns native.lower.arith
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.types native.lower.build)
+  (:require [llvm.core :as core]))
 
 
-;; (arith.rs `Fx::arith`)
+(defun bin-opcode :private (op: LBinOp) -> i32
+  (match op
+    ((BAdd) (opcode-add))
+    ((BSub) (opcode-sub))
+    ((BMul) (opcode-mul))
+    ((BSDiv) (opcode-sdiv))
+    ((BUDiv) (opcode-udiv))
+    ((BSRem) (opcode-srem))
+    ((BURem) (opcode-urem))
+    ((BFAdd) (opcode-fadd))
+    ((BFSub) (opcode-fsub))
+    ((BFMul) (opcode-fmul))
+    ((BFDiv) (opcode-fdiv))
+    ((BFRem) (opcode-frem))
+    ((BAnd) (opcode-and))
+    ((BOr) (opcode-or))
+    ((BXor) (opcode-xor))
+    ((BShl) (opcode-shl))
+    ((BLShr) (opcode-lshr))
+    ((BAShr) (opcode-ashr))))
+
+;; The saturating conversions are intrinsics, not casts: they map to `fptosi` here and are handled before this is asked.
+(defun cast-opcode :private (op: LCastOp) -> i32
+  (match op
+    ((CTrunc) (opcode-trunc))
+    ((CZExt) (opcode-zext))
+    ((CSExt) (opcode-sext))
+    ((CFpTrunc) (opcode-fptrunc))
+    ((CFpExt) (opcode-fpext))
+    ((CFpToSi) (opcode-fptosi))
+    ((CFpToUi) (opcode-fptoui))
+    ((CSiToFp) (opcode-sitofp))
+    ((CUiToFp) (opcode-uitofp))
+    ((CPtrToInt) (opcode-ptrtoint))
+    ((CIntToPtr) (opcode-inttoptr))
+    ((CBitcast) (opcode-bitcast))
+    ((CFpToSiSat) (opcode-fptosi))
+    ((CFpToUiSat) (opcode-fptoui))))
+
+(defun ovf-name :private (op: LOvfOp) -> str
+  (match op
+    ((OvSAdd) "llvm.sadd.with.overflow")
+    ((OvSSub) "llvm.ssub.with.overflow")
+    ((OvSMul) "llvm.smul.with.overflow")))
+
+;; `LLVMIntPredicate`: eq 32, ne 33, ugt 34, uge 35, ult 36, ule 37, sgt 38, sge 39, slt 40, sle 41.
+(defun ipred :private (p: LIPred) -> i32
+  (match p
+    ((IEq) 32i32)
+    ((INe) 33i32)
+    ((ISlt) 40i32)
+    ((ISle) 41i32)
+    ((ISgt) 38i32)
+    ((ISge) 39i32)
+    ((IUlt) 36i32)
+    ((IUle) 37i32)
+    ((IUgt) 34i32)
+    ((IUge) 35i32)))
+
+;; `LLVMRealPredicate`: oeq 1, ogt 2, oge 3, olt 4, ole 5, one 6, ord 7, uno 8, ueq 9, ugt 10, uge 11, ult 12, ule 13, une 14.
+(defun fpred :private (p: LFPred) -> i32
+  (match p
+    ((FOeq) 1i32)
+    ((FOne) 6i32)
+    ((FOlt) 4i32)
+    ((FOle) 5i32)
+    ((FOgt) 2i32)
+    ((FOge) 3i32)
+    ((FOrd) 7i32)
+    ((FUeq) 9i32)
+    ((FUne) 14i32)
+    ((FUlt) 12i32)
+    ((FUle) 13i32)
+    ((FUgt) 10i32)
+    ((FUge) 11i32)
+    ((FUno) 8i32)))
+
+;; The intrinsic NAME overloaded on `overloads`, called with `args`, in the function being lowered. (arith.rs `intrinsic`)
+(defun fx-intrinsic :private (fx: Fx name: str overloads: (Vec i64) args: (Vec i64)) -> i64
+  (b-intrinsic (. fx b) (. (. fx lx) ctx) (. (. fx lx) module) name overloads args))
+
+(defun type-of-value :private (v: i64) -> i64 (unsafe (core/LLVMTypeOf v)))
+
+;; The saturating conversion `fptosi.sat` / `fptoui.sat` to `t`.
+(defun lower-sat :private (fx: Fx signed: bool t: LType x: LExpr) -> (Result i64 LairError)
+  (try-let ((v (fx-val fx x)))
+    (Ok (fx-intrinsic fx (if signed "llvm.fptosi.sat" "llvm.fptoui.sat") [(lx-ty (. fx lx) t) (type-of-value v)] [v]))))
+
+(defun lower-cast :private (fx: Fx op: LCastOp t: LType x: LExpr) -> (Result i64 LairError)
+  (match op
+    ((CFpToSiSat) (lower-sat fx true t x))
+    ((CFpToUiSat) (lower-sat fx false t x))
+    (_ (try-let ((v (fx-val fx x)))
+         (Ok (b-cast (. fx b) (cast-opcode op) v (lx-ty (. fx lx) t)))))))
+
+(defun lower-un :private (fx: Fx op: LUnOp a: LExpr) -> (Result i64 LairError)
+  (try-let ((x (fx-val fx a)))
+    (match op
+      ((UFNeg) (Ok (b-fneg (. fx b) x)))
+      ((UCtpop) (Ok (fx-intrinsic fx "llvm.ctpop" [(type-of-value x)] [x]))))))
+
+;; `insertvalue` along a path of field indices, from position `k`. (arith.rs `insert_path`)
+(defun insert-path :private (fx: Fx agg: i64 x: i64 idx: (Vec LLit) k: i64) -> i64
+  (if (>= k (count idx))
+      x
+      (let ((i (. (nth idx k) lo))
+            (inner (b-extract-value (. fx b) agg i))
+            (inner2 (if (= (+ k 1) (count idx)) x (insert-path fx inner x idx (+ k 1)))))
+        (b-insert-value (. fx b) agg inner2 i))))
+
+;; The last extractvalue of a path. (arith.rs `ExtractValue`)
+(defun extract-path :private (fx: Fx v: i64 idx: (Vec LLit)) -> i64
+  (loop ((k 0) (acc v))
+    (if (>= k (count idx))
+        acc
+        (recur (+ k 1) (b-extract-value (. fx b) acc (. (nth idx k) lo))))))
+
+(defun lower-vector-aggregate :private (fx: Fx e: LExpr) -> (Result i64 LairError)
+  (match (. e kind)
+    ((KExtractElement v i)
+     (try-let ((v2 (fx-val fx v)) (i2 (fx-val fx i)))
+       (Ok (b-extract-element (. fx b) v2 i2))))
+    ((KInsertElement v x i)
+     (try-let ((v2 (fx-val fx v)) (x2 (fx-val fx x)) (i2 (fx-val fx i)))
+       (Ok (b-insert-element (. fx b) v2 x2 i2))))
+    ((KShuffle x y m)
+     (try-let ((x2 (fx-val fx x)) (y2 (fx-val fx y)) (m2 (fx-val fx m)))
+       (Ok (b-shuffle (. fx b) x2 y2 m2))))
+    ((KExtractValue a idx)
+     (try-let ((v (fx-val fx a)))
+       (Ok (extract-path fx v idx))))
+    ((KInsertValue a x idx)
+     (try-let ((a2 (fx-val fx a)) (x2 (fx-val fx x)))
+       (Ok (insert-path fx a2 x2 idx 0))))
+    (_ (Err (ErrInternal (str "unexpected form at " (pos-str (. e pos))))))))
+
+;; Every value-producing instruction that is not memory, a call or control flow. (arith.rs `Fx::arith`)
 (defun lower-arith (fx: Fx e: LExpr) -> (Result i64 LairError)
-  (trap "todo: native.lower.arith lower-arith"))
+  (match (. e kind)
+    ((KBin op x y)
+     (try-let ((a (fx-val fx x)) (b (fx-val fx y)))
+       (Ok (b-binop (. fx b) (bin-opcode op) a b))))
+    ((KUn op x) (lower-un fx op x))
+    ((KOverflow op x y)
+     (try-let ((a (fx-val fx x)) (b (fx-val fx y)))
+       (Ok (fx-intrinsic fx (ovf-name op) [(type-of-value a)] [a b]))))
+    ((KICmp p x y)
+     (try-let ((a (fx-val fx x)) (b (fx-val fx y)))
+       (Ok (b-icmp (. fx b) (ipred p) a b))))
+    ((KFCmp p x y)
+     (try-let ((a (fx-val fx x)) (b (fx-val fx y)))
+       (Ok (b-fcmp (. fx b) (fpred p) a b))))
+    ((KCast op t x) (lower-cast fx op t x))
+    ((KSelect c x y)
+     (try-let ((c2 (fx-val fx c)) (a (fx-val fx x)) (b (fx-val fx y)))
+       (Ok (b-select (. fx b) c2 a b))))
+    (_ (lower-vector-aggregate fx e))))
 
 ;; `llvm.trap` and its `unreachable`-free call. (arith.rs `trap`)
 (defun lower-trap (fx: Fx) -> (Result unit LairError)
-  (trap "todo: native.lower.arith lower-trap"))
+  (do (fx-intrinsic fx "llvm.trap" [] [])
+      (Ok ())))

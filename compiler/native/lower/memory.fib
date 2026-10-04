@@ -1,9 +1,100 @@
-;; compiler/native/lower/memory.fib: memory and atomic instructions (crates/lair/src/lower/memory.rs). OWNER: package L2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/lower/memory.fib: memory and atomic instructions (crates/lair/src/lower/memory.rs). OWNER: package L2.
 
 (ns native.lower.memory
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.types native.lower.calls native.lower.build)
+  (:require [llvm.core :as core] [llvm.target :as target]))
 
+
+(defun ordering-of :private (o: LOrdering) -> i32 (ordering-number (ordering-rank o)))
+
+;; `LLVMAtomicRMWBinOp`: xchg 0, add 1, sub 2, and 3, nand 4, or 5, xor 6, max 7, min 8, umax 9, umin 10, fadd 11, fsub 12, fmax 13, fmin 14.
+(defun rmw-number :private (op: LRmwOp) -> i32
+  (match op
+    ((RXchg) 0i32)
+    ((RAdd) 1i32)
+    ((RSub) 2i32)
+    ((RAnd) 3i32)
+    ((RNand) 4i32)
+    ((ROr) 5i32)
+    ((RXor) 6i32)
+    ((RMax) 7i32)
+    ((RMin) 8i32)
+    ((RUMax) 9i32)
+    ((RUMin) 10i32)
+    ((RFAdd) 11i32)
+    ((RFSub) 12i32)
+    ((RFMax) 13i32)
+    ((RFMin) 14i32)))
+
+(defun single-number :private (s: LScope) -> i32
+  (match s ((ScSingleThread) 1i32) ((ScSystem) 0i32)))
+
+;; `volatile` and `(align N)` on an access or an alloca; without `align` the builder's ABI alignment stands. (memory.rs `access_options`)
+(defun access-options :private (inst: i64 volatile: bool align: (Option i64)) -> unit
+  (do (if volatile (unsafe (core/LLVMSetVolatile inst 1i32)) ())
+      (match align
+        ((some a) (unsafe (core/LLVMSetAlignment inst (trunc i32 a))))
+        (nil ()))))
+
+(defun lower-alloca :private (fx: Fx ty: LType count: (Option LExpr) align: (Option i64)) -> (Result (Option i64) LairError)
+  (let ((lty (lx-ty (. fx lx) ty)))
+    (match count
+      (nil (let ((a (b-alloca (. fx b) lty)))
+             (do (access-options a false align) (Ok (some a)))))
+      ((some c) (try-let ((cv (fx-val fx c)))
+                  (let ((a (b-array-alloca (. fx b) lty cv)))
+                    (do (access-options a false align) (Ok (some a)))))))))
+
+(defun lower-gep :private (fx: Fx inbounds: bool ty: LType ptr: LExpr indices: (Vec LExpr)) -> (Result (Option i64) LairError)
+  (try-let ((p (fx-val fx ptr))
+            (idx (fx-vals fx indices)))
+    (Ok (some (b-gep (. fx b) inbounds (lx-ty (. fx lx) ty) p idx)))))
+
+;; Mark a plain load or store atomic, aligned to its type. (memory.rs `make_atomic`)
+(defun make-atomic :private (fx: Fx inst: i64 ty: i64 o: LOrdering s: LScope) -> unit
+  (unsafe
+    (do (core/LLVMSetOrdering inst (ordering-of o))
+        (core/LLVMSetAtomicSingleThread inst (single-number s))
+        (core/LLVMSetAlignment inst (target/LLVMABIAlignmentOfType (. (. fx lx) td) ty)))))
+
+(defun lower-cmpxchg :private (fx: Fx weak: bool scope: LScope success: LOrdering failure: LOrdering ptr: LExpr expected: LExpr new: LExpr) -> (Result (Option i64) LairError)
+  (try-let ((p (fx-val fx ptr)) (x (fx-val fx expected)) (y (fx-val fx new)))
+    (unsafe
+      (let ((v (core/LLVMBuildAtomicCmpXchg (. fx b) p x y (ordering-of success) (ordering-of failure) (single-number scope))))
+        (do (core/LLVMSetWeak v (if weak 1i32 0i32))
+            (Ok (some v)))))))
+
+(defun lower-atomic :private (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
+  (match (. e kind)
+    ((KAtomicLoad s o t p)
+     (try-let ((pv (fx-val fx p)))
+       (let ((ty (lx-ty (. fx lx) t))
+             (v (b-load (. fx b) ty pv)))
+         (do (make-atomic fx v ty o s) (Ok (some v))))))
+    ((KAtomicStore s o v p)
+     (try-let ((vv (fx-val fx v)) (pv (fx-val fx p)))
+       (let ((st (b-store (. fx b) vv pv)))
+         (do (make-atomic fx st (unsafe (core/LLVMTypeOf vv)) o s) (Ok nil)))))
+    ((KAtomicRmw op s o p v)
+     (try-let ((pv (fx-val fx p)) (vv (fx-val fx v)))
+       (Ok (some (unsafe (core/LLVMBuildAtomicRMW (. fx b) (rmw-number op) pv vv (ordering-of o) (single-number s)))))))
+    ((KCmpXchg weak scope success failure ptr expected new)
+     (lower-cmpxchg fx weak scope success failure ptr expected new))
+    ((KFence s o)
+     (do (b-fence (. fx b) (ordering-of o) (single-number s)) (Ok nil)))
+    (_ (Err (ErrInternal (str "unexpected form at " (pos-str (. e pos))))))))
 
 ;; `alloca load store getelementptr` and the atomics. (memory.rs `Fx::memory`)
 (defun lower-memory (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
-  (trap "todo: native.lower.memory lower-memory"))
+  (match (. e kind)
+    ((KAlloca ty count align) (lower-alloca fx ty count align))
+    ((KLoad ty ptr volatile align)
+     (try-let ((p (fx-val fx ptr)))
+       (let ((l (b-load (. fx b) (lx-ty (. fx lx) ty) p)))
+         (do (access-options l volatile align) (Ok (some l))))))
+    ((KStore value ptr volatile align)
+     (try-let ((v (fx-val fx value)) (p (fx-val fx ptr)))
+       (let ((st (b-store (. fx b) v p)))
+         (do (access-options st volatile align) (Ok nil)))))
+    ((KGep inbounds ty ptr indices) (lower-gep fx inbounds ty ptr indices))
+    (_ (lower-atomic fx e))))
