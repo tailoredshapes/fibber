@@ -4,7 +4,7 @@
 ;; audit:  clean
 ;; stage:  2
 ;; roots:  ../../lib support
-;; covers: map filter sum vec
+;; covers: map filter sum vec reduce
 ;; The let rule folds a binding into the call that reads it only when every other argument of that call is
 ;; a symbol, a literal or a `fn`: the binding's own evaluation then moves past nothing that has an effect.
 ;; A binding whose reader has an argument with an effect (here the `fm` and `fp` calls, which log when
@@ -16,6 +16,7 @@
 
 (defun fm (log: (Cell (Vec i64)) n: i64) -> (fn (i64) i64) (do (note log n) (fn (x) (* x 2))))
 (defun fp (log: (Cell (Vec i64)) n: i64) -> (fn (i64) bool) (do (note log n) (fn (x) (> x 2))))
+(defun fr (log: (Cell (Vec i64)) n: i64) -> (fn (i64 i64) i64) (do (note log n) (fn (a x) (+ a x))))
 (defun src (log: (Cell (Vec i64)) n: i64) -> (Vec i64) (do (note log n) [1 2 3 4]))
 
 (defun main () -> i64
@@ -31,6 +32,13 @@
               (f (filter (fp log 3) m)))
           (check c (= (vec f) [4 6 8])))
         (check c (= @log [1 2 3]))
+        (set! log (vec-empty))
+        ;; a terminal whose function argument has an effect: the source is evaluated first, as bound
+        (set! log (vec-empty))
+        (let ((s (src log 1))
+              (a (reduce (fr log 2) 0 s)))
+          (check c (= a 10)))
+        (check c (= @log [1 2]))
         (set! log (vec-empty))
         ;; the argument of the reader is atomic: the binding is folded, and runs once, as before
         (let ((p (fn (x: i64) (> x 2)))
