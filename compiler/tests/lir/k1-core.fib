@@ -1,0 +1,203 @@
+;; compiler/tests/lir/k1-core.fib: package K1, the checker core: lir.check.{walk,cfg,env,fcx,func,globals}. SOURCE: the Rust of crates/lir/src/check/ (the
+;; message text of each case is the Rust's) and the `diamond_and_loop` test of cfg.rs. Hand-built ASTs; the fcx cases use fake dispatchers, so no rule of K2 runs.
+;; Build: fibc build compiler/tests/lir/k1-core.fib -I compiler -I lib -o OUT
+(ns main (:use types.check lir.diag lir.types lir.lit lir.ast lir.check.env lir.check.cfg lir.check.walk lir.check.fcx lir.check.func lir.check.globals))
+
+(defun at (k: LKind) -> LExpr (expr-new k (pos-new 1 1)))
+(defun atp (l: i64 c: i64 k: LKind) -> LExpr (expr-new k (pos-new l c)))
+(defun local (n: str) -> LExpr (at (KLocal n)))
+(defun i32 (n: i64) -> LExpr (at (KInt ty-i32 (lit-of n))))
+(defun blk (label: str body: (Vec LExpr)) -> LBlock (LBlock label body (pos-new 2 1)))
+(defun fty (ret: (Option LType) params: (Vec LType)) -> LFnType (LFnType CcC ret params false))
+(defun mods () -> LModifiers (LModifiers lk-external false))
+(defun fn-of (name: str ps: (Vec LParam) pts: (Vec LType) blocks: (Vec LBlock)) -> LFunction
+  (LFunction name (fty nil pts) ps blocks (mods) (pos-new 1 1)))
+(defun ret-void () -> LExpr (at (KRet nil)))
+(defun br (l: str) -> LExpr (at (KBr l)))
+(defun cbr (a: str b: str) -> LExpr (at (KCondBr (i32 1) a b)))
+
+;; "ok" or "L:C message" of a result
+(defun show (r: (Result unit Diagnostic)) -> str
+  (match r ((Ok _) "ok") ((Err d) (str (pos-str (. d pos)) " " (. d message)))))
+(defun show-ty (r: (Result LType Diagnostic)) -> str
+  (match r ((Ok t) (type-str t)) ((Err d) (str (pos-str (. d pos)) " " (. d message)))))
+(defun show-env (r: (Result LEnv (Vec Diagnostic))) -> str
+  (match r
+    ((Ok _) "ok")
+    ((Err ds) (str-join-with "; " (vec (map (fn (d) (str (pos-str (. d pos)) " " (. d message))) ds))))))
+(defun show-bind (r: (Result Bindings Diagnostic)) -> str
+  (match r ((Ok b) (str "ok " (count (. b defs)) " " (count (. b allocas)))) ((Err d) (str (pos-str (. d pos)) " " (. d message)))))
+
+(defun item-def (f: LFunction) -> LItem (ItDefine f))
+(defun st (name: str fields: (Vec LType) l: i64) -> LItem (ItStruct (LStructDef name fields (pos-new l 1))))
+(defun gl (name: str ty: LType init: LExpr l: i64) -> LItem (ItGlobal (LGlobalDef name ty init false (mods) (pos-new l 1))))
+(defun dcl (name: str l: i64) -> LItem (ItDeclare (LDeclare name (fty nil []) false (pos-new l 1))))
+
+(defun the-env (items: (Vec LItem)) -> LEnv
+  (match (env-build (LModule items)) ((Ok e) e) ((Err _) (trap "the-env: the module does not build"))))
+
+;; fake dispatchers for the fcx cases: an int literal has its type, a local is looked up, a trap is void, a store is void
+(defun fake-ty (fcx: Fcx e: LExpr) -> (Result (Option LType) Diagnostic)
+  (match (. e kind)
+    ((KInt t _) (Ok (some t)))
+    ((KLocal n) (try-let ((t (fcx-lookup fcx n (. e pos)))) (Ok (some t))))
+    ((KTrap) (Ok nil))
+    (_ (err (. e pos) "fake-ty: unexpected form"))))
+(defun fake-term (fcx: Fcx e: LExpr) -> (Result unit Diagnostic)
+  (match (. e kind)
+    ((KRet (some v)) (try-let ((_ (fcx-val fcx v))) (Ok ())))
+    (_ (Ok ()))))
+
+(defun let1 (name: str v: LExpr body: (Vec LExpr)) -> LExpr
+  (atp 2 5 (KLet [(LBinding name v (pos-new 2 8))] body)))
+
+(defun fcx-for (f: LFunction) -> Fcx
+  (let ((env (the-env [(item-def f)]))
+        (labels (match (func-labels f) ((Ok m) m) ((Err _) (trap "labels"))))
+        (succs (match (func-successors f labels) ((Ok s) s) ((Err _) (trap "successors"))))
+        (b (match (bindings f) ((Ok b) b) ((Err _) (trap "bindings")))))
+    (fcx-new env f (cfg-new succs) labels b fake-ty fake-term)))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      ;; ------------------------------------------------------------ cfg (the Rust test `diamond_and_loop`)
+      (let ((g (cfg-new [[1 2] [3] [3] [3 4] [] [4]])))
+        (do
+          (check cs "cfg: 0 dominates 3, 1 does not, 3 dominates 4"
+                 (and (cfg-dominates? g 0 3) (not (cfg-dominates? g 1 3)) (cfg-dominates? g 3 4)))
+          (check cs "cfg: block 5 is unreachable; availability: a reachable def serves an unreachable user, not the reverse"
+                 (and (not (cfg-reachable? g 5)) (cfg-available? g 0 5) (not (cfg-available? g 5 4))))
+          (check cs "cfg: preds of 3 are 1, 2, 3 and the rpo starts at the entry"
+                 (and (= (nth (. g preds) 3) [1 2 3]) (= (nth (. g rpo) 0) 0) (= (count (. g rpo)) 5)))
+          (check cs "cfg: idoms are 0 0 0 0 3 and -1 for the unreachable block"
+                 (= (. g idom) [0 0 0 0 3 -1]))))
+      (check cs "cfg: a repeated successor makes one predecessor entry"
+             (= (nth (. (cfg-new [[1 1] []]) preds) 1) [0]))
+      ;; ------------------------------------------------------------ walk
+      (check cs "children: a binary form is a then b; a gep is the pointer then the indices"
+             (and (= (count (children (at (KBin BAdd (local "a") (local "b"))))) 2)
+                  (local-is? (nth (children (at (KGep true ty-i32 (local "p") [(i32 0) (i32 1)]))) 0) "p")
+                  (= (count (children (at (KGep true ty-i32 (local "p") [(i32 0) (i32 1)])))) 3)))
+      (check cs "children: an indirect call is the callee pointer then the arguments; a direct call only its arguments"
+             (and (local-is? (nth (children (at (KCall (CalIndirect (local "p") (fty nil [])) [(i32 1)] false))) 0) "p")
+                  (= (count (children (at (KCall (CalIndirect (local "p") (fty nil [])) [(i32 1)] false)))) 2)
+                  (= (count (children (at (KCall (CalDirect "f") [(i32 1)] false)))) 1)))
+      (check cs "children: a switch is the value then the case values; a let is the binding values then the body; ret of nothing has none"
+             (and (= (count (children (at (KSwitch (local "v") "d" [(LCase (i32 1) "a") (LCase (i32 2) "b")])))) 3)
+                  (= (count (children (let1 "x" (i32 1) [(local "x") (ret-void)]))) 3)
+                  (= (count (children (ret-void))) 0)
+                  (= (count (children (at (KAlloca ty-i32 nil nil)))) 0)
+                  (= (count (children (at (KAlloca ty-i32 (some (i32 2)) nil)))) 1)))
+      (check cs "statements: a let contributes its body, nested lets recursively, in order"
+             (let ((s (statements [(let1 "x" (i32 1) [(let1 "y" (i32 2) [(local "y")]) (ret-void)]) (br "a")])))
+               (and (= (count s) 3) (local-is? (nth s 0) "y") (br-is? (nth s 2) "a"))))
+      (let ((f (fn-of "f" [(LParam "a" (pos-new 1 5))] [ty-i32] [(blk "entry" [(let1 "x" (at (KAlloca ty-i32 nil nil)) [(let1 "y" (at (KAlloca ty-i32 (some (i32 2)) nil)) [(ret-void)])])])])))
+        (check cs "bindings: a parameter, a let and a nested let; only the countless alloca is recorded"
+               (= (show-bind (bindings f)) "ok 3 1")))
+      (let ((f (fn-of "f" [(LParam "a" (pos-new 1 5))] [ty-i32] [(blk "entry" [(let1 "a" (i32 1) [(ret-void)])])])))
+        (check cs "bindings: a name bound twice is `duplicate name a in @f` at the second binding"
+               (= (show-bind (bindings f)) "2:8 duplicate name a in @f")))
+      (check cs "constant?: literals, globals, zeroinitializer, strings, structs and arrays of constants; not a local or a bin"
+             (and (constant? (i32 1)) (constant? (at (KGlobal "g"))) (constant? (at (KZero ty-i32))) (constant? (at kind-null))
+                  (constant? (at (KStruct nil [(i32 1) (at (KGlobal "g"))])))
+                  (not (constant? (at (KStruct nil [(i32 1) (local "x")]))))
+                  (not (constant? (local "x"))) (not (constant? (at (KBin BAdd (i32 1) (i32 2)))))
+                  (not (constant? (at (KArray (TArray 1 ty-i32) [(local "x")]))))))
+      (check cs "emits?: a local, a literal, a let and a phi do not; a bin, a call and a struct holding a non-constant do"
+             (and (not (emits? (local "x"))) (not (emits? (i32 1))) (not (emits? (at (KPhi ty-i32 []))))
+                  (not (emits? (let1 "x" (i32 1) [(local "x")])))
+                  (not (emits? (at (KStruct nil [(i32 1)]))))
+                  (emits? (at (KStruct nil [(local "x")])))
+                  (emits? (at (KBin BAdd (i32 1) (i32 2)))) (emits? (at (KCall (CalDirect "f") [] false)))))
+      ;; ------------------------------------------------------------ env
+      (check cs "env: a struct defined twice is `duplicate struct %struct.s` at the second"
+             (= (show-env (env-build (LModule [(st "s" [ty-i32] 1) (st "s" [ty-i32] 2)]))) "2:1 duplicate struct %struct.s"))
+      (check cs "env: llvm. names are reserved; a name defined twice is `duplicate definition of @f`"
+             (= (show-env (env-build (LModule [(dcl "llvm.x" 1) (dcl "f" 2) (dcl "f" 3)])))
+                "1:1 name @llvm.x is reserved; 3:1 duplicate definition of @f"))
+      (check cs "env: an undefined struct in a field or a global is reported in item order"
+             (= (show-env (env-build (LModule [(st "s" [(TNamed "t")] 1) (gl "g" (TArray 2 (TNamed "u")) (at (KZero ty-i32)) 2)])))
+                "1:1 undefined struct %struct.t; 2:1 undefined struct %struct.u"))
+      (check cs "env: a struct that holds itself by value, through an array and another struct, is an error; through a pointer it is not"
+             (and (= (show-env (env-build (LModule [(st "a" [(TArray 2 (TNamed "b"))] 1) (st "b" [(TNamed "a")] 2)])))
+                     "1:1 struct %struct.a contains itself by value; 2:1 struct %struct.b contains itself by value")
+                  (= (show-env (env-build (LModule [(st "a" [ty-ptr (TNamed "a")] 1)]))) "1:1 struct %struct.a contains itself by value")
+                  (= (show-env (env-build (LModule [(st "a" [ty-ptr] 1)]))) "ok")))
+      (let ((env (the-env [(st "s" [ty-i32 ty-ptr] 1) (dcl "f" 2) (gl "g" ty-i32 (i32 0) 3)])))
+        (check cs "env: fields of a named and an anonymous struct, nil otherwise; function lookup messages"
+               (and (= (env-fields env (TNamed "s")) (some [ty-i32 ty-ptr]))
+                    (= (env-fields env (TAnon [ty-i8])) (some [ty-i8]))
+                    (= (env-fields env ty-i32) nil)
+                    (= (show-fn (env-function env "f" (pos-new 5 5))) "ok")
+                    (= (show-fn (env-function env "g" (pos-new 5 5))) "5:5 @g is not a function")
+                    (= (show-fn (env-function env "h" (pos-new 5 5))) "5:5 undefined function @h"))))
+      ;; ------------------------------------------------------------ globals
+      (let ((env (the-env [(st "s" [ty-i32 ty-ptr] 1)])))
+        (do
+          (check cs "globals: the initialiser must be constant, and of the global's type"
+                 (and (= (show (check-global env (LGlobalDef "g" ty-i32 (local "x") false (mods) (pos-new 1 1)))) "1:1 initializer of @g must be a constant")
+                      (= (show (check-global env (LGlobalDef "g" ty-i64 (i32 1) false (mods) (pos-new 1 1)))) "1:1 initializer of @g has type i32, expected i64")
+                      (= (show (check-global env (LGlobalDef "g" ty-i32 (i32 1) false (mods) (pos-new 1 1)))) "ok")))
+          (check cs "globals: struct literals are checked field by field with the Rust's message"
+                 (and (= (show-ty (const-type env (at (KStruct (some "s") [(i32 1)])))) "1:1 %struct.s literal: 2 fields expected, found 1")
+                      (= (show-ty (const-type env (at (KStruct (some "s") [(i32 1) (i32 2)])))) "1:1 %struct.s literal: field 2 has type i32, expected ptr")
+                      (= (show-ty (const-type env (at (KStruct (some "s") [(i32 1) (at kind-null)])))) "%struct.s")
+                      (= (show-ty (const-type env (at (KStruct nil [(i32 1) (at kind-null)])))) "{ i32, ptr }")))
+          (check cs "globals: arrays, undefined globals and non-constants"
+                 (and (= (show-ty (const-type env (at (KArray (TArray 2 ty-i32) [(i32 1) (at kind-null)])))) "1:1 [2 x i32] literal: element 2 has type ptr, expected i32")
+                      (= (show-ty (const-type env (at (KGlobal "nope")))) "1:1 undefined global @nope")
+                      (= (show-ty (const-type env (local "x"))) "1:1 not a constant")))))
+      ;; ------------------------------------------------------------ func
+      (check cs "func: a function without blocks, a duplicate label"
+             (and (= (show (check-function (the-env []) (fn-of "f" [] [] []))) "1:1 function @f has no blocks")
+                  (= (show (check-function (the-env []) (fn-of "f" [] [] [(blk "a" [(ret-void)]) (blk "a" [(ret-void)])]))) "2:1 duplicate block label a")))
+      (check cs "func: a block must end in a terminator, and hold one only at the end"
+             (and (= (show (check-function (the-env []) (fn-of "f" [] [] [(blk "a" [])]))) "2:1 block a does not end in a terminator")
+                  (= (show (check-function (the-env []) (fn-of "f" [] [] [(blk "a" [(i32 1)])]))) "2:1 block a does not end in a terminator")
+                  (= (show (check-function (the-env []) (fn-of "f" [] [] [(blk "a" [(atp 3 4 (KBr "a")) (ret-void)])]))) "3:4 terminator in the middle of block a")))
+      (check cs "func: an undefined label and a branch to the entry"
+             (and (= (show (check-function (the-env []) (fn-of "f" [] [] [(blk "a" [(atp 3 4 (KBr "z"))])]))) "3:4 undefined block z")
+                  (= (show (check-function (the-env []) (fn-of "f" [] [] [(blk "a" [(br "b")]) (blk "b" [(atp 4 2 (KBr "a"))])]))) "4:2 branch to the entry block a")))
+      (check cs "func: block-order is the reverse postorder of the reachable blocks, then the unreachable in source order"
+             (let ((f (fn-of "f" [] [] [(blk "a" [(cbr "b" "c")]) (blk "dead" [(ret-void)]) (blk "b" [(br "d")]) (blk "c" [(br "d")]) (blk "d" [(ret-void)]) (blk "dead2" [(br "d")])])))
+               (match (block-order f)
+                 ((Ok o) (and (= (count o) 6) (= (nth o 0) 0) (= (nth o 4) 1) (= (nth o 5) 5)
+                              (includes? 2 [(nth o 1) (nth o 2)]) (= (nth o 3) 4)))
+                 ((Err _) false))))
+      ;; ------------------------------------------------------------ fcx (fake dispatchers)
+      (let ((f (fn-of "f" [(LParam "a" (pos-new 1 5))] [ty-i32] [(blk "entry" [(let1 "x" (i32 7) [(local "x") (local "a") (at (KRet (some (local "x"))))])])])))
+        (let ((fcx (fcx-for f)))
+          (do
+            (check cs "fcx: a parameter has its type at once; a let name before its binding, and an unknown name, are the Rust's errors"
+                   (and (= (show-ty (fcx-lookup fcx "a" (pos-new 3 3))) "i32")
+                        (= (show-ty (fcx-lookup fcx "x" (pos-new 3 3))) "3:3 x is used before its binding in block entry")
+                        (= (show-ty (fcx-lookup fcx "q" (pos-new 3 3))) "3:3 undefined name q")))
+            (check cs "fcx: after the block, the let name is typed"
+                   (and (= (show (fcx-block fcx 0)) "ok") (= (show-ty (fcx-lookup fcx "x" (pos-new 3 3))) "i32")))
+            (check cs "fcx: fcx-val rejects a terminator and a void value; same compares types"
+                   (and (= (show-ty (fcx-val fcx (ret-void))) "1:1 terminator used as a value")
+                        (= (show-ty (fcx-val fcx (at kind-trap))) "1:1 void value used as an operand")
+                        (= (show (fcx-same fcx "add" 2 ty-i32 ty-i64 (pos-new 4 4))) "4:4 add: operand 2 has type i32, expected i64")
+                        (= (show (fcx-same fcx "add" 2 ty-i32 ty-i32 (pos-new 4 4))) "ok"))))))
+      (let ((f (fn-of "f" [] [] [(blk "entry" [(let1 "x" (at kind-trap) [(ret-void)])])])))
+        (check cs "fcx: a void value bound by a let is `void value bound to x` at the binding"
+               (= (show (fcx-block (fcx-for f) 0)) "2:8 void value bound to x")))
+      (let ((f (fn-of "f" [] [] [(blk "entry" [(let1 "x" (ret-void) [(ret-void)])])])))
+        (check cs "fcx: a terminator bound by a let is `terminator used as a value`"
+               (= (show (fcx-block (fcx-for f) 0)) "1:1 terminator used as a value")))
+      (let ((f (fn-of "f" [] [] [(blk "entry" [(cbr "a" "b")]) (blk "a" [(let1 "x" (i32 1) [(br "c")])]) (blk "b" [(br "c")]) (blk "c" [(local "x") (ret-void)])])))
+        (let ((fcx (fcx-for f)))
+          (do (check cs "fcx: a block that is not dominated by the binding block says `does not dominate its use in block c`"
+                     (and (= (show (fcx-block fcx 1)) "ok")
+                          (= (show (fcx-block fcx 3)) "1:1 x does not dominate its use in block c")))
+              (check cs "fcx: at the end of block a the name is available, at the end of b it is not"
+                     (and (= (show-ty (fcx-lookup-at-end fcx "x" 1 (pos-new 9 9))) "i32")
+                          (= (show-ty (fcx-lookup-at-end fcx "x" 2 (pos-new 9 9))) "9:9 x does not dominate the end of block b"))))))
+      (finish cs))))
+
+(defun show-fn (r: (Result LFnType Diagnostic)) -> str
+  (match r ((Ok _) "ok") ((Err d) (str (pos-str (. d pos)) " " (. d message)))))
+
+(defun local-is? (e: LExpr n: str) -> bool (match (. e kind) ((KLocal m) (= m n)) (_ false)))
+(defun br-is? (e: LExpr n: str) -> bool (match (. e kind) ((KBr m) (= m n)) (_ false)))
