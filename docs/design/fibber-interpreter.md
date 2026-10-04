@@ -1,3 +1,5 @@
+> SUPERSEDED on 2026-10-04 by docs/design/dev-loop.md (the interpreter is a development tool, not a rule 6 oracle).
+
 # A fibber interpreter (`fibi`): design
 
 Status: design only (INT0, 2026-10-04). No compiler code is written or committed by this package. Everything under

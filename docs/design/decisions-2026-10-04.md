@@ -30,3 +30,10 @@ quickly as possible." This supersedes the interpreter decisions above where they
 requirement and script, the divergence table, `fibi compare`, the compare gate stage, mutants of the comparison, the audit-fidelity
 goal. The interpreter may reuse anything (front end, expander, even the JIT), and is judged by speed to first result: start-up
 time, a REPL, `run` without an LLVM compile, readable errors and traces, completion for the IDE. It needs a new design pass.
+
+## Dev loop (docs/design/dev-loop.md §6), decided by the lead under the owner's delegation
+
+1. Yes: `fibc run -O 0` uses FastISel; `-O 1` is for long computations; `build` unchanged. 2. Yes: opt-in `fibc serve`, client falls
+back in-process. 3. Yes: the JSON diagnostics schema of §4.1 with a stable `code` per error kind. 4. Yes: session values are borrowed
+by later inputs, consumed only by explicit `take!` or `clone`. 5. Yes: `fibber-interpreter.md` is superseded; no `fibi`, no
+`compare`; the interpreter decisions D1 to D9 above are void.
