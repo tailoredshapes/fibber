@@ -22,3 +22,11 @@ about 5 of the 51 task cases need preemption. D5 `extern` refused except the whi
 D6 a separate program `fibi`, renamed `fibref` when the Rust is retired. D7 strings and arrays from the spec; the host only at the
 boundary. D8 quick sample in the default gate, full run in `--full`. D9 the `;; stage: 2` labels come off in a separate reviewed
 change once P6 is green. Risks R1 to R7 stand as written; P0's census sizes R1 (speed) first.
+
+## Amendment, later on 2026-10-04: the interpreter is a development tool
+
+The owner: "Rule 6 can suck it. We're past that. The interpreter is a development tool. It helps agents and meat developers as
+quickly as possible." This supersedes the interpreter decisions above where they serve rule 6. Dropped: the independence
+requirement and script, the divergence table, `fibi compare`, the compare gate stage, mutants of the comparison, the audit-fidelity
+goal. The interpreter may reuse anything (front end, expander, even the JIT), and is judged by speed to first result: start-up
+time, a REPL, `run` without an LLVM compile, readable errors and traces, completion for the IDE. It needs a new design pass.
