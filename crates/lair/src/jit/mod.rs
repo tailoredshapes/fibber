@@ -8,19 +8,22 @@ use std::ffi::CStr;
 use std::ptr;
 
 use llvm_sys::orc2::lljit::{
-    LLVMOrcCreateLLJIT, LLVMOrcDisposeLLJIT, LLVMOrcLLJITAddLLVMIRModule,
+    LLVMOrcCreateLLJIT, LLVMOrcCreateLLJITBuilder, LLVMOrcDisposeLLJIT,
+    LLVMOrcLLJITAddLLVMIRModule, LLVMOrcLLJITBuilderSetJITTargetMachineBuilder,
     LLVMOrcLLJITGetDataLayoutStr, LLVMOrcLLJITGetGlobalPrefix, LLVMOrcLLJITGetMainJITDylib,
     LLVMOrcLLJITGetTripleString, LLVMOrcLLJITLookup, LLVMOrcLLJITRef,
 };
 use llvm_sys::orc2::{
     LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess, LLVMOrcCreateNewThreadSafeModule,
-    LLVMOrcDisposeThreadSafeContext, LLVMOrcJITDylibAddGenerator, LLVMOrcThreadSafeContextRef,
+    LLVMOrcDisposeThreadSafeContext, LLVMOrcJITDylibAddGenerator,
+    LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine, LLVMOrcThreadSafeContextRef,
 };
 use llvm_sys::prelude::LLVMContextRef;
 use llvm_sys::support::{LLVMLoadLibraryPermanently, LLVMSearchForAddressOfSymbol};
 
 use crate::error::{Error, Result};
 use crate::llvm::passes::{error_message, optimize};
+use crate::llvm::target::Machine;
 use crate::llvm::{cstr, target};
 use crate::lower::lower;
 use lir::ast::Module;
@@ -56,10 +59,12 @@ impl Jit {
     pub fn new(opts: JitOptions) -> Result<Jit> {
         target::init();
         let mut jit = ptr::null_mut();
-        // SAFETY: a default LLJIT; its strings are copied before use and
-        // the generator is owned by the JITDylib once added.
+        let builder = Self::builder(opts)?;
+        // SAFETY: an LLJIT from the builder (which it consumes); its strings
+        // are copied before use and the generator is owned by the JITDylib
+        // once added.
         unsafe {
-            if let Some(m) = error_message(LLVMOrcCreateLLJIT(&mut jit, ptr::null_mut())) {
+            if let Some(m) = error_message(LLVMOrcCreateLLJIT(&mut jit, builder)) {
                 return Err(Error::Jit(m));
             }
             let jd = LLVMOrcLLJITGetMainJITDylib(jit);
@@ -89,6 +94,29 @@ impl Jit {
                 opts,
                 names: Names::default(),
             })
+        }
+    }
+
+    /// The LLJIT builder for `opts`: null (LLVM's defaults, whose code
+    /// generator runs at its default level) except at optimisation level 0,
+    /// where the code generator runs at level None (FastISel, no DAG
+    /// scheduling), so that a module is compiled fast: this is the path of
+    /// `run`, of the macro runner and of the `def` evaluator, which compile
+    /// large modules of which little runs.
+    fn builder(opts: JitOptions) -> Result<llvm_sys::orc2::lljit::LLVMOrcLLJITBuilderRef> {
+        if opts.opt_level != 0 {
+            return Ok(ptr::null_mut());
+        }
+        let machine = Machine::host(0)?;
+        // SAFETY: the JITTargetMachineBuilder takes the target machine, so
+        // `machine` must not dispose it; the LLJIT builder takes the
+        // JITTargetMachineBuilder, and `LLVMOrcCreateLLJIT` the builder.
+        unsafe {
+            let machine = std::mem::ManuallyDrop::new(machine);
+            let jtmb = LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(machine.tm);
+            let builder = LLVMOrcCreateLLJITBuilder();
+            LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(builder, jtmb);
+            Ok(builder)
         }
     }
 
