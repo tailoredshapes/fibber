@@ -1,0 +1,21 @@
+;; spec:   types §6.6 (taking the content, write-back)
+;; expect: accept
+;; result: 55
+;; audit:  clean
+;; allocs: <= 1
+;; `acc` forwards `&t` in a loop and reads the cell between the calls: every round takes the content out of the private cell
+;; and the write-back puts the callee's result back before the next read, so `@t` sees what the last round wrote (never the
+;; stale slot of a taken call), and the one array is updated in place eleven times.
+(defun add-at (&a: (Array i64) i: i64) -> unit
+  (array-set! &a i (+ (array-get @a i) i)))
+
+(defun acc (&t: (Array i64) n: i64) -> i64
+  (loop [i 0 s 0]
+    (if (< i n)
+        (do (add-at &t i)
+            (recur (+ i 1) (+ s (array-get @t i))))
+        s)))
+
+(defun main () -> i64
+  (let ((c (cell (array 11 0))))
+    (acc &c 11)))

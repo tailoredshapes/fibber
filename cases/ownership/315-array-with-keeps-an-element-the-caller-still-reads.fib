@@ -1,0 +1,19 @@
+;; spec:   types §2.13.2 (a derived element read keeps its array out of its last use), §6.3 (Element reads)
+;; expect: accept
+;; result: 13
+;; audit:  clean
+;; `e` is bound to an element of `a`, and `e` is read after the `array-with` that replaces that slot: a read of `e` is a read of `a`, so
+;; the `array-with` is not the last use of `a`, `a` is retained, the call copies, and the old element survives in `a` (and `e`). Written
+;; in place, the old box would be released by the slot replacement and `e` would read freed memory; `(fresh)` allocates a box of the same
+;; size afterwards so that the allocator reuses the freed one, and `e` would then read 99 instead of 4. (The slots hold two different
+;; boxes: with one box in both, the second slot would keep it alive and the case could not tell.)
+(defstruct Box (n: i64))
+
+(defun fresh () -> Box (Box 99))
+
+(defun main () -> i64
+  (let ((a (array-with (array 2 (Box 0)) 0 (Box 4))))
+    (let ((e (array-get a 0)))
+      (let ((b (array-with a 0 (Box 7))))
+        (let ((f (fresh)))
+          (+ (. e n) (. (array-get b 0) n) (- (. f n) 99) 2))))))

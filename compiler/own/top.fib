@@ -100,6 +100,14 @@
              (fn-literals (. def body) []))
      snd))
 
+;; The object parameters of the `defun`s `fs` that are declared `:owned` (types §6.4, "Declared owned"): owned from the start of
+;; the fixpoint, for the reason `declared`.
+(defun declared-owned :private (p: TypedProgram fs: (Vec i64)) -> (Vec i64)
+  (vec (mapcat (fn (f: i64)
+                 (vec (keep (fn (d: ParamDecl) (if (and (. d owned) (not (. d amp)) (object-binding? p (. d binding))) (some (. d binding)) nil))
+                            (. (g-fun (. p globals) f) params))))
+               fs)))
+
 ;; Rust: top.rs:130 `scc_unit`: an SCC of `defun`s, and the all-owned bodies of those whose value
 ;; is taken (§8.4).
 (defun scc-unit :private (p: TypedProgram t: TopState fs: (Vec i64)) -> TopState
@@ -108,7 +116,7 @@
         members (reduce (fn (m: (Map i64 (Vec i64)) f: i64) (assoc m f (param-bindings (g-fun g f))))
                         (map-empty) fs)
         done (decide p (. (. t prog) summaries) (. (. t prog) bodies) (scc-bodies p fs false)
-                     (facts-new members (into (set-empty) bindings) []))
+                     (facts-new members (into (set-empty) bindings) (declared-owned p fs)))
         o1 (reduce (fn (o: OwnedProgram f: i64)
                      (with o (summaries (assoc (. o summaries) f (facts-summary (. done facts) p f)))))
                    (observe (. t prog) done) fs)

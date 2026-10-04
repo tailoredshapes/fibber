@@ -1,0 +1,20 @@
+;; spec:   types §6.6 (taking the content, write-back)
+;; expect: accept
+;; result: 1517
+;; audit:  clean
+;; `grow` replaces the whole content of its private cell (`set!`) and then pushes onto it, so what the caller's cell must hold after the
+;; call is a different array from the one the call took. `outer` forwards `&p` to it at a non-tail call and reads the cell afterwards:
+;; the write-back of the taken `&p` has to store the callee's final content (the new array: 5 + 5 + 7 = 17) into `outer`'s cell and
+;; must not release the content the call took (already released by the callee's `set!`). Without the write-back `outer`'s cell would
+;; still name the released array (a use after a free, which the audit reports) and the sum would not be 17.
+(defun grow (&a: (Array i64)) -> unit
+  (do (set! a (array 2 5))
+      (array-push! &a 7)))
+
+(defun outer (&p: (Array i64)) -> i64
+  (do (grow &p)
+      (loop [i 0 s 0] (if (< i (array-len @p)) (recur (+ i 1) (+ s (array-get @p i))) s))))
+
+(defun main () -> i64
+  (let ((c (cell (array 4 1))))
+    (+ 1500 (outer &c))))

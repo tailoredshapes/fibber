@@ -25,7 +25,7 @@
 
 ;; Rust `RawParam` and `DefunParts` (lower/top.rs:26, :79): a defun's
 ;; parameters, bounds, return annotation and body forms, not yet lowered.
-(defstruct RawParam (name: str amp: bool ann: (Option Stx) borrow: bool pos: Pos))
+(defstruct RawParam (name: str amp: bool ann: (Option Stx) borrow: bool owned: bool pos: Pos))
 (defstruct DefunParts
   (params: (Vec RawParam) bounds: (Option Stx) ret: (Option Stx) body: (Vec Stx)))
 
@@ -59,8 +59,9 @@
     (nil (Ok nil))))
 
 ;; Rust: lower/top.rs:35 raw_params (one parameter): the parameter at `i` of `list`
-;; (`sym | sym: type | sym :borrow | sym: type :borrow | &sym | &sym: type`) and the
-;; index after it.
+;; (`sym | sym: type | sym :borrow | sym: type :borrow | sym: type :owned | &sym | &sym: type`) and the
+;; index after it. `:owned` (types §6.4, "Declared owned") is the caller's promise of one count to hand over; it
+;; is refused on an `&` parameter (which has no count kind) and together with `:borrow`.
 (defun raw-param (list: (Vec Stx) i: i64) -> (Result (Pair RawParam i64) TypeError)
   (let ((f (nth list i))
         (amp (amp-operand f))
@@ -72,8 +73,15 @@
              (name (unwrap-or typed s))
              (ann (if (some? typed) (get list (+ i 1)) nil))
              (after (+ i (if (some? ann) 2 1)))
-             (borrow (match (get list after) ((some k) (stx-kw? k "borrow")) (nil false))))
-         (Ok (Pair (RawParam name (some? amp) ann borrow (. f pos)) (if borrow (+ after 1) after))))))))
+             (borrow (match (get list after) ((some k) (stx-kw? k "borrow")) (nil false)))
+             (owned (match (get list after) ((some k) (stx-kw? k "owned")) (nil false)))
+             (next (if (or borrow owned) (+ after 1) after)))
+         (cond
+           (and owned (some? amp))
+           (resolve-err (. f pos) (str-join ["&" s " is an in/out parameter and has no count kind: :owned is for plain parameters"]))
+           (and (or borrow owned) (match (get list next) ((some k) (or (stx-kw? k "borrow") (stx-kw? k "owned"))) (nil false)))
+           (resolve-err (. f pos) (str-join ["parameter " s " has more than one of :borrow and :owned"]))
+           :else (Ok (Pair (RawParam name (some? amp) ann borrow owned (. f pos)) next))))))))
 
 ;; Rust: lower/top.rs:35 raw_params
 (defun raw-params (list: (Vec Stx)) -> (Result (Vec RawParam) TypeError)
@@ -131,7 +139,7 @@
     (fn (p: RawParam)
       (try-let ((ann (opt-type-ann (. lw g) (. lw m) (. p ann))))
         (Ok (ParamDecl (lw-bind lw (. p name) (if (. p amp) BkAmpParam BkParam) (. p pos))
-                       (. p name) (. p amp) ann (. p borrow)))))))
+                       (. p name) (. p amp) ann (. p borrow) (. p owned)))))))
 
 ;; `:where ((P T..) (Send T) ..)` as annotations.
 (defun where-anns :private (g: Globals m: i64 cs: (Option Stx)) -> (Result (Vec PredAnn) TypeError)
@@ -186,7 +194,7 @@
                (recur (+ i 1) true out)
                (recur (+ i 1) rest
                       (conj out (ParamDecl (lw-bind lw n BkParam (. (nth ps i) pos)) n false
-                                           (some (if rest vec-ann form-ann)) false)))))))))
+                                           (some (if rest vec-ann form-ann)) false false)))))))))
 
 ;; Rust: lower/top.rs:196 lower_macro: lowers `(defmacro name (p.. ... rest?) body+)` as a
 ;; function over `Form` (§2.8): each parameter `Form`, the rest `(Vec Form)`, the result
