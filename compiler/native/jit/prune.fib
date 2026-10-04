@@ -8,7 +8,7 @@
 
 
 ;; The search: the definitions by name, the names found live, and the definitions still to scan.
-(defstruct Reach (defined: (Map str LItem) live: (Cell (Map str bool)) work: (Cell (Vec LItem))))
+(defstruct PruneSearch (defined: (Map str LItem) live: (Cell (Map str bool)) work: (Cell (Vec LItem))))
 
 (defun item-exported? :private (item: LItem) -> bool
   (match item
@@ -25,7 +25,7 @@
 ;; The module without the internal and private definitions that no exported one reaches, in the Rust's order. (prune.rs `dead_internals`)
 (defun dead-internals (m: LModule) -> LModule
   (let ((items (. m items))
-        (r (Reach (defined-of (. m items)) (cell {}) (cell []))))
+        (r (PruneSearch (defined-of (. m items)) (cell {}) (cell []))))
     (do (dotimes (i (count items))
           (if (item-exported? (nth items i)) (set! (. r work) (conj @(. r work) (nth items i))) ()))
         (scan-all r)
@@ -40,13 +40,13 @@
                  ((some n) (assoc acc n (nth items i)))
                  (nil acc))))))
 
-(defun keep? :private (r: Reach it: LItem) -> bool
+(defun keep? :private (r: PruneSearch it: LItem) -> bool
   (match (item-name it)
     ((some n) (or (item-exported? it) (contains? @(. r live) n)))
     (nil true)))
 
 ;; Takes definitions off the work list until it is empty.
-(defun scan-all :private (r: Reach) -> unit
+(defun scan-all :private (r: PruneSearch) -> unit
   (loop ()
     (let ((w @(. r work)))
       (if (= (count w) 0)
@@ -56,7 +56,7 @@
                 (scan-item r it)
                 (recur)))))))
 
-(defun scan-item :private (r: Reach it: LItem) -> unit
+(defun scan-item :private (r: PruneSearch it: LItem) -> unit
   (match it
     ((ItDefine f) (dotimes (b (count (. f blocks)))
                     (let ((body (. (nth (. f blocks) b) body)))
@@ -65,7 +65,7 @@
     (_ ())))
 
 ;; Notes `name` live and queues its definition, when it has one here and is not live yet.
-(defun reach :private (r: Reach name: str) -> unit
+(defun reach :private (r: PruneSearch name: str) -> unit
   (match (get (. r defined) name)
     ((some it) (if (contains? @(. r live) name)
                    ()
@@ -73,11 +73,11 @@
                        (set! (. r work) (conj @(. r work) it)))))
     (nil ())))
 
-(defun visit-all :private (r: Reach es: (Vec LExpr)) -> unit
+(defun visit-all :private (r: PruneSearch es: (Vec LExpr)) -> unit
   (dotimes (i (count es)) (visit r (nth es i))))
 
 ;; Reaches every global name `e` mentions: a direct callee or a `@name` operand.
-(defun visit :private (r: Reach e: LExpr) -> unit
+(defun visit :private (r: PruneSearch e: LExpr) -> unit
   (match (. e kind)
     ((KGlobal n) (reach r n))
     ((KVector _ es) (visit-all r es))

@@ -46,20 +46,26 @@
   (do (orc/jit-free (. s lljit)) ()))
 
 ;; Parses, checks, lowers, verifies and adds a module. On `Err` nothing was added and the session stays usable. (mod.rs `add_source`)
+;; The module has just been checked by `check-source`, so it is not checked again: Rust's `add_source` checks it twice (once here, once in `add_module`);
+;; the second check of a module the first accepted cannot fail and costs 5% of a compile (measured, compiler/emit of the compiler's own source).
 (defun session-add-source (s: JitSession name: str src: str) -> (Result unit LairError)
   (match (pipe/check-source src)
     ((Err e) (Err e))
-    ((Ok m) (session-add-module s name m))))
+    ((Ok m) (add-checked s name m))))
 
 ;; Adds a module: `check`, the names rules, prune, lower, optimise, hand to ORC. (mod.rs `add_module`)
 (defun session-add-module (s: JitSession name: str m: LModule) -> (Result unit LairError)
   (match (check/check m)
     ((Err ds) (Err (ErrInvalid ds)))
-    ((Ok _) (match (names-check @(. s names) m support/process-defines?)
+    ((Ok _) (add-checked s name m))))
+
+;; The names rules, prune, lower, optimise and hand-over of a module the checker accepted.
+(defun add-checked :private (s: JitSession name: str m: LModule) -> (Result unit LairError)
+  (match (names-check @(. s names) m support/process-defines?)
+    ((Err e) (Err e))
+    ((Ok _) (match (nl/lower (dead-internals m) name (. s triple) (. s data-layout))
               ((Err e) (Err e))
-              ((Ok _) (match (nl/lower (dead-internals m) name (. s triple) (. s data-layout))
-                        ((Err e) (Err e))
-                        ((Ok o) (hand-over s name m o))))))))
+              ((Ok o) (hand-over s name m o))))))
 
 ;; Optimises the lowered module and gives it to ORC, which then owns the context and the module; the names are recorded when it took it.
 (defun hand-over :private (s: JitSession name: str m: LModule o: owned/Owned) -> (Result unit LairError)
