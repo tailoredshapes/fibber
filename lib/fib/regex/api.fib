@@ -38,15 +38,20 @@
     ((Err e) (trap (str "PatternSyntaxException: " e " in " s)))))
 
 (defun pattern-of (rx: Regex) -> str (. rx pattern))
+
+;; how many states the lazy DFA of the forward search holds now, and the most it will hold; a search that needs more
+;; is done by the Pike VM (the same answer, slower)
+(defun dfa-cache-states (rx: Regex) -> i64 @(. (. rx fdfa) count))
+(defun dfa-cache-cap (rx: Regex) -> i64 (. (. rx fdfa) cap))
 (defun group-count (rx: Regex) -> i64 (. rx groups))
 
 ;; ---- finding ----
 
-(defun pack-span (st: i64 e: i64) -> i64 (+ (shl st 32) e))
-(defun span-start (x: i64) -> i64 (shr x 32))
-(defun span-end (x: i64) -> i64 (bit-and x 4294967295))
+(defun pack-span :private (st: i64 e: i64) -> i64 (+ (shl st 32) e))
+(defun span-start :private (x: i64) -> i64 (shr x 32))
+(defun span-end :private (x: i64) -> i64 (bit-and x 4294967295))
 
-(defun check-from (s: str from: i64) -> unit
+(defun check-from :private (s: str from: i64) -> unit
   (if (or (< from 0) (> from (str-len s)))
       (trap "re-find: the offset is outside the string")
       (if (and (< from (str-len s)) (continuation? (byte-at s from)))
@@ -54,7 +59,7 @@
           ())))
 
 ;; the slots of the leftmost match at or after from; empty when none
-(defun find-caps (rx: Regex s: str from: i64) -> (Array i64)
+(defun find-caps :private (rx: Regex s: str from: i64) -> (Array i64)
   (if (. rx use-dfa)
       (let [e (dfa-forward (. rx fdfa) s from)]
         (cond (= e -1) (no-caps)
@@ -66,7 +71,7 @@
       (pike-run (. rx fwd) s from false false)))
 
 ;; the span of the leftmost match at or after from, packed; -1 when none
-(defun find-packed (rx: Regex s: str from: i64) -> i64
+(defun find-packed :private (rx: Regex s: str from: i64) -> i64
   (if (. rx use-dfa)
       (let [e (dfa-forward (. rx fdfa) s from)]
         (cond (= e -1) -1
@@ -75,10 +80,10 @@
               :else (caps-packed (pike-run (. rx fwd) s from false false))))
       (caps-packed (pike-run (. rx fwd) s from false false))))
 
-(defun caps-packed (caps: (Array i64)) -> i64
+(defun caps-packed :private (caps: (Array i64)) -> i64
   (if (= (array-len caps) 0) -1 (pack-span (array-get caps 0) (array-get caps 1))))
 
-(defun make-match (s: str caps: (Array i64) ng: i64) -> Match
+(defun make-match :private (s: str caps: (Array i64) ng: i64) -> Match
   (let [
         st (array-get caps 0)
         e (array-get caps 1)]
@@ -92,7 +97,7 @@
            (loop [i 0 out (vec-empty)]
              (if (< i (* 2 (+ ng 1))) (recur (+ i 1) (conj out (array-get caps i))) out)))))
 
-(defun caps-match (s: str caps: (Array i64) ng: i64) -> (Option Match)
+(defun caps-match :private (s: str caps: (Array i64) ng: i64) -> (Option Match)
   (if (= (array-len caps) 0) nil (some (make-match s caps ng))))
 
 (defun re-find-from (rx: Regex s: str from: i64) -> (Option Match)
@@ -105,12 +110,12 @@
   (caps-match s (pike-run (. rx fwd) s 0 true true) (. rx groups)))
 
 ;; where the search goes on after the match [st, e)
-(defun next-from (s: str st: i64 e: i64) -> i64
+(defun next-from :private (s: str st: i64 e: i64) -> i64
   (if (= st e)
       (if (< e (str-len s)) (+ e (width-of (byte-at s e))) -1)
       e))
 
-(defun seq-from (rx: Regex s: str from: i64 acc: (Vec Match)) -> (Vec Match)
+(defun seq-from :private (rx: Regex s: str from: i64 acc: (Vec Match)) -> (Vec Match)
   (if (< from 0)
       acc
       (let [caps (find-caps rx s from)]
@@ -147,12 +152,12 @@
 
 ;; ---- replacing ----
 
-(defenum TPart (TLit text: str) (TGroup n: i64))
+(defenum TPart :private (TLit text: str) (TGroup n: i64))
 
-(defun digit-val (b: i8) -> i64 (- (zext i64 b) 48))
+(defun digit-val :private (b: i8) -> i64 (- (zext i64 b) 48))
 
 ;; the digits after `$` at i: the group number (taking a further digit only while that group exists) and where it ends
-(defun group-ref (t: str i: i64 ng: i64) -> (Pair i64 i64)
+(defun group-ref :private (t: str i: i64 ng: i64) -> (Pair i64 i64)
   (let [n (str-len t)
         d0 (digit-val (str-byte-at t i))]
     (if (> d0 ng)
@@ -163,17 +168,17 @@
               (recur (+ j 1) (+ (* acc 10) (digit-val (str-byte-at t j))))
               (Pair acc j))))))
 
-(defun digit? (b: i8) -> bool (and (>= b 48i8) (<= b 57i8)))
+(defun digit? :private (b: i8) -> bool (and (>= b 48i8) (<= b 57i8)))
 
 ;; the end of the run of ordinary characters that starts at i
-(defun lit-end (t: str i: i64) -> i64
+(defun lit-end :private (t: str i: i64) -> i64
   (loop [j i]
     (if (and (< j (str-len t)) (!= (str-byte-at t j) 92i8) (!= (str-byte-at t j) 36i8)) (recur (+ j 1)) j)))
 
-(defun add-lit (out: (Vec TPart) text: str) -> (Vec TPart)
+(defun add-lit :private (out: (Vec TPart) text: str) -> (Vec TPart)
   (if (> (str-len text) 0) (conj out (TLit text)) out))
 
-(defun parse-template (t: str ng: i64) -> (Vec TPart)
+(defun parse-template :private (t: str ng: i64) -> (Vec TPart)
   (let [n (str-len t)]
     (loop [i 0 out (vec-empty)]
       (if (>= i n)
@@ -192,7 +197,7 @@
                   :else (let [j (lit-end t i)] (recur j (add-lit out (str-slice t i j))))))))))
 
 ;; the text a template makes for one match, appended to acc
-(defun expand-parts (s: str caps: (Array i64) parts: (Vec TPart) acc: (Vec str)) -> (Vec str)
+(defun expand-parts :private (s: str caps: (Array i64) parts: (Vec TPart) acc: (Vec str)) -> (Vec str)
   (reduce (fn (a: (Vec str) part: TPart)
             (match part
               ((TLit text) (conj a text))
@@ -201,12 +206,12 @@
                             (if (and (>= x 0) (>= y 0)) (conj a (str-slice s x y)) a)))))
           acc parts))
 
-(defun needs-groups? (parts: (Vec TPart)) -> bool
+(defun needs-groups? :private (parts: (Vec TPart)) -> bool
   (reduce (fn (b: bool part: TPart) (match part ((TGroup _) true) ((TLit _) b))) false parts))
 
 ;; the pieces of s with each of the first `limit` matches (all when limit is -1) replaced; `last` is where the
 ;; text not yet copied starts, `from` where the search goes on (-1: nowhere)
-(defun replace-pieces (rx: Regex s: str parts: (Vec TPart) groups?: bool from: i64 last: i64 limit: i64 acc: (Vec str))
+(defun replace-pieces :private (rx: Regex s: str parts: (Vec TPart) groups?: bool from: i64 last: i64 limit: i64 acc: (Vec str))
   -> (Vec str)
   (if (or (< from 0) (= limit 0))
       (conj acc (str-slice s last (str-len s)))
@@ -222,7 +227,7 @@
                               (expand-parts s caps parts (conj acc (str-slice s last st)))))))))
 
 ;; the pieces joined, built in one pass: the length is summed, one array is filled
-(defun join-pieces (pieces: (Vec str)) -> str
+(defun join-pieces :private (pieces: (Vec str)) -> str
   (let [total (reduce (fn (n: i64 p: str) (+ n (str-len p))) 0 pieces)
         buf (cell (array (max total 1) 0i8))
         pos (cell 0)]
@@ -234,9 +239,49 @@
                 () pieces)
         (str-from-bytes (array-copy @buf 0 total)))))
 
-(defun replace-limit (rx: Regex s: str template: str limit: i64) -> str
+;; the spans of the first `limit` matches (all when limit is -1) as [start end start end ..]
+(defun collect-spans :private (rx: Regex s: str limit: i64) -> (Vec i64)
+  (loop [from 0 k 0 acc (vec-empty)]
+    (if (or (< from 0) (= k limit))
+        acc
+        (let [x (find-packed rx s from)]
+          (if (< x 0)
+              acc
+              (recur (next-from s (span-start x) (span-end x)) (+ k 1) (conj (conj acc (span-start x)) (span-end x))))))))
+
+(defun copy-range :private (buf: (Cell (Array i8)) pos: i64 src: (Array i8) lo: i64 hi: i64) -> i64
+  (do (dotimes (j (- hi lo)) (array-set! &buf (+ pos j) (array-get src (+ lo j))))
+      (+ pos (- hi lo))))
+
+(defun matched-bytes :private (spans: (Vec i64)) -> i64
+  (loop [i 0 n 0]
+    (if (< i (count spans)) (recur (+ i 2) (+ n (- (nth spans (+ i 1)) (nth spans i)))) n)))
+
+;; the replacement of a template that has no group in it: the same text for every match. The matches are found
+;; first, then the result is written once into an array of the exact length, with no piece made per match.
+(defun replace-literal :private (rx: Regex s: str lit: str limit: i64) -> str
+  (let [spans (collect-spans rx s limit)
+        k (quot (count spans) 2)
+        total (+ (- (str-len s) (matched-bytes spans)) (* k (str-len lit)))
+        src (str-bytes s)
+        lb (str-bytes lit)
+        buf (cell (array (max total 1) 0i8))]
+    (loop [i 0 last 0 pos 0]
+      (if (< i (count spans))
+          (let [p1 (copy-range buf pos src last (nth spans i))
+                p2 (copy-range buf p1 lb 0 (array-len lb))]
+            (recur (+ i 2) (nth spans (+ i 1)) p2))
+          (do (copy-range buf pos src last (array-len src))
+              (str-from-bytes (array-copy @buf 0 total)))))))
+
+(defun literal-of :private (parts: (Vec TPart)) -> str
+  (join-pieces (vec (map (fn (p: TPart) (match p ((TLit t) t) ((TGroup _) ""))) parts))))
+
+(defun replace-limit :private (rx: Regex s: str template: str limit: i64) -> str
   (let [parts (parse-template template (. rx groups))]
-    (join-pieces (replace-pieces rx s parts (needs-groups? parts) 0 0 limit (vec-empty)))))
+    (if (needs-groups? parts)
+        (join-pieces (replace-pieces rx s parts true 0 0 limit (vec-empty)))
+        (replace-literal rx s (literal-of parts) limit))))
 
 ;; every match replaced; the template is Java's (`$1`, `\$`)
 (defun replace-all (rx: Regex s: str template: str) -> str (replace-limit rx s template -1))

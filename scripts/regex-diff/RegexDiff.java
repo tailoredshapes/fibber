@@ -17,8 +17,8 @@ import java.util.*;
 import java.util.regex.*;
 
 public class RegexDiff {
-    static final String LIT = "abcx01 _-.é\n";
-    static final String TEXTCH = "abcx01 _-.é\n\r";
+    static final String LIT = "abcx01 _-.é€あ\n";
+    static final String TEXTCH = "abcx01 _-.é€あ\n\r";
     static Random rnd;
 
     interface Node { void render(StringBuilder sb); String sample(); }
@@ -128,7 +128,7 @@ public class RegexDiff {
             StringBuilder cs = new StringBuilder();
             int n = 1 + pick(3);
             for (int i = 0; i < n; i++) {
-                if (chance(30)) { String r = chance(50) ? "a~c" : (chance(50) ? "0~1" : "b~x"); cs.append(r); }
+                if (chance(30)) { String r = chance(40) ? "a~c" : (chance(40) ? "0~1" : (chance(50) ? "b~x" : (chance(50) ? "à~ÿ" : "ぁ~ん"))); cs.append(r); }
                 else cs.append(LIT.charAt(pick(LIT.length())));
             }
             return new Cls("set", cs.toString(), chance(30));
@@ -253,6 +253,13 @@ public class RegexDiff {
     }
 
     public static void main(String[] a) throws Exception {
+        if (a[0].equals("rec")) {
+            // java RegexDiff.java rec PATTERN TEXT: the record of one pair (a backslash-n in TEXT is an LF)
+            PrintStream p = new PrintStream(System.out, false, StandardCharsets.UTF_8);
+            p.println(record(a[1], a[2].replace("\\n", "\n"), false));
+            p.flush();
+            return;
+        }
         long seed = Long.parseLong(a[1]);
         int count = Integer.parseInt(a[2]);
         List<String> recs = records(seed, count);
@@ -264,7 +271,7 @@ public class RegexDiff {
             StringBuilder lit = new StringBuilder("\"");
             for (String r : recs) lit.append(r.replace("\\", "\\\\").replace("\"", "\\\"")).append("\\n");
             lit.append("\"");
-            o.print(tpl.replace("@@DATA@@", lit.toString()));
+            o.print(tpl.replace("@@DATA@@", lit.toString()).replace("@@COUNT@@", String.valueOf(count)).replace("@@SEED@@", String.valueOf(seed)));
         }
         o.flush();
     }
