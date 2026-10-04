@@ -1,0 +1,62 @@
+;; fib.regex.charset: sets of Unicode scalar values for the regex engine (stdlib §4.9).
+;; A set is a `(Vec i64)` of ranges, sorted by start, disjoint and not touching, each range packed as
+;; `lo * 2^22 + hi` (a scalar value needs 21 bits), so that the library's `sort` orders ranges by start.
+;; Every function returns a normalised set. Negation is taken over [0, 0x10FFFF]: the surrogate
+;; range is in a negated set and never matched, since a `str` holds no surrogate.
+(ns fib.regex.charset (:use fib.core fib.seq fib.coll))
+
+(def max-cp: i64 1114111)
+
+(defun pack (lo: i64 hi: i64) -> i64 (+ (shl lo 22) hi))
+(defun range-lo (r: i64) -> i64 (shr r 22))
+(defun range-hi (r: i64) -> i64 (bit-and r 4194303))
+
+(defun cs-empty () -> (Vec i64) (vec-empty))
+(defun cs-range (lo: i64 hi: i64) -> (Vec i64) [(pack lo hi)])
+(defun cs-one (c: i64) -> (Vec i64) [(pack c c)])
+
+;; sorted packed ranges, merged where they overlap or touch
+(defun cs-norm (rs: (Vec i64)) -> (Vec i64)
+  (let [sorted (vec (sort rs))
+        n (count sorted)]
+    (if (= n 0)
+        sorted
+        (loop [i 1
+               lo (range-lo (nth sorted 0))
+               hi (range-hi (nth sorted 0))
+               out (vec-empty)]
+          (if (< i n)
+              (let [r (nth sorted i)]
+                (if (<= (range-lo r) (+ hi 1))
+                    (recur (+ i 1) lo (max hi (range-hi r)) out)
+                    (recur (+ i 1) (range-lo r) (range-hi r) (conj out (pack lo hi)))))
+              (conj out (pack lo hi)))))))
+
+(defun cs-union (a: (Vec i64) b: (Vec i64)) -> (Vec i64) (cs-norm (vec (concat a b))))
+
+;; the complement of a normalised set within [0, max-cp]
+(defun cs-negate (s: (Vec i64)) -> (Vec i64)
+  (let [n (count s)]
+    (loop [i 0 prev 0 out (vec-empty)]
+      (if (< i n)
+          (let [r (nth s i)]
+            (recur (+ i 1) (+ (range-hi r) 1)
+                   (if (> (range-lo r) prev) (conj out (pack prev (- (range-lo r) 1))) out)))
+          (if (<= prev max-cp) (conj out (pack prev max-cp)) out)))))
+
+;; whether the normalised set holds c (a binary search)
+(defun cs-has? (s: (Vec i64) c: i64) -> bool
+  (loop [lo 0 hi (- (count s) 1)]
+    (if (> lo hi)
+        false
+        (let [mid (shr (+ lo hi) 1)
+              r (nth s mid)]
+          (cond (< c (range-lo r)) (recur lo (- mid 1))
+                (> c (range-hi r)) (recur (+ mid 1) hi)
+                :else true)))))
+
+(defun cs-digit () -> (Vec i64) (cs-range 48 57))
+(defun cs-word () -> (Vec i64) (cs-norm [(pack 48 57) (pack 65 90) (pack 95 95) (pack 97 122)]))
+(defun cs-space () -> (Vec i64) (cs-norm [(pack 9 13) (pack 32 32)]))
+;; Java's `.`: anything but the line terminators LF, CR, NEL, LS and PS
+(defun cs-dot () -> (Vec i64) (cs-negate (cs-norm [(pack 10 10) (pack 13 13) (pack 133 133) (pack 8232 8233)])))

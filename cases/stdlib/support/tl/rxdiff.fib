@@ -1,0 +1,51 @@
+;; tl.rxdiff: one record of the differential test of fib.regex against java.util.regex (scripts/regex-diff/RegexDiff.java).
+;; A record is `pattern ¦ text ¦ mode ¦ F.. ¦ M.. ¦ R.. ¦ S..` (see the Java file): what Java found with `find`, `matches`,
+;; `replaceAll` and `split`, with offsets in UTF-8 bytes. `check-record` runs the same four through the
+;; library and answers the empty string when every field is equal, else a description of the first difference.
+(ns tl.rxdiff (:use fib.core fib.seq fib.coll fib.regex) (:require [fib.string :as str]))
+
+(defun swap-bytes (s: str a: i8 b: i8 c: i8 d: i8) -> str
+  (let [bs (cell (str-bytes s))]
+    (do (dotimes (i (array-len @bs))
+          (let [x (array-get @bs i)]
+            (if (= x a) (array-set! &bs i b) (if (= x c) (array-set! &bs i d) ()))))
+        (str-from-bytes @bs))))
+
+;; LF is written `~` and CR `^` in the records
+(defun enc (s: str) -> str (swap-bytes s 10i8 126i8 13i8 94i8))
+(defun dec (s: str) -> str (swap-bytes s 126i8 10i8 94i8 13i8))
+
+(defun span-text (m: Match g: i64) -> str
+  (if (< (match-start m g) 0) "n" (str (match-start m g) "-" (match-end m g))))
+
+(defun groups-text (rx: Regex m: Match loose: bool) -> str
+  (str/join "," (map (fn (g: i64) (span-text m g)) (range 0 (if loose 1 (+ (group-count rx) 1))))))
+
+(defun find-field (rx: Regex text: str loose: bool) -> str
+  (str "F" (str/join "" (map (fn (m: Match) (str (groups-text rx m loose) ";")) (re-seq rx text)))))
+
+(defun matches-field (rx: Regex text: str loose: bool) -> str
+  (match (re-matches rx text)
+    ((some m) (str "M" (groups-text rx m loose)))
+    (nil "Mn")))
+
+(defun replace-field (rx: Regex text: str loose: bool) -> str
+  (str "R" (enc (replace-all rx text (if (and (>= (group-count rx) 1) (not loose)) "<$1:$0>" "<$0>")))))
+
+(defun split-field (rx: Regex text: str) -> str
+  (str "S" (enc (str/join "/" (str/split text rx)))))
+
+(defun check-record (line: str) -> str
+  (let [f (str/split line "¦" -1)]
+    (if (!= (count f) 7)
+        (str "bad record " line)
+        (match (try-re-pattern (nth f 0))
+          ((Err e) (str "pattern rejected: " e " : " (nth f 0)))
+          ((Ok rx)
+           (let [text (dec (nth f 1))
+                 loose (= (nth f 2) "L")
+                 got [(find-field rx text loose) (matches-field rx text loose) (replace-field rx text loose) (split-field rx text)]]
+             (loop [i 0]
+               (cond (>= i 4) ""
+                     (= (nth got i) (nth f (+ i 3))) (recur (+ i 1))
+                     :else (str "pattern " (nth f 0) " text " (nth f 1) ": got " (nth got i) " want " (nth f (+ i 3)))))))))))

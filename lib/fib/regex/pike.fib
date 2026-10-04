@@ -1,0 +1,115 @@
+;; fib.regex.pike: the Pike VM, the matcher that knows the groups (stdlib §4.9). It runs the threads of
+;; the program side by side over the characters of the text, in priority order, so that the match it
+;; finds is the one a backtracking matcher would find first (Perl and Java's leftmost-first rule) and
+;; its time is at most (length of text) * (length of program), whatever the pattern: no pattern can
+;; make it exponential. Each thread carries its own copy of the capture slots.
+;; `anchored` starts a match only at `from`; `endreq` accepts a match only if it ends at the end of
+;; the text (Java's `matches`: of the paths that cover the whole text, the first by priority wins).
+;; The answer is the slots (`2g`, `2g+1` hold the start and end of group g, -1 when it did not
+;; take part), or an empty array when there is no match.
+(ns fib.regex.pike (:use fib.core fib.seq fib.coll fib.string.utf8 fib.regex.charset fib.regex.prog))
+
+(defstruct Thr (pc: i64 caps: (Array i64)))
+(defstruct Pk (p: Prog s: str n: i64 seen: (Cell (Array i64)) gens: (Cell i64)))
+
+;; a generation number nobody has used: every closure, and every new iteration of a loop inside one, has its own
+(defun fresh-gen (k: Pk) -> i64 (let [g (+ @(. k gens) 1)] (do (set! (. k gens) g) g)))
+
+(defun cp-at (s: str i: i64) -> i64 (zext i64 (code-at s i)))
+
+(defun word-cp? (c: i64) -> bool
+  (or (and (>= c 48) (<= c 57)) (or (and (>= c 65) (<= c 90)) (or (= c 95) (and (>= c 97) (<= c 122))))))
+
+(defun word-before? (s: str pos: i64) -> bool
+  (if (= pos 0) false (word-cp? (cp-at s (start-before s pos)))))
+
+(defun word-after? (s: str pos: i64) -> bool
+  (if (>= pos (str-len s)) false (word-cp? (cp-at s pos))))
+
+(defun terminator? (c: i64) -> bool (or (= c 10) (or (= c 13) (or (= c 133) (or (= c 8232) (= c 8233))))))
+
+;; Java's `$` (not in multiline mode): at the end, or before a final line terminator, where
+;; CR LF is one terminator and the position between CR and LF is not before one
+(defun dollar-ok? (s: str pos: i64) -> bool
+  (let [n (str-len s)]
+    (if (>= pos n)
+        true
+        (let [c (cp-at s pos)
+              w (width-of (byte-at s pos))]
+          (cond (= (+ pos w) n)
+                (if (= c 10)
+                    (not (and (> pos 0) (= (cp-at s (start-before s pos)) 13)))
+                    (terminator? c))
+                (and (= c 13) (and (= (+ pos 2) n) (= (cp-at s (+ pos 1)) 10))) true
+                :else false)))))
+
+(defun assert-ok? (s: str kind: i64 pos: i64) -> bool
+  (cond (or (= kind 1) (= kind 5)) (= pos 0)
+        (= kind 6) (= pos (str-len s))
+        (or (= kind 2) (= kind 7)) (dollar-ok? s pos)
+        (= kind 3) (!= (word-before? s pos) (word-after? s pos))
+        :else (= (word-before? s pos) (word-after? s pos))))
+
+;; the threads that the closure of `pc` at `pos` adds to `out`, in priority order; `gen` marks the
+;; instructions this closure has visited
+(defun add-thread (k: Pk gen: i64 pos: i64 pc: i64 caps: (Array i64) out: (Vec Thr)) -> (Vec Thr)
+  (let [seen (. k seen)]
+    (if (= (array-get @seen pc) gen)
+        out
+        (let [p (. k p)
+              op (array-get (. p ops) pc)
+              x (array-get (. p xs) pc)]
+          (do (array-set! &seen pc gen)
+              (cond (= op op-jmp) (add-thread k gen pos x caps out)
+                    (= op op-split) (add-thread k gen pos (array-get (. p ys) pc) caps (add-thread k gen pos x caps out))
+                    (= op op-save) (add-thread k gen pos (+ pc 1) (array-with caps x pos) out)
+                    (= op op-loopchk) (if (> pos (array-get caps x))
+                                          (add-thread k (fresh-gen k) pos (+ pc 1) caps out)
+                                          (add-thread k gen pos (array-get (. p ys) pc) caps out))
+                    (= op op-assert) (if (assert-ok? (. k s) x pos) (add-thread k gen pos (+ pc 1) caps out) out)
+                    :else (conj out (Thr pc caps))))))))
+
+;; the threads of clist stepped over the character at pos (class cls, width w) into nlist at pos + w;
+;; stops at a MATCH. The answer: the new list and the best match so far
+(defstruct Step (next: (Vec Thr) best: (Array i64)))
+
+(defun step-threads (k: Pk gen: i64 pos: i64 cls: i64 w: i64 endreq: bool clist: (Vec Thr) i: i64 acc: Step) -> Step
+  (if (>= i (count clist))
+      acc
+      (let [t (nth clist i)
+            p (. k p)
+            pc (. t pc)
+            op (array-get (. p ops) pc)]
+        (cond (= op op-match)
+              (if (or (not endreq) (= pos (. k n)))
+                  (Step (. acc next) (. t caps))
+                  (step-threads k gen pos cls w endreq clist (+ i 1) acc))
+              (and (>= cls 0) (member? p (array-get (. p xs) pc) cls))
+              (step-threads k gen pos cls w endreq clist (+ i 1)
+                            (Step (add-thread k gen (+ pos w) (+ pc 1) (. t caps) (. acc next)) (. acc best)))
+              :else (step-threads k gen pos cls w endreq clist (+ i 1) acc)))))
+
+(defun no-caps () -> (Array i64) (array 0 0))
+
+(defun pike-loop (k: Pk gen: i64 pos: i64 from: i64 anchored: bool endreq: bool clist: (Vec Thr) best: (Array i64))
+  -> (Array i64)
+  (let [fresh (array (. (. k p) nslots) -1)
+        c0 (if (and (= (array-len best) 0) (or (not anchored) (= pos from)))
+               (add-thread k gen pos 0 fresh clist)
+               clist)
+        n (. k n)]
+    (if (and (= (count c0) 0) (or (>= pos n) (> (array-len best) 0) (and anchored (> pos from))))
+        best
+        (let [has (< pos n)
+              w (if has (width-of (byte-at (. k s) pos)) 1)
+              cls (if has (cls-of (. k p) (cp-at (. k s) pos)) -1)
+              g2 (fresh-gen k)
+              st (step-threads k g2 pos cls w endreq c0 0 (Step (vec-empty) best))]
+          (if (>= pos n)
+              (. st best)
+              (pike-loop k g2 (+ pos w) from anchored endreq (. st next) (. st best)))))))
+
+;; the slots of the match of p in s found from `from`, or an empty array
+(defun pike-run (p: Prog s: str from: i64 anchored: bool endreq: bool) -> (Array i64)
+  (let [k (Pk p s (str-len s) (cell (array (max 1 (. p n)) 0)) (cell 1))]
+    (pike-loop k 1 from from anchored endreq (vec-empty) (no-caps))))

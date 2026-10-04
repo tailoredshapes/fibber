@@ -1650,7 +1650,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `interleave` | adapt | `(interleave a b ..)` | `c1 c2 -> (LSeq e) \| Reducible c1 e, Reducible c2 e` | 2 | truncates to the shorter; lazy over the seqs of both; in the fused path every operand is walked by a cursor (recipes by buffering, §2.1 rule 5, in any order); `zip-strict` traps on a mismatch |
 | `interpose` | keep | `(interpose sep c)` | `e c -> (LSeq e) \| Reducible c e` | 2 | The transducer arity is `x<name>` until L1 (§2.1 rule 7). |
 | `tree-seq` | adapt | `(tree-seq branch? children root)` | `(fn (n) bool) (fn (n) d) n -> (LSeq n) \| Reducible d n` | 3 | typed over one node type; depth first, no explicit stack in the caller |
-| `re-seq` | adapt | `(re-seq re s)` | `Regex str -> (LSeq Match)` | 4 | a lazy seq of matches; `fib.regex` |
+| `re-seq` | adapt | `(re-seq re s)` | `Regex str -> (Vec Match)` | 4 | eager; `fib.regex` (§4.9) |
 | `line-seq` | adapt | `(line-seq r)` | `Reader -> (LSeq str)` | 5 | memoised `LSeq`; needs a scope-exit hook to close the handle (§7 L12); `fib.io`; `lines-of` is not offered |
 | `iteration` | adapt | `(iteration step init)` | `(fn (k) (Option (Pair v k))) k -> (LSeq v)` | 5 | memoised `LSeq`; `fib.seq` |
 | `first` | adapt | `(first c)` | `c -> (Option e) \| Reducible c e` | 1 | `nil` on empty; use `(unwrap (first c))` or `(nth c 0)` for the sure case. On an `LSeq` it realises the first node only ([R] A13 lz1). |
@@ -1872,15 +1872,40 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 
 ### 4.9 `fib.regex`
 
+`(:require [fib.regex :as re])` or `(:use fib.regex)`: a facade over `lib/fib/regex/` (`charset ast parse prog pike dfa api`). Delivered by
+the shootout's RE package, ahead of tranche 4's schedule, because regex-redux needs it; `#"..."` (E14, reader), `re-matcher` and the
+backtracking fallback (tranche 5) are not delivered. The design is below the table.
+
 | Clojure name | Verdict | Fibber | Signature | T | Note |
 |---|---|---|---|---|---|
-| `re-pattern` | adapt | `(re-pattern s)` | `str -> Regex` | 4 | traps with the pattern error on a bad pattern, as Clojure throws `PatternSyntaxException`; `try-re-pattern` (new, alias `regex`) returns a `(Result Regex str)`; a non-backtracking engine for the patterns that fit it, so those cannot hang a call, and a backtracking matcher with a step budget for backreferences and lookaround (tranche 5): Java's regex has both and no safety reason forbids them |
-| `try-re-pattern` (new) | new | `(try-re-pattern s)` | `str -> (Result Regex str)` | 4 | the typed twin of `re-pattern` (§3 N13); `regex` is its unqualified alias |
-| `#"regex"` | adapt | `(re "..")` | macro `str -> Regex` | 4 | reads as `(re "regex")`, checked at read/expand time (E14); `(re "..")` is the macro form |
-| `re-find` | adapt | `(re-find re s)` | `Regex str -> (Option Match)` | 4 | `Match` has `whole`, `groups` (`(Vec (Option str))`) and byte offsets, whatever the pattern: Clojure's result is a string without groups and a vector with them, a result type that depends on the pattern (§5 T5) |
-| `re-matches` | adapt | `(re-matches re s)` | `Regex str -> (Option Match)` | 4 | the whole string must match |
-| `re-matcher` | adapt | `(re-matcher re s)` | `Regex str -> Matcher` | 5 | a struct with `Cell` state, single-threaded; `(re-find m)` advances it |
-| `re-groups` | adapt | `(re-groups m)` | `Matcher -> (Option Match)` | 5 | the groups of the matcher's last match |
+| `re-pattern` | adapt | `(re-pattern s)` | `str -> Regex` | 4 | traps with `PatternSyntaxException: <message> near index N in <pattern>` on a bad pattern, as Clojure throws; `try-re-pattern` (new) returns a `(Result Regex str)`. The engine is non-backtracking, so no pattern can hang a call; what it refuses is listed below |
+| `try-re-pattern` (new) | new | `(try-re-pattern s)` | `str -> (Result Regex str)` | 4 | the typed twin of `re-pattern` (§3 N13); `regex` as an unqualified alias is not delivered |
+| `#"regex"` | adapt | `(re "..")` | macro `str -> Regex` | 4 | reads as `(re "regex")`, checked at read/expand time (E14); not delivered: call `re-pattern` |
+| `re-find` | adapt | `(re-find re s)` | `Regex str -> (Option Match)` | 4 | `Match` has `start`, `end` (byte offsets of the whole match), `whole`, `groups` (`(Vec (Option str))`, group 1 on, `nil` for a group that took no part) and `spans` (the offsets of every group, `2g` and `2g+1`, -1 for none), whatever the pattern: Clojure's result is a string without groups and a vector with them, a result type that depends on the pattern (§5 T5). `re-find-from` (new) takes a byte offset at a character boundary |
+| `re-matches` | adapt | `(re-matches re s)` | `Regex str -> (Option Match)` | 4 | the whole string must match: of the matches that cover it, the one a backtracking matcher would find first |
+| `re-seq` | adapt | `(re-seq re s)` | `Regex str -> (Vec Match)` | 4 | eager, not an `LSeq`; after an empty match the search goes on one character later, as `Matcher.find` does (but never into the middle of a character); `re-count` (new) is the number of matches, made without making them |
+| `re-groups` | adapt | `(re-groups m)` | `Match -> (Vec (Option str))` | 4 | Clojure's vector: the whole match, then the groups; `re-group` (new) is one group, `match-start`, `match-end` its offsets. A `Matcher` (`re-matcher`) is tranche 5 |
+| `replace-all`, `replace-first` (new) | new | `(replace-all re s template)` | `Regex str str -> str` | 4 | `Matcher.replaceAll`/`replaceFirst`: `$n` is group n (further digits are taken while that group exists), `\x` is `x`, anything else after `$` or a lone `\` traps; `re-quote-replacement` (new here: `str/re-quote-replacement` waits for the string facade) makes a template that inserts its argument as it is |
+| `re-matcher` | adapt | `(re-matcher re s)` | `Regex str -> Matcher` | 5 | a struct with `Cell` state, single-threaded; `(re-find m)` advances it; not delivered |
+| `Pattern` instance | new | `(impl Pattern Regex ..)` | | 4 | `str/split`, `str/index-of` and the rest of `fib.string` take a `Regex` as a pattern |
+
+**The syntax** is the subset of `java.util.regex` that ordinary programs use, with Java's meaning: literals, `.` (any character but LF, CR, NEL, LS, PS), classes `[a-z0-9_]` with ranges and `^`, the escapes `\d \D \w \W \s \S`
+(ASCII, as Java's default), alternation `|`, groups `( )` and `(?: )`, the quantifiers `* + ? {n} {n,} {n,m}` greedy and lazy (`?` after), the anchors `^ $ \A \z \Z` and the word boundaries `\b \B` (ASCII word characters), and the
+escapes `\t \n \r \f \a \e \0ooo \xhh \uhhhh` and `\` before any non-letter. `^` is the start of the text and `$` its end or before a final line terminator, as without `MULTILINE`. A pattern may use any character of the
+text: classes work on Unicode scalar values, offsets are bytes. **Refused with a message** (Java accepts them; a backtracking matcher with a step budget, tranche 5, is the place): backreferences, lookahead and lookbehind, flags (`(?i)`,
+`MULTILINE`, `DOTALL`), named groups, possessive quantifiers, `\Q..\E`, `\p{..}`, `\G`, `\R`, nested classes and `&&` in a class; a repetition count over 1000 (a counted repetition is compiled as that many copies).
+
+**The engine.** Two matchers over one program (a list of `SET`, `SPLIT`, `JMP`, `SAVE`, `ASSERT`, `LOOPCHK` and `MATCH`, characters partitioned into classes by the boundaries of the sets). The **Pike VM** runs the threads side by side in priority order, so the match it
+finds is a backtracking matcher's (leftmost, then the first by priority: greedy and lazy quantifiers, the first alternative that works); it knows the groups; its time is at most (length of text) * (length of program), whatever the pattern, and its
+memory a thread list. A loop whose body can match nothing is compiled as Java matches it: an iteration that matches nothing is accepted and ends the loop. The **lazy DFA** finds where a match lies in a pattern with no assertion and no such loop:
+forward over the program with a thread started at every position, in first-match mode (when a `MATCH` is reached the threads below it are dropped), it gives the END of the match a backtracking matcher takes; backward over the reversed program, anchored at that
+end, longest-first, it gives the START (the smallest start of a match that ends there is the start of the leftmost match). One table lookup per character, time linear in the text, states and transitions made as the text first needs them, at most
+`min(10000, 2000000 / classes)` states, and a search that needs more is done by the Pike VM instead. `re-find` with groups takes the span from the DFA and runs the Pike VM anchored at its start. A `Regex` holds the caches, so it is
+thread-confined (not `Send`), as a `Matcher` is.
+
+**What the differential test found of Java** (`cases/stdlib/6000-ref-regex-vs-java-util-regex.fib`, `scripts/regex-diff/RegexDiff.java`): the answers are Java's on every pair, with two exceptions that are Java's, not the library's: for a group inside two nested repeats
+Java keeps the capture of an earlier iteration of the outer one (`((a)*b)*` on `abaab` gives group 2 as the first iteration's), where the library keeps the last, as Perl does; and Java steps into the middle of a supplementary character after an empty match,
+finding an empty match there that no text position holds. The test compares only the extent of the match for the first kind and keeps supplementary characters out of its random texts (they are in `6001`).
 
 ### 4.10 `fib.math` (alias `math`)
 

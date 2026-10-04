@@ -1,0 +1,227 @@
+;; fib.regex.parse: the pattern text to a syntax tree (stdlib §4.9). The syntax is the subset of
+;; java.util.regex that ordinary programs use, with Java's meaning:
+;;   literals, `.` (not a line terminator), `[..]` classes with ranges, `^` negation and the escapes
+;;   `\d \D \w \W \s \S`, `|`, `( )`, `(?: )`, the quantifiers `* + ? {n} {n,} {n,m}` greedy and
+;;   lazy (`?` after), the anchors `^ $ \A \z \Z` and `\b \B`, and the character escapes
+;;   `\t \n \r \f \a \e \0ooo \xhh \uhhhh` and `\` before any other non-letter.
+;; Refused with a message (Java accepts them): backreferences `\1`, lookaround, flags `(?i)`, named
+;; groups, possessive quantifiers, `\Q..\E`, nested classes and `&&` in a class, `\p{..}`, `\G`, `\R`.
+;; A counted repetition may repeat at most 1000 times (the program is a copy per repetition).
+(ns fib.regex.parse (:use fib.core fib.seq fib.coll fib.string.utf8 fib.regex.charset fib.regex.ast))
+
+(defstruct Parsed (node: Node pos: i64 groups: i64))
+;; an escape: kind 0 a character `cp`, 1 a set, 2 an assertion `cp`
+(defstruct Esc (kind: i64 cp: i64 cs: (Vec i64) pos: i64))
+;; a quantifier: `has` false when there is none; max -1 is unbounded
+(defstruct Num (v: i64 pos: i64))
+(defstruct Quant (has: bool min: i64 max: i64 greedy: bool pos: i64))
+
+(def max-repeat: i64 1000)
+
+(defun pattern-cps (s: str) -> (Vec i64)
+  (let [n (str-len s)]
+    (loop [i 0 out (vec-empty)]
+      (if (< i n)
+          (recur (+ i (width-of (byte-at s i))) (conj out (zext i64 (code-at s i))))
+          out))))
+
+(defun at (src: (Vec i64) i: i64) -> i64 (if (< i (count src)) (nth src i) -1))
+
+(defun hex-val (c: i64) -> i64
+  (cond (and (>= c 48) (<= c 57)) (- c 48)
+        (and (>= c 97) (<= c 102)) (- c 87)
+        (and (>= c 65) (<= c 70)) (- c 55)
+        :else -1))
+
+(defun err-at (msg: str pos: i64) -> str (str msg " near index " pos))
+
+(defun esc-char (c: i64 pos: i64) -> Esc (Esc 0 c (vec-empty) pos))
+(defun esc-set (cs: (Vec i64) pos: i64) -> Esc (Esc 1 0 cs pos))
+(defun esc-assert (k: i64 pos: i64) -> Esc (Esc 2 k (vec-empty) pos))
+
+;; exactly n hex digits from pos: the value, or -1
+(defun hex-run (src: (Vec i64) pos: i64 n: i64) -> i64
+  (loop [k 0 acc 0]
+    (if (< k n)
+        (let [h (hex-val (at src (+ pos k)))]
+          (if (< h 0) -1 (recur (+ k 1) (+ (* acc 16) h))))
+        acc)))
+
+;; `\0` and up to three octal digits (value at most 0377)
+(defun octal-escape (src: (Vec i64) pos: i64) -> (Result Esc str)
+  (loop [k 0 acc 0]
+    (let [d (- (at src (+ pos k)) 48)]
+      (if (and (< k 3) (>= d 0) (<= d 7) (<= (+ (* acc 8) d) 255))
+          (recur (+ k 1) (+ (* acc 8) d))
+          (if (= k 0) (Err (err-at "Illegal octal escape sequence" pos)) (Ok (esc-char acc (+ pos k))))))))
+
+;; the escape whose backslash is just before pos
+(defun parse-escape (src: (Vec i64) pos: i64 in-class: bool) -> (Result Esc str)
+  (let [c (at src pos)
+        nx (+ pos 1)]
+    (cond (= c -1) (Err "Unexpected internal error or trailing backslash")
+          (= c 100) (Ok (esc-set (cs-digit) nx))
+          (= c 68) (Ok (esc-set (cs-negate (cs-digit)) nx))
+          (= c 119) (Ok (esc-set (cs-word) nx))
+          (= c 87) (Ok (esc-set (cs-negate (cs-word)) nx))
+          (= c 115) (Ok (esc-set (cs-space) nx))
+          (= c 83) (Ok (esc-set (cs-negate (cs-space)) nx))
+          (= c 116) (Ok (esc-char 9 nx))
+          (= c 110) (Ok (esc-char 10 nx))
+          (= c 114) (Ok (esc-char 13 nx))
+          (= c 102) (Ok (esc-char 12 nx))
+          (= c 97) (Ok (esc-char 7 nx))
+          (= c 101) (Ok (esc-char 27 nx))
+          (= c 48) (octal-escape src nx)
+          (= c 120) (let [v (hex-run src nx 2)] (if (< v 0) (Err (err-at "Illegal hexadecimal escape sequence" pos)) (Ok (esc-char v (+ nx 2)))))
+          (= c 117) (let [v (hex-run src nx 4)] (if (< v 0) (Err (err-at "Illegal Unicode escape sequence" pos)) (Ok (esc-char v (+ nx 4)))))
+          (and (not in-class) (= c 98)) (Ok (esc-assert 3 nx))
+          (and (not in-class) (= c 66)) (Ok (esc-assert 4 nx))
+          (and (not in-class) (= c 65)) (Ok (esc-assert 5 nx))
+          (and (not in-class) (= c 122)) (Ok (esc-assert 6 nx))
+          (and (not in-class) (= c 90)) (Ok (esc-assert 7 nx))
+          (and (>= c 49) (<= c 57)) (Err (err-at "backreferences are not supported" pos))
+          (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))) (Err (err-at "unsupported escape sequence" pos))
+          :else (Ok (esc-char c nx)))))
+
+;; ---- classes ----
+
+;; one item of a class: an escape, or a literal character (a `[` and `&&` are refused)
+(defun class-item (src: (Vec i64) pos: i64) -> (Result Esc str)
+  (let [c (at src pos)]
+    (cond (= c 92) (parse-escape src (+ pos 1) true)
+          (= c 91) (Err (err-at "nested character classes are not supported" pos))
+          (and (= c 38) (= (at src (+ pos 1)) 38)) (Err (err-at "class intersection is not supported" pos))
+          :else (Ok (esc-char c (+ pos 1))))))
+
+;; after `[`: ranges so far in `acc`; the whole class up to its `]`
+(defun class-body (src: (Vec i64) pos: i64 acc: (Vec i64) first: bool) -> (Result Parsed str)
+  (let [c (at src pos)]
+    (cond (= c -1) (Err (err-at "Unclosed character class" pos))
+          (and (= c 93) (not first)) (Ok (Parsed (NSet (cs-norm acc)) (+ pos 1) 0))
+          (and (= c 93) first) (Err (err-at "Unclosed character class" pos))
+          :else (try-let [it (class-item src pos)]
+                  (if (= (. it kind) 1)
+                      (class-body src (. it pos) (vec (concat acc (. it cs))) false)
+                      (if (and (= (at src (. it pos)) 45) (!= (at src (+ (. it pos) 1)) 93) (!= (at src (+ (. it pos) 1)) -1))
+                          (try-let [hi (class-item src (+ (. it pos) 1))]
+                            (cond (!= (. hi kind) 0) (Err (err-at "Illegal character range" pos))
+                                  (< (. hi cp) (. it cp)) (Err (err-at "Illegal character range" pos))
+                                  :else (class-body src (. hi pos) (conj acc (pack (. it cp) (. hi cp))) false)))
+                          (class-body src (. it pos) (conj acc (pack (. it cp) (. it cp))) false)))))))
+
+(defun parse-class (src: (Vec i64) pos: i64 ng: i64) -> (Result Parsed str)
+  (let [neg (= (at src pos) 94)]
+    (try-let [body (class-body src (if neg (+ pos 1) pos) (vec-empty) true)]
+      (Ok (Parsed (match (. body node)
+                    ((NSet cs) (NSet (if neg (cs-negate cs) cs)))
+                    (n n))
+                  (. body pos) ng)))))
+
+;; ---- atoms, quantifiers, sequences ----
+
+(defun leaf (n: Node pos: i64 ng: i64) -> (Result Parsed str) (Ok (Parsed n pos ng)))
+
+(defun parse-group (src: (Vec i64) pos: i64 ng: i64) -> (Result Parsed str)
+  (let [special (= (at src pos) 63)
+        capturing (not special)]
+    (cond (and special (!= (at src (+ pos 1)) 58)) (Err (err-at "this group syntax is not supported" pos))
+          :else (let [idx (+ ng 1)
+                      body-pos (if capturing pos (+ pos 2))]
+                  (try-let [body (parse-alt src body-pos (if capturing idx ng))]
+                    (if (= (at src (. body pos)) 41)
+                        (Ok (Parsed (if capturing (NGroup idx (. body node)) (. body node)) (+ (. body pos) 1) (. body groups)))
+                        (Err (err-at "Unclosed group" (. body pos)))))))))
+
+(defun parse-atom (src: (Vec i64) pos: i64 ng: i64) -> (Result Parsed str)
+  (let [c (at src pos)]
+    (cond (= c 40) (parse-group src (+ pos 1) ng)
+          (= c 91) (parse-class src (+ pos 1) ng)
+          (= c 46) (leaf (NSet (cs-dot)) (+ pos 1) ng)
+          (= c 94) (leaf (NAssert 1) (+ pos 1) ng)
+          (= c 36) (leaf (NAssert 2) (+ pos 1) ng)
+          (= c 92) (try-let [e (parse-escape src (+ pos 1) false)]
+                     (cond (= (. e kind) 0) (leaf (NSet (cs-one (. e cp))) (. e pos) ng)
+                           (= (. e kind) 1) (leaf (NSet (. e cs)) (. e pos) ng)
+                           :else (leaf (NAssert (. e cp)) (. e pos) ng)))
+          (or (= c 42) (= c 43) (= c 63)) (Err (err-at "Dangling meta character" pos))
+          (= c 123) (Err (err-at "Illegal repetition" pos))
+          :else (leaf (NSet (cs-one c)) (+ pos 1) ng))))
+
+(defun digits-from (src: (Vec i64) pos: i64) -> Num
+  (loop [i pos acc 0]
+    (let [d (- (at src i) 48)]
+      (if (and (>= d 0) (<= d 9) (< acc 100000))
+          (recur (+ i 1) (+ (* acc 10) d))
+          (Num (if (= i pos) -1 acc) i)))))
+
+(defun no-quant (pos: i64) -> Quant (Quant false 0 0 true pos))
+
+;; the lazy or possessive mark after a quantifier
+(defun finish-quant (src: (Vec i64) mn: i64 mx: i64 pos: i64) -> (Result Quant str)
+  (let [c (at src pos)]
+    (cond (or (> mn max-repeat) (> mx max-repeat)) (Err (err-at "repetition count is too large (at most 1000)" pos))
+          (and (>= mx 0) (< mx mn)) (Err (err-at "Illegal repetition range" pos))
+          (= c 63) (Ok (Quant true mn mx false (+ pos 1)))
+          (= c 43) (Err (err-at "possessive quantifiers are not supported" pos))
+          :else (Ok (Quant true mn mx true pos)))))
+
+;; `{n}`, `{n,}` or `{n,m}` whose brace is at pos
+(defun parse-braces (src: (Vec i64) pos: i64) -> (Result Quant str)
+  (let [lo (digits-from src (+ pos 1))
+        a (. lo v)
+        p1 (. lo pos)]
+    (cond (< a 0) (Err (err-at "Illegal repetition" pos))
+          (= (at src p1) 125) (finish-quant src a a (+ p1 1))
+          (!= (at src p1) 44) (Err (err-at "Unclosed counted closure" p1))
+          :else (let [hi (digits-from src (+ p1 1))
+                      b (. hi v)
+                      p2 (. hi pos)]
+                  (if (!= (at src p2) 125)
+                      (Err (err-at "Unclosed counted closure" p2))
+                      (finish-quant src a b (+ p2 1)))))))
+
+(defun parse-quant (src: (Vec i64) pos: i64) -> (Result Quant str)
+  (let [c (at src pos)]
+    (cond (= c 42) (finish-quant src 0 -1 (+ pos 1))
+          (= c 43) (finish-quant src 1 -1 (+ pos 1))
+          (= c 63) (finish-quant src 0 1 (+ pos 1))
+          (= c 123) (parse-braces src pos)
+          :else (Ok (no-quant pos)))))
+
+(defun parse-piece (src: (Vec i64) pos: i64 ng: i64) -> (Result Parsed str)
+  (try-let [a (parse-atom src pos ng)
+            q (parse-quant src (. a pos))]
+    (if (. q has)
+        (Ok (Parsed (NRep (. a node) (. q min) (. q max) (. q greedy)) (. q pos) (. a groups)))
+        (Ok a))))
+
+(defun cat-node (items: (Vec Node)) -> Node
+  (cond (= (count items) 0) NEmpty
+        (= (count items) 1) (nth items 0)
+        :else (NCat items)))
+
+(defun parse-cat (src: (Vec i64) pos: i64 ng: i64 items: (Vec Node)) -> (Result Parsed str)
+  (let [c (at src pos)]
+    (if (or (= c -1) (= c 124) (= c 41))
+        (Ok (Parsed (cat-node items) pos ng))
+        (try-let [p (parse-piece src pos ng)]
+          (parse-cat src (. p pos) (. p groups) (conj items (. p node)))))))
+
+(defun parse-alts (src: (Vec i64) pos: i64 ng: i64 alts: (Vec Node)) -> (Result Parsed str)
+  (try-let [c (parse-cat src pos ng (vec-empty))]
+    (let [alts2 (conj alts (. c node))]
+      (if (= (at src (. c pos)) 124)
+          (parse-alts src (+ (. c pos) 1) (. c groups) alts2)
+          (Ok (Parsed (if (= (count alts2) 1) (nth alts2 0) (NAlt alts2)) (. c pos) (. c groups)))))))
+
+(defun parse-alt (src: (Vec i64) pos: i64 ng: i64) -> (Result Parsed str)
+  (parse-alts src pos ng (vec-empty)))
+
+;; the whole pattern, or the message of the first error
+(defun parse-regex (s: str) -> (Result Ast str)
+  (let [src (pattern-cps s)]
+    (try-let [p (parse-alt src 0 0)]
+      (if (< (. p pos) (count src))
+          (Err (err-at "Unmatched closing ')'" (. p pos)))
+          (Ok (Ast (. p node) (. p groups)))))))
