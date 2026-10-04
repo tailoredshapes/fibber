@@ -19,6 +19,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 : "${FIBC:?FIBC must name a seed fibc}"
 export LLVM_SYS_211_PREFIX=${LLVM_SYS_211_PREFIX:-/usr/lib/llvm-21}
+# lair generates code for the host CPU unless told otherwise; a release must run on machines other than the one that built it
+# (a tarball built on a CI runner died with SIGILL on a desktop CPU), so everything this script builds targets a baseline.
+export FIB_TARGET_CPU=${FIB_TARGET_CPU:-x86-64-v2}
 out=$(mkdir -p "${1:-dist}" && cd "${1:-dist}" && pwd)
 "$root/scripts/check-version.sh"
 version=$(tr -d '[:space:]' < VERSION)
@@ -73,6 +76,11 @@ mkdir -p "$tree/bin" "$tree/lib" "$tree/share/fibber"
 REAL_CC=$(command -v cc) PATH="$work/shim:$PATH" build "$work/F3" "$tree/bin/fibc"
 if ! readelf -d "$tree/bin/fibc" | grep -q 'RUNPATH.*\$ORIGIN/../lib'; then
   echo "package: the shipped fibc has no RUNPATH \$ORIGIN/../lib (the cc shim did not take): it would not find liblair.so" >&2; exit 1
+fi
+if command -v objdump >/dev/null 2>&1 && [ "$FIB_TARGET_CPU" = x86-64-v2 ]; then
+  if objdump -d "$tree/bin/fibc" | grep -q -E '\b(ymm|zmm)[0-9]'; then
+    echo "package: the shipped fibc uses AVX registers although it was built for $FIB_TARGET_CPU: FIB_TARGET_CPU did not take" >&2; exit 1
+  fi
 fi
 emit "$tree/bin/fibc" > "$work/emit.ship"
 cmp "$work/emit.F" "$work/emit.ship" || { echo "package: the shipped fibc emits something else" >&2; exit 1; }
