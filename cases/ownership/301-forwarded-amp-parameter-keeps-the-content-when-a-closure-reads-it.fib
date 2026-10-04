@@ -1,0 +1,19 @@
+;; spec:   types §6.6 (taking the content; "an `&` parameter captured by an argument is not forwarded")
+;; expect: accept
+;; result: 10
+;; audit:  clean
+;; `f` forwards its `&p` to `poke` at a call in non-tail position, and the closure passed in reads `p`. The closure mentions `p`, so
+;; the call copies in (retain): `poke` writes 9 into its private copy while the closure still reads `f`'s cell, the old array (1);
+;; the write-back then makes `p` the written copy (9). Taking the content would let `poke`'s write land in the array the closure
+;; reads, `seen` would be 9 and the result 18.
+(defun poke (&a: (Array i64) g: (fn () i64) :borrow) -> i64
+  (do (array-set! &a 0 9)
+      (g)))
+
+(defun f (&p: (Array i64)) -> i64
+  (let ((seen (poke &p (fn () (array-get @p 0)))))
+    (+ seen (array-get @p 0))))
+
+(defun main () -> i64
+  (let ((c (cell (array 4 1))))
+    (f &c)))

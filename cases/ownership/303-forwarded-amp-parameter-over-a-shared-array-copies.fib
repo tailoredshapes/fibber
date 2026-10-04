@@ -1,0 +1,17 @@
+;; spec:   types §6.6 (taking the content, why it is sound: "the frames below hold the content too")
+;; expect: accept
+;; result: 1013
+;; audit:  clean
+;; `a` is held by a `let` binding and by the cell `c`, so its count is two. `top` forwards `&p` to `rev` at a non-tail call (taken: one
+;; count moves on, the count stays two), and `rev`'s `array-set!` finds the count above one and copies: `a` is as it was, the cell `c`
+;; holds the written copy (1 + 9 + 1 + 1 = 12). 1000 + 1 (a's slot 1) + 12 = 1013. A take that wrote in place would make `a` 9.
+(defun rev (&p: (Array i64) k: i64) -> unit (array-set! &p k 9))
+
+(defun top (&p: (Array i64)) -> unit
+  (do (rev &p 1) ()))
+
+(defun main () -> i64
+  (let ((a (array 4 1)))
+    (let ((c (cell a)))
+      (do (top &c)
+          (+ 1000 (array-get a 1) (loop [i 0 s 0] (if (< i 4) (recur (+ i 1) (+ s (array-get @c i))) s)))))))

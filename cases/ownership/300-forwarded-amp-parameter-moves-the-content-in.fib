@@ -1,0 +1,20 @@
+;; spec:   types §6.6 (taking the content), §6.10 rule (b)
+;; expect: accept
+;; result: 45
+;; audit:  clean
+;; allocs: <= 1
+;; `flips` has an `&` parameter `p` and passes `&p` on to `rev` at a call that is not in tail position (a loop body). Nothing else
+;; mentions `p` in the call and no closure captures it, so the call takes the content out of `flips`'s private cell instead of
+;; retaining it for `rev`'s: `rev` finds the array unique and `array-set!` writes in place, on every call, down both levels.
+;; The array is the one heap object. With the copy-in retained (`&p: acquire`, as before batch 6) each of the nine `rev`
+;; calls copies the array and the run allocates ten objects.
+(defun rev (&p: (Array i64) k: i64) -> unit (array-set! &p k (+ k 1)))
+
+(defun flips (&p: (Array i64) n: i64) -> unit
+  (loop [i 0]
+    (if (< i n) (do (rev &p i) (recur (+ i 1))) ())))
+
+(defun main () -> i64
+  (let ((c (cell (array 9 1))))
+    (do (flips &c 9)
+        (loop [i 0 s 0] (if (< i 9) (recur (+ i 1) (+ s (array-get @c i))) s)))))

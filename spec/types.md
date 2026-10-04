@@ -2159,9 +2159,10 @@ the arguments left it (**Decided**, owner, 2026-09-28; syntax §2), so
 an argument after `&x` that writes `x` is seen by the callee (cases 151
 to 153). The private cell is initialised with `@x` (**Decided**, D1) —
 an **acquire**, +1 on the content, which the caller's cell `x` keeps
-holding. There is no move: a place is a variable, never a field;
-nothing is ever taken out of anything; the object in `x` is shared by
-the two cells for the duration of the call, and its count says so. The unique-write
+holding. There is no move *in the language*: a place is a variable, never a field;
+nothing is ever taken out of a field; the object in `x` is shared by
+the two cells for the duration of the call, and its count says so (the compiler's **take**, below, is an
+optimisation that is invisible when its conditions hold). The unique-write
 primitives below therefore copy on the first update through an `&`
 parameter, and the copy, held by the private cell alone, is unique
 from then on. The primitives themselves take no copy-in and no
@@ -2174,6 +2175,41 @@ cell's content is moved into the variable with `set!` semantics (the
 variable's old content is released), then the private cell is freed
 (no count). The interpreter implements exactly this, so the compiler's
 allocations match its allocations (§6.12).
+
+**Taking the content** (performance batches 4 and 6, lever L1; cases 261, 262, 300 to 304). The copy-in above is the
+rule of the language; the compiler replaces it by a **take** when nothing can tell the difference. An `&b` argument of an
+ordinary call is **taken** iff all of:
+
+1. `b` is a binding of the enclosing body that has a cell of its own: a `let` cell of this frame, or an **`&` parameter of
+   the enclosing `defun`** (its private cell, §6.6 first paragraph; "forwarded" at an ordinary call, which is not a tail
+   call, until batch 6 this case was always an acquire);
+2. no other operand of the call **mentions** `b` (the test of "captured by an argument" above: a variable, `@b`, `&b`, a
+   `set!` target, inside a `fn` or `async` literal at any depth) and no `fn` or `async` literal of the body captures `b`
+   (own.lastuse `amp`, filled by the same pass that finds last uses; a binding that is pinned never takes);
+3. the callee is not a builtin (an `&` operand of `array-set!` and its kin is the variable's own cell, `own cell`).
+
+A taken `&b` makes the private cell by moving the content of `b`'s cell into it: no `fib.retain`, and the content stays
+where it was, unreferenced, until the write-back; the write-back stores the private cell's content into `b`'s cell and does
+**not** release the old content, which was moved. The call's `explain` line is `&b: move in`; an acquired one is `&b: acquire`.
+
+*Why it is sound.* An acquire and a take differ in one observable thing: while the call runs, the variable `b` still names
+the old content in the acquire and names a moved-from slot in the take. Nothing can read that slot during the call, because
+every route to `b`'s cell during the call is closed: (i) another operand of the call is evaluated *before* the call and
+mentions `b` nowhere (2), so it neither holds a derived read of `b`'s content nor can write `b`; (ii) the callee reaches `b`
+only through the private cell, since the only other names for `b` are `b` itself, closures that mention `b` (none, by 2: a
+closure made by the callee cannot mention `b`, which is not in its scope; one passed in mentions it, an operand), and
+the cells of the frames below the caller: they hold their own cells. In the `&`-parameter case the frames below hold the
+content too only when *their* copy-in acquired it, and then the count is two and the callee's first write copies
+(slower, never wrong); when theirs took it, the content has count one and the chain of takes is a chain of moves of
+one count, which is what a forwarded `&` at a tail call already is. (iii) the cells are never read by another thread: an
+`&` cell is a stack temporary of a frame and no task, atom or `Send` value can hold it (§6.5, §8.6). After the call the
+write-back restores the invariant "every cell holds a counted pointer" before any other expression of the caller runs.
+A call that does not return (a trap, a panic) leaves a moved-from slot behind; the program is terminated and no code reads
+it, which is the same position as a forwarded `&` whose callee traps (**out of scope**: a trap aborts the program, nothing runs after it, §2.11).
+Case 261 takes from a `let` cell; cases 300 to 304 take from an `&` parameter (300 and 302: in place, with an allocation
+bound; 301: a closure mentions the parameter; 303: the content is shared below; 304: the callee replaces the content) and each
+fails under the mutant that breaks the rule it pins (`scripts/mutant-amp-param.sh`, modes `mention`, `param`, `release`,
+`writeback`).
 
 **Forwarding at a tail call** (§6.10 rule (b); **Decided**, D5 as
 amended by the owner): at a call in tail position, an argument `&v`
@@ -3707,8 +3743,8 @@ quantum.
 | non-final `do` step with an `Owned` value | `fib.release` at the step's end |
 | `@c`, `@a`, `@w` | as §8.6/§8.7 (always a `fib.retain`; atom under lock; weak "retain if alive") |
 | `set!`, `reset!`, `swap!` | as §8.6: `consume` new, share if `SHARED`, store, `fib.release` old |
-| `&` copy-in | at call entry, after every argument, in parameter order: `fib.retain` the variable's content and store it into the private cell (§6.6); nothing for a forwarded `&v` (§6.10 rule (b)), nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
-| `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content |
+| `&` copy-in | at call entry, after every argument, in parameter order: `fib.retain` the variable's content and store it into the private cell (§6.6), or, for a taken `&b` (§6.6), store it without the retain; nothing for a forwarded `&v` (§6.10 rule (b)), nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
+| `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content, unless the copy-in took it (§6.6) |
 | `array-set!`, `set-field!` | `fib.unique?` test (flags first, `HAS-WEAK` among them, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
 | `array-take!`, `array-push!`, `array-pop!` | the same test on the array in the `&` cell (`array-push!` tests `fib.array-roomy?`: unique, `ROOMY`, `len < 32`); on failure a copy is stored and the old array released; then the element moved out (null left in the slot of an object element), or appended with `len` increased, or `len` decreased and the last element returned (§2.13.1) |
 | `cell-update!` | load the content of the cell, store null there (object content) or retain it (`dyn`), call `f` with it owned, store the result without a retain (§2.13.1) |
@@ -3854,7 +3890,10 @@ together with seven amendments:
 
 - **D1** copy-in always acquires: no copy-in move, no exclusive places,
   no takeable structs, no taken fields, no `&(. x f)` places, no
-  `fib.takeable?`, no taken-field audit event (§6.6, §8.2);
+  `fib.takeable?`, no taken-field audit event (§6.6, §8.2). Amended by
+  performance batches 4 and 6 (§6.6 "Taking the content"): the *language* still copies in by acquire; the
+  compiler takes the content instead where nothing can tell, from a `let` cell and, since batch 6, from an `&`
+  parameter forwarded at a call that is not a tail call. A place is still only a variable;
 - **D2** `&` parameters are cells read with `@v`, never values (§2.14);
 - **D3** HM inference generalising only at top-level `defun` SCCs; `let`
   and `fn` never generalise; no coercions; no literal polymorphism
