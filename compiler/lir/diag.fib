@@ -1,0 +1,36 @@
+;; compiler/lir/diag.fib: diagnostics, as crates/lir/src/diag.rs: a message and the position of the form at fault.
+;;
+;; A position is one i64, `line << 32 | col`, both 1-based (the Rust `Pos { line: u32, col: u32 }`, whose default is 0:0, is the
+;; word 0). It is a scalar: no object, no count, no header per node of the tree (docs/design/lair-in-fibber.md 1.3).
+(ns lir.diag)
+
+;; One error: printed `LINE:COL: error: MESSAGE` (spec/lir.md section 10).
+(defrecord Diagnostic (pos: i64 message: str))
+
+;; The position of line and col (diag.rs `Pos { line, col }`).
+(defun pos-new (line: i64 col: i64) -> i64 (bit-or (shl line 32) col))
+
+;; The position 0:0 (Rust `Pos::default()`).
+(defun pos-none () -> i64 0)
+
+(defun pos-line (p: i64) -> i64 (shr p 32))
+
+(defun pos-col (p: i64) -> i64 (bit-and p 4294967295))
+
+;; `L:C`.
+(defun pos-str (p: i64) -> str (str (pos-line p) ":" (pos-col p)))
+
+;; A diagnostic at pos (diag.rs `Diagnostic::new`).
+(defun diag-new (pos: i64 message: str) -> Diagnostic (Diagnostic pos message))
+
+;; `LINE:COL: error: MESSAGE` (diag.rs `Display`).
+(defun diag-str (d: Diagnostic) -> str
+  (str (pos-str (. d pos)) ": error: " (. d message)))
+
+;; With a file name in front, as `lair` prints it (diag.rs `in_file`).
+(defun diag-in-file (d: Diagnostic file: str) -> str
+  (str file ":" (diag-str d)))
+
+;; An error carrying one diagnostic (diag.rs `err`): `(Err (Diagnostic pos message))`.
+(defun err (pos: i64 message: str) -> (Result t Diagnostic)
+  (Err (Diagnostic pos message)))

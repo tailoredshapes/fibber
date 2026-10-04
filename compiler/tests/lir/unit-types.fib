@@ -1,0 +1,47 @@
+;; compiler/tests/lir/unit-types.fib: compiler/lir/types.fib and compiler/lir/diag.fib. SOURCE: the expected texts are those of the Rust
+;; tests of crates/lir/src/types.rs (`displays_as_written`, `named_and_anonymous_structs_differ`) and of diag.rs's `Display`
+;; (`LINE:COL: error: MESSAGE`).
+;; Build: fibc build compiler/tests/lir/unit-types.fib -I compiler -I lib -o OUT
+(ns main (:use types.check lir.diag lir.types))
+
+(defun main () -> i64
+  (let ((cs (checks-new))
+        (pair (TAnon [ty-ptr ty-ptr]))
+        (arr (TArray 3 (TArray 0 ty-ptr)))
+        (tailfn (LFnType CcTail nil [ty-ptr] true)))
+    (do
+      (check cs "types display as written"
+             (and (= (type-str pair) "{ ptr, ptr }")
+                  (= (type-str (TVector 4 ty-i32)) "<4 x i32>")
+                  (= (type-str (TNamed "s")) "%struct.s")
+                  (= (type-str arr) "[3 x [0 x ptr]]")
+                  (= (type-str (TAnon [])) "{ }")
+                  (= (type-str ty-float) "float") (= (type-str ty-double) "double") (= (type-str (TInt 64)) "i64")))
+      (check cs "an aggregate has no bit size, a vector has lanes times the element's"
+             (and (type-aggregate? arr) (= (type-bits arr) nil) (= (type-bits ty-ptr) nil)
+                  (= (type-bits (TVector 4 ty-i32)) (some 128)) (= (type-bits ty-double) (some 64))
+                  (= (type-bits ty-i1) (some 1))))
+      (check cs "a function type prints its convention only when it is not ccc, and its variadic dots"
+             (and (= (fn-type-str tailfn) "(fn tailcc void (ptr ...))")
+                  (= (fn-type-str (LFnType CcC (some ty-i64) [ty-i64 ty-ptr] false)) "(fn i64 (i64 ptr))")
+                  (= (ret-str nil) "void") (= (cc-str CcC) "ccc") (= (cc-str CcTail) "tailcc")))
+      (check cs "named and anonymous structs differ; equality is structural"
+             (and (!= (TNamed "p") (TAnon [ty-ptr])) (= (TAnon [ty-ptr ty-i32]) (TAnon [ty-ptr (TInt 32)]))
+                  (!= (TVector 2 ty-i32) (TVector 4 ty-i32))))
+      (check cs "the scalar keywords, and nothing else, name a scalar type"
+             (and (= (scalar-keyword "i1") (some ty-i1)) (= (scalar-keyword "ptr") (some ty-ptr))
+                  (= (scalar-keyword "i128") nil) (= (scalar-keyword "void") nil)))
+      (check cs "int-like, float-like, scalar and the shape of a comparison follow vectors"
+             (and (type-int-like? (TVector 4 ty-i32)) (not (type-int-like? ty-ptr)) (type-float-like? (TVector 2 ty-double))
+                  (= (type-scalar (TVector 4 ty-i32)) ty-i32) (= (type-bool-shape (TVector 4 ty-i32)) (TVector 4 ty-i1))
+                  (= (type-bool-shape ty-i64) ty-i1) (= (type-lanes (TVector 4 ty-i32)) (some 4)) (= (type-lanes ty-i32) nil)))
+      (check cs "a diagnostic prints LINE:COL: error: MESSAGE, with the file in front when asked"
+             (and (= (diag-str (Diagnostic (pos-new 12 7) "bad")) "12:7: error: bad")
+                  (= (diag-in-file (Diagnostic (pos-new 1 1) "x") "a.lir") "a.lir:1:1: error: x")
+                  (= (pos-str (pos-new 4000000 123456)) "4000000:123456")
+                  (= (pos-line (pos-new 9 3)) 9) (= (pos-col (pos-new 9 3)) 3) (= (pos-str (pos-none)) "0:0")))
+      (check cs "err makes an Err of one diagnostic"
+             (match (let ((r (err (pos-new 2 5) "boom"))) (do r))
+               ((Err d) (and (= (. d pos) (pos-new 2 5)) (= (. d message) "boom")))
+               ((Ok x) false)))
+      (finish cs))))

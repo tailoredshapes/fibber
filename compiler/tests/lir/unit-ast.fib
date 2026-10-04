@@ -1,0 +1,47 @@
+;; compiler/tests/lir/unit-ast.fib: compiler/lir/ast.fib. SOURCE: `Kind::is_terminator` of crates/lir/src/ast.rs (ret, br, condbr, switch,
+;; unreachable and a tail call end a block; a plain call does not), `Expr::int_literal`, `Linkage::exported`, and the derived order of
+;; `Ordering`. The tree built here is `(define (main i32) () (block entry (let ((x (i32 -1))) (ret x))))`.
+;; Build: fibc build compiler/tests/lir/unit-ast.fib -I compiler -I lib -o OUT
+(ns main (:use types.check lir.diag lir.types lir.lit lir.ast))
+
+(defun at (k: LKind) -> LExpr (expr-new k (pos-new 1 1)))
+
+(defun call-of (tail: bool) -> LKind (KCall (CalDirect "f") [] tail))
+
+(defun the-module () -> LModule
+  (let ((x (at (KInt ty-i32 (lit-of -1))))
+        (ret (at (KRet (some (at (KLocal "x"))))))
+        (blk (LBlock "entry" [(at (KLet [(LBinding "x" x (pos-new 1 40))] [ret]))] (pos-new 1 30)))
+        (fty (LFnType CcC (some ty-i32) [] false)))
+    (LModule [(ItDefine (LFunction "main" fty [] [blk] (LModifiers lk-external false) (pos-new 1 1)))])))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (check cs "the forms that end a block are ret, br, condbr, switch, unreachable and a tail call"
+             (and (kind-terminator? (KRet nil)) (kind-terminator? (KBr "a")) (kind-terminator? (KCondBr (at kind-null) "a" "b"))
+                  (kind-terminator? (KSwitch (at kind-null) "d" [])) (kind-terminator? kind-unreachable)
+                  (kind-terminator? (call-of true))))
+      (check cs "a plain call, a trap, a literal and a store do not end a block"
+             (and (not (kind-terminator? (call-of false))) (not (kind-terminator? kind-trap)) (not (kind-terminator? kind-null))
+                  (not (kind-terminator? (KLocal "x")))
+                  (not (kind-terminator? (KStore (at kind-null) (at kind-null) false nil)))))
+      (check cs "an integer literal written in place is its LLit, nothing else is"
+             (and (= (expr-int-literal (at (KInt ty-i8 (lit-of 255)))) (some (lit-of 255)))
+                  (= (expr-int-literal (at (KLocal "x"))) nil)
+                  (= (expr-int-literal (at (KFloat ty-double 1.5))) nil)))
+      (check cs "only external linkage is exported"
+             (and (linkage-exported? lk-external) (not (linkage-exported? lk-internal)) (not (linkage-exported? lk-private))))
+      (check cs "orderings rank as the Rust derive orders them"
+             (and (< (ordering-rank OUnordered) (ordering-rank OMonotonic)) (< (ordering-rank OAcquire) (ordering-rank ORelease))
+                  (< (ordering-rank OAcqRel) (ordering-rank OSeqCst)) (= (ordering-rank OSeqCst) 5)))
+      (check cs "a module is an owned tree that can be walked: its one function, block, let and ret"
+             (match (nth (. (the-module) items) 0)
+               ((ItDefine f)
+                (and (= (. f name) "main") (not (function-variadic? f)) (= (count (. f blocks)) 1)
+                     (match (. (nth (. (nth (. f blocks) 0) body) 0) kind)
+                       ((KLet binds body) (and (= (count binds) 1) (= (. (nth binds 0) name) "x") (= (count body) 1)
+                                               (kind-terminator? (. (nth body 0) kind))))
+                       (_ false))))
+               (_ false)))
+      (finish cs))))

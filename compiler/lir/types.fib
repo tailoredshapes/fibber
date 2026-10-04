@@ -1,0 +1,131 @@
+;; compiler/lir/types.fib: the types of lIR (spec/lir.md section 2), as crates/lir/src/types.rs.
+;;
+;; Names. Variant and type names are global across the modules a program links (spec/syntax.md), and the compiler has `Module`, `Block`,
+;; `Item`, `Pos` and many more; so every type of `lir.*` carries an `L` and every variant a short prefix of its enum (`T` for a type,
+;; `Cc` for a convention). The Rust name is beside each.
+;;
+;; Payload-free variants allocate: a `Float` made twice is two objects (measured, docs/design/lair-interfaces.md section 5). The
+;; parser must therefore never write `TFloat`, `TDouble` or `TPtr` or `(TInt 32)` in a hot path; it takes the shared constants below
+;; (`ty-ptr`, `ty-i32` ..), a top-level `def` that is made once and only counted afterwards.
+(ns lir.types)
+
+;; A first-class lIR type (types.rs `Type`). Equality is structural and nominal as in LLVM: a named struct equals only itself.
+(defenum LType
+  (TInt bits: i64)                    ;; iN, N in {1, 8, 16, 32, 64}
+  (TFloat)
+  (TDouble)
+  (TPtr)
+  (TVector lanes: i64 elem: LType)    ;; <N x E>
+  (TNamed name: str)                  ;; %struct.NAME
+  (TAnon fields: (Vec LType))         ;; { T* }
+  (TArray n: i64 elem: LType))        ;; [N x T]; Rust's u64, but the parser refuses N above u32::MAX (parse/ty.rs), so an i64 holds it
+(derive Eq LType)
+
+;; A calling convention (types.rs `Cc`): `CcC` is `ccc`, the default; `CcTail` is `tailcc`.
+(defenum LCc CcC CcTail)
+(derive Eq LCc)
+
+;; A function's type (types.rs `FnType`): convention, result (nil is `void`), parameters, variadic.
+(defstruct LFnType (cc: LCc ret: (Option LType) params: (Vec LType) varargs: bool))
+(derive Eq LFnType)
+
+;; The shared scalar types (types.rs `I1`, `I32` and the keywords of `scalar_keyword`).
+(def ty-i1: LType (TInt 1))
+(def ty-i8: LType (TInt 8))
+(def ty-i16: LType (TInt 16))
+(def ty-i32: LType (TInt 32))
+(def ty-i64: LType (TInt 64))
+(def ty-float: LType TFloat)
+(def ty-double: LType TDouble)
+(def ty-ptr: LType TPtr)
+
+;; The shared conventions.
+(def cc-c: LCc CcC)
+(def cc-tail: LCc CcTail)
+
+;; The scalar type a keyword names (types.rs `scalar_keyword`): `i1 i8 i16 i32 i64 float double ptr`.
+(defun scalar-keyword (s: str) -> (Option LType)
+  (cond (= s "i1") (some ty-i1)
+        (= s "i8") (some ty-i8)
+        (= s "i16") (some ty-i16)
+        (= s "i32") (some ty-i32)
+        (= s "i64") (some ty-i64)
+        (= s "float") (some ty-float)
+        (= s "double") (some ty-double)
+        (= s "ptr") (some ty-ptr)
+        :else nil))
+
+(defun type-int? (t: LType) -> bool
+  (match t ((TInt _) true) (_ false)))
+
+(defun type-float? (t: LType) -> bool
+  (match t ((TFloat) true) ((TDouble) true) (_ false)))
+
+;; The element type of a vector, or the type itself (types.rs `scalar`).
+(defun type-scalar (t: LType) -> LType
+  (match t ((TVector _ e) e) (_ t)))
+
+;; Integer or vector of integers (types.rs `is_int_like`).
+(defun type-int-like? (t: LType) -> bool (type-int? (type-scalar t)))
+
+;; Float, double or a vector of them (types.rs `is_float_like`).
+(defun type-float-like? (t: LType) -> bool (type-float? (type-scalar t)))
+
+(defun type-aggregate? (t: LType) -> bool
+  (match t ((TNamed _) true) ((TAnon _) true) ((TArray _ _) true) (_ false)))
+
+;; Lanes of a vector type (types.rs `lanes`).
+(defun type-lanes (t: LType) -> (Option i64)
+  (match t ((TVector n _) (some n)) (_ nil)))
+
+;; Size in bits of a non-aggregate, non-pointer type, for bitcast (types.rs `bits`); nil for a pointer or an aggregate.
+(defun type-bits (t: LType) -> (Option i64)
+  (match t
+    ((TInt n) (some n))
+    ((TFloat) (some 32))
+    ((TDouble) (some 64))
+    ((TVector n e) (if-some (b (type-bits e)) (some (* b n)) nil))
+    (_ nil)))
+
+;; The same shape with `i1` elements: the type of a comparison (types.rs `bool_shape`).
+(defun type-bool-shape (t: LType) -> LType
+  (match t ((TVector n _) (TVector n ty-i1)) (_ ty-i1)))
+
+;; The text of a type, as `Display` prints it: `i32`, `<4 x i32>`, `%struct.s`, `[3 x ptr]`, `{ ptr, ptr }`, `{ }`.
+(defun type-str (t: LType) -> str
+  (match t
+    ((TInt n) (str "i" n))
+    ((TFloat) "float")
+    ((TDouble) "double")
+    ((TPtr) "ptr")
+    ((TVector n e) (str "<" n " x " (type-str e) ">"))
+    ((TNamed s) (str "%struct." s))
+    ((TArray n e) (str "[" n " x " (type-str e) "]"))
+    ((TAnon fs) (if (= (count fs) 0)
+                    "{ }"
+                    (str "{ " (str-join-with ", " (vec (map type-str fs))) " }")))))
+
+;; `items` joined by `sep`.
+(defun str-join-with (sep: str items: (Vec str)) -> str
+  (loop ((i 0) (acc ""))
+    (if (>= i (count items))
+        acc
+        (recur (+ i 1) (if (= i 0) (nth items 0) (str acc sep (nth items i)))))))
+
+;; `void` or the type (types.rs `show_ret`).
+(defun ret-str (t: (Option LType)) -> str
+  (match t ((some x) (type-str x)) (nil "void")))
+
+;; `ccc` or `tailcc` (types.rs `Display for Cc`).
+(defun cc-str (c: LCc) -> str
+  (match c ((CcC) "ccc") ((CcTail) "tailcc")))
+
+;; The parameter list as `(i64 ptr ...)` (types.rs `show_params`).
+(defun fn-params-str (f: LFnType) -> str
+  (let ((parts (vec (map type-str (. f params)))))
+    (str "(" (str-join-with " " (if (. f varargs) (conj parts "...") parts)) ")")))
+
+;; `(fn tailcc void (ptr ...))`: the text of a function type (types.rs `Display for FnType`; `ccc` is not written).
+(defun fn-type-str (f: LFnType) -> str
+  (let ((cc (match (. f cc) ((CcC) "") ((CcTail) "tailcc "))))
+    (str "(fn " cc (ret-str (. f ret)) " " (fn-params-str f) ")")))

@@ -1,0 +1,103 @@
+;; compiler/lir/lit.fib: the integer literals of lIR, which Rust holds as i128 and fibber, with no integer wider than i64, holds as
+;; the two words of a 128-bit two's complement value.
+;;
+;; WHY 128 BITS AND NOT 65. An `(iK n)` literal admits -2^(K-1) <= n <= 2^K - 1 for K <= 64 (parse/literal.rs `int_fits`; spec/lir.md
+;; section 3), a range of 65 bits plus sign, which a pair (low 64 bits, sign) would carry. But the index lists of `extractvalue` and
+;; `insertvalue` are `Vec<i128>` and accept ANY integer token that i128 parses (parse/instr.rs `indices`: `int_token`, no range check),
+;; and the checker prints them in messages (`extractvalue: field index 340282366920938463463374607431768211455 out of range ..`,
+;; check/aggr.rs). Only a full i128 reproduces those messages, so every integer literal is an `LLit` (hi, lo): the value
+;; `hi * 2^64 + lo` with `lo` read as unsigned and `hi` signed. The parser admits tokens whose magnitude is at most 2^127 - 1 (what
+;; `i128::from_str_radix` takes), exactly as `int_token` does, then applies the sign.
+(ns lir.lit)
+
+;; A 128-bit two's complement integer.
+(defrecord LLit (hi: i64 lo: i64))
+
+;; The literal of a machine integer, sign-extended.
+(defun lit-of (v: i64) -> LLit (LLit (sar v 63) v))
+
+(defun lit-zero () -> LLit (LLit 0 0))
+
+;; Whether the value is below zero.
+(defun lit-negative? (v: LLit) -> bool (< (. v hi) 0))
+
+;; Unsigned `a < b` of two words.
+(defun u64-lt (a: i64 b: i64) -> bool
+  (< (bit-xor a -9223372036854775808) (bit-xor b -9223372036854775808)))
+
+;; -1, 0 or 1 as `a` is below, equal to or above `b` (signed 128-bit).
+(defun lit-cmp (a: LLit b: LLit) -> i64
+  (cond (< (. a hi) (. b hi)) -1
+        (> (. a hi) (. b hi)) 1
+        (= (. a lo) (. b lo)) 0
+        (u64-lt (. a lo) (. b lo)) -1
+        :else 1))
+
+(defun lit-lt? (a: LLit b: LLit) -> bool (< (lit-cmp a b) 0))
+
+;; `a + b`, wrapping at 128 bits.
+(defun lit-add (a: LLit b: LLit) -> LLit
+  (let ((m 4294967295)
+        (s0 (+ (bit-and (. a lo) m) (bit-and (. b lo) m)))
+        (s1 (+ (+ (shr (. a lo) 32) (shr (. b lo) 32)) (shr s0 32)))
+        (s2 (+ (+ (bit-and (. a hi) m) (bit-and (. b hi) m)) (shr s1 32)))
+        (s3 (+ (+ (shr (. a hi) 32) (shr (. b hi) 32)) (shr s2 32))))
+    (LLit (bit-or (shl (bit-and s3 m) 32) (bit-and s2 m))
+          (bit-or (shl (bit-and s1 m) 32) (bit-and s0 m)))))
+
+;; `-a`, wrapping (the minimum is its own negation).
+(defun lit-neg (a: LLit) -> LLit
+  (lit-add (LLit (bit-not (. a hi)) (bit-not (. a lo))) (LLit 0 1)))
+
+;; 2^n for n from 0 to 126.
+(defun lit-pow2 (n: i64) -> LLit
+  (if (< n 64) (LLit 0 (shl 1 n)) (LLit (shl 1 (- n 64)) 0)))
+
+;; The value as an i64, when it fits one.
+(defun lit->i64 (a: LLit) -> (Option i64)
+  (if (= (. a hi) (sar (. a lo) 63)) (some (. a lo)) nil))
+
+;; The low `bits` bits (bits from 1 to 64) as a word: `(v as u128) & mask(bits)` of check/arith.rs and lower/consts.rs `low_bits`. The
+;; word is the unsigned value; compare two of them with `u64-lt`.
+(defun lit-low (a: LLit bits: i64) -> i64
+  (if (>= bits 64) (. a lo) (bit-and (. a lo) (- (shl 1 bits) 1))))
+
+;; Whether `v` fits `iK`: -2^(K-1) <= v <= 2^K - 1, K from 1 to 64 (parse/literal.rs `int_fits`).
+(defun lit-fits-int? (bits: i64 v: LLit) -> bool
+  (let ((lo (lit-neg (lit-pow2 (- bits 1))))
+        (hi (lit-add (lit-pow2 bits) (LLit -1 -1))))
+    (and (>= (lit-cmp v lo) 0) (<= (lit-cmp v hi) 0))))
+
+;; `a * radix + digit` for a non-negative `a` (radix 2 to 16, digit below radix), or nil when the result exceeds 2^127 - 1: one step of
+;; reading the magnitude of a token, as `i128::from_str_radix` does (parse/literal.rs `int_token`).
+(defun lit-mul-add (a: LLit radix: i64 digit: i64) -> (Option LLit)
+  (let ((m 4294967295)
+        (t0 (+ (* (bit-and (. a lo) m) radix) digit))
+        (t1 (+ (* (shr (. a lo) 32) radix) (shr t0 32)))
+        (t2 (+ (* (bit-and (. a hi) m) radix) (shr t1 32)))
+        (t3 (+ (* (shr (. a hi) 32) radix) (shr t2 32))))
+    (if (> t3 2147483647)
+        nil
+        (some (LLit (bit-or (shl t3 32) (bit-and t2 m))
+                    (bit-or (shl (bit-and t1 m) 32) (bit-and t0 m)))))))
+
+;; The signed decimal text of the value, as Rust prints an i128.
+(defun lit-str (a: LLit) -> str
+  (if (lit-negative? a)
+      (str "-" (lit-magnitude-str (lit-neg a)))
+      (lit-magnitude-str a)))
+
+;; The decimal text of the value read as unsigned 128 bits (so the minimum's negation prints).
+(defun lit-magnitude-str :private (a: LLit) -> str
+  (if (and (= (. a hi) 0) (= (. a lo) 0))
+      "0"
+      (loop ((l0 (bit-and (. a lo) 4294967295)) (l1 (shr (. a lo) 32))
+             (l2 (bit-and (. a hi) 4294967295)) (l3 (shr (. a hi) 32))
+             (digits ""))
+        (if (and (= l0 0) (= l1 0) (= l2 0) (= l3 0))
+            digits
+            (let ((c3 (rem l3 10))
+                  (v2 (+ (shl c3 32) l2)) (c2 (rem v2 10))
+                  (v1 (+ (shl c2 32) l1)) (c1 (rem v1 10))
+                  (v0 (+ (shl c1 32) l0)) (c0 (rem v0 10)))
+              (recur (quot v0 10) (quot v1 10) (quot v2 10) (quot l3 10) (str-concat (str c0) digits)))))))

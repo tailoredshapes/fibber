@@ -1,0 +1,189 @@
+;; compiler/lir/ast.fib: the abstract syntax of lIR (spec/lir.md sections 3 to 7), as crates/lir/src/ast.rs: a whole module as one owned tree.
+;;
+;; Shapes decided where Rust and fibber differ (docs/design/lair-in-fibber.md 1.3; docs/design/lair-interfaces.md):
+;; - a position is an i64 (lir.diag `pos-new`); every node that has a `pos` in Rust has one here;
+;; - `Box<Expr>` is a plain `LExpr` field: every fibber object is on the heap already;
+;; - an integer literal or an extractvalue index, an i128 in Rust, is an `LLit` (lir.lit);
+;; - `Kind::Str(Vec<u8>)` is an `(Array i8)`: a string literal may hold any byte (`\xHH`, spec/lir.md section 1), and a fibber `str` is
+;;   valid UTF-8 and traps on anything else (`str-from-bytes`), so it cannot hold the bytes of `(string "\xff")`;
+;; - a `u32` alignment is an i64, `Option<u32>` an `(Option i64)`; a Rust tuple is a record (`LCase`, `LParam`);
+;; - the variants carry a prefix (see lir.types): `K` for `Kind`, `It` for `Item`, `Lk` for `Linkage`, `Cal` for `Callee`, and the operator
+;;   enums their own (`B` BinOp, `U` UnOp, `Ov` OvfOp, `C` CastOp, `I` IPred, `F` FPred, `O` Ordering, `R` RmwOp, `Sc` Scope). The Rust
+;;   name is beside each.
+;; - a payload-free variant allocates when it is written (docs/design/lair-interfaces.md section 5); the parser uses the shared constants
+;;   `kind-trap`, `kind-null`, `kind-unreachable`, `sc-system` .. of this module.
+(ns lir.ast
+  (:use lir.types lir.lit))
+
+;; ---------------------------------------------------------------- operators
+
+;; ast.rs `Linkage`: the default is `LkExternal`.
+(defenum LLinkage LkExternal LkInternal LkPrivate)
+(derive Eq LLinkage)
+
+;; The linkage and visibility words a top-level form takes (ast.rs `Modifiers`; the default is external, not hidden).
+(defstruct LModifiers (linkage: LLinkage hidden: bool))
+
+;; ast.rs `BinOp`.
+(defenum LBinOp BAdd BSub BMul BSDiv BUDiv BSRem BURem BFAdd BFSub BFMul BFDiv BFRem BAnd BOr BXor BShl BLShr BAShr)
+(derive Eq LBinOp)
+
+;; ast.rs `UnOp`.
+(defenum LUnOp UFNeg UCtpop)
+(derive Eq LUnOp)
+
+;; `llvm.s{add,sub,mul}.with.overflow` (ast.rs `OvfOp`).
+(defenum LOvfOp OvSAdd OvSSub OvSMul)
+(derive Eq LOvfOp)
+
+;; ast.rs `CastOp`; `CFpToSiSat` and `CFpToUiSat` are `fptosi-sat` and `fptoui-sat` (llvm.fptosi.sat).
+(defenum LCastOp CTrunc CZExt CSExt CFpTrunc CFpExt CFpToSi CFpToUi CSiToFp CUiToFp CPtrToInt CIntToPtr CBitcast CFpToSiSat CFpToUiSat)
+(derive Eq LCastOp)
+
+;; ast.rs `IPred`.
+(defenum LIPred IEq INe ISlt ISle ISgt ISge IUlt IUle IUgt IUge)
+(derive Eq LIPred)
+
+;; ast.rs `FPred`.
+(defenum LFPred FOeq FOne FOlt FOle FOgt FOge FOrd FUeq FUne FUlt FUle FUgt FUge FUno)
+(derive Eq LFPred)
+
+;; ast.rs `Ordering`, in the order of its derived `Ord` (use `ordering-rank` to compare).
+(defenum LOrdering OUnordered OMonotonic OAcquire ORelease OAcqRel OSeqCst)
+(derive Eq LOrdering)
+
+;; ast.rs `RmwOp`.
+(defenum LRmwOp RXchg RAdd RSub RAnd RNand ROr RXor RMax RMin RUMax RUMin RFAdd RFSub RFMax RFMin)
+(derive Eq LRmwOp)
+
+;; Synchronisation scope (ast.rs `Scope`; the default is `ScSystem`).
+(defenum LScope ScSystem ScSingleThread)
+(derive Eq LScope)
+
+;; The shared payload-free operators that the parser meets most.
+(def sc-system: LScope ScSystem)
+(def sc-single-thread: LScope ScSingleThread)
+(def lk-external: LLinkage LkExternal)
+(def lk-internal: LLinkage LkInternal)
+(def lk-private: LLinkage LkPrivate)
+
+;; The position of an ordering in the derived order of the Rust enum (0 unordered .. 5 seq_cst), for `PartialOrd`.
+(defun ordering-rank (o: LOrdering) -> i64
+  (match o ((OUnordered) 0) ((OMonotonic) 1) ((OAcquire) 2) ((ORelease) 3) ((OAcqRel) 4) ((OSeqCst) 5)))
+
+;; ---------------------------------------------------------------- expressions
+
+;; The callee of a call (ast.rs `Callee`).
+(defenum LCallee
+  (CalDirect name: str)
+  (CalIndirect ptr: LExpr ty: LFnType))
+
+;; A `switch` case: an integer literal form and its label (the `(Expr, String)` of `Kind::Switch`).
+(defstruct LCase (value: LExpr label: str))
+
+;; A binding `(NAME value)` of a `let`, or a phi's `(LABEL value)` (ast.rs `Binding`).
+(defstruct LBinding (name: str value: LExpr pos: i64))
+
+;; An expression with the position of its form (ast.rs `Expr`).
+(defstruct LExpr (kind: LKind pos: i64))
+
+;; ast.rs `Kind`: the forms of lIR, in the order of the Rust enum.
+(defenum LKind
+  (KLocal name: str)
+  (KGlobal name: str)
+  (KInt ty: LType v: LLit)
+  (KFloat ty: LType v: f64)
+  (KNull)
+  (KVector ty: LType elems: (Vec LExpr))
+  (KStr bytes: (Array i8))
+  (KStruct name: (Option str) fields: (Vec LExpr))              ;; `{ .. }` (nil) or `(%struct.S ..)`
+  (KArray ty: LType elems: (Vec LExpr))                         ;; `([N x T] ..)`
+  (KZero ty: LType)                                             ;; `(zeroinitializer T)`
+  (KBin op: LBinOp a: LExpr b: LExpr)
+  (KUn op: LUnOp a: LExpr)
+  (KOverflow op: LOvfOp a: LExpr b: LExpr)
+  (KICmp pred: LIPred a: LExpr b: LExpr)
+  (KFCmp pred: LFPred a: LExpr b: LExpr)
+  (KCast op: LCastOp ty: LType v: LExpr)
+  (KSelect c: LExpr a: LExpr b: LExpr)
+  (KExtractElement v: LExpr i: LExpr)
+  (KInsertElement v: LExpr x: LExpr i: LExpr)
+  (KShuffle a: LExpr b: LExpr mask: LExpr)
+  (KExtractValue a: LExpr idx: (Vec LLit))
+  (KInsertValue a: LExpr v: LExpr idx: (Vec LLit))
+  (KAlloca ty: LType count: (Option LExpr) align: (Option i64))
+  (KLoad ty: LType ptr: LExpr volatile: bool align: (Option i64))
+  (KStore value: LExpr ptr: LExpr volatile: bool align: (Option i64))
+  (KGep inbounds: bool ty: LType ptr: LExpr indices: (Vec LExpr))
+  (KAtomicLoad scope: LScope ord: LOrdering ty: LType ptr: LExpr)
+  (KAtomicStore scope: LScope ord: LOrdering value: LExpr ptr: LExpr)
+  (KAtomicRmw op: LRmwOp scope: LScope ord: LOrdering ptr: LExpr value: LExpr)
+  (KCmpXchg weak: bool scope: LScope success: LOrdering failure: LOrdering ptr: LExpr expected: LExpr new: LExpr)
+  (KFence scope: LScope ord: LOrdering)
+  (KTrap)                                                       ;; `(trap)`: llvm.trap, void and not a terminator
+  (KCall callee: LCallee args: (Vec LExpr) tail: bool)
+  (KRet value: (Option LExpr))
+  (KBr label: str)
+  (KCondBr c: LExpr then: str else: str)
+  (KSwitch v: LExpr default: str cases: (Vec LCase))
+  (KUnreachable)
+  (KPhi ty: LType incoming: (Vec LBinding))
+  (KLet binds: (Vec LBinding) body: (Vec LExpr)))
+
+;; The shared payload-free forms.
+(def kind-null: LKind KNull)
+(def kind-trap: LKind KTrap)
+(def kind-unreachable: LKind KUnreachable)
+
+;; An expression at a position (ast.rs `Expr::new`).
+(defun expr-new (kind: LKind pos: i64) -> LExpr (LExpr kind pos))
+
+;; Whether the form ends a block (ast.rs `Kind::is_terminator`, spec/lir.md section 5.1): `ret br condbr switch unreachable` and a
+;; tail call.
+(defun kind-terminator? (k: LKind) -> bool
+  (match k
+    ((KRet _) true)
+    ((KBr _) true)
+    ((KCondBr _ _ _) true)
+    ((KSwitch _ _ _) true)
+    ((KUnreachable) true)
+    ((KCall _ _ tail) tail)
+    (_ false)))
+
+;; A literal integer written in place, as the checker's constant rules mean it (ast.rs `Expr::int_literal`).
+(defun expr-int-literal (e: LExpr) -> (Option LLit)
+  (match (. e kind) ((KInt _ v) (some v)) (_ nil)))
+
+;; ---------------------------------------------------------------- items
+
+(defstruct LStructDef (name: str fields: (Vec LType) pos: i64))
+
+(defstruct LGlobalDef (name: str ty: LType init: LExpr constant: bool mods: LModifiers pos: i64))
+
+;; `(declare-global NAME T)`: a variable defined elsewhere (spec/lir.md 4.4).
+(defstruct LGlobalDecl (name: str ty: LType hidden: bool pos: i64))
+
+(defstruct LDeclare (name: str ty: LFnType hidden: bool pos: i64))
+
+;; A parameter's name and the position of its form (the `(String, Pos)` of `Function::params`).
+(defstruct LParam (name: str pos: i64))
+
+(defstruct LBlock (label: str body: (Vec LExpr) pos: i64))
+
+(defstruct LFunction (name: str ty: LFnType params: (Vec LParam) blocks: (Vec LBlock) mods: LModifiers pos: i64))
+
+;; ast.rs `Item`.
+(defenum LItem
+  (ItStruct def: LStructDef)
+  (ItGlobal def: LGlobalDef)
+  (ItDeclareGlobal decl: LGlobalDecl)
+  (ItDeclare decl: LDeclare)
+  (ItDefine func: LFunction))
+
+;; A whole module, items in source order (ast.rs `Module`).
+(defstruct LModule (items: (Vec LItem)))
+
+;; Whether the name is visible outside its module (ast.rs `Linkage::exported`).
+(defun linkage-exported? (l: LLinkage) -> bool (= l LkExternal))
+
+(defun function-variadic? (f: LFunction) -> bool (. (. f ty) varargs))
