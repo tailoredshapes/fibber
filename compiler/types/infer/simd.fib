@@ -1,0 +1,212 @@
+;; compiler/types/infer/simd.fib: lane vectors in inference (SIMD wave 2, package P1; spec/types.md 1.9, 2.12).
+;;
+;; New in stage 2: the Rust checker (frozen) has no lane vectors. Three pieces:
+;; - the literal `(simd e..)` / `(simd T e..)`: its elements share one element type;
+;; - the broadcast rule: a numeric LITERAL operand of an arithmetic, bit or comparison operator takes
+;;   the element type of the vector operand (the literal rule of stdlib L19 extended); any other scalar
+;;   operand does not broadcast, its error says to write `(splat V x)`. There is no deferred constraint:
+;;   the rule fires at the application, by the types known then (a vector first operand, or a literal
+;;   first operand whose vector partner is inferred first, `apply-literal-first` in types.infer.call);
+;; - the checks that an element is an integer width, f32, f64 or bool (`DkSimdElem`).
+(ns types.infer.simd
+  (:use syntax.pos syntax.form types.ty types.scheme types.error types.store types.table types.ast types.decls
+        types.builtins types.infer.cx types.infer.unify))
+
+;; ---- which calls broadcast
+
+;; The methods of these protocols and these builtins take part in the broadcast rule.
+(def broadcast-protos: (Vec str) ["Num" "Float" "Bits" "Div" "Eq"])
+(def broadcast-builtins: (Vec str) ["simd/lt" "simd/le" "simd/gt" "simd/ge" "simd/eq" "simd/ne"])
+
+(defun broadcast-op? (cx: Cx r: GlobalRef) -> bool
+  (match r
+    ((GMethod p _) (includes? (. (g-proto (. cx g) p) name) broadcast-protos))
+    ((GBuiltin b) (includes? (. (nth (builtin-table) b) name) broadcast-builtins))
+    (_ false)))
+
+;; ---- literals as lanes
+
+;; The vector type `t` is, as (elem lanes), when it is one already known.
+(defun known-vector (cx: Cx t: Ty) -> (Option (Pair Ty Ty))
+  (ty-simd-parts (store-resolve (. cx st) t)))
+
+(defun literal-arg? (a: Arg) -> bool
+  (match a
+    ((ArgExpr x) (literal-lane? x))
+    (_ false)))
+
+;; An integer or float literal that has no width of its own written (the reader makes no difference
+;; between `5` and `5i64`, nor `1.0` and `1.0f64`).
+(defun literal-lane? (x: Expr) -> bool
+  (match (. x kind)
+    ((ELit (LitInt _ (I64))) true)
+    ((ELit (LitFloat _ (F64))) true)
+    (_ false)))
+
+(defun int-range :private (s: Scalar) -> (Pair i64 i64)
+  (match s
+    ((SI8) (Pair -128 127))
+    ((SI16) (Pair -32768 32767))
+    ((SI32) (Pair -2147483648 2147483647))
+    (_ (Pair -9223372036854775807 9223372036854775807))))
+
+;; The literal `x` as a lane of the vector type `vec` (whose element is the scalar `s`): its type
+;; becomes the element type. The rule of L19: an integer fits an integer width by range and a float
+;; width exactly (2^53 for f64, 2^24 for f32); a float literal is a float lane, rounded for f32.
+(defun literal-as-lane (cx: Cx x: Expr s: Scalar vec: Ty) -> (Result Ty TypeError)
+  (let ((elem (ty-scalar s))
+        (where (str-join ["the lanes of " (cx-show cx vec)])))
+    (match (. x kind)
+      ((ELit (LitInt n _))
+       (cond (scalar-is-int s)
+               (let ((r (int-range s)))
+                 (if (and (>= n (. r fst)) (<= n (. r snd)))
+                     (do (cx-record cx (. x id) elem) (Ok vec))
+                     (Err (type-error Unify (. x pos)
+                            (str-join ["the literal " (show n) " does not fit " (scalar-name s) ", " where])))))
+             (scalar-is-float s)
+               (if (<= (abs n) (if (= s SF32) 16777216 9007199254740992))
+                   (do (cx-record cx (. x id) elem) (Ok vec))
+                   (Err (type-error Unify (. x pos)
+                          (str-join ["the literal " (show n) " is not exact in " (scalar-name s) ", " where]))))
+             :else (Err (type-error Unify (. x pos)
+                          (str-join ["cannot unify i64 with " (scalar-name s) ": " where " are not numbers"])))))
+      ((ELit (LitFloat v _))
+       (if (scalar-is-float s)
+           (do (cx-record cx (. x id) elem) (Ok vec))
+           (Err (type-error Unify (. x pos)
+                  (str-join ["a float literal is not a lane of " (cx-show cx vec) ": the lanes are " (scalar-name s)])))))
+      (_ (Err (type-error Unify (. x pos) "internal: not a literal lane"))))))
+
+;; When `x` is a literal and `param` is already a vector with a known element: the literal's type
+;; (the vector type, which flows trivially); nil when the ordinary rules apply.
+(defun adopt-literal (cx: Cx x: Expr param: Ty) -> (Option (Result Ty TypeError))
+  (if (literal-lane? x)
+      (match (known-vector cx param)
+        (nil nil)
+        ((some ev)
+         (match (store-resolve (. cx st) (. ev fst))
+           ((TCon (KScalar s) _) (some (literal-as-lane cx x s (store-resolve (. cx st) param))))
+           (_ nil))))
+      nil))
+
+;; ---- the error of a scalar that is not a literal
+
+;; The mismatch `err` of `t` flowing into `param`, when one is a vector and the other a scalar of its
+;; element type: the text says that only a literal broadcasts. Any other error is `err`.
+(defun splat-hint (cx: Cx t: Ty param: Ty err: TypeError) -> TypeError
+  (let ((a (store-resolve (. cx st) t)) (b (store-resolve (. cx st) param)))
+    (match (known-vector cx a)
+      ((some ev) (hint-for cx a b err))
+      (nil (match (known-vector cx b)
+             ((some ev) (hint-for cx b a err))
+             (nil err))))))
+
+;; `v` is the vector, `s` the other side.
+(defun hint-for :private (cx: Cx v: Ty s: Ty err: TypeError) -> TypeError
+  (match (known-vector cx v)
+    (nil err)
+    ((some ev)
+     (if (= (store-resolve (. cx st) (. ev fst)) s)
+         (TypeError (. err kind) (. err pos)
+           (str-join [(. err message) ": only a numeric literal broadcasts to a vector; write (splat "
+                      (cx-show cx v) " x) for a scalar variable or expression"]))
+         err))))
+
+;; ---- the literal `(simd e..)`
+
+(defun any-expr? :private (xs: (Vec Expr) f: (fn (Expr) bool) :borrow) -> bool
+  (some? (find-first f xs)))
+
+;; The type of `(simd e..)` or `(simd T e..)`: the elements that are not literals fix the element
+;; type (all equal), the literals that carry no width adopt it, and with nothing to adopt from the
+;; element is i64 for integer literals, f64 for float ones (L19).
+(defun infer-simd (cx: Cx el: (Option Scalar) es: (Vec Expr) pos: Pos infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow)
+    -> (Result Ty TypeError)
+  (let ((t (match el ((some s) (ty-scalar s)) (nil (cx-fresh cx)))))
+    (try-let ((_ (simd-others cx es t infer))
+              (_ (simd-default cx es t pos)))
+      (let ((vec (ty-simd t (ty-nat (count es)))))
+        (try-let ((_ (simd-literals cx es t vec)))
+          (do (cx-defer cx (DkSimdElem t (count es)) pos nil)
+              (Ok vec)))))))
+
+;; Every element that is not an adopting literal is inferred and unified with the element type.
+(defun simd-others :private (cx: Cx es: (Vec Expr) t: Ty infer: (fn (Cx Expr) (Result Ty TypeError)) :borrow) -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (>= i (count es))
+        (Ok ())
+        (let ((x (nth es i)))
+          (if (literal-lane? x)
+              (recur (+ i 1))
+              (try-let ((tx (infer cx x))
+                        (_ (cx-unify cx tx t (. x pos))))
+                (recur (+ i 1))))))))
+
+;; Nothing but literals fixed the element type: `f64` if any is a float, else `i64`.
+(defun simd-default :private (cx: Cx es: (Vec Expr) t: Ty pos: Pos) -> (Result unit TypeError)
+  (match (store-resolve (. cx st) t)
+    ((TVar _)
+     (if (any-expr? es (fn (x: Expr) (match (. x kind) ((ELit (LitFloat _ _)) true) (_ false))))
+         (cx-unify cx t (ty-scalar SF64) pos)
+         (if (any-expr? es literal-lane?)
+             (cx-unify cx t (ty-i64) pos)
+             (Ok ()))))
+    (_ (Ok ()))))
+
+;; The adopting literals, now that the element type is known (or still open: then none can adopt).
+(defun simd-literals :private (cx: Cx es: (Vec Expr) t: Ty vec: Ty) -> (Result unit TypeError)
+  (loop ((i 0))
+    (if (>= i (count es))
+        (Ok ())
+        (let ((x (nth es i)))
+          (if (literal-lane? x)
+              (match (store-resolve (. cx st) t)
+                ((TCon (KScalar s) _) (try-let ((_ (literal-as-lane cx x s vec))) (recur (+ i 1))))
+                (_ (try-let ((tx (lit-own-type cx x))
+                             (_ (cx-unify cx tx t (. x pos))))
+                     (recur (+ i 1)))))
+              (recur (+ i 1)))))))
+
+;; The type a literal has by itself (an element that is a literal and the element type is open: only
+;; reachable when the element type is a rigid variable).
+(defun lit-own-type :private (cx: Cx x: Expr) -> (Result Ty TypeError)
+  (match (. x kind)
+    ((ELit (LitInt _ _)) (do (cx-record cx (. x id) (ty-i64)) (Ok (ty-i64))))
+    ((ELit (LitFloat _ _)) (do (cx-record cx (. x id) (ty-scalar SF64)) (Ok (ty-scalar SF64))))
+    (_ (Ok (ty-unit)))))
+
+;; ---- a literal lane index
+
+;; `(lane v 4)` and `(with-lane v 4 x)` with a literal index and a vector of known lane count: the
+;; index must be in range. nil when it is, or when it cannot be told here (a dynamic index is checked
+;; when the program runs).
+(defun lane-index-error (cx: Cx r: GlobalRef args: (Vec Arg) pos: Pos) -> (Option TypeError)
+  (match r
+    ((GBuiltin b)
+     (let ((name (. (nth (builtin-table) b) name)))
+       (if (and (or (= name "lane") (= name "with-lane")) (>= (count args) 2))
+           (match (nth args 0)
+             ((ArgExpr v) (match (nth args 1) ((ArgExpr i) (lane-index-of cx v i)) (_ nil)))
+             (_ nil))
+           nil)))
+    (_ nil)))
+
+(defun lane-index-of :private (cx: Cx v: Expr i: Expr) -> (Option TypeError)
+  (match (. i kind)
+    ((ELit (LitInt n _))
+     (match (get @(. (. cx t) expr-types) (. v id))
+       (nil nil)
+       ((some vt)
+        (match (known-vector cx vt)
+          (nil nil)
+          ((some ev)
+           (match (store-resolve (. cx st) (. ev snd))
+             ((TCon (KNat lanes) _)
+              (if (and (>= n 0) (< n lanes))
+                  nil
+                  (some (type-error Unify (. i pos)
+                          (str-join ["lane index " (show n) " out of range: " (cx-show cx vt) " has lanes 0 to "
+                                     (show (- lanes 1))])))))
+             (_ nil)))))))
+    (_ nil)))

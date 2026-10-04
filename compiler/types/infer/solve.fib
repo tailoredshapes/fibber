@@ -54,6 +54,7 @@
     ((DkField t f r _) (solve-field cx d t f r))
     ((DkDeref t r _) (solve-deref cx d t r))
     ((DkFloat t) (solve-float cx d t))
+    ((DkSimdElem t n) (solve-simd-elem cx d t n))
     ((DkKeyword site s k r dflt) (solve-keyword cx d site s k r dflt))
     ((DkVecPat s parts) (solve-vec-pat cx d s parts))))
 
@@ -70,6 +71,25 @@
       ((TVar _) (Ok AtStuck))
       ((TCon (KScalar s) _) (if (scalar-is-float s) (Ok (AtSolved [])) (solve-not-float cx d rt)))
       (_ (solve-not-float cx d rt)))))
+
+;; The element of a vector literal, once known: an integer width, f32, f64 or bool, and the value at
+;; most 512 bits wide (a mask is not counted).
+(defun solve-simd-elem :private (cx: Cx d: Deferred t: Ty n: i64) -> (Result Attempt TypeError)
+  (let ((rt (store-resolve (. cx st) t)))
+    (match rt
+      ((TVar _) (Ok AtStuck))
+      ((TCon (KScalar s) _)
+       (cond (not (simd-elem-scalar? s)) (simd-bad-elem cx d rt)
+             (and (not (= s types.ty/SBool)) (> (* n (scalar-bits s)) simd-max-bits))
+               (Err (type-error Unify (. d pos)
+                      (str-join ["a vector is at most " (show simd-max-bits) " bits wide: " (show n) " lanes of "
+                                 (cx-show cx rt) " are " (show (* n (scalar-bits s))) " bits"])))
+             :else (Ok (AtSolved []))))
+      (_ (simd-bad-elem cx d rt)))))
+
+(defun simd-bad-elem :private (cx: Cx d: Deferred t: Ty) -> (Result Attempt TypeError)
+  (Err (type-error Unify (. d pos)
+         (str-join ["a vector element is an integer width, f32, f64 or bool, not " (cx-show cx t)]))))
 
 (defun solve-not-float :private (cx: Cx d: Deferred t: Ty) -> (Result Attempt TypeError)
   (Err (type-error Unify (. d pos)
@@ -287,6 +307,7 @@
        (some (not (or (includes? (PObject (TRigid r)) gs) (includes? (PWeakable (TRigid r)) gs))))
        nil))
     ((TCon (KScalar _) _) (some true))
+    ((TCon (KSimd) _) (some true))
     ((TCon (KNominal id) _) (some (typedef-is-fieldless-enum (g-ty (. cx g) id))))
     (_ (some false))))
 
