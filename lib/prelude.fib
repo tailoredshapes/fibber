@@ -89,11 +89,13 @@
     ((VLeaf _) (trap "vec: a leaf where a branch belongs"))
     ((VBranch kids)
      (let ((sub (bit-and (shr idx level) 31)))
-       (if (= level 5)
-           (VBranch (array-push kids leaf))
-           (if (< sub (array-len kids))
-               (VBranch (array-with kids sub (vnode-push (- level 5) (array-get kids sub) idx leaf)))
-               (VBranch (array-push kids (vnode-path (- level 5) leaf)))))))))
+       (let ((c (cell kids)))
+         (if (= level 5)
+             (do (array-push! &c leaf) (VBranch @c))
+             (if (< sub (array-len @c))
+                 (let ((kid (array-take! &c sub)))
+                   (do (array-set! &c sub (vnode-push (- level 5) kid idx leaf)) (VBranch @c)))
+                 (do (array-push! &c (vnode-path (- level 5) leaf)) (VBranch @c)))))))))
 
 (defun vnode-get :private (node: (VNode a) level: i64 i: i64) -> a
   (match node
@@ -118,7 +120,8 @@
     ((VecEmpty) (VecOf 1 5 nil (array 1 x)))
     ((VecOf cnt shift root tail)
      (if (< (array-len tail) 32)
-         (VecOf (+ cnt 1) shift root (array-push tail x))
+         (let ((c (cell tail)))
+           (do (array-push! &c x) (VecOf (+ cnt 1) shift root @c)))
          (vec-push-tail cnt shift root tail x)))))
 
 (defun vec-count (v: (Vec a)) -> i64
@@ -143,10 +146,14 @@
 ;; the path from the root to the leaf, the other kids shared.
 (defun vnode-assoc :private (node: (VNode a) level: i64 i: i64 x: a) -> (VNode a)
   (match node
-    ((VLeaf items) (VLeaf (array-with items (bit-and i 31) x)))
+    ((VLeaf items)
+     (let ((c (cell items)))
+       (do (array-set! &c (bit-and i 31) x) (VLeaf @c))))
     ((VBranch kids)
-     (let ((sub (bit-and (shr i level) 31)))
-       (VBranch (array-with kids sub (vnode-assoc (array-get kids sub) (- level 5) i x)))))))
+     (let ((sub (bit-and (shr i level) 31))
+           (c (cell kids)))
+       (let ((kid (array-take! &c sub)))
+         (do (array-set! &c sub (vnode-assoc kid (- level 5) i x)) (VBranch @c)))))))
 
 ;; (vec-assoc v i x) is v with element i replaced by x (stdlib §2.5): the path from the root to the leaf is
 ;; copied, or only the tail when i is in the tail, so O(log32 n) objects, and v is unchanged. i = the count
@@ -162,7 +169,8 @@
               ((VecOf cnt shift root tail)
                (let ((tailoff (- cnt (array-len tail))))
                  (if (>= i tailoff)
-                     (VecOf cnt shift root (array-with tail (- i tailoff) x))
+                     (let ((c (cell tail)))
+                       (do (array-set! &c (- i tailoff) x) (VecOf cnt shift root @c)))
                      (match root
                        (nil (trap "assoc: index out of range"))
                        ((some r) (VecOf cnt shift (some (vnode-assoc r shift i x)) tail)))))))))))
@@ -179,12 +187,13 @@
   (match node
     ((VLeaf _) nil)
     ((VBranch kids)
-     (let ((n (array-len kids)))
+     (let ((n (array-len kids))
+           (c (cell kids)))
        (if (= level 5)
-           (if (= n 1) nil (some (VBranch (array-copy kids 0 (- n 1)))))
-           (match (vnode-pop (array-get kids (- n 1)) (- level 5))
-             (nil (if (= n 1) nil (some (VBranch (array-copy kids 0 (- n 1))))))
-             ((some sub) (some (VBranch (array-with kids (- n 1) sub))))))))))
+           (if (= n 1) nil (do (array-pop! &c) (some (VBranch @c))))
+           (match (vnode-pop (array-take! &c (- n 1)) (- level 5))
+             (nil (if (= n 1) nil (do (array-pop! &c) (some (VBranch @c)))))
+             ((some sub) (do (array-set! &c (- n 1) sub) (some (VBranch @c))))))))))
 
 ;; the root of a trie that has lost its last leaf; a root with a single kid above level 5 is that kid, one level down
 (defun vec-pop-root :private (cnt: i64 shift: i64 root: (VNode a) tail: (Array a)) -> (Vec a)
@@ -209,7 +218,8 @@
        (if (= cnt 1)
            VecEmpty
            (if (> t 1)
-               (VecOf (- cnt 1) shift root (array-copy tail 0 (- t 1)))
+               (let ((c (cell tail)))
+                 (do (array-pop! &c) (VecOf (- cnt 1) shift root @c)))
                (match root
                  (nil (trap "vec: a vector with no leaves and no tail"))
                  ((some r) (vec-pop-root (- cnt 1) shift r (vnode-leaf r shift (- cnt 2)))))))))))
