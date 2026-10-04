@@ -1,0 +1,51 @@
+;; matmul, SIMD version (SIMD wave 4, P5): C = A*B as in matmul.fib, with B and C held as (Array f64x4) (row i is n/4
+;; vectors) and A as (Array f64). For a row i of C and a strip of four vectors (16 columns) the 4 accumulators stay in
+;; registers over the whole k loop (a register-blocked micro-kernel): acc += splat(A[i][k]) * B[k][strip]. N must be a
+;; multiple of 16. The entries are integers, so the order of summation does not change the printed sum.
+;; Missing and worked around: a vector load from an (Array f64) (B and C are vectors from the start), fma (mul then add).
+(ns main (:use fib.simd) (:require [fib.fmt :as fmt]))
+
+(defun strip (&c: (Array f64x4) a: (Array f64) b: (Array f64x4) n: i64 nb: i64 i: i64 jb: i64) -> i64
+  (let [z (splat f64x4 0.0)]
+    (loop [k 0 c0 z c1 z c2 z c3 z]
+      (if (< k n)
+        (let [av (splat f64x4 (array-get a (+ (* i n) k)))
+              o (+ (* k nb) jb)]
+          (recur (+ k 1)
+                 (+ c0 (* av (array-get b o)))
+                 (+ c1 (* av (array-get b (+ o 1))))
+                 (+ c2 (* av (array-get b (+ o 2))))
+                 (+ c3 (* av (array-get b (+ o 3))))))
+        (let [o (+ (* i nb) jb)]
+          (do (array-set! &c o c0) (array-set! &c (+ o 1) c1) (array-set! &c (+ o 2) c2) (array-set! &c (+ o 3) c3)
+              0))))))
+
+(defun multiply (&c: (Array f64x4) a: (Array f64) b: (Array f64x4) n: i64) -> i64
+  (let [nb (quot n 4)]
+    (loop [i 0] (if (< i n)
+      (do (loop [jb 0] (if (< jb nb) (do (strip &c a b n nb i jb) (recur (+ jb 4))) 0))
+          (recur (+ i 1)))
+      0))))
+
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0)))
+        nb (quot n 4)
+        a (cell (array (* n n) 0.0))
+        b (cell (array (* n nb) (splat f64x4 0.0)))
+        c (cell (array (* n nb) (splat f64x4 0.0)))]
+    (do (loop [i 0] (if (< i n)
+          (do (loop [j 0] (if (< j n)
+                (do (array-set! &a (+ (* i n) j) (double (rem (+ i j) 7))) (recur (+ j 1)))
+                0))
+              (loop [jb 0] (if (< jb nb)
+                (let [j (* jb 4)]
+                  (do (array-set! &b (+ (* i nb) jb)
+                                  <<(double (rem (+ i (* 2 j)) 5)) (double (rem (+ i (* 2 (+ j 1))) 5))
+                                    (double (rem (+ i (* 2 (+ j 2))) 5)) (double (rem (+ i (* 2 (+ j 3))) 5))>>)
+                      (recur (+ jb 1))))
+                0))
+              (recur (+ i 1)))
+          0))
+        (multiply &c @a @b n)
+        (println (fmt/format-f64 (hsum (loop [i 0 s (splat f64x4 0.0)] (if (< i (* n nb)) (recur (+ i 1) (+ s (array-get @c i))) s))) 1))
+        0)))

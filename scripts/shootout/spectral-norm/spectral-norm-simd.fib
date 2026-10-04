@@ -1,0 +1,77 @@
+;; spectral-norm, SIMD version (SIMD wave 4, P5): f64x4 over four rows at once; same output as spectral-norm.fib.
+;; (scalar header follows) spectral-norm: the Benchmarks Game algorithm. Eigenvalue estimate of the infinite matrix
+;; A(i,j) = 1 / ((i+j)(i+j+1)/2 + i + 1) by 10 rounds of the power method on AtA, printed as %.9f.
+;; Vectors are `(Array f64)` read with array-get; each product builds its result in a `(Cell (Array f64))` written
+;; in place by array-set! (safe: no unsafe, no raw pointers). spectral-norm-vec.fib is the same with `(Vec f64)`
+;; (nth + assoc), about 5x slower: see README.md.
+(ns main (:use fib.simd))
+(def LANES: i64 4)
+
+;; Rows i0 .. i0+3 of A v (or of At v) at once: lane k is row i0+k. Every lane sums over j in order, adding
+;; (1/den) * v[j] to its accumulator exactly as the scalar loop does, so the 9 printed digits are the scalar's by
+;; construction, with no reduction across lanes. i+j and the denominator are integers below 2^53, exact in f64.
+;; transposed: A(i,j) has den (i+j)(i+j+1)/2 + i + 1, At(i,j) = A(j,i) has + j + 1.
+(defun row-block (n: i64 v: (Array f64) iv: f64x4 transposed: bool) -> f64x4
+  (loop [j 0 acc (splat f64x4 0.0)]
+    (if (< j n)
+      (let [fj (splat f64x4 (double j))
+            ij (+ iv fj)
+            tri (/ (* ij (+ ij 1.0)) 2.0)
+            den (+ (+ tri (if transposed fj iv)) 1.0)]
+        (recur (+ j 1) (+ acc (* (/ 1.0 den) (splat f64x4 (array-get v j))))))
+      acc)))
+
+;; The product, n + 3 long (the last block's lanes past n are not used).
+(defun mul (n: i64 v: (Array f64) transposed: bool) -> (Array f64)
+  (let [o (cell (array (+ n LANES) 0.0))]
+    (do (loop [i 0]
+          (if (< i n)
+            (let [iv (+ (splat f64x4 (double i)) <<0.0 1.0 2.0 3.0>>)
+                  r (row-block n v iv transposed)]
+              (do (array-set! &o i (lane r 0)) (array-set! &o (+ i 1) (lane r 1))
+                  (array-set! &o (+ i 2) (lane r 2)) (array-set! &o (+ i 3) (lane r 3))
+                  (recur (+ i LANES))))
+            nil))
+        @o)))
+(defun mul-atav (n: i64 v: (Array f64)) -> (Array f64)
+  (mul n (mul n v false) true))
+
+;; GAP (docs/shootout/gaps.md, "f64 square root"): math/sqrt is specified (stdlib 4.16) but not landed: there is no
+;; sqrt builtin. It is called ONCE, on the final ratio, so Newton's method (converged to the last bit or one ulp,
+;; far inside the 9 printed decimals) does not distort the timing; the Java and C versions use Math.sqrt / sqrt.
+(defun sqrt-newton (x: f64) -> f64
+  (loop [k 0 r 1.0]
+    (if (< k 60) (recur (+ k 1) (/ (+ r (/ x r)) 2.0)) r)))
+
+;; GAP (docs/shootout/gaps.md, "f64 formatting to a fixed number of decimals"): `printf`/`format` are specified (stdlib 4.x)
+;; but not landed. fmt9 rounds the shortest-repr text of a value in [1, 10) to 9 decimals, half up. It runs ONCE.
+(defun zeros (n: i64) -> str
+  (loop [k 0 z ""] (if (< k n) (recur (+ k 1) (str z "0")) z)))
+
+(defun digits (s: str) -> i64
+  (if-some [v (parse-long s)] v 0))
+
+(defun fmt9 (x: f64) -> str
+  (let [s (str x)
+        dot (if-some [d (str-find s "." 0)] d 1)
+        ip (digits (subs s 0 dot))
+        fr (str (subs s (+ dot 1)) (zeros 10))
+        v (+ (+ (* ip 1000000000) (digits (subs fr 0 9))) (if (>= (digits (subs fr 9 10)) 5) 1 0))
+        w (quot v 1000000000)
+        f (str (- v (* w 1000000000)))]
+    (str w "." (zeros (- 9 (count f))) f)))
+
+(defun main () -> i64
+  (let [n (if-some [k (parse-long (nth (args) 0))] k 100)
+        r (loop [k 0 u (array n 1.0) v (array n 0.0)]
+            (if (< k 10)
+              (let [v2 (mul-atav n u)]
+                (recur (+ k 1) (mul-atav n v2) v2))
+              (Pair u v)))
+        u (. r fst)
+        v (. r snd)
+        q (loop [i 0 vbv 0.0 vv 0.0]
+            (if (< i n)
+              (recur (+ i 1) (+ vbv (* (array-get u i) (array-get v i))) (+ vv (* (array-get v i) (array-get v i))))
+              (sqrt-newton (/ vbv vv))))]
+    (do (println (fmt9 q)) 0)))

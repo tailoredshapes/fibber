@@ -1,0 +1,34 @@
+;; matmul: C = A*B for n x n matrices of f64, flat row-major (Array f64), loop order i k j (the inner loop runs along a row
+;; of B and of C). A[i][k] = (i + k) mod 7, B[k][j] = (k + 2j) mod 5: integers, so every sum is exact in any order.
+;; Output: the sum of C with one decimal.
+(ns main (:require [fib.fmt :as fmt]))
+
+(defun row-update (&c: (Array f64) b: (Array f64) n: i64 ci: i64 bk: i64 aik: f64) -> i64
+  (loop [j 0] (if (< j n)
+    (do (array-set! &c (+ ci j) (+ (array-get @c (+ ci j)) (* aik (array-get b (+ bk j))))) (recur (+ j 1)))
+    0)))
+
+(defun multiply (&c: (Array f64) a: (Array f64) b: (Array f64) n: i64) -> i64
+  (loop [i 0] (if (< i n)
+    (do (loop [k 0] (if (< k n)
+          (do (row-update &c b n (* i n) (* k n) (array-get a (+ (* i n) k))) (recur (+ k 1)))
+          0))
+        (recur (+ i 1)))
+    0)))
+
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0)))
+        a (cell (array (* n n) 0.0))
+        b (cell (array (* n n) 0.0))
+        c (cell (array (* n n) 0.0))]
+    (do (loop [i 0] (if (< i n)
+          (do (loop [j 0] (if (< j n)
+                (do (array-set! &a (+ (* i n) j) (double (rem (+ i j) 7)))
+                    (array-set! &b (+ (* i n) j) (double (rem (+ i (* 2 j)) 5)))
+                    (recur (+ j 1)))
+                0))
+              (recur (+ i 1)))
+          0))
+        (multiply &c @a @b n)
+        (println (fmt/format-f64 (loop [i 0 s 0.0] (if (< i (* n n)) (recur (+ i 1) (+ s (array-get @c i))) s)) 1))
+        0)))

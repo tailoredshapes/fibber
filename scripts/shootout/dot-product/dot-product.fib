@@ -1,0 +1,20 @@
+;; dot-product: sum of x[i]*y[i] over arrays of N f64, repeated REPS times (second argument, default 1).
+;; x[i] = i mod 7, y[i] = i mod 3 + 0.5: every product and partial sum is a multiple of 0.5 below 2^53, so the result
+;; is exact in any order of summation (the SIMD version sums in another order). Output with one decimal.
+(ns main (:require [fib.fmt :as fmt]))
+
+(defun dot (x: (Array f64) y: (Array f64) n: i64) -> f64
+  (loop [i 0 s 0.0]
+    (if (< i n) (recur (+ i 1) (+ s (* (array-get x i) (array-get y i)))) s)))
+
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0)))
+        reps (if (> (count (args)) 1) (unwrap (parse-long (nth (args) 1))) 1)
+        x (cell (array n 0.0))
+        y (cell (array n 0.0))]
+    (do (loop [i 0] (if (< i n)
+          (do (array-set! &x i (double (rem i 7))) (array-set! &y i (+ (double (rem i 3)) 0.5)) (recur (+ i 1)))
+          0))
+        (let [total (loop [r 0 t 0.0] (if (< r reps) (recur (+ r 1) (+ t (dot @x @y n))) t))]
+          (println (fmt/format-f64 total 1)))
+        0)))
