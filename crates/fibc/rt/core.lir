@@ -81,7 +81,28 @@
 ;; §8.2: count 1, tid, flags 0 (and the class). In trace mode 16 bytes in
 ;; front hold the ordinal (compiler.md §4). A failed malloc is the trap
 ;; "out of memory", not a write through a null pointer.
+;;
+;; `fib.alloc` is the inlinable fast path: a class of at most 32, not tracing,
+;; one thread, a block on the class's list. Everything else is `fib.alloc-slow`
+;; (a name ending in `-slow` is never inlined: lair marks it `noinline`,
+;; else LLVM inlines an internal function with one call site whatever its
+;; size, and every allocation, retain and release becomes a real call).
 (define internal (fib.alloc ptr) ((i64 size) (i32 tid))
+  (block entry
+    (let ((cls (lshr (add size (i64 15)) (i64 4)))
+          (quiet (and (icmp eq (load i32 @fib.tracing) (i32 0)) (icmp eq (load i32 @fib.mt) (i32 0)))))
+      (br (and quiet (icmp ule cls (i64 32))) hit miss)))
+  (block hit
+    (let ((slot (getelementptr ptr @fib.fl cls))
+          (head (load ptr slot)))
+      (br (icmp ne head (ptr null)) pop miss)))
+  (block pop
+    (store (load ptr head) slot)
+    (call @fib.init-hdr head tid (shl (trunc i32 cls) (i32 8)))
+    (ret head))
+  (block miss (ret (call @fib.alloc-slow size tid))))
+
+(define internal (fib.alloc-slow ptr) ((i64 size) (i32 tid))
   (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain))
   (block plain
     (let ((cls (lshr (add size (i64 15)) (i64 4))))
@@ -193,17 +214,15 @@
   (block done (ret)))
 
 ;; The fast path is the one that is small enough to be inlined at every
-;; call: not null; a STACK or IMMORTAL object (bits 4, 8) has no count and
-;; returns at once (a stack closure is retained and released at every call
-;; of it); not SHARED (bit 1: HAS-WEAK does not matter here), a plain
-;; increment. The SHARED rest is retain-slow.
+;; call: null, a STACK or IMMORTAL object (bits 4, 8: no count, nothing to
+;; do) and a plain object (not SHARED, bit 1; HAS-WEAK does not matter
+;; here), whose count is incremented. The rest is retain-slow.
 (define internal (fib.retain void) ((ptr p))
   (block entry (br (icmp eq p (ptr null)) done check))
   (block check
     (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 12)) (i32 0)) done unshared)))
-  (block unshared
-    (br (icmp eq (and f (i32 1)) (i32 0)) local slow))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
+  (block counted (br (icmp eq (and f (i32 1)) (i32 0)) local slow))
   (block local
     (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
       (store (add (load i64 cp) (i64 1)) cp)
@@ -231,25 +250,20 @@
   (block done (ret)))
 
 ;; Small enough to be inlined at every call: a STACK or IMMORTAL object
-;; returns at once; a plain object (not SHARED) whose count is above 1 is
-;; decremented in place; everything else is release-slow.
+;; (bits 4, 8) is no work; a plain object (not SHARED) whose count is above
+;; 1 is decremented in place; everything else is release-slow.
 (define internal (fib.release void) ((ptr p))
   (block entry (br (icmp eq p (ptr null)) done check))
   (block check
     (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 12)) (i32 0)) done unshared)))
-  (block unshared
-    (br (icmp eq (and f (i32 1)) (i32 0)) local shared))
+      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
+  (block counted (br (icmp eq (and f (i32 1)) (i32 0)) local slow))
   (block local
     (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
           (c (load i64 cp)))
-      (br (icmp ugt c (i64 1)) dec last)))
+      (br (icmp ugt c (i64 1)) dec slow)))
   (block dec (store (sub c (i64 1)) cp) (br done))
-  ;; two call sites with different arguments (an unshared object has flags that
-  ;; release-slow needs only as 0), so that LLVM does not fold the whole drop into
-  ;; every release as it does for a function called once
-  (block shared (call @fib.release-slow p f) (br done))
-  (block last (call @fib.release-slow p (i32 0)) (br done))
+  (block slow (call @fib.release-slow p f) (br done))
   (block done (ret)))
 
 ;; §8.2: the drop of an object whose count reached zero: weak-clear if
