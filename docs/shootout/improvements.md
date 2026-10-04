@@ -51,6 +51,13 @@ Layers: **own** = ownership checker (`compiler/own`), **emit** = emitter (`compi
 - Moves: n-body, spectral-norm, fannkuch-redux, regex-redux, and any program keeping state in a cell. n-body is the largest
   single gap (5.96x), so this is the first lever to pull. Payoff *estimate*: n-body to under 3x.
 
+- **Done in batch 6 (P6), spec/types.md §6.3 "Cell peeks"**, measured on the same machine against the seed's compiler: fannkuch-redux
+  12: 66.8 s to 34.6 s; vec-index (scripts/bench) 0.73 s to 0.39 s; a hot loop of `(array-get @a i)` and `(f @a)` 0.46 s to 0.17 s
+  per 400M reads. **No effect** on n-body (50M: 11.5 s to 11.0 s), spectral-norm (3000: 0.37 s both) and regex-redux (5M: 2.85 s to
+  2.84 s): the shipped n-body already passes `@a` to borrowed helpers, those pairs are gone from its hot functions (checked in the
+  lIR), and what is left is the heap `Six` allocated by every `pair-velocities` and `moved` call plus the checked arithmetic, not
+  counts. The lever is therefore not the one that closes the n-body gap.
+
 ### 2. Forwarded `&` parameters and owned array parameters should move the content, not copy it (own)
 - Evidence: fannkuch-redux 30% in `array-slice` and `array-alloc`, because a forwarded `&p` is `acquire`, where a function
   owning the cell gets `move in` (case 261); inlining the helper by hand took N=10 from 0.55 s to 0.39 s. IO-3: 2.8 s with a
