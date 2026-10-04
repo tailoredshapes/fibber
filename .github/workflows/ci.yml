@@ -143,67 +143,40 @@ jobs:
         timeout-minutes: 45
         run: cargo test -p fibc -- --test-threads=2
 
-  # The truth about main: the seed (tag seed-1, the Rust) builds stage 2
-  # from main's compiler/ and lib/; the stage check holds; stage 2 runs
-  # the case directories, and the cases that do not pass are exactly
-  # those in scripts/ci-stage2.expected.
+  # The truth about main: the released seed (the one SEED names: a stage 2
+  # binary with its own liblair.so, no Rust and no LLVM install needed)
+  # builds stage 2 from main's compiler/ and lib/; the fixed point holds;
+  # stage 2 runs the case directories, and the cases that do not pass are
+  # exactly those in scripts/ci-stage2.expected.
   stage2:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 5
 
-      # The seed in a directory of its own, whole as tagged: its prelude
-      # is embedded, so it must be built from seed-1's lib/.
-      - uses: actions/checkout@v4
-        timeout-minutes: 5
-        with:
-          ref: seed-1
-          path: seed
-
-      - name: Install the pinned toolchain
+      - name: Fetch the seed (SEED names the release and its sha256)
         timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          rustup toolchain install $RUST_TOOLCHAIN --profile minimal
-          rustup default $RUST_TOOLCHAIN
-
-      - name: Install LLVM 21
-        timeout-minutes: 15
-        run: |
-          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 21
-          sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
-
-      - uses: Swatinem/rust-cache@v2
-        timeout-minutes: 10
-        with:
-          prefix-key: stage2
-          workspaces: seed
-
-      - name: Build the seed (fibc and lair, release)
-        timeout-minutes: 60
-        working-directory: seed
-        run: cargo build --release -p fibc -p lair
+          fibc=$(scripts/fetch-seed.sh "$RUNNER_TEMP/seed")
+          echo "SEED_FIBC=$fibc" >> "$GITHUB_ENV"
+          echo "SEED_LIB=$(cd "$(dirname "$fibc")/../lib" && pwd)" >> "$GITHUB_ENV"
 
       - name: Build stage 2 and check it
         timeout-minutes: 30
         run: |
           set -eu
-          seed=$PWD/seed/target/release
-          export FIB_LIB=$PWD/lib LD_LIBRARY_PATH=$seed
-          build() { "$1" build compiler/fibc.fib -I compiler -I lib -L "$seed" -l lair -o "$2"; }
+          export FIB_LIB=$PWD/lib LD_LIBRARY_PATH=$SEED_LIB
+          build() { "$1" build compiler/fibc.fib -I compiler -I lib -L "$SEED_LIB" -l lair -o "$2"; }
           emit() { "$1" emit -I compiler -I lib compiler/fibc.fib; }
-          build "$seed/fibc" "$RUNNER_TEMP/F"
-          emit "$seed/fibc" > "$RUNNER_TEMP/emit.seed"
+          build "$SEED_FIBC" "$RUNNER_TEMP/F"
+          emit "$SEED_FIBC" > "$RUNNER_TEMP/emit.seed"
           emit "$RUNNER_TEMP/F" > "$RUNNER_TEMP/emit.F"
-          # The seed embeds seed-1's prelude, so once main's prelude moves on the seed's lIR legitimately
-          # differs: that comparison is a note. The check is the fixed point: stage 2 built by the seed and
-          # stage 3 built by stage 2 emit the same lIR.
-          if cmp -s "$RUNNER_TEMP/emit.seed" "$RUNNER_TEMP/emit.F"; then echo "note: F emits the seed's lIR"; else echo "note: F emits different lIR from the seed (its embedded prelude lags main's)"; fi
+          # The seed's lIR differs from F's whenever main's compiler or library moved on: a note. The check is the
+          # fixed point: stage 2 built by the seed and stage 3 built by stage 2 emit the same lIR.
+          if cmp -s "$RUNNER_TEMP/emit.seed" "$RUNNER_TEMP/emit.F"; then echo "note: F emits the seed's lIR"; else echo "note: F emits different lIR from the seed (main moved on)"; fi
           build "$RUNNER_TEMP/F" "$RUNNER_TEMP/F3"
           emit "$RUNNER_TEMP/F3" > "$RUNNER_TEMP/emit.F3"
           cmp "$RUNNER_TEMP/emit.F" "$RUNNER_TEMP/emit.F3"
@@ -218,5 +191,5 @@ jobs:
           LIMIT_MODULES: 120
           LIMIT_STDLIB: 2400
         run: |
-          export FIB_LIB=$PWD/lib LD_LIBRARY_PATH=$PWD/seed/target/release
+          export FIB_LIB=$PWD/lib LD_LIBRARY_PATH=$SEED_LIB
           scripts/ci-stage2.sh "$RUNNER_TEMP/F"

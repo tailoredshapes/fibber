@@ -52,9 +52,28 @@ emit "$work/F3" > "$work/emit.F3"
 cmp "$work/emit.F" "$work/emit.F3" || { echo "package: STAGE CHECK FAILED: F3 emit differs from F's (no fixed point)" >&2; exit 1; }
 echo "stage check: F (built by the seed) and F3 (built by F) emit the same lIR ($(wc -c < "$work/emit.F") bytes)"
 
+echo "== the shipped binary, rpath \$ORIGIN/../lib"
+mkdir "$work/shim"
+cat > "$work/shim/cc" <<'SHIM'
+#!/bin/sh
+# Writes the rpath `$ORIGIN/../lib` where lair's link writes an absolute one.
+n=$#; swap=0
+while [ "$n" -gt 0 ]; do
+  a=$1; shift; n=$((n - 1))
+  if [ "$swap" = 1 ] && [ "$a" != -Xlinker ]; then a='$ORIGIN/../lib'; swap=0
+  elif [ "$a" = -rpath ]; then swap=1; fi
+  set -- "$@" "$a"
+done
+exec "$REAL_CC" "$@"
+SHIM
+chmod +x "$work/shim/cc"
+
 tree=$work/$name
 mkdir -p "$tree/bin" "$tree/lib" "$tree/share/fibber"
 REAL_CC=$(command -v cc) PATH="$work/shim:$PATH" build "$work/F3" "$tree/bin/fibc"
+if ! readelf -d "$tree/bin/fibc" | grep -q 'RUNPATH.*\$ORIGIN/../lib'; then
+  echo "package: the shipped fibc has no RUNPATH \$ORIGIN/../lib (the cc shim did not take): it would not find liblair.so" >&2; exit 1
+fi
 emit "$tree/bin/fibc" > "$work/emit.ship"
 cmp "$work/emit.F" "$work/emit.ship" || { echo "package: the shipped fibc emits something else" >&2; exit 1; }
 cp "$work/liblair.so" "$tree/lib/liblair.so"
