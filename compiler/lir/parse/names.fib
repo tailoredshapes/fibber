@@ -1,31 +1,87 @@
 ;; compiler/lir/parse/names.fib: names, and the helpers every parse module shares: crates/lir/src/parse/names.rs and the private helpers of
-;; parse/mod.rs (`arity`, `atom`, `label`). OWNER: package R. STUB, final signatures.
+;; parse/mod.rs (`arity`, `atom`, `label`). OWNER: package R.
 ;;
 ;; The Rust `parse/mod.rs` is the parent of the other parse files and they call its helpers; fibber has no parent module, so the helpers are
 ;; here, at the bottom of the parse modules' dependency order. `&[Sexp]` is a `(Vec Sexp)` (a copy of the operands after the head).
 (ns lir.parse.names
-  (:use lir.diag lir.ast lir.sexp))
+  (:use lir.diag lir.types lir.ast lir.sexp))
 
-;; A reserved word (parse/names.rs `is_reserved`).
+(def reserved-words: (Set str)
+  #{"null" "void" "unordered" "monotonic" "acquire" "release" "acq_rel" "seq_cst" "singlethread" "weak" "inbounds" "volatile" "align"
+    "zeroinitializer" "private" "internal" "external" "hidden"})
+
+(defun scalar? :private (s: str) -> bool
+  (match (scalar-keyword s) ((some _) true) (nil false)))
+
+;; A reserved word (parse/names.rs `is_reserved`): a type keyword or one of the reserved words.
 (defun reserved? (s: str) -> bool
-  (trap "todo: lir.parse.names reserved?"))
+  (or (contains? reserved-words s) (scalar? s)))
 
-;; A valid name: `@name`, `%name` or a bare name as the form expects (parse/names.rs `valid_name`).
+;; The text without a leading `-`.
+(defun strip-minus (s: str) -> str
+  (if (starts-with? s "-") (str-slice s 1 (str-len s)) s))
+
+;; Whether the first byte of s is an ASCII digit.
+(defun digit-first? (s: str) -> bool
+  (and (> (str-len s) 0)
+       (let ((b (zext i64 (str-byte-at s 0)))) (and (>= b 48) (<= b 57)))))
+
+(defun looks-numeric :private (s: str) -> bool
+  (let ((body (strip-minus s)))
+    (or (digit-first? body) (= body "inf") (= body "nan"))))
+
+;; A valid name at its binding site (parse/names.rs `valid_name`).
 (defun valid-name (s: str pos: i64) -> (Result str Diagnostic)
-  (trap "todo: lir.parse.names valid-name"))
+  (cond (or (= (str-len s) 0) (starts-with? s "@") (starts-with? s "%") (looks-numeric s) (= s "..."))
+        (err pos (str "invalid name " s))
+        (reserved? s) (err pos (str "reserved word " s " used as a name"))
+        :else (Ok s)))
 
 ;; `op expects N operands, found M` unless `args` has exactly `n` (parse/mod.rs `arity`).
 (defun arity (op: str args: (Vec Sexp) n: i64 pos: i64) -> (Result unit Diagnostic)
-  (trap "todo: lir.parse.names arity"))
+  (if (= (count args) n)
+      (Ok ())
+      (err pos (str op " expects " n " operand" (if (= n 1) "" "s") ", found " (count args)))))
 
 ;; The atom's text, or an error naming what was expected (parse/mod.rs `atom`).
 (defun atom-text (s: Sexp what: str) -> (Result str Diagnostic)
-  (trap "todo: lir.parse.names atom-text"))
+  (match s
+    ((SxAtom a _) (Ok a))
+    (_ (err (sexp-pos s) (str "expected " what ", found " (sexp-describe s))))))
 
 ;; A label: an atom that is a valid name (parse/mod.rs `label`).
 (defun label (s: Sexp) -> (Result str Diagnostic)
-  (trap "todo: lir.parse.names label"))
+  (try-let ((a (atom-text s "a block label")))
+    (if (or (starts-with? a "@") (starts-with? a "%") (= (str-len a) 0))
+        (err (sexp-pos s) (str "invalid label " a))
+        (Ok a))))
+
+;; The items of v from index k on, as a fresh vector (Rust's `&items[k..]`).
+(defun vec-from (v: (Vec Sexp) k: i64) -> (Vec Sexp)
+  (loop ((i k) (out []))
+    (if (>= i (count v)) out (recur (+ i 1) (conj out (nth v i))))))
+
+;; Whether the form is an atom with exactly this text.
+(defun atom-is? (s: Sexp w: str) -> bool
+  (match s ((SxAtom a _) (= a w)) (_ false)))
+
+;; The atom's text or "" (Rust's `atom().unwrap_or("")`).
+(defun atom-or-empty (s: Sexp) -> str
+  (match s ((SxAtom a _) a) (_ "")))
 
 ;; The expression parser that the instruction modules (instr, memory, atomics, control) are given for their operands, so that they do not
 ;; require lir.parse.expr, which requires them: the one recursion of the grammar is closed by passing `parse-expr` down.
 (defstruct ExprParser (parse: (fn (Sexp) (Result LExpr Diagnostic))))
+
+;; An operand: `parse-expr` through the field.
+(defun operand (sub: ExprParser s: Sexp) -> (Result LExpr Diagnostic)
+  ((. sub parse) s))
+
+;; Every form of `args` as an expression (expr.rs `exprs`).
+(defun operands (sub: ExprParser args: (Vec Sexp)) -> (Result (Vec LExpr) Diagnostic)
+  (loop ((i 0) (out []))
+    (if (>= i (count args))
+        (Ok out)
+        (match ((. sub parse) (nth args i))
+          ((Err d) (Err d))
+          ((Ok e) (recur (+ i 1) (conj out e)))))))

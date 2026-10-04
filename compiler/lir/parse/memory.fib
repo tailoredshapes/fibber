@@ -1,9 +1,87 @@
-;; compiler/lir/parse/memory.fib: alloca, load, store and getelementptr (crates/lir/src/parse/memory.rs). OWNER: package R. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/parse/memory.fib: alloca, load, store and getelementptr (crates/lir/src/parse/memory.rs). OWNER: package R.
 
 (ns lir.parse.memory
-  (:use lir.diag lir.types lir.lit lir.ast lir.sexp lir.parse.names))
+  (:use lir.diag lir.types lir.lit lir.ast lir.sexp lir.parse.names lir.parse.literal lir.parse.ty))
 
+;; The result of the leading options of a form: whether `volatile` was there, the alignment, and the operands left.
+(defstruct Access (volatile: bool align: (Option i64) rest: (Vec Sexp)))
+
+;; The alignment option and the rest.
+(defstruct Aligned (align: (Option i64) rest: (Vec Sexp)))
 
 ;; The form for `alloca load store getelementptr`, nil for another head. (memory.rs `memory`)
 (defun parse-memory (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Option (Result LExpr Diagnostic))
-  (trap "todo: lir.parse.memory parse-memory"))
+  (cond (= name "alloca") (some (alloca sub args pos))
+        (= name "load") (some (load sub args pos))
+        (= name "store") (some (store sub args pos))
+        (= name "getelementptr") (some (gep sub args pos))
+        :else nil))
+
+(defun alloca :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((al (align-option args)))
+    (let ((rest (. al rest)))
+      (if (or (= (count rest) 0) (> (count rest) 2))
+          (err pos (str "alloca expects 1 or 2 operands, found " (count rest)))
+          (try-let ((ty (parse-type (nth rest 0)))
+                    (n (if (= (count rest) 2)
+                           (try-let ((e (operand sub (nth rest 1)))) (Ok (some e)))
+                           (Ok nil))))
+            (Ok (expr-new (KAlloca ty n (. al align)) pos)))))))
+
+(defun load :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((ac (access-options args))
+            (_ (arity "load" (. ac rest) 2 pos))
+            (ty (parse-type (nth (. ac rest) 0)))
+            (p (operand sub (nth (. ac rest) 1))))
+    (Ok (expr-new (KLoad ty p (. ac volatile) (. ac align)) pos))))
+
+(defun store :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((ac (access-options args))
+            (_ (arity "store" (. ac rest) 2 pos))
+            (v (operand sub (nth (. ac rest) 0)))
+            (p (operand sub (nth (. ac rest) 1))))
+    (Ok (expr-new (KStore v p (. ac volatile) (. ac align)) pos))))
+
+;; A leading `volatile`, then an optional `(align N)`.
+(defun access-options :private (args: (Vec Sexp)) -> (Result Access Diagnostic)
+  (let ((volatile (and (> (count args) 0) (atom-is? (nth args 0) "volatile"))))
+    (try-let ((al (align-option (if volatile (vec-from args 1) args))))
+      (Ok (Access volatile (. al align) (. al rest))))))
+
+;; An optional leading `(align N)`: `N` a power of two up to 2^30.
+(defun align-option :private (args: (Vec Sexp)) -> (Result Aligned Diagnostic)
+  (if (= (count args) 0)
+      (Ok (Aligned nil args))
+      (match (nth args 0)
+        ((SxList items p)
+         (if (and (> (count items) 0) (atom-is? (nth items 0) "align"))
+             (align-form args items p)
+             (Ok (Aligned nil args))))
+        (_ (Ok (Aligned nil args))))))
+
+(defun align-form :private (args: (Vec Sexp) items: (Vec Sexp) p: i64) -> (Result Aligned Diagnostic)
+  (if (not (= (count items) 2))
+      (err p "align must be (align N)")
+      (match (match (nth items 1) ((SxAtom t _) (int-token t)) (_ nil))
+        (nil (err p "align must be (align N)"))
+        ((some v)
+         (if (and (lit->i64-in? v) (power-of-two? (. v lo)))
+             (Ok (Aligned (some (. v lo)) (vec-from args 1)))
+             (err p (str "align must be a power of two from 1 to 2^30, found " (lit-str v))))))))
+
+;; Whether v is in 1..2^30.
+(defun lit->i64-in? :private (v: LLit) -> bool
+  (and (= (. v hi) 0) (>= (. v lo) 1) (<= (. v lo) 1073741824)))
+
+(defun power-of-two? :private (n: i64) -> bool
+  (= (bit-and n (- n 1)) 0))
+
+(defun gep :private (sub: ExprParser args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (let ((inbounds (and (> (count args) 0) (atom-is? (nth args 0) "inbounds")))
+        (rest (if (and (> (count args) 0) (atom-is? (nth args 0) "inbounds")) (vec-from args 1) args)))
+    (if (< (count rest) 3)
+        (err pos "getelementptr needs a type, a pointer and at least one index")
+        (try-let ((ty (parse-type (nth rest 0)))
+                  (p (operand sub (nth rest 1)))
+                  (ix (operands sub (vec-from rest 2))))
+          (Ok (expr-new (KGep inbounds ty p ix) pos))))))

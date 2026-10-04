@@ -1,9 +1,9 @@
 ;; compiler/lir/sexp.fib: the S-expressions of lIR (spec/lir.md section 1), as crates/lir/src/sexp/{mod,reader}.rs: the data type, and the
-;; reader that turns the whole text into forms. OWNER: package R. STUB: the types are final; the functions say `todo:`.
+;; reader that turns the whole text into forms. OWNER: package R.
 ;;
 ;; The tokens are made by lir.sexp.lexer. A form carries the position of its first character (lir.diag `pos-new`).
 (ns lir.sexp
-  (:use lir.diag))
+  (:use lir.diag lir.types lir.sexp.lexer))
 
 ;; Lists nested deeper than this are an error (sexp/mod.rs `MAX_DEPTH`).
 (def max-depth: i64 512)
@@ -19,17 +19,84 @@
 
 ;; The position of the form (sexp/mod.rs `Sexp::pos`).
 (defun sexp-pos (s: Sexp) -> i64
-  (trap "todo: lir.sexp sexp-pos"))
+  (match s
+    ((SxList _ p) p) ((SxBrace _ p) p) ((SxBracket _ p) p)
+    ((SxAtom _ p) p) ((SxStr _ p) p) ((SxVecType _ _ p) p)))
 
 ;; The atom's text, if this is an atom (sexp/mod.rs `Sexp::atom`).
 (defun sexp-atom (s: Sexp) -> (Option str)
-  (trap "todo: lir.sexp sexp-atom"))
+  (match s ((SxAtom a _) (some a)) (_ nil)))
 
 ;; A short description for error messages: the atom, or the head of a list (sexp/mod.rs `Sexp::describe`).
 (defun sexp-describe (s: Sexp) -> str
-  (trap "todo: lir.sexp sexp-describe"))
+  (match s
+    ((SxAtom a _) a)
+    ((SxList items _) (if (= (count items) 0) "()" (sexp-describe (nth items 0))))
+    ((SxBrace _ _) "{ … }")
+    ((SxBracket items _) (str "[" (str-join-with " " (vec (map sexp-describe items))) "]"))
+    ((SxStr _ _) "a string")
+    ((SxVecType n e _) (str "<" n " x " e ">"))))
+
+;; The reader: the lexer, and whether it has failed (a lexical error is final; a structural one waits for the rest of the text to be lexed).
+(defstruct Reader (lx: Lexer failed: (Cell bool)))
 
 ;; Reads every form of `src`; the first lexical or structural error (sexp/reader.rs `read`). A lexical error found anywhere in the text
-;; wins over a parse error, because lir::parse reads all forms before it parses any.
+;; wins over a parse error, because lir::parse reads all forms before it parses any, and over a structural error, because the Rust
+;; lexes the whole text before it reads: so a structural error is held while the rest of the text is lexed (`settle`).
 (defun read (src: str) -> (Result (Vec Sexp) Diagnostic)
-  (trap "todo: lir.sexp read"))
+  (let ((rd (Reader (lexer-new src) (cell false))))
+    (loop ((out []))
+      (match (next-token rd)
+        ((Err d) (Err d))
+        ((Ok nil) (Ok out))
+        ((Ok (some t))
+         (match (read-form rd t 0)
+           ((Ok f) (recur (conj out f)))
+           ((Err d) (settle rd d))))))))
+
+(defun next-token :private (rd: Reader) -> (Result (Option Token) Diagnostic)
+  (match (lex-next (. rd lx))
+    ((Err d) (do (set! (. rd failed) true) (Err d)))
+    (r r)))
+
+;; The error of a read that failed: the lexical error itself, or the first one in the rest of the text, or `d`.
+(defun settle :private (rd: Reader d: Diagnostic) -> (Result (Vec Sexp) Diagnostic)
+  (if @(. rd failed)
+      (Err d)
+      (loop ()
+        (match (next-token rd)
+          ((Err e) (Err e))
+          ((Ok nil) (Err d))
+          ((Ok _) (recur))))))
+
+;; 0 for `)`, 1 for `}`, 2 for `]`; -1 for any other token.
+(defun closer-code :private (t: Tok) -> i64
+  (match t ((TokClose) 0) ((TokBraceClose) 1) ((TokBracketClose) 2) (_ -1)))
+
+(defun read-form :private (rd: Reader t: Token depth: i64) -> (Result Sexp Diagnostic)
+  (let ((pos (. t pos)))
+    (match (. t tok)
+      ((TokOpen) (try-let ((items (read-seq rd depth pos 0))) (Ok (SxList items pos))))
+      ((TokBraceOpen) (try-let ((items (read-seq rd depth pos 1))) (Ok (SxBrace items pos))))
+      ((TokBracketOpen) (try-let ((items (read-seq rd depth pos 2))) (Ok (SxBracket items pos))))
+      ((TokClose) (err pos "unexpected )"))
+      ((TokBraceClose) (err pos "unexpected }"))
+      ((TokBracketClose) (err pos "unexpected ]"))
+      ((TokAtom a) (Ok (SxAtom a pos)))
+      ((TokStr b) (Ok (SxStr b pos)))
+      ((TokVecType n e) (Ok (SxVecType n e pos))))))
+
+(defun read-seq :private (rd: Reader depth: i64 open: i64 close: i64) -> (Result (Vec Sexp) Diagnostic)
+  (if (> (+ depth 1) max-depth)
+      (err open (str "nesting deeper than " max-depth))
+      (loop ((items []))
+        (match (next-token rd)
+          ((Err d) (Err d))
+          ((Ok nil) (err open "unexpected end of input: unclosed list"))
+          ((Ok (some t))
+           (let ((c (closer-code (. t tok))))
+             (cond (= c close) (Ok items)
+                   (>= c 0) (err (. t pos) "mismatched closing bracket")
+                   :else (match (read-form rd t (+ depth 1))
+                           ((Ok f) (recur (conj items f)))
+                           ((Err d) (Err d))))))))))

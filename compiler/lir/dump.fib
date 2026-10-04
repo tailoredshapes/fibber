@@ -1,13 +1,309 @@
-;; compiler/lir/dump.fib: the oracle dump of the AST (docs/design/lair-ast-dump.md, written by package O; the Rust side is crates/lair/src/dump.rs). OWNER: package R. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
-
+;; compiler/lir/dump.fib: the oracle dump of the AST (docs/design/lair-ast-dump.md; the Rust side is crates/lair/src/dump.rs). OWNER: package R.
+;;
+;; One line per node, children two spaces deeper. The module is written through a sink: lines are collected and handed over in chunks of
+;; `chunk-lines`, so that a 19 MB module is never one string (`dump-with`); `dump-module` is the same output as one string.
 (ns lir.dump
-  (:use lir.diag lir.ast))
+  (:use lir.diag lir.types lir.lit lir.ast))
 
+(def chunk-lines: i64 2048)
+
+;; The lines not yet handed to the sink, and the sink.
+(defstruct Out (buf: (Cell (Vec str)) sink: (fn (str) unit)))
+
+;; The text of the dump as chunks (each ends in a newline) handed to `sink`, in order.
+(defun dump-with (m: LModule sink: (fn (str) unit)) -> unit
+  (let ((o (Out (cell []) sink)))
+    (do (emit o "module")
+        (dump-items o (. m items))
+        (flush o))))
 
 ;; The module as the canonical line-oriented dump, byte for byte the Rust `dump-ast` output.
 (defun dump-module (m: LModule) -> str
-  (trap "todo: lir.dump dump-module"))
+  (let ((acc (cell [])))
+    (do (dump-with m (fn (chunk: str) (set! acc (conj @acc chunk))))
+        (str-join @acc))))
 
-;; The line the dump prints for a read or parse failure (so that `lairf dump-ast` and `lair dump-ast` compare it).
+;; The line the dump prints for a read or parse failure (so that `lairf dump-ast` and `lair dump-ast` compare it): `LINE:COL: error: MESSAGE`
+;; with the file name in front, as `lair dump-ast` prints it on standard error.
 (defun dump-diagnostic (d: Diagnostic) -> str
-  (trap "todo: lir.dump dump-diagnostic"))
+  (diag-str d))
+
+;; ---------------------------------------------------------------- output
+
+(defun flush :private (o: Out) -> unit
+  (if (> (count @(. o buf)) 0)
+      (let ((text (str-join (with-newlines @(. o buf)))))
+        (do (set! (. o buf) [])
+            ((. o sink) text)))
+      ()))
+
+(defun with-newlines :private (lines: (Vec str)) -> (Vec str)
+  (loop ((i 0) (out []))
+    (if (>= i (count lines)) out (recur (+ i 1) (conj (conj out (nth lines i)) "\n")))))
+
+(defun emit :private (o: Out line: str) -> unit
+  (do (set! (. o buf) (conj @(. o buf) line))
+      (if (>= (count @(. o buf)) chunk-lines) (flush o) ())))
+
+(defun indent :private (d: i64) -> str
+  (loop ((i 0) (s ""))
+    (if (>= i d) s (recur (+ i 1) (str-concat s "  ")))))
+
+;; INDENT TAG [SP POS] [SP ATTRS].
+(defun line :private (o: Out d: i64 tag: str at: i64 attrs: str) -> unit
+  (emit o (str (indent d) tag (if (= at 0) "" (str " " (pos-str at))) (if (= attrs "") "" (str " " attrs)))))
+
+;; ---------------------------------------------------------------- values
+
+(defun hex-digit-char :private (n: i64) -> str (str-slice "0123456789abcdef" n (+ n 1)))
+
+;; `s` as a double-quoted string: `\\`, `\"`, `\n`, `\r`, `\t` and `\xHH` (lower-case hex) for every other byte outside 0x20..0x7e.
+(defun quote-bytes (bs: (Array i8)) -> str
+  (let ((parts (cell [])))
+    (do (loop ((i 0) (from 0))
+          (if (>= i (array-len bs))
+              (set! parts (conj @parts (bytes-slice bs from i)))
+              (let ((b (zext i64 (array-get bs i))))
+                (if (and (>= b 32) (<= b 126) (not (= b 34)) (not (= b 92)))
+                    (recur (+ i 1) from)
+                    (do (set! parts (conj (conj @parts (bytes-slice bs from i)) (escape-byte b)))
+                        (recur (+ i 1) (+ i 1)))))))
+        (str "\"" (str-join @parts) "\""))))
+
+;; The plain bytes from..to as text (all printable ASCII).
+(defun bytes-slice :private (bs: (Array i8) from: i64 to: i64) -> str
+  (if (>= from to)
+      ""
+      (let ((out (cell (array (- to from) 0i8))))
+        (do (dotimes (k (- to from)) (array-set! &out k (array-get bs (+ from k))))
+            (str-from-bytes @out)))))
+
+(defun escape-byte :private (b: i64) -> str
+  (cond (= b 92) "\\\\"
+        (= b 34) "\\\""
+        (= b 10) "\\n"
+        (= b 13) "\\r"
+        (= b 9) "\\t"
+        :else (str "\\x" (hex-digit-char (shr b 4)) (hex-digit-char (bit-and b 15)))))
+
+(defun quote-str :private (s: str) -> str (quote-bytes (str-bytes s)))
+
+(defun tyq :private (t: LType) -> str (quote-str (type-str t)))
+
+(defun fnq :private (t: LFnType) -> str (quote-str (fn-type-str t)))
+
+(defun opt-align :private (a: (Option i64)) -> str
+  (match a ((some n) (str n)) (nil "none")))
+
+(defun mods-str :private (m: LModifiers) -> str
+  (str "linkage=" (linkage-name (. m linkage)) " hidden=" (. m hidden)))
+
+(defun list-str :private (items: (Vec str)) -> str
+  (str "(" (str-join-with " " items) ")"))
+
+(defun hex16 :private (bits: i64) -> str
+  (loop ((k 15) (s ""))
+    (if (< k 0) s (recur (- k 1) (str-concat s (hex-digit-char (bit-and (shr bits (* k 4)) 15)))))))
+
+;; ---------------------------------------------------------------- enum names (the variant in lower case)
+
+(defun linkage-name :private (l: LLinkage) -> str
+  (match l ((LkExternal) "external") ((LkInternal) "internal") ((LkPrivate) "private")))
+
+(defun binop-name :private (o: LBinOp) -> str
+  (match o
+    ((BAdd) "add") ((BSub) "sub") ((BMul) "mul") ((BSDiv) "sdiv") ((BUDiv) "udiv") ((BSRem) "srem") ((BURem) "urem")
+    ((BFAdd) "fadd") ((BFSub) "fsub") ((BFMul) "fmul") ((BFDiv) "fdiv") ((BFRem) "frem") ((BAnd) "and") ((BOr) "or")
+    ((BXor) "xor") ((BShl) "shl") ((BLShr) "lshr") ((BAShr) "ashr")))
+
+(defun unop-name :private (o: LUnOp) -> str
+  (match o ((UFNeg) "fneg") ((UCtpop) "ctpop")))
+
+(defun ovf-name :private (o: LOvfOp) -> str
+  (match o ((OvSAdd) "sadd") ((OvSSub) "ssub") ((OvSMul) "smul")))
+
+(defun cast-name :private (o: LCastOp) -> str
+  (match o
+    ((CTrunc) "trunc") ((CZExt) "zext") ((CSExt) "sext") ((CFpTrunc) "fptrunc") ((CFpExt) "fpext") ((CFpToSi) "fptosi")
+    ((CFpToUi) "fptoui") ((CSiToFp) "sitofp") ((CUiToFp) "uitofp") ((CPtrToInt) "ptrtoint") ((CIntToPtr) "inttoptr")
+    ((CBitcast) "bitcast") ((CFpToSiSat) "fptosisat") ((CFpToUiSat) "fptouisat")))
+
+(defun ipred-name :private (p: LIPred) -> str
+  (match p
+    ((IEq) "eq") ((INe) "ne") ((ISlt) "slt") ((ISle) "sle") ((ISgt) "sgt") ((ISge) "sge") ((IUlt) "ult") ((IUle) "ule")
+    ((IUgt) "ugt") ((IUge) "uge")))
+
+(defun fpred-name :private (p: LFPred) -> str
+  (match p
+    ((FOeq) "oeq") ((FOne) "one") ((FOlt) "olt") ((FOle) "ole") ((FOgt) "ogt") ((FOge) "oge") ((FOrd) "ord") ((FUeq) "ueq")
+    ((FUne) "une") ((FUlt) "ult") ((FUle) "ule") ((FUgt) "ugt") ((FUge) "uge") ((FUno) "uno")))
+
+(defun ord-name :private (o: LOrdering) -> str
+  (match o
+    ((OUnordered) "unordered") ((OMonotonic) "monotonic") ((OAcquire) "acquire") ((ORelease) "release") ((OAcqRel) "acqrel")
+    ((OSeqCst) "seqcst")))
+
+(defun rmw-name :private (o: LRmwOp) -> str
+  (match o
+    ((RXchg) "xchg") ((RAdd) "add") ((RSub) "sub") ((RAnd) "and") ((RNand) "nand") ((ROr) "or") ((RXor) "xor") ((RMax) "max")
+    ((RMin) "min") ((RUMax) "umax") ((RUMin) "umin") ((RFAdd) "fadd") ((RFSub) "fsub") ((RFMax) "fmax") ((RFMin) "fmin")))
+
+(defun scope-name :private (s: LScope) -> str
+  (match s ((ScSystem) "system") ((ScSingleThread) "singlethread")))
+
+;; ---------------------------------------------------------------- items
+
+(defun dump-items :private (o: Out items: (Vec LItem)) -> unit
+  (loop ((i 0))
+    (if (>= i (count items))
+        ()
+        (do (dump-item o 1 (nth items i)) (recur (+ i 1))))))
+
+(defun dump-item :private (o: Out d: i64 it: LItem) -> unit
+  (match it
+    ((ItStruct s)
+     (line o d "struct" (. s pos) (str "name=" (quote-str (. s name)) " fields=" (list-str (vec (map tyq (. s fields)))))))
+    ((ItGlobal g)
+     (do (line o d "global" (. g pos)
+               (str "name=" (quote-str (. g name)) " ty=" (tyq (. g ty)) " const=" (. g constant) " " (mods-str (. g mods))))
+         (dump-expr o (+ d 1) (. g init))))
+    ((ItDeclareGlobal g)
+     (line o d "declare-global" (. g pos) (str "name=" (quote-str (. g name)) " ty=" (tyq (. g ty)) " hidden=" (. g hidden))))
+    ((ItDeclare f)
+     (line o d "declare" (. f pos) (str "name=" (quote-str (. f name)) " fn=" (fnq (. f ty)) " hidden=" (. f hidden))))
+    ((ItDefine f) (dump-function o d f))))
+
+(defun dump-function :private (o: Out d: i64 f: LFunction) -> unit
+  (let ((params (list-str (vec (map (fn (p: LParam) (str (quote-str (. p name)) "@" (pos-str (. p pos)))) (. f params))))))
+    (do (line o d "define" (. f pos)
+              (str "name=" (quote-str (. f name)) " fn=" (fnq (. f ty)) " " (mods-str (. f mods)) " params=" params))
+        (dump-blocks o (+ d 1) (. f blocks)))))
+
+(defun dump-blocks :private (o: Out d: i64 blocks: (Vec LBlock)) -> unit
+  (loop ((i 0))
+    (if (>= i (count blocks))
+        ()
+        (let ((b (nth blocks i)))
+          (do (line o d "block" (. b pos) (str "label=" (quote-str (. b label))))
+              (dump-exprs o (+ d 1) (. b body))
+              (recur (+ i 1)))))))
+
+(defun dump-exprs :private (o: Out d: i64 es: (Vec LExpr)) -> unit
+  (loop ((i 0))
+    (if (>= i (count es))
+        ()
+        (do (dump-expr o d (nth es i)) (recur (+ i 1))))))
+
+(defun dump-bind :private (o: Out d: i64 b: LBinding) -> unit
+  (do (line o d "bind" (. b pos) (str "name=" (quote-str (. b name))))
+      (dump-expr o (+ d 1) (. b value))))
+
+(defun dump-binds :private (o: Out d: i64 bs: (Vec LBinding)) -> unit
+  (loop ((i 0))
+    (if (>= i (count bs))
+        ()
+        (do (dump-bind o d (nth bs i)) (recur (+ i 1))))))
+
+;; ---------------------------------------------------------------- expressions
+
+(defun dump-expr (o: Out d: i64 e: LExpr) -> unit
+  (let ((p (. e pos)) (k (. e kind)))
+    (match k
+      ((KLocal n) (line o d "local" p (str "name=" (quote-str n))))
+      ((KGlobal n) (line o d "global-ref" p (str "name=" (quote-str n))))
+      ((KInt t v) (line o d "int" p (str "ty=" (tyq t) " val=" (lit-str v))))
+      ((KFloat t v) (line o d "float" p (str "ty=" (tyq t) " bits=0x" (hex16 (f64->bits v)))))
+      ((KNull) (line o d "null" p ""))
+      ((KVector t es) (do (line o d "vector" p (str "ty=" (tyq t))) (dump-exprs o (+ d 1) es)))
+      ((KStr b) (line o d "str" p (str "bytes=" (quote-bytes b))))
+      ((KStruct n es)
+       (do (line o d "struct-lit" p (str "name=" (match n ((some s) (quote-str s)) (nil "none"))))
+           (dump-exprs o (+ d 1) es)))
+      ((KArray t es) (do (line o d "array" p (str "ty=" (tyq t))) (dump-exprs o (+ d 1) es)))
+      ((KZero t) (line o d "zero" p (str "ty=" (tyq t))))
+      (_ (dump-op o d p k)))))
+
+(defun dump-op :private (o: Out d: i64 p: i64 k: LKind) -> unit
+  (match k
+    ((KBin op a b) (do (line o d "bin" p (str "op=" (binop-name op))) (dump-two o (+ d 1) a b)))
+    ((KUn op a) (do (line o d "un" p (str "op=" (unop-name op))) (dump-expr o (+ d 1) a)))
+    ((KOverflow op a b) (do (line o d "overflow" p (str "op=" (ovf-name op))) (dump-two o (+ d 1) a b)))
+    ((KICmp pr a b) (do (line o d "icmp" p (str "pred=" (ipred-name pr))) (dump-two o (+ d 1) a b)))
+    ((KFCmp pr a b) (do (line o d "fcmp" p (str "pred=" (fpred-name pr))) (dump-two o (+ d 1) a b)))
+    ((KCast op t v) (do (line o d "cast" p (str "op=" (cast-name op) " ty=" (tyq t))) (dump-expr o (+ d 1) v)))
+    ((KSelect c a b) (do (line o d "select" p "") (dump-three o (+ d 1) c a b)))
+    ((KExtractElement v i) (do (line o d "extract-element" p "") (dump-two o (+ d 1) v i)))
+    ((KInsertElement v x i) (do (line o d "insert-element" p "") (dump-three o (+ d 1) v x i)))
+    ((KShuffle a b m) (do (line o d "shuffle" p "") (dump-three o (+ d 1) a b m)))
+    ((KExtractValue a ix) (do (line o d "extract-value" p (str "idx=" (idx-str ix))) (dump-expr o (+ d 1) a)))
+    ((KInsertValue a v ix) (do (line o d "insert-value" p (str "idx=" (idx-str ix))) (dump-two o (+ d 1) a v)))
+    (_ (dump-memory o d p k))))
+
+(defun idx-str :private (ix: (Vec LLit)) -> str (list-str (vec (map lit-str ix))))
+
+(defun dump-two :private (o: Out d: i64 a: LExpr b: LExpr) -> unit
+  (do (dump-expr o d a) (dump-expr o d b)))
+
+(defun dump-three :private (o: Out d: i64 a: LExpr b: LExpr c: LExpr) -> unit
+  (do (dump-expr o d a) (dump-expr o d b) (dump-expr o d c)))
+
+(defun dump-memory :private (o: Out d: i64 p: i64 k: LKind) -> unit
+  (match k
+    ((KAlloca t count align)
+     (do (line o d "alloca" p (str "ty=" (tyq t) " count=" (match count ((some _) true) (nil false)) " align=" (opt-align align)))
+         (match count ((some c) (dump-expr o (+ d 1) c)) (nil ()))))
+    ((KLoad t ptr vol align)
+     (do (line o d "load" p (str "ty=" (tyq t) " volatile=" vol " align=" (opt-align align))) (dump-expr o (+ d 1) ptr)))
+    ((KStore v ptr vol align)
+     (do (line o d "store" p (str "volatile=" vol " align=" (opt-align align))) (dump-two o (+ d 1) v ptr)))
+    ((KGep inb t ptr ix)
+     (do (line o d "gep" p (str "inbounds=" inb " ty=" (tyq t))) (dump-expr o (+ d 1) ptr) (dump-exprs o (+ d 1) ix)))
+    ((KAtomicLoad sc ord t ptr)
+     (do (line o d "atomic-load" p (str "scope=" (scope-name sc) " ord=" (ord-name ord) " ty=" (tyq t))) (dump-expr o (+ d 1) ptr)))
+    ((KAtomicStore sc ord v ptr)
+     (do (line o d "atomic-store" p (str "scope=" (scope-name sc) " ord=" (ord-name ord))) (dump-two o (+ d 1) v ptr)))
+    ((KAtomicRmw op sc ord ptr v)
+     (do (line o d "atomic-rmw" p (str "op=" (rmw-name op) " scope=" (scope-name sc) " ord=" (ord-name ord))) (dump-two o (+ d 1) ptr v)))
+    ((KCmpXchg weak sc succ fail ptr ex nw)
+     (do (line o d "cmpxchg" p (str "weak=" weak " scope=" (scope-name sc) " success=" (ord-name succ) " failure=" (ord-name fail)))
+         (dump-three o (+ d 1) ptr ex nw)))
+    ((KFence sc ord) (line o d "fence" p (str "scope=" (scope-name sc) " ord=" (ord-name ord))))
+    (_ (dump-control o d p k))))
+
+(defun dump-control :private (o: Out d: i64 p: i64 k: LKind) -> unit
+  (match k
+    ((KTrap) (line o d "trap" p ""))
+    ((KCall callee args tail) (dump-call o d p callee args tail))
+    ((KRet v)
+     (do (line o d "ret" p (str "value=" (match v ((some _) true) (nil false))))
+         (match v ((some x) (dump-expr o (+ d 1) x)) (nil ()))))
+    ((KBr l) (line o d "br" p (str "label=" (quote-str l))))
+    ((KCondBr c t f) (do (line o d "cond-br" p (str "then=" (quote-str t) " else=" (quote-str f))) (dump-expr o (+ d 1) c)))
+    ((KSwitch v df cases)
+     (do (line o d "switch" p (str "default=" (quote-str df) " cases=" (count cases)))
+         (dump-expr o (+ d 1) v)
+         (dump-cases o (+ d 1) cases)))
+    ((KUnreachable) (line o d "unreachable" p ""))
+    ((KPhi t bs) (do (line o d "phi" p (str "ty=" (tyq t))) (dump-binds o (+ d 1) bs)))
+    ((KLet bs body)
+     (do (line o d "let" p (str "bindings=" (count bs))) (dump-binds o (+ d 1) bs) (dump-exprs o (+ d 1) body)))
+    (_ ())))
+
+(defun dump-call :private (o: Out d: i64 p: i64 callee: LCallee args: (Vec LExpr) tail: bool) -> unit
+  (match callee
+    ((CalDirect n)
+     (do (line o d "call" p (str "tail=" tail " callee=direct name=" (quote-str n) " args=" (count args)))
+         (dump-exprs o (+ d 1) args)))
+    ((CalIndirect c ty)
+     (do (line o d "call" p (str "tail=" tail " callee=indirect fn=" (fnq ty) " args=" (count args)))
+         (dump-expr o (+ d 1) c)
+         (dump-exprs o (+ d 1) args)))))
+
+(defun dump-cases :private (o: Out d: i64 cases: (Vec LCase)) -> unit
+  (loop ((i 0))
+    (if (>= i (count cases))
+        ()
+        (let ((c (nth cases i)))
+          (do (line o d "case" 0 (str "label=" (quote-str (. c label))))
+              (dump-expr o (+ d 1) (. c value))
+              (recur (+ i 1)))))))
