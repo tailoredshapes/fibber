@@ -97,16 +97,19 @@
     (str-join ["(constant internal str." (str i) " { i64 i32 i32 i64 " arr " } { (i64 0) (i32 " tid ") (i32 "
                (str flag-immortal) ") (i64 " (str n) ") (" arr " " (byte-words text) ") })\n"])))
 
-;; The constants: strings, immortal closures, vtables. Rust: statics.rs:105 Statics::render
+;; The constants: strings, immortal closures, vtables, one piece each (the pieces `statics-render` joins; a string's is made once).
+;; Rust: statics.rs:105 Statics::render
+(defun statics-render-pieces (st: Statics) -> (Vec str)
+  (into (into (mapv (fn (s: StaticStr) (. s lir)) @(. st strings))
+              (mapv (fn (c: StaticClosure)
+                      (str-join ["(constant internal " (unat (. c name)) " { i64 i32 i32 ptr } { (i64 0) (i32 " (str (. c tid))
+                                 ") (i32 " (str flag-immortal) ") @" (. c code) " })\n"]))
+                    @(. st closures)))
+        (mapv (fn (v: StaticVtable)
+                (let ((k (str (count (. v slots)))))
+                  (str-join ["(constant internal " (unat (. v name)) " [" k " x ptr] ([" k " x ptr] "
+                             (s/join " " (. v slots)) "))\n"])))
+              @(. st vtables))))
+
 (defun statics-render (st: Statics) -> str
-  (str-join
-    (into (into (mapv (fn (s: StaticStr) (. s lir)) @(. st strings))
-                (mapv (fn (c: StaticClosure)
-                        (str-join ["(constant internal " (unat (. c name)) " { i64 i32 i32 ptr } { (i64 0) (i32 " (str (. c tid))
-                                   ") (i32 " (str flag-immortal) ") @" (. c code) " })\n"]))
-                      @(. st closures)))
-          (mapv (fn (v: StaticVtable)
-                  (let ((k (str (count (. v slots)))))
-                    (str-join ["(constant internal " (unat (. v name)) " [" k " x ptr] ([" k " x ptr] "
-                               (s/join " " (. v slots)) "))\n"])))
-                @(. st vtables)))))
+  (str-join (statics-render-pieces st)))

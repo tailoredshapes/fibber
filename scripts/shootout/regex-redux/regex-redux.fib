@@ -1,0 +1,60 @@
+;; regex-redux, the Computer Language Benchmarks Game: read a FASTA file from stdin, strip the header lines and
+;; the newlines with a regex, count the matches of nine IUPAC variants of the pattern agggtaaa|tttaccct,
+;; apply five substitutions one after the other, print the counts and the three lengths.
+;; The text is read as bytes (fib.unix fd-read, 64 KB blocks) and made one `str`; the regex is fib.regex.
+(ns main (:use fib.regex) (:require [fib.unix :as unix]))
+
+(defun read-chunks (fd: i64 chunks: (Vec (Array i8)) total: i64) -> (Pair (Vec (Array i8)) i64)
+  (match (unix/fd-read fd 65536)
+    ((Ok bs) (if (= (array-len bs) 0)
+                 (Pair chunks total)
+                 (read-chunks fd (conj chunks bs) (+ total (array-len bs)))))
+    ((Err e) (trap (str "read failed: errno " e)))))
+
+;; the chunks as one array, copied block by block
+(defun join-chunks (chunks: (Vec (Array i8)) total: i64) -> (Array i8)
+  (let [buf (cell (array (max total 1) 0i8))
+        pos (cell 0)]
+    (do (doseq [c chunks]
+          (let [n (array-len c)
+                at @pos]
+            (do (dotimes (j n) (array-set! &buf (+ at j) (array-get c j)))
+                (set! pos (+ at n)))))
+        (array-copy @buf 0 total))))
+
+(defun read-stdin () -> str
+  (let [r (read-chunks unix/stdin (vec-empty) 0)]
+    (str-from-bytes (join-chunks (. r fst) (. r snd)))))
+
+(defun variant-patterns () -> (Vec str)
+  ["agggtaaa|tttaccct"
+   "[cgt]gggtaaa|tttaccc[acg]"
+   "a[act]ggtaaa|tttacc[agt]t"
+   "ag[act]gtaaa|tttac[agt]ct"
+   "agg[act]taaa|ttta[agt]cct"
+   "aggg[acg]aaa|ttt[cgt]ccct"
+   "agggt[cgt]aa|tt[acg]accct"
+   "agggta[cgt]a|t[acg]taccct"
+   "agggtaa[cgt]|[acg]ttaccct"])
+
+(defun substitutions () -> (Vec (Pair str str))
+  [(Pair "tHa[Nt]" "<4>")
+   (Pair "aND|caN|Ha[DS]|WaS" "<3>")
+   (Pair "a[NSt]|BY" "<2>")
+   (Pair "<[^>]*>" "|")
+   (Pair "\\|[^|][^|]*\\|" "-")])
+
+(defun main () -> i64
+  (let [input (read-stdin)
+        ilen (str-len input)
+        seq (replace-all (re-pattern ">.*\n|\n") input "")
+        clen (str-len seq)]
+    (do (doseq [p (variant-patterns)]
+          (println p (re-count (re-pattern p) seq)))
+        (let [final (reduce (fn (s: str sub: (Pair str str)) (replace-all (re-pattern (. sub fst)) s (. sub snd)))
+                            seq (substitutions))]
+          (do (println)
+              (println ilen)
+              (println clen)
+              (println (str-len final))
+              0)))))

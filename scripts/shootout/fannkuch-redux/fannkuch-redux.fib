@@ -1,0 +1,46 @@
+;; fannkuch-redux (Benchmarks Game): for every permutation of 1..n count the pancake flips needed to bring 1 to the front;
+;; print the checksum (flips summed with alternating sign) and the maximum. Permutations in the game's order (rotate-and-count).
+(ns main)
+
+;; flips of one permutation: copy p1 into p, then reverse the prefix named by p[0] until p[0] is 0.
+(defun count-flips (&p: (Array i64) &p1: (Array i64) n: i64) -> i64
+  (do (loop [i 0] (if (< i n) (do (array-set! &p i (array-get @p1 i)) (recur (+ i 1)))))
+      (loop [flips 0]
+        (let [k (array-get @p 0)]
+          (if (= k 0) flips
+            (do (loop [i 0 j k]    ; reverse the first k+1 entries of p (inline: forwarding &p to a callee copies the array)
+                  (if (< i j)
+                    (let [t (array-get @p i)]
+                      (do (array-set! &p i (array-get @p j))
+                          (array-set! &p j t)
+                          (recur (+ i 1) (- j 1))))))
+                (recur (+ flips 1))))))))
+
+;; the next permutation of p1 (rotate the first r+1 entries); returns the new r, or n when the last one has been passed.
+(defun next-perm (&p1: (Array i64) &cnt: (Array i64) n: i64) -> i64
+  (loop [r 1]
+    (if (= r n) n
+      (let [p0 (array-get @p1 0)]
+        (do (loop [i 0] (if (< i r) (do (array-set! &p1 i (array-get @p1 (+ i 1))) (recur (+ i 1)))))
+            (array-set! &p1 r p0)
+            (array-set! &cnt r (- (array-get @cnt r) 1))
+            (if (> (array-get @cnt r) 0) r (recur (+ r 1))))))))
+
+(defun fannkuch (n: i64) -> (Vec i64)
+  (let [p (cell (array n 0)) p1 (cell (array n 0)) cnt (cell (array n 0))]
+    (do (loop [i 0] (if (< i n) (do (array-set! &p1 i i) (recur (+ i 1)))))
+        (loop [r n pc 0 maxf 0 sum 0]
+          (do (loop [r r] (if (!= r 1) (do (array-set! &cnt (- r 1) r) (recur (- r 1)))))
+              (let [flips (count-flips &p &p1 n)
+                    maxf2 (if (> flips maxf) flips maxf)
+                    sum2 (if (= (rem pc 2) 0) (+ sum flips) (- sum flips))
+                    r2 (next-perm &p1 &cnt n)]
+                (if (= r2 n) [sum2 maxf2]
+                  (recur r2 (+ pc 1) maxf2 sum2))))))))
+
+(defun main () -> i64
+  (let [n (match (first (args)) ((some s) (match (parse-long s) ((some v) v) (_ 7))) (_ 7))
+        res (fannkuch n)]
+    (do (println (nth res 0))
+        (println (str "Pfannkuchen(" n ") = " (nth res 1)))
+        0)))

@@ -1,0 +1,213 @@
+;; fib.regex.dfa: a lazy DFA over the program of fib.regex.prog, for finding where a match is (stdlib §4.9).
+;; A DFA state is the ordered list of the program's instructions that a Pike VM would hold after the
+;; same text (and, last, the entry -1 while the thread that starts a match at the next position is alive), taken after the closure of the jumps (so only SET and MATCH are in it). The transitions
+;; are made when the text first needs them and kept in a table, a row of one entry per character class.
+;; Forward, in first-match mode, over the unanchored program (a thread is started at every position,
+;; at the lowest priority), it finds the END of the match Perl and Java would take: when a MATCH is
+;; reached, the threads below it are dropped and the ones above it go on, as the Pike VM does. Backward,
+;; over the reverse program in longest mode, anchored at that end, it finds the START: the smallest
+;; start of a match that ends there, which is the start of the leftmost match. One table lookup per
+;; character, whatever the pattern; time linear in the text; memory bounded by `cap` states, after
+;; which a scan answers -2 and the caller falls back on the Pike VM.
+;; The DFA does not do zero-width assertions (`^ $ \b`), which depend on the text around a position:
+;; a program with one is run by the Pike VM only (fib.regex.api).
+(ns fib.regex.dfa (:use fib.core fib.seq fib.coll fib.string.utf8 fib.regex.prog))
+
+(defstruct Dfa
+  (p: Prog
+   lists: (Cell (Vec (Vec i64)))
+   flags: (Cell (Array i8))
+   trans: (Cell (Array i64))
+   index: (Cell (Map (Vec i64) i64))
+   count: (Cell i64)
+   seen: (Cell (Array i64))
+   gen: (Cell i64)
+   stop: (Cell bool)
+   start: (Cell i64)
+   ri: (Cell i64)
+   re: (Cell i64)
+   rl: (Cell i64)
+   unanch: bool
+   longest: bool
+   cap: i64))
+
+;; Max states: the table has cap * ncls entries, at most about two million
+(defun cap-for (p: Prog) -> i64 (min 10000 (max 64 (quot 2000000 (. p ncls)))))
+
+(defun new-dfa (p: Prog unanch: bool longest: bool) -> Dfa
+  (Dfa p (cell (vec-empty)) (cell (array 1 0i8)) (cell (array 1 -1)) (cell {}) (cell 0)
+       (cell (array (max 1 (. p n)) 0)) (cell 0) (cell false) (cell -1) (cell 0) (cell 0) (cell 0) unanch longest (cap-for p)))
+
+;; the table is allocated when the first scan needs it, and again when the cache is emptied
+(defun dfa-reset (d: Dfa) -> unit
+  (do (set! (. d lists) (vec-empty))
+      (set! (. d flags) (array (. d cap) 0i8))
+      (set! (. d trans) (array (* (. d cap) (. (. d p) ncls)) -1))
+      (set! (. d index) {})
+      (set! (. d count) 0)
+      (set! (. d start) -1)
+      (dfa-intern d (vec-empty))
+      ()))
+
+(defun has-match? (p: Prog lst: (Vec i64)) -> bool
+  (loop [i 0]
+    (if (< i (count lst))
+        (if (and (>= (nth lst i) 0) (= (array-get (. p ops) (nth lst i)) op-match)) true (recur (+ i 1)))
+        false)))
+
+;; the id of the state with this list, made if it is new; -2 when the cache is full
+(defun dfa-intern (d: Dfa lst: (Vec i64)) -> i64
+  (match (get @(. d index) lst)
+    ((some id) id)
+    (nil (let [id @(. d count)]
+           (if (>= id (. d cap))
+               -2
+               (let [fl (. d flags)]
+                 (do (set! (. d lists) (conj @(. d lists) lst))
+                     (set! (. d index) (assoc @(. d index) lst id))
+                     (set! (. d count) (+ id 1))
+                     (array-set! &fl id (if (has-match? (. d p) lst) 1i8 0i8))
+                     id)))))))
+
+;; ---- closure ----
+
+(defun follow (d: Dfa gen: i64 pc: i64 out: (Vec i64)) -> (Vec i64)
+  (let [seen (. d seen)]
+    (if (or @(. d stop) (and (>= pc 0) (= (array-get @seen pc) gen)))
+        out
+        (if (< pc 0)
+            (conj out pc)
+        (let [p (. d p)
+              op (array-get (. p ops) pc)]
+          (do (array-set! &seen pc gen)
+              (cond (= op op-jmp) (follow d gen (array-get (. p xs) pc) out)
+                    (= op op-split) (follow d gen (array-get (. p ys) pc) (follow d gen (array-get (. p xs) pc) out))
+                    (= op op-save) (follow d gen (+ pc 1) out)
+                    (= op op-set) (conj out pc)
+                    (= op op-match) (do (if (. d longest) () (set! (. d stop) true)) (conj out pc))
+                    :else out)))))))
+
+(defun closure (d: Dfa seeds: (Vec i64)) -> (Vec i64)
+  (let [gen (+ @(. d gen) 1)]
+    (do (set! (. d gen) gen)
+        (set! (. d stop) false)
+        (reduce (fn (out: (Vec i64) pc: i64) (follow d gen pc out)) (vec-empty) seeds))))
+
+;; A transition-table entry says where to go and whether the state there holds a MATCH: -1 not made yet, 0 the
+;; dead state, otherwise `row * 2 + flag` where row = state id * ncls is the state's row of the table.
+(defun entry-of (d: Dfa id: i64) -> i64
+  (+ (* (* id (. (. d p) ncls)) 2) (if (= (array-get @(. d flags) id) 1i8) 1 0)))
+
+(defun id-entry (d: Dfa id: i64) -> i64 (if (< id 0) id (entry-of d id)))
+
+;; the entry of the state before any character: the closure of the program's first instruction
+(defun dfa-start (d: Dfa) -> i64
+  (do (if (or (< (array-len @(. d trans)) (* (. d cap) (. (. d p) ncls))) (>= @(. d count) (. d cap))) (dfa-reset d) ())
+      (if (< @(. d start) 0)
+          (set! (. d start) (id-entry d (dfa-intern d (closure d (if (. d unanch) [0 -1] [0])))))
+          ())
+      @(. d start)))
+
+;; ---- transitions ----
+
+(defun seeds-of (d: Dfa lst: (Vec i64) cls: i64) -> (Vec i64)
+  (let [p (. d p)
+        out (reduce (fn (acc: (Vec i64) pc: i64)
+                      (if (and (>= pc 0) (= (array-get (. p ops) pc) op-set) (member? p (array-get (. p xs) pc) cls))
+                          (conj acc (+ pc 1))
+                          acc))
+                    (vec-empty) lst)]
+    (if (and (> (count lst) 0) (< (nth lst (- (count lst) 1)) 0)) (conj (conj out 0) -1) out)))
+
+;; the entry after the state with entry e reads a character of class cls, made and kept; -2 when the cache is full
+(defun dfa-next (d: Dfa e: i64 cls: i64) -> i64
+  (let [ncls (. (. d p) ncls)
+        id (quot (shr e 1) ncls)
+        nx (id-entry d (dfa-intern d (closure d (seeds-of d (nth @(. d lists) id) cls))))]
+    (if (< nx 0)
+        nx
+        (let [tr (. d trans)]
+          (do (array-set! &tr (+ (shr e 1) cls) nx) nx)))))
+
+;; ---- scans ----
+;; Each scan is two loops. The fast one runs over a borrowed snapshot of the table, so that a step is a load of the
+;; byte, a load of its class and a load of the entry, and stops when it needs more than that: the end, the dead
+;; state (answer 0), or an entry not made yet or a character beyond ASCII (answer 1). It leaves where it stopped in
+;; the registers ri, re (the entry) and rl (the last match end seen). The slow loop handles that one step, with the
+;; table in its cell so that a new entry is written in place, and goes back to the fast one.
+
+(defun stop (d: Dfa code: i64 i: i64 e: i64 last: i64) -> i64
+  (do (set! (. d ri) i) (set! (. d re) e) (set! (. d rl) last) code))
+
+(defun cp-at (s: str i: i64) -> i64 (zext i64 (code-at s i)))
+
+(defun fast-forward (tr: (Array i64) asc: (Array i64) s: str n: i64 d: Dfa i0: i64 e0: i64 last0: i64) -> i64
+  (loop [i i0 e e0 last last0]
+    (if (>= i n)
+        (stop d 0 i e last)
+        (let [a (array-get asc (zext i64 (str-byte-at s i)))]
+          (if (< a 0)
+              (stop d 1 i e last)
+              (let [t (array-get tr (+ (shr e 1) a))]
+                (cond (> t 0) (recur (+ i 1) t (if (= (bit-and t 1) 1) (+ i 1) last))
+                      (= t 0) (stop d 0 i e last)
+                      :else (stop d 1 i e last))))))))
+
+;; the end of the match that starts at or after `from` and that Perl and Java prefer, -1 when there is
+;; none, -2 when the cache is full
+(defun dfa-forward (d: Dfa s: str from: i64) -> i64
+  (let [e0 (dfa-start d)]
+    (if (< e0 0)
+        e0
+        (let [p (. d p)
+              n (str-len s)
+              asc (. p asc)]
+          (loop [i from e e0 last (if (= (bit-and e0 1) 1) from -1)]
+            (if (= (fast-forward @(. d trans) asc s n d i e last) 0)
+                @(. d rl)
+                (let [i2 @(. d ri)
+                      e2 @(. d re)
+                      l2 @(. d rl)
+                      a (array-get asc (zext i64 (str-byte-at s i2)))
+                      c (if (>= a 0) a (cls-of p (cp-at s i2)))
+                      w (if (>= a 0) 1 (width-of (byte-at s i2)))
+                      t (array-get @(. d trans) (+ (shr e2 1) c))
+                      nx (if (= t -1) (dfa-next d e2 c) t)]
+                  (cond (< nx 0) nx
+                        (= nx 0) l2
+                        :else (recur (+ i2 w) nx (if (= (bit-and nx 1) 1) (+ i2 w) l2))))))))))
+
+(defun fast-backward (tr: (Array i64) asc: (Array i64) s: str from: i64 d: Dfa i0: i64 e0: i64 last0: i64) -> i64
+  (loop [i i0 e e0 last last0]
+    (if (<= i from)
+        (stop d 0 i e last)
+        (let [a (array-get asc (zext i64 (str-byte-at s (- i 1))))]
+          (if (< a 0)
+              (stop d 1 i e last)
+              (let [t (array-get tr (+ (shr e 1) a))]
+                (cond (> t 0) (recur (- i 1) t (if (= (bit-and t 1) 1) (- i 1) last))
+                      (= t 0) (stop d 0 i e last)
+                      :else (stop d 1 i e last))))))))
+
+;; the smallest start >= from of a match that ends at e; -1 when there is none, -2 when the cache is full
+;; (d is the DFA of the reverse program, anchored, longest)
+(defun dfa-backward (d: Dfa s: str end: i64 from: i64) -> i64
+  (let [e0 (dfa-start d)]
+    (if (< e0 0)
+        e0
+        (let [p (. d p)
+              asc (. p asc)]
+          (loop [i end e e0 last (if (= (bit-and e0 1) 1) end -1)]
+            (if (= (fast-backward @(. d trans) asc s from d i e last) 0)
+                @(. d rl)
+                (let [i2 @(. d ri)
+                      e2 @(. d re)
+                      l2 @(. d rl)
+                      b (zext i64 (str-byte-at s (- i2 1)))
+                      j (if (< b 128) (- i2 1) (start-before s i2))
+                      c (if (< b 128) (array-get asc b) (cls-of p (cp-at s j)))
+                      t (array-get @(. d trans) (+ (shr e2 1) c))
+                      nx (if (= t -1) (dfa-next d e2 c) t)]
+                  (cond (< nx 0) nx
+                        (= nx 0) l2
+                        :else (recur j nx (if (= (bit-and nx 1) 1) j l2))))))))))

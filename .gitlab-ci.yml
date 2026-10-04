@@ -1,0 +1,106 @@
+# CI on the local GitLab (shell runner, tag `shell`, user gitlab-runner). It replaces .github/workflows/ci.yml and release.yml, which GitHub
+# cannot run while the account's Actions billing limit is exceeded; both stay in the tree until that is settled.
+#
+# What each job judges (CLAUDE.md): `stage2` is the truth about main (the released seed in SEED builds stage 2, the fixed point holds, the
+# case suites pass except the expected ones); `lairf` checks the fibber lair against the Rust one while the Rust one exists (until stage 10);
+# `rust-seed` judges the frozen Rust against the data of its own time (tag seed-1); `release` builds the tarball on a v* tag.
+# The seed comes from the cache directory FIB_SEED_CACHE (DIR/SHA256/seed.tar.gz): the runner has no GitHub login. Put a new seed there
+# (and its sha256 in SEED) when SEED moves.
+
+stages: [test, release]
+
+variables:
+  GIT_DEPTH: "0"                      # the Rust job needs the tag seed-1
+  GIT_FETCH_EXTRA_FLAGS: --tags
+  LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+  FIB_SEED_CACHE: /tank/repos/tailoredshapes/_ci-cache/fibber/seeds
+  CARGO_TARGET_DIR: /home/gitlab-runner/.cache/fibber-ci/cargo-target
+  FIB_LAIR_WORKERS: "4"
+
+default:
+  tags: [shell]
+  timeout: 90m
+  before_script:
+    - source ~/.cargo/env 2>/dev/null || export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+    - ulimit -v 24000000 || true
+
+# One heavy job at a time on the shared machine (the agents and the benchmarks use it too).
+.heavy:
+  resource_group: fibber-heavy
+
+stage2:
+  extends: .heavy
+  stage: test
+  timeout: 60m
+  script:
+    - fibc=$(scripts/fetch-seed.sh "$CI_PROJECT_DIR/.seed")
+    - export FIBC=$fibc
+    - GATE_FRESH=1 GATE_OUT="$CI_PROJECT_DIR/.gate" scripts/gate.sh --full -j 6
+  artifacts:
+    when: on_failure
+    expire_in: 3 days
+    paths: [.gate/*.log]
+
+lairf:
+  extends: .heavy
+  stage: test
+  timeout: 60m
+  needs: []
+  script:
+    - fibc=$(scripts/fetch-seed.sh "$CI_PROJECT_DIR/.seed")
+    - cargo build -p lair --bin lair
+    - FIBC=$fibc LAIR="$CARGO_TARGET_DIR/debug/lair" LEVELS="0 2" scripts/ci-lairf.sh "$CI_PROJECT_DIR/.lairf"
+
+rust-seed:
+  extends: .heavy
+  stage: test
+  timeout: 90m
+  needs: []
+  rules:
+    - changes: [crates/**/*, Cargo.toml, Cargo.lock, scripts/ci-seed-overlay.sh, .gitlab-ci.yml]
+  script:
+    - scripts/ci-seed-overlay.sh
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets --all-features -- -D warnings
+    - cargo test -p fibref -p fibgen -p lir
+    - cargo test -p lair
+    - cargo run -p fibref -- cases cases/ownership
+    - cargo run -p fibref -- cases cases/modules
+
+# A v* tag builds the release tarball (package.sh: static LLVM, no liblair, x86-64-v2) and publishes it to this project's releases.
+release:
+  extends: .heavy
+  stage: release
+  timeout: 90m
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+  script:
+    - fibc=$(scripts/fetch-seed.sh "$CI_PROJECT_DIR/.seed")
+    - test "v$(cat VERSION)" = "$CI_COMMIT_TAG" || { echo "tag $CI_COMMIT_TAG is not v$(cat VERSION)" >&2; exit 1; }
+    - FIBC=$fibc scripts/package.sh dist
+    - mkdir unpacked && tar -xzf dist/fibc-*-linux-x86_64.tar.gz -C unpacked
+    - echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > hello.fib
+    - env -i unpacked/fibc-*/bin/fibc run hello.fib
+    - pkg="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/fibc/${CI_COMMIT_TAG#v}"
+    - for f in dist/fibc-*-linux-x86_64.tar.gz dist/SHA256SUMS; do curl -fsS --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" "$pkg/$(basename "$f")"; done
+    - |
+      curl -fsS --header "JOB-TOKEN: $CI_JOB_TOKEN" --header "Content-Type: application/json" \
+        --data "{\"name\":\"$CI_COMMIT_TAG\",\"tag_name\":\"$CI_COMMIT_TAG\",\"description\":\"Built by scripts/package.sh on the local runner.\",\"assets\":{\"links\":[{\"name\":\"$(basename dist/fibc-*-linux-x86_64.tar.gz)\",\"url\":\"$pkg/$(basename dist/fibc-*-linux-x86_64.tar.gz)\",\"link_type\":\"package\"},{\"name\":\"SHA256SUMS\",\"url\":\"$pkg/SHA256SUMS\",\"link_type\":\"other\"}]}}" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+  artifacts:
+    expire_in: 30 days
+    paths: [dist/*.tar.gz, dist/SHA256SUMS]
+
+# The shootout table: run by hand on a quiet machine (the timings serialise on /tmp/fibsuite.lock).
+shootout:
+  extends: .heavy
+  stage: test
+  when: manual
+  allow_failure: true
+  timeout: 3h
+  script:
+    - fibc=$(scripts/fetch-seed.sh "$CI_PROJECT_DIR/.seed")
+    - FIBC=$fibc scripts/shootout/run.sh --size small,full --out shootout.tsv
+  artifacts:
+    expire_in: 30 days
+    paths: [shootout.tsv]

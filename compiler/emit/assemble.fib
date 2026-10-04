@@ -5,7 +5,7 @@
 ;; A stub reached makes `emit-body` and `emit-closure` return an error whose message starts with `todo: ` (pending, never a pass):
 ;; `emit-all` passes it on, and emit.compile makes it the `pending` of the `Module`.
 (ns emit.assemble
-  (:use types.ty own.program emit.value emit.mono emit.objects emit.statics emit.program emit.inits emit.rt emit.lower.mod))
+  (:use types.ty own.program emit.value emit.mono emit.objects emit.statics emit.program emit.inits emit.rt emit.lower.mod emit.defs.data))
 
 ;; The text of a module before its `main`, in the pieces `assemble-parts` puts together, in this order (`fibc emit-dump --sections`):
 ;; the runtime, the `extern` declarations, the object structs and the type table, the static data, the keyword helpers, the values
@@ -42,6 +42,18 @@
       ;; §3.19, L15: the slot globals of the `def`s made at run time come with the values of the constant `def`s.
       (let ((slots (inits-slot-text p)))
         (Parts (runtime-text) externs types statics keywords (str-join [slots defs]) @(. p quote-text) @(. p funcs))))))
+
+;; The pieces of `module-parts`' text, in the order of `parts-text`: each is the text of whole lIR items that is the same every time the module
+;; is assembled again (a function, a static string, the text of one object's structs), so that the hand-over to the JIT (emit.defs.astmod) parses
+;; each once. `(str-join (module-pieces p d))` is `(assemble-parts p @(. d text))`, which the verifying mode checks.
+(defun module-pieces (p: Program d: Defs) -> (Vec str)
+  (let ((keywords (program-render-keyword-helpers p))
+        (externs @(. p externs))
+        (types (objects-render-pieces (. p objects))))
+    (let ((statics (statics-render-pieces (. p statics))))
+      (let ((slots (inits-slot-text p)))
+        (into (into (into (into (into (into [(runtime-text)] externs) types) statics) [keywords slots]) @(. d pieces))
+              (into [@(. p quote-text)] @(. p funcs)))))))
 
 ;; Rust: compile.rs:285 assemble_parts
 (defun assemble-parts (p: Program defs: str) -> str

@@ -1,0 +1,275 @@
+;; fib.regex.prog: a syntax tree compiled to a program for the matchers (stdlib §4.9).
+;; An instruction is `op x y` in three parallel arrays:
+;;   0 SET x     consume one character that is in set x (an index into the set table)
+;;   1 SPLIT x y try x first, then y (the order is the priority: greedy puts the loop first)
+;;   2 JMP x     continue at x
+;;   3 SAVE x    record the position in slot x (group g has slots 2g and 2g+1; slots 0 and 1 are the whole match)
+;;   4 ASSERT x  a zero-width test of kind x (fib.regex.ast)
+;;   5 MATCH
+;;   6 LOOPCHK x y  at the end of an iteration of a loop whose body can match the empty string: if the
+;;               position is past the one saved in slot x at the start of the iteration, go on, else go to y
+;;               (Java's rule: an iteration that matches nothing is accepted and ends the loop)
+;; A counted repetition is compiled as copies of its body, so the program is as long as the pattern
+;; says. The reverse program (`rev`) reads the pattern backwards and keeps no SAVE: it finds where a
+;; match that ends at a given position starts (the lazy DFA of fib.regex.dfa).
+;; The characters are partitioned into classes, the intervals between the boundaries of every set of
+;; the program, so that the matchers work on small integers: `cls-of` maps a scalar to its class,
+;; `member?` asks whether a set holds a class.
+(ns fib.regex.prog (:use fib.core fib.seq fib.coll fib.regex.charset fib.regex.ast))
+
+(def op-set: i64 0)
+(def op-split: i64 1)
+(def op-jmp: i64 2)
+(def op-save: i64 3)
+(def op-assert: i64 4)
+(def op-match: i64 5)
+(def op-loopchk: i64 6)
+
+(def max-prog: i64 60000)
+
+(defstruct Prog
+  (ops: (Array i64) xs: (Array i64) ys: (Array i64) n: i64
+   ncls: i64 bnd: (Array i64) asc: (Array i64) mem: (Array i8)
+   groups: i64 asserts: bool too-big: bool nslots: i64))
+
+(defstruct Bld (ops: (Cell (Vec i64)) xs: (Cell (Vec i64)) ys: (Cell (Vec i64))
+                sets: (Cell (Vec (Vec i64))) asserts: (Cell bool) rev: bool slot: (Cell i64)))
+
+(defun pc-of (b: Bld) -> i64 (count @(. b ops)))
+
+(defun emit (b: Bld op: i64 x: i64 y: i64) -> i64
+  (let [pc (pc-of b)]
+    (do (set! (. b ops) (conj @(. b ops) op))
+        (set! (. b xs) (conj @(. b xs) x))
+        (set! (. b ys) (conj @(. b ys) y))
+        pc)))
+
+(defun patch (b: Bld pc: i64 x: i64 y: i64) -> unit
+  (do (set! (. b xs) (assoc @(. b xs) pc x))
+      (set! (. b ys) (assoc @(. b ys) pc y))))
+
+(defun patch-split (b: Bld sp: i64 greedy: bool end: i64) -> unit
+  (if greedy (patch b sp (+ sp 1) end) (patch b sp end (+ sp 1))))
+
+(defun add-set (b: Bld cs: (Vec i64)) -> i64
+  (let [k (count @(. b sets))]
+    (do (set! (. b sets) (conj @(. b sets) cs)) k)))
+
+(defun comp (b: Bld n: Node) -> unit
+  (if (> (pc-of b) max-prog)
+      ()
+      (match n
+        ((NEmpty) ())
+        ((NSet cs) (do (emit b op-set (add-set b cs) 0) ()))
+        ((NCat items) (comp-cat b items 0))
+        ((NAlt items) (comp-alt b items 0))
+        ((NRep body mn mx g) (comp-rep b body mn mx g))
+        ((NGroup idx body) (comp-group b idx body))
+        ((NAssert k) (do (set! (. b asserts) true) (emit b op-assert k 0) ())))))
+
+(defun comp-cat (b: Bld items: (Vec Node) i: i64) -> unit
+  (let [n (count items)]
+    (if (< i n)
+        (do (comp b (nth items (if (. b rev) (- (- n 1) i) i)))
+            (comp-cat b items (+ i 1)))
+        ())))
+
+;; a1 | a2 | .. : SPLIT to this arm or the rest, the arm, JMP to the end
+(defun comp-alt (b: Bld items: (Vec Node) i: i64) -> unit
+  (if (= i (- (count items) 1))
+      (comp b (nth items i))
+      (let [sp (emit b op-split 0 0)]
+        (do (patch b sp (+ sp 1) 0)
+            (comp b (nth items i))
+            (let [j (emit b op-jmp 0 0)]
+              (do (patch b sp (+ sp 1) (pc-of b))
+                  (comp-alt b items (+ i 1))
+                  (patch b j (pc-of b) 0)))))))
+
+(defun comp-group (b: Bld idx: i64 body: Node) -> unit
+  (if (. b rev)
+      (comp b body)
+      (do (emit b op-save (* 2 idx) 0)
+          (comp b body)
+          (emit b op-save (+ (* 2 idx) 1) 0)
+          ())))
+
+(defun comp-copies (b: Bld body: Node k: i64) -> unit
+  (if (> k 0) (do (comp b body) (comp-copies b body (- k 1))) ()))
+
+;; k nested optional copies: SPLIT, body, SPLIT, body ..; every SPLIT leaves to the same end
+(defun comp-opts (b: Bld body: Node k: i64 greedy: bool) -> unit
+  (if (= k 0)
+      ()
+      (let [sp (emit b op-split 0 0)]
+        (do (comp b body)
+            (comp-opts b body (- k 1) greedy)
+            (patch-split b sp greedy (pc-of b))))))
+
+(defun nullable? (n: Node) -> bool
+  (match n
+    ((NEmpty) true)
+    ((NSet _) false)
+    ((NCat items) (reduce (fn (a: bool x: Node) (and a (nullable? x))) true items))
+    ((NAlt items) (reduce (fn (a: bool x: Node) (or a (nullable? x))) false items))
+    ((NRep body mn _ _) (or (= mn 0) (nullable? body)))
+    ((NGroup _ body) (nullable? body))
+    ((NAssert _) true)))
+
+(defun take-slot (b: Bld) -> i64
+  (let [k @(. b slot)] (do (set! (. b slot) (+ k 1)) k)))
+
+;; A repetition whose body can match nothing is compiled as Java matches it: every iteration saves its start
+;; and ends in a check that leaves the whole repetition when the iteration matched nothing (the iteration
+;; is accepted, and no other follows). The matcher needs the positions, so the DFA is not used (`asserts`).
+;; chks and splits collect the LOOPCHKs and the SPLITs that leave the repetition: they go to its end.
+(defun comp-guarded (b: Bld body: Node) -> i64
+  (let [slot (take-slot b)]
+    (do (emit b op-save slot 0)
+        (comp b body)
+        (emit b op-loopchk slot 0))))
+
+(defun ncopies (b: Bld body: Node k: i64 chks: (Cell (Vec i64))) -> unit
+  (if (> k 0)
+      (do (set! chks (conj @chks (comp-guarded b body))) (ncopies b body (- k 1) chks))
+      ()))
+
+(defun nopts (b: Bld body: Node k: i64 chks: (Cell (Vec i64)) splits: (Cell (Vec i64))) -> unit
+  (if (> k 0)
+      (let [sp (emit b op-split 0 0)]
+        (do (set! splits (conj @splits sp))
+            (set! chks (conj @chks (comp-guarded b body)))
+            (nopts b body (- k 1) chks splits)))
+      ()))
+
+(defun nstar (b: Bld body: Node chks: (Cell (Vec i64)) splits: (Cell (Vec i64))) -> unit
+  (let [sp (emit b op-split 0 0)]
+    (do (set! splits (conj @splits sp))
+        (set! chks (conj @chks (comp-guarded b body)))
+        (emit b op-jmp sp 0)
+        ())))
+
+(defun comp-nrep (b: Bld body: Node mn: i64 mx: i64 greedy: bool) -> unit
+  (let [chks (cell (vec-empty))
+        splits (cell (vec-empty))]
+    (do (set! (. b asserts) true)
+        (ncopies b body mn chks)
+        (if (= mx -1) (nstar b body chks splits) (nopts b body (- mx mn) chks splits))
+        (let [end (pc-of b)]
+          (do (reduce (fn (u: unit pc: i64) (patch b pc (array-get-vec @(. b xs) pc) end)) () @chks)
+              (reduce (fn (u: unit sp: i64) (patch-split b sp greedy end)) () @splits))))))
+
+(defun array-get-vec (v: (Vec i64) i: i64) -> i64 (nth v i))
+
+(defun comp-star (b: Bld body: Node mn: i64 greedy: bool) -> unit
+  (comp-star-plain b body mn greedy))
+
+(defun comp-star-plain (b: Bld body: Node mn: i64 greedy: bool) -> unit
+  (if (>= mn 1)
+      (do (comp-copies b body (- mn 1))
+          (let [top (pc-of b)]
+            (do (comp b body)
+                (let [sp (emit b op-split 0 0)]
+                  (if greedy (patch b sp top (+ sp 1)) (patch b sp (+ sp 1) top))))))
+      (let [sp (emit b op-split 0 0)]
+        (do (comp b body)
+            (emit b op-jmp sp 0)
+            (patch-split b sp greedy (pc-of b))))))
+
+(defun comp-rep (b: Bld body: Node mn: i64 mx: i64 greedy: bool) -> unit
+  (if (and (not (. b rev)) (nullable? body))
+      (comp-nrep b body mn mx greedy)
+      (comp-rep-plain b body mn mx greedy)))
+
+(defun comp-rep-plain (b: Bld body: Node mn: i64 mx: i64 greedy: bool) -> unit
+  (if (= mx -1)
+      (comp-star b body mn greedy)
+      (do (comp-copies b body mn) (comp-opts b body (- mx mn) greedy))))
+
+;; the number of characters every match has, or -1 when matches differ in length (then the start of a match found
+;; by its end is searched for backward by the reverse DFA; with a fixed length it is that many characters back)
+(defun fixed-len (n: Node) -> i64
+  (match n
+    ((NEmpty) 0)
+    ((NSet _) 1)
+    ((NCat items) (reduce (fn (a: i64 x: Node) (let [l (fixed-len x)] (if (or (< a 0) (< l 0)) -1 (+ a l)))) 0 items))
+    ((NAlt items) (let [l0 (fixed-len (nth items 0))]
+                    (reduce (fn (a: i64 x: Node) (if (= a (fixed-len x)) a -1)) l0 items)))
+    ((NRep body mn mx _) (let [l (fixed-len body)] (if (and (>= l 0) (= mn mx)) (* mn l) -1)))
+    ((NGroup _ body) (fixed-len body))
+    ((NAssert _) -1)))
+
+;; ---- classes ----
+
+(defun vec->array (v: (Vec i64)) -> (Array i64)
+  (let [n (count v)
+        c (cell (array (max n 1) 0))]
+    (do (dotimes (i n) (array-set! &c i (nth v i))) @c)))
+
+;; the boundaries of the character classes: sorted, distinct, from 0 to 0x110000
+(defun boundaries (sets: (Vec (Vec i64))) -> (Vec i64)
+  (let [pts (reduce (fn (acc: (Vec i64) cs: (Vec i64))
+                      (reduce (fn (a: (Vec i64) r: i64) (conj (conj a (range-lo r)) (+ (range-hi r) 1))) acc cs))
+                    [0 128 1114112] sets)
+        sorted (vec (sort pts))]
+    (loop [i 1 out [(nth sorted 0)]]
+      (if (< i (count sorted))
+          (recur (+ i 1) (if (= (nth sorted i) (nth sorted (- i 1))) out (conj out (nth sorted i))))
+          out))))
+
+;; the largest k with bnd[k] <= cp
+(defun cls-of (p: Prog cp: i64) -> i64
+  (let [bnd (. p bnd)]
+    (loop [lo 0 hi (- (array-len bnd) 2)]
+      (if (>= lo hi)
+          lo
+          (let [mid (shr (+ lo hi 1) 1)]
+            (if (<= (array-get bnd mid) cp) (recur mid hi) (recur lo (- mid 1))))))))
+
+(defun member? (p: Prog set: i64 cls: i64) -> bool
+  (= (array-get (. p mem) (+ (* set (. p ncls)) cls)) 1i8))
+
+(defun make-asc (bnd: (Vec i64)) -> (Array i64)
+  (let [c (cell (array 256 -1))
+        n (count bnd)]
+    (do (loop [b 0 k 0]
+          (if (< b 128)
+              (let [k2 (if (and (< (+ k 1) (- n 1)) (>= b (nth bnd (+ k 1)))) (+ k 1) k)]
+                (do (array-set! &c b k2) (recur (+ b 1) k2)))
+              ()))
+        @c)))
+
+(defun make-mem (sets: (Vec (Vec i64)) bnd: (Vec i64)) -> (Array i8)
+  (let [ncls (- (count bnd) 1)
+        c (cell (array (max 1 (* (count sets) ncls)) 0i8))]
+    (do (dotimes (s (count sets))
+          (dotimes (k ncls)
+            (if (cs-has? (nth sets s) (nth bnd k)) (array-set! &c (+ (* s ncls) k) 1i8) ())))
+        @c)))
+
+(defun finish (b: Bld groups: i64) -> Prog
+  (let [sets @(. b sets)
+        bnd (boundaries sets)
+        n (pc-of b)]
+    (Prog (vec->array @(. b ops)) (vec->array @(. b xs)) (vec->array @(. b ys)) n
+          (- (count bnd) 1) (vec->array bnd) (make-asc bnd) (make-mem sets bnd)
+          groups @(. b asserts) (> n max-prog) @(. b slot))))
+
+(defun new-bld (rev: bool groups: i64) -> Bld
+  (Bld (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell (vec-empty)) (cell false) rev (cell (* 2 (+ groups 1)))))
+
+;; the forward program: SAVE 0, the pattern, SAVE 1, MATCH
+(defun compile-forward (a: Ast) -> Prog
+  (let [b (new-bld false (. a groups))]
+    (do (emit b op-save 0 0)
+        (comp b (. a node))
+        (emit b op-save 1 0)
+        (emit b op-match 0 0)
+        (finish b (. a groups)))))
+
+;; the reverse program: the pattern read backwards, MATCH
+(defun compile-reverse (a: Ast) -> Prog
+  (let [b (new-bld true 0)]
+    (do (comp b (. a node))
+        (emit b op-match 0 0)
+        (finish b 0))))

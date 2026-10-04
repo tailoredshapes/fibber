@@ -1,0 +1,107 @@
+;; spec:   stdlib §4.9 (rows re-pattern re-find re-matches re-seq re-groups)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: re-pattern re-find re-matches re-seq re-groups
+;; fib.regex: hand-picked pairs with Java's answers, then the API one function at a time.
+;; (1) 44 (pattern, text) pairs whose records java.util.regex made (`java RegexDiff.java rec PATTERN TEXT`, JDK 27): leftmost
+;; versus longest alternatives, greedy and lazy, empty matches, the anchors with and without a final LF, `\b`, multibyte
+;; offsets (bytes), a supplementary character, empty iterations of a loop, groups that did not take part, `split`
+;; and `replaceAll`; every field of every record must be the library's (tl.rxdiff).
+;; (2) the API: `try-re-pattern` refuses what the header of fib.regex.parse lists, `re-groups`, `re-group`, spans,
+;; `re-count`, the replacement templates (`$n`, `\$`, `re-quote-replacement`), `str/split` by a Regex, and a search that
+;; fills the cache of the DFA (more than `dfa-cache-cap` states, so the Pike VM takes over) and still finds the one match.
+;; (3) the planted fault: a record whose F field is wrong must be reported.
+(ns main (:use fib.core fib.seq fib.coll fib.regex tl.check tl.rng tl.rxdiff) (:require [fib.string :as str]))
+
+(def recs: str "(\\d+)-(\\d+)¦ab 12-345 x¦G¦F3-9,3-5,6-9;¦Mn¦Rab <12:12-345> x¦Sab / x\n(a)|(b)¦b¦G¦F0-1,n,0-1;¦M0-1,n,0-1¦R<:b>¦S\né+¦aééb¦G¦F1-5;¦Mn¦Ra<éé>b¦Sa/b\n.¦a😀b¦G¦F0-1;1-5;5-6;¦Mn¦R<a><😀><b>¦S\na|ab¦ab¦G¦F0-1;¦M0-2¦R<a>b¦S/b\na+¦aab¦G¦F0-2;¦Mn¦R<aa>b¦S/b\n<.+>¦<a><b>¦G¦F0-6;¦M0-6¦R<<a><b>>¦S\n<.+?>¦<a><b>¦G¦F0-3;3-6;¦M0-6¦R<<a>><<b>>¦S\na*¦baaac¦G¦F0-0;1-4;4-4;5-5;¦Mn¦R<>b<aaa><>c<>¦Sb//c\n(\\w+)@(\\w+)¦x@y z@w¦G¦F0-3,0-1,2-3;4-7,4-5,6-7;¦Mn¦R<x:x@y> <z:z@w>¦S/ \n\\d+¦a1b22c¦G¦F1-2;3-5;¦Mn¦Ra<1>b<22>c¦Sa/b/c\n¦abc¦G¦F0-0;1-1;2-2;3-3;¦Mn¦R<>a<>b<>c<>¦Sa/b/c\n,¦,a,¦G¦F0-1;2-3;¦Mn¦R<,>a<,>¦S/a\n^a¦a~a¦G¦F0-1;¦Mn¦R<a>~a¦S/~a\na$¦a~¦G¦F0-1;¦Mn¦R<a>~¦S/~\na$¦a~~¦G¦F¦Mn¦Ra~~¦Sa~~\n\\bfoo\\b¦a foo b foo_ foo¦G¦F2-5;13-16;¦Mn¦Ra <foo> b foo_ <foo>¦Sa / b foo_ \nx*¦é¦G¦F0-0;2-2;¦Mn¦R<>é<>¦Sé\n(?:ab)+?¦ababab¦G¦F0-2;2-4;4-6;¦M0-6¦R<ab><ab><ab>¦S\na{2,3}¦aaaaaaa¦G¦F0-3;3-6;¦Mn¦R<aaa><aaa>a¦S//a\n[^a-c]+¦abxyzcdea¦G¦F2-5;6-8;¦Mn¦Rab<xyz>c<de>a¦Sab/c/a\n\\s+¦ a \\t b~¦G¦F0-1;2-3;5-6;7-8;¦Mn¦R< >a< >\\t< >b<~>¦S/a/\\t/b\n\\W¦a-b_c¦G¦F1-2;¦Mn¦Ra<->b_c¦Sa/b_c\n(a*)*¦b¦G¦F0-0,0-0;1-1,1-1;¦Mn¦R<:>b<:>¦Sb\n(a*)+¦aab¦G¦F0-2,2-2;2-2,2-2;3-3,3-3;¦Mn¦R<:aa><:>b<:>¦S//b\n(a|b?)+¦ab¦G¦F0-2,2-2;2-2,2-2;¦M0-2,2-2¦R<:ab><:>¦S\n\\Aa¦aa¦G¦F0-1;¦Mn¦R<a>a¦S/a\na\\z¦aa¦G¦F1-2;¦Mn¦Ra<a>¦Sa\na\\Z¦a~¦G¦F0-1;¦Mn¦R<a>~¦S/~\n(?:)¦ab¦G¦F0-0;1-1;2-2;¦Mn¦R<>a<>b<>¦Sa/b\na|¦ba¦G¦F0-0;1-2;2-2;¦Mn¦R<>b<a><>¦Sb\n[é-ü]+¦aéüz¦G¦F1-5;¦Mn¦Ra<éü>z¦Sa/z\n(a|ab)(c|bcd)(d*)¦abcd¦G¦F0-4,0-1,1-4,4-4;¦M0-4,0-1,1-4,4-4¦R<a:abcd>¦S\n(a+)(b+)?¦aab a¦G¦F0-3,0-2,2-3;4-5,4-5,n;¦Mn¦R<aa:aab> <a:a>¦S/ \n\\d{2,}?¦12345¦G¦F0-2;2-4;¦M0-5¦R<12><34>5¦S//5\n(?:a|b)*?c¦abcabc¦G¦F0-3;3-6;¦Mn¦R<abc><abc>¦S\n[a-c]+?$¦xabc¦G¦F1-4;¦Mn¦Rx<abc>¦Sx\n\\B.\\B¦abcd¦G¦F1-2;2-3;¦Mn¦Ra<b><c>d¦Sa//d\n(?:x|y)?z¦xz yz z¦G¦F0-2;3-5;6-7;¦Mn¦R<xz> <yz> <z>¦S/ / \na.c¦a~c abc¦G¦F4-7;¦Mn¦Ra~c <abc>¦Sa~c \n\\D\\d¦a1b2c3¦G¦F0-2;2-4;4-6;¦Mn¦R<a1><b2><c3>¦S\n[\\d\\s]+¦a1 2b¦G¦F1-4;¦Mn¦Ra<1 2>b¦Sa/b\né\\b¦é é1¦G¦F3-5;¦Mn¦Ré <é>1¦Sé /1\n€|あ¦a€bあc¦G¦F1-4;5-8;¦Mn¦Ra<€>b<あ>c¦Sa/b/c\n")
+
+(defun err? (p: str) -> bool
+  (match (try-re-pattern p) ((Err _) true) ((Ok _) false)))
+
+(defun group-text (m: Match g: i64) -> str
+  (match (re-group m g) (nil "-") ((some t) t)))
+
+(defun find-text (p: str s: str) -> str
+  (match (re-find (re-pattern p) s) (nil "none") ((some m) (str (. m start) ":" (. m end) ":" (. m whole)))))
+
+;; text of random a and b of the given length, then `a` and fourteen letters and `c`: the only `c`, so one match
+(defun random-ab (r: Rng n: i64) -> str
+  (loop [i 0 acc (vec-empty)]
+    (if (< i n) (recur (+ i 1) (conj acc (if (= (rng-below r 2) 0) "a" "b"))) (str/join "" acc))))
+
+(defun main () -> i64
+  (let [c (checks)
+        lines (vec (filter (fn (l: str) (> (str-len l) 0)) (str/split recs "\n")))
+        ng (re-pattern "(a)|(b)")
+        m1 (re-find (re-pattern "(\\d+)-(\\d+)") "ab 12-345 x")
+        r (rng 99)
+        body (random-ab r 100000)
+        text (str body "a" "ababababababab" "c")
+        big (re-pattern "a[ab]{14}c")
+        bigm (re-find big text)
+        full (dfa-cache-states big)]
+    (do (check c (= (count lines) 44))
+        (check c (= (first-diff lines) ""))
+        ;; the planted fault: an expected answer with a match that is not there
+        (let [p (checks)]
+          (do (check p (= (check-record "a+¦xaay¦G¦F1-3;5-6;¦Mn¦Rx<aa>y¦Sx/y") ""))
+              (check-detects c p)))
+        (check c (= (check-record "a+¦xaay¦G¦F1-3;¦Mn¦Rx<aa>y¦Sx/y") ""))
+        ;; errors
+        (check c (err? "("))
+        (check c (err? "a**"))
+        (check c (err? "[a"))
+        (check c (err? "\\1"))
+        (check c (err? "a{2,1}"))
+        (check c (err? "(?=a)"))
+        (check c (err? "+"))
+        (check c (err? "a{"))
+        (check c (err? "(?i)a"))
+        (check c (err? "a++"))
+        (check c (err? "[b-a]"))
+        (check c (err? "x{1001}"))
+        (check c (not (err? "x{1000}")))
+        ;; groups and spans
+        (check c (= (group-text (some-match m1) 0) "12-345"))
+        (check c (= (group-text (some-match m1) 1) "12"))
+        (check c (= (group-text (some-match m1) 2) "345"))
+        (check c (= (match-start (some-match m1) 2) 6))
+        (check c (= (match-end (some-match m1) 2) 9))
+        (check c (= (group-count ng) 2))
+        (check c (= (count (re-groups (some-match (re-find ng "b")))) 3))
+        (check c (= (group-text (some-match (re-find ng "b")) 1) "-"))
+        (check c (= (find-text "é+" "aééb") "1:5:éé"))
+        (check c (= (find-text "." "😀x") "0:4:😀"))
+        (check c (= (re-count (re-pattern ".") "a😀b") 3))
+        (check c (= (find-text "x" "abc") "none"))
+        (check c (= (count (re-seq (re-pattern "a*") "baaac")) 4))
+        ;; re-matches
+        (check c (= (match (re-matches (re-pattern "a|ab") "ab") (nil "no") ((some m) (. m whole))) "ab"))
+        (check c (= (match (re-matches (re-pattern "a+") "aab") (nil "no") ((some m) (. m whole))) "no"))
+        ;; replacing
+        (check c (= (replace-all (re-pattern "(\\w+)@(\\w+)") "x@y z@w" "$2 at $1") "y at x w at z"))
+        (check c (= (replace-all (re-pattern "a") "banana" "\\$") "b$n$n$"))
+        (check c (= (replace-all (re-pattern "a") "banana" (re-quote-replacement "$1\\")) "b$1\\n$1\\n$1\\"))
+        (check c (= (replace-first (re-pattern "a") "banana" "A") "bAnana"))
+        (check c (= (replace-all (re-pattern "é") "aéb" "e") "aeb"))
+        (check c (= (replace-all (re-pattern "x*") "abc" "-") "-a-b-c-"))
+        ;; str/split by a Regex goes through the Pattern instance
+        (check c (= (str/join "|" (str/split "a1b22c" (re-pattern "\\d+"))) "a|b|c"))
+        (check c (= (str/join "|" (str/split "abc" (re-pattern ""))) "a|b|c"))
+        ;; a search that overflows the DFA cache
+        (check c (= (match bigm (nil -1) ((some m) (. m start))) 100000))
+        (check c (= (re-count big text) 1))
+        (check c (= full (dfa-cache-cap big)))
+        (checks-result c))))
+
+(defun some-match (o: (Option Match)) -> Match
+  (match o ((some m) m) (nil (trap "no match"))))
+
+(defun first-diff (lines: (Vec str)) -> str
+  (loop [i 0]
+    (if (< i (count lines))
+        (let [r (check-record (nth lines i))]
+          (if (= (str-len r) 0) (recur (+ i 1)) r))
+        "")))

@@ -179,3 +179,223 @@ returns the pages to the kernel (`M_TRIM_THRESHOLD`), which `malloc` then faults
 Recommendation: runtime change (`fib.rt`, `rt/*.lir`): call `mallopt(M_TRIM_THRESHOLD, ...)` and `mallopt(M_MMAP_THRESHOLD, ...)` at start
 (Java's and GMP's allocators do not hand pages back on each free), or a size-class free list for arrays. Every benchmark that
 allocates and frees mid-size arrays in a loop pays this.
+
+One section per gap found while writing the shootout programs: what is missing, the smallest reproduction, what the
+Java/C version uses, and a recommendation.
+
+## fannkuch-redux: no mutable array that a callee can write without a copy
+
+**Missing.** `(MArray t)`, `long-array`, `aget`, `aset` (spec/stdlib.md §2.11, rows `aget aset alength long-array`) are specified
+but not in the library or the v0.1.4 seed:
+
+```
+$ fibc build t.fib -I lib      ; (defun f (p: (MArray i64)) -> i64 (aget p 0))  (defun main () -> i64 (f (long-array 4)))
+rejected:
+t.fib:1:15: unknown type MArray
+t.fib:2:38: unbound name long-array
+```
+
+The program therefore uses the builtin value form: `(cell (array n 0))`, `@c`, `(array-get @c i)`, `(array-set! &c i x)`, and
+passes the arrays to helpers as `&p: (Array i64)` in/out parameters. That is legal safe fibber, but see the next gap.
+
+**Java/C use** `int[]` / `int a[32]`, written in place from any callee.
+
+**Recommendation.** Library: land `MArray` with `long-array aget aset alength` as specified (the benchmark would then read like
+the Clojure twin).
+
+## fannkuch-redux: forwarding an `&` parameter to a callee copies the array on every call
+
+**Reproduction.** `(defun rev (&p: (Array i64) k: i64) -> unit ...(array-set! &p ...))` called from
+`(defun flips (&p: (Array i64)) ...  (rev &p k) ...)`. `fibc explain` says `@20:17 (reverse-prefix ..) call &p: acquire`
+(whereas a call from a function that owns the cell says `&p: move in`, cases/ownership/261). `acquire` retains the array for
+the callee's private cell, so the callee's first `array-set!` finds it shared and copies it (`fib.array-slice`, `fib.array-alloc`
+in the profile: 30% of the run at N=10, 0.55 s against 0.39 s after inlining the callee by hand).
+
+**Java/C use** a plain array reference; no copy.
+
+**Recommendation.** Language/compiler change: treat `&p` of an `&` parameter like `&c` of a cell (move the content in, store the
+result back) when nothing else can read `p` during the call. Until then the benchmark inlines the loop (a local rewrite).
+
+What the shootout programs needed and the language or library did not have. One section per gap, appended by
+each benchmark's agent. (Each benchmark worktree started this file on its own: merge the sections.)
+
+## spectral-norm: `MArray` (`double-array`, `aget`, `aset`) is not in the library
+
+**Missing.** `unknown type MArray` (stdlib §2.11, tranche 3, specified, not landed).
+
+**What Java and C use.** `double[]`.
+
+**What was done.** Two versions. `spectral-norm.fib` keeps its vectors as `(Array f64)` (read with `array-get`) and
+builds each product in a `(Cell (Array f64))` written in place by `array-set!` through `&`: safe, no `unsafe`.
+`spectral-norm-vec.fib` is the same with `(Vec f64)`, `nth` and `assoc`, the Clojure-shaped way. The Vec version is
+about 5 times slower (the profile is in README.md): `nth` on a `Vec` is a call that walks the trie.
+
+**Recommendation.** Land `MArray`; then `aget` on it should compile to the same load as `array-get`. Independently,
+`nth` on a `(Vec a)` with a known-small count (the tail only, count <= 32) or a hoisted loop-invariant `v` would
+close the gap for programs that use persistent vectors for numerics.
+
+## spectral-norm: `sqrt` is not a builtin
+
+**Missing.** `(math/sqrt x)`: `unbound name math/sqrt` (stdlib §4.16 says builtin; not landed).
+
+**What Java and C use.** `Math.sqrt` / libm `sqrt`.
+
+**What was done.** `sqrt-newton` in the program: 60 Newton steps from 1.0 on the final ratio, one call, so the time
+is not distorted. It converges to within an ulp, far inside the 9 printed decimals; the three-way md5 agreement
+at both sizes is the check.
+
+**Recommendation.** The builtin (`llvm.sqrt.f64`), as the n-body section of this file (when merged) says.
+
+## spectral-norm: `format` / `printf` with `%.9f` is not landed
+
+**Missing.** `unbound name printf`; `str` of an `f64` is the shortest round-trip text.
+
+**Reproduction.** `(ns main) (defun main () -> i64 (do (printf "%.9f\n" 0.5) 0))`: `unbound name printf`.
+
+**What Java and C use.** `String.format("%.9f", x)` / `printf("%.9f\n", x)`.
+
+**What was done.** `fmt9` in the program: rounds the shortest-repr text of a value in [1, 10) to 9 decimals, half
+up, as Java does; it runs once. It is a local string function, not a library one: a general `format-f64` belongs in
+the library (see n-body's section when merged, `fib.fmt/format-f64`).
+
+**Recommendation.** The `%f` directive of the `format` macro with precision, written in fibber.
+
+## spectral-norm: integer `/` yields a Ratio, so `(i+j)(i+j+1)/2` needs `quot`
+
+Not a gap, a note for ports: `(/ a b)` on `i64` is a `(Ratio i64)`; `quot` (or `shr` for a power of two) is the
+integer division Java's `/` is.
+
+## k-nucleotide and reverse-complement (IO part)
+
+Seed compiler v0.1.4 (`scripts/fetch-seed.sh`), library of this tree. Times are one run on a shared machine unless stated.
+
+### IO-1. No growable byte buffer, no array concatenation, no block copy
+
+What is missing: a way to build one `(Array i8)` from the 64 KB blocks that `fd-read` returns, or to grow an array
+geometrically. `array-push!` is the only growth primitive and, from 32 elements on, it allocates `len + 1` elements and copies
+(spec/types.md §2.13.1, `fib.array-room`), so a byte-at-a-time append is quadratic. `array-copy` is a slice, not a blit; there
+is no `array-concat`, no `array-copy-into`, and `fd-read` itself copies each block once more (`array-copy a 8 len` in lib/fib/unix.fib).
+
+Smallest reproduction (growing an array by pushes; 2x the pushes costs 4x):
+
+```clojure
+(defun grow (n: i64) -> i64
+  (let [c (cell (array 0 (trunc i8 0)))]
+    (do (dotimes (i n) (array-push! &c (trunc i8 i))) (array-len @c))))
+```
+`(grow 20000)` takes 4 ms, `(grow 40000)` 15 ms; 125 million pushes (the THREE sequence of the full k-nucleotide input) would
+take hours.
+
+What Java/C use: `ByteArrayOutputStream` / `readAllBytes` / `System.arraycopy`; `realloc`.
+
+Workaround in the programs (not a distortion: it is cheap, and both measure the same work): reverse-complement keeps the
+complemented residues of a sequence as a list of 64 KB arrays and walks the list backwards, so it never joins them;
+k-nucleotide sums the lengths of the blocks, allocates the result with `(array total 0)` and copies element by element.
+
+Recommendation: library, in `fib.unix` or a new `fib.bytes`: `(array-copy-into! &dst dst-off src src-off n)` (a block copy that
+is one `memcpy` in the runtime), and a `ByteBuf` (`bytes-push`, `bytes-append` with doubling capacity) or `array-push!` with
+geometric growth for every length, not only below 32; plus `(fd-read-all fd)`.
+
+### IO-2. `format` / `printf` are not implemented; and `%.3f` is not one rule
+
+`(format "%s %.3f" "A" 30.295)` is `unbound name format` (stdlib.md row `format`, tranche 4). k-nucleotide prints percentages
+with three decimals. Worse for a three-way comparison: Java's `%.3f` rounds the *shortest decimal representation* of the double
+half up, C's `printf` rounds the exact binary value, so they disagree on exact ties. On the 200000-residue input that
+`scripts/shootout/k-nucleotide` was tested with (the 1-mer count 49885 of 200000, 24.9425 %), Java and a half-up
+`floor(x*1000+0.5)` print `24.943` and C prints `24.942`. All four programs therefore compute the percentage in exact integer
+arithmetic, `v = (count*200000 + total) / (2*total)`, printed as `v/1000 "." v%1000` (three digits): rounded half up on the exact
+rational, identical in every language and equal to the published outputs wherever there is no exact tie.
+Recommendation: library function `(format-f64 x digits)` with one stated rule (exact binary value, round half to even as C
+and Rust do, or Java's); the `format` macro after it.
+
+### IO-3. A helper that writes through an `&` array parameter copies the array on every call
+
+```clojure
+(defun put (&buf: (Array i8) &pos: i64 b: i64) -> unit
+  (do (array-set! &buf @pos (trunc i8 b)) (set! pos (+ @pos 1))))
+```
+called once per output byte from a loop that owns `buf` in a cell: `fibref explain`/profile say `fib.array-slice` is 99.8% of the
+run (the 64 KB buffer is copied per call): reverse-complement of a 2.5 MB input took 2.80 s, against 0.012 s once the write is
+inlined in the loop that owns the cell (spec/stdlib.md §5 "The cause": `&` copy-in acquires, so the first write of every `&` call
+copies). A programmer meets this at once with any buffered writer. Recommendation: language change (C2/C3/C4 of the stdlib
+spec, an `&x` that is the only mention shares without acquiring) or a library `ByteBuf` type whose methods are the in-place writes
+(see IO-1). The program inlines the loop.
+
+### IO-4. `(assoc m k (+ 1 (get m k 0)))` in one expression is 3.4 times slower than binding the count first
+
+Same loop, 1.25 million updates of pseudo-random keys in a `Map i64 i64`: 1480 ms for the nested form, 440 ms when
+`(let [c (get m k 0)] (assoc m k (+ c 1)))`. `m` is not unique while the `get` is evaluated inside the argument list, so
+the assoc copies the path. Clojure's own idiom `(update m k (fnil (fn (c) (+ c 1)) 0))` is as slow as the nested form (1512 ms in the same
+loop). The program uses the second form. Recommendation: compiler (evaluate the arguments of `assoc`
+that do not mention the result before taking the collection), and a library `(update m k f)` / `(inc-in m k)` whose in-place
+case is the one the program wants.
+
+### IO-5. Java class names
+
+A Java public class cannot be called `k-nucleotide`; the twins use non-public classes `k_nucleotide` and `reverse_complement`
+in files `k-nucleotide.java` / `reverse-complement.java` (`javac` accepts that; run with `java -cp DIR k_nucleotide`). The
+Clojure twins are scripts (`clojure.main k-nucleotide.clj`), since `-m` needs a namespace that maps to a file name with
+underscores.
+
+# Gaps found by the shootout programs
+
+One section per gap: what is missing, the smallest reproduction, what the Java/C version uses, and a recommendation.
+Sections are tagged with the package that found them.
+
+## RE-1. Reading an array out of a `Cell` retains and releases it at every use
+
+- **Missing.** A loop that reads `@c` (a `Cell` holding an `(Array t)`) and indexes it makes a `fib.retain` and a `fib.release` call
+  around each `array-get`, because the read of the cell gives the loop a counted reference. The calls are not inlined (the runtime is
+  separate), so a table lookup costs two calls and a count update.
+- **Reproduction.** `(defun f (c: (Cell (Array i64)) n: i64) -> i64 (loop [i 0 s 0] (if (< i n) (recur (+ i 1) (+ s (array-get @c i))) s)))`,
+  then `fibc emit` shows `(call @fib.retain t..)` and `(call @fib.release t..)` inside the loop (also visible in the lIR of
+  `f.fib.regex.dfa.dfa-forward` before the rewrite).
+- **Java/C.** A field read; no count.
+- **Evidence.** regex-redux, one counting pass over 50 MB: 160 ms with the table in a cell, 78 ms when the scan loop takes the table as a borrowed
+  parameter (`fast-forward` in `lib/fib/regex/dfa.fib`, which the library now uses: the program holds a snapshot of the table for the loop, and
+  writes new entries through the cell outside it). Writing a loop that way is a contortion a fibber programmer should not need.
+- **Recommendation (compiler).** A `@cell` read whose only use is an `array-get`/`array-len` in the same expression needs no retain: the cell keeps
+  the array alive. Failing that, an in-place borrow form for a cell's content.
+
+## RE-2. `str-byte-at` is a call into the runtime
+
+- **Missing.** A byte of a `str` costs a function call; `fib.str-byte-at` is 8.0% of the self time of regex-redux, in a loop that is otherwise
+  one load, one table lookup, one table lookup.
+- **Reproduction.** `fibc emit` of any loop over `(str-byte-at s i)`: `(call @fib.str-byte-at p1 t..)`.
+- **Java/C.** `charAt` is an intrinsic; C indexes.
+- **Recommendation (compiler).** An intrinsic: bounds check, load of the byte, as `array-get` has.
+
+## RE-3. No string builder
+
+- **Missing.** `StrBuf` (spec §9 Q26). `str-concat` in a loop is quadratic. `fib.regex` builds its results by hand: sums the piece lengths,
+  fills one `(Array i8)` and calls `str-from-bytes` (`join-pieces`, `replace-literal` in `lib/fib/regex/api.fib`), as `str/join` does.
+- **Java/C.** `StringBuilder`; `realloc`.
+- **Recommendation (library).** `StrBuf` in `fib.string` over a growable `(Array i8)`, as Q26 says; `replace-all` would use it.
+
+## RE-4. No way to read all of a file descriptor
+
+- **Missing.** `fib.unix` has `fd-read` (at most n bytes); a program that wants stdin as one `str` writes the loop and the copy itself
+  (`read-chunks`, `join-chunks` in `scripts/shootout/regex-redux/regex-redux.fib`: 115 ms of the 50 MB).
+- **Java/C.** `System.in.readAllBytes()`; a `read` loop.
+- **Recommendation (library).** `(unix/fd-read-all fd)` -> `(Result (Array i8) i64)` growing by doubling, and `str-from-bytes`.
+
+## RE-5. The reference interpreter cannot run this tree's library
+
+- **Missing.** `fibref` (the Rust interpreter) rejects the current prelude, so method rule 6 (interpreter and compiled agree) cannot be
+  checked for any case that uses the library; the cases of `6000` and `6001` were run compiled only (`fibc cases`, stage 2).
+- **Reproduction.** `fibref run scripts/bench/hello.fib` with `FIB_LIB=lib`: `lib/prelude.fib:214:33: unbound name array-pop!`
+  (also `array-take!`); with the embedded prelude: `lib/fib/core/cells.fib:23:4: unbound name fib.prelude/cell-update!`.
+- **Recommendation.** Bring the interpreter up to the prelude, or record that rule 6's interpreter half is retired since the flip.
+
+## RE-6. The `stdlib_table` test fails before any change
+
+- **Reproduction.** `cargo test -p fibref --test stdlib_table`: `spec/stdlib.md §4: line 1358: the tranche `L6` is no number`
+  (7 of 38 tests fail; unrelated to `fib.regex`, which only adds rows to §4.9 and cases `6000`, `6001`).
+- **Recommendation.** Fix the row, or the test's reading of it. So `covers:` of the new cases is checked by hand against §4.9.
+
+## RE-7. No regex literal and no `str/replace`
+
+- **Missing.** `#"re"` (E14, a reader rule) and `str/replace`/`re-quote-replacement` in `fib.string` (tranche 3, 4). The programs call
+  `re-pattern` on strings, so a backslash is written `\\`; `fib.regex` has its own `replace-all`, `replace-first`, `re-quote-replacement`.
+- **Java/C.** `Pattern.compile("..")`, with the same doubled backslash.
+- **Recommendation.** The reader rule; then `str/replace` over `Pattern` can call `fib.regex`'s functions.
