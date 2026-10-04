@@ -1,0 +1,79 @@
+;; fib.bigint.magdiv: the quotient and remainder of two magnitudes (fib.bigint.mag), Knuth's Algorithm D
+;; (TAOCP 4.3.1) at base 2^31, in the form of Hacker's Delight `divmnu`: the divisor is shifted left until
+;; its top limb has bit 30 set, each quotient limb is estimated from the top two limbs of the running
+;; remainder against the top limb of the divisor, corrected with the second limb, and the rare estimate
+;; that is one too big is added back. Every product fits a signed i64 (limbs are below 2^31).
+(ns fib.bigint.magdiv (:use fib.bigint.mag))
+
+;; the estimate of one quotient limb, corrected against the divisor's second limb v2 and the remainder's
+;; third limb u2: Knuth's step D3
+(defun qhat-fix :private (qhat: i64 rhat: i64 v1: i64 v2: i64 u2: i64) -> i64
+  (if (or (>= qhat MAG-BASE) (> (* qhat v2) (+ (shl rhat 31) u2)))
+      (let [r2 (+ rhat v1)]
+        (if (< r2 MAG-BASE) (qhat-fix (- qhat 1) r2 v1 v2 u2) (- qhat 1)))
+      qhat))
+
+;; un[j .. j+n] -= qhat * vn; the borrow out of the top limb, as 0 or 1 (a negative result)
+(defun mulsub! :private (&un: (Array i64) vn: (Array i64) n: i64 j: i64 qhat: i64) -> i64
+  (let [k (loop [i 0 k 0]
+            (if (< i n)
+                (let [p (* qhat (array-get vn i))
+                      t (- (- (array-get @un (+ i j)) k) (bit-and p MAG-MASK))]
+                  (do (array-set! &un (+ i j) (bit-and t MAG-MASK))
+                      (recur (+ i 1) (- (shr p 31) (sar t 31)))))
+                k))
+        t (- (array-get @un (+ j n)) k)]
+    (do (array-set! &un (+ j n) (bit-and t MAG-MASK))
+        (if (< t 0) 1 0))))
+
+;; un[j .. j+n] += vn, dropping the carry out of the top limb: step D6
+(defun addback! :private (&un: (Array i64) vn: (Array i64) n: i64 j: i64) -> unit
+  (let [k (loop [i 0 k 0]
+            (if (< i n)
+                (let [t (+ (+ (array-get @un (+ i j)) (array-get vn i)) k)]
+                  (do (array-set! &un (+ i j) (bit-and t MAG-MASK))
+                      (recur (+ i 1) (shr t 31))))
+                k))]
+    (array-set! &un (+ j n) (bit-and (+ (array-get @un (+ j n)) k) MAG-MASK))))
+
+;; one step of the loop of Algorithm D: the quotient limb j, the remainder un updated in place
+(defun div-step! :private (&un: (Array i64) vn: (Array i64) n: i64 j: i64) -> i64
+  (let [v1 (array-get vn (- n 1))
+        v2 (array-get vn (- n 2))
+        num (+ (shl (array-get @un (+ j n)) 31) (array-get @un (+ (+ j n) -1)))
+        q0 (quot num v1)
+        qhat (qhat-fix q0 (- num (* q0 v1)) v1 v2 (array-get @un (+ (+ j n) -2)))
+        borrow (mulsub! &un vn n j qhat)]
+    (if (= borrow 1)
+        (do (addback! &un vn n j) (- qhat 1))
+        qhat)))
+
+;; a divided by b, b with two or more limbs and a >= b: the quotient, and the remainder when rem? (else the empty magnitude,
+;; which saves the shift back and the copy of the remainder: a quotient alone is half the passes over the limbs)
+(defun mag-divmod-long :private (a: (Array i64) b: (Array i64) rem?: bool) -> (Pair (Array i64) (Array i64))
+  (let [n (array-len b)
+        m (- (array-len a) n)
+        s (- 31 (limb-bits (array-get b (- n 1))))
+        vn (mag-shl-limbs b s n)
+        un (cell (mag-shl-limbs a s (+ (array-len a) 1)))
+        q (cell (array (+ m 1) 0))]
+    (do (loop [j m]
+          (if (>= j 0)
+              (do (array-set! &q j (div-step! &un vn n j)) (recur (- j 1)))
+              ()))
+        (mag-trim! &q)
+        (Pair @q (if rem? (mag-shr (mag-norm @un) s) (mag-empty))))))
+
+(defun mag-divmod-any :private (a: (Array i64) b: (Array i64) rem?: bool) -> (Pair (Array i64) (Array i64))
+  (cond (mag-zero? b) (trap "BigInt: divide by zero")
+        (< (mag-cmp a b) 0) (Pair (mag-empty) a)
+        (= (array-len b) 1) (let [qr (mag-divmod-small a (array-get b 0))]
+                              (Pair (. qr fst) (mag-of-i64 (. qr snd))))
+        :else (mag-divmod-long a b rem?)))
+
+(defun mag-divmod (a: (Array i64) b: (Array i64)) -> (Pair (Array i64) (Array i64))
+  (mag-divmod-any a b true))
+
+;; the quotient alone
+(defun mag-quot (a: (Array i64) b: (Array i64)) -> (Array i64)
+  (. (mag-divmod-any a b false) fst))

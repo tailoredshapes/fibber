@@ -2220,6 +2220,44 @@ library above loops on a short write), `(fd-seek fd off whence)`, `(fd-pipe) -> 
 `(fd-rmdir path)`, `(errno-text e) -> str`, `(getenv name) -> (Option str)`, `(clock-now)`, `(wall-now)` and
 `(sleep-ns ns)`. Sockets are the next package (S6).
 
+### 4.20 `fib.bigint`: BigInt (package BIG, the shootout suite)
+
+The arbitrary precision integer of §2.8, `lib/fib/bigint.fib` over `lib/fib/bigint/{mag,magmul,magdiv,big}.fib`; a program
+`:use`s `fib.bigint` (it is not implicit, so a program that does not need it does not compile it). The case block is 6000
+to 6099: 6000 to 6002 are the differential cases against `java.math.BigInteger` (`scripts/bigint/BigDiff.java` and
+`tl.bigdiff` draw the same seeded operands from `tl.rng`; each case embeds the digests the Java program printed), 6010 to
+6016 are the unit, trap and law cases with expected values computed by Python's integers.
+
+**Representation.** A `BigInt` is a sign (-1, 0, 1) and a magnitude, an `(Array i64)` of 31-bit limbs, least significant
+first, with no zero limb at the top; zero is the empty magnitude. Limbs hold 31 bits, not 32, because the arithmetic
+traps on overflow and a limb product plus two limbs must fit a signed `i64`. Multiplication is schoolbook below 40 limbs of
+the shorter operand and Karatsuba above (an operand twice as long as the other is cut into pieces of the shorter one's
+length; a single-limb multiplier takes the `mag-mul-small` loop); division is Knuth's Algorithm D (a single-limb divisor
+takes a short division); text is converted nine digits at a time (quadratic).
+
+| Clojure name | Verdict | Fibber | Signature | T | Note |
+|---|---|---|---|---|---|
+| `parse-bigint` (new) | new | `(parse-bigint s)` | `str -> (Option BigInt)` | 5 | an optional `+` or `-` and one or more decimal digits; `nil` for anything else; `(bigint s)` is the trapping form |
+| `gcd` (new) | new | `(gcd a b)` | `BigInt BigInt -> BigInt` | 5 | the non-negative greatest common divisor, `(gcd 0 0)` is 0; Euclid over Algorithm D |
+| `expt` (new) | new | `(expt a n)` | `BigInt i64 -> BigInt` | 5 | `a` to the `n >= 0`, by squaring; a negative `n` traps `expt: negative exponent` |
+| `isqrt` (new) | new | `(isqrt a)` | `BigInt -> BigInt` | 5 | the floor of the square root of `a >= 0` (Newton from above); a negative `a` traps |
+| `big-shift-left` (new) | new | `(big-shift-left a n)` | `BigInt i64 -> BigInt` | 5 | `a * 2^n`; a negative `n` shifts right |
+| `big-shift-right` (new) | new | `(big-shift-right a n)` | `BigInt i64 -> BigInt` | 5 | the floor of `a / 2^n`, as Java's `shiftRight`: a negative `a` rounds toward minus infinity; the bit operations on negative numbers (`bit-and`, ...) are not offered |
+| `big-bit-length` (new) | new | `(big-bit-length a)` | `BigInt -> i64` | 5 | the bits of the magnitude, 0 for zero (Java's `bitLength` differs for negatives) |
+| `big-mul-small` (new) | new | `(big-mul-small a m)` | `BigInt i64 -> BigInt` | 5 | `a * m` for `0 <= m < 2^31` in one pass over the limbs; any other `m` is `(* a (bigint m))`; `(* a b)` with a one-limb `b` takes the same loop |
+| `big-fits-i64?` (new) | new | `(big-fits-i64? a)` | `BigInt -> bool` | 5 | whether `(long a)` converts |
+| `big-even?` (new) | new | `(big-even? a)` | `BigInt -> bool` | 5 | `even?` needs `Bits`, which BigInt does not implement |
+| `big-odd?` (new) | new | `(big-odd? a)` | `BigInt -> bool` | 5 | |
+
+The rows `bigint` and `biginteger` of §4.3 keep their text (a `ToBig` protocol: `BigInt`, the four integer widths and `str`
+convert). The instances of BigInt are `Num` (`+ - * quot rem neg`; `quot` truncates, a zero divisor traps `BigInt: divide by
+zero`), `Eq`, `Ord`, `Hash` (of the limbs, not Clojure's), `Unit` (so `inc dec abs mod zero? pos? neg? max min compare` are the
+library's generic ones), `Show`, `ToStr` (the digits), `Debug` (the digits and `N`), `ToLong` (traps `long: value out of range`),
+`ToDouble` (nearest, ties to even, an infinity beyond the range) and `(Div (Ratio BigInt)) BigInt` (`/` is exact: `(/ 6 -4)` is
+`-3/2` in lowest terms with a positive denominator, so `(Ratio BigInt)` is the tranche 5 ratio of §2.8). **Not delivered:**
+`+'` `-'` `*'` `inc'` `dec'` (the reader ends a symbol at `'`, so the names cannot be written; docs/shootout/gaps.md), the reader
+literal `1N`, `bigdec`, and bases other than 10.
+
 ## 5. Deviations from Clojure
 
 The first version of this page had 82 deviation rows. Under the rule (§1.1) a deviation needs a memory-safety failing

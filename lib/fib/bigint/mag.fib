@@ -1,0 +1,216 @@
+;; fib.bigint.mag: unsigned magnitudes of the library's BigInt, the part that is addition, subtraction,
+;; comparison, small multiplication and division, shifts and conversion to and from text.
+;; A magnitude is an `(Array i64)` of LIMBS, least significant first, each holding 31 bits (0 .. 2^31-1) and
+;; none above the length; the array of length 0 is zero, and a magnitude is NORMALISED: its last limb is not 0.
+;; Decided here, where spec/stdlib.md §2.8 is silent:
+;;  - 31 bits, not 32: the arithmetic traps on overflow (types §2.12) and a limb product plus two limbs
+;;    must fit a signed `i64`: (2^31-1)^2 + 2 (2^31-1) < 2^62. The cost is 3% more limbs than 32 would take.
+;;  - no function here writes through a shared array: every one makes its result in a cell it owns, so the
+;;    array it returns is unique and the next one may write it in place.
+;;  - the functions assume normalised operands and return normalised results; a violation is a bug in the
+;;    caller and not a trap, except the divisors of mag-divmod and mag-divmod-small, which trap on zero.
+(ns fib.bigint.mag (:use fib.core))
+
+(def MAG-BITS: i64 31)
+(def MAG-MASK: i64 2147483647)
+(def MAG-BASE: i64 2147483648)
+
+(defun mag-empty () -> (Array i64) (array 0 0))
+(defun mag-zero? (a: (Array i64)) -> bool (= (array-len a) 0))
+
+;; the same limbs without the zero limbs at the high end
+(defun mag-norm (r: (Array i64)) -> (Array i64)
+  (let [n (loop [k (array-len r)]
+            (if (and (> k 0) (= (array-get r (- k 1)) 0)) (recur (- k 1)) k))]
+    (if (= n (array-len r)) r (array-copy r 0 n))))
+
+;; drops the zero limbs at the high end of a magnitude the caller owns, in place: array-pop! shortens a unique
+;; array without copying it, so the "result may be one limb shorter than I allocated" cases cost no pass
+(defun mag-trim! (&r: (Array i64)) -> unit
+  (let [n (array-len @r)]
+    (if (and (> n 0) (= (array-get @r (- n 1)) 0))
+        (do (array-pop! &r) (mag-trim! &r))
+        ())))
+
+;; the magnitude of a non-negative i64
+(defun mag-of-i64 (n: i64) -> (Array i64)
+  (let [c (cell (array 3 0))]
+    (do (array-set! &c 0 (bit-and n MAG-MASK))
+        (array-set! &c 1 (bit-and (shr n 31) MAG-MASK))
+        (array-set! &c 2 (shr n 62))
+        (do (mag-trim! &c) @c))))
+
+;; -1, 0 or 1
+(defun mag-cmp (a: (Array i64) b: (Array i64)) -> i64
+  (let [la (array-len a) lb (array-len b)]
+    (if (!= la lb)
+        (if (< la lb) -1 1)
+        (loop [i (- la 1)]
+          (if (< i 0)
+              0
+              (let [x (array-get a i) y (array-get b i)]
+                (cond (< x y) -1
+                      (> x y) 1
+                      :else (recur (- i 1)))))))))
+
+(defun mag-add (a: (Array i64) b: (Array i64)) -> (Array i64)
+  (if (< (array-len a) (array-len b))
+      (mag-add b a)
+      (let [la (array-len a) lb (array-len b)
+            c (cell (array (+ la 1) 0))
+            carry (loop [i 0 carry 0]
+                    (if (< i la)
+                        (let [t (+ (+ (array-get a i) (if (< i lb) (array-get b i) 0)) carry)]
+                          (do (array-set! &c i (bit-and t MAG-MASK))
+                              (recur (+ i 1) (shr t 31))))
+                        carry))]
+      (do (array-set! &c la carry) (do (mag-trim! &c) @c)))))
+
+;; a - b, for a >= b
+(defun mag-sub (a: (Array i64) b: (Array i64)) -> (Array i64)
+  (let [la (array-len a) lb (array-len b)
+        c (cell (array la 0))]
+    (do (loop [i 0 borrow 0]
+          (if (< i la)
+              (let [t (- (- (array-get a i) (if (< i lb) (array-get b i) 0)) borrow)]
+                (do (array-set! &c i (bit-and t MAG-MASK))
+                    (recur (+ i 1) (shr t 63))))
+              ()))
+        (do (mag-trim! &c) @c))))
+
+;; a * m for 0 <= m < 2^31
+(defun mag-mul-small (a: (Array i64) m: i64) -> (Array i64)
+  (if (= m 0)
+      (mag-empty)
+      (let [n (array-len a)
+            c (cell (array (+ n 1) 0))
+            carry (loop [i 0 carry 0]
+                    (if (< i n)
+                        (let [t (+ (* (array-get a i) m) carry)]
+                          (do (array-set! &c i (bit-and t MAG-MASK))
+                              (recur (+ i 1) (shr t 31))))
+                        carry))]
+        (do (array-set! &c n carry) (do (mag-trim! &c) @c)))))
+
+;; a + m for 0 <= m < 2^31
+(defun mag-add-small (a: (Array i64) m: i64) -> (Array i64)
+  (let [n (array-len a)
+        c (cell (array (+ n 1) 0))
+        carry (loop [i 0 carry m]
+                (if (< i n)
+                    (let [t (+ (array-get a i) carry)]
+                      (do (array-set! &c i (bit-and t MAG-MASK))
+                          (recur (+ i 1) (shr t 31))))
+                    carry))]
+    (do (array-set! &c n carry) (do (mag-trim! &c) @c))))
+
+;; the quotient and the remainder of a by d, 0 < d < 2^31
+(defun mag-divmod-small (a: (Array i64) d: i64) -> (Pair (Array i64) i64)
+  (if (<= d 0)
+      (trap "BigInt: divide by zero")
+      (let [n (array-len a)
+            c (cell (array n 0))
+            r (loop [i (- n 1) r 0]
+                (if (>= i 0)
+                    (let [t (+ (shl r 31) (array-get a i))]
+                      (do (array-set! &c i (quot t d))
+                          (recur (- i 1) (rem t d))))
+                    r))]
+        (Pair (do (mag-trim! &c) @c) r))))
+
+;; the number of bits of a limb (0 for 0): smear the top bit down, then count
+(defun limb-bits (x: i64) -> i64
+  (let [a (bit-or x (shr x 1))
+        b (bit-or a (shr a 2))
+        c (bit-or b (shr b 4))
+        d (bit-or c (shr c 8))
+        e (bit-or d (shr d 16))]
+    (popcount e)))
+
+;; the number of bits of a magnitude: 0 for zero
+(defun mag-bit-length (a: (Array i64)) -> i64
+  (let [n (array-len a)]
+    (if (= n 0)
+        0
+        (let [top (array-get a (- n 1))]
+          (+ (* (- n 1) 31) (limb-bits top))))))
+
+;; limbs of a shifted left by s bits (0 <= s < 31) into len limbs; the caller makes len big enough
+(defun mag-shl-limbs (a: (Array i64) s: i64 len: i64) -> (Array i64)
+  (let [n (array-len a)
+        c (cell (array len 0))
+        carry (loop [i 0 carry 0]
+                (if (< i n)
+                    (let [x (array-get a i)]
+                      (do (array-set! &c i (bit-or (bit-and (shl x s) MAG-MASK) carry))
+                          (recur (+ i 1) (shr x (- 31 s)))))
+                    carry))]
+    (do (if (< n len) (array-set! &c n carry) ()) @c)))
+
+;; a * 2^k, k >= 0
+(defun mag-shl (a: (Array i64) k: i64) -> (Array i64)
+  (if (mag-zero? a)
+      a
+      (let [limbs (quot k 31)
+            bits (rem k 31)
+            n (array-len a)
+            c (cell (array (+ (+ n limbs) 1) 0))
+            carry (loop [i 0 carry 0]
+                    (if (< i n)
+                        (let [x (array-get a i)]
+                          (do (array-set! &c (+ i limbs) (bit-or (bit-and (shl x bits) MAG-MASK) carry))
+                              (recur (+ i 1) (shr x (- 31 bits)))))
+                        carry))]
+        (do (array-set! &c (+ n limbs) carry) (do (mag-trim! &c) @c)))))
+
+;; floor (a / 2^k), k >= 0
+(defun mag-shr (a: (Array i64) k: i64) -> (Array i64)
+  (let [limbs (quot k 31)
+        bits (rem k 31)
+        n (array-len a)
+        m (- n limbs)]
+    (if (<= m 0)
+        (mag-empty)
+        (let [c (cell (array m 0))]
+          (do (loop [i 0]
+                (if (< i m)
+                    (let [lo (shr (array-get a (+ i limbs)) bits)
+                          hi (if (< (+ (+ i limbs) 1) n)
+                                 (bit-and (shl (array-get a (+ (+ i limbs) 1)) (- 31 bits)) MAG-MASK)
+                                 0)]
+                      (do (array-set! &c i (bit-or lo hi)) (recur (+ i 1))))
+                    ()))
+              (do (mag-trim! &c) @c))))))
+
+;; whether any of the k low bits of a is set
+(defun mag-low-bits? (a: (Array i64) k: i64) -> bool
+  (let [limbs (quot k 31)
+        bits (rem k 31)
+        n (array-len a)]
+    (or (loop [i 0]
+          (cond (or (>= i limbs) (>= i n)) false
+                (!= (array-get a i) 0) true
+                :else (recur (+ i 1))))
+        (and (< limbs n) (> bits 0)
+             (!= (bit-and (array-get a limbs) (- (shl 1 bits) 1)) 0)))))
+
+;; the decimal digits of a magnitude, nine at a time from the low end
+(defun mag-chunks (a: (Array i64)) -> (Vec i64)
+  (loop [x a out (vec-empty)]
+    (if (mag-zero? x)
+        out
+        (let [qr (mag-divmod-small x 1000000000)]
+          (recur (. qr fst) (vec-conj out (. qr snd)))))))
+
+(defun pad9 :private (n: i64) -> str
+  (let [s (str n)] (str-concat (str-slice "000000000" 0 (- 9 (str-len s))) s)))
+
+(defun mag-to-str (a: (Array i64)) -> str
+  (if (mag-zero? a)
+      "0"
+      (let [ch (mag-chunks a)
+            n (vec-count ch)]
+        (str-join (loop [i (- n 2) acc (vec-conj (vec-empty) (str (vec-nth ch (- n 1))))]
+                    (if (< i 0)
+                        acc
+                        (recur (- i 1) (vec-conj acc (pad9 (vec-nth ch i))))))))))

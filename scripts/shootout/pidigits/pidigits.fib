@@ -1,0 +1,51 @@
+;; pidigits: the streaming spigot of the Computer Language Benchmarks Game (Gibbons' unbounded spigot as the game
+;; describes it, the algorithm of its C, Java and Clojure entries): three BigInts numer, accum and denom, a term
+;; added per step, a digit extracted when the digit of 3n+a/d and of 4n+a/d agree, ten digits to a line with the
+;; running count after a tab. Written as a fibber programmer writes it: plain `+ * quot` on `fib.bigint`'s BigInt.
+(ns main (:use fib.bigint))
+
+(defstruct Spigot (numer: BigInt accum: BigInt denom: BigInt))
+
+;; the digit of (numer * nth + accum) / denom
+(defun extract-digit (s: Spigot nth: i64) -> i64
+  (long (quot (+ (* (. s numer) (bigint nth)) (. s accum)) (. s denom))))
+
+;; the term k: accum = (accum + 2 numer) (2k + 1), numer = numer k, denom = denom (2k + 1)
+(defun next-term (s: Spigot k: i64) -> Spigot
+  (let [y2 (bigint (+ (* k 2) 1))]
+    (Spigot (* (. s numer) (bigint k))
+            (* (+ (. s accum) (* (. s numer) (bigint 2))) y2)
+            (* (. s denom) y2))))
+
+;; accum = (accum - denom d) 10, numer = numer 10
+(defun eliminate-digit (s: Spigot d: i64) -> Spigot
+  (Spigot (* (. s numer) (bigint 10))
+          (* (- (. s accum) (* (. s denom) (bigint d))) (bigint 10))
+          (. s denom)))
+
+(defun pad (line: str n: i64) -> str
+  (if (< (str-len line) 10) (pad (str-concat line " ") n) line))
+
+(defun spigot (n: i64) -> unit
+  (loop [s (Spigot (bigint 1) (bigint 0) (bigint 1)) k 0 i 0 line ""]
+    (if (< i n)
+        (let [k1 (+ k 1)
+              t (next-term s k1)]
+          (if (> (. t numer) (. t accum))
+              (recur t k1 i line)
+              (let [d (extract-digit t 3)]
+                (if (!= d (extract-digit t 4))
+                    (recur t k1 i line)
+                    (let [line1 (str-concat line (str d))
+                          i1 (+ i 1)]
+                      (if (= (rem i1 10) 0)
+                          (do (println (str-concat line1 (str "\t:" i1)))
+                              (recur (eliminate-digit t d) k1 i1 ""))
+                          (recur (eliminate-digit t d) k1 i1 line1)))))))
+        (if (= (str-len line) 0)
+            ()
+            (println (str-concat (pad line 10) (str "\t:" n)))))))
+
+(defun main () -> i64
+  (let [n (match (parse-long (vec-nth (args) 0)) ((some v) v) (nil 27))]
+    (do (spigot n) 0)))

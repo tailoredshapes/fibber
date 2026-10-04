@@ -1,0 +1,238 @@
+;; fib.bigint.big: the library's BigInt (spec/stdlib.md §2.8, tranche 5): an arbitrary precision signed
+;; integer, a sign and a magnitude of 31-bit limbs (fib.bigint.mag). Clojure's BigInt is the model; the
+;; differences, each decided here:
+;;  - there is no auto-promotion, and `+'` `-'` `*'` `inc'` `dec'` are not offered: `'` ends a symbol in the
+;;    reader (spec/syntax.md §1.1), so they cannot be written (docs/shootout/gaps.md); `+ - * quot
+;;    rem neg < =` are the `Num`, `Ord` and `Eq` instances at BigInt, so a program that wants the big type says
+;;    so with `bigint`; a mixed `(+ big 1)` is a type error as `(+ i32 i64)` is (types §2.12) and `(+ big 1)`
+;;    works through the literal rule only for a literal operand.
+;;  - quot and rem truncate toward zero (Java's divide and remainder, Clojure's `quot` and `rem`); `mod` is the
+;;    library's generic one, whose sign is the divisor's. Division by zero traps `BigInt: divide by zero`.
+;;  - `/` is exact: a (Ratio BigInt) in lowest terms with a positive denominator, whose Show text is `7/2`.
+;;  - `long` traps `long: value out of range` when the value does not fit, as Clojure's `(long big)` throws;
+;;    `double` rounds to nearest even, an out of range value is an infinity, as `BigInteger.doubleValue`.
+;;  - the text of Show and ToStr is the decimal digits; Debug (`pr-str`) adds Clojure's `N`.
+;;  - not offered: the bit operations on negative numbers (`bit-and` ...: two's complement semantics with an
+;;    infinite sign extension), bases other than 10 in text, and `Hash` equal to the Long's hash for a value
+;;    that fits (the hash is of the limbs).
+;; New names (marked (new) in the spec): `gcd`, `expt`, `isqrt`, `big-shift-left`, `big-shift-right`,
+;; `big-bit-length`, `big-even?`, `big-odd?`, `parse-bigint`.
+(ns fib.bigint.big (:use fib.core fib.bigint.mag fib.bigint.magmul fib.bigint.magdiv))
+
+(defstruct BigInt (sgn: i64 mag: (Array i64)))
+
+;; the value of a sign and a magnitude, zero having sign 0
+(defun big-make :private (sgn: i64 m: (Array i64)) -> BigInt
+  (if (mag-zero? m) (BigInt 0 m) (BigInt sgn m)))
+
+(defun big-of-i64 (n: i64) -> BigInt
+  (cond (= n 0) (BigInt 0 (mag-empty))
+        (> n 0) (BigInt 1 (mag-of-i64 n))
+        :else (let [c (cell (array 3 0))]
+                (do (loop [i 0 m n]
+                      (if (< i 3)
+                          (do (array-set! &c i (neg (rem m MAG-BASE)))
+                              (recur (+ i 1) (quot m MAG-BASE)))
+                          ()))
+                    (BigInt -1 (do (mag-trim! &c) @c))))))
+
+(defun big-sign (a: BigInt) -> i64 (. a sgn))
+
+(defun big-neg (a: BigInt) -> BigInt (BigInt (neg (. a sgn)) (. a mag)))
+(defun big-abs (a: BigInt) -> BigInt (if (< (. a sgn) 0) (big-neg a) a))
+
+;; the order of two magnitudes seen through their signs
+(defun big-cmp (a: BigInt b: BigInt) -> i64
+  (let [sa (. a sgn) sb (. b sgn)]
+    (cond (< sa sb) -1
+          (> sa sb) 1
+          (= sa 0) 0
+          (> sa 0) (mag-cmp (. a mag) (. b mag))
+          :else (mag-cmp (. b mag) (. a mag)))))
+
+(defun big-add (a: BigInt b: BigInt) -> BigInt
+  (let [sa (. a sgn) sb (. b sgn)]
+    (cond (= sa 0) b
+          (= sb 0) a
+          (= sa sb) (BigInt sa (mag-add (. a mag) (. b mag)))
+          :else (let [c (mag-cmp (. a mag) (. b mag))]
+                  (cond (= c 0) (BigInt 0 (mag-empty))
+                        (> c 0) (BigInt sa (mag-sub (. a mag) (. b mag)))
+                        :else (BigInt sb (mag-sub (. b mag) (. a mag))))))))
+
+(defun big-sub (a: BigInt b: BigInt) -> BigInt (big-add a (big-neg b)))
+
+(defun big-mul (a: BigInt b: BigInt) -> BigInt
+  (big-make (* (. a sgn) (. b sgn)) (mag-mul (. a mag) (. b mag))))
+
+;; a * m for a small non-negative m < 2^31, the fast path of the spigot
+(defun big-mul-small (a: BigInt m: i64) -> BigInt
+  (if (and (>= m 0) (< m MAG-BASE))
+      (big-make (. a sgn) (mag-mul-small (. a mag) m))
+      (big-mul a (big-of-i64 m))))
+
+;; truncated quotient and remainder: the remainder has the dividend's sign
+(defun big-divmod (a: BigInt b: BigInt) -> (Pair BigInt BigInt)
+  (let [qr (mag-divmod (. a mag) (. b mag))]
+    (Pair (big-make (* (. a sgn) (. b sgn)) (. qr fst))
+          (big-make (. a sgn) (. qr snd)))))
+(defun big-quot (a: BigInt b: BigInt) -> BigInt
+  (big-make (* (. a sgn) (. b sgn)) (mag-quot (. a mag) (. b mag))))
+(defun big-rem (a: BigInt b: BigInt) -> BigInt (. (big-divmod a b) snd))
+
+(defun big-even? (a: BigInt) -> bool
+  (or (= (. a sgn) 0) (= (bit-and (array-get (. a mag) 0) 1) 0)))
+(defun big-odd? (a: BigInt) -> bool (not (big-even? a)))
+
+(defun big-bit-length (a: BigInt) -> i64 (mag-bit-length (. a mag)))
+
+(defun big-shift-left (a: BigInt n: i64) -> BigInt
+  (if (< n 0)
+      (big-shift-right a (neg n))
+      (big-make (. a sgn) (mag-shl (. a mag) n))))
+
+;; floor division by 2^n, as Java's `shiftRight`: a negative number rounds toward minus infinity
+(defun big-shift-right (a: BigInt n: i64) -> BigInt
+  (cond (< n 0) (big-shift-left a (neg n))
+        (>= (. a sgn) 0) (big-make (. a sgn) (mag-shr (. a mag) n))
+        :else (let [q (mag-shr (. a mag) n)]
+                (big-make -1 (if (mag-low-bits? (. a mag) n) (mag-add-small q 1) q)))))
+
+(defun gcd (a: BigInt b: BigInt) -> BigInt
+  (loop [x (. (big-abs a) mag) y (. (big-abs b) mag)]
+    (if (mag-zero? y)
+        (big-make 1 x)
+        (recur y (. (mag-divmod x y) snd)))))
+
+;; base raised to n >= 0, by repeated squaring
+(defun expt (base: BigInt n: i64) -> BigInt
+  (cond (< n 0) (trap "expt: negative exponent")
+        (= n 0) (big-of-i64 1)
+        :else (loop [r (big-of-i64 1) b base k n]
+                (if (= k 0)
+                    r
+                    (recur (if (= (bit-and k 1) 1) (big-mul r b) r)
+                           (if (> k 1) (big-mul b b) b)
+                           (shr k 1))))))
+
+;; floor of the square root of a non-negative number, by Newton's iteration from above
+(defun isqrt (a: BigInt) -> BigInt
+  (cond (< (. a sgn) 0) (trap "isqrt: negative argument")
+        (= (. a sgn) 0) a
+        :else (loop [x (big-shift-left (big-of-i64 1) (quot (+ (big-bit-length a) 1) 2))]
+                (let [y (big-shift-right (big-add x (big-quot a x)) 1)]
+                  (if (>= (big-cmp y x) 0) x (recur y))))))
+
+(defun big-to-str (a: BigInt) -> str
+  (if (< (. a sgn) 0) (str-concat "-" (mag-to-str (. a mag))) (mag-to-str (. a mag))))
+
+;; the magnitude of the digit run in the bytes bs from i to n, nine at a time
+(defun digits-mag :private (bs: (Array i8) i: i64 n: i64) -> (Option (Array i64))
+  (loop [k i m (mag-empty) acc 0 cnt 0 pw 1]
+    (if (< k n)
+        (let [d (- (sext i64 (array-get bs k)) 48)]
+          (if (or (< d 0) (> d 9))
+              nil
+              (if (= cnt 8)
+                  (recur (+ k 1) (mag-add-small (mag-mul-small m 1000000000) (+ (* acc 10) d)) 0 0 1)
+                  (recur (+ k 1) m (+ (* acc 10) d) (+ cnt 1) (* pw 10)))))
+        (some (if (= cnt 0) m (mag-add-small (mag-mul-small m pw) acc))))))
+
+;; Clojure's `(bigint "123")`, without the trap: an optional sign and one or more decimal digits
+(defun parse-bigint (s: str) -> (Option BigInt)
+  (let [bs (str-bytes s)
+        n (array-len bs)
+        neg? (and (> n 0) (= (array-get bs 0) 45i8))
+        i (if (or neg? (and (> n 0) (= (array-get bs 0) 43i8))) 1 0)]
+    (if (>= i n)
+        nil
+        (match (digits-mag bs i n)
+          ((some m) (some (big-make (if neg? -1 1) m)))
+          (nil nil)))))
+
+;; -- conversions -----------------------------------------------------------------------------------
+
+(defprotocol ToBig (bigint (self) -> BigInt))
+(impl ToBig BigInt (bigint (self) self))
+(impl ToBig i8 (bigint (self) (big-of-i64 (sext i64 self))))
+(impl ToBig i16 (bigint (self) (big-of-i64 (sext i64 self))))
+(impl ToBig i32 (bigint (self) (big-of-i64 (sext i64 self))))
+(impl ToBig i64 (bigint (self) (big-of-i64 self)))
+(impl ToBig str
+  (bigint (self) (match (parse-bigint self)
+                   ((some b) b)
+                   (nil (trap "bigint: not a number")))))
+
+(defun biginteger (x: t) :where ((ToBig t)) -> BigInt (bigint x))
+
+;; the value as an i64 when it fits
+(defun big-fits-i64? (a: BigInt) -> bool
+  (let [m (. a mag) n (array-len m)]
+    (cond (< n 3) true
+          (> n 3) false
+          (< (array-get m 2) 2) true
+          :else (and (< (. a sgn) 0) (= (array-get m 2) 2)
+                     (= (array-get m 1) 0) (= (array-get m 0) 0)))))
+
+(defun big-to-i64 (a: BigInt) -> i64
+  (if (big-fits-i64? a)
+      (let [m (. a mag) n (array-len m)
+            limb (fn (i) (if (< i n) (array-get m i) 0))]
+        (if (and (= n 3) (= (array-get m 2) 2))
+            (- (- 0 9223372036854775807) 1)
+            (let [v (+ (+ (limb 0) (shl (limb 1) 31)) (shl (limb 2) 62))]
+              (if (< (. a sgn) 0) (neg v) v))))
+      (trap "long: value out of range")))
+
+(impl ToLong BigInt (long (self) (big-to-i64 self)))
+
+(defun pow2f :private (k: i64) -> f64
+  (loop [r 1.0 i 0] (if (< i k) (recur (* r 2.0) (+ i 1)) r)))
+
+;; nearest f64, ties to even: the top 63 bits, the rest folded into a sticky low bit
+(defun big-to-f64 (a: BigInt) -> f64
+  (let [bl (big-bit-length a)
+        top (big-to-i64 (big-shift-right (big-abs a) (if (> bl 63) (- bl 63) 0)))
+        sticky (if (and (> bl 63) (mag-low-bits? (. a mag) (- bl 63))) 1 0)
+        x (sitofp f64 (bit-or top sticky))
+        v (if (> bl 63) (* x (pow2f (- bl 63))) x)]
+    (if (< (. a sgn) 0) (neg v) v)))
+
+(impl ToDouble BigInt (double (self) (big-to-f64 self)))
+
+;; -- the protocols ---------------------------------------------------------------------------------------
+
+(impl Num BigInt
+  (+ (self y) (big-add self y))
+  (- (self y) (big-sub self y))
+  (* (self y) (big-mul self y))
+  (quot (self y) (big-quot self y))
+  (rem (self y) (big-rem self y))
+  (neg (self) (big-neg self)))
+
+(impl Eq BigInt (= (self y) (= (big-cmp self y) 0)))
+(impl Hash BigInt
+  (hash (self)
+    (loop [i 0 h (. self sgn)]
+      (if (< i (array-len (. self mag)))
+          (recur (+ i 1) (hash-combine h (array-get (. self mag) i)))
+          h))))
+
+(impl Ord BigInt (< (self y) (< (big-cmp self y) 0)))
+
+(impl Unit BigInt
+  (zero (self) (BigInt 0 (mag-empty)))
+  (one (self) (big-of-i64 1)))
+
+(impl Show BigInt (show (self) (big-to-str self)))
+(impl ToStr BigInt (to-str (self) (big-to-str self)))
+(impl Debug BigInt (debug (self) (str-concat (big-to-str self) "N")))
+
+;; exact division: the lowest terms with a positive denominator
+(impl (Div (Ratio BigInt)) BigInt
+  (/ (self y)
+    (if (= (. y sgn) 0)
+        (trap "ratio: divide by zero")
+        (let [g (gcd self y)
+              h (if (< (. y sgn) 0) (big-neg g) g)]
+          (Ratio (big-quot self h) (big-quot y h))))))
