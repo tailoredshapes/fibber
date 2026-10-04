@@ -1,0 +1,54 @@
+;; expect: accept
+;; stage: 2
+;; ir: @llvm.masked.load.v4f64.p0
+;; ir: @llvm.masked.store.v4f64.p0
+;; ir: @llvm.masked.gather.v4f64.v4p0
+;; ir: @llvm.masked.scatter.v4f64.v4p0
+;; ir: @llvm.masked.load.v4i32.p0
+;; out: load 11 -2 13 14
+;; out: load-i32 5 0 7 8
+;; out: gather 103 10 -9 13
+;; out: scatter 1 11 12 13 3 101 4 103
+;; out: store-gather-match 1
+;; Masked-off lanes take the pass-through value (load, gather) or leave memory alone (store, scatter); the other lanes are the scalar loads and
+;; stores at the same addresses. The buffer holds 10..17, then the masked store writes lanes 1 and 3 of [100 101 102 103] at index 4, then the
+;; scatter writes lanes 0, 2 and 3 of [1 2 3 4] at indexes 0, 4 and 6.
+(declare printf i32 (ptr ...))
+(define (opq <4 x i1>) ((<4 x i1> m))
+  (block entry (let ((s (alloca <4 x i1>))) (store volatile m s) (ret (load volatile <4 x i1> s)))))
+(define (prd void) ((ptr tag) (<4 x double> v))
+  (block entry
+    (call @printf (string "%s %.17g %.17g %.17g %.17g\n") tag (extractelement v (i32 0)) (extractelement v (i32 1)) (extractelement v (i32 2)) (extractelement v (i32 3)))
+    (ret)))
+(define (main i32) ()
+  (block entry
+    (let ((buf (alloca (align 32) [8 x double]))
+          (ibuf (alloca (align 32) [8 x i32])))
+      (let ((p (getelementptr [8 x double] buf (i64 0) (i64 0)))
+            (ip (getelementptr [8 x i32] ibuf (i64 0) (i64 0))))
+        (store (align 32) (<4 x double> 10.0 11.0 12.0 13.0) p)
+        (store (align 32) (<4 x double> 14.0 15.0 16.0 17.0) (getelementptr double p (i64 4)))
+        (store (align 32) (<4 x i32> 5 6 7 8) ip)
+        (call @prd (string "load")
+          (masked-load <4 x double> (getelementptr double p (i64 1)) (call @opq (<4 x i1> 1 0 1 1)) (<4 x double> -1.0 -2.0 -3.0 -4.0) (align 8)))
+        (call @printf (string "load-i32 %d %d %d %d\n")
+          (extractelement (masked-load <4 x i32> ip (call @opq (<4 x i1> 1 0 1 1)) (<4 x i32> 99 0 99 99)) (i32 0))
+          (extractelement (masked-load <4 x i32> ip (call @opq (<4 x i1> 1 0 1 1)) (<4 x i32> 99 0 99 99)) (i32 1))
+          (extractelement (masked-load <4 x i32> ip (call @opq (<4 x i1> 1 0 1 1)) (<4 x i32> 99 0 99 99)) (i32 2))
+          (extractelement (masked-load <4 x i32> ip (call @opq (<4 x i1> 1 0 1 1)) (<4 x i32> 99 0 99 99)) (i32 3)))
+        (masked-store (<4 x double> 100.0 101.0 102.0 103.0) (getelementptr double p (i64 4)) (call @opq (<4 x i1> 0 1 0 1)) (align 8))
+        (let ((g (gather <4 x double> (getelementptr double p (<4 x i64> 7 0 3 3)) (call @opq (<4 x i1> 1 1 0 1)) (<4 x double> -9.0 -9.0 -9.0 -9.0) (align 8))))
+          (call @prd (string "gather") g))
+        (scatter (<4 x double> 1.0 2.0 3.0 4.0) (getelementptr double p (<4 x i64> 0 2 4 6)) (call @opq (<4 x i1> 1 0 1 1)) (align 8))
+        (call @printf (string "scatter %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n")
+          (load double p) (load double (getelementptr double p (i64 1))) (load double (getelementptr double p (i64 2))) (load double (getelementptr double p (i64 3)))
+          (load double (getelementptr double p (i64 4))) (load double (getelementptr double p (i64 5))) (load double (getelementptr double p (i64 6))) (load double (getelementptr double p (i64 7))))
+        ;; the same gather by scalar loads and selects
+        (let ((l0 (load double (getelementptr double p (i64 7))))
+              (l1 (load double p))
+              (l3 (load double (getelementptr double p (i64 3))))
+              (g2 (gather <4 x double> (getelementptr double p (<4 x i64> 7 0 3 3)) (<4 x i1> 1 1 0 1) (<4 x double> -9.0 -9.0 -9.0 -9.0))))
+          (call @printf (string "store-gather-match %d\n")
+            (zext i32 (and (and (fcmp oeq (extractelement g2 (i32 0)) l0) (fcmp oeq (extractelement g2 (i32 1)) l1))
+                           (and (fcmp oeq (extractelement g2 (i32 2)) (double -9.0)) (fcmp oeq (extractelement g2 (i32 3)) l3)))))
+          (ret (i32 0)))))))

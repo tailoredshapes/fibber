@@ -146,6 +146,7 @@ item   ::= (defstruct NAME (type*))
          | (declare-global hidden? NAME type)      ; a variable defined elsewhere (§4.4)
          | (declare hidden? cc? NAME rtype (type* ...?))   ; a function defined elsewhere
          | (define mod* cc? (NAME rtype) ((type PNAME)*) block+)
+         | (target (cpu STRING) (features STRING)?)        ; the CPU and features to generate code for (§4.5)
 mod    ::= private | internal | external           ; linkage (§4.3), at most one
          | hidden                                  ; visibility (§4.3)
 block  ::= (block LABEL instr+)
@@ -153,7 +154,9 @@ block  ::= (block LABEL instr+)
 
 Anything else at the top level is an error `expected a top-level form
 (define, declare, declare-global, defstruct, global, constant), found …`
-(liar silently ignored top-level expressions, `lir-audit/fuzz2.txt`).
+(liar silently ignored top-level expressions, `lir-audit/fuzz2.txt`). The
+message names the forms of the first M3 pass; `(target ..)` (§4.5) is a top-level form too, and
+is left out of the text so that the Rust `lair`, the oracle of the compare scripts, says the same.
 Items may appear in any order and refer to each other in any order.
 
 ### 4.1 Module-level rules
@@ -218,6 +221,53 @@ has no initialiser and is never `constant` in lIR (`store to constant
 undefined behaviour, as in C). `(declare-global stderr ptr)` reaches
 glibc's `stderr`; `errno` is a macro over a function there, not a
 symbol, so `(declare __errno_location ptr ())` is the way to it.
+
+### 4.5 The target
+
+**Decided** (owner, 2026-10-04, SIMD wave 2, package P0; §14 item 12). A module may name the CPU
+and the CPU features its code is generated for:
+
+```
+(target (cpu "x86-64-v3") (features "+avx2,+fma"))
+```
+
+`cpu` is required; `features` is optional and defaults to the empty
+string. Both are LLVM's names for the host's architecture (the x86
+backend today). Why it is in the module: a program's vector code, and the
+number of lanes its front end chooses, depend on the target; `fibc emit`
+on one machine and `lair build` on another must agree, so the choice is
+written where both can read it.
+
+- The module's CPU and features win over the host's and over
+  the environment variable `FIB_TARGET_CPU` (§12). Without a `target`
+  form the host's CPU and features are used, or the CPU `FIB_TARGET_CPU`
+  names, as before.
+- Every function the module defines carries `"target-cpu"` and
+  `"target-features"` attributes with the two strings. LLVM's code
+  generator, its optimiser's cost model (the vector width it picks) and
+  the JIT all read the attributes before the machine's own CPU, so the
+  module's target wins over the host's and over `FIB_TARGET_CPU` in every
+  path (`compiler/tests/native/p0-target.sh` counts `vfmadd` and `ymm`
+  in the assembly), and `emit-llvm` shows the attributes.
+- `lair run` executes the code on the host: the features the module
+  asks for must all be in the host's, else `target: the host does not
+  support +avx512f` (a program that would die of SIGILL is refused
+  instead). `lair build` and `emit` may name any CPU and features: the
+  executable is for whoever runs it.
+- At most one `target` form (`a module has at most one target form`).
+- Rules, checked by the parser and §10 before LLVM is called: `target needs (cpu "NAME")`; `target: unknown
+  field NAME` (anything but `cpu` and `features`); `target: expected (cpu "NAME") or (features "LIST"), found
+  X` (a field that is not a list); `target: cpu expects one string` and `target: features expects one string`;
+  `target: cpu must be a non-empty string of letters, digits, ., _ and -`; `target: features must be a
+  string`; `target: each feature must be +name or -name, found "avx2"` (the name has letters, digits, `.`,
+  `_` and `-`; an empty item or one with a space is found too); `target: duplicate cpu` and `target:
+  duplicate features`; `a module has at most one target form`.
+- LLVM itself ignores, with a warning on standard error, a CPU or
+  feature name it does not know; lIR does not carry LLVM's tables, so it
+  cannot reject them. A spelling mistake therefore costs speed, never
+  correctness: the semantics of every instruction are the same on every
+  target (§6.12 for what is not).
+- Per-function targets (multiversioning) are not in lIR.
 
 ## 5. Functions, blocks and names
 
@@ -341,6 +391,66 @@ instruction and the offending operand. The message forms are:
 | `(ctpop a)` | integer `T` | `T` (`llvm.ctpop`) |
 | `(sadd-overflow a b)` `ssub-overflow` `smul-overflow` | same integer `T` | `{ T, i1 }` (or `{ <N x iK>, <N x i1> }`): the wrapped result and whether it overflowed (`llvm.sadd.with.overflow` and kin; **Decided**, §14 item 5) |
 
+#### Floating-point functions and integer min/max
+
+**Decided** (owner, 2026-10-04, SIMD wave 2, package P0; §14 item 12). Each
+form takes a float or a vector of floats (`F`), or an integer or a vector of
+integers (`I`), and acts on every lane. Each is one LLVM intrinsic and has
+that intrinsic's exact semantics.
+
+| Form | Operands | Result | LLVM |
+|---|---|---|---|
+| `(fma a b c)` | same float `F` | `F`: `a*b+c` with one rounding, always | `llvm.fma` |
+| `(fmuladd a b c)` | same float `F` | `F`: `a*b+c`, fused or not as the target prefers (the result may differ by one rounding between targets) | `llvm.fmuladd` |
+| `(fsqrt a)` | float `F` | `F`: the correctly rounded root; negative gives NaN | `llvm.sqrt` |
+| `(fabs a)` | float `F` | `F` | `llvm.fabs` |
+| `(ffloor a)` `(fceil a)` `(ftrunc a)` | float `F` | `F`: rounded to an integral value toward -inf, +inf, zero | `llvm.floor` `ceil` `trunc` |
+| `(fround a)` | float `F` | `F`: to nearest, ties away from zero | `llvm.round` |
+| `(froundeven a)` | float `F` | `F`: to nearest, ties to even | `llvm.roundeven` |
+| `(fcopysign a b)` | same float `F` | `F`: the magnitude of `a` with the sign of `b` | `llvm.copysign` |
+| `(fmin a b)` `(fmax a b)` | same float `F` | `F`: if either operand is NaN the result is NaN; `-0.0` is less than `+0.0` | `llvm.minimum` `llvm.maximum` |
+| `(fminnum a b)` `(fmaxnum a b)` | same float `F` | `F`: if one operand is NaN the result is the other; the order of `-0.0` and `+0.0` is not specified | `llvm.minnum` `llvm.maxnum` |
+| `(smin a b)` `(smax a b)` `(umin a b)` `(umax a b)` | same integer `I` | `I`, compared as signed or unsigned | `llvm.smin` `smax` `umin` `umax` |
+| `(abs a)` | integer `I` | `I`: the absolute value; `abs` of the minimum value is the minimum value (never poison) | `llvm.abs` with `is_int_min_poison` false |
+
+`fmin`/`fmax` are the NaN-propagating pair and `fminnum`/`fmaxnum` the
+NaN-ignoring pair; the names follow LLVM's `minimum`/`minnum`. A scalar
+`fsqrt` of a constant is not folded by the checker.
+
+#### Fast-math flags
+
+**Decided** (§14 item 12). `fadd fsub fmul fdiv frem`, `fma`, `reduce-fadd`
+and `reduce-fmul` accept flag words between the name and the operands:
+
+```
+(fadd reassoc a b)          (reduce-fadd reassoc (double 0.0) v)          (fmul reassoc contract a b)
+```
+
+An operand count above the form's own is read as flags: the leading words
+beyond the operands. The flags are LLVM's fast-math flags, all opt-in per
+instruction:
+
+| Flag | Licence |
+|---|---|
+| `reassoc` | reassociate and, for a reduction, reorder the lanes: `(a+b)+c` may become `a+(b+c)` |
+| `contract` | fuse a multiply and an add into a `fma` (a `fmul` and an `fadd` that both carry `contract`) |
+| `arcp` | replace a division by multiplication by the reciprocal |
+| `afn` | approximate a function (an intrinsic that is lowered to a library call may be replaced by a faster approximation) |
+| `nsz` | treat `-0.0` and `+0.0` as interchangeable |
+
+Each only licenses a rewrite that changes which of several results is
+computed: a value is never turned into poison. `nnan` and `ninf` (a NaN or
+an infinity where the flag says there is none *is* poison) and `fast`
+(which implies them) are not in lIR: `fast-math flag nnan is not in lIR: a
+value that violates it is poison`. Flags may appear in any order; repeating
+one is `duplicate fast-math flag reassoc`; a word that is none of these is
+`unknown fast-math flag foo`; a flag on a form that does not take them is
+the form's usual operand-count error; a flag position that holds a form, not a word, is `expected a
+fast-math flag, found X`. The measured effect is the point: a
+sum of 4096 doubles in a loop takes 83 ms strict and 14 ms with
+`reassoc` on its `fadd` (docs/design/vectorisation.md), because only then
+may LLVM keep several partial sums in a vector register.
+
 No `nsw`, `nuw` or `exact` flags exist. `sdiv`, `udiv`, `srem`, `urem`
 with a constant zero divisor are `division by constant zero`; a shift
 whose amount is a constant `≥` the bit width is `shift amount n is not
@@ -356,22 +466,31 @@ less than the width w`. Both are poison or undefined in LLVM.
 
 ### 6.3 Conversions
 
-| Form | Rule | Result |
-|---|---|---|
-| `(trunc T v)` | integer scalars, `T` narrower than `v` | `T` |
-| `(zext T v)`, `(sext T v)` | integer scalars, `T` wider | `T` |
-| `(fptrunc float v)` | `v : double` | `float` |
-| `(fpext double v)` | `v : float` | `double` |
-| `(fptosi T v)`, `(fptoui T v)` | `T` integer, `v` float scalar | `T` |
-| `(sitofp T v)`, `(uitofp T v)` | `T` float, `v` integer scalar | `T` |
-| `(ptrtoint T v)` | `T` integer, `v : ptr` | `T` |
-| `(inttoptr ptr v)` | `v` integer | `ptr` |
-| `(bitcast T v)` | `T` and `v`'s type non-aggregate, not `ptr`, same bit size | `T` |
-| `(fptosi-sat T v)`, `(fptoui-sat T v)` | `T` integer scalar, `v` float scalar | `T`: saturating, NaN to 0 (`llvm.fptosi.sat`, `llvm.fptoui.sat`; **Decided**, §14 item 5) |
+A conversion works on a scalar, or on a vector element by element: the
+operand and the result type must then both be vectors **of the same
+number of lanes** (**Decided**, §14 item 12; `sitofp: <4 x i64> and
+<2 x double> must both be scalars or both be vectors of the same
+length`). The class and width rules below apply to the element types.
 
-`fptosi`/`fptoui` of a value out of range is poison as in LLVM;
-`fptosi-sat`/`fptoui-sat` saturate as types.md §8.12 specifies and
-fibber emits them.
+| Form | Rule (on the elements) | Result |
+|---|---|---|
+| `(trunc T v)` | integers, `T` narrower than `v` | `T` |
+| `(zext T v)`, `(sext T v)` | integers, `T` wider | `T` |
+| `(fptrunc T v)` | `T` float, `v` double (`float` or `<N x float>`) | `T` |
+| `(fpext T v)` | `T` double, `v` float | `T` |
+| `(fptosi T v)`, `(fptoui T v)` | `T` integer, `v` float | `T` |
+| `(sitofp T v)`, `(uitofp T v)` | `T` float, `v` integer | `T` |
+| `(ptrtoint T v)` | `T` integer, `v : ptr` | `T` |
+| `(inttoptr T v)` | `T` is `ptr`, `v` integer | `T` |
+| `(bitcast T v)` | `T` and `v`'s type non-aggregate, not `ptr` or a vector of `ptr`, same bit size (the sizes of whole vectors; the lane counts may differ) | `T` |
+| `(fptosi-sat T v)`, `(fptoui-sat T v)` | `T` integer, `v` float | `T`: saturating, NaN to 0 (`llvm.fptosi.sat`, `llvm.fptoui.sat`; **Decided**, §14 item 5) |
+
+`inttoptr` is written `(inttoptr ptr v)` for a scalar and `(inttoptr <N x
+ptr> v)` for a vector of integers; the result type is the pointer type
+itself, as in the former scalar form. `fptosi`/`fptoui` of a value out of
+range is poison, lane by lane, as in LLVM; `fptosi-sat`/`fptoui-sat`
+saturate as types.md §8.12 specifies and fibber emits them, on vectors
+too (the first M3 pass kept them scalar; §14 item 12 lifts that).
 
 ### 6.4 Vectors and aggregates
 
@@ -383,6 +502,23 @@ fibber emits them.
 | `(extractvalue s k₁ ..)` | `s` an aggregate; each `k` a constant index in range: a field of a struct, an element of an array (`extractvalue: index 4 out of range for [4 x i32]`) | the field's or element's type |
 | `(insertvalue s v k₁ ..)` | as above, `v` of the field's or element's type | `s`'s type |
 
+#### Horizontal reductions
+
+**Decided** (§14 item 12). A reduction folds the lanes of one vector into one
+scalar. `V` is a vector `<N x E>`.
+
+| Form | Operands | Result |
+|---|---|---|
+| `(reduce-add v)` `reduce-mul` `reduce-and` `reduce-or` `reduce-xor` | `V` of integers (`<N x i1>` included: `reduce-or` is "any", `reduce-and` is "all") | `E` (`llvm.vector.reduce.add` and kin) |
+| `(reduce-smin v)` `reduce-smax` `reduce-umin` `reduce-umax` | `V` of integers | `E` |
+| `(reduce-fadd a v)` `(reduce-fmul a v)` | `a : E` the start value, `V` of floats | `E`: `a + v[0] + v[1] + ..` in lane order, each step rounded, unless the form carries `reassoc` (then the order is free) |
+| `(reduce-fmin v)` `(reduce-fmax v)` | `V` of floats | `E`: NaN if any lane is NaN (`llvm.vector.reduce.fminimum`, `fmaximum`) |
+| `(reduce-fminnum v)` `(reduce-fmaxnum v)` | `V` of floats | `E`: NaN lanes are ignored unless all are (`llvm.vector.reduce.fmin`, `fmax`) |
+
+The integer reductions are exact in any order. `reduce-fadd` without `reassoc`
+adds the lanes one after another, as written in a scalar loop, and is the
+reference a vectorised sum is compared to.
+
 ### 6.5 Memory
 
 | Form | Rule | Result |
@@ -392,6 +528,11 @@ fibber emits them.
 | `(store volatile? (align N)? v p)` | `p : ptr`; `v` first-class | void |
 | `(getelementptr inbounds? T p i₀ i₁ ..)` | `p : ptr`, `T` sized; `i₀` integer; each further index steps into the current type: into a struct by a constant `i32` field index in range, into an array by any integer, a constant one in range (`getelementptr: index 4 out of range for [4 x i32]`) except into a `[0 x T]`, whose length is unknown | `ptr` |
 
+- A `getelementptr` with a **vector index** (**Decided**, §14 item 12): `(getelementptr T p idx)`
+  where `p : ptr` and `idx : <N x iK>` is the one and only index; the result is `<N x ptr>`, lane `i` being
+  `p` plus `idx[i]` elements of `T`: the addresses of a gather or scatter. `getelementptr: a vector
+  index must be the only index`, `getelementptr: a vector index needs integer elements, found <4 x
+  double>`. A vector base pointer is not in lIR.
 - A `store` whose pointer operand is directly `@c` of a `constant` is
   `store to constant @c`.
 - **Direct accesses are typed.** When the pointer operand of `load`,
@@ -418,6 +559,34 @@ fibber emits them.
   for memory-mapped registers and for a value a signal handler or a
   debugger may change; it is not atomic and orders nothing else (§6.6
   for that). The typed direct-access rule applies unchanged.
+
+#### Masked loads and stores, gather and scatter
+
+**Decided** (§14 item 12). `V` is a vector type `<N x E>` and a mask is `<N x i1>`. A lane whose mask
+bit is 0 is not accessed at all: it can neither fault nor race, so a masked access is how a tail
+of a loop reads and writes only the elements that exist.
+
+| Form | Operands | Result |
+|---|---|---|
+| `(masked-load V p mask passthru (align A)?)` | `p : ptr` to `N` contiguous elements; `mask : <N x i1>`; `passthru : V` | `V`: lane `i` is the element at `p + i` where `mask[i]` is 1, else `passthru[i]` |
+| `(masked-store v p mask (align A)?)` | `v : V`, `p : ptr`, `mask` as above | void: stores lane `i` where `mask[i]` is 1 |
+| `(gather V ptrs mask passthru (align A)?)` | `ptrs : <N x ptr>`; `mask`; `passthru : V` | `V`: lane `i` is the element at `ptrs[i]` where `mask[i]` is 1, else `passthru[i]` |
+| `(scatter v ptrs mask (align A)?)` | `v : V`, `ptrs : <N x ptr>`, `mask` | void: stores lane `i` at `ptrs[i]` where `mask[i]` is 1 |
+
+- `A`, a power of two from 1 to 2^30 as for `load`, is the alignment of the address `p` of a
+  masked access, or of each address of a gather or scatter. Without it the ABI alignment of `V` (masked)
+  or of `E` (gather, scatter) is promised, exactly as a plain `load` does; a smaller `A` is
+  honoured.
+- Errors: `masked-load needs a vector type, found i32`; `masked-load needs a ptr operand, found
+  i64`; `masked-load: operand 2 has type <8 x i1>, expected <4 x i1>` (operands counted from 1, the
+  type not being one); `masked-load: operand 3 has type <4 x i64>, expected <4 x i32>`;
+  `gather: operand 1 has type <4 x i64>, expected <4 x ptr>`; `scatter needs a vector operand, found i32`;
+  the same shapes for `masked-store` and `scatter`. A vector of `ptr` is not a valid `V`: `masked-load
+  needs a vector of integers or floats, found <4 x ptr>` (a pointer vector is moved with plain `load`
+  and `store`).
+- Two lanes of a `scatter` that name one address: which value is left in memory is not specified.
+- Undefined behaviour (§6.12): an unmasked lane that accesses invalid or misaligned memory. A masked-off lane
+  is never accessed.
 
 ### 6.6 Atomics
 
@@ -507,7 +676,8 @@ As in LLVM: memory accesses through invalid, misaligned or freed
 pointers; data races on non-atomic accesses; `sdiv`/`srem` by a zero or
 of the minimum by -1 computed at run time; shifts by a run-time amount
 `≥` the width (poison); out-of-range `fptosi`/`fptoui` (poison); a
-run-time out-of-range vector index (poison); `getelementptr inbounds`
+run-time out-of-range vector index (poison); an unmasked lane of a masked
+load, store, gather or scatter that accesses invalid memory (§6.5); `getelementptr inbounds`
 outside its object (poison); reaching `unreachable`; calling a function
 through a pointer with the wrong function type; a `musttail` callee
 that reads the caller's `alloca`s. lIR's checker cannot see these;
@@ -642,6 +812,7 @@ error of each function but checks every function. The main groups:
 | types | §6: every operand and result type |
 | constants | literal ranges (§3), constant divisors, shifts, vector and array indices (§6), `store` to a `constant`, alignments (§6.5) |
 | calls | §7: arity, argument types, variadic promotion, tail-call rules, `main` |
+| target | §4.5: at most one `target` form and its two strings |
 
 After the checker, `lair` lowers the module and runs the LLVM verifier
 (`LLVMVerifyModule`). A verifier failure after a successful check is an
@@ -785,6 +956,10 @@ lair emit-llvm FILE.lir          ; print the verified LLVM IR
 lair cases DIR..                 ; run a case suite (§13)
 ```
 
+`FIB_TARGET_CPU` names the CPU code is generated for when the module has
+no `target` form (§4.5): unset, empty or `host` mean the host's CPU and
+features; any other value names a CPU with no extra features.
+
 ## 13. Cases
 
 Each case in `cases/lir/` is a `.lir` file whose header states its
@@ -800,6 +975,7 @@ verdict before the implementation decides it (method.md rule 3):
 ;; ir-not: TEXT             ; ... and must not
 ;; paths: jit | aot         ; restrict to one path (default: both)
 ;; audit: …                 ; the lir-audit file it comes from and what liar did
+;; stage: 2                 ; only the fibber `lair` implements this; the Rust `lair` skips the case
 ```
 
 An `accept` case runs through the JIT (`lair run`, no IR optimisation)
@@ -838,3 +1014,4 @@ one the passes used.
 | 9 | linkage and visibility on `define`, `global` and `constant`: `private`, `internal`, `external` (the default) and `hidden`, with the JIT keeping `private` and `internal` names out of the cross-module namespace | **adopted** as proposed, so that a compiler keeps a module's helpers out of the export table | §4.3, §11 |
 | 10 | external global declarations `(declare-global NAME T)`, for `stderr` and other variables the C library or another module defines | **adopted** as proposed | §4.4 |
 | 11 | `volatile` and `(align N)` on `load`, `store` and `alloca` | **adopted** as proposed: `N` a power of two from 1 to 2^30; `volatile` is LLVM's, not atomic | §6.5 |
+| 12 | the instructions SIMD code needs (SIMD wave 2, package P0, owner decisions of 2026-10-04): `fma fmuladd fsqrt fabs ffloor fceil ftrunc fround froundeven fcopysign fmin fmax fminnum fmaxnum smin smax umin umax abs`; fast-math flags `reassoc contract arcp afn nsz` (never `nnan`, `ninf` or `fast`, which make poison) on `fadd fsub fmul fdiv frem fma reduce-fadd reduce-fmul`; the horizontal `reduce-*` family; conversions, saturating conversions and `ptrtoint`/`inttoptr` on vectors; a vector index in `getelementptr`; `masked-load`, `masked-store`, `gather`, `scatter`; the module form `(target (cpu ..) (features ..))` | **adopted** as designed in docs/design/simd-and-tensors.md 2.9, 2.10, with `nsz` allowed (it never makes poison) and `fmuladd` and `fcopysign` added; implemented by the compiler in fibber only (the Rust `lair` is the legacy oracle and does not have them: its harness skips the cases marked `;; stage: 2`) | §4.5, §6.1, §6.3, §6.4, §6.5 |

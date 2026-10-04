@@ -1,0 +1,66 @@
+;; compiler/lir/intrin.fib: the table of the intrinsic forms of lIR (spec/lir.md 6.1, 6.4, 6.5; SIMD wave 2, package P0): the parser, the checker, the
+;; printer and the lowering all read it, so a word is added in one place. The Rust `lair` has none of these forms.
+;;
+;; A form is `KIntrin name flags ty args align` (lir.ast). Its CLASS says how many operands it has and which rule types them:
+;;   f1 f2 f3     float (or vector of floats) in, same type out, 1, 2 or 3 operands
+;;   fbin         `fadd fsub fmul fdiv frem` carrying fast-math flags: 2 operands, as the unflagged `KBin`
+;;   i1 i2        integer (or vector of integers), 1 or 2 operands
+;;   red-i        a vector of integers folded to its element type
+;;   red-f        `reduce-fadd` and `reduce-fmul`: the start value and a vector of floats
+;;   red-m        a vector of floats folded by min or max
+;;   mload gather a leading type, then 3 operands; mstore scatter: 3 operands (the vector first)
+(ns lir.intrin)
+
+
+(defstruct IntrinInfo (class: str llvm: str))
+
+(def intrin-table: (Map str IntrinInfo)
+  {"fma" (IntrinInfo "f3" "llvm.fma") "fmuladd" (IntrinInfo "f3" "llvm.fmuladd")
+   "fsqrt" (IntrinInfo "f1" "llvm.sqrt") "fabs" (IntrinInfo "f1" "llvm.fabs") "ffloor" (IntrinInfo "f1" "llvm.floor")
+   "fceil" (IntrinInfo "f1" "llvm.ceil") "ftrunc" (IntrinInfo "f1" "llvm.trunc") "fround" (IntrinInfo "f1" "llvm.round")
+   "froundeven" (IntrinInfo "f1" "llvm.roundeven")
+   "fcopysign" (IntrinInfo "f2" "llvm.copysign") "fmin" (IntrinInfo "f2" "llvm.minimum") "fmax" (IntrinInfo "f2" "llvm.maximum")
+   "fminnum" (IntrinInfo "f2" "llvm.minnum") "fmaxnum" (IntrinInfo "f2" "llvm.maxnum")
+   "smin" (IntrinInfo "i2" "llvm.smin") "smax" (IntrinInfo "i2" "llvm.smax") "umin" (IntrinInfo "i2" "llvm.umin")
+   "umax" (IntrinInfo "i2" "llvm.umax") "abs" (IntrinInfo "i1" "llvm.abs")
+   "fadd" (IntrinInfo "fbin" "fadd") "fsub" (IntrinInfo "fbin" "fsub") "fmul" (IntrinInfo "fbin" "fmul")
+   "fdiv" (IntrinInfo "fbin" "fdiv") "frem" (IntrinInfo "fbin" "frem")
+   "reduce-add" (IntrinInfo "red-i" "llvm.vector.reduce.add") "reduce-mul" (IntrinInfo "red-i" "llvm.vector.reduce.mul")
+   "reduce-and" (IntrinInfo "red-i" "llvm.vector.reduce.and") "reduce-or" (IntrinInfo "red-i" "llvm.vector.reduce.or")
+   "reduce-xor" (IntrinInfo "red-i" "llvm.vector.reduce.xor") "reduce-smin" (IntrinInfo "red-i" "llvm.vector.reduce.smin")
+   "reduce-smax" (IntrinInfo "red-i" "llvm.vector.reduce.smax") "reduce-umin" (IntrinInfo "red-i" "llvm.vector.reduce.umin")
+   "reduce-umax" (IntrinInfo "red-i" "llvm.vector.reduce.umax")
+   "reduce-fadd" (IntrinInfo "red-f" "llvm.vector.reduce.fadd") "reduce-fmul" (IntrinInfo "red-f" "llvm.vector.reduce.fmul")
+   "reduce-fmin" (IntrinInfo "red-m" "llvm.vector.reduce.fminimum") "reduce-fmax" (IntrinInfo "red-m" "llvm.vector.reduce.fmaximum")
+   "reduce-fminnum" (IntrinInfo "red-m" "llvm.vector.reduce.fmin") "reduce-fmaxnum" (IntrinInfo "red-m" "llvm.vector.reduce.fmax")
+   "masked-load" (IntrinInfo "mload" "llvm.masked.load") "masked-store" (IntrinInfo "mstore" "llvm.masked.store")
+   "gather" (IntrinInfo "gather" "llvm.masked.gather") "scatter" (IntrinInfo "scatter" "llvm.masked.scatter")})
+
+(defun intrin-info (name: str) -> (Option IntrinInfo) (get intrin-table name))
+
+(defun intrin-class (name: str) -> str
+  (match (get intrin-table name) ((some i) (. i class)) (nil "")))
+
+(defun intrin-llvm (name: str) -> str
+  (match (get intrin-table name) ((some i) (. i llvm)) (nil "")))
+
+;; How many value operands the form takes (not counting its leading type, flags or alignment).
+(defun intrin-arity (name: str) -> i64
+  (let ((c (intrin-class name)))
+    (cond (or (= c "f1") (= c "i1") (= c "red-i") (= c "red-m")) 1
+          (or (= c "f2") (= c "i2") (= c "fbin") (= c "red-f")) 2
+          :else 3)))
+
+;; Whether the form takes fast-math flags (spec/lir.md 6.1).
+(defun intrin-flags? (name: str) -> bool
+  (let ((c (intrin-class name)))
+    (or (= c "fbin") (= c "red-f") (= name "fma"))))
+
+;; Whether the form starts with a type operand.
+(defun intrin-typed? (name: str) -> bool
+  (or (= name "masked-load") (= name "gather")))
+
+;; Whether the form may end in `(align N)`.
+(defun intrin-aligned? (name: str) -> bool
+  (let ((c (intrin-class name)))
+    (or (= c "mload") (= c "mstore") (= c "gather") (= c "scatter"))))

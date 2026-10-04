@@ -28,8 +28,83 @@
              (= head "declare-global") (declare-global rest pos)
              (= head "declare") (declare rest pos)
              (= head "define") (define rest pos)
+             (= head "target") (target-form rest pos)
              :else (err pos (str top-text ", found " (sexp-describe form))))))
     (_ (err (sexp-pos form) (str top-text ", found " (sexp-describe form))))))
+
+;; `(target (cpu "NAME") (features "+a,-b"))` (spec/lir.md 4.5; no Rust counterpart).
+(defstruct TargetAcc (cpu: (Option str) features: (Option str)))
+
+(defun name-byte? :private (b: i64) -> bool
+  (or (and (>= b 97) (<= b 122)) (and (>= b 65) (<= b 90)) (and (>= b 48) (<= b 57)) (= b 46) (= b 95) (= b 45)))
+
+(defun name-bytes? :private (bs: (Array i8) from: i64 to: i64) -> bool
+  (loop ((i from))
+    (cond (>= i to) true
+          (name-byte? (zext i64 (array-get bs i))) (recur (+ i 1))
+          :else false)))
+
+;; One feature `+name` or `-name`, bytes [from, to) of `bs`.
+(defun feature-ok? :private (bs: (Array i8) from: i64 to: i64) -> bool
+  (and (> (- to from) 1)
+       (let ((c (zext i64 (array-get bs from)))) (or (= c 43) (= c 45)))
+       (name-bytes? bs (+ from 1) to)))
+
+;; The first feature of the comma-separated list that is not `+name` or `-name`, as text; nil when all are. The empty list is fine.
+(defun bad-feature :private (bs: (Array i8)) -> (Option str)
+  (let ((n (array-len bs)))
+    (if (= n 0)
+        nil
+        (loop ((i 0) (from 0))
+          (cond (> i n) nil
+                (or (= i n) (= (zext i64 (array-get bs i)) 44))
+                (if (feature-ok? bs from i)
+                    (recur (+ i 1) (+ i 1))
+                    (some (str-from-bytes (array-slice bs from i))))
+                :else (recur (+ i 1) from))))))
+
+(defun array-slice :private (bs: (Array i8) from: i64 to: i64) -> (Array i8)
+  (let ((out (cell (array (- to from) (trunc i8 0)))))
+    (do (loop ((i from)) (if (< i to) (do (array-set! &out (- i from) (array-get bs i)) (recur (+ i 1))) ()))
+        @out)))
+
+(defun target-field :private (acc: TargetAcc f: Sexp) -> (Result TargetAcc Diagnostic)
+  (match f
+    ((SxList items p)
+     (let ((key (if (> (count items) 0) (atom-or-empty (nth items 0)) "")))
+       (cond (and (= (count items) 2) (= key "cpu")) (target-cpu acc (nth items 1) p)
+             (and (= (count items) 2) (= key "features")) (target-features acc (nth items 1) p)
+             (or (= key "cpu") (= key "features")) (err p (str "target: " key " expects one string"))
+             (= key "") (err p "target: expected (cpu \"NAME\") or (features \"LIST\")")
+             :else (err p (str "target: unknown field " key)))))
+    (other (err (sexp-pos other) (str "target: expected (cpu \"NAME\") or (features \"LIST\"), found " (sexp-describe other))))))
+
+(defun target-cpu :private (acc: TargetAcc v: Sexp p: i64) -> (Result TargetAcc Diagnostic)
+  (cond (some? (. acc cpu)) (err p "target: duplicate cpu")
+        :else (match v
+                ((SxStr bs _) (if (and (> (array-len bs) 0) (name-bytes? bs 0 (array-len bs)))
+                                  (Ok (with acc (cpu (some (str-from-bytes bs)))))
+                                  (err (sexp-pos v) "target: cpu must be a non-empty string of letters, digits, ., _ and -")))
+                (_ (err (sexp-pos v) "target: cpu must be a non-empty string of letters, digits, ., _ and -")))))
+
+(defun target-features :private (acc: TargetAcc v: Sexp p: i64) -> (Result TargetAcc Diagnostic)
+  (cond (some? (. acc features)) (err p "target: duplicate features")
+        :else (match v
+                ((SxStr bs _)
+                 (match (bad-feature bs)
+                   ((some w) (err (sexp-pos v) (str "target: each feature must be +name or -name, found \"" w "\"")))
+                   (nil (Ok (with acc (features (some (str-from-bytes bs))))))))
+                (_ (err (sexp-pos v) "target: features must be a string")))))
+
+(defun target-form :private (rest: (Vec Sexp) pos: i64) -> (Result LItem Diagnostic)
+  (loop ((i 0) (acc (TargetAcc nil nil)))
+    (if (>= i (count rest))
+        (match (. acc cpu)
+          (nil (err pos "target needs (cpu \"NAME\")"))
+          ((some c) (Ok (ItTarget (LTarget c (unwrap-or (. acc features) "") pos)))))
+        (match (target-field acc (nth rest i))
+          ((Err d) (Err d))
+          ((Ok a) (recur (+ i 1) a))))))
 
 (defun global-name :private (s: Sexp) -> (Result str Diagnostic)
   (try-let ((a (atom-text s "a name"))) (valid-name a (sexp-pos s))))

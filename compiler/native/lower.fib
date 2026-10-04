@@ -24,15 +24,17 @@
                       ((Ok _) (Ok owned)))))))))
 
 (defun module-items :private (lx: Lx m: LModule) -> (Result unit LairError)
-  (let ((items (. m items)))
+  (let ((items (. m items))
+        (tgt (module-target m)))
     (do (declare-structs lx items)
         (dotimes (i (count items))
           (match (nth items i)
-            ((ItDeclare d) (add-function lx (. d name) (. d ty) (hidden-mods (. d hidden))))
-            ((ItDefine f) (add-function lx (. f name) (. f ty) (. f mods)))
+            ((ItDeclare d) (add-function lx (. d name) (. d ty) (hidden-mods (. d hidden)) nil))
+            ((ItDefine f) (add-function lx (. f name) (. f ty) (. f mods) tgt))
             ((ItGlobal g) (add-global lx (. g name) (. g ty) (. g mods)))
             ((ItDeclareGlobal g) (add-global lx (. g name) (. g ty) (hidden-mods (. g hidden))))
-            ((ItStruct _) ())))
+            ((ItStruct _) ())
+            ((ItTarget _) ())))
         (match (init-globals lx items)
           ((Err x) (Err x))
           ((Ok _) (lower-bodies lx items))))))
@@ -87,12 +89,26 @@
     ((some v) v)
     (nil (trap (str "unknown struct " name)))))
 
-(defun add-function :private (lx: Lx name: str ty: LFnType mods: LModifiers) -> unit
+(defun add-function :private (lx: Lx name: str ty: LFnType mods: LModifiers tgt: (Option LTarget)) -> unit
   (let ((f (core/add-function (. lx module) name (lx-fn-ty lx ty))))
     (do (unsafe (core/LLVMSetFunctionCallConv f (trunc i32 (cc-number (. ty cc)))))
         (set-modifiers f mods)
+        (if-some [t tgt] (target-attributes lx f t) ())
         (if (slow-path? name) (add-noinline lx f) ())
         (let ((fns (. lx funcs))) (update! fns (fn (m) (assoc m name (FuncEntry f ty))))))))
+
+;; The string attribute `key` = `value` on the definition `f`.
+(defun add-string-attribute :private (lx: Lx f: i64 key: str value: str) -> unit
+  (let ((k (ffi/bytes-new key)) (v (ffi/bytes-new value)))
+    (unsafe
+      (let ((attr (core/LLVMCreateStringAttribute (. lx ctx) k (trunc i32 (str-len key)) v (trunc i32 (str-len value)))))
+        (do (core/LLVMAddAttributeAtIndex f -1i32 attr)
+            (free k) (free v))))))
+
+;; `"target-cpu"` and `"target-features"` on a function of a module with a `target` form (spec/lir.md 4.5).
+(defun target-attributes :private (lx: Lx f: i64 t: LTarget) -> unit
+  (do (add-string-attribute lx f "target-cpu" (. t cpu))
+      (add-string-attribute lx f "target-features" (. t features))))
 
 ;; The function attribute `noinline` on `f`.
 (defun add-noinline :private (lx: Lx f: i64) -> unit

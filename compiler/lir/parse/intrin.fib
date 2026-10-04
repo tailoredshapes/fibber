@@ -1,0 +1,73 @@
+;; compiler/lir/parse/intrin.fib: the intrinsic forms (spec/lir.md 6.1, 6.4, 6.5; lir.intrin has the table), and the fast-math flags of the
+;; float operations. The Rust parser has none of these. OWNER: package P0 (SIMD wave 2).
+
+(ns lir.parse.intrin
+  (:use lir.diag lir.types lir.ast lir.sexp lir.intrin lir.parse.names lir.parse.ty lir.parse.memory))
+
+(def flag-capable: (Set str) #{"fadd" "fsub" "fmul" "fdiv" "frem"})
+
+;; The form for an intrinsic word, nil for another head. A `fadd`-like word with its own two operands is the plain instruction (nil): only
+;; the extra leading words make it flagged.
+(defun parse-intrin (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Option (Result LExpr Diagnostic))
+  (match (intrin-info name)
+    (nil nil)
+    ((some _)
+     (if (and (contains? flag-capable name) (<= (count args) 2))
+         nil
+         (some (intrin-form sub name args pos))))))
+
+;; The trailing `(align N)` of the forms that take one: the alignment and the operands before it.
+(defstruct IntrinTail (align: (Option i64) rest: (Vec Sexp)))
+
+(defun split-align :private (name: str args: (Vec Sexp)) -> (Result IntrinTail Diagnostic)
+  (if (and (intrin-aligned? name) (> (count args) 0))
+      (let ((last (nth args (- (count args) 1))))
+        (match last
+          ((SxList items _)
+           (if (and (> (count items) 0) (atom-is? (nth items 0) "align"))
+               (try-let ((al (align-option [last])))
+                 (Ok (IntrinTail (. al align) (vec-take args (- (count args) 1)))))
+               (Ok (IntrinTail nil args))))
+          (_ (Ok (IntrinTail nil args)))))
+      (Ok (IntrinTail nil args))))
+
+(defun vec-take :private (v: (Vec Sexp) n: i64) -> (Vec Sexp)
+  (loop ((i 0) (out []))
+    (if (>= i n) out (recur (+ i 1) (conj out (nth v i))))))
+
+(defun intrin-form :private (sub: ExprParser name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((tl (split-align name args)))
+    (let ((rest (. tl rest))
+          (typed (intrin-typed? name))
+          (want (+ (intrin-arity name) (if (intrin-typed? name) 1 0)))
+          (nflags (if (intrin-flags? name) (- (count (. tl rest)) (+ (intrin-arity name) (if (intrin-typed? name) 1 0))) 0)))
+      (cond (< nflags 0) (err pos (arity-text name want (count rest)))
+            (and (= nflags 0) (not (= (count rest) want))) (err pos (arity-text name want (count rest)))
+            (and (> nflags 0) (not (intrin-flags? name))) (err pos (arity-text name want (count rest)))
+            :else (intrin-parts sub name rest pos nflags typed (. tl align))))))
+
+(defun arity-text :private (name: str want: i64 found: i64) -> str
+  (str name " expects " want " operand" (if (= want 1) "" "s") ", found " found))
+
+(defun intrin-parts :private (sub: ExprParser name: str rest: (Vec Sexp) pos: i64 nflags: i64 typed: bool align: (Option i64)) -> (Result LExpr Diagnostic)
+  (try-let ((flags (parse-flags rest nflags))
+            (ty (if typed (try-let ((t (parse-type (nth rest nflags)))) (Ok (some t))) (Ok nil)))
+            (ops (operands sub (vec-from rest (+ nflags (if typed 1 0))))))
+    (Ok (expr-new (KIntrin name flags ty ops align) pos))))
+
+;; The fast-math flags written as the first `n` words of `args`.
+(defun parse-flags :private (args: (Vec Sexp) n: i64) -> (Result i64 Diagnostic)
+  (loop ((i 0) (acc 0))
+    (if (>= i n)
+        (Ok acc)
+        (let ((s (nth args i)))
+          (match s
+            ((SxAtom w p)
+             (match (fm-flag w)
+               ((some bit) (if (= (bit-and acc bit) 0)
+                               (recur (+ i 1) (bit-or acc bit))
+                               (err p (str "duplicate fast-math flag " w))))
+               (nil (if (or (= w "nnan") (= w "ninf") (= w "fast"))
+                        (err p (str "fast-math flag " w " is not in lIR: a value that violates it is poison"))
+                        (err p (str "unknown fast-math flag " w))))))
+            (_ (err (sexp-pos s) (str "expected a fast-math flag, found " (sexp-describe s)))))))))

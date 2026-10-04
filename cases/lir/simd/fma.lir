@@ -1,0 +1,50 @@
+;; expect: accept
+;; stage: 2
+;; ir: call <4 x double> @llvm.fma.v4f64
+;; ir: call contract <4 x double> @llvm.fma.v4f64
+;; ir: call <4 x double> @llvm.fmuladd.v4f64
+;; ir: call <4 x float> @llvm.fma.v4f32
+;; ir: call double @llvm.fma.f64
+;; out: fma 5.5511151231257827e-17 2 13 0
+;; out: fma-lanes 5.5511151231257827e-17 2 13 0
+;; out: fma-contract 5.5511151231257827e-17 2 13 0
+;; out: fma-contract-lanes 5.5511151231257827e-17 2 13 0
+;; out: fmuladd 7 2.75 0 -2
+;; out: fmuladd-lanes 7 2.75 0 -2
+;; out: fma-f32 3.5 2 -11 0
+;; out: fma-f32-lanes 3.5 2 -11 0
+;; every vector result equals the same instruction on each lane; lane 0 of fma shows the single rounding: 0.1*10-1 is 2^-54, not 0
+
+(declare printf i32 (ptr ...))
+(define (opq_4xdouble <4 x double>) ((<4 x double> v))
+  (block entry
+    (let ((s (alloca <4 x double>)))
+      (store volatile v s)
+      (ret (load volatile <4 x double> s)))))
+(define (p_4xdouble void) ((ptr tag) (<4 x double> v))
+  (block entry
+    (let ((dv v) (fv (select (fcmp uno dv dv) (<4 x double> -999.0 -999.0 -999.0 -999.0) dv)))
+      (call @printf (string "%s %.17g %.17g %.17g %.17g\n") tag (extractelement fv (i32 0)) (extractelement fv (i32 1)) (extractelement fv (i32 2)) (extractelement fv (i32 3)))
+      (ret))))
+(define (opq_4xfloat <4 x float>) ((<4 x float> v))
+  (block entry
+    (let ((s (alloca <4 x float>)))
+      (store volatile v s)
+      (ret (load volatile <4 x float> s)))))
+(define (p_4xfloat void) ((ptr tag) (<4 x float> v))
+  (block entry
+    (let ((dv (fpext <4 x double> v)) (fv (select (fcmp uno dv dv) (<4 x double> -999.0 -999.0 -999.0 -999.0) dv)))
+      (call @printf (string "%s %.17g %.17g %.17g %.17g\n") tag (extractelement fv (i32 0)) (extractelement fv (i32 1)) (extractelement fv (i32 2)) (extractelement fv (i32 3)))
+      (ret))))
+(define (main i32) ()
+  (block entry
+    (let ()
+      (call @p_4xdouble (string "fma") (fma (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0))))
+      (call @p_4xdouble (string "fma-lanes") (insertelement (insertelement (insertelement (insertelement (zeroinitializer <4 x double>) (fma (extractelement (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (i32 0)) (extractelement (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (i32 0)) (extractelement (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0)) (i32 0))) (i32 0)) (fma (extractelement (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (i32 1)) (extractelement (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (i32 1)) (extractelement (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0)) (i32 1))) (i32 1)) (fma (extractelement (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (i32 2)) (extractelement (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (i32 2)) (extractelement (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0)) (i32 2))) (i32 2)) (fma (extractelement (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (i32 3)) (extractelement (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (i32 3)) (extractelement (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0)) (i32 3))) (i32 3)))
+      (call @p_4xdouble (string "fma-contract") (fma contract (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0))))
+      (call @p_4xdouble (string "fma-contract-lanes") (insertelement (insertelement (insertelement (insertelement (zeroinitializer <4 x double>) (fma contract (extractelement (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (i32 0)) (extractelement (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (i32 0)) (extractelement (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0)) (i32 0))) (i32 0)) (fma contract (extractelement (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (i32 1)) (extractelement (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (i32 1)) (extractelement (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0)) (i32 1))) (i32 1)) (fma contract (extractelement (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (i32 2)) (extractelement (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (i32 2)) (extractelement (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0)) (i32 2))) (i32 2)) (fma contract (extractelement (call @opq_4xdouble (<4 x double> 0.1 2.0 3.0 -4.0)) (i32 3)) (extractelement (call @opq_4xdouble (<4 x double> 10.0 0.5 4.0 0.25)) (i32 3)) (extractelement (call @opq_4xdouble (<4 x double> -1.0 1.0 1.0 1.0)) (i32 3))) (i32 3)))
+      (call @p_4xdouble (string "fmuladd") (fmuladd (call @opq_4xdouble (<4 x double> 2.0 3.0 0.5 -4.0)) (call @opq_4xdouble (<4 x double> 3.0 0.25 8.0 0.5)) (call @opq_4xdouble (<4 x double> 1.0 2.0 -4.0 0.0))))
+      (call @p_4xdouble (string "fmuladd-lanes") (insertelement (insertelement (insertelement (insertelement (zeroinitializer <4 x double>) (fmuladd (extractelement (call @opq_4xdouble (<4 x double> 2.0 3.0 0.5 -4.0)) (i32 0)) (extractelement (call @opq_4xdouble (<4 x double> 3.0 0.25 8.0 0.5)) (i32 0)) (extractelement (call @opq_4xdouble (<4 x double> 1.0 2.0 -4.0 0.0)) (i32 0))) (i32 0)) (fmuladd (extractelement (call @opq_4xdouble (<4 x double> 2.0 3.0 0.5 -4.0)) (i32 1)) (extractelement (call @opq_4xdouble (<4 x double> 3.0 0.25 8.0 0.5)) (i32 1)) (extractelement (call @opq_4xdouble (<4 x double> 1.0 2.0 -4.0 0.0)) (i32 1))) (i32 1)) (fmuladd (extractelement (call @opq_4xdouble (<4 x double> 2.0 3.0 0.5 -4.0)) (i32 2)) (extractelement (call @opq_4xdouble (<4 x double> 3.0 0.25 8.0 0.5)) (i32 2)) (extractelement (call @opq_4xdouble (<4 x double> 1.0 2.0 -4.0 0.0)) (i32 2))) (i32 2)) (fmuladd (extractelement (call @opq_4xdouble (<4 x double> 2.0 3.0 0.5 -4.0)) (i32 3)) (extractelement (call @opq_4xdouble (<4 x double> 3.0 0.25 8.0 0.5)) (i32 3)) (extractelement (call @opq_4xdouble (<4 x double> 1.0 2.0 -4.0 0.0)) (i32 3))) (i32 3)))
+      (call @p_4xfloat (string "fma-f32") (fma (call @opq_4xfloat (<4 x float> 1.5 2.0 -3.0 0.125)) (call @opq_4xfloat (<4 x float> 2.0 0.5 4.0 8.0)) (call @opq_4xfloat (<4 x float> 0.5 1.0 1.0 -1.0))))
+      (call @p_4xfloat (string "fma-f32-lanes") (insertelement (insertelement (insertelement (insertelement (zeroinitializer <4 x float>) (fma (extractelement (call @opq_4xfloat (<4 x float> 1.5 2.0 -3.0 0.125)) (i32 0)) (extractelement (call @opq_4xfloat (<4 x float> 2.0 0.5 4.0 8.0)) (i32 0)) (extractelement (call @opq_4xfloat (<4 x float> 0.5 1.0 1.0 -1.0)) (i32 0))) (i32 0)) (fma (extractelement (call @opq_4xfloat (<4 x float> 1.5 2.0 -3.0 0.125)) (i32 1)) (extractelement (call @opq_4xfloat (<4 x float> 2.0 0.5 4.0 8.0)) (i32 1)) (extractelement (call @opq_4xfloat (<4 x float> 0.5 1.0 1.0 -1.0)) (i32 1))) (i32 1)) (fma (extractelement (call @opq_4xfloat (<4 x float> 1.5 2.0 -3.0 0.125)) (i32 2)) (extractelement (call @opq_4xfloat (<4 x float> 2.0 0.5 4.0 8.0)) (i32 2)) (extractelement (call @opq_4xfloat (<4 x float> 0.5 1.0 1.0 -1.0)) (i32 2))) (i32 2)) (fma (extractelement (call @opq_4xfloat (<4 x float> 1.5 2.0 -3.0 0.125)) (i32 3)) (extractelement (call @opq_4xfloat (<4 x float> 2.0 0.5 4.0 8.0)) (i32 3)) (extractelement (call @opq_4xfloat (<4 x float> 0.5 1.0 1.0 -1.0)) (i32 3))) (i32 3)))
+      (ret (i32 0)))))

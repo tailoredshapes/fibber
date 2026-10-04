@@ -4,7 +4,7 @@
 ;; idempotent), because there is no global state to remember it in. The work is llvm.target's; this module is the lair-shaped face of it.
 
 (ns native.target
-  (:use native.error)
+  (:use lir.diag lir.ast native.error)
   (:require [llvm.target :as lt]))
 
 
@@ -19,6 +19,14 @@
   (match (lt/host-machine opt)
     ((Err m) (Err (ErrBackend m)))
     ((Ok m) (Ok (Machine (. m tm) (. m triple) (. m layout))))))
+
+;; Whether the host can run code for the module's `target` form: `target: the host does not support +avx512f` for the first feature it lacks.
+(defun target-runnable (m: LModule) -> (Result unit LairError)
+  (match (module-target m)
+    (nil (Ok ()))
+    ((some t) (match (lt/host-lacks (. t features))
+                ((some f) (Err (ErrInvalid [(diag-new (. t pos) (str "target: the host does not support " f))])))
+                (nil (Ok ()))))))
 
 ;; (target.rs `Drop`)
 (defun machine-dispose (m: Machine) -> unit

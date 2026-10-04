@@ -9,6 +9,13 @@ from=${1:-0}; to=${2:-199}; count=${3:-25}; dir=${4:-cases/lir}
 : "${LAIR:?set LAIR to the Rust lair}" "${LAIRF:?set LAIRF to lairf}"
 work=${TMPDIR:-/tmp}/f-compare-$$
 mkdir -p "$work"
+# the seeds: the cases of DIR the Rust lair can read (the ones that say `;; stage: 2` use forms only the fibber lair has: spec/lir.md 13)
+seeds=$work/seeds; mkdir -p "$seeds"
+for f in $(find "$dir" -name '*.lir' | sort); do
+  grep -q '^;; stage: *2' "$f" && continue
+  rel=${f#"$dir"/}; mkdir -p "$seeds/$(dirname "$rel")"; cp "$f" "$seeds/$rel"
+done
+dir=$seeds
 same=0; diff=0; flaky=0
 for s in $(seq "$from" "$to"); do
   for t in rust fib; do

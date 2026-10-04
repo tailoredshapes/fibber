@@ -1,0 +1,44 @@
+;; expect: accept
+;; stage: 2
+;; ir: getelementptr double, ptr
+;; ir: <4 x ptr>
+;; ir: ptrtoint <4 x ptr>
+;; ir: inttoptr <4 x i64>
+;; out: offsets 0 8 16 24
+;; out: offsets-i32 12 4 0 8
+;; out: roundtrip 1 1 1 1
+;; out: deref 2.5 1.5 0.5 -0.5
+;; A getelementptr with a vector index gives a vector of pointers, lane i being the base plus index i elements; ptrtoint and inttoptr work on
+;; vectors, lane by lane. The offsets are the byte distances from the base, and a round trip through integers is the identity.
+(declare printf i32 (ptr ...))
+(define (opq <4 x i64>) ((<4 x i64> x))
+  (block entry (let ((s (alloca <4 x i64>))) (store volatile x s) (ret (load volatile <4 x i64> s)))))
+(define (splat <4 x i64>) ((i64 x))
+  (block entry
+    (ret (shufflevector (insertelement (zeroinitializer <4 x i64>) x (i32 0)) (zeroinitializer <4 x i64>) (<4 x i32> 0 0 0 0)))))
+(define (pr4 void) ((ptr tag) (<4 x i64> v))
+  (block entry
+    (call @printf (string "%s %ld %ld %ld %ld\n") tag (extractelement v (i32 0)) (extractelement v (i32 1)) (extractelement v (i32 2)) (extractelement v (i32 3)))
+    (ret)))
+(define (main i32) ()
+  (block entry
+    (let ((buf (alloca (align 32) [4 x double])))
+      (let ((p (getelementptr [4 x double] buf (i64 0) (i64 0)))
+            (p32 (getelementptr [4 x double] buf (i64 0) (i64 0))))
+        (store (align 32) (<4 x double> 2.5 1.5 0.5 -0.5) p)
+        (let ((ptrs (getelementptr double p (call @opq (<4 x i64> 0 1 2 3))))
+              (base (ptrtoint i64 p)))
+          (call @pr4 (string "offsets") (sub (ptrtoint <4 x i64> ptrs) (call @splat base)))
+          (let ((ptrs32 (getelementptr i32 p (call @opq (<4 x i64> 3 1 0 2)))))
+            (call @pr4 (string "offsets-i32") (sub (ptrtoint <4 x i64> ptrs32) (call @splat base))))
+          (let ((addrs (ptrtoint <4 x i64> ptrs))
+                (back (ptrtoint <4 x i64> (inttoptr <4 x ptr> (ptrtoint <4 x i64> ptrs)))))
+            (call @printf (string "roundtrip %d %d %d %d\n")
+              (zext i32 (icmp eq (extractelement back (i32 0)) (extractelement addrs (i32 0))))
+              (zext i32 (icmp eq (extractelement back (i32 1)) (extractelement addrs (i32 1))))
+              (zext i32 (icmp eq (extractelement back (i32 2)) (extractelement addrs (i32 2))))
+              (zext i32 (icmp eq (extractelement back (i32 3)) (extractelement addrs (i32 3))))))
+          (call @printf (string "deref %.17g %.17g %.17g %.17g\n")
+            (load double (extractelement ptrs (i32 0))) (load double (extractelement ptrs (i32 1)))
+            (load double (extractelement ptrs (i32 2))) (load double (extractelement ptrs (i32 3))))
+          (ret (i32 0)))))))

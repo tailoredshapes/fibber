@@ -1,0 +1,19 @@
+;; expect: accept
+;; stage: 2
+;; signal: SIGSEGV
+;; The control of masked-guard.lir: the same vector with every lane on reads the PROT_NONE page and the process is killed by SIGSEGV. Without
+;; this case the guard page of masked-guard.lir could be doing nothing.
+(declare printf i32 (ptr ...))
+(declare mmap ptr (ptr i64 i32 i32 i32 i64))
+(declare mprotect i32 (ptr i64 i32))
+(define (opq <4 x i1>) ((<4 x i1> m))
+  (block entry (let ((s (alloca <4 x i1>))) (store volatile m s) (ret (load volatile <4 x i1> s)))))
+(define (main i32) ()
+  (block entry
+    (let ((base (call @mmap (ptr null) (i64 8192) (i32 3) (i32 34) (i32 -1) (i64 0)))
+          (guard (getelementptr i8 base (i64 4096)))
+          (v (getelementptr i8 base (i64 4080))))
+      (let ((r (call @mprotect guard (i64 4096) (i32 0))))
+        (let ((l (masked-load <4 x double> v (call @opq (<4 x i1> 1 1 1 1)) (<4 x double> -1.0 -1.0 -1.0 -1.0) (align 8))))
+          (call @printf (string "unreachable %.17g\n") (extractelement l (i32 3))))
+        (ret (i32 0))))))

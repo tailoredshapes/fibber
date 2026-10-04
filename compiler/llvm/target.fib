@@ -116,6 +116,27 @@
            (let ((tm (create-machine target triple (requested-cpu) opt)))
              (Ok (Machine tm (core/take-message triple) (layout-of tm)))))))))
 
+;; The first feature `+name` of the comma-separated list `features` that the host's CPU lacks, nil when it has them all (`-name` is always
+;; fine). The host's own list is LLVM's `LLVMGetHostCPUFeatures`.
+(defun host-lacks (features: str) -> (Option str)
+  (let ((have (host-feature-set)))
+    (loop ((rest (split-commas features)))
+      (cond (empty? rest) nil
+            (and (starts-with? (nth rest 0) "+") (not (contains? have (nth rest 0)))) (some (nth rest 0))
+            :else (recur (vec (drop 1 rest)))))))
+
+(defun host-feature-set :private () -> (Set str)
+  (do (init)
+      (let ((s (core/take-message (unsafe (LLVMGetHostCPUFeatures)))))
+        (into #{} (split-commas s)))))
+
+(defun split-commas :private (s: str) -> (Vec str)
+  (let ((n (str-len s)))
+    (loop ((i 0) (from 0) (out []))
+      (cond (>= i n) (if (> i from) (conj out (str-slice s from i)) out)
+            (= (str-byte-at s i) 44i8) (recur (+ i 1) (+ i 1) (if (> i from) (conj out (str-slice s from i)) out))
+            :else (recur (+ i 1) from out)))))
+
 (defun machine-free (m: Machine) -> unit
   (unsafe (LLVMDisposeTargetMachine (. m tm))))
 

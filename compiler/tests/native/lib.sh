@@ -29,6 +29,17 @@ units() {
   done
 }
 
+# skip_stage2: drop the units that are a .lir file (or FILE@N) whose header says `;; stage: 2`: the Rust lair, the oracle of these scripts, does not
+# have the instructions of spec/lir.md 4.5 and 6 added by SIMD wave 2, so there is nothing to compare them with; the cases harness (`lairf cases`) runs them.
+skip_stage2() {
+  local u f
+  while IFS= read -r u; do
+    f=${u%@*}
+    if [ -f "$f" ] && grep -q '^;; stage: *2' "$f"; then continue; fi
+    echo "$u"
+  done
+}
+
 judge() {
   local u=$1 n=$2 r=$T/$n
   rust_run "$u" "$r.a"; rust_run "$u" "$r.b"
@@ -60,7 +71,7 @@ compare_main() {
   [ -x "$LAIR" ] || { echo "$NAME: the Rust lair is not at $LAIR (set LAIR; cargo build -p lair)" >&2; return 2; }
   export FIB_TARGET_CPU=${FIB_TARGET_CPU:-x86-64-v2}
   FIBER=no; [ -n "${LAIRF:-}" ] && [ -x "$LAIRF" ] && FIBER=yes
-  local list; list=$(units "$@")
+  local list; list=$(units "$@" | skip_stage2)
   [ -n "$list" ] || { echo "$NAME: nothing to compare (give files or directories of .lir)" >&2; return 2; }
   T=$(mktemp -d "${TMPDIR:-$HOME/.cache/fibber-scratch}/$NAME.XXXXXX")
   export T FIBER
