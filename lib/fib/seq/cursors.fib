@@ -56,7 +56,7 @@
 ;;    which was not run: there is none on this machine): `(zip [] s)` realises the first node of `s`. They end with the
 ;;    shorter operand. `interleave` gives the elements of a pair together or not at all: with `[1 2 3]` and `[10 20]` it is
 ;;    `(1 10 2 20)`. It has two operands; the variadic form is L2 (T3).
-;;  - `zip-with` is the three-argument `map` until Y11 deletes it (spec §3 N4); `f` is stored in the nodes, so it is owned.
+;;  - the three-argument `map` (Clojure's `(map f c1 c2)`, in fib.seq.adaptors) is `zip` with a function: the same lazy walk of two seqs.
 ;;  - `zipmap` walks the keys with each-while and the values by cursor and stops at the shorter; a key twice keeps the later
 ;;    value (assoc replaces), and the Map is `map-empty` of the prelude, so its shape follows the prelude's (P1 makes it the
 ;;    small insertion-ordered one). The values are Cursable, as the row says; a `Map`, a `Set` or an `Option` needs an impl.
@@ -310,15 +310,6 @@
                         ((LNil) LNil)
                         ((LCons y tb) (LCons (Pair x y) (lzip ta tb))))))))))
 
-(defun lzip-with :private (f: (fn (x y) r) a: (LSeq x) b: (LSeq y)) -> (LSeq r)
-  (lazy-node (fn ()
-    (let ((na (lnode a)) (nb (lnode b)))
-      (match na
-        ((LNil) LNil)
-        ((LCons x ta) (match nb
-                        ((LNil) LNil)
-                        ((LCons y tb) (LCons (f x y) (lzip-with f ta tb))))))))))
-
 ;; the pair of nodes x, y is made together: the node of y is ready, and the rest is lazy
 (defun linterleave :private (a: (LSeq e) b: (LSeq e)) -> (LSeq e)
   (lazy-node (fn ()
@@ -331,11 +322,6 @@
 
 (defun zip (a: c1 b: c2) :where ((Reducible c1 x) (Reducible c2 y)) -> (LSeq (Pair x y))
   (lzip (to-lseq a) (to-lseq b)))
-
-;; the 3-arity of map. It stays a function of its own (Y11): `map` is a stage of the Rust fusion tables (expand/fuse/tables.rs),
-;; which would not know the clause names `map$2` and `map$3` that the expander's pick gives it
-(defun zip-with (f: (fn (x y) r) a: c1 b: c2) :where ((Reducible c1 x) (Reducible c2 y)) -> (LSeq r)
-  (lzip-with f (to-lseq a) (to-lseq b)))
 
 (defun interleave (a: c1 b: c2) :where ((Reducible c1 e) (Reducible c2 e)) -> (LSeq e)
   (linterleave (to-lseq a) (to-lseq b)))

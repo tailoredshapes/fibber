@@ -1,0 +1,57 @@
+;; spec:   stdlib §4.4 rows map, sort, sort-by (the overloads by arity, L1; Y11b), §3 N4
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: map sort sort-by
+;; The clauses are `map$2 map$3`, `sort$1 sort$2` and `sort-by$2 sort-by$3`, picked by the argument count. `(map f c1 c2)` stops at the
+;; shorter collection in either order, takes lazy and fused chains as its operands, is lazy, and a local named `map` shadows it; a bare
+;; `map` as a value is its smallest clause (the two-argument one). `(sort cmp c)` and `(sort-by key cmp c)` agree with the same sort
+;; over a bound seq (the Rust fusion tables know the one-argument `sort` and the two-argument `sort-by`, so the longer clauses see a chain as
+;; the seq it is bound to), and keep their elements when the comparator ties.
+(ns main (:use fib.core fib.seq tl.check))
+
+(defun same (a: (Vec e) b: (Vec e)) :where ((Eq e)) -> bool
+  (if (= (vec-count a) (vec-count b))
+      (loop ((i 0))
+        (if (< i (vec-count a))
+            (if (= (vec-nth a i) (vec-nth b i)) (recur (+ i 1)) false)
+            true))
+      false))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (calls (cell 0))
+        (xs [1 2 3 4 5 6])
+        (ys [10 20 30]))
+    (do (check c (same (to-vec (map + xs ys)) [11 22 33]))
+        (check c (same (to-vec (map + ys xs)) [11 22 33]))
+        (check c (same (to-vec (map - ys xs)) [9 18 27]))
+        (check c (same (to-vec (map + [] xs)) []))
+        (check c (same (to-vec (map + xs [])) []))
+        ;; fused and lazy chains as operands
+        (check c (same (to-vec (map + (map inc xs) (filter odd? xs))) [3 6 9]))
+        (check c (same (to-vec (map * (take 3 (iterate inc 1)) (range 10 20))) [10 22 36]))
+        ;; strings and chars
+        (check c (same (to-vec (map (fn (a: str b: str) (str-concat a b)) ["a" "b" "c"] ["x" "y"])) ["ax" "by"]))
+        ;; lazy: nothing runs until a node is demanded, each node once
+        (let ((s (map (fn (a: i64 b: i64) (do (set! calls (+ @calls 1)) (+ a b))) xs ys)))
+          (do (check c (= @calls 0))
+              (check c (= (nth s 1) 22))
+              (check c (= @calls 2))
+              (check c (= (count s) 3))
+              (check c (= (count s) 3))
+              (check c (= @calls 3))))
+        ;; a local shadows, and a bare name is the smallest clause
+        (let ((map (fn (a: i64 b: i64 d: i64) (+ a (+ b d)))))
+          (check c (= (map 1 2 3) 6)))
+        (let ((f map)) (check c (same (to-vec (f inc [1 2])) [2 3])))
+        ;; the sorts
+        (check c (same (to-vec (sort > [3 1 2])) [3 2 1]))
+        (check c (same (to-vec (sort > (map inc (filter odd? xs)))) [6 4 2]))
+        (check c (same (to-vec (sort > (map inc (filter odd? xs)))) (to-vec (sort > (vec (map inc (filter odd? xs)))))))
+        (check c (same (to-vec (sort-by count > ["a" "ccc" "bb" "dd"])) ["ccc" "bb" "dd" "a"]))
+        (check c (same (to-vec (sort-by count < ["a" "ccc" "bb" "dd"])) ["a" "bb" "dd" "ccc"]))
+        (check c (same (to-vec (sort-by (fn (x: i64) (- 0 x)) < (map inc xs))) [7 6 5 4 3 2]))
+        (check c (same (to-vec (sort-by (fn (x: i64) (- 0 x)) (map inc xs))) [7 6 5 4 3 2]))
+        (checks-result c))))

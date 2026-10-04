@@ -79,8 +79,23 @@
            ((LNil) (recur t))
            ((LCons x xs) (LCons x (lconcat xs (lmapcat f t)))))))))))
 
-(defun map (f: (fn (e) b) c: c) :where ((Reducible c e)) -> (LSeq b)
-  (lmap f (to-lseq c)))
+(defun lzip-with :private (f: (fn (x y) r) a: (LSeq x) b: (LSeq y)) -> (LSeq r)
+  (lazy-node (fn ()
+    (let ((na (lnode a)) (nb (lnode b)))
+      (match na
+        ((LNil) LNil)
+        ((LCons x ta) (match nb
+                        ((LNil) LNil)
+                        ((LCons y tb) (LCons (f x y) (lzip-with f ta tb))))))))))
+
+;; (map f c) is the one-collection form; (map f c1 c2) is Clojure's: f sees one element of each and the seq ends with the shorter
+;; collection (map$2, map$3). A node realises the next node of both collections before it looks at either, as `zip` does. The expander
+;; fuses a two-argument call (the Rust tables take a stage of exactly two arguments); the three-argument call stays lazy.
+(defn map
+  ([f: (fn (e) b) c: c] :where ((Reducible c e)) -> (LSeq b)
+    (lmap f (to-lseq c)))
+  ([f: (fn (x y) r) a: c1 b: c2] :where ((Reducible c1 x) (Reducible c2 y)) -> (LSeq r)
+    (lzip-with f (to-lseq a) (to-lseq b))))
 
 (defun filter (p: (fn (e) r) c: c) :where ((Reducible c e) (Truthy r)) -> (LSeq e)
   (lfilter p (to-lseq c)))

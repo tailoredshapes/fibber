@@ -1,5 +1,5 @@
 ;; fib.seq.sort: the materialisers that reorder or regroup (tranche 1 plan §4.2; owner L7).
-;; Exports: sort sort-by sort-with sort-by-with reverse group-by frequencies.
+;; Exports: sort sort-by reverse group-by frequencies.
 ;; Replaces nothing in the prelude (it has no sort); the prototype is `sort-with` of rrevise3/sl/coll.fib.
 ;;
 ;; Rules, each from stdlib.md and decided here where the page is silent:
@@ -102,19 +102,21 @@
                     ()))
               (fib.prelude/vec-from-array @cur))))))
 
-;; (sort-with cmp c): the 2-arity of Clojure's sort, kept as a function of its own because `sort` is a terminal of the Rust fusion tables, which do not know `sort$1` (Y11); the comparator's result is a Cmp
-(defun sort-with (cmp: (fn (e e) r) :borrow c: c) :where ((Reducible c e) (Cmp r)) -> (VSeq e)
-  (vseq-of (sort-vec (fn (a b) (resolve (cmp a b) (fn () (cmp b a)))) (to-vec c))))
+;; (sort c) is the natural order; (sort cmp c) is Clojure's 2-arity, whose comparator's result is a Cmp. Both are clauses of one name
+;; (sort$1, sort$2). The Rust fusion tables know `sort` with one argument only, so a chain under `sort$2` is built as the seq it
+;; is bound to, and `sort$1` still reads a fused chain in place.
+(defn sort
+  ([c: c] :where ((Reducible c e) (Ord e)) -> (VSeq e)
+    (vseq-of (sort-vec-ord (to-vec c))))
+  ([cmp: (fn (e e) r) :borrow c: c] :where ((Reducible c e) (Cmp r)) -> (VSeq e)
+    (vseq-of (sort-vec (fn (a b) (resolve (cmp a b) (fn () (cmp b a)))) (to-vec c)))))
 
-(defun sort (c: c) :where ((Reducible c e) (Ord e)) -> (VSeq e)
-  (vseq-of (sort-vec-ord (to-vec c))))
-
-;; (sort-by-with key cmp c): the 3-arity of Clojure's sort-by until L1; cmp compares two keys
-(defun sort-by-with (key: (fn (e) k) cmp: (fn (k k) r) :borrow c: c) :where ((Reducible c e) (Cmp r)) -> (VSeq e)
-  (vseq-of (sort-vec (fn (a b) (resolve (cmp (key a) (key b)) (fn () (cmp (key b) (key a))))) (to-vec c))))
-
-(defun sort-by (key: (fn (e) k) c: c) :where ((Reducible c e) (Ord k)) -> (VSeq e)
-  (vseq-of (sort-vec (fn (a b) (compare (key a) (key b))) (to-vec c))))
+;; (sort-by key c) compares the keys in their natural order; (sort-by key cmp c) compares two keys with cmp (sort-by$2, sort-by$3)
+(defn sort-by
+  ([key: (fn (e) k) c: c] :where ((Reducible c e) (Ord k)) -> (VSeq e)
+    (vseq-of (sort-vec (fn (a b) (compare (key a) (key b))) (to-vec c))))
+  ([key: (fn (e) k) cmp: (fn (k k) r) :borrow c: c] :where ((Reducible c e) (Cmp r)) -> (VSeq e)
+    (vseq-of (sort-vec (fn (a b) (resolve (cmp (key a) (key b)) (fn () (cmp (key b) (key a))))) (to-vec c)))))
 
 ;; a List of the elements, last first
 (defun reverse (c: c) :where ((Reducible c e)) -> (List e)
