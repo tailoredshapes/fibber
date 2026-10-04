@@ -1,6 +1,7 @@
 # SIMD vectors and `fib.tensor`
 
-Status: design only (nothing here is implemented; no `.rs` or `.fib` source changed). Every statement about the existing
+Status: design, **revised 2026-10-04 with the owner's six decisions** (the box below; each is applied in the section it
+concerns, and section 7 is closed). Nothing here is implemented; no `.rs` or `.fib` source changed. Every statement about the existing
 compiler cites the file it was read in. Every number marked *measured* was produced in this session on the dev machine
 (Intel i7-14700KF, AVX2 and FMA, no AVX-512, one thread, a shared box: **indicative, not final**; the runs that time
 something took `/tmp/fibsuite.lock`). Everything marked **Proposed** is a decision for the owner. Scratch programs are in
@@ -8,8 +9,35 @@ something took `/tmp/fibsuite.lock`). Everything marked **Proposed** is a decisi
 
 The owner's request: "I also want to make sure we're using SIMD where we can; native tensors would be a big win."
 
-Contents: 0 evidence and what exists; 1 relation to the original design; 2 Part 1, SIMD; 3 Part 2, `fib.tensor`;
+Contents: owner decisions; 0 evidence and what exists; 1 relation to the original design; 2 Part 1, SIMD; 3 Part 2, `fib.tensor`;
 4 cases and benchmarks; 5 implementation plan; 6 risks; 7 questions for the owner.
+
+---
+
+## Owner decisions of 2026-10-04 (binding)
+
+1. **Literal spelling.** `<<1.0 2.0 3.0 4.0>>`, the element type a suffix after the closer (`<<0.1 0.2>>f32`), any lane count
+   1 to 64 (up to 512 bits). ADR 016's `<f32<..>>` is **omitted**, not kept as an alternative: it costs a second reader state
+   (its opener `<f32<1.0` is one symbol today and its closer is asymmetric), and the owner accepted the suffix for the
+   reader's sake (2.3).
+2. **Broadcast: literals and `splat` only** (revised the same day; the first answer was "ADR 016's rule", a variable broadcasts
+   when the vector's type is known). A scalar **literal** operand of a vector operator broadcasts and adopts the vector's element
+   type (`(+ 5 <<1 2 3>>)`, `(* 2.0 v)`), extending the rule by which an integer literal in an argument position adopts the
+   numeric type it unifies with (`spec/stdlib.md` L19). A scalar **variable or any other expression** does not: write
+   `(splat x)`. There is no deferred constraint and no inference-order dependence in the checker; `(+ x v)` with a scalar `x` is
+   an error whose text says to use `splat`. Rationale: a simpler checker, no surprises from the order in which inference
+   learns a type, and ADR 016's ergonomics kept for the common case, the literal. A mismatched element type is an error
+   (fibber has no implicit numeric promotion: **ADR 017 stays dropped**; the spec says so, 1 and 2.4).
+3. **Writable views of a unique tensor are worth designing**: a scoped exclusive borrow as a language feature. Package D2
+   wrote it: `docs/design/exclusive-views.md` (3.4 below summarises, 5 lists the package).
+4. **Integer vector arithmetic is checked by default**, like scalar arithmetic; `wrapping` (ADR 015) is the opt-out; `unchecked-*`
+   are provided as `spec/stdlib.md` L10 specifies (2.8).
+5. **Rule 6 (interpreter against compiler) no longer judges new features** (the Rust is frozen). A *fibber interpreter* will be
+   written (package INT0); until it exists each SIMD operation is tested against a **scalar reference written in the case
+   itself** (4.1).
+6. **The other liar ADRs have more material; it is used**: lane operations and horizontal reductions (2.6), `vec-get`/`vec-set`/
+   `vec-shuffle` (2.6), the rationale for dropping ADR 017 (1), the `<[..]>` idea of ADR 018 against fibber's unique in-place
+   update (1), ADR 015's `wrapping` (2.8), and the lIR vector scenarios of `cert/features/vector_types.feature` as test inputs (4.1).
 
 ---
 
@@ -122,10 +150,43 @@ vectors" being in the original design; they were, as a first-class feature.
 |---|---|---|
 | ADR 016 `016-simd-vectors.md` (Accepted) | SIMD "as natural to use as other primitives, not a special optimization"; literal `<<1 2 3 4>>` (v4 i64), `<<1.0 2.0>>` (f64), explicit element type `<i8<1 2 3 4>>`, `<f32<1.0 2.0>>`; the ordinary arithmetic operators work elementwise; scalar broadcast `(+ 5 <<1 2 3>>)`; the programmer writes the element count and "the compiler handles chunking and cleanup" (`(+ 4 <<1 2 3 4 5>>)` on a 4-wide machine is one chunk and a tail); compile-time errors for length mismatch and non-numeric elements; promotion via ADR 017; open questions: power-of-two widths or arbitrary, alignment syntax | Adopted as the premise: SIMD is a **first-class value type with a literal and operator overloading** (2.1 to 2.5). Differences: no promotion (ADR 017 is dropped, `spec/types.md` 1.1), a suffix spelling for the element type (2.3), broadcast by a typing rule that is not a numeric promotion (2.4). The two open questions are answered in 2.12 |
 | ADR 015 `015-numeric-primitives.md` | default overflow is an error; `(wrapping expr)` wraps C/Rust-style; `(boxed expr)` promotes to a bignum | The same two modes exist for vectors; wrapping is the `unchecked-*` family already specified (`spec/stdlib.md:1517-1519`, section 7 L10) plus a `wrapping` scope macro (2.8) |
-| ADR 017 `017-type-promotion.md` | numeric promotion in mixed operations | Dropped by fibber (`spec/types.md` 1.1: "No implicit conversion between any two scalar types"). Not revived |
+| ADR 017 `017-type-promotion.md` | numeric promotion in mixed operations | Dropped by fibber (`spec/types.md` 1.1: "No implicit conversion between any two scalar types"). **Not revived** (owner, 2026-10-04); the rationale follows the table |
 | ADR 018 `018-collections.md` | `<[...]>` and `<{...}>`: "the `<...>` wrapper consistently means give me the fast/raw version" (conventional mutable vector and map) | Dropped by fibber: "the `&` + copy-on-write rule gives in-place updates on unique persistent values instead" (`spec/drafts/inference/syntax.md:565-568`, section "What is deliberately not in the language", from commit 2d7c5c5). The in-place rule is what `fib.tensor` relies on (3.4). The `<<...>>` SIMD literal does not share a prefix with `<[`, so dropping 018 does not touch it |
 | ADR 019, 024 (LIR as universal backend; type-directed arithmetic codegen) | arithmetic is selected by the operand type at code generation | Same shape as the checker's built-in `Num` instances (`spec/types.md` 2.12) which this design extends to vector types |
 | `spec/drafts/inference/syntax.md:565-566` | "No SIMD literals (ADR 016 dropped for the core; can return as a library over lIR vector types)." | Superseded by the owner's later statement (first-class). The line is still right about the layering: **only the type, the literal and the arithmetic are in the language; everything else is the library `fib.simd` over lIR vector instructions** (2.2) |
+
+**Why ADR 017 stays dropped.** ADR 017 promotes along `i8 -> i16 -> i32 -> i64 -> f32 -> f64` for scalars and, lanewise, for
+vectors (`(+ <<1 2 3>> <<1.0 2.0 3.0>>)` is `<<2.0 4.0 6.0>>`; `(+ <i32<1 2 3>> <<4 5 6>>)` is an `i64` vector). Its own
+"Negative" list is the case against it: *implicit widening could hide precision issues* (`i64` to `f64` loses bits above 2^53, and
+`i64 -> f32` is in its chain) and *promotion may require conversion instructions* (on vectors that is a hidden `sitofp` or
+`fpext` per operation, and an `i64x4 -> f64x4` conversion has no single AVX2 instruction, section 2.13). fibber's checker has
+no subtyping and no coercion anywhere (`spec/types.md` 1.7), so a promotion lattice would be a new, global typing rule for one
+feature. The ADR's own escape hatch ("explicit types available when promotion is undesirable") is what fibber makes the only
+mode: `(simd/convert f64x4 v)`. What survives from the ADR is its *non-numeric* rows (a string, character, boolean or keyword is not
+a lane: `a vector element must be a number`) and its length rule (a length mismatch is always an error, orthogonal to the element
+type). The checker's message for a mixed pair is `cannot unify (Simd i64 3) with (Simd f64 3)`, with the hint `convert with
+simd/convert` when the two differ only in element type.
+
+**ADR 018's `<[..]>` against fibber.** ADR 018 gave two families: persistent `[..]`/`{..}` and *conventional* mutable `<[..]>`/`<{..}>`
+("the `<...>` wrapper consistently means give me the fast/raw version"), with a colour that makes a conventional collection
+unusable across threads unless wrapped in an atom. fibber replaced the pair by **one** persistent family that updates in place
+when the value is unique (`fib.unique?`, `spec/types.md` 6.6): the programmer gets the conventional speed without a second type,
+a second syntax, or a colour, and a value that is shared is copied, never mutated under a reader. That is why `fib.tensor` is an
+immutable value whose `aset!` is in place when unique (3.4), and why the one thing that unique update cannot express, a *writable
+window into part of a unique buffer*, is the language feature of `docs/design/exclusive-views.md` rather than a `<[..]>`-style
+mutable type. ADR 018's closing line, "the `<...>` wrapper is consistent across SIMD and collections", is not kept: `<<..>>` stays
+the SIMD literal and nothing else.
+
+**Other liar sources read for this revision.** `.moth/done/cn5cd` (the SIMD acceptance list: `<<..>>` and `<i8<..>>` parse,
+arithmetic, scalar broadcast, **horizontal operations**, mapping to lIR vector types; the surface it names is `(lane v i)`,
+`(with-lane v i x)`, `(hsum v)`, `(hmin v)`, `(hmax v)`, and it required power-of-two widths, which decision 1 lifts);
+`.moth/ready/jx7f5` (`(vec4 i32 1 2 3 4)`, `(vec-get v 0)`, `(vec-set v 2 99)`, `(vec-shuffle v1 v2 [0 4 1 5])`: the same three
+lIR instructions `extractelement`, `insertelement`, `shufflevector`, which lIR already has; fibber's names are in 2.6);
+`cert/features/vector_types.feature` (lIR-level scenarios: integer and float vector literals, negative lanes, `<N x i1>` vectors,
+`add`/`fadd`/`mul` lanewise, `icmp`/`fcmp` giving `<N x i1>`, splat as a literal; reused in 4.1); ADR 015 (`wrapping`, 2.8); ADR
+024 (arithmetic by operand type, the same shape as the checker's built-in `Num` rows). ADR 003 is the origin of `&`, and ADR 007
+("aliasing allowed", justified by single threading) is the rule fibber does **not** keep for windows: it is why exclusive views need a
+design at all (`docs/design/exclusive-views.md`).
 
 What liar actually implemented (per the coordinator's reading of `/tank/repos/liar/liar/src/`): the lexer tokens, `Expr::SimdVector`,
 `parse_simd_elements`, the inferred type `<N x T>` and `generate_simd_vector` building an lIR vector literal whose element
@@ -144,7 +205,7 @@ syntax. This design therefore has to *specify* operators, broadcast and typed li
 | Named lane types or parametric? | One parametric constructor `(Simd T n)`, with names `f64x4`, `i32x8`, ... as reader-level sugar for it (a regular pattern, not a table), and `<elem>xn` for the target's native lane count |
 | Lane count | any `n` from 1 to 64 (not only powers of two): LLVM legalises (0.4). Loops over arrays use `native-lanes` |
 | Masks | `(Simd bool n)` = lIR `<n x i1>`, spelled `(Mask n)` |
-| Operators | `+ - * /` (floats), checked `+ - *` and `neg` (integers), `bit-and bit-or bit-xor bit-not shl shr sar popcount`; comparisons by name (`simd/lt` ...) because `Ord` returns `bool` |
+| Operators | `+ - * /` (floats), checked `+ - *` and `neg` (integers), `bit-and bit-or bit-xor bit-not shl shr sar popcount`; comparisons by name (`simd/lt` ...) because `Ord` returns `bool`. A scalar **literal** operand broadcasts; a variable needs `(splat x)` (decision 2, 2.4) |
 | Integer overflow | the scalar rule: lanewise check, trap on any lane; `unchecked-*` and the `wrapping` macro wrap |
 | Floats | IEEE lanewise, never trap, the same NaN, infinity and `-0.0` results as the scalar op |
 | Memory | `simd/load` and `simd/store!` on `(Array T)`: one bounds check per vector; masked forms for tails; gather and scatter checked per lane |
@@ -164,10 +225,10 @@ Everything that can be written as a function over that type and a few primitives
 | Type `(Simd T n)`, sugar names, layout class `vec` (`<n x T>` in the table of `spec/types.md` 8.1) | checker + emitter (`compiler/types/`, `compiler/emit/`) | new type constructor; a nat (literal number) argument in type position, checked like a colour argument (`spec/types.md` 1.3: a parameter that is not a type is already a precedent, and monomorphisation keys by type arguments, 4.3) |
 | Literal `<<...>>` | reader (`compiler/syntax/lexer.fib`) and a core form `(simd ...)` | 2.3 |
 | `+ - * /`, `neg`, bit ops, `=` on vectors | the built-in `Num`, `Float`, `Bits`, `Eq` instances (`spec/types.md` 2.12) | rows keyed by vector type in the arithmetic lowering (`spec/types.md` 8.12 table; `compiler/native/lower/arith.fib`, emitter side `compiler/emit/lower/`) |
-| Scalar broadcast | checker rule (2.4) | a deferred constraint |
+| Scalar broadcast of a literal | checker: the literal adopts the vector's element type (2.4) | the L19 rule, no new constraint |
 | lane access, insert, constant shuffle, splat, compare, select, bitcast | `fib.simd` functions that are one-instruction **primitives** (`simd/lane`, `simd/with-lane`, `simd/shuffle`, `simd/splat`, `simd/lt`..., `simd/blend`, `simd/reinterpret`) | rows in `compiler/types/builtins.fib` (the `BuiltinSig` table, e.g. line 50) and the emitter; every one maps to an **existing** lIR instruction (0.2) |
 | `fma`, `sqrt`, `abs`, `floor`/`ceil`/`trunc`/`round`, `min`/`max`, vector conversions, masked load/store, gather/scatter, fast flags | primitives that need **new lIR instructions** (2.10) | lIR spec 6.1/6.3/6.5, parser, checker, printer, `compiler/native/lower/*`, `crates/lair` (Rust, with its unit tests) and lairf |
-| `reduce-add/min/max`, `any`, `all`, `iota`, `lanes`, `lo`/`hi`/`concat`, `reverse`, `tail-mask`, `load-tail`, `store-tail!`, `dot`, `sum`, `axpy` | plain **library code** over the primitives | none (halving shuffles and lane ops; `any`/`all` through `bitcast <n x i1>` to `iN`, which lIR allows for N up to 64) |
+| `hsum`, `hmin`, `hmax` (aliases `reduce-add/min/max`), `any`, `all`, `iota`, `lanes`, `lo`/`hi`/`concat`, `reverse`, `tail-mask`, `load-tail`, `store-tail!`, `dot`, `sum`, `axpy` | plain **library code** over the primitives | none (halving shuffles and lane ops; `any`/`all` through `bitcast <n x i1>` to `iN`, which lIR allows for N up to 64) |
 | `native-lanes`, `native-has-fma?` | compile-time constants of the target (2.9) | emitter receives a `Target` |
 
 ### 2.3 Types, literals, reader
@@ -216,10 +277,11 @@ and a literal with its own suffix that disagrees is a read error (`300i8` alread
 016's table: `(+ <<1 2 3>> <<4 5 6 7>>)` is `cannot unify (Simd i64 3) with (Simd i64 4)`; a non-numeric element is `a vector
 element must be a number or a variable of numeric type`.
 
-*Not the ADR's spelling.* ADR 016 writes the element type inside the opener, `<f32<1.0 2.0>>`, `<i8<1 2 3 4>>`. That token
-is, today, one symbol (`<f32<1.0` and `4>>`), and the asymmetric closer needs a second reader state. The suffix form uses what
-the reader already has for numbers (`1.0f32`, `5i8`). If the owner prefers the ADR spelling the reader rule is a second opener
-`<TYPE<` with `TYPE` one of the six element names, same form `(simd TYPE e1 ..)`; nothing else in this design changes.
+*Not the ADR's spelling (decided, decision 1).* ADR 016 writes the element type inside the opener, `<f32<1.0 2.0>>`,
+`<i8<1 2 3 4>>`. That token is, today, one symbol (`<f32<1.0` and `4>>`), and the asymmetric closer needs a second reader
+state. The owner prefers the ADR's look but accepted the suffix, which uses what the reader already has for numbers (`1.0f32`,
+`5i8`). The `<f32<..>>` form is therefore **omitted**: it costs a second opener rule for no capability, and two spellings of one
+literal would be one more thing for every tool (printer, macros, error messages) to agree on. `Show` prints the suffix form.
 
 The constructor function form `(f64x4 a b c d)` and `(simd/splat V x)` are provided as well, because the literal's elements
 are expressions and a macro that builds vectors needs a call form.
@@ -231,32 +293,37 @@ is an infinity or NaN, `-0.0` behaves as the scalar `-0.0` does; no flag that ma
 (`nnan`, `ninf`, `nsz` are not in the grammar and stay out, 2.10). `%`/`rem` on vectors is not provided (`frem` is a libm call
 per lane; use `(- x (* y (simd/trunc (/ x y))))` or scalar code). `quot` is not provided on vectors. Integer `/` is not
 provided (no hardware instruction; the scalar rule's two traps would cost a branch per lane). Bit operations and shifts are the
-`Bits` instances lanewise; a shift count is a vector or a scalar (broadcast) and is masked to the width as the scalar is
+`Bits` instances lanewise; a shift count is a vector or a scalar *literal* (a variable count is `(splat n)`) and is masked to the width as the scalar is
 (`spec/types.md` 8.12: `n mod w`).
 
 The built-in `Num` instance exists for every vector type of floats and integers (the same status as the scalar ones in
 `spec/types.md` 2.12: "protocol methods with built-in instances"), so `(reduce + vs)`, `(+ a b)` and generic code under
 `(Num a)` all work.
 
-**Broadcast** (ADR 016: `(+ 5 <<1 2 3>>)`). fibber has no implicit conversion between scalar types and the checker has no
-subtyping (`spec/types.md` 1.7: "no subtyping, no coercion anywhere"), but the one place where a scalar already adapts is the
-literal in an argument position (stdlib 7 L19). **Proposed:** a *binary arithmetic or comparison builtin* whose one operand
-is `(Simd T n)` and whose other operand is a scalar of type exactly `T` splats the scalar. That is typing, not
-promotion: `T` must be the element type, never `i32` against `f64` (`(+ <<1 2>>i32 1.0)` stays an error). Cases:
+**Broadcast: literals and `splat` only** (owner, decision 2). ADR 016 broadcasts any scalar (`(+ 5 <<1 2 3>>)`, `(* <<1 2 3 4>> 2)`).
+fibber has no implicit conversion between scalar types and no subtyping (`spec/types.md` 1.7: "no subtyping, no coercion
+anywhere"), but one place where a scalar already adapts exists: an integer literal in an argument position adopts the numeric
+type it unifies with (`spec/stdlib.md` L19). **Rule:** in a binary arithmetic, bit or comparison builtin whose other operand is
+`(Simd T n)`, a scalar **literal** operand is read at type `T` and splatted:
 
-- a numeric **literal** operand always broadcasts and adopts `T` under the L19 rule (`(* v 2)` on `f64x4` is `(* v <<2.0 2.0 2.0 2.0>>)`;
-  a float literal against `f32` is rounded, as with a suffix);
-- a **variable** operand broadcasts when the vector operand's type is already known at that point of inference. The checker
-  needs a deferred constraint `Broadcast(a, b)` (like `HasField`, `spec/types.md` 1.8 and 3.4) resolved when either side
-  becomes known; if neither is known at generalisation the error is `cannot infer whether (+ a b) broadcasts; annotate a
-  parameter or use (simd/splat V x)`. `simd/splat` is always available and unambiguous;
+- `(* v 2)` on `f64x4` is `(* v <<2.0 2.0 2.0 2.0>>)`; `(+ 5 <<1 2 3>>)` is `<<6 7 8>>`; a float literal against `f32` is rounded, as
+  with a suffix; an integer literal against a float `T` must be exact (the L19 rule), and a literal that is not representable in `T`
+  (`300` against `i8`, `1.5` against `i32`) is an error;
+- a scalar **variable, call, field read or any other expression** is **not** broadcast: `(+ x v)` is the error `scalar operand
+  of a vector operator: write (splat x)` (position of the scalar operand); `(simd/splat V x)` and the sugar `(splat x)`, whose
+  vector type comes from the other operand or the annotation, are the explicit form. Because no constraint is deferred, the
+  result of every operator application is decided where it is written: there is no inference-order dependence, and no
+  `cannot infer whether (+ a b) broadcasts` error exists;
+- a mismatched element type is an error whatever the operand: `(+ <<1 2>>i32 1.0)` and `(+ <<1 2>> 1.5)` are errors, never a
+  promotion (ADR 017 stays dropped, section 1);
 - the **result** is the vector type; a comparison's result is the mask (2.6).
 
-Why allow it at all, given "no coercion". The tie-breaker of the project is "unless it breaks memory safety, Clojure has
-the ergonomics; if it does, Rust has": `core.matrix` broadcasts scalars (`(add m 2)`), Rust's `std::simd` does not (it
-requires `Simd::splat`). Broadcast does not touch memory safety, so Clojure's side wins; the cost is one deferred constraint,
-and the one rule that is *not* adopted from ADR 016 is promotion between numeric types. If the owner wants no inference-order
-sensitivity at all, the fallback is literals-only plus `splat`, which is a strict subset.
+Why literals at all, given "no coercion". The tie-breaker of the project is "unless it breaks memory safety, Clojure has the
+ergonomics; if it does, Rust has": `core.matrix` broadcasts scalars, Rust's `std::simd` requires `Simd::splat`. The owner chose the
+middle: the literal case is the overwhelming one in numeric code (`(* 2.0 x)`, `(+ v 1.0)`), costs the checker nothing beyond the
+literal-adoption it already has, and keeps ADR 016's look; the variable case is where ADR 016's rule needed a deferred constraint
+(`Broadcast(a, b)`, like `HasField`) resolved by inference order, and where a reader cannot tell from the text whether `(+ a b)` adds
+vectors or splats a scalar. Writing `(splat x)` costs one word and says what happens. Simpler checker, no inference-order surprises.
 
 ### 2.5 Hardware width: the compiler does not chunk, LLVM legalises
 
@@ -281,6 +348,13 @@ What this means in practice (**Proposed**):
 ### 2.6 Operations
 
 Names are `fib.simd` (written `simd/` with the usual alias). `V` is a vector type, `M` its mask, `E` its element.
+
+**Names from liar** (decision 6). ADR 016's issue (`cn5cd`) names the lane and horizontal operations `lane`, `with-lane`, `hsum`, `hmin`,
+`hmax`; the later issue `jx7f5` names them `vec-get`, `vec-set`, `vec-shuffle` over the same three lIR instructions. fibber takes the
+first set (`simd/lane`, `simd/with-lane`, `simd/hsum`, `simd/hmin`, `simd/hmax`) and the shuffle name `simd/shuffle`, and does not take
+`vec-get`/`vec-set`/`vec-shuffle`: `vec` means the persistent `Vec` in fibber, so a SIMD `vec-get` would invite the wrong reading.
+`reduce-add`, `reduce-min`, `reduce-max` stay as aliases for the horizontals (the Clojure-shaped name). The bounds rule is below: a
+literal lane index is checked at compile time, a dynamic one traps.
 
 **Primitives that map to an existing lIR instruction**
 
@@ -316,7 +390,7 @@ Names are `fib.simd` (written `simd/` with the usual alias). `V` is a vector typ
 **Library code (no new instruction)**
 
 `(simd/iota V)` (`<<0 1 2 3>>`, a constant), `(simd/lanes v)` (a constant), `(simd/lo v)`, `(simd/hi v)`, `(simd/concat a b)`,
-`(simd/reverse v)` (shuffle), `(simd/reduce-add v)`, `reduce-min`, `reduce-max`, `(simd/reduce-add-ordered v)`, `(simd/tail-mask V k)` (the
+`(simd/reverse v)` (shuffle), `(simd/hsum v)` (alias `reduce-add`), `hmin`, `hmax` (aliases `reduce-min`, `reduce-max`), `(simd/hsum-ordered v)`, `(simd/tail-mask V k)` (the
 mask with the first `k` lanes true: `(simd/lt (simd/iota I) (simd/splat I k))`), `(simd/load-tail V a i)` (zero-filled),
 `(simd/store-tail! &a i v)`, `simd/dot`, `simd/sum`, `simd/axpy!` (3.7 reuses them).
 
@@ -367,6 +441,8 @@ with malloc, so the payload is 8-byte aligned and not 32-byte aligned.
   completeness and are not in any benchmark kernel.
 
 ### 2.8 Overflow: checked, `unchecked-*`, `wrapping`
+
+**Decided (owner, 2026-10-04, decision 4):** integer vector arithmetic is checked by default, exactly like scalar arithmetic; `wrapping` is the opt-out, as in ADR 015 and consistent with the scalar rules; the `unchecked-*` family (L10) is provided for scalars and vectors. There is no vectors-only wrapping default.
 
 Integer `+ - *` and `neg` on vectors are **checked** like the scalar (`spec/types.md` 8.12): `sadd-overflow`/`ssub-overflow`/
 `smul-overflow` already take vectors in lIR (`spec/lir.md` 6.1: result `{ <N x iK>, <N x i1> }`), then `reduce-or` of the overflow
@@ -496,18 +572,18 @@ pixels are one output byte, so a byte is `8 / W` vectors (`W` is 1, 2, 4 or 8):
 
 ;; The mask of lanes whose |z|^2 stays at or below 4 through 50 iterations of z = z^2 + c (the reference `inside?`, per lane).
 (defun inside-lanes (cr: f64xn ci: f64) -> (Mask :native)
-  (let [civ (simd/splat f64xn ci) two 2.0 four 4.0]            ; literals broadcast (2.4)
+  (let [civ (simd/splat f64xn ci)]                              ; a variable is splat explicitly; literals broadcast (2.4)
     (loop [i 0 zr (simd/splat f64xn 0.0) zi (simd/splat f64xn 0.0)
            tr (simd/splat f64xn 0.0) ti (simd/splat f64xn 0.0)
            live (simd/all-true (Mask :native))]
       (if (or (>= i 50) (not (simd/any live)))
         live
-        (let [zi2 (+ (* (* two zr) zi) civ)
+        (let [zi2 (+ (* (* 2.0 zr) zi) civ)
               zr2 (+ (- tr ti) cr)
               tr2 (* zr2 zr2)
               ti2 (* zi2 zi2)
               ;; sticky: once a lane escapes it stays out, whatever inf/NaN follows (the scalar returns at the first escape)
-              live2 (simd/and live (simd/le (+ tr2 ti2) four))]
+              live2 (simd/and live (simd/le (+ tr2 ti2) 4.0))]
           (recur (+ i 1) zr2 zi2 tr2 ti2 live2))))))
 
 ;; One byte: eight pixels from x0, the first the high bit; pixels at or past n are zero bits.
@@ -517,8 +593,8 @@ pixels are one output byte, so a byte is `8 / W` vectors (`W` is 1, 2, 4 or 8):
       (if (< g (quot 8 w))                                      ; w <= 8; on w = 1 this is the scalar loop
         (let [x0 (+ (* bx 8) (* g w))
               xs (+ (simd/splat f64xn (double x0)) iota)      ; the x of each lane
-              cr (- (/ (* 2.0 xs) (double n)) 1.5)             ; same operations as the reference, lanewise
-              in-row (simd/lt xs (double n))                   ; lanes inside the row (the reference's (< x n))
+              cr (- (/ (* 2.0 xs) (simd/splat f64xn (double n))) 1.5)   ; same operations as the reference; a variable is splat
+              in-row (simd/lt xs (simd/splat f64xn (double n)))  ; lanes inside the row (the reference's (< x n))
               m (simd/and in-row (inside-lanes cr ci))
               bits (simd/mask-bits (simd/reverse m))]          ; reverse: lane 0 becomes the high bit of the group
           (recur (+ g 1) (bit-or (shl acc w) bits)))
@@ -550,17 +626,17 @@ honest expected gain is about 1.5 to 2x, not 4x, and this kernel is the one to m
         xi (array-get s i) yi (array-get s (+ P i)) zi (array-get s (+ (* 2 P) i))]
     (loop [j 0 ax (simd/splat f64xn 0.0) ay ax az ax]
       (if (< j P)
-        (let [dx (- xi (simd/load f64xn s j))                  ; scalar - vector broadcasts
-              dy (- yi (simd/load f64xn s (+ P j)))
-              dz (- zi (simd/load f64xn s (+ (* 2 P) j)))
+        (let [dx (- (simd/splat f64xn xi) (simd/load f64xn s j))  ; a scalar variable is splat
+              dy (- (simd/splat f64xn yi) (simd/load f64xn s (+ P j)))
+              dz (- (simd/splat f64xn zi) (simd/load f64xn s (+ (* 2 P) j)))
               d2 (simd/fma dx dx (simd/fma dy dy (* dz dz)))
               mj (simd/load f64xn s (+ (* 6 P) j))
               mag (simd/blend (simd/eq d2 0.0)                 ; the lane j = i (and any exact coincidence): no force
                               (simd/splat f64xn 0.0)
-                              (/ dt (* d2 (simd/sqrt d2))))
+                              (/ (simd/splat f64xn dt) (* d2 (simd/sqrt d2))))
               k (* mj mag)]
           (recur (+ j w) (+ ax (* dx k)) (+ ay (* dy k)) (+ az (* dz k))))
-        (Three (simd/reduce-add ax) (simd/reduce-add ay) (simd/reduce-add az))))))
+        (Three (simd/hsum ax) (simd/hsum ay) (simd/hsum az))))))
 
 (defun advance (&s: (Array f64) dt: f64) -> i64
   (do (loop [i 0]                                              ; velocities, all from the old positions
@@ -571,12 +647,12 @@ honest expected gain is about 1.5 to 2x, not 4x, and this kernel is the one to m
                 (array-set! &s (+ (* 5 P) i) (- (array-get @s (+ (* 5 P) i)) (. a c)))
                 (recur (+ i 1))))
           0))
-      (loop [j 0]                                              ; positions: x += dt*vx, three vector blocks
+      (loop [j 0 dtv (simd/splat f64xn dt)]                    ; positions: x += dt*vx, three blocks; dt splat once
         (if (< j P)
-          (do (simd/store! &s j (+ (simd/load f64xn @s j) (* dt (simd/load f64xn @s (+ (* 3 P) j)))))
-              (simd/store! &s (+ P j) (+ (simd/load f64xn @s (+ P j)) (* dt (simd/load f64xn @s (+ (* 4 P) j)))))
-              (simd/store! &s (+ (* 2 P) j) (+ (simd/load f64xn @s (+ (* 2 P) j)) (* dt (simd/load f64xn @s (+ (* 5 P) j)))))
-              (recur (+ j (simd/native-lanes f64))))
+          (do (simd/store! &s j (+ (simd/load f64xn @s j) (* dtv (simd/load f64xn @s (+ (* 3 P) j)))))
+              (simd/store! &s (+ P j) (+ (simd/load f64xn @s (+ P j)) (* dtv (simd/load f64xn @s (+ (* 4 P) j)))))
+              (simd/store! &s (+ (* 2 P) j) (+ (simd/load f64xn @s (+ (* 2 P) j)) (* dtv (simd/load f64xn @s (+ (* 5 P) j)))))
+              (recur (+ j (simd/native-lanes f64)) dtv))
           0))))
 ```
 
@@ -599,11 +675,11 @@ integer vector or integer-to-float conversion (which AVX2 cannot do for 64-bit l
                       (if (< j n)
                         (let [ij (+ (simd/splat f64xn (double j)) iota (simd/splat f64xn fi))   ; i + j, per lane
                               den (+ (/ (* ij (+ ij 1.0)) 2.0) fi 1.0)                          ; exact for integers < 2^53
-                              a (/ 1.0 den)
+                              a (/ 1.0 den)                                                           ; the literal broadcasts
                               m (simd/tail-mask f64xn (- n j))                                  ; all true except in the last block
-                              x (simd/load-masked f64xn v j m 0.0)]                             ; masked-off lanes are not read
+                              x (simd/load-masked f64xn v j m (simd/splat f64xn 0.0))]                             ; masked-off lanes are not read
                           (recur (+ j w) (simd/fma a x acc)))                                   ; a finite, x = 0 in dead lanes
-                        (simd/reduce-add acc)))]
+                        (simd/hsum acc)))]
               (do (array-set! &o i s) (recur (+ i 1))))
             nil))
         @o)))
@@ -629,7 +705,7 @@ scalar 1.35 s.
 | Layout | strided, any order; row-major (C) by default |
 | Views | `slice transpose reshape diagonal broadcast-to flip`, `row`, `col`: new struct sharing the buffer by a count, **no element copy** |
 | Value semantics | a tensor is an immutable *value*; `aset` and friends are in place when the buffer is unique (the project's rule), else copy-on-write. **No aliasing writes** |
-| Writable views | none in v1 (needs a language feature, section 7 Q3) |
+| Writable views | none in v1; the language feature is designed in `docs/design/exclusive-views.md` (decision 3), scheduled as P10b |
 | Elementwise | eager functions; the library's fusion rewrite turns nested calls and single-use lets into one loop (3.6) |
 | Reductions | `(reduce f t)` is Clojure's left fold; `sum`/`prod`/`max` are the SIMD pairwise ones |
 | Matmul | our own blocked kernel with a SIMD micro-kernel; BLAS through `extern` optional |
@@ -721,11 +797,11 @@ passed along, views are made and **dropped** before the write, and the kernels w
 (3.5). The pattern "fill the blocks of C by writing through block views" is a *library* pattern: the kernel works on the
 raw buffer after one `array-make-unique!` (3.5); user code states `(mmul a b)` or `(mmul! &c a b)`.
 
-*Left open (Q3).* A scoped exclusive borrow, `(with-view! [v (view-mut &t spec)] ...)`, so a user could write through a window
-of a unique tensor in place, would need a language feature: `&` is a variable's private cell and "there is no field place"
-(`spec/types.md` 2.14, D1); a borrow of a *part* of a cell's content with a lexical extent is new ground, and the checker
-must prove no read of `t` inside it. v1 does without; `(update-slice! &t spec f)` (copy the window out, apply `f`,
-write it back) covers the user-level need at the cost of a window copy.
+*Writable views (decision 3: designed).* `&` is a variable's private cell and "there is no field place" (`spec/types.md` 2.14, D1), so a
+window of *part* of a cell's content with a lexical extent is new ground. `docs/design/exclusive-views.md` designs it:
+`(with-view [v (slice! &t 0 8)] (fill! &v 0.0))`, a scoped exclusive borrow of a private cell whose windows cannot escape the form,
+with the owner frozen for its extent, plus draft spec rows. It is a post-v1 package (5, P10b); v1 keeps `(update-slice! &t spec f)`
+(copy the window out, apply `f`, write it back) for the user-level need.
 
 **Reading.** `(aget t i j)` is a borrowed element read: the tensor is borrowed, the element is a scalar (no mode), so
 no count. In a loop it is `offset + i*s0 + j*s1` and a load with one bounds check against `(array-len buf)`, which LLVM
@@ -895,7 +971,7 @@ rewrite; `sum prod maximum minimum mean argmax` with axes; `dot axpy`; `mmul mmu
 blocked loop with checked or `wrapping` accumulators); the benchmarks.
 **Later:** threads; i8 i16 bool tensors; `einsum`; convolution; FFT; linear algebra (`solve`, `lu`, `qr`, `svd`); transcendental
 functions (`exp log sin tanh`: a vectorised polynomial implementation, exact-vs-fast question); sparse; a statically ranked
-`(Matrix T)`; writable views (Q3); GPU (out of scope); BLAS module; autotuned block sizes; multiversioning.
+`(Matrix T)`; writable views (`docs/design/exclusive-views.md`, P10b); GPU (out of scope); BLAS module; autotuned block sizes; multiversioning.
 
 ---
 
@@ -905,8 +981,13 @@ functions (`exp log sin tanh`: a vectorised polynomial implementation, exact-vs-
 
 All cases are `cases/stdlib`-style programs with verdicts in the header (`spec/method.md`: nothing is done until an executable test says so). Numbers: SIMD 6200 to 6299, tensor 6300 to 6399
 (the regex cases are 6100-6101 and BigInt 6000-6099, commit ea66335). The Rust `fibref` is frozen and cannot run these
-(`docs/shootout/improvements.md` item 10), so rule 6's second tool is replaced by a **scalar reference inside each case**,
-written with the ordinary scalar operators and loops, and the harness compares the vector result with it.
+(`docs/shootout/improvements.md` item 10). **Decision 5 (owner): rule 6 (interpreter against compiler) no longer judges new features;**
+a fibber interpreter will be written (package INT0) and becomes the second tool then. Until it exists, each SIMD operation is
+tested against a **scalar reference written in the case itself**, with the ordinary scalar operators and loops, and the case compares
+the vector result with it. The lIR scenarios of liar's `cert/features/vector_types.feature` (integer and float vector literals of the
+widths `<4 x i32> <2 x i64> <8 x i8> <16 x i8> <4 x float> <2 x double> <8 x i16>`, negative lanes, `<N x i1>` literals, lanewise
+`add fadd mul`, `icmp eq` and `fcmp olt` giving `<N x i1>`, a splat written as a literal) are reused as inputs: P0 turns each
+scenario into a `cases/lir` case with the expected value from the feature file, and P4 repeats the same inputs through `<<..>>`.
 
 *SIMD (Part 1).*
 1. **Every operation against a scalar reference.** For each of `+ - * /`, `neg`, `abs`, `sqrt`, `floor ceil trunc round-even`, `min max min-num
@@ -930,8 +1011,7 @@ written with the ordinary scalar operators and loops, and the harness compares t
 6. **Reduction order**: `reduce-add` on `f64x4` of `<<1e16 1.0 -1e16 1.0>>` equals the pairwise value pinned in the case, `reduce-add-ordered` equals the left fold; for
    i32x4 near `MAX` the checked reduce traps.
 7. **Literal and types**: `<<1 2 3 4>>` is `(Simd i64 4)`; `<<1.0 2.0>>f32` reads at f32 (0.1 is rounded to f32); `<<1 2>> + <<1 2 3>>` fails with the length error; `(+ <<1 2>>i32 1.0)` fails (no
-   promotion); `(* v 2)` broadcasts; `(* v s)` with an annotated `s` broadcasts; inference-order case with an unknown `s` gives the
-   `cannot infer whether ... broadcasts` error; `(+ <<1 2>> 1.5)` fails; vectors in struct fields, `Vec` elements, closure captures, a
+   promotion); `(* v 2)` and `(+ 5 <<1 2 3>>)` broadcast; `(* v s)` with a scalar variable `s` is the `write (splat x)` error whatever the order of inference, and `(* v (splat s))` works; `(+ <<1 2>> 1.5)` fails; a mixed `f32`/`f64` pair fails with no promotion; vectors in struct fields, `Vec` elements, closure captures, a
    `spawn` result, and `dyn`-free generics (`(defun f (a: (Simd f64 n)) ...)`) work and `fibc explain` shows no count operation for them.
 8. **Targets**: the whole group is built and run under `FIB_TARGET_CPU` unset (AVX2 here), `x86-64` and `x86-64-v2` (SSE only, so
    `native-lanes f64` is 2) and compared output for output; a *compile-only* run with `skylake-avx512` (this CPU cannot run it) checks the lowering
@@ -1004,7 +1084,8 @@ parallel with the first SIMD packages, which is the one place the order is relax
 | **P7** SIMD elementwise and reduction kernels (`ew-kernel`, `sum`, axis reductions) and cases | P4, P6, P6b | `lib/fib/tensor/` |
 | **P8** fusion rewrite for tensor functions | P6, P7 | `compiler/expand/{fusetab,fuse,fusescan,fuselet,fuserun}.fib`, `compiler/tests/expand/` (the Rust expander is frozen, so only the stage-2 compare scripts see it; `fibref` stays unfused and must give the same values) |
 | **P9** matmul: packing, micro-kernels, blocking, edges, cases, benchmark | P4, P6b, P7 | `lib/fib/tensor/gemm.fib` |
-| **P10** later: threads, BLAS module, multiversioning, transcendental functions, writable views | after v1 | |
+| **P10** later: threads, BLAS module, multiversioning, transcendental functions | after v1 | |
+| **P10b** exclusive views: `with-view`, scoped types, library `slice!`/`split!`, from `docs/design/exclusive-views.md` | P6, P6b; owner approval of the spec drafts | `spec/types.md`, `spec/syntax.md`, `compiler/{types,own,expand}`, `lib/fib/tensor/` |
 
 Independence: P0, P1, P2, P6 can start the same day (four agents) and touch different directories; P3 follows P0's form;
 P4 is the merge point; P6b is small and can ride with P0 or P6. The 120-call agent budget of this task is about one package: P0
@@ -1022,7 +1103,7 @@ the compiler's own source uses no vectors, so the check is that `fibc emit compi
 1. **Fast-math and FP contract.** `fma` has one meaning (exact), so a CPU without FMA runs a libm call per lane: slow, and
    `(native-has-fma?)` must guard every hot use. Contracted vs uncontracted results differ in the last bits across targets;
    tolerances in matmul cases and nothing weaker for elementwise.
-2. **The broadcast constraint** adds inference-order sensitivity; fallback (literals only, plus `splat`) costs nothing to keep.
+2. **Broadcast is literals and `splat` only** (decision 2): no deferred constraint, no inference-order risk; the cost is a `(splat x)` at each variable use.
 3. **Reader change.** `<<` and `>>` were symbol characters; no program uses them (3.3 grep), but a user macro that builds `>>` text
    would. The rule keeps a bare `<<`/`>>` as symbols.
 4. **Odd lane counts and ABI.** Unusual widths cross calls badly (0.4); the cap of 64 and the advice to use powers of two limit it.
@@ -1031,19 +1112,25 @@ the compiler's own source uses no vectors, so the check is that `fibc emit compi
 6. **Fusion by rewrite** depends on name resolution (`fuse-library`) and misses function values; and the expression-type
    alternative is unproven. The fallback is an explicit `(ew [a b c] (fn [x y z] ...))` macro that always generates one loop.
 7. **`SHARED` after a task** kills in-place updates (3.8).
-8. **The interpreter and the Rust tools are frozen**, so rule 6 cannot compare the compiler against `fibref` for this feature; the in-case scalar references are the
-   substitute and they are weaker (same compiler on both sides). A frozen-Rust exemption must be recorded by the owner (Q5).
+8. **The interpreter and the Rust tools are frozen** and rule 6 no longer judges new features (decision 5); the in-case scalar references are the
+   substitute and they are weaker (same compiler on both sides) until INT0 gives an independent second implementation.
 9. **Compile time.** Many monomorphised vector types and unrolled legalisation (`<64 x f64>`) can blow up code size; the 64-lane cap and
    512-bit cap are the guard; measure `compile-time.sh` (`scripts/bench/compile-time.sh`) after P1.
 10. **Target table** for CPU features is a maintained list; a wrong entry gives wrong lane counts but never wrong results.
 11. **No AVX-512 hardware here**: the 512-bit paths compile but cannot be run on this machine.
 12. **Two lowerings** (Rust lair, lairf) must move together for P0 until the Rust lair is retired; the compare scripts are the guard.
 
-## 7. Questions for the owner
+## 7. Questions: closed (owner, 2026-10-04)
 
-1. The literal spelling: suffix after the closer (`<<1.0 2.0>>f32`, proposed) or ADR 016's `<f32<1.0 2.0>>`? Is arbitrary length 1 to 64 right, or stay at powers of two?
-2. Broadcast of a *variable* scalar (deferred constraint) or literals and `splat` only?
-3. Writable views of a unique tensor: wanted enough to design a scoped exclusive borrow (a language feature), or is "no aliasing writes" the rule?
-4. Integer vector `+` checked by default (the scalar rule, one extra reduce and branch) with `wrapping` to opt out, as ADR 015? Or wrapping by default on vectors only?
-5. Rule 6 for this feature while `fibref` is frozen: is the in-case scalar reference an acceptable substitute?
-6. Do ADR 016's full text, any 019/024 consequences for lIR (e.g. an intended target-attribute form), or earlier liar SIMD tests exist beyond `/tank/repos/liar/doc/adr/`? If so they override sections 2.3 to 2.5.
+| # | Question | Answer | Applied in |
+|---|---|---|---|
+| 1 | Literal spelling; arbitrary lane count? | Suffix after the closer (`<<1.0 2.0>>f32`); any count 1 to 64 (512 bits). `<f32<..>>` omitted | decision 1; 2.3, 2.5, 2.12 |
+| 2 | Broadcast of a variable scalar? | **No**: literals and `splat` only (revised); no deferred constraint | decision 2; 2.4, 2.13, 4.1 case 7, risk 2 |
+| 3 | Writable views of a unique tensor? | Worth designing: a scoped exclusive borrow | `docs/design/exclusive-views.md`; 3.4, P10b |
+| 4 | Integer vector `+` checked or wrapping? | Checked by default; `wrapping` opt-out; `unchecked-*` provided | decision 4; 2.8 |
+| 5 | Rule 6 while `fibref` is frozen? | Not the judge for new features; in-case scalar references until the fibber interpreter (INT0) | decision 5; 4.1, risk 8 |
+| 6 | More material in liar? | Yes, used: ADR 015, 017, 018, 024, the SIMD moth issues, `vector_types.feature` | decision 6; 1, 2.6, 4.1 |
+
+Small items that remain (none blocks P0 to P2): the exact text of the error for a scalar variable operand (`scalar operand of a vector
+operator: write (splat x)` is proposed); whether `(splat x)` without a type is accepted in an operator application where the other operand fixes
+the type (proposed: yes; elsewhere `(simd/splat V x)`).
