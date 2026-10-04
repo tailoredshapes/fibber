@@ -802,7 +802,7 @@ and counted (**Decided**):
 ```
 array      : ∀a. (fn :send (i64 a) (Array a))                     ; n copies of init (each stored: E2)
 array-len  : ∀a. (fn :send ((Array a)) i64)
-array-get  : ∀a. (fn :send ((Array a) i64) a)                      ; traps out of range; result is a borrow of the element inside the body, owned to the caller (§4)
+array-get  : ∀a. (fn :send ((Array a) i64) a)                      ; traps out of range; the element, a part of the array (§6.2, §6.3 "Element reads")
 array-with : ∀a. (fn :send ((Array a) i64 a) (Array a))            ; a new array with one slot changed (E2 for the element)
 array-copy : ∀a. (fn :send ((Array a) i64 i64) (Array a))          ; slice [i, j)
 array-set! : ∀a. (fn ((& (Array a)) i64 a) unit)                   ; a signature (§1.4); in place iff unique, else copy (§6.6)
@@ -1655,6 +1655,7 @@ relies on exactly this distinction.
 | `(cell e)`, `(atom e)`, `(weak e)`, `(fn ..)`, `(async ..)`, `(spawn ..)`, `(join ..)`, `(await ..)`, `(swap! ..)` | `Owned` |
 | variable `x` | as its binding says (§6.1) |
 | `(. e f)` | `Derived(b)` if `e` is `Borrowed(b)` or `Derived(b)`; if `e` is `Owned`, `e` becomes an implicit owning temporary `t` of the current step and the result is `Derived(t)` |
+| `(array-get a i)` | `Derived(b)` if `a` is `Borrowed(b)` or `Derived(b)`: the element is a strict part of the array, read with no count operation (§6.3, "Element reads"). If `a` is `Owned`, or is a part of an owned temporary of the call's own step (`(array-get (. (f) arr) i)`), the result is `Owned`: the read retains the element and the temporary is released at the end of the step. An element that is not an object has no mode |
 | `(dyn P e)` | the mode of `e` |
 | `(let ..)` | the mode of its body, adjusted by the scope-exit rule (§6.3) |
 | `(loop ..)` | the mode of its body, adjusted by the scope-exit rule with the loop variables as its owning bindings (§6.10) |
@@ -1770,6 +1771,43 @@ beyond the `match` clause row; what follows is why that is sound.
   guard is an ordinary call and a `recur` in a guard is `recur not in
   tail position`; the body of the clause is in tail position when the
   `match` is (§6.10).
+
+**Element reads** (performance batch 4, lever B; cases 270 to 278). `(array-get a i)` is the one
+primitive whose result is a part of an operand, as `(. e f)` is, and §6.2 gives it the same mode: `Derived(b)` when
+`a` is `Borrowed(b)` or `Derived(b)` and `b` is not a temporary of the call's own step, `Owned` otherwise. Source: `compiler/own/walk/call.fib`
+(`elem-mode` and `finish-call`) decide the mode; `compiler/emit/lower/builtins.fib` (the `array-get` arm) retains the element exactly
+when the plan's mode for the call is not `Derived`. The consequences are those of every `Derived` value (§6.1, §6.3):
+a use at a borrowed position, a field read or a scalar test takes no count; at an escape position or an owned
+position the value is retained (`consume`); a `let` of it is a derived binding of `b`; a `let` or `match` that exits
+with it as its value retains it before releasing `b`. The rule is sound for two reasons, and each has a case that
+fails without it:
+
+- *The element cannot outlive the array.* `Derived(b)` is valid while `b` is, and every rule that keeps `b` alive
+  for a derived value of it applies unchanged: a read of the binding that holds the element counts as a read of `b`
+  (own.lastuse `local-reads`), so `b` is not at its last use, and is neither moved nor released early, while the
+  element is still to be read; the operands of a call are siblings, so a sibling that reads `b` keeps it live until
+  the call (`(f (array-get a 0) (g a))` with `g` owning its argument retains `a` for `g`: case 271); a loop's body is
+  walked twice, so an element read of an outer binding inside a loop is a read of it at the next `recur` (case 274); a
+  closure that captures the derived binding captures a retained reference when it is a heap closure (E3: case 275); a binding that holds the element keeps `b` live (case 276).
+- *The element cannot be overwritten under the borrow.* The in-place writes (`array-set!`, `array-take!`,
+  `array-push!`, `array-pop!`, `set-field!`, §6.6, §2.13.1) act on the content of a cell, and only when
+  `fib.unique?` finds it unique: count 1, none of `SHARED`, `IMMORTAL`, `STACK`, `HAS-WEAK`. An array that a
+  `Borrowed(b)` or `Derived(b)` value names is held by a count of `b`'s owner (the binding that owns it, or the
+  caller of a borrowed parameter), so while the borrow is live that array has count 1 only if no cell holds it, and
+  then no write reaches it; if a cell holds it as well the count is at least 2 and the write copies (§6.6), leaving
+  the borrowed array and its elements as they were. Cases 273 and 277 write to a sibling holder of a shared array and of a shared struct while an element is borrowed. A cell's content is never borrowed in place: `@c` always acquires
+  (the row `@c` read above), so a value read out of a cell is `Owned` and its temporary holds a count, and an `&c`
+  argument takes the content without a count (`PsMoveIn`) only when no other operand of the call mentions `c`
+  (own.lastuse `amp`), so no sibling operand holds a derived read of it. An array that is the `Owned` result of
+  `@c` is the case the rule leaves `Owned` (above): `(let ((e (array-get @c 0))) (array-set! &c 0 x) e)` retains
+  the element at the read, the write finds the array shared by the temporary and copies, and `e` is the old element
+  (case 272).
+
+Not done: a `Derived` read from an `Owned` array operand or from a part of a temporary of the call's own step (case 278),
+and a borrowed read through a cell (case 272). Both stay as they were: `Owned`, one retain at the read and one release
+of the element's consumer. The audit does not see a read of a freed object that takes no count (the use after free of a
+borrowed element); the cases 271 and 276 therefore allocate an object of the same size after the point where a wrong plan would
+free the element, so that the allocator reuses its memory and the read gives another answer.
 
 ### 6.4 Borrowed and owned parameters, owned results, summaries (§4)
 

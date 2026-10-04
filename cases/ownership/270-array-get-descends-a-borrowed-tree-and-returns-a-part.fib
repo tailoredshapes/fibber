@@ -1,0 +1,27 @@
+;; spec:   spec/types.md §6.2, §6.3 (Element reads)
+;; expect: accept
+;; result: 22402
+;; audit:  clean
+;; allocs: <= 8
+;; `total` reads two elements of the array its borrowed parameter holds and passes them, still parts of the array, to a borrowed
+;; parameter of the next frame. `first-leaf` returns a part of the tree it borrows: the returned element is retained once (E1) and
+;; the caller releases it. A count missing from the returned element frees a leaf the tree still holds, and the audit sees the
+;; double free. The tree is a leaf held twice by an array, that array's node held twice by another.
+(defenum Tree (Leaf n: i64) (Branch kids: (Array Tree)))
+
+(defun total (t: Tree) -> i64
+  (match t
+    ((Leaf n) n)
+    ((Branch kids) (+ (total (array-get kids 0)) (* 100 (total (array-get kids 1)))))))
+
+(defun first-leaf (t: Tree) -> Tree
+  (match t
+    ((Leaf _) t)
+    ((Branch kids) (first-leaf (array-get kids 0)))))
+
+(defun main () -> i64
+  (let ((leaf (Leaf 2))
+        (inner (Branch (array 2 leaf)))
+        (root (Branch (array 2 inner))))
+    (+ (* 1000 (match (first-leaf root) ((Leaf n) n) (_ 0)))
+       (total root))))

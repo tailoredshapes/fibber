@@ -49,7 +49,8 @@ re-ran `explain` on `b.fib`: bindings `v owns`):
    This is C2 in stdlib.md §7.
 2. A field of an owned shell is derived of the shell; consuming it retains it (count 2 for as long as the shell lives). C7.
 3. `&` copy-in acquires (types §6.6). C3.
-4. `array-get` returns a retained element: the child of a unique array has count 2 when read.
+4. `array-get` returns a retained element: the child of a unique array has count 2 when read. (Since performance batch 4, lever B, an element
+   read of a borrowed or derived array is a part of it and takes no count until it reaches an owned position: spec/types.md §6.3, "Element reads".)
 5. `@c` on a cell is an acquire.
 
 **Decision: runtime check first and always; static analysis only to remove 1, 2 and 4.** No analysis result is ever trusted

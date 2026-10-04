@@ -1,0 +1,21 @@
+;; spec:   spec/types.md §6.3 (Element reads, the element cannot outlive the array)
+;; expect: accept
+;; result: 7
+;; audit:  clean
+;; `(array-get a 0)` is a part of `a` and takes no count, and it is evaluated before `(eat a)`, which keeps `a` in a cell (so its
+;; parameter is owned). `a` is not at its last use at the second argument, the first still reads it: the call retains it for `eat`.
+;; Were `a` handed over as at a last use, `eat` would free the array and its box before `total` reads the box. The audit does not see
+;; a read of a freed object, so `(fresh)`, the third argument, allocates a box of the same size after the free: the allocator hands
+;; it the freed one's memory, and `total` then reads 99 where it must read 5.
+(defstruct Box (n: i64))
+
+(defun eat (a: (Array Box)) -> i64
+  (let ((c (cell a))) (array-len @c)))
+
+(defun fresh () -> Box (Box 99))
+
+(defun total (b: Box k: i64 f: Box) -> i64 (+ (. b n) (+ k (* 0 (. f n)))))
+
+(defun main () -> i64
+  (let ((a (array 2 (Box 5))))
+    (total (array-get a 0) (eat a) (fresh))))

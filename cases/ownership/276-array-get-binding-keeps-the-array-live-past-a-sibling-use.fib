@@ -1,0 +1,22 @@
+;; spec:   spec/types.md §6.3 (Element reads, the element cannot outlive the array)
+;; expect: accept
+;; result: 6
+;; audit:  clean
+;; `e` is bound to a part of `a`; `eat a` looks like the last use of `a`, but `e` is read afterwards and a read of `e` is a read of
+;; `a` (a derived binding keeps its root). `a` is therefore retained for `eat` and the box is still there when `hold` takes a count of
+;; it (`hold` keeps it in a cell, so its parameter is owned). Were `a` handed over to `eat`, the array and the box would be freed
+;; first. The audit does not see a read of a freed object, so `(fresh)` allocates a box of the same size after the free: the
+;; allocator hands it the freed one's memory, and `hold` then reads 99 where it must read 4.
+(defstruct Box (n: i64))
+
+(defun eat (a: (Array Box)) -> i64
+  (let ((c (cell a))) (array-len @c)))
+
+(defun fresh () -> Box (Box 99))
+
+(defun hold (b: Box f: Box) -> i64 (let ((c (cell b))) (+ (. @c n) (* 0 (. f n)))))
+
+(defun main () -> i64
+  (let ((a (array 2 (Box 4))))
+    (let ((e (array-get a 0)))
+      (+ (eat a) (hold e (fresh))))))
