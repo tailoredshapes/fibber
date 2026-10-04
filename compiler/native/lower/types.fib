@@ -1,17 +1,39 @@
-;; compiler/native/lower/types.fib: lIR types to LLVM types (crates/lair/src/lower/types.rs). OWNER: package L1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/lower/types.fib: lIR types to LLVM types (crates/lair/src/lower/types.rs). OWNER: package L1.
 
 (ns native.lower.types
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx)
+  (:require [llvm.core :as core] [llvm.ffi :as ffi]))
 
 
 ;; The LLVM type of an lIR type. (types.rs `Lx::ty`)
 (defun lx-ty (lx: Lx t: LType) -> i64
-  (trap "todo: native.lower.types lx-ty"))
+  (let ((ctx (. lx ctx)))
+    (unsafe
+      (match t
+        ((TInt n) (core/LLVMIntTypeInContext ctx (trunc i32 n)))
+        ((TFloat) (core/LLVMFloatTypeInContext ctx))
+        ((TDouble) (core/LLVMDoubleTypeInContext ctx))
+        ((TPtr) (core/LLVMPointerTypeInContext ctx 0i32))
+        ((TVector n e) (core/LLVMVectorType (lx-ty lx e) (trunc i32 n)))
+        ((TArray n e) (core/LLVMArrayType2 (lx-ty lx e) n))
+        ((TNamed s) (match (get @(. lx structs) s)
+                      ((some v) v)
+                      (nil (trap (str "unknown struct " s)))))
+        ((TAnon fs) (lx-struct-type lx fs))))))
+
+;; The literal (unnamed) struct type of the field types.
+(defun lx-struct-type (lx: Lx fs: (Vec LType)) -> i64
+  (let ((ws (ffi/words-new (vec (map (fn (f) (lx-ty lx f)) fs)))))
+    (unsafe
+      (let ((r (core/LLVMStructTypeInContext (. lx ctx) ws (trunc i32 (count fs)) 0i32)))
+        (do (free ws) r)))))
 
 ;; The LLVM type of a result: `void` for nil. (types.rs `ret_ty`)
 (defun lx-ret-ty (lx: Lx t: (Option LType)) -> i64
-  (trap "todo: native.lower.types lx-ret-ty"))
+  (match t
+    ((some x) (lx-ty lx x))
+    (nil (unsafe (core/LLVMVoidTypeInContext (. lx ctx))))))
 
 ;; The LLVM function type. (types.rs `fn_ty`)
 (defun lx-fn-ty (lx: Lx f: LFnType) -> i64
-  (trap "todo: native.lower.types lx-fn-ty"))
+  (core/function-type (lx-ret-ty lx (. f ret)) (vec (map (fn (p) (lx-ty lx p)) (. f params))) (. f varargs)))

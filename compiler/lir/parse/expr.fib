@@ -1,24 +1,87 @@
-;; compiler/lir/parse/expr.fib: the expression dispatcher of the parser (crates/lir/src/parse/expr.rs). OWNER: package R. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/parse/expr.fib: the expression dispatcher of the parser (crates/lir/src/parse/expr.rs). OWNER: package R.
 
 ;; `parse-expr` is the one recursion of the grammar. The instruction modules (instr, memory, atomics, control) take it as an `ExprParser`
 ;; (lir.parse.names) so that they do not require this module.
 
 (ns lir.parse.expr
-  (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names))
+  (:use lir.diag lir.types lir.ast lir.sexp lir.parse.names lir.parse.ty lir.parse.literal
+        lir.parse.instr lir.parse.memory lir.parse.atomics lir.parse.control))
 
+;; `parse-expr` as the value the instruction modules take.
+(defun expr-parser () -> ExprParser (ExprParser parse-expr))
 
 ;; One expression: an atom (a local, a global) or a list headed by a form name. (expr.rs `parse_expr`)
 (defun parse-expr (s: Sexp) -> (Result LExpr Diagnostic)
-  (trap "todo: lir.parse.expr parse-expr"))
+  (match s
+    ((SxAtom a p) (atom-expr a p))
+    ((SxStr _ p) (err p "a string must be written (string \"…\")"))
+    ((SxBrace items p) (try-let ((fields (parse-exprs items))) (Ok (expr-new (KStruct nil fields) p))))
+    ((SxVecType _ _ _) (err (sexp-pos s) (str "expected a value, found " (sexp-describe s))))
+    ((SxBracket _ _) (err (sexp-pos s) (str "expected a value, found " (sexp-describe s))))
+    ((SxList items p) (list-expr items p))))
+
+(defun atom-expr :private (a: str p: i64) -> (Result LExpr Diagnostic)
+  (cond (starts-with? a "@")
+        (if (= (str-len a) 1)
+            (err p "invalid name @")
+            (Ok (expr-new (KGlobal (str-slice a 1 (str-len a))) p)))
+        (digit-first? (strip-minus a))
+        (err p (str "a number must be written with its type, as (i32 " a ")"))
+        :else (Ok (expr-new (KLocal a) p))))
+
+(defun list-expr :private (items: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (if (= (count items) 0)
+      (err pos "empty form ()")
+      (let ((head (nth items 0)) (args (vec-from items 1)))
+        (match head
+          ((SxVecType _ _ _) (try-let ((ty (parse-type head))) (vector-literal ty args pos)))
+          ((SxBracket _ _) (try-let ((ty (parse-type head))) (array-form ty args pos)))
+          ((SxAtom name _) (named-form name args pos))
+          (_ (err (sexp-pos head) (str "expected an instruction name, found " (sexp-describe head))))))))
+
+;; `([N x T] e..)`: the shell of `array-literal` with its elements.
+(defun array-form :private (ty: LType args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (try-let ((_ (array-literal ty args pos))
+            (elems (parse-exprs args)))
+    (Ok (expr-new (KArray ty elems) pos))))
+
+(defun named-form :private (name: str args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (let ((sub (expr-parser)))
+    (match (scalar-keyword name)
+      ((some ty) (scalar-literal ty args pos))
+      (nil
+       (cond (starts-with? name "%struct.")
+             (try-let ((fields (parse-exprs args)))
+               (Ok (expr-new (KStruct (some (str-slice name 8 (str-len name))) fields) pos)))
+             (= name "string") (string-literal args pos)
+             (= name "zeroinitializer")
+             (try-let ((_ (arity name args 1 pos)) (ty (type-arg (nth args 0))))
+               (Ok (expr-new (KZero ty) pos)))
+             :else (heads name args pos sub))))))
+
+;; The instruction modules in the Rust's order; the first that owns the head answers.
+(defun heads :private (name: str args: (Vec Sexp) pos: i64 sub: ExprParser) -> (Result LExpr Diagnostic)
+  (match (parse-instr name args pos sub)
+    ((some r) r)
+    (nil (match (parse-memory name args pos sub)
+           ((some r) r)
+           (nil (match (parse-atomic name args pos sub)
+                  ((some r) r)
+                  (nil (match (parse-control name args pos sub)
+                         ((some r) r)
+                         (nil (err pos (str "unknown instruction " name)))))))))))
+
+(defun string-literal :private (args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
+  (if (= (count args) 1)
+      (match (nth args 0)
+        ((SxStr bytes _) (Ok (expr-new (KStr bytes) pos)))
+        (_ (err pos "string expects one string operand")))
+      (err pos "string expects one string operand")))
 
 ;; Every form of `args` as an expression. (expr.rs `exprs`)
 (defun parse-exprs (args: (Vec Sexp)) -> (Result (Vec LExpr) Diagnostic)
-  (trap "todo: lir.parse.expr parse-exprs"))
+  (operands (expr-parser) args))
 
 ;; A type operand. (expr.rs `type_arg`)
 (defun type-arg (s: Sexp) -> (Result LType Diagnostic)
-  (trap "todo: lir.parse.expr type-arg"))
-
-;; `parse-expr` as the value the instruction modules take.
-(defun expr-parser () -> ExprParser
-  (trap "todo: lir.parse.expr expr-parser"))
+  (parse-type s))

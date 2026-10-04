@@ -1,13 +1,52 @@
-;; compiler/lir/check.fib: the whole-module checker (spec/lir.md section 10; crates/lir/src/check/mod.rs). OWNER: package K1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check.fib: the whole-module checker (spec/lir.md section 10; crates/lir/src/check/mod.rs). OWNER: package K1.
 
 (ns lir.check
   (:use lir.diag lir.types lir.ast lir.check.env lir.check.globals lir.check.func))
 
 
+;; The first error of one item, as a one-element or empty list.
+(defun check-item (env: LEnv item: LItem) -> (Result unit Diagnostic)
+  (match item
+    ((ItGlobal g) (check-global env g))
+    ((ItDefine f) (check-function env f))
+    (_ (Ok ()))))
+
 ;; Checks the whole module: every error of the module-level rules, else the first error of each global and function. (mod.rs `check`)
 (defun check (m: LModule) -> (Result unit (Vec Diagnostic))
-  (trap "todo: lir.check check"))
+  (match (env-build m)
+    ((Err ds) (Err ds))
+    ((Ok env)
+     (let ((items (. m items)))
+       (loop ((i 0) (errs (vec-empty)))
+         (if (>= i (count items))
+             (if (= (count errs) 0) (Ok ()) (Err errs))
+             (recur (+ i 1)
+                    (match (check-item env (nth items i))
+                      ((Ok _) errs)
+                      ((Err d) (conj errs d))))))))))
+
+(defun main-bad (pos: i64) -> (Result unit Diagnostic)
+  (err pos "main must be (main i32) with no parameters or (i32 ptr)"))
+
+(defun main-params-ok? (f: LFunction) -> bool
+  (let ((ps (. (. f ty) params)))
+    (or (= (count ps) 0)
+        (and (= (count ps) 2) (= (nth ps 0) ty-i32) (= (nth ps 1) ty-ptr)))))
 
 ;; The rule for a module that is run or linked into an executable (spec/lir.md 7.2): `main must be (main i32) ..`, `no main function`. (mod.rs `check_main`)
 (defun check-main (m: LModule) -> (Result unit Diagnostic)
-  (trap "todo: lir.check check-main"))
+  (let ((items (. m items)))
+    (loop ((i 0))
+      (if (>= i (count items))
+          (err (pos-new 1 1) "no main function")
+          (match (nth items i)
+            ((ItDefine f)
+             (if (= (. f name) "main")
+                 (cond (or (not (= (. (. f ty) cc) cc-c)) (not (= (. (. f ty) ret) (some ty-i32))) (not (main-params-ok? f)))
+                       (main-bad (. f pos))
+                       (not (linkage-exported? (. (. f mods) linkage)))
+                       (err (. f pos) "main must not be private or internal")
+                       :else (Ok ()))
+                 (recur (+ i 1))))
+            ((ItDeclare d) (if (= (. d name) "main") (main-bad (. d pos)) (recur (+ i 1))))
+            (_ (recur (+ i 1))))))))

@@ -1,6 +1,11 @@
 ;; compiler/lir/sexp/lexer.fib: tokens of lIR (sexp/lexer.rs): parentheses, braces, brackets, strings, vector types and atoms. OWNER: package R.
-;; STUB. The interface of this module is internal to package R (only `lir.sexp/read` is fixed for the others); the signature below is the
-;; Rust one, and R may replace it with a streaming lexer that never builds a token vector (docs/design/lair-in-fibber.md 1.4).
+;;
+;; The Rust lexer builds the whole token vector; this one is streaming (docs/design/lair-in-fibber.md 1.4): `lex-next` yields one token
+;; at a time and the reader consumes it at once, so the 19 MB text never has a token vector beside its tree. `tokens` still exists, built
+;; on `lex-next`, for the tests.
+;;
+;; Positions count characters, as the Rust `chars()` does: the lexer walks bytes and a UTF-8 continuation byte does not advance the
+;; column. `is_whitespace` is Unicode's (`ws-len`).
 (ns lir.sexp.lexer
   (:use lir.diag))
 
@@ -13,6 +18,186 @@
 
 (defstruct Token (tok: Tok pos: i64))
 
+(def tok-open: Tok TokOpen)
+(def tok-close: Tok TokClose)
+(def tok-brace-open: Tok TokBraceOpen)
+(def tok-brace-close: Tok TokBraceClose)
+(def tok-bracket-open: Tok TokBracketOpen)
+(def tok-bracket-close: Tok TokBracketClose)
+
+;; The text, and the cursor: byte offset, line and column, three cells.
+(defstruct Lexer (src: str n: i64 i: (Cell i64) line: (Cell i64) col: (Cell i64)))
+
+(defun lexer-new (src: str) -> Lexer
+  (Lexer src (str-len src) (cell 0) (cell 1) (cell 1)))
+
+;; The byte at offset i as 0 to 255, or -1 past the end.
+(defun byte-at :private (lx: Lexer i: i64) -> i64
+  (if (< i (. lx n)) (zext i64 (str-byte-at (. lx src) i)) -1))
+
+(defun lex-pos :private (lx: Lexer) -> i64 (pos-new @(. lx line) @(. lx col)))
+
+;; Consumes one byte; the column advances unless it is a continuation byte.
+(defun bump :private (lx: Lexer) -> unit
+  (let ((b (byte-at lx @(. lx i))))
+    (do (set! (. lx i) (+ @(. lx i) 1))
+        (cond (= b 10) (do (set! (. lx line) (+ @(. lx line) 1)) (set! (. lx col) 1))
+              (= (bit-and b 192) 128) ()
+              :else (set! (. lx col) (+ @(. lx col) 1))))))
+
+;; Consumes one character (its lead byte and the continuation bytes).
+(defun bump-char :private (lx: Lexer) -> unit
+  (do (bump lx)
+      (loop ()
+        (if (= (bit-and (byte-at lx @(. lx i)) 192) 128) (do (bump lx) (recur)) ()))))
+
+;; The byte length of the whitespace character at i (Unicode White_Space), 0 if there is none.
+(defun ws-len :private (lx: Lexer i: i64) -> i64
+  (let ((b (byte-at lx i)) (b1 (byte-at lx (+ i 1))) (b2 (byte-at lx (+ i 2))))
+    (cond (< b 128) (if (or (= b 32) (and (>= b 9) (<= b 13))) 1 0)
+          (= b 194) (if (or (= b1 133) (= b1 160)) 2 0)
+          (= b 225) (if (and (= b1 154) (= b2 128)) 3 0)
+          (= b 226) (cond (and (= b1 128) (or (and (>= b2 128) (<= b2 138)) (= b2 168) (= b2 169) (= b2 175))) 3
+                          (and (= b1 129) (= b2 159)) 3
+                          :else 0)
+          (= b 227) (if (and (= b1 128) (= b2 128)) 3 0)
+          :else 0)))
+
+;; A byte that ends an atom (lexer.rs `is_delim`).
+(defun delim-at? :private (lx: Lexer i: i64) -> bool
+  (let ((b (byte-at lx i)))
+    (or (= b 40) (= b 41) (= b 123) (= b 125) (= b 91) (= b 93) (= b 34) (= b 59) (= b 44) (> (ws-len lx i) 0))))
+
+(defun skip-space :private (lx: Lexer) -> unit
+  (loop ()
+    (let ((i @(. lx i)) (b (byte-at lx i)))
+      (cond (= b 59) (do (loop () (if (and (>= (byte-at lx @(. lx i)) 0) (not (= (byte-at lx @(. lx i)) 10)))
+                                      (do (bump lx) (recur))
+                                      ()))
+                         (recur))
+            (= b 44) (do (bump lx) (recur))
+            (> (ws-len lx i) 0) (do (bump-char lx) (recur))
+            :else ()))))
+
+;; The next token, nil at the end of the text (lexer.rs `Lexer::next`).
+(defun lex-next (lx: Lexer) -> (Result (Option Token) Diagnostic)
+  (do (skip-space lx)
+      (let ((start (lex-pos lx)) (b (byte-at lx @(. lx i))))
+        (cond (< b 0) (Ok nil)
+              (= b 40) (single lx tok-open start)
+              (= b 41) (single lx tok-close start)
+              (= b 123) (single lx tok-brace-open start)
+              (= b 125) (single lx tok-brace-close start)
+              (= b 91) (single lx tok-bracket-open start)
+              (= b 93) (single lx tok-bracket-close start)
+              (= b 34) (lex-string lx start)
+              (= b 60) (lex-vector lx start)
+              :else (lex-atom lx start)))))
+
+(defun single :private (lx: Lexer t: Tok start: i64) -> (Result (Option Token) Diagnostic)
+  (do (bump lx) (Ok (some (Token t start)))))
+
+(defun lex-atom :private (lx: Lexer start: i64) -> (Result (Option Token) Diagnostic)
+  (let ((from @(. lx i)))
+    (do (loop () (if (and (>= (byte-at lx @(. lx i)) 0) (not (delim-at? lx @(. lx i)))) (do (bump lx) (recur)) ()))
+        (Ok (some (Token (TokAtom (str-slice (. lx src) from @(. lx i))) start))))))
+
+(defun hex-digit :private (c: i64) -> i64
+  (cond (and (>= c 48) (<= c 57)) (- c 48)
+        (and (>= c 97) (<= c 102)) (- c 87)
+        (and (>= c 65) (<= c 70)) (- c 55)
+        :else -1))
+
+;; `escape_debug` of the character at the cursor, for the message of an invalid escape (ASCII exactly; others as themselves).
+(defun escape-debug :private (c: str) -> str
+  (cond (= c "\n") "\\n"
+        (= c "\r") "\\r"
+        (= c "\t") "\\t"
+        (= c "'") "\\'"
+        (= c "\\") "\\\\"
+        (= c "\"") "\\\""
+        (and (= (str-len c) 1) (or (< (zext i64 (str-byte-at c 0)) 32) (= (zext i64 (str-byte-at c 0)) 127)))
+        (str "\\u{" (hex-text (zext i64 (str-byte-at c 0))) "}")
+        :else c))
+
+(defun hex-text :private (n: i64) -> str
+  (if (< n 16)
+      (str-slice "0123456789abcdef" n (+ n 1))
+      (str-concat (hex-text (quot n 16)) (hex-text (rem n 16)))))
+
+;; The escape after a backslash that stood at `at`: its byte, or the error.
+(defun lex-escape :private (lx: Lexer at: i64) -> (Result i64 Diagnostic)
+  (let ((i @(. lx i)) (b (byte-at lx i)))
+    (cond (< b 0) (err at "unterminated string")
+          (= b 110) (do (bump lx) (Ok 10))
+          (= b 116) (do (bump lx) (Ok 9))
+          (= b 114) (do (bump lx) (Ok 13))
+          (= b 48) (do (bump lx) (Ok 0))
+          (= b 92) (do (bump lx) (Ok 92))
+          (= b 34) (do (bump lx) (Ok 34))
+          (= b 120) (do (bump lx) (lex-hex lx at))
+          :else (do (bump-char lx)
+                    (err at (str "invalid escape \\" (escape-debug (str-slice (. lx src) i @(. lx i)))))))))
+
+;; `\x` and two characters, both consumed whatever they are.
+(defun lex-hex :private (lx: Lexer at: i64) -> (Result i64 Diagnostic)
+  (let ((hi (take-digit lx)) (lo (take-digit lx)))
+    (if (and (>= hi 0) (>= lo 0))
+        (Ok (+ (* hi 16) lo))
+        (err at "invalid escape \\x: two hex digits expected"))))
+
+;; Consumes a character and answers its hex value, -1 if it is not a digit (or there was none).
+(defun take-digit :private (lx: Lexer) -> i64
+  (let ((b (byte-at lx @(. lx i))))
+    (if (< b 0) -1 (do (bump-char lx) (hex-digit b)))))
+
+;; A string literal; the bytes after escapes, any bytes.
+(defun lex-string :private (lx: Lexer start: i64) -> (Result (Option Token) Diagnostic)
+  (do (bump lx)
+      (let ((out (cell (array 0 0i8))))
+        (loop ()
+          (let ((at (lex-pos lx)) (b (byte-at lx @(. lx i))))
+            (cond (< b 0) (err start "unterminated string")
+                  (= b 34) (do (bump lx) (Ok (some (Token (TokStr @out) start))))
+                  (= b 92) (do (bump lx)
+                               (match (lex-escape lx at)
+                                 ((Err d) (Err d))
+                                 ((Ok v) (do (array-push! &out (trunc i8 v)) (recur)))))
+                  :else (do (bump lx) (array-push! &out (trunc i8 b)) (recur))))))))
+
+;; `<N x T>` as one token.
+(defun lex-vector :private (lx: Lexer start: i64) -> (Result (Option Token) Diagnostic)
+  (do (bump lx)
+      (let ((from @(. lx i)))
+        (loop ()
+          (let ((b (byte-at lx @(. lx i))))
+            (cond (= b 62) (vector-token lx start (str-slice (. lx src) from @(. lx i)))
+                  (or (< b 0) (= b 10) (= b 40) (= b 41)) (err start "unterminated vector type")
+                  :else (do (bump lx) (recur))))))))
+
+(defun vector-token :private (lx: Lexer start: i64 body: str) -> (Result (Option Token) Diagnostic)
+  (do (bump lx)
+      (let ((parts (words body)))
+        (if (and (= (count parts) 3) (= (nth parts 1) "x"))
+            (Ok (some (Token (TokVecType (nth parts 0) (nth parts 2)) start)))
+            (err start (str "malformed vector type <" body ">"))))))
+
+;; Whether byte b is ASCII whitespace.
+(defun ascii-space? :private (b: i64) -> bool (or (= b 32) (and (>= b 9) (<= b 13))))
+
+;; The ASCII-whitespace-separated words of a text (`split_whitespace`).
+(defun words :private (s: str) -> (Vec str)
+  (loop ((i 0) (from -1) (out []))
+    (cond (>= i (str-len s)) (if (>= from 0) (conj out (str-slice s from i)) out)
+          (ascii-space? (zext i64 (str-byte-at s i)))
+          (recur (+ i 1) -1 (if (>= from 0) (conj out (str-slice s from i)) out))
+          :else (recur (+ i 1) (if (>= from 0) from i) out))))
+
 ;; Splits `src` into tokens with their positions (sexp/lexer.rs `tokens`).
 (defun tokens (src: str) -> (Result (Vec Token) Diagnostic)
-  (trap "todo: lir.sexp.lexer tokens"))
+  (let ((lx (lexer-new src)))
+    (loop ((out []))
+      (match (lex-next lx)
+        ((Err d) (Err d))
+        ((Ok nil) (Ok out))
+        ((Ok (some t)) (recur (conj out t)))))))

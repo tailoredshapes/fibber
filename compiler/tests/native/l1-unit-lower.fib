@@ -1,0 +1,98 @@
+;; compiler/tests/native/l1-unit-lower.fib: package L1 (native.lower and friends) on a hand-built module of items without bodies. SOURCE: the expected text is
+;; what the Rust `lair emit-llvm` prints for the same module written as lIR (compiler/tests/native/l1-a.lir, run through target/debug/lair); the triple and data layout
+;; are the ones that text names, so the comparison does not depend on the machine. A module with bodies needs the instruction lowering (package L2).
+;; Build: l1-unit.sh
+(ns main
+  (:use types.check lir.diag lir.types lir.lit lir.ast native.error)
+  (:require [native.lower :as nl] [native.owned :as owned] [native.target :as target] [native.pipeline :as pipe]))
+
+(def triple: str "x86_64-pc-linux-gnu")
+(def layout: str "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128")
+
+(defun at (k: LKind) -> LExpr (expr-new k (pos-new 1 1)))
+(defun int (t: LType n: i64) -> LExpr (at (KInt t (lit-of n))))
+(defun gdef (name: str ty: LType init: LExpr constant: bool mods: LModifiers) -> LItem
+  (ItGlobal (LGlobalDef name ty init constant mods (pos-new 1 1))))
+(defun ext () -> LModifiers (LModifiers lk-external false))
+
+(defun abff () -> (Array i8)
+  (let ((c (cell (array 3 0i8))))
+    (do (array-set! &c 0 97i8) (array-set! &c 1 98i8) (array-set! &c 2 -1i8) @c)))
+
+(defun the-module () -> LModule
+  (let ((anon (TAnon [ty-i8 ty-i64]))
+        (arr2 (TArray 2 ty-i16))
+        (arr3 (TArray 3 ty-i32))
+        (vec2 (TVector 2 ty-i32))
+        )
+    (LModule
+      [(ItStruct (LStructDef "p" [ty-i32 ty-ptr] (pos-new 1 1)))
+       (gdef "g" ty-i32 (int ty-i32 7) false (ext))
+       (gdef "s" ty-ptr (at (KStr (abff))) true (LModifiers lk-internal false))
+       (gdef "q" (TNamed "p") (at (KStruct (some "p") [(int ty-i32 1) (at kind-null)])) false (ext))
+       (gdef "v" vec2 (at (KVector vec2 [(int ty-i32 1) (int ty-i32 2)])) false (LModifiers lk-external true))
+       (gdef "d" ty-double (at (KFloat ty-double 1.5)) false (ext))
+       (gdef "anon" anon (at (KStruct nil [(int ty-i8 255) (int ty-i64 -1)])) false (ext))
+       (gdef "arr" arr2 (at (KArray arr2 [(int ty-i16 1) (int ty-i16 2)])) false (ext))
+       (gdef "z" arr3 (at (KZero arr3)) false (ext))
+       (gdef "fp" ty-ptr (at (KGlobal "f")) false (ext))
+       (ItDeclareGlobal (LGlobalDecl "ext" ty-i64 false (pos-new 1 1)))
+       (ItDeclare (LDeclare "h" (LFnType CcTail (some ty-i64) [ty-i64 ty-ptr] true) true (pos-new 1 1)))
+       (ItDeclare (LDeclare "f-slow" (LFnType CcC nil [] false) false (pos-new 1 1)))
+       (ItDeclare (LDeclare "f" (LFnType CcC nil [] false) false (pos-new 1 1)))])))
+
+(def expected: str "; ModuleID = 'a.lir'
+source_filename = \"a.lir\"
+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"
+target triple = \"x86_64-pc-linux-gnu\"
+
+%struct.p = type { i32, ptr }
+
+@g = global i32 7
+@s = internal constant ptr @.str
+@q = global %struct.p { i32 1, ptr null }
+@v = hidden global <2 x i32> <i32 1, i32 2>
+@d = global double 1.500000e+00
+@anon = global { i8, i64 } { i8 -1, i64 -1 }
+@arr = global [2 x i16] [i16 1, i16 2]
+@z = global [3 x i32] zeroinitializer
+@fp = global ptr @f
+@ext = external global i64
+@.str = private unnamed_addr constant [4 x i8] c\"ab\\FF\\00\"
+
+declare hidden tailcc i64 @h(i64, ptr, ...)
+
+; Function Attrs: noinline
+declare void @f-slow() #0
+
+declare void @f()
+
+attributes #0 = { noinline }
+")
+
+(defun lowered-text (m: LModule) -> str
+  (match (nl/lower m "a.lir" triple layout)
+    ((Err e) (lair-error-str e))
+    ((Ok o) (let ((t (owned/owned-ir o))) (do (owned/owned-dispose o) t)))))
+
+;; A module the LLVM verifier rejects: a global whose initialiser has the wrong type is an internal error, not a crash.
+(defun bad-module () -> LModule
+  (LModule [(gdef "g" ty-i32 (int ty-i64 1) false (ext))]))
+
+(defun main () -> i64
+  (let ((cs (checks-new)))
+    (do
+      (check cs "a module of structs, globals and declarations lowers to the text the Rust prints"
+             (= (lowered-text (the-module)) expected))
+      (check cs "the verifier is the backstop: a mistyped initialiser is an internal error"
+             (starts-with? (lowered-text (bad-module)) "internal error: LLVM verifier rejected a checked module: "))
+      (check cs "requested-cpu: unset, empty and host mean the host's"
+             (and (nil? (target/requested-cpu nil)) (nil? (target/requested-cpu (some ""))) (nil? (target/requested-cpu (some "host")))
+                  (= (target/requested-cpu (some "x86-64-v2")) (some "x86-64-v2"))))
+      (check cs "the error texts of error.rs"
+             (and (= (lair-error-str (ErrBackend "x")) "error: x")
+                  (= (lair-error-str (ErrJit "x")) "error: jit: x")
+                  (= (lair-error-render (ErrBackend "x") "f.lir") "f.lir: error: x")
+                  (= (lair-error-render (lair-error-diag (diag-new (pos-new 3 4) "m")) "f.lir") "f.lir:3:4: error: m")
+                  (= (lair-error-str (lair-error-diag (diag-new (pos-new 3 4) "m"))) "3:4: error: m")))
+      (finish cs))))

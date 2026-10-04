@@ -1,4 +1,4 @@
-;; compiler/lir/check/walk.fib: walking expressions: sub-expressions in evaluation order, a block's statements, the names a function binds, and constants (crates/lir/src/check/walk.rs, and `is_constant` and `emits` of check/expr.rs). OWNER: package K1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/lir/check/walk.fib: walking expressions: sub-expressions in evaluation order, a block's statements, the names a function binds, and constants (crates/lir/src/check/walk.rs, and `is_constant` and `emits` of check/expr.rs). OWNER: package K1.
 
 ;; `constant?` and `emits?` live here, and not with the dispatcher, because phi.rs and globals.rs use them and the dispatcher requires phi.
 
@@ -10,22 +10,166 @@
 ;; `alloca`, with its type (walk.rs `Bindings`).
 (defstruct Bindings (defs: (Map str i64) allocas: (Map str LType)))
 
+;; The expressions of a callee head, then the arguments.
+(defun call-children (callee: LCallee args: (Vec LExpr)) -> (Vec LExpr)
+  (match callee
+    ((CalIndirect p _) (into [p] args))
+    ((CalDirect _) args)))
+
+;; The values of the bindings, then the body.
+(defun let-children (binds: (Vec LBinding) body: (Vec LExpr)) -> (Vec LExpr)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (>= i (count binds))
+        (into acc body)
+        (recur (+ i 1) (conj acc (. (nth binds i) value))))))
+
+(defun case-values (v: LExpr cases: (Vec LCase)) -> (Vec LExpr)
+  (loop ((i 0) (acc [v]))
+    (if (>= i (count cases))
+        acc
+        (recur (+ i 1) (conj acc (. (nth cases i) value))))))
+
+(defun phi-values (inc: (Vec LBinding)) -> (Vec LExpr)
+  (loop ((i 0) (acc (vec-empty)))
+    (if (>= i (count inc))
+        acc
+        (recur (+ i 1) (conj acc (. (nth inc i) value))))))
+
 ;; Direct sub-expressions in evaluation order (spec/lir.md 5.2). (walk.rs `children`)
 (defun children (e: LExpr) -> (Vec LExpr)
-  (trap "todo: lir.check.walk children"))
+  (match (. e kind)
+    ((KVector _ es) es)
+    ((KStruct _ es) es)
+    ((KArray _ es) es)
+    ((KUn _ a) [a])
+    ((KCast _ _ a) [a])
+    ((KExtractValue a _) [a])
+    ((KAtomicLoad _ _ _ a) [a])
+    ((KLoad _ a _ _) [a])
+    ((KRet v) (match v ((some a) [a]) (nil (vec-empty))))
+    ((KCondBr a _ _) [a])
+    ((KAlloca _ c _) (match c ((some a) [a]) (nil (vec-empty))))
+    ((KStore a b _ _) [a b])
+    ((KBin _ a b) [a b])
+    ((KOverflow _ a b) [a b])
+    ((KICmp _ a b) [a b])
+    ((KFCmp _ a b) [a b])
+    ((KExtractElement a b) [a b])
+    ((KInsertValue a b _) [a b])
+    ((KAtomicStore _ _ a b) [a b])
+    ((KAtomicRmw _ _ _ a b) [a b])
+    ((KSelect a b c) [a b c])
+    ((KInsertElement a b c) [a b c])
+    ((KShuffle a b c) [a b c])
+    ((KGep _ _ p idx) (into [p] idx))
+    ((KCmpXchg _ _ _ _ p x n) [p x n])
+    ((KCall callee args _) (call-children callee args))
+    ((KSwitch v _ cases) (case-values v cases))
+    ((KPhi _ inc) (phi-values inc))
+    ((KLet binds body) (let-children binds body))
+    (_ (vec-empty))))
+
+;; The statements of a body, appended to `acc`.
+(defun statements-into (body: (Vec LExpr) acc: (Vec LExpr)) -> (Vec LExpr)
+  (loop ((i 0) (acc acc))
+    (if (>= i (count body))
+        acc
+        (let ((e (nth body i)))
+          (recur (+ i 1)
+                 (match (. e kind)
+                   ((KLet _ inner) (statements-into inner acc))
+                   (_ (conj acc e))))))))
 
 ;; A block's statements: its forms, a top-level `let` contributing its body (spec/lir.md 5.1). (walk.rs `statements`)
 (defun statements (body: (Vec LExpr)) -> (Vec LExpr)
-  (trap "todo: lir.check.walk statements"))
+  (statements-into body (vec-empty)))
+
+;; Records the name `name` bound in block `blk` (-1: a parameter), or fails on a second binding. (walk.rs `add`)
+(defun bind-add (b: Bindings fname: str name: str blk: i64 pos: i64) -> (Result Bindings Diagnostic)
+  (if (contains? (. b defs) name)
+      (err pos (str "duplicate name " name " in @" fname))
+      (Ok (Bindings (assoc (. b defs) name blk) (. b allocas)))))
+
+;; The binding of `bind` and everything inside its value. (walk.rs `collect`, one binding of a `let`)
+(defun collect-bind (b: Bindings fname: str bind: LBinding blk: i64) -> (Result Bindings Diagnostic)
+  (try-let ((b1 (collect b fname (. bind value) blk)) (b2 (bind-add b1 fname (. bind name) blk (. bind pos))))
+    (Ok (match (. (. bind value) kind)
+          ((KAlloca ty nil _) (Bindings (. b2 defs) (assoc (. b2 allocas) (. bind name) ty)))
+          (_ b2)))))
+
+;; Every expression of `es` from index `from`, collected in order.
+(defun collect-all (b: Bindings fname: str es: (Vec LExpr) from: i64 blk: i64) -> (Result Bindings Diagnostic)
+  (loop ((i from) (b b))
+    (if (>= i (count es))
+        (Ok b)
+        (match (collect b fname (nth es i) blk)
+          ((Ok b2) (recur (+ i 1) b2))
+          ((Err d) (Err d))))))
+
+(defun collect-binds (b: Bindings fname: str binds: (Vec LBinding) blk: i64) -> (Result Bindings Diagnostic)
+  (loop ((i 0) (b b))
+    (if (>= i (count binds))
+        (Ok b)
+        (match (collect-bind b fname (nth binds i) blk)
+          ((Ok b2) (recur (+ i 1) b2))
+          ((Err d) (Err d))))))
+
+(defun collect (b: Bindings fname: str e: LExpr blk: i64) -> (Result Bindings Diagnostic)
+  (match (. e kind)
+    ((KLet binds body)
+     (try-let ((b1 (collect-binds b fname binds blk)))
+       (collect-all b1 fname body 0 blk)))
+    (_ (collect-all b fname (children e) 0 blk))))
+
+(defun collect-blocks (b: Bindings f: LFunction) -> (Result Bindings Diagnostic)
+  (loop ((i 0) (b b))
+    (if (>= i (count (. f blocks)))
+        (Ok b)
+        (match (collect-all b (. f name) (. (nth (. f blocks) i) body) 0 i)
+          ((Ok b2) (recur (+ i 1) b2))
+          ((Err d) (Err d))))))
+
+(defun collect-params (b: Bindings f: LFunction) -> (Result Bindings Diagnostic)
+  (loop ((i 0) (b b))
+    (if (>= i (count (. f params)))
+        (Ok b)
+        (let ((p (nth (. f params) i)))
+          (match (bind-add b (. f name) (. p name) -1 (. p pos))
+            ((Ok b2) (recur (+ i 1) b2))
+            ((Err d) (Err d)))))))
 
 ;; Collects every binding of `f`, rejecting a name bound twice: `duplicate name X in @f`. (walk.rs `bindings`)
 (defun bindings (f: LFunction) -> (Result Bindings Diagnostic)
-  (trap "todo: lir.check.walk bindings"))
+  (try-let ((b (collect-params (Bindings {} {}) f)))
+    (collect-blocks b f)))
 
 ;; A constant written in place: literals, `@name`, strings, `zeroinitializer` and structs or arrays of constants (spec/lir.md 6.11, 9). (expr.rs `is_constant`)
 (defun constant? (e: LExpr) -> bool
-  (trap "todo: lir.check.walk constant?"))
+  (match (. e kind)
+    ((KInt _ _) true)
+    ((KFloat _ _) true)
+    ((KNull) true)
+    ((KVector _ _) true)
+    ((KStr _) true)
+    ((KGlobal _) true)
+    ((KZero _) true)
+    ((KStruct _ fs) (every? constant? fs))
+    ((KArray _ fs) (every? constant? fs))
+    (_ false)))
 
 ;; Whether evaluating `e` emits an instruction of its own (a phi must come before any, spec/lir.md 5.4). (expr.rs `emits`)
 (defun emits? (e: LExpr) -> bool
-  (trap "todo: lir.check.walk emits?"))
+  (match (. e kind)
+    ((KLocal _) false)
+    ((KGlobal _) false)
+    ((KInt _ _) false)
+    ((KFloat _ _) false)
+    ((KNull) false)
+    ((KVector _ _) false)
+    ((KStr _) false)
+    ((KZero _) false)
+    ((KLet _ _) false)
+    ((KPhi _ _) false)
+    ((KStruct _ fs) (not (every? constant? fs)))
+    ((KArray _ fs) (not (every? constant? fs)))
+    (_ true)))

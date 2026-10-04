@@ -1,30 +1,119 @@
-;; compiler/lir/parse/ty.fib: types in lIR text (crates/lir/src/parse/ty.rs). OWNER: package R. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
-
+;; compiler/lir/parse/ty.fib: types in lIR text (crates/lir/src/parse/ty.rs). OWNER: package R.
 (ns lir.parse.ty
   (:use lir.diag lir.types lir.sexp lir.parse.names))
-
 
 (defstruct ParamTypes (types: (Vec LType) varargs: bool))
 
 ;; A convention word taken from the head of a list, and how many items it used (the `(Cc, usize)` of `parse_cc`).
 (defstruct CcSplit (cc: LCc used: i64))
 
+;; The value of an unsigned decimal text (a leading `+` allowed, as Rust's `u32::from_str`), or -1 when it is not one or exceeds u32::MAX.
+(defun parse-u32 (s: str) -> i64
+  (let ((n (str-len s))
+        (from (if (starts-with? s "+") 1 0)))
+    (if (>= from n)
+        -1
+        (loop ((i from) (acc 0))
+          (if (>= i n)
+              acc
+              (let ((b (zext i64 (str-byte-at s i))))
+                (if (and (>= b 48) (<= b 57))
+                    (let ((v (+ (* acc 10) (- b 48))))
+                      (if (> v 4294967295) -1 (recur (+ i 1) v)))
+                    -1)))))))
+
+(defun parse-types :private (items: (Vec Sexp)) -> (Result (Vec LType) Diagnostic)
+  (loop ((i 0) (out []))
+    (if (>= i (count items))
+        (Ok out)
+        (match (parse-type (nth items i))
+          ((Err d) (Err d))
+          ((Ok t) (recur (+ i 1) (conj out t)))))))
+
 ;; A type: a scalar keyword, `%struct.NAME`, `<N x E>` (1 to 1024 lanes), `{ T* }`, `[N x T]` (N up to 4294967295). (ty.rs `parse_type`)
 (defun parse-type (s: Sexp) -> (Result LType Diagnostic)
-  (trap "todo: lir.parse.ty parse-type"))
+  (match s
+    ((SxAtom a p) (atom-type a p))
+    ((SxVecType n e p) (vector-type n e p))
+    ((SxBrace items _) (try-let ((ts (parse-types items))) (Ok (TAnon ts))))
+    ((SxBracket items p) (array-type items p))
+    (_ (err (sexp-pos s) (str "expected a type, found " (sexp-describe s))))))
+
+(defun atom-type :private (a: str p: i64) -> (Result LType Diagnostic)
+  (match (scalar-keyword a)
+    ((some t) (Ok t))
+    (nil (cond (= a "void") (err p "void is only a function result type")
+               (and (starts-with? a "%struct.") (> (str-len a) 8)) (Ok (TNamed (str-slice a 8 (str-len a))))
+               :else (err p (str "unknown type " a))))))
+
+(defun vector-type :private (n: str e: str p: i64) -> (Result LType Diagnostic)
+  (let ((lanes (parse-u32 n)))
+    (if (and (>= lanes 1) (<= lanes 1024))
+        (match (scalar-keyword e)
+          ((some t) (Ok (TVector lanes t)))
+          (nil (err p (str "unknown vector element type " e))))
+        (err p "vector length must be 1 to 1024"))))
+
+(defun all-digits? :private (s: str) -> bool
+  (loop ((i 0))
+    (cond (>= i (str-len s)) true
+          (let ((b (zext i64 (str-byte-at s i)))) (and (>= b 48) (<= b 57))) (recur (+ i 1))
+          :else false)))
+
+;; `[N x T]` (spec/lir.md 2.1).
+(defun array-type :private (items: (Vec Sexp) p: i64) -> (Result LType Diagnostic)
+  (if (not (and (= (count items) 3) (atom-is? (nth items 1) "x")))
+      (err p "array type must be [N x T]")
+      (let ((n (nth items 0))
+            (digits (atom-or-empty (nth items 0))))
+        (cond (not (and (> (str-len digits) 0) (all-digits? digits)))
+              (err (sexp-pos n) (str "array length must be a non-negative integer, found " (sexp-describe n)))
+              (< (parse-u32 digits) 0) (err (sexp-pos n) (str "array length " digits " is too large"))
+              :else (try-let ((t (parse-type (nth items 2)))) (Ok (TArray (parse-u32 digits) t)))))))
 
 ;; A result type: a type or `void` (nil). (ty.rs `parse_ret`)
 (defun parse-ret (s: Sexp) -> (Result (Option LType) Diagnostic)
-  (trap "todo: lir.parse.ty parse-ret"))
+  (if (atom-is? s "void")
+      (Ok nil)
+      (try-let ((t (parse-type s))) (Ok (some t)))))
 
 ;; A parameter type list `(T* ...?)`. (ty.rs `parse_params`)
 (defun parse-params (s: Sexp) -> (Result ParamTypes Diagnostic)
-  (trap "todo: lir.parse.ty parse-params"))
+  (match s
+    ((SxList items _)
+     (loop ((i 0) (out []))
+       (if (>= i (count items))
+           (Ok (ParamTypes out false))
+           (let ((t (nth items i)))
+             (if (atom-is? t "...")
+                 (if (= (+ i 1) (count items))
+                     (Ok (ParamTypes out true))
+                     (err (sexp-pos t) "... must be the last parameter type"))
+                 (match (parse-type t)
+                   ((Err d) (Err d))
+                   ((Ok ty) (recur (+ i 1) (conj out ty)))))))))
+    (_ (err (sexp-pos s) (str "expected a parameter type list, found " (sexp-describe s))))))
 
 ;; The calling convention word at the head of `items`, if any (ccc, tailcc), and how many items it used. (ty.rs `parse_cc`)
 (defun parse-cc (items: (Vec Sexp)) -> CcSplit
-  (trap "todo: lir.parse.ty parse-cc"))
+  (cond (and (> (count items) 0) (atom-is? (nth items 0) "tailcc")) (CcSplit cc-tail 1)
+        (and (> (count items) 0) (atom-is? (nth items 0) "ccc")) (CcSplit cc-c 1)
+        :else (CcSplit cc-c 0)))
 
 ;; `(fn CC? RET PARAMS)`; `op` names the form in messages. (ty.rs `parse_fn_type`)
 (defun parse-fn-type (s: Sexp op: str) -> (Result LFnType Diagnostic)
-  (trap "todo: lir.parse.ty parse-fn-type"))
+  (match s
+    ((SxList items pos)
+     (if (and (> (count items) 0) (atom-is? (nth items 0) "fn"))
+         (let ((after (vec-from items 1))
+               (split (parse-cc after))
+               (rest (vec-from after (. split used))))
+           (try-let ((_ (arity "fn" rest 2 pos))
+                     (ret (parse-ret (nth rest 0)))
+                     (ps (parse-params (nth rest 1))))
+             (Ok (LFnType (. split cc) ret (. ps types) (. ps varargs)))))
+         (fn-type-found s op)))
+    (_ (fn-type-found s op))))
+
+(defun fn-type-found :private (s: Sexp op: str) -> (Result LFnType Diagnostic)
+  (err (sexp-pos s) (str op " needs a function type (fn R (T..)), found " (sexp-describe s))))

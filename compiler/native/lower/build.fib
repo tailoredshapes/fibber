@@ -1,0 +1,144 @@
+;; compiler/native/lower/build.fib: the IR-builder calls of the instruction lowering, as functions of handles (package L2's own module; it
+;; requires nothing of the lowering). Each makes an UNNAMED instruction (lIR names a value later, `native.lower.expr/name-value`), as the Rust
+;; does with `NONAME`; the LLVM-C names are copied by LLVM, so the empty C string made here is freed at once.
+;;
+;; The numbers of the enums are those of llvm-c/Core.h of LLVM 21 (`LLVMOpcode`, `LLVMIntPredicate`, `LLVMRealPredicate`,
+;; `LLVMAtomicOrdering`, `LLVMAtomicRMWBinOp`, `LLVMTailCallKind`).
+(ns native.lower.build
+  (:require [llvm.ffi :as ffi] [llvm.core :as core]))
+
+;; ---------------------------------------------------------------- the enums of LLVM-C
+
+(defun opcode-add () -> i32 8i32)
+(defun opcode-fadd () -> i32 9i32)
+(defun opcode-sub () -> i32 10i32)
+(defun opcode-fsub () -> i32 11i32)
+(defun opcode-mul () -> i32 12i32)
+(defun opcode-fmul () -> i32 13i32)
+(defun opcode-udiv () -> i32 14i32)
+(defun opcode-sdiv () -> i32 15i32)
+(defun opcode-fdiv () -> i32 16i32)
+(defun opcode-urem () -> i32 17i32)
+(defun opcode-srem () -> i32 18i32)
+(defun opcode-frem () -> i32 19i32)
+(defun opcode-shl () -> i32 20i32)
+(defun opcode-lshr () -> i32 21i32)
+(defun opcode-ashr () -> i32 22i32)
+(defun opcode-and () -> i32 23i32)
+(defun opcode-or () -> i32 24i32)
+(defun opcode-xor () -> i32 25i32)
+(defun opcode-trunc () -> i32 30i32)
+(defun opcode-zext () -> i32 31i32)
+(defun opcode-sext () -> i32 32i32)
+(defun opcode-fptoui () -> i32 33i32)
+(defun opcode-fptosi () -> i32 34i32)
+(defun opcode-uitofp () -> i32 35i32)
+(defun opcode-sitofp () -> i32 36i32)
+(defun opcode-fptrunc () -> i32 37i32)
+(defun opcode-fpext () -> i32 38i32)
+(defun opcode-ptrtoint () -> i32 39i32)
+(defun opcode-inttoptr () -> i32 40i32)
+(defun opcode-bitcast () -> i32 41i32)
+
+;; The ordering of lIR (0 unordered .. 5 seq_cst) as `LLVMAtomicOrdering` (unordered 1, monotonic 2, acquire 4, release 5, acq_rel 6, seq_cst 7).
+(defun ordering-number (rank: i64) -> i32
+  (cond (= rank 0) 1i32
+        (= rank 1) 2i32
+        (= rank 2) 4i32
+        (= rank 3) 5i32
+        (= rank 4) 6i32
+        :else 7i32))
+
+;; ---------------------------------------------------------------- the builder
+
+;; The empty C string, for the caller to free.
+(defun noname () -> ptr (ffi/bytes-new ""))
+
+(defun b-binop (b: i64 opc: i32 x: i64 y: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((v (core/LLVMBuildBinOp b opc x y n))) (do (free n) v)))))
+
+(defun b-fneg (b: i64 x: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((v (core/LLVMBuildFNeg b x n))) (do (free n) v)))))
+
+(defun b-icmp (b: i64 pred: i32 x: i64 y: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((v (core/LLVMBuildICmp b pred x y n))) (do (free n) v)))))
+
+(defun b-fcmp (b: i64 pred: i32 x: i64 y: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((v (core/LLVMBuildFCmp b pred x y n))) (do (free n) v)))))
+
+(defun b-cast (b: i64 opc: i32 x: i64 ty: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((v (core/LLVMBuildCast b opc x ty n))) (do (free n) v)))))
+
+(defun b-select (b: i64 c: i64 x: i64 y: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((v (core/LLVMBuildSelect b c x y n))) (do (free n) v)))))
+
+(defun b-extract-element (b: i64 v: i64 i: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildExtractElement b v i n))) (do (free n) r)))))
+
+(defun b-insert-element (b: i64 v: i64 x: i64 i: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildInsertElement b v x i n))) (do (free n) r)))))
+
+(defun b-shuffle (b: i64 x: i64 y: i64 m: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildShuffleVector b x y m n))) (do (free n) r)))))
+
+(defun b-extract-value (b: i64 v: i64 i: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildExtractValue b v (trunc i32 i) n))) (do (free n) r)))))
+
+(defun b-insert-value (b: i64 agg: i64 v: i64 i: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildInsertValue b agg v (trunc i32 i) n))) (do (free n) r)))))
+
+(defun b-alloca (b: i64 ty: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildAlloca b ty n))) (do (free n) r)))))
+
+(defun b-array-alloca (b: i64 ty: i64 count: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildArrayAlloca b ty count n))) (do (free n) r)))))
+
+(defun b-load (b: i64 ty: i64 p: i64) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildLoad2 b ty p n))) (do (free n) r)))))
+
+(defun b-store (b: i64 v: i64 p: i64) -> i64
+  (unsafe (core/LLVMBuildStore b v p)))
+
+(defun b-gep (b: i64 inbounds: bool ty: i64 p: i64 idx: (Vec i64)) -> i64
+  (let ((n (noname))
+        (is (ffi/words-new idx)))
+    (unsafe
+      (let ((r (if inbounds
+                   (core/LLVMBuildInBoundsGEP2 b ty p is (trunc i32 (count idx)) n)
+                   (core/LLVMBuildGEP2 b ty p is (trunc i32 (count idx)) n))))
+        (do (free n) (free is) r)))))
+
+(defun b-fence (b: i64 ord: i32 single: i32) -> i64
+  (let ((n (noname)))
+    (unsafe (let ((r (core/LLVMBuildFence b ord single n))) (do (free n) r)))))
+
+;; `intrinsic NAME` overloaded on the types `overloads`, called with `args` (arith.rs `intrinsic`).
+(defun b-intrinsic (b: i64 ctx: i64 module: i64 name: str overloads: (Vec i64) args: (Vec i64)) -> i64
+  (let ((nm (ffi/bytes-new name))
+        (tys (ffi/words-new overloads))
+        (k (count overloads)))
+    (unsafe
+      (let ((id (core/LLVMLookupIntrinsicID nm (str-len name)))
+            (f (core/LLVMGetIntrinsicDeclaration module id tys k))
+            (fty (core/LLVMIntrinsicGetType ctx id tys k)))
+        (do (free nm) (free tys)
+            (core/build-call b fty f args ""))))))
+
+;; The literal (unpacked) struct type of the fields `ts`.
+(defun struct-type (ctx: i64 ts: (Vec i64)) -> i64
+  (let ((p (ffi/words-new ts)))
+    (unsafe (let ((r (core/LLVMStructTypeInContext ctx p (trunc i32 (count ts)) 0i32))) (do (free p) r)))))

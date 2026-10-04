@@ -1,17 +1,33 @@
-;; compiler/native/pipeline.fib: the shared front half of every path: parse, check, and for a program the `main` rule (crates/lair/src/pipeline.rs). OWNER: package L1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/pipeline.fib: the shared front half of every path: parse, check, and for a program the `main` rule (crates/lair/src/pipeline.rs). OWNER: package L1.
 
 (ns native.pipeline
-  (:use lir.diag lir.ast native.error))
+  (:use lir.diag lir.ast native.error native.owned native.target)
+  (:require [lir :as front] [lir.check :as check] [native.lower :as nl]))
 
 
 ;; Parses and checks a module. (pipeline.rs `check_source`)
 (defun check-source (src: str) -> (Result LModule LairError)
-  (trap "todo: native.pipeline check-source"))
+  (match (front/parse-and-check src)
+    ((Err ds) (Err (ErrInvalid ds)))
+    ((Ok m) (Ok m))))
 
 ;; Parses and checks a module that will run as a program (`check-main`). (pipeline.rs `for_executable`)
 (defun for-executable (src: str) -> (Result LModule LairError)
-  (trap "todo: native.pipeline for-executable"))
+  (match (check-source src)
+    ((Err e) (Err e))
+    ((Ok m) (match (check/check-main m)
+              ((Err d) (Err (lair-error-diag d)))
+              ((Ok _) (Ok m))))))
 
 ;; The verified, unoptimised LLVM IR of a module for the host: the text `lairf emit-llvm` prints. (pipeline.rs `emit_llvm`)
 (defun emit-llvm (src: str name: str) -> (Result str LairError)
-  (trap "todo: native.pipeline emit-llvm"))
+  (match (check-source src)
+    ((Err e) (Err e))
+    ((Ok m) (match (machine-host 0)
+              ((Err e) (Err e))
+              ((Ok host) (let ((r (nl/lower m name (. host triple) (. host data-layout))))
+                           (do (machine-dispose host)
+                               (match r
+                                 ((Err e) (Err e))
+                                 ((Ok o) (let ((text (owned-ir o)))
+                                           (do (owned-dispose o) (Ok text))))))))))))

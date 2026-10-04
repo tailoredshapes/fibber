@@ -1,9 +1,113 @@
-;; compiler/native/lower/func.fib: lowering one function: blocks in dominator order, phis fixed up at the end (crates/lair/src/lower/func.rs). OWNER: package L1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/lower/func.fib: lowering one function: blocks in dominator order, phis fixed up at the end (crates/lair/src/lower/func.rs). OWNER: package L1.
 
 (ns native.lower.func
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.expr native.lower.arith native.lower.calls native.lower.memory))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.consts native.lower.expr native.lower.arith native.lower.calls native.lower.memory)
+  (:require [llvm.core :as core] [llvm.ffi :as ffi] [lir.check.func :as cf]))
 
 
 ;; Lowers the body of `f`, a function already declared in `lx`; builds the `Fx` with `lower-expr` as its dispatcher. (func.rs `Lx::function`)
 (defun lx-function (lx: Lx f: LFunction) -> (Result unit LairError)
-  (trap "todo: native.lower.func lx-function"))
+  (let ((entry (match (get @(. lx funcs) (. f name))
+                 ((some e) e)
+                 (nil (trap (str "undeclared function " (. f name)))))))
+    (match (cf/block-order f)
+      ((Err d) (Err (ErrInternal (diag-str d))))
+      ((Ok order) (lx-function-in lx f (. entry value) order)))))
+
+(defun lx-function-in :private (lx: Lx f: LFunction func: i64 order: (Vec i64)) -> (Result unit LairError)
+  (let ((b (unsafe (core/LLVMCreateBuilderInContext (. lx ctx))))
+        (blocks (vec (map (fn (blk) (core/append-block (. lx ctx) func (. blk label))) (. f blocks))))
+        (labels (loop ((i 0) (m {}))
+                  (if (>= i (count (. f blocks)))
+                      m
+                      (recur (+ i 1) (assoc m (. (nth (. f blocks) i) label) i)))))
+        (names: (Cell (Map str i64)) (cell {}))
+        (phis: (Cell (Vec PhiFix)) (cell [])))
+    (let ((fx (Fx lx b blocks labels names phis lower-expr))
+          (r (fx-body fx f func order)))
+      (do (unsafe (core/LLVMDisposeBuilder b)) r))))
+
+(defun bind-name :private (fx: Fx name: str v: i64) -> unit
+  (set! (. fx names) (assoc @(. fx names) name v)))
+
+(defun fx-body :private (fx: Fx f: LFunction func: i64 order: (Vec i64)) -> (Result unit LairError)
+  (do (dotimes (i (count (. f params)))
+        (let ((v (unsafe (core/LLVMGetParam func (trunc i32 i))))
+              (name (. (nth (. f params) i) name)))
+          (do (name-value v name) (bind-name fx name v))))
+      (match (fx-blocks fx f order)
+        ((Err x) (Err x))
+        ((Ok _) (fx-fix-phis fx)))))
+
+;; The blocks in dominator order, each instruction lowered in turn.
+(defun fx-blocks :private (fx: Fx f: LFunction order: (Vec i64)) -> (Result unit LairError)
+  (loop ((i 0))
+    (if (>= i (count order))
+        (Ok ())
+        (let ((blk (nth order i)))
+          (do (unsafe (core/LLVMPositionBuilderAtEnd (. fx b) (nth (. fx blocks) blk)))
+              (match (fx-instrs fx (. (nth (. f blocks) blk) body))
+                ((Err x) (Err x))
+                ((Ok _) (recur (+ i 1)))))))))
+
+(defun fx-instrs :private (fx: Fx body: (Vec LExpr)) -> (Result unit LairError)
+  (loop ((i 0))
+    (if (>= i (count body))
+        (Ok ())
+        (match (fx-expr fx (nth body i))
+          ((Err x) (Err x))
+          ((Ok _) (recur (+ i 1)))))))
+
+;; Adds the incoming edges of every phi, once the whole function is lowered. LLVM wants one entry per edge: a `br` or `switch` naming
+;; the phi's block twice gets the same value twice.
+(defun fx-fix-phis :private (fx: Fx) -> (Result unit LairError)
+  (let ((phis @(. fx phis)))
+    (loop ((i 0))
+      (if (>= i (count phis))
+          (Ok ())
+          (match (fix-phi fx (nth phis i))
+            ((Err x) (Err x))
+            ((Ok _) (recur (+ i 1))))))))
+
+(defun fix-phi :private (fx: Fx p: PhiFix) -> (Result unit LairError)
+  (let ((inc (. p incoming)))
+    (loop ((i 0))
+      (if (>= i (count inc))
+          (Ok ())
+          (let ((b (nth inc i)))
+            (match (incoming-value fx (. b value))
+              ((Err x) (Err x))
+              ((Ok v) (let ((bb (nth (. fx blocks) (get-label fx (. b name)))))
+                        (do (add-edges (. p phi) v bb)
+                            (recur (+ i 1)))))))))))
+
+(defun get-label :private (fx: Fx name: str) -> i64
+  (match (get (. fx labels) name)
+    ((some i) i)
+    (nil (trap (str "unknown label " name)))))
+
+(defun add-edges :private (phi: i64 v: i64 bb: i64) -> unit
+  (let ((n (edges bb (unsafe (core/LLVMGetInstructionParent phi))))
+        (vs (ffi/words-new [v]))
+        (bs (ffi/words-new [bb])))
+    (do (dotimes (i n) (unsafe (core/LLVMAddIncoming phi vs bs 1i32)))
+        (unsafe (do (free vs) (free bs))))))
+
+(defun incoming-value :private (fx: Fx e: LExpr) -> (Result i64 LairError)
+  (match (. e kind)
+    ((KLocal n) (match (get @(. fx names) n)
+                  ((some v) (Ok v))
+                  (nil (Err (ErrInternal (str "phi value " n " not lowered"))))))
+    (_ (lx-constant (. fx lx) e))))
+
+;; How many edges of `from`'s terminator lead to `to` (at least 1; 1 when `from` has no terminator).
+(defun edges :private (from: i64 to: i64) -> i64
+  (unsafe
+    (let ((term (core/LLVMGetBasicBlockTerminator from)))
+      (if (= term 0)
+          1
+          (let ((n (sext i64 (core/LLVMGetNumSuccessors term))))
+            (max 1 (loop ((i 0) (c 0))
+                     (if (>= i n)
+                         c
+                         (recur (+ i 1) (if (= (core/LLVMGetSuccessor term (trunc i32 i)) to) (+ c 1) c))))))))))

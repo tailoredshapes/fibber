@@ -1,9 +1,129 @@
-;; compiler/native/lower.fib: lowering a checked lIR module to an LLVM module (crates/lair/src/lower/mod.rs `lower`). OWNER: package L1. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/lower.fib: lowering a checked lIR module to an LLVM module (crates/lair/src/lower/mod.rs `lower`). OWNER: package L1.
 
 (ns native.lower
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.owned native.lower.lx))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.owned native.lower.lx native.lower.types native.lower.consts native.lower.func)
+  (:require [llvm.core :as core] [llvm.ffi :as ffi] [llvm.target :as lt] [llvm.analysis :as analysis] [fib.string :as s]))
 
 
 ;; Lowers a module `lir.check/check` accepted, for the given triple and data layout, and runs the LLVM verifier on the result (`Internal` if it rejects). Declares structs, then every function and global, then initialisers, then bodies. (mod.rs `lower`)
 (defun lower (m: LModule name: str triple: str data-layout: str) -> (Result Owned LairError)
-  (trap "todo: native.lower lower"))
+  (let ((owned (owned-new name triple data-layout))
+        (dl (ffi/bytes-new data-layout))
+        (td (unsafe (lt/LLVMCreateTargetData dl)))
+        (structs: (Cell (Map str i64)) (cell {}))
+        (fields: (Cell (Map str (Vec LType))) (cell {}))
+        (funcs: (Cell (Map str FuncEntry)) (cell {}))
+        (globals: (Cell (Map str i64)) (cell {})))
+    (let ((lx (Lx (. owned ctx) (. owned module) td structs fields funcs globals))
+          (r (module-items lx m)))
+      (do (unsafe (do (lt/LLVMDisposeTargetData td) (free dl)))
+          (match r
+            ((Err x) (do (owned-dispose owned) (Err x)))
+            ((Ok _) (match (analysis/verify (. owned module))
+                      ((Err msg) (do (owned-dispose owned) (Err (ErrInternal msg))))
+                      ((Ok _) (Ok owned)))))))))
+
+(defun module-items :private (lx: Lx m: LModule) -> (Result unit LairError)
+  (let ((items (. m items)))
+    (do (declare-structs lx items)
+        (dotimes (i (count items))
+          (match (nth items i)
+            ((ItDeclare d) (add-function lx (. d name) (. d ty) (hidden-mods (. d hidden))))
+            ((ItDefine f) (add-function lx (. f name) (. f ty) (. f mods)))
+            ((ItGlobal g) (add-global lx (. g name) (. g ty) (. g mods)))
+            ((ItDeclareGlobal g) (add-global lx (. g name) (. g ty) (hidden-mods (. g hidden))))
+            ((ItStruct _) ())))
+        (match (init-globals lx items)
+          ((Err x) (Err x))
+          ((Ok _) (lower-bodies lx items))))))
+
+(defun init-globals :private (lx: Lx items: (Vec LItem)) -> (Result unit LairError)
+  (loop ((i 0))
+    (if (>= i (count items))
+        (Ok ())
+        (match (nth items i)
+          ((ItGlobal g) (match (lx-constant lx (. g init))
+                          ((Err x) (Err x))
+                          ((Ok init) (let ((gv (global-of lx (. g name))))
+                                       (do (unsafe (do (core/LLVMSetInitializer gv init)
+                                                       (core/LLVMSetGlobalConstant gv (if (. g constant) 1i32 0i32))))
+                                           (recur (+ i 1)))))))
+          (_ (recur (+ i 1)))))))
+
+(defun global-of :private (lx: Lx name: str) -> i64
+  (match (get @(. lx globals) name)
+    ((some v) v)
+    (nil (trap (str "unknown global " name)))))
+
+(defun lower-bodies :private (lx: Lx items: (Vec LItem)) -> (Result unit LairError)
+  (loop ((i 0))
+    (if (>= i (count items))
+        (Ok ())
+        (match (nth items i)
+          ((ItDefine f) (match (lx-function lx f)
+                          ((Err x) (Err x))
+                          ((Ok _) (recur (+ i 1)))))
+          (_ (recur (+ i 1)))))))
+
+(defun declare-structs :private (lx: Lx items: (Vec LItem)) -> unit
+  (do (dotimes (i (count items))
+        (match (nth items i)
+          ((ItStruct s) (let ((n (ffi/bytes-new (str "struct." (. s name))))
+                              (t (unsafe (core/LLVMStructCreateNamed (. lx ctx) n))))
+                          (do (unsafe (free n))
+                              (set! (. lx structs) (assoc @(. lx structs) (. s name) t))
+                              (set! (. lx struct-fields) (assoc @(. lx struct-fields) (. s name) (. s fields))))))
+          (_ ())))
+      (dotimes (i (count items))
+        (match (nth items i)
+          ((ItStruct s) (let ((ws (ffi/words-new (vec (map (fn (f) (lx-ty lx f)) (. s fields))))))
+                          (unsafe
+                            (do (core/LLVMStructSetBody (global-struct lx (. s name)) ws (trunc i32 (count (. s fields))) 0i32)
+                                (free ws)))))
+          (_ ())))))
+
+(defun global-struct :private (lx: Lx name: str) -> i64
+  (match (get @(. lx structs) name)
+    ((some v) v)
+    (nil (trap (str "unknown struct " name)))))
+
+(defun add-function :private (lx: Lx name: str ty: LFnType mods: LModifiers) -> unit
+  (let ((f (core/add-function (. lx module) name (lx-fn-ty lx ty))))
+    (do (unsafe (core/LLVMSetFunctionCallConv f (trunc i32 (cc-number (. ty cc)))))
+        (set-modifiers f mods)
+        (if (slow-path? name) (add-noinline lx f) ())
+        (set! (. lx funcs) (assoc @(. lx funcs) name (FuncEntry f ty))))))
+
+;; The function attribute `noinline` on `f`.
+(defun add-noinline :private (lx: Lx f: i64) -> unit
+  (let ((k (ffi/bytes-new "noinline")))
+    (unsafe
+      (let ((kind (core/LLVMGetEnumAttributeKindForName k 8))
+            (attr (core/LLVMCreateEnumAttribute (. lx ctx) kind 0)))
+        (do (core/LLVMAddAttributeAtIndex f -1i32 attr)
+            (free k))))))
+
+;; A global; a definition gets its initialiser later, a `declare-global` none (spec/lir.md 4.4).
+(defun add-global :private (lx: Lx name: str ty: LType mods: LModifiers) -> unit
+  (let ((t (lx-ty lx ty))
+        (n (ffi/bytes-new name)))
+    (let ((gv (unsafe (core/LLVMAddGlobal (. lx module) t n))))
+      (do (unsafe (free n))
+          (set-modifiers gv mods)
+          (set! (. lx globals) (assoc @(. lx globals) name gv))))))
+
+;; Applies linkage and visibility words (spec/lir.md 4.3): internal is 8, private 9, hidden visibility 1.
+(defun set-modifiers :private (v: i64 mods: LModifiers) -> unit
+  (do (match (. mods linkage)
+        ((LkExternal) ())
+        ((LkInternal) (unsafe (core/LLVMSetLinkage v 8i32)))
+        ((LkPrivate) (unsafe (core/LLVMSetLinkage v 9i32))))
+      (if (. mods hidden) (unsafe (core/LLVMSetVisibility v 1i32)) ())))
+
+;; A function whose name ends in `-slow` is the out-of-line path of an inlinable fast path (the runtime's `fib.release` and
+;; `fib.release-slow`): it is never inlined (see mod.rs `is_slow_path` for why).
+(defun slow-path? :private (name: str) -> bool
+  (s/ends-with? name "-slow"))
+
+(defun hidden-mods :private (hidden: bool) -> LModifiers
+  (LModifiers lk-external hidden))

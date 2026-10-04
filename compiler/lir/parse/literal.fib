@@ -1,32 +1,184 @@
-;; compiler/lir/parse/literal.fib: literals in lIR text (crates/lir/src/parse/literal.rs). OWNER: package R. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
-
+;; compiler/lir/parse/literal.fib: literals in lIR text (crates/lir/src/parse/literal.rs). OWNER: package R.
+;;
 ;; Integers are `LLit` (lir.lit): `int-token` reads the magnitude with `lit-mul-add`, which refuses what `i128::from_str_radix` refuses (more than
 ;; 2^127 - 1), then applies the sign; `int-value` checks the range of the type with `lit-fits-int?`.
-
+;;
+;; `array-literal` cannot parse its elements (its module is below `lir.parse.expr`): it makes the shell, `([N x T])` with no elements
+;; after the count check, and `lir.parse.expr` fills the elements in (see its `array-form`).
 (ns lir.parse.literal
   (:use lir.diag lir.types lir.lit lir.ast lir.sexp lir.parse.names))
 
+(extern strtod :private (ptr ptr) -> f64)
+
+(defun digit-of :private (b: i64 radix: i64) -> i64
+  (let ((v (cond (and (>= b 48) (<= b 57)) (- b 48)
+                 (and (>= b 97) (<= b 122)) (- b 87)
+                 (and (>= b 65) (<= b 90)) (- b 55)
+                 :else 99)))
+    (if (< v radix) v -1)))
+
+;; The magnitude of the digits of s from byte `from`, in `radix`, nil when empty, not all digits, or above 2^127 - 1.
+(defun magnitude :private (s: str from: i64 radix: i64) -> (Option LLit)
+  (if (>= from (str-len s))
+      nil
+      (loop ((i from) (acc (lit-zero)))
+        (if (>= i (str-len s))
+            (some acc)
+            (let ((d (digit-of (zext i64 (str-byte-at s i)) radix)))
+              (if (< d 0)
+                  nil
+                  (match (lit-mul-add acc radix d)
+                    ((some v) (recur (+ i 1) v))
+                    (nil nil))))))))
 
 ;; An integer token: decimal, `0x`, `0b`, an optional `-`; nil when it is not one or its magnitude exceeds 2^127 - 1. (literal.rs `int_token`)
 (defun int-token (s: str) -> (Option LLit)
-  (trap "todo: lir.parse.literal int-token"))
+  (let ((neg (starts-with? s "-"))
+        (body (strip-minus s)))
+    (let ((m (cond (starts-with? body "0x") (magnitude body 2 16)
+                   (starts-with? body "0b") (magnitude body 2 2)
+                   :else (magnitude body 0 10))))
+      (match m
+        ((some v) (some (if neg (lit-neg v) v)))
+        (nil nil)))))
+
+(defun alnum? :private (b: i64) -> bool
+  (or (and (>= b 48) (<= b 57)) (and (>= b 97) (<= b 122)) (and (>= b 65) (<= b 90))))
+
+;; Digits first, then ASCII letters and digits only (literal.rs `is_int_text`).
+(defun int-text? :private (s: str) -> bool
+  (let ((body (strip-minus s)))
+    (and (digit-first? body)
+         (loop ((i 0))
+           (cond (>= i (str-len body)) true
+                 (alnum? (zext i64 (str-byte-at body i))) (recur (+ i 1))
+                 :else false)))))
 
 ;; The value of an `iK` literal token, in range `-2^(K-1) .. 2^K-1`, else `integer literal TOK out of range for iK` or `invalid integer literal TOK`. (literal.rs `int_value`)
 (defun int-value (bits: i64 tok: str pos: i64) -> (Result LLit Diagnostic)
-  (trap "todo: lir.parse.literal int-value"))
+  (match (int-token tok)
+    ((some v) (if (lit-fits-int? bits v) (Ok v) (int-out-of-range bits tok pos)))
+    (nil (if (int-text? tok)
+             (int-out-of-range bits tok pos)
+             (err pos (str "invalid integer literal " tok))))))
+
+(defun int-out-of-range :private (bits: i64 tok: str pos: i64) -> (Result LLit Diagnostic)
+  (err pos (str "integer literal " tok " out of range for i" bits)))
+
+(defun digits-at :private (s: str i: i64) -> i64
+  (loop ((j i))
+    (if (and (< j (str-len s)) (let ((b (zext i64 (str-byte-at s j)))) (and (>= b 48) (<= b 57))))
+        (recur (+ j 1))
+        j)))
+
+(defun byte-or :private (s: str i: i64) -> i64
+  (if (< i (str-len s)) (zext i64 (str-byte-at s i)) -1))
+
+;; digits, an optional `.` and digits, an optional exponent (literal.rs `float_syntax`).
+(defun float-syntax :private (s: str) -> bool
+  (let ((body (strip-minus s)))
+    (let ((i1 (digits-at body 0))
+          (seen0 (> (digits-at body 0) 0)))
+      (let ((dot (= (byte-or body i1) 46))
+            (i2 (if (= (byte-or body i1) 46) (digits-at body (+ i1 1)) i1)))
+        (let ((seen (or seen0 (> i2 (if dot (+ i1 1) i1))))
+              (e (byte-or body i2)))
+          (if (or (= e 101) (= e 69))
+              (let ((i3 (if (or (= (byte-or body (+ i2 1)) 43) (= (byte-or body (+ i2 1)) 45)) (+ i2 2) (+ i2 1)))
+                    (i4 (digits-at body (if (or (= (byte-or body (+ i2 1)) 43) (= (byte-or body (+ i2 1)) 45)) (+ i2 2) (+ i2 1)))))
+                (and seen (> i4 i3) (= i4 (str-len body))))
+              (and seen (= i2 (str-len body)))))))))
+
+;; `strtod` of a clean decimal text.
+(defun read-f64 :private (s: str) -> f64
+  (let ((bs (str-bytes s)) (n (array-len bs)))
+    (unsafe
+      (let ((p (alloc (+ n 1))) (e (alloc 8)))
+        (do (dotimes (i n) (store-i8 (ptr+ p i) (array-get bs i)))
+            (store-i8 (ptr+ p n) 0i8)
+            (let ((r (strtod p e))) (do (free e) (free p) r)))))))
+
+(defun finite? :private (v: f64) -> bool (= (- v v) 0.0))
+
+;; The f64 a token reads as, or nil when it is not a float token.
+(defun float-token :private (tok: str) -> (Option f64)
+  (cond (= tok "inf") (some (bits->f64 9218868437227405312))
+        (= tok "-inf") (some (bits->f64 -4503599627370496))
+        (= tok "nan") (some (bits->f64 9221120237041090560))
+        (float-syntax tok) (some (read-f64 tok))
+        :else nil))
 
 ;; The value of a `float` or `double` literal token (`inf`, `-inf`, `nan` included); a finite token that rounds to infinity is out of range. (literal.rs `float_value`)
 (defun float-value (ty: LType tok: str pos: i64) -> (Result f64 Diagnostic)
-  (trap "todo: lir.parse.literal float-value"))
+  (match (float-token tok)
+    (nil (err pos (str "invalid float literal " tok)))
+    ((some v)
+     (let ((finite-token (not (or (= tok "inf") (= tok "-inf") (= tok "nan"))))
+           (overflow (match ty
+                       ((TFloat) (not (finite? (fpext f64 (fptrunc f32 v)))))
+                       (_ (not (finite? v))))))
+       (if (and finite-token overflow)
+           (err pos (str "float literal out of range for " (type-str ty)))
+           (Ok v))))))
 
 ;; `(iK n)`, `(float x)`, `(double x)`, `(ptr null)`. (literal.rs `scalar_literal`)
 (defun scalar-literal (ty: LType args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
-  (trap "todo: lir.parse.literal scalar-literal"))
+  (let ((name (type-str ty)))
+    (try-let ((_ (arity name args 1 pos)))
+      (match (nth args 0)
+        ((SxAtom tok ap) (scalar-token ty name tok ap pos))
+        (other (err (sexp-pos other) (str name " literal needs a number")))))))
+
+(defun scalar-token :private (ty: LType name: str tok: str ap: i64 pos: i64) -> (Result LExpr Diagnostic)
+  (match ty
+    ((TInt b) (try-let ((v (int-value b tok ap))) (Ok (expr-new (KInt ty v) pos))))
+    ((TPtr) (if (= tok "null") (Ok (expr-new kind-null pos)) (err pos "the only ptr literal is (ptr null)")))
+    (_ (try-let ((v (float-value ty tok ap))) (Ok (expr-new (KFloat ty v) pos))))))
 
 ;; `(<N x E> e..)`. (literal.rs `vector_literal`)
 (defun vector-literal (ty: LType args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
-  (trap "todo: lir.parse.literal vector-literal"))
+  (match ty
+    ((TVector n elem)
+     (if (not (= (count args) n))
+         (err pos (str "vector literal " (type-str ty) " needs " n " elements, found " (count args)))
+         (loop ((i 0) (out []))
+           (if (>= i (count args))
+               (Ok (expr-new (KVector ty out) pos))
+               (match (vector-element elem (nth args i))
+                 ((Err d) (Err d))
+                 ((Ok e) (recur (+ i 1) (conj out e))))))))
+    (_ (err pos "not a vector type"))))
 
-;; `([N x T] e..)`. (literal.rs `array_literal`)
+(defun vector-element :private (elem: LType a: Sexp) -> (Result LExpr Diagnostic)
+  (let ((pos (sexp-pos a)) (bad "vector literal element must be a number"))
+    (match a
+      ((SxAtom tok _)
+       (match elem
+         ((TInt b)
+          (if (or (some-lit? (int-token tok)) (int-text? tok))
+              (try-let ((v (int-value b tok pos))) (Ok (expr-new (KInt elem v) pos)))
+              (err pos bad)))
+         ((TPtr) (if (= tok "null") (Ok (expr-new kind-null pos)) (err pos bad)))
+         ((TFloat) (float-element elem tok pos))
+         ((TDouble) (float-element elem tok pos))
+         (_ (err pos bad))))
+      (_ (err pos bad)))))
+
+(defun some-lit? :private (o: (Option LLit)) -> bool
+  (match o ((some _) true) (nil false)))
+
+(defun float-element :private (elem: LType tok: str pos: i64) -> (Result LExpr Diagnostic)
+  (match (float-value elem tok pos)
+    ((Ok v) (Ok (expr-new (KFloat elem v) pos)))
+    ((Err d) (if (starts-with? (. d message) "invalid")
+                 (err pos "vector literal element must be a number")
+                 (Err d)))))
+
+;; `([N x T] e..)`: the shell, with the count checked; the caller parses the elements. (literal.rs `array_literal`)
 (defun array-literal (ty: LType args: (Vec Sexp) pos: i64) -> (Result LExpr Diagnostic)
-  (trap "todo: lir.parse.literal array-literal"))
+  (match ty
+    ((TArray n _)
+     (if (= (count args) n)
+         (Ok (expr-new (KArray ty []) pos))
+         (err pos (str (type-str ty) " literal: " n " elements expected, found " (count args)))))
+    (_ (err pos "not an array type"))))
