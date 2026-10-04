@@ -1,0 +1,15 @@
+;; compiler/llvm/analysis.fib: llvm-c/Analysis.h, the verifier, as crates/lair/src/lower uses it (LLVMVerifyModule with
+;; LLVMReturnStatusAction: it returns 1 and a message instead of printing and aborting).
+(ns llvm.analysis (:require [llvm.ffi :as ffi] [llvm.core :as core]))
+
+(extern LLVMVerifyModule (i64 i32 ptr) -> i32)
+
+;; `Ok ()` when the module is well formed, else the verifier's message (LLVM's, copied and disposed).
+(defun verify (m: i64) -> (Result unit str)
+  (let ((msg (ffi/slot-new)))
+    (unsafe
+      (let ((failed (LLVMVerifyModule m 2i32 msg))
+            (r (if (= failed 0i32)
+                   (Ok ())
+                   (Err (core/take-message (load-i64 msg))))))
+        (do (free msg) r)))))

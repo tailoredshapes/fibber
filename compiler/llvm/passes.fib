@@ -1,0 +1,22 @@
+;; compiler/llvm/passes.fib: llvm-c/Transforms/PassBuilder.h, LLVM's new pass manager, as crates/lair/src/llvm/passes.rs uses it:
+;; the `default<On>` pipelines.
+(ns llvm.passes (:require [llvm.ffi :as ffi] [llvm.support :as support]))
+
+(extern LLVMCreatePassBuilderOptions () -> i64)
+(extern LLVMDisposePassBuilderOptions (i64) -> unit)
+(extern LLVMRunPasses (i64 ptr i64 i64) -> i64)
+
+;; Runs `default<On>` over the module `m`, n = `level` clamped to 3; level 0 runs nothing. `tm` is a target machine or 0. Rust:
+;; passes.rs `optimize`
+(defun optimize (m: i64 tm: i64 level: i64) -> (Result unit str)
+  (if (<= level 0)
+      (Ok ())
+      (let ((spec (ffi/bytes-new (str-concat "default<O" (str-concat (show (min level 3)) ">"))))
+            (opts (unsafe (LLVMCreatePassBuilderOptions))))
+        (unsafe
+          (let ((e (LLVMRunPasses m spec tm opts)))
+            (do (LLVMDisposePassBuilderOptions opts)
+                (free spec)
+                (match (support/status e)
+                  ((Err msg) (Err (str-concat "optimisation failed: " msg)))
+                  ((Ok _) (Ok ())))))))))

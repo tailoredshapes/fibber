@@ -1,0 +1,93 @@
+;; compiler/llvm/orc.fib: llvm-c/Orc.h and llvm-c/LLJIT.h as crates/lair/src/jit/mod.rs uses them: an LLJIT session over the host,
+;; modules added to it, symbols looked up in it.
+;;
+;; Ownership, as in lair's `Jit`: `LLVMOrcCreateLLJIT` consumes the builder; the generator that makes the process's symbols (the C
+;; library's) visible is owned by the JITDylib once added; `LLVMOrcLLJITAddLLVMIRModule` consumes the thread-safe module on success,
+;; and with it the LLVM context and module it was made from, so after `add-module` neither is disposed by the caller.
+;; `jit-free` ends the session and every address it gave out is dead.
+(ns llvm.orc (:require [llvm.ffi :as ffi] [llvm.support :as support]))
+
+;; --- Orc.h
+(extern LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess (ptr i32 i64 ptr) -> i64)
+;; --- LLJIT.h
+(extern LLVMOrcCreateLLJIT (ptr i64) -> i64)
+(extern LLVMOrcCreateLLJITBuilder () -> i64)
+;; --- Orc.h
+(extern LLVMOrcCreateNewThreadSafeContextFromLLVMContext (i64) -> i64)
+(extern LLVMOrcCreateNewThreadSafeModule (i64 i64) -> i64)
+;; --- LLJIT.h
+(extern LLVMOrcDisposeLLJIT (i64) -> i64)
+;; --- Orc.h
+(extern LLVMOrcDisposeThreadSafeContext (i64) -> unit)
+(extern LLVMOrcJITDylibAddGenerator (i64 i64) -> unit)
+(extern LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine (i64) -> i64)
+;; --- LLJIT.h
+(extern LLVMOrcLLJITAddLLVMIRModule (i64 i64 i64) -> i64)
+(extern LLVMOrcLLJITBuilderSetJITTargetMachineBuilder (i64 i64) -> unit)
+(extern LLVMOrcLLJITGetDataLayoutStr (i64) -> i64)
+(extern LLVMOrcLLJITGetGlobalPrefix (i64) -> i32)
+(extern LLVMOrcLLJITGetMainJITDylib (i64) -> i64)
+(extern LLVMOrcLLJITGetTripleString (i64) -> i64)
+(extern LLVMOrcLLJITLookup (i64 ptr ptr) -> i64)
+
+;; ---------------------------------------------------------------------------------------------------------------------------------
+
+;; An LLJIT session with the process's symbols searchable: `tm` is the handle of a target machine whose CPU and code generation level
+;; the session takes (the machine is consumed: do not dispose it), or 0 for LLVM's defaults (lair's `new`, as opposed to
+;; `new_fast_codegen`). The target must be registered (llvm.target/init). Rust: jit/mod.rs `with_codegen`
+(defun jit-new (tm: i64) -> (Result i64 str)
+  (let ((out (ffi/slot-new))
+        (builder (if (= tm 0)
+                     0
+                     (unsafe
+                       (let ((jtmb (LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine tm))
+                             (b (LLVMOrcCreateLLJITBuilder)))
+                         (do (LLVMOrcLLJITBuilderSetJITTargetMachineBuilder b jtmb) b))))))
+    (match (unsafe (support/status (LLVMOrcCreateLLJIT out builder)))
+      ((Err m) (do (ffi/free-addr (ffi/ptr->addr out)) (Err m)))
+      ((Ok _)
+       (let ((jit (unsafe (load-i64 out))))
+         (do (unsafe (free out))
+             (add-process-generator jit)))))))
+
+;; Adds the generator that finds the process's own symbols (puts, malloc ...) to the main JITDylib of `jit`; the session, or the
+;; message with the session disposed.
+(defun add-process-generator :private (jit: i64) -> (Result i64 str)
+  (let ((gen (ffi/slot-new)))
+    (unsafe
+      (let ((e (LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess gen (LLVMOrcLLJITGetGlobalPrefix jit) 0 (ffi/addr->ptr 0))))
+        (match (support/status e)
+          ((Err m) (do (free gen) (LLVMOrcDisposeLLJIT jit) (Err m)))
+          ((Ok _) (do (LLVMOrcJITDylibAddGenerator (LLVMOrcLLJITGetMainJITDylib jit) (load-i64 gen))
+                      (free gen)
+                      (Ok jit))))))))
+
+;; Adds `module` (made in the LLVM context `ctx`) to the main JITDylib. On success the session owns both; on `Err` the caller still does.
+(defun add-module (jit: i64 ctx: i64 module: i64) -> (Result unit str)
+  (unsafe
+    (let ((tsc (LLVMOrcCreateNewThreadSafeContextFromLLVMContext ctx))
+          (tsm (LLVMOrcCreateNewThreadSafeModule module tsc)))
+      (do (LLVMOrcDisposeThreadSafeContext tsc)
+          (support/status (LLVMOrcLLJITAddLLVMIRModule jit (LLVMOrcLLJITGetMainJITDylib jit) tsm))))))
+
+;; The address of the symbol `name`, compiled if need be.
+(defun lookup (jit: i64 name: str) -> (Result i64 str)
+  (let ((n (ffi/bytes-new name))
+        (out (ffi/slot-new)))
+    (unsafe
+      (let ((e (LLVMOrcLLJITLookup jit out n))
+            (r (match (support/status e)
+                 ((Ok _) (Ok (load-i64 out)))
+                 ((Err m) (Err m)))))
+        (do (free n) (free out) r)))))
+
+;; Ends the session; its addresses die with it.
+(defun jit-free (jit: i64) -> (Result unit str)
+  (unsafe (support/status (LLVMOrcDisposeLLJIT jit))))
+
+;; The triple and the data layout the session compiles for.
+(defun triple (jit: i64) -> str
+  (ffi/c-string-at (unsafe (LLVMOrcLLJITGetTripleString jit))))
+
+(defun data-layout (jit: i64) -> str
+  (ffi/c-string-at (unsafe (LLVMOrcLLJITGetDataLayoutStr jit))))

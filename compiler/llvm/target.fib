@@ -1,0 +1,146 @@
+;; compiler/llvm/target.fib: llvm-c/Target.h and llvm-c/TargetMachine.h as crates/lair/src/llvm/target.rs uses them: the host
+;; target, a target machine (position-independent, so that `cc` links a PIE), its data layout, and the object file it emits.
+;;
+;; `init` registers the x86-64 target only: LLVM-C's `LLVMInitializeNativeTarget` and its siblings are `static inline` functions of
+;; the headers (they expand to the per-target `LLVMInitializeX86Target` ...), so there is no symbol to bind and a port for another
+;; host adds its own initialisers beside these five.
+;;
+;; FIB_TARGET_CPU names the CPU to generate code for instead of the host's, with no extra features (a release is built for a baseline
+;; such as `x86-64-v2`); unset, empty or `host` mean the host's CPU name and feature string, as `requested_cpu` in target.rs.
+(ns llvm.target (:require [llvm.ffi :as ffi] [llvm.core :as core]))
+
+(extern LLVMInitializeX86TargetInfo () -> unit)
+(extern LLVMInitializeX86Target () -> unit)
+(extern LLVMInitializeX86TargetMC () -> unit)
+(extern LLVMInitializeX86AsmPrinter () -> unit)
+(extern LLVMInitializeX86AsmParser () -> unit)
+(extern getenv :private (ptr) -> ptr)
+(extern fopen :private (ptr ptr) -> ptr)
+(extern fwrite :private (ptr i64 i64 ptr) -> i64)
+(extern fclose :private (ptr) -> i32)
+
+;; --- Target.h
+(extern LLVMABIAlignmentOfType (i64 i64) -> i32)
+(extern LLVMCopyStringRepOfTargetData (i64) -> i64)
+(extern LLVMCreateTargetData (ptr) -> i64)
+;; --- TargetMachine.h
+(extern LLVMCreateTargetDataLayout (i64) -> i64)
+(extern LLVMCreateTargetMachine (i64 ptr ptr ptr i32 i32 i32) -> i64)
+;; --- Target.h
+(extern LLVMDisposeTargetData (i64) -> unit)
+;; --- TargetMachine.h
+(extern LLVMDisposeTargetMachine (i64) -> unit)
+(extern LLVMGetDefaultTargetTriple () -> i64)
+(extern LLVMGetHostCPUFeatures () -> i64)
+(extern LLVMGetHostCPUName () -> i64)
+(extern LLVMGetTargetFromName (ptr) -> i64)
+(extern LLVMGetTargetFromTriple (ptr ptr ptr) -> i32)
+(extern LLVMTargetMachineEmitToFile (i64 i64 ptr i32 ptr) -> i32)
+(extern LLVMTargetMachineEmitToMemoryBuffer (i64 i64 i32 ptr ptr) -> i32)
+
+;; ---------------------------------------------------------------------------------------------------------------------------------
+
+;; Registers the x86-64 target, its machine-code layer, assembly printer and parser. Idempotent in LLVM; call it once.
+(defun init () -> unit
+  (unsafe
+    (do (LLVMInitializeX86TargetInfo)
+        (LLVMInitializeX86Target)
+        (LLVMInitializeX86TargetMC)
+        (LLVMInitializeX86AsmPrinter)
+        (LLVMInitializeX86AsmParser))))
+
+;; A target machine and what a module it makes code for is told: the triple, the data layout.
+(defstruct Machine (tm: i64 triple: str layout: str))
+
+;; The value of an environment variable, nil when it is unset.
+(defun env (name: str) -> (Option str)
+  (let ((n (ffi/bytes-new name)))
+    (unsafe
+      (let ((a (ffi/ptr->addr (getenv n))))
+        (do (free n) (if (= a 0) nil (some (ffi/c-string-at a))))))))
+
+;; The CPU asked for through FIB_TARGET_CPU: nil for an unset, empty or `host` value.
+(defun requested-cpu () -> (Option str)
+  (if-some [v (env "FIB_TARGET_CPU")]
+    (if (or (= v "") (= v "host")) nil (some v))
+    nil))
+
+;; The code generation level of -O n: 0 None, 1 Less, 2 Default, 3 and more Aggressive.
+(defun codegen-level :private (opt: i64) -> i32
+  (cond (= opt 0) 0i32 (= opt 1) 1i32 (= opt 2) 2i32 true 3i32))
+
+;; The `llvm::Target` of the triple at address `triple` (LLVM's own string): its handle, or the message.
+(defun target-of-triple :private (triple: i64) -> (Result i64 str)
+  (let ((out (ffi/slot-new))
+        (msg (ffi/slot-new)))
+    (unsafe
+      (let ((failed (LLVMGetTargetFromTriple (ffi/addr->ptr triple) out msg))
+            (r (if (= failed 0i32)
+                   (Ok (load-i64 out))
+                   (Err (core/take-message (load-i64 msg))))))
+        (do (free out) (free msg) r)))))
+
+;; The data layout string of the machine.
+(defun layout-of :private (tm: i64) -> str
+  (unsafe
+    (let ((td (LLVMCreateTargetDataLayout tm))
+          (s (core/take-message (LLVMCopyStringRepOfTargetData td))))
+      (do (LLVMDisposeTargetData td) s))))
+
+;; The machine for `target` and the triple at address `triple`, with the CPU `cpu` and no extra features when it is named, else the
+;; host's name and features.
+(defun create-machine :private (target: i64 triple: i64 cpu: (Option str) opt: i64) -> i64
+  (let ((level (codegen-level opt))
+        (tp (ffi/addr->ptr triple)))
+    (if-some [name cpu]
+      (let ((c (ffi/bytes-new name))
+            (f (ffi/bytes-new "")))
+        (unsafe
+          (let ((tm (LLVMCreateTargetMachine target tp c f level 2i32 0i32)))
+            (do (free c) (free f) tm))))
+      (unsafe
+        (let ((hc (LLVMGetHostCPUName))
+              (hf (LLVMGetHostCPUFeatures))
+              (tm (LLVMCreateTargetMachine target tp (ffi/addr->ptr hc) (ffi/addr->ptr hf) level 2i32 0i32)))
+          (do (core/take-message hc) (core/take-message hf) tm))))))
+
+;; The host machine at code generation level `opt` (0 to 3), position-independent so that `cc` can link a PIE (LLVMRelocPIC), the CPU
+;; named by FIB_TARGET_CPU when set. Registers the target first. Disposed by `machine-free`. Rust: target.rs `Machine::host`
+(defun host-machine (opt: i64) -> (Result Machine str)
+  (do (init)
+      (let ((triple (unsafe (LLVMGetDefaultTargetTriple))))
+        (match (target-of-triple triple)
+          ((Err m) (do (core/take-message triple)
+                       (Err (str-concat "no target for the host: " m))))
+          ((Ok target)
+           (let ((tm (create-machine target triple (requested-cpu) opt)))
+             (Ok (Machine tm (core/take-message triple) (layout-of tm)))))))))
+
+(defun machine-free (m: Machine) -> unit
+  (unsafe (LLVMDisposeTargetMachine (. m tm))))
+
+;; The object file of module `m` as an LLVMMemoryBuffer (LLVMObjectFile), made by the machine `tm`: its handle, or the message. The
+;; caller disposes it with `core/LLVMDisposeMemoryBuffer`. Rust: aot.rs, `LLVMTargetMachineEmitToMemoryBuffer`.
+(defun emit-object (tm: i64 m: i64) -> (Result i64 str)
+  (let ((out (ffi/slot-new))
+        (msg (ffi/slot-new)))
+    (unsafe
+      (let ((failed (LLVMTargetMachineEmitToMemoryBuffer tm m 1i32 msg out))
+            (r (if (= failed 0i32)
+                   (Ok (load-i64 out))
+                   (Err (core/take-message (load-i64 msg))))))
+        (do (free out) (free msg) r)))))
+
+;; The bytes of the memory buffer `buf`, written to the file `path` (fopen, fwrite: the bytes are binary, so no `str`).
+(defun write-buffer (buf: i64 path: str) -> (Result unit str)
+  (let ((p (ffi/bytes-new path))
+        (mode (ffi/bytes-new "wb")))
+    (unsafe
+      (let ((f (fopen p mode))
+            (r (if (= (ffi/ptr->addr f) 0)
+                   (Err (str-concat "cannot open " path))
+                   (let ((n (core/LLVMGetBufferSize buf))
+                         (w (fwrite (ffi/addr->ptr (core/LLVMGetBufferStart buf)) 1 n f)))
+                     (do (fclose f)
+                         (if (= w n) (Ok ()) (Err (str-concat "short write to " path))))))))
+        (do (free p) (free mode) r)))))

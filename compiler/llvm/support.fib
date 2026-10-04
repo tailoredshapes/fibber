@@ -1,0 +1,52 @@
+;; compiler/llvm/support.fib: LLVM-C's llvm-c/Error.h (LLVMErrorRef), Support.h (the process's own symbols), IRReader.h (textual IR)
+;; and BitWriter.h, as `extern`s and wrappers. crates/lair uses the first two; the last two are here for the spike and for the
+;; harness of the port (lair feeds LLVM IR it builds, never text: see compiler/tests/llvm/spike.fib part d).
+(ns llvm.support (:require [llvm.ffi :as ffi] [llvm.core :as core]))
+
+;; --- Error.h
+(extern LLVMDisposeErrorMessage (i64) -> unit)
+(extern LLVMGetErrorMessage (i64) -> i64)
+;; --- Support.h
+(extern LLVMLoadLibraryPermanently (ptr) -> i32)
+;; --- IRReader.h
+(extern LLVMParseIRInContext (i64 i64 ptr ptr) -> i32)
+;; --- Support.h
+(extern LLVMSearchForAddressOfSymbol (ptr) -> i64)
+;; --- BitWriter.h
+(extern LLVMWriteBitcodeToFile (i64 ptr) -> i32)
+
+;; ---------------------------------------------------------------------------------------------------------------------------------
+
+;; What an `LLVMErrorRef` the caller was handed comes to: `Ok ()` for success (the null error), else `Err` of its message; the
+;; error is consumed (LLVMGetErrorMessage disposes it) and the message string disposed.
+(defun status (e: i64) -> (Result unit str)
+  (if (= e 0)
+      (Ok ())
+      (unsafe
+        (let ((m (LLVMGetErrorMessage e))
+              (text (ffi/c-string-at m)))
+          (do (LLVMDisposeErrorMessage m) (Err text))))))
+
+;; Makes the process's own symbols searchable (the C library and what it loaded), as lair's `in_process` does, and whether `name`
+;; is one of them.
+(defun process-defines? (name: str) -> bool
+  (let ((n (ffi/bytes-new name)))
+    (unsafe
+      (do (LLVMLoadLibraryPermanently (ffi/addr->ptr 0))
+          (let ((a (LLVMSearchForAddressOfSymbol n)))
+            (do (free n) (!= a 0)))))))
+
+;; The module of the textual IR `text` (named `name` in messages) parsed in the context `ctx`: its handle, or the parser's
+;; diagnostic. The buffer made here is consumed by LLVMParseIRInContext.
+(defun parse-ir (ctx: i64 text: str name: str) -> (Result i64 str)
+  (let ((t (ffi/bytes-new text))
+        (n (ffi/bytes-new name))
+        (out (ffi/slot-new))
+        (msg (ffi/slot-new)))
+    (unsafe
+      (let ((buf (core/LLVMCreateMemoryBufferWithMemoryRangeCopy t (str-len text) n))
+            (failed (LLVMParseIRInContext ctx buf out msg))
+            (r (if (= failed 0i32)
+                   (Ok (load-i64 out))
+                   (Err (ffi/c-string-at (load-i64 msg))))))
+        (do (free t) (free n) (free out) (free msg) r)))))

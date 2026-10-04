@@ -1,0 +1,151 @@
+;; compiler/tests/llvm/spike.fib: fibber drives LLVM-C directly, with no liblair.so (package 0A of lair-in-fibber). Four parts, each
+;; printing a line and failing the run (exit status 1, the part named on standard error) when the answer is not the expected one:
+;;
+;;   a. `define i32 @answer() { ret i32 42 }` built with the IR builder, verified, JITted with LLJIT, looked up, called:
+;;      prints `a: jit answer = 42`
+;;   b. the same shape as `main`, emitted as an object file by a target machine (FIB_TARGET_CPU honoured), linked with `cc`, run:
+;;      prints `b: executable exit status = 42`
+;;   c. a JITted function that calls `puts` through the process symbol generator: prints `hello from the JIT` (C's stdout) and
+;;      `c: puts returned N`, N above zero
+;;   d. a module parsed from a textual .ll string with LLVMParseIRInContext, verified, JITted, called: prints `d: parsed ll = 7`
+;;
+;; fibber cannot call a function pointer, and lair_call_i64 is in liblair, so `call-address` runs the JITted function on a new
+;; thread with pthread_create (a C function that does call a pointer) and reads its result through pthread_join; the result is a
+;; `void *`, whose bits above the function's i32 result are undefined, so it is masked.
+;;
+;; Build and run, from the repository root (see compiler/tests/llvm/build.sh for the link line):
+;;   compiler/tests/llvm/build.sh static|shared OUT && OUT WORKDIR
+(ns spike
+  (:require [llvm.ffi :as ffi] [llvm.core :as core] [llvm.analysis :as analysis]
+            [llvm.target :as target] [llvm.passes :as passes] [llvm.orc :as orc] [llvm.support :as support]))
+
+(extern pthread_create :private (ptr ptr ptr ptr) -> i32)
+(extern pthread_join :private (i64 ptr) -> i32)
+(extern system :private (ptr) -> i32)
+(extern fflush :private (i64) -> i32)
+
+;; Calls the C-ABI function at `addr`, which takes the argument `arg` and returns a word, on a new thread, and gives the word.
+(defun call-address (addr: i64 arg: i64) -> (Result i64 str)
+  (let ((thread (ffi/slot-new))
+        (ret (ffi/slot-new)))
+    (unsafe
+      (let ((made (pthread_create thread (ffi/addr->ptr 0) (ffi/addr->ptr addr) (ffi/addr->ptr arg)))
+            (r (if (= made 0i32)
+                   (do (pthread_join (load-i64 thread) ret) (Ok (load-i64 ret)))
+                   (Err "pthread_create failed"))))
+        (do (free thread) (free ret) r)))))
+
+;; The low 32 bits of a word, which is what an i32 function leaves in the result register.
+(defun low32 (w: i64) -> i64 (bit-and w 4294967295))
+
+;; Runs a shell command: its exit status, or -1 when it did not exit normally.
+(defun shell (cmd: str) -> i64
+  (let ((c (ffi/bytes-new cmd)))
+    (unsafe
+      (let ((st (sext i64 (system c))))
+        (do (free c)
+            (if (= (bit-and st 127) 0) (bit-and (shr st 8) 255) -1))))))
+
+;; `define i32 @name() { ret i32 value }` in the module `m` of the context `ctx`; the function.
+(defun const-fn (ctx: i64 m: i64 name: str value: i64) -> i64
+  (let ((i32t (unsafe (core/LLVMIntTypeInContext ctx 32i32)))
+        (b (unsafe (core/LLVMCreateBuilderInContext ctx))))
+    (let ((f (core/add-function m name (core/function-type i32t [] false)))
+          (blk (core/append-block ctx f "entry")))
+      (unsafe
+        (do (core/LLVMPositionBuilderAtEnd b blk)
+            (core/LLVMBuildRet b (core/const-int i32t value false))
+            (core/LLVMDisposeBuilder b)
+            f)))))
+
+;; The line printed and whether the answer is the expected one.
+(defun expect (label: str got: i64 want: i64) -> (Result unit str)
+  (do (println (str-join [label (show got)]))
+      (if (= got want) (Ok ()) (Err (str-join [label " expected " (show want)])))))
+
+;; Part a.
+(defun part-a () -> (Result unit str)
+  (let ((ctx (unsafe (core/LLVMContextCreate)))
+        (m (core/module-new ctx "spike-a"))
+        (f (const-fn ctx m "answer" 42)))
+    (try-let ((v1 (analysis/verify m))
+              (jit (orc/jit-new 0))
+              (v2 (orc/add-module jit ctx m))
+              (addr (orc/lookup jit "answer"))
+              (r (call-address addr 0))
+              (v3 (orc/jit-free jit)))
+      (expect "a: jit answer = " (low32 r) 42))))
+
+;; Part b.
+(defun part-b (dir: str) -> (Result unit str)
+  (let ((ctx (unsafe (core/LLVMContextCreate)))
+        (m (core/module-new ctx "spike-b"))
+        (f (const-fn ctx m "main" 42))
+        (obj (str-join [dir "/spike-b.o"] ))
+        (exe (str-join [dir "/spike-b"])))
+    (try-let ((mach (target/host-machine 2))
+              (v1 (do (core/set-target m (. mach triple)) (core/set-data-layout m (. mach layout)) (analysis/verify m)))
+              (v3 (passes/optimize m (. mach tm) 2))
+              (buf (target/emit-object (. mach tm) m))
+              (v2 (target/write-buffer buf obj))
+              (st (let ((cc (shell (str-join ["cc " obj " -o " exe])))) (if (= cc 0) (Ok (shell exe)) (Err "cc failed")))))
+      (do (println (str-join ["b: triple " (. mach triple) " cpu " (if-some [c (target/requested-cpu)] c "host")]))
+          (expect "b: executable exit status = " st 42)))))
+
+;; Part c.
+(defun part-c () -> (Result unit str)
+  (let ((ctx (unsafe (core/LLVMContextCreate)))
+        (m (core/module-new ctx "spike-c"))
+        (b (unsafe (core/LLVMCreateBuilderInContext ctx)))
+        (i8t (unsafe (core/LLVMInt8TypeInContext ctx)))
+        (i32t (unsafe (core/LLVMIntTypeInContext ctx 32i32)))
+        (ptrt (unsafe (core/LLVMPointerTypeInContext ctx 0i32)))
+        (text "hello from the JIT"))
+    (let ((puts-ty (core/function-type i32t [ptrt] false))
+          (puts (core/add-function m "puts" puts-ty))
+          (hello (core/add-function m "hello" (core/function-type i32t [] false)))
+          (blk (core/append-block ctx hello "entry"))
+          (msg (let ((arrt (unsafe (core/LLVMArrayType2 i8t (+ (str-len text) 1))))
+                     (g (ffi/bytes-new "msg")))
+                 (unsafe (let ((gv (core/LLVMAddGlobal m arrt g))
+                               (tp (ffi/bytes-new text)))
+                           (do (core/LLVMSetInitializer gv (core/LLVMConstStringInContext2 ctx tp (str-len text) 0i32))
+                               (free g) (free tp) gv))))))
+      (do (unsafe (core/LLVMPositionBuilderAtEnd b blk))
+          (unsafe (core/LLVMBuildRet b (core/build-call b puts-ty puts [msg] "r")))
+          (try-let ((v1 (analysis/verify m))
+                    (jit (orc/jit-new 0))
+                    (v2 (orc/add-module jit ctx m))
+                    (addr (orc/lookup jit "hello"))
+                    (r (call-address addr 0))
+                    (v3 (orc/jit-free jit)))
+            (do (unsafe (fflush 0))
+                (println (str-join ["c: puts returned " (show (low32 r))]))
+                (if (> (low32 r) 0) (Ok ()) (Err "c: puts returned nothing"))))))))
+
+;; Part d.
+(defun part-d () -> (Result unit str)
+  (let ((ctx (unsafe (core/LLVMContextCreate))))
+    (try-let ((m (support/parse-ir ctx "define i32 @seven() {\n  ret i32 7\n}\n" "spike-d"))
+              (v1 (analysis/verify m))
+              (jit (orc/jit-new 0))
+              (v2 (orc/add-module jit ctx m))
+              (addr (orc/lookup jit "seven"))
+              (r (call-address addr 0))
+              (v3 (orc/jit-free jit)))
+      (expect "d: parsed ll = " (low32 r) 7))))
+
+(defun run-part (name: str r: (Result unit str)) -> i64
+  (match r
+    ((Ok _) 0)
+    ((Err m) (do (eprintln (str-join [name ": " m])) 1))))
+
+(defun main () -> i64
+  (let ((dir (if (> (count (args)) 0) (nth (args) 0) ".")))
+    (if (= dir "--startup")
+        0    ; `spike --startup` does nothing: what is left is the cost of starting a program linked with LLVM
+    (do (target/init)
+        (+ (+ (run-part "a" (part-a))
+              (run-part "b" (part-b dir)))
+           (+ (run-part "c" (part-c))
+              (run-part "d" (part-d))))))))
