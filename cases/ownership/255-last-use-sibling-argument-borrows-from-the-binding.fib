@@ -1,0 +1,28 @@
+;; spec:   types §6.3 (consume, borrowed parameters), §6.4; docs/design/in-place-update.md §1 (lever L1)
+;; expect: accept
+;; result: 5
+;; audit:  clean
+;; `(f (. p a) p)`: the first argument is a Box borrowed from `p` and
+;; stays a bare pointer until `f` reads it; the second is `p` itself at
+;; its last use, handed to an owned parameter. If `p` were handed over,
+;; `f` would free it (the Holder's scope ends first) while `a` is
+;; still to be read. The pass keeps the count when a sibling argument
+;; reads the same binding.
+(defstruct Box (n: i64))
+(defstruct Pair2 (a: Box b: Box))
+(defstruct Holder (p: Pair2))
+;; `scribble` allocates (on the heap: `keep` makes them escape) and frees three Boxes and answers 0: after a premature free
+;; it overwrites the freed object (the allocator reuses the last block freed), so a read
+;; of the stale Box answers something else and the result shows it.
+(defun keep (b: Box) -> Box b)
+(defun scribble () -> i64
+  (let ((j1 (keep (Box 98))) (j2 (keep (Box 99))) (j3 (keep (Box 97))))
+    (- (+ (. j1 n) (. j2 n) (. j3 n)) 294)))
+
+(defun f (a: Box p: Pair2) -> i64
+  (do (let ((h (Holder p))) ())
+      (+ (scribble) (. a n))))
+
+(defun main () -> i64
+  (let ((p (Pair2 (Box 5) (Box 6))))
+    (f (. p a) p)))

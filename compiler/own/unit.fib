@@ -9,9 +9,10 @@
 ;;    stop growing (Rust's `absorb` returns whether they grew, here the facts are compared);
 ;; 3. admission: a walk that applies rule (e) to the tail sites with the finished facts; its
 ;;    events decide the scope-local bindings (§6.11, E6 is the admitted tail calls);
-;; 4. emission: a last walk with the scope-local bindings known.
+;; 4. emission: a last walk with the scope-local bindings known and the last uses of the admitting
+;;    walk's modes (own.lastuse): a binding's count is handed over at its last use.
 (ns own.unit
-  (:use types.ast types.program own.program own.facts own.stack own.walk.state own.walk.lit
+  (:use types.ast types.program own.program own.facts own.stack own.lastuse own.walk.state own.walk.lit
         own.walk.expr))
 
 ;; The bodies of a unit, each with its key and spec; the `defun`s of the SCC (none for a method
@@ -47,11 +48,11 @@
 ;; Rust `Run::walk`: a walk over every body of the unit; `sites` are the tail sites once known,
 ;; `admit` whether rule (e) is applied to them with `facts`, `local` the scope-local sites.
 (defun run-walk :private (r: Run facts: Facts sites: (Option (Map i64 Tail)) admit: bool
-                          local: (Set Site)) -> Walked
+                          local: (Set Site) dead: (Set i64)) -> Walked
   (let [unit (. r unit)]
     (reduce (fn (w: Walked pair: (Pair BodyKey BodySpec))
               (walk-one w (Ctx (. r p) (. r summaries) facts (. unit scc) (. unit all-owned)
-                               sites admit local)
+                               sites admit local dead)
                         (. pair snd)))
             (Walked [] [] (map-empty) (map-empty) (set-empty))
             (. unit bodies))))
@@ -59,7 +60,7 @@
 ;; The facts of the fixpoint: walks until a walk's events add nothing.
 (defun settle :private (r: Run sites: (Map i64 Tail) facts: Facts) -> Facts
   (loop [f facts]
-    (let [w (run-walk r f (some sites) false (set-empty))
+    (let [w (run-walk r f (some sites) false (set-empty) (set-empty))
           g (facts-absorb f (. r p) (. w events) (. w literals))]
       (if (= g f) f (recur g)))))
 
@@ -97,13 +98,16 @@
 ;; Rust: unit.rs:101 `decide`: decides a unit, starting from `facts`.
 (defun decide (p: TypedProgram summaries: (Map i64 Summary) unit: Unit facts: Facts) -> Decided
   (let [r (Run p summaries unit)
-        sites (. (run-walk r facts nil false (set-empty)) tails)
+        sites (. (run-walk r facts nil false (set-empty) (set-empty)) tails)
         settled (settle r sites facts)
-        admitted (run-walk r settled (some sites) true (set-empty))
+        admitted (run-walk r settled (some sites) true (set-empty) (set-empty))
         done (facts-absorb settled p (. admitted events) (. admitted literals))
         local (scope-local (. admitted events) (. admitted candidates) (. admitted literals)
                            (. done heap))
-        emitted (run-walk r done (some sites) true local)]
+        dead (reduce (fn (acc: (Set i64) pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
+                       (into acc (vec (last-uses (. (. (. pair fst) snd) body) (. pair snd)))))
+                     (set-empty) (zip (. unit bodies) (. admitted outs)))
+        emitted (run-walk r done (some sites) true local dead)]
     (Decided (mapv (fn (pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
                      (let [key (. (. pair fst) fst)
                            spec (. (. pair fst) snd)

@@ -1,0 +1,25 @@
+;; spec:   types §6.3 (consume, join), §6.4; docs/design/in-place-update.md §1 (lever L1)
+;; expect: accept
+;; result: 14
+;; audit:  clean
+;; The consuming call is in one arm of an `if`, the later read is after the
+;; `if`: on the path through the arm `b` is not at its last use. Moving it
+;; in the arm (the arm is the last place the branch reads it) would free the
+;; Box that the read after the `if` then reads.
+(defstruct Box (n: i64))
+;; `scribble` allocates (on the heap: `keep` makes them escape) and frees three Boxes and answers 0: after a premature free
+;; it overwrites the freed object (the allocator reuses the last blocks freed), so a read
+;; of the stale Box answers something else and the result shows it.
+(defun keep (b: Box) -> Box b)
+(defun scribble () -> i64
+  (let ((j1 (keep (Box 98))) (j2 (keep (Box 99))) (j3 (keep (Box 97))))
+    (- (+ (. j1 n) (. j2 n) (. j3 n)) 294)))
+
+(defun test (b: Box eat: (fn (Box) i64) flag: bool) -> Box
+  (if flag
+      b
+      (let ((x (if (> (. b n) 3) (eat b) 1)))
+        (Box (+ x (+ (scribble) (. b n)))))))
+
+(defun main () -> i64
+  (. (test (Box 7) (fn (b: Box) (. b n)) false) n))

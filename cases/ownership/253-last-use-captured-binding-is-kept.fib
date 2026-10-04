@@ -1,0 +1,25 @@
+;; spec:   types §6.3 (consume), §6.5 (captures); docs/design/in-place-update.md §1 (lever L1)
+;; expect: accept
+;; result: 8
+;; audit:  clean
+;; A stack closure holds `b` without a count and reads it when it is
+;; called, after the consuming call. The pass never hands over a binding
+;; some closure captures, so `eat b` retains and `get` reads a live Box.
+(defstruct Box (n: i64))
+;; `scribble` allocates (on the heap: `keep` makes them escape) and frees three Boxes and answers 0: after a premature free
+;; it overwrites the freed object (the allocator reuses the last blocks freed), so a read
+;; of the stale Box answers something else and the result shows it.
+(defun keep (b: Box) -> Box b)
+(defun scribble () -> i64
+  (let ((j1 (keep (Box 98))) (j2 (keep (Box 99))) (j3 (keep (Box 97))))
+    (- (+ (. j1 n) (. j2 n) (. j3 n)) 294)))
+
+(defun test (b: Box eat: (fn (Box) i64) flag: bool) -> Box
+  (if flag
+      b
+      (let ((get (fn () (. b n))))
+        (let ((x (eat b)))
+          (Box (+ x (+ (scribble) (get))))))))
+
+(defun main () -> i64
+  (. (test (Box 4) (fn (b: Box) (. b n)) false) n))

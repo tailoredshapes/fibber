@@ -1,0 +1,210 @@
+;; compiler/own/lastuse.fib: last uses (spec/types.md §6.3, §6.4; docs/design/in-place-update.md §1, lever L1).
+;;
+;; One backward liveness pass over a body, run after the decisive walk has said which site every
+;; expression reads (its `Mode`). The answer is a set of expression ids: x is in it when x reads a
+;; binding's site (mode `Borrowed(SiteBind b)`) and nothing on any path after x completes reads that
+;; site again, directly or through an alias or a part of it (a variable whose mode is `Borrowed` or
+;; `Derived` of the same site). The walk consumes such an x by a move: no retain here, no release of b
+;; later (the walk, own.walk.step, keeps the paths straight).
+;;
+;; What makes a read "later" (the pass only ever errs towards "later", never towards "last"):
+;; - a loop is walked twice, so what its body reads before the next `recur` is live at every `recur`
+;;   except the loop's own variables (they are assigned there); a site bound outside the loop and read
+;;   inside it is therefore never last inside the loop unless the path leaves the loop;
+;; - the other operands of a call (`ECall`, `EConcat`, `ESet`): a borrowed argument is a pointer into
+;;   its site that stays pending until the call, so a read by any sibling operand, before or after, keeps
+;;   the site live (`x` of `Lu`: the sites that count in the answer only, never in the flow);
+;; - an `&b` argument reads b at the call and again at the write-back;
+;; - a `match` guard never moves (the false edge reads what the later clauses read), nor does an
+;;   `async` body (suspension points), nor a binding some `fn` or `async` literal captures (a stack
+;;   closure reads it when it is called, not when it is made), nor its aliases' roots.
+(ns own.lastuse
+  (:use types.ast own.program))
+
+;; What the pass reads and fills: the modes and the binding kinds of the walk it follows, the
+;; bindings that are pinned (never moved), the reads of the operands of the sibling forms, the answer.
+(defstruct LuCx
+  (modes: (Map i64 ExprOwn) kinds: (Map i64 BindingOwn) pinned: (Set i64)
+   kids: (Cell (Map i64 (Set i64))) dead: (Cell (Set i64))))
+
+;; One traversal: the context, the sites live at the next `recur`, whether the answer is filled,
+;; and the sites that count in the answer but not in the flow.
+(defstruct Lu (cx: LuCx back: (Set i64) fill: bool pend: (Set i64)))
+
+(defun uni :private (a: (Set i64) b: (Set i64)) -> (Set i64)
+  (reduce (fn (acc: (Set i64) x: i64) (conj acc x)) a (vec b)))
+
+(defun kill :private (s: (Set i64) ids: (Vec i64)) -> (Set i64)
+  (reduce (fn (acc: (Set i64) x: i64) (disj acc x)) s ids))
+
+(defun site-root :private (m: Mode) -> (Option i64)
+  (match m
+    ((MBorrowed (SiteBind b)) (some b))
+    ((MDerived (SiteBind b)) (some b))
+    (_ nil)))
+
+(defun mode-of :private (u: Lu e: Expr) -> Mode
+  (match (get (. (. u cx) modes) (. e id))
+    ((some x) (. x mode))
+    (_ MScalar)))
+
+;; The variables a pattern binds.
+(defun pat-binds :private (p: Pattern acc: (Vec i64)) -> (Vec i64)
+  (match (. p kind)
+    ((PBind b) (conj acc b))
+    ((PCtor _ _ subs) (reduce (fn (a: (Vec i64) s: Pattern) (pat-binds s a)) acc subs))
+    ((PAs q b) (pat-binds q (conj acc b)))
+    ((PVec subs rest)
+     (let [a (reduce (fn (a: (Vec i64) s: Pattern) (pat-binds s a)) acc subs)]
+       (match rest ((RestBind r) (conj a r)) (_ a))))
+    (_ acc)))
+
+;; The `&b` arguments of a call.
+(defun amps-of :private (args: (Vec Arg)) -> (Set i64)
+  (reduce (fn (acc: (Set i64) a: Arg) (match a ((ArgAmp b _) (conj acc b)) (_ acc)))
+          (set-empty) args))
+
+;; The forms whose operands are siblings in the sense of the header.
+(defun sibling-form? :private (e: Expr) -> bool
+  (match (. e kind)
+    ((ECall _ _) true)
+    ((EConcat _) true)
+    ((ESet _ _) true)
+    (_ false)))
+
+;; Phase A: the sites an expression reads anywhere inside it (a literal reads its captures and
+;; nothing of its body); fills `kids` for the operands of the sibling forms.
+(defun reads-of :private (u: Lu e: Expr) -> (Set i64)
+  (match (. e kind)
+    ((ELocal _) (match (site-root (mode-of u e)) ((some b) (conj (set-empty) b)) (_ (set-empty))))
+    ((EFn lit) (into (set-empty) (. lit captures)))
+    ((EAsync _ caps) (into (set-empty) caps))
+    (_
+     (let [cs (expr-children e)
+           rs (mapv (fn (c: Expr) (reads-of u c)) cs)
+           extra (match (. e kind)
+                   ((ECall _ args) (amps-of args))
+                   ((EDeref (PlAmp b) _) (conj (set-empty) b))
+                   ((ESet (PlAmp b) _) (conj (set-empty) b))
+                   ((ESetField b _ _) (conj (set-empty) b))
+                   (_ (set-empty)))]
+       (do (when (sibling-form? e)
+             (let [c0 (. u cx)]
+               (set! (. c0 kids)
+                     (reduce (fn (m: (Map i64 (Set i64)) i: i64) (assoc m (. (nth cs i) id) (nth rs i)))
+                             @(. c0 kids) (range (count cs))))))
+           (reduce uni extra rs))))))
+
+;; Phase B: records e when it is the last use of the binding whose site it reads.
+(defun record :private (u: Lu e: Expr live: (Set i64)) -> unit
+  (when (. u fill)
+    (match (mode-of u e)
+      ((MBorrowed (SiteBind b))
+       (when (not (or (contains? live b) (contains? (. u pend) b) (contains? (. (. u cx) pinned) b)))
+         (let [d (. (. u cx) dead)] (set! d (conj @d (. e id))))))
+      (_ ()))))
+
+;; The operands cs in evaluation order, the last live-after `live`: the sites live before the
+;; first. With `sib`, the reads of the operands before one count in the answer for it.
+(defun trav-seq :private (u: Lu cs: (Vec Expr) live: (Set i64) sib: bool) -> (Set i64)
+  (let [kids @(. (. u cx) kids)
+        reads (if sib (mapv (fn (c: Expr) (get kids (. c id) (set-empty))) cs) [])]
+    (loop [k (- (count cs) 1) acc live]
+      (if (< k 0)
+        acc
+        (recur (- k 1)
+               (trav (if sib
+                       (with u (pend (reduce uni (. u pend) (take k reads))))
+                       u)
+                     (nth cs k) acc))))))
+
+;; The clauses of a match, from the last: the sites live before each, falling through its guard to the
+;; later clauses; the union over all of them is what is live before the first test.
+(defun match-in :private (u: Lu cls: (Vec Clause) lbs: (Vec (Set i64)) live: (Set i64)) -> (Set i64)
+  (let [nog (with u (fill false))]
+    (loop [i (- (count cls) 1) later (set-empty)]
+      (if (< i 0)
+        later
+        (let [c (nth cls i)
+              body-in (nth lbs i)
+              in (kill (match (. c guard)
+                         ((some g) (trav nog g (uni body-in later)))
+                         (_ body-in))
+                       (pat-binds (. c pat) []))]
+          (recur (- i 1) (uni later in)))))))
+
+;; A loop: the body twice (the second time with what the first found live at the `recur`s), then the
+;; initialisers in order.
+(defun loop-in :private (u: Lu bs: (Vec LoopBind) body: Expr live: (Set i64)) -> (Set i64)
+  (let [vars (mapv (fn (b: LoopBind) (. b binding)) bs)
+        pass1 (trav (with u (back (set-empty)) (fill false)) body live)
+        g (kill pass1 vars)
+        pass2 (trav (with u (back g)) body live)]
+    (trav-seq u (mapv (fn (b: LoopBind) (. b init)) bs) (kill pass2 vars) false)))
+
+;; Phase B: the sites live before e, given those live after it; the answer filled on the way.
+(defun trav (u: Lu e: Expr live: (Set i64)) -> (Set i64)
+  (do (record u e live)
+      (match (. e kind)
+        ((ELocal _) (match (site-root (mode-of u e)) ((some b) (conj live b)) (_ live)))
+        ((EFn lit) (uni live (into (set-empty) (. lit captures))))
+        ((EAsync _ caps) (uni live (into (set-empty) caps)))
+        ((ECall _ args)
+         (let [amps (amps-of args)]
+           (uni (trav-seq u (expr-children e) (uni live amps) true) amps)))
+        ((EConcat es) (trav-seq u es live true))
+        ((ESet p _)
+         (let [acc (trav-seq u (expr-children e) live true)]
+           (match p ((PlAmp b) (conj acc b)) (_ acc))))
+        ((EDeref (PlAmp b) _) (conj live b))
+        ((ESetField b _ v) (conj (trav u v live) b))
+        ((EIf c t f) (trav u c (uni (trav u t live) (trav u f live))))
+        ((EDo es) (trav-seq u es live false))
+        ((ELet bs body)
+         (reduce (fn (acc: (Set i64) b: LetBind)
+                   (trav u (. b init) (kill acc (pat-binds (. b pat) []))))
+                 (trav u body live) (reverse bs)))
+        ((EMatch s cls)
+         (trav u s (match-in u cls (mapv (fn (c: Clause) (trav u (. c body) live)) cls) live)))
+        ((ELoop bs body) (loop-in u bs body live))
+        ((ERecur es) (trav-seq u es (. u back) false))
+        (_ (trav-seq u (expr-children e) live false)))))
+
+;; The bindings a literal under e captures, and the bindings whose sites they alias or are part of.
+(defun captured-in :private (e: Expr acc: (Vec i64)) -> (Vec i64)
+  (reduce (fn (a: (Vec i64) c: Expr) (captured-in c a))
+          (match (. e kind)
+            ((EFn lit) (into acc (. lit captures)))
+            ((EAsync _ caps) (into acc caps))
+            (_ acc))
+          (expr-children e)))
+
+(defun pin-root :private (u: Lu b: i64 pinned: (Set i64)) -> (Set i64)
+  (if (contains? pinned b)
+    pinned
+    (let [p (conj pinned b)]
+      (match (get (. (. u cx) kinds) b)
+        ((some k)
+         (match (. k kind)
+           ((BnAliasOf (SiteBind r)) (pin-root u r p))
+           ((BnDerivedOf (SiteBind r)) (pin-root u r p))
+           (_ p)))
+        (_ p)))))
+
+;; The bodies of the `fn` literals under e, outermost first; an `async` body is not one.
+(defun fn-bodies :private (e: Expr acc: (Vec Expr)) -> (Vec Expr)
+  (match (. e kind)
+    ((EAsync _ _) acc)
+    ((EFn lit) (fn-bodies (. lit body) (conj acc (. lit body))))
+    (_ (reduce (fn (a: (Vec Expr) c: Expr) (fn-bodies c a)) acc (expr-children e)))))
+
+;; The expressions of the body (and of its `fn` literals) that are the last use of a binding.
+(defun last-uses (body: Expr out: BodyOwn) -> (Set i64)
+  (let [cx0 (LuCx (. out exprs) (. out bindings) (set-empty) (cell (map-empty)) (cell (set-empty)))
+        u0 (Lu cx0 (set-empty) true (set-empty))
+        pinned (reduce (fn (p: (Set i64) b: i64) (pin-root u0 b p)) (set-empty) (captured-in body []))
+        cx (with cx0 (pinned pinned))
+        u (with u0 (cx cx))
+        roots (fn-bodies body [body])]
+    (do (doseq [r roots] (reads-of u r) (trav u r (set-empty)))
+        @(. cx dead))))

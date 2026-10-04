@@ -1,0 +1,18 @@
+;; spec:   types §6.3 (consume, scope exit, join), §6.4; docs/design/in-place-update.md §1 (lever L1)
+;; expect: accept
+;; result: 14
+;; audit:  clean
+;; `b` is handed to `eat` at its last use in the true arm and not used in
+;; the false arm. The count the true arm gave away must not be released a
+;; second time at the exit, and the false arm, which kept it, must release
+;; it: a leak when it is dropped on both paths, a double free when it is
+;; kept on both. `pick` runs both arms.
+(defstruct Box (n: i64))
+
+(defun pick (flag: bool) -> i64
+  (let ((eat (fn (b: Box) (. b n)))
+        (b (Box 5)))
+    (if flag (let ((x (eat b))) x) 2)))
+
+(defun main () -> i64
+  (+ (* 2 (pick true)) (* 2 (pick false))))

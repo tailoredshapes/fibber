@@ -43,8 +43,15 @@
 (defun store :private (w: Walker x: Expr) -> unit
   (let [m (walk-expr w x false)]
     (w-note w (walk-val w x m) AtStore)
-    (when (mode-shared? m)
+    (when (and (mode-shared? m) (not (hand-over? w x m)))
       (w-push-op w (. x id) OpRetain (SiteValue (. x id)) WhyStore))))
+
+;; Whether the value x of mode m, handed to a store or a loop variable, is the last use of the
+;; binding it reads: then its count is handed over instead of retained (the path now owns nothing of it).
+(defun hand-over? :private (w: Walker x: Expr m: Mode) -> bool
+  (match m
+    ((MBorrowed s) (if (w-last-use? w x s) (do (w-mark-moved w s) true) false))
+    (_ false)))
 
 ;; Rust: walk/expr.rs:158 `Walker::field`: a field of an object is a part of it.
 (defun field-form :private (w: Walker x: Expr) -> Mode
@@ -84,9 +91,14 @@
 ;; Rust: walk/expr.rs:71 `Walker::if_form`: the condition and each branch are steps.
 (defun if-form :private (w: Walker e: Expr c: Expr t: Expr f: Expr tail: bool) -> Mode
   (do (walk-step w c false)
-      (let [mt (walk-step w t tail)
-            mf (walk-step w f tail)]
-        (walk-join w e [(Pair t mt) (Pair f mf)]))))
+      (let [st (w-branch-start w)
+            mt (do (w-branch-enter w st) (walk-step w t tail))
+            et (w-branch-leave w)
+            mf (do (w-branch-enter w st) (walk-step w f tail))
+            ef (w-branch-leave w)
+            m (walk-join w e [(Pair t mt) (Pair f mf)])]
+        (do (w-branch-merge w st [(Pair t et) (Pair f ef)])
+            m))))
 
 ;; Rust: walk/expr.rs:247 `Walker::bind_let`: a `let` of one name to the value init of mode m: an
 ;; `Owned` value is owned by the binding, any other is an alias of, or a part of, a site.
@@ -119,7 +131,7 @@
         v (. lb binding)
         m (walk-step w init false)]
     (w-note w (walk-val w init m) (AtLoopInit v))
-    (when (mode-shared? m)
+    (when (and (mode-shared? m) (not (hand-over? w init m)))
       (w-push-op w (. init id) OpRetain (SiteValue (. init id)) WhyLoopInit))
     (if (w-binding-is-object w v)
         (do (w-own-site w (SiteBind v) false)
@@ -142,6 +154,7 @@
 (defun recur-form :private (w: Walker e: Expr args: (Vec Expr)) -> Mode
   (let [r (walk-recur w args)]
     (w-put-recur w (. e id) r)
+    (set! (. w diverged) true)
     MScalar))
 
 ;; Rust: walk/expr.rs:24 `Walker::form`: the mode of e as its form gives it.

@@ -54,7 +54,7 @@
     (when (and (mode-shared? m) (empty? moved))
       (w-push-op w id OpRetain (SiteValue id) WhyReturn))
     (doseq [x (reverse sites)]
-      (when (not (contains? moved (. x fst)))
+      (when (not (or (contains? moved (. x fst)) (w-env-moved? w (. x fst))))
         (w-add-after w id (w-end-op w (. x fst) WhyScopeExit))))
     (doseq [op (w-release-params w moved false WhyParamExit)]
       (w-add-after w id op))))
@@ -154,8 +154,10 @@
       (if-some [g (. lit name)]
         (do (set! (. f self-name) (some g))
             (w-bind w g (MBorrowed (SiteEnv id)) (BnAliasOf (SiteEnv id))))))
-    (run-body w (. lit body) true)
-    (w-close-frame w)
+    (let [saved (w-frame-save w)]
+      (do (run-body w (. lit body) true)
+          (w-close-frame w)
+          (w-frame-restore w saved)))
     (MOwned false)))
 
 ;; Rust: walk/lit.rs:248 `Walker::async_lit`: an `async` literal (§6.9): an escaping heap closure with
@@ -165,6 +167,8 @@
         cs (walk-captures w id caps true)]
     (record-closure w id true cs [])
     (enter-literal w id FkAsync cs true)
-    (run-body w body true)
-    (w-close-frame w)
+    (let [saved (w-frame-save w)]
+      (do (run-body w body true)
+          (w-close-frame w)
+          (w-frame-restore w saved)))
     (MOwned false)))

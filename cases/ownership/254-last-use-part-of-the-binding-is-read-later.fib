@@ -1,0 +1,26 @@
+;; spec:   types §6.2 (Derived), §6.3 (consume), §6.4; docs/design/in-place-update.md §1 (lever L1)
+;; expect: accept
+;; result: 5
+;; audit:  clean
+;; `a` is a part of `p` (it reads `p`'s site) and is read after `eat p`.
+;; `p` is therefore not at its last use at the call: handing it over frees
+;; the Pair2 and with it the Box that `a` points into.
+(defstruct Box (n: i64))
+(defstruct Pair2 (a: Box b: Box))
+;; `scribble` allocates (on the heap: `keep` makes them escape) and frees three Boxes and answers 0: after a premature free
+;; it overwrites the freed object (the allocator reuses the last blocks freed), so a read
+;; of the stale Box answers something else and the result shows it.
+(defun keep (b: Box) -> Box b)
+(defun scribble () -> i64
+  (let ((j1 (keep (Box 98))) (j2 (keep (Box 99))) (j3 (keep (Box 97))))
+    (- (+ (. j1 n) (. j2 n) (. j3 n)) 294)))
+
+(defun test (p: Pair2 eat: (fn (Pair2) i64) flag: bool) -> Pair2
+  (if flag
+      p
+      (let ((a (. p a)))
+        (let ((x (eat p)))
+          (Pair2 (Box (+ x (+ (scribble) (. a n)))) (Box 0))))))
+
+(defun main () -> i64
+  (. (. (test (Pair2 (Box 2) (Box 3)) (fn (p: Pair2) (. (. p b) n)) false) a) n))

@@ -63,10 +63,11 @@
 ;; earlier units; the unit's facts so far; the unit's `defun`s (none for a method or a `def`);
 ;; whether the bodies walked are all-owned (§8.4); the tail sites once known (`nil` while
 ;; finding them); whether tail sites are admitted by rule (e) with these facts; the
-;; scope-local sites once known.
+;; scope-local sites once known; the expressions that are the last use of the binding they read
+;; (own.lastuse; none until the last walk).
 (defstruct Ctx
   (p: TypedProgram summaries: (Map i64 Summary) facts: Facts scc: (Vec i64) all-owned: bool
-   tail-sites: (Option (Map i64 Tail)) admit: bool scope-local: (Set Site)))
+   tail-sites: (Option (Map i64 Tail)) admit: bool scope-local: (Set Site) dead: (Set i64)))
 
 (defenum FrameKind FkDefun FkMethod FkFn FkAsync FkDef)
 (derive Eq FrameKind)
@@ -94,7 +95,8 @@
 (defstruct Walker
   (cx: Ctx frames: (Cell (Vec Frame)) site-frame: (Cell (Map Site i64)) out: (Cell BodyOwn)
    events: (Cell (Vec Event)) tails: (Cell (Map i64 Tail)) candidates: (Cell (Map Site i64))
-   expr: (fn (Walker Expr bool) Mode)))
+   expr: (fn (Walker Expr bool) Mode)
+   moved: (Cell (Set Site)) diverged: (Cell bool)))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; The methods of Rust's `Walker` (walk/mod.rs:207-458) are functions `w-NAME` of the walker, which
@@ -108,7 +110,7 @@
 ;; expression (the cycle's function field).
 (defun walker-new (cx: Ctx expr: (fn (Walker Expr bool) Mode)) -> Walker
   (Walker cx (cell []) (cell (map-empty)) (cell (body-own-new)) (cell []) (cell (map-empty))
-          (cell (map-empty)) expr))
+          (cell (map-empty)) expr (cell (set-empty)) (cell false)))
 
 ;; Rust: walk/mod.rs:452 `kind_of_param`: an owned parameter is `BnOwnedParam`, else `BnBorrowedParam`.
 (defun kind-of-param (owned: bool) -> BindKind
@@ -275,7 +277,7 @@
     (do (when-some [s moved] (when note (w-note w (some (VB s)) AtMoveOut)))
         (when retained (w-push-op w e OpRetain (SiteValue e) WhyDerivedExit))
         (doseq [p (reverse sites)]
-          (when (not (= (some (. p fst)) moved))
+          (when (not (or (= (some (. p fst)) moved) (w-env-moved? w (. p fst))))
             (w-add-after w e (w-end-op w (. p fst) (if (. p snd) WhyStepEnd WhyScopeExit)))))
         (if (or retained (some? moved)) (MOwned false) m))))
 
@@ -290,7 +292,7 @@
     (vec (for [temps [false true]
                sc scopes
                p (reverse @(. sc sites))
-               :when (and (= (. p snd) temps) (not (contains? moved (. p fst))))]
+               :when (and (= (. p snd) temps) (not (contains? moved (. p fst))) (not (w-env-moved? w (. p fst))))]
            (w-end-op w (. p fst) why)))))
 
 ;; Rust: walk/mod.rs:424 `release_params`: the owned parameters of the frame not in `moved` (the
@@ -298,8 +300,76 @@
 (defun w-release-params (w: Walker moved: (Set Site) keep-env: bool why: Why) -> (Vec Op)
   (vec (for [s @(. (w-frame w) owned-params)
              :when (not (or (contains? moved s)
+                            (w-env-moved? w s)
                             (and keep-env (match s ((SiteEnv _) true) (_ false)))))]
          (Op OpRelease s why))))
 
 ;; Rust: walk/mod.rs:438 `owning`: the mode of a new owning binding.
 (defun w-owning (b: i64) -> Mode (MBorrowed (SiteBind b)))
+;; ---------------------------------------------------------------------------------------------
+;; Moves at last use (docs/design/in-place-update.md, lever L1). `moved` is the bindings whose count
+;; the path being walked has handed over (a call's owned parameter, a store, a loop variable) at their
+;; last use: no scope exit, jump or return releases them again on this path. At a branching form each
+;; branch is walked from the same state; a binding that one branch that falls through moved and another
+;; did not is released at the end of the other (the exit that follows then skips it), and a branch
+;; that does not fall through (a `recur`, an admitted tail call) takes no part. `diverged` says that
+;; the path just walked ended in a jump.
+
+;; Whether the path has handed `s` over.
+(defun w-env-moved? (w: Walker s: Site) -> bool
+  (contains? @(. w moved) s))
+
+;; The path hands `s` over.
+(defun w-mark-moved (w: Walker s: Site) -> unit
+  (set! (. w moved) (conj @(. w moved) s)))
+
+;; Whether `x`, which reads site `s`, is the last use of a binding of this frame that the path may
+;; hand over: an owning binding or owned parameter, not a stack object, not already handed over.
+(defun w-last-use? (w: Walker x: Expr s: Site) -> bool
+  (and (contains? (. (. w cx) dead) (. x id))
+       (match s ((SiteBind _) true) (_ false))
+       (w-movable w s)
+       (not (contains? (. (. w cx) scope-local) s))
+       (not (w-env-moved? w s))))
+
+;; The state to branch from, and what a branch ended in.
+(defstruct Branch (moved: (Set Site) jumped: bool))
+
+;; The state at the head of a branching form.
+(defun w-branch-start (w: Walker) -> Branch
+  (Branch @(. w moved) @(. w diverged)))
+
+;; Starts one branch from `st`.
+(defun w-branch-enter (w: Walker st: Branch) -> unit
+  (do (set! (. w moved) (. st moved))
+      (set! (. w diverged) false)))
+
+;; What the branch just walked ended in.
+(defun w-branch-leave (w: Walker) -> Branch
+  (Branch @(. w moved) @(. w diverged)))
+
+;; The state after a branching form with branches `ends` (each its expression and what it ended
+;; in): the bindings any branch that falls through handed over, each released at the end of the
+;; falling-through branches that did not.
+(defun w-branch-merge (w: Walker st: Branch ends: (Vec (Pair Expr Branch))) -> unit
+  (let [live (filterv (fn (b: (Pair Expr Branch)) (not (. (. b snd) jumped))) ends)]
+    (if (empty? live)
+      (do (set! (. w moved) (reduce (fn (acc: (Set Site) b: (Pair Expr Branch)) (into acc (vec (. (. b snd) moved))))
+                                     (. st moved) ends))
+          (set! (. w diverged) true))
+      (let [all (reduce (fn (acc: (Set Site) b: (Pair Expr Branch))
+                          (reduce (fn (a: (Set Site) s: Site) (if (w-movable w s) (conj a s) a))
+                                  acc (vec (. (. b snd) moved))))
+                        (. st moved) live)]
+        (do (doseq [b live]
+              (doseq [s (vec (sort (vec all)))]
+                (when (not (contains? (. (. b snd) moved) s))
+                  (w-add-after w (. (. b fst) id) (Op OpRelease s WhyScopeExit)))))
+            (set! (. w moved) all)
+            (set! (. w diverged) (. st jumped)))))))
+
+;; The state to restore after the body of a literal (a frame of its own).
+(defun w-frame-save (w: Walker) -> Branch (w-branch-start w))
+(defun w-frame-restore (w: Walker st: Branch) -> unit
+  (do (set! (. w moved) (. st moved))
+      (set! (. w diverged) (. st jumped))))

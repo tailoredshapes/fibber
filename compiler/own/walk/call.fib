@@ -70,6 +70,7 @@
                      ops (into (w-release-scopes w 0 moved WhyJump)
                                (w-release-params w moved keep-env WhyJump))]
                  (w-pop-scope w)
+                 (set! (. w diverged) true)
                  (with own (jump ops)))
                (let [scope (w-pop-scope w)]
                  (w-exit-scope w scope (. e id) (MOwned false))
@@ -174,12 +175,14 @@
 ;; `consume` at an owned position (§6.3; at a tail call, step 2): scalars as they are, an owned
 ;; value moved, a binding of the frame that an admitted tail call may move, moved once, and
 ;; anything else retained.
-(defun consume :private (w: Walker m: Mode moved: (Cell (Set Site)) admitted: bool) -> Pass
+(defun consume :private (w: Walker x: Expr m: Mode moved: (Cell (Set Site)) admitted: bool) -> Pass
   (match m
     ((MScalar) PsScalar)
     ((MOwned _) PsMove)
     ((MBorrowed s) :when (and admitted (w-movable w s) (not (contains? @moved s)))
      (do (set! moved (conj @moved s)) PsMove))
+    ((MBorrowed s) :when (w-last-use? w x s)
+     (do (w-mark-moved w s) PsMove))
     (_ PsRetain)))
 
 ;; How the head is handed over: a scalar when the head is not a closure value (§6.3), the
@@ -197,7 +200,7 @@
                (AtHead (->HeadAt (. cs call) (. cs site) admitted self-tail)))
        (if (and self-tail admitted)
          PsKeepEnv
-         (let [pass (consume w hm moved admitted)]
+         (let [pass (consume w head hm moved admitted)]
            (stack-literal-temp w head pass)
            pass))))))
 
@@ -232,7 +235,7 @@
                 (_ (walk-val w x m)))]
       (arg-note w cs i p m val)
       PsBorrow)
-    (let [pass (consume w m moved (. cs admitted))]
+    (let [pass (consume w x m moved (. cs admitted))]
       (stack-literal-temp w x pass)
       (arg-note w cs i p m (walk-val w x m))
       pass)))
@@ -287,7 +290,7 @@
     (if (>= i (count args))
       passes
       (let [m (nth ms i)
-            pass (recur-pass w (. l scope) m moved)
+            pass (recur-pass w (. l scope) (nth args i) m moved)
             val (walk-val w (nth args i) m)]
         (when (< i (count (. l vars)))
           (w-note w val (AtRecur (nth (. l vars) i))))
@@ -295,18 +298,19 @@
 
 ;; A binding of a scope the jump exits is moved once and retained after; anything else is
 ;; consumed.
-(defun recur-pass :private (w: Walker scope: i64 m: Mode moved: (Cell (Set Site))) -> Pass
+(defun recur-pass :private (w: Walker scope: i64 x: Expr m: Mode moved: (Cell (Set Site))) -> Pass
   (match m
     ((MBorrowed s) :when (and (exited? w scope s) (not (contains? @moved s)))
      (do (set! moved (conj @moved s)) PsMove))
     ((MBorrowed s) :when (exited? w scope s) PsRetain)
-    (_ (consume w m moved false))))
+    (_ (consume w x m moved false))))
 
 ;; The releases of the old values of the loop variables that the jump did not move, last
 ;; variable first.
 (defun old-releases :private (w: Walker vars: (Vec i64) moved: (Set Site)) -> (Vec Op)
   (vec (keep (fn (v: i64)
-               (if (and (w-binding-is-object w v) (not (contains? moved (SiteBind v))))
+               (if (and (w-binding-is-object w v) (not (contains? moved (SiteBind v)))
+                        (not (w-env-moved? w (SiteBind v))))
                  (some (Op OpRelease (SiteBind v) WhyRecurOld))
                  nil))
              (reverse vars))))
