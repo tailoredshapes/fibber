@@ -1,0 +1,67 @@
+;; spectral-norm: the Benchmarks Game algorithm. Eigenvalue estimate of the infinite matrix
+;; A(i,j) = 1 / ((i+j)(i+j+1)/2 + i + 1) by 10 rounds of the power method on AtA, printed as %.9f.
+;; Vectors are `(Array f64)` read with array-get; each product builds its result in a `(Cell (Array f64))` written
+;; in place by array-set! (safe: no unsafe, no raw pointers). spectral-norm-vec.fib is the same with `(Vec f64)`
+;; (nth + assoc), about 5x slower: see README.md.
+(ns main)
+(defun a-at (i: i64 j: i64) -> f64
+  (/ 1.0 (double (+ (quot (* (+ i j) (+ i j 1)) 2) i 1))))
+(defun mul-av (n: i64 v: (Array f64)) -> (Array f64)
+  (let [o (cell (array n 0.0))]
+    (do (loop [i 0]
+          (if (< i n)
+            (do (array-set! &o i (loop [j 0 s 0.0]
+                                   (if (< j n) (recur (+ j 1) (+ s (* (a-at i j) (array-get v j)))) s)))
+                (recur (+ i 1)))
+            nil))
+        @o)))
+(defun mul-atv (n: i64 v: (Array f64)) -> (Array f64)
+  (let [o (cell (array n 0.0))]
+    (do (loop [i 0]
+          (if (< i n)
+            (do (array-set! &o i (loop [j 0 s 0.0]
+                                   (if (< j n) (recur (+ j 1) (+ s (* (a-at j i) (array-get v j)))) s)))
+                (recur (+ i 1)))
+            nil))
+        @o)))
+(defun mul-atav (n: i64 v: (Array f64)) -> (Array f64)
+  (mul-atv n (mul-av n v)))
+;; GAP (docs/shootout/gaps.md, "f64 square root"): math/sqrt is specified (stdlib 4.16) but not landed: there is no
+;; sqrt builtin. It is called ONCE, on the final ratio, so Newton's method (converged to the last bit or one ulp,
+;; far inside the 9 printed decimals) does not distort the timing; the Java and C versions use Math.sqrt / sqrt.
+(defun sqrt-newton (x: f64) -> f64
+  (loop [k 0 r 1.0]
+    (if (< k 60) (recur (+ k 1) (/ (+ r (/ x r)) 2.0)) r)))
+
+;; GAP (docs/shootout/gaps.md, "f64 formatting to a fixed number of decimals"): `printf`/`format` are specified (stdlib 4.x)
+;; but not landed. fmt9 rounds the shortest-repr text of a value in [1, 10) to 9 decimals, half up. It runs ONCE.
+(defun zeros (n: i64) -> str
+  (loop [k 0 z ""] (if (< k n) (recur (+ k 1) (str z "0")) z)))
+
+(defun digits (s: str) -> i64
+  (if-some [v (parse-long s)] v 0))
+
+(defun fmt9 (x: f64) -> str
+  (let [s (str x)
+        dot (if-some [d (str-find s "." 0)] d 1)
+        ip (digits (subs s 0 dot))
+        fr (str (subs s (+ dot 1)) (zeros 10))
+        v (+ (+ (* ip 1000000000) (digits (subs fr 0 9))) (if (>= (digits (subs fr 9 10)) 5) 1 0))
+        w (quot v 1000000000)
+        f (str (- v (* w 1000000000)))]
+    (str w "." (zeros (- 9 (count f))) f)))
+
+(defun main () -> i64
+  (let [n (if-some [k (parse-long (nth (args) 0))] k 100)
+        r (loop [k 0 u (array n 1.0) v (array n 0.0)]
+            (if (< k 10)
+              (let [v2 (mul-atav n u)]
+                (recur (+ k 1) (mul-atav n v2) v2))
+              (Pair u v)))
+        u (. r fst)
+        v (. r snd)
+        q (loop [i 0 vbv 0.0 vv 0.0]
+            (if (< i n)
+              (recur (+ i 1) (+ vbv (* (array-get u i) (array-get v i))) (+ vv (* (array-get v i) (array-get v i))))
+              (sqrt-newton (/ vbv vv))))]
+    (do (println (fmt9 q)) 0)))
