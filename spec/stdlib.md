@@ -1888,7 +1888,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 |---|---|---|---|---|---|
 | `clojure.math/E` | keep | `math/e` | `f64` | 4 | a `def` |
 | `clojure.math/PI` | keep | `math/pi` | `f64` | 4 | a `def` |
-| `clojure.math/sqrt` | keep | `(math/sqrt x)` | `f64 -> f64` | 4 | IEEE-exact, so a builtin both tools agree on (§7 L11); `f32` too |
+| `clojure.math/sqrt` | keep | `(math/sqrt x)` | `f64 -> f64` | 4 | IEEE-exact, so a builtin both tools agree on (§7 L11); `f32` too; **today** `lib/fib/math.fib` is a function over libm's `sqrt` (an `extern` in `fib.math.libm`, called inside `unsafe` in the library only), `f64` only, case 4204; replaced by the builtin when L11 lands (docs/shootout/gaps.md) |
 | `clojure.math/cbrt` | keep | `(math/cbrt x)` | `f64 -> f64` | 4 | written in fibber over `f64->bits`, so the interpreter and the compiler agree bit for bit |
 | `clojure.math/pow` | keep | `(math/pow x y)` | `f64 f64 -> f64` | 4 | in fibber (fdlibm-style); `ipow` is the exact integer power |
 | `clojure.math/exp` | keep | `(math/exp x)` | `f64 -> f64` | 4 | in fibber |
@@ -1992,6 +1992,7 @@ Offered over the survey's names by tranche: T1 153, T2 81, T3 199, T4 113, T5 81
 | `flush` | keep | `(flush)` | `-> unit` | 4 | the prelude writes unbuffered, so a no-op until buffering exists |
 | `printf` | adapt | `(printf "fmt" a ..)` | macro `-> unit` | 4 | the directives are checked against the argument types at compile time |
 | `format` | adapt | `(format "fmt" a ..)` | macro `-> str` | 4 | `%s` over `ToStr` (Clojure's `%s` is `str`), `%d` an integer, `%f` a float, `%x`; a literal format string is checked at compile time and a non-literal at run time (§2.9); locale independent |
+| `format-f64` (new) | new | `(fmt/format-f64 x digits)` | `f64 i64 -> str` | 4 | module `fib.fmt`: `x` as fixed-point text with `digits` places, as C's `%.*f`; stand-in for the `%f` directive of `format` until it lands; over glibc's `strfromd` (an `extern` in `fib.fmt.libc`, called inside `unsafe` in the library only), so it rounds the exact binary value where Java's `%.9f` rounds the shortest decimal text half up (they differ only on a value whose shortest text ends in a 5 exactly at the last place); case 4205 (docs/shootout/gaps.md) |
 | `pprint` | adapt | `(pprint x)` | `a -> unit \| Pretty a` | 5 | long tail |
 | `read-line` | adapt | `(read-line)` | `-> (Option str)` | 4 | `nil` at end of input; `fib.io` |
 | `dbg` (new) | new | `(dbg e)` | macro `a -> a \| Show a` | 1 | the prelude's debugging macro, kept: prints `dbg POS: e = <text>` to stderr and returns the value (`crates/fibref/src/expand/prelude/forms.rs`), the text being `fib.prelude/show` of the value, so a string is not quoted; it would be `Debug` only if the owner decides so (§2.7; case 611); not a Clojure name |
