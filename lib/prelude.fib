@@ -179,6 +179,29 @@
     ((VLeaf items) items)
     ((VBranch kids) (vnode-leaf (array-get kids (bit-and (shr i level) 31)) (- level 5) i))))
 
+;; The elements of an array from index j0 on, in order, until k says stop; whether it ran to the end.
+(defun array-each-from :private (xs: (Array a) j0: i64 k: (fn (a) bool) :borrow) -> bool
+  (let ((n (array-len xs)))
+    (loop ((j j0)) (if (< j n) (if (k (array-get xs j)) (recur (+ j 1)) false) true))))
+
+;; The elements of v from index `from` on, in order, until k says stop; whether it ran to the end. The walk goes leaf by leaf, so the
+;; trie is descended once for every 32 elements, where (vec-nth v i) in a loop descends it, with a count taken and dropped at each
+;; level, for every element. `from` at or past the count walks nothing.
+(defun vec-each-from (v: (Vec a) from: i64 k: (fn (a) bool) :borrow) -> bool
+  (match v
+    ((VecEmpty) true)
+    ((VecOf cnt shift root tail)
+     (let ((tailoff (- cnt (array-len tail))))
+       (if (loop ((i from))
+             (if (< i tailoff)
+                 (let ((leaf (match root
+                               ((some r) (vnode-leaf r shift i))
+                               (nil (trap "vec: a vector with no leaves and no tail")))))
+                   (if (array-each-from leaf (bit-and i 31) k) (recur (shl (+ (shr i 5) 1) 5)) false))
+                 true))
+           (array-each-from tail (if (< from tailoff) 0 (- from tailoff)) k)
+           false)))))
+
 ;; node, a branch at level (5 or more), without its last leaf; nil when that leaves nothing. One new array and one
 ;; new node for each level of the path to the last leaf, the other kids shared.
 (defun vnode-pop :private (node: (VNode a) level: i64) -> (Option (VNode a))

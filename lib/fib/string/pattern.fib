@@ -28,11 +28,25 @@
   (find-in (self s from)
     (match (str-find s self from)
       (nil nil)
-      ((some i) (some (Pair i (+ i (str-len self))))))))
+      ((some i) (some (Pair i (+ i (str-len self)))))))
+  (split-by (self s limit) (if (= (str-len self) 0) (split-pieces self s limit) (split-literal self s limit))))
 
 ;; a `char` is the string of its one character
 (impl Pattern char
-  (find-in (self s from) (find-in (char->str self) s from)))
+  (find-in (self s from) (find-in (char->str self) s from))
+  (split-by (self s limit) (split-by (char->str self) s limit)))
+
+;; split-pieces for a pattern that is a non-empty `str`: no match is empty, so none starts a piece early and the next search
+;; starts at the end of the last. The generic loop makes a Pair and an Option per match (find-in answers them to a caller it
+;; cannot see) and, for a `char`, the one-character string per match; here the Option of str-find is matched where it is made,
+;; so the one object a piece costs is its slice.
+(defun split-literal :private (pat: str s: str limit: i64) -> (Vec str)
+  (loop ((from 0) (pieces (vec-empty)))
+    (if (if (> limit 0) (= (fib.prelude/vec-count pieces) (- limit 1)) false)
+        (finish-pieces s from limit pieces)
+        (match (str-find s pat from)
+          (nil (finish-pieces s from limit pieces))
+          ((some i) (recur (+ i (str-len pat)) (fib.prelude/vec-conj pieces (str-slice s from i))))))))
 
 ;; where the next search starts after the match [st, en): at its end, or one character on when it
 ;; is empty, or -1 when an empty match at the very end leaves nothing to search

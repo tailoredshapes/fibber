@@ -11,30 +11,31 @@
 ;;  - the name is always qualified: an unqualified `join` is the task-wait builtin (§3 N9).
 (ns fib.string.join (:use fib.core fib.seq))
 
-;; the total length of the parts and of the separators between them
-(defun joined-length :private (sep: str parts: (Vec str)) -> i64
-  (let ((n (fib.prelude/vec-count parts)))
-    (loop ((i 0) (total 0))
-      (if (< i n)
-          (recur (+ i 1) (+ total (+ (str-len (fib.prelude/vec-nth parts i)) (if (> i 0) (str-len sep) 0))))
-          total))))
-
 ;; the bytes of piece, written into buf from pos on; the next position
 (defun write-piece :private (buf: (Cell (Array i8)) pos: i64 piece: str) -> i64
   (let ((n (str-len piece)))
     (do (dotimes (j n) (array-set! &buf (+ pos j) (str-byte-at piece j)))
         (+ pos n))))
 
-(defun join-parts :private (sep: str parts: (Vec str)) -> str
-  (let ((n (fib.prelude/vec-count parts))
-        (buf (cell (array (joined-length sep parts) 0i8))))
-    (do (loop ((i 0) (pos 0))
-          (if (< i n)
-              (recur (+ i 1) (write-piece buf (if (> i 0) (write-piece buf pos sep) pos) (fib.prelude/vec-nth parts i)))
-              ()))
+;; the parts and the separators between them, written into one array of `total` bytes (the length of the parts and of the
+;; separators), which becomes the str. The walk is leaf by leaf (vec-each-from), not an index and a descent of the trie per part.
+(defun join-parts :private (sep: str parts: (Vec str) total: i64) -> str
+  (let ((buf (cell (array total 0i8)))
+        (pos (cell 0))
+        (i (cell 0)))
+    (do (fib.prelude/vec-each-from parts 0
+          (fn (p) (do (set! pos (write-piece buf (if (> @i 0) (write-piece buf @pos sep) @pos) p))
+                      (set! i (+ @i 1))
+                      true)))
         (str-from-bytes @buf))))
 
+;; The parts are collected by the bulk builder (vec-collect: two objects for every 32 parts), not by a conj onto a vector held
+;; in a cell: the read of the cell makes the vector shared, so every conj copied the tail of up to 32 parts. The length of the
+;; text is summed on the way, so there is no pass for it.
 (defun join (sep: str c: c) :where ((Reducible c e) (ToStr e)) -> str
-  (let ((parts (cell (vec-empty))))
-    (do (each-while c (fn (x) (do (set! parts (fib.prelude/vec-conj @parts (to-str x))) true)))
-        (join-parts sep @parts))))
+  (let ((len (cell 0))
+        (n (cell 0))
+        (parts (fib.prelude/vec-collect
+                 (fn (k) (each-while c (fn (x) (let ((p (to-str x)))
+                                                 (do (set! len (+ @len (str-len p))) (set! n (+ @n 1)) (k p)))))))))
+    (join-parts sep parts (+ @len (* (str-len sep) (if (> @n 0) (- @n 1) 0))))))
