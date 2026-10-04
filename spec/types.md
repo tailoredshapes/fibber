@@ -259,7 +259,8 @@ spell (syntax §3.9), and because of its representation (§8.1).
 no null of any other type, no implicit conversion from `T` to
 `(Option T)`, and `match` (with the prelude's `if-let`, `nil?`, `some?`
 over it) is its only eliminator. For an object `T` that is not itself an
-`Option` the representation is a nullable pointer (§8.1), so the
+`Option` the representation is a nullable pointer (§8.1), and for a
+scalar one (in stage 2) a pair held by value, so the
 abstraction costs nothing; `(Option (Option T))` is a heap enum, so
 `(some nil)` and `nil` stay the distinct values the semantics says they
 are (§8.1). The prelude derives `Eq`, `Ord` (`nil` before `some`),
@@ -592,7 +593,8 @@ reference to observe: for an object `T` it is the payload's pointer or
 null (§8.1), so its box would be the payload's and `@w` could not tell
 "the Option died" from "it was `nil`", and `(weak nil)` would read the
 header of a null pointer; a heap-enum `Option` (§8.1) is a fresh object
-at each `(some ..)` whose identity no program can hold on to. A program
+at each `(some ..)` whose identity no program can hold on to, and an
+`Option` held as a pair (§8.1, stage 2) is no object at all. A program
 takes the weak reference of the object inside the `Option`.
 `(Weak (dyn P))` stays well formed (§8.7).
 
@@ -1403,13 +1405,16 @@ scheme (**Decided**):
   is keyed by the **layout class** of its argument: the scalar lIR
   types (`i1 i8 i16 i32 i64 float double`), `ptr` (every object type
   except the next two), `opt` (an `(Option T)` with `T` of class `ptr`: a
-  nullable pointer, §8.1), `box` (an `(Option T)` with `T` of a scalar
-  class, of `unit`, or itself an `Option`: a heap enum, §8.1), and the
-  two-word `dyn`.
+  nullable pointer, §8.1), `box` (an `(Option T)` with `T` of `unit`, of
+  `dyn`, or itself an `Option`: a heap enum, §8.1), and the
+  two-word `dyn`. (In stage 2 an `(Option T)` with `T` of a scalar class is of a
+  scalar class itself, its lIR type the pair `{ i1 t }`, §8.1; the stage-1
+  `fibc`, which is frozen, still gives it the class `box`.)
 
 The separate `opt` and `box` classes are what keep the `Option`
 representation rule of §8.1 intact under monomorphisation: `(Option a)`
-at `a` of class `opt`, `box` or a scalar class takes the heap-enum row,
+at `a` of class `opt` or `box` takes the heap-enum row, at `a` of a
+scalar class the pair row (stage 2) or the heap-enum row (stage 1),
 and only at `a` of class `ptr` the null row. (Until the stage-1 fix
 s1a there was no `box` class: an `(Option i64)` was of class `ptr`, so a
 body keyed by class built `(Option a)` as a nullable pointer where its
@@ -2999,7 +3004,9 @@ it. Runtime support functions are ordinary lIR `define`s in a
 | `ptr` (unsafe) | `ptr`, uncounted | i64-like scalar |
 | every object type (`str`, `Form`, `Array`, struct, enum with fields, `Cell`, `Atom`, `Weak` of a non-`dyn`, `Task`, closure) | `ptr` to a block starting with the header (§8.2) | ptr |
 | `(Option T)`, `T` an object type that is not itself an `Option` | `ptr`, null = `nil`; no allocation for `some` | opt |
-| `(Option T)`, `T` a scalar, a `dyn` (with or without `:send`), a `(Weak (dyn P))`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
+| `(Option T)`, `T` a scalar that has a value (`bool`, an integer, `char`, `keyword`, a float, a field-less `defenum`, `ptr`) — stage 2 | `{ i1 t }` by value, `t` the lIR type of `T`: the tag (1 for `some`), then the payload, zero for `nil`; no allocation, no count (§8.3; docs/design/unboxed-option.md) | `{ i1 t }`, a scalar class |
+| `(Option T)`, `T` a scalar that has a value — stage 1 (frozen) | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
+| `(Option T)`, `T` `unit`, a `dyn` (with or without `:send`), a `(Weak (dyn P))`, or itself an `(Option ..)` | `ptr` to a heap enum object: tag and payload (§8.3; v1) | ptr |
 | `(fn κ (Ā) R)` | `ptr` to a closure object (§8.4) | ptr |
 | `(dyn P)`, `(dyn P :send)` | `{ ptr ptr }` by value: object, vtable | dyn |
 | `(Weak (dyn P))`, `(Weak (dyn P :send))` | `{ ptr ptr }` by value: the object's weak box (§8.7), vtable | dyn |
@@ -3191,7 +3198,15 @@ compiled program.
 - `(Option T)`, `T` a non-`Option` object type: the bare nullable
   pointer; `nil` is `(ptr null)`; `(some p)` in a pattern is a null
   test. `fib.retain`/`release` are null-tolerant, so codegen needs no
-  special case. Every other `Option` (§8.1) is an ordinary heap enum
+  special case. In stage 2 an `Option` of a scalar that has a value
+  (§8.1) is the pair `{ i1 t }` by value: `nil` is
+  `(zeroinitializer { i1 t })`, `(some x)` is `{ (i1 1) x }`, a pattern
+  reads the tag with `extractvalue` and a `(some p)` sub-pattern binds
+  `extractvalue 1`; there is no object, so no allocation and no count,
+  and an object field, an array element, a cell, a capture or a task
+  slot of such a type holds the pair inline (its `size-align` is the
+  tag byte and `t` at its alignment). Every other `Option` (§8.1) is an
+  ordinary heap enum
   with tag `0` = `nil`, `1` = `some` and the payload at its own lIR type;
   `(some p)` in a pattern reads the tag.
 - `str`: `(defstruct fib.str (i64 i32 i32 i64 [0 x i8]))` (count, type

@@ -1301,7 +1301,7 @@ function type is `(fn :local (A..) R)`. `M` is `names::mangle`. `L` is the lIR
 type: `i1 i8 i16 i32 i64 float double`, `ptr` for a counted object pointer,
 `raw` for a program's raw `ptr`, `dyn`, and `void` for `unit`. `C` is the class
 of `mono::class_of`: `scalar`, `ptr`, `opt` (a nullable pointer), `boxed` (an
-`Option` held as a heap enum), `dyn` or `unit`; `R` is the mangled name of the
+`Option` held as a heap enum), `dyn` or `unit`; stage 2's `L` for an `(Option scalar)` is the pair `{ i1 t }` and its `C` is `scalar`; `R` is the mangled name of the
 class's representative type (`mono::representative`). `O` is `-` for a type that
 is no object (a scalar, a `dyn`, `unit`, a null-represented `Option`, a
 function), else `SNAME tid N size S offsets OFFSETS`: the struct name, the type

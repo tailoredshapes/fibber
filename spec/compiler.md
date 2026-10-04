@@ -333,11 +333,15 @@ variable of the scheme, the full type when the variable carries a
 protocol bound, else its layout class (`i1 i8 i16 i32 i64 float double
 ptr opt box dyn`). Inside a class-keyed specialisation the compiler
 substitutes a **representative** type of the class for the variable
-(`str` for `ptr`, `(Option str)` for `opt`, `(Option i64)` for `box`, a
-`dyn` for `dyn`, the scalar itself), so every expression has a concrete
+(`str` for `ptr`, `(Option str)` for `opt`, `(Option (Option i64))` for
+`box` (stage 1 used `(Option i64)`, which stage 2 holds as a pair), a
+`dyn` for `dyn`, the scalar itself, and for the pair `{ i1 t }` of an
+`(Option scalar)` the `(Option` of the scalar's representative), so every
+expression has a concrete
 layout; `opt` is an `(Option T)` held as a nullable pointer and `box`
-one held as a heap enum (types §8.1: a scalar, unit or `Option`
-payload), kept apart because an `(Option a)` is a nullable pointer when
+one held as a heap enum (types §8.1: a unit, `dyn` or `Option`
+payload; in stage 1 also a scalar), kept apart because an `(Option a)` is a
+nullable pointer when
 `a` is a `ptr` and a heap enum when `a` is `opt` or `box`; nothing in
 such a body can dispatch on the variable, since it has no bound. Method
 calls whose resolution is a bound of the scheme are resolved per
@@ -470,6 +474,17 @@ as described.
     the live tally nor the allocation counts are determined. The
     harness compares only the message and the exit status for a trap
     when either side spawned a thread.
+13. **Stage 2 holds an `Option` of a scalar as a value, the interpreter
+    as a heap enum** (performance batch 4, lever A; types §8.1,
+    docs/design/unboxed-option.md). The compiled count of heap objects
+    for a program that makes such an `Option` is lower than the
+    interpreter's, where §4 and method.md rule 3 say the traces are the
+    same lines. The `allocs: <= N` bound still holds (a compiled run
+    allocates at most what the interpreter does), and a case whose
+    bound only the compiled count meets (`cases/ownership` 267) carries
+    `;; stage: 2`, as compiler/mirror-pending/X9c-stage2-only.md says;
+    the memory audit is unchanged (there is nothing to leak). The
+    frozen Rust `fibc` still boxes.
 
 ## 9. The C interface to lair (M6)
 
