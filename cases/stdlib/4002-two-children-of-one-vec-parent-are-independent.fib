@@ -1,0 +1,62 @@
+;; spec:   design/in-place-update.md §6 T2 (two children of one parent), stdlib §2.5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc conj pop nth count
+;; `a` is used three times, so it is retained for the first two uses and its last use may move: b and c are made from
+;; the same parent and then a itself is read. The parent is built at the edges of the layout: 31 elements (one slot
+;; below a full tail), 32 (a full tail, so a conj makes the first trie node), 33, 1024 + 32 (the root is full and the
+;; next conj grows the tree) and 1100 (deep). For each parent size n: b = conj a 1, c = conj a 2, d = assoc a 0 9,
+;; e = pop a, and then all five are read in full and the parent is read again.
+;; MUTANT: scripts/mutant-unique.sh; under `fib.unique?` true b, c, d and e write into `a`'s tail, and the reads of `a`
+;; or of b fail.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun build (n: i64) -> (Vec i64)
+  (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (+ i 100))) v)))
+
+;; the first m elements of v are (+ i 100)
+(defun prefix-ok (v: (Vec i64) m: i64) -> bool
+  (loop ((i 0) (ok true)) (if (and ok (< i m)) (recur (+ i 1) (= (nth v i) (+ i 100))) ok)))
+
+(defun family-ok (n: i64) -> bool
+  (let ((a (build n)))
+    (let ((b (conj a 1))
+          (c (conj a 2))
+          (d (assoc a 0 9))
+          (e (pop a)))
+      (and (= (count a) n) (prefix-ok a n)
+           (= (count b) (+ n 1)) (prefix-ok b n) (= (nth b n) 1)
+           (= (count c) (+ n 1)) (prefix-ok c n) (= (nth c n) 2)
+           (= (count d) n) (= (nth d 0) 9)
+           (loop ((i 1) (ok true)) (if (and ok (< i n)) (recur (+ i 1) (= (nth d i) (+ i 100))) ok))
+           (= (count e) (- n 1)) (prefix-ok e (- n 1))
+           ;; and the parent once more, after the children have been read
+           (= (count a) n) (prefix-ok a n)))))
+
+;; grandchildren: two children of each child, the second made after the first has been updated
+(defun tree-ok (n: i64) -> bool
+  (let ((a (build n)))
+    (let ((b (conj a 1))
+          (c (conj a 2)))
+      (let ((b1 (conj b 11))
+            (b2 (assoc b 0 12))
+            (c1 (conj c 21))
+            (c2 (pop c)))
+        (let ((b3 (conj b1 13)))
+          (and (prefix-ok a n) (= (count a) n)
+               (= (count b) (+ n 1)) (= (nth b n) 1)
+               (= (count b1) (+ n 2)) (= (nth b1 n) 1) (= (nth b1 (+ n 1)) 11)
+               (= (nth b2 0) 12) (= (count b2) (+ n 1))
+               (= (count b3) (+ n 3)) (= (nth b3 (+ n 1)) 11) (= (nth b3 (+ n 2)) 13)
+               (= (count c) (+ n 1)) (= (nth c n) 2)
+               (= (count c1) (+ n 2)) (= (nth c1 (+ n 1)) 21)
+               (= (count c2) n) (prefix-ok c2 n)))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (dotimes (i 5)
+          (let ((n (nth [31 32 33 1056 1100] i)))
+            (do (check c (family-ok n)) (check c (tree-ok n)))))
+        (checks-result c))))

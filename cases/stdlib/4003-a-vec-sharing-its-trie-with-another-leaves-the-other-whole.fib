@@ -1,0 +1,69 @@
+;; spec:   design/in-place-update.md §6 T3 (shared tail, unique shell), stdlib §2.5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc conj pop nth count
+;; `b = (assoc a 0 x)` copies the path to slot 0 and shares every other branch of `a`'s trie; the shell of `b` is
+;; unique and its fields point at nodes that `a` holds as well (count 2). `b` is then updated in a loop, 200 times at
+;; slots spread over every branch (so every shared node is visited), by assoc and by conj and pop, and after each
+;; round `a` is read in full: it must not have changed. Then the other way round: `a` is updated in a loop while `b` is
+;; read. A parent of 1100 elements has a root, 34 nodes of 32 and a tail; one of 40 has a node and a tail.
+;; MUTANT: scripts/mutant-unique.sh; a shell that is unique with a field of count 2 is the steal case, and `fib.unique?`
+;; true on the shared node writes through into `a`.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun build (n: i64) -> (Vec i64)
+  (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (+ i 100))) v)))
+
+(defun whole-ok (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0) (ok true)) (if (and ok (< i n)) (recur (+ i 1) (= (nth v i) (+ i 100))) ok))))
+
+;; b updated in a loop: a stays whole after every round; b ends up with the writes of all the rounds
+(defun updates-b-ok (n: i64) -> bool
+  (let ((a (build n)))
+    (let ((b0 (assoc a 0 -1)))
+      (let ((b (loop ((j 0) (b b0))
+                 (if (< j 200)
+                     (recur (+ j 1) (if (whole-ok a n) (assoc b (rem (* j 37) n) (- 0 (+ j 2))) (assoc b 0 -999)))
+                     b))))
+        (and (whole-ok a n)
+             (= (count b) n)
+             ;; the last write to each slot k < n is by the biggest j < 200 with (rem (* j 37) n) = k, else the base
+             (loop ((k 0) (ok true))
+               (if (and ok (< k n))
+                   (recur (+ k 1)
+                          (= (nth b k)
+                             (loop ((j 199)) (if (< j 0) (if (= k 0) -1 (+ k 100)) (if (= (rem (* j 37) n) k) (- 0 (+ j 2)) (recur (- j 1)))))))
+                   ok)))))))
+
+;; b grown and shrunk by conj and pop: a stays whole
+(defun grows-b-ok (n: i64) -> bool
+  (let ((a (build n)))
+    (let ((b (assoc a 0 -1)))
+      (let ((g (loop ((j 0) (g b)) (if (< j 70) (recur (+ j 1) (conj g j)) g))))
+        (let ((s (loop ((j 0) (s g)) (if (< j 100) (recur (+ j 1) (pop s)) s))))
+          (and (whole-ok a n)
+               (= (count g) (+ n 70)) (= (nth g (+ n 69)) 69)
+               (= (count s) (- (+ n 70) 100)) (= (nth s 0) -1)
+               (whole-ok a n)))))))
+
+;; the other way round: a is updated, b is read
+(defun updates-a-ok (n: i64) -> bool
+  (let ((a (build n)))
+    (let ((b (assoc a 0 -1)))
+      (let ((a2 (loop ((j 0) (a a)) (if (< j 200) (recur (+ j 1) (assoc a (rem (* j 37) n) -5)) a))))
+        (and (= (count a2) n)
+             (= (nth b 0) -1)
+             (loop ((i 1) (ok true)) (if (and ok (< i n)) (recur (+ i 1) (= (nth b i) (+ i 100))) ok)))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (updates-b-ok 1100))
+        (check c (updates-b-ok 40))
+        (check c (grows-b-ok 1100))
+        (check c (grows-b-ok 40))
+        (check c (updates-a-ok 1100))
+        (check c (updates-a-ok 40))
+        (checks-result c))))

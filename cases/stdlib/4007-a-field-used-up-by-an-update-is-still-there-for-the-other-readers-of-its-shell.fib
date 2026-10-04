@@ -1,0 +1,90 @@
+;; spec:   design/in-place-update.md §1 (the steal rule), §6 T7 (steal safety), stdlib §2.5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc conj pop nth count
+;; An analysis that moves a field out of a dead shell (the steal) must decline when anything reads the shell, or another
+;; projection of the same field, after the consuming use. Seven shapes of that, each on a user struct `Chunk` whose
+;; field is a Vec (the shape of `VecOf`'s tail) and each checked against the persistent answer: (1) the field is
+;; updated, then the shell's other field and the field itself are read; (2) the field is read through an alias of
+;; the shell (`b` is `a`), after the update of `a`'s; (3) a second `match` on the same shell after the first one
+;; updated the field; (4) a closure captured the shell and is called after the update; (5) a loop that reuses the
+;; shell in every round, each round updating the field and reading the previous round's count; (6) the field is
+;; updated twice, the result of the first kept; (7) the update's result becomes a new shell with the old field's
+;; neighbour, and the old shell is read after. Each runs on a 40-element field and a 1100-element one.
+;; MUTANT: a steal that did not test `fib.unique?`, or one that tested a shell whose field is also held by a
+;; projection, writes into the old field, and the read after shows it (scripts/mutant-unique.sh forces the test true).
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct Chunk (n: i64 data: (Vec i64)))
+
+(defun build (n: i64) -> (Vec i64)
+  (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (+ i 100))) v)))
+
+(defun whole-ok (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0) (ok true)) (if (and ok (< i n)) (recur (+ i 1) (= (nth v i) (+ i 100))) ok))))
+
+;; (1) update the field, then read the shell's other field and the field
+(defun shape1 (c: Chunk) -> i64
+  (match c
+    ((Chunk n d) (let ((d2 (assoc d 0 -1))) (+ (* 1000 (. c n)) (+ (count d) (nth d2 0)))))))
+
+;; (2) through an alias
+(defun shape2 (c: Chunk) -> i64
+  (let ((a c) (b c))
+    (match a
+      ((Chunk n d) (let ((d2 (conj d -1))) (+ (count (. b data)) (* 10 (count d2))))))))
+
+;; (3) a second match on the same shell
+(defun shape3 (c: Chunk) -> i64
+  (let ((first (match c ((Chunk _ d) (assoc d 0 -1)))))
+    (match c ((Chunk _ d) (+ (nth d 0) (* 10 (nth first 0)))))))
+
+;; (4) a closure captured the shell
+(defun shape4 (c: Chunk) -> i64
+  (let ((f (fn () (nth (. c data) 0))))
+    (match c
+      ((Chunk _ d) (let ((d2 (assoc d 0 -1))) (+ (f) (* 10 (nth d2 0))))))))
+
+;; (5) a loop that reuses the shell in every round
+(defun shape5 (c: Chunk) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i 5)
+        (recur (+ i 1)
+               (match c ((Chunk n d) (let ((d2 (assoc d 0 (- 0 i)))) (+ acc (+ (nth d 0) (nth d2 0)))))))
+        acc)))
+
+;; (6) twice, the first result kept
+(defun shape6 (c: Chunk) -> i64
+  (match c
+    ((Chunk _ d)
+     (let ((d1 (pop d)))
+       (let ((d2 (pop d1)))
+         (+ (count d) (+ (* 10 (count d1)) (* 100 (count d2)))))))))
+
+;; (7) the result becomes a new shell; the old one is read after
+(defun shape7 (c: Chunk) -> i64
+  (match c
+    ((Chunk n d)
+     (let ((c2 (Chunk (+ n 1) (conj d -1))))
+       (+ (* 1000 (count (. c data))) (+ (* 10 (. c2 n)) (count (. c2 data))))))))
+
+(defun run-ok (n: i64) -> bool
+  (let ((c (Chunk 7 (build n))))
+    (and (= (shape1 c) (+ 7000 (+ n -1)))
+         (= (shape2 c) (+ n (* 10 (+ n 1))))
+         (= (shape3 c) (+ 100 -10))
+         (= (shape4 c) (+ 100 -10))
+         (= (shape5 c) (+ (* 5 100) (- 0 (+ 0 (+ 1 (+ 2 (+ 3 4)))))))
+         (= (shape6 c) (+ n (+ (* 10 (- n 1)) (* 100 (- n 2)))))
+         (= (shape7 c) (+ (* 1000 n) (+ 80 (+ n 1))))
+         (whole-ok (. c data) n))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (run-ok 40))
+        (check c (run-ok 1100))
+        (check c (run-ok 33))
+        (checks-result c))))

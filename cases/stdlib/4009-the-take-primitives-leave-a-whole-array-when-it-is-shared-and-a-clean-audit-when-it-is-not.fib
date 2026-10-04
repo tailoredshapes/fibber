@@ -1,0 +1,54 @@
+;; spec:   design/in-place-update.md §2 (array-take!, array-push!, array-pop!), §6 T7, T8
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: array-take! array-push! array-pop!
+;; The three primitives of the in-place lever, on arrays of Vecs (objects with a count, so a leak or a double release is
+;; seen by the audit). (1) `array-take!` on an array held by a cell alone takes element 1 and leaves a null slot; the slot
+;; is refilled, or the array is dropped with the null in it; both end with a clean audit. (2) `array-take!` on an array that
+;; another variable holds copies it first: the other array is whole afterwards. (3) `array-push!` and `array-pop!`: pushed
+;; to the capacity of a tail (32), the pushed values read back; popped back down; a shared array pushed to is not changed.
+;; Only a compiler that has the primitives (lever L2) runs this case.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun v3 (x: i64) -> (Vec i64) [x (+ x 1) (+ x 2)])
+
+(defun unique-ok (c: Checks) -> unit
+  (let ((a (cell (array 3 (v3 0)))))
+    (do (array-set! &a 1 (v3 10))
+        (array-set! &a 2 (v3 20))
+        (let ((t (array-take! &a 1)))
+          (do (check c (= t (v3 10)))
+              (array-set! &a 1 (v3 11))
+              (check c (= (array-get @a 1) (v3 11)))))
+        (let ((t2 (array-take! &a 2)))
+          (check c (= t2 (v3 20)))))))
+
+(defun shared-ok (c: Checks) -> unit
+  (let ((orig (array 3 (v3 5))))
+    (let ((a (cell orig)))
+      (do (check c (= (array-take! &a 0) (v3 5)))
+          (check c (= (array-get orig 0) (v3 5)))
+          (check c (= (array-len orig) 3))))))
+
+(defun push-pop-ok (c: Checks) -> unit
+  (let ((a (cell (array 1 (v3 0)))))
+    (do (dotimes (i 31) (array-push! &a (v3 (+ i 1))))
+        (check c (= (array-len @a) 32))
+        (check c (= (array-get @a 31) (v3 31)))
+        (let ((last (array-pop! &a)))
+          (do (check c (= last (v3 31)))
+              (check c (= (array-len @a) 31))))
+        (let ((keep @a))
+          (do (array-push! &a (v3 99))
+              (check c (= (array-len keep) 31))
+              (check c (= (array-len @a) 32))
+              (check c (= (array-get @a 31) (v3 99))))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (unique-ok c)
+        (shared-ok c)
+        (push-pop-ok c)
+        (checks-result c))))

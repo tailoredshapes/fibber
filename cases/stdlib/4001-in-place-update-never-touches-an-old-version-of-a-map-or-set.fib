@@ -1,0 +1,82 @@
+;; spec:   design/in-place-update.md §6 T1 (history kept), stdlib §2.5, §2.7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc dissoc conj disj get contains?
+;; T1 for the Map and the Set: every version a loop makes is kept in a Vec, and afterwards each is read in full. A Map
+;; grows by `assoc` of new keys and of existing ones (the existing-key update is the in-place case of a map lever),
+;; then shrinks by `dissoc`; a Set grows by `conj` and shrinks by `disj`, 300 elements so the trie is several levels
+;; deep. Version j of the map holds the keys 0..j-1 with value (* key 100) + (the number of times the key was
+;; rewritten up to j); the check recomputes that.
+;; MUTANT: scripts/mutant-unique.sh forces `fib.unique?` true; the histories then hold one object under every name.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+;; step s writes key (rem s n): a new key for s < n, a rewrite after
+(defun grow-map (n: i64 steps: i64) -> (Vec (Map i64 i64))
+  (loop ((s 0) (m (map-empty)) (h (vec-empty)))
+    (if (< s steps)
+        (recur (+ s 1) (assoc m (rem s n) (+ (* (rem s n) 100) (quot s n))) (conj h m))
+        (conj h m))))
+
+(defun map-ok (n: i64 steps: i64) -> bool
+  (let ((hist (grow-map n steps)))
+    (loop ((j 0) (ok true))
+      (if (and ok (<= j steps))
+          (recur (+ j 1)
+                 (let ((m (nth hist j)))
+                   (and (= (count m) (if (< j n) j n))
+                        (loop ((k 0) (good true))
+                          (if (and good (< k n))
+                              ;; key k has been written at steps k, k+n, ..: those < j, so (j - k + n - 1) / n times
+                              (recur (+ k 1)
+                                     (let ((times (if (< k j) (quot (+ (- j k) (- n 1)) n) 0)))
+                                       (if (= times 0)
+                                           (= (get m k) nil)
+                                           (= (get m k) (some (+ (* k 100) (- times 1)))))))
+                              good)))))
+          ok))))
+
+;; then dissoc one key per step, in key order: version j lacks the keys below j
+(defun dissoc-ok (n: i64) -> bool
+  (let ((full (loop ((k 0) (m (map-empty))) (if (< k n) (recur (+ k 1) (assoc m k (* k 2))) m))))
+    (let ((hist (loop ((j 0) (m full) (h (vec-empty))) (if (< j n) (recur (+ j 1) (dissoc m j) (conj h m)) (conj h m)))))
+      (loop ((j 0) (ok true))
+        (if (and ok (<= j n))
+            (recur (+ j 1)
+                   (let ((m (nth hist j)))
+                     (and (= (count m) (- n j))
+                          (loop ((k 0) (good true))
+                            (if (and good (< k n))
+                                (recur (+ k 1) (if (< k j) (= (get m k) nil) (= (get m k) (some (* k 2)))))
+                                good)))))
+            ok)))))
+
+(defun set-ok (n: i64) -> bool
+  (let ((grown (loop ((k 0) (s (set-empty)) (h (vec-empty))) (if (< k n) (recur (+ k 1) (conj s (* k 3)) (conj h s)) (conj h s)))))
+    (let ((shrunk (loop ((j 0) (s (nth grown n)) (h (vec-empty))) (if (< j n) (recur (+ j 1) (disj s (* j 3)) (conj h s)) (conj h s)))))
+      (and (loop ((j 0) (ok true))
+             (if (and ok (<= j n))
+                 (recur (+ j 1)
+                        (let ((s (nth grown j)))
+                          (and (= (count s) j)
+                               (loop ((k 0) (good true))
+                                 (if (and good (< k n)) (recur (+ k 1) (= (contains? s (* k 3)) (< k j))) good)))))
+                 ok))
+           (loop ((j 0) (ok true))
+             (if (and ok (<= j n))
+                 (recur (+ j 1)
+                        (let ((s (nth shrunk j)))
+                          (and (= (count s) (- n j))
+                               (loop ((k 0) (good true))
+                                 (if (and good (< k n)) (recur (+ k 1) (= (contains? s (* k 3)) (>= k j))) good)))))
+                 ok))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (map-ok 40 130))
+        (check c (map-ok 300 320))
+        (check c (dissoc-ok 120))
+        (check c (set-ok 300))
+        (check c (set-ok 9))
+        (checks-result c))))

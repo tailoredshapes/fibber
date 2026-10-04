@@ -1,0 +1,18 @@
+;; spec:   design/in-place-update.md §6 T9 (counts), §5 L3, stdlib §2.5, §8.1 item 5 (count cases)
+;; expect: accept
+;; result: 1007
+;; audit:  clean
+;; allocs: <= 1200
+;; roots:  ../../lib support
+;; open:   L3
+;; covers: conj
+;; 1000 `conj` from the empty Vec, the Vec held by one name. Today every conj copies the tail array and allocates a new `VecOf`: 2094
+;; objects (measured with `fibc run --trace`). With the tail array grown in place (L3: `array-push!`, ROOMY capacity 32) a conj still
+;; allocates one `VecOf` shell, because an enum cannot be updated in place (design §2.5), plus one tail array and one leaf for every
+;; 32 elements: 1000 shells and about 100 more, so at most 1200. It is OPEN for L3. L5 (the shell reused) lowers it again: case 4012.
+(ns main (:use fib.core fib.seq fib.coll))
+
+;; 1000 conj on a vector that nobody else holds
+(defun main () -> i64
+  (let ((v (loop ((i 0) (v (vec-empty))) (if (>= i 1000) v (recur (+ i 1) (conj v i))))))
+    (+ (count v) (if (> (count v) 7) (nth v 7) 0))))

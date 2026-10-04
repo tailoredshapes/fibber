@@ -1,0 +1,69 @@
+;; spec:   design/in-place-update.md §6 T5 (tasks and atoms), §4 (tasks, atoms), stdlib §2.5, §4.1 (atom swap!)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: atom swap! deref future
+;; Two ways a Vec meets another thread. (1) A Vec in an `atom` is updated by `swap!` from two tasks, 100 conj each, and
+;; a version read from the atom before the tasks start is read again after they ended: the 200 appended elements are all
+;; there (a lost one would be a torn write), the old version is untouched, and a second atom that holds the same Vec
+;; sees only its own two updates. (2) A Vec is captured by a task (so it is SHARED from `spawn` on) and also kept by
+;; the parent; the child updates its view by assoc and conj, the parent updates its own, 200 rounds, and each side reads
+;; the other's Vec through its own: neither update may be seen by the other side. The failure of the unsafe version
+;; is a race, so the rounds are many; the mutant shows it at once (the same object under both names).
+;; MUTANT: scripts/mutant-unique.sh; case 4005 fails on the first round of (2) and on the old version of (1).
+(ns main (:use fib.core fib.seq fib.coll fib.async tl.check))
+
+(defun build (n: i64) -> (Vec i64)
+  (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (+ i 100))) v)))
+
+(defun whole-ok (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0) (ok true)) (if (and ok (< i n)) (recur (+ i 1) (= (nth v i) (+ i 100))) ok))))
+
+(defun add-hundred (a: (Atom (Vec i64)) base: i64) -> unit
+  (dotimes (i 100) (swap! a (fn (x) (conj x (+ base i))))))
+
+(defun atoms-ok (n: i64) -> bool
+  (let ((v (build n)))
+    (let ((a (atom v))
+          (b (atom v)))
+      (let ((old @a))
+        (let ((t1 (future (add-hundred a 1000)))
+              (t2 (future (add-hundred a 2000))))
+          (do (swap! b (fn (x) (assoc x 0 -1)))
+              (swap! b (fn (x) (conj x -2)))
+              (join t1)
+              (join t2)
+              (let ((now @a)
+                    (nb @b))
+                (and (whole-ok old n) (whole-ok v n)
+                     (= (count now) (+ n 200))
+                     (loop ((i 0) (ok true)) (if (and ok (< i n)) (recur (+ i 1) (= (nth now i) (+ i 100))) ok))
+                     ;; the tasks' elements are all there, in any interleaving: the sums of 1000+i and 2000+i
+                     (= (loop ((i n) (s 0)) (if (< i (+ n 200)) (recur (+ i 1) (+ s (nth now i))) s))
+                        (+ (+ (* 100 1000) 4950) (+ (* 100 2000) 4950)))
+                     (= (count nb) (+ n 1)) (= (nth nb 0) -1) (= (nth nb n) -2)))))))))
+
+;; the child gets v by capture, the parent keeps it
+(defun child (v: (Vec i64) n: i64 r: i64) -> bool
+  (let ((a (assoc v 0 (+ 5000 r)))
+        (b (conj v (+ 6000 r))))
+    (and (= (nth a 0) (+ 5000 r)) (= (count a) n) (= (count b) (+ n 1)) (= (nth b n) (+ 6000 r)))))
+
+(defun round-ok (n: i64 r: i64) -> bool
+  (let ((v (build n)))
+    (let ((t (future (child v n r))))
+      (let ((p (assoc v 0 (- 0 r)))
+            (q (conj v (- 0 (+ r 7)))))
+        (and (join t)
+             (whole-ok v n)
+             (= (nth p 0) (- 0 r)) (= (nth q n) (- 0 (+ r 7))))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (atoms-ok 40))
+        (check c (atoms-ok 1100))
+        (check c (loop ((r 0) (ok true)) (if (and ok (< r 200)) (recur (+ r 1) (round-ok 40 r)) ok)))
+        (check c (loop ((r 0) (ok true)) (if (and ok (< r 100)) (recur (+ r 1) (round-ok 1100 r)) ok)))
+        (checks-result c))))

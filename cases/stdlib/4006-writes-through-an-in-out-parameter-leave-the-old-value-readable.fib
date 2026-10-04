@@ -1,0 +1,78 @@
+;; spec:   design/in-place-update.md §6 T6 (& parameters), §4 (in/out parameters), stdlib §6.5, syntax §3.13
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: push! assoc conj nth count
+;; `&v` copies the cell's value in and writes the result back when the call ends; between the two the old value is
+;; still the argument variable's, so a read of it is a read of the old version. Four cases. (1) A loop of 1100 `push!`
+;; through a cell, a snapshot of the cell taken every 50: every snapshot keeps its length and its elements. (2) A
+;; `defun` with a `&` parameter that reads the cell's old value, writes through the parameter, and returns the old
+;; value: after the call the returned value is the version before the write and the cell holds the version after.
+;; (3) The same defun called twice in a row on the same cell, its first result kept: three versions, all readable. (4)
+;; A `&` parameter forwarded to a second `&` call, then read in the first function after the return.
+;; MUTANT: scripts/mutant-unique.sh forces `fib.unique?` true; the returned old value is then the new one.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun elem (i: i64) -> i64 (+ (* i 31) 7))
+
+(defun whole-ok (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0) (ok true)) (if (and ok (< i n)) (recur (+ i 1) (= (nth v i) (elem i))) ok))))
+
+(defun push-and-old (&v: (Vec i64) x: i64) -> (Vec i64)
+  (let ((old @v))
+    (do (push! &v x) old)))
+
+(defun set-and-old (&v: (Vec i64) x: i64) -> (Vec i64)
+  (let ((old @v))
+    (do (set! v (assoc @v 0 x)) old)))
+
+(defun forward (&v: (Vec i64) x: i64) -> i64
+  (let ((before @v))
+    (do (push-and-old &v x)
+        (push-and-old &v (+ x 1))
+        (+ (count before) (* 1000 (count @v))))))
+
+(defun snapshots-ok (n: i64) -> bool
+  (let ((c (cell (vec-empty)))
+        (snaps (cell (vec-empty))))
+    (do (dotimes (i n)
+          (do (push! &c (elem i))
+              (if (= (rem i 50) 0) (set! snaps (conj @snaps @c)) ())))
+        (and (whole-ok @c n)
+             (loop ((j 0) (ok true))
+               (if (and ok (< j (count @snaps))) (recur (+ j 1) (whole-ok (nth @snaps j) (+ (* j 50) 1))) ok))))))
+
+(defun old-value-ok (n: i64) -> bool
+  (let ((c (cell (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (elem i))) v)))))
+    (let ((old (push-and-old &c 5)))
+      (and (whole-ok old n) (= (count @c) (+ n 1)) (= (nth @c n) 5) (whole-ok old n)))))
+
+(defun three-versions-ok (n: i64) -> bool
+  (let ((c (cell (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (elem i))) v)))))
+    (let ((v1 (push-and-old &c 5)))
+      (let ((v2 (push-and-old &c 6)))
+        (let ((v3 (set-and-old &c -1)))
+          (and (whole-ok v1 n)
+               (= (count v2) (+ n 1)) (= (nth v2 n) 5) (= (nth v2 0) (elem 0))
+               (= (count v3) (+ n 2)) (= (nth v3 (+ n 1)) 6) (= (nth v3 0) (elem 0))
+               (= (count @c) (+ n 2)) (= (nth @c 0) -1)
+               (whole-ok v1 n)))))))
+
+(defun forward-ok (n: i64) -> bool
+  (let ((c (cell (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (elem i))) v)))))
+    (let ((keep @c))
+      (let ((r (forward &c 9)))
+        (and (= r (+ n (* 1000 (+ n 2)))) (whole-ok keep n) (= (count @c) (+ n 2)) (= (nth @c (+ n 1)) 10))))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (snapshots-ok 1100))
+        (check c (old-value-ok 40))
+        (check c (old-value-ok 1100))
+        (check c (three-versions-ok 40))
+        (check c (three-versions-ok 1100))
+        (check c (forward-ok 40))
+        (check c (forward-ok 1100))
+        (checks-result c))))

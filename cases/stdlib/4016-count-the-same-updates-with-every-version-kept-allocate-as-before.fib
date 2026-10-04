@@ -1,0 +1,28 @@
+;; spec:   design/in-place-update.md §6 T9 (the shared case did not get cheaper by accident, and did not get dearer), stdlib §2.5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; allocs: <= 11084
+;; roots:  ../../lib support
+;; covers: assoc conj pop
+;; The programs of cases 4010, 4011, 4013 and 4015 (smaller), with each version kept in a history Vec, so every update runs on a
+;; value that two names hold and must copy. Their allocations are the persistent library's: 11084 objects, counted with `fibc run --trace`
+;; at 0633f62 (200 assoc and 200 pop on a Vec of 20000, 300 conj, 200 present-key assoc on a Map of 300, every version kept). The levers
+;; that update unique values in place must leave this where it is; the bound is the upper end (a shared update that got dearer fails it),
+;; and the lower end is held by the persistence cases 4000 to 4007: a copy skipped on a shared value changes an answer there.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun big () -> (Vec i64) (vec (range 20000)))
+
+;; 200 assoc, 300 conj and 200 pop with a history, and 200 present-key assoc on a map with a history
+(defun main () -> i64
+  (let ((a (loop ((i 0) (v (big)) (h (vec-empty)))
+             (if (>= i 200) (+ (count h) (nth v 7919)) (recur (+ i 1) (assoc v (rem (* i 7919) 20000) i) (conj h v)))))
+        (b (loop ((i 0) (v (vec-empty)) (h (vec-empty)))
+             (if (>= i 300) (+ (count h) (count v)) (recur (+ i 1) (conj v i) (conj h v)))))
+        (p (loop ((i 0) (v (big)) (h (vec-empty)))
+             (if (>= i 200) (+ (count h) (count v)) (recur (+ i 1) (pop v) (conj h v)))))
+        (m (loop ((i 0) (m (loop ((k 0) (m (map-empty))) (if (< k 300) (recur (+ k 1) (assoc m k 0)) m))) (h (vec-empty)))
+             (if (>= i 200) (+ (count h) (count m)) (recur (+ i 1) (assoc m (rem (* i 7919) 300) i) (conj h m))))))
+    ;; 201 + 600 + 20000 + 500
+    (if (= (+ (+ a b) (+ p m)) 21301) 0 1)))

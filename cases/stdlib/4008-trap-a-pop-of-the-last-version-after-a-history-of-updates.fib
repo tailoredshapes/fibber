@@ -1,0 +1,21 @@
+;; spec:   design/in-place-update.md §6 T8 (a trapping update), stdlib §4.4 (row pop: an empty Vec traps `pop: empty`)
+;; expect: trap
+;; trap:   pop: empty
+;; roots:  ../../lib support
+;; covers: pop conj assoc
+;; A history of versions is built (a Vec of 200 elements in a Struct, every version kept in a second Vec), updated by
+;; conj, assoc and pop, and then popped one time too many: the trap happens inside the update, with the old versions and
+;; the shell of the struct alive. The two tools must agree on the trap and on the free trace up to it (method rule 6),
+;; which is what shows that a trap in the middle of an update frees nothing twice: the stealing lever leaves a null slot in a
+;; shell and the unwinding of a trap must not release it. The message is the library's; an in-place pop that trapped late, after
+;; it had taken the slot, would give another trace.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defstruct Chunk (n: i64 data: (Vec i64)))
+
+(defun main () -> i64
+  (let ((c (Chunk 3 (loop ((i 0) (v (vec-empty))) (if (< i 200) (recur (+ i 1) (conj v i)) v)))))
+    (let ((hist (loop ((i 0) (v (. c data)) (h (vec-empty)))
+                  (if (< i 200) (recur (+ i 1) (pop (assoc (conj v i) 0 i)) (conj h v)) h))))
+      (loop ((i 0) (v (. c data)))
+        (if (< i 201) (recur (+ i 1) (pop v)) (+ (count v) (count hist)))))))

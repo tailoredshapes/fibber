@@ -1,0 +1,103 @@
+;; spec:   design/in-place-update.md §6 T4 (captures and structures), §4 (weak, immortal), stdlib §2.5
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc conj pop nth count deref
+;; A Vec that something else holds is updated, and the other holder is read afterwards. The holders: a heap closure
+;; that captured the Vec (it is called after the update), a struct field, an element of another Vec, a value of a Map,
+;; a weak reference (the object has been weakly pointed to, so `fib.unique?` refuses it however its count stands), a
+;; literal in the body (IMMORTAL), a `def` constant (IMMORTAL, shared by every call), and a `loop` variable whose
+;; previous value is kept by a closure made in the iteration. The update is `assoc` in one case, `conj` and `pop` in
+;; the others, on 40-element vectors (a tail alone) and 1100 (a trie).
+;; MUTANT: scripts/mutant-unique.sh; each holder shows the write through its own read.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defstruct Holder (v: (Vec i64) tag: i64))
+
+(def K: (Vec i64) [1 2 3])
+
+(defun build (n: i64) -> (Vec i64)
+  (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (+ i 100))) v)))
+
+(defun whole-ok (v: (Vec i64) n: i64) -> bool
+  (and (= (count v) n)
+       (loop ((i 0) (ok true)) (if (and ok (< i n)) (recur (+ i 1) (= (nth v i) (+ i 100))) ok))))
+
+;; a heap closure captured v; it is called after v was updated three ways
+(defun closure-ok (n: i64) -> bool
+  (let ((v (build n)))
+    (let ((f (fn () (nth v 0)))
+          (g (fn () (count v))))
+      (let ((a (assoc v 0 -1))
+            (b (conj v -2))
+            (c (pop v)))
+        (and (= (f) 100) (= (g) n) (= (nth a 0) -1) (= (count b) (+ n 1)) (= (count c) (- n 1)))))))
+
+(defun struct-ok (n: i64) -> bool
+  (let ((h (Holder (build n) 7)))
+    (let ((a (assoc (. h v) 0 -1))
+          (b (conj (. h v) -2))
+          (c (pop (. h v))))
+      (and (whole-ok (. h v) n) (= (nth a 0) -1) (= (nth b n) -2) (= (count c) (- n 1))))))
+
+(defun vec-of-vecs-ok (n: i64) -> bool
+  (let ((outer [(build n) (build n)]))
+    (let ((a (assoc (nth outer 0) 0 -1))
+          (b (conj (nth outer 1) -2))
+          (o2 (assoc outer 0 a)))
+      (and (whole-ok (nth outer 0) n) (whole-ok (nth outer 1) n)
+           (= (nth (nth o2 0) 0) -1) (whole-ok (nth o2 1) n) (= (count b) (+ n 1))))))
+
+(defun map-value-ok (n: i64) -> bool
+  (let ((m (assoc (map-empty) 1 (build n))))
+    (let ((a (assoc (get-or m 1 (vec-empty)) 0 -1))
+          (b (conj (get-or m 1 (vec-empty)) -2)))
+      (and (whole-ok (get-or m 1 (vec-empty)) n) (= (nth a 0) -1) (= (count b) (+ n 1))))))
+
+(defun get-or (m: (Map i64 (Vec i64)) k: i64 d: (Vec i64)) -> (Vec i64)
+  (match (get m k) ((some x) x) (nil d)))
+
+(defun weak-ok (n: i64) -> bool
+  (let ((v (build n)))
+    (let ((w (weak v)))
+      (let ((a (assoc v 0 -1))
+            (b (conj v -2)))
+        (and (whole-ok v n)
+             (= (nth a 0) -1) (= (count b) (+ n 1))
+             (match @w ((some x) (whole-ok x n)) (nil false)))))))
+
+(defun literal-ok () -> bool
+  (let ((lit [1 2 3]))
+    (let ((a (assoc lit 0 9))
+          (b (conj lit 4))
+          (c (pop lit))
+          (d (assoc K 1 8))
+          (e (conj K 5)))
+      (and (= lit [1 2 3]) (= K [1 2 3]) (= a [9 2 3]) (= b [1 2 3 4]) (= c [1 2])
+           (= d [1 8 3]) (= e [1 2 3 5])))))
+
+;; the value of a loop variable kept by a closure from each iteration, then every closure is called
+(defun loop-closures-ok () -> bool
+  (let ((fs (loop ((i 0) (v (build 40)) (fs (vec-empty)))
+              (if (< i 20)
+                  (recur (+ i 1) (assoc v 0 (- 0 i)) (conj fs (fn () (nth v 0))))
+                  fs))))
+    (loop ((i 0) (ok true))
+      (if (and ok (< i 20)) (recur (+ i 1) (= ((nth fs i) ) (if (= i 0) 100 (- 1 i)))) ok))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (closure-ok 40))
+        (check c (closure-ok 1100))
+        (check c (struct-ok 40))
+        (check c (struct-ok 1100))
+        (check c (vec-of-vecs-ok 40))
+        (check c (vec-of-vecs-ok 1100))
+        (check c (map-value-ok 40))
+        (check c (map-value-ok 1100))
+        (check c (weak-ok 40))
+        (check c (weak-ok 1100))
+        (check c (literal-ok))
+        (check c (loop-closures-ok))
+        (checks-result c))))

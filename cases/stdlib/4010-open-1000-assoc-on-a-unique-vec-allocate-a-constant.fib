@@ -1,0 +1,22 @@
+;; spec:   design/in-place-update.md §6 T9 (counts), §5 L3, stdlib §2.5, §8.1 item 5 (count cases)
+;; expect: accept
+;; result: 100001
+;; audit:  clean
+;; allocs: <= 6526
+;; roots:  ../../lib support
+;; open:   L3
+;; covers: assoc
+;; `(vec (range 100000))` builds a Vec nobody else holds (6476 objects, counted with `fibc run --trace`: the A lines; the build alone
+;; is that, with no assoc at all), and 1000 `assoc` then update it in a loop, each variable held by exactly one name. The persistent
+;; library copies the path of every update, 9 objects each (15476 in all, measured at 0633f62 with the stage 2 of this tree). Updated in
+;; place when the vector is unique (L3, over the primitives `array-take!` and `array-push!`) an assoc allocates nothing: the bound is the build
+;; plus 50. It fails today and is OPEN for L3; the day it passes the harness fails the run, and the commit that lands L3 removes `open`
+;; and replaces 6526 by the count it measures. The shared case (one version kept in a history) must NOT get cheaper or dearer: case 4016.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun big () -> (Vec i64) (vec (range 100000)))
+
+;; 1000 assoc on a vector that nobody else holds
+(defun main () -> i64
+  (let ((v (loop ((i 0) (v (big))) (if (>= i 1000) v (recur (+ i 1) (assoc v (rem (* i 7919) 100000) i))))))
+    (+ (count v) (nth v 7919))))

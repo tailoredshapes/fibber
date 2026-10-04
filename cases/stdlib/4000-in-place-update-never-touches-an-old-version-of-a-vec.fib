@@ -1,0 +1,81 @@
+;; spec:   design/in-place-update.md §6 T1 (history kept), stdlib §2.5 (persistent in the API, in place when unique)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; roots:  ../../lib support
+;; covers: assoc conj pop nth count
+;; Every version of a Vec that a loop makes is kept in a second Vec, and after the loop every kept version is read in
+;; full: version j must be exactly what the j-th step made. Each kept version is held by `hist` when the next update
+;; runs, so the update has to copy; a library that wrote in place whenever it could (and not only when the count is 1)
+;; would change the old versions and the reads would show it. Three loops: `assoc` of one slot (at 1100 elements, so
+;; the trie has a level below the tail, and at 7, a tail alone), `conj` from empty past the 32, 1024 and 1056 edges, and
+;; `pop` from 1100 down to 0. The version at step j is also checked by a model that is rebuilt from nothing: the value
+;; of slot k in version j is known by arithmetic.
+;; MUTANT: scripts/mutant-unique.sh forces `fib.unique?` true; this case then fails on the first check of the first
+;; loop (the check bit 0), because the history holds one object under 1100 names.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun base (n: i64) -> (Vec i64)
+  (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (* i 10))) v)))
+
+;; version j (0 is the base) of slot (rem (* j 7) n) holds 1000000 + j; slot k of version j is the last write to k
+;; at a step <= j, or the base value
+(defun assoc-ok (n: i64 steps: i64) -> bool
+  (let ((hist (loop ((j 0) (v (base n)) (h (vec-empty)))
+                (if (< j steps)
+                    (recur (+ j 1) (assoc v (rem (* (+ j 1) 7) n) (+ 1000000 (+ j 1))) (conj h v))
+                    (conj h v)))))
+    (loop ((j 0) (ok true))
+      (if (and ok (<= j steps))
+          (recur (+ j 1)
+                 (let ((v (nth hist j)))
+                   (and (= (count v) n)
+                        (loop ((k 0) (good true))
+                          (if (and good (< k n))
+                              (recur (+ k 1) (= (nth v k) (last-write k j n)))
+                              good)))))
+          ok))))
+
+;; the value slot k holds after j steps: the newest step s <= j with (rem (* s 7) n) = k, else the base value
+(defun last-write (k: i64 j: i64 n: i64) -> i64
+  (loop ((s j))
+    (if (< s 1) (* k 10)
+        (if (= (rem (* s 7) n) k) (+ 1000000 s) (recur (- s 1))))))
+
+;; versions of a Vec grown by conj: version j has j elements, element i is i * 3
+(defun conj-ok (steps: i64) -> bool
+  (let ((hist (loop ((j 0) (v (vec-empty)) (h (vec-empty)))
+                (if (< j steps) (recur (+ j 1) (conj v (* j 3)) (conj h v)) (conj h v)))))
+    (loop ((j 0) (ok true))
+      (if (and ok (<= j steps))
+          (recur (+ j 1)
+                 (let ((v (nth hist j)))
+                   (and (= (count v) j)
+                        (loop ((i 0) (good true))
+                          (if (and good (< i j)) (recur (+ i 1) (= (nth v i) (* i 3))) good)))))
+          ok))))
+
+;; versions of a Vec shrunk by pop: version j has n - j elements, element i is i + 5
+(defun pop-ok (n: i64) -> bool
+  (let ((start (loop ((i 0) (v (vec-empty))) (if (< i n) (recur (+ i 1) (conj v (+ i 5))) v))))
+    (let ((hist (loop ((j 0) (v start) (h (vec-empty)))
+                  (if (< j n) (recur (+ j 1) (pop v) (conj h v)) (conj h v)))))
+      (loop ((j 0) (ok true))
+        (if (and ok (<= j n))
+            (recur (+ j 1)
+                   (let ((v (nth hist j)))
+                     (and (= (count v) (- n j))
+                          (loop ((i 0) (good true))
+                            (if (and good (< i (- n j))) (recur (+ i 1) (= (nth v i) (+ i 5))) good)))))
+            ok)))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (assoc-ok 1100 300))
+        (check c (assoc-ok 7 20))
+        (check c (assoc-ok 33 70))
+        (check c (conj-ok 1100))
+        (check c (conj-ok 40))
+        (check c (pop-ok 1100))
+        (check c (pop-ok 33))
+        (checks-result c))))
