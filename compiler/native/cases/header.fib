@@ -1,6 +1,10 @@
-;; compiler/native/cases/header.fib: case headers (spec/lir.md section 13; crates/lair/src/cases/header.rs). OWNER: package H. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/cases/header.fib: case headers (spec/lir.md section 13; crates/lair/src/cases/header.rs). OWNER: package H.
+;; Divergences from the Rust, none observable on the corpus: the `exit` value is read by `parse-i32` (the Rust's `i32::from_str`: an optional
+;; sign, decimal digits, the i32 range), `trim` is the library's (Java whitespace) where Rust's is Unicode White_Space.
 
-(ns native.cases.header)
+(ns native.cases.header
+  (:require [fib.string :as s])
+  (:use native.cases.text))
 
 
 ;; Which paths a case runs on (header.rs `Paths`).
@@ -16,10 +20,111 @@
 
 (defstruct CaseHeader (expect: CaseExpect ir: (Vec str) ir-not: (Vec str) paths: CasePaths))
 
-;; (header.rs `parse`)
-(defun parse-header (src: str) -> (Result CaseHeader str)
-  (trap "todo: native.cases.header parse-header"))
+(def signal-names: (Vec str) ["SIGILL" "SIGTRAP" "SIGABRT" "SIGFPE" "SIGSEGV" "SIGTERM"])
+(def signal-numbers: (Vec i64) [4 5 6 8 11 15])
+
+(defun index-in :private (xs: (Vec str) x: str) -> (Option i64)
+  (loop ((i 0))
+    (cond (>= i (count xs)) nil
+          (= (nth xs i) x) (some i)
+          :else (recur (+ i 1)))))
 
 ;; `SIGILL (4)` for a known signal, `signal 42` otherwise. (header.rs `signal_name`)
 (defun signal-name (sig: i64) -> str
-  (trap "todo: native.cases.header signal-name"))
+  (match (index-in (mapv show signal-numbers) (show sig))
+    ((some i) (str-join [(nth signal-names i) " (" (show sig) ")"]))
+    (nil (str-concat "signal " (show sig)))))
+
+;; The words of `text` between commas and spaces, empty words dropped.
+(defun signal-words :private (text: str) -> (Vec str)
+  (let ((n (str-len text)))
+    (loop ((i 0) (from 0) (acc []))
+      (let ((sep (and (< i n) (let ((c (str-byte-at text i))) (or (= c 44i8) (= c 32i8))))))
+        (cond (>= i n) (if (> i from) (conj acc (str-slice text from i)) acc)
+              sep (recur (+ i 1) (+ i 1) (if (> i from) (conj acc (str-slice text from i)) acc))
+              :else (recur (+ i 1) from acc))))))
+
+;; (header.rs `Signal::parse_list`)
+(defun parse-signals :private (text: str) -> (Result (Vec CaseSignal) str)
+  (loop ((ws (signal-words text)) (acc []))
+    (if (empty? ws)
+        (Ok acc)
+        (match (index-in signal-names (nth ws 0))
+          (nil (Err (str-concat "unknown signal: " (nth ws 0))))
+          ((some i) (recur (vec (drop 1 ws)) (conj acc (CaseSignal (nth signal-numbers i)))))))))
+
+;; Rust's `i32::from_str` on the trimmed value: nil when it is not a number or does not fit.
+(defun parse-i32 (t: str) -> (Option i64)
+  (let ((n (str-len t))
+        (neg (and (> n 0) (= (str-byte-at t 0) 45i8)))
+        (from (if (and (> n 0) (or (= (str-byte-at t 0) 45i8) (= (str-byte-at t 0) 43i8))) 1 0)))
+    (if (>= from n)
+        nil
+        (loop ((i from) (v 0))
+          (if (>= i n)
+              (let ((r (if neg (- 0 v) v))) (if (and (>= r -2147483648) (<= r 2147483647)) (some r) nil))
+              (let ((d (- (sext i64 (str-byte-at t i)) 48)))
+                (if (and (>= d 0) (<= d 9) (< v 100000000000))
+                    (recur (+ i 1) (+ (* v 10) d))
+                    nil)))))))
+
+;; The keys and values of a header so far (header.rs `parse`'s locals).
+(defstruct HAcc (expect: (Option str) exit: i64 out: (Vec str) error: (Option str) signals: (Vec CaseSignal)
+                 ir: (Vec str) ir-not: (Vec str) paths: CasePaths))
+
+(def h-empty: HAcc (HAcc nil 0 [] nil [] [] [] PathsBoth))
+
+;; One header line: the key, and the value with one leading space taken off.
+(defun apply-line :private (a: HAcc key: str value: str) -> (Result HAcc str)
+  (cond (= key "expect") (Ok (with a (expect (some (s/trim value)))))
+        (= key "exit") (match (parse-i32 (s/trim value))
+                         (nil (Err (str-concat "bad exit: " value)))
+                         ((some n) (Ok (with a (exit n)))))
+        (= key "signal") (try-let [ss (parse-signals value)] (Ok (with a (signals (into (. a signals) ss)))))
+        (= key "out") (Ok (with a (out (conj (. a out) value))))
+        (= key "error") (Ok (with a (error (some value))))
+        (= key "ir") (Ok (with a (ir (conj (. a ir) value))))
+        (= key "ir-not") (Ok (with a (ir-not (conj (. a ir-not) value))))
+        (= key "paths") (let ((v (s/trim value)))
+                          (cond (= v "jit") (Ok (with a (paths PathsJit)))
+                                (= v "aot") (Ok (with a (paths PathsAot)))
+                                :else (Err (str-concat "bad paths: " v))))
+        :else (Ok a)))
+
+;; `trim_start_matches(";;")` then `trim_start`.
+(defun line-body :private (line: str) -> str
+  (loop ((i 0))
+    (if (and (<= (+ i 2) (str-len line)) (= (str-slice line i (+ i 2)) ";;"))
+        (recur (+ i 2))
+        (s/triml (str-slice line i (str-len line))))))
+
+(defun read-lines :private (lines: (Vec str)) -> (Result HAcc str)
+  (loop ((i 0) (a h-empty))
+    (if (or (>= i (count lines)) (not (starts-with? (nth lines i) ";;")))
+        (Ok a)
+        (let ((body (line-body (nth lines i))))
+          (match (str-find body ":" 0)
+            (nil (recur (+ i 1) a))
+            ((some c) (let ((v (str-slice body (+ c 1) (str-len body))))
+                        (try-let [a2 (apply-line a (str-slice body 0 c) (if (starts-with? v " ") (str-slice v 1 (str-len v)) v))]
+                          (recur (+ i 1) a2)))))))))
+
+(defun finish :private (a: HAcc) -> (Result CaseHeader str)
+  (let ((ex (. a expect))
+        (acc? (= ex (some "accept")))
+        (rej? (= ex (some "reject"))))
+    (cond (and acc? (nil? (. a error)) (not (empty? (. a signals))) (not (= (. a exit) 0)))
+            (Err "accept case with both exit and signal")
+          (and acc? (nil? (. a error)))
+            (Ok (CaseHeader (ExpAccept (. a exit) (. a signals) (. a out)) (. a ir) (. a ir-not) (. a paths)))
+          (and rej? (some? (. a error)) (not (s/blank? (unwrap-or (. a error) ""))))
+            (Ok (CaseHeader (ExpReject (unwrap-or (. a error) "")) (. a ir) (. a ir-not) (. a paths)))
+          rej? (Err "reject case without an error text")
+          (and acc? (some? (. a error))) (Err "accept case with an error text")
+          :else (Err (str-concat "bad or missing expect: "
+                                 (match ex (nil "None") ((some e) (str-join ["Some(" (debug-str e) ")"]))))))))
+
+;; (header.rs `parse`)
+(defun parse-header (src: str) -> (Result CaseHeader str)
+  (try-let [a (read-lines (rust-lines src))]
+    (finish a)))

@@ -1,0 +1,73 @@
+;; compiler/tests/native/h-header.fib: package H's unit tests of native.cases.header and native.cases.text against the texts and rules of
+;; crates/lair/src/cases/header.rs (its `reads_headers` test and every error text). Prints `ok NAME` / `FAIL NAME` per check; exit 0 when all pass.
+(ns main (:use native.cases.header native.cases.text))
+
+(defun hdr (src: str) -> (Result CaseHeader str) (parse-header src))
+
+(defun err-of (src: str) -> str
+  (match (hdr src) ((Err e) e) ((Ok _) "<accepted>")))
+
+(defun acc-of (src: str) -> (Option CaseExpect)
+  (match (hdr src) ((Err _) nil) ((Ok h) (some (. h expect)))))
+
+(defun sig-nums (ss: (Vec CaseSignal)) -> (Vec i64) (mapv (fn (s: CaseSignal) (. s number)) ss))
+
+(defun report (name: str ok: bool) -> i64
+  (if ok (do (println (str "ok " name)) 0) (do (println (str "FAIL " name)) 1)))
+
+(defun exit-of (src: str) -> i64
+  (match (hdr src) ((Ok h) (match (. h expect) ((ExpAccept e _ _) e) ((ExpReject _) -999))) ((Err _) -1000)))
+
+(defun out-of (src: str) -> (Vec str)
+  (match (hdr src) ((Ok h) (match (. h expect) ((ExpAccept _ _ o) o) ((ExpReject _) [])) ) ((Err _) ["<err>"])))
+
+(defun sigs-of (src: str) -> (Vec i64)
+  (match (hdr src) ((Ok h) (match (. h expect) ((ExpAccept _ s _) (sig-nums s)) ((ExpReject _) [])) ) ((Err _) [-1])))
+
+(defun paths-of (src: str) -> i64
+  (match (hdr src) ((Ok h) (match (. h paths) ((PathsBoth) 0) ((PathsJit) 1) ((PathsAot) 2))) ((Err _) -1)))
+
+(defun reject-text (src: str) -> str
+  (match (hdr src) ((Ok h) (match (. h expect) ((ExpReject t) t) ((ExpAccept _ _ _) "<accept>"))) ((Err _) "<err>")))
+
+(defun main () -> i64
+  (let ((full ";; expect: accept\n;; exit: 3\n;; out: a b\n;; out: \n;; ir: fence\n(x)")
+        (n (+ 0 0)))
+    (+ n
+     (report "exit" (= (exit-of full) 3))
+     (report "out keeps text and empty" (= (out-of full) ["a b" ""]))
+     (report "ir" (= (match (hdr full) ((Ok h) (. h ir)) ((Err _) [])) ["fence"]))
+     (report "signals list" (= (sigs-of ";; expect: accept\n;; signal: SIGILL, SIGTRAP\n") [4 5]))
+     (report "signals space sep, two lines" (= (sigs-of ";; expect: accept\n;; signal: SIGFPE SEGV\n") [-1]))
+     (report "signals two lines" (= (sigs-of ";; expect: accept\n;; signal: SIGSEGV\n;; signal: SIGTERM,SIGABRT\n") [11 15 6]))
+     (report "unknown signal" (= (err-of ";; expect: accept\n;; signal: SIGFOO\n") "unknown signal: SIGFOO"))
+     (report "exit and signal" (= (err-of ";; expect: accept\n;; exit: 1\n;; signal: SIGILL\n") "accept case with both exit and signal"))
+     (report "exit zero and signal ok" (= (sigs-of ";; expect: accept\n;; exit: 0\n;; signal: SIGILL\n") [4]))
+     (report "signal-name known" (= (signal-name 4) "SIGILL (4)"))
+     (report "signal-name 11" (= (signal-name 11) "SIGSEGV (11)"))
+     (report "signal-name unknown" (= (signal-name 42) "signal 42"))
+     (report "reject" (= (reject-text ";; expect: reject\n;; error: add: operand 2\n") "add: operand 2"))
+     (report "reject without error" (= (err-of ";; expect: reject\n") "reject case without an error text"))
+     (report "reject blank error" (= (err-of ";; expect: reject\n;; error:   \n") "reject case without an error text"))
+     (report "accept with error" (= (err-of ";; expect: accept\n;; error: x\n") "accept case with an error text"))
+     (report "bad expect" (= (err-of ";; expect: maybe\n") "bad or missing expect: Some(\"maybe\")"))
+     (report "missing expect" (= (err-of "(define)") "bad or missing expect: None"))
+     (report "bad exit" (= (err-of ";; expect: accept\n;; exit: x\n") "bad exit: x"))
+     (report "bad exit keeps raw value" (= (err-of ";; expect: accept\n;; exit: 1 2\n") "bad exit: 1 2"))
+     (report "exit plus sign" (= (exit-of ";; expect: accept\n;; exit: +7\n") 7))
+     (report "exit negative" (= (exit-of ";; expect: accept\n;; exit: -2\n") -2))
+     (report "exit out of i32" (= (err-of ";; expect: accept\n;; exit: 2147483648\n") "bad exit: 2147483648"))
+     (report "paths jit" (= (paths-of ";; expect: accept\n;; paths: jit\n") 1))
+     (report "paths aot" (= (paths-of ";; expect: accept\n;; paths: aot\n") 2))
+     (report "paths default" (= (paths-of ";; expect: accept\n") 0))
+     (report "bad paths" (= (err-of ";; expect: accept\n;; paths: both\n") "bad paths: both"))
+     (report "unknown key ignored" (= (exit-of ";; expect: accept\n;; spec: x\n;; foo\n;; exit: 2\n") 2))
+     (report "key not trimmed" (= (err-of ";; expect : accept\n") "bad or missing expect: None"))
+     (report "header ends at first non-;; line" (= (err-of ";; expect: accept\n(x)\n;; error: no\n") "<accepted>"))
+     (report "many semicolons" (= (exit-of ";; expect: accept\n;;;;exit: 4\n") 4))
+     (report "odd semicolons" (= (err-of ";;; expect: accept\n") "bad or missing expect: None"))
+     (report "crlf" (= (out-of ";; expect: accept\r\n;; out: a\r\n") ["a"]))
+     (report "debug-str" (= (debug-str "a\"b\\\n") "\"a\\\"b\\\\\\n\""))
+     (report "debug-strs" (= (debug-strs ["a" "b"]) "[\"a\", \"b\"]"))
+     (report "rust-lines" (= (rust-lines "a\n\nb\r\nc\n") ["a" "" "b" "c"]))
+     (report "rust-lines no final newline" (= (rust-lines "a\nb") ["a" "b"])))))
