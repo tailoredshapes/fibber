@@ -58,7 +58,8 @@ spec, an `&x` that is the only mention shares without acquiring) or a library `B
 
 Same loop, 1.25 million updates of pseudo-random keys in a `Map i64 i64`: 1480 ms for the nested form, 440 ms when
 `(let [c (get m k 0)] (assoc m k (+ c 1)))`. `m` is not unique while the `get` is evaluated inside the argument list, so
-the assoc copies the path. The program uses the second form. Recommendation: compiler (evaluate the arguments of `assoc`
+the assoc copies the path. Clojure's own idiom `(update m k (fnil (fn (c) (+ c 1)) 0))` is as slow as the nested form (1512 ms in the same
+loop). The program uses the second form. Recommendation: compiler (evaluate the arguments of `assoc`
 that do not mention the result before taking the collection), and a library `(update m k f)` / `(inc-in m k)` whose in-place
 case is the one the program wants.
 
