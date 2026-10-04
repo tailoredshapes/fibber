@@ -1,0 +1,52 @@
+;; spec:   syntax §1.1 (the vector literal `<<..>>`), docs/design/simd-and-tensors.md 2.3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; covers: <<..>>
+;; The vector literal reads as `(simd e ..)`: elements of one literal type, the width of each literal kept, an element that is a
+;; variable or a call left alone, the closer `>>` ending a token only directly inside the literal.
+(ns main (:use fib.core tl.check))
+
+;; `shape` shows how the reader read its argument: the head and the elements of a list form, each as the text of its kind and, for a
+;; number, its width. The typing of `(simd ..)` is not under test (the macro's argument is a form, never typed), only the reader.
+(defmacro shape (f)
+  (match f
+    ((List items)
+     (Str (loop ((i 0) (acc ""))
+            (if (< i (vec-count items))
+                (recur (+ i 1)
+                       (str-join [acc " "
+                                  (match (vec-nth items i)
+                                    ((Sym s) s)
+                                    ((Int v w) (str-join [(show v) (cond (= w :i8) "i8" (= w :i16) "i16" (= w :i32) "i32" :else "i64")]))
+                                    ((Flt v w) (str-join [(show v) (if (= w :f32) "f32" "f64")]))
+                                    ((Bool b) (if b "true" "false"))
+                                    ((List xs) (str-join ["(" (show (vec-count xs)) ")"]))
+                                    (_ "?"))]))
+                acc))))
+    (_ (Str "not a list"))))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do
+      (check c (= (shape <<1 2 3 4>>) " simd 1i64 2i64 3i64 4i64"))
+      (check c (= (shape <<1.0 2.5>>) " simd 1.0f64 2.5f64"))
+      (check c (= (shape <<-1 -2>>) " simd -1i64 -2i64"))
+      (check c (= (shape <<7>>) " simd 7i64"))
+      (check c (= (shape <<1i8 2i8>>) " simd 1i8 2i8"))
+      (check c (= (shape <<1.5f32 2.5f32>>) " simd 1.5f32 2.5f32"))
+      (check c (= (shape <<true false true>>) " simd true false true"))
+      (check c (= (shape <<x y z>>) " simd x y z"))
+      (check c (= (shape <<x 1 (f y)>>) " simd x 1i64 (2)"))
+      (check c (= (shape <<(f a>>)>>) " simd (2)"))
+      (check c (= (shape <<#_ 9 1 2>>) " simd 1i64 2i64"))
+      (check c (= (shape <<1,2,3>>) " simd 1i64 2i64 3i64"))
+      (check c (= (shape (<<1 2>> <<3>>)) " (3) (2)"))
+      (check c (= (shape [<<1 2>>]) "not a list"))
+      (check c (= (shape (<<
+                         1 2 >>)) " << 1i64 2i64 >>"))
+      (check c (= (shape (<<1
+                          2>>)) " (3)")))
+    (checks-result c)))

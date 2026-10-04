@@ -1,0 +1,134 @@
+;; compiler/syntax/simd.fib: the vector literal `<<e1 .. en>>` and `<<e1 .. en>>T` as the form `(simd e1' .. en')`
+;; (docs/design/simd-and-tensors.md 2.3; owner decision 1 of wave 2). The lexer (syntax.lexer) delimits the literal and the
+;; reader (syntax.reader) collects its elements; this module judges them, where the reader can: from 1 to 64 elements, the
+;; elements that are literals agree in type (numbers of one width, or booleans, for a mask), and a suffix after `>>` fixes the
+;; element type of a literal made of number literals. Everything the reader cannot know (the type of a symbol or of a call)
+;; is left to the checker, which sees the `(simd ..)` form.
+;;
+;; With a suffix, each number literal is read at that width, as if it had been written with the suffix: an integer literal for an
+;; integer width must fit (`<<300>>i8` is IntegerOutOfRange), a float literal for f32 is rounded to the f32 nearest (read from its
+;; text, as `0.1f32` is), an integer literal for a float width must be exact, a float literal for an integer width is an error,
+;; and a literal that carries its own suffix must carry the same one. A suffix needs number literals only: the element of a
+;; call or a variable has no width the reader could give it.
+(ns syntax.simd
+  (:require [syntax.number :as number])
+  (:use syntax.pos syntax.form syntax.error syntax.cursor))
+
+(def max-lanes: i64 64)
+
+(defun bad-element :private (cur: Cursor e: Stx reason: str) -> ReadError
+  (ReadError (BadSimdElement (cursor-slice cur (. (. e pos) start) (. (. e pos) end)) reason) (. e pos)))
+
+;; The text of a literal element.
+(defun text-of :private (cur: Cursor e: Stx) -> str
+  (cursor-slice cur (. (. e pos) start) (. (. e pos) end)))
+
+;; The type of a literal element as the reader knows it: i8 .. i64, f32, f64, bool; "" for an expression (a symbol, a list);
+;; "!" for an atom that is no element at all.
+(defun class-of :private (e: Stx) -> str
+  (match (. e kind)
+    ((SInt _ w) (int-width-suffix w))
+    ((SFlt _ w) (flt-width-suffix w))
+    ((SBool _) "bool")
+    ((SSym _) "")
+    ((SList _) "")
+    (_ "!")))
+
+;; The first literal element's class, "" when there is none.
+(defun first-class :private (items: (Vec Stx)) -> str
+  (loop ((i 0))
+    (cond (>= i (count items)) ""
+          (not (= (class-of (nth items i)) "")) (class-of (nth items i))
+          :else (recur (+ i 1)))))
+
+;; The first element that is not an element at all, or whose class differs from want ("" for no want).
+(defun check-plain :private (cur: Cursor items: (Vec Stx) want: str) -> (Option ReadError)
+  (loop ((i 0))
+    (if (>= i (count items))
+        nil
+        (let ((e (nth items i))
+              (c (class-of e)))
+          (cond (= c "!") (some (bad-element cur e "an element is a number, a boolean, or an expression such as a variable or a call"))
+                (and (not (= c "")) (not (= c want)))
+                  (some (bad-element cur e (str-join ["it is " c ", but the first literal in the vector is " want
+                                                      "; the elements of a vector have one type (write 2.0 for a float, or put i8 .. f64 after the >>)"])))
+                :else (recur (+ i 1)))))))
+
+;; ---- with a suffix ----
+
+;; Whether the three-character text t ends with suffix.
+(defun ends-with3? :private (t: str suffix: str) -> bool
+  (and (>= (str-len t) 3) (= (str-slice t (- (str-len t) 3) (str-len t)) suffix)))
+
+(defun own-suffix? :private (cur: Cursor e: Stx) -> bool
+  (let ((t (text-of cur e)))
+    (match (. e kind)
+      ((SInt _ w) (or (not (= (int-width-suffix w) "i64")) (ends-with3? t "i64")))
+      ((SFlt _ w) (or (= (flt-width-suffix w) "f32") (ends-with3? t "f64")))
+      (_ false))))
+
+(defun disagrees :private (cur: Cursor e: Stx sfx: str) -> ReadError
+  (bad-element cur e (str-join ["its own suffix is not the vector's suffix " sfx])))
+
+(defun at-pos :private (e: Stx r: (Result StxKind ErrKind)) -> (Result Stx ReadError)
+  (match r
+    ((Ok k) (Ok (Stx k (. e pos))))
+    ((Err kind) (Err (ReadError kind (. e pos))))))
+
+;; The largest integer that a float width holds exactly, together with all below it.
+(defun exact-limit :private (sfx: str) -> i64
+  (if (= sfx "f32") 16777216 9007199254740992))
+
+;; An integer literal at the suffix's width.
+(defun int-element :private (cur: Cursor e: Stx v: i64 sfx: str) -> (Result Stx ReadError)
+  (cond (own-suffix? cur e)
+          (if (= (class-of e) sfx) (Ok e) (Err (disagrees cur e sfx)))
+        (or (= sfx "f32") (= sfx "f64"))
+          (if (and (>= v (- 0 (exact-limit sfx))) (<= v (exact-limit sfx)))
+              (Ok (Stx (SFlt (sitofp f64 v) (if (= sfx "f32") F32 F64)) (. e pos)))
+              (Err (bad-element cur e (str-join ["the integer is not exact in " sfx " (it is beyond " (show (exact-limit sfx)) ")"]))))
+        :else
+          (at-pos e (number/check-literal (SInt v (int-width-named sfx))))))
+
+;; A float literal at the suffix's width.
+;; The IntWidth named by an integer suffix.
+(defun int-width-named :private (sfx: str) -> IntWidth
+  (cond (= sfx "i8") I8
+        (= sfx "i16") I16
+        (= sfx "i32") I32
+        :else I64))
+
+(defun float-element :private (cur: Cursor e: Stx sfx: str) -> (Result Stx ReadError)
+  (cond (own-suffix? cur e)
+          (if (= (class-of e) sfx) (Ok e) (Err (disagrees cur e sfx)))
+        (= sfx "f32") (at-pos e (number/parse-number (str-concat (text-of cur e) "f32")))
+        (= sfx "f64") (Ok e)
+        :else (Err (bad-element cur e (str-join ["a float cannot be an element of an " sfx " vector"])))))
+
+(defun suffixed :private (cur: Cursor e: Stx sfx: str) -> (Result Stx ReadError)
+  (match (. e kind)
+    ((SInt v _) (int-element cur e v sfx))
+    ((SFlt _ _) (float-element cur e sfx))
+    (_ (Err (bad-element cur e (str-join ["a vector literal with the suffix " sfx " takes number literals only"]))))))
+
+(defun all-suffixed :private (cur: Cursor items: (Vec Stx) sfx: str) -> (Result (Vec Stx) ReadError)
+  (loop ((i 0) (out (vec-empty)))
+    (if (>= i (count items))
+        (Ok out)
+        (match (suffixed cur (nth items i) sfx)
+          ((Err e) (Err e))
+          ((Ok e) (recur (+ i 1) (conj out e)))))))
+
+;; ---- the form ----
+
+;; `(simd e ..)` from the elements read between `<<` and `>>`, the suffix (if any) and the whole span; open is the `<<`.
+(defun build-simd (cur: Cursor items: (Vec Stx) suffix: (Option str) whole: Pos open: Pos) -> (Result Stx ReadError)
+  (cond (= (count items) 0) (Err (ReadError EmptySimd whole))
+        (> (count items) max-lanes) (Err (ReadError (TooManySimdLanes (count items)) whole))
+        :else
+          (try-let ((es (match suffix
+                          (nil (match (check-plain cur items (first-class items))
+                                 ((some e) (Err e))
+                                 (nil (Ok items))))
+                          ((some sfx) (all-suffixed cur items sfx)))))
+            (Ok (Stx (SList (vec (concat [(Stx (SSym "simd") open)] es))) whole)))))

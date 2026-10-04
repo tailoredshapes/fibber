@@ -25,7 +25,7 @@
 ;; The end of the input is the token `TEof` here where Rust has `None`;
 ;; that is the only difference of shape. Where the Rust is silent, this
 ;; port decides nothing of its own.
-(ns syntax.reader (:use syntax.pos syntax.form syntax.error syntax.lexer))
+(ns syntax.reader (:require [syntax.simd :as simd]) (:use syntax.pos syntax.form syntax.error syntax.lexer syntax.cursor))
 
 ;; The deepest nesting the reader accepts.
 (def max-depth: i64 1000)
@@ -35,6 +35,7 @@
   (IForm s: Stx)
   (IDiscarded)
   (IClose found: Delim pos: Pos)
+  (ISimdClose suffix: (Option str) pos: Pos)
   (IEnd))
 
 ;; What a sequence frame becomes when it closes.
@@ -53,35 +54,38 @@
 (defun read-all (source: str file: str) -> (Result (Vec Stx) ReadError)
   (let ((rd (Rd (lexer-new source file) (cell false) (cell (map-empty)) (cell 0))))
     (loop ((out (vec-empty)))
-      (match (read-item rd 0)
+      (match (read-item rd 0 false)
         ((Err e) (Err e))
         ((Ok (IForm s)) (recur (conj out s)))
         ((Ok (IDiscarded)) (recur out))
         ((Ok (IEnd)) (Ok out))
+        ((Ok (ISimdClose _ pos)) (Err (ReadError (UnexpectedClose \>) pos)))
         ((Ok (IClose found pos)) (Err (ReadError (UnexpectedClose (delim-close found)) pos)))))))
 
 ;; Reads from the next token: a finished form, a discarded one, a closing
 ;; delimiter (left to the frame that owns it) or the end. depth is the
-;; number of frames open around the token.
-(defun read-item :private (rd: Rd depth: i64) -> (Result Item ReadError)
-  (match (next-token (. rd lx))
+;; number of frames open around the token; simd is true when the token is
+;; an element of a vector literal `<<..>>` (where `>>` closes it).
+(defun read-item :private (rd: Rd depth: i64 simd: bool) -> (Result Item ReadError)
+  (match (next-token (. rd lx) simd)
     ((Err e) (Err e))
     ((Ok tok)
      (let ((pos (. tok pos)))
        (match (. tok kind)
          ((TEof) (Ok IEnd))
          ((TClose d) (Ok (IClose d pos)))
+         ((TCloseSimd sfx) (Ok (ISimdClose sfx pos)))
          ((TAtom k) (read-atom rd k pos))
          ((TOpenFn)
           (if @(. rd in-fn)
               (Err (ReadError NestedFn pos))
-              (read-checked rd depth TOpenFn pos)))
-         (opener (read-checked rd depth opener pos)))))))
+              (read-checked rd depth simd TOpenFn pos)))
+         (opener (read-checked rd depth simd opener pos)))))))
 
-(defun read-checked :private (rd: Rd depth: i64 opener: TokenKind pos: Pos) -> (Result Item ReadError)
+(defun read-checked :private (rd: Rd depth: i64 simd: bool opener: TokenKind pos: Pos) -> (Result Item ReadError)
   (if (>= depth max-depth)
       (Err (too-deep pos))
-      (read-opened rd (+ depth 1) opener pos)))
+      (read-opened rd (+ depth 1) simd opener pos)))
 
 ;; An atom; inside `#(` a symbol may be a parameter.
 (defun read-atom :private (rd: Rd k: StxKind pos: Pos) -> (Result Item ReadError)
@@ -132,21 +136,22 @@
       (str-join ["%" (show n)])))
 
 ;; The form or discard an opening token starts; depth counts its frame.
-(defun read-opened :private (rd: Rd depth: i64 tok: TokenKind pos: Pos) -> (Result Item ReadError)
+(defun read-opened :private (rd: Rd depth: i64 simd: bool tok: TokenKind pos: Pos) -> (Result Item ReadError)
   (match tok
     ((TOpen d) (item-of (read-seq rd depth d SPlain pos)))
     ((TOpenSet) (item-of (read-seq rd depth DBrace SSet pos)))
+    ((TOpenSimd) (item-of (read-simd rd depth pos)))
     ((TOpenFn)
      (do (set! (. rd in-fn) true)
          (set! (. rd uses) (map-empty))
          (set! (. rd top) 0)
          (item-of (read-seq rd depth DParen SFn pos))))
     ((TPrefix p)
-     (match (read-operand rd depth (ReadError (PrefixWithoutForm (prefix-text p)) pos))
+     (match (read-operand rd depth simd (ReadError (PrefixWithoutForm (prefix-text p)) pos))
        ((Err e) (Err e))
        ((Ok form) (item-of (apply-prefix p pos form)))))
     (_
-     (match (read-operand rd depth (ReadError DiscardWithoutForm pos))
+     (match (read-operand rd depth simd (ReadError DiscardWithoutForm pos))
        ((Err e) (Err e))
        ((Ok _) (Ok IDiscarded))))))
 
@@ -157,11 +162,11 @@
 
 ;; The one form a prefix or `#_` is waiting for, skipping discarded forms;
 ;; a closing delimiter or the end there is unfinished, the frame's error.
-(defun read-operand :private (rd: Rd depth: i64 unfinished: ReadError) -> (Result Stx ReadError)
-  (match (read-item rd depth)
+(defun read-operand :private (rd: Rd depth: i64 simd: bool unfinished: ReadError) -> (Result Stx ReadError)
+  (match (read-item rd depth simd)
     ((Err e) (Err e))
     ((Ok (IForm s)) (Ok s))
-    ((Ok (IDiscarded)) (read-operand rd depth unfinished))
+    ((Ok (IDiscarded)) (read-operand rd depth simd unfinished))
     ((Ok _) (Err unfinished))))
 
 ;; The forms of a list, vector, map, `#{` or `#(` up to its closing
@@ -169,16 +174,31 @@
 ;; delimiter.
 (defun read-seq :private (rd: Rd depth: i64 d: Delim kind: SeqKind open: Pos) -> (Result Stx ReadError)
   (loop ((items (vec-empty)))
-    (match (read-item rd depth)
+    (match (read-item rd depth false)
       ((Err e) (Err e))
       ((Ok (IForm s)) (recur (conj items s)))
       ((Ok (IDiscarded)) (recur items))
       ((Ok (IEnd)) (Err (ReadError (Unclosed (delim-open d)) open)))
+      ((Ok (ISimdClose _ close)) (Err (ReadError (UnexpectedClose \>) close)))
       ((Ok (IClose found close))
        (if (same-delim found d)
            (build-seq rd d kind (pos-through open close) items)
            (Err (ReadError (MismatchedClose (delim-open d) (. open line) (. open col) (delim-close found))
                            close)))))))
+
+;; The elements of a vector literal up to its `>>`, as the form `(simd ..)` (syntax.simd). open is the position of the `<<`, whose
+;; two characters are the head's. Its elements are read with `>>` as a closer; inside a list or vector among them it is a symbol.
+(defun read-simd :private (rd: Rd depth: i64 open: Pos) -> (Result Stx ReadError)
+  (loop ((items (vec-empty)))
+    (match (read-item rd depth true)
+      ((Err e) (Err e))
+      ((Ok (IForm s)) (recur (conj items s)))
+      ((Ok (IDiscarded)) (recur items))
+      ((Ok (IEnd)) (Err (ReadError UnclosedSimd open)))
+      ((Ok (IClose found close))
+       (Err (ReadError (MismatchedCloseSimd (. open line) (. open col) (delim-close found)) close)))
+      ((Ok (ISimdClose sfx close))
+       (simd/build-simd (. (. rd lx) cur) items sfx (pos-through open close) (open-token open))))))
 
 (defun build-seq :private (rd: Rd d: Delim kind: SeqKind pos: Pos items: (Vec Stx)) -> (Result Stx ReadError)
   (match kind

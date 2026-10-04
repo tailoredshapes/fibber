@@ -70,6 +70,8 @@
   (TDiscard)
   (TOpenFn)
   (TOpenSet)
+  (TOpenSimd)
+  (TCloseSimd suffix: (Option str))
   (TAtom k: StxKind)
   (TEof))
 
@@ -83,15 +85,16 @@
 (defun lexer-new (src: str file: str) -> Lexer
   (Lexer (cursor-new src file)))
 
-;; The next token; TEof at the end of the input.
-(defun next-token (lx: Lexer) -> (Result Token ReadError)
+;; The next token; TEof at the end of the input. simd is true when the token is read directly inside a vector literal
+;; `<<..>>` (not inside a list nested in it): there a `>>` ends a number, symbol or keyword and is itself the closing token.
+(defun next-token (lx: Lexer simd: bool) -> (Result Token ReadError)
   (do (skip-trivia lx)
       (let ((cur (. lx cur))
             (mark (cursor-mark cur)))
         (match (cursor-peek cur)
           (nil (Ok (Token TEof (cursor-pos-from cur mark))))
           ((some c)
-           (match (lex-token lx c mark)
+           (match (lex-token lx c mark simd)
              ((Err e) (Err e))
              ((Ok kind) (Ok (Token kind (cursor-pos-from cur mark))))))))))
 
@@ -125,7 +128,7 @@
     ((Err e) (Err e))
     ((Ok k) (Ok (TAtom k)))))
 
-(defun lex-token :private (lx: Lexer c: char mark: Mark) -> (Result TokenKind ReadError)
+(defun lex-token :private (lx: Lexer c: char mark: Mark simd: bool) -> (Result TokenKind ReadError)
   (let ((cur (. lx cur)))
     (match c
       (\( (single cur (TOpen DParen)))
@@ -142,8 +145,10 @@
       (\@ (lex-tight-prefix lx c mark))
       (\& (lex-tight-prefix lx c mark))
       (\# (lex-dispatch cur mark))
-      (\: (lex-keyword cur mark))
-      (_ (lex-word cur c mark)))))
+      (\: (lex-keyword cur mark simd))
+      (\< (if (opens-simd? cur) (do (cursor-bump cur) (cursor-bump cur) (Ok TOpenSimd)) (lex-word cur c mark simd)))
+      (\> (if (and simd (= (cursor-peek-nth cur 1) (some \>))) (lex-simd-close cur mark) (lex-word cur c mark simd)))
+      (_ (lex-word cur c mark simd)))))
 
 ;; `~` `~@` `@` `&`: each must be followed immediately by a form. A `&`
 ;; that is not is the reserved symbol `&` itself (§1.1), which is what
@@ -175,9 +180,9 @@
         ((some \") (atom-kind (literal/lex-regex cur mark)))
         (other (do (cursor-bump cur) (Err (err-at cur mark (UnknownDispatch other))))))))
 
-(defun lex-keyword :private (cur: Cursor mark: Mark) -> (Result TokenKind ReadError)
+(defun lex-keyword :private (cur: Cursor mark: Mark simd: bool) -> (Result TokenKind ReadError)
   (do (cursor-bump cur)
-      (cursor-bump-while cur is-constituent)
+      (bump-token cur simd)
       (let ((text (cursor-text-from cur mark))
             (name (str-slice text 1 (str-len text))))
         (if (or (= (str-len name) 0) (starts-with? name ":") (not (valid-slashes name)))
@@ -198,10 +203,10 @@
 
 ;; A number, a forbidden character or a symbol: what is left when c starts
 ;; no delimiter, prefix, string, character, dispatch or keyword.
-(defun lex-word :private (cur: Cursor c: char mark: Mark) -> (Result TokenKind ReadError)
-  (cond (starts-number c (cursor-peek-nth cur 1)) (lex-number cur mark)
+(defun lex-word :private (cur: Cursor c: char mark: Mark simd: bool) -> (Result TokenKind ReadError)
+  (cond (starts-number c (cursor-peek-nth cur 1)) (lex-number cur mark simd)
         (is-forbidden c) (do (cursor-bump cur) (Err (err-at cur mark (InvalidCharacter c))))
-        :else (lex-symbol cur mark)))
+        :else (lex-symbol cur mark simd)))
 
 ;; The byte offset of the `/` of text when it is `-?D/D` with D a
 ;; non-empty run of decimal digits (a ratio, §1.1), else -1.
@@ -246,8 +251,8 @@
          ((Ok den)
           (Ok (TAtom (SList [(Stx (SSym "/") (part-pos pos slash (+ slash 1))) num den])))))))))
 
-(defun lex-number :private (cur: Cursor mark: Mark) -> (Result TokenKind ReadError)
-  (do (cursor-bump-while cur is-constituent)
+(defun lex-number :private (cur: Cursor mark: Mark simd: bool) -> (Result TokenKind ReadError)
+  (do (bump-token cur simd)
       (let ((text (cursor-text-from cur mark))
             (slash (ratio-slash text)))
         (if (>= slash 0)
@@ -256,11 +261,59 @@
               ((Ok k) (Ok (TAtom k)))
               ((Err kind) (Err (err-at cur mark kind))))))))
 
-(defun lex-symbol :private (cur: Cursor mark: Mark) -> (Result TokenKind ReadError)
-  (do (cursor-bump-while cur is-constituent)
+(defun lex-symbol :private (cur: Cursor mark: Mark simd: bool) -> (Result TokenKind ReadError)
+  (do (bump-token cur simd)
       (let ((text (cursor-text-from cur mark)))
         (cond (= text "true") (Ok (TAtom (SBool true)))
               (= text "false") (Ok (TAtom (SBool false)))
               (= text "nil") (Ok (TAtom SNil))
               (valid-slashes text) (Ok (TAtom (SSym text)))
               :else (Err (err-at cur mark (InvalidSymbol text)))))))
+
+;; ---- vector literals `<<..>>` (docs/design/simd-and-tensors.md 2.3) ----
+
+;; Consumes the constituents of a number, symbol or keyword; directly inside a vector literal (simd) it stops before a `>>`.
+(defun bump-token :private (cur: Cursor simd: bool) -> unit
+  (loop ()
+    (match (cursor-peek cur)
+      (nil ())
+      ((some ch)
+       (if (and (is-constituent ch) (not (and simd (at-simd-close? cur))))
+           (do (cursor-bump cur) (recur))
+           ())))))
+
+;; Whether the cursor is on `>>`.
+(defun at-simd-close? :private (cur: Cursor) -> bool
+  (and (= (cursor-peek cur) (some \>)) (= (cursor-peek-nth cur 1) (some \>))))
+
+;; Whether the cursor, on `<`, starts a vector literal: `<<` and then a character that starts a form (so a bare `<<`, `<<` before a
+;; space or a closing delimiter, stays a symbol) other than `<` or `=` (so `<<<` and `<<=` stay symbols), and other than a single `>`
+;; (`<<>` stays a symbol; `<<>>` is the empty literal, an error).
+(defun opens-simd? :private (cur: Cursor) -> bool
+  (and (= (cursor-peek-nth cur 1) (some \<))
+       (starts-form-char (cursor-peek-nth cur 2))
+       (not (= (cursor-peek-nth cur 2) (some \<)))
+       (not (= (cursor-peek-nth cur 2) (some \=)))
+       (or (not (= (cursor-peek-nth cur 2) (some \>))) (= (cursor-peek-nth cur 3) (some \>)))))
+
+(defun simd-suffix? :private (s: str) -> bool
+  (or (= s "i8") (= s "i16") (= s "i32") (= s "i64") (= s "f32") (= s "f64")))
+
+;; Whether c is a lower-case ASCII letter.
+(defun lower-letter? :private (c: char) -> bool
+  (let ((n (char->i32 c)))
+    (and (>= n 97i32) (<= n 122i32))))
+
+;; The closing `>>` of a vector literal, and the element type suffix that touches it (a run of constituents that starts with a
+;; letter, up to the next `>>`): i8 i16 i32 i64 f32 f64, else BadSimdSuffix at the suffix.
+(defun lex-simd-close :private (cur: Cursor mark: Mark) -> (Result TokenKind ReadError)
+  (do (cursor-bump cur)
+      (cursor-bump cur)
+      (let ((at (cursor-mark cur)))
+        (if (match (cursor-peek cur) (nil false) ((some ch) (lower-letter? ch)))
+            (do (bump-token cur true)
+                (let ((text (cursor-text-from cur at)))
+                  (if (simd-suffix? text)
+                      (Ok (TCloseSimd (some text)))
+                      (Err (err-at cur at (BadSimdSuffix text))))))
+            (Ok (TCloseSimd nil))))))
