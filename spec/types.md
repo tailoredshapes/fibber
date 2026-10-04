@@ -805,7 +805,7 @@ and counted (**Decided**):
 array      : ∀a. (fn :send (i64 a) (Array a))                     ; n copies of init (each stored: E2)
 array-len  : ∀a. (fn :send ((Array a)) i64)
 array-get  : ∀a. (fn :send ((Array a) i64) a)                      ; traps out of range; the element, a part of the array (§6.2, §6.3 "Element reads")
-array-with : ∀a. (fn :send ((Array a) i64 a) (Array a))            ; a new array with one slot changed (E2 for the element)
+array-with : ∀a. (fn :send ((Array a) i64 a) (Array a))            ; an array with one slot changed: the result is a value, observably new; the operand is consumed (§2.13.2); E2 for the element
 array-copy : ∀a. (fn :send ((Array a) i64 i64) (Array a))          ; slice [i, j)
 array-set! : ∀a. (fn ((& (Array a)) i64 a) unit)                   ; a signature (§1.4); in place iff unique, else copy (§6.6)
 array-take!: ∀a. (fn ((& (Array a)) i64) a)                        ; a signature; the element moved out (§2.13.1)
@@ -843,6 +843,29 @@ a call is `function with & parameters is not a value` (§2.1). `array-set!` and
 §2.13.1 adds the four that test uniqueness as they move a value out of a
 place or grow an array; everything else that updates in place is library code
 over these.
+
+#### 2.13.2 `array-with` consumes its array operand
+
+(Batch 6, lever P7b; before it the operand was borrowed and every call copied.) `(array-with a i x)` answers an array equal to
+`a` but for slot `i`, and what it does with the *operand* is now the unique-write protocol of §6.6 applied to a value rather
+than a cell: the operand is handed over (a consume position of the kind E2: moved from an owned temporary or at the last use of
+a binding, retained otherwise, §6.3), and the call tests `fib.unique?` on it. Unique (count one, none of `SHARED`, `IMMORTAL`,
+`STACK`, `HAS-WEAK`): the slot is written in place and the operand itself is the result, its one count travelling to the
+caller as the result's. Not unique: a copy with the change is the result and the count that the call was handed is released.
+Source: `compiler/emit/lower/builtins.fib` (`array-with`), the position is `EscStore` in `compiler/types/builtins.fib`.
+
+*Why it is sound.* The result is the same array as the operand only when the operand's single count was the call's own:
+no other binding, field, cell, task or atom holds it, so no read of it can occur after the call, and no borrow of it
+can be live. A derived borrow of an element, the one way to hold a part of the array without a count, is a read of
+the array for the purpose of last use (§6.3 "Element reads"; case 276), so while one is live the operand is not at its
+last use and is retained, the count is two, and the call copies; a sibling operand that reads the array does the same
+(case 271's rule). The flags give the cases a count cannot see: a stack array, an immortal one, one that ever had a weak
+reference (§6.6, case 89) and one shared with another thread are copied. The replaced element is released after the new one
+is stored, exactly as before (the array held it; the call's result no longer does). What changes is cost only: a
+call whose operand is not at its last use now retains and releases it once more than it did, and then copies as before;
+a call at the last use of a unique array allocates nothing. A parameter that is the operand becomes **owned** by rule 1
+of §6.4 (an `E2` use of a borrowed parameter), which is how a library function taking an array and returning it updated
+passes its argument on without a copy; callers that read their array afterwards pay one retain. Cases 312 to 318, mutants `inplace`, `leak` and `lastuse` of `scripts/mutant-amp-param.sh`.
 
 #### 2.13.1 The in-place primitives: take, push, pop, update
 

@@ -1,0 +1,15 @@
+;; spec:   types §6.4 (Declared owned), §2.13.2 (array-with consumes its operand)
+;; expect: accept
+;; result: 380
+;; audit:  clean
+;; allocs: <= 1
+;; `put` takes an array it owns (`:owned`) and answers it with one slot changed. The loop hands the array over at its last use each
+;; round (the loop variable is replaced by the result), so the callee's count is one, `array-with` finds the array unique and writes
+;; in place: the array literal is the one heap object for twenty updates. Borrowed (before batch 6), each call copies it: twenty-one.
+(defun put (a: (Array i64) :owned i: i64) -> (Array i64)
+  (array-with a i (* 2 i)))
+
+(defun main () -> i64
+  (let ((r (loop [i 0 a (array 20 0)]
+             (if (< i 20) (recur (+ i 1) (put a i)) a))))
+    (loop [i 0 s 0] (if (< i 20) (recur (+ i 1) (+ s (array-get r i))) s))))
