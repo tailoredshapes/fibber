@@ -1,0 +1,94 @@
+;; fasta, the Computer Language Benchmarks Game: the repeated ALU sequence, then two random sequences drawn from weighted
+;; tables with the game's linear congruential generator; 60 columns per line. Output is built in a 64 KB byte buffer
+;; (an (Array i8) written in place through a cell) and written with fib.unix fd-write-range.
+(ns main (:use fib.unix))
+
+(def IM: i64 139968)
+(def IA: i64 3877)
+(def IC: i64 29573)
+(def CAP: i64 65536)
+
+(def ALU: str (str "GGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGG"
+                   "GAGGCCGAGGCGGGCGGATCACCTGAGGTCAGGAGTTCGAGA"
+                   "CCAGCCTGGCCAACATGGTGAAACCCCGTCTCTACTAAAAAT"
+                   "ACAAAAATTAGCCGGGCGTGGTGGCGCGCGCCTGTAATCCCA"
+                   "GCTACTCGGGAGGCTGAGGCAGGAGAATCGCTTGAACCCGGG"
+                   "AGGCGGAGGTTGCAGTGAGCCGAGATCGCGCCACTGCACTCC"
+                   "AGCCTGGGCGACAGAGCGAGACTCCGTCTCAAAAA"))
+
+(defun write-all (bytes: (Array i8) n: i64) -> unit
+  (loop [off 0]
+    (if (< off n)
+        (match (fd-write-range stdout bytes off (- n off))
+          ((Ok w) (recur (+ off w)))
+          ((Err e) (trap "fasta: write failed")))
+        ())))
+
+(defun flush (&buf: (Array i8) &pos: i64) -> unit
+  (do (write-all @buf @pos) (set! pos 0)))
+
+(defun put-str (s: str &buf: (Array i8) &pos: i64) -> unit
+  (do (dotimes (i (str-len s)) (array-set! &buf (+ @pos i) (str-byte-at s i)))
+      (set! pos (+ @pos (str-len s)))))
+
+(defun repeat-fasta (alu: (Array i8) n: i64 &buf: (Array i8) &pos: i64) -> unit
+  (let [m (array-len alu)]
+    (loop [left n k 0]
+      (if (> left 0)
+          (let [w (if (< left 60) left 60)
+                p @pos]
+            (do (dotimes (j w) (array-set! &buf (+ p j) (array-get alu (rem (+ k j) m))))
+                (array-set! &buf (+ p w) 10i8)
+                (set! pos (+ p (+ w 1)))
+                (if (> @pos (- CAP 61)) (flush &buf &pos) ())
+                (recur (- left w) (rem (+ k w) m))))
+          ()))))
+
+(defun pick (cum: (Array f64) r: f64) -> i64
+  (let [m (- (array-len cum) 1)]
+    (loop [i 0] (if (and (< i m) (>= r (array-get cum i))) (recur (+ i 1)) i))))
+
+(defun random-fasta (cum: (Array f64) syms: (Array i8) n: i64 seed: i64 &buf: (Array i8) &pos: i64) -> i64
+  (loop [left n last seed]
+    (if (> left 0)
+        (let [w (if (< left 60) left 60)
+              p @pos]
+          (let [last2 (loop [j 0 l last]
+                        (if (< j w)
+                            (let [l2 (rem (+ (* l IA) IC) IM)
+                                  r (/ (sitofp f64 l2) 139968.0)]
+                              (do (array-set! &buf (+ p j) (array-get syms (pick cum r)))
+                                  (recur (+ j 1) l2)))
+                            l))]
+            (do (array-set! &buf (+ p w) 10i8)
+                (set! pos (+ p (+ w 1)))
+                (if (> @pos (- CAP 61)) (flush &buf &pos) ())
+                (recur (- left w) last2))))
+        last)))
+
+;; running sums of the probabilities, in f64
+(defun cumulative (probs: (Vec f64)) -> (Array f64)
+  (let [c (cell (array (count probs) 0.0))]
+    (do (loop [i 0 acc 0.0]
+          (if (< i (count probs))
+              (let [a (+ acc (nth probs i))]
+                (do (array-set! &c i a) (recur (+ i 1) a)))
+              ()))
+        @c)))
+
+(defun main () -> i64
+  (let [n (unwrap-or (parse-long (nth (args) 0)) 1000)
+        buf (cell (array CAP 0i8))
+        pos (cell 0)
+        iub-s (str-bytes "acgtBDHKMNRSVWY")
+        iub-c (cumulative [0.27 0.12 0.12 0.27 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02 0.02])
+        hs-s (str-bytes "acgt")
+        hs-c (cumulative [0.3029549426680 0.1979883004921 0.1975473066391 0.3015094502008])]
+    (do (put-str ">ONE Homo sapiens alu\n" &buf &pos)
+        (repeat-fasta (str-bytes ALU) (* n 2) &buf &pos)
+        (put-str ">TWO IUB ambiguity codes\n" &buf &pos)
+        (let [s (random-fasta iub-c iub-s (* n 3) 42 &buf &pos)]
+          (do (put-str ">THREE Homo sapiens frequency\n" &buf &pos)
+              (random-fasta hs-c hs-s (* n 5) s &buf &pos)))
+        (flush &buf &pos)
+        0)))
