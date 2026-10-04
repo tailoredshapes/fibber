@@ -176,8 +176,13 @@
                       (if (or (= l LirFloat) (= l LirDouble))
                           (Ok (VVal (str-join ["(" (lir-ty-text l) " " (float-lir-text (sitofp f64 n)) ")"]) l))
                           (Ok (v-int l n))))))
-    ((LitFloat x w) (let ((t (match w ((F32) LirFloat) ((F64) LirDouble))))
-                      (Ok (VVal (str-join ["(" (lir-ty-text t) " " (float-lir-text x) ")"]) t))))
+    ;; A float literal that took the element type of a vector it is an operand of (types 1.9) has that type, not its own width.
+    ((LitFloat x w) (try-let ((ty (lcx-ty cx e)) (lt (program-lir (. cx p) ty)))
+                      (let ((t (match lt
+                                 ((some (LirFloat)) LirFloat)
+                                 ((some (LirDouble)) LirDouble)
+                                 (_ (match w ((F32) LirFloat) ((F64) LirDouble))))))
+                        (Ok (VVal (str-join ["(" (lir-ty-text t) " " (float-lir-text x) ")"]) t)))))
     ((LitStr s) (Ok (VVal (statics-string (. (. cx p) statics) s 0) LirPtr)))
     ((LitChar c) (Ok (v-int LirI32 (long c))))
     ((LitBool b) (Ok (v-int LirI1 (if b 1 0))))

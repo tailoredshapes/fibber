@@ -1,0 +1,17 @@
+;; fib.simd: the library face of lane vectors (spec/types.md 1.9, docs/design/simd-and-tensors.md 2.1, 2.6). Not an implicit module: a program
+;; that divides vectors, or wants the Clojure-shaped names, writes `(:use fib.simd)`.
+;;
+;; The language itself has the type `(Simd T n)`, the literal `<<..>>`, `splat`, `+ - * neg` and the bit operators, `=`, the comparisons
+;; `simd/lt simd/le simd/gt simd/ge simd/eq simd/ne`, `lane`, `with-lane`, `hsum`, `hmin`, `hmax`. What is here is only what a library can say:
+;;  - `/` on a vector of floats: the `Div` instance. It cannot be in fib.core.num: the Rust tools that read the implicit library do not know the
+;;    type `Simd`, so it lives where only the tools of stage 2 read it. Integer `/` is not provided (no instruction; the scalar rule's two
+;;    traps would cost a branch per lane).
+;;  - `reduce-add`, `reduce-min`, `reduce-max`: the Clojure-shaped names of `hsum`, `hmin`, `hmax`.
+;;  - `lanewise-min`, `lanewise-max` are not here yet (they need the lIR `fmin`/`smin` through a builtin); nor are loads and stores.
+(ns fib.simd (:use fib.core.protocols))
+
+(impl (Div (Simd a n)) (Simd a n) :where ((Float a)) (/ (self y) (fdiv self y)))
+
+(defun reduce-add (v: (Simd t n)) :where ((Num t)) -> t (hsum v))
+(defun reduce-min (v: (Simd t n)) :where ((Num t)) -> t (hmin v))
+(defun reduce-max (v: (Simd t n)) :where ((Num t)) -> t (hmax v))

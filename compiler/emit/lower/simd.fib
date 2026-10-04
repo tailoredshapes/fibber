@@ -52,6 +52,15 @@
     (val cx (str-join ["(shufflevector (insertelement " z " " (v-text x) " (i32 0)) " z " "
                        (mask-text (mapv (fn (i: i64) 0) (range (lanes-of t)))) ")"]) t)))
 
+;; The two operands of a call of the library's `Div` method on vectors (`/` is not a native method): the scalar literal that took the vector's element
+;; type (types 1.9, the broadcast rule) splatted, on either side.
+(defun lcx-splat-pair (cx: LowerCx vals: (Vec V)) -> (Vec V)
+  (if (= (count vals) 2)
+      (match (vec-type (nth vals 0) (some (nth vals 1)))
+        (nil vals)
+        ((some t) [(as-vec cx t (nth vals 0)) (as-vec cx t (nth vals 1))]))
+      vals))
+
 ;; `x` as a vector of type `t`: itself, or the splat of a scalar literal.
 (defun as-vec :private (cx: LowerCx t: LirTy x: V) -> V
   (match (v-ty x)
@@ -199,6 +208,32 @@
     (cond (= name "hsum") (if (float-elem? t) (hsum-tree cx v) (hsum-int cx v))
           (= name "hmin") (val cx (str-join ["(" (if (float-elem? t) "reduce-fmin " "reduce-smin ") (v-text v) ")"]) e)
           :else (val cx (str-join ["(" (if (float-elem? t) "reduce-fmax " "reduce-smax ") (v-text v) ")"]) e))))
+
+;; Mask logic: `simd/and or xor not`, `simd/any` and `simd/all` (the lIR `reduce-or` and `reduce-and` of the `<n x i1>`), and `simd/blend m a b`
+;; (lane k from `a` where the mask is true, else from `b`: the lIR `select` with a vector condition). `x` is the mask, `y` and `z` the others.
+(defun lcx-mask-op (cx: LowerCx name: str x: V y: (Option V) z: (Option V)) -> V
+  (let ((t (unwrap-or (v-ty x) LirI1)) (a (v-text x)))
+    (cond (= name "simd/not") (val cx (str-join ["(xor " a " " (vconst t "1") ")"]) t)
+          (= name "simd/any") (val cx (str-join ["(reduce-or " a ")"]) LirI1)
+          (= name "simd/all") (val cx (str-join ["(reduce-and " a ")"]) LirI1)
+          (= name "simd/blend") (let ((p (unwrap-or y x)) (q (unwrap-or z x)))
+                                  (val cx (str-join ["(select " a " " (v-text p) " " (v-text q) ")"]) (unwrap-or (v-ty p) t)))
+          :else (let ((b (v-text (unwrap-or y x))))
+                  (val cx (str-join ["(" (if (= name "simd/and") "and" (if (= name "simd/or") "or" "xor")) " " a " " b ")"]) t)))))
+
+;; `unchecked-add`, `-subtract`, `-multiply`, `-negate`: the wrapping operations of an integer or an integer vector (spec/stdlib.md 7 L10), the
+;; lIR `add`, `sub`, `mul`, which wrap; the opt-out of the overflow check. (A float has no overflow mode and takes the plain operation.)
+(defun lcx-unchecked (cx: LowerCx name: str x: V y: (Option V)) -> V
+  (let ((t (unwrap-or (v-ty x) LirI64)))
+    (let ((fl (float-elem? t)) (a (v-text x)))
+      (match y
+        (nil (if fl
+                 (val cx (str-join ["(fneg " a ")"]) t)
+                 (val cx (str-join ["(sub " (if (vec? t) (vconst t "0") (str-join ["(" (lir-ty-text t) " 0)"])) " " a ")"]) t)))
+        ((some y2)
+         (let ((op (cond (= name "unchecked-add") (if fl "fadd" "add") (= name "unchecked-subtract") (if fl "fsub" "sub")
+                         :else (if fl "fmul" "mul"))))
+           (val cx (str-join ["(" op " " a " " (v-text y2) ")"]) t)))))))
 
 ;; ---- the literal and splat
 
