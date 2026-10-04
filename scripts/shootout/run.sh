@@ -134,7 +134,7 @@ timed_median() {
     p=""
     if [ "$lang" = clj ]; then
       # in-program time: the last number on the last stderr line that has one (seconds; `ms` after it means ms)
-      p=$(awk '/[0-9]/ { l = $0 } END { if (l == "") exit; if (match(l, /[0-9]+(\.[0-9]+)?([eE]-?[0-9]+)?/)) { v = substr(l, RSTART, RLENGTH) + 0; rest = substr(l, RSTART + RLENGTH); if (rest ~ /^ *ms/) v = v / 1000; printf "%.4f", v } }' "$tmp/stderr")
+      p=$(awk '/in-program|clj-compute/ { l = $0; lab = 1 } !lab && /[0-9]/ { l = $0 } END { if (l == "") exit; if (match(l, /[0-9]+(\.[0-9]+)?([eE]-?[0-9]+)?/)) { v = substr(l, RSTART, RLENGTH) + 0; rest = substr(l, RSTART + RLENGTH); if (rest ~ /^ *ms/) v = v / 1000; printf "%.4f", v } }' "$tmp/stderr")
       if grep -q -i 'reflection warning\|boxed math warning' "$tmp/stderr"; then RES_NOTE="clj warnings on stderr"; fi
     fi
     rows+=("$e $u $m ${p:-_}")
@@ -194,39 +194,65 @@ fasta_input() {
 }
 
 # ---------------------------------------------------------------- one benchmark
+# src DIR NAME EXT: the source file of a benchmark: NAME.EXT, else NAME without hyphens .EXT (n-body -> nbody.java)
+src() {
+  local f=$1/$2.$3 g=$1/${2//-/}.$3
+  if [ -f "$f" ]; then echo "$f"; elif [ -f "$g" ]; then echo "$g"; fi
+}
+
 build_all() {  # NAME: builds the languages in $langs into $scratch; sets HAVE_<lang> flags
-  local name=$1 d=$here/$1
+  local name=$1 d=$here/$1 s; CLJ_NS=; CLJ_MODE=; CLJ_FILE=; JAVA_CLASS=
   HAVE_fib=; HAVE_java=; HAVE_clj=; HAVE_c=; BUILD_NOTE_fib=; BUILD_NOTE_java=; BUILD_NOTE_clj=; BUILD_NOTE_c=
   if want_lang fib; then
-    if [ ! -f "$d/$name.fib" ]; then BUILD_NOTE_fib="no $name.fib"
+    s=$(src "$d" "$name" fib)
+    if [ -z "$s" ]; then BUILD_NOTE_fib="no $name.fib"
     elif [ -z "$fibc" ]; then BUILD_NOTE_fib="no fibc (set FIBC)"
-    elif "$fibc" build "$d/$name.fib" -I "$root/lib" -o "$scratch/bin/$name-fib" > "$tmp/build-fib.log" 2>&1; then HAVE_fib=1
+    elif "$fibc" build "$s" -I "$root/lib" -o "$scratch/bin/$name-fib" > "$tmp/build-fib.log" 2>&1; then HAVE_fib=1
     else BUILD_NOTE_fib="fibc build failed: $(head -c 300 "$tmp/build-fib.log" | tr '\n\t' '  ')"; fi
   fi
   if want_lang java; then
-    if [ ! -f "$d/$name.java" ]; then BUILD_NOTE_java="no $name.java"
+    s=$(src "$d" "$name" java)
+    if [ -z "$s" ]; then BUILD_NOTE_java="no $name.java"
     else
-      mkdir -p "$scratch/java/$name"
-      if [ "$scratch/java/$name/$name.class" -nt "$d/$name.java" ] || javac -d "$scratch/java/$name" "$d/$name.java" > "$tmp/build-java.log" 2>&1; then HAVE_java=1
+      # the class to run: the first top-level `class NAME` of the file (binary-trees.java declares binarytrees)
+      JAVA_CLASS=$(sed -n 's/^\(public \)\{0,1\}\(final \)\{0,1\}\(abstract \)\{0,1\}class[[:space:]]\+\([A-Za-z0-9_$]*\).*/\4/p' "$s" | head -1)
+      [ -z "$JAVA_CLASS" ] && JAVA_CLASS=${name//-/}
+      rm -rf "$scratch/java/$name"; mkdir -p "$scratch/java/$name"
+      if javac -d "$scratch/java/$name" "$s" > "$tmp/build-java.log" 2>&1; then HAVE_java=1
       else BUILD_NOTE_java="javac failed: $(head -c 300 "$tmp/build-java.log" | tr '\n\t' '  ')"; fi
     fi
   fi
   if want_lang clj; then
-    if [ ! -f "$d/$name.clj" ]; then BUILD_NOTE_clj="no $name.clj"
+    s=$(src "$d" "$name" clj)
+    if [ -z "$s" ]; then BUILD_NOTE_clj="no $name.clj"
     elif [ ! -f "$cljdir/clojure-1.12.0.jar" ]; then BUILD_NOTE_clj="no Clojure jars in $cljdir"
     else
-      CLJ_NS=$(sed -n 's/^(ns[[:space:]]\+\([^][[:space:]()]*\).*/\1/p' "$d/$name.clj" | head -1)
-      if [ -z "$CLJ_NS" ]; then BUILD_NOTE_clj="$name.clj has no (ns NAME ..) first form"
+      # a file whose top level calls -main (`(apply -main *command-line-args*)`, `(when .. (-main ..))`) is a script:
+      # `clojure.main FILE N`; otherwise it must declare an ns and is run as `clojure.main -m NS N`
+      CLJ_MODE=ns; CLJ_FILE=$s
+      if grep -q -E '^\((when|if|apply|-main)[^;]*-main|^\(-main' "$s"; then CLJ_MODE=script
       else
-        local rel; rel=$(echo "$CLJ_NS" | tr '-' '_' | tr '.' '/')
-        rm -rf "$scratch/clj/$name"; mkdir -p "$scratch/clj/$name/$(dirname "$rel")"
-        cp "$d/$name.clj" "$scratch/clj/$name/$rel.clj"; HAVE_clj=1
+        CLJ_NS=$(sed -n 's/^(ns[[:space:]]\+\([^][[:space:]()]*\).*/\1/p' "$s" | head -1)
+      fi
+      if [ "$CLJ_MODE" = ns ] && [ -z "$CLJ_NS" ]; then BUILD_NOTE_clj="$s: no top-level -main call and no (ns NAME ..) form"
+      else
+        if [ "$CLJ_MODE" = ns ]; then
+          local rel; rel=$(echo "$CLJ_NS" | tr '-' '_' | tr '.' '/')
+          rm -rf "$scratch/clj/$name"; mkdir -p "$scratch/clj/$name/$(dirname "$rel")"
+          cp "$s" "$scratch/clj/$name/$rel.clj"
+        else mkdir -p "$scratch/clj/$name"; fi
+        HAVE_clj=1
       fi
     fi
   fi
   if want_lang c; then
-    if [ ! -f "$d/$name.c" ]; then BUILD_NOTE_c="no $name.c"
-    elif $cc -O3 -march=native -o "$scratch/bin/$name-c" "$d/$name.c" -lm > "$tmp/build-c.log" 2>&1; then HAVE_c=1
+    s=$(src "$d" "$name" c)
+    # cflags: extra gcc arguments (`-lgmp`), from the file `cflags` of the directory; -ffp-contract=off when the README asks for it
+    local extra=""
+    [ -f "$d/cflags" ] && extra=$(tr '\n' ' ' < "$d/cflags")
+    grep -q -e '-ffp-contract=off' "$d/README.md" 2>/dev/null && case " $extra " in *ffp-contract*) ;; *) extra="-ffp-contract=off $extra" ;; esac
+    if [ -z "$s" ]; then BUILD_NOTE_c="no $name.c"
+    elif $cc -O3 -march=native $extra -o "$scratch/bin/$name-c" "$s" -lm $extra > "$tmp/build-c.log" 2>&1; then HAVE_c=1
     else BUILD_NOTE_c="$cc failed: $(head -c 300 "$tmp/build-c.log" | tr '\n\t' '  ')"; fi
   fi
 }
@@ -257,8 +283,12 @@ run_bench() {  # NAME SIZE
     if [ -z "$have" ]; then row "$name" "$size" "$n" $l "n/a" "" "" "" "" - "$note"; echo "run.sh: $name $l: $note" >&2; continue; fi
     case $l in
       fib) timed_median "$r" "${md:-none}" "$input" fib "$scratch/bin/$name-fib" "$n" ;;
-      java) timed_median "$r" "${md:-none}" "$input" java java $jflags -cp "$scratch/java/$name" "$name" "$n" ;;
-      clj) timed_median "$r" "${md:-none}" "$input" clj java $jflags -cp "$jars:$scratch/clj/$name" clojure.main -m "$CLJ_NS" "$n" ;;
+      java) timed_median "$r" "${md:-none}" "$input" java java $jflags -cp "$scratch/java/$name" "$JAVA_CLASS" "$n" ;;
+      clj) if [ "$CLJ_MODE" = script ]; then
+             timed_median "$r" "${md:-none}" "$input" clj java $jflags -cp "$jars" clojure.main "$CLJ_FILE" "$n"
+           else
+             timed_median "$r" "${md:-none}" "$input" clj java $jflags -cp "$jars:$scratch/clj/$name" clojure.main -m "$CLJ_NS" "$n"
+           fi ;;
       c) timed_median "$r" "${md:-none}" "$input" c "$scratch/bin/$name-c" "$n" ;;
     esac
     [ "$RES_STATUS" = FAIL ] && fail_any=1
