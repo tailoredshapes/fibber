@@ -4,8 +4,10 @@
 ;; at a character boundary, as `str-find` reports them. The match found is Java's: the leftmost, and
 ;; among the matches that start there the one a backtracking matcher would find first (greedy and lazy
 ;; quantifiers, the first alternative that works). Decided here, where the page is silent:
-;;  - a `Regex` holds the caches of its DFAs, so it is thread-confined (not `Send`), as a `Matcher`
-;;    is (stdlib §2.10); build one per task.
+;;  - a `Regex` is immutable: the programs, and for a pattern small enough the whole DFA as a table (`Tab`), so it is
+;;    `Send`, shared by tasks, and a `#"..."` literal is made by the compiler as static data (expand.regex). The lazy
+;;    DFA of a pattern too big for a table is the state of a `Matcher`, made for one search (or one `re-seq`, `re-count`,
+;;    `replace-all`, `replace-first` call) and dropped with it; `matcher-of` says `nil` when the `Regex` needs none.
 ;;  - `Match` has `start` and `end` (byte offsets of the whole match), `whole`, `groups` (group 1 on, `nil`
 ;;    for a group that took no part) and `spans` (the offsets of every group, 2g and 2g+1, -1 for none).
 ;;  - `re-seq` is eager: a `(Vec Match)`. After an empty match the search goes on one character later,
@@ -20,7 +22,10 @@
         fib.regex.ast fib.regex.parse fib.regex.prog fib.regex.pike fib.regex.dfa))
 
 (defstruct Regex
-  (pattern: str groups: i64 fwd: Prog rev: Prog fdfa: Dfa rdfa: Dfa use-dfa: bool fixed: i64))
+  (pattern: str groups: i64 fwd: Prog rev: Prog ftab: Tab rtab: Tab use-dfa: bool fixed: i64))
+
+;; the mutable state of searches over a `Regex` whose DFA did not fit a table: the lazy DFAs, forward and reverse
+(defstruct Matcher (f: (Option Dfa) r: (Option Dfa)))
 
 (defstruct Match (start: i64 end: i64 whole: str groups: (Vec (Option str)) spans: (Vec i64)))
 
@@ -30,7 +35,9 @@
           r (compile-reverse a)]
       (if (or (. f too-big) (. r too-big))
           (Err "pattern is too large")
-          (Ok (Regex s (. a groups) f r (new-dfa f true false) (new-dfa r false true) (not (. f asserts)) (fixed-len (. a node))))))))
+          (let [dfa? (not (. f asserts))]
+            (Ok (Regex s (. a groups) f r (if dfa? (freeze-dfa f true false) (no-tab)) (if dfa? (freeze-dfa r false true) (no-tab))
+                       dfa? (fixed-len (. a node)))))))))
 
 (defun re-pattern (s: str) -> Regex
   (match (try-re-pattern s)
@@ -39,10 +46,44 @@
 
 (defun pattern-of (rx: Regex) -> str (. rx pattern))
 
-;; how many states the lazy DFA of the forward search holds now, and the most it will hold; a search that needs more
-;; is done by the Pike VM (the same answer, slower)
-(defun dfa-cache-states (rx: Regex) -> i64 @(. (. rx fdfa) count))
-(defun dfa-cache-cap (rx: Regex) -> i64 (. (. rx fdfa) cap))
+;; whether the DFAs of rx are tables (searches need no state); the most states the lazy DFA of the forward search will hold, and
+;; how many it holds after a search of s with a matcher of its own; a search that needs more is done by the Pike VM (the same
+;; answer, slower)
+(defun frozen? (rx: Regex) -> bool (and (. rx use-dfa) (. (. rx ftab) ok) (. (. rx rtab) ok)))
+(defun dfa-cache-cap (rx: Regex) -> i64 (cap-for (. rx fwd)))
+(defun dfa-cache-states (rx: Regex s: str) -> i64
+  (let [m (matcher-of rx s)]
+    (do (find-packed rx m s 0)
+        (match m
+          ((some mm) (match (. mm f) ((some d) @(. d count)) (nil 0)))
+          (nil 0)))))
+
+;; A lazy DFA starts cold, so for a text shorter than this the Pike VM does the search instead (the same answer): a DFA built
+;; for forty characters costs about 20 microseconds against 0.2 for the Pike VM (measured, docs/shootout/regex-literals.md)
+(def lazy-min: i64 256)
+
+;; the state a search of s over rx needs: nil when its DFAs are tables, when it has none, or when s is too short for a lazy DFA
+(defun matcher-of (rx: Regex s: str) -> (Option Matcher)
+  (if (and (. rx use-dfa) (not (frozen? rx)) (>= (str-len s) lazy-min))
+      (some (Matcher (if (. (. rx ftab) ok) nil (some (new-dfa (. rx fwd) true false)))
+                     (if (. (. rx rtab) ok) nil (some (new-dfa (. rx rev) false true)))))
+      nil))
+
+;; the end of the leftmost match at or after from by the forward DFA (-1 none, -2 it needs the Pike VM); the start of the match that
+;; ends at e, by the reverse one
+;; whether a search with state m uses the DFAs: they are tables, or there is a lazy one
+(defun dfa-on? :private (rx: Regex m: (Option Matcher)) -> bool
+  (and (. rx use-dfa) (or (frozen? rx) (some? m))))
+
+(defun fwd-end :private (rx: Regex m: (Option Matcher) s: str from: i64) -> i64
+  (if (. (. rx ftab) ok)
+      (tab-forward (. rx ftab) (. rx fwd) s from)
+      (dfa-forward (unwrap (. (unwrap m) f)) s from)))
+
+(defun rev-start :private (rx: Regex m: (Option Matcher) s: str e: i64 from: i64) -> i64
+  (if (. (. rx rtab) ok)
+      (tab-backward (. rx rtab) (. rx rev) s e from)
+      (dfa-backward (unwrap (. (unwrap m) r)) s e from)))
 (defun group-count (rx: Regex) -> i64 (. rx groups))
 
 ;; ---- finding ----
@@ -59,23 +100,23 @@
           ())))
 
 ;; the slots of the leftmost match at or after from; empty when none
-(defun find-caps :private (rx: Regex s: str from: i64) -> (Array i64)
-  (if (. rx use-dfa)
-      (let [e (dfa-forward (. rx fdfa) s from)]
+(defun find-caps :private (rx: Regex m: (Option Matcher) s: str from: i64) -> (Array i64)
+  (if (dfa-on? rx m)
+      (let [e (fwd-end rx m s from)]
         (cond (= e -1) (no-caps)
               (< e 0) (pike-run (. rx fwd) s from false false)
-              :else (let [st (dfa-backward (. rx rdfa) s e from)]
+              :else (let [st (rev-start rx m s e from)]
                       (cond (< st 0) (pike-run (. rx fwd) s from false false)
                             (> (. rx groups) 0) (pike-run (. rx fwd) s st true false)
                             :else (let [c (cell (array 2 st))] (do (array-set! &c 1 e) @c))))))
       (pike-run (. rx fwd) s from false false)))
 
 ;; the span of the leftmost match at or after from, packed; -1 when none
-(defun find-packed :private (rx: Regex s: str from: i64) -> i64
-  (if (. rx use-dfa)
-      (let [e (dfa-forward (. rx fdfa) s from)]
+(defun find-packed :private (rx: Regex m: (Option Matcher) s: str from: i64) -> i64
+  (if (dfa-on? rx m)
+      (let [e (fwd-end rx m s from)]
         (cond (= e -1) -1
-              (>= e 0) (let [st (if (>= (. rx fixed) 0) (back-chars s e (. rx fixed)) (dfa-backward (. rx rdfa) s e from))]
+              (>= e 0) (let [st (if (>= (. rx fixed) 0) (back-chars s e (. rx fixed)) (rev-start rx m s e from))]
                          (if (>= st 0) (pack-span st e) (caps-packed (pike-run (. rx fwd) s from false false))))
               :else (caps-packed (pike-run (. rx fwd) s from false false))))
       (caps-packed (pike-run (. rx fwd) s from false false))))
@@ -105,7 +146,7 @@
   (if (= (array-len caps) 0) nil (some (make-match s caps ng))))
 
 (defun re-find-from (rx: Regex s: str from: i64) -> (Option Match)
-  (do (check-from s from) (caps-match s (find-caps rx s from) (. rx groups))))
+  (do (check-from s from) (caps-match s (find-caps rx (matcher-of rx s) s from) (. rx groups))))
 
 (defun re-find (rx: Regex s: str) -> (Option Match) (re-find-from rx s 0))
 
@@ -119,23 +160,23 @@
       (if (< e (str-len s)) (+ e (width-of (byte-at s e))) -1)
       e))
 
-(defun seq-from :private (rx: Regex s: str from: i64 acc: (Vec Match)) -> (Vec Match)
+(defun seq-from :private (rx: Regex m: (Option Matcher) s: str from: i64 acc: (Vec Match)) -> (Vec Match)
   (if (< from 0)
       acc
-      (let [caps (find-caps rx s from)]
+      (let [caps (find-caps rx m s from)]
         (if (= (array-len caps) 0)
             acc
-            (seq-from rx s (next-from s (array-get caps 0) (array-get caps 1)) (conj acc (make-match s caps (. rx groups))))))))
+            (seq-from rx m s (next-from s (array-get caps 0) (array-get caps 1)) (conj acc (make-match s caps (. rx groups))))))))
 
-(defun re-seq (rx: Regex s: str) -> (Vec Match) (seq-from rx s 0 (vec-empty)))
+(defun re-seq (rx: Regex s: str) -> (Vec Match) (seq-from rx (matcher-of rx s) s 0 (vec-empty)))
 
 ;; the number of matches, without making them
 (defun re-count (rx: Regex s: str) -> i64
-  (loop [from 0 n 0]
+  (loop [from 0 n 0 m (matcher-of rx s)]
     (if (< from 0)
         n
-        (let [x (find-packed rx s from)]
-          (if (< x 0) n (recur (next-from s (span-start x) (span-end x)) (+ n 1)))))))
+        (let [x (find-packed rx m s from)]
+          (if (< x 0) n (recur (next-from s (span-start x) (span-end x)) (+ n 1) m))))))
 
 (defun re-groups (m: Match) -> (Vec (Option str))
   (vec (concat [(some (. m whole))] (. m groups))))
@@ -151,7 +192,7 @@
 
 (impl Pattern Regex
   (find-in (self s from)
-    (let [x (find-packed self s from)]
+    (let [x (find-packed self (matcher-of self s) s from)]
       (if (< x 0) nil (some (Pair (span-start x) (span-end x)))))))
 
 ;; ---- replacing ----
@@ -215,19 +256,19 @@
 
 ;; the pieces of s with each of the first `limit` matches (all when limit is -1) replaced; `last` is where the
 ;; text not yet copied starts, `from` where the search goes on (-1: nowhere)
-(defun replace-pieces :private (rx: Regex s: str parts: (Vec TPart) groups?: bool from: i64 last: i64 limit: i64 acc: (Vec str))
+(defun replace-pieces :private (rx: Regex m: (Option Matcher) s: str parts: (Vec TPart) groups?: bool from: i64 last: i64 limit: i64 acc: (Vec str))
   -> (Vec str)
   (if (or (< from 0) (= limit 0))
       (conj acc (str-slice s last (str-len s)))
       (let [caps (if groups?
-                     (find-caps rx s from)
-                     (let [x (find-packed rx s from)]
+                     (find-caps rx m s from)
+                     (let [x (find-packed rx m s from)]
                        (if (< x 0) (no-caps) (let [c (cell (array 2 (span-start x)))] (do (array-set! &c 1 (span-end x)) @c)))))]
         (if (= (array-len caps) 0)
             (conj acc (str-slice s last (str-len s)))
             (let [st (array-get caps 0)
                   e (array-get caps 1)]
-              (replace-pieces rx s parts groups? (next-from s st e) e (- limit 1)
+              (replace-pieces rx m s parts groups? (next-from s st e) e (- limit 1)
                               (expand-parts s caps parts (conj acc (str-slice s last st)))))))))
 
 ;; the pieces joined, built in one pass: the length is summed, one array is filled
@@ -245,13 +286,13 @@
 
 ;; the spans of the first `limit` matches (all when limit is -1) as [start end start end ..]
 (defun collect-spans :private (rx: Regex s: str limit: i64) -> (Vec i64)
-  (loop [from 0 k 0 acc (vec-empty)]
+  (loop [from 0 k 0 acc (vec-empty) m (matcher-of rx s)]
     (if (or (< from 0) (= k limit))
         acc
-        (let [x (find-packed rx s from)]
+        (let [x (find-packed rx m s from)]
           (if (< x 0)
               acc
-              (recur (next-from s (span-start x) (span-end x)) (+ k 1) (conj (conj acc (span-start x)) (span-end x))))))))
+              (recur (next-from s (span-start x) (span-end x)) (+ k 1) (conj (conj acc (span-start x)) (span-end x)) m))))))
 
 (defun copy-range :private (buf: (Cell (Array i8)) pos: i64 src: (Array i8) lo: i64 hi: i64) -> i64
   (do (dotimes (j (- hi lo)) (array-set! &buf (+ pos j) (array-get src (+ lo j))))
@@ -284,7 +325,7 @@
 (defun replace-limit :private (rx: Regex s: str template: str limit: i64) -> str
   (let [parts (parse-template template (. rx groups))]
     (if (needs-groups? parts)
-        (join-pieces (replace-pieces rx s parts true 0 0 limit (vec-empty)))
+        (join-pieces (replace-pieces rx (matcher-of rx s) s parts true 0 0 limit (vec-empty)))
         (replace-literal rx s (literal-of parts) limit))))
 
 ;; every match replaced; the template is Java's (`$1`, `\$`)

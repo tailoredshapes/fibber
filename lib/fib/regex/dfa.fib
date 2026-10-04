@@ -9,6 +9,11 @@
 ;; start of a match that ends there, which is the start of the leftmost match. One table lookup per
 ;; character, whatever the pattern; time linear in the text; memory bounded by `cap` states, after
 ;; which a scan answers -2 and the caller falls back on the Pike VM.
+;; Two forms. The lazy `Dfa` (the cells below) is the mutable matcher state: it is made for one search, or one loop of searches
+;; (fib.regex.api's `Matcher`), starts with room for `init-cap` states and doubles the table up to `cap`; it is never stored in a
+;; `Regex`. For a small pattern `freeze-dfa` explores every state and every class once and keeps the table as an immutable `Tab`
+;; (`ok` true): a search over a `Tab` (`tab-forward`, `tab-backward`) writes nothing, so a `Regex` that holds one is immutable
+;; and `Send`, and costs no state per search. A pattern whose states do not all fit the budget has `ok` false and uses the lazy `Dfa`.
 ;; The DFA does not do zero-width assertions (`^ $ \b`), which depend on the text around a position:
 ;; a program with one is run by the Pike VM only (fib.regex.api).
 (ns fib.regex.dfa (:use fib.core fib.seq fib.coll fib.string.utf8 fib.regex.prog))
@@ -34,15 +39,21 @@
 ;; Max states: the table has cap * ncls entries, at most about two million
 (defun cap-for (p: Prog) -> i64 (min 10000 (max 64 (quot 2000000 (. p ncls)))))
 
-(defun new-dfa (p: Prog unanch: bool longest: bool) -> Dfa
+(defun new-dfa-cap (p: Prog unanch: bool longest: bool cap: i64) -> Dfa
   (Dfa p (cell (vec-empty)) (cell (array 1 0i8)) (cell (array 1 -1)) (cell {}) (cell 0)
-       (cell (array (max 1 (. p n)) 0)) (cell 0) (cell false) (cell -1) (cell 0) (cell 0) (cell 0) unanch longest (cap-for p)))
+       (cell (array (max 1 (. p n)) 0)) (cell 0) (cell false) (cell -1) (cell 0) (cell 0) (cell 0) unanch longest cap))
+
+(defun new-dfa (p: Prog unanch: bool longest: bool) -> Dfa
+  (new-dfa-cap p unanch longest (cap-for p)))
+
+;; the states the table has room for when it is first made; it doubles when a state does not fit, up to `cap`
+(def init-cap: i64 16)
 
 ;; the table is allocated when the first scan needs it, and again when the cache is emptied
 (defun dfa-reset (d: Dfa) -> unit
   (do (set! (. d lists) (vec-empty))
-      (set! (. d flags) (array (. d cap) 0i8))
-      (set! (. d trans) (array (* (. d cap) (. (. d p) ncls)) -1))
+      (set! (. d flags) (array (min (. d cap) init-cap) 0i8))
+      (set! (. d trans) (array (* (min (. d cap) init-cap) (. (. d p) ncls)) -1))
       (set! (. d index) {})
       (set! (. d count) 0)
       (set! (. d start) -1)
@@ -55,6 +66,21 @@
         (if (and (>= (nth lst i) 0) (= (array-get (. p ops) (nth lst i)) op-match)) true (recur (+ i 1)))
         false)))
 
+;; the table and the flags twice as large (not past `cap` states), what they held kept
+(defun dfa-grow (d: Dfa) -> unit
+  (let [old-f @(. d flags)
+        old-t @(. d trans)
+        n (array-len old-f)
+        m (min (. d cap) (* n 2))
+        ncls (. (. d p) ncls)
+        nf (cell (array m 0i8))
+        nt (cell (array (* m ncls) -1))]
+    (do (dotimes (i n) (array-set! &nf i (array-get old-f i)))
+        (dotimes (i (* n ncls)) (array-set! &nt i (array-get old-t i)))
+        (set! (. d flags) @nf)
+        (set! (. d trans) @nt)
+        ())))
+
 ;; the id of the state with this list, made if it is new; -2 when the cache is full
 (defun dfa-intern (d: Dfa lst: (Vec i64)) -> i64
   (match (get @(. d index) lst)
@@ -63,7 +89,8 @@
            (if (>= id (. d cap))
                -2
                (let [fl (. d flags)]
-                 (do (set! (. d lists) (conj @(. d lists) lst))
+                 (do (if (>= id (array-len @fl)) (dfa-grow d) ())
+                     (set! (. d lists) (conj @(. d lists) lst))
                      (set! (. d index) (assoc @(. d index) lst id))
                      (set! (. d count) (+ id 1))
                      (array-set! &fl id (if (has-match? (. d p) lst) 1i8 0i8))
@@ -102,7 +129,7 @@
 
 ;; the entry of the state before any character: the closure of the program's first instruction
 (defun dfa-start (d: Dfa) -> i64
-  (do (if (or (< (array-len @(. d trans)) (* (. d cap) (. (. d p) ncls))) (>= @(. d count) (. d cap))) (dfa-reset d) ())
+  (do (if (or (= @(. d count) 0) (>= @(. d count) (. d cap))) (dfa-reset d) ())
       (if (< @(. d start) 0)
           (set! (. d start) (id-entry d (dfa-intern d (closure d (if (. d unanch) [0 -1] [0])))))
           ())
@@ -211,3 +238,72 @@
                   (cond (< nx 0) nx
                         (= nx 0) l2
                         :else (recur j nx (if (= (bit-and nx 1) 1) j l2))))))))))
+;; ---- the frozen DFA ----
+
+;; An immutable table of every state of a DFA: `trans` has a row of `ncls` entries per state, `start` is the entry of the state
+;; before any character. `ok` is false when the states did not all fit (`trans` is then empty and the lazy `Dfa` is used).
+(defstruct Tab (ok: bool start: i64 trans: (Array i64)))
+
+(defun no-tab () -> Tab (Tab false -1 (array 1 -1)))
+
+;; the budget of a frozen table: states, and entries (states times classes: 8 bytes each)
+(def frozen-states: i64 128)
+(def frozen-entries: i64 16384)
+
+;; the entries of the row of state `id`, made; false when the cache is full
+(defun explore-row (d: Dfa id: i64) -> bool
+  (let [ncls (. (. d p) ncls)]
+    (loop [cls 0]
+      (cond (>= cls ncls) true
+            (!= (array-get @(. d trans) (+ (* id ncls) cls)) -1) (recur (+ cls 1))
+            (< (dfa-next d (entry-of d id) cls) 0) false
+            :else (recur (+ cls 1))))))
+
+;; every state reachable from the start, with all its transitions made; false as soon as one does not fit
+(defun explore-all (d: Dfa) -> bool
+  (loop [id 0]
+    (cond (>= id @(. d count)) true
+          (explore-row d id) (recur (+ id 1))
+          :else false)))
+
+;; the table of the DFA of `p`, or `(no-tab)` when it has more states than the budget (or the program is not for a DFA)
+(defun freeze-dfa (p: Prog unanch: bool longest: bool) -> Tab
+  (let [d (new-dfa-cap p unanch longest (max 2 (min frozen-states (quot frozen-entries (. p ncls)))))
+        e0 (dfa-start d)]
+    (if (and (>= e0 0) (explore-all d))
+        (Tab true e0 (array-copy @(. d trans) 0 (* @(. d count) (. p ncls))))
+        (no-tab))))
+
+;; the end of the match that starts at or after `from` that Perl and Java prefer, -1 when there is none: `dfa-forward` over a table
+;; that holds every state, so there is nothing to make and nothing to write
+(defun tab-forward (t: Tab p: Prog s: str from: i64) -> i64
+  (let [tr (. t trans)
+        asc (. p asc)
+        n (str-len s)
+        e0 (. t start)]
+    (loop [i from e e0 last (if (= (bit-and e0 1) 1) from -1)]
+      (if (>= i n)
+          last
+          (let [a (array-get asc (zext i64 (str-byte-at s i)))
+                c (if (>= a 0) a (cls-of p (cp-at s i)))
+                w (if (>= a 0) 1 (width-of (byte-at s i)))
+                nx (array-get tr (+ (shr e 1) c))]
+            (if (= nx 0)
+                last
+                (recur (+ i w) nx (if (= (bit-and nx 1) 1) (+ i w) last))))))))
+
+;; the smallest start >= from of a match that ends at `end`, -1 when there is none: `dfa-backward` over a table
+(defun tab-backward (t: Tab p: Prog s: str end: i64 from: i64) -> i64
+  (let [tr (. t trans)
+        asc (. p asc)
+        e0 (. t start)]
+    (loop [i end e e0 last (if (= (bit-and e0 1) 1) end -1)]
+      (if (<= i from)
+          last
+          (let [b (zext i64 (str-byte-at s (- i 1)))
+                j (if (< b 128) (- i 1) (start-before s i))
+                c (if (< b 128) (array-get asc b) (cls-of p (cp-at s j)))
+                nx (array-get tr (+ (shr e 1) c))]
+            (if (= nx 0)
+                last
+                (recur j nx (if (= (bit-and nx 1) 1) j last))))))))
