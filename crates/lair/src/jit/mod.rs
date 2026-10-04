@@ -2,6 +2,7 @@
 //! (spec/lir.md §11).
 
 mod names;
+mod prune;
 mod trampoline;
 
 use std::ffi::CStr;
@@ -130,7 +131,9 @@ impl Jit {
     pub fn add_module(&mut self, name: &str, m: &Module) -> Result<()> {
         lir::check(m).map_err(Error::Invalid)?;
         self.names.check(m, in_process)?;
-        let owned = lower(m, name, &self.triple, &self.data_layout)?;
+        // Only what an exported definition reaches is lowered and compiled (see `prune`).
+        let live = prune::dead_internals(m);
+        let owned = lower(&live, name, &self.triple, &self.data_layout)?;
         // SAFETY: the module is verified; ownership of its context and
         // module passes to the JIT through the thread-safe wrappers.
         unsafe {
