@@ -70,30 +70,80 @@
 (define internal (fib.class i8) ((i32 tid))
   (block entry (ret (load i8 (getelementptr i8 @fib.classes (zext i64 tid))))))
 
-;; §8.2: malloc; count 1, tid, flags 0. In trace mode 16 bytes in
+;; The small-object free lists (spec/types.md §8.2, the allocator). An object
+;; of at most 512 bytes is a block of 16 * cls bytes, cls = 1..32, and its
+;; class sits in bits 8.. of its flags word (no flag test reads them: they
+;; test bits 0-3). A dead block of a class goes on that class's list (its
+;; first word is the link) and the next allocation of the class pops it,
+;; with no call to malloc or free. Only while the program has one thread:
+;; `fib.mt` is set before the first thread starts (fib.spawn, fib.pool-start)
+;; and from then on every block comes from malloc and goes back to free, so
+;; the lists need no lock; the blocks still on them stay there. A block is
+;; always a plain malloc block, so it may be freed by free from any thread
+;; or runtime that reads the class. Trace mode keeps malloc and free for
+;; every object (the 16 bytes of ordinal in front), class 0.
+(global internal fib.mt i32 (i32 0))
+(global internal fib.fl [33 x ptr] (zeroinitializer [33 x ptr]))
+
+;; §8.2: count 1, tid, flags 0 (and the class). In trace mode 16 bytes in
 ;; front hold the ordinal (compiler.md §4). A failed malloc is the trap
 ;; \"out of memory\", not a write through a null pointer.
 (define internal (fib.alloc ptr) ((i64 size) (i32 tid))
   (block entry (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain))
   (block plain
-    (let ((p (call @malloc size)))
-      (br (icmp eq p (ptr null)) oom plainok)))
-  (block plainok
-    (call @fib.init-hdr p tid (i32 0))
-    (ret p))
+    (let ((cls (lshr (add size (i64 15)) (i64 4))))
+      (br (icmp ule cls (i64 32)) small big)))
+  (block small
+    (let ((slot (getelementptr ptr @fib.fl cls))
+          (head (load ptr slot)))
+      (br (icmp ne (load i32 @fib.mt) (i32 0)) fresh single)))
+  (block single
+    (br (icmp ne head (ptr null)) pop fresh))
+  (block pop
+    (store (load ptr head) slot)
+    (br made))
+  (block fresh
+    (let ((q (call @malloc (shl cls (i64 4)))))
+      (br (icmp eq q (ptr null)) oom made)))
+  (block made
+    (let ((p (phi ptr (pop head) (fresh q))))
+      (call @fib.init-hdr p tid (shl (trunc i32 cls) (i32 8)))
+      (ret p)))
+  (block big
+    (let ((p1 (call @malloc size)))
+      (br (icmp eq p1 (ptr null)) oom bigok)))
+  (block bigok
+    (call @fib.init-hdr p1 tid (i32 0))
+    (ret p1))
   (block traced
-    (let ((q (call @malloc (add size (i64 16)))))
-      (br (icmp eq q (ptr null)) oom tracedok)))
+    (let ((q2 (call @malloc (add size (i64 16)))))
+      (br (icmp eq q2 (ptr null)) oom tracedok)))
   (block tracedok
     (let ((n (call @fib.next-ordinal))
-          (p2 (getelementptr i8 q (i64 16))))
-      (store n q)
+          (p2 (getelementptr i8 q2 (i64 16))))
+      (store n q2)
       (call @fib.init-hdr p2 tid (i32 0))
       (call @fib.trace-line (i8 65) n (call @fib.class tid))
       (ret p2)))
   (block oom
     (call @fib.trap-c (string \"out of memory\"))
     (unreachable)))
+
+;; Gives a dead object's block back: onto its class's list while there is
+;; one thread, else to free. `f` is the flags word read before the drop.
+(define internal (fib.free-block void) ((ptr p) (i32 f))
+  (block entry
+    (let ((cls (zext i64 (lshr f (i32 8)))))
+      (br (icmp ne cls (i64 0)) classed plain)))
+  (block classed
+    (br (icmp eq (load i32 @fib.mt) (i32 0)) push plain))
+  (block push
+    (let ((cls2 (zext i64 (lshr f (i32 8))))
+          (slot (getelementptr ptr @fib.fl cls2)))
+      (store (load ptr slot) p)
+      (store p slot)
+      (ret)))
+  (block plain (call @free p) (ret)))
 
 ;; The program's `(alloc n)` after its `calloc` (syntax §3.15): the block,
 ;; or the trap \"out of memory\" when there is none, as the interpreter
@@ -109,7 +159,7 @@
 
 (define internal (fib.init-hdr void) ((ptr p) (i32 tid) (i32 flags))
   (block entry
-    (store (select (icmp eq flags (i32 0)) (i64 1) (i64 0)) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
+    (store (select (icmp eq (and flags (i32 15)) (i32 0)) (i64 1) (i64 0)) (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
     (store tid (getelementptr %struct.fib.hdr p (i32 0) (i32 1)))
     (store flags (getelementptr %struct.fib.hdr p (i32 0) (i32 2)))
     (ret)))
@@ -140,23 +190,36 @@
 (define internal (fib.tid i32) ((ptr p))
   (block entry (ret (load i32 (getelementptr %struct.fib.hdr p (i32 0) (i32 1))))))
 
+(define internal (fib.retain-slow void) ((ptr p) (i32 f))
+  (block entry
+    (br (icmp ne (and f (i32 12)) (i32 0)) done counted))
+  (block counted
+    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
+      (atomicrmw add monotonic cp (i64 1))
+      (br done)))
+  (block done (ret)))
+
+;; The fast path is the one that is small enough to be inlined at every
+;; call: not null, not SHARED, STACK or IMMORTAL (bits 1, 4, 8: HAS-WEAK
+;; does not matter here), a plain increment. The rest is retain-slow.
 (define internal (fib.retain void) ((ptr p))
   (block entry (br (icmp eq p (ptr null)) done check))
   (block check
     (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
-  (block counted
+      (br (icmp eq (and f (i32 13)) (i32 0)) local slow)))
+  (block local
     (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
-      (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
-  (block shared (atomicrmw add monotonic cp (i64 1)) (br done))
-  (block local (store (add (load i64 cp) (i64 1)) cp) (br done))
+      (store (add (load i64 cp) (i64 1)) cp)
+      (br done)))
+  (block slow (call @fib.retain-slow p f) (br done))
   (block done (ret)))
 
-(define internal (fib.release void) ((ptr p))
-  (block entry (br (icmp eq p (ptr null)) done check))
-  (block check
-    (let ((f (call @fib.flags p)))
-      (br (icmp ne (and f (i32 12)) (i32 0)) done counted)))
+;; The release of an object that is SHARED (count atomic) or whose
+;; flags are not known to be plain; counted objects only reach the
+;; atomic branch.
+(define internal (fib.release-slow void) ((ptr p) (i32 f))
+  (block entry
+    (br (icmp ne (and f (i32 12)) (i32 0)) done counted))
   (block counted
     (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0))))
       (br (icmp ne (and f (i32 1)) (i32 0)) shared local)))
@@ -168,6 +231,22 @@
       (br (icmp eq c (i64 1)) drop dec)))
   (block dec (store (sub c (i64 1)) cp) (br done))
   (block drop (call @fib.drop p) (br done))
+  (block done (ret)))
+
+;; Small enough to be inlined at every call: a plain object (not SHARED,
+;; STACK or IMMORTAL) whose count is above 1 is decremented in place;
+;; everything else is release-slow.
+(define internal (fib.release void) ((ptr p))
+  (block entry (br (icmp eq p (ptr null)) done check))
+  (block check
+    (let ((f (call @fib.flags p)))
+      (br (icmp eq (and f (i32 13)) (i32 0)) local slow)))
+  (block local
+    (let ((cp (getelementptr %struct.fib.hdr p (i32 0) (i32 0)))
+          (c (load i64 cp)))
+      (br (icmp ugt c (i64 1)) dec slow)))
+  (block dec (store (sub c (i64 1)) cp) (br done))
+  (block slow (call @fib.release-slow p f) (br done))
   (block done (ret)))
 
 ;; §8.2: the drop of an object whose count reached zero: weak-clear if
@@ -186,7 +265,7 @@
       (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced plain)))
   (block plain
     (indirect-call (load ptr rec) (fn void (ptr ptr)) p wl)
-    (call @free p)
+    (call @fib.free-block p f)
     (ret))
   (block traced
     ;; The free is traced before the children's releases, as the
@@ -1466,6 +1545,7 @@
 ;; writes the T line (compiler.md §4).
 (define internal (fib.spawn void) ((ptr task) (ptr entry))
   (block entry
+    (store (i32 1) @fib.mt)
     (let ((node (call @malloc (i64 16)))
           (rc (call @pthread_create node (ptr null) entry task)))
       (br (icmp ne rc (i32 0)) failed started)))
@@ -1650,6 +1730,7 @@
     (let ((r (cmpxchg acq_rel acquire @fib.pool-started (i32 0) (i32 1))))
       (br (extractvalue r 1) start done)))
   (block start
+    (store (i32 1) @fib.mt)
     (br (icmp ne (load i32 @fib.tracing) (i32 0)) traced spawn))
   (block traced (call @write (i32 2) (string \"T\\n\") (i64 2)) (br spawn))
   (block spawn
