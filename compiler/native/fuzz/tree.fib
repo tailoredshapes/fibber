@@ -1,0 +1,100 @@
+;; compiler/native/fuzz/tree.fib: forms as trees (crates/lair/src/fuzz/tree.rs): printing them to source, counting and addressing their nodes
+;; in pre-order. OWNER: package F. The Rust edits a node in place; here `update-nth` returns the changed forms (a persistent update).
+(ns native.fuzz.tree
+  (:use lir.sexp))
+
+(defun hex2 :private (b: i64) -> str
+  (str (str-slice "0123456789abcdef" (shr b 4) (+ (shr b 4) 1)) (str-slice "0123456789abcdef" (bit-and b 15) (+ (bit-and b 15) 1))))
+
+(defun string-text :private (bs: (Array i8)) -> str
+  (str "\""
+       (str-join (loop ((i 0) (out []))
+                   (if (>= i (array-len bs))
+                       out
+                       (let ((b (zext i64 (array-get bs i))))
+                         (recur (+ i 1)
+                                (conj out (cond (= b 34) "\\\"" (= b 92) "\\\\" (= b 10) "\\n"
+                                                (and (>= b 32) (<= b 126)) (str-from-bytes (array 1 (trunc i8 b)))
+                                                :else (str "\\x" (hex2 b)))))))))
+       "\""))
+
+;; The text of one form, as chunks (tree.rs `write`).
+(defun write-form :private (s: Sexp out: (Vec str)) -> (Vec str)
+  (match s
+    ((SxAtom a _) (conj out a))
+    ((SxVecType n e _) (conj out (str "<" n " x " e ">")))
+    ((SxStr bs _) (conj out (string-text bs)))
+    ((SxList items _) (write-seq items "(" ")" out))
+    ((SxBrace items _) (write-seq items "{" "}" out))
+    ((SxBracket items _) (write-seq items "[" "]" out))))
+
+(defun write-seq :private (items: (Vec Sexp) open: str close: str out: (Vec str)) -> (Vec str)
+  (loop ((i 0) (o (conj out open)))
+    (if (>= i (count items))
+        (conj o close)
+        (recur (+ i 1) (write-form (nth items i) (if (> i 0) (conj o " ") o))))))
+
+;; The source text of `forms`, one top-level form per line. Positions are lost. (tree.rs `print`)
+(defun print-forms (forms: (Vec Sexp)) -> str
+  (str-join (loop ((i 0) (out []))
+              (if (>= i (count forms))
+                  out
+                  (recur (+ i 1) (conj (write-form (nth forms i) out) "\n"))))))
+
+;; The children of a form, if it has any (tree.rs `items`).
+(defun items-of (s: Sexp) -> (Option (Vec Sexp))
+  (match s
+    ((SxList v _) (some v)) ((SxBrace v _) (some v)) ((SxBracket v _) (some v))
+    (_ nil)))
+
+(defun with-items :private (s: Sexp v: (Vec Sexp)) -> Sexp
+  (match s
+    ((SxList _ p) (SxList v p)) ((SxBrace _ p) (SxBrace v p)) ((SxBracket _ p) (SxBracket v p))
+    (_ s)))
+
+(defun inner-count :private (s: Sexp) -> i64
+  (match (items-of s) ((some v) (count-nodes v)) (nil 0)))
+
+;; How many nodes the forms hold, themselves included (tree.rs `count`).
+(defun count-nodes (forms: (Vec Sexp)) -> i64
+  (reduce (fn (a: i64 f: Sexp) (+ a (+ 1 (inner-count f)))) 0 forms))
+
+;; The `n`th node in pre-order (tree.rs `nth`).
+(defun nth-node (forms: (Vec Sexp) n: i64) -> (Option Sexp)
+  (loop ((i 0) (n n))
+    (if (>= i (count forms))
+        nil
+        (let ((f (nth forms i)))
+          (if (= n 0)
+              (some f)
+              (let ((inner (inner-count f))
+                    (m (- n 1)))
+                (if (< m inner)
+                    (match (items-of f) ((some v) (nth-node v m)) (nil nil))
+                    (recur (+ i 1) (- m inner)))))))))
+
+;; The forms with `f` applied to the `n`th node in pre-order; nil if there is none (tree.rs `with_nth`).
+(defun update-nth (forms: (Vec Sexp) n: i64 f: (fn (Sexp) Sexp)) -> (Option (Vec Sexp))
+  (loop ((i 0) (n n))
+    (if (>= i (count forms))
+        nil
+        (let ((s (nth forms i)))
+          (if (= n 0)
+              (some (assoc forms i (f s)))
+              (let ((inner (inner-count s))
+                    (m (- n 1)))
+                (if (< m inner)
+                    (match (items-of s)
+                      ((some v) (match (update-nth v m f)
+                                  ((some v2) (some (assoc forms i (with-items s v2))))
+                                  (nil nil)))
+                      (nil nil))
+                    (recur (+ i 1) (- m inner)))))))))
+
+;; Every atom's text, in pre-order, duplicates included (tree.rs `atoms`).
+(defun atoms-of (forms: (Vec Sexp)) -> (Vec str)
+  (reduce (fn (out: (Vec str) f: Sexp)
+            (match f
+              ((SxAtom a _) (conj out a))
+              (_ (match (items-of f) ((some v) (into out (atoms-of v))) (nil out)))))
+          [] forms))

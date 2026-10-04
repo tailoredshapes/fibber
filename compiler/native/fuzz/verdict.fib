@@ -1,0 +1,50 @@
+;; compiler/native/fuzz/verdict.fib: judging what `lair fuzz-one` did with a mutant (crates/lair/src/fuzz/verdict.rs). OWNER: package F.
+;; One addition to the Rust: a fibber program that traps prints `trap: ...` (the Rust's `panicked`), and that is a finding too.
+(ns native.fuzz.verdict
+  (:require [fib.string :as s])
+  (:use native.cases.exec native.cases.header native.cases.text))
+
+(def checked-mark: str "fuzz-one: checked")
+(def compiled-mark: str "fuzz-one: compiled")
+
+(defenum FzVerdict
+  FzRejected        ;; the checker (or the JIT's namespace rules) refused it with a message
+  FzRan             ;; it compiled and `main` returned
+  FzRuntimeCrash    ;; it compiled and `main` was killed by a signal: the mutant's own undefined behaviour, not a finding
+  FzRuntimeTimeout  ;; it compiled and `main` did not finish in time
+  (FzFinding what: str))
+
+(derive Eq FzVerdict)
+
+(defun contains? :private (hay: str needle: str) -> bool (some? (str-find hay needle 0)))
+
+(defun last-lines :private (text: str n: i64) -> str
+  (let ((lines (vec (filter (fn (l: str) (not (starts-with? l "fuzz-one:"))) (rust-lines text)))))
+    (s/join " | " (vec (drop (max 0 (- (count lines) n)) lines)))))
+
+(defun trapped? :private (stderr: str) -> bool
+  (or (contains? stderr "panicked") (starts-with? stderr "trap:") (contains? stderr "\ntrap:")))
+
+;; The verdict on a worker's result (`Err` is the harness's own failure). (verdict.rs `classify`)
+(defun classify (out: (Result Outcome str)) -> FzVerdict
+  (match out
+    ((Err msg) (FzFinding (str "harness: " msg)))
+    ((Ok o) (classify-outcome o))))
+
+(defun classify-outcome :private (o: Outcome) -> FzVerdict
+  (let ((stderr (. o stderr))
+        (checked (contains? stderr checked-mark))
+        (compiled (contains? stderr compiled-mark))
+        (tail (last-lines stderr 3)))
+    (cond (trapped? stderr) (FzFinding (str "panic: " tail))
+          (contains? stderr "internal error") (FzFinding (str "internal error: " tail))
+          (. o timed-out) (cond compiled FzRuntimeTimeout
+                                checked (FzFinding "the backend timed out")
+                                :else (FzFinding "the checker timed out"))
+          :else (match (. o signal)
+                  ((some sig) (if compiled
+                                  FzRuntimeCrash
+                                  (FzFinding (str "killed by " (signal-name sig) " " (if checked "in the backend" "in the checker") ": " tail))))
+                  (nil (cond compiled FzRan
+                             (and (not (= (. o status) 0)) (contains? stderr "error")) FzRejected
+                             :else (FzFinding (str "exit " (. o status) " before compiling, with no error message: " tail))))))))

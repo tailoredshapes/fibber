@@ -1,0 +1,92 @@
+;; compiler/native/fuzz/deep.fib: mutations that tend to leave a module valid, so that it reaches the lowering and LLVM (crates/lair/src/fuzz/deep.rs).
+;; OWNER: package F.
+(ns native.fuzz.deep
+  (:require [native.fuzz.rng :as rng] [native.fuzz.tree :as tree] [native.fuzz.words :as w])
+  (:use lir.sexp native.fuzz.case native.fuzz.nodes))
+
+(def n-deep: i64 5)
+
+;; Every atom equal to `from` under `s` replaced by `to`, and how many were (deep.rs `replace_all`).
+(defun replace-all :private (s: Sexp from: str to: Sexp) -> (Pair Sexp i64)
+  (match s
+    ((SxAtom a _) (if (= a from) (Pair to 1) (Pair s 0)))
+    (_ (match (tree/items-of s)
+         (nil (Pair s 0))
+         ((some v) (let ((rs (mapv (fn (x: Sexp) (replace-all x from to)) v)))
+                     (Pair (edit-items s (fn (old: (Vec Sexp)) (mapv (fn (p: (Pair Sexp i64)) (. p fst)) rs)))
+                           (reduce (fn (a: i64 p: (Pair Sexp i64)) (+ a (. p snd))) 0 rs))))))))
+
+;; One type for another throughout one top-level form (deep.rs `swap_type_everywhere`).
+(defun swap-type-everywhere :private (r: rng/FzRng c: FzCase forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (let ((from (one-of r ["i1" "i8" "i16" "i32" "i64" "float" "double" "ptr"]))
+        (to (random-type r c))
+        (i (rng/rng-below r (count forms)))
+        (p (replace-all (nth forms i) from to)))
+    (if (> (. p snd) 0) (some (Pair "swap-type-everywhere" (assoc forms i (. p fst)))) nil)))
+
+;; A random node whose first child is an atom in `heads` (deep.rs `form_with_head`).
+(defun form-with-head :private (r: rng/FzRng forms: (Vec Sexp) heads: (Vec str)) -> (Option i64)
+  (find-node r forms 40
+             (fn (s: Sexp) (match (first-atom s)
+                             ((some h) (some? (first (filter (fn (x: str) (= x h)) heads))))
+                             (nil false)))))
+
+(defun set-word :private (forms: (Vec Sexp) n: i64 at: i64 word: str) -> (Option (Vec Sexp))
+  (tree/update-nth forms n (fn (s: Sexp) (edit-list s (fn (v: (Vec Sexp)) (if (< at (count v)) (assoc v at (atom-of word)) v))))))
+
+(defun change-predicate :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (form-with-head r forms ["icmp" "fcmp"])
+    (nil nil)
+    ((some n) (let ((is-int (match (tree/nth-node forms n)
+                              ((some s) (= (first-atom s) (some "icmp")))
+                              (nil false)))
+                    (word (one-of r (if is-int w/ipreds w/fpreds))))
+                (result-of "change-predicate" (set-word forms n 1 word))))))
+
+(defun change-ordering :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (form-with-head r forms ["atomic-load" "atomic-store" "atomicrmw" "cmpxchg" "fence"])
+    (nil nil)
+    ((some n) (let ((word (one-of r w/orderings))
+                    (at (+ 1 (rng/rng-below r 3))))
+                (result-of "change-ordering" (set-word forms n at word))))))
+
+;; `volatile`, `inbounds` or `(align N)` slipped into a memory form.
+(defun add-modifier :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (form-with-head r forms ["load" "store" "alloca" "getelementptr"])
+    (nil nil)
+    ((some n) (let ((k (rng/rng-below r 3))
+                    (modifier (cond (= k 0) (atom-of "volatile")
+                                    (= k 1) (atom-of "inbounds")
+                                    :else (SxList [(atom-of "align") (atom-of (one-of r ["1" "2" "8" "16" "64" "4096" "1073741824" "3" "0"]))] 0)))
+                    (x (rng/rng-next r)))
+                (result-of "add-modifier"
+                           (tree/update-nth forms n
+                             (fn (s: Sexp) (edit-list s (fn (v: (Vec Sexp)) (vec-insert v (+ 1 (rng/urem x (count v))) modifier))))))))))
+
+(defun block? :private (s: Sexp) -> bool
+  (= (first-atom s) (some "block")))
+
+(defun relabel :private (v: (Vec Sexp) label: str) -> (Vec Sexp)
+  (if (> (count v) 1) (assoc v 1 (atom-of label)) v))
+
+;; A block copied under a fresh label: unreachable, and so under the stricter dominance rule of §5.3 (deep.rs `duplicate_block`).
+(defun add-block :private (v: (Vec Sexp) label: str) -> (Vec Sexp)
+  (let ((idx (vec (filter (fn (i: i64) (block? (nth v i))) (range (count v))))))
+    (if (empty? idx)
+        v
+        (conj v (edit-list (nth v (nth idx (- (count idx) 1))) (fn (b: (Vec Sexp)) (relabel b label)))))))
+
+(defun duplicate-block :private (r: rng/FzRng forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (match (form-with-head r forms ["define"])
+    (nil nil)
+    ((some n) (let ((label (str "dup" (rng/rng-below r 1000))))
+                (result-of "duplicate-block"
+                           (tree/update-nth forms n (fn (s: Sexp) (edit-list s (fn (v: (Vec Sexp)) (add-block v label))))))))))
+
+;; Op `k` of deep.rs `OPS`.
+(defun apply-deep (k: i64 r: rng/FzRng c: FzCase forms: (Vec Sexp)) -> (Option (Pair str (Vec Sexp)))
+  (cond (= k 0) (swap-type-everywhere r c forms)
+        (= k 1) (change-predicate r forms)
+        (= k 2) (change-ordering r forms)
+        (= k 3) (add-modifier r forms)
+        :else (duplicate-block r forms)))

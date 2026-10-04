@@ -1,0 +1,51 @@
+;; compiler/native/fuzz/rng.fib: the fuzzer's generator (crates/lair/src/fuzz/rng.rs): SplitMix64, the same stream from the same seed.
+;; OWNER: package F. A u64 lives in an i64 (the same 64 bits); fibber's `+` and `*` trap on overflow, so the wrapping sum and product
+;; are made from halves that cannot overflow, and the unsigned remainder from the shifted value.
+(ns native.fuzz.rng)
+
+(defstruct FzRng (state: (Cell i64)))
+
+(defun rng-new (seed: i64) -> FzRng (FzRng (cell seed)))
+
+(def m32: i64 4294967295)
+(def m16: i64 65535)
+
+;; x + y modulo 2^64.
+(defun wadd (x: i64 y: i64) -> i64
+  (let ((lo (+ (bit-and x m32) (bit-and y m32)))
+        (hi (bit-and (+ (+ (shr x 32) (shr y 32)) (shr lo 32)) m32)))
+    (bit-or (shl hi 32) (bit-and lo m32))))
+
+(defun limb :private (x: i64 k: i64) -> i64 (bit-and (shr x (* 16 k)) m16))
+
+;; The product of two limbs columns: sum of limb i of a times limb (k - i) of b, for i = 0..k (each term below 2^32).
+(defun column :private (a: i64 b: i64 k: i64) -> i64
+  (loop ((i 0) (s 0))
+    (if (> i k) s (recur (+ i 1) (+ s (* (limb a i) (limb b (- k i))))))))
+
+;; x * y modulo 2^64, by 16-bit limbs: the four low columns with their carries.
+(defun wmul (x: i64 y: i64) -> i64
+  (loop ((k 0) (carry 0) (out 0))
+    (if (> k 3)
+        out
+        (let ((t (+ (column x y k) carry)))
+          (recur (+ k 1) (shr t 16) (bit-or out (shl (bit-and t m16) (* 16 k))))))))
+
+;; The next 64 bits (rng.rs `next_u64`).
+(defun rng-next (r: FzRng) -> i64
+  (let ((s (wadd @(. r state) -7046029254386353131))
+        (z1 (wmul (bit-xor s (shr s 30)) -4658895280553007687))
+        (z2 (wmul (bit-xor z1 (shr z1 27)) -7723592293110705685)))
+    (do (set! (. r state) s) (bit-xor z2 (shr z2 31)))))
+
+;; x mod m for x read as unsigned and m positive.
+(defun urem (x: i64 m: i64) -> i64
+  (rem (+ (* 2 (rem (shr x 1) m)) (bit-and x 1)) m))
+
+;; A number in 0..n; 0 when n is 0, without drawing (rng.rs `below`).
+(defun rng-below (r: FzRng n: i64) -> i64
+  (if (= n 0) 0 (urem (rng-next r) n)))
+
+;; The index of one element of a collection of `n`, or nil for none (rng.rs `pick`, which draws only for a non-empty slice).
+(defun rng-pick-index (r: FzRng n: i64) -> (Option i64)
+  (if (= n 0) nil (some (rng-below r n))))
