@@ -8,7 +8,7 @@
 ;; widens its result in lIR: a narrow integer by `sext` (`zext` for an `i1`), a `float` by `fpext`. The text of this module is
 ;; never printed, only the constants it makes. Memory is read through raw pointers (`unsafe`), from addresses held as `i64`s.
 (ns emit.defs.jit
-  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi])
+  (:require [native.api :as jit] [native.call :as call] [lair.ffi :as ffi] [emit.defs.astmod :as am] [lir.ast :as la])
   (:use types.ty own.program emit.value emit.text emit.layout emit.objects emit.statics emit.program emit.assemble emit.defs.data))
 
 ;; What a `def`'s entry returned, or a field held. Rust: defs/jit.rs:88 Raw (the `f32` is widened, as `float_text(f64::from(x))`)
@@ -228,27 +228,36 @@
 ;; Inside the session: adds the module, runs the runtime's initialiser, reads the statics' addresses, calls the entry and reads
 ;; its value. Not `fib.init`, which would also read FIB_TRACE: the objects a `def` allocates at compile time are not in the trace
 ;; of the run (compiler.md §4), whatever the environment says. Rust: defs/jit.rs:55-66
-(defun read-in-session :private (j: jit/Jit p: Program d: Defs k: i64 text: str entry: str known: (Vec str) t: Ty lt: (Option LirTy))
+(defun read-in-session :private (j: jit/Jit p: Program d: Defs k: i64 m: la/LModule entry: str known: (Vec str) t: Ty lt: (Option LirTy))
     -> (Result str str)
-  (try-let ((_a (tag-err (jit/jit-add-source j (str-join ["def." (str k)]) text) (str-join ["def " (str k) ": "])))
+  (try-let ((_a (tag-err (jit/jit-add-module j (str-join ["def." (str k)]) m) (str-join ["def " (str k) ": "])))
             (init (tag-err (jit/jit-c-entry j (str-join ["fib.definit." (str k)])) (str-join ["def " (str k) ": "])))
             (_b (tag-err (call/call-i64 init []) (str-join ["def " (str k) ": "])))
             (names (known-addresses j k known))
             (raw (call-entry j entry lt)))
     (reader-value (Reader (cell names)) d p raw t)))
 
-(defun in-session :private (p: Program d: Defs k: i64 text: str entry: str known: (Vec str) t: Ty lt: (Option LirTy)) -> (Result str str)
+(defun in-session :private (p: Program d: Defs k: i64 m: la/LModule entry: str known: (Vec str) t: Ty lt: (Option LirTy)) -> (Result str str)
   (match (jit/jit-new-fast-codegen 0)
     ((Err m) (Err (str-join ["def " (str k) ": " m])))
     ((Ok j)
-     (let ((r (read-in-session j p d k text entry known t lt)))
+     (let ((r (read-in-session j p d k m entry known t lt)))
        (do (jit/jit-free j) r)))))
 
-;; The text of the module the JIT is given for def k: the module so far, the entry, the runtime initialiser, the address getters.
-(defun session-text :private (p: Program d: Defs k: i64 body: str entry: str lt: (Option LirTy) known: (Vec str)) -> str
-  (str-join [(assemble-parts p @(. d text)) (entry-text entry body lt)
+;; The text of what a session adds to the module so far for def k: the entry, the runtime initialiser, the address getters.
+(defun session-tail :private (k: i64 body: str entry: str lt: (Option LirTy) known: (Vec str)) -> str
+  (str-join [(entry-text entry body lt)
              (str-join ["(define (fib.definit." (str k) " void) () (block entry (call @fib.rq-init) (ret)))\n"])
              (address-getters k known)]))
+
+;; The module the JIT is given for def k: the module so far, then the tail, as trees (emit.defs.astmod); with FIB_AST_VERIFY set, they are
+;; checked to print as the text of the module so far and the tail do.
+(defun session-module :private (p: Program d: Defs k: i64 tail: str) -> (Result la/LModule str)
+  (try-let ((m (am/module-ast p d tail)))
+    (if (am/verifying?)
+        (try-let ((_ (am/verify-module p d tail m)))
+          (Ok m))
+        (Ok m))))
 
 ;; Evaluates the initialiser of def number k (`d`, a constant) and records its value for the ones after (syntax §3.19).
 ;; Rust: defs/jit.rs:25-69, the body of the loop of `emit_defs`
@@ -261,9 +270,9 @@
                  (lt (program-lir p t)))
          (let ((entry (str-join ["fib.defentry." (str k)]))
                (known (into @(. defs constants) (statics-closure-names (. p statics)))))
-           (let ((text (session-text p defs k body entry lt known)))
-             (try-let ((v (in-session p defs k text entry known t lt)))
+           (try-let ((m (session-module p defs k (session-tail k body entry lt known)))
+                     (v (in-session p defs k m entry known t lt)))
                (let ((dv (DefValue v lt)))
                  (do (set! (. p def-values) (assoc @(. p def-values) d dv))
                      (set! (. defs values) (assoc @(. defs values) d dv))
-                     (Ok ())))))))))))
+                     (Ok ()))))))))))

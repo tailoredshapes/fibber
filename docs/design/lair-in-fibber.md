@@ -175,12 +175,20 @@ spec/bootstrap.md §4 measured the compiled Stx reader at 4.6 microseconds per a
 integers, and the lIR reader must be several times cheaper per token than that one, which keeps a `Pos` per node and a token
 object per atom (R3).
 
-The in-memory hand-over is not in this version. Today the emitter (`compiler/emit/ir.fib` 276 lines, `text.fib` 136 lines)
-prints text, and `emit.defs.jit` and `macros.runner` give it to a JIT session, which parses and checks it again for every `def`
-and every macro module (the per-def sessions that cost the round trip: the owner's brief puts it at 56 MB; I did not measure
-that figure, I measured the 19.1 MB of the compiler's own lIR above). Stage 9 makes the emitter build `lir.ast` values, the
-checker still runs on them (method rule 7: "lIR verifies its input"), and `lir.print` stays for `fibc emit`, for the stage check
-and as the oracle: printing the AST the emitter built must equal the text it prints today, byte for byte.
+The in-memory hand-over (wave 5, H1) is in for the per-`def` sessions of the emitter, in a form short of stage 9 as first written.
+The emitter still renders text (`compiler/emit/ir.fib`, `text.fib`, the lowering), but `emit.assemble/module-pieces` gives the module so
+far as pieces that are the same text every time it is assembled again (the runtime, one object's structs and walkers, one static
+string, one function, one `def` constant), and `emit.defs.astmod` reads each piece once with `lir.parse`, keeps the items by the piece's
+text, and gives the session an `LModule` of those items and the session's own few lines (`native.api/jit-add-module`). The session
+drops what no exported definition reaches (`dead-internals`) before it checks, so a `def` whose initialiser reaches 10% of the module
+checks 10% of it. Measured (the compiler's own 139 `def`s): the sessions had read 134 MB of text, 21.8 s of the 25.3 s they took was
+`parse+check`; `emit compiler/fibc.fib` went from 24-25 s to 9.7-11.9 s with its output unchanged. What this is not: the emitter does not
+build trees from its data (lowering, `defs.data`, the runtime are text), so the trees are the reading of the pieces; a diagnostic of
+a session names a position within its piece; and a function no entry reaches is not checked in a `def` session (the whole program is
+still checked by `build`, and macro modules still go through `session-add-source`). `lir.print` stays for `fibc emit` and as the
+oracle: `FIB_AST_VERIFY=1` makes every session and the final module compare the print of its trees with the print of the whole text
+read again, and compiler/tests/native/h1-ast-vs-text.sh runs that over the emit corpus (`--fault` plants a fault in the builder and
+requires it to be caught). The stage-9 end state, trees built from the emitter's data, remains the way to avoid even the first read.
 
 ### 1.5 The C interface, entry by entry
 

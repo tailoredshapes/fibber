@@ -7,6 +7,7 @@
 ;; set and holds what needs no body, the runtime and `main`.
 ;; `compile-macro` (E11) is the macro-time module of one `defmacro` (macros/abi.rs's text is emit.macros.abi's).
 (ns emit.compile
+  (:require [emit.defs.astmod :as am])
   (:use types.ty types.table types.decls types.program own.program emit.value emit.names emit.objects emit.statics emit.program emit.inits
         emit.assemble emit.defs.mod emit.lower.cx emit.lower.mod emit.macros.abi))
 
@@ -27,7 +28,7 @@
 ;; `emit_defs` loops over none and returns the empty `Defs`), so it never reaches that package.
 (defun make-defs :private (p: Program) -> (Result Defs str)
   (if (empty? (filter (fn (d: i64) (. (g-def (program-g p) d) constant)) (all-def-ids p)))
-      (Ok (Defs (cell "") (cell (map-empty)) (cell []) (cell 0)))
+      (Ok (defs-new))
       (emit-defs p)))
 
 ;; The `main` section: the init functions, then `main` calling the entry. Nothing in it depends on a body being emitted.
@@ -40,6 +41,14 @@
   (if (starts-with? m "todo: ")
       (Ok (Module (parts-pending) (main-part p entry executable) (some m)))
       (Err m)))
+
+;; With FIB_AST_VERIFY set, the module as trees (emit.defs.astmod) must print as the text of the module does.
+(defun verified :private (p: Program defs: Defs m: Module) -> (Result Module str)
+  (if (am/verifying?)
+      (try-let ((ast (am/module-ast p defs (. m main)))
+                (_ (am/verify-module p defs (. m main) ast)))
+        (Ok m))
+      (Ok m)))
 
 ;; The Module of a program that has a `main`, planned, with its defs made and its entry requested. Rust: compile.rs:60 compile_module
 ;; The entry's name is the same whenever it is requested (names carry no counter): a module that stops at the defs knows it.
@@ -55,7 +64,7 @@
             (do (set! (. p def-values) (merge @(. p def-values) @(. defs values)))
                 (let ((entry (program-request p (BodyFun main) [])))
                   (match (emit-all p)
-                    ((Ok _) (Ok (Module (module-parts p @(. defs text)) (main-part p entry executable) nil)))
+                    ((Ok _) (verified p defs (Module (module-parts p @(. defs text)) (main-part p entry executable) nil)))
                     ((Err m) (pending-or-error p entry executable m))))))))))))
 
 ;; The lIR text of a whole program for `fibc run`: runtime, static data, bodies, and a `main` that prints the result.
