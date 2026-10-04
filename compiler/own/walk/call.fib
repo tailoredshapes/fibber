@@ -26,8 +26,8 @@
   (let [callee (callee-of w head)]
     (w-push-scope w)
     (let [head-m (if (= callee CalValue) (some ((. w expr) w head false)) nil)
-          ms (arg-modes w args)
           params (impl-params w head callee (params-of w callee (count args)))
+          ms (arg-modes w args (peek-args w head callee params args tail))
           captured (captured-args w args)
           d (decide w e callee params args ms tail captured)]
       (when tail (w-tail! w (. e id) d))
@@ -61,13 +61,71 @@
         (do (w-mark-moved w s)
             (w-out! w (fn (o: BodyOwn) -> BodyOwn (with o (reuse (assoc (. o reuse) (. e id) b))))))))))
 
-;; The mode of each argument; an `&v` has none.
-(defun arg-modes :private (w: Walker args: (Vec Arg)) -> (Vec (Option Mode))
-  (reduce (fn (acc: (Vec (Option Mode)) a: Arg)
-            (conj acc (match a
-                        ((ArgExpr x) (some ((. w expr) w x false)))
-                        ((ArgAmp _ _) nil))))
-          [] args))
+;; The cell binding a `@` reads, when the cell is one whose `@` may be a peek (own.peek, spec/types.md §6.3 "Cell peeks", P1) and the
+;; content is an object (a scalar content takes no count anyway).
+(defun peek-cell (w: Walker x: Expr) -> (Option i64)
+  (let [b (match (. x kind)
+            ((EDeref (PlAmp b) _) (some b))
+            ((EDeref (PlExpr c) _) (match (. c kind) ((ELocal b) (some b)) (_ nil)))
+            (_ nil))]
+    (match b
+      ((some v) (if (and (contains? @(. w peekable) v) (w-is-object w x)) b nil))
+      (_ nil))))
+
+;; Reads `x`, a `@c` that is a peek, with no count (§6.3, P2 and P3 already decided): the cell variable is read, the expression has the
+;; mode `Scalar` (no count, no binding: no rule reads it), and the plan records it for the emitter.
+(defun peek-deref (w: Walker x: Expr) -> Mode
+  (do (match (. x kind)
+        ((EDeref (PlExpr c) _) ((. w expr) w c false))
+        (_ MScalar))
+      (w-set-mode w (. x id) MScalar)
+      (w-out! w (fn (o: BodyOwn) -> BodyOwn (with o (peeks (conj (. o peeks) (. x id))))))
+      MScalar))
+
+;; Whether position i of the callee takes its argument borrowed and no more: a borrowed `defun` or method position that is not an `&`,
+;; `weak` or `raw-retained` one, or a builtin position that only borrows. Never a closure value or an `extern` (P2).
+(defun borrow-position? :private (callee: Callee params: (Vec Param) i: i64) -> bool
+  (match callee
+    ((CalFun _) (plain-borrow? (nth params i)))
+    ((CalMethod _ _) (plain-borrow? (nth params i)))
+    ((CalBuiltin b) (= (get (. (nth (builtin-table) b) escapes) i) (some EscBorrow)))
+    (_ false)))
+
+(defun plain-borrow? :private (p: Param) -> bool
+  (and (= (. p class) ClBorrow) (not (. p amp)) (not (. p weak)) (not (. p raw-retained))))
+
+;; Whether an operand of the call (the head or an argument) mentions the cell b, at any depth (P3).
+(defun names-cell? :private (b: i64 head: Expr args: (Vec Arg) skip: i64) -> bool
+  (let [cs (conj (set-empty) b)]
+    (or (mentions-amp head b cs)
+        (some? (find-first (fn (j: i64)
+                             (and (not (= j skip))
+                                  (match (nth args j)
+                                    ((ArgExpr y) (mentions-amp y b cs))
+                                    ((ArgAmp v _) (= v b)))))
+                           (range (count args)))))))
+
+;; Per argument, whether it is a peek: a `@c` of a peekable cell (P1) at a borrowed position (P2) of a call not in tail position, that no
+;; other operand of the call names (P3).
+(defun peek-args :private (w: Walker head: Expr callee: Callee params: (Vec Param) args: (Vec Arg) tail: bool) -> (Vec bool)
+  (vec (map-indexed (fn (i: i64 a: Arg)
+                      (match a
+                        ((ArgExpr x)
+                         (if (and (not tail) (borrow-position? callee params i))
+                           (match (peek-cell w x)
+                             ((some b) (not (names-cell? b head args i)))
+                             (_ false))
+                           false))
+                        (_ false)))
+                    args)))
+
+;; The mode of each argument; an `&v` has none; a peek (`peeks`) is read with no count.
+(defun arg-modes :private (w: Walker args: (Vec Arg) peeks: (Vec bool)) -> (Vec (Option Mode))
+  (vec (map-indexed (fn (i: i64 a: Arg)
+                      (match a
+                        ((ArgExpr x) (some (if (nth peeks i) (peek-deref w x) ((. w expr) w x false))))
+                        ((ArgAmp _ _) nil)))
+                    args)))
 
 ;; The pass of each argument, in order, and the write-backs `(index, binding)` of the `&v`
 ;; arguments that are acquired.
