@@ -39,3 +39,34 @@
           (dst (getelementptr %struct.fib.array.i8 r (i32 0) (i32 4) (i64 0))))
       (call @memcpy dst src (mul m esize))
       (ret r))))
+
+;; `array-push!` (in-place-update.md §2): a copy of a with room for 32 elements
+;; (the vector tail's whole range), the elements not yet retained. ROOMY (flag
+;; bit 4, no reader of the flags tests it: they mask bits 0-3) says the block holds
+;; 32 elements, len of them used, so a unique ROOMY array grows in place. A length
+;; of 32 or more gets exactly one more element and no flag.
+(define internal (fib.array-room ptr) ((ptr a) (i32 tid) (i64 esize))
+  (block entry
+    (let ((n (call @fib.array-len a))
+          (small (icmp slt n (i64 32)))
+          (cap (select small (i64 32) (add n (i64 1))))
+          (r (call @fib.alloc (add (i64 24) (mul cap esize)) tid))
+          (src (getelementptr %struct.fib.array.i8 a (i32 0) (i32 4) (i64 0)))
+          (dst (getelementptr %struct.fib.array.i8 r (i32 0) (i32 4) (i64 0))))
+      (store n (getelementptr %struct.fib.array.i8 r (i32 0) (i32 3)))
+      (call @memcpy dst src (mul n esize))
+      (br small roomy done)))
+  (block roomy
+    (let ((fp (getelementptr %struct.fib.hdr r (i32 0) (i32 2))))
+      (store (or (load i32 fp) (i32 16)) fp)
+      (br done)))
+  (block done (ret r)))
+
+;; True when a is unique and ROOMY with a free slot: array-push! writes it in place.
+(define internal (fib.array-roomy? i1) ((ptr a))
+  (block entry
+    (br (call @fib.unique? a) test no))
+  (block test
+    (br (icmp ne (and (call @fib.flags a) (i32 16)) (i32 0)) full no))
+  (block full (ret (icmp slt (call @fib.array-len a) (i64 32))))
+  (block no (ret (i1 0))))

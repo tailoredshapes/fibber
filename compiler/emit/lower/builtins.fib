@@ -92,6 +92,7 @@
     ("set!" (try-let ((c (arg name a 0)) (v (arg name a 1))) (set-cell cx c (nth tys 0) v)))
     ("reset!" (try-let ((c (arg name a 0)) (v (arg name a 1))) (lcx-reset cx c (nth tys 0) v)))
     ("swap!" (try-let ((c (arg name a 0)) (f (arg name a 1))) (lcx-swap cx c (nth tys 0) f)))
+    ("cell-update!" (try-let ((c (arg name a 0)) (f (arg name a 1))) (lcx-cell-update cx c (nth tys 0) f)))
     ("weak" (try-let ((x (arg name a 0))) (builtin-weak cx e x)))
     ("gensym" (builtin-gensym cx name a))
     ("spawn" (try-let ((f (arg name a 0))) (lcx-spawn cx e f)))
@@ -107,15 +108,15 @@
 (defstruct Arr (tid: i64 sname: str elem: Ty unit: bool el: LirTy esize: i64 counted: bool))
 
 (defun array-name? :private (name: str) -> bool
-  (one-of? name ["array" "array-len" "array-get" "array-with" "array-copy" "array-set!"]))
+  (one-of? name ["array" "array-len" "array-get" "array-with" "array-copy" "array-set!" "array-take!" "array-push!" "array-pop!"]))
 
 ;; The array type the builtin works on: the result's for the makers, the cell's content for `array-set!`, else the argument's.
 (defun array-ty-of :private (cx: LowerCx name: str e: Expr tys: (Vec Ty)) -> (Result Ty str)
   (cond (one-of? name ["array" "array-copy" "array-with"]) (lcx-ty cx e)
-        (= name "array-set!")
+        (one-of? name ["array-set!" "array-take!" "array-push!" "array-pop!"])
         (match (nth tys 0)
           ((TCon (KCell) args) (Ok (nth args 0)))
-          (_ (Err "array-set! on a non-cell")))
+          (_ (Err (str-join [name " on a non-cell"]))))
         :else (Ok (nth tys 0))))
 
 ;; An element of `unit` has no value, but takes the `i1` slot a cell of `unit` takes (program.rs `elem_lir`), so that the array has
@@ -208,6 +209,70 @@
           (lcx-store cx copy (lcx-gep cx cell-s cell slot-cell-value))
           (lcx-release cx content)))))
 
+;; The array in the cell of `&a`, unique: when it is not (or, for `array-push!`, when it has no room: `roomy`), a copy takes its place in
+;; the cell and the old one is released (in-place-update.md §2). Returns the array now in the cell. A copy for a push has room for 32
+;; elements and the flag ROOMY (`fib.array-room`); a copy for the others has none.
+(defun array-own :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V) roomy: bool) -> (Result V str)
+  (try-let ((co (program-object (. cx p) cell-ty)))
+    (let ((cell-s (. co snd)) (cell (v-text (nth a 0))) (aty (TCon KArray [(. r elem)])))
+      (try-let ((content ((. (. cx hub) cell-load) cx cell-s cell aty)))
+        (let ((b (. cx b))
+              (ok (fb-val b (str-join [(if roomy "(call @fib.array-roomy? " "(call @fib.unique? ") (v-text content) ")"]) LirI1))
+              (lc (fb-label b "copy")) (lj (fb-label b "owned")))
+          (do (fb-term b (str-join ["(br " (v-text ok) " " lj " " lc ")"]))
+              (fb-open b lc)
+              (let ((copy (if roomy
+                              (let ((p (fb-val b (str-join ["(call @fib.array-room " (v-text content) " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr)))
+                                (do (fb-stmt b (str-join ["(call @trace." (str (. r tid)) " " (v-text p) " @fib.retain)"])) p))
+                              (array-dup cx r (v-text content)))))
+                (do (lcx-store cx copy (lcx-gep cx cell-s cell slot-cell-value))
+                    (lcx-release cx content)
+                    (fb-term b (str-join ["(br " lj ")"]))))
+              (fb-open b lj)
+              ((. (. cx hub) cell-load) cx cell-s cell aty)))))))
+
+(defun array-len-ptr :private (cx: LowerCx r: Arr arr: V) -> str
+  (lcx-gep cx (. r sname) (v-text arr) slot-len))
+
+;; `(array-push! &a x)`: appended in place when the array is unique and has room, else to a copy with room.
+(defun array-push :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
+  (try-let ((arr (array-own cx r cell-ty a true)))
+    (let ((b (. cx b)) (lp (array-len-ptr cx r arr)))
+      (let ((n (lcx-load cx LirI64 lp)))
+        (let ((ep (fb-val b (elem-ptr r (v-text arr) (v-text n)) LirPtr)))
+          (do (lcx-store cx (nth a 1) (v-text ep))
+              (fb-stmt b (str-join ["(store " (v-text (fb-val b (str-join ["(add " (v-text n) " (i64 1))"]) LirI64)) " " lp ")"]))
+              (Ok VUnit)))))))
+
+;; `(array-pop! &a)`: the last element, moved out of a unique array, else out of a copy; traps on an empty one.
+(defun array-pop :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
+  (try-let ((arr (array-own cx r cell-ty a false)))
+    (let ((b (. cx b)) (lp (array-len-ptr cx r arr)) (lo (fb-label b "popok")) (lt (fb-label b "popempty")))
+      (let ((n (lcx-load cx LirI64 lp)))
+        (do (fb-term b (str-join ["(br " (v-text (fb-val b (str-join ["(icmp sgt " (v-text n) " (i64 0))"]) LirI1)) " " lo " " lt ")"]))
+            (fb-open b lt)
+            (fb-stmt b "(call @fib.trap-c (string \"array-pop! on an empty array\"))")
+            (fb-term b "(unreachable)")
+            (fb-open b lo)
+            (let ((n1 (fb-val b (str-join ["(sub " (v-text n) " (i64 1))"]) LirI64)))
+              (let ((ep (fb-val b (elem-ptr r (v-text arr) (v-text n1)) LirPtr)))
+                (let ((v (if (. r unit) VUnit (lcx-load cx (. r el) (v-text ep)))))
+                  (do (fb-stmt b (str-join ["(store " (v-text n1) " " lp ")"]))
+                      (match (. r el) ((LirDyn) (lcx-retain cx v)) (_ ()))
+                      (Ok v))))))))))
+
+;; `(array-take! &a i)`: element `i` moved out (a null left in its slot), from a unique array or else from a copy.
+(defun array-take :private (cx: LowerCx r: Arr cell-ty: Ty a: (Vec V)) -> (Result V str)
+  (try-let ((arr (array-own cx r cell-ty a false)))
+    (let ((b (. cx b)) (ep (array-index cx r (v-text arr) (nth a 1))))
+      (if (. r unit)
+          (Ok VUnit)
+          (let ((v (lcx-load cx (. r el) ep)))
+            (match (. r el)
+              ((LirPtr) (do (fb-stmt b (str-join ["(store (ptr null) " ep ")"])) (Ok v)))
+              ((LirDyn) (do (lcx-retain cx v) (Ok v)))
+              (_ (Ok v))))))))
+
 (defun builtin-array :private (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result V str)
   (try-let ((r (arr-info cx name e tys)))
     (match name
@@ -227,6 +292,9 @@
                                                          " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr)))
                       (do (fb-stmt (. cx b) (str-join ["(call @trace." (str (. r tid)) " " (v-text p) " @fib.retain)"]))
                           (Ok p))))
+      ("array-take!" (array-take cx r (nth tys 0) a))
+      ("array-push!" (array-push cx r (nth tys 0) a))
+      ("array-pop!" (array-pop cx r (nth tys 0) a))
       (_ (array-set cx r (nth tys 0) a)))))
 
 ;; ---- strings, the command line, floats
