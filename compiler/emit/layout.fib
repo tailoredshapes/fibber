@@ -26,11 +26,24 @@
                  ((some (TCon (KDyn _ _) _)) LirDyn)
                  (_ LirPtr)))))
     ((TCon (KDyn _ _) _) (Ok (some LirDyn)))
-    ((TCon (KNominal id) _)
-     (Ok (some (if (typedef-is-fieldless-enum (g-ty g id)) LirI32 LirPtr))))
+    ((TCon (KNominal id) args)
+     (if (= id @(. g option))
+         (match (first args)
+           ((some payload)
+            (try-let ((pl (lir-ty g payload)))
+              (Ok (some (match (scalar-payload pl) ((some s) (LirOpt s)) (nil LirPtr))))))
+           (nil (Ok (some LirPtr))))
+         (Ok (some (if (typedef-is-fieldless-enum (g-ty g id)) LirI32 LirPtr)))))
     ((TCon _ _) (Ok (some LirPtr)))
     ((TFn _ _ _) (Ok (some LirPtr)))
     (_ (Err (str-join ["a type variable reached the lowering: " (printer-ty (printer-new g) t)])))))
+
+;; The lIR type of a payload that makes its `Option` a value (`OptValue`): a scalar that has a value, so no pointer, no `dyn`,
+;; no `Option` of a scalar and no `unit`.
+(defun scalar-payload :private (l: (Option LirTy)) -> (Option LirTy)
+  (match l
+    ((some (LirPtr)) nil) ((some (LirDyn)) nil) ((some (LirOpt _)) nil)
+    (_ l)))
 
 ;; Whether a type is an object type: its values are counted pointers (or a
 ;; `dyn`, whose object word is). Rust: layout.rs:42 is_object
@@ -41,9 +54,9 @@
     (_ true)))
 
 ;; How an `(Option T)` is represented (§8.1): `OptNull`, a nullable pointer
-;; (`nil` is null, `some` allocates nothing), or `OptBoxed`, a heap enum with a
-;; tag and the payload.
-(defenum OptRep OptNull OptBoxed)
+;; (`nil` is null, `some` allocates nothing), `OptValue`, the pair `(LirOpt t)` by value
+;; (the payload a scalar with a value), or `OptBoxed`, a heap enum with a tag and the payload.
+(defenum OptRep OptNull OptBoxed OptValue)
 (derive Eq OptRep)
 
 ;; The payload type of an `Option`, if `t` is one. Rust: layout.rs:60 option_payload
@@ -55,7 +68,9 @@
 ;; The representation of `(Option payload)`. Rust: layout.rs:68 option_rep
 (defun option-rep (g: Globals payload: Ty) -> (Result OptRep str)
   (try-let ((l (lir-ty g payload)))
-    (Ok (if (and (= l (some LirPtr)) (nil? (option-payload g payload))) OptNull OptBoxed))))
+    (Ok (cond (and (= l (some LirPtr)) (nil? (option-payload g payload))) OptNull
+              (some? (scalar-payload l)) OptValue
+              :else OptBoxed))))
 
 ;; The types of the fields of a struct or of one variant, in declaration order,
 ;; at the concrete arguments. Rust: layout.rs:80 field_tys
@@ -84,7 +99,9 @@
     ((LirI1) (Pair 1 1)) ((LirI8) (Pair 1 1)) ((LirI16) (Pair 2 2))
     ((LirI32) (Pair 4 4)) ((LirFloat) (Pair 4 4))
     ((LirI64) (Pair 8 8)) ((LirDouble) (Pair 8 8)) ((LirPtr) (Pair 8 8)) ((LirRaw) (Pair 8 8))
-    ((LirDyn) (Pair 16 8))))
+    ((LirDyn) (Pair 16 8))
+    ((LirOpt t) (let ((s (size-align t)))
+                  (Pair (round-up (+ (round-up 1 (. s snd)) (. s fst)) (. s snd)) (. s snd))))))
 
 ;; `off` rounded up to a multiple of `a` (Rust's `div_ceil(a) * a`).
 (defun round-up :private (off: i64 a: i64) -> i64

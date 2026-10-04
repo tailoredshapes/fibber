@@ -37,7 +37,11 @@
        (match (option-payload g t)
          (nil (Ok ClsPtr))
          ((some p) (try-let ((r (option-rep g p)))
-                     (Ok (match r ((OptNull) ClsOpt) ((OptBoxed) ClsBoxed)))))))
+                     (match r
+                       ((OptNull) (Ok ClsOpt))
+                       ((OptBoxed) (Ok ClsBoxed))
+                       ;; an `Option` held as a value has the lIR type `(LirOpt t)`, a scalar class: not here
+                       ((OptValue) (Err "an Option held as a value with a pointer type")))))))
       ((some s) (Ok (ClsScalar s))))))
 
 ;; The representative type of a class: what an unconstrained variable becomes inside its specialisation (compiler.md §7).
@@ -48,11 +52,13 @@
      (match t
        ((LirI1) (ty-bool)) ((LirI8) (ty-scalar SI8)) ((LirI16) (ty-scalar SI16)) ((LirI32) (ty-scalar SI32))
        ((LirFloat) (ty-scalar SF32)) ((LirDouble) (ty-scalar SF64)) ((LirRaw) (ty-scalar SPtr))
+       ((LirOpt s) (ty-nominal @(. g option) [(representative g (ClsScalar s))]))
        (_ (ty-i64))))
     ((ClsUnit) (ty-unit))
     ((ClsPtr) (ty-str))
     ((ClsOpt) (ty-nominal @(. g option) [(ty-str)]))
-    ((ClsBoxed) (ty-nominal @(. g option) [(ty-i64)]))
+    ;; a heap enum: an `(Option i64)` is a value now (`LirOpt`), so the representative is an Option of one
+    ((ClsBoxed) (ty-nominal @(. g option) [(ty-nominal @(. g option) [(ty-i64)])]))
     ((ClsDyn) (TCon (KDyn 0 false) []))))
 
 ;; Whether type t mentions quantified variable i (Rust: the `visit` of mono.rs:93 `mentions`; the colour leaves of a function

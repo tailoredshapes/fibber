@@ -15,8 +15,10 @@
 ;; drop and trace follow; `LirRaw` is a raw `ptr` of a program (types §8.1,
 ;; syntax §3.15), uncounted, `ptr` in lIR text and in layout but its own
 ;; variant, because the compiler decides from this type whether a slot is
-;; counted; `LirDyn` is a `(dyn P)` value, `{ ptr ptr }` by value.
-(defenum LirTy LirI1 LirI8 LirI16 LirI32 LirI64 LirFloat LirDouble LirPtr LirRaw LirDyn)
+;; counted; `LirDyn` is a `(dyn P)` value, `{ ptr ptr }` by value; `(LirOpt t)` is an
+;; `(Option T)` whose payload is of the scalar lIR type `t`, `{ i1 t }` by value: the tag
+;; (1 for `some`), then the payload, zero for `nil` (types §8.1, docs/design/unboxed-option.md).
+(defenum LirTy LirI1 LirI8 LirI16 LirI32 LirI64 LirFloat LirDouble LirPtr LirRaw LirDyn (LirOpt of: LirTy))
 (derive Eq LirTy) (derive Hash LirTy)
 
 ;; Rust: value.rs:29 text
@@ -24,7 +26,8 @@
   (match t
     ((LirI1) "i1") ((LirI8) "i8") ((LirI16) "i16") ((LirI32) "i32") ((LirI64) "i64")
     ((LirFloat) "float") ((LirDouble) "double") ((LirPtr) "ptr") ((LirRaw) "ptr")
-    ((LirDyn) "{ ptr ptr }")))
+    ((LirDyn) "{ ptr ptr }")
+    ((LirOpt t) (str-join ["{ i1 " (lir-ty-text t) " }"]))))
 
 ;; Rust: value.rs:43 is_int
 (defun lir-ty-is-int (t: LirTy) -> bool
@@ -36,7 +39,19 @@
 (defun lir-ty-bits (t: LirTy) -> i64
   (match t
     ((LirI1) 1) ((LirI8) 8) ((LirI16) 16) ((LirI32) 32) ((LirI64) 64)
-    ((LirDouble) 64) ((LirPtr) 64) ((LirRaw) 64) ((LirFloat) 32) ((LirDyn) 128)))
+    ((LirDouble) 64) ((LirPtr) 64) ((LirRaw) 64) ((LirFloat) 32) ((LirDyn) 128)
+    ((LirOpt t) (+ 64 (lir-ty-bits t)))))
+
+;; The zero of an lIR type as a value: the payload of a `nil` of `(LirOpt t)`, and the initial value of a slot.
+(defun lir-zero (t: LirTy) -> str
+  (match t
+    ((LirPtr) "(ptr null)")
+    ((LirRaw) "(ptr null)")
+    ((LirFloat) "(float 0.0)")
+    ((LirDouble) "(double 0.0)")
+    ((LirDyn) "(zeroinitializer { ptr ptr })")
+    ((LirOpt _) (str-join ["(zeroinitializer " (lir-ty-text t) ")"]))
+    (_ (str-join ["(" (lir-ty-text t) " 0)"]))))
 
 ;; A value: an SSA name, a global address or a literal, with its type; `VUnit`
 ;; is no value (`unit`).

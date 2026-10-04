@@ -12,7 +12,8 @@
   (:use types.ty own.program emit.value emit.text emit.layout emit.objects emit.statics emit.program emit.assemble emit.defs.data))
 
 ;; What a `def`'s entry returned, or a field held. Rust: defs/jit.rs:88 Raw (the `f32` is widened, as `float_text(f64::from(x))`)
-(defenum DefRaw DrUnit (DrInt n: i64) (DrFlt x: f64) (DrPtr a: i64))
+;; `DrOpt` is an `(Option scalar)` held as the pair `{ i1 t }`: its tag and its payload.
+(defenum DefRaw DrUnit (DrInt n: i64) (DrFlt x: f64) (DrPtr a: i64) (DrOpt tag: i64 payload: DefRaw))
 
 ;; The constants already made for the objects at these JIT addresses (the earlier `def`s, the immortal closures, and each object read
 ;; so far, so that a shared object is one constant). Rust: defs/jit.rs:157 Reader
@@ -42,6 +43,11 @@
     ((LirDouble) (Ok (DrFlt (mem-f64 a))))
     ((LirPtr) (Ok (DrPtr (mem-i64 a))))
     ((LirDyn) (Err "a def holding a dyn"))
+    ((LirOpt inner)
+     ;; the tag byte, then the payload at its alignment
+     (let ((offsets (field-offsets [(Pair 1 1) (size-align inner)])))
+       (try-let ((payload (read-raw (+ a (nth offsets 1)) inner)))
+         (Ok (DrOpt (bit-and (mem-u8 a) 1) payload)))))
     ((LirRaw) (Err "a def holding a raw ptr"))))
 
 ;; --- the entry ---
@@ -50,6 +56,24 @@
 (defun entry-word :private (entry: str ty: str expr: str) -> str
   (str-join ["(define (" entry " " ty ") () (block entry (ret " expr ")))\n"]))
 
+;; The type an entry returns for a value `c` of lIR type `l` and the text that widens `c` to it.
+(defun widened :private (l: LirTy c: str) -> (Pair str str)
+  (match l
+    ((LirI1) (Pair "i64" (str-join ["(zext i64 " c ")"])))
+    ((LirI8) (Pair "i64" (str-join ["(sext i64 " c ")"])))
+    ((LirI16) (Pair "i64" (str-join ["(sext i64 " c ")"])))
+    ((LirI32) (Pair "i64" (str-join ["(sext i64 " c ")"])))
+    ((LirFloat) (Pair "double" (str-join ["(fpext double " c ")"])))
+    (_ (Pair (lir-ty-text l) c))))
+
+;; The entries of a def held as the pair `{ i1 t }`: `entry` gives the tag and `entry.v` the payload, each calling the body (a
+;; def's initialiser is evaluated twice; the pair is a scalar's, so this costs nothing but time).
+(defun pair-entries :private (entry: str body: str inner: LirTy) -> str
+  (let ((c (str-join ["(call @" body ")"])))
+    (let ((w (widened inner "p")))
+      (str-join [(entry-word entry "i64" (str-join ["(zext i64 (extractvalue " c " 0))"]))
+                 "(define (" entry ".v " (. w fst) ") () (block entry (let ((p (extractvalue " c " 1))) (ret " (. w snd) "))))\n"]))))
+
 ;; The entry `fib.defentry.K` of the body `body` of type `lt`: what `call-entry` can call. Rust: defs/jit.rs:36 (the `define` text)
 (defun entry-text :private (entry: str body: str lt: (Option LirTy)) -> str
   (match lt
@@ -57,12 +81,8 @@
     ((some l)
      (let ((c (str-join ["(call @" body ")"])))
        (match l
-         ((LirI1) (entry-word entry "i64" (str-join ["(zext i64 " c ")"])))
-         ((LirI8) (entry-word entry "i64" (str-join ["(sext i64 " c ")"])))
-         ((LirI16) (entry-word entry "i64" (str-join ["(sext i64 " c ")"])))
-         ((LirI32) (entry-word entry "i64" (str-join ["(sext i64 " c ")"])))
-         ((LirFloat) (entry-word entry "double" (str-join ["(fpext double " c ")"])))
-         (_ (entry-word entry (lir-ty-text l) c)))))))
+         ((LirOpt inner) (pair-entries entry body inner))
+         (_ (let ((w (widened l c))) (entry-word entry (. w fst) (. w snd)))))))))
 
 ;; Calls the entry with the signature its lIR result type gives. Rust: defs/jit.rs:112 call_entry
 (defun call-entry :private (j: jit/Jit entry: str lt: (Option LirTy)) -> (Result DefRaw str)
@@ -72,6 +92,9 @@
      (match lt
        (nil (try-let ((_a (tag-err (call/call-i64 addr []) "def entry: "))) (Ok DrUnit)))
        ((some (LirDyn)) (Err "a def holding a dyn"))
+       ((some (LirOpt inner))
+        (try-let ((tag (tag-err (call/call-i64 addr []) "def entry: ")) (payload (call-entry j (str-concat entry ".v") (some inner))))
+          (Ok (DrOpt tag payload))))
        ((some (LirRaw)) (Err "a def holding a raw ptr"))
        ((some (LirFloat)) (try-let ((x (tag-err (call/call-f64 addr []) "def entry: "))) (Ok (DrFlt x))))
        ((some (LirDouble)) (try-let ((x (tag-err (call/call-f64 addr []) "def entry: "))) (Ok (DrFlt x))))
@@ -176,6 +199,7 @@
      (try-let ((rep (option-rep (program-g p) payload)))
        (match rep
          ((OptNull) (if (= a 0) (Ok "(ptr null)") (reader-object r d p a payload)))
+         ((OptValue) (Err "a def holding an Option of a scalar"))
          ((OptBoxed) (if (= a 0) (defs-emit-object d p t (some 0) []) (reader-object r d p a t))))))
     (nil (reader-object r d p a t))))
 
@@ -189,6 +213,11 @@
          ((DrUnit) (Ok ""))
          ((DrInt n) (Ok (lit-text l (str n))))
          ((DrFlt x) (Ok (lit-text l (float-lir-text x))))
+         ((DrOpt tag payload)
+          (match (option-payload (program-g p) t)
+            (nil (Err "a pair where an Option of a scalar was expected"))
+            ((some x) (try-let ((pv (reader-value r d p payload x)))
+                        (Ok (str-join ["{ (i1 " (str tag) ") " pv " }"]))))))
          ((DrPtr a)
           (match l
             ((LirPtr) (reader-pointer r d p a t))

@@ -135,6 +135,20 @@
                     (sub-patterns cx (str-join [sname ".v1"]) slot-variant-field0 [payload] subs v fail)
                     (Ok ()))))))))
 
+;; `(Option payload)` held as the pair `{ i1 t }` by value (`OptValue`): the tag is read from the value, nothing is loaded and no
+;; count is taken; the payload, for a `(some p)` sub-pattern, is its second member.
+(defun value-option :private (cx: LowerCx is-some: bool payload: Ty subs: (Vec Pattern) v: V fail: str) -> (Result unit str)
+  (match (v-ty v)
+    ((some (LirOpt inner))
+     (let ((tag (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " 0)"]) LirI1)))
+       (do (if is-some
+               (branch cx tag fail)
+               (branch cx (test-val cx (str-join ["(xor " (v-text tag) " (i1 1))"])) fail))
+           (if (and is-some (= (count subs) 1) (not (wild? (nth subs 0))))
+               (lcx-match-pattern cx (nth subs 0) (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " 1)"]) inner) payload fail)
+               (Ok ())))))
+    (_ (Err "an Option of a scalar held as something that is not a pair"))))
+
 (defun option-pattern :private (cx: LowerCx variant: (Option i64) subs: (Vec Pattern) v: V t: Ty fail: str) -> (Result unit str)
   (let ((g (program-g (. cx p))) (is-some (= variant (some 1))))
     (match (option-payload g t)
@@ -147,6 +161,7 @@
                 (if (and is-some (= (count subs) 1))
                     (lcx-match-pattern cx (nth subs 0) v payload fail)
                     (Ok ()))))
+           ((OptValue) (value-option cx is-some payload subs v fail))
            ((OptBoxed) (boxed-option cx is-some payload subs v t fail))))))))
 
 ;; The element `i` of the vector `v`, read as `vec-nth` reads it with no count operation. Rust: pattern.rs:90

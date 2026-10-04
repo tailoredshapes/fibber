@@ -111,6 +111,19 @@
               base vals)
       ()))
 
+;; `(some x)` and `nil` of an `Option` held as the pair `{ i1 t }` by value (`OptValue`): the tag and the payload, zero for `nil`.
+;; Nothing is allocated, whatever the plan says of the site.
+(defun construct-value-option :private (cx: LowerCx variant: (Option i64) vals: (Vec V) t: Ty) -> (Result V str)
+  (try-let ((l (program-lir (. cx p) t)))
+    (match l
+      ((some (LirOpt inner))
+       (match variant
+         ((some 0) (Ok (VVal (lir-zero (LirOpt inner)) (LirOpt inner))))
+         (_ (match (first vals)
+              ((some v) (Ok (fb-val (. cx b) (str-join ["{ (i1 1) " (v-text v) " }"]) (LirOpt inner))))
+              (nil (Err "some without a payload"))))))
+      (_ (Err "an Option held as a value without a pair type")))))
+
 ;; `(some x)` and `nil` of an `Option`: null or the payload when `Option` is a nullable pointer, else a heap enum with a tag.
 ;; Rust: lower/objects.rs:93 LowerCx::construct_option
 (defun construct-option :private (cx: LowerCx e: Expr variant: (Option i64) vals: (Vec V) t: Ty) -> (Result V str)
@@ -124,6 +137,7 @@
             (match variant
               ((some 0) (Ok (v-null)))
               (_ (match (first vals) ((some v) (Ok v)) (nil (Err "some without a payload"))))))
+           ((OptValue) (construct-value-option cx variant vals t))
            ((OptBoxed)
             ;; A `nil` whose site the plan gave no allocation (a generic payload) is the null pointer, as the interpreter makes it.
             (if (and (= variant (some 0)) (nil? (get (. (. cx own) allocs) (. e id))))

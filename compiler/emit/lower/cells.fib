@@ -91,6 +91,7 @@
   (try-let ((rep (option-rep (program-g (. cx p)) target)))
     (match rep
       ((OptNull) (Ok (fb-val (. cx b) (str-join ["(call @fib.upgrade " (v-text w) ")"]) LirPtr)))
+      ((OptValue) (Err "a weak reference to a scalar"))
       ((OptBoxed) (upgrade-dyn cx w target)))))
 
 ;; `(reset! a v)`: the consumed value share-marked if the atom is, stored under the lock, the old value released (§8.6).
@@ -114,6 +115,16 @@
 
 ;; Whether two values of one type are the same word (an object's address, a scalar's bits). Rust: lower/cells.rs:213 same_bits
 (defun same-bits :private (cx: LowerCx x: V y: V) -> V
+  (match (v-ty x)
+    ((some (LirOpt inner))
+     ;; An `(Option scalar)` held as a pair: the tags are the same and the payloads are (a `nil`'s payload is zero, so two `nil`s are).
+     (let ((b (. cx b)) (part (fn (v: V i: i64 t: LirTy) (fb-val (. cx b) (str-join ["(extractvalue " (v-text v) " " (str i) ")"]) t))))
+       (let ((tags (same-bits cx (part x 0 LirI1) (part y 0 LirI1)))
+             (vals (same-bits cx (part x 1 inner) (part y 1 inner))))
+         (fb-val b (str-join ["(and " (v-text tags) " " (v-text vals) ")"]) LirI1))))
+    (_ (same-bits-word cx x y))))
+
+(defun same-bits-word :private (cx: LowerCx x: V y: V) -> V
   (let ((b (. cx b)) (a (v-text x)) (c (v-text y)))
     (let ((cast (fn (ty: str)
                   (let ((ia (fb-val b (str-join ["(bitcast " ty " " a ")"]) (if (= ty "i32") LirI32 LirI64)))
