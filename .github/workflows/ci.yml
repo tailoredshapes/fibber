@@ -129,6 +129,18 @@ jobs:
         timeout-minutes: 45
         run: cargo test -p lair
 
+      # The legacy oracle of the lairf job (crates/lair is frozen until stage 10): the `lair` command line, which links LLVM statically.
+      - name: Build the lair binary
+        timeout-minutes: 30
+        run: cargo build -p lair --bin lair
+
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: rust-lair
+          path: target/debug/lair
+          retention-days: 3
+
       # crates/fibc is not in the fibref job: it needs LLVM. Its tests
       # are the compiler itself: the rule-6 suites (tests/cases.rs runs
       # cases/ownership and cases/modules interpreted and compiled, as
@@ -143,16 +155,13 @@ jobs:
         timeout-minutes: 45
         run: cargo test -p fibc -- --test-threads=2
 
-  # The truth about main: the released seed (the one SEED names: a stage 2
-  # binary with its own liblair.so, no Rust and no LLVM install needed)
-  # builds stage 2 from main's compiler/ and lib/; the fixed point holds;
-  # stage 2 runs the case directories, and the cases that do not pass are
-  # exactly those in scripts/ci-stage2.expected.
+  # The truth about main: the released seed (the one SEED names: a stage 2 binary; before the flip it carries its own liblair.so, which it uses to
+  # compile) builds stage 2 from main's compiler/ and lib/; stage 2 links LLVM 21 itself (the static archives of llvm-dev, as the release does,
+  # through scripts/llvm-static.sh) and needs no liblair.so and no Rust; the fixed point holds; stage 2 runs the case directories, and the
+  # cases that do not pass are exactly those in scripts/ci-stage2.expected.
   stage2:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 5
@@ -166,39 +175,29 @@ jobs:
           echo "SEED_FIBC=$fibc" >> "$GITHUB_ENV"
           echo "SEED_LIB=$(cd "$(dirname "$fibc")/../lib" && pwd)" >> "$GITHUB_ENV"
 
-      # The tree's own lair: stage 2 links the code generator of the tree it is built from (it may call entries the seed's
-      # liblair.so lacks), so the Rust toolchain and LLVM come back for this one crate.
-      - name: Install the pinned toolchain
-        timeout-minutes: 10
-        run: |
-          rustup toolchain install $RUST_TOOLCHAIN --profile minimal
-          rustup default $RUST_TOOLCHAIN
-
+      # LLVM 21 for the link: llvm-21-dev has the static archives and llvm-config; zstd and zlib are the system libraries they name.
       - name: Install LLVM 21
         timeout-minutes: 15
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 21
-          sudo apt-get install -y llvm-21-dev libpolly-21-dev libzstd-dev zlib1g-dev libxml2-dev
-
-      - uses: Swatinem/rust-cache@v2
-        timeout-minutes: 10
-        with:
-          prefix-key: stage2-lair
-
-      - name: Build lair (release)
-        timeout-minutes: 30
-        run: cargo build --release -p lair
+          sudo apt-get install -y llvm-21-dev libzstd-dev zlib1g-dev libxml2-dev
+          echo "LLVM_CONFIG=/usr/lib/llvm-21/bin/llvm-config" >> "$GITHUB_ENV"
 
       - name: Build stage 2 and check it
         timeout-minutes: 30
         run: |
           set -eu
-          export FIB_LIB=$PWD/lib LAIR=$PWD/target/release LD_LIBRARY_PATH=$PWD/target/release
-          build() { "$1" build compiler/fibc.fib -I compiler -I lib -L "$LAIR" -l lair -o "$2"; }
-          emit() { "$1" emit -I compiler -I lib compiler/fibc.fib; }
+          export FIB_LIB=$PWD/lib
+          read -r -a llvm < <(scripts/llvm-static.sh "$RUNNER_TEMP/llvm")
+          # Only the seed (a release made before the flip) loads a liblair.so; F and F3 have none and must not find one.
+          build() { if [ "$1" = "$SEED_FIBC" ]; then LD_LIBRARY_PATH=$SEED_LIB "$1" build compiler/fibc.fib -I compiler -I lib "${llvm[@]}" -o "$2"
+                    else "$1" build compiler/fibc.fib -I compiler -I lib "${llvm[@]}" -o "$2"; fi; }
+          emit() { if [ "$1" = "$SEED_FIBC" ]; then LD_LIBRARY_PATH=$SEED_LIB "$1" emit -I compiler -I lib compiler/fibc.fib
+                   else "$1" emit -I compiler -I lib compiler/fibc.fib; fi; }
           build "$SEED_FIBC" "$RUNNER_TEMP/F"
+          ! ldd "$RUNNER_TEMP/F" | grep -q -E 'liblair|libLLVM'
           emit "$SEED_FIBC" > "$RUNNER_TEMP/emit.seed"
           emit "$RUNNER_TEMP/F" > "$RUNNER_TEMP/emit.F"
           # The seed's lIR differs from F's whenever main's compiler or library moved on: a note. The check is the
@@ -218,5 +217,47 @@ jobs:
           LIMIT_MODULES: 120
           LIMIT_STDLIB: 2400
         run: |
-          export FIB_LIB=$PWD/lib LD_LIBRARY_PATH=$PWD/target/release
+          export FIB_LIB=$PWD/lib
           scripts/ci-stage2.sh "$RUNNER_TEMP/F"
+
+  # lairf, lair written in fibber (compiler/lairf.fib, built by the seed through the shared libLLVM-21, no liblair), against the Rust lair on the
+  # same inputs: the five compare scripts over cases/lir and 30 emitted programs (scripts/ci-lairf.sh). The Rust lair is the `lair` job's binary,
+  # handed over as an artifact: building it here would bring back the Rust toolchain and minutes of LLVM linking that stage2 shed, and storing hashes of its
+  # output instead would go stale with every change of the emitter or the library (the emitted programs are inputs). Its own job, so that the legacy
+  # Rust build neither delays nor fails the stage2 job. Removed with the Rust lair (stage 10).
+  lairf:
+    needs: lair
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: rust-lair
+          path: rust-lair
+
+      - name: Fetch the seed
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          fibc=$(scripts/fetch-seed.sh "$RUNNER_TEMP/seed")
+          echo "SEED_FIBC=$fibc" >> "$GITHUB_ENV"
+          echo "SEED_LIB=$(cd "$(dirname "$fibc")/../lib" && pwd)" >> "$GITHUB_ENV"
+
+      - name: Install LLVM 21
+        timeout-minutes: 15
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev zlib1g-dev libzstd-dev
+
+      - name: Build lairf and compare it with the Rust lair
+        timeout-minutes: 40
+        run: |
+          chmod +x rust-lair/lair
+          FIBC=$SEED_FIBC SEED_LIB=$SEED_LIB LAIR=$PWD/rust-lair/lair scripts/ci-lairf.sh "$RUNNER_TEMP/lairf"

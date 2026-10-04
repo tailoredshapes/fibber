@@ -19,7 +19,7 @@ permissions:
   contents: write
 
 env:
-  LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+  LLVM_SYS_211_PREFIX: /usr/lib/llvm-21   # only for the Rust tools of v0.0.* tags
 
 jobs:
   release:
@@ -33,14 +33,16 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      # The Rust toolchain and its cache are for the Rust tools of a v0.0.* tag alone: fibc (v0.1 and later) links LLVM itself and builds no Rust.
       - name: Install stable toolchain
+        if: startsWith(env.TAG, 'v0.0.')
         timeout-minutes: 10
         run: |
           rustup update stable
           rustup default stable
 
-      # As ci.yml's lair job: LLVM 21 from apt.llvm.org, its development package, Polly's archives and the system libraries llvm-sys
-      # links statically.
+      # LLVM 21 from apt.llvm.org and its development package: the static archives scripts/package.sh links into fibc (scripts/llvm-static.sh).
+      # (llvm-sys of the v0.0.* Rust tools also wants Polly's archives.)
       - name: Install LLVM 21
         timeout-minutes: 15
         run: |
@@ -51,6 +53,7 @@ jobs:
           /usr/lib/llvm-21/bin/llvm-config --version
 
       - uses: Swatinem/rust-cache@v2
+        if: startsWith(env.TAG, 'v0.0.')
         timeout-minutes: 10
         with:
           prefix-key: release
