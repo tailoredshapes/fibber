@@ -1,13 +1,82 @@
-;; compiler/native/lower/calls.fib: calls and terminators (crates/lair/src/lower/calls.rs). OWNER: package L2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/lower/calls.fib: calls and terminators (crates/lair/src/lower/calls.rs). OWNER: package L2.
 
 (ns native.lower.calls
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.types native.lower.consts)
+  (:require [llvm.core :as core]))
 
+
+;; The operands `es`, lowered left to right.
+(defun fx-vals (fx: Fx es: (Vec LExpr)) -> (Result (Vec i64) LairError)
+  (loop ((i 0) (acc []))
+    (if (>= i (count es))
+        (Ok acc)
+        (match (fx-val fx (nth es i))
+          ((Ok v) (recur (+ i 1) (conj acc v)))
+          ((Err x) (Err x))))))
+
+;; The LLVM block of a label of the function being lowered. (calls.rs `block`)
+(defun fx-block :private (fx: Fx label: str) -> (Result i64 LairError)
+  (if-some (i (get (. fx labels) label))
+    (Ok (nth (. fx blocks) i))
+    (Err (ErrInternal (str "unknown label " label)))))
+
+;; The callee's value and type: a direct callee is a function of the module, an indirect one an operand.
+(defun call-callee :private (fx: Fx callee: LCallee) -> (Result FuncEntry LairError)
+  (match callee
+    ((CalDirect g)
+     (if-some (fe (get @(. (. fx lx) funcs) g))
+       (Ok fe)
+       (Err (ErrInternal (str "unknown function @" g)))))
+    ((CalIndirect p ty)
+     (try-let ((f (fx-val fx p)))
+       (Ok (FuncEntry f ty))))))
+
+;; A tail call is `musttail` followed by `ret` (spec/lir.md 7.3).
+(defun finish-tail :private (fx: Fx c: i64 ty: LFnType) -> unit
+  (unsafe
+    (do (core/LLVMSetTailCallKind c 2i32)
+        (match (. ty ret)
+          ((some _) (core/LLVMBuildRet (. fx b) c))
+          (nil (core/LLVMBuildRetVoid (. fx b))))
+        ())))
 
 ;; A call, tail or not; nil for a void result. (calls.rs `Fx::call`)
 (defun lower-call (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
-  (trap "todo: native.lower.calls lower-call"))
+  (match (. e kind)
+    ((KCall callee args tail)
+     (try-let ((fe (call-callee fx callee))
+               (vals (fx-vals fx args)))
+       (let ((ty (. fe ty))
+             (fty (lx-fn-ty (. fx lx) ty))
+             (c (core/build-call (. fx b) fty (. fe value) vals "")))
+         (do (unsafe (core/LLVMSetInstructionCallConv c (trunc i32 (cc-number (. ty cc)))))
+             (cond (not tail) (Ok (match (. ty ret) ((some _) (some c)) (nil nil)))
+                   :else (do (finish-tail fx c ty) (Ok nil)))))))
+    (_ (Err (ErrInternal "not a call")))))
 
-;; `ret br condbr switch unreachable`. (calls.rs `control`)
+(defun lower-switch :private (fx: Fx v: LExpr d: str cases: (Vec LCase)) -> (Result unit LairError)
+  (try-let ((val (fx-val fx v))
+            (db (fx-block fx d)))
+    (let ((sw (unsafe (core/LLVMBuildSwitch (. fx b) val db (trunc i32 (count cases))))))
+      (loop ((i 0))
+        (if (>= i (count cases))
+            (Ok ())
+            (let ((c (nth cases i)))
+              (try-let ((cv (lx-constant (. fx lx) (. c value)))
+                        (bb (fx-block fx (. c label))))
+                (do (unsafe (core/LLVMAddCase sw cv bb))
+                    (recur (+ i 1))))))))))
+
+;; `ret`, `br`, `condbr`, `switch`, `unreachable`. (calls.rs `control`)
 (defun lower-control (fx: Fx e: LExpr) -> (Result unit LairError)
-  (trap "todo: native.lower.calls lower-control"))
+  (let ((b (. fx b)))
+    (match (. e kind)
+      ((KRet (some v)) (try-let ((x (fx-val fx v))) (do (unsafe (core/LLVMBuildRet b x)) (Ok ()))))
+      ((KRet nil) (do (unsafe (core/LLVMBuildRetVoid b)) (Ok ())))
+      ((KBr l) (try-let ((bb (fx-block fx l))) (do (unsafe (core/LLVMBuildBr b bb)) (Ok ()))))
+      ((KCondBr c t f)
+       (try-let ((cv (fx-val fx c)) (tb (fx-block fx t)) (fb (fx-block fx f)))
+         (do (unsafe (core/LLVMBuildCondBr b cv tb fb)) (Ok ()))))
+      ((KSwitch v d cases) (lower-switch fx v d cases))
+      ((KUnreachable) (do (unsafe (core/LLVMBuildUnreachable b)) (Ok ())))
+      (_ (Err (ErrInternal (str "not a terminator at " (pos-str (. e pos)))))))))

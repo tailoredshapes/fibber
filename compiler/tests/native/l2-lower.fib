@@ -1,0 +1,176 @@
+;; compiler/tests/native/l2-lower.fib: package L2's test: modules built by hand as ASTs (no reader), lowered by `native.lower/lower`, printed, and compared
+;; with the text `lair emit-llvm` gives for the same program written as lIR (compiler/tests/native/l2/NAME.lir and its golden NAME.ll, made by
+;; `target/debug/lair emit-llvm compiler/tests/native/l2/NAME.lir > compiler/tests/native/l2/NAME.ll`, run from the repository root).
+;; The triple and the data layout are read from the golden itself; the module name is the path of the .lir file, as `lair` names it.
+;;
+;; Build (from the repository root; the library of this tree, a seed fibc, LLVM 21 shared):
+;;   FIB_LIB=lib fibc build compiler/tests/native/l2-lower.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o OUT
+;; Run from the repository root: `OUT`. Prints one line per module, and `l2-lower: ok` (exit 0) when every module matches, else the first
+;; differing line of each failure (exit 1).
+(ns main
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.owned native.lower)
+  (:require [fib.string :as s]))
+
+(defun ex (k: LKind) -> LExpr (expr-new k 0))
+(defun lc (n: str) -> LExpr (ex (KLocal n)))
+(defun i64n (n: i64) -> LExpr (ex (KInt ty-i64 (lit-of n))))
+(defun i32n (n: i64) -> LExpr (ex (KInt ty-i32 (lit-of n))))
+(defun bd (n: str v: LExpr) -> LBinding (LBinding n v 0))
+(defun blk (label: str body: (Vec LExpr)) -> LBlock (LBlock label body 0))
+(defun bin (op: LBinOp a: LExpr b: LExpr) -> LExpr (ex (KBin op a b)))
+(defun ret (v: LExpr) -> LExpr (ex (KRet (some v))))
+(defun lets (binds: (Vec LBinding) body: (Vec LExpr)) -> LExpr (ex (KLet binds body)))
+
+;; A function item: convention, result, parameters as (name, type), blocks.
+(defun fdef (name: str cc: LCc ret: (Option LType) names: (Vec str) tys: (Vec LType) blocks: (Vec LBlock)) -> LItem
+  (ItDefine (LFunction name (LFnType cc ret tys false) (vec (map (fn (n: str) (LParam n 0)) names)) blocks (LModifiers lk-external false) 0)))
+
+(defun arith-module () -> LModule
+  (LModule
+    [(fdef "f" cc-c (some ty-i64) ["x" "y"] [ty-i64 ty-i64]
+       [(blk "entry"
+          [(lets [(bd "a" (bin BAdd (lc "x") (lc "y")))
+                  (bd "c" (ex (KICmp ISlt (lc "a") (lc "y"))))
+                  (bd "s" (ex (KSelect (lc "c") (lc "a") (lc "y"))))]
+                 [(ret (lc "s"))])])])]))
+
+(defun memory-module () -> LModule
+  (LModule
+    [(fdef "g" cc-c (some ty-i64) ["p" "n"] [ty-ptr ty-i64]
+       [(blk "entry"
+          [(lets [(bd "a" (ex (KAlloca ty-i64 nil (some 16))))
+                  (bd "q" (ex (KGep true ty-i64 (lc "p") [(lc "n")])))]
+                 [(ex (KStore (i64n 7) (lc "a") false nil))
+                  (ex (KStore (lc "n") (lc "q") true nil))
+                  (ex (KAtomicStore sc-system OSeqCst (lc "n") (lc "p")))
+                  (lets [(bd "l" (ex (KAtomicLoad sc-system OAcquire ty-i64 (lc "p"))))
+                         (bd "r" (ex (KAtomicRmw RAdd sc-system OSeqCst (lc "p") (lc "l"))))
+                         (bd "c" (ex (KCmpXchg true sc-system OSeqCst OMonotonic (lc "p") (lc "r") (lc "n"))))]
+                        [(ex (KFence sc-system OSeqCst))
+                         (ret (bin BAdd (ex (KLoad ty-i64 (lc "a") false nil)) (ex (KExtractValue (lc "c") [(lit-of 0)]))))])])])])]))
+
+(defun inc (label: str v: LExpr) -> LBinding (bd label v))
+
+(defun sum-fn () -> LItem
+  (fdef "sum" cc-c (some ty-i64) ["n"] [ty-i64]
+    [(blk "entry" [(ex (KBr "loop"))])
+     (blk "loop"
+       [(lets [(bd "i" (ex (KPhi ty-i64 [(inc "entry" (i64n 1)) (inc "loop" (lc "i2"))])))
+               (bd "acc" (ex (KPhi ty-i64 [(inc "entry" (i64n 0)) (inc "loop" (lc "acc2"))])))
+               (bd "acc2" (bin BAdd (lc "acc") (lc "i")))
+               (bd "i2" (bin BAdd (lc "i") (i64n 1)))]
+              [(ex (KCondBr (ex (KICmp ISle (lc "i2") (lc "n"))) "loop" "exit"))])])
+     (blk "exit" [(ret (lc "acc2"))])]))
+
+(defun sw-fn () -> LItem
+  (fdef "sw" cc-c (some ty-i32) ["k"] [ty-i32]
+    [(blk "entry" [(ex (KSwitch (lc "k") "other" [(LCase (i32n 0) "zero") (LCase (i32n 1) "one") (LCase (i32n -5) "neg")]))])
+     (blk "zero" [(ret (i32n 100))])
+     (blk "one" [(ret (i32n 200))])
+     (blk "neg" [(ret (i32n 300))])
+     (blk "other" [(ret (i32n -1))])]))
+
+(defun both-fn () -> LItem
+  (fdef "both" cc-c (some ty-i32) ["c"] [ty-i1]
+    [(blk "entry" [(ex (KCondBr (lc "c") "j" "j"))])
+     (blk "j" [(ret (ex (KPhi ty-i32 [(inc "entry" (i32n 4))])))])]))
+
+(defun count-fn () -> LItem
+  (fdef "count" cc-c (some ty-i64) ["n" "acc"] [ty-i64 ty-i64]
+    [(blk "entry" [(ex (KCondBr (ex (KICmp IEq (lc "n") (i64n 0))) "done" "more"))])
+     (blk "done" [(ret (lc "acc"))])
+     (blk "more"
+       [(ex (KCall (CalDirect "count") [(bin BSub (lc "n") (i64n 1)) (bin BAdd (lc "acc") (i64n 1))] true))])]))
+
+(defun step-fn () -> LItem
+  (fdef "step" cc-tail (some ty-i64) ["self" "n"] [ty-ptr ty-i64]
+    [(blk "entry"
+       [(ex (KCall (CalIndirect (lc "self") (LFnType cc-tail (some ty-i64) [ty-ptr ty-i64] false)) [(lc "self") (lc "n")] true))])]))
+
+(defun nothing-fn () -> LItem
+  (fdef "nothing" cc-c nil [] []
+    [(blk "entry" [(ex kind-trap) (ex (KCall (CalDirect "nothing") [] false)) (ex kind-unreachable)])]))
+
+(defun control-module () -> LModule
+  (LModule [(sum-fn) (sw-fn) (both-fn) (count-fn) (step-fn) (nothing-fn)]))
+
+;; casts, floats, vectors, aggregates, intrinsics and a call with a string: the cases that are not memory or control.
+(defun cst (op: LCastOp ty: LType v: LExpr) -> LExpr (ex (KCast op ty v)))
+(defun idx (n: i64) -> (Vec LLit) [(lit-of n)])
+
+(defun misc-binds () -> (Vec LBinding)
+  (let ((v4 (TVector 4 ty-i32))
+        (pair (TAnon [ty-i64 ty-i8])))
+    [(bd "n" (ex (KUn UFNeg (lc "d"))))
+     (bd "c" (ex (KFCmp FOlt (lc "d") (lc "n"))))
+     (bd "p" (ex (KUn UCtpop (lc "w"))))
+     (bd "o" (ex (KOverflow OvSAdd (lc "w") (lc "w"))))
+     (bd "s" (cst CFpToSiSat ty-i64 (lc "d")))
+     (bd "u" (cst CFpToUiSat ty-i8 (lc "d")))
+     (bd "e" (ex (KExtractElement (lc "v") (i32n 0))))
+     (bd "iv" (ex (KInsertElement (lc "v") (lc "e") (i32n 1))))
+     (bd "sh" (ex (KShuffle (lc "v") (lc "iv") (ex (KVector v4 [(i32n 3) (i32n 7) (i32n 0) (i32n 4)])))))
+     (bd "z" (cst CZExt ty-i64 (lc "e")))
+     (bd "st" (ex (KStruct nil [(lc "w") (ex (KInt ty-i8 (lit-of 1)))])))
+     (bd "ar" (ex (KArray (TArray 2 ty-i64) [(lc "w") (lc "z")])))
+     (bd "iv2" (ex (KInsertValue (lc "st") (ex (KInt ty-i8 (lit-of 5))) (idx 1))))
+     (bd "ar2" (ex (KInsertValue (lc "ar") (lc "w") (idx 1))))
+     (bd "k" (ex (KSelect (lc "c") (ex (KExtractValue (lc "o") (idx 0))) (ex (KExtractValue (lc "ar2") (idx 1))))))
+     (bd "zz" (ex (KZero pair)))
+     (bd "t" (ex (KCall (CalDirect "puts") [(ex (KStr (str-bytes "hi")))] false)))
+     (bd "b" (cst CBitcast ty-i64 (lc "d")))
+     (bd "tr" (cst CTrunc ty-i8 (lc "w")))
+     (bd "f" (cst CSiToFp ty-double (lc "w")))
+     (bd "pp" (cst CIntToPtr ty-ptr (lc "w")))
+     (bd "q" (cst CPtrToInt ty-i64 (lc "pp")))]))
+
+(defun misc-sum () -> LExpr
+  (bin BAdd (lc "k")
+    (bin BAdd (ex (KExtractValue (lc "iv2") (idx 0)))
+      (bin BAdd (ex (KExtractValue (lc "zz") (idx 0)))
+        (bin BAdd (lc "z")
+          (bin BAdd (lc "b")
+            (bin BAdd (cst CZExt ty-i64 (lc "u")) (lc "q"))))))))
+
+(defun misc-module () -> LModule
+  (LModule
+    [(ItDeclare (LDeclare "puts" (LFnType cc-c (some ty-i32) [ty-ptr] false) false 0))
+     (fdef "m" cc-c (some ty-i64) ["d" "v" "w"] [ty-double (TVector 4 ty-i32) ty-i64]
+       [(blk "entry" [(lets (misc-binds) [(ret (misc-sum))])])])]))
+
+;; The text between `prefix` and the next quote: `target triple = "X"` gives X.
+(defun quoted-after (text: str prefix: str) -> str
+  (match (str-find text prefix 0)
+    (nil "")
+    ((some i)
+     (let ((start (+ i (str-len prefix))))
+       (match (str-find text "\"" start)
+         (nil "")
+         ((some j) (str-slice text start j)))))))
+
+;; The line numbers and text of the first difference of two texts.
+(defun first-diff (a: str b: str) -> str
+  (let ((la (s/split a "\n")) (lb (s/split b "\n")))
+    (loop ((i 0))
+      (cond (and (>= i (count la)) (>= i (count lb))) "no difference"
+            (or (>= i (count la)) (>= i (count lb)) (!= (nth la i) (nth lb i)))
+            (str "line " (+ i 1) ": want [" (if (< i (count la)) (nth la i) "<end>") "] got [" (if (< i (count lb)) (nth lb i) "<end>") "]")
+            :else (recur (+ i 1))))))
+
+;; 0 when the module lowers to the golden's text, 1 otherwise (with the reason printed).
+(defun check-module (name: str m: LModule) -> i64
+  (let ((lir (str "compiler/tests/native/l2/" name ".lir")))
+    (match (read-file (str "compiler/tests/native/l2/" name ".ll"))
+      (nil (do (println (str name ": no golden")) 1))
+      ((some want)
+       (match (lower m lir (quoted-after want "target triple = \"") (quoted-after want "target datalayout = \""))
+         ((Err e) (do (println (str name ": " (lair-error-str e))) 1))
+         ((Ok o)
+          (let ((got (owned-ir o)))
+            (do (owned-dispose o)
+                (if (= got want) (do (println (str name ": same")) 0) (do (println (str name ": DIFF " (first-diff want got))) 1))))))))))
+
+(defun main () -> i64
+  (let ((bad (+ (check-module "arith" (arith-module)) (check-module "memory" (memory-module)) (check-module "control" (control-module)) (check-module "misc" (misc-module)))))
+    (do (println (if (= bad 0) "l2-lower: ok" (str "l2-lower: " bad " failed")))
+        bad)))

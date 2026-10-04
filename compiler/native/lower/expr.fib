@@ -1,15 +1,150 @@
-;; compiler/native/lower/expr.fib: lowering expressions: the dispatcher over the forms (crates/lair/src/lower/expr.rs). OWNER: package L2. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/lower/expr.fib: lowering expressions: the dispatcher over the forms (crates/lair/src/lower/expr.rs). OWNER: package L2.
 
-;; The value of the `expr` field of `Fx`. Its helpers (`let_form`, `struct_value`, `aggregate_value`, `insert_all`) are private to the owner.
+;; The value of the `expr` field of `Fx`. Its helpers (`let_form`, `struct_value`, `aggregate_value`, `insert_all`) are private.
+;; `const-expr?` is `lir.check.walk/constant?` written again here (five lines) so that the lowering does not load the checker.
 
 (ns native.lower.expr
-  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx))
+  (:use lir.diag lir.types lir.lit lir.ast native.error native.lower.lx native.lower.types native.lower.consts
+        native.lower.build native.lower.arith native.lower.calls native.lower.memory)
+  (:require [llvm.ffi :as ffi] [llvm.core :as core]))
 
 
-;; Names an LLVM value, as lIR names its locals. (expr.rs `name_value`)
+;; Names an LLVM value, as lIR names its locals: a constant keeps its (absent) name, and so does a value that has one. (expr.rs `name_value`)
 (defun name-value (v: i64 name: str) -> unit
-  (trap "todo: native.lower.expr name-value"))
+  (if (!= (unsafe (core/LLVMIsConstant v)) 0i32)
+      ()
+      (let ((slot (ffi/slot-new))
+            (nm (ffi/bytes-new name)))
+        (unsafe
+          (do (core/LLVMGetValueName2 v slot)
+              (if (= (load-i64 slot) 0) (core/LLVMSetValueName2 v nm (str-len name)) ())
+              (free slot)
+              (free nm))))))
 
-;; Lowers `e`; nil is a void form. (expr.rs `Fx::expr`)
+;; A constant written in place (expr.rs `is_constant`).
+(defun const-expr? :private (e: LExpr) -> bool
+  (match (. e kind)
+    ((KInt _ _) true)
+    ((KFloat _ _) true)
+    ((KNull) true)
+    ((KVector _ _) true)
+    ((KStr _) true)
+    ((KGlobal _) true)
+    ((KZero _) true)
+    ((KStruct _ fs) (all-const? fs))
+    ((KArray _ fs) (all-const? fs))
+    (_ false)))
+
+(defun all-const? :private (es: (Vec LExpr)) -> bool
+  (loop ((i 0))
+    (cond (>= i (count es)) true
+          (not (const-expr? (nth es i))) false
+          :else (recur (+ i 1)))))
+
+;; `insertvalue` of each element into a poison value of type `ty`. (expr.rs `insert_all`)
+(defun insert-all :private (fx: Fx ty: i64 vals: (Vec i64)) -> i64
+  (loop ((i 0) (agg (unsafe (core/LLVMGetPoison ty))))
+    (if (>= i (count vals))
+        agg
+        (recur (+ i 1) (b-insert-value (. fx b) agg (nth vals i) i)))))
+
+;; A named struct or array value: a constant, or `insertvalue`s of its elements into a value of type `ty`. (expr.rs `aggregate_value`)
+(defun aggregate-value :private (fx: Fx e: LExpr ty: i64 elems: (Vec LExpr)) -> (Result i64 LairError)
+  (if (all-const? elems)
+      (lx-constant (. fx lx) e)
+      (try-let ((vals (fx-vals fx elems)))
+        (Ok (insert-all fx ty vals)))))
+
+(defun struct-value :private (fx: Fx e: LExpr name: (Option str) fields: (Vec LExpr)) -> (Result i64 LairError)
+  (match name
+    ((some n)
+     (if-some (ty (get @(. (. fx lx) structs) n))
+       (aggregate-value fx e ty fields)
+       (Err (ErrInternal (str "unknown struct " n)))))
+    (nil
+     (if (all-const? fields)
+         (lx-constant (. fx lx) e)
+         (try-let ((vals (fx-vals fx fields)))
+           (let ((ts (vec (map (fn (v: i64) (unsafe (core/LLVMTypeOf v))) vals)))
+                 (ty (struct-type (. (. fx lx) ctx) ts)))
+             (Ok (insert-all fx ty vals))))))))
+
+(defun let-form :private (fx: Fx binds: (Vec LBinding) body: (Vec LExpr)) -> (Result (Option i64) LairError)
+  (match (let-bind fx binds)
+    ((Err x) (Err x))
+    ((Ok _)
+     (loop ((i 0) (last nil))
+       (if (>= i (count body))
+           (Ok last)
+           (match (fx-expr fx (nth body i))
+             ((Ok v) (recur (+ i 1) v))
+             ((Err x) (Err x))))))))
+
+(defun let-bind :private (fx: Fx binds: (Vec LBinding)) -> (Result unit LairError)
+  (loop ((i 0))
+    (if (>= i (count binds))
+        (Ok ())
+        (let ((bd (nth binds i)))
+          (match (fx-val fx (. bd value))
+            ((Err x) (Err x))
+            ((Ok v) (do (name-value v (. bd name))
+                        (set! (. fx names) (assoc @(. fx names) (. bd name) v))
+                        (recur (+ i 1)))))))))
+
+(defun lower-phi :private (fx: Fx t: LType inc: (Vec LBinding)) -> (Result (Option i64) LairError)
+  (let ((ty (lx-ty (. fx lx) t))
+        (n (ffi/bytes-new "")))
+    (let ((phi (unsafe (let ((p (core/LLVMBuildPhi (. fx b) ty n))) (do (free n) p)))))
+      (do (set! (. fx phis) (conj @(. fx phis) (PhiFix phi inc)))
+          (Ok (some phi))))))
+
+(defun lower-local :private (fx: Fx n: str) -> (Result (Option i64) LairError)
+  (if-some (v (get @(. fx names) n))
+    (Ok (some v))
+    (Err (ErrInternal (str "name " n " not lowered")))))
+
+;; Memory forms and arithmetic, the dispatcher's tail.
+(defun lower-rest :private (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
+  (match (. e kind)
+    ((KAlloca _ _ _) (lower-memory fx e))
+    ((KLoad _ _ _ _) (lower-memory fx e))
+    ((KStore _ _ _ _) (lower-memory fx e))
+    ((KGep _ _ _ _) (lower-memory fx e))
+    ((KAtomicLoad _ _ _ _) (lower-memory fx e))
+    ((KAtomicStore _ _ _ _) (lower-memory fx e))
+    ((KAtomicRmw _ _ _ _ _) (lower-memory fx e))
+    ((KCmpXchg _ _ _ _ _ _ _) (lower-memory fx e))
+    ((KFence _ _) (lower-memory fx e))
+    (_ (match (lower-arith fx e)
+         ((Ok v) (Ok (some v)))
+         ((Err x) (Err x))))))
+
+(defun some-of :private (r: (Result i64 LairError)) -> (Result (Option i64) LairError)
+  (match r ((Ok v) (Ok (some v))) ((Err x) (Err x))))
+
+(defun void-of :private (r: (Result unit LairError)) -> (Result (Option i64) LairError)
+  (match r ((Ok _) (Ok nil)) ((Err x) (Err x))))
+
+;; Lowers `e`; nil is a void form or a terminator. (expr.rs `Fx::expr`)
 (defun lower-expr (fx: Fx e: LExpr) -> (Result (Option i64) LairError)
-  (trap "todo: native.lower.expr lower-expr"))
+  (match (. e kind)
+    ((KLocal n) (lower-local fx n))
+    ((KGlobal _) (some-of (lx-constant (. fx lx) e)))
+    ((KInt _ _) (some-of (lx-constant (. fx lx) e)))
+    ((KFloat _ _) (some-of (lx-constant (. fx lx) e)))
+    ((KNull) (some-of (lx-constant (. fx lx) e)))
+    ((KZero _) (some-of (lx-constant (. fx lx) e)))
+    ((KVector _ _) (some-of (lx-constant (. fx lx) e)))
+    ((KStr bytes) (Ok (some (lx-string (. fx lx) bytes))))
+    ((KStruct name fields) (some-of (struct-value fx e name fields)))
+    ((KArray t elems) (some-of (aggregate-value fx e (lx-ty (. fx lx) t) elems)))
+    ((KTrap) (void-of (lower-trap fx)))
+    ((KLet binds body) (let-form fx binds body))
+    ((KPhi t inc) (lower-phi fx t inc))
+    ((KCall _ _ _) (lower-call fx e))
+    ((KRet _) (void-of (lower-control fx e)))
+    ((KBr _) (void-of (lower-control fx e)))
+    ((KCondBr _ _ _) (void-of (lower-control fx e)))
+    ((KSwitch _ _ _) (void-of (lower-control fx e)))
+    ((KUnreachable) (void-of (lower-control fx e)))
+    (_ (lower-rest fx e))))
