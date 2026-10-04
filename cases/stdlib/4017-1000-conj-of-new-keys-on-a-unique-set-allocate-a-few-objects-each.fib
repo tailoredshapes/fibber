@@ -1,0 +1,19 @@
+;; spec:   design/in-place-update.md §6 T9 (counts), stdlib §2.5
+;; expect: accept
+;; result: 1007
+;; audit:  clean
+;; allocs: <= 2555
+;; roots:  ../../lib support
+;; covers: conj contains?
+;; A Set built by 1000 `conj` of new keys, held by one name, then 7 probes. `conj` takes the Set's map out of its shell with a
+;; constructor pattern, so the map is unique inside `map-assoc` and every level of the trie is updated in place; with the map read
+;; by `(. self m)` the field was held twice, and each conj copied the path from the root (7696 objects in all). The bound is
+;; the figure counted with `fibc run --trace` (2555 in all); a conj that copies the path again fails it.
+(ns main (:use fib.core fib.seq fib.coll))
+
+(defun fill (n: i64) -> (Set i64)
+  (loop ((k 0) (s (set-empty))) (if (< k n) (recur (+ k 1) (conj s (rem (* k 7919) 1000003))) s)))
+
+(defun main () -> i64
+  (let ((s (fill 1000)))
+    (+ (count s) (loop ((i 0) (hits 0)) (if (< i 7) (recur (+ i 1) (if (contains? s (* i 7919)) (+ hits 1) hits)) hits)))))

@@ -393,13 +393,18 @@
 ;; and this the one that stays a hash trie at any size.
 (defun map-empty-hashed () MapEmpty)
 
-;; items with x inserted at i, and with element i removed.
+;; items with x inserted at i. The elements move: array-take! leaves a null in a unique items (a shared one is copied first, as the
+;; protocol says), so no element's count is touched (the copy that retained every element and the drop of items that released them
+;; touched each element's header: a cache miss a child in a large trie).
 (defun array-insert :private (items: (Array a) i: i64 x: a) -> (Array a)
   (let ((n (array-len items))
+        (src (cell items))
         (c (cell (array (+ n 1) x))))
-    (dotimes (j i) (array-set! &c j (array-get items j)))
-    (dotimes (j (- n i)) (array-set! &c (+ i (+ j 1)) (array-get items (+ i j))))
+    (dotimes (j i) (array-set! &c j (array-take! &src j)))
+    (dotimes (j (- n i)) (array-set! &c (+ i (+ j 1)) (array-take! &src (+ i j))))
     @c))
+
+;; items with element i removed.
 
 (defun array-remove :private (items: (Array a) i: i64) -> (Array a)
   (let ((n (array-len items))
@@ -558,7 +563,7 @@
 
 (defun set-empty () (Set MapEmpty))
 (defun set-contains? (s: (Set k) x: k) -> bool (contains? (. s m) x))
-(defun disj (s: (Set k) x: k) -> (Set k) (Set (dissoc (. s m) x)))
+(defun disj (s: (Set k) x: k) -> (Set k) (match s ((Set m) (Set (dissoc m x)))))
 
 ;; The number of elements.
 (defun set-count (s: (Set k)) -> i64 (map-count (. s m)))
