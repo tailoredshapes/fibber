@@ -1,0 +1,364 @@
+;; compiler/tests/native/c-checks.fib: the checks of package C's test of native.call (c-call.fib and c-call-orc.fib are its two mains): a module of functions of 0 to 8 integer-class and 0 to 8 double
+;; arguments, in several mixes, JIT-compiled, and called through the shim; a deep recursion on a big stack; a trap; the mailbox.
+;;
+;;   (main) all SELF      every check, one line each (`ok NAME` or `FAIL NAME: ...`), exit status 0 when all are ok
+;;   (main) trap KIND     calls a function that traps (`boom`, llvm.trap) or aborts (`die`, abort(3)); never returns
+;;
+;; SELF is the path of this executable: the check of the trap runs it again as a child, whose death by a signal it reads from `system`.
+;; Build: compiler/tests/native/c-call.sh (needs liblair.so for the JIT session of the module under test, until native.api lands).
+(ns c-checks
+  (:require [llvm.ffi :as ffi] [native.call :as call]))
+
+(extern system :private (ptr) -> i32)
+
+(def module-lir: str
+  "(declare abort void ())
+(define (f0 i64) () (block entry (ret (i64 42))))
+(define (f1 i64) ((i64 a)) (block entry (ret (mul a (i64 3)))))
+(define (f2 double) ((i64 a) (double b)) (block entry (ret (fmul (sitofp double a) b))))
+(define (f3 i64) ((ptr p) (i64 n) (double d))
+  (block entry (ret (add (add (load i64 p) n) (fptosi i64 d)))))
+(define (f4 double) ((double a) (i64 b) (double c) (i64 d))
+  (block entry (ret (fadd (fadd a c) (sitofp double (add b (mul d (i64 10))))))))
+(define (f5 i64) ((i64 a) (ptr b) (i64 c) (double d) (i64 e))
+  (block entry
+    (ret (add (add (add a (mul (load i64 b) (i64 10))) (add (mul c (i64 100)) (mul (fptosi i64 d) (i64 1000))))
+              (mul e (i64 10000))))))
+(define (f6 double) ((i64 a) (double b) (i64 c) (double d) (ptr e) (i64 f))
+  (block entry
+    (ret (fadd (fadd (fadd (sitofp double a) (fmul b (double 2.0))) (fadd (fmul (sitofp double c) (double 3.0)) (fmul d (double 4.0))))
+               (fadd (fmul (sitofp double (load i64 e)) (double 5.0)) (fmul (sitofp double f) (double 6.0)))))))
+(define (f8 i64) ((i64 a) (i64 b) (i64 c) (i64 d) (i64 e) (i64 f) (i64 g) (i64 h))
+  (block entry
+    (ret (add (add (add a (mul b (i64 2))) (add (mul c (i64 3)) (mul d (i64 4))))
+              (add (add (mul e (i64 5)) (mul f (i64 6))) (add (mul g (i64 7)) (mul h (i64 8))))))))
+(define (d8 double) ((double a) (double b) (double c) (double d) (double e) (double f) (double g) (double h))
+  (block entry
+    (ret (fadd (fadd (fadd a (fmul b (double 2.0))) (fadd (fmul c (double 3.0)) (fmul d (double 4.0))))
+               (fadd (fadd (fmul e (double 5.0)) (fmul f (double 6.0))) (fadd (fmul g (double 7.0)) (fmul h (double 8.0))))))))
+(define (m16 double) ((i64 a) (double x) (i64 b) (double y) (i64 c) (double z) (i64 d) (double w)
+                      (i64 e) (double v) (i64 f) (double u) (i64 g) (double t) (i64 h) (double s))
+  (block entry
+    (let ((ints (call @sumi a b c d e f g h))
+          (dbls (call @sumd x y z w v u t s)))
+      (ret (fadd (sitofp double ints) dbls)))))
+(define (sumi i64) ((i64 a) (i64 b) (i64 c) (i64 d) (i64 e) (i64 f) (i64 g) (i64 h))
+  (block entry
+    (ret (add (add (add a (mul b (i64 2))) (add (mul c (i64 3)) (mul d (i64 4))))
+              (add (add (mul e (i64 5)) (mul f (i64 6))) (add (mul g (i64 7)) (mul h (i64 8))))))))
+(define (sumd double) ((double a) (double b) (double c) (double d) (double e) (double f) (double g) (double h))
+  (block entry
+    (ret (fadd (fadd (fadd a (fmul b (double 2.0))) (fadd (fmul c (double 3.0)) (fmul d (double 4.0))))
+               (fadd (fadd (fmul e (double 5.0)) (fmul f (double 6.0))) (fadd (fmul g (double 7.0)) (fmul h (double 8.0))))))))
+(define (next ptr) ((ptr p)) (block entry (ret (getelementptr i64 p (i64 1)))))
+(define (n32 i32) ((i32 a)) (block entry (ret (add a (i32 1)))))
+(define (unit void) ((ptr p)) (block entry (store (i64 99) p) (ret)))
+(define (deep i64) ((i64 n))
+  (block entry (br (icmp eq n (i64 0)) done again))
+  (block again
+    (let ((pad (alloca i8 (i64 4096))))
+      (store volatile (i8 1) pad)
+      (ret (add (call @deep (sub n (i64 1))) (i64 1)))))
+  (block done (ret (i64 0))))
+(define (boom i64) () (block entry (trap) (unreachable)))
+(define (die i64) () (block entry (call @abort) (unreachable)))")
+
+;; The checks are over lookup functions, `(fn (str) i64)`: the address of the named function of the module under test, so that the same
+;; checks run over a lair.jit session (c-call.fib) and over an ORC one (c-call-orc.fib).
+;; ------------------------------------------------------------------------------------------ the checks
+
+;; One line per check; the count of failures is the exit status.
+(defstruct Tally (failed: (Cell i64)))
+
+(defun tally-new () -> Tally (Tally (cell 0)))
+
+(defun say :private (t: Tally ok: bool name: str detail: str) -> unit
+  (if ok
+      (println (str-concat "ok " name))
+      (do (set! (. t failed) (+ @(. t failed) 1))
+          (println (str-join ["FAIL " name ": " detail])))))
+
+(defun expect-i64 :private (t: Tally name: str got: (Result i64 str) want: i64) -> unit
+  (match got
+    ((Ok v) (say t (= v want) name (str-join ["got " (show v) ", want " (show want)])))
+    ((Err m) (say t false name m))))
+
+(defun expect-f64 :private (t: Tally name: str got: (Result f64 str) want: f64) -> unit
+  (match got
+    ((Ok v) (say t (= v want) name (str-join ["got " (show v) ", want " (show want)])))
+    ((Err m) (say t false name m))))
+
+(defun expect-err :private (t: Tally name: str got: (Result i64 str) want: str) -> unit
+  (match got
+    ((Ok v) (say t false name (str-concat "no error, got " (show v))))
+    ((Err m) (say t (= m want) name (str-join ["got \"" m "\", want \"" want "\""])))))
+
+(defun low32 :private (w: i64) -> i64 (bit-and w 4294967295))
+
+;; The address of the function `name` of the module a lookup function serves (a trap when it has none: the module is the test's own).
+(defun entry (e: (fn (str) i64) name: str) -> i64
+  (e name))
+
+;; A block of 4 words, for the pointer arguments: 1000 2000 3000 4000.
+(defun words-block :private () -> i64
+  (ffi/ptr->addr (ffi/words-new [1000 2000 3000 4000])))
+
+(defun arities (t: Tally e: (fn (str) i64)) -> unit
+  (let ((p (words-block)))
+    (do (expect-i64 t "0 arguments" (call/call-i64 (entry e "f0") []) 42)
+        (expect-i64 t "1 integer" (call/call-i64 (entry e "f1") [14]) 42)
+        (expect-f64 t "i64 double -> double" (call/call-mixed-f64 (entry e "f2") [7] [0.5]) 3.5)
+        (expect-i64 t "ptr i64 double -> i64" (call/call-mixed (entry e "f3") [p 20] [3.75]) 1023)
+        (expect-f64 t "double i64 double i64 -> double" (call/call-mixed-f64 (entry e "f4") [5 6] [0.25 0.5]) 65.75)
+        (expect-i64 t "i64 ptr i64 double i64 (5 mixed)" (call/call-mixed (entry e "f5") [1 p 3 5] [4.5])
+                    (+ (+ 1 10000) (+ 300 (+ 4000 50000))))
+        (expect-f64 t "i64 double i64 double ptr i64 (6 mixed) -> double"
+                    (call/call-mixed-f64 (entry e "f6") [1 3 p 6] [0.5 0.25]) 5048.0)
+        (expect-i64 t "8 integers (two on the stack)" (call/call-i64 (entry e "f8") [1 2 3 4 5 6 7 8]) 204)
+        (expect-f64 t "8 doubles" (call/call-mixed-f64 (entry e "d8") [] [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0]) 204.0)
+        (expect-f64 t "8 integers and 8 doubles interleaved"
+                    (call/call-mixed-f64 (entry e "m16") [1 2 3 4 5 6 7 8] [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0]) 408.0)
+        (expect-i64 t "pointer result" (call/call-i64 (entry e "next") [p]) (+ p 8))
+        (expect-i64 t "i32 result, masked" (let ((r (call/call-i64 (entry e "n32") [41]))) (match r ((Ok v) (Ok (low32 v))) ((Err m) (Err m)))) 42)
+        (expect-i64 t "void result: the effect" (do (call/call-i64 (entry e "unit") [p]) (Ok (unsafe (load-i64 (ffi/addr->ptr p))))) 99)
+        (unsafe (free (ffi/addr->ptr p))))))
+
+(defun refusals (t: Tally) -> unit
+  (do (expect-err t "address 0" (call/call-i64 0 []) "call-i64: address 0")
+      (expect-err t "9 arguments" (call/call-i64 1 [1 2 3 4 5 6 7 8 9]) "call-i64: more than 8 arguments")
+      (expect-err t "mixed, address 0" (call/call-mixed 0 [] []) "call-mixed: address 0")
+      (expect-err t "mixed, 9 doubles" (call/call-mixed 1 [] [1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0]) "call-mixed: more than 8 arguments of a class")
+      (expect-err t "on-stack, address 0" (call/call-on-stack 0 [] 65536) "call-on-stack: address 0")))
+
+;; 3000 levels of 4 KiB: 12 MiB, past the 8 MiB the calling thread's stack has.
+(defun deep-stack (t: Tally e: (fn (str) i64)) -> unit
+  (do (expect-i64 t "deep recursion on a 64 MiB stack" (call/call-on-stack (entry e "deep") [3000] 67108864) 3000)
+      (expect-i64 t "deep recursion on a 256 MiB stack" (call/call-on-stack (entry e "deep") [30000] 268435456) 30000)
+      (expect-i64 t "shallow recursion on the calling thread" (call/call-i64 (entry e "deep") [100]) 100)
+      (expect-err t "a stack that is too small" (call/call-on-stack (entry e "f0") [] 100) "call-on-stack: the stack size is not acceptable")))
+
+;; ------------------------------------------------------------------------------------------ the trap
+
+;; The wait status of a shell command, or -1.
+(defun shell :private (cmd: str) -> i64
+  (let ((c (ffi/bytes-new cmd)))
+    (unsafe (let ((st (sext i64 (system c)))) (do (free c) st)))))
+
+;; Whether the child died of the signal `sig` (`system` gives the shell's status: the shell may pass the signal on or exit 128 + sig).
+(defun died-of :private (st: i64 sig: i64) -> bool
+  (or (= (bit-and st 127) sig) (= (bit-and (shr st 8) 255) (+ 128 sig))))
+
+(defun trap-child :private (t: Tally self: str extra: str kind: str sig: i64 name: str) -> unit
+  (let ((st (shell (str-join [self " trap " kind " " extra " 2>/dev/null"]))))
+    (say t (died-of st sig) name (str-concat "wait status " (show st)))))
+
+(defun traps (t: Tally self: str extra: str) -> unit
+  (do (trap-child t self extra "boom" 4 "a trap (llvm.trap) kills the process with SIGILL")
+      (trap-child t self extra "die" 6 "an abort kills the process with SIGABRT")
+      (trap-child t self extra "boom-stack" 4 "a trap on a big stack kills the process too")
+      (trap-child t self extra "boom-worker" 4 "a trap in the mailbox's worker kills the process too")))
+
+;; ------------------------------------------------------------------------------------------ the mailbox
+
+(def hooked-lir: str
+  "(global hook1 ptr (ptr null))
+(global hook2 ptr (ptr null))
+(global cx ptr (ptr null))
+(define (install void) ((ptr h1) (ptr h2) (ptr c))
+  (block entry (store h1 @hook1) (store h2 @hook2) (store c @cx) (ret)))
+(define (ask1 i64) ((i64 x))
+  (block entry
+    (let ((h (load ptr @hook1)) (c (load ptr @cx)))
+      (ret (indirect-call h (fn i64 (ptr i64)) c x)))))
+(define (ask2 i64) ((i64 x) (i64 y))
+  (block entry
+    (let ((h (load ptr @hook2)) (c (load ptr @cx)))
+      (ret (indirect-call h (fn i64 (ptr i64 i64)) c x y)))))
+(define (one i64) ((i64 x)) (block entry (ret (add (call @ask1 x) (i64 1000000)))))
+(define (two i64) ((i64 x) (i64 y)) (block entry (ret (add (call @ask2 x y) (i64 2000000)))))
+(define (both i64) ((i64 x))
+  (block entry (ret (add (call @ask1 x) (call @ask2 x (i64 7))))))
+(define (many i64) ((i64 n))
+  (block entry (br head))
+  (block head
+    (let ((i (phi i64 (entry (i64 0)) (body i2)))
+          (acc (phi i64 (entry (i64 0)) (body acc2))))
+      (br (icmp slt i n) body exit)))
+  (block body
+    (let ((r (call @ask1 i))
+          (acc2 (add acc r))
+          (i2 (add i (i64 1))))
+      (br head)))
+  (block exit (ret acc)))
+(define (nested i64) ((i64 n))
+  (block entry (br (icmp eq n (i64 0)) done again))
+  (block again
+    (let ((pad (alloca i8 (i64 4096))))
+      (store volatile (i8 1) pad)
+      (ret (add (call @nested (sub n (i64 1))) (i64 1)))))
+  (block done (ret (call @ask1 (i64 5)))))
+(define (boomw i64) () (block entry (trap) (unreachable)))")
+
+(defun answer :private (mb: call/Mailbox arity: i64) -> i64
+  (if (= arity 1)
+      (+ (* (call/call-hook-arg mb 0) 3) 1)
+      (+ (* (call/call-hook-arg mb 0) 100) (call/call-hook-arg mb 1))))
+
+;; Answers every hook call of the running call until it returns: the hook calls seen as `[arity a b]` words, or the error.
+(defun serve :private (mb: call/Mailbox) -> (Result (Vec i64) str)
+  (loop ((seen (vec-empty)))
+    (match (call/call-wait mb)
+      ((Err e) (Err e))
+      ((Ok (call/Done)) (Ok seen))
+      ((Ok (call/Hook k))
+       (let ((a (call/call-hook-arg mb 0))
+             (b (if (= k 2) (call/call-hook-arg mb 1) 0)))
+         (do (call/call-hook-reply mb (answer mb k))
+             (recur (conj (conj (conj seen k) a) b))))))))
+
+;; Starts the function with the arguments, serves it, and checks the result and the hook calls seen.
+(defun served :private (t: Tally name: str mb: call/Mailbox addr: i64 args: (Vec i64) want-seen: (Vec i64) want: i64) -> unit
+  (match (call/call-start mb addr args)
+    ((Err e) (say t false name e))
+    ((Ok _)
+     (match (serve mb)
+       ((Err e) (say t false name e))
+       ((Ok seen) (say t (and (= seen want-seen) (= (call/call-result mb) want)) name
+                       (str-join ["seen " (show seen) " result " (show (call/call-result mb))])))))))
+
+(defun wait-text :private (mb: call/Mailbox) -> str
+  (match (call/call-wait mb)
+    ((Ok (call/Done)) "done")
+    ((Ok (call/Hook k)) (str-concat "a hook of arity " (show k)))
+    ((Err e) (str-concat "error: " e))))
+
+(defun say-text :private (t: Tally name: str got: str want: str) -> unit
+  (say t (= got want) name (str-join ["got \"" got "\", want \"" want "\""])))
+
+(defun hooks-served (t: Tally e: (fn (str) i64) mb: call/Mailbox) -> unit
+  (do (served t "one(21): a hook of arity 1" mb (entry e "one") [21] [1 21 0] 1000064)
+      (served t "two(3, 4): a hook of arity 2" mb (entry e "two") [3 4] [2 3 4] 2000304)
+      (served t "both(4): both arities in order" mb (entry e "both") [4] [1 4 0 2 4 7] 420)
+      (served t "one(5) again on the same mailbox" mb (entry e "one") [5] [1 5 0] 1000016)
+      (served t "one(-1): negative words" mb (entry e "one") [-1] [1 -1 0] 999998)))
+
+(defun many-hooks (t: Tally e: (fn (str) i64) mb: call/Mailbox) -> unit
+  (match (call/call-start mb (entry e "many") [1000])
+    ((Err e) (say t false "a thousand hook calls in one call" e))
+    ((Ok _)
+     (match (serve mb)
+       ((Err e) (say t false "a thousand hook calls in one call" e))
+       ((Ok seen) (say t (and (= (count seen) 3000) (= (call/call-result mb) 1499500)
+                              (= (nth seen 2997) 1) (= (nth seen 2998) 999))
+                       "a thousand hook calls in one call"
+                       (str-join [(show (count seen)) " words, result " (show (call/call-result mb))])))))))
+
+;; The worker's stack: 10000 frames of 4 KiB before the hook is called.
+(defun worker-stack (t: Tally e: (fn (str) i64) mb: call/Mailbox) -> unit
+  (served t "the worker has a big stack (10000 frames of 4 KiB, then a hook)" mb (entry e "nested") [10000] [1 5 0] 10016))
+
+(defun is-ok :private (r: (Result unit str)) -> bool
+  (match r ((Ok _) true) ((Err _) false)))
+
+(defun is-none :private (o: (Option str)) -> bool
+  (match o ((some _) false) (nil true)))
+
+(defun refused :private (r: (Result unit str)) -> str
+  (match r ((Err e) e) ((Ok _) "accepted")))
+
+(defun misuse-parked (t: Tally e: (fn (str) i64) mb: call/Mailbox) -> unit
+  (do (say t (is-ok (call/call-start mb (entry e "one") [1])) "start one(1)" "refused")
+      (say-text t "wait" (wait-text mb) "a hook of arity 1")
+      (say-text t "start again while it is parked" (refused (call/call-start mb (entry e "two") [1 2]))
+                "lair_call_start: a call is still running")
+      (say t (= (call/call-hook-arg mb 5) 0) "argument 5 of a hook that has one" "not 0")
+      (call/call-hook-reply mb 5)
+      (say-text t "wait after the misuses" (wait-text mb) "error: lair_call_start: a call is still running")
+      (say-text t "wait again" (wait-text mb) "done")
+      (say t (= (call/call-result mb) 1000005) "result of the call that was parked" (show (call/call-result mb)))))
+
+(defun misuse (t: Tally e: (fn (str) i64) mb: call/Mailbox) -> unit
+  (do (call/call-hook-reply mb 1)
+      (say-text t "wait after a reply with no hook waiting" (wait-text mb) "error: lair_call_hook_reply: no hook call is waiting")
+      (say-text t "the fault text" (unwrap-or (call/call-fault mb) "none") "lair_call_hook_reply: no hook call is waiting")
+      (say-text t "start at address 0" (refused (call/call-start mb 0 [])) "call-start: address 0")
+      (say-text t "start with 9 arguments" (refused (call/call-start mb (entry e "one") [1 2 3 4 5 6 7 8 9]))
+                "call-start: more than 8 arguments")
+      (misuse-parked t e mb)))
+
+(defun fresh-mailbox (t: Tally) -> unit
+  (match (call/call-new)
+    ((Err e) (say t false "a fresh mailbox" e))
+    ((Ok mb)
+     (do (say-text t "wait on a mailbox that never started" (wait-text mb) "error: lair_call_wait: no call was started")
+         (say-text t "result before any call" (show (call/call-result mb)) "0")
+         (say t (not (is-none (call/call-fault mb))) "the fault of a result before any call" "no fault")
+         (call/call-free mb)))))
+
+;; One mailbox used for one call: 0 when the call was served and its result right.
+(defun one-call :private (e: (fn (str) i64) i: i64) -> i64
+  (match (call/call-new)
+    ((Err _) 1)
+    ((Ok mb)
+     (let ((r (match (call/call-start mb (entry e "one") [i])
+                ((Err _) 1)
+                ((Ok _) (match (serve mb)
+                          ((Err _) 1)
+                          ((Ok _) (if (= (call/call-result mb) (+ 1000001 (* 3 i))) 0 1)))))))
+       (do (call/call-free mb) r)))))
+
+;; Many mailboxes, each used and freed: joined workers, freed state.
+(defun many-mailboxes (t: Tally e: (fn (str) i64)) -> unit
+  (let ((bad (loop ((i 0) (bad 0))
+               (if (< i 300) (recur (+ i 1) (+ bad (one-call e i))) bad))))
+    (say t (= bad 0) "300 mailboxes made, used and freed" (str-concat "failures: " (show bad)))))
+
+;; A mailbox freed while its call is parked at a hook nobody answers: detached, nothing crashes.
+(defun detached (t: Tally e: (fn (str) i64)) -> unit
+  (match (call/call-new)
+    ((Err e) (say t false "a mailbox freed while parked" e))
+    ((Ok mb)
+     (do (call/call-start mb (entry e "one") [1])
+         (say-text t "parked before the free" (wait-text mb) "a hook of arity 1")
+         (call/call-free mb)
+         (say t true "a mailbox freed while parked is detached" "")))))
+
+(defun void :private (r: (Result i64 str)) -> (Result unit str)
+  (match r ((Ok _) (Ok ())) ((Err m) (Err m))))
+
+(defun mailbox-session (t: Tally e: (fn (str) i64)) -> unit
+  (match (call/call-new)
+    ((Err e) (say t false "call-new" e))
+    ((Ok mb)
+     (let ((h (call/hook-addresses)))
+       (do (say t (is-ok (void (call/call-i64 (entry e "install") [(. h one) (. h two) (. mb handle)]))) "install the hooks" "failed")
+           (hooks-served t e mb)
+           (many-hooks t e mb)
+           (worker-stack t e mb)
+           (misuse t e mb)
+           (call/call-free mb)
+           (fresh-mailbox t)
+           (many-mailboxes t e)
+           (detached t e))))))
+
+(defun trap-in-worker :private (e: (fn (str) i64)) -> (Result i64 str)
+  (match (call/call-new)
+    ((Err m) (Err m))
+    ((Ok mb) (do (call/call-start mb (entry e "boomw") []) (call/call-wait mb) (Ok 0)))))
+
+;; The child of a trap check: never returns when the trap works (prints `survived`, status 3, when it does not). `em` serves the module
+;; of `module-lir`, `eh` the module of `hooked-lir`.
+(defun trap-run (kind: str em: (fn (str) i64) eh: (fn (str) i64)) -> i64
+  (let ((r (cond (= kind "boom") (call/call-i64 (entry em "boom") [])
+                 (= kind "die") (call/call-i64 (entry em "die") [])
+                 (= kind "boom-stack") (call/call-on-stack (entry em "boom") [] 67108864)
+                 true (trap-in-worker eh))))
+    (do (println "survived") 3)))
+
+;; Every check but the traps: the tally's failures.
+(defun run-all (t: Tally em: (fn (str) i64) eh: (fn (str) i64)) -> unit
+  (do (refusals t) (arities t em) (deep-stack t em) (mailbox-session t eh)))
+
+(defun report (t: Tally) -> i64
+  (do (println (str-join [(show @(. t failed)) " failed"]))
+      (if (= @(. t failed) 0) 0 1)))

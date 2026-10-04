@@ -1,0 +1,82 @@
+;; compiler/tests/native/c-call-orc.fib: package C's test of native.call with no liblair: the shim, the mailbox and the modules under test are
+;; LLVM IR text (made from lIR by `lair emit-llvm`, until the lowering of fibber exists), parsed, verified and added to ORC LLJIT sessions through
+;; compiler/llvm; native.call's host is installed over the first of them (`host-install`). The checks are c-checks.fib's, the same as c-call.fib's.
+;;
+;;   c-call-orc all SELF DIR     DIR holds shim.ll mailbox.ll module.ll hooked.ll; every check, one line each; exit 0 when all are ok
+;;   c-call-orc trap KIND DIR    the child of a trap check
+;;   c-call-orc print NAME       the lIR text of `shim`, `mailbox`, `module` or `hooked` on standard output
+;;
+;; Build and run: compiler/tests/native/c-call-orc.sh.
+(ns main
+  (:require [llvm.core :as core] [llvm.analysis :as analysis] [llvm.target :as target] [llvm.orc :as orc] [llvm.support :as support]
+            [native.call :as call] [native.support :as nsupport] [c-checks :as c]))
+
+;; A session holding the LLVM IR modules `texts` (in this order), or the message.
+(defun session :private (texts: (Vec str) name: str) -> (Result i64 str)
+  (try-let ((jit (orc/jit-new 0)))
+    (loop ((i 0))
+      (if (< i (count texts))
+          (let ((ctx (unsafe (core/LLVMContextCreate))))
+            (match (try-let ((m (support/parse-ir ctx (nth texts i) (str-join [name "-" (show i)])))
+                             (v (analysis/verify m))
+                             (a (orc/add-module jit ctx m)))
+                     (Ok ()))
+              ((Err e) (Err (str-join [name ": " e])))
+              ((Ok _) (recur (+ i 1)))))
+          (Ok jit)))))
+
+(defun lookup :private (jit: i64) -> (fn (str) i64)
+  (fn (name: str) -> i64
+    (match (orc/lookup jit name)
+      ((Ok a) a)
+      ((Err m) (trap m)))))
+
+(defun lookup-result :private (jit: i64) -> (fn (str) (Result i64 str))
+  (fn (name: str) -> (Result i64 str) (orc/lookup jit name)))
+
+(defun read :private (dir: str name: str) -> (Result str str)
+  (match (read-file (str-join [dir "/" name ".ll"]))
+    ((some t) (Ok t))
+    (nil (Err (str-join ["cannot read " dir "/" name ".ll"])))))
+
+;; The host over ORC, then the sessions of the two modules under test: the lookups of the module and of the hooked module.
+(defun setup :private (dir: str) -> (Result (Vec (fn (str) i64)) str)
+  (try-let ((shim (read dir "shim"))
+            (mailbox (read dir "mailbox"))
+            (module (read dir "module"))
+            (hooked (read dir "hooked"))
+            (h (session [shim mailbox] "host"))
+            (i (call/host-install (lookup-result h)))
+            (m (session [module] "module"))
+            (k (session [hooked] "hooked")))
+    (Ok [(lookup m) (lookup k)])))
+
+(defun all (self: str dir: str) -> i64
+  (do (target/init)
+      (match (setup dir)
+        ((Err e) (do (eprintln e) 2))
+        ((Ok ls)
+         (let ((t (c/tally-new)))
+           (do (c/run-all t (nth ls 0) (nth ls 1))
+               (c/traps t self dir)
+               (c/report t)))))))
+
+(defun trap-mode (kind: str dir: str) -> i64
+  (do (target/init)
+      (match (setup dir)
+        ((Err e) (do (eprintln e) 2))
+        ((Ok ls) (c/trap-run kind (nth ls 0) (nth ls 1))))))
+
+(defun print-source (name: str) -> i64
+  (cond (= name "shim") (do (println (nsupport/shim-source)) 0)
+        (= name "mailbox") (do (println (nsupport/mailbox-source)) 0)
+        (= name "module") (do (println c/module-lir) 0)
+        (= name "hooked") (do (println c/hooked-lir) 0)
+        true (do (eprintln "print: shim, mailbox, module or hooked") 2)))
+
+(defun main () -> i64
+  (let ((a (args)))
+    (cond (and (= (count a) 3) (= (nth a 0) "all")) (all (nth a 1) (nth a 2))
+          (and (= (count a) 3) (= (nth a 0) "trap")) (trap-mode (nth a 1) (nth a 2))
+          (and (= (count a) 2) (= (nth a 0) "print")) (print-source (nth a 1))
+          true (do (eprintln "usage: c-call-orc all SELF DIR | trap KIND DIR | print NAME") 2))))

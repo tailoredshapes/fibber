@@ -1,0 +1,54 @@
+;; compiler/tests/native/c-call.fib: package C's test of native.call over lair.jit sessions (the checks are c-checks.fib): a module of functions of 0 to 8
+;; integer-class and 0 to 8 double arguments in several mixes, called through the shim; a deep recursion on a big stack; traps; the mailbox.
+;;
+;;   c-call all SELF      every check, one line each (`ok NAME` or `FAIL NAME: ...`), exit status 0 when all are ok
+;;   c-call trap KIND     calls a function that traps (`boom`, llvm.trap) or aborts (`die`, abort(3)); never returns
+;;
+;; SELF is the path of this executable: the check of the trap runs it again as a child, whose death by a signal it reads from `system`.
+;; Build: compiler/tests/native/c-call.sh (needs liblair.so for the JIT session of the module under test, until native.api lands).
+(ns main
+  (:require [lair.jit :as jit] [c-lair-host :as host] [c-checks :as c]))
+
+(defun lookup :private (j: jit/Jit) -> (fn (str) i64)
+  (fn (name: str) -> i64
+    (match (jit/jit-address j name)
+      ((Ok a) a)
+      ((Err m) (trap m)))))
+
+;; A session holding the module `src`, or the message.
+(defun session :private (name: str src: str) -> (Result jit/Jit str)
+  (try-let ((j (jit/jit-new 0))
+            (a (jit/jit-add-source j name src)))
+    (Ok j)))
+
+(defun sessions :private () -> (Result (Vec jit/Jit) str)
+  (try-let ((m (session "module" c/module-lir))
+            (h (session "hooked" c/hooked-lir)))
+    (Ok [m h])))
+
+(defun all (self: str) -> i64
+  (match (sessions)
+    ((Err e) (do (eprintln e) 2))
+    ((Ok js)
+     (let ((t (c/tally-new))
+           (em (lookup (nth js 0)))
+           (eh (lookup (nth js 1))))
+       (do (c/run-all t em eh)
+           (c/traps t self "")
+           (c/report t))))))
+
+(defun trap-mode (kind: str) -> i64
+  (match (sessions)
+    ((Err e) (do (eprintln e) 2))
+    ((Ok js) (c/trap-run kind (lookup (nth js 0)) (lookup (nth js 1))))))
+
+(defun main () -> i64
+  (match (host/install)
+    ((Err e) (do (eprintln e) 2))
+    ((Ok _) (run))))
+
+(defun run :private () -> i64
+  (let ((a (args)))
+    (cond (and (= (count a) 2) (= (nth a 0) "all")) (all (nth a 1))
+          (and (= (count a) 2) (= (nth a 0) "trap")) (trap-mode (nth a 1))
+          true (do (eprintln "usage: c-call all SELF | trap boom|die|boom-stack|boom-worker") 2))))

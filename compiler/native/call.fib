@@ -1,10 +1,24 @@
-;; compiler/native/call.fib: calling an address the JIT gave out, and the mailbox of a call the compiler answers: the names and signatures of `lair.call` (compiler/lair/call.fib). OWNER: package C. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/call.fib: calling an address the JIT gave out, and the mailbox of a call the compiler answers: the names and signatures of `lair.call` (compiler/lair/call.fib). OWNER: package C.
 
 ;; The cutover is a changed `:require`: every function below has the name, parameters and result of its namesake in compiler/lair/call.fib, and
-;; `Hooks`, `Mailbox` and `Wait` the same fields and variants. How the shim is reached without a handle in the signature is the owner's: see
-;; docs/design/lair-interfaces.md section 4.
-
-(ns native.call)
+;; `Hooks`, `Mailbox` and `Wait` the same fields and variants.
+;;
+;; How a call is made. Fibber cannot call an address. The shim (native.support: `lair_shim_run`, lIR text) can: it reads a record of words,
+;; calls the callee with six integers, eight doubles and two more integers on the stack, as the System V ABI places each class on its own, and
+;; stores the result in the record. Fibber reaches the shim through libc: `bsearch` over one element calls its comparison, `lair_shim_cmp`,
+;; once on the calling thread; `pthread_create` runs `lair_shim_thread` on a thread whose stack size fibber chooses (`call-on-stack`). The
+;; mailbox (`lair_mb_*`, native.support) is called the same way: each of its functions is a callee of the shim.
+;;
+;; The one piece of process-wide state. The shim and the mailbox are compiled once into a JIT session that lives as long as the process (like
+;; LLVM's target registry), held by the top-level `the-host` below, made on the first call and never freed; its addresses are
+;; the `Host` record. `call-i64` has no session in its signature (the signatures are `lair.call`'s), so it cannot take one. Two threads that make
+;; their first call at once may each make a session (the second is kept, the first leaks): the compiler makes its first call
+;; on its one thread before any other.
+;;
+;; The session is `native.api`'s (`jit-new`, `jit-add-source`, `jit-address`: the names of `lair.jit`). Until package J's `native.api` is real, a
+;; program that wants a working host installs its own with `host-install` (compiler/tests/native/c-lair-host.fib over lair.jit,
+;; c-call-orc.fib over ORC).
+(ns native.call (:require [native.api :as api] [llvm.ffi :as ffi] [native.support :as support]))
 
 
 (def max-args: i64 8)
@@ -16,46 +30,212 @@
 ;; What `call-wait` found: the call returned, or the worker is parked at a hook call of this arity (1 or 2).
 (defenum Wait (Done) (Hook arity: i64))
 
+(extern bsearch :private (ptr ptr i64 i64 ptr) -> ptr)
+(extern pthread_create :private (ptr ptr ptr ptr) -> i32)
+(extern pthread_join :private (i64 ptr) -> i32)
+(extern pthread_attr_init :private (ptr) -> i32)
+(extern pthread_attr_setstacksize :private (ptr i64) -> i32)
+(extern pthread_attr_destroy :private (ptr) -> i32)
+
+;; --------------------------------------------------------------------------------------------- the host
+
+;; The addresses of the shim and of the mailbox's functions.
+(defstruct Host (cmp: i64 thread: i64 mb-new: i64 start: i64 wait: i64 arg: i64 reply: i64 result: i64 fault: i64 free: i64 hook1: i64 hook2: i64))
+
+(def the-host: (Atom (Option Host)) (atom nil))
+
+(defun host-from :private (lookup: (fn (str) (Result i64 str))) -> (Result Host str)
+  (try-let ((cmp (lookup "lair_shim_cmp"))
+            (thread (lookup "lair_shim_thread"))
+            (mb-new (lookup "lair_mb_new"))
+            (start (lookup "lair_mb_start"))
+            (wait (lookup "lair_mb_wait"))
+            (arg (lookup "lair_mb_hook_arg"))
+            (reply (lookup "lair_mb_hook_reply"))
+            (result (lookup "lair_mb_result"))
+            (fault (lookup "lair_mb_fault"))
+            (free (lookup "lair_mb_free"))
+            (hook1 (lookup "lair_mb_hook1"))
+            (hook2 (lookup "lair_mb_hook2")))
+    (Ok (Host cmp thread mb-new start wait arg reply result fault free hook1 hook2))))
+
+(defun host-new :private () -> (Result Host str)
+  (try-let ((j (api/jit-new 0))
+            (s1 (api/jit-add-source j "lair.shim" (support/shim-source)))
+            (s2 (api/jit-add-source j "lair.mailbox" (support/mailbox-source))))
+    (host-from (fn (name: str) -> (Result i64 str) (api/jit-address j name)))))
+
+;; Makes the host from a session of the caller's, in which the modules of `native.support` (`shim-source`, then `mailbox-source`) have been
+;; compiled and which lives as long as the process: `lookup` gives the address of an exported function of it. For a program that has its own
+;; session and no `lair.jit` (compiler/tests/native/c-call-orc.fib adds them to an ORC session); replaces any host made before.
+(defun host-install (lookup: (fn (str) (Result i64 str))) -> (Result unit str)
+  (try-let ((h (host-from lookup)))
+    (do (reset! the-host (some h)) (Ok ()))))
+
+;; The host, made on first use.
+(defun host () -> (Result Host str)
+  (match @the-host
+    ((some h) (Ok h))
+    (nil (try-let ((h (host-new)))
+           (do (reset! the-host (some h)) (Ok h))))))
+
+;; --------------------------------------------------------------------------------------------- the record
+
+;; The record of the shim (19 words, 160 bytes with padding): zeros, the callee, the integer arguments at words 1.., the doubles' bits at
+;; words 9.., the result kind at word 18 (1 for a double result). For the caller to free.
+(defun record-new :private (addr: i64 ints: (Vec i64) dbls: (Vec f64) kind: i64) -> ptr
+  (unsafe
+    (let ((p (alloc 160)))
+      (do (dotimes (i 20) (store-i64 (ptr+ p (* i 8)) 0))
+          (store-i64 p addr)
+          (dotimes (i (count ints)) (store-i64 (ptr+ p (* (+ i 1) 8)) (nth ints i)))
+          (dotimes (i (count dbls)) (store-i64 (ptr+ p (* (+ i 9) 8)) (f64->bits (nth dbls i))))
+          (store-i64 (ptr+ p 144) kind)
+          p))))
+
+(defun record-result :private (p: ptr) -> i64
+  (unsafe (load-i64 (ptr+ p 136))))
+
+;; Runs the shim on the record on the calling thread.
+(defun run-here :private (h: Host rec: ptr) -> unit
+  (unsafe (do (bsearch rec rec 1 8 (ffi/addr->ptr (. h cmp))) ())))
+
+;; Runs the shim on the record on a new thread with a stack of `stack` bytes, and waits for it.
+(defun run-on-thread :private (h: Host rec: ptr stack: i64) -> (Result unit str)
+  (unsafe
+    (let ((tid (alloc 8))
+          (attr (alloc 64)))
+      (let ((r (if (!= (pthread_attr_init attr) 0i32)
+                   (Err "call-on-stack: pthread_attr_init failed")
+                   (if (!= (pthread_attr_setstacksize attr stack) 0i32)
+                       (Err "call-on-stack: the stack size is not acceptable")
+                       (if (!= (pthread_create tid attr (ffi/addr->ptr (. h thread)) rec) 0i32)
+                           (Err "call-on-stack: pthread_create failed")
+                           (do (pthread_join (load-i64 tid) (ffi/addr->ptr 0)) (Ok ())))))))
+        (do (pthread_attr_destroy attr) (free tid) (free attr) r)))))
+
+;; The raw result bits of a call: the record is made, run here (`stack` 0) or on a thread of that many bytes, read and freed.
+(defun invoke :private (addr: i64 ints: (Vec i64) dbls: (Vec f64) kind: i64 stack: i64) -> (Result i64 str)
+  (try-let ((h (host)))
+    (let ((rec (record-new addr ints dbls kind)))
+      (let ((ran (if (= stack 0) (Ok (run-here h rec)) (run-on-thread h rec stack))))
+        (let ((out (match ran
+                     ((Ok _) (Ok (record-result rec)))
+                     ((Err m) (Err m)))))
+          (do (unsafe (free rec)) out))))))
+
+;; --------------------------------------------------------------------------------------------- calls
+
+;; Why a call with n arguments at addr cannot be made (lair would answer 0 and make no call), or nil.
+(defun refusal :private (who: str addr: i64 n: i64) -> (Option str)
+  (cond (= addr 0) (some (str-concat who ": address 0"))
+        (> n max-args) (some (str-concat who ": more than 8 arguments"))
+        true nil))
+
+(defun f64-of :private (r: (Result i64 str)) -> (Result f64 str)
+  (match r
+    ((Ok bits) (Ok (bits->f64 bits)))
+    ((Err m) (Err m))))
+
 ;; Calls the C-ABI function at addr with up to 8 integer arguments on the calling thread. (capi/call.rs `lair_call_i64`)
 (defun call-i64 (addr: i64 args: (Vec i64)) -> (Result i64 str)
-  (trap "todo: native.call call-i64"))
+  (match (refusal "call-i64" addr (count args))
+    ((some why) (Err why))
+    (nil (invoke addr args [] 0 0))))
 
 ;; As `call-i64` for a function that returns a double. (capi/call.rs `lair_call_f64`)
 (defun call-f64 (addr: i64 args: (Vec i64)) -> (Result f64 str)
-  (trap "todo: native.call call-f64"))
+  (match (refusal "call-f64" addr (count args))
+    ((some why) (Err why))
+    (nil (f64-of (invoke addr args [] 1 0)))))
+
+;; Beyond `lair.call`. A function with integer-class (integer and pointer) parameters `ints`, in order, and double parameters `dbls`, in
+;; order, in any interleaving in its prototype: the System V ABI gives each class its own registers, so the two lists are all the call needs.
+;; Up to 8 of each (an integer past the sixth is on the stack, a double never). A `float` parameter is a double whose low 32 bits are the
+;; float's (`(bits->f64 (f32->bits x))` zero-extended); the result's high bits are unspecified as in `call-i64`.
+(defun call-mixed (addr: i64 ints: (Vec i64) dbls: (Vec f64)) -> (Result i64 str)
+  (cond (= addr 0) (Err "call-mixed: address 0")
+        (or (> (count ints) max-args) (> (count dbls) max-args)) (Err "call-mixed: more than 8 arguments of a class")
+        true (invoke addr ints dbls 0 0)))
+
+;; As `call-mixed` for a function that returns a double.
+(defun call-mixed-f64 (addr: i64 ints: (Vec i64) dbls: (Vec f64)) -> (Result f64 str)
+  (cond (= addr 0) (Err "call-mixed-f64: address 0")
+        (or (> (count ints) max-args) (> (count dbls) max-args)) (Err "call-mixed-f64: more than 8 arguments of a class")
+        true (f64-of (invoke addr ints dbls 1 0))))
+
+;; As `call-i64` on a new thread whose stack is `stack` bytes (at least 16384; the system rounds), for a function that recurses deeply. The
+;; calling thread waits. (`call-i64` runs on the calling thread's stack; the mailbox's worker has 64 MiB.)
+(defun call-on-stack (addr: i64 args: (Vec i64) stack: i64) -> (Result i64 str)
+  (match (refusal "call-on-stack" addr (count args))
+    ((some why) (Err why))
+    (nil (invoke addr args [] 0 stack))))
+
+;; --------------------------------------------------------------------------------------------- the mailbox
 
 ;; The two hook pointers, `(cx, a) -> word` and `(cx, a, b) -> word`. (capi/mailbox.rs `lair_hook1_address`, `lair_hook2_address`)
+;; The host is made on the first call: a failure to make it is a trap, since the signature has no error.
 (defun hook-addresses () -> Hooks
-  (trap "todo: native.call hook-addresses"))
+  (match (host)
+    ((Ok h) (Hooks (. h hook1) (. h hook2)))
+    ((Err m) (trap (str-concat "hook-addresses: " m)))))
+
+;; Calls the function of the host chosen by `pick` with the words, or fails the program when the host cannot be made (a mailbox exists
+;; only after `call-new` made the host, so this does not happen after it).
+(defun mb-call :private (pick: (fn (Host) i64) args: (Vec i64)) -> i64
+  (match (host)
+    ((Err m) (trap (str-concat "native.call: " m)))
+    ((Ok h) (match (invoke (pick h) args [] 0 0)
+              ((Ok v) v)
+              ((Err m) (trap (str-concat "native.call: " m)))))))
 
 ;; A new, idle mailbox. (capi/mailbox.rs `lair_call_new`)
 (defun call-new () -> (Result Mailbox str)
-  (trap "todo: native.call call-new"))
+  (try-let ((h (host))
+            (p (invoke (. h mb-new) [] [] 0 0)))
+    (if (= p 0) (Err "lair_call_new: the mailbox could not be made") (Ok (Mailbox p)))))
 
 ;; (capi/mailbox.rs `lair_call_free`)
 (defun call-free (c: Mailbox) -> unit
-  (trap "todo: native.call call-free"))
+  (do (mb-call (fn (h: Host) -> i64 (. h free)) [(. c handle)]) ()))
 
 ;; The text of the first misuse since the last accepted start, or nil. (capi/mailbox.rs `lair_call_fault`)
 (defun call-fault (c: Mailbox) -> (Option str)
-  (trap "todo: native.call call-fault"))
+  (let ((len (ffi/slot-new)))
+    (let ((at (mb-call (fn (h: Host) -> i64 (. h fault)) [(. c handle) (ffi/ptr->addr len)])))
+      (let ((r (if (= at 0) nil (some (ffi/text-at at (unsafe (load-i64 len)))))))
+        (do (unsafe (free len)) r)))))
 
-;; Runs the function on the mailbox's worker and returns at once. (capi/mailbox.rs `lair_call_start`)
+;; Runs the function on the mailbox's worker (64 MiB of stack) and returns at once. (capi/mailbox.rs `lair_call_start`)
+;; `Err` when it is refused: address 0, more than 8 arguments, or a call is running or parked (then the text is the mailbox's own).
 (defun call-start (c: Mailbox addr: i64 args: (Vec i64)) -> (Result unit str)
-  (trap "todo: native.call call-start"))
+  (match (refusal "call-start" addr (count args))
+    ((some why) (Err why))
+    (nil
+     (let ((buf (unsafe (ffi/words-new args))))
+       (do (mb-call (fn (h: Host) -> i64 (. h start)) [(. c handle) addr (ffi/ptr->addr buf) (count args)])
+           (unsafe (free buf))
+           (match (call-fault c)
+             ((some why) (Err why))
+             (nil (Ok ()))))))))
 
-;; Blocks until the call returned or the worker is parked at a hook. (capi/mailbox.rs `lair_call_wait`)
+;; Blocks until the call returned or the worker is parked at a hook. `Err` of the fault text after a misuse, once (the call that was
+;; running is untouched: wait again). (capi/mailbox.rs `lair_call_wait`)
 (defun call-wait (c: Mailbox) -> (Result Wait str)
-  (trap "todo: native.call call-wait"))
+  (let ((k (unsafe (sext i64 (trunc i32 (mb-call (fn (h: Host) -> i64 (. h wait)) [(. c handle)]))))))
+    (cond (= k 0) (Ok Done)
+          (or (= k 1) (= k 2)) (Ok (Hook k))
+          true (Err (unwrap-or (call-fault c) "the mailbox is not usable")))))
 
-;; (capi/mailbox.rs `lair_call_hook_arg`)
+;; Argument i (0 or 1) of the hook call the worker is parked at; 0 when there is none or i is not below its arity (a misuse). (capi/mailbox.rs `lair_call_hook_arg`)
 (defun call-hook-arg (c: Mailbox i: i64) -> i64
-  (trap "todo: native.call call-hook-arg"))
+  (mb-call (fn (h: Host) -> i64 (. h arg)) [(. c handle) i]))
 
-;; (capi/mailbox.rs `lair_call_hook_reply`)
+;; Answers the hook call the worker is parked at; the worker resumes and the hook returns v. With no hook waiting nothing happens and the
+;; next `call-wait` is `Err`. (capi/mailbox.rs `lair_call_hook_reply`)
 (defun call-hook-reply (c: Mailbox v: i64) -> unit
-  (trap "todo: native.call call-hook-reply"))
+  (do (mb-call (fn (h: Host) -> i64 (. h reply)) [(. c handle) v]) ()))
 
-;; (capi/mailbox.rs `lair_call_result`)
+;; The value of the finished call, as `call-i64` reads one; 0 before the call is done (a misuse). (capi/mailbox.rs `lair_call_result`)
 (defun call-result (c: Mailbox) -> i64
-  (trap "todo: native.call call-result"))
+  (mb-call (fn (h: Host) -> i64 (. h result)) [(. c handle)]))

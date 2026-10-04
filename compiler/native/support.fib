@@ -1,15 +1,396 @@
-;; compiler/native/support.fib: the lIR text of the mailbox protocol and of the call shim (crates/lair/src/capi/{exchange,mailbox,call}.rs). OWNER: package C. STUB: the signatures are final (docs/design/lair-interfaces.md); every function says `todo:`.
+;; compiler/native/support.fib: the lIR text of the mailbox protocol and of the call shim (crates/lair/src/capi/{exchange,mailbox,call}.rs). OWNER: package C.
 
-;; Fibber cannot export a C function, so the hooks a macro-time module calls and the worker thread are lIR text, compiled once into the process's
-;; JIT (docs/design/lair-in-fibber.md 1.5). The text is embedded in the compiler as a string.
+;; Fibber cannot call a function address and cannot export a C function, so the call shim and the mailbox (with the hooks a macro-time module
+;; calls) are lIR text, compiled once into a JIT session of the process (native.call holds it) and reached from fibber through libc:
+;; `bsearch` (one element: it calls its comparison once, on the calling thread) and `pthread_create` (a thread whose stack has a chosen size).
+;; docs/design/lair-in-fibber.md 1.5, option (a). native.call says how each function is called.
+;;
+;; The shim (`lair_shim_run REC`) calls the C function a record in memory names, with up to 8 integer-class and 8 double arguments, and
+;; leaves the result in the record. `lair_shim_cmp` and `lair_shim_thread` are the two shapes of entry a libc function can call.
+;; The mailbox (`lair_mb_*`) is capi/exchange.rs's state machine over a pthread mutex and two condition variables, with the worker thread
+;; made by `pthread_create` on a 64 MiB stack; `lair_mb_hook1` and `lair_mb_hook2` are the hooks. Every function of both modules is exported.
 
 (ns native.support)
 
 
-;; The lIR module of the call shim: a global slot holding callee, argument count and up to eight arguments, and a `void()` function that reads it, switches on the count, calls through the pointer with `ccc` and stores the result. (capi/call.rs `invoke`)
+;; The lIR module of the call shim: a record of words holding callee, up to eight integer-class and eight double arguments, and the result; `lair_shim_run` reads it, calls through the pointer with `ccc` and stores the result (integer or double). (capi/call.rs `invoke`, `invoke_f64`)
 (defun shim-source () -> str
-  (trap "todo: native.support shim-source"))
+  ";; The call shim: calls the C function a record names. Record, in words: 0 callee, 1..8 the integer arguments, 9..16 the
+;; double arguments (as bits), 17 the result (bits), 18 the result kind (0 integer or pointer, 1 double).
+;; The call always passes six integers in registers, eight doubles in registers and two more integers on the stack, as the System V
+;; ABI places each class independently: a callee of any mix of up to eight integer-class and eight double arguments finds
+;; each where its prototype puts it, and ignores the rest.
+(define (lair_shim_run void) ((ptr rec))
+  (block entry
+    (let ((callee (inttoptr ptr (load i64 rec)))
+          (n0 (load i64 (getelementptr i64 rec (i64 1))))
+          (n1 (load i64 (getelementptr i64 rec (i64 2))))
+          (n2 (load i64 (getelementptr i64 rec (i64 3))))
+          (n3 (load i64 (getelementptr i64 rec (i64 4))))
+          (n4 (load i64 (getelementptr i64 rec (i64 5))))
+          (n5 (load i64 (getelementptr i64 rec (i64 6))))
+          (n6 (load i64 (getelementptr i64 rec (i64 7))))
+          (n7 (load i64 (getelementptr i64 rec (i64 8))))
+          (d0 (bitcast double (load i64 (getelementptr i64 rec (i64 9)))))
+          (d1 (bitcast double (load i64 (getelementptr i64 rec (i64 10)))))
+          (d2 (bitcast double (load i64 (getelementptr i64 rec (i64 11)))))
+          (d3 (bitcast double (load i64 (getelementptr i64 rec (i64 12)))))
+          (d4 (bitcast double (load i64 (getelementptr i64 rec (i64 13)))))
+          (d5 (bitcast double (load i64 (getelementptr i64 rec (i64 14)))))
+          (d6 (bitcast double (load i64 (getelementptr i64 rec (i64 15)))))
+          (d7 (bitcast double (load i64 (getelementptr i64 rec (i64 16)))))
+          (kind (load i64 (getelementptr i64 rec (i64 18)))))
+      (br (icmp eq kind (i64 0)) integer real)))
+  (block integer
+    (store (indirect-call callee (fn i64 (i64 i64 i64 i64 i64 i64 double double double double double double double double i64 i64))
+                          n0 n1 n2 n3 n4 n5 d0 d1 d2 d3 d4 d5 d6 d7 n6 n7)
+           (getelementptr i64 rec (i64 17)))
+    (ret))
+  (block real
+    (store (bitcast i64 (indirect-call callee (fn double (i64 i64 i64 i64 i64 i64 double double double double double double double double i64 i64))
+                                       n0 n1 n2 n3 n4 n5 d0 d1 d2 d3 d4 d5 d6 d7 n6 n7))
+           (getelementptr i64 rec (i64 17)))
+    (ret)))
 
-;; The lIR module of the mailbox: worker thread entry (`pthread_create`, 64 MiB stack), a mutex and two condition variables, the hooks of arity 1 and 2, and the state machine of `exchange.rs` with its defined misuse behaviour. (capi/exchange.rs, capi/mailbox.rs)
+;; libc's bsearch with one element calls its comparison once, on the calling thread, as (key, base): the way to run the shim here.
+(define (lair_shim_cmp i32) ((ptr a) (ptr b))
+  (block entry (call @lair_shim_run a) (ret (i32 0))))
+
+;; The start routine of a thread made by pthread_create: the way to run the shim on a stack of a chosen size.
+(define (lair_shim_thread ptr) ((ptr rec))
+  (block entry (call @lair_shim_run rec) (ret (ptr null))))")
+
+;; The lIR module of the mailbox: worker thread entry (`pthread_create`, 64 MiB stack), a mutex and two condition variables, the hooks of arity 1 and 2, and the state machine of `exchange.rs` with its defined misuse behaviour. It declares `lair_shim_run`, so the shim module is added first. (capi/exchange.rs, capi/mailbox.rs)
 (defun mailbox-source () -> str
-  (trap "todo: native.support mailbox-source"))
+  ";; The mailbox (crates/lair/src/capi/exchange.rs and mailbox.rs). A mailbox is 50 words: 0 state (0 idle, 1 running, 2 hook, 3 replied,
+;; 4 done), 1 arity, 2 a, 3 b, 4 reply, 5 result, 6 the worker's pthread_t, 7 1 when a worker has been made and not yet joined or
+;; detached, 8 the fault text or null, 9 its length, 10 1 for a fault wait has not reported, 11 the reference count (the handle's and
+;; the running worker's), 12 the worker's own pthread_self (0 until it runs), 13..31 the call shim's record, 32..36 the mutex,
+;; 37..42 the condition the compiler's thread sleeps on, 43..48 the condition the worker sleeps on.
+(declare lair_shim_run void (ptr))
+(declare malloc ptr (i64))
+(declare free void (ptr))
+(declare memset ptr (ptr i32 i64))
+(declare strlen i64 (ptr))
+(declare pthread_self i64 ())
+(declare pthread_create i32 (ptr ptr ptr ptr))
+(declare pthread_join i32 (i64 ptr))
+(declare pthread_detach i32 (i64))
+(declare pthread_attr_init i32 (ptr))
+(declare pthread_attr_setstacksize i32 (ptr i64))
+(declare pthread_attr_destroy i32 (ptr))
+(declare pthread_mutex_init i32 (ptr ptr))
+(declare pthread_mutex_destroy i32 (ptr))
+(declare pthread_mutex_lock i32 (ptr))
+(declare pthread_mutex_unlock i32 (ptr))
+(declare pthread_cond_init i32 (ptr ptr))
+(declare pthread_cond_destroy i32 (ptr))
+(declare pthread_cond_wait i32 (ptr ptr))
+(declare pthread_cond_broadcast i32 (ptr))
+
+(define private (w ptr) ((ptr mb) (i64 k))
+  (block entry (ret (getelementptr i64 mb k))))
+(define private (rd i64) ((ptr mb) (i64 k))
+  (block entry (ret (load i64 (call @w mb k)))))
+(define private (wr void) ((ptr mb) (i64 k) (i64 v))
+  (block entry (store v (call @w mb k)) (ret)))
+(define private (lock void) ((ptr mb))
+  (block entry (call @pthread_mutex_lock (call @w mb (i64 32))) (ret)))
+(define private (unlock void) ((ptr mb))
+  (block entry (call @pthread_mutex_unlock (call @w mb (i64 32))) (ret)))
+(define private (wake-main void) ((ptr mb))
+  (block entry (call @pthread_cond_broadcast (call @w mb (i64 37))) (ret)))
+(define private (wake-worker void) ((ptr mb))
+  (block entry (call @pthread_cond_broadcast (call @w mb (i64 43))) (ret)))
+(define private (sleep-main void) ((ptr mb))
+  (block entry (call @pthread_cond_wait (call @w mb (i64 37)) (call @w mb (i64 32))) (ret)))
+(define private (sleep-worker void) ((ptr mb))
+  (block entry (call @pthread_cond_wait (call @w mb (i64 43)) (call @w mb (i64 32))) (ret)))
+
+;; Records a misuse (the first text stays), has the next wait report it and wakes the compiler's thread. The lock is held.
+(define private (fault void) ((ptr mb) (ptr msg))
+  (block entry (br (icmp eq (call @rd mb (i64 8)) (i64 0)) first rest))
+  (block first
+    (call @wr mb (i64 8) (ptrtoint i64 msg))
+    (call @wr mb (i64 9) (call @strlen msg))
+    (br rest))
+  (block rest
+    (call @wr mb (i64 10) (i64 1))
+    (call @wake-main mb)
+    (ret)))
+
+;; Drops one reference; the last frees the mailbox.
+(define private (release-ref void) ((ptr mb))
+  (block entry
+    (br (icmp eq (atomicrmw sub seq_cst (call @w mb (i64 11)) (i64 1)) (i64 1)) last more))
+  (block last
+    (call @pthread_mutex_destroy (call @w mb (i64 32)))
+    (call @pthread_cond_destroy (call @w mb (i64 37)))
+    (call @pthread_cond_destroy (call @w mb (i64 43)))
+    (call @free mb)
+    (ret))
+  (block more (ret)))
+
+;; lair_call_new: a new, idle mailbox.
+(define (lair_mb_new ptr) ()
+  (block entry
+    (let ((mb (call @malloc (i64 400))))
+      (call @memset mb (i32 0) (i64 400))
+      (call @wr mb (i64 11) (i64 1))
+      (call @pthread_mutex_init (call @w mb (i64 32)) (ptr null))
+      (call @pthread_cond_init (call @w mb (i64 37)) (ptr null))
+      (call @pthread_cond_init (call @w mb (i64 43)) (ptr null))
+      (ret mb))))
+
+;; The worker's body: the call, then the result.
+(define private (worker ptr) ((ptr mb))
+  (block entry
+    (call @lock mb)
+    (call @wr mb (i64 12) (call @pthread_self))
+    (call @unlock mb)
+    (call @lair_shim_run (call @w mb (i64 13)))
+    (call @lock mb)
+    (call @wr mb (i64 5) (call @rd mb (i64 30)))
+    (call @wr mb (i64 0) (i64 4))
+    (call @wake-main mb)
+    (call @unlock mb)
+    (call @release-ref mb)
+    (ret (ptr null))))
+
+;; Why a start is refused, as a text, or null. The lock is held.
+(define private (refusal ptr) ((ptr mb) (i64 addr) (i64 args) (i64 n))
+  (block entry
+    (br (icmp eq args (i64 0)) null? many?))
+  (block null?
+    (br (icmp ne n (i64 0)) bad-null many?))
+  (block bad-null (ret (string \"lair_call_start: args is null but n is not 0\")))
+  (block many?
+    (br (icmp ugt n (i64 8)) too-many state?))
+  (block too-many (ret (string \"lair_call_start: more than 8 arguments\")))
+  (block state?
+    (let ((state (call @rd mb (i64 0))))
+      (br (icmp eq state (i64 0)) addr? done?)))
+  (block done?
+    (br (icmp eq (call @rd mb (i64 0)) (i64 4)) addr? busy))
+  (block busy (ret (string \"lair_call_start: a call is still running\")))
+  (block addr?
+    (br (icmp eq addr (i64 0)) no-address ok))
+  (block no-address (ret (string \"lair_call_start: the address is 0\")))
+  (block ok (ret (ptr null))))
+
+;; Writes the call into the shim's record: callee, the n arguments, zeros for the rest, the integer result kind.
+(define private (fill void) ((ptr mb) (i64 addr) (ptr args) (i64 n))
+  (block entry
+    (call @memset (call @w mb (i64 13)) (i32 0) (i64 152))
+    (call @wr mb (i64 13) addr)
+    (br loop))
+  (block loop
+    (let ((i (phi i64 (entry (i64 0)) (body i2))))
+      (br (icmp ult i n) body done)))
+  (block body
+    (let ((v (load i64 (getelementptr i64 args i)))
+          (i2 (add i (i64 1))))
+      (call @wr mb (add (i64 14) i) v)
+      (br loop)))
+  (block done (ret)))
+
+;; lair_call_start: runs addr with the n arguments at args on a worker thread of 64 MiB of stack.
+(define (lair_mb_start void) ((ptr mb) (i64 addr) (ptr args) (i64 n))
+  (block entry
+    (call @lock mb)
+    (let ((why (call @refusal mb addr (ptrtoint i64 args) n)))
+      (br (icmp eq why (ptr null)) accept refuse)))
+  (block refuse
+    (call @fault mb why)
+    (call @unlock mb)
+    (ret))
+  (block accept
+    (call @wr mb (i64 8) (i64 0))
+    (call @wr mb (i64 9) (i64 0))
+    (call @wr mb (i64 10) (i64 0))
+    (call @wr mb (i64 0) (i64 1))
+    (call @wr mb (i64 12) (i64 0))
+    (let ((had (call @rd mb (i64 7))))
+      (call @wr mb (i64 7) (i64 0))
+      (call @unlock mb)
+      (br (icmp eq had (i64 0)) spawn join-old)))
+  (block join-old
+    (call @pthread_join (call @rd mb (i64 6)) (ptr null))
+    (br spawn))
+  (block spawn
+    (call @fill mb addr args n)
+    (call @add-ref mb)
+    (let ((made (call @spawn-thread mb)))
+      (call @lock mb)
+      (br (icmp eq made (i32 0)) started failed)))
+  (block started
+    (call @wr mb (i64 7) (i64 1))
+    (call @unlock mb)
+    (ret))
+  (block failed
+    (call @wr mb (i64 0) (i64 0))
+    (call @fault mb (string \"lair_call_start: no worker thread\"))
+    (call @unlock mb)
+    (call @release-ref mb)
+    (ret)))
+
+(define private (add-ref void) ((ptr mb))
+  (block entry (atomicrmw add seq_cst (call @w mb (i64 11)) (i64 1)) (ret)))
+
+;; pthread_create with a 64 MiB stack; the worker's thread id goes into word 6. 0 on success.
+(define private (spawn-thread i32) ((ptr mb))
+  (block entry
+    (let ((attr (alloca (align 8) i64 (i64 8)))) ; 64 bytes: pthread_attr_t is 56
+      (call @pthread_attr_init attr)
+      (call @pthread_attr_setstacksize attr (i64 67108864))
+      (let ((r (call @pthread_create (call @w mb (i64 6)) attr @worker mb)))
+        (call @pthread_attr_destroy attr)
+        (ret r)))))
+
+;; lair_call_wait: 0 when the call returned, the arity of the hook it is parked at, or -1 once after a misuse.
+(define (lair_mb_wait i32) ((ptr mb))
+  (block entry
+    (call @lock mb)
+    (br again))
+  (block again
+    (br (icmp ne (call @rd mb (i64 10)) (i64 0)) reported look))
+  (block reported
+    (call @wr mb (i64 10) (i64 0))
+    (call @unlock mb)
+    (ret (i32 -1)))
+  (block look
+    (switch (call @rd mb (i64 0)) sleep ((i64 0) idle) ((i64 2) hooked) ((i64 4) done)))
+  (block idle
+    (call @fault mb (string \"lair_call_wait: no call was started\"))
+    (br again))
+  (block hooked
+    (let ((k (call @rd mb (i64 1))))
+      (call @unlock mb)
+      (ret (trunc i32 k))))
+  (block done
+    (call @unlock mb)
+    (ret (i32 0)))
+  (block sleep
+    (call @sleep-main mb)
+    (br again)))
+
+;; lair_call_hook_arg: argument i (0 or 1) of the hook the worker is parked at, else 0 and a fault.
+(define (lair_mb_hook_arg i64) ((ptr mb) (i64 i))
+  (block entry
+    (call @lock mb)
+    (br (icmp eq (call @rd mb (i64 0)) (i64 2)) parked none))
+  (block parked
+    (br (icmp ult i (call @rd mb (i64 1))) fine bad-index))
+  (block fine
+    (let ((v (call @rd mb (add (i64 2) i))))
+      (call @unlock mb)
+      (ret v)))
+  (block bad-index
+    (call @fault mb (string \"lair_call_hook_arg: the index is not below the arity\"))
+    (call @unlock mb)
+    (ret (i64 0)))
+  (block none
+    (call @fault mb (string \"lair_call_hook_arg: no hook call is waiting\"))
+    (call @unlock mb)
+    (ret (i64 0))))
+
+;; lair_call_hook_reply: answers the hook call the worker is parked at.
+(define (lair_mb_hook_reply void) ((ptr mb) (i64 v))
+  (block entry
+    (call @lock mb)
+    (br (icmp eq (call @rd mb (i64 0)) (i64 2)) yes no))
+  (block yes
+    (call @wr mb (i64 4) v)
+    (call @wr mb (i64 0) (i64 3))
+    (call @wake-worker mb)
+    (call @unlock mb)
+    (ret))
+  (block no
+    (call @fault mb (string \"lair_call_hook_reply: no hook call is waiting\"))
+    (call @unlock mb)
+    (ret)))
+
+;; lair_call_result: the value the finished call returned, else 0 and a fault.
+(define (lair_mb_result i64) ((ptr mb))
+  (block entry
+    (call @lock mb)
+    (br (icmp eq (call @rd mb (i64 0)) (i64 4)) yes no))
+  (block yes
+    (let ((v (call @rd mb (i64 5))))
+      (call @unlock mb)
+      (ret v)))
+  (block no
+    (call @fault mb (string \"lair_call_result: no call has finished\"))
+    (call @unlock mb)
+    (ret (i64 0))))
+
+;; lair_call_fault: the text of the first misuse since the last accepted start, or null; its length goes to *len.
+(define (lair_mb_fault ptr) ((ptr mb) (ptr len))
+  (block entry
+    (call @lock mb)
+    (let ((p (call @rd mb (i64 8)))
+          (n (call @rd mb (i64 9))))
+      (call @unlock mb)
+      (store n len)
+      (ret (inttoptr ptr p)))))
+
+;; lair_call_free: see capi/mailbox.rs. A finished or unused mailbox joins its worker; one that is still running is detached.
+(define (lair_mb_free void) ((ptr mb))
+  (block entry
+    (call @lock mb)
+    (let ((state (call @rd mb (i64 0)))
+          (had (call @rd mb (i64 7)))
+          (tid (call @rd mb (i64 6))))
+      (call @wr mb (i64 7) (i64 0))
+      (call @unlock mb)
+      (br (icmp eq had (i64 0)) drop have)))
+  (block have
+    (br (icmp eq state (i64 4)) join-it idle?))
+  (block idle?
+    (br (icmp eq state (i64 0)) join-it detach-it))
+  (block join-it
+    (call @pthread_join tid (ptr null))
+    (br drop))
+  (block detach-it
+    (call @pthread_detach tid)
+    (br drop))
+  (block drop
+    (call @release-ref mb)
+    (ret)))
+
+;; The hook of arity 1 or 2, called by module code with the mailbox as cx: parks the calling worker until the compiler answers.
+(define private (hook i64) ((ptr cx) (i64 arity) (i64 a) (i64 b))
+  (block entry
+    (br (icmp eq cx (ptr null)) none live))
+  (block none (ret (i64 0)))
+  (block live
+    (call @lock cx)
+    (br (icmp eq (call @rd cx (i64 0)) (i64 1)) mine? stranger))
+  (block mine?
+    (br (icmp eq (call @rd cx (i64 12)) (call @pthread_self)) park stranger))
+  (block stranger
+    (call @fault cx (string \"a hook was called outside its call's worker thread\"))
+    (call @unlock cx)
+    (ret (i64 0)))
+  (block park
+    (call @wr cx (i64 0) (i64 2))
+    (call @wr cx (i64 1) arity)
+    (call @wr cx (i64 2) a)
+    (call @wr cx (i64 3) b)
+    (call @wake-main cx)
+    (br check))
+  (block check
+    (br (icmp eq (call @rd cx (i64 0)) (i64 3)) answered waiting))
+  (block waiting
+    (call @sleep-worker cx)
+    (br check))
+  (block answered
+    (call @wr cx (i64 0) (i64 1))
+    (let ((r (call @rd cx (i64 4))))
+      (call @unlock cx)
+      (ret r))))
+
+(define (lair_mb_hook1 i64) ((ptr cx) (i64 a))
+  (block entry (ret (call @hook cx (i64 1) a (i64 0)))))
+(define (lair_mb_hook2 i64) ((ptr cx) (i64 a) (i64 b))
+  (block entry (ret (call @hook cx (i64 2) a b))))")
