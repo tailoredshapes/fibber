@@ -243,11 +243,12 @@ written where both can read it.
   form the host's CPU and features are used, or the CPU `FIB_TARGET_CPU`
   names, as before.
 - Every function the module defines carries `"target-cpu"` and
-  `"target-features"` attributes with the two strings, so the code
-  generator, the optimiser's cost model and the JIT all honour them
-  per function, and a module compiled to LLVM IR text (`emit-llvm`) shows
-  them. The target machine of `lair build` and `lair emit` is built from
-  the same two strings.
+  `"target-features"` attributes with the two strings. LLVM's code
+  generator, its optimiser's cost model (the vector width it picks) and
+  the JIT all read the attributes before the machine's own CPU, so the
+  module's target wins over the host's and over `FIB_TARGET_CPU` in every
+  path (`compiler/tests/native/p0-target.sh` counts `vfmadd` and `ymm`
+  in the assembly), and `emit-llvm` shows the attributes.
 - `lair run` executes the code on the host: the features the module
   asks for must all be in the host's, else `target: the host does not
   support +avx512f` (a program that would die of SIGILL is refused

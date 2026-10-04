@@ -1,0 +1,29 @@
+;; expect: accept
+;; stage: 2
+;; ir: , i32 32, <4 x i1>
+;; ir: , i32 16, <4 x i1>
+;; ir: , i32 8, <2 x i1>
+;; ir: , i32 2, <4 x i1>
+;; ir: , i32 1, <4 x i1>
+;; out: done
+;; ir-not: , i32 0, <
+;; The alignment operand of a masked access: the ABI alignment of the vector (masked-load of <4 x double>: 32, of <4 x i32>: 16) or of the element
+;; (scatter of <2 x i64>: 8) when `(align N)` is not written, else N (masked-store 2, gather 1). Every mask is zero, so nothing is accessed.
+(declare printf i32 (ptr ...))
+(define (opq <4 x i1>) ((<4 x i1> m))
+  (block entry (let ((s (alloca <4 x i1>))) (store volatile m s) (ret (load volatile <4 x i1> s)))))
+(define (opp <2 x i1>) ((<2 x i1> m))
+  (block entry (let ((s (alloca <2 x i1>))) (store volatile m s) (ret (load volatile <2 x i1> s)))))
+(define (main i32) ()
+  (block entry
+    (let ((buf (alloca (align 32) [8 x double]))
+          (zero4 (call @opq (<4 x i1> 0 0 0 0)))
+          (zero2 (call @opp (<2 x i1> 0 0))))
+      (let ((p (getelementptr [8 x double] buf (i64 0) (i64 0))))
+        (let ((a (masked-load <4 x double> p zero4 (zeroinitializer <4 x double>)))
+              (b (masked-load <4 x i32> p zero4 (zeroinitializer <4 x i32>)))
+              (g (gather <4 x i32> (getelementptr i32 p (<4 x i64> 0 1 2 3)) zero4 (zeroinitializer <4 x i32>) (align 1))))
+          (masked-store (zeroinitializer <4 x i32>) p zero4 (align 2))
+          (scatter (zeroinitializer <2 x i64>) (getelementptr i64 p (<2 x i64> 0 1)) zero2)
+          (call @printf (string "done\n"))
+          (ret (i32 0)))))))
