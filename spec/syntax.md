@@ -190,6 +190,10 @@ which the rules above leave open:
   character, keyword or `nil` element, a bool mixed with numbers, a non-literal under a suffix), `BadSimdSuffix` (a letter after the
   `>>` that is not one of the six), `UnclosedSimd`, `MismatchedCloseSimd`; an out-of-range element is the usual `IntegerOutOfRange` or
   `FloatOutOfRange`. The Rust reader (`fibref read`) is frozen and does not read the literal.
+  **The head `simd` is reserved.** The form `(simd ..)` is the literal's, wherever it stands: a local variable, parameter or pattern
+  binding named `simd` does not shadow it, so `(let ((simd 1)) <<1 2>>)` is a vector (and `simd` itself is still a variable when it is not
+  the head of a list). A top-level function named `simd` is not called through the head either: a list headed `simd` is always the
+  literal's form. Name a function otherwise. (Unlike `splat` and the conversions, which a local does shadow.)
 - `#{` .. `}` (E8) reads as `(hash-set ..)`, so `#{1 2}` is `(hash-set 1 2)`;
   an unclosed one is the error `Unclosed` for `{`.
 - `UnknownDispatch`'s message is `unknown reader syntax #X: only #_, #(, #{ are defined`;
