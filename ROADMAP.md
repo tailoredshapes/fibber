@@ -530,6 +530,17 @@ Order of work, cheapest first: (1) the dissoc count (a library edit, one case), 
 bindings, (5) library check once, (4) allocator. Each is a proposal; each needs a before/after from
 `scripts/bench/run.sh` and its case before it counts.
 
+### Where the performance cycle stands (2026-10-04)
+
+Batch 1 landed: the `dissoc` count (`bea0905`), the size-class allocator and inlinable retain/release (`0f280bf`), the
+library checked only where reachable (lever B, `99c054b`), the cycle's tools (`8827908`), and the design of in-place update
+(`0633f62`, docs/design/in-place-update.md).
+Batch 2 landed: the primitives `array-take!`, `array-push!`, `array-pop!`, `cell-update!` and the `ROOMY` flag (`ca8553e`),
+the last-use analysis in `compiler/own` (`b016d22`, `71faf5e`), the persistence, audit and count cases 4000 to 4016 (`647b9ba`),
+`update!` (`28d715c`, `17473a1`), `Vec` over the primitives (`f6a113b`, L3) and `Map`/`Set` (`a50cb1d`, L4). L8 is in progress
+(its work is not in this tree). L5 (shell reuse) is not in this tree. The count cases 4010 to 4015 and 4054 carry `open:`
+headers; no run is recorded in this document, and the table above is still the PERF0 one.
+
 ### The performance cycle
 
 Builds and case runs are the cost of every lever (stage 2 build 40 s, `emit` 30 s, stdlib cases 11 min one at a time), so the
@@ -567,14 +578,37 @@ cut is there (a cached expanded and lowered library, or lowering bodies lazily),
 
 Binary releases of `fibc` on GitHub (README.md, Install; `scripts/package.sh`,
 `.github/workflows/release.yml`). The Rust tools are the 0.0.x line (tag
-`seed-1` is to be released as v0.0.1); the bootstrapped compiler starts at
+`seed-1`, released as v0.0.1); the bootstrapped compiler starts at
 0.1.0 and stays 0.x.
+
+**The process.**
+
+1. `VERSION` and `compiler/driver/version.fib` hold the same version
+   (`scripts/check-version.sh` fails otherwise; `package.sh` runs it).
+2. Tag `vX.Y.Z` at a commit whose `VERSION` is `X.Y.Z` and push the tag. For v0.1 and later the
+   release workflow refuses a tag that is not `v` + `VERSION`.
+3. The workflow fetches the **seed** that the file `SEED` names (`scripts/fetch-seed.sh`: a release
+   tarball, its sha256 verified) and runs `scripts/package.sh` with it: the seed builds stage 2 (F), F builds
+   F3, and the stage check is the fixed point (F and F3 emit the same lIR for `compiler/fibc.fib`); the
+   shipped `fibc` is built by F3. The unpacked tarball must run `hello.fib` under `env -i` before the
+   release is created.
+4. `package.sh` builds for `FIB_TARGET_CPU=x86-64-v2` unless told otherwise (README, Install), and, when
+   `objdump` is present, fails if the shipped `fibc` uses `ymm` or `zmm` registers.
+5. The seed moves forward deliberately: a commit changes `SEED` to a newer release's url and sha256
+   (v0.1.3 is the `SEED` now: commit `0a86093`).
+
+**Lessons: a seed is only usable if it runs on every CPU.** v0.1.2 died with SIGILL on a CPU other than the CI
+runner's (code generated for the build host), so v0.1.3 is built for a baseline CPU; v0.1.1 failed the unpack check.
+
+**The bootstrap chain.** `seed-1` (the Rust tools, a tag) builds v0.0.1 (the Rust tools, released; the first
+`SEED`), which builds v0.1.0, v0.1.1, v0.1.2 and v0.1.3 (stage 2, the compiler in fibber: the `SEED` file at each
+of those four tags names v0.0.1). v0.1.3 is the current `SEED` (commit `0a86093`): the first release that knows the
+in-place primitives (spec/types.md section 2.13.1) and is built for a baseline CPU.
 
 - [x] `fibc --version`; the relocatable tarball runs `hello.fib` with an
       empty environment (`scripts/package.sh`)
-- [ ] v0.0.1 released and its sha256 recorded in `SEED`; the workflow run on
-      GitHub (not run there yet)
-- [ ] v0.1.0 released
+- [x] v0.0.1 released and its sha256 recorded in `SEED`
+- [x] v0.1.3 released and recorded as the `SEED`
 - [ ] 1.0.0 readiness: the owner's call, not decided by any test
 
 ## Decisions

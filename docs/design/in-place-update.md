@@ -1,6 +1,9 @@
 # In-place update when uniquely held
 
-Status: **design only** (performance batch 1, lever C). No code changed. Everything marked "measured" was run in this
+Status: written as a design (performance batch 1, lever C); levers L1 (last use), L2 (the primitives), L3 (Vec), L4 (Map/Set) and
+L6 (`update!`) have since landed (commits `b016d22`, `71faf5e`, `ca8553e`, `f6a113b`, `a50cb1d`, `28d715c`, `17473a1`); L5 (shell reuse) and the
+`array-with` change are not in the tree. The sections below are the design as written; where they differ from the code, the code
+is the truth, and the specification of what landed is spec/types.md §2.13.1 and spec/stdlib.md §2.5. Everything marked "measured" was run in this
 session with the released stage 2 (`~/.cache/fibber-scratch/PERF0/fibc`); everything else is a proposal and a claim about
 a future change, to be proved by the tests in section 6.
 

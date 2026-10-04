@@ -806,9 +806,20 @@ array-get  : ∀a. (fn :send ((Array a) i64) a)                      ; traps out
 array-with : ∀a. (fn :send ((Array a) i64 a) (Array a))            ; a new array with one slot changed (E2 for the element)
 array-copy : ∀a. (fn :send ((Array a) i64 i64) (Array a))          ; slice [i, j)
 array-set! : ∀a. (fn ((& (Array a)) i64 a) unit)                   ; a signature (§1.4); in place iff unique, else copy (§6.6)
+array-take!: ∀a. (fn ((& (Array a)) i64) a)                        ; a signature; the element moved out (§2.13.1)
+array-push!: ∀a. (fn ((& (Array a)) a) unit)                       ; a signature; append, in place iff unique and ROOMY (§2.13.1)
+array-pop! : ∀a. (fn ((& (Array a))) a)                            ; a signature; the last element moved out, a trap when empty (§2.13.1)
+cell-update!: ∀a. (fn ((Cell a) (fn :send (a) a)) unit)            ; the content moved out of the cell for the call of f (§2.13.1)
 (set-field! &x f e)    x : (Cell S);  f a field name, not an expression;  HasField(S, f, F);  e : F   ⇒ unit
                                                                     ; in place iff unique, else copy (§6.6)
 ```
+
+The four rows after `array-set!` are the in-place primitives of performance batch 2 (design:
+docs/design/in-place-update.md). Their type texts and escape kinds are the rows of
+`compiler/types/builtins.fib` (`BuiltinSig`): `array-take!` `[EscInOut EscScalar]`, `array-push!`
+`[EscInOut EscStore]`, `array-pop!` `[EscInOut]`, `cell-update!` `[EscBorrow EscBorrow]`. They exist
+in the compiler in fibber only: the Rust sources under `crates/` have no row for them, and the prelude
+(`lib/prelude.fib`) calls them.
 
 `array-set!` has a signature, not a type (§1.4): like a `defun` with
 an `&` parameter it is called with `&x` at its first position (§2.2)
@@ -825,9 +836,61 @@ struct type of @x for field f; annotate it`; `e` is an ordinary operand
 and a store (E2, §6.3). At either primitive `&x` takes no copy-in:
 the primitive tests and updates the content of `x`'s own cell (§6.6).
 A reference to `array-set!` or `set-field!` other than as the head of
-a call is `function with & parameters is not a value` (§2.1). The two
-are the only primitives that perform a **unique write** (§6.6);
-everything else that updates in place is library code over them.
+a call is `function with & parameters is not a value` (§2.1). `array-set!` and
+`set-field!` are the primitives that perform a **unique write** (§6.6), and
+§2.13.1 adds the four that test uniqueness as they move a value out of a
+place or grow an array; everything else that updates in place is library code
+over these.
+
+#### 2.13.1 The in-place primitives: take, push, pop, update
+
+Source of each statement: `compiler/emit/lower/builtins.fib` (`array-own`,
+`array-take`, `array-push`, `array-pop`), `compiler/emit/lower/cells.fib`
+(`lcx-cell-update`), `crates/fibc/rt/array.lir` (`fib.array-room`,
+`fib.array-roomy?`), `crates/fibc/rt/core.lir` (`fib.unique?`).
+
+The three array primitives take the array through an `&` position, as
+`array-set!` does, and use the same test as the unique write (§6.6): they read
+the content of the cell, and if `fib.unique?` holds (none of `SHARED`,
+`IMMORTAL`, `STACK`, `HAS-WEAK`, and count 1) they work on that array; if not,
+they first build a copy, store it into the cell, release the old array, and
+work on the copy. A shared array is therefore never written.
+
+| Primitive | Result | On the array in the cell |
+|---|---|---|
+| `(array-take! &c i)` | element `i`, owned | `i` is range-checked (`fib.trap-index` outside `0 .. len`). For an element that is an object pointer the slot is set to null and the count moves to the result, with no retain. For a scalar element the value is read and the slot is unchanged. For a `dyn` element the value is retained and the slot is unchanged |
+| `(array-push! &c x)` | `unit` | appends `x` (a store, E2) and adds one to `len`. In place iff the array is unique and `ROOMY` (§8.2) with `len < 32` (`fib.array-roomy?`). Otherwise a copy takes the cell, made by `fib.array-room`: for `len < 32` a block with room for 32 elements, flagged `ROOMY`; for `len >= 32` a block of exactly `len + 1` elements, not flagged. Elements of the copy are retained |
+| `(array-pop! &c)` | the last element, owned | traps with `array-pop! on an empty array` when `len` is 0. Otherwise `len` is reduced by one and the last element is returned, moved out of the array that was in the cell (a unique one, or the copy made when it was not; the copy retained every element, so the old array keeps its own count) |
+| `(cell-update! c f)` | `unit` | `c` is a `Cell`, not an `&` position, and `f : (fn :send (a) a)`. The content is moved out of the cell, `f` is called on it as an owned argument and its result is stored into the cell without a retain. For an object-pointer content the cell holds null while `f` runs, so a value only the cell held reaches `f` with count 1. For a `dyn` content the value is retained for the call and the old reference released after it. A cell of `unit` content is refused at lowering (`cell-update! on a cell of unit`) |
+
+**Null slots.** After `array-take!` of an object element on a unique array, the
+slot holds null until `array-set!` writes it again. Between the two the
+program may only `array-set!` that slot, `array-pop!` or drop the array:
+`array-set!` releases the old content of a slot, and the release of a null
+pointer is a no-op (`fib.release` tests for null: §8.2). `array-get` of a
+taken slot would read null; no library function does it, and it is the
+caller's obligation, not checked.
+
+**The `ROOMY` flag.** Bit 4 of the header flags word (value 16, §8.2). It says
+"this block was allocated with room for 32 elements, `len` of them in use".
+Only `fib.array-room` sets it, so only the growth path of `array-push!` does;
+`array`, `array-with`, `array-copy` and the copy of `array-set!`, `array-take!` and
+`array-pop!` leave it clear. `fib.unique?` masks bits 0 to 3 and so ignores
+it. `len` remains the number of elements in use, so every reader of an array's
+length is unaffected. A shared `ROOMY` array is copied by the next push
+(`fib.array-roomy?` tests uniqueness first), and the copy of a `ROOMY` array
+made by `array-set!` or `array-take!` is not `ROOMY`.
+
+**The trap of pop on empty.** `array-pop!` on an array of length 0 traps, on a
+unique array and on a shared one alike (a shared one is copied first). The
+library does not reach it: `vec-pop` answers `pop: empty` for `VecEmpty` itself,
+and calls `array-pop!` on the tail only when the tail has more than one element,
+and `vnode-pop` calls it only on a branch of `n >= 1` kids (`lib/prelude.fib`).
+
+**Rule for callers.** `array-push!` is written for the vector tail: with
+`len >= 32` it copies exactly `len + 1` elements on every call, so a caller
+that wants amortised in-place growth beyond 32 does not get it from this
+primitive.
 
 ### 2.14 `&` parameters and places
 
@@ -1617,7 +1680,7 @@ consume(e):   Owned        → move: no operation; the count travels with the va
 | # | Position | Forms |
 |---|---|---|
 | E1 | return | the value of a `defun`, `fn`, method or `async` body (after the body's own scope exits) |
-| E2 | store | the object arguments of struct and variant constructors; `(cell e)`; `(set! c e)`; `(atom e)`; `(reset! a e)`; `(array n e)` (n copies); `(array-with a i e)`; `(array-set! &a i e)`; `(set-field! &s f e)`; the result of `f` in `(swap! a f)`; the operand of `(raw-retained e)` (§6.13). Stores inside library functions are those functions' business: `conj`'s element is stored by `array-with` inside `conj` |
+| E2 | store | the object arguments of struct and variant constructors; `(cell e)`; `(set! c e)`; `(atom e)`; `(reset! a e)`; `(array n e)` (n copies); `(array-with a i e)`; `(array-set! &a i e)`; `(array-push! &a e)`; `(set-field! &s f e)`; the result of `f` in `(swap! a f)` and in `(cell-update! c f)`; the operand of `(raw-retained e)` (§6.13). Stores inside library functions are those functions' business: `conj`'s element is stored by `array-with` inside `conj` |
 | E3 | capture | each object capture of a heap closure (a `fn` that is escaping or at a tail site, §6.5) and of every `async`; the retain happens when the closure or task object is created |
 | E4 | thread | the argument of `spawn` (consumed; E3 already retained its captures) |
 | E5 | await | subsumed by E3: the task's frame owns everything it references (§6.9) |
@@ -2912,6 +2975,10 @@ flags: bit 0 SHARED    counts are atomic from now on (§7)
        bit 2 STACK     a scope-local object: retain/release are no-ops (§6.11)
        bit 3 IMMORTAL  static data: literals and everything reachable from them,
                        def values (syntax §3.19), named-function closures, vtables
+       bit 4 ROOMY     an array block with room for 32 elements, len of them in use
+                       (§2.13.1); set only by fib.array-room, the growth path of
+                       array-push!; no test of the other bits reads it (fib.unique?
+                       masks bits 0 to 3)
 ```
 
 `count` is the number of counted references (§2) of a counted object.
@@ -3557,6 +3624,8 @@ quantum.
 | `&` copy-in | at call entry, after every argument, in parameter order: `fib.retain` the variable's content and store it into the private cell (§6.6); nothing for a forwarded `&v` (§6.10 rule (b)), nor for the `&` operand of `array-set!` or `set-field!`, which update the variable's own cell (§2.13) |
 | `&` write-back | store the private cell's content into the variable; `fib.release` the variable's old content |
 | `array-set!`, `set-field!` | `fib.unique?` test (flags first, `HAS-WEAK` among them, then the count, §8.2); in-place write, or copy + store + `fib.release` old |
+| `array-take!`, `array-push!`, `array-pop!` | the same test on the array in the `&` cell (`array-push!` tests `fib.array-roomy?`: unique, `ROOMY`, `len < 32`); on failure a copy is stored and the old array released; then the element moved out (null left in the slot of an object element), or appended with `len` increased, or `len` decreased and the last element returned (§2.13.1) |
+| `cell-update!` | load the content of the cell, store null there (object content) or retain it (`dyn`), call `f` with it owned, store the result without a retain (§2.13.1) |
 | static objects: the type table, literals, named-function closures, vtables | lIR `constant`s with `count` 0 and `IMMORTAL` in their headers, referring to each other by address (§8.2, §8.3, §8.4, §8.5); no module initialiser, nothing runs before `main` |
 | `def` initialisation | the constant expression is evaluated at compile time — its literal parts folded, the prelude calls of the collection-literal rewrite (`conj`, `assoc`, syntax §1.4) run through the JIT that runs macros (ROADMAP, M4) — and the resulting graph, `def`s in source order, is emitted as static objects as above (syntax §3.19); `fib.immortalise` is then the interpreter's only (**Decided**, owner, 2026-09-28, lir.md §14 item 3) |
 | stack object (`STACK`: private `&` cell, stack closure, scope-local object, §6.11) | `(alloca %struct.T)` of its layout, one per allocation site in the function's entry block, reused by every execution of the site; header stored, fields through `getelementptr` on the struct type (§8.2, §8.4, §8.6) |

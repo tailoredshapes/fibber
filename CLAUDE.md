@@ -32,7 +32,7 @@ test says so; claims in docs, commit messages and chat carry no weight.
 | `lib/` | `prelude.fib` and the implicit library `fib/` (facades `fib.core fib.seq fib.coll fib.print` and their parts): M7, design in `spec/stdlib.md` |
 | `compiler/` | the compiler in fibber (M6, spec/bootstrap.md), bootstrapped: `syntax/` reader, `expand/` expander, `macros/` macro runner, `types/` type checker, `own/` ownership checker, `emit/` lIR emitter, `driver/` commands, `lair/` bindings of lair's C interface, tools `fibc.fib read.fib expand.fib types.fib own.fib explain.fib emit.fib`, `tests/` edge inputs, golden programs and compare scripts, `mirror-pending/` what the ports still owe the Rust |
 | `editors/vscode/` | the VS Code language pack for `.fib`: a TextMate grammar, language configuration and snippets; no build step |
-| `scripts/` | release engineering: `package.sh` (the relocatable tarball of stage 2), `package-rust.sh`, `fetch-seed.sh` (the seed named by `SEED`), `check-version.sh` (`VERSION` against `compiler/driver/version.fib`); `.github/workflows/release.yml` runs them on a `v*` tag. See README.md, Install |
+| `scripts/` | release engineering: `package.sh` (the relocatable tarball of stage 2), `package-rust.sh`, `fetch-seed.sh` (the seed named by `SEED`), `check-version.sh` (`VERSION` against `compiler/driver/version.fib`); `.github/workflows/release.yml` runs them on a `v*` tag; `SEED` at the root names the release (url, sha256) that builds stage 2 in CI and for releases (v0.1.3 now). `FIB_TARGET_CPU` (read by lair) picks the CPU code is generated for: `package.sh` sets `x86-64-v2` so a release runs on any CPU; unset, code is for the host. See README.md, Install and ROADMAP.md, Releases |
 | `lir-audit/` | findings from auditing liar's lIR, each re-established as a case in `cases/lir/audit` |
 
 ## Rust standards
@@ -66,6 +66,8 @@ test says so; claims in docs, commit messages and chat carry no weight.
   F's emit equals the seed's only while `lib/prelude.fib` is the one the
   seed embedded (a seed built before a prelude change emits the old one), so
   that comparison is a note, not a gate.
+- The in-place primitives `array-take!`, `array-push!`, `array-pop!` and `cell-update!` (spec/types.md §2.13.1) exist in the
+  compiler in fibber only: the Rust sources under `crates/` have no row for them, and `lib/prelude.fib` calls them.
 - Each pass has a Rust dump as its oracle for the language the seed knows
   (`fibref read|expand|types|own`, `fibc emit-dump`) and a compare script
   under `compiler/tests/`. Rebuild the binaries after any edit of

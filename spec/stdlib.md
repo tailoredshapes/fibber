@@ -706,8 +706,10 @@ element that a `conj` loop costs today (**[H]**: the design record's bulk builde
 
 **`(update! c f)` is the in-place form for a value in a `Cell`** (row `update!`): `(set! c (conj @c x))` copies because `@c` acquires, and `(update! c (fn (v) (conj v x)))` moves the value out of the cell for the call of `f`. Cells only; an `Atom` copies (it is shared) and keeps `swap!`.
 
-**A loop of `conj` or `assoc` is in place iff the accumulator is unique.** Today it never is
-([R] A4):
+**A loop of `conj` or `assoc` is in place iff the accumulator is unique.** The table and the analysis below are the
+state measured at `de1c007`, before the in-place update landed (performance batch 2, design
+docs/design/in-place-update.md), when it never was ([R] A4). What landed since is in "When is an update in place"
+below; the counts of the table have not been re-measured in this section:
 
 | Program (1000 updates) | Heap objects |
 |---|---|
@@ -740,6 +742,45 @@ struct with a tail of spare capacity, held in a cell and updated through `set-fi
 today; that changes a layout that `fibc` (`rt/vec.lir`, `lower/pattern.rs`, `macros/abi.rs`) and `fibref`
 (`eval/vecs.rs`) share. The review moves that decision **before tranche 3** (§9 Q18): the struct `Vec` is the
 route the evidence supports, and C7 is the route that keeps the enum.
+
+**When is an update in place (for users).** What follows is checked against the implementation named in each line;
+spec/types.md §2.13.1 has the primitives.
+
+1. **In place means: the value has one holder at the moment of the update, and the update takes that holder's
+   reference.** The test is made at run time, by `fib.unique?` (`crates/fibc/rt/core.lir`): none of the flags `SHARED`,
+   `IMMORTAL`, `STACK`, `HAS-WEAK`, and count exactly 1. If it fails, the primitive copies, stores the copy into the
+   place and releases the old value; the old value is not written. So a value that anyone else holds is never mutated,
+   whatever the program does, and a wrong guess by the compiler about uniqueness can only cost a copy.
+2. **The cell idiom is how library code gets there.** `lib/prelude.fib` updates a vector tail or a trie node by putting
+   the array in a local `cell`, moving a child out with `array-take!`, and writing it back with `array-set!` (`vnode-assoc`,
+   `vnode-pop`, the descent of `mnode-assoc` and `mnode-dissoc`), appending with `array-push!` (`vec-conj`, `vnode-push`)
+   and removing with `array-pop!` (`vec-pop`, `vnode-pop`). `vec-assoc`, `vec-conj` and `vec-pop` use them for the
+   tail and the path to the leaf, and `assoc` of an **existing** key of a `Map` or `Set` uses them for the descent.
+   Inserting a **new** key still copies the array of the node that gains it (`array-insert`, `array-remove` in the
+   prelude are not in-place primitives).
+3. **A cell holding the only reference lets `update!` work.** `(update! c (fn (v) (conj v x)))` moves the value out of
+   the cell for the call of the function (`cell-update!`, `compiler/emit/lower/cells.fib`), so `conj` sees count 1 and
+   may write in place. `(set! c (conj @c x))` does not: `@c` acquires, so `conj` sees count 2 and copies
+   (`lib/fib/core/cells.fib`). If something else also holds the value (another variable that is used again, a field of a
+   struct, an element of another vector, a snapshot read with `@c` before), the count is 2 or more and `update!` copies;
+   cases 4050 and 4051 are written to fail if it did not.
+4. **A variable's last use hands over its count.** The ownership pass of the compiler in fibber (`compiler/own/lastuse.fib`)
+   moves a binding's reference into the call at its last use, and takes a field out of a dead owned shell at its last use
+   (`compiler/mirror-pending/last-use.md`). This removes the extra count that made the loop of §2.5 above copy. A variable
+   that is used again after the call is retained first, has count 2, and the call copies, correctly.
+5. **Atoms are never unique.** A value stored in an `Atom` is marked `SHARED` before the store (types §6.3, `fib.share`,
+   `rt/atom.lir`), and `fib.unique?` refuses a `SHARED` object, so `swap!` works on a copy. `(update! an-atom f)` is a type
+   error (case 4052). The same holds for anything a task captured: `spawn` shares its captures, so neither side updates
+   such a value in place. The copy that an update makes is a fresh object, and the updater may update it in place afterwards.
+6. **Literals and `def` values are never unique** (`IMMORTAL`), nor is anything that a `weak` ever pointed to (`HAS-WEAK`,
+   never cleared). `(assoc [1 2 3] 0 9)` on a literal copies.
+7. **`&` parameters and `push!`.** An `&` argument is copied in with a retain (types §6.6), and the prelude defines
+   `push!` as `(set! v (vec-conj @v x))` (`lib/prelude.fib`), where `@v` acquires as well; so a `push!` call is not an
+   in-place update of the caller's vector. Code that wants the in-place path keeps the accumulator in a `loop` variable
+   or in a cell updated with `update!`.
+8. **How to tell.** `fibc run --trace` prints one `A` line per heap object allocated; a count case (`allocs: <= N`, spec/method.md
+   rule 3) bounds it. The cases that are written for this are `cases/stdlib/4000` to `4016` (persistence, and counts, several
+   of them `open`) and `4050` to `4054` (`update!`); an `open` case prints as failing until its bound is met.
 
 **What is tested.** The zero-cost claims are tests with counts (§8): a three-stage pipeline over n and
 over 10n elements allocates the same number of objects (passes today: +4 for 1000, A1), a bulk `vec` of

@@ -23,16 +23,27 @@ the way; a small working language is one of them, not the destination.
 Releases are on the [GitHub releases page](https://github.com/tailoredshapes/fibber/releases):
 `fibc-VERSION-linux-x86_64.tar.gz` and `SHA256SUMS`. The 0.0.x releases are
 the Rust tools; from 0.1.0 `fibc` is the compiler written in fibber, built by
-itself, and stays 0.x until the owner says 1.0.0. Download both files, then:
+itself, and stays 0.x until the owner says 1.0.0. The current release is
+0.1.3 (the file `VERSION`). Download both files, then:
 
 ```
-sha256sum -c --ignore-missing SHA256SUMS     # fibc-0.1.0-linux-x86_64.tar.gz: OK
-tar xzf fibc-0.1.0-linux-x86_64.tar.gz
+sha256sum -c --ignore-missing SHA256SUMS     # fibc-0.1.3-linux-x86_64.tar.gz: OK
+tar xzf fibc-0.1.3-linux-x86_64.tar.gz
 echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > hello.fib
-fibc-0.1.0-linux-x86_64/bin/fibc --version   # fibc 0.1.0
-fibc-0.1.0-linux-x86_64/bin/fibc run hello.fib
-fibc-0.1.0-linux-x86_64/bin/fibc build hello.fib -o hello && ./hello
+fibc-0.1.3-linux-x86_64/bin/fibc --version   # fibc 0.1.3
+fibc-0.1.3-linux-x86_64/bin/fibc run hello.fib
+fibc-0.1.3-linux-x86_64/bin/fibc build hello.fib -o hello && ./hello
 ```
+
+The tarball holds one directory, `fibc-VERSION-linux-x86_64/`:
+
+| Path | What |
+|------|------|
+| `bin/fibc` | the compiler |
+| `bin/fibref` | the frozen reference interpreter, which also serves `fibref lsp` to the editor pack; present when the seed that built the release had one beside its `fibc` |
+| `lib/liblair.so` | the code generator (lair, with LLVM inside), found by the rpath `$ORIGIN/../lib` |
+| `share/fibber/lib/` | the standard library source, found beside `bin/` by `fibc` itself |
+| `LICENSE`, `README.txt` | the licence (BSD 3-Clause) and a short layout note |
 
 No environment variable is needed: `bin/fibc` finds `lib/liblair.so` by its
 rpath and the library in `share/fibber/lib` by its own location, so move the
@@ -40,6 +51,67 @@ unpacked directory as a whole. LLVM is not needed (it is inside
 `liblair.so`); the machine needs libc, libm, libstdc++, libgcc_s, libz and
 libzstd, and a C compiler (`cc`) for `fibc build`. To make a release
 yourself, see `scripts/package.sh`.
+
+**Which CPU the code is for.** A release is built with `FIB_TARGET_CPU=x86-64-v2`
+(`scripts/package.sh` sets it unless it is already set), so that the `fibc`
+binary in the tarball runs on any x86-64 CPU with those instructions and not
+only on the one that built it. `FIB_TARGET_CPU` is read by lair (`crates/lair/src/llvm/target.rs`)
+whenever it generates code, so it also applies to the programs you compile: with the
+variable unset, empty or `host`, `fibc run` and `fibc build` on your machine generate code
+for **your host CPU** (its name and its features), and a program built that way may
+not run on an older CPU. To build a program that runs elsewhere, set it:
+
+```
+FIB_TARGET_CPU=x86-64-v2 fibc build hello.fib -o hello
+```
+
+Any other value is passed to LLVM as a CPU name with no extra features.
+
+## Editor
+
+`editors/vscode/` is a VS Code language pack for `.fib`: a TextMate grammar
+(highlighting of comments, strings, numbers, keywords, special forms, the
+library's macros, `x:` annotations, reader macros), language configuration
+(brackets, comments) and snippets. It has no build step; copy or symlink the
+directory to `~/.vscode/extensions/tailoredshapes.fibber-0.1.0` and reload the window.
+Since its 0.2.0 it also starts `fibref lsp` for completion, hover and diagnostics;
+that needs `npm install` in the directory and a `fibref` on `PATH` (the tarball's
+`bin/fibref`, when it has one) or the setting `fibber.fibrefPath`. The release workflow also
+attaches the extension as `fibber-vscode-VERSION.vsix` to each release
+(`code --install-extension FILE.vsix`). Details: `editors/vscode/README.md`.
+
+## Performance
+
+Measured by `scripts/bench/` (one fibber program per benchmark, each printing a
+checksum; Rust twins in `scripts/bench/rust/`; `FIBC=bin/fibc scripts/bench/run.sh`).
+The table is the ROADMAP's PERF0 measurement (2026-10-03, released fibc 0.1.0, median of 3,
+28-core host, `rustc -O` twins), taken **before** the in-place update of collections
+landed; it has not been re-measured since, and the ROADMAP's Performance section has the
+profiles and the plan. Every benchmark printed the same checksum as its Rust twin.
+
+| benchmark | fibber s | Rust s | ratio | what it does |
+|---|---|---|---|---|
+| num-i64 | 2.97 | 2.87 | 1.0 | loop/recur, 1e9 steps |
+| num-f64 | 1.50 | 1.51 | 0.9 | f64 series, 2e9 steps |
+| recursion | 2.32 | 1.36 | 1.7 | fib 44 + arity-overloaded tail call |
+| binary-trees | 2.81 | 2.55 | 1.1 | depth 18, enum tree |
+| dispatch | 2.66 | 0.39 | 6.8 | protocol, enum match, closures |
+| vec-index | 0.83 | 0.08 | 10.3 | 1e8 `nth` |
+| num-nbody | 1.38 | 0.10 | 13.7 | 5 structs in a Vec, `assoc` per body per step |
+| strings | 1.08 | 0.09 | 11.9 | str, split, join, index-of |
+| lazy-fused | 1.05 | 0.09 | 11.6 | fused range/map/filter/reduce |
+| map-assoc-get | 1.68 | 0.14 | 11.9 | `(Map i64 i64)`, 1e6 assoc, 2e6 get |
+| vec-sort | 0.92 | 0.07 | 13.1 | sort 2e6, sort-by 1e6 |
+| set-conj | 0.84 | 0.05 | 16.7 | 1e6 conj, 1e6 contains? |
+| vec-conj-pop | 1.64 | 0.06 | 27.2 | 2e7 conj, 2e7 pop |
+| lazy-bound | 1.48 | 0.03 | 49.1 | the same chain, each stage bound by `let` |
+| vec-assoc | 3.36 | 0.01 | 333 | 1e7 `assoc` on a unique 1e5 Vec |
+| set-disj | 3.38 | under 0.01 | n/m | 2e4 conj then 1e4 disj; quadratic; `dissoc` was changed in `bea0905`, not re-measured |
+
+Scalar code is at Rust's speed; what touches a collection was 7x to 330x slower, because no
+update was in place. Since then the in-place primitives, the last-use analysis and the library
+over them have landed (spec/stdlib.md §2.5, "When is an update in place"); their effect is to be
+measured, not claimed here.
 
 ## Status
 
