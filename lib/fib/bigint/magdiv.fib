@@ -48,8 +48,9 @@
         (do (addback! &un vn n j) (- qhat 1))
         qhat)))
 
-;; a divided by b, b with two or more limbs and a >= b: the quotient and the remainder
-(defun mag-divmod-long :private (a: (Array i64) b: (Array i64)) -> (Pair (Array i64) (Array i64))
+;; a divided by b, b with two or more limbs and a >= b: the quotient, and the remainder when rem? (else the empty magnitude,
+;; which saves the shift back and the copy of the remainder: a quotient alone is half the passes over the limbs)
+(defun mag-divmod-long :private (a: (Array i64) b: (Array i64) rem?: bool) -> (Pair (Array i64) (Array i64))
   (let [n (array-len b)
         m (- (array-len a) n)
         s (- 31 (limb-bits (array-get b (- n 1))))
@@ -60,11 +61,19 @@
           (if (>= j 0)
               (do (array-set! &q j (div-step! &un vn n j)) (recur (- j 1)))
               ()))
-        (Pair (mag-norm @q) (mag-shr (mag-norm @un) s)))))
+        (mag-trim! &q)
+        (Pair @q (if rem? (mag-shr (mag-norm @un) s) (mag-empty))))))
 
-(defun mag-divmod (a: (Array i64) b: (Array i64)) -> (Pair (Array i64) (Array i64))
+(defun mag-divmod-any :private (a: (Array i64) b: (Array i64) rem?: bool) -> (Pair (Array i64) (Array i64))
   (cond (mag-zero? b) (trap "BigInt: divide by zero")
         (< (mag-cmp a b) 0) (Pair (mag-empty) a)
         (= (array-len b) 1) (let [qr (mag-divmod-small a (array-get b 0))]
                               (Pair (. qr fst) (mag-of-i64 (. qr snd))))
-        :else (mag-divmod-long a b)))
+        :else (mag-divmod-long a b rem?)))
+
+(defun mag-divmod (a: (Array i64) b: (Array i64)) -> (Pair (Array i64) (Array i64))
+  (mag-divmod-any a b true))
+
+;; the quotient alone
+(defun mag-quot (a: (Array i64) b: (Array i64)) -> (Array i64)
+  (. (mag-divmod-any a b false) fst))

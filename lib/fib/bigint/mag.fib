@@ -24,13 +24,21 @@
             (if (and (> k 0) (= (array-get r (- k 1)) 0)) (recur (- k 1)) k))]
     (if (= n (array-len r)) r (array-copy r 0 n))))
 
+;; drops the zero limbs at the high end of a magnitude the caller owns, in place: array-pop! shortens a unique
+;; array without copying it, so the "result may be one limb shorter than I allocated" cases cost no pass
+(defun mag-trim! (&r: (Array i64)) -> unit
+  (let [n (array-len @r)]
+    (if (and (> n 0) (= (array-get @r (- n 1)) 0))
+        (do (array-pop! &r) (mag-trim! &r))
+        ())))
+
 ;; the magnitude of a non-negative i64
 (defun mag-of-i64 (n: i64) -> (Array i64)
   (let [c (cell (array 3 0))]
     (do (array-set! &c 0 (bit-and n MAG-MASK))
         (array-set! &c 1 (bit-and (shr n 31) MAG-MASK))
         (array-set! &c 2 (shr n 62))
-        (mag-norm @c))))
+        (do (mag-trim! &c) @c))))
 
 ;; -1, 0 or 1
 (defun mag-cmp (a: (Array i64) b: (Array i64)) -> i64
@@ -56,7 +64,7 @@
                           (do (array-set! &c i (bit-and t MAG-MASK))
                               (recur (+ i 1) (shr t 31))))
                         carry))]
-      (do (array-set! &c la carry) (mag-norm @c)))))
+      (do (array-set! &c la carry) (do (mag-trim! &c) @c)))))
 
 ;; a - b, for a >= b
 (defun mag-sub (a: (Array i64) b: (Array i64)) -> (Array i64)
@@ -68,7 +76,7 @@
                 (do (array-set! &c i (bit-and t MAG-MASK))
                     (recur (+ i 1) (shr t 63))))
               ()))
-        (mag-norm @c))))
+        (do (mag-trim! &c) @c))))
 
 ;; a * m for 0 <= m < 2^31
 (defun mag-mul-small (a: (Array i64) m: i64) -> (Array i64)
@@ -82,7 +90,7 @@
                           (do (array-set! &c i (bit-and t MAG-MASK))
                               (recur (+ i 1) (shr t 31))))
                         carry))]
-        (do (array-set! &c n carry) (mag-norm @c)))))
+        (do (array-set! &c n carry) (do (mag-trim! &c) @c)))))
 
 ;; a + m for 0 <= m < 2^31
 (defun mag-add-small (a: (Array i64) m: i64) -> (Array i64)
@@ -94,7 +102,7 @@
                       (do (array-set! &c i (bit-and t MAG-MASK))
                           (recur (+ i 1) (shr t 31))))
                     carry))]
-    (do (array-set! &c n carry) (mag-norm @c))))
+    (do (array-set! &c n carry) (do (mag-trim! &c) @c))))
 
 ;; the quotient and the remainder of a by d, 0 < d < 2^31
 (defun mag-divmod-small (a: (Array i64) d: i64) -> (Pair (Array i64) i64)
@@ -108,7 +116,7 @@
                       (do (array-set! &c i (quot t d))
                           (recur (- i 1) (rem t d))))
                     r))]
-        (Pair (mag-norm @c) r))))
+        (Pair (do (mag-trim! &c) @c) r))))
 
 ;; the number of bits of a limb (0 for 0): smear the top bit down, then count
 (defun limb-bits (x: i64) -> i64
@@ -153,7 +161,7 @@
                           (do (array-set! &c (+ i limbs) (bit-or (bit-and (shl x bits) MAG-MASK) carry))
                               (recur (+ i 1) (shr x (- 31 bits)))))
                         carry))]
-        (do (array-set! &c (+ n limbs) carry) (mag-norm @c)))))
+        (do (array-set! &c (+ n limbs) carry) (do (mag-trim! &c) @c)))))
 
 ;; floor (a / 2^k), k >= 0
 (defun mag-shr (a: (Array i64) k: i64) -> (Array i64)
@@ -172,7 +180,7 @@
                                  0)]
                       (do (array-set! &c i (bit-or lo hi)) (recur (+ i 1))))
                     ()))
-              (mag-norm @c))))))
+              (do (mag-trim! &c) @c))))))
 
 ;; whether any of the k low bits of a is set
 (defun mag-low-bits? (a: (Array i64) k: i64) -> bool
