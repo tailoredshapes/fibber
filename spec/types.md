@@ -1889,6 +1889,45 @@ least one of:
    §6.10 treats every `defun` it calls as outside the current SCC; an
    `async` body has no tail calls at all (§6.10 rule (f)).
 
+4. **Declared owned** (batch 6; before it `x: T :owned` on a `defun` was `:owned is not a parameter`, and only the
+   methods of a protocol could say it). A parameter written `x: T :owned` is owned from the start of the fixpoint, for the
+   reason `declared`, whatever the body does with it. Rule 4 of the code (`own.facts` `facts-want-owned`, a field of its shell
+   is consumed at its last use) is the same kind of fact, inferred; this one is written.
+
+**What `:owned` on a `defun` parameter means, and why it is sound.** Surface: `(defun f (a: (Array i64) :owned) ..)`, the
+qualifier after the type, as `:borrow` (syntax §3.1); it is the same keyword a protocol method's parameter takes (syntax
+§3.10) and means the same: the caller hands over one count, the callee releases it or hands it on (§6.4 above). It is
+refused on an `&` parameter (an in/out parameter is a cell and has no count kind: `&x is an in/out parameter and has
+no count kind`), together with `:borrow` (`has more than one of :borrow and :owned`), and is accepted and ignored on a
+parameter that is not an object (a scalar has no count). The kind is a calling convention (the opening of this
+section): it moves where an object is freed and never what the program computes, so declaring it cannot make a
+program wrong, only change what it costs; the declaration can only add to what inference found, never remove (the
+facts only grow). What it buys is the callee's unique update: an owned parameter that is at its last use reaches a
+`cell`, an in-place primitive or a constructor *moved*, with its one count, so `fib.unique?` finds it unique and
+`(let ((c (cell a))) (do (array-set! &c 0 x) @c))` writes in place; a borrowed one would be retained by the `cell` and copied
+at the first write. The caller does not need to know the callee's body: its own `consume` decides the count it hands
+over (§6.3), and that is where the soundness of the whole lies:
+
+- a caller whose argument is **not** at its last use (a later read of the variable, a sibling operand that reads it, a
+  loop that reads it again, a closure that captures it) **retains**: the callee's count is two, the callee's write
+  finds the array shared and copies, and the caller's array is untouched: correct and slower (case 313 passes the
+  array on and reads it afterwards, case 316 reads it in a sibling operand);
+- a caller whose argument is at its last use **moves** its count: no other holder, a unique callee updates in place and the
+  caller cannot observe it because it never reads the variable again (the last-use machinery of lever L1,
+  own.lastuse: reading a binding, an alias of it or a derived part of it later, on any path, a loop's next
+  iteration included, makes the use not last);
+- a shared array (a count of two or more, or `SHARED`, `STACK`, `IMMORTAL`, `HAS-WEAK`, §6.6) is copied by the callee
+  whoever passed it (cases 314, 318);
+- a task or an atom never lets an array be unique while another holder can read it: what `spawn`, `reset!` and `swap!`
+  keep is a count of its own (E2, E4: retained, or moved from a temporary that nobody else names), so an array that the
+  caller still reads, or that an atom still holds, has count two or more in the callee and is copied; one that crosses to
+  another thread is marked `SHARED` and is never written in place (§8.8);
+- an `&` parameter of the caller passed at an `:owned` position is an expression `@p`, an acquire (§6.6): the content has
+  count two (the caller's cell and the temporary), the callee copies; `:owned` does not make an in/out parameter movable;
+- a closure value of a `defun` with an `:owned` parameter is called through its all-owned body (§8.4), unchanged: every
+  object parameter of a closure body is owned already;
+- a protocol method and an `impl` are unchanged: their kinds are declared on the protocol.
+
 An argument expression is **frame-owned** iff it is `Owned` and not
 immortal (a fresh object, a call result, a cell read), or it is
 `Borrowed(x)` or `Derived(x)` for a binding `x` that the caller's frame

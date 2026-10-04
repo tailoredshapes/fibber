@@ -286,7 +286,7 @@ Ownership consequences are stated briefly and decided in types §6.
 
 ```
 (defun name private? (param*) where? ret? body)          ; private ::= :private (§5)
-param ::= sym | sym: type | sym :borrow | sym: type :borrow | &sym | &sym: type
+param ::= sym | sym: type | sym :borrow | sym: type :borrow | sym: type :owned | &sym | &sym: type
        | (pat :as sym: type)            ; a pattern parameter (stdlib §7 L7)
 where ::= :where (constraint+)          ; constraint ::= (Proto type+) | (Send type)
 ret   ::= -> type
@@ -314,7 +314,11 @@ its escape summary (types §6.4) is then part of the interface rather
 than an inference result, and a body that breaks it is the error
 `parameter p of f is declared :borrow but escapes`. Summaries are
 inferred, so the annotation changes no verdict; it documents and pins
-one (**Decided**: the flat spelling is what `x: T` already is). `&sym`
+one (**Decided**: the flat spelling is what `x: T` already is). `x: type :owned`
+declares the other count kind (types §6.4, "Declared owned"): the caller hands over one count and the function releases
+it or hands it on, so a unique array that a caller passes at its last use can be updated in place by the callee; it
+changes no verdict and no result, only where objects are freed and what copies. It is an error on an `&` parameter and
+beside `:borrow`. `&sym`
 is an in-out parameter (§3.13). A function with an `&` parameter is not
 a value: it may be called but not passed, stored or returned
 (**Decided**; types §1.4). A `defun` may not be redefined in its
