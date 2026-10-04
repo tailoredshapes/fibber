@@ -58,9 +58,21 @@ pub struct Jit {
 
 impl Jit {
     pub fn new(opts: JitOptions) -> Result<Jit> {
+        Self::with_codegen(opts, false)
+    }
+
+    /// A session whose code generator runs at level None whatever `opts.opt_level` is (FastISel, no
+    /// DAG scheduling): for the sessions of a compiler, which compile large modules of which little
+    /// runs (the `def` evaluator, the macro runner). The code it makes is slower; use [`Jit::new`]
+    /// for a program the user runs.
+    pub fn new_fast_codegen(opts: JitOptions) -> Result<Jit> {
+        Self::with_codegen(opts, true)
+    }
+
+    fn with_codegen(opts: JitOptions, fast_codegen: bool) -> Result<Jit> {
         target::init();
         let mut jit = ptr::null_mut();
-        let builder = Self::builder(opts)?;
+        let builder = Self::builder(fast_codegen)?;
         // SAFETY: an LLJIT from the builder (which it consumes); its strings
         // are copied before use and the generator is owned by the JITDylib
         // once added.
@@ -98,14 +110,10 @@ impl Jit {
         }
     }
 
-    /// The LLJIT builder for `opts`: null (LLVM's defaults, whose code
-    /// generator runs at its default level) except at optimisation level 0,
-    /// where the code generator runs at level None (FastISel, no DAG
-    /// scheduling), so that a module is compiled fast: this is the path of
-    /// `run`, of the macro runner and of the `def` evaluator, which compile
-    /// large modules of which little runs.
-    fn builder(opts: JitOptions) -> Result<llvm_sys::orc2::lljit::LLVMOrcLLJITBuilderRef> {
-        if opts.opt_level != 0 {
+    /// The LLJIT builder: null (LLVM's defaults, whose code generator runs at its default level) unless
+    /// `fast_codegen`, which builds the LLJIT from a target machine at CodeGenLevelNone.
+    fn builder(fast_codegen: bool) -> Result<llvm_sys::orc2::lljit::LLVMOrcLLJITBuilderRef> {
+        if !fast_codegen {
             return Ok(ptr::null_mut());
         }
         let machine = Machine::host(0)?;

@@ -71,6 +71,13 @@ typedef struct lair_jit lair_jit;
  * *out is the session; on failure *out is NULL (when `out` is not). */
 lair_error *lair_jit_new(int opt_level, lair_jit **out);
 
+/* As lair_jit_new, with the code generator at its fastest, least optimising
+ * level whatever opt_level is: for a compiler's own sessions (a `def`
+ * evaluator, a macro runner), which compile large modules of which little
+ * runs. The code it makes is slower; a program the user runs wants
+ * lair_jit_new. */
+lair_error *lair_jit_new_fast_codegen(int opt_level, lair_jit **out);
+
 /* End a session. Every address it gave out dies with it: calling one
  * afterwards, or while the call is in progress, is undefined behaviour.
  * NULL does nothing. */

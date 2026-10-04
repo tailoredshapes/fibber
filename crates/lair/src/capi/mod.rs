@@ -49,7 +49,8 @@ pub use error::{lair_error_free, lair_error_text, LairError};
 #[cfg(feature = "test-panic")]
 pub use error::{TEST_PANIC_ADDRESS, TEST_PANIC_SOURCE};
 pub use jit::{
-    lair_jit_add_source, lair_jit_address, lair_jit_c_entry, lair_jit_free, lair_jit_new, LairJit,
+    lair_jit_add_source, lair_jit_address, lair_jit_c_entry, lair_jit_free, lair_jit_new,
+    lair_jit_new_fast_codegen, LairJit,
 };
 pub use mailbox::{
     lair_call_fault, lair_call_free, lair_call_hook_arg, lair_call_hook_reply, lair_call_new,

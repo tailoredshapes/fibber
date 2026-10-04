@@ -46,6 +46,29 @@ pub unsafe extern "C" fn lair_jit_new(opt_level: c_int, out: *mut *mut LairJit) 
     })
 }
 
+/// As [`lair_jit_new`], with the code generator at its fastest and least optimising level
+/// whatever `opt_level` is: for the sessions of a compiler (a `def` evaluator, a macro runner).
+///
+/// # Safety
+/// `out` is null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn lair_jit_new_fast_codegen(
+    opt_level: c_int,
+    out: *mut *mut LairJit,
+) -> *mut LairError {
+    if !out.is_null() {
+        *out = ptr::null_mut();
+    }
+    guard(|| {
+        let out = out_param("out", out)?;
+        let level = level_arg(opt_level)?;
+        let jit =
+            Jit::new_fast_codegen(JitOptions { opt_level: level }).map_err(|e| e.to_string())?;
+        *out = Box::into_raw(Box::new(jit)).cast::<LairJit>();
+        Ok(())
+    })
+}
+
 /// End a session. Every address it gave dies with it: calling one
 /// afterwards, or while this call runs, is undefined behaviour. A null
 /// `jit` does nothing.
