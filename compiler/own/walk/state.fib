@@ -64,10 +64,11 @@
 ;; whether the bodies walked are all-owned (§8.4); the tail sites once known (`nil` while
 ;; finding them); whether tail sites are admitted by rule (e) with these facts; the
 ;; scope-local sites once known; the expressions that are the last use of the binding they read
-;; (own.lastuse; none until the last walk).
+;; (own.lastuse; none until the last walk), and the reads of field variables that are the last use of a field
+;; whose shell nothing else reads afterwards.
 (defstruct Ctx
   (p: TypedProgram summaries: (Map i64 Summary) facts: Facts scc: (Vec i64) all-owned: bool
-   tail-sites: (Option (Map i64 Tail)) admit: bool scope-local: (Set Site) dead: (Set i64)))
+   tail-sites: (Option (Map i64 Tail)) admit: bool scope-local: (Set Site) dead: (Set i64) steal: (Set i64) amp: (Set i64)))
 
 (defenum FrameKind FkDefun FkMethod FkFn FkAsync FkDef)
 (derive Eq FrameKind)
@@ -96,7 +97,7 @@
   (cx: Ctx frames: (Cell (Vec Frame)) site-frame: (Cell (Map Site i64)) out: (Cell BodyOwn)
    events: (Cell (Vec Event)) tails: (Cell (Map i64 Tail)) candidates: (Cell (Map Site i64))
    expr: (fn (Walker Expr bool) Mode)
-   moved: (Cell (Set Site)) diverged: (Cell bool)))
+   moved: (Cell (Set Site)) diverged: (Cell bool) stealable: (Cell (Map i64 Site))))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; The methods of Rust's `Walker` (walk/mod.rs:207-458) are functions `w-NAME` of the walker, which
@@ -110,7 +111,7 @@
 ;; expression (the cycle's function field).
 (defun walker-new (cx: Ctx expr: (fn (Walker Expr bool) Mode)) -> Walker
   (Walker cx (cell []) (cell (map-empty)) (cell (body-own-new)) (cell []) (cell (map-empty))
-          (cell (map-empty)) expr (cell (set-empty)) (cell false)))
+          (cell (map-empty)) expr (cell (set-empty)) (cell false) (cell (map-empty))))
 
 ;; Rust: walk/mod.rs:452 `kind_of_param`: an owned parameter is `BnOwnedParam`, else `BnBorrowedParam`.
 (defun kind-of-param (owned: bool) -> BindKind
@@ -331,6 +332,19 @@
        (w-movable w s)
        (not (contains? (. (. w cx) scope-local) s))
        (not (w-env-moved? w s))))
+
+;; Whether `x`, a read of the variable bound to a field of a shell, is the field's last use and the shell may be
+;; stolen from: it is this frame's own (an owner of a count that is not on the stack), nothing else reads it after.
+(defun w-steal? (w: Walker x: Expr) -> bool
+  (and (contains? (. (. w cx) steal) (. x id))
+       (match (. x kind)
+         ((ELocal b)
+          (match (get @(. w stealable) b)
+            ((some s) (and (w-movable w s)
+                           (not (contains? (. (. w cx) scope-local) s))
+                           (not (w-env-moved? w s))))
+            (_ false)))
+         (_ false))))
 
 ;; The state to branch from, and what a branch ended in.
 (defstruct Branch (moved: (Set Site) jumped: bool))

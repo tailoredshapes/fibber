@@ -39,6 +39,34 @@
   (when-some (w (lcx-obj-word cx v))
     (fb-stmt (. cx b) (str-join ["(call @fib.retain " w ")"]))))
 
+;; `PsSteal` of the value `v` of the pattern variable `b` (own.program): when the shell it was read from is unique at run time, `v` moves out
+;; of the shell (its slot is nulled) and keeps its count; else it is retained as `PsRetain` does. A variable without an origin, or a value that is
+;; not a plain pointer, is retained.
+(defun lcx-steal (cx: LowerCx b: i64 v: V) -> unit
+  (match (get @(. cx origins) b)
+    (nil (lcx-retain cx v))
+    ((some o)
+     (match (Pair v (. o shell))
+       ((Pair (VVal _ (LirPtr)) (VVal sh (LirPtr)))
+        (let ((f (. cx b)))
+          (let ((unique (fb-val f (str-join ["(call @fib.unique? " sh ")"]) LirI1))
+                (ls (fb-label f "steal")) (lk (fb-label f "keep")) (lj (fb-label f "stolen")))
+            (do (fb-term f (str-join ["(br " (v-text unique) " " ls " " lk ")"]))
+                (fb-open f ls)
+                (fb-stmt f (str-join ["(store (ptr null) " (lcx-gep cx (. o sname) sh (. o slot)) ")"]))
+                (fb-term f (str-join ["(br " lj ")"]))
+                (fb-open f lk)
+                (lcx-retain cx v)
+                (fb-term f (str-join ["(br " lj ")"]))
+                (fb-open f lj)))))
+       (_ (lcx-retain cx v))))))
+
+;; The steal of the argument expression `x`, a read of a pattern variable.
+(defun lcx-steal-of (cx: LowerCx x: Expr v: V) -> unit
+  (match (. x kind)
+    ((ELocal b) (lcx-steal cx b v))
+    (_ (lcx-retain cx v))))
+
 ;; Rust: lower/ops.rs:75 Cx::release
 (defun lcx-release (cx: LowerCx v: V) -> unit
   (when-some (w (lcx-obj-word cx v))

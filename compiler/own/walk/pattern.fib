@@ -33,11 +33,28 @@
   (do (w-own-site w (SiteBind r) false)
       (w-bind w r (w-owning r) BnOwns)))
 
+;; The variables that are direct sub-patterns of a top-level constructor pattern (but an `Option`'s), matched
+;; against a scrutinee that is a site's value (`whole` is `Borrowed`: a binding's or an owned temporary's), name fields
+;; of that shell: the plan may steal them (`PsSteal`) at their last use.
+(defun note-fields :private (w: Walker pat: Pattern whole: Mode) -> unit
+  (match (. pat kind)
+    ((PCtor t _ subs)
+     (match whole
+       ((MBorrowed s)
+        (when (not (= t @(. (. (w-p w) globals) option)))
+          (doseq [p subs]
+            (match (. p kind)
+              ((PBind x) (when (w-binding-is-object w x) (set! (. w stealable) (assoc @(. w stealable) x s))))
+              (_ (do))))))
+       (_ (do))))
+    (_ (do))))
+
 ;; Rust: walk/pattern.rs:36 `Walker::bind_pattern`: binds the variables of pat; `top` while no
 ;; constructor pattern encloses it.
 (defun bind-pattern (w: Walker pat: Pattern whole: Mode inner: Mode top: bool) -> unit
   (let [here (if top whole inner)]
-    (match (. pat kind)
+    (do (when top (note-fields w pat whole))
+        (match (. pat kind)
       ((PWild) (do))
       ((PLit _) (do))
       ((PBind b) (bind-var w b here))
@@ -45,7 +62,7 @@
       ((PAs p b) (do (bind-var w b here) (bind-pattern w p whole inner top)))
       ((PVec subs rest)
        (do (doseq [s subs] (bind-pattern w s whole inner false))
-           (match rest ((RestBind r) (bind-rest w r)) (_ (do))))))))
+           (match rest ((RestBind r) (bind-rest w r)) (_ (do)))))))))
 
 ;; Rust: walk/expr.rs:274 `Walker::scrutinee`: the scrutinee s of mode m (an `Owned` one is an implicit
 ;; owning binding of the scope, a §6.11 candidate if s allocates): the two modes `pattern-modes` gives.

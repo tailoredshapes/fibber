@@ -13,13 +13,17 @@ Effect on the plan, for the same program:
   at the scope exit, the `recur` jump (`release [v] (old loop value)`) or the return is then absent on that path;
 - at a branch (`if`, `match`) where one arm falls through having handed a binding over and another does not use it,
   the other arm releases it at its own end (`w-branch-merge`), so the exit that follows skips it;
+- a field variable of a top-level constructor pattern (not `Option`'s) whose shell is an owner's value or an owned
+  temporary, at the variable's last use, with nothing reading the shell as a whole afterwards, is consumed as `steal`
+  (`explain`: `stolen`) where the Rust says `retain`; the emitter then tests `fib.unique?` of the shell at run time
+  (`lcx-steal` in `emit/lower/ops.fib`): unique, the field moves out and its slot is nulled; shared, it is retained;
 - nothing else changes: the facts, the summaries, the tail-call decisions and the scope-local sets are the same
   (the events do not depend on the passes), so `fibref own --sections facts,summary,taken` still equals stage 2's.
 
 So `fibref own` and `fibref explain` (and `fibc explain` of the seed) disagree with stage 2's on the `body` and
 `explain` sections of any program with such a use, and `fibref`'s emitted lIR has more retain/release pairs than
 stage 2's. Examples: `compiler/tests/own/last-use/*.fib` with their goldens (written from stage 2; the Rust has no
-oracle for them), and `cases/ownership/248..256`. The 15 programs of `compiler/tests/own/golden/` contain no such use,
+oracle for them), and `cases/ownership/248..260`. The 15 programs of `compiler/tests/own/golden/` contain no such use,
 so their dumps are unchanged by the pass.
 
 Not ported, and not to be: the Rust is the seed, and the seed's plan is the conservative one that this pass improves on.

@@ -1,0 +1,16 @@
+;; spec:   types §6.6 (copy-in, copy-out); docs/design/in-place-update.md §1 (lever L1)
+;; expect: accept
+;; result: 14
+;; audit:  clean
+;; allocs: <= 1
+;; `(bump &c)`: nothing else can read `c` while `bump` runs (no closure captures it, no other argument mentions it), so
+;; the call takes the array out of the cell instead of retaining it for the private cell, and the write-back stores
+;; the result without releasing the old content. `bump` then finds the array unique and `array-set!` writes in place:
+;; the array is the one heap object (the cells are on the stack). With the copy-in retained the write copies it: two.
+(defun bump (&a: (Array i64)) -> unit (array-set! &a 0 9))
+
+(defun main () -> i64
+  (let ((c (cell (array 4 1))))
+    (do (bump &c)
+        (bump &c)
+        (+ (array-get @c 0) (array-get @c 1) 4))))

@@ -1,0 +1,21 @@
+;; spec:   types §6.3 (consume), §6.6 (unique writes); docs/design/in-place-update.md §1 (steal, lever L1)
+;; expect: accept
+;; result: 10
+;; audit:  clean
+;; The plan steals `a` from `h` (`h` is not read again), but `keeper` also holds the Holder, so at run time it is
+;; not unique and `a` is retained, not taken: the write through the cell copies the array, and the array `keeper`
+;; holds still reads 1. A steal that does not test uniqueness would null the shared Holder's field and read a
+;; null array here.
+(defstruct Holder (a: (Array i64)))
+(defstruct Keeper (h: Holder))
+(defun keep (h: Holder) -> Holder h)
+
+(defun main () -> i64
+  (let ((h (keep (Holder (array 4 1)))))
+    (let ((keeper (Keeper h)))
+      (+ (match h
+           ((Holder a)
+            (let ((c (cell a)))
+              (do (array-set! &c 0 9)
+                  (array-get @c 0)))))
+         (array-get (. (. keeper h) a) 0)))))

@@ -1,0 +1,20 @@
+;; spec:   types §6.3 (consume), §6.6 (unique writes); docs/design/in-place-update.md §1 (steal, lever L1)
+;; expect: accept
+;; result: 20
+;; audit:  clean
+;; allocs: <= 3
+;; Both fields of a unique shell are taken at their last uses, the second after the first: each steal nulls only its
+;; own slot, the shell stays alive until its exit (and frees nothing it no longer holds). Three heap objects: the two
+;; arrays and the Two; each write is in place.
+(defstruct Two (a: (Array i64) b: (Array i64)))
+(defun keep (t: Two) -> Two t)
+
+(defun main () -> i64
+  (let ((t (keep (Two (array 4 1) (array 4 2)))))
+    (match t
+      ((Two a b)
+       (let ((ca (cell a)))
+         (do (array-set! &ca 0 9)
+             (let ((cb (cell b)))
+               (do (array-set! &cb 0 8)
+                   (+ (array-get @ca 0) (+ (array-get @cb 0) (+ (array-get @ca 1) (array-get @cb 1))))))))))))

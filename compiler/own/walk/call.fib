@@ -59,7 +59,7 @@
             pass (arg-pass w cs i a (nth ms i) (nth params i) moved)]
         (recur (+ i 1) (conj passes pass)
                (match a
-                 ((ArgAmp b _) :when (= pass PsAcquire) (conj wbs (Pair i b)))
+                 ((ArgAmp b _) :when (or (= pass PsAcquire) (= pass PsMoveIn)) (conj wbs (Pair i b)))
                  (_ wbs)))))))
 
 ;; The end of a call: the jump of a tail call (§6.10 step 3), or the release of the step's
@@ -183,6 +183,7 @@
      (do (set! moved (conj @moved s)) PsMove))
     ((MBorrowed s) :when (w-last-use? w x s)
      (do (w-mark-moved w s) PsMove))
+    ((MDerived _) :when (w-steal? w x) PsSteal)
     (_ PsRetain)))
 
 ;; How the head is handed over: a scalar when the head is not a closure value (§6.3), the
@@ -200,7 +201,8 @@
                (AtHead (->HeadAt (. cs call) (. cs site) admitted self-tail)))
        (if (and self-tail admitted)
          PsKeepEnv
-         (let [pass (consume w head hm moved admitted)]
+         (let [taken (consume w head hm moved admitted)
+               pass (if (= taken PsSteal) PsRetain taken)]
            (stack-literal-temp w head pass)
            pass))))))
 
@@ -216,7 +218,8 @@
 (defun arg-pass :private (w: Walker cs: CallSite i: i64 a: Arg m: (Option Mode) p: Param
                           moved: (Cell (Set Site))) -> Pass
   (match a
-    ((ArgAmp b _) (amp-pass w b (. cs callee) (and (. cs tail) (not (nth (. cs captured) i)))))
+    ((ArgAmp b _) (amp-pass w b (. cs callee) (and (. cs tail) (not (nth (. cs captured) i)))
+                            (and (contains? (. (. w cx) amp) (+ (* (. cs call) 64) i)) (w-movable w (SiteBind b)))))
     ((ArgExpr x)
      (match m
        (nil PsScalar)
@@ -256,12 +259,13 @@
                           (. cs site) (. cs admitted) (w-frame-owned w m)))))
 
 ;; `&b` handed to a callee (§6.6); `tail`: in tail position and not captured by another argument.
-(defun amp-pass :private (w: Walker b: i64 c: Callee tail: bool) -> Pass
+(defun amp-pass :private (w: Walker b: i64 c: Callee tail: bool take: bool) -> Pass
   (do (when-not (is-amp (. (. (. w cx) p) globals) b)
         (w-note w (some (VB (SiteBind b))) AtOther))
       (cond
         (match c ((CalBuiltin _) true) (_ false)) PsOwnCell
         (and tail (forwards? w b)) PsForward
+        take PsMoveIn
         :else PsAcquire)))
 
 ;; Rust: walk/call.rs:335 `Walker::recur`: `(recur ..)`, a tail call to the loop (§6.10).

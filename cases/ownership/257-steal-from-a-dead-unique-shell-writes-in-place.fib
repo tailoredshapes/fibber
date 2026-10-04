@@ -1,0 +1,20 @@
+;; spec:   types §6.3 (consume), §6.6 (unique writes); docs/design/in-place-update.md §1 (steal, lever L1)
+;; expect: accept
+;; result: 9
+;; audit:  clean
+;; allocs: <= 2
+;; `h` is the only holder of the Holder and nothing reads it after `a` is taken out of it, so at `a`'s last use the
+;; Holder is unique and dead: the array moves out of it (its slot is nulled, the Holder is freed at the exit) and keeps
+;; its count of one. The cell that takes `a` therefore holds the only reference and `array-set!` writes in place: two
+;; heap objects in all, the array and the Holder (`keep` makes the Holder one; the cell is on the stack). With the field
+;; retained instead (count 2) the write copies the array: three.
+(defstruct Holder (a: (Array i64)))
+(defun keep (h: Holder) -> Holder h)
+
+(defun main () -> i64
+  (let ((h (keep (Holder (array 4 1)))))
+    (match h
+      ((Holder a)
+       (let ((c (cell a)))
+         (do (array-set! &c 0 9)
+             (array-get @c 0)))))))

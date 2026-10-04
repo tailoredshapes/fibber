@@ -1,11 +1,20 @@
 ;; compiler/own/lastuse.fib: last uses (spec/types.md §6.3, §6.4; docs/design/in-place-update.md §1, lever L1).
 ;;
 ;; One backward liveness pass over a body, run after the decisive walk has said which site every
-;; expression reads (its `Mode`). The answer is a set of expression ids: x is in it when x reads a
-;; binding's site (mode `Borrowed(SiteBind b)`) and nothing on any path after x completes reads that
-;; site again, directly or through an alias or a part of it (a variable whose mode is `Borrowed` or
-;; `Derived` of the same site). The walk consumes such an x by a move: no retain here, no release of b
-;; later (the walk, own.walk.step, keeps the paths straight).
+;; expression reads (its `Mode`). It answers two sets of expression ids:
+;; - `dead`: x reads a binding's site (mode `Borrowed(SiteBind b)`) and nothing on any path after x
+;;   completes reads that site again, directly or through an alias or a part of it. The walk consumes
+;;   such an x by a move: no retain here, no release of b later (own.walk.step keeps the paths straight);
+;; - `steal`: x is a variable bound to a field of a shell (a top-level constructor pattern's
+;;   direct variable) and neither x nor the shell, as a whole, is read after x. The walk consumes such
+;;   an x by a steal: if the shell is unique at run time the field moves out of it (nulled), else it is retained;
+;; - `amp`: the `&b` argument k of call e, where b is a cell that no `fn` or `async` literal of the body captures and
+;;   no other operand of the call mentions: the call may take the cell's content (no copy-in retain, no release of the
+;;   old content at the write-back) since nothing can read the variable until the write-back.
+;;
+;; What is read is named by ids (`wid`, `pid`, `vid`): reading a shell or any alias of it or any part of it that
+;; is not a field variable reads the whole (`wid`); reading a field variable x reads x (`vid`) and "some part of
+;; the shell" (`pid`), which a move of the shell must wait for but a steal of another field need not.
 ;;
 ;; What makes a read "later" (the pass only ever errs towards "later", never towards "last"):
 ;; - a loop is walked twice, so what its body reads before the next `recur` is live at every `recur`
@@ -13,40 +22,59 @@
 ;;   inside it is therefore never last inside the loop unless the path leaves the loop;
 ;; - the other operands of a call (`ECall`, `EConcat`, `ESet`): a borrowed argument is a pointer into
 ;;   its site that stays pending until the call, so a read by any sibling operand, before or after, keeps
-;;   the site live (`x` of `Lu`: the sites that count in the answer only, never in the flow);
+;;   the site live (`pend` of `Lu`: the ids that count in the answer only, never in the flow);
 ;; - an `&b` argument reads b at the call and again at the write-back;
-;; - a `match` guard never moves (the false edge reads what the later clauses read), nor does an
-;;   `async` body (suspension points), nor a binding some `fn` or `async` literal captures (a stack
-;;   closure reads it when it is called, not when it is made), nor its aliases' roots.
+;; - a `match` guard never moves, nor does an `async` body (suspension points), nor a binding some `fn` or
+;;   `async` literal captures (a stack closure reads it when it is called, not when it is made), nor its
+;;   aliases' roots.
 (ns own.lastuse
   (:use types.ast own.program))
 
 ;; What the pass reads and fills: the modes and the binding kinds of the walk it follows, the
-;; bindings that are pinned (never moved), the reads of the operands of the sibling forms, the answer.
+;; bindings that are pinned (never moved), the field variables, the reads of the operands of the
+;; sibling forms, the answers.
 (defstruct LuCx
-  (modes: (Map i64 ExprOwn) kinds: (Map i64 BindingOwn) pinned: (Set i64)
-   kids: (Cell (Map i64 (Set i64))) dead: (Cell (Set i64))))
+  (modes: (Map i64 ExprOwn) kinds: (Map i64 BindingOwn) pinned: (Set i64) stv: (Set i64)
+   kids: (Cell (Map i64 (Set i64))) dead: (Cell (Set i64)) steal: (Cell (Set i64)) amp: (Cell (Set i64))))
 
-;; One traversal: the context, the sites live at the next `recur`, whether the answer is filled,
-;; and the sites that count in the answer but not in the flow.
+;; What the pass found: the expressions that are a last use (move), the reads of a field variable that are a last use
+;; (steal), and the `&b` arguments, as call id * 64 + argument index, whose cell nothing else can read during the call (move-in).
+(defstruct LastUses (dead: (Set i64) steal: (Set i64) amp: (Set i64)))
+
+;; One traversal: the context, the ids live at the next `recur`, whether the answer is filled,
+;; and the ids that count in the answer but not in the flow.
 (defstruct Lu (cx: LuCx back: (Set i64) fill: bool pend: (Set i64)))
 
 (defun uni :private (a: (Set i64) b: (Set i64)) -> (Set i64)
   (reduce (fn (acc: (Set i64) x: i64) (conj acc x)) a (vec b)))
 
-(defun kill :private (s: (Set i64) ids: (Vec i64)) -> (Set i64)
-  (reduce (fn (acc: (Set i64) x: i64) (disj acc x)) s ids))
+;; The ids of a site read as a whole and as a part of a shell; of a variable.
+(defun wid :private (s: Site) -> (Option i64)
+  (match s ((SiteBind b) (some (* b 8))) ((SiteValue e) (some (+ (* e 8) 3))) (_ nil)))
+(defun pid :private (s: Site) -> (Option i64)
+  (match s ((SiteBind b) (some (+ (* b 8) 1))) ((SiteValue e) (some (+ (* e 8) 4))) (_ nil)))
+(defun vid :private (x: i64) -> i64 (+ (* x 8) 2))
 
-(defun site-root :private (m: Mode) -> (Option i64)
-  (match m
-    ((MBorrowed (SiteBind b)) (some b))
-    ((MDerived (SiteBind b)) (some b))
-    (_ nil)))
+(defun ids-of :private (xs: (Vec (Option i64))) -> (Set i64)
+  (reduce (fn (acc: (Set i64) o: (Option i64)) (match o ((some x) (conj acc x)) (_ acc))) (set-empty) xs))
+
+;; The variables' ids no longer live: a binding that goes out of scope or is assigned.
+(defun kill :private (s: (Set i64) ids: (Vec i64)) -> (Set i64)
+  (reduce (fn (acc: (Set i64) b: i64) (disj (disj (disj acc (* b 8)) (+ (* b 8) 1)) (+ (* b 8) 2))) s ids))
 
 (defun mode-of :private (u: Lu e: Expr) -> Mode
   (match (get (. (. u cx) modes) (. e id))
     ((some x) (. x mode))
     (_ MScalar)))
+
+;; What the local variable x, read by e, reads.
+(defun local-reads :private (u: Lu e: Expr x: i64) -> (Set i64)
+  (match (mode-of u e)
+    ((MBorrowed s) (ids-of [(wid s)]))
+    ((MDerived s) (if (contains? (. (. u cx) stv) x)
+                    (ids-of [(some (vid x)) (pid s)])
+                    (ids-of [(wid s)])))
+    (_ (set-empty))))
 
 ;; The variables a pattern binds.
 (defun pat-binds :private (p: Pattern acc: (Vec i64)) -> (Vec i64)
@@ -59,9 +87,41 @@
        (match rest ((RestBind r) (conj a r)) (_ a))))
     (_ acc)))
 
+;; The field variables of a pattern matched against a shell (a scrutinee that is a binding's value or owned):
+;; the variables that are the direct sub-patterns of a top-level constructor pattern, except an `Option`'s.
+(defun field-vars :private (p: Pattern opt: i64 acc: (Vec i64)) -> (Vec i64)
+  (match (. p kind)
+    ((PCtor t _ subs)
+     (if (= t opt)
+       acc
+       (reduce (fn (a: (Vec i64) s: Pattern) (match (. s kind) ((PBind x) (conj a x)) (_ a))) acc subs)))
+    (_ acc)))
+
+;; Whether the expression is a shell in the above sense: it reads a binding's site as itself, or is owned.
+(defun shell? :private (modes: (Map i64 ExprOwn) s: Expr) -> bool
+  (match (get modes (. s id))
+    ((some x) (match (. x mode) ((MBorrowed _) true) ((MOwned _) true) (_ false)))
+    (_ false)))
+
+;; The field variables of every match and let pattern under e.
+(defun stv-in :private (modes: (Map i64 ExprOwn) opt: i64 e: Expr acc: (Vec i64)) -> (Vec i64)
+  (reduce (fn (a: (Vec i64) c: Expr) (stv-in modes opt c a))
+          (match (. e kind)
+            ((EMatch s cls)
+             (if (shell? modes s)
+               (reduce (fn (a: (Vec i64) c: Clause) (field-vars (. c pat) opt a)) acc cls)
+               acc))
+            ((ELet bs _)
+             (reduce (fn (a: (Vec i64) b: LetBind)
+                       (if (shell? modes (. b init)) (field-vars (. b pat) opt a) a))
+                     acc bs))
+            (_ acc))
+          (expr-children e)))
+
 ;; The `&b` arguments of a call.
 (defun amps-of :private (args: (Vec Arg)) -> (Set i64)
-  (reduce (fn (acc: (Set i64) a: Arg) (match a ((ArgAmp b _) (conj acc b)) (_ acc)))
+  (reduce (fn (acc: (Set i64) a: Arg)
+            (match a ((ArgAmp b _) (uni acc (ids-of [(some (* b 8))]))) (_ acc)))
           (set-empty) args))
 
 ;; The forms whose operands are siblings in the sense of the header.
@@ -72,21 +132,26 @@
     ((ESet _ _) true)
     (_ false)))
 
-;; Phase A: the sites an expression reads anywhere inside it (a literal reads its captures and
+;; The ids of the captured bindings, as read where the literal is made.
+(defun capture-reads :private (caps: (Vec i64)) -> (Set i64)
+  (reduce (fn (acc: (Set i64) b: i64) (uni acc (ids-of [(some (* b 8)) (some (+ (* b 8) 1)) (some (vid b))])))
+          (set-empty) caps))
+
+;; Phase A: the ids an expression reads anywhere inside it (a literal reads its captures and
 ;; nothing of its body); fills `kids` for the operands of the sibling forms.
 (defun reads-of :private (u: Lu e: Expr) -> (Set i64)
   (match (. e kind)
-    ((ELocal _) (match (site-root (mode-of u e)) ((some b) (conj (set-empty) b)) (_ (set-empty))))
-    ((EFn lit) (into (set-empty) (. lit captures)))
-    ((EAsync _ caps) (into (set-empty) caps))
+    ((ELocal x) (local-reads u e x))
+    ((EFn lit) (capture-reads (. lit captures)))
+    ((EAsync _ caps) (capture-reads caps))
     (_
      (let [cs (expr-children e)
            rs (mapv (fn (c: Expr) (reads-of u c)) cs)
            extra (match (. e kind)
                    ((ECall _ args) (amps-of args))
-                   ((EDeref (PlAmp b) _) (conj (set-empty) b))
-                   ((ESet (PlAmp b) _) (conj (set-empty) b))
-                   ((ESetField b _ _) (conj (set-empty) b))
+                   ((EDeref (PlAmp b) _) (ids-of [(some (* b 8))]))
+                   ((ESet (PlAmp b) _) (ids-of [(some (* b 8))]))
+                   ((ESetField b _ _) (ids-of [(some (* b 8))]))
                    (_ (set-empty)))]
        (do (when (sibling-form? e)
              (let [c0 (. u cx)]
@@ -95,16 +160,35 @@
                              @(. c0 kids) (range (count cs))))))
            (reduce uni extra rs))))))
 
-;; Phase B: records e when it is the last use of the binding whose site it reads.
+;; Whether the ids are all absent from the flow and the pending set.
+(defun none-live? :private (u: Lu live: (Set i64) ids: (Vec (Option i64))) -> bool
+  (every? (fn (o: (Option i64))
+            (match o
+              ((some x) (not (or (contains? live x) (contains? (. u pend) x))))
+              (_ true)))
+          ids))
+
+;; Phase B: records e when it is the last use of the binding whose site it reads (`dead`), or of
+;; the field variable it reads (`steal`).
 (defun record :private (u: Lu e: Expr live: (Set i64)) -> unit
   (when (. u fill)
     (match (mode-of u e)
       ((MBorrowed (SiteBind b))
-       (when (not (or (contains? live b) (contains? (. u pend) b) (contains? (. (. u cx) pinned) b)))
+       (when (and (none-live? u live [(some (* b 8)) (some (+ (* b 8) 1))])
+                  (not (contains? (. (. u cx) pinned) b)))
          (let [d (. (. u cx) dead)] (set! d (conj @d (. e id))))))
+      ((MDerived s)
+       (match (. e kind)
+         ((ELocal x)
+          (when (and (contains? (. (. u cx) stv) x)
+                     (none-live? u live [(wid s) (some (vid x))])
+                     (not (contains? (. (. u cx) pinned) x))
+                     (match s ((SiteBind b) (not (contains? (. (. u cx) pinned) b))) (_ true)))
+            (let [d (. (. u cx) steal)] (set! d (conj @d (. e id))))))
+         (_ ())))
       (_ ()))))
 
-;; The operands cs in evaluation order, the last live-after `live`: the sites live before the
+;; The operands cs in evaluation order, the last live-after `live`: the ids live before the
 ;; first. With `sib`, the reads of the operands before one count in the answer for it.
 (defun trav-seq :private (u: Lu cs: (Vec Expr) live: (Set i64) sib: bool) -> (Set i64)
   (let [kids @(. (. u cx) kids)
@@ -118,7 +202,7 @@
                        u)
                      (nth cs k) acc))))))
 
-;; The clauses of a match, from the last: the sites live before each, falling through its guard to the
+;; The clauses of a match, from the last: the ids live before each, falling through its guard to the
 ;; later clauses; the union over all of them is what is live before the first test.
 (defun match-in :private (u: Lu cls: (Vec Clause) lbs: (Vec (Set i64)) live: (Set i64)) -> (Set i64)
   (let [nog (with u (fill false))]
@@ -142,22 +226,36 @@
         pass2 (trav (with u (back g)) body live)]
     (trav-seq u (mapv (fn (b: LoopBind) (. b init)) bs) (kill pass2 vars) false)))
 
-;; Phase B: the sites live before e, given those live after it; the answer filled on the way.
+;; Records the `&b` arguments of the call e that may take the cell's content.
+(defun note-amps :private (u: Lu e: Expr args: (Vec Arg)) -> unit
+  (when (. u fill)
+    (let [kids @(. (. u cx) kids)
+          sibs (reduce (fn (acc: (Set i64) c: Expr) (uni acc (get kids (. c id) (set-empty)))) (set-empty) (expr-children e))
+          d (. (. u cx) amp)]
+      (doseq [i (range (count args))]
+        (match (nth args i)
+          ((ArgAmp b _)
+           (when (and (not (contains? sibs (* b 8))) (not (contains? (. (. u cx) pinned) b)))
+             (set! d (conj @d (+ (* (. e id) 64) i)))))
+          (_ ()))))))
+
+;; Phase B: the ids live before e, given those live after it; the answers filled on the way.
 (defun trav (u: Lu e: Expr live: (Set i64)) -> (Set i64)
   (do (record u e live)
       (match (. e kind)
-        ((ELocal _) (match (site-root (mode-of u e)) ((some b) (conj live b)) (_ live)))
-        ((EFn lit) (uni live (into (set-empty) (. lit captures))))
-        ((EAsync _ caps) (uni live (into (set-empty) caps)))
+        ((ELocal x) (uni live (local-reads u e x)))
+        ((EFn lit) (uni live (capture-reads (. lit captures))))
+        ((EAsync _ caps) (uni live (capture-reads caps)))
         ((ECall _ args)
          (let [amps (amps-of args)]
-           (uni (trav-seq u (expr-children e) (uni live amps) true) amps)))
+           (do (note-amps u e args)
+               (uni (trav-seq u (expr-children e) (uni live amps) true) amps))))
         ((EConcat es) (trav-seq u es live true))
         ((ESet p _)
          (let [acc (trav-seq u (expr-children e) live true)]
-           (match p ((PlAmp b) (conj acc b)) (_ acc))))
-        ((EDeref (PlAmp b) _) (conj live b))
-        ((ESetField b _ v) (conj (trav u v live) b))
+           (match p ((PlAmp b) (uni acc (ids-of [(some (* b 8))]))) (_ acc))))
+        ((EDeref (PlAmp b) _) (uni live (ids-of [(some (* b 8))])))
+        ((ESetField b _ v) (uni (trav u v live) (ids-of [(some (* b 8))])))
         ((EIf c t f) (trav u c (uni (trav u t live) (trav u f live))))
         ((EDo es) (trav-seq u es live false))
         ((ELet bs body)
@@ -170,7 +268,7 @@
         ((ERecur es) (trav-seq u es (. u back) false))
         (_ (trav-seq u (expr-children e) live false)))))
 
-;; The bindings a literal under e captures, and the bindings whose sites they alias or are part of.
+;; The bindings a literal under e captures.
 (defun captured-in :private (e: Expr acc: (Vec i64)) -> (Vec i64)
   (reduce (fn (a: (Vec i64) c: Expr) (captured-in c a))
           (match (. e kind)
@@ -179,6 +277,7 @@
             (_ acc))
           (expr-children e)))
 
+;; The binding b and the bindings whose sites it aliases or is a part of.
 (defun pin-root :private (u: Lu b: i64 pinned: (Set i64)) -> (Set i64)
   (if (contains? pinned b)
     pinned
@@ -198,13 +297,16 @@
     ((EFn lit) (fn-bodies (. lit body) (conj acc (. lit body))))
     (_ (reduce (fn (a: (Vec Expr) c: Expr) (fn-bodies c a)) acc (expr-children e)))))
 
-;; The expressions of the body (and of its `fn` literals) that are the last use of a binding.
-(defun last-uses (body: Expr out: BodyOwn) -> (Set i64)
-  (let [cx0 (LuCx (. out exprs) (. out bindings) (set-empty) (cell (map-empty)) (cell (set-empty)))
+;; The expressions of the body (and of its `fn` literals) that are the last use of a binding (the first
+;; set), of a field variable of a shell nothing else reads afterwards (the second), and the `&` arguments that may
+;; take their cell's content (the third); `opt` is the id of `Option`.
+(defun last-uses (body: Expr out: BodyOwn opt: i64) -> LastUses
+  (let [cx0 (LuCx (. out exprs) (. out bindings) (set-empty) (set-empty) (cell (map-empty)) (cell (set-empty)) (cell (set-empty)) (cell (set-empty)))
         u0 (Lu cx0 (set-empty) true (set-empty))
         pinned (reduce (fn (p: (Set i64) b: i64) (pin-root u0 b p)) (set-empty) (captured-in body []))
-        cx (with cx0 (pinned pinned))
+        stv (into (set-empty) (stv-in (. out exprs) opt body []))
+        cx (with cx0 (pinned pinned) (stv stv))
         u (with u0 (cx cx))
         roots (fn-bodies body [body])]
     (do (doseq [r roots] (reads-of u r) (trav u r (set-empty)))
-        @(. cx dead))))
+        (LastUses @(. cx dead) @(. cx steal) @(. cx amp)))))

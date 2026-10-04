@@ -28,11 +28,13 @@
     ((ArgExpr x)
      (try-let ((v (lcx-value cx x)))
        (do (when (= pass PsRetain) (lcx-retain cx v))
+           (when (= pass PsSteal) (lcx-steal-of cx x v))
            (try-let ((t (lcx-ty cx x))) (Ok (Pair v t))))))
     ((ArgAmp b _)
      (try-let ((t (lcx-binding-ty cx b)))
        (match pass
          ((PsAcquire) (Ok (Pair VUnit t)))
+         ((PsMoveIn) (Ok (Pair VUnit t)))
          ((PsForward) (try-let ((v (lcx-local cx b))) (Ok (Pair v t))))
          ((PsOwnCell) (try-let ((v (lcx-local cx b))) (Ok (Pair v t))))
          (_ (Err "an & argument passed as a pass that is not acquire, forward or own-cell")))))))
@@ -55,14 +57,14 @@
     (_ (Err why))))
 
 ;; The private `STACK` cell of one `&` argument at call entry (§8.6): the variable's content, retained, in a stack object of this site.
-(defun call-private-cell :private (cx: LowerCx b: i64) -> (Result V str)
+(defun call-private-cell :private (cx: LowerCx b: i64 take: bool) -> (Result V str)
   (try-let ((cell-ty (lcx-binding-ty cx b)) (content-ty (cell-content cell-ty "an & parameter that is not a cell"))
             (obj (program-object (. cx p) cell-ty)))
     (let ((tid (. obj fst)) (sname (. obj snd)))
       (let ((slot (fb-entry-alloca (. cx b) (str-join ["%struct." sname]) (obj-size (objects-get (. (. cx p) objects) tid)))))
         (do (fb-stmt (. cx b) (str-join ["(call @fib.stack-init " slot " (i32 " (str tid) "))"]))
             (try-let ((var (lcx-local cx b)) (content (lcx-cell-load cx sname (v-text var) content-ty)))
-              (do (lcx-retain cx content)
+              (do (when (not take) (lcx-retain cx content))
                   (lcx-store cx content (lcx-gep cx sname slot slot-cell-value))
                   (Ok (VVal slot LirPtr)))))))))
 
@@ -73,20 +75,20 @@
         (Ok acc)
         (match (nth args i)
           ((ArgAmp b _)
-           (if (= (nth passes i) PsAcquire)
-               (try-let ((slot (call-private-cell cx b))) (recur (+ i 1) (assoc acc i slot)))
+           (if (or (= (nth passes i) PsAcquire) (= (nth passes i) PsMoveIn))
+               (try-let ((slot (call-private-cell cx b (= (nth passes i) PsMoveIn)))) (recur (+ i 1) (assoc acc i slot)))
                (recur (+ i 1) acc)))
           (_ (recur (+ i 1) acc))))))
 
 ;; The write-back after an ordinary call (§8.6): the private cell's content into the variable, the variable's old content released.
 ;; Rust: lower/call.rs:158 write_back
-(defun call-write-back :private (cx: LowerCx var: i64 private: V cell-ty: Ty) -> (Result unit str)
+(defun call-write-back :private (cx: LowerCx var: i64 private: V cell-ty: Ty took: bool) -> (Result unit str)
   (try-let ((content-ty (cell-content cell-ty "a write-back to a non-cell")) (obj (program-object (. cx p) cell-ty)))
     (let ((sname (. obj snd)))
       (try-let ((content (lcx-cell-load cx sname (v-text private) content-ty)) (target (lcx-local cx var))
                 (old (lcx-cell-load cx sname (v-text target) content-ty)))
         (do (lcx-store cx content (lcx-gep cx sname (v-text target) slot-cell-value))
-            (lcx-release cx old)
+            (when (not took) (lcx-release cx old))
             (fb-stmt (. cx b) (str-join ["(call @fib.stack-end " (v-text private) ")"]))
             (Ok ()))))))
 
@@ -317,7 +319,9 @@
 
 ;; The write-backs the plan asks for after an ordinary call.
 (defun call-write-backs :private (cx: LowerCx own: CallOwn vals: (Vec V) tys: (Vec Ty)) -> (Result unit str)
-  (try-each (fn (wb: (Pair i64 i64)) (call-write-back cx (. wb snd) (nth vals (. wb fst)) (nth tys (. wb fst)))) (. own write-backs)))
+  (try-each (fn (wb: (Pair i64 i64))
+              (call-write-back cx (. wb snd) (nth vals (. wb fst)) (nth tys (. wb fst)) (= (get (. own args) (. wb fst)) (some PsMoveIn))))
+            (. own write-backs)))
 
 ;; Everything after the target: the releases and the jump of a tail call, the call, the write-backs, the return of a tail call.
 (defun call-site :private (cx: LowerCx e: Expr own: CallOwn target: Target vals: (Vec V) tys: (Vec Ty)) -> (Result Flow str)

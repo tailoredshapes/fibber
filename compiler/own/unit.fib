@@ -48,11 +48,11 @@
 ;; Rust `Run::walk`: a walk over every body of the unit; `sites` are the tail sites once known,
 ;; `admit` whether rule (e) is applied to them with `facts`, `local` the scope-local sites.
 (defun run-walk :private (r: Run facts: Facts sites: (Option (Map i64 Tail)) admit: bool
-                          local: (Set Site) dead: (Set i64)) -> Walked
+                          local: (Set Site) dead: (Set i64) steal: (Set i64) amp: (Set i64)) -> Walked
   (let [unit (. r unit)]
     (reduce (fn (w: Walked pair: (Pair BodyKey BodySpec))
               (walk-one w (Ctx (. r p) (. r summaries) facts (. unit scc) (. unit all-owned)
-                               sites admit local dead)
+                               sites admit local dead steal amp)
                         (. pair snd)))
             (Walked [] [] (map-empty) (map-empty) (set-empty))
             (. unit bodies))))
@@ -60,7 +60,7 @@
 ;; The facts of the fixpoint: walks until a walk's events add nothing.
 (defun settle :private (r: Run sites: (Map i64 Tail) facts: Facts) -> Facts
   (loop [f facts]
-    (let [w (run-walk r f (some sites) false (set-empty) (set-empty))
+    (let [w (run-walk r f (some sites) false (set-empty) (set-empty) (set-empty) (set-empty))
           g (facts-absorb f (. r p) (. w events) (. w literals))]
       (if (= g f) f (recur g)))))
 
@@ -98,16 +98,19 @@
 ;; Rust: unit.rs:101 `decide`: decides a unit, starting from `facts`.
 (defun decide (p: TypedProgram summaries: (Map i64 Summary) unit: Unit facts: Facts) -> Decided
   (let [r (Run p summaries unit)
-        sites (. (run-walk r facts nil false (set-empty) (set-empty)) tails)
+        sites (. (run-walk r facts nil false (set-empty) (set-empty) (set-empty) (set-empty)) tails)
         settled (settle r sites facts)
-        admitted (run-walk r settled (some sites) true (set-empty) (set-empty))
+        admitted (run-walk r settled (some sites) true (set-empty) (set-empty) (set-empty) (set-empty))
         done (facts-absorb settled p (. admitted events) (. admitted literals))
         local (scope-local (. admitted events) (. admitted candidates) (. admitted literals)
                            (. done heap))
-        dead (reduce (fn (acc: (Set i64) pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
-                       (into acc (vec (last-uses (. (. (. pair fst) snd) body) (. pair snd)))))
-                     (set-empty) (zip (. unit bodies) (. admitted outs)))
-        emitted (run-walk r done (some sites) true local dead)]
+        lasts (mapv (fn (pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
+                      (last-uses (. (. (. pair fst) snd) body) (. pair snd) @(. (. p globals) option)))
+                    (zip (. unit bodies) (. admitted outs)))
+        dead (reduce (fn (acc: (Set i64) l: LastUses) (into acc (vec (. l dead)))) (set-empty) lasts)
+        steal (reduce (fn (acc: (Set i64) l: LastUses) (into acc (vec (. l steal)))) (set-empty) lasts)
+        amp (reduce (fn (acc: (Set i64) l: LastUses) (into acc (vec (. l amp)))) (set-empty) lasts)
+        emitted (run-walk r done (some sites) true local dead steal amp)]
     (Decided (mapv (fn (pair: (Pair (Pair BodyKey BodySpec) BodyOwn))
                      (let [key (. (. pair fst) fst)
                            spec (. (. pair fst) snd)

@@ -1,0 +1,17 @@
+;; spec:   types §6.6 (copy-in, copy-out); docs/design/in-place-update.md §1 (lever L1)
+;; expect: accept
+;; result: 10
+;; audit:  clean
+;; `peek` is handed to `poke`, which calls it while it runs; `peek` reads the cell `c` that `&c` is passed for. The
+;; cell is captured by a closure, so the call keeps the copy-in (retain): `peek` still reads the old array (value 1)
+;; while `poke` holds a private copy it writes 9 into, and the write-back then makes `c` the written copy.
+;; Handing the content over instead would let `poke`'s write land in the array `peek` reads, and `peek` would read 9.
+(defun poke (&a: (Array i64) f: (fn () i64)) -> i64
+  (do (array-set! &a 0 9)
+      (f)))
+
+(defun main () -> i64
+  (let ((c (cell (array 4 1))))
+    (let ((peek (fn () (array-get @c 0))))
+      (let ((seen (poke &c peek)))
+        (+ seen (array-get @c 0))))))
