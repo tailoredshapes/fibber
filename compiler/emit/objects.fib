@@ -9,10 +9,12 @@
   (:use types.ty types.decls emit.value emit.text emit.layout emit.objects.walk)
   (:export-from emit.objects.kinds))
 
-;; The table, in interning order. Rust: objects.rs:171 Objects
-(defstruct Objects (list: (Cell (Vec ObjInfo)) index: (Cell (Map str i64))))
+;; The table, in interning order. Rust: objects.rs:171 Objects. `structs` and `walkers` hold the text rendered for a type id, so
+;; that a module assembled again for every `def` of a program (emit.defs.jit) renders each type once; a task type's entry is dropped
+;; when its frame is set, the one change an entry's type undergoes.
+(defstruct Objects (list: (Cell (Vec ObjInfo)) index: (Cell (Map str i64)) structs: (Cell (Map i64 str)) walkers: (Cell (Map i64 str))))
 
-(defun objects-new () -> Objects (Objects (cell []) (cell (map-empty))))
+(defun objects-new () -> Objects (Objects (cell []) (cell (map-empty)) (cell (map-empty)) (cell (map-empty))))
 
 ;; The trace class letter (compiler.md §4) as its byte: `c`, `a` or `o`. Rust: objects.rs:66 ObjInfo::class
 (defun obj-class (o: ObjInfo) -> i64
@@ -101,7 +103,9 @@
   (let ((o (nth @(. os list) tid)))
     (match (. o kind)
       ((ObTask caps _)
-       (set! (. os list) (assoc @(. os list) tid (ObjInfo (. o tid) (. o sname) (. o name) (ObTask caps frame)))))
+       (do (set! (. os structs) (dissoc @(. os structs) tid))
+           (set! (. os walkers) (dissoc @(. os walkers) tid))
+           (set! (. os list) (assoc @(. os list) tid (ObjInfo (. o tid) (. o sname) (. o name) (ObTask caps frame))))))
       (_ ()))))
 
 ;; Rust: objects.rs:228 Objects::len
@@ -141,10 +145,25 @@
                (s/join " " (mapv rec list)) "))\n"
                "(constant internal fib.classes [" n " x i8] ([" n " x i8] " (s/join " " (mapv class list)) "))\n"])))
 
+;; The text of the `defstruct`s of `o`, and of its three walkers, kept in `os` once rendered.
+(defun struct-text :private (os: Objects o: ObjInfo) -> str
+  (if-some [t (get @(. os structs) (. o tid))]
+    t
+    (let ((t (render-structs o)))
+      (do (set! (. os structs) (assoc @(. os structs) (. o tid) t))
+          t))))
+
+(defun walker-text :private (os: Objects o: ObjInfo) -> str
+  (if-some [t (get @(. os walkers) (. o tid))]
+    t
+    (let ((t (str-join [(walker o "drop") (walker o "trace") (walker o "share")])))
+      (do (set! (. os walkers) (assoc @(. os walkers) (. o tid) t))
+          t))))
+
 ;; Every `defstruct`, `drop`, `trace` and `share` function, and the type and class tables. Rust: objects.rs:238 Objects::render
 (defun objects-render (os: Objects) -> str
   (let ((list @(. os list)))
     (str-join
-      (into (into (mapv render-structs list)
-                  (mapcat (fn (o: ObjInfo) [(walker o "drop") (walker o "trace") (walker o "share")]) list))
+      (into (into (mapv (fn (o: ObjInfo) (struct-text os o)) list)
+                  (mapv (fn (o: ObjInfo) (walker-text os o)) list))
             [(render-tables list)]))))

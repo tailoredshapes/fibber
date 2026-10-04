@@ -5,8 +5,9 @@
   (:require [fib.string :as s])
   (:use emit.value emit.layout))
 
-;; A string constant: the text of its type id and its bytes. Rust: statics.rs:13 `strings`
-(defstruct StaticStr (tid: str text: str))
+;; A string constant: the text of its type id and its bytes, and its rendered `constant` (made once, when the string is first
+;; wanted, because a module is assembled again for every `def`). Rust: statics.rs:13 `strings`
+(defstruct StaticStr (tid: str text: str lir: str))
 ;; An immortal closure: its name, its code, its type id. Rust: statics.rs:18 `closures`
 (defstruct StaticClosure (name: str code: str tid: i64))
 ;; A vtable: its name and its slots. Rust: statics.rs:20 `vtables`
@@ -27,8 +28,9 @@
 (defun statics-string (st: Statics text: str tid-str: i64) -> str
   (if-some [n (get @(. st string-index) text)]
     n
-    (let ((name (str-join ["@str." (str (count @(. st strings)))])))
-      (do (set! (. st strings) (conj @(. st strings) (StaticStr (str tid-str) text)))
+    (let ((i (count @(. st strings)))
+          (name (str-join ["@str." (str (count @(. st strings)))])))
+      (do (set! (. st strings) (conj @(. st strings) (StaticStr (str tid-str) text (render-string i (str tid-str) text))))
           (set! (. st string-index) (assoc @(. st string-index) text name))
           name))))
 
@@ -90,15 +92,15 @@
                           (range (str-len text)))
                     "(i8 0)")))
 
-(defun render-string :private (i: i64 st: StaticStr) -> str
-  (let ((n (str-len (. st text))) (arr (str-join ["[" (str (+ (str-len (. st text)) 1)) " x i8]"])))
-    (str-join ["(constant internal str." (str i) " { i64 i32 i32 i64 " arr " } { (i64 0) (i32 " (. st tid) ") (i32 "
-               (str flag-immortal) ") (i64 " (str n) ") (" arr " " (byte-words (. st text)) ") })\n"])))
+(defun render-string :private (i: i64 tid: str text: str) -> str
+  (let ((n (str-len text)) (arr (str-join ["[" (str (+ (str-len text) 1)) " x i8]"])))
+    (str-join ["(constant internal str." (str i) " { i64 i32 i32 i64 " arr " } { (i64 0) (i32 " tid ") (i32 "
+               (str flag-immortal) ") (i64 " (str n) ") (" arr " " (byte-words text) ") })\n"])))
 
 ;; The constants: strings, immortal closures, vtables. Rust: statics.rs:105 Statics::render
 (defun statics-render (st: Statics) -> str
   (str-join
-    (into (into (vec (map-indexed render-string @(. st strings)))
+    (into (into (mapv (fn (s: StaticStr) (. s lir)) @(. st strings))
                 (mapv (fn (c: StaticClosure)
                         (str-join ["(constant internal " (unat (. c name)) " { i64 i32 i32 ptr } { (i64 0) (i32 " (str (. c tid))
                                    ") (i32 " (str flag-immortal) ") @" (. c code) " })\n"]))
