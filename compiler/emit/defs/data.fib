@@ -4,15 +4,17 @@
 ;; these) and emit.defs.mod (`emit-defs`, which `:export-from`s this module so that `Defs` is still seen where it was).
 (ns emit.defs.data
   (:require [fib.string :as s])
-  (:use types.ty types.decls emit.value emit.layout emit.program emit.inits))
+  (:use lir.ast types.ty types.decls emit.value emit.layout emit.program emit.inits))
 
 ;; The text, values and constants of the defs. Rust: defs/mod.rs:28 Defs
 ;; `text` holds the `(constant ..)` lines made so far, `values` each constant `def`'s value, `constants` the names made (`@def.N`).
-(defstruct Defs (text: (Cell str) values: (Cell (Map i64 DefValue)) constants: (Cell (Vec str)) counter: (Cell i64)))
+;; `pieces` holds the same lines one by one, and `asts` the items the in-memory hand-over made of a piece of text, by the text (emit.defs.astmod).
+(defstruct Defs (text: (Cell str) values: (Cell (Map i64 DefValue)) constants: (Cell (Vec str)) counter: (Cell i64)
+                 pieces: (Cell (Vec str)) asts: (Cell (Map str (Vec LItem)))))
 
 ;; No constants yet (Rust: `Defs::default()`).
 (defun defs-new () -> Defs
-  (Defs (cell "") (cell (map-empty)) (cell []) (cell 0)))
+  (Defs (cell "") (cell (map-empty)) (cell []) (cell 0) (cell []) (cell (map-empty))))
 
 ;; The `def`s made at compile time as static data: those whose initialiser is a constant expression (syntax §3.19); the others are
 ;; made at run time by the init functions of emit.inits. Rust: defs/mod.rs:58 def_ids
@@ -27,7 +29,8 @@
         n)))
 
 (defun defs-append :private (d: Defs line: str) -> unit
-  (set! (. d text) (str-concat @(. d text) line)))
+  (do (set! (. d text) (str-concat @(. d text) line))
+      (set! (. d pieces) (conj @(. d pieces) line))))
 
 ;; An array constant of `t = (Array E)` with these element texts. Rust: defs/mod.rs:62 Defs::emit_array
 (defun defs-emit-array (d: Defs p: Program t: Ty el: LirTy elems: (Vec str)) -> (Result str str)

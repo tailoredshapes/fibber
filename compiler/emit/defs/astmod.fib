@@ -1,0 +1,64 @@
+;; compiler/emit/defs/astmod.fib: the module of a `def`'s JIT session as lIR trees, not text (docs/design/lair-in-fibber.md 1.4, stage 9).
+;; The emitter still renders text, but in pieces that are the same text every time the module is assembled again (`module-pieces`: the
+;; runtime, one object's structs, one static string, one function, one `def` constant): each piece is read once, by `lir.parse`, into
+;; its items, kept by its text in `(. d asts)`, and a session is given the items of its pieces plus its own few lines, which are read
+;; each time. A session of the `def`s of a program of 1.5 MB at the end therefore reads about what is new since the last one, not the
+;; whole module again (`native.jit` then prunes what the entry cannot reach before it checks: `session-add-module-live`).
+;; `lir.print` of these trees is the text's: FIB_AST_VERIFY=1 makes every session check it (`verify-module`), see
+;; compiler/tests/native/h1-ast-vs-text.sh. Positions in the trees are within their piece (a diagnostic of a session says so).
+(ns emit.defs.astmod
+  (:require [lir.parse :as parse] [lir.print :as print] [fib.unix :as unix] [fib.string :as s])
+  (:use lir.ast lir.diag emit.program emit.assemble emit.defs.data))
+
+;; The items of one piece of text, read now or found read.
+(defun piece-items :private (d: Defs piece: str) -> (Result (Vec LItem) str)
+  (if (= (str-len piece) 0)
+      (Ok [])
+      (match (get @(. d asts) piece)
+        ((some its) (Ok its))
+        (nil (match (parse/parse-source piece)
+               ((Err e) (Err (str-join ["in-memory module: " (diag-str e)])))
+               ((Ok m) (do (set! (. d asts) (assoc @(. d asts) piece (. m items)))
+                           (Ok (. m items)))))))))
+
+;; The module of the program so far followed by the lIR text `tail` (read each time: it is a session's own).
+(defun module-ast (p: Program d: Defs tail: str) -> (Result LModule str)
+  (let ((pieces (let ((all (module-pieces p d)))
+                  ;; FIB_AST_VERIFY=fault: the builder leaves the runtime out, which the verifying mode must catch (h1-ast-vs-text.sh --fault)
+                  (if (= (unix/getenv "FIB_AST_VERIFY") (some "fault")) (vec (drop 1 all)) all))))
+    (loop ((i 0) (acc []))
+      (if (< i (count pieces))
+          (match (piece-items d (nth pieces i))
+            ((Err m) (Err m))
+            ((Ok its) (recur (+ i 1) (into acc its))))
+          (match (parse/parse-source tail)
+            ((Err e) (Err (str-join ["in-memory module (the session's own text): " (diag-str e)])))
+            ((Ok t) (Ok (LModule (into acc (. t items))))))))))
+
+;; Whether FIB_AST_VERIFY is set.
+(defun verifying? () -> bool
+  (some? (unix/getenv "FIB_AST_VERIFY")))
+
+;; The position of the first line where two texts differ, as a sentence.
+(defun first-difference :private (a: str b: str) -> str
+  (let ((la (s/split-lines a)) (lb (s/split-lines b)))
+    (loop ((i 0))
+      (cond (and (>= i (count la)) (>= i (count lb))) "no line differs"
+            (>= i (count la)) (str-join ["the text has " (str (count lb)) " lines, the trees " (str (count la))])
+            (>= i (count lb)) (str-join ["the text has " (str (count lb)) " lines, the trees " (str (count la))])
+            (not (= (nth la i) (nth lb i))) (str-join ["line " (str (+ i 1)) ": trees `" (nth la i) "`, text `" (nth lb i) "`"])
+            :else (recur (+ i 1))))))
+
+;; The checks of the verifying mode for a module `m` made by `module-ast` with the same `tail`: the pieces are the text of the parts, and
+;; the printed trees are the printed reading of the whole text, byte for byte.
+(defun verify-module (p: Program d: Defs tail: str m: LModule) -> (Result unit str)
+  (let ((text (str-join [(assemble-parts p @(. d text)) tail])))
+    (if (not (= (str-join (module-pieces p d)) (assemble-parts p @(. d text))))
+        (Err "FIB_AST_VERIFY: the pieces of the module are not its text")
+        (match (parse/parse-source text)
+          ((Err e) (Err (str-join ["FIB_AST_VERIFY: the text does not read: " (diag-str e)])))
+          ((Ok whole)
+           (let ((a (print/print-module m)) (b (print/print-module whole)))
+             (if (= a b)
+                 (Ok ())
+                 (Err (str-join ["FIB_AST_VERIFY: the trees of the pieces print differently from the text: " (first-difference a b)])))))))))
