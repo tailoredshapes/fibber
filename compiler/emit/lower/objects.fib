@@ -34,13 +34,56 @@
     (Ok (ObjAt (. obj fst) (. obj snd) (obj-size (objects-get (. (. cx p) objects) (. obj fst)))))))
 
 ;; The object allocated, its tag stored when it is a variant's, its fields stored from slot `base`.
-(defun build-object :private (cx: LowerCx e: Expr o: ObjAt sname: str base: i64 tag: (Option i64) vals: (Vec V))
+(defun fresh-object :private (cx: LowerCx e: Expr o: ObjAt sname: str base: i64 tag: (Option i64) vals: (Vec V))
     -> (Result V str)
   (try-let ((p (lcx-alloc-at cx (. e id) (. o tid) sname (. o size))))
     (do (when-some [i tag]
           (fb-stmt (. cx b) (str-join ["(store (i32 " (str i) ") " (lcx-gep cx sname p slot-enum-tag) ")"])))
         (lcx-store-fields cx sname p base vals)
         (Ok (VVal p LirPtr)))))
+
+;; The fields of the object `p` overwritten by `vals` from slot `base`, each old value released (a null one, a slot a steal emptied, is
+;; no work).
+(defun overwrite-fields :private (cx: LowerCx sname: str p: str base: i64 vals: (Vec V)) -> unit
+  (do (reduce (fn (slot: i64 v: V)
+                (match v
+                  ((VUnit) slot)
+                  ((VVal _ ty)
+                   (let ((ep (lcx-gep cx sname p slot)))
+                     (let ((old (lcx-load cx ty ep)))
+                       (do (lcx-store cx v ep) (lcx-release cx old) (+ slot 1)))))))
+              base vals)
+      ()))
+
+;; The object of a constructor call whose plan names a shell (own.program `reuse`): when the shell is unique at run time its memory
+;; becomes the object (its fields overwritten, the old values released), and its count is the result's; else the object is built as
+;; usual and the shell, dead from here on, is released. A site the plan put on the stack, or a shell of another type, is built as usual
+;; and the shell released.
+(defun build-object :private (cx: LowerCx e: Expr o: ObjAt sname: str base: i64 tag: (Option i64) vals: (Vec V))
+    -> (Result V str)
+  (match (get (. (. cx own) reuse) (. e id))
+    (nil (fresh-object cx e o sname base tag vals))
+    ((some b)
+     (try-let ((sv (lcx-local cx b)) (st (lcx-binding-ty cx b)) (t (lcx-ty cx e)))
+       (let ((f (. cx b)))
+         (match (Pair sv (get (. (. cx own) allocs) (. e id)))
+           ((Pair (VVal sh (LirPtr)) (some (AlHeap))) :when (= st t)
+            (let ((unique (fb-val f (str-join ["(call @fib.unique? " sh ")"]) LirI1))
+                  (lr (fb-label f "reuse")) (lf (fb-label f "fresh")) (lj (fb-label f "built")))
+              (do (fb-term f (str-join ["(br " (v-text unique) " " lr " " lf ")"]))
+                  (fb-open f lr)
+                  (overwrite-fields cx sname sh base vals)
+                  (let ((from-reuse (fb-current f)))
+                    (do (fb-term f (str-join ["(br " lj ")"]))
+                        (fb-open f lf)
+                        (try-let ((q (fresh-object cx e o sname base tag vals)))
+                          (do (lcx-release cx sv)
+                              (let ((from-fresh (fb-current f)))
+                                (do (fb-term f (str-join ["(br " lj ")"]))
+                                    (fb-open f lj)
+                                    (Ok (fb-phi f LirPtr [(PhiEdge from-reuse sh) (PhiEdge from-fresh (v-text q))])))))))))))
+           (_ (try-let ((q (fresh-object cx e o sname base tag vals)))
+                (do (lcx-release cx sv) (Ok q))))))))))
 
 ;; A constructor call: the object with its fields stored. Rust: lower/objects.rs:54 LowerCx::construct
 (defun lcx-construct (cx: LowerCx e: Expr id: i64 variant: (Option i64) vals: (Vec V)) -> (Result V str)

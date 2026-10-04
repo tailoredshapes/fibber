@@ -14,7 +14,8 @@
 #            `array-with` replaced by `awx`, a write through a cell with `array-set!` (correct today: the cell's content has a count
 #            above 1, so it copies; in place exactly when `fib.unique?` says so, which is what the library levers do). The
 #            cases must then pass unmutated and fail under the mutant. Drop it once the library is in place itself.
-#   PREFIX   cases of cases/stdlib to run (default 4000- .. 4007-, the persistence cases T1..T7)
+#   PREFIX   cases of cases/stdlib to run (default 4000- .. 4007-, the persistence cases T1..T7); `ownership/264-` names a case of
+#            cases/ownership (default also 264-, 266-: the shell reuse and the steal through an Option payload)
 # environment: FIBC (the fibc that builds the mutant; default the gate's F of this tree, else target/debug/fibc of the main
 #   checkout), LAIR_DIR (the directory with liblair.so), MUT_OUT (scratch; default ~/.cache/fibber-scratch/mutant-unique-MODE),
 #   MUT_J (cases at once, default 2).
@@ -24,7 +25,7 @@ set -uo pipefail
 MODE=always
 case "${1:-}" in always|nocount) MODE=$1; shift;; esac
 CASES=("$@")
-[ ${#CASES[@]} -gt 0 ] || CASES=(4000- 4001- 4002- 4003- 4004- 4005- 4006- 4007-)
+[ ${#CASES[@]} -gt 0 ] || CASES=(4000- 4001- 4002- 4003- 4004- 4005- 4006- 4007- ownership/264- ownership/266-)
 R=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${MUT_OUT:-$HOME/.cache/fibber-scratch/mutant-unique-$MODE}
 main_target=$(cd "$R" && git rev-parse --git-common-dir | sed 's|/\.git$||')/target/debug
@@ -40,7 +41,7 @@ mkdir -p "$OUT/tree/crates/fibc" "$OUT/tree/cases" "$OUT/tmp"
 export TMPDIR=$OUT/tmp
 cp -r "$R/compiler" "$R/lib" "$OUT/tree/"
 cp -r "$R/crates/fibc/rt" "$OUT/tree/crates/fibc/"
-cp -r "$R/cases/stdlib" "$OUT/tree/cases/"
+cp -r "$R/cases/stdlib" "$R/cases/ownership" "$OUT/tree/cases/"
 if [ -n "${MUT_DEMO:-}" ]; then
   perl -0pi -e 's/\(array-with /(awx /g; s/(\(defun vec-empty \(\) VecEmpty\))/$1\n\n(defun awx :private (items: (Array a) i: i64 x: a) -> (Array a)\n  (let ((c (cell items))) (do (array-set! &c i x) \@c)))/' "$OUT/tree/lib/prelude.fib"
   grep -c '(awx ' "$OUT/tree/lib/prelude.fib"
@@ -70,12 +71,14 @@ export FIB_LIB=$OUT/tree/lib
 survived=0
 # the control: the same cases, the same library, the unmutated compiler: they must pass, or a "kill" proves nothing
 for p in "${CASES[@]}"; do
-  res=$("$FIBC" cases cases/stdlib --only "$p" -j "${MUT_J:-2}" 2>&1)
+  dir=cases/stdlib; q=$p; case $p in ownership/*) dir=cases/ownership; q=${p#ownership/};; esac
+  res=$("$FIBC" cases "$dir" --only "$q" -j "${MUT_J:-2}" 2>&1)
   if echo "$res" | grep -q " 0 fail"; then echo "control   $p passes unmutated"; else echo "CONTROL FAILED $p: the case fails without the mutant"; echo "$res" | tail -5; exit 2; fi
 done
 for p in "${CASES[@]}"; do
-  res=$("$OUT/F" cases cases/stdlib --only "$p" -j "${MUT_J:-2}" 2>&1)
-  rows=$(echo "$res" | grep -E "^$p" | cut -c1-150)
+  dir=cases/stdlib; q=$p; case $p in ownership/*) dir=cases/ownership; q=${p#ownership/};; esac
+  res=$("$OUT/F" cases "$dir" --only "$q" -j "${MUT_J:-2}" 2>&1)
+  rows=$(echo "$res" | grep -E "^$q" | cut -c1-150)
   if echo "$res" | grep -q " 0 fail"; then
     if [ "$MODE" = nocount ] && [ "$p" = 4005- ]; then echo "exempt    $rows (SHARED objects are refused by the flag test)"; continue; fi
     echo "SURVIVED  $rows"; survived=1; else echo "killed    ${rows:-$p ($(echo "$res" | tail -1))}"; fi

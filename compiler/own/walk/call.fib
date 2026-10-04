@@ -37,7 +37,18 @@
             r (arg-passes w cs args ms params moved)]
         (finish-call w e cs (CallOwn callee d hp (. r fst) (. r snd) []) @moved)
         (record-alloc w e head)
+        (note-reuse w e)
         (MOwned false)))))
+
+;; A constructor call that may build its object in the memory of a shell (own.lastuse `reuse`): the result takes over the shell's
+;; count, so the shell is handed over like a binding at its last use, and the plan records the call.
+(defun note-reuse :private (w: Walker e: Expr) -> unit
+  (when-some [b (get (. (. w cx) reuse) (. e id))]
+    (let [s (SiteBind b)]
+      (when (and (w-movable w s) (not (contains? (. (. w cx) scope-local) s)) (not (w-env-moved? w s))
+                 (not (contains? @(. w moved) s)))
+        (do (w-mark-moved w s)
+            (w-out! w (fn (o: BodyOwn) -> BodyOwn (with o (reuse (assoc (. o reuse) (. e id) b))))))))))
 
 ;; The mode of each argument; an `&v` has none.
 (defun arg-modes :private (w: Walker args: (Vec Arg)) -> (Vec (Option Mode))

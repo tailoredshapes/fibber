@@ -1,0 +1,25 @@
+;; spec:   docs/design/in-place-update.md §1 (steal), §5 (lever L5); compiler/own/lastuse.fib `field-vars`
+;; expect: accept
+;; result: 4103
+;; audit:  clean
+;; `grow` names the payload of an `Option` field in its pattern, `(Slot (some v))`: `v` is the field's own slot (an `Option` of an object is
+;; the pointer), so it is stolen from a unique `Slot` and the vector grown in place. `p` is used again after the first call, so that call
+;; sees a shared shell and must retain `v` (the vector of `p` keeps 1 element); the second call is on the only holder `q`. A steal that did not
+;; test the shell would empty `p`'s slot and `(slot-count p)` would be 0.
+(defstruct Slot (o: (Option (Vec i64))))
+
+(defun grow (s: Slot) -> Slot
+  (match s
+    ((Slot (some v)) (Slot (some (vec-conj v 1))))
+    ((Slot nil) (Slot (some (vec-conj (vec-empty) 0))))))
+
+(defun slot-count (s: Slot) -> i64
+  (match s
+    ((Slot (some v)) (vec-count v))
+    ((Slot nil) 0)))
+
+(defun main () -> i64
+  (let ((p (Slot (some (vec-conj (vec-empty) 5)))))
+    (let ((q (grow p)))
+      (let ((r (grow q)))
+        (+ (* (slot-count p) 1000) (+ (* (slot-count r) 1000) (+ (slot-count r) 100)))))))

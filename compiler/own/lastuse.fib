@@ -35,15 +35,19 @@
 ;; sibling forms, the answers.
 (defstruct LuCx
   (modes: (Map i64 ExprOwn) kinds: (Map i64 BindingOwn) pinned: (Set i64) stv: (Set i64)
-   kids: (Cell (Map i64 (Set i64))) dead: (Cell (Set i64)) steal: (Cell (Set i64)) amp: (Cell (Set i64))))
+   kids: (Cell (Map i64 (Set i64))) dead: (Cell (Set i64)) steal: (Cell (Set i64)) amp: (Cell (Set i64))
+   reuse: (Cell (Map i64 i64)) opt: i64))
 
 ;; What the pass found: the expressions that are a last use (move), the reads of a field variable that are a last use
 ;; (steal), and the `&b` arguments, as call id * 64 + argument index, whose cell nothing else can read during the call (move-in).
-(defstruct LastUses (dead: (Set i64) steal: (Set i64) amp: (Set i64)))
+(defstruct LastUses (dead: (Set i64) steal: (Set i64) amp: (Set i64) reuse: (Map i64 i64)))
 
 ;; One traversal: the context, the ids live at the next `recur`, whether the answer is filled,
 ;; and the ids that count in the answer but not in the flow.
-(defstruct Lu (cx: LuCx back: (Set i64) fill: bool pend: (Set i64)))
+(defstruct Lu (cx: LuCx back: (Set i64) fill: bool pend: (Set i64) shells: (Vec Shell)))
+
+;; A shell in scope: the binding that a `match` clause destructures with a constructor pattern of type t and variant (lever L5).
+(defstruct Shell (b: i64 t: i64 variant: (Option i64)))
 
 (defun uni :private (a: (Set i64) b: (Set i64)) -> (Set i64)
   (reduce (fn (acc: (Set i64) x: i64) (conj acc x)) a (vec b)))
@@ -196,6 +200,32 @@
          (_ ())))
       (_ ()))))
 
+;; `u` inside the body of clause c of a match on s: when s reads a binding as a whole and the clause's pattern is a constructor
+;; pattern (not an `Option`'s), that binding is a shell whose object a constructor call of the same variant may be built in.
+(defun clause-shell :private (u: Lu s: Expr c: Clause) -> Lu
+  (match (mode-of u s)
+    ((MBorrowed (SiteBind b))
+     (match (. (. c pat) kind)
+       ((PCtor t v _) :when (not (= t (. (. u cx) opt))) (with u (shells (conj (. u shells) (Shell b t v)))))
+       (_ u)))
+    (_ u)))
+
+;; Phase B: a constructor call e that is the last use of an enclosing shell of its own variant (nothing reads the shell, as a
+;; whole or in part, after e): the object of e may be built in the shell's memory (`reuse`, emit/lower/objects.fib).
+(defun record-reuse :private (u: Lu e: Expr live: (Set i64)) -> unit
+  (when (. u fill)
+    (match (. e kind)
+      ((ECall head _)
+       (match (. head kind)
+         ((EGlobal (GCtor t v))
+          (when-some [sh (find-first (fn (s: Shell) (and (= (. s t) t) (= (. s variant) v))) (reverse (. u shells)))]
+            (let [b (. sh b)]
+              (when (and (none-live? u live [(some (* b 8)) (some (+ (* b 8) 1))])
+                         (not (contains? (. (. u cx) pinned) b)))
+                (let [d (. (. u cx) reuse)] (set! d (assoc @d (. e id) b)))))))
+         (_ ())))
+      (_ ()))))
+
 ;; The operands cs in evaluation order, the last live-after `live`: the ids live before the
 ;; first. With `sib`, the reads of the operands before one count in the answer for it.
 (defun trav-seq :private (u: Lu cs: (Vec Expr) live: (Set i64) sib: bool) -> (Set i64)
@@ -250,6 +280,7 @@
 ;; Phase B: the ids live before e, given those live after it; the answers filled on the way.
 (defun trav (u: Lu e: Expr live: (Set i64)) -> (Set i64)
   (do (record u e live)
+      (record-reuse u e live)
       (match (. e kind)
         ((ELocal x) (uni live (local-reads u e x)))
         ((EFn lit) (uni live (capture-reads (. lit captures))))
@@ -271,7 +302,7 @@
                    (trav u (. b init) (kill acc (pat-binds (. b pat) []))))
                  (trav u body live) (reverse bs)))
         ((EMatch s cls)
-         (trav u s (match-in u cls (mapv (fn (c: Clause) (trav u (. c body) live)) cls) live)))
+         (trav u s (match-in u cls (mapv (fn (c: Clause) (trav (clause-shell u s c) (. c body) live)) cls) live)))
         ((ELoop bs body) (loop-in u bs body live))
         ((ERecur es) (trav-seq u es (. u back) false))
         (_ (trav-seq u (expr-children e) live false)))))
@@ -309,12 +340,12 @@
 ;; set), of a field variable of a shell nothing else reads afterwards (the second), and the `&` arguments that may
 ;; take their cell's content (the third); `opt` is the id of `Option`.
 (defun last-uses (body: Expr out: BodyOwn opt: i64) -> LastUses
-  (let [cx0 (LuCx (. out exprs) (. out bindings) (set-empty) (set-empty) (cell (map-empty)) (cell (set-empty)) (cell (set-empty)) (cell (set-empty)))
-        u0 (Lu cx0 (set-empty) true (set-empty))
+  (let [cx0 (LuCx (. out exprs) (. out bindings) (set-empty) (set-empty) (cell (map-empty)) (cell (set-empty)) (cell (set-empty)) (cell (set-empty)) (cell (map-empty)) opt)
+        u0 (Lu cx0 (set-empty) true (set-empty) [])
         pinned (reduce (fn (p: (Set i64) b: i64) (pin-root u0 b p)) (set-empty) (captured-in body []))
         stv (into (set-empty) (stv-in (. out exprs) opt body []))
         cx (with cx0 (pinned pinned) (stv stv))
         u (with u0 (cx cx))
         roots (fn-bodies body [body])]
     (do (doseq [r roots] (reads-of u r) (trav u r (set-empty)))
-        (LastUses @(. cx dead) @(. cx steal) @(. cx amp)))))
+        (LastUses @(. cx dead) @(. cx steal) @(. cx amp) @(. cx reuse)))))

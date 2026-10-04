@@ -1,0 +1,22 @@
+;; spec:   docs/design/in-place-update.md §5 (lever L5, shell reuse)
+;; expect: accept
+;; result: 10106
+;; audit:  clean
+;; `bump` destructures its argument and builds a new `Box` of the same variant from its fields, so the new object may be built in the
+;; argument's memory (`reuse`) when the argument is unique at run time. Here `p` is used again after the call, so the caller hands `bump` a
+;; second count: the shell is shared, `bump` builds a fresh object and leaves `p` whole. A reuse that did not test the count would
+;; overwrite `p` (its vector would be released and its number changed) and `main` would read 2 and a freed vector. The second call
+;; hands over the only count (`q` is not used again): the shell is reused and the audit still sees every vector released once.
+(defstruct Box (n: i64 v: (Vec i64)))
+
+(defun bump (b: Box) -> Box
+  (match b
+    ((Box n v) (Box (+ n 1) (vec-conj v n)))))
+
+(defun main () -> i64
+  (let ((p (Box 100 (vec-conj (vec-empty) 7))))
+    (let ((q (bump p)))
+      (let ((r (bump q)))
+        (+ (* (. p n) 100)
+           (+ (* (vec-count (. p v)) 1)
+              (+ (* (. r n) 1) (* (vec-count (. r v)) 1))))))))
