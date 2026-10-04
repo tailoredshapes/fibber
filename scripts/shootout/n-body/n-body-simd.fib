@@ -1,0 +1,81 @@
+;; n-body, SIMD version (SIMD wave 4, P5): the same output as n-body.fib. A body's position and its velocity are each one
+;; f64x4 (x y z and an unused fourth lane, held at 0.0), so the difference of two positions, the velocity updates and the
+;; position update are one vector operation each, and no `Six` record is built: a pair updates both velocities in place.
+;; The arithmetic of every lane is the scalar program's, in the same order: the squared distance is summed as
+;; (dx^2 + dy^2) + dz^2 from the lanes (not with `hsum`, whose tree order would round differently), and the velocity
+;; change is (dx * m) * mag as there, so the result is bit-identical to the scalar one.
+;; The sqrt is the scalar `math/sqrt`: there is no vector sqrt builtin yet (gap), so the three lanes' sum, the sqrt and the
+;; division stay scalar and only the vector arithmetic around them is wide.
+;; State: `a` is 10 vectors, positions 0..4 and velocities 5..9; `ms` the 5 masses.
+(ns main (:use fib.simd) (:require [fib.math :as math] [fib.fmt :as fmt]))
+
+(def solar-mass: f64 39.47841760435743)   ; 4 * pi * pi, as Java computes it
+(def days-per-year: f64 365.24)
+
+(defun body (&a: (Array f64x4) &ms: (Array f64) i: i64 x: f64 y: f64 z: f64 vx: f64 vy: f64 vz: f64 m: f64) -> i64
+  (do (array-set! &a i <<x y z 0.0>>)
+      (array-set! &a (+ 5 i) <<(* vx days-per-year) (* vy days-per-year) (* vz days-per-year) 0.0>>)
+      (array-set! &ms i (* m solar-mass))
+      0))
+
+(defun momentum (a: (Array f64x4) ms: (Array f64) k: i64) -> f64
+  (loop [i 0 s 0.0] (if (>= i 5) s (recur (+ i 1) (+ s (* (lane (array-get a (+ 5 i)) k) (array-get ms i)))))))
+
+(defun offset-momentum (&a: (Array f64x4) ms: (Array f64)) -> i64
+  (let [px (momentum @a ms 0) py (momentum @a ms 1) pz (momentum @a ms 2)]
+    (do (array-set! &a 5 <<(/ (- 0.0 px) solar-mass) (/ (- 0.0 py) solar-mass) (/ (- 0.0 pz) solar-mass) 0.0>>)
+        0)))
+
+;; both velocities of the pair, written in place; the positions are read through the borrow first
+(defun pair (&a: (Array f64x4) ms: (Array f64) i: i64 j: i64 dt: f64) -> i64
+  (let [dx (- (array-get @a i) (array-get @a j))
+        sq (* dx dx)
+        d2 (+ (+ (lane sq 0) (lane sq 1)) (lane sq 2))
+        mag (splat f64x4 (/ dt (* d2 (math/sqrt d2))))
+        mi (splat f64x4 (array-get ms i)) mj (splat f64x4 (array-get ms j))
+        vi (array-get @a (+ 5 i)) vj (array-get @a (+ 5 j))]
+    (do (array-set! &a (+ 5 i) (- vi (* (* dx mj) mag)))
+        (array-set! &a (+ 5 j) (+ vj (* (* dx mi) mag)))
+        0)))
+
+(defun advance (&a: (Array f64x4) ms: (Array f64) dt: f64) -> i64
+  (do (loop [i 0] (if (>= i 5) 0
+        (do (loop [j (+ i 1)] (if (>= j 5) 0 (do (pair &a ms i j dt) (recur (+ j 1)))))
+            (recur (+ i 1)))))
+      (let [dtv (splat f64x4 dt)]
+        (loop [i 0] (if (>= i 5) 0
+          (do (array-set! &a i (+ (array-get @a i) (* dtv (array-get @a (+ 5 i)))))
+              (recur (+ i 1))))))))
+
+(defun energy-with (a: (Array f64x4) ms: (Array f64) i: i64 e: f64) -> f64
+  (loop [j (+ i 1) e e]
+    (if (>= j 5) e
+      (let [dx (- (array-get a i) (array-get a j))
+            sq (* dx dx)]
+        (recur (+ j 1) (- e (/ (* (array-get ms i) (array-get ms j))
+                               (math/sqrt (+ (+ (lane sq 0) (lane sq 1)) (lane sq 2))))))))))
+
+(defun energy (a: (Array f64x4) ms: (Array f64)) -> f64
+  (loop [i 0 e 0.0]
+    (if (>= i 5) e
+      (let [v (array-get a (+ 5 i)) vv (* v v) mi (array-get ms i)]
+        (recur (+ i 1) (energy-with a ms i (+ e (* (* 0.5 mi) (+ (+ (lane vv 0) (lane vv 1)) (lane vv 2))))))))))
+
+(defun main () -> i64
+  (let [n (or (parse-long (nth (args) 0)) 0)
+        a (cell (array 10 (splat f64x4 0.0)))
+        ms (cell (array 5 0.0))]
+    (do (body &a &ms 0 0.0 0.0 0.0 0.0 0.0 0.0 1.0)
+        (body &a &ms 1 4.84143144246472090e+00 -1.16032004402742839e+00 -1.03622044471123109e-01
+              1.66007664274403694e-03 7.69901118419740425e-03 -6.90460016972063023e-05 9.54791938424326609e-04)
+        (body &a &ms 2 8.34336671824457987e+00 4.12479856412430479e+00 -4.03523417114321381e-01
+              -2.76742510726862411e-03 4.99852801234917238e-03 2.30417297573763929e-05 2.85885980666130812e-04)
+        (body &a &ms 3 1.28943695621391310e+01 -1.51111514016986312e+01 -2.23307578892655734e-01
+              2.96460137564761618e-03 2.37847173959480950e-03 -2.96589568540237556e-05 4.36624404335156298e-05)
+        (body &a &ms 4 1.53796971148509165e+01 -2.59193146099879641e+01 1.79258772950371181e-01
+              2.68067772490389322e-03 1.62824170038242295e-03 -9.51592254519715870e-05 5.15138902046611451e-05)
+        (offset-momentum &a @ms)
+        (println (fmt/format-f64 (energy @a @ms) 9))
+        (loop [k 0] (if (>= k n) 0 (do (advance &a @ms 0.01) (recur (+ k 1)))))
+        (println (fmt/format-f64 (energy @a @ms) 9))
+        0)))

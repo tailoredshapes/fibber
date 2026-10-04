@@ -1,0 +1,54 @@
+;; mandelbrot, SIMD version (SIMD wave 4, P5): the same bytes as mandelbrot.fib. The eight pixels of one output byte are
+;; the eight lanes of one f64x8, so the escape loop runs the whole byte at once (on AVX2 a f64x8 is two ymm registers,
+;; two independent dependency chains per iteration). A lane that escaped stays dead (the mask only ever loses lanes),
+;; which is what the scalar program's early return means; the loop ends when no lane is live. The operations per lane
+;; are those of mandelbrot.fib in the same order (no fma), so the bytes are identical.
+;; What is not available yet and is worked around: a mask-to-bits instruction (the eight lanes are read with `lane`),
+;; and a lane-index vector (`iota`; the literal <<0.0 .. 7.0>> is used).
+(ns main (:use fib.unix fib.simd))
+
+(def MAXIT: i64 50)
+
+;; The mask of lanes whose |z|^2 stays at or below 4 through MAXIT iterations of z = z^2 + c.
+(defun inside-lanes (cr: f64x8 ci: f64) -> (Mask 8)
+  (let [civ (splat f64x8 ci)]
+    (loop [i 0 zr (splat f64x8 0.0) zi (splat f64x8 0.0) tr (splat f64x8 0.0) ti (splat f64x8 0.0)
+           live (splat (Mask 8) true)]
+      (if (or (>= i MAXIT) (not (simd/any live)))
+        live
+        (let [zi2 (+ (* (* 2.0 zr) zi) civ)
+              zr2 (+ (- tr ti) cr)
+              tr2 (* zr2 zr2)
+              ti2 (* zi2 zi2)]
+          (recur (+ i 1) zr2 zi2 tr2 ti2 (simd/and live (simd/le (+ tr2 ti2) 4.0))))))))
+
+(defun bit (m: (Mask 8) k: i64) -> i64 (if (lane m k) 1 0))
+
+;; One byte: eight pixels from bx*8, the first the high bit; pixels at or past n are zero bits.
+(defun pack (n: i64 bx: i64 ci: f64) -> i64
+  (let [xs (+ (splat f64x8 (double (* bx 8))) <<0.0 1.0 2.0 3.0 4.0 5.0 6.0 7.0>>)
+        nv (splat f64x8 (double n))
+        cr (- (/ (* 2.0 xs) nv) 1.5)
+        m (simd/and (simd/lt xs nv) (inside-lanes cr ci))]
+    (+ (shl (bit m 0) 7) (shl (bit m 1) 6) (shl (bit m 2) 5) (shl (bit m 3) 4)
+       (shl (bit m 4) 3) (shl (bit m 5) 2) (shl (bit m 6) 1) (bit m 7))))
+
+(defun row (n: i64 y: i64 buf: (Cell (Array i8))) -> unit
+  (let [ci (- (/ (* 2.0 (double y)) (double n)) 1.0)
+        w (quot (+ n 7) 8)]
+    (loop [bx 0]
+      (if (< bx w)
+        (do (array-set! &buf bx (trunc i8 (pack n bx ci)))
+            (recur (+ bx 1)))
+        ()))))
+
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0)))
+        w (quot (+ n 7) 8)
+        buf (cell (array w (trunc i8 0)))]
+    (do
+      (fd-write stdout (str-bytes (str "P4\n" n " " n "\n")))
+      (loop [y 0]
+        (if (< y n)
+          (do (row n y buf) (fd-write stdout @buf) (recur (+ y 1)))
+          0)))))

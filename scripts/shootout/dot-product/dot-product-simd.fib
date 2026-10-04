@@ -1,0 +1,34 @@
+;; dot-product, SIMD version (SIMD wave 4, P5): the arrays are (Array f64x4), element k holding x[4k .. 4k+3], and the
+;; sum runs in four independent f64x4 accumulators (16 products per trip) that are added once at the end. The sum is
+;; exact (see dot-product.fib), so the order does not change the printed digits. N must be a multiple of 16.
+;; There is no vector load from an (Array f64) yet, so the data lives as vectors from the start: filling the arrays is
+;; part of the program, written with a lane literal.
+(ns main (:use fib.simd) (:require [fib.fmt :as fmt]))
+
+(defun dot (x: (Array f64x4) y: (Array f64x4) nv: i64) -> f64
+  (let [z (splat f64x4 0.0)]
+    (loop [i 0 a0 z a1 z a2 z a3 z]
+      (if (< i nv)
+        (recur (+ i 4)
+               (+ a0 (* (array-get x i) (array-get y i)))
+               (+ a1 (* (array-get x (+ i 1)) (array-get y (+ i 1))))
+               (+ a2 (* (array-get x (+ i 2)) (array-get y (+ i 2))))
+               (+ a3 (* (array-get x (+ i 3)) (array-get y (+ i 3)))))
+        (hsum (+ (+ a0 a1) (+ a2 a3)))))))
+
+(defun main () -> i64
+  (let [n (unwrap (parse-long (nth (args) 0)))
+        reps (if (> (count (args)) 1) (unwrap (parse-long (nth (args) 1))) 1)
+        nv (quot n 4)
+        x (cell (array nv (splat f64x4 0.0)))
+        y (cell (array nv (splat f64x4 0.0)))]
+    (do (loop [k 0] (if (< k nv)
+          (let [i (* k 4)]
+            (do (array-set! &x k <<(double (rem i 7)) (double (rem (+ i 1) 7)) (double (rem (+ i 2) 7)) (double (rem (+ i 3) 7))>>)
+                (array-set! &y k <<(+ (double (rem i 3)) 0.5) (+ (double (rem (+ i 1) 3)) 0.5)
+                                   (+ (double (rem (+ i 2) 3)) 0.5) (+ (double (rem (+ i 3) 3)) 0.5)>>)
+                (recur (+ k 1))))
+          0))
+        (let [total (loop [r 0 t 0.0] (if (< r reps) (recur (+ r 1) (+ t (dot @x @y nv))) t))]
+          (println (fmt/format-f64 total 1)))
+        0)))
