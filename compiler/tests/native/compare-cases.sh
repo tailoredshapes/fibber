@@ -7,7 +7,11 @@ NAME=compare-cases
 units() {
   if [ $# -eq 0 ]; then set -- $(find cases/lir -mindepth 1 -maxdepth 1 -type d | sort); fi
   local d
-  for d in "$@"; do [ -d "$d" ] && echo "$d"; done
+  # a directory whose every case says `;; stage: 2` is for the fibber lair alone (see lib.sh `skip_stage2`)
+  for d in "$@"; do
+    [ -d "$d" ] || continue
+    if [ -n "$(find "$d" -name '*.lir' | xargs grep -L '^;; stage: *2' 2>/dev/null)" ]; then echo "$d"; fi
+  done
 }
 rust_run() { capture "$2" "$LAIR" cases "$1"; }
 fib_run() { capture "$2" "$LAIRF" cases "$1"; }
