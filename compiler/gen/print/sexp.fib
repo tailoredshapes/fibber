@@ -1,0 +1,80 @@
+;; compiler/gen/print/sexp.fib: the s-expression the printer lays out, and its layout (crates/fibgen/src/print/mod.rs `Sexp`, `flat`, `layout`). OWNER: package P.
+;; `FgSexp` moved here from gen.print (pipelines.rs prints Sexp and print.fib's `expr` prints pipelines: one of them has to sit below the other).
+;; The text is part of the golden corpus: the 80-column rule is byte for byte.
+(ns gen.print.sexp
+  (:use fib.string))
+
+(defenum FgSexp (SxAtom s: str) (SxList items: (Vec FgSexp)) (SxVector items: (Vec FgSexp)) (SxPrefix p: str x: FgSexp))
+
+(defun sx-atom (s: str) -> FgSexp (SxAtom s))
+(defun sx-list (items: (Vec FgSexp)) -> FgSexp (SxList items))
+;; `(head item ...)`.
+(defun sx-form (head: str items: (Vec FgSexp)) -> FgSexp (SxList (vec (concat [(SxAtom head)] items))))
+
+;; print::flat: one line.
+(defun print-flat (s: FgSexp) -> str
+  (match s
+    ((SxAtom a) a)
+    ((SxList xs) (str "(" (join " " (mapv print-flat xs)) ")"))
+    ((SxVector xs) (str "[" (join " " (mapv print-flat xs)) "]"))
+    ((SxPrefix p x) (str p (print-flat x)))))
+
+(defun sx-atom-is? :private (items: (Vec FgSexp) i: i64 text: str) -> bool
+  (and (< i (vec-count items))
+       (match (vec-nth items i) ((SxAtom a) (= a text)) (_ false))))
+
+(defun sx-head-in? :private (h: str names: (Vec str)) -> bool
+  (some? (find-first (fn (n: str) (= n h)) names)))
+
+;; How many items stay on the first line: defun 5 (6 with :private, 2 more with :where), impl 3, let/loop/plet/match/fn/if 2, else 1.
+(defun sx-keep :private (items: (Vec FgSexp)) -> i64
+  (let ((n (vec-count items)))
+    (min n
+         (match (vec-nth items 0)
+           ((SxAtom h)
+             (cond (= h "defun")
+                   (let ((private (sx-atom-is? items 2 ":private"))
+                         (at (if private 4 3))
+                         (bounded (sx-atom-is? items at ":where")))
+                     (+ 5 (if private 1 0) (if bounded 2 0)))
+                   (= h "impl") 3
+                   (sx-head-in? h ["let" "loop" "plet" "match" "fn" "if"]) 2
+                   :else 1))
+           (_ 1)))))
+
+(defun sx-head-width :private (items: (Vec FgSexp) keep: i64) -> i64
+  (loop ((i 0) (w 0))
+    (if (< i keep) (recur (+ i 1) (+ w (count (print-flat (vec-nth items i))) 1)) w)))
+
+(defun sx-broken :private (open: str close: str items: (Vec FgSexp) indent: i64) -> str
+  (let ((keep0 (sx-keep items))
+        (keep (if (<= (+ indent (sx-head-width items keep0)) 80) keep0 (min keep0 2)))
+        (pad (str-join (mapv (fn (i: i64) " ") (range (+ indent 2)))))
+        (first (join " " (mapv (fn (i: i64) (print-flat (vec-nth items i))) (range keep))))
+        (rest (mapv (fn (i: i64) (str "\n" pad (print-layout (vec-nth items i) (+ indent 2))))
+                    (range keep (vec-count items)))))
+    (str open first (str-join rest) close)))
+
+;; print::layout: one line when indent + width <= 80, else the head kept and one item per line at indent + 2.
+(defun print-layout (s: FgSexp indent: i64) -> str
+  (let ((one (print-flat s)))
+    (if (<= (+ indent (count one)) 80)
+        one
+        (match s
+          ((SxPrefix p x) (str p (print-layout x (+ indent (count p)))))
+          ((SxAtom a) one)
+          ((SxList xs) (if (= (vec-count xs) 0) one (sx-broken "(" ")" xs indent)))
+          ((SxVector xs) (if (= (vec-count xs) 0) one (sx-broken "[" "]" xs indent)))))))
+
+;; Rust's `{:?}` of a str: quotes, and the escapes of quote, backslash, newline, return, tab.
+(defun sx-debug-char :private (c: char) -> str
+  (let ((n (char->i32 c)))
+    (cond (= n 34i32) "\\\""
+          (= n 92i32) "\\\\"
+          (= n 10i32) "\\n"
+          (= n 13i32) "\\r"
+          (= n 9i32) "\\t"
+          :else (char->str c))))
+
+(defun sx-debug-str (s: str) -> str
+  (str "\"" (str-join (mapv sx-debug-char (str-chars s))) "\""))

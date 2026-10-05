@@ -4,18 +4,157 @@
 ;; and, when the program counts calls, the weighted number of times its functions ran. The programs `:use` the four facades of the library.
 ;; It does not use gen.state: the pipeline generator has its own state (`FgPGen`, gen.lambdas) and its own rng stream.
 (ns gen.pipelines
-  (:use gen.ty gen.ast gen.lambdas))
+  (:use gen.ty gen.ast gen.rng gen.lambdas))
+
+(defun pg-chance :private (g: FgPGen pct: i64) -> bool (rng-chance (. g rng) pct))
+(defun pg-below :private (g: FgPGen n: i64) -> i64 (rng-below (. g rng) n))
+(defun pg-range :private (g: FgPGen lo: i64 hi: i64) -> i64 (rng-range (. g rng) lo hi))
+
+(defun pipelines-vec-lit (items: (Vec FgExpr)) -> FgExpr (expr-new (YVec YInt) (EkVecLit items)))
+
+;; Between `lo` and `hi` literals.
+(defun pipelines-int-lits (g: FgPGen lo: i64 hi: i64) -> (Vec FgExpr)
+  (let ((n (+ lo (pg-below g (+ (- hi lo) 1)))))
+    (loop ((i 0) (out []))
+      (if (< i n) (recur (+ i 1) (conj out (expr-int (pg-range g -3 12)))) out))))
+
+;; `r` of the pipeline, then the call counter beside it.
+(defun pipelines-with-calls (g: FgPGen pipe: FgExpr) -> FgExpr
+  (if (not @(. g counted))
+      pipe
+      (let ((r (expr-var "r" YInt))
+            (calls (expr-new YInt (EkDeref (expr-var (lambdas-calls) (YCell YInt)))))
+            (scaled (expr-call YInt "*" [r (expr-int (pipe-count-scale))]))
+            (sum (expr-call YInt "+" [scaled calls])))
+        (lambdas-lets [(FgNameInit "r" pipe)] sum))))
+
+;; A `def` of `v`, and the variable that names it.
+(defun pipelines-hoist (g: FgPGen v: FgExpr) -> FgExpr
+  (let ((name (str "src" (+ (vec-count @(. g defs)) 1)))
+        (ty (. v ty)))
+    (do (set! (. g defs) (conj @(. g defs) (FgDef name ty v)))
+        (expr-var name ty))))
+
+;; A size for `take` and `drop`: a literal, or a captured number.
+(defun pipelines-count-arg (g: FgPGen) -> FgExpr
+  (let ((ints @(. g ints)))
+    (if (and (> (vec-count ints) 0) (pg-chance g 30))
+        (expr-var (vec-nth ints (pg-below g (vec-count ints))) YInt)
+        (expr-int (pg-range g -1 7)))))
+
+(defun pg-src-vec :private (g: FgPGen top: bool hi: i64) -> FgSrc
+  (let ((v (pipelines-vec-lit (pipelines-int-lits g 1 hi))))
+    (if (and top (pg-chance g 25))
+        (SrVec (pipelines-hoist g v))
+        (SrVec v))))
+
+(defun pipelines-source (g: FgPGen top: bool) -> FgSrc
+  (let ((hi (+ 3 (* 2 (. g size)))) (k (pg-below g 100)))
+    (cond (<= k 59) (pg-src-vec g top hi)
+          (<= k 79) (SrList (expr-call YList "list" (pipelines-int-lits g 1 hi)))
+          :else (SrRange (expr-int (pg-range g 0 8))))))
+
+(defun pipelines-concat-stage (g: FgPGen) -> FgStage
+  (let ((k (pg-below g 100))
+        (other (cond (< k 40)
+                     (match @(. g cv)
+                       ((some cv) (if (pg-chance g 40)
+                                      (OpVec (expr-var cv (YVec YInt)))
+                                      (OpVec (pipelines-vec-lit (pipelines-int-lits g 0 4)))))
+                       (nil (OpVec (pipelines-vec-lit (pipelines-int-lits g 0 4)))))
+                     (< k 70) (OpLazy (pipelines-chain g 2 false false))
+                     :else (OpEager (pipelines-chain g 2 false false)))))
+    (SgConcat other (pg-chance g 55))))
+
+(defun pipelines-stage (g: FgPGen concat: bool mapcat: bool) -> FgStage
+  (let ((weights [3 3 2 2 2 2 (if mapcat 2 0) (if concat 3 0)]))
+    (match (rng-weighted (. g rng) weights)
+      ((some 0) (SgMap (lambdas-int-fn g true)))
+      ((some 1) (SgFilter (lambdas-bool-fn g)))
+      ((some 2) (SgRemove (lambdas-bool-fn g)))
+      ((some 3) (SgTake (pipelines-count-arg g)))
+      ((some 4) (SgDrop (pipelines-count-arg g)))
+      ((some 5) (SgTakeWhile (lambdas-bool-fn g)))
+      ((some 6) (SgMapcat (lambdas-vec-fn g)))
+      (_ (pipelines-concat-stage g)))))
+
+(defun pg-mapcat? :private (s: FgStage) -> bool (match s ((SgMapcat f) true) (_ false)))
+
+;; A source and up to `max` stages. `top` chains may take a source from a `def`; `concat` says whether a stage may be a `concat`.
+(defun pipelines-chain (g: FgPGen max: i64 top: bool concat: bool) -> FgChain
+  (let ((src (pipelines-source g top))
+        (n (if (= max 0) 0 (+ 1 (pg-below g max)))))
+    (loop ((i 0) (stages []) (mapcats 0))
+      (if (< i n)
+          (let ((s (pipelines-stage g concat (< mapcats 2))))
+            (recur (+ i 1) (conj stages s) (if (pg-mapcat? s) (+ mapcats 1) mapcats)))
+          (FgChain src stages)))))
+
+(defun pg-reduce-init :private (g: FgPGen) -> FgExpr (expr-int (pg-range g -5 5)))
+
+(defun pipelines-term-of (g: FgPGen) -> FgTerm
+  (let ((weights [3 2 3 2 2 2 2 2 2 2 2 2 2 2]))
+    (match (rng-weighted (. g rng) weights)
+      ((some 0) (let ((f (lambdas-step-fn g))) (TmReduce f (pg-reduce-init g) nil)))
+      ((some 12) (let ((f (lambdas-step-fn g)) (init (pg-reduce-init g))) (TmReduce f init (some (pg-range g 0 40)))))
+      ((some 13) (TmReduce1 (lambdas-step-fn g)))
+      ((some 1) TmCount)
+      ((some 2) TmVec)
+      ((some 3) TmFirst)
+      ((some 4) TmLast)
+      ((some 5) TmEmpty)
+      ((some 6) TmSum)
+      ((some 7) TmSort)
+      ((some 8) (TmEvery (lambdas-bool-fn g)))
+      ((some 9) (TmFindFirst (lambdas-bool-fn g)))
+      ((some 10) (TmSortBy (lambdas-key-fn g)))
+      (_ (TmNth (expr-int (pg-range g 0 5)))))))
+
+(defun pg-seq-last? :private (s: FgStage) -> bool
+  (match s ((SgConcat o first) (not first)) (_ false)))
+(defun pg-nth? :private (t: FgTerm) -> bool (match t ((TmNth n) true) (_ false)))
+
+(defun pg-shape :private (g: FgPGen chain: FgChain terms: (Vec FgTerm)) -> FgShape
+  (let ((n (vec-count (. chain stages)))
+        (threadable (and (not (some? (find-first pg-seq-last? (. chain stages))))
+                         (not (some? (find-first pg-nth? terms)))))
+        (k (pg-below g 100)))
+    (cond (and (<= k 24) threadable) ShThread
+          (and (>= k 25) (<= k 44)) ShNested
+          (and (>= k 45) (<= k 69)) ShBound
+          (> n 1) (ShSplit (+ 1 (pg-below g (- n 1))))
+          :else ShNested)))
+
+(defun pipelines-pipe (g: FgPGen) -> FgPipe
+  (let ((chain (pipelines-chain g (min (+ 1 (. g size)) 6) true true))
+        (twice (pg-chance g 25))
+        (terms (if twice
+                   (let ((a (pipelines-term-of g))) [a (pipelines-term-of g)])
+                   [(pipelines-term-of g)]))
+        (shape (pg-shape g chain terms)))
+    (FgPipe chain terms shape)))
+
+(defun pg-captures :private (g: FgPGen) -> (Vec FgNameInit)
+  (let ((calls (if @(. g counted) [(FgNameInit (lambdas-calls) (expr-call (YCell YInt) "cell" [(expr-int 0)]))] []))
+        (n (rng-below (. g rng) 3))
+        (ints (loop ((i 0) (out []))
+                (if (< i n)
+                    (let ((name (str "k" (+ i 1))) (v (pg-range g -2 5)))
+                      (do (set! (. g ints) (conj @(. g ints) name))
+                          (recur (+ i 1) (conj out (FgNameInit name (expr-int v))))))
+                    out)))
+        (cv (if (pg-chance g 30)
+                (let ((items (pipelines-int-lits g 1 4)))
+                  (do (set! (. g cv) (some "cv")) [(FgNameInit "cv" (pipelines-vec-lit items))]))
+                [])))
+    (vec (concat (vec (concat calls ints)) cv))))
 
 ;; generate_pipeline: PGen from the seed; counted = chance 60; 0..2 captured ints `k1..`; a captured vector `cv` with chance 30; one pipe; main.
-(defun pipelines-generate (seed: i64 size: i64) -> FgProgram (trap "todo: gen.pipelines pipelines-generate"))
-(defun pipelines-vec-lit (items: (Vec FgExpr)) -> FgExpr (trap "todo: gen.pipelines pipelines-vec-lit"))
-(defun pipelines-int-lits (g: FgPGen lo: i64 hi: i64) -> (Vec FgExpr) (trap "todo: gen.pipelines pipelines-int-lits"))
-(defun pipelines-with-calls (g: FgPGen pipe: FgExpr) -> FgExpr (trap "todo: gen.pipelines pipelines-with-calls"))
-(defun pipelines-pipe (g: FgPGen) -> FgPipe (trap "todo: gen.pipelines pipelines-pipe"))
-(defun pipelines-chain (g: FgPGen max: i64 top: bool concat: bool) -> FgChain (trap "todo: gen.pipelines pipelines-chain"))
-(defun pipelines-source (g: FgPGen top: bool) -> FgSrc (trap "todo: gen.pipelines pipelines-source"))
-(defun pipelines-hoist (g: FgPGen v: FgExpr) -> FgExpr (trap "todo: gen.pipelines pipelines-hoist"))
-(defun pipelines-count-arg (g: FgPGen) -> FgExpr (trap "todo: gen.pipelines pipelines-count-arg"))
-(defun pipelines-stage (g: FgPGen concat: bool mapcat: bool) -> FgStage (trap "todo: gen.pipelines pipelines-stage"))
-(defun pipelines-concat-stage (g: FgPGen) -> FgStage (trap "todo: gen.pipelines pipelines-concat-stage"))
-(defun pipelines-term-of (g: FgPGen) -> FgTerm (trap "todo: gen.pipelines pipelines-term-of"))
+(defun pipelines-generate (seed: i64 size: i64) -> FgProgram
+  (let ((g (FgPGen (rng-new seed) (cell false) (cell []) (cell nil) (cell []) (max size 1)))
+        (counted (do (set! (. g counted) (pg-chance g 60)) @(. g counted)))
+        (binds (pg-captures g))
+        (pipe (pipelines-pipe g))
+        (body (pipelines-with-calls g (expr-new YInt (EkPipe pipe))))
+        (main (if (= (vec-count binds) 0) body (lambdas-lets binds body))))
+    (FgProgram @(. g defs) [] [] main)))

@@ -94,18 +94,178 @@
 (defstruct FgPatVars (pat: FgPat vars: (Vec FgVar)))
 (defstruct FgDefs (defs: (Vec FgDef) vars: (Vec FgVar)))
 
+
+;; ---- macros.rs: the name and the `defmacro` text of each preamble macro (Mac::name, Mac::definition); the expansion is the model's (M2).
+(defun mac-all () -> (Vec FgMac) [McTwice McOnce2 McSwapSub McFlipIf McSumAll McNargs McSeq])
+(defun mac-name (m: FgMac) -> str
+  (match m ((McTwice) "twice") ((McOnce2) "once2") ((McSwapSub) "swap-sub") ((McFlipIf) "flip-if")
+    ((McSumAll) "sum-all") ((McNargs) "nargs") ((McSeq) "seq")))
+(defun mac-definition (m: FgMac) -> str
+  (match m
+    ((McTwice) "(defmacro twice (e) `(+ ~e ~e))")
+    ((McOnce2) "(defmacro once2 (e) (let ((t (gensym \"t\"))) `(let ((~t ~e)) (+ ~t ~t))))")
+    ((McSwapSub) "(defmacro swap-sub (form)\n  (match form ((List [(Sym \"-\") a b]) `(- ~b ~a)) (_ form)))")
+    ((McFlipIf) "(defmacro flip-if (form)\n  (match form ((List [(Sym \"if\") c t e]) `(if (not ~c) ~e ~t)) (_ form)))")
+    ((McSumAll) "(defmacro sum-all (... xs)\n  (match xs ([] '0) ([x & more] `(+ ~x (sum-all ~@more)))))")
+    ((McNargs) "(defmacro nargs (... xs) (Int (vec-count xs) :i64))")
+    ((McSeq) "(defmacro seq (... steps) `(do ~@steps))")))
+
 ;; ---- the tree's own functions (ast.rs `impl Expr`, `impl Program`; pipe/mod.rs `exprs`). The shrinker and the printer use `children`.
 (defun expr-new (ty: FgTy kind: FgKind) -> FgExpr (FgExpr ty kind))
-(defun expr-int (n: i64) -> FgExpr (trap "todo: gen.ast expr-int"))
-(defun expr-var (name: str ty: FgTy) -> FgExpr (trap "todo: gen.ast expr-var"))
-(defun expr-call (ty: FgTy head: str args: (Vec FgExpr)) -> FgExpr (trap "todo: gen.ast expr-call"))
+(defun expr-int (n: i64) -> FgExpr (FgExpr YInt (EkInt n)))
+(defun expr-var (name: str ty: FgTy) -> FgExpr (FgExpr ty (EkVar name)))
+(defun arg-val :private (e: FgExpr) -> FgArg (ArVal e))
+(defun expr-call (ty: FgTy head: str args: (Vec FgExpr)) -> FgExpr
+  (FgExpr ty (EkCall head (mapv arg-val args))))
+
+(defun bind-init :private (b: FgBind) -> FgExpr (. b init))
+(defun name-init :private (b: FgNameInit) -> FgExpr (. b init))
+(defun arm-body :private (a: FgArm) -> FgExpr (. a body))
+(defun arg-expr :private (a: FgArg) -> (Option FgExpr) (match a ((ArVal e) (some e)) ((ArInOut n) nil)))
+(defun clause-parts :private (c: FgClause) -> (Vec FgExpr)
+  (match (. c guard) ((some g) [g (. c body)]) (nil [(. c body)])))
+(defun cat :private (a: (Vec FgExpr) b: (Vec FgExpr)) -> (Vec FgExpr) (vec (concat a b)))
+(defun flat-cat :private (xs: (Vec (Vec FgExpr))) -> (Vec FgExpr) (reduce cat [] xs))
+
 ;; Expr::children: the sub-expressions in the order of the Rust (the shrinker's node numbering depends on it; `&` arguments are skipped).
-(defun expr-children (e: FgExpr) -> (Vec FgExpr) (trap "todo: gen.ast expr-children"))
+(defun expr-children (e: FgExpr) -> (Vec FgExpr)
+  (match (. e kind)
+    ((EkVecLit es) es) ((EkDo es) es) ((EkRecur es) es) ((EkMacro m es) es)
+    ((EkLet bs b) (conj (mapv bind-init bs) b))
+    ((EkLoop bs b) (conj (mapv name-init bs) b))
+    ((EkPlet bs b) (conj (mapv name-init bs) b))
+    ((EkIf c t f) [c t f])
+    ((EkMatch s cl) (cat [s] (mapv arm-body cl)))
+    ((EkCall h args) (vec (keep arg-expr args)))
+    ((EkApply f args) (cat [f] args))
+    ((EkSet a b) [a b])
+    ((EkGMatch s cl) (cat [s] (flat-cat (mapv clause-parts cl))))
+    ((EkDyn p s x) [x]) ((EkConv op to x) [x]) ((EkFn ps x) [x]) ((EkFnNamed n ps x) [x])
+    ((EkField x f) [x]) ((EkDeref x) [x]) ((EkSetField c f x) [x]) ((EkAsync x) [x]) ((EkAwait x) [x])
+    ((EkWeakDead n x) [x])
+    ((EkPipe p) (pipe-exprs p))
+    (_ [])))
+
+;; A cursor over the replacement children: `kids-next` is the replacement for the next child, in the order of `expr-children`.
+(defstruct FgKids (kids: (Vec FgExpr) at: (Cell i64)))
+(defun kids-next (k: FgKids) -> FgExpr
+  (let ((i @(. k at)))
+    (do (set! (. k at) (+ i 1)) (vec-nth (. k kids) i))))
+(defun kids-many (k: FgKids n: i64) -> (Vec FgExpr)
+  (loop ((i 0) (out []))
+    (if (< i n) (recur (+ i 1) (conj out (kids-next k))) out)))
+
+(defun with-bind-inits :private (k: FgKids bs: (Vec FgBind)) -> (Vec FgBind)
+  (mapv (fn (b: FgBind) (FgBind (. b pat) (kids-next k))) bs))
+(defun with-name-inits :private (k: FgKids bs: (Vec FgNameInit)) -> (Vec FgNameInit)
+  (mapv (fn (b: FgNameInit) (FgNameInit (. b name) (kids-next k))) bs))
+(defun with-clause :private (k: FgKids c: FgClause) -> FgClause
+  (match (. c guard)
+    ((some g) (let ((g2 (kids-next k))) (FgClause (. c pat) (some g2) (kids-next k))))
+    (nil (FgClause (. c pat) nil (kids-next k)))))
+(defun with-arg :private (k: FgKids a: FgArg) -> FgArg
+  (match a ((ArVal x) (ArVal (kids-next k))) ((ArInOut n) a)))
+
+(defun with-kind :private (k: FgKids kind: FgKind) -> FgKind
+  (match kind
+    ((EkVecLit es) (EkVecLit (kids-many k (vec-count es))))
+    ((EkDo es) (EkDo (kids-many k (vec-count es))))
+    ((EkRecur es) (EkRecur (kids-many k (vec-count es))))
+    ((EkMacro m es) (EkMacro m (kids-many k (vec-count es))))
+    ((EkLet bs b) (let ((bs2 (with-bind-inits k bs))) (EkLet bs2 (kids-next k))))
+    ((EkLoop bs b) (let ((bs2 (with-name-inits k bs))) (EkLoop bs2 (kids-next k))))
+    ((EkPlet bs b) (let ((bs2 (with-name-inits k bs))) (EkPlet bs2 (kids-next k))))
+    ((EkIf c t f) (let ((c2 (kids-next k)) (t2 (kids-next k))) (EkIf c2 t2 (kids-next k))))
+    ((EkMatch s cl)
+      (let ((s2 (kids-next k)))
+        (EkMatch s2 (mapv (fn (a: FgArm) (FgArm (. a pat) (kids-next k))) cl))))
+    ((EkCall h args) (EkCall h (mapv (fn (a: FgArg) (with-arg k a)) args)))
+    ((EkApply f args) (let ((f2 (kids-next k))) (EkApply f2 (kids-many k (vec-count args)))))
+    ((EkSet a b) (let ((a2 (kids-next k))) (EkSet a2 (kids-next k))))
+    ((EkGMatch s cl) (let ((s2 (kids-next k))) (EkGMatch s2 (mapv (fn (c: FgClause) (with-clause k c)) cl))))
+    ((EkDyn p s x) (EkDyn p s (kids-next k)))
+    ((EkConv op to x) (EkConv op to (kids-next k)))
+    ((EkFn ps x) (EkFn ps (kids-next k)))
+    ((EkFnNamed n ps x) (EkFnNamed n ps (kids-next k)))
+    ((EkField x f) (EkField (kids-next k) f))
+    ((EkDeref x) (EkDeref (kids-next k)))
+    ((EkSetField c f x) (EkSetField c f (kids-next k)))
+    ((EkAsync x) (EkAsync (kids-next k)))
+    ((EkAwait x) (EkAwait (kids-next k)))
+    ((EkWeakDead n x) (EkWeakDead n (kids-next k)))
+    ((EkPipe p) (EkPipe (pipe-with-exprs p (kids-many k (vec-count (pipe-exprs p))))))
+    (_ kind)))
+
 ;; Expr::children_mut becomes `expr-with-children`: the same node with its children replaced, in the same order.
-(defun expr-with-children (e: FgExpr kids: (Vec FgExpr)) -> FgExpr (trap "todo: gen.ast expr-with-children"))
-(defun expr-size (e: FgExpr) -> i64 (trap "todo: gen.ast expr-size"))
-(defun program-bodies (p: FgProgram) -> (Vec FgExpr) (trap "todo: gen.ast program-bodies"))
-(defun program-size (p: FgProgram) -> i64 (trap "todo: gen.ast program-size"))
-(defun program-uses-library? (p: FgProgram) -> bool (trap "todo: gen.ast program-uses-library?"))
-(defun pipe-exprs (p: FgPipe) -> (Vec FgExpr) (trap "todo: gen.ast pipe-exprs"))
-(defun pipe-with-exprs (p: FgPipe es: (Vec FgExpr)) -> FgPipe (trap "todo: gen.ast pipe-with-exprs"))
+(defun expr-with-children (e: FgExpr kids: (Vec FgExpr)) -> FgExpr
+  (FgExpr (. e ty) (with-kind (FgKids kids (cell 0)) (. e kind))))
+
+;; Expr::size: the number of nodes.
+(defun expr-size (e: FgExpr) -> i64
+  (reduce (fn (n: i64 c: FgExpr) (+ n (expr-size c))) 1 (expr-children e)))
+
+;; Whether any node of the tree satisfies `p` (pre-order, as `walk`).
+(defun expr-any? (e: FgExpr p: (fn (FgExpr) bool)) -> bool
+  (or (p e) (some? (find-first (fn (c: FgExpr) (expr-any? c p)) (expr-children e)))))
+
+;; Every expression of the program: the constants, the method bodies, the helper bodies, then `main`.
+(defun method-body :private (m: FgMethod) -> FgExpr (. m body))
+(defun impl-bodies :private (i: FgImpl) -> (Vec FgExpr) (mapv method-body (. i methods)))
+(defun program-bodies (p: FgProgram) -> (Vec FgExpr)
+  (let ((defs (mapv (fn (d: FgDef) (. d init)) (. p defs)))
+        (methods (flat-cat (mapv impl-bodies (. p impls))))
+        (funs (mapv (fn (f: FgFun) (. f body)) (. p funs))))
+    (conj (cat (cat defs methods) funs) (. p main))))
+
+(defun program-size (p: FgProgram) -> i64
+  (reduce (fn (n: i64 e: FgExpr) (+ n (expr-size e))) 0 (program-bodies p)))
+
+(defun pipe-node? :private (e: FgExpr) -> bool (match (. e kind) ((EkPipe p) true) (_ false)))
+(defun program-uses-library? (p: FgProgram) -> bool
+  (some? (find-first (fn (b: FgExpr) (expr-any? b pipe-node?)) (program-bodies p))))
+
+;; ---- pipe/mod.rs: the expressions of a pipeline, in the order the shrinker and the model number them.
+(defun operand-exprs :private (o: FgOperand) -> (Vec FgExpr)
+  (match o ((OpVec e) [e]) ((OpLazy c) (chain-exprs c)) ((OpEager c) (chain-exprs c))))
+(defun src-expr :private (s: FgSrc) -> FgExpr (match s ((SrVec e) e) ((SrList e) e) ((SrRange e) e)))
+(defun stage-exprs :private (s: FgStage) -> (Vec FgExpr)
+  (match s
+    ((SgMap e) [e]) ((SgFilter e) [e]) ((SgRemove e) [e]) ((SgTake e) [e]) ((SgDrop e) [e])
+    ((SgTakeWhile e) [e]) ((SgMapcat e) [e])
+    ((SgConcat o first) (operand-exprs o))))
+(defun chain-exprs (c: FgChain) -> (Vec FgExpr)
+  (cat [(src-expr (. c src))] (flat-cat (mapv stage-exprs (. c stages)))))
+(defun term-exprs :private (t: FgTerm) -> (Vec FgExpr)
+  (match t
+    ((TmReduce f init stop) [f init]) ((TmReduce1 f) [f]) ((TmEvery f) [f]) ((TmFindFirst f) [f])
+    ((TmSortBy f) [f]) ((TmNth f) [f])
+    (_ [])))
+(defun pipe-exprs (p: FgPipe) -> (Vec FgExpr)
+  (cat (chain-exprs (. p chain)) (flat-cat (mapv term-exprs (. p terms)))))
+
+(defun src-with :private (k: FgKids s: FgSrc) -> FgSrc
+  (match s ((SrVec e) (SrVec (kids-next k))) ((SrList e) (SrList (kids-next k))) ((SrRange e) (SrRange (kids-next k)))))
+(defun operand-with :private (k: FgKids o: FgOperand) -> FgOperand
+  (match o
+    ((OpVec e) (OpVec (kids-next k)))
+    ((OpLazy c) (OpLazy (chain-with k c)))
+    ((OpEager c) (OpEager (chain-with k c)))))
+(defun stage-with :private (k: FgKids s: FgStage) -> FgStage
+  (match s
+    ((SgMap e) (SgMap (kids-next k))) ((SgFilter e) (SgFilter (kids-next k))) ((SgRemove e) (SgRemove (kids-next k)))
+    ((SgTake e) (SgTake (kids-next k))) ((SgDrop e) (SgDrop (kids-next k)))
+    ((SgTakeWhile e) (SgTakeWhile (kids-next k))) ((SgMapcat e) (SgMapcat (kids-next k)))
+    ((SgConcat o first) (SgConcat (operand-with k o) first))))
+(defun chain-with (k: FgKids c: FgChain) -> FgChain
+  (let ((src (src-with k (. c src))))
+    (FgChain src (mapv (fn (s: FgStage) (stage-with k s)) (. c stages)))))
+(defun term-with :private (k: FgKids t: FgTerm) -> FgTerm
+  (match t
+    ((TmReduce f init stop) (let ((f2 (kids-next k))) (TmReduce f2 (kids-next k) stop)))
+    ((TmReduce1 f) (TmReduce1 (kids-next k)))
+    ((TmEvery f) (TmEvery (kids-next k))) ((TmFindFirst f) (TmFindFirst (kids-next k)))
+    ((TmSortBy f) (TmSortBy (kids-next k))) ((TmNth f) (TmNth (kids-next k)))
+    (_ t)))
+(defun pipe-with-exprs (p: FgPipe es: (Vec FgExpr)) -> FgPipe
+  (let ((k (FgKids es (cell 0))) (chain (chain-with k (. p chain))))
+    (FgPipe chain (mapv (fn (t: FgTerm) (term-with k t)) (. p terms)) (. p shape))))

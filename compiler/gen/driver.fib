@@ -4,7 +4,7 @@
 ;; cases at a time with -j), so the parallelism is the harness's; only generation and the model are sequential, one seed at a time under a
 ;; memory and time bound (the OOM of seed 1409: design section 3.4).
 (ns gen.driver
-  (:use gen.ty gen.ast gen.model.value gen.run gen.report gen.coverage))
+  (:use gen.ty gen.ast gen.model.value gen.model.expected gen.pipelines gen.core gen.run gen.report gen.coverage))
 
 (defstruct FgConfig
   (seed: i64 count: i64 size: (Option i64) jobs: i64 timeout-secs: i64 shrink: bool shrink-budget: i64 exemplars: i64
@@ -17,11 +17,13 @@
 (defstruct FgGroup (class: FgClass key: str n: i64 samples: (Vec FgSample)))
 
 ;; size_of: cfg.size or 1 + i mod 6.
-(defun driver-size-of (cfg: FgConfig i: i64) -> i64 (trap "todo: gen.driver driver-size-of"))
+(defun driver-size-of (cfg: FgConfig i: i64) -> i64
+  (match (. cfg size) ((some k) k) (nil (+ 1 (rem i 6)))))
 ;; GenKind::generate.
-(defun driver-generate (kind: FgGenKind seed: i64 size: i64) -> FgProgram (trap "todo: gen.driver driver-generate"))
+(defun driver-generate (kind: FgGenKind seed: i64 size: i64) -> FgProgram
+  (match kind ((GkPipelines) (pipelines-generate seed size)) ((GkPrograms) (generate seed size))))
 ;; The model half of check_traced; the run half is the harness.
-(defun driver-check (p: FgProgram) -> (Result i64 FgModelError) (trap "todo: gen.driver driver-check"))
+(defun driver-check (p: FgProgram) -> (Result i64 FgModelError) (model-expected p))
 ;; run_batch / harness::gen::run_kind.
 (defun driver-run-batch (cfg: FgConfig) -> FgSummary (trap "todo: gen.driver driver-run-batch"))
 ;; minimise: shrink keeping (class, key) and a result the model can compute.

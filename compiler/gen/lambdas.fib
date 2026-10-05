@@ -11,16 +11,153 @@
 
 (defun lambdas-calls () -> str "calls")
 
-(defun lambdas-lit (g: FgPGen) -> FgExpr (trap "todo: gen.lambdas lambdas-lit"))
-(defun lambdas-leaf (g: FgPGen params: (Vec str)) -> FgExpr (trap "todo: gen.lambdas lambdas-leaf"))
-(defun lambdas-term (g: FgPGen d: i64 params: (Vec str)) -> FgExpr (trap "todo: gen.lambdas lambdas-term"))
-(defun lambdas-pred (g: FgPGen d: i64 params: (Vec str)) -> FgExpr (trap "todo: gen.lambdas lambdas-pred"))
+(defun lam-int :private (g: FgPGen lo: i64 hi: i64) -> FgExpr (expr-int (rng-range (. g rng) lo hi)))
+(defun lam-call :private (ty: FgTy h: str args: (Vec FgExpr)) -> FgExpr (expr-call ty h args))
+(defun lam-ivar :private (name: str) -> FgExpr (expr-var name YInt))
+(defun lam-if :private (ty: FgTy c: FgExpr a: FgExpr b: FgExpr) -> FgExpr (expr-new ty (EkIf c a b)))
+(defun lam-bool :private (b: bool) -> FgExpr (expr-new YBool (EkBool b)))
+
+;; A literal in the range every leaf draws from.
+(defun lambdas-lit (g: FgPGen) -> FgExpr (lam-int g -9 20))
+
+;; A leaf: usually a parameter, else a captured number, the size of the captured vector, or a literal.
+(defun lambdas-leaf (g: FgPGen params: (Vec str)) -> FgExpr
+  (if (and (> (vec-count params) 0) (rng-chance (. g rng) 60))
+      (lam-ivar (vec-nth params (rng-below (. g rng) (vec-count params))))
+      (let ((ints (mapv lam-ivar @(. g ints)))
+            (pool (match @(. g cv)
+                    ((some cv) (conj ints (lam-call YInt "count" [(expr-var cv (YVec YInt))])))
+                    (nil ints))))
+        (if (or (= (vec-count pool) 0) (rng-chance (. g rng) 40))
+            (lambdas-lit g)
+            (vec-nth pool (rng-below (. g rng) (vec-count pool)))))))
+
+(defun lam-var? :private (x: str) -> (fn (FgExpr) bool)
+  (fn (n: FgExpr) (match (. n kind) ((EkVar v) (= v x)) (_ false))))
+
+;; `e`, or a form of `e` and `x` when `e` never mentions `x`: a function that ignores its argument tests little.
+(defun lam-mention :private (g: FgPGen e: FgExpr x: str) -> FgExpr
+  (cond (expr-any? e (lam-var? x)) e
+        (= (. e ty) YBool)
+        (let ((a (lambdas-term g 1 []))
+              (b (lambdas-term g 1 [])))
+          (lam-if YBool e (lam-call YBool "<" [(lam-ivar x) a]) (lam-call YBool ">" [(lam-ivar x) b])))
+        :else (lam-call YInt "+" [(lam-ivar x) e])))
+
+(defun lam-binary :private (g: FgPGen h: str d: i64 params: (Vec str)) -> FgExpr
+  (let ((a (lambdas-term g (- d 1) params)) (b (lambdas-term g (- d 1) params)))
+    (lam-call YInt h [a b])))
+
+(defun lam-scaled :private (g: FgPGen h: str lo: i64 hi: i64 d: i64 params: (Vec str)) -> FgExpr
+  (let ((k (lam-int g lo hi)) (a (lambdas-term g (- d 1) params)))
+    (lam-call YInt h [a k])))
+
+;; An `i64` term over `params`, at most `d` operators deep.
+(defun lambdas-term (g: FgPGen d: i64 params: (Vec str)) -> FgExpr
+  (if (or (= d 0) (rng-chance (. g rng) 25))
+      (lambdas-leaf g params)
+      (let ((k (rng-below (. g rng) 6)))
+        (cond (= k 0) (lam-binary g "+" d params)
+              (= k 1) (lam-binary g "-" d params)
+              (= k 2) (lam-scaled g "*" -3 3 d params)
+              (= k 3) (lam-scaled g "rem" 2 9 d params)
+              :else (let ((c (lambdas-pred g (- d 1) params))
+                          (a (lambdas-term g (- d 1) params))
+                          (b (lambdas-term g (- d 1) params)))
+                      (lam-if YInt c a b))))))
+
+(defun lam-pred-compound :private (g: FgPGen d: i64 params: (Vec str)) -> FgExpr
+  (let ((p (lambdas-pred g (- d 1) params))
+        (q (lambdas-pred g (- d 1) params))
+        (k (rng-below (. g rng) 3)))
+    (cond (= k 0) (lam-call YBool "not" [p])
+          (= k 1) (lam-if YBool p q (lam-bool false))
+          :else (lam-if YBool p (lam-bool true) q))))
+
+(defun lam-pred-mod :private (g: FgPGen params: (Vec str)) -> FgExpr
+  (let ((m (rng-range (. g rng) 2 5))
+        (r (lam-call YInt "rem" [(lambdas-term g 1 params) (expr-int m)])))
+    (lam-call YBool "=" [r (expr-int (rng-range (. g rng) 0 (- m 1)))])))
+
+;; A `bool` over `params`, at most `d` operators deep.
+(defun lambdas-pred (g: FgPGen d: i64 params: (Vec str)) -> FgExpr
+  (cond (and (> d 0) (rng-chance (. g rng) 35)) (lam-pred-compound g d params)
+        (rng-chance (. g rng) 40) (lam-pred-mod g params)
+        :else (let ((h (vec-nth ["<" "<=" ">" ">="] (rng-below (. g rng) 4)))
+                    (a (lambdas-term g 1 params))
+                    (b (lambdas-term g 1 params)))
+                (lam-call YBool h [a b]))))
+
+;; `body`, preceded by the statement that adds a weight to the call counter when the program counts calls and `count` allows it.
+(defun lam-counting :private (g: FgPGen body: FgExpr count: bool) -> FgExpr
+  (if (not (and @(. g counted) count))
+      body
+      (let ((w (lam-int g 1 7))
+            (cell (fn () (expr-var (lambdas-calls) (YCell YInt))))
+            (read (expr-new YInt (EkDeref (expr-var (lambdas-calls) (YCell YInt)))))
+            (bump (lam-call YInt "+" [read w]))
+            (set (expr-new YUnit (EkSet (cell) bump))))
+        (expr-new (. body ty) (EkDo [set body])))))
+
+(defun lam-fn :private (params: (Vec str) body: FgExpr ret: FgTy) -> FgExpr
+  (let ((ps (mapv (fn (p: str) (FgNameTy p YInt)) params))
+        (ty (YFunc (mapv (fn (p: str) YInt) params) ret)))
+    (expr-new ty (EkFn ps body))))
+
 ;; `(fn (x: i64) term)`; `count` says whether it may count its calls.
-(defun lambdas-int-fn (g: FgPGen count: bool) -> FgExpr (trap "todo: gen.lambdas lambdas-int-fn"))
-(defun lambdas-bool-fn (g: FgPGen) -> FgExpr (trap "todo: gen.lambdas lambdas-bool-fn"))
+(defun lambdas-int-fn (g: FgPGen count: bool) -> FgExpr
+  (let ((t (lambdas-term g 2 ["x"]))
+        (b (lam-mention g t "x"))
+        (c (lam-counting g b count)))
+    (lam-fn ["x"] c YInt)))
+
+(defun lambdas-bool-fn (g: FgPGen) -> FgExpr
+  (let ((p (lambdas-pred g 2 ["x"]))
+        (b (lam-mention g p "x"))
+        (c (lam-counting g b true)))
+    (lam-fn ["x"] c YBool)))
+
+(defun lam-veclit :private (items: (Vec FgExpr)) -> FgExpr (expr-new (YVec YInt) (EkVecLit items)))
+
 ;; `(fn (x: i64) (Vec i64))`: one to three elements, or one or none.
-(defun lambdas-vec-fn (g: FgPGen) -> FgExpr (trap "todo: gen.lambdas lambdas-vec-fn"))
+(defun lambdas-vec-fn (g: FgPGen) -> FgExpr
+  (let ((n (+ 1 (rng-below (. g rng) 3)))
+        (items (loop ((i 0) (out [])) (if (< i n) (recur (+ i 1) (conj out (lambdas-term g 1 ["x"]))) out)))
+        (body (if (rng-chance (. g rng) 50)
+                  (lam-veclit items)
+                  (let ((c (lambdas-pred g 1 ["x"]))
+                        (rest (if (rng-chance (. g rng) 50)
+                                  (lam-veclit [])
+                                  (lam-veclit [(lambdas-term g 1 ["x"])]))))
+                    (lam-if (YVec YInt) c (lam-veclit items) rest))))
+        (c2 (lam-counting g body true)))
+    (lam-fn ["x"] c2 (YVec YInt))))
+
+(defun lam-step-body :private (g: FgPGen e: FgExpr) -> FgExpr
+  (let ((a (fn () (lam-ivar "a"))) (k (rng-below (. g rng) 4)))
+    (cond (= k 0) (lam-call YInt "+" [(a) e])
+          (= k 1) (lam-call YInt "-" [e (a)])
+          (= k 2) (let ((p (lambdas-pred g 1 ["x"])) (sum (lam-call YInt "+" [(a) e])))
+                    (lam-if YInt p sum (a)))
+          :else (let ((m (lam-int g 2 9))
+                      (modulus (lam-int g 97 9973))
+                      (grown (lam-call YInt "+" [(lam-call YInt "*" [(a) m]) e])))
+                  (lam-call YInt "rem" [grown modulus])))))
+
 ;; `(fn (a: i64 x: i64) ..)`: a fold step whose accumulator stays small.
-(defun lambdas-step-fn (g: FgPGen) -> FgExpr (trap "todo: gen.lambdas lambdas-step-fn"))
-(defun lambdas-key-fn (g: FgPGen) -> FgExpr (trap "todo: gen.lambdas lambdas-key-fn"))
-(defun lambdas-lets (binds: (Vec FgNameInit) body: FgExpr) -> FgExpr (trap "todo: gen.lambdas lambdas-lets"))
+(defun lambdas-step-fn (g: FgPGen) -> FgExpr
+  (let ((e (lambdas-term g 1 ["x"]))
+        (body (lam-step-body g e))
+        (c (lam-counting g body true)))
+    (lam-fn ["a" "x"] c YInt)))
+
+;; A sort key with ties: a term reduced modulo a small number. It never counts: how often a sort calls its key is the sort's own.
+(defun lambdas-key-fn (g: FgPGen) -> FgExpr
+  (let ((t (lambdas-term g 1 ["x"]))
+        (m (lam-int g 2 5))
+        (body (lam-call YInt "rem" [t m])))
+    (lam-fn ["x"] body YInt)))
+
+;; `(let ((name e) ..) body)` over plain names.
+(defun lambdas-lets (binds: (Vec FgNameInit) body: FgExpr) -> FgExpr
+  (expr-new (. body ty) (EkLet (mapv (fn (b: FgNameInit) (FgBind (GpBind (. b name)) (. b init))) binds) body)))

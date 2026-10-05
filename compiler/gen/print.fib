@@ -1,28 +1,219 @@
 ;; compiler/gen/print.fib: printing a program as fibber source, crates/fibgen/src/print/mod.rs, items.rs, pipelines.rs (seed-1). OWNER: package P.
 ;; The text is part of the golden corpus (compiler/tests/golden/gen): byte for byte, including the 80-column layout rule and the preamble.
 ;; The reader/printer of the compiler (syntax.print) is NOT used: it prints Stx, not this layout.
+;; `FgSexp`, `print-flat` and `print-layout` live in gen.print.sexp (they are below the pipeline printer, gen.print.pipelines, which `print-expr` calls through a function value).
 (ns gen.print
-  (:use gen.ty gen.ast))
+  (:use gen.ty gen.ast gen.print.sexp gen.print.pipelines fib.string))
 
-(defenum FgSexp (SxAtom s: str) (SxList items: (Vec FgSexp)) (SxVector items: (Vec FgSexp)) (SxPrefix p: str x: FgSexp))
+;; ---- the preamble: (the names that use it, its text), in the order of the Rust table.
+(defstruct FgPre (names: (Vec str) text: str))
+
+(defun pre-table :private () -> (Vec FgPre)
+  [(FgPre ["Pt" "Shape" "Rect" "Circle" "Named"] "(defstruct Pt (x: i64 y: i64))")
+   (FgPre ["Wrap" "Shape" "Rect" "Circle" "Named"] "(defstruct Wrap (s: str v: (Vec i64)))")
+   (FgPre ["Holder"] "(defstruct Holder (f: (fn (i64) i64) c: (Cell i64)))")
+   (FgPre ["Shape" "Circle" "Rect" "Named"] "(defenum Shape (Circle r: i64) (Rect a: Pt b: Pt) (Named n: str w: Wrap))")
+   (FgPre ["Hook"] "(defstruct (Hook k :colour) (f: (fn k (i64) i64) tag: i64))")
+   (FgPre ["Job" "Idle" "Ready"] "(defenum (Job k :colour) (Idle) (Ready run: (fn k () i64)))")
+   (FgPre ["Score" "Rank" "score" "bonus" "rank" "tier"]
+          "(defprotocol Score\n  (score (self) -> i64)\n  (bonus (self k: i64) -> i64 (+ (score self) k)))")
+   (FgPre ["Rank" "rank" "tier"]
+          "(defprotocol Rank :requires (Score)\n  (rank (self) -> i64)\n  (tier (self) -> i64 (+ (rank self) (score self))))")
+   (FgPre ["Ver"] "(defstruct Ver (major: i64 minor: i64))\n(derive Eq Ver)\n(derive Ord Ver)")
+   (FgPre ["Lvl" "Low" "Mid" "High"]
+          "(defenum Lvl (Low) (Mid n: i64) (High a: i64 b: str))\n(derive Eq Lvl)\n(derive Ord Lvl)")
+   (FgPre ["inc1"] "(defun inc1 (x: i64) -> i64 (+ x 1))")
+   (FgPre ["digest"]
+          "(defun digest (v: (Vec i64)) -> i64\n  (loop ((i 0) (h 7))\n    (if (< i (vec-count v))\n        (recur (+ i 1) (rem (+ (* h 31) (vec-nth v i)) 1000003))\n        h)))")
+   (FgPre ["sum-vec"]
+          "(defun sum-vec (v: (Vec i64)) -> i64\n  (loop ((i 0) (s 0))\n    (if (< i (count v)) (recur (+ i 1) (+ s (nth v i))) s)))")])
+
+;; The line a program with a library pipeline starts with: the four facades.
+(defun print-library-ns () -> str "(ns main (:use fib.core fib.seq fib.coll fib.print))\n\n")
+
+;; Tokens of `body`: split on whitespace and ()[]@& (empty tokens kept out: they name nothing).
+(defun pr-delim? :private (c: char) -> bool
+  (let ((n (char->i32 c)))
+    (or (= n 32i32) (= n 9i32) (= n 10i32) (= n 13i32) (= n 40i32) (= n 41i32) (= n 91i32) (= n 93i32) (= n 64i32) (= n 38i32))))
+
+(defun pr-tokens :private (body: str) -> (Vec str)
+  (let ((r (reduce (fn (acc: (Vec str) c: char)
+                     (if (pr-delim? c)
+                         (conj acc "")
+                         (assoc acc (- (vec-count acc) 1) (str (vec-nth acc (- (vec-count acc) 1)) (char->str c)))))
+                   [""] (str-chars body))))
+    (vec (filter (fn (t: str) (> (str-len t) 0)) r))))
+
+(defun pr-named? :private (tokens: (Set str) names: (Vec str)) -> bool
+  (some? (find-first (fn (n: str) (contains? tokens n)) names)))
+
+;; The preamble declarations and macros that `body` names, in table order, then a blank line when there are any.
+(defun print-preamble (body: str) -> str
+  (let ((tokens (into #{} (pr-tokens body)))
+        (decls (mapv (fn (p: FgPre) (str (. p text) "\n"))
+                     (vec (filter (fn (p: FgPre) (pr-named? tokens (. p names))) (pre-table)))))
+        (macros (mapv (fn (m: FgMac) (str (mac-definition m) "\n"))
+                      (vec (filter (fn (m: FgMac) (contains? tokens (mac-name m))) (mac-all)))))
+        (out (str-join (vec (concat decls macros)))))
+    (if (= (str-len out) 0) "" (str out "\n"))))
+
+;; ---- expressions
+(defun pr-name-binds :private (bs: (Vec FgNameInit)) -> FgSexp
+  (sx-list (mapv (fn (b: FgNameInit) (sx-list [(sx-atom (. b name)) (print-expr (. b init))])) bs)))
+
+(defun print-fn-params (ps: (Vec FgNameTy)) -> FgSexp
+  (if (= (vec-count ps) 0)
+      (sx-atom "()")
+      (sx-list (vec (mapcat (fn (p: FgNameTy) [(sx-atom (str (. p name) ":")) (sx-atom (ty-text (. p ty)))]) ps)))))
+
+(defun print-flt-text (x: f64) -> str
+  (cond (not (= x x)) "NaN"
+        (> x 1.7976931348623157E308) "inf"
+        (< x -1.7976931348623157E308) "-inf"
+        :else (str x)))
+
+(defun pr-forms :private (es: (Vec FgExpr)) -> (Vec FgSexp) (mapv print-expr es))
+
+;; print::expr and expr_more.
+(defun print-expr (e: FgExpr) -> FgSexp
+  (match (. e kind)
+    ((EkInt n) (sx-atom (str n)))
+    ((EkBool b) (sx-atom (if b "true" "false")))
+    ((EkStr s) (sx-atom (sx-debug-str s)))
+    ((EkUnit) (sx-atom "()"))
+    ((EkNil) (sx-atom "nil"))
+    ((EkEmpty) (sx-atom "Empty"))
+    ((EkVecLit es) (SxVector (pr-forms es)))
+    ((EkVar n) (sx-atom n))
+    ((EkGlobal n) (sx-atom n))
+    ((EkLet bs b)
+      (sx-form "let" [(sx-list (mapv (fn (x: FgBind) (sx-list [(print-pat (. x pat)) (print-expr (. x init))])) bs)) (print-expr b)]))
+    ((EkIf c t f) (sx-form "if" [(print-expr c) (print-expr t) (print-expr f)]))
+    ((EkDo es) (sx-form "do" (pr-forms es)))
+    ((EkMatch s cl)
+      (sx-form "match" (vec (concat [(print-expr s)]
+                                    (mapv (fn (a: FgArm) (sx-list [(print-pat (. a pat)) (print-expr (. a body))])) cl)))))
+    ((EkLoop bs b) (sx-form "loop" [(pr-name-binds bs) (print-expr b)]))
+    ((EkRecur es) (sx-form "recur" (pr-forms es)))
+    ((EkFn ps b) (sx-form "fn" [(print-fn-params ps) (print-expr b)]))
+    ((EkFnNamed n ps b) (sx-form "fn" [(sx-atom n) (print-fn-params ps) (print-expr b)]))
+    (_ (print-expr-more e))))
+
+(defun pr-arg :private (a: FgArg) -> FgSexp
+  (match a ((ArVal e) (print-expr e)) ((ArInOut n) (SxPrefix "&" (sx-atom n)))))
+
+(defun print-expr-more :private (e: FgExpr) -> FgSexp
+  (match (. e kind)
+    ((EkCall h args) (sx-list (vec (concat [(sx-atom h)] (mapv pr-arg args)))))
+    ((EkApply f args) (sx-list (vec (concat [(print-expr f)] (pr-forms args)))))
+    ((EkField s f) (sx-list [(sx-atom ".") (print-expr s) (sx-atom f)]))
+    ((EkDeref c) (SxPrefix "@" (print-expr c)))
+    ((EkSet t v) (sx-list [(sx-atom "set!") (print-expr t) (print-expr v)]))
+    ((EkSetField c f v) (sx-list [(sx-atom "set-field!") (SxPrefix "&" (sx-atom c)) (sx-atom f) (print-expr v)]))
+    ((EkAsync b) (sx-list [(sx-atom "async") (print-expr b)]))
+    ((EkAwait t) (sx-list [(sx-atom "await") (print-expr t)]))
+    ((EkPlet bs b) (sx-form "plet" [(pr-name-binds bs) (print-expr b)]))
+    ((EkPipe p) (print-pipe p))
+    ((EkWeakDead n t)
+      (sx-list [(sx-atom "let") (sx-list [(sx-list [(sx-atom n) (print-expr t)])]) (sx-list [(sx-atom "weak") (sx-atom n)])]))
+    (_ (print-expr-new e))))
+
+;; items.rs expr_new: the forms of Dyn, GMatch, Macro, IntW, Flt, Conv.
+(defun print-clause :private (c: FgClause) -> FgSexp
+  (let ((head [(print-pat (. c pat))])
+        (guard (match (. c guard) ((some g) [(sx-atom ":when") (print-expr g)]) (nil [])))
+        (body [(print-expr (. c body))]))
+    (sx-list (vec (concat (vec (concat head guard)) body)))))
+
+(defun print-expr-new :private (e: FgExpr) -> FgSexp
+  (match (. e kind)
+    ((EkDyn p send x)
+      (sx-list (vec (concat [(sx-atom "dyn") (sx-atom (proto-name p))]
+                            (vec (concat (if send [(sx-atom ":send")] []) [(print-expr x)]))))))
+    ((EkGMatch s cl) (sx-form "match" (vec (concat [(print-expr s)] (mapv print-clause cl)))))
+    ((EkMacro m args) (sx-form (mac-name m) (pr-forms args)))
+    ((EkIntW n t) (sx-atom (str n (num-name t))))
+    ((EkFlt x t) (sx-atom (str (print-flt-text x) (match t ((NmF32) "f32") (_ "")))))
+    ((EkConv op to x)
+      (sx-list [(sx-atom op) (sx-atom (match to ((some t) (num-name t)) (nil "i64"))) (print-expr x)]))
+    (_ (sx-atom "<unprintable>"))))
+
+;; items.rs pat.
+(defun print-pat (p: FgPat) -> FgSexp
+  (match p
+    ((GpWild) (sx-atom "_"))
+    ((GpBind n) (sx-atom n))
+    ((GpNil) (sx-atom "nil"))
+    ((GpLit n) (sx-atom (str n)))
+    ((GpSome q) (sx-list [(sx-atom "some") (print-pat q)]))
+    ((GpCtor c ps) (sx-list (vec (concat [(sx-atom c)] (mapv print-pat ps)))))
+    ((GpAs q n) (sx-list [(print-pat q) (sx-atom ":as") (sx-atom n)]))
+    ((GpVector ps rest)
+      (let ((tail (match rest
+                    ((some r) [(sx-atom "&") (match r ((RsBind n) (sx-atom n)) ((RsWild) (sx-atom "_")))])
+                    (nil []))))
+        (SxVector (vec (concat (mapv print-pat ps) tail)))))))
+
+;; print/pipelines.rs pipe: threaded, nested, bound, split shapes.
+(defun print-pipe (p: FgPipe) -> FgSexp (pipes-sexp p print-expr))
+
+;; ---- items
+;; Whether the helper `name` is printed `:private`: one in four, by its number.
+(defun print-private? (name: str) -> bool
+  (let ((digits (str-join (vec (filter (fn (s: str) (and (>= (str-len s) 1) (digit-text? s))) (mapv char->str (str-chars name)))))))
+    (match (parse-long digits) ((some n) (= (rem n 4) 1)) (nil false))))
+
+(defun digit-text? :private (s: str) -> bool
+  (let ((n (char->i32 (vec-nth (str-chars s) 0)))) (and (>= n 48i32) (<= n 57i32))))
+
+(defun pr-param-items :private (p: FgParam) -> (Vec FgSexp)
+  [(sx-atom (str (if (. p inout) "&" "") (. p name) ":")) (sx-atom (ty-text (. p ty)))])
+
+(defun pr-bound-proto :private (f: FgFun) -> (Option FgProto)
+  (reduce (fn (acc: (Option FgProto) p: FgParam) (match (. p ty) ((YGen q true) (some q)) (_ acc))) nil (. f params)))
+
+;; items.rs fundef: `(defun name [:private] (params) [:where ((P a))] -> ret body)`.
+(defun print-fundef (f: FgFun) -> FgSexp
+  (let ((params (vec (mapcat pr-param-items (. f params))))
+        (private (if (print-private? (. f name)) [(sx-atom ":private")] []))
+        (where (match (pr-bound-proto f)
+                 ((some q) [(sx-atom ":where") (sx-list [(sx-list [(sx-atom (proto-name q)) (sx-atom "a")])])])
+                 (nil []))))
+    (sx-list (vec (concat (vec (concat (vec (concat [(sx-atom "defun") (sx-atom (. f name))] private))
+                                       (vec (concat [(sx-list params)] where))))
+                          [(sx-atom "->") (sx-atom (ty-text (. f ret))) (print-expr (. f body))])))))
+
+(defun pr-impl-head :private (i: FgImpl) -> FgSexp
+  (match (. i target)
+    ((YHook s) (sx-list [(sx-atom "Hook") (sx-atom (if (. i colour-var) "k" ":local"))]))
+    (t (sx-atom (ty-text t)))))
+
+;; items.rs impl_def.
+(defun print-impl (i: FgImpl) -> FgSexp
+  (let ((methods (mapv (fn (m: FgMethod)
+                         (sx-list [(sx-atom (. m name))
+                                   (sx-list (vec (concat [(sx-atom "self")] (mapv (fn (p: FgNameTy) (sx-atom (. p name))) (. m params)))))
+                                   (print-expr (. m body))]))
+                       (. i methods))))
+    (sx-form "impl" (vec (concat [(sx-atom (proto-name (. i proto))) (pr-impl-head i)] methods)))))
+
+(defun print-expr-text (e: FgExpr) -> str (print-layout (print-expr e) 0))
+(defun print-ty-text (t: FgTy) -> str (ty-text t))
 
 ;; print::program: library namespace line, preamble declarations and macros the body names, defs, impls, funs, main.
-(defun print-program (p: FgProgram) -> str (trap "todo: gen.print print-program"))
-;; The 13 preamble blocks (Pt Wrap Holder Shape Hook Job Score Rank Ver Lvl inc1 digest sum-vec) and the macros, selected by the tokens of `body`, in table order. Tokens split on whitespace and ()[]@&.
-(defun print-preamble (body: str) -> str (trap "todo: gen.print print-preamble"))
-;; print::expr and expr_more.
-(defun print-expr (e: FgExpr) -> FgSexp (trap "todo: gen.print print-expr"))
-;; items.rs fundef.
-(defun print-fundef (f: FgFun) -> FgSexp (trap "todo: gen.print print-fundef"))
-;; items.rs impl_def.
-(defun print-impl (i: FgImpl) -> FgSexp (trap "todo: gen.print print-impl"))
-;; items.rs pat.
-(defun print-pat (p: FgPat) -> FgSexp (trap "todo: gen.print print-pat"))
-;; print/pipelines.rs pipe: threaded, nested, bound, split shapes.
-(defun print-pipe (p: FgPipe) -> FgSexp (trap "todo: gen.print print-pipe"))
-;; print::flat: one line.
-(defun print-flat (s: FgSexp) -> str (trap "todo: gen.print print-flat"))
-;; print::layout: one line when indent + width <= 80, else the head kept (defun 5, impl 3, let/loop/plet/match/fn/if 2, else 1) and one item per line at indent + 2.
-(defun print-layout (s: FgSexp indent: i64) -> str (trap "todo: gen.print print-layout"))
-(defun print-expr-text (e: FgExpr) -> str (trap "todo: gen.print print-expr-text"))
-(defun print-ty-text (t: FgTy) -> str (trap "todo: gen.print print-ty-text"))
+(defun pr-def :private (d: FgDef) -> str
+  (str (print-layout (sx-list [(sx-atom "def") (sx-atom (str (. d name) ":")) (sx-atom (ty-text (. d ty))) (print-expr (. d init))]) 0) "\n"))
+
+(defun pr-main :private (p: FgProgram) -> str
+  (str (print-layout (sx-list [(sx-atom "defun") (sx-atom "main") (sx-atom "()") (sx-atom "->") (sx-atom "i64") (print-expr (. p main))]) 0) "\n"))
+
+(defun print-body :private (p: FgProgram) -> str
+  (str-join (vec (concat
+    (vec (concat (mapv pr-def (. p defs)) (if (> (vec-count (. p defs)) 0) ["\n"] [])))
+    (vec (concat (mapv (fn (i: FgImpl) (str (print-layout (print-impl i) 0) "\n\n")) (. p impls))
+                 (vec (concat (mapv (fn (f: FgFun) (str (print-layout (print-fundef f) 0) "\n\n")) (. p funs))
+                              [(pr-main p)]))))))))
+
+(defun print-program (p: FgProgram) -> str
+  (let ((body (print-body p)))
+    (str (if (program-uses-library? p) (print-library-ns) "") (print-preamble body) body)))

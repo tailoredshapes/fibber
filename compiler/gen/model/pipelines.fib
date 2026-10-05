@@ -1,9 +1,276 @@
 ;; compiler/gen/model/pipelines.fib: port of crates/fibgen/src/model/pipelines.rs: the model of a library pipeline, Clojure lazy seqs walked one demand at a time (map once per element pulled, take n never pulls again, ...), a Memo for a bound seq, digest, COUNT_SCALE.
 ;;  OWNER: see design section 5.
+;; A `FgNode` is a stage with the state it needs (Cells); `pn-next` makes it give one element, pulling its source only as far as that takes. So a function runs exactly as
+;; often as Clojure's lazy seq would run it: `map` once per element pulled, `filter` until a hit, `take n` never pulls the source again once it has given `n`, `take-while`
+;; stops at the first miss, `drop n` skips on its first demand, `concat` goes on into its second part in the demand that finds the first one empty, `mapcat` takes the next
+;; source element when the last result is used up. A terminal reads the chain through a `FgMemo`: a seq realised once, as a bound seq is.
 (ns gen.model.pipelines
   (:use gen.ty gen.ast gen.model.value gen.model))
 
+(defenum FgNode
+  (NdItems items: (Vec i64) at: (Cell i64))
+  (NdMap src: FgNode f: FgV)
+  (NdFilter src: FgNode p: FgV keep: bool)
+  (NdTake src: FgNode left: (Cell i64))
+  (NdDrop src: FgNode n: i64 started: (Cell bool))
+  (NdTakeWhile src: FgNode p: FgV)
+  (NdConcat a: FgNode b: FgNode in-b: (Cell bool))
+  (NdMapcat src: FgNode f: FgV inner: (Cell (Vec i64)) at: (Cell i64)))
+
+(defstruct FgMemo (node: FgNode seen: (Cell (Vec i64)) ended: (Cell bool)))
+
+;; The fold `digest` makes of a `Vec`: every element and its place (wrapping, as the Rust `h * 31 + x`).
+(defun pipelines-digest (xs: (Vec i64)) -> i64
+  (reduce (fn (h: i64 x: i64) (rem (unchecked-add (unchecked-multiply h 31) x) 1000003)) 7 xs))
+
+(defun pn-bad :private (what: str) -> FgStop (StUnsupported what))
+
+(defun pn-int-of :private (v: FgV) -> (Result i64 FgStop)
+  (match v ((VlInt n) (Ok n)) (_ (Err (pn-bad "a pipeline function gave a value that is not an i64")))))
+
+(defun pn-bool-of :private (v: FgV) -> (Result bool FgStop)
+  (match v ((VlBool b) (Ok b)) (_ (Err (pn-bad "a pipeline predicate gave a value that is not a bool")))))
+
+(defun pn-ints-of :private (v: FgV) -> (Result (Vec i64) FgStop)
+  (match v
+    ((VlVector xs) (pn-ints xs))
+    ((VlList xs) (pn-ints xs))
+    (_ (Err (pn-bad "a pipeline source is not a collection")))))
+
+(defun pn-ints :private (xs: (Vec FgV)) -> (Result (Vec i64) FgStop)
+  (loop ((i 0) (out []))
+    (if (< i (vec-count xs))
+        (try-let [n (pn-int-of (vec-nth xs i))] (recur (+ i 1) (conj out n)))
+        (Ok out))))
+
+(defun pn-items (items: (Vec i64)) -> FgNode (NdItems items (cell 0)))
+
+(defun pn-apply1 :private (m: FgMachine f: FgV x: i64) -> (Result FgV FgStop) (machine-apply m f [(VlInt x)]))
+
+;; `filter` and `remove`: until a hit.
+(defun pn-filter :private (m: FgMachine src: FgNode p: FgV keep: bool) -> (Result (Option i64) FgStop)
+  (try-let [x (pn-next m src)]
+    (match x
+      (nil (Ok nil))
+      ((some v) (try-let [r (pn-apply1 m p v)
+                          b (pn-bool-of r)]
+                  (if (= b keep) (Ok (some v)) (pn-filter m src p keep)))))))
+
+;; `drop`: the first demand skips `n` elements, which runs the stages below it for each, and then gives the next.
+(defun pn-skip :private (m: FgMachine src: FgNode n: i64 started: (Cell bool)) -> (Result (Option i64) FgStop)
+  (if @started
+      (pn-next m src)
+      (do (set! started true)
+          (loop ((i 0))
+            (if (< i n)
+                (try-let [x (pn-next m src)]
+                  (match x (nil (Ok nil)) ((some v) (recur (+ i 1)))))
+                (pn-next m src))))))
+
+(defun pn-concat :private (m: FgMachine a: FgNode b: FgNode in-b: (Cell bool)) -> (Result (Option i64) FgStop)
+  (if @in-b
+      (pn-next m b)
+      (try-let [x (pn-next m a)]
+        (match x
+          ((some v) (Ok (some v)))
+          (nil (do (set! in-b true) (pn-next m b)))))))
+
+;; `mapcat`: the rest of the last result, or the result for the next source element that has one.
+(defun pn-mapcat :private (m: FgMachine src: FgNode f: FgV inner: (Cell (Vec i64)) at: (Cell i64)) -> (Result (Option i64) FgStop)
+  (if (< @at (vec-count @inner))
+      (let ((x (vec-nth @inner @at)))
+        (do (set! at (+ @at 1)) (Ok (some x))))
+      (try-let [x (pn-next m src)]
+        (match x
+          (nil (Ok nil))
+          ((some v) (try-let [r (pn-apply1 m f v)
+                              xs (pn-ints-of r)]
+                      (do (set! inner xs) (set! at 0) (pn-mapcat m src f inner at))))))))
+
+;; The next element, or nil at the end.
+(defun pn-next (m: FgMachine node: FgNode) -> (Result (Option i64) FgStop)
+  (match node
+    ((NdItems items at)
+      (if (< @at (vec-count items))
+          (let ((x (vec-nth items @at))) (do (set! at (+ @at 1)) (Ok (some x))))
+          (Ok nil)))
+    ((NdMap src f)
+      (try-let [x (pn-next m src)]
+        (match x
+          (nil (Ok nil))
+          ((some v) (try-let [r (pn-apply1 m f v) n (pn-int-of r)] (Ok (some n)))))))
+    ((NdFilter src p keep) (pn-filter m src p keep))
+    ((NdTake src left)
+      (if (<= @left 0)
+          (Ok nil)
+          (do (set! left (- @left 1)) (pn-next m src))))
+    ((NdDrop src n started) (pn-skip m src n started))
+    ((NdTakeWhile src p)
+      (try-let [x (pn-next m src)]
+        (match x
+          (nil (Ok nil))
+          ((some v) (try-let [r (pn-apply1 m p v) b (pn-bool-of r)] (if b (Ok (some v)) (Ok nil)))))))
+    ((NdConcat a b in-b) (pn-concat m a b in-b))
+    ((NdMapcat src f inner at) (pn-mapcat m src f inner at))))
+
+;; Every remaining element.
+(defun pn-drain :private (m: FgMachine node: FgNode) -> (Result (Vec i64) FgStop)
+  (loop ((out []))
+    (try-let [x (pn-next m node)]
+      (match x (nil (Ok out)) ((some v) (recur (conj out v)))))))
+
+;; Memo::get: element `at`, realising nodes as needed.
+(defun memo-get :private (m: FgMachine memo: FgMemo at: i64) -> (Result (Option i64) FgStop)
+  (if (and (>= at (vec-count @(. memo seen))) (not @(. memo ended)))
+      (try-let [x (pn-next m (. memo node))]
+        (match x
+          ((some v) (do (set! (. memo seen) (conj @(. memo seen) v)) (memo-get m memo at)))
+          (nil (do (set! (. memo ended) true) (memo-get m memo at)))))
+      (Ok (if (< at (vec-count @(. memo seen))) (some (vec-nth @(. memo seen) at)) nil))))
+
+(defun memo-all :private (m: FgMachine memo: FgMemo) -> (Result (Vec i64) FgStop)
+  (loop ((at 0))
+    (try-let [x (memo-get m memo at)]
+      (match x
+        (nil (Ok @(. memo seen)))
+        ((some v) (recur (+ at 1)))))))
+
+;; The nodes of `c`, with the sizes, functions and operands of its stages evaluated in the order they are applied.
+(defun pn-build :private (m: FgMachine c: FgChain env: (Option FgEnv)) -> (Result FgNode FgStop)
+  (try-let [src (pn-source m (. c src) env)]
+    (loop ((i 0) (node src))
+      (if (< i (vec-count (. c stages)))
+          (try-let [n2 (pn-stage m (vec-nth (. c stages) i) node env)] (recur (+ i 1) n2))
+          (Ok node)))))
+
+(defun pn-source :private (m: FgMachine s: FgSrc env: (Option FgEnv)) -> (Result FgNode FgStop)
+  (match s
+    ((SrVec e) (try-let [v (machine-ev m e env) xs (pn-ints-of v)] (Ok (pn-items xs))))
+    ((SrList e) (try-let [v (machine-ev m e env) xs (pn-ints-of v)] (Ok (pn-items xs))))
+    ((SrRange e)
+      (try-let [v (machine-ev m e env)
+                n (pn-int-of v)
+                u (machine-alloc m (max n 0))]
+        (Ok (pn-items (vec (range (max n 0)))))))))
+
+(defun pn-fn-stage :private (m: FgMachine e: FgExpr env: (Option FgEnv) k: (fn (FgV) FgNode)) -> (Result FgNode FgStop)
+  (try-let [f (machine-ev m e env)] (Ok (k f))))
+
+(defun pn-stage :private (m: FgMachine s: FgStage src: FgNode env: (Option FgEnv)) -> (Result FgNode FgStop)
+  (match s
+    ((SgMap e) (pn-fn-stage m e env (fn (f: FgV) (NdMap src f))))
+    ((SgFilter e) (pn-fn-stage m e env (fn (f: FgV) (NdFilter src f true))))
+    ((SgRemove e) (pn-fn-stage m e env (fn (f: FgV) (NdFilter src f false))))
+    ((SgTakeWhile e) (pn-fn-stage m e env (fn (f: FgV) (NdTakeWhile src f))))
+    ((SgMapcat e) (pn-fn-stage m e env (fn (f: FgV) (NdMapcat src f (cell []) (cell 0)))))
+    ((SgTake e) (try-let [v (machine-ev m e env) n (pn-int-of v)] (Ok (NdTake src (cell n)))))
+    ((SgDrop e) (try-let [v (machine-ev m e env) n (pn-int-of v)] (Ok (NdDrop src n (cell false)))))
+    ((SgConcat other first)
+      (try-let [o (pn-operand m other env)]
+        (Ok (if first (NdConcat o src (cell false)) (NdConcat src o (cell false))))))))
+
+(defun pn-operand :private (m: FgMachine o: FgOperand env: (Option FgEnv)) -> (Result FgNode FgStop)
+  (match o
+    ((OpVec e) (try-let [v (machine-ev m e env) xs (pn-ints-of v)] (Ok (pn-items xs))))
+    ((OpLazy c) (pn-build m c env))
+    ((OpEager c) (try-let [n (pn-build m c env) xs (pn-drain m n)] (Ok (pn-items xs))))))
+
+(defun pn-add :private (a: i64 b: i64) -> (Result i64 FgStop)
+  (let ((r (unchecked-add a b)))
+    (if (< (bit-and (bit-xor a r) (bit-xor b r)) 0) (Err (StTrap "integer overflow in + at i64")) (Ok r))))
+
+(defun pn-mul7 :private (a: i64) -> (Result i64 FgStop)
+  (if (or (> a 1317624576693539401) (< a -1317624576693539401))
+      (Err (StTrap "integer overflow in * at i64"))
+      (Ok (* a 7))))
+
+;; Terminals that fold with a function: reduce and reduce1.
+(defun pn-fold-from :private (m: FgMachine memo: FgMemo f: FgV acc0: i64 at0: i64 stop: (Option i64)) -> (Result i64 FgStop)
+  (loop ((at at0) (acc acc0))
+    (try-let [x (memo-get m memo at)]
+      (match x
+        (nil (Ok acc))
+        ((some v)
+          (if (match stop ((some t) (> acc t)) (nil false))
+              (Ok acc)
+              (try-let [r (machine-apply m f [(VlInt acc) (VlInt v)])
+                        n (pn-int-of r)]
+                (recur (+ at 1) n))))))))
+
+(defun pn-every-find :private (m: FgMachine memo: FgMemo p: FgV every: bool) -> (Result i64 FgStop)
+  (loop ((at 0))
+    (try-let [x (memo-get m memo at)]
+      (match x
+        (nil (Ok (if every 1 (pipe-none))))
+        ((some v)
+          (try-let [r (pn-apply1 m p v) hit (pn-bool-of r)]
+            (cond (and every (not hit)) (Ok 0)
+                  (and (not every) hit) (Ok (+ v 1))
+                  :else (recur (+ at 1)))))))))
+
+;; Stable sort of the elements by integer key (Rust `sort_by_key` is stable).
+(defun pn-sort-keyed :private (m: FgMachine key: FgV xs: (Vec i64)) -> (Result (Vec i64) FgStop)
+  (try-let [keyed (loop ((i 0) (out []))
+                    (if (< i (vec-count xs))
+                        (try-let [r (pn-apply1 m key (vec-nth xs i)) k (pn-int-of r)]
+                          (recur (+ i 1) (conj out [k (vec-nth xs i)])))
+                        (Ok out)))]
+    (Ok (mapv (fn (p: (Vec i64)) (vec-nth p 1)) (sort-by (fn (p: (Vec i64)) (vec-nth p 0)) keyed)))))
+
+(defun pn-nth :private (m: FgMachine memo: FgMemo i: i64) -> (Result i64 FgStop)
+  (try-let [hit (if (>= i 0) (memo-get m memo i) (try-let [all (memo-all m memo)] (Ok nil)))]
+    (match hit
+      ((some v) (Ok v))
+      (nil (Err (StTrap "nth: index out of range"))))))
+
+(defun pn-term-with :private (m: FgMachine t: FgTerm memo: FgMemo env: (Option FgEnv)) -> (Result i64 FgStop)
+  (match t
+    ((TmEvery p) (try-let [f (machine-ev m p env)] (pn-every-find m memo f true)))
+    ((TmFindFirst p) (try-let [f (machine-ev m p env)] (pn-every-find m memo f false)))
+    ((TmSortBy k)
+      (try-let [key (machine-ev m k env)
+                xs (memo-all m memo)
+                sorted (pn-sort-keyed m key xs)]
+        (Ok (pipelines-digest sorted))))
+    ((TmNth i) (try-let [v (machine-ev m i env) n (pn-int-of v)] (pn-nth m memo n)))
+    (_ (Err (StUnsupported "terminal")))))
+
+;; What `t` makes of the seq, as the number the program folds it to.
+(defun pn-term :private (m: FgMachine t: FgTerm memo: FgMemo env: (Option FgEnv)) -> (Result i64 FgStop)
+  (match t
+    ((TmReduce f init stop)
+      (try-let [fv (machine-ev m f env)
+                iv (machine-ev m init env)
+                acc (pn-int-of iv)]
+        (pn-fold-from m memo fv acc 0 stop)))
+    ((TmReduce1 f)
+      (try-let [fv (machine-ev m f env)
+                first (memo-get m memo 0)]
+        (match first
+          (nil (Err (StTrap "reduce: empty collection")))
+          ((some a) (pn-fold-from m memo fv a 1 nil)))))
+    ((TmCount) (try-let [xs (memo-all m memo)] (Ok (vec-count xs))))
+    ((TmVec) (try-let [xs (memo-all m memo)] (Ok (pipelines-digest xs))))
+    ((TmFirst) (try-let [x (memo-get m memo 0)] (Ok (match x ((some v) v) (nil (pipe-none))))))
+    ((TmLast) (try-let [xs (memo-all m memo)] (Ok (if (= (vec-count xs) 0) (pipe-none) (vec-nth xs (- (vec-count xs) 1))))))
+    ((TmEmpty) (try-let [x (memo-get m memo 0)] (Ok (match x (nil 1) ((some v) 0)))))
+    ((TmSum) (try-let [xs (memo-all m memo)] (reduce-ints pn-add 0 xs)))
+    ((TmSort) (try-let [xs (memo-all m memo)] (Ok (pipelines-digest (vec (sort xs))))))
+    (_ (pn-term-with m t memo env))))
+
+(defun reduce-ints :private (f: (fn (i64 i64) (Result i64 FgStop)) init: i64 xs: (Vec i64)) -> (Result i64 FgStop)
+  (loop ((i 0) (acc init))
+    (if (< i (vec-count xs))
+        (try-let [n (f acc (vec-nth xs i))] (recur (+ i 1) n))
+        (Ok acc))))
+
 ;; Machine::ev_pipe.
-(defun pipelines-ev (m: FgMachine p: FgPipe env: (Option FgEnv)) -> (Result FgV FgStop) (trap "todo: gen.model.pipelines pipelines-ev"))
-;; pipelines.rs digest: the fold the printed program also computes.
-(defun pipelines-digest (xs: (Vec i64)) -> i64 (trap "todo: gen.model.pipelines pipelines-digest"))
+(defun pipelines-ev (m: FgMachine p: FgPipe env: (Option FgEnv)) -> (Result FgV FgStop)
+  (try-let [node (pn-build m (. p chain) env)]
+    (let ((memo (FgMemo node (cell []) (cell false))))
+      (loop ((i 0) (total 0))
+        (if (< i (vec-count (. p terms)))
+            (try-let [v (pn-term m (vec-nth (. p terms) i) memo env)
+                      t2 (if (= i 0) (Ok v) (try-let [s (pn-mul7 total)] (pn-add s v)))]
+              (recur (+ i 1) t2))
+            (Ok (VlInt total)))))))
