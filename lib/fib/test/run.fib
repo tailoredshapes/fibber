@@ -1,0 +1,277 @@
+;; fib.test.run: the runner and the reporters of fib.test (docs/design/test-harness.md §4, §5). `run-main` takes the suites of a spec
+;; file and the command line (`--only SUBSTR`, `--seed N`, `-j N`, `--format plain|json`, `--list`, `--no-isolate`, `--timeout SECS`)
+;; and returns the exit status: 0 every scenario held, 1 one did not, 2 the command line or a selection that matches nothing.
+;;
+;; ISOLATION. A failed `expect` is a value (`Broke`) and never stops anything. A trap, an exhausted stack or a hang is the scenario
+;; process's own: each scenario runs in a child made by `fork` (no exec, so no start-up cost and the scenario closure is simply
+;; called), which writes what its steps came to into a file of the run's scratch directory and `_exit`s; its standard error goes to a
+;; second file. The parent reads both, so a trap becomes a row with the trap's message, not the end of the run. This is the interim
+;; mechanism of the design until a task's trap is returned by `join` (L28 step 1); only `run-isolated` changes then.
+(ns fib.test.run
+  (:use fib.core fib.seq fib.coll fib.print fib.test.core fib.test.gen)
+  (:require [fib.os :as os] [fib.os.native :as n] [fib.string :as s]))
+
+(extern fork :private () -> i32)
+(extern dup2 :private (i32 i32) -> i32)
+(extern creat :private (ptr i32) -> i32)
+(extern waitpid :private (i32 ptr i32) -> i32)
+(extern _exit :private (i32) -> unit)
+(extern alarm :private (i32) -> i32)
+
+;; ---- what crosses the process boundary: one line per step, fields apart by a tab, `\`, tab and newline escaped ----------------------
+
+(defun esc-char :private (c: char) -> str
+  (cond (= c \\) "\\\\"
+        (= c \tab) "\\t"
+        (= c \newline) "\\n"
+        :else (str c)))
+
+(defun esc (s: str) -> str
+  (reduce (fn (acc: str c: char) (str acc (esc-char c))) "" (s/chars s)))
+
+(defun encode-step :private (s: StepRun) -> str
+  (match (. s judged)
+    ((Held) (str (esc (. s kind)) "\t" (esc (. s text)) "\tH\t\t\n"))
+    ((Broke e a) (str (esc (. s kind)) "\t" (esc (. s text)) "\tB\t" (esc e) "\t" (esc a) "\n"))))
+
+(defun encode (steps: (Vec StepRun)) -> str
+  (str-join (mapv encode-step steps)))
+
+;; The fields of every line of `text`: a tab ends a field, a newline a line, `\` followed by t, n or `\` is that character.
+(defstruct WireCut (lines: (Vec (Vec str)) fields: (Vec str) cur: str esc: bool))
+
+(defun cut-step :private (k: WireCut c: char) -> WireCut
+  (cond (. k esc) (WireCut (. k lines) (. k fields) (str (. k cur) (cond (= c \t) "\t" (= c \n) "\n" :else (str c))) false)
+        (= c \\) (WireCut (. k lines) (. k fields) (. k cur) true)
+        (= c \tab) (WireCut (. k lines) (conj (. k fields) (. k cur)) "" false)
+        (= c \newline) (WireCut (conj (. k lines) (conj (. k fields) (. k cur))) [] "" false)
+        :else (WireCut (. k lines) (. k fields) (str (. k cur) c) false)))
+
+(defun decode (text: str) -> (Vec StepRun)
+  (mapv (fn (f: (Vec str))
+          (StepRun (nth f 0) (nth f 1) (if (= (nth f 2) "H") Held (Broke (nth f 3) (nth f 4)))))
+        (. (reduce cut-step (WireCut [] [] "" false) (s/chars text)) lines)))
+
+;; ---- one scenario, isolated -------------------------------------------------------------------------------------------------------
+
+;; The report row of one scenario: what a reporter needs, nothing it must recompute.
+(defstruct ScenarioRow (head: str impl: str id: str text: str covers: (Vec str) plan: (Vec str) status: str steps: (Vec StepRun) message: str))
+
+(defun broken? :private (steps: (Vec StepRun)) -> bool
+  (some? (first (filter (fn (s: StepRun) (match (. s judged) ((Held) false) ((Broke _ _) true))) steps))))
+
+(defun thens? :private (steps: (Vec StepRun)) -> bool
+  (some? (first (filter (fn (s: StepRun) (= (. s kind) "Then")) steps))))
+
+;; The status of a row from the steps it ran. A scenario with no Then cannot fail, and is refused as a failure.
+(defun judged-row :private (sc: Scenario head: str impl: str steps: (Vec StepRun)) -> ScenarioRow
+  (cond (not (thens? steps)) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "no Then step: a scenario that cannot fail")
+        (broken? steps) (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "fail" steps "")
+        :else (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) "pass" steps "")))
+
+(defun failed-row :private (sc: Scenario head: str impl: str status: str message: str) -> ScenarioRow
+  (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) status [] message))
+
+;; In the child: standard error to `err`, an alarm, the scenario run, its steps written to `out`, then out without unwinding.
+(defun child-run :private (sc: Scenario seed: i64 out: str err: str secs: i64) -> unit
+  (unsafe
+    (let ((fe (creat (n/c-text err) 384i32)))
+      (do (dup2 fe 2i32)
+          (alarm (trunc i32 secs))
+          (write-file out (encode ((. sc run) seed)))
+          (_exit 0i32)))))
+
+;; The exit status of a process as waitpid says it: the code, or 128 and the signal.
+(defun decode-status :private (w: i64) -> i64
+  (if (= (bit-and w 127) 0) (bit-and (quot w 256) 255) (+ 128 (bit-and w 127))))
+
+(defstruct ChildEnded (pid: i64 status: i64))
+
+(defun wait-any :private () -> ChildEnded
+  (unsafe
+    (let ((st (alloc 8))
+          (r (waitpid -1i32 st 0i32))
+          (status (if (< r 0i32) -1 (decode-status (sext i64 (load-i32 st))))))
+      (do (free st) (ChildEnded (sext i64 r) status)))))
+
+;; Starts the child of a scenario; its pid, or -1.
+(defun start :private (sc: Scenario seed: i64 out: str err: str secs: i64) -> i64
+  (unsafe
+    (let ((pid (fork)))
+      (cond (< pid 0i32) -1
+            (= pid 0i32) (do (child-run sc seed out err secs) 0)
+            :else (sext i64 pid)))))
+
+(defun last-line :private (text: str) -> str
+  (let ((ls (filter (fn (l: str) (not (= l ""))) (s/split-lines text))))
+    (if (empty? ls) "" (nth (vec ls) (- (count (vec ls)) 1)))))
+
+;; What a finished child came to.
+(defun row-of-child :private (sc: Scenario head: str impl: str status: i64 out: str err: str) -> ScenarioRow
+  (cond (= status 142) (failed-row sc head impl "timeout" "killed by the alarm: the scenario did not finish in time")
+        (not (= status 0)) (failed-row sc head impl "trap" (str "exit " status ": " (last-line (unwrap-or (read-file err) ""))))
+        :else (match (read-file out)
+                (nil (failed-row sc head impl "trap" "the scenario process left no result"))
+                ((some text) (judged-row sc head impl (decode text))))))
+
+;; ---- the run ----------------------------------------------------------------------------------------------------------------------
+
+(defstruct SpecOpts (only: str seed: i64 jobs: i64 format: str list: bool isolate: bool secs: i64))
+
+(defstruct ScenarioJob (suite: Suite sc: Scenario seed: i64))
+
+;; The id a row is selected and reported by: the scenario's own, the implementation in brackets after the contract's slug.
+(defun full-id (s: Suite sc: Scenario) -> str
+  (if (= (. s impl) "")
+      (. sc id)
+      (let ((h (str-len (slugify (. s head)))))
+        (str (str-slice (. sc id) 0 h) "[" (. s impl) "]" (str-slice (. sc id) h (str-len (. sc id)))))))
+
+(defun jobs-of :private (suites: (Vec Suite) o: SpecOpts) -> (Vec ScenarioJob)
+  (vec (filter (fn (j: ScenarioJob) (s/includes? (. (. j sc) id) (. o only)))
+               (mapcat (fn (s: Suite)
+                         (mapv (fn (sc: Scenario) (ScenarioJob s (Scenario (full-id s sc) (. sc text) (. sc covers) (. sc steps) (. sc run)) (stream-seed (. o seed) (hash (. sc id))))) (. s scenarios)))
+                       suites))))
+
+(defun run-here :private (j: ScenarioJob) -> ScenarioRow
+  (judged-row (. j sc) (. (. j suite) head) (. (. j suite) impl) ((. (. j sc) run) (. j seed))))
+
+;; Rows of all jobs in order, `jobs` children at a time.
+(defun run-isolated (js: (Vec ScenarioJob) tmp: str jobs: i64 secs: i64) -> (Vec ScenarioRow)
+  (let ((rows (loop ((next 0) (running {}) (done {}))
+                (cond (and (< next (count js)) (< (count running) jobs))
+                        (let ((j (nth js next))
+                              (pid (start (. j sc) (. j seed) (str tmp "/" next ".out") (str tmp "/" next ".err") secs)))
+                          (if (< pid 0)
+                              (recur (+ next 1) running (assoc done next (failed-row (. j sc) (. (. j suite) head) (. (. j suite) impl) "trap" "fork failed")))
+                              (recur (+ next 1) (assoc running pid next) done)))
+                      (empty? running) done
+                      :else (let ((e (wait-any)))
+                              (match (get running (. e pid))
+                                (nil (recur next (if (< (. e pid) 0) {} running) done))
+                                ((some i)
+                                 (let ((j (nth js i)))
+                                   (recur next (dissoc running (. e pid))
+                                          (assoc done i (row-of-child (. j sc) (. (. j suite) head) (. (. j suite) impl) (. e status)
+                                                                      (str tmp "/" i ".out") (str tmp "/" i ".err")))))))))))
+        (lost (fn (i: i64) (failed-row (. (nth js i) sc) (. (. (nth js i) suite) head) (. (. (nth js i) suite) impl) "trap" "its process was lost"))))
+    (mapv (fn (i: i64) (unwrap-or (get rows i) (lost i))) (range (count js)))))
+
+;; ---- reporters --------------------------------------------------------------------------------------------------------------------
+
+(defun pad :private (s: str w: i64) -> str
+  (loop ((o s)) (if (< (str-len o) w) (recur (str o " ")) o)))
+
+(defun mark :private (status: str) -> str
+  (cond (= status "pass") "pass"
+        (= status "fail") "FAIL"
+        (= status "trap") "TRAP"
+        :else "TIME"))
+
+(defun label (r: ScenarioRow) -> str
+  (if (= (. r impl) "") (. r head) (str (. r head) "[" (. r impl) "]")))
+
+(defun step-lines :private (r: ScenarioRow) -> str
+  (str-join (mapv (fn (s: StepRun)
+                    (match (. s judged)
+                      ((Held) (str "        " (. s text) "\n"))
+                      ((Broke e a) (str "      > " (. s text) "\n          expected: " e "\n          actual:   " a "\n"))))
+                  (. r steps))))
+
+(defun row-plain :private (r: ScenarioRow) -> str
+  (str (pad (mark (. r status)) 6) (. r text) "\n"
+       (if (= (. r status) "pass") "" (str (step-lines r) (if (= (. r message) "") "" (str "        " (. r message) "\n"))
+                                           "        at " (. r id) "\n"))))
+
+(defun count-of (rows: (Vec ScenarioRow) status: str) -> i64
+  (count (filter (fn (r: ScenarioRow) (= (. r status) status)) rows)))
+
+(defun plain (rows: (Vec ScenarioRow) seed: i64) -> str
+  (let ((groups (vec (distinct (mapv (fn (r: ScenarioRow) (label r)) rows)))))
+    (str (str-join (mapv (fn (g: str)
+                           (str g "\n" (str-join (mapv (fn (r: ScenarioRow) (str "  " (row-plain r))) (filter (fn (r: ScenarioRow) (= (label r) g)) rows)))))
+                         groups))
+         "\n" (count rows) " scenarios: " (count-of rows "pass") " pass, " (count-of rows "fail") " fail, " (count-of rows "trap") " trap, "
+         (count-of rows "timeout") " timeout (seed " seed ")\n"
+         (str-join (mapv (fn (r: ScenarioRow) (str "replay: --only '" (. r id) "' --seed " seed "\n"))
+                         (filter (fn (r: ScenarioRow) (not (= (. r status) "pass"))) rows))))))
+
+(defun json-char :private (c: char) -> str
+  (cond (= c \") "\\\""
+        (= c \\) "\\\\"
+        (= c \newline) "\\n"
+        (= c \tab) "\\t"
+        (< (char->i32 c) 32i32) " "
+        :else (str c)))
+
+(defun js (s: str) -> str
+  (str "\"" (reduce (fn (acc: str c: char) (str acc (json-char c))) "" (s/chars s)) "\""))
+
+(defun js-list :private (xs: (Vec str)) -> str
+  (str "[" (str-join (vec (interpose "," (mapv js xs)))) "]"))
+
+(defun step-json :private (s: StepRun) -> str
+  (match (. s judged)
+    ((Held) (str "{\"kind\":" (js (. s kind)) ",\"text\":" (js (. s text)) ",\"status\":\"held\"}"))
+    ((Broke e a) (str "{\"kind\":" (js (. s kind)) ",\"text\":" (js (. s text)) ",\"status\":\"broke\",\"expected\":" (js e) ",\"actual\":" (js a) "}"))))
+
+(defun row-json :private (r: ScenarioRow) -> str
+  (str "{\"suite\":" (js (. r head)) ",\"impl\":" (js (. r impl)) ",\"id\":" (js (. r id)) ",\"text\":" (js (. r text))
+       ",\"covers\":" (js-list (. r covers)) ",\"status\":" (js (. r status)) ",\"message\":" (js (. r message))
+       ",\"steps\":[" (str-join (vec (interpose "," (mapv step-json (. r steps))))) "]}"))
+
+;; The run as one JSON document; the schema is in the design, §5.
+(defun json (rows: (Vec ScenarioRow) seed: i64) -> str
+  (str "{\"schema\":1,\"seed\":" seed ",\"summary\":{\"total\":" (count rows) ",\"pass\":" (count-of rows "pass") ",\"fail\":" (count-of rows "fail")
+       ",\"trap\":" (count-of rows "trap") ",\"timeout\":" (count-of rows "timeout") "},\"results\":["
+       (str-join (vec (interpose "," (mapv row-json rows)))) "]}\n"))
+
+(defun list-plain :private (js: (Vec ScenarioJob)) -> str
+  (str-join (mapv (fn (j: ScenarioJob) (str (. (. j sc) id) "\n" (str-join (mapv (fn (l: str) (str "    " l "\n")) (. (. j sc) steps))))) js)))
+
+;; ---- the command line ---------------------------------------------------------------------------------------------------------------
+
+(defun parse-args :private (as: (Vec str)) -> (Result SpecOpts str)
+  (loop ((i 0) (o (SpecOpts "" 1 1 "plain" false true 60)))
+    (if (>= i (count as))
+        (Ok o)
+        (let ((a (nth as i))
+              (v (if (< (+ i 1) (count as)) (nth as (+ i 1)) "")))
+          (cond (= a "--only") (recur (+ i 2) (SpecOpts v (. o seed) (. o jobs) (. o format) (. o list) (. o isolate) (. o secs)))
+                (= a "--seed") (match (parse-long v) (nil (Err "--seed wants an integer"))
+                                 ((some n) (recur (+ i 2) (SpecOpts (. o only) n (. o jobs) (. o format) (. o list) (. o isolate) (. o secs)))))
+                (or (= a "-j") (= a "--jobs")) (match (parse-long v) (nil (Err "-j wants an integer"))
+                                 ((some n) (recur (+ i 2) (SpecOpts (. o only) (. o seed) (max n 1) (. o format) (. o list) (. o isolate) (. o secs)))))
+                (= a "--timeout") (match (parse-long v) (nil (Err "--timeout wants an integer"))
+                                 ((some n) (recur (+ i 2) (SpecOpts (. o only) (. o seed) (. o jobs) (. o format) (. o list) (. o isolate) n))))
+                (= a "--format") (if (or (= v "plain") (= v "json"))
+                                     (recur (+ i 2) (SpecOpts (. o only) (. o seed) (. o jobs) v (. o list) (. o isolate) (. o secs)))
+                                     (Err "--format is plain or json"))
+                (= a "--list") (recur (+ i 1) (SpecOpts (. o only) (. o seed) (. o jobs) (. o format) true (. o isolate) (. o secs)))
+                (= a "--no-isolate") (recur (+ i 1) (SpecOpts (. o only) (. o seed) (. o jobs) (. o format) (. o list) false (. o secs)))
+                :else (Err (str "unknown argument " a)))))))
+
+(defun report :private (rows: (Vec ScenarioRow) o: SpecOpts) -> i64
+  (do (print (if (= (. o format) "json") (json rows (. o seed)) (plain rows (. o seed))))
+      (if (= (count (filter (fn (r: ScenarioRow) (not (= (. r status) "pass"))) rows)) 0) 0 1)))
+
+(defun run-jobs :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
+  (if (not (. o isolate))
+      (report (mapv run-here js) o)
+      (match (os/create-temp-directory (str (os/temp-directory) "/fibtest-XXXXXX"))
+        ((Err _) (do (eprintln "fibc test: cannot make a scratch directory") 2))
+        ((Ok tmp) (let ((rows (run-isolated js tmp (. o jobs) (. o secs))))
+                    (do (doseq [i (range (count js))]
+                          (do (os/remove-file (str tmp "/" i ".out")) (os/remove-file (str tmp "/" i ".err"))))
+                        (os/remove-directory tmp)
+                        (report rows o)))))))
+
+;; The whole run of a spec file: its suites and the command line (`(args)`).
+(defun run-main (suites: (Vec Suite)) -> i64
+  (match (parse-args (vec (args)))
+    ((Err m) (do (eprintln (str "fibc test: " m)) 2))
+    ((Ok o)
+     (let ((js (jobs-of suites o)))
+       (cond (empty? js) (do (eprintln (str "fibc test: no scenario matches '" (. o only) "'; a run with nothing to run is not a pass")) 2)
+             (. o list) (do (print (list-plain js)) 0)
+             :else (run-jobs js o))))))

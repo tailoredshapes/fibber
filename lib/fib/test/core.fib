@@ -1,0 +1,249 @@
+;; fib.test.core: the behaviour-spec forms of fib.test (docs/design/test-harness.md §1 to §3): `scenario` with `given`, `upon` and `then`,
+;; `expect`, `feature`, `defcontract`, `defspecs`, and the data they build. A scenario is DATA first: an id, a text, the texts of its
+;; steps (so `--list` can print the scenario without running it) and a closure that runs it and returns what each step came to, as
+;; values. A failed `expect` is a `Broke` value in that list, never a trap; a trap is the run's own and is isolated by fib.test.run.
+;;
+;; `given`, `upon` and `then` are not macros: `scenario` reads them as steps (`when` is the library's own macro, hence `upon`; the report
+;; prints it as `When`). `expect` is read by `then` the same way. The macros call fib.test.form at expansion time.
+(ns fib.test.core (:use fib.core fib.seq fib.coll fib.print))
+
+;; ---- printing the source of a step: the macros quote its forms and these print them at run time, so the text of `(expect = 3 (f x))` reaches
+;; the report as written (a macro of stage 2 sees the prelude only, never a library function: macros/runner.fib) ----
+
+(defun join-forms :private (xs: (Vec Form) from: i64) -> str
+  (loop ((i from) (out ""))
+    (if (< i (count xs))
+        (recur (+ i 1) (str out (if (> i from) " " "") (form-text (nth xs i))))
+        out)))
+
+;; The form as source text on one line.
+(defun form-text (f: Form) -> str
+  (match f
+    ((Sym s) s)
+    ((Kw k) (str ":" k))
+    ((Int v _) (str v))
+    ((Flt v _) (str v))
+    ((Str v) (pr-str v))
+    ((Chr _) "\\c")
+    ((Bool b) (str b))
+    ((Nil) "nil")
+    ((List xs) (str "(" (join-forms xs 0) ")"))
+    ((Vec xs) (str "[" (join-forms xs 0) "]"))
+    ((Map xs) (str "{" (join-forms xs 0) "}"))))
+
+;; The text of a binding vector `[a e b g]` as `a = e, b = g`.
+(defun bindings-text (f: Form) -> str
+  (match f
+    ((Vec xs)
+     (loop ((i 0) (out ""))
+       (if (< (+ i 1) (count xs))
+           (recur (+ i 2) (str out (if (> i 0) ", " "") (form-text (nth xs i)) " = " (form-text (nth xs (+ i 1)))))
+           out)))
+    (_ (form-text f))))
+
+;; The text of a `then` item: `(expect rel expected actual)` as `expected rel actual`; any other form as itself.
+(defun expect-head? :private (h: Form) -> bool
+  (match h ((Sym s) (= s "expect")) (_ false)))
+
+(defun then-text (f: Form) -> str
+  (match f
+    ((List xs)
+     (if (and (= (count xs) 4) (expect-head? (nth xs 0)))
+         (str (form-text (nth xs 2)) " " (form-text (nth xs 1)) " " (form-text (nth xs 3)))
+         (form-text f)))
+    (_ (form-text f))))
+
+;; A line of a scenario's plan.
+(defun given-line (f: Form) -> str (str "Given " (bindings-text f)))
+(defun upon-line (f: Form) -> str (str "When " (bindings-text f)))
+(defun then-line (f: Form) -> str (str "Then " (then-text f)))
+
+
+;; What one expectation came to: it held, or it did not, with both sides as text.
+(defenum Judged
+  (Held)
+  (Broke expected: str actual: str))
+
+;; One step as it ran: its kind (`Given`, `When`, `Then`), its text, and what it came to (a Given and a When are Held).
+(defstruct StepRun (kind: str text: str judged: Judged))
+
+;; A scenario: `id` is stable (the slug of feature and text, or the `(id ..)` the author wrote), `covers` links it to spec rows, `steps`
+;; is the plan (the text of each step) and `run` takes the seed of the run and executes it.
+(defstruct Scenario (id: str text: str covers: (Vec str) steps: (Vec str) run: (fn (i64) (Vec StepRun))))
+
+;; A set of scenarios under one head: a feature (impl is "") or a contract run against one implementation.
+(defstruct Suite (head: str impl: str scenarios: (Vec Scenario)))
+
+(defstruct StepLog (log: (Cell (Vec StepRun))))
+
+(defun new-rec () -> StepLog (StepLog (cell (vec-empty))))
+
+(defun rec-steps (r: StepLog) -> (Vec StepRun) @(. r log))
+
+(defun add-step :private (r: StepLog s: StepRun) -> unit
+  (set! (. r log) (conj @(. r log) s)))
+
+;; A Given or a When happened.
+(defun note (r: StepLog kind: str text: str) -> unit
+  (add-step r (StepRun kind text Held)))
+
+;; A Then: `ok` is what the relation said; both sides are text for the report.
+(defun judge (r: StepLog text: str ok: bool expected: str actual: str) -> unit
+  (add-step r (StepRun "Then" text (if ok Held (Broke expected actual)))))
+
+(defun judge-true (r: StepLog text: str ok: bool) -> unit
+  (judge r text ok "true" "false"))
+
+;; The id of a name: letters and digits kept, every other run of characters one `-`.
+(defun slugify (s: str) -> str
+  (loop ((i 0) (out "") (dash false))
+    (if (< i (str-len s))
+        (let ((b (sext i64 (str-byte-at s i))))
+          (if (or (or (and (>= b 97) (<= b 122)) (and (>= b 65) (<= b 90))) (and (>= b 48) (<= b 57)))
+              (recur (+ i 1) (str-concat (if dash (str-concat out "-") out) (str-slice s i (+ i 1))) false)
+              (recur (+ i 1) out (> (str-len out) 0))))
+        out)))
+
+(defun scenario-in :private (head: str sc: Scenario) -> Scenario
+  (Scenario (str-concat (slugify head) (str-concat "/" (. sc id))) (. sc text) (. sc covers) (. sc steps) (. sc run)))
+
+;; The scenarios of a feature or contract, their ids prefixed with its slug.
+(defun in-feature (head: str scs: (Vec Scenario)) -> (Vec Scenario)
+  (mapv (fn (sc: Scenario) (scenario-in head sc)) scs))
+
+;; The scenarios of the items of a feature or contract: a `scenario` or `prop` is a vector of one, an `outline` of one for each row.
+(defun flat (xs: (Vec (Vec Scenario))) -> (Vec Scenario)
+  (reduce (fn (acc: (Vec Scenario) x: (Vec Scenario)) (into acc x)) [] xs))
+
+(defun feature-suite (head: str scs: (Vec Scenario)) -> Suite
+  (Suite head "" (in-feature head scs)))
+
+(defun contract-suite (head: str impl: str scs: (Vec Scenario)) -> Suite
+  (Suite head impl (in-feature head scs)))
+
+;; ---- the macros: prelude names only (macros/runner.fib), no helper functions, so each step's code is built inline ------------------
+
+;; (scenario "text" step ..): a Scenario. A step is (given [b e ..]) or (upon [b e ..]), whose bindings hold for the steps after it,
+;; (then item ..) where an item is (expect rel expected actual) or a boolean form, (covers "row" ..) or (id "x").
+(defmacro scenario (text ... steps)
+  (let ((log (gensym "log"))
+        (seed (gensym "seed")))
+    (let ((body (loop ((i (- (vec-count steps) 1)) (acc `(fib.test.core/rec-steps ~log)))
+                  (if (< i 0)
+                      acc
+                      (match (vec-nth steps i)
+                        ((List items)
+                         (match (vec-nth items 0)
+                           ((Sym h)
+                            (cond (= h "given")
+                                    (recur (- i 1) `(do (fib.test.core/note ~log "Given" (fib.test.core/given-line (quote ~(vec-nth items 1))))
+                                                        (let ~(vec-nth items 1) ~acc)))
+                                  (= h "upon")
+                                    (recur (- i 1) `(do (fib.test.core/note ~log "When" (fib.test.core/upon-line (quote ~(vec-nth items 1))))
+                                                        (let ~(vec-nth items 1) ~acc)))
+                                  (= h "then")
+                                    (recur (- i 1)
+                                           (loop ((j (- (vec-count items) 1)) (o acc))
+                                             (if (> j 0)
+                                                 (recur (- j 1)
+                                                        (match (vec-nth items j)
+                                                          ((List xs)
+                                                           (match (vec-nth xs 0)
+                                                             ((Sym r)
+                                                              (if (= r "expect")
+                                                                  (let ((e (gensym "e")) (a (gensym "a")))
+                                                                    `(do (let ((~e ~(vec-nth xs 2)) (~a ~(vec-nth xs 3)))
+                                                                           (fib.test.core/judge ~log (fib.test.core/then-line (quote ~(vec-nth items j)))
+                                                                                                (~(vec-nth xs 1) ~e ~a) (pr-str ~e) (pr-str ~a)))
+                                                                         ~o))
+                                                                  `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~(vec-nth items j))) ~(vec-nth items j)) ~o)))
+                                                             (_ `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~(vec-nth items j))) ~(vec-nth items j)) ~o))))
+                                                          (x `(do (fib.test.core/judge-true ~log (fib.test.core/then-line (quote ~x)) ~x) ~o))))
+                                                 o)))
+                                  :else (recur (- i 1) acc)))
+                           (_ (recur (- i 1) acc))))
+                        (_ (recur (- i 1) acc))))))
+          (plan (loop ((i 0) (out (vec-empty)))
+                  (if (< i (vec-count steps))
+                      (recur (+ i 1)
+                             (match (vec-nth steps i)
+                               ((List items)
+                                (match (vec-nth items 0)
+                                  ((Sym h)
+                                   (cond (= h "given") (vec-conj out `(fib.test.core/given-line (quote ~(vec-nth items 1))))
+                                         (= h "upon") (vec-conj out `(fib.test.core/upon-line (quote ~(vec-nth items 1))))
+                                         (= h "then") (loop ((j 1) (o out))
+                                                        (if (< j (vec-count items))
+                                                            (recur (+ j 1) (vec-conj o `(fib.test.core/then-line (quote ~(vec-nth items j)))))
+                                                            o))
+                                         :else out))
+                                  (_ out)))
+                               (_ out)))
+                      out)))
+          (covers (loop ((i 0) (out (vec-empty)))
+                    (if (< i (vec-count steps))
+                        (recur (+ i 1)
+                               (match (vec-nth steps i)
+                                 ((List items)
+                                  (match (vec-nth items 0)
+                                    ((Sym h) (if (= h "covers")
+                                                 (loop ((j 1) (o out)) (if (< j (vec-count items)) (recur (+ j 1) (vec-conj o (vec-nth items j))) o))
+                                                 out))
+                                    (_ out)))
+                                 (_ out)))
+                        out)))
+          (ident (loop ((i 0) (out text))
+                   (if (< i (vec-count steps))
+                       (recur (+ i 1)
+                              (match (vec-nth steps i)
+                                ((List items)
+                                 (match (vec-nth items 0) ((Sym h) (if (= h "id") (vec-nth items 1) out)) (_ out)))
+                                (_ out)))
+                       out))))
+      `[(fib.test.core/Scenario (fib.test.core/slugify ~ident) ~text [~@covers] [~@plan]
+          (fn (~seed) (let ((~log (fib.test.core/new-rec))) ~body)))])))
+
+;; (outline "text" [a b] [[1 2] [3 4]] step ..): a scenario outline (Gherkin's Scenario Outline, a table of examples): one scenario for
+;; each row, its text the outline's text and the row, a (given [a 1 b 2]) of the row's values before the steps.
+(defmacro outline (text names rows ... steps)
+  (match names
+    ((Vec ns)
+     (match rows
+       ((Vec rs)
+        `(fib.test.core/flat
+           [~@(loop ((i 0) (out (vec-empty)))
+                (if (< i (vec-count rs))
+                    (recur (+ i 1)
+                           (vec-conj out
+                             (match (vec-nth rs i)
+                               ((Vec vs)
+                                `(scenario (str ~text " " (fib.test.core/form-text (quote ~(vec-nth rs i))))
+                                   (given ~(Vec (loop ((j 0) (b (vec-empty)))
+                                                  (if (< j (vec-count ns)) (recur (+ j 1) (vec-conj (vec-conj b (vec-nth ns j)) (vec-nth vs j))) b))))
+                                   ~@steps))
+                               (_ (trap "outline: a row is a vector")))))
+                    out))]))
+       (_ (trap "outline: the rows are a vector"))))
+    (_ (trap "outline: the names are a vector"))))
+
+;; (feature "name" scenario ..): a Suite of scenarios with no implementation.
+(defmacro feature (name ... scenarios)
+  `(fib.test.core/feature-suite ~name (fib.test.core/flat [~@scenarios])))
+
+;; (defcontract Name [make ..] scenario ..): a function from the implementation's constructors to the contract's scenarios. Its
+;; parameters are what the scenarios build the implementation from, usually one factory `make`; their types are inferred, so the
+;; contract is generic over them and each use is monomorphised (design §2).
+(defmacro defcontract (name params ... scenarios)
+  (match params
+    ((Vec ps) `(defun ~name ~(List ps) (fib.test.core/flat [~@scenarios])))
+    (_ (trap "defcontract: the parameters are a vector"))))
+
+;; (implements Contract "impl-name" arg ..): the Suite of the contract's scenarios against one implementation.
+(defmacro implements (name impl ... args)
+  (match name
+    ((Sym s) `(fib.test.core/contract-suite ~(Str s) ~impl (~name ~@args)))
+    (_ (trap "implements: the contract is a name"))))
+
+;; (defspecs name suite ..): `(name)` is every suite of the file, the list `fibc test` runs.
+(defmacro defspecs (name ... suites)
+  `(defun ~name () -> (Vec fib.test.core/Suite) [~@suites]))
