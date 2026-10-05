@@ -1,0 +1,34 @@
+;; fib.tensor `mmul` of two N x N matrices, REPEAT times (args: N REPEAT [f32]), printing the sum of the last product (6 places).
+;; A64-1: the first numbers for the tensor kernels on aarch64 (docs/shootout/aarch64.md). The kernel is the target's (has-fma: the ordered fma chain on both x86-64-v3
+;; and arm64), so the checksum is the same on both machines: it is the cross-architecture bit check. Not a shootout row: there is no C or Java twin.
+(ns main (:require [fib.tensor :as t] [fib.fmt :as fmt]))
+
+(defun gen64 (n: i64 seed: i64) -> (t/Tensor f64)
+  (let ((buf (cell (array n 0.0))))
+    (do (dotimes (i n) (array-set! &buf i (fdiv (double (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0)))
+        (t/from-array [n] @buf 0.0))))
+
+(defun gen32 (n: i64 seed: i64) -> (t/Tensor f32)
+  (let ((buf (cell (array n 0.0f32))))
+    (do (dotimes (i n) (array-set! &buf i (fdiv (float (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0f32)))
+        (t/from-array [n] @buf 0.0f32))))
+
+(defun run64 (n: i64 reps: i64) -> f64
+  (let ((a (t/reshape [n n] (gen64 (* n n) 1))) (b (t/reshape [n n] (gen64 (* n n) 2))))
+    (loop ((r 0) (s 0.0))
+      (if (< r reps)
+          (recur (+ r 1) (let ((c (t/mmul a b))) (reduce (fn (a: f64 x: f64) (+ a x)) 0.0 (t/to-vec c))))
+          s))))
+
+(defun run32 (n: i64 reps: i64) -> f64
+  (let ((a (t/reshape [n n] (gen32 (* n n) 1))) (b (t/reshape [n n] (gen32 (* n n) 2))))
+    (loop ((r 0) (s 0.0))
+      (if (< r reps)
+          (recur (+ r 1) (let ((c (t/mmul a b))) (reduce (fn (a: f64 x: f32) (+ a (fpext f64 x))) 0.0 (t/to-vec c))))
+          s))))
+
+(defun main () -> i64
+  (let ((n (unwrap (parse-long (nth (args) 0))))
+        (reps (unwrap (parse-long (nth (args) 1))))
+        (s (if (and (> (count (args)) 2) (= (nth (args) 2) "f32")) (run32 n reps) (run64 n reps))))
+    (do (println (fmt/format-f64 s 6)) 0)))

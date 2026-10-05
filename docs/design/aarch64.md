@@ -275,13 +275,39 @@ mac-check: 0 step(s) failed
 
 Step 6 passes by listing the known failures; a failure outside `KNOWN` is printed and fails the step.
 
-## 7. Open findings (the Mac and the census)
+## 7. Findings (the Mac and the census) and what A64-1 did with them
 
-1. `sysconf(84)` (2.6): one worker thread on macOS. 2. `strfromd` (2.6). 3. Mailbox mutex size (2.4). 4. JIT `-O 0` crash on 6223 (2.3). 5. `lairf cases`/`fuzz` use `/proc/self/exe` (2.7).
-6. 7402/7404 OS pipe/TCP timeouts on Darwin: the Darwin backend has been type-checked but never run before (`docs/design/os.md`); `fcntl` variadic calls and the `socket`/`accept` fallbacks need a look.
-7. `has-fma`/`target-of-features` on a native aarch64 host (2.2). 8. `package.sh`, `llvm-static.sh`, `SEED`, CI are Linux-x86 only (2.9, 2.10).
-9. iOS has no backend variant, no exported-function mode (5).
-10. The macro runner under `FIB_TARGET_CPU`/a different OS: a macro that itself uses `fib.os` is compiled with the *target's* OS backend by `roots.fib` while it runs on the host; no case does today.
+| # | Finding | Status after A64-1 |
+|---|---|---|
+| 1 | `sysconf(84)`: one worker thread on macOS | fixed: `emit.os` rewrites the runtime's `@sysconf (i32 84)` to `58` for Darwin (on the Mac `sysconf(84)` is -1, `sysconf(58)` is 20); `compiler/tests/emit/unit-runtime.fib` checks both texts. Not measured as pool size on the Mac (the library's `spawn` makes a thread per task, the pool serves `async`/`await`) |
+| 2 | `strfromd` | fixed: `fib.fmt` calls `snprintf` (`:varargs :fixed 3`); case 4205 passes on the Mac |
+| 3 | mailbox mutex size | fixed: 8 words for the mutex (Darwin's `pthread_mutex_t` is 64 bytes, glibc's 40) and 8 per condition variable; the old layout overlapped the mutex's last words with the first condition variable on Darwin. Ran on the Mac: `lairf cases cases/lir/instr` 25 of 26 |
+| 4 | JIT `-O 0` crash on 6223 | fixed, root cause in 2.3 (a LLVM FastISel/RegAllocFast bug with callee-pop `tailcc` calls, JIT and AOT) |
+| 5 | `lairf cases`/`fuzz` use `/proc/self/exe` | fixed (`fib.os` `executable-path`); `lairf cases` ran on the Mac; `fuzz` shares the function and was not run there |
+| 6 | 7402/7404 timeouts on Darwin | 7404 was a real hang with a root cause shared with every variadic C call: see 7.1. 7402 passes alone in 1 s on the Mac (its earlier timeout was the 10-job load, or the same fcntl garbage) |
+| 7 | `has-fma` on a native aarch64 host | `(has-fma)` is true on the Mac (printed); cases 7077/7078 compare `mmul` with the reference of the target's kernel and pass on the Mac and on x86 with `FIB_TARGET_CPU=x86-64` and `x86-64-v3`. Rows for aarch64 CPUs in `types/target.fib` (A64-2) were not touched |
+| 8 | `package.sh`, `llvm-static.sh`, `SEED`, CI Linux-x86 only | `SEED` has a per-platform table and `fetch-seed.sh` reads it; `package.sh` builds the darwin-arm64 tarball (7.2); CI and the release workflow were not changed |
+| 9 | iOS has no backend variant | open |
+| 10 | the macro runner under a different OS | open |
+| 11 | new: `cases/lir/instr/declare-global.lir` fails on the Mac: it names the C global `stderr`, which Darwin calls `__stderrp` | open (a case that is Linux-specific) |
+
+### 7.1 Variadic C functions on Apple arm64
+
+Apple's AArch64 ABI passes the arguments of a variadic call after the fixed ones on the stack, not in registers. The library declared `fcntl` as `(i32 i32 i64) :varargs`, which lowers to
+`declare i32 @fcntl(i32, i32, i64, ...)` and calls it with three arguments, so the third was passed as a *fixed* one, in a register, and `fcntl` read garbage from the stack. Measured on the Mac:
+a socket from `socket-new` had `F_GETFL` 2 (no `O_NONBLOCK`), a listener 10 (`O_APPEND`), and `accept` on it blocked for ever: case 7404. On x86-64 both ways of passing are the same.
+`(extern name (T..) -> R :varargs :fixed N)` now declares only the first N parameters before the dots (`program-declare-extern`); the calls still pass every argument. The same fix serves `snprintf` (4205)
+and libcurl's `curl_easy_setopt`/`getinfo` (not run on the Mac). The Rust seed ignores `:fixed`, so the shared library compiles with it and behaves as before on Linux. After it, `F_GETFL` is 6 (`O_NONBLOCK|O_RDWR`)
+and `accept` answers `EAGAIN` (35). The OS backend's other variadic calls go through the runtime's lIR, which declares them correctly (`openat (i32 ptr i32 ...)`).
+
+### 7.2 darwin-arm64 release path (what ran)
+
+`scripts/package.sh` on the Mac (seed: the cross-built `fibc`) printed `stage check: F (built by the seed) and F3 (built by F) emit the same lIR`, `shipped fibc: no LC_RPATH, loads: /usr/lib/libSystem.B.dylib /usr/lib/libc++.1.dylib
+/usr/lib/libz.1.dylib /usr/lib/libxml2.2.dylib` and produced `fibc-0.1.5-darwin-arm64.tar.gz` (21 MB; `bin/fibc` 66.9 MB, ad-hoc signed by ld64). LLVM is static: `scripts/llvm-static.sh` merges llvm@21's archives (core orcjit native passes analysis irreader
+bitwriter x86 aarch64) and Homebrew's `libzstd.a` with Apple's `libtool -static` into one `libllvm-static.a` (ld64 resolves archive members in any order, so the Linux ld script's GROUP is not needed); `-l c++ -l z -l xml2` are the system's.
+The x86 and aarch64 backends are named explicitly: `native` alone is the host's, and the target initialisation of `compiler/llvm/target.fib` calls both. Unpacked in another directory and run with `env -i PATH=/usr/bin:/bin` inside `sandbox-exec`
+with `/opt/homebrew` made unreadable (`ls /opt/homebrew/opt/llvm@21/lib` answers "Operation not permitted" there), `bin/fibc --version`, `run hello.fib`, `build hello.fib` and three ownership cases all worked, and `strings` finds no `/opt/homebrew` in the binary.
+Not done: a hardened-runtime or notarised binary (A64-5), a tarball built by the released seed, CI, `compiler/tests/native/a64-*` in the gate, and checking `--version` on a Mac without Xcode's `cc` (`fibc build` needs `cc`; `run` does not).
 
 ## 8. Package plan
 
@@ -306,5 +332,6 @@ The reason the cross route is short: `fibc emit` is pure fibber and needs no LLV
 
 ## 9. What was not done
 
-Nothing ran on iOS, the iOS Simulator, aarch64 Linux or an M4. The Mac's `mac-check.sh` was run in `--quick` mode only. A static-LLVM macOS build was not attempted. A hardened-runtime or notarised `fibc` was not tried.
-`has-fma` is set but unconsumed; the SIMD library was not changed. No performance measurement was taken. The Rust seed and `crates/` were not touched.
+Nothing ran on iOS, the iOS Simulator, aarch64 Linux or an M4. The Mac's `mac-check.sh` was run in `--quick` mode only (A64-1: `0 step(s) failed`, KNOWN reduced to `1707`). A hardened-runtime or notarised `fibc` was not tried.
+A64-1 did not touch the aarch64 CPU rows of `types/target.fib`, CI, the release workflow or `a64-emit.sh` in the gate; it did not publish or tag anything, and the `SEED` row for darwin-arm64 is empty until a release exists.
+First performance numbers are in `docs/shootout/aarch64.md`; the NEON GEMM tile was not rewritten. The Rust seed and `crates/` were not touched.
