@@ -5,9 +5,10 @@
 ;; roots:  ../../lib support
 ;; covers: fd-mkdir fd-rmdir fd-unlink
 ;; A directory is made and removed; making it twice is EEXIST (17), making one under a missing parent is ENOENT
-;; (2), removing a missing one is ENOENT, unlinking a directory is EISDIR (21), a file in it is made and
+;; (2), removing a missing one is ENOENT, removing one that holds a file is ENOTEMPTY (the platform's number: 39 on Linux, 66 on Darwin, from the
+;; ABI table of fib.os), unlinking a directory is EISDIR (21) on Linux and EPERM (1) on Darwin (the ABI table again), a file in it is made and
 ;; removed, and reading a directory is EISDIR.
-(ns main (:use tl.check tl.sysx fib.unix))
+(ns main (:use tl.check tl.sysx fib.unix) (:require [fib.os.abi :as abi]))
 
 (defun main () -> i64
   (let ((c (checks))
@@ -20,8 +21,8 @@
           (do (check c (> w 2))
               (check c (= (put w "x") 1))
               (fd-close w)))
-        (check c (= (num (fd-rmdir dir)) -39))
-        (check c (= (num (fd-unlink dir)) -21))
+        (check c (= (num (fd-rmdir dir)) (- 0 (. abi/host not-empty))))
+        (check c (= (num (fd-unlink dir)) (- 0 (. abi/host unlink-directory))))
         (let ((d (open-ro dir)))
           (do (check c (> d 2))
               (check c (= (nread (fd-read d 10)) -21))
