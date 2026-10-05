@@ -1,0 +1,50 @@
+;; spec:   types §1.9 (masked loads and stores, tails), docs/design/simd-and-tensors.md 2.7
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; simd-load-masked takes lane k from the array where the mask is true and from the pass-through where it is false, and a masked-off lane may lie past the end of the array without trapping; simd-store-masked! writes only the active lanes; simd-load-tail and simd-store-tail! handle the last, short, vector of a loop. Every result is compared with the scalar loop written here, and a whole-array sum by vectors plus one tail agrees with the scalar sum for every length from 0 to 11.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun fill (n: i64) -> (Array i32)
+  (let ((a (cell (array n 0i32))))
+    (do (doseq [i (range n)] (array-set! &a i (trunc i32 (+ 3 (* 2 i))))) @a)))
+
+(defun sum-scalar (a: (Array i32)) -> i64
+  (loop ((i 0) (acc 0)) (if (< i (array-len a)) (recur (+ i 1) (+ acc (sext i64 (array-get a i)))) acc)))
+
+(defun sum-vectors (a: (Array i32)) -> i64
+  (loop ((i 0) (acc 0))
+    (if (< i (array-len a))
+        (let ((v: i32x4 (simd-load-tail a i))) (recur (+ i 4) (+ acc (sext i64 (hsum v)))))
+        acc)))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (fill 10)))
+    (do (let ((m: (Simd bool 4) <<true false true true>>) (pass: i32x4 <<-1 -2 -3 -4>>i32))
+          (doseq [i (range 7)]
+            (let ((v: i32x4 (simd-load-masked a i m pass)))
+              (doseq [k (range 4)]
+                (check c (= (lane v k) (if (lane m k) (array-get a (+ i k)) (lane pass k))))))))
+        (let ((m: (Simd bool 4) <<true true false false>>) (pass: i32x4 <<-1 -2 -3 -4>>i32) (v: i32x4 (simd-load-masked a 8 m pass)))
+          (do (check c (= (lane v 0) (array-get a 8))) (check c (= (lane v 1) (array-get a 9)))
+              (check c (= (lane v 2) -3i32)) (check c (= (lane v 3) -4i32))))
+        (let ((v: i32x4 (simd-load-tail a 8)))
+          (do (check c (= (lane v 0) (array-get a 8))) (check c (= (lane v 1) (array-get a 9)))
+              (check c (= (lane v 2) 0i32)) (check c (= (lane v 3) 0i32))))
+        (let ((v: i32x4 (simd-load-tail a 10)))
+          (check c (= v <<0 0 0 0>>i32)))
+        (doseq [n (range 12)]
+          (let ((b (fill n))) (check c (= (sum-vectors b) (sum-scalar b)))))
+        (let ((arr (cell (fill 10))) (ref (cell (fill 10))) (v: i32x4 <<100 200 300 400>>i32) (m: (Simd bool 4) <<false true true false>>))
+          (do (simd-store-masked! &arr 2 v m)
+              (doseq [k (range 4)] (when (lane m k) (array-set! &ref (+ 2 k) (lane v k))))
+              (doseq [i (range 10)] (check c (= (array-get @arr i) (array-get @ref i))))
+              (simd-store-masked! &arr 8 v <<true true false false>>)
+              (check c (= (array-get @arr 8) 100i32)) (check c (= (array-get @arr 9) 200i32))
+              (simd-store-tail! &arr 8 <<7 8 9 10>>i32)
+              (check c (= (array-get @arr 8) 7i32)) (check c (= (array-get @arr 9) 8i32)) (check c (= (array-len @arr) 10))))
+        (let ((p (checks)))
+          (let ((v: i32x4 (simd-load-tail a 8))) (do (check p (= (lane v 2) 1i32)) (check-detects c p))))
+        (checks-result c))))

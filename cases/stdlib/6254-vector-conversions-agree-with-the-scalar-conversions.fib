@@ -1,0 +1,35 @@
+;; spec:   types §1.9 (conversions), docs/design/simd-and-tensors.md 2.6, types §8.12 (fptosi saturates)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; (simd/convert v) converts every lane to the lane type the context names, exactly as the scalar conversion does it: i32 to f32 and f64 (sitofp), f64 to i64 and f32 to i32 (fptosi, which saturates and sends NaN to 0), i8 to i32 (sext), i32 to i8 (trunc, the low bits), f32 to f64 (fpext) and f64 to f32 (fptrunc). Every lane is compared with the scalar conversion of that lane, including the lanes that saturate and the NaN lane.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (nan (bits->f64 9221120237041090560)))
+    (do (let ((a: i32x4 <<1 -2 2147483647 -2147483648>>i32))
+          (let ((f: f32x4 (simd/convert a)) (d: f64x4 (simd/convert a)))
+            (doseq [k (range 4)]
+              (do (check c (= (lane f k) (sitofp f32 (lane a k))))
+                  (check c (= (lane d k) (sitofp f64 (lane a k))))))))
+        (let ((x: f64x4 <<1.9 -1.9 1.0e30 -1.0e30>>))
+          (let ((i: i64x4 (simd/convert x)))
+            (doseq [k (range 4)] (check c (= (lane i k) (fptosi i64 (lane x k)))))))
+        (let ((x: f64x2 (simd/convert <<1.5 2.5>>f32)) (y: f32x4 <<1.0e20 -1.0e20 0.0 7.5>>f32))
+          (let ((j: i32x4 (simd/convert y)))
+            (do (check c (= (lane x 0) 1.5)) (check c (= (lane x 1) 2.5))
+                (doseq [k (range 4)] (check c (= (lane j k) (fptosi i32 (lane y k))))))))
+        (let ((z: f64x2 (with-lane <<0.0 3.7>> 0 nan)))
+          (let ((k: i64x2 (simd/convert z)))
+            (do (check c (= (lane k 0) 0)) (check c (= (lane k 0) (fptosi i64 nan))) (check c (= (lane k 1) 3)))))
+        (let ((a: i8x4 <<1 -1 127 -128>>i8) (b: i32x4 <<300 -300 65537 -1>>i32) (d: f64x2 <<0.1 1.0e40>>))
+          (let ((w: i32x4 (simd/convert a)) (n: i8x4 (simd/convert b)) (s: f32x2 (simd/convert d)))
+            (do (doseq [k (range 4)]
+                  (do (check c (= (lane w k) (sext i32 (lane a k))))
+                      (check c (= (lane n k) (trunc i8 (lane b k))))))
+                (doseq [k (range 2)] (check c (= (lane s k) (fptrunc f32 (lane d k))))))))
+        (let ((p (checks)) (a: i32x4 <<1 2 3 4>>i32))
+          (let ((f: f32x4 (simd/convert a))) (do (check p (= (lane f 0) 2.0f32)) (check-detects c p))))
+        (checks-result c))))

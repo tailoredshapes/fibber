@@ -15,20 +15,20 @@
 
 ;; ---- types and text
 
-(defun elem-of :private (t: LirTy) -> LirTy
+(defun elem-of (t: LirTy) -> LirTy
   (match t ((LirVec e _) e) (_ t)))
 
-(defun lanes-of :private (t: LirTy) -> i64
+(defun lanes-of (t: LirTy) -> i64
   (match t ((LirVec _ n) n) (_ 1)))
 
-(defun vec? :private (t: LirTy) -> bool
+(defun vec? (t: LirTy) -> bool
   (match t ((LirVec _ _) true) (_ false)))
 
-(defun float-elem? :private (t: LirTy) -> bool
+(defun float-elem? (t: LirTy) -> bool
   (let ((e (elem-of t))) (or (= e LirFloat) (= e LirDouble))))
 
 ;; `i32x4`, `f64x2`, `mask8`: the vector's name in a message.
-(defun vec-name :private (t: LirTy) -> str
+(defun vec-name (t: LirTy) -> str
   (let ((e (elem-of t)) (n (str (lanes-of t))))
     (cond (= e LirI1) (str-join ["mask" n])
           (= e LirFloat) (str-join ["f32x" n])
@@ -36,18 +36,18 @@
           :else (str-join [(lir-ty-text e) "x" n]))))
 
 ;; `(<n x e> a a ..)`: the constant vector with every lane `text`.
-(defun vconst :private (t: LirTy text: str) -> str
+(defun vconst (t: LirTy text: str) -> str
   (str-join (into ["(" (lir-ty-text t)] (into (mapv (fn (i: i64) (str-concat " " text)) (range (lanes-of t))) [")"]))))
 
 ;; `(<m x i32> i ..)`: a literal shuffle mask.
-(defun mask-text :private (idx: (Vec i64)) -> str
+(defun mask-text (idx: (Vec i64)) -> str
   (str-join (into ["(<" (str (count idx)) " x i32>"] (into (mapv (fn (i: i64) (str-concat " " (str i))) idx) [")"]))))
 
-(defun val :private (cx: LowerCx instr: str t: LirTy) -> V
+(defun val (cx: LowerCx instr: str t: LirTy) -> V
   (fb-val (. cx b) instr t))
 
 ;; Every lane of vector type `t` is the scalar `x`.
-(defun splat-lanes :private (cx: LowerCx t: LirTy x: V) -> V
+(defun splat-lanes (cx: LowerCx t: LirTy x: V) -> V
   (let ((z (str-join ["(zeroinitializer " (lir-ty-text t) ")"])))
     (val cx (str-join ["(shufflevector (insertelement " z " " (v-text x) " (i32 0)) " z " "
                        (mask-text (mapv (fn (i: i64) 0) (range (lanes-of t)))) ")"]) t)))
@@ -62,7 +62,7 @@
       vals))
 
 ;; `x` as a vector of type `t`: itself, or the splat of a scalar literal.
-(defun as-vec :private (cx: LowerCx t: LirTy x: V) -> V
+(defun as-vec (cx: LowerCx t: LirTy x: V) -> V
   (match (v-ty x)
     ((some (LirVec _ _)) x)
     (_ (splat-lanes cx t x))))
@@ -87,7 +87,7 @@
               (val cx (str-join ["(extractvalue " (v-text r) " 0)"]) t)))))))
 
 ;; `neg`: floats `fneg`; integers trap when a lane is the minimum, as the scalar.
-(defun vec-neg :private (cx: LowerCx t: LirTy a: str) -> V
+(defun vec-neg (cx: LowerCx t: LirTy a: str) -> V
   (if (float-elem? t)
       (val cx (str-join ["(fneg " a ")"]) t)
       (let ((w (lir-ty-bits (elem-of t))))

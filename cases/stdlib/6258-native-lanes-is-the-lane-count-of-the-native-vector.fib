@@ -1,0 +1,28 @@
+;; spec:   types §1.9 (native lane counts), docs/design/simd-and-tensors.md 1.9, 2.9
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; (native-lanes T) is the lane count of f32xn / f64xn / (Simd T :native) for the element T, an i64 known at compile time: it agrees with the count read back from a vector of that type (simd/lanes, and the loop of lane writes), with the width rule (the count of an element half as wide is twice as large), and it is usable as an ordinary i64 in a loop bound that fills an array through simd-store!.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (native-lanes f64) (simd/lanes (splat f64xn 0.0))))
+        (check c (= (native-lanes f32) (simd/lanes (splat f32xn 0.0f32))))
+        (check c (= (native-lanes i8) (simd/lanes (splat (Simd i8 :native) 1i8))))
+        (check c (= (native-lanes f32) (* 2 (native-lanes f64))))
+        (check c (= (native-lanes i32) (native-lanes f32)))
+        (check c (= (native-lanes i8) (* 8 (native-lanes i64))))
+        (check c (>= (native-lanes f64) 2))
+        (let ((n (native-lanes f64)) (a (cell (array 16 0.0))))
+          (do (loop ((i 0))
+                (if (<= (+ i n) 16)
+                    (do (simd-store! &a i (splat f64xn 2.5)) (recur (+ i n)))
+                    0))
+              (doseq [i (range (* n (quot 16 n)))] (check c (= (array-get @a i) 2.5)))
+              (doseq [i (range (* n (quot 16 n)) 16)] (check c (= (array-get @a i) 0.0)))))
+        (let ((p (checks)))
+          (do (check p (= (native-lanes f64) 0)) (check-detects c p)))
+        (checks-result c))))

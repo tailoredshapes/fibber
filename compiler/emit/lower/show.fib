@@ -5,7 +5,7 @@
 (ns emit.lower.show
   (:require [fib.string :as s])
   (:use types.ty types.scheme types.ast types.decls own.program emit.value emit.layout emit.names emit.ir emit.statics emit.program
-        emit.lower.cx))
+        emit.lower.cx emit.lower.ops emit.lower.simd))
 
 ;; The call a scalar's `show` is. `x` is the value; an integer narrower than 64 bits is widened first. Rust: show.rs:17
 (defun scalar-show :private (cx: LowerCx sc: Scalar x: V) -> str
@@ -50,8 +50,38 @@
     ((TCon (KNominal id) _) (typedef-is-fieldless-enum (g-ty g id)))
     (_ false)))
 
+;; ---- a lane vector: the literal, `<<1 2 3 4>>i32`, the element type visible unless it is i64 or f64 (spec/types.md 1.9, "Show")
+
+(defun simd-suffix :private (sc: Scalar) -> str
+  (match sc ((SI8) "i8") ((SI16) "i16") ((SI32) "i32") ((SF32) "f32") (_ "")))
+
+;; A fresh `str` of `text`.
+(defun simd-piece :private (cx: LowerCx text: str) -> V
+  (fb-val (. cx b) (str-join ["(call @fib.str-copy " (statics-string (. (. cx p) statics) text 0) ")"]) LirPtr))
+
+;; `acc` and `p` joined into a fresh `str`; both are released.
+(defun simd-append :private (cx: LowerCx acc: V p: V) -> V
+  (let ((r (fb-val (. cx b) (str-join ["(call @fib.str-concat " (v-text acc) " " (v-text p) ")"]) LirPtr)))
+    (do (lcx-release cx acc) (lcx-release cx p) r)))
+
+(defun simd-show :private (cx: LowerCx x: V sc: Scalar lt: LirTy) -> (Result V str)
+  (loop ((i 0) (acc (simd-piece cx "<<")))
+    (if (>= i (lanes-of lt))
+        (Ok (simd-append cx acc (simd-piece cx (str-join [">>" (simd-suffix sc)]))))
+        (try-let ((s (lcx-native-show cx (fb-val (. cx b) (str-join ["(extractelement " (v-text x) " (i32 " (str i) "))"]) (elem-of lt))
+                                      (TCon (KScalar sc) []))))
+          (recur (+ i 1) (simd-append cx (if (= i 0) acc (simd-append cx acc (simd-piece cx " "))) s))))))
+
 ;; Rust: lower/show.rs:15 LowerCx::native_show
 (defun lcx-native-show (cx: LowerCx x: V t: Ty) -> (Result V str)
+  (match t
+    ((TCon (KSimd) args)
+     (match (Pair (v-ty x) (nth args 0))
+       ((Pair (some lt) (TCon (KScalar sc) _)) (simd-show cx x sc lt))
+       (_ (Err "show of a vector of an unknown element"))))
+    (_ (lcx-native-show-plain cx x t))))
+
+(defun lcx-native-show-plain :private (cx: LowerCx x: V t: Ty) -> (Result V str)
   (let ((g (program-g (. cx p))))
     (try-let ((call (match t
                       ((TCon (KScalar sc) _) (Ok (scalar-show cx sc x)))

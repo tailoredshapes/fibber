@@ -1,0 +1,24 @@
+;; spec:   types §1.9 (stores), docs/design/simd-and-tensors.md 2.7, types §2.13.1 (an array is never written when shared)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The array has a second owner when simd-store! runs, so the store goes to a copy: the other owner still reads the old elements and the cell reads the new ones; a store into an array nobody else holds changes just the lanes written. Both compared with the element-by-element reference written here.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (cell (array 6 1.0))))
+    (do (let ((shared (array 6 2.0)) (b (cell shared)) (v: f64x4 <<9.0 8.0 7.0 6.0>>))
+          (do (simd-store! &b 1 v)
+              (doseq [i (range 6)]
+                (do (check c (= (array-get shared i) 2.0))
+                    (check c (= (array-get @b i) (if (and (>= i 1) (< i 5)) (lane v (- i 1)) 2.0)))))))
+        (let ((v: f64x4 <<9.0 8.0 7.0 6.0>>))
+          (do (simd-store! &a 2 v)
+              (doseq [i (range 6)]
+                (check c (= (array-get @a i) (if (and (>= i 2) (< i 6)) (lane v (- i 2)) 1.0))))
+))
+        (let ((p (checks)))
+          (do (check p (= (array-get @a 0) 5.0)) (check-detects c p)))
+        (checks-result c))))

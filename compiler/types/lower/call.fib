@@ -12,10 +12,10 @@
 ;; - `arity` is the function `arity-error`: the first `?` of each branch returns its error.
 (ns types.lower.call
   (:use syntax.pos syntax.form syntax.print types.ty types.scheme types.error types.store types.table
-        types.ast types.decls types.names types.builtins types.lower.typeform types.lower.scope))
+        types.ast types.decls types.names types.builtins types.target types.lower.typeform types.lower.scope))
 
 ;; What a call's head names, when it matters for lowering.
-(defenum Special SfDeref SfSet SfNot SfConcat SfSetField SfDyn SfSimd SfSplat (SfConvert op: ConvOp))
+(defenum Special SfDeref SfSet SfNot SfConcat SfSetField SfDyn SfSimd SfSplat SfNativeLanes (SfConvert op: ConvOp))
 
 ;; Whether `(dyn P :send e)`: the keyword right after the protocol.
 (defun dyn-send :private (items: (Vec Stx)) -> bool
@@ -33,10 +33,12 @@
         :else nil))
 
 ;; Rust: lower/call.rs:47 is_primitive_form: whether `name` is a primitive form (§4.3) not
-;; shadowed locally.
+;; shadowed locally. `simd` is the exception: it is the head of the vector literal `<<..>>` (the reader writes it), so no local
+;; shadows it (spec/syntax.md 1, the vector literal).
 (defun lw-is-primitive-form (lw: Lowerer name: str) -> bool
-  (and (or (= name "set-field!") (= name "dyn") (= name "simd") (= name "splat") (str-in conversions name))
-       (not (lw-is-local lw name))))
+  (or (= name "simd")
+      (and (or (= name "set-field!") (= name "dyn") (= name "splat") (= name "native-lanes") (str-in conversions name))
+           (not (lw-is-local lw name)))))
 
 ;; Rust: lower/call.rs:53 primitive_value: the error for a primitive form used as a value.
 (defun lw-primitive-value (lw: Lowerer name: str form: Stx) -> TypeError
@@ -66,6 +68,7 @@
          (cond (= name "set-field!") (some SfSetField)
                (= name "dyn") (some SfDyn)
                (= name "simd") (some SfSimd)
+               (= name "native-lanes") (some SfNativeLanes)
                (= name "splat") (some SfSplat)
                :else (match (conv-op name) ((some op) (some (SfConvert op))) (nil nil)))
         (lw-is-local lw name) nil
@@ -80,8 +83,26 @@
                           ((GMethod p i) (if (and (= i 0) (= (some p) @(. (. lw g) deref-proto))) (some SfDeref) nil))
                           (_ nil)))))))
 
-;; Rust: lower/call.rs:106 call: a list form that is not a core form.
+;; `(simd/shuffle a b <<i ..>>)`: the indices are a vector literal of integer literals (lIR's shuffle mask is a constant), checked here so that
+;; the error is the checker's, at the indices.
+(defun shuffle-indices? :private (x: Stx) -> bool
+  (match (. x kind)
+    ((SList xs)
+     (and (> (count xs) 1) (= (stx-as-sym (nth xs 0)) (some "simd"))
+          (loop ((i 1))
+            (cond (>= i (count xs)) true
+                  (match (. (nth xs i) kind) ((SInt _ _) true) (_ false)) (recur (+ i 1))
+                  :else false))))
+    (_ false)))
+
 (defun lw-call (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
+  (if (and (= (stx-as-sym (nth items 0)) (some "simd/shuffle")) (= (count items) 4) (not (shuffle-indices? (nth items 3)))
+           (not (lw-is-local lw "simd/shuffle")))
+      (Err (type-error-other (. (nth items 3) pos) "simd/shuffle: the indices must be a vector literal of integer literals"))
+      (lw-call-plain lw items form)))
+
+;; Rust: lower/call.rs:106 call: a list form that is not a core form.
+(defun lw-call-plain :private (lw: Lowerer items: (Vec Stx) form: Stx) -> (Result Expr TypeError)
   (match (match (stx-as-sym (nth items 0)) ((some name) (special lw name)) (nil nil))
     ((some s) (special-call lw s items form))
     (nil
@@ -175,6 +196,14 @@
          ((ASimd _ (ANat _)) (Ok (ESplat ann e)))
          (_ (Err (type-error-other (. (nth items 1) pos)
                    "splat's first operand is a vector type with a known lane count, as f64x4"))))))
+    ((SfNativeLanes)
+     (try-let ((_ (arity items pos 1))
+               (ann (type-ann (. lw g) (. lw m) (nth items 1) false)))
+       (match ann
+         ((AScalar s) (if (simd-elem-scalar? s)
+                          (Ok (ELit (LitInt (target-lanes (g-target (. lw g)) (scalar-bits s)) I64)))
+                          (Err (type-error-other (. (nth items 1) pos) "native-lanes takes an integer width, f32 or f64"))))
+         (_ (Err (type-error-other (. (nth items 1) pos) "native-lanes takes an integer width, f32 or f64"))))))
     ((SfConvert op)
      (try-let ((_ (arity items pos 2)))
        (convert lw op items)))))

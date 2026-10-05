@@ -1,0 +1,24 @@
+;; spec:   stdlib §7 L10 (the macro `wrapping`)
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The rewrite reaches a let, an if and a loop inside the body and several operands of one call (folded to the left), a single operand of - (the negation) and of + or * (the operand), a vector literal inside, and a body of several forms; every answer is the scalar reference computed in i64.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (check c (= (wrapping (let ((a 100i8)) (if (> a 0i8) (+ a a a) 0i8))) (trunc i8 (+ 100 (+ 100 100)))))
+        (check c (= (wrapping (- 100i8 100i8 100i8)) (trunc i8 (- (- 100 100) 100))))
+        (check c (= (wrapping (* 10i8 10i8 10i8)) (trunc i8 (* (* 10 10) 10))))
+        (check c (= (wrapping (- -128i8)) -128i8))
+        (check c (= (wrapping (+ 7i8)) 7i8))
+        (check c (= (wrapping (* 7i8)) 7i8))
+        (check c (= (wrapping 1i8 (+ 127i8 127i8)) (trunc i8 254)))
+        (check c (= (wrapping (loop ((i 0) (h 5381i32)) (if (< i 5) (recur (+ i 1) (+ (* h 33i32) 7i32)) h)))
+                    (trunc i32 (loop ((i 0) (h 5381)) (if (< i 5) (recur (+ i 1) (sext i64 (trunc i32 (+ (* h 33) 7)))) h)))))
+        (check c (= (hsum (wrapping (+ <<127 1>>i8 <<1 1>>i8))) (trunc i8 (+ 128 2))))
+        (let ((p (checks)))
+          (do (check p (= (wrapping (- 100i8 100i8 100i8)) 100i8)) (check-detects c p)))
+        (checks-result c))))

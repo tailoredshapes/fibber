@@ -34,3 +34,55 @@
 ;; (defonce name: T v) is (def name: T v)
 (defmacro defonce (name ... rest)
   `(def ~name ~@rest))
+
+;; (wrapping e ..): inside the body, `+ - *` and `neg` wrap at the operand's width instead of trapping (spec/stdlib.md 7 L10, ADR 015; spec/types.md
+;; 1.9 for vectors): each call headed by one of those symbols becomes `unchecked-add` `unchecked-subtract` `unchecked-multiply` `unchecked-negate`
+;; (more than two operands fold to the left, one operand of `+` or `*` is the operand, one of `-` is the negation). The rewrite is of the written
+;; code, so it reaches the arguments of a macro that is not yet expanded and a `let` or `loop` body, but not the inside of a `fn`, `quote` or
+;; `quasiquote` form (a closure runs where the macro does not see it). It applies to integers and integer vectors; on a float the wrapping
+;; operations are the plain ones; on any other type (a Ratio, a BigInt) it is a type error. A macro body here has no recursion and no
+;; library, so the walk is a breadth-first flattening of the tree into a vector, then the rebuilding of the nodes from the last to the first.
+(defmacro wrapping (... es)
+  (let ((body (if (= (vec-count es) 1) (vec-nth es 0) `(do ~@es)))
+        (skip? (fn (xs: (Vec Form))
+                 (if (> (vec-count xs) 0)
+                     (match (vec-nth xs 0) ((Sym s) (or (= s "fn") (or (= s "quote") (= s "quasiquote")))) (_ false))
+                     false)))
+        (op (fn (s: str) (if (= s "+") (Sym "unchecked-add") (if (= s "-") (Sym "unchecked-subtract") (Sym "unchecked-multiply"))))))
+    (let ((kids-of (fn (x: Form)
+                     (match x
+                       ((List xs) (if (skip? xs) (vec-empty) xs))
+                       ((Vec xs) xs)
+                       ((Map xs) xs)
+                       (_ (vec-empty)))))
+          (rewrite (fn (kids: (Vec Form))
+                     (match (vec-nth kids 0)
+                       ((Sym s)
+                        (let ((n (- (vec-count kids) 1)))
+                          (cond (and (or (= s "+") (= s "*")) (= n 1)) (vec-nth kids 1)
+                                (and (or (= s "-") (= s "neg")) (= n 1)) (List [(Sym "unchecked-negate") (vec-nth kids 1)])
+                                (and (or (= s "+") (or (= s "-") (= s "*"))) (>= n 2))
+                                  (loop ((i 3) (acc (List [(op s) (vec-nth kids 1) (vec-nth kids 2)])))
+                                    (if (< i (vec-count kids)) (recur (+ i 1) (List [(op s) acc (vec-nth kids i)])) acc))
+                                :else (List kids))))
+                       (_ (List kids))))))
+      (let ((t (loop ((ns [body]) (i 0) (starts (vec-empty)) (counts (vec-empty)))
+                 (if (>= i (vec-count ns))
+                     (Triple ns starts counts)
+                     (let ((kids (kids-of (vec-nth ns i))))
+                       (recur (loop ((j 0) (acc ns)) (if (< j (vec-count kids)) (recur (+ j 1) (vec-conj acc (vec-nth kids j))) acc))
+                              (+ i 1) (vec-conj starts (vec-count ns)) (vec-conj counts (vec-count kids))))))))
+        (let ((ns (. t fst)) (starts (. t snd)) (counts (. t thd)) (n (vec-count (. t fst))))
+          (loop ((j (- n 1)) (rs (vec-empty)))
+            (if (< j 0)
+                (vec-nth rs (- n 1))
+                (let ((node (vec-nth ns j)) (c (vec-nth counts j)))
+                  (recur (- j 1)
+                         (vec-conj rs
+                                   (if (= c 0)
+                                       node
+                                       (let ((kids (loop ((k 0) (acc (vec-empty)))
+                                                     (if (< k c)
+                                                         (recur (+ k 1) (vec-conj acc (vec-nth rs (- (- n 1) (+ (vec-nth starts j) k)))))
+                                                         acc))))
+                                         (match node ((List _) (rewrite kids)) ((Vec _) (Vec kids)) (_ (Map kids)))))))))))))))

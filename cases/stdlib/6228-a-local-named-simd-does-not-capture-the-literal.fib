@@ -1,0 +1,24 @@
+;; spec:   syntax §1 (the head simd is reserved), types §1.9, docs/design/simd-and-tensors.md 2.3
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The reader writes <<..>> as (simd ..). A let binding, a parameter and a closure parameter named simd do not shadow that head: the literal is still a vector, checked against the scalar sums; and the variable named simd is still a variable where it is not a list head.
+(ns main (:use fib.core tl.check))
+
+(defun with-param (simd: i64) -> i64 (+ simd (hsum <<10 20 30>>)))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (let ((simd 5))
+          (do (check c (= (hsum <<1 2 3 4>>) (+ 1 (+ 2 (+ 3 4)))))
+              (check c (= (+ simd 1) 6))
+              (let ((v: i64x2 <<7 8>>))
+                (check c (= (hsum v) (+ 7 8))))))
+        (check c (= (with-param 1) (+ 1 (+ 10 (+ 20 30)))))
+        (let ((f (fn (simd: i64) (+ simd (hsum <<1 1>>)))))
+          (check c (= (f 40) 42)))
+        (let ((p (checks)))
+          (do (check p (= (hsum <<1 2>>) 4)) (check-detects c p)))
+        (checks-result c))))

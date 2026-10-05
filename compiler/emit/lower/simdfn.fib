@@ -1,0 +1,114 @@
+;; compiler/emit/lower/simdfn.fib: the functions of a float or an integer, scalar or vector, that are one lIR instruction (spec/lir.md 6.1, "Floating-point
+;; functions and integer min/max"), the conversions between lane types (6.3), the shuffles and the constants of a vector type:
+;;   simd/fma simd/sqrt simd/floor simd/ceil simd/trunc simd/round simd/round-even simd/abs simd/min simd/max simd/min-num simd/max-num
+;;   simd/convert simd/reverse simd/shuffle simd/lanes simd/kind
+;; `simd/min` and `simd/max` are the NaN-propagating pair (`fmin`, `fmax`: a NaN operand gives NaN, `-0.0` is below `+0.0`), as the library's `min` and `max`;
+;; `simd/min-num` and `simd/max-num` are IEEE minNum and maxNum (a NaN operand loses). `simd/abs` of an integer traps on the minimum, as `neg` does.
+;; `simd/round` is to nearest with ties away from zero, `simd/round-even` ties to even. Memory access to arrays is emit.lower.simdmem.
+(ns emit.lower.simdfn
+  (:use types.ty types.ast emit.value emit.ir emit.program emit.layout emit.lower.cx emit.lower.simd))
+
+(defun ty-of :private (x: V) -> LirTy (unwrap-or (v-ty x) LirI64))
+
+;; The lIR instruction of a one-instruction function, `nil` when `name` is none.
+(defun fn-instr :private (name: str fl: bool) -> (Option str)
+  (cond (= name "simd/fma") (some "fma")
+        (= name "simd/sqrt") (some "fsqrt")
+        (= name "simd/floor") (some "ffloor")
+        (= name "simd/ceil") (some "fceil")
+        (= name "simd/trunc") (some "ftrunc")
+        (= name "simd/round") (some "fround")
+        (= name "simd/round-even") (some "froundeven")
+        (= name "simd/abs") (some (if fl "fabs" "abs"))
+        (= name "simd/min") (some (if fl "fmin" "smin"))
+        (= name "simd/max") (some (if fl "fmax" "smax"))
+        (= name "simd/min-num") (some "fminnum")
+        (= name "simd/max-num") (some "fmaxnum")
+        :else nil))
+
+;; Traps when a lane (or the scalar) of `a` is the minimum of its integer type: the absolute value does not fit.
+(defun abs-check :private (cx: LowerCx t: LirTy a: str) -> unit
+  (let ((m (str (shl -1 (- (lir-ty-bits (elem-of t)) 1)))))
+    (if (vec? t)
+        (let ((amin (val cx (str-join ["(icmp eq " a " " (vconst t m) ")"]) (LirVec LirI1 (lanes-of t)))))
+          (lcx-trap-if cx (val cx (str-join ["(reduce-or " (v-text amin) ")"]) LirI1) (str-join ["integer overflow in abs at " (vec-name t)])))
+        (lcx-trap-if cx (val cx (str-join ["(icmp eq " a " (" (lir-ty-text t) " " m "))"]) LirI1)
+                     (str-join ["integer overflow in abs at " (lir-ty-text t)])))))
+
+(defun lcx-simd-fn (cx: LowerCx name: str a: (Vec V)) -> (Result V str)
+  (let ((t (ty-of (nth a 0))))
+    (match (fn-instr name (float-elem? t))
+      (nil (Err (str-join ["unsupported: " name])))
+      ((some op)
+       (do (when (and (= name "simd/abs") (not (float-elem? t))) (abs-check cx t (v-text (nth a 0))))
+           (Ok (val cx (str-join ["(" op (str-join (mapv (fn (v: V) (str-concat " " (v-text v))) a)) ")"]) t)))))))
+
+;; ---- conversions
+
+(defun elem-bits :private (e: LirTy) -> i64
+  (cond (= e LirFloat) 32 (= e LirDouble) 64 :else (lir-ty-bits e)))
+
+(defun float-lane? :private (e: LirTy) -> bool (or (= e LirFloat) (= e LirDouble)))
+
+;; The cast instruction from lane type `from` to lane type `to`: nil when they are the same type.
+(defun conv-instr :private (from: LirTy to: LirTy) -> (Option str)
+  (let ((ff (float-lane? from)) (tf (float-lane? to)) (fb (elem-bits from)) (tb (elem-bits to)))
+    (cond (and ff tf) (cond (> tb fb) (some "fpext") (< tb fb) (some "fptrunc") :else nil)
+          ff (some "fptosi-sat")
+          tf (some "sitofp")
+          :else (cond (> tb fb) (some "sext") (< tb fb) (some "trunc") :else nil))))
+
+;; `(simd/convert v)` to the vector type `to` of the same lane count: integers to floats, floats to integers (saturating, NaN to 0, as the scalar
+;; `fptosi` of types 8.12), wider and narrower lanes (narrowing an integer keeps the low bits, as `trunc`).
+(defun lcx-simd-convert (cx: LowerCx x: V to: LirTy) -> (Result V str)
+  (let ((from (ty-of x)))
+    (cond (not (and (vec? from) (vec? to))) (Err "simd/convert converts a vector to a vector")
+          (or (= (elem-of from) LirI1) (= (elem-of to) LirI1)) (Err "simd/convert does not convert a mask")
+          :else (match (conv-instr (elem-of from) (elem-of to))
+                  (nil (Ok x))
+                  ((some op) (Ok (val cx (str-join ["(" op " " (lir-ty-text to) " " (v-text x) ")"]) to)))))))
+
+;; ---- shuffles and constants
+
+;; The literal integer lanes of the call's argument `i`, when it is a vector literal of integer literals.
+(defun literal-lanes :private (e: Expr i: i64) -> (Option (Vec i64))
+  (match (. e kind)
+    ((ECall _ args)
+     (match (get args i)
+       ((some (ArgExpr x))
+        (match (. x kind)
+          ((ESimd _ es)
+           (let ((vs (mapv (fn (l: Expr) (match (. l kind) ((ELit (LitInt v _)) (some v)) (_ nil))) es)))
+             (if (some? (find-first (fn (o: (Option i64)) (nil? o)) vs))
+                 nil
+                 (some (mapv (fn (o: (Option i64)) (unwrap-or o 0)) vs)))))
+          (_ nil)))
+       (_ nil)))
+    (_ nil)))
+
+;; `(simd/shuffle a b <<i0 i1 ..>>)`: lane k of the result is lane ik of the concatenation of `a` and `b`; the indices are a vector literal of
+;; integer literals below twice the lane count.
+(defun lcx-simd-shuffle (cx: LowerCx e: Expr a: V b: V) -> (Result V str)
+  (let ((t (ty-of a)))
+    (match (literal-lanes e 2)
+      (nil (Err "simd/shuffle: the indices must be a vector literal of integer literals"))
+      ((some idx)
+       (if (some? (find-first (fn (i: i64) (or (< i 0) (>= i (* 2 (lanes-of t))))) idx))
+           (Err (str-join ["simd/shuffle: an index is outside 0 .. " (str (- (* 2 (lanes-of t)) 1))]))
+           (Ok (val cx (str-join ["(shufflevector " (v-text a) " " (v-text b) " " (mask-text idx) ")"]) (LirVec (elem-of t) (count idx)))))))))
+
+(defun lcx-simd-reverse (cx: LowerCx x: V) -> V
+  (let ((t (ty-of x)))
+    (val cx (str-join ["(shufflevector " (v-text x) " " (v-text x) " " (mask-text (mapv (fn (i: i64) (- (- (lanes-of t) 1) i)) (range (lanes-of t)))) ")"]) t)))
+
+;; The code of a lane type: the width of an integer, 100 plus the width of a float, 1 for a mask.
+(defun lane-kind :private (e: LirTy) -> i64
+  (cond (= e LirI1) 1 (float-lane? e) (+ 100 (elem-bits e)) :else (lir-ty-bits e)))
+
+(defun lcx-simd-const (name: str x: V) -> V
+  (let ((t (ty-of x)))
+    (v-int LirI64 (if (= name "simd/lanes") (lanes-of t) (lane-kind (elem-of t))))))
+
+(defun simd-fn-name? (name: str) -> bool
+  (contains? (set ["simd/fma" "simd/sqrt" "simd/floor" "simd/ceil" "simd/trunc" "simd/round" "simd/round-even" "simd/abs" "simd/min" "simd/max"
+                   "simd/min-num" "simd/max-num" "simd/convert" "simd/reverse" "simd/shuffle" "simd/lanes" "simd/kind"]) name))

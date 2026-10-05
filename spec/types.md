@@ -414,10 +414,23 @@ NaN-propagating `reduce-fmin`/`reduce-fmax`. The literal `(simd e ..)` is the ze
 **Further builtins of the lowering** (rows of `types.builtins`): the masks have no `Bits` instance, so `simd/and simd/or simd/xor simd/not` (lanewise),
 `simd/any simd/all` (bool: `reduce-or`, `reduce-and`) and `simd/blend m a b` (`select`: lane from `a` where the mask is true) are the mask operations; and
 the wrapping family of stdlib §7 L10 for integers and integer vectors, `unchecked-add unchecked-subtract unchecked-multiply unchecked-negate`
-(`add sub mul`, which wrap at the lane width), the opt-out of the checked operators. **Not there yet:** the `wrapping` scope macro of the design (2.8), `Show` of a
-vector, vector loads and stores, shuffles, conversions, `fma`/`sqrt` and kin (the lIR has the instructions; no builtin row), a vector in a `def`, and a
-vector argument of an `extern` is not rejected. A local variable named `simd` captures the reader's `<<..>>` (a top-level `defun simd` does not: the core form wins), which
-is a gap of the reader's form, reported by the package that found it. An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26
+(`add sub mul`, which wrap at the lane width), the opt-out of the checked operators; and the scope macro `(wrapping e ..)` of stdlib §7 L10 (`lib/fib/core/forms.fib`),
+which rewrites every call of `+ - *` and `neg` in its body to those builtins (more than two operands fold to the left; one operand of `-` or `neg` is the negation, of
+`+` or `*` the operand) and does not look into a `fn`, `quote` or `quasiquote` form. **`Show` of a vector** is native (the instance of §2.12): the literal with the element type
+visible, `<<1 2 3 4>>i32`, `<<1.5 2.5>>f32`, `<<1.0 2.0>>` for `f64` and `<<7 8>>` for `i64` (no suffix), `<<true false>>` for a mask; the reader reads the text back to
+the same vector. **Vector memory** (builtins `emit.lower.simdmem`, on an `(Array T)` of integers or floats, the vector type being the context's): `simd-load a i` traps
+`simd-load: lanes out of range of the array` unless `0 <= i` and `i + n <= len` (one check per vector); `simd-store! &a i v` is checked the same and copies a shared array first;
+`simd-load-unchecked` and `simd-store-unchecked!` skip the bounds check (unsafe; the store still copies a shared array); `simd-load-masked a i m passthru` and `simd-store-masked! &a i v m` touch
+only the active lanes and trap if an active lane is outside the array; `simd-load-tail a i` (lanes past the end 0) and `simd-store-tail! &a i v` need `0 <= i <= len`. Alignment promised is the element's.
+`simd-load-vec` and `simd-store-vec` of `fib.simd` do a `Vec` lane by lane. `simd/shuffle a b <<i ..>>` (indices a vector literal of integer literals, checked by the checker; the result lane count is the index count),
+`simd/reverse`, `simd/lanes` and `simd/kind` (constants). `Debug` and `ToStr` of a vector are in `fib.simd`. **Float and integer functions** on a scalar or every lane (`emit.lower.simdfn`, one lIR instruction each, spec/lir.md 6.1): `simd/fma` (one rounding), `simd/sqrt`, `simd/floor`, `simd/ceil`, `simd/trunc`,
+`simd/round` (ties away from zero), `simd/round-even`, `simd/abs` (integers trap on the minimum), `simd/min` and `simd/max` (**NaN rule:** a NaN operand gives NaN; `-0.0` is below `+0.0`; integers signed), `simd/min-num` and `simd/max-num`
+(a NaN operand loses). `simd/convert v` converts every lane to the lane type of the context: int to float (`sitofp`), float to int (`fptosi-sat`: saturates, NaN is 0), wider integer `sext`, narrower `trunc`, `fpext`, `fptrunc`.
+**`(native-lanes T)`** is a primitive form, an `i64` literal made by the checker: the lane count of `:native` / `f32xn` / `f64xn` for the element `T` on the target the checker was given.
+**A vector in a `def`** is a value initialised before `main` (not static data; a vector is never counted). **Not in the library:** `MArray`; `MArray` does not exist in the library.
+A vector argument or result of an `extern` is a type error (`an extern position cannot be a vector`). The head `simd` of the
+literal's form is reserved: no local variable named `simd` shadows it (spec/syntax.md 1).
+An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26
 limit (so `(with-lane v 0 5)` on `i32x4` needs `5i32`).
 
 ## 2. Typing rules for the core forms and builtins
