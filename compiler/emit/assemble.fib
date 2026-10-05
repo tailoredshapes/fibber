@@ -34,6 +34,10 @@
 ;; assembles again for every `def` it runs, so the program's functions and quoted constants are copied and left in place.
 ;; Rust: compile.rs:269 module_parts
 (defun module-parts (p: Program defs: str) -> Parts
+  (module-parts-with (runtime-text) p defs))
+
+;; `module-parts` with the text of the runtime `rt` (the target's for a program, the host's for what the JIT runs: emit.rt).
+(defun module-parts-with (rt: str p: Program defs: str) -> Parts
   ;; The names of the keyword helpers intern strings: they come before the statics are rendered.
   (let ((keywords (program-render-keyword-helpers p))
         (externs (program-render-externs p))
@@ -41,7 +45,7 @@
     (let ((statics (statics-render (. p statics))))
       ;; §3.19, L15: the slot globals of the `def`s made at run time come with the values of the constant `def`s.
       (let ((slots (inits-slot-text p)))
-        (Parts (runtime-text) externs types statics keywords (str-join [slots defs]) @(. p quote-text) @(. p funcs))))))
+        (Parts rt externs types statics keywords (str-join [slots defs]) @(. p quote-text) @(. p funcs))))))
 
 ;; The pieces of `module-parts`' text, in the order of `parts-text`: each is the text of whole lIR items that is the same every time the module
 ;; is assembled again (a function, a static string, the text of one object's structs), so that the hand-over to the JIT (emit.defs.astmod) parses
@@ -52,12 +56,12 @@
         (types (objects-render-pieces (. p objects))))
     (let ((statics (statics-render-pieces (. p statics))))
       (let ((slots (inits-slot-text p)))
-        (into (into (into (into (into (into [(runtime-text)] externs) types) statics) [keywords slots]) @(. d pieces))
+        (into (into (into (into (into (into [(runtime-text-host)] externs) types) statics) [keywords slots]) @(. d pieces))
               (into [@(. p quote-text)] @(. p funcs)))))))
 
 ;; Rust: compile.rs:285 assemble_parts
 (defun assemble-parts (p: Program defs: str) -> str
-  (parts-text (module-parts p defs)))
+  (parts-text (module-parts-with (runtime-text-host) p defs)))
 
 ;; Emits every body and closure queued so far. Rust: compile.rs:71 emit_all
 (defun emit-all (p: Program) -> (Result unit str)
