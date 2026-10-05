@@ -1,0 +1,25 @@
+;; spec: docs/design/relational-search.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.logic :as l]) (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (calls (cell 0))
+        (goal (loop ((i 0) (g (l/delay-goal (fn () (do (set! calls (+ @calls 1)) (l/all []))))))
+                (if (< i 512) (recur (+ i 1) (l/all [g])) g)))
+        (work (cell (l/start goal))))
+    (do (dotimes (i 512)
+          (match (l/step @work)
+            ((l/SearchProgress rest) (set! work rest))
+            (_ (check c false))))
+        (check c (= @calls 0))
+        (match (l/step @work)
+          ((l/SearchProgress rest) (set! work rest))
+          (_ (check c false)))
+        (check c (= @calls 1))
+        (check c (= (count (l/take-states 1 @work)) 1))
+        (check c (= (count (l/take-states 0 (l/start (l/delay-goal (fn () (trap "must remain unforced")))))) 0))
+        (checks-result c))))

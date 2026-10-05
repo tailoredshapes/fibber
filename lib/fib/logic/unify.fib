@@ -1,0 +1,51 @@
+;; Persistent substitutions. Occurs checking keeps all accepted terms finite.
+(ns fib.logic.unify (:use fib.core fib.seq fib.coll fib.print fib.logic.terms))
+
+(defstruct State (bindings: (Map i64 Term) next-id: i64))
+(defun empty-state () -> State (State {} 0))
+
+(defun walk (term: Term bindings: (Map i64 Term)) -> Term
+  (loop ((value term))
+    (match value
+      ((Var id) (match (get bindings id) ((some next) (recur next)) (nil value)))
+      (_ value))))
+
+(defun occurs? :private (id: i64 term: Term bindings: (Map i64 Term)) -> bool
+  (match (walk term bindings)
+    ((Var other) (= id other))
+    ((Cons h t) (or (occurs? id h bindings) (occurs? id t bindings)))
+    (_ false)))
+
+(defun extend :private (id: i64 term: Term bindings: (Map i64 Term)) -> (Option (Map i64 Term))
+  (if (occurs? id term bindings) nil (some (assoc bindings id term))))
+
+(defun unify (left: Term right: Term bindings: (Map i64 Term)) -> (Option (Map i64 Term))
+  (let ((a (walk left bindings)) (b (walk right bindings)))
+    (if (same-term? a b) (some bindings)
+        (match a
+          ((Var id) (extend id b bindings))
+          (_ (match b
+               ((Var id) (extend id a bindings))
+               (_ (match a
+                    ((Cons ah at) (match b
+                       ((Cons bh bt) (match (unify ah bh bindings)
+                          ((some next) (unify at bt next)) (nil nil)))
+                       (_ nil)))
+                    (_ nil)))))))))
+
+;; Shared renaming across all query terms preserves aliasing in each answer.
+(defun reify-term :private (term: Term bindings: (Map i64 Term) names: (Map i64 Term)) -> (Pair Term (Map i64 Term))
+  (match (walk term bindings)
+    ((Var id) (match (get names id)
+      ((some name) (Pair name names))
+      (nil (let ((name (Var (count names)))) (Pair name (assoc names id name))))))
+    ((Cons h t) (let ((head (reify-term h bindings names))
+                     (tail (reify-term t bindings (. head snd))))
+                 (Pair (Cons (. head fst) (. tail fst)) (. tail snd))))
+    (value (Pair value names))))
+
+(defun reify-many (terms: (Vec Term) state: State) -> (Vec Term)
+  (loop ((i 0) (names: (Map i64 Term) {}) (out: (Vec Term) []))
+    (if (< i (count terms))
+        (let ((value (reify-term (nth terms i) (. state bindings) names)))
+          (recur (+ i 1) (. value snd) (conj out (. value fst)))) out)))

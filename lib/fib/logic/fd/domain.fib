@@ -1,0 +1,66 @@
+;; Canonical finite i64 sets: compact 63-bit windows or sorted sparse values.
+(ns fib.logic.fd.domain (:use fib.core fib.seq fib.coll))
+(defenum Domain (Small base: i64 mask: i64) (Sparse items: (Vec i64)))
+
+(defun values (d: Domain) -> (Vec i64)
+  (match d
+    ((Sparse xs) xs)
+    ((Small base mask)
+      (loop ((bits mask) (i 0) (out: (Vec i64) []))
+        (if (= bits 0) out
+            (recur (sar bits 1) (+ i 1)
+              (if (= (bit-and bits 1) 0) out (conj out (+ base i)))))))))
+(defun domain-size (d: Domain) -> i64
+  (match d ((Small _ mask) (popcount mask)) ((Sparse xs) (count xs))))
+(defun domain (items: (Vec i64)) -> Domain
+  (let ((xs (to-vec (sort (to-vec (set items))))) (n (count xs)))
+    (if (= n 0) (Small 0 0)
+        (let ((base (nth xs 0)) (span (unchecked-subtract (nth xs (- n 1)) base)))
+          (if (or (< span 0) (> span 62)) (Sparse xs)
+              (Small base (reduce (fn (mask: i64 v: i64) (bit-or mask (shl 1 (- v base)))) 0 xs)))))))
+(defun interval (lo: i64 hi: i64) -> Domain
+  (let ((span (unchecked-subtract hi lo)))
+    (cond (< hi lo) (Small 0 0)
+          (and (>= span 0) (<= span 62)) (Small lo (if (= span 62) 9223372036854775807 (- (shl 1 (+ span 1)) 1)))
+          :else (Sparse (loop ((i lo) (out: (Vec i64) []))
+                          (if (= i hi) (conj out i) (recur (+ i 1) (conj out i))))))))
+(defun contains-value? (d: Domain value: i64) -> bool
+  (match d
+    ((Small base mask) (let ((offset (unchecked-subtract value base)))
+      (and (>= offset 0) (<= offset 62) (!= (bit-and mask (shl 1 offset)) 0))))
+    ((Sparse xs) (loop ((lo 0) (hi (count xs)))
+      (if (< lo hi)
+          (let ((mid (+ lo (quot (- hi lo) 2))) (v (nth xs mid)))
+            (cond (= v value) true (< v value) (recur (+ mid 1) hi) :else (recur lo mid))) false)))))
+(defun minimum (d: Domain) -> i64
+  (do (when (= (domain-size d) 0) (trap "fd: empty domain has no minimum"))
+      (match d
+        ((Sparse xs) (nth xs 0))
+        ((Small base mask) (loop ((i 0) (bits mask))
+          (if (!= (bit-and bits 1) 0) (+ base i) (recur (+ i 1) (sar bits 1))))))))
+(defun maximum (d: Domain) -> i64
+  (do (when (= (domain-size d) 0) (trap "fd: empty domain has no maximum"))
+      (match d ((Sparse xs) (nth xs (- (count xs) 1)))
+        ((Small base mask) (loop ((i 0) (bits mask))
+          (if (= (sar bits 1) 0) (+ base i) (recur (+ i 1) (sar bits 1))))))))
+(defun remove-value (d: Domain value: i64) -> Domain
+  (match d
+    ((Small base mask) (let ((offset (unchecked-subtract value base)))
+      (if (and (>= offset 0) (<= offset 62)) (Small base (bit-and mask (bit-not (shl 1 offset)))) d)))
+    ((Sparse xs) (Sparse (filterv (fn (n: i64) (!= n value)) xs)))))
+(defun intersection (a: Domain b: Domain) -> Domain
+  (if (or (= (domain-size a) 0) (= (domain-size b) 0)) (Small 0 0)
+      (match a
+        ((Small base mask) (match b
+          ((Small other bits)
+            (if (or (< (maximum a) other) (< (maximum b) base)) (Small base 0)
+                (let ((delta (- other base)))
+                  (Small base (bit-and mask (if (>= delta 0) (shl bits delta) (sar bits (- delta))))))))
+          (_ (domain (filterv (fn (v: i64) (contains-value? b v)) (values a))))))
+        (_ (domain (filterv (fn (v: i64) (contains-value? b v)) (values a)))))))
+(defun equal-domain? (a: Domain b: Domain) -> bool
+  (match a ((Small base mask) (match b
+    ((Small other bits) (if (= base other) (= mask bits) (= (values a) (values b))))
+    (_ (= (values a) (values b)))))
+    (_ (= (values a) (values b)))))
+(impl Eq Domain (= (self other) (equal-domain? self other)))

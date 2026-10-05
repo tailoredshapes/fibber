@@ -1,0 +1,42 @@
+;; Typed finite logic terms. Atom tags remain distinct; pairs may be improper lists.
+(ns fib.logic.terms (:use fib.core fib.seq fib.coll fib.print))
+
+(defenum Term (Var id: i64) (Integer value: i64) (Symbol name: str) (Nil) (Cons head: Term tail: Term))
+
+(defun integer (n: i64) -> Term (Integer n))
+(defun symbol (s: str) -> Term (Symbol s))
+(defun nil-term () -> Term Nil)
+(defun pair (head: Term tail: Term) -> Term (Cons head tail))
+(defun list-term (items: (Vec Term)) -> Term
+  (loop ((i (count items)) (tail: Term Nil))
+    (if (> i 0) (recur (- i 1) (Cons (nth items (- i 1)) tail)) tail)))
+
+(defun same-term? (a: Term b: Term) -> bool
+  (match a
+    ((Var x) (match b ((Var y) (= x y)) (_ false)))
+    ((Integer x) (match b ((Integer y) (= x y)) (_ false)))
+    ((Symbol x) (match b ((Symbol y) (= x y)) (_ false)))
+    ((Nil) (match b ((Nil) true) (_ false)))
+    ((Cons h t) (match b ((Cons x y) (and (same-term? h x) (same-term? t y))) (_ false)))))
+(impl Eq Term (= (self other) (same-term? self other)))
+
+(defun string-join :private (parts: (Vec str)) -> str
+  (loop ((i 0) (out ""))
+    (if (< i (count parts))
+        (recur (+ i 1) (str-join [out (if (= i 0) "" " ") (nth parts i)])) out)))
+
+(defun term-text (value: Term) -> str
+  (match value
+    ((Var id) (str-join ["_." (str id)]))
+    ((Integer n) (str n))
+    ((Symbol s) s)
+    ((Nil) "()")
+    ((Cons _ _)
+     (loop ((tail value) (parts: (Vec str) []))
+       (match tail
+         ((Cons h t) (recur t (conj parts (term-text h))))
+         ((Nil) (str-join ["(" (string-join parts) ")"]))
+         (_ (str-join ["(" (string-join parts) " . " (term-text tail) ")"])))))))
+(impl Show Term (show (self) (term-text self)))
+(impl Debug Term (debug (self) (term-text self)))
+(impl ToStr Term (to-str (self) (term-text self)))

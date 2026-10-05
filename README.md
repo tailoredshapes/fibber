@@ -24,15 +24,15 @@ Releases are on the [GitHub releases page](https://github.com/tailoredshapes/fib
 `fibc-VERSION-linux-x86_64.tar.gz` and `SHA256SUMS`. The 0.0.x releases are
 the Rust tools; from 0.1.0 `fibc` is the compiler written in fibber, built by
 itself, and stays 0.x until the owner says 1.0.0. The current release is
-0.1.3 (the file `VERSION`). Download both files, then:
+0.1.5 (the file `VERSION`). Download both files, then:
 
 ```
-sha256sum -c --ignore-missing SHA256SUMS     # fibc-0.1.3-linux-x86_64.tar.gz: OK
-tar xzf fibc-0.1.3-linux-x86_64.tar.gz
+sha256sum -c --ignore-missing SHA256SUMS     # fibc-0.1.5-linux-x86_64.tar.gz: OK
+tar xzf fibc-0.1.5-linux-x86_64.tar.gz
 echo '(defun main () -> i64 (do (println "hello from fibber") 0))' > hello.fib
-fibc-0.1.3-linux-x86_64/bin/fibc --version   # fibc 0.1.3
-fibc-0.1.3-linux-x86_64/bin/fibc run hello.fib
-fibc-0.1.3-linux-x86_64/bin/fibc build hello.fib -o hello && ./hello
+fibc-0.1.5-linux-x86_64/bin/fibc --version   # fibc 0.1.5
+fibc-0.1.5-linux-x86_64/bin/fibc run hello.fib
+fibc-0.1.5-linux-x86_64/bin/fibc build hello.fib -o hello && ./hello
 ```
 
 The tarball holds one directory, `fibc-VERSION-linux-x86_64/`:
@@ -81,103 +81,153 @@ that needs `npm install` in the directory and a `fibref` on `PATH` (the tarball'
 attaches the extension as `fibber-vscode-VERSION.vsix` to each release
 (`code --install-extension FILE.vsix`). Details: `editors/vscode/README.md`.
 
+## Status and development
+
+The active compiler is written in fibber: `compiler/fibc.fib` contains the
+front end and emitter, `compiler/lir/` checks lIR, and `compiler/native/`
+lowers it through the LLVM-C bindings in `compiler/llvm/`. The runtime
+remains lIR source. The Rust tools in `crates/` are frozen as the bootstrap
+seed and legacy comparison tools; new language work belongs in `compiler/`
+and `lib/`.
+
+The current release and bootstrap seed are **0.1.5**, recorded in `VERSION`
+and `SEED`. The bootstrap check is a fixed point: stage 2 builds stage 3,
+and both emit byte-identical lIR for the compiler's source. Equality with
+an older seed's output is informational because the compiler and embedded
+prelude can change. See [the CI workflow](.github/workflows/ci.yml).
+
+Recent compiler and library changes include:
+
+- Scalar `Option` values stored inline as a tag and payload, including in
+  collection elements, closure captures and task frames. Options of ordinary
+  objects remain nullable pointers; nested options and other payloads retain
+  their boxed representation. See [the representation design](docs/design/unboxed-option.md).
+- Last-use moves, moves of fields out of dead owned objects, and reuse of
+  unique collection shells and arrays. Persistent updates preserve old
+  versions when another holder exists. See [the update rules](spec/stdlib.md#25-mutation-and-uniqueness).
+- Fusion of a sequence bound by `let` when it has one eligible consumer,
+  with tests for effect order and preservation of memoization when reused.
+- SIMD lane values, arithmetic, masks, reductions and target-dependent widths
+  through `fib.simd`, with native vector lowering. See [the SIMD measurements](docs/shootout/simd.md).
+- FastISel for `fibc run -O 0`, plus recorded development-loop timings.
+  The compiler server, incremental checking and session work are described in
+  [the development-loop design](docs/design/dev-loop.md); that design is not
+  a claim that every planned command exists.
+
+The standard library in `lib/` follows Clojure's names and argument shapes,
+within fibber's static types and ownership model. Its specification and
+remaining work are in [spec/stdlib.md](spec/stdlib.md). The specifications,
+case headers and [ROADMAP.md](ROADMAP.md) contain both historical records
+and current rules; dated amendments identify changes.
+
+The explicit [`fib.tensor` numerical library](lib/fib/tensor/README.md) adds
+typed dense tensors, checked strided views, broadcasting, eager arithmetic,
+fused `axpby`, ordered and axis reductions, boolean masks, and matrix multiplication.
+Floating arithmetic uses native eight-lane `f32` and four-lane `f64` kernels;
+matrix multiplication uses register tiles and reusable packed panels. Explicit `sum-fast`/`dot-fast`
+permit reassociated reductions. After rebuilding stage 2, try
+`./F run examples/tensor.fib`; see the
+library README for API, safety contracts, and reproducible NumPy comparisons.
+This is a dense numerical foundation, not NumPy feature or performance parity.
+
+The explicit [`fib.logic` relational library](lib/fib/logic/README.md) adds
+finite typed terms, persistent unification with occurs checking, fair sequential
+search, and `fresh`/`conde` syntax. The same relation can infer missing values or
+enumerate answers; try `./F run examples/logic.fib`. Parallel search remains
+future work, with this engine serving as its tested reference.
+
+Its [`fib.logic.fd` extension](lib/fib/logic/README.md) adds compact and sparse
+finite integer domains, propagation for all-different and arithmetic constraints,
+and smallest-domain-first search. The port of [tsmarsh/sudoku](examples/sudoku/solver.fib)
+uses those constraints; build it with `./F build examples/sudoku.fib -I examples -I lib`.
+The [finite-domain design note](docs/design/finite-domains-and-sudoku.md) records
+the API, provenance, validation cases, and a comparison with the original
+Clojure/core.logic implementation.
+
+### Build and validate
+
+With a seed compiler on `PATH` and LLVM 21 development libraries installed:
+
+```sh
+fibc build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o /tmp/fibc2
+/tmp/fibc2 build compiler/fibc.fib -I compiler -I lib -L /usr/lib/llvm-21/lib -l LLVM-21 -o /tmp/fibc3
+/tmp/fibc2 emit -I compiler -I lib compiler/fibc.fib > /tmp/fibc2.lir
+/tmp/fibc3 emit -I compiler -I lib compiler/fibc.fib > /tmp/fibc3.lir
+cmp /tmp/fibc2.lir /tmp/fibc3.lir
+```
+
+`scripts/fetch-seed.sh /tmp/fibber-seed` fetches and verifies the seed named
+in `SEED`, and prints its compiler path. Release packaging links LLVM
+statically; the local build above links `libLLVM-21` dynamically.
+
+```sh
+FIBC=/tmp/fibc2 scripts/gate.sh --quick   # ownership, modules, stdlib sample
+FIBC=/tmp/fibc2 scripts/gate.sh --full    # fixed point and full case directories
+/tmp/fibc2 cases cases/stdlib --only 4010 4011 4015 -j 2
+/tmp/fibc2 run -O 0 program.fib          # fast development code generation
+/tmp/fibc2 build program.fib -o program  # optimized native executable
+/tmp/fibc2 explain program.fib          # ownership decisions
+/tmp/fibc2 emit program.fib             # generated lIR
+```
+
+The stage-2 case gate checks the non-passing set against
+[scripts/ci-stage2.expected](scripts/ci-stage2.expected), currently one
+known failure: the `def`-initialized atom case 1707. Cases marked `open`
+are counted separately; they are not passes. A changed non-passing set
+fails the gate, including a known failure that starts passing.
+
+The [October 4 decisions](docs/design/decisions-2026-10-04.md) supersede the
+interpreter-oracle requirement: the interpreter is now a development
+and editor tool. The frozen Rust interpreter does not implement the newer
+stage-2 features. The earlier interpreter/compiler comparison rules in
+[spec/method.md](spec/method.md) remain historical text pending consolidation;
+use the stage-2 gate for current compiler validation. `cargo test --workspace`
+checks the legacy Rust tools and requires LLVM 21 for `lair`.
+
 ## Performance
 
-Measured by `scripts/bench/` (one fibber program per benchmark, each printing a
-checksum; Rust twins in `scripts/bench/rust/`; `FIBC=bin/fibc scripts/bench/run.sh`).
-The table is the ROADMAP's PERF0 measurement (2026-10-03, released fibc 0.1.0, median of 3,
-28-core host, `rustc -O` twins), taken **before** the in-place update of collections
-landed; it has not been re-measured since, and the ROADMAP's Performance section has the
-profiles and the plan. Every benchmark printed the same checksum as its Rust twin.
+These are **recorded measurements**, not a fresh benchmark of the current
+checkout. The [quick baseline](scripts/bench/baseline.tsv), dated 2026-10-04,
+records a median of three runs on a 28-core host at tree stamp
+`97a9ee6a6019c82f`. Outputs are checked against recorded checksums.
 
-| benchmark | fibber s | Rust s | ratio | what it does |
-|---|---|---|---|---|
-| num-i64 | 2.97 | 2.87 | 1.0 | loop/recur, 1e9 steps |
-| num-f64 | 1.50 | 1.51 | 0.9 | f64 series, 2e9 steps |
-| recursion | 2.32 | 1.36 | 1.7 | fib 44 + arity-overloaded tail call |
-| binary-trees | 2.81 | 2.55 | 1.1 | depth 18, enum tree |
-| dispatch | 2.66 | 0.39 | 6.8 | protocol, enum match, closures |
-| vec-index | 0.83 | 0.08 | 10.3 | 1e8 `nth` |
-| num-nbody | 1.38 | 0.10 | 13.7 | 5 structs in a Vec, `assoc` per body per step |
-| strings | 1.08 | 0.09 | 11.9 | str, split, join, index-of |
-| lazy-fused | 1.05 | 0.09 | 11.6 | fused range/map/filter/reduce |
-| map-assoc-get | 1.68 | 0.14 | 11.9 | `(Map i64 i64)`, 1e6 assoc, 2e6 get |
-| vec-sort | 0.92 | 0.07 | 13.1 | sort 2e6, sort-by 1e6 |
-| set-conj | 0.84 | 0.05 | 16.7 | 1e6 conj, 1e6 contains? |
-| vec-conj-pop | 1.64 | 0.06 | 27.2 | 2e7 conj, 2e7 pop |
-| lazy-bound | 1.48 | 0.03 | 49.1 | the same chain, each stage bound by `let` |
-| vec-assoc | 3.36 | 0.01 | 333 | 1e7 `assoc` on a unique 1e5 Vec |
-| set-disj | 3.38 | under 0.01 | n/m | 2e4 conj then 1e4 disj; quadratic; `dissoc` was changed in `bea0905`, not re-measured |
+| benchmark | seconds | workload |
+|---|---:|---|
+| num-f64 | 1.46 | scalar floating-point loop |
+| num-nbody | 0.59 | bodies stored in a vector, updated per step |
+| vec-conj-pop | 0.90 | repeated vector append and pop |
+| vec-index | 0.73 | repeated vector indexing |
+| vec-sort | 0.43 | sorting and sorting by a key |
+| map-assoc-get | 0.28 | map updates and lookups |
+| set-conj | 0.23 | set insertion and membership |
+| lazy-fused | 0.68 | directly consumed sequence pipeline |
+| lazy-bound | 0.03 | sequence pipeline bound through local variables |
+| strings | 0.65 | string construction, splitting, joining and search |
 
-Scalar code is at Rust's speed; what touches a collection was 7x to 330x slower, because no
-update was in place. Since then the in-place primitives, the last-use analysis and the library
-over them have landed (spec/stdlib.md §2.5, "When is an update in place"); their effect is to be
-measured, not claimed here.
+The older PERF0 measurements and Rust comparisons are retained in
+[ROADMAP.md](ROADMAP.md#performance). They preceded the collection update
+work and should not be read as current ratios to Rust. The quick baseline
+is a regression reference, not evidence that all collections now match Rust.
 
-## Status
+The [SIMD shootout](docs/shootout/simd.md) records separate scalar and SIMD
+fibber kernels alongside Java and C, with verified output and median-of-five
+measurements. On its AVX2 host, explicit SIMD reduced n-body from 5.98 to
+1.75 seconds, spectral-norm from 1.27 to 0.52, and mandelbrot from 10.82 to
+2.20. Algorithms and data layouts differ between some comparisons; the
+report explains those differences and the remaining gaps, including vector
+loads/stores, bounds-check overhead, FMA and boxed records.
 
-**The compiler is bootstrapped** (M6, 2026-10-02). `compiler/fibc.fib` is a
-fibber compiler written in fibber: reader, expander with a macro runner,
-type checker, ownership checker and lIR emitter, about 32,000 lines. The
-Rust `fibc` (stage 1) builds it into stage 2; stage 2 builds itself into
-stage 3; all three emit byte-identical lIR for the compiler's own source,
-and stage 3 emits the same lIR as stage 1 on every program of the case
-suite. Native code comes from `lair`, also written in fibber (`compiler/native`),
-over LLVM-C (`compiler/llvm`); the Rust `lair` and its C interface
-(`liblair.so`) are kept as an oracle until the Rust tools go. The runtime `fib.rt` is lIR text, and the test harnesses are
-Rust. The standard library (M7) is a Clojure-shaped library in `lib/`,
-implicit in every program; its second tranche is under way. Nothing counts
-as implemented until an executable test says so ([spec/method.md](spec/method.md)).
+The [development-loop baseline](scripts/bench/dev-loop.tsv) records median
+startup-to-result times of 108 ms for an empty program, 139 ms for hello,
+and 332 ms for the medium program at `-O 0` (1,059 ms at `-O 2`). It uses
+a different recorded tree, `9deee19b87eb1f7a`.
 
-```
-cargo test --workspace                          # the full suite (lair needs LLVM 21)
-cargo run -p fibref -- cases cases/ownership    # 243 cases
-cargo run -p fibref -- cases cases/modules      # programs of several modules, a directory each
-cargo run -p fibref -- run   <file.fib>         # result and memory audit
-cargo run -p fibref -- explain <file.fib>       # the ownership decisions
-cargo run -p fibref -- cases cases/stdlib       # the standard library's cases (header keys: cases/stdlib/README.md)
-cargo run -p fibref -- read [--print] <file>..  # the reader's dump or printed forms (spec/bootstrap.md §2)
-cargo run -p fibref -- expand|types|own <file>..  # the dumps of the expander, type checker and ownership checker (spec/bootstrap.md §5 to §7)
-cargo run -p lair -- cases cases/lir            # 323 lIR cases, JIT and AOT
-cargo run -p lair -- run   <file.lir>           # JIT-compile and run main
-cargo run -p lair -- build <file.lir> -o out    # native executable
-cargo run -p lair -- check <file.lir>           # the checker alone
-cargo run -p lair -- fuzz cases/lir --count N   # mutation fuzzer over the accept cases (spec/lir.md §10.1)
-cargo run -p fibc -- cases cases/ownership      # every case interpreted and compiled, traces compared (method rule 6)
-cargo run -p fibc -- run   <file.fib> [-- a b]  # compile through the JIT and run main; a b are (args)
-cargo run -p fibc -- build <file.fib> -o out [-L dir].. [-l lib]..  # native executable, linked with the libraries named
-cargo run -p fibc -- gen --seed S --count N     # N generated programs through the same harness (method rule 5)
-cargo run -p fibc -- emit <file.fib>            # the lIR module; emit-dump prints it by section (spec/bootstrap.md §8)
+To measure your checkout without changing the recorded baselines:
+
+```sh
+FIBC=/tmp/fibc2 scripts/bench/quick.sh
+FIBC=/tmp/fibc2 scripts/bench/dev-loop.sh
 ```
 
-The compiler in fibber is a program like any other. Build it with stage 1
-and use it as `fibc`:
-
-```
-fibc build compiler/fibc.fib -I compiler -I lib -L target/debug -l lair -o fibc2
-./fibc2 build compiler/fibc.fib -I compiler -I lib -L target/debug -l lair -o fibc3   # it compiles itself
-./fibc3 emit compiler/fibc.fib | cmp - <(fibc emit compiler/fibc.fib)               # byte-identical lIR
-```
-
-`lair` links LLVM 21 statically through llvm-sys: set
-`LLVM_SYS_211_PREFIX` to an LLVM 21 install that has `llvm-config`
-(apt.llvm.org's `llvm-21-dev`; see `.github/workflows/ci.yml`).
-
-| Part | Where | State |
-|------|-------|-------|
-| Method: how claims are checked | [spec/method.md](spec/method.md) | decided |
-| Ownership model | [spec/ownership.md](spec/ownership.md) | decided |
-| Syntax | [spec/syntax.md](spec/syntax.md) | decided |
-| Type system and ownership checker | [spec/types.md](spec/types.md) | decided |
-| Cases | [cases/ownership/](cases/ownership/) | 243, all passing under both tools (the language, ownership, closures, threads, macros, the prelude's data structures; the numbering and the findings behind each block are in the case headers) |
-| Module cases | [cases/modules/](cases/modules/) | 27 programs of several modules (syntax §5), each a directory with its `main.fib`, all passing both ways |
-| Reference interpreter `fibref`: audited heap, reader, expander, types, ownership checker, evaluator | [crates/fibref](crates/fibref) | done (M2, [ROADMAP.md](ROADMAP.md)) |
-| Random program generator `fibgen` (method rule 5) | [crates/fibgen](crates/fibgen) | done (M2) |
-| Library | [lib/](lib), design [spec/stdlib.md](spec/stdlib.md) | M7, **Proposed**, tranches 0 and 1 done and tranche 2 under way (2026-10-03): the prelude (`Vec`, `Map` and `Set`, `Result`, tasks, files) plus four implicit facades `fib.core fib.seq fib.coll fib.print` of about forty parts: protocols (`Reducible`, `Seqable`, `Lookup`, ...), fused adaptors and memoised lazy seqs, sorting, strings and formatting, `defrecord`, numeric conversions, endless sources, cursors; verified against real Clojure 1.12 where behaviour is Clojure's |
-| Standard library cases | [cases/stdlib/](cases/stdlib/) | 912 cases, 881 passing under both tools, 31 `open-` (items of later tranches): reference, law, count (allocation bounds), trap and reject cases per function |
-| lIR: the assembler for LLVM IR that `fibc` emits | [spec/lir.md](spec/lir.md) | decided (owner, 2026-09-28; the second M3 pass's additions decided the same day, §14 items 8 to 11) |
-| lIR cases | [cases/lir/](cases/lir/) | 323, all passing on both paths (instr: each instruction; mapping: the shapes of types §8; audit: liar's findings re-established; adversarial, the fuzzer's findings among them; verify: one reject case per rule) |
-| lIR checker `lir` (no LLVM) and `lair`: JIT, AOT, case harness | [crates/lir](crates/lir), [crates/lair](crates/lair) | done (M3) |
-| Compiler `fibc`: `fibref`'s front end lowered to lIR, the runtime `fib.rt`, the rule-6 harness, macros and `def`s through the JIT, `async` as state machines | [spec/compiler.md](spec/compiler.md), [crates/fibc](crates/fibc) | done (M4, decided 2026-09-30): all 191 cases pass interpreted and compiled with matching free traces (`fibc cases cases/ownership`, 2026-10-01), and generated programs run through the same harness (`fibc gen`) |
-| The C interface to `lair` (`liblair.so`), used by the compiler written in fibber | [spec/compiler.md §9](spec/compiler.md), [crates/lair/include/lair.h](crates/lair/include/lair.h), [crates/lair/src/capi](crates/lair/src/capi), bindings in [compiler/lair/](compiler/lair) | M6; 23 `lair_*` functions; a test keeps the header equal to the exports; `fibc build FILE -o OUT -L DIR -l lair` links a fibber program against it and writes the rpath. Retired by `native.*` (lair in fibber, `compiler/native`): the compiler no longer uses it; kept as a legacy oracle until the Rust tools go |
-| Bootstrap: the compiler written in fibber | [spec/bootstrap.md](spec/bootstrap.md), [compiler/](compiler) | M6 done as far as the definition goes (2026-10-02, **Proposed**): `compiler/fibc.fib` (commands `emit`, `build`, `run`, `explain`, `emit-dump`) over `compiler/{syntax,expand,macros,types,own,emit,lair,driver}`. Each pass equals its Rust oracle byte for byte on the whole corpus (the reader, expander, `fibref types`, `fibref own` and `explain`, `fibc emit-dump`); stage 1, 2 and 3 emit identical lIR for the compiler itself; open: the Rust test harness cannot yet use stage 3 as the compiler, and 8 reflection-error inputs differ in position between the JIT and the interpreter ([ROADMAP.md](ROADMAP.md)) |
+The scripts serialize benchmark and gate runs through `/tmp/fibsuite.lock`.
+Use `--record` only when deliberately replacing a baseline.

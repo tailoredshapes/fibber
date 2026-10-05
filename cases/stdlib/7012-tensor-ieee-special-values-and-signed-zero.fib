@@ -1,0 +1,26 @@
+;; spec: docs/design/numerical-library.md; signed zero and IEEE values survive tensor operations
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (inf (bits->f64 9218868437227405312))
+        (nan (bits->f64 9221120237041090561))
+        (x (t/tensor [0.0 -0.0 inf nan]))
+        (y (t/neg x)) (z (t/add x x)))
+    (do (check c (= (f64->bits (t/flat-at y 0)) -9223372036854775808))
+        (check c (= (f64->bits (t/flat-at y 1)) 0))
+        (check c (= (t/flat-at y 2) (bits->f64 -4503599627370496)))
+        (check c (= (f64->bits (t/flat-at y 3)) (bit-xor (f64->bits nan) -9223372036854775808)))
+        (check c (= (t/flat-at z 2) inf))
+        (check c (!= (t/flat-at z 3) (t/flat-at z 3)))
+        (check c (= (f64->bits (t/item (t/neg (t/full [] 0.0)))) -9223372036854775808))
+        (check c (= (f32->bits (t/item (t/neg (t/full [] 0.0f32)))) -2147483648i32))
+        (check c (= (t/argmax (t/tensor [nan 1.0 2.0])) 0))
+        (check c (= (t/argmin (t/tensor [2.0 nan 1.0])) 2))
+        (check c (!= (t/maximum x) (t/maximum x)))
+        (check c (not (t/flat-at (t/equal x x) 3)))
+        (checks-result c))))

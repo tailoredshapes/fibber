@@ -1,0 +1,111 @@
+;; Public low-level descriptor with checked constructors and scalar access.
+;; Raw numerical kernels must validate every input before deriving pointers.
+(ns fib.tensor.storage (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.memory))
+
+;; A scalar witness supplies dtype and identities even for zero-element buffers.
+(defprotocol Element
+  (element-zero (self) -> Self)
+  (element-kind (self) -> keyword)
+  (element-width (self) -> i64))
+(impl Element i32 (element-zero (self) 0i32) (element-kind (self) :i32) (element-width (self) 4))
+(impl Element i64 (element-zero (self) 0) (element-kind (self) :i64) (element-width (self) 8))
+(impl Element f32 (element-zero (self) 0.0f32) (element-kind (self) :f32) (element-width (self) 4))
+(impl Element f64 (element-zero (self) 0.0) (element-kind (self) :f64) (element-width (self) 8))
+(impl Element bool (element-zero (self) false) (element-kind (self) :bool) (element-width (self) 1))
+
+(defstruct (Tensor t) (buffer: (Array t) meta: (Array i64) seed: t))
+
+(defun from-parts (buffer: (Array t) offset: i64 dims: (Vec i64) steps: (Vec i64) seed: t) :where ((Element t)) -> (Tensor t)
+  (Tensor buffer (make-meta (array-len buffer) offset dims steps) (element-zero seed)))
+
+(defun from-array (dims: (Vec i64) buffer: (Array t) seed: t) :where ((Element t)) -> (Tensor t)
+  (do (when (!= (shape-size dims) (array-len buffer)) (trap "tensor: buffer size mismatch"))
+      (from-parts buffer 0 dims (dense-strides dims) seed)))
+
+(defun shape (x: (Tensor t)) -> (Vec i64) (meta-shape (. x meta)))
+(defun dtype (x: (Tensor t)) :where ((Element t)) -> keyword (element-kind (. x seed)))
+(defun rank (x: (Tensor t)) -> i64 (meta-rank (. x meta)))
+(defun size (x: (Tensor t)) -> i64 (meta-size (. x meta)))
+(defun strides (x: (Tensor t)) -> (Vec i64) (meta-strides (. x meta)))
+(defun contiguous? (x: (Tensor t)) -> bool (dense? (. x meta)))
+
+;; Required at every raw-kernel boundary: Tensor is a forgeable public descriptor.
+(defun validate (x: (Tensor t)) -> unit
+  (check-range (array-len (. x buffer)) (array-get (. x meta) 0) (shape x) (strides x)))
+
+(defun at (x: (Tensor t) indices: (Vec i64)) -> t
+  (array-get (. x buffer) (indexed-offset (. x meta) indices)))
+
+(defun flat-at (x: (Tensor t) index: i64) -> t
+  (array-get (. x buffer) (flat-offset (. x meta) index)))
+
+(defun item (x: (Tensor t)) -> t
+  (if (= (size x) 1) (flat-at x 0) (trap "tensor: item requires one element")))
+
+;; Validate payload bytes plus the native header before Array's raw allocation.
+(defun checked-size (dims: (Vec i64) seed: t) :where ((Element t)) -> i64
+  (let ((n (shape-size dims)))
+    (do (+ (array-header-size) (* n (element-width seed))) n)))
+
+(defun full (dims: (Vec i64) value: t) :where ((Element t)) -> (Tensor t)
+  (from-array dims (array (checked-size dims value) value) value))
+
+(defun zeros (dims: (Vec i64)) -> (Tensor f64) (full dims 0.0))
+(defun ones (dims: (Vec i64)) -> (Tensor f64) (full dims 1.0))
+(defun zeros-f32 (dims: (Vec i64)) -> (Tensor f32) (full dims 0.0f32))
+(defun zeros-i32 (dims: (Vec i64)) -> (Tensor i32) (full dims 0i32))
+(defun zeros-i64 (dims: (Vec i64)) -> (Tensor i64) (full dims 0))
+
+;; The explicit seed fixes dtype and permits an empty generic Array.
+(defun from-vec (dims: (Vec i64) values: (Vec t) seed: t) :where ((Element t)) -> (Tensor t)
+  (do (when (!= (shape-size dims) (count values)) (trap "tensor: value count mismatch"))
+      (let ((buf (cell (array (checked-size dims seed) seed))))
+        (do (dotimes (i (count values)) (array-set! &buf i (nth values i)))
+            (from-array dims @buf seed)))))
+
+(defun tensor (values: (Vec f64)) -> (Tensor f64) (from-vec [(count values)] values 0.0))
+(defun tensor-i64 (values: (Vec i64)) -> (Tensor i64) (from-vec [(count values)] values 0))
+
+(defun to-vec (x: (Tensor t)) -> (Vec t)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (size x)) (recur (+ i 1) (conj out (flat-at x i))) out)))
+
+;; Copy materializes logical elements only, not an entire parent buffer.
+(defun copy (x: (Tensor t)) :where ((Element t)) -> (Tensor t)
+  (if (= (size x) 0)
+      (from-array (shape x) (array 0 (. x seed)) (. x seed))
+      (let ((buf (cell (array (checked-size (shape x) (. x seed)) (flat-at x 0)))))
+        (do (dotimes (i (size x)) (array-set! &buf i (flat-at x i)))
+            (from-array (shape x) @buf (. x seed))))))
+
+(defun contiguous (x: (Tensor t)) :where ((Element t)) -> (Tensor t)
+  (if (contiguous? x) x (copy x)))
+
+;; Export exactly the logical elements, including for an offset contiguous slice.
+(defun to-array (x: (Tensor t)) :where ((Element t)) -> (Array t)
+  (. (copy x) buffer))
+
+;; Value update: the checked primitive copies shared backing storage.
+(defun assoc (x: (Tensor t) indices: (Vec i64) value: t) :where ((Element t)) -> (Tensor t)
+  (let ((base (if (contiguous? x) x (copy x)))
+        (pos (indexed-offset (. base meta) indices)) (buf (cell (. base buffer))))
+    (do (array-set! &buf pos value) (Tensor @buf (. base meta) (. base seed)))))
+
+(defun arange (start: i64 stop: i64 step: i64) -> (Tensor i64)
+  (do (when (= step 0) (trap "tensor: arange step is zero"))
+      (let ((distance (if (> step 0) (if (< start stop) (- stop start) 0)
+                         (if (> start stop) (- start stop) 0)))
+            (width (if (> step 0) step (- 0 step)))
+            (n (+ (quot distance width) (if (= (rem distance width) 0) 0 1)))
+            (buf (cell (array (checked-size [n] start) start))))
+        (do (dotimes (i n) (array-set! &buf i (+ start (* i step))))
+            (from-array [n] @buf start)))))
+
+(defun linspace (start: f64 stop: f64 n: i64) -> (Tensor f64)
+  (do (when (< n 0) (trap "tensor: negative extent"))
+      (let ((buf (cell (array (checked-size [n] start) start))))
+        (do (when (> n 1)
+              (dotimes (i n)
+                (array-set! &buf i (if (= i (- n 1)) stop
+                                      (+ start (* (fdiv (double i) (double (- n 1))) (- stop start)))))))
+            (from-array [n] @buf start)))))

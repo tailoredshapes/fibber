@@ -1,0 +1,194 @@
+;; Ordered GEMM with configurable register/cache tiles and tiled strided packing.
+(ns fib.tensor.gemm-f32
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.memory))
+
+(defun data :private (x: (Tensor f32)) -> ptr
+  (unsafe (ptr+ (raw (. x buffer)) (+ (array-header-size) (* 4 (array-get (. x meta) 0))))))
+(defun address :private (p: ptr n: i64 row: i64 col: i64) -> ptr
+  (unsafe (ptr+ p (unchecked-multiply 4 (unchecked-add (unchecked-multiply row n) col)))))
+
+(defun pack-tile :private (ap: ptr cp: ptr n: i64 sr: i64 sc: i64 i0: i64 i1: i64 j0: i64 j1: i64) -> unit
+  (unsafe
+    (dotimes (i (- i1 i0))
+      (dotimes (j (- j1 j0))
+        (let ((row (+ i0 i)) (col (+ j0 j))
+              (p (ptr+ ap (unchecked-multiply 4 (unchecked-add (unchecked-multiply row sr) (unchecked-multiply col sc))))))
+          (store-f32 (address cp n row col) (load-f32 p)))))))
+
+(defun pack-validated :private (x: (Tensor f32)) -> (Tensor f32)
+  (if (contiguous? x) x
+      (let ((ds (shape x)) (m (nth ds 0)) (n (nth ds 1)) (steps (strides x))
+            (output (unsafe (array-uninit-f32 (checked-size ds 0.0f32))))
+            (ap (data x)) (cp (unsafe (ptr+ (raw output) (array-header-size)))))
+        (do (loop ((ii 0))
+              (when (< ii m)
+                (do (loop ((jj 0))
+                      (when (< jj n)
+                        (do (pack-tile ap cp n (nth steps 0) (nth steps 1) ii (min m (+ ii 32)) jj (min n (+ jj 32)))
+                            (recur (+ jj 32)))))
+                    (recur (+ ii 32)))))
+            (from-array ds output 0.0f32)))))
+
+(defun pack-matrix (x: (Tensor f32)) -> (Tensor f32)
+  (do (validate x) (when (!= (rank x) 2) (trap "tensor: matrix packing requires rank two")) (pack-validated x)))
+
+(defun tile4x4 :private (ap: ptr bp: ptr cp: ptr n: i64 k: i64 row: i64 col: i64 begin: i64 end: i64 bn: i64 bstart: i64) -> unit
+  (unsafe
+    (loop ((p begin)
+           (a00 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 0) (+ col 0)))))
+           (a10 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 1) (+ col 0)))))
+           (a20 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 2) (+ col 0)))))
+           (a30 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 3) (+ col 0))))))
+      (if (< p end)
+          (let ((b0 (load-f32x4 (address bp bn (unchecked-subtract p bstart) 0))))
+            (recur (+ p 1)
+                   (+ a00 (* (splat f32x4 (load-f32 (address ap k (+ row 0) p))) b0))
+                   (+ a10 (* (splat f32x4 (load-f32 (address ap k (+ row 1) p))) b0))
+                   (+ a20 (* (splat f32x4 (load-f32 (address ap k (+ row 2) p))) b0))
+                   (+ a30 (* (splat f32x4 (load-f32 (address ap k (+ row 3) p))) b0))))
+          (do
+            (store-f32x4 (address cp n (+ row 0) (+ col 0)) a00)
+            (store-f32x4 (address cp n (+ row 1) (+ col 0)) a10)
+            (store-f32x4 (address cp n (+ row 2) (+ col 0)) a20)
+            (store-f32x4 (address cp n (+ row 3) (+ col 0)) a30))))))
+
+(defun tile4x8 :private (ap: ptr bp: ptr cp: ptr n: i64 k: i64 row: i64 col: i64 begin: i64 end: i64 bn: i64 bstart: i64) -> unit
+  (unsafe
+    (loop ((p begin)
+           (a0 (if (= begin 0) (splat f32x8 0.0f32) (load-f32x8 (address cp n row col))))
+           (a1 (if (= begin 0) (splat f32x8 0.0f32) (load-f32x8 (address cp n (+ row 1) col))))
+           (a2 (if (= begin 0) (splat f32x8 0.0f32) (load-f32x8 (address cp n (+ row 2) col))))
+           (a3 (if (= begin 0) (splat f32x8 0.0f32) (load-f32x8 (address cp n (+ row 3) col)))))
+      (if (< p end)
+          (let ((b (load-f32x8 (address bp bn (unchecked-subtract p bstart) 0))))
+            (recur (+ p 1)
+                   (+ a0 (* (splat f32x8 (load-f32 (address ap k row p))) b))
+                   (+ a1 (* (splat f32x8 (load-f32 (address ap k (+ row 1) p))) b))
+                   (+ a2 (* (splat f32x8 (load-f32 (address ap k (+ row 2) p))) b))
+                   (+ a3 (* (splat f32x8 (load-f32 (address ap k (+ row 3) p))) b))))
+          (do (store-f32x8 (address cp n row col) a0)
+              (store-f32x8 (address cp n (+ row 1) col) a1)
+              (store-f32x8 (address cp n (+ row 2) col) a2)
+              (store-f32x8 (address cp n (+ row 3) col) a3))))))
+
+(defun tile8x4 :private (ap: ptr bp: ptr cp: ptr n: i64 k: i64 row: i64 col: i64 begin: i64 end: i64 bn: i64 bstart: i64) -> unit
+  (unsafe
+    (loop ((p begin)
+           (a00 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 0) (+ col 0)))))
+           (a10 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 1) (+ col 0)))))
+           (a20 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 2) (+ col 0)))))
+           (a30 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 3) (+ col 0)))))
+           (a40 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 4) (+ col 0)))))
+           (a50 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 5) (+ col 0)))))
+           (a60 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 6) (+ col 0)))))
+           (a70 (if (= begin 0) (splat f32x4 0.0f32) (load-f32x4 (address cp n (+ row 7) (+ col 0))))))
+      (if (< p end)
+          (let ((b0 (load-f32x4 (address bp bn (unchecked-subtract p bstart) 0))))
+            (recur (+ p 1)
+                   (+ a00 (* (splat f32x4 (load-f32 (address ap k (+ row 0) p))) b0))
+                   (+ a10 (* (splat f32x4 (load-f32 (address ap k (+ row 1) p))) b0))
+                   (+ a20 (* (splat f32x4 (load-f32 (address ap k (+ row 2) p))) b0))
+                   (+ a30 (* (splat f32x4 (load-f32 (address ap k (+ row 3) p))) b0))
+                   (+ a40 (* (splat f32x4 (load-f32 (address ap k (+ row 4) p))) b0))
+                   (+ a50 (* (splat f32x4 (load-f32 (address ap k (+ row 5) p))) b0))
+                   (+ a60 (* (splat f32x4 (load-f32 (address ap k (+ row 6) p))) b0))
+                   (+ a70 (* (splat f32x4 (load-f32 (address ap k (+ row 7) p))) b0))))
+          (do
+            (store-f32x4 (address cp n (+ row 0) (+ col 0)) a00)
+            (store-f32x4 (address cp n (+ row 1) (+ col 0)) a10)
+            (store-f32x4 (address cp n (+ row 2) (+ col 0)) a20)
+            (store-f32x4 (address cp n (+ row 3) (+ col 0)) a30)
+            (store-f32x4 (address cp n (+ row 4) (+ col 0)) a40)
+            (store-f32x4 (address cp n (+ row 5) (+ col 0)) a50)
+            (store-f32x4 (address cp n (+ row 6) (+ col 0)) a60)
+            (store-f32x4 (address cp n (+ row 7) (+ col 0)) a70))))))
+
+(defun tile-height :private (kind: i64) -> i64 (if (= kind 2) 8 4))
+(defun tile-width :private (kind: i64) -> i64 (if (= kind 1) 8 4))
+(defun tile :private (kind: i64 ap: ptr bp: ptr cp: ptr n: i64 k: i64 row: i64 col: i64 begin: i64 end: i64 bn: i64 bstart: i64) -> unit
+  (cond (= kind 1) (tile4x8 ap bp cp n k row col begin end bn bstart)
+        (= kind 2) (tile8x4 ap bp cp n k row col begin end bn bstart)
+        :else (tile4x4 ap bp cp n k row col begin end bn bstart)))
+
+(defun blocks :private (kind: i64 cache: i64 inner: i64 ap: ptr bp: ptr cp: ptr m: i64 n: i64 k: i64) -> unit
+  (let ((h (tile-height kind)) (w (tile-width kind)) (mr (- m (rem m h))) (nr (- n (rem n w))))
+    (loop ((jj 0))
+      (when (< jj nr)
+        (do (loop ((pp 0))
+              (when (< pp k)
+                (do (loop ((ii 0))
+                      (when (< ii mr)
+                        (do (dotimes (i (quot (- (min mr (+ ii cache)) ii) h))
+                              (dotimes (j (quot (- (min nr (+ jj cache)) jj) w))
+                                (tile kind ap (address bp 1 0 (+ jj (* j w))) cp n k (+ ii (* i h)) (+ jj (* j w)) pp (min k (+ pp inner)) n 0)))
+                            (recur (+ ii cache)))))
+                    (recur (+ pp inner)))))
+            (recur (+ jj cache)))))))
+
+(defun edge :private (ap: ptr bp: ptr cp: ptr n: i64 k: i64 row: i64 col: i64 brs: i64 bcs: i64) -> unit
+  (unsafe
+    (let ((value (loop ((p 0) (acc 0.0f32))
+                   (if (< p k)
+                       (recur (+ p 1) (+ acc (* (load-f32 (address ap k row p)) (load-f32 (address bp 1 0 (unchecked-add (unchecked-multiply p brs) (unchecked-multiply col bcs))))))) acc))))
+      (store-f32 (address cp n row col) value))))
+
+(defun edges :private (kind: i64 ap: ptr bp: ptr cp: ptr m: i64 n: i64 k: i64 brs: i64 bcs: i64) -> unit
+  (let ((mr (- m (rem m (tile-height kind)))) (nr (- n (rem n (tile-width kind)))))
+    (do (dotimes (i mr) (dotimes (j (- n nr)) (edge ap bp cp n k i (+ nr j) brs bcs)))
+        (dotimes (i (- m mr)) (dotimes (j n) (edge ap bp cp n k (+ mr i) j brs bcs))))))
+
+
+;; Copy directly from B's original strides into one reusable, fixed-pitch panel.
+(defun panel-copy :private (bp: ptr panel: ptr pitch: i64 brs: i64 bcs: i64 pp: i64 count: i64 jj: i64 cols: i64) -> unit
+  (unsafe
+    (dotimes (p count)
+      (dotimes (j cols)
+        (let ((offset (unchecked-add (unchecked-multiply (+ pp p) brs) (unchecked-multiply (+ jj j) bcs))))
+          (store-f32 (address panel pitch p j) (load-f32 (address bp 1 0 offset))))))))
+
+(defun panel-blocks :private (kind: i64 cache: i64 inner: i64 ap: ptr b: (Tensor f32) cp: ptr m: i64 n: i64 k: i64) -> unit
+  (let ((h (tile-height kind)) (w (tile-width kind)) (mr (- m (rem m h))) (nr (- n (rem n w)))
+        (bp (data b)) (bs (strides b))
+        (buffer (unsafe (array-uninit-f32 (* cache inner))))
+        (panel (unsafe (ptr+ (raw buffer) (array-header-size)))))
+    (when (and (> mr 0) (> nr 0))
+      (loop ((jj 0))
+        (when (< jj nr)
+          (do (loop ((pp 0))
+                (when (< pp k)
+                  (do (panel-copy bp panel cache (nth bs 0) (nth bs 1) pp (min inner (- k pp)) jj (min cache (- nr jj)))
+                      (loop ((ii 0))
+                        (when (< ii mr)
+                          (do (dotimes (i (quot (- (min mr (+ ii cache)) ii) h))
+                                (dotimes (j (quot (- (min nr (+ jj cache)) jj) w))
+                                  (tile kind ap (address panel 1 0 (* j w)) cp n k (+ ii (* i h)) (+ jj (* j w))
+                                        pp (min k (+ pp inner)) cache pp)))
+                              (recur (+ ii cache)))))
+                      (recur (+ pp inner)))))
+              (recur (+ jj cache))))))))
+
+;; Safe tuning interface: only supported tile/cache combinations are accepted.
+(defun multiply-mode (kind: i64 cache: i64 inner: i64 panels: bool a: (Tensor f32) b: (Tensor f32)) -> (Tensor f32)
+  (do (validate a) (validate b)
+      (when (or (< kind 0) (> kind 2)
+                (not (or (= cache 32) (= cache 64) (= cache 128)))
+                (not (or (= inner 32) (= inner 64) (= inner 128)))) (trap "tensor: invalid GEMM configuration"))
+      (when (or (!= (rank a) 2) (!= (rank b) 2)) (trap "tensor: mmul requires rank two"))
+      (let ((ad (shape a)) (bd (shape b)) (m (nth ad 0)) (k (nth ad 1)) (n (nth bd 1)))
+        (do (when (!= k (nth bd 0)) (trap "tensor: mmul inner dimension mismatch"))
+            (let ((left (pack-validated a)) (right (if panels b (pack-validated b))) (length (checked-size [m n] 0.0f32))
+                  (output (if (= k 0) (array length 0.0f32) (unsafe (array-uninit-f32 length))))
+                  (ap (data left)) (bp (data right)) (cp (unsafe (ptr+ (raw output) (array-header-size)))))
+              (do (when (> length 0)
+                    (do (if panels (panel-blocks kind cache inner ap right cp m n k) (blocks kind cache inner ap bp cp m n k))
+                        (edges kind ap bp cp m n k (nth (strides right) 0) (nth (strides right) 1))))
+                  (from-array [m n] output 0.0f32)))))))
+
+(defun multiply-config (kind: i64 cache: i64 inner: i64 a: (Tensor f32) b: (Tensor f32)) -> (Tensor f32)
+  (multiply-mode kind cache inner false a b))
+
+(defun multiply (a: (Tensor f32) b: (Tensor f32)) -> (Tensor f32)
+  (let ((kind (if (and (= (rank b) 2) (>= (nth (shape b) 1) 32)) 1 0))
+        (panels (and (= (rank a) 2) (= (rank b) 2) (>= (nth (shape a) 0) 256)
+                     (>= (nth (shape a) 1) 128) (>= (nth (shape b) 1) 128))))
+    (multiply-mode kind 64 128 panels a b)))

@@ -1,0 +1,251 @@
+;; Complete writes into fresh scalar-only output buffers. Raw helpers are private.
+(ns fib.tensor.kernel-f32
+  (:use fib.core fib.seq fib.coll fib.tensor.storage fib.tensor.views fib.tensor.layout fib.tensor.plan fib.tensor.memory))
+
+(defun data :private (x: (Tensor f32)) -> ptr
+  (unsafe (ptr+ (raw (. x buffer)) (+ (array-header-size) (* 4 (array-get (. x meta) 0))))))
+(defun address :private (p: ptr step: i64 i: i64) -> ptr
+  (unsafe (ptr+ p (unchecked-multiply 4 (unchecked-multiply step i)))))
+
+(defun block :private (p: ptr step: i64 i: i64 scalar: f32) -> f32x8
+  (unsafe
+    (cond (= step 0) (splat f32x8 scalar)
+          (= step 1) (load-f32x8 (address p step i))
+          :else <<(load-f32 (address p step i)) (load-f32 (address p step (+ i 1)))
+                  (load-f32 (address p step (+ i 2))) (load-f32 (address p step (+ i 3)))
+                  (load-f32 (address p step (+ i 4))) (load-f32 (address p step (+ i 5)))
+                  (load-f32 (address p step (+ i 6))) (load-f32 (address p step (+ i 7)))>>)))
+
+(defun block4 :private (p: ptr step: i64 i: i64 scalar: f32) -> f32x4
+  (unsafe
+    (cond (= step 0) (splat f32x4 scalar) (= step 1) (load-f32x4 (address p step i))
+          :else <<(load-f32 (address p step i)) (load-f32 (address p step (+ i 1)))
+                  (load-f32 (address p step (+ i 2))) (load-f32 (address p step (+ i 3)))>>)))
+
+(defun row-add :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f32x8 (address cp 1 i) (+ a b)) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (+ a b))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (+ a b)) (recur (+ i 1))))))))))
+
+(defun row-sub :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f32x8 (address cp 1 i) (- a b)) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (- a b))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (- a b)) (recur (+ i 1))))))))))
+
+(defun row-mul :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f32x8 (address cp 1 i) (* a b)) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (* a b))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (* a b)) (recur (+ i 1))))))))))
+
+(defun row-div :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f32x8 (address cp 1 i) (fdiv a b)) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (fdiv a b))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (fdiv a b)) (recur (+ i 1))))))))))
+
+(defun row-affine :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f32x8 (address cp 1 i) (+ (* alphav a) (* betav b))) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (+ (* (splat f32x4 alpha) a) (* (splat f32x4 beta) b)))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (+ (* alpha a) (* beta b))) (recur (+ i 1))))))))))
+
+(defun row :private (op: i64 alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (cond (= op 0) (row-add alpha beta ap bp cp n ls rs)
+        (= op 1) (row-sub alpha beta ap bp cp n ls rs)
+        (= op 2) (row-mul alpha beta ap bp cp n ls rs)
+        (= op 3) (row-div alpha beta ap bp cp n ls rs)
+        :else (row-affine alpha beta ap bp cp n ls rs)))
+
+(defun flat-add :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f32x8 av) (load-f32x8 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f32x8 bv) (load-f32x8 (address bp 1 i)))))
+                (do (store-f32x8 (address cp 1 i) (+ a b)) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (+ a b))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (+ a b)) (recur (+ i 1))))))))))
+
+(defun flat-sub :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f32x8 av) (load-f32x8 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f32x8 bv) (load-f32x8 (address bp 1 i)))))
+                (do (store-f32x8 (address cp 1 i) (- a b)) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (- a b))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (- a b)) (recur (+ i 1))))))))))
+
+(defun flat-mul :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f32x8 av) (load-f32x8 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f32x8 bv) (load-f32x8 (address bp 1 i)))))
+                (do (store-f32x8 (address cp 1 i) (* a b)) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (* a b))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (* a b)) (recur (+ i 1))))))))))
+
+(defun flat-div :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f32x8 av) (load-f32x8 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f32x8 bv) (load-f32x8 (address bp 1 i)))))
+                (do (store-f32x8 (address cp 1 i) (fdiv a b)) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (fdiv a b))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (fdiv a b)) (recur (+ i 1))))))))))
+
+(defun flat-affine :private (alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 8))) (four (- n (rem n 4))) (av (if (= ls 0) (load-f32 ap) 0.0f32))
+          (bv (if (= rs 0) (load-f32 bp) 0.0f32))
+          (alphav (splat f32x8 alpha)) (betav (splat f32x8 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f32x8 av) (load-f32x8 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f32x8 bv) (load-f32x8 (address bp 1 i)))))
+                (do (store-f32x8 (address cp 1 i) (+ (* alphav a) (* betav b))) (recur (+ i 8))))))
+          (when (< end four)
+            (let ((a (block4 ap ls end av)) (b (block4 bp rs end bv)))
+              (store-f32x4 (address cp 1 end) (+ (* (splat f32x4 alpha) a) (* (splat f32x4 beta) b)))))
+          (loop ((i four))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f32 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f32 (address bp rs i)))))
+                (do (store-f32 (address cp 1 i) (+ (* alpha a) (* beta b))) (recur (+ i 1))))))))))
+
+(defun flat :private (op: i64 alpha: f32 beta: f32 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (cond (= op 0) (flat-add alpha beta ap bp cp n ls rs)
+        (= op 1) (flat-sub alpha beta ap bp cp n ls rs)
+        (= op 2) (flat-mul alpha beta ap bp cp n ls rs)
+        (= op 3) (flat-div alpha beta ap bp cp n ls rs)
+        :else (flat-affine alpha beta ap bp cp n ls rs)))
+
+(defun flat-input? :private (dims: (Vec i64) original: (Vec i64) x: (Tensor f32)) -> bool
+  (or (= (fib.tensor.storage/size x) 1) (and (= dims original) (contiguous? x))))
+
+(defun planned :private (op: i64 alpha: f32 beta: f32 dims: (Vec i64)
+                        a: (Tensor f32) b: (Tensor f32) output: (Array f32)) -> unit
+  (let ((left (broadcast-to dims a)) (right (broadcast-to dims b))
+        (plan (traversal dims (strides left) (strides right))) (inner (inner-length plan))
+        (ap (data left)) (bp (data right)) (cp (unsafe (ptr+ (raw output) (array-header-size)))))
+    (dotimes (r (rows plan))
+      (row op alpha beta (address ap 1 (row-offset plan (. plan left) r))
+                          (address bp 1 (row-offset plan (. plan right) r))
+                          (address cp 1 (* r inner)) inner (left-step plan) (right-step plan)))))
+
+(defun compute (op: i64 alpha: f32 beta: f32 a: (Tensor f32) b: (Tensor f32)) -> (Tensor f32)
+  (do (validate a) (validate b)
+      (let ((ad (shape a)) (bd (shape b)) (dims (broadcast-shape ad bd)) (n (checked-size dims 0.0f32))
+            (output (unsafe (array-uninit-f32 n))))
+        (do (when (> n 0)
+              (if (and (flat-input? dims ad a) (flat-input? dims bd b))
+                  (flat op alpha beta (data a) (data b) (unsafe (ptr+ (raw output) (array-header-size))) n
+                       (if (= (fib.tensor.storage/size a) 1) 0 1) (if (= (fib.tensor.storage/size b) 1) 0 1))
+                  (planned op alpha beta dims a b output)))
+            (from-array dims output 0.0f32)))))

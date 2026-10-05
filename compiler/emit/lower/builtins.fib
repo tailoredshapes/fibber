@@ -130,11 +130,11 @@
 (defstruct Arr (tid: i64 sname: str elem: Ty unit: bool el: LirTy esize: i64 counted: bool))
 
 (defun array-name? :private (name: str) -> bool
-  (one-of? name ["array" "array-len" "array-get" "array-with" "array-copy" "array-set!" "array-take!" "array-push!" "array-pop!"]))
+  (one-of? name ["array-uninit-f32" "array-uninit-f64" "array" "array-len" "array-get" "array-with" "array-copy" "array-set!" "array-take!" "array-push!" "array-pop!"]))
 
 ;; The array type the builtin works on: the result's for the makers, the cell's content for `array-set!`, else the argument's.
 (defun array-ty-of :private (cx: LowerCx name: str e: Expr tys: (Vec Ty)) -> (Result Ty str)
-  (cond (one-of? name ["array" "array-copy" "array-with"]) (lcx-ty cx e)
+  (cond (one-of? name ["array-uninit-f32" "array-uninit-f64" "array" "array-copy" "array-with"]) (lcx-ty cx e)
         (one-of? name ["array-set!" "array-take!" "array-push!" "array-pop!"])
         (match (nth tys 0)
           ((TCon (KCell) args) (Ok (nth args 0)))
@@ -324,9 +324,22 @@
             (let ((old (lcx-load cx (. r el) ep)))
               (do (lcx-store cx (nth a 2) ep) (lcx-release cx old) (Ok res))))))))
 
+(defun array-uninit :private (cx: LowerCx r: Arr n: V) -> V
+  (let ((b (. cx b)) (ok (fb-label b "uninit-ok")) (bad (fb-label b "uninit-size"))
+        (limit (quot (- 9223372036854775807 24) (. r esize)))
+        (valid (fb-val b (str-join ["(icmp ule " (v-text n) " (i64 " (str limit) "))"]) LirI1)))
+    (do (fb-term b (str-join ["(br " (v-text valid) " " ok " " bad ")"]))
+        (fb-open b bad)
+        (fb-stmt b "(call @fib.trap-c (string \"array-uninit: invalid length\"))")
+        (fb-term b "(unreachable)")
+        (fb-open b ok)
+        (fb-val b (str-join ["(call @fib.array-alloc " (v-text n) " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr))))
+
 (defun builtin-array :private (cx: LowerCx name: str e: Expr a: (Vec V) tys: (Vec Ty)) -> (Result V str)
   (try-let ((r (arr-info cx name e tys)))
     (match name
+      ("array-uninit-f32" (Ok (array-uninit cx r (nth a 0))))
+      ("array-uninit-f64" (Ok (array-uninit cx r (nth a 0))))
       ("array" (let ((n (nth a 0))
                      (p (fb-val (. cx b) (str-join ["(call @fib.array-alloc " (v-text n) " (i32 " (str (. r tid)) ") (i64 " (str (. r esize)) "))"]) LirPtr)))
                  (do (array-fill cx r p n (nth a 1)) (Ok p))))
@@ -414,6 +427,8 @@
 (defun load-ty :private (name: str) -> (Option LirTy)
   (match name
     ("load-i8" (some LirI8)) ("load-i16" (some LirI16)) ("load-i32" (some LirI32)) ("load-i64" (some LirI64)) ("load-ptr" (some LirRaw))
+    ("load-f32" (some LirFloat)) ("load-f64" (some LirDouble))
+    ("load-f32x8" (some (LirVec LirFloat 8))) ("load-f32x4" (some (LirVec LirFloat 4))) ("load-f64x4" (some (LirVec LirDouble 4)))
     (_ nil)))
 
 ;; syntax §3.15: the block is zeroed, as the interpreter's is, and one that cannot be had is the trap `out of memory`, as the
@@ -431,9 +446,15 @@
           (match (lcx-obj-word cx v)
             ((some w) (Ok (VVal w LirRaw)))
             (nil (Err "raw of a scalar"))))
+        (one-of? name ["store-f32x8" "store-f32" "store-f64" "store-f32x4" "store-f64x4"])
+        (try-let ((p (arg name a 0)) (v (arg name a 1)))
+          (do (fb-stmt (. cx b) (str-join ["(store (align 1) " (v-text v) " " (v-text p) ")"])) (Ok VUnit)))
         (one-of? name ["store-i8" "store-i16" "store-i32" "store-i64" "store-ptr"])
         (try-let ((p (arg name a 0)) (v (arg name a 1)))
           (do (lcx-store cx v (v-text p)) (Ok VUnit)))
         :else (if-some [t (load-ty name)]
-                (try-let ((p (arg name a 0))) (Ok (lcx-load cx t (v-text p))))
+                (try-let ((p (arg name a 0)))
+                  (if (one-of? name ["load-f32x8" "load-f32" "load-f64" "load-f32x4" "load-f64x4"])
+                      (Ok (fb-val (. cx b) (str-join ["(load (align 1) " (lir-ty-text t) " " (v-text p) ")"]) t))
+                      (Ok (lcx-load cx t (v-text p)))))
                 (Err (str-join ["builtin " name])))))

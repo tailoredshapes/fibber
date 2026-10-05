@@ -1,0 +1,27 @@
+;; spec: docs/design/numerical-library.md; unrolled reductions, every tail and arbitrary strides
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (dotimes (n 97)
+          (let ((a (t/map-as (fn (v: i64) (double v)) 0.0 (t/arange 0 n 1)))
+                (b (t/scale 0.25 a)) (x (t/map-as (fn (v: f64) (float v)) 0.0f32 b)))
+            (do (check c (= (t/sum-fast b) (t/sum b)))
+                (check c (= (t/sum-fast x) (t/sum x)))
+                (check c (= (t/dot-fast b b) (t/dot b b)))
+                (check c (= (t/dot-fast x (t/flip 0 x)) (t/dot x (t/flip 0 x))))
+                (check c (= (t/dot-fast (t/broadcast-to [n] (t/full [] 2.0)) b) (t/sum (t/scale 2.0 b))))
+                (check c (= (t/sum-fast (t/flip 0 b)) (t/sum b))))))
+        (let ((cube (t/reshape [3 5 7] (t/map-as (fn (v: i64) (double (- v 52))) 0.0 (t/arange 0 105 1)))))
+          (do (check c (= (t/sum-fast (t/permute [2 0 1] cube)) (t/sum cube)))
+              (check c (= (t/sum-fast (t/flip 1 (t/transpose cube))) (t/sum cube)))
+              (check c (= (t/sum-fast (t/slice 2 0 7 2 cube)) (t/sum (t/slice 2 0 7 2 cube))))))
+        (let ((a (t/tensor [10000000000000000.0 1.0 -10000000000000000.0 1.0])))
+          (do (check c (= (t/sum a) 1.0))
+              (check c (= (t/sum-fast a) 2.0))))
+        (checks-result c))))

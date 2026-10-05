@@ -1,0 +1,40 @@
+;; Port of tsmarsh/sudoku (743e4640), originally adapting David Nolen's solver.
+;; EPL-1.0 for this example; see examples/sudoku/LICENSE and README.md.
+(ns sudoku.solver (:use fib.core fib.seq fib.coll)
+  (:require [fib.logic :as l] [fib.logic.fd :as fd]))
+
+(defun groups () -> (Vec (Vec i64))
+  (let ((rows (mapv (fn (r: i64) (mapv (fn (c: i64) (+ (* r 9) c)) (range 9))) (range 9)))
+        (cols (mapv (fn (c: i64) (mapv (fn (r: i64) (+ (* r 9) c)) (range 9))) (range 9)))
+        (boxes (mapv (fn (b: i64) (mapv (fn (i: i64)
+                 (+ (* (+ (* (quot b 3) 3) (quot i 3)) 9) (* (rem b 3) 3) (rem i 3))) (range 9))) (range 9))))
+    (into (into rows cols) boxes)))
+(defun validate-hints (hints: (Vec i64)) -> unit
+  (do (when (!= (count hints) 81) (trap "sudoku: expected 81 cells"))
+      (dotimes (i 81) (when (or (< (nth hints i) 0) (> (nth hints i) 9)) (trap "sudoku: cell outside 0..9")))))
+(defun model (hints: (Vec i64) variables: (Vec l/Term)) -> l/Goal
+  (let ((clues (loop ((i 0) (out: (Vec l/Goal) [(fd/in-all variables (fd/interval 1 9))]))
+                 (if (< i 81)
+                     (recur (+ i 1) (if (= (nth hints i) 0) out (conj out (l/== (nth variables i) (l/integer (nth hints i)))))) out)))
+        (units (groups)))
+    (l/all (loop ((i 0) (out clues))
+       (if (< i 27) (recur (+ i 1) (conj out (fd/distinct (mapv (fn (index: i64) (nth variables index)) (nth units i))))) out)))))
+(defun integer-value :private (term: l/Term) -> i64
+  (match term ((l/Integer n) n) (_ (trap "sudoku: incomplete solution"))))
+(defun sudokufd (hints: (Vec i64)) -> (Vec (Vec i64))
+  (do (validate-hints hints)
+      (mapv (fn (terms: (Vec l/Term)) (mapv integer-value terms))
+            (l/run-many 1 81 (fn (variables) (model hints variables))))))
+(defun valid-solution? (hints: (Vec i64) solution: (Vec i64)) -> bool
+  (and (= (count hints) 81) (= (count solution) 81)
+       (every? (fn (i: i64) (and (>= (nth solution i) 1) (<= (nth solution i) 9)
+                    (or (= (nth hints i) 0) (= (nth hints i) (nth solution i))))) (range 81))
+       (every? (fn (unit: (Vec i64)) (= (count (set (mapv (fn (i: i64) (nth solution i)) unit))) 9)) (groups))))
+(defun parse-hints (text: str) -> (Vec i64)
+  (let ((cells (loop ((i 0) (out: (Vec i64) []))
+                 (if (= i (str-len text)) out
+                     (let ((c (long (str-byte-at text i))))
+                       (cond (and (>= c 48) (<= c 57)) (recur (+ i 1) (conj out (- c 48)))
+                             (or (= c 32) (= c 9) (= c 10) (= c 13)) (recur (+ i 1) out)
+                             :else (trap "sudoku: expected digits or whitespace")))))))
+    (do (validate-hints cells) cells)))

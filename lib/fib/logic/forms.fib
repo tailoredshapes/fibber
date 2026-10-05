@@ -1,0 +1,26 @@
+;; Syntax over the tested functional core; templates use qualified facade names.
+(ns fib.logic.forms)
+
+(defmacro conde (... clauses)
+  (loop ((i 0) (goals (vec-empty)))
+    (if (< i (vec-count clauses))
+        (let ((items (match (vec-nth clauses i)
+                       ((Vec xs) xs) ((List xs) xs)
+                       (_ (trap "conde: each clause is a vector or list of goals")))))
+          (recur (+ i 1) (vec-conj goals `(fib.logic/all [~@items]))))
+        `(fib.logic/any [~@goals]))))
+
+(defmacro fresh (variables ... goals)
+  (let ((names (match variables
+                 ((Vec xs) xs) ((List xs) xs)
+                 (_ (trap "fresh: variable names must be a vector or list")))))
+    (loop ((i (vec-count names)) (body `(fib.logic/all [~@goals])))
+      (if (> i 0)
+          (let ((name (vec-nth names (- i 1))))
+            (match name
+              ((Sym _) (recur (- i 1) `(fib.logic/call-fresh (fn (~name) ~body))))
+              (_ (trap "fresh: each variable must be a symbol"))))
+          body))))
+
+(defmacro zzz (goal)
+  `(fib.logic/delay-goal (fn () ~goal)))

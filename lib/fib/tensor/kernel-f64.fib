@@ -1,0 +1,213 @@
+;; Complete writes into fresh scalar-only output buffers. Raw helpers are private.
+(ns fib.tensor.kernel-f64
+  (:use fib.core fib.seq fib.coll fib.tensor.storage fib.tensor.views fib.tensor.layout fib.tensor.plan fib.tensor.memory))
+
+(defun data :private (x: (Tensor f64)) -> ptr
+  (unsafe (ptr+ (raw (. x buffer)) (+ (array-header-size) (* 8 (array-get (. x meta) 0))))))
+(defun address :private (p: ptr step: i64 i: i64) -> ptr
+  (unsafe (ptr+ p (unchecked-multiply 8 (unchecked-multiply step i)))))
+
+(defun block :private (p: ptr step: i64 i: i64 scalar: f64) -> f64x4
+  (unsafe
+    (cond (= step 0) (splat f64x4 scalar)
+          (= step 1) (load-f64x4 (address p step i))
+          :else <<(load-f64 (address p step i)) (load-f64 (address p step (+ i 1)))
+                  (load-f64 (address p step (+ i 2))) (load-f64 (address p step (+ i 3)))>>)))
+
+(defun row-add :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f64x4 (address cp 1 i) (+ a b)) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (+ a b)) (recur (+ i 1))))))))))
+
+(defun row-sub :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f64x4 (address cp 1 i) (- a b)) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (- a b)) (recur (+ i 1))))))))))
+
+(defun row-mul :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f64x4 (address cp 1 i) (* a b)) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (* a b)) (recur (+ i 1))))))))))
+
+(defun row-div :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f64x4 (address cp 1 i) (fdiv a b)) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (fdiv a b)) (recur (+ i 1))))))))))
+
+(defun row-affine :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (block ap ls i av))
+                    (b (block bp rs i bv)))
+                (do (store-f64x4 (address cp 1 i) (+ (* alphav a) (* betav b))) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (+ (* alpha a) (* beta b))) (recur (+ i 1))))))))))
+
+(defun row :private (op: i64 alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (cond (= op 0) (row-add alpha beta ap bp cp n ls rs)
+        (= op 1) (row-sub alpha beta ap bp cp n ls rs)
+        (= op 2) (row-mul alpha beta ap bp cp n ls rs)
+        (= op 3) (row-div alpha beta ap bp cp n ls rs)
+        :else (row-affine alpha beta ap bp cp n ls rs)))
+
+(defun flat-add :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f64x4 av) (load-f64x4 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f64x4 bv) (load-f64x4 (address bp 1 i)))))
+                (do (store-f64x4 (address cp 1 i) (+ a b)) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (+ a b)) (recur (+ i 1))))))))))
+
+(defun flat-sub :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f64x4 av) (load-f64x4 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f64x4 bv) (load-f64x4 (address bp 1 i)))))
+                (do (store-f64x4 (address cp 1 i) (- a b)) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (- a b)) (recur (+ i 1))))))))))
+
+(defun flat-mul :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f64x4 av) (load-f64x4 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f64x4 bv) (load-f64x4 (address bp 1 i)))))
+                (do (store-f64x4 (address cp 1 i) (* a b)) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (* a b)) (recur (+ i 1))))))))))
+
+(defun flat-div :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f64x4 av) (load-f64x4 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f64x4 bv) (load-f64x4 (address bp 1 i)))))
+                (do (store-f64x4 (address cp 1 i) (fdiv a b)) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (fdiv a b)) (recur (+ i 1))))))))))
+
+(defun flat-affine :private (alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (unsafe
+    (let ((end (- n (rem n 4))) (av (if (= ls 0) (load-f64 ap) 0.0))
+          (bv (if (= rs 0) (load-f64 bp) 0.0))
+          (alphav (splat f64x4 alpha)) (betav (splat f64x4 beta)))
+      (do (loop ((i 0))
+            (when (< i end)
+              (let ((a (if (= ls 0) (splat f64x4 av) (load-f64x4 (address ap 1 i))))
+                    (b (if (= rs 0) (splat f64x4 bv) (load-f64x4 (address bp 1 i)))))
+                (do (store-f64x4 (address cp 1 i) (+ (* alphav a) (* betav b))) (recur (+ i 4))))))
+          (loop ((i end))
+            (when (< i n)
+              (let ((a (if (= ls 0) av (load-f64 (address ap ls i))))
+                    (b (if (= rs 0) bv (load-f64 (address bp rs i)))))
+                (do (store-f64 (address cp 1 i) (+ (* alpha a) (* beta b))) (recur (+ i 1))))))))))
+
+(defun flat :private (op: i64 alpha: f64 beta: f64 ap: ptr bp: ptr cp: ptr n: i64 ls: i64 rs: i64) -> unit
+  (cond (= op 0) (flat-add alpha beta ap bp cp n ls rs)
+        (= op 1) (flat-sub alpha beta ap bp cp n ls rs)
+        (= op 2) (flat-mul alpha beta ap bp cp n ls rs)
+        (= op 3) (flat-div alpha beta ap bp cp n ls rs)
+        :else (flat-affine alpha beta ap bp cp n ls rs)))
+
+(defun flat-input? :private (dims: (Vec i64) original: (Vec i64) x: (Tensor f64)) -> bool
+  (or (= (fib.tensor.storage/size x) 1) (and (= dims original) (contiguous? x))))
+
+(defun planned :private (op: i64 alpha: f64 beta: f64 dims: (Vec i64)
+                        a: (Tensor f64) b: (Tensor f64) output: (Array f64)) -> unit
+  (let ((left (broadcast-to dims a)) (right (broadcast-to dims b))
+        (plan (traversal dims (strides left) (strides right))) (inner (inner-length plan))
+        (ap (data left)) (bp (data right)) (cp (unsafe (ptr+ (raw output) (array-header-size)))))
+    (dotimes (r (rows plan))
+      (row op alpha beta (address ap 1 (row-offset plan (. plan left) r))
+                          (address bp 1 (row-offset plan (. plan right) r))
+                          (address cp 1 (* r inner)) inner (left-step plan) (right-step plan)))))
+
+(defun compute (op: i64 alpha: f64 beta: f64 a: (Tensor f64) b: (Tensor f64)) -> (Tensor f64)
+  (do (validate a) (validate b)
+      (let ((ad (shape a)) (bd (shape b)) (dims (broadcast-shape ad bd)) (n (checked-size dims 0.0))
+            (output (unsafe (array-uninit-f64 n))))
+        (do (when (> n 0)
+              (if (and (flat-input? dims ad a) (flat-input? dims bd b))
+                  (flat op alpha beta (data a) (data b) (unsafe (ptr+ (raw output) (array-header-size))) n
+                       (if (= (fib.tensor.storage/size a) 1) 0 1) (if (= (fib.tensor.storage/size b) 1) 0 1))
+                  (planned op alpha beta dims a b output)))
+            (from-array dims output 0.0)))))

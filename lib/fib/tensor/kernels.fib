@@ -1,0 +1,44 @@
+;; Numeric dispatch; pure traversal plans remove per-element coordinate decoding.
+(ns fib.tensor.kernels
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views fib.tensor.plan)
+  (:require [fib.tensor.kernel-f32 :as k32] [fib.tensor.kernel-f64 :as k64]))
+
+(defun scalar-number-op :private (op: i64 alpha: t beta: t a: t b: t) :where ((Num t)) -> t
+  (cond (= op 0) (+ a b) (= op 1) (- a b) (= op 2) (* a b) :else (+ (* alpha a) (* beta b))))
+
+(defun binary-integer :private (op: i64 alpha: t beta: t a: (Tensor t) b: (Tensor t))
+  :where ((Element t) (Num t)) -> (Tensor t)
+  (do (validate a) (validate b)
+      (let ((dims (broadcast-shape (shape a) (shape b))) (left (broadcast-to dims a)) (right (broadcast-to dims b))
+            (plan (traversal dims (strides left) (strides right))) (inner (inner-length plan))
+            (n (checked-size dims (. a seed))) (buf (cell (array n (. a seed))))
+            (ao (array-get (. left meta) 0)) (bo (array-get (. right meta) 0)))
+        (do (dotimes (r (rows plan))
+              (let ((abase (+ ao (row-offset plan (. plan left) r))) (bbase (+ bo (row-offset plan (. plan right) r))))
+                (dotimes (i inner)
+                  (array-set! &buf (+ (* r inner) i)
+                    (scalar-number-op op alpha beta
+                      (array-get (. left buffer) (+ abase (* i (left-step plan))))
+                      (array-get (. right buffer) (+ bbase (* i (right-step plan)))))))))
+            (from-array dims @buf (. a seed))))))
+
+(defprotocol Arithmetic
+  (binary (self op: i64 a: (Tensor Self) b: (Tensor Self)) -> (Tensor Self)))
+(impl Arithmetic i32 (binary (self op a b) (binary-integer op 0i32 0i32 a b)))
+(impl Arithmetic i64 (binary (self op a b) (binary-integer op 0 0 a b)))
+(impl Arithmetic f32 (binary (self op a b) (k32/compute op 0.0f32 0.0f32 a b)))
+(impl Arithmetic f64 (binary (self op a b) (k64/compute op 0.0 0.0 a b)))
+
+(defprotocol Division
+  (divide (self a: (Tensor Self) b: (Tensor Self)) -> (Tensor Self)))
+(impl Division f32 (divide (self a b) (k32/compute 3 0.0f32 0.0f32 a b)))
+(impl Division f64 (divide (self a b) (k64/compute 3 0.0 0.0 a b)))
+
+(defprotocol Affine
+  (affine (self alpha: Self a: (Tensor Self) beta: Self b: (Tensor Self)) -> (Tensor Self)))
+(impl Affine i32 (affine (self alpha a beta b) (binary-integer 4 alpha beta a b)))
+(impl Affine i64 (affine (self alpha a beta b) (binary-integer 4 alpha beta a b)))
+(impl Affine f32 (affine (self alpha a beta b) (k32/compute 4 alpha beta a b)))
+(impl Affine f64 (affine (self alpha a beta b) (k64/compute 4 alpha beta a b)))
+
+(defun negate-value (value: t) :where ((Num t)) -> t (neg value))

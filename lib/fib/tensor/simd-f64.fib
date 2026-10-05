@@ -1,0 +1,97 @@
+;; Validated native reductions. Four independent accumulators hide addition latency.
+(ns fib.tensor.simd-f64
+  (:use fib.core fib.simd fib.seq fib.tensor.storage fib.tensor.memory fib.tensor.plan))
+
+(defun data :private (x: (Tensor f64)) -> ptr
+  (unsafe (ptr+ (raw (. x buffer)) (+ (array-header-size) (* 8 (array-get (. x meta) 0))))))
+
+(defun address :private (p: ptr step: i64 i: i64) -> ptr
+  (unsafe (ptr+ p (unchecked-multiply 8 (unchecked-multiply step i)))))
+
+(defun gather :private (p: ptr step: i64 i: i64) -> f64x4
+  (unsafe
+    (cond (= step 1) (load-f64x4 (address p step i))
+          (= step 0) (splat f64x4 (load-f64 p))
+          :else <<(load-f64 (address p step i)) (load-f64 (address p step (+ i 1)))
+                  (load-f64 (address p step (+ i 2))) (load-f64 (address p step (+ i 3)))>>)))
+
+(defun dense-sum :private (p: ptr n: i64) -> f64
+  (unsafe
+    (let ((end (- n (rem n 16)))
+          (lanes (loop ((i 0) (a (splat f64x4 0.0)) (b (splat f64x4 0.0))
+                        (c (splat f64x4 0.0)) (d (splat f64x4 0.0)))
+                   (if (< i end)
+                       (recur (+ i 16) (+ a (load-f64x4 (address p 1 i)))
+                              (+ b (load-f64x4 (address p 1 (+ i 4))))
+                              (+ c (load-f64x4 (address p 1 (+ i 8))))
+                              (+ d (load-f64x4 (address p 1 (+ i 12))))) (+ (+ a b) (+ c d)))))
+          (packed (- n (rem n 4)))
+          (rest (loop ((i end) (acc lanes))
+                  (if (< i packed) (recur (+ i 4) (+ acc (load-f64x4 (address p 1 i)))) acc))))
+      (loop ((i packed) (acc (hsum rest)))
+        (if (< i n) (recur (+ i 1) (+ acc (load-f64 (address p 1 i)))) acc)))))
+
+(defun strided-row-sum :private (p: ptr step: i64 n: i64) -> f64
+  (unsafe
+    (let ((end (- n (rem n 4)))
+          (lanes (loop ((i 0) (acc (splat f64x4 0.0)))
+                   (if (< i end) (recur (+ i 4) (+ acc (gather p step i))) acc))))
+      (loop ((i end) (acc (hsum lanes)))
+        (if (< i n) (recur (+ i 1) (+ acc (load-f64 (address p step i)))) acc)))))
+
+(defun strided-sum :private (x: (Tensor f64)) -> f64
+  (let ((steps (strides x)) (plan (traversal (shape x) steps steps))
+        (n (inner-length plan)) (step (left-step plan)) (p (data x)))
+    (loop ((row 0) (acc 0.0))
+      (if (< row (rows plan))
+          (let ((rp (address p 1 (row-offset plan (. plan left) row))))
+            (recur (+ row 1) (+ acc (if (= step 1) (dense-sum rp n) (strided-row-sum rp step n))))) acc))))
+
+(defun sum-packed (x: (Tensor f64)) -> f64
+  (do (validate x)
+      (if (contiguous? x) (dense-sum (data x) (fib.tensor.storage/size x)) (strided-sum x))))
+
+(defun dense-dot :private (ap: ptr bp: ptr n: i64) -> f64
+  (unsafe
+    (let ((end (- n (rem n 16)))
+          (lanes (loop ((i 0) (a (splat f64x4 0.0)) (b (splat f64x4 0.0))
+                        (c (splat f64x4 0.0)) (d (splat f64x4 0.0)))
+                   (if (< i end)
+                       (recur (+ i 16)
+                              (+ a (* (load-f64x4 (address ap 1 i)) (load-f64x4 (address bp 1 i))))
+                              (+ b (* (load-f64x4 (address ap 1 (+ i 4))) (load-f64x4 (address bp 1 (+ i 4)))))
+                              (+ c (* (load-f64x4 (address ap 1 (+ i 8))) (load-f64x4 (address bp 1 (+ i 8)))))
+                              (+ d (* (load-f64x4 (address ap 1 (+ i 12))) (load-f64x4 (address bp 1 (+ i 12))))))
+                       (+ (+ a b) (+ c d)))))
+          (packed (- n (rem n 4)))
+          (rest (loop ((i end) (acc lanes))
+                  (if (< i packed) (recur (+ i 4) (+ acc (* (load-f64x4 (address ap 1 i)) (load-f64x4 (address bp 1 i))))) acc))))
+      (loop ((i packed) (acc (hsum rest)))
+        (if (< i n) (recur (+ i 1) (+ acc (* (load-f64 (address ap 1 i))
+                                          (load-f64 (address bp 1 i))))) acc)))))
+
+(defun strided-dot :private (ap: ptr bp: ptr n: i64 astep: i64 bstep: i64) -> f64
+  (unsafe
+    (let ((end (- n (rem n 16)))
+          (lanes (loop ((i 0) (a (splat f64x4 0.0)) (b (splat f64x4 0.0))
+                        (c (splat f64x4 0.0)) (d (splat f64x4 0.0)))
+                   (if (< i end)
+                       (recur (+ i 16)
+                              (+ a (* (gather ap astep i) (gather bp bstep i)))
+                              (+ b (* (gather ap astep (+ i 4)) (gather bp bstep (+ i 4))))
+                              (+ c (* (gather ap astep (+ i 8)) (gather bp bstep (+ i 8))))
+                              (+ d (* (gather ap astep (+ i 12)) (gather bp bstep (+ i 12)))))
+                       (+ (+ a b) (+ c d)))))
+          (packed (- n (rem n 4)))
+          (rest (loop ((i end) (acc lanes))
+                  (if (< i packed) (recur (+ i 4) (+ acc (* (gather ap astep i) (gather bp bstep i)))) acc))))
+      (loop ((i packed) (acc (hsum rest)))
+        (if (< i n) (recur (+ i 1) (+ acc (* (load-f64 (address ap astep i))
+                                          (load-f64 (address bp bstep i))))) acc)))))
+
+(defun dot-packed (a: (Tensor f64) b: (Tensor f64)) -> f64
+  (do (validate a) (validate b)
+      (when (or (!= (rank a) 1) (!= (rank b) 1)) (trap "tensor: dot requires rank one"))
+      (when (!= (fib.tensor.storage/size a) (fib.tensor.storage/size b)) (trap "tensor: dot size mismatch"))
+      (if (and (contiguous? a) (contiguous? b)) (dense-dot (data a) (data b) (fib.tensor.storage/size a))
+          (strided-dot (data a) (data b) (fib.tensor.storage/size a) (nth (strides a) 0) (nth (strides b) 0)))))

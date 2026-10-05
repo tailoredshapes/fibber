@@ -1,0 +1,30 @@
+;; spec: docs/design/numerical-library.md; planned traversal and fused arithmetic match scalar callbacks
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun compare (c: Checks :borrow a: (t/Tensor f64) b: (t/Tensor f64)) -> unit
+  (do (check c (= (t/to-vec (t/add a b)) (t/to-vec (t/zip-with (fn (x: f64 y: f64) (+ x y)) 0.0 a b))))
+      (check c (= (t/to-vec (t/axpby 2.0 a -0.25 b))
+                  (t/to-vec (t/zip-with (fn (x: f64 y: f64) (+ (* 2.0 x) (* -0.25 y))) 0.0 a b))))))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (t/reshape [3 5 7] (t/linspace -52.0 52.0 105))))
+    (do (compare c a (t/linspace 1.0 7.0 7))
+        (compare c (t/permute [2 0 1] a) (t/full [3 1] 2.0))
+        (compare c (t/flip 1 a) (t/full [3 1 1] 4.0))
+        (compare c (t/slice 2 0 7 2 a) (t/full [4] 0.5))
+        (compare c (t/full [2 0 3] 1.0) (t/full [1 3] 2.0))
+        (compare c (t/full [] 1.0) (t/full [] 3.0))
+        (dotimes (n 19)
+          (let ((x (t/from-vec [n] (t/to-vec (t/arange 0 n 1)) 0))
+                (y (t/map-as (fn (v: i64) (float v)) 0.0f32 x)))
+            (do (check c (= (t/to-vec (t/axpby 2 x 3 (t/flip 0 x)))
+                            (t/to-vec (t/zip-with (fn (a: i64 b: i64) (+ (* 2 a) (* 3 b))) 0 x (t/flip 0 x)))))
+                (check c (= (t/to-vec (t/axpby 0.5f32 y 2.0f32 (t/flip 0 y)))
+                            (t/to-vec (t/zip-with (fn (a: f32 b: f32) (+ (* 0.5f32 a) (* 2.0f32 b))) 0.0f32 y (t/flip 0 y))))))))
+        (check c (= (t/to-vec (t/axpby 2i32 (t/full [2] 3i32) 4i32 (t/full [] 5i32))) [26i32 26i32]))
+        (checks-result c))))

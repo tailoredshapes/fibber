@@ -1,0 +1,48 @@
+;; Nonidentity axis reductions begin with each slice's first element.
+(ns fib.tensor.reduce-extra
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.reduce))
+
+(defun prod-axis (axis: i64 keepdims: bool x: (Tensor t))
+  :where ((Element t) (Num t) (Unit t)) -> (Tensor t)
+  (fold-axis (fn (a: t b: t) (* a b)) (one (. x seed)) axis keepdims x))
+
+(defun fold-axis-first :private (f: (fn (t t) t) :borrow axis: i64 keepdims: bool x: (Tensor t))
+  :where ((Element t)) -> (Tensor t)
+  (let ((dims (shape x)) (ax (normalize-axis (count dims) axis))
+        (extent (nth dims ax)) (out-dims (axis-shape dims ax keepdims))
+        (n (checked-size out-dims (. x seed))) (buf (cell (array n (. x seed)))))
+    (do (when (= extent 0) (trap "tensor: extrema over empty axis"))
+        (when (> n 0)
+          (let ((meta (make-meta (array-len (. x buffer)) (array-get (. x meta) 0)
+                                (axis-shape dims ax false) (axis-shape (strides x) ax false)))
+                (step (nth (strides x) ax)))
+            (dotimes (i n)
+              (let ((base (flat-offset meta i))
+                    (value (loop ((j 1) (acc (array-get (. x buffer) base)))
+                             (if (< j extent)
+                                 (recur (+ j 1) (f acc (array-get (. x buffer) (+ base (* j step))))) acc))))
+                (array-set! &buf i value)))))
+        (from-array out-dims @buf (. x seed)))))
+
+(defun maximum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Ord t)) -> (Tensor t)
+  (fold-axis-first (fn (a: t b: t) (max a b)) axis keepdims x))
+(defun minimum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Ord t)) -> (Tensor t)
+  (fold-axis-first (fn (a: t b: t) (min a b)) axis keepdims x))
+
+(defun mean-axis (axis: i64 keepdims: bool x: (Tensor f64)) -> (Tensor f64)
+  (let ((ax (normalize-axis (rank x) axis)) (extent (nth (shape x) ax)))
+    (do (when (= extent 0) (trap "tensor: mean of empty axis"))
+        (let ((total (sum-axis ax keepdims x)) (n (checked-size (shape total) 0.0))
+              (buf (cell (array n 0.0))))
+          (do (dotimes (i n) (array-set! &buf i (fdiv (flat-at total i) (double extent))))
+              (from-array (shape total) @buf 0.0))))))
+
+;; Ties keep the first logical index. IEEE comparisons leave a first NaN in place.
+(defun arg-extreme :private (largest: bool x: (Tensor t)) :where ((Ord t)) -> i64
+  (do (when (= (fib.tensor.storage/size x) 0) (trap "tensor: arg-extrema of empty tensor"))
+      (loop ((i 1) (best 0))
+        (if (< i (fib.tensor.storage/size x))
+            (let ((a (flat-at x i)) (b (flat-at x best)))
+              (recur (+ i 1) (if (if largest (> a b) (< a b)) i best))) best))))
+(defun argmax (x: (Tensor t)) :where ((Ord t)) -> i64 (arg-extreme true x))
+(defun argmin (x: (Tensor t)) :where ((Ord t)) -> i64 (arg-extreme false x))

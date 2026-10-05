@@ -1066,6 +1066,29 @@ externs and the raw-pointer builtins (`ptr+`, `load-i8` ... `load-ptr`,
 else changes inside `unsafe`: counting and type checking still apply to
 fibber objects (**Decided**, §9).
 
+**Native floating memory extension** (stage 2, 2026-10-04, numerical-library work).
+`load-f32`, `load-f64`, `load-f32x4`, `load-f64x4`, and `load-f32x8` take a
+`ptr` and return `f32`, `f64`, `(Simd f32 4)`, `(Simd f64 4)`, and
+`(Simd f32 8)`, respectively. The matching
+`store-*` takes a pointer and that exact value type and returns `unit`.
+All ten require lexical `unsafe`. They access 4, 8, 16, 32, or 32 bytes,
+respectively, with byte alignment (LLVM `align 1`); unaligned addresses are
+permitted. Callers must keep the owner alive and supply a complete readable
+or writable range. These primitives add no bounds, lifetime, or uniqueness
+checks. Cases 7009, 7017, 7053, and 7056 in `cases/stdlib` pin the round trips
+and unsafe boundary. This extension is native-stage only, like the SIMD types; the frozen
+Rust reference does not implement it.
+
+`array-uninit-f32` and `array-uninit-f64` take an `i64` length and return
+`(Array f32)` and `(Array f64)`, respectively, only inside lexical `unsafe`.
+They allocate ordinary reference-counted native arrays without filling the
+payload. Negative lengths and lengths exceeding `(INT64_MAX - 24) / sizeof(T)`
+trap with `array-uninit: invalid length` before allocation. Callers must write
+an element before reading it and initialize every element before exposing the
+array to safe code. Destruction inspects no floating payload. These are
+native-stage primitives; the frozen Rust reference does not implement them.
+Cases 7016, 7055, 7070, and 7071 pin initialization, unsafe access, and bounds.
+
 A fibber object reaches foreign code only as an address. `(raw e)` is
 the address of `e`'s object, valid for the duration of the enclosing
 scope: a borrow, which is what §9 means by "borrows valid only for the

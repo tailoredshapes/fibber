@@ -1,0 +1,29 @@
+;; Comparisons create boolean tensors; selection broadcasts all three operands.
+(ns fib.tensor.masks
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views fib.tensor.elementwise))
+
+(defun equal (a: (Tensor t) b: (Tensor t)) :where ((Eq t)) -> (Tensor bool)
+  (zip-with (fn (x: t y: t) (= x y)) false a b))
+(defun less (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
+  (zip-with (fn (x: t y: t) (< x y)) false a b))
+(defun less-equal (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
+  (zip-with (fn (x: t y: t) (<= x y)) false a b))
+(defun greater (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
+  (zip-with (fn (x: t y: t) (> x y)) false a b))
+(defun greater-equal (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
+  (zip-with (fn (x: t y: t) (>= x y)) false a b))
+
+(defun where (mask: (Tensor bool) a: (Tensor t) b: (Tensor t)) :where ((Element t)) -> (Tensor t)
+  (let ((dims (broadcast-shape (shape mask) (broadcast-shape (shape a) (shape b))))
+        (condition (broadcast-to dims mask)) (left (broadcast-to dims a)) (right (broadcast-to dims b))
+        (n (checked-size dims (. a seed))) (buf (cell (array n (. a seed)))))
+    (do (dotimes (i n)
+          (array-set! &buf i (if (flat-at condition i) (flat-at left i) (flat-at right i))))
+        (from-array dims @buf (. a seed)))))
+
+(defun any? (mask: (Tensor bool)) -> bool
+  (loop ((i 0))
+    (if (< i (fib.tensor.storage/size mask)) (if (flat-at mask i) true (recur (+ i 1))) false)))
+(defun all? (mask: (Tensor bool)) -> bool
+  (loop ((i 0))
+    (if (< i (fib.tensor.storage/size mask)) (if (flat-at mask i) (recur (+ i 1)) false) true)))

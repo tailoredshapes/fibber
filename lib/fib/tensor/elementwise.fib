@@ -1,0 +1,50 @@
+;; Eager, checked scalar kernels. Broadcasting is planned once per operation.
+(ns fib.tensor.elementwise
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views fib.tensor.kernels))
+
+;; Explicit output seed supports dtype-changing maps and empty results without calling f.
+(defun map-as (f: (fn (a) b) :borrow seed: b x: (Tensor a)) :where ((Element b)) -> (Tensor b)
+  (let ((n (checked-size (shape x) seed)) (buf (cell (array n seed))))
+    (do (dotimes (i n) (array-set! &buf i (f (flat-at x i))))
+        (from-array (shape x) @buf seed))))
+
+(defun map (f: (fn (t) t) :borrow x: (Tensor t)) :where ((Element t)) -> (Tensor t)
+  (map-as f (. x seed) x))
+
+(defun zip-with (f: (fn (a b) c) :borrow seed: c a: (Tensor a) b: (Tensor b))
+  :where ((Element a) (Element b) (Element c)) -> (Tensor c)
+  (let ((dims (broadcast-shape (shape a) (shape b)))
+        (left (broadcast-to dims a)) (right (broadcast-to dims b))
+        (n (checked-size dims seed)) (buf (cell (array n seed))))
+    (do (dotimes (i n) (array-set! &buf i (f (flat-at left i) (flat-at right i))))
+        (from-array dims @buf seed))))
+
+(defun add (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t) (Arithmetic t)) -> (Tensor t)
+  (binary (. a seed) 0 a b))
+
+(defun sub (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t) (Arithmetic t)) -> (Tensor t)
+  (binary (. a seed) 1 a b))
+
+(defun mul (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t) (Arithmetic t)) -> (Tensor t)
+  (binary (. a seed) 2 a b))
+
+;; Division is float-only: integer / in Fibber creates ratios, not scalar tensors.
+(defun div (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Float t) (Division t)) -> (Tensor t)
+  (divide (. a seed) a b))
+
+(defun scale (factor: t x: (Tensor t)) :where ((Element t) (Num t) (Arithmetic t)) -> (Tensor t)
+  (mul x (full [] factor)))
+
+(defun shift (amount: t x: (Tensor t)) :where ((Element t) (Num t) (Arithmetic t)) -> (Tensor t)
+  (add x (full [] amount)))
+
+(defun neg (x: (Tensor t)) :where ((Element t) (Num t)) -> (Tensor t)
+  (map (fn (value: t) (negate-value value)) x))
+
+(defun square (x: (Tensor t)) :where ((Element t) (Num t) (Arithmetic t)) -> (Tensor t)
+  (mul x x))
+
+;; Eager alpha*x + beta*y in one traversal and one output allocation; no implicit FMA.
+(defun axpby (alpha: t x: (Tensor t) beta: t y: (Tensor t))
+  :where ((Element t) (Num t) (Affine t)) -> (Tensor t)
+  (affine (. x seed) alpha x beta y))

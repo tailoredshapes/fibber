@@ -1,0 +1,40 @@
+;; spec: docs/design/numerical-library.md; initial checked scalar tensor foundation
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks))
+        (a (t/reshape [2 3] (t/arange 0 6 1)))
+        (tr (t/transpose a))
+        (rev (t/flip -1 a))
+        (sl (t/slice 1 1 3 1 a)))
+    (do (check c (= (t/shape a) [2 3]))
+        (check c (= (t/strides a) [3 1]))
+        (check c (= (t/at a [1 2]) 5))
+        (check c (= (t/to-vec tr) [0 3 1 4 2 5]))
+        (check c (= (t/to-vec rev) [2 1 0 5 4 3]))
+        (check c (= (t/to-vec sl) [1 2 4 5]))
+        (check c (= (array-len (t/to-array sl)) 4))
+        (check c (= (array-get (t/to-array sl) 3) 5))
+        (check c (not (t/contiguous? tr)))
+        (check c (t/contiguous? (t/copy tr)))
+        (check c (= (t/to-vec (t/transpose tr)) (t/to-vec a)))
+        (let ((b (t/broadcast-to [2 3] (t/tensor-i64 [10 20 30])))
+              (changed (t/assoc b [1 0] 99)))
+          (do (check c (= (t/to-vec b) [10 20 30 10 20 30]))
+              (check c (= (t/to-vec changed) [10 20 30 99 20 30]))))
+        (let ((changed (t/assoc a [0 0] 99)))
+          (do (check c (= (t/at changed [0 0]) 99))
+              (check c (= (t/at a [0 0]) 0))
+              (check c (= (t/at tr [0 0]) 0))))
+        (check c (= (t/item (t/full [] 7i32)) 7i32))
+        (check c (= (t/size (t/zeros [2 0 3])) 0))
+        (check c (= (t/size (t/copy (t/slice 0 2 2 1 a))) 0))
+        (check c (= (array-len (t/to-array (t/slice 0 2 2 1 a))) 0))
+        (check c (= (t/to-vec (t/arange 5 -1 -2)) [5 3 1]))
+        (check c (= (t/to-vec (t/linspace 0.0 1.0 3)) [0.0 0.5 1.0]))
+        (checks-result c))))

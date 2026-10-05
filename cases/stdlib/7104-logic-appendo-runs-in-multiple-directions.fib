@@ -1,0 +1,23 @@
+;; spec: docs/design/relational-search.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.logic :as l]) (:use tl.check))
+
+(defun appendo (x: l/Term y: l/Term z: l/Term) -> l/Goal
+  (l/any [(l/all [(l/== x (l/nil-term)) (l/== y z)])
+    (l/call-fresh (fn (h) (l/call-fresh (fn (tail) (l/call-fresh (fn (rest)
+      (l/all [(l/== x (l/pair h tail)) (l/== z (l/pair h rest))
+              (l/delay-goal (fn () (appendo tail y rest)))])))))))]))
+
+(defun main () -> i64
+  (let ((c (checks)) (one (l/list-term [(l/integer 1)]))
+        (two (l/list-term [(l/integer 2)])) (both (l/list-term [(l/integer 1) (l/integer 2)])))
+    (do (check c (= (l/run 1 (fn (q) (appendo one two q))) [both]))
+        (check c (= (l/run 1 (fn (q) (appendo q two both))) [one]))
+        (check c (= (l/run 1 (fn (q) (appendo one q both))) [two]))
+        (check c (= (l/run-many 4 2 (fn (qs) (appendo (nth qs 0) (nth qs 1) both)))
+                    [[(l/nil-term) both] [one two] [both (l/nil-term)]]))
+        (checks-result c))))

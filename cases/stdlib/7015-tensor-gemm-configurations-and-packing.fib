@@ -1,0 +1,37 @@
+;; spec: docs/design/numerical-library.md; every tile and cache configuration covers outputs exactly
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.tensor :as t] [fib.tensor.gemm-f32 :as g32] [fib.tensor.gemm-f64 :as g64]) (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (options [32 64 128]))
+    (do (dotimes (m 10)
+          (dotimes (n 10)
+            (let ((a (t/reshape [m 5] (t/linspace 1.0 (double (* m 5)) (* m 5))))
+                  (b (t/reshape [5 n] (t/linspace -1.0 (double (- (* n 5) 2)) (* n 5))))
+                  (x (t/map-as (fn (v: f64) (float v)) 0.0f32 a))
+                  (y (t/map-as (fn (v: f64) (float v)) 0.0f32 b))
+                  (expected (t/to-vec (t/mmul-scalar a b))))
+              (dotimes (kind 3)
+                (do (check c (= (t/to-vec (g64/multiply-config kind 32 64 a b)) expected))
+                    (check c (= (t/to-vec (g64/multiply-mode kind 32 64 true (t/flip 1 a) (t/flip 0 b))) expected))
+                    (check c (= (t/to-vec (g32/multiply-mode kind 32 64 true (t/flip 1 x) (t/flip 0 y)))
+                                (t/to-vec (t/mmul-scalar x y))))
+                    (check c (= (t/to-vec (g32/multiply-config kind 32 64 x y))
+                                (t/to-vec (t/mmul-scalar x y)))))))))
+        (let ((a (t/reshape [9 65] (t/linspace 1.0 585.0 585))) (b (t/full [65 11] 0.5))
+              (expected (t/to-vec (t/mmul-scalar a b)))
+              (x (t/map-as (fn (v: f64) (float v)) 0.0f32 a))
+              (y (t/full [65 11] 0.5f32)) (expected32 (t/to-vec (t/mmul-scalar x y))))
+          (do (dotimes (kind 3) (dotimes (ci 3) (dotimes (ki 3)
+                (do (check c (= (t/to-vec (g64/multiply-config kind (nth options ci) (nth options ki) a b)) expected))
+                    (check c (= (t/to-vec (g64/multiply-mode kind (nth options ci) (nth options ki) true a b)) expected))
+                    (check c (= (t/to-vec (g32/multiply-mode kind (nth options ci) (nth options ki) true x y)) expected32))))))
+              (check c (= (t/to-vec (g64/pack-matrix (t/flip 1 a))) (t/to-vec (t/flip 1 a))))
+              (check c (= (t/to-vec (g64/pack-matrix (t/transpose a))) (t/to-vec (t/transpose a))))
+              (check c (= (t/to-vec (t/mmul (t/transpose (t/full [65 9] 1.0)) b)) (t/to-vec (t/full [9 11] 32.5))))))
+        (check c (= (t/to-vec (g32/multiply-mode 1 64 128 true (t/full [9 0] 1.0f32) (t/full [0 11] 1.0f32))) (t/to-vec (t/full [9 11] 0.0f32))))
+        (checks-result c))))

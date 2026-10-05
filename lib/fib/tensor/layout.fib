@@ -1,0 +1,122 @@
+;; Checked strided layouts. Strides and offsets are measured in elements.
+;; Metadata is [offset rank shape... strides...]; rank zero has one element.
+(ns fib.tensor.layout (:use fib.core fib.seq fib.coll))
+
+(defun shape-size (dims: (Vec i64)) -> i64
+  (do (when (> (count dims) 8) (trap "tensor: rank exceeds 8"))
+      (let ((empty (loop ((i 0) (empty false))
+                     (if (< i (count dims))
+                         (let ((d (nth dims i)))
+                           (do (when (< d 0) (trap "tensor: negative extent"))
+                               (recur (+ i 1) (or empty (= d 0)))))
+                         empty))))
+        (if empty 0
+            (loop ((i 0) (n 1))
+              (if (< i (count dims)) (recur (+ i 1) (* n (nth dims i))) n))))))
+
+(defun dense-strides (dims: (Vec i64)) -> (Vec i64)
+  (let ((n (shape-size dims)))
+    (loop ((i (- (count dims) 1)) (stride 1) (out (vec-empty)))
+      (if (>= i 0)
+          (recur (- i 1) (if (= n 0) 0 (* stride (nth dims i))) (conj out stride))
+          (loop ((j (- (count out) 1)) (ss (vec-empty)))
+            (if (>= j 0) (recur (- j 1) (conj ss (nth out j))) ss))))))
+
+(defun check-range (len: i64 offset: i64 dims: (Vec i64) steps: (Vec i64)) -> unit
+  (let ((n (shape-size dims)))
+    (do (when (!= (count dims) (count steps)) (trap "tensor: stride rank mismatch"))
+        (if (= n 0)
+            (when (or (< offset 0) (> offset len)) (trap "tensor: empty offset out of range"))
+            (let ((bounds (loop ((i 0) (lo offset) (hi offset))
+                            (if (< i (count dims))
+                                (let ((delta (* (- (nth dims i) 1) (nth steps i))))
+                                  (recur (+ i 1) (+ lo (min 0 delta)) (+ hi (max 0 delta))))
+                                (Pair lo hi)))))
+              (when (or (< (. bounds fst) 0) (>= (. bounds snd) len))
+                (trap "tensor: view out of range of buffer")))))))
+
+(defun make-meta (len: i64 offset: i64 dims: (Vec i64) steps: (Vec i64)) -> (Array i64)
+  (do (check-range len offset dims steps)
+      (let ((r (count dims)) (m (cell (array (+ 2 (* 2 (count dims))) 0))))
+        (do (array-set! &m 0 offset)
+            (array-set! &m 1 r)
+            (dotimes (i r)
+              (do (array-set! &m (+ 2 i) (nth dims i))
+                  (array-set! &m (+ 2 (+ r i)) (nth steps i))))
+            @m))))
+
+(defun meta-rank (m: (Array i64)) -> i64
+  (do (when (< (array-len m) 2) (trap "tensor: invalid metadata"))
+      (let ((r (array-get m 1)))
+        (do (when (or (< r 0) (> r 8)) (trap "tensor: invalid rank"))
+            (when (!= (array-len m) (+ 2 (* 2 r))) (trap "tensor: invalid metadata"))
+            r))))
+
+(defun meta-shape (m: (Array i64)) -> (Vec i64)
+  (let ((r (meta-rank m)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i r) (recur (+ i 1) (conj out (array-get m (+ 2 i)))) out))))
+
+(defun meta-strides (m: (Array i64)) -> (Vec i64)
+  (let ((r (meta-rank m)))
+    (loop ((i 0) (out (vec-empty)))
+      (if (< i r) (recur (+ i 1) (conj out (array-get m (+ 2 (+ r i))))) out))))
+
+(defun normalize-axis (r: i64 axis: i64) -> i64
+  (let ((a (if (< axis 0) (+ r axis) axis)))
+    (if (or (< a 0) (>= a r)) (trap "tensor: axis out of range") a)))
+
+;; Logical row-major iteration works for transposed, reversed, and broadcast layouts.
+(defun meta-size (m: (Array i64)) -> i64
+  (let ((r (meta-rank m))
+        (empty (loop ((i 0) (empty false))
+                 (if (< i r)
+                     (let ((d (array-get m (+ 2 i))))
+                       (do (when (< d 0) (trap "tensor: negative extent"))
+                           (recur (+ i 1) (or empty (= d 0)))))
+                     empty))))
+    (if empty 0
+        (loop ((i 0) (n 1))
+          (if (< i r) (recur (+ i 1) (* n (array-get m (+ 2 i)))) n)))))
+
+(defun flat-offset (m: (Array i64) index: i64) -> i64
+  (let ((r (meta-rank m)) (n (meta-size m)))
+    (do (when (or (< index 0) (>= index n)) (trap "tensor: flat index out of range"))
+        (loop ((i (- r 1)) (left index) (pos (array-get m 0)))
+          (if (>= i 0)
+              (let ((d (array-get m (+ 2 i))))
+                (recur (- i 1) (quot left d)
+                       (+ pos (* (rem left d) (array-get m (+ 2 (+ r i)))))))
+              pos)))))
+
+(defun indexed-offset (m: (Array i64) indices: (Vec i64)) -> i64
+  (let ((r (meta-rank m)))
+    (do (when (!= r (count indices)) (trap "tensor: index rank mismatch"))
+        (loop ((i 0) (pos (array-get m 0)))
+          (if (< i r)
+              (let ((x (nth indices i)) (d (array-get m (+ 2 i))))
+                (do (when (or (< x 0) (>= x d)) (trap "tensor: index out of range"))
+                    (recur (+ i 1) (+ pos (* x (array-get m (+ 2 (+ r i))))))))
+              pos)))))
+
+(defun dense? (m: (Array i64)) -> bool
+  (let ((dims (meta-shape m)) (r (count dims)))
+    (if (= (shape-size dims) 0) true
+        (loop ((i (- r 1)) (stride 1))
+          (if (>= i 0)
+              (let ((d (nth dims i)) (s (array-get m (+ 2 (+ r i)))))
+                (if (and (> d 1) (!= s stride)) false
+                    (recur (- i 1) (* stride d))))
+              true)))))
+
+(defun broadcast-shape (a: (Vec i64) b: (Vec i64)) -> (Vec i64)
+  (do (shape-size a) (shape-size b)
+      (let ((r (max (count a) (count b))))
+        (loop ((i 0) (out (vec-empty)))
+          (if (< i r)
+              (let ((ai (- i (- r (count a)))) (bi (- i (- r (count b))))
+                    (x (if (< ai 0) 1 (nth a ai))) (y (if (< bi 0) 1 (nth b bi))))
+                (let ((d (cond (= x y) x (= x 1) y (= y 1) x
+                               :else (trap "tensor: broadcast shape mismatch"))))
+                  (recur (+ i 1) (conj out d))))
+              out)))))

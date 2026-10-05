@@ -1,0 +1,21 @@
+;; spec: docs/design/relational-search.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.logic :as l]) (:use tl.check))
+
+(defun never () -> l/Goal (l/delay-goal (fn () (never))))
+(defun repeat-value (q: l/Term value: i64) -> l/Goal
+  (l/any [(l/== q (l/integer value)) (l/delay-goal (fn () (repeat-value q value)))]))
+
+(defun main () -> i64
+  (let ((c (checks)) (answers (l/run 6 (fn (q) (l/any [(repeat-value q 1) (repeat-value q 2)])))))
+    (do
+      (check c (= (l/run 1 (fn (q) (l/any [(never) (l/== q (l/integer 7))]))) [(l/integer 7)]))
+      (check c (= (count answers) 6))
+      (check c (reduce (fn (found: bool x: l/Term) (or found (= x (l/integer 1)))) false answers))
+      (check c (reduce (fn (found: bool x: l/Term) (or found (= x (l/integer 2)))) false answers))
+      (check c (= (l/run 1 (fn (q) (l/all [(l/any [(l/== q (l/integer 1)) (l/== q (l/integer 2))]) (l/call-fresh (fn (x) (l/any [(l/all [(l/== q (l/integer 1)) (never)]) (l/== q (l/integer 2))])))]))) [(l/integer 2)]))
+      (checks-result c))))

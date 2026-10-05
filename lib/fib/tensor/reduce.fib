@@ -1,0 +1,55 @@
+;; Ordered scalar reductions. SIMD/reassociated reductions will use an explicit contract.
+(ns fib.tensor.reduce
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage))
+
+(defun fold (f: (fn (a t) a) :borrow initial: a x: (Tensor t)) -> a
+  (let ((n (fib.tensor.storage/size x)))
+    (loop ((i 0) (acc initial))
+      (if (< i n) (recur (+ i 1) (f acc (flat-at x i))) acc))))
+
+(defun sum (x: (Tensor t)) :where ((Element t) (Num t)) -> t
+  (fold (fn (a: t b: t) (+ a b)) (element-zero (. x seed)) x))
+
+(defun prod (x: (Tensor t)) :where ((Element t) (Num t) (Unit t)) -> t
+  (fold (fn (a: t b: t) (* a b)) (one (. x seed)) x))
+
+(defun maximum (x: (Tensor t)) :where ((Ord t)) -> t
+  (do (when (= (fib.tensor.storage/size x) 0) (trap "tensor: maximum of empty tensor"))
+      (fold (fn (a: t b: t) (max a b)) (flat-at x 0) x)))
+
+(defun minimum (x: (Tensor t)) :where ((Ord t)) -> t
+  (do (when (= (fib.tensor.storage/size x) 0) (trap "tensor: minimum of empty tensor"))
+      (fold (fn (a: t b: t) (min a b)) (flat-at x 0) x)))
+
+(defun mean (x: (Tensor f64)) -> f64
+  (do (when (= (fib.tensor.storage/size x) 0) (trap "tensor: mean of empty tensor"))
+      (fdiv (sum x) (double (fib.tensor.storage/size x)))))
+
+(defun axis-shape (dims: (Vec i64) axis: i64 keepdims: bool) -> (Vec i64)
+  (loop ((i 0) (out (vec-empty)))
+    (if (< i (count dims))
+        (recur (+ i 1) (if (= i axis) (if keepdims (conj out 1) out)
+                            (conj out (nth dims i))))
+        out)))
+
+;; Each logical output element folds its source axis in increasing index order.
+(defun fold-axis (f: (fn (a t) a) :borrow initial: a axis: i64 keepdims: bool x: (Tensor t))
+  :where ((Element a)) -> (Tensor a)
+  (let ((dims (shape x)) (ax (normalize-axis (count dims) axis))
+        (extent (nth dims ax)) (out-dims (axis-shape dims ax keepdims))
+        (n (checked-size out-dims initial)) (buf (cell (array n initial))))
+    (do (when (and (> extent 0) (> n 0))
+          (let ((base-meta (make-meta (array-len (. x buffer)) (array-get (. x meta) 0)
+                                     (axis-shape dims ax false) (axis-shape (strides x) ax false)))
+                (step (nth (strides x) ax)))
+            (dotimes (i n)
+              (let ((base (flat-offset base-meta i))
+                    (value (loop ((j 0) (acc initial))
+                             (if (< j extent)
+                                 (recur (+ j 1) (f acc (array-get (. x buffer) (+ base (* j step)))))
+                                 acc))))
+                (array-set! &buf i value)))))
+        (from-array out-dims @buf initial))))
+
+(defun sum-axis (axis: i64 keepdims: bool x: (Tensor t)) :where ((Element t) (Num t)) -> (Tensor t)
+  (fold-axis (fn (a: t b: t) (+ a b)) (element-zero (. x seed)) axis keepdims x))

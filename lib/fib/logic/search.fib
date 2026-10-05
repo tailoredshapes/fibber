@@ -1,0 +1,91 @@
+;; Immutable FIFO search. One transition evaluates at most one goal.
+(ns fib.logic.search (:use fib.core fib.seq fib.coll fib.print fib.logic.terms fib.logic.unify fib.logic.fd.types)
+  (:require [fib.logic.fd.engine :as fd] [fib.logic.fd.domain :as domain]))
+
+(defenum Goal (Equal left: Term right: Term) (All goals: (Vec Goal)) (Any goals: (Vec Goal))
+  (Fresh build: (fn (Term) Goal)) (Delayed build: (fn () Goal)) (Constrain constraint: Constraint))
+(defenum Goals (NoGoals) (NextGoal goal: Goal tail: Goals))
+(defstruct Work (state: State goals: Goals store: Store))
+(defstruct Search (front: (Vec Work) position: i64 back: (Vec Work)))
+(defenum Transition (SearchDone) (SearchProgress rest: Search) (SearchFound state: State rest: Search))
+
+(defun == (left: Term right: Term) -> Goal (Equal left right))
+(defun all (goals: (Vec Goal)) -> Goal (All goals))
+(defun any (goals: (Vec Goal)) -> Goal (Any goals))
+(defun call-fresh (build: (fn (Term) Goal)) -> Goal (Fresh build))
+(defun delay-goal (build: (fn () Goal)) -> Goal (Delayed build))
+(defun start-in (goal: Goal state: State) -> Search (Search [(Work state (NextGoal goal NoGoals) (empty-store))] 0 []))
+(defun start (goal: Goal) -> Search (start-in goal (empty-state)))
+
+(defun enqueue :private (search: Search work: Work) -> Search
+  (Search (. search front) (. search position) (conj (. search back) work)))
+(defun pop-work :private (search: Search) -> (Option (Pair Work Search))
+  (let ((front (. search front)) (position (. search position)) (back (. search back)))
+    (cond (< position (count front)) (some (Pair (nth front position) (Search front (+ position 1) back)))
+          (> (count back) 0) (some (Pair (nth back 0) (Search back 1 [])))
+          :else nil)))
+(defun prepend :private (goals: (Vec Goal) tail: Goals) -> Goals
+  (loop ((i (count goals)) (out tail))
+    (if (> i 0) (recur (- i 1) (NextGoal (nth goals (- i 1)) out)) out)))
+(defun alternatives :private (goals: (Vec Goal) state: State store: Store tail: Goals search: Search) -> Search
+  (loop ((i 0) (out search))
+    (if (< i (count goals))
+        (recur (+ i 1) (enqueue out (Work state (NextGoal (nth goals i) tail) store))) out)))
+
+(defun continue-work :private (state: State store: Store tail: Goals rest: Search) -> Transition
+  (match tail
+    ((NoGoals)
+      (let ((snapshot (Snapshot state store)))
+        (match (fd/choose snapshot)
+          ((some choice)
+            (let ((goals (mapv (fn (n: i64) (Equal (Var (. choice fst)) (Integer n))) (domain/values (. choice snd)))))
+              (SearchProgress (alternatives goals state store NoGoals rest))))
+          (nil (do (when (not (fd/complete? snapshot)) (trap "fd: constraint needs a finite domain"))
+                   (SearchFound state rest))))))
+    (_ (SearchProgress (enqueue rest (Work state tail store))))))
+
+(defun after-constraint :private (result: (Option Snapshot) tail: Goals rest: Search) -> Transition
+  (match result (nil (SearchProgress rest))
+    ((some next) (continue-work (. next state) (. next store) tail rest))))
+
+(defun evaluate :private (goal: Goal state: State store: Store tail: Goals rest: Search) -> Transition
+  (match goal
+    ((Equal a b) (match (unify a b (. state bindings))
+      ((some bindings)
+        (let ((next (State bindings (. state next-id))))
+          (if (and (= (count (. store domains)) 0) (= (count (. store constraints)) 0))
+              (continue-work next store tail rest)
+              (after-constraint (fd/propagate (Snapshot next store)) tail rest))))
+      (nil (SearchProgress rest))))
+    ((All goals) (continue-work state store (prepend goals tail) rest))
+    ((Any goals) (SearchProgress (alternatives goals state store tail rest)))
+    ((Fresh build) (SearchProgress
+      (enqueue rest (Work (State (. state bindings) (+ (. state next-id) 1))
+                          (NextGoal (build (Var (. state next-id))) tail) store))))
+    ((Delayed build) (SearchProgress (enqueue rest (Work state (NextGoal (build) tail) store))))
+    ((Constrain constraint) (after-constraint (fd/post state store constraint) tail rest))))
+
+;; No recursive stepping, flattening, or forcing another branch in this call.
+(defun step (search: Search) -> Transition
+  (match (pop-work search)
+    (nil SearchDone)
+    ((some item)
+     (let ((work (. item fst)) (rest (. item snd)))
+       (match (. work goals)
+         ((NoGoals) (continue-work (. work state) (. work store) NoGoals rest))
+         ((NextGoal goal tail) (evaluate goal (. work state) (. work store) tail rest)))))))
+
+(defun next-answer (stream: Search) -> (Option (Pair State Search))
+  (loop ((work stream))
+    (match (step work)
+      ((SearchDone) nil)
+      ((SearchFound state rest) (some (Pair state rest)))
+      ((SearchProgress rest) (recur rest)))))
+
+(defun take-states (limit: i64 stream: Search) -> (Vec State)
+  (do (when (< limit 0) (trap "logic: negative answer limit"))
+      (loop ((left limit) (work stream) (out: (Vec State) []))
+        (if (= left 0) out
+            (match (next-answer work)
+              ((some answer) (recur (- left 1) (. answer snd) (conj out (. answer fst))))
+              (nil out))))))

@@ -1,0 +1,35 @@
+;; Input construction and output checksums are outside each timed operation.
+;; First measurement is a warmup; tensor.py reports the median of the rest.
+(ns main (:require [fib.tensor :as t]))
+
+(defun bench-add (a: (t/Tensor f64) b: (t/Tensor f64) runs: i64) -> unit
+  (dotimes (i runs)
+    (let ((start (sys-clock-now)) (result (t/add a b)) (elapsed (- (sys-clock-now) start)))
+      (println "add " elapsed " " (t/sum-fast result)))))
+(defun bench-sum (a: (t/Tensor f64) runs: i64) -> unit
+  (dotimes (i runs)
+    (let ((start (sys-clock-now)) (result (t/sum-fast a)) (elapsed (- (sys-clock-now) start)))
+      (println "sum " elapsed " " result))))
+(defun bench-dot (a: (t/Tensor f64) b: (t/Tensor f64) runs: i64) -> unit
+  (dotimes (i runs)
+    (let ((start (sys-clock-now)) (result (t/dot-fast a b)) (elapsed (- (sys-clock-now) start)))
+      (println "dot " elapsed " " result))))
+(defun bench-mmul (a: (t/Tensor f64) b: (t/Tensor f64) runs: i64) -> unit
+  (dotimes (i runs)
+    (let ((start (sys-clock-now)) (result (t/mmul a b)) (elapsed (- (sys-clock-now) start)))
+      (println "mmul " elapsed " " (t/sum-fast result)))))
+(defun bench-strided (a: (t/Tensor f64) b: (t/Tensor f64) runs: i64) -> unit
+  (let ((view (t/transpose a)))
+    (dotimes (i runs)
+      (let ((start (sys-clock-now)) (result (t/mmul view b)) (elapsed (- (sys-clock-now) start)))
+        (println "mmul-transpose " elapsed " " (t/sum-fast result))))))
+(defun bench-scalar (a: (t/Tensor f64) b: (t/Tensor f64) runs: i64) -> unit
+  (dotimes (i runs)
+    (let ((start (sys-clock-now)) (result (t/mmul-scalar a b)) (elapsed (- (sys-clock-now) start)))
+      (println "mmul-scalar " elapsed " " (t/sum-fast result)))))
+
+(defun main () -> i64
+  (let ((a (t/full [1048576] 1.0)) (b (t/full [1048576] 2.0))
+        (ma (t/full [128 128] 1.0)) (mb (t/full [128 128] 2.0)))
+    (do (bench-add a b 6) (bench-sum a 6) (bench-dot a b 6)
+        (bench-mmul ma mb 6) (bench-strided ma mb 6) (bench-scalar ma mb 6) 0)))

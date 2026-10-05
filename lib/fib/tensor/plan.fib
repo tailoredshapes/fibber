@@ -1,0 +1,32 @@
+;; Pure traversal plans. Coalesce axes only when every operand permits it.
+(ns fib.tensor.plan (:use fib.core fib.seq fib.coll fib.tensor.layout))
+
+(defstruct Traversal (dims: (Vec i64) left: (Vec i64) right: (Vec i64)))
+
+(defun traversal (dims: (Vec i64) left: (Vec i64) right: (Vec i64)) -> Traversal
+  (do (shape-size dims)
+      (when (or (!= (count dims) (count left)) (!= (count dims) (count right)))
+        (trap "tensor: traversal stride rank mismatch"))
+      (if (= (shape-size dims) 0) (Traversal [0] [0] [0])
+      (loop ((i 0) (ds: (Vec i64) []) (ls: (Vec i64) []) (rs: (Vec i64) []))
+        (if (< i (count dims))
+            (let ((d (nth dims i)) (l (nth left i)) (r (nth right i)) (j (- (count ds) 1)))
+              (cond (= d 1) (recur (+ i 1) ds ls rs)
+                    (and (>= j 0) (= (nth ls j) (* d l)) (= (nth rs j) (* d r)))
+                    (recur (+ i 1) (assoc ds j (* (nth ds j) d)) (assoc ls j l) (assoc rs j r))
+                    :else (recur (+ i 1) (conj ds d) (conj ls l) (conj rs r))))
+            (if (= (count ds) 0) (Traversal [1] [0] [0]) (Traversal ds ls rs)))))))
+
+(defun inner-length (plan: Traversal) -> i64 (nth (. plan dims) (- (count (. plan dims)) 1)))
+(defun left-step (plan: Traversal) -> i64 (nth (. plan left) (- (count (. plan dims)) 1)))
+(defun right-step (plan: Traversal) -> i64 (nth (. plan right) (- (count (. plan dims)) 1)))
+(defun rows (plan: Traversal) -> i64
+  (let ((n (shape-size (. plan dims))) (inner (inner-length plan)))
+    (if (= n 0) 0 (quot n inner))))
+
+;; Decode once per row; the hot inner loop then advances by constant strides.
+(defun row-offset (plan: Traversal steps: (Vec i64) row: i64) -> i64
+  (loop ((axis (- (count (. plan dims)) 2)) (left row) (offset 0))
+    (if (>= axis 0)
+        (let ((d (nth (. plan dims) axis)))
+          (recur (- axis 1) (quot left d) (+ offset (* (rem left d) (nth steps axis))))) offset)))

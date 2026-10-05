@@ -1,0 +1,38 @@
+;; spec: docs/design/numerical-library.md; masks and nonidentity/empty axis reductions
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun main () -> i64
+  (let ((c (checks)) (a (t/reshape [2 3] (t/tensor [3.0 1.0 2.0 -2.0 -4.0 -3.0])))
+        (mask (t/greater a (t/full [] 0.0))))
+    (do (check c (= (t/dtype mask) :bool))
+        (check c (= (t/to-vec mask) [true true true false false false]))
+        (check c (t/any? mask)) (check c (not (t/all? mask)))
+        (check c (= (t/to-vec (t/where mask a (t/full [] 0.0))) [3.0 1.0 2.0 0.0 0.0 0.0]))
+        (check c (= (t/to-vec (t/where (t/full [2 1] true) (t/tensor-i64 [1 2 3]) (t/full [] 8))) [1 2 3 1 2 3]))
+        (check c (= (t/to-vec (t/where (t/transpose mask) (t/transpose a) (t/full [] 7.0))) [3.0 7.0 1.0 7.0 2.0 7.0]))
+        (check c (t/all? (t/equal a a)))
+        (check c (t/all? (t/less-equal a a)))
+        (check c (t/all? (t/greater-equal a a)))
+        (check c (not (t/any? (t/less a a))))
+        (check c (t/all? (t/full [0] false)))
+        (check c (not (t/any? (t/full [0] true))))
+        (check c (= (t/size (t/where (t/full [0] true) (t/full [] 1) (t/full [] 2))) 0))
+        (check c (= (t/to-vec (t/maximum-axis -1 false a)) [3.0 -2.0]))
+        (check c (= (t/to-vec (t/minimum-axis 0 true a)) [-2.0 -4.0 -3.0]))
+        (check c (= (t/shape (t/minimum-axis 0 true a)) [1 3]))
+        (check c (= (t/to-vec (t/mean-axis -1 true a)) [2.0 -3.0]))
+        (check c (= (t/to-vec (t/prod-axis 1 false a)) [6.0 -24.0]))
+        (check c (= (t/to-vec (t/maximum-axis 0 false (t/transpose a))) [3.0 -2.0]))
+        (check c (= (t/to-vec (t/minimum-axis 1 false (t/flip 1 a))) [1.0 -4.0]))
+        (check c (= (t/to-vec (t/prod-axis 1 false (t/full [2 0] 3i32))) [1i32 1i32]))
+        (check c (= (t/shape (t/maximum-axis 1 false (t/zeros [0 3]))) [0]))
+        (check c (= (t/argmax (t/tensor-i64 [1 8 8 2])) 1))
+        (check c (= (t/argmin (t/flip 0 (t/tensor-i64 [1 -4 -4 2]))) 1))
+        (let ((changed (t/assoc mask [0 0] false)))
+          (do (check c (t/at mask [0 0])) (check c (not (t/at changed [0 0])))))
+        (checks-result c))))

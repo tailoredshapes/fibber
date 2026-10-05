@@ -1,0 +1,30 @@
+;; spec: docs/design/relational-search.md
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+(ns main (:require [fib.logic :as l]) (:use tl.check fib.logic))
+
+(defun appendo (x: l/Term y: l/Term z: l/Term) -> l/Goal
+  (conde [(l/== x (l/nil-term)) (l/== y z)]
+         [(fresh [h tail rest] (l/== x (l/pair h tail)) (l/== z (l/pair h rest))
+                  (zzz (appendo tail y rest)))]))
+
+(defun main () -> i64
+  (let ((c (checks)))
+    (do (dotimes (n 13)
+          (let ((values (mapv (fn (i: i64) (if (= (rem i 2) 0) (l/integer i) (l/symbol "a"))) (range n)))
+                (input (l/list-term values))
+                (expected (mapv (fn (i: i64) [(l/list-term (to-vec (take i values)))
+                                             (l/list-term (to-vec (drop i values)))]) (range (+ n 1))))
+                (actual (l/run-many (+ n 2) 2 (fn (qs) (appendo (nth qs 0) (nth qs 1) input)))))
+            (do (check c (= actual expected))
+                (dotimes (i (+ n 1))
+                  (let ((parts (nth expected i)))
+                    (check c (= (l/run 1 (fn (q) (appendo (nth parts 0) (nth parts 1) q))) [input])))))))
+        (check c (= (l/run-many 1 0 (fn (qs) (l/all []))) [[]]))
+        (check c (= (l/run 2 (fn (q) (l/any [(l/== q (l/integer 1)) (l/== q (l/integer 1))]))) [(l/integer 1) (l/integer 1)]))
+        (check c (= (l/term-text (l/list-term [(l/integer -1) (l/symbol "tea")])) "(-1 tea)"))
+        (check c (= (l/term-text (l/pair (l/integer 1) (l/integer 2))) "(1 . 2)"))
+        (checks-result c))))

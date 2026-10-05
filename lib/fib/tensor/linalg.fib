@@ -1,0 +1,48 @@
+;; Scalar reference kernels support arbitrary checked strides and empty inner dimensions.
+(ns fib.tensor.linalg
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage)
+  (:require [fib.tensor.gemm-f32 :as g32] [fib.tensor.gemm-f64 :as g64]))
+
+(defun dot (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t)) -> t
+  (do (when (or (!= (rank a) 1) (!= (rank b) 1)) (trap "tensor: dot requires rank one"))
+      (when (!= (fib.tensor.storage/size a) (fib.tensor.storage/size b)) (trap "tensor: dot size mismatch"))
+      (let ((n (fib.tensor.storage/size a)))
+        (loop ((i 0) (acc (element-zero (. a seed))))
+          (if (< i n) (recur (+ i 1) (+ acc (* (flat-at a i) (flat-at b i)))) acc)))))
+
+(defun outer (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t)) -> (Tensor t)
+  (do (when (or (!= (rank a) 1) (!= (rank b) 1)) (trap "tensor: outer requires rank one"))
+      (let ((m (fib.tensor.storage/size a)) (n (fib.tensor.storage/size b))
+            (seed (element-zero (. a seed))) (buf (cell (array (checked-size [m n] seed) seed))))
+        (do (dotimes (i m)
+              (dotimes (j n) (array-set! &buf (+ (* i n) j) (* (flat-at a i) (flat-at b j)))))
+            (from-array [m n] @buf seed)))))
+
+(defun mmul-scalar (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t)) -> (Tensor t)
+  (do (when (or (!= (rank a) 2) (!= (rank b) 2)) (trap "tensor: mmul requires rank two"))
+      (let ((ad (shape a)) (bd (shape b)))
+        (do (when (!= (nth ad 1) (nth bd 0)) (trap "tensor: mmul inner dimension mismatch"))
+            (let ((m (nth ad 0)) (k (nth ad 1)) (n (nth bd 1))
+                  (as (strides a)) (bs (strides b))
+                  (ao (array-get (. a meta) 0)) (bo (array-get (. b meta) 0))
+                  (seed (element-zero (. a seed))) (buf (cell (array (checked-size [m n] seed) seed))))
+              (do (dotimes (i m)
+                    (dotimes (j n)
+                      (let ((value (loop ((p 0) (acc seed))
+                                     (if (< p k)
+                                         (let ((av (array-get (. a buffer) (+ ao (+ (* i (nth as 0)) (* p (nth as 1))))))
+                                               (bv (array-get (. b buffer) (+ bo (+ (* p (nth bs 0)) (* j (nth bs 1)))))))
+                                           (recur (+ p 1) (+ acc (* av bv))))
+                                         acc))))
+                        (array-set! &buf (+ (* i n) j) value))))
+                  (from-array [m n] @buf seed)))))))
+
+(defprotocol MatrixKernel
+  (matrix-multiply (self a: (Tensor Self) b: (Tensor Self)) -> (Tensor Self)))
+(impl MatrixKernel i32 (matrix-multiply (self a b) (mmul-scalar a b)))
+(impl MatrixKernel i64 (matrix-multiply (self a b) (mmul-scalar a b)))
+(impl MatrixKernel f32 (matrix-multiply (self a b) (g32/multiply a b)))
+(impl MatrixKernel f64 (matrix-multiply (self a b) (g64/multiply a b)))
+
+(defun mmul (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t) (MatrixKernel t)) -> (Tensor t)
+  (matrix-multiply (. a seed) a b))
