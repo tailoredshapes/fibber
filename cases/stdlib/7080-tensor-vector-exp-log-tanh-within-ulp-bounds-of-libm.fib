@@ -1,0 +1,80 @@
+;; spec: lib/fib/tensor/vmath.fib (header: the error bounds); exp, log and tanh of f64 and f32 tensors against libm over dense sweeps, special values and every tail length
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; A wrong polynomial coefficient, a wrong sign, a wrong range reduction or a wrong tail changes some result by more than the asserted bound.
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+(extern exp (f64) -> f64)
+(extern log (f64) -> f64)
+(extern tanh (f64) -> f64)
+(extern expf (f32) -> f32)
+(extern logf (f32) -> f32)
+(extern tanhf (f32) -> f32)
+
+(defun ulps (a: f64 b: f64) -> i64
+  (cond (= a b) 0
+        (and (!= a a) (!= b b)) 0
+        (or (!= a a) (!= b b)) 1000000000
+        :else (let ((x (f64->bits a)) (y (f64->bits b))) (if (> x y) (- x y) (- y x)))))
+(defun ulps32 (a: f32 b: f32) -> i64
+  (cond (= a b) 0
+        (and (!= a a) (!= b b)) 0
+        (or (!= a a) (!= b b)) 1000000000
+        :else (let ((x (sext i64 (f32->bits a))) (y (sext i64 (f32->bits b)))) (if (> x y) (- x y) (- y x)))))
+
+;; op 0 exp 1 log 2 tanh; reports the worst error and the input where it happened
+(defun op64 (op: i64 x: (t/Tensor f64)) -> (t/Tensor f64)
+  (cond (= op 0) (t/exp x) (= op 1) (t/log x) :else (t/tanh x)))
+(defun op32 (op: i64 x: (t/Tensor f32)) -> (t/Tensor f32)
+  (cond (= op 0) (t/exp x) (= op 1) (t/log x) :else (t/tanh x)))
+(defun lib64 (op: i64 x: f64) -> f64 (unsafe (cond (= op 0) (exp x) (= op 1) (log x) :else (tanh x))))
+(defun lib32 (op: i64 x: f32) -> f32 (unsafe (cond (= op 0) (expf x) (= op 1) (logf x) :else (tanhf x))))
+
+(defun worst64 (op: i64 xs: (Array f64)) -> i64
+  (let ((n (array-len xs)) (y (t/to-array (op64 op (t/from-array [n] xs 0.0)))))
+    (loop ((i 0) (w 0))
+      (if (< i n) (recur (+ i 1) (max w (ulps (array-get y i) (lib64 op (array-get xs i))))) w))))
+(defun worst32 (op: i64 xs: (Array f32)) -> i64
+  (let ((n (array-len xs)) (y (t/to-array (op32 op (t/from-array [n] xs 0.0f32)))))
+    (loop ((i 0) (w 0))
+      (if (< i n) (recur (+ i 1) (max w (ulps32 (array-get y i) (lib32 op (array-get xs i))))) w))))
+
+(defun fill (n: i64 f: (fn (i64) f64) :borrow) -> (Array f64)
+  (let ((b (cell (array n 0.0)))) (do (dotimes (i n) (array-set! &b i (f i))) @b)))
+(defun fill-f32 (n: i64 f: (fn (i64) f64) :borrow) -> (Array f32)
+  (let ((b (cell (array n 0.0f32)))) (do (dotimes (i n) (array-set! &b i (float (f i)))) @b)))
+(defun pow2x (u: f64) -> f64 (unsafe (exp (* 0.6931471805599453 u))))
+
+(defun one64 (op: i64 x: f64) -> f64 (t/item (op64 op (t/full [] x))))
+(defun nan? (x: f64) -> bool (!= x x))
+
+(defun main () -> i64
+  (let ((c (checks)) (n 200000) (inf (/ 1.0 0.0)) (nan (- (/ 1.0 0.0) (/ 1.0 0.0))))
+    (do ;; dense sweeps: bounds 1, 2, 2 ULP for f64 and 1 ULP for f32 (vmath.fib header)
+        (check c (<= (worst64 0 (fill n (fn (i: i64) (+ -708.396 (* (double i) (fdiv 1418.17 (double n))))))) 1))
+        (check c (<= (worst64 0 (fill n (fn (i: i64) (* (+ -1.0 (* (double i) (fdiv 2.0 (double n)))) 0.001)))) 1))
+        (check c (<= (worst64 1 (fill n (fn (i: i64) (pow2x (+ -1074.0 (* (double i) (fdiv 2097.0 (double n)))))))) 2))
+        (check c (<= (worst64 1 (fill n (fn (i: i64) (+ 0.5 (* (double i) (fdiv 1.5 (double n))))))) 2))
+        (check c (<= (worst64 2 (fill (* 2 n) (fn (i: i64) (+ -22.0 (* (double i) 0.00022))))) 2))
+        (check c (<= (worst64 2 (fill n (fn (i: i64) (* (+ -1.0 (* (double i) (fdiv 2.0 (double n)))) 0.6)))) 2))
+        (check c (<= (worst32 0 (fill-f32 n (fn (i: i64) (+ -103.0 (* (double i) (fdiv 191.0 (double n))))))) 1))
+        (check c (<= (worst32 1 (fill-f32 n (fn (i: i64) (pow2x (+ -149.0 (* (double i) (fdiv 277.0 (double n)))))))) 1))
+        (check c (<= (worst32 2 (fill-f32 n (fn (i: i64) (+ -12.0 (* (double i) (fdiv 24.0 (double n))))))) 1))
+        ;; special values
+        (check c (and (= (one64 0 0.0) 1.0) (= (one64 0 (- 0.0 inf)) 0.0) (= (one64 0 inf) inf) (nan? (one64 0 nan))
+                      (= (one64 0 -709.0) 0.0) (= (one64 0 710.0) inf) (= (one64 0 -800.0) 0.0) (= (one64 0 800.0) inf)))
+        (check c (and (= (one64 1 0.0) (- 0.0 inf)) (nan? (one64 1 -1.0)) (nan? (one64 1 (- 0.0 inf))) (= (one64 1 inf) inf)
+                      (nan? (one64 1 nan)) (= (one64 1 1.0) 0.0) (= (one64 1 -0.0) (- 0.0 inf))))
+        (check c (and (= (one64 2 inf) 1.0) (= (one64 2 (- 0.0 inf)) -1.0) (nan? (one64 2 nan)) (= (one64 2 30.0) 1.0)
+                      (= (one64 2 -30.0) -1.0) (= (f64->bits (one64 2 -0.0)) (f64->bits -0.0)) (= (f64->bits (one64 2 0.0)) 0)))
+        ;; every tail length and a strided (transposed) input: the same values as one element at a time
+        (dotimes (len 11)
+          (let ((v (t/from-array [len] (fill len (fn (i: i64) (- (* (double i) 0.7) 2.0))) 0.0)))
+            (do (check c (= (t/to-vec (t/exp v)) (mapv (fn (x: f64) (one64 0 x)) (t/to-vec v))))
+                (check c (= (t/to-vec (t/tanh v)) (mapv (fn (x: f64) (one64 2 x)) (t/to-vec v)))))))
+        (let ((m (t/reshape [3 5] (t/from-array [15] (fill 15 (fn (i: i64) (+ 0.5 (* (double i) 0.3)))) 0.0))))
+          (check c (= (t/to-vec (t/log (t/transpose m))) (mapv (fn (x: f64) (one64 1 x)) (t/to-vec (t/transpose m))))))
+        (check c (= (checks-made c) 35))
+        (checks-result c))))

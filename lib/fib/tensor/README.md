@@ -214,6 +214,20 @@ results can differ in the last bits or more on cancellation-sensitive inputs.
 No cross-target bitwise reproducibility is promised. `sum` and `dot` preserve
 ordered scalar semantics.
 
+## Vector exp, log and tanh
+
+`exp`, `log` and `tanh` map an `f64` or `f32` tensor to a fresh tensor of the same
+shape, four lanes at a time, without a libm call (`fib.tensor.vmath`; the constants
+come from `scripts/bench/tensor/gen-vmath.py`). Measured against libm over dense
+sweeps (case 7080, which asserts these bounds): `exp` at most 1 ULP in
+[-708.396, 709.78] (below, the result is flushed to +0.0, where libm returns
+subnormals; above 709.7827 it is +inf), `log` at most 2 ULP over the whole positive
+range including subnormal inputs, `tanh` at most 2 ULP. `f32` is computed in `f64`
+and rounded back, within 1 ULP of `expf`/`logf`/`tanhf`. Special values follow libm:
+NaN in gives NaN, `log 0 = -inf`, `log x<0 = NaN`, `tanh +-inf = +-1`,
+`tanh -0.0 = -0.0`. Results can differ from the scalar libm in the last place. A
+strided input is first made contiguous.
+
 ## Safety and validation
 
 The `Tensor` descriptor is public so callers can name the generic type.
