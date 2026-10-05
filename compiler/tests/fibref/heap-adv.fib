@@ -104,6 +104,24 @@
     (all [(is-ok "write v over holder" (heap-write h c 0 (obj v))) (ck "v live" (heap-is-live h v)) (is-int "v count" (heap-count h v) 1)
           (ck "holder freed" (not (heap-is-live h holder)))])))
 
+;; ================= the audit line (compiler/tests/golden/fibref/run-ownership.txt formats) =================
+(defun t-the-audit-line-of-a-clean-run () -> str
+  (let [h (heap-new) a (imm h []) _r (rel h a) l (audit-line (heap-finish h))]
+    (ck l (= l "clean=true leak-cycles=0 leaks=0 errors=0"))))
+
+(defun t-the-audit-line-of-a-cycle-leak () -> str
+  (let [h (heap-new) c (cell-of h INone) v (imm h [(obj c)]) _w (wr h c 0 (obj v)) _a (rel h v) _b (rel h c) l (audit-line (heap-finish h))]
+    (ck l (= l "clean=false leak-cycles=2 leaks=0 errors=0"))))
+
+(defun t-the-audit-line-of-a-leak-a-dangling-ref-and-an-open-scope () -> str
+  (let [h1 (heap-new) _a (imm h1 [])
+        h2 (heap-new) x (imm h2 []) c (cell-of h2 INone) v (imm h2 [(obj c) (obj x)]) _w (wr h2 c 0 (obj v)) _1 (rel h2 v) _2 (rel h2 c) _3 (rel h2 x) _4 (rel h2 x)
+        h3 (heap-new) _s (heap-open-scope h3)
+        l1 (audit-line (heap-finish h1)) l2 (audit-line (heap-finish h2)) l3 (audit-line (heap-finish h3))]
+    (all [(ck l1 (= l1 "clean=false leak-cycles=0 leaks=1 errors=0"))
+          (ck l2 (= l2 "clean=false leak-cycles=2 leaks=0 errors=1 [dangling reference #2.1 -> #0]"))
+          (ck l3 (= l3 "clean=false leak-cycles=0 leaks=0 errors=1 [scope 0 never ended]"))])))
+
 (defun main () -> i64
   (min 100
     (run-suite "heap-adv"
@@ -126,4 +144,7 @@
        (tc "rollback-nil-over-dangling" t-a-write-of-nil-over-a-dangling-slot-reports-the-double-free-once)
        (tc "rollback-shared-atom-cell" t-a-write-into-a-shared-atom-that-fails-on-a-cell-retains-and-shares-nothing)
        (tc "rollback-failed-alloc-prefix" t-a-failed-alloc-after-a-valid-prefix-retains-nothing)
-       (tc "rollback-old-value-kept-alive" t-writing-a-ref-that-only-the-old-value-kept-alive-keeps-it-alive)])))
+       (tc "rollback-old-value-kept-alive" t-writing-a-ref-that-only-the-old-value-kept-alive-keeps-it-alive)
+       (tc "audit-line-clean" t-the-audit-line-of-a-clean-run)
+       (tc "audit-line-cycle" t-the-audit-line-of-a-cycle-leak)
+       (tc "audit-line-leak-dangling-scope" t-the-audit-line-of-a-leak-a-dangling-ref-and-an-open-scope)])))
