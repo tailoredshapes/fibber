@@ -1,0 +1,173 @@
+;; fib.tensor against NumPy (docs/shootout/tensor.md). One process runs one kernel:
+;;   bench KERNEL N RUNS      prints "t <ns>" per run (run 0 is the warmup) and "cs <checksum>"
+;; Inputs are built outside the timed region from the same integer formulas as bench.py
+;; (dyadic fractions, exact in f32 and f64); the checksum is computed outside it too, from
+;; the first run's result (sum of squares of every element, accumulated in f64).
+(ns main (:require [fib.tensor :as t] [fib.math :as math] [tb.libm :as libm]))
+
+;; gen: flavour 0 = ((i mod 97) - 48)/8, 1 = ((7i mod 89) - 44)/16, 2 = ((5i mod 83) - 41)/32
+(defun gen64 (i: i64 flavor: i64) -> f64
+  (cond (= flavor 0) (fdiv (double (- (rem i 97) 48)) 8.0)
+        (= flavor 1) (fdiv (double (- (rem (* i 7) 89) 44)) 16.0)
+        :else (fdiv (double (- (rem (* i 5) 83) 41)) 32.0)))
+
+(defun gen32 (i: i64 flavor: i64) -> f32
+  (cond (= flavor 0) (fdiv (float (- (rem i 97) 48)) 8.0f32)
+        (= flavor 1) (fdiv (float (- (rem (* i 7) 89) 44)) 16.0f32)
+        :else (fdiv (float (- (rem (* i 5) 83) 41)) 32.0f32)))
+
+(defun count-of (dims: (Vec i64)) -> i64
+  (loop ((i 0) (n 1)) (if (< i (count dims)) (recur (+ i 1) (* n (nth dims i))) n)))
+
+(defun make64 (dims: (Vec i64) flavor: i64) -> (t/Tensor f64)
+  (let ((n (count-of dims)) (buf (cell (array n 0.0))))
+    (do (dotimes (i n) (array-set! &buf i (gen64 i flavor)))
+        (t/from-array dims @buf 0.0))))
+
+(defun make32 (dims: (Vec i64) flavor: i64) -> (t/Tensor f32)
+  (let ((n (count-of dims)) (buf (cell (array n 0.0f32))))
+    (do (dotimes (i n) (array-set! &buf i (gen32 i flavor)))
+        (t/from-array dims @buf 0.0f32))))
+
+(defun cs64 (x: (t/Tensor f64)) -> f64
+  (let ((a (t/to-array x)) (n (t/size x)))
+    (loop ((i 0) (acc 0.0)) (if (< i n) (let ((v (array-get a i))) (recur (+ i 1) (+ acc (* v v)))) acc))))
+
+(defun cs32 (x: (t/Tensor f32)) -> f64
+  (let ((a (t/to-array x)) (n (t/size x)))
+    (loop ((i 0) (acc 0.0))
+      (if (< i n) (let ((v (double (array-get a i)))) (recur (+ i 1) (+ acc (* v v)))) acc))))
+
+(defun lap (start: i64) -> unit (println "t " (- (sys-clock-now) start)))
+
+;; ---- kernels: each builds inputs, then runs RUNS times; result destroyed outside the timing ----
+
+(defun k-matmul64 (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n n] 0)) (b (make64 [n n] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (c (t/mmul a b)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 c))))))))
+
+(defun k-matmul32 (n: i64 runs: i64) -> unit
+  (let ((a (make32 [n n] 0)) (b (make32 [n n] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (c (t/mmul a b)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs32 c))))))))
+
+(defun k-fma64 (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n] 0)) (b (make64 [n] 1)) (c (make64 [n] 2)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (d (t/add (t/mul a b) c)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 d))))))))
+
+(defun k-fma32 (n: i64 runs: i64) -> unit
+  (let ((a (make32 [n] 0)) (b (make32 [n] 1)) (c (make32 [n] 2)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (d (t/add (t/mul a b) c)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs32 d))))))))
+
+;; scalar reductions: checksum is the value itself
+(defun k-sum (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/sum a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " v)))))))
+
+(defun k-sumfast (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/sum-fast a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " v)))))))
+
+(defun k-mean (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/mean a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " v)))))))
+
+(defun k-max (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/maximum a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " v)))))))
+
+;; axis reductions on n x n (kind: 0 sum axis 0, 1 sum axis 1, 2 max axis 0, 3 max axis 1)
+(defun axis-op (kind: i64 a: (t/Tensor f64)) -> (t/Tensor f64)
+  (cond (= kind 0) (t/sum-axis 0 false a)
+        (= kind 1) (t/sum-axis 1 false a)
+        (= kind 2) (t/maximum-axis 0 false a)
+        :else (t/maximum-axis 1 false a)))
+
+(defun k-axis (kind: i64 n: i64 runs: i64) -> unit
+  (let ((a (make64 [n n] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (axis-op kind a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
+(defun k-bcast (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n n] 1)) (row (make64 [n] 2)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/add a row)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
+;; softmax over rows of n x n: exp(x - rowmax) / rowsum
+(defun softmax (x: (t/Tensor f64)) -> (t/Tensor f64)
+  (let ((m (t/maximum-axis -1 true x))
+        (ex (t/map (fn (v: f64) (unsafe (libm/exp v))) (t/sub x m))))
+    (t/div ex (t/sum-axis -1 true ex))))
+
+(defun k-softmax (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n n] 2)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (softmax a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
+;; layernorm over the last axis of rows x 1024 (rows = n): (x - mu)/sqrt(var + 1e-5) * gamma + beta
+(defun layernorm (x: (t/Tensor f64) gamma: (t/Tensor f64) beta: (t/Tensor f64)) -> (t/Tensor f64)
+  (let ((mu (t/mean-axis -1 true x))
+        (xc (t/sub x mu))
+        (var (t/mean-axis -1 true (t/mul xc xc)))
+        (inv (t/map (fn (v: f64) (fdiv 1.0 (math/sqrt (+ v 0.00001)))) var)))
+    (t/add (t/mul (t/mul xc inv) gamma) beta)))
+
+(defun k-layernorm (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n 1024] 1)) (g (make64 [1024] 2)) (b (make64 [1024] 0)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (layernorm a g b)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
+;; MLP forward, f32: relu(x W1 + b1) W2 + b2, x is n x 784, 784-512-10
+(defun relu (x: (t/Tensor f32)) -> (t/Tensor f32)
+  (t/where (t/greater x (t/full [] 0.0f32)) x (t/full [] 0.0f32)))
+
+(defun mlp (x: (t/Tensor f32) w1: (t/Tensor f32) b1: (t/Tensor f32) w2: (t/Tensor f32) b2: (t/Tensor f32))
+  -> (t/Tensor f32)
+  (t/add (t/mmul (relu (t/add (t/mmul x w1) b1)) w2) b2))
+
+(defun k-mlp (n: i64 runs: i64) -> unit
+  (let ((x (make32 [n 784] 1)) (w1 (make32 [784 512] 2)) (b1 (make32 [512] 0))
+        (w2 (make32 [512 10] 2)) (b2 (make32 [10] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (mlp x w1 b1 w2 b2)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs32 v))))))))
+
+(defun main () -> i64
+  (let ((k (nth (args) 0)) (n (unwrap (parse-long (nth (args) 1)))) (runs (unwrap (parse-long (nth (args) 2)))))
+    (do (cond (= k "matmul64") (k-matmul64 n runs)
+              (= k "matmul32") (k-matmul32 n runs)
+              (= k "fma64") (k-fma64 n runs)
+              (= k "fma32") (k-fma32 n runs)
+              (= k "sum") (k-sum n runs)
+              (= k "sumfast") (k-sumfast n runs)
+              (= k "mean") (k-mean n runs)
+              (= k "max") (k-max n runs)
+              (= k "sum0") (k-axis 0 n runs)
+              (= k "sum1") (k-axis 1 n runs)
+              (= k "max0") (k-axis 2 n runs)
+              (= k "max1") (k-axis 3 n runs)
+              (= k "bcast") (k-bcast n runs)
+              (= k "softmax") (k-softmax n runs)
+              (= k "layernorm") (k-layernorm n runs)
+              (= k "mlp") (k-mlp n runs)
+              :else (println "unknown kernel " k))
+        0)))
