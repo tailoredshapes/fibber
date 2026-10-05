@@ -2,21 +2,19 @@
 ;; file and the command line (`--only SUBSTR`, `--seed N`, `-j N`, `--format plain|json`, `--list`, `--no-isolate`, `--timeout SECS`)
 ;; and returns the exit status: 0 every scenario held, 1 one did not, 2 the command line or a selection that matches nothing.
 ;;
-;; ISOLATION. A failed `expect` is a value (`Broke`) and never stops anything. A trap, an exhausted stack or a hang is the scenario
-;; process's own: each scenario runs in a child made by `fork` (no exec, so no start-up cost and the scenario closure is simply
-;; called), which writes what its steps came to into a file of the run's scratch directory and `_exit`s; its standard error goes to a
-;; second file. The parent reads both, so a trap becomes a row with the trap's message, not the end of the run. This is the interim
-;; mechanism of the design until a task's trap is returned by `join` (L28 step 1); only `run-isolated` changes then.
+;; ISOLATION. A failed `expect` is a value (`Broke`) and never stops anything. A trap is the scenario's own, and there are two ways to keep it
+;; from ending the run (`--isolate`):
+;;   task (the default)  each scenario runs in a task (`spawn`) and `try-join` returns its trap, so a trap is a row, not the end. No process,
+;;                       no files; a trap's message is the row's. What it cannot survive: a hang (nothing kills a thread), a stack that is
+;;                       exhausted or memory that runs out (fatal for the process), a scenario that corrupts shared state.
+;;   fork                each scenario runs in a child made by `fib.os.process/fork-start` (no exec: the scenario closure is simply called),
+;;                       whose result, standard output and error come back in files; `--timeout SECS` (which selects fork) kills a hang
+;;                       (status 142, reported `TIME`); a crash is the child's, so it is a row. Costs a process per scenario (docs/design/
+;;                       test-harness.md 5.5) and is refused once this process has other threads (`fork-start`).
+;;   none                everything in this thread; the first trap ends the run.
 (ns fib.test.run
   (:use fib.core fib.seq fib.coll fib.print fib.test.core fib.test.gen)
-  (:require [fib.os :as os] [fib.os.native :as n] [fib.string :as s]))
-
-(extern fork :private () -> i32)
-(extern dup2 :private (i32 i32) -> i32)
-(extern creat :private (ptr i32) -> i32)
-(extern waitpid :private (i32 ptr i32) -> i32)
-(extern _exit :private (i32) -> unit)
-(extern alarm :private (i32) -> i32)
+  (:require [fib.os :as os] [fib.async :as as] [fib.string :as s]))
 
 ;; ---- what crosses the process boundary: one line per step, fields apart by a tab, `\`, tab and newline escaped ----------------------
 
@@ -72,54 +70,22 @@
 (defun failed-row :private (sc: Scenario head: str impl: str status: str message: str) -> ScenarioRow
   (ScenarioRow head impl (. sc id) (. sc text) (. sc covers) (. sc steps) status [] message))
 
-;; In the child: standard error to the file `errp` names, an alarm, the scenario run, its steps written to `out`, then out without unwinding.
-;; The child allocates nothing before it has its own standard error: in trace mode (FIB_TRACE) its allocation lines would go to the
-;; parent's trace under ordinals the parent also uses, so the path is made in the parent and the descriptor is the first thing the child makes.
-(defun child-run :private (sc: Scenario seed: i64 out: str errp: ptr secs: i64) -> unit
-  (unsafe
-    (let ((fe (creat errp 384i32)))
-      (do (dup2 fe 2i32)
-          (alarm (trunc i32 secs))
-          (write-file out (encode ((. sc run) seed)))
-          (_exit 0i32)))))
-
-;; The exit status of a process as waitpid says it: the code, or 128 and the signal.
-(defun decode-status :private (w: i64) -> i64
-  (if (= (bit-and w 127) 0) (bit-and (quot w 256) 255) (+ 128 (bit-and w 127))))
-
-(defstruct ChildEnded (pid: i64 status: i64))
-
-(defun wait-any :private () -> ChildEnded
-  (unsafe
-    (let ((st (alloc 8))
-          (r (waitpid -1i32 st 0i32))
-          (status (if (< r 0i32) -1 (decode-status (sext i64 (load-i32 st))))))
-      (do (free st) (ChildEnded (sext i64 r) status)))))
-
-;; Starts the child of a scenario; its pid, or -1.
-(defun start :private (sc: Scenario seed: i64 out: str err: str secs: i64) -> i64
-  (unsafe
-    (let ((errp (n/c-text err))
-          (pid (fork)))
-      (cond (< pid 0i32) (do (free errp) -1)
-            (= pid 0i32) (do (child-run sc seed out errp secs) 0)
-            :else (do (free errp) (sext i64 pid))))))
-
 (defun last-line :private (text: str) -> str
   (let ((ls (filter (fn (l: str) (not (= l ""))) (s/split-lines text))))
     (if (empty? ls) "" (nth (vec ls) (- (count (vec ls)) 1)))))
 
 ;; What a finished child came to.
-(defun row-of-child :private (sc: Scenario head: str impl: str status: i64 out: str err: str) -> ScenarioRow
-  (cond (= status 142) (failed-row sc head impl "timeout" "killed by the alarm: the scenario did not finish in time")
-        (not (= status 0)) (failed-row sc head impl "trap" (str "exit " status ": " (last-line (unwrap-or (read-file err) ""))))
-        :else (match (read-file out)
+(defun row-of-child :private (sc: Scenario head: str impl: str f: os/Forked) -> ScenarioRow
+  (cond (. f timed-out) (failed-row sc head impl "timeout" "killed by the alarm: the scenario did not finish in time")
+        (not (= (. f status) 0)) (failed-row sc head impl "trap" (str "exit " (. f status) ": " (last-line (. f err))))
+        :else (match (. f result)
                 (nil (failed-row sc head impl "trap" "the scenario process left no result"))
                 ((some text) (judged-row sc head impl (decode text))))))
 
 ;; ---- the run ----------------------------------------------------------------------------------------------------------------------
 
-(defstruct SpecOpts (only: str seed: i64 jobs: i64 format: str list: bool isolate: bool secs: i64))
+;; `isolate` is "task", "fork" or "none"; `secs` is the fork child's alarm.
+(defstruct SpecOpts (only: str seed: i64 jobs: i64 format: str list: bool isolate: str secs: i64))
 
 (defstruct ScenarioJob (suite: Suite sc: Scenario seed: i64))
 
@@ -139,24 +105,49 @@
 (defun run-here :private (j: ScenarioJob) -> ScenarioRow
   (judged-row (. j sc) (. (. j suite) head) (. (. j suite) impl) ((. (. j sc) run) (. j seed))))
 
-;; Rows of all jobs in order, `jobs` children at a time.
-(defun run-isolated (js: (Vec ScenarioJob) tmp: str jobs: i64 secs: i64) -> (Vec ScenarioRow)
+;; ---- task isolation: a scenario in a task, its trap returned by `try-join` ----------------------------------------------------------
+
+;; The row of a joined task: the steps it returned, or the trap that ended it.
+(defun row-of-task :private (j: ScenarioJob r: (Result (Vec StepRun) as/Trap)) -> ScenarioRow
+  (match r
+    ((Ok steps) (judged-row (. j sc) (. (. j suite) head) (. (. j suite) impl) steps))
+    ((Err trap) (failed-row (. j sc) (. (. j suite) head) (. (. j suite) impl) "trap" (str "trap: " (. trap message))))))
+
+;; `jobs` scenarios at a time, each in a task; the rows in order.
+(defun run-tasks (js: (Vec ScenarioJob) jobs: i64) -> (Vec ScenarioRow)
+  (loop ((rest js) (rows []))
+    (if (empty? rest)
+        rows
+        (let ((batch (vec (take jobs rest)))
+              (tasks (mapv (fn (j: ScenarioJob) (let ((run (. (. j sc) run)) (seed (. j seed))) (spawn (fn () (run seed))))) batch)))
+          (recur (vec (drop jobs rest))
+                 (into rows (mapv (fn (i: i64) (row-of-task (nth batch i) (as/try-join (nth tasks i)))) (range (count batch)))))))))
+
+;; ---- fork isolation: a scenario in a child process (fib.os.process/fork-start) -----------------------------------------------------
+
+;; The result of a scenario written for the parent: the steps, one line each.
+(defun child-result (sc: Scenario seed: i64) -> str
+  (encode ((. sc run) seed)))
+
+;; Rows of all jobs in order, `jobs` children at a time. A child's files are `tmp/N.res|out|err`.
+(defun run-forked (js: (Vec ScenarioJob) tmp: str jobs: i64 secs: i64) -> (Vec ScenarioRow)
   (let ((rows (loop ((next 0) (running {}) (done {}))
                 (cond (and (< next (count js)) (< (count running) jobs))
                         (let ((j (nth js next))
-                              (pid (start (. j sc) (. j seed) (str tmp "/" next ".out") (str tmp "/" next ".err") secs)))
-                          (if (< pid 0)
-                              (recur (+ next 1) running (assoc done next (failed-row (. j sc) (. (. j suite) head) (. (. j suite) impl) "trap" "fork failed")))
-                              (recur (+ next 1) (assoc running pid next) done)))
+                              (sc (. j sc))
+                              (seed (. j seed)))
+                          (match (os/fork-start tmp (str next) secs (fn () (child-result sc seed)))
+                            ((Err e) (recur (+ next 1) running (assoc done next (failed-row sc (. (. j suite) head) (. (. j suite) impl) "trap" (str "fork failed: " (. e message))))))
+                            ((Ok c) (recur (+ next 1) (assoc running (. c pid) (Pair next c)) done))))
                       (empty? running) done
-                      :else (let ((e (wait-any)))
+                      :else (let ((e (os/wait-any-child)))
                               (match (get running (. e pid))
                                 (nil (recur next (if (< (. e pid) 0) {} running) done))
-                                ((some i)
-                                 (let ((j (nth js i)))
+                                ((some p)
+                                 (let ((j (nth js (. p fst))))
                                    (recur next (dissoc running (. e pid))
-                                          (assoc done i (row-of-child (. j sc) (. (. j suite) head) (. (. j suite) impl) (. e status)
-                                                                      (str tmp "/" i ".out") (str tmp "/" i ".err")))))))))))
+                                          (assoc done (. p fst) (row-of-child (. j sc) (. (. j suite) head) (. (. j suite) impl)
+                                                                              (os/fork-collect (. p snd) (. e status))))))))))))
         (lost (fn (i: i64) (failed-row (. (nth js i) sc) (. (. (nth js i) suite) head) (. (. (nth js i) suite) impl) "trap" "its process was lost"))))
     (mapv (fn (i: i64) (unwrap-or (get rows i) (lost i))) (range (count js)))))
 
@@ -232,52 +223,90 @@
 (defun list-plain :private (js: (Vec ScenarioJob)) -> str
   (str-join (mapv (fn (j: ScenarioJob) (str (. (. j sc) id) "\n" (str-join (mapv (fn (l: str) (str "    " l "\n")) (. (. j sc) steps))))) js)))
 
+;; ---- TAP: one `ok`/`not ok` line per scenario, a `#` line for what broke ------------------------------------------------------------
+
+(defun tap-diag :private (r: ScenarioRow) -> str
+  (str-join (mapv (fn (s: StepRun)
+                    (match (. s judged)
+                      ((Held) "")
+                      ((Broke e a) (str "# " (. s text) ": expected " e ", actual " a "\n"))))
+                  (. r steps))))
+
+(defun tap-row :private (r: ScenarioRow n: i64) -> str
+  (str (if (= (. r status) "pass") "ok " "not ok ") n " - " (. r id)
+       (if (= (. r status) "pass") "" (str " # " (. r status) (if (= (. r message) "") "" (str ": " (. r message)))))
+       "\n" (tap-diag r)))
+
+;; TAP version 13: the plan first, a `# seed` line so a failure is replayable from the log.
+(defun tap (rows: (Vec ScenarioRow) seed: i64) -> str
+  (str "TAP version 13\n1.." (count rows) "\n# seed " seed "\n"
+       (str-join (mapv (fn (i: i64) (tap-row (nth rows i) (+ i 1))) (range (count rows))))))
+
 ;; ---- the command line ---------------------------------------------------------------------------------------------------------------
 
+(defun flag-with-value? :private (a: str) -> bool
+  (some? (first (filter (fn (f: str) (= f a)) ["--only" "--seed" "-j" "--jobs" "--timeout" "--format" "--isolate"]))))
+
+(defun canon-flag :private (a: str) -> str
+  (cond (= a "-j") "jobs" (= a "--jobs") "jobs" :else (str-slice a 2 (str-len a))))
+
+(defun int-flag :private (m: (Map str str) key: str default: i64) -> (Result i64 str)
+  (match (get m key)
+    (nil (Ok default))
+    ((some v) (match (parse-long v) (nil (Err (str "--" key " wants an integer"))) ((some n) (Ok n))))))
+
+(defun opts-of :private (m: (Map str str)) -> (Result SpecOpts str)
+  (try-let ((seed (int-flag m "seed" 1))
+            (jobs (int-flag m "jobs" 1))
+            (secs (int-flag m "timeout" 60)))
+    (let ((fmt (unwrap-or (get m "format") "plain"))
+          (iso (unwrap-or (get m "isolate") (if (some? (get m "timeout")) "fork" "task"))))
+      (cond (not (or (= fmt "plain") (or (= fmt "json") (= fmt "tap")))) (Err "--format is plain, tap or json")
+            (not (or (= iso "task") (or (= iso "fork") (= iso "none")))) (Err "--isolate is task, fork or none")
+            :else (Ok (SpecOpts (unwrap-or (get m "only") "") seed (max jobs 1) fmt (some? (get m "list")) iso secs))))))
+
 (defun parse-args :private (as: (Vec str)) -> (Result SpecOpts str)
-  (loop ((i 0) (o (SpecOpts "" 1 1 "plain" false true 60)))
+  (loop ((i 0) (m {}))
     (if (>= i (count as))
-        (Ok o)
+        (opts-of m)
         (let ((a (nth as i))
               (v (if (< (+ i 1) (count as)) (nth as (+ i 1)) "")))
-          (cond (= a "--only") (recur (+ i 2) (SpecOpts v (. o seed) (. o jobs) (. o format) (. o list) (. o isolate) (. o secs)))
-                (= a "--seed") (match (parse-long v) (nil (Err "--seed wants an integer"))
-                                 ((some n) (recur (+ i 2) (SpecOpts (. o only) n (. o jobs) (. o format) (. o list) (. o isolate) (. o secs)))))
-                (or (= a "-j") (= a "--jobs")) (match (parse-long v) (nil (Err "-j wants an integer"))
-                                 ((some n) (recur (+ i 2) (SpecOpts (. o only) (. o seed) (max n 1) (. o format) (. o list) (. o isolate) (. o secs)))))
-                (= a "--timeout") (match (parse-long v) (nil (Err "--timeout wants an integer"))
-                                 ((some n) (recur (+ i 2) (SpecOpts (. o only) (. o seed) (. o jobs) (. o format) (. o list) (. o isolate) n))))
-                (= a "--format") (if (or (= v "plain") (= v "json"))
-                                     (recur (+ i 2) (SpecOpts (. o only) (. o seed) (. o jobs) v (. o list) (. o isolate) (. o secs)))
-                                     (Err "--format is plain or json"))
-                (= a "--list") (recur (+ i 1) (SpecOpts (. o only) (. o seed) (. o jobs) (. o format) true (. o isolate) (. o secs)))
-                (= a "--no-isolate") (recur (+ i 1) (SpecOpts (. o only) (. o seed) (. o jobs) (. o format) (. o list) false (. o secs)))
+          (cond (flag-with-value? a) (recur (+ i 2) (assoc m (canon-flag a) v))
+                (= a "--list") (recur (+ i 1) (assoc m "list" "1"))
+                (= a "--no-isolate") (recur (+ i 1) (assoc m "isolate" "none"))
                 :else (Err (str "unknown argument " a)))))))
 
 (defun report :private (rows: (Vec ScenarioRow) o: SpecOpts) -> i64
-  (do (print (if (= (. o format) "json") (json rows (. o seed)) (plain rows (. o seed))))
+  (do (print (cond (= (. o format) "json") (json rows (. o seed))
+                   (= (. o format) "tap") (tap rows (. o seed))
+                   :else (plain rows (. o seed))))
       (if (= (count (filter (fn (r: ScenarioRow) (not (= (. r status) "pass"))) rows)) 0) 0 1)))
 
+(defun run-forked-in :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
+  (match (os/create-temp-directory (str (os/temp-directory) "/fibtest-XXXXXX"))
+    ((Err _) (do (eprintln "fibc test: cannot make a scratch directory") 2))
+    ((Ok tmp) (let ((rows (run-forked js tmp (. o jobs) (. o secs))))
+                (do (os/remove-directory tmp)
+                    (report rows o))))))
+
 (defun run-jobs :private (js: (Vec ScenarioJob) o: SpecOpts) -> i64
-  (if (not (. o isolate))
-      (report (mapv run-here js) o)
-      (match (os/create-temp-directory (str (os/temp-directory) "/fibtest-XXXXXX"))
-        ((Err _) (do (eprintln "fibc test: cannot make a scratch directory") 2))
-        ((Ok tmp) (let ((rows (run-isolated js tmp (. o jobs) (. o secs))))
-                    (do (doseq [i (range (count js))]
-                          (do (os/remove-file (str tmp "/" i ".out")) (os/remove-file (str tmp "/" i ".err"))))
-                        (os/remove-directory tmp)
-                        (report rows o)))))))
+  (cond (= (. o isolate) "none") (report (mapv run-here js) o)
+        (= (. o isolate) "task") (report (run-tasks js (. o jobs)) o)
+        :else (run-forked-in js o)))
 
 ;; The whole run of a spec file: its suites and the command line (`(args)`).
 (defun run-main (suites: (Vec Suite)) -> i64
-  (match (parse-args (vec (args)))
+  (run-main-with suites (vec (args))))
+
+;; The same with the command line given (a spec that is a case passes its own words).
+(defun run-main-with (suites: (Vec Suite) argv: (Vec str)) -> i64
+  (match (parse-args argv)
     ((Err m) (do (eprintln (str "fibc test: " m)) 2))
     ((Ok o)
-     (let ((js (jobs-of suites o)))
-       (cond (not (= (count (set (mapv (fn (j: ScenarioJob) (. (. j sc) id)) (jobs-of suites (SpecOpts "" 1 1 "plain" false true 60)))))
-                     (count (jobs-of suites (SpecOpts "" 1 1 "plain" false true 60)))))
+     (let ((all (jobs-of suites (SpecOpts "" 1 1 "plain" false "none" 60)))
+           (js (jobs-of suites o)))
+       (cond (not (= (count (set (mapv (fn (j: ScenarioJob) (. (. j sc) id)) all))) (count all)))
                (do (eprintln "fibc test: two scenarios have the same id; give one an (id \"..\")") 2)
-             (empty? js)(do (eprintln (str "fibc test: no scenario matches '" (. o only) "'; a run with nothing to run is not a pass")) 2)
+             (empty? js) (do (eprintln (str "fibc test: no scenario matches '" (. o only) "'; a run with nothing to run is not a pass")) 2)
              (. o list) (do (print (list-plain js)) 0)
              :else (run-jobs js o))))))

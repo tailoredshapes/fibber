@@ -56,7 +56,7 @@ creates an inheritable descriptor; use `set-inheritable` when needed.
 | `fib.os.directories` | `list-directory`, `create-temp-directory template` |
 | `fib.os.time` | checked `monotonic-ns`, `wall-ns`, `sleep-ns`; convenience `clock-now`, `wall-now` |
 | `fib.os.environment` | `getenv`, `setenv`, `unsetenv`, `temp-directory` |
-| `fib.os.process` | `process-id`, `parent-process-id`, `executable-path`, `current-directory`, `change-directory` |
+| `fib.os.process` | `process-id`, `parent-process-id`, `executable-path`, `current-directory`, `change-directory`, `thread-count`, `fork-run` and `fork-start`, `wait-any-child`, `wait-child`, `fork-collect` (a closure run in a child process; refused while other threads exist) |
 | `fib.os.system` | `system-info`, `page-size`, `available-cpus` |
 | `fib.os.random` | `random-bytes size` |
 | `fib.os.platform` | `current`, `name`, `from-name`; `Platform` variants `Linux`, `Darwin`, `Unsupported` |

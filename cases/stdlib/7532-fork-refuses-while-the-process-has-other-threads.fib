@@ -1,0 +1,36 @@
+;; spec: docs/design/test-harness.md 5; fib.os.process fork-start (threads)
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; POSIX leaves only the forking thread in the child, so fork-start refuses while another thread exists (a running task's thread, the pool's
+;; workers once an `async` has started them). A spawned task's thread is detached and gone once the task is joined, so fork works after a `join`.
+;; Planted fault (scripts/mutant-fork.sh no-guard): the guard gives up and forks anyway, so the fork while a task runs succeeds.
+(ns main (:use tl.check fib.async) (:require [fib.os :as os]))
+
+(defun forked-ok? (dir: str tag: str) -> bool
+  (match (os/fork-run dir tag 10 (fn () "child"))
+    ((Ok r) (and (= (. r status) 0) (= (. r result) (some "child"))))
+    ((Err _) false)))
+
+(defun main () -> i64
+  (let [c (checks)
+        dir (match (os/create-temp-directory (str (os/temp-directory) "/fibfork-XXXXXX")) ((Ok d) d) ((Err _) "/tmp"))
+        before (forked-ok? dir "before")
+        joined (join (spawn (fn () 7)))
+        after-spawn (forked-ok? dir "after-spawn")
+        busy (spawn (fn () (do (os/sleep-ns 400000000) 8)))
+        threads (os/thread-count)
+        refused (os/fork-run dir "while-busy" 10 (fn () "child"))
+        pooled (join busy)
+        after-join (forked-ok? dir "after-join")]
+    (do (check c before)
+        (check c (= joined 7))
+        (check c after-spawn)
+        (check c (= pooled 8))
+        (check c (match refused ((Err e) (and (= (. e kind) os/InvalidInput) (= (. e operation) "fork"))) (_ false)))
+        (check c (match threads ((some n) (> n 1)) (_ false)))
+        (check c after-join)
+        (os/remove-directory dir)
+        (checks-result c))))

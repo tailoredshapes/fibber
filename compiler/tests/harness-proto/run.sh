@@ -7,6 +7,8 @@
 #   3. a planted fault in the association list (assoc appends a duplicate key) fails exactly that scenario of that implementation and
 #      nothing of the library's Map: the fault is shown, then the tree's alist.fib is untouched (the plant is made in a copy);
 #   4. replay: the same seed gives the same report, another seed gives another counterexample draw;
+#   6. isolation modes: task (default) and fork give the same counts and the same ids; a trap is a row in both; a hang is a `timeout` row
+#      under `--timeout` (fork) with the scenarios around it reported; `--format tap` is a plan plus one line per scenario;
 #   5. cases/: a spec file is also a `fibc cases` case, its verdict the exit value of `main`, its memory audit clean through the forks.
 # usage: compiler/tests/harness-proto/run.sh        environment: FIBC (a stage 2 with `unchecked-add`; default the tree's gate F), FIB_LIB
 #   (default this tree's lib), SCRATCH (default ~/.cache/fibber-scratch/harness-proto). Exit 0 when every check held.
@@ -22,6 +24,7 @@ fails=0
 check() { if [ "$2" = "$3" ]; then echo "ok    $1"; else echo "FAIL  $1: got [$2] want [$3]"; fails=$((fails+1)); fi; }
 
 "$FIBC" build "$R/compiler/tests/harness-proto/map-spec.fib" -o "$S/spec" || exit 2
+"$FIBC" build "$R/compiler/tests/harness-proto/hang-spec.fib" -o "$S/hang" || exit 2
 
 out=$("$S/spec"); st=$?
 check "1 exit status of a run with failures" "$st" 1
@@ -51,7 +54,20 @@ check "4 another seed, another draw" "$([ "$a" != "$c" ] && echo differ || echo 
 out=$("$FIBC" cases "$R/compiler/tests/harness-proto/cases"); st=$?
 echo "$out"
 check "5 spec files as cases (verdict = the run's exit value, audit clean in the parent and the forked children)" \
-  "$(echo "$out" | grep -E '^[0-9]+ cases:')" "3 cases: 3 pass, 0 fail, 0 pending, 0 header error"
+  "$(echo "$out" | grep -E '^[0-9]+ cases:')" "4 cases: 4 pass, 0 fail, 0 pending, 0 header error"
+
+t=$("$S/spec" --isolate task --format json | grep -o '"id":"[^"]*","text":"[^"]*","covers":\[[^]]*\],"status":"[a-z]*"'); f=$("$S/spec" --isolate fork -j 4 --format json | grep -o '"id":"[^"]*","text":"[^"]*","covers":\[[^]]*\],"status":"[a-z]*"')
+check "6 task and fork isolation: the same ids and statuses" "$t" "$f"
+check "6 the trap row says the trap (task)" "$("$S/spec" --only a-trap-is-isolated | grep -c 'trap: nth: index out of range')" 1
+check "6 the trap row says the trap (fork)" "$("$S/spec" --isolate fork --only a-trap-is-isolated | grep -c 'exit 134: trap: nth: index out of range')" 1
+out=$("$S/hang" --timeout 1); st=$?
+check "6 hang: exit" "$st" 1
+check "6 hang: counts" "$(echo "$out" | grep -E '^[0-9]+ scenarios:')" "3 scenarios: 2 pass, 0 fail, 0 trap, 1 timeout (seed 1)"
+check "6 hang: the row" "$(echo "$out" | grep -c '^  TIME  a scenario that loops forever')" 1
+out=$("$S/spec" --only every-vector --format tap --seed 7)
+check "6 tap: the plan, then one not ok line" "$(echo "$out" | grep -E '^(1\.\.1|not ok 1 - Vec/every-vector-is-shorter-than-3-planted-false # fail)$' | tr '\n' '|')" "1..1|not ok 1 - Vec/every-vector-is-shorter-than-3-planted-false # fail|"
+"$S/spec" --no-isolate >/dev/null 2>&1; check "6 without isolation the same trap ends the run (so check 1 can fail): exit 134" "$?" 134
+"$S/spec" --isolate bogus >/dev/null 2>&1; check "6 a bad --isolate is a usage error (2)" "$?" 2
 
 echo "harness-proto: $fails failed"
 exit $((fails > 0))

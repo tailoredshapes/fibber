@@ -1,0 +1,39 @@
+;; spec: docs/design/test-harness.md 5 (isolation), exceptions.md 8; fib.os.process fork-run
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; covers: process-id
+;; fork-run runs a closure in a child process and says how it ended, without the child's frames, trap or hang reaching the parent.
+;; Planted faults (scripts/mutant-fork.sh): the status decode drops the signal (trap and hang read as 0); the child does not redirect
+;; its output; the alarm is not set; the child returns into the caller (state shared with the parent would show).
+(ns main (:use tl.check) (:require [fib.os :as os]))
+
+(defun scratch () -> str
+  (match (os/create-temp-directory (str (os/temp-directory) "/fibfork-XXXXXX")) ((Ok d) d) ((Err _) "/tmp")))
+
+(defun run (dir: str tag: str secs: i64 f: (fn () str)) -> os/Forked
+  (match (os/fork-run dir tag secs f)
+    ((Ok r) r)
+    ((Err e) (os/Forked -9 false nil "" (. e message)))))
+
+(defun main () -> i64
+  (let [c (checks) dir (scratch) mine (os/process-id) shared (cell 1)
+        ok (run dir "ok" 10 (fn () (do (println "from the child") (str "pid-differs:" (not (= (os/process-id) mine))))))
+        trapped (run dir "trap" 10 (fn () (str (nth [1 2] 5))))
+        hung (run dir "hang" 1 (fn () (loop ((i 0)) (recur (+ i 1)))))
+        mutated (run dir "mutate" 10 (fn () (do (set! shared 99) "set")))]
+    (do (check c (= (. ok status) 0))
+        (check c (= (. ok result) (some "pid-differs:true")))
+        (check c (= (. ok out) "from the child\n"))
+        (check c (= (. trapped status) 134))
+        (check c (= (. trapped result) nil))
+        (check c (some? (str-find (. trapped err) "index out of range" 0)))
+        (check c (and (= (. hung status) 142) (. hung timed-out) (= (. hung result) nil)))
+        (check c (= (. mutated result) (some "set")))
+        (check c (= @shared 1))
+        (check c (= (os/process-id) mine))
+        (check c (match (os/list-directory dir) ((Ok es) (= (count es) 0)) (_ false)))
+        (os/remove-directory dir)
+        (checks-result c))))

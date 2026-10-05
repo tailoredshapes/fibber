@@ -255,17 +255,23 @@ candidate that still fails replaces it, at most 500 steps), the report quoting t
 
 1. Assertions are values (2.2): `expect` appends `Broke`; no trap. Measured: a scenario with a wrong claim and the scenarios after it all
    report (8.1).
-2. Unexpected traps (`nth` out of range, overflow, `(trap ..)`) abort the process (spec/types.md §2.11: no handler). L28 step 1 will
-   return a task's trap from `join`; then `run-isolated` becomes `(try-join (spawn (fn () (run sc seed))))`, per scenario, and nothing
-   else changes. Until then:
-3. **Interim: `fork` without `exec`.** The child *calls the scenario closure itself* (no re-entry by name, so no second compile and no
-   selection logic), writes `encode(steps)` to a file in the run's scratch directory (a tab-separated line per step, `\`, tab and
-   newline escaped), and `_exit`s. Its standard error is a second file (the trap message is the last line), an `alarm` kills a hang
-   (status 142, reported `TIME`). The parent runs `-j N` children at a time, `wait`s for whichever ends, and reads the files; a missing
-   result file or a non-zero status is a `TRAP` row. `fib.os` has no spawn or fork (it has `process-id`, `executable-path`, directories,
-   files, `create-temp-directory`); `driver.proc` has fork+exec of *this executable*, private to the compiler. The prototype declares
-   its own `fork dup2 creat waitpid _exit alarm` externs in `fib.test.run` (7 lines). **Proposal:** a `fib.os.process` `spawn-self` /
-   `fork-run` is the right home; then `driver.proc` and `fib.test.run` share it.
+2. Unexpected traps (`nth` out of range, overflow, `(trap ..)`) end the process (spec/types.md §2.11: no handler), unless they happen on a
+   task's thread: exceptions stage 1 returns a task's trap from `try-join`. **Built (2026-10-05): the default isolation is the task**,
+   `(try-join (spawn (fn () (run seed))))` per scenario, `-j N` tasks at a time; `Scenario.run` and the `Gen` closures are `:send`.
+   Measured (1000 trivial scenarios, `compiler/tests/harness-proto/stress.fib`): in-process 8 ms; task `-j 1` 113 ms, `-j 4` 41 ms, `-j 12`
+   28 ms; fork `-j 1` 233 ms, `-j 4` 149 ms, `-j 12` 124 ms. What the task does not give: a trapped task's frames are abandoned (the audit
+   reports `leaks`, case 003 of the prototype: 10 objects), a hang cannot be stopped, stack exhaustion and out-of-memory are fatal for the
+   process, and the runtime also prints the trap on standard error.
+3. **Fork, for a time limit or a crash** (`--isolate fork`, implied by `--timeout SECS`): `fib.os.process` has `fork-start`, `wait-any-child`,
+   `fork-collect`, `fork-run` (cases 7531, 7532, mutants in `scripts/mutant-fork.sh`). The child *calls the scenario closure itself* (no
+   re-entry by name, no second compile), writes `encode(steps)` to `DIR/N.res`, its standard output and error to `N.out`, `N.err`, and
+   `_exit`s without the audit; an `alarm` kills a hang (status 142, reported `TIME`). A trap is exit 134 with the message as the last line of
+   `N.err`. **Threads:** POSIX keeps only the calling thread in the child, so a lock another thread held stays locked and the run queue's
+   workers are gone; `fork-start` refuses (an `Err`) while `/proc/self/status` shows another thread. A finished `spawn`'s thread is detached
+   and gone, so fork after `join` is allowed; the pool's workers stay, so fork before the first `async`. No `pthread_atfork` is used (it
+   would need the runtime to reset `fib.pool-started`, an `rt/` change this work did not make). Where `/proc` is absent (macOS) the count is
+   unknown and the guard is the caller's. A runner that forks must not have started tasks first; hence `--isolate task` and `fork` are
+   alternatives per run, not mixed.
 4. **Why not re-enter the binary by name** (`fibc test FILE --only NAME`, the other option the owner named): it pays a process start and,
    under `fibc run`, a *whole front end and JIT* per scenario (0.18 s for `hello`, 1.8 s for the 29-line prototype spec, measured), so
    100 scenarios would cost minutes; with an AOT-built spec binary it is about 1 ms. Fork-without-exec (0.2 ms, measured) is about 5x cheaper than even
