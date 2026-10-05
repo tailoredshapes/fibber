@@ -1,0 +1,95 @@
+;; scripts/tsan/kernels.fib: threaded kernels for scripts/tsan.sh (one per argument; scripts/tsan-suite.txt lists them). Each returns 0 when its
+;; answer is right and 1 when it is not, so a TSAN run also checks the answer. Long-running tasks matter: a task that has finished before the
+;; next one starts is ordered with it by the run queue's mutex, and TSAN then (correctly) sees no race.
+;;   tiles N K      with-tiles over an i64 array of N, K tiles (the tile-window seed read: scripts/tsan-planted.sh plants it back)
+;;   tilesf N K     the same over f64
+;;   spawnjoin N    N sequential spawn+join
+;;   many N         N tasks live at once, then joined
+;;   async N        N sequential `async` tasks (the pool)
+;;   pfib D         spawn-recursive fib 24 to depth D
+;;   pmap N         pmap over N items
+;;   atom N         four futures each swap! an atom N times
+;;   share N        four tasks read one persistent vector (share-marking and counts)
+;;   fan N          N `async` tasks that all await one slow task (every waiter is woken from the worker that completes it), joined from main
+;;   chain N        an `async` chain: each task awaits the next, N deep, joined from main
+;;   trap N         N tasks that trap, each asked with try-join
+(ns main (:use fib.core fib.async fib.view fib.view.tiles))
+
+(defun sfib (n: i64) -> i64 (if (< n 2) n (+ (sfib (- n 1)) (sfib (- n 2)))))
+(defun pfib (n: i64 d: i64) -> i64
+  (if (or (= d 0) (< n 2)) (sfib n)
+      (let ((t (spawn (fn () (pfib (- n 1) (- d 1))))) (b (pfib (- n 2) (- d 1))))
+        (+ (join t) b))))
+
+(defun tiles (n: i64 k: i64) -> i64
+  (let ((out (cell (array n 0))))
+    (do (with-tiles [w out k] (dotimes (r 20) (dotimes (i (vlen w)) (vset! w i (+ (rem (+ (* i i) 1) 7) r)))))
+        (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (array-get @out i))) (if (> s 0) 0 1))))))
+
+(defun tilesf (n: i64 k: i64) -> i64
+  (let ((out (cell (array n 0.0))))
+    (do (with-tiles [w out k] (dotimes (r 20) (dotimes (i (vlen w)) (vset! w i (+ (vget w i) 1.0)))))
+        (loop ((i 0) (ok true)) (if (< i n) (recur (+ i 1) (and ok (= (array-get @out i) 20.0))) (if ok 0 1))))))
+
+(defun spawnjoin (n: i64) -> i64
+  (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (join (spawn (fn () i))))) (if (= s (quot (* n (- n 1)) 2)) 0 1))))
+
+(defun many (n: i64) -> i64
+  (let ((ts (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (vec-conj acc (spawn (fn () (* i 2))))) acc))))
+    (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (join (vec-nth ts i)))) (if (= s (* n (- n 1))) 0 1)))))
+
+(defun async-n (n: i64) -> i64
+  (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (join (async i)))) (if (= s (quot (* n (- n 1)) 2)) 0 1))))
+
+(defun add-n (a: (Atom i64) n: i64) -> unit
+  (dotimes (i n) (swap! a (fn (x) (+ x 1)))))
+
+(defun atoms (n: i64) -> i64
+  (let ((a (atom 0)))
+    (let ((ts [(future (add-n a n)) (future (add-n a n)) (future (add-n a n)) (future (add-n a n))]))
+      (do (dotimes (i 4) (join (nth ts i)))
+          (if (= @a (* 4 n)) 0 1)))))
+
+(defun count-sum (v: (Vec i64) n: i64) -> i64
+  (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (vec-nth v (rem i (vec-count v))))) s)))
+
+(defun share (n: i64) -> i64
+  (let ((v (vec (range 1000))))
+    (let ((ts [(spawn (fn () (count-sum v (* n 100)))) (spawn (fn () (count-sum v (* n 100))))
+               (spawn (fn () (count-sum v (* n 100)))) (spawn (fn () (count-sum v (* n 100))))]))
+      (let ((a (join (nth ts 0))) (b (join (nth ts 1))) (c (join (nth ts 2))) (d (join (nth ts 3))))
+        (if (and (= a b) (= b c) (= c d) (> a 0)) 0 1)))))
+
+(defun traps (n: i64) -> i64
+  (loop ((i 0) (failed 0))
+    (if (= i n)
+        (if (= failed n) 0 1)
+        (recur (+ i 1) (match (try-join (spawn (fn () (trap "again")))) ((Err _) (+ failed 1)) ((Ok _) failed))))))
+
+(defun slow (n: i64) -> (Task i64) (async (do (await (yield)) (await (yield)) n)))
+
+(defun fan (n: i64) -> i64
+  (let ((t (slow 7)))
+    (let ((ts (loop ((i 0) (acc (vec-empty))) (if (< i n) (recur (+ i 1) (vec-conj acc (async (+ i (await t))))) acc))))
+      (loop ((i 0) (s 0)) (if (< i n) (recur (+ i 1) (+ s (join (vec-nth ts i)))) (if (= s (+ (quot (* n (- n 1)) 2) (* 7 n))) 0 1))))))
+
+(defun chain (n: i64) -> (Task i64)
+  (if (= n 0) (async 0) (let ((next (chain (- n 1)))) (async (+ 1 (await next))))))
+
+(defun arg (i: i64) -> i64 (unwrap (parse-long (nth (args) i))))
+
+(defun main () -> i64
+  (let ((kern (nth (args) 0)))
+    (cond (= kern "tiles") (tiles (arg 1) (arg 2))
+          (= kern "tilesf") (tilesf (arg 1) (arg 2))
+          (= kern "spawnjoin") (spawnjoin (arg 1))
+          (= kern "many") (many (arg 1))
+          (= kern "async") (async-n (arg 1))
+          (= kern "pfib") (if (= (pfib 24 (arg 1)) 46368) 0 1)
+          (= kern "pmap") (let ((xs (vec (range (arg 1))))) (if (= (count (pmap (fn (x) (+ x 1)) xs)) (arg 1)) 0 1))
+          (= kern "atom") (atoms (arg 1))
+          (= kern "share") (share (arg 1))
+          (= kern "fan") (fan (arg 1))
+          (= kern "chain") (if (= (join (chain (arg 1))) (arg 1)) 0 1)
+          (= kern "trap") (traps (arg 1))
+          :else (trap "kernel"))))
