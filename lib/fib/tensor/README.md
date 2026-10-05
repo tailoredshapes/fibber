@@ -259,6 +259,26 @@ plants 14 faults (dropped bias on edge tiles, activation on every inner block, w
 On the benchmark MLP (batch 256, 784-512-10, `scripts/bench/tensor/micro-mlp.fib`) the three-pass pipeline
 took 3.3 ms and `dense` twice 1.5 ms; the bias add alone was 0.03 ms, the `where`-based relu 1.8 ms.
 
+### Softmax and layernorm over the last axis
+
+```clojure
+(t/softmax scores)                      ; exp(x - rowmax) / rowsum, any rank >= 1, f64 or f32
+(t/layernorm x gamma beta 1.0e-5)       ; (x - mean) / sqrt(var + eps) * gamma + beta; gamma, beta broadcast to [n]
+```
+
+Each row is handled while it is in L1: softmax reads it for the maximum, for `exp` (written once, summed on the
+way) and for the division; layernorm for the sum, the squared deviations and the output. The composition of
+`maximum-axis`, `sub`, `exp`, `sum-axis`, `div` (or `mean-axis`, `sub`, `mul`, ... for layernorm) makes five to ten
+passes over the whole tensor and as many temporaries. The row sums are **reassociated** (four `f64` or eight
+`f32` lanes, then a horizontal add, as `sum-fast`), so they can differ from the ordered `sum-axis` in the last
+bits; the variance is the population variance from the centred second pass, not a one-pass `E[x^2] - E[x]^2`
+(which cancels for a large mean: case 7085 has a mean of 1e6 over a spread of 27). `exp` is the vector `exp` above
+(`f32` computed in `f64` and rounded). A NaN in a row gives a NaN softmax row. A strided input is first made
+contiguous. Case 7085 compares both against a scalar oracle with libm over every tail length, ranks one to three,
+views, empty tensors and extreme values; `scripts/mutant-tensor-fused.sh` plants 10 faults in them.
+Softmax 4096x4096 `f64`: 74.7 ms against 145.1 ms composed (NumPy 126.8); layernorm 4096x1024: 9.7 ms against
+42.9 ms composed (NumPy 35.2): `docs/shootout/tensor.md`, section 9.
+
 ## Safety and validation
 
 The `Tensor` descriptor is public so callers can name the generic type.

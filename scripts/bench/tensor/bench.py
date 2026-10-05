@@ -76,13 +76,17 @@ def setup(k, n):
     if k == "bcast":
         a, row = make([n, n], 1, f64), make([n], 2, f64)
         return lambda: a + row, cs
-    if k == "softmax":
+    if k in ("attn", "attnfused"):
+        # one head: scores = q k^T / sqrt(64), softmax over rows, times v; n is the sequence length, head dim 64, f32
+        q, kk, v = make([n, 64], 1, f32), make([n, 64], 2, f32), make([n, 64], 0, f32)
+        return lambda: softmax(q @ kk.T / np.float32(8.0)) @ v, cs
+    if k in ("softmax", "softmaxfused"):
         a = make([n, n], 2, f64)
         return lambda: softmax(a), cs
-    if k == "layernorm":
+    if k in ("layernorm", "layernormfused"):
         a, g, b = make([n, 1024], 1, f64), make([1024], 2, f64), make([1024], 0, f64)
         return lambda: layernorm(a, g, b), cs
-    if k == "mlp":
+    if k in ("mlp", "mlpfused"):
         x, w1, b1 = make([n, 784], 1, f32), make([784, 512], 2, f32), make([512], 0, f32)
         w2, b2 = make([512, 10], 2, f32), make([10], 1, f32)
         return lambda: relu(x @ w1 + b1) @ w2 + b2, cs

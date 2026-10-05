@@ -1,6 +1,6 @@
 #!/bin/bash
 # Mutation check of the fused dense layer (lib/fib/tensor/gemm-fma-f32.fib epilogue, vmath activations, linalg dense): each mutant plants one fault in
-# the library, runs the cases that pin it (stdlib 7083 for the epilogue, 7084 for where) and passes only if at least one FAILS. The library is read when a program is built, so no stage 2
+# the library, runs the cases that pin it (stdlib 7083 for the epilogue, 7084 for where, 7085 for softmax and layernorm) and passes only if at least one FAILS. The library is read when a program is built, so no stage 2
 # is rebuilt. Sources are restored after every mutant and on exit; run it on a clean tree.
 # usage: mutant-tensor-fused.sh F        F: a stage 2 fibc.   Exit: 0 every mutant killed, 1 one survived, 2 a plant changed nothing.   ONLY=name runs one.
 set -u
@@ -44,4 +44,15 @@ mutant where-ignores-slice-offset $M 's/(cb (array-get (. condition meta) 0))/(c
 mutant where-ignores-value-offset $M 's/(lb (array-get (. left meta) 0))/(lb 0)/' 7084
 mutant where-treats-broadcast-as-linear $M 's/(cond (contiguous? x) 1/(cond (contiguous? x) 1 (> (count (strides x)) 1) 1/' 7084
 mutant where-swaps-branches $M 's/(if (array-get cx (+ cb (\* cs i))) (array-get lx (+ lb (\* ls i))) (array-get rx (+ rb (\* rs i))))/(if (array-get cx (+ cb (* cs i))) (array-get rx (+ rb (* rs i))) (array-get lx (+ lb (* ls i))))/' 7084
+V=lib/fib/tensor/vmath.fib
+mutant softmax-no-max-subtraction $V 's/(e: f64x4 (expv-f64 (- x m)))/(e: f64x4 (expv-f64 x))/' 7085
+mutant softmax-f32-no-max-subtraction $V 's/(e: f32x8 (expv-f32 (- x m)))/(e: f32x8 (expv-f32 x))/' 7085
+mutant softmax-output-base-uses-source-offset $V 's/(row-exp-f64 src (+ off b) n mx &buf b)/(row-exp-f64 src (+ off b) n mx \&buf (+ off b))/' 7085
+mutant softmax-tail-skips-exp $V 's/(let ((e (lane (expv-f64 (splat f64x4 (- (array-get src (+ sb i)) mx))) 0)))/(let ((e 0.0))/' 7085
+mutant softmax-f32-no-division $V 's/(simd-store! \&out (+ ob i) (fdiv e dv))\(.*\)(recur (+ i 8))/(simd-store! \&out (+ ob i) e)\1(recur (+ i 8))/' 7085
+mutant layernorm-variance-uncentred $V 's/(var (fdiv (row-sum-f64 src sb n mu true) (double n)))/(var (fdiv (row-sum-f64 src sb n 0.0 true) (double n)))/' 7085
+mutant layernorm-gamma-index-fixed $V 's/(g: f64x4 (simd-load gamma i))/(g: f64x4 (simd-load gamma 0))/' 7085
+mutant layernorm-beta-dropped $V 's/(+ (\* (\* (- x m) iv) g) bt)/(* (* (- x m) iv) g)/' 7085
+mutant layernorm-tail-beta-index $V 's/(array-get gamma i)) (array-get beta i)))/(array-get gamma i)) (array-get beta 0)))/' 7085
+mutant layernorm-f32-mean-drops-tail $V 's/(mu (fdiv (row-sum-f32 src sb n 0.0f32 false) (float n)))/(mu (fdiv (row-sum-f32 src sb (- n (rem n 8)) 0.0f32 false) (float n)))/' 7085
 exit $survived

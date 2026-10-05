@@ -1,0 +1,100 @@
+;; spec: lib/fib/tensor/README.md (Softmax and layernorm): softmax and layernorm over the last axis, f64 and f32, any rank, any layout
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; The oracle is a scalar loop in f64 with libm exp: the row maximum, exp(x - max), the ordered sum, the quotient; the mean, the two-pass variance, the
+;; normalisation. Bounds (relative to 1 + |want|): softmax 1e-12 for f64 and 1e-5 for f32, layernorm 1e-10 and 2e-4 (f32 sums in f32). A wrong tail, a lane dropped from a sum,
+;; a stale row base, a lost offset of a view, or gamma and beta read at the wrong index changes some element by far more than that.
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+(extern exp (f64) -> f64)
+(extern sqrt (f64) -> f64)
+
+(defun gen (n: i64 seed: i64) -> (Vec f64)
+  (loop ((i 0) (out []))
+    (if (< i n) (recur (+ i 1) (conj out (fdiv (double (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0))) out)))
+(defun to64 (v: (Vec f64)) -> (t/Tensor f64) (t/tensor v))
+(defun to32 (v: (Vec f64)) -> (t/Tensor f32) (t/from-vec [(count v)] (mapv (fn (x: f64) (float x)) v) 0.0f32))
+(defun back (x: (t/Tensor f32)) -> (Vec f64) (mapv (fn (v: f32) (double v)) (t/to-vec x)))
+
+(defun close? (got: f64 want: f64 rtol: f64) -> bool
+  (if (!= want want) (!= got got) (<= (abs (- got want)) (* rtol (+ 1.0 (abs want))))))
+(defun all-close? (got: (Vec f64) want: (Vec f64) rtol: f64) -> bool
+  (and (= (count got) (count want))
+       (loop ((i 0)) (if (< i (count got)) (if (close? (nth got i) (nth want i) rtol) (recur (+ i 1)) false) true))))
+
+(defun softmax-row (v: (Vec f64) b: i64 n: i64) -> (Vec f64)
+  (let ((mx (loop ((i 1) (m (nth v b))) (if (< i n) (recur (+ i 1) (if (> (nth v (+ b i)) m) (nth v (+ b i)) m)) m)))
+        (es (loop ((i 0) (out [])) (if (< i n) (recur (+ i 1) (conj out (unsafe (exp (- (nth v (+ b i)) mx))))) out)))
+        (sum (loop ((i 0) (s 0.0)) (if (< i n) (recur (+ i 1) (+ s (nth es i))) s))))
+    (mapv (fn (e: f64) (fdiv e sum)) es)))
+(defun softmax-oracle (v: (Vec f64) n: i64) -> (Vec f64)
+  (loop ((r 0) (out [])) (if (< r (quot (count v) n)) (recur (+ r 1) (into out (softmax-row v (* r n) n))) out)))
+
+(defun norm-row (v: (Vec f64) b: i64 n: i64 g: (Vec f64) bt: (Vec f64) eps: f64) -> (Vec f64)
+  (let ((mu (fdiv (loop ((i 0) (s 0.0)) (if (< i n) (recur (+ i 1) (+ s (nth v (+ b i)))) s)) (double n)))
+        (var (fdiv (loop ((i 0) (s 0.0)) (if (< i n) (recur (+ i 1) (+ s (* (- (nth v (+ b i)) mu) (- (nth v (+ b i)) mu)))) s)) (double n)))
+        (inv (fdiv 1.0 (unsafe (sqrt (+ var eps))))))
+    (loop ((i 0) (out [])) (if (< i n) (recur (+ i 1) (conj out (+ (* (* (- (nth v (+ b i)) mu) inv) (nth g i)) (nth bt i)))) out))))
+(defun layernorm-oracle (v: (Vec f64) n: i64 g: (Vec f64) bt: (Vec f64) eps: f64) -> (Vec f64)
+  (loop ((r 0) (out [])) (if (< r (quot (count v) n)) (recur (+ r 1) (into out (norm-row v (* r n) n g bt eps))) out)))
+
+(defun sm64? (dims: (Vec i64) v: (Vec f64)) -> bool
+  (let ((n (nth dims (- (count dims) 1))))
+    (all-close? (t/to-vec (t/softmax (t/reshape dims (to64 v)))) (softmax-oracle v n) 1.0e-12)))
+(defun sm32? (dims: (Vec i64) v: (Vec f64)) -> bool
+  (let ((n (nth dims (- (count dims) 1))) (x (t/reshape dims (to32 v))))
+    (all-close? (back (t/softmax x)) (softmax-oracle (back x) n) 1.0e-5)))
+(defun ln64? (dims: (Vec i64) v: (Vec f64) g: (Vec f64) bt: (Vec f64)) -> bool
+  (let ((n (nth dims (- (count dims) 1))))
+    (all-close? (t/to-vec (t/layernorm (t/reshape dims (to64 v)) (to64 g) (to64 bt) 1.0e-5)) (layernorm-oracle v n g bt 1.0e-5) 1.0e-10)))
+(defun ln32? (dims: (Vec i64) v: (Vec f64) g: (Vec f64) bt: (Vec f64)) -> bool
+  (let ((n (nth dims (- (count dims) 1))) (x (t/reshape dims (to32 v))))
+    (all-close? (back (t/layernorm x (to32 g) (to32 bt) 1.0e-5f32)) (layernorm-oracle (back x) n (back (to32 g)) (back (to32 bt)) 1.0e-5) 2.0e-4)))
+
+(defun main () -> i64
+  (let ((c (checks)) (ns [1 2 3 4 5 7 8 9 15 17 33]))
+    (do ;; every tail length, a few rows each
+        (dotimes (i (count ns))
+          (let ((n (nth ns i)) (v (gen (* 5 n) 1)) (g (gen n 2)) (bt (gen n 3)))
+            (do (check c (sm64? [5 n] v)) (check c (sm32? [5 n] v))
+                (check c (ln64? [5 n] v g bt)) (check c (ln32? [5 n] v g bt)))))
+        ;; ranks one and three
+        (check c (sm64? [13] (gen 13 4)))
+        (check c (sm64? [2 3 9] (gen 54 5)))
+        (check c (ln32? [2 3 9] (gen 54 5) (gen 9 6) (gen 9 7)))
+        ;; softmax: large and very negative values (exp underflows to 0), one dominant element, equal elements
+        (check c (sm64? [2 6] [800.0 -800.0 1.0 2.0 3.0 4.0 -900.0 -901.0 -902.0 0.0 0.0 0.0]))
+        (check c (sm64? [1 5] [3.0 3.0 3.0 3.0 3.0]))
+        (check c (= (t/to-vec (t/softmax (t/tensor [1.0e300]))) [1.0]))
+        ;; a NaN in a row gives a NaN row and leaves the others alone
+        (let ((out (t/to-vec (t/softmax (t/reshape [2 3] (t/tensor [1.0 (fdiv 0.0 0.0) 2.0 1.0 2.0 3.0])))))
+              (want (softmax-row [1.0 2.0 3.0] 0 3)))
+          (check c (and (!= (nth out 0) (nth out 0)) (!= (nth out 1) (nth out 1)) (!= (nth out 2) (nth out 2))
+                        (all-close? [(nth out 3) (nth out 4) (nth out 5)] want 1.0e-12))))
+        ;; layernorm with a large mean (1e6; the data span 27, so the variance is about 60): a variance from E[x^2] - E[x]^2 would be off by 1e-4 relative or worse
+        (let ((v (mapv (fn (x: f64) (+ 1000000.0 x)) (gen 40 8))) (g (gen 10 9)) (bt (gen 10 10)))
+          (check c (all-close? (t/to-vec (t/layernorm (t/reshape [4 10] (to64 v)) (to64 g) (to64 bt) 1.0e-5)) (layernorm-oracle v 10 g bt 1.0e-5) 1.0e-8)))
+        ;; gamma and beta as a scalar and as a stepped slice; a constant row (variance 0: output is beta)
+        (let ((v (gen 24 11)))
+          (do (check c (all-close? (t/to-vec (t/layernorm (t/reshape [4 6] (to64 v)) (t/full [] 2.0) (t/full [] 0.5) 1.0e-5))
+                                   (layernorm-oracle v 6 [2.0 2.0 2.0 2.0 2.0 2.0] [0.5 0.5 0.5 0.5 0.5 0.5] 1.0e-5) 1.0e-10))
+              (let ((wide (to64 (gen 12 12))) (g (t/slice 0 0 12 2 wide)))
+                (check c (all-close? (t/to-vec (t/layernorm (t/reshape [4 6] (to64 v)) g (t/full [] 0.0) 1.0e-5))
+                                     (layernorm-oracle v 6 (t/to-vec g) [0.0 0.0 0.0 0.0 0.0 0.0] 1.0e-5) 1.0e-10)))
+              (check c (= (t/to-vec (t/layernorm (t/full [2 3] 4.0) (t/full [3] 1.0) (t/full [3] 0.25) 1.0e-5)) [0.25 0.25 0.25 0.25 0.25 0.25]))))
+        ;; views: a transposed matrix (rows are not contiguous) and a slice with an offset
+        (let ((m (t/reshape [7 5] (to64 (gen 35 13)))) (mt (t/transpose (t/reshape [5 7] (to64 (gen 35 14))))))
+          (do (check c (all-close? (t/to-vec (t/softmax mt)) (softmax-oracle (t/to-vec mt) 5) 1.0e-12))
+              (let ((s (t/slice 0 2 6 1 m)))
+                (check c (all-close? (t/to-vec (t/softmax s)) (softmax-oracle (t/to-vec s) 5) 1.0e-12)))
+              (let ((s (t/slice 0 2 6 1 m)) (g (to64 (gen 5 15))) (bt (to64 (gen 5 16))))
+                (check c (all-close? (t/to-vec (t/layernorm s g bt 1.0e-5)) (layernorm-oracle (t/to-vec s) 5 (t/to-vec g) (t/to-vec bt) 1.0e-5) 1.0e-10)))
+              (check c (all-close? (t/to-vec (t/layernorm mt (to64 (gen 5 15)) (to64 (gen 5 16)) 1.0e-5))
+                                   (layernorm-oracle (t/to-vec mt) 5 (gen 5 15) (gen 5 16) 1.0e-5) 1.0e-10))))
+        ;; empty
+        (check c (= (t/shape (t/softmax (t/zeros [0 4]))) [0 4]))
+        (check c (= (t/shape (t/layernorm (t/zeros [3 0]) (t/zeros [0]) (t/zeros [0]) 1.0e-5)) [3 0]))
+        (check c (= (checks-made c) 61))
+        (checks-result c))))
