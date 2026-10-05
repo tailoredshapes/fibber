@@ -84,6 +84,12 @@
 ;; always a plain malloc block, so it may be freed by free from any thread
 ;; or runtime that reads the class. Trace mode keeps malloc and free for
 ;; every object (the 16 bytes of ordinal in front), class 0.
+;;
+;; `fib.mt` is atomic (monotonic), not plain: every spawn stores 1 again while other threads read it, a data race in the memory model
+;; (found by ThreadSanitizer, scripts/tsan.sh). Monotonic is enough, and acquire/release is not needed: the first store happens on the
+;; one thread that exists, before pthread_create, which orders it before everything the new thread does; a later store writes the
+;; same 1; no other data is published through the flag (the lists are never written once it is 1). On x86 and arm64 a monotonic
+;; i32 load and store are the plain mov / ldr and str.
 (global internal fib.mt i32 (i32 0))
 (global internal fib.fl [33 x ptr] (zeroinitializer [33 x ptr]))
 
@@ -99,7 +105,7 @@
 (define internal (fib.alloc ptr) ((i64 size) (i32 tid))
   (block entry
     (let ((cls (lshr (add size (i64 15)) (i64 4)))
-          (quiet (and (icmp eq (load i32 @fib.tracing) (i32 0)) (icmp eq (load i32 @fib.mt) (i32 0)))))
+          (quiet (and (icmp eq (load i32 @fib.tracing) (i32 0)) (icmp eq (atomic-load monotonic i32 @fib.mt) (i32 0)))))
       (br (and quiet (icmp ule cls (i64 32))) hit miss)))
   (block hit
     (let ((slot (getelementptr ptr @fib.fl cls))
@@ -132,7 +138,7 @@
   (block small
     (let ((slot (getelementptr ptr @fib.fl cls))
           (head (load ptr slot)))
-      (br (icmp ne (load i32 @fib.mt) (i32 0)) fresh single)))
+      (br (icmp ne (atomic-load monotonic i32 @fib.mt) (i32 0)) fresh single)))
   (block single
     (br (icmp ne head (ptr null)) pop fresh))
   (block pop
@@ -176,7 +182,7 @@
     (let ((cls (zext i64 (lshr f (i32 8)))))
       (br (icmp ne cls (i64 0)) classed plain)))
   (block classed
-    (br (icmp eq (load i32 @fib.mt) (i32 0)) push plain))
+    (br (icmp eq (atomic-load monotonic i32 @fib.mt) (i32 0)) push plain))
   (block push
     (let ((cls2 (zext i64 (lshr f (i32 8))))
           (slot (getelementptr ptr @fib.fl cls2)))

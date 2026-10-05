@@ -19,20 +19,21 @@
 (defun header-bytes :private () -> i64 24)
 
 ;; The window [lo, hi) of the array, for a task. Private: a window made from an array and a range, with no lender and no owner, is only safe
-;; where the array is known to be held for as long as the window, which `run-tiles!` and the macro below ensure.
-(defun tile-window :private (arr: (Array a) lo: i64 hi: i64) :where ((ViewElem a)) -> (Win a)
-  (let ((seed (array-get arr 0)))
-    (unsafe (Win (ptr+ (raw arr) (+ (header-bytes) (* (view-width seed) lo))) (- hi lo) seed))))
+;; where the array is known to be held for as long as the window, which `run-tiles!` and the macro below ensure. `seed` is element 0, read
+;; ONCE by `run-tiles!` before any task starts and handed to every task: a task that read it itself raced with the task of tile 0 writing
+;; element 0 (a data race, found by scripts/tsan.sh); the window needs it only as a value of the element type.
+(defun tile-window :private (arr: (Array a) lo: i64 hi: i64 seed: a) :where ((ViewElem a)) -> (Win a)
+  (unsafe (Win (ptr+ (raw arr) (+ (header-bytes) (* (view-width seed) lo))) (- hi lo) seed)))
 
-;; Runs `f arr lo hi` for each of k tiles of the array lent through `&a`, one task each, and joins them all.
-(defun run-tiles! (&a: (Array a) k: i64 f: (fn :send ((Array a) i64 i64) unit)) :where ((ViewElem a) (Send a)) -> unit
+;; Runs `f arr lo hi seed` for each of k tiles of the array lent through `&a`, one task each, and joins them all.
+(defun run-tiles! (&a: (Array a) k: i64 f: (fn :send ((Array a) i64 i64 a) unit)) :where ((ViewElem a) (Send a)) -> unit
   (do (when (< k 1) (trap "with-tiles: the number of tiles is at least 1"))
       (when (= (array-len @a) 0) (trap "with-tiles: the array is empty"))
       (array-set! &a 0 (array-get @a 0))
-      (let ((n (array-len @a)) (tasks (cell [])))
+      (let ((n (array-len @a)) (seed (array-get @a 0)) (tasks (cell [])))
         (do (dotimes (t k)
               (let ((arr @a) (lo (quot (* n t) k)) (hi (quot (* n (+ t 1)) k)))
-                (set! tasks (conj @tasks (spawn (fn () (f arr lo hi)))))))
+                (set! tasks (conj @tasks (spawn (fn () (f arr lo hi seed)))))))
             (doseq [t @tasks] (join t))))))
 
 ;; (with-tiles [w a k] body+): `w` names the tile's window in the body; `a` is the owner (a private cell, as for with-view); k the number of tiles.
@@ -40,10 +41,10 @@
   (match spec
     ((Vec items)
      (if (= (vec-count items) 3)
-         (let ((arr (gensym "tile-array")) (lo (gensym "tile-lo")) (hi (gensym "tile-hi")))
+         (let ((arr (gensym "tile-array")) (lo (gensym "tile-lo")) (hi (gensym "tile-hi")) (seed (gensym "tile-seed")))
            `(fib.view.tiles/run-tiles! (& ~(vec-nth items 1)) ~(vec-nth items 2)
-              (fn (~arr ~lo ~hi)
-                (let ((~(vec-nth items 0) (fib.prelude/cell (fib.view/view-sub ((var fib.view.tiles/tile-window) ~arr ~lo ~hi)))))
+              (fn (~arr ~lo ~hi ~seed)
+                (let ((~(vec-nth items 0) (fib.prelude/cell (fib.view/view-sub ((var fib.view.tiles/tile-window) ~arr ~lo ~hi ~seed)))))
                   (do ~@body)))))
          (trap "with-tiles: the spec is [w a k]")))
     (_ (trap "with-tiles: the spec is [w a k]"))))
