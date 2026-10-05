@@ -176,6 +176,45 @@
       (let ((s (sys-clock-now)) (v (t/map (fn (x: f64) (unsafe (libm/exp x))) a)) (e (- (sys-clock-now) s)))
         (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
 
+;; the same MLP with the library's fused dense layer: the bias and the relu run in the GEMM's store phase
+(defun k-mlpfused (n: i64 runs: i64) -> unit
+  (let ((x (make32 [n 784] 1)) (w1 (make32 [784 512] 2)) (b1 (make32 [512] 0))
+        (w2 (make32 [512 10] 2)) (b2 (make32 [10] 1)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/dense (t/dense x w1 b1 :relu) w2 b2 :identity)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs32 v))))))))
+
+(defun k-softmaxfused (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n n] 2)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/softmax a)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
+(defun k-layernormfused (n: i64 runs: i64) -> unit
+  (let ((a (make64 [n 1024] 1)) (g (make64 [1024] 2)) (b (make64 [1024] 0)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (v (t/layernorm a g b 0.00001)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs64 v))))))))
+
+;; scaled dot-product attention for one head, f32, head dim 64: softmax(q k^T / 8) v. q k^T reads k transposed as a view (no copy).
+(defun scores (q: (t/Tensor f32) k: (t/Tensor f32)) -> (t/Tensor f32)
+  (t/mmul (t/scale 0.125f32 q) (t/transpose k)))
+
+(defun k-attn (n: i64 runs: i64) -> unit
+  (let ((q (make32 [n 64] 1)) (k (make32 [n 64] 2)) (v (make32 [n 64] 0)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now))
+            (o (let ((sc (scores q k)) (m (t/maximum-axis -1 true sc)) (ex (t/exp (t/sub sc m))))
+                 (t/mmul (t/div ex (t/sum-axis -1 true ex)) v)))
+            (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs32 o))))))))
+
+(defun k-attnfused (n: i64 runs: i64) -> unit
+  (let ((q (make32 [n 64] 1)) (k (make32 [n 64] 2)) (v (make32 [n 64] 0)))
+    (dotimes (r runs)
+      (let ((s (sys-clock-now)) (o (t/mmul (t/softmax (scores q k)) v)) (e (- (sys-clock-now) s)))
+        (do (println "t " e) (when (= r 0) (println "cs " (cs32 o))))))))
+
 (defun main () -> i64
   (let ((k (nth (args) 0)) (n (unwrap (parse-long (nth (args) 1)))) (runs (unwrap (parse-long (nth (args) 2)))))
     (do (cond (= k "matmul64") (k-matmul64 n runs)
@@ -197,5 +236,10 @@
               (= k "explibm") (k-explibm n runs)
               (= k "layernorm") (k-layernorm n runs)
               (= k "mlp") (k-mlp n runs)
+              (= k "mlpfused") (k-mlpfused n runs)
+              (= k "softmaxfused") (k-softmaxfused n runs)
+              (= k "layernormfused") (k-layernormfused n runs)
+              (= k "attn") (k-attn n runs)
+              (= k "attnfused") (k-attnfused n runs)
               :else (println "unknown kernel " k))
         0)))

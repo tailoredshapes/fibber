@@ -269,3 +269,85 @@ broadcast add, which are still the generic elementwise kernels (a `where` and a 
 - The fma-less x86 targets run the old kernels (1.5x slower than the new on this CPU: 1024 f64 49 ms against 32 ms) until the compiler gives `simd/fma` a non-libm lowering there.
 - No other kernel shapes tuned (tall/skinny products, small n, are padded to whole panels: 256x512x10 spends most of its work on zeros).
 - Timing rows for a*b+c are not trustworthy in this run (see 8.1).
+
+## 9. Package TP3: fused layers (after TP2)
+
+Four library commits on top of TP2 (`lib/fib/tensor`, `scripts/bench/tensor`, cases 7083 to 7085; no compiler change). Stage 2 is the TP2 one (built from this
+tree by the v0.1.5 seed): a library edit needs no new stage 2. The goal was the MLP within 1.2x of NumPy+OpenBLAS (1.72 ms against 3.56 ms); the owner's
+guidance was fused, copy-free library code first, and to stop at diminishing returns rather than tune the kernel toward OpenBLAS.
+
+### 9.1 Profile, before any change
+
+`scripts/bench/tensor/micro-mlp.fib` (best of 15 per stage, same process, ms):
+
+| stage | ms |
+|---|---:|
+| matmul 256x784x512 | 1.55 to 1.67 |
+| bias add 256x512 (`add`, row broadcast) | 0.03 to 0.05 |
+| relu, `where (greater x 0) x 0` | **1.76 to 1.94** |
+| matmul 256x512x10 | 0.056 |
+| bias add 256x10 | 0.007 |
+| the whole pipeline | 3.30 to 3.75 |
+
+The TP2 doc blamed "bias, relu and broadcast passes". Measured, the bias add is nothing (the broadcast kernel is fast); the cost was the relu: `greater` through a
+closure per element and `where` decoding three indices per element (`flat-at`). The second matmul (10 columns, padded to one 16-wide panel) is 0.06 ms, so the
+tall/skinny tuning of step 4 has nothing to buy. The allocations are two outputs (512 KiB and 10 KiB) and the packing buffers (about 1.2 MiB); the GEMM output was already
+`array-uninit-f32` (the matmul writes every element before it is read: the first inner block stores, later blocks load then store; documented in `multiply-with`).
+
+### 9.2 What changed
+
+1. **GEMM epilogue, `t/dense x w b act`, `t/mmul-bias`** (`gemm-fma-f32.fib` `multiply-with`, `linalg.fib`). Each 6x16 output tile of the last inner block is finished
+   in place right after the micro-kernel stored it: `C = act(C + bias)`, bias padded to whole panels so edge tiles run the same two-vector code in their scratch tile.
+   The activation is a keyword (`:identity :relu :tanh :sigmoid :silu :gelu`); `t/activate` and `t/relu` do one activation over a tensor in one pass. Other activations
+   are added in `fib.tensor.vmath` (`apply4`) with one more case in `activation-code`. `f64`, a target without FMA and an empty inner dimension compose `mmul`, `add`, `activate`.
+   Case 7083 (261 checks: the ordered fma reference plus bias plus a scalar activation, over every tail shape, two row, column and inner blocks, six activations, views and strided
+   bias) and 14 planted faults (`scripts/mutant-tensor-fused.sh`: epilogue skipped on edge or full tiles, applied on every inner block or only the first, bias at the wrong tile or
+   column block, one half of the tile or the last bias element dropped, bias stride ignored, a tile row unfinished, wrong activation code, relu removed, activation dropped by `dense`), all killed.
+2. **`where` walks dense operands and scalars linearly** (`masks.fib`): the unfused relu 1.76 to 0.45 ms. Case 7084 (20 checks against indexed reads), 5 planted faults, all killed.
+3. **`t/softmax`, `t/layernorm`** (last axis, f64 and f32, in `vmath.fib`): each row is processed while it is in L1 (see the README for the contract: reassociated sums, centred variance).
+   Case 7085 (61 checks against a scalar libm oracle) and 10 planted faults, all killed.
+4. **Benchmark rows**: `mlpfused`, `softmaxfused`, `layernormfused`, `attn` (QK^T / 8, softmax by composition, times V; one head, n = 1024, d = 64, f32) and `attnfused`
+   (`t/softmax` in the middle), in `bench.fib`, `bench.py` (same formulas) and `run.py`.
+
+### 9.3 Numbers
+
+The machine was busy with other agents' work (load 6 to 10): a `run.py` table row can move by 2x between two runs (the same MLP binary: 1.6, 3.1, 4.5 ms in three runs), so the
+fibber columns below are an **A/B**: the TP2 binary (`bench_old`, built from commit 405eb5a) and this tree's binary alternate, seven processes each, each process the median of its
+5 timed runs (after one warm-up), under `flock /tmp/fibsuite.lock`; the table shows the median over the processes (min in brackets). NumPy columns are `run.py` (median of 5, one
+thread, same lock), the least noisy of three runs; checksums of every row compared (relative 1e-4 for f32, 1e-9 for f64), all `ok`.
+
+```
+python3 ~/.cache/fibber-scratch/tp3/ab.py mlp:256:mlp:mlpfused softmax:4096:softmax:softmaxfused layernorm:4096:layernorm:layernormfused matmul32:512:matmul32:matmul32 ...
+python3 scripts/bench/tensor/run.py --fibc F --bin B --openblas ~/.cache/fibber-scratch/tp1/ob --only mlp softmax layernorm attn matmul32
+```
+
+| kernel | numpy | numpy + OpenBLAS | TP2 composed | TP3 composed | TP3 fused | fused / numpy | fused / OpenBLAS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| MLP f32 b256 784-512-10 (`dense` twice) | 9.0 | 1.69 | 3.60 (3.48) | 2.20 (2.12) | **1.73 (1.59)** | 0.19 | **1.02 (0.94)** |
+| softmax rows 4096x4096 f64 | 127.6 | - | 148.5 (142.1) | 146.0 (141.0) | **73.1 (70.8)** | 0.57 | - |
+| layernorm 4096x1024 f64 | 35.2 | - | 43.8 (39.4) | 40.9 (39.2) | **10.7 (9.8)** | 0.30 | - |
+| attention f32 n=1024 d=64 (softmax fused, mmuls as before) | 26.2 | 6.8 to 7.7 | 11.5 | 11.5 | 9.1 | 0.35 | 1.2 to 1.3 |
+| matmul f32 512 / 1024 (unchanged path) | 11.0 / 98.4 | 2.0 / 15.1 | 2.24 / 17.05 | 2.18 / 17.30 | - | - | - |
+| matmul f64 1024 (unchanged path) | - | - | 35.0 | 35.1 | - | - | - |
+
+("TP3 composed" is the same `add` / `where` / `mmul` code as TP2, with the `where` fix; the attention rows are single `run.py` runs and noisy: the TP2 and TP3 composed
+columns are the same code there, since `where` is not on that path.)
+
+**The goal is met on this run:** the MLP is 1.02x NumPy+OpenBLAS at the median of the A/B and 0.94x at its best (target 1.2x; TP2 was 2.07x); fibber's MLP went from 3.6 to 1.7 ms. The
+matmul path is unchanged (`multiply` calls `multiply-with` with code -1; 512 and 1024 f32 and 1024 f64 within noise of TP2). The remaining time is the two products themselves
+(1.55 ms of 1.6), which is the kernel the owner chose not to tune further.
+
+### 9.4 Not done, and why
+
+- **Pack-once weights (`t/pack-weights`, step 5):** not done. Packing B for the 784x512 product is one read and one write of 1.6 MB (about 0.1 ms of 1.6): an estimate, not a
+  measurement, and a handle type would put a second representation of a weight matrix into the public API for at most 6%. If inference with fixed weights becomes the main use, it is the next lever.
+- **Prefetch / further kernel work:** not done; stopped at diminishing returns as asked (the MLP is at OpenBLAS parity).
+- **Tall/skinny tuning:** nothing to tune: the 10-column product is 0.056 ms.
+- **Last-axis `sum-axis`, `maximum-axis` (2.9 and 4.4x NumPy):** not changed. `sum-axis` is ordered by contract (the chain of dependent adds is the floor); a vectorised
+  `maximum-axis` would differ from `(max a b)` folding in the sign of a zero (`simd/max` orders -0.0 below +0.0, the fold is order dependent), which is a behaviour change. The fused
+  `softmax` and `layernorm` take their reductions (reassociated, documented) inside the row kernels instead. A `sum-axis-fast` would be new API; not added.
+- **Activations on f32 use the f64 vector math** (two f64x4 halves per f32x8): `:gelu`, `:silu`, `:tanh`, `:sigmoid` are correct to a few ULP but not fast; relu and identity stay in f32. There
+  is no f32-native `exp`. Attention's `t/exp`-based composed row and the fused row therefore stay 1.2 to 1.3x slower than NumPy+OpenBLAS (not tuned: the task said a benchmark row, not an optimised kernel).
+- **`dense` for integer tensors** is not provided (the GEMM is f32/f64); `dense` on an empty inner dimension or without hardware FMA composes the unfused ops.
+- Cases 7083 and the older fma-reference cases (7077, 7078) compare against `fma-reference` bit for bit, so they pass on the host (FMA) target only: at `FIB_TARGET_CPU=x86-64-v2`
+  7078 fails already at the base commit and 7083 fails the same way (7080, 7084, 7085 pass there).

@@ -1,7 +1,8 @@
 ;; Scalar reference kernels support arbitrary checked strides and empty inner dimensions.
 (ns fib.tensor.linalg
   (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage)
-  (:require [fib.tensor.gemm-f32 :as g32] [fib.tensor.gemm-fma-f32 :as gf32] [fib.tensor.gemm-f64 :as g64] [fib.tensor.gemm-fma-f64 :as gf64]))
+  (:require [fib.tensor.gemm-f32 :as g32] [fib.tensor.gemm-fma-f32 :as gf32] [fib.tensor.gemm-f64 :as g64] [fib.tensor.gemm-fma-f64 :as gf64]
+            [fib.tensor.elementwise :as ew] [fib.tensor.kernels :as kn] [fib.tensor.vmath :as vm]))
 
 (defun dot (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t)) -> t
   (do (when (or (!= (rank a) 1) (!= (rank b) 1)) (trap "tensor: dot requires rank one"))
@@ -50,3 +51,25 @@
 
 (defun mmul (a: (Tensor t) b: (Tensor t)) :where ((Element t) (Num t) (MatrixKernel t)) -> (Tensor t)
   (matrix-multiply (. a seed) a b))
+
+;; ---- fused dense layer: (dense x w b :relu) = activation(x*w + b) in one pass over the output
+;; f32 on a target with fma: the bias add and the activation run in the GEMM's store phase, on the tile the micro-kernel just
+;; wrote (gemm-fma-f32, `multiply-with`). Anywhere else, and for an empty inner dimension, the same value is composed from
+;; `mmul`, `add` and `activate`: the result is the same function of the same operands, the fused one differs only in the last
+;; bits of the product (an fma chain, as `mmul`) and in doing no extra pass or temporary.
+(defun composed :private (a: (Tensor t) b: (Tensor t) bias: (Tensor t) code: i64) :where ((Element t) (Num t) (MatrixKernel t) (kn/Arithmetic t) (vm/Transcendental t)) -> (Tensor t)
+  (vm/transcend (. a seed) code (ew/add (mmul a b) bias)))
+
+(defprotocol DenseKernel
+  (dense-multiply (self a: (Tensor Self) b: (Tensor Self) bias: (Tensor Self) code: i64) -> (Tensor Self)))
+(impl DenseKernel f32
+  (dense-multiply (self a b bias code)
+    (if (and (has-fma) (!= (nth (shape a) 1) 0)) (gf32/multiply-with a b bias code) (composed a b bias code))))
+(impl DenseKernel f64 (dense-multiply (self a b bias code) (composed a b bias code)))
+
+;; activation names: :identity :relu :tanh :sigmoid :silu :gelu. `bias` is any tensor that broadcasts to the [n] columns.
+(defun dense (x: (Tensor t) w: (Tensor t) bias: (Tensor t) act: keyword) :where ((Element t) (Num t) (DenseKernel t)) -> (Tensor t)
+  (dense-multiply (. x seed) x w bias (vm/activation-code act)))
+
+(defun mmul-bias (x: (Tensor t) w: (Tensor t) bias: (Tensor t)) :where ((Element t) (Num t) (DenseKernel t)) -> (Tensor t)
+  (dense x w bias :identity))

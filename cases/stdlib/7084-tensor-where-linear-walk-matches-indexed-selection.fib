@@ -1,0 +1,57 @@
+;; spec: lib/fib/tensor/README.md (Masks and selection): where selects element by element after broadcasting all three operands
+;; expect: accept
+;; result: 0
+;; audit: clean
+;; stage: 2
+;; roots: ../../lib support
+;; where walks dense operands and broadcast scalars by offset + step * i and every other layout by indexed reads. The oracle here is the indexed read of
+;; each operand broadcast to the result shape. A wrong step for a scalar, a dropped offset of a slice or an offset-free mask changes some element.
+(ns main (:require [fib.tensor :as t]) (:use tl.check))
+
+(defun gen (n: i64 seed: i64) -> (t/Tensor f32)
+  (let ((buf (cell (array n 0.0f32))))
+    (do (dotimes (i n) (array-set! &buf i (fdiv (float (- (rem (+ (* i 7919) (* seed 104729)) 1013) 500)) 37.0f32)))
+        (t/from-array [n] @buf 0.0f32))))
+(defun mat (m: i64 n: i64 seed: i64) -> (t/Tensor f32) (t/reshape [m n] (gen (* m n) seed)))
+
+;; does where agree, element by element, with the indexed reads of the three operands broadcast to dims?
+(defun agrees? (dims: (Vec i64) mask: (t/Tensor bool) a: (t/Tensor f32) b: (t/Tensor f32)) -> bool
+  (let ((got (t/where mask a b)) (m (t/broadcast-to dims mask)) (l (t/broadcast-to dims a)) (r (t/broadcast-to dims b)))
+    (and (= (t/shape got) dims)
+         (loop ((i 0))
+           (if (< i (t/size m))
+               (if (= (t/flat-at got i) (if (t/flat-at m i) (t/flat-at l i) (t/flat-at r i))) (recur (+ i 1)) false)
+               true)))))
+
+(defun main () -> i64
+  (let ((c (checks)) (zero (t/full [] 0.0f32)) (seven (t/full [] 7.0f32)) (x (mat 9 13 1)) (y (mat 9 13 2)))
+    (do ;; the MLP shape: dense mask, dense value, scalar else
+        (check c (agrees? [9 13] (t/greater x zero) x zero))
+        (check c (agrees? [9 13] (t/greater x zero) zero y))
+        (check c (agrees? [9 13] (t/greater x y) x y))
+        ;; scalar mask (both values), scalar on both sides
+        (check c (agrees? [9 13] (t/full [] true) x y))
+        (check c (agrees? [9 13] (t/full [] false) x y))
+        (check c (agrees? [9 13] (t/greater x y) seven zero))
+        ;; a dense slice with an offset (rows 2 to 8 of a larger matrix), as mask source and as value
+        (let ((big (mat 12 13 3)) (rows (t/slice 0 2 11 1 big)))
+          (do (check c (agrees? [9 13] (t/greater rows zero) rows y))
+              (check c (agrees? [9 13] (t/greater x zero) y rows))
+              (check c (agrees? [9 13] (t/greater y rows) rows zero))
+              ;; a mask that is itself a slice with an offset
+              (check c (agrees? [9 13] (t/slice 0 2 11 1 (t/greater big zero)) x y))))
+        ;; layouts that are neither dense nor scalar: transposed, flipped, a stepped slice, a broadcast row and column
+        (let ((xt (t/transpose (mat 13 9 4))) (row (gen 13 5)) (col (t/reshape [9 1] (gen 9 6))))
+          (do (check c (agrees? [9 13] (t/greater xt zero) xt y))
+              (check c (agrees? [9 13] (t/greater x zero) (t/flip 1 x) y))
+              (check c (agrees? [9 13] (t/greater x row) row y))
+              (check c (agrees? [9 13] (t/greater x col) x col))
+              (check c (agrees? [9 13] (t/greater (t/slice 1 0 13 1 x) zero) (t/slice 0 0 9 1 y) zero))
+              (let ((st (t/slice 1 0 26 2 (mat 9 26 7)))) (check c (agrees? [9 13] (t/greater st zero) st y)))))
+        ;; shapes: a rank-one, a rank-three, one element, empty
+        (check c (agrees? [13] (t/greater (gen 13 8) zero) (gen 13 9) zero))
+        (check c (agrees? [2 3 4] (t/greater (t/reshape [2 3 4] (gen 24 1)) zero) (t/reshape [2 3 4] (gen 24 2)) seven))
+        (check c (agrees? [1] (t/full [1] true) (gen 1 1) (gen 1 2)))
+        (check c (= (t/shape (t/where (t/greater (t/zeros-f32 [0 3]) zero) (t/zeros-f32 [0 3]) zero)) [0 3]))
+        (check c (= (checks-made c) 20))
+        (checks-result c))))

@@ -11,7 +11,7 @@
 ;; f32: correctly rounded to within 1 ULP of the f32 libm result in the same ranges (the f64 result is under half an f32 ULP away).
 ;; Not bit-for-bit libm, and a result may differ from the scalar libm in the last place.
 (ns fib.tensor.vmath
-  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage))
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.views))
 
 (defun nan :private () -> f64 (bits->f64 9221120237041090560))
 (defun inf :private () -> f64 (bits->f64 9218868437227405312))
@@ -74,8 +74,37 @@
         (large (simd/blend (simd/lt x zero) (neg th) th)))
     (simd/blend (simd/eq x zero) x (simd/blend (simd/lt a (splat f64x4 0.55)) small large))))
 
+;; Activations (op 3 and up; `activation-code` names them). Built on exp4 and tanh4, so they are as accurate as those and as the f64 result
+;; rounded to f32. relu keeps the `where (greater x 0) x 0` meaning: NaN and -0.0 give +0.0.
+;;   sigmoid 1/(1+e^-x)   silu x*sigmoid(x)   gelu 0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))  (the tanh form, as GPT-2 and BERT use)
+(defun sigmoid4 :private (x: f64x4) -> f64x4
+  (let ((one (splat f64x4 1.0))) (fdiv one (+ one (exp4 (neg x))))))
+
+(defun gelu4 :private (x: f64x4) -> f64x4
+  (let ((inner (* (splat f64x4 0.7978845608028654) (simd/muladd (* (* x x) x) (splat f64x4 0.044715) x))))
+    (* (* (splat f64x4 0.5) x) (+ (splat f64x4 1.0) (tanh4 inner)))))
+
 (defun apply4 :private (op: i64 x: f64x4) -> f64x4
-  (cond (= op 0) (exp4 x) (= op 1) (log4 x) :else (tanh4 x)))
+  (cond (= op 0) (exp4 x) (= op 1) (log4 x) (= op 2) (tanh4 x) (= op 3) (sigmoid4 x)
+        (= op 4) (* x (sigmoid4 x)) (= op 5) (gelu4 x)
+        (= op 6) (simd/blend (simd/gt x (splat f64x4 0.0)) x (splat f64x4 0.0))
+        :else x))
+
+(defun activation-code (name: keyword) -> i64
+  (cond (= name :tanh) 2 (= name :sigmoid) 3 (= name :silu) 4 (= name :gelu) 5 (= name :relu) 6 (= name :identity) 7
+        :else (trap "tensor: unknown activation (:identity :relu :tanh :sigmoid :silu :gelu)")))
+
+;; One f32x8 through activation `op`: the GEMM epilogue's lane function. relu and identity stay in f32; the rest run as two f64x4 halves.
+(defun lift8 :private (op: i64 v: f32x8) -> f32x8
+  (let ((lo: f32x4 (simd/shuffle v v <<0 1 2 3>>)) (hi: f32x4 (simd/shuffle v v <<4 5 6 7>>))
+        (wl: f64x4 (simd/convert lo)) (wh: f64x4 (simd/convert hi))
+        (rl: f32x4 (simd/convert (apply4 op wl))) (rh: f32x4 (simd/convert (apply4 op wh))))
+    (simd/shuffle rl rh <<0 1 2 3 4 5 6 7>>)))
+
+(defun activate8 (op: i64 v: f32x8) -> f32x8
+  (cond (= op 7) v
+        (= op 6) (simd/blend (simd/gt v (splat f32x8 0.0f32)) v (splat f32x8 0.0f32))
+        :else (lift8 op v)))
 
 (defun run-f64 :private (op: i64 x: (Tensor f64)) -> (Tensor f64)
   (let ((d (contiguous x)) (n (fib.tensor.storage/size d)) (off (array-get (. d meta) 0)) (src (. d buffer))
@@ -109,3 +138,178 @@
 (defun exp (x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t) (transcend (. x seed) 0 x))
 (defun log (x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t) (transcend (. x seed) 1 x))
 (defun tanh (x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t) (transcend (. x seed) 2 x))
+;; Elementwise activation in one pass and one allocation: (t/activate :gelu x). Names: :identity :relu :tanh :sigmoid :silu :gelu.
+(defun activate (name: keyword x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t)
+  (transcend (. x seed) (activation-code name) x))
+(defun relu (x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t) (transcend (. x seed) 6 x))
+
+;; ---- softmax and layernorm over the last axis, row by row, in the row's own cache lines: a row is read at most three times and written once
+;; (the composition of maximum-axis, sub, exp, sum-axis, div makes eleven passes over the whole tensor and five temporaries). The reductions
+;; are reassociated (four or eight lanes, then a horizontal add), like sum-fast: the sums can differ from the ordered `sum-axis` in the last bits.
+;; softmax x = exp(x - rowmax) / rowsum; a NaN in a row gives a NaN row. layernorm x gamma beta eps = (x - mean) / sqrt(var + eps) * gamma + beta
+;; with the population variance, from one pass of sums of (x - x0) and (x - x0)^2 (x0 the row's first element: the shift keeps the one-pass
+;; variance from cancelling when the mean is large) and one pass that writes. Every read and write is bounds-checked.
+
+(defun expv-f64 :private (v: f64x4) -> f64x4 (exp4 v))
+
+(defun row-max-f64 :private (src: (Array f64) b: i64 n: i64) -> f64
+  (let ((end (- n (rem n 4)))
+        (v: f64x4 (loop ((i 0) (acc: f64x4 (splat f64x4 (array-get src b))))
+                    (if (< i end) (let ((x: f64x4 (simd-load src (+ b i)))) (recur (+ i 4) (simd/max acc x))) acc))))
+    (loop ((i end) (m (hmax v))) (if (< i n) (recur (+ i 1) (max m (array-get src (+ b i)))) m))))
+
+;; out[ob..ob+n) = exp(src[sb..sb+n) - mx); returns the sum
+(defun row-exp-f64 :private (src: (Array f64) sb: i64 n: i64 mx: f64 &out: (Array f64) ob: i64) -> f64
+  (let ((end (- n (rem n 4))) (m (splat f64x4 mx))
+        (v: f64x4 (loop ((i 0) (acc: f64x4 (splat f64x4 0.0)))
+                    (if (< i end)
+                        (let ((x: f64x4 (simd-load src (+ sb i))) (e: f64x4 (expv-f64 (- x m))))
+                          (do (simd-store! &out (+ ob i) e) (recur (+ i 4) (+ acc e))))
+                        acc))))
+    (loop ((i end) (acc (hsum v)))
+      (if (< i n)
+          (let ((e (lane (expv-f64 (splat f64x4 (- (array-get src (+ sb i)) mx))) 0)))
+            (do (array-set! &out (+ ob i) e) (recur (+ i 1) (+ acc e))))
+          acc))))
+
+(defun row-divide-f64 :private (ob: i64 n: i64 d: f64 &out: (Array f64)) -> unit
+  (let ((end (- n (rem n 4))) (dv (splat f64x4 d)))
+    (do (loop ((i 0)) (when (< i end) (let ((e: f64x4 (simd-load @out (+ ob i)))) (do (simd-store! &out (+ ob i) (fdiv e dv)) (recur (+ i 4))))))
+        (loop ((i end)) (when (< i n) (do (array-set! &out (+ ob i) (fdiv (array-get @out (+ ob i)) d)) (recur (+ i 1))))))))
+
+(defun softmax-f64 :private (x: (Tensor f64)) -> (Tensor f64)
+  (let ((d (contiguous x)) (dims (shape d)) (n (nth dims (- (count dims) 1))) (total (fib.tensor.storage/size d))
+        (off (array-get (. d meta) 0)) (src (. d buffer)) (buf (cell (array (checked-size dims 0.0) 0.0))))
+    (do (when (> total 0)
+          (dotimes (r (quot total n))
+            (let ((b (* r n)) (mx (row-max-f64 src (+ off b) n)) (sum (row-exp-f64 src (+ off b) n mx &buf b)))
+              (row-divide-f64 b n sum &buf))))
+        (from-array dims @buf 0.0))))
+
+;; sum over src[sb..sb+n) of (x - c)^k, k = 1 or 2 (reassociated: 4 lanes, then a horizontal add and the tail)
+(defun row-sum-f64 :private (src: (Array f64) sb: i64 n: i64 c: f64 squared: bool) -> f64
+  (let ((end (- n (rem n 4))) (cv (splat f64x4 c))
+        (v: f64x4 (loop ((i 0) (acc: f64x4 (splat f64x4 0.0)))
+                    (if (< i end)
+                        (let ((x: f64x4 (simd-load src (+ sb i))) (dx: f64x4 (- x cv)))
+                          (recur (+ i 4) (+ acc (if squared (* dx dx) dx))))
+                        acc))))
+    (loop ((i end) (acc (hsum v)))
+      (if (< i n)
+          (let ((dx (- (array-get src (+ sb i)) c))) (recur (+ i 1) (+ acc (if squared (* dx dx) dx))))
+          acc))))
+
+;; out[ob..) = (src - mu) * inv * gamma + beta, the order of operations of the composed layernorm
+(defun row-normalize-f64 :private (src: (Array f64) sb: i64 n: i64 mu: f64 inv: f64 gamma: (Array f64) beta: (Array f64) &out: (Array f64) ob: i64) -> unit
+  (let ((end (- n (rem n 4))) (m (splat f64x4 mu)) (iv (splat f64x4 inv)))
+    (do (loop ((i 0))
+          (when (< i end)
+            (let ((x: f64x4 (simd-load src (+ sb i))) (g: f64x4 (simd-load gamma i)) (bt: f64x4 (simd-load beta i)))
+              (do (simd-store! &out (+ ob i) (+ (* (* (- x m) iv) g) bt)) (recur (+ i 4))))))
+        (loop ((i end))
+          (when (< i n)
+            (do (array-set! &out (+ ob i) (+ (* (* (- (array-get src (+ sb i)) mu) inv) (array-get gamma i)) (array-get beta i)))
+                (recur (+ i 1))))))))
+
+(defun layernorm-f64 :private (x: (Tensor f64) gamma: (Tensor f64) beta: (Tensor f64) eps: f64) -> (Tensor f64)
+  (let ((d (contiguous x)) (dims (shape d)) (n (nth dims (- (count dims) 1))) (total (fib.tensor.storage/size d))
+        (off (array-get (. d meta) 0)) (src (. d buffer))
+        (g (contiguous (broadcast-to [n] gamma))) (bt (contiguous (broadcast-to [n] beta)))
+        (buf (cell (array (checked-size dims 0.0) 0.0))))
+    (do (when (> total 0)
+          (dotimes (r (quot total n))
+            (let ((b (* r n)) (sb (+ off b))
+                  (mu (fdiv (row-sum-f64 src sb n 0.0 false) (double n)))
+                  (var (fdiv (row-sum-f64 src sb n mu true) (double n)))
+                  (inv (fdiv 1.0 (lane (simd/sqrt (splat f64x4 (+ var eps))) 0))))
+              (row-normalize-f64 src sb n mu inv (. g buffer) (. bt buffer) &buf b))))
+        (from-array dims @buf 0.0))))
+
+(defun expv-f32 :private (v: f32x8) -> f32x8 (lift8 0 v))
+
+(defun row-max-f32 :private (src: (Array f32) b: i64 n: i64) -> f32
+  (let ((end (- n (rem n 8)))
+        (v: f32x8 (loop ((i 0) (acc: f32x8 (splat f32x8 (array-get src b))))
+                    (if (< i end) (let ((x: f32x8 (simd-load src (+ b i)))) (recur (+ i 8) (simd/max acc x))) acc))))
+    (loop ((i end) (m (hmax v))) (if (< i n) (recur (+ i 1) (max m (array-get src (+ b i)))) m))))
+
+;; out[ob..ob+n) = exp(src[sb..sb+n) - mx); returns the sum
+(defun row-exp-f32 :private (src: (Array f32) sb: i64 n: i64 mx: f32 &out: (Array f32) ob: i64) -> f32
+  (let ((end (- n (rem n 8))) (m (splat f32x8 mx))
+        (v: f32x8 (loop ((i 0) (acc: f32x8 (splat f32x8 0.0f32)))
+                    (if (< i end)
+                        (let ((x: f32x8 (simd-load src (+ sb i))) (e: f32x8 (expv-f32 (- x m))))
+                          (do (simd-store! &out (+ ob i) e) (recur (+ i 8) (+ acc e))))
+                        acc))))
+    (loop ((i end) (acc (hsum v)))
+      (if (< i n)
+          (let ((e (lane (expv-f32 (splat f32x8 (- (array-get src (+ sb i)) mx))) 0)))
+            (do (array-set! &out (+ ob i) e) (recur (+ i 1) (+ acc e))))
+          acc))))
+
+(defun row-divide-f32 :private (ob: i64 n: i64 d: f32 &out: (Array f32)) -> unit
+  (let ((end (- n (rem n 8))) (dv (splat f32x8 d)))
+    (do (loop ((i 0)) (when (< i end) (let ((e: f32x8 (simd-load @out (+ ob i)))) (do (simd-store! &out (+ ob i) (fdiv e dv)) (recur (+ i 8))))))
+        (loop ((i end)) (when (< i n) (do (array-set! &out (+ ob i) (fdiv (array-get @out (+ ob i)) d)) (recur (+ i 1))))))))
+
+(defun softmax-f32 :private (x: (Tensor f32)) -> (Tensor f32)
+  (let ((d (contiguous x)) (dims (shape d)) (n (nth dims (- (count dims) 1))) (total (fib.tensor.storage/size d))
+        (off (array-get (. d meta) 0)) (src (. d buffer)) (buf (cell (array (checked-size dims 0.0f32) 0.0f32))))
+    (do (when (> total 0)
+          (dotimes (r (quot total n))
+            (let ((b (* r n)) (mx (row-max-f32 src (+ off b) n)) (sum (row-exp-f32 src (+ off b) n mx &buf b)))
+              (row-divide-f32 b n sum &buf))))
+        (from-array dims @buf 0.0f32))))
+
+;; sum over src[sb..sb+n) of (x - c)^k, k = 1 or 2 (reassociated: 8 lanes, then a horizontal add and the tail)
+(defun row-sum-f32 :private (src: (Array f32) sb: i64 n: i64 c: f32 squared: bool) -> f32
+  (let ((end (- n (rem n 8))) (cv (splat f32x8 c))
+        (v: f32x8 (loop ((i 0) (acc: f32x8 (splat f32x8 0.0f32)))
+                    (if (< i end)
+                        (let ((x: f32x8 (simd-load src (+ sb i))) (dx: f32x8 (- x cv)))
+                          (recur (+ i 8) (+ acc (if squared (* dx dx) dx))))
+                        acc))))
+    (loop ((i end) (acc (hsum v)))
+      (if (< i n)
+          (let ((dx (- (array-get src (+ sb i)) c))) (recur (+ i 1) (+ acc (if squared (* dx dx) dx))))
+          acc))))
+
+;; out[ob..) = (src - mu) * inv * gamma + beta, the order of operations of the composed layernorm
+(defun row-normalize-f32 :private (src: (Array f32) sb: i64 n: i64 mu: f32 inv: f32 gamma: (Array f32) beta: (Array f32) &out: (Array f32) ob: i64) -> unit
+  (let ((end (- n (rem n 8))) (m (splat f32x8 mu)) (iv (splat f32x8 inv)))
+    (do (loop ((i 0))
+          (when (< i end)
+            (let ((x: f32x8 (simd-load src (+ sb i))) (g: f32x8 (simd-load gamma i)) (bt: f32x8 (simd-load beta i)))
+              (do (simd-store! &out (+ ob i) (+ (* (* (- x m) iv) g) bt)) (recur (+ i 8))))))
+        (loop ((i end))
+          (when (< i n)
+            (do (array-set! &out (+ ob i) (+ (* (* (- (array-get src (+ sb i)) mu) inv) (array-get gamma i)) (array-get beta i)))
+                (recur (+ i 1))))))))
+
+(defun layernorm-f32 :private (x: (Tensor f32) gamma: (Tensor f32) beta: (Tensor f32) eps: f32) -> (Tensor f32)
+  (let ((d (contiguous x)) (dims (shape d)) (n (nth dims (- (count dims) 1))) (total (fib.tensor.storage/size d))
+        (off (array-get (. d meta) 0)) (src (. d buffer))
+        (g (contiguous (broadcast-to [n] gamma))) (bt (contiguous (broadcast-to [n] beta)))
+        (buf (cell (array (checked-size dims 0.0f32) 0.0f32))))
+    (do (when (> total 0)
+          (dotimes (r (quot total n))
+            (let ((b (* r n)) (sb (+ off b))
+                  (mu (fdiv (row-sum-f32 src sb n 0.0f32 false) (float n)))
+                  (var (fdiv (row-sum-f32 src sb n mu true) (float n)))
+                  (inv (fdiv 1.0f32 (lane (simd/sqrt (splat f32x8 (+ var eps))) 0))))
+              (row-normalize-f32 src sb n mu inv (. g buffer) (. bt buffer) &buf b))))
+        (from-array dims @buf 0.0f32))))
+
+(defprotocol Rows
+  (rows-softmax (self x: (Tensor Self)) -> (Tensor Self))
+  (rows-layernorm (self x: (Tensor Self) gamma: (Tensor Self) beta: (Tensor Self) eps: Self) -> (Tensor Self)))
+(impl Rows f64 (rows-softmax (self x) (softmax-f64 x)) (rows-layernorm (self x gamma beta eps) (layernorm-f64 x gamma beta eps)))
+(impl Rows f32 (rows-softmax (self x) (softmax-f32 x)) (rows-layernorm (self x gamma beta eps) (layernorm-f32 x gamma beta eps)))
+
+;; softmax over the last axis of a tensor of any rank at least one; layernorm over the last axis with gamma and beta that broadcast to [n].
+(defun softmax (x: (Tensor t)) :where ((Element t) (Rows t)) -> (Tensor t)
+  (do (when (< (rank x) 1) (trap "tensor: softmax needs rank at least one"))
+      (rows-softmax (. x seed) x)))
+(defun layernorm (x: (Tensor t) gamma: (Tensor t) beta: (Tensor t) eps: t) :where ((Element t) (Rows t)) -> (Tensor t)
+  (do (when (< (rank x) 1) (trap "tensor: layernorm needs rank at least one"))
+      (rows-layernorm (. x seed) x gamma beta eps)))

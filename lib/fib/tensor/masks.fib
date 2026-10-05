@@ -13,12 +13,25 @@
 (defun greater-equal (a: (Tensor t) b: (Tensor t)) :where ((Ord t)) -> (Tensor bool)
   (zip-with (fn (x: t y: t) (>= x y)) false a b))
 
+;; An operand that one linear walk covers: a dense layout (step 1) or a broadcast scalar (every stride zero, step 0); anything else is -1.
+(defun linear-step :private (x: (Tensor t)) -> i64
+  (cond (contiguous? x) 1
+        (= (reduce + 0 (map abs (strides x))) 0) 0
+        :else -1))
+
 (defun where (mask: (Tensor bool) a: (Tensor t) b: (Tensor t)) :where ((Element t)) -> (Tensor t)
   (let ((dims (broadcast-shape (shape mask) (broadcast-shape (shape a) (shape b))))
         (condition (broadcast-to dims mask)) (left (broadcast-to dims a)) (right (broadcast-to dims b))
-        (n (checked-size dims (. a seed))) (buf (cell (array n (. a seed)))))
-    (do (dotimes (i n)
-          (array-set! &buf i (if (flat-at condition i) (flat-at left i) (flat-at right i))))
+        (n (checked-size dims (. a seed))) (buf (cell (array n (. a seed))))
+        (cs (linear-step condition)) (ls (linear-step left)) (rs (linear-step right)))
+    (do (if (and (>= cs 0) (>= ls 0) (>= rs 0))
+            ;; a linear walk: logical element i is buffer element offset + step * i, reads stay bounds-checked
+            (let ((cb (array-get (. condition meta) 0)) (lb (array-get (. left meta) 0)) (rb (array-get (. right meta) 0))
+                  (cx (. condition buffer)) (lx (. left buffer)) (rx (. right buffer)))
+              (dotimes (i n)
+                (array-set! &buf i (if (array-get cx (+ cb (* cs i))) (array-get lx (+ lb (* ls i))) (array-get rx (+ rb (* rs i)))))))
+            (dotimes (i n)
+              (array-set! &buf i (if (flat-at condition i) (flat-at left i) (flat-at right i)))))
         (from-array dims @buf (. a seed)))))
 
 (defun any? (mask: (Tensor bool)) -> bool

@@ -10,8 +10,15 @@
 ;; order, whatever the tile or block it falls in (a block continues the chain from C): the result
 ;; equals `fma-reference` bit for bit. It differs from the ordered `mmul-scalar` (multiply, then add) in
 ;; the last bits, because an fma rounds once.
+;;
+;; Epilogue (`multiply-with`): with an activation code >= 0 the last inner block finishes each output tile in place, right after the
+;; micro-kernel stored it (the tile is still in L1): C = act(C + bias), bias a row broadcast over the rows. Tiles are 6x16, so
+;; the bias is copied into a buffer zero padded to whole 16-column panels and every tile adds two full vectors of it. An edge tile is
+;; finished in the scratch tile, before the copy out, so the same code covers it and the padding is never written to C. Each output
+;; element gets the bias and the activation exactly once, whatever block or tile it falls in: the earlier inner blocks only accumulate.
+;; The product part is unchanged, so `multiply-with` equals `act(fma-reference + bias)`; code -1 is the plain product.
 (ns fib.tensor.gemm-fma-f32
-  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.memory))
+  (:use fib.core fib.seq fib.coll fib.tensor.layout fib.tensor.storage fib.tensor.memory fib.tensor.views fib.tensor.vmath))
 
 (defun mc :private () -> i64 96)   ; rows of A per block, a multiple of 6
 (defun kc :private () -> i64 512)  ; inner extent per block
@@ -61,14 +68,24 @@
               (store-f32x8 (ofs cp (unchecked-multiply 4 ldc)) a40) (store-f32x8 (ofs cp (unchecked-add (unchecked-multiply 4 ldc) 8)) a41)
               (store-f32x8 (ofs cp (unchecked-multiply 5 ldc)) a50) (store-f32x8 (ofs cp (unchecked-add (unchecked-multiply 5 ldc) 8)) a51))))))
 
+;; ---- epilogue: C = act(C + bias) over one 6x16 tile; `bias` points at its 16 (padded) bias values
+(defun finish-tile :private (cp: ptr ldc: i64 bias: ptr code: i64) -> unit
+  (unsafe
+    (let ((b0 (load-f32x8 bias)) (b1 (load-f32x8 (ofs bias 8))))
+      (dotimes (i 6)
+        (let ((r (ofs cp (unchecked-multiply i ldc))))
+          (do (store-f32x8 r (activate8 code (+ (load-f32x8 r) b0)))
+              (store-f32x8 (ofs r 8) (activate8 code (+ (load-f32x8 (ofs r 8)) b1)))))))))
+
 ;; ---- an incomplete tile goes through a 6x16 scratch tile (pitch 16) so the kernel is the same
-(defun edge-tile :private (ap: ptr bp: ptr cp: ptr ldc: i64 kk: i64 load: bool mr: i64 nr: i64 tp: ptr) -> unit
+(defun edge-tile :private (ap: ptr bp: ptr cp: ptr ldc: i64 kk: i64 load: bool mr: i64 nr: i64 tp: ptr bias: ptr code: i64) -> unit
   (unsafe
     (do (dotimes (i 96) (store-f32 (ofs tp i) 0.0f32))
         (when load
           (dotimes (i mr) (dotimes (j nr) (store-f32 (ofs tp (unchecked-add (unchecked-multiply 16 i) j))
                                                       (load-f32 (ofs cp (unchecked-add (unchecked-multiply ldc i) j)))))))
         (kern6x16 ap bp tp 16 kk load)
+        (when (>= code 0) (finish-tile tp 16 bias code))
         (dotimes (i mr) (dotimes (j nr) (store-f32 (ofs cp (unchecked-add (unchecked-multiply ldc i) j))
                                                     (load-f32 (ofs tp (unchecked-add (unchecked-multiply 16 i) j)))))))))
 
@@ -103,7 +120,7 @@
             bs0 bs1 (min 16 (- cols (* 16 q))) kk)))
 
 ;; ---- one (A block) x (B block) product into C
-(defun block-product :private (ap: ptr bp: ptr cp: ptr ldc: i64 rows: i64 cols: i64 kk: i64 load: bool tp: ptr) -> unit
+(defun block-product :private (ap: ptr bp: ptr cp: ptr ldc: i64 rows: i64 cols: i64 kk: i64 load: bool tp: ptr bias: ptr code: i64) -> unit
   (dotimes (jq (quot (+ cols 15) 16))
     (dotimes (iq (quot (+ rows 5) 6))
       (let ((mr (min 6 (- rows (* 6 iq)))) (nr (min 16 (- cols (* 16 jq))))
@@ -111,11 +128,12 @@
             (b (ofs bp (unchecked-multiply (unchecked-multiply 16 jq) kk)))
             (c (ofs cp (unchecked-add (unchecked-multiply (unchecked-multiply 6 iq) ldc) (unchecked-multiply 16 jq)))))
         (if (and (= mr 6) (= nr 16))
-            (kern6x16 a b c ldc kk load)
-            (edge-tile a b c ldc kk load mr nr tp))))))
+            (do (kern6x16 a b c ldc kk load)
+                (when (>= code 0) (finish-tile c ldc (ofs bias (unchecked-multiply 16 jq)) code)))
+            (edge-tile a b c ldc kk load mr nr tp (ofs bias (unchecked-multiply 16 jq)) code))))))
 
 ;; ---- the loop nest: column block, inner block (pack B), row block (pack A)
-(defun nest :private (ap: ptr bp: ptr cp: ptr abuf: ptr bbuf: ptr tp: ptr
+(defun nest :private (ap: ptr bp: ptr cp: ptr abuf: ptr bbuf: ptr tp: ptr biasp: ptr code: i64
                       as0: i64 as1: i64 bs0: i64 bs1: i64 m: i64 n: i64 k: i64) -> unit
   (loop ((jj 0))
     (when (< jj n)
@@ -128,16 +146,32 @@
                         (when (< ii m)
                           (let ((rows (min (mc) (- m ii))))
                             (do (pack-a-block abuf (ofs ap (unchecked-add (unchecked-multiply ii as0) (unchecked-multiply pp as1))) as0 as1 rows kk)
-                                (block-product abuf bbuf (ofs cp (unchecked-add (unchecked-multiply ii n) jj)) n rows cols kk (> pp 0) tp)
+                                (block-product abuf bbuf (ofs cp (unchecked-add (unchecked-multiply ii n) jj)) n rows cols kk (> pp 0) tp (ofs biasp jj) (if (>= (+ pp kk) k) code -1))
                                 (recur (+ ii (mc)))))))
                       (recur (+ pp (kc)))))))
             (recur (+ jj (nc))))))))
 
 (defun multiply (a: (Tensor f32) b: (Tensor f32)) -> (Tensor f32)
+  (multiply-with a b (zeros-f32 [1]) -1))
+
+;; The bias, broadcast to [n] and copied into a zero padded buffer of whole 16-column panels (reads are checked).
+(defun padded-bias :private (bias: (Tensor f32) n: i64) -> (Array f32)
+  (let ((row (broadcast-to [n] bias)) (src (. row buffer)) (off (array-get (. row meta) 0)) (st (nth (strides row) 0))
+        (buf (cell (array (roundup n 16) 0.0f32))))
+    (do (validate row)
+        (dotimes (j n) (array-set! &buf j (array-get src (+ off (* j st)))))
+        @buf)))
+
+;; C = act(A*B + bias) for activation code `code` (fib.tensor.vmath/activation-code) or the plain product for code -1; bias is
+;; any tensor that broadcasts to [n]. k = 0 is the caller's: the product is all zeros, but no tile would run the epilogue.
+;; Safety of the uninitialised output: the loop nest covers every tile of every block, the first inner block stores each of its
+;; elements (load is false) and later blocks load before they store, so every element of C is written before it is read.
+(defun multiply-with (a: (Tensor f32) b: (Tensor f32) bias: (Tensor f32) code: i64) -> (Tensor f32)
   (do (validate a) (validate b)
       (when (or (!= (rank a) 2) (!= (rank b) 2)) (trap "tensor: mmul requires rank two"))
       (let ((ad (shape a)) (bd (shape b)) (m (nth ad 0)) (k (nth ad 1)) (n (nth bd 1)))
         (do (when (!= k (nth bd 0)) (trap "tensor: mmul inner dimension mismatch"))
+            (when (and (>= code 0) (= k 0)) (trap "tensor: fused epilogue needs a nonzero inner dimension"))
             (let ((length (checked-size [m n] 0.0f32))
                   (output (if (= k 0) (array length 0.0f32) (unsafe (array-uninit-f32 length)))))
               (do (when (and (> length 0) (> k 0))
@@ -145,10 +179,11 @@
                           (abuf (unsafe (array-uninit-f32 (* (roundup (min (mc) m) 6) kk))))
                           (bbuf (unsafe (array-uninit-f32 (* (roundup (min (nc) n) 16) kk))))
                           (tbuf (unsafe (array-uninit-f32 96)))
+                          (biasbuf (if (>= code 0) (padded-bias bias n) (array 16 0.0f32)))
                           (as (strides a)) (bs (strides b)))
                       (nest (data a) (data b) (unsafe (ptr+ (raw output) (array-header-size)))
                             (unsafe (ptr+ (raw abuf) (array-header-size))) (unsafe (ptr+ (raw bbuf) (array-header-size)))
-                            (unsafe (ptr+ (raw tbuf) (array-header-size)))
+                            (unsafe (ptr+ (raw tbuf) (array-header-size))) (unsafe (ptr+ (raw biasbuf) (array-header-size))) code
                             (nth as 0) (nth as 1) (nth bs 0) (nth bs 1) m n k)))
                   (from-array [m n] output 0.0f32)))))))
 

@@ -41,6 +41,11 @@ SUITE = [
     ("softmax", 4096, 256, "softmax rows 4096x4096 f64", 1e-9),
     ("layernorm", 4096, 256, "layernorm 4096x1024 f64", 1e-9),
     ("mlp", 256, 32, "MLP f32 b256 784-512-10", 1e-4),
+    ("mlpfused", 256, 32, "MLP f32 b256 784-512-10 (t/dense)", 1e-4),
+    ("softmaxfused", 4096, 256, "softmax rows 4096x4096 f64 (t/softmax)", 1e-9),
+    ("layernormfused", 4096, 256, "layernorm 4096x1024 f64 (t/layernorm)", 1e-9),
+    ("attn", 1024, 128, "attention f32 n=1024 d=64 (composed)", 1e-4),
+    ("attnfused", 1024, 128, "attention f32 n=1024 d=64 (t/softmax)", 1e-4),
 ]
 
 
@@ -84,7 +89,7 @@ def main():
         fm, fc, fe = run([a.bin] + args, {}, runs)
         nm, nc, ne = run(["python3", os.path.join(HERE, "bench.py")] + args, {}, runs)
         ob = None
-        if a.openblas and k.startswith("matmul") or (a.openblas and k == "mlp"):
+        if a.openblas and k.startswith("matmul") or (a.openblas and k in ("mlp", "mlpfused", "attn", "attnfused")):
             ob, oc, oe = run(["python3", os.path.join(HERE, "bench.py")] + args, {"LD_LIBRARY_PATH": a.openblas}, runs)
         ok = fm is not None and nm is not None and abs(fc - nc) <= rtol * max(abs(fc), abs(nc)) + 1e-300
         if not ok:
