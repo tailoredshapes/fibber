@@ -1,0 +1,61 @@
+;; compiler/fibref/heap.fib: the audited heap, the memory audit (docs/design/fibref-port.md section 4). OWNER: package F1.
+;; Port of crates/fibref/src/heap/ (2,122 lines): store, object, alloc, release, cascade, scope, unique, shared, immortalise, audit, graph, scc, event,
+;; error, and the rules new since seed-1 (steal, move-in, peeks, ROOMY, array-push!/pop!/take!, cell-update!). The heap is a value of cells passed as
+;; one argument (no global state). An operation validates before it changes anything: after an `Err` the heap is as it was.
+(ns fibref.heap
+  (:use fibref.value))
+
+;; The audit errors of heap/error.rs (the fields name the object and the attempted operation).
+(defenum HpOp HpRetain HpRelease HpRead HpWrite HpWeak HpShare HpStore HpInspect)
+(defenum HpWhy HpPlaceNotCell HpContentNotImmutable HpShared HpImmortal HpStackData HpCountAbove1)
+(defenum HpErr
+  (HeUnknownId id: i64)
+  (HeUseAfterFree id: i64 op: HpOp)
+  (HeReleaseOfFreed id: i64)
+  (HeWriteToImmutable id: i64)
+  (HeBadField id: i64 index: i64)
+  (HeSharedCell id: i64)
+  (HeWrongSlotCount kind: IKind given: i64)
+  (HeNotUnique id: i64 why: HpWhy)
+  (HeStackUseAfterScope id: i64 op: HpOp)
+  (HeStackRefInHeap id: i64)
+  (HeStackRefIntoOuterScope id: i64 scope: i64)
+  (HeWeakToStack id: i64)
+  (HeSharedStack id: i64)
+  (HeImmortalHoldsMortal id: i64)
+  (HeMutableImmortal kind: IKind)
+  (HeUnknownScope scope: i64)
+  (HeScopeEnded scope: i64))
+
+;; The events of heap/event.rs, in the order they happened (what `fibref trace` prints and what a unit test replays).
+(defenum HpEvent
+  (EvAlloc id: i64 kind: IKind) (EvRetain id: i64 count: i64) (EvRelease id: i64 count: i64) (EvFree id: i64)
+  (EvRead id: i64 field: i64) (EvWrite id: i64 field: i64) (EvWeak id: i64) (EvUpgrade id: i64 live: bool) (EvShared id: i64)
+  (EvAllocImmortal id: i64 kind: IKind) (EvAllocStack id: i64 kind: IKind scope: i64) (EvWriteUnique place: i64 id: i64 field: i64)
+  (EvScopeOpen scope: i64) (EvScopeEnd scope: i64) (EvDrop id: i64) (EvInitDone))
+
+;; What is live at exit (audit.rs LeakClass): kept alive only by a cycle through a cell or atom (count = live Ref fields), another leak, or an
+;; immutable cycle (a bug: the language cannot build one).
+(defenum HpLeakClass HpLeakCycle HpLeak HpImmutableCycle)
+(defstruct HpLeakRow (id: i64 kind: IKind count: i64 held: i64 class: HpLeakClass))
+(defstruct HpReport (leaks: (Vec HpLeakRow) dangling: (Vec str) open-scopes: (Vec i64) live-tally: (Vec i64)))   ;; tally: live o c a
+
+;; The heap. Opaque to everyone but fibref.heap: the object table, the counters and the event log live in these cells.
+(defstruct Heap (objects: (Cell (Vec IVal)) log: (Cell (Vec HpEvent)) state: (Cell (Vec i64))))
+
+(defun heap-new () -> Heap (trap "todo: fibref.heap heap-new"))
+(defun heap-alloc (h: Heap kind: IKind tid: i64 fields: (Vec IVal)) -> (Result i64 HpErr) (trap "todo: fibref.heap heap-alloc"))
+(defun heap-retain (h: Heap id: i64) -> (Result unit HpErr) (trap "todo: fibref.heap heap-retain"))
+(defun heap-release (h: Heap id: i64) -> (Result unit HpErr) (trap "todo: fibref.heap heap-release"))
+(defun heap-read (h: Heap id: i64 field: i64) -> (Result IVal HpErr) (trap "todo: fibref.heap heap-read"))
+(defun heap-write (h: Heap id: i64 field: i64 v: IVal) -> (Result unit HpErr) (trap "todo: fibref.heap heap-write"))
+(defun heap-write-unique (h: Heap place: i64 field: i64 v: IVal) -> (Result unit HpErr) (trap "todo: fibref.heap heap-write-unique"))
+(defun heap-open-scope (h: Heap) -> i64 (trap "todo: fibref.heap heap-open-scope"))
+(defun heap-alloc-in-scope (h: Heap scope: i64 kind: IKind tid: i64 fields: (Vec IVal)) -> (Result i64 HpErr) (trap "todo: fibref.heap heap-alloc-in-scope"))
+(defun heap-end-scope (h: Heap scope: i64) -> (Result unit HpErr) (trap "todo: fibref.heap heap-end-scope"))
+(defun heap-mark-shared (h: Heap id: i64) -> (Result unit HpErr) (trap "todo: fibref.heap heap-mark-shared"))
+(defun heap-immortalise (h: Heap id: i64) -> (Result unit HpErr) (trap "todo: fibref.heap heap-immortalise"))
+(defun heap-init-done (h: Heap) -> unit (trap "todo: fibref.heap heap-init-done"))
+;; The audit at exit (audit.rs `finish`, graph.rs, scc.rs): every object still live, classified; dangling refs; scopes never ended.
+(defun heap-finish (h: Heap) -> HpReport (trap "todo: fibref.heap heap-finish"))
+(defun hp-err-text (e: HpErr) -> str (trap "todo: fibref.heap hp-err-text"))
