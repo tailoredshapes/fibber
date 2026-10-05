@@ -1,0 +1,53 @@
+;; compiler/gen/rng.fib: SplitMix64, as crates/fibgen/src/rng.rs (seed-1). OWNER: G0 (real, not a stub: it is the determinism contract and one
+;; page long). The state is one u64 held as the i64 with the same bits: fibber has no unsigned type, so the wrapping family does the
+;; arithmetic (`unchecked-add`, `unchecked-multiply`), `shr` is the logical shift, and the one unsigned operation, `u64 % n`, is
+;; `rng-umod`. Checked against compiler/tests/golden/gen/rng.tsv by compiler/tests/gen/rng-check.fib.
+(ns gen.rng)
+
+(defstruct FgRng (state: (Cell i64)))
+
+(defun rng-new (seed: i64) -> FgRng (FgRng (cell seed)))
+
+;; The next 64 random bits (as the i64 with those bits).
+(defun rng-next (r: FgRng) -> i64
+  (let ((s (unchecked-add @(. r state) -7046029254386353131)))
+    (do (set! (. r state) s)
+        (let ((z1 (unchecked-multiply (bit-xor s (shr s 30)) -4658895280553007687))
+               (z2 (unchecked-multiply (bit-xor z1 (shr z1 27)) -7723592293110705685)))
+          (bit-xor z2 (shr z2 31))))))
+
+;; `z mod n` for z read as a u64 and 0 < n < 2^62 (the Rust `next_u64() % n as u64`).
+(defun rng-umod (z: i64 n: i64) -> i64
+  (if (>= z 0)
+      (rem z n)
+      (let ((q (shl (quot (shr z 1) n) 1))
+             (r (unchecked-subtract z (unchecked-multiply q n))))
+        (if (>= r n) (- r n) r))))
+
+;; A number in 0..n; 0 when n is 0 (Rng::below).
+(defun rng-below (r: FgRng n: i64) -> i64
+  (if (= n 0) 0 (rng-umod (rng-next r) n)))
+
+;; A number in lo..=hi (Rng::range).
+(defun rng-range (r: FgRng lo: i64 hi: i64) -> i64
+  (let ((span (max (+ (- hi lo) 1) 1)))
+    (+ lo (rng-below r span))))
+
+;; True with probability pct percent (Rng::chance). The draw is made even when pct is 0 or 100.
+(defun rng-chance (r: FgRng pct: i64) -> bool
+  (< (rng-below r 100) pct))
+
+;; The index chosen with probability proportional to its weight, or nil when every weight is zero (Rng::weighted).
+;; No draw is made when the total is zero.
+(defun rng-weighted (r: FgRng weights: (Vec i64)) -> (Option i64)
+  (let ((total (reduce + 0 weights)))
+    (if (= total 0)
+        nil
+        (loop ((i 0) (x (rng-below r total)))
+          (if (< x (vec-nth weights i))
+              (some i)
+              (recur (+ i 1) (- x (vec-nth weights i))))))))
+
+;; Rng::pick over a collection of n elements: the index of the one picked, nil when n is 0 (no draw is made then). Callers index their vector.
+(defun rng-pick-index (r: FgRng n: i64) -> (Option i64)
+  (if (= n 0) nil (some (rng-below r n))))

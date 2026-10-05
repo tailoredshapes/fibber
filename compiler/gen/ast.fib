@@ -1,0 +1,111 @@
+;; compiler/gen/ast.fib: the generated program as a typed tree, as crates/fibgen/src/ast.rs, macros.rs (the `Mac` enum) and pipe/mod.rs (the
+;; pipeline node, here because `Kind` holds a `Pipe` and a `Pipe` holds `Expr`s: modules cannot be cyclic). OWNER: package T.
+;;
+;; Shapes (design section 4.2): variant prefixes `Ek` (Kind), `Gp` (Pat), `Rs` (Rest), `Ar` (Arg), `Mc` (Mac), `Sr` (Src), `Sg` (Stage), `Op` (Operand),
+;; `Tm` (Term), `Sh` (Shape). A Rust tuple is a record. `Box` is a plain field. Float literals are f64: the generator only makes multiples of 1/4
+;; and the specials NaN and the infinities, so printing needs no shortest-round-trip algorithm (design section 4.5).
+(ns gen.ast
+  (:use gen.ty gen.ctx))
+
+(defenum FgMac McTwice McOnce2 McSwapSub McFlipIf McSumAll McNargs McSeq)
+(derive Eq FgMac)
+
+(defstruct FgExpr (ty: FgTy kind: FgKind))
+
+(defstruct FgBind (pat: FgPat init: FgExpr))
+(defstruct FgNameInit (name: str init: FgExpr))
+(defstruct FgNameTy (name: str ty: FgTy))
+(defstruct FgClause (pat: FgPat guard: (Option FgExpr) body: FgExpr))
+(defstruct FgArm (pat: FgPat body: FgExpr))
+
+(defenum FgRest (RsBind name: str) RsWild)
+(defenum FgArg (ArVal e: FgExpr) (ArInOut name: str))
+
+(defenum FgPat
+  GpWild
+  (GpBind name: str)
+  GpNil
+  (GpSome p: FgPat)
+  (GpCtor name: str args: (Vec FgPat))
+  (GpAs p: FgPat name: str)
+  (GpVector items: (Vec FgPat) rest: (Option FgRest))
+  (GpLit v: i64))
+
+;; `Conv`'s `Option<NumTy>`: nil is `i64`.
+(defenum FgKind
+  (EkInt v: i64) (EkBool v: bool) (EkStr v: str) EkUnit EkNil EkEmpty
+  (EkVecLit items: (Vec FgExpr))
+  (EkVar name: str) (EkGlobal name: str)
+  (EkLet binds: (Vec FgBind) body: FgExpr)
+  (EkIf c: FgExpr t: FgExpr e: FgExpr)
+  (EkDo steps: (Vec FgExpr))
+  (EkMatch scrut: FgExpr arms: (Vec FgArm))
+  (EkLoop binds: (Vec FgNameInit) body: FgExpr)
+  (EkRecur args: (Vec FgExpr))
+  (EkFn params: (Vec FgNameTy) body: FgExpr)
+  (EkFnNamed name: str params: (Vec FgNameTy) body: FgExpr)
+  (EkCall head: str args: (Vec FgArg))
+  (EkApply f: FgExpr args: (Vec FgExpr))
+  (EkField e: FgExpr name: str)
+  (EkDeref e: FgExpr)
+  (EkSet cell: FgExpr v: FgExpr)
+  (EkSetField cell: str field: str v: FgExpr)
+  (EkAsync e: FgExpr)
+  (EkAwait e: FgExpr)
+  (EkPlet binds: (Vec FgNameInit) body: FgExpr)
+  (EkWeakDead name: str target: FgExpr)
+  (EkDyn proto: FgProto send: bool e: FgExpr)
+  (EkGMatch scrut: FgExpr clauses: (Vec FgClause))
+  (EkMacro mac: FgMac args: (Vec FgExpr))
+  (EkIntW v: i64 n: FgNum)
+  (EkFlt v: f64 n: FgNum)
+  (EkConv op: str to: (Option FgNum) e: FgExpr)
+  (EkPipe p: FgPipe))
+
+;; ---- pipelines (pipe/mod.rs)
+(defenum FgSrc (SrVec e: FgExpr) (SrList e: FgExpr) (SrRange e: FgExpr))
+(defenum FgStage
+  (SgMap f: FgExpr) (SgFilter f: FgExpr) (SgRemove f: FgExpr) (SgTake n: FgExpr) (SgDrop n: FgExpr)
+  (SgTakeWhile f: FgExpr) (SgMapcat f: FgExpr)
+  (SgConcat other: FgOperand first: bool))
+(defenum FgOperand (OpVec e: FgExpr) (OpLazy chain: FgChain) (OpEager chain: FgChain))
+(defstruct FgChain (src: FgSrc stages: (Vec FgStage)))
+(defenum FgTerm
+  (TmReduce f: FgExpr init: FgExpr stop: (Option i64)) (TmReduce1 f: FgExpr)
+  TmCount TmVec TmFirst TmLast TmEmpty TmSum TmSort
+  (TmEvery f: FgExpr) (TmFindFirst f: FgExpr) (TmSortBy f: FgExpr) (TmNth n: FgExpr))
+;; Shape::Split(usize) is `ShSplit`.
+(defenum FgShape ShThread ShNested ShBound (ShSplit k: i64))
+(defstruct FgPipe (chain: FgChain terms: (Vec FgTerm) shape: FgShape))
+
+;; pipe/mod.rs constants: NONE (what a missing element folds to) and COUNT_SCALE.
+(defun pipe-none () -> i64 1000001)
+(defun pipe-count-scale () -> i64 100003)
+
+;; ---- items
+(defstruct FgMethod (name: str params: (Vec FgNameTy) body: FgExpr))
+(defstruct FgImpl (proto: FgProto target: FgTy methods: (Vec FgMethod) colour-var: bool))
+(defstruct FgParam (name: str ty: FgTy inout: bool))
+(defstruct FgFun (name: str params: (Vec FgParam) ret: FgTy body: FgExpr))
+(defstruct FgDef (name: str ty: FgTy init: FgExpr))
+(defstruct FgProgram (defs: (Vec FgDef) impls: (Vec FgImpl) funs: (Vec FgFun) main: FgExpr))
+
+;; Pairs the Rust returns as tuples.
+(defstruct FgPatVars (pat: FgPat vars: (Vec FgVar)))
+(defstruct FgDefs (defs: (Vec FgDef) vars: (Vec FgVar)))
+
+;; ---- the tree's own functions (ast.rs `impl Expr`, `impl Program`; pipe/mod.rs `exprs`). The shrinker and the printer use `children`.
+(defun expr-new (ty: FgTy kind: FgKind) -> FgExpr (FgExpr ty kind))
+(defun expr-int (n: i64) -> FgExpr (trap "todo: gen.ast expr-int"))
+(defun expr-var (name: str ty: FgTy) -> FgExpr (trap "todo: gen.ast expr-var"))
+(defun expr-call (ty: FgTy head: str args: (Vec FgExpr)) -> FgExpr (trap "todo: gen.ast expr-call"))
+;; Expr::children: the sub-expressions in the order of the Rust (the shrinker's node numbering depends on it; `&` arguments are skipped).
+(defun expr-children (e: FgExpr) -> (Vec FgExpr) (trap "todo: gen.ast expr-children"))
+;; Expr::children_mut becomes `expr-with-children`: the same node with its children replaced, in the same order.
+(defun expr-with-children (e: FgExpr kids: (Vec FgExpr)) -> FgExpr (trap "todo: gen.ast expr-with-children"))
+(defun expr-size (e: FgExpr) -> i64 (trap "todo: gen.ast expr-size"))
+(defun program-bodies (p: FgProgram) -> (Vec FgExpr) (trap "todo: gen.ast program-bodies"))
+(defun program-size (p: FgProgram) -> i64 (trap "todo: gen.ast program-size"))
+(defun program-uses-library? (p: FgProgram) -> bool (trap "todo: gen.ast program-uses-library?"))
+(defun pipe-exprs (p: FgPipe) -> (Vec FgExpr) (trap "todo: gen.ast pipe-exprs"))
+(defun pipe-with-exprs (p: FgPipe es: (Vec FgExpr)) -> FgPipe (trap "todo: gen.ast pipe-with-exprs"))
