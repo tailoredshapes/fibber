@@ -1,0 +1,49 @@
+;; spec:   spec/lir.md 6.1 (fmin fmax fminnum fmaxnum smin smax), docs/design/simd-and-tensors.md 2.6, stdlib `min` `max`
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; The NaN rule: simd/min and simd/max return NaN when either operand is NaN (as the library's min and max do, the same answers are compared here), -0.0 is below +0.0; simd/min-num and simd/max-num return the other operand when one is NaN. They act lane by lane on f64x4 and on a plain float. Integer lanes (i8x4, i32x4, i64x2) are compared with the scalar if. Float lanes of ordinary values are compared with the scalar if.
+(ns main (:use fib.core fib.seq fib.coll tl.check))
+
+(defun nan? (x: f64) -> bool (!= x x))
+(defun pick-min (a: i64 b: i64) -> i64 (if (< a b) a b))
+(defun pick-max (a: i64 b: i64) -> i64 (if (> a b) a b))
+
+(defun main () -> i64
+  (let ((c (checks)) (nan (bits->f64 9221120237041090560)))
+    (do (let ((a: f64x4 (with-lane <<1.0 2.0 3.0 4.0>> 0 nan)) (b: f64x4 <<5.0 1.0 0.0 -0.0>>))
+          (let ((lo (simd/min a b)) (hi (simd/max a b)) (lon (simd/min-num a b)) (hin (simd/max-num a b)))
+            (do (check c (nan? (lane lo 0))) (check c (nan? (lane hi 0)))
+                (check c (= (lane lo 1) 1.0)) (check c (= (lane hi 1) 2.0))
+                (check c (= (lane lon 0) 5.0)) (check c (= (lane hin 0) 5.0))
+                (check c (= (lane lon 1) 1.0)) (check c (= (lane hin 1) 2.0))
+                (check c (= (lane lo 2) (min 3.0 0.0))) (check c (= (lane hi 2) (max 3.0 0.0)))
+                (check c (= (lane lo 3) (min 4.0 -0.0))) (check c (= (lane hi 3) (max 4.0 -0.0))))))
+        (check c (nan? (simd/min nan 1.0))) (check c (nan? (simd/max 1.0 nan)))
+        (check c (nan? (min nan 1.0))) (check c (nan? (max 1.0 nan)))
+        (check c (= (simd/min-num nan 1.0) 1.0)) (check c (= (simd/max-num 1.0 nan) 1.0))
+        (check c (= (f64->bits (simd/min 0.0 -0.0)) (f64->bits -0.0)))
+        (check c (= (f64->bits (simd/min -0.0 0.0)) (f64->bits -0.0)))
+        (check c (= (f64->bits (simd/max 0.0 -0.0)) (f64->bits 0.0)))
+        (check c (= (f64->bits (simd/max -0.0 0.0)) (f64->bits 0.0)))
+        (let ((a: i32x4 <<1 -5 300 -2147483648>>i32) (b: i32x4 <<2 -6 300 2147483647>>i32))
+          (let ((lo (simd/min a b)) (hi (simd/max a b)))
+            (doseq [k (range 4)]
+              (do (check c (= (sext i64 (lane lo k)) (pick-min (sext i64 (lane a k)) (sext i64 (lane b k)))))
+                  (check c (= (sext i64 (lane hi k)) (pick-max (sext i64 (lane a k)) (sext i64 (lane b k)))))))))
+        (let ((a: i8x4 <<1 -5 127 -128>>i8) (b: i8x4 <<2 -6 -128 127>>i8))
+          (let ((lo (simd/min a b)) (hi (simd/max a b)))
+            (doseq [k (range 4)]
+              (do (check c (= (sext i64 (lane lo k)) (pick-min (sext i64 (lane a k)) (sext i64 (lane b k)))))
+                  (check c (= (sext i64 (lane hi k)) (pick-max (sext i64 (lane a k)) (sext i64 (lane b k)))))))))
+        (let ((a: i64x2 <<9223372036854775807 -3>>) (b: i64x2 <<-9223372036854775807 -2>>))
+          (do (check c (= (lane (simd/min a b) 0) (pick-min (lane a 0) (lane b 0)))) (check c (= (lane (simd/max a b) 1) (pick-max (lane a 1) (lane b 1))))))
+        (check c (= (simd/min 3 4) 3)) (check c (= (simd/max 3i8 4i8) 4i8))
+        (let ((a: i32x4 <<-7 7 0 -2147483647>>i32))
+          (let ((m (simd/abs a)))
+            (doseq [k (range 4)] (check c (= (sext i64 (lane m k)) (let ((x (sext i64 (lane a k)))) (if (< x 0) (- 0 x) x)))))))
+        (let ((p (checks)))
+          (do (check p (= (simd/max 1.0 nan) 1.0)) (check-detects c p)))
+        (checks-result c))))

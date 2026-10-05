@@ -423,7 +423,10 @@ the same vector. **Vector memory** (builtins `emit.lower.simdmem`, on an `(Array
 `simd-load-unchecked` and `simd-store-unchecked!` skip the bounds check (unsafe; the store still copies a shared array); `simd-load-masked a i m passthru` and `simd-store-masked! &a i v m` touch
 only the active lanes and trap if an active lane is outside the array; `simd-load-tail a i` (lanes past the end 0) and `simd-store-tail! &a i v` need `0 <= i <= len`. Alignment promised is the element's.
 `simd-load-vec` and `simd-store-vec` of `fib.simd` do a `Vec` lane by lane. `simd/shuffle a b <<i ..>>` (indices a vector literal of integer literals, checked by the checker; the result lane count is the index count),
-`simd/reverse`, `simd/lanes` and `simd/kind` (constants). `Debug` and `ToStr` of a vector are in `fib.simd`. **Not there yet:** conversions, `fma`/`sqrt` and kin, `(native-lanes T)`, and a vector in a `def`; `MArray` does not exist in the library.
+`simd/reverse`, `simd/lanes` and `simd/kind` (constants). `Debug` and `ToStr` of a vector are in `fib.simd`. **Float and integer functions** on a scalar or every lane (`emit.lower.simdfn`, one lIR instruction each, spec/lir.md 6.1): `simd/fma` (one rounding), `simd/sqrt`, `simd/floor`, `simd/ceil`, `simd/trunc`,
+`simd/round` (ties away from zero), `simd/round-even`, `simd/abs` (integers trap on the minimum), `simd/min` and `simd/max` (**NaN rule:** a NaN operand gives NaN; `-0.0` is below `+0.0`; integers signed), `simd/min-num` and `simd/max-num`
+(a NaN operand loses). `simd/convert v` converts every lane to the lane type of the context: int to float (`sitofp`), float to int (`fptosi-sat`: saturates, NaN is 0), wider integer `sext`, narrower `trunc`, `fpext`, `fptrunc`.
+**Not there yet:** `(native-lanes T)` and a vector in a `def`; `MArray` does not exist in the library.
 A vector argument or result of an `extern` is a type error (`an extern position cannot be a vector`). The head `simd` of the
 literal's form is reserved: no local variable named `simd` shadows it (spec/syntax.md 1).
 An integer literal against an `i8`/`i16`/`i32` *scalar* parameter is still the L26

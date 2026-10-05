@@ -1,0 +1,54 @@
+;; spec:   types §1.9, spec/lir.md 6.1 (floating-point functions), docs/design/simd-and-tensors.md 2.6
+;; expect: accept
+;; result: 0
+;; audit:  clean
+;; stage:  2
+;; roots:  ../../lib support
+;; simd/sqrt simd/floor simd/ceil simd/trunc simd/round simd/round-even simd/abs and simd/fma on a float and on every lane of f64x4 and f32x4, each against a reference written here: sqrt against libm's, the roundings by integer conversion and comparison, abs by the bits with the sign cleared, and fma by a pair of operands whose product is not exact (the fused result keeps the error 1.0 that a multiply then add loses: 0.0).
+(ns main (:require [fib.math :as math]) (:use fib.core fib.seq fib.coll tl.check))
+
+(defun ref-trunc (x: f64) -> f64 (sitofp f64 (fptosi i64 x)))
+(defun ref-floor (x: f64) -> f64 (let ((t (ref-trunc x))) (if (> t x) (- t 1.0) t)))
+(defun ref-ceil (x: f64) -> f64 (let ((t (ref-trunc x))) (if (< t x) (+ t 1.0) t)))
+(defun ref-round (x: f64) -> f64 (if (>= x 0.0) (ref-floor (+ x 0.5)) (- 0.0 (ref-floor (+ (- 0.0 x) 0.5)))))
+(defun ref-even (x: f64) -> f64
+  (let ((f (ref-floor x)))
+    (let ((d (- x f)))
+      (cond (< d 0.5) f
+            (> d 0.5) (+ f 1.0)
+            :else (if (= (rem (fptosi i64 f) 2) 0) f (+ f 1.0))))))
+(defun ref-abs-bits (x: f64) -> i64 (bit-and (f64->bits x) 9223372036854775807))
+
+(defun main () -> i64
+  (let ((c (checks)) (vs [<<2.5 -2.5 0.4 -0.6>> <<3.5 -3.5 4.0e9 -7.25>> <<0.5 -0.5 1.5 -1.5>>]))
+    (do (doseq [j (range 3)]
+          (let ((x: f64x4 (nth vs j)))
+            (doseq [k (range 4)]
+              (let ((e (lane x k)))
+                (do (check c (= (lane (simd/floor x) k) (ref-floor e)))
+                    (check c (= (lane (simd/ceil x) k) (ref-ceil e)))
+                    (check c (= (lane (simd/trunc x) k) (ref-trunc e)))
+                    (check c (= (lane (simd/round x) k) (ref-round e)))
+                    (check c (= (lane (simd/round-even x) k) (ref-even e)))
+                    (check c (= (f64->bits (lane (simd/abs x) k)) (ref-abs-bits e)))
+                    (check c (= (simd/floor e) (ref-floor e)))
+                    (check c (= (simd/round-even e) (ref-even e))))))))
+        (let ((x: f64x4 <<4.0 2.0 1.0e10 0.25>>))
+          (doseq [k (range 4)]
+            (do (check c (= (lane (simd/sqrt x) k) (math/sqrt (lane x k))))
+                (check c (= (simd/sqrt (lane x k)) (math/sqrt (lane x k)))))))
+        (let ((x: f32x4 <<4.0 2.5 -2.5 0.25>>f32))
+          (doseq [k (range 4)]
+            (let ((e (fpext f64 (lane x k))))
+              (do (check c (= (lane (simd/floor x) k) (fptrunc f32 (ref-floor e))))
+                  (check c (= (lane (simd/round-even x) k) (fptrunc f32 (ref-even e))))
+                  (check c (= (fpext f64 (lane (simd/sqrt (simd/abs x)) k)) (fpext f64 (fptrunc f32 (math/sqrt (fpext f64 (lane (simd/abs x) k)))))))))))
+        (let ((a 134217729.0) (e: f64x2 <<134217729.0 3.0>>))
+          (do (check c (= (simd/fma a a (neg (* a a))) 1.0))
+              (check c (= (+ (* a a) (neg (* a a))) 0.0))
+              (let ((r (simd/fma e e (neg (* e e)))))
+                (do (check c (= (lane r 0) 1.0)) (check c (= (lane r 1) 0.0))))
+              (check c (= (lane (simd/fma <<2.0 3.0>> <<4.0 5.0>> <<1.0 1.0>>) 1) (+ (* 3.0 5.0) 1.0)))))
+        (let ((p (checks)))
+          (do (check p (= (simd/floor 2.5) 3.0)) (check-detects c p)))
+        (checks-result c))))
