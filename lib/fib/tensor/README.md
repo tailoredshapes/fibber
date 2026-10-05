@@ -229,6 +229,36 @@ NaN in gives NaN, `log 0 = -inf`, `log x<0 = NaN`, `tanh +-inf = +-1`,
 `FIB_TARGET_CPU=x86-64-v2` too) and `simd/bitcast` for 2^k and the exponent split. Results can differ from the scalar libm in the last place. A
 strided input is first made contiguous.
 
+## Fused dense layers and activations
+
+A neural-network layer is `activation(x * w + b)`. Written as `mmul`, `add`, `where`, it makes three
+passes over the output and two temporaries; `dense` does it in the GEMM's store phase:
+
+```clojure
+(t/dense x w b :relu)          ; x: [m k], w: [k n], b: broadcasts to [n]  ->  [m n]
+(t/mmul-bias x w b)            ; the same with no activation
+(t/activate :gelu y)           ; an activation alone, one pass, one allocation (also (t/relu y))
+;; a two-layer network:
+(t/dense (t/dense x w1 b1 :relu) w2 b2 :identity)
+```
+
+Activations are the keywords `:identity :relu :tanh :sigmoid :silu :gelu` (`:gelu` is the tanh form
+GPT-2 and BERT use; an unknown name traps). `:relu` means `(where (greater x 0) x 0)` exactly, so NaN and
+`-0.0` give `+0.0`; the others are `fib.tensor.vmath`'s vector `exp` and `tanh` (so within a few ULP of libm,
+the bounds of `exp` and `tanh` above, and an `f32` result is the `f64` result rounded).
+
+For `f32` on a target with FMA, `dense` finishes each 6x16 output tile of the last inner block right after
+the micro-kernel stored it (the tile is in L1): `C = act(C + bias)`, so the output is written once and no
+temporary exists. The bias is copied once into a buffer padded to whole 16-column panels, so the epilogue
+is two full vector adds per row also on edge tiles (which finish in their scratch tile before the copy out).
+The product is the same fma chain as `mmul`, so `dense` equals `act(mmul + bias)` computed with the same
+bits; for `f64`, a target without FMA, and an empty inner dimension, `dense` is composed from `mmul`, `add`
+and `activate` (same value, extra passes). Case 7083 checks it against the ordered fma reference plus a scalar
+activation over every tail shape, inner blocks and strided views, and `scripts/mutant-tensor-fused.sh`
+plants 14 faults (dropped bias on edge tiles, activation on every inner block, wrong column offset, ...).
+On the benchmark MLP (batch 256, 784-512-10, `scripts/bench/tensor/micro-mlp.fib`) the three-pass pipeline
+took 3.3 ms and `dense` twice 1.5 ms; the bias add alone was 0.03 ms, the `where`-based relu 1.8 ms.
+
 ## Safety and validation
 
 The `Tensor` descriptor is public so callers can name the generic type.

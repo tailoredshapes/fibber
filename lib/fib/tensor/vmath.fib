@@ -74,8 +74,34 @@
         (large (simd/blend (simd/lt x zero) (neg th) th)))
     (simd/blend (simd/eq x zero) x (simd/blend (simd/lt a (splat f64x4 0.55)) small large))))
 
+;; Activations (op 3 and up; `activation-code` names them). Built on exp4 and tanh4, so they are as accurate as those and as the f64 result
+;; rounded to f32. relu keeps the `where (greater x 0) x 0` meaning: NaN and -0.0 give +0.0.
+;;   sigmoid 1/(1+e^-x)   silu x*sigmoid(x)   gelu 0.5x(1+tanh(sqrt(2/pi)(x+0.044715x^3)))  (the tanh form, as GPT-2 and BERT use)
+(defun sigmoid4 :private (x: f64x4) -> f64x4
+  (let ((one (splat f64x4 1.0))) (fdiv one (+ one (exp4 (neg x))))))
+
+(defun gelu4 :private (x: f64x4) -> f64x4
+  (let ((inner (* (splat f64x4 0.7978845608028654) (simd/muladd (* (* x x) x) (splat f64x4 0.044715) x))))
+    (* (* (splat f64x4 0.5) x) (+ (splat f64x4 1.0) (tanh4 inner)))))
+
 (defun apply4 :private (op: i64 x: f64x4) -> f64x4
-  (cond (= op 0) (exp4 x) (= op 1) (log4 x) :else (tanh4 x)))
+  (cond (= op 0) (exp4 x) (= op 1) (log4 x) (= op 2) (tanh4 x) (= op 3) (sigmoid4 x)
+        (= op 4) (* x (sigmoid4 x)) (= op 5) (gelu4 x)
+        (= op 6) (simd/blend (simd/gt x (splat f64x4 0.0)) x (splat f64x4 0.0))
+        :else x))
+
+(defun activation-code (name: keyword) -> i64
+  (cond (= name :tanh) 2 (= name :sigmoid) 3 (= name :silu) 4 (= name :gelu) 5 (= name :relu) 6 (= name :identity) 7
+        :else (trap "tensor: unknown activation (:identity :relu :tanh :sigmoid :silu :gelu)")))
+
+;; One f32x8 through activation `op`: the GEMM epilogue's lane function. relu and identity stay in f32; the rest run as two f64x4 halves.
+(defun activate8 (op: i64 v: f32x8) -> f32x8
+  (cond (= op 7) v
+        (= op 6) (simd/blend (simd/gt v (splat f32x8 0.0f32)) v (splat f32x8 0.0f32))
+        :else (let ((lo: f32x4 (simd/shuffle v v <<0 1 2 3>>)) (hi: f32x4 (simd/shuffle v v <<4 5 6 7>>))
+                    (wl: f64x4 (simd/convert lo)) (wh: f64x4 (simd/convert hi))
+                    (rl: f32x4 (simd/convert (apply4 op wl))) (rh: f32x4 (simd/convert (apply4 op wh))))
+                (simd/shuffle rl rh <<0 1 2 3 4 5 6 7>>))))
 
 (defun run-f64 :private (op: i64 x: (Tensor f64)) -> (Tensor f64)
   (let ((d (contiguous x)) (n (fib.tensor.storage/size d)) (off (array-get (. d meta) 0)) (src (. d buffer))
@@ -109,3 +135,7 @@
 (defun exp (x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t) (transcend (. x seed) 0 x))
 (defun log (x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t) (transcend (. x seed) 1 x))
 (defun tanh (x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t) (transcend (. x seed) 2 x))
+;; Elementwise activation in one pass and one allocation: (t/activate :gelu x). Names: :identity :relu :tanh :sigmoid :silu :gelu.
+(defun activate (name: keyword x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t)
+  (transcend (. x seed) (activation-code name) x))
+(defun relu (x: (Tensor t)) :where ((Element t) (Transcendental t)) -> (Tensor t) (transcend (. x seed) 6 x))
